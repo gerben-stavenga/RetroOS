@@ -1,3 +1,7 @@
 *.o
 *.bin
 *.d
+
+image
+kernel.bin
+boot.bin
