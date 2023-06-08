@@ -30,10 +30,11 @@ Given the above it's good to specifically cite some of the non-goals
 1) Performance. We do want to write simple and performant code but 
 not to the point it adds code, complexity, more asm. It's not meant
 as a production OS.
-2) Ideas like micro-kernels are a non-goal in this project. Those
+2) Security. Ideas like micro-kernels are a non-goal in this project. Those
 ideas would only play a role in as much it helps simplicity and 
 understandability of the kernel. Not because of security and
-stability concerns.
+stability concerns. However simplicity and understandability should
+be good for security.
 3) Device drivers. To get a working kernel we need to support
 keyboard, screen, mouse and hard disks. This detracts from the goals
 of kernel. In real world setting device drivers are arguably the
@@ -47,11 +48,11 @@ still some (high level) platform assumptions. The assumptions are
 machine, with a flat memory model.
 2) There is paging at some arch specified granularity.
 3) Interrupts / traps for external events or errors.
-4The usual keyboard, screen, and storage are attached. Where
+4) The usual keyboard, screen, and storage are attached. Where
 keyboard can be modelled as an incoming stream of characters, the
 screen can be modelled by a rectangular 2d array of characters/pixels
-and the storage can be modelled as 1d array of blocks, each of a
-fixed size bytes. 
+and the storage can be modelled as 1d array of blocks of a
+fixed size. 
 
 These are eminently reasonable and practical assumptions to target for
 a portable OS.
@@ -59,7 +60,7 @@ a portable OS.
 ## System calls
 
 The end goal is to be able to support a reasonable subset of libc,
-enough to get useful set of gnu coreutils and compiler working.
+enough to get a useful set of gnu coreutils and compiler working.
 The classic milestone would be self-hosting.
 
 ## High level design
@@ -70,7 +71,7 @@ Arch consist of a few components, namely
 - A very platform specific booting part, mostly pure asm.
 - Syscall / interrupt part, very thin asm layer + platform
 dependent c++ code servicing the interrupts and translating them
-to proper kernel calls.
+to the proper calls to the main kernel.
 - Timer, keyboard, screen and hard disk drivers. We keep this part
 as small as possible.
 - Paging manager.
@@ -86,11 +87,11 @@ interact with.
 - Timers, screen
 - OS API (what functionality the OS provides)
 
-### Meta
+### Going meta
 
 To facilitate development and testability it should be possible to
 implement arch on top of the kernel OS API. Which means one should be
-able to build the OS that runs inside it's own OS. This would
+able to build the OS that runs inside its own OS. This would
 be another self-hosting milestone. The other arch implementation
 would be against the linux (posix) API allowing development of
 kernel on linux / macos as a regular user application.
@@ -103,3 +104,11 @@ kernel on linux / macos as a regular user application.
   - linux - implemented on top of linux.
 - kernel - the pure standard c++ kernel implementation.
 - libc - implementation of libc on the OS API (this should allow self-hosting).
+- freestanding - algo/utility libraries to be used from arch and kernel (no c/c++ standard lib)
+
+### Freestanding
+
+Because libc and libstdc++ depend on the OS they cannot be dependent
+on by the arch and kernel. To facilitate development we have to build
+a library of algorithms and useful functions to be used as building
+blocks.
