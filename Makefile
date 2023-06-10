@@ -2,12 +2,12 @@ CC := i386-elf-g++
 LD := i386-elf-ld
 AS := nasm
 
-CFLAGS := -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti -std=c++17
+CFLAGS := -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti -std=c++17 -I .
 
 BOOT_BIN := src/arch/x86/boot.bin
-ARCH_OBJ := src/arch/x86/entry.o src/arch/x86/start32.o
+ARCH_OBJ := src/arch/x86/entry.o src/arch/x86/start32.o src/arch/x86/x86_int.o
 
-ALL_OBJ := src/arch/x86/start32.o
+ALL_OBJ := src/arch/x86/start32.o src/arch/x86/x86_int.o
 
 include $(ALL_OBJ:.o=.d)
 

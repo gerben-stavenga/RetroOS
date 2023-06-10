@@ -107,6 +107,9 @@ static void SlaveIrqHandler(Regs* regs) {
 }
 
 static void Ignore(Regs*) {}
+
+constexpr int ENOSYS = 100;
+
 static void SystemCall(Regs* regs) {
     if (regs->rax >= array_size(syscall_table) || !syscall_table[regs->rax]) {
         regs->rax = -ENOSYS;
@@ -156,7 +159,7 @@ constexpr std::array<isr_t, 256> MakeTable(std::index_sequence<seq...>) {
 static const std::array<isr_t, 256> isr_table = MakeTable(std::make_index_sequence<256>{});
 
 IdtEntry MakeEntry(std::uint64_t base, std::uint16_t sel, std::uint8_t flags) {
-    IdtEntry entry;
+    IdtEntry entry{};
     base += 8 * i;
     entry.base_lo = base & 0xFFFF;
     entry.base_mid = (base >> 16) & 0xFFFF;
@@ -178,23 +181,6 @@ void InitInterrupts() {
         idt[i] = MakeEntry(base + 8 * i, 0x8, flags);
     }
 
-    // Remap PIC
-    // INIT | ICW4
-    outb(0x20, 0x11);
-    outb(0xA0, 0x11);
-    // Offset
-    outb(0x21, 0x20);
-    outb(0xA1, 0x28);
-    // Cascade identity
-    outb(0x21, 0x04);
-    outb(0xA1, 0x02);
-    // ICW4 (8086 mode)
-    outb(0x21, 0x01);
-    outb(0xA1, 0x01);
-
-    // Mask all interrupts
-    outb(0x21, 0xFF);
-    outb(0xA1, 0xFF);
 
     DescriptorPtr idt_ptr{sizeof(idt) - 1, idt.data()};
     asm("lidt %0" : : "m"(idt_ptr));
