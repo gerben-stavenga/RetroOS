@@ -5,11 +5,12 @@ section .text
     extern real_mode_idt_ptr
 global _start
 _start:
-[bits 16]
-    push edx
-    call switch_to_pm
-    jmp 0x8:_start32
+[bits 32]
+    ; stack contains drive number
+    call kmain
+    jmp $
 
+[bits 16]
 switch_to_pm:
     cli
     lgdt [gdt_ptr] ; load the GDT
@@ -18,7 +19,6 @@ switch_to_pm:
     mov eax, cr0 ; get cr0
     or eax, 1 ; set PE bit
     mov cr0, eax ; write cr0
-    jmp 0x8:_start32 ; 0x8 is 32 bit protected code segment
     jmp 0x28:update_segs ; 0x28 is 16 bit protected code segment
 update_segs:
     mov ds, dx
@@ -83,39 +83,10 @@ swapregs:
     xchg ebp, [regs + REGS.bp]
     ret
 
-print:
-    lodsb
-    or al, al
-    jz done
-    mov ah, 0x0e
-    mov bx, 0x0007
-    int 0x10
-    jmp print
-done:
-    ret
-
-msg:
-    db "Hello, World!", 13, 10, 0
-
-global idt
-align 64
-idt:
-%assign i 0
-%rep 256
-    dw  int_vector + 8 * i  ; offset low
-    dw  0x8  ; kernel cs
-%if i >= 32 && i < 48
-    dw  0x8E00  ; interrupt
-%else
-    dw  0x8F00  ; trap
-%endif
-    dw  0  ; ofset high
-%assign i (i + 1)
-%endrep
-
 [bits 32]
 
 align 64
+global int_vector
 int_vector:
 %assign i 0
 %rep 256
@@ -173,9 +144,6 @@ wrapper_with_error_code:
     popa
     add esp, 8
     iret
-
-_start32:
-    call kmain
 
 struc REGS
     .ax resd 1
