@@ -11,7 +11,7 @@
     mov si, booting_msg
     call print
 
-    mov al, 15
+    mov al, 35
     mov bx, 0x1000
     call readdisk
 

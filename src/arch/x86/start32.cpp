@@ -73,11 +73,8 @@ struct IdtEntry {
 
 IdtEntry idt[256];
 
-extern "C" DescriptorPtr gdt_ptr;
 DescriptorPtr gdt_ptr = {sizeof(gdt) - 1, gdt};
-extern "C" DescriptorPtr idt_ptr;
 DescriptorPtr idt_ptr = {sizeof(idt) - 1, idt};
-extern "C" DescriptorPtr real_mode_idt_ptr;
 DescriptorPtr real_mode_idt_ptr = { 0x3FF, 0 };
 
 extern "C" void int_vector();
@@ -88,46 +85,35 @@ void hlt() {
     }
 }
 
-int pos_x, pos_y;
-void ClearScreen() {
-    uint16_t *video = reinterpret_cast<uint16_t *>(0xB8000);
-    for (int i = 0; i < 80 * 25; ++i) {
-        video[i] = 0x0700 | ' ';
-    }
-    pos_x = pos_y = 0;
-}
+struct Screen {
+    int cursor_x, cursor_y;
 
-__attribute__((noinline)) void print(const char* s) {
-    uint16_t *video = reinterpret_cast<uint16_t *>(0xB8000);
-    uint8_t c;
-    while (c = *s) {
+    void ClearScreen() {
+        uint16_t *video = reinterpret_cast<uint16_t *>(0xB8000);
+        memset(video, 0, 80 * 25 * 2);
+        cursor_x = cursor_y = 0;
+    }
+
+    void put(char c) {
+        uint16_t *video = reinterpret_cast<uint16_t *>(0xB8000);
         if (c == '\n') {
-            pos_y++;
-            pos_x = 0;
-            if (pos_y == 25) {
+            cursor_x = 0;
+            cursor_y++;
+            if (cursor_y == 25) {
                 memmove(video, video + 80, 80 * 24 * 2);
                 memset(video + 80 * 24, 0, 80 * 2);
-                pos_y = 24;
+                cursor_y = 24;
             }
         } else {
-            if (pos_x < 80) video[pos_y * 80 + pos_x] = 0x0700 | c;
-            pos_x++;
+            if (cursor_x < 80) {
+                video[cursor_y * 80 + cursor_x] = 0x700 | c;
+            }
+            cursor_x++;
         }
-        s++;
     }
-}
+};
 
-__attribute__((noinline)) void printhex(const void* p, int n) {
-    char buf[] = "   ";
-    auto hexdigit = [](int x) { return x >= 10 ? 'A' + x - 10 : '0' + x; };
-    const uint8_t* s = static_cast<const uint8_t *>(p);
-    for (int i = 0; i < n; i++) {
-        buf[0] = hexdigit(s[i] >> 4);
-        buf[1] = hexdigit(s[i] & 0xF);
-        print(buf);
-    }
-    print("\n");
-}
+Screen screen;
 
 inline void outb(uint16_t port, uint8_t data) {
     asm volatile("outb %0, %1" : : "a"(data), "d"(port));
@@ -155,31 +141,28 @@ inline void DoIrq(Regs* regs, int irq) {
     if (irq == 0) {
         if ((counter++) & 0xF) return;
     }
-    print("IRQ: ");
-    printhex(&irq, 4);
-    print("counter: ");
-    printhex(&counter, 4);
+    print(screen, "IRQ: {} time counter {}\n", irq, counter);
 }
 
-static void divide_error(Regs* regs) {}
-static void debug(Regs* regs) {}
-static void nmi(Regs* regs) {}
-static void int3(Regs* regs) {}
-static void overflow(Regs* regs) {}
-static void bounds(Regs* regs) {}
-static void invalid_op(Regs* regs) {}
-static void device_not_available(Regs* regs) {}
-static void double_fault(Regs* regs) {}
-static void coprocessor_segment_overrun(Regs* regs) {}
-static void invalid_TSS(Regs* regs) {}
-static void segment_not_present(Regs* regs) {}
-static void stack_segment(Regs* regs) {}
-static void general_protection(Regs* regs) {}
-static void page_fault(Regs* regs) {}
-static void coprocessor_error(Regs* regs) {}
-static void reserved(Regs* regs) {}
-static void alignment_check(Regs* regs) {}
-static void unknown_exception_handler(Regs* regs) {}
+static void divide_error(Regs*) {}
+static void debug(Regs*) {}
+static void nmi(Regs*) {}
+static void int3(Regs*) {}
+static void overflow(Regs*) {}
+static void bounds(Regs*) {}
+static void invalid_op(Regs*) {}
+static void device_not_available(Regs*) {}
+static void double_fault(Regs*) {}
+static void coprocessor_segment_overrun(Regs*) {}
+static void invalid_TSS(Regs*) {}
+static void segment_not_present(Regs*) {}
+static void stack_segment(Regs*) {}
+static void general_protection(Regs*) {}
+static void page_fault(Regs*) {}
+static void coprocessor_error(Regs*) {}
+static void reserved(Regs*) {}
+static void alignment_check(Regs*) {}
+static void unknown_exception_handler(Regs*) {}
 
 static void MasterIrqHandler(Regs* regs) {
     int irq = regs->int_no - 32;
@@ -210,8 +193,7 @@ static void SlaveIrqHandler(Regs* regs) {
     outb(0xA1, inb(0xA1) & ~mask);
 }
 
-static void Ignore(Regs*) {
-}
+static void Ignore(Regs*) {}
 
 template <typename T, size_t N>
 constexpr size_t array_size(const T (&)[N]) {
@@ -349,21 +331,14 @@ extern "C" void isr_handler(Regs* regs) {
 }
 
 extern "C" void kmain(int pos, int drive) {
-    pos_x = pos & 0xFF;
-    pos_y = (pos >> 8) & 0xFF;
-    print("Entering main kernel\n");
-    print("Booted from drive: ");
-    char d[3] = "A\n";
-    if (drive < 0x80) {
-        d[0] += drive;
-    } else {
-        d[0] = 'c' + drive - 0x80;
-    }
-    print(d);
+    int x = screen.cursor_x = pos & 0xFF;
+    int y = screen.cursor_y = (pos >> 8) & 0xFF;
+    print(screen, "Entering main kernel with stack at {}\n", &pos);
+    print(screen, "Booted from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
 
     RemapInterrupts();
     SetupDescriptorTables();
 
-    print("Boot succeeded\n");
+    print(screen, "Boot succeeded\n");
     hlt();
 }
