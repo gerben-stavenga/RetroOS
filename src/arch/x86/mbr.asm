@@ -47,15 +47,14 @@ readdisk:
     jc readdisk
     ret
 
-print:
-    lodsb
-    or al, al
-    jz done
+print_char:
     mov ah, 0x0e
     mov bx, 0x0007
     int 0x10
-    jmp print
-done:
+print:
+    lodsb
+    or al, al
+    jnz print_char
     ret
 
 struc REGS

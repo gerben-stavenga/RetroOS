@@ -331,6 +331,7 @@ void SetupPaging() {
 }
 
 extern "C" void isr_handler(Regs* regs) {
+    regs->int_no &= 0xFF;
     isr_table.entries[regs->int_no](regs);
 }
 
