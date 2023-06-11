@@ -4,10 +4,10 @@ AS := nasm
 
 CFLAGS := -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti -std=c++17 -I .
 
-BOOT_BIN := src/arch/x86/boot.bin
-ARCH_OBJ := src/arch/x86/entry.o src/arch/x86/start32.o src/arch/x86/x86_int.o
+BOOTLOADER_OBJ := src/arch/x86/boot.o
+KERNEL_OBJ := src/arch/x86/start32.o
 
-ALL_OBJ := src/arch/x86/start32.o src/arch/x86/x86_int.o
+ALL_OBJ := $(BOOTLOADER_OBJ) $(KERNEL_OBJ)
 
 include $(ALL_OBJ:.o=.d)
 
@@ -25,10 +25,17 @@ include $(ALL_OBJ:.o=.d)
 
 %.d: depend.sh
 
-src/arch/x86/kernel.bin: $(ARCH_OBJ)
-	i386-elf-ld -Ttext=0x1000 $(ARCH_OBJ) --oformat binary -o $@
+src/arch/x86/bootloader.bin: src/arch/x86/boot_entry.o $(BOOTLOADER_OBJ)
+	i386-elf-ld -Ttext=0x7e00 $^ --oformat binary -o $@
 
-IMAGE_DEPS := src/arch/x86/boot.bin src/arch/x86/kernel.bin
+src/arch/x86/bootloader_padded.bin: src/arch/x86/bootloader.bin
+	cp $^ $@
+	truncate -s 2560 $@
+
+src/arch/x86/kernel.bin: src/arch/x86/entry.o $(KERNEL_OBJ)
+	i386-elf-ld -Ttext=0x1000 $^ --oformat binary -o $@
+
+IMAGE_DEPS := src/arch/x86/mbr.bin src/arch/x86/bootloader_padded.bin src/arch/x86/kernel.bin
 image: $(IMAGE_DEPS)
 	cat $(IMAGE_DEPS) > image
 	truncate -s 16M image
