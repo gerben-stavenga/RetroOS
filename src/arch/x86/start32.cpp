@@ -8,7 +8,7 @@
 
 struct DescriptorPtr {
     uint16_t limit;
-    void* base;
+    const void* base;
 } __attribute__((packed));
 
 struct AccessWord {
@@ -54,7 +54,12 @@ struct GdtEntry {
     FlagsWord flags;
 } __attribute__((packed));
 
-GdtEntry gdt[7] = {
+constexpr int kKernelCS = 0x8;
+constexpr int kKernelDS = 0x10;
+constexpr int kUserCS = 0x18;
+constexpr int kUserDS = 0x20;
+
+const GdtEntry gdt[7] = {
         {0, null_access, null_flags},
         {0xFFFF, kernel_access_cs, k32_flags},  // cs = 0x8
         {0xFFFF, kernel_access_ds, k32_flags},  // ds = 0x10
@@ -72,10 +77,6 @@ struct IdtEntry {
 } __attribute__((packed));
 
 IdtEntry idt[256];
-
-DescriptorPtr gdt_ptr = {sizeof(gdt) - 1, gdt};
-DescriptorPtr idt_ptr = {sizeof(idt) - 1, idt};
-DescriptorPtr real_mode_idt_ptr = { 0x3FF, 0 };
 
 extern "C" void int_vector();
 
@@ -136,7 +137,7 @@ typedef void (*EntryHandler)(Regs*);
 
 static const EntryHandler syscall_table[1] = {};
 
-inline void DoIrq(Regs* regs, int irq) {
+inline void DoIrq(int irq) {
     static int counter = 0;
     if (irq == 0) {
         if ((counter++) & 0xF) return;
@@ -172,7 +173,7 @@ static void MasterIrqHandler(Regs* regs) {
     // Acknowledge PIC
     outb(0x20, 0x20);
 
-    DoIrq(regs, irq);
+    DoIrq(irq);
 
     // Unblock IRQ
     outb(0x21, inb(0x21) & ~mask);
@@ -187,7 +188,7 @@ static void SlaveIrqHandler(Regs* regs) {
     outb(0x20, 0x20);
     outb(0xA0, 0x20);
 
-    DoIrq(regs, irq);
+    DoIrq(irq);
 
     // Unblock IRQ
     outb(0xA1, inb(0xA1) & ~mask);
@@ -253,7 +254,7 @@ constexpr IsrTable MakeTable() {
     return table;
 }
 
-IsrTable isr_table = MakeTable();
+const IsrTable isr_table = MakeTable();
 
 void RemapInterrupts() {
     // Remap PIC such that IRQ 0 .. 15 are directed to interrupts 32 .. 47
@@ -278,23 +279,26 @@ void RemapInterrupts() {
 void SetupDescriptorTables() {
     uintptr_t base = reinterpret_cast<uintptr_t>(int_vector);
     for (int i = 0; i < 256; i++) {
-        int flags = i >= 32 && i < 48 ? 0x8E00 : 0x8F00;
-        idt[i] = IdtEntry{base & 0xFFFF, 0x8, flags, base >> 16};
+        uint16_t flags = i >= 32 && i < 48 ? 0x8E00 : 0x8F00;
+        idt[i] = IdtEntry{static_cast<uint16_t >(base & 0xFFFF), 0x8, flags, static_cast<uint16_t>(base >> 16)};
         base += 8;
     }
     idt[0x80].flags |= 0x6000;  // User interrupt, so DPL = 3
 
+    DescriptorPtr gdt_ptr = {sizeof(gdt) - 1, gdt};
+    DescriptorPtr idt_ptr = {sizeof(idt) - 1, idt};
+
     asm volatile (
-            "lidt idt_ptr\n\t"
-            "lgdt gdt_ptr\n\t"
+            "lidt %2\n\t"
+            "lgdt %1\n\t"
             "mov %0, %%ds\n\t"
             "mov %0, %%es\n\t"
             "mov %0, %%fs\n\t"
             "mov %0, %%gs\n\t"
-            "ljmpl $0x8, $set_cs\n\t"
-            "set_cs:\n\t"
+            "ljmpl $0x8, $1f\n\t"
+            "1:\n\t"
             "sti\n\t"
-            ::"r"(0x10));
+            ::"r"(kKernelDS), "m"(gdt_ptr), "m"(idt_ptr):"memory");
 
     // UnMask all interrupts
     outb(0x21, 0);
@@ -330,11 +334,10 @@ extern "C" void isr_handler(Regs* regs) {
     isr_table.entries[regs->int_no](regs);
 }
 
-extern "C" void kmain(int pos, int drive) {
-    int x = screen.cursor_x = pos & 0xFF;
-    int y = screen.cursor_y = (pos >> 8) & 0xFF;
+extern "C" void kmain(int pos) {
+    screen.cursor_x = pos & 0xFF;
+    screen.cursor_y = (pos >> 8) & 0xFF;
     print(screen, "Entering main kernel with stack at {}\n", &pos);
-    print(screen, "Booted from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
 
     RemapInterrupts();
     SetupDescriptorTables();
