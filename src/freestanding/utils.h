@@ -96,7 +96,7 @@ void print_val(CharOut& out, const void* p) {
 
 template <typename CharOut>
 void print_val(CharOut& out, string_view buf) {
-    for (int i = 0; i < buf.size; i++) {
+    for (size_t i = 0; i < buf.size; i++) {
         out.put(buf[i]);
     }
 }

@@ -47,7 +47,7 @@ align 64
 global int_vector
 int_vector:
 %assign i 0
-%rep 256
+%rep 49
 align 8
 %if i >= 128
     push (i - 256)

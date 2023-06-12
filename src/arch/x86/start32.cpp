@@ -76,7 +76,8 @@ struct IdtEntry {
     uint16_t offset_high;
 } __attribute__((packed));
 
-IdtEntry idt[256];
+constexpr int kIdtEntries = 49;
+IdtEntry idt[kIdtEntries];
 
 extern "C" void int_vector();
 
@@ -139,8 +140,17 @@ static const EntryHandler syscall_table[1] = {};
 
 inline void DoIrq(int irq) {
     static int counter = 0;
-    if (irq == 0) {
-        if ((counter++) & 0xF) return;
+    switch (irq) {
+        case 0:
+            if ((counter++) & 0xF) return;
+            break;
+        case 1: {
+            int key = inb(0x60);
+            print(screen, "Key: {} {}\n", key & 0x7F, string_view(key & 0x80 ? "released" : "pressed"));
+            break;
+        }
+        default:
+            break;
     }
     print(screen, "IRQ: {} time counter {}\n", irq, counter);
 }
@@ -278,12 +288,12 @@ void RemapInterrupts() {
 
 void SetupDescriptorTables() {
     uintptr_t base = reinterpret_cast<uintptr_t>(int_vector);
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < kIdtEntries; i++) {
         uint16_t flags = i >= 32 && i < 48 ? 0x8E00 : 0x8F00;
         idt[i] = IdtEntry{static_cast<uint16_t >(base & 0xFFFF), 0x8, flags, static_cast<uint16_t>(base >> 16)};
         base += 8;
     }
-    idt[0x80].flags |= 0x6000;  // User interrupt, so DPL = 3
+    idt[kIdtEntries - 1].flags |= 0x6000;  // User interrupt, so DPL = 3
 
     DescriptorPtr gdt_ptr = {sizeof(gdt) - 1, gdt};
     DescriptorPtr idt_ptr = {sizeof(idt) - 1, idt};
