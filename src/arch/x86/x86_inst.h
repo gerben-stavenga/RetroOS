@@ -36,6 +36,14 @@ inline uint8_t inb(uint16_t port) {
     return data;
 }
 
+inline void EnableIRQ() {
+    asm volatile ("sti\n\t");
+}
+
+inline void DisableIRQ() {
+    asm volatile ("cli\n\t");
+}
+
 inline void hlt_inst() {
     asm volatile("hlt\n\t");
 }

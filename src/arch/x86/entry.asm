@@ -48,7 +48,7 @@ align 64
 global int_vector
 int_vector:
 %assign i 0
-%rep 48
+%rep 49
 align 8
 %if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
     ; error code is already pushed by CPU
@@ -59,9 +59,3 @@ align 8
     call entry_wrapper
 %assign i (i + 1)
 %endrep
-
-global int_0x80
-int_0x80:
-    push 0
-    push int_vector + 0x80 * 8
-    jmp entry_wrapper
