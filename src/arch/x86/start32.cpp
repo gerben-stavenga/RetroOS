@@ -5,86 +5,34 @@
 #include <stddef.h>
 
 #include "src/freestanding/utils.h"
-
-struct DescriptorPtr {
-    uint16_t limit;
-    const void* base;
-} __attribute__((packed));
-
-struct AccessWord {
-    uint16_t base_mid: 8;
-    uint16_t access: 1;
-    uint16_t rw: 1;
-    uint16_t dc: 1;
-    uint16_t ex: 1;
-    uint16_t special: 1;
-    uint16_t dpl: 2;
-    uint16_t present: 1;
-};
-
-constexpr AccessWord access_word(bool ex, bool special, uint8_t dpl, bool present) {
-    return AccessWord{0, 0, 1, 0, ex, special, dpl, present};
-}
-
-constexpr auto kernel_access_cs = access_word(true, true, 0, true);
-constexpr auto kernel_access_ds = access_word(false, true, 0, true);
-constexpr auto user_access_cs = access_word(true, true, 3, true);
-constexpr auto user_access_ds = access_word(false, true, 3, true);
-constexpr auto null_access = AccessWord{0, 0, 0, 0, 0, 0, 0, 0};
-
-struct FlagsWord {
-    uint16_t limit_high: 4;
-    uint16_t reserved: 2;
-    uint16_t big: 1;
-    uint16_t granularity: 1;
-    uint16_t base_high: 8;
-};
-
-constexpr FlagsWord flags_word(bool big) {
-    return FlagsWord{static_cast<uint16_t>(big ? 0xF : 0), 0, big, big, 0};
-}
-
-constexpr auto k32_flags = flags_word(true);
-constexpr auto k16_flags = flags_word(false);
-constexpr auto null_flags = FlagsWord{0, 0, 0, 0, 0};
-
-struct GdtEntry {
-    uint32_t limit_base_low;
-    AccessWord access;
-    FlagsWord flags;
-} __attribute__((packed));
+#include "descriptors.h"
+#include "x86_inst.h"
 
 constexpr int kKernelCS = 0x8;
 constexpr int kKernelDS = 0x10;
 constexpr int kUserCS = 0x18;
 constexpr int kUserDS = 0x20;
 
-const GdtEntry gdt[7] = {
-        {0, null_access, null_flags},
-        {0xFFFF, kernel_access_cs, k32_flags},  // cs = 0x8
-        {0xFFFF, kernel_access_ds, k32_flags},  // ds = 0x10
-        {0xFFFF, user_access_cs, k32_flags},  // cs = 0x18
-        {0xFFFF, user_access_ds, k32_flags},  // ds = 0x20
-        {0xFFFF, kernel_access_cs, k16_flags},  // cs = 0x28
-        {0xFFFF, kernel_access_ds, k16_flags},  // ds = 0x30
+DescriptorEntry gdt[6] = {
+        {},
+        MakeSegDesc(true, true, 0),  // cs = 0x8
+        MakeSegDesc(true, false, 0),  // ds = 0x10
+        MakeSegDesc(true, true, 3),  // cs = 0x18
+        MakeSegDesc(true, false, 3),  // ds = 0x20
+        {}, // TSS
+//        {0xFFFF, kernel_access_cs, k16_flags},  // cs = 0x28
+//        {0xFFFF, kernel_access_ds, k16_flags},  // ds = 0x30
 };
 
-struct IdtEntry {
-    uint16_t offset_low;
-    uint16_t selector;
-    uint16_t flags;
-    uint16_t offset_high;
-} __attribute__((packed));
-
-constexpr int kIdtEntries = 49;
+constexpr int kIdtEntries = 0x80 + 1;
 IdtEntry idt[kIdtEntries];
 
-extern "C" void int_vector();
+struct InterruptEntry { uint8_t code[8]; };
+extern "C"  InterruptEntry int_vector[];
+extern "C" char int_0x80[];
 
 void hlt() {
-    while (true) {
-        asm volatile("hlt\n\t");
-    }
+    while (true) hlt_inst();
 }
 
 struct Screen {
@@ -117,13 +65,12 @@ struct Screen {
 
 Screen screen;
 
-inline void outb(uint16_t port, uint8_t data) {
-    asm volatile("outb %0, %1" : : "a"(data), "d"(port));
-}
-inline uint8_t inb(uint16_t port) {
-    uint8_t data;
-    asm volatile("inb %1, %0" : "=a"(data) : "d"(port));
-    return data;
+template<typename... Args>
+void panic(string_view format, const Args&... args) {
+    screen.ClearScreen();
+    print(screen, "Kernel panic: ");
+    print(screen, format, args...);
+    hlt();
 }
 
 // Matches the stack frame of the entry.asm
@@ -140,13 +87,15 @@ static const EntryHandler syscall_table[1] = {};
 
 inline void DoIrq(int irq) {
     static int counter = 0;
+    static uint8_t key_state[16];
     switch (irq) {
         case 0:
             if ((counter++) & 0xF) return;
             break;
         case 1: {
             int key = inb(0x60);
-            print(screen, "Key: {} {}\n", key & 0x7F, string_view(key & 0x80 ? "released" : "pressed"));
+            key_state[(key & 0x7f) >> 3] = (key >> 7) << (key & 7);
+            print(screen, "Key: {} {}\n", key & 0x7F, key & 0x80 ? "released" : "pressed");
             break;
         }
         default:
@@ -155,65 +104,94 @@ inline void DoIrq(int irq) {
     print(screen, "IRQ: {} time counter {}\n", irq, counter);
 }
 
-static void divide_error(Regs*) {}
-static void debug(Regs*) {}
-static void nmi(Regs*) {}
-static void int3(Regs*) {}
-static void overflow(Regs*) {}
-static void bounds(Regs*) {}
-static void invalid_op(Regs*) {}
-static void device_not_available(Regs*) {}
-static void double_fault(Regs*) {}
-static void coprocessor_segment_overrun(Regs*) {}
-static void invalid_TSS(Regs*) {}
-static void segment_not_present(Regs*) {}
-static void stack_segment(Regs*) {}
-static void general_protection(Regs*) {}
-static void page_fault(Regs*) {}
-static void coprocessor_error(Regs*) {}
-static void reserved(Regs*) {}
-static void alignment_check(Regs*) {}
-static void unknown_exception_handler(Regs*) {}
+enum Signals : int {
+    SIGFPE, SIGTRAP, SIGSEGV, SIGILL, SIGBUS
+};
 
-static void MasterIrqHandler(Regs* regs) {
+struct GenericException {
+    int signal;
+    string_view name;
+};
+GenericException exceptions[32] = {
+        {SIGFPE, "divide error"},  // 0
+        {-1, "debug"},
+        {-1, "non-maskable interrupt"},
+        {SIGTRAP, "int3"},  // 3
+        {SIGSEGV, "overflow"},  // 4
+        {SIGSEGV, "bounds"},  // 5
+        {SIGILL, "invalid operand"},  // 6
+        {SIGSEGV, "device not available"},  // 7
+        {SIGSEGV, "double fault"},  // 8
+        {SIGFPE, "coprocessor segment overrun"},  // 9
+        {SIGSEGV, "invalid TSS"},  // 10
+        {SIGBUS, "segment not present"},  // 11
+        {SIGBUS, "stack segment"},  // 12
+        {-1, "general protection"},  // 13
+        {-1, "page fault"},  // 14
+        {SIGSEGV, "reserved"},  // 15
+        {-1, "coprocessor error"},  // 16
+        {SIGSEGV, "alignment check"},  // 17
+};
+
+static void generic_exception_handler(Regs* regs) {
+    auto int_no = regs->int_no;
+    auto signal = exceptions[int_no].signal;
+
+    panic("An unsupported exception, signal = {} name = {}\n", signal, exceptions[regs->int_no].name);
+}
+
+static void unknown_exception_handler(Regs* regs) {
+    panic("An unsupported exception {}", int(regs->int_no));
+}
+
+static void debug(Regs*) {
+    panic("Debug");
+}
+
+static void coprocessor_error(Regs*) {
+    panic("Coprocessor error");
+}
+
+static void nmi(Regs*) {
+    // There are mainly two ways a non-maskable interrupt occurs
+    // 1) Hardware failure (best to inform user and hang)
+    // 2) Watchdog timer (not supported thus hang)
+    panic("Non-maskable interrupt received, most likely hardware failure");
+}
+
+static void double_fault(Regs*) {
+    // Only a kernel bug can trigger a double fault, hence we should die
+    panic("Kernel bug: double_fault");
+}
+
+static void general_protection(Regs* regs) {
+    panic("GP {}", regs->err_code);
+}
+
+static void page_fault(Regs* regs) {
+    panic("page fault {}\n", regs->err_code);
+}
+
+static void IrqHandler(Regs* regs) {
     int irq = regs->int_no - 32;
-    uint8_t mask = 1 << irq;
+    uint8_t mask = 1 << (irq & 7);
+    uint16_t pic_port = irq >= 8 ? 0xA1 : 0x20;
     // Block IRQ
-    outb(0x21, inb(0x21) | mask);
+    outb(pic_port, inb(pic_port) | mask);
     // Acknowledge PIC
+    if (irq >= 8) outb(0xA1, 0x20);
     outb(0x20, 0x20);
 
     DoIrq(irq);
 
     // Unblock IRQ
-    outb(0x21, inb(0x21) & ~mask);
-}
-
-static void SlaveIrqHandler(Regs* regs) {
-    int irq = regs->int_no - 32;
-    uint8_t mask = 1 << (irq - 8);
-    // Block IRQ
-    outb(0xA1, inb(0xA1) | mask);
-    // Acknowledge PIC
-    outb(0x20, 0x20);
-    outb(0xA0, 0x20);
-
-    DoIrq(irq);
-
-    // Unblock IRQ
-    outb(0xA1, inb(0xA1) & ~mask);
-}
-
-static void Ignore(Regs*) {}
-
-template <typename T, size_t N>
-constexpr size_t array_size(const T (&)[N]) {
-    return N;
+    outb(pic_port, inb(pic_port) & ~mask);
 }
 
 constexpr int ENOSYS = 100;
 
 static void SystemCall(Regs* regs) {
+    print(screen, "Syscall {}", regs->eax);
     if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
         regs->eax = -ENOSYS;
         return;
@@ -222,45 +200,47 @@ static void SystemCall(Regs* regs) {
 }
 
 struct IsrTable {
-    EntryHandler entries[256];
+    EntryHandler entries[kIdtEntries];
 };
 
 constexpr EntryHandler IsrHandler(int i) {
     switch (i) {
-        case 0: return divide_error;
         case 1: return debug;
         case 2: return nmi;
-        case 3: return int3;	/* int3-5 can be called from all */
-        case 4: return overflow;
-        case 5: return bounds;
-        case 6: return invalid_op;
-        case 7: return device_not_available;
         case 8: return double_fault;
-        case 9: return coprocessor_segment_overrun;
-        case 10: return invalid_TSS;
-        case 11: return segment_not_present;
-        case 12: return stack_segment;
+        case 16: return coprocessor_error;
         case 13: return general_protection;
         case 14: return page_fault;
-        case 15: return reserved;
-        case 16: return coprocessor_error;
-        case 17: return alignment_check;
+
+        case 0:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+        case 9:
+        case 10:
+        case 11:
+        case 12:
+        case 17:
+            return generic_exception_handler;
+
+        case 15:
         case 18 ... 31:
             return unknown_exception_handler;
-        case 32 ... 39:  // IRQ0 ... IRQ7
-            return MasterIrqHandler;
-        case 40 ... 47:  // IRQ8 ... IRQ15
-            return SlaveIrqHandler;
+
+        case 32 ... 47:  // IRQ0 ... IRQ15
+            return IrqHandler;
         case 0x80:
             return SystemCall;
         default:
-            return Ignore;
+            return nullptr;
     }
 }
 
 constexpr IsrTable MakeTable() {
     IsrTable table{};
-    for (int i = 0; i < 256; i++) table.entries[i] = IsrHandler(i);
+    for (int i = 0; i < kIdtEntries; i++) table.entries[i] = IsrHandler(i);
     return table;
 }
 
@@ -287,20 +267,18 @@ void RemapInterrupts() {
 }
 
 void SetupDescriptorTables() {
-    uintptr_t base = reinterpret_cast<uintptr_t>(int_vector);
-    for (int i = 0; i < kIdtEntries; i++) {
-        uint16_t flags = i >= 32 && i < 48 ? 0x8E00 : 0x8F00;
-        idt[i] = IdtEntry{static_cast<uint16_t >(base & 0xFFFF), 0x8, flags, static_cast<uint16_t>(base >> 16)};
-        base += 8;
+    // CPU exceptions
+    for (int i = 0; i < 48; i++) {
+        int dpl = (i >= 3 && i <= 5) ? 3 : 0;  // int3, into and bounds exception may be generated by users
+        idt[i] = MakeInterruptGate(int_vector + i, dpl);
     }
-    idt[kIdtEntries - 1].flags |= 0x6000;  // User interrupt, so DPL = 3
+    // Set int 0x80 syscall
+    idt[0x80] = MakeInterruptGate(int_0x80, 3);
 
-    DescriptorPtr gdt_ptr = {sizeof(gdt) - 1, gdt};
-    DescriptorPtr idt_ptr = {sizeof(idt) - 1, idt};
+    LoadGDT(gdt, sizeof(gdt));
+    LoadIDT(idt, sizeof(idt));
 
     asm volatile (
-            "lidt %2\n\t"
-            "lgdt %1\n\t"
             "mov %0, %%ds\n\t"
             "mov %0, %%es\n\t"
             "mov %0, %%fs\n\t"
@@ -308,47 +286,112 @@ void SetupDescriptorTables() {
             "ljmpl $0x8, $1f\n\t"
             "1:\n\t"
             "sti\n\t"
-            ::"r"(kKernelDS), "m"(gdt_ptr), "m"(idt_ptr):"memory");
+            ::"r"(kKernelDS));
 
-    // UnMask all interrupts
+    // Unmask all interrupts
     outb(0x21, 0);
     outb(0xA1, 0);
 }
 
-void SetupPaging() {
-    /*asm volatile (
-        // Load page table
-            "mov %0, %%cr3\n\t"
-            // Enable PAE
-            "mov %%cr4, %%0\n\t"
-            "or $0x20, %%0\n\t"
-            "mov %%0, %%cr4\n\t"
-            // Enable paging
-            "mov %%cr0, %%0\n\t"
-            "or $0x80000000, %%0\n\t"
-            " mov %%0, %%cr0\n\t"
-            // Set long mode
-            "mov $0xC0000080, %%ecx\n\t"
-            "rdmsr\n\t"
-            "or $0x100, %%eax\n\t"
-            "wrmsr\n\t"
-            // Enable paging
-            "mov %%cr0, %%0\n\t"
-            "or $0x80000000, %%0\n\t"
-            "mov %%0, %%cr0\n\t"
-        // Compatibility mode
-            : : "r"(pml4) : "%0");*/
+struct PageEntry {
+    uint32_t present : 1;
+    uint32_t read_write : 1;
+    uint32_t user_super : 1;
+    uint32_t zero1 : 2;
+    uint32_t accessed : 1;
+    uint32_t dirty : 1;
+    uint32_t zero2 : 2;
+    uint32_t available : 3;
+    uint32_t offset : 20;
+} __attribute__((packed));
+
+alignas(4096) PageEntry page_tables[4][1024];
+alignas(4096) PageEntry page_dir[1024];
+
+// Linear memory layout
+// [0, 0x1000) null page (not present)
+// [0x1000, 0xFF000000) user space (mapping dep
+// [0xFF000000, 0xFFC00000) 16 mb kernel space (fixed mapping)
+// [0xFFC00000, 0x100000000) 4 mb of 1m page tables entries covering the 4gb address space
+// [0xFFFFF000, 0x100000000) page table covering [0xFFC00000, 0x100000000) and simultaneous page dir
+
+constexpr uintptr_t kKernelBase = 0xFF000000;
+constexpr uintptr_t kCurPageTab = 0xFFC00000;
+constexpr uintptr_t kCurPageDir = 0xFFFFF000;
+
+inline uintptr_t Cast(const void* p) {
+    return reinterpret_cast<uintptr_t>(p);
+}
+
+inline uintptr_t CurrentCR3() {
+    return *reinterpret_cast<uint32_t*>(-4);
+}
+
+inline uintptr_t PhysAddress(const void* p) {
+    uintptr_t linear = reinterpret_cast<uintptr_t>(p);
+    return (reinterpret_cast<const uint32_t*>(0xFFC00000)[linear >> 12] & -4096) + (linear & 4095);
+}
+
+inline constexpr PageEntry MakePageEntry(uintptr_t address) {
+    return PageEntry{1, 1, 1, 0, 0, 0, 0, 0, address >> 12};
+}
+
+extern "C" void SetupPaging(uintptr_t phys_address) {
+    auto ptables = reinterpret_cast<PageEntry (*)[1024]>(Cast(page_tables) - kKernelBase + phys_address);
+    PageEntry* pdir = reinterpret_cast<PageEntry*>(Cast(page_dir) - kKernelBase + phys_address);
+
+    // Identity map the lowest 4mb
+    for (unsigned i = 0; i < 1024; i++) {
+        ptables[0][i] = MakePageEntry(i << 12);
+    }
+    // stack is there for now so commented out
+    // ptables[0][0] = PageEntry{};  // make nullptr an exception
+    for (unsigned i = 0; i < 3; i++) {
+        for (unsigned j = 0; j < 1024; j++) {
+            ptables[i + 1][j] = MakePageEntry(((i * 1024 + j) << 12) + phys_address);
+        }
+    }
+    pdir[0] = MakePageEntry(Cast(ptables[0]));
+    pdir[0x3FC] = MakePageEntry(Cast(ptables[1]));
+    pdir[0x3FD] = MakePageEntry(Cast(ptables[2]));
+    pdir[0x3FE] = MakePageEntry(Cast(ptables[3]));
+    pdir[0x3FF] = MakePageEntry(Cast(pdir));
+
+    LoadPageDir(reinterpret_cast<uintptr_t>(pdir));
+
+    // Enable paging
+    asm volatile (
+        "mov %%cr0, %%eax\n\t"
+        "or $0x80000000, %%eax\n\t"
+        "mov %%eax, %%cr0\n\t"
+        :::"ax");
 }
 
 extern "C" void isr_handler(Regs* regs) {
-    regs->int_no &= 0xFF;
+    // Convert pushed return address into interrupt number
+    regs->int_no = (regs->int_no - reinterpret_cast<uintptr_t>(int_vector)) / 8;
     isr_table.entries[regs->int_no](regs);
+}
+
+void VerifyA20Enabled() {
+    print(screen, "Verifying A20\n");
+    volatile uint32_t tmp;
+    uint32_t volatile* a20_aliased = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(&tmp) ^ 0x100000);
+    uint32_t cnt = 0;
+    do {
+        tmp = cnt++;
+    } while (tmp == *a20_aliased);
+    print(screen, "A20 enabled\n");
 }
 
 extern "C" void kmain(int pos) {
     screen.cursor_x = pos & 0xFF;
     screen.cursor_y = (pos >> 8) & 0xFF;
-    print(screen, "Entering main kernel with stack at {}\n", &pos);
+
+    VerifyA20Enabled();
+
+    auto ip = GetIP();
+    print(screen, "Entering main kernel\nStack at {} and ip {} at phys address {}\n", &pos, ip, reinterpret_cast<void*>(PhysAddress(ip)));
 
     RemapInterrupts();
     SetupDescriptorTables();

@@ -65,6 +65,34 @@ The classic milestone would be self-hosting.
 
 ## High level design
 
+What exactly is an Operating System (OS)? According to Wikipedia, an OS is system software that administers computer hardware and software resources, offering common services for computer programs. Another perspective defines an OS as software that mediates the interface between computer hardware components and the user.
+
+Influential software freedom advocate Richard Stallman characterizes GNU/Linux as an OS, wherein Linux merely represents a component, specifically the kernel, of the broader entity known as the operating system.
+
+Each of these viewpoints holds significance, yet this project primarily focuses on what is conventionally termed the "kernel." From this project's perspective, an OS, or a kernel, is essentially an abstraction of "physical computers."
+
+Programming languages are abstractions of "mathematical computing," encapsulating computation in a manner that is both human-friendly and CPU-independent, thus facilitating code that can be compiled to run on any computer. Similarly, an operating system offers an abstraction of an actual physical computer. A physical computer not only approximates a mathematical computer but also enables interaction with the physical world via devices controlled by the computer.
+
+Features like system calls, libc, and POSIX provide portability across various CPU architectures, allowing consistent interaction with peripherals such as permanent storage, internet, keyboard, and display.
+
+Inspired by concepts like the "C++ abstract machine" model, this project aims to define a "RetroOS abstract physical computer," which would be a model of a practical computer that could theoretically exist.
+
+A physical computer typically has some number of cores which 
+independently execute code living in a shared RAM. At the level of
+user applications an OS has abstracted away the cores and exposes
+threads/processes that execute concurrently. Memory is mostly 
+isolated from each other and each process can behave as if it's
+alone. The pinnacle of design should be that the kernel itself
+should be easily expressible on top of the abstractions it exposes.
+
+CPU | Kernel
+-|-
+cores | threads/processes
+interrupts/ipc | signals
+paging | process isolation
+hs/ssd | filesystem
+
+
 ### Arch
 
 Arch consist of a few components, namely
@@ -112,3 +140,11 @@ Because libc and libstdc++ depend on the OS they cannot be dependent
 on by the arch and kernel. To facilitate development we have to build
 a library of algorithms and useful functions to be used as building
 blocks.
+
+
+#### Free flowing thoughts
+
+Page table location at end of address space, 
+4 gb mem <-> 1m pages <-> 1024 page tables with 1 page directory
+
+0xFFFFF000 last page in linear address space, should be page dir

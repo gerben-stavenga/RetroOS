@@ -2,26 +2,28 @@ section .text
 [bits 32]
 global _start
 _start:
+    push eax  ; push cursor
+    push edx  ; push address
+    extern SetupPaging
+    call SetupPaging
+    lea eax, [high_address]
+    jmp eax
+high_address:
+    add esp, 4
     extern kmain ; coded in c
-    jmp kmain
+    call kmain
 
 extern isr_handler
-wrapper_without_error_code:
-    push ebp       ; at the place of where the int_no should be
-    mov ebp, esp
-    push eax
-    xor eax, eax
-    xchg eax, [ebp + 4] ; load the int_no from the "error code" location and set the error code to zero
-    xchg [ebp], eax  ; store the int_no in the proper stack location and load the old value of ebp into eax
-    mov ebp, eax
-    pop eax
-wrapper_with_error_code:
+entry_wrapper:
+    ; stack int handler return address , error code , return stackframe
+    ; save remaining registers
     pusha
     push ds
     push es
     push fs
     push gs
 
+    ; set all segments to the kernel value
     mov eax, 0x10
     mov ds, eax
     mov es, eax
@@ -29,7 +31,6 @@ wrapper_with_error_code:
     mov gs, eax
 
     mov ebp, esp
-
     cld
     push ebp
     call isr_handler
@@ -40,25 +41,27 @@ wrapper_with_error_code:
     pop es
     pop ds
     popa
-    add esp, 8
+    add esp, 8  ; skip error code and interrupt number
     iret
 
 align 64
 global int_vector
 int_vector:
 %assign i 0
-%rep 49
+%rep 48
 align 8
-%if i >= 128
-    push (i - 256)
-%else
-    push i
-%endif
 %if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
-    jmp wrapper_with_error_code
+    ; error code is already pushed by CPU
 %else
-    jmp wrapper_without_error_code
+    ; push zero error code to make the stack layout uniform
+    push 0
 %endif
+    call entry_wrapper
 %assign i (i + 1)
 %endrep
 
+global int_0x80
+int_0x80:
+    push 0
+    push int_vector + 0x80 * 8
+    jmp entry_wrapper

@@ -79,6 +79,11 @@ void print_val(CharOut& out, const int& x) {
 }
 
 template <typename CharOut>
+void print_val(CharOut& out, const long unsigned& x) {
+    print_val_s(out, x);
+}
+
+template <typename CharOut>
 void print_val(CharOut& out, const char& c) {
     out.put(c);
 }
@@ -99,6 +104,11 @@ void print_val(CharOut& out, string_view buf) {
     for (size_t i = 0; i < buf.size; i++) {
         out.put(buf[i]);
     }
+}
+
+template <typename CharOut>
+void print_val(CharOut& out, const char* s) {
+    print_val(out, string_view(s));
 }
 
 template <typename CharOut>
@@ -140,6 +150,11 @@ void print(CharOut& out, string_view format, const Head& head, const Tail &... t
     }
     print_val(out, head);
     print(out, format, tail...);
+}
+
+template <typename T, size_t N>
+constexpr size_t array_size(const T (&)[N]) {
+    return N;
 }
 
 #endif //OS_UTILS_H

@@ -17,7 +17,7 @@ include $(ALL_OBJ:.o=.d)
 %.bin: %.asm
 	$(AS) -f bin $< -o $@
 
-%.o: %.cpp
+%.o: %.cpp Makefile
 	$(CC) $(CFLAGS) -c $< -o $@
 
 %.d: %.cpp
@@ -33,7 +33,7 @@ src/arch/x86/bootloader_padded.bin: src/arch/x86/bootloader.bin
 	truncate -s 2560 $@
 
 src/arch/x86/kernel.bin: src/arch/x86/entry.o $(KERNEL_OBJ)
-	i386-elf-ld -Ttext=0x1000 $^ --oformat binary -o $@
+	i386-elf-ld -Ttext=0xFF000000 $^ --oformat binary -o $@
 
 IMAGE_DEPS := src/arch/x86/mbr.bin src/arch/x86/bootloader_padded.bin src/arch/x86/kernel.bin
 image: $(IMAGE_DEPS)
