@@ -19,7 +19,7 @@ start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0x1000
+    mov sp, 0xFFFC
 
     push edx ; save drive
 
