@@ -5,8 +5,8 @@
 #include <stdint.h>
 
 #include "src/freestanding/utils.h"
+#include "x86_inst.h"
 
-constexpr uintptr_t kKernelAddress = 0x1000;
 constexpr int kKernelLBA = 6;
 constexpr int kKernelSize = 20;
 
@@ -25,23 +25,10 @@ struct Regs {
 
 static Regs& regs = *reinterpret_cast<Regs*>(0x7c08);
 
-void printhello() {
-    char hello[] = "hello";
-    uint16_t* video = reinterpret_cast<uint16_t*>(0xb8000);
-    for (int i = 0; hello[i]; i++) {
-        video[i] = hello[i] | 0x700;
-    }
-}
-
-void generate_real_interrupt(int interrupt) {
-    asm volatile(
-            "movl (,%%eax, 4), %%eax\n\t"
-            "lcall *(0x7c2c)\n\t"
-            :"+a"(interrupt):: "edx", "memory", "cc");
-}
+extern "C" void generate_real_interrupt(int interrupt);
 
 __attribute__((noinline)) void hlt() {
-    while (true) asm volatile ("hlt\n\t");
+    while (true) hlt_inst();
 }
 
 struct Out {
@@ -60,13 +47,13 @@ struct Out {
     }
 };
 
-inline int min(int a, int b) { return a < b ? a : b; }
+inline int min(unsigned a, unsigned b) { return a < b ? a : b; }
 
-static bool read_disk(int drive, int lba, int count, void *buffer) {
-    int sectors_per_track;
-    int num_heads;
+__attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count, void *buffer) {
+    unsigned sectors_per_track;
+    unsigned num_heads;
 
-    if (drive & 0x80) {
+    if ((drive & 0x80)) {
         regs.ax = 0x800;
         regs.dx = drive;
         generate_real_interrupt(0x13);
@@ -80,21 +67,18 @@ static bool read_disk(int drive, int lba, int count, void *buffer) {
         sectors_per_track = 18;
         num_heads = 2;
     }
-    Out out;
-    print(out, "Disk params num_heads: {} sectors_per_track: {}\n", num_heads, sectors_per_track);
+    // Out out;
+    // print(out, "Disk params num_heads: {} sectors_per_track: {}\n", num_heads, sectors_per_track);
 
     // Use int 13 to read disk
     auto address = reinterpret_cast<uintptr_t>(buffer);
     while (count > 0) {
-        int sector = lba % sectors_per_track;
-        int head = lba / sectors_per_track;
+        unsigned sector = lba % sectors_per_track;
+        unsigned head = lba / sectors_per_track;
         int cylinder = head / num_heads;
         head = head % num_heads;
 
-        int nsectors = min(count, min(127, sectors_per_track * num_heads - sector));
-
-        Out out;
-        print(out, "sect {} head {} cyl {} nsectors {}\n", sector, head, cylinder, nsectors);
+        unsigned nsectors = min(count, min(127, sectors_per_track * num_heads - sector));
 
         regs.es = address >> 4;
         regs.bx = address & 0xF;
@@ -109,16 +93,32 @@ static bool read_disk(int drive, int lba, int count, void *buffer) {
         lba += nsectors;
         address += 512 * nsectors;
         count -= nsectors;
-    } while (count > 0);
+    }
     return true;
 }
 
-extern "C" void BootLoader(int drive) {
+static bool CheckA20() {
+    volatile uint32_t tmp = 0xDEADBEEF;
+    uint32_t volatile* a20_aliased = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(&tmp) ^ 0x100000);
+    if (tmp != *a20_aliased) return true;
+    tmp = 0xCAFEBABE;
+    return tmp != *a20_aliased;
+}
+
+static void EnableA20() {
+    if (CheckA20()) return;
+    regs.ax = 0x2401;
+    generate_real_interrupt(0x15);
+    // Hang if not
+    while (!CheckA20());
+}
+
+extern "C" int BootLoader(void* buffer, int drive) {
     Out out;
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
-    void* buffer = reinterpret_cast<void*>(kKernelAddress);
+    EnableA20();
+    print(out, "A20 enabled\n");
     print(out, "Loading kernel at {}\n", buffer);
     read_disk(drive, kKernelLBA, kKernelSize, buffer);
-    using KernelMain = void (*)(int cursor);
-    reinterpret_cast<KernelMain>(buffer)(out.GetCursor());
+    return out.GetCursor();
 }

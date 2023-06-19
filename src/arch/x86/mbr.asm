@@ -35,6 +35,7 @@ start:
 
     ; move to pm
     call switch_to_pm
+    pop edx ; restore drive
     jmp CS32:BOOT_LOADER_ADDR
 
 ; dx = drive, es:bx = buffer, ax = num sectors
@@ -72,31 +73,32 @@ endstruc
 
 switch_to_pm:
     cli
-    lgdt [gdt_ptr] ; load the GDT
-    mov dx, DS32 ; set data segment to 0x10
+    lgdt cs:[gdt_ptr] ; load the GDT
     mov eax, cr0 ; get cr0
     or eax, 1 ; set PE bit
     mov cr0, eax ; write cr0
+    mov ax, DS32 ; set data segment to 0x10
     jmp CS16:update_segs
 update_segs:
-    mov ds, dx
-    mov es, dx
-    mov ss, dx
-    mov fs, dx
-    mov gs, dx
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov fs, ax
+    mov gs, ax
     ret
 
 switch_to_rm:  ; execute in 16 bit protected mode
     cli
-    mov dx, REALSEG
     mov eax, cr0 ; get cr0
     and eax, 0xFFFFFFFE ; clear PE bit
     mov cr0, eax ; write cr0
+    mov ax, REALSEG
     jmp REALSEG:update_segs
 
 handler:
     dd 0x0
 x86_16_gen_interrupt:
+    mov eax, [eax * 4]
     mov [handler], eax
 
     call switch_to_rm
@@ -112,15 +114,14 @@ x86_16_gen_interrupt:
     pushf
     call far [cs:handler]
 
-    pushf  ; save flags after interrupt
-    pop WORD [cs:regs + REGS.flags]
     push ds
-    pop WORD [cs:regs + REGS.ds]
-    push es
-    pop WORD [cs:regs + REGS.es]
-
     push 0
     pop ds
+    pop WORD [regs + REGS.ds]
+    pushf  ; save flags after interrupt
+    pop WORD [regs + REGS.flags]
+    push es
+    pop WORD [regs + REGS.es]
 
     call swapregs
 
