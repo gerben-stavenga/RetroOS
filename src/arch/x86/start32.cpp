@@ -10,10 +10,32 @@
 
 #define NOINLINE __attribute__((noinline))
 
+#ifdef NDEBUG
+constexpr bool kDebug = false;
+#else
+constexpr bool kDebug = true;
+#endif
+
+#define kassert(cond) do { if (!(cond) && kDebug) panic("Kernel assert: " #cond " failed at " __FILE__ ":{}.\n", __LINE__); } while(false)
+
 constexpr int kKernelCS = 0x8;
 constexpr int kKernelDS = 0x10;
 constexpr int kUserCS = 0x18;
 constexpr int kUserDS = 0x20;
+
+// Linear memory layout
+// [0, 0x1000) null page (not present)
+// [0x1000, 0xFF000000) user space (mapping dep
+// [0xFF000000, 0xFFB00000) 15 mb kernel space (fixed mapping)
+// [0xFFB00000, 0xFFC00000) 1 mb mapped to physical [0, 1mb)
+// [0xFFC00000, 0x100000000) 4 mb of 1m page tables entries covering the 4gb address space
+// [0xFFFFF000, 0x100000000) page table covering [0xFFC00000, 0x100000000) and simultaneous page dir
+
+constexpr uintptr_t kKernelBase = 0xFF000000;
+constexpr uintptr_t kLowMemBase = 0xFFB00000;
+constexpr uintptr_t kCurPageTab = 0xFFC00000;
+constexpr uintptr_t kCurPageDir = 0xFFFFF000;
+constexpr uintptr_t k = kCurPageTab - 0x60000;
 
 DescriptorEntry gdt[6] = {
         {},
@@ -41,13 +63,13 @@ struct Screen {
     int cursor_x, cursor_y;
 
     void ClearScreen() {
-        uint16_t *video = reinterpret_cast<uint16_t *>(0xB8000);
+        uint16_t *video = reinterpret_cast<uint16_t *>(kLowMemBase + 0xB8000);
         memset(video, 0, 80 * 25 * 2);
         cursor_x = cursor_y = 0;
     }
 
     void put(char c) {
-        uint16_t *video = reinterpret_cast<uint16_t *>(0xB8000);
+        uint16_t *video = reinterpret_cast<uint16_t *>(kLowMemBase + 0xB8000);
         if (c == '\n') {
             cursor_x = 0;
             cursor_y++;
@@ -69,7 +91,7 @@ Screen screen;
 
 template<typename... Args>
 void panic(string_view format, const Args&... args) {
-    screen.ClearScreen();
+    //screen.ClearScreen();
     print(screen, "Kernel panic: ");
     print(screen, format, args...);
     hlt();
@@ -103,7 +125,7 @@ inline void DoIrq(int irq) {
         default:
             break;
     }
-    print(screen, "IRQ: {} time counter {}\n", irq, counter);
+    // print(screen, "IRQ: {} time counter {}\n", irq, counter);
 }
 
 enum Signals : int {
@@ -170,9 +192,7 @@ static void general_protection(Regs* regs) {
     panic("GP {}", regs->err_code);
 }
 
-static void page_fault(Regs* regs) {
-    panic("page fault {}\n", regs->err_code);
-}
+static void page_fault(Regs* regs);
 
 static void IrqHandler(Regs* regs) {
     int irq = regs->int_no - 32;
@@ -283,7 +303,7 @@ NOINLINE static void SetupDescriptorTables() {
     LoadGDT(gdt, sizeof(gdt));
     LoadIDT(idt, sizeof(idt));
 
-    // Reload all segments 
+    // Reload all segments
     asm volatile (
             "mov %0, %%ds\n\t"
             "mov %0, %%es\n\t"
@@ -293,6 +313,11 @@ NOINLINE static void SetupDescriptorTables() {
             "1:\n\t"
             ::"r"(kKernelDS));
 }
+
+constexpr unsigned kPageSize = 4096;
+constexpr unsigned kNumPageEntries = kPageSize / sizeof(uint32_t);
+constexpr int kNumPages = 1 << 20;   // 4GB address space has 1M 4K pages
+constexpr int kNumWords = kNumPages / 32;
 
 struct PageEntry {
     uint32_t present : 1;
@@ -306,26 +331,30 @@ struct PageEntry {
     uint32_t offset : 20;
 } __attribute__((packed));
 
-alignas(4096) PageEntry page_tables[4][1024];
-alignas(4096) PageEntry page_dir[1024];
+template <typename CharOut>
+void print_val(CharOut& out, const PageEntry& e) {
+    print(out, "{{p: {}, r/w: {}, u/s: {}, offset: {}}}", e.present, e.read_write, e.user_super, e.offset);
+}
 
-// Linear memory layout
-// [0, 0x1000) null page (not present)
-// [0x1000, 0xFF000000) user space (mapping dep
-// [0xFF000000, 0xFFC00000) 16 mb kernel space (fixed mapping)
-// [0xFFC00000, 0x100000000) 4 mb of 1m page tables entries covering the 4gb address space
-// [0xFFFFF000, 0x100000000) page table covering [0xFFC00000, 0x100000000) and simultaneous page dir
+struct alignas(kPageSize) PageTable {
+    PageEntry entries[kNumPageEntries];
+};
 
-constexpr uintptr_t kKernelBase = 0xFF000000;
-constexpr uintptr_t kCurPageTab = 0xFFC00000;
-constexpr uintptr_t kCurPageDir = 0xFFFFF000;
+static_assert(sizeof(PageTable) == kPageSize);
+
+PageTable page_tables[5];
+constexpr PageTable* zero_page = page_tables + 4;
 
 inline uintptr_t Cast(const void* p) {
     return reinterpret_cast<uintptr_t>(p);
 }
 
+inline PageEntry* GetCurrentDir() {
+    return reinterpret_cast<PageEntry*>(kCurPageDir);
+}
+
 inline uintptr_t CurrentCR3() {
-    return *reinterpret_cast<uint32_t*>(-4);
+    return *reinterpret_cast<uint32_t*>(-4) & -kPageSize;
 }
 
 inline uintptr_t PhysAddress(const void* p) {
@@ -333,39 +362,195 @@ inline uintptr_t PhysAddress(const void* p) {
     return (reinterpret_cast<const uint32_t*>(0xFFC00000)[linear >> 12] & -4096) + (linear & 4095);
 }
 
-inline constexpr PageEntry MakePageEntry(uintptr_t address) {
-    return PageEntry{1, 1, 1, 0, 0, 0, 0, 0, address >> 12};
+inline constexpr PageEntry MakePageEntry(uintptr_t address, bool present, bool read_write, bool user_super) {
+    return PageEntry{present, read_write, user_super, 0, 0, 0, 0, 0, address >> 12};
 }
 
-extern "C" void SetupPaging(uintptr_t phys_address) {
-    auto ptables = reinterpret_cast<PageEntry (*)[1024]>(Cast(page_tables) - kKernelBase + phys_address);
-    PageEntry* pdir = reinterpret_cast<PageEntry*>(Cast(page_dir) - kKernelBase + phys_address);
+inline void FlushTLB() {
+    LoadPageDir(CurrentCR3());
+}
 
-    // Identity map the lowest 4mb
-    for (unsigned i = 0; i < 1024; i++) {
-        ptables[0][i] = MakePageEntry(i << 12);
-    }
-    // stack is there for now so commented out
-    // ptables[0][0] = PageEntry{};  // make nullptr an exception
-    for (unsigned i = 0; i < 3; i++) {
-        for (unsigned j = 0; j < 1024; j++) {
-            ptables[i + 1][j] = MakePageEntry(((i * 1024 + j) << 12) + phys_address);
+uint32_t available[kNumWords];  // 128KB bit mask
+
+int AllocPhysPage() {
+    for (int i = 0; i < kNumWords; i++) {
+        if (available[i] != -1) {
+            int j = 0;
+            while (available[i] & (1 << j)) j++;
+            available[i] |= 1 << j;
+            return i * 32 + j;
         }
     }
-    pdir[0] = MakePageEntry(Cast(ptables[0]));
-    pdir[0x3FC] = MakePageEntry(Cast(ptables[1]));
-    pdir[0x3FD] = MakePageEntry(Cast(ptables[2]));
-    pdir[0x3FE] = MakePageEntry(Cast(ptables[3]));
-    pdir[0x3FF] = MakePageEntry(Cast(pdir));
+    return -1;
+}
 
-    LoadPageDir(reinterpret_cast<uintptr_t>(pdir));
+void FreePhysPage(unsigned page) {
+    available[page / 32] &= ~(uint32_t{1} << (page & 31));
+}
 
-    // Enable paging and RW
+void MarkUsed(unsigned low, unsigned high) {
+    if (low < (high & -32)) {
+        available[low / 32] |= -(1 << (low & 31));
+        if (high & 31) available[high / 32] |= (1 << (high & 31)) - 1;
+        low = (low + 32) & -32;
+        high &= -32;
+        for (; low < high; low += 32) available[low / 32] = -1;
+    } else {
+        available[low / 32] |= ((1 << (high & 31)) - 1) & -(1 << (low & 31));
+    }
+}
+
+PageEntry* GetPageEntry(int page) {
+    return reinterpret_cast<PageEntry*>(kCurPageTab) + page;
+}
+
+// Add npages to the current address space
+void *AllocPages(int npages) {
+    // First 64kb of linear address space we leave unmapped, for null exception
+    int i;
+    for (i = 16; i < kKernelBase / kPageSize - npages + 1; i++) {
+        if (!GetPageEntry(i)->present) break;
+    }
+    if (i == kKernelBase / kPageSize - npages + 1) return nullptr;
+    void* res = reinterpret_cast<void*>(uintptr_t{i} * kPageSize);
+    for (int j = 0; j < npages; j++, i++) *GetPageEntry(i) = MakePageEntry(PhysAddress(page_tables + 4), 1, 0, 1);
+    return res;
+}
+
+void SwitchPageDir(PageTable* new_dir) {
+    LoadPageDir(PhysAddress(new_dir));
+}
+
+void InitializePageDir(PageTable* page_dir) {
+    auto zp_address = PhysAddress(zero_page);
+    auto kt_address = PhysAddress(page_tables);
+    for (int i = 0; i < kNumPageEntries - 4; i++) page_dir->entries[i] = MakePageEntry(zp_address, 1, 0, 1);
+    for (int i = 0; i < 3; i++) page_dir->entries[i + kNumPageEntries - 4] = MakePageEntry(kt_address + i * kPageSize, 1, 1, 0);
+    page_dir->entries[kNumPageEntries - 1] = MakePageEntry(PhysAddress(page_dir), 1, 1, 0);
+}
+
+PageTable* CreatePageDir() {
+    auto zp_address = PhysAddress(zero_page);
+    for (int i = 0; i < kNumPageEntries - 256; i++) {
+        if (page_tables[2].entries[i].offset == zp_address >> 12) {
+            auto p = reinterpret_cast<PageTable*>((kNumPageEntries - 2) * kNumPageEntries * kPageSize + i * kPageSize);
+            InitializePageDir(p);
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+void DestroyPageDir(const PageTable* p) {
+    auto cr3 = CurrentCR3();
+    auto this_page = PhysAddress(p);
+    if (cr3 != this_page) {
+        LoadPageDir(this_page);
+    } else {
+        cr3 = PhysAddress(page_tables + 3);
+    }
+    for (int i = 16; i < kKernelBase / kPageSize; i++) {
+        if (!GetPageEntry(i)->present) break;
+        int page = GetPageEntry(i)->offset;
+        if (page == PhysAddress(zero_page) / kPageSize) continue;
+        FreePhysPage(page);
+    }
+
+    LoadPageDir(cr3);
+}
+
+extern "C" uint8_t _etext;
+extern "C" uint8_t _edata;
+extern "C" uint8_t _end;
+
+void InitPaging() {
+    for (int i = 0; i < array_size(available); i++) {
+        if (available[i]) {
+            print(screen, "Huh! non zero available {} {}\n", i, reinterpret_cast<void*>(PhysAddress(available + i)));
+            break;
+        }
+    }
+
+    if (!CheckA20()) {
+        // So far we only used < 1MB memory, so nothing is fucked yet as we haven't encountered aliased mem.
+        // We can simply continue by marking all pages at an odd 1MB segment unavailable, this halves the available
+        // memory.
+        print(screen, "A20 disabled! Compensating but losing half the memory");
+        constexpr int kWordsPerMB = (1 << 20) / kPageSize / 32;
+        for (int i = 0; i < kNumWords; i += 2 * kWordsPerMB) {
+            memset(available + i + kWordsPerMB, -1, sizeof(uint32_t) * kWordsPerMB);
+        }
+    }
+
+    MarkUsed(0, 1);  // zero page is used by bios
+
+    // Mark pages where kernel is loaded as used
+    int kKernelPages = (reinterpret_cast<uintptr_t>(&_end) - kKernelBase + kPageSize - 1) / kPageSize;
+    print(screen, "Kernel pages {}\n", kKernelPages);
+    int kernel_low = PhysAddress(reinterpret_cast<void*>(kKernelBase)) / kPageSize;
+    MarkUsed(kernel_low, kernel_low + kKernelPages);
+
+    // Mark extended bios area + UMB used
+    int umb_low = (uintptr_t{*reinterpret_cast<uint16_t*>(kLowMemBase + 0x40e)} << 4) / kPageSize;
+    int umb_high = 0x100000 / kPageSize;
+    MarkUsed(umb_low, umb_high);
+
+    // We are done with the identity mapping, make zero page zero
+    memset(zero_page, 0, kPageSize);
+    // Make page dir as it should be
+    InitializePageDir(page_tables + 3);
+    // Use COW for rest of kernel space
+    for (int i = kNumPages - 3 * kNumPageEntries; i < kNumPages - kNumPageEntries - 256; i++) {
+        *GetPageEntry(i) = MakePageEntry(PhysAddress(zero_page), 1, 0, 0);
+    }
+
+    FlushTLB();
+}
+
+alignas(4096) uint8_t kernel_stack[4096];
+
+// This is a subtle function. The bootloader loads the kernel at some arbitrary physical address with unpaged
+// memory, the kernel is compiled/linked expecting to be loaded at kKernelBase. When enabling paging the page tables
+// can map the linear address at kKernelBase to the physical address where it's loaded, after which the code can
+// execute at the right address. However this code is called before paging is enabled, so we have to be careful because
+// access of globals will be at the wrong physical address. We compensate by passing in `delta` to offset the address
+// of globals to the correct physical address. After paging is enabled we should switch to the right stack and right
+// ip, this must be done in asm and will be handled in entry.asm. This function returns the address of the stack.
+extern "C" void* EnablePaging(uintptr_t delta) {
+    // Zero bss
+    auto bss_start = &_edata + delta;
+    memset(bss_start, 0, &_end - &_edata);
+
+    auto ptables = reinterpret_cast<PageTable*>(Cast(page_tables) + delta);
+
+    // Identity map the lowest 4mb, we use the zero-page to store the mapping as we don't use it yet
+    for (unsigned i = 0; i < 1024; i++) {
+        ptables[4].entries[i] = MakePageEntry(i << 12, 1, 1, 0);
+    }
+
+    // Map 4mb starting at the start of the kernel into kernel mem
+    uintptr_t phys_address = delta + kKernelBase;
+    for (unsigned i = 0; i < 1024; i++) {
+        ptables[0].entries[i] = MakePageEntry(i * kPageSize + phys_address, 1, 1, 0);
+    }
+
+    auto phys_address_id = [](void * p) { return reinterpret_cast<uintptr_t>(p); };
+    ptables[3].entries[0] = MakePageEntry(phys_address_id(ptables + 4), 1, 1, 0);
+    for (int i = 0; i < 4; i++) ptables[3].entries[i + kNumPageEntries - 4] = MakePageEntry(phys_address_id(ptables + i), 1, 1, 0);
+
+    LoadPageDir(phys_address_id(ptables + 3));
+
+    // Enable paging and Write Protect bit
     asm volatile (
         "mov %%cr0, %%eax\n\t"
-        "or $0x80000000, %%eax\n\t"
+        "or $0x80010000, %%eax\n\t"
         "mov %%eax, %%cr0\n\t"
         :::"ax");
+
+    // Map first MB into the end of kernel space.
+    for (int i = 0; i < 256; i++) *GetPageEntry(kLowMemBase / kPageSize + i) = MakePageEntry(i * kPageSize,1,1,0);
+    FlushTLB();
+    return kernel_stack + sizeof(kernel_stack);
 }
 
 extern "C" void isr_handler(Regs* regs) {
@@ -374,29 +559,125 @@ extern "C" void isr_handler(Regs* regs) {
     isr_table.entries[regs->int_no](regs);
 }
 
-NOINLINE static void VerifyA20Enabled() {
-    print(screen, "Verifying A20\n");
-    volatile uint32_t tmp;
-    uint32_t volatile* a20_aliased = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(&tmp) ^ 0x100000);
-    uint32_t cnt = 0;
-    do {
-        tmp = cnt++;
-    } while (tmp == *a20_aliased);
-    print(screen, "A20 enabled\n");
-}
-
 extern "C" void kmain(int pos) {
     screen.cursor_x = pos & 0xFF;
     screen.cursor_y = (pos >> 8) & 0xFF;
 
     auto ip = GetIP();
     print(screen, "Entering main kernel\nStack at {} and ip {} at phys address {}\n", &pos, ip, reinterpret_cast<void*>(PhysAddress(ip)));
+    InitPaging();
 
-    VerifyA20Enabled();
     RemapInterrupts();
     SetupDescriptorTables();
     EnableIRQ();
 
     print(screen, "Boot succeeded\n");
+
+    if (1) {
+        auto p = static_cast<uint32_t *>(AllocPages(3));
+        print(screen, "Got memory: {}\n", p);
+
+        for (int i = 15; i < 20; i += 1) {
+            print(screen, "Page {} loaded {}\n", i, *GetPageEntry(i));
+        }
+
+        print(screen, "Read {}\n", p[0]);
+
+        p[0] = 10;
+
+        print(screen, "Read {}\n", p[0]);
+
+        for (int i = 15; i < 20; i += 1) {
+            print(screen, "Page {} loaded {}\n", i, *GetPageEntry(i));
+        }
+
+        auto newp = CreatePageDir();
+        print(screen, "Got page at {}\n", newp);
+
+        SwitchPageDir(newp);
+
+        for (int i = 15; i < 20; i += 1) {
+            print(screen, "Page {} loaded {}\n", i, *GetPageEntry(i));
+        }
+
+        auto q = static_cast<uint32_t *>(AllocPages(3));
+        print(screen, "Got memory: {}\n", q);
+
+        for (int i = 15; i < 20; i += 1) {
+            print(screen, "Page {} loaded {}\n", i, *GetPageEntry(i));
+        }
+
+        print(screen, "Read {}\n", q[0]);
+
+        q[0] = 20;
+
+        print(screen, "Read {}\n", q[0]);
+
+        for (int i = 15; i < 20; i += 1) {
+            print(screen, "Page {} loaded {}\n", i, *GetPageEntry(i));
+        }
+
+        DestroyPageDir(newp);
+
+        // SwitchPageDir(page_tables + 3);
+
+        print(screen, "Read {}\n", p[0]);
+    }
+
+    // *reinterpret_cast<uint32_t volatile*>(0x10);
     hlt();
+}
+
+static void page_fault(Regs* regs) {
+    constexpr uintptr_t kPresent = 1;
+    constexpr uintptr_t kWrite = 2;
+    constexpr uintptr_t kUser = 4;
+
+    auto error = regs->err_code;
+    auto fault_address = LoadPageFaultAddress();
+    int page_index = fault_address >> 12;
+
+    if (fault_address < kKernelBase) {
+        auto page_entry = *GetPageEntry(page_index);
+        if (!page_entry.present) {
+            // A bug-free kernel will not address memory outside of the allocation of the user
+            kassert(error & kUser);
+            panic("Seg fault, user outside allocation");
+        }
+        kassert(error & kWrite);
+        // Must be write to zero-page
+        int page = AllocPhysPage();
+        if (page == -1) panic("OOM");
+        *GetPageEntry(page_index) = MakePageEntry(uintptr_t {page} * kPageSize, 1, 1, 1);
+        FlushTLB();
+        memset(reinterpret_cast<void*>(fault_address & -kPageSize), 0, kPageSize);
+        FlushTLB();
+        return;
+    }
+    if (error & kUser) {
+        panic("Seg fault, user addresses kernel space");
+    }
+    // The whole kernel mem area is readable by the kernel, so this must be a write
+    kassert(error & kWrite);  // The whole area is always readable (COW)
+
+    // Fault occurred in kernel space by the kernel
+    if (fault_address >= kCurPageTab) {
+        // The whole page_dir is present and readable, due to initialization with zero-page.
+        // Kernel tried to access a non-existing page table
+        int page = AllocPhysPage();
+        if (page == -1) panic("OOM");
+        auto page_dir_entry = (fault_address >> 12) & 1023;
+        GetCurrentDir()[page_dir_entry] = MakePageEntry(uintptr_t {page} * kPageSize, 1, 1, 0);
+        FlushTLB();
+        memset(reinterpret_cast<void*>(fault_address & -kPageSize), 0, kPageSize);
+        FlushTLB();
+        return;
+    }
+    if (fault_address >= kKernelBase + (8 << 20)) {
+        int page = AllocPhysPage();
+        if (page == -1) panic("OOM");
+        *GetPageEntry(page_index) = MakePageEntry(uintptr_t {page} * kPageSize, 1, 1, 0);
+        return;
+    }
+    panic("Failure in kernel address {}\n", reinterpret_cast<void*>(fault_address));
 }

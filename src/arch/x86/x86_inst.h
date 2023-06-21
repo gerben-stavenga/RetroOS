@@ -23,7 +23,7 @@ inline void LoadIDT(void* base, size_t size) {
 // This is the physical address, pointers in the kernel refer
 // to linear address.
 inline void LoadPageDir(uintptr_t page) {
-    asm volatile ("mov %0, %%cr3\n\t"::"r"(page));
+    asm volatile ("mov %0, %%cr3\n\t"::"r"(page):"memory");
 }
 
 inline void outb(uint16_t port, uint8_t data) {
@@ -48,6 +48,12 @@ inline void hlt_inst() {
     asm volatile("hlt\n\t");
 }
 
+inline uintptr_t LoadPageFaultAddress() {
+    uintptr_t address;
+    asm ("mov %%cr2, %0":"=r"(address));
+    return address;
+}
+
 inline const void* GetIP() {
     uintptr_t res;
     asm volatile(
@@ -56,6 +62,14 @@ inline const void* GetIP() {
             "pop %0\n\t"
             : "=r"(res));
     return reinterpret_cast<const void*>(res);
+}
+
+inline bool CheckA20() {
+    volatile uint32_t tmp = 0xDEADBEEF;
+    uint32_t volatile* a20_aliased = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(&tmp) ^ 0x100000);
+    if (tmp != *a20_aliased) return true;
+    tmp = 0xCAFEBABE;
+    return tmp != *a20_aliased;
 }
 
 #endif //OS_X86_INST_H

@@ -8,7 +8,7 @@
 #include "x86_inst.h"
 
 constexpr int kKernelLBA = 6;
-constexpr int kKernelSize = 20;
+constexpr int kKernelSize = 30;
 
 struct Regs {
     uint32_t ax;
@@ -97,14 +97,6 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
     return true;
 }
 
-static bool CheckA20() {
-    volatile uint32_t tmp = 0xDEADBEEF;
-    uint32_t volatile* a20_aliased = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(&tmp) ^ 0x100000);
-    if (tmp != *a20_aliased) return true;
-    tmp = 0xCAFEBABE;
-    return tmp != *a20_aliased;
-}
-
 static void EnableA20() {
     if (CheckA20()) return;
     regs.ax = 0x2401;
@@ -116,6 +108,7 @@ static void EnableA20() {
 extern "C" int BootLoader(void* buffer, int drive) {
     Out out;
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
+    print(out, "Extended BIOS at {}\n", reinterpret_cast<void*>(static_cast<uintptr_t>(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
     EnableA20();
     print(out, "A20 enabled\n");
     print(out, "Loading kernel at {}\n", buffer);

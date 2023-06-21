@@ -2,16 +2,16 @@ section .text
 [bits 32]
 global _start
 _start:
-    push eax  ; push cursor
-    push edx  ; push address
-    extern SetupPaging
-    call SetupPaging
-    lea eax, [high_address]
-    jmp eax
-high_address:
-    add esp, 4
-    extern kmain ; coded in c
-    call kmain
+    call calc_delta
+ret_address:
+    push eax  ; push delta
+    extern EnablePaging
+    call EnablePaging  ; this is a relative call and works despite ip not matching the address of
+    mov esp, eax  ; EnablePaging returns the new kernel stack in eax
+    push ebx  ; pass in cursor position
+    extern kmain
+    lea eax, [kmain]
+    call eax  ; Use absolute address call
 
 extern isr_handler
 entry_wrapper:
@@ -59,3 +59,8 @@ align 8
     call entry_wrapper
 %assign i (i + 1)
 %endrep
+
+calc_delta:
+    mov eax, [esp]
+    sub eax, ret_address
+    ret

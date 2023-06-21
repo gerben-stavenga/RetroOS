@@ -19,7 +19,7 @@ start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0xFFFC
+    mov sp, 0x1000  ; between 0x500 and 0x1000 is conventional mem
 
     push edx ; save drive
 
