@@ -5,11 +5,11 @@ section .text
 global _start
 _start:
     extern BootLoader
-    push edx
+    push edx  ; save the disk drive
     push KERNEL_ADDRESS  ; address to load
     call BootLoader
-    pop edx
-    add esp, 4
+    add esp, 8
+    mov ebx, eax  ; save the cursor position
     jmp KERNEL_ADDRESS
 
 global generate_real_interrupt
