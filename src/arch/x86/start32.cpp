@@ -37,6 +37,10 @@ constexpr uintptr_t kCurPageTab = 0xFFC00000;
 constexpr uintptr_t kCurPageDir = 0xFFFFF000;
 constexpr uintptr_t k = kCurPageTab - 0x60000;
 
+alignas(4096) uint8_t kernel_stack[4096];
+
+TSS task_state_segment(kernel_stack + sizeof(kernel_stack), kKernelDS);
+
 DescriptorEntry gdt[6] = {
         {},
         MakeSegDesc(true, true, 0),  // cs = 0x8
@@ -300,8 +304,11 @@ NOINLINE static void SetupDescriptorTables() {
     // Set int 0x80 syscall
     idt[0x80] = MakeInterruptGate(int_vector + 48, 3);
 
+    // gdt[5] = MakeTSSDescriptor(&task_state_segment);
+
     LoadGDT(gdt, sizeof(gdt));
     LoadIDT(idt, sizeof(idt));
+    //LoadTR(0x28);
 
     // Reload all segments
     asm volatile (
@@ -309,9 +316,9 @@ NOINLINE static void SetupDescriptorTables() {
             "mov %0, %%es\n\t"
             "mov %0, %%fs\n\t"
             "mov %0, %%gs\n\t"
-            "ljmpl $0x8, $1f\n\t"  // use jmp to reload cs
+            "ljmpl %1, $1f\n\t"  // use jmp to reload cs
             "1:\n\t"
-            ::"r"(kKernelDS));
+            ::"r"(kKernelDS), "i"(kKernelCS));
 }
 
 constexpr unsigned kPageSize = 4096;
@@ -506,8 +513,6 @@ void InitPaging() {
 
     FlushTLB();
 }
-
-alignas(4096) uint8_t kernel_stack[4096];
 
 // This is a subtle function. The bootloader loads the kernel at some arbitrary physical address with unpaged
 // memory, the kernel is compiled/linked expecting to be loaded at kKernelBase. When enabling paging the page tables

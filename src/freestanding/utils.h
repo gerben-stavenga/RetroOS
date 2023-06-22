@@ -79,6 +79,11 @@ void print_val(CharOut& out, const int& x) {
 }
 
 template <typename CharOut>
+void print_val(CharOut& out, const unsigned& x) {
+    print_val_s(out, x);
+}
+
+template <typename CharOut>
 void print_val(CharOut& out, const long unsigned& x) {
     print_val_s(out, x);
 }
