@@ -16,13 +16,6 @@ constexpr bool kDebug = false;
 constexpr bool kDebug = true;
 #endif
 
-#define kassert(cond) do { if (!(cond) && kDebug) panic("Kernel assert: " #cond " failed at " __FILE__ ":{}.\n", __LINE__); } while(false)
-
-constexpr int kKernelCS = 0x8;
-constexpr int kKernelDS = 0x10;
-constexpr int kUserCS = 0x18;
-constexpr int kUserDS = 0x20;
-
 // Linear memory layout
 // [0, 0x1000) null page (not present)
 // [0x1000, 0xFF000000) user space (mapping dep
@@ -36,32 +29,6 @@ constexpr uintptr_t kLowMemBase = 0xFFB00000;
 constexpr uintptr_t kCurPageTab = 0xFFC00000;
 constexpr uintptr_t kCurPageDir = 0xFFFFF000;
 constexpr uintptr_t k = kCurPageTab - 0x60000;
-
-alignas(4096) uint8_t kernel_stack[4096];
-
-TSS task_state_segment(kernel_stack + sizeof(kernel_stack), kKernelDS);
-
-DescriptorEntry gdt[6] = {
-        {},
-        MakeSegDesc(true, true, 0),  // cs = 0x8
-        MakeSegDesc(true, false, 0),  // ds = 0x10
-        MakeSegDesc(true, true, 3),  // cs = 0x18
-        MakeSegDesc(true, false, 3),  // ds = 0x20
-        {}, // TSS
-//        {0xFFFF, kernel_access_cs, k16_flags},  // cs = 0x28
-//        {0xFFFF, kernel_access_ds, k16_flags},  // ds = 0x30
-};
-
-constexpr int kIdtEntries = 0x81;
-constexpr int kIsrEntries = 49;
-IdtEntry idt[kIdtEntries];
-
-struct InterruptEntry { uint8_t code[8]; };
-extern "C"  InterruptEntry int_vector[];
-
-NOINLINE static void hlt() {
-    while (true) hlt_inst();
-}
 
 struct Screen {
     int cursor_x, cursor_y;
@@ -93,6 +60,10 @@ struct Screen {
 
 Screen screen;
 
+NOINLINE static void hlt() {
+    while (true) hlt_inst();
+}
+
 template<typename... Args>
 void panic(string_view format, const Args&... args) {
     //screen.ClearScreen();
@@ -100,6 +71,40 @@ void panic(string_view format, const Args&... args) {
     print(screen, format, args...);
     hlt();
 }
+
+void kassert_impl(bool cond, string_view cond_str, string_view file, int line) {
+    if (!cond && kDebug) panic("Kernel assert: Condition \"{}\" failed at {}:{}.\n", cond_str, file, line);
+}
+
+#define kassert(cond) kassert_impl((cond), #cond, __FILE__, __LINE__)
+
+constexpr int kKernelCS = 0x8;
+constexpr int kKernelDS = 0x10;
+constexpr int kUserCS = 0x18;
+constexpr int kUserDS = 0x20;
+constexpr int kTSS = 0x28;
+
+alignas(4096) uint8_t kernel_stack[4096];
+
+TSS task_state_segment(kernel_stack + sizeof(kernel_stack), kKernelDS);
+
+DescriptorEntry gdt[6] = {
+        {},
+        MakeSegDesc(true, true, 0),  // cs = 0x8
+        MakeSegDesc(true, false, 0),  // ds = 0x10
+        MakeSegDesc(true, true, 3),  // cs = 0x18
+        MakeSegDesc(true, false, 3),  // ds = 0x20
+        {}, // TSS
+//        {0xFFFF, kernel_access_cs, k16_flags},  // cs = 0x28
+//        {0xFFFF, kernel_access_ds, k16_flags},  // ds = 0x30
+};
+
+constexpr int kIdtEntries = 0x81;
+constexpr int kIsrEntries = 49;
+IdtEntry idt[kIdtEntries];
+
+struct InterruptEntry { uint8_t code[8]; };
+extern "C"  InterruptEntry int_vector[];
 
 // Matches the stack frame of the entry.asm
 struct Regs {
@@ -304,11 +309,11 @@ NOINLINE static void SetupDescriptorTables() {
     // Set int 0x80 syscall
     idt[0x80] = MakeInterruptGate(int_vector + 48, 3);
 
-    // gdt[5] = MakeTSSDescriptor(&task_state_segment);
+    gdt[5] = MakeTSSDescriptor(&task_state_segment);
 
     LoadGDT(gdt, sizeof(gdt));
     LoadIDT(idt, sizeof(idt));
-    //LoadTR(0x28);
+    LoadTR(kTSS);
 
     // Reload all segments
     asm volatile (
