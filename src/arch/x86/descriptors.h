@@ -24,6 +24,18 @@ struct DescriptorEntry {
 
 static_assert(sizeof(DescriptorEntry) == 8);
 
+struct TSS {
+    constexpr TSS(void* stack, int stack_selector) : esp0(stack), ss0(stack_selector) {}
+    uint32_t _link = 0;
+    void* esp0 = 0;
+    uint32_t ss0 = 0;
+    uint32_t _unused[22] = {};
+    uint16_t _trap = 0;
+    uint16_t _io_map_base = sizeof(TSS);  // it starts at the end of the segment limit, so empty array => no access
+} __attribute__((packed));
+
+static_assert(sizeof(TSS) == 104);
+
 constexpr DescriptorEntry MakeSegDesc(bool is_32bit, bool is_code, int dpl) {
     return DescriptorEntry {
         0xFFFF,  // limit
@@ -43,15 +55,15 @@ constexpr DescriptorEntry MakeSegDesc(bool is_32bit, bool is_code, int dpl) {
     };
 }
 
-constexpr DescriptorEntry MakeTSSDescriptor(void* ptr) {
+constexpr DescriptorEntry MakeTSSDescriptor(TSS* ptr) {
     uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
     return DescriptorEntry {
-            103,  // limit
-            base,
+            sizeof(TSS) - 1,  // limit
+            base & 0xFFFFFF,
             1,  // access
             0,  // busy
             0,  // dc
-            1, // executable
+            1,  // executable
             0,  // special is zero
             0,  // dpl (only kernel can do task switch)
             1,  // present

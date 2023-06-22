@@ -67,8 +67,8 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
         sectors_per_track = 18;
         num_heads = 2;
     }
-    // Out out;
-    // print(out, "Disk params num_heads: {} sectors_per_track: {}\n", num_heads, sectors_per_track);
+    Out out;
+    //print(out, "Disk params num_heads: {} sectors_per_track: {}\n", num_heads, sectors_per_track);
 
     // Use int 13 to read disk
     auto address = reinterpret_cast<uintptr_t>(buffer);
@@ -90,6 +90,7 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
         if ((regs.flags & 1) != 0) {
             return false;
         }
+        //print(out, "Read {} sectors\n", regs.ax & 0xFF);
         lba += nsectors;
         address += 512 * nsectors;
         count -= nsectors;
@@ -112,6 +113,12 @@ extern "C" int BootLoader(void* buffer, int drive) {
     EnableA20();
     print(out, "A20 enabled\n");
     print(out, "Loading kernel at {}\n", buffer);
-    read_disk(drive, kKernelLBA, kKernelSize, buffer);
+    if (!read_disk(drive, kKernelLBA, kKernelSize, buffer)) {
+        print(out, "Loading failed\n", buffer);
+        hlt();
+    }
+    /*for (int i = 13410; i < 13420; i++) {
+        print(out, "{} ", int(static_cast<uint8_t*>(buffer)[i]));
+    }*/
     return out.GetCursor();
 }

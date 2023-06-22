@@ -20,6 +20,10 @@ inline void LoadIDT(void* base, size_t size) {
     asm volatile ("lidt %0\n\t"::"m"(ptr));
 }
 
+inline void LoadTR(int selector) {
+    asm volatile ("ltr %w0\n\t"::"r" (selector));
+}
+
 // This is the physical address, pointers in the kernel refer
 // to linear address.
 inline void LoadPageDir(uintptr_t page) {
