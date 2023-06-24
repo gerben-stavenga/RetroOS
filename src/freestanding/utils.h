@@ -50,7 +50,30 @@ struct string_view {
     const char* p = nullptr;
     size_t size = 0;
 };
+/*
+class OutputStream {
+public:
+    virtual void Push(string_view) = 0;
+};
 
+class BufferedOStream {
+    constexpr BufferedOStream(OutputStream* stream_) : stream(stream_) {}
+
+    void put(char c) {
+        buffer[pos++] = c;
+        if (c == '\n' || pos == kBufferSize) {
+            stream->Push({buffer, pos});
+            pos = 0;
+        }
+    }
+
+private:
+    constexpr static int kBufferSize = 1024;
+    char buffer[kBufferSize] = {};
+    OutputStream* stream;
+    size_t pos = 0;
+};
+*/
 template <typename CharOut>
 void print_val_u(CharOut& out, uint64_t x) {
     char buf[20];
@@ -80,6 +103,11 @@ void print_val(CharOut& out, const int& x) {
 
 template <typename CharOut>
 void print_val(CharOut& out, const unsigned& x) {
+    print_val_s(out, x);
+}
+
+template <typename CharOut>
+void print_val(CharOut& out, const long& x) {
     print_val_s(out, x);
 }
 

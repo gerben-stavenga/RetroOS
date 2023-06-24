@@ -1,20 +1,14 @@
-[org 0x7c00]
-BOOT_LOADER_ADDR EQU 0x7e00
-BOOT_LOADER_SECTORS EQU 5
+KERNEL_ADDRESS EQU 0x1000
 REALSEG EQU 0x0
 CS32 EQU 0x8
 CS16 EQU 0x18
 DS32 EQU 0x10
 
 [bits 16]
-    jmp REALSEG:start  ; make sure cs = 0
-    times 8-($-$$) db 0
-regs:
-    times 9 dd 0    ; 0x8 int regs
-    dd x86_16_gen_interrupt ; 0x2C offset:seg of real mode interrupt
-    dw CS16 ;
-align 4
-start:
+global _start
+_start:
+    jmp REALSEG:next  ; make sure cs = 0
+next:
     xor ax, ax
     mov ds, ax
     mov es, ax
@@ -26,8 +20,21 @@ start:
     mov si, booting_msg
     call print
 
-    mov ax, BOOT_LOADER_SECTORS
-    mov bx, BOOT_LOADER_ADDR
+    ;  // clear BSS
+    extern _edata
+    extern _end
+    lea di, [_edata]
+    mov cx, _end
+    sub cx, di
+    xor ax, ax
+    cld
+    rep stosb
+
+    ;  // load rest of bootloader
+    mov ax, _edata + 511
+    sub ax, _start
+    shr ax, 9  ; (_edata - _start + 511) / 512 number of sectors that must be loaded
+    lea bx, [_start + 512]
     call readdisk
 
     mov si, loaded_msg
@@ -35,8 +42,7 @@ start:
 
     ; move to pm
     call switch_to_pm
-    pop edx ; restore drive
-    jmp CS32:BOOT_LOADER_ADDR
+    jmp CS32:start32
 
 ; dx = drive, es:bx = buffer, ax = num sectors
 readdisk:
@@ -58,20 +64,8 @@ print:
     jnz print_char
     ret
 
-struc REGS
-    .ax resd 1
-    .bx resd 1
-    .cx resd 1
-    .dx resd 1
-    .si resd 1
-    .di resd 1
-    .bp resd 1
-    .flags resd 1
-    .ds resw 1
-    .es resw 1
-endstruc
-
 switch_to_pm:
+    push eax
     cli
     lgdt cs:[gdt_ptr] ; load the GDT
     mov eax, cr0 ; get cr0
@@ -85,9 +79,11 @@ update_segs:
     mov ss, ax
     mov fs, ax
     mov gs, ax
+    pop eax
     ret
 
 switch_to_rm:  ; execute in 16 bit protected mode
+    push eax
     cli
     mov eax, cr0 ; get cr0
     and eax, 0xFFFFFFFE ; clear PE bit
@@ -95,40 +91,63 @@ switch_to_rm:  ; execute in 16 bit protected mode
     mov ax, REALSEG
     jmp REALSEG:update_segs
 
-handler:
-    dd 0x0
+struc REGS
+    .ax resd 1
+    .bx resd 1
+    .cx resd 1
+    .dx resd 1
+    .si resd 1
+    .di resd 1
+    .bp resd 1
+    .flags resd 1
+    .ds resw 1
+    .es resw 1
+endstruc
+    extern regs
 x86_16_gen_interrupt:
-    mov eax, [eax * 4]
-    mov [handler], eax
-
     call switch_to_rm
-
-    call swapregs
 
     push WORD [regs + REGS.es]
     pop es
     push WORD [regs + REGS.ds]
     pop ds
 
-    ; mimic int
-    pushf
-    call far [cs:handler]
+    pushf   ; save flags before call to interrupt handler to mimic int
+    call far [esp + 6]  ; call the interrupt
 
     push ds
-    push 0
+    ; restore ds to 0, so we can use it to access the real mode data
+    push REALSEG
     pop ds
     pop WORD [regs + REGS.ds]
-    pushf  ; save flags after interrupt
-    pop WORD [regs + REGS.flags]
     push es
     pop WORD [regs + REGS.es]
-
-    call swapregs
+    pushf  ; save flags after interrupt
+    pop WORD [regs + REGS.flags]
 
     call switch_to_pm
+    jmp CS32:return
 
-    db 0x66  ; called from 32 bit code, so we need to pop 32 bit return address
-    retf
+[bits 32]
+start32:
+    ; drive already pushed
+    push KERNEL_ADDRESS  ; address to load
+    extern BootLoader
+    call BootLoader
+    add esp, 8
+    mov ebx, eax  ; save the cursor position
+    jmp KERNEL_ADDRESS
+
+global generate_real_interrupt
+generate_real_interrupt:
+    mov eax, [esp + 4]  ; get interrupt number
+    mov eax, [eax * 4]  ; get interrupt address
+    mov [esp + 4], eax  ; replace interrupt number with address
+    call swapregs  ; save registers and load interrupt parameters
+    jmp CS16:x86_16_gen_interrupt
+return:
+    call swapregs  ; store interrupt parameters and restore registers
+    ret
 
 swapregs:
     xchg eax, [regs + REGS.ax]
@@ -139,6 +158,7 @@ swapregs:
     xchg edi, [regs + REGS.di]
     xchg ebp, [regs + REGS.bp]
     ret
+
 
 align 4
 gdt:

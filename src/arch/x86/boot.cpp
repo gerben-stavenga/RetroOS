@@ -7,7 +7,7 @@
 #include "src/freestanding/utils.h"
 #include "x86_inst.h"
 
-constexpr int kKernelLBA = 6;
+constexpr int kKernelLBA = 5;
 constexpr int kKernelSize = 30;
 
 struct Regs {
@@ -21,9 +21,9 @@ struct Regs {
     uint32_t flags;
     uint16_t ds;
     uint16_t es;
-};
+} __attribute__((packed));
 
-static Regs& regs = *reinterpret_cast<Regs*>(0x7c08);
+Regs regs;
 
 extern "C" void generate_real_interrupt(int interrupt);
 
@@ -67,8 +67,6 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
         sectors_per_track = 18;
         num_heads = 2;
     }
-    Out out;
-    //print(out, "Disk params num_heads: {} sectors_per_track: {}\n", num_heads, sectors_per_track);
 
     // Use int 13 to read disk
     auto address = reinterpret_cast<uintptr_t>(buffer);
@@ -90,7 +88,6 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
         if ((regs.flags & 1) != 0) {
             return false;
         }
-        //print(out, "Read {} sectors\n", regs.ax & 0xFF);
         lba += nsectors;
         address += 512 * nsectors;
         count -= nsectors;
@@ -106,19 +103,18 @@ static void EnableA20() {
     while (!CheckA20());
 }
 
+extern char _start[], _edata[], _end[];
 extern "C" int BootLoader(void* buffer, int drive) {
     Out out;
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
+    print(out, "Loader size: {}\n", _edata - _start);
     print(out, "Extended BIOS at {}\n", reinterpret_cast<void*>(static_cast<uintptr_t>(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
     EnableA20();
     print(out, "A20 enabled\n");
-    print(out, "Loading kernel at {}\n", buffer);
+    print(out, "Loading kernel at physical address {}\n", buffer);
     if (!read_disk(drive, kKernelLBA, kKernelSize, buffer)) {
         print(out, "Loading failed\n", buffer);
         hlt();
     }
-    /*for (int i = 13410; i < 13420; i++) {
-        print(out, "{} ", int(static_cast<uint8_t*>(buffer)[i]));
-    }*/
     return out.GetCursor();
 }
