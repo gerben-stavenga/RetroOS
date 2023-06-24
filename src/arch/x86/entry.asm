@@ -2,9 +2,9 @@ section .text
 [bits 32]
 global _start
 _start:
-    call calc_delta
+    call get_physical_address
 ret_address:
-    push eax  ; push delta
+    push eax  ; push physical address
     extern EnablePaging
     call EnablePaging  ; this is a relative call and works despite ip not matching the address of
     mov esp, eax  ; EnablePaging returns the new kernel stack in eax
@@ -30,9 +30,8 @@ entry_wrapper:
     mov fs, eax
     mov gs, eax
 
-    mov ebp, esp
     cld
-    push ebp
+    push esp  ; save esp value as it is before the instruction pointer is pushed
     call isr_handler
     pop ebp
 
@@ -60,7 +59,7 @@ align 8
 %assign i (i + 1)
 %endrep
 
-calc_delta:
-    mov eax, [esp]
-    sub eax, ret_address
+get_physical_address:
+    mov eax, [esp]  ; get physical return address
+    sub eax, ret_address - _start  ; subtract delta to get physical address of _start
     ret

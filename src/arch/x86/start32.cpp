@@ -28,7 +28,6 @@ constexpr uintptr_t kKernelBase = 0xFF000000;
 constexpr uintptr_t kLowMemBase = 0xFFB00000;
 constexpr uintptr_t kCurPageTab = 0xFFC00000;
 constexpr uintptr_t kCurPageDir = 0xFFFFF000;
-constexpr uintptr_t k = kCurPageTab - 0x60000;
 
 struct Screen {
     int cursor_x, cursor_y;
@@ -60,7 +59,7 @@ struct Screen {
 
 Screen screen;
 
-NOINLINE static void hlt() {
+NOINLINE [[noreturn]] static void hlt() {
     while (true) hlt_inst();
 }
 
@@ -120,7 +119,7 @@ static const EntryHandler syscall_table[1] = {};
 
 inline void DoIrq(int irq) {
     static int counter = 0;
-    static uint8_t key_state[16];
+    static uint8_t key_state[16]; (void)key_state;
     switch (irq) {
         case 0:
             if ((counter++) & 0xF) return;
@@ -386,7 +385,7 @@ uint32_t available[kNumWords];  // 128KB bit mask
 
 int AllocPhysPage() {
     for (int i = 0; i < kNumWords; i++) {
-        if (available[i] != -1) {
+        if (available[i] != uint32_t (-1)) {
             int j = 0;
             while (available[i] & (1 << j)) j++;
             available[i] |= 1 << j;
@@ -419,7 +418,7 @@ PageEntry* GetPageEntry(int page) {
 // Add npages to the current address space
 void *AllocPages(int npages) {
     // First 64kb of linear address space we leave unmapped, for null exception
-    int i;
+    unsigned i;
     for (i = 16; i < kKernelBase / kPageSize - npages + 1; i++) {
         if (!GetPageEntry(i)->present) break;
     }
@@ -436,14 +435,14 @@ void SwitchPageDir(PageTable* new_dir) {
 void InitializePageDir(PageTable* page_dir) {
     auto zp_address = PhysAddress(zero_page);
     auto kt_address = PhysAddress(page_tables);
-    for (int i = 0; i < kNumPageEntries - 4; i++) page_dir->entries[i] = MakePageEntry(zp_address, 1, 0, 1);
+    for (unsigned i = 0; i < kNumPageEntries - 4; i++) page_dir->entries[i] = MakePageEntry(zp_address, 1, 0, 1);
     for (int i = 0; i < 3; i++) page_dir->entries[i + kNumPageEntries - 4] = MakePageEntry(kt_address + i * kPageSize, 1, 1, 0);
     page_dir->entries[kNumPageEntries - 1] = MakePageEntry(PhysAddress(page_dir), 1, 1, 0);
 }
 
 PageTable* CreatePageDir() {
     auto zp_address = PhysAddress(zero_page);
-    for (int i = 0; i < kNumPageEntries - 256; i++) {
+    for (unsigned i = 0; i < kNumPageEntries - 256; i++) {
         if (page_tables[2].entries[i].offset == zp_address >> 12) {
             auto p = reinterpret_cast<PageTable*>((kNumPageEntries - 2) * kNumPageEntries * kPageSize + i * kPageSize);
             InitializePageDir(p);
@@ -461,9 +460,9 @@ void DestroyPageDir(const PageTable* p) {
     } else {
         cr3 = PhysAddress(page_tables + 3);
     }
-    for (int i = 16; i < kKernelBase / kPageSize; i++) {
+    for (unsigned i = 16; i < kKernelBase / kPageSize; i++) {
         if (!GetPageEntry(i)->present) break;
-        int page = GetPageEntry(i)->offset;
+        unsigned page = GetPageEntry(i)->offset;
         if (page == PhysAddress(zero_page) / kPageSize) continue;
         FreePhysPage(page);
     }
@@ -471,12 +470,12 @@ void DestroyPageDir(const PageTable* p) {
     LoadPageDir(cr3);
 }
 
-extern "C" uint8_t _etext;
-extern "C" uint8_t _edata;
-extern "C" uint8_t _end;
+extern "C" uint8_t _start[];
+extern "C" uint8_t _edata[];
+extern "C" uint8_t _end[];
 
 void InitPaging() {
-    for (int i = 0; i < array_size(available); i++) {
+    for (unsigned i = 0; i < array_size(available); i++) {
         if (available[i]) {
             print(screen, "Huh! non zero available {} {}\n", i, reinterpret_cast<void*>(PhysAddress(available + i)));
             break;
@@ -497,10 +496,10 @@ void InitPaging() {
     MarkUsed(0, 1);  // zero page is used by bios
 
     // Mark pages where kernel is loaded as used
-    int kKernelPages = (reinterpret_cast<uintptr_t>(&_end) - kKernelBase + kPageSize - 1) / kPageSize;
-    print(screen, "Kernel pages {}\n", kKernelPages);
-    int kernel_low = PhysAddress(reinterpret_cast<void*>(kKernelBase)) / kPageSize;
-    MarkUsed(kernel_low, kernel_low + kKernelPages);
+    int num_kernel_pages = (Cast(_end) - Cast(_start) + kPageSize - 1) / kPageSize;
+    print(screen, "Kernel pages {}\n", num_kernel_pages);
+    int kernel_low = PhysAddress(_start) / kPageSize;
+    MarkUsed(kernel_low, kernel_low + num_kernel_pages);
 
     // Mark extended bios area + UMB used
     int umb_low = (uintptr_t{*reinterpret_cast<uint16_t*>(kLowMemBase + 0x40e)} << 4) / kPageSize;
@@ -512,7 +511,7 @@ void InitPaging() {
     // Make page dir as it should be
     InitializePageDir(page_tables + 3);
     // Use COW for rest of kernel space
-    for (int i = kNumPages - 3 * kNumPageEntries; i < kNumPages - kNumPageEntries - 256; i++) {
+    for (unsigned i = kNumPages - 3 * kNumPageEntries; i < kNumPages - kNumPageEntries - 256; i++) {
         *GetPageEntry(i) = MakePageEntry(PhysAddress(zero_page), 1, 0, 0);
     }
 
@@ -526,29 +525,25 @@ void InitPaging() {
 // access of globals will be at the wrong physical address. We compensate by passing in `delta` to offset the address
 // of globals to the correct physical address. After paging is enabled we should switch to the right stack and right
 // ip, this must be done in asm and will be handled in entry.asm. This function returns the address of the stack.
-extern "C" void* EnablePaging(uintptr_t delta) {
-    // Zero bss
-    auto bss_start = &_edata + delta;
-    memset(bss_start, 0, &_end - &_edata);
+extern "C" void* EnablePaging(uintptr_t phys_address) {
+    if ((phys_address & (kPageSize - 1)) != 0 || reinterpret_cast<uintptr_t>(_start) != kKernelBase) hlt();
+    memset(reinterpret_cast<uint8_t*>(phys_address) + (_edata - _start), 0, _end - _edata);  // Zero bss
 
-    auto ptables = reinterpret_cast<PageTable*>(Cast(page_tables) + delta);
+    auto delta = Cast(page_tables) - Cast(_start);
+    if ((delta & (kPageSize - 1)) != 0) hlt();
+    auto ptables = reinterpret_cast<PageTable*>(phys_address) + (delta / kPageSize);
 
     // Identity map the lowest 4mb, we use the zero-page to store the mapping as we don't use it yet
-    for (unsigned i = 0; i < 1024; i++) {
-        ptables[4].entries[i] = MakePageEntry(i << 12, 1, 1, 0);
-    }
-
     // Map 4mb starting at the start of the kernel into kernel mem
-    uintptr_t phys_address = delta + kKernelBase;
     for (unsigned i = 0; i < 1024; i++) {
+        ptables[4].entries[i] = MakePageEntry(i * kPageSize, 1, 1, 0);
         ptables[0].entries[i] = MakePageEntry(i * kPageSize + phys_address, 1, 1, 0);
     }
 
-    auto phys_address_id = [](void * p) { return reinterpret_cast<uintptr_t>(p); };
-    ptables[3].entries[0] = MakePageEntry(phys_address_id(ptables + 4), 1, 1, 0);
-    for (int i = 0; i < 4; i++) ptables[3].entries[i + kNumPageEntries - 4] = MakePageEntry(phys_address_id(ptables + i), 1, 1, 0);
+    ptables[3].entries[0] = MakePageEntry(Cast(ptables + 4), 1, 1, 0);
+    for (int i = 0; i < 4; i++) ptables[3].entries[i + kNumPageEntries - 4] = MakePageEntry(Cast(ptables + i), 1, 1, 0);
 
-    LoadPageDir(phys_address_id(ptables + 3));
+    LoadPageDir(Cast(ptables + 3));
 
     // Enable paging and Write Protect bit
     asm volatile (
@@ -639,7 +634,7 @@ extern "C" void kmain(int pos) {
 }
 
 static void page_fault(Regs* regs) {
-    constexpr uintptr_t kPresent = 1;
+    constexpr uintptr_t kPresent = 1; (void)kPresent;
     constexpr uintptr_t kWrite = 2;
     constexpr uintptr_t kUser = 4;
 
@@ -658,7 +653,7 @@ static void page_fault(Regs* regs) {
         // Must be write to zero-page
         int page = AllocPhysPage();
         if (page == -1) panic("OOM");
-        *GetPageEntry(page_index) = MakePageEntry(uintptr_t {page} * kPageSize, 1, 1, 1);
+        *GetPageEntry(page_index) = MakePageEntry(uintptr_t(page) * kPageSize, 1, 1, 1);
         FlushTLB();
         memset(reinterpret_cast<void*>(fault_address & -kPageSize), 0, kPageSize);
         FlushTLB();
@@ -677,7 +672,7 @@ static void page_fault(Regs* regs) {
         int page = AllocPhysPage();
         if (page == -1) panic("OOM");
         auto page_dir_entry = (fault_address >> 12) & 1023;
-        GetCurrentDir()[page_dir_entry] = MakePageEntry(uintptr_t {page} * kPageSize, 1, 1, 0);
+        GetCurrentDir()[page_dir_entry] = MakePageEntry(uintptr_t(page) * kPageSize, 1, 1, 0);
         FlushTLB();
         memset(reinterpret_cast<void*>(fault_address & -kPageSize), 0, kPageSize);
         FlushTLB();
@@ -686,7 +681,7 @@ static void page_fault(Regs* regs) {
     if (fault_address >= kKernelBase + (8 << 20)) {
         int page = AllocPhysPage();
         if (page == -1) panic("OOM");
-        *GetPageEntry(page_index) = MakePageEntry(uintptr_t {page} * kPageSize, 1, 1, 0);
+        *GetPageEntry(page_index) = MakePageEntry(uintptr_t(page) * kPageSize, 1, 1, 0);
         return;
     }
     panic("Failure in kernel address {}\n", reinterpret_cast<void*>(fault_address));
