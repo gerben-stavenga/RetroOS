@@ -7,7 +7,6 @@
 #include "src/freestanding/utils.h"
 #include "x86_inst.h"
 
-constexpr int kKernelLBA = 5;
 constexpr int kKernelSize = 30;
 
 struct Regs {
@@ -31,7 +30,13 @@ __attribute__((noinline)) void hlt() {
     while (true) hlt_inst();
 }
 
-struct Out {
+struct Out : public OutputStream {
+    void Push(string_view str) {
+        for (char c : str) {
+            put(c);
+        }
+    }
+
     void put(char c) {
         if (c == '\n') put(13);
         regs.ax = 0xe00 | c;
@@ -111,8 +116,9 @@ extern "C" int BootLoader(void* buffer, int drive) {
     print(out, "Extended BIOS at {}\n", reinterpret_cast<void*>(static_cast<uintptr_t>(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
     EnableA20();
     print(out, "A20 enabled\n");
-    print(out, "Loading kernel at physical address {}\n", buffer);
-    if (!read_disk(drive, kKernelLBA, kKernelSize, buffer)) {
+    unsigned kernel_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
+    print(out, "Loading kernel from lba {} at physical address {}\n", kernel_lba, buffer);
+    if (!read_disk(drive, kernel_lba, kKernelSize, buffer)) {
         print(out, "Loading failed\n", buffer);
         hlt();
     }

@@ -1,7 +1,7 @@
 *.o
+*.a
 *.bin
 *.d
+*.elf
 
 image
-kernel.bin
-boot.bin

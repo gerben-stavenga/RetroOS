@@ -5,6 +5,8 @@
 #ifndef OS_X86_INST_H
 #define OS_X86_INST_H
 
+#include <stddef.h>
+
 struct DescriptorPtr {
     uint16_t limit;
     const void* base;
