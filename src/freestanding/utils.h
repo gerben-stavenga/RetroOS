@@ -8,6 +8,19 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define NOINLINE __attribute__((noinline))
+
+#ifdef NDEBUG
+constexpr bool kDebug = false;
+#else
+constexpr bool kDebug = true;
+#endif
+
+template <typename T, size_t N>
+constexpr size_t array_size(const T (&)[N]) {
+    return N;
+}
+
 inline void memmove(void* dst, const void* src, size_t n) {
     if (reinterpret_cast<uintptr_t>(dst) <= reinterpret_cast<uintptr_t>(src)) {
         for (size_t i = 0; i < n; i++) {
@@ -47,147 +60,116 @@ struct string_view {
     string_view consume(size_t i) { return string_view(p + i, size - i); }
     char operator[](size_t i) { return p[i]; }
 
+    const char* begin() const { return p; }
+    const char* end() const { return p + size; }
+
     const char* p = nullptr;
     size_t size = 0;
 };
-/*
+
 class OutputStream {
 public:
     virtual void Push(string_view) = 0;
 };
 
 class BufferedOStream {
-    constexpr BufferedOStream(OutputStream* stream_) : stream(stream_) {}
+public:
+    ~BufferedOStream() {
+        char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedOStream);
+        if (pos != 0) {
+            stream->Push({buffer, pos});
+        }
+    }
 
     void put(char c) {
+        char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedOStream);
         buffer[pos++] = c;
-        if (c == '\n' || pos == kBufferSize) {
+        if (c == '\n' || pos == buffer_size) {
             stream->Push({buffer, pos});
             pos = 0;
         }
     }
 
+protected:
+    constexpr BufferedOStream(OutputStream* stream_, size_t buffer_size_) : stream(stream_), buffer_size(buffer_size_) {}
+
 private:
-    constexpr static int kBufferSize = 1024;
-    char buffer[kBufferSize] = {};
     OutputStream* stream;
     size_t pos = 0;
+    size_t buffer_size;
 };
-*/
-template <typename CharOut>
-void print_val_u(CharOut& out, uint64_t x) {
-    char buf[20];
-    int n = 0;
-    do {
-        buf[n++] = x % 10;
-        x /= 10;
-    } while (x);
-    for (int i = n - 1; i >= 0; i--) {
-        out.put(buf[i] + '0');
-    }
-}
 
-template <typename CharOut>
-void print_val_s(CharOut& out, int64_t x) {
-    if (x < 0) {
-        out.put('-');
-        x = (~x) + 1;
-    }
-    print_val_u(out, uint64_t (x));
-}
+template<int N>
+class BufferedOStreamN : public BufferedOStream {
+public:
+    constexpr BufferedOStreamN(OutputStream* stream_) : BufferedOStream(stream_, N) {}
+private:
+    char buffer[N];
+};
 
-template <typename CharOut>
-void print_val(CharOut& out, const int& x) {
+template<typename T>
+struct Hex {
+    constexpr Hex(T x_) : x(x_) {}
+    T x;
+};
+
+void print_val_u(BufferedOStream& out, uint64_t x);
+void print_val_s(BufferedOStream& out, int64_t x);
+void print_val_hex(BufferedOStream& out, uint64_t x, int ndigits);
+void print_val_str(BufferedOStream& out, string_view buf);
+
+inline void print_val(BufferedOStream& out, const int& x) {
     print_val_s(out, x);
 }
 
-template <typename CharOut>
-void print_val(CharOut& out, const unsigned& x) {
+inline void print_val(BufferedOStream& out, const unsigned& x) {
     print_val_s(out, x);
 }
 
-template <typename CharOut>
-void print_val(CharOut& out, const long& x) {
+inline void print_val(BufferedOStream& out, const long& x) {
     print_val_s(out, x);
 }
 
-template <typename CharOut>
-void print_val(CharOut& out, const long unsigned& x) {
+inline void print_val(BufferedOStream& out, const long unsigned& x) {
     print_val_s(out, x);
 }
 
-template <typename CharOut>
-void print_val(CharOut& out, const char& c) {
+inline void print_val(BufferedOStream& out, const char& c) {
     out.put(c);
 }
 
-template <typename CharOut>
-void print_val(CharOut& out, const void* p) {
-    out.put('0'); out.put('x');
-    uintptr_t x = reinterpret_cast<uintptr_t>(p);
-    int ndigits = sizeof(uintptr_t) * 2;
-    for (int i = 0; i < ndigits; i++) {
-        int d = (x >> (4 * (ndigits - 1 - i))) & 0xF;
-        out.put(d < 10 ? '0' + d : 'A' + d - 10);
-    }
+inline void print_val(BufferedOStream& out, const void* p) {
+    print_val_hex(out, reinterpret_cast<uintptr_t>(p), sizeof(uintptr_t) * 2);
 }
 
-template <typename CharOut>
-void print_val(CharOut& out, string_view buf) {
-    for (size_t i = 0; i < buf.size; i++) {
-        out.put(buf[i]);
-    }
+inline void print_val(BufferedOStream& out, const string_view& buf) {
+    print_val_str(out, buf);
 }
 
-template <typename CharOut>
-void print_val(CharOut& out, const char* s) {
+inline void print_val(BufferedOStream& out, char const* const& s) {
     print_val(out, string_view(s));
 }
 
-template <typename CharOut>
-string_view print(CharOut& out, string_view format) {
-    int bracket = 0;
-    for (size_t i = 0; i < format.size; i++) {
-        char c = format.p[i];
-        if (bracket == 1) {
-            if (c == '}') {
-                bracket--;
-                return format.consume(i + 1);
-            } else if (c == '{') {
-                bracket = 0;
-            } else {
-                return string_view();
-            }
-        } else if (bracket == -1) {
-            if (c == '}') {
-                bracket = 0;
-            } else {
-                return string_view();
-            }
-        } else if (c == '{') {
-            bracket++;
-            continue;
-        } else if (c == '}') {
-            bracket--;
-            continue;
-        }
-        out.put(c);
-    }
-    return string_view();
+template <typename T>
+void print_val(BufferedOStream& out, const Hex<T>& x) {
+    print_val_hex(out, x.x, sizeof(T) * 2);
 }
 
-template <typename CharOut, typename Head, typename... Tail>
-void print(CharOut& out, string_view format, const Head& head, const Tail &... tail) {
+string_view print_buf(BufferedOStream& out, string_view format);
+
+template <typename Head, typename... Tail>
+void print_buf(BufferedOStream& out, string_view format, const Head& head, const Tail&... tail) {
     if (format.size > 0) {
-        format = print(out, format);
+        format = print_buf(out, format);
     }
     print_val(out, head);
-    print(out, format, tail...);
+    print_buf(out, format, tail...);
 }
 
-template <typename T, size_t N>
-constexpr size_t array_size(const T (&)[N]) {
-    return N;
+template <typename CharOut, typename... Args>
+void print(CharOut& out, string_view format, const Args&... args) {
+    BufferedOStreamN<100> buf(&out);
+    print_buf(buf, format, args...);
 }
 
 #endif //OS_UTILS_H

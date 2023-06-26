@@ -5,6 +5,14 @@
 #ifndef OS_DESCRIPTORS_H
 #define OS_DESCRIPTORS_H
 
+#include <stdint.h>
+
+constexpr int kKernelCS = 0x8;
+constexpr int kKernelDS = 0x10;
+constexpr int kUserCS = 0x18;
+constexpr int kUserDS = 0x20;
+constexpr int kTSS = 0x28;
+
 struct DescriptorEntry {
     uint32_t limit : 16;
     uint32_t base : 24;
@@ -93,5 +101,7 @@ constexpr IdtEntry MakeInterruptGate(void* ptr, uint16_t dpl) {
     auto offset_high = static_cast<uint16_t>(base >> 16);
     return IdtEntry{offset_low, 0x8, 0, 0xE, dpl, 1, offset_high};
 }
+
+void SetupDescriptorTables();
 
 #endif //OS_DESCRIPTORS_H

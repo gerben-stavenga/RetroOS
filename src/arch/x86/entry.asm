@@ -9,8 +9,8 @@ ret_address:
     call EnablePaging  ; this is a relative call and works despite ip not matching the address of
     mov esp, eax  ; EnablePaging returns the new kernel stack in eax
     push ebx  ; pass in cursor position
-    extern kmain
-    lea eax, [kmain]
+    extern KernelInit
+    lea eax, [KernelInit]
     call eax  ; Use absolute address call
 
 extern isr_handler
