@@ -32,8 +32,8 @@ next:
 
     ;  // load rest of bootloader
     mov ax, _edata + 511
-    sub ax, _start
-    shr ax, 9  ; (_edata - _start + 511) / 512 number of sectors that must be loaded
+    sub ax, _start + 512
+    shr ax, 9  ; (_edata - _start - 1) / 512 number of sectors that must be loaded
     lea bx, [_start + 512]
     call readdisk
 
@@ -126,7 +126,7 @@ x86_16_gen_interrupt:
     pop WORD [regs + REGS.flags]
 
     call switch_to_pm
-    jmp CS32:return
+    jmp CS32:swapregs
 
 [bits 32]
 start32:
@@ -135,7 +135,10 @@ start32:
     extern BootLoader
     call BootLoader
     add esp, 8
-    mov ebx, eax  ; save the cursor position
+    extern boot_data
+    mov ebx, [boot_data]
+    mov esi, [boot_data + 4]
+    mov edi, [boot_data + 8]
     jmp KERNEL_ADDRESS
 
 global generate_real_interrupt
@@ -145,10 +148,7 @@ generate_real_interrupt:
     mov [esp + 4], eax  ; replace interrupt number with address
     call swapregs  ; save registers and load interrupt parameters
     jmp CS16:x86_16_gen_interrupt
-return:
-    call swapregs  ; store interrupt parameters and restore registers
-    ret
-
+    ; store interrupt return values and restore registers
 swapregs:
     xchg eax, [regs + REGS.ax]
     xchg ebx, [regs + REGS.bx]

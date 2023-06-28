@@ -2,12 +2,11 @@ section .text
 [bits 32]
 global _start
 _start:
-    call get_physical_address
-ret_address:
-    push eax  ; push physical address
-    extern EnablePaging
-    call EnablePaging  ; this is a relative call and works despite ip not matching the address of
-    mov esp, eax  ; EnablePaging returns the new kernel stack in eax
+    extern PrepareKernel
+    call PrepareKernel
+    mov esp, eax  ; PrepareKernel returns the new kernel stack in eax
+    push edi ; ramdisk size
+    push esi ; ramdisk address
     push ebx  ; pass in cursor position
     extern KernelInit
     lea eax, [KernelInit]
@@ -33,7 +32,7 @@ entry_wrapper:
     cld
     push esp  ; save esp value as it is before the instruction pointer is pushed
     call isr_handler
-    pop ebp
+    mov esp, eax  ; either a pop or a change of stack to a new process
 
     pop gs
     pop fs
@@ -48,18 +47,13 @@ global int_vector
 int_vector:
 %assign i 0
 %rep 49
-align 8
+align 8 ; The code below is either 5 or 7 bytes long, so aligning to 8 bytes makes for a equal spaced array of handlers
 %if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
     ; error code is already pushed by CPU
 %else
     ; push zero error code to make the stack layout uniform
     push 0
 %endif
-    call entry_wrapper
+    call entry_wrapper  ; the interrupt number can be deduced from the return address pushed by the call instruction
 %assign i (i + 1)
 %endrep
-
-get_physical_address:
-    mov eax, [esp]  ; get physical return address
-    sub eax, ret_address - _start  ; subtract delta to get physical address of _start
-    ret

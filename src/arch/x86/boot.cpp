@@ -24,6 +24,14 @@ struct Regs {
 
 Regs regs;
 
+struct BootData {
+    int cursor_pos;
+    void* ramdisk;
+    int ramdisk_size;
+};
+
+BootData boot_data;
+
 extern "C" void generate_real_interrupt(int interrupt);
 
 __attribute__((noinline)) void hlt() {
@@ -100,6 +108,24 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
     return true;
 }
 
+class TarFSReader : public USTARReader {
+public:
+    TarFSReader(int drive, int lba) : drive_(drive), lba_(lba) {}
+
+private:
+    bool ReadBlocks(int n, void *buffer) override {
+        if (!read_disk(drive_, lba_, n, buffer)) return false;
+        lba_ += n;
+        return true;
+    }
+    void SkipBlocks(int n) override {
+        lba_ += n;
+    }
+
+    int drive_;
+    int lba_;
+};
+
 static void EnableA20() {
     if (CheckA20()) return;
     regs.ax = 0x2401;
@@ -109,7 +135,7 @@ static void EnableA20() {
 }
 
 extern char _start[], _edata[], _end[];
-extern "C" int BootLoader(void* buffer, int drive) {
+extern "C" void BootLoader(void* buffer, int drive) {
     Out out;
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
     print(out, "Loader size: {}\n", _edata - _start);
@@ -117,10 +143,28 @@ extern "C" int BootLoader(void* buffer, int drive) {
     EnableA20();
     print(out, "A20 enabled\n");
     unsigned kernel_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
-    print(out, "Loading kernel from lba {} at physical address {}\n", kernel_lba, buffer);
-    if (!read_disk(drive, kernel_lba, kKernelSize, buffer)) {
-        print(out, "Loading failed\n", buffer);
+    TarFSReader tar(drive, kernel_lba);
+    uint8_t* ramdisk = reinterpret_cast<uint8_t*>(0x40000);
+    uint8_t * load_address = ramdisk;
+    size_t size = 0;
+    bool found = false;
+    while ((size = tar.ReadHeader(load_address)) != SIZE_MAX) {
+        string_view filename{reinterpret_cast<char*>(load_address)};
+        print(out, "Loading {} of size {}\n", filename, size);
+        load_address += 512;
+        tar.ReadFile(load_address, size);
+        if (filename == "src/arch/x86/kernel.bin") {
+            print(out, "Loading kernel at physical address {}\n", buffer);
+            memcpy(buffer, load_address, size);
+            found = true;
+        }
+        load_address += (size + 511) & -512;
+    }
+    if (!found) {
+        print(out, "Kernel not found\n");
         hlt();
     }
-    return out.GetCursor();
+    boot_data.cursor_pos = out.GetCursor();
+    boot_data.ramdisk = ramdisk;
+    boot_data.ramdisk_size = load_address - ramdisk;
 }

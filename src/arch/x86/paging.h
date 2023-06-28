@@ -64,7 +64,7 @@ inline uintptr_t CurrentCR3() {
 
 inline uintptr_t PhysAddress(const void* p) {
     uintptr_t linear = reinterpret_cast<uintptr_t>(p);
-    return (reinterpret_cast<const uint32_t*>(0xFFC00000)[linear >> 12] & -4096) + (linear & 4095);
+    return (reinterpret_cast<const uint32_t*>(0xFFC00000)[linear >> 12] & -kPageSize) + (linear & (kPageSize - 1));
 }
 
 inline PageEntry* GetPageEntry(int page) {
@@ -72,10 +72,11 @@ inline PageEntry* GetPageEntry(int page) {
 }
 
 inline constexpr PageEntry MakePageEntry(uintptr_t address, bool present, bool read_write, bool user_super) {
-return PageEntry{present, read_write, user_super, 0, 0, 0, 0, 0, address >> 12};
+    return PageEntry{present, read_write, user_super, 0, 0, 0, 0, 0, address >> 12};
 }
 
-void InitPaging();
+void InitPaging(int kernel_low, int kernel_high, int ramdisk_low, int ramdisk_high);
+void EnablePaging(PageTable* ptables, uintptr_t phys_address);
 
 void* AllocPages(int npages);
 
