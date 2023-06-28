@@ -7,11 +7,49 @@
 #include "entry.h"
 #include "irq.h"
 #include "kassert.h"
+#include "x86_inst.h"
 #include "src/freestanding/utils.h"
+
+constexpr int ENOSYS = -100;
 
 typedef void (*EntryHandler)(Regs*);
 
-static const EntryHandler syscall_table[1] = {};
+// edx
+void MoveToUserMode(Regs* regs) {
+    if (regs->cs != 0x8) {
+        regs->eax = ENOSYS;
+        return;
+    }
+    regs->cs = 0x1B;
+    regs->ds = 0x23;
+    regs->es = 0x23;
+    regs->fs = 0x23;
+    regs->gs = 0x23;
+    regs->ss = 0x23;
+    regs->eip = regs->edx;
+    regs->eax = regs->ebx = regs->ecx = regs->edx = regs->esi = regs->edi = regs->ebp = regs->esp = 0;
+}
+
+void ShowRegs(Regs* regs) {
+    kprint("ShowRegs: @{}:{} stack {}:{}\nkernel stack {} {}\n", Hex(regs->cs), Hex(regs->eip), Hex(regs->ss), Hex(regs->esp), Hex(regs->temp_esp), Hex(regs->edx));
+}
+
+void Write(Regs* regs) {
+    kprint("{}", string_view(reinterpret_cast<char*>(regs->ecx), regs->edx));
+}
+
+static const EntryHandler syscall_table[] = {
+        MoveToUserMode,  // 0
+        ShowRegs,  // 1
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        Write,  // 9
+};
 
 enum Signals : int {
     SIGFPE, SIGTRAP, SIGSEGV, SIGILL, SIGBUS
@@ -74,17 +112,16 @@ static void double_fault(Regs*) {
 }
 
 static void general_protection(Regs* regs) {
-    panic("GP {}", regs->err_code);
+    panic("GP {} {}:{}", regs->err_code, Hex(regs->cs), Hex(regs->eip));
 }
 
-static void page_fault(Regs* regs);
-
-constexpr int ENOSYS = 100;
+void page_fault(Regs* regs);
 
 static void SystemCall(Regs* regs) {
-    kprint("Syscall {}", regs->eax);
+    kprint("SystemCall: {}\n", regs->eax);
+    //hlt();
     if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
-        regs->eax = -ENOSYS;
+        regs->eax = ENOSYS;
         return;
     }
     syscall_table[regs->eax](regs);
@@ -114,8 +151,10 @@ constexpr EntryHandler IsrHandler(int i) {
         case 18 ... 31:
             return unknown_exception_handler;
 
-        case 32 ... 47:  // IRQ0 ... IRQ15
+        case 32 ... 39:  // IRQ0 ... IRQ7
             return IrqHandler;
+        case 40 ... 47:  // IRQ8 ... IRQ15
+            return IrqSlaveHandler;
         case 48:
             return SystemCall;
         default:
@@ -133,8 +172,10 @@ const IsrTable isr_table = MakeTable();
 
 extern "C" uint64_t int_vector[];
 
-extern "C" void isr_handler(Regs* regs) {
-    // Convert pushed return address into interrupt number
+extern "C" void* isr_handler(Regs* regs) {
+    EnableIRQ();
     regs->int_no = (regs->int_no - reinterpret_cast<uintptr_t>(int_vector)) / 8;
     isr_table.entries[regs->int_no](regs);
+    DisableIRQ();
+    return regs;
 }
