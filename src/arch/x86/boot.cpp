@@ -34,7 +34,7 @@ BootData boot_data;
 
 extern "C" void generate_real_interrupt(int interrupt);
 
-__attribute__((noinline)) void hlt() {
+NOINLINE [[noreturn]] void terminate() {
     while (true) hlt_inst();
 }
 
@@ -110,20 +110,16 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
 
 class TarFSReader : public USTARReader {
 public:
-    TarFSReader(int drive, int lba) : drive_(drive), lba_(lba) {}
+    TarFSReader(int drive, int lba) : USTARReader(lba), drive_(drive) {}
 
 private:
     bool ReadBlocks(int n, void *buffer) override {
-        if (!read_disk(drive_, lba_, n, buffer)) return false;
-        lba_ += n;
+        if (!read_disk(drive_, block_, n, buffer)) return false;
+        block_ += n;
         return true;
-    }
-    void SkipBlocks(int n) override {
-        lba_ += n;
     }
 
     int drive_;
-    int lba_;
 };
 
 static void EnableA20() {
@@ -144,17 +140,18 @@ extern "C" void BootLoader(void* buffer, int drive) {
     print(out, "A20 enabled\n");
     unsigned kernel_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
     TarFSReader tar(drive, kernel_lba);
-    uint8_t* ramdisk = reinterpret_cast<uint8_t*>(0x40000);
-    uint8_t * load_address = ramdisk;
+    char* ramdisk = reinterpret_cast<char*>(0x80000);
+    char * load_address = ramdisk;
     size_t size = 0;
     bool found = false;
     while ((size = tar.ReadHeader(load_address)) != SIZE_MAX) {
-        string_view filename{reinterpret_cast<char*>(load_address)};
-        print(out, "Loading {} of size {}\n", filename, size);
+        string_view filename{load_address};
         load_address += 512;
         tar.ReadFile(load_address, size);
         if (filename == "src/arch/x86/kernel.bin") {
-            print(out, "Loading kernel at physical address {}\n", buffer);
+            char md5_out[16];
+            md5(string_view(load_address, size), md5_out);
+            print(out, "Loading {} of size {} with md5 {} at physical address {}\n", filename, size, Hex(string_view(md5_out, 16)), buffer);
             memcpy(buffer, load_address, size);
             found = true;
         }
@@ -162,7 +159,7 @@ extern "C" void BootLoader(void* buffer, int drive) {
     }
     if (!found) {
         print(out, "Kernel not found\n");
-        hlt();
+        terminate();
     }
     boot_data.cursor_pos = out.GetCursor();
     boot_data.ramdisk = ramdisk;

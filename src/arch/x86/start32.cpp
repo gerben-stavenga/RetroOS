@@ -53,13 +53,8 @@ void KernelOutput::Push(string_view str) {
 
 constinit KernelOutput kout;
 
-NOINLINE [[noreturn]] void hlt() {
+NOINLINE [[noreturn]] void terminate() {
     while (true) hlt_inst();
-}
-
-NOINLINE [[noreturn]] void panic_assert(string_view cond_str, string_view file, int line) {
-    kprint("Kernel assert: Condition \"{}\" failed at {}:{}.\n", cond_str, file, line);
-    hlt();
 }
 
 extern PageTable page_tables[];
@@ -76,19 +71,19 @@ extern "C" uint8_t _end[];
 // of globals to the correct physical address. After paging is enabled we should switch to the right stack and right
 // ip, this must be done in asm and will be handled in entry.asm. This function returns the address of the stack.
 extern "C" void* PrepareKernel() {
-    static uint8_t init_stack[1024 * 4];
+    static uint8_t init_stack[1024 * 64];
 
     constexpr uintptr_t kCallOffset = 5;  // 5 bytes for call instruction
     auto phys_address = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0))) - kCallOffset;
 
     if ((phys_address & (kPageSize - 1)) != 0 || reinterpret_cast<uintptr_t>(_start) != kKernelBase) {
         // The loaded kernel must be page aligned, linked at kKernelBase
-        hlt();
+        terminate();
     }
     memset(reinterpret_cast<uint8_t*>(phys_address) + (_edata - _start), 0, _end - _edata);  // Zero bss
 
-    auto delta = Cast(page_tables) - Cast(_start);
-    auto ptables = reinterpret_cast<PageTable*>(phys_address) + (delta / kPageSize);
+    auto delta = AsLinear(page_tables) - AsLinear(_start);
+    auto ptables = reinterpret_cast<PageTable*>(phys_address + delta);
 
     EnablePaging(ptables, phys_address);
 
@@ -98,6 +93,23 @@ extern "C" void* PrepareKernel() {
 void* ramdisk;
 size_t ramdisk_size;
 
+class RamUSTARReader : public USTARReader {
+public:
+    constexpr RamUSTARReader(const char* data, size_t size) : data_(data), size_(size) {}
+
+    bool ReadBlocks(int n, void *buf) override {
+        //kprint("ReadBlocks from {} at block {} n {} to {}\n", (void*)data_, block_, n, buf);
+        if ((block_ + n) * 512 > size_) return false;
+        memcpy(buf, data_ + block_ * 512, n * 512);
+        block_ += n;
+        return true;
+    }
+
+private:
+    const char* data_;
+    size_t size_;
+};
+
 // alignas(alignof(RamUSTARReader)) uint8_t fs[sizeof(RamUSTARReader)];
 constinit RamUSTARReader fs(nullptr, 0);
 
@@ -106,7 +118,7 @@ void InitFS(uintptr_t phys, size_t size) {
     ramdisk_size = size;
 }
 
-size_t Open(const char* path) {
+size_t Open(string_view path) {
     fs = RamUSTARReader(static_cast<const char*>(ramdisk), ramdisk_size);
     return fs.FindFile(path);
 }
@@ -133,12 +145,18 @@ extern "C" void KernelInit(int pos, uintptr_t ramdisk, int ramdisk_size) {
 
     InitFS(ramdisk, ramdisk_size);
 
-    auto size = Open("src/arch/x86/init");
-    auto dst = AllocPages((size + 65536 * 4 + kPageSize - 1) / kPageSize);
+    string_view filename = "src/arch/x86/init.bin";
+    auto size = Open(filename);
+    if (size == SIZE_MAX) {
+        kprint("Failed to load {}\n", filename);
+        terminate();
+    }
+    auto dst = reinterpret_cast<void*>(0x10000);
     ReadFile(dst, size);
+    char md5_out[16];
+    md5(string_view(static_cast<const char*>(dst), size), md5_out);
 
-    kprint("Boot succeeded {} {} {}\n", size, dst, Hex(*reinterpret_cast<uintptr_t*>(dst)));
-
+    kprint("Boot succeeded!\nLoaded {} of size {} with md5 {} at {}\nMoving to userspace\n", filename, size, Hex(string_view(md5_out, 16)), dst);
     // Move to init
     asm volatile(
             "push $0\n\t"  // We make a call from ring 0 which does not push old stack, so we push dummy values

@@ -7,8 +7,8 @@
 
 #include "entry.h"
 
+void WaitKeypress();
 void IrqHandler(Regs* regs);
-void IrqSlaveHandler(Regs* regs);
 void RemapInterrupts();
 
 #endif //OS_IRQ_H
