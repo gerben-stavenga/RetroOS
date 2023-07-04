@@ -68,27 +68,28 @@ inline constexpr size_t strnlen(const char* p, size_t max) {
 
 struct string_view {
     constexpr string_view() = default;
-    constexpr string_view(const char* s) : p(s), size_(strlen(s)) {}
-    template<int N> constexpr string_view(const char s[N]) : p(s), size_(strlen(s)) {}
-    constexpr string_view(const char* s, size_t n) : p(s), size_(n) {}
+    constexpr string_view(const char* s) : string_view(s, strlen(s)) {}
+    template<int N> constexpr string_view(const char s[N]) : string_view(s, N) {}
+    constexpr string_view(const char* s, size_t n) : data_(s), size_(n) {}
 
-    string_view consume(size_t i) { return string_view(p + i, size_ - i); }
-    char operator[](size_t i) { return p[i]; }
+    void remove_prefix(size_t n) { data_ += n; size_ -= n; }
 
-    const char* data() const { return p; }
+    char operator[](size_t i) const { return data_[i]; }
+    const char* data() const { return data_; }
     size_t size() const { return size_; }
-    const char* begin() const { return p; }
-    const char* end() const { return p + size_; }
+    const char* begin() const { return data_; }
+    const char* end() const { return data_ + size_; }
+    string_view substr(size_t start, size_t end) const { return string_view(data_ + start, end - start); }
 
     bool operator==(string_view other) {
         if (size_ != other.size_) return false;
         for (size_t i = 0; i < size_; i++) {
-            if (p[i] != other.p[i]) return false;
+            if (data_[i] != other.data_[i]) return false;
         }
         return true;
     }
 private:
-    const char* p = nullptr;
+    const char* data_ = nullptr;
     size_t size_ = 0;
 };
 
@@ -124,6 +125,86 @@ private:
     size_t buffer_size;
 };
 
+template<typename T>
+struct Hex {
+    constexpr Hex(T x_) : x(x_) {}
+    T x;
+};
+
+void print_char(BufferedOStream& out, uint64_t x, uint64_t);
+void print_val_u(BufferedOStream& out, uint64_t x, uint64_t);
+void print_val_s(BufferedOStream& out, uint64_t x, uint64_t);
+void print_val_hex(BufferedOStream& out, uint64_t x, uint64_t ndigits);
+void print_val_str(BufferedOStream& out, uint64_t data, uint64_t size);
+void print_val_hexbuf(BufferedOStream& out, uint64_t data, uint64_t size);
+
+struct ValuePrinter {
+    uint64_t value;
+    uint64_t extra;
+    void (*print)(BufferedOStream& out, uint64_t value, uint64_t extra);
+};
+
+inline ValuePrinter MakeValuePrinter(const bool* x) {
+    return {static_cast<uint64_t>(*x), 0, print_val_u };
+}
+inline ValuePrinter MakeValuePrinter(const char* x) {
+    return {static_cast<uint64_t>(*x), 0, print_char };
+}
+inline ValuePrinter MakeValuePrinter(const int16_t* x) {
+    return {static_cast<uint64_t>(*x), 0, print_val_s };
+}
+inline ValuePrinter MakeValuePrinter(const uint16_t* x) {
+    return {static_cast<uintptr_t>(*x), 0, print_val_u };
+}
+inline ValuePrinter MakeValuePrinter(const int* x) {
+    return {static_cast<uint64_t>(*x), 0, print_val_s };
+}
+inline ValuePrinter MakeValuePrinter(const uint32_t* x) {
+    return {static_cast<uintptr_t>(*x), 0, print_val_u };
+}
+inline ValuePrinter MakeValuePrinter(const long int* x) {
+    return {static_cast<uint64_t>(*x), 0, print_val_s };
+}
+inline ValuePrinter MakeValuePrinter(const uint64_t* x) {
+    return {static_cast<uintptr_t>(*x), 0, print_val_u };
+}
+
+template <typename T>
+ValuePrinter MakeValuePrinter(const Hex<T>* x) {
+    return {static_cast<uint64_t>(x->x), sizeof(T) * 2, print_val_hex };
+}
+
+template <>
+inline ValuePrinter MakeValuePrinter<string_view>(const Hex<string_view>* x) {
+    return {reinterpret_cast<uintptr_t>(x->x.data()), x->x.size(), print_val_hexbuf };
+}
+
+template <typename T>
+inline ValuePrinter MakeValuePrinter(T const* const* x) {
+    auto tmp = Hex(reinterpret_cast<uintptr_t>(*x));
+    return MakeValuePrinter(&tmp);
+}
+
+inline ValuePrinter MakeValuePrinter(const string_view* x) {
+    return {reinterpret_cast<uintptr_t>(x->data()), x->size(), print_val_str };
+}
+inline ValuePrinter MakeValuePrinter(char const* const* x) {
+    auto tmp = string_view(*x);
+    return MakeValuePrinter(&tmp);
+}
+
+void print_buf(BufferedOStream& out, string_view format, const ValuePrinter* printers, size_t n);
+
+template <typename T, size_t N>
+struct Array {
+    T data[N];
+    constexpr size_t size() const { return N; }
+    constexpr const T& operator[](size_t i) const { return data[i]; }
+    constexpr T& operator[](size_t i) { return data[i]; }
+};
+
+void PrintImpl(OutputStream& out, string_view format, const ValuePrinter* printers, size_t n);
+
 template<int N>
 class BufferedOStreamN : public BufferedOStream {
 public:
@@ -132,101 +213,52 @@ private:
     char buffer[N];
 };
 
-template<typename T>
-struct Hex {
-    constexpr Hex(T x_) : x(x_) {}
-    T x;
-};
-
-void print_val_u(BufferedOStream& out, uint64_t x);
-void print_val_s(BufferedOStream& out, int64_t x);
-void print_val_hex(BufferedOStream& out, uint64_t x, int ndigits);
-void print_val_str(BufferedOStream& out, string_view buf);
-
-inline void print_val(BufferedOStream& out, const int& x) {
-    print_val_s(out, x);
+template <typename... Args>
+void print(OutputStream& out, string_view format, const Args&... args) {
+    constexpr auto n = sizeof...(Args);
+    const ValuePrinter printers[n] = {MakeValuePrinter(&args)...};
+    PrintImpl(out, format, printers, n);
 }
 
-inline void print_val(BufferedOStream& out, const unsigned& x) {
-    print_val_s(out, x);
+template <typename... Args>
+void print(BufferedOStream& out, string_view format, const Args&... args) {
+    constexpr auto n = sizeof...(Args);
+    const ValuePrinter printers[n] = {MakeValuePrinter(&args)...};
+    print_buf(out, format, printers, n);
 }
 
-inline void print_val(BufferedOStream& out, const long& x) {
-    print_val_s(out, x);
-}
+[[noreturn]] void terminate() __attribute__((weak));
 
-inline void print_val(BufferedOStream& out, const long unsigned& x) {
-    print_val_s(out, x);
-}
+[[noreturn]] void panic_assert(OutputStream& out, string_view str, string_view file, int line);
 
-inline void print_val(BufferedOStream& out, const char& c) {
-    out.put(c);
-}
-
-inline void print_val(BufferedOStream& out, const void* p) {
-    print_val_hex(out, reinterpret_cast<uintptr_t>(p), sizeof(uintptr_t) * 2);
-}
-
-inline void print_val(BufferedOStream& out, const string_view& buf) {
-    print_val_str(out, buf);
-}
-
-inline void print_val(BufferedOStream& out, char const* const& s) {
-    print_val(out, string_view(s));
-}
-
-template <typename T>
-void print_val(BufferedOStream& out, const Hex<T>& x) {
-    print_val_hex(out, x.x, sizeof(T) * 2);
-}
-
-string_view print_buf(BufferedOStream& out, string_view format);
-
-template <typename Head, typename... Tail>
-void print_buf(BufferedOStream& out, string_view format, const Head& head, const Tail&... tail) {
-    if (format.size() > 0) {
-        format = print_buf(out, format);
-    }
-    print_val(out, head);
-    print_buf(out, format, tail...);
-}
-
-template <typename CharOut, typename... Args>
-void print(CharOut& out, string_view format, const Args&... args) {
-    BufferedOStreamN<100> buf(&out);
-    print_buf(buf, format, args...);
+inline void AssertImpl(bool cond, OutputStream& out, string_view cond_str, string_view file, int line) {
+    if (kDebug && !cond) panic_assert(out, cond_str, file, line);
 }
 
 class USTARReader {
 public:
+    USTARReader() = default;
+    USTARReader(size_t block) : block_(block) {}
+
     size_t FindFile(string_view filename);
     size_t ReadHeader(void* buf);
     bool ReadFile(void* buf, size_t size);
 
+protected:
+    size_t block_ = 0;
 private:
     virtual bool ReadBlocks(int n, void *buf) = 0;
-    virtual void SkipBlocks(int n) = 0;
+
+    void SkipBlocks(int n) {
+        block_ += n;
+    }
 };
 
-class RamUSTARReader : public USTARReader {
-public:
-    constexpr RamUSTARReader(const char* data, size_t size) : data_(data), size_(size) {}
+void md5(string_view buf, char out[16]);
 
-    bool ReadBlocks(int n, void *buf) override {
-        if (pos_ + n * 512 > size_) return false;
-        memcpy(buf, data_ + pos_, n * 512);
-        pos_ += n * 512;
-        return true;
-    }
-
-    void SkipBlocks(int n) override {
-        pos_ += n * 512;
-    }
-
-private:
-    const char* data_;
-    size_t size_;
-    size_t pos_ = 0;
-};
+inline uint32_t LoadLE32(const void* p) {
+    auto up = static_cast<uint8_t const*>(p);
+    return uint32_t(up[0]) | uint32_t(up[1]) << 8 | uint32_t(up[2]) << 16 | uint32_t(up[3]) << 24;
+}
 
 #endif //OS_UTILS_H
