@@ -4,11 +4,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "boot.h"
 #include "src/freestanding/utils.h"
 #include "descriptors.h"
 #include "irq.h"
 #include "kassert.h"
 #include "paging.h"
+#include "thread.h"
 #include "x86_inst.h"
 
 struct Screen {
@@ -53,7 +55,7 @@ void KernelOutput::Push(string_view str) {
 
 constinit KernelOutput kout;
 
-NOINLINE [[noreturn]] void terminate() {
+NOINLINE [[noreturn]] void terminate(int) {
     while (true) hlt_inst();
 }
 
@@ -63,6 +65,11 @@ extern "C" uint8_t _start[];
 extern "C" uint8_t _edata[];
 extern "C" uint8_t _end[];
 
+// Make sure it's not in bss, so it's not zeroed.
+BootData boot_data = {nullptr, nullptr, 0, 1, 0,{}};
+
+extern uint8_t kernel_stack[4096 * 16];
+
 // This is a subtle function. The bootloader loads the kernel at some arbitrary physical address with unpaged
 // memory, the kernel is compiled/linked expecting to be loaded at kKernelBase. When enabling paging the page tables
 // can map the linear address at kKernelBase to the physical address where it's loaded, after which the code can
@@ -70,24 +77,24 @@ extern "C" uint8_t _end[];
 // access of globals will be at the wrong physical address. We compensate by passing in `delta` to offset the address
 // of globals to the correct physical address. After paging is enabled we should switch to the right stack and right
 // ip, this must be done in asm and will be handled in entry.asm. This function returns the address of the stack.
-extern "C" void* PrepareKernel() {
-    static uint8_t init_stack[1024 * 64];
-
-    constexpr uintptr_t kCallOffset = 5;  // 5 bytes for call instruction
-    auto phys_address = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0))) - kCallOffset;
-
+extern "C" void* PrepareKernel(const BootData* boot_data_ptr) {
+    auto phys_address = reinterpret_cast<uintptr_t>(boot_data_ptr->kernel);
     if ((phys_address & (kPageSize - 1)) != 0 || reinterpret_cast<uintptr_t>(_start) != kKernelBase) {
         // The loaded kernel must be page aligned, linked at kKernelBase
-        terminate();
+        terminate(-1);
     }
-    memset(reinterpret_cast<uint8_t*>(phys_address) + (_edata - _start), 0, _end - _edata);  // Zero bss
 
-    auto delta = AsLinear(page_tables) - AsLinear(_start);
-    auto ptables = reinterpret_cast<PageTable*>(phys_address + delta);
+    auto delta = phys_address - AsLinear(_start);
+    auto adjust = [delta](auto* ptr) { return reinterpret_cast<decltype(ptr)>(reinterpret_cast<uintptr_t>(ptr) + delta); };
 
+    *adjust(&boot_data) = *boot_data_ptr;  // Copy boot data to the right address
+
+    memset(adjust(_edata), 0, _end - _edata);  // Zero bss
+
+    auto ptables = adjust(page_tables);
     EnablePaging(ptables, phys_address);
 
-    return init_stack + sizeof(init_stack);
+    return kernel_stack + sizeof(kernel_stack);
 }
 
 void* ramdisk;
@@ -127,12 +134,15 @@ void ReadFile(void* dst, size_t size) {
     fs.ReadFile(dst, size);
 }
 
-extern "C" void KernelInit(int pos, uintptr_t ramdisk, int ramdisk_size) {
-    screen.cursor_x = pos & 0xFF;
-    screen.cursor_y = (pos >> 8) & 0xFF;
+extern "C" void KernelInit() {
+    screen.cursor_x = boot_data.cursor_pos & 0xFF;
+    screen.cursor_y = (boot_data.cursor_pos >> 8) & 0xFF;
+
+    uintptr_t ramdisk = PhysAddress(boot_data.ramdisk);
+    size_t ramdisk_size = boot_data.ramdisk_size;
 
     auto ip = GetIP();
-    kprint("Entering main kernel\nStack at {} and ip {} at phys address {}\n", &pos, ip, reinterpret_cast<void*>(PhysAddress(ip)));
+    kprint("Entering main kernel\nStack at {} and ip {} at phys address {}\n", &boot_data, ip, Hex(PhysAddress(ip)));
 
     int kernel_low = PhysAddress(_start) / kPageSize;
     int kernel_high = (PhysAddress(_end) + kPageSize - 1) / kPageSize;
@@ -143,23 +153,30 @@ extern "C" void KernelInit(int pos, uintptr_t ramdisk, int ramdisk_size) {
     RemapInterrupts();
     EnableIRQ();
 
+
     InitFS(ramdisk, ramdisk_size);
 
     string_view filename = "src/arch/x86/init.bin";
     auto size = Open(filename);
     if (size == SIZE_MAX) {
         kprint("Failed to load {}\n", filename);
-        terminate();
+        terminate(-1);
     }
     auto dst = reinterpret_cast<void*>(0x10000);
     ReadFile(dst, size);
     char md5_out[16];
     md5(string_view(static_cast<const char*>(dst), size), md5_out);
+    auto init_stack = reinterpret_cast<uintptr_t>(kKernelBase);
 
     kprint("Boot succeeded!\nLoaded {} of size {} with md5 {} at {}\nMoving to userspace\n", filename, size, Hex(string_view(md5_out, 16)), dst);
+
+    current_thread = CreateThread(nullptr, kernel_page_dir, true);
+    current_thread->state = ThreadState::THREAD_RUNNING;
+
+    WaitKeypress();
     // Move to init
     asm volatile(
             "push $0\n\t"  // We make a call from ring 0 which does not push old stack, so we push dummy values
             "push $0\n\t"
-            "int $0x80\n\t"::"a" (0), "d" (dst));
+            "int $0x80\n\t"::"a" (0), "d" (dst), "c" (init_stack));
 }

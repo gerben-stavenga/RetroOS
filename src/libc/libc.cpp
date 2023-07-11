@@ -13,7 +13,7 @@ uintptr_t SysCall(uintptr_t num, uintptr_t arg0, uintptr_t arg1, uintptr_t arg2,
 }
 
 void Exit(int code) {
-    SysCall(1, code, 0, 0, 0, 0);
+    SysCall(0, code, 0, 0, 0, 0);
 }
 
 void* Alloc(size_t size) {

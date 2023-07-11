@@ -14,8 +14,6 @@ public:
 
 extern KernelOutput kout;
 
-NOINLINE [[noreturn]] void terminate();
-
 template <typename... Args>
 void kprint(string_view fmt, Args... args) {
     print(kout, fmt, args...);
@@ -25,7 +23,7 @@ template<typename... Args>
 void panic(string_view format, const Args&... args) {
     kprint("Kernel panic: ");
     kprint(format, args...);
-    terminate();
+    terminate(-1);
 }
 
 #define kassert(cond) AssertImpl((cond), kout, #cond, __FILE__, __LINE__)

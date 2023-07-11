@@ -1,4 +1,3 @@
-KERNEL_ADDRESS EQU 0x1000
 REALSEG EQU 0x0
 CS32 EQU 0x8
 CS16 EQU 0x18
@@ -23,7 +22,7 @@ next:
     ;  // clear BSS
     extern _edata
     extern _end
-    lea di, [_edata]
+    mov di, _edata
     mov cx, _end
     sub cx, di
     xor ax, ax
@@ -32,9 +31,9 @@ next:
 
     ;  // load rest of bootloader
     mov ax, _edata + 511
-    sub ax, _start + 512
+    mov bx, _start + 512
+    sub ax, bx
     shr ax, 9  ; (_edata - _start - 1) / 512 number of sectors that must be loaded
-    lea bx, [_start + 512]
     call readdisk
 
     mov si, loaded_msg
@@ -131,15 +130,11 @@ x86_16_gen_interrupt:
 [bits 32]
 start32:
     ; drive already pushed
-    push KERNEL_ADDRESS  ; address to load
     extern BootLoader
     call BootLoader
-    add esp, 8
-    extern boot_data
-    mov ebx, [boot_data]
-    mov esi, [boot_data + 4]
-    mov edi, [boot_data + 8]
-    jmp KERNEL_ADDRESS
+    add esp, 4  ; remove drive from stack
+    mov edi, eax
+    jmp DWORD [edi]  ; boot_data.kernel
 
 global generate_real_interrupt
 generate_real_interrupt:

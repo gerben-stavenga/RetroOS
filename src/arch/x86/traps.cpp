@@ -7,6 +7,8 @@
 #include "entry.h"
 #include "irq.h"
 #include "kassert.h"
+#include "paging.h"
+#include "thread.h"
 #include "x86_inst.h"
 #include "src/freestanding/utils.h"
 
@@ -14,33 +16,11 @@ constexpr int ENOSYS = -100;
 
 typedef void (*EntryHandler)(Regs*);
 
-// edx
-void SysExit(Regs* regs) {
-    if (regs->cs == 0x8) {
-        // It's called from kernel mode, which is a special case meant to switch to the init task.
-        regs->cs = 0x1B;
-        regs->ds = 0x23;
-        regs->es = 0x23;
-        regs->fs = 0x23;
-        regs->gs = 0x23;
-        regs->ss = 0x23;
-        regs->eip = regs->edx;
-        regs->eax = regs->ebx = regs->ecx = regs->edx = regs->esi = regs->edi = regs->ebp = regs->esp = 0;
-    } else {
-        // From userspace this is a normal exit.
-        // TODO: free resources (file descriptors, memory, etc.)
-        // Switch to the init task.
-        //
-        return;
-    }
-}
-
 void ShowRegs(Regs* regs) {
-    kprint("ShowRegs: @{}:{} stack {}:{}\nkernel stack {} {}\n", Hex(regs->cs), Hex(regs->eip), Hex(regs->ss), Hex(regs->esp), Hex(regs->temp_esp), Hex(regs->edx));
+    kprint("ShowRegs: @{}:{} stack {}:{}\nkernel stack @{} ecx: {} edx: {}\n", Hex(regs->cs), Hex(regs->eip), Hex(regs->ss), Hex(regs->esp), Hex(regs->temp_esp), Hex(regs->ecx), Hex(regs->edx));
 }
 
 void Write(Regs* regs) {
-    ShowRegs(regs);
     kprint("{}", string_view(reinterpret_cast<char*>(regs->ecx), regs->edx));
 }
 
@@ -49,7 +29,7 @@ static const EntryHandler syscall_table[] = {
         ShowRegs,  // 1
         nullptr,
         nullptr,
-        nullptr,
+        SysFork,
         nullptr,
         nullptr,
         nullptr,
