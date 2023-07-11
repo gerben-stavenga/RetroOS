@@ -4,9 +4,165 @@
 
 #include "utils.h"
 
+extern "C" {
+
+void *memcpy(void *dst, const void *src, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        static_cast<char *>(dst)[i] = static_cast<const char *>(src)[i];
+    }
+    return dst;
+    //return __builtin_memcpy(dst, src, n);
+}
+
+void *memset(void *dst, int value, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        static_cast<char *>(dst)[i] = value;
+    }
+    return dst;
+    //return __builtin_memset(dst, value, n);
+}
+
+void *memmove(void *dst, const void *src, size_t n) {
+    auto d = static_cast<char *>(dst);
+    auto s = static_cast<const char *>(src);
+    if (reinterpret_cast<uintptr_t>(dst) < reinterpret_cast<uintptr_t>(src)) {
+        while (n--) {
+            *d++ = *s++;
+        }
+    } else {
+        d += n;
+        s += n;
+        while (n--) {
+            *--d = *--s;
+        }
+    }
+    return dst;
+}
+
+void *memchr(const void *ptr, int value, size_t n) {
+    auto p = static_cast<const char *>(ptr);
+    while (n--) {
+        if (*p == value) {
+            return const_cast<char *>(p);
+        }
+        p++;
+    }
+    return nullptr;
+}
+
+int memcmp(const void *lhs, const void *rhs, size_t n) {
+    auto l = static_cast<const char *>(lhs);
+    auto r = static_cast<const char *>(rhs);
+    while (n--) {
+        if (*l != *r) {
+            return *l - *r;
+        }
+        l++;
+        r++;
+    }
+    return 0;
+}
+
+size_t strlen(const char *str) {
+    size_t i = 0;
+    while (str[i]) i++;
+    return i;
+}
+
+size_t strnlen(const char *str, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (str[i] == 0) return i;
+    }
+    return n;
+}
+
+const char *strchr(const char *str, int c) {
+    for (size_t i = 0; str[i]; i++) {
+        if (str[i] == c) {
+            return str + i;
+        }
+    }
+    return nullptr;
+}
+
+const char *strrchr(const char *str, int c) {
+    const char *last = nullptr;
+    for (size_t i = 0; str[i]; i++) {
+        if (str[i] == c) {
+            last = str + i;
+        }
+    }
+    return last;
+}
+
+int strcmp(const char *lhs, const char *rhs) {
+    auto l = reinterpret_cast<const uint8_t *>(lhs);
+    auto r = reinterpret_cast<const uint8_t *>(rhs);
+    while (*l && *l == *r) {
+        l++;
+        r++;
+    }
+    return *l - *r;
+}
+
+int strncmp(const char *lhs, const char *rhs, size_t n) {
+    auto l = reinterpret_cast<const uint8_t *>(lhs);
+    auto r = reinterpret_cast<const uint8_t *>(rhs);
+    while (n-- && *l && *l == *r) {
+        l++;
+        r++;
+    }
+    return n ? *l - *r : 0;
+}
+
+char *strcpy(char *dst, const char *src) {
+    auto d = dst;
+    do {
+        *d++ = *src;
+    } while (*src++);
+    return dst;
+}
+
+char *strncpy(char *dst, const char *src, size_t n) {
+    auto d = dst;
+    while (n--) {
+        *d++ = *src;
+        if (*src) {
+            src++;
+        }
+    }
+    return dst;
+}
+
+char *strcat(char *dst, const char *src) {
+    strcpy(dst + strlen(dst), src);
+    return dst;
+}
+
+char *strncat(char *dst, const char *src, size_t n) {
+    strncpy(dst + strlen(dst), src, n);
+    return dst;
+}
+
+const char* strstr(const char *haystack, const char *needle) {
+    size_t len = 0;
+    while (needle[len]) {
+        if (haystack[len] == needle[len]) {
+            len++;
+        } else {
+            if (!haystack[len]) return nullptr;
+            len = 0;
+            haystack++;
+        }
+    }
+    return haystack;
+}
+
+}  // extern "C"
+
 void panic_assert(OutputStream& out, string_view cond_str, string_view file, int line) {
     print(out, "Kernel assert: Condition \"{}\" failed at {}:{}.\n", cond_str, file, line);
-    terminate();
+    terminate(-1);
 }
 
 NOINLINE void PrintImpl(OutputStream& out, string_view format, const ValuePrinter* printers, size_t n) {
@@ -26,11 +182,8 @@ NOINLINE void print_buf(BufferedOStream& out, string_view format, const ValuePri
                 while (j < format.size() && format[j] != '}') {
                     j++;
                 }
-                if (j == format.size()) {
-                    terminate();
-                }
-                if (k >= n) {
-                    terminate();
+                if (j == format.size() || k >= n) {
+                    goto error;
                 }
                 printers[k].print(out, printers[k].value, printers[k].extra);
                 k++;
@@ -41,54 +194,68 @@ NOINLINE void print_buf(BufferedOStream& out, string_view format, const ValuePri
         }
     }
     if (k < n) {
-        terminate();
+        error:
+        print(out, "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
+        terminate(-1);
     }
 }
 
-NOINLINE void print_char(BufferedOStream& out, uint64_t x, uint64_t) {
+NOINLINE void print_char(BufferedOStream& out, uintptr_t x, uintptr_t) {
     out.put(x);
 }
 
-NOINLINE void print_val_u(BufferedOStream& out, uint64_t x, uint64_t) {
+NOINLINE void print_val_u(BufferedOStream& out, uintptr_t x, uintptr_t y) {
+    auto z = uint64_t(x) | (uint64_t(y) << 32);
     char buf[20];
     int n = 0;
     do {
-        buf[n++] = x % 10;
-        x /= 10;
-    } while (x);
+        buf[n++] = z % 10;
+        z /= 10;
+    } while (z);
     for (int i = n - 1; i >= 0; i--) {
         out.put(buf[i] + '0');
     }
 }
 
-void print_val_s(BufferedOStream& out, uint64_t x, uint64_t) {
-    if (int64_t(x) < 0) {
+void print_val_s(BufferedOStream& out, uintptr_t x, uintptr_t y) {
+    auto z = uint64_t(x) | (uint64_t(y) << 32);
+    if (int64_t(z) < 0) {
         out.put('-');
-        x = (~x) + 1;
+        z = (~z) + 1;
     }
-    print_val_u(out, uint64_t (x), 0);
+    print_val_u(out, z, z >> 32);
 }
 
 inline char HexDigit(int x) {
     return x < 10 ? '0' + x : 'a' + x - 10;
 }
 
-void print_val_hex(BufferedOStream& out, uint64_t x, uint64_t ndigits) {
-    out.put('0'); out.put('x');
+NOINLINE static void print_hex(BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
     for (int i = ndigits - 1; i >= 0; i--) {
         int digit = (x >> (i * 4)) & 0xf;
         out.put(HexDigit(digit));
     }
 }
 
-void print_val_str(BufferedOStream& out, uint64_t data, uint64_t size) {
+void print_val_hex(BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
+    out.put('0'); out.put('x');
+    print_hex(out, x, ndigits);
+}
+
+void print_val_hex64(BufferedOStream& out, uintptr_t x, uintptr_t y) {
+    out.put('0'); out.put('x');
+    print_hex(out, y, sizeof(uintptr_t) * 2);
+    print_hex(out, x, sizeof(uintptr_t) * 2);
+}
+
+void print_val_str(BufferedOStream& out, uintptr_t data, uintptr_t size) {
     string_view str(reinterpret_cast<const char*>(data), size);
     for (size_t i = 0; i < str.size(); i++) {
         out.put(str[i]);
     }
 }
 
-void print_val_hexbuf(BufferedOStream& out, uint64_t data, uint64_t size) {
+void print_val_hexbuf(BufferedOStream& out, uintptr_t data, uintptr_t size) {
     string_view str(reinterpret_cast<const char*>(data), size);
     for (size_t i = 0; i < str.size(); i++) {
         out.put(HexDigit(uint8_t(str[i]) >> 4));
@@ -107,13 +274,13 @@ struct USTARRawHeader {
     char typeflag[1];
     char link_target[100];
     char magic[6];
-    char version[2];
-    char username[32];
-    char groupname[32];
-    char devmajor[8];
-    char devminor[8];
+    char _version[2];
+    char _username[32];
+    char _groupname[32];
+    char _devmajor[8];
+    char _devminor[8];
     char prefix[155];
-    char pad[12];
+    char _pad[12];
 };
 
 static_assert(sizeof(USTARRawHeader) == 512);
@@ -220,7 +387,7 @@ inline uint32_t LeftRotate(uint32_t x, uint32_t c) {
 
 // All variables are unsigned 32 bit and wrap modulo 2^32 when calculating
 static void ChunkMD5(const char* chunk, uint32_t md5_hash[4]) {
-    static const uint32_t kShifts[4][4] = {
+    static const uint8_t kShifts[4][4] = {
             7, 12, 17, 22,
             5, 9, 14, 20,
             4, 11, 16, 23,
@@ -253,31 +420,23 @@ static void ChunkMD5(const char* chunk, uint32_t md5_hash[4]) {
 
     uint32_t block_data[16];
     memcpy(block_data, chunk, 64);
-    for (int group = 0; group < 4; group++) {
-        static const int base[4] = {0, 1, 5, 0};
-        static const int stride[4] = {1, 5, 3, 7};
-        for (int j = 0, g = base[group]; j < 16; j++, g += stride[group]) {
-            auto func = [group](uint32_t x, uint32_t y, uint32_t z) {
-                switch (group) {
-                    case 0:
-                        return (x & y) | ((~x) & z);
-                    case 1:
-                        return (x & z) | (y & (~z));
-                    case 2:
-                        return x ^ y ^ z;
-                    case 3:
-                        return y ^ (x | (~z));
-                    default:
-                        __builtin_unreachable();
-                }
-            };
-            uint32_t F = A + func(B, C, D) + kConsts[group][j] + block_data[g & 0xf];
+
+    auto hash_group = [&A, &B, &C, &D, block_data](int group, auto func) {
+        constexpr uint8_t base[4] = {0, 1, 5, 0};
+        constexpr uint8_t stride[4] = {1, 5, 3, 7};
+        for (int i = 0, g = base[group]; i < 16; i++, g += stride[group]) {
+            uint32_t F = A + func(B, C, D) + kConsts[group][i] + block_data[g & 0xf];
             A = D;
             D = C;
             C = B;
-            B = B + LeftRotate(F, kShifts[group][j & 3]);
+            B = B + LeftRotate(F, kShifts[group][i & 3]);
         }
-    }
+    };
+
+    hash_group(0, [](uint32_t x, uint32_t y, uint32_t z) { return (x & y) | ((~x) & z); });
+    hash_group(1, [](uint32_t x, uint32_t y, uint32_t z) { return (x & z) | (y & (~z)); });
+    hash_group(2, [](uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z; });
+    hash_group(3, [](uint32_t x, uint32_t y, uint32_t z) { return y ^ (x | (~z)); });
 
     md5_hash[0] += A;
     md5_hash[1] += B;
@@ -287,21 +446,18 @@ static void ChunkMD5(const char* chunk, uint32_t md5_hash[4]) {
 
 void md5(string_view buf, char out[16]) {
     // Initialize variables:
-    uint32_t md5_hash[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};   // A, B, C, D
+    uint32_t md5_hash[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };   // A, B, C, D
 
     uint64_t len = buf.size() * 8;
     while (buf.size() >= 64) {
         ChunkMD5(buf.data(), md5_hash);
         buf.remove_prefix(64);
     }
-    char padding[64];
+    char padding[64] = {};
     memcpy(padding, buf.data(), buf.size());
     padding[buf.size()] = 0x80;
     auto p = buf.size() + 1;
-    if (p <= 56) {
-        memset(padding + p, 0, 56 - p);
-    } else {
-        memset(padding + p, 0, 64 - p);
+    if (p > 56) {
         ChunkMD5(padding, md5_hash);
         memset(padding, 0, 56);
     }

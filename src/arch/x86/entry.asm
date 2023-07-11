@@ -2,12 +2,10 @@ section .text
 [bits 32]
 global _start
 _start:
+    push edi ; boot data pointer
     extern PrepareKernel
     call PrepareKernel
     mov esp, eax  ; PrepareKernel returns the new kernel stack in eax
-    push edi ; ramdisk size
-    push esi ; ramdisk address
-    push ebx  ; pass in cursor position
     extern KernelInit
     lea eax, [KernelInit]
     call eax  ; Use absolute address call

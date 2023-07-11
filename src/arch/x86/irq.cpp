@@ -5,13 +5,15 @@
 #include "irq.h"
 
 #include "kassert.h"
+#include "thread.h"
 #include "x86_inst.h"
 
 constexpr uint16_t kMasterPort = 0x20;
 constexpr uint16_t kSlavePort = 0xA0;
 constexpr uint8_t kEOI = 0x20;
 
-volatile int key_pressed = 0;
+static volatile int key_pressed = 0;
+static int counter = 0;
 
 void WaitKeypress() {
     kprint("Press key");
@@ -23,26 +25,30 @@ void WaitKeypress() {
     kprint(": pressed {}\n", key);
 }
 
-inline void DoIrq(int irq) {
-    static int counter = 0;
+int GetTime() {
+    return counter;
+}
+
+inline bool DoIrq(int irq) {
     static uint8_t key_state[16]; (void)key_state;
     switch (irq) {
         case 0:
-            if ((counter++) & 0xF) return;
-            break;
+            counter++;
+            return true;
         case 1: {
             int key = inb(0x60);
-            key_state[(key & 0x7f) >> 3] = (key >> 7) << (key & 7);
             if ((key & 0x80) == 0) {
+                key_state[(key & 0x7f) >> 3] |= 1 << (key & 7);
                 key_pressed = key;
+            } else {
+                key_state[(key & 0x7f) >> 3] &= ~(1 << (key & 7));
             }
-            //kprint("Key: {} {}\n", key & 0x7F, key & 0x80 ? "released" : "pressed");
             break;
         }
         default:
             break;
     }
-    //kprint("IRQ: {} time counter {}\n", irq, counter);
+    return false;
 }
 
 void IrqHandler(Regs* regs) {
@@ -71,10 +77,29 @@ void IrqHandler(Regs* regs) {
     outb(pic_port, kEOI);
     // At this point interrupts are resumed except for the IRQ we are handling.
 
-    DoIrq(irq);
+    bool should_schedule = DoIrq(irq);
 
     // Unblock IRQ.
     outb(pic_port + 1, mask);
+
+    if (should_schedule) {
+        // Schedule(regs, false);
+    }
+}
+
+void InitializePit(uint32_t frequency) {
+    // Set PIT to mode 3 (square wave generator) and set frequency.
+    constexpr uint16_t kPitPort = 0x43;
+    constexpr uint8_t kMode3 = 0x36;  // channel(2 bits) = 0, rw mode (2 bits) = 3 (LSB then MSB), mode = 3 (square wave), bcd = 0
+    outb(kPitPort, kMode3);
+    auto divisor = 1193180 / frequency;
+    if (divisor > 0xFFFF) {
+        divisor = 0xFFFF;
+    } else if (divisor < 1) {
+        divisor = 1;
+    }
+    outb(0x40, divisor & 0xFF);
+    outb(0x40, divisor >> 8);
 }
 
 void InitializePic(uint16_t port, uint8_t irq_offset, uint8_t cascade) {
@@ -102,4 +127,6 @@ void RemapInterrupts() {
     InitializePic(kMasterPort, 0x20, 1 << kCascadeIRQ);
     // Set slave PIC IRQs starting at 40 (0x28)
     InitializePic(kSlavePort, 0x28, kCascadeIRQ);
+
+    InitializePit(100);
 }

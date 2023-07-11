@@ -8,6 +8,7 @@
 #include "entry.h"
 
 void WaitKeypress();
+int GetTime();
 void IrqHandler(Regs* regs);
 void RemapInterrupts();
 

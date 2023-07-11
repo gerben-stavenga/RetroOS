@@ -1,8 +1,7 @@
 //
 // Created by gerben stavenga on 6/11/23.
 //
-
-#include <stdint.h>
+#include "boot.h"
 
 #include "src/freestanding/utils.h"
 #include "x86_inst.h"
@@ -24,17 +23,11 @@ struct Regs {
 
 Regs regs;
 
-struct BootData {
-    int cursor_pos;
-    void* ramdisk;
-    int ramdisk_size;
-};
-
 BootData boot_data;
 
 extern "C" void generate_real_interrupt(int interrupt);
 
-NOINLINE [[noreturn]] void terminate() {
+NOINLINE [[noreturn]] void terminate(int) {
     while (true) hlt_inst();
 }
 
@@ -108,6 +101,39 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
     return true;
 }
 
+int CreateMemMap(MMapEntry *entries, int max_entries) {
+    int count = 0;
+    regs.es = 0;
+    regs.bx = 0;
+    constexpr uint32_t smap_id = 0x534d4150;  // Ascii 'SMAP'
+    while (count < max_entries) {
+        entries[count].acpi = 1;
+        regs.ax = 0xe820;
+        regs.cx = 24;
+        regs.dx = smap_id;
+        regs.di = reinterpret_cast<uintptr_t>(&entries[count]);
+        generate_real_interrupt(0x15);
+        if (regs.ax != smap_id) {
+            return -1;
+        }
+        if ((regs.flags & 1) != 0) {
+            if (count == 0) {
+                return -1;
+            } else {
+                break;
+            }
+        }
+        if (!(entries[count].acpi & 1)) {
+            // ignore
+        } else {
+            count++;
+        }
+        if (regs.bx == 0) break;
+    }
+    sort(entries, entries + count, [](const auto &a, const auto &b) { return a.base < b.base; });
+    return count;
+}
+
 class TarFSReader : public USTARReader {
 public:
     TarFSReader(int drive, int lba) : USTARReader(lba), drive_(drive) {}
@@ -131,17 +157,19 @@ static void EnableA20() {
 }
 
 extern char _start[], _edata[], _end[];
-extern "C" void BootLoader(void* buffer, int drive) {
+extern "C" BootData* BootLoader(int drive) {
+    void* const buffer = reinterpret_cast<void*>(0x1000);
     Out out;
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
     print(out, "Loader size: {}\n", _edata - _start);
-    print(out, "Extended BIOS at {}\n", reinterpret_cast<void*>(static_cast<uintptr_t>(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
+    print(out, "Extended BIOS at {}\n", Hex(uintptr_t(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
     EnableA20();
     print(out, "A20 enabled\n");
-    unsigned kernel_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
-    TarFSReader tar(drive, kernel_lba);
+    boot_data.mmap_count = CreateMemMap(boot_data.mmap_entries, array_size(boot_data.mmap_entries));
+    unsigned fs_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
+    TarFSReader tar(drive, fs_lba);
     char* ramdisk = reinterpret_cast<char*>(0x80000);
-    char * load_address = ramdisk;
+    char* load_address = ramdisk;
     size_t size = 0;
     bool found = false;
     while ((size = tar.ReadHeader(load_address)) != SIZE_MAX) {
@@ -159,9 +187,12 @@ extern "C" void BootLoader(void* buffer, int drive) {
     }
     if (!found) {
         print(out, "Kernel not found\n");
-        terminate();
+        terminate(-1);
     }
+    print(out, "Kernel loaded .. starting kernel\n");
+    boot_data.kernel = buffer;
     boot_data.cursor_pos = out.GetCursor();
     boot_data.ramdisk = ramdisk;
     boot_data.ramdisk_size = load_address - ramdisk;
+    return &boot_data;
 }

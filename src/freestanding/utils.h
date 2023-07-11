@@ -21,54 +21,115 @@ constexpr size_t array_size(const T (&)[N]) {
     return N;
 }
 
-inline void memmove(void* dst, const void* src, size_t n) {
-    if (reinterpret_cast<uintptr_t>(dst) <= reinterpret_cast<uintptr_t>(src)) {
-        for (size_t i = 0; i < n; i++) {
-            static_cast<uint8_t*>(dst)[i] = static_cast<const uint8_t*>(src)[i];
-        }
-    } else {
-        for (size_t i = n; i > 0; i--) {
-            static_cast<uint8_t*>(dst)[i - 1] = static_cast<const uint8_t*>(src)[i - 1];
-        }
-    }
-}
+template<class T, T v>
+struct integral_constant
+{
+    static constexpr T value = v;
+    using value_type = T;
+    using type = integral_constant; // using injected-class-name
+    constexpr operator value_type() const noexcept { return value; }
+    constexpr value_type operator()() const noexcept { return value; } // since c++14
+};
 
-inline void memcpy(void* dst, const void* src, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        static_cast<uint8_t*>(dst)[i] = static_cast<const uint8_t*>(src)[i];
-    }
-}
+template< bool B >
+using bool_constant = integral_constant<bool, B>;
 
-inline void memset(void* dst, int value, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        static_cast<uint8_t*>(dst)[i] = value;
-    }
-}
+using true_type = bool_constant<true>;
+using false_type = bool_constant<false>;
 
-inline char* strncpy(char* dst, const char* src, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        dst[i] = src[i];
-        if (src[i] == 0) {
-            return dst;
-        }
-    }
-    return dst;
-}
+template<class T>
+struct is_integral : bool_constant<
+        requires (T t, T* p, void (*f)(T)) // T* parameter excludes reference types
+        {
+                reinterpret_cast<T>(t); // Exclude class types
+        f(0); // Exclude enumeration types
+        p + t; // Exclude everything not yet excluded but integral types
+        }> {};
 
-inline constexpr size_t strlen(const char* p) {
-    size_t i = 0;
-    for (; p[i] != 0; i++);
-    return i;
-}
+template< class T >
+inline constexpr bool is_integral_v = is_integral<T>::value;
 
-inline constexpr size_t strnlen(const char* p, size_t max) {
-    for (size_t i = 0; i < max; i++) if (p[i] == 0) return i;
-    return max;
+template < class T >
+concept integral = is_integral_v<T>;
+
+template<class T, class U>
+struct is_same : false_type {};
+
+template<class T>
+struct is_same<T, T> : true_type {};
+
+
+template<class T> struct remove_cv { typedef T type; };
+template<class T> struct remove_cv<const T> { typedef T type; };
+template<class T> struct remove_cv<volatile T> { typedef T type; };
+template<class T> struct remove_cv<const volatile T> { typedef T type; };
+
+template<class T> struct remove_const { typedef T type; };
+template<class T> struct remove_const<const T> { typedef T type; };
+
+template<class T> struct remove_volatile { typedef T type; };
+template<class T> struct remove_volatile<volatile T> { typedef T type; };
+
+template< class T >
+using remove_cv_t = typename remove_cv<T>::type;
+template< class T >
+using remove_const_t = typename remove_const<T>::type;
+template< class T >
+using remove_volatile_t = typename remove_volatile<T>::type;
+
+template<class T>
+struct is_floating_point
+        : integral_constant<
+                bool,
+                // Note: standard floating-point types
+                is_same<float, typename remove_cv<T>::type>::value
+                || is_same<double, typename remove_cv<T>::type>::value
+                || is_same<long double, typename remove_cv<T>::type>::value
+                // Note: extended floating-point types (C++23, if supported)
+/*                || is_same<float16_t, typename remove_cv<T>::type>::value
+                || is_same<float32_t, typename remove_cv<T>::type>::value
+                || is_same<float64_t, typename remove_cv<T>::type>::value
+                || is_same<float128_t, typename remove_cv<T>::type>::value
+                || is_same<bfloat16_t, typename remove_cv<T>::type>::value
+*/
+        > {};
+
+template<class T>
+struct is_arithmetic : integral_constant<bool,
+        is_integral<T>::value ||
+        is_floating_point<T>::value> {};
+
+namespace detail
+{
+    template<typename T,bool = is_arithmetic<T>::value>
+    struct is_signed : integral_constant<bool, T(-1) < T(0)> {};
+
+    template<typename T>
+    struct is_signed<T,false> : false_type {};
+} // namespace detail
+
+template<typename T>
+struct is_signed : detail::is_signed<T>::type {};
+
+extern "C" {
+
+void *memmove(void *dst, const void *src, size_t n);
+void *memcpy(void *dst, const void *src, size_t n);
+void *memset(void *dst, int value, size_t n);
+char *strncpy(char *dst, const char *src, size_t n);
+size_t strlen(const char *p);
+size_t strnlen(const char *p, size_t max);
+int strcmp(const char *a, const char *b);
+int strncmp(const char *a, const char *b, size_t n);
+const char* strchr(const char *s, int c);
+const char* strrchr(const char *s, int c);
+const char* strstr(const char* haystack, const char* needle);
+
 }
 
 struct string_view {
     constexpr string_view() = default;
-    constexpr string_view(const char* s) : string_view(s, strlen(s)) {}
+    constexpr string_view(const char* s) : string_view(s, __builtin_strlen(s)) {}
     template<int N> constexpr string_view(const char s[N]) : string_view(s, N) {}
     constexpr string_view(const char* s, size_t n) : data_(s), size_(n) {}
 
@@ -125,83 +186,66 @@ private:
     size_t buffer_size;
 };
 
+void print_char(BufferedOStream& out, uintptr_t x, uintptr_t);
+void print_val_u(BufferedOStream& out, uintptr_t x, uintptr_t);
+void print_val_s(BufferedOStream& out, uintptr_t x, uintptr_t);
+void print_val_hex(BufferedOStream& out, uintptr_t x, uintptr_t ndigits);
+void print_val_hex64(BufferedOStream& out, uintptr_t x, uintptr_t ndigits);
+void print_val_str(BufferedOStream& out, uintptr_t data, uintptr_t size);
+void print_val_hexbuf(BufferedOStream& out, uintptr_t data, uintptr_t size);
+
+struct ValuePrinter {
+    uintptr_t value;
+    uintptr_t extra;
+    void (*print)(BufferedOStream& out, uintptr_t value, uintptr_t extra);
+};
+
+inline ValuePrinter MakeValuePrinter(const bool& x) {
+    return {static_cast<uintptr_t>(x), 0, print_val_u };
+}
+inline ValuePrinter MakeValuePrinter(const char& x) {
+    return {static_cast<uintptr_t>(x), 0, print_char };
+}
+
+inline ValuePrinter MakeValuePrinter(const integral auto& x) {
+    auto value = static_cast<uint64_t>(x);
+    return {static_cast<uintptr_t>(value), static_cast<uintptr_t>(value >> 32), print_val_u };
+}
+
 template<typename T>
 struct Hex {
     constexpr Hex(T x_) : x(x_) {}
     T x;
 };
 
-void print_char(BufferedOStream& out, uint64_t x, uint64_t);
-void print_val_u(BufferedOStream& out, uint64_t x, uint64_t);
-void print_val_s(BufferedOStream& out, uint64_t x, uint64_t);
-void print_val_hex(BufferedOStream& out, uint64_t x, uint64_t ndigits);
-void print_val_str(BufferedOStream& out, uint64_t data, uint64_t size);
-void print_val_hexbuf(BufferedOStream& out, uint64_t data, uint64_t size);
-
-struct ValuePrinter {
-    uint64_t value;
-    uint64_t extra;
-    void (*print)(BufferedOStream& out, uint64_t value, uint64_t extra);
-};
-
-inline ValuePrinter MakeValuePrinter(const bool* x) {
-    return {static_cast<uint64_t>(*x), 0, print_val_u };
-}
-inline ValuePrinter MakeValuePrinter(const char* x) {
-    return {static_cast<uint64_t>(*x), 0, print_char };
-}
-inline ValuePrinter MakeValuePrinter(const int16_t* x) {
-    return {static_cast<uint64_t>(*x), 0, print_val_s };
-}
-inline ValuePrinter MakeValuePrinter(const uint16_t* x) {
-    return {static_cast<uintptr_t>(*x), 0, print_val_u };
-}
-inline ValuePrinter MakeValuePrinter(const int* x) {
-    return {static_cast<uint64_t>(*x), 0, print_val_s };
-}
-inline ValuePrinter MakeValuePrinter(const uint32_t* x) {
-    return {static_cast<uintptr_t>(*x), 0, print_val_u };
-}
-inline ValuePrinter MakeValuePrinter(const long int* x) {
-    return {static_cast<uint64_t>(*x), 0, print_val_s };
-}
-inline ValuePrinter MakeValuePrinter(const uint64_t* x) {
-    return {static_cast<uintptr_t>(*x), 0, print_val_u };
-}
-
 template <typename T>
-ValuePrinter MakeValuePrinter(const Hex<T>* x) {
-    return {static_cast<uint64_t>(x->x), sizeof(T) * 2, print_val_hex };
+ValuePrinter MakeValuePrinter(const Hex<T>& x) {
+    if (sizeof(T) > sizeof(uintptr_t)) {
+        return {static_cast<uintptr_t>(x.x), static_cast<uintptr_t>(x.x >> 32), print_val_hex64};
+    } else {
+        return {static_cast<uintptr_t>(x.x), sizeof(T) * 2, print_val_hex};
+    }
 }
 
 template <>
-inline ValuePrinter MakeValuePrinter<string_view>(const Hex<string_view>* x) {
-    return {reinterpret_cast<uintptr_t>(x->x.data()), x->x.size(), print_val_hexbuf };
+inline ValuePrinter MakeValuePrinter<string_view>(const Hex<string_view>& x) {
+    return {reinterpret_cast<uintptr_t>(x.x.data()), x.x.size(), print_val_hexbuf };
 }
 
-template <typename T>
-inline ValuePrinter MakeValuePrinter(T const* const* x) {
-    auto tmp = Hex(reinterpret_cast<uintptr_t>(*x));
-    return MakeValuePrinter(&tmp);
+inline ValuePrinter MakeValuePrinter(void const* const& x) {
+    auto tmp = Hex(reinterpret_cast<uintptr_t>(x));
+    return MakeValuePrinter(tmp);
 }
 
-inline ValuePrinter MakeValuePrinter(const string_view* x) {
-    return {reinterpret_cast<uintptr_t>(x->data()), x->size(), print_val_str };
+inline ValuePrinter MakeValuePrinter(const string_view& x) {
+    return {reinterpret_cast<uintptr_t>(x.data()), x.size(), print_val_str };
 }
-inline ValuePrinter MakeValuePrinter(char const* const* x) {
-    auto tmp = string_view(*x);
-    return MakeValuePrinter(&tmp);
+inline ValuePrinter MakeValuePrinter(char const* const& x) {
+    auto tmp = string_view(x);
+    return MakeValuePrinter(tmp);
 }
 
 void print_buf(BufferedOStream& out, string_view format, const ValuePrinter* printers, size_t n);
-
-template <typename T, size_t N>
-struct Array {
-    T data[N];
-    constexpr size_t size() const { return N; }
-    constexpr const T& operator[](size_t i) const { return data[i]; }
-    constexpr T& operator[](size_t i) { return data[i]; }
-};
 
 void PrintImpl(OutputStream& out, string_view format, const ValuePrinter* printers, size_t n);
 
@@ -216,18 +260,18 @@ private:
 template <typename... Args>
 void print(OutputStream& out, string_view format, const Args&... args) {
     constexpr auto n = sizeof...(Args);
-    const ValuePrinter printers[n] = {MakeValuePrinter(&args)...};
+    const ValuePrinter printers[n] = {MakeValuePrinter(args)...};
     PrintImpl(out, format, printers, n);
 }
 
 template <typename... Args>
 void print(BufferedOStream& out, string_view format, const Args&... args) {
     constexpr auto n = sizeof...(Args);
-    const ValuePrinter printers[n] = {MakeValuePrinter(&args)...};
+    const ValuePrinter printers[n] = {MakeValuePrinter(args)...};
     print_buf(out, format, printers, n);
 }
 
-[[noreturn]] void terminate() __attribute__((weak));
+[[noreturn]] void terminate(int exit_code) __attribute__((weak));
 
 [[noreturn]] void panic_assert(OutputStream& out, string_view str, string_view file, int line);
 
@@ -256,9 +300,27 @@ private:
 
 void md5(string_view buf, char out[16]);
 
-inline uint32_t LoadLE32(const void* p) {
-    auto up = static_cast<uint8_t const*>(p);
-    return uint32_t(up[0]) | uint32_t(up[1]) << 8 | uint32_t(up[2]) << 16 | uint32_t(up[3]) << 24;
+template <typename T>
+void swap(T& a, T& b) {
+    T tmp = a;
+    a = b;
+    b = tmp;
+}
+
+template <typename T, typename IsLess>
+void sort(T* begin, T* end, IsLess is_less) {
+    for (auto i = begin; i != end; ++i) {
+        for (auto j = i + 1; j != end; ++j) {
+            if (is_less(*j, *i)) {
+                swap(*i, *j);
+            }
+        }
+    }
+}
+
+template <typename T>
+T min(const T& a, const T& b) {
+    return a < b ? a : b;
 }
 
 #endif //OS_UTILS_H
