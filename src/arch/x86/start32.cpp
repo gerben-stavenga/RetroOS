@@ -153,7 +153,6 @@ extern "C" void KernelInit() {
     RemapInterrupts();
     EnableIRQ();
 
-
     InitFS(ramdisk, ramdisk_size);
 
     string_view filename = "src/arch/x86/init.bin";
@@ -173,7 +172,6 @@ extern "C" void KernelInit() {
     current_thread = CreateThread(nullptr, kernel_page_dir, true);
     current_thread->state = ThreadState::THREAD_RUNNING;
 
-    WaitKeypress();
     // Move to init
     asm volatile(
             "push $0\n\t"  // We make a call from ring 0 which does not push old stack, so we push dummy values
