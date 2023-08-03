@@ -194,7 +194,7 @@ NOINLINE void print_buf(BufferedOStream& out, string_view format, const ValuePri
         }
     }
     if (k < n) {
-        error:
+error:
         print(out, "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
         terminate(-1);
     }

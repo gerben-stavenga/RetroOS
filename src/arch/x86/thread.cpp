@@ -84,7 +84,7 @@ void Schedule(Regs* regs, bool must_switch) {
         }
     }
     if (next_thread == nullptr) {
-        if (!must_switch) return;
+        if (!must_switch || current_thread->tid == 0) return;
         next_thread = &threads[0];
     }
     kassert(current_thread->state == THREAD_RUNNING);
