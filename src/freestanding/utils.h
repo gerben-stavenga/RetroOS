@@ -271,6 +271,41 @@ void print(BufferedOStream& out, string_view format, const Args&... args) {
     print_buf(out, format, printers, n);
 }
 
+class InputStream {
+public:
+    virtual size_t Pull(char* buf, size_t max_len) = 0;
+};
+
+class BufferedIStream {
+public:
+    BufferedIStream(InputStream* stream_, size_t buffer_size_) : stream(stream_), buffer_size(buffer_size_) {}
+
+    bool get(char& c) {
+        char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedIStream);
+        if (pos == size) {
+            pos = 0;
+            size = stream->Pull(buffer, buffer_size);
+            if (size == 0) return false;
+        }
+        c = buffer[pos++];
+        return true;
+    }
+
+private:
+    InputStream* stream;
+    size_t pos = 0;
+    size_t size = 0;
+    size_t buffer_size;
+};
+
+template<int N>
+class BufferedIStreamN : public BufferedIStream {
+public:
+    constexpr BufferedIStreamN(InputStream* stream_) : BufferedIStream(stream_, N) {}
+private:
+    char buffer[N];
+};
+
 [[noreturn]] void terminate(int exit_code) __attribute__((weak));
 
 [[noreturn]] void panic_assert(OutputStream& out, string_view str, string_view file, int line);

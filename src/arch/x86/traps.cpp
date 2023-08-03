@@ -16,17 +16,58 @@ constexpr int ENOSYS = -100;
 
 typedef void (*EntryHandler)(Regs*);
 
+/*
+ * Make a filesystem that combines all resources in a hierarchy.
+ * /dev/xxx are devices (core, mem, dma, keyboard, mouse, timer, hd, etc)
+ * /dev/core allows execution of code sharing the same address space
+ * /dev/mem allows access to physical memory through paging
+ * /dev/dma allows access to physical memory through DMA
+ * /dev/keyboard allows access to the keyboard
+ * /dev/mouse allows access to the mouse
+ * /dev/timer allows access to the timer
+ * /dev/hd allows access to the hard disk
+ *
+ * A implementation of this for a specific architecture provides the necessary interface layer for the kernel to
+ * run. The kernel itself is architecture independent, in particular one can implement the devices on top of a
+ */
+
 void ShowRegs(Regs* regs) {
     kprint("ShowRegs: @{}:{} stack {}:{}\nkernel stack @{} ecx: {} edx: {}\n", Hex(regs->cs), Hex(regs->eip), Hex(regs->ss), Hex(regs->esp), Hex(regs->temp_esp), Hex(regs->ecx), Hex(regs->edx));
 }
 
-void Write(Regs* regs) {
+void Yield(Regs* regs) {
+    Schedule(regs, true);
+}
+
+void ConsoleOut(Regs* regs) {
     kprint("{}", string_view(reinterpret_cast<char*>(regs->ecx), regs->edx));
 }
 
+void KeyboardIn(Regs* regs) {
+//    regs->eax =
+    (void) regs;
+}
+
+/*
+void ReadSyscall(Regs* regs) {
+    auto fd = regs->ecx;
+    auto buf = reinterpret_cast<char*>(regs->edx);
+    auto len = regs->esi;
+    auto ret = Read(fd, buf, len);
+    regs->eax = ret;
+}
+
+void WriteSyscall(Regs* regs) {
+    auto fd = regs->ecx;
+    auto buf = reinterpret_cast<char*>(regs->edx);
+    auto len = regs->esi;
+    auto ret = Write(fd, buf, len);
+    regs->eax = ret;
+}
+*/
 static const EntryHandler syscall_table[] = {
         SysExit,  // 0
-        ShowRegs,  // 1
+        Yield,  // 1
         nullptr,
         nullptr,
         SysFork,
@@ -34,7 +75,7 @@ static const EntryHandler syscall_table[] = {
         nullptr,
         nullptr,
         nullptr,
-        Write,  // 9
+        ConsoleOut,  // 9
 };
 
 enum Signals : int {
@@ -70,7 +111,7 @@ static void generic_exception_handler(Regs* regs) {
     auto int_no = regs->int_no;
     auto signal = exceptions[int_no].signal;
 
-    panic("An unsupported exception, signal = {} name = {}\n", signal, exceptions[regs->int_no].name);
+    panic("An unsupported exception, signal = {} name = {} @{}:{}\n", signal, exceptions[regs->int_no].name, Hex(regs->cs), Hex(regs->eip));
 }
 
 static void unknown_exception_handler(Regs* regs) {
@@ -104,7 +145,7 @@ static void general_protection(Regs* regs) {
 void page_fault(Regs* regs);
 
 static void SystemCall(Regs* regs) {
-    kprint("SystemCall: {}\n", regs->eax);
+    //kprint("SystemCall: {}\n", regs->eax);
     //hlt();
     if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
         regs->eax = ENOSYS;
@@ -161,5 +202,9 @@ extern "C" void* isr_handler(Regs* regs) {
     regs->int_no = (regs->int_no - reinterpret_cast<uintptr_t>(int_vector)) / 8;
     isr_table.entries[regs->int_no](regs);
     DisableIRQ();
+    if (should_yield && regs->cs & 3) {
+        Schedule(regs, false);
+        should_yield = false;
+    }
     return regs;
 }
