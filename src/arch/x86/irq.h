@@ -12,4 +12,6 @@ int GetTime();
 void IrqHandler(Regs* regs);
 void RemapInterrupts();
 
+extern volatile bool should_yield;
+
 #endif //OS_IRQ_H

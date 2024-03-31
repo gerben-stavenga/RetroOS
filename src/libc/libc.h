@@ -12,24 +12,63 @@
 
 uintptr_t SysCall(uintptr_t num, uintptr_t arg0, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3, uintptr_t arg4);
 
-void Exit(int code);
+inline void Exit(int code) {
+    SysCall(0, code, 0, 0, 0, 0);
+}
 
-void* Alloc(size_t size);
-void Free(void* ptr);
+inline void Yield() {
+    SysCall(1, 0, 0, 0, 0, 0);
+}
 
-int Fork();
+#if 0
+inline void* Alloc(size_t size) {
+    return (void*) SysCall(2, size, 0, 0, 0, 0);
+}
 
-void Exec(const char* path, char* const argv[], char* const envp[]);
+inline void Free(void* ptr) {
+    SysCall(3, (uintptr_t) ptr, 0, 0, 0, 0);
+}
+#endif
 
-int Open(const char* path, int flags, int mode);
+inline int Fork() {
+    return SysCall(4, 0, 0, 0, 0, 0);
+}
 
-void Close(int fd);
+inline void Exec(const char* path, char* const argv[], char* const envp[]) {
+    SysCall(5, (uintptr_t) path, (uintptr_t) argv, (uintptr_t) envp, 0, 0);
+}
 
-int Read(int fd, void* buf, size_t count);
+inline int Open(const char* path, int flags, int mode) {
+    return SysCall(6, (uintptr_t) path, flags, mode, 0, 0);
+}
 
-int Write(int fd, const void* buf, size_t count);
+inline void Close(int fd) {
+    SysCall(7, fd, 0, 0, 0, 0);
+}
 
-int Seek(int fd, int offset, int whence);
+inline size_t Read(int fd, void* buf, size_t count) {
+    return SysCall(8, fd, (uintptr_t) buf, count, 0, 0);
+}
+
+inline int Write(int fd, const void* buf, size_t count) {
+    return SysCall(9, fd, (uintptr_t) buf, count, 0, 0);
+}
+
+inline int Seek(int fd, int offset, int whence) {
+    return SysCall(10, fd, offset, whence, 0, 0);
+}
+
+class Reader : public InputStream {
+public:
+    Reader(int fd) : fd_(fd) {}
+
+    size_t Pull(char* buf, size_t max_len) override {
+        return Read(fd_, buf, max_len);
+    }
+
+private:
+    int fd_;
+};
 
 class Writer : public OutputStream {
 public:
