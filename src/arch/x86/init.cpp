@@ -4,16 +4,16 @@
 
 #include "src/libc/libc.h"
 
-[[noreturn]] void shell() {
-
-    // create
+[[noreturn]] void Shell() {
     while (true) {
-        uprint("shell> ");
-        char buf[256];
-        int n = uread(buf, 256);
-        buf[n] = '\0';
-        uprint("You typed: {}\n", buf);
+        uprint("I am the child!\n");
+        while (true) {
+            asm volatile("");
+        }
+        Yield();
     }
+    Exit(0);
+    uprint("This should not be printed!\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -21,9 +21,7 @@ int main(int argc, char* argv[]) {
     uprint("Hello, world!\n");
     int pid = Fork();
     if (pid == 0) {
-        uprint("I am the child!\n");
-        Exit(0);
-        uprint("This should not be printed!\n");
+        Shell();
     }
     while (true) {
         asm volatile("");
