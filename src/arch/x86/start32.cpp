@@ -65,9 +65,6 @@ extern "C" uint8_t _start[];
 extern "C" uint8_t _edata[];
 extern "C" uint8_t _end[];
 
-// Make sure it's not in bss, so it's not zeroed.
-BootData boot_data = {nullptr, nullptr, 0, 1, 0,{}};
-
 extern uint8_t kernel_stack[4096 * 16];
 
 // This is a subtle function. The bootloader loads the kernel at some arbitrary physical address with unpaged
@@ -77,8 +74,8 @@ extern uint8_t kernel_stack[4096 * 16];
 // access of globals will be at the wrong physical address. We compensate by passing in `delta` to offset the address
 // of globals to the correct physical address. After paging is enabled we should switch to the right stack and right
 // ip, this must be done in asm and will be handled in entry.asm. This function returns the address of the stack.
-extern "C" void* PrepareKernel(const BootData* boot_data_ptr) {
-    auto phys_address = reinterpret_cast<uintptr_t>(boot_data_ptr->kernel);
+extern "C" void* PrepareKernel(const BootData* boot_data) {
+    auto phys_address = reinterpret_cast<uintptr_t>(boot_data->kernel);
     if ((phys_address & (kPageSize - 1)) != 0 || reinterpret_cast<uintptr_t>(_start) != kKernelBase) {
         // The loaded kernel must be page aligned, linked at kKernelBase
         terminate(-1);
@@ -87,8 +84,7 @@ extern "C" void* PrepareKernel(const BootData* boot_data_ptr) {
     auto delta = phys_address - AsLinear(_start);
     auto adjust = [delta](auto* ptr) { return reinterpret_cast<decltype(ptr)>(reinterpret_cast<uintptr_t>(ptr) + delta); };
 
-    *adjust(&boot_data) = *boot_data_ptr;  // Copy boot data to the right address
-
+    // Need to do this as not to override pages 
     memset(adjust(_edata), 0, _end - _edata);  // Zero bss
 
     auto ptables = adjust(page_tables);
@@ -134,19 +130,16 @@ void ReadFile(void* dst, size_t size) {
     fs.ReadFile(dst, size);
 }
 
-extern "C" void KernelInit() {
-    screen.cursor_x = boot_data.cursor_pos & 0xFF;
-    screen.cursor_y = (boot_data.cursor_pos >> 8) & 0xFF;
+extern "C" void KernelInit(const BootData* boot_data) {
+    screen.cursor_x = boot_data->cursor_pos & 0xFF;
+    screen.cursor_y = (boot_data->cursor_pos >> 8) & 0xFF;
 
-    uintptr_t ramdisk = PhysAddress(boot_data.ramdisk);
-    size_t ramdisk_size = boot_data.ramdisk_size;
-
-    auto ip = GetIP();
-    kprint("Entering main kernel\nStack at {} and ip {} at phys address {}\n", &boot_data, ip, Hex(PhysAddress(ip)));
+    uintptr_t ramdisk = PhysAddress(boot_data->ramdisk);
+    size_t ramdisk_size = boot_data->ramdisk_size;
 
     int kernel_low = PhysAddress(_start) / kPageSize;
     int kernel_high = (PhysAddress(_end) + kPageSize - 1) / kPageSize;
-    InitPaging(kernel_low, kernel_high, ramdisk / kPageSize, (ramdisk + ramdisk_size + kPageSize - 1) / kPageSize);
+    InitPaging(kernel_low, kernel_high, ramdisk / kPageSize, (ramdisk + ramdisk_size + kPageSize - 1) / kPageSize, boot_data);
 
     SetupDescriptorTables();
 

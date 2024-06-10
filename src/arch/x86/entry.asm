@@ -1,13 +1,24 @@
+%ifidn __OUTPUT_FORMAT__,elf
+section .note.GNU-stack noalloc noexec nowrite progbits
+%endif
+%ifidn __OUTPUT_FORMAT__,elf32
+section .note.GNU-stack noalloc noexec nowrite progbits
+%endif
+%ifidn __OUTPUT_FORMAT__,elf64
+section .note.GNU-stack noalloc noexec nowrite progbits
+%endif
 section .text
 [bits 32]
 global _start
 _start:
-    push edi ; boot data pointer
+    mov ebx, ecx
+    push ecx ; boot data pointer
     extern PrepareKernel
     call PrepareKernel
     mov esp, eax  ; PrepareKernel returns the new kernel stack in eax
     extern KernelInit
     lea eax, [KernelInit]
+    push ebx
     call eax  ; Use absolute address call
 
 extern isr_handler

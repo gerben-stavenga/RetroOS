@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 
+#include "boot.h"
 #include "entry.h"
 #include "src/freestanding/utils.h"
 
@@ -170,7 +171,7 @@ inline uintptr_t GetPageIndex(const void* p) {
     return AsLinear(p) / kPageSize;
 }
 
-void InitPaging(int kernel_low, int kernel_high, int ramdisk_low, int ramdisk_high);
+void InitPaging(int kernel_low, int kernel_high, int ramdisk_low, int ramdisk_high, const BootData* boot_data);
 void EnablePaging(PageTable* ptables, uintptr_t phys_address);
 
 void* AllocPages(int npages);
