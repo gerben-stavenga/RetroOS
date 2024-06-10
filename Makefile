@@ -1,11 +1,12 @@
-CC := i686-elf-g++
-LD := i686-elf-g++
-AR := i686-elf-ar
+CC := i686-linux-gnu-g++
+LD := i686-linux-gnu-g++
+AR := i686-linux-gnu-ar
 AS := nasm
+OBJCOPY := i686-linux-gnu-objcopy
 
 # no-red-zone is needed because in kernel mode, the stack is nested due to interrupts not switching to a new stack
-CFLAGS := -Os -Wall -Wextra -ffreestanding -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-common -mno-red-zone -std=c++20 -I .
-LDFLAGS := $(CFLAGS) -nostdlib -lgcc
+CFLAGS := -O2 -Wall -Wextra -ffreestanding -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-common -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -mno-red-zone -std=c++20 -I .
+LDFLAGS := -nostdlib -no-pie -lgcc
 
 BOOTLOADER_OBJ := src/arch/x86/boot.o
 KERNEL_OBJ := src/arch/x86/start32.o src/arch/x86/paging.o src/arch/x86/descriptors.o src/arch/x86/traps.o src/arch/x86/irq.o src/arch/x86/thread.o
@@ -27,7 +28,7 @@ include $(ALL_OBJ:.o=.d)
 	./depend.sh $(@D) $(CFLAGS) $< > $@
 
 %.bin: %.elf
-	i386-elf-objcopy -O binary $< $@
+	$(OBJCOPY) --remove-section .note* -O binary $< $@
 
 src/freestanding/freestanding.a: src/freestanding/utils.o
 	$(AR) rcs $@ $^

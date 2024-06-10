@@ -4,7 +4,6 @@
 
 #include "paging.h"
 
-#include "boot.h"
 #include "kassert.h"
 #include "x86_inst.h"
 #include "src/freestanding/utils.h"
@@ -238,16 +237,14 @@ void page_fault(Regs* regs) {
     }
 }
 
-extern BootData boot_data;
-
-void InitPaging(int kernel_low, int kernel_high, int ramdisk_low, int ramdisk_high) {
+void InitPaging(int kernel_low, int kernel_high, int ramdisk_low, int ramdisk_high, const BootData* boot_data) {
     for (unsigned i = 0; i < array_size(available); i++) {
         kassert(available[i] == 0);
     }
     memset(available, -1, sizeof(available));
     int free_pages = 0;
-    for (int i = 0; i < boot_data.mmap_count; i++) {
-        auto& mmap = boot_data.mmap_entries[i];
+    for (int i = 0; i < boot_data->mmap_count; i++) {
+        auto& mmap = boot_data->mmap_entries[i];
         if (mmap.type != 1) continue;
         auto start = (mmap.base + kPageSize - 1) / kPageSize;
         auto end = (mmap.base + mmap.length) / kPageSize;

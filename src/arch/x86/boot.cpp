@@ -23,39 +23,62 @@ struct Regs {
 
 Regs regs;
 
-BootData boot_data;
-
 extern "C" void generate_real_interrupt(int interrupt);
 
 NOINLINE [[noreturn]] void terminate(int) {
     while (true) hlt_inst();
 }
 
+inline int GetCursor() {
+    regs.ax = 0x300;
+    regs.bx = 0;
+    generate_real_interrupt(0x10);
+    return regs.dx;
+}
+
+inline void PutChar(char c) {
+    if (c == '\n') PutChar(13);
+    regs.ax = 0xe00 | c;
+    regs.bx = 7;
+    generate_real_interrupt(0x10);
+}
+
+
+inline void Print(string_view str) {
+    regs.ax = 0x300;
+    regs.bx = 0;
+    generate_real_interrupt(0x10);
+    regs.ax = 0x1301;
+    regs.bx = 7;
+    regs.cx = str.size();
+    regs.es = 0;
+    regs.bp = reinterpret_cast<uintptr_t>(str.data());
+    generate_real_interrupt(0x10);
+}
+
 struct Out : public OutputStream {
-    void Push(string_view str) {
+    void Push(string_view str) override {
         for (char c : str) {
-            put(c);
+            PutChar(c);
         }
-    }
-
-    void put(char c) {
-        if (c == '\n') put(13);
-        regs.ax = 0xe00 | c;
-        regs.bx = 7;
-        generate_real_interrupt(0x10);
-    }
-
-    int GetCursor() {
-        regs.ax = 0x300;
-        regs.bx = 0;
-        generate_real_interrupt(0x10);
-        return regs.dx;
     }
 };
 
 inline int min(unsigned a, unsigned b) { return a < b ? a : b; }
 
-__attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count, void *buffer) {
+__attribute__((__always_inline__)) inline bool read_sectors(int drive, unsigned sector, unsigned head, unsigned cylinder, unsigned nsectors, uintptr_t address) {
+    // Use int 13 to read disk
+    regs.es = address >> 4;
+    regs.bx = address & 0xF;
+
+    regs.ax = 0x0200 + nsectors;
+    regs.cx = (cylinder << 8) | (sector + 1) | ((cylinder >> 2) & 0xC0);
+    regs.dx = (head << 8) | drive;
+    generate_real_interrupt(0x13);
+    return (regs.flags & 1) == 0;
+}
+
+bool read_disk(int drive, unsigned lba, unsigned count, void *buffer) {
     unsigned sectors_per_track;
     unsigned num_heads;
 
@@ -84,22 +107,15 @@ __attribute__((noinline)) bool read_disk(int drive, unsigned lba, unsigned count
 
         unsigned nsectors = min(count, min(127, sectors_per_track * num_heads - sector));
 
-        regs.es = address >> 4;
-        regs.bx = address & 0xF;
+        if(!read_sectors(drive, sector, head, cylinder, nsectors, address)) return false;
 
-        regs.ax = 0x0200 + nsectors;
-        regs.cx = (cylinder << 8) | (sector + 1) | ((cylinder >> 2) & 0xC0);
-        regs.dx = (head << 8) | drive;
-        generate_real_interrupt(0x13);
-        if ((regs.flags & 1) != 0) {
-            return false;
-        }
         lba += nsectors;
         address += 512 * nsectors;
         count -= nsectors;
     }
     return true;
 }
+
 
 int CreateMemMap(MMapEntry *entries, int max_entries) {
     int count = 0;
@@ -157,7 +173,7 @@ static void EnableA20() {
 }
 
 extern char _start[], _edata[], _end[];
-extern "C" BootData* BootLoader(int drive) {
+[[noreturn]] void FullBootLoader(int drive) {
     void* const buffer = reinterpret_cast<void*>(0x1000);
     Out out;
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
@@ -165,7 +181,6 @@ extern "C" BootData* BootLoader(int drive) {
     print(out, "Extended BIOS at {}\n", Hex(uintptr_t(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
     EnableA20();
     print(out, "A20 enabled\n");
-    boot_data.mmap_count = CreateMemMap(boot_data.mmap_entries, array_size(boot_data.mmap_entries));
     unsigned fs_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
     TarFSReader tar(drive, fs_lba);
     char* ramdisk = reinterpret_cast<char*>(0x80000);
@@ -174,6 +189,8 @@ extern "C" BootData* BootLoader(int drive) {
     bool found = false;
     while ((size = tar.ReadHeader(load_address)) != SIZE_MAX) {
         string_view filename{load_address};
+        print(out, "filename {} size {}\n", filename, size);
+
         load_address += 512;
         tar.ReadFile(load_address, size);
         if (filename == "src/arch/x86/kernel.bin") {
@@ -190,9 +207,24 @@ extern "C" BootData* BootLoader(int drive) {
         terminate(-1);
     }
     print(out, "Kernel loaded .. starting kernel\n");
+    BootData boot_data;
     boot_data.kernel = buffer;
-    boot_data.cursor_pos = out.GetCursor();
+    boot_data.cursor_pos = GetCursor();
     boot_data.ramdisk = ramdisk;
     boot_data.ramdisk_size = load_address - ramdisk;
-    return &boot_data;
+    boot_data.mmap_count = CreateMemMap(boot_data.mmap_entries, array_size(boot_data.mmap_entries));
+    typedef void (__attribute__((fastcall))*Kernel)(BootData*);
+    ((Kernel)(buffer))(&boot_data);
+    __builtin_unreachable();
+}
+
+extern "C"
+char start_msg[];
+
+extern "C" __attribute__((noinline, fastcall, section(".boot")))
+[[noreturn]] void BootLoader(int /* dummy */, int drive) {
+    Print({start_msg, 16});
+    auto nsectors = (reinterpret_cast<uintptr_t>(_edata) - reinterpret_cast<uintptr_t>(_start) - 1) / 512;
+    read_sectors(drive, 1, 0, 0, nsectors, 0x7C00 + 512);
+    FullBootLoader(drive);
 }
