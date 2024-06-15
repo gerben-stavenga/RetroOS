@@ -100,11 +100,10 @@ class RamUSTARReader : public USTARReader {
 public:
     constexpr RamUSTARReader(const char* data, size_t size) : data_(data), size_(size) {}
 
-    bool ReadBlocks(int n, void *buf) override {
+    bool ReadBlocks(size_t block, int n, void *buf) override {
         //kprint("ReadBlocks from {} at block {} n {} to {}\n", (void*)data_, block_, n, buf);
-        if ((block_ + n) * 512 > size_) return false;
-        memcpy(buf, data_ + block_ * 512, n * 512);
-        block_ += n;
+        if ((block + n) * 512 > size_) return false;
+        memcpy(buf, data_ + block * 512, n * 512);
         return true;
     }
 

@@ -31,8 +31,7 @@ gdt_ptr:
     dd gdt
 
 next:
-    xor ax, ax
-    mov ss, ax
+    lss esp, cs:[gdt]   ; this happens to load ss and esp to 0
     mov sp, 0x1000  ; between 0x500 and 0x1000 is conventional mem
 
     ; move to pm
@@ -67,7 +66,6 @@ struc REGS
     .si resd 1
     .di resd 1
     .bp resd 1
-    .flags resd 1
     .ds resw 1
     .es resw 1
 endstruc
@@ -83,15 +81,8 @@ x86_16_gen_interrupt:
     pushf   ; save flags before call to interrupt handler to mimic int
     call far [esp + 6]  ; call the interrupt
 
-    push ds
-    ; restore ds to 0, so we can use it to access the real mode data
-    push REALSEG
-    pop ds
-    pop WORD [regs + REGS.ds]
-    push es
-    pop WORD [regs + REGS.es]
     pushf  ; save flags after interrupt
-    pop WORD [regs + REGS.flags]
+    pop WORD ss:[regs + REGS.ax]
 
     call REALSEG:toggle_pm
     jmp CS32:swapregs
