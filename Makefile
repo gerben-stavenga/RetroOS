@@ -45,8 +45,11 @@ src/arch/x86/kernel.elf: src/arch/x86/kernel.ld src/arch/x86/entry.o $(KERNEL_OB
 src/arch/x86/init.elf: src/libc/crt0.o src/arch/x86/init.o src/libc/libc.a src/freestanding/freestanding.a
 	$(LD) -Ttext=0x10000 $^ -o $@ $(LDFLAGS)
 
+kernel.md5: src/arch/x86/kernel.bin
+	md5sum $< | xxd -r -p > $@
+
 # tar is used to create a filesystem image, it naturally blocks files to 512 bytes which matches the sector size
-fs.tar: src/arch/x86/bootloader.bin src/arch/x86/kernel.bin src/arch/x86/init.bin depend.sh
+fs.tar: src/arch/x86/bootloader.bin kernel.md5 src/arch/x86/kernel.bin src/arch/x86/init.bin depend.sh
 	tar -cf fs.tar $^
 
 # the first file in the tar is the bootloader, so we need to skip the first 512 bytes which is the tar header for

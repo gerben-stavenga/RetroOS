@@ -130,7 +130,7 @@ const char* strstr(const char* haystack, const char* needle);
 struct string_view {
     constexpr string_view() = default;
     constexpr string_view(const char* s) : string_view(s, __builtin_strlen(s)) {}
-    template<int N> constexpr string_view(const char s[N]) : string_view(s, N) {}
+    template<int N> constexpr string_view(const char (&s)[N]) : string_view(s, N) {}
     constexpr string_view(const char* s, size_t n) : data_(s), size_(n) {}
 
     void remove_prefix(size_t n) { data_ += n; size_ -= n; }
@@ -323,10 +323,15 @@ public:
     size_t ReadHeader(void* buf);
     bool ReadFile(void* buf, size_t size);
 
-protected:
-    size_t block_ = 0;
 private:
-    virtual bool ReadBlocks(int n, void *buf) = 0;
+    size_t block_ = 0;
+
+    virtual bool ReadBlocks(size_t block, int n, void *buf) = 0;
+    bool ReadBlocks(int n, void* buf) {
+        if (!ReadBlocks(block_, n, buf)) return false;
+        block_ += n;
+        return true;
+    }
 
     void SkipBlocks(int n) {
         block_ += n;
