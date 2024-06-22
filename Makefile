@@ -1,12 +1,12 @@
-CC := i686-linux-gnu-g++
-LD := i686-linux-gnu-g++
-AR := i686-linux-gnu-ar
+CC := clang++
+LD := clang++
+AR := ar
 AS := nasm
-OBJCOPY := i686-linux-gnu-objcopy
+OBJCOPY := objcopy
 
 # no-red-zone is needed because in kernel mode, the stack is nested due to interrupts not switching to a new stack
-CFLAGS := -O2 -Wall -Wextra -ffreestanding -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-common -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -mno-red-zone -std=c++20 -I .
-LDFLAGS := -nostdlib -no-pie -lgcc
+CFLAGS := -O2 -Wall -Wextra -m32 -march=i386 -ffreestanding -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-common -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -mno-red-zone -std=c++20 -I .
+LDFLAGS := -m32 -nostdlib -no-pie -lgcc
 
 BOOTLOADER_OBJ := build/src/arch/x86/boot.o
 KERNEL_OBJ := build/src/arch/x86/start32.o build/src/arch/x86/paging.o build/src/arch/x86/descriptors.o build/src/arch/x86/traps.o build/src/arch/x86/irq.o build/src/arch/x86/thread.o
@@ -18,6 +18,7 @@ ALL_OBJ := $(BOOTLOADER_OBJ) $(KERNEL_OBJ) $(FREESTANDING_OBJ) $(LIBC_OBJ) $(INI
 
 include $(ALL_OBJ:.o=.d)
 
+
 build/%.o: %.asm
 	mkdir -p $(@D)
 	$(AS) -f elf $< -o $@
@@ -28,7 +29,7 @@ build/%.o: %.cpp build/%.d Makefile
 
 build/%.d: %.cpp depend.sh
 	mkdir -p $(@D)
-	./depend.sh $(@D) $(CFLAGS) $< > $@
+	./depend.sh $(CC) $(@D) $(CFLAGS) $< > $@
 
 %.bin: %.elf
 	mkdir -p $(@D)
