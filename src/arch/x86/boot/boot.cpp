@@ -213,12 +213,9 @@ char start_msg[15];
 
 extern "C" __attribute__((noinline, fastcall, section(".boot")))
 [[noreturn]] void BootLoader(int /* dummy */, int drive) {
-    //start_msg[0] = char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive);
-    //Print(start_msg);
+    Print(start_msg);
     auto nsectors = (reinterpret_cast<uintptr_t>(_edata) - reinterpret_cast<uintptr_t>(_start) - 1) / 512;
     if (read_disk(drive, 1, nsectors, reinterpret_cast<void*>(0x7C00 + 512))) {
-    start_msg[0] = char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive);
-    Print(start_msg);
         FullBootLoader(drive);
     } else {
         Halt();
