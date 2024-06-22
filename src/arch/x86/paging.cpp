@@ -73,7 +73,7 @@ void* AllocPages(int npages) {
 
 void InitializePageDir(PageTable* page_dir) {
     auto kt_page = PhysAddress(page_tables) / kPageSize;
-    memset(page_dir, 0, kPageSize);
+    *page_dir = PageTable{};
     page_dir->entries[kKernelBase / kPageSize / kNumPageEntries] = PageEntry(kt_page, 1, 0, 0);
     page_dir->entries[kNumPageEntries - 2] = PageEntry(PhysAddress(page_tables + 2) / kPageSize, 1, 0, 0);
     page_dir->entries[kNumPageEntries - 1] = PageEntry(PhysAddress(page_dir) / kPageSize, 1, 0, 0);
@@ -285,7 +285,7 @@ void InitPaging(int kernel_low, int kernel_high, int ramdisk_low, int ramdisk_hi
     kprint("Free mem {}\n", free_pages * kPageSize);
 
     // We are done with the identity mapping, make zero page zero
-    memset(zero_page, 0, kPageSize);
+    *zero_page = PageTable{};
     kernel_free_pages_low = kKernelBase / kPageSize + kernel_high - kernel_low;
     kernel_free_pages_high = kLowMemBase / kPageSize;
 

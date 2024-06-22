@@ -224,7 +224,7 @@ inline ValuePrinter MakeValuePrinter(const char& x) {
     return res;
 }
 
-inline ValuePrinter MakeValuePrinter(const integral auto& x) {
+inline ValuePrinter MakeValuePrinter(const integral auto x) {
     ValuePrinter res;
     res.n = x;
     res.print = is_signed<decltype(x)>::value ? print_val_s : print_val_u;
@@ -288,7 +288,6 @@ private:
 };
 
 template <typename... Args>
-ALWAYS_INLINE
 void print(OutputStream& out, string_view format, const Args&... args) {
     constexpr auto n = sizeof...(Args);
     const ValuePrinter printers[n] = {MakeValuePrinter(args)...};
@@ -296,7 +295,6 @@ void print(OutputStream& out, string_view format, const Args&... args) {
 }
 
 template <typename... Args>
-ALWAYS_INLINE
 size_t print(size_t pos, BufferedOStream& out, string_view format, const Args&... args) {
     constexpr auto n = sizeof...(Args);
     const ValuePrinter printers[n] = {MakeValuePrinter(args)...};
@@ -349,7 +347,6 @@ inline void AssertImpl(bool cond, OutputStream& out, string_view cond_str, strin
 class USTARReader {
 public:
     USTARReader() = default;
-    USTARReader(size_t block) : block_(block) {}
 
     size_t FindFile(string_view filename);
     size_t ReadHeader(void* buf);

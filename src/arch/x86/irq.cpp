@@ -12,7 +12,11 @@ constexpr uint16_t kMasterPort = 0x20;
 constexpr uint16_t kSlavePort = 0xA0;
 constexpr uint8_t kEOI = 0x20;
 
-volatile PipeN<1024> key_pipe;
+inline uint16_t PicPort(int irq) {
+    return irq >= 8 ? kSlavePort : kMasterPort;
+}
+
+PipeN<1024> key_pipe;
 static volatile int counter = 0;
 volatile bool should_yield = false;
 
@@ -30,7 +34,7 @@ int GetTime() {
 void (*irq_handlers[16])() = {nullptr};
 
 bool RegisterIrqHandler(int irq, void (*handler)()) {
-    uint16_t pic_port = (irq >= 8 ? kSlavePort : kMasterPort);
+    uint16_t pic_port = PicPort(irq);
     auto mask = X86_inb(pic_port + 1);
     auto irq_bit = 1 << (irq & 7);
     if ((mask & irq_bit) == 0) {
@@ -177,7 +181,7 @@ void IrqHandler(Regs* regs) {
         // so we have to send an EOI to the master.
         X86_outb(kMasterPort, kEOI);
     }
-    uint16_t pic_port = (irq >= 8 ? kSlavePort : kMasterPort);
+    uint16_t pic_port = PicPort(irq);
     uint8_t irq_bit = 1 << (irq & 7);
 
     bool spurious_irq = irq_bit == 0x80;  // irq == 7 || irq == 15

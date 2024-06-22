@@ -29,9 +29,25 @@ gdt:
 gdt_ptr:
     dw gdt_ptr - gdt - 1
     dd gdt
+struc REGS
+    .ax resd 1
+    .bx resd 1
+    .cx resd 1
+    .dx resd 1
+    .si resd 1
+    .di resd 1
+    .bp resd 1
+    .ds resw 1
+    .es resw 1
+endstruc
+global regs
+regs:
+    istruc REGS
+    iend
 
 next:
-    lss esp, cs:[gdt]   ; this happens to load ss and esp to 0
+    xor esp, esp    ; make sure high bits are zero
+    mov ss, sp
     mov sp, 0x1000  ; between 0x500 and 0x1000 is conventional mem
 
     ; move to pm
@@ -58,18 +74,6 @@ toggle_pm:
     pop ebp
     retf
 
-struc REGS
-    .ax resd 1
-    .bx resd 1
-    .cx resd 1
-    .dx resd 1
-    .si resd 1
-    .di resd 1
-    .bp resd 1
-    .ds resw 1
-    .es resw 1
-endstruc
-    extern regs
 x86_16_gen_interrupt:
     call CS16:toggle_pm
 
@@ -79,12 +83,13 @@ x86_16_gen_interrupt:
     pop ds
 
     pushf   ; save flags before call to interrupt handler to mimic int
-    call far [esp + 6]  ; call the interrupt
-
+    call far [ss:esp + 6]  ; call the interrupt
     pushf  ; save flags after interrupt
-    pop WORD ss:[regs + REGS.ax]
 
-    call REALSEG:toggle_pm
+    call REALSEG:toggle_pm  ; restore data segments
+
+    pop WORD [regs + REGS.ax]  ; flags will end up in eax on return
+
     jmp CS32:swapregs
 
 [bits 32]
