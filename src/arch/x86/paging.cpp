@@ -30,7 +30,7 @@ PageEntry ZeroPageEntry(bool user, bool cow) {
 }
 
 inline void FlushTLB() {
-    LoadPageDir(CurrentCR3());
+    X86_set_cr3(CurrentCR3());
 }
 
 void IncSharedCount(int page) {
@@ -143,7 +143,7 @@ void DestroyPageDir(const PageTable* p) {
     }
     FreePhysPage(GetPageEntry(kNumPages - 1)->Page());
 
-    LoadPageDir(cr3);
+    X86_set_cr3(cr3);
     FlushTLB();
 }
 
@@ -151,7 +151,7 @@ void SwitchPageDir(PageTable* new_dir) {
     // We must keep the kernel addresses mapped identically
     auto kernel_entries = kKernelBase / kPageSize / kNumPageEntries;
     memcpy(new_dir->entries + kernel_entries, GetCurrentDir() + kernel_entries, (kNumPageEntries - kernel_entries - 1) * sizeof(PageEntry));
-    LoadPageDir(PhysAddress(new_dir));
+    X86_set_cr3(PhysAddress(new_dir));
     FlushTLB();
 }
 
@@ -169,7 +169,7 @@ void page_fault(Regs* regs) {
     constexpr uintptr_t kUser = 4;
 
     auto error = regs->err_code;
-    auto fault_address = LoadPageFaultAddress();
+    auto fault_address = X86_load_cr2();
     auto page_index = fault_address / kPageSize;
 
     // kprint("Page fault error {} @{} coming from @{}:{} stack: {}\n", error, Hex(fault_address), Hex(regs->cs), Hex(regs->eip), s);
@@ -322,7 +322,7 @@ void EnablePaging(PageTable* ptables, uintptr_t phys_address) {
 
     for (int i = 0; i < 4; i++) ptables[3].entries[i + kNumPageEntries - 4] = PageEntry(AsPhysical(ptables + i) / kPageSize, 1, 0, 0);
 
-    LoadPageDir(AsPhysical(ptables + 3));
+    X86_set_cr3(AsPhysical(ptables + 3));
 
     // Enable paging and Write Protect bit
     asm volatile (

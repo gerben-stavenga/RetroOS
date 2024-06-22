@@ -1,14 +1,14 @@
-CC := i686-linux-gnu-g++
-LD := i686-linux-gnu-g++
-AR := i686-linux-gnu-ar
+CC := clang++
+LD := ld
+AR := ar
 AS := nasm
 OBJCOPY := i686-linux-gnu-objcopy
 
 # no-red-zone is needed because in kernel mode, the stack is nested due to interrupts not switching to a new stack
-CFLAGS := -O2 -Wall -Wextra -ffreestanding -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-common -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -mno-red-zone -std=c++20 -I .
-LDFLAGS := -nostdlib -no-pie -lgcc
+CFLAGS := -O2 -Wall -Wextra -m32 -march=i386 -ffreestanding -fbuiltin -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-common -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -mno-red-zone -std=c++20 -I .
+LDFLAGS := -melf_i386 -nostdlib -no-pie
 
-BOOTLOADER_OBJ := build/src/arch/x86/boot.o
+BOOTLOADER_OBJ := build/src/arch/x86/boot/boot.o
 KERNEL_OBJ := build/src/arch/x86/start32.o build/src/arch/x86/paging.o build/src/arch/x86/descriptors.o build/src/arch/x86/traps.o build/src/arch/x86/irq.o build/src/arch/x86/thread.o
 FREESTANDING_OBJ := build/src/freestanding/utils.o
 LIBC_OBJ := build/src/libc/libc.o
@@ -42,7 +42,7 @@ build/src/libc/libc.a: $(LIBC_OBJ)
 	mkdir -p $(@D)
 	$(AR) rcs $@ $^
 
-build/src/arch/x86/bootloader.elf: src/arch/x86/boot.ld build/src/arch/x86/mbr.o $(BOOTLOADER_OBJ) build/src/freestanding/freestanding.a
+build/src/arch/x86/bootloader.elf: src/arch/x86/boot/boot.ld build/src/arch/x86/boot/mbr.o $(BOOTLOADER_OBJ) build/src/freestanding/freestanding.a
 	mkdir -p $(@D)
 	$(LD) -T $^ -o $@ $(LDFLAGS)
 
@@ -52,7 +52,7 @@ build/src/arch/x86/kernel.elf: src/arch/x86/kernel.ld build/src/arch/x86/entry.o
 
 build/src/arch/x86/init.elf: build/src/libc/crt0.o $(INIT_OBJ) build/src/libc/libc.a build/src/freestanding/freestanding.a
 	mkdir -p $(@D)
-	$(LD) -Ttext=0x10000 $^ -o $@ $(LDFLAGS)
+	$(LD) --image-base-= 0x10000 $^ -o $@ $(LDFLAGS)
 
 build/kernel.md5: build/src/arch/x86/kernel.bin
 	md5sum $< | xxd -r -p > $@

@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "boot.h"
+#include "boot/boot.h"
 #include "src/freestanding/utils.h"
 #include "descriptors.h"
 #include "irq.h"
@@ -14,7 +14,7 @@
 #include "x86_inst.h"
 
 struct Screen {
-    int cursor_x, cursor_y;
+    int cursor_x = 0, cursor_y = 0;
 
     void ClearScreen() {
         uint16_t *video = reinterpret_cast<uint16_t *>(kLowMemBase + 0xB8000);
@@ -43,20 +43,24 @@ struct Screen {
     }
 };
 
-constinit Screen screen;
+struct KernelOutput : public OutputStream {
+    void Push(string_view str) override;
+
+    Screen screen_;
+};
 
 void KernelOutput::Push(string_view str) {
-    Screen tmp = screen;
+    Screen tmp = screen_;
     for (char c : str) {
         tmp.Put(c);
     }
-    screen = tmp;
+    screen_ = tmp;
 }
 
 constinit KernelOutput kout;
 
 NOINLINE [[noreturn]] void terminate(int) {
-    while (true) hlt_inst();
+    while (true) X86_hlt();
 }
 
 extern PageTable page_tables[];
@@ -130,8 +134,8 @@ void ReadFile(void* dst, size_t size) {
 }
 
 extern "C" void KernelInit(const BootData* boot_data) {
-    screen.cursor_x = boot_data->cursor_pos & 0xFF;
-    screen.cursor_y = (boot_data->cursor_pos >> 8) & 0xFF;
+    kout.screen_.cursor_x = boot_data->cursor_pos & 0xFF;
+    kout.screen_.cursor_y = (boot_data->cursor_pos >> 8) & 0xFF;
 
     uintptr_t ramdisk = PhysAddress(boot_data->ramdisk);
     size_t ramdisk_size = boot_data->ramdisk_size;
@@ -143,7 +147,7 @@ extern "C" void KernelInit(const BootData* boot_data) {
     SetupDescriptorTables();
 
     RemapInterrupts();
-    EnableIRQ();
+    X86_sti();
 
     InitFS(ramdisk, ramdisk_size);
 

@@ -9,6 +9,9 @@
 #include <stddef.h>
 
 #define NOINLINE __attribute__((noinline))
+#define ALWAYS_INLINE __attribute__((always_inline))
+#define PREDICT_TRUE(x) __builtin_expect((x), 1)
+#define PREDICT_FALSE(x) __builtin_expect((x), 0)
 
 #ifdef NDEBUG
 constexpr bool kDebug = false;
@@ -46,38 +49,38 @@ struct is_integral : bool_constant<
         p + t; // Exclude everything not yet excluded but integral types
         }> {};
 
-template< class T >
+template <class T>
 inline constexpr bool is_integral_v = is_integral<T>::value;
 
-template < class T >
+template <class T>
 concept integral = is_integral_v<T>;
 
-template<class T, class U>
+template <class T, class U>
 struct is_same : false_type {};
 
-template<class T>
+template <class T>
 struct is_same<T, T> : true_type {};
 
 
-template<class T> struct remove_cv { typedef T type; };
-template<class T> struct remove_cv<const T> { typedef T type; };
-template<class T> struct remove_cv<volatile T> { typedef T type; };
-template<class T> struct remove_cv<const volatile T> { typedef T type; };
+template <class T> struct remove_cv { typedef T type; };
+template <class T> struct remove_cv<const T> { typedef T type; };
+template <class T> struct remove_cv<volatile T> { typedef T type; };
+template <class T> struct remove_cv<const volatile T> { typedef T type; };
 
-template<class T> struct remove_const { typedef T type; };
-template<class T> struct remove_const<const T> { typedef T type; };
+template <class T> struct remove_const { typedef T type; };
+template <class T> struct remove_const<const T> { typedef T type; };
 
-template<class T> struct remove_volatile { typedef T type; };
-template<class T> struct remove_volatile<volatile T> { typedef T type; };
+template <class T> struct remove_volatile { typedef T type; };
+template <class T> struct remove_volatile<volatile T> { typedef T type; };
 
-template< class T >
+template <class T >
 using remove_cv_t = typename remove_cv<T>::type;
-template< class T >
+template <class T >
 using remove_const_t = typename remove_const<T>::type;
-template< class T >
+template <class T >
 using remove_volatile_t = typename remove_volatile<T>::type;
 
-template<class T>
+template <class T>
 struct is_floating_point
         : integral_constant<
                 bool,
@@ -94,21 +97,21 @@ struct is_floating_point
 */
         > {};
 
-template<class T>
+template <class T>
 struct is_arithmetic : integral_constant<bool,
         is_integral<T>::value ||
         is_floating_point<T>::value> {};
 
 namespace detail
 {
-    template<typename T,bool = is_arithmetic<T>::value>
+    template <typename T,bool = is_arithmetic<T>::value>
     struct is_signed : integral_constant<bool, T(-1) < T(0)> {};
 
-    template<typename T>
+    template <typename T>
     struct is_signed<T,false> : false_type {};
 } // namespace detail
 
-template<typename T>
+template <typename T>
 struct is_signed : detail::is_signed<T>::type {};
 
 extern "C" {
@@ -121,15 +124,15 @@ size_t strlen(const char *p);
 size_t strnlen(const char *p, size_t max);
 int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, size_t n);
-const char* strchr(const char *s, int c);
-const char* strrchr(const char *s, int c);
-const char* strstr(const char* haystack, const char* needle);
+char* strchr(const char *s, int c);
+char* strrchr(const char *s, int c);
+char* strstr(const char* haystack, const char* needle);
 
 }
 
 struct string_view {
     constexpr string_view() = default;
-    constexpr string_view(const char* s) : string_view(s, __builtin_strlen(s)) {}
+    constexpr string_view(const char* s) : string_view(s, strlen(s)) {}
     template<int N> constexpr string_view(const char (&s)[N]) : string_view(s, N) {}
     constexpr string_view(const char* s, size_t n) : data_(s), size_(n) {}
 
@@ -161,20 +164,21 @@ public:
 
 class BufferedOStream {
 public:
-    ~BufferedOStream() {
-        char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedOStream);
+    void Finalize(size_t pos) {
         if (pos != 0) {
+            char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedOStream);
             stream->Push({buffer, pos});
         }
     }
 
-    void put(char c) {
+    size_t put(size_t pos, char c) {
         char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedOStream);
         buffer[pos++] = c;
-        if (c == '\n' || pos == buffer_size) {
+        if (PREDICT_FALSE(c == '\n' || pos == buffer_size)) {
             stream->Push({buffer, pos});
             pos = 0;
         }
+        return pos;
     }
 
 protected:
@@ -182,34 +186,49 @@ protected:
 
 private:
     OutputStream* stream;
-    size_t pos = 0;
     size_t buffer_size;
 };
 
-void print_char(BufferedOStream& out, uintptr_t x, uintptr_t);
-void print_val_u(BufferedOStream& out, uintptr_t x, uintptr_t);
-void print_val_s(BufferedOStream& out, uintptr_t x, uintptr_t);
-void print_val_hex(BufferedOStream& out, uintptr_t x, uintptr_t ndigits);
-void print_val_hex64(BufferedOStream& out, uintptr_t x, uintptr_t ndigits);
-void print_val_str(BufferedOStream& out, uintptr_t data, uintptr_t size);
-void print_val_hexbuf(BufferedOStream& out, uintptr_t data, uintptr_t size);
-
 struct ValuePrinter {
-    uintptr_t value;
-    uintptr_t extra;
-    void (*print)(BufferedOStream& out, uintptr_t value, uintptr_t extra);
+    ValuePrinter() {};
+    union {
+        uint64_t n;
+        struct {
+            uintptr_t x;
+            uintptr_t size;
+        } hex_num;
+        void* p;
+        string_view s;
+    };
+    size_t (*print)(size_t pos, BufferedOStream& out, const ValuePrinter& value);
 };
 
+size_t print_char(size_t pos, BufferedOStream& out, const ValuePrinter& value);
+size_t print_val_u(size_t pos, BufferedOStream& out, const ValuePrinter& value);
+size_t print_val_s(size_t pos, BufferedOStream& out, const ValuePrinter& value);
+size_t print_val_hex(size_t pos, BufferedOStream& out, const ValuePrinter& value);
+size_t print_val_hex64(size_t pos, BufferedOStream& out, const ValuePrinter& value);
+size_t print_val_str(size_t pos, BufferedOStream& out, const ValuePrinter& value);
+size_t print_val_hexbuf(size_t pos, BufferedOStream& out, const ValuePrinter& value);
+
 inline ValuePrinter MakeValuePrinter(const bool& x) {
-    return {static_cast<uintptr_t>(x), 0, print_val_u };
+    ValuePrinter res;
+    res.n = x;
+    res.print = print_val_u;
+    return res;
 }
 inline ValuePrinter MakeValuePrinter(const char& x) {
-    return {static_cast<uintptr_t>(x), 0, print_char };
+    ValuePrinter res;
+    res.n = x;
+    res.print = print_char;
+    return res;
 }
 
 inline ValuePrinter MakeValuePrinter(const integral auto& x) {
-    auto value = static_cast<uint64_t>(x);
-    return {static_cast<uintptr_t>(value), static_cast<uintptr_t>(value >> 32), print_val_u };
+    ValuePrinter res;
+    res.n = x;
+    res.print = is_signed<decltype(x)>::value ? print_val_s : print_val_u;
+    return res;
 }
 
 template<typename T>
@@ -220,16 +239,24 @@ struct Hex {
 
 template <typename T>
 ValuePrinter MakeValuePrinter(const Hex<T>& x) {
+    ValuePrinter res;
     if (sizeof(T) > sizeof(uintptr_t)) {
-        return {static_cast<uintptr_t>(x.x), static_cast<uintptr_t>(x.x >> 32), print_val_hex64};
+        res.n = x.x;
+        res.print = print_val_hex64;
     } else {
-        return {static_cast<uintptr_t>(x.x), sizeof(T) * 2, print_val_hex};
+        res.hex_num.x = x.x;
+        res.hex_num.size = 2 * sizeof(T);
+        res.print = print_val_hex;
     }
+    return res;
 }
 
 template <>
 inline ValuePrinter MakeValuePrinter<string_view>(const Hex<string_view>& x) {
-    return {reinterpret_cast<uintptr_t>(x.x.data()), x.x.size(), print_val_hexbuf };
+    ValuePrinter res;
+    res.s = x.x;
+    res.print = print_val_hexbuf;
+    return res;
 }
 
 inline ValuePrinter MakeValuePrinter(void const* const& x) {
@@ -238,14 +265,17 @@ inline ValuePrinter MakeValuePrinter(void const* const& x) {
 }
 
 inline ValuePrinter MakeValuePrinter(const string_view& x) {
-    return {reinterpret_cast<uintptr_t>(x.data()), x.size(), print_val_str };
+    ValuePrinter res;
+    res.s = x;
+    res.print = print_val_str;
+    return res;
 }
 inline ValuePrinter MakeValuePrinter(char const* const& x) {
     auto tmp = string_view(x);
     return MakeValuePrinter(tmp);
 }
 
-void print_buf(BufferedOStream& out, string_view format, const ValuePrinter* printers, size_t n);
+size_t print_buf(size_t pos, BufferedOStream& out, string_view format, const ValuePrinter* printers, size_t n);
 
 void PrintImpl(OutputStream& out, string_view format, const ValuePrinter* printers, size_t n);
 
@@ -258,6 +288,7 @@ private:
 };
 
 template <typename... Args>
+ALWAYS_INLINE
 void print(OutputStream& out, string_view format, const Args&... args) {
     constexpr auto n = sizeof...(Args);
     const ValuePrinter printers[n] = {MakeValuePrinter(args)...};
@@ -265,10 +296,11 @@ void print(OutputStream& out, string_view format, const Args&... args) {
 }
 
 template <typename... Args>
-void print(BufferedOStream& out, string_view format, const Args&... args) {
+ALWAYS_INLINE
+size_t print(size_t pos, BufferedOStream& out, string_view format, const Args&... args) {
     constexpr auto n = sizeof...(Args);
     const ValuePrinter printers[n] = {MakeValuePrinter(args)...};
-    print_buf(out, format, printers, n);
+    return print_buf(pos, out, format, printers, n);
 }
 
 class InputStream {

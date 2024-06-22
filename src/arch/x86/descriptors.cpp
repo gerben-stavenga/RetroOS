@@ -38,9 +38,9 @@ void SetupDescriptorTables() {
 
     gdt[5] = MakeTSSDescriptor(&task_state_segment);
 
-    LoadGDT(gdt, sizeof(gdt));
-    LoadIDT(idt, sizeof(idt));
-    LoadTR(kTSS);
+    X86_lgdt(gdt, sizeof(gdt));
+    X86_lidt(idt, sizeof(idt));
+    X86_ltr(kTSS);
 
     // Reload all segments
     asm volatile (

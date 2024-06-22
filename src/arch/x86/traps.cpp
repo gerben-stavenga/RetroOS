@@ -198,10 +198,10 @@ const IsrTable isr_table = MakeTable();
 extern "C" uint64_t int_vector[];
 
 extern "C" void* isr_handler(Regs* regs) {
-    EnableIRQ();
+    X86_sti();
     regs->int_no = (regs->int_no - reinterpret_cast<uintptr_t>(int_vector)) / 8;
     isr_table.entries[regs->int_no](regs);
-    DisableIRQ();
+    X86_cli();
     if (should_yield && regs->cs & 3) {
         Schedule(regs, false);
         should_yield = false;

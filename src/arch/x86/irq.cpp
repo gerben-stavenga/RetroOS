@@ -31,13 +31,13 @@ void (*irq_handlers[16])() = {nullptr};
 
 bool RegisterIrqHandler(int irq, void (*handler)()) {
     uint16_t pic_port = (irq >= 8 ? kSlavePort : kMasterPort);
-    auto mask = inb(pic_port + 1);
+    auto mask = X86_inb(pic_port + 1);
     auto irq_bit = 1 << (irq & 7);
     if ((mask & irq_bit) == 0) {
         // IRQ is already enabled, so we can't register a handler.
         return false;
     }
-    outb(pic_port + 1, mask & ~irq_bit);
+    X86_outb(pic_port + 1, mask & ~irq_bit);
     irq_handlers[irq] = handler;
     return true;
 }
@@ -154,7 +154,7 @@ char kbd_US_shift[128] = {
 
 void KeyboardHandler() {
     static uint8_t key_state[16];
-    int key = inb(0x60);
+    int key = X86_inb(0x60);
     if ((key & 0x80) == 0) {
         key_state[(key & 0x7f) >> 3] |= 1 << (key & 7);
         bool shift = (key_state[LSHIFT / 8] & (1 << (LSHIFT & 7))) || (key_state[RSHIFT / 8] & (1 << (RSHIFT & 7)));
@@ -175,7 +175,7 @@ void IrqHandler(Regs* regs) {
     if (irq >= 8) {
         // A slave interrupt is always raised through IRQ 2 of the master,
         // so we have to send an EOI to the master.
-        outb(kMasterPort, kEOI);
+        X86_outb(kMasterPort, kEOI);
     }
     uint16_t pic_port = (irq >= 8 ? kSlavePort : kMasterPort);
     uint8_t irq_bit = 1 << (irq & 7);
@@ -183,15 +183,15 @@ void IrqHandler(Regs* regs) {
     bool spurious_irq = irq_bit == 0x80;  // irq == 7 || irq == 15
     if (spurious_irq) {
         // Note, we have set the PIC to ISR mode, so we can read the ISR from the PIC.
-        auto isr_reg = inb(pic_port);
+        auto isr_reg = X86_inb(pic_port);
         if ((isr_reg & irq_bit) == 0) return;
     }
     // Interrupts are allowed to nest except for the same IRQ. At this point the PIC
     // is blocking all IRQs it handles. So we first block the IRQ we are handling.
-    auto mask = inb(pic_port + 1);
-    outb(pic_port + 1, mask | irq_bit);
+    auto mask = X86_inb(pic_port + 1);
+    X86_outb(pic_port + 1, mask | irq_bit);
     // Acknowledge interrupt by sending End Of Interrupt to PIC.
-    outb(pic_port, kEOI);
+    X86_outb(pic_port, kEOI);
     // At this point interrupts are resumed except for the IRQ we are handling.
 
     if (irq_handlers[irq] != nullptr) {
@@ -201,7 +201,7 @@ void IrqHandler(Regs* regs) {
     }
 
     // Unblock IRQ.
-    outb(pic_port + 1, mask);
+    X86_outb(pic_port + 1, mask);
 }
 
 void InitializePit(int channel, int frequency) {
@@ -210,7 +210,7 @@ void InitializePit(int channel, int frequency) {
     // Set PIT to mode 3 (square wave generator)
     // channel(2 bits) = 0, rw mode (2 bits) = 3 (LSB then MSB), mode (3 bits) = 3 (square wave), bcd (1 bit) = 0
     constexpr uint8_t kMode3 = 0x36;
-    outb(kPitPort + kCommand, (channel << 6) | kMode3);
+    X86_outb(kPitPort + kCommand, (channel << 6) | kMode3);
     // 2^32 ticks per hour equals 1193046.47111 Hz which is surprisingly close to 1193182 Hz.
     // The lowest frequency is chosen when the divisor = 65536 leading to the classical 18.2 Hz timer.
     // Calculate divisor for frequency
@@ -222,27 +222,27 @@ void InitializePit(int channel, int frequency) {
         divisor = 1;
     }
     // Set frequency by sending the divisor LSB then MSB
-    outb(kPitPort + channel, divisor & 0xFF);
-    outb(kPitPort + channel, divisor >> 8);
+    X86_outb(kPitPort + channel, divisor & 0xFF);
+    X86_outb(kPitPort + channel, divisor >> 8);
 }
 
 void InitializePic(uint16_t port, uint8_t irq_offset, uint8_t cascade) {
     // Sending Initialization Command Words (ICW) to PIC
     // ICW1 - INIT | ICW4
-    outb(port, 0x11);
+    X86_outb(port, 0x11);
     // ICW2 - Set interrupt offset (must be multiple of 8), because the 3 LSBs are set to the IRQ number..
-    outb(port + 1, irq_offset);
+    X86_outb(port + 1, irq_offset);
     // ICW3 Cascade identity, for master a bitmask of the slave's IRQ, for slave the identity
-    outb(port + 1, cascade);
+    X86_outb(port + 1, cascade);
     // ICW4 (8086 mode)
-    outb(port + 1, 0x01);
+    X86_outb(port + 1, 0x01);
 
     // Set PIC to Interrupt Service Register mode, subsequent reads from PIC
     // will read ISR (needed for spurious IRQ detection)
-    outb(port, 0xb);
+    X86_outb(port, 0xb);
 
     // Mask all interrupts, except for the cascade IRQ
-    outb(port + 1, port == kMasterPort ? ~cascade : 0xff);
+    X86_outb(port + 1, port == kMasterPort ? ~cascade : 0xff);
 }
 
 void RemapInterrupts() {
