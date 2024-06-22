@@ -11,7 +11,6 @@ void *memcpy(void *dst, const void *src, size_t n) {
         static_cast<char *>(dst)[i] = static_cast<const char *>(src)[i];
     }
     return dst;
-    //return __builtin_memcpy(dst, src, n);
 }
 
 void *memset(void *dst, int value, size_t n) {
@@ -19,7 +18,6 @@ void *memset(void *dst, int value, size_t n) {
         static_cast<char *>(dst)[i] = value;
     }
     return dst;
-    //return __builtin_memset(dst, value, n);
 }
 
 void *memmove(void *dst, const void *src, size_t n) {
@@ -76,23 +74,23 @@ size_t strnlen(const char *str, size_t n) {
     return n;
 }
 
-const char *strchr(const char *str, int c) {
+char *strchr(const char *str, int c) {
     for (size_t i = 0; str[i]; i++) {
         if (str[i] == c) {
-            return str + i;
+            return const_cast<char*>(str + i);
         }
     }
     return nullptr;
 }
 
-const char *strrchr(const char *str, int c) {
+char *strrchr(const char *str, int c) {
     const char *last = nullptr;
     for (size_t i = 0; str[i]; i++) {
         if (str[i] == c) {
             last = str + i;
         }
     }
-    return last;
+    return const_cast<char*>(last);
 }
 
 int strcmp(const char *lhs, const char *rhs) {
@@ -144,7 +142,7 @@ char *strncat(char *dst, const char *src, size_t n) {
     return dst;
 }
 
-const char* strstr(const char *haystack, const char *needle) {
+char* strstr(const char *haystack, const char *needle) {
     size_t len = 0;
     while (needle[len]) {
         if (haystack[len] == needle[len]) {
@@ -155,7 +153,7 @@ const char* strstr(const char *haystack, const char *needle) {
             haystack++;
         }
     }
-    return haystack;
+    return const_cast<char*>(haystack);
 }
 
 }  // extern "C"
@@ -167,15 +165,15 @@ void panic_assert(OutputStream& out, string_view cond_str, string_view file, int
 
 NOINLINE void PrintImpl(OutputStream& out, string_view format, const ValuePrinter* printers, size_t n) {
     BufferedOStreamN<100> buf(&out);
-    print_buf(buf, format, printers, n);
+    buf.Finalize(print_buf(0, buf, format, printers, n));
 }
 
-NOINLINE void print_buf(BufferedOStream& out, string_view format, const ValuePrinter* printers, size_t n) {
+NOINLINE size_t print_buf(size_t pos, BufferedOStream& out, string_view format, const ValuePrinter* printers, size_t n) {
     size_t k = 0;
     for (size_t i = 0; i < format.size(); i++) {
-        if (format[i] == '{') {
+        if (PREDICT_FALSE(format[i] == '{')) {
             if (i + 1 < format.size() && format[i + 1] == '{') {
-                out.put('{');
+                pos = out.put(pos, '{');
                 i++;
             } else {
                 size_t j = i + 1;
@@ -185,27 +183,27 @@ NOINLINE void print_buf(BufferedOStream& out, string_view format, const ValuePri
                 if (j == format.size() || k >= n) {
                     goto error;
                 }
-                printers[k].print(out, printers[k].value, printers[k].extra);
+                pos = printers[k].print(pos, out, printers[k]);
                 k++;
                 i = j;
             }
         } else {
-            out.put(format[i]);
+            pos = out.put(pos, format[i]);
         }
     }
     if (k < n) {
 error:
-        print(out, "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
+        pos = print(pos, out, "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
         terminate(-1);
     }
+    return pos;
 }
 
-NOINLINE void print_char(BufferedOStream& out, uintptr_t x, uintptr_t) {
-    out.put(x);
+NOINLINE size_t print_char(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    return out.put(pos, value.n);
 }
 
-NOINLINE void print_val_u(BufferedOStream& out, uintptr_t x, uintptr_t y) {
-    auto z = uint64_t(x) | (uint64_t(y) << 32);
+NOINLINE size_t print_decimal(size_t pos, BufferedOStream& out, uint64_t z) {
     char buf[20];
     int n = 0;
     do {
@@ -213,54 +211,67 @@ NOINLINE void print_val_u(BufferedOStream& out, uintptr_t x, uintptr_t y) {
         z /= 10;
     } while (z);
     for (int i = n - 1; i >= 0; i--) {
-        out.put(buf[i] + '0');
+        pos = out.put(pos, buf[i] + '0');
     }
+    return pos;
 }
 
-void print_val_s(BufferedOStream& out, uintptr_t x, uintptr_t y) {
-    auto z = uint64_t(x) | (uint64_t(y) << 32);
+NOINLINE size_t print_val_u(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    auto z = value.n;
+    return print_decimal(pos, out, z);
+}
+
+size_t print_val_s(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    auto z = value.n;
     if (int64_t(z) < 0) {
-        out.put('-');
-        z = (~z) + 1;
+        pos = out.put(pos, '-');
+        z = -z;
     }
-    print_val_u(out, z, z >> 32);
+    return print_decimal(pos, out, z);
 }
 
 inline char HexDigit(int x) {
     return x < 10 ? '0' + x : 'a' + x - 10;
 }
 
-NOINLINE static void print_hex(BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
+NOINLINE static size_t print_hex(size_t pos, BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
     for (int i = ndigits - 1; i >= 0; i--) {
         int digit = (x >> (i * 4)) & 0xf;
-        out.put(HexDigit(digit));
+        pos = out.put(pos, HexDigit(digit));
     }
+    return pos;
 }
 
-void print_val_hex(BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
-    out.put('0'); out.put('x');
-    print_hex(out, x, ndigits);
+size_t print_val_hex(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    auto x = value.hex_num.x;
+    auto ndigits = value.hex_num.size;
+    pos = out.put(pos, '0'); pos = out.put(pos, 'x');
+    return print_hex(pos, out, x, ndigits);
 }
 
-void print_val_hex64(BufferedOStream& out, uintptr_t x, uintptr_t y) {
-    out.put('0'); out.put('x');
-    print_hex(out, y, sizeof(uintptr_t) * 2);
-    print_hex(out, x, sizeof(uintptr_t) * 2);
+size_t print_val_hex64(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    uintptr_t x = value.n & 0xFFFFFFFF;
+    uintptr_t y = value.n >> 32;
+    pos = out.put(pos, '0'); pos = out.put(pos, 'x');
+    pos = print_hex(pos, out, y, sizeof(uintptr_t) * 2);
+    return print_hex(pos, out, x, sizeof(uintptr_t) * 2);
 }
 
-void print_val_str(BufferedOStream& out, uintptr_t data, uintptr_t size) {
-    string_view str(reinterpret_cast<const char*>(data), size);
+size_t print_val_str(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    string_view str(value.s);
     for (size_t i = 0; i < str.size(); i++) {
-        out.put(str[i]);
+        pos = out.put(pos, str[i]);
     }
+    return pos;
 }
 
-void print_val_hexbuf(BufferedOStream& out, uintptr_t data, uintptr_t size) {
-    string_view str(reinterpret_cast<const char*>(data), size);
+size_t print_val_hexbuf(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    string_view str(value.s);
     for (size_t i = 0; i < str.size(); i++) {
-        out.put(HexDigit(uint8_t(str[i]) >> 4));
-        out.put(HexDigit(str[i] & 0xF));
+        pos = out.put(pos, HexDigit(uint8_t(str[i]) >> 4));
+        pos = out.put(pos, HexDigit(str[i] & 0xF));
     }
+    return pos;
 }
 
 struct USTARRawHeader {
@@ -388,29 +399,29 @@ inline uint32_t LeftRotate(uint32_t x, uint32_t c) {
 // All variables are unsigned 32 bit and wrap modulo 2^32 when calculating
 static void ChunkMD5(const char* chunk, uint32_t md5_hash[4]) {
     static const uint8_t kShifts[4][4] = {
-            7, 12, 17, 22,
-            5, 9, 14, 20,
-            4, 11, 16, 23,
-            6, 10, 15, 21,
+            {7, 12, 17, 22},
+            {5, 9, 14, 20},
+            {4, 11, 16, 23},
+            {6, 10, 15, 21},
     };
 
     static const uint32_t kConsts[4][16] = {
-            0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+            {0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
             0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
             0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
-            0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-            0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+            0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821},
+            {0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
             0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
             0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-            0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-            0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+            0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a},
+            {0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
             0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
             0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
-            0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-            0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+            0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665},
+            {0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
             0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
             0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
-            0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+            0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391},
     };
 
     uint32_t A = md5_hash[0];

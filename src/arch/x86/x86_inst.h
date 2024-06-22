@@ -12,62 +12,52 @@ struct DescriptorPtr {
     const void* base;
 } __attribute__((packed));
 
-inline void LoadGDT(void* base, size_t size) {
+inline void X86_lgdt(void* base, size_t size) {
     DescriptorPtr ptr = {static_cast<uint16_t>(size - 1), base};
     asm volatile ("lgdt %0\n\t"::"m"(ptr));
 }
 
-inline void LoadIDT(void* base, size_t size) {
+inline void X86_lidt(void* base, size_t size) {
     DescriptorPtr ptr = {static_cast<uint16_t>(size - 1), base};
     asm volatile ("lidt %0\n\t"::"m"(ptr));
 }
 
-inline void LoadTR(int selector) {
+inline void X86_ltr(int selector) {
     asm volatile ("ltr %w0\n\t"::"r" (selector));
 }
 
 // This is the physical address, pointers in the kernel refer
 // to linear address.
-inline void LoadPageDir(uintptr_t page) {
+inline void X86_set_cr3(uintptr_t page) {
     asm volatile ("mov %0, %%cr3\n\t"::"r"(page):"memory");
 }
 
-inline void outb(uint16_t port, uint8_t data) {
+inline void X86_outb(uint16_t port, uint8_t data) {
     asm volatile("outb %0, %1" : : "a"(data), "d"(port));
 }
 
-inline uint8_t inb(uint16_t port) {
+inline uint8_t X86_inb(uint16_t port) {
     uint8_t data;
     asm volatile("inb %1, %0" : "=a"(data) : "d"(port));
     return data;
 }
 
-inline void EnableIRQ() {
+inline void X86_sti() {
     asm volatile ("sti\n\t");
 }
 
-inline void DisableIRQ() {
+inline void X86_cli() {
     asm volatile ("cli\n\t");
 }
 
-inline void hlt_inst() {
+inline void X86_hlt() {
     asm volatile("hlt\n\t");
 }
 
-inline uintptr_t LoadPageFaultAddress() {
+inline uintptr_t X86_load_cr2() {
     uintptr_t address;
     asm ("mov %%cr2, %0":"=r"(address));
     return address;
-}
-
-inline const void* GetIP() {
-    uintptr_t res;
-    asm volatile(
-            "call 1f\n\t"
-            "1:\n\t"
-            "pop %0\n\t"
-            : "=r"(res));
-    return reinterpret_cast<const void*>(res);
 }
 
 inline bool CheckA20() {

@@ -63,7 +63,7 @@ constexpr DescriptorEntry MakeSegDesc(bool is_32bit, bool is_code, int dpl) {
     };
 }
 
-constexpr DescriptorEntry MakeTSSDescriptor(TSS* ptr) {
+inline DescriptorEntry MakeTSSDescriptor(TSS* ptr) {
     uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
     return DescriptorEntry {
             sizeof(TSS) - 1,  // limit
@@ -95,7 +95,7 @@ struct IdtEntry {
 
 // We only use interrupt gates (which additionally clears IF) and enable interrupts manually
 // depending on the logic
-constexpr IdtEntry MakeInterruptGate(void* ptr, uint16_t dpl) {
+inline IdtEntry MakeInterruptGate(void* ptr, uint16_t dpl) {
     auto base = reinterpret_cast<uintptr_t>(ptr);
     auto offset_low = static_cast<uint16_t>(base);
     auto offset_high = static_cast<uint16_t>(base >> 16);

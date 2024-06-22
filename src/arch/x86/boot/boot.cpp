@@ -4,9 +4,7 @@
 #include "boot.h"
 
 #include "src/freestanding/utils.h"
-#include "x86_inst.h"
-
-constexpr int kKernelSize = 30;
+#include "src/arch/x86/x86_inst.h"
 
 struct Regs {
     uint32_t ax;
@@ -25,10 +23,6 @@ Regs regs;
 // Call an interrupt function and returns the flag status
 extern "C" int __attribute__((no_caller_saved_registers)) generate_real_interrupt(int interrupt);
 
-NOINLINE [[noreturn]] void terminate(int) {
-    while (true) hlt_inst();
-}
-
 inline int GetCursor() {
     regs.ax = 0x300;
     regs.bx = 0;
@@ -43,19 +37,6 @@ inline void PutChar(char c) {
     generate_real_interrupt(0x10);
 }
 
-
-inline void Print(string_view str) {
-    regs.ax = 0x300;
-    regs.bx = 0;
-    generate_real_interrupt(0x10);
-    regs.ax = 0x1301;
-    regs.bx = 7;
-    regs.cx = str.size();
-    regs.es = 0;
-    regs.bp = reinterpret_cast<uintptr_t>(str.data());
-    generate_real_interrupt(0x10);
-}
-
 struct Out : public OutputStream {
     void Push(string_view str) override {
         for (char c : str) {
@@ -64,10 +45,21 @@ struct Out : public OutputStream {
     }
 };
 
+Out out;
+
+[[noreturn]] inline void Halt() {
+    while (true) X86_hlt();    
+}
+
+NOINLINE [[noreturn]] void terminate(int exit_code) {
+    print(out, "Panic! Exit code {}", exit_code);
+    Halt();
+}
+
 inline int min(unsigned a, unsigned b) { return a < b ? a : b; }
 
 __attribute__((__always_inline__))
-inline bool read_disk(int drive, unsigned lba, unsigned count, void* buffer) {
+inline bool read_disk(int drive, unsigned lba, uint16_t count, void* buffer) {
     auto address = reinterpret_cast<uintptr_t>(buffer);
     struct __attribute__((packed)) {
         char size;
@@ -76,7 +68,8 @@ inline bool read_disk(int drive, unsigned lba, unsigned count, void* buffer) {
         uint16_t off;
         uint16_t seg;
         uint64_t lba;
-    } packet = { 16, 0, count, address & 0xF, address >> 4, lba };
+    } packet = { 16, 0, count, static_cast<uint16_t>(address & 0xF), 
+                static_cast<uint16_t>(address >> 4), lba };
     // Use int 13 to read disk
     regs.ax = 0x4200;
     regs.ds = 0;
@@ -143,7 +136,6 @@ extern char _start[], _edata[], _end[];
 [[noreturn]] void FullBootLoader(int drive) {
     memset(_edata, 0, _end - _edata);
     void* const buffer = reinterpret_cast<void*>(0x1000);
-    Out out;
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
     print(out, "Loader size: {}\n", _edata - _start);
     print(out, "Extended BIOS at {}\n", Hex(uintptr_t(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
@@ -196,15 +188,30 @@ extern char _start[], _edata[], _end[];
     __builtin_unreachable();
 }
 
+// Master boot record code (must fit the 512 byte limit)
+__attribute__((always_inline))
+inline void Print(string_view str) {
+    regs.ax = 0x300;
+    regs.bx = 0;
+    generate_real_interrupt(0x10);
+    regs.ax = 0x1301;
+    regs.bx = 7;
+    regs.cx = str.size();
+    regs.es = 0;
+    regs.bp = reinterpret_cast<uintptr_t>(str.data());
+    generate_real_interrupt(0x10);
+}
+
 extern "C"
-char start_msg[];
+char start_msg[15];
 
 extern "C" __attribute__((noinline, fastcall, section(".boot")))
 [[noreturn]] void BootLoader(int /* dummy */, int drive) {
-    Print({start_msg, 15});
+    Print(start_msg);
     auto nsectors = (reinterpret_cast<uintptr_t>(_edata) - reinterpret_cast<uintptr_t>(_start) - 1) / 512;
-    if (!read_disk(drive, 1, nsectors, reinterpret_cast<void*>(0x7C00 + 512))) {
-        while (true) hlt_inst();
+    if (read_disk(drive, 1, nsectors, reinterpret_cast<void*>(0x7C00 + 512))) {
+        FullBootLoader(drive);
+    } else {
+        Halt();
     }
-    FullBootLoader(drive);
 }

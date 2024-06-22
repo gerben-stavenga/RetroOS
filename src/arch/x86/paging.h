@@ -7,7 +7,7 @@
 
 #include <stdint.h>
 
-#include "boot.h"
+#include "boot/boot.h"
 #include "entry.h"
 #include "src/freestanding/utils.h"
 
@@ -123,17 +123,20 @@ inline bool IsZero(const PageEntry& e) {
     return e.AsUInt() == 0;
 }
 
-inline void PageEntryPrinter(BufferedOStream& out, uintptr_t value, uintptr_t) {
-    auto entry = PageEntry(value);
+inline size_t PageEntryPrinter(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    auto entry = PageEntry(value.n);
     if (entry.IsPresent()) {
-        print(out, "{{r/w: {}, u/s: {}, cow {}, page: {}}}", entry.IsReadWrite(), entry.IsUserSuper(), entry.IsCow(), Hex(entry.Page()));
+        return print(pos, out, "{{r/w: {}, u/s: {}, cow {}, page: {}}}", entry.IsReadWrite(), entry.IsUserSuper(), entry.IsCow(), Hex(entry.Page()));
     } else {
-        print(out, "{{Page not present}}");
+        return print(pos, out, "{{Page not present}}");
     }
 }
 
 inline ValuePrinter MakeValuePrinter(const PageEntry& e) {
-    return {e.AsUInt(), 0, PageEntryPrinter};
+    ValuePrinter res;
+    res.n = e.AsUInt();
+    res.print = PageEntryPrinter;
+    return res;
 }
 
 struct alignas(kPageSize) PageTable {

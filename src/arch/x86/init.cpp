@@ -16,6 +16,7 @@
     uprint("This should not be printed!\n");
 }
 
+extern "C"
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     uprint("Hello, world!\n");
