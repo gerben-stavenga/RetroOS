@@ -18,7 +18,7 @@ struct Regs {
     uint16_t es;
 } __attribute__((packed));
 
-Regs regs;
+extern Regs regs;
 
 // Call an interrupt function and returns the flag status
 extern "C" int __attribute__((no_caller_saved_registers)) generate_real_interrupt(int interrupt);
@@ -114,14 +114,20 @@ int CreateMemMap(MMapEntry *entries, int max_entries) {
 
 class TarFSReader : public USTARReader {
 public:
-    TarFSReader(int drive, int lba) : USTARReader(lba), drive_(drive) {}
+    TarFSReader(int drive, int lba) : drive_(drive), lba_(lba) {}
 
 private:
     bool ReadBlocks(size_t block, int n, void *buffer) override {
-        return read_disk(drive_, block, n, buffer);
+        print(out, "Reading {} blocks starting at {} to {}\n", n, block + lba_, buffer);
+        if (!read_disk(drive_, lba_ + block, n, buffer)) {
+            print(out, "Failed {}\n", Hex{regs.ax});
+            return false;
+        }
+        return true;
     }
 
     int drive_;
+    int lba_;
 };
 
 static void EnableA20() {
@@ -207,9 +213,12 @@ char start_msg[15];
 
 extern "C" __attribute__((noinline, fastcall, section(".boot")))
 [[noreturn]] void BootLoader(int /* dummy */, int drive) {
-    Print(start_msg);
+    //start_msg[0] = char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive);
+    //Print(start_msg);
     auto nsectors = (reinterpret_cast<uintptr_t>(_edata) - reinterpret_cast<uintptr_t>(_start) - 1) / 512;
     if (read_disk(drive, 1, nsectors, reinterpret_cast<void*>(0x7C00 + 512))) {
+    start_msg[0] = char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive);
+    Print(start_msg);
         FullBootLoader(drive);
     } else {
         Halt();

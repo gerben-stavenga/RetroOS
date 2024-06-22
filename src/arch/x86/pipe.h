@@ -9,40 +9,47 @@ class Pipe {
 public:
     Pipe(size_t size) : size(size) {}
 
-    int Write(string_view s) volatile {
+    int Write(string_view s) {
         int i = 0;
-        while (i < s.size() && write_pos < read_pos + size) {
-            Buffer()[write_pos++ & (size - 1)] = s[i++];
+        auto wp = write_pos;
+        auto rp = read_pos;
+        while (i < s.size() && wp < rp + size) {
+            Buffer()[wp++ & (size - 1)] = s[i++];
         }
+        write_pos = wp;
         return i;
     }
 
-    void Push(char c) volatile {
+    void Push(char c) {
         if (write_pos == read_pos + size) {
             read_pos++;
         }
         Buffer()[write_pos++ & (size - 1)] = c;
     }
 
-    char Pop() volatile {
+    char Pop() {
+        if (Empty()) return 0;
         return Buffer()[read_pos++ & (size - 1)];
     }
 
-    bool Empty() volatile {
+    bool Empty() {
         return read_pos == write_pos;
     }
 
-    int Read(char* buf, int len) volatile {
+    int Read(char* buf, int len) {
         int i = 0;
-        while (i < len && read_pos < write_pos) {
-            buf[i++] = Buffer()[read_pos++ & (size - 1)];
+        auto wp = write_pos;
+        auto rp = read_pos;
+        while (i < len && rp < wp) {
+            buf[i++] = Buffer()[rp++ & (size - 1)];
         }
+        read_pos = rp;
         return i;
     }
 
 private:
-    volatile char* Buffer() volatile {
-        return reinterpret_cast<volatile char*>(this + 1);
+    char* Buffer() {
+        return reinterpret_cast<char*>(this + 1);
     }
 
     uint64_t read_pos = 0;
