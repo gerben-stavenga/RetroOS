@@ -38,7 +38,7 @@ inline void PutChar(char c) {
 }
 
 struct Out : public OutputStream {
-    void Push(string_view str) override {
+    void Push(std::string_view str) override {
         for (char c : str) {
             PutChar(c);
         }
@@ -117,8 +117,7 @@ public:
     TarFSReader(int drive, int lba) : drive_(drive), lba_(lba) {}
 
 private:
-    bool ReadBlocks(size_t block, int n, void *buffer) override {
-        print(out, "Reading {} blocks starting at {} to {}\n", n, block + lba_, buffer);
+    bool ReadBlocks(std::size_t block, int n, void *buffer) override {
         if (!read_disk(drive_, lba_ + block, n, buffer)) {
             print(out, "Failed {}\n", Hex{regs.ax});
             return false;
@@ -151,11 +150,11 @@ extern char _start[], _edata[], _end[];
     TarFSReader tar(drive, fs_lba);
     char* ramdisk = reinterpret_cast<char*>(0x80000);
     char* load_address = ramdisk;
-    size_t size = 0;
+    std::size_t size = 0;
     bool found = false;
     char expected_md5[16];
     while ((size = tar.ReadHeader(load_address)) != SIZE_MAX) {
-        string_view filename{load_address};
+        std::string_view filename{load_address};
         print(out, "filename {} size {}\n", filename, size);
 
         load_address += 512;
@@ -164,14 +163,14 @@ extern char _start[], _edata[], _end[];
             memcpy(expected_md5, load_address, 16);
         } else if (filename == "src/arch/x86/kernel.bin") {
             char md5_out[16];
-            md5(string_view(load_address, size), md5_out);
-            if (string_view(expected_md5) != string_view(md5_out)) {
+            md5(std::string_view(load_address, size), md5_out);
+            if (std::string_view(expected_md5) != std::string_view(md5_out)) {
                 print(out, "Error md5 checksum of kernel {} of size {} mismatch! Expected {} got {}\n",
-                      filename, size, Hex(string_view(expected_md5)), Hex(string_view(md5_out)));
+                      filename, size, Hex(std::string_view(expected_md5)), Hex(std::string_view(md5_out)));
                 memcpy(buffer, load_address, size);
                 found = true;
             } else {
-                print(out, "Loading {} of size {} with md5 {} at physical address {}\n", filename, size, Hex(string_view(md5_out, 16)), buffer);
+                print(out, "Loading {} of size {} with md5 {} at physical address {}\n", filename, size, Hex(std::string_view(md5_out, 16)), buffer);
                 memcpy(buffer, load_address, size);
                 found = true;
             }
@@ -196,7 +195,7 @@ extern char _start[], _edata[], _end[];
 
 // Master boot record code (must fit the 512 byte limit)
 __attribute__((always_inline))
-inline void Print(string_view str) {
+inline void Print(std::string_view str) {
     regs.ax = 0x300;
     regs.bx = 0;
     generate_real_interrupt(0x10);
@@ -213,7 +212,7 @@ char start_msg[15];
 
 extern "C" __attribute__((noinline, fastcall, section(".boot")))
 [[noreturn]] void BootLoader(int /* dummy */, int drive) {
-    Print(start_msg);
+    Print({start_msg, 15});
     auto nsectors = (reinterpret_cast<uintptr_t>(_edata) - reinterpret_cast<uintptr_t>(_start) - 1) / 512;
     if (read_disk(drive, 1, nsectors, reinterpret_cast<void*>(0x7C00 + 512))) {
         FullBootLoader(drive);

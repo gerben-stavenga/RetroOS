@@ -5,7 +5,7 @@
 #ifndef OS_PAGING_H
 #define OS_PAGING_H
 
-#include <stdint.h>
+#include <cstdint>
 
 #include "boot/boot.h"
 #include "entry.h"
@@ -123,7 +123,7 @@ inline bool IsZero(const PageEntry& e) {
     return e.AsUInt() == 0;
 }
 
-inline size_t PageEntryPrinter(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+inline std::size_t PageEntryPrinter(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
     auto entry = PageEntry(value.n);
     if (entry.IsPresent()) {
         return print(pos, out, "{{r/w: {}, u/s: {}, cow {}, page: {}}}", entry.IsReadWrite(), entry.IsUserSuper(), entry.IsCow(), Hex(entry.Page()));

@@ -5,7 +5,7 @@
 #ifndef OS_DESCRIPTORS_H
 #define OS_DESCRIPTORS_H
 
-#include <stdint.h>
+#include <cstdint>
 
 constexpr int kKernelCS = 0x8;
 constexpr int kKernelDS = 0x10;

@@ -6,12 +6,12 @@
 #define OS_IRQ_H
 
 #include "entry.h"
+#include "pipe.h"
 
-void WaitKeypress();
+extern PipeN<1024> key_pipe;
+
 int GetTime();
 void IrqHandler(Regs* regs);
 void RemapInterrupts();
-
-extern volatile bool should_yield;
 
 #endif //OS_IRQ_H

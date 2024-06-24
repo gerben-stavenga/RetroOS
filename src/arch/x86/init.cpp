@@ -4,27 +4,25 @@
 
 #include "src/libc/libc.h"
 
+int global = 1;
 [[noreturn]] void Shell() {
-    while (true) {
-        uprint("I am the child!\n");
-        while (true) {
-            asm volatile("");
-        }
+    global = 2;
+    for (int i = 0; i < 3; i++) {
+        uprint("I am the child! {} {}\n", i, global);
         Yield();
     }
     Exit(0);
-    uprint("This should not be printed!\n");
 }
 
 extern "C"
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
-    uprint("Hello, world!\n");
-    int pid = Fork();
-    if (pid == 0) {
-        Shell();
-    }
     while (true) {
-        asm volatile("");
+        uprint("Logging in!\n");
+        int pid = Fork();
+        if (pid == 0) {
+            Shell();
+        }
+        Yield();
     }
 }

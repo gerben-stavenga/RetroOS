@@ -40,8 +40,11 @@ entry_wrapper:
 
     cld
     push esp  ; save esp value as it is before the instruction pointer is pushed
-    call isr_handler
-    mov esp, eax  ; either a pop or a change of stack to a new process
+    call isr_handler  ; does not return
+
+global exit_kernel
+exit_kernel:
+    mov esp, [esp + 4]
 
     pop gs
     pop fs

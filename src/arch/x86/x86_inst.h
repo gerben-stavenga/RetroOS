@@ -5,19 +5,19 @@
 #ifndef OS_X86_INST_H
 #define OS_X86_INST_H
 
-#include <stddef.h>
+#include <cstddef>
 
 struct DescriptorPtr {
     uint16_t limit;
     const void* base;
 } __attribute__((packed));
 
-inline void X86_lgdt(void* base, size_t size) {
+inline void X86_lgdt(void* base, std::size_t size) {
     DescriptorPtr ptr = {static_cast<uint16_t>(size - 1), base};
     asm volatile ("lgdt %0\n\t"::"m"(ptr));
 }
 
-inline void X86_lidt(void* base, size_t size) {
+inline void X86_lidt(void* base, std::size_t size) {
     DescriptorPtr ptr = {static_cast<uint16_t>(size - 1), base};
     asm volatile ("lidt %0\n\t"::"m"(ptr));
 }

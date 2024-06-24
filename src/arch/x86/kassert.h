@@ -12,12 +12,12 @@ struct KernelOutput;
 extern KernelOutput kout;
 
 template <typename... Args>
-void kprint(string_view fmt, Args... args) {
+void kprint(std::string_view fmt, Args... args) {
     print(reinterpret_cast<OutputStream&>(kout), fmt, args...);
 }
 
 template<typename... Args>
-void panic(string_view format, const Args&... args) {
+void panic(std::string_view format, const Args&... args) {
     kprint("Kernel panic: ");
     kprint(format, args...);
     terminate(-1);

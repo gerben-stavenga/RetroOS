@@ -5,7 +5,7 @@
 #ifndef OS_BOOT_H
 #define OS_BOOT_H
 
-#include <stdint.h>
+#include <cstdint>
 
 struct MMapEntry {
     uint64_t base;
