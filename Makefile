@@ -1,5 +1,5 @@
-CC := clang++
-# CC := g++
+# CC := clang++
+CC := g++
 LD := ld
 AR := ar
 AS := nasm

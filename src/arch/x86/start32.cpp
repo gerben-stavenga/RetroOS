@@ -1,8 +1,8 @@
 //
 // Created by gerben stavenga on 6/5/23.
 //
-#include <stdint.h>
-#include <stddef.h>
+#include <cstdint>
+#include <cstddef>
 
 #include "boot/boot.h"
 #include "src/freestanding/utils.h"
@@ -44,12 +44,12 @@ struct Screen {
 };
 
 struct KernelOutput : public OutputStream {
-    void Push(string_view str) override;
+    void Push(std::string_view str) override;
 
     Screen screen_;
 };
 
-void KernelOutput::Push(string_view str) {
+void KernelOutput::Push(std::string_view str) {
     Screen tmp = screen_;
     for (char c : str) {
         tmp.Put(c);
@@ -98,13 +98,13 @@ extern "C" void* PrepareKernel(const BootData* boot_data) {
 }
 
 void* ramdisk;
-size_t ramdisk_size;
+std::size_t ramdisk_size;
 
 class RamUSTARReader : public USTARReader {
 public:
-    constexpr RamUSTARReader(const char* data, size_t size) : data_(data), size_(size) {}
+    constexpr RamUSTARReader(const char* data, std::size_t size) : data_(data), size_(size) {}
 
-    bool ReadBlocks(size_t block, int n, void *buf) override {
+    bool ReadBlocks(std::size_t block, int n, void *buf) override {
         //kprint("ReadBlocks from {} at block {} n {} to {}\n", (void*)data_, block_, n, buf);
         if ((block + n) * 512 > size_) return false;
         memcpy(buf, data_ + block * 512, n * 512);
@@ -113,32 +113,32 @@ public:
 
 private:
     const char* data_;
-    size_t size_;
+    std::size_t size_;
 };
 
 // alignas(alignof(RamUSTARReader)) uint8_t fs[sizeof(RamUSTARReader)];
 constinit RamUSTARReader fs(nullptr, 0);
 
-void InitFS(uintptr_t phys, size_t size) {
+void InitFS(uintptr_t phys, std::size_t size) {
     ramdisk = reinterpret_cast<void*>(kLowMemBase + phys);
     ramdisk_size = size;
 }
 
-size_t Open(string_view path) {
+std::size_t Open(std::string_view path) {
     fs = RamUSTARReader(static_cast<const char*>(ramdisk), ramdisk_size);
     return fs.FindFile(path);
 }
 
-void ReadFile(void* dst, size_t size) {
+void ReadFile(void* dst, std::size_t size) {
     fs.ReadFile(dst, size);
 }
 
-extern "C" void KernelInit(const BootData* boot_data) {
+extern "C" [[noreturn]] void KernelInit(const BootData* boot_data) {
     kout.screen_.cursor_x = boot_data->cursor_pos & 0xFF;
     kout.screen_.cursor_y = (boot_data->cursor_pos >> 8) & 0xFF;
 
     uintptr_t ramdisk = PhysAddress(boot_data->ramdisk);
-    size_t ramdisk_size = boot_data->ramdisk_size;
+    std::size_t ramdisk_size = boot_data->ramdisk_size;
 
     int kernel_low = PhysAddress(_start) / kPageSize;
     int kernel_high = (PhysAddress(_end) + kPageSize - 1) / kPageSize;
@@ -151,7 +151,7 @@ extern "C" void KernelInit(const BootData* boot_data) {
 
     InitFS(ramdisk, ramdisk_size);
 
-    string_view filename = "src/arch/x86/init.bin";
+    std::string_view filename = "src/arch/x86/init.bin";
     auto size = Open(filename);
     if (size == SIZE_MAX) {
         kprint("Failed to load {}\n", filename);
@@ -160,17 +160,14 @@ extern "C" void KernelInit(const BootData* boot_data) {
     auto dst = reinterpret_cast<void*>(0x10000);
     ReadFile(dst, size);
     char md5_out[16];
-    md5(string_view(static_cast<const char*>(dst), size), md5_out);
+    md5(std::string_view(static_cast<const char*>(dst), size), md5_out);
     auto init_stack = reinterpret_cast<uintptr_t>(kKernelBase);
 
-    kprint("Boot succeeded!\nLoaded {} of size {} with md5 {} at {}\nMoving to userspace\n", filename, size, Hex(string_view(md5_out, 16)), dst);
+    kprint("Boot succeeded!\nLoaded {} of size {} with md5 {} at {}\nMoving to userspace\n", filename, size, Hex(std::string_view(md5_out, 16)), dst);
 
-    current_thread = CreateThread(nullptr, kernel_page_dir, true);
-    current_thread->state = ThreadState::THREAD_RUNNING;
+    auto thread = CreateThread(nullptr, kernel_page_dir, true);
+    thread->cpu_state.eip = reinterpret_cast<uintptr_t>(dst);
+    thread->cpu_state.esp = init_stack;
 
-    // Move to init
-    asm volatile(
-            "push $0\n\t"  // We make a call from ring 0 which does not push old stack, so we push dummy values
-            "push $0\n\t"
-            "int $0x80\n\t"::"a" (0), "d" (dst), "c" (init_stack));
+    ExitToThread(thread);
 }

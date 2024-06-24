@@ -86,7 +86,7 @@ void RecurseMarkCOW(uintptr_t page, int depth) {
         for (int i = 0; i < kNumPageEntries; i++) {
             RecurseMarkCOW(kNumPages - (kNumPages - page) * kNumPageEntries + i, depth + 1);
         }
-        kprint("Mark page {} at depth {}\n", page, depth);
+        // kprint("Mark page {} at depth {}\n", page, depth);
         IncSharedCount(e.Page());
         if (e.IsReadWrite()) {
             e.data &= ~e.kReadWrite;
@@ -142,9 +142,6 @@ void DestroyPageDir(const PageTable* p) {
         RecurseFreePages(kNumPages - kNumPageEntries + i, 0);
     }
     FreePhysPage(GetPageEntry(kNumPages - 1)->Page());
-
-    X86_set_cr3(cr3);
-    FlushTLB();
 }
 
 void SwitchPageDir(PageTable* new_dir) {
@@ -152,7 +149,6 @@ void SwitchPageDir(PageTable* new_dir) {
     auto kernel_entries = kKernelBase / kPageSize / kNumPageEntries;
     memcpy(new_dir->entries + kernel_entries, GetCurrentDir() + kernel_entries, (kNumPageEntries - kernel_entries - 1) * sizeof(PageEntry));
     X86_set_cr3(PhysAddress(new_dir));
-    FlushTLB();
 }
 
 void segv(Regs* regs) {
@@ -202,15 +198,15 @@ void page_fault(Regs* regs) {
         kassert(!page_entry.IsReadWrite());
         if (page_entry.IsCow()) {
             int phys_page_index = page_entry.Page();
-            kprint("COW page fault @{} page {} #{}\n", Hex(fault_address), phys_page_index, available[phys_page_index]);
+            // kprint("COW page fault @{} page {} #{}\n", Hex(fault_address), phys_page_index, available[phys_page_index]);
             kassert(available[phys_page_index] > 0 || phys_page_index == PhysAddress(zero_page) / kPageSize);
             if (available[phys_page_index] == 1) {
                 // Page is not shared, we can just make it writable.
-                kprint("COW page is not shared making r/w\n");
+                // kprint("COW page is not shared making r/w\n");
                 page_entry.data |= PageEntry::kReadWrite;
                 page_entry.data &= ~PageEntry::kCow;
             } else {
-                kprint("COW page is shared making copy\n");
+                // kprint("COW page is shared making copy\n");
                 // Page was meant to writable. We need to copy it.
                 *GetPageEntry(kernel_temp_page) = page_entry;
                 int phys_page = AllocPhysPage();
@@ -230,7 +226,7 @@ void page_fault(Regs* regs) {
         if (false /*&& !IsZero(page_entry)*/) {
             panic("Swapping not implemented yet\n");
         } else {
-            kprint("Zero page cow @{}\n", Hex(fault_address));
+            // kprint("Zero page cow @{}\n", Hex(fault_address));
             page_entry = ZeroPageEntry(is_user, true);
             FlushTLB();
         }

@@ -6,7 +6,6 @@
 
 #include "kassert.h"
 #include "x86_inst.h"
-#include "pipe.h"
 
 constexpr uint16_t kMasterPort = 0x20;
 constexpr uint16_t kSlavePort = 0xA0;
@@ -18,14 +17,6 @@ inline uint16_t PicPort(int irq) {
 
 PipeN<1024> key_pipe;
 static volatile int counter = 0;
-volatile bool should_yield = false;
-
-void WaitKeypress() {
-    kprint("Press key");
-    while (key_pipe.Empty()) {}
-    int key = key_pipe.Pop();
-    kprint(": pressed {}\n", key);
-}
 
 int GetTime() {
     return counter;
@@ -48,7 +39,6 @@ bool RegisterIrqHandler(int irq, void (*handler)()) {
 
 void TimerHandler() {
     counter++;
-    should_yield = true;
 }
 
 enum Special {

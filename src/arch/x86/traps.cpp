@@ -2,7 +2,7 @@
 // Created by gerben stavenga on 6/25/23.
 //
 
-#include <stdint.h>
+#include <cstdint>
 
 #include "entry.h"
 #include "irq.h"
@@ -35,25 +35,15 @@ void ShowRegs(Regs* regs) {
     kprint("ShowRegs: @{}:{} stack {}:{}\nkernel stack @{} ecx: {} edx: {}\n", Hex(regs->cs), Hex(regs->eip), Hex(regs->ss), Hex(regs->esp), Hex(regs->temp_esp), Hex(regs->ecx), Hex(regs->edx));
 }
 
-void Yield(Regs* regs) {
-    Schedule(regs, true);
-}
-
-void ConsoleOut(Regs* regs) {
-    kprint("{}", string_view(reinterpret_cast<char*>(regs->ecx), regs->edx));
-}
-
-void KeyboardIn(Regs* regs) {
-//    regs->eax =
-    (void) regs;
-}
-
-/*
 void ReadSyscall(Regs* regs) {
     auto fd = regs->ecx;
     auto buf = reinterpret_cast<char*>(regs->edx);
     auto len = regs->esi;
-    auto ret = Read(fd, buf, len);
+    if (fd != 0) {
+        kprint("Non-stdin not supported\n");
+        return;
+    }
+    auto ret = key_pipe.Read(buf, len);
     regs->eax = ret;
 }
 
@@ -61,21 +51,27 @@ void WriteSyscall(Regs* regs) {
     auto fd = regs->ecx;
     auto buf = reinterpret_cast<char*>(regs->edx);
     auto len = regs->esi;
-    auto ret = Write(fd, buf, len);
+    if (regs->edx != 1) {
+        kprint("Non-stdout not supported\n");
+        return;
+    } else {
+        kprint("{}", std::string_view(reinterpret_cast<char*>(regs->ecx), regs->ebx));
+    }
+    auto ret = len;
     regs->eax = ret;
 }
-*/
+
 static const EntryHandler syscall_table[] = {
         SysExit,  // 0
         Yield,  // 1
         nullptr,
         nullptr,
-        SysFork,
+        SysFork,  // 4
         nullptr,
         nullptr,
         nullptr,
-        nullptr,
-        ConsoleOut,  // 9
+        ReadSyscall,  // 8
+        WriteSyscall,  // 9
 };
 
 enum Signals : int {
@@ -84,7 +80,7 @@ enum Signals : int {
 
 struct GenericException {
     int signal;
-    string_view name;
+    std::string_view name;
 };
 GenericException exceptions[32] = {
         {SIGFPE, "divide error"},  // 0
@@ -146,7 +142,6 @@ void page_fault(Regs* regs);
 
 static void SystemCall(Regs* regs) {
     //kprint("SystemCall: {}\n", regs->eax);
-    //hlt();
     if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
         regs->eax = ENOSYS;
         return;
@@ -195,16 +190,10 @@ constexpr IsrTable MakeTable() {
 
 const IsrTable isr_table = MakeTable();
 
-extern "C" uint64_t int_vector[];
-
-extern "C" void* isr_handler(Regs* regs) {
+extern "C" [[noreturn]] void isr_handler(Regs* regs) {
     X86_sti();
     regs->int_no = (regs->int_no - reinterpret_cast<uintptr_t>(int_vector)) / 8;
     isr_table.entries[regs->int_no](regs);
     X86_cli();
-    if (should_yield && regs->cs & 3) {
-        Schedule(regs, false);
-        should_yield = false;
-    }
-    return regs;
+    exit_kernel(regs);
 }

@@ -5,8 +5,8 @@
 #ifndef OS_THREAD_H
 #define OS_THREAD_H
 
-#include <stdint.h>
-#include <stddef.h>
+#include <cstdint>
+#include <cstddef>
 
 #include "entry.h"
 #include "paging.h"
@@ -34,7 +34,7 @@ struct Thread {
     ThreadState state;
     int time;
     PageTable* page_dir;
-    CPUState cpu_state;
+    Regs cpu_state;
     int num_file_descriptors;
     int file_descriptors[16];
 };
@@ -44,9 +44,9 @@ extern Thread* current_thread;
 constexpr int kMaxThreads = 1024;
 extern Thread threads[kMaxThreads];
 
+[[noreturn]] void ExitToThread(Thread* thread);
 Thread* CreateThread(Thread* parent, PageTable* page_dir, bool is_process);  // parent == nullptr means init thread
-void Schedule(Regs* regs, bool must_switch);
-
+void Yield(Regs* regs);
 void SysExit(Regs* regs);
 void SysFork(Regs* regs);
 

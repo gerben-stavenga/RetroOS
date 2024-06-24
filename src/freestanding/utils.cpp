@@ -6,21 +6,21 @@
 
 extern "C" {
 
-void *memcpy(void *dst, const void *src, size_t n) {
-    for (size_t i = 0; i < n; i++) {
+void *memcpy(void *dst, const void *src, std::size_t n) {
+    for (std::size_t i = 0; i < n; i++) {
         static_cast<char *>(dst)[i] = static_cast<const char *>(src)[i];
     }
     return dst;
 }
 
-void *memset(void *dst, int value, size_t n) {
-    for (size_t i = 0; i < n; i++) {
+void *memset(void *dst, int value, std::size_t n) {
+    for (std::size_t i = 0; i < n; i++) {
         static_cast<char *>(dst)[i] = value;
     }
     return dst;
 }
 
-void *memmove(void *dst, const void *src, size_t n) {
+void *memmove(void *dst, const void *src, std::size_t n) {
     auto d = static_cast<char *>(dst);
     auto s = static_cast<const char *>(src);
     if (reinterpret_cast<uintptr_t>(dst) < reinterpret_cast<uintptr_t>(src)) {
@@ -37,7 +37,7 @@ void *memmove(void *dst, const void *src, size_t n) {
     return dst;
 }
 
-void *memchr(const void *ptr, int value, size_t n) {
+void *memchr(const void *ptr, int value, std::size_t n) {
     auto p = static_cast<const char *>(ptr);
     while (n--) {
         if (*p == value) {
@@ -48,7 +48,7 @@ void *memchr(const void *ptr, int value, size_t n) {
     return nullptr;
 }
 
-int memcmp(const void *lhs, const void *rhs, size_t n) {
+int memcmp(const void *lhs, const void *rhs, std::size_t n) {
     auto l = static_cast<const char *>(lhs);
     auto r = static_cast<const char *>(rhs);
     while (n--) {
@@ -61,21 +61,21 @@ int memcmp(const void *lhs, const void *rhs, size_t n) {
     return 0;
 }
 
-size_t strlen(const char *str) {
-    size_t i = 0;
+std::size_t strlen(const char *str) {
+    std::size_t i = 0;
     while (str[i]) i++;
     return i;
 }
 
-size_t strnlen(const char *str, size_t n) {
-    for (size_t i = 0; i < n; i++) {
+std::size_t strnlen(const char *str, std::size_t n) {
+    for (std::size_t i = 0; i < n; i++) {
         if (str[i] == 0) return i;
     }
     return n;
 }
 
 char *strchr(const char *str, int c) {
-    for (size_t i = 0; str[i]; i++) {
+    for (std::size_t i = 0; str[i]; i++) {
         if (str[i] == c) {
             return const_cast<char*>(str + i);
         }
@@ -85,7 +85,7 @@ char *strchr(const char *str, int c) {
 
 char *strrchr(const char *str, int c) {
     const char *last = nullptr;
-    for (size_t i = 0; str[i]; i++) {
+    for (std::size_t i = 0; str[i]; i++) {
         if (str[i] == c) {
             last = str + i;
         }
@@ -103,7 +103,7 @@ int strcmp(const char *lhs, const char *rhs) {
     return *l - *r;
 }
 
-int strncmp(const char *lhs, const char *rhs, size_t n) {
+int strncmp(const char *lhs, const char *rhs, std::size_t n) {
     auto l = reinterpret_cast<const uint8_t *>(lhs);
     auto r = reinterpret_cast<const uint8_t *>(rhs);
     while (n-- && *l && *l == *r) {
@@ -121,7 +121,7 @@ char *strcpy(char *dst, const char *src) {
     return dst;
 }
 
-char *strncpy(char *dst, const char *src, size_t n) {
+char *strncpy(char *dst, const char *src, std::size_t n) {
     auto d = dst;
     while (n--) {
         *d++ = *src;
@@ -137,13 +137,13 @@ char *strcat(char *dst, const char *src) {
     return dst;
 }
 
-char *strncat(char *dst, const char *src, size_t n) {
+char *strncat(char *dst, const char *src, std::size_t n) {
     strncpy(dst + strlen(dst), src, n);
     return dst;
 }
 
 char* strstr(const char *haystack, const char *needle) {
-    size_t len = 0;
+    std::size_t len = 0;
     while (needle[len]) {
         if (haystack[len] == needle[len]) {
             len++;
@@ -158,25 +158,25 @@ char* strstr(const char *haystack, const char *needle) {
 
 }  // extern "C"
 
-void panic_assert(OutputStream& out, string_view cond_str, string_view file, int line) {
+void panic_assert(OutputStream& out, std::string_view cond_str, std::string_view file, int line) {
     print(out, "Kernel assert: Condition \"{}\" failed at {}:{}.\n", cond_str, file, line);
     terminate(-1);
 }
 
-NOINLINE void PrintImpl(OutputStream& out, string_view format, const ValuePrinter* printers, size_t n) {
+NOINLINE void PrintImpl(OutputStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
     BufferedOStreamN<100> buf(&out);
     buf.Finalize(print_buf(0, buf, format, printers, n));
 }
 
-NOINLINE size_t print_buf(size_t pos, BufferedOStream& out, string_view format, const ValuePrinter* printers, size_t n) {
-    size_t k = 0;
-    for (size_t i = 0; i < format.size(); i++) {
+NOINLINE std::size_t print_buf(std::size_t pos, BufferedOStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
+    std::size_t k = 0;
+    for (std::size_t i = 0; i < format.size(); i++) {
         if (PREDICT_FALSE(format[i] == '{')) {
             if (i + 1 < format.size() && format[i + 1] == '{') {
                 pos = out.put(pos, '{');
                 i++;
             } else {
-                size_t j = i + 1;
+                std::size_t j = i + 1;
                 while (j < format.size() && format[j] != '}') {
                     j++;
                 }
@@ -199,11 +199,11 @@ error:
     return pos;
 }
 
-NOINLINE size_t print_char(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+NOINLINE std::size_t print_char(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
     return out.put(pos, value.n);
 }
 
-NOINLINE size_t print_decimal(size_t pos, BufferedOStream& out, uint64_t z) {
+NOINLINE std::size_t print_decimal(std::size_t pos, BufferedOStream& out, uint64_t z) {
     char buf[20];
     int n = 0;
     do {
@@ -216,12 +216,12 @@ NOINLINE size_t print_decimal(size_t pos, BufferedOStream& out, uint64_t z) {
     return pos;
 }
 
-NOINLINE size_t print_val_u(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+NOINLINE std::size_t print_val_u(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
     auto z = value.n;
     return print_decimal(pos, out, z);
 }
 
-size_t print_val_s(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+std::size_t print_val_s(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
     auto z = value.n;
     if (int64_t(z) < 0) {
         pos = out.put(pos, '-');
@@ -234,7 +234,7 @@ inline char HexDigit(int x) {
     return x < 10 ? '0' + x : 'a' + x - 10;
 }
 
-NOINLINE static size_t print_hex(size_t pos, BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
+NOINLINE static std::size_t print_hex(std::size_t pos, BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
     for (int i = ndigits - 1; i >= 0; i--) {
         int digit = (x >> (i * 4)) & 0xf;
         pos = out.put(pos, HexDigit(digit));
@@ -242,14 +242,14 @@ NOINLINE static size_t print_hex(size_t pos, BufferedOStream& out, uintptr_t x, 
     return pos;
 }
 
-size_t print_val_hex(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+std::size_t print_val_hex(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
     auto x = value.hex_num.x;
     auto ndigits = value.hex_num.size;
     pos = out.put(pos, '0'); pos = out.put(pos, 'x');
     return print_hex(pos, out, x, ndigits);
 }
 
-size_t print_val_hex64(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+std::size_t print_val_hex64(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
     uintptr_t x = value.n & 0xFFFFFFFF;
     uintptr_t y = value.n >> 32;
     pos = out.put(pos, '0'); pos = out.put(pos, 'x');
@@ -257,17 +257,17 @@ size_t print_val_hex64(size_t pos, BufferedOStream& out, const ValuePrinter& val
     return print_hex(pos, out, x, sizeof(uintptr_t) * 2);
 }
 
-size_t print_val_str(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
-    string_view str(value.s);
-    for (size_t i = 0; i < str.size(); i++) {
+std::size_t print_val_str(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    std::string_view str(value.s);
+    for (std::size_t i = 0; i < str.size(); i++) {
         pos = out.put(pos, str[i]);
     }
     return pos;
 }
 
-size_t print_val_hexbuf(size_t pos, BufferedOStream& out, const ValuePrinter& value) {
-    string_view str(value.s);
-    for (size_t i = 0; i < str.size(); i++) {
+std::size_t print_val_hexbuf(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+    std::string_view str(value.s);
+    for (std::size_t i = 0; i < str.size(); i++) {
         pos = out.put(pos, HexDigit(uint8_t(str[i]) >> 4));
         pos = out.put(pos, HexDigit(str[i] & 0xF));
     }
@@ -297,23 +297,23 @@ struct USTARRawHeader {
 static_assert(sizeof(USTARRawHeader) == 512);
 
 struct USTARHeader {
-    string_view filename;
+    std::string_view filename;
     uint32_t filemode;
     uint32_t uid;
     uint32_t gid;
     uint64_t filesize;
     uint64_t mtime;
     uint8_t typeflag;
-    string_view link_target;
+    std::string_view link_target;
     char checksum[8];
 
     char filename_[256];
     char link_target_[256];
 };
 
-uint64_t ReadOctal(string_view buf) {
+uint64_t ReadOctal(std::string_view buf) {
     uint64_t result = 0;
-    for (size_t i = 0; i < buf.size(); i++) {
+    for (std::size_t i = 0; i < buf.size(); i++) {
         char c = buf[i];
         if (c < '0' || c > '7') {
             break;
@@ -335,23 +335,23 @@ USTARHeader Convert(const USTARRawHeader& h) {
 
     strncpy(result.link_target_, h.link_target, sizeof(h.link_target));
 
-    result.filename = string_view(result.filename_, strnlen(result.filename_, sizeof(result.filename_)));
-    result.link_target = string_view(result.link_target_, strnlen(result.link_target_, sizeof(result.link_target_)));
+    result.filename = std::string_view(result.filename_, strnlen(result.filename_, sizeof(result.filename_)));
+    result.link_target = std::string_view(result.link_target_, strnlen(result.link_target_, sizeof(result.link_target_)));
 
-    result.filemode = ReadOctal(string_view(h.filemode, sizeof(h.filemode)));
-    result.uid = ReadOctal(string_view(h.uid, sizeof(h.uid)));
-    result.gid = ReadOctal(string_view(h.gid, sizeof(h.gid)));
-    result.filesize = ReadOctal(string_view(h.filesize, sizeof(h.filesize)));
-    result.mtime = ReadOctal(string_view(h.mtime, sizeof(h.mtime)));
+    result.filemode = ReadOctal(std::string_view(h.filemode, sizeof(h.filemode)));
+    result.uid = ReadOctal(std::string_view(h.uid, sizeof(h.uid)));
+    result.gid = ReadOctal(std::string_view(h.gid, sizeof(h.gid)));
+    result.filesize = ReadOctal(std::string_view(h.filesize, sizeof(h.filesize)));
+    result.mtime = ReadOctal(std::string_view(h.mtime, sizeof(h.mtime)));
     result.typeflag = h.typeflag[0];
-    result.link_target = string_view(h.link_target, sizeof(h.link_target));
+    result.link_target = std::string_view(h.link_target, sizeof(h.link_target));
     memcpy(result.checksum, h.checksum, sizeof(h.checksum));
     return result;
 }
 
 constexpr int kUSTARBlockSize = 512;
 
-size_t USTARReader::FindFile(string_view filename) {
+std::size_t USTARReader::FindFile(std::string_view filename) {
     USTARRawHeader raw_header;
     while (ReadBlocks(1, &raw_header)) {
         USTARHeader header = Convert(raw_header);
@@ -364,7 +364,7 @@ size_t USTARReader::FindFile(string_view filename) {
     return SIZE_MAX;
 }
 
-size_t USTARReader::ReadHeader(void* buf) {
+std::size_t USTARReader::ReadHeader(void* buf) {
     USTARRawHeader* raw_header = static_cast<USTARRawHeader*>(buf);
     if (!ReadBlocks(1, raw_header)) {
         return SIZE_MAX;
@@ -376,7 +376,7 @@ size_t USTARReader::ReadHeader(void* buf) {
     return header.filesize;
 }
 
-bool USTARReader::ReadFile(void* buf, size_t bufsize) {
+bool USTARReader::ReadFile(void* buf, std::size_t bufsize) {
     char tmp_buf[kUSTARBlockSize];
 
     if (!ReadBlocks(bufsize / kUSTARBlockSize, buf)) {
@@ -455,7 +455,7 @@ static void ChunkMD5(const char* chunk, uint32_t md5_hash[4]) {
     md5_hash[3] += D;
 }
 
-void md5(string_view buf, char out[16]) {
+void md5(std::string_view buf, char out[16]) {
     // Initialize variables:
     uint32_t md5_hash[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };   // A, B, C, D
 

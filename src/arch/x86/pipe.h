@@ -5,11 +5,15 @@
 #ifndef OS_PIPE_H
 #define OS_PIPE_H
 
+#include <cstddef>
+
+#include "src/freestanding/utils.h"
+
 class Pipe {
 public:
-    Pipe(size_t size) : size(size) {}
+    Pipe(std::size_t size) : size(size) {}
 
-    int Write(string_view s) {
+    int Write(std::string_view s) {
         int i = 0;
         auto wp = write_pos;
         auto rp = read_pos;
@@ -54,7 +58,7 @@ private:
 
     uint64_t read_pos = 0;
     uint64_t write_pos = 0;
-    size_t size;
+    std::size_t size;
 };
 
 template <int N>
