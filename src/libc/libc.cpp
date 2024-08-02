@@ -12,3 +12,9 @@ uintptr_t SysCall(uintptr_t num, uintptr_t arg0, uintptr_t arg1, uintptr_t arg2,
     return num;
 }
 
+char** envp;
+
+[[noreturn]] void StartProgram(int (*main)(int, char *[], char *[]), int argc, char *argv[]) {
+    envp = argv + argc + 1;
+    Exit(main(argc, argv, envp));
+}

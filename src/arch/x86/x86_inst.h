@@ -6,18 +6,19 @@
 #define OS_X86_INST_H
 
 #include <cstddef>
+#include <cstdint>
 
 struct DescriptorPtr {
     uint16_t limit;
     const void* base;
 } __attribute__((packed));
 
-inline void X86_lgdt(void* base, std::size_t size) {
+inline void X86_lgdt(const void* base, std::size_t size) {
     DescriptorPtr ptr = {static_cast<uint16_t>(size - 1), base};
     asm volatile ("lgdt %0\n\t"::"m"(ptr));
 }
 
-inline void X86_lidt(void* base, std::size_t size) {
+inline void X86_lidt(const void* base, std::size_t size) {
     DescriptorPtr ptr = {static_cast<uint16_t>(size - 1), base};
     asm volatile ("lidt %0\n\t"::"m"(ptr));
 }
@@ -32,13 +33,23 @@ inline void X86_set_cr3(uintptr_t page) {
     asm volatile ("mov %0, %%cr3\n\t"::"r"(page):"memory");
 }
 
-inline void X86_outb(uint16_t port, uint8_t data) {
+inline void X86_outb(std::uint16_t port, uint8_t data) {
     asm volatile("outb %0, %1" : : "a"(data), "d"(port));
 }
 
-inline uint8_t X86_inb(uint16_t port) {
+inline uint8_t X86_inb(std::uint16_t port) {
     uint8_t data;
     asm volatile("inb %1, %0" : "=a"(data) : "d"(port));
+    return data;
+}
+
+inline void X86_outw(std::uint16_t port, uint16_t data) {
+    asm volatile("outw %0, %1" : : "a"(data), "d"(port));
+}
+
+inline uint16_t X86_inw(std::uint16_t port) {
+    uint16_t data;
+    asm volatile("inw %1, %0" : "=a"(data) : "d"(port));
     return data;
 }
 

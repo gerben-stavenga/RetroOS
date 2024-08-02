@@ -35,6 +35,7 @@ inline void PutChar(char c) {
     regs.ax = 0xe00 | c;
     regs.bx = 7;
     generate_real_interrupt(0x10);
+    X86_outb(0xe9, c);  // qemu console output when run "--debugcon stdio"
 }
 
 struct Out : public OutputStream {
@@ -51,7 +52,7 @@ Out out;
     while (true) X86_hlt();    
 }
 
-NOINLINE [[noreturn]] void terminate(int exit_code) {
+NOINLINE [[noreturn]] void exit(int exit_code) {
     print(out, "Panic! Exit code {}", exit_code);
     Halt();
 }
@@ -140,7 +141,6 @@ static void EnableA20() {
 extern char _start[], _edata[], _end[];
 [[noreturn]] void FullBootLoader(int drive) {
     memset(_edata, 0, _end - _edata);
-    void* const buffer = reinterpret_cast<void*>(0x1000);
     print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
     print(out, "Loader size: {}\n", _edata - _start);
     print(out, "Extended BIOS at {}\n", Hex(uintptr_t(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
@@ -148,47 +148,37 @@ extern char _start[], _edata[], _end[];
     print(out, "A20 enabled\n");
     unsigned fs_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
     TarFSReader tar(drive, fs_lba);
-    char* ramdisk = reinterpret_cast<char*>(0x80000);
-    char* load_address = ramdisk;
-    std::size_t size = 0;
-    bool found = false;
-    char expected_md5[16];
-    while ((size = tar.ReadHeader(load_address)) != SIZE_MAX) {
-        std::string_view filename{load_address};
-        print(out, "filename {} size {}\n", filename, size);
-
-        load_address += 512;
-        tar.ReadFile(load_address, size);
-        if (filename == "kernel.md5") {
-            memcpy(expected_md5, load_address, 16);
-        } else if (filename == "src/arch/x86/kernel.bin") {
-            char md5_out[16];
-            md5(std::string_view(load_address, size), md5_out);
-            if (std::string_view(expected_md5) != std::string_view(md5_out)) {
-                print(out, "Error md5 checksum of kernel {} of size {} mismatch! Expected {} got {}\n",
-                      filename, size, Hex(std::string_view(expected_md5)), Hex(std::string_view(md5_out)));
-                memcpy(buffer, load_address, size);
-                found = true;
-            } else {
-                print(out, "Loading {} of size {} with md5 {} at physical address {}\n", filename, size, Hex(std::string_view(md5_out, 16)), buffer);
-                memcpy(buffer, load_address, size);
-                found = true;
-            }
-        }
-        load_address += (size + 511) & -512;
+    auto size = tar.FindFile("kernel.md5");
+    if (size != 16) {
+        print(out, "md5 file not found or invalid size {}", size);
+        exit(-1);
     }
-    if (!found) {
-        print(out, "Kernel not found\n");
-        terminate(-1);
+    char expected_md5[16];
+    tar.ReadFile(expected_md5, 16);
+
+    size = tar.FindFile("src/arch/x86/kernel.bin");
+    if (size == -1) {
+        print(out, "kernel not found");
+        exit(-1);
+    }
+    auto const buffer = reinterpret_cast<char*>((0x7C00 + _end - _start + 0xFFF) & -0x1000);
+    tar.ReadFile(buffer, size);
+    print(out, "Loaded kernel at {} {}\n", (void*)buffer, size);
+
+    char md5_out[16];
+    md5(std::string_view(buffer, size), md5_out);
+    if (std::string_view(expected_md5, 16) != std::string_view(md5_out, 16)) {
+        print(out, "Error md5 checksum of kernel of size {} mismatch! Expected {} got {}\n",
+            size, Hex(std::string_view(expected_md5, 16)), Hex(std::string_view(md5_out, 16)));
+        exit(-1);
     }
     print(out, "Kernel loaded .. starting kernel\n");
     BootData boot_data;
     boot_data.kernel = buffer;
     boot_data.cursor_pos = GetCursor();
-    boot_data.ramdisk = ramdisk;
-    boot_data.ramdisk_size = load_address - ramdisk;
+    boot_data.start_sector = fs_lba;
     boot_data.mmap_count = CreateMemMap(boot_data.mmap_entries, array_size(boot_data.mmap_entries));
-    typedef void (__attribute__((fastcall))*Kernel)(BootData*);
+    typedef void (*Kernel)(BootData*);
     ((Kernel)(buffer))(&boot_data);
     __builtin_unreachable();
 }

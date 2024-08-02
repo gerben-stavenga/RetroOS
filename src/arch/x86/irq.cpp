@@ -73,7 +73,7 @@ enum Special {
     DEL = 0x53,
 };
 
-char kbd_US[128] = {
+const char kbd_US[128] = {
     0,
     27,  // Escape
     '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', '\t',
@@ -109,7 +109,7 @@ char kbd_US[128] = {
     -88,  /* F12 Key */
     0,  /* All other keys are undefined */
 };
-char kbd_US_shift[128] = {
+const char kbd_US_shift[128] = {
     0,
     27,  // Escape
     '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b', '\t',
@@ -146,6 +146,8 @@ char kbd_US_shift[128] = {
     0,  /* All other keys are undefined */
 };
 
+void StackTrace();
+
 void KeyboardHandler() {
     static uint8_t key_state[16];
     int key = X86_inb(0x60);
@@ -154,6 +156,10 @@ void KeyboardHandler() {
         bool shift = (key_state[LSHIFT / 8] & (1 << (LSHIFT & 7))) || (key_state[RSHIFT / 8] & (1 << (RSHIFT & 7)));
         bool capslock = key_state[CAPSLOCK / 8] & (1 << (CAPSLOCK & 7));
         int8_t c = (shift != capslock) ? kbd_US_shift[key] : kbd_US[key];
+        if (c == -82) {
+            // Insert
+            StackTrace();
+        }
         if (c <= 0) {
             return;
         } else {

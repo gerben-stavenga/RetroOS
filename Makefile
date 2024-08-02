@@ -1,16 +1,16 @@
-# CC := clang++
-CC := g++
+CC := clang++
+# CC := g++
 LD := ld
 AR := ar
 AS := nasm
 OBJCOPY := objcopy
 
 # no-red-zone is needed because in kernel mode, the stack is nested due to interrupts not switching to a new stack
-CFLAGS := -O2 -Wall -Wextra -m32 -march=i386 -ffreestanding -fbuiltin -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-common -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -mno-red-zone -std=c++20 -I .
+CFLAGS := -O2 -g -Wall -Wextra -m32 -march=i386 -ffreestanding -fbuiltin -fno-exceptions -fno-rtti -fno-omit-frame-pointer -fno-common -fno-pie -fcf-protection=none -fno-asynchronous-unwind-tables -mno-red-zone -std=c++20 -I .
 LDFLAGS := -melf_i386 -nostdlib -no-pie -L/usr/lib/gcc/x86_64-linux-gnu/13/32 -lgcc
 
 BOOTLOADER_OBJ := build/src/arch/x86/boot/boot.o
-KERNEL_OBJ := build/src/arch/x86/start32.o build/src/arch/x86/paging.o build/src/arch/x86/descriptors.o build/src/arch/x86/traps.o build/src/arch/x86/irq.o build/src/arch/x86/thread.o
+KERNEL_OBJ := build/src/arch/x86/start32.o build/src/arch/x86/paging.o build/src/arch/x86/descriptors.o build/src/arch/x86/traps.o build/src/arch/x86/irq.o build/src/arch/x86/thread.o build/src/arch/x86/drv/hdd.o
 FREESTANDING_OBJ := build/src/freestanding/utils.o
 LIBC_OBJ := build/src/libc/libc.o
 INIT_OBJ := build/src/arch/x86/init.o
@@ -56,13 +56,16 @@ build/src/arch/x86/kernel.elf: src/arch/x86/kernel.ld build/src/arch/x86/entry.o
 
 build/src/arch/x86/init.elf: build/src/libc/crt0.o $(INIT_OBJ) build/src/libc/libc.a build/src/freestanding/freestanding.a
 	@mkdir -p $(@D)
-	@$(LD) -Ttext=0x10000 $^ -o $@ $(LDFLAGS)
+	@$(LD) $^ -o $@ $(LDFLAGS)
+
+build/system.map: build/src/arch/x86/kernel.elf
+	nm -n $< > $@
 
 build/kernel.md5: build/src/arch/x86/kernel.bin
 	@md5sum $< | xxd -r -p > $@
 
 # tar is used to create a filesystem image, it naturally blocks files to 512 bytes which matches the sector size
-build/fs.tar: build/src/arch/x86/bootloader.bin build/kernel.md5 build/src/arch/x86/kernel.bin build/src/arch/x86/init.bin
+build/fs.tar: build/src/arch/x86/bootloader.bin build/kernel.md5 build/src/arch/x86/kernel.bin build/system.map build/src/arch/x86/init.elf
 	@tar -cf $@ -C build $(^:build/%=%)
 
 # the first file in the tar is the bootloader, so we need to skip the first 512 bytes which is the tar header for

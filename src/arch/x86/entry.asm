@@ -9,17 +9,13 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 %endif
 section .text
 [bits 32]
-global _start
-_start:
-    mov ebx, ecx
-    push ecx ; boot data pointer
-    extern PrepareKernel
-    call PrepareKernel
-    mov esp, eax  ; PrepareKernel returns the new kernel stack in eax
-    extern KernelInit
-    lea eax, [KernelInit]
-    push ebx
-    call eax  ; Use absolute address call
+global SwitchStack
+SwitchStack:
+    mov eax, [esp + 8]  ; func arg
+    mov esp, [esp + 4]  ; new stack arg
+    xor ebp, ebp  ; ensure stack frame ends
+    call eax  ; should not return
+    ud2
 
 extern isr_handler
 entry_wrapper:
@@ -38,9 +34,17 @@ entry_wrapper:
     mov fs, eax
     mov gs, eax
 
+    mov eax, esp
+
+    ; setup a mock stack frame 
+    push dword [eax + 56]  ; push return eip
+    push dword [eax + 24]  ; push old ebp 
+    mov ebp, esp
+
     cld
-    push esp  ; save esp value as it is before the instruction pointer is pushed
+    push eax  ; save esp value as it is before the instruction pointer is pushed
     call isr_handler  ; does not return
+    ud2
 
 global exit_kernel
 exit_kernel:

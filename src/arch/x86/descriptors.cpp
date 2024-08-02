@@ -7,7 +7,7 @@
 #include "x86_inst.h"
 #include "src/freestanding/utils.h"
 
-alignas(4096) uint8_t kernel_stack[4096 * 4];
+alignas(4096) uint8_t kernel_stack[4096 * 32];
 
 DescriptorEntry gdt[6] = {
         {},

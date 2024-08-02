@@ -158,9 +158,15 @@ char* strstr(const char *haystack, const char *needle) {
 
 }  // extern "C"
 
-void panic_assert(OutputStream& out, std::string_view cond_str, std::string_view file, int line) {
-    print(out, "Kernel assert: Condition \"{}\" failed at {}:{}.\n", cond_str, file, line);
-    terminate(-1);
+PanicStream::~PanicStream() {
+    if (out_) {
+        print(*out_, "\n");
+        exit(-1);
+    }
+}
+
+PanicStream::PanicStream(OutputStream& out, const char* cond_str, const char* file, int line) : out_(&out) {
+    print(out, "assert: Condition \"{}\" failed at {}:{}.", cond_str, file, line);
 }
 
 NOINLINE void PrintImpl(OutputStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
@@ -177,7 +183,7 @@ NOINLINE std::size_t print_buf(std::size_t pos, BufferedOStream& out, std::strin
                 i++;
             } else {
                 std::size_t j = i + 1;
-                while (j < format.size() && format[j] != '}') {
+                while (j < format.size() && format  [j] != '}') {
                     j++;
                 }
                 if (j == format.size() || k >= n) {
@@ -187,6 +193,13 @@ NOINLINE std::size_t print_buf(std::size_t pos, BufferedOStream& out, std::strin
                 k++;
                 i = j;
             }
+        } else if (PREDICT_FALSE(format[i] == '}')) {
+            if (i + 1 < format.size() && format[i + 1] == '}') {
+                pos = out.put(pos, format[i]);
+                i++;
+            } else {
+                goto error;
+            }
         } else {
             pos = out.put(pos, format[i]);
         }
@@ -194,7 +207,7 @@ NOINLINE std::size_t print_buf(std::size_t pos, BufferedOStream& out, std::strin
     if (k < n) {
 error:
         pos = print(pos, out, "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
-        terminate(-1);
+        exit(-1);
     }
     return pos;
 }
@@ -353,7 +366,9 @@ constexpr int kUSTARBlockSize = 512;
 
 std::size_t USTARReader::FindFile(std::string_view filename) {
     USTARRawHeader raw_header;
+    block_ = 0;
     while (ReadBlocks(1, &raw_header)) {
+        if (raw_header.filename[0] == '\0') break;
         USTARHeader header = Convert(raw_header);
         if (header.filename == filename) {
             return header.filesize;
@@ -377,13 +392,12 @@ std::size_t USTARReader::ReadHeader(void* buf) {
 }
 
 bool USTARReader::ReadFile(void* buf, std::size_t bufsize) {
-    char tmp_buf[kUSTARBlockSize];
-
     if (!ReadBlocks(bufsize / kUSTARBlockSize, buf)) {
         return false;
     }
     auto left_over = bufsize % kUSTARBlockSize;
     if (left_over != 0) {
+        char tmp_buf[kUSTARBlockSize];
         if (!ReadBlocks(1, tmp_buf)) {
             return false;
         }
@@ -476,4 +490,176 @@ void md5(std::string_view buf, char out[16]) {
     ChunkMD5(padding, md5_hash);
 
     memcpy(out, md5_hash, 16);
+}
+
+constexpr std::uint64_t kUsedMarker = 0xA110CEDDA110CEDDul;
+constexpr std::uint64_t kFreeMarker = 0xFEE59ACEFEE59ACEul;
+
+struct MemBlock {
+    uint64_t marker;
+    MemBlock* next;
+    MemBlock* prev;
+};
+
+MemBlock* head;
+
+void InitializeAllocator(void* ptr, std::size_t size) {
+    auto start = static_cast<MemBlock*>(ptr);
+    auto end = reinterpret_cast<MemBlock*>(GetAddress(ptr) + size - sizeof(MemBlock));
+    *start = MemBlock{kFreeMarker, end, end};
+    *end = MemBlock{kUsedMarker, start, start};  // sentinel
+    head = start;
+}
+
+extern "C" {
+
+void* malloc(std::size_t size) {
+    auto p = head;
+    size = (size + 7) & -8;
+    do {
+        assert(p->marker == kUsedMarker || p->marker == kFreeMarker);
+        auto next = p->next;
+        if (next < p) break;
+        
+        if (p->marker == kFreeMarker) {
+            auto s = GetAddress(next) - GetAddress(p + 1);
+            if (s >= size) {
+                constexpr std::size_t kMinFreeBlock = 64;
+                if (s >= size + sizeof(MemBlock) + kMinFreeBlock) {
+                    auto n = GetAddress(p + 1) + size;                    
+                    auto split = reinterpret_cast<MemBlock*>(n);
+                    *split = MemBlock{kFreeMarker, next, p};
+                    p->next = split;
+                    next->prev = split;
+                }
+                p->marker = kUsedMarker;
+                return p + 1;
+            }
+        }
+        p = next;
+    } while (true);
+    return nullptr;
+}
+
+void* calloc(std::size_t size) {
+    auto p = malloc(size);
+    memset(p, 0, size);
+    return p;
+}
+
+void* realloc(void* p, std::size_t size) {
+    auto ret = malloc(size);
+    memcpy(ret, p, size);
+    free(p);
+    return ret;
+}
+
+void free(void* ptr) {
+    auto block = static_cast<MemBlock*>(ptr) - 1;
+    assert(block->marker == kUsedMarker);
+    block->marker = kFreeMarker;
+    if (block->prev->marker == kFreeMarker) {
+        block->prev->next = block->next;
+        block->next->prev = block->prev;
+    } else if (block->next->marker == kFreeMarker) {
+        block->next->next->prev = block;
+        block->next = block->next->next;
+    }
+}
+
+}  // extern "C"
+
+// Format of an ELF executable file
+
+constexpr uint32_t kElfMagic = 0x464C457FU;  // "\x7FELF" in little endian
+
+// File header
+struct ElfHeader {
+    uint32_t magic;  // must equal ELF_MAGIC
+    uint8_t elf[12];
+    uint16_t type;
+    uint16_t machine;
+    uint32_t version;
+    uint32_t entry;
+    uint32_t phoff;
+    uint32_t shoff;
+    uint32_t flags;
+    uint16_t ehsize;
+    uint16_t phentsize;
+    uint16_t phnum;
+    uint16_t shentsize;
+    uint16_t shnum;
+    uint16_t shstrndx;
+};
+
+// Program section header
+struct ProgramHeader {
+    uint32_t type;
+    uint32_t off;
+    uint32_t vaddr;
+    uint32_t paddr;
+    uint32_t filesz;
+    uint32_t memsz;
+    uint32_t flags;
+    uint32_t align;
+};
+
+// Values for Proghdr type
+enum {
+    kElfProgLoad = 1,
+
+    // Flag bits for Proghdr flags
+    kElfProgFlagExec = 1,
+    kElfProgFlagWrite = 2,
+    kElfProgFlagRead = 4,
+};
+
+const void* LoadElf(std::string_view elf_buf, void* (*mmap)(uintptr_t, std::size_t, int)) {
+    auto elf = reinterpret_cast<const ElfHeader*>(elf_buf.data());  // scratch space
+
+    if (elf->magic != kElfMagic) return nullptr;
+    if (elf->elf[0] != 1) return nullptr;
+    if (elf->elf[1] != 1) return nullptr;
+    if (elf->elf[3] != 0) return nullptr;
+    if (elf->type != 2) return nullptr;  // executable
+    if (elf->machine != 3) return nullptr;  // x86
+
+    // Load each program segment (ignores ph flags).
+    auto phs = reinterpret_cast<const ProgramHeader*>(&elf_buf[elf->phoff]);
+    for (const auto& ph : Range(phs, elf->phnum)) {
+        if (ph.type != 1) continue;
+        auto buf = mmap(ph.vaddr, ph.memsz, ph.type);
+        memcpy(buf, &elf_buf[ph.off], ph.filesz);
+    }
+
+    return reinterpret_cast<const void*>(elf->entry);
+}
+
+void StackTrace(OutputStream& out, std::string_view symbol_map) {
+    void* bp;
+    asm ("movl %%ebp, %0": "=r" (bp));
+    void** frame = static_cast<void**>(bp);
+    bp = frame[0];
+    while (bp) {
+        auto ip = frame[1];
+        std::string_view name;
+        for (auto p = symbol_map.begin(); p < symbol_map.end();) {
+            uintptr_t x = 0;
+            for (int i = 0; i < 8; i++) {
+                x *= 16;
+                if (p[i] >= 'a' && p[i] <= 'f') x += p[i] - 'a' + 10;
+                else x += p[i] - '0'; 
+            }
+            if (x > reinterpret_cast<std::uintptr_t>(ip)) break;
+            p += 11;
+            auto tmp = p;
+            while (*p != '\n') p++;
+            name = {tmp, std::size_t(p - tmp)};
+            p++;
+//            for (int i = 0; )
+        }
+        print(out, "Stack frame {} at {}@{}\n", bp, name, ip);
+        frame = static_cast<void**>(bp);
+        bp = frame[0];
+    }
 }

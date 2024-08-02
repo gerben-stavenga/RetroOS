@@ -16,8 +16,7 @@ struct MMapEntry {
 
 struct BootData {
     void* kernel;
-    void* ramdisk;
-    intptr_t ramdisk_size;
+    unsigned start_sector;
     int cursor_pos;
     int mmap_count;
     MMapEntry mmap_entries[32];

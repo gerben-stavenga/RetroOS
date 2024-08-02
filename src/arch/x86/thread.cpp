@@ -44,12 +44,14 @@ constexpr uint64_t c = 0x12345679;  // c and 2^64 are relatively prime
 uint64_t seed = 0xcafebabedeadbeef;
 
 [[noreturn]] void ExitToThread(Thread* thread) {
-    auto old_page_dir = (current_thread && current_thread->state == THREAD_UNUSED) 
-            ? current_thread->page_dir : nullptr;
     thread->state = THREAD_RUNNING;
+    if (current_thread && current_thread->state == THREAD_UNUSED) {
+        SwitchPageDirAndFreeOld(thread->page_dir, current_thread->page_dir);
+    } else {
+        SwitchPageDir(thread->page_dir);
+    }
     current_thread = thread;
-    SwitchPageDir(thread->page_dir);
-    if (old_page_dir) DestroyPageDir(old_page_dir);
+    // kprint("Exitting eax = {} eip = {}\n", thread->cpu_state.eax, Hex(thread->cpu_state.eip));
     exit_kernel(&thread->cpu_state);
 }
 
@@ -70,15 +72,18 @@ void Schedule(int tid, bool must_switch) {
     }
     if (next_thread == nullptr) {
         if (!must_switch || current_thread->tid == 0) {
+            kprint("Schedule returning to caller\n");
             return;
         }
         next_thread = &threads[0];
     }
+    kprint("Schedule returning to tid {}\n", next_thread->tid);
     ExitToThread(next_thread);
 }
 
 void SysFork(Regs* regs) {
     auto page_dir = ForkCurrent();
+    assert(page_dir != nullptr);
     auto child_thread = CreateThread(current_thread, page_dir, true);
     SaveState(child_thread, regs);
     regs->eax = child_thread->tid;
@@ -93,7 +98,7 @@ void Yield(Regs* regs) {
 
 // edx is exit code
 void SysExit(Regs* regs) {
-    kassert(current_thread->tid != 0);
+    assert(current_thread->tid != 0);
     kprint("Thread {} exited with code {} at @{}:{}\n", current_thread->tid, regs->edx, Hex(regs->cs), Hex(regs->eip));
     current_thread->state = THREAD_UNUSED;
     Schedule(current_thread->tid, true);

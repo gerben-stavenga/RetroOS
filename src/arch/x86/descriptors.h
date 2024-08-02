@@ -104,4 +104,6 @@ inline IdtEntry MakeInterruptGate(void* ptr, uint16_t dpl) {
 
 void SetupDescriptorTables();
 
+extern uint8_t kernel_stack[4096 * 32];
+
 #endif //OS_DESCRIPTORS_H
