@@ -81,13 +81,16 @@ void page_fault(uintptr_t fault_addr, int error) {
 // [kCurPageDir, 0x100000000) page table covering [0xFFC00000, 0x100000000) and simultaneous page dir
 
 constexpr uintptr_t kKernelBase = 0xE0000000;  // 512mb of kernel address space
-constexpr uintptr_t kLowMemBase = 0xFFB00000;  // 1mb of low memory mapped to physical [0, 1mb)
+constexpr uintptr_t kLowMemBase = 0xFF700000;  // 1mb of low memory mapped to physical [0, 1mb)
+constexpr uintptr_t kForkPageTab = 0xFF800000; // 4mb of page tables for a separate address space
 constexpr uintptr_t kCurPageTab = 0xFFC00000;  // 4mb of page table entries covering the 4gb address space
 constexpr uintptr_t kCurPageDir = 0xFFFFF000;  // last page is the page dir and simultaneous page table covering [0xFFC00000, 0x100000000)
 
 constexpr uintptr_t kPageSize = 4096;
 constexpr uintptr_t kNumPageEntries = kPageSize / sizeof(uintptr_t);
 constexpr uintptr_t kNumPages = 1 << 20;   // 4GB address space has 1M 4K pages
+
+constexpr auto kKernelPageDirIdx = kKernelBase / kPageSize / kNumPageEntries;
 
 struct PageEntry {
     constexpr PageEntry() = default;
@@ -139,13 +142,19 @@ inline ValuePrinter MakeValuePrinter(const PageEntry& e) {
     return res;
 }
 
-struct alignas(kPageSize) PageTable {
+struct PageTable {
     PageEntry entries[kNumPageEntries];
 };
 
-extern PageTable page_tables[5];
-constexpr PageTable* zero_page = page_tables + 4;
-constexpr PageTable* kernel_page_dir = page_tables + 3;
+struct alignas(kPageSize) KernelPages {
+    PageTable pdir;  // The directory of kernel/init process
+    PageTable ptab;  // The page table mapping the kernel binary
+    PageTable kernel_low_mem_base;  // page table just below the page table addresses
+    PageTable scratch;
+    PageTable zero_page;
+};
+
+extern KernelPages kernel_pages;
 
 static_assert(sizeof(PageTable) == kPageSize);
 
@@ -153,39 +162,57 @@ inline uintptr_t AsLinear(const void* p) {
     return reinterpret_cast<uintptr_t>(p);
 }
 
-inline PageEntry* GetPageEntry(uintptr_t page) {
-    return reinterpret_cast<PageEntry*>(kCurPageTab) + page;
+inline uintptr_t PageIdx(const void* p) {
+    return AsLinear(p) / kPageSize;
 }
 
-inline PageEntry* GetCurrentDir() {
-    return reinterpret_cast<PageEntry*>(kCurPageDir);
+inline uintptr_t ParentPageIdx(std::uintptr_t page_idx) {
+    return kNumPages - 1 - (kNumPages - 1 - page_idx) / kNumPageEntries;
+}
+
+inline uintptr_t ChildPageIdx(std::uintptr_t root_idx, unsigned idx) {
+    return kNumPages - (kNumPages - root_idx) * kNumPageEntries + idx;
+}
+
+inline PageEntry& GetPageEntry(uintptr_t page_idx) {
+    return reinterpret_cast<PageEntry*>(kCurPageTab)[page_idx];
+}
+
+inline uintptr_t PhysicalPage(std::uintptr_t page_idx) {
+    return GetPageEntry(page_idx).Page();
+} 
+
+inline uintptr_t PhysicalPage(const void* p) {
+    return PhysicalPage(PageIdx(p));
+} 
+
+inline PageTable& GetCurrentDir() {
+    return *reinterpret_cast<PageTable*>(kCurPageDir);
 }
 
 inline uintptr_t CurrentCR3() {
     return *reinterpret_cast<uint32_t*>(-4) & -kPageSize;
 }
 
-inline uintptr_t PhysAddress(const void* p) {
-    uintptr_t linear = AsLinear(p);
-    return GetPageEntry(linear / kPageSize)->Page() * kPageSize + (linear & (kPageSize - 1));
-}
-
 inline uintptr_t GetPageIndex(const void* p) {
     return AsLinear(p) / kPageSize;
 }
 
-void InitPaging(int kernel_low, int kernel_high, int ramdisk_low, int ramdisk_high, const BootData* boot_data);
-void EnablePaging(PageTable* ptables, uintptr_t phys_address);
+void InitPaging(int kernel_low, int kernel_high, const BootData* boot_data);
+void EnablePaging(KernelPages* kpages, uintptr_t phys_address, int read_only);
 
 void* AllocPages(int npages);
 
 //PageTable* CreatePageDir();
-void DestroyPageDir(const PageTable* p);
+void SwitchPageDirAndFreeOld(PageTable* new_dir, PageTable* old_dir);
 
 PageTable* ForkCurrent();
 
 void SwitchPageDir(PageTable* new_dir);
 
 void page_fault(Regs* regs);
+
+void* malloc(std::size_t size);
+void free(void* ptr);
 
 #endif //OS_PAGING_H

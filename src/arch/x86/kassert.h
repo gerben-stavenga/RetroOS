@@ -20,9 +20,9 @@ template<typename... Args>
 void panic(std::string_view format, const Args&... args) {
     kprint("Kernel panic: ");
     kprint(format, args...);
-    terminate(-1);
+    exit(-1);
 }
 
-#define kassert(cond) AssertImpl((cond), reinterpret_cast<OutputStream&>(kout), #cond, __FILE__, __LINE__)
+void StackTrace();
 
 #endif //OS_KASSERT_H

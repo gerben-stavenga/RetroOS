@@ -25,13 +25,22 @@ constexpr bool kDebug = true;
 template <typename T, std::size_t N>
 constexpr std::size_t array_size(const T (&)[N]) { return N; }
 
+template <typename T>
+struct Range {
+    constexpr Range(T* p, std::size_t s) : begin_(p), end_(p + s) {}
+    auto begin() { return begin_; }
+    auto end() { return end_; }
+    T* begin_;
+    T* end_;
+};
+
 extern "C" {
 
 void *memmove(void *dst, const void *src, std::size_t n);
 void *memcpy(void *dst, const void *src, std::size_t n);
 void *memset(void *dst, int value, std::size_t n);
 char *strncpy(char *dst, const char *src, std::size_t n);
-// std::size_t strlen(const char *p);
+std::size_t strlen(const char *p);
 std::size_t strnlen(const char *p, std::size_t max);
 int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, std::size_t n);
@@ -81,7 +90,7 @@ struct ValuePrinter {
             uintptr_t x;
             uintptr_t size;
         } hex_num;
-        void* p;
+        const void* p;
         std::string_view s;
     };
     std::size_t (*print)(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
@@ -94,6 +103,17 @@ std::size_t print_val_hex(std::size_t pos, BufferedOStream& out, const ValuePrin
 std::size_t print_val_hex64(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
 std::size_t print_val_str(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
 std::size_t print_val_hexbuf(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
+
+template <typename T>
+concept Printable = requires(const T& v)
+{
+    {v.MakeValuePrinter()} -> std::same_as<ValuePrinter>;
+};
+
+template <Printable T>
+ValuePrinter MakeValuePrinter(const T& x) {
+    return x.MakeValuePrinter();
+}
 
 inline ValuePrinter MakeValuePrinter(const bool& x) {
     ValuePrinter res;
@@ -119,24 +139,22 @@ template<typename T>
 struct Hex {
     constexpr Hex(T x_) : x(x_) {}
     T x;
+
+    ValuePrinter MakeValuePrinter() const {
+        ValuePrinter res;
+        if (sizeof(T) > sizeof(uintptr_t)) {
+            res.n = x;
+            res.print = print_val_hex64;
+        } else {
+            res.hex_num.x = x;
+            res.hex_num.size = 2 * sizeof(T);
+            res.print = print_val_hex;
+        }
+        return res;
+    }
 };
 
-template <typename T>
-ValuePrinter MakeValuePrinter(const Hex<T>& x) {
-    ValuePrinter res;
-    if (sizeof(T) > sizeof(uintptr_t)) {
-        res.n = x.x;
-        res.print = print_val_hex64;
-    } else {
-        res.hex_num.x = x.x;
-        res.hex_num.size = 2 * sizeof(T);
-        res.print = print_val_hex;
-    }
-    return res;
-}
-
-template <>
-inline ValuePrinter MakeValuePrinter<std::string_view>(const Hex<std::string_view>& x) {
+inline ValuePrinter MakeValuePrinter(const Hex<std::string_view>& x) {
     ValuePrinter res;
     res.s = x.x;
     res.print = print_val_hexbuf;
@@ -220,13 +238,29 @@ private:
     char buffer[N];
 };
 
-[[noreturn]] void terminate(int exit_code) __attribute__((weak));
+__attribute__((weak))
+[[noreturn]] void exit(int exit_code);
 
-[[noreturn]] void panic_assert(OutputStream& out, std::string_view str, std::string_view file, int line);
 
-inline void AssertImpl(bool cond, OutputStream& out, std::string_view cond_str, std::string_view file, int line) {
-    if (kDebug && !cond) panic_assert(out, cond_str, file, line);
-}
+class PanicStream {
+public:
+    PanicStream(OutputStream& out, const char* str, const char* file, int line);
+    PanicStream(PanicStream&& other) : out_(other.out_) { other.out_ = nullptr; }
+    ~PanicStream();
+
+    template <typename T>
+    PanicStream& operator<<(const T& x) {
+        print(*out_, " {}", x);
+        return *this;
+    }
+private:
+    OutputStream* out_;
+};
+
+__attribute__((weak))
+PanicStream GetPanicStream(const char* str, const char* file, int line);
+
+#define assert(cond) if (!kDebug || (cond)) {} else GetPanicStream(#cond, __FILE__, __LINE__)
 
 class USTARReader {
 public:
@@ -275,5 +309,88 @@ template <typename T>
 T min(const T& a, const T& b) {
     return a < b ? a : b;
 }
+
+#if 0
+template <typename T, std::size_t N>
+class BTree {
+    class Node {
+        T array[N - 1];
+        Node* children[N];
+        int size = 0;
+        bool is_leaf = true;
+
+        int insert_in(T x) {
+            assert(size < N - 1);
+            size++;
+            for (auto i = size; i != 0; i--) {
+                if (array[i - 1] < x) {
+                    if (array[i - 1] == x) {
+                        array[i - 1] = std::move(x);
+                        size--;
+                    } else {
+                        array[i] = std::move(x);
+                    }
+                    return i;
+                }
+                array[i] = std::move(array[i - 1]);
+            }
+            array[0] = std::move(x);
+            return 0;
+        }
+
+        bool insert(T x) {
+            if (is_leaf) {
+                if (size < N - 1) {
+                    insert_in(std::move(x));
+                    return false;
+                }
+                
+            } else {
+                for (auto i = 0; i < N; i++) {
+                    if (x < array[i]) return children[i]->insert(std::move(x));
+                    if (x == array[i]) {
+                        array[i] = std::move(x);
+                        return false;
+                    }
+                }
+                return children[N]->insert(std::move(x));
+            }
+        }
+    }
+
+    Node* root_ = nullptr;
+
+public:
+    void insert(T x) {
+        if (root_ == nullptr) root_ = new Node;
+        if (root->size < N - 1) {
+            root_->size++;
+            for (auto i = root_->size; i != 0; i--) {
+                if (root_->array[i - 1] <= x) {
+                    root_->array[i] = std::move(x);
+                    return;
+                }
+                root_->array[i] = std::move(root_->array[i]); 
+            }
+            root_->array[0] = std::move(x);
+            return;
+        }
+        root_->insert(std::move(x));
+    }
+};
+#endif
+
+const void* LoadElf(std::string_view elf, void* (*mmap)(uintptr_t, std::size_t, int));
+
+inline std::uintptr_t GetAddress(const void* p) { return reinterpret_cast<std::uintptr_t>(p); }
+
+void InitializeAllocator(void* ptr, std::size_t size);
+
+extern "C" void* malloc(std::size_t size);
+extern "C" void* calloc(std::size_t size);
+extern "C" void* realloc(void* ptr, std::size_t size);
+extern "C" void free(void*);
+
+void StackTrace(OutputStream& out, std::string_view symbol_map);
 
 #endif //OS_UTILS_H

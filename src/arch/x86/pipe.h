@@ -14,7 +14,7 @@ public:
     Pipe(std::size_t size) : size(size) {}
 
     int Write(std::string_view s) {
-        int i = 0;
+        std::size_t i = 0;
         auto wp = write_pos;
         auto rp = read_pos;
         while (i < s.size() && wp < rp + size) {
@@ -40,8 +40,8 @@ public:
         return read_pos == write_pos;
     }
 
-    int Read(char* buf, int len) {
-        int i = 0;
+    int Read(char* buf, std::size_t len) {
+        std::size_t i = 0;
         auto wp = write_pos;
         auto rp = read_pos;
         while (i < len && rp < wp) {
@@ -50,6 +50,7 @@ public:
         read_pos = rp;
         return i;
     }
+
 
 private:
     char* Buffer() {

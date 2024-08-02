@@ -36,9 +36,9 @@ void ShowRegs(Regs* regs) {
 }
 
 void ReadSyscall(Regs* regs) {
-    auto fd = regs->ecx;
-    auto buf = reinterpret_cast<char*>(regs->edx);
-    auto len = regs->esi;
+    auto fd = regs->edx;
+    auto buf = reinterpret_cast<char*>(regs->ecx);
+    auto len = regs->ebx;
     if (fd != 0) {
         kprint("Non-stdin not supported\n");
         return;
@@ -48,14 +48,14 @@ void ReadSyscall(Regs* regs) {
 }
 
 void WriteSyscall(Regs* regs) {
-    auto fd = regs->ecx;
-    auto buf = reinterpret_cast<char*>(regs->edx);
-    auto len = regs->esi;
-    if (regs->edx != 1) {
+    auto fd = regs->edx;
+    auto buf = reinterpret_cast<char*>(regs->ecx);
+    auto len = regs->ebx;
+    if (fd != 1) {
         kprint("Non-stdout not supported\n");
         return;
     } else {
-        kprint("{}", std::string_view(reinterpret_cast<char*>(regs->ecx), regs->ebx));
+        kprint("{}", std::string_view(buf, len));
     }
     auto ret = len;
     regs->eax = ret;
@@ -141,12 +141,13 @@ static void general_protection(Regs* regs) {
 void page_fault(Regs* regs);
 
 static void SystemCall(Regs* regs) {
-    //kprint("SystemCall: {}\n", regs->eax);
+    kprint("SystemCall: {}\n", regs->eax);
     if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
         regs->eax = ENOSYS;
         return;
     }
     syscall_table[regs->eax](regs);
+    // kprint("End system call eax = {} resume eip {}\n", regs->eax, Hex{regs->eip});    
 }
 
 constexpr int kIsrEntries = 32 + 16 + 1;  // 32 exceptions, 16 IRQs, 1 syscall
