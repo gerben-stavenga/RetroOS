@@ -628,7 +628,7 @@ const void* LoadElf(std::string_view elf_buf, void* (*mmap)(uintptr_t, std::size
     auto phs = reinterpret_cast<const ProgramHeader*>(&elf_buf[elf->phoff]);
     for (const auto& ph : Range(phs, elf->phnum)) {
         if (ph.type != 1) continue;
-        auto buf = mmap(ph.vaddr, ph.memsz, ph.type);
+        auto buf = mmap(ph.vaddr, ph.memsz, ph.flags);
         memcpy(buf, &elf_buf[ph.off], ph.filesz);
     }
 
