@@ -48,6 +48,7 @@ entry_wrapper:
 
 global exit_kernel
 exit_kernel:
+    cli  ; when called to switch task the regs pointer it's not a proper kernel stack, so no interrupts should occur
     mov esp, [esp + 4]
 
     pop gs

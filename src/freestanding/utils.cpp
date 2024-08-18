@@ -604,6 +604,43 @@ struct ProgramHeader {
     uint32_t align;
 };
 
+struct SectionHeader {
+	uint32_t	sh_name;
+	uint32_t	sh_type;
+	uint32_t	sh_flags;
+	uint32_t	sh_addr;
+	uint32_t	sh_offset;
+	uint32_t	sh_size;
+	uint32_t	sh_link;
+	uint32_t	sh_info;
+	uint32_t	sh_addralign;
+	uint32_t	sh_entsize;
+};
+
+enum ShT_Types {
+	SHT_NULL	= 0,   // Null section
+	SHT_PROGBITS	= 1,   // Program information
+	SHT_SYMTAB	= 2,   // Symbol table
+	SHT_STRTAB	= 3,   // String table
+	SHT_RELA	= 4,   // Relocation (w/ addend)
+	SHT_NOBITS	= 8,   // Not present in file
+	SHT_REL		= 9,   // Relocation (no addend)
+};
+
+enum ShT_Attributes {
+	SHF_WRITE	= 0x01, // Writable section
+	SHF_ALLOC	= 0x02  // Exists in memory
+};
+
+struct Symbol {
+    uint32_t st_name;
+    uint32_t st_value;
+    uint32_t st_size;
+    uint8_t st_info;
+    uint8_t st_other;
+    uint16_t st_shndx;
+};
+
 // Values for Proghdr type
 enum {
     kElfProgLoad = 1,
@@ -627,11 +664,25 @@ const void* LoadElf(std::string_view elf_buf, void* (*mmap)(uintptr_t, std::size
     // Load each program segment (ignores ph flags).
     auto phs = reinterpret_cast<const ProgramHeader*>(&elf_buf[elf->phoff]);
     for (const auto& ph : Range(phs, elf->phnum)) {
-        if (ph.type != 1) continue;
+        if (ph.type != kElfProgLoad) continue;
         auto buf = mmap(ph.vaddr, ph.memsz, ph.flags);
         memcpy(buf, &elf_buf[ph.off], ph.filesz);
     }
+/*
+    auto shs = reinterpret_cast<const SectionHeader*>(&elf_buf[elf->shoff]);
+    auto strtab_sh = shs[elf->shstrndx];
 
+    for (const auto& sh : Range(shs, elf->shnum)) {
+        if (sh.sh_type != SHT_SYMTAB) continue;
+        auto symtab = reinterpret_cast<const Symbol*>(reinterpret_cast<uintptr_t>(&sh) + sh.sh_offset);
+        int nsyms = sh.sh_size / sh.sh_entsize;
+
+        auto nsyms = symtab->st_size;
+        for (const auto& sym : Range(symtab, nsyms)) {
+
+        }
+    }
+*/
     return reinterpret_cast<const void*>(elf->entry);
 }
 

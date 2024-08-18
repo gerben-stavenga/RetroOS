@@ -252,7 +252,7 @@ void RemapInterrupts() {
     // Set slave PIC IRQs starting at 40 (0x28)
     InitializePic(kSlavePort, 0x28, kCascadeIRQ);
 
-    InitializePit(0, 100);
+    InitializePit(0, 1000);
     RegisterIrqHandler(0, TimerHandler);
     RegisterIrqHandler(1, KeyboardHandler);
 }

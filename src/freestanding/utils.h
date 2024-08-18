@@ -47,8 +47,16 @@ int strncmp(const char *a, const char *b, std::size_t n);
 char* strchr(const char *s, int c);
 char* strrchr(const char *s, int c);
 char* strstr(const char* haystack, const char* needle);
+void *memchr(const void *ptr, int value, std::size_t n);
+int memcmp(const void *lhs, const void *rhs, std::size_t n);
 
-}
+
+void* malloc(std::size_t size);
+void* calloc(std::size_t size);
+void* realloc(void* ptr, std::size_t size);
+void free(void*);
+
+}  // extern "C"
 
 class OutputStream {
 public:
@@ -315,7 +323,7 @@ template <typename T, std::size_t N>
 class BTree {
     class Node {
         T array[N - 1];
-        Node* children[N];
+        Node* children;
         int size = 0;
         bool is_leaf = true;
 
@@ -385,11 +393,6 @@ const void* LoadElf(std::string_view elf, void* (*mmap)(uintptr_t, std::size_t, 
 inline std::uintptr_t GetAddress(const void* p) { return reinterpret_cast<std::uintptr_t>(p); }
 
 void InitializeAllocator(void* ptr, std::size_t size);
-
-extern "C" void* malloc(std::size_t size);
-extern "C" void* calloc(std::size_t size);
-extern "C" void* realloc(void* ptr, std::size_t size);
-extern "C" void free(void*);
 
 void StackTrace(OutputStream& out, std::string_view symbol_map);
 
