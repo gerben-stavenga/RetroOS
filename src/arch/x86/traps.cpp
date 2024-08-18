@@ -191,10 +191,21 @@ constexpr IsrTable MakeTable() {
 
 const IsrTable isr_table = MakeTable();
 
+extern uint8_t kernel_stack[4096 * 32];
+
 extern "C" [[noreturn]] void isr_handler(Regs* regs) {
+    if (reinterpret_cast<uintptr_t>(regs) - reinterpret_cast<uintptr_t>(kernel_stack) < 16 * 4096) {
+        kprint("Low stack");
+        StackTrace();
+    }
     X86_sti();
     regs->int_no = (regs->int_no - reinterpret_cast<uintptr_t>(int_vector)) / 8;
+    Regs tmp = *regs;
     isr_table.entries[regs->int_no](regs);
-    X86_cli();
+    static volatile bool x = true;
+    if (x && regs->int_no < 48) {
+        x = false;
+        assert(memcmp(&tmp, regs, sizeof(Regs)) == 0) << Hex(std::string_view((char*)&tmp, sizeof(Regs))) << Hex(std::string_view((char*)regs, sizeof(Regs)));
+    }
     exit_kernel(regs);
 }

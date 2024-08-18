@@ -10,52 +10,26 @@
 
 #include "src/freestanding/utils.h"
 
-uintptr_t SysCall(uintptr_t num, uintptr_t arg0, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3, uintptr_t arg4);
-
-[[noreturn]] inline void Exit(int code) {
-    SysCall(0, code, 0, 0, 0, 0);
-    __builtin_unreachable();
+inline uintptr_t SysCall(uintptr_t num, uintptr_t arg0, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3, uintptr_t arg4) {
+    asm volatile("int $0x80"
+                 : "+a"(num), "+d"(arg0)
+                 : "c"(arg1), "b"(arg2), "S"(arg3), "D"(arg4)
+                 : "memory");
+    return num;
 }
 
-inline void Yield() {
-    SysCall(1, 0, 0, 0, 0, 0);
-}
 
-inline void* Alloc(std::size_t size) {
-    return (void*) SysCall(2, size, 0, 0, 0, 0);
-}
-
-inline void Free(void* ptr) {
-    SysCall(3, (uintptr_t) ptr, 0, 0, 0, 0);
-}
-
-inline int Fork() {
-    return SysCall(4, 0, 0, 0, 0, 0);
-}
-
-inline void Exec(const char* path, char* const argv[], char* const envp[]) {
-    SysCall(5, (uintptr_t) path, (uintptr_t) argv, (uintptr_t) envp, 0, 0);
-}
-
-inline int Open(const char* path, int flags, int mode) {
-    return SysCall(6, (uintptr_t) path, flags, mode, 0, 0);
-}
-
-inline void Close(int fd) {
-    SysCall(7, fd, 0, 0, 0, 0);
-}
-
-inline std::size_t Read(int fd, void* buf, std::size_t count) {
-    return SysCall(8, fd, (uintptr_t) buf, count, 0, 0);
-}
-
-inline int Write(int fd, const void* buf, std::size_t count) {
-    return SysCall(9, fd, (uintptr_t) buf, count, 0, 0);
-}
-
-inline int Seek(int fd, int offset, int whence) {
-    return SysCall(10, fd, offset, whence, 0, 0);
-}
+[[noreturn]] void Exit(int code);
+void Yield();
+void* Alloc(std::size_t size);
+void Free(void* ptr);
+int Fork();
+void Exec(const char* path, char* const argv[], char* const envp[]);
+int Open(const char* path, int flags, int mode);
+void Close(int fd);
+std::size_t Read(int fd, void* buf, std::size_t count);
+int Write(int fd, const void* buf, std::size_t count);
+int Seek(int fd, int offset, int whence);
 
 class Reader : public InputStream {
 public:
