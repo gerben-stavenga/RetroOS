@@ -34,6 +34,11 @@ struct Range {
     T* end_;
 };
 
+__attribute__((weak))
+[[noreturn]] void Exit(int exit_code);
+__attribute__((weak))
+void StdOutPush(std::string_view str);
+    
 extern "C" {
 
 void *memmove(void *dst, const void *src, std::size_t n);
@@ -246,9 +251,19 @@ private:
     char buffer[N];
 };
 
-__attribute__((weak))
-[[noreturn]] void exit(int exit_code);
+class StdOutStream : public OutputStream {
+public:
+    void Push(std::string_view str) override {
+        StdOutPush(str);
+    }
+};
 
+extern StdOutStream std_out;
+
+template <typename... Args>
+void kprint(std::string_view fmt, Args... args) {
+    print(std_out, fmt, args...);
+}
 
 class PanicStream {
 public:
@@ -265,10 +280,7 @@ private:
     OutputStream* out_;
 };
 
-__attribute__((weak))
-PanicStream GetPanicStream(const char* str, const char* file, int line);
-
-#define assert(cond) if (!kDebug || (cond)) {} else GetPanicStream(#cond, __FILE__, __LINE__)
+#define assert(cond) if (!kDebug || (cond)) {} else PanicStream(std_out, #cond, __FILE__, __LINE__)
 
 class USTARReader {
 public:

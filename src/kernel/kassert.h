@@ -7,20 +7,11 @@
 
 #include "src/freestanding/utils.h"
 
-struct KernelOutput;
-
-extern KernelOutput kout;
-
-template <typename... Args>
-void kprint(std::string_view fmt, Args... args) {
-    print(reinterpret_cast<OutputStream&>(kout), fmt, args...);
-}
-
 template<typename... Args>
 void panic(std::string_view format, const Args&... args) {
     kprint("Kernel panic: ");
     kprint(format, args...);
-    exit(-1);
+    Exit(-1);
 }
 
 void StackTrace();

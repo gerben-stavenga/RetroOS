@@ -6,11 +6,8 @@
 #define OS_IRQ_H
 
 #include "entry.h"
-#include "pipe.h"
+#include "src/kernel/pipe.h"
 
-extern PipeN<1024> key_pipe;
-
-int GetTime();
 void IrqHandler(Regs* regs);
 void RemapInterrupts();
 

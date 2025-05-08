@@ -6,7 +6,8 @@
 
 #include "entry.h"
 #include "irq.h"
-#include "kassert.h"
+#include "src/kernel/kassert.h"
+#include "src/kernel/syscalls.h"
 #include "paging.h"
 #include "thread.h"
 #include "x86_inst.h"
@@ -34,45 +35,6 @@ typedef void (*EntryHandler)(Regs*);
 void ShowRegs(Regs* regs) {
     kprint("ShowRegs: @{}:{} stack {}:{}\nkernel stack @{} ecx: {} edx: {}\n", Hex(regs->cs), Hex(regs->eip), Hex(regs->ss), Hex(regs->esp), Hex(regs->temp_esp), Hex(regs->ecx), Hex(regs->edx));
 }
-
-void ReadSyscall(Regs* regs) {
-    auto fd = regs->edx;
-    auto buf = reinterpret_cast<char*>(regs->ecx);
-    auto len = regs->ebx;
-    if (fd != 0) {
-        kprint("Non-stdin not supported\n");
-        return;
-    }
-    auto ret = key_pipe.Read(buf, len);
-    regs->eax = ret;
-}
-
-void WriteSyscall(Regs* regs) {
-    auto fd = regs->edx;
-    auto buf = reinterpret_cast<char*>(regs->ecx);
-    auto len = regs->ebx;
-    if (fd != 1) {
-        kprint("Non-stdout not supported\n");
-        return;
-    } else {
-        kprint("{}", std::string_view(buf, len));
-    }
-    auto ret = len;
-    regs->eax = ret;
-}
-
-static const EntryHandler syscall_table[] = {
-        SysExit,  // 0
-        Yield,  // 1
-        nullptr,
-        nullptr,
-        SysFork,  // 4
-        nullptr,
-        nullptr,
-        nullptr,
-        ReadSyscall,  // 8
-        WriteSyscall,  // 9
-};
 
 enum Signals : int {
     SIGFPE, SIGTRAP, SIGSEGV, SIGILL, SIGBUS
@@ -140,72 +102,54 @@ static void general_protection(Regs* regs) {
 
 void page_fault(Regs* regs);
 
+extern uint8_t kernel_stack[4096 * 32];
+
+__attribute__((noinline))
 static void SystemCall(Regs* regs) {
     kprint("SystemCall: {}\n", regs->eax);
+    assert(regs == reinterpret_cast<Regs*>(kernel_stack + sizeof(kernel_stack) - sizeof(Regs)));
     if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
         regs->eax = ENOSYS;
         return;
     }
-    syscall_table[regs->eax](regs);
-    // kprint("End system call eax = {} resume eip {}\n", regs->eax, Hex{regs->eip});    
+    regs->eax = syscall_table[regs->eax](regs->edx, regs->ecx, regs->ebx, regs->esi, regs->edi);
 }
 
-constexpr int kIsrEntries = 32 + 16 + 1;  // 32 exceptions, 16 IRQs, 1 syscall
-struct IsrTable {
-    EntryHandler entries[kIsrEntries];
-};
 
-constexpr EntryHandler IsrHandler(int i) {
-    switch (i) {
-        case 1: return debug;
-        case 2: return nmi;
-        case 8: return double_fault;
-        case 13: return general_protection;
-        case 14: return page_fault;
-        case 16: return coprocessor_error;
+extern "C" void isr_handler(Regs* regs) {
+    if (reinterpret_cast<uintptr_t>(regs) - reinterpret_cast<uintptr_t>(kernel_stack) < 16 * 4096) {
+        // kprint("Low stack");
+        // StackTrace();
+    } else {
+        X86_sti();
+    }
+    if (regs->int_no >= 32 && regs->int_no < 48) {
+    } else {
+        kprint("Going interrupt number: {} @{}:{}\n", regs->int_no, Hex(regs->cs), Hex(regs->eip));
+    }
+    switch (regs->int_no) {
+        case 1: return debug(regs);
+        case 2: return nmi(regs);
+        case 8: return double_fault(regs);
+        case 13: return general_protection(regs);
+        case 14: return page_fault(regs);
+        case 16: return coprocessor_error(regs);
 
         case 0:
         case 3 ... 7:
         case 9 ... 12:
         case 17:
-            return generic_exception_handler;
+            return generic_exception_handler(regs);
 
         case 15:
         case 18 ... 31:
-            return unknown_exception_handler;
+            return unknown_exception_handler(regs);
 
         case 32 ... 47:  // IRQ0 ... IRQ15
-            return IrqHandler;
+            return IrqHandler(regs);
         case 48:
-            return SystemCall;
+            return SystemCall(regs);
         default:
-            return nullptr;
+            __builtin_unreachable();
     }
-}
-
-constexpr IsrTable MakeTable() {
-    IsrTable table{};
-    for (int i = 0; i < kIsrEntries; i++) table.entries[i] = IsrHandler(i);
-    return table;
-}
-
-const IsrTable isr_table = MakeTable();
-
-extern uint8_t kernel_stack[4096 * 32];
-
-extern "C" [[noreturn]] void isr_handler(Regs* regs) {
-    if (reinterpret_cast<uintptr_t>(regs) - reinterpret_cast<uintptr_t>(kernel_stack) < 16 * 4096) {
-        kprint("Low stack");
-        StackTrace();
-    }
-    X86_sti();
-    regs->int_no = (regs->int_no - reinterpret_cast<uintptr_t>(int_vector)) / 8;
-    Regs tmp = *regs;
-    isr_table.entries[regs->int_no](regs);
-    static volatile bool x = true;
-    if (x && regs->int_no < 48) {
-        x = false;
-        assert(memcmp(&tmp, regs, sizeof(Regs)) == 0) << Hex(std::string_view((char*)&tmp, sizeof(Regs))) << Hex(std::string_view((char*)regs, sizeof(Regs)));
-    }
-    exit_kernel(regs);
 }

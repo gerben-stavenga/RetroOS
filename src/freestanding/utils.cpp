@@ -4,6 +4,8 @@
 
 #include "utils.h"
 
+constinit StdOutStream std_out;
+
 extern "C" {
 
 void *memcpy(void *dst, const void *src, std::size_t n) {
@@ -161,7 +163,7 @@ char* strstr(const char *haystack, const char *needle) {
 PanicStream::~PanicStream() {
     if (out_) {
         print(*out_, "\n");
-        exit(-1);
+        Exit(-1);
     }
 }
 
@@ -207,7 +209,7 @@ NOINLINE std::size_t print_buf(std::size_t pos, BufferedOStream& out, std::strin
     if (k < n) {
 error:
         pos = print(pos, out, "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
-        exit(-1);
+        Exit(-1);
     }
     return pos;
 }
@@ -707,7 +709,6 @@ void StackTrace(OutputStream& out, std::string_view symbol_map) {
             while (*p != '\n') p++;
             name = {tmp, std::size_t(p - tmp)};
             p++;
-//            for (int i = 0; )
         }
         print(out, "Stack frame {} at {}@{}\n", bp, name, ip);
         frame = static_cast<void**>(bp);

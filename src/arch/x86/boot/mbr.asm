@@ -18,8 +18,6 @@ global _start
 _start:
     jmp REALSEG:next  ; make sure cs = 0
     global start_msg
-start_msg:
-    db 'Start booting', 13, 10
 align 4
 gdt:
     dw 0, 0, 0, 0

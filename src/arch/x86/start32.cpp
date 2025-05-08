@@ -8,11 +8,12 @@
 #include "src/freestanding/utils.h"
 #include "descriptors.h"
 #include "irq.h"
-#include "kassert.h"
 #include "paging.h"
-#include "thread.h"
 #include "x86_inst.h"
 #include "drv/hdd.h"
+
+#include "src/kernel/startup.h"
+#include "src/kernel/kassert.h"
 
 struct Screen {
     int cursor_x = 0, cursor_y = 0;
@@ -45,35 +46,18 @@ struct Screen {
     }
 };
 
-struct KernelOutput : public OutputStream {
-    void Push(std::string_view str) override;
+constinit Screen screen;
 
-    Screen screen_;
-};
-
-void KernelOutput::Push(std::string_view str) {
-    Screen tmp = screen_;
+void StdOutPush(std::string_view str) {
+    Screen tmp = screen;
     for (char c : str) {
         tmp.Put(c);
     }
-    screen_ = tmp;
+    screen = tmp;
 }
 
-constinit KernelOutput kout;
-
-PanicStream GetPanicStream(const char* str, const char* file, int line) {
-    return PanicStream(kout, str, file, line);
-}
-
-std::size_t symbol_size;
-char *symbol_map;
-
-void StackTrace() {
-    StackTrace(kout, {symbol_map, symbol_size});
-}
-
-NOINLINE [[noreturn]] void exit(int) {
-    StackTrace(kout, {symbol_map, symbol_size});
+NOINLINE [[noreturn]] void Exit(int) {
+    StackTrace();
     while (true) X86_hlt();
 }
 
@@ -82,38 +66,9 @@ extern "C" uint8_t _data[];
 extern "C" uint8_t _edata[];
 extern "C" uint8_t _end[];
 
-class RamUSTARReader : public USTARReader {
-public:
-    constexpr RamUSTARReader(unsigned start) : start_(start) {}
-
-    bool ReadBlocks(std::size_t block, int n, void *buf) override {
-        ReadSectors(start_ + block, n, buf);
-        return true;
-    }
-
-private:
-    unsigned start_;
-};
-
-RamUSTARReader fs(0);
-
-void InitFS(unsigned start) {
-    fs = RamUSTARReader(start);
-}
-
-std::size_t Open(std::string_view path) {
-    return fs.FindFile(path);
-}
-
-void ReadFile(void* dst, std::size_t size) {
-    fs.ReadFile(dst, size);
-}
-
-void ReadSectors(unsigned lba, unsigned count, void* p);
-
-extern "C" [[noreturn]] void KernelInit(const BootData* boot_data) {
-    kout.screen_.cursor_x = boot_data->cursor_pos & 0xFF;
-    kout.screen_.cursor_y = (boot_data->cursor_pos >> 8) & 0xFF;
+[[noreturn]] void KernelInit(const BootData* boot_data) {
+    screen.cursor_x = boot_data->cursor_pos & 0xFF;
+    screen.cursor_y = (boot_data->cursor_pos >> 8) & 0xFF;
 
     SetupDescriptorTables();
 
@@ -125,42 +80,7 @@ extern "C" [[noreturn]] void KernelInit(const BootData* boot_data) {
 
     InitPaging(kernel_low, kernel_high, boot_data);
 
-    kprint("Initializing disk {}\n", boot_data->start_sector);
-    InitFS(boot_data->start_sector);
-
-    auto ssize = Open("system.map");
-    auto smap = (char*)malloc(ssize);
-    ReadFile(smap, ssize);
-    symbol_map = smap;
-    symbol_size = ssize;
-
-    std::string_view filename = "src/arch/x86/init.elf";
-    auto size = Open(filename);
-    if (size == SIZE_MAX) {
-        kprint("Failed to load {}\n", filename);
-        exit(-1);
-    }
-    char* buf = (char*)malloc(size);
-    assert(buf != nullptr);
-    ReadFile(buf, size);
-    char md5_out[16];
-    md5(std::string_view(buf, size), md5_out);
-    kprint("init.elf md5 {} {}\n", size, Hex(std::string_view{md5_out, 16}));
-    auto dst = LoadElf({buf, size}, +[](uintptr_t address, std::size_t sz, int type) { 
-        kprint("Map @{} size {} of type {}\n", Hex(address), sz, type);
-        memset(reinterpret_cast<void*>(address), 0, sz);
-        return reinterpret_cast<void*>(address); 
-    });
-    free(buf);
-
-    auto init_stack = reinterpret_cast<uintptr_t>(kKernelBase);
-    kprint("Boot succeeded!\nLoaded {} of size {} with md5 {} at {}\nMoving to userspace\n", filename, size, Hex(std::string_view(md5_out, 16)), dst);
-
-    auto thread = CreateThread(nullptr, &kernel_pages.pdir, true);
-    thread->cpu_state.eip = reinterpret_cast<uintptr_t>(dst);
-    thread->cpu_state.esp = init_stack;
-
-    ExitToThread(thread);
+    Startup(boot_data->start_sector, &kernel_pages.pdir);
 }
 
 extern "C"
@@ -179,7 +99,7 @@ __attribute__((section(".entry")))
     auto phys_address = reinterpret_cast<uintptr_t>(boot_data->kernel);
     if ((phys_address & (kPageSize - 1)) != 0 || reinterpret_cast<uintptr_t>(_start) != kKernelBase) {
         // The loaded kernel must be page aligned, linked at kKernelBase
-        exit(-1);
+        Exit(-1);
     }
 
     auto delta = phys_address - AsLinear(_start);
