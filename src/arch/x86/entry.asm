@@ -17,9 +17,16 @@ SwitchStack:
     call eax  ; should not return
     ud2
 
-extern isr_handler
+global exit_kernel
+exit_kernel:
+    cli  ; when called to switch task the regs pointer it's not a proper kernel stack, so no interrupts should occur
+    mov esp, [esp + 4]
+    jmp exit_interrupt
+
+entry_wrapper_no_error_code:
+    push dword [esp]
 entry_wrapper:
-    ; stack int handler return address , error code , return stackframe
+    ; stack int handler return address , error code , interrupt number
     ; save remaining registers
     pusha
     push ds
@@ -43,14 +50,11 @@ entry_wrapper:
 
     cld
     push eax  ; save esp value as it is before the instruction pointer is pushed
+    extern isr_handler
     call isr_handler  ; does not return
-    ud2
+    add esp, 12
 
-global exit_kernel
-exit_kernel:
-    cli  ; when called to switch task the regs pointer it's not a proper kernel stack, so no interrupts should occur
-    mov esp, [esp + 4]
-
+exit_interrupt:
     pop gs
     pop fs
     pop es
@@ -64,13 +68,12 @@ global int_vector
 int_vector:
 %assign i 0
 %rep 49
-align 8 ; The code below is either 5 or 7 bytes long, so aligning to 8 bytes makes for a equal spaced array of handlers
+align 8 ; The code below is either 4 or 7 bytes long, so aligning to 8 bytes makes for a equal spaced array of handlers
+    push i  ; 2 bytes
 %if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
-    ; error code is already pushed by CPU
+    jmp entry_wrapper  ; 2 or 5 bytes
 %else
-    ; push zero error code to make the stack layout uniform
-    push 0
+    jmp entry_wrapper_no_error_code  ; 2 or 5 bytes
 %endif
-    call entry_wrapper  ; the interrupt number can be deduced from the return address pushed by the call instruction
 %assign i (i + 1)
 %endrep

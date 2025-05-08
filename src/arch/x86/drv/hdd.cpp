@@ -1,5 +1,5 @@
 #include "src/arch/x86/x86_inst.h"
-#include "src/arch/x86/kassert.h"
+#include "src/kernel/kassert.h"
 #include "src/freestanding/utils.h"
 
 enum {

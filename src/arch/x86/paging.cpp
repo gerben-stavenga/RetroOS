@@ -4,11 +4,13 @@
 
 #include "paging.h"
 
-#include "kassert.h"
+#include "src/kernel/kassert.h"
 #include "x86_inst.h"
 #include "src/freestanding/utils.h"
 #include "irq.h"
 #include "thread.h"
+
+#include "src/kernel/thread.h"
 
 /***
  * How does forking work. When forking the whole address space is duplicated. This is done
@@ -185,6 +187,8 @@ std::uintptr_t RecursivelyCopyPageTable(std::uintptr_t page_idx) {
     }
 }
 
+// Attribute to force the linker to not drop the function
+__attribute__((used))
 PageTable* ForkCurrent() {
     kprint("Free pages {} free kernel pages {}\n", free_pages, num_page_dirs);
     // Establish recursive pages
@@ -220,12 +224,6 @@ void SwitchPageDir(PageTable* new_dir) {
     auto size = (kNumPageEntries - 1 - kKernelPageDirIdx) * sizeof(PageEntry);
     memcpy(new_dir->entries + kKernelPageDirIdx, GetCurrentDir().entries + kKernelPageDirIdx, size);
     X86_set_cr3(PhysicalPage(new_dir) * kPageSize);
-}
-
-void segv(Regs* regs) {
-    (void)regs;  // silence unused warning
-    // TODO send sigsegv
-    panic("Seg fault tid {}, user outside allocation\n", current_thread->tid);
 }
 
 extern uint8_t kernel_stack[4096];
@@ -276,7 +274,7 @@ void page_fault(Regs* regs) {
         } else {
             kprint("Page fault @{} present {} write {} user {}\n", Hex(fault_address), page_present, is_write, is_user);
         }
-        // StackTrace(kout, {});
+        // StackTrace();
     }
 
     // Address space is divided as [nullptr protection, user space, kernel space]
@@ -285,12 +283,12 @@ void page_fault(Regs* regs) {
         assert(is_user) << pf_printer;
         // Null pointer dereference
         assert(false) << pf_printer << Hex(regs->esp) << *(void**)regs->eip;
-        return segv(regs);
+        return SegvCurrentThread(regs, fault_address);
     }
     if (is_user && fault_address >= kKernelBase) {
         // User mode tried to access kernel memory
         assert(false) << pf_printer << *regs;
-        return segv(regs);
+        return SegvCurrentThread(regs, fault_address);
     }
     // We know now that it's not a permission issue.
 
@@ -327,7 +325,7 @@ void page_fault(Regs* regs) {
             }
         } else {
             assert(is_user) << pf_printer;  // Kernel should never try to write to read only page.
-            segv(regs);
+            SegvCurrentThread(regs, fault_address);
         }
     } else {
         //kprint("Page not present\n");

@@ -55,10 +55,4 @@ private:
     int fd_;
 };
 
-template <typename... Args>
-void uprint(std::string_view s, const Args&... args) {
-    Writer w(1);
-    print(w, s, args...);
-}
-
 #endif //OS_LIBC_H

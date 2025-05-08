@@ -9,6 +9,10 @@
     __builtin_unreachable();
 }
 
+void StdOutPush(std::string_view str) {
+    Write(1, str.data(), str.size());
+}
+
 void Yield() {
     SysCall(1, 0, 0, 0, 0, 0);
 }

@@ -38,22 +38,18 @@ inline void PutChar(char c) {
     X86_outb(0xe9, c);  // qemu console output when run "--debugcon stdio"
 }
 
-struct Out : public OutputStream {
-    void Push(std::string_view str) override {
-        for (char c : str) {
-            PutChar(c);
-        }
+void StdOutPush(std::string_view str) {
+    for (char c : str) {
+        PutChar(c);
     }
-};
-
-Out out;
+}
 
 [[noreturn]] inline void Halt() {
     while (true) X86_hlt();    
 }
 
-NOINLINE [[noreturn]] void exit(int exit_code) {
-    print(out, "Panic! Exit code {}", exit_code);
+NOINLINE [[noreturn]] void Exit(int exit_code) {
+    kprint("Panic! Exit code {}", exit_code);
     Halt();
 }
 
@@ -120,7 +116,7 @@ public:
 private:
     bool ReadBlocks(std::size_t block, int n, void *buffer) override {
         if (!read_disk(drive_, lba_ + block, n, buffer)) {
-            print(out, "Failed {}\n", Hex{regs.ax});
+            kprint("Failed {}\n", Hex{regs.ax});
             return false;
         }
         return true;
@@ -141,38 +137,38 @@ static void EnableA20() {
 extern char _start[], _edata[], _end[];
 [[noreturn]] void FullBootLoader(int drive) {
     memset(_edata, 0, _end - _edata);
-    print(out, "Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
-    print(out, "Loader size: {}\n", _edata - _start);
-    print(out, "Extended BIOS at {}\n", Hex(uintptr_t(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
+    kprint("Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
+    kprint("Loader size: {}\n", _edata - _start);
+    kprint("Extended BIOS at {}\n", Hex(uintptr_t(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
     EnableA20();
-    print(out, "A20 enabled\n");
+    kprint("A20 enabled\n");
     unsigned fs_lba = (reinterpret_cast<uintptr_t >(_edata) - reinterpret_cast<uintptr_t >(_start) + 511) / 512;
     TarFSReader tar(drive, fs_lba);
-    auto size = tar.FindFile("kernel.md5");
+    auto size = tar.FindFile("src/arch/x86/kernel.bin.md5");
     if (size != 16) {
-        print(out, "md5 file not found or invalid size {}", size);
-        exit(-1);
+        kprint("md5 file not found or invalid size {}", size);
+        Exit(-1);
     }
     char expected_md5[16];
     tar.ReadFile(expected_md5, 16);
 
     size = tar.FindFile("src/arch/x86/kernel.bin");
     if (size == -1) {
-        print(out, "kernel not found");
-        exit(-1);
+        kprint("kernel not found");
+        Exit(-1);
     }
     auto const buffer = reinterpret_cast<char*>((0x7C00 + _end - _start + 0xFFF) & -0x1000);
     tar.ReadFile(buffer, size);
-    print(out, "Loaded kernel at {} {}\n", (void*)buffer, size);
+    kprint("Loaded kernel at {} {}\n", (void*)buffer, size);
 
     char md5_out[16];
     md5(std::string_view(buffer, size), md5_out);
     if (std::string_view(expected_md5, 16) != std::string_view(md5_out, 16)) {
-        print(out, "Error md5 checksum of kernel of size {} mismatch! Expected {} got {}\n",
+        kprint("Error md5 checksum of kernel of size {} mismatch! Expected {} got {}\n",
             size, Hex(std::string_view(expected_md5, 16)), Hex(std::string_view(md5_out, 16)));
-        exit(-1);
+        Exit(-1);
     }
-    print(out, "Kernel loaded .. starting kernel\n");
+    kprint("Kernel loaded .. starting kernel\n");
     BootData boot_data;
     boot_data.kernel = buffer;
     boot_data.cursor_pos = GetCursor();
@@ -183,26 +179,8 @@ extern char _start[], _edata[], _end[];
     __builtin_unreachable();
 }
 
-// Master boot record code (must fit the 512 byte limit)
-__attribute__((always_inline))
-inline void Print(std::string_view str) {
-    regs.ax = 0x300;
-    regs.bx = 0;
-    generate_real_interrupt(0x10);
-    regs.ax = 0x1301;
-    regs.bx = 7;
-    regs.cx = str.size();
-    regs.es = 0;
-    regs.bp = reinterpret_cast<uintptr_t>(str.data());
-    generate_real_interrupt(0x10);
-}
-
-extern "C"
-char start_msg[15];
-
 extern "C" __attribute__((noinline, fastcall, section(".boot")))
 [[noreturn]] void BootLoader(int /* dummy */, int drive) {
-    Print({start_msg, 15});
     auto nsectors = (reinterpret_cast<uintptr_t>(_edata) - reinterpret_cast<uintptr_t>(_start) - 1) / 512;
     if (read_disk(drive, 1, nsectors, reinterpret_cast<void*>(0x7C00 + 512))) {
         FullBootLoader(drive);
