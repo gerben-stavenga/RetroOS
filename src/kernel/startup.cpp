@@ -57,7 +57,7 @@ void ReadFile(void* dst, std::size_t size) {
     symbol_size = ssize;
 
     kprint("Loading init.elf\n");
-    std::string_view filename = "src/arch/x86/init.elf";
+    std::string_view filename = "src/kernel/init.elf";
     auto size = Open(filename);
     if (size == SIZE_MAX) {
         panic("Failed to load {}\n", filename);

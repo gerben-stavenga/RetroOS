@@ -46,7 +46,7 @@ regs:
 next:
     xor esp, esp    ; make sure high bits are zero
     mov ss, sp
-    mov sp, 0x1000  ; between 0x500 and 0x1000 is conventional mem
+    mov sp, 0x7C00  ; use the space just below code
 
     ; move to pm
     call REALSEG:toggle_pm

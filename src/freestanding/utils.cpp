@@ -4,6 +4,8 @@
 
 #include "utils.h"
 
+#include "demangle.h"
+
 constinit StdOutStream std_out;
 
 extern "C" {
@@ -161,22 +163,22 @@ char* strstr(const char *haystack, const char *needle) {
 }  // extern "C"
 
 PanicStream::~PanicStream() {
-    if (out_) {
-        print(*out_, "\n");
-        Exit(-1);
-    }
+    print(std_out, "\n");
+    Exit(-1);
 }
 
-PanicStream::PanicStream(OutputStream& out, const char* cond_str, const char* file, int line) : out_(&out) {
-    print(out, "assert: Condition \"{}\" failed at {}:{}.", cond_str, file, line);
+PanicStream GetPanicStream(const char* cond_str, const char* file, int line) {
+    print(std_out, "assert: Condition \"{}\" failed at {}:{}.", cond_str, file, line);
+    return PanicStream();
 }
 
 NOINLINE void PrintImpl(OutputStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
-    BufferedOStreamN<100> buf(&out);
-    buf.Finalize(print_buf(0, buf, format, printers, n));
+    char* pos;
+    BufferedOStream buf(&out, &pos);
+    buf.Flush(print_buf(pos, buf, format, printers, n));
 }
 
-NOINLINE std::size_t print_buf(std::size_t pos, BufferedOStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
+NOINLINE char* print_buf(char* pos, BufferedOStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
     std::size_t k = 0;
     for (std::size_t i = 0; i < format.size(); i++) {
         if (PREDICT_FALSE(format[i] == '{')) {
@@ -214,11 +216,11 @@ error:
     return pos;
 }
 
-NOINLINE std::size_t print_char(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+NOINLINE char* print_char(char* pos, BufferedOStream& out, const ValuePrinter& value) {
     return out.put(pos, value.n);
 }
 
-NOINLINE std::size_t print_decimal(std::size_t pos, BufferedOStream& out, uint64_t z) {
+NOINLINE char* print_decimal(char* pos, BufferedOStream& out, uint64_t z) {
     char buf[20];
     int n = 0;
     do {
@@ -231,12 +233,12 @@ NOINLINE std::size_t print_decimal(std::size_t pos, BufferedOStream& out, uint64
     return pos;
 }
 
-NOINLINE std::size_t print_val_u(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+NOINLINE char* print_val_u(char* pos, BufferedOStream& out, const ValuePrinter& value) {
     auto z = value.n;
     return print_decimal(pos, out, z);
 }
 
-std::size_t print_val_s(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_s(char* pos, BufferedOStream& out, const ValuePrinter& value) {
     auto z = value.n;
     if (int64_t(z) < 0) {
         pos = out.put(pos, '-');
@@ -249,7 +251,7 @@ inline char HexDigit(int x) {
     return x < 10 ? '0' + x : 'a' + x - 10;
 }
 
-NOINLINE static std::size_t print_hex(std::size_t pos, BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
+NOINLINE static char* print_hex(char* pos, BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
     for (int i = ndigits - 1; i >= 0; i--) {
         int digit = (x >> (i * 4)) & 0xf;
         pos = out.put(pos, HexDigit(digit));
@@ -257,14 +259,14 @@ NOINLINE static std::size_t print_hex(std::size_t pos, BufferedOStream& out, uin
     return pos;
 }
 
-std::size_t print_val_hex(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_hex(char* pos, BufferedOStream& out, const ValuePrinter& value) {
     auto x = value.hex_num.x;
     auto ndigits = value.hex_num.size;
     pos = out.put(pos, '0'); pos = out.put(pos, 'x');
     return print_hex(pos, out, x, ndigits);
 }
 
-std::size_t print_val_hex64(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_hex64(char* pos, BufferedOStream& out, const ValuePrinter& value) {
     uintptr_t x = value.n & 0xFFFFFFFF;
     uintptr_t y = value.n >> 32;
     pos = out.put(pos, '0'); pos = out.put(pos, 'x');
@@ -272,7 +274,7 @@ std::size_t print_val_hex64(std::size_t pos, BufferedOStream& out, const ValuePr
     return print_hex(pos, out, x, sizeof(uintptr_t) * 2);
 }
 
-std::size_t print_val_str(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_str(char* pos, BufferedOStream& out, const ValuePrinter& value) {
     std::string_view str(value.s);
     for (std::size_t i = 0; i < str.size(); i++) {
         pos = out.put(pos, str[i]);
@@ -280,7 +282,7 @@ std::size_t print_val_str(std::size_t pos, BufferedOStream& out, const ValuePrin
     return pos;
 }
 
-std::size_t print_val_hexbuf(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_hexbuf(char* pos, BufferedOStream& out, const ValuePrinter& value) {
     std::string_view str(value.s);
     for (std::size_t i = 0; i < str.size(); i++) {
         pos = out.put(pos, HexDigit(uint8_t(str[i]) >> 4));
@@ -688,11 +690,24 @@ const void* LoadElf(std::string_view elf_buf, void* (*mmap)(uintptr_t, std::size
     return reinterpret_cast<const void*>(elf->entry);
 }
 
+struct Out : BufferedOStream {
+    Out(char* buf, std::size_t size) : BufferedOStream(buf, size, &pos_) {}
+
+    static void callback(const char* str, std::size_t len, void* opaque) {
+        auto out = static_cast<Out*>(opaque);
+        out->pos_ = out->Push(out->pos_, {str, len});
+    }
+
+    char* pos_;
+};
+
 void StackTrace(OutputStream& out, std::string_view symbol_map) {
     void* bp;
     asm ("movl %%ebp, %0": "=r" (bp));
     void** frame = static_cast<void**>(bp);
     bp = frame[0];
+    char demangle_buf[256];
+    char cstr[256];
     while (bp) {
         auto ip = frame[1];
         std::string_view name;
@@ -707,10 +722,18 @@ void StackTrace(OutputStream& out, std::string_view symbol_map) {
             p += 11;
             auto tmp = p;
             while (*p != '\n') p++;
-            name = {tmp, std::size_t(p - tmp)};
+            memcpy(cstr, tmp, p - tmp);
+            cstr[p - tmp] = 0;
+            Out out(demangle_buf, sizeof(demangle_buf));
+            if (true && cplus_demangle_v3_callback (cstr, 0, Out::callback, &out)) {
+                name = {demangle_buf, out.Flush(out.pos_)};
+            } else {
+                out.Flush(out.pos_);
+                name = {tmp, static_cast<std::size_t>(p - tmp)};
+            }
             p++;
         }
-        print(out, "Stack frame {} at {}@{}\n", bp, name, ip);
+        print(out, "{} at {} (sp = {})\n", ip, name, bp);
         frame = static_cast<void**>(bp);
         bp = frame[0];
     }

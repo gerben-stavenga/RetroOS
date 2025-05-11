@@ -100,6 +100,7 @@ int AllocPhysPage() {
             return i;
         }
     }
+    panic("No free pages");
     return -1;
 }
 
@@ -123,7 +124,6 @@ void FreeKernelPage(PageTable* p) {
 void RecurseFreePages(uintptr_t page_idx) {
     auto& e = GetPageEntry(page_idx);
     assert(e.IsPresent()) << e;
-    FreePhysPage(e.Page());
     if (page_idx >= kCurPageTab / kPageSize) {
         auto p = reinterpret_cast<PageTable*>(page_idx * kPageSize);
         for (int i = 0; i < kNumPageEntries; i++) {
@@ -132,6 +132,7 @@ void RecurseFreePages(uintptr_t page_idx) {
             }
         }
     }
+    FreePhysPage(e.Page());
 }
 
 void DumpTable(PageTable* tables, std::uintptr_t page_idx) {
@@ -157,6 +158,8 @@ void DumpTable(PageTable* tables, std::uintptr_t page_idx) {
     }
 }
 
+// Allocate a page and recursively copies pagetables page_idx and below in the hierachy.
+// Returns the physical page of root page table
 __attribute__((noinline))
 std::uintptr_t RecursivelyCopyPageTable(std::uintptr_t page_idx) {
     auto src = reinterpret_cast<PageTable*>(page_idx * kPageSize);
@@ -193,6 +196,7 @@ PageTable* ForkCurrent() {
     kprint("Free pages {} free kernel pages {}\n", free_pages, num_page_dirs);
     // Establish recursive pages
     auto pt = AllocPageDir(RecursivelyCopyPageTable(kNumPages - 1));
+    kprint("Root pdir page {}\n", PhysicalPage(pt));
     // Re-establish recursive pages
     pt->entries[kNumPageEntries - 1] = PageEntry(PhysicalPage(pt), 1, 0, 0);
     pt->entries[kNumPageEntries - 2] = 0;
@@ -207,6 +211,17 @@ PageTable* ForkCurrent() {
     FlushTLB();
     FreePhysPage(pe.Page());
     return pt;
+}
+
+PageTable* SwitchFreshPageDirAndFreeOld(PageTable* old_dir) {
+    auto pd = AllocPageDir(AllocPhysPage());
+    auto user_space = kKernelBase / kPageSize / kNumPageEntries;
+    memcpy(pd->entries + user_space, GetCurrentDir().entries + user_space, kPageSize - user_space * sizeof(PageEntry));
+    // Re-establish recursive pages
+    pd->entries[kNumPageEntries - 1] = PageEntry(PhysicalPage(pd), 1, 0, 0);
+    assert(pd->entries[kNumPageEntries - 2].AsUInt() == 0);
+    SwitchPageDirAndFreeOld(pd, old_dir);
+    return pd;
 }
 
 void SwitchPageDirAndFreeOld(PageTable* new_dir, PageTable* old_dir) {
@@ -249,7 +264,7 @@ void page_fault(Regs* regs) {
             return p;
         }
 
-        static std::size_t print_page_fault(std::size_t pos, BufferedOStream& out, const ValuePrinter& value) {
+        static char* print_page_fault(char* pos, BufferedOStream& out, const ValuePrinter& value) {
             auto p = static_cast<const Printer*>(value.p);
 
             auto error = p->regs->err_code;
@@ -282,7 +297,7 @@ void page_fault(Regs* regs) {
     if (fault_address < kNullLimit) {
         assert(is_user) << pf_printer;
         // Null pointer dereference
-        assert(false) << pf_printer << Hex(regs->esp) << *(void**)regs->eip;
+        StackTrace();
         return SegvCurrentThread(regs, fault_address);
     }
     if (is_user && fault_address >= kKernelBase) {

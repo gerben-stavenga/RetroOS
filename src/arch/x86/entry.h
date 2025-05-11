@@ -23,7 +23,7 @@ struct Regs {
         return res;
     }
 
-    static std::size_t Print(std::size_t pos, BufferedOStream& out, const ValuePrinter& v) {
+    static char* Print(char* pos, BufferedOStream& out, const ValuePrinter& v) {
         auto p = static_cast<const Regs*>(v.p);
         return print(pos, out, "Regs eip: {}, esp: {}, eax: {}\n", p->eip, p->esp, p->eax);
     }

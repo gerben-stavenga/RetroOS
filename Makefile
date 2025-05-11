@@ -12,9 +12,11 @@ LDFLAGS := -melf_i386 -nostdlib -no-pie -L/usr/lib/gcc/x86_64-linux-gnu/13/32 -l
 BOOTLOADER_OBJ := build/src/arch/x86/boot/boot.o
 ARCH_OBJ := build/src/arch/x86/start32.o build/src/arch/x86/paging.o build/src/arch/x86/descriptors.o build/src/arch/x86/traps.o build/src/arch/x86/irq.o build/src/arch/x86/thread.o build/src/arch/x86/drv/hdd.o
 KERNEL_OBJ := build/src/kernel/startup.o build/src/kernel/thread.o build/src/kernel/syscalls.o build/src/kernel/drv/basic.o
-FREESTANDING_OBJ := build/src/freestanding/utils.o
+FREESTANDING_OBJ := build/src/freestanding/utils.o build/src/freestanding/demangle.o
 LIBC_OBJ := build/src/libc/libc.o
 INIT_OBJ := build/src/kernel/init.o
+
+FIB_OBJ := build/src/apps/fib.o
 
 ALL_OBJ := $(BOOTLOADER_OBJ) $(KERNEL_OBJ) $(FREESTANDING_OBJ) $(LIBC_OBJ) $(INIT_OBJ)
 
@@ -98,13 +100,14 @@ build/src/arch/x86/bootloader.elf: build/src/arch/x86/boot/mbr.o $(BOOTLOADER_OB
 
 build/src/arch/x86/kernel.elf: build/src/arch/x86/entry.o $(ARCH_OBJ) build/src/kernel/kernel.a build/src/freestanding/freestanding.a
 
-build/src/arch/x86/init.elf: build/src/libc/crt0.o $(INIT_OBJ) build/src/libc/libc.a build/src/freestanding/freestanding.a
+build/src/kernel/init.elf: build/src/libc/crt0.o $(INIT_OBJ) build/src/libc/libc.a build/src/freestanding/freestanding.a
 	@$(LD) $^ -o $@ $(LDFLAGS)
 
-
+build/src/apps/fib.elf: build/src/libc/crt0.o build/src/apps/fib.o build/src/libc/libc.a build/src/freestanding/freestanding.a
+	@$(LD) $^ -o $@ $(LDFLAGS)
 
 # tar is used to create a filesystem image, it naturally blocks files to 512 bytes which matches the sector size
-build/fs.tar: build/src/arch/x86/bootloader.bin build/src/arch/x86/kernel.bin.md5 build/src/arch/x86/kernel.bin build/src/arch/x86/kernel.map build/src/arch/x86/init.elf
+build/fs.tar: build/src/arch/x86/bootloader.bin build/src/arch/x86/kernel.bin.md5 build/src/arch/x86/kernel.bin build/src/arch/x86/kernel.map build/src/kernel/init.elf build/src/apps/fib.elf build/depend.sh
 	@tar -cf $@ -C build $(^:build/%=%)
 
 # the first file in the tar is the bootloader, so we need to skip the first 512 bytes which is the tar header for

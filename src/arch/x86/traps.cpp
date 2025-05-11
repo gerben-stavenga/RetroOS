@@ -106,7 +106,7 @@ extern uint8_t kernel_stack[4096 * 32];
 
 __attribute__((noinline))
 static void SystemCall(Regs* regs) {
-    kprint("SystemCall: {}\n", regs->eax);
+    // kprint("SystemCall: {}\n", regs->eax);
     assert(regs == reinterpret_cast<Regs*>(kernel_stack + sizeof(kernel_stack) - sizeof(Regs)));
     if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
         regs->eax = ENOSYS;
@@ -122,10 +122,6 @@ extern "C" void isr_handler(Regs* regs) {
         // StackTrace();
     } else {
         X86_sti();
-    }
-    if (regs->int_no >= 32 && regs->int_no < 48) {
-    } else {
-        kprint("Going interrupt number: {} @{}:{}\n", regs->int_no, Hex(regs->cs), Hex(regs->eip));
     }
     switch (regs->int_no) {
         case 1: return debug(regs);

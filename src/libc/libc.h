@@ -31,28 +31,4 @@ std::size_t Read(int fd, void* buf, std::size_t count);
 int Write(int fd, const void* buf, std::size_t count);
 int Seek(int fd, int offset, int whence);
 
-class Reader : public InputStream {
-public:
-    Reader(int fd) : fd_(fd) {}
-
-    std::size_t Pull(char* buf, std::size_t max_len) override {
-        return Read(fd_, buf, max_len);
-    }
-
-private:
-    int fd_;
-};
-
-class Writer : public OutputStream {
-public:
-    Writer(int fd) : fd_(fd) {}
-
-    void Push(std::string_view s) override {
-        Write(fd_,s.data(), s.size());
-    }
-
-private:
-    int fd_;
-};
-
 #endif //OS_LIBC_H

@@ -22,6 +22,57 @@ constexpr bool kDebug = false;
 constexpr bool kDebug = true;
 #endif
 
+__attribute__((weak))
+[[noreturn]] void Exit(int exit_code);
+__attribute__((weak))
+void StdOutPush(std::string_view str);
+    
+
+class OutputStream {
+public:
+    virtual std::pair<char*, std::size_t> Next() = 0;
+    virtual void Flush(std::size_t backup_count) = 0;
+};
+    
+class StdOutStream : public OutputStream {
+public:
+    std::pair<char*, std::size_t> Next() override {
+        if (pos_) StdOutPush(std::string_view(buffer_, sizeof(buffer_)));
+        pos_ += sizeof(buffer_);
+        return {buffer_, sizeof(buffer_)};
+    }
+
+    void Flush(std::size_t backup_count) override {
+        auto len = sizeof(buffer_) - backup_count;
+        if (len > 0) {
+            StdOutPush(std::string_view(buffer_, len));
+        }
+        pos_ = 0;
+    }
+
+private:
+    char buffer_[256] = {};
+    std::size_t pos_ = 0;
+};
+
+extern StdOutStream std_out;
+    
+class PanicStream {
+public:
+    ~PanicStream();
+
+    template <typename T>
+    PanicStream& operator<<(const T& x) {
+        print(std_out, " {}", x);
+        return *this;
+    }
+};
+
+PanicStream GetPanicStream(const char* str, const char* file, int line);
+
+#define assert(cond) if (!kDebug || (cond)) {} else GetPanicStream(#cond, __FILE__, __LINE__)
+
+
 template <typename T, std::size_t N>
 constexpr std::size_t array_size(const T (&)[N]) { return N; }
 
@@ -34,11 +85,6 @@ struct Range {
     T* end_;
 };
 
-__attribute__((weak))
-[[noreturn]] void Exit(int exit_code);
-__attribute__((weak))
-void StdOutPush(std::string_view str);
-    
 extern "C" {
 
 void *memmove(void *dst, const void *src, std::size_t n);
@@ -63,36 +109,78 @@ void free(void*);
 
 }  // extern "C"
 
-class OutputStream {
-public:
-    virtual void Push(std::string_view) = 0;
-};
-
 class BufferedOStream {
 public:
-    void Finalize(std::size_t pos) {
-        if (pos != 0) {
-            char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedOStream);
-            stream->Push({buffer, pos});
+    constexpr BufferedOStream(OutputStream* stream, char** pos) : stream_(stream) {
+        if (stream == nullptr) {
+            *pos = nullptr;
+            buffer_end_ = nullptr;
+            return;
         }
+        auto [buffer, len] = stream->Next();
+        if (buffer == nullptr) {
+            *pos = nullptr;
+            buffer_end_ = nullptr;
+            return;
+        }
+        buffer_end_ = buffer + len;
+        *pos = buffer;
     }
 
-    std::size_t put(std::size_t pos, char c) {
-        char* buffer = reinterpret_cast<char*>(this) + sizeof(BufferedOStream);
-        buffer[pos++] = c;
-        if (PREDICT_FALSE(c == '\n' || pos == buffer_size)) {
-            stream->Push({buffer, pos});
-            pos = 0;
+    constexpr BufferedOStream(char* buf, std::size_t size, char** pos) : buffer_end_(buf + size) {
+        *pos = buf;
+        size_ = size;
+    }
+
+    ~BufferedOStream() {
+        assert(buffer_end_ == nullptr);
+    }
+
+    std::size_t Flush(char* pos) {
+        auto buffer_end = buffer_end_;
+        if (buffer_end == nullptr) return 0;
+        buffer_end_ = nullptr;
+        assert(pos != nullptr);
+        auto backup_count = buffer_end - pos;
+        if (stream_ != nullptr) {
+            stream_->Flush(backup_count);
+        }
+        return size_ - backup_count;
+    }
+
+    char* put(char* pos, char c) {
+        if (pos == nullptr)  return nullptr;
+        while (pos >= buffer_end_) pos = Next();
+        *pos++ = c;
+        return pos;
+    }
+
+    char* Push(char* pos, std::string_view str) {
+        for (auto c : str) {
+            pos = put(pos, c);
+            if (pos == nullptr) return nullptr;
         }
         return pos;
     }
 
-protected:
-    constexpr BufferedOStream(OutputStream* stream_, std::size_t buffer_size_) : stream(stream_), buffer_size(buffer_size_) {}
-
 private:
-    OutputStream* stream;
-    std::size_t buffer_size;
+    OutputStream* stream_ = nullptr;
+    char* buffer_end_ = nullptr;
+    size_t size_ = 0;
+
+    char* Next() {
+        if (stream_ == nullptr) return Error();
+        auto [buffer, len] = stream_->Next();
+        if (buffer == nullptr) return Error();
+        buffer_end_ = buffer + len;
+        size_ += len;
+        return buffer;
+    }
+
+    char* Error() {
+        buffer_end_ = nullptr;
+        return nullptr;
+    }
 };
 
 struct ValuePrinter {
@@ -106,16 +194,16 @@ struct ValuePrinter {
         const void* p;
         std::string_view s;
     };
-    std::size_t (*print)(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
+    char* (*print)(char* pos, BufferedOStream& out, const ValuePrinter& value);
 };
 
-std::size_t print_char(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
-std::size_t print_val_u(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
-std::size_t print_val_s(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
-std::size_t print_val_hex(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
-std::size_t print_val_hex64(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
-std::size_t print_val_str(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
-std::size_t print_val_hexbuf(std::size_t pos, BufferedOStream& out, const ValuePrinter& value);
+char* print_char(char* pos, BufferedOStream& out, const ValuePrinter& value);
+char* print_val_u(char* pos, BufferedOStream& out, const ValuePrinter& value);
+char* print_val_s(char* pos, BufferedOStream& out, const ValuePrinter& value);
+char* print_val_hex(char* pos, BufferedOStream& out, const ValuePrinter& value);
+char* print_val_hex64(char* pos, BufferedOStream& out, const ValuePrinter& value);
+char* print_val_str(char* pos, BufferedOStream& out, const ValuePrinter& value);
+char* print_val_hexbuf(char* pos, BufferedOStream& out, const ValuePrinter& value);
 
 template <typename T>
 concept Printable = requires(const T& v)
@@ -190,17 +278,9 @@ inline ValuePrinter MakeValuePrinter(char const* const& x) {
     return MakeValuePrinter(tmp);
 }
 
-std::size_t print_buf(std::size_t pos, BufferedOStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n);
+char* print_buf(char* pos, BufferedOStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n);
 
 void PrintImpl(OutputStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n);
-
-template<int N>
-class BufferedOStreamN : public BufferedOStream {
-public:
-    constexpr BufferedOStreamN(OutputStream* stream_) : BufferedOStream(stream_, N) {}
-private:
-    char buffer[N];
-};
 
 template <typename... Args>
 void print(OutputStream& out, std::string_view format, const Args&... args) {
@@ -210,11 +290,12 @@ void print(OutputStream& out, std::string_view format, const Args&... args) {
 }
 
 template <typename... Args>
-std::size_t print(std::size_t pos, BufferedOStream& out, std::string_view format, const Args&... args) {
+char* print(char* pos, BufferedOStream& out, std::string_view format, const Args&... args) {
     constexpr auto n = sizeof...(Args);
     const ValuePrinter printers[n] = {MakeValuePrinter(args)...};
     return print_buf(pos, out, format, printers, n);
 }
+
 
 class InputStream {
 public:
@@ -251,36 +332,10 @@ private:
     char buffer[N];
 };
 
-class StdOutStream : public OutputStream {
-public:
-    void Push(std::string_view str) override {
-        StdOutPush(str);
-    }
-};
-
-extern StdOutStream std_out;
-
 template <typename... Args>
 void kprint(std::string_view fmt, Args... args) {
     print(std_out, fmt, args...);
 }
-
-class PanicStream {
-public:
-    PanicStream(OutputStream& out, const char* str, const char* file, int line);
-    PanicStream(PanicStream&& other) : out_(other.out_) { other.out_ = nullptr; }
-    ~PanicStream();
-
-    template <typename T>
-    PanicStream& operator<<(const T& x) {
-        print(*out_, " {}", x);
-        return *this;
-    }
-private:
-    OutputStream* out_;
-};
-
-#define assert(cond) if (!kDebug || (cond)) {} else PanicStream(std_out, #cond, __FILE__, __LINE__)
 
 class USTARReader {
 public:
@@ -407,5 +462,8 @@ inline std::uintptr_t GetAddress(const void* p) { return reinterpret_cast<std::u
 void InitializeAllocator(void* ptr, std::size_t size);
 
 void StackTrace(OutputStream& out, std::string_view symbol_map);
+
+/* Callback typedef for allocation-less demangler interfaces. */
+typedef void (*demangle_callbackref) (const char *, size_t, void *);
 
 #endif //OS_UTILS_H
