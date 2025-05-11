@@ -8,5 +8,6 @@ int main(int argc, char* argv[], char* envp[]);
 extern "C"
 __attribute__((fastcall))
 [[noreturn]] void _start(int argc, char* argv[]) {
+    InitializeAllocator((void*)0x10000, 0x100000);
     StartProgram(main, argc, argv);
 }

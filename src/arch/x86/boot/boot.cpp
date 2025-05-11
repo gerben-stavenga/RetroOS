@@ -58,22 +58,30 @@ inline int min(unsigned a, unsigned b) { return a < b ? a : b; }
 __attribute__((__always_inline__))
 inline bool read_disk(int drive, unsigned lba, uint16_t count, void* buffer) {
     auto address = reinterpret_cast<uintptr_t>(buffer);
-    struct __attribute__((packed)) {
-        char size;
-        char null;
-        uint16_t count;
-        uint16_t off;
-        uint16_t seg;
-        uint64_t lba;
-    } packet = { 16, 0, count, static_cast<uint16_t>(address & 0xF), 
-                static_cast<uint16_t>(address >> 4), lba };
-    // Use int 13 to read disk
-    regs.ax = 0x4200;
-    regs.ds = 0;
-    regs.si = reinterpret_cast<uintptr_t>(&packet);
-    regs.dx = drive;
-    auto flags = generate_real_interrupt(0x13);
-    return (flags & 1) == 0;
+    do {
+        uint16_t num_sectors = min(count, 100);
+        struct __attribute__((packed)) {
+            char size;
+            char null;
+            uint16_t count;
+            uint16_t off;
+            uint16_t seg;
+            uint64_t lba;
+        } packet = { 16, 0, num_sectors, static_cast<uint16_t>(address & 0xF), 
+                    static_cast<uint16_t>(address >> 4), lba };
+        // Use int 13 to read disk
+        regs.ax = 0x4200;
+        regs.ds = 0;
+        regs.si = reinterpret_cast<uintptr_t>(&packet);
+        regs.dx = drive;
+        auto flags = generate_real_interrupt(0x13);
+        if (flags & 1) return false;
+        address += num_sectors * 512;
+        lba += num_sectors;
+        if (count <= num_sectors) break;
+        count -= num_sectors;
+    } while (true);
+    return true;
 }
 
 int CreateMemMap(MMapEntry *entries, int max_entries) {

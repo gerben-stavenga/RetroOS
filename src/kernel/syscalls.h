@@ -11,6 +11,8 @@ std::uintptr_t SysFork(std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uint
 std::uintptr_t WriteSyscall(std::uintptr_t fd, std::uintptr_t buf, std::uintptr_t len, std::uintptr_t, std::uintptr_t);
 std::uintptr_t ReadSyscall(std::uintptr_t fd, std::uintptr_t buf, std::uintptr_t len, std::uintptr_t, std::uintptr_t);
 std::uintptr_t WriteSyscall(std::uintptr_t fd, std::uintptr_t buf, std::uintptr_t len, std::uintptr_t, std::uintptr_t);
+std::uintptr_t SysOpen(std::uintptr_t fd, std::uintptr_t buf, std::uintptr_t len, std::uintptr_t, std::uintptr_t);
+std::uintptr_t Exec(std::uintptr_t path_, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t);
 
 constexpr SysCall syscall_table[] = {
     SysExit,  // 0
@@ -18,8 +20,8 @@ constexpr SysCall syscall_table[] = {
     nullptr,
     nullptr,
     SysFork,  // 4
-    nullptr,
-    nullptr,
+    Exec,  // 5
+    SysOpen,  // 6
     nullptr,
     ReadSyscall,  // 8
     WriteSyscall,  // 9
