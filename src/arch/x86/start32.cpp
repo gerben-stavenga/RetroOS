@@ -73,12 +73,15 @@ extern "C" uint8_t _end[];
     SetupDescriptorTables();
 
     RemapInterrupts();
-    X86_sti();
 
     int kernel_low = PhysicalPage(_start);
     int kernel_high = PhysicalPage(_end + kPageSize - 1);
 
     InitPaging(kernel_low, kernel_high, boot_data);
+
+    kprint("Kernel loaded at {} size {} kernel low {} high {}\n",
+        Hex(reinterpret_cast<uintptr_t>(_start)), _end - _start, kernel_low, kernel_high);
+    X86_sti();
 
     Startup(boot_data->start_sector, &kernel_pages.pdir);
 }

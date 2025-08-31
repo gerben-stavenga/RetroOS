@@ -271,10 +271,10 @@ void page_fault(Regs* regs) {
             const bool page_present = error & 1;
             const bool is_write = error & 2;
             const bool is_user = error & 4;
-            return print(pos, out, "page fault @{} present {} write {} user {} from ip@{}", Hex(p->fault_address), page_present, is_write, is_user, Hex(p->regs->eip));
+            return print(pos, out, "page fault @{} present {} write {} user {} from ip", Hex(p->fault_address), page_present, is_write, is_user /*, Hex(p->regs->eip)*/);
         }
         Regs* regs;
-        std::uintptr_t fault_address;
+        std::uint64_t fault_address;
     };
 
     Printer pf_printer{regs, fault_address};

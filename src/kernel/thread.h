@@ -19,7 +19,7 @@ enum ThreadState {
 };
 
 struct CpuState {
-    constexpr static size_t kSize = 16 * 8;
+    constexpr static size_t kSize = 26 * 8;
     constexpr static size_t kAlign = 16;
     alignas(kAlign) uint8_t opaque[kSize];  
 

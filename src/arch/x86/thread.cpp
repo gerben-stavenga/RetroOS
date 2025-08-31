@@ -9,25 +9,24 @@
 #include "paging.h"
 #include "descriptors.h"
 
+extern "C" void exit_interrupt(Regs* regs);
+
 void InitializeProcessThread(Thread* thread, const void* entry) {
     std::uint32_t ds = kUserDS | 3;
     std::uint32_t cs = kUserCS | 3;
     constexpr uint32_t kIFMask = 1 << 9;
-    thread->cpu_state.GetCPUState<Regs>() = Regs {
-        .gs = ds,
-        .fs = ds,
-        .es = ds,
-        .ds = ds,
-        .edi = 0,
-        .esi = 0,
-        .ebp = 0,
-        .temp_esp = 0,
-        .ebx = 0,
-        .edx = 0,
-        .ecx = 0,
-        .eax = 0,
-        .int_no = 0,
-        .err_code = 0,
+    thread->cpu_state.GetCPUState<Regs>() = Frame32 {
+        Regs {
+            .gs = ds,
+            .fs = ds,
+            .es = ds,
+            .ds = ds,
+            .entry_eip = reinterpret_cast<uint32_t>(exit_interrupt),
+            .entry_cs = kKernelCS,
+            .regs = {},
+            .int_no = 0,
+            .err_code = 0,
+        },
         .eip = (uint32_t)entry,
         .cs = cs,
         .eflags = kIFMask,
@@ -62,5 +61,5 @@ __attribute__((used))
 
 __attribute__((used))
 void SetReturn(Thread& thread, std::uintptr_t ret) {
-    thread.cpu_state.GetCPUState<Regs>().eax = ret;
+    thread.cpu_state.GetCPUState<Regs>().regs[RAX] = ret;
 }

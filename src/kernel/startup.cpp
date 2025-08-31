@@ -51,6 +51,9 @@ void ReadFile(void* dst, std::size_t size) {
 
     kprint("Initializing symbol map\n");
     auto ssize = Open("src/arch/x86/kernel.map");
+    if (ssize == SIZE_MAX) {
+        panic("Failed to load src/arch/x86/kernel.map\n");
+    }   
     auto smap = (char*)malloc(ssize);
     ReadFile(smap, ssize);
     symbol_map = smap;

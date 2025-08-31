@@ -33,7 +33,8 @@ typedef void (*EntryHandler)(Regs*);
  */
 
 void ShowRegs(Regs* regs) {
-    kprint("ShowRegs: @{}:{} stack {}:{}\nkernel stack @{} ecx: {} edx: {}\n", Hex(regs->cs), Hex(regs->eip), Hex(regs->ss), Hex(regs->esp), Hex(regs->temp_esp), Hex(regs->ecx), Hex(regs->edx));
+    auto frame = static_cast<Frame32*>(regs);
+    kprint("ShowRegs: @{}:{} stack {}:{}\n ecx: {} edx: {}\n", Hex(frame->cs), Hex(frame->eip), Hex(frame->ss), Hex(frame->esp), Hex(regs->regs[RCX]), Hex(regs->regs[RDX]));
 }
 
 enum Signals : int {
@@ -69,7 +70,8 @@ static void generic_exception_handler(Regs* regs) {
     auto int_no = regs->int_no;
     auto signal = exceptions[int_no].signal;
 
-    panic("An unsupported exception, signal = {} name = {} @{}:{}\n", signal, exceptions[regs->int_no].name, Hex(regs->cs), Hex(regs->eip));
+    auto frame = static_cast<Frame32*>(regs);
+    panic("An unsupported exception, signal = {} name = {} @{}:{}\n", signal, exceptions[regs->int_no].name, Hex(frame->cs), Hex(frame->eip));
 }
 
 static void unknown_exception_handler(Regs* regs) {
@@ -97,7 +99,8 @@ static void double_fault(Regs*) {
 }
 
 static void general_protection(Regs* regs) {
-    panic("GP {} {}:{}", regs->err_code, Hex(regs->cs), Hex(regs->eip));
+    auto frame = static_cast<Frame32*>(regs);
+    panic("GP {} {}:{}", regs->err_code, Hex(frame->cs), Hex(frame->eip));
 }
 
 void page_fault(Regs* regs);
@@ -108,11 +111,11 @@ __attribute__((noinline))
 static void SystemCall(Regs* regs) {
     // kprint("SystemCall: {}\n", regs->eax);
     assert(regs == reinterpret_cast<Regs*>(kernel_stack + sizeof(kernel_stack) - sizeof(Regs)));
-    if (regs->eax >= array_size(syscall_table) || !syscall_table[regs->eax]) {
-        regs->eax = ENOSYS;
+    if (regs->regs[RAX] >= array_size(syscall_table) || !syscall_table[regs->regs[RAX]]) {
+        regs->regs[RAX] = ENOSYS;
         return;
     }
-    regs->eax = syscall_table[regs->eax](regs->edx, regs->ecx, regs->ebx, regs->esi, regs->edi);
+    regs->regs[RAX] = syscall_table[regs->regs[RAX]](regs->regs[RDX], regs->regs[RCX], regs->regs[RBX], regs->regs[RSI], regs->regs[RDI]);
 }
 
 

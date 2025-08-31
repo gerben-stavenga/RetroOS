@@ -521,6 +521,8 @@ void* malloc(std::size_t size) {
     auto p = head;
     size = (size + 7) & -8;
     do {
+        kprint("malloc {} size {}\n", p, size);
+        assert(p != nullptr) << p;
         assert(p->marker == kUsedMarker || p->marker == kFreeMarker);
         auto next = p->next;
         if (next < p) break;

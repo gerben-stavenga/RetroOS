@@ -58,7 +58,7 @@ inline int min(unsigned a, unsigned b) { return a < b ? a : b; }
 __attribute__((__always_inline__))
 inline bool read_disk(int drive, unsigned lba, uint16_t count, void* buffer) {
     auto address = reinterpret_cast<uintptr_t>(buffer);
-    do {
+    while (count > 0) {
         uint16_t num_sectors = min(count, 100);
         struct __attribute__((packed)) {
             char size;
@@ -78,9 +78,8 @@ inline bool read_disk(int drive, unsigned lba, uint16_t count, void* buffer) {
         if (flags & 1) return false;
         address += num_sectors * 512;
         lba += num_sectors;
-        if (count <= num_sectors) break;
         count -= num_sectors;
-    } while (true);
+    }
     return true;
 }
 

@@ -5,6 +5,7 @@
 #ifndef OS_PAGING_H
 #define OS_PAGING_H
 
+#include <array>
 #include <cstdint>
 
 #include "boot/boot.h"
@@ -87,15 +88,13 @@ constexpr uintptr_t kCurPageTab = 0xFFC00000;  // 4mb of page table entries cove
 constexpr uintptr_t kCurPageDir = 0xFFFFF000;  // last page is the page dir and simultaneous page table covering [0xFFC00000, 0x100000000)
 
 constexpr uintptr_t kPageSize = 4096;
-constexpr uintptr_t kNumPageEntries = kPageSize / sizeof(uintptr_t);
 constexpr uintptr_t kNumPages = 1 << 20;   // 4GB address space has 1M 4K pages
 
-constexpr auto kKernelPageDirIdx = kKernelBase / kPageSize / kNumPageEntries;
-
+template <typename T>
 struct PageEntry {
     constexpr PageEntry() = default;
-    constexpr PageEntry(uintptr_t data) : data(data) {}
-    constexpr PageEntry(uintptr_t page, bool read_write, bool user_super, bool cow)
+    constexpr PageEntry(T data) : data(data) {}
+    constexpr PageEntry(T page, bool read_write, bool user_super, bool cow)
         : data(kPresent | (read_write ? kReadWrite : 0) | (user_super ? kUserSuper : 0) | (cow ? kCow : 0) | (page * kPage)) { }
 
     bool IsPresent() const { return data & kPresent; }
@@ -104,8 +103,10 @@ struct PageEntry {
     bool IsAccessed() const { return data & kAccessed; }
     bool IsDirty() const { return data & kDirty; }
     bool IsCow() const { return data & kCow; }
-    uintptr_t Page() const { return data / kPage; }
-    uintptr_t AsUInt() const { return data; }
+    T Page() const { return data / kPage; }
+    T AsUInt() const { return data; }
+
+    static constexpr uintptr_t kNumPageEntries = kPageSize / sizeof(T);
 
     enum {
         kPresent = 1,
@@ -117,17 +118,17 @@ struct PageEntry {
         kPage = 1 << 12,
     };
 
-    uintptr_t data = 0;
+    T data = 0;
 } __attribute__((packed));
 
-static_assert(sizeof(PageEntry) == sizeof(uintptr_t));
-
-inline bool IsZero(const PageEntry& e) {
+template <typename T>
+inline bool IsZero(const PageEntry<T>& e) {
     return e.AsUInt() == 0;
 }
 
+template <typename T>
 inline char* PageEntryPrinter(char* pos, BufferedOStream& out, const ValuePrinter& value) {
-    auto entry = PageEntry(value.n);
+    auto entry = PageEntry<T>(value.n);
     if (entry.IsPresent()) {
         return print(pos, out, "{{r/w: {}, u/s: {}, cow {}, page: {}}}", entry.IsReadWrite(), entry.IsUserSuper(), entry.IsCow(), Hex(entry.Page()));
     } else {
@@ -135,7 +136,8 @@ inline char* PageEntryPrinter(char* pos, BufferedOStream& out, const ValuePrinte
     }
 }
 
-inline ValuePrinter MakeValuePrinter(const PageEntry& e) {
+template <typename T>
+inline ValuePrinter MakeValuePrinter(const PageEntry<T>& e) {
     ValuePrinter res;
     res.n = e.AsUInt();
     res.print = PageEntryPrinter;
@@ -143,10 +145,17 @@ inline ValuePrinter MakeValuePrinter(const PageEntry& e) {
 }
 
 struct PageTable {
-    PageEntry entries[kNumPageEntries];
+    alignas(kPageSize) char data[kPageSize];  // The page table is aligned to a page size
+
+    template <typename T>
+    std::array<PageEntry<T>, PageEntry<T>::kNumPageEntries> GetEntries() const {
+        return {reinterpret_cast<const PageEntry<T>*>(data)};
+    }
 };
 
-struct alignas(kPageSize) KernelPages {
+static_assert(sizeof(PageTable) == kPageSize);
+
+struct KernelPages {
     PageTable pdir;  // The directory of kernel/init process
     PageTable ptab;  // The page table mapping the kernel binary
     PageTable kernel_low_mem_base;  // page table just below the page table addresses
@@ -156,29 +165,32 @@ struct alignas(kPageSize) KernelPages {
 
 extern KernelPages kernel_pages;
 
-static_assert(sizeof(PageTable) == kPageSize);
 
 inline uintptr_t AsLinear(const void* p) {
     return reinterpret_cast<uintptr_t>(p);
 }
 
-inline uintptr_t PageIdx(const void* p) {
+template <typename T>
+inline T PageIdx(const void* p) {
     return AsLinear(p) / kPageSize;
 }
 
-inline uintptr_t ParentPageIdx(std::uintptr_t page_idx) {
-    return kNumPages - 1 - (kNumPages - 1 - page_idx) / kNumPageEntries;
+template <typename T>
+inline T ParentPageIdx(T page_idx) {
+    return page_idx / PageEntry<T>::kNumPageEntries + (kCurPageDir / kPageSize - kCurPageDir / kPageSize / PageEntry<T>::kNumPageEntries);
 }
 
 inline uintptr_t ChildPageIdx(std::uintptr_t root_idx, unsigned idx) {
     return kNumPages - (kNumPages - root_idx) * kNumPageEntries + idx;
 }
 
-inline PageEntry& GetPageEntry(uintptr_t page_idx) {
-    return reinterpret_cast<PageEntry*>(kCurPageTab)[page_idx];
+template <typename T>
+inline PageEntry<T>& GetPageEntry(T page_idx) {
+    return reinterpret_cast<PageEntry<T>*>(kCurPageTab)[page_idx];
 }
 
-inline uintptr_t PhysicalPage(std::uintptr_t page_idx) {
+template <typename T>
+inline T PhysicalPage(T page_idx) {
     return GetPageEntry(page_idx).Page();
 } 
 

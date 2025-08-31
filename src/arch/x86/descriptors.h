@@ -12,6 +12,9 @@ constexpr int kKernelDS = 0x10;
 constexpr int kUserCS = 0x18;
 constexpr int kUserDS = 0x20;
 constexpr int kTSS = 0x28;
+constexpr int kKernelCS64 = 0x30;
+constexpr int kKernelDS64 = 0x40;
+
 
 void SetupDescriptorTables();
 
