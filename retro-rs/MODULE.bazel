@@ -1,0 +1,48 @@
+module(name = "retro_os", version = "0.1.0")
+
+bazel_dep(name = "rules_rust", version = "0.56.0")
+bazel_dep(name = "rules_cc", version = "0.1.1")
+bazel_dep(name = "rules_nasm", version = "0.4.0")
+bazel_dep(name = "rules_pkg", version = "1.0.1")
+bazel_dep(name = "platforms", version = "0.0.10")
+
+# Configure rust toolchain - only register for host (exec), our custom ones handle target
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["nightly/2025-01-15"],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+# Download rustc toolchain
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rust_toolchain_x86_64_linux",
+    url = "https://static.rust-lang.org/dist/2025-01-15/rust-nightly-x86_64-unknown-linux-gnu.tar.xz",
+    strip_prefix = "rust-nightly-x86_64-unknown-linux-gnu",
+    build_file = "//toolchain:rust_toolchain.BUILD",
+)
+
+http_archive(
+    name = "rust_src",
+    url = "https://static.rust-lang.org/dist/2025-01-15/rust-src-nightly.tar.xz",
+    strip_prefix = "rust-src-nightly/rust-src/lib/rustlib/src/rust",
+    build_file = "//stdlib:rust_src.BUILD",
+)
+
+http_archive(
+    name = "compiler_builtins",
+    url = "https://crates.io/api/v1/crates/compiler_builtins/0.1.140/download",
+    type = "tar.gz",
+    strip_prefix = "compiler_builtins-0.1.140",
+    build_file = "//stdlib:compiler_builtins.BUILD",
+)
+
+# Register toolchains
+register_toolchains(
+    "@rules_nasm//nasm/toolchain",
+    "//toolchain:retro_rust_toolchain",
+    "//toolchain:bare_cc_toolchain_def",
+)
