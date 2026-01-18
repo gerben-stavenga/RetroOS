@@ -1,0 +1,39 @@
+# Build kernel using rules_rust and rules_nasm
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//rules:defs.bzl", "kernel_link", "kernel_binary")
+
+nasm_library(
+    name = "entry",
+    srcs = ["entry.asm"],
+    copts = ["-f", "elf32"],
+)
+
+rust_static_library(
+    name = "kernel",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kernel",
+    crate_features = ["kernel"],
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=2",
+        "-Crelocation-model=static",
+        "-Ccode-model=kernel",
+    ],
+    deps = ["//lib"],
+)
+
+kernel_link(
+    name = "kernel_elf",
+    asm_objs = [":entry"],
+    rust_libs = [":kernel"],
+    linker_script = "kernel.ld",
+    visibility = ["//visibility:public"],
+)
+
+kernel_binary(
+    name = "kernel_bin",
+    elf = ":kernel_elf",
+    visibility = ["//visibility:public"],
+)

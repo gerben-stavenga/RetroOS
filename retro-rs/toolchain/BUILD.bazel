@@ -1,0 +1,121 @@
+load("@rules_rust//rust:toolchain.bzl", "rust_toolchain", "rust_stdlib_filegroup")
+load(":bare_cc_toolchain_config.bzl", "bare_cc_toolchain_config")
+load(":bootstrap.bzl", "bootstrap_mode_flag")
+
+package(default_visibility = ["//visibility:public"])
+
+# Bootstrap mode flag - when true, use empty stdlib
+bootstrap_mode_flag(
+    name = "bootstrap_mode",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "is_bootstrap",
+    flag_values = {":bootstrap_mode": "True"},
+)
+
+# Custom platform for i686-retro-none (bare metal)
+platform(
+    name = "i686_retro_none",
+    constraint_values = [
+        "@platforms//cpu:x86_32",
+        "@platforms//os:none",
+    ],
+)
+
+# Minimal CC toolchain for bare-metal
+bare_cc_toolchain_config(name = "bare_cc_config")
+
+cc_toolchain(
+    name = "bare_cc_toolchain",
+    all_files = ":empty_files",
+    compiler_files = ":empty_files",
+    dwp_files = ":empty_files",
+    linker_files = ":empty_files",
+    objcopy_files = ":empty_files",
+    strip_files = ":empty_files",
+    toolchain_config = ":bare_cc_config",
+)
+
+filegroup(name = "empty_files", srcs = [])
+
+toolchain(
+    name = "bare_cc_toolchain_def",
+    exec_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_32",
+        "@platforms//os:none",
+    ],
+    toolchain = ":bare_cc_toolchain",
+    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
+)
+
+# Target spec JSON for i686-retro-none
+TARGET_JSON = """{
+  "llvm-target": "i686-unknown-none",
+  "data-layout": "e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-i128:128-f64:32:64-f80:32-n8:16:32-S128",
+  "arch": "x86",
+  "target-endian": "little",
+  "target-pointer-width": "32",
+  "target-c-int-width": "32",
+  "os": "none",
+  "executables": true,
+  "linker-flavor": "ld.lld",
+  "linker": "rust-lld",
+  "panic-strategy": "abort",
+  "disable-redzone": true,
+  "relocation-model": "static",
+  "features": "-mmx,-sse,-sse2",
+  "exe-suffix": ".elf"
+}"""
+
+# Empty stdlib for bootstrap mode
+rust_stdlib_filegroup(
+    name = "empty_stdlib",
+    srcs = [],
+)
+
+# Full stdlib with core/alloc/compiler_builtins
+rust_stdlib_filegroup(
+    name = "full_stdlib",
+    srcs = [
+        "//stdlib:core",
+        "//stdlib:alloc",
+        "//stdlib:compiler_builtins",
+    ],
+)
+
+# Stdlib selection based on bootstrap mode
+alias(
+    name = "retro_stdlib",
+    actual = select({
+        ":is_bootstrap": ":empty_stdlib",
+        "//conditions:default": ":full_stdlib",
+    }),
+)
+
+# Single toolchain for all i686-retro-none builds
+rust_toolchain(
+    name = "retro_rust_toolchain_impl",
+    binary_ext = "",
+    dylib_ext = ".so",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_json = TARGET_JSON,
+    rust_doc = "@rust_toolchain_x86_64_linux//:rustdoc_bin",
+    rust_std = ":retro_stdlib",
+    rustc = "@rust_toolchain_x86_64_linux//:rustc_bin",
+    staticlib_ext = ".a",
+    stdlib_linkflags = [],
+)
+
+toolchain(
+    name = "retro_rust_toolchain",
+    exec_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_32",
+        "@platforms//os:none",
+    ],
+    toolchain = ":retro_rust_toolchain_impl",
+    toolchain_type = "@rules_rust//rust:toolchain_type",
+)

@@ -1,0 +1,19 @@
+# Bazel
+bazel-*
+.bazelrc.user
+MODULE.bazel.lock
+
+# Cargo
+target/
+
+# Build artifacts
+build/
+image
+image.bin
+
+# Rust analyzer (contains absolute paths, regenerate with bazel)
+rust-project.json
+
+# IDE
+.vscode/
+.idea/
