@@ -126,12 +126,12 @@ inline bool IsZero(const PageEntry& e) {
     return e.AsUInt() == 0;
 }
 
-inline char* PageEntryPrinter(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+inline char* PageEntryPrinter(Writer out, const ValuePrinter& value) {
     auto entry = PageEntry(value.n);
     if (entry.IsPresent()) {
-        return print(pos, out, "{{r/w: {}, u/s: {}, cow {}, page: {}}}", entry.IsReadWrite(), entry.IsUserSuper(), entry.IsCow(), Hex(entry.Page()));
+        return print(std::move(out), "{{r/w: {}, u/s: {}, cow {}, page: {}}}", entry.IsReadWrite(), entry.IsUserSuper(), entry.IsCow(), Hex(entry.Page()));
     } else {
-        return print(pos, out, "{{Page not present}}");
+        return print(std::move(out), "{{Page not present}}");
     }
 }
 

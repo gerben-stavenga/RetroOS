@@ -6,8 +6,26 @@
 
 #include "demangle.h"
 
-constinit StdOutStream std_out;
+constexpr std::uint64_t kUsedMarker = 0xA110CEDDA110CEDDul;
+constexpr std::uint64_t kFreeMarker = 0xFEE59ACEFEE59ACEul;
 
+struct MemBlock {
+    uint64_t marker;
+    MemBlock* next;
+    MemBlock* prev;
+};
+
+MemBlock* head;
+
+void InitializeAllocator(void* ptr, std::size_t size) {
+    auto start = static_cast<MemBlock*>(ptr);
+    auto end = reinterpret_cast<MemBlock*>(GetAddress(ptr) + size - sizeof(MemBlock));
+    *start = MemBlock{kFreeMarker, end, end};
+    *end = MemBlock{kUsedMarker, start, start};  // sentinel
+    head = start;
+}
+
+// libc replacements
 extern "C" {
 
 void *memcpy(void *dst, const void *src, std::size_t n) {
@@ -41,11 +59,11 @@ void *memmove(void *dst, const void *src, std::size_t n) {
     return dst;
 }
 
-void *memchr(const void *ptr, int value, std::size_t n) {
+const void *memchr(const void *ptr, int value, std::size_t n) {
     auto p = static_cast<const char *>(ptr);
     while (n--) {
         if (*p == value) {
-            return const_cast<char *>(p);
+            return p;
         }
         p++;
     }
@@ -78,23 +96,23 @@ std::size_t strnlen(const char *str, std::size_t n) {
     return n;
 }
 
-char *strchr(const char *str, int c) {
+const char *strchr(const char *str, int c) {
     for (std::size_t i = 0; str[i]; i++) {
         if (str[i] == c) {
-            return const_cast<char*>(str + i);
+            return str + i;
         }
     }
     return nullptr;
 }
 
-char *strrchr(const char *str, int c) {
+const char *strrchr(const char *str, int c) {
     const char *last = nullptr;
     for (std::size_t i = 0; str[i]; i++) {
         if (str[i] == c) {
             last = str + i;
         }
     }
-    return const_cast<char*>(last);
+    return last;
 }
 
 int strcmp(const char *lhs, const char *rhs) {
@@ -146,7 +164,7 @@ char *strncat(char *dst, const char *src, std::size_t n) {
     return dst;
 }
 
-char* strstr(const char *haystack, const char *needle) {
+const char* strstr(const char *haystack, const char *needle) {
     std::size_t len = 0;
     while (needle[len]) {
         if (haystack[len] == needle[len]) {
@@ -157,13 +175,150 @@ char* strstr(const char *haystack, const char *needle) {
             haystack++;
         }
     }
-    return const_cast<char*>(haystack);
+    return haystack;
+}
+
+// libc memory allocator
+void* malloc(std::size_t size) {
+    auto p = head;
+    size = (size + 7) & -8;
+    do {
+        assert(p->marker == kUsedMarker || p->marker == kFreeMarker);
+        auto next = p->next;
+        if (next < p) break;
+        
+        if (p->marker == kFreeMarker) {
+            auto s = GetAddress(next) - GetAddress(p + 1);
+            if (s >= size) {
+                constexpr std::size_t kMinFreeBlock = 64;
+                if (s >= size + sizeof(MemBlock) + kMinFreeBlock) {
+                    auto n = GetAddress(p + 1) + size;                    
+                    auto split = reinterpret_cast<MemBlock*>(n);
+                    *split = MemBlock{kFreeMarker, next, p};
+                    p->next = split;
+                    next->prev = split;
+                }
+                p->marker = kUsedMarker;
+                return p + 1;
+            }
+        }
+        p = next;
+    } while (true);
+    return nullptr;
+}
+
+void* calloc(std::size_t size) {
+    auto p = malloc(size);
+    std::memset(p, 0, size);
+    return p;
+}
+
+void* realloc(void* p, std::size_t size) {
+    auto ret = malloc(size);
+    std::memcpy(ret, p, size);
+    free(p);
+    return ret;
+}
+
+void free(void* ptr) {
+    auto block = static_cast<MemBlock*>(ptr) - 1;
+    assert(block->marker == kUsedMarker);
+    block->marker = kFreeMarker;
+    if (block->prev->marker == kFreeMarker) {
+        block->prev->next = block->next;
+        block->next->prev = block->prev;
+    } else if (block->next->marker == kFreeMarker) {
+        block->next->next->prev = block;
+        block->next = block->next->next;
+    }
 }
 
 }  // extern "C"
 
+
+[[noreturn]] void ThrowOutOfRange() {
+#ifdef __cpp_exceptions
+    throw std::out_of_range("Index out of range");
+#else
+    abort();
+#endif
+}
+
+constinit DefaultAlloc def_alloc;
+
+inline MemResource*& MemoryResource(void* ptr) {
+    return static_cast<MemResource**>(ptr)[-1];
+}
+
+inline void* Alloc(MemResource* mr, size_t cap, size_t elem_size) noexcept {
+    auto ptr = mr->allocate(cap *  elem_size + sizeof(std::max_align_t), sizeof(std::max_align_t));
+    ptr = static_cast<std::byte*>(ptr) + sizeof(std::max_align_t);
+    MemoryResource(ptr) = mr;
+    return ptr;
+}
+
+inline void Dealloc(MemResource* mr, void* base, size_t bytes) noexcept {
+    mr->deallocate(static_cast<std::max_align_t*>(base) - 1, bytes + sizeof(std::max_align_t), sizeof(std::max_align_t));
+}
+
+std::pair<void*, uint32_t> VecBase::GrowOutline(void* base, uint32_t size, uint32_t cap, uint32_t elem_size, Relocator relocate, uint32_t newcap) noexcept {
+    if (cap == 0) {
+        auto mr = static_cast<MemResource*>(base);
+        if (mr == nullptr) mr = &def_alloc;
+        newcap = std::max<uint32_t>(newcap, 1);
+        auto newbase = Alloc(mr, newcap, elem_size);
+        return {newbase, newcap};
+    } else {
+        auto mr = MemoryResource(base);
+        newcap = std::max<uint32_t>(newcap, cap * 2);
+        auto newbase = Alloc(mr, newcap, elem_size);
+        if (relocate) {
+            relocate(newbase, base, size);
+        } else {
+            std::memcpy(newbase, base, size * elem_size);
+        }
+        Dealloc(mr, base, cap * elem_size);
+        return {newbase, newcap};
+    }
+}
+
+void VecBase::FreeOutline(void* base, size_t bytes) noexcept {
+    auto mr = MemoryResource(base);
+    Dealloc(mr, base, bytes);
+}
+
+
+// static 
+const char* Reader::ReadSlow(char* buf, std::size_t n, InputStream* stream, const char* pos) {
+    auto to_copy = stream->end() - pos;
+    do {
+        assert(to_copy < n);
+        std::memcpy(buf, pos, to_copy);
+        buf += to_copy;
+        n -= to_copy;
+        pos = stream->Next();
+        to_copy = stream->end() - pos;        
+    } while (n > to_copy);
+    std::memcpy(buf, pos, n);
+    return pos + n;
+}
+
+// static
+char* Writer::WriteSlow(std::string_view str, OutputStream* stream, char* pos) {
+    auto to_copy = stream->end() - pos;
+    assert(to_copy < str.size());
+    do {
+        std::memcpy(pos, str.data(), to_copy);
+        str.remove_prefix(to_copy);
+        pos = stream->Next();
+        to_copy = stream->end() - pos;
+    } while (str.size() > to_copy);
+    std::memcpy(pos, str.data(), str.size());
+    return pos + str.size();
+}
+
 PanicStream::~PanicStream() {
-    print(std_out, "\n");
+    print(std_err, "\n");
     Exit(-1);
 }
 
@@ -173,17 +328,16 @@ PanicStream GetPanicStream(const char* cond_str, const char* file, int line) {
 }
 
 NOINLINE void PrintImpl(OutputStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
-    char* pos;
-    BufferedOStream buf(&out, &pos);
-    buf.Flush(print_buf(pos, buf, format, printers, n));
+    Writer buf(&out);
+    buf.Call([&](Writer b) { print_buf(std::move(b), format, printers, n); });
 }
 
-NOINLINE char* print_buf(char* pos, BufferedOStream& out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
+NOINLINE char* print_buf(Writer out, std::string_view format, const ValuePrinter* printers, std::size_t n) {
     std::size_t k = 0;
     for (std::size_t i = 0; i < format.size(); i++) {
         if (PREDICT_FALSE(format[i] == '{')) {
             if (i + 1 < format.size() && format[i + 1] == '{') {
-                pos = out.put(pos, '{');
+                out.put('{');
                 i++;
             } else {
                 std::size_t j = i + 1;
@@ -193,34 +347,35 @@ NOINLINE char* print_buf(char* pos, BufferedOStream& out, std::string_view forma
                 if (j == format.size() || k >= n) {
                     goto error;
                 }
-                pos = printers[k].print(pos, out, printers[k]);
+                out.Call([&](Writer b) { printers[k].print(std::move(b), printers[k]); });
                 k++;
                 i = j;
             }
         } else if (PREDICT_FALSE(format[i] == '}')) {
             if (i + 1 < format.size() && format[i + 1] == '}') {
-                pos = out.put(pos, format[i]);
+                out.put(format[i]);
                 i++;
             } else {
                 goto error;
             }
         } else {
-            pos = out.put(pos, format[i]);
+            out.put(format[i]);
         }
     }
     if (k < n) {
 error:
-        pos = print(pos, out, "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
+        print(std::move(out), "\n\nInvalid format string: \"{}\" with {} arguments.\n", format, n);
         Exit(-1);
     }
-    return pos;
+    return std::move(out).IntoPos();
 }
 
-NOINLINE char* print_char(char* pos, BufferedOStream& out, const ValuePrinter& value) {
-    return out.put(pos, value.n);
+NOINLINE char* print_char(Writer out, const ValuePrinter& value) {
+    out.put(value.n);
+    return std::move(out).IntoPos();
 }
 
-NOINLINE char* print_decimal(char* pos, BufferedOStream& out, uint64_t z) {
+NOINLINE char* print_decimal(Writer out, uint64_t z) {
     char buf[20];
     int n = 0;
     do {
@@ -228,67 +383,67 @@ NOINLINE char* print_decimal(char* pos, BufferedOStream& out, uint64_t z) {
         z /= 10;
     } while (z);
     for (int i = n - 1; i >= 0; i--) {
-        pos = out.put(pos, buf[i] + '0');
+        out.put(buf[i] + '0');
     }
-    return pos;
+    return std::move(out).IntoPos();
 }
 
-NOINLINE char* print_val_u(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+NOINLINE char* print_val_u(Writer out, const ValuePrinter& value) {
     auto z = value.n;
-    return print_decimal(pos, out, z);
+    return print_decimal(std::move(out), z);
 }
 
-char* print_val_s(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_s(Writer out, const ValuePrinter& value) {
     auto z = value.n;
     if (int64_t(z) < 0) {
-        pos = out.put(pos, '-');
+        out.put('-');
         z = -z;
     }
-    return print_decimal(pos, out, z);
+    return print_decimal(std::move(out), z);
 }
 
 inline char HexDigit(int x) {
     return x < 10 ? '0' + x : 'a' + x - 10;
 }
 
-NOINLINE static char* print_hex(char* pos, BufferedOStream& out, uintptr_t x, uintptr_t ndigits) {
+NOINLINE static char* print_hex(Writer out, uintptr_t x, uintptr_t ndigits) {
     for (int i = ndigits - 1; i >= 0; i--) {
         int digit = (x >> (i * 4)) & 0xf;
-        pos = out.put(pos, HexDigit(digit));
+        out.put(HexDigit(digit));
     }
-    return pos;
+    return std::move(out).IntoPos();
 }
 
-char* print_val_hex(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_hex(Writer out, const ValuePrinter& value) {
     auto x = value.hex_num.x;
     auto ndigits = value.hex_num.size;
-    pos = out.put(pos, '0'); pos = out.put(pos, 'x');
-    return print_hex(pos, out, x, ndigits);
+    out.put('0'); out.put('x');
+    return print_hex(std::move(out), x, ndigits);
 }
 
-char* print_val_hex64(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_hex64(Writer out, const ValuePrinter& value) {
     uintptr_t x = value.n & 0xFFFFFFFF;
     uintptr_t y = value.n >> 32;
-    pos = out.put(pos, '0'); pos = out.put(pos, 'x');
-    pos = print_hex(pos, out, y, sizeof(uintptr_t) * 2);
-    return print_hex(pos, out, x, sizeof(uintptr_t) * 2);
+    out.put('0'); out.put('x');
+    out.Call([&](Writer b) { print_hex(std::move(b), y, sizeof(uintptr_t) * 2); });
+    return print_hex(std::move(out), x, sizeof(uintptr_t) * 2);
 }
 
-char* print_val_str(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_str(Writer out, const ValuePrinter& value) {
     std::string_view str(value.s);
     for (std::size_t i = 0; i < str.size(); i++) {
-        pos = out.put(pos, str[i]);
+        out.put(str[i]);
     }
-    return pos;
+    return std::move(out).IntoPos();
 }
 
-char* print_val_hexbuf(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+char* print_val_hexbuf(Writer out, const ValuePrinter& value) {
     std::string_view str(value.s);
     for (std::size_t i = 0; i < str.size(); i++) {
-        pos = out.put(pos, HexDigit(uint8_t(str[i]) >> 4));
-        pos = out.put(pos, HexDigit(str[i] & 0xF));
+        out.put(HexDigit(uint8_t(str[i]) >> 4));
+        out.put(HexDigit(str[i] & 0xF));
     }
-    return pos;
+    return std::move(out).IntoPos();
 }
 
 struct USTARRawHeader {
@@ -362,7 +517,7 @@ USTARHeader Convert(const USTARRawHeader& h) {
     result.mtime = ReadOctal(std::string_view(h.mtime, sizeof(h.mtime)));
     result.typeflag = h.typeflag[0];
     result.link_target = std::string_view(h.link_target, sizeof(h.link_target));
-    memcpy(result.checksum, h.checksum, sizeof(h.checksum));
+    std::memcpy(result.checksum, h.checksum, sizeof(h.checksum));
     return result;
 }
 
@@ -405,7 +560,7 @@ bool USTARReader::ReadFile(void* buf, std::size_t bufsize) {
         if (!ReadBlocks(1, tmp_buf)) {
             return false;
         }
-        memcpy((char*)buf + bufsize - left_over, tmp_buf, left_over);
+        std::memcpy((char*)buf + bufsize - left_over, tmp_buf, left_over);
     }
     return true;
 }
@@ -448,7 +603,7 @@ static void ChunkMD5(const char* chunk, uint32_t md5_hash[4]) {
     uint32_t D = md5_hash[3];
 
     uint32_t block_data[16];
-    memcpy(block_data, chunk, 64);
+    std::memcpy(block_data, chunk, 64);
 
     auto hash_group = [&A, &B, &C, &D, block_data](int group, auto func) {
         constexpr uint8_t base[4] = {0, 1, 5, 0};
@@ -483,95 +638,18 @@ void md5(std::string_view buf, char out[16]) {
         buf.remove_prefix(64);
     }
     char padding[64] = {};
-    memcpy(padding, buf.data(), buf.size());
+    std::memcpy(padding, buf.data(), buf.size());
     padding[buf.size()] = 0x80;
     auto p = buf.size() + 1;
     if (p > 56) {
         ChunkMD5(padding, md5_hash);
-        memset(padding, 0, 56);
+        std::memset(padding, 0, 56);
     }
-    memcpy(padding + 56, &len, sizeof(uint64_t));
+    std::memcpy(padding + 56, &len, sizeof(uint64_t));
     ChunkMD5(padding, md5_hash);
 
-    memcpy(out, md5_hash, 16);
+    std::memcpy(out, md5_hash, 16);
 }
-
-constexpr std::uint64_t kUsedMarker = 0xA110CEDDA110CEDDul;
-constexpr std::uint64_t kFreeMarker = 0xFEE59ACEFEE59ACEul;
-
-struct MemBlock {
-    uint64_t marker;
-    MemBlock* next;
-    MemBlock* prev;
-};
-
-MemBlock* head;
-
-void InitializeAllocator(void* ptr, std::size_t size) {
-    auto start = static_cast<MemBlock*>(ptr);
-    auto end = reinterpret_cast<MemBlock*>(GetAddress(ptr) + size - sizeof(MemBlock));
-    *start = MemBlock{kFreeMarker, end, end};
-    *end = MemBlock{kUsedMarker, start, start};  // sentinel
-    head = start;
-}
-
-extern "C" {
-
-void* malloc(std::size_t size) {
-    auto p = head;
-    size = (size + 7) & -8;
-    do {
-        assert(p->marker == kUsedMarker || p->marker == kFreeMarker);
-        auto next = p->next;
-        if (next < p) break;
-        
-        if (p->marker == kFreeMarker) {
-            auto s = GetAddress(next) - GetAddress(p + 1);
-            if (s >= size) {
-                constexpr std::size_t kMinFreeBlock = 64;
-                if (s >= size + sizeof(MemBlock) + kMinFreeBlock) {
-                    auto n = GetAddress(p + 1) + size;                    
-                    auto split = reinterpret_cast<MemBlock*>(n);
-                    *split = MemBlock{kFreeMarker, next, p};
-                    p->next = split;
-                    next->prev = split;
-                }
-                p->marker = kUsedMarker;
-                return p + 1;
-            }
-        }
-        p = next;
-    } while (true);
-    return nullptr;
-}
-
-void* calloc(std::size_t size) {
-    auto p = malloc(size);
-    memset(p, 0, size);
-    return p;
-}
-
-void* realloc(void* p, std::size_t size) {
-    auto ret = malloc(size);
-    memcpy(ret, p, size);
-    free(p);
-    return ret;
-}
-
-void free(void* ptr) {
-    auto block = static_cast<MemBlock*>(ptr) - 1;
-    assert(block->marker == kUsedMarker);
-    block->marker = kFreeMarker;
-    if (block->prev->marker == kFreeMarker) {
-        block->prev->next = block->next;
-        block->next->prev = block->prev;
-    } else if (block->next->marker == kFreeMarker) {
-        block->next->next->prev = block;
-        block->next = block->next->next;
-    }
-}
-
-}  // extern "C"
 
 // Format of an ELF executable file
 
@@ -670,7 +748,7 @@ const void* LoadElf(std::string_view elf_buf, void* (*mmap)(uintptr_t, std::size
     for (const auto& ph : Range(phs, elf->phnum)) {
         if (ph.type != kElfProgLoad) continue;
         auto buf = mmap(ph.vaddr, ph.memsz, ph.flags);
-        memcpy(buf, &elf_buf[ph.off], ph.filesz);
+        std::memcpy(buf, &elf_buf[ph.off], ph.filesz);
     }
 /*
     auto shs = reinterpret_cast<const SectionHeader*>(&elf_buf[elf->shoff]);
@@ -690,16 +768,10 @@ const void* LoadElf(std::string_view elf_buf, void* (*mmap)(uintptr_t, std::size
     return reinterpret_cast<const void*>(elf->entry);
 }
 
-struct Out : BufferedOStream {
-    Out(char* buf, std::size_t size) : BufferedOStream(buf, size, &pos_) {}
-
-    static void callback(const char* str, std::size_t len, void* opaque) {
-        auto out = static_cast<Out*>(opaque);
-        out->pos_ = out->Push(out->pos_, {str, len});
-    }
-
-    char* pos_;
-};
+void callback(const char* str, std::size_t len, void* opaque) {
+    auto out = static_cast<Writer*>(opaque);
+    out->Write({str, len});
+}
 
 void StackTrace(OutputStream& out, std::string_view symbol_map) {
     void* bp;
@@ -722,13 +794,13 @@ void StackTrace(OutputStream& out, std::string_view symbol_map) {
             p += 11;
             auto tmp = p;
             while (*p != '\n') p++;
-            memcpy(cstr, tmp, p - tmp);
+            std::memcpy(cstr, tmp, p - tmp);
             cstr[p - tmp] = 0;
-            Out out(demangle_buf, sizeof(demangle_buf));
-            if (true && cplus_demangle_v3_callback (cstr, 0, Out::callback, &out)) {
-                name = {demangle_buf, out.Flush(out.pos_)};
+            bool demangled = false;
+            ArrayOutStream out(demangle_buf, sizeof(demangle_buf));
+            if (true && cplus_demangle_v3_callback (cstr, 0, callback, &Writer(&out))) {
+                name = {demangle_buf, std::size_t(out.end() - demangle_buf)};
             } else {
-                out.Flush(out.pos_);
                 name = {tmp, static_cast<std::size_t>(p - tmp)};
             }
             p++;

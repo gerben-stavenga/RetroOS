@@ -29,9 +29,10 @@ genrule(
     cmd = "tail -c +513 $< > $@ && truncate -s 16M $@",
 )
 
+# Run QEMU with the disk image
 sh_binary(
     name = "run",
-    srcs = ["run.sh"],
+    srcs = ["run_qemu.sh"],
     data = [":image"],
-    args = ["$(rootpath :image)"],
 )
+

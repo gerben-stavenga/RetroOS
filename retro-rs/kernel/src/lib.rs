@@ -15,6 +15,7 @@ extern crate alloc;
 pub mod descriptors;
 pub mod heap;
 pub mod elf;
+pub mod hdd;
 pub mod irq;
 pub mod paging2;
 pub mod phys_mm;
@@ -128,13 +129,14 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     // Update VGA base to use LOW_MEM_BASE mapping before removing identity
     vga::vga().base = LOW_MEM_BASE + 0xB8000;
 
-    // Remove identity mapping now that we're running at virtual addresses
-    paging2::remove_identity_mapping();
+    // Finish paging setup (remove identity, enable NX, setup long mode, harden)
+    paging2::finish_setup_paging();
 
     println!("Accessing boot_data...");
 
-    // Get kernel physical address from boot_data
+    // Get kernel physical address from boot_data and set it for virt_to_phys
     let kernel_phys = boot_data.kernel as usize;
+    paging2::set_kernel_phys_base(kernel_phys);
     println!("kernel_phys: {:#x}", kernel_phys);
 
     let kernel_size = core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_start) as usize;
@@ -150,6 +152,11 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
         kernel_low_page,
         kernel_high_page,
     );
+
+    // Mark zero page as reserved so COW always copies (ref count never decremented)
+    let zero_page_phys = paging2::physical_page(&ZERO_PAGE as *const _ as usize);
+    phys_mm::mark_reserved(zero_page_phys, zero_page_phys + 1);
+
     println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
     // Initialize kernel heap allocator
@@ -181,6 +188,10 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     irq::init_interrupts();
     println!("Interrupts initialized");
 
+    // Enable interrupts
+    x86::sti();
+    println!("Interrupts enabled");
+
     // Initialize threading
     thread::init_threading();
     println!("Threading initialized");
@@ -188,46 +199,153 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");
 
-    // Check CPU capabilities
-    if paging2::cpu_supports_pae() {
-        println!("CPU supports PAE");
-    }
-    if paging2::cpu_supports_long_mode() {
-        println!("CPU supports Long Mode (64-bit)");
-    }
+    // Start the init process (never returns)
+    startup::startup(boot_data.start_sector);
+}
 
-    // Enable interrupts
-    x86::sti();
-    println!("Interrupts enabled");
+/// CPU-pushed interrupt frame for 32-bit mode
+/// Padded at start to match Frame64 size (40 bytes total)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Frame32 {
+    pub _pad: [u32; 5],  // 20 bytes padding
+    pub eip: u32,
+    pub cs: u32,
+    pub eflags: u32,
+    pub esp: u32,
+    pub ss: u32,
+}
 
-    // Halt loop with interrupts enabled
-    loop {
-        x86::hlt();
+impl core::fmt::Debug for Frame32 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frame32")
+            .field("eip", &format_args!("{:#010x}", self.eip))
+            .field("cs", &format_args!("{:#06x}", self.cs))
+            .field("eflags", &format_args!("{:#010x}", self.eflags))
+            .field("esp", &format_args!("{:#010x}", self.esp))
+            .field("ss", &format_args!("{:#06x}", self.ss))
+            .finish()
+    }
+}
+
+/// CPU-pushed interrupt frame for 64-bit mode
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Frame64 {
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+impl core::fmt::Debug for Frame64 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frame64")
+            .field("rip", &format_args!("{:#018x}", self.rip))
+            .field("cs", &format_args!("{:#06x}", self.cs))
+            .field("rflags", &format_args!("{:#018x}", self.rflags))
+            .field("rsp", &format_args!("{:#018x}", self.rsp))
+            .field("ss", &format_args!("{:#06x}", self.ss))
+            .finish()
+    }
+}
+
+/// Union for CPU-pushed interrupt frame (32-bit or 64-bit)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union Frame {
+    pub f32: Frame32,
+    pub f64: Frame64,
+}
+
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Default to 32-bit view for now
+        unsafe { self.f32.fmt(f) }
     }
 }
 
 /// CPU register state saved by interrupt handler
+/// Uses u64 for software-pushed registers to support both 32-bit and 64-bit userspace.
+/// The CPU frame is a union since the CPU pushes different sizes in different modes.
 #[repr(C)]
 pub struct Regs {
-    pub gs: u32,
-    pub fs: u32,
-    pub es: u32,
-    pub ds: u32,
-    pub edi: u32,
-    pub esi: u32,
-    pub ebp: u32,
-    pub esp_dummy: u32,
-    pub ebx: u32,
-    pub edx: u32,
-    pub ecx: u32,
-    pub eax: u32,
-    pub int_num: u32,
-    pub err_code: u32,
-    pub eip: u32,
-    pub cs: u32,
-    pub eflags: u32,
-    pub user_esp: u32,
-    pub user_ss: u32,
+    // Segment registers (zero-extended)
+    pub gs: u64,
+    pub fs: u64,
+    pub es: u64,
+    pub ds: u64,
+    // x86-64 extended registers (zero in 32-bit mode)
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    // General purpose registers
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rsp_dummy: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rax: u64,
+    // Interrupt info (software-pushed, zero-extended to 64-bit)
+    pub int_num: u64,
+    pub err_code: u64,
+    // CPU-pushed interrupt frame (layout depends on CPU mode)
+    pub frame: Frame,
+}
+
+impl Regs {
+    /// Get instruction pointer (works for both 32 and 64-bit modes)
+    pub fn ip(&self) -> u64 {
+        // In 32-bit mode, use f32.eip. In 64-bit mode, use f64.rip.
+        // For now assume 32-bit kernel mode.
+        unsafe { self.frame.f32.eip as u64 }
+    }
+
+    /// Get code segment
+    pub fn code_seg(&self) -> u16 {
+        unsafe { self.frame.f32.cs as u16 }
+    }
+
+    /// Get flags
+    pub fn flags(&self) -> u64 {
+        unsafe { self.frame.f32.eflags as u64 }
+    }
+
+    /// Get stack pointer
+    pub fn sp(&self) -> u64 {
+        unsafe { self.frame.f32.esp as u64 }
+    }
+
+    /// Get stack segment
+    pub fn stack_seg(&self) -> u16 {
+        unsafe { self.frame.f32.ss as u16 }
+    }
+}
+
+impl core::fmt::Debug for Regs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "INT: {:#04x}  ERR: {:#010x}", self.int_num, self.err_code)?;
+        writeln!(f, "IP:  {:#010x}  CS: {:#06x}  FL: {:#010x}", self.ip(), self.code_seg(), self.flags())?;
+        writeln!(f, "SP:  {:#010x}  SS: {:#06x}", self.sp(), self.stack_seg())?;
+        writeln!(f, "RAX: {:#018x}  RBX: {:#018x}", self.rax, self.rbx)?;
+        writeln!(f, "RCX: {:#018x}  RDX: {:#018x}", self.rcx, self.rdx)?;
+        writeln!(f, "RSI: {:#018x}  RDI: {:#018x}", self.rsi, self.rdi)?;
+        writeln!(f, "RBP: {:#018x}  R8:  {:#018x}", self.rbp, self.r8)?;
+        writeln!(f, "R9:  {:#018x}  R10: {:#018x}", self.r9, self.r10)?;
+        writeln!(f, "R11: {:#018x}  R12: {:#018x}", self.r11, self.r12)?;
+        writeln!(f, "R13: {:#018x}  R14: {:#018x}", self.r13, self.r14)?;
+        writeln!(f, "R15: {:#018x}", self.r15)?;
+        write!(f, "DS: {:#06x}  ES: {:#06x}  FS: {:#06x}  GS: {:#06x}",
+               self.ds as u16, self.es as u16, self.fs as u16, self.gs as u16)
+    }
 }
 
 /// Panic handler

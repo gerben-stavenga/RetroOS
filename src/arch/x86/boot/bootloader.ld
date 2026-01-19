@@ -1,5 +1,6 @@
 SECTIONS
 {
+  regs = 0x7C00 - 32;
   . = 0x7C00;
   .boot : {
     *(.boot)

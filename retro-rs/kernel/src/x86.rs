@@ -52,6 +52,14 @@ pub fn flush_tlb() {
     }
 }
 
+/// Invalidate TLB entry for specific address
+#[inline]
+pub fn invlpg(addr: usize) {
+    unsafe {
+        asm!("invlpg [{}]", in(reg) addr, options(nostack));
+    }
+}
+
 /// Read CR4 register
 #[inline]
 pub fn read_cr4() -> u32 {
@@ -103,12 +111,22 @@ pub mod cr4 {
     pub const OSXMMEXCPT: u32 = 1 << 10; // OS support for unmasked SIMD exceptions
 }
 
-/// Read from I/O port
+/// Read byte from I/O port
 #[inline]
 pub fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe {
         asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack));
+    }
+    value
+}
+
+/// Read word (16-bit) from I/O port
+#[inline]
+pub fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe {
+        asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack));
     }
     value
 }
@@ -190,6 +208,50 @@ pub mod cr0 {
     pub const NW: u32 = 1 << 29; // Not Write-through
     pub const CD: u32 = 1 << 30; // Cache Disable
     pub const PG: u32 = 1 << 31; // Paging
+}
+
+/// EFER MSR (Extended Feature Enable Register)
+pub const EFER_MSR: u32 = 0xC0000080;
+
+/// EFER flags
+pub mod efer {
+    pub const SCE: u64 = 1 << 0;   // System Call Extensions
+    pub const LME: u64 = 1 << 8;   // Long Mode Enable
+    pub const LMA: u64 = 1 << 10;  // Long Mode Active (read-only)
+    pub const NXE: u64 = 1 << 11;  // No-Execute Enable
+}
+
+/// Read Model Specific Register
+#[inline]
+pub fn rdmsr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack),
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+/// Write Model Specific Register
+#[inline]
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack),
+        );
+    }
 }
 
 /// Reload all data segment registers

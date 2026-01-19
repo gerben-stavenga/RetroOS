@@ -108,9 +108,9 @@ pub fn register_irq(irq: u8, handler: fn()) -> bool {
 /// Timer interrupt handler
 fn timer_handler() {
     unsafe {
-        TIMER_TICKS += 1;
+        let current = core::ptr::read_volatile(&raw const TIMER_TICKS);
+        core::ptr::write_volatile(&raw mut TIMER_TICKS, current + 1);
     }
-    // TODO: Call scheduler
 }
 
 /// Keyboard interrupt handler
@@ -131,7 +131,7 @@ pub fn init_interrupts() {
 
 /// Handle an IRQ (called from isr_handler for interrupts 32-47)
 pub fn handle_irq(regs: &mut Regs) {
-    let irq = (regs.int_num - IRQ_OFFSET as u32) as u8;
+    let irq = (regs.int_num - IRQ_OFFSET as u64) as u8;
 
     let (pic_port, irq_bit) = if irq < 8 {
         (MASTER_CMD, 1u8 << irq)
@@ -172,5 +172,14 @@ pub fn handle_irq(regs: &mut Regs) {
 
 /// Get timer ticks
 pub fn get_ticks() -> u64 {
-    unsafe { TIMER_TICKS }
+    unsafe { core::ptr::read_volatile(&raw const TIMER_TICKS) }
+}
+
+/// Sleep for N timer ticks (blocks with interrupts enabled)
+pub fn sleep_ticks(ticks: u64) {
+    let target = get_ticks() + ticks;
+    while get_ticks() < target {
+        // sti; hlt is atomic - CPU checks for pending interrupts between them
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+    }
 }

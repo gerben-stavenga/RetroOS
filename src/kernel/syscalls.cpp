@@ -79,7 +79,7 @@ std::uintptr_t Exec(std::uintptr_t path_, std::uintptr_t, std::uintptr_t, std::u
 
     current_thread->page_dir = SwitchFreshPageDirAndFreeOld(current_thread->page_dir);
     auto entry = LoadElf({buf, size}, +[](uintptr_t address, std::size_t sz, int type) { 
-        memset(reinterpret_cast<void*>(address), 0, sz);
+        std::memset(reinterpret_cast<void*>(address), 0, sz);
         return reinterpret_cast<void*>(address); 
     });
     free(buf);

@@ -1,45 +1,58 @@
 //! ELF executable loader
 //!
 //! Uses lib::elf for parsing, handles memory mapping.
+//! Page tables are allocated on-demand via the page fault handler.
 
-use crate::paging2::{self, page_idx, PAGE_SIZE};
-use crate::phys_mm;
+use crate::paging2::{self, page_idx, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
+use crate::x86;
 pub use lib::elf::ElfError;
 
-/// Map a virtual page for user space
-fn map_user_page(vaddr: usize, writable: bool) -> Result<(), ElfError> {
+/// User stack top address (just below kernel space)
+pub const USER_STACK_TOP: usize = 0xC000_0000;
+
+/// User stack size in pages
+pub const USER_STACK_PAGES: usize = 16;  // 64KB stack
+
+/// Set final permissions on a page (called after loading is complete)
+fn finalize_page_permissions(vaddr: usize, writable: bool, executable: bool) {
     let page = page_idx(vaddr);
+    let page_addr = vaddr & !(PAGE_SIZE - 1);
 
-    if paging2::is_present(page) {
-        if writable && !paging2::is_writable(page) && !paging2::is_cow(page) {
-            paging2::set_entry(page, paging2::get_phys_page(page), true, true, false);
+    match paging2::entries() {
+        Entries::Legacy(e) => {
+            if e[page].present() {
+                let phys = e[page].page();
+                let mut entry = Entry32::new(phys, writable, true);
+                entry.set_soft_ro(!writable);
+                e[page] = entry;
+                x86::invlpg(page_addr);
+            }
         }
-        return Ok(());
+        Entries::Pae(e) => {
+            if e[page].present() {
+                let phys = e[page].page();
+                // Preserve NX from existing entry (demand_page sets NX by default)
+                let had_nx = e[page].raw() & paging2::flags::NO_EXECUTE != 0;
+                let mut entry = Entry64::new(phys, writable, true);
+                entry.set_soft_ro(!writable);
+                // Clear NX only if this segment is executable; otherwise preserve
+                // (executable wins if multiple segments share a page)
+                if !executable && had_nx {
+                    entry.set_no_execute(true);
+                }
+                e[page] = entry;
+                x86::invlpg(page_addr);
+            }
+        }
     }
-
-    let phys_page = phys_mm::alloc_phys_page().ok_or(ElfError::OutOfMemory)?;
-    paging2::set_entry(page, phys_page, writable, true, false);
-
-    unsafe {
-        let ptr = (vaddr & !(PAGE_SIZE - 1)) as *mut u8;
-        core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
-    }
-
-    Ok(())
 }
 
 /// Load an ELF executable into user address space
 pub fn load_elf(elf_data: &[u8]) -> Result<u32, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
+    // First pass: copy data (pages demand-allocated on access)
     for seg in elf.segments() {
-        let start_page = seg.vaddr / PAGE_SIZE;
-        let end_page = (seg.vaddr + seg.memsz + PAGE_SIZE - 1) / PAGE_SIZE;
-
-        for page in start_page..end_page {
-            map_user_page(page * PAGE_SIZE, seg.is_writable())?;
-        }
-
         if let Some(data) = seg.data {
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), seg.vaddr as *mut u8, data.len());
@@ -50,6 +63,18 @@ pub fn load_elf(elf_data: &[u8]) -> Result<u32, ElfError> {
                     core::ptr::write_bytes(bss, 0, seg.memsz - data.len());
                 }
             }
+        }
+    }
+
+    // Second pass: set final permissions based on segment flags
+    for seg in elf.segments() {
+        let start_page = seg.vaddr / PAGE_SIZE;
+        let end_page = (seg.vaddr + seg.memsz + PAGE_SIZE - 1) / PAGE_SIZE;
+        let writable = seg.is_writable();
+        let executable = seg.is_executable();
+
+        for page in start_page..end_page {
+            finalize_page_permissions(page * PAGE_SIZE, writable, executable);
         }
     }
 

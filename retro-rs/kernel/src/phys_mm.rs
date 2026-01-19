@@ -3,7 +3,7 @@
 //! Tracks physical page usage with reference counts.
 //! - 0 = free
 //! - 255 = reserved (never allocatable)
-//! - 1-254 = reference count (for COW sharing)
+//! - 1-254 = reference count (for copy-on-write sharing)
 
 use crate::paging2::PAGE_SIZE;
 use crate::MMapEntry;
@@ -135,7 +135,7 @@ pub fn free_phys_page(page: usize) -> bool {
     }
 }
 
-/// Increment shared count for a page (for COW)
+/// Increment shared count for a page (for copy-on-write sharing)
 /// Returns true if successful
 pub fn inc_shared_count(page: usize) -> bool {
     if page >= MAX_PAGES {

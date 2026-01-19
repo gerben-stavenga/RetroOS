@@ -4,7 +4,6 @@
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
 use crate::descriptors::{set_kernel_stack, USER_CS, USER_DS};
-use crate::paging2::KERNEL_BASE;
 use crate::{KERNEL_STACK, println};
 use crate::x86;
 use crate::Regs;
@@ -26,29 +25,40 @@ pub enum ThreadState {
     Zombie,
 }
 
-/// CPU state saved during context switch (matches Regs layout)
+use crate::{Frame, Frame32};
+
+/// CPU state saved during context switch (matches Regs layout exactly)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CpuState {
-    pub gs: u32,
-    pub fs: u32,
-    pub es: u32,
-    pub ds: u32,
-    pub edi: u32,
-    pub esi: u32,
-    pub ebp: u32,
-    pub esp_dummy: u32,
-    pub ebx: u32,
-    pub edx: u32,
-    pub ecx: u32,
-    pub eax: u32,
-    pub int_num: u32,
-    pub err_code: u32,
-    pub eip: u32,
-    pub cs: u32,
-    pub eflags: u32,
-    pub user_esp: u32,
-    pub user_ss: u32,
+    // Segment registers
+    pub gs: u64,
+    pub fs: u64,
+    pub es: u64,
+    pub ds: u64,
+    // x86-64 extended registers
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    // General purpose registers
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rsp_dummy: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rax: u64,
+    // Interrupt info (zero-extended to 64-bit)
+    pub int_num: u64,
+    pub err_code: u64,
+    // CPU-pushed interrupt frame (union, use f32 for 32-bit mode)
+    pub frame: Frame,
 }
 
 impl CpuState {
@@ -58,49 +68,66 @@ impl CpuState {
             fs: 0,
             es: 0,
             ds: 0,
-            edi: 0,
-            esi: 0,
-            ebp: 0,
-            esp_dummy: 0,
-            ebx: 0,
-            edx: 0,
-            ecx: 0,
-            eax: 0,
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rdi: 0,
+            rsi: 0,
+            rbp: 0,
+            rsp_dummy: 0,
+            rbx: 0,
+            rdx: 0,
+            rcx: 0,
+            rax: 0,
             int_num: 0,
             err_code: 0,
-            eip: 0,
-            cs: 0,
-            eflags: 0,
-            user_esp: 0,
-            user_ss: 0,
+            frame: Frame { f32: Frame32 { _pad: [0; 5], eip: 0, cs: 0, eflags: 0, esp: 0, ss: 0 } },
         }
     }
 
-    /// Initialize for a user process
+    /// Initialize for a 32-bit user process
     pub fn init_user_process(&mut self, entry: u32, stack: u32) {
-        let ds = USER_DS as u32;
-        let cs = USER_CS as u32;
+        let ds = USER_DS as u64;
+        let cs32 = USER_CS as u32;
         const IF_FLAG: u32 = 1 << 9; // Interrupt enable flag
 
         self.gs = ds;
         self.fs = ds;
         self.es = ds;
         self.ds = ds;
-        self.edi = 0;
-        self.esi = 0;
-        self.ebp = 0;
-        self.esp_dummy = 0;
-        self.ebx = 0;
-        self.edx = 0;
-        self.ecx = 0;
-        self.eax = 0;
+        self.r15 = 0;
+        self.r14 = 0;
+        self.r13 = 0;
+        self.r12 = 0;
+        self.r11 = 0;
+        self.r10 = 0;
+        self.r9 = 0;
+        self.r8 = 0;
+        self.rdi = 0;
+        self.rsi = 0;
+        self.rbp = 0;
+        self.rsp_dummy = 0;
+        self.rbx = 0;
+        self.rdx = 0;
+        self.rcx = 0;
+        self.rax = 0;
         self.int_num = 0;
         self.err_code = 0;
-        self.eip = entry;
-        self.cs = cs;
-        self.eflags = IF_FLAG;
-        self.user_esp = stack;
-        self.user_ss = ds;
+        self.frame = Frame {
+            f32: Frame32 {
+                _pad: [0; 5],
+                eip: entry,
+                cs: cs32,
+                eflags: IF_FLAG,
+                esp: stack,
+                ss: USER_DS as u32,
+            }
+        };
     }
 }
 
@@ -204,8 +231,8 @@ pub fn create_thread(parent: Option<&Thread>, page_dir: u32, is_process: bool) -
 }
 
 /// Initialize a thread as a user process
-pub fn init_process_thread(thread: &mut Thread, entry: u32) {
-    thread.cpu_state.init_user_process(entry, KERNEL_BASE as u32);
+pub fn init_process_thread(thread: &mut Thread, entry: u32, stack: u32) {
+    thread.cpu_state.init_user_process(entry, stack);
 }
 
 /// Save current CPU state to thread
@@ -223,8 +250,8 @@ pub fn save_state(thread: &mut Thread) {
 }
 
 /// Set return value in thread's saved state
-pub fn set_return(thread: &mut Thread, ret: u32) {
-    thread.cpu_state.eax = ret;
+pub fn set_return(thread: &mut Thread, ret: i32) {
+    thread.cpu_state.rax = ret as u32 as u64;  // Sign-extend for 32-bit, zero-extend to 64
 }
 
 /// Schedule next thread

@@ -162,4 +162,8 @@ impl Segment<'_> {
     pub fn is_writable(&self) -> bool {
         (self.flags & PF_WRITE) != 0
     }
+
+    pub fn is_executable(&self) -> bool {
+        (self.flags & PF_EXEC) != 0
+    }
 }

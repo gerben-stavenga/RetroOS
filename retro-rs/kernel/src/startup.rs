@@ -2,14 +2,17 @@
 //!
 //! Reads files from the TAR filesystem on disk and loads init.elf
 
-use crate::{SCRATCH, elf};
-use crate::paging2::{LOW_MEM_BASE, PAGE_SIZE};
+extern crate alloc;
+
+use alloc::vec;
+use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE};
+use crate::{elf, hdd};
 use crate::println;
 use crate::thread;
 use crate::x86;
 use lib::tar::TarHeader;
 
-/// TAR block size
+/// TAR block size (same as disk sector size)
 const BLOCK_SIZE: usize = 512;
 
 /// Disk start sector for TAR filesystem
@@ -26,39 +29,16 @@ pub fn init_fs(start_sector: u32) {
     }
 }
 
-/// Read sectors from disk via BIOS (using low memory mapping)
-fn read_sectors(lba: u32, count: u32, buffer: *mut u8) -> bool {
-    // We can only use BIOS from real mode, which we can't do from kernel
-    // Instead, we'll use the LOW_MEM_BASE mapping to access data
-    // that was already loaded by the bootloader.
-    //
-    // For now, we assume the entire TAR is already in low memory
-    // starting at a known address. This is a simplification.
-    //
-    // In a real implementation, we'd need a disk driver (IDE/ATA)
-    // or store the filesystem in memory during boot.
-
-    // The bootloader loads the TAR at 0x10000 (64KB mark)
-    // We can access it via LOW_MEM_BASE + offset
-    const TAR_BASE: usize = LOW_MEM_BASE + 0x10000;
-    let offset = (lba as usize) * BLOCK_SIZE;
-    let size = (count as usize) * BLOCK_SIZE;
-
-    unsafe {
-        let src = (TAR_BASE + offset) as *const u8;
-        core::ptr::copy_nonoverlapping(src, buffer, size);
-    }
-    true
+/// Read sectors from disk using ATA PIO driver
+fn read_sectors(lba: u32, count: u32, buffer: *mut u8) {
+    hdd::read_sectors(lba, count, buffer);
 }
 
 /// Read TAR blocks
-fn read_blocks(count: u32, buffer: *mut u8) -> bool {
+fn read_blocks(count: u32, buffer: *mut u8) {
     unsafe {
-        let result = read_sectors(START_SECTOR + CURRENT_BLOCK, count, buffer);
-        if result {
-            CURRENT_BLOCK += count;
-        }
-        result
+        read_sectors(START_SECTOR + CURRENT_BLOCK, count, buffer);
+        CURRENT_BLOCK += count;
     }
 }
 
@@ -84,9 +64,7 @@ pub fn find_file(filename: &[u8]) -> Option<usize> {
     let mut header_buf = [0u8; BLOCK_SIZE];
 
     loop {
-        if !read_blocks(1, header_buf.as_mut_ptr()) {
-            return None;
-        }
+        read_blocks(1, header_buf.as_mut_ptr());
 
         let header = unsafe { &*(header_buf.as_ptr() as *const TarHeader) };
 
@@ -110,9 +88,9 @@ pub fn find_file(filename: &[u8]) -> Option<usize> {
 }
 
 /// Read file data (must be called after find_file positioned us correctly)
-pub fn read_file(buffer: *mut u8, size: usize) -> bool {
+pub fn read_file(buffer: *mut u8, size: usize) {
     let blocks = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
-    read_blocks(blocks, buffer)
+    read_blocks(blocks, buffer);
 }
 
 /// Startup: load and run init.elf
@@ -138,29 +116,12 @@ pub fn startup(start_sector: u32) -> ! {
 
     println!("init.elf size: {:#x}", size);
 
-    // Allocate buffer for ELF (use scratch space in kernel pages)
-    // For larger files we'd need proper memory allocation
-    let buffer = unsafe { &raw mut SCRATCH }.cast::<u8>();
-
-    if size > PAGE_SIZE {
-        println!("init.elf too large for scratch buffer");
-        loop {
-            x86::cli();
-            x86::hlt();
-        }
-    }
-
-    if !read_file(buffer, size) {
-        println!("Failed to read init.elf");
-        loop {
-            x86::cli();
-            x86::hlt();
-        }
-    }
+    // Allocate buffer for ELF on heap
+    let mut elf_buffer = vec![0u8; size];
+    read_file(elf_buffer.as_mut_ptr(), size);
 
     // Load ELF into user address space
-    let elf_data = unsafe { core::slice::from_raw_parts(buffer, size) };
-    let entry = match elf::load_elf(elf_data) {
+    let entry = match elf::load_elf(&elf_buffer) {
         Ok(e) => e,
         Err(_) => {
             println!("Failed to load ELF");
@@ -172,6 +133,10 @@ pub fn startup(start_sector: u32) -> ! {
     };
 
     println!("Entry point: {:#x}", entry);
+
+    let stack = PAGE_TABLE_BASE as u32;
+
+    println!("User stack: {:#x}", stack);
 
     // Create init thread
     let page_dir = x86::read_cr3();
@@ -187,7 +152,7 @@ pub fn startup(start_sector: u32) -> ! {
     };
 
     // Initialize as user process
-    thread::init_process_thread(init_thread, entry);
+    thread::init_process_thread(init_thread, entry, stack);
 
     println!("Starting init process...");
 
