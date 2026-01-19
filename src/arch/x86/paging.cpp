@@ -207,7 +207,7 @@ PageTable* ForkCurrent() {
         DumpTable(reinterpret_cast<PageTable*>(kForkPageTab), kNumPages - 1);
     }
     auto pe = PageEntry();
-    swap(GetCurrentDir().entries[kNumPageEntries - 2], pe);
+    std::swap(GetCurrentDir().entries[kNumPageEntries - 2], pe);
     FlushTLB();
     FreePhysPage(pe.Page());
     return pt;
@@ -216,7 +216,7 @@ PageTable* ForkCurrent() {
 PageTable* SwitchFreshPageDirAndFreeOld(PageTable* old_dir) {
     auto pd = AllocPageDir(AllocPhysPage());
     auto user_space = kKernelBase / kPageSize / kNumPageEntries;
-    memcpy(pd->entries + user_space, GetCurrentDir().entries + user_space, kPageSize - user_space * sizeof(PageEntry));
+    std::memcpy(pd->entries + user_space, GetCurrentDir().entries + user_space, kPageSize - user_space * sizeof(PageEntry));
     // Re-establish recursive pages
     pd->entries[kNumPageEntries - 1] = PageEntry(PhysicalPage(pd), 1, 0, 0);
     assert(pd->entries[kNumPageEntries - 2].AsUInt() == 0);
@@ -237,7 +237,7 @@ void SwitchPageDir(PageTable* new_dir) {
     assert(new_dir != nullptr);
     // We must keep the kernel addresses mapped identically (except the recursive pagedir entry)
     auto size = (kNumPageEntries - 1 - kKernelPageDirIdx) * sizeof(PageEntry);
-    memcpy(new_dir->entries + kKernelPageDirIdx, GetCurrentDir().entries + kKernelPageDirIdx, size);
+    std::memcpy(new_dir->entries + kKernelPageDirIdx, GetCurrentDir().entries + kKernelPageDirIdx, size);
     X86_set_cr3(PhysicalPage(new_dir) * kPageSize);
 }
 
@@ -264,14 +264,14 @@ void page_fault(Regs* regs) {
             return p;
         }
 
-        static char* print_page_fault(char* pos, BufferedOStream& out, const ValuePrinter& value) {
+        static char* print_page_fault(Writer out, const ValuePrinter& value) {
             auto p = static_cast<const Printer*>(value.p);
 
             auto error = p->regs->err_code;
             const bool page_present = error & 1;
             const bool is_write = error & 2;
             const bool is_user = error & 4;
-            return print(pos, out, "page fault @{} present {} write {} user {} from ip@{}", Hex(p->fault_address), page_present, is_write, is_user, Hex(p->regs->eip));
+            return print(std::move(out), "page fault @{} present {} write {} user {} from ip@{}", Hex(p->fault_address), page_present, is_write, is_user, Hex(p->regs->eip));
         }
         Regs* regs;
         std::uintptr_t fault_address;
@@ -331,12 +331,12 @@ void page_fault(Regs* regs) {
                 // kprint("COW page is shared making copy\n");
                 // Page was meant to writable. We need to copy it.
                 auto page_ptr = reinterpret_cast<void *>(fault_address & -kPageSize);
-                memcpy(&kernel_pages.scratch, page_ptr, kPageSize);
+                std::memcpy(&kernel_pages.scratch, page_ptr, kPageSize);
                 int phys_page = AllocPhysPage();
                 if (phys_page == -1) panic("OOM");
                 page_entry = PageEntry(phys_page, 1, is_u_s, 0);
                 FlushTLB();
-                memcpy(page_ptr, &kernel_pages.scratch, kPageSize);
+                std::memcpy(page_ptr, &kernel_pages.scratch, kPageSize);
             }
         } else {
             assert(is_user) << pf_printer;  // Kernel should never try to write to read only page.
@@ -370,16 +370,16 @@ void InitPaging(int kernel_low, int kernel_high, const BootData* boot_data) {
     for (unsigned i = 0; i < array_size(available); i++) {
         assert(available[i] == 0);
     }
-    memset(available, -1, sizeof(available));
+    std::memset(available, -1, sizeof(available));
     for (int i = 0; i < boot_data->mmap_count; i++) {
         auto& mmap = boot_data->mmap_entries[i];
         if (mmap.type != 1) continue;
         auto start = (mmap.base + kPageSize - 1) / kPageSize;
         auto end = (mmap.base + mmap.length) / kPageSize;
         kprint("Available memory {} - {} ({} pages)\n", Hex(mmap.base), Hex(mmap.base + mmap.length), end - start);
-        start = min<int>(start, kMaxPages);
-        end = min<int>(end, kMaxPages);
-        if (start < end) memset(available + start, 0, (end - start) * sizeof(available[0]));
+        start = std::min<int>(start, kMaxPages);
+        end = std::min<int>(end, kMaxPages);
+        if (start < end) std::memset(available + start, 0, (end - start) * sizeof(available[0]));
         free_pages += end - start;
     }
 
@@ -395,7 +395,7 @@ void InitPaging(int kernel_low, int kernel_high, const BootData* boot_data) {
         kprint("A20 disabled! Compensating but losing half the memory");
         constexpr auto kPagesPerMB = (1 << 20) / kPageSize;
         for (int i = kPagesPerMB; i < kMaxPages; i += 2 * kPagesPerMB) {
-            MarkUsed(i, min(kMaxPages, int(i + kPagesPerMB)));
+            MarkUsed(i, std::min(kMaxPages, int(i + kPagesPerMB)));
         }
     }
 

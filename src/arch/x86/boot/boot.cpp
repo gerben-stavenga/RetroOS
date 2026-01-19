@@ -55,11 +55,14 @@ NOINLINE [[noreturn]] void Exit(int exit_code) {
 
 inline int min(unsigned a, unsigned b) { return a < b ? a : b; }
 
-__attribute__((__always_inline__))
-inline bool read_disk(int drive, unsigned lba, uint16_t count, void* buffer) {
+__attribute__((noinline, section(".boot"), cold))
+inline bool read_disk(int drive, unsigned lba, int count, void* buffer) {
     auto address = reinterpret_cast<uintptr_t>(buffer);
-    do {
-        uint16_t num_sectors = min(count, 100);
+    auto offset = address & 0xF;
+    auto segment = address >> 4;
+    constexpr int max_sectors = 100;
+    while (true) {
+        uint16_t num_sectors = min(count, max_sectors);
         struct __attribute__((packed)) {
             char size;
             char null;
@@ -67,8 +70,8 @@ inline bool read_disk(int drive, unsigned lba, uint16_t count, void* buffer) {
             uint16_t off;
             uint16_t seg;
             uint64_t lba;
-        } packet = { 16, 0, num_sectors, static_cast<uint16_t>(address & 0xF), 
-                    static_cast<uint16_t>(address >> 4), lba };
+        } packet = { 16, 0, num_sectors, static_cast<uint16_t>(offset), 
+                    static_cast<uint16_t>(segment), lba };
         // Use int 13 to read disk
         regs.ax = 0x4200;
         regs.ds = 0;
@@ -76,11 +79,11 @@ inline bool read_disk(int drive, unsigned lba, uint16_t count, void* buffer) {
         regs.dx = drive;
         auto flags = generate_real_interrupt(0x13);
         if (flags & 1) return false;
-        address += num_sectors * 512;
-        lba += num_sectors;
-        if (count <= num_sectors) break;
-        count -= num_sectors;
-    } while (true);
+        if (count <= max_sectors) break;
+        segment += max_sectors * (512 / 16);
+        lba += max_sectors;
+        count -= max_sectors;
+    }
     return true;
 }
 
@@ -113,7 +116,7 @@ int CreateMemMap(MMapEntry *entries, int max_entries) {
         }
         if (regs.bx == 0) break;
     }
-    sort(entries, entries + count, [](const auto &a, const auto &b) { return a.base < b.base; });
+    std::sort(entries, entries + count, [](const auto &a, const auto &b) { return a.base < b.base; });
     return count;
 }
 
@@ -144,7 +147,7 @@ static void EnableA20() {
 
 extern char _start[], _edata[], _end[];
 [[noreturn]] void FullBootLoader(int drive) {
-    memset(_edata, 0, _end - _edata);
+    std::memset(_edata, 0, _end - _edata);
     kprint("Booting from drive: {}\n", char(drive >= 0x80 ? 'c' + drive - 0x80 : 'a' + drive));
     kprint("Loader size: {}\n", _edata - _start);
     kprint("Extended BIOS at {}\n", Hex(uintptr_t(*reinterpret_cast<uint16_t*>(0x40E)) << 4));
@@ -187,9 +190,9 @@ extern char _start[], _edata[], _end[];
     __builtin_unreachable();
 }
 
-extern "C" __attribute__((noinline, fastcall, section(".boot")))
-[[noreturn]] void BootLoader(int /* dummy */, int drive) {
-    auto nsectors = (reinterpret_cast<uintptr_t>(_edata) - reinterpret_cast<uintptr_t>(_start) - 1) / 512;
+extern "C" __attribute__((noinline, fastcall, section(".boot"), cold))
+[[noreturn]] void BootLoader(uintptr_t nsectors, int drive) {
+    nsectors /= 512;
     if (read_disk(drive, 1, nsectors, reinterpret_cast<void*>(0x7C00 + 512))) {
         FullBootLoader(drive);
     } else {

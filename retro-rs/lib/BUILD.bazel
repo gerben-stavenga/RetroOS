@@ -1,0 +1,16 @@
+# Build lib crate using rules_rust
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "lib",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+)

@@ -9,8 +9,8 @@
     __builtin_unreachable();
 }
 
-void StdOutPush(std::string_view str) {
-    Write(1, str.data(), str.size());
+void StdFlush(int fd, std::string_view str) {
+    Write(fd, str.data(), str.size());
 }
 
 void Yield() {

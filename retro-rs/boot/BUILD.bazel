@@ -1,0 +1,36 @@
+# Build bootloader using rules_rust and rules_nasm
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//rules:defs.bzl", "bootloader_link", "bootloader_binary")
+
+nasm_library(
+    name = "mbr",
+    srcs = ["mbr.asm"],
+    copts = ["-f", "elf32"],
+)
+
+rust_static_library(
+    name = "boot",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boot",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+    deps = ["//lib"],
+)
+
+bootloader_link(
+    name = "bootloader_elf",
+    asm_objs = [":mbr"],
+    rust_libs = [":boot"],
+    linker_script = "bootloader.ld",
+)
+
+bootloader_binary(
+    name = "bootloader_bin",
+    elf = ":bootloader_elf",
+    visibility = ["//visibility:public"],
+)

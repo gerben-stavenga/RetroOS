@@ -1,0 +1,38 @@
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+
+exports_files(["i686-retro-none.json"])
+
+# Compute MD5 of kernel ELF
+genrule(
+    name = "kernel_md5",
+    srcs = ["//kernel:kernel_elf"],
+    outs = ["kernel.elf.md5"],
+    cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
+)
+
+# Create filesystem TAR with bootloader first (A sorts before kernel)
+pkg_tar(
+    name = "fs_tar",
+    files = {
+        "//boot:bootloader_bin": "A",
+        ":kernel_md5": "kernel.elf.md5",
+        "//kernel:kernel_elf": "kernel.elf",
+        "//apps/init:init_elf": "init.elf",
+    },
+)
+
+# Strip first 512 bytes (TAR header) so bootloader starts at offset 0
+genrule(
+    name = "image",
+    srcs = [":fs_tar"],
+    outs = ["image.bin"],
+    cmd = "tail -c +513 $< > $@ && truncate -s 16M $@",
+)
+
+# Run QEMU with the disk image
+sh_binary(
+    name = "run",
+    srcs = ["run_qemu.sh"],
+    data = [":image"],
+)
+

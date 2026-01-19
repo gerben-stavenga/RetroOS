@@ -13,7 +13,20 @@ CS32 EQU 0x8
 CS16 EQU 0x18
 DS32 EQU 0x10
 
+struc REGS
+    .ax resd 1
+    .bx resd 1
+    .cx resd 1
+    .dx resd 1
+    .si resd 1
+    .di resd 1
+    .bp resd 1
+    .ds resw 1
+    .es resw 1
+endstruc
+
 [bits 16]
+extern regs
 global _start
 _start:
     jmp REALSEG:next  ; make sure cs = 0
@@ -27,29 +40,16 @@ gdt:
 gdt_ptr:
     dw gdt_ptr - gdt - 1
     dd gdt
-struc REGS
-    .ax resd 1
-    .bx resd 1
-    .cx resd 1
-    .dx resd 1
-    .si resd 1
-    .di resd 1
-    .bp resd 1
-    .ds resw 1
-    .es resw 1
-endstruc
-global regs
-regs:
-    istruc REGS
-    iend
 
 next:
     xor esp, esp    ; make sure high bits are zero
     mov ss, sp
-    mov sp, 0x7C00  ; use the space just below code
+    mov sp, regs  ; use the space just below regs as stack
 
     ; move to pm
     call REALSEG:toggle_pm
+    extern _edata
+    mov ecx, _edata - _start - 511  ; linker can resolve this at link time
     extern BootLoader
     jmp CS32:BootLoader
 
