@@ -15,10 +15,12 @@ SECTIONS
         *(.text .text.*)
         KEEP(*(.note*))
     }
+    _etext = .;
 
     .rodata ALIGN(4K) : {
         *(.rodata .rodata.*)
     }
+    _erodata = .;
 
     /* Read-only section ends here */
     _data = .;

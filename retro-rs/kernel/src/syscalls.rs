@@ -51,7 +51,7 @@ const SYSCALL_TABLE: [Option<SyscallFn>; 10] = [
 
 /// Dispatch a syscall
 pub fn dispatch(regs: &mut Regs) {
-    let syscall_num = regs.eax as usize;
+    let syscall_num = regs.rax as usize;
 
     let result = if syscall_num < SYSCALL_TABLE.len() {
         if let Some(handler) = SYSCALL_TABLE[syscall_num] {
@@ -63,13 +63,13 @@ pub fn dispatch(regs: &mut Regs) {
         ENOSYS
     };
 
-    regs.eax = result as u32;
+    regs.rax = result as u32 as u64;  // Sign-extend for 32-bit compatibility
 }
 
 /// Exit syscall (0)
 /// Terminates the current process
 fn sys_exit(regs: &mut Regs) -> i32 {
-    let exit_code = regs.edx as i32;
+    let exit_code = regs.rdx as i32;
     thread::exit_thread(exit_code);
 }
 
@@ -121,9 +121,9 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
 
 /// Exec syscall (5)
 /// Replaces current process with a new program
-/// EDX = path pointer (null-terminated)
+/// RDX = path pointer (null-terminated)
 fn sys_exec(regs: &mut Regs) -> i32 {
-    let path_ptr = regs.edx as *const u8;
+    let path_ptr = regs.rdx as *const u8;
 
     // Get path as slice
     let path = unsafe {
@@ -156,9 +156,7 @@ fn sys_exec(regs: &mut Regs) -> i32 {
 
     // Read the file into scratch buffer
     let buffer = unsafe { &raw mut SCRATCH as *mut u8 };
-    if !startup::read_file(buffer, size) {
-        return ENOENT;
-    }
+    startup::read_file(buffer, size);
 
     // Free current user pages
     paging2::free_user_pages();
@@ -172,9 +170,9 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     };
 
     // Update current thread's EIP to the new entry point
-    // and reset stack to top of user space
+    // Stack is demand-paged on first access
     if let Some(current) = thread::current() {
-        thread::init_process_thread(current, entry);
+        thread::init_process_thread(current, entry, elf::USER_STACK_TOP as u32);
         thread::exit_to_thread(current);
     }
 
@@ -183,9 +181,9 @@ fn sys_exec(regs: &mut Regs) -> i32 {
 
 /// Open syscall (6)
 /// Opens a file and returns its size (or -1 if not found)
-/// EDX = path pointer (null-terminated)
+/// RDX = path pointer (null-terminated)
 fn sys_open(regs: &mut Regs) -> i32 {
-    let path_ptr = regs.edx as *const u8;
+    let path_ptr = regs.rdx as *const u8;
 
     // Get path as slice
     let path = unsafe {
@@ -215,9 +213,9 @@ fn sys_open(regs: &mut Regs) -> i32 {
 /// Read syscall (8)
 /// Reads from a file descriptor
 fn sys_read(regs: &mut Regs) -> i32 {
-    let fd = regs.edx;
-    let _buf = regs.ecx as *mut u8;
-    let _len = regs.ebx as usize;
+    let fd = regs.rdx;
+    let _buf = regs.rcx as *mut u8;
+    let _len = regs.rbx as usize;
 
     if fd == 0 {
         // stdin - TODO: implement keyboard buffer
@@ -231,9 +229,9 @@ fn sys_read(regs: &mut Regs) -> i32 {
 /// Write syscall (9)
 /// Writes to a file descriptor
 fn sys_write(regs: &mut Regs) -> i32 {
-    let fd = regs.edx;
-    let buf = regs.ecx as *const u8;
-    let len = regs.ebx as usize;
+    let fd = regs.rdx;
+    let buf = regs.rcx as *const u8;
+    let len = regs.rbx as usize;
 
     if fd == 1 || fd == 2 {
         // stdout or stderr - write to VGA

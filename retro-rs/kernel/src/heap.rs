@@ -7,14 +7,21 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
-use crate::paging2::{self, PAGE_SIZE};
+use crate::paging2::{self, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
 use crate::phys_mm;
-
-/// Heap starts 64KB after KERNEL_BASE for nullptr protection
-pub const HEAP_BASE: usize = 0xC0B1_0000;
 
 /// Heap ends before the top of address space
 pub const HEAP_END: usize = 0xFFF0_0000;
+
+/// Get heap base (first page after kernel _end)
+fn heap_base() -> usize {
+    unsafe extern "C" {
+        static _end: u8;
+    }
+    let end = (&raw const _end) as usize;
+    // Align up to next page
+    (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
 
 /// Free block header stored at the start of each free region
 struct FreeBlock {
@@ -50,7 +57,7 @@ impl KernelAllocator {
         KernelAllocator {
             inner: UnsafeCell::new(AllocatorInner {
                 head: None,
-                mapped_end: HEAP_BASE,
+                mapped_end: 0,  // Set properly in init()
             }),
         }
     }
@@ -59,7 +66,8 @@ impl KernelAllocator {
     pub fn init(&self) {
         let inner = unsafe { &mut *self.inner.get() };
         inner.head = None;
-        inner.mapped_end = HEAP_BASE;
+        inner.mapped_end = heap_base();
+        crate::println!("Heap base: {:#x}", inner.mapped_end);
     }
 }
 
@@ -80,9 +88,12 @@ impl AllocatorInner {
                 None => return false,
             };
 
-            // Map it into kernel space
+            // Map it into kernel space (user=false, readonly=false)
             let virt_page_idx = self.mapped_end / PAGE_SIZE;
-            paging2::set_entry(virt_page_idx, phys_page, true, false, false);
+            match paging2::entries() {
+                Entries::Legacy(e) => e[virt_page_idx] = Entry32::new(phys_page, true, false),
+                Entries::Pae(e) => e[virt_page_idx] = Entry64::new(phys_page, true, false),
+            }
 
             self.mapped_end += PAGE_SIZE;
         }
