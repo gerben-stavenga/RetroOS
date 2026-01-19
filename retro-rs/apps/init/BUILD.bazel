@@ -1,0 +1,23 @@
+# Build init user program
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+
+rust_static_library(
+    name = "init_lib",
+    srcs = ["src/main.rs"],
+    crate_name = "init",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=s",
+        "-Crelocation-model=static",
+    ],
+)
+
+# Link into ELF
+genrule(
+    name = "init_elf",
+    srcs = [":init_lib", "user.ld"],
+    outs = ["init.elf"],
+    cmd = "ld.lld -m elf_i386 -T $(location user.ld) -o $@ $(location :init_lib)",
+    visibility = ["//visibility:public"],
+)

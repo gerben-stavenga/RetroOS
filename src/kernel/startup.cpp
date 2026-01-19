@@ -70,7 +70,7 @@ void ReadFile(void* dst, std::size_t size) {
     kprint("init.elf md5 {} {}\n", size, Hex(std::string_view{md5_out, 16}));
     auto dst = LoadElf({buf, size}, +[](uintptr_t address, std::size_t sz, int type) { 
         kprint("Map @{} size {} of type {}\n", Hex(address), sz, type);
-        memset(reinterpret_cast<void*>(address), 0, sz);
+        std::memset(reinterpret_cast<void*>(address), 0, sz);
         return reinterpret_cast<void*>(address); 
     });
     free(buf);

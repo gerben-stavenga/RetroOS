@@ -729,7 +729,7 @@ static struct demangle_component *
 d_make_demangle_mangled_name (struct d_info *di, const char *s)
 {
 if (d_peek_char (di) != '_' || d_peek_next_char (di) != 'Z')
-    return d_make_name (di, s, strlen (s));
+    return d_make_name (di, s, std::strlen (s));
 d_advance (di, 2);
 return d_encoding (di, 0);
 }
@@ -1396,7 +1396,7 @@ else if (IS_LOWER (peek))
     if (ret != nullptr && ret->type == DEMANGLE_COMPONENT_OPERATOR)
     {
     di->expansion += sizeof "operator" + ret->u.s_operator.op->len - 2;
-    if (!strcmp (ret->u.s_operator.op->code, "li"))
+    if (!std::strcmp (ret->u.s_operator.op->code, "li"))
         ret = d_make_comp (di, DEMANGLE_COMPONENT_UNARY, ret,
                 d_source_name (di));
     }
@@ -1554,7 +1554,7 @@ if ((di->options & DMGL_JAVA) != 0
     anonymous namespace, and replace it with a more user friendly
     name.  */
 if (len >= (int) ANONYMOUS_NAMESPACE_PREFIX_LEN + 2
-    && memcmp (name, ANONYMOUS_NAMESPACE_PREFIX,
+    && std::memcmp (name, ANONYMOUS_NAMESPACE_PREFIX,
         ANONYMOUS_NAMESPACE_PREFIX_LEN) == 0)
     {
     const char *s;
@@ -2472,11 +2472,9 @@ switch (peek)
                         &cplus_demangle_builtin_types[34],
                         arg, suffix);
         d_advance (di, 1);
-        char* pos;
-        BufferedOStream out(buf, sizeof(buf), &pos);
-        pos = print (pos, out, "{}", arg);
+        auto size = sprint (buf, "{}", arg);
         di->expansion += ret->u.s_extended_builtin.type->len
-                + out.Flush(pos) + (suffix != 0);
+                + size + (suffix != 0);
         break;
     }
 
@@ -3223,7 +3221,7 @@ else
     {
     code = op->u.s_operator.op->code;
     di->expansion += op->u.s_operator.op->len - 2;
-    if (strcmp (code, "st") == 0)
+    if (std::strcmp (code, "st") == 0)
         return d_make_comp (di, DEMANGLE_COMPONENT_UNARY, op,
                 cplus_demangle_type (di));
     }
@@ -3261,7 +3259,7 @@ else
         if (op->type == DEMANGLE_COMPONENT_CAST
         && d_check_char (di, '_'))
         operand = d_exprlist (di, 'E');
-        else if (code && !strcmp (code, "sP"))
+        else if (code && !std::strcmp (code, "sP"))
         operand = d_template_args_1 (di);
         else
         operand = d_expression_1 (di);
@@ -3285,13 +3283,13 @@ else
         else if (code[0] == 'f')
         /* fold-expression.  */
         left = d_operator_name (di);
-        else if (!strcmp (code, "di"))
+        else if (!std::strcmp (code, "di"))
         left = d_unqualified_name (di, nullptr, nullptr);
         else
         left = d_expression_1 (di);
-        if (!strcmp (code, "cl"))
+        if (!std::strcmp (code, "cl"))
         right = d_exprlist (di, 'E');
-        else if (!strcmp (code, "dt") || !strcmp (code, "pt"))
+        else if (!std::strcmp (code, "dt") || !std::strcmp (code, "pt"))
         {
         peek = d_peek_char (di);
         /* These codes start a qualified name.  */
@@ -3326,8 +3324,8 @@ else
 
         if (code == nullptr)
         return nullptr;
-        else if (!strcmp (code, "qu")
-            || !strcmp (code, "dX"))
+        else if (!std::strcmp (code, "qu")
+            || !std::strcmp (code, "dX"))
         {
         /* ?: expression.  */
         first = d_expression_1 (di);
@@ -3432,7 +3430,7 @@ else
     di->expansion -= type->u.s_builtin.type->len;
 
     if (type->type == DEMANGLE_COMPONENT_BUILTIN_TYPE
-    && strcmp (type->u.s_builtin.type->name,
+    && std::strcmp (type->u.s_builtin.type->name,
             cplus_demangle_builtin_types[33].name) == 0)
     {
     if (d_peek_char (di) == 'E')
@@ -3995,7 +3993,7 @@ if (need > dgs->alc)
 if (dgs->allocation_failure)
     return;
 
-memcpy (dgs->buf + dgs->len, s, l);
+std::memcpy (dgs->buf + dgs->len, s, l);
 dgs->buf[dgs->len + l] = '\0';
 dgs->len += l;
 }
@@ -4253,17 +4251,15 @@ for (i = 0; i < l; i++)
 static inline void
 d_append_string (struct d_print_info *dpi, const char *s)
 {
-d_append_buffer (dpi, s, strlen (s));
+d_append_buffer (dpi, s, std::strlen (s));
 }
 
 static inline void
 d_append_num (struct d_print_info *dpi, int l)
 {
     char buf[25];
-    char* pos;
-    BufferedOStream out(buf, sizeof(buf), &pos);
-    pos = print (pos, out,"{}", l);
-    d_append_buffer (dpi, buf, out.Flush(pos));
+    auto size = sprint(buf, "{}", l);
+    d_append_buffer (dpi, buf, size);
 }
 
 static inline char
@@ -4941,7 +4937,7 @@ switch (dc->type)
         if ((options & DMGL_JAVA) != 0
             && dcl->type == DEMANGLE_COMPONENT_NAME
             && dcl->u.s_name.len == 6
-            && strncmp (dcl->u.s_name.s, "JArray", 6) == 0)
+            && std::strncmp (dcl->u.s_name.s, "JArray", 6) == 0)
         {
             /* Special-case Java arrays, so that JArray<TYPE> appears
             instead as TYPE[].  */
@@ -5497,7 +5493,7 @@ switch (dc->type)
     if (op->type == DEMANGLE_COMPONENT_OPERATOR)
     {
         code = op->u.s_operator.op->code;
-        if (!strcmp (code, "ad"))
+        if (!std::strcmp (code, "ad"))
         {
         /* Don't print the argument list for the address of a
         function.  */
@@ -5517,14 +5513,14 @@ switch (dc->type)
     }
 
     /* For sizeof..., just print the pack length.  */
-    if (code && !strcmp (code, "sZ"))
+    if (code && !std::strcmp (code, "sZ"))
     {
         struct demangle_component *a = d_find_pack (dpi, operand);
         int len = d_pack_length (a);
         d_append_num (dpi, len);
         return;
     }
-    else if (code && !strcmp (code, "sP"))
+    else if (code && !std::strcmp (code, "sP"))
     {
         int len = d_args_length (dpi, operand);
         d_append_num (dpi, len);
@@ -5539,10 +5535,10 @@ switch (dc->type)
         d_print_cast (dpi, options, op);
         d_append_char (dpi, ')');
     }
-    if (code && !strcmp (code, "gs"))
+    if (code && !std::strcmp (code, "gs"))
     /* Avoid parens after '::'.  */
     d_print_comp (dpi, options, operand);
-    else if (code && (!strcmp (code, "st") || !strcmp (code, "nx")))
+    else if (code && (!std::strcmp (code, "st") || !std::strcmp (code, "nx")))
     /* Always print parens for sizeof (type) and noexcept(expr).  */
     {
         d_append_char (dpi, '(');
@@ -5586,7 +5582,7 @@ switch (dc->type)
     && d_left (dc)->u.s_operator.op->name[0] == '>')
     d_append_char (dpi, '(');
 
-    if (strcmp (d_left (dc)->u.s_operator.op->code, "cl") == 0
+    if (std::strcmp (d_left (dc)->u.s_operator.op->code, "cl") == 0
         && d_left (d_right (dc))->type == DEMANGLE_COMPONENT_TYPED_NAME)
     {
     /* Function call used in an expression should not have printed types
@@ -5601,7 +5597,7 @@ switch (dc->type)
     }
     else
     d_print_subexpr (dpi, options, d_left (d_right (dc)));
-    if (strcmp (d_left (dc)->u.s_operator.op->code, "ix") == 0)
+    if (std::strcmp (d_left (dc)->u.s_operator.op->code, "ix") == 0)
     {
     d_append_char (dpi, '[');
     d_print_comp (dpi, options, d_right (d_right (dc)));
@@ -5609,7 +5605,7 @@ switch (dc->type)
     }
     else
     {
-    if (strcmp (d_left (dc)->u.s_operator.op->code, "cl") != 0)
+    if (std::strcmp (d_left (dc)->u.s_operator.op->code, "cl") != 0)
         d_print_expr_op (dpi, options, d_left (dc));
     d_print_subexpr (dpi, options, d_right (d_right (dc)));
     }
@@ -5643,7 +5639,7 @@ switch (dc->type)
     struct demangle_component *second = d_left (d_right (d_right (dc)));
     struct demangle_component *third = d_right (d_right (d_right (dc)));
 
-    if (!strcmp (op->u.s_operator.op->code, "qu"))
+    if (!std::strcmp (op->u.s_operator.op->code, "qu"))
     {
         d_print_subexpr (dpi, options, first);
         d_print_expr_op (dpi, options, op);
@@ -6445,7 +6441,7 @@ int status;
 
 if (mangled[0] == '_' && mangled[1] == 'Z')
     type = DCT_MANGLED;
-else if (strncmp (mangled, "_GLOBAL_", 8) == 0
+else if (std::strncmp (mangled, "_GLOBAL_", 8) == 0
     && (mangled[8] == '.' || mangled[8] == '_' || mangled[8] == '$')
     && (mangled[9] == 'D' || mangled[9] == 'I')
     && mangled[10] == '_')
@@ -6460,7 +6456,7 @@ else
 di.unresolved_name_state = 1;
 
 again:
-cplus_demangle_init_info (mangled, options, strlen (mangled), &di);
+cplus_demangle_init_info (mangled, options, std::strlen (mangled), &di);
 
 /* PR 87675 - Check for a mangled string that is so long
     that we do not have enough stack space to demangle it.  */
@@ -6500,7 +6496,7 @@ if (((options & DMGL_NO_RECURSE_LIMIT) == 0)
             : DEMANGLE_COMPONENT_GLOBAL_DESTRUCTORS),
             d_make_demangle_mangled_name (&di, d_str (&di)),
             nullptr);
-    d_advance (&di, strlen (d_str (&di)));
+    d_advance (&di, std::strlen (d_str (&di)));
     break;
     default:
         __builtin_unreachable(); /* We have listed all the cases.  */
@@ -6757,7 +6753,7 @@ int ret;
 *ctor_kind = (enum gnu_v3_ctor_kinds) 0;
 *dtor_kind = (enum gnu_v3_dtor_kinds) 0;
 
-cplus_demangle_init_info (mangled, DMGL_GNU_V3, strlen (mangled), &di);
+cplus_demangle_init_info (mangled, DMGL_GNU_V3, std::strlen (mangled), &di);
 
 {
     __extension__ struct demangle_component comps[di.num_comps];

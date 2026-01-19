@@ -1,0 +1,70 @@
+# Build core and compiler_builtins from rust-src
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//toolchain:bootstrap.bzl", "with_bootstrap")
+
+package(default_visibility = ["//visibility:public"])
+
+# Internal targets built with bootstrap mode (empty stdlib)
+rust_library(
+    name = "core_internal",
+    srcs = ["@rust_src//:core_src"],
+    crate_name = "core",
+    crate_root = "@rust_src//:library/core/src/lib.rs",
+    edition = "2021",
+    rustc_flags = [
+        "--cap-lints=allow",
+        "-Cpanic=abort",
+        "-Copt-level=z",
+    ],
+    tags = ["manual"],
+    visibility = ["//visibility:private"],
+)
+
+rust_library(
+    name = "alloc_internal",
+    srcs = ["@rust_src//:alloc_src"],
+    crate_name = "alloc",
+    crate_root = "@rust_src//:library/alloc/src/lib.rs",
+    edition = "2021",
+    rustc_flags = [
+        "--cap-lints=allow",
+        "-Cpanic=abort",
+        "-Copt-level=z",
+    ],
+    deps = [":core_internal", ":compiler_builtins_internal"],
+    tags = ["manual"],
+    visibility = ["//visibility:private"],
+)
+
+rust_library(
+    name = "compiler_builtins_internal",
+    srcs = ["@compiler_builtins//:src"],
+    crate_name = "compiler_builtins",
+    crate_root = "@compiler_builtins//:src/lib.rs",
+    crate_features = ["mem", "compiler-builtins"],
+    edition = "2021",
+    rustc_flags = [
+        "--cap-lints=allow",
+        "-Cpanic=abort",
+        "-Copt-level=z",
+    ],
+    deps = [":core_internal"],
+    tags = ["manual"],
+    visibility = ["//visibility:private"],
+)
+
+# Public targets that apply bootstrap transition
+with_bootstrap(
+    name = "core",
+    actual = ":core_internal",
+)
+
+with_bootstrap(
+    name = "alloc",
+    actual = ":alloc_internal",
+)
+
+with_bootstrap(
+    name = "compiler_builtins",
+    actual = ":compiler_builtins_internal",
+)

@@ -20,7 +20,7 @@ struct Screen {
 
     void ClearScreen() {
         uint16_t *video = reinterpret_cast<uint16_t *>(kLowMemBase + 0xB8000);
-        memset(video, 0, 80 * 25 * 2);
+        std::memset(video, 0, 80 * 25 * 2);
         cursor_x = cursor_y = 0;
     }
 
@@ -39,8 +39,8 @@ struct Screen {
             cursor_y++;
         }
         if (cursor_y == 25) {
-            memmove(video, video + 80, 80 * 24 * 2);
-            memset(video + 80 * 24, 0, 80 * 2);
+            std::memmove(video, video + 80, 80 * 24 * 2);
+            std::memset(video + 80 * 24, 0, 80 * 2);
             cursor_y = 24;
         }
     }
@@ -48,7 +48,7 @@ struct Screen {
 
 constinit Screen screen;
 
-void StdOutPush(std::string_view str) {
+void StdFlush(int fd, std::string_view str) {
     Screen tmp = screen;
     for (char c : str) {
         tmp.Put(c);
@@ -106,7 +106,7 @@ __attribute__((section(".entry")))
     auto adjust = [delta](auto* ptr) { return reinterpret_cast<decltype(ptr)>(reinterpret_cast<uintptr_t>(ptr) + delta); };
 
     // Need to do this as not to override pages 
-    memset(adjust(_edata), 0, _end - _edata);  // Zero bss
+    std::memset(adjust(_edata), 0, _end - _edata);  // Zero bss
 
     auto kpages = adjust(&kernel_pages);
     EnablePaging(kpages, phys_address, _data - _start);

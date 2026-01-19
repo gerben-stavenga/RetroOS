@@ -125,8 +125,11 @@ void ProcessKey(int key) {
     if ((key & 0x80) == 0) {
         key_state[(key & 0x7f) >> 3] |= 1 << (key & 7);
         bool shift = (key_state[LSHIFT / 8] & (1 << (LSHIFT & 7))) || (key_state[RSHIFT / 8] & (1 << (RSHIFT & 7)));
+        int8_t c = shift ? kbd_US_shift[key] : kbd_US[key];
         bool capslock = key_state[CAPSLOCK / 8] & (1 << (CAPSLOCK & 7));
-        int8_t c = (shift != capslock) ? kbd_US_shift[key] : kbd_US[key];
+        if (capslock && std::isalpha(c)) {
+            c ^= 32;
+        }
         if (c == -82) {
             // Insert key
             StackTrace();
