@@ -6,11 +6,13 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use lib::println;
 
 /// Syscall numbers
 const SYS_EXIT: u32 = 0;
 const SYS_YIELD: u32 = 1;
 const SYS_WRITE: u32 = 9;
+const SYS_EXEC: u32 = 5;
 
 /// File descriptors
 const STDOUT: u32 = 1;
@@ -50,6 +52,13 @@ fn yield_cpu() {
     }
 }
 
+#[inline(never)]
+fn exec(s: &str) -> i32 {
+    unsafe {
+        syscall3(SYS_EXEC, s.as_ptr() as u32, s.len() as u32, 0)
+    }
+}
+
 /// Entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -64,7 +73,9 @@ pub extern "C" fn _start() -> ! {
         }
         counter = counter.wrapping_add(1);
         if counter % 10000000 == 0 {
-            yield_cpu();
+            if exec("printmsg.elf") != 0 {
+                write(b"Exec failed\n");
+            }
         }
     }
 }

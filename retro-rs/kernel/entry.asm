@@ -147,9 +147,11 @@ call_isr_handler:
     add eax, 4              ; adjust for return address on stack
 
     ; Setup a mock stack frame for debugging
-    ; Offset to frame.eip: 4*8 (segs) + 8*8 (r8-15) + 8*8 (gprs) + 16 (int/err) + 20 (frame._pad) = 196
+    ; Regs layout: gs/fs/es/ds (32) + r15-r8 (64) + rdi/rsi/rbp/... (64) + int/err (16) + frame (40)
+    ; Offset to frame.eip: 32 + 64 + 64 + 16 + 20 (Frame32._pad) = 196
+    ; Offset to rbp: 32 + 64 + 16 (rdi+rsi) = 112
     push dword [eax + 196]  ; push return eip
-    push dword [eax + 80]   ; push old ebp (low 32 bits of rbp)
+    push dword [eax + 112]  ; push old ebp (low 32 bits of rbp)
     mov ebp, esp
 
     cld                     ; clear direction flag
