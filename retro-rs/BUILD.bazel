@@ -18,6 +18,7 @@ pkg_tar(
         ":kernel_md5": "kernel.elf.md5",
         "//kernel:kernel_elf": "kernel.elf",
         "//apps/init:init_elf": "init.elf",
+        "//apps/init:printmsg_elf": "printmsg.elf",
     },
 )
 

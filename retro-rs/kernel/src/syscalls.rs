@@ -14,6 +14,7 @@
 
 use crate::{SCRATCH, elf};
 use crate::paging2::{self, PAGE_SIZE};
+use crate::stacktrace::SymbolData;
 use crate::startup;
 use crate::thread;
 use crate::vga;
@@ -123,55 +124,44 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
 /// Replaces current process with a new program
 /// RDX = path pointer (null-terminated)
 fn sys_exec(regs: &mut Regs) -> i32 {
-    let path_ptr = regs.rdx as *const u8;
-
-    // Get path as slice
-    let path = unsafe {
-        let mut len = 0;
-        let mut p = path_ptr;
-        while *p != 0 && len < 256 {
-            len += 1;
-            p = p.add(1);
-        }
-        core::slice::from_raw_parts(path_ptr, len)
-    };
+    let path = unsafe { &*core::ptr::slice_from_raw_parts(regs.rdx as *const u8, regs.rcx as usize) };
 
     // Print path for debugging
-    print!("Exec: ");
-    for &c in path {
-        vga::vga().putchar(c);
-    }
-    println!();
+    let Ok(path) = core::str::from_utf8(path) else {
+        return ENOENT;
+    };
+    println!("Exec: {}", path);
 
     // Find the file in TAR
-    let size = match startup::find_file(path) {
+    let size = match startup::find_file(path.as_bytes()) {
         Some(s) => s,
         None => return ENOENT,
     };
 
-    if size > PAGE_SIZE {
-        println!("Exec: file too large");
-        return ENOMEM;
-    }
+    println!("File size {}", size);
+
+    let mut buffer = alloc::vec![0; size];
 
     // Read the file into scratch buffer
-    let buffer = unsafe { &raw mut SCRATCH as *mut u8 };
-    startup::read_file(buffer, size);
+    startup::read_file(&mut buffer);
 
     // Free current user pages
     paging2::free_user_pages();
     paging2::flush_tlb();
 
     // Load the ELF
-    let elf_data = unsafe { core::slice::from_raw_parts(buffer, size) };
-    let entry = match elf::load_elf(elf_data) {
+    let entry = match elf::load_elf(&buffer) {
         Ok(e) => e,
         Err(_) => return ENOEXEC,
     };
 
+    // Extract symbols for debugging (before buffer is dropped)
+    let symbols = SymbolData::new(buffer.into_boxed_slice());
+
     // Update current thread's EIP to the new entry point
     // Stack is demand-paged on first access
     if let Some(current) = thread::current() {
+        current.symbols = symbols;
         thread::init_process_thread(current, entry, elf::USER_STACK_TOP as u32);
         thread::exit_to_thread(current);
     }

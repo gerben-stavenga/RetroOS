@@ -1,7 +1,6 @@
 # Build kernel using rules_rust and rules_nasm
 load("@rules_rust//rust:defs.bzl", "rust_static_library")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
-load("//rules:defs.bzl", "kernel_link", "kernel_binary")
 
 nasm_library(
     name = "entry",
@@ -17,23 +16,16 @@ rust_static_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=2",
         "-Crelocation-model=static",
-        "-Ccode-model=kernel",
+        "-Cforce-frame-pointers=yes",
     ],
     deps = ["//lib"],
 )
 
-kernel_link(
+genrule(
     name = "kernel_elf",
-    asm_objs = [":entry"],
-    rust_libs = [":kernel"],
-    linker_script = "kernel.ld",
-    visibility = ["//visibility:public"],
-)
-
-kernel_binary(
-    name = "kernel_bin",
-    elf = ":kernel_elf",
+    srcs = [":entry", ":kernel", "kernel.ld"],
+    outs = ["kernel.elf"],
+    cmd = "ld -m elf_i386 -T $(location kernel.ld) $(location :entry) $(location :kernel) -o $@",
     visibility = ["//visibility:public"],
 )

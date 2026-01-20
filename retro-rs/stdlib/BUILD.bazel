@@ -15,6 +15,7 @@ rust_library(
         "--cap-lints=allow",
         "-Cpanic=abort",
         "-Copt-level=z",
+        "-Cforce-frame-pointers=yes",
     ],
     tags = ["manual"],
     visibility = ["//visibility:private"],
@@ -30,6 +31,7 @@ rust_library(
         "--cap-lints=allow",
         "-Cpanic=abort",
         "-Copt-level=z",
+        "-Cforce-frame-pointers=yes",
     ],
     deps = [":core_internal", ":compiler_builtins_internal"],
     tags = ["manual"],
@@ -47,8 +49,26 @@ rust_library(
         "--cap-lints=allow",
         "-Cpanic=abort",
         "-Copt-level=z",
+        "-Cforce-frame-pointers=yes",
     ],
     deps = [":core_internal"],
+    tags = ["manual"],
+    visibility = ["//visibility:private"],
+)
+
+rust_library(
+    name = "rustc_demangle_internal",
+    srcs = ["@rustc_demangle//:src"],
+    crate_name = "rustc_demangle",
+    crate_root = "@rustc_demangle//:src/lib.rs",
+    edition = "2021",
+    rustc_flags = [
+        "--cap-lints=allow",
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Cforce-frame-pointers=yes",
+    ],
+    deps = [":core_internal", ":compiler_builtins_internal"],
     tags = ["manual"],
     visibility = ["//visibility:private"],
 )
@@ -67,4 +87,9 @@ with_bootstrap(
 with_bootstrap(
     name = "compiler_builtins",
     actual = ":compiler_builtins_internal",
+)
+
+with_bootstrap(
+    name = "rustc_demangle",
+    actual = ":rustc_demangle_internal",
 )

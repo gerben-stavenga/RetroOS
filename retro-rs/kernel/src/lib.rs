@@ -11,6 +11,7 @@
 use core::panic::PanicInfo;
 
 extern crate alloc;
+extern crate rustc_demangle;
 
 pub mod descriptors;
 pub mod heap;
@@ -19,6 +20,7 @@ pub mod hdd;
 pub mod irq;
 pub mod paging2;
 pub mod phys_mm;
+pub mod stacktrace;
 pub mod startup;
 pub mod syscalls;
 pub mod thread;
@@ -351,16 +353,21 @@ impl core::fmt::Debug for Regs {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    x86::cli();
     println!();
     println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
 
     if let Some(location) = info.location() {
         println!("at {}:{}", location.file(), location.line());
+    } else {
+        println!("at <unknown location>");
     }
 
-    if let Some(msg) = info.message().as_str() {
-        println!("{}", msg);
-    }
+    // PanicMessage implements Display
+    println!("  {}", info.message());
+    println!();
+
+    stacktrace::stack_trace();
 
     loop {
         x86::cli();

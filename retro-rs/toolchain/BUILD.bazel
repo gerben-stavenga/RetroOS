@@ -83,6 +83,7 @@ rust_stdlib_filegroup(
         "//stdlib:core",
         "//stdlib:alloc",
         "//stdlib:compiler_builtins",
+        "//stdlib:rustc_demangle",
     ],
 )
 

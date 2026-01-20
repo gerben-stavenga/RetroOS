@@ -65,13 +65,13 @@ fn wait_data_ready(port: u16) {
 ///
 /// # Safety
 /// Buffer must be large enough to hold count * 512 bytes
-pub fn read_sectors(lba: u32, count: u32, buffer: *mut u8) {
+pub fn read_sectors(lba: u32, mut  buffer: &mut [u8]) -> u32 {
+    let count = buffer.len().div_ceil(512) as u32;
     debug_assert!(lba + count <= (1 << 28), "LBA28 overflow");
 
     let port = PRIMARY_BASE;
     let slave = 0u8; // Master drive
 
-    let mut p = buffer as *mut u16;
     let mut remaining = count;
     let mut current_lba = lba;
 
@@ -100,12 +100,19 @@ pub fn read_sectors(lba: u32, count: u32, buffer: *mut u8) {
             wait_data_ready(port);
 
             // Read 256 words (512 bytes) per sector
-            for _ in 0..256 {
-                unsafe {
-                    *p = inw(port + reg::DATA);
-                    p = p.add(1);
-                }
+            let mut tmp = [0u8; 512];
+            for i in 0..256 {
+                let data = unsafe { inw(port + reg::DATA) };
+                tmp[2 * i] = data as u8;
+                tmp[2 * i + 1] = (data >> 8) as u8;
+            }
+            if buffer.len() >= 512 {
+                buffer[..512].copy_from_slice(&tmp);
+                buffer = &mut buffer[512..];
+            } else {
+                buffer.copy_from_slice(&tmp[..buffer.len()])
             }
         }
     }
+    count
 }

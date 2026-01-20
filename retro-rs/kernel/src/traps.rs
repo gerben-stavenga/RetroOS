@@ -1,8 +1,9 @@
 //! CPU exception and trap handlers
 
 use crate::irq::handle_irq;
-use crate::paging2::{self, Entry, RawPage};
+use crate::paging2::{self, RawPage};
 use crate::println;
+use crate::syscalls::dispatch;
 use crate::x86;
 use crate::Regs;
 
@@ -43,17 +44,12 @@ const EXCEPTION_NAMES: [&str; 32] = [
 ];
 
 /// Panic with register dump
+#[track_caller]
 fn panic_with_regs(msg: &str, regs: &Regs) -> ! {
     x86::cli();
-    println!();
-    println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
-    println!("{}", msg);
+    // Print regs before panic so they appear in output
     println!("{:?}", regs);
-
-    loop {
-        x86::cli();
-        x86::hlt();
-    }
+    panic!("{}", msg);
 }
 
 /// Handle divide error (int 0)
@@ -272,6 +268,7 @@ fn handle_protection_fault<E: paging2::Entry>(
     } else if user {
         segv_current_thread(regs, fault_addr);
     } else {
+        println!("Fault address: {:#x} (page {})", fault_addr, page_index);
         panic_with_regs("Kernel write to read-only page", regs);
     }
 }
@@ -334,11 +331,6 @@ fn generic_exception(regs: &Regs) -> ! {
     panic_with_regs("Unhandled exception", regs);
 }
 
-/// Handle syscall (int 0x80)
-fn syscall(regs: &mut Regs) {
-    crate::syscalls::dispatch(regs);
-}
-
 /// Main interrupt service routine - dispatches to specific handlers
 #[unsafe(no_mangle)]
 pub extern "C" fn isr_handler(regs: *mut Regs) {
@@ -376,7 +368,7 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         32..=47 => handle_irq(regs),
 
         // Syscall (IDT entry 0x80 uses vector 48's handler)
-        48 => syscall(regs),
+        48 => dispatch(regs),
 
         _ => generic_exception(regs),
     }

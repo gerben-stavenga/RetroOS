@@ -1,5 +1,6 @@
 # Build init user program
 load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 
 rust_static_library(
     name = "init_lib",
@@ -8,9 +9,10 @@ rust_static_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=s",
         "-Crelocation-model=static",
+        "-Cforce-frame-pointers=yes",
     ],
+    deps = ["//lib"],
 )
 
 # Link into ELF
@@ -19,5 +21,20 @@ genrule(
     srcs = [":init_lib", "user.ld"],
     outs = ["init.elf"],
     cmd = "ld.lld -m elf_i386 -T $(location user.ld) -o $@ $(location :init_lib)",
+    visibility = ["//visibility:public"],
+)
+
+nasm_library(
+    name = "printmsg_lib",
+    srcs = ["printmsg.asm"],
+    copts = ["-f", "elf32"],
+)
+
+# Link into ELF
+genrule(
+    name = "printmsg_elf",
+    srcs = [":printmsg_lib", "user.ld"],
+    outs = ["printmsg.elf"],
+    cmd = "ld.lld -m elf_i386 -T $(location user.ld) -o $@ $(location :printmsg_lib)",
     visibility = ["//visibility:public"],
 )
