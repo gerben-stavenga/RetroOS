@@ -4,6 +4,7 @@
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
 use crate::descriptors::{set_kernel_stack, USER_CS, USER_DS};
+use crate::stacktrace::SymbolData;
 use crate::{KERNEL_STACK, println};
 use crate::x86;
 use crate::Regs;
@@ -132,7 +133,6 @@ impl CpuState {
 }
 
 /// Thread control block
-#[repr(C)]
 pub struct Thread {
     pub tid: i32,
     pub pid: i32,
@@ -144,6 +144,7 @@ pub struct Thread {
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
     pub cpu_state: CpuState,
+    pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
 }
 
 impl Thread {
@@ -159,6 +160,7 @@ impl Thread {
             num_fds: 0,
             fds: [-1; MAX_FDS],
             cpu_state: CpuState::empty(),
+            symbols: None,
         }
     }
 }

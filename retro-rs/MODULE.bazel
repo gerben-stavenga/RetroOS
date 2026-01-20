@@ -40,6 +40,14 @@ http_archive(
     build_file = "//stdlib:compiler_builtins.BUILD",
 )
 
+http_archive(
+    name = "rustc_demangle",
+    url = "https://crates.io/api/v1/crates/rustc-demangle/0.1.24/download",
+    type = "tar.gz",
+    strip_prefix = "rustc-demangle-0.1.24",
+    build_file = "//stdlib:rustc_demangle.BUILD",
+)
+
 # Register toolchains
 register_toolchains(
     "@rules_nasm//nasm/toolchain",
