@@ -14,36 +14,21 @@ pub const USER_STACK_TOP: usize = 0xC000_0000;
 pub const USER_STACK_PAGES: usize = 16;  // 64KB stack
 
 /// Set final permissions on a page (called after loading is complete)
-fn finalize_page_permissions(vaddr: usize, writable: bool, executable: bool) {
+fn finalize_page_permissions<E: Entry>(entries: &mut [E], vaddr: usize, writable: bool, executable: bool) {
     let page = page_idx(vaddr);
     let page_addr = vaddr & !(PAGE_SIZE - 1);
 
-    match paging2::entries() {
-        Entries::Legacy(e) => {
-            if e[page].present() {
-                let phys = e[page].page();
-                let mut entry = Entry32::new(phys, writable, true);
-                entry.set_soft_ro(!writable);
-                e[page] = entry;
-                x86::invlpg(page_addr);
-            }
+    if entries[page].present() {
+        let phys = entries[page].page();
+        let mut entry = E::new(phys, writable, true);
+        entry.set_soft_ro(!writable);
+        // Clear NX only if this segment is executable; otherwise preserve
+        // (executable wins if multiple segments share a page)
+        if executable {
+            entry.set_no_execute(false);
         }
-        Entries::Pae(e) => {
-            if e[page].present() {
-                let phys = e[page].page();
-                // Preserve NX from existing entry (demand_page sets NX by default)
-                let had_nx = e[page].raw() & paging2::flags::NO_EXECUTE != 0;
-                let mut entry = Entry64::new(phys, writable, true);
-                entry.set_soft_ro(!writable);
-                // Clear NX only if this segment is executable; otherwise preserve
-                // (executable wins if multiple segments share a page)
-                if !executable && had_nx {
-                    entry.set_no_execute(true);
-                }
-                e[page] = entry;
-                x86::invlpg(page_addr);
-            }
-        }
+        entries[page] = entry;
+        x86::invlpg(page_addr);
     }
 }
 
@@ -74,7 +59,14 @@ pub fn load_elf(elf_data: &[u8]) -> Result<u32, ElfError> {
         let executable = seg.is_executable();
 
         for page in start_page..end_page {
-            finalize_page_permissions(page * PAGE_SIZE, writable, executable);
+            match paging2::entries() {
+                Entries::Legacy(e) => {
+                    finalize_page_permissions(e, page * PAGE_SIZE, writable, executable);
+                }
+                Entries::Pae(e) => {
+                    finalize_page_permissions(e, page * PAGE_SIZE, writable, executable);
+                }
+            }
         }
     }
 

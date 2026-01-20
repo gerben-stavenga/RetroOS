@@ -1,7 +1,6 @@
 # Build bootloader using rules_rust and rules_nasm
 load("@rules_rust//rust:defs.bzl", "rust_static_library")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
-load("//rules:defs.bzl", "bootloader_link", "bootloader_binary")
 
 nasm_library(
     name = "mbr",
@@ -22,15 +21,17 @@ rust_static_library(
     deps = ["//lib"],
 )
 
-bootloader_link(
+genrule(
     name = "bootloader_elf",
-    asm_objs = [":mbr"],
-    rust_libs = [":boot"],
-    linker_script = "bootloader.ld",
+    srcs = [":mbr", ":boot", "bootloader.ld"],
+    outs = ["bootloader.elf"],
+    cmd = "ld -m elf_i386 -T $(location bootloader.ld) $(location :mbr) $(location :boot) -o $@",
 )
 
-bootloader_binary(
+genrule(
     name = "bootloader_bin",
-    elf = ":bootloader_elf",
+    srcs = [":bootloader_elf"],
+    outs = ["bootloader.bin"],
+    cmd = "objcopy -O binary $< $@",
     visibility = ["//visibility:public"],
 )

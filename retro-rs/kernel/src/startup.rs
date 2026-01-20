@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::vec;
 use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE};
+use crate::stacktrace::SymbolData;
 use crate::{elf, hdd};
 use crate::println;
 use crate::thread;
@@ -30,15 +31,14 @@ pub fn init_fs(start_sector: u32) {
 }
 
 /// Read sectors from disk using ATA PIO driver
-fn read_sectors(lba: u32, count: u32, buffer: *mut u8) {
-    hdd::read_sectors(lba, count, buffer);
+fn read_sectors(lba: u32, buffer: &mut [u8]) -> u32 {
+    hdd::read_sectors(lba, buffer)
 }
 
 /// Read TAR blocks
-fn read_blocks(count: u32, buffer: *mut u8) {
+fn read_blocks(buffer: &mut [u8]) {
     unsafe {
-        read_sectors(START_SECTOR + CURRENT_BLOCK, count, buffer);
-        CURRENT_BLOCK += count;
+        CURRENT_BLOCK += read_sectors(START_SECTOR + CURRENT_BLOCK, buffer);
     }
 }
 
@@ -64,7 +64,7 @@ pub fn find_file(filename: &[u8]) -> Option<usize> {
     let mut header_buf = [0u8; BLOCK_SIZE];
 
     loop {
-        read_blocks(1, header_buf.as_mut_ptr());
+        read_blocks(&mut header_buf);
 
         let header = unsafe { &*(header_buf.as_ptr() as *const TarHeader) };
 
@@ -88,9 +88,8 @@ pub fn find_file(filename: &[u8]) -> Option<usize> {
 }
 
 /// Read file data (must be called after find_file positioned us correctly)
-pub fn read_file(buffer: *mut u8, size: usize) {
-    let blocks = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
-    read_blocks(blocks, buffer);
+pub fn read_file(buffer: &mut [u8]) {
+    read_blocks(buffer);
 }
 
 /// Startup: load and run init.elf
@@ -98,6 +97,9 @@ pub fn startup(start_sector: u32) -> ! {
     println!("Initializing filesystem at sector {:#x}", start_sector);
 
     init_fs(start_sector);
+
+    // Load symbol table for stack traces
+    crate::stacktrace::init_from_tar();
 
     // Find init.elf
     let init_path = b"init.elf";
@@ -118,7 +120,7 @@ pub fn startup(start_sector: u32) -> ! {
 
     // Allocate buffer for ELF on heap
     let mut elf_buffer = vec![0u8; size];
-    read_file(elf_buffer.as_mut_ptr(), size);
+    read_file(&mut elf_buffer);
 
     // Load ELF into user address space
     let entry = match elf::load_elf(&elf_buffer) {
@@ -131,6 +133,9 @@ pub fn startup(start_sector: u32) -> ! {
             }
         }
     };
+
+    // Extract symbols for debugging
+    let symbols = SymbolData::new(elf_buffer.into_boxed_slice());
 
     println!("Entry point: {:#x}", entry);
 
@@ -151,7 +156,8 @@ pub fn startup(start_sector: u32) -> ! {
         }
     };
 
-    // Initialize as user process
+    // Store symbols and initialize as user process
+    init_thread.symbols = symbols;
     thread::init_process_thread(init_thread, entry, stack);
 
     println!("Starting init process...");
