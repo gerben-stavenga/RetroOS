@@ -19,6 +19,7 @@ pkg_tar(
         "//kernel:kernel_elf": "kernel.elf",
         "//apps/init:init_elf": "init.elf",
         "//apps/init:printmsg_elf": "printmsg.elf",
+        "//apps/hello64:hello64_elf": "hello64.elf",
     },
 )
 

@@ -13,6 +13,7 @@
 //! Return value in: EAX
 
 use crate::{SCRATCH, elf};
+use crate::descriptors;
 use crate::paging2::{self, PAGE_SIZE};
 use crate::stacktrace::SymbolData;
 use crate::startup;
@@ -110,11 +111,14 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
         None => return ENOMEM,
     };
 
-    // Copy CPU state from parent to child
+    // Copy CPU state and mode from parent to child
     child.cpu_state = current.cpu_state;
+    child.is_64bit = current.is_64bit;
 
     // Child returns 0
     thread::set_return(child, 0);
+
+    println!("Fork: parent={} child={}", current.tid, child.tid);
 
     // Parent returns child's TID
     child.tid
@@ -150,7 +154,7 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     paging2::flush_tlb();
 
     // Load the ELF
-    let entry = match elf::load_elf(&buffer) {
+    let loaded = match elf::load_elf(&buffer) {
         Ok(e) => e,
         Err(_) => return ENOEXEC,
     };
@@ -158,11 +162,35 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     // Extract symbols for debugging (before buffer is dropped)
     let symbols = SymbolData::new(buffer.into_boxed_slice());
 
-    // Update current thread's EIP to the new entry point
+    // Update current thread's entry point and mode
     // Stack is demand-paged on first access
     if let Some(current) = thread::current() {
         current.symbols = symbols;
-        thread::init_process_thread(current, entry, elf::USER_STACK_TOP as u32);
+
+        let want_64 = loaded.class == elf::ElfClass::Elf64;
+
+        // Toggle CPU mode if needed
+        if want_64 != current.is_64bit {
+            if want_64 {
+                // Switching to long mode: CR3 must be PML4
+                let cr3 = paging2::pml4_cr3(&current.root);
+                descriptors::toggle_mode(cr3);
+                // Update root to store PML4 physical address
+                current.root = paging2::RootPageTable { phys: cr3 };
+            } else {
+                // Switching back to protected mode: CR3 = PDPT
+                descriptors::toggle_mode(current.root.cr3());
+                // Re-init root from current address space (now PAE)
+                current.root.init_current();
+            }
+        }
+
+        if want_64 {
+            thread::init_process_thread_64(current, loaded.entry, elf::USER_STACK_TOP as u64);
+        } else {
+            thread::init_process_thread(current, loaded.entry as u32, elf::USER_STACK_TOP as u32);
+        }
+
         thread::exit_to_thread(current);
     }
 

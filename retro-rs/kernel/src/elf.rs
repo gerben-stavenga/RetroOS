@@ -5,7 +5,7 @@
 
 use crate::paging2::{self, page_idx, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
 use crate::x86;
-pub use lib::elf::ElfError;
+pub use lib::elf::{ElfError, ElfClass};
 
 /// User stack top address (just below kernel space)
 pub const USER_STACK_TOP: usize = 0xC000_0000;
@@ -32,8 +32,14 @@ fn finalize_page_permissions<E: Entry>(entries: &mut [E], vaddr: usize, writable
     }
 }
 
+/// Loaded ELF info
+pub struct LoadedElf {
+    pub entry: u64,
+    pub class: ElfClass,
+}
+
 /// Load an ELF executable into user address space
-pub fn load_elf(elf_data: &[u8]) -> Result<u32, ElfError> {
+pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
     // First pass: copy data (pages demand-allocated on access)
@@ -71,5 +77,5 @@ pub fn load_elf(elf_data: &[u8]) -> Result<u32, ElfError> {
     }
 
     paging2::flush_tlb();
-    Ok(elf.entry())
+    Ok(LoadedElf { entry: elf.entry(), class: elf.class() })
 }

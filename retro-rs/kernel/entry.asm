@@ -25,13 +25,18 @@ SwitchStack:
     call eax            ; should not return
     ud2                 ; trap if it does
 
-; Exit kernel mode and return to interrupted context (32-bit)
-; extern "C" fn exit_kernel(regs: *const Regs) -> !
+; Exit kernel mode and return to interrupted context
+; extern "C" fn exit_kernel(regs: *const Regs, is_64bit: u32) -> !
 global exit_kernel
 exit_kernel:
     cli                     ; disable interrupts while manipulating stack
+    mov eax, [esp + 8]      ; is_64bit flag
     mov esp, [esp + 4]      ; load regs pointer as stack
-    jmp exit_interrupt_32   ; restore all registers and iret
+    test eax, eax
+    jnz .exit_64
+    jmp exit_interrupt_32   ; 32-bit: restore registers and iret
+.exit_64:
+    jmp far [far_ptr_64]    ; 64-bit: switch to long mode and iretq
 
 ; Macro to push a 32-bit register as 64-bit (with high dword = 0)
 %macro push64_32 1

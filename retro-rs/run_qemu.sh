@@ -1,14 +1,26 @@
 #!/bin/bash
 # Run RetroOS in QEMU with debugcon output
+# Usage: ./run_qemu.sh [386|686|x64] [extra qemu args...]
 
-# Find the image relative to runfiles
-RUNFILES="${BASH_SOURCE[0]}.runfiles"
-if [[ -d "$RUNFILES" ]]; then
-    IMAGE="$RUNFILES/_main/image.bin"
-else
-    # Fallback for direct execution
-    IMAGE="$(dirname "$0")/image.bin"
-fi
+set -e
+
+ARCH="${1:-386}"
+shift 2>/dev/null || true
+
+case "$ARCH" in
+    386)  QEMU=qemu-system-i386;   CPU="-cpu 486" ;;
+    686)  QEMU=qemu-system-i386;   CPU="" ;;
+    x64)  QEMU=qemu-system-x86_64; CPU="" ;;
+    *)    echo "Usage: $0 [386|686|x64] [extra qemu args...]"; exit 1 ;;
+esac
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Build image
+~/bin/bazelisk build //:image 2>&1 | tail -3
+
+IMAGE="$SCRIPT_DIR/bazel-bin/image.bin"
 
 # Run with clean environment to avoid snap/glibc conflicts
 exec env -i \
@@ -16,7 +28,8 @@ exec env -i \
     HOME="$HOME" \
     DISPLAY="${DISPLAY:-}" \
     XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
-    qemu-system-i386 \
+    $QEMU \
+    $CPU \
     -drive "file=$IMAGE,format=raw,snapshot=on" \
     -debugcon stdio \
     -no-reboot \

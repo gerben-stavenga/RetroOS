@@ -151,6 +151,20 @@ fn page_fault(regs: &mut Regs) {
     let user = (error & 4) != 0;
     let instruction_fetch = (error & 0x10) != 0;
 
+    // Debug: emit fault info via raw debugcon port I/O (no memory allocation)
+    unsafe {
+        // Emit 'D' for demand (not present) or 'P' for protection, then hex addr
+        let ch = if present { b'P' } else { b'D' };
+        core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") ch);
+        // Emit fault address as 8 hex digits
+        for shift in [28, 24, 20, 16, 12, 8, 4, 0u32] {
+            let nibble = ((fault_addr >> shift) & 0xF) as u8;
+            let hex = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+            core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") hex);
+        }
+        core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") b' ');
+    }
+
     let page_index = page_idx(fault_addr);
 
     // Null pointer protection (first 64KB and last 64KB)
@@ -172,6 +186,11 @@ fn page_fault(regs: &mut Regs) {
 
     // Kernel fault in kernel code/data region is a bug
     if !user && fault_addr >= KERNEL_BASE {
+        unsafe {
+            for &b in b"KFAULT!" {
+                core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") b);
+            }
+        }
         panic_with_regs("Kernel fault in kernel range", regs);
     }
 

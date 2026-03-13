@@ -73,13 +73,16 @@ pub extern "C" fn _start() -> ! {
     write(b"RetroOS userspace is running.\n");
 
     loop {
+        write(b"Forking...\n");
         let pid = fork();
         if pid == 0 {
             // Child: exec the shell program
-            exec("printmsg.elf");
+            write(b"Child: exec\n");
+            exec("hello64.elf");
             write(b"Exec failed\n");
             exit(1);
         }
+        write(b"Parent: yield\n");
         // Parent: wait for child (yield until child exits)
         // TODO: proper waitpid syscall
         loop {

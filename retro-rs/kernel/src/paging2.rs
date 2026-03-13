@@ -88,7 +88,7 @@ pub const KERNEL_BASE: usize = 0xC0B0_0000;
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub union RootPageTable {
-    phys: u32,
+    pub phys: u32,
     pdpt: [u64; 4],
 }
 
@@ -115,23 +115,25 @@ impl RootPageTable {
         }
     }
 
-    /// CR3 value for this root page table.
+    /// CR3 value for this root page table (PAE PDPT physical address).
+    /// In Compat mode the pdpt union field is still the authoritative representation
+    /// (we keep PAE-style page tables even in long mode).
     pub fn cr3(&self) -> u32 {
-        if cpu_mode() == CpuMode::Pae {
-            let vaddr = unsafe { &self.pdpt } as *const _ as usize;
-            let page = physical_page(vaddr);
-            (page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64) as u32
-        } else {
-            unsafe { self.phys }
+        match cpu_mode() {
+            CpuMode::Pae | CpuMode::Compat => {
+                let vaddr = unsafe { &self.pdpt } as *const _ as usize;
+                let page = physical_page(vaddr);
+                (page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64) as u32
+            }
+            CpuMode::Legacy => unsafe { self.phys },
         }
     }
 
-    /// Mutable pdpt slice for PAE COW updates. None for legacy/PML4.
+    /// Mutable pdpt slice for PAE COW updates. None for legacy.
     pub fn pdpt_mut(&mut self) -> Option<&mut [u64; 4]> {
-        if cpu_mode() == CpuMode::Pae {
-            Some(unsafe { &mut self.pdpt })
-        } else {
-            None
+        match cpu_mode() {
+            CpuMode::Pae | CpuMode::Compat => Some(unsafe { &mut self.pdpt }),
+            CpuMode::Legacy => None,
         }
     }
 
@@ -338,7 +340,6 @@ impl KernelPages {
 /// PML4 for long mode - shared with PAE via PML4[0] = PDPT
 static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
-/// Fixed hardware-facing PDPT for PAE mode.
 /// Set up long mode page tables (call after enable_pae)
 /// Links PML4[0] = PDPT and PDPT[4] = PML4
 pub fn setup_long_mode_tables() {
@@ -346,7 +347,7 @@ pub fn setup_long_mode_tables() {
     let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
 
     // PML4[0] = PDPT (so long mode uses same mappings)
-    unsafe { PML4[0] = Entry64::new(pdpt_phys >> 12, true, false); }
+    unsafe { PML4[0] = Entry64::new(pdpt_phys >> 12, true, true); }
 
     // PDPT[4] = PML4 (so we can access PML4 via PML4_BASE)
     // PDPT is at entries[0xC0600] (address 0xC0603000)
@@ -354,6 +355,24 @@ pub fn setup_long_mode_tables() {
     if let Entries::E64(e) = entries() {
         e[0xC0600 + 4] = Entry64::new(pml4_phys >> 12, true, false);
     }
+}
+
+/// Update PML4[0] to point to a process's virtual root PDPT and return
+/// the PML4 physical address (suitable for CR3 in long mode).
+///
+/// The virtual root page is extracted from root.pdpt[3] (the recursive slot),
+/// which is not overlapped by the phys union field.
+pub fn pml4_cr3(root: &RootPageTable) -> u32 {
+    let vroot = Entry64(unsafe { root.pdpt[3] }).page();
+    unsafe { PML4[0] = Entry64::new(vroot, true, true); }
+    let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
+    (pml4_phys * PAGE_SIZE as u64) as u32
+}
+
+/// PML4 physical address (for CR3).
+pub fn pml4_phys() -> u32 {
+    let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
+    (pml4_phys * PAGE_SIZE as u64) as u32
 }
 
 /// Populate a RootPageTable's pdpt entries from the current virtual root.
@@ -377,11 +396,54 @@ pub fn populate_pdpt(pdpt: &mut [u64; 4]) {
 
 /// Populate pdpt entries from a virtual root accessed via temp_map.
 /// Used during fork when the new root isn't the current address space.
+///
+/// PAE PDPT entries have no hardware R/W bit — the CPU ignores R/W during
+/// the PDPT-level page walk. So we must "deshare" each user PD before
+/// writing it to the hardware PDPT: give the child a private copy with
+/// R/O PDEs, so that COW is enforced at the PDE level (which the CPU checks).
 pub fn populate_pdpt_from(root_phys: u64, pdpt: &mut [u64; 4]) {
     let root_page = root_phys / PAGE_SIZE as u64;
+    let root = root_base();
+    let user_count = recursive_idx() - root;
+
+    // Read child's virtual root to find shared PDs
+    let mut old_pds = [0u64; 3];
     temp_map(root_page);
-    let src = TEMP_MAP_VADDR as *const Entry64;
     unsafe {
+        let src = TEMP_MAP_VADDR as *const Entry64;
+        for i in 0..user_count.min(3) {
+            let entry = *src.add(i);
+            if entry.present() {
+                old_pds[i] = entry.page();
+            }
+        }
+    }
+    temp_unmap();
+
+    // Deshare: copy each shared PD via the parent's self-map,
+    // giving the child private PDs with R/O PDEs.
+    let mut new_pds = [0u64; 3];
+    if let Entries::E64(entries) = entries() {
+        for i in 0..user_count.min(3) {
+            if old_pds[i] != 0 && crate::phys_mm::is_shared(old_pds[i]) {
+                new_pds[i] = share_and_copy(entries, root + i)
+                    .expect("Out of memory during fork deshare");
+                crate::phys_mm::free_phys_page(old_pds[i]);
+            }
+        }
+    }
+
+    // Update child's virtual root with deshared PDs, then read for hw PDPT
+    temp_map(root_page);
+    unsafe {
+        let dst = TEMP_MAP_VADDR as *mut Entry64;
+        for i in 0..user_count.min(3) {
+            if new_pds[i] != 0 {
+                *dst.add(i) = Entry64::new(new_pds[i], true, true);
+            }
+        }
+        // Read final entries for hardware PDPT (sanitize: R/W=0, U/S=0)
+        let src = TEMP_MAP_VADDR as *const Entry64;
         for i in 0..4 {
             let mut entry = *src.add(i);
             entry.set_hw_writable(false);
@@ -389,7 +451,7 @@ pub fn populate_pdpt_from(root_phys: u64, pdpt: &mut [u64; 4]) {
             pdpt[i] = entry.0;
         }
         // Recursive slot points to virtual root
-        let recursive_slot = recursive_idx() - root_base();
+        let recursive_slot = recursive_idx() - root;
         pdpt[recursive_slot] = Entry64::new(root_page, false, false).0;
     }
     temp_unmap();
@@ -571,7 +633,8 @@ pub fn finish_setup_paging() {
         }
         Entries::E64(e) => {
             crate::println!("Paging: PAE (64-bit entries)");
-            if cpu_supports_long_mode() {
+            let lm = cpu_supports_long_mode();
+            if lm {
                 crate::println!("CPU supports Long Mode (64-bit)");
 
                 // Before removing id map copy the compat <-> legacy protmode
@@ -585,8 +648,14 @@ pub fn finish_setup_paging() {
 
             remove_identity_mapping(e);
 
+            // Re-establish identity mapping for trampoline page using SCRATCH
+            if lm {
+                let scratch_vaddr = unsafe { &raw const crate::SCRATCH } as usize;
+                let scratch_page = physical_page(scratch_vaddr);
+                map_trampoline(e, scratch_page);
+            }
+
             if cpu_supports_nx() {
-                crate::println!("CPU supports NX");
                 enable_nx();
             }
             harden_kernel(e);
@@ -867,20 +936,32 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
     let epp = entries_per_page::<E>();
     let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
 
+    debug_assert!(child_base + epp <= NUM_PAGES,
+        "share_and_copy: idx {:#x} children {:#x}..{:#x} > NUM_PAGES {:#x}",
+        idx, child_base, child_base + epp, NUM_PAGES);
+
     // Get physical page of the parent page table (the one that entries[child_base..] maps)
     let parent_phys = entries[idx].page();
 
     // Allocate new page for child copy
     let new_phys = phys_mm::alloc_phys_page()?;
 
-    // Copy parent -> child via temp_map, marking both R/O
-    // First: copy and mark child R/O
+    // For the root page table, only mark user entries R/O (below recursive entry).
+    // Kernel entries stay writable — shared between all processes.
+    // For non-root page tables, all entries are user.
+    let user_count = if idx == recursive_idx() {
+        recursive_idx() - child_base
+    } else {
+        epp
+    };
+
+    // Copy parent -> child via temp_map, marking user entries R/O
     temp_map(new_phys);
     unsafe {
         let dst = TEMP_MAP_VADDR as *mut E;
         for i in 0..epp {
             let mut e = entries[child_base + i];
-            if e.present() {
+            if e.present() && i < user_count {
                 e.set_hw_writable(false);
             }
             *dst.add(i) = e;
@@ -888,11 +969,11 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
     }
     temp_unmap();
 
-    // Second: mark parent R/O and inc ref counts via temp_map
+    // Mark parent user entries R/O and inc ref counts via temp_map
     temp_map(parent_phys);
     unsafe {
         let src = TEMP_MAP_VADDR as *mut E;
-        for i in 0..epp {
+        for i in 0..user_count {
             let e = &mut *src.add(i);
             if e.present() {
                 e.set_hw_writable(false);
@@ -918,9 +999,20 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         "cow_entry: idx {} is the recursive entry, must never be COW'd", idx);
 
     let old_phys = entries[idx].page();
+    let ref_count = phys_mm::get_ref_count(old_phys);
 
-    if phys_mm::get_ref_count(old_phys) == 1 {
+    if ref_count == 1 {
+        // Sole owner — just make writable
         entries[idx].set_hw_writable(true);
+        flush_tlb();
+        return;
+    }
+
+    // Zero page: allocate a fresh zeroed page (no children to share)
+    if phys_mm::is_zero_page(old_phys) {
+        let new_phys = phys_mm::alloc_phys_page().expect("Out of memory during COW");
+        let user = entries[idx].user();
+        entries[idx] = E::new(new_phys, true, user);
         flush_tlb();
         return;
     }
@@ -1020,6 +1112,27 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 /// Trampoline page physical address (last page of first 64KB)
 pub const TRAMPOLINE_PAGE: usize = 0xF;  // page 15 = address 0xF000
 pub const TRAMPOLINE_ADDR: usize = TRAMPOLINE_PAGE * PAGE_SIZE;
+
+/// Identity-map the trampoline page (0xF000) using SCRATCH as a self-referencing PD+PT.
+/// Must be called after remove_identity_mapping() so the trampoline remains accessible.
+pub fn map_trampoline(entries: &mut [Entry64], scratch_page: u64) {
+    let root = root_base();
+
+    // Access SCRATCH via LOW_MEM_BASE to clear and set up entries
+    let scratch = (LOW_MEM_BASE + scratch_page as usize * PAGE_SIZE) as *mut Entry64;
+    unsafe {
+        // Clear all entries
+        core::ptr::write_bytes(scratch, 0, 512);
+        // PD entry [0]: points to SCRATCH itself as PT (self-referencing)
+        *scratch.add(0) = Entry64::new(scratch_page, true, false);
+        // PT entry [TRAMPOLINE_PAGE]: identity-maps physical 0xF000
+        *scratch.add(TRAMPOLINE_PAGE) = Entry64::new(TRAMPOLINE_PAGE as u64, true, false);
+    }
+
+    // PDPT[0] = SCRATCH as PD for 0-1GB
+    entries[root] = Entry64::new(scratch_page, true, false);
+    flush_tlb();
+}
 
 /// Copy trampoline code to physical address 0xF000
 /// Uses LOW_MEM_BASE mapping to access the destination
