@@ -81,7 +81,7 @@ fn sys_yield(_regs: &mut Regs) -> i32 {
     if let Some(current) = thread::current() {
         thread::save_state(current);
         current.state = thread::ThreadState::Ready;
-        thread::schedule(current.tid, false);
+        thread::schedule();
     }
     0
 }

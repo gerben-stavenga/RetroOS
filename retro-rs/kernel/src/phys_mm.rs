@@ -8,6 +8,19 @@
 use crate::paging2::PAGE_SIZE;
 use crate::MMapEntry;
 
+/// Cached zero page physical page number (set once during init)
+static mut ZERO_PAGE_PHYS: u64 = u64::MAX;
+
+/// Set the zero page physical address (call once during init)
+pub fn set_zero_page(phys: u64) {
+    unsafe { ZERO_PAGE_PHYS = phys; }
+}
+
+/// Check if a page is the zero page (always shared, never freed)
+fn is_zero_page(page: u64) -> bool {
+    unsafe { page == ZERO_PAGE_PHYS }
+}
+
 /// Maximum number of physical pages we track (64K pages = 256MB)
 /// Limited to keep kernel under 1MB for now
 const MAX_PAGES: usize = 64 * 1024;
@@ -119,6 +132,7 @@ pub fn alloc_phys_page() -> Option<u64> {
 /// Free a physical page (decrement reference count)
 /// Returns true if the page is now free
 pub fn free_phys_page(page: u64) -> bool {
+    if is_zero_page(page) { return false; }
     if page as usize >= MAX_PAGES {
         return false;
     }
@@ -138,6 +152,7 @@ pub fn free_phys_page(page: u64) -> bool {
 /// Increment shared count for a page (for copy-on-write sharing)
 /// Returns true if successful
 pub fn inc_shared_count(page: u64) -> bool {
+    if is_zero_page(page) { return true; }
     if page as usize >= MAX_PAGES {
         return false;
     }
@@ -156,6 +171,7 @@ pub fn inc_shared_count(page: u64) -> bool {
 
 /// Get the reference count for a page
 pub fn get_ref_count(page: u64) -> u8 {
+    if is_zero_page(page) { return RESERVED; }
     if page as usize >= MAX_PAGES {
         return RESERVED;
     }
