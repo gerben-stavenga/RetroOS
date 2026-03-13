@@ -256,26 +256,24 @@ pub fn set_return(thread: &mut Thread, ret: i32) {
     thread.cpu_state.rax = ret as u32 as u64;  // Sign-extend for 32-bit, zero-extend to 64
 }
 
-/// Schedule next thread
-/// tid: current thread's TID to exclude
-/// must_switch: if true, must switch even if no other threads (go to idle)
-pub fn schedule(tid: i32, must_switch: bool) {
+/// Schedule next thread (randomly selected from ready threads)
+pub fn schedule() {
     unsafe {
         const A: u64 = 0xdead_beed;
         const C: u64 = 0x1234_5679;
         SEED = A.wrapping_mul(SEED).wrapping_add(C);
 
+        let current_tid = if !CURRENT_THREAD.is_null() { (*CURRENT_THREAD).tid } else { -1 };
+
         let mut next_thread: *mut Thread = core::ptr::null_mut();
         let mut count = 0u64;
 
-        // Skip thread 0 (idle) in normal scheduling
         for i in 1..MAX_THREADS {
-            if i as i32 == tid {
+            if i as i32 == current_tid {
                 continue;
             }
             if THREADS[i].state == ThreadState::Ready {
                 count += 1;
-                // Reservoir sampling for random selection
                 if SEED % count == 0 {
                     next_thread = &mut THREADS[i];
                 }
@@ -283,15 +281,9 @@ pub fn schedule(tid: i32, must_switch: bool) {
         }
 
         if next_thread.is_null() {
-            if !must_switch || (!CURRENT_THREAD.is_null() && (*CURRENT_THREAD).tid == 0) {
-                // Stay with current thread or already in idle
-                return;
-            }
-            // Go to idle thread
-            next_thread = &mut THREADS[0];
+            // No other threads ready — stay with current
+            return;
         }
-
-        println!("Schedule -> tid {}", (*next_thread).tid);
 
         exit_to_thread(&mut *next_thread);
     }
@@ -322,24 +314,18 @@ unsafe extern "C" {
     fn exit_kernel(cpu_state: *const CpuState) -> !;
 }
 
-/// Mark current thread as zombie and schedule away
+/// Exit current thread and schedule next
 pub fn exit_thread(exit_code: i32) -> ! {
     unsafe {
-        if !CURRENT_THREAD.is_null() {
-            let thread = &mut *CURRENT_THREAD;
-            println!("Thread {} exited with code {}", thread.tid, exit_code);
-            // Free user pages (decrements shared ref counts for COW)
-            crate::paging2::free_user_pages();
-            thread.state = ThreadState::Unused;
-            // TODO: Wake parent if waiting
-        }
-        schedule(-1, true);
+        let thread = &mut *CURRENT_THREAD;
+        println!("Thread {} exited with code {}", thread.tid, exit_code);
+        crate::paging2::free_user_pages();
+        thread.state = ThreadState::Unused;
+        CURRENT_THREAD = core::ptr::null_mut();
+        // TODO: Wake parent if waiting
+        schedule();
     }
-    // schedule with must_switch should never return
-    loop {
-        x86::cli();
-        x86::hlt();
-    }
+    panic!("No threads to schedule after exit");
 }
 
 /// Signal thread (e.g., on segfault)
@@ -357,7 +343,8 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) {
         unsafe {
             if CURRENT_THREAD == thread as *mut _ {
                 thread.state = ThreadState::Unused;
-                schedule(thread.tid, true);
+                CURRENT_THREAD = core::ptr::null_mut();
+                schedule();
             } else {
                 thread.state = ThreadState::Zombie;
             }

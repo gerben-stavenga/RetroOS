@@ -151,9 +151,9 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
         kernel_high_page,
     );
 
-    // Mark zero page as reserved so COW always copies (ref count never decremented)
+    // Register zero page — always shared, never ref-counted
     let zero_page_phys = paging2::physical_page(&ZERO_PAGE as *const _ as usize);
-    phys_mm::mark_reserved(zero_page_phys, zero_page_phys + 1);
+    phys_mm::set_zero_page(zero_page_phys);
 
     println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
 

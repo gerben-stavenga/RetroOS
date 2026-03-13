@@ -11,8 +11,9 @@ use lib::println;
 /// Syscall numbers
 const SYS_EXIT: u32 = 0;
 const SYS_YIELD: u32 = 1;
-const SYS_WRITE: u32 = 9;
+const SYS_FORK: u32 = 4;
 const SYS_EXEC: u32 = 5;
+const SYS_WRITE: u32 = 9;
 
 /// File descriptors
 const STDOUT: u32 = 1;
@@ -52,6 +53,12 @@ fn yield_cpu() {
     }
 }
 
+/// Fork the process. Returns child pid in parent, 0 in child.
+fn fork() -> i32 {
+    unsafe { syscall3(SYS_FORK, 0, 0, 0) }
+}
+
+/// Exec a program (replaces current process)
 #[inline(never)]
 fn exec(s: &str) -> i32 {
     unsafe {
@@ -65,17 +72,18 @@ pub extern "C" fn _start() -> ! {
     write(b"Hello from init!\n");
     write(b"RetroOS userspace is running.\n");
 
-    // Simple loop
-    let mut counter = 0u32;
     loop {
-        if counter % 1000000 == 0 {
-            write(b".");
+        let pid = fork();
+        if pid == 0 {
+            // Child: exec the shell program
+            exec("printmsg.elf");
+            write(b"Exec failed\n");
+            exit(1);
         }
-        counter = counter.wrapping_add(1);
-        if counter % 10000000 == 0 {
-            if exec("printmsg.elf") != 0 {
-                write(b"Exec failed\n");
-            }
+        // Parent: wait for child (yield until child exits)
+        // TODO: proper waitpid syscall
+        loop {
+            yield_cpu();
         }
     }
 }

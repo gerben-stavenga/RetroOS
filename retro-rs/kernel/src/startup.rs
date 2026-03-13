@@ -102,61 +102,35 @@ pub fn startup(start_sector: u32) -> ! {
     crate::stacktrace::init_from_tar();
 
     // Find init.elf
-    let init_path = b"init.elf";
     println!("Loading init.elf");
 
-    let size = match find_file(init_path) {
+    let size = match find_file(b"init.elf") {
         Some(s) => s,
-        None => {
-            println!("Failed to find init.elf");
-            loop {
-                x86::cli();
-                x86::hlt();
-            }
-        }
+        None => panic!("init.elf not found"),
     };
 
     println!("init.elf size: {:#x}", size);
 
-    // Allocate buffer for ELF on heap
     let mut elf_buffer = vec![0u8; size];
     read_file(&mut elf_buffer);
 
-    // Load ELF into user address space
     let entry = match elf::load_elf(&elf_buffer) {
         Ok(e) => e,
-        Err(_) => {
-            println!("Failed to load ELF");
-            loop {
-                x86::cli();
-                x86::hlt();
-            }
-        }
+        Err(_) => panic!("Failed to load init.elf"),
     };
 
-    // Extract symbols for debugging
     let symbols = SymbolData::new(elf_buffer.into_boxed_slice());
 
     println!("Entry point: {:#x}", entry);
 
     let stack = PAGE_TABLE_BASE as u32;
-
     println!("User stack: {:#x}", stack);
 
     // Create init thread
     let page_dir = crate::paging2::current_root_phys();
-    let init_thread = match thread::create_thread(None, page_dir, true) {
-        Some(t) => t,
-        None => {
-            println!("Failed to create init thread");
-            loop {
-                x86::cli();
-                x86::hlt();
-            }
-        }
-    };
+    let init_thread = thread::create_thread(None, page_dir, true)
+        .expect("Failed to create init thread");
 
-    // Store symbols and initialize as user process
     init_thread.symbols = symbols;
     thread::init_process_thread(init_thread, entry, stack);
 

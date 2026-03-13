@@ -855,7 +855,8 @@ fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
 // COW fault handling
 // =============================================================================
 
-/// Mark children of a page table entry as shared R/O and copy the page.
+/// Copy a page table page and mark children as shared R/O in both copies.
+/// All writes go through temp_map to avoid faulting on the self-mapped entries.
 /// Returns the new page's physical page number.
 fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
     use crate::phys_mm;
@@ -866,24 +867,42 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
     let epp = entries_per_page::<E>();
     let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
 
-    for i in 0..epp {
-        if entries[child_base + i].present() {
-            entries[child_base + i].set_hw_writable(false);
-            phys_mm::inc_shared_count(entries[child_base + i].page());
-        }
-    }
+    // Get physical page of the parent page table (the one that entries[child_base..] maps)
+    let parent_phys = entries[idx].page();
 
+    // Allocate new page for child copy
     let new_phys = phys_mm::alloc_phys_page()?;
 
+    // Copy parent -> child via temp_map, marking both R/O
+    // First: copy and mark child R/O
     temp_map(new_phys);
-    let dst = TEMP_MAP_VADDR as *mut E;
     unsafe {
+        let dst = TEMP_MAP_VADDR as *mut E;
         for i in 0..epp {
-            *dst.add(i) = entries[child_base + i];
+            let mut e = entries[child_base + i];
+            if e.present() {
+                e.set_hw_writable(false);
+            }
+            *dst.add(i) = e;
         }
     }
     temp_unmap();
 
+    // Second: mark parent R/O and inc ref counts via temp_map
+    temp_map(parent_phys);
+    unsafe {
+        let src = TEMP_MAP_VADDR as *mut E;
+        for i in 0..epp {
+            let e = &mut *src.add(i);
+            if e.present() {
+                e.set_hw_writable(false);
+                phys_mm::inc_shared_count(e.page());
+            }
+        }
+    }
+    temp_unmap();
+
+    flush_tlb();
     Some(new_phys)
 }
 
