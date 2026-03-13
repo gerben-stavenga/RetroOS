@@ -693,11 +693,16 @@ pub fn enable_legacy(kpages: &mut LegacyPages, scratch: &mut PageTable32, kernel
 /// Assumes kernel < 1MB (same as legacy mode)
 ///
 pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: usize) {
-    // Identity map using scratch as both PD and PT (self-referential)
-    // scratch[0] = scratch itself, so scratch acts as PD with scratch as PT for first 2MB
+    // Identity map using scratch as PD: scratch[0] = scratch (self-ref PT for 0-2MB),
+    // scratch[1] = pt_pml4 (PT for 2-4MB, temporarily borrowed)
     scratch[0] = Entry64::new(scratch.phys_page(), true, false);
-    for i in 1..512 {
+    scratch[1] = Entry64::new(kpages.pt_pml4.phys_page(), true, false);
+    for i in 2..512 {
         scratch[i] = Entry64::new(i as u64, true, false);
+    }
+    // pt_pml4 temporarily serves as identity PT for 2-4MB
+    for i in 0..512 {
+        kpages.pt_pml4[i] = Entry64::new((512 + i) as u64, true, false);
     }
     // Note: page 0xF is preserved in remove_identity_mapping() for mode switching trampoline
 
@@ -890,8 +895,8 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
 pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     use crate::phys_mm;
 
-    debug_assert!(idx < recursive_idx(),
-        "cow_entry: idx {} is at or above recursive entry, only user entries can be shared", idx);
+    debug_assert!(idx != recursive_idx(),
+        "cow_entry: idx {} is the recursive entry, must never be COW'd", idx);
 
     let old_phys = entries[idx].page();
 

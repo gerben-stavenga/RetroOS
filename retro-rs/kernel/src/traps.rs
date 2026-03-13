@@ -221,7 +221,8 @@ fn handle_protection_fault<E: paging2::Entry>(
     }
 
     // Walk from leaf upward to find the first !hw_writable entry.
-    // If higher levels are also R/O, the write inside cow_page_table
+    // Covers both user COW pages and demand-paged kernel page tables.
+    // If higher levels are also R/O, the write inside cow_entry
     // will nested-fault and resolve them first.
     let mut idx = page_index;
     loop {
@@ -243,7 +244,8 @@ fn handle_protection_fault<E: paging2::Entry>(
             return;
         }
         let parent = paging2::parent_index::<E>(idx);
-        if parent >= paging2::recursive_idx() {
+        if parent == idx {
+            // Reached the recursive entry (fixed point) — stop
             break;
         }
         idx = parent;
