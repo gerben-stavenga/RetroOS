@@ -140,7 +140,7 @@ pub struct Thread {
     pub parent_tid: i32,
     pub state: ThreadState,
     pub time: u32,
-    pub page_dir: u32,  // Physical address of page directory
+    pub root: crate::paging2::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
     pub cpu_state: CpuState,
@@ -156,7 +156,7 @@ impl Thread {
             parent_tid: -1,
             state: ThreadState::Unused,
             time: 0,
-            page_dir: 0,
+            root: crate::paging2::RootPageTable::empty(),
             num_fds: 0,
             fds: [-1; MAX_FDS],
             cpu_state: CpuState::empty(),
@@ -204,7 +204,7 @@ pub fn get_thread(tid: usize) -> Option<&'static mut Thread> {
 }
 
 /// Create a new thread
-pub fn create_thread(parent: Option<&Thread>, page_dir: u32, is_process: bool) -> Option<&'static mut Thread> {
+pub fn create_thread(parent: Option<&Thread>, page_dir: u64, is_process: bool) -> Option<&'static mut Thread> {
     unsafe {
         for i in 0..MAX_THREADS {
             if THREADS[i].state == ThreadState::Unused {
@@ -219,7 +219,7 @@ pub fn create_thread(parent: Option<&Thread>, page_dir: u32, is_process: bool) -
                 thread.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
                 thread.state = ThreadState::Ready;
                 thread.time = crate::irq::get_ticks() as u32;
-                thread.page_dir = page_dir;
+                thread.root.init_fork(page_dir);
                 thread.num_fds = 0;
                 for fd in &mut thread.fds {
                     *fd = -1;
@@ -302,10 +302,8 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
     unsafe {
         thread.state = ThreadState::Running;
 
-        // Switch page directory
-        if thread.page_dir != 0 {
-            x86::write_cr3(thread.page_dir);
-        }
+        // Switch address space
+        thread.root.activate();
 
         // Update kernel stack in TSS for this thread
         let stack_top = (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024) as u32;
@@ -329,9 +327,11 @@ pub fn exit_thread(exit_code: i32) -> ! {
     unsafe {
         if !CURRENT_THREAD.is_null() {
             let thread = &mut *CURRENT_THREAD;
+            println!("Thread {} exited with code {}", thread.tid, exit_code);
+            // Free user pages (decrements shared ref counts for COW)
+            crate::paging2::free_user_pages();
             thread.state = ThreadState::Unused;
             // TODO: Wake parent if waiting
-            println!("Thread {} exited with code {}", thread.tid, exit_code);
         }
         schedule(-1, true);
     }
@@ -374,7 +374,9 @@ pub fn init_threading() {
         THREADS[0].priority = 0;
         THREADS[0].parent_tid = -1;
         THREADS[0].state = ThreadState::Running;
-        THREADS[0].page_dir = x86::read_cr3();
+        THREADS[0].root.init_current();
+        THREADS[0].root.activate();
         CURRENT_THREAD = &mut THREADS[0];
     }
 }
+

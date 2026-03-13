@@ -144,7 +144,7 @@ pub fn startup(start_sector: u32) -> ! {
     println!("User stack: {:#x}", stack);
 
     // Create init thread
-    let page_dir = x86::read_cr3();
+    let page_dir = crate::paging2::current_root_phys();
     let init_thread = match thread::create_thread(None, page_dir, true) {
         Some(t) => t,
         None => {

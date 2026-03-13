@@ -134,16 +134,12 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     // Finish paging setup (remove identity, enable NX, setup long mode, harden)
     paging2::finish_setup_paging();
 
-    println!("Accessing boot_data...");
-
-    // Get kernel physical address from boot_data and set it for virt_to_phys
-    let kernel_phys = boot_data.kernel as usize;
-    paging2::set_kernel_phys_base(kernel_phys);
+    let kernel_phys = boot_data.kernel as u64;
     println!("kernel_phys: {:#x}", kernel_phys);
 
-    let kernel_size = core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_start) as usize;
-    let kernel_low_page = kernel_phys / PAGE_SIZE;
-    let kernel_high_page = (kernel_phys + kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let kernel_size = core::ptr::addr_of!(_end) as u64 - core::ptr::addr_of!(_start) as u64;
+    let kernel_low_page = kernel_phys / PAGE_SIZE as u64;
+    let kernel_high_page = (kernel_phys + kernel_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
 
     println!("Initializing phys_mm...");
 
@@ -160,6 +156,9 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     phys_mm::mark_reserved(zero_page_phys, zero_page_phys + 1);
 
     println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
+
+    // Initialize temp mapping for fork
+    paging2::init_temp_map();
 
     // Initialize kernel heap allocator
     heap::init();

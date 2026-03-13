@@ -25,7 +25,7 @@ static mut NEXT_FREE: usize = 0;
 ///
 /// # Safety
 /// Must be called once during kernel init with valid memory map.
-pub fn init_phys_mm(mmap_entries: &[MMapEntry], mmap_count: usize, kernel_low: usize, kernel_high: usize) {
+pub fn init_phys_mm(mmap_entries: &[MMapEntry], mmap_count: usize, kernel_low: u64, kernel_high: u64) {
     unsafe {
         // Mark all pages as reserved initially
         for i in 0..MAX_PAGES {
@@ -44,12 +44,12 @@ pub fn init_phys_mm(mmap_entries: &[MMapEntry], mmap_count: usize, kernel_low: u
                 continue;
             }
 
-            let start_page = (entry.base as usize + PAGE_SIZE - 1) / PAGE_SIZE;
-            let end_page = ((entry.base + entry.length) as usize) / PAGE_SIZE;
+            let start_page = (entry.base as u64 + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
+            let end_page = ((entry.base + entry.length) as u64) / PAGE_SIZE as u64;
 
             for page in start_page..end_page {
-                if page < MAX_PAGES {
-                    PAGE_REFS[page] = 0; // Free
+                if (page as usize) < MAX_PAGES {
+                    PAGE_REFS[page as usize] = 0; // Free
                 }
             }
         }
@@ -61,37 +61,37 @@ pub fn init_phys_mm(mmap_entries: &[MMapEntry], mmap_count: usize, kernel_low: u
 
         // Mark kernel pages as used
         for page in kernel_low..kernel_high {
-            if page < MAX_PAGES {
-                PAGE_REFS[page] = 1;
+            if (page as usize) < MAX_PAGES {
+                PAGE_REFS[page as usize] = 1;
             }
         }
 
         // Start searching after kernel
-        NEXT_FREE = kernel_high;
+        NEXT_FREE = kernel_high as usize;
     }
 }
 
 /// Mark a range of pages as reserved
-pub fn mark_reserved(low_page: usize, high_page: usize) {
+pub fn mark_reserved(low_page: u64, high_page: u64) {
     for page in low_page..high_page {
-        if page < MAX_PAGES {
-            unsafe { PAGE_REFS[page] = RESERVED; }
+        if (page as usize) < MAX_PAGES {
+            unsafe { PAGE_REFS[page as usize] = RESERVED; }
         }
     }
 }
 
 /// Mark a range of pages as used (reference count = 1)
-pub fn mark_used(low_page: usize, high_page: usize) {
+pub fn mark_used(low_page: u64, high_page: u64) {
     for page in low_page..high_page {
-        if page < MAX_PAGES {
-            unsafe { PAGE_REFS[page] = 1; }
+        if (page as usize) < MAX_PAGES {
+            unsafe { PAGE_REFS[page as usize] = 1; }
         }
     }
 }
 
 /// Allocate a physical page
 /// Returns page number or None if out of memory
-pub fn alloc_phys_page() -> Option<usize> {
+pub fn alloc_phys_page() -> Option<u64> {
     unsafe {
         let start = NEXT_FREE;
         let mut page = start;
@@ -104,7 +104,7 @@ pub fn alloc_phys_page() -> Option<usize> {
             if PAGE_REFS[page] == 0 {
                 PAGE_REFS[page] = 1;
                 NEXT_FREE = page + 1;
-                return Some(page);
+                return Some(page as u64);
             }
 
             page += 1;
@@ -118,57 +118,57 @@ pub fn alloc_phys_page() -> Option<usize> {
 
 /// Free a physical page (decrement reference count)
 /// Returns true if the page is now free
-pub fn free_phys_page(page: usize) -> bool {
-    if page >= MAX_PAGES {
+pub fn free_phys_page(page: u64) -> bool {
+    if page as usize >= MAX_PAGES {
         return false;
     }
 
     unsafe {
-        let count = PAGE_REFS[page];
+        let count = PAGE_REFS[page as usize];
         if count == 0 || count == RESERVED {
             // Already free or reserved, bug
             return false;
         }
 
-        PAGE_REFS[page] = count - 1;
+        PAGE_REFS[page as usize] = count - 1;
         count - 1 == 0
     }
 }
 
 /// Increment shared count for a page (for copy-on-write sharing)
 /// Returns true if successful
-pub fn inc_shared_count(page: usize) -> bool {
-    if page >= MAX_PAGES {
+pub fn inc_shared_count(page: u64) -> bool {
+    if page as usize >= MAX_PAGES {
         return false;
     }
 
     unsafe {
-        let count = PAGE_REFS[page];
+        let count = PAGE_REFS[page as usize];
         if count == 0 || count >= RESERVED - 1 {
             // Free, reserved, or at max count
             return false;
         }
 
-        PAGE_REFS[page] = count + 1;
+        PAGE_REFS[page as usize] = count + 1;
         true
     }
 }
 
 /// Get the reference count for a page
-pub fn get_ref_count(page: usize) -> u8 {
-    if page >= MAX_PAGES {
+pub fn get_ref_count(page: u64) -> u8 {
+    if page as usize >= MAX_PAGES {
         return RESERVED;
     }
-    unsafe { PAGE_REFS[page] }
+    unsafe { PAGE_REFS[page as usize] }
 }
 
 /// Check if a page is shared (ref count > 1)
-pub fn is_shared(page: usize) -> bool {
-    if page >= MAX_PAGES {
+pub fn is_shared(page: u64) -> bool {
+    if page as usize >= MAX_PAGES {
         return false;
     }
     unsafe {
-        let count = PAGE_REFS[page];
+        let count = PAGE_REFS[page as usize];
         count > 1 && count != RESERVED
     }
 }
