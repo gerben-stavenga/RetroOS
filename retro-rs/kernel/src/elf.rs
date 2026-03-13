@@ -21,7 +21,7 @@ fn finalize_page_permissions<E: Entry>(entries: &mut [E], vaddr: usize, writable
     if entries[page].present() {
         let phys = entries[page].page();
         let mut entry = E::new(phys, writable, true);
-        entry.set_soft_ro(!writable);
+        entry.set_writable(writable);
         // Clear NX only if this segment is executable; otherwise preserve
         // (executable wins if multiple segments share a page)
         if executable {
@@ -60,10 +60,10 @@ pub fn load_elf(elf_data: &[u8]) -> Result<u32, ElfError> {
 
         for page in start_page..end_page {
             match paging2::entries() {
-                Entries::Legacy(e) => {
+                Entries::E32(e) => {
                     finalize_page_permissions(e, page * PAGE_SIZE, writable, executable);
                 }
-                Entries::Pae(e) => {
+                Entries::E64(e) => {
                     finalize_page_permissions(e, page * PAGE_SIZE, writable, executable);
                 }
             }

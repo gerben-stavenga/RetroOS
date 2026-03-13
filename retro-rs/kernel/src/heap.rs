@@ -91,8 +91,8 @@ impl AllocatorInner {
             // Map it into kernel space (user=false, readonly=false)
             let virt_page_idx = self.mapped_end / PAGE_SIZE;
             match paging2::entries() {
-                Entries::Legacy(e) => e[virt_page_idx] = Entry32::new(phys_page, true, false),
-                Entries::Pae(e) => e[virt_page_idx] = Entry64::new(phys_page, true, false),
+                Entries::E32(e) => e[virt_page_idx] = Entry32::new(phys_page, true, false),
+                Entries::E64(e) => e[virt_page_idx] = Entry64::new(phys_page, true, false),
             }
 
             self.mapped_end += PAGE_SIZE;

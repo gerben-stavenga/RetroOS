@@ -177,14 +177,14 @@ fn page_fault(regs: &mut Regs) {
 
     // Dispatch based on mode, then handle fault
     match paging2::entries() {
-        paging2::Entries::Legacy(e) => {
+        paging2::Entries::E32(e) => {
             if present {
                 handle_protection_fault(e, regs, fault_addr, page_index, write, user, instruction_fetch);
             } else {
                 demand_page(e, page_index, false);
             }
         }
-        paging2::Entries::Pae(e) => {
+        paging2::Entries::E64(e) => {
             if present {
                 handle_protection_fault(e, regs, fault_addr, page_index, write, user, instruction_fetch);
             } else {
@@ -194,53 +194,11 @@ fn page_fault(regs: &mut Regs) {
     }
 }
 
-/// Handle protection fault for COW resolution (generic)
-fn handle_cow_fault<E: paging2::Entry>(
-    entries: &mut [E],
-    regs: &mut Regs,
-    fault_addr: usize,
-    page_index: usize,
-) {
-    use crate::paging2::PAGE_SIZE;
-    use crate::phys_mm;
-
-    let phys_page = entries[page_index].page();
-    let ref_count = phys_mm::get_ref_count(phys_page);
-
-    if ref_count == 1 {
-        // Not shared, just make it writable
-        entries[page_index].set_writable(true);
-        paging2::flush_tlb();
-    } else {
-        // Shared, need to copy before writing
-        phys_mm::free_phys_page(phys_page);
-
-        // Allocate new page
-        let new_page = match phys_mm::alloc_phys_page() {
-            Some(p) => p,
-            None => panic_with_regs("Out of memory on write fault", regs),
-        };
-
-        // Copy the page contents
-        let src = (fault_addr & !(PAGE_SIZE - 1)) as *const RawPage;
-        unsafe {
-            core::ptr::copy_nonoverlapping(src, &raw mut crate::SCRATCH, 1);
-        }
-
-        // Update page entry: writable, preserve U bit
-        let user = entries[page_index].user();
-        entries[page_index] = E::new(new_page, true, user);
-        paging2::flush_tlb();
-
-        // Copy back from scratch
-        let dst = (fault_addr & !(PAGE_SIZE - 1)) as *mut RawPage;
-        unsafe {
-            core::ptr::copy_nonoverlapping(&raw const crate::SCRATCH, dst, 1);
-        }
-    }
-}
-
 /// Handle protection faults (present page, but access denied)
+///
+/// For write faults, walks up from leaf to root via parent_index(),
+/// COWing any shared intermediate levels top-down, then handles the leaf.
+/// Works uniformly for all paging depths (2-level, 3-level, 4-level).
 fn handle_protection_fault<E: paging2::Entry>(
     entries: &mut [E],
     regs: &mut Regs,
@@ -251,7 +209,6 @@ fn handle_protection_fault<E: paging2::Entry>(
     instruction_fetch: bool,
 ) {
     if instruction_fetch {
-        // NX violation - tried to execute non-executable page
         if user {
             segv_current_thread(regs, fault_addr);
             return;
@@ -263,14 +220,38 @@ fn handle_protection_fault<E: paging2::Entry>(
         panic_with_regs("Read fault on present page", regs);
     }
 
-    if !entries[page_index].soft_ro() {
-        handle_cow_fault(entries, regs, fault_addr, page_index);
-    } else if user {
-        segv_current_thread(regs, fault_addr);
-    } else {
-        println!("Fault address: {:#x} (page {})", fault_addr, page_index);
-        panic_with_regs("Kernel write to read-only page", regs);
+    // Walk from leaf upward to find the first !hw_writable entry.
+    // If higher levels are also R/O, the write inside cow_page_table
+    // will nested-fault and resolve them first.
+    let mut idx = page_index;
+    loop {
+        if entries[idx].present() && !entries[idx].hw_writable() {
+            if !entries[idx].writable() {
+                if user { segv_current_thread(regs, fault_addr); return; }
+                panic_with_regs("Kernel write to read-only page", regs);
+            }
+            paging2::cow_entry(entries, idx);
+            // If resolved at PDPT level, update thread's hardware PDPT
+            if let Some(slot) = paging2::root_slot(idx) {
+                if let Some(thread) = crate::thread::current() {
+                    if let Some(pdpt) = thread.root.pdpt_mut() {
+                        paging2::update_pdpt_entry(pdpt, slot, entries[idx].raw());
+                        paging2::flush_tlb();
+                    }
+                }
+            }
+            return;
+        }
+        let parent = paging2::parent_index::<E>(idx);
+        if parent >= paging2::recursive_idx() {
+            break;
+        }
+        idx = parent;
     }
+
+    // Protection fault but nothing is R/O — should not happen
+    if user { segv_current_thread(regs, fault_addr); return; }
+    panic_with_regs("Unexpected write protection fault", regs);
 }
 
 /// Demand page allocation for not-present pages
@@ -286,7 +267,7 @@ fn demand_page<E: paging2::Entry>(
     use crate::paging2::PAGE_TABLE_BASE_IDX;
 
     let zero_page = paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
-    let is_user = page_index < E::USER_ENTRY_LIMIT;
+    let is_user = page_index < paging2::recursive_idx();
     let mut e = E::new(zero_page, false, is_user);  // RW=false (zero page is read-only)
     // NX for user data pages only (not page tables)
     if use_nx && page_index < PAGE_TABLE_BASE_IDX {
