@@ -8,17 +8,9 @@
 use crate::paging2::PAGE_SIZE;
 use crate::MMapEntry;
 
-/// Cached zero page physical page number (set once during init)
-static mut ZERO_PAGE_PHYS: u64 = u64::MAX;
-
-/// Set the zero page physical address (call once during init)
-pub fn set_zero_page(phys: u64) {
-    unsafe { ZERO_PAGE_PHYS = phys; }
-}
-
 /// Check if a page is the zero page (always shared, never freed)
-fn is_zero_page(page: u64) -> bool {
-    unsafe { page == ZERO_PAGE_PHYS }
+pub fn is_zero_page(page: u64) -> bool {
+    page == crate::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize)
 }
 
 /// Maximum number of physical pages we track (64K pages = 256MB)

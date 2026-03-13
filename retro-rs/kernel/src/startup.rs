@@ -114,14 +114,14 @@ pub fn startup(start_sector: u32) -> ! {
     let mut elf_buffer = vec![0u8; size];
     read_file(&mut elf_buffer);
 
-    let entry = match elf::load_elf(&elf_buffer) {
+    let loaded = match elf::load_elf(&elf_buffer) {
         Ok(e) => e,
         Err(_) => panic!("Failed to load init.elf"),
     };
 
     let symbols = SymbolData::new(elf_buffer.into_boxed_slice());
 
-    println!("Entry point: {:#x}", entry);
+    println!("Entry point: {:#x}", loaded.entry);
 
     let stack = PAGE_TABLE_BASE as u32;
     println!("User stack: {:#x}", stack);
@@ -132,7 +132,7 @@ pub fn startup(start_sector: u32) -> ! {
         .expect("Failed to create init thread");
 
     init_thread.symbols = symbols;
-    thread::init_process_thread(init_thread, entry, stack);
+    thread::init_process_thread(init_thread, loaded.entry as u32, stack);
 
     println!("Starting init process...");
 

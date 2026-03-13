@@ -3,7 +3,7 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
-use crate::descriptors::{set_kernel_stack, USER_CS, USER_DS};
+use crate::descriptors::{set_kernel_stack, USER_CS, USER_CS64, USER_DS};
 use crate::stacktrace::SymbolData;
 use crate::{KERNEL_STACK, println};
 use crate::x86;
@@ -26,7 +26,7 @@ pub enum ThreadState {
     Zombie,
 }
 
-use crate::{Frame, Frame32};
+use crate::{Frame, Frame32, Frame64};
 
 /// CPU state saved during context switch (matches Regs layout exactly)
 #[repr(C)]
@@ -130,6 +130,44 @@ impl CpuState {
             }
         };
     }
+
+    /// Initialize for a 64-bit user process
+    pub fn init_user_process_64(&mut self, entry: u64, stack: u64) {
+        let ds = USER_DS as u64;
+        const IF_FLAG: u64 = 1 << 9;
+
+        self.gs = ds;
+        self.fs = ds;
+        self.es = ds;
+        self.ds = ds;
+        self.r15 = 0;
+        self.r14 = 0;
+        self.r13 = 0;
+        self.r12 = 0;
+        self.r11 = 0;
+        self.r10 = 0;
+        self.r9 = 0;
+        self.r8 = 0;
+        self.rdi = 0;
+        self.rsi = 0;
+        self.rbp = 0;
+        self.rsp_dummy = 0;
+        self.rbx = 0;
+        self.rdx = 0;
+        self.rcx = 0;
+        self.rax = 0;
+        self.int_num = 0;
+        self.err_code = 0;
+        self.frame = Frame {
+            f64: Frame64 {
+                rip: entry,
+                cs: USER_CS64 as u64,
+                rflags: IF_FLAG,
+                rsp: stack,
+                ss: USER_DS as u64,
+            }
+        };
+    }
 }
 
 /// Thread control block
@@ -144,6 +182,7 @@ pub struct Thread {
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
     pub cpu_state: CpuState,
+    pub is_64bit: bool,               // True if running in 64-bit (long) mode
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
 }
 
@@ -160,6 +199,7 @@ impl Thread {
             num_fds: 0,
             fds: [-1; MAX_FDS],
             cpu_state: CpuState::empty(),
+            is_64bit: false,
             symbols: None,
         }
     }
@@ -232,9 +272,16 @@ pub fn create_thread(parent: Option<&Thread>, page_dir: u64, is_process: bool) -
     }
 }
 
-/// Initialize a thread as a user process
+/// Initialize a thread as a 32-bit user process
 pub fn init_process_thread(thread: &mut Thread, entry: u32, stack: u32) {
+    thread.is_64bit = false;
     thread.cpu_state.init_user_process(entry, stack);
+}
+
+/// Initialize a thread as a 64-bit user process
+pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
+    thread.is_64bit = true;
+    thread.cpu_state.init_user_process_64(entry, stack);
 }
 
 /// Save current CPU state to thread
@@ -294,24 +341,51 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
     unsafe {
         thread.state = ThreadState::Running;
 
-        // Switch address space
-        thread.root.activate();
+        let in_long_mode = crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat;
+
+        // Switch address space and CPU mode if needed
+        if thread.is_64bit {
+            if !in_long_mode {
+                // Switch from protected mode to long mode (compat)
+                let cr3 = crate::paging2::pml4_cr3(&thread.root);
+                crate::descriptors::toggle_mode(cr3);
+            } else {
+                // Already in long mode — just update PML4[0] and reload CR3
+                crate::x86::write_cr3(crate::paging2::pml4_cr3(&thread.root));
+            }
+        } else {
+            if in_long_mode {
+                // Switch from long mode back to protected mode
+                crate::descriptors::toggle_mode(thread.root.cr3());
+            } else {
+                // Already in protected mode
+                thread.root.activate();
+            }
+        }
 
         // Update kernel stack in TSS for this thread
-        let stack_top = (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024) as u32;
-        set_kernel_stack(stack_top);
+        let stack_top = (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024);
+        if thread.is_64bit {
+            crate::descriptors::set_kernel_stack_64(stack_top as u64);
+        } else {
+            set_kernel_stack(stack_top as u32);
+        }
 
         CURRENT_THREAD = thread;
 
+        println!("-> tid {} EIP={:#x} EAX={:#x}", thread.tid,
+            unsafe { thread.cpu_state.frame.f32.eip },
+            thread.cpu_state.rax);
+
         // Exit to user mode via iret
-        exit_kernel(&thread.cpu_state);
+        exit_kernel(&thread.cpu_state, thread.is_64bit as u32);
     }
 }
 
 // Exit kernel and return to user mode
 // Implemented in entry.asm
 unsafe extern "C" {
-    fn exit_kernel(cpu_state: *const CpuState) -> !;
+    fn exit_kernel(cpu_state: *const CpuState, is_64bit: u32) -> !;
 }
 
 /// Exit current thread and schedule next

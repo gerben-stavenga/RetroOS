@@ -1,4 +1,4 @@
-//! ELF executable parsing for 32-bit x86
+//! ELF executable parsing for 32-bit and 64-bit x86
 
 /// ELF magic number: "\x7FELF"
 pub const ELF_MAGIC: u32 = 0x464C_457F;
@@ -11,9 +11,20 @@ pub const SHT_STRTAB: u32 = 3;
 pub const STT_NOTYPE: u8 = 0;
 pub const STT_FUNC: u8 = 2;
 
-/// ELF header (52 bytes for 32-bit)
+/// ELF class
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElfClass {
+    Elf32,
+    Elf64,
+}
+
+// =============================================================================
+// ELF32 structures
+// =============================================================================
+
+/// ELF32 header (52 bytes)
 #[repr(C, packed)]
-pub struct ElfHeader {
+pub struct ElfHeader32 {
     pub magic: u32,
     pub elf: [u8; 12],
     pub typ: u16,
@@ -31,9 +42,9 @@ pub struct ElfHeader {
     pub shstrndx: u16,
 }
 
-/// Program header (32 bytes for 32-bit)
+/// ELF32 program header (32 bytes)
 #[repr(C, packed)]
-pub struct ProgramHeader {
+pub struct ProgramHeader32 {
     pub typ: u32,
     pub off: u32,
     pub vaddr: u32,
@@ -43,6 +54,119 @@ pub struct ProgramHeader {
     pub flags: u32,
     pub align: u32,
 }
+
+/// ELF32 section header (40 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SectionHeader32 {
+    pub name: u32,
+    pub typ: u32,
+    pub flags: u32,
+    pub addr: u32,
+    pub offset: u32,
+    pub size: u32,
+    pub link: u32,
+    pub info: u32,
+    pub addralign: u32,
+    pub entsize: u32,
+}
+
+/// ELF32 symbol table entry (16 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Sym32 {
+    pub name: u32,
+    pub value: u32,
+    pub size: u32,
+    pub info: u8,
+    pub other: u8,
+    pub shndx: u16,
+}
+
+impl Sym32 {
+    pub fn typ(&self) -> u8 { self.info & 0xf }
+}
+
+// =============================================================================
+// ELF64 structures
+// =============================================================================
+
+/// ELF64 header (64 bytes)
+#[repr(C, packed)]
+pub struct ElfHeader64 {
+    pub magic: u32,
+    pub elf: [u8; 12],
+    pub typ: u16,
+    pub machine: u16,
+    pub version: u32,
+    pub entry: u64,
+    pub phoff: u64,
+    pub shoff: u64,
+    pub flags: u32,
+    pub ehsize: u16,
+    pub phentsize: u16,
+    pub phnum: u16,
+    pub shentsize: u16,
+    pub shnum: u16,
+    pub shstrndx: u16,
+}
+
+/// ELF64 program header (56 bytes) — note flags moved before offset
+#[repr(C, packed)]
+pub struct ProgramHeader64 {
+    pub typ: u32,
+    pub flags: u32,
+    pub off: u64,
+    pub vaddr: u64,
+    pub paddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
+/// ELF64 section header (64 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SectionHeader64 {
+    pub name: u32,
+    pub typ: u32,
+    pub flags: u64,
+    pub addr: u64,
+    pub offset: u64,
+    pub size: u64,
+    pub link: u32,
+    pub info: u32,
+    pub addralign: u64,
+    pub entsize: u64,
+}
+
+/// ELF64 symbol table entry (24 bytes) — note reordered fields
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Sym64 {
+    pub name: u32,
+    pub info: u8,
+    pub other: u8,
+    pub shndx: u16,
+    pub value: u64,
+    pub size: u64,
+}
+
+impl Sym64 {
+    pub fn typ(&self) -> u8 { self.info & 0xf }
+}
+
+// =============================================================================
+// Backwards-compatible type aliases
+// =============================================================================
+
+pub type ElfHeader = ElfHeader32;
+pub type ProgramHeader = ProgramHeader32;
+pub type SectionHeader = SectionHeader32;
+
+// =============================================================================
+// Common types
+// =============================================================================
 
 /// Program header types
 pub const PT_LOAD: u32 = 1;
@@ -63,99 +187,115 @@ pub enum ElfError {
     OutOfMemory,
 }
 
-/// Parsed ELF file
+// =============================================================================
+// Unified parser
+// =============================================================================
+
+/// Parsed ELF file (32-bit or 64-bit)
 pub struct Elf<'a> {
     data: &'a [u8],
-    header: &'a ElfHeader,
+    class: ElfClass,
 }
 
 impl<'a> Elf<'a> {
-    /// Parse an ELF file from raw bytes
+    /// Parse an ELF file from raw bytes (accepts both ELF32 and ELF64)
     pub fn parse(data: &'a [u8]) -> Result<Self, ElfError> {
-        if data.len() < core::mem::size_of::<ElfHeader>() {
+        if data.len() < 16 {
             return Err(ElfError::InvalidMagic);
         }
 
-        let header = unsafe { &*(data.as_ptr() as *const ElfHeader) };
-
-        if header.magic != ELF_MAGIC {
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if magic != ELF_MAGIC {
             return Err(ElfError::InvalidMagic);
         }
-        if header.elf[0] != 1 {
-            return Err(ElfError::InvalidClass);
-        }
-        if header.elf[1] != 1 {
+        if data[5] != 1 {
             return Err(ElfError::InvalidEndian);
         }
-        if header.typ != 2 {
+
+        let class = match data[4] {
+            1 => ElfClass::Elf32,
+            2 => ElfClass::Elf64,
+            _ => return Err(ElfError::InvalidClass),
+        };
+
+        // Validate header size
+        let min_size = match class {
+            ElfClass::Elf32 => core::mem::size_of::<ElfHeader32>(),
+            ElfClass::Elf64 => core::mem::size_of::<ElfHeader64>(),
+        };
+        if data.len() < min_size {
+            return Err(ElfError::InvalidMagic);
+        }
+
+        // Validate type (must be ET_EXEC=2) and machine
+        let (typ, machine) = match class {
+            ElfClass::Elf32 => {
+                let h = unsafe { &*(data.as_ptr() as *const ElfHeader32) };
+                (h.typ, h.machine)
+            }
+            ElfClass::Elf64 => {
+                let h = unsafe { &*(data.as_ptr() as *const ElfHeader64) };
+                (h.typ, h.machine)
+            }
+        };
+
+        if typ != 2 {
             return Err(ElfError::InvalidType);
         }
-        if header.machine != 3 {
+        let expected_machine = match class {
+            ElfClass::Elf32 => 3,     // EM_386
+            ElfClass::Elf64 => 0x3E,  // EM_X86_64
+        };
+        if machine != expected_machine {
             return Err(ElfError::InvalidMachine);
         }
 
-        Ok(Self { data, header })
+        Ok(Self { data, class })
     }
 
-    /// Get entry point address
-    pub fn entry(&self) -> u32 {
-        self.header.entry
+    /// ELF class (32-bit or 64-bit)
+    pub fn class(&self) -> ElfClass {
+        self.class
+    }
+
+    /// Entry point address
+    pub fn entry(&self) -> u64 {
+        match self.class {
+            ElfClass::Elf32 => {
+                let h = unsafe { &*(self.data.as_ptr() as *const ElfHeader32) };
+                h.entry as u64
+            }
+            ElfClass::Elf64 => {
+                let h = unsafe { &*(self.data.as_ptr() as *const ElfHeader64) };
+                h.entry
+            }
+        }
     }
 
     /// Iterate over loadable program segments
     pub fn segments(&self) -> SegmentIter<'a> {
-        SegmentIter {
-            data: self.data,
-            offset: self.header.phoff as usize,
-            size: self.header.phentsize as usize,
-            count: self.header.phnum as usize,
-            index: 0,
-        }
+        let (offset, size, count) = match self.class {
+            ElfClass::Elf32 => {
+                let h = unsafe { &*(self.data.as_ptr() as *const ElfHeader32) };
+                (h.phoff as usize, h.phentsize as usize, h.phnum as usize)
+            }
+            ElfClass::Elf64 => {
+                let h = unsafe { &*(self.data.as_ptr() as *const ElfHeader64) };
+                (h.phoff as usize, h.phentsize as usize, h.phnum as usize)
+            }
+        };
+        SegmentIter { data: self.data, class: self.class, offset, size, count, index: 0 }
     }
 }
 
 /// Iterator over ELF segments
 pub struct SegmentIter<'a> {
     data: &'a [u8],
+    class: ElfClass,
     offset: usize,
     size: usize,
     count: usize,
     index: usize,
-}
-
-impl<'a> Iterator for SegmentIter<'a> {
-    type Item = Segment<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.count {
-            let ph_start = self.offset + self.index * self.size;
-            self.index += 1;
-
-            if ph_start + core::mem::size_of::<ProgramHeader>() > self.data.len() {
-                continue;
-            }
-
-            let ph = unsafe { &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader) };
-
-            if ph.typ == PT_LOAD {
-                let off = ph.off as usize;
-                let filesz = ph.filesz as usize;
-                let file_data = if filesz > 0 && off + filesz <= self.data.len() {
-                    Some(&self.data[off..off + filesz])
-                } else {
-                    None
-                };
-
-                return Some(Segment {
-                    vaddr: ph.vaddr as usize,
-                    memsz: ph.memsz as usize,
-                    flags: ph.flags,
-                    data: file_data,
-                });
-            }
-        }
-        None
-    }
 }
 
 /// A loadable ELF segment
@@ -176,40 +316,50 @@ impl Segment<'_> {
     }
 }
 
-/// ELF section header (40 bytes for 32-bit)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SectionHeader {
-    pub name: u32,
-    pub typ: u32,
-    pub flags: u32,
-    pub addr: u32,
-    pub offset: u32,
-    pub size: u32,
-    pub link: u32,
-    pub info: u32,
-    pub addralign: u32,
-    pub entsize: u32,
-}
+impl<'a> Iterator for SegmentIter<'a> {
+    type Item = Segment<'a>;
 
-/// ELF symbol table entry (16 bytes for 32-bit)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Sym32 {
-    pub name: u32,
-    pub value: u32,
-    pub size: u32,
-    pub info: u8,
-    pub other: u8,
-    pub shndx: u16,
-}
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.count {
+            let ph_start = self.offset + self.index * self.size;
+            self.index += 1;
 
-impl Sym32 {
-    /// Get symbol type (low 4 bits of info)
-    pub fn typ(&self) -> u8 {
-        self.info & 0xf
+            let (typ, flags, off, vaddr, filesz, memsz) = match self.class {
+                ElfClass::Elf32 => {
+                    if ph_start + core::mem::size_of::<ProgramHeader32>() > self.data.len() {
+                        continue;
+                    }
+                    let ph = unsafe { &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader32) };
+                    (ph.typ, ph.flags, ph.off as usize, ph.vaddr as usize,
+                     ph.filesz as usize, ph.memsz as usize)
+                }
+                ElfClass::Elf64 => {
+                    if ph_start + core::mem::size_of::<ProgramHeader64>() > self.data.len() {
+                        continue;
+                    }
+                    let ph = unsafe { &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader64) };
+                    (ph.typ, ph.flags, ph.off as usize, ph.vaddr as usize,
+                     ph.filesz as usize, ph.memsz as usize)
+                }
+            };
+
+            if typ == PT_LOAD {
+                let file_data = if filesz > 0 && off + filesz <= self.data.len() {
+                    Some(&self.data[off..off + filesz])
+                } else {
+                    None
+                };
+
+                return Some(Segment { vaddr, memsz, flags, data: file_data });
+            }
+        }
+        None
     }
 }
+
+// =============================================================================
+// Symbol table (32-bit only for now)
+// =============================================================================
 
 /// Parsed symbol table - references into original ELF data
 pub struct SymbolTable<'a> {
@@ -218,13 +368,13 @@ pub struct SymbolTable<'a> {
 }
 
 impl<'a> SymbolTable<'a> {
-    /// Parse symbol table from ELF data
+    /// Parse symbol table from ELF32 data
     pub fn parse(elf_data: &'a [u8]) -> Option<Self> {
         if elf_data.len() < 52 {
             return None;
         }
 
-        let header = unsafe { &*(elf_data.as_ptr() as *const ElfHeader) };
+        let header = unsafe { &*(elf_data.as_ptr() as *const ElfHeader32) };
         if header.magic != ELF_MAGIC {
             return None;
         }
@@ -238,14 +388,14 @@ impl<'a> SymbolTable<'a> {
         }
 
         // Get section headers
-        let sh_size = core::mem::size_of::<SectionHeader>();
+        let sh_size = core::mem::size_of::<SectionHeader32>();
         if shoff + shnum * sh_size > elf_data.len() {
             return None;
         }
 
         let sections = unsafe {
             core::slice::from_raw_parts(
-                elf_data.as_ptr().add(shoff) as *const SectionHeader,
+                elf_data.as_ptr().add(shoff) as *const SectionHeader32,
                 shnum
             )
         };
@@ -260,8 +410,8 @@ impl<'a> SymbolTable<'a> {
         let shstrtab_data = &elf_data[shstrtab_off..shstrtab_off + shstrtab_size];
 
         // Find .symtab and .strtab
-        let mut symtab: Option<&SectionHeader> = None;
-        let mut strtab: Option<&SectionHeader> = None;
+        let mut symtab: Option<&SectionHeader32> = None;
+        let mut strtab: Option<&SectionHeader32> = None;
 
         for section in sections {
             let name_offset = section.name as usize;
