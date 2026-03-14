@@ -13,16 +13,19 @@ SECTIONS
 
     .text ALIGN(4K) : {
         *(.text .text.*)
+        *(.trampoline)
         KEEP(*(.note*))
     }
+
+    . = ALIGN(4K);
     _etext = .;
 
     .rodata ALIGN(4K) : {
         *(.rodata .rodata.*)
     }
-    _erodata = .;
 
-    /* Read-only section ends here */
+    . = ALIGN(4K);
+    _erodata = .;
     _data = .;
 
     .data ALIGN(4K) : {

@@ -73,9 +73,6 @@ pub const PAGE_TABLE_BASE: usize = 0xC000_0000;
 /// Page index where page tables start (PAGE_TABLE_BASE / PAGE_SIZE)
 pub const PAGE_TABLE_BASE_IDX: usize = PAGE_TABLE_BASE / PAGE_SIZE;
 
-/// PML4 region for long mode page tables (PDPT[4], 2MB)
-pub const PML4_BASE: usize = 0xC080_0000;
-
 /// Low memory (first 1MB) mapped here for VGA, BIOS, etc. (PDPT[5] first half)
 pub const LOW_MEM_BASE: usize = 0xC0A0_0000;
 
@@ -341,20 +338,15 @@ impl KernelPages {
 static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
 /// Set up long mode page tables (call after enable_pae)
-/// Links PML4[0] = PDPT and PDPT[4] = PML4
+/// Sets PML4[0] = PDPT so long mode uses same address space.
+/// Note: vroot[4] (pt_pml4) is NOT overwritten — the PML4 page must not
+/// double as a page table, otherwise demand paging writes PTEs into it
+/// and corrupts PML4 entries.
 pub fn setup_long_mode_tables() {
     let pdpt_phys = crate::x86::read_cr3() as u64;
-    let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
 
     // PML4[0] = PDPT (so long mode uses same mappings)
     unsafe { PML4[0] = Entry64::new(pdpt_phys >> 12, true, true); }
-
-    // PDPT[4] = PML4 (so we can access PML4 via PML4_BASE)
-    // PDPT is at entries[0xC0600] (address 0xC0603000)
-    // Note: this is only called in PAE mode
-    if let Entries::E64(e) = entries() {
-        e[0xC0600 + 4] = Entry64::new(pml4_phys >> 12, true, false);
-    }
 }
 
 /// Update PML4[0] to point to a process's virtual root PDPT and return
@@ -406,13 +398,16 @@ pub fn populate_pdpt_from(root_phys: u64, pdpt: &mut [u64; 4]) {
     let root = root_base();
     let user_count = recursive_idx() - root;
 
+    crate::println!("populate_pdpt_from: root_phys={:#x} root_page={:#x} user_count={}", root_phys, root_page, user_count);
+
     // Read child's virtual root to find shared PDs
     let mut old_pds = [0u64; 3];
     temp_map(root_page);
     unsafe {
-        let src = TEMP_MAP_VADDR as *const Entry64;
+        let src = temp_map_vaddr() as *const Entry64;
         for i in 0..user_count.min(3) {
             let entry = *src.add(i);
+            crate::println!("  vroot[{}]: {:#018x}", i, entry.0);
             if entry.present() {
                 old_pds[i] = entry.page();
             }
@@ -436,14 +431,14 @@ pub fn populate_pdpt_from(root_phys: u64, pdpt: &mut [u64; 4]) {
     // Update child's virtual root with deshared PDs, then read for hw PDPT
     temp_map(root_page);
     unsafe {
-        let dst = TEMP_MAP_VADDR as *mut Entry64;
+        let dst = temp_map_vaddr() as *mut Entry64;
         for i in 0..user_count.min(3) {
             if new_pds[i] != 0 {
                 *dst.add(i) = Entry64::new(new_pds[i], true, true);
             }
         }
         // Read final entries for hardware PDPT (sanitize: R/W=0, U/S=0)
-        let src = TEMP_MAP_VADDR as *const Entry64;
+        let src = temp_map_vaddr() as *const Entry64;
         for i in 0..4 {
             let mut entry = *src.add(i);
             entry.set_hw_writable(false);
@@ -606,8 +601,14 @@ pub fn current_root_phys() -> u64 {
     }
 }
 
-/// Flush TLB
+/// Flush TLB. In PAE mode, also syncs the hardware PDPT from the virtual root
+/// before reloading CR3 (the PDPT is an extension of CR3 in PAE).
 pub fn flush_tlb() {
+    if cpu_mode() == CpuMode::Pae {
+        if let Some(thread) = crate::thread::current() {
+            populate_pdpt(unsafe { &mut thread.root.pdpt });
+        }
+    }
     crate::x86::flush_tlb();
 }
 
@@ -647,17 +648,13 @@ pub fn finish_setup_paging() {
             }
 
             remove_identity_mapping(e);
+            crate::println!("Identity mapping removed");
 
-            // Re-establish identity mapping for trampoline page using SCRATCH
-            if lm {
-                let scratch_vaddr = unsafe { &raw const crate::SCRATCH } as usize;
-                let scratch_page = physical_page(scratch_vaddr);
-                map_trampoline(e, scratch_page);
-            }
-
-            if cpu_supports_nx() {
-                enable_nx();
-            }
+            // NX disabled for now — causes RSVD faults in long mode
+            // if cpu_supports_nx() {
+            //     enable_nx();
+            //     crate::println!("NX enabled");
+            // }
             harden_kernel(e);
             flush_tlb();
         }
@@ -822,31 +819,47 @@ pub fn enable_paging(kpages: *mut KernelPages, scratch: *mut RawPage, kernel_phy
 // Temporary mapping for fork operations
 // =============================================================================
 
-/// Temporary mapping address (first entry of PML4 region, unused)
-/// In legacy: pt_kernel[0] maps this. In PAE: pt_pml4[0] maps this.
-/// Both are KERNEL_PAGES.pages[1], entry 0.
-const TEMP_MAP_VADDR: usize = PML4_BASE;  // 0xC0800000
-
-/// Pointer to the page table that controls TEMP_MAP_VADDR
-/// This is KERNEL_PAGES.pages[1] (pt_kernel for legacy, pt_pml4 for PAE)
+/// Pointer to the page table page that controls the temp mapping
 static mut TEMP_MAP_PT: *mut RawPage = core::ptr::null_mut();
 
+/// Entry index within TEMP_MAP_PT
+static mut TEMP_MAP_ENTRY: usize = 0;
+
+/// Temp mapping virtual address (set by init_temp_map)
+static mut TEMP_MAP_VADDR_MUT: usize = 0;
+
+fn temp_map_vaddr() -> usize {
+    unsafe { TEMP_MAP_VADDR_MUT }
+}
+
 /// Initialize temp mapping (call after paging enabled, before fork)
+///
+/// Uses the last entry of pt_kernel in both modes.
+/// Legacy: pt_kernel = pages[1], 1024 entries, last entry VA = 0xC0BFF000
+/// PAE:    pt_kernel = pages[2],  512 entries, last entry VA = 0xC0BFF000
 pub fn init_temp_map() {
     unsafe {
-        TEMP_MAP_PT = &raw mut crate::KERNEL_PAGES.pages[1];
+        if is_pae() {
+            TEMP_MAP_PT = &raw mut crate::KERNEL_PAGES.pages[2];
+            TEMP_MAP_ENTRY = entries_per_page::<Entry64>() - 1;
+        } else {
+            TEMP_MAP_PT = &raw mut crate::KERNEL_PAGES.pages[1];
+            TEMP_MAP_ENTRY = entries_per_page::<Entry32>() - 1;
+        }
+        TEMP_MAP_VADDR_MUT = 0xC0BFF000;
     }
 }
 
-/// Map a physical page at TEMP_MAP_VADDR
+/// Map a physical page at the temp mapping address
 fn temp_map(phys_page: u64) {
     unsafe {
+        let idx = TEMP_MAP_ENTRY;
         if is_pae() {
             let pt = TEMP_MAP_PT as *mut Entry64;
-            *pt = Entry64::new(phys_page, true, false);
+            *pt.add(idx) = Entry64::new(phys_page, true, false);
         } else {
             let pt = TEMP_MAP_PT as *mut Entry32;
-            *pt = Entry32::new(phys_page, true, false);
+            *pt.add(idx) = Entry32::new(phys_page, true, false);
         }
     }
     flush_tlb();
@@ -855,12 +868,13 @@ fn temp_map(phys_page: u64) {
 /// Unmap the temp mapping
 fn temp_unmap() {
     unsafe {
+        let idx = TEMP_MAP_ENTRY;
         if is_pae() {
             let pt = TEMP_MAP_PT as *mut Entry64;
-            *pt = Entry64::default();
+            *pt.add(idx) = Entry64::default();
         } else {
             let pt = TEMP_MAP_PT as *mut Entry32;
-            *pt = Entry32::default();
+            *pt.add(idx) = Entry32::default();
         }
     }
     flush_tlb();
@@ -910,7 +924,7 @@ fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
     // Patch recursive entry in new copy to point to itself
     temp_map(new_root);
     unsafe {
-        let dst = TEMP_MAP_VADDR as *mut E;
+        let dst = temp_map_vaddr() as *mut E;
         let user_count = rec_idx - root_base();
         *dst.add(user_count) = E::new(new_root, true, false);
     }
@@ -958,7 +972,7 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
     // Copy parent -> child via temp_map, marking user entries R/O
     temp_map(new_phys);
     unsafe {
-        let dst = TEMP_MAP_VADDR as *mut E;
+        let dst = temp_map_vaddr() as *mut E;
         for i in 0..epp {
             let mut e = entries[child_base + i];
             if e.present() && i < user_count {
@@ -972,7 +986,7 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
     // Mark parent user entries R/O and inc ref counts via temp_map
     temp_map(parent_phys);
     unsafe {
-        let src = TEMP_MAP_VADDR as *mut E;
+        let src = temp_map_vaddr() as *mut E;
         for i in 0..user_count {
             let e = &mut *src.add(i);
             if e.present() {
@@ -1025,7 +1039,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         temp_map(p);
         unsafe {
             let src = (idx * PAGE_SIZE) as *const u8;
-            let dst = TEMP_MAP_VADDR as *mut u8;
+            let dst = temp_map_vaddr() as *mut u8;
             core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
         }
         temp_unmap();
@@ -1042,18 +1056,6 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
 // Free user pages
 // =============================================================================
 
-/// Free all user pages in current address space.
-///
-/// Recursively walks from root user entries down to leaf pages.
-/// Shared subtrees (ref count > 1) are freed with a single dec-ref.
-/// Sole-owned subtrees are walked and freed page by page.
-pub fn free_user_pages() {
-    match entries() {
-        Entries::E32(e) => free_generic(e),
-        Entries::E64(e) => free_generic(e),
-    }
-}
-
 /// Generic free: walk user root entries, recursively free subtrees.
 fn free_generic<E: Entry>(entries: &mut [E]) {
     let root = root_base();
@@ -1065,6 +1067,22 @@ fn free_generic<E: Entry>(entries: &mut [E]) {
         }
     }
     flush_tlb();
+}
+
+/// Free all user pages in current address space.
+///
+/// Recursively walks from root user entries down to leaf pages.
+/// Shared subtrees (ref count > 1) are freed with a single dec-ref.
+/// Sole-owned subtrees are walked and freed page by page.
+/// Free all user-space pages and page tables.
+pub fn free_user_pages() {
+    match entries() {
+        Entries::E32(e) => free_generic(e),
+        Entries::E64(e) => {
+            free_generic(e);
+            flush_tlb();
+        }
+    }
 }
 
 /// Recursively free a page table subtree rooted at `parent_idx`.
@@ -1113,25 +1131,162 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 pub const TRAMPOLINE_PAGE: usize = 0xF;  // page 15 = address 0xF000
 pub const TRAMPOLINE_ADDR: usize = TRAMPOLINE_PAGE * PAGE_SIZE;
 
-/// Identity-map the trampoline page (0xF000) using SCRATCH as a self-referencing PD+PT.
-/// Must be called after remove_identity_mapping() so the trampoline remains accessible.
-pub fn map_trampoline(entries: &mut [Entry64], scratch_page: u64) {
-    let root = root_base();
-
-    // Access SCRATCH via LOW_MEM_BASE to clear and set up entries
-    let scratch = (LOW_MEM_BASE + scratch_page as usize * PAGE_SIZE) as *mut Entry64;
-    unsafe {
-        // Clear all entries
-        core::ptr::write_bytes(scratch, 0, 512);
-        // PD entry [0]: points to SCRATCH itself as PT (self-referencing)
-        *scratch.add(0) = Entry64::new(scratch_page, true, false);
-        // PT entry [TRAMPOLINE_PAGE]: identity-maps physical 0xF000
-        *scratch.add(TRAMPOLINE_PAGE) = Entry64::new(TRAMPOLINE_PAGE as u64, true, false);
+/// Ensure the trampoline page (VA 0xF000) is identity-mapped to PA 0xF000.
+/// If intermediate page table levels (PDPT[0], PD[0]) don't exist yet,
+/// the write triggers nested page faults that the demand pager resolves.
+pub fn ensure_trampoline_mapped() {
+    if let Entries::E64(e) = entries() {
+        e[TRAMPOLINE_PAGE] = Entry64::new(TRAMPOLINE_PAGE as u64, true, false);
+        crate::x86::invlpg(TRAMPOLINE_ADDR);
     }
+}
 
-    // PDPT[0] = SCRATCH as PD for 0-1GB
-    entries[root] = Entry64::new(scratch_page, true, false);
-    flush_tlb();
+/// Debug: print PML4 state (VA, physical page, PML4[0] contents)
+pub fn debug_pml4() {
+    let pml4_va = unsafe { (&raw const PML4) as usize };
+    let pml4_phys = physical_page(pml4_va);
+    let pml4_0 = unsafe { PML4[0].0 };
+    crate::println!("PML4: va={:#x} phys={:#x} [0]={:#018x}", pml4_va, pml4_phys, pml4_0);
+}
+
+/// Debug: dump page table entries for a virtual address
+pub fn debug_mapping(vaddr: usize) {
+    if let Entries::E64(e) = entries() {
+        let page = page_idx(vaddr);
+        let pde = parent_index::<Entry64>(page);
+        let pdpte = parent_index::<Entry64>(pde);
+        let rec = recursive_idx();
+        crate::println!("mapping {:#x}: page={:#x} pte={:#018x} pde[{:#x}]={:#018x} pdpte[{:#x}]={:#018x} rec[{:#x}]={:#018x}",
+            vaddr, page, e[page].0, pde, e[pde].0, pdpte, e[pdpte].0, rec, e[rec].0);
+    }
+}
+
+/// Debug: simulate long mode 4-level page walk via temp_map.
+/// Reads actual physical page table entries the CPU would see after toggle_mode.
+/// Call BEFORE toggle_mode with the CR3 that will be used.
+pub fn debug_long_walk(cr3: u32, va: usize) {
+    let pml4_page = cr3 as u64 / PAGE_SIZE as u64;
+    let va64 = va as u64;
+
+    // Level 4: PML4
+    let pml4_idx = ((va64 >> 39) & 0x1FF) as usize;
+    let pml4e = read_phys_entry(pml4_page, pml4_idx);
+    crate::println!("LM walk {:#x}:", va);
+    crate::println!("  PML4[{}] @ page {:#x} = {:#018x}", pml4_idx, pml4_page, pml4e);
+    if pml4e & 1 == 0 { crate::println!("  -> NOT PRESENT"); return; }
+    check_reserved(pml4e, "PML4E");
+
+    // Level 3: PDPT
+    let pdpt_page = (pml4e & Entry64::ADDR_MASK) >> 12;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pdpte = read_phys_entry(pdpt_page, pdpt_idx);
+    crate::println!("  PDPT[{}] @ page {:#x} = {:#018x}", pdpt_idx, pdpt_page, pdpte);
+    if pdpte & 1 == 0 { crate::println!("  -> NOT PRESENT"); return; }
+    if pdpte & 0x80 != 0 { crate::println!("  -> 1GB page"); return; }
+    check_reserved(pdpte, "PDPTE");
+
+    // Level 2: PD
+    let pd_page = (pdpte & Entry64::ADDR_MASK) >> 12;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pde = read_phys_entry(pd_page, pd_idx);
+    crate::println!("  PD[{}] @ page {:#x} = {:#018x}", pd_idx, pd_page, pde);
+    if pde & 1 == 0 { crate::println!("  -> NOT PRESENT"); return; }
+    if pde & 0x80 != 0 { crate::println!("  -> 2MB page"); return; }
+    check_reserved(pde, "PDE");
+
+    // Level 1: PT
+    let pt_page = (pde & Entry64::ADDR_MASK) >> 12;
+    let pt_idx = (va >> 12) & 0x1FF;
+    let pte = read_phys_entry(pt_page, pt_idx);
+    crate::println!("  PT[{}] @ page {:#x} = {:#018x}", pt_idx, pt_page, pte);
+    if pte & 1 == 0 { crate::println!("  -> NOT PRESENT"); return; }
+    check_reserved(pte, "PTE");
+    crate::println!("  -> phys page {:#x}", (pte & Entry64::ADDR_MASK) >> 12);
+}
+
+/// Read a single 64-bit entry from a physical page via temp_map (public wrapper)
+pub fn read_phys_entry_pub(phys_page: u64, idx: usize) -> u64 {
+    read_phys_entry(phys_page, idx)
+}
+
+/// Read a single 64-bit entry from a physical page via temp_map
+fn read_phys_entry(phys_page: u64, idx: usize) -> u64 {
+    temp_map(phys_page);
+    let val = unsafe {
+        let ptr = temp_map_vaddr() as *const u64;
+        *ptr.add(idx)
+    };
+    temp_unmap();
+    val
+}
+
+/// Check if a page table entry has likely reserved bits set (bits 52-62 or high phys)
+fn check_reserved(entry: u64, level: &str) {
+    // Bits beyond ADDR_MASK that aren't NX (bit 63) or known flags
+    let addr_bits = entry & 0x000F_FFFF_FFFF_F000;
+    // Check if physical address seems unreasonably high (> 16GB suggests corruption)
+    if addr_bits > 0x4_0000_0000 {
+        crate::println!("  !!! {} phys addr {:#x} seems too high", level, addr_bits);
+    }
+    // Check bits 52-62 (available in AMD64, but some may be reserved on specific CPUs)
+    let avail_bits = (entry >> 52) & 0x7FF;
+    if avail_bits != 0 {
+        crate::println!("  !!! {} bits 52-62 = {:#x}", level, avail_bits);
+    }
+}
+
+/// Debug: walk the kernel page table (PD[5]) in long mode and check all entries
+pub fn debug_long_walk_pt(cr3: u32) {
+    let pml4_page = cr3 as u64 / PAGE_SIZE as u64;
+
+    // PML4[0] → vroot
+    let pml4e = read_phys_entry(pml4_page, 0);
+    let vroot_page = (pml4e & Entry64::ADDR_MASK) >> 12;
+
+    // vroot[3] → vroot (recursive, used as PD)
+    let pdpte3 = read_phys_entry(vroot_page, 3);
+    let pd_page = (pdpte3 & Entry64::ADDR_MASK) >> 12;
+
+    // PD[5] → pt_kernel
+    let pde5 = read_phys_entry(pd_page, 5);
+    let pt_page = (pde5 & Entry64::ADDR_MASK) >> 12;
+
+    crate::println!("LM kernel PT @ page {:#x} (PML4[0]={:#018x} PDPT[3]={:#018x} PD[5]={:#018x}):",
+        pt_page, pml4e, pdpte3, pde5);
+
+    // Check all 512 PT entries
+    temp_map(pt_page);
+    unsafe {
+        let pt = temp_map_vaddr() as *const u64;
+        for i in 0..512 {
+            let pte = *pt.add(i);
+            if pte & 1 != 0 {
+                // Check NX bit (bit 63) on an executable page
+                let nx = pte & (1u64 << 63) != 0;
+                let phys = (pte & Entry64::ADDR_MASK) >> 12;
+                let rsvd = (pte >> 52) & 0x7FF;
+                // Show all kernel entries (index 256+) and any flagged entries
+                if i >= 256 || nx || rsvd != 0 || phys > 0x100000 {
+                    crate::println!("  PT[{}]: {:#018x}", i, pte);
+                }
+            }
+        }
+    }
+    temp_unmap();
+
+    // Also check PD entries (vroot used as PD via recursion)
+    crate::println!("LM PD (vroot) entries:");
+    temp_map(vroot_page);
+    unsafe {
+        let pd = temp_map_vaddr() as *const u64;
+        for i in 0..8 {
+            let pde = *pd.add(i);
+            if pde != 0 {
+                crate::println!("  vroot[{}]: {:#018x}", i, pde);
+            }
+        }
+    }
+    temp_unmap();
 }
 
 /// Copy trampoline code to physical address 0xF000

@@ -123,6 +123,9 @@ pub fn startup(start_sector: u32) -> ! {
 
     println!("Entry point: {:#x}", loaded.entry);
 
+    // Ensure trampoline is identity-mapped so all forked processes inherit it
+    crate::paging2::ensure_trampoline_mapped();
+
     let stack = PAGE_TABLE_BASE as u32;
     println!("User stack: {:#x}", stack);
 
@@ -134,6 +137,13 @@ pub fn startup(start_sector: u32) -> ! {
     init_thread.symbols = symbols;
     thread::init_process_thread(init_thread, loaded.entry as u32, stack);
 
+    // Debug: check thread's pdpt vs boot pdpt
+    println!("Thread CR3: {:#x}", init_thread.root.cr3());
+    if let Some(pdpt) = unsafe { init_thread.root.pdpt_mut() } {
+        for i in 0..4 {
+            println!("  pdpt[{}]: {:#018x}", i, pdpt[i]);
+        }
+    }
     println!("Starting init process...");
 
     // Switch to init thread (doesn't return)

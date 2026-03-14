@@ -1,6 +1,6 @@
 //! Stack trace support via frame pointer walking
 //!
-//! Walks the EBP chain to produce a backtrace. Requires frame pointers
+//! Walks the EBP/RBP chain to produce a backtrace. Requires frame pointers
 //! to be preserved (-Cforce-frame-pointers=yes).
 
 extern crate alloc;
@@ -12,6 +12,7 @@ use core::arch::asm;
 use lib::elf::{SymbolTable, STT_FUNC};
 
 /// Owned symbol data - keeps ELF data alive for SymbolTable references
+#[derive(Clone)]
 pub struct SymbolData {
     elf_data: Box<[u8]>,
 }
@@ -29,7 +30,7 @@ impl SymbolData {
     }
 
     /// Look up a symbol by address
-    pub fn lookup(&self, addr: u32) -> (&str, u32) {
+    pub fn lookup(&self, addr: u64) -> (&str, u64) {
         // SAFETY: elf_data is owned by self and won't move
         let elf_ref: &[u8] = unsafe {
             core::slice::from_raw_parts(self.elf_data.as_ptr(), self.elf_data.len())
@@ -45,9 +46,7 @@ impl SymbolData {
     pub fn symbol_count(&self) -> (usize, usize) {
         let elf_ref: &[u8] = &self.elf_data;
         if let Some(table) = SymbolTable::parse(elf_ref) {
-            let total = table.symbols().len();
-            let funcs = table.symbols().iter().filter(|s| s.typ() == STT_FUNC).count();
-            (total, funcs)
+            (table.symbol_count(), table.func_count())
         } else {
             (0, 0)
         }
@@ -98,53 +97,81 @@ pub fn stack_trace() {
     unsafe {
         asm!("mov {}, ebp", out(reg) bp);
     }
-    stack_trace_from(bp);
+    stack_trace_from(bp as u32);
 }
 
-/// Print a stack trace starting from a specific frame pointer
-pub fn stack_trace_from(mut bp: usize) {
-    // Skip the first frame (this function)
+/// Print a stack trace starting from a specific frame pointer.
+///
+/// Always starts walking 32-bit kernel frames (ebp chain with 4-byte pairs).
+/// When the return IP drops below KERNEL_BASE, we've crossed the entry.asm
+/// mock frame into user space. At that point, if the current thread is 64-bit,
+/// we switch to 64-bit frame walking (rbp/rip pairs of 8 bytes each).
+pub fn stack_trace_from(mut bp: u32) {
+    unsafe extern "C" { fn ret_from_64(); }
+    let ret_from_64 = ret_from_64 as u32;
+
+    // Skip the first frame (this function / trap handler)
     if bp != 0 {
-        let frame = bp as *const usize;
-        unsafe {
-            bp = *frame;
-        }
+        let frame = bp as *const u32;
+        unsafe { bp = *frame; }
     }
 
     println!("Stack trace:");
 
     let mut depth = 0;
     const MAX_DEPTH: usize = 20;
-
-    // Kernel stack bounds (approximate)
-    const KERNEL_STACK_LOW: usize = 0xC0000000;
-    const KERNEL_STACK_HIGH: usize = 0xD0000000;
+    let mut user_64 = false;
 
     while bp != 0 && depth < MAX_DEPTH {
-        // Validate frame pointer is in reasonable kernel memory range
-        if bp < KERNEL_STACK_LOW || bp >= KERNEL_STACK_HIGH {
+        if bp < 0x1000 {
             break;
         }
 
-        let frame = bp as *const usize;
+        if user_64 {
+            // 64-bit user frames: [rbp(8), rip(8)]
+            let frame = bp as usize as *const u64;
+            let (next_bp, ip) = unsafe { (*frame, *frame.add(1)) };
 
-        let (next_bp, ip) = unsafe {
-            (*frame, *frame.add(1))
-        };
+            if ip == 0 || ip < 0x1000 {
+                break;
+            }
 
-        if ip == 0 || ip < 0x1000 {
-            break;
+            let (name, offset) = lookup_symbol(ip);
+            print!("  {:2}: {:#010x}", depth, ip);
+            if !name.is_empty() {
+                print!(" {}+{:#x}", rustc_demangle::demangle(name), offset);
+            }
+            println!();
+
+            bp = next_bp as u32;
+        } else {
+            // 32-bit frames: [ebp(4), eip(4)]
+            let frame = bp as *const u32;
+            let (next_bp, ip) = unsafe { (*frame, *frame.add(1) as u64) };
+
+            if ip == 0 || ip < 0x1000 {
+                break;
+            }
+
+            // Detect call_isr_handler returning to 64-bit trampoline:
+            // the next frame is the mock frame with 64-bit [rbp(8), rip(8)]
+            if ip == ret_from_64 as u64 {
+                user_64 = true;
+                bp = next_bp;
+                depth += 1;
+                continue;
+            }
+
+            let (name, offset) = lookup_symbol(ip);
+            print!("  {:2}: {:#010x}", depth, ip);
+            if !name.is_empty() {
+                print!(" {}+{:#x}", rustc_demangle::demangle(name), offset);
+            }
+            println!();
+
+            bp = next_bp;
         }
 
-        let (name, offset) = lookup_symbol(ip as u32);
-
-        print!("  {:2}: {:#010x}", depth, ip);
-        if !name.is_empty() {
-            print!(" {}+{:#x}", rustc_demangle::demangle(name), offset);
-        }
-        println!();
-
-        bp = next_bp;
         depth += 1;
     }
 
@@ -157,8 +184,8 @@ pub fn stack_trace_from(mut bp: usize) {
 const KERNEL_BASE: u32 = 0xC000_0000;
 
 /// Look up a symbol name for an address
-fn lookup_symbol(addr: u32) -> (&'static str, u32) {
-    if addr >= KERNEL_BASE {
+fn lookup_symbol(addr: u64) -> (&'static str, u64) {
+    if addr >= KERNEL_BASE as u64 {
         // Kernel address - use kernel symbols
         let sym_data = unsafe { (*kernel_symbols_ptr()).as_ref() };
         if let Some(data) = sym_data {

@@ -358,113 +358,149 @@ impl<'a> Iterator for SegmentIter<'a> {
 }
 
 // =============================================================================
-// Symbol table (32-bit only for now)
+// Symbol table (32-bit and 64-bit)
 // =============================================================================
 
-/// Parsed symbol table - references into original ELF data
+/// Find .symtab and .strtab section offsets/sizes from section headers.
+/// Returns (sym_off, sym_size, str_off, str_size).
+fn find_symtab_strtab(
+    elf_data: &[u8],
+    shoff: usize,
+    shnum: usize,
+    shstrndx: usize,
+    sh_entry_size: usize,
+    // Closures to extract fields from section headers of either width
+    get_name: fn(&[u8]) -> u32,
+    get_typ: fn(&[u8]) -> u32,
+    get_offset: fn(&[u8]) -> usize,
+    get_size: fn(&[u8]) -> usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if shoff == 0 || shnum == 0 || shstrndx >= shnum {
+        return None;
+    }
+    if shoff + shnum * sh_entry_size > elf_data.len() {
+        return None;
+    }
+
+    // Get section header string table
+    let shstrtab_raw = &elf_data[shoff + shstrndx * sh_entry_size..];
+    let shstrtab_off = get_offset(shstrtab_raw);
+    let shstrtab_size = get_size(shstrtab_raw);
+    if shstrtab_off + shstrtab_size > elf_data.len() {
+        return None;
+    }
+    let shstrtab_data = &elf_data[shstrtab_off..shstrtab_off + shstrtab_size];
+
+    let mut sym_result: Option<(usize, usize)> = None;
+    let mut str_result: Option<(usize, usize)> = None;
+
+    for i in 0..shnum {
+        let sh = &elf_data[shoff + i * sh_entry_size..];
+        let name_offset = get_name(sh) as usize;
+        if name_offset >= shstrtab_data.len() { continue; }
+        let name = get_str(shstrtab_data, name_offset);
+        let typ = get_typ(sh);
+        if name == b".symtab" && typ == SHT_SYMTAB {
+            sym_result = Some((get_offset(sh), get_size(sh)));
+        } else if name == b".strtab" && typ == SHT_STRTAB {
+            str_result = Some((get_offset(sh), get_size(sh)));
+        }
+    }
+
+    match (sym_result, str_result) {
+        (Some((so, ss)), Some((ro, rs))) => Some((so, ss, ro, rs)),
+        _ => None,
+    }
+}
+
+/// Parsed symbol table - works with both ELF32 and ELF64
 pub struct SymbolTable<'a> {
-    symbols: &'a [Sym32],
+    syms32: Option<&'a [Sym32]>,
+    syms64: Option<&'a [Sym64]>,
     strtab: &'a [u8],
 }
 
 impl<'a> SymbolTable<'a> {
-    /// Parse symbol table from ELF32 data
+    /// Parse symbol table from ELF data (auto-detects 32/64-bit)
     pub fn parse(elf_data: &'a [u8]) -> Option<Self> {
-        if elf_data.len() < 52 {
-            return None;
+        if elf_data.len() < 16 { return None; }
+        let magic = u32::from_le_bytes([elf_data[0], elf_data[1], elf_data[2], elf_data[3]]);
+        if magic != ELF_MAGIC { return None; }
+
+        let class = elf_data[4];
+        match class {
+            1 => Self::parse32(elf_data),
+            2 => Self::parse64(elf_data),
+            _ => None,
         }
-
-        let header = unsafe { &*(elf_data.as_ptr() as *const ElfHeader32) };
-        if header.magic != ELF_MAGIC {
-            return None;
-        }
-
-        let shoff = header.shoff as usize;
-        let shnum = header.shnum as usize;
-        let shstrndx = header.shstrndx as usize;
-
-        if shoff == 0 || shnum == 0 || shstrndx >= shnum {
-            return None;
-        }
-
-        // Get section headers
-        let sh_size = core::mem::size_of::<SectionHeader32>();
-        if shoff + shnum * sh_size > elf_data.len() {
-            return None;
-        }
-
-        let sections = unsafe {
-            core::slice::from_raw_parts(
-                elf_data.as_ptr().add(shoff) as *const SectionHeader32,
-                shnum
-            )
-        };
-
-        // Get section header string table
-        let shstrtab = &sections[shstrndx];
-        let shstrtab_off = shstrtab.offset as usize;
-        let shstrtab_size = shstrtab.size as usize;
-        if shstrtab_off + shstrtab_size > elf_data.len() {
-            return None;
-        }
-        let shstrtab_data = &elf_data[shstrtab_off..shstrtab_off + shstrtab_size];
-
-        // Find .symtab and .strtab
-        let mut symtab: Option<&SectionHeader32> = None;
-        let mut strtab: Option<&SectionHeader32> = None;
-
-        for section in sections {
-            let name_offset = section.name as usize;
-            if name_offset >= shstrtab_data.len() {
-                continue;
-            }
-
-            let name = get_str(shstrtab_data, name_offset);
-
-            if name == b".symtab" && section.typ == SHT_SYMTAB {
-                symtab = Some(section);
-            } else if name == b".strtab" && section.typ == SHT_STRTAB {
-                strtab = Some(section);
-            }
-        }
-
-        let (sym_section, str_section) = match (symtab, strtab) {
-            (Some(s), Some(t)) => (s, t),
-            _ => return None,
-        };
-
-        // Get symbol table slice
-        let sym_off = sym_section.offset as usize;
-        let sym_size = sym_section.size as usize;
-        let sym_count = sym_size / core::mem::size_of::<Sym32>();
-
-        if sym_off + sym_size > elf_data.len() {
-            return None;
-        }
-
-        let symbols = unsafe {
-            core::slice::from_raw_parts(
-                elf_data.as_ptr().add(sym_off) as *const Sym32,
-                sym_count
-            )
-        };
-
-        // Get string table slice
-        let str_off = str_section.offset as usize;
-        let str_size = str_section.size as usize;
-
-        if str_off + str_size > elf_data.len() {
-            return None;
-        }
-
-        let strtab = &elf_data[str_off..str_off + str_size];
-
-        Some(SymbolTable { symbols, strtab })
     }
 
-    /// Get symbols slice
-    pub fn symbols(&self) -> &[Sym32] {
-        self.symbols
+    fn parse32(elf_data: &'a [u8]) -> Option<Self> {
+        if elf_data.len() < core::mem::size_of::<ElfHeader32>() { return None; }
+        let h = unsafe { &*(elf_data.as_ptr() as *const ElfHeader32) };
+
+        let (sym_off, sym_size, str_off, str_size) = find_symtab_strtab(
+            elf_data, h.shoff as usize, h.shnum as usize, h.shstrndx as usize,
+            core::mem::size_of::<SectionHeader32>(),
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader32)).name },
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader32)).typ },
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader32)).offset as usize },
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader32)).size as usize },
+        )?;
+
+        if sym_off + sym_size > elf_data.len() || str_off + str_size > elf_data.len() {
+            return None;
+        }
+
+        let sym_count = sym_size / core::mem::size_of::<Sym32>();
+        let symbols = unsafe {
+            core::slice::from_raw_parts(elf_data.as_ptr().add(sym_off) as *const Sym32, sym_count)
+        };
+        let strtab = &elf_data[str_off..str_off + str_size];
+
+        Some(SymbolTable { syms32: Some(symbols), syms64: None, strtab })
+    }
+
+    fn parse64(elf_data: &'a [u8]) -> Option<Self> {
+        if elf_data.len() < core::mem::size_of::<ElfHeader64>() { return None; }
+        let h = unsafe { &*(elf_data.as_ptr() as *const ElfHeader64) };
+
+        let (sym_off, sym_size, str_off, str_size) = find_symtab_strtab(
+            elf_data, h.shoff as usize, h.shnum as usize, h.shstrndx as usize,
+            core::mem::size_of::<SectionHeader64>(),
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader64)).name },
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader64)).typ },
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader64)).offset as usize },
+            |s| unsafe { (*(s.as_ptr() as *const SectionHeader64)).size as usize },
+        )?;
+
+        if sym_off + sym_size > elf_data.len() || str_off + str_size > elf_data.len() {
+            return None;
+        }
+
+        let sym_count = sym_size / core::mem::size_of::<Sym64>();
+        let symbols = unsafe {
+            core::slice::from_raw_parts(elf_data.as_ptr().add(sym_off) as *const Sym64, sym_count)
+        };
+        let strtab = &elf_data[str_off..str_off + str_size];
+
+        Some(SymbolTable { syms32: None, syms64: Some(symbols), strtab })
+    }
+
+    /// Total symbol count
+    pub fn symbol_count(&self) -> usize {
+        if let Some(s) = self.syms32 { s.len() }
+        else if let Some(s) = self.syms64 { s.len() }
+        else { 0 }
+    }
+
+    /// Count function symbols
+    pub fn func_count(&self) -> usize {
+        if let Some(s) = self.syms32 {
+            s.iter().filter(|s| s.typ() == STT_FUNC).count()
+        } else if let Some(s) = self.syms64 {
+            s.iter().filter(|s| s.typ() == STT_FUNC).count()
+        } else { 0 }
     }
 
     /// Get string table
@@ -472,38 +508,58 @@ impl<'a> SymbolTable<'a> {
         self.strtab
     }
 
-    /// Look up symbol name by string table offset
-    pub fn symbol_name(&self, sym: &Sym32) -> &'a str {
-        let bytes = get_str(self.strtab, sym.name as usize);
+    fn str_name(&self, name_idx: u32) -> &'a str {
+        let bytes = get_str(self.strtab, name_idx as usize);
         core::str::from_utf8(bytes).unwrap_or("")
     }
 
-    /// Find the symbol containing an address, returns (name, offset)
-    pub fn lookup(&self, addr: u32) -> (&'a str, u32) {
-        let mut best_sym: Option<&Sym32> = None;
-        let mut best_addr: u32 = 0;
-
-        for sym in self.symbols {
-            let typ = sym.typ();
-            if typ != STT_FUNC && typ != STT_NOTYPE {
-                continue;
+    /// Find the function symbol containing a 64-bit address, returns (name, offset).
+    /// Prefers symbols with known size that contain the address over nearest-below
+    /// symbols with size=0.
+    pub fn lookup(&self, addr: u64) -> (&'a str, u64) {
+        if let Some(symbols) = self.syms32 {
+            let addr32 = addr as u32;
+            let mut best: Option<&Sym32> = None;
+            let mut best_addr: u32 = 0;
+            let mut best_has_size = false;
+            for sym in symbols.iter() {
+                let typ = sym.typ();
+                if typ != STT_FUNC && typ != STT_NOTYPE { continue; }
+                if sym.value == 0 || sym.name == 0 { continue; }
+                if sym.value > addr32 { continue; }
+                let has_size = sym.size > 0;
+                if has_size && addr32 > sym.value + sym.size { continue; }
+                if has_size > best_has_size || (has_size == best_has_size && sym.value > best_addr) {
+                    best_addr = sym.value;
+                    best_has_size = has_size;
+                    best = Some(sym);
+                }
             }
-
-            if sym.value == 0 || sym.name == 0 {
-                continue;
+            if let Some(sym) = best {
+                return (self.str_name(sym.name), (addr32 - sym.value) as u64);
             }
-
-            if sym.value <= addr && sym.value > best_addr {
-                best_addr = sym.value;
-                best_sym = Some(sym);
+        } else if let Some(symbols) = self.syms64 {
+            let mut best: Option<&Sym64> = None;
+            let mut best_addr: u64 = 0;
+            let mut best_has_size = false;
+            for sym in symbols.iter() {
+                let typ = sym.typ();
+                if typ != STT_FUNC && typ != STT_NOTYPE { continue; }
+                if sym.value == 0 || sym.name == 0 { continue; }
+                if sym.value > addr { continue; }
+                let has_size = sym.size > 0;
+                if has_size && addr > sym.value + sym.size { continue; }
+                if has_size > best_has_size || (has_size == best_has_size && sym.value > best_addr) {
+                    best_addr = sym.value;
+                    best_has_size = has_size;
+                    best = Some(sym);
+                }
+            }
+            if let Some(sym) = best {
+                return (self.str_name(sym.name), addr - sym.value);
             }
         }
-
-        if let Some(sym) = best_sym {
-            (self.symbol_name(sym), addr - sym.value)
-        } else {
-            ("", 0)
-        }
+        ("", 0)
     }
 }
 

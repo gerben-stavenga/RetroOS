@@ -1,0 +1,14 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "crt",
+    srcs = ["src/lib.rs"],
+    crate_name = "crt",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+        "-Cforce-frame-pointers=yes",
+    ],
+    visibility = ["//visibility:public"],
+)

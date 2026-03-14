@@ -4,6 +4,7 @@ use crate::irq::handle_irq;
 use crate::paging2::{self, RawPage};
 use crate::println;
 use crate::syscalls::dispatch;
+use crate::thread;
 use crate::x86;
 use crate::Regs;
 
@@ -43,12 +44,12 @@ const EXCEPTION_NAMES: [&str; 32] = [
     "Reserved",                 // 31
 ];
 
-/// Panic with register dump
+/// Panic with register dump and stack trace from the faulting frame
 #[track_caller]
 fn panic_with_regs(msg: &str, regs: &Regs) -> ! {
     x86::cli();
-    // Print regs before panic so they appear in output
     println!("{:?}", regs);
+    crate::stacktrace::stack_trace_from(regs.rbp as u32);
     panic!("{}", msg);
 }
 
@@ -150,6 +151,7 @@ fn page_fault(regs: &mut Regs) {
     let write = (error & 2) != 0;
     let user = (error & 4) != 0;
     let instruction_fetch = (error & 0x10) != 0;
+    let access = if instruction_fetch { "fetch" } else if write { "write" } else { "read" };
 
     // Debug: emit fault info via raw debugcon port I/O (no memory allocation)
     unsafe {
@@ -175,6 +177,7 @@ fn page_fault(regs: &mut Regs) {
             segv_current_thread(regs, fault_addr);
             return;
         }
+        println!("Page fault: {} at {:#x} RIP={:#x}", access, fault_addr, regs.ip());
         panic_with_regs("Kernel null pointer dereference", regs);
     }
 
@@ -191,6 +194,7 @@ fn page_fault(regs: &mut Regs) {
                 core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") b);
             }
         }
+        println!("Page fault: {} at {:#x} RIP={:#x}", access, fault_addr, regs.ip());
         panic_with_regs("Kernel fault in kernel range", regs);
     }
 

@@ -95,8 +95,16 @@ entry_wrapper_32:
     mov fs, eax
     mov gs, eax
 
-    ; Call common handler (ESP points to Regs struct)
+    ; Build mock stack frame bridging kernel → user for stack traces
+    ; Regs layout: gs/fs/es/ds (32) + r15-r8 (64) + rdi/rsi/rbp/... (64) + int/err (16) + frame (40)
+    ; Offset to Frame32.eip: 32 + 64 + 64 + 16 + 20 (Frame32._pad) = 196
+    ; Offset to rbp: 32 + 64 + 16 (rdi+rsi) = 112
+    mov eax, esp
+    push dword [eax + 196]  ; user's eip
+    push dword [eax + 112]  ; user's ebp (low 32 bits of rbp)
+    mov ebp, esp
     call call_isr_handler
+    add esp, 8              ; clean up mock frame
 
 exit_interrupt_32:
     ; Restore segment registers
@@ -145,18 +153,13 @@ exit_interrupt_32:
 ; =============================================================================
 ; Common ISR handler call (32-bit)
 ; Called from both 32-bit and 64-bit entry points
-; Input: ESP points to Regs struct
+; Caller sets up mock stack frame (ebp/eip pair), then calls this.
+; Input: EAX = pointer to Regs struct (set by caller before mock frame push)
+; This function has a standard prologue so the frame chain is:
+;   isr_handler → call_isr_handler → mock frame (user ebp/eip)
 ; =============================================================================
 call_isr_handler:
-    mov eax, esp
-    add eax, 4              ; adjust for return address on stack
-
-    ; Setup a mock stack frame for debugging
-    ; Regs layout: gs/fs/es/ds (32) + r15-r8 (64) + rdi/rsi/rbp/... (64) + int/err (16) + frame (40)
-    ; Offset to frame.eip: 32 + 64 + 64 + 16 + 20 (Frame32._pad) = 196
-    ; Offset to rbp: 32 + 64 + 16 (rdi+rsi) = 112
-    push dword [eax + 196]  ; push return eip
-    push dword [eax + 112]  ; push old ebp (low 32 bits of rbp)
+    push ebp
     mov ebp, esp
 
     cld                     ; clear direction flag
@@ -165,7 +168,7 @@ call_isr_handler:
     extern isr_handler
     call isr_handler        ; call Rust interrupt handler
 
-    add esp, 12             ; clean up mock frame and argument
+    leave
     ret
 
 ; =============================================================================
@@ -174,7 +177,23 @@ call_isr_handler:
 ; =============================================================================
 trampoline_64_to_32:
     ; Now in 32-bit mode, ESP = low 32 bits of RSP (points to Regs)
+    ; SS is null (long mode same-privilege interrupt sets SS=0).
+    ; Must load a valid 32-bit data segment before any push/pop.
+    mov ax, 0x10
+    mov ss, ax
+    ; Build mock stack frame with full 64-bit rbp/rip values
+    ; Offset to Frame64.rip: 32 + 64 + 64 + 16 = 176
+    ; Offset to rbp: 112
+    mov eax, esp
+    push dword [eax + 180]  ; user's rip high 32
+    push dword [eax + 176]  ; user's rip low 32
+    push dword [eax + 116]  ; user's rbp high 32
+    push dword [eax + 112]  ; user's rbp low 32
+    mov ebp, esp
     call call_isr_handler
+global ret_from_64
+ret_from_64:
+    add esp, 16             ; clean up mock frame (2x 64-bit values)
     ; Far jump back to 64-bit mode (indirect via memory)
     jmp far [far_ptr_64]
 
@@ -278,6 +297,12 @@ exit_interrupt_64:
 ; =============================================================================
 global toggle_prot_compat
 toggle_prot_compat:
+    push ebp
+    mov ebp, esp
+    push ebx
+    mov ebx, ecx        ; save CR3 in callee-saved ebx
+    mov al, '0'
+    out 0xE9, al
     jmp 0xF000
 
 ; =============================================================================
@@ -340,31 +365,42 @@ global trampoline_start
 global trampoline_end
 [bits 32]
 trampoline_start:
-    ; Save callee-saved register and store new CR3
-    push ebp
-    mov ebp, ecx        ; ECX = new CR3 from fastcall
+    ; ebx = new CR3 (set by toggle_prot_compat)
+    ; stack frame already set up by toggle_prot_compat
 
     ; Disable paging
     mov eax, cr0
     and eax, ~(1 << 31)     ; Clear PG bit
     mov cr0, eax
+    ; paging off — no stack access, only caller-saved regs + ebx
+    mov al, '1'
+    out 0xE9, al              ; paging off
 
     ; Toggle long mode in EFER MSR (clobbers EAX, EDX, ECX)
     mov ecx, 0xC0000080     ; EFER MSR
     rdmsr
     xor eax, (1 << 8)       ; Toggle LME bit
     wrmsr
+    mov al, '2'
+    out 0xE9, al              ; EFER toggled
 
     ; Load new page tables (also flushes TLB)
-    mov cr3, ebp
+    mov cr3, ebx
+    mov al, '3'
+    out 0xE9, al              ; CR3 loaded
 
     ; Enable paging
     mov eax, cr0
     or eax, (1 << 31)       ; Set PG bit
     mov cr0, eax
+    mov al, '4'
+    out 0xE9, al              ; paging on
 
-    ; Restore callee-saved register and return
-    pop ebp
+    ; paging on — stack accessible again
+    pop ebx
+    leave
+    mov al, '5'
+    out 0xE9, al              ; returning
     ret
 
 trampoline_toggle_end:
