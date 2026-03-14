@@ -375,9 +375,12 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
 
         CURRENT_THREAD = thread;
 
-        println!("-> tid {} EIP={:#x} EAX={:#x}", thread.tid,
-            unsafe { thread.cpu_state.frame.f32.eip },
-            thread.cpu_state.rax);
+        let ip = if thread.is_64bit {
+            unsafe { thread.cpu_state.frame.f64.rip }
+        } else {
+            unsafe { thread.cpu_state.frame.f32.eip as u64 }
+        };
+        println!("-> tid {} IP={:#x} AX={:#x}", thread.tid, ip, thread.cpu_state.rax);
 
         // Exit to user mode via iret
         exit_kernel(&thread.cpu_state, thread.is_64bit as u32);
