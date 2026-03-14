@@ -175,13 +175,36 @@ fn page_fault(regs: &mut Regs) {
 
     // Kernel fault in kernel code/data region is a bug
     if !user && fault_addr >= KERNEL_BASE {
+        // Read all values into locals before any debug output
+        let rip = regs.ip();
+        let err = error;
+        let addr = fault_addr as u64;
         unsafe {
-            for &b in b"KFAULT!" {
-                core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") b);
+            core::arch::asm!("cli");
+            macro_rules! dbg_char {
+                ($c:expr) => { core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") $c) };
             }
+            macro_rules! dbg_hex {
+                ($val:expr) => {{
+                    let v: u64 = $val;
+                    let mut i = 60i32;
+                    while i >= 0 {
+                        let nib = ((v >> i) & 0xf) as u8;
+                        let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                        dbg_char!(c);
+                        i -= 4;
+                    }
+                }};
+            }
+            dbg_char!(b'K'); dbg_char!(b'F'); dbg_char!(b' ');
+            dbg_hex!(addr);
+            dbg_char!(b' ');
+            dbg_hex!(rip);
+            dbg_char!(b' ');
+            dbg_hex!(err);
+            dbg_char!(b'\n');
+            loop { core::arch::asm!("hlt"); }
         }
-        println!("Page fault: {} at {:#x} RIP={:#x}", access, fault_addr, regs.ip());
-        panic_with_regs("Kernel fault in kernel range", regs);
     }
 
     // Dispatch based on mode, then handle fault
@@ -241,15 +264,7 @@ fn handle_protection_fault<E: paging2::Entry>(
                 panic_with_regs("Kernel write to read-only page", regs);
             }
             paging2::cow_entry(entries, idx);
-            // If resolved at PDPT level, update thread's hardware PDPT
-            if let Some(slot) = paging2::root_slot(idx) {
-                if let Some(thread) = crate::thread::current() {
-                    if let Some(pdpt) = thread.root.pdpt_mut() {
-                        paging2::update_pdpt_entry(pdpt, slot, entries[idx].raw());
-                        paging2::flush_tlb();
-                    }
-                }
-            }
+            paging2::flush_tlb();
             return;
         }
         let parent = paging2::parent_index::<E>(idx);

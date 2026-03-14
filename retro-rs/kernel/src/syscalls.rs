@@ -6,10 +6,12 @@
 //! - 4: Fork
 //! - 5: Exec
 //! - 6: Open
+//! - 7: Waitpid
 //! - 8: Read
 //! - 9: Write
 //!
 //! Arguments passed in: EDX, ECX, EBX, ESI, EDI
+//! 64-bit ABI: RDI, RSI, RDX, R10, R8 (remapped to canonical layout)
 //! Return value in: EAX
 
 use crate::elf;
@@ -46,22 +48,24 @@ const SYSCALL_TABLE: [Option<SyscallFn>; 10] = [
     Some(sys_fork),   // 4
     Some(sys_exec),   // 5
     Some(sys_open),   // 6
-    None,             // 7
+    Some(sys_wait),   // 7
     Some(sys_read),   // 8
     Some(sys_write),  // 9
 ];
 
 /// Dispatch a syscall
 pub fn dispatch(regs: &mut Regs) {
-    // 64-bit syscall ABI uses caller-saved registers: rdi=arg0, rsi=arg1, rdx=arg2
-    // Remap to the canonical layout (rdx=arg0, rcx=arg1, rbx=arg2) so handlers
-    // don't need to know which mode the caller is in.
+    // 64-bit syscall ABI uses different registers: rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4
+    // Remap to the canonical layout (rdx=arg0, rcx=arg1, rbx=arg2, rsi=arg3, rdi=arg4)
+    // so handlers don't need to know which mode the caller is in.
     let is_64bit = thread::current().map_or(false, |t| t.is_64bit);
     if is_64bit {
-        let (a0, a1, a2) = (regs.rdi, regs.rsi, regs.rdx);
+        let (a0, a1, a2, a3, a4) = (regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8);
         regs.rdx = a0;
         regs.rcx = a1;
         regs.rbx = a2;
+        regs.rsi = a3;
+        regs.rdi = a4;
     }
 
     let syscall_num = regs.rax as usize;
@@ -122,10 +126,9 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
         None => return ENOMEM,
     };
 
-    // Copy CPU state, mode, and symbols from parent to child
+    // Copy CPU state and mode from parent to child
     child.cpu_state = current.cpu_state;
     child.is_64bit = current.is_64bit;
-    child.symbols = current.symbols.clone();
 
     // Child returns 0
     thread::set_return(child, 0);
@@ -138,15 +141,23 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
 
 /// Exec syscall (5)
 /// Replaces current process with a new program
-/// RDX = path pointer (null-terminated)
+/// arg0 (rdx) = path pointer
+/// arg1 (rcx) = path length
+/// arg2 (rbx) = argv pointer (array of &str = [(ptr, len), ...])
+/// arg3 (rsi) = argc (number of &str elements)
 fn sys_exec(regs: &mut Regs) -> i32 {
     let path = unsafe { &*core::ptr::slice_from_raw_parts(regs.rdx as *const u8, regs.rcx as usize) };
 
-    // Print path for debugging
     let Ok(path) = core::str::from_utf8(path) else {
         return ENOENT;
     };
     println!("Exec: {}", path);
+
+    // Read argv from caller's address space (before we free it)
+    let argc = regs.rsi as usize;
+    let argv_ptr = regs.rbx as usize;
+    let caller_64bit = thread::current().map_or(false, |t| t.is_64bit);
+    let args = read_argv(argv_ptr, argc, caller_64bit);
 
     // Find the file in TAR
     let size = match startup::find_file(path.as_bytes()) {
@@ -154,11 +165,7 @@ fn sys_exec(regs: &mut Regs) -> i32 {
         None => return ENOENT,
     };
 
-    println!("File size {}", size);
-
     let mut buffer = alloc::vec![0; size];
-
-    // Read the file into scratch buffer
     startup::read_file(&mut buffer);
 
     // Free current user pages and load new ELF (point of no return)
@@ -175,32 +182,33 @@ fn sys_exec(regs: &mut Regs) -> i32 {
         thread::exit_thread(-ENOEXEC);
     }
 
-    // Extract symbols for debugging (before buffer is dropped)
     let symbols = SymbolData::new(buffer.into_boxed_slice());
 
-    // Update current thread's entry point and mode
-    // Stack is demand-paged on first access
     if let Some(current) = thread::current() {
         // Toggle CPU mode if needed
         if want_64 != current.is_64bit {
             paging2::ensure_trampoline_mapped();
             if want_64 {
-                // Switching to long mode: CR3 must be PML4
-                let cr3 = paging2::pml4_cr3(&current.root);
+                let cr3 = paging2::pml4_cr3(current.root.vroot_phys());
                 descriptors::toggle_mode(cr3);
                 current.is_64bit = true;
             } else {
-                // Switching back to protected mode: CR3 = PDPT
                 descriptors::toggle_mode(current.root.cr3());
-                // Re-init root from current address space (now PAE)
-                current.root.init_current();
+                paging2::flush_tlb();
             }
         }
 
+        // Set up argv on the new user stack and get the adjusted SP
+        let word = if want_64 { 8usize } else { 4usize };
+        let stack = setup_user_stack(&args, want_64, word);
+
         if want_64 {
-            thread::init_process_thread_64(current, loaded.entry, elf::USER_STACK_TOP as u64);
+            thread::init_process_thread_64(current, loaded.entry, stack.sp as u64);
+            // System V ABI: first two args in RDI, RSI
+            current.cpu_state.rdi = stack.argc as u64;
+            current.cpu_state.rsi = stack.argv as u64;
         } else {
-            thread::init_process_thread(current, loaded.entry as u32, elf::USER_STACK_TOP as u32);
+            thread::init_process_thread(current, loaded.entry as u32, stack.sp as u32);
         }
 
         current.symbols = symbols;
@@ -208,6 +216,94 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     }
 
     ENOSYS
+}
+
+/// Read argv from the caller's userspace into kernel-owned Vecs.
+/// Each &str in userspace is (ptr, len) — 8 bytes for 32-bit, 16 bytes for 64-bit.
+fn read_argv(argv_ptr: usize, argc: usize, is_64bit: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    let mut args = alloc::vec::Vec::with_capacity(argc);
+    for i in 0..argc {
+        let (str_ptr, str_len) = if is_64bit {
+            let base = argv_ptr + i * 16;
+            let ptr = unsafe { *(base as *const u64) } as usize;
+            let len = unsafe { *((base + 8) as *const u64) } as usize;
+            (ptr, len)
+        } else {
+            let base = argv_ptr + i * 8;
+            let ptr = unsafe { *(base as *const u32) } as usize;
+            let len = unsafe { *((base + 4) as *const u32) } as usize;
+            (ptr, len)
+        };
+        let mut buf = alloc::vec![0u8; str_len];
+        unsafe { core::ptr::copy_nonoverlapping(str_ptr as *const u8, buf.as_mut_ptr(), str_len); }
+        args.push(buf);
+    }
+    args
+}
+
+/// Result of setting up the user stack with argv data
+struct StackSetup {
+    sp: usize,
+    argc: usize,
+    argv: usize,
+}
+
+/// Set up argv on the new process's user stack.
+///
+/// Stack layout (high to low):
+///   [string bytes for arg0] [string bytes for arg1] ...
+///   [&str array: (ptr0, len0), (ptr1, len1), ...]
+///   32-bit only: [dummy return addr] [argc] [argv_ptr]
+fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool, word: usize) -> StackSetup {
+    let stack_top = elf::USER_STACK_TOP;
+    let mut sp = stack_top;
+
+    // 1. Write string data at top of stack
+    let mut string_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(args.len());
+    for arg in args.iter() {
+        sp -= arg.len();
+        unsafe { core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len()); }
+        string_addrs.push(sp);
+    }
+
+    // 2. Align to word boundary
+    sp &= !(word - 1);
+
+    // 3. Write &str array: [(ptr, len), (ptr, len), ...]
+    // Layout must match Rust's &str representation
+    sp -= args.len() * 2 * word;
+    let argv_base = sp;
+    for (i, (arg, &addr)) in args.iter().zip(string_addrs.iter()).enumerate() {
+        let entry_addr = argv_base + i * 2 * word;
+        if want_64 {
+            unsafe {
+                *(entry_addr as *mut u64) = addr as u64;       // ptr
+                *((entry_addr + 8) as *mut u64) = arg.len() as u64; // len
+            }
+        } else {
+            unsafe {
+                *(entry_addr as *mut u32) = addr as u32;       // ptr
+                *((entry_addr + 4) as *mut u32) = arg.len() as u32; // len
+            }
+        }
+    }
+
+    if want_64 {
+        // 64-bit: _start(argc, argv) via System V ABI — argc in RDI, argv in RSI
+        // Caller sets these in the CpuState. SP just needs to be below the data.
+        sp &= !0xF; // 16-byte align
+        StackSetup { sp, argc: args.len(), argv: argv_base }
+    } else {
+        // 32-bit: _start(argc, argv) via cdecl — args on the stack
+        // Stack: [dummy_ret_addr] [argc] [argv_ptr]
+        sp -= 4;
+        unsafe { *(sp as *mut u32) = argv_base as u32; } // argv
+        sp -= 4;
+        unsafe { *(sp as *mut u32) = args.len() as u32; } // argc
+        sp -= 4;
+        unsafe { *(sp as *mut u32) = 0; } // dummy return address
+        StackSetup { sp, argc: args.len(), argv: argv_base }
+    }
 }
 
 /// Open syscall (6)
@@ -239,6 +335,21 @@ fn sys_open(regs: &mut Regs) -> i32 {
         Some(size) => size as i32,
         None => ENOENT,
     }
+}
+
+/// Waitpid syscall (7)
+/// Waits for a child process to exit
+/// RDX = pid (-1 for any child)
+/// Returns: child tid (or negative error)
+fn sys_wait(regs: &mut Regs) -> i32 {
+    let pid = regs.rdx as i32;
+    let (tid, _code) = thread::waitpid(pid);
+    if tid >= 0 || tid == -10 {
+        return tid;
+    }
+    // EAGAIN: children exist but none exited yet — yield
+    // Userspace must retry (busy-wait with yield)
+    0x7fff_ffff // sentinel: "try again"
 }
 
 /// Read syscall (8)
