@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+
+rust_static_library(
+    name = "stress_lib",
+    srcs = ["src/main.rs"],
+    crate_name = "stress",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+        "-Cforce-frame-pointers=yes",
+    ],
+    deps = ["//crt"],
+)
+
+genrule(
+    name = "stress_elf",
+    srcs = [":stress_lib", "//apps/init:user.ld"],
+    outs = ["stress.elf"],
+    cmd = "ld.lld -m elf_i386 -T $(location //apps/init:user.ld) -o $@ $(location :stress_lib)",
+    visibility = ["//visibility:public"],
+)
