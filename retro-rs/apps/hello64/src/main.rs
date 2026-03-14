@@ -2,6 +2,6 @@
 #![no_main]
 
 #[unsafe(no_mangle)]
-pub extern "C" fn main() {
+pub fn main(_args: &[&str]) {
     crt::print("Hello from 64-bit!\n");
 }

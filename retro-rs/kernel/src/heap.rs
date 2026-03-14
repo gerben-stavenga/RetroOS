@@ -72,23 +72,39 @@ impl KernelAllocator {
 }
 
 impl AllocatorInner {
-    /// Extend the heap by mapping more pages
+    /// Extend the heap by mapping more pages.
+    /// Skips the temp_map reserved page (0xC0BFF000) if encountered.
     fn extend_heap(&mut self, min_size: usize) -> bool {
         let pages_needed = (min_size + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages_needed = pages_needed.max(4); // Allocate at least 4 pages at a time
+        let temp_map_addr = paging2::temp_map_vaddr();
 
-        for _ in 0..pages_needed {
+        let mut region_start = self.mapped_end;
+        let mut region_pages = 0;
+
+        // Keep mapping until we have one contiguous region >= pages_needed
+        while region_pages < pages_needed {
             if self.mapped_end >= HEAP_END {
-                return false;
+                break;
             }
 
-            // Allocate physical page
+            // Skip the temp_map reserved page — flush the current region
+            if self.mapped_end == temp_map_addr {
+                if region_pages > 0 {
+                    paging2::flush_tlb();
+                    self.add_free_region(region_start, region_pages * PAGE_SIZE);
+                    region_pages = 0;
+                }
+                self.mapped_end += PAGE_SIZE;
+                region_start = self.mapped_end;
+                continue;
+            }
+
             let phys_page = match phys_mm::alloc_phys_page() {
                 Some(p) => p,
-                None => return false,
+                None => break,
             };
 
-            // Map it into kernel space (user=false, readonly=false)
             let virt_page_idx = self.mapped_end / PAGE_SIZE;
             match paging2::entries() {
                 Entries::E32(e) => e[virt_page_idx] = Entry32::new(phys_page, true, false),
@@ -96,16 +112,16 @@ impl AllocatorInner {
             }
 
             self.mapped_end += PAGE_SIZE;
+            region_pages += 1;
         }
 
         paging2::flush_tlb();
 
-        // Add the new region to the free list
-        let new_region_start = self.mapped_end - pages_needed * PAGE_SIZE;
-        let new_region_size = pages_needed * PAGE_SIZE;
-        self.add_free_region(new_region_start, new_region_size);
+        if region_pages > 0 {
+            self.add_free_region(region_start, region_pages * PAGE_SIZE);
+        }
 
-        true
+        region_pages >= pages_needed
     }
 
     /// Add a region to the free list (sorted by address, coalesces)
@@ -266,7 +282,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let inner = unsafe { &mut *self.inner.get() };
 
-        let size = layout.size().max(MIN_BLOCK_SIZE);
+        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
 
         // Try to allocate from existing free list
@@ -286,7 +302,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let inner = unsafe { &mut *self.inner.get() };
 
-        let size = layout.size().max(MIN_BLOCK_SIZE);
+        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
         inner.add_free_region(ptr as usize, size);
     }
 }

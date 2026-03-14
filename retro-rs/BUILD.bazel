@@ -20,6 +20,8 @@ pkg_tar(
         "//apps/init:init_elf": "init.elf",
         "//apps/printmsg:printmsg_elf": "printmsg.elf",
         "//apps/hello64:hello64_elf": "hello64.elf",
+        "//apps/stress:stress_elf": "stress.elf",
+        "//apps/stress64:stress64_elf": "stress64.elf",
     },
 )
 
