@@ -301,8 +301,6 @@ toggle_prot_compat:
     mov ebp, esp
     push ebx
     mov ebx, ecx        ; save CR3 in callee-saved ebx
-    mov al, '0'
-    out 0xE9, al
     jmp 0xF000
 
 ; =============================================================================
@@ -373,34 +371,24 @@ trampoline_start:
     and eax, ~(1 << 31)     ; Clear PG bit
     mov cr0, eax
     ; paging off — no stack access, only caller-saved regs + ebx
-    mov al, '1'
-    out 0xE9, al              ; paging off
 
     ; Toggle long mode in EFER MSR (clobbers EAX, EDX, ECX)
     mov ecx, 0xC0000080     ; EFER MSR
     rdmsr
     xor eax, (1 << 8)       ; Toggle LME bit
     wrmsr
-    mov al, '2'
-    out 0xE9, al              ; EFER toggled
 
     ; Load new page tables (also flushes TLB)
     mov cr3, ebx
-    mov al, '3'
-    out 0xE9, al              ; CR3 loaded
 
     ; Enable paging
     mov eax, cr0
     or eax, (1 << 31)       ; Set PG bit
     mov cr0, eax
-    mov al, '4'
-    out 0xE9, al              ; paging on
 
     ; paging on — stack accessible again
     pop ebx
     leave
-    mov al, '5'
-    out 0xE9, al              ; returning
     ret
 
 trampoline_toggle_end:
