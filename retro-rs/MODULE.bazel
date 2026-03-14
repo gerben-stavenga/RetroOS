@@ -52,5 +52,7 @@ http_archive(
 register_toolchains(
     "@rules_nasm//nasm/toolchain",
     "//toolchain:retro_rust_toolchain",
+    "//toolchain:retro_rust_toolchain_64",
     "//toolchain:bare_cc_toolchain_def",
+    "//toolchain:bare_cc_toolchain_64_def",
 )

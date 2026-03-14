@@ -347,6 +347,7 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
         if thread.is_64bit {
             if !in_long_mode {
                 // Switch from protected mode to long mode (compat)
+                crate::paging2::ensure_trampoline_mapped();
                 let cr3 = crate::paging2::pml4_cr3(&thread.root);
                 crate::descriptors::toggle_mode(cr3);
             } else {
@@ -356,6 +357,7 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
         } else {
             if in_long_mode {
                 // Switch from long mode back to protected mode
+                crate::paging2::ensure_trampoline_mapped();
                 crate::descriptors::toggle_mode(thread.root.cr3());
             } else {
                 // Already in protected mode

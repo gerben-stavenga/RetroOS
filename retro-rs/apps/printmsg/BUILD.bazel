@@ -1,26 +1,22 @@
-# Build init user program
 load("@rules_rust//rust:defs.bzl", "rust_static_library")
 
-exports_files(["user.ld"])
-
 rust_static_library(
-    name = "init_lib",
+    name = "printmsg_lib",
     srcs = ["src/main.rs"],
-    crate_name = "init",
+    crate_name = "printmsg",
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
         "-Crelocation-model=static",
         "-Cforce-frame-pointers=yes",
     ],
-    deps = ["//lib"],
+    deps = ["//crt"],
 )
 
-# Link into ELF
 genrule(
-    name = "init_elf",
-    srcs = [":init_lib", "user.ld"],
-    outs = ["init.elf"],
-    cmd = "ld.lld -m elf_i386 -T $(location user.ld) -o $@ $(location :init_lib)",
+    name = "printmsg_elf",
+    srcs = [":printmsg_lib", "//apps/init:user.ld"],
+    outs = ["printmsg.elf"],
+    cmd = "ld.lld -m elf_i386 -T $(location //apps/init:user.ld) -o $@ $(location :printmsg_lib)",
     visibility = ["//visibility:public"],
 )

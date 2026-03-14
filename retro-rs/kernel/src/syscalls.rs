@@ -12,7 +12,7 @@
 //! Arguments passed in: EDX, ECX, EBX, ESI, EDI
 //! Return value in: EAX
 
-use crate::{SCRATCH, elf};
+use crate::elf;
 use crate::descriptors;
 use crate::paging2::{self, PAGE_SIZE};
 use crate::stacktrace::SymbolData;
@@ -53,6 +53,17 @@ const SYSCALL_TABLE: [Option<SyscallFn>; 10] = [
 
 /// Dispatch a syscall
 pub fn dispatch(regs: &mut Regs) {
+    // 64-bit syscall ABI uses caller-saved registers: rdi=arg0, rsi=arg1, rdx=arg2
+    // Remap to the canonical layout (rdx=arg0, rcx=arg1, rbx=arg2) so handlers
+    // don't need to know which mode the caller is in.
+    let is_64bit = thread::current().map_or(false, |t| t.is_64bit);
+    if is_64bit {
+        let (a0, a1, a2) = (regs.rdi, regs.rsi, regs.rdx);
+        regs.rdx = a0;
+        regs.rcx = a1;
+        regs.rbx = a2;
+    }
+
     let syscall_num = regs.rax as usize;
 
     let result = if syscall_num < SYSCALL_TABLE.len() {
@@ -65,7 +76,7 @@ pub fn dispatch(regs: &mut Regs) {
         ENOSYS
     };
 
-    regs.rax = result as u32 as u64;  // Sign-extend for 32-bit compatibility
+    regs.rax = result as u32 as u64;
 }
 
 /// Exit syscall (0)
@@ -111,9 +122,10 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
         None => return ENOMEM,
     };
 
-    // Copy CPU state and mode from parent to child
+    // Copy CPU state, mode, and symbols from parent to child
     child.cpu_state = current.cpu_state;
     child.is_64bit = current.is_64bit;
+    child.symbols = current.symbols.clone();
 
     // Child returns 0
     thread::set_return(child, 0);
@@ -149,15 +161,19 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     // Read the file into scratch buffer
     startup::read_file(&mut buffer);
 
-    // Free current user pages
+    // Free current user pages and load new ELF (point of no return)
     paging2::free_user_pages();
     paging2::flush_tlb();
 
-    // Load the ELF
     let loaded = match elf::load_elf(&buffer) {
         Ok(e) => e,
-        Err(_) => return ENOEXEC,
+        Err(_) => { thread::exit_thread(-ENOEXEC); },
     };
+
+    let want_64 = loaded.class == elf::ElfClass::Elf64;
+    if want_64 && !paging2::cpu_supports_long_mode() {
+        thread::exit_thread(-ENOEXEC);
+    }
 
     // Extract symbols for debugging (before buffer is dropped)
     let symbols = SymbolData::new(buffer.into_boxed_slice());
@@ -165,18 +181,18 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     // Update current thread's entry point and mode
     // Stack is demand-paged on first access
     if let Some(current) = thread::current() {
-        current.symbols = symbols;
-
-        let want_64 = loaded.class == elf::ElfClass::Elf64;
-
         // Toggle CPU mode if needed
         if want_64 != current.is_64bit {
+            paging2::ensure_trampoline_mapped();
             if want_64 {
                 // Switching to long mode: CR3 must be PML4
                 let cr3 = paging2::pml4_cr3(&current.root);
+                paging2::debug_pml4();
+                paging2::debug_long_walk(cr3, 0xF000);
+                paging2::debug_long_walk(cr3, 0xC0B08F90);
+                println!("toggle_mode cr3={:#x}", cr3);
                 descriptors::toggle_mode(cr3);
-                // Update root to store PML4 physical address
-                current.root = paging2::RootPageTable { phys: cr3 };
+                current.is_64bit = true;
             } else {
                 // Switching back to protected mode: CR3 = PDPT
                 descriptors::toggle_mode(current.root.cr3());
@@ -185,12 +201,16 @@ fn sys_exec(regs: &mut Regs) -> i32 {
             }
         }
 
+        crate::x86::outb(0xE9, b'D');
         if want_64 {
             thread::init_process_thread_64(current, loaded.entry, elf::USER_STACK_TOP as u64);
         } else {
             thread::init_process_thread(current, loaded.entry as u32, elf::USER_STACK_TOP as u32);
         }
+        crate::x86::outb(0xE9, b'E');
 
+        current.symbols = symbols;
+        crate::x86::outb(0xE9, b'F');
         thread::exit_to_thread(current);
     }
 
