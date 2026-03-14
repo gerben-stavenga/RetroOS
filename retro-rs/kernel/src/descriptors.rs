@@ -401,20 +401,13 @@ unsafe extern "fastcall" {
 /// Safety: Requires trampoline copied to 0xF000 and identity-mapped.
 pub fn toggle_mode(new_cr3: u32) {
     x86::cli();
-    x86::outb(0xE9, b'T');
     unsafe { toggle_prot_compat(new_cr3); }
-    x86::outb(0xE9, b'R');
-    /// Reload IDT/TSS based on current mode (check EFER.LMA)
+    // Reload IDT/TSS based on current mode (check EFER.LMA)
     let efer = x86::rdmsr(x86::EFER_MSR);
-    x86::outb(0xE9, b'E');
     if efer & x86::efer::LMA != 0 {
         load_long_mode_descriptors();
-        x86::outb(0xE9, b'L');
     } else {
         load_prot_mode_descriptors();
-        x86::outb(0xE9, b'P');
     }
-    x86::outb(0xE9, b'I');
     x86::sti();
-    x86::outb(0xE9, b'!');
 }

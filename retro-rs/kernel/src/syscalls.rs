@@ -187,10 +187,6 @@ fn sys_exec(regs: &mut Regs) -> i32 {
             if want_64 {
                 // Switching to long mode: CR3 must be PML4
                 let cr3 = paging2::pml4_cr3(&current.root);
-                paging2::debug_pml4();
-                paging2::debug_long_walk(cr3, 0xF000);
-                paging2::debug_long_walk(cr3, 0xC0B08F90);
-                println!("toggle_mode cr3={:#x}", cr3);
                 descriptors::toggle_mode(cr3);
                 current.is_64bit = true;
             } else {
@@ -201,16 +197,13 @@ fn sys_exec(regs: &mut Regs) -> i32 {
             }
         }
 
-        crate::x86::outb(0xE9, b'D');
         if want_64 {
             thread::init_process_thread_64(current, loaded.entry, elf::USER_STACK_TOP as u64);
         } else {
             thread::init_process_thread(current, loaded.entry as u32, elf::USER_STACK_TOP as u32);
         }
-        crate::x86::outb(0xE9, b'E');
 
         current.symbols = symbols;
-        crate::x86::outb(0xE9, b'F');
         thread::exit_to_thread(current);
     }
 
