@@ -96,19 +96,39 @@ impl RootPageTable {
 
     /// Initialize from the current (active) address space.
     pub fn init_current(&mut self) {
-        if cpu_mode() == CpuMode::Pae {
-            populate_pdpt(unsafe { &mut self.pdpt });
+        if is_pae() {
+            // Set recursive entry so self-map works; user entries synced by flush_tlb
+            let rec = recursive_idx();
+            if let Entries::E64(e) = entries() {
+                let rec_slot = rec - root_base();
+                unsafe { self.pdpt[rec_slot] = Entry64::new(e[rec].page(), false, false).0; }
+            }
         } else {
             self.phys = current_root_phys() as u32;
         }
     }
 
-    /// Initialize from a forked virtual root (accessed via temp_map).
+    /// Initialize from a forked virtual root.
     pub fn init_fork(&mut self, root_phys: u64) {
-        if cpu_mode() == CpuMode::Pae {
-            populate_pdpt_from(root_phys, unsafe { &mut self.pdpt });
+        if is_pae() {
+            // Set recursive entry pointing to child's vroot; user entries synced by flush_tlb
+            let rec_slot = recursive_idx() - root_base();
+            unsafe { self.pdpt[rec_slot] = Entry64::new(root_phys / PAGE_SIZE as u64, false, false).0; }
         } else {
             self.phys = root_phys as u32;
+        }
+    }
+
+    /// Physical address of the virtual root page table.
+    pub fn vroot_phys(&self) -> u64 {
+        match cpu_mode() {
+            CpuMode::Pae => {
+                // Recursive entry in pdpt[3] has the vroot page
+                Entry64(unsafe { self.pdpt[3] }).page() * PAGE_SIZE as u64
+            }
+            CpuMode::Compat | CpuMode::Legacy => {
+                unsafe { self.phys as u64 }
+            }
         }
     }
 
@@ -349,16 +369,12 @@ pub fn setup_long_mode_tables() {
     unsafe { PML4[0] = Entry64::new(pdpt_phys >> 12, true, true); }
 }
 
-/// Update PML4[0] to point to a process's virtual root PDPT and return
+/// Update PML4[0] to point to a virtual root PDPT and return
 /// the PML4 physical address (suitable for CR3 in long mode).
-///
-/// The virtual root page is extracted from root.pdpt[3] (the recursive slot),
-/// which is not overlapped by the phys union field.
-pub fn pml4_cr3(root: &RootPageTable) -> u32 {
-    let vroot = Entry64(unsafe { root.pdpt[3] }).page();
-    unsafe { PML4[0] = Entry64::new(vroot, true, true); }
-    let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
-    (pml4_phys * PAGE_SIZE as u64) as u32
+pub fn pml4_cr3(vroot_phys: u64) -> u32 {
+    let vroot_page = vroot_phys / PAGE_SIZE as u64;
+    unsafe { PML4[0] = Entry64::new(vroot_page, true, true); }
+    pml4_phys()
 }
 
 /// PML4 physical address (for CR3).
@@ -367,107 +383,38 @@ pub fn pml4_phys() -> u32 {
     (pml4_phys * PAGE_SIZE as u64) as u32
 }
 
-/// Populate a RootPageTable's pdpt entries from the current virtual root.
-/// Sanitizes entries (R/W=0, U/S=0 for hardware) and sets the recursive
-/// entry to point to the virtual root (not itself).
-pub fn populate_pdpt(pdpt: &mut [u64; 4]) {
+/// Sync the hardware PDPT from the virtual root (PAE only).
+///
+/// The PAE PDPT hardware ignores R/W and U/S bits, so COW can't be
+/// enforced at that level. We compensate by desharing all user PDPT
+/// entries (giving this process sole ownership of its PD pages) and
+/// then copying to the local pdpt with U/S=0.
+///
+/// This is the ONLY PAE-specific paging logic. Everything else
+/// (fork, COW, fault handling) is mode-ignorant.
+fn sync_pae_pdpt() {
+    if cpu_mode() != CpuMode::Pae { return; }
+    let Some(thread) = crate::thread::current() else { return; };
+
     if let Entries::E64(e) = entries() {
         let root = root_base();
+        let user_count = recursive_idx() - root;
+
+        // Deshare: ensure each user PDPT entry is solely owned
+        for i in 0..user_count {
+            if e[root + i].present() && !e[root + i].hw_writable() {
+                cow_entry(e, root + i);
+            }
+        }
+
+        // Copy to local pdpt (sanitize: R/W=0, U/S=0 for hardware)
+        let pdpt = unsafe { &mut thread.root.pdpt };
         for i in 0..4 {
             let mut entry = e[root + i];
             entry.set_hw_writable(false);
             entry.set_user(false);
             pdpt[i] = entry.0;
         }
-        // Recursive slot points to virtual root (NOT itself)
-        let virtual_root_page = e[recursive_idx()].page();
-        let recursive_slot = recursive_idx() - root;
-        pdpt[recursive_slot] = Entry64::new(virtual_root_page, false, false).0;
-    }
-}
-
-/// Populate pdpt entries from a virtual root accessed via temp_map.
-/// Used during fork when the new root isn't the current address space.
-///
-/// PAE PDPT entries have no hardware R/W bit — the CPU ignores R/W during
-/// the PDPT-level page walk. So we must "deshare" each user PD before
-/// writing it to the hardware PDPT: give the child a private copy with
-/// R/O PDEs, so that COW is enforced at the PDE level (which the CPU checks).
-pub fn populate_pdpt_from(root_phys: u64, pdpt: &mut [u64; 4]) {
-    let root_page = root_phys / PAGE_SIZE as u64;
-    let root = root_base();
-    let user_count = recursive_idx() - root;
-
-    crate::println!("populate_pdpt_from: root_phys={:#x} root_page={:#x} user_count={}", root_phys, root_page, user_count);
-
-    // Read child's virtual root to find shared PDs
-    let mut old_pds = [0u64; 3];
-    temp_map(root_page);
-    unsafe {
-        let src = temp_map_vaddr() as *const Entry64;
-        for i in 0..user_count.min(3) {
-            let entry = *src.add(i);
-            crate::println!("  vroot[{}]: {:#018x}", i, entry.0);
-            if entry.present() {
-                old_pds[i] = entry.page();
-            }
-        }
-    }
-    temp_unmap();
-
-    // Deshare: copy each shared PD via the parent's self-map,
-    // giving the child private PDs with R/O PDEs.
-    let mut new_pds = [0u64; 3];
-    if let Entries::E64(entries) = entries() {
-        for i in 0..user_count.min(3) {
-            if old_pds[i] != 0 && crate::phys_mm::is_shared(old_pds[i]) {
-                new_pds[i] = share_and_copy(entries, root + i)
-                    .expect("Out of memory during fork deshare");
-                crate::phys_mm::free_phys_page(old_pds[i]);
-            }
-        }
-    }
-
-    // Update child's virtual root with deshared PDs, then read for hw PDPT
-    temp_map(root_page);
-    unsafe {
-        let dst = temp_map_vaddr() as *mut Entry64;
-        for i in 0..user_count.min(3) {
-            if new_pds[i] != 0 {
-                *dst.add(i) = Entry64::new(new_pds[i], true, true);
-            }
-        }
-        // Read final entries for hardware PDPT (sanitize: R/W=0, U/S=0)
-        let src = temp_map_vaddr() as *const Entry64;
-        for i in 0..4 {
-            let mut entry = *src.add(i);
-            entry.set_hw_writable(false);
-            entry.set_user(false);
-            pdpt[i] = entry.0;
-        }
-        // Recursive slot points to virtual root
-        let recursive_slot = recursive_idx() - root;
-        pdpt[recursive_slot] = Entry64::new(root_page, false, false).0;
-    }
-    temp_unmap();
-}
-
-/// Update a single pdpt entry after COW resolution at root level.
-pub fn update_pdpt_entry(pdpt: &mut [u64; 4], slot: usize, raw: u64) {
-    let mut e = Entry64(raw);
-    e.set_hw_writable(false);
-    e.set_user(false);
-    pdpt[slot] = e.0;
-}
-
-/// Check if an entry index is a root-level entry (PDPT level in PAE).
-/// Returns the slot index (0-3) if so.
-pub fn root_slot(idx: usize) -> Option<usize> {
-    let root = root_base();
-    if idx >= root && idx < root + 4 {
-        Some(idx - root)
-    } else {
-        None
     }
 }
 
@@ -601,14 +548,16 @@ pub fn current_root_phys() -> u64 {
     }
 }
 
-/// Flush TLB. In PAE mode, also syncs the hardware PDPT from the virtual root
-/// before reloading CR3 (the PDPT is an extension of CR3 in PAE).
+/// Raw TLB invalidation (CR3 reload). Used internally by paging operations
+/// that don't need the PAE PDPT sync.
+fn invalidate_tlb() {
+    crate::x86::flush_tlb();
+}
+
+/// Flush TLB. In PAE mode, also deshares and syncs the hardware PDPT
+/// before reloading CR3.
 pub fn flush_tlb() {
-    if cpu_mode() == CpuMode::Pae {
-        if let Some(thread) = crate::thread::current() {
-            populate_pdpt(unsafe { &mut thread.root.pdpt });
-        }
-    }
+    sync_pae_pdpt();
     crate::x86::flush_tlb();
 }
 
@@ -617,7 +566,7 @@ pub fn flush_tlb() {
 /// Clears the first root entry (PD[0] for legacy, PDPT[0] for PAE)
 fn remove_identity_mapping<E: Entry>(entries: &mut [E]) {
     entries[root_base()] = E::default();
-    flush_tlb();
+    invalidate_tlb();
 }
 
 /// Finish paging setup after stack switch
@@ -651,7 +600,7 @@ pub fn finish_setup_paging() {
             crate::println!("Identity mapping removed");
 
             harden_kernel(e);
-            flush_tlb();
+            invalidate_tlb();
         }
     }
 }
@@ -823,7 +772,7 @@ static mut TEMP_MAP_ENTRY: usize = 0;
 /// Temp mapping virtual address (set by init_temp_map)
 static mut TEMP_MAP_VADDR_MUT: usize = 0;
 
-fn temp_map_vaddr() -> usize {
+pub fn temp_map_vaddr() -> usize {
     unsafe { TEMP_MAP_VADDR_MUT }
 }
 
@@ -857,7 +806,7 @@ fn temp_map(phys_page: u64) {
             *pt.add(idx) = Entry32::new(phys_page, true, false);
         }
     }
-    flush_tlb();
+    invalidate_tlb();
 }
 
 /// Unmap the temp mapping
@@ -872,7 +821,7 @@ fn temp_unmap() {
             *pt.add(idx) = Entry32::default();
         }
     }
-    flush_tlb();
+    invalidate_tlb();
 }
 
 /// Get entries per page for an Entry type
@@ -925,7 +874,7 @@ fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
     }
     temp_unmap();
 
-    flush_tlb();
+    invalidate_tlb();
     Some(new_root * PAGE_SIZE as u64)
 }
 
@@ -992,7 +941,7 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
     }
     temp_unmap();
 
-    flush_tlb();
+    invalidate_tlb();
     Some(new_phys)
 }
 
@@ -1013,7 +962,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     if ref_count == 1 {
         // Sole owner — just make writable
         entries[idx].set_hw_writable(true);
-        flush_tlb();
+        invalidate_tlb();
         return;
     }
 
@@ -1022,7 +971,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         let new_phys = phys_mm::alloc_phys_page().expect("Out of memory during COW");
         let user = entries[idx].user();
         entries[idx] = E::new(new_phys, true, user);
-        flush_tlb();
+        invalidate_tlb();
         return;
     }
 
@@ -1044,7 +993,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     let user = entries[idx].user();
     entries[idx] = E::new(new_phys, true, user);
     phys_mm::free_phys_page(old_phys);
-    flush_tlb();
+    invalidate_tlb();
 }
 
 // =============================================================================
@@ -1061,7 +1010,7 @@ fn free_generic<E: Entry>(entries: &mut [E]) {
             free_subtree(entries, root + i);
         }
     }
-    flush_tlb();
+    invalidate_tlb();
 }
 
 /// Free all user pages in current address space.
@@ -1073,10 +1022,7 @@ fn free_generic<E: Entry>(entries: &mut [E]) {
 pub fn free_user_pages() {
     match entries() {
         Entries::E32(e) => free_generic(e),
-        Entries::E64(e) => {
-            free_generic(e);
-            flush_tlb();
-        }
+        Entries::E64(e) => free_generic(e),
     }
 }
 
@@ -1206,6 +1152,6 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
         entries[i].set_no_execute(true);
     }
 
-    flush_tlb();
+    invalidate_tlb();
     crate::println!("Kernel hardening complete");
 }

@@ -182,6 +182,7 @@ pub struct Thread {
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
     pub cpu_state: CpuState,
+    pub exit_code: i32,
     pub is_64bit: bool,               // True if running in 64-bit (long) mode
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
 }
@@ -199,6 +200,7 @@ impl Thread {
             num_fds: 0,
             fds: [-1; MAX_FDS],
             cpu_state: CpuState::empty(),
+            exit_code: 0,
             is_64bit: false,
             symbols: None,
         }
@@ -348,11 +350,11 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
             if !in_long_mode {
                 // Switch from protected mode to long mode (compat)
                 crate::paging2::ensure_trampoline_mapped();
-                let cr3 = crate::paging2::pml4_cr3(&thread.root);
+                let cr3 = crate::paging2::pml4_cr3(thread.root.vroot_phys());
                 crate::descriptors::toggle_mode(cr3);
             } else {
                 // Already in long mode — just update PML4[0] and reload CR3
-                crate::x86::write_cr3(crate::paging2::pml4_cr3(&thread.root));
+                crate::x86::write_cr3(crate::paging2::pml4_cr3(thread.root.vroot_phys()));
             }
         } else {
             if in_long_mode {
@@ -375,12 +377,17 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
 
         CURRENT_THREAD = thread;
 
+        // Sync PAE hardware PDPT after CURRENT_THREAD is set, so
+        // sync_pae_pdpt writes to the correct thread's local pdpt.
+        if !thread.is_64bit {
+            crate::paging2::flush_tlb();
+        }
+
         let ip = if thread.is_64bit {
             unsafe { thread.cpu_state.frame.f64.rip }
         } else {
             unsafe { thread.cpu_state.frame.f32.eip as u64 }
         };
-        println!("-> tid {} IP={:#x} AX={:#x}", thread.tid, ip, thread.cpu_state.rax);
 
         // Exit to user mode via iret
         exit_kernel(&thread.cpu_state, thread.is_64bit as u32);
@@ -399,12 +406,41 @@ pub fn exit_thread(exit_code: i32) -> ! {
         let thread = &mut *CURRENT_THREAD;
         println!("Thread {} exited with code {}", thread.tid, exit_code);
         crate::paging2::free_user_pages();
-        thread.state = ThreadState::Unused;
+        thread.exit_code = exit_code;
+        thread.state = ThreadState::Zombie;
         CURRENT_THREAD = core::ptr::null_mut();
-        // TODO: Wake parent if waiting
         schedule();
     }
     panic!("No threads to schedule after exit");
+}
+
+/// Wait for a child to exit. Returns (child_tid, exit_code) or -ECHILD if no children.
+/// If pid == -1, waits for any child. Otherwise waits for specific pid.
+/// Non-blocking: returns -EAGAIN if children exist but none have exited yet.
+pub fn waitpid(pid: i32) -> (i32, i32) {
+    unsafe {
+        let current_tid = if !CURRENT_THREAD.is_null() { (*CURRENT_THREAD).tid } else { return (-10, 0); };
+        let mut has_children = false;
+
+        for i in 1..MAX_THREADS {
+            let t = &mut THREADS[i];
+            if t.parent_tid == current_tid && t.state != ThreadState::Unused {
+                has_children = true;
+                if t.state == ThreadState::Zombie && (pid == -1 || t.tid == pid) {
+                    let tid = t.tid;
+                    let code = t.exit_code;
+                    t.state = ThreadState::Unused;
+                    return (tid, code);
+                }
+            }
+        }
+
+        if has_children {
+            (-11, 0)  // EAGAIN
+        } else {
+            (-10, 0)  // ECHILD
+        }
+    }
 }
 
 /// Signal thread (e.g., on segfault)
