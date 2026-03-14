@@ -153,20 +153,6 @@ fn page_fault(regs: &mut Regs) {
     let instruction_fetch = (error & 0x10) != 0;
     let access = if instruction_fetch { "fetch" } else if write { "write" } else { "read" };
 
-    // Debug: emit fault info via raw debugcon port I/O (no memory allocation)
-    unsafe {
-        // Emit 'D' for demand (not present) or 'P' for protection, then hex addr
-        let ch = if present { b'P' } else { b'D' };
-        core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") ch);
-        // Emit fault address as 8 hex digits
-        for shift in [28, 24, 20, 16, 12, 8, 4, 0u32] {
-            let nibble = ((fault_addr >> shift) & 0xF) as u8;
-            let hex = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") hex);
-        }
-        core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") b' ');
-    }
-
     let page_index = page_idx(fault_addr);
 
     // Null pointer protection (first 64KB and last 64KB)
