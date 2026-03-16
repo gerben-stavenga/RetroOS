@@ -126,24 +126,22 @@ pub fn startup(start_sector: u32) -> ! {
     // Ensure trampoline is identity-mapped so all forked processes inherit it
     crate::paging2::ensure_trampoline_mapped();
 
-    let stack = PAGE_TABLE_BASE as u32;
+    // Set up user stack with argc=0 for _start(argc, argv)
+    let stack_top = PAGE_TABLE_BASE as u32;
+    let stack = stack_top - 12; // [dummy_ret=0] [argc=0] [argv=ptr]
+    unsafe {
+        *((stack_top - 4) as *mut u32) = stack;  // argv (non-null, never dereferenced since argc=0)
+        *((stack_top - 8) as *mut u32) = 0;      // argc
+        *((stack_top - 12) as *mut u32) = 0;     // dummy return address
+    }
     println!("User stack: {:#x}", stack);
 
-    // Create init thread
-    let page_dir = crate::paging2::current_root_phys();
-    let init_thread = thread::create_thread(None, page_dir, true)
+    // Create init thread (0 = use current address space)
+    let init_thread = thread::create_thread(None, 0, true)
         .expect("Failed to create init thread");
 
     init_thread.symbols = symbols;
     thread::init_process_thread(init_thread, loaded.entry as u32, stack);
-
-    // Debug: check thread's pdpt vs boot pdpt
-    println!("Thread CR3: {:#x}", init_thread.root.cr3());
-    if let Some(pdpt) = unsafe { init_thread.root.pdpt_mut() } {
-        for i in 0..4 {
-            println!("  pdpt[{}]: {:#018x}", i, pdpt[i]);
-        }
-    }
     println!("Starting init process...");
 
     // Switch to init thread (doesn't return)

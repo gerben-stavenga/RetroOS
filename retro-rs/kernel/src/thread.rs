@@ -207,11 +207,8 @@ impl Thread {
     }
 }
 
-/// Thread array
-static mut THREADS: [Thread; MAX_THREADS] = {
-    const EMPTY: Thread = Thread::empty();
-    [EMPTY; MAX_THREADS]
-};
+/// Thread array (heap-allocated to keep large RootPageTable out of .data)
+static mut THREADS: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
 
 /// Current running thread
 static mut CURRENT_THREAD: *mut Thread = core::ptr::null_mut();
@@ -245,8 +242,10 @@ pub fn get_thread(tid: usize) -> Option<&'static mut Thread> {
     }
 }
 
-/// Create a new thread
-pub fn create_thread(parent: Option<&Thread>, page_dir: u64, is_process: bool) -> Option<&'static mut Thread> {
+/// Create a new thread.
+/// `forked_root_page`: physical page number of the forked root page table
+/// (from fork_current), or 0 to use the current address space.
+pub fn create_thread(parent: Option<&Thread>, forked_root_page: u64, is_process: bool) -> Option<&'static mut Thread> {
     unsafe {
         for i in 0..MAX_THREADS {
             if THREADS[i].state == ThreadState::Unused {
@@ -261,7 +260,11 @@ pub fn create_thread(parent: Option<&Thread>, page_dir: u64, is_process: bool) -
                 thread.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
                 thread.state = ThreadState::Ready;
                 thread.time = crate::irq::get_ticks() as u32;
-                thread.root.init_fork(page_dir);
+                if forked_root_page == 0 {
+                    thread.root.init_current();
+                } else {
+                    thread.root.init_fork(forked_root_page);
+                }
                 thread.num_fds = 0;
                 for fd in &mut thread.fds {
                     *fd = -1;
@@ -291,6 +294,8 @@ pub fn save_state(thread: &mut Thread) {
     unsafe {
         let stack_top = (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024) as usize;
         let regs = (stack_top - core::mem::size_of::<Regs>()) as *const Regs;
+        let saved_eip = (*regs).frame.f32.eip;
+        println!("save_state: tid={} rax={} eip={:#x}", thread.tid, (*regs).rax, saved_eip);
         // Copy Regs to CpuState (same layout)
         core::ptr::copy_nonoverlapping(
             regs as *const u8,
@@ -302,7 +307,7 @@ pub fn save_state(thread: &mut Thread) {
 
 /// Set return value in thread's saved state
 pub fn set_return(thread: &mut Thread, ret: i32) {
-    thread.cpu_state.rax = ret as u32 as u64;  // Sign-extend for 32-bit, zero-extend to 64
+    thread.cpu_state.rax = ret as i64 as u64;  // Sign-extend for 32-bit, zero-extend to 64
 }
 
 /// Schedule next thread (randomly selected from ready threads)
@@ -343,28 +348,27 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
     unsafe {
         thread.state = ThreadState::Running;
 
-        let in_long_mode = crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat;
+        // Save outgoing thread's user entries
+        if !CURRENT_THREAD.is_null() {
+            (*CURRENT_THREAD).root.save();
+        }
 
-        // Switch address space and CPU mode if needed
-        if thread.is_64bit {
-            if !in_long_mode {
-                // Switch from protected mode to long mode (compat)
-                crate::paging2::ensure_trampoline_mapped();
-                let cr3 = crate::paging2::pml4_cr3(thread.root.vroot_phys());
-                crate::descriptors::toggle_mode(cr3);
-            } else {
-                // Already in long mode — just update PML4[0] and reload CR3
-                crate::x86::write_cr3(crate::paging2::pml4_cr3(thread.root.vroot_phys()));
-            }
+        let in_long_mode = crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat;
+        let want_long_mode = thread.is_64bit;
+
+        // Switch address space: load incoming thread's entries + CPU mode
+        if want_long_mode != in_long_mode {
+            thread.root.load_entries();
+            // Sync HW_PDPT for both toggle directions:
+            //   PAE→Compat: hardware still reads HW_PDPT for recursive mapping + trampoline
+            //   Compat→PAE: new CR3 will point to HW_PDPT after toggle
+            crate::paging2::sync_hw_pdpt();
+            // Flush TLB so new entries take effect before mapping trampoline
+            crate::x86::flush_tlb();
+            crate::paging2::ensure_trampoline_mapped();
+            crate::descriptors::toggle_mode(crate::paging2::toggle_cr3(want_long_mode));
         } else {
-            if in_long_mode {
-                // Switch from long mode back to protected mode
-                crate::paging2::ensure_trampoline_mapped();
-                crate::descriptors::toggle_mode(thread.root.cr3());
-            } else {
-                // Already in protected mode
-                thread.root.activate();
-            }
+            thread.root.activate();
         }
 
         // Update kernel stack in TSS for this thread
@@ -377,17 +381,22 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
 
         CURRENT_THREAD = thread;
 
-        // Sync PAE hardware PDPT after CURRENT_THREAD is set, so
-        // sync_pae_pdpt writes to the correct thread's local pdpt.
-        if !thread.is_64bit {
-            crate::paging2::flush_tlb();
-        }
-
         let ip = if thread.is_64bit {
             unsafe { thread.cpu_state.frame.f64.rip }
         } else {
             unsafe { thread.cpu_state.frame.f32.eip as u64 }
         };
+
+        // Debug: read code bytes at ip and stack at esp to verify mapping
+        let code = unsafe { core::ptr::read_unaligned(ip as *const u32) };
+        let user_esp = if thread.is_64bit {
+            unsafe { thread.cpu_state.frame.f64.rsp }
+        } else {
+            unsafe { thread.cpu_state.frame.f32.esp as u64 }
+        };
+        let stack_val = unsafe { core::ptr::read_unaligned(user_esp as *const u32) };
+        println!("exit_to_thread: tid={} rax={} ip={:#x} code={:#010x} esp={:#x} [esp]={:#x}",
+            thread.tid, thread.cpu_state.rax, ip, code, user_esp, stack_val);
 
         // Exit to user mode via iret
         exit_kernel(&thread.cpu_state, thread.is_64bit as u32);
@@ -457,7 +466,8 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) {
 
         unsafe {
             if CURRENT_THREAD == thread as *mut _ {
-                thread.state = ThreadState::Unused;
+                thread.state = ThreadState::Zombie;
+                thread.exit_code = -11;  // SIGSEGV
                 CURRENT_THREAD = core::ptr::null_mut();
                 schedule();
             } else {
@@ -468,8 +478,15 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) {
 }
 
 /// Initialize threading system with init thread
+#[allow(static_mut_refs)]
 pub fn init_threading() {
     unsafe {
+        // Allocate thread table on the heap
+        THREADS.reserve(MAX_THREADS);
+        for _ in 0..MAX_THREADS {
+            THREADS.push(Thread::empty());
+        }
+
         // Thread 0 is the init/idle thread (uses current page directory)
         THREADS[0].tid = 0;
         THREADS[0].pid = 0;

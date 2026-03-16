@@ -15,8 +15,8 @@ rust_static_library(
 
 genrule(
     name = "printmsg_elf",
-    srcs = [":printmsg_lib", "//apps/init:user.ld"],
+    srcs = [":printmsg_lib", "//crt:user.ld"],
     outs = ["printmsg.elf"],
-    cmd = "ld.lld -m elf_i386 -T $(location //apps/init:user.ld) -o $@ $(location :printmsg_lib)",
+    cmd = "ld.lld -m elf_i386 -T $(location //crt:user.ld) -o $@ $(location :printmsg_lib)",
     visibility = ["//visibility:public"],
 )

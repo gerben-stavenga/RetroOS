@@ -16,9 +16,9 @@ rust_static_library(
 
 genrule(
     name = "stress64_elf_raw",
-    srcs = [":stress64_lib", "//apps/hello64:user64.ld"],
+    srcs = [":stress64_lib", "//crt:user64.ld"],
     outs = ["stress64.elf"],
-    cmd = "ld.lld -m elf_x86_64 -T $(location //apps/hello64:user64.ld) -o $@ $(location :stress64_lib)",
+    cmd = "ld.lld -m elf_x86_64 -T $(location //crt:user64.ld) -o $@ $(location :stress64_lib)",
 )
 
 x86_64_target(
