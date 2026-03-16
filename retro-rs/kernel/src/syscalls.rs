@@ -81,6 +81,10 @@ pub fn dispatch(regs: &mut Regs) {
     };
 
     regs.rax = result as u32 as u64;
+
+    if syscall_num == 4 {
+        println!("dispatch fork: result={} regs.rax={}", result, regs.rax);
+    }
 }
 
 /// Exit syscall (0)
@@ -133,7 +137,7 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
     // Child returns 0
     thread::set_return(child, 0);
 
-    println!("Fork: parent={} child={}", current.tid, child.tid);
+    println!("Fork: parent={} child={} child.rax={}", current.tid, child.tid, child.cpu_state.rax);
 
     // Parent returns child's TID
     child.tid
@@ -178,6 +182,7 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     };
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
+    println!("exec: want_64={} entry={:#x}", want_64, loaded.entry);
     if want_64 && !paging2::cpu_supports_long_mode() {
         thread::exit_thread(-ENOEXEC);
     }
@@ -188,16 +193,14 @@ fn sys_exec(regs: &mut Regs) -> i32 {
         // Toggle CPU mode if needed
         if want_64 != current.is_64bit {
             paging2::ensure_trampoline_mapped();
-            if want_64 {
-                let cr3 = paging2::pml4_cr3(current.root.vroot_phys());
-                descriptors::toggle_mode(cr3);
-                current.is_64bit = true;
-            } else {
-                descriptors::toggle_mode(current.root.cr3());
-                paging2::flush_tlb();
+            if !want_64 {
+                paging2::sync_hw_pdpt();
             }
+            descriptors::toggle_mode(paging2::toggle_cr3(want_64));
+            current.is_64bit = want_64;
         }
 
+        println!("exec: setting up stack");
         // Set up argv on the new user stack and get the adjusted SP
         let word = if want_64 { 8usize } else { 4usize };
         let stack = setup_user_stack(&args, want_64, word);
@@ -211,6 +214,7 @@ fn sys_exec(regs: &mut Regs) -> i32 {
             thread::init_process_thread(current, loaded.entry as u32, stack.sp as u32);
         }
 
+        println!("exec: calling exit_to_thread");
         current.symbols = symbols;
         thread::exit_to_thread(current);
     }

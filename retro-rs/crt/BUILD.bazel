@@ -1,5 +1,7 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
 
+exports_files(["user.ld", "user64.ld"])
+
 rust_library(
     name = "crt",
     srcs = ["src/lib.rs"],

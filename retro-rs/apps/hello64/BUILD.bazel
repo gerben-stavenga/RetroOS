@@ -1,8 +1,6 @@
 load("@rules_rust//rust:defs.bzl", "rust_static_library")
 load("//toolchain:transitions.bzl", "x86_64_target")
 
-exports_files(["user64.ld"])
-
 rust_static_library(
     name = "hello64_lib",
     srcs = ["src/main.rs"],
@@ -18,9 +16,9 @@ rust_static_library(
 
 genrule(
     name = "hello64_elf_raw",
-    srcs = [":hello64_lib", "user64.ld"],
+    srcs = [":hello64_lib", "//crt:user64.ld"],
     outs = ["hello64.elf"],
-    cmd = "ld.lld -m elf_x86_64 -T $(location user64.ld) -o $@ $(location :hello64_lib)",
+    cmd = "ld.lld -m elf_x86_64 -T $(location //crt:user64.ld) -o $@ $(location :hello64_lib)",
 )
 
 # Transition wrapper: builds hello64 for x86_64 platform

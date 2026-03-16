@@ -1,62 +1,90 @@
-//! Unified paging with recursive scheme
+//! # Paging design
 //!
-//! Supports both legacy 32-bit paging and PAE paging with a common interface.
-//!
-//! # Recursive mapping
-//!
-//! `entries[i]` is the page table entry for virtual page `i`. One self-referential
-//! entry (the "recursive entry") makes the entire page table hierarchy visible as
-//! a region within this flat array. `parent_index(i) = PAGE_TABLE_BASE_IDX + i / epp`
-//! gives the entry that maps the page containing `entries[i]`.
-//!
-//! The recursive entry is a fixed point: `parent_index(recursive) == recursive`.
-//! It divides the array into user and kernel:
-//!
-//! - `entries[0..recursive]` — user (U/S=1). Leaf PTEs and their page table ancestors.
-//! - `entries[recursive..]` — kernel (U/S=0). Recursive entry, kernel page tables, kernel leaves.
-//!
-//! COW sharing applies only below the recursive entry. The recursive entry itself
-//! is always present and hw_writable.
-//!
-//! # Memory layout
+//! ## Address space layout
 //!
 //! ```text
-//! 0x00000000 - 0xBFFFFFFF  User space (3 GB)
+//! 0x00000000 - 0xBFFFFFFF  User space (3 GB, 3 root entries)
 //! 0xC0000000 - 0xC07FFFFF  Recursive page tables (8 MB)
-//! 0xC0800000 - 0xC09FFFFF  PML4 region (2 MB, for future long mode)
-//! 0xC0A00000 - 0xC0AFFFFF  Low memory (1 MB, VGA/BIOS)
+//! 0xC0800000 - 0xC09FFFFF  PML4 region (2 MB, compat mode only)
+//! 0xC0A00000 - 0xC0AFFFFF  Low memory (1 MB, VGA/BIOS identity map)
 //! 0xC0B00000 - ...         Kernel code/data
 //! ```
 //!
-//! Legacy mode: PD[768] → PD (recursive entry at entries[0xC0300])
-//! PAE mode:    PDPT[3] → PDPT (recursive entry at entries[0xC0603])
+//! ## Recursive mapping
 //!
-//! # PAE recursive mapping
+//! One entry in the root page table points back to itself. This makes
+//! the entire page table hierarchy appear as a flat array at 0xC0000000:
 //!
-//! It is commonly claimed (e.g. on OSDev) that PAE cannot use recursive paging
-//! because the PDPT is only 4 entries and a self-referential entry "wastes 1GB."
-//! This is wrong on both counts:
+//!   `entries[i]` = page table entry for virtual page `i`
+//!   `parent_index(i) = PAGE_TABLE_BASE_IDX + i / epp`
 //!
-//! 1. The PDPT is 4 entries (32 bytes), but it lives in a 4KB page. The CPU only
-//!    reads the first 4 entries during its page walk. The remaining 508 entries
-//!    on that page are ignored by hardware — but through the recursive mapping,
-//!    they appear in `entries[]` and work as regular kernel page table entries.
+//! The recursive entry is the fixed point of parent_index. It divides
+//! entries[] into user (below) and kernel (at and above). COW sharing
+//! applies only to user entries.
 //!
-//! 2. The 1GB virtual range claimed by the recursive PDPT slot is mostly
-//!    not-present entries that cost nothing (demand paged). The actual page table
-//!    pages within that range are at most 4 page directories + 2048 page tables
-//!    = 8MB. This is far cheaper than Linux's approach on 32-bit, which reserves
-//!    up to 896MB of kernel virtual space for a direct physical memory map (and
-//!    still can't address all RAM above that, requiring HIGHMEM).
+//! All operations — fork, COW, free, fault handling — are generic over
+//! entry size and work identically for any paging depth. The formula
+//! above is the same for 2-level, 3-level, and 4-level paging. Only
+//! epp (entries per page: 1024 for 32-bit, 512 for 64-bit) differs.
 //!
-//! # Mode-generic code
+//! ## Constant root page
 //!
-//! All paging operations are generic over `Entry` (32-bit or 64-bit) and compute
-//! structure from `epp()` (entries per page) and `levels()` at runtime. The
-//! recursive mapping normalizes all modes into the same flat array — the formula
-//! `parent_index(i) = PAGE_TABLE_BASE_IDX + i / epp` is identical for legacy,
-//! PAE, and (future) 4-level paging. Only the number of hops to the fixed point
-//! changes.
+//! The root page table (PD or PDPT) is a constant static page in the
+//! kernel. Kernel entries (recursive, PML4 back-pointer, kernel PTs)
+//! live in this constant page and are automatically shared by all
+//! processes. Only user entries differ per-process.
+//!
+//! Per-thread storage (`RootPageTable`):
+//! - Legacy: 768 saved PD entries (user PD[0..768])
+//! - PAE/Compat: 3 saved PDPT entries (user PDPT[0..3]) + CR3
+//!
+//! Context switch: load thread's user entries into the constant root,
+//! then reload CR3 (flushes TLB, re-reads hardware PDPT in PAE).
+//!
+//! ## Legacy mode (i386, 2-level)
+//!
+//! ```text
+//! PD (constant static page, 1024 entries, 4B each)
+//! ├── PD[0..767]   → user PTs (per-process, swapped at ctx switch)
+//! ├── PD[768]      → PD (recursive, constant)
+//! └── PD[770]      → kernel PT (constant)
+//! ```
+//!
+//! - CR3 = PD phys (constant)
+//! - Fork: share_and_copy(PD). Auto-patches PD[768]→self. Done.
+//!
+//! ## Compat mode (x86-64, 4-level, 32-bit kernel in compatibility mode)
+//!
+//! ```text
+//! PML4 (constant static page, CR3 points here)
+//! └── PML4[0]      → PDPT (constant)
+//!
+//! PDPT (constant static page)
+//! ├── PDPT[0..2]   → user PDs (per-process, swapped at ctx switch)
+//! ├── PDPT[3]      → PDPT (recursive, constant)
+//! ├── PDPT[4]      → PML4 (back-pointer, constant)
+//! └── PDPT[5]      → kernel PT (constant)
+//! ```
+//!
+//! - CR3 = PML4 phys (constant, unless 64-bit process deshares PML4)
+//! - Fork: share_and_copy(PDPT). Auto-patches PDPT[3]→self.
+//!   Shares PDPT[0..2] (user PDs) and PDPT[4] (PML4). Done.
+//!
+//! ## PAE mode (pre-x86-64, 3-level)
+//!
+//! Same as compat (constant PDPT, fork share_and_copy), plus one
+//! workaround: PAE hardware ignores R/W on PDPT entries, so COW
+//! can't be enforced at that level. After fork, deshare PDPT[0..2]
+//! immediately (cow_entry each shared PD). This pushes COW enforcement
+//! to the PD level where hardware respects R/W.
+//!
+//! PAE CR3 points to a 32-byte hardware PDPT (separate static mut),
+//! updated from the constant PDPT at context switch.
+//!
+//! ## Fork (all modes)
+//!
+//! share_and_copy the root (PD for legacy, PDPT for PAE/compat).
+//! Self-referential entries are auto-patched. PAE deshares [0..2].
 
 use core::ops::{Index, IndexMut};
 
@@ -79,86 +107,146 @@ pub const LOW_MEM_BASE: usize = 0xC0A0_0000;
 /// Kernel space starts here (PDPT[5+], after low memory)
 pub const KERNEL_BASE: usize = 0xC0B0_0000;
 
-/// Per-process root page table. A union because the representation differs:
-/// - Legacy/PML4: just the physical address of the root page table (= CR3 value)
-/// - PAE: 4 sanitized PDPT entries, 32-byte aligned. CR3 = physical address of this.
-#[repr(C, align(32))]
+/// Per-thread saved root page table entries.
+///
+/// The root page (PD or PDPT) is a constant static page. This struct
+/// holds the per-process user entries that get swapped into the constant
+/// root at context switch.
+///
+/// - Legacy: 768 PD entries (user PD[0..768])
+/// - PAE/Compat: 3 PDPT entries (user PDPT[0..3]) + CR3 value
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub union RootPageTable {
-    pub phys: u32,
-    pdpt: [u64; 4],
+    pub e32: [Entry32; 768],    // Legacy: user PD entries
+    pub e64: [Entry64; 4],      // PAE/Compat: PDPT[0..3] + CR3
 }
+
+/// Hardware PDPT for PAE mode (32 bytes, loaded by CPU on CR3 reload).
+/// Separate from the constant virtual PDPT page.
+#[repr(C, align(32))]
+struct HwPdpt([u64; 4]);
+static mut HW_PDPT: HwPdpt = HwPdpt([0; 4]);
 
 impl RootPageTable {
     pub const fn empty() -> Self {
-        RootPageTable { pdpt: [0; 4] }
+        RootPageTable { e32: [Entry32(0); 768] }
     }
 
     /// Initialize from the current (active) address space.
+    /// Saves current user entries from the constant root.
     pub fn init_current(&mut self) {
-        if is_pae() {
-            // Set recursive entry so self-map works; user entries synced by flush_tlb
-            let rec = recursive_idx();
-            if let Entries::E64(e) = entries() {
-                let rec_slot = rec - root_base();
-                unsafe { self.pdpt[rec_slot] = Entry64::new(e[rec].page(), false, false).0; }
-            }
-        } else {
-            self.phys = current_root_phys() as u32;
-        }
+        self.save();
     }
 
-    /// Initialize from a forked virtual root.
-    pub fn init_fork(&mut self, root_phys: u64) {
-        if is_pae() {
-            // Set recursive entry pointing to child's vroot; user entries synced by flush_tlb
-            let rec_slot = recursive_idx() - root_base();
-            unsafe { self.pdpt[rec_slot] = Entry64::new(root_phys / PAGE_SIZE as u64, false, false).0; }
-        } else {
-            self.phys = root_phys as u32;
-        }
-    }
-
-    /// Physical address of the virtual root page table.
-    pub fn vroot_phys(&self) -> u64 {
+    /// Save user entries from the constant root into this struct.
+    pub fn save(&mut self) {
         match cpu_mode() {
-            CpuMode::Pae => {
-                // Recursive entry in pdpt[3] has the vroot page
-                Entry64(unsafe { self.pdpt[3] }).page() * PAGE_SIZE as u64
+            CpuMode::Legacy => {
+                if let Entries::E32(e) = entries() {
+                    let root = root_base();
+                    let user_count = recursive_idx() - root;
+                    for i in 0..user_count {
+                        unsafe { self.e32[i] = e[root + i]; }
+                    }
+                }
             }
-            CpuMode::Compat | CpuMode::Legacy => {
-                unsafe { self.phys as u64 }
-            }
-        }
-    }
-
-    /// CR3 value for this root page table (PAE PDPT physical address).
-    /// In Compat mode the pdpt union field is still the authoritative representation
-    /// (we keep PAE-style page tables even in long mode).
-    pub fn cr3(&self) -> u32 {
-        match cpu_mode() {
             CpuMode::Pae | CpuMode::Compat => {
-                let vaddr = unsafe { &self.pdpt } as *const _ as usize;
-                let page = physical_page(vaddr);
-                (page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64) as u32
+                if let Entries::E64(e) = entries() {
+                    let root = root_base();
+                    let user_count = recursive_idx() - root;
+                    for i in 0..user_count {
+                        unsafe { self.e64[i] = e[root + i]; }
+                    }
+                    unsafe { self.e64[3] = Entry64(root_cr3()); }
+                }
             }
-            CpuMode::Legacy => unsafe { self.phys },
         }
     }
 
-    /// Mutable pdpt slice for PAE COW updates. None for legacy.
-    pub fn pdpt_mut(&mut self) -> Option<&mut [u64; 4]> {
+    /// Load user entries from this struct into the constant root.
+    /// Does NOT reload CR3 — call activate() for that, or use with
+    /// toggle_cr3() when a mode switch follows.
+    pub fn load_entries(&self) {
         match cpu_mode() {
-            CpuMode::Pae | CpuMode::Compat => Some(unsafe { &mut self.pdpt }),
-            CpuMode::Legacy => None,
+            CpuMode::Legacy => {
+                if let Entries::E32(e) = entries() {
+                    let root = root_base();
+                    let user_count = recursive_idx() - root;
+                    for i in 0..user_count {
+                        e[root + i] = unsafe { self.e32[i] };
+                    }
+                }
+            }
+            CpuMode::Pae | CpuMode::Compat => {
+                if let Entries::E64(e) = entries() {
+                    let root = root_base();
+                    let user_count = recursive_idx() - root;
+                    for i in 0..user_count {
+                        e[root + i] = unsafe { self.e64[i] };
+                    }
+                }
+            }
         }
     }
 
-    /// Load this root page table into CR3.
-    /// The pdpt entries are already correct — set at fork time and kept
-    /// in sync by the page fault handler after COW resolution.
+    /// Load user entries into constant root and reload CR3.
+    /// Use when no mode toggle is needed.
     pub fn activate(&self) {
-        unsafe { crate::x86::write_cr3(self.cr3()); }
+        self.load_entries();
+        if cpu_mode() == CpuMode::Pae {
+            sync_hw_pdpt();
+        }
+        unsafe { crate::x86::write_cr3(self.cr3() as u32); }
+    }
+
+    /// CR3 value for this address space.
+    /// - Legacy: constant PD phys
+    /// - PAE: constant hardware PDPT phys
+    /// - Compat: PML4 phys from e64[3] (constant unless deshared)
+    pub fn cr3(&self) -> u64 {
+        match cpu_mode() {
+            CpuMode::Legacy => current_root_phys(),
+            CpuMode::Pae => unsafe {
+                let vaddr = (&raw const HW_PDPT) as usize;
+                let page = physical_page(vaddr);
+                page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64
+            },
+            CpuMode::Compat => unsafe { self.e64[3].0 & !(PAGE_SIZE as u64 - 1) },
+        }
+    }
+
+    /// Initialize for a forked child.
+    /// Copies user entries from the forked root page (via temp_map)
+    /// and sets CR3.
+    pub fn init_fork(&mut self, new_root_phys: u64) {
+        match cpu_mode() {
+            CpuMode::Legacy => {
+                let user_count = recursive_idx() - root_base();
+                temp_map(new_root_phys);
+                unsafe {
+                    let src = temp_map_vaddr() as *const Entry32;
+                    for i in 0..user_count {
+                        self.e32[i] = *src.add(i);
+                    }
+                }
+                temp_unmap();
+            }
+            CpuMode::Pae | CpuMode::Compat => {
+                let user_count = recursive_idx() - root_base();
+                temp_map(new_root_phys);
+                unsafe {
+                    let src = temp_map_vaddr() as *const Entry64;
+                    for i in 0..user_count {
+                        self.e64[i] = *src.add(i);
+                    }
+                }
+                temp_unmap();
+                if let Some(parent) = crate::thread::current() {
+                    unsafe { self.e64[3] = parent.root.e64[3]; }
+                }
+            }
+        }
     }
 }
 
@@ -364,56 +452,66 @@ static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 /// and corrupts PML4 entries.
 pub fn setup_long_mode_tables() {
     let pdpt_phys = crate::x86::read_cr3() as u64;
+    let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
 
     // PML4[0] = PDPT (so long mode uses same mappings)
     unsafe { PML4[0] = Entry64::new(pdpt_phys >> 12, true, true); }
+
+    // PDPT[4] = PML4 (back-pointer so PML4 is visible in recursive mapping)
+    if let Entries::E64(e) = entries() {
+        e[root_base() + 4] = Entry64::new(pml4_phys, true, false);
+    }
 }
 
-/// Update PML4[0] to point to a virtual root PDPT and return
-/// the PML4 physical address (suitable for CR3 in long mode).
-pub fn pml4_cr3(vroot_phys: u64) -> u32 {
-    let vroot_page = vroot_phys / PAGE_SIZE as u64;
-    unsafe { PML4[0] = Entry64::new(vroot_page, true, true); }
-    pml4_phys()
+/// Get the root CR3 value (constant PD/PML4 phys).
+/// For legacy: PD phys. For PAE: HW_PDPT phys. For compat: PML4 phys.
+pub fn root_cr3() -> u64 {
+    match cpu_mode() {
+        CpuMode::Legacy => current_root_phys(),
+        CpuMode::Pae => unsafe {
+            let vaddr = (&raw const HW_PDPT) as usize;
+            let page = physical_page(vaddr);
+            page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64
+        },
+        CpuMode::Compat => {
+            let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
+            pml4_phys * PAGE_SIZE as u64
+        },
+    }
 }
 
-/// PML4 physical address (for CR3).
-pub fn pml4_phys() -> u32 {
-    let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
-    (pml4_phys * PAGE_SIZE as u64) as u32
+/// CR3 for the TARGET mode after a toggle.
+/// PAE→compat (want_64=true): PML4 phys
+/// compat→PAE (want_64=false): HW_PDPT phys
+/// Call load_entries() + sync_hw_pdpt() before this when going to PAE.
+pub fn toggle_cr3(want_64: bool) -> u32 {
+    if want_64 {
+        // Target is long/compat mode → CR3 = PML4 phys
+        let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
+        (pml4_phys * PAGE_SIZE as u64) as u32
+    } else {
+        // Target is PAE → CR3 = HW_PDPT phys
+        unsafe {
+            let vaddr = (&raw const HW_PDPT) as usize;
+            let page = physical_page(vaddr);
+            (page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64) as u32
+        }
+    }
 }
 
-/// Sync the hardware PDPT from the virtual root (PAE only).
-///
-/// The PAE PDPT hardware ignores R/W and U/S bits, so COW can't be
-/// enforced at that level. We compensate by desharing all user PDPT
-/// entries (giving this process sole ownership of its PD pages) and
-/// then copying to the local pdpt with U/S=0.
-///
-/// This is the ONLY PAE-specific paging logic. Everything else
-/// (fork, COW, fault handling) is mode-ignorant.
-fn sync_pae_pdpt() {
-    if cpu_mode() != CpuMode::Pae { return; }
-    let Some(thread) = crate::thread::current() else { return; };
+/// Copy constant PDPT[0..4] to the hardware PDPT (PAE only).
+/// Sanitizes entries: R/W=0, U/S=0 (hardware ignores these, but
+/// keep them clean).
+pub fn sync_hw_pdpt() {
+    if cpu_mode() == CpuMode::Legacy { return; }
 
     if let Entries::E64(e) = entries() {
         let root = root_base();
-        let user_count = recursive_idx() - root;
-
-        // Deshare: ensure each user PDPT entry is solely owned
-        for i in 0..user_count {
-            if e[root + i].present() && !e[root + i].hw_writable() {
-                cow_entry(e, root + i);
-            }
-        }
-
-        // Copy to local pdpt (sanitize: R/W=0, U/S=0 for hardware)
-        let pdpt = unsafe { &mut thread.root.pdpt };
         for i in 0..4 {
             let mut entry = e[root + i];
             entry.set_hw_writable(false);
             entry.set_user(false);
-            pdpt[i] = entry.0;
+            unsafe { HW_PDPT.0[i] = entry.0; }
         }
     }
 }
@@ -554,10 +652,10 @@ fn invalidate_tlb() {
     crate::x86::flush_tlb();
 }
 
-/// Flush TLB. In PAE mode, also deshares and syncs the hardware PDPT
+/// Flush TLB. In PAE mode, also syncs the hardware PDPT
 /// before reloading CR3.
 pub fn flush_tlb() {
-    sync_pae_pdpt();
+    sync_hw_pdpt();
     crate::x86::flush_tlb();
 }
 
@@ -850,9 +948,8 @@ pub fn pde_index<E: Entry>(page: usize) -> usize {
 
 /// Fork the current address space using lazy copy-on-write.
 ///
-/// Copies only the root page table. All child page tables are shared
-/// read-only. The page fault handler resolves sharing lazily at every
-/// level via the recursive mapping — same algorithm for all paging modes.
+/// share_and_copy's the root page table. All child page tables are shared
+/// read-only. Returns the new root's physical page number.
 pub fn fork_current() -> Option<u64> {
     match entries() {
         Entries::E32(e) => fork_generic(e),
@@ -860,22 +957,31 @@ pub fn fork_current() -> Option<u64> {
     }
 }
 
-/// Generic fork: COW the root page table for a new address space.
+/// Fork the current address space (COW).
+///
+/// All modes: share_and_copy the root (PD for legacy, PDPT for PAE/compat).
+/// Self-referential entries are auto-patched by share_and_copy.
+/// PAE: additionally deshare user entries [0..recursive) because PAE
+/// hardware ignores R/W on PDPT entries.
+///
+/// Returns the new root's physical page number.
 fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
-    let rec_idx = recursive_idx();
-    let new_root = share_and_copy(entries, rec_idx)?;
+    let new_root = share_and_copy(entries, recursive_idx())?;
 
-    // Patch recursive entry in new copy to point to itself
-    temp_map(new_root);
-    unsafe {
-        let dst = temp_map_vaddr() as *mut E;
-        let user_count = rec_idx - root_base();
-        *dst.add(user_count) = E::new(new_root, true, false);
+    // PAE: deshare user entries — hardware ignores R/W on PDPT entries,
+    // so we eagerly COW user PDs to push enforcement to the PD level.
+    if cpu_mode() == CpuMode::Pae {
+        let root = root_base();
+        let user_count = recursive_idx() - root;
+        for i in 0..user_count {
+            if entries[root + i].present() && !entries[root + i].hw_writable() {
+                cow_entry(entries, root + i);
+            }
+        }
     }
-    temp_unmap();
 
-    invalidate_tlb();
-    Some(new_root * PAGE_SIZE as u64)
+    flush_tlb();
+    Some(new_root)
 }
 
 // =============================================================================
@@ -913,14 +1019,22 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
         epp
     };
 
-    // Copy parent -> child via temp_map, marking user entries R/O
+    // Copy parent -> child via temp_map, marking user entries R/O.
+    // Self-referential entries (e.g. PDPT[3] recursive) are patched
+    // to point to the new copy.
     temp_map(new_phys);
     unsafe {
         let dst = temp_map_vaddr() as *mut E;
         for i in 0..epp {
             let mut e = entries[child_base + i];
-            if e.present() && i < user_count {
-                e.set_hw_writable(false);
+            if e.present() {
+                if i < user_count {
+                    e.set_hw_writable(false);
+                }
+                if e.page() == parent_phys {
+                    // Self-referential → point to new copy
+                    e = E::new(new_phys, true, false);
+                }
             }
             *dst.add(i) = e;
         }
