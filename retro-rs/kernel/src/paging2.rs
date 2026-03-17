@@ -155,10 +155,21 @@ impl RootPageTable {
                 if let Entries::E64(e) = entries() {
                     let root = root_base();
                     let user_count = recursive_idx() - root;
+                    // Debug: detect PDPT[0] R/O → R/W transition
+                    let was_ro = unsafe { self.e64[0].0 & flags::READ_WRITE == 0 && self.e64[0].0 & flags::PRESENT != 0 };
+                    let now_rw = e[root].hw_writable();
+                    if was_ro && now_rw {
+                        let tid = crate::thread::current().map_or(-1, |t| t.tid);
+                        crate::println!("SAVE-BUG: tid={} PDPT[0] was R/O now R/W! old={:#x} new={:#x}",
+                            tid, unsafe { self.e64[0].0 }, e[root].raw());
+                    }
                     for i in 0..user_count {
                         unsafe { self.e64[i] = e[root + i]; }
                     }
-                    unsafe { self.e64[3] = Entry64(root_cr3()); }
+                    // Always save PML4 phys (from PDPT[4] back-pointer),
+                    // so cr3() works regardless of which mode we restore in.
+                    let pml4_page = e[root + 4].page();
+                    unsafe { self.e64[3] = Entry64(pml4_page * PAGE_SIZE as u64); }
                 }
             }
         }
@@ -185,6 +196,7 @@ impl RootPageTable {
                     for i in 0..user_count {
                         e[root + i] = unsafe { self.e64[i] };
                     }
+                    // Debug removed
                 }
             }
         }
@@ -203,7 +215,7 @@ impl RootPageTable {
     /// CR3 value for this address space.
     /// - Legacy: constant PD phys
     /// - PAE: constant hardware PDPT phys
-    /// - Compat: PML4 phys from e64[3] (constant unless deshared)
+    /// - Compat: PML4 phys from e64[3] (saved from PDPT[4] back-pointer)
     pub fn cr3(&self) -> u64 {
         match cpu_mode() {
             CpuMode::Legacy => current_root_phys(),
@@ -240,6 +252,7 @@ impl RootPageTable {
                     for i in 0..user_count {
                         self.e64[i] = *src.add(i);
                     }
+                    // (init_fork debug removed)
                 }
                 temp_unmap();
                 if let Some(parent) = crate::thread::current() {
@@ -578,7 +591,7 @@ pub fn recursive_idx() -> usize {
 
 /// First child of the recursive entry — start of the root page table entries.
 #[inline]
-fn root_base() -> usize {
+pub fn root_base() -> usize {
     (recursive_idx() - PAGE_TABLE_BASE_IDX) * epp()
 }
 
@@ -968,9 +981,24 @@ pub fn fork_current() -> Option<u64> {
 fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
     let new_root = share_and_copy(entries, recursive_idx())?;
 
-    // PAE: deshare user entries — hardware ignores R/W on PDPT entries,
-    // so we eagerly COW user PDs to push enforcement to the PD level.
-    if cpu_mode() == CpuMode::Pae {
+    // Verify PDPT[0] is R/O after share_and_copy
+    if cpu_mode() == CpuMode::Compat {
+        let root = root_base();
+        if entries[root].present() && entries[root].hw_writable() {
+            let tid = crate::thread::current().map_or(-1, |t| t.tid);
+            crate::println!("FORK-BUG: tid={} PDPT[0] still R/W after share_and_copy! raw={:#x}",
+                tid, entries[root].raw());
+        }
+    }
+
+    // Deshare user root entries (PDPT[0..2] in PAE, PDPT[0..2] in Compat).
+    // PAE hardware ignores R/W on PDPT entries, so COW can't be enforced
+    // at that level — eagerly COW to push enforcement to PD level.
+    // Compat mode CAN enforce R/W on PDPT entries, but the cascading COW
+    // chain (nested faults resolving higher levels) has a subtle bug where
+    // cow_entry for a PDE triggers a nested fault that COWs PDPT[0],
+    // replacing the PD page mid-operation. Deshare avoids this.
+    if cpu_mode() == CpuMode::Pae || cpu_mode() == CpuMode::Compat {
         let root = root_base();
         let user_count = recursive_idx() - root;
         for i in 0..user_count {
@@ -1073,6 +1101,14 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     let old_phys = entries[idx].page();
     let ref_count = phys_mm::get_ref_count(old_phys);
 
+    // Debug: track COW of root entries (PDPT[0..2])
+    let root = root_base();
+    if idx >= root && idx < root + 3 {
+        let tid = crate::thread::current().map_or(-1, |t| t.tid);
+        crate::println!("COW-ROOT: tid={} idx={:#x} PDPT[{}] raw={:#x} page={:#x} ref={}",
+            tid, idx, idx - root, entries[idx].raw(), old_phys, ref_count);
+    }
+
     if ref_count == 1 {
         // Sole owner — just make writable
         entries[idx].set_hw_writable(true);
@@ -1154,8 +1190,17 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 
     let epp = entries_per_page::<E>();
     let phys = entries[parent_idx].page();
+    let ref_count = phys_mm::get_ref_count(phys);
 
-    if phys_mm::get_ref_count(phys) == 1 {
+    // Debug: track root-level frees
+    let root = root_base();
+    if parent_idx >= root && parent_idx < root + 3 {
+        let tid = crate::thread::current().map_or(-1, |t| t.tid);
+        crate::println!("FREE-ROOT: tid={} PDPT[{}] page={:#x} ref={}",
+            tid, parent_idx - root, phys, ref_count);
+    }
+
+    if ref_count == 1 {
         // Sole owner — walk children
         let child_base = (parent_idx - PAGE_TABLE_BASE_IDX) * epp;
         for j in 0..epp {

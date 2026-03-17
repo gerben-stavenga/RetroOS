@@ -182,9 +182,20 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     descriptors::setup_descriptor_tables(stack_top);
     println!("Descriptors initialized");
 
-    // Setup PIC and enable interrupts
+    // Setup PIC and enable interrupts (must happen before mode toggle,
+    // because toggle_mode calls sti() and unmapped PIC would crash)
     irq::init_interrupts();
     println!("Interrupts initialized");
+
+    // If CPU supports long mode, switch to compat mode now.
+    // All code (32-bit and 64-bit user processes) runs in compat mode.
+    if paging2::cpu_supports_long_mode() {
+        paging2::sync_hw_pdpt();
+        x86::flush_tlb();
+        paging2::ensure_trampoline_mapped();
+        descriptors::toggle_mode(paging2::toggle_cr3(true));
+        println!("Switched to Compat mode");
+    }
 
     // Enable interrupts
     x86::sti();
@@ -300,31 +311,44 @@ pub struct Regs {
 }
 
 impl Regs {
+    /// In compat mode, the CPU always pushes Frame64 (even for 32-bit user code)
+    fn use_f64() -> bool {
+        crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat
+    }
+
     /// Get instruction pointer (works for both 32 and 64-bit modes)
     pub fn ip(&self) -> u64 {
-        // In 32-bit mode, use f32.eip. In 64-bit mode, use f64.rip.
-        // For now assume 32-bit kernel mode.
-        unsafe { self.frame.f32.eip as u64 }
+        unsafe {
+            if Self::use_f64() { self.frame.f64.rip } else { self.frame.f32.eip as u64 }
+        }
     }
 
     /// Get code segment
     pub fn code_seg(&self) -> u16 {
-        unsafe { self.frame.f32.cs as u16 }
+        unsafe {
+            if Self::use_f64() { self.frame.f64.cs as u16 } else { self.frame.f32.cs as u16 }
+        }
     }
 
     /// Get flags
     pub fn flags(&self) -> u64 {
-        unsafe { self.frame.f32.eflags as u64 }
+        unsafe {
+            if Self::use_f64() { self.frame.f64.rflags } else { self.frame.f32.eflags as u64 }
+        }
     }
 
     /// Get stack pointer
     pub fn sp(&self) -> u64 {
-        unsafe { self.frame.f32.esp as u64 }
+        unsafe {
+            if Self::use_f64() { self.frame.f64.rsp } else { self.frame.f32.esp as u64 }
+        }
     }
 
     /// Get stack segment
     pub fn stack_seg(&self) -> u16 {
-        unsafe { self.frame.f32.ss as u16 }
+        unsafe {
+            if Self::use_f64() { self.frame.f64.ss as u16 } else { self.frame.f32.ss as u16 }
+        }
     }
 }
 
