@@ -2,6 +2,35 @@
 #![no_main]
 
 /// 32-bit stress test: fork a binary tree to depth, alternating 32/64-bit execs.
+/// Verifies COW by filling pages with a marker before fork and checking after.
+
+/// 4 pages of memory for COW verification
+const CHECK_WORDS: usize = 4 * 4096 / 4;
+static mut MEM_CHECK: [u32; CHECK_WORDS] = [0; CHECK_WORDS];
+
+fn fill_pages(marker: u32) {
+    let base = unsafe { &raw mut MEM_CHECK } as *mut u32;
+    for i in 0..CHECK_WORDS {
+        unsafe { core::ptr::write_volatile(base.add(i), marker); }
+    }
+}
+
+fn check_pages(marker: u32) {
+    let base = unsafe { &raw const MEM_CHECK } as *const u32;
+    for i in 0..CHECK_WORDS {
+        let val = unsafe { core::ptr::read_volatile(base.add(i)) };
+        if val != marker {
+            crt::print("FAIL: mem[");
+            crt::print_num(i as i32);
+            crt::print("] = ");
+            crt::print_num(val as i32);
+            crt::print(" expected ");
+            crt::print_num(marker as i32);
+            crt::print("\n");
+            crt::exit(2);
+        }
+    }
+}
 
 #[unsafe(no_mangle)]
 pub fn main(args: &[&str]) {
@@ -18,14 +47,18 @@ fn stress(depth: i32) {
         return;
     }
 
-    // Fork child 1: stays 32-bit, recurses
+    // Fill pages with depth-unique marker before forking
+    let marker = depth as u32 | 0xDEAD_0000;
+    fill_pages(marker);
+
+    // Fork child 1: stays 32-bit, recurses (gets COW copy, will overwrite in recursive stress)
     let pid1 = crt::fork();
     if pid1 == 0 {
         stress(depth - 1);
         crt::exit(0);
     }
 
-    // Fork child 2: exec into 64-bit stress test with decremented depth
+    // Fork child 2: exec into 64-bit stress test (gets COW copy, exec frees it)
     let pid2 = crt::fork();
     if pid2 == 0 {
         let mut buf = [0u8; 12];
@@ -36,4 +69,7 @@ fn stress(depth: i32) {
     }
 
     crt::wait_all();
+
+    // Verify our pages survived children's COW writes and exec
+    check_pages(marker);
 }

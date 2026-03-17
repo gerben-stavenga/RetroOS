@@ -133,6 +133,7 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
     // Copy CPU state and mode from parent to child
     child.cpu_state = current.cpu_state;
     child.is_64bit = current.is_64bit;
+    child.frame_is_64 = current.frame_is_64;
 
     // Child returns 0
     thread::set_return(child, 0);
@@ -190,13 +191,21 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     let symbols = SymbolData::new(buffer.into_boxed_slice());
 
     if let Some(current) = thread::current() {
-        // Toggle CPU mode if needed
+        // Toggle CPU mode if needed (PAE → Compat)
+        // In compat mode, both 32/64-bit run without toggling.
         if want_64 != current.is_64bit {
-            paging2::ensure_trampoline_mapped();
-            if !want_64 {
-                paging2::sync_hw_pdpt();
+            let need_toggle = match paging2::cpu_mode() {
+                paging2::CpuMode::Pae => want_64,
+                paging2::CpuMode::Compat => false,  // TODO: toggle to PAE for VM86
+                _ => false,
+            };
+            if need_toggle {
+                paging2::ensure_trampoline_mapped();
+                if !want_64 {
+                    paging2::sync_hw_pdpt();
+                }
+                descriptors::toggle_mode(paging2::toggle_cr3(want_64));
             }
-            descriptors::toggle_mode(paging2::toggle_cr3(want_64));
             current.is_64bit = want_64;
         }
 

@@ -263,7 +263,16 @@ fn handle_protection_fault<E: paging2::Entry>(
                 if user { segv_current_thread(regs, fault_addr); return; }
                 panic_with_regs("Kernel write to read-only page", regs);
             }
+            // Check if COWing ANY entry corrupts PDPT[0]
+            let root = paging2::root_base();
+            let pre_pdpt0 = entries[root].raw();
             paging2::cow_entry(entries, idx);
+            let post_pdpt0 = entries[root].raw();
+            if pre_pdpt0 != post_pdpt0 && !(idx == root) {
+                let tid = crate::thread::current().map_or(-1, |t| t.tid);
+                println!("CORRUPT: tid={} COW idx={:#x} changed PDPT[0]! {:#x}->{:#x}",
+                    tid, idx, pre_pdpt0, post_pdpt0);
+            }
             paging2::flush_tlb();
             return;
         }
