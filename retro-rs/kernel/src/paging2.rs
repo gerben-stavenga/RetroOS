@@ -1241,6 +1241,54 @@ pub fn ensure_trampoline_mapped() {
     }
 }
 
+/// Map the first 1MB of physical memory as user-accessible (for VM86 mode).
+/// Maps 256 pages (physical 0x00000-0xFFFFF) at virtual 0x00000-0xFFFFF
+/// with User + RW + Exec permissions.
+/// This overwrites the trampoline PTE at page 0xF, but ensure_trampoline_mapped()
+/// (called before every mode toggle) restores it.
+pub fn map_low_mem_user() {
+    match entries() {
+        Entries::E32(e) => map_low_mem_user_generic(e),
+        Entries::E64(e) => map_low_mem_user_generic(e),
+    }
+}
+
+fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
+    // Map 256 pages: virtual page i → physical page i, user+RW
+    for i in 0..256usize {
+        let e = E::new(i as u64, true, true);
+        // Don't set NX — VM86 code needs to be executable
+        entries[i] = e;
+    }
+
+    // A20 disabled by default: map pages 0x100-0x10F → physical 0x000-0x00F
+    // (wrap-around aliasing of first 64KB at the 1MB boundary)
+    for i in 0..16usize {
+        let e = E::new(i as u64, true, true);
+        entries[0x100 + i] = e;
+    }
+
+    flush_tlb();
+}
+
+/// Set A20 gate state for VM86 mode.
+/// When disabled (default): virtual 0x100000-0x10FFFF → physical 0x00000-0x0FFFF (wrap)
+/// When enabled: virtual 0x100000-0x10FFFF → physical 0x100000-0x10FFFF (linear)
+pub fn set_a20(enabled: bool) {
+    match entries() {
+        Entries::E32(e) => set_a20_generic(e, enabled),
+        Entries::E64(e) => set_a20_generic(e, enabled),
+    }
+}
+
+fn set_a20_generic<E: Entry>(entries: &mut [E], enabled: bool) {
+    for i in 0..16usize {
+        let phys = if enabled { 0x100 + i } else { i };
+        entries[0x100 + i] = E::new(phys as u64, true, true);
+    }
+    flush_tlb();
+}
+
 /// Copy trampoline code to physical address 0xF000
 /// Uses LOW_MEM_BASE mapping to access the destination
 pub fn copy_trampoline() {

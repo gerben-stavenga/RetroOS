@@ -7,7 +7,7 @@ use crate::descriptors::{set_kernel_stack, USER_CS, USER_CS64, USER_DS};
 use crate::stacktrace::SymbolData;
 use crate::{KERNEL_STACK, println};
 use crate::x86;
-use crate::Regs;
+use crate::{Frame, Frame32, Frame64, Regs};
 
 /// Maximum number of threads
 pub const MAX_THREADS: usize = 1024;
@@ -26,175 +26,57 @@ pub enum ThreadState {
     Zombie,
 }
 
-use crate::{Frame, Frame32, Frame64};
-
-/// CPU state saved during context switch (matches Regs layout exactly)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CpuState {
-    // Segment registers
-    pub gs: u64,
-    pub fs: u64,
-    pub es: u64,
-    pub ds: u64,
-    // x86-64 extended registers
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    // General purpose registers
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rbp: u64,
-    pub rsp_dummy: u64,
-    pub rbx: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rax: u64,
-    // Interrupt info (zero-extended to 64-bit)
-    pub int_num: u64,
-    pub err_code: u64,
-    // CPU-pushed interrupt frame (union, use f32 for 32-bit mode)
-    pub frame: Frame,
+/// Thread execution mode (user code bitness)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadMode {
+    Mode16,  // VM86 (requires PAE CPU mode)
+    Mode32,  // 32-bit protected/compat
+    Mode64,  // 64-bit long mode
 }
 
-impl CpuState {
-    pub const fn empty() -> Self {
-        CpuState {
-            gs: 0,
-            fs: 0,
-            es: 0,
-            ds: 0,
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rdi: 0,
-            rsi: 0,
-            rbp: 0,
-            rsp_dummy: 0,
-            rbx: 0,
-            rdx: 0,
-            rcx: 0,
-            rax: 0,
-            int_num: 0,
-            err_code: 0,
-            frame: Frame { f32: Frame32 { _pad: [0; 5], eip: 0, cs: 0, eflags: 0, esp: 0, ss: 0 } },
-        }
+/// Saved interrupt frame format
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+    Protected,  // Frame32 (saved in PAE/Legacy CPU mode)
+    Long,       // Frame64 (saved in Compat CPU mode)
+}
+
+impl FrameFormat {
+    /// Frame format used by the current CPU mode
+    pub fn current() -> Self {
+        if Regs::use_f64() { FrameFormat::Long } else { FrameFormat::Protected }
     }
 
-    /// Convert frame from Frame32 to Frame64 format
-    pub fn frame_to_64(&mut self) {
-        unsafe {
-            let f = &self.frame.f32;
-            let eip = f.eip;
-            let cs = f.cs;
-            let eflags = f.eflags;
-            let esp = f.esp;
-            let ss = f.ss;
-            self.frame = Frame {
-                f64: Frame64 {
-                    rip: eip as u64,
-                    cs: cs as u64,
-                    rflags: eflags as u64,
-                    rsp: esp as u64,
-                    ss: ss as u64,
-                }
-            };
-        }
+    pub fn is_long(self) -> bool {
+        self == FrameFormat::Long
     }
+}
 
-    /// Convert frame from Frame64 to Frame32 format
-    pub fn frame_to_32(&mut self) {
-        unsafe {
-            let f = &self.frame.f64;
-            let rip = f.rip;
-            let cs = f.cs;
-            let rflags = f.rflags;
-            let rsp = f.rsp;
-            let ss = f.ss;
-            self.frame = Frame {
-                f32: Frame32 {
-                    _pad: [0; 5],
-                    eip: rip as u32,
-                    cs: cs as u32,
-                    eflags: rflags as u32,
-                    esp: rsp as u32,
-                    ss: ss as u32,
-                }
-            };
-        }
-    }
-
-    /// Get IP from frame, using the given format
-    pub fn ip_as(&self, is_64: bool) -> u64 {
-        unsafe {
-            if is_64 { self.frame.f64.rip } else { self.frame.f32.eip as u64 }
-        }
-    }
-
-    /// Get SP from frame, using the given format
-    pub fn sp_as(&self, is_64: bool) -> u64 {
-        unsafe {
-            if is_64 { self.frame.f64.rsp } else { self.frame.f32.esp as u64 }
-        }
-    }
-
+/// Initialize Regs for user processes (extends Regs with descriptor-aware methods)
+impl Regs {
     /// Initialize for a 32-bit user process
     pub fn init_user_process(&mut self, entry: u32, stack: u32) {
         let ds = USER_DS as u64;
-        const IF_FLAG: u64 = 1 << 9; // Interrupt enable flag
+        const IF_FLAG: u64 = 1 << 9;
 
+        *self = Self::empty();
         self.gs = ds;
         self.fs = ds;
         self.es = ds;
         self.ds = ds;
-        self.r15 = 0;
-        self.r14 = 0;
-        self.r13 = 0;
-        self.r12 = 0;
-        self.r11 = 0;
-        self.r10 = 0;
-        self.r9 = 0;
-        self.r8 = 0;
-        self.rdi = 0;
-        self.rsi = 0;
-        self.rbp = 0;
-        self.rsp_dummy = 0;
-        self.rbx = 0;
-        self.rdx = 0;
-        self.rcx = 0;
-        self.rax = 0;
-        self.int_num = 0;
-        self.err_code = 0;
-        // In compat mode, CPU always uses Frame64 for iretq
-        if Regs::use_f64() {
+        if Self::use_f64() {
             self.frame = Frame {
                 f64: Frame64 {
-                    rip: entry as u64,
-                    cs: USER_CS as u64,
-                    rflags: IF_FLAG,
-                    rsp: stack as u64,
-                    ss: USER_DS as u64,
+                    rip: entry as u64, cs: USER_CS as u64, rflags: IF_FLAG,
+                    rsp: stack as u64, ss: USER_DS as u64,
                 }
             };
         } else {
             self.frame = Frame {
                 f32: Frame32 {
                     _pad: [0; 5],
-                    eip: entry,
-                    cs: USER_CS as u32,
-                    eflags: IF_FLAG as u32,
-                    esp: stack,
-                    ss: USER_DS as u32,
+                    eip: entry, cs: USER_CS as u32, eflags: IF_FLAG as u32,
+                    esp: stack, ss: USER_DS as u32,
                 }
             };
         }
@@ -205,35 +87,15 @@ impl CpuState {
         let ds = USER_DS as u64;
         const IF_FLAG: u64 = 1 << 9;
 
+        *self = Self::empty();
         self.gs = ds;
         self.fs = ds;
         self.es = ds;
         self.ds = ds;
-        self.r15 = 0;
-        self.r14 = 0;
-        self.r13 = 0;
-        self.r12 = 0;
-        self.r11 = 0;
-        self.r10 = 0;
-        self.r9 = 0;
-        self.r8 = 0;
-        self.rdi = 0;
-        self.rsi = 0;
-        self.rbp = 0;
-        self.rsp_dummy = 0;
-        self.rbx = 0;
-        self.rdx = 0;
-        self.rcx = 0;
-        self.rax = 0;
-        self.int_num = 0;
-        self.err_code = 0;
         self.frame = Frame {
             f64: Frame64 {
-                rip: entry,
-                cs: USER_CS64 as u64,
-                rflags: IF_FLAG,
-                rsp: stack,
-                ss: USER_DS as u64,
+                rip: entry, cs: USER_CS64 as u64, rflags: IF_FLAG,
+                rsp: stack, ss: USER_DS as u64,
             }
         };
     }
@@ -250,11 +112,13 @@ pub struct Thread {
     pub root: crate::paging2::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
-    pub cpu_state: CpuState,
+    pub cpu_state: Regs,
     pub exit_code: i32,
-    pub is_64bit: bool,               // True if running in 64-bit (long) mode
-    pub frame_is_64: bool,            // True if cpu_state.frame is Frame64 format
+    pub mode: ThreadMode,              // User code bitness (16/32/64)
+    pub frame_format: FrameFormat,    // Saved interrupt frame format
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
+    pub vm86_vif: bool,               // VM86 virtual interrupt flag
+    pub vm86_a20: bool,               // VM86 A20 gate (false=wrap, true=enabled)
 }
 
 impl Thread {
@@ -269,11 +133,13 @@ impl Thread {
             root: crate::paging2::RootPageTable::empty(),
             num_fds: 0,
             fds: [-1; MAX_FDS],
-            cpu_state: CpuState::empty(),
+            cpu_state: Regs::empty(),
             exit_code: 0,
-            is_64bit: false,
-            frame_is_64: false,
+            mode: ThreadMode::Mode32,
+            frame_format: FrameFormat::Protected,
             symbols: None,
+            vm86_vif: false,
+            vm86_a20: false,
         }
     }
 }
@@ -340,7 +206,7 @@ pub fn create_thread(parent: Option<&Thread>, forked_root_page: u64, is_process:
                 for fd in &mut thread.fds {
                     *fd = -1;
                 }
-                thread.cpu_state = CpuState::empty();
+                thread.cpu_state = Regs::empty();
                 return Some(thread);
             }
         }
@@ -350,34 +216,64 @@ pub fn create_thread(parent: Option<&Thread>, forked_root_page: u64, is_process:
 
 /// Initialize a thread as a 32-bit user process
 pub fn init_process_thread(thread: &mut Thread, entry: u32, stack: u32) {
-    thread.is_64bit = false;
-    thread.frame_is_64 = Regs::use_f64();
+    thread.mode = ThreadMode::Mode32;
+    thread.frame_format = FrameFormat::current();
     thread.cpu_state.init_user_process(entry, stack);
 }
 
 /// Initialize a thread as a 64-bit user process
 pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
-    thread.is_64bit = true;
-    thread.frame_is_64 = true;  // 64-bit threads always use Frame64
+    thread.mode = ThreadMode::Mode64;
+    thread.frame_format = FrameFormat::Long;  // 64-bit threads always use Frame64
     thread.cpu_state.init_user_process_64(entry, stack);
 }
 
-/// Save current CPU state to thread
-pub fn save_state(thread: &mut Thread) {
-    unsafe {
-        let stack_top = (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024) as usize;
-        let regs = (stack_top - core::mem::size_of::<Regs>()) as *const Regs;
-        let saved_ip = (*regs).ip();
-        println!("save_state: tid={} rax={} eip={:#x}", thread.tid, (*regs).rax, saved_ip);
-        // Record frame format at save time
-        thread.frame_is_64 = Regs::use_f64();
-        // Copy Regs to CpuState (same layout)
-        core::ptr::copy_nonoverlapping(
-            regs as *const u8,
-            &mut thread.cpu_state as *mut CpuState as *mut u8,
-            core::mem::size_of::<CpuState>(),
-        );
+/// Initialize a thread for VM86 mode (.COM execution)
+/// cs/ip/ss/sp are real-mode segment:offset values
+pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
+    thread.mode = ThreadMode::Mode16;
+    thread.frame_format = FrameFormat::Protected; // VM86 always uses Frame32 (IRET in PAE mode)
+    thread.vm86_vif = true;  // Virtual interrupts enabled by default
+    thread.vm86_a20 = false; // A20 disabled (wrap-around) by default
+
+    const VM_FLAG: u32 = 1 << 17;  // VM86 mode
+    const IF_FLAG: u32 = 1 << 9;   // Interrupt enable
+
+    let state = &mut thread.cpu_state;
+    *state = Regs::empty();
+
+    // DS=ES=CS for .COM programs, FS=GS=0
+    state.ds = cs as u64;
+    state.es = cs as u64;
+    state.fs = 0;
+    state.gs = 0;
+
+    // Set up Frame32 with VM86 flags — CPU interprets CS/SS as real-mode segments when VM=1
+    state.frame = Frame {
+        f32: Frame32 {
+            _pad: [0; 5],
+            eip: ip as u32,
+            cs: cs as u32,
+            eflags: VM_FLAG | IF_FLAG,
+            esp: sp as u32,
+            ss: ss as u32,
+        }
+    };
+}
+
+/// Save current CPU state to thread from the given Regs pointer.
+/// For VM86 threads, the real-mode segments are already in regs.ds/es/fs/gs
+/// (swapped in by isr_handler on entry), so they copy naturally into Regs.
+pub fn save_state(thread: &mut Thread, regs: &Regs) {
+    let saved_ip = regs.ip();
+    println!("save_state: tid={} rax={} eip={:#x}", thread.tid, regs.rax, saved_ip);
+    // Record frame format at save time (VM86 threads always use Protected)
+    if thread.mode == ThreadMode::Mode16 {
+        thread.frame_format = FrameFormat::Protected;
+    } else {
+        thread.frame_format = FrameFormat::current();
     }
+    thread.cpu_state = *regs;
 }
 
 /// Set return value in thread's saved state
@@ -415,84 +311,111 @@ pub fn schedule() {
         }
 
         let nt = &*next_thread;
-        crate::println!("schedule: switching to tid={} frame_is_64={} is_64bit={}",
-            nt.tid, nt.frame_is_64, nt.is_64bit);
+        crate::println!("schedule: switching to tid={} frame={:?} mode={:?}",
+            nt.tid, nt.frame_format, nt.mode);
         exit_to_thread(&mut *next_thread);
     }
 }
 
 /// Switch to a thread (does not return for calling thread)
 pub fn exit_to_thread(thread: &mut Thread) -> ! {
-    unsafe {
-        thread.state = ThreadState::Running;
+    thread.state = ThreadState::Running;
 
-        // Save outgoing thread's user entries
+    // Save outgoing thread's user entries
+    unsafe {
         if !CURRENT_THREAD.is_null() {
             (*CURRENT_THREAD).root.save();
         }
-
-        // Toggle CPU mode (PAE ↔ Compat) if needed.
-        // In compat mode, both 32-bit and 64-bit user code runs without toggling.
-        // Toggle from PAE to compat when a 64-bit thread is scheduled.
-        // Toggle from compat to PAE when VM86 is needed (TODO).
-        let need_toggle = match crate::paging2::cpu_mode() {
-            crate::paging2::CpuMode::Pae => thread.is_64bit,
-            crate::paging2::CpuMode::Compat => false,  // TODO: toggle to PAE for VM86
-            _ => false,
-        };
-
-        if need_toggle {
-            thread.root.load_entries();
-            crate::paging2::sync_hw_pdpt();
-            crate::x86::flush_tlb();
-            crate::paging2::ensure_trampoline_mapped();
-            crate::descriptors::toggle_mode(crate::paging2::toggle_cr3(thread.is_64bit));
-        } else {
-            thread.root.activate();
-        }
-
-        // Update kernel stack in TSS for this thread
-        let stack_top = (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024);
-        if thread.is_64bit || Regs::use_f64() {
-            crate::descriptors::set_kernel_stack_64(stack_top as u64);
-        } else {
-            set_kernel_stack(stack_top as u32);
-        }
-
-        // Convert frame format if it doesn't match current CPU mode
-        let need_f64 = Regs::use_f64();
-        if thread.frame_is_64 != need_f64 {
-            if need_f64 {
-                thread.cpu_state.frame_to_64();
-            } else {
-                thread.cpu_state.frame_to_32();
-            }
-            thread.frame_is_64 = need_f64;
-        }
-
-        CURRENT_THREAD = thread;
-
-        let ip = thread.cpu_state.ip_as(thread.frame_is_64);
-        let user_esp = thread.cpu_state.sp_as(thread.frame_is_64);
-        crate::println!("exit_to_thread: pre-read ip={:#x} esp={:#x} frame_is_64={}",
-            ip, user_esp, thread.frame_is_64);
-
-        // Debug: read code bytes at ip and stack at esp to verify mapping
-        let code = unsafe { core::ptr::read_unaligned(ip as *const u32) };
-        let stack_val = unsafe { core::ptr::read_unaligned(user_esp as *const u32) };
-        println!("exit_to_thread: tid={} rax={} ip={:#x} code={:#010x} esp={:#x} [esp]={:#x}",
-            thread.tid, thread.cpu_state.rax, ip, code, user_esp, stack_val);
-
-        // Exit to user mode via iret (frame format matches CPU mode after conversion)
-        let use_64 = thread.frame_is_64;
-        exit_kernel(&thread.cpu_state, use_64 as u32);
     }
+
+    // Toggle CPU mode (PAE ↔ Compat) if needed.
+    // Compat→PAE for VM86 (Mode16), PAE→Compat for 64-bit (Mode64).
+    // Mode32 works in both modes — no toggle needed.
+    let need_toggle = match crate::paging2::cpu_mode() {
+        crate::paging2::CpuMode::Pae => thread.mode == ThreadMode::Mode64,
+        crate::paging2::CpuMode::Compat => thread.mode == ThreadMode::Mode16,
+        _ => false,
+    };
+
+    if need_toggle {
+        thread.root.load_entries();
+        crate::paging2::sync_hw_pdpt();
+        crate::x86::flush_tlb();
+        crate::paging2::ensure_trampoline_mapped();
+        crate::descriptors::toggle_mode(crate::paging2::toggle_cr3(thread.mode == ThreadMode::Mode64));
+    } else {
+        thread.root.activate();
+    }
+
+    // Update kernel stack in TSS
+    let stack_top = unsafe { (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024) };
+    if thread.mode == ThreadMode::Mode64 || Regs::use_f64() {
+        crate::descriptors::set_kernel_stack_64(stack_top as u64);
+    } else {
+        set_kernel_stack(stack_top as u32);
+    }
+
+    unsafe { CURRENT_THREAD = thread; }
+
+    // Local exit frame: Regs + 4 extra u32 segments for VM86 IRET.
+    // For non-VM86, the extra fields sit harmlessly past the iret frame.
+    #[repr(C)]
+    struct ExitFrame {
+        regs: Regs,
+        vm86_es: u32,
+        vm86_ds: u32,
+        vm86_fs: u32,
+        vm86_gs: u32,
+    }
+
+    let mut frame = ExitFrame {
+        regs: thread.cpu_state,
+        vm86_es: 0,
+        vm86_ds: 0,
+        vm86_fs: 0,
+        vm86_gs: 0,
+    };
+
+    let is_long;
+
+    if thread.mode == ThreadMode::Mode16 {
+        // VM86: move real-mode segments to extra area, zero regs fields
+        // so exit_interrupt_32 loads null (safe); IRET pops real values from extra area
+        frame.vm86_es = frame.regs.es as u32;
+        frame.vm86_ds = frame.regs.ds as u32;
+        frame.vm86_fs = frame.regs.fs as u32;
+        frame.vm86_gs = frame.regs.gs as u32;
+        frame.regs.ds = 0;
+        frame.regs.es = 0;
+        frame.regs.fs = 0;
+        frame.regs.gs = 0;
+        is_long = false;
+    } else {
+        // Convert frame format if it doesn't match current CPU mode
+        let need = FrameFormat::current();
+        if thread.frame_format != need {
+            if need.is_long() {
+                frame.regs.frame_to_64();
+            } else {
+                frame.regs.frame_to_32();
+            }
+            thread.frame_format = need;
+        }
+        is_long = thread.frame_format.is_long();
+    }
+
+    let ip = frame.regs.ip_as(is_long);
+    let user_esp = frame.regs.sp_as(is_long);
+    println!("exit_to_thread: tid={} ip={:#x} esp={:#x} mode={:?}",
+        thread.tid, ip, user_esp, thread.mode);
+
+    unsafe { exit_kernel(&frame.regs, is_long as u32) }
 }
 
 // Exit kernel and return to user mode
 // Implemented in entry.asm
 unsafe extern "C" {
-    fn exit_kernel(cpu_state: *const CpuState, is_64bit: u32) -> !;
+    fn exit_kernel(cpu_state: *const Regs, use_long_frame: u32) -> !;
 }
 
 /// Exit current thread and schedule next

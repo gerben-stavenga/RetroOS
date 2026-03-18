@@ -23,6 +23,7 @@ pkg_tar(
         "//apps/stress:stress_elf": "stress.elf",
         "//apps/shell:shell_elf": "shell.elf",
         "//apps/stress64:stress64_elf": "stress64.elf",
+        "//apps/hello_com:hello_com": "HELLO.COM",
     },
 )
 

@@ -58,7 +58,7 @@ pub fn dispatch(regs: &mut Regs) {
     // 64-bit syscall ABI uses different registers: rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4
     // Remap to the canonical layout (rdx=arg0, rcx=arg1, rbx=arg2, rsi=arg3, rdi=arg4)
     // so handlers don't need to know which mode the caller is in.
-    let is_64bit = thread::current().map_or(false, |t| t.is_64bit);
+    let is_64bit = thread::current().map_or(false, |t| t.mode == thread::ThreadMode::Mode64);
     if is_64bit {
         let (a0, a1, a2, a3, a4) = (regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8);
         regs.rdx = a0;
@@ -96,10 +96,10 @@ fn sys_exit(regs: &mut Regs) -> i32 {
 
 /// Yield syscall (1)
 /// Yields CPU to another thread
-fn sys_yield(_regs: &mut Regs) -> i32 {
+fn sys_yield(regs: &mut Regs) -> i32 {
     // Save current state and schedule another thread
     if let Some(current) = thread::current() {
-        thread::save_state(current);
+        thread::save_state(current, regs);
         current.state = thread::ThreadState::Ready;
         thread::schedule();
     }
@@ -108,7 +108,7 @@ fn sys_yield(_regs: &mut Regs) -> i32 {
 
 /// Fork syscall (4)
 /// Creates a copy of the current process
-fn sys_fork(_regs: &mut Regs) -> i32 {
+fn sys_fork(regs: &mut Regs) -> i32 {
     // Fork the address space
     let new_page_dir = match paging2::fork_current() {
         Some(pd) => pd,
@@ -122,7 +122,7 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
     };
 
     // Save current thread's state
-    thread::save_state(current);
+    thread::save_state(current, regs);
 
     // Create child thread
     let child = match thread::create_thread(Some(current), new_page_dir, true) {
@@ -132,8 +132,8 @@ fn sys_fork(_regs: &mut Regs) -> i32 {
 
     // Copy CPU state and mode from parent to child
     child.cpu_state = current.cpu_state;
-    child.is_64bit = current.is_64bit;
-    child.frame_is_64 = current.frame_is_64;
+    child.mode = current.mode;
+    child.frame_format = current.frame_format;
 
     // Child returns 0
     thread::set_return(child, 0);
@@ -158,10 +158,19 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     };
     println!("Exec: {}", path);
 
+    // Detect .COM extension (case-insensitive)
+    let is_com = path.len() >= 4 && {
+        let ext = &path.as_bytes()[path.len()-4..];
+        (ext[0] == b'.' &&
+         (ext[1] == b'c' || ext[1] == b'C') &&
+         (ext[2] == b'o' || ext[2] == b'O') &&
+         (ext[3] == b'm' || ext[3] == b'M'))
+    };
+
     // Read argv from caller's address space (before we free it)
     let argc = regs.rsi as usize;
     let argv_ptr = regs.rbx as usize;
-    let caller_64bit = thread::current().map_or(false, |t| t.is_64bit);
+    let caller_64bit = thread::current().map_or(false, |t| t.mode == thread::ThreadMode::Mode64);
     let args = read_argv(argv_ptr, argc, caller_64bit);
 
     // Find the file in TAR
@@ -172,6 +181,11 @@ fn sys_exec(regs: &mut Regs) -> i32 {
 
     let mut buffer = alloc::vec![0; size];
     startup::read_file(&mut buffer);
+
+    // .COM files use the VM86 exec path
+    if is_com {
+        return exec_com(&buffer);
+    }
 
     // Free current user pages and load new ELF (point of no return)
     paging2::free_user_pages();
@@ -193,10 +207,11 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     if let Some(current) = thread::current() {
         // Toggle CPU mode if needed (PAE → Compat)
         // In compat mode, both 32/64-bit run without toggling.
-        if want_64 != current.is_64bit {
+        let want_mode = if want_64 { thread::ThreadMode::Mode64 } else { thread::ThreadMode::Mode32 };
+        if want_mode != current.mode {
             let need_toggle = match paging2::cpu_mode() {
                 paging2::CpuMode::Pae => want_64,
-                paging2::CpuMode::Compat => false,  // TODO: toggle to PAE for VM86
+                paging2::CpuMode::Compat => want_mode == thread::ThreadMode::Mode16,
                 _ => false,
             };
             if need_toggle {
@@ -206,7 +221,7 @@ fn sys_exec(regs: &mut Regs) -> i32 {
                 }
                 descriptors::toggle_mode(paging2::toggle_cr3(want_64));
             }
-            current.is_64bit = want_64;
+            current.mode = want_mode;
         }
 
         println!("exec: setting up stack");
@@ -225,6 +240,36 @@ fn sys_exec(regs: &mut Regs) -> i32 {
 
         println!("exec: calling exit_to_thread");
         current.symbols = symbols;
+        thread::exit_to_thread(current);
+    }
+
+    ENOSYS
+}
+
+/// Execute a .COM file in VM86 mode (point of no return)
+fn exec_com(data: &[u8]) -> i32 {
+    use crate::vm86;
+
+    // Free current user pages
+    paging2::free_user_pages();
+    paging2::flush_tlb();
+
+    // Map first 1MB user-accessible for VM86
+    paging2::map_low_mem_user();
+
+    // Set up IVT (all 256 entries → IRET stub)
+    vm86::setup_ivt();
+
+    // Load .COM binary
+    let (cs, ip, ss, sp) = vm86::load_com(data);
+    println!("exec_com: cs={:#06x} ip={:#06x} ss={:#06x} sp={:#06x}", cs, ip, ss, sp);
+
+    if let Some(current) = thread::current() {
+        // Initialize VM86 thread state
+        thread::init_process_thread_vm86(current, cs, ip, ss, sp);
+        current.symbols = None;
+
+        println!("exec_com: calling exit_to_thread");
         thread::exit_to_thread(current);
     }
 
@@ -303,7 +348,7 @@ fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool, word: usize) ->
 
     if want_64 {
         // 64-bit: _start(argc, argv) via System V ABI — argc in RDI, argv in RSI
-        // Caller sets these in the CpuState. SP just needs to be below the data.
+        // Caller sets these in the Regs. SP just needs to be below the data.
         sp &= !0xF; // 16-byte align
         StackSetup { sp, argc: args.len(), argv: argv_base }
     } else {
