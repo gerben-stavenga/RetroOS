@@ -120,7 +120,12 @@ fn stack_segment(regs: &Regs) -> ! {
 }
 
 /// Handle general protection fault (int 13)
-fn general_protection(regs: &Regs) -> ! {
+/// For VM86 threads, dispatches to the VM86 monitor instead of panicking.
+fn general_protection(regs: &mut Regs) {
+    if is_vm86(regs) {
+        crate::vm86::vm86_monitor(regs);
+        return;
+    }
     println!("GP fault, selector: {:#x}", regs.err_code);
     panic_with_regs("General protection fault", regs);
 }
@@ -157,8 +162,10 @@ fn page_fault(regs: &mut Regs) {
 
     // Null pointer protection (first 64KB and last 64KB)
     // Catches both null and ~0 (e.g., (char*)-1 or null + negative offset)
+    // Skip for VM86 threads — they legitimately access IVT (0x0000-0x03FF) and BDA
     const NULL_LIMIT: usize = 0x10000;
-    if fault_addr < NULL_LIMIT || fault_addr >= (0 as usize).wrapping_sub(NULL_LIMIT) {
+    let vm86_thread = thread::current().map_or(false, |t| t.mode == thread::ThreadMode::Mode16);
+    if !vm86_thread && (fault_addr < NULL_LIMIT || fault_addr >= (0 as usize).wrapping_sub(NULL_LIMIT)) {
         if user {
             segv_current_thread(regs, fault_addr);
             return;
@@ -347,11 +354,61 @@ fn generic_exception(regs: &Regs) -> ! {
     panic_with_regs("Unhandled exception", regs);
 }
 
+/// VM86 extra frame: when an interrupt occurs in VM86 mode, the CPU pushes
+/// 4 extra segment registers (GS, FS, DS, ES) as u32 above the normal frame.
+/// These sit at regs + sizeof(Regs) on the kernel stack.
+/// On entry: copy them into regs.es/ds/fs/gs so handlers see real VM86 segments.
+/// On exit: copy regs.es/ds/fs/gs back and zero the regs fields so
+/// exit_interrupt_32 loads null (safe), and IRET pops real values from the extra frame.
+const VM_FLAG: u64 = 1 << 17;
+
+fn is_vm86(regs: &Regs) -> bool {
+    // VM86 mode is only possible in PAE mode (Frame32).
+    // In Compat mode (Frame64), VM86 cannot be active — skip the check.
+    if Regs::use_f64() { return false; }
+    unsafe { regs.frame.f32.eflags as u64 & VM_FLAG != 0 }
+}
+
+/// Swap VM86 extra segments into Regs on interrupt entry
+unsafe fn vm86_swap_in(regs: &mut Regs) {
+    unsafe {
+        // Extra frame is right above Regs: [ES, DS, FS, GS] as u32
+        // Layout at regs+sizeof(Regs): es(u32), ds(u32), fs(u32), gs(u32)
+        let extra = (regs as *mut Regs).add(1) as *const u32;
+        regs.es = *extra.add(0) as u64;
+        regs.ds = *extra.add(1) as u64;
+        regs.fs = *extra.add(2) as u64;
+        regs.gs = *extra.add(3) as u64;
+    }
+}
+
+/// Swap VM86 segments back from Regs to extra frame on interrupt exit
+unsafe fn vm86_swap_out(regs: &mut Regs) {
+    unsafe {
+        let extra = (regs as *mut Regs).add(1) as *mut u32;
+        *extra.add(0) = regs.es as u32;
+        *extra.add(1) = regs.ds as u32;
+        *extra.add(2) = regs.fs as u32;
+        *extra.add(3) = regs.gs as u32;
+    }
+    // Zero regs segment fields so exit_interrupt_32 loads null (safe in protected mode)
+    regs.es = 0;
+    regs.ds = 0;
+    regs.fs = 0;
+    regs.gs = 0;
+}
+
 /// Main interrupt service routine - dispatches to specific handlers
 #[unsafe(no_mangle)]
 pub extern "C" fn isr_handler(regs: *mut Regs) {
     let regs = unsafe { &mut *regs };
     let int_num = regs.int_num;
+
+    // VM86 segment swap on entry
+    let vm86 = is_vm86(regs);
+    if vm86 {
+        unsafe { vm86_swap_in(regs); }
+    }
 
     // Enable interrupts for most handlers (except low stack situation)
     // TODO: Check stack depth
@@ -387,5 +444,10 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         48 => dispatch(regs),
 
         _ => generic_exception(regs),
+    }
+
+    // VM86 segment swap on exit
+    if vm86 {
+        unsafe { vm86_swap_out(regs); }
     }
 }

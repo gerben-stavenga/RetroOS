@@ -25,6 +25,7 @@ pub mod startup;
 pub mod syscalls;
 pub mod thread;
 pub mod traps;
+pub mod vm86;
 pub mod x86;
 
 // Re-export lib's vga module and macros
@@ -275,10 +276,10 @@ impl core::fmt::Debug for Frame {
     }
 }
 
-/// CPU register state saved by interrupt handler
-/// Uses u64 for software-pushed registers to support both 32-bit and 64-bit userspace.
-/// The CPU frame is a union since the CPU pushes different sizes in different modes.
+/// CPU register state saved by interrupt handler.
+/// Also used as the saved CPU state in Thread (identical layout).
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Regs {
     // Segment registers (zero-extended)
     pub gs: u64,
@@ -311,9 +312,62 @@ pub struct Regs {
 }
 
 impl Regs {
+    pub const fn empty() -> Self {
+        Regs {
+            gs: 0, fs: 0, es: 0, ds: 0,
+            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+            rdi: 0, rsi: 0, rbp: 0, rsp_dummy: 0, rbx: 0, rdx: 0, rcx: 0, rax: 0,
+            int_num: 0, err_code: 0,
+            frame: Frame { f32: Frame32 { _pad: [0; 5], eip: 0, cs: 0, eflags: 0, esp: 0, ss: 0 } },
+        }
+    }
+
     /// In compat mode, the CPU always pushes Frame64 (even for 32-bit user code)
-    fn use_f64() -> bool {
+    pub fn use_f64() -> bool {
         crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat
+    }
+
+    /// Convert frame from Frame32 to Frame64 format
+    pub fn frame_to_64(&mut self) {
+        unsafe {
+            let f = &self.frame.f32;
+            let (eip, cs, eflags, esp, ss) = (f.eip, f.cs, f.eflags, f.esp, f.ss);
+            self.frame = Frame {
+                f64: Frame64 {
+                    rip: eip as u64, cs: cs as u64, rflags: eflags as u64,
+                    rsp: esp as u64, ss: ss as u64,
+                }
+            };
+        }
+    }
+
+    /// Convert frame from Frame64 to Frame32 format
+    pub fn frame_to_32(&mut self) {
+        unsafe {
+            let f = &self.frame.f64;
+            let (rip, cs, rflags, rsp, ss) = (f.rip, f.cs, f.rflags, f.rsp, f.ss);
+            self.frame = Frame {
+                f32: Frame32 {
+                    _pad: [0; 5],
+                    eip: rip as u32, cs: cs as u32, eflags: rflags as u32,
+                    esp: rsp as u32, ss: ss as u32,
+                }
+            };
+        }
+    }
+
+    /// Get IP from frame, using the given format
+    pub fn ip_as(&self, is_64: bool) -> u64 {
+        unsafe {
+            if is_64 { self.frame.f64.rip } else { self.frame.f32.eip as u64 }
+        }
+    }
+
+    /// Get SP from frame, using the given format
+    pub fn sp_as(&self, is_64: bool) -> u64 {
+        unsafe {
+            if is_64 { self.frame.f64.rsp } else { self.frame.f32.esp as u64 }
+        }
     }
 
     /// Get instruction pointer (works for both 32 and 64-bit modes)

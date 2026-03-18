@@ -68,6 +68,14 @@ fn stress(depth: i32) {
         crt::exit(1);
     }
 
+    // Fork child 3: exec HELLO.COM (VM86 mode)
+    let pid3 = crt::fork();
+    if pid3 == 0 {
+        crt::exec("HELLO.COM", &[]);
+        crt::print("exec HELLO.COM failed\n");
+        crt::exit(1);
+    }
+
     crt::wait_all();
 
     // Verify our pages survived children's COW writes and exec
