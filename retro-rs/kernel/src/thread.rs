@@ -119,6 +119,9 @@ pub struct Thread {
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
     pub vm86_vif: bool,               // VM86 virtual interrupt flag
     pub vm86_a20: bool,               // VM86 A20 gate (false=wrap, true=enabled)
+    pub pending_signals: u32,         // Pending signal bitmask (bits 0-15 = hardware IRQs)
+    pub vpic: crate::vm86::VirtualPic,      // Virtual PIC (per-thread)
+    pub vkbd: crate::vm86::VirtualKeyboard, // Virtual keyboard (per-thread)
 }
 
 impl Thread {
@@ -140,6 +143,9 @@ impl Thread {
             symbols: None,
             vm86_vif: false,
             vm86_a20: false,
+            pending_signals: 0,
+            vpic: crate::vm86::VirtualPic::new(),
+            vkbd: crate::vm86::VirtualKeyboard::new(),
         }
     }
 }
@@ -265,8 +271,6 @@ pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, 
 /// For VM86 threads, the real-mode segments are already in regs.ds/es/fs/gs
 /// (swapped in by isr_handler on entry), so they copy naturally into Regs.
 pub fn save_state(thread: &mut Thread, regs: &Regs) {
-    let saved_ip = regs.ip();
-    println!("save_state: tid={} rax={} eip={:#x}", thread.tid, regs.rax, saved_ip);
     // Record frame format at save time (VM86 threads always use Protected)
     if thread.mode == ThreadMode::Mode16 {
         thread.frame_format = FrameFormat::Protected;
@@ -310,9 +314,6 @@ pub fn schedule() {
             return;
         }
 
-        let nt = &*next_thread;
-        crate::println!("schedule: switching to tid={} frame={:?} mode={:?}",
-            nt.tid, nt.frame_format, nt.mode);
         exit_to_thread(&mut *next_thread);
     }
 }
@@ -356,6 +357,11 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
     }
 
     unsafe { CURRENT_THREAD = thread; }
+
+    // Deliver pending signals before entering userspace
+    if thread.mode == ThreadMode::Mode16 {
+        crate::vm86::deliver_pending_signals(thread);
+    }
 
     // Local exit frame: Regs + 4 extra u32 segments for VM86 IRET.
     // For non-VM86, the extra fields sit harmlessly past the iret frame.
@@ -403,11 +409,6 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
         }
         is_long = thread.frame_format.is_long();
     }
-
-    let ip = frame.regs.ip_as(is_long);
-    let user_esp = frame.regs.sp_as(is_long);
-    println!("exit_to_thread: tid={} ip={:#x} esp={:#x} mode={:?}",
-        thread.tid, ip, user_esp, thread.mode);
 
     unsafe { exit_kernel(&frame.regs, is_long as u32) }
 }

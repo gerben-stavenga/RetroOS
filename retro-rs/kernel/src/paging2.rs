@@ -1101,14 +1101,6 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     let old_phys = entries[idx].page();
     let ref_count = phys_mm::get_ref_count(old_phys);
 
-    // Debug: track COW of root entries (PDPT[0..2])
-    let root = root_base();
-    if idx >= root && idx < root + 3 {
-        let tid = crate::thread::current().map_or(-1, |t| t.tid);
-        crate::println!("COW-ROOT: tid={} idx={:#x} PDPT[{}] raw={:#x} page={:#x} ref={}",
-            tid, idx, idx - root, entries[idx].raw(), old_phys, ref_count);
-    }
-
     if ref_count == 1 {
         // Sole owner — just make writable
         entries[idx].set_hw_writable(true);
@@ -1254,8 +1246,31 @@ pub fn map_low_mem_user() {
 }
 
 fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
-    // Map 256 pages: virtual page i → physical page i, user+RW
-    for i in 0..256usize {
+    // Page 0 (BIOS IVT + BDA): allocate a private copy so each VM86 process
+    // has its own IVT. Copy via temp mapping to avoid null pointer issues.
+    let page0_copy = crate::phys_mm::alloc_phys_page().expect("alloc page 0 copy");
+    temp_map(0); // map physical page 0 at temp VA
+    let mut buf = [0u8; PAGE_SIZE];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            temp_map_vaddr() as *const u8,
+            buf.as_mut_ptr(),
+            PAGE_SIZE,
+        );
+    }
+    temp_map(page0_copy); // map fresh page at temp VA
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            temp_map_vaddr() as *mut u8,
+            PAGE_SIZE,
+        );
+    }
+    temp_unmap();
+    entries[0] = E::new(page0_copy, true, true);
+
+    // Map pages 1-255: virtual page i → physical page i, user+RW
+    for i in 1..256usize {
         let e = E::new(i as u64, true, true);
         // Don't set NX — VM86 code needs to be executable
         entries[i] = e;

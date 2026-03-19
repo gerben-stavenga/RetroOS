@@ -188,10 +188,19 @@ impl IdtEntry64 {
     }
 }
 
-/// Unified Task State Segment (104 bytes)
+/// IOPB covers ports 0x000-0x3DF (VGA ports end at 0x3DF).
+/// Byte count: (0x3DF / 8) + 1 = 124 data bytes + 1 terminating 0xFF = 125.
+/// Ports above 0x3DF fall outside the IOPB (beyond TSS limit) and are denied.
+const IOPB_SIZE: usize = 125;
+
+/// Unified Task State Segment with interrupt redirection bitmap and IOPB.
 /// Works for both 32-bit and 64-bit modes:
 /// - 32-bit: CPU reads ESP0 from low 32 bits, SS0 from high 32 bits of sp0
 /// - 64-bit: CPU reads RSP0 as full 64 bits of sp0
+///
+/// With CR4.VME=1, the CPU consults the interrupt redirection bitmap (32 bytes
+/// before iopb_offset) for INT n in VM86 mode: bit SET = #GP to monitor,
+/// bit CLEAR = through IVT directly. CLI/STI/PUSHF/POPF/IRET use hardware VIF.
 #[repr(C, packed)]
 pub struct Tss {
     _reserved0: u32,         // offset 0: link (32-bit) / reserved (64-bit)
@@ -202,7 +211,9 @@ pub struct Tss {
     pub ist: [u64; 7],       // offset 36: IST1-IST7 (64-bit only, zero for 32-bit)
     _reserved2: u64,         // offset 92
     _reserved3: u16,         // offset 100
-    _io_map_base: u16,       // offset 102
+    iopb_offset: u16,        // offset 102
+    int_redir: [u8; 32],     // offset 104: software interrupt redirection bitmap
+    pub iopb: [u8; IOPB_SIZE], // offset 136: I/O Permission Bitmap
 }
 
 impl Tss {
@@ -216,9 +227,32 @@ impl Tss {
             ist: [0; 7],
             _reserved2: 0,
             _reserved3: 0,
-            _io_map_base: 104, // Points past TSS = no I/O bitmap
+            iopb_offset: 136, // Points to iopb field (after 32-byte redirection bitmap)
+            int_redir: [0; 32], // All INTs go through IVT by default
+            iopb: [0xFF; IOPB_SIZE], // All ports denied by default
         }
     }
+}
+
+/// Set up TSS bitmaps for VM86:
+/// - IOPB: allow VGA ports (0x3C0-0x3DF), deny everything else
+/// - Interrupt redirection: trap INT 10h, 20h, 21h to monitor, rest through IVT
+/// Safety: caller must ensure exclusive access to the TSS.
+unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
+    // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
+    (*tss).iopb[120] = 0x00;
+    (*tss).iopb[121] = 0x00;
+    (*tss).iopb[122] = 0x00;
+    (*tss).iopb[123] = 0x00;
+
+    // Interrupt redirection: set bits for INTs we handle in the monitor
+    // Bit SET = #GP to monitor, bit CLEAR = through IVT
+    // INT 0x10: byte 2, bit 0
+    (*tss).int_redir[0x10 / 8] |= 1 << (0x10 % 8);
+    // INT 0x20: byte 4, bit 0
+    (*tss).int_redir[0x20 / 8] |= 1 << (0x20 % 8);
+    // INT 0x21: byte 4, bit 1
+    (*tss).int_redir[0x21 / 8] |= 1 << (0x21 % 8);
 }
 
 /// GDT entry indices
@@ -299,8 +333,9 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
     unsafe {
         let tss_limit = core::mem::size_of::<Tss>() as u32 - 1;
 
-        // Setup TSS32 with packed SS:ESP
+        // Setup TSS32 with packed SS:ESP, VGA IOPB, and interrupt redirection
         TSS32.sp0 = ((KERNEL_DS as u64) << 32) | (kernel_stack_top as u64);
+        setup_vm86_bitmaps(&raw mut TSS32);
         let tss32_addr = core::ptr::addr_of!(TSS32) as u64;
         GDT[GDT_TSS32] = GdtEntry::tss_low(tss32_addr, tss_limit);
 
@@ -338,6 +373,15 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
         x86::lgdt(&gdt_ptr);
 
         x86::reload_segments(KERNEL_DS, KERNEL_CS);
+    }
+
+    // Enable VME if supported (hardware-accelerated VM86: CLI/STI/PUSHF/POPF/IRET use VIF)
+    let (_, _, _, edx) = x86::cpuid(1);
+    if edx & (1 << 1) != 0 {
+        unsafe { x86::write_cr4(x86::read_cr4() | x86::cr4::VME); }
+        crate::println!("VME enabled");
+    } else {
+        crate::println!("VME not supported, using software VM86 monitor");
     }
 
     // Load initial protected mode IDT, TSS, and segments

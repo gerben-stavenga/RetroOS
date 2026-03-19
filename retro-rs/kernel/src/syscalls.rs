@@ -82,9 +82,6 @@ pub fn dispatch(regs: &mut Regs) {
 
     regs.rax = result as u32 as u64;
 
-    if syscall_num == 4 {
-        println!("dispatch fork: result={} regs.rax={}", result, regs.rax);
-    }
 }
 
 /// Exit syscall (0)
@@ -137,8 +134,6 @@ fn sys_fork(regs: &mut Regs) -> i32 {
 
     // Child returns 0
     thread::set_return(child, 0);
-
-    println!("Fork: parent={} child={} child.rax={}", current.tid, child.tid, child.cpu_state.rax);
 
     // Parent returns child's TID
     child.tid
