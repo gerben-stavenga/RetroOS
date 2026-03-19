@@ -247,8 +247,7 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
 
     // Interrupt redirection: set bits for INTs we handle in the monitor
     // Bit SET = #GP to monitor, bit CLEAR = through IVT
-    // INT 0x10: byte 2, bit 0
-    (*tss).int_redir[0x10 / 8] |= 1 << (0x10 % 8);
+    // INT 0x10: through IVT → VGA BIOS ROM at 0xC0000
     // INT 0x20: byte 4, bit 0
     (*tss).int_redir[0x20 / 8] |= 1 << (0x20 % 8);
     // INT 0x21: byte 4, bit 1

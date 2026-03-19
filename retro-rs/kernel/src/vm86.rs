@@ -3,9 +3,14 @@
 //! Provides:
 //! - VM86 monitor (handles GP faults from sensitive instructions)
 //! - DOS INT 21h emulation (basic character/string I/O, exit)
-//! - BIOS INT 10h emulation (teletype output)
-//! - IVT setup (fills 256 entries pointing at IRET stub)
+//! - Virtual hardware (PIC, keyboard) for per-thread device emulation
+//! - Signal delivery (hardware IRQs reflected through BIOS IVT)
 //! - .COM file loader
+//!
+//! The BIOS ROM at 0xF0000-0xFFFFF and the BIOS IVT at 0x0000-0x03FF are
+//! preserved from the original hardware state (via COW page 0). BIOS handlers
+//! work transparently because their I/O instructions trap through the TSS IOPB
+//! to our virtual devices.
 
 use crate::thread;
 use crate::vga;
@@ -19,9 +24,6 @@ const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer (top of 64KB segment)
 const COM_SP: u16 = 0xFFFE;
 
-/// Segment where the IRET stub lives (0xF000:0x0000)
-const IVT_HANDLER_SEG: u16 = 0xF000;
-const IVT_HANDLER_OFF: u16 = 0x0000;
 
 
 // ============================================================================
@@ -133,6 +135,8 @@ fn emulate_outb(port: u16, val: u8) {
         }
         // Slave PIC data
         0xA1 => {}
+        // Keyboard controller command
+        0x64 => {}
         _ => {
             println!("\x1b[91mVM86: illegal OUT to port {:#06x}\x1b[0m", port);
             thread::exit_thread(-11);
@@ -174,18 +178,12 @@ pub fn deliver_pending_signals_inline(regs: &mut Regs) {
 /// Reflect an interrupt through the IVT: push FLAGS/CS/IP, set CS:IP to handler.
 fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
     unsafe {
-        let flags = regs.frame.f32.eflags as u16;
-        let cs = regs.frame.f32.cs as u16;
-        let ip = regs.frame.f32.eip as u16;
+        vm86_push(regs, regs.frame.f32.eflags as u16);
+        vm86_push(regs, regs.frame.f32.cs as u16);
+        vm86_push(regs, regs.frame.f32.eip as u16);
 
-        vm86_push(regs, flags);
-        vm86_push(regs, cs);
-        vm86_push(regs, ip);
-
-        let ivt_off = read_u16(0, (int_num as u32) * 4);
-        let ivt_seg = read_u16(0, (int_num as u32) * 4 + 2);
-        regs.frame.f32.eip = ivt_off as u32;
-        regs.frame.f32.cs = ivt_seg as u32;
+        regs.frame.f32.eip = read_u16(0, (int_num as u32) * 4) as u32;
+        regs.frame.f32.cs = read_u16(0, (int_num as u32) * 4 + 2) as u32;
     }
 }
 
@@ -312,6 +310,28 @@ pub fn vm86_monitor(regs: &mut Regs) {
                 regs.frame.f32.eflags = (flags as u32 & !0x0002_0000) | preserved | (1 << 9);
             }
         }
+        // INSB (0x6C) — IN byte from port DX to ES:DI, advance DI
+        0x6C => {
+            let port = regs.rdx as u16;
+            let val = emulate_inb(port);
+            write_u16(regs.es as u32, regs.rdi as u32, val as u16);
+            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+                regs.rdi = regs.rdi.wrapping_sub(1); // DF=1
+            } else {
+                regs.rdi = regs.rdi.wrapping_add(1);
+            }
+        }
+        // OUTSB (0x6E) — OUT byte from DS:SI to port DX, advance SI
+        0x6E => {
+            let port = regs.rdx as u16;
+            let val = read_u16(regs.ds as u32, regs.rsi as u32) as u8;
+            emulate_outb(port, val);
+            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+                regs.rsi = regs.rsi.wrapping_sub(1);
+            } else {
+                regs.rsi = regs.rsi.wrapping_add(1);
+            }
+        }
         // IN AL, imm8 (0xE4)
         0xE4 => {
             let port = fetch_byte(regs) as u16;
@@ -376,7 +396,6 @@ pub fn vm86_monitor(regs: &mut Regs) {
 /// Handle INT n from VM86 mode
 fn handle_vm86_int(regs: &mut Regs, int_num: u8) {
     match int_num {
-        0x10 => int_10h(regs),
         0x20 => {
             // INT 20h — DOS program terminate
             thread::exit_thread(0);
@@ -400,24 +419,6 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) {
                 regs.frame.f32.eip = ivt_off as u32;
                 regs.frame.f32.cs = ivt_seg as u32;
             }
-        }
-    }
-}
-
-// ============================================================================
-// BIOS INT 10h — Video services
-// ============================================================================
-
-fn int_10h(regs: &mut Regs) {
-    let ah = (regs.rax >> 8) as u8;
-    match ah {
-        // AH=0x0E: Teletype output
-        0x0E => {
-            let ch = regs.rax as u8;
-            vga::vga().putchar(ch);
-        }
-        _ => {
-            // Ignore unsupported INT 10h functions
         }
     }
 }
@@ -458,31 +459,17 @@ fn int_21h(regs: &mut Regs) {
     }
 }
 
-// ============================================================================
-// IVT setup — fill all 256 entries with a pointer to an IRET instruction
-// ============================================================================
-
-/// Set up VM86 IVT: write an IRET stub at 0xF000:0x0000, then point all
-/// 256 IVT entries to it. Programs that hook interrupts will overwrite
-/// the entries they care about.
+/// Prepare the VM86 IVT for a new process.
+///
+/// The BIOS IVT at 0x0000-0x03FF is preserved from the COW copy of page 0,
+/// so BIOS handlers in ROM (0xF0000-0xFFFFF) are accessible. When a BIOS
+/// handler does I/O (IN/OUT), it traps through the IOPB to our virtual
+/// PIC/keyboard, so BIOS code works transparently.
+///
+/// Interrupts we emulate in the monitor (INT 10h, 20h, 21h) are trapped
+/// via the TSS interrupt redirection bitmap and never reach the IVT.
 pub fn setup_ivt() {
-    let iret_addr = ((IVT_HANDLER_SEG as u32) << 4) + IVT_HANDLER_OFF as u32;
-    unsafe {
-        *(iret_addr as *mut u8) = 0xCF; // IRET opcode
-    }
-    // Fill all 256 IVT entries (4 bytes each: offset:segment) at address 0.
-    // Use raw_write_u16 to avoid Rust's null pointer panic for address 0.
-    let entry = (IVT_HANDLER_OFF as u32) | ((IVT_HANDLER_SEG as u32) << 16);
-    for i in 0u32..256 {
-        let addr = i * 4;
-        unsafe {
-            core::arch::asm!(
-                "mov [{addr}], {val}",
-                addr = in(reg) addr,
-                val = in(reg) entry,
-            );
-        }
-    }
+    // Nothing to do — the BIOS IVT is already set up from the COW page 0 copy.
 }
 
 // ============================================================================
