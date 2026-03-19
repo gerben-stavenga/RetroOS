@@ -1269,11 +1269,13 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     temp_unmap();
     entries[0] = E::new(page0_copy, true, true);
 
-    // Map pages 1-255: virtual page i → physical page i, user+RW
+    // Map pages 1-255: virtual page i → physical page i
+    // 0x01000-0x9FFFF: conventional memory (RW)
+    // 0xA0000-0xBFFFF: VGA framebuffer (RW)
+    // 0xC0000-0xFFFFF: ROM area (RO)
     for i in 1..256usize {
-        let e = E::new(i as u64, true, true);
-        // Don't set NX — VM86 code needs to be executable
-        entries[i] = e;
+        let writable = i < 0xC0; // ROM starts at page 0xC0 (0xC0000)
+        entries[i] = E::new(i as u64, writable, true);
     }
 
     // A20 disabled by default: map pages 0x100-0x10F → physical 0x000-0x00F
