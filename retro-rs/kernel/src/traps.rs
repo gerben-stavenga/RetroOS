@@ -270,16 +270,7 @@ fn handle_protection_fault<E: paging2::Entry>(
                 if user { segv_current_thread(regs, fault_addr); return; }
                 panic_with_regs("Kernel write to read-only page", regs);
             }
-            // Check if COWing ANY entry corrupts PDPT[0]
-            let root = paging2::root_base();
-            let pre_pdpt0 = entries[root].raw();
             paging2::cow_entry(entries, idx);
-            let post_pdpt0 = entries[root].raw();
-            if pre_pdpt0 != post_pdpt0 && !(idx == root) {
-                let tid = crate::thread::current().map_or(-1, |t| t.tid);
-                println!("CORRUPT: tid={} COW idx={:#x} changed PDPT[0]! {:#x}->{:#x}",
-                    tid, idx, pre_pdpt0, post_pdpt0);
-            }
             paging2::flush_tlb();
             return;
         }
@@ -438,7 +429,30 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         18..=31 => generic_exception(regs),
 
         // IRQs (32-47)
-        32..=47 => handle_irq(regs),
+        32..=47 => {
+            handle_irq(regs);
+
+            let irq = int_num - 32;
+
+            // Queue signal on VM86 threads for IVT reflection
+            if let Some(t) = thread::current() {
+                if t.mode == thread::ThreadMode::Mode16 {
+                    t.pending_signals |= 1 << irq;
+                }
+            }
+
+            // Timer preemption (IRQ 0, every 10ms at 1000 Hz)
+            // Only preempt if interrupted from user mode (VM86 or RPL=3).
+            // Never preempt kernel code — save_state would capture mid-syscall state.
+            if irq == 0 && (vm86 || regs.code_seg() & 3 != 0) && crate::irq::get_ticks() % 10 == 0 {
+                if let Some(current) = thread::current() {
+                    thread::save_state(current, regs);
+                    current.state = thread::ThreadState::Ready;
+                    thread::schedule();
+                    // schedule may return if no other threads are ready
+                }
+            }
+        }
 
         // Syscall (IDT entry 0x80 uses vector 48's handler)
         48 => dispatch(regs),
@@ -446,8 +460,9 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         _ => generic_exception(regs),
     }
 
-    // VM86 segment swap on exit
+    // VM86: deliver pending signals, then swap segments back
     if vm86 {
+        crate::vm86::deliver_pending_signals_inline(regs);
         unsafe { vm86_swap_out(regs); }
     }
 }

@@ -117,6 +117,13 @@ impl Vga {
             EscState::Normal => {}
         }
 
+        // Scroll before writing so re-entrant calls (e.g. timer IRQ
+        // printing during putchar) never index past the buffer end.
+        if self.cursor_y >= VGA_HEIGHT {
+            self.scroll();
+            self.cursor_y = VGA_HEIGHT - 1;
+        }
+
         match c {
             0x1b => {
                 self.esc_state = EscState::Escape;
@@ -137,11 +144,6 @@ impl Vga {
                     self.cursor_y += 1;
                 }
             }
-        }
-
-        if self.cursor_y >= VGA_HEIGHT {
-            self.scroll();
-            self.cursor_y = VGA_HEIGHT - 1;
         }
     }
 }

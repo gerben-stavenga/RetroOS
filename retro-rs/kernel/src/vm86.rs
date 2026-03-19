@@ -23,8 +23,178 @@ const COM_SP: u16 = 0xFFFE;
 const IVT_HANDLER_SEG: u16 = 0xF000;
 const IVT_HANDLER_OFF: u16 = 0x0000;
 
+
+// ============================================================================
+// Virtual hardware — per-thread PIC and keyboard emulation
+// ============================================================================
+
+/// Virtual 8259 PIC (one per thread, master only)
+pub struct VirtualPic {
+    pub isr: u8,  // In-Service Register
+    pub imr: u8,  // Interrupt Mask Register
+}
+
+impl VirtualPic {
+    pub const fn new() -> Self {
+        Self { isr: 0, imr: 0 }
+    }
+
+    /// Non-specific EOI: clear highest-priority (lowest-numbered) in-service bit
+    pub fn eoi(&mut self) {
+        if self.isr != 0 {
+            self.isr &= self.isr - 1; // clear lowest set bit
+        }
+    }
+
+    /// Mark an IRQ as in-service (called when delivering a signal)
+    pub fn set_in_service(&mut self, irq: u8) {
+        self.isr |= 1 << irq;
+    }
+}
+
+const KBD_BUF_SIZE: usize = 32;
+
+/// Virtual keyboard controller (scancode buffer)
+pub struct VirtualKeyboard {
+    buffer: [u8; KBD_BUF_SIZE],
+    head: usize,
+    tail: usize,
+}
+
+impl VirtualKeyboard {
+    pub const fn new() -> Self {
+        Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0 }
+    }
+
+    /// Buffer a scancode from the real keyboard IRQ handler
+    pub fn push(&mut self, scancode: u8) {
+        let next = (self.tail + 1) % KBD_BUF_SIZE;
+        if next != self.head {
+            self.buffer[self.tail] = scancode;
+            self.tail = next;
+        }
+    }
+
+    /// Read next scancode (port 0x60 emulation)
+    pub fn pop(&mut self) -> u8 {
+        if self.head == self.tail {
+            return 0;
+        }
+        let sc = self.buffer[self.head];
+        self.head = (self.head + 1) % KBD_BUF_SIZE;
+        sc
+    }
+
+    /// Check if data is available (port 0x64 bit 0)
+    pub fn has_data(&self) -> bool {
+        self.head != self.tail
+    }
+}
+
+// ============================================================================
+// Virtual I/O port emulation
+// ============================================================================
+
+/// Emulate IN from a port. VGA ports never reach here (allowed via IOPB).
+fn emulate_inb(port: u16) -> u8 {
+    match port {
+        // Master PIC command (read ISR)
+        0x20 => thread::current().map_or(0, |t| t.vpic.isr),
+        // Master PIC data (read IMR)
+        0x21 => thread::current().map_or(0xFF, |t| t.vpic.imr),
+        // Keyboard data port
+        0x60 => thread::current().map_or(0, |t| t.vkbd.pop()),
+        // Keyboard status port (bit 0 = output buffer full)
+        0x64 => thread::current().map_or(0, |t| if t.vkbd.has_data() { 1 } else { 0 }),
+        _ => {
+            println!("\x1b[91mVM86: illegal IN from port {:#06x}\x1b[0m", port);
+            thread::exit_thread(-11);
+        }
+    }
+}
+
+/// Emulate OUT to a port. VGA ports never reach here (allowed via IOPB).
+fn emulate_outb(port: u16, val: u8) {
+    match port {
+        // Master PIC command
+        0x20 => {
+            if val == 0x20 {
+                // Non-specific EOI
+                if let Some(t) = thread::current() { t.vpic.eoi(); }
+            }
+        }
+        // Master PIC data (write IMR)
+        0x21 => {
+            if let Some(t) = thread::current() { t.vpic.imr = val; }
+        }
+        // Slave PIC command
+        0xA0 => {
+            // EOI to slave — acknowledge, no virtual slave PIC for now
+        }
+        // Slave PIC data
+        0xA1 => {}
+        _ => {
+            println!("\x1b[91mVM86: illegal OUT to port {:#06x}\x1b[0m", port);
+            thread::exit_thread(-11);
+        }
+    }
+}
+
+// ============================================================================
+// Signal delivery — reflect hardware IRQs to VM86 threads via IVT
+// ============================================================================
+
+/// Deliver all pending signals to a VM86 thread by pushing FLAGS/CS/IP
+/// onto its stack and redirecting CS:IP to the IVT handler.
+/// Each delivered signal nests: the innermost runs first, IRET unwinds.
+pub fn deliver_pending_signals(thread: &mut thread::Thread) {
+    while thread.pending_signals != 0 {
+        let irq = thread.pending_signals.trailing_zeros();
+        thread.pending_signals &= !(1 << irq);
+        thread.vpic.set_in_service(irq as u8);
+        let int_num = (irq + 8) as u8; // IRQ 0 = INT 8, IRQ 1 = INT 9, etc.
+        reflect_interrupt(&mut thread.cpu_state, int_num);
+    }
+}
+
+/// Deliver pending signals using a live Regs on the interrupt stack.
+/// Called from isr_handler before returning to VM86 (inline return path).
+pub fn deliver_pending_signals_inline(regs: &mut Regs) {
+    if let Some(thread) = thread::current() {
+        while thread.pending_signals != 0 {
+            let irq = thread.pending_signals.trailing_zeros();
+            thread.pending_signals &= !(1 << irq);
+            thread.vpic.set_in_service(irq as u8);
+            let int_num = (irq + 8) as u8;
+            reflect_interrupt(regs, int_num);
+        }
+    }
+}
+
+/// Reflect an interrupt through the IVT: push FLAGS/CS/IP, set CS:IP to handler.
+fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
+    unsafe {
+        let flags = regs.frame.f32.eflags as u16;
+        let cs = regs.frame.f32.cs as u16;
+        let ip = regs.frame.f32.eip as u16;
+
+        vm86_push(regs, flags);
+        vm86_push(regs, cs);
+        vm86_push(regs, ip);
+
+        let ivt_off = read_u16(0, (int_num as u32) * 4);
+        let ivt_seg = read_u16(0, (int_num as u32) * 4 + 2);
+        regs.frame.f32.eip = ivt_off as u32;
+        regs.frame.f32.cs = ivt_seg as u32;
+    }
+}
+
 // ============================================================================
 // VM86 monitor — handles GP faults for sensitive instructions
+//
+// VGA ports (0x3C0-0x3DF) are allowed via the TSS IOPB and never reach here.
+// All other I/O ports are denied by the IOPB, so IN/OUT on them traps here.
+// We block non-VGA I/O: return 0xFF for IN, no-op for OUT.
 // ============================================================================
 
 /// Read a byte from the VM86 address space at CS:IP and advance IP
@@ -39,16 +209,32 @@ fn fetch_byte(regs: &mut Regs) -> u8 {
     }
 }
 
-/// Read a u16 from a real-mode seg:off address
+/// Read a u16 from a real-mode seg:off address (unaligned-safe, null-safe)
 fn read_u16(seg: u32, off: u32) -> u16 {
     let linear = (seg << 4) + off;
-    unsafe { *(linear as *const u16) }
+    let val: u16;
+    unsafe {
+        core::arch::asm!(
+            "movzx {val:e}, word ptr [{addr}]",
+            addr = in(reg) linear,
+            val = out(reg) val,
+            options(readonly, nostack),
+        );
+    }
+    val
 }
 
-/// Write a u16 to a real-mode seg:off address
+/// Write a u16 to a real-mode seg:off address (unaligned-safe, null-safe)
 fn write_u16(seg: u32, off: u32, val: u16) {
     let linear = (seg << 4) + off;
-    unsafe { *(linear as *mut u16) = val; }
+    unsafe {
+        core::arch::asm!(
+            "mov word ptr [{addr}], {val:x}",
+            addr = in(reg) linear,
+            val = in(reg) val,
+            options(nostack),
+        );
+    }
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
@@ -129,48 +315,50 @@ pub fn vm86_monitor(regs: &mut Regs) {
         // IN AL, imm8 (0xE4)
         0xE4 => {
             let port = fetch_byte(regs) as u16;
-            regs.rax = (regs.rax & !0xFF) | crate::x86::inb(port) as u64;
+            regs.rax = (regs.rax & !0xFF) | emulate_inb(port) as u64;
         }
         // IN AX, imm8 (0xE5)
         0xE5 => {
             let port = fetch_byte(regs) as u16;
-            regs.rax = (regs.rax & !0xFFFF) | crate::x86::inw(port) as u64;
+            regs.rax = (regs.rax & !0xFFFF) | emulate_inb(port) as u64;
         }
         // OUT imm8, AL (0xE6)
         0xE6 => {
             let port = fetch_byte(regs) as u16;
-            crate::x86::outb(port, regs.rax as u8);
+            emulate_outb(port, regs.rax as u8);
         }
         // OUT imm8, AX (0xE7)
         0xE7 => {
             let port = fetch_byte(regs) as u16;
-            // outw not critical, just use outb for low byte
-            crate::x86::outb(port, regs.rax as u8);
+            emulate_outb(port, regs.rax as u8);
         }
         // IN AL, DX (0xEC)
         0xEC => {
             let port = regs.rdx as u16;
-            regs.rax = (regs.rax & !0xFF) | crate::x86::inb(port) as u64;
+            regs.rax = (regs.rax & !0xFF) | emulate_inb(port) as u64;
         }
         // IN AX, DX (0xED)
         0xED => {
             let port = regs.rdx as u16;
-            regs.rax = (regs.rax & !0xFFFF) | crate::x86::inw(port) as u64;
+            regs.rax = (regs.rax & !0xFFFF) | emulate_inb(port) as u64;
         }
         // OUT DX, AL (0xEE)
         0xEE => {
             let port = regs.rdx as u16;
-            crate::x86::outb(port, regs.rax as u8);
+            emulate_outb(port, regs.rax as u8);
         }
         // OUT DX, AX (0xEF)
         0xEF => {
             let port = regs.rdx as u16;
-            crate::x86::outb(port, regs.rax as u8);
+            emulate_outb(port, regs.rax as u8);
         }
-        // HLT (0xF4) — yield
+        // HLT (0xF4) — save state and yield to another thread
         0xF4 => {
-            crate::x86::sti();
-            crate::x86::hlt();
+            if let Some(current) = thread::current() {
+                thread::save_state(current, regs);
+                current.state = thread::ThreadState::Ready;
+                thread::schedule();
+            }
         }
         _ => {
             println!("\x1b[91mVM86: unhandled opcode {:#04x} at {:04x}:{:04x}\x1b[0m",
@@ -274,22 +462,25 @@ fn int_21h(regs: &mut Regs) {
 // IVT setup — fill all 256 entries with a pointer to an IRET instruction
 // ============================================================================
 
-/// Set up the Interrupt Vector Table at address 0x0000-0x03FF.
-/// All 256 entries point to IVT_HANDLER_SEG:IVT_HANDLER_OFF (0xF000:0x0000).
-/// We also write an IRET opcode (0xCF) at linear address 0xF0000.
+/// Set up VM86 IVT: write an IRET stub at 0xF000:0x0000, then point all
+/// 256 IVT entries to it. Programs that hook interrupts will overwrite
+/// the entries they care about.
 pub fn setup_ivt() {
-    // Write IRET instruction at the handler address
     let iret_addr = ((IVT_HANDLER_SEG as u32) << 4) + IVT_HANDLER_OFF as u32;
     unsafe {
         *(iret_addr as *mut u8) = 0xCF; // IRET opcode
     }
-
-    // Fill IVT (256 entries, 4 bytes each: offset:segment)
-    for i in 0..256u32 {
-        let entry_addr = i * 4;
+    // Fill all 256 IVT entries (4 bytes each: offset:segment) at address 0.
+    // Use raw_write_u16 to avoid Rust's null pointer panic for address 0.
+    let entry = (IVT_HANDLER_OFF as u32) | ((IVT_HANDLER_SEG as u32) << 16);
+    for i in 0u32..256 {
+        let addr = i * 4;
         unsafe {
-            *(entry_addr as *mut u16) = IVT_HANDLER_OFF;
-            *((entry_addr + 2) as *mut u16) = IVT_HANDLER_SEG;
+            core::arch::asm!(
+                "mov [{addr}], {val}",
+                addr = in(reg) addr,
+                val = in(reg) entry,
+            );
         }
     }
 }

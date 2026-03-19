@@ -116,7 +116,13 @@ fn timer_handler() {
 /// Keyboard interrupt handler
 fn keyboard_handler() {
     let scancode = inb(0x60);
-    // TODO: Process key
+    // Buffer scancode for VM86 threads; print for others
+    if let Some(t) = crate::thread::current() {
+        if t.mode == crate::thread::ThreadMode::Mode16 {
+            t.vkbd.push(scancode);
+            return;
+        }
+    }
     println!("Key: {:#04x}", scancode);
 }
 
