@@ -36,8 +36,19 @@ const ENOENT: i32 = -2;
 /// Error: exec format error
 const ENOEXEC: i32 = -8;
 
+/// Syscall result: return value + optional switch target
+pub struct SyscallResult {
+    pub retval: i32,
+    pub switch_to: Option<usize>,
+}
+
+impl SyscallResult {
+    fn val(retval: i32) -> Self { Self { retval, switch_to: None } }
+    fn switch(switch_to: Option<usize>) -> Self { Self { retval: 0, switch_to } }
+}
+
 /// Syscall handler type
-type SyscallFn = fn(&mut Regs) -> i32;
+type SyscallFn = fn(&mut Regs) -> SyscallResult;
 
 /// Syscall table
 const SYSCALL_TABLE: [Option<SyscallFn>; 10] = [
@@ -53,12 +64,12 @@ const SYSCALL_TABLE: [Option<SyscallFn>; 10] = [
     Some(sys_write),  // 9
 ];
 
-/// Dispatch a syscall
-pub fn dispatch(regs: &mut Regs) {
+/// Dispatch a syscall. Returns Some(idx) if a context switch is needed.
+pub fn dispatch(regs: &mut Regs) -> Option<usize> {
     // 64-bit syscall ABI uses different registers: rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4
     // Remap to the canonical layout (rdx=arg0, rcx=arg1, rbx=arg2, rsi=arg3, rdi=arg4)
     // so handlers don't need to know which mode the caller is in.
-    let is_64bit = thread::current().map_or(false, |t| t.mode == thread::ThreadMode::Mode64);
+    let is_64bit = thread::current().mode == thread::ThreadMode::Mode64;
     if is_64bit {
         let (a0, a1, a2, a3, a4) = (regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8);
         regs.rdx = a0;
@@ -74,58 +85,59 @@ pub fn dispatch(regs: &mut Regs) {
         if let Some(handler) = SYSCALL_TABLE[syscall_num] {
             handler(regs)
         } else {
-            ENOSYS
+            SyscallResult::val(ENOSYS)
         }
     } else {
-        ENOSYS
+        SyscallResult::val(ENOSYS)
     };
 
-    regs.rax = result as u32 as u64;
-
+    regs.rax = result.retval as u32 as u64;
+    result.switch_to
 }
 
 /// Exit syscall (0)
 /// Terminates the current process
-fn sys_exit(regs: &mut Regs) -> i32 {
+fn sys_exit(regs: &mut Regs) -> SyscallResult {
     let exit_code = regs.rdx as i32;
-    thread::exit_thread(exit_code);
+    SyscallResult::switch(thread::exit_thread(exit_code))
 }
 
 /// Yield syscall (1)
 /// Yields CPU to another thread
-fn sys_yield(regs: &mut Regs) -> i32 {
+fn sys_yield(regs: &mut Regs) -> SyscallResult {
     // Save current state and schedule another thread
-    if let Some(current) = thread::current() {
-        thread::save_state(current, regs);
-        current.state = thread::ThreadState::Ready;
-        thread::schedule();
-    }
-    0
+    let current = thread::current();
+    thread::save_state(current, regs);
+    thread::set_return(current, 0);  // Yield returns 0 when resumed
+    current.state = thread::ThreadState::Ready;
+    SyscallResult::switch(thread::schedule())
 }
 
 /// Fork syscall (4)
 /// Creates a copy of the current process
-fn sys_fork(regs: &mut Regs) -> i32 {
+fn sys_fork(regs: &mut Regs) -> SyscallResult {
     // Fork the address space
     let new_page_dir = match paging2::fork_current() {
         Some(pd) => pd,
-        None => return ENOMEM,
+        None => return SyscallResult::val(ENOMEM),
     };
 
     // Get current thread
-    let current = match thread::current() {
-        Some(t) => t,
-        None => return ENOSYS,
-    };
+    let current = thread::current();
 
     // Save current thread's state
     thread::save_state(current, regs);
 
-    // Create child thread
+    // Create child thread (init_fork extracts PDPT entries from new_page_dir)
     let child = match thread::create_thread(Some(current), new_page_dir, true) {
         Some(t) => t,
-        None => return ENOMEM,
+        None => return SyscallResult::val(ENOMEM),
     };
+
+    // Free the child's root page table page — init_fork already extracted the
+    // PDPT entries into the thread's RootPageTable, so the page itself is no
+    // longer needed. Without this, it leaks 1 page per fork.
+    crate::phys_mm::free_phys_page(new_page_dir);
 
     // Copy CPU state and mode from parent to child
     child.cpu_state = current.cpu_state;
@@ -136,7 +148,7 @@ fn sys_fork(regs: &mut Regs) -> i32 {
     thread::set_return(child, 0);
 
     // Parent returns child's TID
-    child.tid
+    SyscallResult::val(child.tid)
 }
 
 /// Exec syscall (5)
@@ -145,12 +157,13 @@ fn sys_fork(regs: &mut Regs) -> i32 {
 /// arg1 (rcx) = path length
 /// arg2 (rbx) = argv pointer (array of &str = [(ptr, len), ...])
 /// arg3 (rsi) = argc (number of &str elements)
-fn sys_exec(regs: &mut Regs) -> i32 {
+fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let path = unsafe { &*core::ptr::slice_from_raw_parts(regs.rdx as *const u8, regs.rcx as usize) };
 
     let Ok(path) = core::str::from_utf8(path) else {
-        return ENOENT;
+        return SyscallResult::val(ENOENT);
     };
+    crate::phys_mm::dump_stats();
     println!("Exec: {}", path);
 
     // Detect .COM extension (case-insensitive)
@@ -165,21 +178,42 @@ fn sys_exec(regs: &mut Regs) -> i32 {
     // Read argv from caller's address space (before we free it)
     let argc = regs.rsi as usize;
     let argv_ptr = regs.rbx as usize;
-    let caller_64bit = thread::current().map_or(false, |t| t.mode == thread::ThreadMode::Mode64);
+    let caller_64bit = thread::current().mode == thread::ThreadMode::Mode64;
+    let hp0 = crate::heap::heap_pages();
     let args = read_argv(argv_ptr, argc, caller_64bit);
+    let hp1 = crate::heap::heap_pages();
+
+    // Drop old SymbolData before allocating the new buffer. The old symbols
+    // hold a Box<[u8]> with the entire previous ELF (~300-400K). Freeing it
+    // first lets the heap free list absorb the space, so the new buffer
+    // allocation can reuse it instead of extending the heap every iteration.
+    {
+        let current = thread::current();
+        if current.symbols.is_some() {
+            println!("DROP-SYM: tid={} for {}", current.tid, path);
+        }
+        current.symbols = None;
+    }
+    let hp2 = crate::heap::heap_pages();
 
     // Find the file in TAR
     let size = match startup::find_file(path.as_bytes()) {
         Some(s) => s,
-        None => return ENOENT,
+        None => return SyscallResult::val(ENOENT),
     };
 
     let mut buffer = alloc::vec![0; size];
+    let hp3 = crate::heap::heap_pages();
     startup::read_file(&mut buffer);
+    if hp3 > hp0 {
+        println!("HEAP-EXEC: +{} (argv={} sym={} buf={}) size={}", hp3 - hp0, hp1 - hp0, hp2 - hp1, hp3 - hp2, size);
+    }
 
     // .COM files use the VM86 exec path
     if is_com {
-        return exec_com(&buffer);
+        let tid = exec_com(&buffer);
+        // buffer and args dropped here by RAII
+        return SyscallResult::switch(Some(tid));
     }
 
     // Free current user pages and load new ELF (point of no return)
@@ -188,61 +222,63 @@ fn sys_exec(regs: &mut Regs) -> i32 {
 
     let loaded = match elf::load_elf(&buffer) {
         Ok(e) => e,
-        Err(_) => { thread::exit_thread(-ENOEXEC); },
+        Err(_) => { return SyscallResult::switch(thread::exit_thread(-ENOEXEC)); },
     };
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
     println!("exec: want_64={} entry={:#x}", want_64, loaded.entry);
     if want_64 && !paging2::cpu_supports_long_mode() {
-        thread::exit_thread(-ENOEXEC);
+        return SyscallResult::switch(thread::exit_thread(-ENOEXEC));
     }
 
     let symbols = SymbolData::new(buffer.into_boxed_slice());
-
-    if let Some(current) = thread::current() {
-        // Toggle CPU mode if needed (PAE → Compat)
-        // In compat mode, both 32/64-bit run without toggling.
-        let want_mode = if want_64 { thread::ThreadMode::Mode64 } else { thread::ThreadMode::Mode32 };
-        if want_mode != current.mode {
-            let need_toggle = match paging2::cpu_mode() {
-                paging2::CpuMode::Pae => want_64,
-                paging2::CpuMode::Compat => want_mode == thread::ThreadMode::Mode16,
-                _ => false,
-            };
-            if need_toggle {
-                paging2::ensure_trampoline_mapped();
-                if !want_64 {
-                    paging2::sync_hw_pdpt();
-                }
-                descriptors::toggle_mode(paging2::toggle_cr3(want_64));
-            }
-            current.mode = want_mode;
-        }
-
-        println!("exec: setting up stack");
-        // Set up argv on the new user stack and get the adjusted SP
-        let word = if want_64 { 8usize } else { 4usize };
-        let stack = setup_user_stack(&args, want_64, word);
-
-        if want_64 {
-            thread::init_process_thread_64(current, loaded.entry, stack.sp as u64);
-            // System V ABI: first two args in RDI, RSI
-            current.cpu_state.rdi = stack.argc as u64;
-            current.cpu_state.rsi = stack.argv as u64;
-        } else {
-            thread::init_process_thread(current, loaded.entry as u32, stack.sp as u32);
-        }
-
-        println!("exec: calling exit_to_thread");
-        current.symbols = symbols;
-        thread::exit_to_thread(current);
+    if symbols.is_none() {
+        println!("SYM-NONE: {}", path);
     }
 
-    ENOSYS
+    let current = thread::current();
+    let tid = current.tid as usize;
+
+    // Toggle CPU mode if needed (PAE → Compat)
+    // In compat mode, both 32/64-bit run without toggling.
+    let want_mode = if want_64 { thread::ThreadMode::Mode64 } else { thread::ThreadMode::Mode32 };
+    if want_mode != current.mode {
+        let need_toggle = match paging2::cpu_mode() {
+            paging2::CpuMode::Pae => want_64,
+            paging2::CpuMode::Compat => want_mode == thread::ThreadMode::Mode16,
+            _ => false,
+        };
+        if need_toggle {
+            paging2::ensure_trampoline_mapped();
+            if !want_64 {
+                paging2::sync_hw_pdpt();
+            }
+            descriptors::toggle_mode(paging2::toggle_cr3(want_64));
+        }
+        current.mode = want_mode;
+    }
+
+    println!("exec: setting up stack");
+    // Set up argv on the new user stack and get the adjusted SP
+    let word = if want_64 { 8usize } else { 4usize };
+    let stack = setup_user_stack(&args, want_64, word);
+
+    if want_64 {
+        thread::init_process_thread_64(current, loaded.entry, stack.sp as u64);
+        // System V ABI: first two args in RDI, RSI
+        current.cpu_state.rdi = stack.argc as u64;
+        current.cpu_state.rsi = stack.argv as u64;
+    } else {
+        thread::init_process_thread(current, loaded.entry as u32, stack.sp as u32);
+    }
+
+    current.symbols = symbols;
+    // args and buffer dropped here by RAII
+    SyscallResult::switch(Some(tid))
 }
 
-/// Execute a .COM file in VM86 mode (point of no return)
-fn exec_com(data: &[u8]) -> i32 {
+/// Execute a .COM file in VM86 mode. Returns thread index to switch to.
+fn exec_com(data: &[u8]) -> usize {
     use crate::vm86;
 
     // Free current user pages
@@ -259,16 +295,14 @@ fn exec_com(data: &[u8]) -> i32 {
     let (cs, ip, ss, sp) = vm86::load_com(data);
     println!("exec_com: cs={:#06x} ip={:#06x} ss={:#06x} sp={:#06x}", cs, ip, ss, sp);
 
-    if let Some(current) = thread::current() {
-        // Initialize VM86 thread state
-        thread::init_process_thread_vm86(current, cs, ip, ss, sp);
-        current.symbols = None;
+    let current = thread::current();
+    let tid = current.tid as usize;
 
-        println!("exec_com: calling exit_to_thread");
-        thread::exit_to_thread(current);
-    }
+    // Initialize VM86 thread state
+    thread::init_process_thread_vm86(current, cs, ip, ss, sp);
+    current.symbols = None;
 
-    ENOSYS
+    tid
 }
 
 /// Read argv from the caller's userspace into kernel-owned Vecs.
@@ -362,7 +396,7 @@ fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool, word: usize) ->
 /// Open syscall (6)
 /// Opens a file and returns its size (or -1 if not found)
 /// RDX = path pointer (null-terminated)
-fn sys_open(regs: &mut Regs) -> i32 {
+fn sys_open(regs: &mut Regs) -> SyscallResult {
     let path_ptr = regs.rdx as *const u8;
 
     // Get path as slice
@@ -385,8 +419,8 @@ fn sys_open(regs: &mut Regs) -> i32 {
 
     // Find the file in TAR and return its size
     match startup::find_file(path) {
-        Some(size) => size as i32,
-        None => ENOENT,
+        Some(size) => SyscallResult::val(size as i32),
+        None => SyscallResult::val(ENOENT),
     }
 }
 
@@ -394,36 +428,36 @@ fn sys_open(regs: &mut Regs) -> i32 {
 /// Waits for a child process to exit
 /// RDX = pid (-1 for any child)
 /// Returns: child tid (or negative error)
-fn sys_wait(regs: &mut Regs) -> i32 {
+fn sys_wait(regs: &mut Regs) -> SyscallResult {
     let pid = regs.rdx as i32;
     let (tid, _code) = thread::waitpid(pid);
     if tid >= 0 || tid == -10 {
-        return tid;
+        return SyscallResult::val(tid);
     }
     // EAGAIN: children exist but none exited yet — yield
     // Userspace must retry (busy-wait with yield)
-    0x7fff_ffff // sentinel: "try again"
+    SyscallResult::val(0x7fff_ffff) // sentinel: "try again"
 }
 
 /// Read syscall (8)
 /// Reads from a file descriptor
-fn sys_read(regs: &mut Regs) -> i32 {
+fn sys_read(regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx;
     let _buf = regs.rcx as *mut u8;
     let _len = regs.rbx as usize;
 
     if fd == 0 {
         // stdin - TODO: implement keyboard buffer
-        0
+        SyscallResult::val(0)
     } else {
         // TODO: Read from file
-        ENOSYS
+        SyscallResult::val(ENOSYS)
     }
 }
 
 /// Write syscall (9)
 /// Writes to a file descriptor
-fn sys_write(regs: &mut Regs) -> i32 {
+fn sys_write(regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx;
     let buf = regs.rcx as *const u8;
     let len = regs.rbx as usize;
@@ -435,8 +469,8 @@ fn sys_write(regs: &mut Regs) -> i32 {
                 vga::vga().putchar(*buf.add(i));
             }
         }
-        len as i32
+        SyscallResult::val(len as i32)
     } else {
-        ENOSYS
+        SyscallResult::val(ENOSYS)
     }
 }

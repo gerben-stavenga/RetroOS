@@ -117,7 +117,8 @@ fn timer_handler() {
 fn keyboard_handler() {
     let scancode = inb(0x60);
     // Buffer scancode for VM86 threads; print for others
-    if let Some(t) = crate::thread::current() {
+    if crate::thread::is_initialized() {
+        let t = crate::thread::current();
         if t.mode == crate::thread::ThreadMode::Mode16 {
             t.vkbd.push(scancode);
             return;

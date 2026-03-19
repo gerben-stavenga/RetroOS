@@ -59,7 +59,11 @@ fn divide_error(regs: &Regs) -> ! {
 }
 
 /// Handle debug exception (int 1)
-fn debug_exception(regs: &Regs) -> ! {
+/// In VM86 or user mode, kill the thread instead of panicking.
+fn debug_exception(regs: &mut Regs) -> Option<usize> {
+    if is_vm86(regs) || regs.code_seg() & 3 != 0 {
+        return segv_current_thread(regs, regs.ip() as usize);
+    }
     panic_with_regs("Debug exception", regs);
 }
 
@@ -90,7 +94,32 @@ fn bound_range(regs: &Regs) -> ! {
 }
 
 /// Handle invalid opcode (int 6)
-fn invalid_opcode(regs: &Regs) -> ! {
+/// Returns Some(idx) if a context switch is needed.
+fn invalid_opcode(regs: &mut Regs) -> Option<usize> {
+    if regs.code_seg() & 3 != 0 || is_vm86(regs) {
+        // Debug: check if the ROM page mapping is corrupted
+        if is_vm86(regs) {
+            let cs = regs.code_seg() as u32;
+            let ip = regs.ip() as u32;
+            let linear = (cs << 4) + ip;
+            let page = linear >> 12;
+            // Check what physical page the PTE points to
+            use crate::paging2::Entry;
+            match crate::paging2::entries() {
+                crate::paging2::Entries::E32(e) => {
+                    let pte = e[page as usize];
+                    println!("UD2: linear={:#x} page={:#x} PTE={:#x} (phys={:#x})",
+                        linear, page, pte.raw(), pte.page());
+                }
+                crate::paging2::Entries::E64(e) => {
+                    let pte = e[page as usize];
+                    println!("UD2: linear={:#x} page={:#x} PTE={:#x} (phys={:#x})",
+                        linear, page, pte.raw(), pte.page());
+                }
+            }
+        }
+        return segv_current_thread(regs, regs.ip() as usize);
+    }
     panic_with_regs("Invalid opcode", regs);
 }
 
@@ -121,10 +150,10 @@ fn stack_segment(regs: &Regs) -> ! {
 
 /// Handle general protection fault (int 13)
 /// For VM86 threads, dispatches to the VM86 monitor instead of panicking.
-fn general_protection(regs: &mut Regs) {
+/// Returns Some(idx) if a context switch is needed.
+fn general_protection(regs: &mut Regs) -> Option<usize> {
     if is_vm86(regs) {
-        crate::vm86::vm86_monitor(regs);
-        return;
+        return crate::vm86::vm86_monitor(regs);
     }
     println!("GP fault, selector: {:#x}", regs.err_code);
     panic_with_regs("General protection fault", regs);
@@ -141,7 +170,7 @@ fn general_protection(regs: &mut Regs) {
 /// - Writing that PTE may fault if the parent level doesn't exist
 /// - That fault is handled the same way, climbing up the hierarchy
 /// - Recursion terminates at the self-referential PDPT entry (always present)
-fn page_fault(regs: &mut Regs) {
+fn page_fault(regs: &mut Regs) -> Option<usize> {
     use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
 
     let fault_addr = x86::read_cr2() as usize;
@@ -164,11 +193,10 @@ fn page_fault(regs: &mut Regs) {
     // Catches both null and ~0 (e.g., (char*)-1 or null + negative offset)
     // Skip for VM86 threads — they legitimately access IVT (0x0000-0x03FF) and BDA
     const NULL_LIMIT: usize = 0x10000;
-    let vm86_thread = thread::current().map_or(false, |t| t.mode == thread::ThreadMode::Mode16);
+    let vm86_thread = thread::is_initialized() && thread::current().mode == thread::ThreadMode::Mode16;
     if !vm86_thread && (fault_addr < NULL_LIMIT || fault_addr >= (0 as usize).wrapping_sub(NULL_LIMIT)) {
         if user {
-            segv_current_thread(regs, fault_addr);
-            return;
+            return segv_current_thread(regs, fault_addr);
         }
         println!("Page fault: {} at {:#x} RIP={:#x}", access, fault_addr, regs.ip());
         panic_with_regs("Kernel null pointer dereference", regs);
@@ -176,8 +204,7 @@ fn page_fault(regs: &mut Regs) {
 
     // User mode tried to access kernel memory (PAGE_TABLE_BASE or above)
     if user && fault_addr >= PAGE_TABLE_BASE {
-        segv_current_thread(regs, fault_addr);
-        return;
+        return segv_current_thread(regs, fault_addr);
     }
 
     // Kernel fault in kernel code/data region is a bug
@@ -218,19 +245,20 @@ fn page_fault(regs: &mut Regs) {
     match paging2::entries() {
         paging2::Entries::E32(e) => {
             if present {
-                handle_protection_fault(e, regs, fault_addr, page_index, write, user, instruction_fetch);
+                return handle_protection_fault(e, regs, fault_addr, page_index, write, user, instruction_fetch);
             } else {
                 demand_page(e, page_index, false);
             }
         }
         paging2::Entries::E64(e) => {
             if present {
-                handle_protection_fault(e, regs, fault_addr, page_index, write, user, instruction_fetch);
+                return handle_protection_fault(e, regs, fault_addr, page_index, write, user, instruction_fetch);
             } else {
                 demand_page(e, page_index, paging2::nx_enabled());
             }
         }
     }
+    None
 }
 
 /// Handle protection faults (present page, but access denied)
@@ -246,11 +274,10 @@ fn handle_protection_fault<E: paging2::Entry>(
     write: bool,
     user: bool,
     instruction_fetch: bool,
-) {
+) -> Option<usize> {
     if instruction_fetch {
         if user {
-            segv_current_thread(regs, fault_addr);
-            return;
+            return segv_current_thread(regs, fault_addr);
         }
         panic_with_regs("Kernel executed non-executable page (NX violation)", regs);
     }
@@ -267,12 +294,12 @@ fn handle_protection_fault<E: paging2::Entry>(
     loop {
         if entries[idx].present() && !entries[idx].hw_writable() {
             if !entries[idx].writable() {
-                if user { segv_current_thread(regs, fault_addr); return; }
+                if user { return segv_current_thread(regs, fault_addr); }
                 panic_with_regs("Kernel write to read-only page", regs);
             }
             paging2::cow_entry(entries, idx);
             paging2::flush_tlb();
-            return;
+            return None;
         }
         let parent = paging2::parent_index::<E>(idx);
         if parent == idx {
@@ -283,7 +310,7 @@ fn handle_protection_fault<E: paging2::Entry>(
     }
 
     // Protection fault but nothing is R/O — should not happen
-    if user { segv_current_thread(regs, fault_addr); return; }
+    if user { return segv_current_thread(regs, fault_addr); }
     panic_with_regs("Unexpected write protection fault", regs);
 }
 
@@ -310,17 +337,15 @@ fn demand_page<E: paging2::Entry>(
     paging2::flush_tlb();
 }
 
-/// Signal current thread on segmentation fault
-fn segv_current_thread(regs: &mut Regs, fault_addr: usize) {
+/// Signal current thread on segmentation fault.
+/// Returns Some(idx) if a context switch is needed.
+fn segv_current_thread(regs: &mut Regs, fault_addr: usize) -> Option<usize> {
     use crate::thread;
 
     println!("\x1b[91mSegmentation fault at {:#x} RIP={:#x}\x1b[0m", fault_addr, regs.ip());
 
-    if let Some(thread) = thread::current() {
-        thread::signal_thread(thread, fault_addr);
-    } else {
-        panic_with_regs("Segfault with no current thread", regs);
-    }
+    let thread = thread::current();
+    thread::signal_thread(thread, fault_addr)
 }
 
 /// Handle x87 FPU error (int 16)
@@ -389,7 +414,9 @@ unsafe fn vm86_swap_out(regs: &mut Regs) {
     regs.gs = 0;
 }
 
-/// Main interrupt service routine - dispatches to specific handlers
+/// Main interrupt service routine - dispatches to specific handlers.
+/// This is the ONLY place that calls switch_to_thread (via exit_kernel).
+/// All handlers return normally so RAII works for heap-allocated locals.
 #[unsafe(no_mangle)]
 pub extern "C" fn isr_handler(regs: *mut Regs) {
     let regs = unsafe { &mut *regs };
@@ -407,11 +434,11 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         x86::sti();
     }
 
-    match int_num {
+    let switch_to: Option<usize> = match int_num {
         0 => divide_error(regs),
-        1 => debug_exception(regs),
+        1 => debug_exception(regs),  // mutable ref needed for VM86/user kill
         2 => nmi(regs),
-        3 => breakpoint(regs),
+        3 => { breakpoint(regs); None }
         4 => overflow(regs),
         5 => bound_range(regs),
         6 => invalid_opcode(regs),
@@ -433,31 +460,40 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
             handle_irq(regs);
 
             let irq = int_num - 32;
+            let mut sw = None;
 
-            // Queue signal on VM86 threads for IVT reflection
-            if let Some(t) = thread::current() {
+            if thread::is_initialized() {
+                // Queue signal on VM86 threads for IVT reflection
+                let t = thread::current();
                 if t.mode == thread::ThreadMode::Mode16 {
                     t.pending_signals |= 1 << irq;
                 }
-            }
 
-            // Timer preemption (IRQ 0, every 10ms at 1000 Hz)
-            // Only preempt if interrupted from user mode (VM86 or RPL=3).
-            // Never preempt kernel code — save_state would capture mid-syscall state.
-            if irq == 0 && (vm86 || regs.code_seg() & 3 != 0) && crate::irq::get_ticks() % 10 == 0 {
-                if let Some(current) = thread::current() {
+                // Timer preemption (IRQ 0, every 10ms at 1000 Hz)
+                // Only preempt if interrupted from user mode (VM86 or RPL=3).
+                // Never preempt kernel code — save_state would capture mid-syscall state.
+                if irq == 0 && (vm86 || regs.code_seg() & 3 != 0) && crate::irq::get_ticks() % 10 == 0 {
+                    let current = thread::current();
                     thread::save_state(current, regs);
                     current.state = thread::ThreadState::Ready;
-                    thread::schedule();
-                    // schedule may return if no other threads are ready
+                    sw = thread::schedule();
                 }
             }
+            sw
         }
 
         // Syscall (IDT entry 0x80 uses vector 48's handler)
         48 => dispatch(regs),
 
         _ => generic_exception(regs),
+    };
+
+    // If a handler requested a context switch, do it here.
+    // This is the single exit point — all Rust locals above are dropped by RAII first.
+    if let Some(idx) = switch_to {
+        // Save current state if not already saved (exit/yield/preempt already saved)
+        // For exec, the thread state was already set up by the handler.
+        thread::switch_to_thread(idx);
     }
 
     // VM86: deliver pending signals, then swap segments back

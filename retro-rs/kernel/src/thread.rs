@@ -153,21 +153,20 @@ impl Thread {
 /// Thread array (heap-allocated to keep large RootPageTable out of .data)
 static mut THREADS: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
 
-/// Current running thread
-static mut CURRENT_THREAD: *mut Thread = core::ptr::null_mut();
+/// Current running thread index (0 = idle/init, always valid after init)
+static mut CURRENT_THREAD: usize = 0;
 
 /// PRNG state for random scheduling
 static mut SEED: u64 = 0xcafe_babe_dead_beef;
 
-/// Get current thread
-pub fn current() -> Option<&'static mut Thread> {
-    unsafe {
-        if CURRENT_THREAD.is_null() {
-            None
-        } else {
-            Some(&mut *CURRENT_THREAD)
-        }
-    }
+/// Check if threading system is initialized
+pub fn is_initialized() -> bool {
+    unsafe { (*(&raw const THREADS)).len() > 0 }
+}
+
+/// Get current thread (always valid — TID 0 is idle/init)
+pub fn current() -> &'static mut Thread {
+    unsafe { &mut THREADS[CURRENT_THREAD] }
 }
 
 /// Get thread by TID
@@ -285,48 +284,52 @@ pub fn set_return(thread: &mut Thread, ret: i32) {
     thread.cpu_state.rax = ret as i64 as u64;  // Sign-extend for 32-bit, zero-extend to 64
 }
 
-/// Schedule next thread (randomly selected from ready threads)
-pub fn schedule() {
+/// Schedule next thread (randomly selected from ready threads).
+/// Returns Some(idx) if a switch is needed, None to stay with current.
+pub fn schedule() -> Option<usize> {
     unsafe {
         const A: u64 = 0xdead_beed;
         const C: u64 = 0x1234_5679;
         SEED = A.wrapping_mul(SEED).wrapping_add(C);
 
-        let current_tid = if !CURRENT_THREAD.is_null() { (*CURRENT_THREAD).tid } else { -1 };
+        let current_tid = CURRENT_THREAD;
 
-        let mut next_thread: *mut Thread = core::ptr::null_mut();
+        let mut next_idx: usize = usize::MAX;
         let mut count = 0u64;
 
         for i in 1..MAX_THREADS {
-            if i as i32 == current_tid {
+            if i == current_tid {
                 continue;
             }
             if THREADS[i].state == ThreadState::Ready {
                 count += 1;
                 if SEED % count == 0 {
-                    next_thread = &mut THREADS[i];
+                    next_idx = i;
                 }
             }
         }
 
-        if next_thread.is_null() {
-            // No other threads ready — stay with current
-            return;
+        if next_idx == usize::MAX {
+            None
+        } else {
+            Some(next_idx)
         }
-
-        exit_to_thread(&mut *next_thread);
     }
 }
 
-/// Switch to a thread (does not return for calling thread)
-pub fn exit_to_thread(thread: &mut Thread) -> ! {
+/// Get the current thread index
+pub fn current_idx() -> usize {
+    unsafe { CURRENT_THREAD }
+}
+
+/// Switch to a thread by index (does not return — only call from isr_handler or startup)
+pub fn switch_to_thread(idx: usize) -> ! {
+    let thread = unsafe { &mut THREADS[idx] };
     thread.state = ThreadState::Running;
 
     // Save outgoing thread's user entries
     unsafe {
-        if !CURRENT_THREAD.is_null() {
-            (*CURRENT_THREAD).root.save();
-        }
+        THREADS[CURRENT_THREAD].root.save();
     }
 
     // Toggle CPU mode (PAE ↔ Compat) if needed.
@@ -344,6 +347,9 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
         crate::x86::flush_tlb();
         crate::paging2::ensure_trampoline_mapped();
         crate::descriptors::toggle_mode(crate::paging2::toggle_cr3(thread.mode == ThreadMode::Mode64));
+        // Clear trampoline mapping — it's only needed during the toggle itself.
+        // Leaving it mapped as kernel-only breaks VM86 threads that access page 0xF.
+        crate::paging2::clear_trampoline();
     } else {
         thread.root.activate();
     }
@@ -356,7 +362,9 @@ pub fn exit_to_thread(thread: &mut Thread) -> ! {
         set_kernel_stack(stack_top as u32);
     }
 
-    unsafe { CURRENT_THREAD = thread; }
+    unsafe { CURRENT_THREAD = idx; }
+    // Re-borrow after updating CURRENT_THREAD
+    let thread = unsafe { &mut THREADS[idx] };
 
     // Deliver pending signals before entering userspace
     if thread.mode == ThreadMode::Mode16 {
@@ -419,18 +427,22 @@ unsafe extern "C" {
     fn exit_kernel(cpu_state: *const Regs, use_long_frame: u32) -> !;
 }
 
-/// Exit current thread and schedule next
-pub fn exit_thread(exit_code: i32) -> ! {
+/// Exit current thread and schedule next.
+/// Always returns Some(idx) — falls back to thread 0 (idle) if no other threads ready.
+/// Caller must call switch_to_thread with the result.
+pub fn exit_thread(exit_code: i32) -> Option<usize> {
     unsafe {
-        let thread = &mut *CURRENT_THREAD;
-        println!("Thread {} exited with code {}", thread.tid, exit_code);
+        let thread = &mut THREADS[CURRENT_THREAD];
         crate::paging2::free_user_pages();
+        println!("Thread {} exited with code {}", thread.tid, exit_code);
+        crate::phys_mm::dump_stats();
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
-        CURRENT_THREAD = core::ptr::null_mut();
-        schedule();
+        // Symbols are dropped here by RAII when thread goes zombie
+        thread.symbols = None;
+        CURRENT_THREAD = 0;
+        Some(schedule().unwrap_or(0))
     }
-    panic!("No threads to schedule after exit");
 }
 
 /// Wait for a child to exit. Returns (child_tid, exit_code) or -ECHILD if no children.
@@ -438,7 +450,7 @@ pub fn exit_thread(exit_code: i32) -> ! {
 /// Non-blocking: returns -EAGAIN if children exist but none have exited yet.
 pub fn waitpid(pid: i32) -> (i32, i32) {
     unsafe {
-        let current_tid = if !CURRENT_THREAD.is_null() { (*CURRENT_THREAD).tid } else { return (-10, 0); };
+        let current_tid = THREADS[CURRENT_THREAD].tid;
         let mut has_children = false;
 
         for i in 1..MAX_THREADS {
@@ -462,8 +474,9 @@ pub fn waitpid(pid: i32) -> (i32, i32) {
     }
 }
 
-/// Signal thread (e.g., on segfault)
-pub fn signal_thread(thread: &mut Thread, fault_address: usize) {
+/// Signal thread (e.g., on segfault).
+/// Returns Some(idx) if a context switch is needed (current thread killed).
+pub fn signal_thread(thread: &mut Thread, fault_address: usize) -> Option<usize> {
     if thread.pid == 0 {
         // Kernel thread - panic
         println!("\x1b[91mSEGV in init at {:#x}\x1b[0m", fault_address);
@@ -475,13 +488,17 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) {
         println!("SEGV in thread {} at {:#x}", thread.tid, fault_address);
 
         unsafe {
-            if CURRENT_THREAD == thread as *mut _ {
+            if CURRENT_THREAD == thread.tid as usize {
+                crate::paging2::free_user_pages();
                 thread.state = ThreadState::Zombie;
                 thread.exit_code = -11;  // SIGSEGV
-                CURRENT_THREAD = core::ptr::null_mut();
-                schedule();
+                thread.symbols = None;
+                CURRENT_THREAD = 0;
+                Some(schedule().unwrap_or(0))
             } else {
+                // Not current thread — can't free pages here (wrong address space)
                 thread.state = ThreadState::Zombie;
+                None
             }
         }
     }
@@ -505,7 +522,7 @@ pub fn init_threading() {
         THREADS[0].state = ThreadState::Running;
         THREADS[0].root.init_current();
         THREADS[0].root.activate();
-        CURRENT_THREAD = &mut THREADS[0];
+        // CURRENT_THREAD defaults to 0, which is correct
     }
 }
 

@@ -13,6 +13,14 @@ use crate::phys_mm;
 /// Heap ends before the top of address space
 pub const HEAP_END: usize = 0xFFF0_0000;
 
+/// Total physical pages consumed by the heap (never returned)
+static mut HEAP_PAGES: u32 = 0;
+
+/// Track large allocs/deallocs for debugging
+static mut LARGE_ALLOCS: u32 = 0;
+static mut LARGE_FREES: u32 = 0;
+static mut LARGE_REUSE: u32 = 0;  // alloc satisfied from free list (no extend)
+
 /// Get heap base (first page after kernel _end)
 fn heap_base() -> usize {
     unsafe extern "C" {
@@ -104,6 +112,7 @@ impl AllocatorInner {
                 Some(p) => p,
                 None => break,
             };
+            unsafe { HEAP_PAGES += 1; }
 
             let virt_page_idx = self.mapped_end / PAGE_SIZE;
             match paging2::entries() {
@@ -287,10 +296,12 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
         // Try to allocate from existing free list
         if let Some(ptr) = inner.alloc_from_list(size, align) {
+            if size >= 100_000 { unsafe { LARGE_REUSE += 1; } }
             return ptr;
         }
 
         // Need more memory
+        if size >= 100_000 { unsafe { LARGE_ALLOCS += 1; } }
         if !inner.extend_heap(size + align) {
             return core::ptr::null_mut();
         }
@@ -303,12 +314,27 @@ unsafe impl GlobalAlloc for KernelAllocator {
         let inner = unsafe { &mut *self.inner.get() };
 
         let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
+        if size >= 100_000 { unsafe { LARGE_FREES += 1; } }
         inner.add_free_region(ptr as usize, size);
     }
 }
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator::new();
+
+/// Get total physical pages consumed by the heap
+pub fn heap_pages() -> u32 {
+    unsafe { core::ptr::read_volatile(&raw const HEAP_PAGES) }
+}
+
+/// Get large alloc/free/reuse counts
+pub fn large_stats() -> (u32, u32, u32) {
+    unsafe {
+        (core::ptr::read_volatile(&raw const LARGE_ALLOCS),
+         core::ptr::read_volatile(&raw const LARGE_FREES),
+         core::ptr::read_volatile(&raw const LARGE_REUSE))
+    }
+}
 
 /// Initialize the kernel heap allocator
 pub fn init() {
