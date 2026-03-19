@@ -145,5 +145,5 @@ pub fn startup(start_sector: u32) -> ! {
     println!("Starting init process...");
 
     // Switch to init thread (doesn't return)
-    thread::exit_to_thread(init_thread);
+    thread::switch_to_thread(init_thread.tid as usize);
 }

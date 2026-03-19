@@ -197,13 +197,12 @@ fn lookup_symbol(addr: u64) -> (&'static str, u64) {
         }
     } else {
         // User address - use current thread's symbols
-        if let Some(thread) = thread::current() {
-            if let Some(ref symbols) = thread.symbols {
-                let (name, offset) = symbols.lookup(addr);
-                if !name.is_empty() {
-                    // SAFETY: thread symbols live as long as thread
-                    return (unsafe { core::mem::transmute(name) }, offset);
-                }
+        let thread = thread::current();
+        if let Some(ref symbols) = thread.symbols {
+            let (name, offset) = symbols.lookup(addr);
+            if !name.is_empty() {
+                // SAFETY: thread symbols live as long as thread
+                return (unsafe { core::mem::transmute(name) }, offset);
             }
         }
     }

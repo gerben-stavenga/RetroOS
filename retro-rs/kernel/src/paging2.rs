@@ -159,9 +159,8 @@ impl RootPageTable {
                     let was_ro = unsafe { self.e64[0].0 & flags::READ_WRITE == 0 && self.e64[0].0 & flags::PRESENT != 0 };
                     let now_rw = e[root].hw_writable();
                     if was_ro && now_rw {
-                        let tid = crate::thread::current().map_or(-1, |t| t.tid);
                         crate::println!("SAVE-BUG: tid={} PDPT[0] was R/O now R/W! old={:#x} new={:#x}",
-                            tid, unsafe { self.e64[0].0 }, e[root].raw());
+                            crate::thread::current().tid, unsafe { self.e64[0].0 }, e[root].raw());
                     }
                     for i in 0..user_count {
                         unsafe { self.e64[i] = e[root + i]; }
@@ -255,9 +254,7 @@ impl RootPageTable {
                     // (init_fork debug removed)
                 }
                 temp_unmap();
-                if let Some(parent) = crate::thread::current() {
-                    unsafe { self.e64[3] = parent.root.e64[3]; }
-                }
+                unsafe { self.e64[3] = crate::thread::current().root.e64[3]; }
             }
         }
     }
@@ -985,9 +982,8 @@ fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
     if cpu_mode() == CpuMode::Compat {
         let root = root_base();
         if entries[root].present() && entries[root].hw_writable() {
-            let tid = crate::thread::current().map_or(-1, |t| t.tid);
             crate::println!("FORK-BUG: tid={} PDPT[0] still R/W after share_and_copy! raw={:#x}",
-                tid, entries[root].raw());
+                crate::thread::current().tid, entries[root].raw());
         }
     }
 
@@ -1108,15 +1104,6 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         return;
     }
 
-    // Zero page: allocate a fresh zeroed page (no children to share)
-    if phys_mm::is_zero_page(old_phys) {
-        let new_phys = phys_mm::alloc_phys_page().expect("Out of memory during COW");
-        let user = entries[idx].user();
-        entries[idx] = E::new(new_phys, true, user);
-        invalidate_tlb();
-        return;
-    }
-
     let new_phys = if idx >= PAGE_TABLE_BASE_IDX {
         share_and_copy(entries, idx).expect("Out of memory during COW")
     } else {
@@ -1187,9 +1174,8 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
     // Debug: track root-level frees
     let root = root_base();
     if parent_idx >= root && parent_idx < root + 3 {
-        let tid = crate::thread::current().map_or(-1, |t| t.tid);
         crate::println!("FREE-ROOT: tid={} PDPT[{}] page={:#x} ref={}",
-            tid, parent_idx - root, phys, ref_count);
+            crate::thread::current().tid, parent_idx - root, phys, ref_count);
     }
 
     if ref_count == 1 {
@@ -1233,6 +1219,17 @@ pub fn ensure_trampoline_mapped() {
     }
 }
 
+/// Clear the trampoline mapping after a mode toggle completes.
+/// The trampoline is only needed during the toggle; leaving it mapped
+/// kernel-only breaks VM86 threads that access page 0xF.
+pub fn clear_trampoline() {
+    match entries() {
+        Entries::E32(e) => { e[TRAMPOLINE_PAGE] = Entry32::default(); }
+        Entries::E64(e) => { e[TRAMPOLINE_PAGE] = Entry64::default(); }
+    }
+    crate::x86::invlpg(TRAMPOLINE_ADDR);
+}
+
 /// Map the first 1MB of physical memory as user-accessible (for VM86 mode).
 /// Maps 256 pages (physical 0x00000-0xFFFFF) at virtual 0x00000-0xFFFFF
 /// with User + RW + Exec permissions.
@@ -1269,13 +1266,17 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     temp_unmap();
     entries[0] = E::new(page0_copy, true, true);
 
-    // Map pages 1-255: virtual page i → physical page i
-    // 0x01000-0x9FFFF: conventional memory (RW)
-    // 0xA0000-0xBFFFF: VGA framebuffer (RW)
-    // 0xC0000-0xFFFFF: ROM area (RO)
-    for i in 1..256usize {
-        let writable = i < 0xC0; // ROM starts at page 0xC0 (0xC0000)
-        entries[i] = E::new(i as u64, writable, true);
+    // Pages 1-0x9F: conventional memory — left unmapped (demand-paged zero)
+    // Each process gets private zeroed pages on first access.
+
+    // Pages 0xA0-0xBF: VGA framebuffer — identity mapped RW
+    for i in 0xA0..0xC0usize {
+        entries[i] = E::new(i as u64, true, true);
+    }
+
+    // Pages 0xC0-0xFF: ROM area — identity mapped RO
+    for i in 0xC0..0x100usize {
+        entries[i] = E::new(i as u64, false, true);
     }
 
     // A20 disabled by default: map pages 0x100-0x10F → physical 0x000-0x00F
