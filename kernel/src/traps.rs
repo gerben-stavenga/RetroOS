@@ -79,8 +79,8 @@ fn nmi(_regs: &Regs) -> ! {
 
 /// Handle breakpoint (int 3)
 fn breakpoint(regs: &mut Regs) {
-    println!("Breakpoint at {:#x}", regs.ip());
-    // Continue execution
+    println!("Breakpoint at {:04x}:{:#x} tid={}", regs.code_seg(), regs.ip(),
+        if thread::is_initialized() { thread::current().tid } else { -1 });
 }
 
 /// Handle overflow (int 4)
