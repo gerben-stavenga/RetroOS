@@ -700,6 +700,11 @@ pub fn finish_setup_paging() {
             remove_identity_mapping(e);
             crate::println!("Identity mapping removed");
 
+            enable_nx();
+            if nx_enabled() {
+                crate::println!("NX (No-Execute) protection enabled");
+            }
+
             harden_kernel(e);
             invalidate_tlb();
         }
