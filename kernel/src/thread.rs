@@ -364,11 +364,6 @@ pub fn switch_to_thread(idx: usize) -> ! {
     // Re-borrow after updating CURRENT_THREAD
     let thread = unsafe { &mut THREADS[idx] };
 
-    // Discard stale IRQs from other threads when switching to VM86
-    if thread.mode == ThreadMode::Mode16 {
-        crate::irq::drain_discard();
-    }
-
     // Local exit frame: Regs + 4 extra u32 segments for VM86 IRET.
     // For non-VM86, the extra fields sit harmlessly past the iret frame.
     #[repr(C)]
@@ -387,6 +382,22 @@ pub fn switch_to_thread(idx: usize) -> ! {
         vm86_fs: 0,
         vm86_gs: 0,
     };
+
+    // Drain IRQ events before returning to the target thread.
+    // VM86: reflect pending interrupts into the exit frame (page tables
+    // are loaded, so IVT at page 0 is accessible).
+    // Non-VM86: convert keyboard scancodes to ASCII in global KEY_PIPE.
+    if thread.mode == ThreadMode::Mode16 {
+        crate::irq::drain(|event| {
+            crate::vm86::deliver_irq(thread, &mut frame.regs, event);
+        });
+    } else {
+        use crate::irq::Irq;
+        crate::irq::drain(|event| match event {
+            Irq::Key(sc) => crate::keyboard::process_key(sc),
+            _ => {}
+        });
+    }
 
     let is_long;
 

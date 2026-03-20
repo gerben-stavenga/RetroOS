@@ -480,7 +480,15 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         _ => generic_exception(regs),
     };
 
-    // Drain IRQ event queue when returning to userspace
+    // If a handler requested a context switch, do it here.
+    // switch_to_thread drains IRQ events for the target thread.
+    if let Some(idx) = switch_to {
+        thread::switch_to_thread(idx);
+    }
+
+    // Drain IRQ event queue when returning to the current thread.
+    // VM86: reflect interrupts through IVT into the live regs.
+    // Protected mode: convert keyboard scancodes to ASCII.
     let from_user = vm86 || regs.code_seg() & 3 != 0;
     if from_user && thread::is_initialized() {
         use crate::irq::Irq;
@@ -493,12 +501,6 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
                 _ => {}
             });
         }
-    }
-
-    // If a handler requested a context switch, do it here.
-    // This is the single exit point — all Rust locals above are dropped by RAII first.
-    if let Some(idx) = switch_to {
-        thread::switch_to_thread(idx);
     }
 
     // VM86: swap segments back
