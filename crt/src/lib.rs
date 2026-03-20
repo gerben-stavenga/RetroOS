@@ -120,6 +120,41 @@ pub fn print_num(mut n: i32) {
     write(1, &digit);
 }
 
+/// Read a line from stdin into buf (echoing characters).
+/// Returns the number of bytes in the line (not including newline).
+pub fn read_line(buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+    loop {
+        let mut ch = [0u8; 1];
+        let n = read(0, &mut ch);
+        if n <= 0 {
+            yield_cpu();
+            continue;
+        }
+        match ch[0] {
+            b'\n' => {
+                write(1, b"\n");
+                return pos;
+            }
+            8 => {
+                // Backspace
+                if pos > 0 {
+                    pos -= 1;
+                    write(1, &[8, b' ', 8]); // erase on screen
+                }
+            }
+            c if c >= 0x20 => {
+                if pos < buf.len() {
+                    buf[pos] = c;
+                    pos += 1;
+                    write(1, &[c]);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Parse a string as a decimal integer
 pub fn parse_int(s: &str) -> i32 {
     let mut n: i32 = 0;

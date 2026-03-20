@@ -119,7 +119,6 @@ pub struct Thread {
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
     pub vm86_vif: bool,               // VM86 virtual interrupt flag
     pub vm86_a20: bool,               // VM86 A20 gate (false=wrap, true=enabled)
-    pub pending_signals: u32,         // Pending signal bitmask (bits 0-15 = hardware IRQs)
     pub vpic: crate::vm86::VirtualPic,      // Virtual PIC (per-thread)
     pub vkbd: crate::vm86::VirtualKeyboard, // Virtual keyboard (per-thread)
 }
@@ -143,7 +142,6 @@ impl Thread {
             symbols: None,
             vm86_vif: false,
             vm86_a20: false,
-            pending_signals: 0,
             vpic: crate::vm86::VirtualPic::new(),
             vkbd: crate::vm86::VirtualKeyboard::new(),
         }
@@ -366,9 +364,9 @@ pub fn switch_to_thread(idx: usize) -> ! {
     // Re-borrow after updating CURRENT_THREAD
     let thread = unsafe { &mut THREADS[idx] };
 
-    // Deliver pending signals before entering userspace
+    // Discard stale IRQs from other threads when switching to VM86
     if thread.mode == ThreadMode::Mode16 {
-        crate::vm86::deliver_pending_signals(thread);
+        crate::irq::drain_discard();
     }
 
     // Local exit frame: Regs + 4 extra u32 segments for VM86 IRET.
@@ -434,8 +432,6 @@ pub fn exit_thread(exit_code: i32) -> Option<usize> {
     unsafe {
         let thread = &mut THREADS[CURRENT_THREAD];
         crate::paging2::free_user_pages();
-        println!("Thread {} exited with code {}", thread.tid, exit_code);
-        crate::phys_mm::dump_stats();
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
         // Symbols are dropped here by RAII when thread goes zombie
