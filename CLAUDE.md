@@ -4,40 +4,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-RetroOS is an educational x86-32 operating system written in C++20 with minimal assembly. Design philosophy prioritizes simplicity and readability over performance. The project aspires to be self-hosting.
+RetroOS is an educational x86-32 operating system written in Rust with minimal assembly. Design philosophy prioritizes simplicity and readability over performance. The project aspires to be self-hosting.
 
 ## Build Commands
 
 ```bash
-make image              # Build complete 16MB disk image
-make                    # Build all components without creating image
-make clean              # Remove build artifacts
-qemu-system-i386 image  # Run in QEMU emulator
+bazelisk build //:image    # Build complete 16MB disk image
+bazelisk build //kernel:kernel_elf  # Build kernel only
+./run_qemu.sh [386|686|x64]        # Run in QEMU emulator
 ```
 
-Build outputs:
-- `build/bootloader.bin` - 512-byte MBR bootloader
-- `build/kernel.bin` - Kernel binary with MD5 verification
-- `build/init.elf` - Init process (shell)
-- `image` - Final bootable disk image
+Build outputs (via Bazel):
+- `bazel-bin/boot/bootloader.bin` - MBR bootloader
+- `bazel-bin/kernel/kernel.elf` - Kernel ELF
+- `bazel-bin/image.bin` - Final bootable disk image
 
 ## Architecture
 
 ### Directory Structure
 
-- `src/arch/x86/` - Platform-specific x86-32 code (boot, paging, interrupts, descriptors)
-- `src/kernel/` - Platform-independent kernel (threads, syscalls, drivers)
-- `src/freestanding/` - Utility library with no std dependencies (Vector, String, print, ELF loader, TAR reader)
-- `src/libc/` - Standard C library implementation for userspace
-- `src/apps/` - User applications
+- `boot/` - Bootloader (MBR assembly + Rust stage2)
+- `kernel/` - Kernel (entry.asm + Rust)
+  - `kernel/src/paging2.rs` - Virtual memory with recursive paging
+  - `kernel/src/thread.rs` - Process/thread management, scheduler
+  - `kernel/src/traps.rs` - Interrupt/exception handlers (single exit point via switch_to_thread)
+  - `kernel/src/syscalls.rs` - System call implementations
+  - `kernel/src/vm86.rs` - VM86 mode for DOS .COM execution
+  - `kernel/src/heap.rs` - Kernel heap allocator
+  - `kernel/src/phys_mm.rs` - Physical page allocator
+- `lib/` - Freestanding library (VGA, ELF, TAR, MD5)
+- `crt/` - C runtime / user linker scripts
+- `apps/` - User applications (init, shell, stress tests, hello.com)
+- `toolchain/` - Bazel toolchain configuration for bare-metal Rust
 
 ### Boot Process
 
-1. **MBR** (`src/arch/x86/boot/mbr.asm`) - Loads rest of bootloader from sector 1
-2. **Bootloader** (`src/arch/x86/boot/boot.cpp`) - Switches to protected mode, sets up GDT, enables A20, reads kernel from TAR filesystem, verifies MD5, passes BootData to kernel
-3. **Kernel Entry** (`src/arch/x86/start32.cpp`) - Sets up paging (recursive scheme), IDT, remaps PIC, loads init.elf
-4. **Kernel Startup** (`src/kernel/startup.cpp`) - Initializes filesystem, creates init thread
-5. **Init Process** (`src/kernel/init.cpp`) - Shell that can fork/exec programs
+1. **MBR** (`boot/mbr.asm`) - Loads rest of bootloader from sector 1
+2. **Bootloader** (`boot/src/lib.rs`) - Switches to protected mode, sets up GDT, enables A20, reads kernel from TAR filesystem, verifies MD5
+3. **Kernel Entry** (`kernel/entry.asm` + `kernel/src/lib.rs`) - Sets up paging, IDT, remaps PIC
+4. **Init Process** - Shell that can fork/exec programs
 
 ### Memory Layout (Virtual)
 
@@ -51,27 +56,14 @@ Build outputs:
 
 ### Key Design Patterns
 
-- **Recursive Paging**: Page directory entry[1023] points to itself, allowing kernel to access all page tables at 0xFFC00000
+- **Recursive Paging**: Page directory self-reference at entry[last], all page tables accessible at 0xFFC00000
 - **Copy-on-Write Forking**: Fork shares parent pages read-only, allocates on write fault
-- **BIOS Bridging**: Bootloader switches PM↔RM for BIOS calls (INT 0x10 video, INT 0x13 disk)
-- **TAR Filesystem**: Entire filesystem is a TAR archive - kernel, init, apps stored sequentially
+- **Single Exit Point**: All interrupt handlers return normally (RAII), only `isr_handler` calls `switch_to_thread`/`exit_kernel`
+- **TAR Filesystem**: Entire filesystem is a TAR archive
+- **VM86 Mode**: DOS .COM programs run via VM86 with virtual PIC/keyboard per thread
 
 ### Syscall Interface
 
 INT 0x80 with: EAX=syscall#, EDX=arg0, ECX=arg1, EBX=arg2, ESI=arg3, EDI=arg4
 
 Key syscalls: Exit(0), Yield(1), Fork(4), Exec(5), Open(6), Read(8), Write(9)
-
-## Cross-Compilation
-
-Uses clang++ with: `-m32 -march=i386 -ffreestanding -fno-exceptions -fno-rtti -std=c++20 -mno-red-zone`
-
-NASM for assembly, ld for linking with custom linker scripts (`src/arch/x86/kernel.ld`, `src/arch/x86/boot/bootloader.ld`).
-
-## Key Files
-
-- `src/arch/x86/paging.cpp` - Virtual memory management with recursive paging
-- `src/arch/x86/entry.asm` - Interrupt/exception entry handlers (49 vectors)
-- `src/kernel/thread.cpp` - Process/thread management, scheduler
-- `src/kernel/syscalls.cpp` - System call implementations
-- `src/freestanding/utils.cpp` - Core utilities (Vector, String, print, ELF loader, TAR reader, MD5)

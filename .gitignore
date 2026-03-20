@@ -1,28 +1,19 @@
-# vim generated
-*.swp
-*~
+# Bazel
+bazel-*
+.bazelrc.user
+MODULE.bazel.lock
 
-# Ignore the bazel symlinks
-/bazel-*
+# Cargo
+target/
 
-# Visual Studio 2017
-.vs
+# Build artifacts
+build/
+image
+image.bin
 
-# Visual Studio Code
-/.vscode/
+# Rust analyzer (contains absolute paths, regenerate with bazel)
+rust-project.json
 
-# IntelliJ
-.idea
-*.iml
-
-# Eclipse
-**/.settings
-**/.project
-**/.classpath
-
-# Clangd uses these common ephemeral files
-.cache
-compile_commands.json
-
-# build
-/build/
+# IDE
+.vscode/
+.idea/
