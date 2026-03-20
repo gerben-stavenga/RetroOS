@@ -91,6 +91,31 @@ impl VirtualKeyboard {
     pub fn has_data(&self) -> bool {
         self.head != self.tail
     }
+
+    /// Pop next key-down scancode, skipping releases (for INT 16h AH=0)
+    pub fn pop_key(&mut self) -> Option<u8> {
+        while self.head != self.tail {
+            let sc = self.buffer[self.head];
+            self.head = (self.head + 1) % KBD_BUF_SIZE;
+            if sc & 0x80 == 0 {
+                return Some(sc);
+            }
+        }
+        None
+    }
+
+    /// Peek next key-down scancode without consuming (for INT 16h AH=1)
+    pub fn peek_key(&self) -> Option<u8> {
+        let mut i = self.head;
+        while i != self.tail {
+            let sc = self.buffer[i];
+            if sc & 0x80 == 0 {
+                return Some(sc);
+            }
+            i = (i + 1) % KBD_BUF_SIZE;
+        }
+        None
+    }
 }
 
 // ============================================================================
@@ -109,10 +134,8 @@ fn emulate_inb(port: u16) -> Result<u8, Option<usize>> {
         0x60 => Ok(thread::current().vkbd.pop()),
         // Keyboard status port (bit 0 = output buffer full)
         0x64 => Ok(if thread::current().vkbd.has_data() { 1 } else { 0 }),
-        _ => {
-            println!("\x1b[91mVM86: illegal IN from port {:#06x}\x1b[0m", port);
-            Err(thread::exit_thread(-11))
-        }
+        // Unknown ports: return 0xFF (unpopulated bus)
+        _ => Ok(0xFF)
     }
 }
 
@@ -139,10 +162,8 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Option<usize>> {
         0xA1 => Ok(()),
         // Keyboard controller command
         0x64 => Ok(()),
-        _ => {
-            println!("\x1b[91mVM86: illegal OUT to port {:#06x}\x1b[0m", port);
-            Err(thread::exit_thread(-11))
-        }
+        // Unknown ports: silently ignore (BIOS probes various ports during mode switches)
+        _ => Ok(())
     }
 }
 
@@ -150,30 +171,14 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Option<usize>> {
 // Signal delivery — reflect hardware IRQs to VM86 threads via IVT
 // ============================================================================
 
-/// Deliver all pending signals to a VM86 thread by pushing FLAGS/CS/IP
-/// onto its stack and redirecting CS:IP to the IVT handler.
-/// Each delivered signal nests: the innermost runs first, IRET unwinds.
-pub fn deliver_pending_signals(thread: &mut thread::Thread) {
-    while thread.pending_signals != 0 {
-        let irq = thread.pending_signals.trailing_zeros();
-        thread.pending_signals &= !(1 << irq);
-        thread.vpic.set_in_service(irq as u8);
-        let int_num = (irq + 8) as u8; // IRQ 0 = INT 8, IRQ 1 = INT 9, etc.
-        reflect_interrupt(&mut thread.cpu_state, int_num);
-    }
-}
-
-/// Deliver pending signals using a live Regs on the interrupt stack.
-/// Called from isr_handler before returning to VM86 (inline return path).
-pub fn deliver_pending_signals_inline(regs: &mut Regs) {
-    let thread = thread::current();
-    while thread.pending_signals != 0 {
-        let irq = thread.pending_signals.trailing_zeros();
-        thread.pending_signals &= !(1 << irq);
-        thread.vpic.set_in_service(irq as u8);
-        let int_num = (irq + 8) as u8;
-        reflect_interrupt(regs, int_num);
-    }
+/// Deliver an IRQ event to a VM86 thread: buffer data, reflect through IVT.
+pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: crate::irq::Irq) {
+    use crate::irq::Irq;
+    if let Irq::Key(sc) = event { thread.vkbd.push(sc); }
+    let irq = event.irq_num();
+    thread.vpic.set_in_service(irq);
+    let int_num = irq + 8; // IRQ 0 = INT 8, IRQ 1 = INT 9, etc.
+    reflect_interrupt(regs, int_num);
 }
 
 /// Reflect an interrupt through the IVT: push FLAGS/CS/IP, set CS:IP to handler.
@@ -239,16 +244,18 @@ fn write_u16(seg: u32, off: u32, val: u16) {
 /// Push a u16 onto the VM86 stack (SS:SP)
 fn vm86_push(regs: &mut Regs, val: u16) {
     unsafe {
-        regs.frame.f32.esp = regs.frame.f32.esp.wrapping_sub(2);
-        write_u16(regs.frame.f32.ss, regs.frame.f32.esp, val);
+        let sp = (regs.frame.f32.esp as u16).wrapping_sub(2);
+        regs.frame.f32.esp = (regs.frame.f32.esp & 0xFFFF0000) | sp as u32;
+        write_u16(regs.frame.f32.ss, sp as u32, val);
     }
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
 fn vm86_pop(regs: &mut Regs) -> u16 {
     unsafe {
-        let val = read_u16(regs.frame.f32.ss, regs.frame.f32.esp);
-        regs.frame.f32.esp = regs.frame.f32.esp.wrapping_add(2);
+        let sp = regs.frame.f32.esp as u16;
+        let val = read_u16(regs.frame.f32.ss, sp as u32);
+        regs.frame.f32.esp = (regs.frame.f32.esp & 0xFFFF0000) | sp.wrapping_add(2) as u32;
         val
     }
 }
@@ -412,6 +419,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Option<usize> {
             // INT 20h — DOS program terminate
             thread::exit_thread(0)
         }
+        0x16 => int_16h(regs),
         0x21 => int_21h(regs),
         _ => {
             // Reflect through IVT: push FLAGS, CS, IP and jump to IVT handler
@@ -435,6 +443,55 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Option<usize> {
         }
     }
 }
+
+// ============================================================================
+// BIOS INT 16h — Keyboard services
+// ============================================================================
+
+fn int_16h(regs: &mut Regs) -> Option<usize> {
+    let ah = (regs.rax >> 8) as u8;
+    match ah {
+        // AH=0x00: Wait for keypress, return scancode in AH, ASCII in AL
+        0x00 => {
+            let t = thread::current();
+            match t.vkbd.pop_key() {
+                Some(scancode) => {
+                    let ascii = crate::keyboard::scancode_to_ascii(scancode);
+                    regs.rax = (regs.rax & !0xFFFF) | ((scancode as u64) << 8) | ascii as u64;
+                    None
+                }
+                None => {
+                    // No key available — yield and retry (back up IP to re-execute INT 16h)
+                    unsafe {
+                        regs.frame.f32.eip = regs.frame.f32.eip.wrapping_sub(2);
+                    }
+                    thread::save_state(t, regs);
+                    t.state = thread::ThreadState::Ready;
+                    thread::schedule()
+                }
+            }
+        }
+        // AH=0x01: Check for keypress (non-blocking), ZF=1 if no key
+        0x01 => {
+            let t = thread::current();
+            if let Some(scancode) = t.vkbd.peek_key() {
+                let ascii = crate::keyboard::scancode_to_ascii(scancode);
+                regs.rax = (regs.rax & !0xFFFF) | ((scancode as u64) << 8) | ascii as u64;
+                // Clear ZF (key available)
+                unsafe { regs.frame.f32.eflags &= !(1 << 6); }
+            } else {
+                // Set ZF (no key)
+                unsafe { regs.frame.f32.eflags |= 1 << 6; }
+            }
+            None
+        }
+        _ => {
+            println!("VM86: unhandled INT 16h AH={:#04x}", ah);
+            None
+        }
+    }
+}
+
 
 // ============================================================================
 // DOS INT 21h — DOS services
@@ -504,10 +561,18 @@ pub fn setup_ivt() {
 pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
     let base = (COM_SEGMENT as u32) << 4;
 
-    // Write INT 20h (CD 20) at PSP offset 0 — so RET from .COM terminates
+    // PSP offset 0: restore VGA text mode and terminate
+    // MOV AX,0003h / INT 10h / INT 20h
+    // When .COM returns (RET → PSP:0000), this restores mode 3 before exit.
     unsafe {
-        *(base as *mut u8) = 0xCD;
-        *((base + 1) as *mut u8) = 0x20;
+        let p = base as *mut u8;
+        *p.add(0) = 0xB8;  // MOV AX, imm16
+        *p.add(1) = 0x03;
+        *p.add(2) = 0x00;
+        *p.add(3) = 0xCD;  // INT 10h
+        *p.add(4) = 0x10;
+        *p.add(5) = 0xCD;  // INT 20h
+        *p.add(6) = 0x20;
     }
 
     // Copy .COM data at offset 0x100

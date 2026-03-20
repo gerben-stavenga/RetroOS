@@ -26,11 +26,6 @@ static mut PAGE_REFS: [u8; MAX_PAGES] = [0; MAX_PAGES];
 /// Next page to check when allocating (simple optimization)
 static mut NEXT_FREE: usize = 0;
 
-/// Diagnostic counters for tracking leaks
-static mut TOTAL_ALLOCS: u64 = 0;
-static mut TOTAL_FREES: u64 = 0;  // ref reached 0
-static mut TOTAL_DECREFS: u64 = 0;  // ref decremented but > 0
-
 /// Initialize physical memory allocator from memory map
 ///
 /// # Safety
@@ -114,7 +109,6 @@ pub fn alloc_phys_page() -> Option<u64> {
             if PAGE_REFS[page] == 0 {
                 PAGE_REFS[page] = 1;
                 NEXT_FREE = page + 1;
-                TOTAL_ALLOCS += 1;
                 return Some(page as u64);
             }
 
@@ -143,13 +137,7 @@ pub fn free_phys_page(page: u64) -> bool {
         }
 
         PAGE_REFS[page as usize] = count - 1;
-        if count - 1 == 0 {
-            TOTAL_FREES += 1;
-            true
-        } else {
-            TOTAL_DECREFS += 1;
-            false
-        }
+        count - 1 == 0
     }
 }
 
@@ -208,30 +196,4 @@ pub fn free_page_count() -> usize {
     count
 }
 
-/// Print diagnostic counters and page ref distribution
-pub fn dump_stats() {
-    unsafe {
-        let mut free = 0u32;
-        let mut used1 = 0u32;
-        let mut used2 = 0u32;
-        let mut used3plus = 0u32;
-        let mut reserved = 0u32;
-        for i in 0..MAX_PAGES {
-            match PAGE_REFS[i] {
-                0 => free += 1,
-                RESERVED => reserved += 1,
-                1 => used1 += 1,
-                2 => used2 += 1,
-                _ => used3plus += 1,
-            }
-        }
-        let ta = core::ptr::read_volatile(&raw const TOTAL_ALLOCS);
-        let tf = core::ptr::read_volatile(&raw const TOTAL_FREES);
-        let td = core::ptr::read_volatile(&raw const TOTAL_DECREFS);
-        let hp = crate::heap::heap_pages();
-        let (la, lf, lr) = crate::heap::large_stats();
-        crate::println!("PHYS: alloc={} free={} decref={} | free={} r1={} r2={} r3+={} rsv={} heap={} lg={}/{}/{}",
-            ta, tf, td,
-            free, used1, used2, used3plus, reserved, hp, la, lf, lr);
-    }
-}
+

@@ -455,24 +455,16 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         17 => alignment_check(regs),
         18..=31 => generic_exception(regs),
 
-        // IRQs (32-47)
+        // IRQs (32-47): PIC ACK + push typed event to queue
         32..=47 => {
             handle_irq(regs);
 
-            let irq = int_num - 32;
             let mut sw = None;
-
-            if thread::is_initialized() {
-                // Queue signal on VM86 threads for IVT reflection
-                let t = thread::current();
-                if t.mode == thread::ThreadMode::Mode16 {
-                    t.pending_signals |= 1 << irq;
-                }
-
+            let from_user = vm86 || regs.code_seg() & 3 != 0;
+            if from_user && thread::is_initialized() {
                 // Timer preemption (IRQ 0, every 10ms at 1000 Hz)
-                // Only preempt if interrupted from user mode (VM86 or RPL=3).
-                // Never preempt kernel code — save_state would capture mid-syscall state.
-                if irq == 0 && (vm86 || regs.code_seg() & 3 != 0) && crate::irq::get_ticks() % 10 == 0 {
+                let irq = int_num - 32;
+                if irq == 0 && crate::irq::get_ticks() % 10 == 0 {
                     let current = thread::current();
                     thread::save_state(current, regs);
                     current.state = thread::ThreadState::Ready;
@@ -488,17 +480,29 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         _ => generic_exception(regs),
     };
 
+    // Drain IRQ event queue when returning to userspace
+    let from_user = vm86 || regs.code_seg() & 3 != 0;
+    if from_user && thread::is_initialized() {
+        use crate::irq::Irq;
+        let t = thread::current();
+        if vm86 {
+            crate::irq::drain(|event| crate::vm86::deliver_irq(t, regs, event));
+        } else {
+            crate::irq::drain(|event| match event {
+                Irq::Key(sc) => crate::keyboard::process_key(sc),
+                _ => {}
+            });
+        }
+    }
+
     // If a handler requested a context switch, do it here.
     // This is the single exit point — all Rust locals above are dropped by RAII first.
     if let Some(idx) = switch_to {
-        // Save current state if not already saved (exit/yield/preempt already saved)
-        // For exec, the thread state was already set up by the handler.
         thread::switch_to_thread(idx);
     }
 
-    // VM86: deliver pending signals, then swap segments back
+    // VM86: swap segments back
     if vm86 {
-        crate::vm86::deliver_pending_signals_inline(regs);
         unsafe { vm86_swap_out(regs); }
     }
 }

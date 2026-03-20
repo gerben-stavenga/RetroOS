@@ -147,8 +147,13 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
     // Child returns 0
     thread::set_return(child, 0);
 
-    // Parent returns child's TID
-    SyscallResult::val(child.tid)
+    // Parent returns child's TID (when it resumes later)
+    thread::set_return(current, child.tid);
+    current.state = thread::ThreadState::Ready;
+
+    // Switch to child first so it can exec before parent triggers COW faults
+    let child_idx = child.tid as usize;
+    SyscallResult::switch(Some(child_idx))
 }
 
 /// Exec syscall (5)
@@ -163,9 +168,6 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let Ok(path) = core::str::from_utf8(path) else {
         return SyscallResult::val(ENOENT);
     };
-    crate::phys_mm::dump_stats();
-    println!("Exec: {}", path);
-
     // Detect .COM extension (case-insensitive)
     let is_com = path.len() >= 4 && {
         let ext = &path.as_bytes()[path.len()-4..];
@@ -179,22 +181,13 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let argc = regs.rsi as usize;
     let argv_ptr = regs.rbx as usize;
     let caller_64bit = thread::current().mode == thread::ThreadMode::Mode64;
-    let hp0 = crate::heap::heap_pages();
     let args = read_argv(argv_ptr, argc, caller_64bit);
-    let hp1 = crate::heap::heap_pages();
 
     // Drop old SymbolData before allocating the new buffer. The old symbols
     // hold a Box<[u8]> with the entire previous ELF (~300-400K). Freeing it
     // first lets the heap free list absorb the space, so the new buffer
     // allocation can reuse it instead of extending the heap every iteration.
-    {
-        let current = thread::current();
-        if current.symbols.is_some() {
-            println!("DROP-SYM: tid={} for {}", current.tid, path);
-        }
-        current.symbols = None;
-    }
-    let hp2 = crate::heap::heap_pages();
+    thread::current().symbols = None;
 
     // Find the file in TAR
     let size = match startup::find_file(path.as_bytes()) {
@@ -203,11 +196,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     };
 
     let mut buffer = alloc::vec![0; size];
-    let hp3 = crate::heap::heap_pages();
     startup::read_file(&mut buffer);
-    if hp3 > hp0 {
-        println!("HEAP-EXEC: +{} (argv={} sym={} buf={}) size={}", hp3 - hp0, hp1 - hp0, hp2 - hp1, hp3 - hp2, size);
-    }
 
     // .COM files use the VM86 exec path
     if is_com {
@@ -226,15 +215,11 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     };
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
-    println!("exec: want_64={} entry={:#x}", want_64, loaded.entry);
     if want_64 && !paging2::cpu_supports_long_mode() {
         return SyscallResult::switch(thread::exit_thread(-ENOEXEC));
     }
 
     let symbols = SymbolData::new(buffer.into_boxed_slice());
-    if symbols.is_none() {
-        println!("SYM-NONE: {}", path);
-    }
 
     let current = thread::current();
     let tid = current.tid as usize;
@@ -258,7 +243,6 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
         current.mode = want_mode;
     }
 
-    println!("exec: setting up stack");
     // Set up argv on the new user stack and get the adjusted SP
     let word = if want_64 { 8usize } else { 4usize };
     let stack = setup_user_stack(&args, want_64, word);
@@ -293,7 +277,7 @@ fn exec_com(data: &[u8]) -> usize {
 
     // Load .COM binary
     let (cs, ip, ss, sp) = vm86::load_com(data);
-    println!("exec_com: cs={:#06x} ip={:#06x} ss={:#06x} sp={:#06x}", cs, ip, ss, sp);
+
 
     let current = thread::current();
     let tid = current.tid as usize;
@@ -443,12 +427,14 @@ fn sys_wait(regs: &mut Regs) -> SyscallResult {
 /// Reads from a file descriptor
 fn sys_read(regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx;
-    let _buf = regs.rcx as *mut u8;
-    let _len = regs.rbx as usize;
+    let buf = regs.rcx as *mut u8;
+    let len = regs.rbx as usize;
 
     if fd == 0 {
-        // stdin - TODO: implement keyboard buffer
-        SyscallResult::val(0)
+        // stdin — read from global keyboard buffer
+        let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        let n = crate::keyboard::read(user_buf);
+        SyscallResult::val(n as i32)
     } else {
         // TODO: Read from file
         SyscallResult::val(ENOSYS)

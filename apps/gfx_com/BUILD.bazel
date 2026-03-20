@@ -1,0 +1,7 @@
+genrule(
+    name = "gfx_com",
+    srcs = ["gfx.asm"],
+    outs = ["GFX.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

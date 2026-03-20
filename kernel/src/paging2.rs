@@ -155,13 +155,6 @@ impl RootPageTable {
                 if let Entries::E64(e) = entries() {
                     let root = root_base();
                     let user_count = recursive_idx() - root;
-                    // Debug: detect PDPT[0] R/O → R/W transition
-                    let was_ro = unsafe { self.e64[0].0 & flags::READ_WRITE == 0 && self.e64[0].0 & flags::PRESENT != 0 };
-                    let now_rw = e[root].hw_writable();
-                    if was_ro && now_rw {
-                        crate::println!("SAVE-BUG: tid={} PDPT[0] was R/O now R/W! old={:#x} new={:#x}",
-                            crate::thread::current().tid, unsafe { self.e64[0].0 }, e[root].raw());
-                    }
                     for i in 0..user_count {
                         unsafe { self.e64[i] = e[root + i]; }
                     }
@@ -1170,13 +1163,6 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
     let epp = entries_per_page::<E>();
     let phys = entries[parent_idx].page();
     let ref_count = phys_mm::get_ref_count(phys);
-
-    // Debug: track root-level frees
-    let root = root_base();
-    if parent_idx >= root && parent_idx < root + 3 {
-        crate::println!("FREE-ROOT: tid={} PDPT[{}] page={:#x} ref={}",
-            crate::thread::current().tid, parent_idx - root, phys, ref_count);
-    }
 
     if ref_count == 1 {
         // Sole owner — walk children

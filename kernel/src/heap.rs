@@ -322,20 +322,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator::new();
 
-/// Get total physical pages consumed by the heap
-pub fn heap_pages() -> u32 {
-    unsafe { core::ptr::read_volatile(&raw const HEAP_PAGES) }
-}
-
-/// Get large alloc/free/reuse counts
-pub fn large_stats() -> (u32, u32, u32) {
-    unsafe {
-        (core::ptr::read_volatile(&raw const LARGE_ALLOCS),
-         core::ptr::read_volatile(&raw const LARGE_FREES),
-         core::ptr::read_volatile(&raw const LARGE_REUSE))
-    }
-}
-
 /// Initialize the kernel heap allocator
 pub fn init() {
     ALLOCATOR.init();
