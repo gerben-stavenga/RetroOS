@@ -342,7 +342,7 @@ fn demand_page<E: paging2::Entry>(
 fn segv_current_thread(regs: &mut Regs, fault_addr: usize) -> Option<usize> {
     use crate::thread;
 
-    println!("\x1b[91mSegmentation fault at {:#x} RIP={:#x}\x1b[0m", fault_addr, regs.ip());
+    println!("\x1b[91mSegmentation fault at {:#x} CS:IP={:04x}:{:#x}\x1b[0m", fault_addr, regs.code_seg(), regs.ip());
 
     let thread = thread::current();
     thread::signal_thread(thread, fault_addr)

@@ -1,11 +1,11 @@
-//! VM86 mode support for DOS .COM program execution
+//! VM86 mode support for DOS program execution (.COM and .EXE)
 //!
 //! Provides:
 //! - VM86 monitor (handles GP faults from sensitive instructions)
 //! - DOS INT 21h emulation (basic character/string I/O, exit)
 //! - Virtual hardware (PIC, keyboard) for per-thread device emulation
 //! - Signal delivery (hardware IRQs reflected through BIOS IVT)
-//! - .COM file loader
+//! - .COM and MZ .EXE file loaders
 //!
 //! The BIOS ROM at 0xF0000-0xFFFFF and the BIOS IVT at 0x0000-0x03FF are
 //! preserved from the original hardware state (via COW page 0). BIOS handlers
@@ -328,6 +328,20 @@ pub fn vm86_monitor(regs: &mut Regs) -> Option<usize> {
             }
             None
         }
+        // INSW (0x6D) — IN word from port DX to ES:DI, advance DI
+        0x6D => {
+            let port = regs.rdx as u16;
+            let lo = match emulate_inb(port) { Ok(v) => v, Err(sw) => return sw };
+            let hi = match emulate_inb(port + 1) { Ok(v) => v, Err(sw) => return sw };
+            let val = (hi as u16) << 8 | lo as u16;
+            write_u16(regs.es as u32, regs.rdi as u32, val);
+            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+                regs.rdi = regs.rdi.wrapping_sub(2);
+            } else {
+                regs.rdi = regs.rdi.wrapping_add(2);
+            }
+            None
+        }
         // OUTSB (0x6E) — OUT byte from DS:SI to port DX, advance SI
         0x6E => {
             let port = regs.rdx as u16;
@@ -337,6 +351,19 @@ pub fn vm86_monitor(regs: &mut Regs) -> Option<usize> {
                 regs.rsi = regs.rsi.wrapping_sub(1);
             } else {
                 regs.rsi = regs.rsi.wrapping_add(1);
+            }
+            None
+        }
+        // OUTSW (0x6F) — OUT word from DS:SI to port DX, advance SI
+        0x6F => {
+            let port = regs.rdx as u16;
+            let val = read_u16(regs.ds as u32, regs.rsi as u32);
+            if let Err(sw) = emulate_outb(port, val as u8) { return sw; }
+            if let Err(sw) = emulate_outb(port + 1, (val >> 8) as u8) { return sw; }
+            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+                regs.rsi = regs.rsi.wrapping_sub(2);
+            } else {
+                regs.rsi = regs.rsi.wrapping_add(2);
             }
             None
         }
@@ -520,10 +547,171 @@ fn int_21h(regs: &mut Regs) -> Option<usize> {
             }
             None
         }
+        // AH=0x25: Set interrupt vector (AL=int, DS:DX=handler)
+        0x25 => {
+            let int_num = regs.rax as u8;
+            let off = regs.rdx as u16;
+            let seg = regs.ds as u16;
+            write_u16(0, (int_num as u32) * 4, off);
+            write_u16(0, (int_num as u32) * 4 + 2, seg);
+            None
+        }
+        // AH=0x19: Get current default drive (returns AL=drive, 0=A, 2=C)
+        0x19 => {
+            regs.rax = (regs.rax & !0xFF) | 2; // C:
+            None
+        }
+        // AH=0x1A: Set DTA (Disk Transfer Area) address to DS:DX
+        0x1A => {
+            // Store DTA address — NC needs this for FindFirst/FindNext
+            let dta = ((regs.ds as u32) << 4) + regs.rdx as u32;
+            thread::current().vm86_dta = dta;
+            None
+        }
+        // AH=0x30: Get DOS version (return AL=major, AH=minor)
+        0x30 => {
+            // Report DOS 3.30
+            regs.rax = (regs.rax & !0xFFFF) | 0x1E03; // AL=3 (major), AH=30 (minor)
+            regs.rbx = 0; // OEM serial
+            regs.rcx = 0;
+            None
+        }
+        // AH=0x35: Get interrupt vector (AL=int, returns ES:BX=handler)
+        0x35 => {
+            let int_num = regs.rax as u8;
+            let off = read_u16(0, (int_num as u32) * 4);
+            let seg = read_u16(0, (int_num as u32) * 4 + 2);
+            regs.rbx = off as u64;
+            regs.es = seg as u64;
+            None
+        }
+        // AH=0x38: Get country information — return minimal stub
+        0x38 => {
+            // Just clear carry (success) with zeroed-out info at DS:DX
+            let addr = ((regs.ds as u32) << 4) + regs.rdx as u32;
+            unsafe {
+                core::ptr::write_bytes(addr as *mut u8, 0, 34);
+                // Currency symbol = '$'
+                *(addr as *mut u8).add(2) = b'$';
+            }
+            // Clear carry flag (success)
+            unsafe { regs.frame.f32.eflags &= !1; }
+            None
+        }
+        // AH=0x47: Get current directory (DL=drive, DS:SI=buffer)
+        0x47 => {
+            // Return root directory "\" (empty string = root)
+            let addr = ((regs.ds as u32) << 4) + regs.rsi as u32;
+            unsafe { *(addr as *mut u8) = 0; }
+            // Clear carry flag (success)
+            unsafe { regs.frame.f32.eflags &= !1; }
+            None
+        }
+        // AH=0x3D: Open file (DS:DX=filename, AL=access mode)
+        0x3D => {
+            // No filesystem — return error (file not found)
+            regs.rax = (regs.rax & !0xFFFF) | 2; // error code 2 = file not found
+            unsafe { regs.frame.f32.eflags |= 1; } // set carry
+            None
+        }
+        // AH=0x3E: Close file handle (BX=handle)
+        0x3E => {
+            // No-op, clear carry
+            unsafe { regs.frame.f32.eflags &= !1; }
+            None
+        }
+        // AH=0x3F: Read from file (BX=handle, CX=count, DS:DX=buffer)
+        0x3F => {
+            // Return 0 bytes read (EOF)
+            regs.rax = (regs.rax & !0xFFFF);
+            unsafe { regs.frame.f32.eflags &= !1; }
+            None
+        }
+        // AH=0x4E: Find first matching file (CX=attr, DS:DX=filespec)
+        0x4E => {
+            // No files found
+            regs.rax = (regs.rax & !0xFFFF) | 18; // error 18 = no more files
+            unsafe { regs.frame.f32.eflags |= 1; } // set carry
+            None
+        }
+        // AH=0x4F: Find next matching file
+        0x4F => {
+            regs.rax = (regs.rax & !0xFFFF) | 18;
+            unsafe { regs.frame.f32.eflags |= 1; }
+            None
+        }
         // AH=0x4C: Terminate with return code (AL)
         0x4C => {
             let code = regs.rax as u8;
             thread::exit_thread(code as i32)
+        }
+        // AH=0x2F: Get DTA address (returns ES:BX)
+        0x2F => {
+            let dta = thread::current().vm86_dta;
+            regs.rbx = (dta & 0xF) as u64;
+            regs.es = (dta >> 4) as u64;
+            None
+        }
+        // AH=0x48: Allocate memory (BX=paragraphs needed)
+        0x48 => {
+            // Not enough memory
+            regs.rax = (regs.rax & !0xFFFF) | 8; // error 8 = insufficient memory
+            regs.rbx = 0; // largest block available = 0
+            unsafe { regs.frame.f32.eflags |= 1; }
+            None
+        }
+        // AH=0x49: Free memory (ES=segment)
+        0x49 => {
+            unsafe { regs.frame.f32.eflags &= !1; }
+            None
+        }
+        // AH=0x4A: Resize memory block (ES=segment, BX=new size in paragraphs)
+        0x4A => {
+            // Pretend success
+            unsafe { regs.frame.f32.eflags &= !1; }
+            None
+        }
+        // AH=0x44: IOCTL (various subfunctions)
+        0x44 => {
+            // Return error for most subfunctions
+            regs.rax = (regs.rax & !0xFFFF) | 1; // error 1 = invalid function
+            unsafe { regs.frame.f32.eflags |= 1; }
+            None
+        }
+        // AH=0x0E: Select disk (DL=drive, 0=A, 2=C)
+        0x0E => {
+            regs.rax = (regs.rax & !0xFF) | 3; // AL = number of logical drives
+            None
+        }
+        // AH=0x3C: Create file
+        0x3C => {
+            regs.rax = (regs.rax & !0xFFFF) | 5; // error 5 = access denied
+            unsafe { regs.frame.f32.eflags |= 1; }
+            None
+        }
+        // AH=0x40: Write to file (BX=handle, CX=count, DS:DX=buffer)
+        0x40 => {
+            let handle = regs.rbx as u16;
+            let count = regs.rcx as u16;
+            // Handle 1=stdout, 2=stderr
+            if handle == 1 || handle == 2 {
+                let addr = ((regs.ds as u32) << 4) + regs.rdx as u32;
+                for i in 0..count as u32 {
+                    let ch = unsafe { *((addr + i) as *const u8) };
+                    vga::vga().putchar(ch);
+                }
+                regs.rax = (regs.rax & !0xFFFF) | count as u64;
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
+                unsafe { regs.frame.f32.eflags |= 1; }
+            }
+            None
+        }
+        // AH=0x42: Seek (BX=handle, CX:DX=offset, AL=origin)
+        0x42 => {
+            regs.rax = (regs.rax & !0xFFFF) | 6; // error 6 = invalid handle
+            unsafe { regs.frame.f32.eflags |= 1; }
+            None
         }
         _ => {
             println!("VM86: unhandled INT 21h AH={:#04x}", ah);
@@ -546,27 +734,18 @@ pub fn setup_ivt() {
 }
 
 // ============================================================================
-// .COM file loader
+// DOS program loaders (.COM and MZ .EXE)
 // ============================================================================
 
-/// Load a .COM binary into the VM86 address space.
-/// Returns (cs, ip, ss, sp) for initializing the thread.
-///
-/// Layout:
-///   Segment COM_SEGMENT (0x1000):
-///     0x0000-0x00FF: PSP (Program Segment Prefix)
-///       PSP[0..2] = INT 20h (CD 20) — program termination
-///     0x0100-...:    .COM binary code
-///   Stack at COM_SEGMENT:COM_SP (top of segment)
-pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
-    let base = (COM_SEGMENT as u32) << 4;
-
-    // PSP offset 0: restore VGA text mode and terminate
-    // MOV AX,0003h / INT 10h / INT 20h
-    // When .COM returns (RET → PSP:0000), this restores mode 3 before exit.
+/// Write the PSP (Program Segment Prefix) at the given segment.
+/// PSP[0..2] = code to restore VGA mode 3 and terminate (INT 20h).
+/// When a .COM returns (RET → PSP:0000) or an .EXE calls INT 20h,
+/// this restores text mode before exit.
+fn write_psp(segment: u16) {
+    let base = (segment as u32) << 4;
     unsafe {
         let p = base as *mut u8;
-        *p.add(0) = 0xB8;  // MOV AX, imm16
+        *p.add(0) = 0xB8;  // MOV AX, 0003h
         *p.add(1) = 0x03;
         *p.add(2) = 0x00;
         *p.add(3) = 0xCD;  // INT 10h
@@ -574,8 +753,26 @@ pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
         *p.add(5) = 0xCD;  // INT 20h
         *p.add(6) = 0x20;
     }
+}
+
+/// Check if data starts with the MZ signature.
+pub fn is_mz_exe(data: &[u8]) -> bool {
+    data.len() >= 28 && data[0] == b'M' && data[1] == b'Z'
+}
+
+/// Load a .COM binary into the VM86 address space.
+/// Returns (cs, ip, ss, sp) for initializing the thread.
+///
+/// Layout:
+///   Segment COM_SEGMENT (0x1000):
+///     0x0000-0x00FF: PSP (Program Segment Prefix)
+///     0x0100-...:    .COM binary code
+///   Stack at COM_SEGMENT:COM_SP (top of segment)
+pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
+    write_psp(COM_SEGMENT);
 
     // Copy .COM data at offset 0x100
+    let base = (COM_SEGMENT as u32) << 4;
     let load_addr = base + COM_OFFSET as u32;
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -586,4 +783,89 @@ pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
     }
 
     (COM_SEGMENT, COM_OFFSET, COM_SEGMENT, COM_SP)
+}
+
+/// Load an MZ .EXE binary into the VM86 address space.
+/// Returns (cs, ip, ss, sp) for initializing the thread.
+///
+/// MZ header layout (first 28 bytes):
+///   0x00: 'MZ' signature
+///   0x02: bytes on last page (0 = full 512-byte page)
+///   0x04: total pages (512 bytes each, includes header)
+///   0x06: relocation count
+///   0x08: header size in paragraphs (16 bytes each)
+///   0x0E: initial SS (relative to load segment)
+///   0x10: initial SP
+///   0x14: initial IP
+///   0x16: initial CS (relative to load segment)
+///   0x18: relocation table offset
+pub fn load_exe(data: &[u8]) -> Option<(u16, u16, u16, u16)> {
+    if data.len() < 28 {
+        return None;
+    }
+
+    let w = |off: usize| u16::from_le_bytes([data[off], data[off + 1]]);
+
+    let last_page_bytes = w(0x02) as u32;
+    let total_pages = w(0x04) as u32;
+    let reloc_count = w(0x06) as usize;
+    let header_paragraphs = w(0x08) as u32;
+    let init_ss = w(0x0E);
+    let init_sp = w(0x10);
+    let init_ip = w(0x14);
+    let init_cs = w(0x16);
+    let reloc_offset = w(0x18) as usize;
+
+    // Calculate file size and load module offset/size
+    let file_size = if last_page_bytes == 0 {
+        total_pages * 512
+    } else {
+        (total_pages - 1) * 512 + last_page_bytes
+    };
+    let header_size = header_paragraphs * 16;
+    let load_size = file_size.saturating_sub(header_size) as usize;
+
+    if header_size as usize > data.len() || load_size > data.len() - header_size as usize {
+        return None;
+    }
+
+    // Load segment: PSP is at COM_SEGMENT, load module starts one segment after
+    let psp_segment = COM_SEGMENT;
+    let load_segment = psp_segment + 0x10; // 256 bytes after PSP base
+
+    write_psp(psp_segment);
+
+    // Copy load module
+    let load_base = (load_segment as u32) << 4;
+    let load_data = &data[header_size as usize..header_size as usize + load_size];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            load_data.as_ptr(),
+            load_base as *mut u8,
+            load_size,
+        );
+    }
+
+    // Apply relocations: each entry is (offset, segment) within the load module.
+    // Add load_segment to the 16-bit word at that address.
+    let reloc_end = reloc_offset + reloc_count * 4;
+    if reloc_end > data.len() {
+        return None;
+    }
+    for i in 0..reloc_count {
+        let entry = reloc_offset + i * 4;
+        let off = w(entry) as u32;
+        let seg = w(entry + 2) as u32;
+        let addr = load_base + (seg << 4) + off;
+        unsafe {
+            let p = addr as *mut u16;
+            let val = p.read_unaligned();
+            p.write_unaligned(val.wrapping_add(load_segment));
+        }
+    }
+
+    let cs = init_cs.wrapping_add(load_segment);
+    let ss = init_ss.wrapping_add(load_segment);
+
+    Some((cs, init_ip, ss, init_sp))
 }

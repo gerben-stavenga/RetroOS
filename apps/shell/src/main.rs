@@ -53,7 +53,7 @@ pub fn main(args: &[&str]) {
             "help" => {
                 crt::print("  stress [N]  - COW stress test (default depth 3)\n");
                 crt::print("  hello       - run HELLO.COM in VM86 mode\n");
-                crt::print("  <file.elf>  - run any program\n");
+                crt::print("  <file>      - run .elf, .com, or .exe program\n");
                 crt::print("  exit        - exit shell\n");
             }
             "stress" => {

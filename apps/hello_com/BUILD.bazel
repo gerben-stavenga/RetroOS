@@ -5,3 +5,8 @@ genrule(
     cmd = "nasm -f bin -o $@ $<",
     visibility = ["//visibility:public"],
 )
+
+exports_files(
+    ["NC.EXE"],
+    visibility = ["//visibility:public"],
+)

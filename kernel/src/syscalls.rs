@@ -168,14 +168,9 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let Ok(path) = core::str::from_utf8(path) else {
         return SyscallResult::val(ENOENT);
     };
-    // Detect .COM extension (case-insensitive)
-    let is_com = path.len() >= 4 && {
-        let ext = &path.as_bytes()[path.len()-4..];
-        (ext[0] == b'.' &&
-         (ext[1] == b'c' || ext[1] == b'C') &&
-         (ext[2] == b'o' || ext[2] == b'O') &&
-         (ext[3] == b'm' || ext[3] == b'M'))
-    };
+    // Detect DOS executable extensions (case-insensitive)
+    let is_com = has_ext(path, b"COM");
+    let is_exe = has_ext(path, b"EXE");
 
     // Read argv from caller's address space (before we free it)
     let argc = regs.rsi as usize;
@@ -198,9 +193,9 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let mut buffer = alloc::vec![0; size];
     startup::read_file(&mut buffer);
 
-    // .COM files use the VM86 exec path
-    if is_com {
-        let tid = exec_com(&buffer);
+    // DOS executables use the VM86 exec path
+    if is_com || is_exe {
+        let tid = exec_dos(&buffer, is_exe);
         // buffer and args dropped here by RAII
         return SyscallResult::switch(Some(tid));
     }
@@ -261,8 +256,9 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     SyscallResult::switch(Some(tid))
 }
 
-/// Execute a .COM file in VM86 mode. Returns thread index to switch to.
-fn exec_com(data: &[u8]) -> usize {
+/// Execute a DOS program (.COM or .EXE) in VM86 mode.
+/// Returns thread index to switch to.
+fn exec_dos(data: &[u8], is_exe: bool) -> usize {
     use crate::vm86;
 
     // Free current user pages
@@ -272,21 +268,35 @@ fn exec_com(data: &[u8]) -> usize {
     // Map first 1MB user-accessible for VM86
     paging2::map_low_mem_user();
 
-    // Set up IVT (all 256 entries → IRET stub)
+    // Set up IVT
     vm86::setup_ivt();
 
-    // Load .COM binary
-    let (cs, ip, ss, sp) = vm86::load_com(data);
-
+    // Load binary
+    let (cs, ip, ss, sp) = if is_exe && vm86::is_mz_exe(data) {
+        vm86::load_exe(data).unwrap_or_else(|| {
+            crate::println!("Invalid MZ EXE");
+            (0, 0, 0, 0)
+        })
+    } else {
+        vm86::load_com(data)
+    };
 
     let current = thread::current();
     let tid = current.tid as usize;
 
-    // Initialize VM86 thread state
     thread::init_process_thread_vm86(current, cs, ip, ss, sp);
     current.symbols = None;
 
     tid
+}
+
+/// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
+fn has_ext(path: &str, ext: &[u8; 3]) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 4 && b[b.len() - 4] == b'.'
+        && b[b.len() - 3].to_ascii_uppercase() == ext[0]
+        && b[b.len() - 2].to_ascii_uppercase() == ext[1]
+        && b[b.len() - 1].to_ascii_uppercase() == ext[2]
 }
 
 /// Read argv from the caller's userspace into kernel-owned Vecs.

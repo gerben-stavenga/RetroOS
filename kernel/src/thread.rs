@@ -119,6 +119,7 @@ pub struct Thread {
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
     pub vm86_vif: bool,               // VM86 virtual interrupt flag
     pub vm86_a20: bool,               // VM86 A20 gate (false=wrap, true=enabled)
+    pub vm86_dta: u32,                // VM86 DOS Disk Transfer Area address
     pub vpic: crate::vm86::VirtualPic,      // Virtual PIC (per-thread)
     pub vkbd: crate::vm86::VirtualKeyboard, // Virtual keyboard (per-thread)
 }
@@ -142,6 +143,7 @@ impl Thread {
             symbols: None,
             vm86_vif: false,
             vm86_a20: false,
+            vm86_dta: 0,
             vpic: crate::vm86::VirtualPic::new(),
             vkbd: crate::vm86::VirtualKeyboard::new(),
         }
