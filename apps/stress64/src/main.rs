@@ -63,8 +63,8 @@ fn stress(depth: i32) {
     if pid2 == 0 {
         let mut buf = [0u8; 12];
         let depth_str = crt::format_int(depth - 1, &mut buf);
-        crt::exec("stress64.elf", &["stress64.elf", depth_str]);
-        crt::print("exec stress64 failed\n");
+        crt::exec("stress.elf", &["stress.elf", depth_str]);
+        crt::print("exec stress failed\n");
         crt::exit(1);
     }
 
