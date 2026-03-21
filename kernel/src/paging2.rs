@@ -969,30 +969,19 @@ pub fn fork_current() -> Option<u64> {
 ///
 /// All modes: share_and_copy the root (PD for legacy, PDPT for PAE/compat).
 /// Self-referential entries are auto-patched by share_and_copy.
-/// PAE: additionally deshare user entries [0..recursive) because PAE
-/// hardware ignores R/W on PDPT entries.
+/// PAE only: deshare user entries [0..recursive) because PAE hardware
+/// ignores R/W on PDPT entries.
 ///
 /// Returns the new root's physical page number.
 fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
     let new_root = share_and_copy(entries, recursive_idx())?;
 
-    // Verify PDPT[0] is R/O after share_and_copy
-    if cpu_mode() == CpuMode::Compat {
-        let root = root_base();
-        if entries[root].present() && entries[root].hw_writable() {
-            crate::println!("FORK-BUG: tid={} PDPT[0] still R/W after share_and_copy! raw={:#x}",
-                crate::thread::current().tid, entries[root].raw());
-        }
-    }
-
-    // Deshare user root entries (PDPT[0..2] in PAE, PDPT[0..2] in Compat).
+    // Deshare user root entries in PAE mode (PDPT[0..2]).
     // PAE hardware ignores R/W on PDPT entries, so COW can't be enforced
     // at that level — eagerly COW to push enforcement to PD level.
-    // Compat mode CAN enforce R/W on PDPT entries, but the cascading COW
-    // chain (nested faults resolving higher levels) has a subtle bug where
-    // cow_entry for a PDE triggers a nested fault that COWs PDPT[0],
-    // replacing the PD page mid-operation. Deshare avoids this.
-    if cpu_mode() == CpuMode::Pae || cpu_mode() == CpuMode::Compat {
+    // Compat mode doesn't need this: PDPT entries are ordinary page table
+    // entries with full R/W enforcement, so cascading COW works naturally.
+    if cpu_mode() == CpuMode::Pae {
         let root = root_base();
         let user_count = recursive_idx() - root;
         for i in 0..user_count {
