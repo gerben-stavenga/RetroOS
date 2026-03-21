@@ -22,11 +22,8 @@ fn finalize_page_permissions<E: Entry>(entries: &mut [E], vaddr: usize, writable
         let phys = entries[page].page();
         let mut entry = E::new(phys, writable, true);
         entry.set_writable(writable);
-        // Clear NX only if this segment is executable; otherwise preserve
-        // (executable wins if multiple segments share a page)
-        if executable {
-            entry.set_no_execute(false);
-        }
+        // Default to NX, clear only for executable segments
+        entry.set_no_execute(!executable);
         entries[page] = entry;
         x86::invlpg(page_addr);
     }
@@ -57,20 +54,23 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         }
     }
 
-    // Second pass: set final permissions based on segment flags
-    for seg in elf.segments() {
-        let start_page = seg.vaddr / PAGE_SIZE;
-        let end_page = (seg.vaddr + seg.memsz + PAGE_SIZE - 1) / PAGE_SIZE;
-        let writable = seg.is_writable();
-        let executable = seg.is_executable();
+    // Second pass: set final permissions based on segment flags.
+    // Process non-executable segments first so executable wins on shared pages.
+    for executable_pass in [false, true] {
+        for seg in elf.segments() {
+            if seg.is_executable() != executable_pass { continue; }
+            let start_page = seg.vaddr / PAGE_SIZE;
+            let end_page = (seg.vaddr + seg.memsz + PAGE_SIZE - 1) / PAGE_SIZE;
+            let writable = seg.is_writable();
 
-        for page in start_page..end_page {
-            match paging2::entries() {
-                Entries::E32(e) => {
-                    finalize_page_permissions(e, page * PAGE_SIZE, writable, executable);
-                }
-                Entries::E64(e) => {
-                    finalize_page_permissions(e, page * PAGE_SIZE, writable, executable);
+            for page in start_page..end_page {
+                match paging2::entries() {
+                    Entries::E32(e) => {
+                        finalize_page_permissions(e, page * PAGE_SIZE, writable, executable_pass);
+                    }
+                    Entries::E64(e) => {
+                        finalize_page_permissions(e, page * PAGE_SIZE, writable, executable_pass);
+                    }
                 }
             }
         }
