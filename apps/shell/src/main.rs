@@ -51,10 +51,37 @@ pub fn main(args: &[&str]) {
         match name {
             "exit" => return,
             "help" => {
+                crt::print("  cd <dir>    - change directory\n");
+                crt::print("  pwd         - print working directory\n");
                 crt::print("  stress [N]  - COW stress test (default depth 3)\n");
                 crt::print("  hello       - run HELLO.COM in VM86 mode\n");
                 crt::print("  <file>      - run .elf, .com, or .exe program\n");
                 crt::print("  exit        - exit shell\n");
+            }
+            "cd" => {
+                if rest.is_empty() {
+                    // cd with no args goes to root
+                    crt::chdir("/");
+                } else {
+                    let r = crt::chdir(rest);
+                    if r < 0 {
+                        crt::print("cd: no such directory: ");
+                        crt::print(rest);
+                        crt::print("\n");
+                    }
+                }
+            }
+            "pwd" => {
+                let mut cwdbuf = [0u8; 64];
+                let len = crt::getcwd(&mut cwdbuf);
+                if len > 0 {
+                    crt::print("/");
+                    let s = unsafe { core::str::from_utf8_unchecked(&cwdbuf[..len as usize]) };
+                    crt::print(s);
+                    crt::print("\n");
+                } else {
+                    crt::print("/\n");
+                }
             }
             "stress" => {
                 let depth = if rest.is_empty() { "3" } else { rest };

@@ -54,7 +54,7 @@ impl SyscallResult {
 type SyscallFn = fn(&mut Regs) -> SyscallResult;
 
 /// Syscall table
-const SYSCALL_TABLE: [Option<SyscallFn>; 12] = [
+const SYSCALL_TABLE: [Option<SyscallFn>; 14] = [
     Some(sys_exit),   // 0
     Some(sys_yield),  // 1
     None,             // 2
@@ -67,6 +67,8 @@ const SYSCALL_TABLE: [Option<SyscallFn>; 12] = [
     Some(sys_write),  // 9
     Some(sys_close),  // 10
     Some(sys_seek),   // 11
+    Some(sys_chdir),  // 12
+    Some(sys_getcwd), // 13
 ];
 
 /// Dispatch a syscall. Returns Some(idx) if a context switch is needed.
@@ -152,6 +154,10 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
     // Inherit open file descriptors (bumps refcounts in global file table)
     vfs::dup_fds(&current.fds, &mut child.fds);
 
+    // Inherit current working directory
+    child.cwd = current.cwd;
+    child.cwd_len = current.cwd_len;
+
     // Child returns 0
     thread::set_return(child, 0);
 
@@ -195,8 +201,10 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     // allocation can reuse it instead of extending the heap every iteration.
     thread::current().symbols = None;
 
-    // Find the file in TAR
-    let size = match startup::find_file(path.as_bytes()) {
+    // Resolve path relative to cwd, then find in TAR
+    let mut path_buf = [0u8; 164];
+    let resolved = vfs::resolve(path.as_bytes(), &mut path_buf);
+    let size = match startup::find_file(resolved) {
         Some(s) => s,
         None => return SyscallResult::val(ENOENT),
     };
@@ -488,4 +496,25 @@ fn sys_seek(regs: &mut Regs) -> SyscallResult {
     let offset = regs.rcx as i32;
     let whence = regs.rbx as i32;
     SyscallResult::val(vfs::seek(fd, offset, whence))
+}
+
+/// Change current directory
+/// RDX = pointer to path string, RCX = length
+fn sys_chdir(regs: &mut Regs) -> SyscallResult {
+    let ptr = regs.rdx as usize as *const u8;
+    let len = regs.rcx as usize;
+    let path = unsafe { core::slice::from_raw_parts(ptr, len) };
+    SyscallResult::val(vfs::chdir(path))
+}
+
+/// Get current directory
+/// RDX = pointer to buffer, RCX = buffer size
+/// Returns length written or negative error
+fn sys_getcwd(regs: &mut Regs) -> SyscallResult {
+    let ptr = regs.rdx as usize as *mut u8;
+    let size = regs.rcx as usize;
+    let cwd = crate::thread::current().cwd_str();
+    let len = cwd.len().min(size);
+    unsafe { core::ptr::copy_nonoverlapping(cwd.as_ptr(), ptr, len); }
+    SyscallResult::val(len as i32)
 }
