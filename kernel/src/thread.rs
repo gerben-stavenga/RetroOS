@@ -117,11 +117,13 @@ pub struct Thread {
     pub mode: ThreadMode,              // User code bitness (16/32/64)
     pub frame_format: FrameFormat,    // Saved interrupt frame format
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
-    pub vm86_vif: bool,               // VM86 virtual interrupt flag
+    pub vm86_vif: bool,               // VM86 virtual interrupt flag (software, used without VME)
     pub vm86_a20: bool,               // VM86 A20 gate (false=wrap, true=enabled)
     pub vm86_dta: u32,                // VM86 DOS Disk Transfer Area address
+    pub vm86_heap_seg: u16,           // VM86 DOS heap: next free segment for INT 21h/48h
     pub vpic: crate::vm86::VirtualPic,      // Virtual PIC (per-thread)
     pub vkbd: crate::vm86::VirtualKeyboard, // Virtual keyboard (per-thread)
+    pub vm86_exec_parent: Option<crate::vm86::ExecParent>, // Saved parent state for EXEC return
 }
 
 impl Thread {
@@ -144,8 +146,10 @@ impl Thread {
             vm86_vif: false,
             vm86_a20: false,
             vm86_dta: 0,
+            vm86_heap_seg: 0xA000,
             vpic: crate::vm86::VirtualPic::new(),
             vkbd: crate::vm86::VirtualKeyboard::new(),
+            vm86_exec_parent: None,
         }
     }
 }
@@ -238,18 +242,21 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
     thread.mode = ThreadMode::Mode16;
     thread.frame_format = FrameFormat::Protected; // VM86 always uses Frame32 (IRET in PAE mode)
-    thread.vm86_vif = true;  // Virtual interrupts enabled by default
+    thread.vm86_vif = true;  // Virtual interrupts enabled by default (software VIF)
     thread.vm86_a20 = false; // A20 disabled (wrap-around) by default
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode
     const IF_FLAG: u32 = 1 << 9;   // Interrupt enable
+    const VIF_FLAG: u32 = 1 << 19; // Virtual interrupts enabled by default (hardware VIF)
 
     let state = &mut thread.cpu_state;
     *state = Regs::empty();
 
-    // DS=ES=CS for .COM programs, FS=GS=0
-    state.ds = cs as u64;
-    state.es = cs as u64;
+    // DS=ES=PSP segment for DOS programs, FS=GS=0
+    // For .COM: PSP = CS. For .EXE: PSP = CS - 0x10 (PSP precedes load module).
+    // Caller passes the load segment as CS; the PSP is always COM_SEGMENT.
+    state.ds = crate::vm86::COM_SEGMENT as u64;
+    state.es = crate::vm86::COM_SEGMENT as u64;
     state.fs = 0;
     state.gs = 0;
 
@@ -259,7 +266,7 @@ pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, 
             _pad: [0; 5],
             eip: ip as u32,
             cs: cs as u32,
-            eflags: VM_FLAG | IF_FLAG,
+            eflags: VM_FLAG | IF_FLAG | VIF_FLAG,
             esp: sp as u32,
             ss: ss as u32,
         }
@@ -391,8 +398,9 @@ pub fn switch_to_thread(idx: usize) -> ! {
     // Non-VM86: convert keyboard scancodes to ASCII in global KEY_PIPE.
     if thread.mode == ThreadMode::Mode16 {
         crate::irq::drain(|event| {
-            crate::vm86::deliver_irq(thread, &mut frame.regs, event);
+            crate::vm86::deliver_irq(thread, &mut frame.regs, Some(event));
         });
+        crate::vm86::deliver_irq(thread, &mut frame.regs, None);
     } else {
         use crate::irq::Irq;
         crate::irq::drain(|event| match event {
@@ -444,6 +452,7 @@ unsafe extern "C" {
 pub fn exit_thread(exit_code: i32) -> Option<usize> {
     unsafe {
         let thread = &mut THREADS[CURRENT_THREAD];
+        crate::vfs::close_all_fds(&mut thread.fds);
         crate::paging2::free_user_pages();
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
