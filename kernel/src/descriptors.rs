@@ -236,7 +236,7 @@ impl Tss {
 
 /// Set up TSS bitmaps for VM86:
 /// - IOPB: allow VGA ports (0x3C0-0x3DF), deny everything else
-/// - Interrupt redirection: trap INT 10h, 20h, 21h to monitor, rest through IVT
+/// - Interrupt redirection: trap handled INTs to monitor, rest through IVT
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
@@ -245,15 +245,17 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     (*tss).iopb[122] = 0x00;
     (*tss).iopb[123] = 0x00;
 
-    // Interrupt redirection: set bits for INTs we handle in the monitor
-    // Bit SET = #GP to monitor, bit CLEAR = through IVT
-    // INT 0x10: through IVT → VGA BIOS ROM at 0xC0000
-    // INT 0x16: keyboard services (BIOS handler uses 32-bit mode, breaks VM86)
-    (*tss).int_redir[0x16 / 8] |= 1 << (0x16 % 8);
-    // INT 0x20: DOS terminate
-    (*tss).int_redir[0x20 / 8] |= 1 << (0x20 % 8);
-    // INT 0x21: DOS services
-    (*tss).int_redir[0x21 / 8] |= 1 << (0x21 % 8);
+    // Interrupt redirection: set bits for INTs we handle in the monitor.
+    // Bit SET = #GP to monitor, bit CLEAR = through IVT directly.
+    // Every INT with a handler in handle_vm86_int must be listed here.
+    for int_num in [0x20, 0x21, 0x28, 0x2E, 0x2F, 0x67, 0xF0u8] {
+        (*tss).int_redir[(int_num / 8) as usize] |= 1 << (int_num % 8);
+    }
+}
+
+/// Check whether INT n is intercepted (bit set in redirection bitmap).
+pub fn int_intercepted(int_num: u8) -> bool {
+    unsafe { TSS32.int_redir[(int_num / 8) as usize] & (1 << (int_num % 8)) != 0 }
 }
 
 /// GDT entry indices

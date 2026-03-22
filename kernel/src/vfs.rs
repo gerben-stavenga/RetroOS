@@ -34,6 +34,7 @@ pub struct DirEntry {
     pub name: [u8; 100],
     pub name_len: usize,
     pub size: u32,
+    pub is_dir: bool,
 }
 
 /// Global file table — slot is free when refcount == 0
@@ -69,15 +70,54 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
 }
 
+/// Resolve a path relative to the current working directory.
+/// Strips DOS prefix, normalizes slashes, prepends cwd for relative paths.
+/// Paths that had a drive prefix (C:\...) are treated as absolute (no cwd prepend).
+/// Returns the full TAR path in `buf`.
+fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
+    // Detect if path has a drive letter (absolute DOS path)
+    let has_drive = path.len() >= 2 && path[1] == b':' && path[0].is_ascii_alphabetic();
+    let stripped = strip_dos_prefix(path);
+
+    let len = if stripped.is_empty() {
+        0
+    } else {
+        let mut pos = 0;
+        // Only prepend cwd for relative paths (no drive prefix)
+        if !has_drive {
+            let cwd = crate::thread::current().cwd_str();
+            for &b in cwd {
+                if pos < buf.len() { buf[pos] = b; pos += 1; }
+            }
+        }
+        // Copy the path, normalizing backslashes
+        for &b in stripped {
+            if pos < buf.len() {
+                buf[pos] = if b == b'\\' { b'/' } else { b };
+                pos += 1;
+            }
+        }
+        pos
+    };
+    &buf[..len]
+}
+
+/// Resolve a path relative to cwd (public, for use by exec).
+/// Strips DOS prefix, normalizes backslashes, prepends cwd.
+pub fn resolve<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
+    resolve_path(path, buf)
+}
+
 /// Walk the TAR archive looking for `path`. Returns a Vnode on match.
-/// Strips DOS path prefixes and matches case-insensitively.
+/// Resolves relative to cwd, strips DOS path prefixes, case-insensitive.
 fn tar_open(path: &[u8]) -> Option<Vnode> {
-    let basename = strip_dos_prefix(path);
+    let mut buf = [0u8; 164];
+    let full_path = resolve_path(path, &mut buf);
     let mut block: u32 = 0;
     loop {
         let entry = startup::tar_entry_at_block(block)?;
         let name = &entry.name[..entry.name_len];
-        if eq_ignore_case(name, basename) {
+        if eq_ignore_case(name, full_path) {
             return Some(Vnode {
                 data_block: entry.data_block,
                 size: entry.size,
@@ -120,22 +160,177 @@ fn tar_read(vnode: &Vnode, offset: u32, buf: &mut [u8]) -> i32 {
     done as i32
 }
 
-/// Enumerate root directory by index. Returns None at end.
+/// Check if a TAR entry name is in the given directory.
+/// Returns the basename (part after the directory prefix) if it matches,
+/// or None if it's not in this directory or is in a deeper subdirectory.
+fn entry_in_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
+    // dir is "" for root or "WOLF3D/" for a subdirectory
+    if entry_name.len() <= dir.len() {
+        return None;
+    }
+    // Check prefix matches (case-insensitive)
+    if !dir.is_empty() {
+        if entry_name.len() < dir.len() { return None; }
+        let prefix = &entry_name[..dir.len()];
+        if !eq_ignore_case(prefix, dir) { return None; }
+    }
+    let rest = &entry_name[dir.len()..];
+    // Skip if it's in a deeper subdirectory (contains '/')
+    if rest.iter().any(|&b| b == b'/') {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Enumerate current directory by index. Returns directories first, then files.
+/// Returns None at end.
 pub fn readdir(index: usize) -> Option<DirEntry> {
+    let cwd = crate::thread::current().cwd_str();
+
+    // Phase 1: collect unique subdirectory names
+    let mut dirs: [[u8; 64]; 32] = [[0; 64]; 32];
+    let mut dir_lens: [usize; 32] = [0; 32];
+    let mut dir_count = 0usize;
     let mut block: u32 = 0;
+    loop {
+        let entry = match startup::tar_entry_at_block(block) {
+            Some(e) => e,
+            None => break,
+        };
+        let name = &entry.name[..entry.name_len];
+        if name.len() > cwd.len() {
+            let prefix = &name[..cwd.len()];
+            if cwd.is_empty() || eq_ignore_case(prefix, cwd) {
+                let rest = &name[cwd.len()..];
+                if let Some(slash) = rest.iter().position(|&b| b == b'/') {
+                    let dir_name = &rest[..slash];
+                    let mut dup = false;
+                    for j in 0..dir_count {
+                        if dir_lens[j] == dir_name.len() && eq_ignore_case(&dirs[j][..dir_lens[j]], dir_name) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if !dup && dir_count < 32 {
+                        let len = dir_name.len().min(64);
+                        dirs[dir_count][..len].copy_from_slice(&dir_name[..len]);
+                        dir_lens[dir_count] = len;
+                        dir_count += 1;
+                    }
+                }
+            }
+        }
+        block = entry.next_block;
+    }
+
+    // Return directory entry if index falls in directory range
+    if index < dir_count {
+        let len = dir_lens[index];
+        let mut de = DirEntry {
+            name: [0; 100],
+            name_len: len,
+            size: 0,
+            is_dir: true,
+        };
+        de.name[..len].copy_from_slice(&dirs[index][..len]);
+        return Some(de);
+    }
+
+    // Phase 2: enumerate files (index offset by dir_count)
+    let file_idx = index - dir_count;
+    block = 0;
     let mut i = 0usize;
     loop {
         let entry = startup::tar_entry_at_block(block)?;
-        if i == index {
-            return Some(DirEntry {
-                name: entry.name,
-                name_len: entry.name_len,
-                size: entry.size,
-            });
+        let name = &entry.name[..entry.name_len];
+        if let Some(basename) = entry_in_dir(name, cwd) {
+            if i == file_idx {
+                let mut de = DirEntry {
+                    name: [0; 100],
+                    name_len: basename.len(),
+                    size: entry.size,
+                    is_dir: false,
+                };
+                de.name[..basename.len()].copy_from_slice(basename);
+                return Some(de);
+            }
+            i += 1;
         }
-        i += 1;
         block = entry.next_block;
     }
+}
+
+/// Change current directory. Path can be relative or absolute.
+/// Returns 0 on success, negative error on failure.
+pub fn chdir(path: &[u8]) -> i32 {
+    let stripped = strip_dos_prefix(path);
+
+    // Handle ".." — go up one level
+    if stripped == b".." {
+        let t = crate::thread::current();
+        let cwd = t.cwd_str();
+        if cwd.is_empty() { return 0; } // already at root
+        // Remove trailing slash, then find the previous slash
+        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
+        let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
+            Some(pos) => pos + 1, // keep the slash
+            None => 0,            // back to root
+        };
+        t.cwd_len = new_len;
+        return 0;
+    }
+
+    // Handle "\" or "/" — go to root
+    if stripped.is_empty() || stripped == b"/" || stripped == b"\\" {
+        let t = crate::thread::current();
+        t.cwd_len = 0;
+        return 0;
+    }
+
+    // Build the new directory path and verify it exists in the TAR
+    let mut new_cwd = [0u8; 64];
+    let mut pos = 0;
+
+    // Start from cwd for relative paths
+    let t = crate::thread::current();
+    let cwd = t.cwd_str();
+    for &b in cwd {
+        if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+    }
+    // Append the new directory name, normalizing backslashes
+    for &b in stripped {
+        if pos < new_cwd.len() {
+            new_cwd[pos] = if b == b'\\' { b'/' } else { b };
+            pos += 1;
+        }
+    }
+    // Ensure trailing slash
+    if pos > 0 && new_cwd[pos - 1] != b'/' {
+        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
+    }
+
+    // Verify the directory exists: check if any TAR entry starts with this prefix
+    let prefix = &new_cwd[..pos];
+    let mut block: u32 = 0;
+    let found = loop {
+        match startup::tar_entry_at_block(block) {
+            Some(entry) => {
+                let name = &entry.name[..entry.name_len];
+                if name.len() >= prefix.len() && eq_ignore_case(&name[..prefix.len()], prefix) {
+                    break true;
+                }
+                block = entry.next_block;
+            }
+            None => break false,
+        }
+    };
+
+    if !found {
+        return -2; // ENOENT
+    }
+
+    t.set_cwd(&new_cwd[..pos]);
+    0
 }
 
 // ============================================================================

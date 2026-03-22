@@ -18,6 +18,8 @@ const SYS_READ: u32 = 8;
 const SYS_WRITE: u32 = 9;
 const SYS_CLOSE: u32 = 10;
 const SYS_SEEK: u32 = 11;
+const SYS_CHDIR: u32 = 12;
+const SYS_GETCWD: u32 = 13;
 
 // RetroOS syscall ABI: int 0x80, eax=num, edx=arg0, ecx=arg1, ebx=arg2, esi=arg3
 
@@ -73,6 +75,14 @@ pub fn close(fd: i32) -> i32 {
 
 pub fn seek(fd: i32, offset: i32, whence: i32) -> i32 {
     unsafe { syscall(SYS_SEEK, fd as usize, offset as usize, whence as usize, 0) }
+}
+
+pub fn chdir(path: &str) -> i32 {
+    unsafe { syscall(SYS_CHDIR, path.as_ptr() as usize, path.len(), 0, 0) }
+}
+
+pub fn getcwd(buf: &mut [u8]) -> i32 {
+    unsafe { syscall(SYS_GETCWD, buf.as_mut_ptr() as usize, buf.len(), 0, 0) }
 }
 
 pub fn exit(code: i32) -> ! {

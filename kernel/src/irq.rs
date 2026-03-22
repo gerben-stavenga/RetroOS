@@ -127,9 +127,27 @@ fn dump_thread_state(regs: &Regs) {
         let vm86 = regs.frame.f32.eflags & (1 << 17) != 0;
         if vm86 {
             let vif = if crate::thread::is_initialized() { crate::thread::current().vm86_vif } else { false };
-            crate::dbg_println!("[DBG] tid={} VM86 {:04X}:{:04X} AX={:04X} DX={:04X} flags={:04X} VIF={}",
+            let lin = (regs.frame.f32.cs << 4) + regs.frame.f32.eip;
+            let b = core::slice::from_raw_parts(lin as *const u8, 16);
+            let ticks = *(0x46Cu32 as *const u32);
+            let isr = if crate::thread::is_initialized() { crate::thread::current().vpic.isr } else { 0 };
+            crate::dbg_println!("[DBG] tid={} VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ISR={:02X} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
                 tid, regs.frame.f32.cs, regs.frame.f32.eip,
-                regs.rax as u16, regs.rdx as u16, regs.frame.f32.eflags as u16, vif);
+                regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+                regs.ds as u16, regs.frame.f32.ss, regs.frame.f32.esp,
+                regs.frame.f32.eflags as u16, vif, isr, ticks,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+            // Dump VGA text buffer (80x25, char+attr interleaved at 0xB8000)
+            let vga = core::slice::from_raw_parts(0xB8000 as *const u8, 4000);
+            for row in 0..25 {
+                let mut line = [b'.'; 80];
+                for col in 0..80 {
+                    let ch = vga[(row * 80 + col) * 2];
+                    line[col] = if ch >= 0x20 && ch < 0x7F { ch } else { b'.' };
+                }
+                crate::dbg_println!("[VGA {:02}] {}", row,
+                    core::str::from_utf8(&line).unwrap_or("???"));
+            }
         } else {
             crate::dbg_println!("[DBG] tid={} PM EIP={:#010x}", tid, regs.frame.f32.eip);
         }

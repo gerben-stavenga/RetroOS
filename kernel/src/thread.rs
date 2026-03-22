@@ -124,6 +124,11 @@ pub struct Thread {
     pub vpic: crate::vm86::VirtualPic,      // Virtual PIC (per-thread)
     pub vkbd: crate::vm86::VirtualKeyboard, // Virtual keyboard (per-thread)
     pub vm86_exec_parent: Option<crate::vm86::ExecParent>, // Saved parent state for EXEC return
+    pub vm86_skip_irq: bool,  // Skip first IRQ drain (fresh EXEC'd child with tiny stack)
+    pub vm86_xms: Option<alloc::boxed::Box<crate::vm86::XmsState>>,  // XMS driver state
+    pub vm86_ems: Option<alloc::boxed::Box<crate::vm86::EmsState>>,  // EMS driver state
+    pub cwd: [u8; 64],     // Current working directory (e.g. "WOLF3D/", "" for root)
+    pub cwd_len: usize,
 }
 
 impl Thread {
@@ -150,7 +155,24 @@ impl Thread {
             vpic: crate::vm86::VirtualPic::new(),
             vkbd: crate::vm86::VirtualKeyboard::new(),
             vm86_exec_parent: None,
+            vm86_skip_irq: false,
+            vm86_xms: None,
+            vm86_ems: None,
+            cwd: [0; 64],
+            cwd_len: 0,
         }
+    }
+
+    /// Get current working directory as a byte slice
+    pub fn cwd_str(&self) -> &[u8] {
+        &self.cwd[..self.cwd_len]
+    }
+
+    /// Set current working directory. Path should end with '/' or be empty for root.
+    pub fn set_cwd(&mut self, path: &[u8]) {
+        let len = path.len().min(self.cwd.len());
+        self.cwd[..len].copy_from_slice(&path[..len]);
+        self.cwd_len = len;
     }
 }
 
@@ -396,7 +418,12 @@ pub fn switch_to_thread(idx: usize) -> ! {
     // VM86: reflect pending interrupts into the exit frame (page tables
     // are loaded, so IVT at page 0 is accessible).
     // Non-VM86: convert keyboard scancodes to ASCII in global KEY_PIPE.
-    if thread.mode == ThreadMode::Mode16 {
+    if thread.vm86_skip_irq {
+        // Fresh EXEC'd child — discard pending IRQs so they don't overflow
+        // the program's tiny initial stack before it sets up its real one.
+        thread.vm86_skip_irq = false;
+        crate::irq::drain_discard();
+    } else if thread.mode == ThreadMode::Mode16 {
         crate::irq::drain(|event| {
             crate::vm86::deliver_irq(thread, &mut frame.regs, Some(event));
         });
@@ -452,12 +479,27 @@ unsafe extern "C" {
 pub fn exit_thread(exit_code: i32) -> Option<usize> {
     unsafe {
         let thread = &mut THREADS[CURRENT_THREAD];
+        let parent_tid = thread.parent_tid;
         crate::vfs::close_all_fds(&mut thread.fds);
+        if let Some(ref mut ems) = thread.vm86_ems {
+            ems.free_all_pages();
+        }
+        thread.vm86_ems = None;
+        thread.vm86_xms = None;
         crate::paging2::free_user_pages();
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
         // Symbols are dropped here by RAII when thread goes zombie
         thread.symbols = None;
+
+        // Wake blocked parent (e.g., waiting for EXEC'd child to finish)
+        if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
+            let parent = &mut THREADS[parent_tid as usize];
+            if parent.state == ThreadState::Blocked {
+                parent.state = ThreadState::Ready;
+            }
+        }
+
         CURRENT_THREAD = 0;
         Some(schedule().unwrap_or(0))
     }

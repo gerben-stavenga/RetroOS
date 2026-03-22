@@ -105,6 +105,21 @@ fn invalid_opcode(regs: &mut Regs) -> Option<usize> {
             let b = unsafe { core::slice::from_raw_parts(linear as *const u8, 8) };
             dbg_println!("UD2: {:04X}:{:04X} bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
                 cs, ip, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+            // Dump VM86 stack (return chain) and registers
+            let ss = unsafe { regs.frame.f32.ss as u32 };
+            let sp = unsafe { regs.frame.f32.esp as u16 };
+            let stack_base = (ss << 4) + sp as u32;
+            let s0 = unsafe { (stack_base as *const u16).read_unaligned() };
+            let s1 = unsafe { ((stack_base + 2) as *const u16).read_unaligned() };
+            let s2 = unsafe { ((stack_base + 4) as *const u16).read_unaligned() };
+            let s3 = unsafe { ((stack_base + 6) as *const u16).read_unaligned() };
+            let s4 = unsafe { ((stack_base + 8) as *const u16).read_unaligned() };
+            let s5 = unsafe { ((stack_base + 10) as *const u16).read_unaligned() };
+            dbg_println!("  SS:SP={:04X}:{:04X} stack: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
+                ss, sp, s0, s1, s2, s3, s4, s5);
+            dbg_println!("  AX={:04X} BX={:04X} CX={:04X} DX={:04X} SI={:04X} DI={:04X} DS={:04X} ES={:04X}",
+                regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+                regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
         }
         return segv_current_thread(regs, regs.ip() as usize);
     }

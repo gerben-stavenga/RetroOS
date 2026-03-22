@@ -15,9 +15,10 @@ pub fn main(_args: &[&str]) {
         crt::print_num(pid);
         crt::print("\n");
         if pid == 0 {
-            crt::print("child: exec shell\n");
+            crt::print("child: exec NC\n");
+            crt::exec("NC.EXE", &["NC.EXE"]);
+            // Fallback to shell if NC fails
             crt::exec("shell.elf", &["shell.elf"]);
-            crt::print("init: exec shell failed\n");
             crt::exit(1);
         }
         crt::print("parent: waitpid\n");
