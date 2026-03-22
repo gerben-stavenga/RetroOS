@@ -169,7 +169,7 @@ fn emulate_inb(port: u16) -> Result<u8, Action> {
         0x64 => Ok(if thread::current().vkbd.has_data() { 1 } else { 0 }),
         // PIT ports
         0x40..=0x43 => {
-            crate::println!("VM86: IN PIT port {:02X}", port);
+            dbg_println!("VM86: IN PIT port {:02X}", port);
             Ok(0xFF)
         }
         // Unknown ports: return 0xFF (unpopulated bus)
