@@ -770,7 +770,12 @@ pub fn enable_legacy(kpages: &mut LegacyPages, scratch: &mut PageTable32, kernel
     // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
     // PT index for 0xC0A00000: (0xC0A00000 >> 12) & 0x3FF = 512
     for i in 0..256 {
-        kpages.pt_kernel[512 + i] = Entry32::new(i as u64, true, false);
+        let mut e = Entry32::new(i as u64, true, false);
+        // VGA framebuffer (0xA0-0xBF) must be uncacheable
+        if i >= 0xA0 && i < 0xC0 {
+            e.set_raw(e.raw() | flags::CACHE_DISABLE);
+        }
+        kpages.pt_kernel[512 + i] = e;
     }
 
     // Map kernel at KERNEL_BASE (0xC0B00000)
@@ -825,7 +830,11 @@ pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys:
     // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
     // PT index 0-255 maps physical 0x00000000-0x000FFFFF
     for i in 0..256 {
-        kpages.pt_kernel[i] = Entry64::new(i as u64, true, false);
+        let mut e = Entry64::new(i as u64, true, false);
+        if i >= 0xA0 && i < 0xC0 {
+            e.set_raw(e.raw() | flags::CACHE_DISABLE);
+        }
+        kpages.pt_kernel[i] = e;
     }
 
     // Map kernel at KERNEL_BASE (0xC0B00000)
@@ -901,7 +910,7 @@ pub fn init_temp_map() {
 }
 
 /// Map a physical page at the temp mapping address
-fn temp_map(phys_page: u64) {
+pub fn temp_map(phys_page: u64) {
     unsafe {
         let idx = TEMP_MAP_ENTRY;
         if is_pae() {
@@ -916,7 +925,7 @@ fn temp_map(phys_page: u64) {
 }
 
 /// Unmap the temp mapping
-fn temp_unmap() {
+pub fn temp_unmap() {
     unsafe {
         let idx = TEMP_MAP_ENTRY;
         if is_pae() {
@@ -1256,13 +1265,22 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     // Pages 1-0x9F: conventional memory — left unmapped (demand-paged zero)
     // Each process gets private zeroed pages on first access.
 
-    // Pages 0xA0-0xBF: VGA framebuffer — identity mapped RW
+    // Pages 0xA0-0xBF: VGA framebuffer — identity mapped RW, cache disabled
+    // PCD (bit 4) must be set so the CPU doesn't cache/combine writes.
+    // VGA Odd/Even addressing relies on seeing individual byte accesses.
     for i in 0xA0..0xC0usize {
-        entries[i] = E::new(i as u64, true, true);
+        let mut e = E::new(i as u64, true, true);
+        e.set_raw(e.raw() | flags::CACHE_DISABLE);
+        entries[i] = e;
     }
 
-    // Pages 0xC0-0xFF: ROM area — identity mapped RO
-    for i in 0xC0..0x100usize {
+    // Pages 0xC0-0xCF: ROM area — identity mapped RO
+    for i in 0xC0..0xD0usize {
+        entries[i] = E::new(i as u64, false, true);
+    }
+    // Pages 0xD0-0xDF: EMS page frame — left unmapped (mapped on demand by EMS driver)
+    // Pages 0xE0-0xFF: ROM area — identity mapped RO
+    for i in 0xE0..0x100usize {
         entries[i] = E::new(i as u64, false, true);
     }
 
@@ -1311,6 +1329,34 @@ fn set_a20_generic<E: Entry>(entries: &mut [E], enabled: bool) {
         entries[0x100 + i] = E::new(phys as u64, true, true);
     }
     flush_tlb();
+}
+
+/// Map an EMS page frame window (0-3) to the given 4 physical pages.
+/// Window N maps to virtual pages 0xD0 + N*4 .. 0xD0 + N*4 + 3.
+/// Pass phys_pages = None to unmap the window.
+pub fn map_ems_window(window: usize, phys_pages: Option<&[u64; 4]>) {
+    assert!(window < 4);
+    let base = 0xD0 + window * 4;
+    match entries() {
+        Entries::E32(e) => map_ems_window_generic(e, base, phys_pages),
+        Entries::E64(e) => map_ems_window_generic(e, base, phys_pages),
+    }
+    flush_tlb();
+}
+
+fn map_ems_window_generic<E: Entry>(entries: &mut [E], base: usize, phys_pages: Option<&[u64; 4]>) {
+    match phys_pages {
+        Some(pages) => {
+            for i in 0..4 {
+                entries[base + i] = E::new(pages[i], true, true);
+            }
+        }
+        None => {
+            for i in 0..4 {
+                entries[base + i] = E::default();
+            }
+        }
+    }
 }
 
 /// Copy trampoline code to physical address 0xF000
