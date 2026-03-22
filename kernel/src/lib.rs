@@ -27,12 +27,13 @@ pub mod startup;
 pub mod syscalls;
 pub mod thread;
 pub mod traps;
+pub mod vfs;
 pub mod vm86;
 pub mod x86;
 
 // Re-export lib's vga module and macros
 pub use lib::vga;
-pub use lib::{print, println};
+pub use lib::{print, println, dbg_print, dbg_println};
 
 use paging2::{KernelPages, PAGE_SIZE, LOW_MEM_BASE};
 
@@ -197,6 +198,7 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
         x86::flush_tlb();
         paging2::ensure_trampoline_mapped();
         descriptors::toggle_mode(paging2::toggle_cr3(true));
+        paging2::clear_trampoline();
         println!("Switched to Compat mode");
     }
 

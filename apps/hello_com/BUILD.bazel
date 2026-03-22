@@ -7,6 +7,6 @@ genrule(
 )
 
 exports_files(
-    ["NC.EXE"],
+    ["NC.EXE", "COMMAND.COM"],
     visibility = ["//visibility:public"],
 )

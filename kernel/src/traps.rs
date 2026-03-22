@@ -2,7 +2,7 @@
 
 use crate::irq::handle_irq;
 use crate::paging2::{self, RawPage};
-use crate::println;
+use crate::{println, dbg_println};
 use crate::syscalls::dispatch;
 use crate::thread;
 use crate::x86;
@@ -102,21 +102,9 @@ fn invalid_opcode(regs: &mut Regs) -> Option<usize> {
             let cs = regs.code_seg() as u32;
             let ip = regs.ip() as u32;
             let linear = (cs << 4) + ip;
-            let page = linear >> 12;
-            // Check what physical page the PTE points to
-            use crate::paging2::Entry;
-            match crate::paging2::entries() {
-                crate::paging2::Entries::E32(e) => {
-                    let pte = e[page as usize];
-                    println!("UD2: linear={:#x} page={:#x} PTE={:#x} (phys={:#x})",
-                        linear, page, pte.raw(), pte.page());
-                }
-                crate::paging2::Entries::E64(e) => {
-                    let pte = e[page as usize];
-                    println!("UD2: linear={:#x} page={:#x} PTE={:#x} (phys={:#x})",
-                        linear, page, pte.raw(), pte.page());
-                }
-            }
+            let b = unsafe { core::slice::from_raw_parts(linear as *const u8, 8) };
+            dbg_println!("UD2: {:04X}:{:04X} bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                cs, ip, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
         }
         return segv_current_thread(regs, regs.ip() as usize);
     }
@@ -494,7 +482,9 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         use crate::irq::Irq;
         let t = thread::current();
         if vm86 {
-            crate::irq::drain(|event| crate::vm86::deliver_irq(t, regs, event));
+            crate::irq::drain(|event| crate::vm86::deliver_irq(t, regs, Some(event)));
+            // Flush any pending vpic events (e.g. queued while VIF=0, now VIF=1 after STI/IRET/POPF)
+            crate::vm86::deliver_irq(t, regs, None);
         } else {
             crate::irq::drain(|event| match event {
                 Irq::Key(sc) => crate::keyboard::process_key(sc),

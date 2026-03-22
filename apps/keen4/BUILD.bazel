@@ -1,0 +1,11 @@
+exports_files(
+    [
+        "AUDIO.CK4",
+        "CONFIG.CK4",
+        "Egagraph.ck4",
+        "Gamemaps.ck4",
+        "Keen4e.exe",
+        "SAVEGAM0.CK4",
+    ],
+    visibility = ["//visibility:public"],
+)

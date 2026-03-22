@@ -9,6 +9,8 @@
 //! - 7: Waitpid
 //! - 8: Read
 //! - 9: Write
+//! - 10: Close
+//! - 11: Seek
 //!
 //! Arguments passed in: EDX, ECX, EBX, ESI, EDI
 //! 64-bit ABI: RDI, RSI, RDX, R10, R8 (remapped to canonical layout)
@@ -20,6 +22,7 @@ use crate::paging2::{self, PAGE_SIZE};
 use crate::stacktrace::SymbolData;
 use crate::startup;
 use crate::thread;
+use crate::vfs;
 use crate::vga;
 use crate::Regs;
 use crate::{print, println};
@@ -51,7 +54,7 @@ impl SyscallResult {
 type SyscallFn = fn(&mut Regs) -> SyscallResult;
 
 /// Syscall table
-const SYSCALL_TABLE: [Option<SyscallFn>; 10] = [
+const SYSCALL_TABLE: [Option<SyscallFn>; 12] = [
     Some(sys_exit),   // 0
     Some(sys_yield),  // 1
     None,             // 2
@@ -62,6 +65,8 @@ const SYSCALL_TABLE: [Option<SyscallFn>; 10] = [
     Some(sys_wait),   // 7
     Some(sys_read),   // 8
     Some(sys_write),  // 9
+    Some(sys_close),  // 10
+    Some(sys_seek),   // 11
 ];
 
 /// Dispatch a syscall. Returns Some(idx) if a context switch is needed.
@@ -144,6 +149,9 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
     child.mode = current.mode;
     child.frame_format = current.frame_format;
 
+    // Inherit open file descriptors (bumps refcounts in global file table)
+    vfs::dup_fds(&current.fds, &mut child.fds);
+
     // Child returns 0
     thread::set_return(child, 0);
 
@@ -177,6 +185,9 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let argv_ptr = regs.rbx as usize;
     let caller_64bit = thread::current().mode == thread::ThreadMode::Mode64;
     let args = read_argv(argv_ptr, argc, caller_64bit);
+
+    // Close inherited file descriptors before loading the new program
+    vfs::close_all_fds(&mut thread::current().fds);
 
     // Drop old SymbolData before allocating the new buffer. The old symbols
     // hold a Box<[u8]> with the entire previous ELF (~300-400K). Freeing it
@@ -388,12 +399,12 @@ fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool, word: usize) ->
 }
 
 /// Open syscall (6)
-/// Opens a file and returns its size (or -1 if not found)
+/// Opens a file and returns a file descriptor (or negative error)
 /// RDX = path pointer (null-terminated)
 fn sys_open(regs: &mut Regs) -> SyscallResult {
     let path_ptr = regs.rdx as *const u8;
 
-    // Get path as slice
+    // Get path as slice (null-terminated)
     let path = unsafe {
         let mut len = 0;
         let mut p = path_ptr;
@@ -404,18 +415,7 @@ fn sys_open(regs: &mut Regs) -> SyscallResult {
         core::slice::from_raw_parts(path_ptr, len)
     };
 
-    // Print path for debugging
-    print!("Open: ");
-    for &c in path {
-        vga::vga().putchar(c);
-    }
-    println!();
-
-    // Find the file in TAR and return its size
-    match startup::find_file(path) {
-        Some(size) => SyscallResult::val(size as i32),
-        None => SyscallResult::val(ENOENT),
-    }
+    SyscallResult::val(vfs::open(path))
 }
 
 /// Waitpid syscall (7)
@@ -436,7 +436,7 @@ fn sys_wait(regs: &mut Regs) -> SyscallResult {
 /// Read syscall (8)
 /// Reads from a file descriptor
 fn sys_read(regs: &mut Regs) -> SyscallResult {
-    let fd = regs.rdx;
+    let fd = regs.rdx as i32;
     let buf = regs.rcx as *mut u8;
     let len = regs.rbx as usize;
 
@@ -445,8 +445,10 @@ fn sys_read(regs: &mut Regs) -> SyscallResult {
         let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
         let n = crate::keyboard::read(user_buf);
         SyscallResult::val(n as i32)
+    } else if fd >= 3 {
+        let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        SyscallResult::val(vfs::read(fd, user_buf))
     } else {
-        // TODO: Read from file
         SyscallResult::val(ENOSYS)
     }
 }
@@ -469,4 +471,21 @@ fn sys_write(regs: &mut Regs) -> SyscallResult {
     } else {
         SyscallResult::val(ENOSYS)
     }
+}
+
+/// Close syscall (10)
+/// Closes a file descriptor
+fn sys_close(regs: &mut Regs) -> SyscallResult {
+    let fd = regs.rdx as i32;
+    SyscallResult::val(vfs::close(fd))
+}
+
+/// Seek syscall (11)
+/// Repositions file offset
+/// RDX = fd, RCX = offset, RBX = whence (0=SET, 1=CUR, 2=END)
+fn sys_seek(regs: &mut Regs) -> SyscallResult {
+    let fd = regs.rdx as i32;
+    let offset = regs.rcx as i32;
+    let whence = regs.rbx as i32;
+    SyscallResult::val(vfs::seek(fd, offset, whence))
 }

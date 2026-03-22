@@ -1189,32 +1189,39 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 pub const TRAMPOLINE_PAGE: usize = 0xF;  // page 15 = address 0xF000
 pub const TRAMPOLINE_ADDR: usize = TRAMPOLINE_PAGE * PAGE_SIZE;
 
-/// Ensure the trampoline page (VA 0xF000) is identity-mapped to PA 0xF000.
-/// If intermediate page table levels (PDPT[0], PD[0]) don't exist yet,
-/// the write triggers nested page faults that the demand pager resolves.
+/// Saved page table entry for the trampoline page, so it can be restored
+/// after a mode toggle without clobbering whatever was mapped there (e.g.
+/// a VM86 environment block).
+static mut TRAMPOLINE_SAVED: u64 = 0;
+
+/// Temporarily map the trampoline page (VA 0xF000) identity-mapped to
+/// PA 0xF000 for a mode toggle.  Saves the current PTE so
+/// `restore_trampoline()` can put it back afterwards.
 pub fn ensure_trampoline_mapped() {
     if let Entries::E64(e) = entries() {
+        unsafe { TRAMPOLINE_SAVED = e[TRAMPOLINE_PAGE].0; }
         e[TRAMPOLINE_PAGE] = Entry64::new(TRAMPOLINE_PAGE as u64, true, false);
         crate::x86::invlpg(TRAMPOLINE_ADDR);
     }
 }
 
-/// Clear the trampoline mapping after a mode toggle completes.
-/// The trampoline is only needed during the toggle; leaving it mapped
-/// kernel-only breaks VM86 threads that access page 0xF.
+/// Restore the trampoline page's PTE to whatever it was before
+/// `ensure_trampoline_mapped()`.
 pub fn clear_trampoline() {
     match entries() {
-        Entries::E32(e) => { e[TRAMPOLINE_PAGE] = Entry32::default(); }
-        Entries::E64(e) => { e[TRAMPOLINE_PAGE] = Entry64::default(); }
+        Entries::E32(e) => {
+            e[TRAMPOLINE_PAGE] = Entry32(unsafe { TRAMPOLINE_SAVED } as u32);
+        }
+        Entries::E64(e) => {
+            e[TRAMPOLINE_PAGE] = Entry64(unsafe { TRAMPOLINE_SAVED });
+        }
     }
     crate::x86::invlpg(TRAMPOLINE_ADDR);
 }
 
 /// Map the first 1MB of physical memory as user-accessible (for VM86 mode).
-/// Maps 256 pages (physical 0x00000-0xFFFFF) at virtual 0x00000-0xFFFFF
-/// with User + RW + Exec permissions.
-/// This overwrites the trampoline PTE at page 0xF, but ensure_trampoline_mapped()
-/// (called before every mode toggle) restores it.
+/// Page 0 gets a private COW copy; pages 1-0x9F are demand-paged zero;
+/// 0xA0-0xBF VGA framebuffer; 0xC0-0xFF ROM (read-only).
 pub fn map_low_mem_user() {
     match entries() {
         Entries::E32(e) => map_low_mem_user_generic(e),
@@ -1266,6 +1273,25 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
         entries[0x100 + i] = e;
     }
 
+    flush_tlb();
+}
+
+/// Allocate a physical page, fill it with `data` (zero-padded to PAGE_SIZE),
+/// and map it at user virtual page `page_idx` (writable, user-accessible).
+pub fn map_user_page(page_idx: usize, data: &[u8]) {
+    assert!(data.len() <= PAGE_SIZE);
+    let phys = crate::phys_mm::alloc_phys_page().expect("alloc user page");
+    temp_map(phys);
+    unsafe {
+        let dst = temp_map_vaddr() as *mut u8;
+        core::ptr::write_bytes(dst, 0, PAGE_SIZE);
+        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+    }
+    temp_unmap();
+    match entries() {
+        Entries::E32(e) => { e[page_idx] = Entry32::new(phys, true, true); }
+        Entries::E64(e) => { e[page_idx] = Entry64::new(phys, true, true); }
+    }
     flush_tlb();
 }
 

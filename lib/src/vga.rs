@@ -183,3 +183,34 @@ macro_rules! println {
         $crate::vga::vga().putchar(b'\n');
     }};
 }
+
+/// Debug console writer (port 0xE9 only, no VGA)
+pub struct DebugCon;
+
+impl Write for DebugCon {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            unsafe { core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") b); }
+        }
+        Ok(())
+    }
+}
+
+/// Print to debug console only (port 0xE9), not VGA
+#[macro_export]
+macro_rules! dbg_print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = $crate::vga::DebugCon.write_fmt(format_args!($($arg)*));
+    }};
+}
+
+/// Print to debug console only with newline
+#[macro_export]
+macro_rules! dbg_println {
+    () => { $crate::dbg_print!("\n") };
+    ($($arg:tt)*) => {{
+        $crate::dbg_print!($($arg)*);
+        $crate::dbg_print!("\n");
+    }};
+}

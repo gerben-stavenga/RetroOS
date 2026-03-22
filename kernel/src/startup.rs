@@ -92,6 +92,45 @@ pub fn read_file(buffer: &mut [u8]) {
     read_blocks(buffer);
 }
 
+/// TAR entry metadata returned by tar_entry_at_block
+pub struct TarEntry {
+    pub name: [u8; 100],
+    pub name_len: usize,
+    pub size: u32,
+    pub data_block: u32,
+    pub next_block: u32,
+}
+
+/// Read a TAR entry at the given block offset without touching CURRENT_BLOCK.
+/// Returns None at end-of-archive.
+pub fn tar_entry_at_block(block: u32) -> Option<TarEntry> {
+    let mut buf = [0u8; BLOCK_SIZE];
+    let lba = unsafe { START_SECTOR } + block;
+    hdd::read_sectors(lba, &mut buf);
+    let header = unsafe { &*(buf.as_ptr() as *const TarHeader) };
+    if header.is_end() { return None; }
+    let size = header.filesize() as u32;
+    let data_blocks = header.data_blocks();
+    let name_bytes = header.filename();
+    let mut name = [0u8; 100];
+    let name_len = name_bytes.len().min(100);
+    name[..name_len].copy_from_slice(&name_bytes[..name_len]);
+    Some(TarEntry {
+        name,
+        name_len,
+        size,
+        data_block: block + 1,
+        next_block: block + 1 + data_blocks,
+    })
+}
+
+/// Read raw sectors at a given TAR data block offset into buffer.
+/// Returns number of sectors read.
+pub fn read_data_at_block(block: u32, buffer: &mut [u8]) -> u32 {
+    let lba = unsafe { START_SECTOR } + block;
+    hdd::read_sectors(lba, buffer)
+}
+
 /// Startup: load and run init.elf
 pub fn startup(start_sector: u32) -> ! {
     println!("Initializing filesystem at sector {:#x}", start_sector);
@@ -123,8 +162,10 @@ pub fn startup(start_sector: u32) -> ! {
 
     println!("Entry point: {:#x}", loaded.entry);
 
-    // Ensure trampoline is identity-mapped so all forked processes inherit it
+    // Temporarily map trampoline so copy_trampoline's data is accessible,
+    // then clear it — page 0xF is used by VM86 for the environment block.
     crate::paging2::ensure_trampoline_mapped();
+    crate::paging2::clear_trampoline();
 
     // Set up user stack with argc=0 for _start(argc, argv)
     let stack_top = PAGE_TABLE_BASE as u32;

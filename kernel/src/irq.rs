@@ -120,6 +120,22 @@ pub fn init_interrupts() {
 // IRQ dispatch
 // ============================================================================
 
+/// F12 debug: dump interrupted thread's CS:IP, BIOS timer, and code bytes
+fn dump_thread_state(regs: &Regs) {
+    unsafe {
+        let tid = if crate::thread::is_initialized() { crate::thread::current().tid } else { -1 };
+        let vm86 = regs.frame.f32.eflags & (1 << 17) != 0;
+        if vm86 {
+            let vif = if crate::thread::is_initialized() { crate::thread::current().vm86_vif } else { false };
+            crate::dbg_println!("[DBG] tid={} VM86 {:04X}:{:04X} AX={:04X} DX={:04X} flags={:04X} VIF={}",
+                tid, regs.frame.f32.cs, regs.frame.f32.eip,
+                regs.rax as u16, regs.rdx as u16, regs.frame.f32.eflags as u16, vif);
+        } else {
+            crate::dbg_println!("[DBG] tid={} PM EIP={:#010x}", tid, regs.frame.f32.eip);
+        }
+    }
+}
+
 /// Handle an IRQ: PIC ACK, read hardware data, push typed event to queue.
 pub fn handle_irq(regs: &mut Regs) {
     let irq = (regs.int_num - IRQ_OFFSET as u64) as u8;
@@ -154,7 +170,16 @@ pub fn handle_irq(regs: &mut Regs) {
             }
             Some(Irq::Tick)
         }
-        1 => Some(Irq::Key(inb(0x60))),
+        1 => {
+            let sc = inb(0x60);
+            if sc == 0x58 {
+                // F12: dump current thread's CS:IP for debugging hung VM86
+                dump_thread_state(regs);
+                None
+            } else {
+                Some(Irq::Key(sc))
+            }
+        }
         _ => None,
     };
 
