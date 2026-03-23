@@ -244,7 +244,8 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     (*tss).iopb[121] = 0x00;
     (*tss).iopb[122] = 0x00;
     (*tss).iopb[123] = 0x00;
-
+    // Temporarily deny port 0x3DA to dump retrace loop code
+    (*tss).iopb[123] |= 1 << 2; // port 0x3DA = byte 123, bit 2
     // Interrupt redirection: set bits for INTs we handle in the monitor.
     // Bit SET = #GP to monitor, bit CLEAR = through IVT directly.
     // Every INT with a handler in handle_vm86_int must be listed here.

@@ -300,14 +300,176 @@ impl XmsState {
 }
 
 // ============================================================================
+// UMA (Upper Memory Area) scan and UMB allocation
+// ============================================================================
+
+/// UMA covers pages 0xC0-0xEF (192KB). Pages 0xF0-0xFF are always BIOS ROM.
+const UMA_BASE: usize = 0xC0;
+const UMA_END: usize = 0xF0;
+const UMA_PAGES: usize = UMA_END - UMA_BASE; // 48
+
+/// Bitmap of free pages in UMA (bit i = page UMA_BASE+i). 1=free, 0=ROM/reserved.
+/// Set by scan_uma(), then EMS claims 16 pages, rest available for UMB.
+static mut UMA_FREE: u64 = 0;
+
+/// Bitmap of UMB-allocated pages (subset of UMA_FREE). 1=allocated by UMB, 0=free.
+static mut UMB_ALLOC: u64 = 0;
+
+/// Bitmap of pages reserved for EMS (16 pages for 64KB page frame).
+static mut EMS_PAGES: u64 = 0;
+
+/// EMS page frame base page (set by scan_uma)
+static mut EMS_BASE_PAGE: usize = 0xD0;
+
+/// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
+pub fn scan_uma() {
+    let mut free: u64 = 0;
+    for i in 0..UMA_PAGES {
+        let base = ((UMA_BASE + i) * 0x1000) as *const u8;
+        let first = unsafe { *base };
+        let mut uniform = true;
+        for j in 1..0x1000 {
+            if unsafe { *base.add(j) } != first { uniform = false; break; }
+        }
+        if uniform && (first == 0x00 || first == 0xFF) {
+            free |= 1 << i;
+        }
+    }
+    unsafe { UMA_FREE = free; }
+
+    // Find 16 contiguous free pages for EMS (prefer D0-DF = standard location)
+    let ems_offset = find_contiguous_run(free, 16, 0xD0 - UMA_BASE);
+    if let Some(off) = ems_offset {
+        let ems_mask = ((1u64 << 16) - 1) << off;
+        unsafe {
+            EMS_PAGES = ems_mask;
+            EMS_BASE_PAGE = UMA_BASE + off;
+            UMA_FREE = free & !ems_mask; // remove EMS pages from free pool
+        }
+    }
+
+    // Log results
+    let umb_free = unsafe { UMA_FREE };
+    let ems_base = unsafe { EMS_BASE_PAGE };
+    let mut umb_count = 0u32;
+    let mut t = umb_free;
+    while t != 0 { umb_count += 1; t &= t - 1; }
+    dbg_println!("UMA: EMS frame at {:05X}, UMB {}KB free", ems_base * 0x1000, umb_count * 4);
+}
+
+/// Find `count` contiguous set bits in `bitmap`, preferring `hint` offset.
+fn find_contiguous_run(bitmap: u64, count: usize, hint: usize) -> Option<usize> {
+    // Try starting at hint first
+    if hint + count <= UMA_PAGES {
+        let mask = ((1u64 << count) - 1) << hint;
+        if bitmap & mask == mask { return Some(hint); }
+    }
+    // Scan from start
+    let mut run_start = 0;
+    let mut run_len = 0;
+    for i in 0..UMA_PAGES {
+        if bitmap & (1 << i) != 0 {
+            if run_len == 0 { run_start = i; }
+            run_len += 1;
+            if run_len >= count { return Some(run_start); }
+        } else {
+            run_len = 0;
+        }
+    }
+    None
+}
+
+/// Get UMB-available bitmap (free pages minus EMS minus already allocated)
+fn umb_avail() -> u64 {
+    unsafe { UMA_FREE & !UMB_ALLOC }
+}
+
+/// Allocate a UMB of at least `paragraphs` size (1 paragraph = 16 bytes).
+/// Returns (segment, paragraphs_allocated) or None.
+fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
+    let pages_needed = ((paragraphs as usize) * 16 + 0xFFF) / 0x1000;
+    if pages_needed == 0 { return None; }
+
+    let avail = umb_avail();
+    // First-fit contiguous run
+    let mut run_start = 0;
+    let mut run_len = 0;
+    for i in 0..UMA_PAGES {
+        if avail & (1 << i) != 0 {
+            if run_len == 0 { run_start = i; }
+            run_len += 1;
+            if run_len >= pages_needed {
+                let mut alloc_mask = 0u64;
+                for j in run_start..run_start + pages_needed {
+                    alloc_mask |= 1 << j;
+                }
+                unsafe { UMB_ALLOC |= alloc_mask; }
+                let base_page = UMA_BASE + run_start;
+                crate::paging2::map_umb(base_page, pages_needed);
+                let seg = (base_page as u16) * 0x100; // page to segment
+                let paras = (pages_needed as u16) * 0x100;
+                return Some((seg, paras));
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+    None
+}
+
+/// Free a UMB by segment address.
+fn umb_free(segment: u16) -> bool {
+    let page = (segment / 0x100) as usize;
+    if page < UMA_BASE || page >= UMA_END { return false; }
+    let offset = page - UMA_BASE;
+
+    let alloc = unsafe { UMB_ALLOC };
+    if alloc & (1 << offset) == 0 { return false; }
+
+    // Free contiguous run starting at offset
+    let mut mask = 0u64;
+    let mut i = offset;
+    while i < UMA_PAGES && alloc & (1 << i) != 0 {
+        mask |= 1 << i;
+        i += 1;
+    }
+    let count = (i - offset) as usize;
+    unsafe { UMB_ALLOC &= !mask; }
+    crate::paging2::unmap_umb(page, count);
+    true
+}
+
+/// Largest free UMB in paragraphs.
+fn umb_largest() -> u16 {
+    let avail = umb_avail();
+    let mut largest = 0usize;
+    let mut run = 0usize;
+    for i in 0..UMA_PAGES {
+        if avail & (1 << i) != 0 {
+            run += 1;
+            if run > largest { largest = run; }
+        } else {
+            run = 0;
+        }
+    }
+    (largest as u16) * 0x100
+}
+
+// ============================================================================
 // EMS (Expanded Memory Specification) state
 // ============================================================================
 
 const MAX_EMS_HANDLES: usize = 16;
 /// Total EMS pages available (256 × 16KB = 4MB)
 const EMS_TOTAL_PAGES: u16 = 256;
-/// EMS page frame segment (linear 0xD0000)
-pub const EMS_FRAME_SEG: u16 = 0xD000;
+/// EMS page frame segment — set dynamically by scan_uma()
+pub fn ems_frame_seg() -> u16 {
+    (unsafe { EMS_BASE_PAGE } as u16) * 0x100
+}
+
+fn ems_base_page() -> usize {
+    unsafe { EMS_BASE_PAGE }
+}
 
 /// Per-thread EMS driver state
 pub struct EmsState {
@@ -343,7 +505,7 @@ impl EmsState {
         for w in 0..4 {
             if self.frame[w].is_some() {
                 self.frame[w] = None;
-                crate::paging2::map_ems_window(w, None);
+                crate::paging2::map_ems_window(ems_base_page(), w, None);
             }
         }
         for handle in &mut self.handles {
@@ -365,7 +527,7 @@ impl EmsState {
 /// Emulate IN from a port.
 fn emulate_inb(port: u16) -> Result<u8, Action> {
     match port {
-        // VGA ports — pass through to hardware
+        // VGA ports — pass through to hardware (including 0x3DA retrace register)
         0x3C0..=0x3DF => Ok(crate::x86::inb(port)),
         // Master PIC command (read ISR)
         0x20 => Ok(thread::current().vpic.isr),
@@ -441,10 +603,12 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
 /// Called from outside the monitor (traps.rs drain, switch_to_thread).
 /// EFLAGS.IF may not reflect VIF here, so we map VIF↔IF around reflects.
 pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<crate::irq::Irq>) {
-    // QEMU bug workaround: QEMU doesn't force Odd/Even read mode in text
-    // mode like real VGA hardware does. Periodically restore GC5 bit 4
-    // when delivering IRQs, but only when the interrupted code is the DOS
-    // program (not BIOS ROM which may need GC5=0x00 for font loading).
+    // QEMU VGA bug workaround: real VGA hardware forces Odd/Even read mode
+    // (GC5 bit 4) in text modes regardless of the register value. QEMU doesn't,
+    // so if a DOS program writes GC5=0x00 (e.g. Keen4 during VGA detection)
+    // and never restores it, text mode reads break (chars at 2x offset).
+    // Fix: on each IRQ delivery, re-set GC5 bit 4 when in text mode.
+    // Skip when CS >= C000 (BIOS ROM) — BIOS font loading needs GC5=0x00.
     unsafe {
         let cs = regs.frame.f32.cs;
         if cs < 0xC000 {
@@ -468,11 +632,23 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
             Irq::Tick => { thread.vpic.push(0x08); }
         }
     }
-    if !thread.vm86_vif { return; }
+    if !thread.vm86_vif {
+        static mut VIF_SKIP: u32 = 0;
+        unsafe { let p = &raw mut VIF_SKIP; *p += 1;
+            if *p % 10000 == 0 { dbg_println!("IRQ: VIF=0 skip #{}, isr={:02X}", *p, thread.vpic.isr); }
+        }
+        return;
+    }
     // Don't deliver while a handler is in service — prevents nesting into
     // non-reentrant BIOS code (e.g. new timer IRQ injected inside keyboard handler
     // after STI). Pending IRQs stay queued until all handlers EOI.
-    if thread.vpic.isr != 0 { return; }
+    if thread.vpic.isr != 0 {
+        static mut ISR_SKIP: u32 = 0;
+        unsafe { let p = &raw mut ISR_SKIP; *p += 1;
+            if *p % 10000 == 0 { dbg_println!("IRQ: ISR={:02X} skip #{}", thread.vpic.isr, *p); }
+        }
+        return;
+    }
     // Deliver only ONE interrupt at a time to avoid overflowing small DOS stacks
     // (e.g. Prince of Persia SP=0x0080). Remaining events stay queued in vpic
     // and get delivered on subsequent traps after the handler EOIs.
@@ -777,6 +953,52 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         // IN AL, DX (0xEC)
         0xEC => {
             let port = regs.rdx as u16;
+            // Log first 50 unique CS:IP locations reading 0x3DA
+            if port == 0x3DA {
+                static mut READ_CTR: u32 = 0;
+                static mut SEEN: [(u16, u16); 50] = [(0, 0); 50];
+                static mut SEEN_COUNT: [(u16, u16, u32); 50] = [(0, 0, 0); 50];
+                static mut N_SEEN: usize = 0;
+                unsafe {
+                    let p = &raw mut READ_CTR; *p += 1;
+                    let cs = regs.frame.f32.cs as u16;
+                    let ip = regs.frame.f32.eip as u16;
+                    let n = *(&raw const N_SEEN);
+                    let mut found = false;
+                    for i in 0..n {
+                        if (*(&raw const SEEN_COUNT))[i].0 == cs && (*(&raw const SEEN_COUNT))[i].1 == ip {
+                            (*(&raw mut SEEN_COUNT))[i].2 += 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found && n < 50 {
+                        (*(&raw mut SEEN_COUNT))[n] = (cs, ip, 1);
+                        *(&raw mut N_SEEN) = n + 1;
+                        // Dump code for each new caller
+                        let base = ((cs as u32) << 4).wrapping_add(ip as u32).saturating_sub(8);
+                        let code = core::slice::from_raw_parts(base as *const u8, 32);
+                        dbg_println!("3DA: new caller #{} CS:IP={:04X}:{:04X} code:", n, cs, ip);
+                        for row in 0..2 {
+                            let o = row * 16;
+                            dbg_println!("  {:05X}: {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
+                                base as usize + o,
+                                code[o], code[o+1], code[o+2], code[o+3],
+                                code[o+4], code[o+5], code[o+6], code[o+7],
+                                code[o+8], code[o+9], code[o+10], code[o+11],
+                                code[o+12], code[o+13], code[o+14], code[o+15]);
+                        }
+                    }
+                    // Every 100k reads, print summary
+                    if *(&raw const READ_CTR) % 100000 == 0 {
+                        dbg_println!("3DA: {} total reads, {} callers:", *(&raw const READ_CTR), n);
+                        for i in 0..n {
+                            let s = (*(&raw const SEEN_COUNT))[i];
+                            dbg_println!("  {:04X}:{:04X} = {} reads", s.0, s.1, s.2);
+                        }
+                    }
+                }
+            }
             let val = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
             regs.rax = (regs.rax & !0xFF) | val as u64;
             Action::Done
@@ -1234,20 +1456,28 @@ fn int_21h(regs: &mut Regs) -> Action {
                 i += 1;
             }
             dbg_println!("  Open: {}", unsafe { core::str::from_utf8_unchecked(&name[..i]) });
-            let fd = crate::vfs::open(&name[..i]);
-            if fd >= 0 {
-                regs.rax = (regs.rax & !0xFFFF) | fd as u64;
-                unsafe { regs.frame.f32.eflags &= !1; } // clear carry
+            // Check for device names
+            if name[..i].eq_ignore_ascii_case(b"EMMXXXX0") {
+                regs.rax = (regs.rax & !0xFFFF) | EMS_DEVICE_HANDLE as u64;
+                unsafe { regs.frame.f32.eflags &= !1; }
             } else {
-                regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
-                unsafe { regs.frame.f32.eflags |= 1; } // set carry
+                let fd = crate::vfs::open(&name[..i]);
+                if fd >= 0 {
+                    regs.rax = (regs.rax & !0xFFFF) | fd as u64;
+                    unsafe { regs.frame.f32.eflags &= !1; } // clear carry
+                } else {
+                    regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
+                    unsafe { regs.frame.f32.eflags |= 1; } // set carry
+                }
             }
             Action::Done
         }
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
-            let handle = regs.rbx as i32;
-            crate::vfs::close(handle);
+            let handle = regs.rbx as u16;
+            if handle != EMS_DEVICE_HANDLE {
+                crate::vfs::close(handle as i32);
+            }
             unsafe { regs.frame.f32.eflags &= !1; }
             Action::Done
         }
@@ -1379,11 +1609,21 @@ fn int_21h(regs: &mut Regs) -> Action {
                         };
                         regs.rdx = (regs.rdx & !0xFFFF) | info as u64;
                         unsafe { regs.frame.f32.eflags &= !1; }
+                    } else if handle == EMS_DEVICE_HANDLE {
+                        // EMMXXXX0 device: bit 7=1 (device)
+                        regs.rdx = (regs.rdx & !0xFFFF) | 0x80;
+                        unsafe { regs.frame.f32.eflags &= !1; }
                     } else {
                         // File handle: bit 7=0 (file), bit 6=0 (not EOF)
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x0000;
                         unsafe { regs.frame.f32.eflags &= !1; }
                     }
+                }
+                // AL=0x07: Check device output status (BX=handle)
+                0x07 => {
+                    // AL=FFh = ready
+                    regs.rax = (regs.rax & !0xFF) | 0xFF;
+                    unsafe { regs.frame.f32.eflags &= !1; }
                 }
                 // AL=0x08: Check if block device is removable (BL=drive, 0=default,1=A,3=C)
                 0x08 => {
@@ -1872,12 +2112,33 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             regs.rcx = (regs.rcx & !0xFFFFFFFF) | (XMS_END - 1) as u64;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
-        // AH=10h — Request Upper Memory Block (UMB)
-        // AH=11h — Release Upper Memory Block
-        0x10 | 0x11 => {
-            regs.rax = (regs.rax & !0xFFFF); // failure
-            regs.rbx = (regs.rbx & !0xFF) | 0xB1; // no UMBs available
-            regs.rdx = (regs.rdx & !0xFFFF); // largest available = 0
+        // AH=10h — Request Upper Memory Block (DX=size in paragraphs)
+        0x10 => {
+            let size = regs.rdx as u16;
+            match umb_alloc(size) {
+                Some((seg, paras)) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1; // success
+                    regs.rbx = (regs.rbx & !0xFFFF) | seg as u64;
+                    regs.rdx = (regs.rdx & !0xFFFF) | paras as u64;
+                    dbg_println!("XMS: UMB alloc {} paras → seg {:04X} ({} paras)", size, seg, paras);
+                }
+                None => {
+                    let largest = umb_largest();
+                    regs.rax = (regs.rax & !0xFFFF); // failure
+                    regs.rbx = (regs.rbx & !0xFF) | if largest > 0 { 0xB0 } else { 0xB1 };
+                    regs.rdx = (regs.rdx & !0xFFFF) | largest as u64;
+                }
+            }
+        }
+        // AH=11h — Release Upper Memory Block (DX=segment)
+        0x11 => {
+            let seg = regs.rdx as u16;
+            if umb_free(seg) {
+                regs.rax = (regs.rax & !0xFFFF) | 1; // success
+            } else {
+                regs.rax = (regs.rax & !0xFFFF); // failure
+                regs.rbx = (regs.rbx & !0xFF) | 0xB2; // invalid UMB segment
+            }
         }
         _ => {
             dbg_println!("XMS: UNHANDLED AH={:02X}", ah);
@@ -1977,10 +2238,7 @@ fn ems_state() -> &'static mut EmsState {
 
 fn int_67h(regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
-    match ah {
-        0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x45 | 0x46 | 0x4B | 0x4C => {}
-        _ => dbg_println!("EMS: AH={:02X} AX={:04X}", ah, regs.rax as u16),
-    }
+    dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} DX={:04X}", ah, regs.rax as u16, regs.rbx as u16, regs.rdx as u16);
     match ah {
         // AH=40h — Get status
         0x40 => {
@@ -1988,7 +2246,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         }
         // AH=41h — Get page frame segment
         0x41 => {
-            regs.rbx = (regs.rbx & !0xFFFF) | EMS_FRAME_SEG as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | ems_frame_seg() as u64;
             regs.rax = (regs.rax & !0xFF00); // AH=0
         }
         // AH=42h — Get unallocated page count
@@ -2074,7 +2332,7 @@ fn int_67h(regs: &mut Regs) -> Action {
             // BX=FFFFh means unmap
             if log_page == 0xFFFF {
                 ems.frame[phys_page as usize] = None;
-                crate::paging2::map_ems_window(phys_page as usize, None);
+                crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
                 regs.rax = (regs.rax & !0xFF00); // AH=0
                 return Action::Done;
             }
@@ -2087,7 +2345,7 @@ fn int_67h(regs: &mut Regs) -> Action {
             match &ems.handles[handle as usize] {
                 Some(h) if (log_page as usize) < h.pages.len() => {
                     let phys_pages = &h.pages[log_page as usize];
-                    crate::paging2::map_ems_window(phys_page as usize, Some(phys_pages));
+                    crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
                     ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                     regs.rax = (regs.rax & !0xFF00); // AH=0
                 }
@@ -2109,7 +2367,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                     if let Some((h, _)) = ems.frame[w] {
                         if h == handle as u8 {
                             ems.frame[w] = None;
-                            crate::paging2::map_ems_window(w, None);
+                            crate::paging2::map_ems_window(ems_base_page(), w, None);
                         }
                     }
                 }
@@ -2198,7 +2456,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                     phys_raw as u8
                 } else {
                     // Segment mode: convert segment to physical page index
-                    let seg_offset = phys_raw.wrapping_sub(EMS_FRAME_SEG);
+                    let seg_offset = phys_raw.wrapping_sub(ems_frame_seg());
                     (seg_offset / 0x0400) as u8 // each window is 0x400 paragraphs (16KB)
                 };
 
@@ -2209,12 +2467,12 @@ fn int_67h(regs: &mut Regs) -> Action {
 
                 if log_page == 0xFFFF {
                     ems.frame[phys_page as usize] = None;
-                    crate::paging2::map_ems_window(phys_page as usize, None);
+                    crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
                 } else {
                     match &ems.handles[handle as usize] {
                         Some(h) if (log_page as usize) < h.pages.len() => {
                             let phys_pages = &h.pages[log_page as usize];
-                            crate::paging2::map_ems_window(phys_page as usize, Some(phys_pages));
+                            crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
                             ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                         }
                         _ => {
@@ -2282,7 +2540,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                 let di = regs.rdi as u32;
                 let base = (es << 4) + di;
                 for i in 0..4u32 {
-                    let seg = EMS_FRAME_SEG + (i as u16) * 0x0400;
+                    let seg = ems_frame_seg() + (i as u16) * 0x0400;
                     unsafe {
                         ((base + i * 4) as *mut u16).write_unaligned(seg);
                         ((base + i * 4 + 2) as *mut u16).write_unaligned(i as u16);
@@ -2678,6 +2936,8 @@ const XMS_STUB_SEG: u16 = 0x0050;
 const XMS_STUB_OFF: u16 = 0x0000;
 /// Private interrupt number used by XMS far-call stub
 const XMS_INT: u8 = 0xF0;
+/// Dummy file handle returned for device "EMMXXXX0" (EMS detection)
+const EMS_DEVICE_HANDLE: u16 = 0xFE;
 
 pub fn setup_ivt() {
     // Install XMS entry stub at 0x0500: INT F0h + RETF (3 bytes)
@@ -2688,6 +2948,8 @@ pub fn setup_ivt() {
         *stub.add(2) = 0xCB;   // RETF
     }
 
+    // Scan upper memory to find free pages for UMB/EMS
+    scan_uma();
 }
 
 // ============================================================================

@@ -1274,13 +1274,9 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
         entries[i] = e;
     }
 
-    // Pages 0xC0-0xCF: ROM area — identity mapped RO
-    for i in 0xC0..0xD0usize {
-        entries[i] = E::new(i as u64, false, true);
-    }
-    // Pages 0xD0-0xDF: EMS page frame — left unmapped (mapped on demand by EMS driver)
-    // Pages 0xE0-0xFF: ROM area — identity mapped RO
-    for i in 0xE0..0x100usize {
+    // Pages 0xC0-0xFF: ROM/BIOS area — identity mapped RO by default.
+    // UMB and EMS pages are cleared to not-present later by scan_uma().
+    for i in 0xC0..0x100usize {
         entries[i] = E::new(i as u64, false, true);
     }
 
@@ -1332,11 +1328,12 @@ fn set_a20_generic<E: Entry>(entries: &mut [E], enabled: bool) {
 }
 
 /// Map an EMS page frame window (0-3) to the given 4 physical pages.
-/// Window N maps to virtual pages 0xD0 + N*4 .. 0xD0 + N*4 + 3.
+/// `base_page` is the EMS page frame start (from scan_uma).
+/// Window N maps to virtual pages base_page + N*4 .. base_page + N*4 + 3.
 /// Pass phys_pages = None to unmap the window.
-pub fn map_ems_window(window: usize, phys_pages: Option<&[u64; 4]>) {
+pub fn map_ems_window(base_page: usize, window: usize, phys_pages: Option<&[u64; 4]>) {
     assert!(window < 4);
-    let base = 0xD0 + window * 4;
+    let base = base_page + window * 4;
     match entries() {
         Entries::E32(e) => map_ems_window_generic(e, base, phys_pages),
         Entries::E64(e) => map_ems_window_generic(e, base, phys_pages),
@@ -1357,6 +1354,38 @@ fn map_ems_window_generic<E: Entry>(entries: &mut [E], base: usize, phys_pages: 
             }
         }
     }
+}
+
+/// Enable UMB region: clear RO identity mapping so demand paging provides RAM on first access.
+pub fn map_umb(base_page: usize, num_pages: usize) {
+    match entries() {
+        Entries::E32(e) => { for i in 0..num_pages { e[base_page + i] = Entry32::default(); } }
+        Entries::E64(e) => { for i in 0..num_pages { e[base_page + i] = Entry64::default(); } }
+    }
+    flush_tlb();
+}
+
+/// Disable UMB region: free physical pages and restore RO identity mapping.
+pub fn unmap_umb(base_page: usize, num_pages: usize) {
+    match entries() {
+        Entries::E32(e) => {
+            for i in 0..num_pages {
+                if e[base_page + i].present() {
+                    crate::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                }
+                e[base_page + i] = Entry32::new((base_page + i) as u64, false, true);
+            }
+        }
+        Entries::E64(e) => {
+            for i in 0..num_pages {
+                if e[base_page + i].present() {
+                    crate::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                }
+                e[base_page + i] = Entry64::new((base_page + i) as u64, false, true);
+            }
+        }
+    }
+    flush_tlb();
 }
 
 /// Copy trampoline code to physical address 0xF000
