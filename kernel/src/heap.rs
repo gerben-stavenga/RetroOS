@@ -22,7 +22,7 @@ static mut LARGE_FREES: u32 = 0;
 static mut LARGE_REUSE: u32 = 0;  // alloc satisfied from free list (no extend)
 
 /// Get heap base (first page after kernel _end)
-fn heap_base() -> usize {
+pub fn heap_base() -> usize {
     unsafe extern "C" {
         static _end: u8;
     }

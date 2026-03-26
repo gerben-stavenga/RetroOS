@@ -4,8 +4,9 @@
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
 use crate::descriptors::{set_kernel_stack, USER_CS, USER_CS64, USER_DS};
+use crate::paging2::Entry;
 use crate::stacktrace::SymbolData;
-use crate::{KERNEL_STACK, println};
+use crate::{ARCH_STACK, println};
 use crate::x86;
 use crate::{Frame, Frame32, Frame64, Regs};
 
@@ -117,22 +118,13 @@ pub struct Thread {
     pub mode: ThreadMode,              // User code bitness (16/32/64)
     pub frame_format: FrameFormat,    // Saved interrupt frame format
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
-    pub vm86_vif: bool,               // VM86 virtual interrupt flag (software, used without VME)
-    pub vm86_a20: bool,               // VM86 A20 gate (false=wrap, true=enabled)
-    pub vm86_dta: u32,                // VM86 DOS Disk Transfer Area address
-    pub vm86_heap_seg: u16,           // VM86 DOS heap: next free segment for INT 21h/48h
-    pub vpic: crate::vm86::VirtualPic,      // Virtual PIC (per-thread)
-    pub vkbd: crate::vm86::VirtualKeyboard, // Virtual keyboard (per-thread)
-    pub vm86_exec_parent: Option<crate::vm86::ExecParent>, // Saved parent state for EXEC return
-    pub vm86_skip_irq: bool,  // Skip first IRQ drain (fresh EXEC'd child with tiny stack)
-    pub vm86_xms: Option<alloc::boxed::Box<crate::vm86::XmsState>>,  // XMS driver state
-    pub vm86_ems: Option<alloc::boxed::Box<crate::vm86::EmsState>>,  // EMS driver state
+    pub vm86: crate::vm86::Vm86State,
     pub cwd: [u8; 64],     // Current working directory (e.g. "WOLF3D/", "" for root)
     pub cwd_len: usize,
 }
 
 impl Thread {
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         Thread {
             tid: 0,
             pid: 0,
@@ -148,16 +140,7 @@ impl Thread {
             mode: ThreadMode::Mode32,
             frame_format: FrameFormat::Protected,
             symbols: None,
-            vm86_vif: false,
-            vm86_a20: false,
-            vm86_dta: 0,
-            vm86_heap_seg: 0xA000,
-            vpic: crate::vm86::VirtualPic::new(),
-            vkbd: crate::vm86::VirtualKeyboard::new(),
-            vm86_exec_parent: None,
-            vm86_skip_irq: false,
-            vm86_xms: None,
-            vm86_ems: None,
+            vm86: crate::vm86::Vm86State::new(),
             cwd: [0; 64],
             cwd_len: 0,
         }
@@ -264,8 +247,7 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
     thread.mode = ThreadMode::Mode16;
     thread.frame_format = FrameFormat::Protected; // VM86 always uses Frame32 (IRET in PAE mode)
-    thread.vm86_vif = true;  // Virtual interrupts enabled by default (software VIF)
-    thread.vm86_a20 = false; // A20 disabled (wrap-around) by default
+    thread.vm86 = crate::vm86::Vm86State::new();
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode
     const IF_FLAG: u32 = 1 << 9;   // Interrupt enable
@@ -384,7 +366,7 @@ pub fn switch_to_thread(idx: usize) -> ! {
     }
 
     // Update kernel stack in TSS
-    let stack_top = unsafe { (&raw const KERNEL_STACK).cast::<u8>().add(128 * 1024) };
+    let stack_top = unsafe { (&raw const ARCH_STACK).cast::<u8>().add(128 * 1024) };
     if thread.mode == ThreadMode::Mode64 || Regs::use_f64() {
         crate::descriptors::set_kernel_stack_64(stack_top as u64);
     } else {
@@ -418,12 +400,16 @@ pub fn switch_to_thread(idx: usize) -> ! {
     // VM86: reflect pending interrupts into the exit frame (page tables
     // are loaded, so IVT at page 0 is accessible).
     // Non-VM86: convert keyboard scancodes to ASCII in global KEY_PIPE.
-    if thread.vm86_skip_irq {
+    if thread.vm86.skip_irq {
         // Fresh EXEC'd child — discard pending IRQs so they don't overflow
         // the program's tiny initial stack before it sets up its real one.
-        thread.vm86_skip_irq = false;
+        thread.vm86.skip_irq = false;
         crate::irq::drain_discard();
     } else if thread.mode == ThreadMode::Mode16 {
+        let ticks = crate::irq::take_pending_ticks();
+        if ticks > 0 {
+            thread.vm86.vpic.push(0x08);
+        }
         crate::irq::drain(|event| {
             crate::vm86::deliver_irq(thread, &mut frame.regs, Some(event));
         });
@@ -481,11 +467,15 @@ pub fn exit_thread(exit_code: i32) -> Option<usize> {
         let thread = &mut THREADS[CURRENT_THREAD];
         let parent_tid = thread.parent_tid;
         crate::vfs::close_all_fds(&mut thread.fds);
-        if let Some(ref mut ems) = thread.vm86_ems {
+        if let Some(ref mut ems) = thread.vm86.ems {
             ems.free_all_pages();
         }
-        thread.vm86_ems = None;
-        thread.vm86_xms = None;
+        thread.vm86.ems = None;
+        thread.vm86.xms = None;
+        if thread.mode == ThreadMode::Mode16 && !thread.vm86.a20_enabled {
+            crate::paging2::set_a20(true, &mut thread.vm86.hma_pages);
+            thread.vm86.a20_enabled = true;
+        }
         crate::paging2::free_user_pages();
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
@@ -585,4 +575,3 @@ pub fn init_threading() {
         // CURRENT_THREAD defaults to 0, which is correct
     }
 }
-

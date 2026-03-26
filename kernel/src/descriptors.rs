@@ -1,14 +1,16 @@
 //! GDT, IDT, and TSS setup for x86
 //!
 //! Segment selectors:
-//! - 0x08: Kernel Code 32-bit (ring 0)
-//! - 0x10: Kernel Data (ring 0)
-//! - 0x18: Kernel Code 64-bit (ring 0)
+//! - 0x08: Kernel Code 32-bit (ring 0, arch)
+//! - 0x10: Kernel Data (ring 0, arch)
+//! - 0x18: Kernel Code 64-bit (ring 0, arch)
 //! - 0x20: User Code 32-bit (ring 3)
 //! - 0x28: User Data (ring 3)
 //! - 0x30: User Code 64-bit (ring 3)
 //! - 0x38: TSS32 (8 bytes - 32-bit descriptor)
 //! - 0x40: TSS64 (16 bytes - 0x40 + 0x48)
+//! - 0x50: Ring-1 Code 32-bit (OS kernel)
+//! - 0x58: Ring-1 Data (OS kernel)
 
 use crate::x86::{self, GdtPtr, IdtPtr};
 
@@ -23,6 +25,10 @@ pub const TSS32_SEL: u16 = 0x38;
 pub const KERNEL_CS64: u16 = 0x18;
 pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
 pub const TSS64_SEL: u16 = 0x40;
+
+/// Segment selectors - ring 1 (OS kernel)
+pub const RING1_CS: u16 = 0x50 | 1; // Ring 1
+pub const RING1_DS: u16 = 0x58 | 1; // Ring 1
 
 /// Number of IDT entries (0-48 for exceptions/IRQs, 0x80 for syscall)
 const IDT_ENTRIES: usize = 0x81;
@@ -244,8 +250,6 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     (*tss).iopb[121] = 0x00;
     (*tss).iopb[122] = 0x00;
     (*tss).iopb[123] = 0x00;
-    // Temporarily deny port 0x3DA to dump retrace loop code
-    (*tss).iopb[123] |= 1 << 2; // port 0x3DA = byte 123, bit 2
     // Interrupt redirection: set bits for INTs we handle in the monitor.
     // Bit SET = #GP to monitor, bit CLEAR = through IVT directly.
     // Every INT with a handler in handle_vm86_int must be listed here.
@@ -270,8 +274,10 @@ const GDT_USER_CS64: usize = 6;   // 0x30
 const GDT_TSS32: usize = 7;       // 0x38
 const GDT_TSS64_LO: usize = 8;    // 0x40
 const GDT_TSS64_HI: usize = 9;    // 0x48 (null - upper 32 bits of base are 0)
+const GDT_RING1_CS: usize = 10;   // 0x50
+const GDT_RING1_DS: usize = 11;   // 0x58
 
-const GDT_ENTRIES: usize = 10;
+const GDT_ENTRIES: usize = 12;
 
 /// 32-bit Interrupt Descriptor Table
 #[repr(C, align(8))]
@@ -288,15 +294,17 @@ struct Idt64 {
 // Static tables
 static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::null(),               // 0x00: Null
-    GdtEntry::segment32(true, 0),   // 0x08: Kernel Code 32-bit
-    GdtEntry::segment32(false, 0),  // 0x10: Kernel Data
-    GdtEntry::segment64(0),         // 0x18: Kernel Code 64-bit
-    GdtEntry::segment32(true, 3),   // 0x20: User Code 32-bit
-    GdtEntry::segment32(false, 3),  // 0x28: User Data
-    GdtEntry::segment64(3),         // 0x30: User Code 64-bit
+    GdtEntry::segment32(true, 0),   // 0x08: Kernel Code 32-bit (ring 0)
+    GdtEntry::segment32(false, 0),  // 0x10: Kernel Data (ring 0)
+    GdtEntry::segment64(0),         // 0x18: Kernel Code 64-bit (ring 0)
+    GdtEntry::segment32(true, 3),   // 0x20: User Code 32-bit (ring 3)
+    GdtEntry::segment32(false, 3),  // 0x28: User Data (ring 3)
+    GdtEntry::segment64(3),         // 0x30: User Code 64-bit (ring 3)
     GdtEntry::null(),               // 0x38: TSS32 (filled at runtime)
     GdtEntry::null(),               // 0x40: TSS64 low (filled at runtime)
     GdtEntry::null(),               // 0x48: TSS64 high (always null for <4GB)
+    GdtEntry::segment32(true, 1),   // 0x50: Ring-1 Code 32-bit (flat, no wrapping yet)
+    GdtEntry::segment32(false, 1),  // 0x58: Ring-1 Data (flat, no wrapping yet)
 ];
 
 static mut IDT32: Idt32 = Idt32 {
@@ -458,4 +466,36 @@ pub fn toggle_mode(new_cr3: u32) {
         load_prot_mode_descriptors();
     }
     x86::sti();
+}
+
+/// Drop from ring 0 to ring 1. Returns normally, but caller is now at CPL=1.
+///
+/// Builds a fake IRET frame with RING1_CS/RING1_DS and EIP pointing to the
+/// instruction after IRET. After this returns, all code executes at ring 1.
+pub fn enter_ring1() {
+    unsafe {
+        core::arch::asm!(
+            "mov {orig_esp:e}, esp",  // save ESP before pushes
+            "push {ss:e}",            // SS = RING1_DS
+            "push {orig_esp:e}",      // ESP = original (before pushes)
+            "pushfd",                 // EFLAGS
+            "or dword ptr [esp], 0x1000", // set IOPL=1 so ring-1 can do I/O
+            "and dword ptr [esp], ~0x200", // clear IF — no interrupts until segments loaded
+            "push {cs:e}",            // CS = RING1_CS
+            "lea {tmp:e}, [2f]",
+            "push {tmp:e}",           // EIP = after iretd
+            "iretd",
+            "2:",                     // now at ring 1, interrupts disabled
+            "mov ds, {ds:e}",
+            "mov es, {ds:e}",
+            "mov fs, {ds:e}",
+            "mov gs, {ds:e}",
+            "sti",                    // safe to take interrupts now
+            ss = in(reg) RING1_DS as u32,
+            cs = in(reg) RING1_CS as u32,
+            ds = in(reg) RING1_DS as u32,
+            orig_esp = out(reg) _,
+            tmp = out(reg) _,
+        );
+    }
 }

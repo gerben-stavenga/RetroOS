@@ -210,37 +210,43 @@ fn page_fault(regs: &mut Regs) -> Option<usize> {
         return segv_current_thread(regs, fault_addr);
     }
 
-    // Kernel fault in kernel code/data region is a bug
+    // Kernel fault in kernel code/data region:
+    // - Heap range (heap_base..HEAP_END): demand-page it (not present + write)
+    // - Everything else: bug
     if !user && fault_addr >= KERNEL_BASE {
-        // Read all values into locals before any debug output
-        let rip = regs.ip();
-        let err = error;
-        let addr = fault_addr as u64;
-        unsafe {
-            core::arch::asm!("cli");
-            macro_rules! dbg_char {
-                ($c:expr) => { core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") $c) };
+        let in_heap = !present && fault_addr >= crate::heap::heap_base()
+            && fault_addr < crate::heap::HEAP_END;
+        if !in_heap {
+            // Read all values into locals before any debug output
+            let rip = regs.ip();
+            let err = error;
+            let addr = fault_addr as u64;
+            unsafe {
+                core::arch::asm!("cli");
+                macro_rules! dbg_char {
+                    ($c:expr) => { core::arch::asm!("out dx, al", in("dx") 0xe9u16, in("al") $c) };
+                }
+                macro_rules! dbg_hex {
+                    ($val:expr) => {{
+                        let v: u64 = $val;
+                        let mut i = 60i32;
+                        while i >= 0 {
+                            let nib = ((v >> i) & 0xf) as u8;
+                            let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                            dbg_char!(c);
+                            i -= 4;
+                        }
+                    }};
+                }
+                dbg_char!(b'K'); dbg_char!(b'F'); dbg_char!(b' ');
+                dbg_hex!(addr);
+                dbg_char!(b' ');
+                dbg_hex!(rip);
+                dbg_char!(b' ');
+                dbg_hex!(err);
+                dbg_char!(b'\n');
+                loop { core::arch::asm!("hlt"); }
             }
-            macro_rules! dbg_hex {
-                ($val:expr) => {{
-                    let v: u64 = $val;
-                    let mut i = 60i32;
-                    while i >= 0 {
-                        let nib = ((v >> i) & 0xf) as u8;
-                        let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
-                        dbg_char!(c);
-                        i -= 4;
-                    }
-                }};
-            }
-            dbg_char!(b'K'); dbg_char!(b'F'); dbg_char!(b' ');
-            dbg_hex!(addr);
-            dbg_char!(b' ');
-            dbg_hex!(rip);
-            dbg_char!(b' ');
-            dbg_hex!(err);
-            dbg_char!(b'\n');
-            loop { core::arch::asm!("hlt"); }
         }
     }
 
@@ -417,29 +423,140 @@ unsafe fn vm86_swap_out(regs: &mut Regs) {
     regs.gs = 0;
 }
 
-/// Main interrupt service routine - dispatches to specific handlers.
-/// This is the ONLY place that calls switch_to_thread (via exit_kernel).
-/// All handlers return normally so RAII works for heap-allocated locals.
+// =============================================================================
+// Arch interface: ring-1 kernel → ring-0 arch calls via INT 0x80
+// =============================================================================
+
+/// Saved ring-1 kernel context for returning from execute()
+#[allow(static_mut_refs)]
+static mut KERNEL_REGS: Option<Regs> = None;
+
+/// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
+pub mod arch_call {
+    pub const EXECUTE: u64 = 0x100;  // execute(tid) — EDX=tid
+}
+
+/// Handle INT 0x80 from ring 1: arch primitive dispatch.
+/// Currently only supports execute(tid).
+fn arch_dispatch(regs: &mut Regs) {
+    match regs.rax {
+        arch_call::EXECUTE => arch_execute(regs),
+        _ => panic!("Unknown arch call: {:#x}", regs.rax),
+    }
+}
+
+/// Arch execute(tid): save kernel context, switch to user thread.
+/// The kernel's INT frame is saved so we can return to it when the
+/// user thread produces an event (syscall, fault, IRQ, etc.).
+fn arch_execute(regs: &mut Regs) {
+    let tid = regs.rdx as usize;
+    // Save kernel's return context (the INT 0x80 frame)
+    unsafe { KERNEL_REGS = Some(*regs); }
+    // Switch to the user thread (does not return — IRETs to user)
+    thread::switch_to_thread(tid);
+}
+
+/// Check if there's a saved kernel context to return to.
+/// If so, save the user thread's state and return to the ring-1 kernel
+/// by overwriting `regs` with the saved kernel context.
+/// Returns true if returning to kernel, false for normal handling.
+#[allow(static_mut_refs)]
+fn return_to_kernel(regs: &mut Regs, int_num: u64) -> bool {
+    let kernel_regs = unsafe { KERNEL_REGS.as_ref() };
+    if kernel_regs.is_none() {
+        return false;
+    }
+
+    // Save user thread state
+    let current = thread::current();
+    thread::save_state(current, regs);
+
+    // Store the event info in the kernel's return registers:
+    // EAX = int_num (so kernel knows what happened)
+    let mut kregs = unsafe { KERNEL_REGS.take().unwrap() };
+    kregs.rax = int_num;
+
+    // Restore kernel context — isr_handler returns, exit_interrupt_32
+    // restores these regs and IRETs back to ring 1
+    *regs = kregs;
+    true
+}
+
+// =============================================================================
+// Interrupt dispatch
+// =============================================================================
+
+/// Main interrupt service routine.
+///
+/// Dispatches based on source ring:
+/// - Ring 1 (kernel): IRQ → ACK+queue+return. Trap → panic. INT 0x80 → arch call.
+/// - Ring 3 (user): save state, return event to ring-1 kernel via KERNEL_REGS.
+/// - Ring 0 (boot, no event loop yet): legacy dispatch path.
 #[unsafe(no_mangle)]
 pub extern "C" fn isr_handler(regs: *mut Regs) {
     let regs = unsafe { &mut *regs };
     let int_num = regs.int_num;
+    let source_ring = regs.code_seg() & 3;
+    let vm86 = is_vm86(regs);
 
     // VM86 segment swap on entry
-    let vm86 = is_vm86(regs);
     if vm86 {
         unsafe { vm86_swap_in(regs); }
     }
 
-    // Enable interrupts for most handlers (except low stack situation)
-    // TODO: Check stack depth
+    // =========================================================================
+    // Ring 1: kernel was interrupted
+    // =========================================================================
+    if source_ring == 1 {
+        match int_num {
+            // IRQs: ACK + queue, return to kernel immediately
+            32..=47 => {
+                handle_irq(regs);
+            }
+            // INT 0x80: arch primitive call
+            48 => {
+                arch_dispatch(regs);
+                // arch_execute does not return (calls switch_to_thread)
+                // other arch calls return here
+            }
+            // Anything else from ring 1 is a kernel bug
+            _ => {
+                panic_with_regs("Unexpected interrupt from ring-1 kernel", regs);
+            }
+        }
+        return;
+    }
+
+    // =========================================================================
+    // Ring 3 (or VM86): user process was interrupted
+    // =========================================================================
+    #[allow(static_mut_refs)]
+    if (source_ring == 3 || vm86) && unsafe { KERNEL_REGS.is_some() } {
+        // Handle IRQs minimally (ACK + queue)
+        if (32..=47).contains(&int_num) {
+            handle_irq(regs);
+        }
+
+        // Save user thread state and return event to ring-1 kernel
+        if vm86 {
+            unsafe { vm86_swap_out(regs); }
+        }
+        return_to_kernel(regs, int_num);
+        return;
+    }
+
+    // =========================================================================
+    // Legacy path: no ring-1 event loop active (boot or fallback)
+    // =========================================================================
+
+    // Enable interrupts for most handlers
     if int_num != 2 && int_num != 8 {
         x86::sti();
     }
 
     let switch_to: Option<usize> = match int_num {
         0 => divide_error(regs),
-        1 => debug_exception(regs),  // mutable ref needed for VM86/user kill
+        1 => debug_exception(regs),
         2 => nmi(regs),
         3 => { breakpoint(regs); None }
         4 => overflow(regs),
@@ -447,13 +564,13 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
         6 => invalid_opcode(regs),
         7 => device_not_available(regs),
         8 => double_fault(regs),
-        9 => generic_exception(regs), // Coprocessor segment overrun
+        9 => generic_exception(regs),
         10 => invalid_tss(regs),
         11 => segment_not_present(regs),
         12 => stack_segment(regs),
         13 => general_protection(regs),
         14 => page_fault(regs),
-        15 => generic_exception(regs), // Reserved
+        15 => generic_exception(regs),
         16 => fpu_error(regs),
         17 => alignment_check(regs),
         18..=31 => generic_exception(regs),
@@ -463,9 +580,8 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
             handle_irq(regs);
 
             let mut sw = None;
-            let from_user = vm86 || regs.code_seg() & 3 != 0;
+            let from_user = vm86 || source_ring == 3;
             if from_user && thread::is_initialized() {
-                // Timer preemption (IRQ 0, every 10ms at 1000 Hz)
                 let irq = int_num - 32;
                 if irq == 0 && crate::irq::get_ticks() % 10 == 0 {
                     let current = thread::current();
@@ -477,28 +593,27 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
             sw
         }
 
-        // Syscall (IDT entry 0x80 uses vector 48's handler)
+        // Syscall
         48 => dispatch(regs),
 
         _ => generic_exception(regs),
     };
 
-    // If a handler requested a context switch, do it here.
-    // switch_to_thread drains IRQ events for the target thread.
     if let Some(idx) = switch_to {
         thread::switch_to_thread(idx);
     }
 
-    // Drain IRQ event queue when returning to the current thread.
-    // VM86: reflect interrupts through IVT into the live regs.
-    // Protected mode: convert keyboard scancodes to ASCII.
-    let from_user = vm86 || regs.code_seg() & 3 != 0;
+    // Drain IRQ event queue when returning to current user thread
+    let from_user = vm86 || source_ring == 3;
     if from_user && thread::is_initialized() {
         use crate::irq::Irq;
         let t = thread::current();
         if vm86 {
+            let ticks = crate::irq::take_pending_ticks();
+            if ticks > 0 {
+                t.vm86.vpic.push(0x08);
+            }
             crate::irq::drain(|event| crate::vm86::deliver_irq(t, regs, Some(event)));
-            // Flush any pending vpic events (e.g. queued while VIF=0, now VIF=1 after STI/IRET/POPF)
             crate::vm86::deliver_irq(t, regs, None);
         } else {
             crate::irq::drain(|event| match event {
