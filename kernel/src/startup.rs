@@ -185,6 +185,53 @@ pub fn startup(start_sector: u32) -> ! {
     thread::init_process_thread(init_thread, loaded.entry as u32, stack);
     println!("Starting init process...");
 
-    // Switch to init thread (doesn't return)
-    thread::switch_to_thread(init_thread.tid as usize);
+    // Drop to ring 1 — kernel event loop runs at CPL=1
+    crate::descriptors::enter_ring1();
+    println!("Running at ring 1");
+
+    // Event loop: execute threads via arch INT, handle returned events
+    let tid = init_thread.tid as usize;
+    event_loop(tid);
+}
+
+/// Ring-1 kernel event loop.
+/// Calls arch execute(tid) via INT 0x80. Arch switches to the user thread
+/// and returns here when an event occurs (syscall, IRQ, fault).
+fn event_loop(first_tid: usize) -> ! {
+    let mut tid = first_tid;
+    loop {
+        let event = arch_execute(tid);
+        match event {
+            // Syscall: dispatch using the thread's saved state
+            48 => {
+                let thread = crate::thread::current();
+                let result = crate::syscalls::dispatch(&mut thread.cpu_state);
+                if let Some(next) = result.switch_to {
+                    tid = next;
+                }
+            }
+            // IRQs (32-47): already ACK'd+queued by arch, nothing to do
+            32..=47 => {}
+            // Everything else: for now just re-execute
+            _ => {}
+        }
+    }
+}
+
+/// Call arch execute(tid) via INT 0x80.
+/// Returns the interrupt number that caused the return.
+#[inline(never)]
+fn arch_execute(tid: usize) -> u32 {
+    let event: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("eax") crate::traps::arch_call::EXECUTE as u32 => event,
+            in("edx") tid as u32,
+            out("ecx") _,
+            out("ebx") _,
+            out("edi") _,
+        );
+    }
+    event
 }

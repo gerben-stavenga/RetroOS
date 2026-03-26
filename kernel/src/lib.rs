@@ -66,7 +66,12 @@ static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
 static mut KERNEL_PAGES: KernelPages = unsafe { core::mem::zeroed() };
 
 /// Kernel stack - 128KB
-static mut KERNEL_STACK: [u8; 128 * 1024] = [0; 128 * 1024];
+static mut KERNEL_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
+
+/// Ring-0 arch stack — used as TSS ESP0 so that interrupts from ring 1
+/// don't clobber the ring-1 kernel's call frames.
+#[unsafe(link_section = ".data")]
+static mut ARCH_STACK: [u8; 128 * 1024] = [0; 128 * 1024];
 
 // External assembly functions
 unsafe extern "C" {
@@ -180,10 +185,10 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
         }
     }
 
-    // Setup GDT, IDT, TSS
+    // Setup GDT, IDT, TSS — use ARCH_STACK for TSS ESP0
     #[allow(static_mut_refs)]
-    let stack_top = unsafe { (KERNEL_STACK.as_ptr_range().end) as u32 };
-    descriptors::setup_descriptor_tables(stack_top);
+    let arch_stack_top = unsafe { (ARCH_STACK.as_ptr_range().end) as u32 };
+    descriptors::setup_descriptor_tables(arch_stack_top);
     println!("Descriptors initialized");
 
     // Setup PIC and enable interrupts (must happen before mode toggle,

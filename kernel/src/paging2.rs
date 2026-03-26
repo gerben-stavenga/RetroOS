@@ -1100,7 +1100,11 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         return;
     }
 
+    let epp = entries_per_page::<E>();
     let new_phys = if idx >= PAGE_TABLE_BASE_IDX {
+        let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
+        debug_assert!(child_base + epp <= NUM_PAGES,
+            "cow_entry: idx {:#x} is not a non-leaf recursive entry", idx);
         share_and_copy(entries, idx).expect("Out of memory during COW")
     } else {
         // Leaf: copy from user VA (still maps old page during copy)
@@ -1311,18 +1315,41 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
 
 /// Set A20 gate state for VM86 mode.
 /// When disabled (default): virtual 0x100000-0x10FFFF → physical 0x00000-0x0FFFF (wrap)
-/// When enabled: virtual 0x100000-0x10FFFF → physical 0x100000-0x10FFFF (linear)
-pub fn set_a20(enabled: bool) {
+/// When enabled: virtual 0x100000-0x10FFFF → the thread's saved HMA mappings.
+pub fn set_a20(enabled: bool, hma: &mut [Entry64; crate::vm86::HMA_PAGE_COUNT]) {
     match entries() {
-        Entries::E32(e) => set_a20_generic(e, enabled),
-        Entries::E64(e) => set_a20_generic(e, enabled),
+        Entries::E32(e) => set_a20_generic_32(e, enabled, hma),
+        Entries::E64(e) => set_a20_generic_64(e, enabled, hma),
     }
 }
 
-fn set_a20_generic<E: Entry>(entries: &mut [E], enabled: bool) {
+fn set_a20_generic_64(entries: &mut [Entry64], enabled: bool, hma: &mut [Entry64; crate::vm86::HMA_PAGE_COUNT]) {
     for i in 0..16usize {
-        let phys = if enabled { 0x100 + i } else { i };
-        entries[0x100 + i] = E::new(phys as u64, true, true);
+        let idx = 0x100 + i;
+        if enabled {
+            entries[idx] = hma[i];
+        } else {
+            hma[i] = entries[idx];
+            entries[idx] = Entry64::new(i as u64, true, true);
+        }
+    }
+    flush_tlb();
+}
+
+fn set_a20_generic_32(entries: &mut [Entry32], enabled: bool, hma: &mut [Entry64; crate::vm86::HMA_PAGE_COUNT]) {
+    for i in 0..16usize {
+        let idx = 0x100 + i;
+        if enabled {
+            let saved = hma[i];
+            let mut e = Entry32::new(saved.page(), saved.hw_writable(), saved.user());
+            e.set_writable(saved.writable());
+            entries[idx] = e;
+        } else {
+            let mut saved = Entry64::new(entries[idx].page(), entries[idx].hw_writable(), entries[idx].user());
+            saved.set_writable(entries[idx].writable());
+            hma[i] = saved;
+            entries[idx] = Entry32::new(i as u64, true, true);
+        }
     }
     flush_tlb();
 }
@@ -1445,11 +1472,13 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     // .text: read-only, executable (no NX)
     for i in text_start_page..text_end_page {
         entries[i].set_hw_writable(false);
+        entries[i].set_writable(false);
     }
 
     // .rodata: read-only, non-executable
     for i in text_end_page..rodata_end_page {
         entries[i].set_hw_writable(false);
+        entries[i].set_writable(false);
         entries[i].set_no_execute(true);
     }
 

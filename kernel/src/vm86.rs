@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use crate::paging2::{Entry, Entry64};
 use crate::thread;
 use crate::vga;
 use crate::dbg_println;
@@ -39,7 +40,42 @@ const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer (top of 64KB segment)
 const COM_SP: u16 = 0xFFFE;
 
+pub const HMA_PAGE_COUNT: usize = 16;
 
+/// Per-thread VM86 state.
+pub struct Vm86State {
+    pub vif: bool,
+    pub a20_enabled: bool,
+    pub dta: u32,
+    pub heap_seg: u16,
+    pub vpic: VirtualPic,
+    pub vkbd: VirtualKeyboard,
+    pub exec_parent: Option<ExecParent>,
+    pub skip_irq: bool,
+    pub xms: Option<alloc::boxed::Box<XmsState>>,
+    pub ems: Option<alloc::boxed::Box<EmsState>>,
+    pub hma_pages: [Entry64; HMA_PAGE_COUNT],
+}
+
+impl Vm86State {
+    pub fn new() -> Self {
+        let zero_page = crate::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
+        let zero_entry = Entry64::new(zero_page, false, true);
+        Self {
+            vif: true,
+            a20_enabled: false,
+            dta: 0,
+            heap_seg: 0xA000,
+            vpic: VirtualPic::new(),
+            vkbd: VirtualKeyboard::new(),
+            exec_parent: None,
+            skip_irq: false,
+            xms: None,
+            ems: None,
+            hma_pages: [zero_entry; HMA_PAGE_COUNT],
+        }
+    }
+}
 
 // ============================================================================
 // Virtual hardware — per-thread PIC and keyboard emulation
@@ -59,6 +95,11 @@ pub struct VirtualPic {
 impl VirtualPic {
     pub const fn new() -> Self {
         Self { isr: 0, imr: 0, queue: [0; VPIC_QUEUE_SIZE], head: 0, tail: 0 }
+    }
+
+    /// Check if there are pending interrupt vectors in the queue.
+    pub fn has_pending(&self) -> bool {
+        self.head != self.tail
     }
 
     /// Non-specific EOI: clear highest-priority (lowest-numbered) in-service bit
@@ -160,8 +201,9 @@ impl VirtualKeyboard {
         true
     }
 
-    /// Read port 0x60 — returns latched scancode (idempotent, like real 8042)
-    pub fn read_port60(&self) -> u8 {
+    /// Read port 0x60 — returns latched scancode and clears OBF (like real 8042)
+    pub fn read_port60(&mut self) -> u8 {
+        self.obf = false;
         self.port60
     }
 
@@ -530,17 +572,17 @@ fn emulate_inb(port: u16) -> Result<u8, Action> {
         // VGA ports — pass through to hardware (including 0x3DA retrace register)
         0x3C0..=0x3DF => Ok(crate::x86::inb(port)),
         // Master PIC command (read ISR)
-        0x20 => Ok(thread::current().vpic.isr),
+        0x20 => Ok(thread::current().vm86.vpic.isr),
         // Master PIC data (read IMR)
-        0x21 => Ok(thread::current().vpic.imr),
+        0x21 => Ok(thread::current().vm86.vpic.imr),
         // Keyboard data port — returns latched scancode (like real 8042 output buffer)
         0x60 => {
-            let sc = thread::current().vkbd.read_port60();
+            let sc = thread::current().vm86.vkbd.read_port60();
             if sc != 0 { dbg_println!("KBD: port 0x60 read -> {:02X}", sc); }
             Ok(sc)
         }
         // Keyboard status port (bit 0 = output buffer full)
-        0x64 => Ok(if thread::current().vkbd.has_data() { 1 } else { 0 }),
+        0x64 => Ok(if thread::current().vm86.vkbd.has_data() { 1 } else { 0 }),
         // PIT counter reads — pass through so timing loops see a changing value
         0x40..=0x42 => Ok(crate::x86::inb(port)),
         // PIT command register not readable
@@ -564,16 +606,16 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
                 // Non-specific EOI
                 let t = thread::current();
                 // If keyboard IRQ (bit 1) was in service, clear output buffer flag
-                if t.vpic.isr & 0x02 != 0 {
-                    t.vkbd.obf = false;
+                if t.vm86.vpic.isr & 0x02 != 0 {
+                    t.vm86.vkbd.obf = false;
                 }
-                t.vpic.eoi();
+                t.vm86.vpic.eoi();
             }
             Ok(())
         }
         // Master PIC data (write IMR)
         0x21 => {
-            thread::current().vpic.imr = val;
+            thread::current().vm86.vpic.imr = val;
             Ok(())
         }
         // Slave PIC command
@@ -625,63 +667,66 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
         }
     }
 
+    // Buffer discrete events (keyboard). Timer ticks are pumped separately in traps.rs.
     use crate::irq::Irq;
     if let Some(e) = event {
         match e {
-            Irq::Key(sc) => { thread.vkbd.push(sc); thread.vpic.push(0x09); }
-            Irq::Tick => { thread.vpic.push(0x08); }
+            Irq::Key(sc) => {
+                dbg_println!("KEY: sc={:02X} vif={} isr={:02X}", sc, thread.vm86.vif, thread.vm86.vpic.isr);
+                thread.vm86.vkbd.push(sc);
+                thread.vm86.vpic.push(0x09);
+            }
+            Irq::Tick => {} // handled via take_pending_ticks() in traps.rs
         }
     }
-    if !thread.vm86_vif {
-        static mut VIF_SKIP: u32 = 0;
-        unsafe { let p = &raw mut VIF_SKIP; *p += 1;
-            if *p % 10000 == 0 { dbg_println!("IRQ: VIF=0 skip #{}, isr={:02X}", *p, thread.vpic.isr); }
+    if !thread.vm86.vif {
+        // Set VIP (Virtual Interrupt Pending) when interrupts are queued.
+        // With VME: CPU will #GP on next STI, giving us a chance to deliver.
+        // Without VME: VIP is informational but harmless.
+        if thread.vm86.vpic.has_pending() {
+            unsafe { regs.frame.f32.eflags |= 1 << 20; } // VIP flag
         }
         return;
     }
     // Don't deliver while a handler is in service — prevents nesting into
     // non-reentrant BIOS code (e.g. new timer IRQ injected inside keyboard handler
     // after STI). Pending IRQs stay queued until all handlers EOI.
-    if thread.vpic.isr != 0 {
-        static mut ISR_SKIP: u32 = 0;
-        unsafe { let p = &raw mut ISR_SKIP; *p += 1;
-            if *p % 10000 == 0 { dbg_println!("IRQ: ISR={:02X} skip #{}", thread.vpic.isr, *p); }
-        }
-        return;
-    }
+    if thread.vm86.vpic.isr != 0 { return; }
     // Deliver only ONE interrupt at a time to avoid overflowing small DOS stacks
     // (e.g. Prince of Persia SP=0x0080). Remaining events stay queued in vpic
     // and get delivered on subsequent traps after the handler EOIs.
-    let vec = match thread.vpic.pop() {
+    let vec = match thread.vm86.vpic.pop() {
         Some(v) => v,
         None => return,
     };
     // For keyboard IRQ (INT 9): latch scancode into port 0x60 before reflecting
     if vec == 0x09 {
-        if !thread.vkbd.latch() {
+        if !thread.vm86.vkbd.latch() {
             // No scancode available — spurious INT 9, drop it
             return;
         }
     }
     let irq_num = vec.wrapping_sub(8);
     if irq_num < 8 {
-        thread.vpic.isr |= 1 << irq_num;
+        thread.vm86.vpic.isr |= 1 << irq_num;
     }
+    // Clear VIP — we're delivering now
+    unsafe { regs.frame.f32.eflags &= !(1 << 20); }
     let saved_if = sync_vif(thread, regs);
     reflect_interrupt(regs, vec);
     restore_vif(thread, regs, saved_if);
 }
 
 /// Map VIF into EFLAGS.IF so handlers/reflect work with IF naturally.
-/// Reads VIF from hardware (VME) or thread.vm86_vif (software).
+/// Reads VIF from hardware (VME) or thread.vm86.vif (software).
 /// Returns the saved real IF value for restore_vif.
 fn sync_vif(thread: &mut thread::Thread, regs: &mut Regs) -> u32 {
     unsafe {
         let saved_if = regs.frame.f32.eflags & IF_FLAG;
         if vme_active() {
-            thread.vm86_vif = regs.frame.f32.eflags & VIF_FLAG != 0;
+            thread.vm86.vif = regs.frame.f32.eflags & VIF_FLAG != 0;
         }
-        if thread.vm86_vif { regs.frame.f32.eflags |= IF_FLAG; }
+        if thread.vm86.vif { regs.frame.f32.eflags |= IF_FLAG; }
         else { regs.frame.f32.eflags &= !IF_FLAG; }
         saved_if
     }
@@ -691,9 +736,9 @@ fn sync_vif(thread: &mut thread::Thread, regs: &mut Regs) -> u32 {
 /// Writes VIF back to hardware (VME) if active.
 fn restore_vif(thread: &mut thread::Thread, regs: &mut Regs, saved_if: u32) {
     unsafe {
-        thread.vm86_vif = regs.frame.f32.eflags & IF_FLAG != 0;
+        thread.vm86.vif = regs.frame.f32.eflags & IF_FLAG != 0;
         if vme_active() {
-            if thread.vm86_vif { regs.frame.f32.eflags |= VIF_FLAG; }
+            if thread.vm86.vif { regs.frame.f32.eflags |= VIF_FLAG; }
             else { regs.frame.f32.eflags &= !VIF_FLAG; }
         }
         regs.frame.f32.eflags = (regs.frame.f32.eflags & !IF_FLAG) | saved_if;
@@ -953,52 +998,6 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         // IN AL, DX (0xEC)
         0xEC => {
             let port = regs.rdx as u16;
-            // Log first 50 unique CS:IP locations reading 0x3DA
-            if port == 0x3DA {
-                static mut READ_CTR: u32 = 0;
-                static mut SEEN: [(u16, u16); 50] = [(0, 0); 50];
-                static mut SEEN_COUNT: [(u16, u16, u32); 50] = [(0, 0, 0); 50];
-                static mut N_SEEN: usize = 0;
-                unsafe {
-                    let p = &raw mut READ_CTR; *p += 1;
-                    let cs = regs.frame.f32.cs as u16;
-                    let ip = regs.frame.f32.eip as u16;
-                    let n = *(&raw const N_SEEN);
-                    let mut found = false;
-                    for i in 0..n {
-                        if (*(&raw const SEEN_COUNT))[i].0 == cs && (*(&raw const SEEN_COUNT))[i].1 == ip {
-                            (*(&raw mut SEEN_COUNT))[i].2 += 1;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found && n < 50 {
-                        (*(&raw mut SEEN_COUNT))[n] = (cs, ip, 1);
-                        *(&raw mut N_SEEN) = n + 1;
-                        // Dump code for each new caller
-                        let base = ((cs as u32) << 4).wrapping_add(ip as u32).saturating_sub(8);
-                        let code = core::slice::from_raw_parts(base as *const u8, 32);
-                        dbg_println!("3DA: new caller #{} CS:IP={:04X}:{:04X} code:", n, cs, ip);
-                        for row in 0..2 {
-                            let o = row * 16;
-                            dbg_println!("  {:05X}: {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
-                                base as usize + o,
-                                code[o], code[o+1], code[o+2], code[o+3],
-                                code[o+4], code[o+5], code[o+6], code[o+7],
-                                code[o+8], code[o+9], code[o+10], code[o+11],
-                                code[o+12], code[o+13], code[o+14], code[o+15]);
-                        }
-                    }
-                    // Every 100k reads, print summary
-                    if *(&raw const READ_CTR) % 100000 == 0 {
-                        dbg_println!("3DA: {} total reads, {} callers:", *(&raw const READ_CTR), n);
-                        for i in 0..n {
-                            let s = (*(&raw const SEEN_COUNT))[i];
-                            dbg_println!("  {:04X}:{:04X} = {} reads", s.0, s.1, s.2);
-                        }
-                    }
-                }
-            }
             let val = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
             regs.rax = (regs.rax & !0xFF) | val as u64;
             Action::Done
@@ -1176,7 +1175,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
         0x20 => {
             // INT 20h — DOS program terminate
             // If we're in an EXEC'd child, return to parent instead of killing thread
-            if let Some(parent) = thread::current().vm86_exec_parent.take() {
+            if let Some(parent) = thread::current().vm86.exec_parent.take() {
                 return exec_return(regs, &parent);
             }
             match thread::exit_thread(0) {
@@ -1215,7 +1214,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
                         crate::vfs::read_raw(fd, &mut buf);
                         crate::vfs::close(fd);
 
-                        let child_seg = thread::current().vm86_heap_seg;
+                        let child_seg = thread::current().vm86.heap_seg;
                         let parent_ss = unsafe { regs.frame.f32.ss };
                         let parent_sp = unsafe { regs.frame.f32.esp };
                         let parent_cs = unsafe { regs.frame.f32.cs };
@@ -1226,7 +1225,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
                         let (cs, ip, ss, sp) = load_com_child(&buf, child_seg);
                         // Advance heap past child (64K for COM)
                         let t = thread::current();
-                        t.vm86_heap_seg = child_seg.wrapping_add(0x1000).max(t.vm86_heap_seg);
+                        t.vm86.heap_seg = child_seg.wrapping_add(0x1000).max(t.vm86.heap_seg);
                         unsafe {
                             regs.frame.f32.cs = cs as u32;
                             regs.frame.f32.eip = ip as u32;
@@ -1237,7 +1236,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
                         regs.es = child_seg as u64;
 
                         let t = thread::current();
-                        t.vm86_exec_parent = Some(ExecParent {
+                        t.vm86.exec_parent = Some(ExecParent {
                             ss: parent_ss as u16,
                             sp: parent_sp as u16,
                             cs: parent_cs as u16,
@@ -1368,12 +1367,12 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x1A => {
             // Store DTA address — NC needs this for FindFirst/FindNext
             let dta = ((regs.ds as u32) << 4) + regs.rdx as u32;
-            thread::current().vm86_dta = dta;
+            thread::current().vm86.dta = dta;
             Action::Done
         }
         // AH=0x2F: Get DTA address (returns ES:BX)
         0x2F => {
-            let dta = thread::current().vm86_dta;
+            let dta = thread::current().vm86.dta;
             regs.es = (dta >> 4) as u64;
             regs.rbx = (regs.rbx & !0xFFFF) | (dta & 0x0F) as u64;
             Action::Done
@@ -1530,7 +1529,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x4F: Find next matching file
         0x4F => {
             // Read the stored search index from DTA reserved bytes
-            let dta = thread::current().vm86_dta as *const u8;
+            let dta = thread::current().vm86.dta as *const u8;
             let pat_len = unsafe { *dta } as usize;
             let search_idx = unsafe { (dta.add(1) as *const u16).read_unaligned() } as usize;
             let mut pat = [0u8; 64];
@@ -1543,7 +1542,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x4C: Terminate with return code (AL)
         0x4C => {
             // If we're in an EXEC'd child, return to parent
-            if let Some(parent) = thread::current().vm86_exec_parent.take() {
+            if let Some(parent) = thread::current().vm86.exec_parent.take() {
                 return exec_return(regs, &parent);
             }
             let code = regs.rax as u8;
@@ -1556,18 +1555,18 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x48 => {
             let need = regs.rbx as u16;
             let t = thread::current();
-            let avail = 0xA000u16.saturating_sub(t.vm86_heap_seg);
+            let avail = 0xA000u16.saturating_sub(t.vm86.heap_seg);
             if need <= avail {
-                let seg = t.vm86_heap_seg;
-                t.vm86_heap_seg += need;
+                let seg = t.vm86.heap_seg;
+                t.vm86.heap_seg += need;
                 regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                 unsafe { regs.frame.f32.eflags &= !1; }
-                dbg_println!("  alloc {} para → seg {:04X} (heap now {:04X})", need, seg, t.vm86_heap_seg);
+                dbg_println!("  alloc {} para → seg {:04X} (heap now {:04X})", need, seg, t.vm86.heap_seg);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
                 regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
                 unsafe { regs.frame.f32.eflags |= 1; }
-                dbg_println!("  alloc FAIL: need {} avail {} heap={:04X}", need, avail, t.vm86_heap_seg);
+                dbg_println!("  alloc FAIL: need {} avail {} heap={:04X}", need, avail, t.vm86.heap_seg);
             }
             Action::Done
         }
@@ -1583,7 +1582,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             let new_end = es.wrapping_add(regs.rbx as u16);
             if new_end <= 0xA000 {
                 // Program resizing its block — free memory starts after it
-                thread::current().vm86_heap_seg = new_end;
+                thread::current().vm86.heap_seg = new_end;
                 unsafe { regs.frame.f32.eflags &= !1; }
             } else {
                 // Not enough memory — report max available
@@ -1881,10 +1880,10 @@ fn int_2fh(regs: &mut Regs) -> Action {
 /// Ensure XMS state exists for current thread, return mutable reference
 fn xms_state() -> &'static mut XmsState {
     let t = thread::current();
-    if t.vm86_xms.is_none() {
-        t.vm86_xms = Some(alloc::boxed::Box::new(XmsState::new()));
+    if t.vm86.xms.is_none() {
+        t.vm86.xms = Some(alloc::boxed::Box::new(XmsState::new()));
     }
-    t.vm86_xms.as_deref_mut().unwrap()
+    t.vm86.xms.as_deref_mut().unwrap()
 }
 
 fn xms_dispatch(regs: &mut Regs) -> Action {
@@ -1901,8 +1900,8 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         0x03 => {
             let xms = xms_state();
             xms.a20_global += 1;
-            crate::paging2::set_a20(true);
-            thread::current().vm86_a20 = true;
+            crate::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
+            thread::current().vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
             regs.rbx = (regs.rbx & !0xFFFF); // BL=0 no error
         }
@@ -1911,8 +1910,8 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             let xms = xms_state();
             xms.a20_global = xms.a20_global.saturating_sub(1);
             if xms.a20_global == 0 && xms.a20_local == 0 {
-                crate::paging2::set_a20(false);
-                thread::current().vm86_a20 = false;
+                crate::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
+                thread::current().vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
@@ -1921,8 +1920,8 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         0x05 => {
             let xms = xms_state();
             xms.a20_local += 1;
-            crate::paging2::set_a20(true);
-            thread::current().vm86_a20 = true;
+            crate::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
+            thread::current().vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
@@ -1931,15 +1930,15 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             let xms = xms_state();
             xms.a20_local = xms.a20_local.saturating_sub(1);
             if xms.a20_local == 0 && xms.a20_global == 0 {
-                crate::paging2::set_a20(false);
-                thread::current().vm86_a20 = false;
+                crate::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
+                thread::current().vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
         // AH=07h — Query A20 state
         0x07 => {
-            let enabled = thread::current().vm86_a20;
+            let enabled = thread::current().vm86.a20_enabled;
             regs.rax = (regs.rax & !0xFFFF) | if enabled { 1 } else { 0 };
             regs.rbx = (regs.rbx & !0xFFFF);
         }
@@ -2230,10 +2229,10 @@ fn xms_move(regs: &mut Regs) {
 /// Ensure EMS state exists for current thread
 fn ems_state() -> &'static mut EmsState {
     let t = thread::current();
-    if t.vm86_ems.is_none() {
-        t.vm86_ems = Some(alloc::boxed::Box::new(EmsState::new()));
+    if t.vm86.ems.is_none() {
+        t.vm86.ems = Some(alloc::boxed::Box::new(EmsState::new()));
     }
-    t.vm86_ems.as_deref_mut().unwrap()
+    t.vm86.ems.as_deref_mut().unwrap()
 }
 
 fn int_67h(regs: &mut Regs) -> Action {
@@ -2731,10 +2730,10 @@ fn exec_program(regs: &mut Regs) -> Action {
     // Inherit cwd from parent
     child.cwd = current.cwd;
     child.cwd_len = current.cwd_len;
-    child.vm86_skip_irq = true;
+    child.vm86.skip_irq = true;
     // setup_psp/load_exe set these on current() (parent) — copy to child
-    child.vm86_dta = current.vm86_dta;
-    child.vm86_heap_seg = current.vm86_heap_seg;
+    child.vm86.dta = current.vm86.dta;
+    child.vm86.heap_seg = current.vm86.heap_seg;
 
     // Block parent until child exits. Clear carry for when parent resumes.
     current.state = thread::ThreadState::Blocked;
@@ -2872,8 +2871,8 @@ fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Ac
                 idx += 1;
                 let name = &entry.name[..entry.name_len];
                 if dos_wildcard_match(pat, name) {
-                    // Fill DTA at thread.vm86_dta
-                    let dta = thread::current().vm86_dta;
+                    // Fill DTA at thread.vm86.dta
+                    let dta = thread::current().vm86.dta;
                     // DTA layout (43 bytes):
                     //   0x00: reserved for FindNext (we store pattern_len + search_index + pattern)
                     //   0x15: attribute of matched file
@@ -3005,7 +3004,7 @@ fn map_psp() {
     paging2::map_user_page(PSP_PAGE, &psp);
 
     // Default DTA is at PSP:0080h (linear = COM_SEGMENT*16 + 0x80)
-    crate::thread::current().vm86_dta = (COM_SEGMENT as u32) * 16 + 0x80;
+    crate::thread::current().vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;
 }
 
 /// Check if data starts with the MZ signature.
@@ -3024,7 +3023,7 @@ pub fn is_mz_exe(data: &[u8]) -> bool {
 pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
     map_psp();
     // COM gets full 64K segment
-    thread::current().vm86_heap_seg = COM_SEGMENT.wrapping_add(0x1000);
+    thread::current().vm86.heap_seg = COM_SEGMENT.wrapping_add(0x1000);
 
     // Copy .COM data at offset 0x100
     let base = (COM_SEGMENT as u32) << 4;
@@ -3094,7 +3093,7 @@ pub fn load_exe(data: &[u8]) -> Option<(u16, u16, u16, u16)> {
     // Set initial heap past the loaded program (PSP + load image + min extra/BSS)
     let load_paras = ((load_size as u32 + 15) / 16) as u16;
     let end_seg = load_segment.wrapping_add(load_paras).wrapping_add(min_extra as u16);
-    thread::current().vm86_heap_seg = end_seg;
+    thread::current().vm86.heap_seg = end_seg;
 
     // Copy load module
     let load_base = (load_segment as u32) << 4;

@@ -3,6 +3,251 @@
 A single 32-bit kernel binary that runs DOS, 32-bit, and 64-bit programs
 on any x86 from a 386 to a modern x86-64 processor.
 
+## Arch and ring-1 kernel
+
+RetroOS is split into two layers with hardware-enforced isolation:
+
+- **arch**: ring-0 supervisor (~2MB code/data)
+- **kernel**: ring-1 OS kernel with event loop
+
+`arch` is intentionally small. It does not implement OS policy. Its job is
+to abstract the real machine into a simpler idealized computer for the
+`kernel`.
+
+The `kernel` owns everything that gives the system meaning:
+
+- scheduling policy
+- process and thread abstractions
+- filesystems
+- ELF loading
+- DOS/VM86 runtime
+- device policy and higher-level drivers
+- shell/init/session management
+
+The guiding rule is:
+
+- if it requires privilege or isolation, it belongs in `arch`
+- if it is policy, interpretation, or emulation, it belongs in `kernel`
+
+## Privilege model
+
+RetroOS uses three of the four x86 privilege rings:
+
+| Ring | Role | Paging | Privileged insns | Segment limits |
+|------|------|--------|-----------------|----------------|
+| 0 | arch | supervisor (U/S=0) | yes | flat (full access) |
+| 1 | kernel | supervisor (U/S=0) | no | wrapped (arch region excluded) |
+| 3 | user | user (U/S=1) | no | flat |
+
+Ring 1 is supervisor for paging purposes — it can access U/S=0 pages. But
+x86 segment limits with 32-bit wrapping exclude the arch/page-table region
+from ring-1 access, providing full hardware isolation between arch and
+kernel.
+
+This is the x86 protection model used as Intel originally intended:
+paging for user/supervisor isolation, rings for privilege separation,
+and segments for fine-grained memory partitioning between rings.
+
+### Segment-based arch isolation
+
+The ring-1 code and data segments use base/limit wrapping to punch a hole
+in the address space:
+
+```
+Ring-1 CS/DS: base = 0xC0C0_0000, limit = 0xFF3F_FFFF
+
+Accessible (wraps around 4GB):
+  0xC0C0_0000 → 0xFFFF_FFFF  (kernel high region)
+  0x0000_0000 → 0xBFFF_FFFF  (user space)
+
+Excluded (#GP on access):
+  0xC000_0000 → 0xC0BF_FFFF  (page tables + arch)
+```
+
+Ring-0 arch uses flat segments (base=0, limit=4GB) for full access.
+The segment swap happens automatically on ring transitions — interrupt
+from ring 1 loads ring-0 SS from TSS (flat), IRET back restores
+ring-1 SS (wrapped).
+
+User pointer translation: since the ring-1 data segment has a non-zero
+base, user pointers from `Regs` (which are raw `u64` values, not Rust
+pointers) must be translated via a single function:
+
+```rust
+fn user_ptr<T>(addr: u32) -> *const T {
+    addr.wrapping_sub(SEGMENT_BASE) as *const T
+}
+```
+
+## Interrupt dispatch
+
+All interrupts and exceptions enter ring 0 via the IDT. `arch` inspects
+the saved CS RPL to determine the source:
+
+- **Ring 3 → ring 0**: user event. Package as `Event` (syscall, fault,
+  IRQ), IRET to ring-1 kernel for handling.
+- **Ring 1 → ring 0**: kernel arch call. Handle the primitive directly
+  (`map`, `fork`, `clean_low`, `activate`, `execute`), IRET back to ring 1.
+
+Same IDT entry, same INT vector. The CS RPL in the saved frame
+distinguishes the two cases. No call gates needed.
+
+This works because INT/IRET round-trips correctly between any two
+privilege levels. Unlike SYSCALL/SYSRET or SYSENTER/SYSEXIT (which
+always return to ring 3), INT/IRET returns to whatever ring the caller
+was in.
+
+## Event loop
+
+The `kernel` is an event loop:
+
+1. pick a runnable task
+2. `activate(task.as)` — INT to arch, sets address space, IRET back
+3. `event = execute(&mut task.state)` — INT to arch, IRET to user,
+   user runs until interrupt, arch packages event, IRET back to kernel
+4. handle the event
+5. repeat
+
+`arch` does not own scheduler policy. It only resumes execution and
+reports why execution stopped.
+
+Threads are a kernel concept, not an `arch` concept. From the `arch`
+point of view, there are only:
+
+- address spaces
+- saved CPU states
+- events returned from `execute`
+
+## Memory layout
+
+### Virtual address map
+
+```
+0x0000_0000 - 0x0000_FFFF  Null guard (unmapped)
+0x0001_0000 - 0xBFFF_FFFF  User space (~3 GB)
+0xC000_0000 - 0xC0BF_FFFF  Supervisor-only (12 MB, ring-1 excluded by segments)
+0xC0C0_0000 - 0xFFFF_FFFF  Kernel (~1012 MB, ring-1 accessible)
+```
+
+### Root page as PD (through recursive mapping)
+
+The root page table (PD for legacy, PDPT for PAE/compat) has a recursive
+entry that makes itself appear as the page directory for the high region.
+Each entry acts as a PD entry covering 4MB (legacy) or 2MB (PAE/compat):
+
+**PAE/Compat layout** (PDPT entries as PD entries, 2MB each):
+
+| Entry | Address       | U/S | Purpose                          |
+|-------|---------------|-----|----------------------------------|
+| [0]   | `0xC000_0000` | 0   | PT entries for user 0-1GB        |
+| [1]   | `0xC020_0000` | 0   | PT entries for user 1-2GB        |
+| [2]   | `0xC040_0000` | 0   | PT entries for user 2-3GB        |
+| [3]   | `0xC060_0000` | 0   | Recursive (PD entries themselves) |
+| [4]   | `0xC080_0000` | 0   | PML4 (compat only)               |
+| [5]   | `0xC0A0_0000` | 0   | arch code/data                   |
+| [6+]  | `0xC0C0_0000` | 1   | kernel                           |
+
+**Legacy layout** (PD entries, 4MB each):
+
+| Entry | Address       | U/S | Purpose                    |
+|-------|---------------|-----|----------------------------|
+| [768] | `0xC000_0000` | 0   | Recursive (page tables)    |
+| [769] | `0xC040_0000` | 0   | (reserved)                 |
+| [770] | `0xC080_0000` | 0   | arch code/data             |
+| [771+]| `0xC0C0_0000` | 1   | kernel                     |
+
+The kernel starts at `0xC0C0_0000` in all modes. U/S=0 entries are
+supervisor-only; U/S=1 entries are the ring-1 kernel. The segment limits
+provide the actual isolation between ring-1 kernel and the arch/page-table
+region — paging U/S is defense in depth against ring-3 user processes.
+
+## Minimal arch interface
+
+`arch` only needs a very small set of primitives, invoked by the ring-1
+kernel via INT:
+
+- **fork() -> as**
+  Clone the current address space using shared/refcounted mappings.
+- **clean_low(as)**
+  Remove all low-region mappings from an address space while preserving the
+  high kernel mapping.
+- **map(as, ...)**
+  Map memory into the low region of an address space.
+- **activate(as)**
+  Install an address space's low region beneath the high kernel mapping.
+  This changes memory visibility but does not execute.
+- **execute(state) -> event**
+  Run the CPU using the currently active address space until something
+  interesting happens, then return updated CPU state and an event.
+
+This is the core idea: every entry into `arch` from ring 3 is reflected
+as a return from `execute` to ring 1.
+
+Typical events are:
+
+- syscall
+- irq
+- page fault
+- protection fault
+- vm86 trap
+- halt
+- yield
+- exit
+
+`arch` captures these events but does not interpret them beyond what is
+required for safety.
+
+## Refcounted address spaces
+
+`arch` refcounts physical pages and page-table structures.
+
+This makes lifecycle operations simple:
+
+- **fork**
+  `fork()` creates a child address space sharing pages with the parent.
+- **spawn fresh process**
+  `fork()` followed by `clean_low()` gives a fresh low address space with the
+  high kernel mapping intact.
+- **exec**
+  `clean_low()` followed by `map(...)` replaces the current process image.
+- **exit**
+  `clean_low()` drops all user mappings; refcounting frees pages whose count
+  reaches zero.
+
+In other words, `arch` is responsible for backing memory safely, while the
+`kernel` decides what those address spaces mean.
+
+## VM86 as just another execution mode
+
+VM86 is not a special in-kernel subsystem. It is just another saved CPU mode
+handled by `execute()`.
+
+The `kernel` can build a DOS machine by:
+
+- creating or reusing an address space
+- `clean_low()` on it
+- mapping the first 1 MiB of DOS-visible memory
+- loading PSP, IVT, BIOS-visible state, and program image
+- calling `execute()` with VM86 state
+
+If 16-bit execution stops for a privileged reason, `execute()` returns a
+`vm86 trap` event. The `kernel` then decides what that means:
+
+- DOS interrupt emulation
+- BIOS-facing policy
+- virtual PIC/PIT/keyboard state
+- IRQ reflection by editing guest stack/registers
+- DOS `EXEC` and parent/child semantics
+
+This keeps VM86 mechanism in `arch` and DOS policy in the `kernel`.
+
+### Mode toggling for VM86
+
+VM86 requires PAE mode (cannot IRET to VM86 from long mode). On x86-64
+CPUs, `arch` toggles from compat to PAE before executing a VM86 task, and
+toggles back afterward. This toggle only happens on actual mode switches
+(not on every timer tick while the same VM86 task is running).
+
 ## One binary, all x86 generations
 
 The kernel is compiled once as a 32-bit ELF. At boot, it detects the CPU
@@ -37,7 +282,7 @@ These formulas are the same for 2-level, 3-level, and 4-level paging.
 Only `epp` differs (1024 for 32-bit entries, 512 for 64-bit entries).
 
 There is no page table walk code anywhere in the kernel. The CPU performs
-the walk implicitly when the kernel accesses `entries[i]` — the recursive
+the walk implicitly when `arch` accesses `entries[i]` — the recursive
 mapping *is* the walk. Every paging operation reduces to array indexing:
 
 - **Map a page**: `entries[page_idx] = phys | flags`
@@ -91,7 +336,7 @@ to compat mode, IRET to the 64-bit process, and toggle back on interrupt.
 
 ## Unified interrupt handling across modes
 
-The kernel handles interrupts from 16-bit (VM86), 32-bit, and 64-bit
+`arch` handles interrupts from 16-bit (VM86), 32-bit, and 64-bit
 userspace through a single Rust handler. The assembly entry point normalizes
 the register save area:
 
@@ -103,21 +348,10 @@ Both produce an identical `Regs` layout. The Rust interrupt handler sees one
 type regardless of origin mode. After handling, `exit_kernel` dispatches to
 the right return path (IRET for 32-bit/VM86, far jump + IRETQ for 64-bit).
 
-## Single exit point
-
-All interrupt and exception handlers return normally with an optional
-context-switch request. Only `isr_handler` calls `switch_to_thread`. This
-means:
-
-- RAII works: Rust destructors run before any context switch
-- One place to drain the IRQ event queue
-- One place to handle VM86 segment swapping
-- Stack traces always unwind through a clean call chain
-
 ## Typed IRQ event queue
 
 Hardware interrupts push typed events (`enum Irq { Tick, Key(u8) }`) into
-a global queue. The queue is drained only when returning to userspace:
+a global queue. The queue is drained when returning to the kernel:
 
 - **VM86 threads**: events are reflected through the IVT as real-mode
   interrupts, with per-thread virtual PIC and keyboard

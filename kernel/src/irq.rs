@@ -37,20 +37,36 @@ impl Irq {
     }
 }
 
-/// Global IRQ event queue. Handlers push here; drained on return to userspace.
+/// Global IRQ event queue for discrete events (keyboard).
+/// Timer ticks use a separate counter to avoid flooding and evicting keys.
 static mut QUEUE: Pipe<Irq, 256> = Pipe::new(Irq::Tick);
 
 /// Timer tick counter (incremented immediately for get_ticks/sleep_ticks)
 static mut TIMER_TICKS: u64 = 0;
+
+/// Pending timer ticks for VM86 delivery (separate from queue to avoid evicting keys)
+static mut PENDING_TICKS: u32 = 0;
 
 /// Drain all queued IRQ events, calling f for each.
 pub fn drain(f: impl FnMut(Irq)) {
     unsafe { (*(&raw mut QUEUE)).drain(f); }
 }
 
+/// Take pending tick count (returns count and resets to 0).
+pub fn take_pending_ticks() -> u32 {
+    unsafe {
+        let t = core::ptr::read_volatile(&raw const PENDING_TICKS);
+        core::ptr::write_volatile(&raw mut PENDING_TICKS, 0);
+        t
+    }
+}
+
 /// Discard all queued IRQ events.
 pub fn drain_discard() {
-    unsafe { (*(&raw mut QUEUE)).clear(); }
+    unsafe {
+        (*(&raw mut QUEUE)).clear();
+        core::ptr::write_volatile(&raw mut PENDING_TICKS, 0);
+    }
 }
 
 // ============================================================================
@@ -126,11 +142,11 @@ fn dump_thread_state(regs: &Regs) {
         let tid = if crate::thread::is_initialized() { crate::thread::current().tid } else { -1 };
         let vm86 = regs.frame.f32.eflags & (1 << 17) != 0;
         if vm86 {
-            let vif = if crate::thread::is_initialized() { crate::thread::current().vm86_vif } else { false };
+            let vif = if crate::thread::is_initialized() { crate::thread::current().vm86.vif } else { false };
             let lin = (regs.frame.f32.cs << 4) + regs.frame.f32.eip;
             let b = core::slice::from_raw_parts(lin as *const u8, 16);
             let ticks = *(0x46Cu32 as *const u32);
-            let isr = if crate::thread::is_initialized() { crate::thread::current().vpic.isr } else { 0 };
+            let isr = if crate::thread::is_initialized() { crate::thread::current().vm86.vpic.isr } else { 0 };
             crate::dbg_println!("[DBG] tid={} VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ISR={:02X} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
                 tid, regs.frame.f32.cs, regs.frame.f32.eip,
                 regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -185,8 +201,10 @@ pub fn handle_irq(regs: &mut Regs) {
             unsafe {
                 let t = core::ptr::read_volatile(&raw const TIMER_TICKS);
                 core::ptr::write_volatile(&raw mut TIMER_TICKS, t + 1);
+                let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
+                core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
             }
-            Some(Irq::Tick)
+            None // ticks use PENDING_TICKS counter, not the queue
         }
         1 => {
             let sc = inb(0x60);
