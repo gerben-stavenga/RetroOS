@@ -5,12 +5,12 @@
 //! - 255 = reserved (never allocatable)
 //! - 1-254 = reference count (for copy-on-write sharing)
 
-use crate::paging2::PAGE_SIZE;
+use crate::arch::paging2::PAGE_SIZE;
 use crate::MMapEntry;
 
 /// Check if a page is the zero page (always shared, never freed)
 pub fn is_zero_page(page: u64) -> bool {
-    page == crate::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize)
+    page == crate::arch::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize)
 }
 
 /// Maximum number of physical pages we track (64K pages = 256MB)

@@ -7,8 +7,8 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
-use crate::paging2::{self, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
-use crate::phys_mm;
+use crate::arch::paging2::{self, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
+use crate::arch::phys_mm;
 
 /// Heap ends before the top of address space
 pub const HEAP_END: usize = 0xFFF0_0000;

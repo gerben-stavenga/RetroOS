@@ -16,13 +16,13 @@
 //! 64-bit ABI: RDI, RSI, RDX, R10, R8 (remapped to canonical layout)
 //! Return value in: EAX
 
-use crate::elf;
-use crate::descriptors;
-use crate::paging2::{self, PAGE_SIZE};
-use crate::stacktrace::SymbolData;
-use crate::startup;
-use crate::thread;
-use crate::vfs;
+use crate::kernel::elf;
+use crate::arch::descriptors;
+use crate::arch::paging2::{self, PAGE_SIZE};
+use crate::kernel::stacktrace::SymbolData;
+use crate::kernel::startup;
+use crate::kernel::thread;
+use crate::kernel::vfs;
 use crate::vga;
 use crate::Regs;
 use crate::{print, println};
@@ -144,7 +144,7 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
     // Free the child's root page table page — init_fork already extracted the
     // PDPT entries into the thread's RootPageTable, so the page itself is no
     // longer needed. Without this, it leaks 1 page per fork.
-    crate::phys_mm::free_phys_page(new_page_dir);
+    crate::arch::phys_mm::free_phys_page(new_page_dir);
 
     // Copy CPU state and mode from parent to child
     child.cpu_state = current.cpu_state;
@@ -278,7 +278,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 /// Execute a DOS program (.COM or .EXE) in VM86 mode.
 /// Returns thread index to switch to.
 fn exec_dos(data: &[u8], is_exe: bool) -> usize {
-    use crate::vm86;
+    use crate::kernel::vm86;
 
     // Free current user pages
     paging2::free_user_pages();
@@ -451,7 +451,7 @@ fn sys_read(regs: &mut Regs) -> SyscallResult {
     if fd == 0 {
         // stdin — read from global keyboard buffer
         let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-        let n = crate::keyboard::read(user_buf);
+        let n = crate::kernel::keyboard::read(user_buf);
         SyscallResult::val(n as i32)
     } else if fd >= 3 {
         let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
@@ -513,7 +513,7 @@ fn sys_chdir(regs: &mut Regs) -> SyscallResult {
 fn sys_getcwd(regs: &mut Regs) -> SyscallResult {
     let ptr = regs.rdx as usize as *mut u8;
     let size = regs.rcx as usize;
-    let cwd = crate::thread::current().cwd_str();
+    let cwd = crate::kernel::thread::current().cwd_str();
     let len = cwd.len().min(size);
     unsafe { core::ptr::copy_nonoverlapping(cwd.as_ptr(), ptr, len); }
     SyscallResult::val(len as i32)

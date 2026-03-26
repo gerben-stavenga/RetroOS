@@ -4,7 +4,7 @@
 //! Thread FD arrays index into this table. FDs 0/1/2 are reserved
 //! for stdin/stdout/stderr and handled directly in syscall handlers.
 
-use crate::startup;
+use crate::kernel::startup;
 
 /// Maximum simultaneous open files system-wide
 const MAX_OPEN_FILES: usize = 64;
@@ -85,7 +85,7 @@ fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
         let mut pos = 0;
         // Only prepend cwd for relative paths (no drive prefix)
         if !has_drive {
-            let cwd = crate::thread::current().cwd_str();
+            let cwd = crate::kernel::thread::current().cwd_str();
             for &b in cwd {
                 if pos < buf.len() { buf[pos] = b; pos += 1; }
             }
@@ -185,7 +185,7 @@ fn entry_in_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 /// Enumerate current directory by index. Returns directories first, then files.
 /// Returns None at end.
 pub fn readdir(index: usize) -> Option<DirEntry> {
-    let cwd = crate::thread::current().cwd_str();
+    let cwd = crate::kernel::thread::current().cwd_str();
 
     // Phase 1: collect unique subdirectory names
     let mut dirs: [[u8; 64]; 32] = [[0; 64]; 32];
@@ -267,7 +267,7 @@ pub fn chdir(path: &[u8]) -> i32 {
 
     // Handle ".." — go up one level
     if stripped == b".." {
-        let t = crate::thread::current();
+        let t = crate::kernel::thread::current();
         let cwd = t.cwd_str();
         if cwd.is_empty() { return 0; } // already at root
         // Remove trailing slash, then find the previous slash
@@ -282,7 +282,7 @@ pub fn chdir(path: &[u8]) -> i32 {
 
     // Handle "\" or "/" — go to root
     if stripped.is_empty() || stripped == b"/" || stripped == b"\\" {
-        let t = crate::thread::current();
+        let t = crate::kernel::thread::current();
         t.cwd_len = 0;
         return 0;
     }
@@ -292,7 +292,7 @@ pub fn chdir(path: &[u8]) -> i32 {
     let mut pos = 0;
 
     // Start from cwd for relative paths
-    let t = crate::thread::current();
+    let t = crate::kernel::thread::current();
     let cwd = t.cwd_str();
     for &b in cwd {
         if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
@@ -376,7 +376,7 @@ pub fn open(path: &[u8]) -> i32 {
         None => return -24, // EMFILE
     };
 
-    let fds = &mut crate::thread::current().fds;
+    let fds = &mut crate::kernel::thread::current().fds;
     let fd = match alloc_fd(fds) {
         Some(f) => f,
         None => return -24, // EMFILE
@@ -396,7 +396,7 @@ pub fn open(path: &[u8]) -> i32 {
 
 /// Read from an open file descriptor. Returns bytes read or negative error.
 pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
-    let fds = &crate::thread::current().fds;
+    let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9; // EBADF
     }
@@ -420,7 +420,7 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
 /// Read entire file contents via fd into a kernel buffer (ignores current offset).
 /// Used by EXEC to load program files.
 pub fn read_raw(fd: i32, buf: &mut [u8]) -> i32 {
-    let fds = &crate::thread::current().fds;
+    let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9;
     }
@@ -437,7 +437,7 @@ pub fn read_raw(fd: i32, buf: &mut [u8]) -> i32 {
 
 /// Close a file descriptor. Returns 0 or negative error.
 pub fn close(fd: i32) -> i32 {
-    let fds = &mut crate::thread::current().fds;
+    let fds = &mut crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9; // EBADF
     }
@@ -459,7 +459,7 @@ pub fn close(fd: i32) -> i32 {
 /// whence: 0=SET, 1=CUR, 2=END
 /// Returns new offset or negative error.
 pub fn seek(fd: i32, offset: i32, whence: i32) -> i32 {
-    let fds = &crate::thread::current().fds;
+    let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9; // EBADF
     }

@@ -14,8 +14,8 @@
 
 extern crate alloc;
 
-use crate::paging2::{Entry, Entry64};
-use crate::thread;
+use crate::arch::paging2::{Entry, Entry64};
+use crate::kernel::thread;
 use crate::vga;
 use crate::dbg_println;
 use crate::Regs;
@@ -29,7 +29,7 @@ const VIF_FLAG: u32 = 1 << 19;
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
 
 fn vme_active() -> bool {
-    crate::x86::read_cr4() & crate::x86::cr4::VME != 0
+    crate::arch::x86::read_cr4() & crate::arch::x86::cr4::VME != 0
 }
 
 
@@ -59,7 +59,7 @@ pub struct Vm86State {
 
 impl Vm86State {
     pub fn new() -> Self {
-        let zero_page = crate::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
+        let zero_page = crate::arch::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
         let zero_entry = Entry64::new(zero_page, false, true);
         Self {
             vif: true,
@@ -447,7 +447,7 @@ fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
                 }
                 unsafe { UMB_ALLOC |= alloc_mask; }
                 let base_page = UMA_BASE + run_start;
-                crate::paging2::map_umb(base_page, pages_needed);
+                crate::arch::paging2::map_umb(base_page, pages_needed);
                 let seg = (base_page as u16) * 0x100; // page to segment
                 let paras = (pages_needed as u16) * 0x100;
                 return Some((seg, paras));
@@ -477,7 +477,7 @@ fn umb_free(segment: u16) -> bool {
     }
     let count = (i - offset) as usize;
     unsafe { UMB_ALLOC &= !mask; }
-    crate::paging2::unmap_umb(page, count);
+    crate::arch::paging2::unmap_umb(page, count);
     true
 }
 
@@ -547,14 +547,14 @@ impl EmsState {
         for w in 0..4 {
             if self.frame[w].is_some() {
                 self.frame[w] = None;
-                crate::paging2::map_ems_window(ems_base_page(), w, None);
+                crate::arch::paging2::map_ems_window(ems_base_page(), w, None);
             }
         }
         for handle in &mut self.handles {
             if let Some(h) = handle.take() {
                 for group in &h.pages {
                     for &p in group {
-                        crate::phys_mm::free_phys_page(p);
+                        crate::arch::phys_mm::free_phys_page(p);
                     }
                 }
             }
@@ -570,7 +570,7 @@ impl EmsState {
 fn emulate_inb(port: u16) -> Result<u8, Action> {
     match port {
         // VGA ports — pass through to hardware (including 0x3DA retrace register)
-        0x3C0..=0x3DF => Ok(crate::x86::inb(port)),
+        0x3C0..=0x3DF => Ok(crate::arch::x86::inb(port)),
         // Master PIC command (read ISR)
         0x20 => Ok(thread::current().vm86.vpic.isr),
         // Master PIC data (read IMR)
@@ -584,7 +584,7 @@ fn emulate_inb(port: u16) -> Result<u8, Action> {
         // Keyboard status port (bit 0 = output buffer full)
         0x64 => Ok(if thread::current().vm86.vkbd.has_data() { 1 } else { 0 }),
         // PIT counter reads — pass through so timing loops see a changing value
-        0x40..=0x42 => Ok(crate::x86::inb(port)),
+        0x40..=0x42 => Ok(crate::arch::x86::inb(port)),
         // PIT command register not readable
         0x43 => Ok(0xFF),
         // Unknown ports: return 0xFF (unpopulated bus)
@@ -597,7 +597,7 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
     match port {
         // VGA ports — pass through to hardware
         0x3C0..=0x3DF => {
-            crate::x86::outb(port, val);
+            crate::arch::x86::outb(port, val);
             Ok(())
         }
         // Master PIC command
@@ -626,7 +626,7 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
         0x64 => Ok(()),
         // PIT command — only allow latch commands (bits 5-4 = 00), block reprogramming
         0x43 => {
-            if val & 0x30 == 0x00 { crate::x86::outb(port, val); }
+            if val & 0x30 == 0x00 { crate::arch::x86::outb(port, val); }
             Ok(())
         }
         // PIT counter data writes — ignore (don't let games reprogram kernel timer)
@@ -644,7 +644,7 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
 ///
 /// Called from outside the monitor (traps.rs drain, switch_to_thread).
 /// EFLAGS.IF may not reflect VIF here, so we map VIF↔IF around reflects.
-pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<crate::irq::Irq>) {
+pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<crate::arch::irq::Irq>) {
     // QEMU VGA bug workaround: real VGA hardware forces Odd/Even read mode
     // (GC5 bit 4) in text modes regardless of the register value. QEMU doesn't,
     // so if a DOS program writes GC5=0x00 (e.g. Keen4 during VGA detection)
@@ -656,19 +656,19 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
         if cs < 0xC000 {
             let mode = *(0x449 as *const u8);
             if mode <= 3 || mode == 7 {
-                let saved_idx = crate::x86::inb(0x3CE);
-                crate::x86::outb(0x3CE, 5);
-                let gc5 = crate::x86::inb(0x3CF);
+                let saved_idx = crate::arch::x86::inb(0x3CE);
+                crate::arch::x86::outb(0x3CE, 5);
+                let gc5 = crate::arch::x86::inb(0x3CF);
                 if gc5 & 0x10 == 0 {
-                    crate::x86::outb(0x3CF, gc5 | 0x10);
+                    crate::arch::x86::outb(0x3CF, gc5 | 0x10);
                 }
-                crate::x86::outb(0x3CE, saved_idx);
+                crate::arch::x86::outb(0x3CE, saved_idx);
             }
         }
     }
 
     // Buffer discrete events (keyboard). Timer ticks are pumped separately in traps.rs.
-    use crate::irq::Irq;
+    use crate::arch::irq::Irq;
     if let Some(e) = event {
         match e {
             Irq::Key(sc) => {
@@ -1167,7 +1167,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
 /// With VME, only INTs whose bit is SET in the redirection bitmap trap here.
 /// Without VME, all INTs trap — unintercepted ones are reflected through IVT.
 fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
-    if !crate::descriptors::int_intercepted(int_num) {
+    if !crate::arch::descriptors::int_intercepted(int_num) {
         reflect_interrupt(regs, int_num);
         return Action::Done;
     }
@@ -1207,12 +1207,12 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
                 dbg_println!("INT 2E: exec {:?}", unsafe { core::str::from_utf8_unchecked(prog) });
                 let fd = dos_open_program(prog);
                 if fd >= 0 {
-                    let size = crate::vfs::seek(fd, 0, 2);
-                    crate::vfs::seek(fd, 0, 0);
+                    let size = crate::kernel::vfs::seek(fd, 0, 2);
+                    crate::kernel::vfs::seek(fd, 0, 0);
                     if size > 0 {
                         let mut buf = alloc::vec![0u8; size as usize];
-                        crate::vfs::read_raw(fd, &mut buf);
-                        crate::vfs::close(fd);
+                        crate::kernel::vfs::read_raw(fd, &mut buf);
+                        crate::kernel::vfs::close(fd);
 
                         let child_seg = thread::current().vm86.heap_seg;
                         let parent_ss = unsafe { regs.frame.f32.ss };
@@ -1246,7 +1246,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
                         });
                         return Action::Done;
                     }
-                    crate::vfs::close(fd);
+                    crate::kernel::vfs::close(fd);
                 }
             }
             // Command not found — just return
@@ -1431,7 +1431,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 path[i] = ch;
                 i += 1;
             }
-            let result = crate::vfs::chdir(&path[..i]);
+            let result = crate::kernel::vfs::chdir(&path[..i]);
             if result < 0 {
                 unsafe { regs.frame.f32.eflags |= 1; } // set CF
                 regs.rax = (regs.rax & !0xFFFF) | 3; // AX=3 path not found
@@ -1460,7 +1460,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 regs.rax = (regs.rax & !0xFFFF) | EMS_DEVICE_HANDLE as u64;
                 unsafe { regs.frame.f32.eflags &= !1; }
             } else {
-                let fd = crate::vfs::open(&name[..i]);
+                let fd = crate::kernel::vfs::open(&name[..i]);
                 if fd >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     unsafe { regs.frame.f32.eflags &= !1; } // clear carry
@@ -1475,7 +1475,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x3E => {
             let handle = regs.rbx as u16;
             if handle != EMS_DEVICE_HANDLE {
-                crate::vfs::close(handle as i32);
+                crate::kernel::vfs::close(handle as i32);
             }
             unsafe { regs.frame.f32.eflags &= !1; }
             Action::Done
@@ -1495,7 +1495,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 unsafe { regs.frame.f32.eflags &= !1; }
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
-                let n = crate::vfs::read(handle, buf);
+                let n = crate::kernel::vfs::read(handle, buf);
                 if n >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     unsafe { regs.frame.f32.eflags &= !1; }
@@ -1677,7 +1677,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             let handle = regs.rbx as i32;
             let offset = ((regs.rcx as u32) << 16 | regs.rdx as u16 as u32) as i32;
             let whence = regs.rax as u8 as i32; // AL = origin
-            let result = crate::vfs::seek(handle, offset, whence);
+            let result = crate::kernel::vfs::seek(handle, offset, whence);
             if result >= 0 {
                 // Return new position in DX:AX
                 regs.rdx = (regs.rdx & !0xFFFF) | ((result as u32 >> 16) as u64);
@@ -1706,9 +1706,9 @@ fn int_21h(regs: &mut Regs) -> Action {
                 i += 1;
             }
             // Check if file exists by trying to open it
-            let fd = crate::vfs::open(&name[..i]);
+            let fd = crate::kernel::vfs::open(&name[..i]);
             if fd >= 0 {
-                crate::vfs::close(fd);
+                crate::kernel::vfs::close(fd);
                 if al == 0 {
                     // Get attributes: return 0x20 (archive) in CX
                     regs.rcx = (regs.rcx & !0xFFFF) | 0x20;
@@ -1900,7 +1900,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         0x03 => {
             let xms = xms_state();
             xms.a20_global += 1;
-            crate::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
+            crate::arch::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
             thread::current().vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
             regs.rbx = (regs.rbx & !0xFFFF); // BL=0 no error
@@ -1910,7 +1910,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             let xms = xms_state();
             xms.a20_global = xms.a20_global.saturating_sub(1);
             if xms.a20_global == 0 && xms.a20_local == 0 {
-                crate::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
+                crate::arch::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
                 thread::current().vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -1920,7 +1920,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         0x05 => {
             let xms = xms_state();
             xms.a20_local += 1;
-            crate::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
+            crate::arch::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
             thread::current().vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
@@ -1930,7 +1930,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             let xms = xms_state();
             xms.a20_local = xms.a20_local.saturating_sub(1);
             if xms.a20_local == 0 && xms.a20_global == 0 {
-                crate::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
+                crate::arch::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
                 thread::current().vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -2276,7 +2276,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                     for _ in 0..pages_needed {
                         let mut group = [0u64; 4];
                         for p in &mut group {
-                            match crate::phys_mm::alloc_phys_page() {
+                            match crate::arch::phys_mm::alloc_phys_page() {
                                 Some(page) => *p = page,
                                 None => { ok = false; break; }
                             }
@@ -2284,14 +2284,14 @@ fn int_67h(regs: &mut Regs) -> Action {
                         if !ok { break; }
                         // Zero the allocated pages
                         for &p in &group {
-                            crate::paging2::temp_map(p);
+                            crate::arch::paging2::temp_map(p);
                             unsafe {
                                 core::ptr::write_bytes(
-                                    crate::paging2::temp_map_vaddr() as *mut u8, 0,
-                                    crate::paging2::PAGE_SIZE,
+                                    crate::arch::paging2::temp_map_vaddr() as *mut u8, 0,
+                                    crate::arch::paging2::PAGE_SIZE,
                                 );
                             }
-                            crate::paging2::temp_unmap();
+                            crate::arch::paging2::temp_unmap();
                         }
                         pages.push(group);
                     }
@@ -2304,7 +2304,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                         // Free any partially allocated pages
                         for group in &pages {
                             for &p in group {
-                                if p != 0 { crate::phys_mm::free_phys_page(p); }
+                                if p != 0 { crate::arch::phys_mm::free_phys_page(p); }
                             }
                         }
                         regs.rax = (regs.rax & !0xFF00) | (0x88 << 8); // AH=88: not enough pages
@@ -2331,7 +2331,7 @@ fn int_67h(regs: &mut Regs) -> Action {
             // BX=FFFFh means unmap
             if log_page == 0xFFFF {
                 ems.frame[phys_page as usize] = None;
-                crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
+                crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
                 regs.rax = (regs.rax & !0xFF00); // AH=0
                 return Action::Done;
             }
@@ -2344,7 +2344,7 @@ fn int_67h(regs: &mut Regs) -> Action {
             match &ems.handles[handle as usize] {
                 Some(h) if (log_page as usize) < h.pages.len() => {
                     let phys_pages = &h.pages[log_page as usize];
-                    crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
+                    crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
                     ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                     regs.rax = (regs.rax & !0xFF00); // AH=0
                 }
@@ -2366,7 +2366,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                     if let Some((h, _)) = ems.frame[w] {
                         if h == handle as u8 {
                             ems.frame[w] = None;
-                            crate::paging2::map_ems_window(ems_base_page(), w, None);
+                            crate::arch::paging2::map_ems_window(ems_base_page(), w, None);
                         }
                     }
                 }
@@ -2374,7 +2374,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                 if let Some(h) = ems.handles[handle as usize].take() {
                     for group in &h.pages {
                         for &p in group {
-                            crate::phys_mm::free_phys_page(p);
+                            crate::arch::phys_mm::free_phys_page(p);
                         }
                     }
                 }
@@ -2466,12 +2466,12 @@ fn int_67h(regs: &mut Regs) -> Action {
 
                 if log_page == 0xFFFF {
                     ems.frame[phys_page as usize] = None;
-                    crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
+                    crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
                 } else {
                     match &ems.handles[handle as usize] {
                         Some(h) if (log_page as usize) < h.pages.len() => {
                             let phys_pages = &h.pages[log_page as usize];
-                            crate::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
+                            crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
                             ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                         }
                         _ => {
@@ -2501,14 +2501,14 @@ fn int_67h(regs: &mut Regs) -> Action {
                             let mut group = [0u64; 4];
                             let mut ok = true;
                             for p in &mut group {
-                                match crate::phys_mm::alloc_phys_page() {
+                                match crate::arch::phys_mm::alloc_phys_page() {
                                     Some(page) => *p = page,
                                     None => { ok = false; break; }
                                 }
                             }
                             if !ok {
                                 // Free partially allocated group
-                                for &p in &group { if p != 0 { crate::phys_mm::free_phys_page(p); } }
+                                for &p in &group { if p != 0 { crate::arch::phys_mm::free_phys_page(p); } }
                                 regs.rax = (regs.rax & !0xFF00) | (0x88 << 8);
                                 return Action::Done;
                             }
@@ -2518,7 +2518,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                         // Shrink: free excess pages
                         for group in h.pages.drain(new_count as usize..) {
                             for &p in &group {
-                                crate::phys_mm::free_phys_page(p);
+                                crate::arch::phys_mm::free_phys_page(p);
                             }
                         }
                     }
@@ -2562,7 +2562,7 @@ fn int_67h(regs: &mut Regs) -> Action {
 }
 
 fn dos_open_program(name: &[u8]) -> i32 {
-    let fd = crate::vfs::open(name);
+    let fd = crate::kernel::vfs::open(name);
     if fd >= 0 { return fd; }
     // If the name already has a dot, don't try extensions
     if name.iter().any(|&c| c == b'.') { return fd; }
@@ -2572,13 +2572,13 @@ fn dos_open_program(name: &[u8]) -> i32 {
     if len + 4 <= buf.len() {
         buf[..len].copy_from_slice(name);
         buf[len..len + 4].copy_from_slice(b".COM");
-        let fd = crate::vfs::open(&buf[..len + 4]);
+        let fd = crate::kernel::vfs::open(&buf[..len + 4]);
         if fd >= 0 { return fd; }
     }
     // Try .EXE
     if len + 4 <= buf.len() {
         buf[len..len + 4].copy_from_slice(b".EXE");
-        let fd = crate::vfs::open(&buf[..len + 4]);
+        let fd = crate::kernel::vfs::open(&buf[..len + 4]);
         if fd >= 0 { return fd; }
     }
     -2 // ENOENT
@@ -2647,24 +2647,24 @@ fn exec_program(regs: &mut Regs) -> Action {
         unsafe { regs.frame.f32.eflags |= 1; }
         return Action::Done;
     }
-    let size = crate::vfs::seek(fd, 0, 2);
+    let size = crate::kernel::vfs::seek(fd, 0, 2);
     if size <= 0 {
-        crate::vfs::close(fd);
+        crate::kernel::vfs::close(fd);
         regs.rax = (regs.rax & !0xFFFF) | 2;
         unsafe { regs.frame.f32.eflags |= 1; }
         return Action::Done;
     }
-    crate::vfs::seek(fd, 0, 0);
+    crate::kernel::vfs::seek(fd, 0, 0);
     let mut buf = alloc::vec![0u8; size as usize];
-    crate::vfs::read_raw(fd, &mut buf);
-    crate::vfs::close(fd);
+    crate::kernel::vfs::read_raw(fd, &mut buf);
+    crate::kernel::vfs::close(fd);
     let is_exe = is_mz_exe(&buf);
 
     dbg_println!("EXEC fork: prog={}",
         unsafe { core::str::from_utf8_unchecked(prog_name) });
 
     // --- Fork a new address space for the child ---
-    use crate::paging2;
+    use crate::arch::paging2;
 
     let new_root = match paging2::fork_current() {
         Some(r) => r,
@@ -2683,13 +2683,13 @@ fn exec_program(regs: &mut Regs) -> Action {
     let child = match thread::create_thread(Some(current), new_root, true) {
         Some(t) => t,
         None => {
-            crate::phys_mm::free_phys_page(new_root);
+            crate::arch::phys_mm::free_phys_page(new_root);
             regs.rax = (regs.rax & !0xFFFF) | 8;
             unsafe { regs.frame.f32.eflags |= 1; }
             return Action::Done;
         }
     };
-    crate::phys_mm::free_phys_page(new_root);
+    crate::arch::phys_mm::free_phys_page(new_root);
     let child_tid = child.tid;
     let child_idx = child_tid as usize;
 
@@ -2866,7 +2866,7 @@ fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Ac
     let mut idx = start_index;
 
     loop {
-        match crate::vfs::readdir(idx) {
+        match crate::kernel::vfs::readdir(idx) {
             Some(entry) => {
                 idx += 1;
                 let name = &entry.name[..entry.name_len];
@@ -2962,7 +2962,7 @@ pub fn setup_ivt() {
 ///
 /// Both pages are allocated, filled, and mapped via paging2::map_user_page.
 fn map_psp() {
-    use crate::paging2;
+    use crate::arch::paging2;
 
     const PSP_PAGE: usize = 0x10;  // COM_SEGMENT << 4 >> 12
     const ENV_PAGE: usize = 0x0F;  // page before PSP
@@ -3004,7 +3004,7 @@ fn map_psp() {
     paging2::map_user_page(PSP_PAGE, &psp);
 
     // Default DTA is at PSP:0080h (linear = COM_SEGMENT*16 + 0x80)
-    crate::thread::current().vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;
+    crate::kernel::thread::current().vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;
 }
 
 /// Check if data starts with the MZ signature.

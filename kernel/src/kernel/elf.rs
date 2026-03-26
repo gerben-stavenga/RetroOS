@@ -3,8 +3,8 @@
 //! Uses lib::elf for parsing, handles memory mapping.
 //! Page tables are allocated on-demand via the page fault handler.
 
-use crate::paging2::{self, page_idx, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
-use crate::x86;
+use crate::arch::paging2::{self, page_idx, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
+use crate::arch::x86;
 pub use lib::elf::{ElfError, ElfClass};
 
 /// User stack top address (just below kernel space)

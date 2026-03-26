@@ -5,12 +5,12 @@
 extern crate alloc;
 
 use alloc::vec;
-use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE};
-use crate::stacktrace::SymbolData;
-use crate::{elf, hdd};
+use crate::arch::paging2::{KERNEL_BASE, PAGE_TABLE_BASE};
+use crate::kernel::stacktrace::SymbolData;
+use crate::kernel::{elf, hdd};
 use crate::println;
-use crate::thread;
-use crate::x86;
+use crate::kernel::thread;
+use crate::arch::x86;
 use lib::tar::TarHeader;
 
 /// TAR block size (same as disk sector size)
@@ -138,7 +138,7 @@ pub fn startup(start_sector: u32) -> ! {
     init_fs(start_sector);
 
     // Load symbol table for stack traces
-    crate::stacktrace::init_from_tar();
+    crate::kernel::stacktrace::init_from_tar();
 
     // Find init.elf
     println!("Loading init.elf");
@@ -164,8 +164,8 @@ pub fn startup(start_sector: u32) -> ! {
 
     // Temporarily map trampoline so copy_trampoline's data is accessible,
     // then clear it — page 0xF is used by VM86 for the environment block.
-    crate::paging2::ensure_trampoline_mapped();
-    crate::paging2::clear_trampoline();
+    crate::arch::paging2::ensure_trampoline_mapped();
+    crate::arch::paging2::clear_trampoline();
 
     // Set up user stack with argc=0 for _start(argc, argv)
     let stack_top = PAGE_TABLE_BASE as u32;
@@ -186,7 +186,7 @@ pub fn startup(start_sector: u32) -> ! {
     println!("Starting init process...");
 
     // Drop to ring 1 — kernel event loop runs at CPL=1
-    crate::descriptors::enter_ring1();
+    crate::arch::descriptors::enter_ring1();
     println!("Running at ring 1");
 
     // Event loop: execute threads via arch INT, handle returned events
@@ -204,9 +204,8 @@ fn event_loop(first_tid: usize) -> ! {
         match event {
             // Syscall: dispatch using the thread's saved state
             48 => {
-                let thread = crate::thread::current();
-                let result = crate::syscalls::dispatch(&mut thread.cpu_state);
-                if let Some(next) = result.switch_to {
+                let thread = crate::kernel::thread::current();
+                if let Some(next) = crate::kernel::syscalls::dispatch(&mut thread.cpu_state) {
                     tid = next;
                 }
             }
@@ -226,7 +225,7 @@ fn arch_execute(tid: usize) -> u32 {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inout("eax") crate::traps::arch_call::EXECUTE as u32 => event,
+            inout("eax") crate::arch::traps::arch_call::EXECUTE as u32 => event,
             in("edx") tid as u32,
             out("ecx") _,
             out("ebx") _,

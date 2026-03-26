@@ -13,31 +13,19 @@ use core::panic::PanicInfo;
 extern crate alloc;
 extern crate rustc_demangle;
 
-pub mod descriptors;
-pub mod heap;
-pub mod elf;
-pub mod hdd;
-pub mod irq;
-pub mod keyboard;
-pub mod paging2;
-pub mod pipe;
-pub mod phys_mm;
-pub mod stacktrace;
-pub mod startup;
-pub mod syscalls;
-pub mod thread;
-pub mod traps;
-pub mod vfs;
-pub mod vm86;
-pub mod x86;
+mod arch;
+mod kernel;
+pub mod pipe;  // Shared utility: ring buffer used by both arch and kernel
+
+// Re-export kernel submodules so arch/ code can use crate::thread, crate::vm86, etc.
+pub use kernel::thread;
+pub use kernel::vm86;
 
 // Re-export lib's vga module and macros
 pub use lib::vga;
 pub use lib::{print, println, dbg_print, dbg_println};
 
-use paging2::{KernelPages, PAGE_SIZE, LOW_MEM_BASE};
-
-use crate::paging2::RawPage;
+use arch::paging2::{KernelPages, PAGE_SIZE, LOW_MEM_BASE, RawPage};
 
 /// Memory map entry from bootloader
 #[repr(C, packed)]
@@ -114,7 +102,7 @@ pub unsafe extern "C" fn PrepareKernel(boot_data: *const BootData) -> ! {
         let kernel_pages = (kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
         // Enable paging (auto-detects Legacy vs PAE)
-        paging2::enable_paging(kpages, scratch, phys_address, kernel_pages);
+        arch::paging2::enable_paging(kpages, scratch, phys_address, kernel_pages);
 
         // Now paging is enabled, we're running at virtual address
         // Set up argument for KernelInit on the stack
@@ -141,7 +129,7 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     vga::vga().base = LOW_MEM_BASE + 0xB8000;
 
     // Finish paging setup (remove identity, enable NX, setup long mode, harden)
-    paging2::finish_setup_paging();
+    arch::paging2::finish_setup_paging();
 
     let kernel_phys = boot_data.kernel as u64;
     println!("kernel_phys: {:#x}", kernel_phys);
@@ -153,7 +141,7 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     println!("Initializing phys_mm...");
 
     // Initialize physical memory allocator
-    phys_mm::init_phys_mm(
+    arch::phys_mm::init_phys_mm(
         &boot_data.mmap_entries,
         boot_data.mmap_count as usize,
         kernel_low_page,
@@ -161,13 +149,13 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     );
 
 
-    println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
+    println!("Physical memory: {:#x} pages free", arch::phys_mm::free_page_count());
 
     // Initialize temp mapping for fork
-    paging2::init_temp_map();
+    arch::paging2::init_temp_map();
 
     // Initialize kernel heap allocator
-    heap::init();
+    kernel::heap::init();
     println!("Heap initialized");
 
     // Print memory map
@@ -188,38 +176,38 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     // Setup GDT, IDT, TSS — use ARCH_STACK for TSS ESP0
     #[allow(static_mut_refs)]
     let arch_stack_top = unsafe { (ARCH_STACK.as_ptr_range().end) as u32 };
-    descriptors::setup_descriptor_tables(arch_stack_top);
+    arch::descriptors::setup_descriptor_tables(arch_stack_top);
     println!("Descriptors initialized");
 
     // Setup PIC and enable interrupts (must happen before mode toggle,
     // because toggle_mode calls sti() and unmapped PIC would crash)
-    irq::init_interrupts();
+    arch::irq::init_interrupts();
     println!("Interrupts initialized");
 
     // If CPU supports long mode, switch to compat mode now.
     // All code (32-bit and 64-bit user processes) runs in compat mode.
-    if paging2::cpu_supports_long_mode() {
-        paging2::sync_hw_pdpt();
-        x86::flush_tlb();
-        paging2::ensure_trampoline_mapped();
-        descriptors::toggle_mode(paging2::toggle_cr3(true));
-        paging2::clear_trampoline();
+    if arch::paging2::cpu_supports_long_mode() {
+        arch::paging2::sync_hw_pdpt();
+        arch::x86::flush_tlb();
+        arch::paging2::ensure_trampoline_mapped();
+        arch::descriptors::toggle_mode(arch::paging2::toggle_cr3(true));
+        arch::paging2::clear_trampoline();
         println!("Switched to Compat mode");
     }
 
     // Enable interrupts
-    x86::sti();
+    arch::x86::sti();
     println!("Interrupts enabled");
 
     // Initialize threading
-    thread::init_threading();
+    kernel::thread::init_threading();
     println!("Threading initialized");
 
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");
 
     // Start the init process (never returns)
-    startup::startup(boot_data.start_sector);
+    kernel::startup::startup(boot_data.start_sector);
 }
 
 /// CPU-pushed interrupt frame for 32-bit mode
@@ -333,7 +321,7 @@ impl Regs {
 
     /// In compat mode, the CPU always pushes Frame64 (even for 32-bit user code)
     pub fn use_f64() -> bool {
-        crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat
+        crate::arch::paging2::cpu_mode() == crate::arch::paging2::CpuMode::Compat
     }
 
     /// Convert frame from Frame32 to Frame64 format
@@ -436,7 +424,7 @@ impl core::fmt::Debug for Regs {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    x86::cli();
+    arch::x86::cli();
     println!();
     println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
 
@@ -450,10 +438,10 @@ fn panic(info: &PanicInfo) -> ! {
     println!("  {}", info.message());
     println!();
 
-    stacktrace::stack_trace();
+    kernel::stacktrace::stack_trace();
 
     loop {
-        x86::cli();
-        x86::hlt();
+        arch::x86::cli();
+        arch::x86::hlt();
     }
 }

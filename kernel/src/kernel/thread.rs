@@ -3,11 +3,11 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
-use crate::descriptors::{set_kernel_stack, USER_CS, USER_CS64, USER_DS};
-use crate::paging2::Entry;
-use crate::stacktrace::SymbolData;
+use crate::arch::descriptors::{set_kernel_stack, USER_CS, USER_CS64, USER_DS};
+use crate::arch::paging2::Entry;
+use crate::kernel::stacktrace::SymbolData;
 use crate::{ARCH_STACK, println};
-use crate::x86;
+use crate::arch::x86;
 use crate::{Frame, Frame32, Frame64, Regs};
 
 /// Maximum number of threads
@@ -110,7 +110,7 @@ pub struct Thread {
     pub parent_tid: i32,
     pub state: ThreadState,
     pub time: u32,
-    pub root: crate::paging2::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
+    pub root: crate::arch::paging2::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
     pub cpu_state: Regs,
@@ -118,7 +118,7 @@ pub struct Thread {
     pub mode: ThreadMode,              // User code bitness (16/32/64)
     pub frame_format: FrameFormat,    // Saved interrupt frame format
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
-    pub vm86: crate::vm86::Vm86State,
+    pub vm86: crate::kernel::vm86::Vm86State,
     pub cwd: [u8; 64],     // Current working directory (e.g. "WOLF3D/", "" for root)
     pub cwd_len: usize,
 }
@@ -132,7 +132,7 @@ impl Thread {
             parent_tid: -1,
             state: ThreadState::Unused,
             time: 0,
-            root: crate::paging2::RootPageTable::empty(),
+            root: crate::arch::paging2::RootPageTable::empty(),
             num_fds: 0,
             fds: [-1; MAX_FDS],
             cpu_state: Regs::empty(),
@@ -140,7 +140,7 @@ impl Thread {
             mode: ThreadMode::Mode32,
             frame_format: FrameFormat::Protected,
             symbols: None,
-            vm86: crate::vm86::Vm86State::new(),
+            vm86: crate::kernel::vm86::Vm86State::new(),
             cwd: [0; 64],
             cwd_len: 0,
         }
@@ -210,7 +210,7 @@ pub fn create_thread(parent: Option<&Thread>, forked_root_page: u64, is_process:
                 thread.priority = parent.map(|p| p.priority).unwrap_or(0);
                 thread.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
                 thread.state = ThreadState::Ready;
-                thread.time = crate::irq::get_ticks() as u32;
+                thread.time = crate::arch::irq::get_ticks() as u32;
                 if forked_root_page == 0 {
                     thread.root.init_current();
                 } else {
@@ -247,7 +247,7 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
     thread.mode = ThreadMode::Mode16;
     thread.frame_format = FrameFormat::Protected; // VM86 always uses Frame32 (IRET in PAE mode)
-    thread.vm86 = crate::vm86::Vm86State::new();
+    thread.vm86 = crate::kernel::vm86::Vm86State::new();
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode
     const IF_FLAG: u32 = 1 << 9;   // Interrupt enable
@@ -259,8 +259,8 @@ pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, 
     // DS=ES=PSP segment for DOS programs, FS=GS=0
     // For .COM: PSP = CS. For .EXE: PSP = CS - 0x10 (PSP precedes load module).
     // Caller passes the load segment as CS; the PSP is always COM_SEGMENT.
-    state.ds = crate::vm86::COM_SEGMENT as u64;
-    state.es = crate::vm86::COM_SEGMENT as u64;
+    state.ds = crate::kernel::vm86::COM_SEGMENT as u64;
+    state.es = crate::kernel::vm86::COM_SEGMENT as u64;
     state.fs = 0;
     state.gs = 0;
 
@@ -346,21 +346,21 @@ pub fn switch_to_thread(idx: usize) -> ! {
     // Toggle CPU mode (PAE ↔ Compat) if needed.
     // Compat→PAE for VM86 (Mode16), PAE→Compat for 64-bit (Mode64).
     // Mode32 works in both modes — no toggle needed.
-    let need_toggle = match crate::paging2::cpu_mode() {
-        crate::paging2::CpuMode::Pae => thread.mode == ThreadMode::Mode64,
-        crate::paging2::CpuMode::Compat => thread.mode == ThreadMode::Mode16,
+    let need_toggle = match crate::arch::paging2::cpu_mode() {
+        crate::arch::paging2::CpuMode::Pae => thread.mode == ThreadMode::Mode64,
+        crate::arch::paging2::CpuMode::Compat => thread.mode == ThreadMode::Mode16,
         _ => false,
     };
 
     if need_toggle {
         thread.root.load_entries();
-        crate::paging2::sync_hw_pdpt();
-        crate::x86::flush_tlb();
-        crate::paging2::ensure_trampoline_mapped();
-        crate::descriptors::toggle_mode(crate::paging2::toggle_cr3(thread.mode == ThreadMode::Mode64));
+        crate::arch::paging2::sync_hw_pdpt();
+        crate::arch::x86::flush_tlb();
+        crate::arch::paging2::ensure_trampoline_mapped();
+        crate::arch::descriptors::toggle_mode(crate::arch::paging2::toggle_cr3(thread.mode == ThreadMode::Mode64));
         // Clear trampoline mapping — it's only needed during the toggle itself.
         // Leaving it mapped as kernel-only breaks VM86 threads that access page 0xF.
-        crate::paging2::clear_trampoline();
+        crate::arch::paging2::clear_trampoline();
     } else {
         thread.root.activate();
     }
@@ -368,7 +368,7 @@ pub fn switch_to_thread(idx: usize) -> ! {
     // Update kernel stack in TSS
     let stack_top = unsafe { (&raw const ARCH_STACK).cast::<u8>().add(128 * 1024) };
     if thread.mode == ThreadMode::Mode64 || Regs::use_f64() {
-        crate::descriptors::set_kernel_stack_64(stack_top as u64);
+        crate::arch::descriptors::set_kernel_stack_64(stack_top as u64);
     } else {
         set_kernel_stack(stack_top as u32);
     }
@@ -404,20 +404,20 @@ pub fn switch_to_thread(idx: usize) -> ! {
         // Fresh EXEC'd child — discard pending IRQs so they don't overflow
         // the program's tiny initial stack before it sets up its real one.
         thread.vm86.skip_irq = false;
-        crate::irq::drain_discard();
+        crate::arch::irq::drain_discard();
     } else if thread.mode == ThreadMode::Mode16 {
-        let ticks = crate::irq::take_pending_ticks();
+        let ticks = crate::arch::irq::take_pending_ticks();
         if ticks > 0 {
             thread.vm86.vpic.push(0x08);
         }
-        crate::irq::drain(|event| {
-            crate::vm86::deliver_irq(thread, &mut frame.regs, Some(event));
+        crate::arch::irq::drain(|event| {
+            crate::kernel::vm86::deliver_irq(thread, &mut frame.regs, Some(event));
         });
-        crate::vm86::deliver_irq(thread, &mut frame.regs, None);
+        crate::kernel::vm86::deliver_irq(thread, &mut frame.regs, None);
     } else {
-        use crate::irq::Irq;
-        crate::irq::drain(|event| match event {
-            Irq::Key(sc) => crate::keyboard::process_key(sc),
+        use crate::arch::irq::Irq;
+        crate::arch::irq::drain(|event| match event {
+            Irq::Key(sc) => crate::kernel::keyboard::process_key(sc),
             _ => {}
         });
     }
@@ -466,17 +466,17 @@ pub fn exit_thread(exit_code: i32) -> Option<usize> {
     unsafe {
         let thread = &mut THREADS[CURRENT_THREAD];
         let parent_tid = thread.parent_tid;
-        crate::vfs::close_all_fds(&mut thread.fds);
+        crate::kernel::vfs::close_all_fds(&mut thread.fds);
         if let Some(ref mut ems) = thread.vm86.ems {
             ems.free_all_pages();
         }
         thread.vm86.ems = None;
         thread.vm86.xms = None;
         if thread.mode == ThreadMode::Mode16 && !thread.vm86.a20_enabled {
-            crate::paging2::set_a20(true, &mut thread.vm86.hma_pages);
+            crate::arch::paging2::set_a20(true, &mut thread.vm86.hma_pages);
             thread.vm86.a20_enabled = true;
         }
-        crate::paging2::free_user_pages();
+        crate::arch::paging2::free_user_pages();
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
         // Symbols are dropped here by RAII when thread goes zombie
@@ -539,7 +539,7 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) -> Option<usize>
 
         unsafe {
             if CURRENT_THREAD == thread.tid as usize {
-                crate::paging2::free_user_pages();
+                crate::arch::paging2::free_user_pages();
                 thread.state = ThreadState::Zombie;
                 thread.exit_code = -11;  // SIGSEGV
                 thread.symbols = None;

@@ -3,7 +3,7 @@
 //! Simple polling-based driver for reading sectors from the primary ATA disk.
 //! Uses LBA28 addressing mode, supporting disks up to 128GB.
 
-use crate::x86::{inb, inw, outb};
+use crate::arch::x86::{inb, inw, outb};
 
 /// ATA register offsets from base port
 mod reg {

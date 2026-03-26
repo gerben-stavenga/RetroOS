@@ -201,7 +201,7 @@ impl RootPageTable {
         if cpu_mode() == CpuMode::Pae {
             sync_hw_pdpt();
         }
-        unsafe { crate::x86::write_cr3(self.cr3() as u32); }
+        unsafe { crate::arch::x86::write_cr3(self.cr3() as u32); }
     }
 
     /// CR3 value for this address space.
@@ -454,7 +454,7 @@ static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 /// double as a page table, otherwise demand paging writes PTEs into it
 /// and corrupts PML4 entries.
 pub fn setup_long_mode_tables() {
-    let pdpt_phys = crate::x86::read_cr3() as u64;
+    let pdpt_phys = crate::arch::x86::read_cr3() as u64;
     let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
 
     // PML4[0] = PDPT (so long mode uses same mappings)
@@ -537,9 +537,9 @@ pub enum CpuMode {
 /// Read current paging mode from CPU registers (CR4.PAE, EFER.LME)
 #[inline]
 pub fn cpu_mode() -> CpuMode {
-    if crate::x86::read_cr4() & crate::x86::cr4::PAE == 0 {
+    if crate::arch::x86::read_cr4() & crate::arch::x86::cr4::PAE == 0 {
         CpuMode::Legacy
-    } else if !cpu_supports_long_mode() || unsafe { crate::x86::rdmsr(crate::x86::EFER_MSR) } & crate::x86::efer::LME == 0 {
+    } else if !cpu_supports_long_mode() || unsafe { crate::arch::x86::rdmsr(crate::arch::x86::EFER_MSR) } & crate::arch::x86::efer::LME == 0 {
         CpuMode::Pae
     } else {
         CpuMode::Compat
@@ -631,7 +631,7 @@ pub fn physical_page(vaddr: usize) -> u64 {
 
 /// Get current CR3 value (page directory physical address)
 pub fn current_cr3() -> u64 {
-    (crate::x86::read_cr3() & !(PAGE_SIZE as u32 - 1)) as u64
+    (crate::arch::x86::read_cr3() & !(PAGE_SIZE as u32 - 1)) as u64
 }
 
 /// Get current process's virtual root physical address.
@@ -639,7 +639,7 @@ pub fn current_cr3() -> u64 {
 /// For PAE: read from recursive entry (CR3 points to thread's pdpt, not virtual root).
 pub fn current_root_phys() -> u64 {
     if cpu_mode() != CpuMode::Pae {
-        return crate::x86::read_cr3() as u64;
+        return crate::arch::x86::read_cr3() as u64;
     }
     // The virtual root's recursive entry points to itself
     let recursive_slot = recursive_idx() - root_base();
@@ -652,14 +652,14 @@ pub fn current_root_phys() -> u64 {
 /// Raw TLB invalidation (CR3 reload). Used internally by paging operations
 /// that don't need the PAE PDPT sync.
 fn invalidate_tlb() {
-    crate::x86::flush_tlb();
+    crate::arch::x86::flush_tlb();
 }
 
 /// Flush TLB. In PAE mode, also syncs the hardware PDPT
 /// before reloading CR3.
 pub fn flush_tlb() {
     sync_hw_pdpt();
-    crate::x86::flush_tlb();
+    crate::arch::x86::flush_tlb();
 }
 
 /// Remove identity mapping (call after switching to virtual addresses)
@@ -713,23 +713,23 @@ pub fn finish_setup_paging() {
 
 /// Check if CPU supports PAE (CPUID.1:EDX bit 6)
 pub fn cpu_supports_pae() -> bool {
-    let (_, _, _, edx) = crate::x86::cpuid(1);
+    let (_, _, _, edx) = crate::arch::x86::cpuid(1);
     edx & (1 << 6) != 0
 }
 
 /// Check if CPU supports long mode (CPUID.80000001:EDX bit 29)
 pub fn cpu_supports_long_mode() -> bool {
-    let (max_ext, _, _, _) = crate::x86::cpuid(0x80000000);
+    let (max_ext, _, _, _) = crate::arch::x86::cpuid(0x80000000);
     if max_ext < 0x80000001 { return false; }
-    let (_, _, _, edx) = crate::x86::cpuid(0x80000001);
+    let (_, _, _, edx) = crate::arch::x86::cpuid(0x80000001);
     edx & (1 << 29) != 0
 }
 
 /// Check if CPU supports NX/XD bit (CPUID.80000001:EDX bit 20)
 pub fn cpu_supports_nx() -> bool {
-    let (max_ext, _, _, _) = crate::x86::cpuid(0x80000000);
+    let (max_ext, _, _, _) = crate::arch::x86::cpuid(0x80000000);
     if max_ext < 0x80000001 { return false; }
-    let (_, _, _, edx) = crate::x86::cpuid(0x80000001);
+    let (_, _, _, edx) = crate::arch::x86::cpuid(0x80000001);
     edx & (1 << 20) != 0
 }
 
@@ -747,8 +747,8 @@ pub fn enable_nx() {
         return;  // NX requires PAE or long mode
     }
     unsafe {
-        let efer = crate::x86::rdmsr(crate::x86::EFER_MSR);
-        crate::x86::wrmsr(crate::x86::EFER_MSR, efer | crate::x86::efer::NXE);
+        let efer = crate::arch::x86::rdmsr(crate::arch::x86::EFER_MSR);
+        crate::arch::x86::wrmsr(crate::arch::x86::EFER_MSR, efer | crate::arch::x86::efer::NXE);
         NX_ENABLED = true;
     }
 }
@@ -796,9 +796,9 @@ pub fn enable_legacy(kpages: &mut LegacyPages, scratch: &mut PageTable32, kernel
 
     unsafe {
         // Load CR3 and enable paging (phys_addr fits in 32 bits during boot)
-        crate::x86::write_cr3(kpages.pd.phys_addr() as u32);
-        let cr0 = crate::x86::read_cr0();
-        crate::x86::write_cr0(cr0 | crate::x86::cr0::PG | crate::x86::cr0::WP);
+        crate::arch::x86::write_cr3(kpages.pd.phys_addr() as u32);
+        let cr0 = crate::arch::x86::read_cr0();
+        crate::arch::x86::write_cr0(cr0 | crate::arch::x86::cr0::PG | crate::arch::x86::cr0::WP);
     }
 }
 
@@ -852,12 +852,12 @@ pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys:
     // Boot with virtual root in CR3 directly (R/W bits in PDPT[0..3] are
     // technically reserved, but OK for boot — we switch to the thread's
     // thread's RootPageTable once threading is initialized)
-    let cr4 = crate::x86::read_cr4();
+    let cr4 = crate::arch::x86::read_cr4();
     unsafe {
-        crate::x86::write_cr4(cr4 | crate::x86::cr4::PAE);
-        crate::x86::write_cr3(kpages.pdpt.phys_addr() as u32);
-        let cr0 = crate::x86::read_cr0();
-        crate::x86::write_cr0(cr0 | crate::x86::cr0::PG | crate::x86::cr0::WP);
+        crate::arch::x86::write_cr4(cr4 | crate::arch::x86::cr4::PAE);
+        crate::arch::x86::write_cr3(kpages.pdpt.phys_addr() as u32);
+        let cr0 = crate::arch::x86::read_cr0();
+        crate::arch::x86::write_cr0(cr0 | crate::arch::x86::cr0::PG | crate::arch::x86::cr0::WP);
     }
 }
 
@@ -1012,7 +1012,7 @@ fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
 /// All writes go through temp_map to avoid faulting on the self-mapped entries.
 /// Returns the new page's physical page number.
 fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
-    use crate::phys_mm;
+    use crate::arch::phys_mm;
 
     debug_assert!(idx >= PAGE_TABLE_BASE_IDX,
         "share_and_copy: idx {} is a leaf page, not a page table entry", idx);
@@ -1085,7 +1085,7 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
 /// copies the old contents, and updates the entry. For page table entries,
 /// also marks children R/O and increments their ref counts.
 pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
-    use crate::phys_mm;
+    use crate::arch::phys_mm;
 
     debug_assert!(idx != recursive_idx(),
         "cow_entry: idx {} is the recursive entry, must never be COW'd", idx);
@@ -1161,7 +1161,7 @@ pub fn free_user_pages() {
 /// If sole-owned, walk children: recurse for intermediate levels,
 /// free directly for leaf pages.
 fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
-    use crate::phys_mm;
+    use crate::arch::phys_mm;
 
     if !entries[parent_idx].present() {
         return;
@@ -1214,7 +1214,7 @@ pub fn ensure_trampoline_mapped() {
     if let Entries::E64(e) = entries() {
         unsafe { TRAMPOLINE_SAVED = e[TRAMPOLINE_PAGE].0; }
         e[TRAMPOLINE_PAGE] = Entry64::new(TRAMPOLINE_PAGE as u64, true, false);
-        crate::x86::invlpg(TRAMPOLINE_ADDR);
+        crate::arch::x86::invlpg(TRAMPOLINE_ADDR);
     }
 }
 
@@ -1229,7 +1229,7 @@ pub fn clear_trampoline() {
             e[TRAMPOLINE_PAGE] = Entry64(unsafe { TRAMPOLINE_SAVED });
         }
     }
-    crate::x86::invlpg(TRAMPOLINE_ADDR);
+    crate::arch::x86::invlpg(TRAMPOLINE_ADDR);
 }
 
 /// Map the first 1MB of physical memory as user-accessible (for VM86 mode).
@@ -1245,7 +1245,7 @@ pub fn map_low_mem_user() {
 fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     // Page 0 (BIOS IVT + BDA): allocate a private copy so each VM86 process
     // has its own IVT. Copy via temp mapping to avoid null pointer issues.
-    let page0_copy = crate::phys_mm::alloc_phys_page().expect("alloc page 0 copy");
+    let page0_copy = crate::arch::phys_mm::alloc_phys_page().expect("alloc page 0 copy");
     temp_map(0); // map physical page 0 at temp VA
     let mut buf = [0u8; PAGE_SIZE];
     unsafe {
@@ -1298,7 +1298,7 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
 /// and map it at user virtual page `page_idx` (writable, user-accessible).
 pub fn map_user_page(page_idx: usize, data: &[u8]) {
     assert!(data.len() <= PAGE_SIZE);
-    let phys = crate::phys_mm::alloc_phys_page().expect("alloc user page");
+    let phys = crate::arch::phys_mm::alloc_phys_page().expect("alloc user page");
     temp_map(phys);
     unsafe {
         let dst = temp_map_vaddr() as *mut u8;
@@ -1398,7 +1398,7 @@ pub fn unmap_umb(base_page: usize, num_pages: usize) {
         Entries::E32(e) => {
             for i in 0..num_pages {
                 if e[base_page + i].present() {
-                    crate::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                    crate::arch::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
                 }
                 e[base_page + i] = Entry32::new((base_page + i) as u64, false, true);
             }
@@ -1406,7 +1406,7 @@ pub fn unmap_umb(base_page: usize, num_pages: usize) {
         Entries::E64(e) => {
             for i in 0..num_pages {
                 if e[base_page + i].present() {
-                    crate::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                    crate::arch::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
                 }
                 e[base_page + i] = Entry64::new((base_page + i) as u64, false, true);
             }
