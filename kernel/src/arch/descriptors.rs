@@ -12,7 +12,7 @@
 //! - 0x50: Ring-1 Code 32-bit (OS kernel)
 //! - 0x58: Ring-1 Data (OS kernel)
 
-use crate::x86::{self, GdtPtr, IdtPtr};
+use crate::arch::x86::{self, GdtPtr, IdtPtr};
 
 /// Segment selectors - 32-bit (compatibility mode)
 pub const KERNEL_CS: u16 = 0x08;

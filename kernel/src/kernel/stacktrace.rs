@@ -7,7 +7,8 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec;
-use crate::{print, println, startup, thread};
+use crate::{print, println};
+use crate::kernel::{startup, thread};
 use core::arch::asm;
 use lib::elf::{SymbolTable, STT_FUNC};
 
