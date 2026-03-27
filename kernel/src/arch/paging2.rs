@@ -1294,6 +1294,21 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     flush_tlb();
 }
 
+/// Map a physical page into the user address space.
+pub fn map_user_page_phys(vpage: usize, ppage: u64) {
+    match entries() {
+        Entries::E32(e) => {
+            let entry = Entry32::new(ppage, true, true);
+            e[vpage] = entry;
+        }
+        Entries::E64(e) => {
+            let entry = Entry64::new(ppage, true, true);
+            e[vpage] = entry;
+        }
+    }
+    flush_tlb();
+}
+
 /// Allocate a physical page, fill it with `data` (zero-padded to PAGE_SIZE),
 /// and map it at user virtual page `page_idx` (writable, user-accessible).
 pub fn map_user_page(page_idx: usize, data: &[u8]) {

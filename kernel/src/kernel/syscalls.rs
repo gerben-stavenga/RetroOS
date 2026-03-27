@@ -17,8 +17,7 @@
 //! Return value in: EAX
 
 use crate::kernel::elf;
-use crate::arch::descriptors;
-use crate::arch::paging2::{self, PAGE_SIZE};
+use crate::arch::paging2::PAGE_SIZE;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::startup;
 use crate::kernel::thread;
@@ -106,7 +105,7 @@ pub fn dispatch(regs: &mut Regs) -> Option<usize> {
 /// Terminates the current process
 fn sys_exit(regs: &mut Regs) -> SyscallResult {
     let exit_code = regs.rdx as i32;
-    SyscallResult::switch(thread::exit_thread(exit_code))
+    SyscallResult::switch(Some(thread::exit_thread(exit_code)))
 }
 
 /// Yield syscall (1)
@@ -123,28 +122,25 @@ fn sys_yield(regs: &mut Regs) -> SyscallResult {
 /// Fork syscall (4)
 /// Creates a copy of the current process
 fn sys_fork(regs: &mut Regs) -> SyscallResult {
-    // Fork the address space
-    let new_page_dir = match paging2::fork_current() {
-        Some(pd) => pd,
-        None => return SyscallResult::val(ENOMEM),
-    };
+    // Fork the address space — arch fills in the child's root page table
+    let mut child_root = crate::arch::paging2::RootPageTable::empty();
+    let new_page_dir = startup::arch_user_fork(&mut child_root);
 
-    // Get current thread
+    // Get current thread and save post-COW root (fork marked entries R/O)
     let current = thread::current();
+    startup::arch_save_root(&mut current.root);
 
     // Save current thread's state
     thread::save_state(current, regs);
 
-    // Create child thread (init_fork extracts PDPT entries from new_page_dir)
-    let child = match thread::create_thread(Some(current), new_page_dir, true) {
+    // Create child thread with the pre-filled root page table
+    let child = match thread::create_thread(Some(current), child_root, true) {
         Some(t) => t,
         None => return SyscallResult::val(ENOMEM),
     };
 
-    // Free the child's root page table page — init_fork already extracted the
-    // PDPT entries into the thread's RootPageTable, so the page itself is no
-    // longer needed. Without this, it leaks 1 page per fork.
-    crate::arch::phys_mm::free_phys_page(new_page_dir);
+    // Free the child's root page table page — entries already extracted
+    startup::arch_free_phys_page(new_page_dir);
 
     // Copy CPU state and mode from parent to child
     child.cpu_state = current.cpu_state;
@@ -161,13 +157,13 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
     // Child returns 0
     thread::set_return(child, 0);
 
-    // Parent returns child's TID (when it resumes later)
-    thread::set_return(current, child.tid);
+    // Parent returns child's TID
     current.state = thread::ThreadState::Ready;
+    let child_tid = child.tid;
+    let child_idx = child_tid as usize;
 
     // Switch to child first so it can exec before parent triggers COW faults
-    let child_idx = child.tid as usize;
-    SyscallResult::switch(Some(child_idx))
+    SyscallResult { retval: child_tid, switch_to: Some(child_idx) }
 }
 
 /// Exec syscall (5)
@@ -212,6 +208,11 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let mut buffer = alloc::vec![0; size];
     startup::read_file(&mut buffer);
 
+    let want_64 = match lib::elf::Elf::parse(&buffer) {
+        Ok(e) => e.class() == lib::elf::ElfClass::Elf64,
+        Err(_) => false,
+    };
+
     // DOS executables use the VM86 exec path
     if is_com || is_exe {
         let tid = exec_dos(&buffer, is_exe);
@@ -220,44 +221,22 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     }
 
     // Free current user pages and load new ELF (point of no return)
-    paging2::free_user_pages();
-    paging2::flush_tlb();
+    startup::arch_user_clean();
 
     let loaded = match elf::load_elf(&buffer) {
         Ok(e) => e,
-        Err(_) => { return SyscallResult::switch(thread::exit_thread(-ENOEXEC)); },
+        Err(_) => { return SyscallResult::switch(Some(thread::exit_thread(-ENOEXEC))); },
     };
-
-    let want_64 = loaded.class == elf::ElfClass::Elf64;
-    if want_64 && !paging2::cpu_supports_long_mode() {
-        return SyscallResult::switch(thread::exit_thread(-ENOEXEC));
-    }
 
     let symbols = SymbolData::new(buffer.into_boxed_slice());
 
     let current = thread::current();
     let tid = current.tid as usize;
 
-    // Toggle CPU mode if needed (PAE → Compat)
-    // In compat mode, both 32/64-bit run without toggling.
-    let want_mode = if want_64 { thread::ThreadMode::Mode64 } else { thread::ThreadMode::Mode32 };
-    if want_mode != current.mode {
-        let need_toggle = match paging2::cpu_mode() {
-            paging2::CpuMode::Pae => want_64,
-            paging2::CpuMode::Compat => want_mode == thread::ThreadMode::Mode16,
-            _ => false,
-        };
-        if need_toggle {
-            paging2::ensure_trampoline_mapped();
-            if !want_64 {
-                paging2::sync_hw_pdpt();
-            }
-            descriptors::toggle_mode(paging2::toggle_cr3(want_64));
-        }
-        current.mode = want_mode;
-    }
+    // Just set the mode — arch handles CPU mode toggling in arch_execute
+    current.mode = if want_64 { thread::ThreadMode::Mode64 } else { thread::ThreadMode::Mode32 };
 
-    // Set up argv on the new user stack and get the adjusted SP
+    // Set up argv on the new user stack (demand-pages stack)
     let word = if want_64 { 8usize } else { 4usize };
     let stack = setup_user_stack(&args, want_64, word);
 
@@ -271,6 +250,9 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     }
 
     current.symbols = symbols;
+
+    // Save root after all pages are set up (ELF + demand-paged stack)
+    startup::arch_save_root(&mut current.root);
     // args and buffer dropped here by RAII
     SyscallResult::switch(Some(tid))
 }
@@ -280,12 +262,9 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 fn exec_dos(data: &[u8], is_exe: bool) -> usize {
     use crate::kernel::vm86;
 
-    // Free current user pages
-    paging2::free_user_pages();
-    paging2::flush_tlb();
-
-    // Map first 1MB user-accessible for VM86
-    paging2::map_low_mem_user();
+    // Free current user pages + map first 1MB for VM86
+    startup::arch_user_clean();
+    startup::arch_map_low_mem();
 
     // Set up IVT
     vm86::setup_ivt();
@@ -301,6 +280,7 @@ fn exec_dos(data: &[u8], is_exe: bool) -> usize {
     };
 
     let current = thread::current();
+    startup::arch_save_root(&mut current.root);
     let tid = current.tid as usize;
 
     thread::init_process_thread_vm86(current, cs, ip, ss, sp);

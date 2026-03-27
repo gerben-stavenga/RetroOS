@@ -1136,10 +1136,8 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                 _ => {
                     crate::println!("VM86: FATAL unhandled opcode 0x66 {:#04x} at {:04x}:{:04x}",
                         op, unsafe { regs.frame.f32.cs }, unsafe { regs.frame.f32.eip } - 2);
-                    match thread::exit_thread(-11) {
-                        Some(idx) => Action::Switch(idx),
-                        None => Action::Done,
-                    }
+                    let next = thread::exit_thread(-11);
+                    Action::Switch(next)
                 }
             }
         }
@@ -1151,10 +1149,8 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             crate::println!("VM86: FATAL unhandled opcode {:#04x} at {:04x}:{:04x}",
                 opcode, unsafe { regs.frame.f32.cs }, unsafe { regs.frame.f32.eip } - 1);
             // Kill the VM86 thread
-            match thread::exit_thread(-11) {
-                Some(idx) => Action::Switch(idx),
-                None => Action::Done,
-            }
+            let next = thread::exit_thread(-11);
+            Action::Switch(next)
         }
     }
 }
@@ -1178,10 +1174,8 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
             if let Some(parent) = thread::current().vm86.exec_parent.take() {
                 return exec_return(regs, &parent);
             }
-            match thread::exit_thread(0) {
-                Some(idx) => Action::Switch(idx),
-                None => Action::Done,
-            }
+            let next = thread::exit_thread(0);
+            Action::Switch(next)
         }
         0x21 => int_21h(regs),
         // INT 2Eh — COMMAND.COM internal execute
@@ -1546,10 +1540,8 @@ fn int_21h(regs: &mut Regs) -> Action {
                 return exec_return(regs, &parent);
             }
             let code = regs.rax as u8;
-            match thread::exit_thread(code as i32) {
-                Some(idx) => Action::Switch(idx),
-                None => Action::Done,
-            }
+            let next = thread::exit_thread(code as i32);
+            Action::Switch(next)
         }
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
@@ -2666,30 +2658,24 @@ fn exec_program(regs: &mut Regs) -> Action {
     // --- Fork a new address space for the child ---
     use crate::arch::paging2;
 
-    let new_root = match paging2::fork_current() {
-        Some(r) => r,
-        None => {
-            regs.rax = (regs.rax & !0xFFFF) | 8;
-            unsafe { regs.frame.f32.eflags |= 1; }
-            return Action::Done;
-        }
-    };
+    let mut child_root = crate::arch::paging2::RootPageTable::empty();
+    let new_root = crate::kernel::startup::arch_user_fork(&mut child_root);
 
     // Save parent state
     let current = thread::current();
     thread::save_state(current, regs);
 
     // Create child thread
-    let child = match thread::create_thread(Some(current), new_root, true) {
+    let child = match thread::create_thread(Some(current), child_root, true) {
         Some(t) => t,
         None => {
-            crate::arch::phys_mm::free_phys_page(new_root);
+            crate::kernel::startup::arch_free_phys_page(new_root);
             regs.rax = (regs.rax & !0xFFFF) | 8;
-            unsafe { regs.frame.f32.eflags |= 1; }
+            unsafe { regs.frame.f64.rflags |= 1; }
             return Action::Done;
         }
     };
-    crate::arch::phys_mm::free_phys_page(new_root);
+    crate::kernel::startup::arch_free_phys_page(new_root);
     let child_tid = child.tid;
     let child_idx = child_tid as usize;
 

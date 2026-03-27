@@ -3,8 +3,8 @@
 //! Uses lib::elf for parsing, handles memory mapping.
 //! Page tables are allocated on-demand via the page fault handler.
 
-use crate::arch::paging2::{self, page_idx, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
-use crate::arch::x86;
+use crate::arch::paging2::PAGE_SIZE;
+use crate::kernel::startup::arch_set_page_flags;
 pub use lib::elf::{ElfError, ElfClass};
 
 /// User stack top address (just below kernel space)
@@ -12,22 +12,6 @@ pub const USER_STACK_TOP: usize = 0xC000_0000;
 
 /// User stack size in pages
 pub const USER_STACK_PAGES: usize = 16;  // 64KB stack
-
-/// Set final permissions on a page (called after loading is complete)
-fn finalize_page_permissions<E: Entry>(entries: &mut [E], vaddr: usize, writable: bool, executable: bool) {
-    let page = page_idx(vaddr);
-    let page_addr = vaddr & !(PAGE_SIZE - 1);
-
-    if entries[page].present() {
-        let phys = entries[page].page();
-        let mut entry = E::new(phys, writable, true);
-        entry.set_writable(writable);
-        // Default to NX, clear only for executable segments
-        entry.set_no_execute(!executable);
-        entries[page] = entry;
-        x86::invlpg(page_addr);
-    }
-}
 
 /// Loaded ELF info
 pub struct LoadedElf {
@@ -61,21 +45,12 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
             if seg.is_executable() != executable_pass { continue; }
             let start_page = seg.vaddr / PAGE_SIZE;
             let end_page = (seg.vaddr + seg.memsz + PAGE_SIZE - 1) / PAGE_SIZE;
-            let writable = seg.is_writable();
-
-            for page in start_page..end_page {
-                match paging2::entries() {
-                    Entries::E32(e) => {
-                        finalize_page_permissions(e, page * PAGE_SIZE, writable, executable_pass);
-                    }
-                    Entries::E64(e) => {
-                        finalize_page_permissions(e, page * PAGE_SIZE, writable, executable_pass);
-                    }
-                }
+            let count = end_page - start_page;
+            if count > 0 {
+                arch_set_page_flags(start_page, count, seg.is_writable(), executable_pass);
             }
         }
     }
 
-    paging2::flush_tlb();
     Ok(LoadedElf { entry: elf.entry(), class: elf.class() })
 }

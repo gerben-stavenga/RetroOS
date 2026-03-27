@@ -3,6 +3,7 @@
 # Usage: ./run_qemu.sh [386|686|x64] [extra qemu args...]
 
 set -e
+set -o pipefail
 
 ARCH="${1:-386}"
 shift 2>/dev/null || true

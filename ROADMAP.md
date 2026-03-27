@@ -22,8 +22,12 @@
 - [ ] Implement Linux API for 32-bit
 - [ ] Implement Linux API for 64-bit
 
+### Architecture
+- [ ] Hardware-enforced isolation (Ring 1 segment limits)
+
 ## Completed
 
+- [x] 3-ring architecture: separate Arch (Ring 0) primitives from Kernel (Ring 1) policy
 - [x] PAE paging with 64-bit page table entries
 - [x] NX (No-Execute) bit support
 - [x] Demand paging via page fault handler

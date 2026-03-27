@@ -36,19 +36,18 @@ RetroOS uses three of the four x86 privilege rings:
 | Ring | Role | Paging | Privileged insns | Segment limits |
 |------|------|--------|-----------------|----------------|
 | 0 | arch | supervisor (U/S=0) | yes | flat (full access) |
-| 1 | kernel | supervisor (U/S=0) | no | wrapped (arch region excluded) |
+| 1 | kernel | supervisor (U/S=0) | no | flat (wrapped planned) |
 | 3 | user | user (U/S=1) | no | flat |
 
-Ring 1 is supervisor for paging purposes — it can access U/S=0 pages. But
-x86 segment limits with 32-bit wrapping exclude the arch/page-table region
-from ring-1 access, providing full hardware isolation between arch and
-kernel.
+Ring 1 is supervisor for paging purposes — it can access U/S=0 pages. The
+long-term plan is to use x86 segment limits with 32-bit wrapping to
+exclude the arch/page-table region from ring-1 access, providing full
+hardware isolation between arch and kernel.
 
-This is the x86 protection model used as Intel originally intended:
-paging for user/supervisor isolation, rings for privilege separation,
-and segments for fine-grained memory partitioning between rings.
+### Segment-based arch isolation (planned)
 
-### Segment-based arch isolation
+*Note: For now, Ring 1 uses flat segments. The wrapped model described
+below is a long-term roadmap goal.*
 
 The ring-1 code and data segments use base/limit wrapping to punch a hole
 in the address space:
