@@ -220,8 +220,28 @@ extern "C" fn event_loop(first_tid: usize) -> ! {
                     tid = next;
                 }
             }
-            // IRQs (32-47): already ACK'd+queued by arch, nothing to do
+            // IRQs (32-47): drain queued events and deliver to thread
             32..=47 => {
+                if thread.mode == thread::ThreadMode::Mode16 {
+                    // VM86: deliver pending ticks + drain discrete events
+                    // Use raw pointer to split the borrow between thread and cpu_state
+                    let tp = thread as *mut thread::Thread;
+                    let regs = unsafe { &mut (*tp).cpu_state };
+                    let ticks = crate::arch::irq::take_pending_ticks();
+                    for _ in 0..ticks {
+                        crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(crate::arch::irq::Irq::Tick));
+                    }
+                    crate::arch::irq::drain(|evt| {
+                        crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(evt));
+                    });
+                } else {
+                    // Protected mode: feed scancodes to keyboard pipe
+                    crate::arch::irq::drain(|evt| {
+                        if let crate::arch::irq::Irq::Key(sc) = evt {
+                            crate::kernel::keyboard::process_key(sc);
+                        }
+                    });
+                }
                 if let Some(next) = thread::schedule() {
                     tid = next;
                 }
