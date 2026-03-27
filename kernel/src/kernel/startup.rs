@@ -5,12 +5,11 @@
 extern crate alloc;
 
 use alloc::vec;
-use crate::arch::paging2::{KERNEL_BASE, PAGE_TABLE_BASE};
+use crate::arch::paging2::PAGE_TABLE_BASE;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::{elf, hdd};
 use crate::println;
 use crate::kernel::thread;
-use crate::arch::x86;
 use lib::tar::TarHeader;
 
 /// TAR block size (same as disk sector size)
@@ -131,8 +130,10 @@ pub fn read_data_at_block(block: u32, buffer: &mut [u8]) -> u32 {
     hdd::read_sectors(lba, buffer)
 }
 
-/// Startup: load and run init.elf
-pub fn startup(start_sector: u32) -> ! {
+/// Startup: load and run init.elf, then enter event loop.
+/// Called from enter_ring1 — we are already at ring 1.
+pub extern "C" fn startup(start_sector: usize) -> ! {
+    let start_sector = start_sector as u32;
     println!("Initializing filesystem at sector {:#x}", start_sector);
 
     init_fs(start_sector);
@@ -162,11 +163,6 @@ pub fn startup(start_sector: u32) -> ! {
 
     println!("Entry point: {:#x}", loaded.entry);
 
-    // Temporarily map trampoline so copy_trampoline's data is accessible,
-    // then clear it — page 0xF is used by VM86 for the environment block.
-    crate::arch::paging2::ensure_trampoline_mapped();
-    crate::arch::paging2::clear_trampoline();
-
     // Set up user stack with argc=0 for _start(argc, argv)
     let stack_top = PAGE_TABLE_BASE as u32;
     let stack = stack_top - 12; // [dummy_ret=0] [argc=0] [argv=ptr]
@@ -177,60 +173,207 @@ pub fn startup(start_sector: u32) -> ! {
     }
     println!("User stack: {:#x}", stack);
 
-    // Create init thread (0 = use current address space)
-    let init_thread = thread::create_thread(None, 0, true)
+    // Create init thread (capture current address space after ELF loaded)
+    let mut root = crate::arch::paging2::RootPageTable::empty();
+    arch_save_root(&mut root);
+    let init_thread = thread::create_thread(None, root, true)
         .expect("Failed to create init thread");
 
     init_thread.symbols = symbols;
     thread::init_process_thread(init_thread, loaded.entry as u32, stack);
     println!("Starting init process...");
 
-    // Drop to ring 1 — kernel event loop runs at CPL=1
-    crate::arch::descriptors::enter_ring1();
-    println!("Running at ring 1");
-
-    // Event loop: execute threads via arch INT, handle returned events
-    let tid = init_thread.tid as usize;
-    event_loop(tid);
+    // Enter event loop (already at ring 1)
+    event_loop(init_thread.tid as usize);
 }
 
 /// Ring-1 kernel event loop.
-/// Calls arch execute(tid) via INT 0x80. Arch switches to the user thread
+/// Calls arch execute() via INT 0x80. Arch switches to the user thread
 /// and returns here when an event occurs (syscall, IRQ, fault).
-fn event_loop(first_tid: usize) -> ! {
+extern "C" fn event_loop(first_tid: usize) -> ! {
+    crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut tid = first_tid;
     loop {
-        let event = arch_execute(tid);
+        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+        thread::set_current(tid);
+
+        // 1. Sync thread state TO Arch (load hardware context)
+        set_arch_user_pages(&thread.root);
+        set_arch_user_mode(match thread.mode {
+            thread::ThreadMode::Mode16 => 0,
+            thread::ThreadMode::Mode32 => 1,
+            thread::ThreadMode::Mode64 => 2,
+        });
+        set_arch_user_regs(&thread.cpu_state);
+
+        // 2. Switch to user mode via Arch primitive
+        let (event, extra) = do_arch_execute();
+
+        // 3. Sync thread state FROM Arch (hardware returned an event)
+        get_arch_user_regs(&mut thread.cpu_state);
+        arch_save_root(&mut thread.root);
+
         match event {
             // Syscall: dispatch using the thread's saved state
             48 => {
-                let thread = crate::kernel::thread::current();
                 if let Some(next) = crate::kernel::syscalls::dispatch(&mut thread.cpu_state) {
                     tid = next;
                 }
             }
             // IRQs (32-47): already ACK'd+queued by arch, nothing to do
-            32..=47 => {}
+            32..=47 => {
+                if let Some(next) = thread::schedule() {
+                    tid = next;
+                }
+            }
+            // Page fault (14): arch passes fault address in extra (EDX).
+            14 => {
+                let fault_addr = extra as usize;
+                if let Some(next) = thread::signal_thread(thread, fault_addr) {
+                    tid = next;
+                }
+            }
             // Everything else: for now just re-execute
             _ => {}
         }
     }
 }
 
-/// Call arch execute(tid) via INT 0x80.
-/// Returns the interrupt number that caused the return.
+/// Call arch execute() via INT 0x80.
+/// Returns (event_number, extra). Extra = fault address for event 14.
 #[inline(never)]
-fn arch_execute(tid: usize) -> u32 {
+fn do_arch_execute() -> (u32, u32) {
     let event: u32;
+    let extra: u32;
     unsafe {
         core::arch::asm!(
             "int 0x80",
             inout("eax") crate::arch::traps::arch_call::EXECUTE as u32 => event,
-            in("edx") tid as u32,
+            out("edx") extra,
             out("ecx") _,
             out("ebx") _,
             out("edi") _,
         );
     }
-    event
+    (event, extra)
+}
+
+fn set_arch_user_pages(root: &crate::arch::paging2::RootPageTable) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::SET_USER_PAGES as u32,
+            in("edx") root as *const _ as u32,
+        );
+    }
+}
+
+fn set_arch_user_mode(mode: u32) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::SET_USER_MODE as u32,
+            in("edx") mode,
+        );
+    }
+}
+
+fn set_arch_user_regs(regs: &crate::Regs) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::SET_USER_REGS as u32,
+            in("edx") regs as *const _ as u32,
+        );
+    }
+}
+
+fn get_arch_user_regs(regs: &mut crate::Regs) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::GET_USER_REGS as u32,
+            in("edx") regs as *mut _ as u32,
+        );
+    }
+}
+
+/// Fork the current user address space. Fills `out` with the child's root page table.
+/// Returns the physical page number of the child's root.
+pub fn arch_user_fork(out: &mut crate::arch::paging2::RootPageTable) -> u64 {
+    let new_root: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("eax") crate::arch::traps::arch_call::FORK as u32 => new_root,
+            in("edx") out as *mut _ as u32,
+        );
+    }
+    new_root as u64
+}
+
+pub fn arch_user_clean() {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::CLEAN as u32,
+        );
+    }
+}
+
+pub fn arch_user_map(vpage: usize, ppage: u64) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::MAP as u32,
+            in("edx") vpage as u32,
+            in("ebx") ppage as u32,
+        );
+    }
+}
+
+/// Set page permissions for a range. flags: bit 0 = writable, bit 1 = executable.
+pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, executable: bool) {
+    let flags = (writable as u32) | ((executable as u32) << 1);
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::SET_PAGE_FLAGS as u32,
+            in("edx") start_vpage as u32,
+            in("ecx") count as u32,
+            in("ebx") flags,
+        );
+    }
+}
+
+/// Map first 1MB user-accessible for VM86.
+pub fn arch_map_low_mem() {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::MAP_LOW_MEM as u32,
+        );
+    }
+}
+
+/// Free a physical page.
+pub fn arch_free_phys_page(phys: u64) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::FREE_PHYS_PAGE as u32,
+            in("edx") phys as u32,
+        );
+    }
+}
+
+/// Save current address space root into a RootPageTable.
+pub fn arch_save_root(out: &mut crate::arch::paging2::RootPageTable) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::SAVE_ROOT as u32,
+            in("edx") out as *mut _ as u32,
+        );
+    }
 }

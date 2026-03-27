@@ -12,6 +12,8 @@
 //! - 0x50: Ring-1 Code 32-bit (OS kernel)
 //! - 0x58: Ring-1 Data (OS kernel)
 
+#![allow(static_mut_refs)]
+
 use crate::arch::x86::{self, GdtPtr, IdtPtr};
 
 /// Segment selectors - 32-bit (compatibility mode)
@@ -468,34 +470,36 @@ pub fn toggle_mode(new_cr3: u32) {
     x86::sti();
 }
 
-/// Drop from ring 0 to ring 1. Returns normally, but caller is now at CPL=1.
+/// Drop from ring 0 to ring 1 and jump to the kernel entry point.
 ///
-/// Builds a fake IRET frame with RING1_CS/RING1_DS and EIP pointing to the
-/// instruction after IRET. After this returns, all code executes at ring 1.
-pub fn enter_ring1() {
+/// Switches to KERNEL_STACK and jumps to `entry` with `arg` passed on the stack.
+pub fn enter_ring1(entry: extern "C" fn(usize) -> !, arg: usize) -> ! {
     unsafe {
+        let kernel_stack_top = (crate::KERNEL_STACK.as_ptr_range().end) as u32;
+        
+        // Build a C call frame on KERNEL_STACK: [ESP]=ret_addr, [ESP+4]=arg
+        *((kernel_stack_top - 4) as *mut u32) = arg as u32;   // arg
+        *((kernel_stack_top - 8) as *mut u32) = 0;            // dummy return address
+        let esp_with_arg = kernel_stack_top - 8;
+
         core::arch::asm!(
-            "mov {orig_esp:e}, esp",  // save ESP before pushes
-            "push {ss:e}",            // SS = RING1_DS
-            "push {orig_esp:e}",      // ESP = original (before pushes)
-            "pushfd",                 // EFLAGS
-            "or dword ptr [esp], 0x1000", // set IOPL=1 so ring-1 can do I/O
-            "and dword ptr [esp], ~0x200", // clear IF — no interrupts until segments loaded
-            "push {cs:e}",            // CS = RING1_CS
-            "lea {tmp:e}, [2f]",
-            "push {tmp:e}",           // EIP = after iretd
-            "iretd",
-            "2:",                     // now at ring 1, interrupts disabled
             "mov ds, {ds:e}",
             "mov es, {ds:e}",
             "mov fs, {ds:e}",
             "mov gs, {ds:e}",
-            "sti",                    // safe to take interrupts now
+            "push {ss:e}",            // SS = RING1_DS
+            "push {esp:e}",           // ESP = KERNEL_STACK_TOP (minus arg)
+            "pushfd",                 // EFLAGS
+            "or dword ptr [esp], 0x1000", // set IOPL=1 so ring-1 can do I/O
+            "push {cs:e}",            // CS = RING1_CS
+            "push {eip:e}",           // EIP = entry
+            "iretd",
             ss = in(reg) RING1_DS as u32,
+            esp = in(reg) esp_with_arg,
             cs = in(reg) RING1_CS as u32,
             ds = in(reg) RING1_DS as u32,
-            orig_esp = out(reg) _,
-            tmp = out(reg) _,
+            eip = in(reg) entry,
+            options(noreturn)
         );
     }
 }

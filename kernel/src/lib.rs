@@ -53,13 +53,13 @@ static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
 /// Kernel pages - statically allocated page tables
 static mut KERNEL_PAGES: KernelPages = unsafe { core::mem::zeroed() };
 
-/// Kernel stack - 128KB
-static mut KERNEL_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
+/// Kernel stack - 128KB (used for Ring 1 event loop)
+pub static mut KERNEL_STACK: [u8; 128 * 1024] = [0; 128 * 1024];
 
-/// Ring-0 arch stack — used as TSS ESP0 so that interrupts from ring 1
-/// don't clobber the ring-1 kernel's call frames.
+/// Ring-0 arch stack — used as TSS ESP0 so that interrupts from ring 1/3
+/// don't clobber the kernel's call frames.
 #[unsafe(link_section = ".data")]
-static mut ARCH_STACK: [u8; 128 * 1024] = [0; 128 * 1024];
+pub static mut ARCH_STACK: [u8; 128 * 1024] = [0; 128 * 1024];
 
 // External assembly functions
 unsafe extern "C" {
@@ -206,8 +206,8 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");
 
-    // Start the init process (never returns)
-    kernel::startup::startup(boot_data.start_sector);
+    // Drop to ring 1 — kernel starts here
+    arch::descriptors::enter_ring1(kernel::startup::startup, boot_data.start_sector as usize);
 }
 
 /// CPU-pushed interrupt frame for 32-bit mode
@@ -215,7 +215,8 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Frame32 {
-    pub _pad: [u32; 5],  // 20 bytes padding
+    /// Padding to align with 64-bit frame layout
+    pub _pad: [u32; 5],
     pub eip: u32,
     pub cs: u32,
     pub eflags: u32,
@@ -319,11 +320,6 @@ impl Regs {
         }
     }
 
-    /// In compat mode, the CPU always pushes Frame64 (even for 32-bit user code)
-    pub fn use_f64() -> bool {
-        crate::arch::paging2::cpu_mode() == crate::arch::paging2::CpuMode::Compat
-    }
-
     /// Convert frame from Frame32 to Frame64 format
     pub fn frame_to_64(&mut self) {
         unsafe {
@@ -367,39 +363,30 @@ impl Regs {
         }
     }
 
-    /// Get instruction pointer (works for both 32 and 64-bit modes)
+    /// Get instruction pointer.
+    /// Regs are always normalized to f64 format by arch before kernel sees them.
     pub fn ip(&self) -> u64 {
-        unsafe {
-            if Self::use_f64() { self.frame.f64.rip } else { self.frame.f32.eip as u64 }
-        }
+        unsafe { self.frame.f64.rip }
     }
 
     /// Get code segment
     pub fn code_seg(&self) -> u16 {
-        unsafe {
-            if Self::use_f64() { self.frame.f64.cs as u16 } else { self.frame.f32.cs as u16 }
-        }
+        unsafe { self.frame.f64.cs as u16 }
     }
 
     /// Get flags
     pub fn flags(&self) -> u64 {
-        unsafe {
-            if Self::use_f64() { self.frame.f64.rflags } else { self.frame.f32.eflags as u64 }
-        }
+        unsafe { self.frame.f64.rflags }
     }
 
     /// Get stack pointer
     pub fn sp(&self) -> u64 {
-        unsafe {
-            if Self::use_f64() { self.frame.f64.rsp } else { self.frame.f32.esp as u64 }
-        }
+        unsafe { self.frame.f64.rsp }
     }
 
     /// Get stack segment
     pub fn stack_seg(&self) -> u16 {
-        unsafe {
-            if Self::use_f64() { self.frame.f64.ss as u16 } else { self.frame.f32.ss as u16 }
-        }
+        unsafe { self.frame.f64.ss as u16 }
     }
 }
 

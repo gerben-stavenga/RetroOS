@@ -7,14 +7,10 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
-use crate::arch::paging2::{self, Entry, Entry32, Entry64, Entries, PAGE_SIZE};
-use crate::arch::phys_mm;
+use crate::arch::paging2::PAGE_SIZE;
 
 /// Heap ends before the top of address space
 pub const HEAP_END: usize = 0xFFF0_0000;
-
-/// Total physical pages consumed by the heap (never returned)
-static mut HEAP_PAGES: u32 = 0;
 
 /// Track large allocs/deallocs for debugging
 static mut LARGE_ALLOCS: u32 = 0;
@@ -80,26 +76,25 @@ impl KernelAllocator {
 }
 
 impl AllocatorInner {
-    /// Extend the heap by mapping more pages.
-    /// Skips the temp_map reserved page (0xC0BFF000) if encountered.
+    /// Extend the heap by claiming virtual address space.
+    /// Actual physical pages are demand-allocated by the arch page fault handler.
+    /// Skips the temp_map reserved page if encountered.
     fn extend_heap(&mut self, min_size: usize) -> bool {
         let pages_needed = (min_size + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages_needed = pages_needed.max(4); // Allocate at least 4 pages at a time
-        let temp_map_addr = paging2::temp_map_vaddr();
+        let temp_map_addr = crate::arch::paging2::temp_map_vaddr();
 
         let mut region_start = self.mapped_end;
         let mut region_pages = 0;
 
-        // Keep mapping until we have one contiguous region >= pages_needed
         while region_pages < pages_needed {
             if self.mapped_end >= HEAP_END {
                 break;
             }
 
-            // Skip the temp_map reserved page — flush the current region
+            // Skip the temp_map reserved page
             if self.mapped_end == temp_map_addr {
                 if region_pages > 0 {
-                    paging2::flush_tlb();
                     self.add_free_region(region_start, region_pages * PAGE_SIZE);
                     region_pages = 0;
                 }
@@ -108,23 +103,9 @@ impl AllocatorInner {
                 continue;
             }
 
-            let phys_page = match phys_mm::alloc_phys_page() {
-                Some(p) => p,
-                None => break,
-            };
-            unsafe { HEAP_PAGES += 1; }
-
-            let virt_page_idx = self.mapped_end / PAGE_SIZE;
-            match paging2::entries() {
-                Entries::E32(e) => e[virt_page_idx] = Entry32::new(phys_page, true, false),
-                Entries::E64(e) => e[virt_page_idx] = Entry64::new(phys_page, true, false),
-            }
-
             self.mapped_end += PAGE_SIZE;
             region_pages += 1;
         }
-
-        paging2::flush_tlb();
 
         if region_pages > 0 {
             self.add_free_region(region_start, region_pages * PAGE_SIZE);

@@ -3,8 +3,10 @@
 //! Ring-0 interrupt handler. Zero imports from kernel/ — all policy decisions
 //! are returned to the ring-1 kernel as events via the execute() interface.
 
+#![allow(static_mut_refs)]
+
 use crate::arch::irq::handle_irq;
-use crate::arch::paging2::{self, RawPage};
+use crate::arch::paging2::{self, Entry, RawPage};
 use crate::{println, dbg_println};
 use crate::arch::x86;
 use crate::Regs;
@@ -13,23 +15,131 @@ use crate::Regs;
 // Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
 // =============================================================================
 
-/// Saved ring-1 kernel context for returning from execute()
-#[allow(static_mut_refs)]
-static mut KERNEL_REGS: Option<Regs> = None;
+// =============================================================================
+// Arch state (Ring 0 maintains state for Ring 1 and Ring 3)
+// =============================================================================
 
-/// Saved user regs from last execute() return — kernel reads this
-/// to get the user thread's state after an event.
-pub static mut USER_REGS: Regs = unsafe { core::mem::zeroed() };
+/// Kernel state (Ring 1): saved registers when blocked in execute()
+static mut KERNEL_STATE: Option<Regs> = None;
+
+/// User state storage with padding for VM86 segments
+#[repr(C)]
+struct StoredUserState {
+    regs: Regs,
+    /// Space for 4 segments (ES, DS, FS, GS) pushed past Regs in VM86 mode
+    vm86_padding: [u32; 4],
+}
+
+/// User state (Ring 3): Registers + Pages (root) + Mode
+static mut USER_STATE: StoredUserState = StoredUserState {
+    regs: Regs::empty(),
+    vm86_padding: [0; 4],
+};
+static mut USER_ROOT: paging2::RootPageTable = paging2::RootPageTable::empty();
+static mut USER_MODE: u32 = 1; // 0=VM86, 1=32-bit, 2=64-bit
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
+    /// Switch to the currently loaded User State
     pub const EXECUTE: u64 = 0x100;
+    /// Copy Arch's USER_REGS to Ring 1 buffer (EDX=ptr)
+    pub const GET_USER_REGS: u64 = 0x101;
+    /// Copy Ring 1 buffer to Arch's USER_REGS (EDX=ptr)
+    pub const SET_USER_REGS: u64 = 0x102;
+    /// Load new User Pages (root) (EDX=ptr to RootPageTable)
+    pub const SET_USER_PAGES: u64 = 0x103;
+    /// Set User Mode (EDX: 0=VM86, 1=32, 2=64)
+    pub const SET_USER_MODE: u64 = 0x104;
+    /// COW fork. EDX=ptr to RootPageTable (filled with child entries).
+    /// Returns new root phys in EAX.
+    pub const FORK: u64 = 0x105;
+    /// Free all current User Pages + flush TLB.
+    pub const CLEAN: u64 = 0x106;
+    /// Map a user page (EDX=vpage, EBX=phys_page).
+    pub const MAP: u64 = 0x107;
+    /// Set page flags for a range (EDX=start_vpage, ECX=count, EBX=flags).
+    /// flags: bit 0 = writable, bit 1 = executable. Flushes TLB.
+    pub const SET_PAGE_FLAGS: u64 = 0x108;
+    /// Map first 1MB user-accessible for VM86.
+    pub const MAP_LOW_MEM: u64 = 0x109;
+    /// Free a physical page (EDX=phys_page_number as u64).
+    pub const FREE_PHYS_PAGE: u64 = 0x10A;
+    /// Save current address space root into EDX=ptr to RootPageTable.
+    pub const SAVE_ROOT: u64 = 0x10B;
 }
 
 /// Handle INT 0x80 from ring 1: arch primitive dispatch.
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
         arch_call::EXECUTE => arch_execute(regs),
+        arch_call::GET_USER_REGS => {
+            let ptr = regs.rdx as usize as *mut Regs;
+            unsafe { *ptr = USER_STATE.regs; }
+        }
+        arch_call::SET_USER_REGS => {
+            let ptr = regs.rdx as usize as *const Regs;
+            unsafe { USER_STATE.regs = *ptr; }
+        }
+        arch_call::SET_USER_PAGES => {
+            let ptr = regs.rdx as usize as *const paging2::RootPageTable;
+            unsafe { USER_ROOT = *ptr; }
+        }
+        arch_call::SET_USER_MODE => {
+            unsafe { USER_MODE = regs.rdx as u32; }
+        }
+        arch_call::FORK => {
+            let out_ptr = regs.rdx as usize as *mut paging2::RootPageTable;
+            let old_root = unsafe { USER_ROOT };
+            unsafe { USER_ROOT.activate(); }
+            let new_root_phys = paging2::fork_current().expect("Arch: Fork failed (OOM)");
+            // Fill in the child's RootPageTable via temp_map (ring 0)
+            let mut child_root = paging2::RootPageTable::empty();
+            child_root.init_fork(new_root_phys);
+            unsafe { *out_ptr = child_root; }
+            unsafe { USER_ROOT = old_root; }
+            regs.rax = new_root_phys;
+        }
+        arch_call::CLEAN => {
+            paging2::free_user_pages();
+        }
+        arch_call::MAP => {
+            let vpage = regs.rdx as usize;
+            let ppage = regs.rbx as u64;
+            paging2::map_user_page_phys(vpage, ppage);
+        }
+        arch_call::SET_PAGE_FLAGS => {
+            let start = regs.rdx as usize;
+            let count = regs.rcx as usize;
+            let flags = regs.rbx as u32;
+            let writable = flags & 1 != 0;
+            let executable = flags & 2 != 0;
+            match paging2::entries() {
+                paging2::Entries::E32(e) => {
+                    for i in 0..count {
+                        set_page_flags_entry(e, (start + i) * paging2::PAGE_SIZE, writable, executable);
+                    }
+                }
+                paging2::Entries::E64(e) => {
+                    for i in 0..count {
+                        set_page_flags_entry(e, (start + i) * paging2::PAGE_SIZE, writable, executable);
+                    }
+                }
+            }
+            paging2::flush_tlb();
+        }
+        arch_call::MAP_LOW_MEM => {
+            paging2::map_low_mem_user();
+        }
+        arch_call::FREE_PHYS_PAGE => {
+            let phys = regs.rdx;
+            crate::arch::phys_mm::free_phys_page(phys);
+        }
+        arch_call::SAVE_ROOT => {
+            let out = regs.rdx as usize as *mut paging2::RootPageTable;
+            let mut root = paging2::RootPageTable::empty();
+            root.init_current();
+            unsafe { *out = root; }
+        }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }
 }
@@ -39,38 +149,97 @@ unsafe extern "C" {
     fn exit_kernel(cpu_state: *const Regs, use_long_frame: u32) -> !;
 }
 
-/// Arch execute(): save kernel context, switch to user thread.
+/// Arch execute(): perform hardware switch to user mode.
 ///
-/// The kernel passes a pointer to the user Regs in EDX.
-/// Arch loads those regs and IRETs to the user process.
-/// When the user produces an event, arch saves user state to USER_REGS
-/// and returns to the kernel's execute() call site with the event in EAX.
+/// Uses the USER_REGS, USER_ROOT, and USER_MODE currently stored in arch.
 fn arch_execute(regs: &mut Regs) {
-    // Save kernel's return context
-    unsafe { KERNEL_REGS = Some(*regs); }
+    // Save current Ring 1 kernel state
+    unsafe { KERNEL_STATE = Some(*regs); }
 
-    // Read user regs pointer from EDX
-    let user_regs_ptr = regs.rdx as usize as *const Regs;
-    let user_regs = unsafe { &*user_regs_ptr };
+    let root = unsafe { &mut USER_ROOT };
+    let mode = unsafe { USER_MODE };
 
-    // TODO: activate address space, set TSS, mode toggle
-    // For now, just IRET to user with the provided regs
-    let is_long = user_regs.code_seg() == crate::arch::descriptors::USER_CS64 as u16;
+    // 1. Activate address space (Pages)
+    let current_mode = paging2::cpu_mode();
+    let want_64 = mode == 2;
+    let want_vm86 = mode == 0;
+
+    let need_toggle = match current_mode {
+        paging2::CpuMode::Pae => want_64,
+        paging2::CpuMode::Compat => want_vm86,
+        _ => false,
+    };
+
+    if need_toggle {
+        root.load_entries();
+        paging2::sync_hw_pdpt();
+        x86::flush_tlb();
+        paging2::ensure_trampoline_mapped();
+        crate::arch::descriptors::toggle_mode(paging2::toggle_cr3(want_64));
+        paging2::clear_trampoline();
+    } else {
+        root.activate();
+    }
+
+    // 2. Update kernel stack in TSS (so interrupts return to Ring 0)
+    let stack_top = unsafe { (crate::ARCH_STACK.as_ptr_range().end) as usize };
+    if want_64 || x86::read_cr4() & x86::cr4::PAE != 0 {
+        crate::arch::descriptors::set_kernel_stack_64(stack_top as u64);
+    } else {
+        crate::arch::descriptors::set_kernel_stack(stack_top as u32);
+    }
+
+    // 3. IRET to User Mode (Registers)
+    let user_regs = unsafe { &mut USER_STATE.regs };
+    if want_vm86 {
+        // Copy segments from Regs to VM86 "extra" stack area (past end of Regs struct)
+        // exit_interrupt_32 expects these 4 segments to be at the end of the stack frame.
+        unsafe { vm86_swap_out(user_regs); }
+        // Zero internal segments to avoid loading invalid selectors in exit_interrupt_32
+        user_regs.ds = 0;
+        user_regs.es = 0;
+        user_regs.fs = 0;
+        user_regs.gs = 0;
+    }
+
+    // Kernel stores regs in f64 format. Convert to f32 if CPU uses 32-bit frames.
+    let is_long = paging2::cpu_mode() == paging2::CpuMode::Compat;
+    if !is_long {
+        user_regs.frame_to_32();
+    }
+
     unsafe {
-        exit_kernel(user_regs_ptr, is_long as u32);
+        exit_kernel(user_regs, is_long as u32);
     }
 }
 
 /// Return to ring-1 kernel with an event.
-/// Saves user regs to USER_REGS, restores kernel context, sets EAX = int_num.
+/// Saves user regs to USER_STATE if coming from ring 3, restores kernel context, sets EAX = event.
 #[allow(static_mut_refs)]
-fn return_to_kernel(regs: &mut Regs, int_num: u64) {
-    // Save user state where kernel can read it
-    unsafe { USER_REGS = *regs; }
+fn return_to_kernel(regs: &mut Regs, event: u64) {
+    // Determine if we are returning from a user-mode event or a ring-1 arch call.
+    // User-mode events must save their updated state so the kernel can see it.
+    let user = raw_code_seg(regs) & 3 == 3 || is_vm86(regs);
 
-    // Restore kernel context with event number in EAX
-    let mut kregs = unsafe { KERNEL_REGS.take().unwrap() };
-    kregs.rax = int_num;
+    if user {
+        unsafe {
+            if is_vm86(regs) {
+                vm86_swap_in(regs);
+            }
+            // Normalize to f64 so kernel always sees a uniform format
+            if paging2::cpu_mode() != paging2::CpuMode::Compat {
+                regs.frame_to_64();
+            }
+            USER_STATE.regs = *regs;
+        }
+    }
+
+    // Restore Ring 1 kernel state with event in EAX, fault addr in EDX
+    let mut kregs = unsafe { KERNEL_STATE.take().expect("Arch: KERNEL_STATE is None during return") };
+    kregs.rax = event;
+    if event == 14 {
+        kregs.rdx = x86::read_cr2() as u64;
+    }
     *regs = kregs;
 }
 
@@ -87,7 +256,7 @@ fn return_to_kernel(regs: &mut Regs, int_num: u64) {
 pub extern "C" fn isr_handler(regs: *mut Regs) {
     let regs = unsafe { &mut *regs };
     let int_num = regs.int_num;
-    let source_ring = regs.code_seg() & 3;
+    let source_ring = raw_code_seg(regs) & 3;
     let vm86 = is_vm86(regs);
 
     // VM86 segment swap on entry
@@ -100,6 +269,11 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
     // =========================================================================
     if source_ring == 1 {
         match int_num {
+            14 => {
+                if try_handle_page_fault(regs).is_none() {
+                    panic_with_regs("Unhandled page fault in ring-1 kernel", regs);
+                }
+            }
             32..=47 => handle_irq(regs),
             48 => arch_dispatch(regs),
             _ => panic_with_regs("Unexpected interrupt from ring-1 kernel", regs),
@@ -111,7 +285,7 @@ pub extern "C" fn isr_handler(regs: *mut Regs) {
     // Ring 3 (or VM86): user process was interrupted — return to kernel
     // =========================================================================
     #[allow(static_mut_refs)]
-    if (source_ring == 3 || vm86) && unsafe { KERNEL_REGS.is_some() } {
+    if (source_ring == 3 || vm86) && unsafe { KERNEL_STATE.is_some() } {
         // ACK hardware IRQs
         if (32..=47).contains(&int_num) {
             handle_irq(regs);
@@ -178,9 +352,14 @@ fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
         return None; // Let kernel handle (segfault)
     }
 
-    // Kernel fault in kernel code/data region (not heap) is a bug
-    if !user && fault_addr >= KERNEL_BASE {
-        return None; // Let kernel handle (panic)
+    // Kernel fault in heap region: demand-page a real writable page
+    if !user && fault_addr >= KERNEL_BASE && fault_addr < crate::kernel::heap::HEAP_END {
+        let heap_start = crate::kernel::heap::heap_base();
+        if fault_addr >= heap_start && !present {
+            return Some(demand_page_kernel(fault_addr));
+        }
+        // Present fault or below heap_base in kernel space is a bug
+        return None;
     }
 
     // Dispatch based on mode
@@ -235,6 +414,19 @@ fn handle_protection_fault<E: paging2::Entry>(
     None // Unexpected, let kernel handle
 }
 
+/// Set final permissions on a page (for SET_PAGE_FLAGS arch call)
+fn set_page_flags_entry<E: paging2::Entry>(entries: &mut [E], vaddr: usize, writable: bool, executable: bool) {
+    let page = paging2::page_idx(vaddr);
+    if entries[page].present() {
+        let phys = entries[page].page();
+        let mut entry = E::new(phys, writable, true);
+        entry.set_writable(writable);
+        entry.set_no_execute(!executable);
+        entries[page] = entry;
+        x86::invlpg(vaddr & !(paging2::PAGE_SIZE - 1));
+    }
+}
+
 /// Demand page allocation for not-present pages
 fn demand_page<E: paging2::Entry>(
     entries: &mut [E],
@@ -257,10 +449,37 @@ fn demand_page<E: paging2::Entry>(
 // VM86 segment helpers
 // =============================================================================
 
+/// Demand-page a kernel heap page: allocate a real writable physical page.
+fn demand_page_kernel(fault_addr: usize) {
+    let phys = crate::arch::phys_mm::alloc_phys_page()
+        .expect("Arch: OOM during kernel heap demand paging");
+    let page_index = paging2::page_idx(fault_addr);
+    match paging2::entries() {
+        paging2::Entries::E32(e) => {
+            e[page_index] = paging2::Entry32::new(phys, true, false);
+        }
+        paging2::Entries::E64(e) => {
+            e[page_index] = paging2::Entry64::new(phys, true, false);
+        }
+    }
+    paging2::flush_tlb();
+}
+
+/// Read code segment from raw interrupt frame (ring 0: knows CPU mode).
+fn raw_code_seg(regs: &Regs) -> u16 {
+    unsafe {
+        if paging2::cpu_mode() == paging2::CpuMode::Compat {
+            regs.frame.f64.cs as u16
+        } else {
+            regs.frame.f32.cs as u16
+        }
+    }
+}
+
 const VM_FLAG: u64 = 1 << 17;
 
 fn is_vm86(regs: &Regs) -> bool {
-    if Regs::use_f64() { return false; }
+    if paging2::cpu_mode() == paging2::CpuMode::Compat { return false; }
     unsafe { regs.frame.f32.eflags as u64 & VM_FLAG != 0 }
 }
 

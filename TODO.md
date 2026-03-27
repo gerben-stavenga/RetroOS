@@ -15,3 +15,6 @@
 - [ ] EMS (Expanded Memory Specification) support
 - [ ] VCPI (Virtual Control Program Interface) support
 - [ ] DPMI (DOS Protected Mode Interface) support
+
+## Architecture
+- [ ] Hardware-enforced isolation: shrink Ring 1 segment limits to exclude Ring 0/Arch region (long-term)
