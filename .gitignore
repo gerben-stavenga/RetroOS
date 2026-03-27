@@ -17,3 +17,6 @@ rust-project.json
 # IDE
 .vscode/
 .idea/
+
+# Proprietary binaries (not for public distribution)
+apps-proprietary/
