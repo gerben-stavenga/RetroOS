@@ -243,7 +243,11 @@ impl RootPageTable {
                     // (init_fork debug removed)
                 }
                 temp_unmap();
-                unsafe { self.e64[3] = crate::thread::current().root.e64[3]; }
+                // Read PML4 phys from live constant root (not parent's saved root which may be empty)
+                if let Entries::E64(e) = entries() {
+                    let pml4_page = e[root_base() + 4].page();
+                    unsafe { self.e64[3] = Entry64(pml4_page * PAGE_SIZE as u64); }
+                }
             }
         }
     }

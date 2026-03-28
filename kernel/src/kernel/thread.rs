@@ -153,6 +153,16 @@ pub fn get_thread(tid: usize) -> Option<&'static mut Thread> {
     }
 }
 
+/// Get mutable references to two different threads (for switch_to).
+pub fn get_two_threads(a: usize, b: usize) -> (&'static mut Thread, &'static mut Thread) {
+    assert!(a != b && a < MAX_THREADS && b < MAX_THREADS);
+    unsafe {
+        let pa = &mut THREADS[a] as *mut Thread;
+        let pb = &mut THREADS[b] as *mut Thread;
+        (&mut *pa, &mut *pb)
+    }
+}
+
 /// Create a new thread with the given root page table.
 pub fn create_thread(parent: Option<&Thread>, root: crate::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
     unsafe {

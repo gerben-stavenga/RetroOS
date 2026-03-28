@@ -237,12 +237,8 @@ fn event_loop(first_tid: usize) -> ! {
 
         if let Some(new_tid) = new_tid {
             if new_tid != tid {
-                arch_switch_to(
-                    &mut thread::get_thread(tid).unwrap().cpu_state,
-                    &mut thread::get_thread(tid).unwrap().root,
-                    &thread::get_thread(new_tid).unwrap().cpu_state,
-                    &thread::get_thread(new_tid).unwrap().root,
-                );
+                let (old, new) = thread::get_two_threads(tid, new_tid);
+                arch_switch_to(&mut old.cpu_state, &mut old.root, &new.cpu_state, &new.root);
                 tid = new_tid;
                 thread::set_current(tid);
             }
