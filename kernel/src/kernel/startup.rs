@@ -5,7 +5,6 @@
 extern crate alloc;
 
 use alloc::vec;
-use crate::arch::paging2::PAGE_TABLE_BASE;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::{elf, hdd};
 use crate::println;
@@ -134,6 +133,10 @@ pub fn read_data_at_block(block: u32, buffer: &mut [u8]) -> u32 {
 /// Called from enter_ring1 — we are already at ring 1.
 pub extern "C" fn startup(start_sector: usize) -> ! {
     let start_sector = start_sector as u32;
+
+    // Initialize threading (must happen at ring 1, before any heap use)
+    crate::kernel::thread::init_threading();
+
     println!("Initializing filesystem at sector {:#x}", start_sector);
 
     init_fs(start_sector);
@@ -164,7 +167,7 @@ pub extern "C" fn startup(start_sector: usize) -> ! {
     println!("Entry point: {:#x}", loaded.entry);
 
     // Set up user stack with argc=0 for _start(argc, argv)
-    let stack_top = PAGE_TABLE_BASE as u32;
+    let stack_top = elf::USER_STACK_TOP as u32;
     let stack = stack_top - 12; // [dummy_ret=0] [argc=0] [argv=ptr]
     unsafe {
         *((stack_top - 4) as *mut u32) = stack;  // argv (non-null, never dereferenced since argc=0)
@@ -174,7 +177,7 @@ pub extern "C" fn startup(start_sector: usize) -> ! {
     println!("User stack: {:#x}", stack);
 
     // Create init thread (capture current address space after ELF loaded)
-    let mut root = crate::arch::paging2::RootPageTable::empty();
+    let mut root = crate::RootPageTable::empty();
     arch_save_root(&mut root);
     let init_thread = thread::create_thread(None, root, true)
         .expect("Failed to create init thread");
@@ -246,6 +249,12 @@ extern "C" fn event_loop(first_tid: usize) -> ! {
                     tid = next;
                 }
             }
+            // GP fault (13): VM86 monitor intercepts INT/IRET/IO/CLI/STI
+            13 if thread.mode == thread::ThreadMode::Mode16 => {
+                if let Some(next) = crate::kernel::vm86::vm86_monitor(&mut thread.cpu_state) {
+                    tid = next;
+                }
+            }
             // Page fault (14): arch passes fault address in extra (EDX).
             14 => {
                 let fault_addr = extra as usize;
@@ -278,7 +287,7 @@ fn do_arch_execute() -> (u32, u32) {
     (event, extra)
 }
 
-fn set_arch_user_pages(root: &crate::arch::paging2::RootPageTable) {
+fn set_arch_user_pages(root: &crate::RootPageTable) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -320,7 +329,7 @@ fn get_arch_user_regs(regs: &mut crate::Regs) {
 
 /// Fork the current user address space. Fills `out` with the child's root page table.
 /// Returns the physical page number of the child's root.
-pub fn arch_user_fork(out: &mut crate::arch::paging2::RootPageTable) -> u64 {
+pub fn arch_user_fork(out: &mut crate::RootPageTable) -> u64 {
     let new_root: u32;
     unsafe {
         core::arch::asm!(
@@ -388,12 +397,130 @@ pub fn arch_free_phys_page(phys: u64) {
 }
 
 /// Save current address space root into a RootPageTable.
-pub fn arch_save_root(out: &mut crate::arch::paging2::RootPageTable) {
+pub fn arch_save_root(out: &mut crate::RootPageTable) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
             in("eax") crate::arch::traps::arch_call::SAVE_ROOT as u32,
             in("edx") out as *mut _ as u32,
+        );
+    }
+}
+
+/// Toggle A20 gate for VM86 mode.
+pub fn arch_set_a20(enabled: bool, hma: &mut [u64; crate::kernel::vm86::HMA_PAGE_COUNT]) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::SET_A20 as u32,
+            in("edx") enabled as u32,
+            in("ecx") hma as *mut _ as u32,
+        );
+    }
+}
+
+/// Zero a physical page.
+pub fn arch_zero_phys_page(phys: u64) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::ZERO_PHYS_PAGE as u32,
+            in("edx") phys as u32,
+        );
+    }
+}
+
+/// Map/unmap an EMS page frame window.
+pub fn arch_map_ems_window(base_page: usize, window: usize, phys_pages: Option<&[u64; 4]>) {
+    let ptr = match phys_pages {
+        Some(p) => p as *const _ as u32,
+        None => 0u32,
+    };
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::MAP_EMS_WINDOW as u32,
+            in("edx") base_page as u32,
+            in("ecx") window as u32,
+            in("ebx") ptr,
+        );
+    }
+}
+
+/// Enable UMB region (clear page entries for demand paging).
+pub fn arch_map_umb(base_page: usize, count: usize) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::MAP_UMB as u32,
+            in("edx") base_page as u32,
+            in("ecx") count as u32,
+        );
+    }
+}
+
+/// Disable UMB region (restore identity mapping).
+pub fn arch_unmap_umb(base_page: usize, count: usize) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::UNMAP_UMB as u32,
+            in("edx") base_page as u32,
+            in("ecx") count as u32,
+        );
+    }
+}
+
+/// Get the temp-map reserved virtual address (heap must skip this page).
+pub fn arch_temp_map_addr() -> usize {
+    let addr: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("eax") crate::arch::traps::arch_call::GET_TEMP_MAP_ADDR as u32 => addr,
+        );
+    }
+    addr as usize
+}
+
+/// Initialize HMA save area with zero-page entries.
+pub fn arch_init_hma(hma: &mut [u64; crate::kernel::vm86::HMA_PAGE_COUNT]) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::INIT_HMA as u32,
+            in("edx") hma as *mut _ as u32,
+        );
+    }
+}
+
+/// Activate a root page table (switch CR3).
+pub fn arch_activate_root(root: &crate::RootPageTable) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::ACTIVATE_ROOT as u32,
+            in("edx") root as *const _ as u32,
+        );
+    }
+}
+
+/// Flush TLB.
+pub fn arch_flush_tlb() {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::FLUSH_TLB as u32,
+        );
+    }
+}
+
+/// Free user pages in current address space (arch CLEAN call).
+pub fn arch_free_user_pages() {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::CLEAN as u32,
         );
     }
 }

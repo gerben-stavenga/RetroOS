@@ -3,7 +3,7 @@
 //! Uses lib::elf for parsing, handles memory mapping.
 //! Page tables are allocated on-demand via the page fault handler.
 
-use crate::arch::paging2::PAGE_SIZE;
+const PAGE_SIZE: usize = 4096;
 use crate::kernel::startup::arch_set_page_flags;
 pub use lib::elf::{ElfError, ElfClass};
 

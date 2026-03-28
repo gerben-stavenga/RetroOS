@@ -98,7 +98,7 @@ pub struct Thread {
     pub parent_tid: i32,
     pub state: ThreadState,
     pub time: u32,
-    pub root: crate::arch::paging2::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
+    pub root: crate::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
     pub cpu_state: Regs,
@@ -120,7 +120,7 @@ impl Thread {
             parent_tid: -1,
             state: ThreadState::Unused,
             time: 0,
-            root: crate::arch::paging2::RootPageTable::empty(),
+            root: crate::RootPageTable::empty(),
             num_fds: 0,
             fds: [-1; MAX_FDS],
             cpu_state: Regs::empty(),
@@ -182,7 +182,7 @@ pub fn get_thread(tid: usize) -> Option<&'static mut Thread> {
 }
 
 /// Create a new thread with the given root page table.
-pub fn create_thread(parent: Option<&Thread>, root: crate::arch::paging2::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
+pub fn create_thread(parent: Option<&Thread>, root: crate::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
     unsafe {
         for i in 0..MAX_THREADS {
             if THREADS[i].state == ThreadState::Unused {
@@ -332,7 +332,7 @@ pub fn exit_thread(exit_code: i32) -> usize {
         thread.vm86.ems = None;
         thread.vm86.xms = None;
         if thread.mode == ThreadMode::Mode16 && !thread.vm86.a20_enabled {
-            crate::arch::paging2::set_a20(true, &mut thread.vm86.hma_pages);
+            crate::kernel::startup::arch_set_a20(true, &mut thread.vm86.hma_pages);
             thread.vm86.a20_enabled = true;
         }
         
@@ -429,8 +429,8 @@ pub fn init_threading() {
         THREADS[0].priority = 0;
         THREADS[0].parent_tid = -1;
         THREADS[0].state = ThreadState::Running;
-        THREADS[0].root.init_current();
-        THREADS[0].root.activate();
+        crate::kernel::startup::arch_save_root(&mut THREADS[0].root);
+        crate::kernel::startup::arch_activate_root(&THREADS[0].root);
         // CURRENT_THREAD defaults to 0, which is correct
     }
 }

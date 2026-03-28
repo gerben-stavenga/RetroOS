@@ -17,7 +17,6 @@
 //! Return value in: EAX
 
 use crate::kernel::elf;
-use crate::arch::paging2::PAGE_SIZE;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::startup;
 use crate::kernel::thread;
@@ -123,7 +122,7 @@ fn sys_yield(regs: &mut Regs) -> SyscallResult {
 /// Creates a copy of the current process
 fn sys_fork(regs: &mut Regs) -> SyscallResult {
     // Fork the address space — arch fills in the child's root page table
-    let mut child_root = crate::arch::paging2::RootPageTable::empty();
+    let mut child_root = crate::RootPageTable::empty();
     let new_page_dir = startup::arch_user_fork(&mut child_root);
 
     // Get current thread and save post-COW root (fork marked entries R/O)
@@ -187,6 +186,13 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let argv_ptr = regs.rbx as usize;
     let caller_64bit = thread::current().mode == thread::ThreadMode::Mode64;
     let args = read_argv(argv_ptr, argc, caller_64bit);
+
+    crate::dbg_println!("exec: path={} argc={}", path, args.len());
+    for (i, arg) in args.iter().enumerate() {
+        if let Ok(s) = core::str::from_utf8(arg) {
+            crate::dbg_println!("  arg[{}]={}", i, s);
+        }
+    }
 
     // Close inherited file descriptors before loading the new program
     vfs::close_all_fds(&mut thread::current().fds);

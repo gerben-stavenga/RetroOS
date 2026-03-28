@@ -14,7 +14,6 @@
 
 extern crate alloc;
 
-use crate::arch::paging2::{Entry, Entry64};
 use crate::kernel::thread;
 use crate::vga;
 use crate::dbg_println;
@@ -28,9 +27,6 @@ const VIF_FLAG: u32 = 1 << 19;
 /// Flags that VM86 code cannot change (IOPL, VM)
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
 
-fn vme_active() -> bool {
-    crate::arch::x86::read_cr4() & crate::arch::x86::cr4::VME != 0
-}
 
 
 /// .COM load segment (standard DOS convention: PSP at seg:0000, code at seg:0100)
@@ -54,13 +50,13 @@ pub struct Vm86State {
     pub skip_irq: bool,
     pub xms: Option<alloc::boxed::Box<XmsState>>,
     pub ems: Option<alloc::boxed::Box<EmsState>>,
-    pub hma_pages: [Entry64; HMA_PAGE_COUNT],
+    pub hma_pages: [u64; HMA_PAGE_COUNT],
 }
 
 impl Vm86State {
     pub fn new() -> Self {
-        let zero_page = crate::arch::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
-        let zero_entry = Entry64::new(zero_page, false, true);
+        let mut hma_pages = [0u64; HMA_PAGE_COUNT];
+        crate::kernel::startup::arch_init_hma(&mut hma_pages);
         Self {
             vif: true,
             a20_enabled: false,
@@ -72,7 +68,7 @@ impl Vm86State {
             skip_irq: false,
             xms: None,
             ems: None,
-            hma_pages: [zero_entry; HMA_PAGE_COUNT],
+            hma_pages,
         }
     }
 }
@@ -379,16 +375,9 @@ pub fn scan_uma() {
     }
     unsafe { UMA_FREE = free; }
 
-    // Find 16 contiguous free pages for EMS (prefer D0-DF = standard location)
-    let ems_offset = find_contiguous_run(free, 16, 0xD0 - UMA_BASE);
-    if let Some(off) = ems_offset {
-        let ems_mask = ((1u64 << 16) - 1) << off;
-        unsafe {
-            EMS_PAGES = ems_mask;
-            EMS_BASE_PAGE = UMA_BASE + off;
-            UMA_FREE = free & !ems_mask; // remove EMS pages from free pool
-        }
-    }
+    // EMS disabled: needs arch-layer phys page management
+    // let ems_offset = find_contiguous_run(free, 16, 0xD0 - UMA_BASE);
+    // if let Some(off) = ems_offset { ... }
 
     // Log results
     let umb_free = unsafe { UMA_FREE };
@@ -447,7 +436,7 @@ fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
                 }
                 unsafe { UMB_ALLOC |= alloc_mask; }
                 let base_page = UMA_BASE + run_start;
-                crate::arch::paging2::map_umb(base_page, pages_needed);
+                crate::kernel::startup::arch_map_umb(base_page, pages_needed);
                 let seg = (base_page as u16) * 0x100; // page to segment
                 let paras = (pages_needed as u16) * 0x100;
                 return Some((seg, paras));
@@ -477,7 +466,7 @@ fn umb_free(segment: u16) -> bool {
     }
     let count = (i - offset) as usize;
     unsafe { UMB_ALLOC &= !mask; }
-    crate::arch::paging2::unmap_umb(page, count);
+    crate::kernel::startup::arch_unmap_umb(page, count);
     true
 }
 
@@ -544,21 +533,7 @@ impl EmsState {
 
     /// Free all physical pages held by all handles
     pub fn free_all_pages(&mut self) {
-        for w in 0..4 {
-            if self.frame[w].is_some() {
-                self.frame[w] = None;
-                crate::arch::paging2::map_ems_window(ems_base_page(), w, None);
-            }
-        }
-        for handle in &mut self.handles {
-            if let Some(h) = handle.take() {
-                for group in &h.pages {
-                    for &p in group {
-                        crate::arch::phys_mm::free_phys_page(p);
-                    }
-                }
-            }
-        }
+        // EMS disabled: no physical pages to free
     }
 }
 
@@ -718,14 +693,14 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
 }
 
 /// Map VIF into EFLAGS.IF so handlers/reflect work with IF naturally.
-/// Reads VIF from hardware (VME) or thread.vm86.vif (software).
-/// Returns the saved real IF value for restore_vif.
+/// Arch guarantees VIF in EFLAGS is always valid (hardware-managed with VME,
+/// arch-preserved without VME). Returns the saved real IF value for restore_vif.
 fn sync_vif(thread: &mut thread::Thread, regs: &mut Regs) -> u32 {
     unsafe {
         let saved_if = regs.frame.f32.eflags & IF_FLAG;
-        if vme_active() {
-            thread.vm86.vif = regs.frame.f32.eflags & VIF_FLAG != 0;
-        }
+        // VIF in EFLAGS is authoritative (hardware maintains it with VME,
+        // and we maintain it in saved regs without VME — CPU preserves it either way)
+        thread.vm86.vif = regs.frame.f32.eflags & VIF_FLAG != 0;
         if thread.vm86.vif { regs.frame.f32.eflags |= IF_FLAG; }
         else { regs.frame.f32.eflags &= !IF_FLAG; }
         saved_if
@@ -733,14 +708,12 @@ fn sync_vif(thread: &mut thread::Thread, regs: &mut Regs) -> u32 {
 }
 
 /// Extract VIF from EFLAGS.IF back into thread, restore real IF.
-/// Writes VIF back to hardware (VME) if active.
+/// Writes VIF back to EFLAGS (arch propagates to hardware if VME active).
 fn restore_vif(thread: &mut thread::Thread, regs: &mut Regs, saved_if: u32) {
     unsafe {
         thread.vm86.vif = regs.frame.f32.eflags & IF_FLAG != 0;
-        if vme_active() {
-            if thread.vm86.vif { regs.frame.f32.eflags |= VIF_FLAG; }
-            else { regs.frame.f32.eflags &= !VIF_FLAG; }
-        }
+        if thread.vm86.vif { regs.frame.f32.eflags |= VIF_FLAG; }
+        else { regs.frame.f32.eflags &= !VIF_FLAG; }
         regs.frame.f32.eflags = (regs.frame.f32.eflags & !IF_FLAG) | saved_if;
     }
 }
@@ -1250,8 +1223,8 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
         0x28 => Action::Done, // no-op, but could yield here if desired
         // INT 2Fh — Multiplex interrupt (XMS installation check)
         0x2F => int_2fh(regs),
-        // INT 67h — EMS driver
-        0x67 => int_67h(regs),
+        // INT 67h — EMS driver (disabled: needs arch-layer phys page management)
+        // 0x67 => int_67h(regs),
         // INT F0h — XMS dispatch (private, called via far-call stub)
         XMS_INT => xms_dispatch(regs),
         _ => {
@@ -1892,7 +1865,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         0x03 => {
             let xms = xms_state();
             xms.a20_global += 1;
-            crate::arch::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
+            crate::kernel::startup::arch_set_a20(true, &mut thread::current().vm86.hma_pages);
             thread::current().vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
             regs.rbx = (regs.rbx & !0xFFFF); // BL=0 no error
@@ -1902,7 +1875,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             let xms = xms_state();
             xms.a20_global = xms.a20_global.saturating_sub(1);
             if xms.a20_global == 0 && xms.a20_local == 0 {
-                crate::arch::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
+                crate::kernel::startup::arch_set_a20(false, &mut thread::current().vm86.hma_pages);
                 thread::current().vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -1912,7 +1885,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         0x05 => {
             let xms = xms_state();
             xms.a20_local += 1;
-            crate::arch::paging2::set_a20(true, &mut thread::current().vm86.hma_pages);
+            crate::kernel::startup::arch_set_a20(true, &mut thread::current().vm86.hma_pages);
             thread::current().vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
@@ -1922,7 +1895,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             let xms = xms_state();
             xms.a20_local = xms.a20_local.saturating_sub(1);
             if xms.a20_local == 0 && xms.a20_global == 0 {
-                crate::arch::paging2::set_a20(false, &mut thread::current().vm86.hma_pages);
+                crate::kernel::startup::arch_set_a20(false, &mut thread::current().vm86.hma_pages);
                 thread::current().vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -2276,14 +2249,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                         if !ok { break; }
                         // Zero the allocated pages
                         for &p in &group {
-                            crate::arch::paging2::temp_map(p);
-                            unsafe {
-                                core::ptr::write_bytes(
-                                    crate::arch::paging2::temp_map_vaddr() as *mut u8, 0,
-                                    crate::arch::paging2::PAGE_SIZE,
-                                );
-                            }
-                            crate::arch::paging2::temp_unmap();
+                            crate::kernel::startup::arch_zero_phys_page(p);
                         }
                         pages.push(group);
                     }
@@ -2323,7 +2289,7 @@ fn int_67h(regs: &mut Regs) -> Action {
             // BX=FFFFh means unmap
             if log_page == 0xFFFF {
                 ems.frame[phys_page as usize] = None;
-                crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
+                crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, None);
                 regs.rax = (regs.rax & !0xFF00); // AH=0
                 return Action::Done;
             }
@@ -2336,7 +2302,7 @@ fn int_67h(regs: &mut Regs) -> Action {
             match &ems.handles[handle as usize] {
                 Some(h) if (log_page as usize) < h.pages.len() => {
                     let phys_pages = &h.pages[log_page as usize];
-                    crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
+                    crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
                     ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                     regs.rax = (regs.rax & !0xFF00); // AH=0
                 }
@@ -2358,7 +2324,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                     if let Some((h, _)) = ems.frame[w] {
                         if h == handle as u8 {
                             ems.frame[w] = None;
-                            crate::arch::paging2::map_ems_window(ems_base_page(), w, None);
+                            crate::kernel::startup::arch_map_ems_window(ems_base_page(), w, None);
                         }
                     }
                 }
@@ -2458,12 +2424,12 @@ fn int_67h(regs: &mut Regs) -> Action {
 
                 if log_page == 0xFFFF {
                     ems.frame[phys_page as usize] = None;
-                    crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, None);
+                    crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, None);
                 } else {
                     match &ems.handles[handle as usize] {
                         Some(h) if (log_page as usize) < h.pages.len() => {
                             let phys_pages = &h.pages[log_page as usize];
-                            crate::arch::paging2::map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
+                            crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
                             ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                         }
                         _ => {
@@ -2656,9 +2622,7 @@ fn exec_program(regs: &mut Regs) -> Action {
         unsafe { core::str::from_utf8_unchecked(prog_name) });
 
     // --- Fork a new address space for the child ---
-    use crate::arch::paging2;
-
-    let mut child_root = crate::arch::paging2::RootPageTable::empty();
+    let mut child_root = crate::RootPageTable::empty();
     let new_root = crate::kernel::startup::arch_user_fork(&mut child_root);
 
     // Save parent state
@@ -2681,10 +2645,10 @@ fn exec_program(regs: &mut Regs) -> Action {
 
     // Switch to child's address space: load child's page tables, then
     // set up a fresh VM86 memory layout with full 640KB available.
-    child.root.activate();
-    paging2::free_user_pages();
-    paging2::flush_tlb();
-    paging2::map_low_mem_user();
+    crate::kernel::startup::arch_activate_root(&child.root);
+    crate::kernel::startup::arch_free_user_pages();
+    crate::kernel::startup::arch_flush_tlb();
+    crate::kernel::startup::arch_map_low_mem();
     setup_ivt();
 
     // Load the program at COM_SEGMENT (full conventional memory)
@@ -2693,7 +2657,7 @@ fn exec_program(regs: &mut Regs) -> Action {
             Some(t) => t,
             None => {
                 // Restore parent's address space and clean up
-                current.root.activate();
+                crate::kernel::startup::arch_activate_root(&current.root);
                 thread::exit_thread(1);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
                 unsafe { regs.frame.f32.eflags |= 1; }
@@ -2707,8 +2671,8 @@ fn exec_program(regs: &mut Regs) -> Action {
     dbg_println!("EXEC: cs={:04X} ip={:04X} ss={:04X} sp={:04X}", cs, ip, ss, sp);
 
     // Save child's address space and switch back to parent
-    child.root.save();
-    current.root.activate();
+    crate::kernel::startup::arch_save_root(&mut child.root);
+    crate::kernel::startup::arch_activate_root(&current.root);
 
     // Set up child thread as VM86
     child.mode = thread::ThreadMode::Mode16;
@@ -2946,48 +2910,51 @@ pub fn setup_ivt() {
 /// - PSP (256 bytes) at COM_SEGMENT:0000 = page 0x10, offset 0.
 /// - Environment block at page 0x0F (linear 0xF000, segment 0x0F00).
 ///
-/// Both pages are allocated, filled, and mapped via paging2::map_user_page.
+/// Pages are written via demand paging (ring-1 writes trigger page faults
+/// that allocate fresh pages at ring 0).
 fn map_psp() {
-    use crate::arch::paging2;
-
-    const PSP_PAGE: usize = 0x10;  // COM_SEGMENT << 4 >> 12
-    const ENV_PAGE: usize = 0x0F;  // page before PSP
-    const ENV_SEG: u16 = 0x0F00;   // ENV_PAGE << 12 >> 4
+    const PSP_ADDR: usize = 0x10000;  // COM_SEGMENT << 4
+    const ENV_ADDR: usize = 0x0F000;  // page before PSP
+    const ENV_SEG: u16 = 0x0F00;      // ENV_ADDR >> 4
 
     // Environment page (linear 0xF000)
     // Format: NUL-terminated strings, double NUL at end, then u16 count + program name
-    let mut env = [0u8; 4096];
+    let env_ptr = ENV_ADDR as *mut u8;
+    unsafe { core::ptr::write_bytes(env_ptr, 0, 4096); }
     let mut off = 0;
     // COMSPEC — NC checks this to find the command interpreter
     let comspec = b"COMSPEC=C:\\COMMAND.COM\0";
-    env[off..off + comspec.len()].copy_from_slice(comspec);
+    unsafe { core::ptr::copy_nonoverlapping(comspec.as_ptr(), env_ptr.add(off), comspec.len()); }
     off += comspec.len();
     let path = b"PATH=C:\\\0";
-    env[off..off + path.len()].copy_from_slice(path);
+    unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), env_ptr.add(off), path.len()); }
     off += path.len();
-    env[off] = 0; // double NUL: end of environment
-    off += 1;
-    env[off] = 0x01; // word count after env
-    env[off + 1] = 0x00;
-    off += 2;
+    unsafe {
+        *env_ptr.add(off) = 0; // double NUL: end of environment
+        off += 1;
+        *env_ptr.add(off) = 0x01; // word count after env
+        *env_ptr.add(off + 1) = 0x00;
+        off += 2;
+    }
     let name = b"C:\\PROG.EXE\0";
-    env[off..off + name.len()].copy_from_slice(name);
-    paging2::map_user_page(ENV_PAGE, &env);
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), env_ptr.add(off), name.len()); }
 
     // PSP page (linear 0x10000)
-    let mut psp = [0u8; 4096];
-    psp[0] = 0xCD; // INT 20h
-    psp[1] = 0x20;
-    psp[2] = 0x00; // top of memory = 0xA000
-    psp[3] = 0xA0;
-    // Parent PSP segment — point to ourselves (top-level process, like COMMAND.COM)
-    psp[0x16] = COM_SEGMENT as u8;
-    psp[0x17] = (COM_SEGMENT >> 8) as u8;
-    psp[0x2C] = ENV_SEG as u8;
-    psp[0x2D] = (ENV_SEG >> 8) as u8;
-    psp[0x80] = 0; // command tail length
-    psp[0x81] = 0x0D; // CR
-    paging2::map_user_page(PSP_PAGE, &psp);
+    let psp_ptr = PSP_ADDR as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(psp_ptr, 0, 4096);
+        *psp_ptr.add(0) = 0xCD; // INT 20h
+        *psp_ptr.add(1) = 0x20;
+        *psp_ptr.add(2) = 0x00; // top of memory = 0xA000
+        *psp_ptr.add(3) = 0xA0;
+        // Parent PSP segment — point to ourselves (top-level process, like COMMAND.COM)
+        *psp_ptr.add(0x16) = COM_SEGMENT as u8;
+        *psp_ptr.add(0x17) = (COM_SEGMENT >> 8) as u8;
+        *psp_ptr.add(0x2C) = ENV_SEG as u8;
+        *psp_ptr.add(0x2D) = (ENV_SEG >> 8) as u8;
+        *psp_ptr.add(0x80) = 0; // command tail length
+        *psp_ptr.add(0x81) = 0x0D; // CR
+    }
 
     // Default DTA is at PSP:0080h (linear = COM_SEGMENT*16 + 0x80)
     crate::kernel::thread::current().vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;

@@ -38,6 +38,11 @@ static mut USER_STATE: StoredUserState = StoredUserState {
 static mut USER_ROOT: paging2::RootPageTable = paging2::RootPageTable::empty();
 static mut USER_MODE: u32 = 1; // 0=VM86, 1=32-bit, 2=64-bit
 
+/// Software VIF/VIP for CPUs without VME (386/486).
+/// Saved from user EFLAGS before IRET, restored after trap.
+static mut VIF_NO_VME: bool = false;
+static mut VIP_NO_VME: bool = false;
+
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
     /// Switch to the currently loaded User State
@@ -66,6 +71,24 @@ pub mod arch_call {
     pub const FREE_PHYS_PAGE: u64 = 0x10A;
     /// Save current address space root into EDX=ptr to RootPageTable.
     pub const SAVE_ROOT: u64 = 0x10B;
+    /// Toggle A20 gate. EDX=enabled (0/1), ECX=ptr to [u64; 16] HMA save area.
+    pub const SET_A20: u64 = 0x10C;
+    /// Zero a physical page. EDX=phys page number.
+    pub const ZERO_PHYS_PAGE: u64 = 0x10D;
+    /// Map/unmap an EMS window. EDX=base_page, ECX=window(0-3), EBX=ptr to [u64;4] or 0 for unmap.
+    pub const MAP_EMS_WINDOW: u64 = 0x10E;
+    /// Enable UMB region (clear page entries). EDX=base_page, ECX=count.
+    pub const MAP_UMB: u64 = 0x10F;
+    /// Disable UMB region (restore identity mapping). EDX=base_page, ECX=count.
+    pub const UNMAP_UMB: u64 = 0x110;
+    /// Get the temp-map reserved virtual address. Returns in EAX.
+    pub const GET_TEMP_MAP_ADDR: u64 = 0x111;
+    /// Initialize HMA save area with zero-page entries. EDX=ptr to [u64; 16].
+    pub const INIT_HMA: u64 = 0x112;
+    /// Activate a root page table (write CR3). EDX=ptr to RootPageTable.
+    pub const ACTIVATE_ROOT: u64 = 0x113;
+    /// Flush TLB (sync PDPT + re-write CR3).
+    pub const FLUSH_TLB: u64 = 0x114;
 }
 
 /// Handle INT 0x80 from ring 1: arch primitive dispatch.
@@ -140,6 +163,61 @@ fn arch_dispatch(regs: &mut Regs) {
             root.init_current();
             unsafe { *out = root; }
         }
+        arch_call::SET_A20 => {
+            let enabled = regs.rdx != 0;
+            let hma = unsafe { &mut *(regs.rcx as usize as *mut [paging2::Entry64; crate::vm86::HMA_PAGE_COUNT]) };
+            paging2::set_a20(enabled, hma);
+        }
+        arch_call::ZERO_PHYS_PAGE => {
+            let phys = regs.rdx;
+            paging2::temp_map(phys);
+            unsafe {
+                core::ptr::write_bytes(paging2::temp_map_vaddr() as *mut u8, 0, paging2::PAGE_SIZE);
+            }
+            paging2::temp_unmap();
+        }
+        arch_call::MAP_EMS_WINDOW => {
+            let base_page = regs.rdx as usize;
+            let window = regs.rcx as usize;
+            let phys_ptr = regs.rbx as usize;
+            let phys_pages = if phys_ptr == 0 {
+                None
+            } else {
+                Some(unsafe { &*(phys_ptr as *const [u64; 4]) })
+            };
+            paging2::map_ems_window(base_page, window, phys_pages);
+        }
+        arch_call::MAP_UMB => {
+            let base_page = regs.rdx as usize;
+            let count = regs.rcx as usize;
+            paging2::map_umb(base_page, count);
+        }
+        arch_call::UNMAP_UMB => {
+            let base_page = regs.rdx as usize;
+            let count = regs.rcx as usize;
+            paging2::unmap_umb(base_page, count);
+        }
+        arch_call::GET_TEMP_MAP_ADDR => {
+            regs.rax = paging2::temp_map_vaddr() as u64;
+        }
+        arch_call::INIT_HMA => {
+            let out = regs.rdx as usize as *mut [u64; crate::vm86::HMA_PAGE_COUNT];
+            let zero_page = paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
+            let zero_entry = paging2::Entry64::new(zero_page, false, true);
+            unsafe {
+                let arr = &mut *out;
+                for slot in arr.iter_mut() {
+                    *slot = zero_entry.0;
+                }
+            }
+        }
+        arch_call::ACTIVATE_ROOT => {
+            let root = unsafe { &*(regs.rdx as usize as *const paging2::RootPageTable) };
+            root.activate();
+        }
+        arch_call::FLUSH_TLB => {
+            paging2::flush_tlb();
+        }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }
 }
@@ -192,6 +270,17 @@ fn arch_execute(regs: &mut Regs) {
     // 3. IRET to User Mode (Registers)
     let user_regs = unsafe { &mut USER_STATE.regs };
     if want_vm86 {
+        // Without VME, save kernel-managed VIF/VIP before IRET (CPU won't preserve them)
+        if x86::read_cr4() & x86::cr4::VME == 0 {
+            unsafe {
+                let flags = user_regs.frame.f64.rflags;
+                VIF_NO_VME = flags & (1 << 19) != 0;
+                VIP_NO_VME = flags & (1 << 20) != 0;
+            }
+        }
+        // Force IF=1: IRET to VM86 loads all of EFLAGS including IF.
+        // Prevent kernel from accidentally disabling hardware interrupts.
+        unsafe { user_regs.frame.f64.rflags |= 0x200; }
         // Copy segments from Regs to VM86 "extra" stack area (past end of Regs struct)
         // exit_interrupt_32 expects these 4 segments to be at the end of the stack frame.
         unsafe { vm86_swap_out(user_regs); }
@@ -223,7 +312,8 @@ fn return_to_kernel(regs: &mut Regs, event: u64) {
 
     if user {
         unsafe {
-            if is_vm86(regs) {
+            let vm86 = is_vm86(regs);
+            if vm86 {
                 vm86_swap_in(regs);
             }
             // Normalize to f64 so kernel always sees a uniform format
@@ -231,6 +321,12 @@ fn return_to_kernel(regs: &mut Regs, event: u64) {
                 regs.frame_to_64();
             }
             USER_STATE.regs = *regs;
+            // Without VME, restore kernel-managed VIF/VIP (CPU didn't preserve them)
+            if vm86 && (x86::read_cr4() & x86::cr4::VME == 0) {
+                let flags = &mut USER_STATE.regs.frame.f64.rflags;
+                if VIF_NO_VME { *flags |= 1 << 19; } else { *flags &= !(1 << 19); }
+                if VIP_NO_VME { *flags |= 1 << 20; } else { *flags &= !(1 << 20); }
+            }
         }
     }
 
@@ -340,10 +436,11 @@ fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
     let page_index = page_idx(fault_addr);
 
     // Null pointer protection (first 64KB and last 64KB)
-    // Skip null check for VM86 (legitimate IVT/BDA access)
+    // Skip for VM86 (legitimate IVT/BDA access) and supervisor (ring-1 kernel
+    // setting up user memory, e.g. PSP/environment for DOS programs)
     const NULL_LIMIT: usize = 0x10000;
     let vm86 = is_vm86(regs);
-    if !vm86 && (fault_addr < NULL_LIMIT || fault_addr >= (0usize).wrapping_sub(NULL_LIMIT)) {
+    if !vm86 && user && (fault_addr < NULL_LIMIT || fault_addr >= (0usize).wrapping_sub(NULL_LIMIT)) {
         return None; // Let kernel handle (segfault or panic)
     }
 

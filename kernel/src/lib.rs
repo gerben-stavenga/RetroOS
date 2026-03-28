@@ -27,6 +27,9 @@ pub use lib::{print, println, dbg_print, dbg_println};
 
 use arch::paging2::{KernelPages, PAGE_SIZE, LOW_MEM_BASE, RawPage};
 
+// Re-export arch types used as opaque blobs by kernel code
+pub use arch::paging2::RootPageTable;
+
 /// Memory map entry from bootloader
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -198,10 +201,6 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     // Enable interrupts
     arch::x86::sti();
     println!("Interrupts enabled");
-
-    // Initialize threading
-    kernel::thread::init_threading();
-    println!("Threading initialized");
 
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");
