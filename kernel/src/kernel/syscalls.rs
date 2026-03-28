@@ -74,7 +74,7 @@ pub fn dispatch(regs: &mut Regs) -> Option<usize> {
     // 64-bit syscall ABI uses different registers: rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4
     // Remap to the canonical layout (rdx=arg0, rcx=arg1, rbx=arg2, rsi=arg3, rdi=arg4)
     // so handlers don't need to know which mode the caller is in.
-    let is_64bit = thread::current().mode == thread::ThreadMode::Mode64;
+    let is_64bit = regs.mode() == crate::UserMode::Mode64;
     if is_64bit {
         let (a0, a1, a2, a3, a4) = (regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8);
         regs.rdx = a0;
@@ -133,8 +133,6 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
 
     // Copy CPU state from REGS (running thread's state is in arch, not cpu_state)
     child.cpu_state = *regs;
-    child.mode = current.mode;
-    child.frame_format = current.frame_format;
 
     // Inherit open file descriptors (bumps refcounts in global file table)
     vfs::dup_fds(&current.fds, &mut child.fds);
@@ -174,7 +172,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     // Read argv from caller's address space (before we free it)
     let argc = regs.rsi as usize;
     let argv_ptr = regs.rbx as usize;
-    let caller_64bit = thread::current().mode == thread::ThreadMode::Mode64;
+    let caller_64bit = regs.mode() == crate::UserMode::Mode64;
     let args = read_argv(argv_ptr, argc, caller_64bit);
 
     // Close inherited file descriptors before loading the new program
@@ -222,9 +220,6 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
     let current = thread::current();
     let tid = current.tid as usize;
-
-    // Just set the mode — arch handles CPU mode toggling in arch_execute
-    current.mode = if want_64 { thread::ThreadMode::Mode64 } else { thread::ThreadMode::Mode32 };
 
     // Set up argv on the new user stack (demand-pages stack)
     let word = if want_64 { 8usize } else { 4usize };

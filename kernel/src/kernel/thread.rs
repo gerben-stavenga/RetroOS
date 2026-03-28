@@ -25,32 +25,6 @@ pub enum ThreadState {
     Zombie,
 }
 
-/// Thread execution mode (user code bitness)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThreadMode {
-    Mode16,  // VM86 (requires PAE CPU mode)
-    Mode32,  // 32-bit protected/compat
-    Mode64,  // 64-bit long mode
-}
-
-/// Saved interrupt frame format
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameFormat {
-    Protected,  // Returned through 32-bit IRET path
-    Long,       // Returned through 64-bit IRETQ path
-}
-
-impl FrameFormat {
-    /// Regs are always normalized to Frame64 in Rust.
-    pub fn current() -> Self {
-        FrameFormat::Long
-    }
-
-    pub fn is_long(self) -> bool {
-        self == FrameFormat::Long
-    }
-}
-
 /// Initialize Regs for user processes (extends Regs with descriptor-aware methods)
 impl Regs {
     /// Initialize for a 32-bit user process (stored as Frame64; arch converts on exit if needed)
@@ -105,8 +79,6 @@ pub struct Thread {
     pub fds: [i32; MAX_FDS],
     pub cpu_state: Regs,
     pub exit_code: i32,
-    pub mode: ThreadMode,              // User code bitness (16/32/64)
-    pub frame_format: FrameFormat,    // Saved interrupt frame format
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
     pub vm86: crate::kernel::vm86::Vm86State,
     pub cwd: [u8; 64],     // Current working directory (e.g. "WOLF3D/", "" for root)
@@ -127,8 +99,6 @@ impl Thread {
             fds: [-1; MAX_FDS],
             cpu_state: Regs::empty(),
             exit_code: 0,
-            mode: ThreadMode::Mode32,
-            frame_format: FrameFormat::Protected,
             symbols: None,
             vm86: crate::kernel::vm86::Vm86State::new(),
             cwd: [0; 64],
@@ -214,23 +184,17 @@ pub fn create_thread(parent: Option<&Thread>, root: crate::RootPageTable, is_pro
 
 /// Initialize a thread as a 32-bit user process
 pub fn init_process_thread(thread: &mut Thread, entry: u32, stack: u32) {
-    thread.mode = ThreadMode::Mode32;
-    thread.frame_format = FrameFormat::current();
     thread.cpu_state.init_user_process(entry, stack);
 }
 
 /// Initialize a thread as a 64-bit user process
 pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
-    thread.mode = ThreadMode::Mode64;
-    thread.frame_format = FrameFormat::Long;  // 64-bit threads always use Frame64
     thread.cpu_state.init_user_process_64(entry, stack);
 }
 
 /// Initialize a thread for VM86 mode (.COM execution)
 /// cs/ip/ss/sp are real-mode segment:offset values
 pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
-    thread.mode = ThreadMode::Mode16;
-    thread.frame_format = FrameFormat::Protected; // VM86 returns through the 32-bit IRET path
     thread.vm86 = crate::kernel::vm86::Vm86State::new();
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode
@@ -257,16 +221,8 @@ pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, 
     };
 }
 
-/// Save current CPU state to thread from the given Regs pointer.
-/// For VM86 threads, the real-mode segments are already in regs.ds/es/fs/gs
-/// (swapped in by isr_handler on entry), so they copy naturally into Regs.
+/// Save CPU state to thread.
 pub fn save_state(thread: &mut Thread, regs: &Regs) {
-    // Record frame format at save time (VM86 threads always use Protected)
-    if thread.mode == ThreadMode::Mode16 {
-        thread.frame_format = FrameFormat::Protected;
-    } else {
-        thread.frame_format = FrameFormat::current();
-    }
     thread.cpu_state = *regs;
 }
 
@@ -330,7 +286,7 @@ pub fn exit_thread(exit_code: i32) -> usize {
         }
         thread.vm86.ems = None;
         thread.vm86.xms = None;
-        if thread.mode == ThreadMode::Mode16 && !thread.vm86.a20_enabled {
+        if thread.cpu_state.mode() == crate::UserMode::VM86 && !thread.vm86.a20_enabled {
             crate::kernel::startup::arch_set_a20(true, &mut thread.vm86.hma_pages);
             thread.vm86.a20_enabled = true;
         }

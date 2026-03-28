@@ -3023,7 +3023,6 @@ fn exec_program(regs: &mut Regs) -> Action {
         );
 
         // Set up child thread as VM86
-        child.mode = thread::ThreadMode::Mode16;
         thread::init_process_thread_vm86(child, cs, ip, ss, sp);
         child.vm86.skip_irq = true;
         child.vm86.vkbd.clear();
