@@ -135,10 +135,6 @@ impl RootPageTable {
 
     /// Initialize from the current (active) address space.
     /// Saves current user entries from the constant root.
-    pub fn init_current(&mut self) {
-        self.save();
-    }
-
     /// Save user entries from the constant root into this struct.
     pub fn save(&mut self) {
         match cpu_mode() {
@@ -1202,31 +1198,27 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 pub const TRAMPOLINE_PAGE: usize = 0xF;  // page 15 = address 0xF000
 pub const TRAMPOLINE_ADDR: usize = TRAMPOLINE_PAGE * PAGE_SIZE;
 
-/// Saved page table entry for the trampoline page, so it can be restored
-/// after a mode toggle without clobbering whatever was mapped there (e.g.
-/// a VM86 environment block).
-static mut TRAMPOLINE_SAVED: u64 = 0;
-
-/// Temporarily map the trampoline page (VA 0xF000) identity-mapped to
-/// PA 0xF000 for a mode toggle.  Saves the current PTE so
-/// `restore_trampoline()` can put it back afterwards.
-pub fn ensure_trampoline_mapped() {
+/// Map the trampoline page (VA 0xF000) identity-mapped for a mode toggle.
+/// Returns the saved PTE to pass to `clear_trampoline()`.
+pub fn ensure_trampoline_mapped() -> u64 {
     if let Entries::E64(e) = entries() {
-        unsafe { TRAMPOLINE_SAVED = e[TRAMPOLINE_PAGE].0; }
+        let saved = e[TRAMPOLINE_PAGE].0;
         e[TRAMPOLINE_PAGE] = Entry64::new(TRAMPOLINE_PAGE as u64, true, false);
         crate::arch::x86::invlpg(TRAMPOLINE_ADDR);
+        saved
+    } else {
+        0
     }
 }
 
-/// Restore the trampoline page's PTE to whatever it was before
-/// `ensure_trampoline_mapped()`.
-pub fn clear_trampoline() {
+/// Restore the trampoline page's PTE after a mode toggle.
+pub fn clear_trampoline(saved: u64) {
     match entries() {
         Entries::E32(e) => {
-            e[TRAMPOLINE_PAGE] = Entry32(unsafe { TRAMPOLINE_SAVED } as u32);
+            e[TRAMPOLINE_PAGE] = Entry32(saved as u32);
         }
         Entries::E64(e) => {
-            e[TRAMPOLINE_PAGE] = Entry64(unsafe { TRAMPOLINE_SAVED });
+            e[TRAMPOLINE_PAGE] = Entry64(saved);
         }
     }
     crate::arch::x86::invlpg(TRAMPOLINE_ADDR);

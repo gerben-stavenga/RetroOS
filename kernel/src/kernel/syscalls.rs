@@ -121,16 +121,9 @@ fn sys_yield(regs: &mut Regs) -> SyscallResult {
 /// Fork syscall (4)
 /// Creates a copy of the current process
 fn sys_fork(regs: &mut Regs) -> SyscallResult {
-    // Fork the address space — arch fills in the child's root page table
-    let mut child_root = crate::RootPageTable::empty();
-    let new_page_dir = startup::arch_user_fork(&mut child_root);
-
-    // Get current thread and save post-COW root (fork marked entries R/O)
     let current = thread::current();
-    startup::arch_save_root(&mut current.root);
-
-    // Save current thread's state
-    thread::save_state(current, regs);
+    let mut child_root = crate::RootPageTable::empty();
+    startup::arch_user_fork(&mut child_root);
 
     // Create child thread with the pre-filled root page table
     let child = match thread::create_thread(Some(current), child_root, true) {
@@ -138,11 +131,8 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
         None => return SyscallResult::val(ENOMEM),
     };
 
-    // Free the child's root page table page — entries already extracted
-    startup::arch_free_phys_page(new_page_dir);
-
-    // Copy CPU state and mode from parent to child
-    child.cpu_state = current.cpu_state;
+    // Copy CPU state from REGS (running thread's state is in arch, not cpu_state)
+    child.cpu_state = *regs;
     child.mode = current.mode;
     child.frame_format = current.frame_format;
 
@@ -187,13 +177,6 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let caller_64bit = thread::current().mode == thread::ThreadMode::Mode64;
     let args = read_argv(argv_ptr, argc, caller_64bit);
 
-    crate::dbg_println!("exec: path={} argc={}", path, args.len());
-    for (i, arg) in args.iter().enumerate() {
-        if let Ok(s) = core::str::from_utf8(arg) {
-            crate::dbg_println!("  arg[{}]={}", i, s);
-        }
-    }
-
     // Close inherited file descriptors before loading the new program
     vfs::close_all_fds(&mut thread::current().fds);
 
@@ -222,6 +205,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     // DOS executables use the VM86 exec path
     if is_com || is_exe {
         let tid = exec_dos(&buffer, is_exe);
+        *regs = thread::current().cpu_state;
         // buffer and args dropped here by RAII
         return SyscallResult::switch(Some(tid));
     }
@@ -257,8 +241,8 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
     current.symbols = symbols;
 
-    // Save root after all pages are set up (ELF + demand-paged stack)
-    startup::arch_save_root(&mut current.root);
+    // Sync new state to REGS (event loop works on REGS, not thread.cpu_state)
+    *regs = current.cpu_state;
     // args and buffer dropped here by RAII
     SyscallResult::switch(Some(tid))
 }
@@ -286,7 +270,6 @@ fn exec_dos(data: &[u8], is_exe: bool) -> usize {
     };
 
     let current = thread::current();
-    startup::arch_save_root(&mut current.root);
     let tid = current.tid as usize;
 
     thread::init_process_thread_vm86(current, cs, ip, ss, sp);
@@ -328,10 +311,10 @@ fn read_argv(argv_ptr: usize, argc: usize, is_64bit: bool) -> alloc::vec::Vec<al
 }
 
 /// Result of setting up the user stack with argv data
-struct StackSetup {
-    sp: usize,
-    argc: usize,
-    argv: usize,
+pub(crate) struct StackSetup {
+    pub(crate) sp: usize,
+    pub(crate) argc: usize,
+    pub(crate) argv: usize,
 }
 
 /// Set up argv on the new process's user stack.
@@ -340,7 +323,7 @@ struct StackSetup {
 ///   [string bytes for arg0] [string bytes for arg1] ...
 ///   [&str array: (ptr0, len0), (ptr1, len1), ...]
 ///   32-bit only: [dummy return addr] [argc] [argv_ptr]
-fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool, word: usize) -> StackSetup {
+pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool, word: usize) -> StackSetup {
     let stack_top = elf::USER_STACK_TOP;
     let mut sp = stack_top;
 

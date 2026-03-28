@@ -131,10 +131,8 @@ pub fn read_data_at_block(block: u32, buffer: &mut [u8]) -> u32 {
 
 /// Startup: load and run init.elf, then enter event loop.
 /// Called from enter_ring1 — we are already at ring 1.
-pub extern "C" fn startup(start_sector: usize) -> ! {
-    let start_sector = start_sector as u32;
+pub fn startup(start_sector: u32) -> ! {
 
-    // Initialize threading (must happen at ring 1, before any heap use)
     crate::kernel::thread::init_threading();
 
     println!("Initializing filesystem at sector {:#x}", start_sector);
@@ -176,60 +174,44 @@ pub extern "C" fn startup(start_sector: usize) -> ! {
     }
     println!("User stack: {:#x}", stack);
 
-    // Create init thread (capture current address space after ELF loaded)
-    let mut root = crate::RootPageTable::empty();
-    arch_save_root(&mut root);
-    let init_thread = thread::create_thread(None, root, true)
+    // Create init thread — root is empty; switch_to captures it when we first switch away
+    let init_thread = thread::create_thread(None, crate::RootPageTable::empty(), true)
         .expect("Failed to create init thread");
 
     init_thread.symbols = symbols;
-    thread::init_process_thread(init_thread, loaded.entry as u32, stack);
     println!("Starting init process...");
 
-    // Enter event loop (already at ring 1)
+    // Thread 0 is running — its state goes in REGS, not cpu_state
+    unsafe {
+        (*(&raw mut crate::arch::traps::REGS)).init_user_process(loaded.entry as u32, stack);
+    }
+
     event_loop(init_thread.tid as usize);
 }
 
 /// Ring-1 kernel event loop.
-/// Calls arch execute() via INT 0x80. Arch switches to the user thread
-/// and returns here when an event occurs (syscall, IRQ, fault).
-extern "C" fn event_loop(first_tid: usize) -> ! {
+/// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
+fn event_loop(first_tid: usize) -> ! {
+    use crate::arch::traps::REGS;
+
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut tid = first_tid;
+
+    // REGS already set up by startup, page tables correct from boot
+    thread::set_current(tid);
+
     loop {
-        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
-        thread::set_current(tid);
-
-        // 1. Sync thread state TO Arch (load hardware context)
-        set_arch_user_pages(&thread.root);
-        set_arch_user_mode(match thread.mode {
-            thread::ThreadMode::Mode16 => 0,
-            thread::ThreadMode::Mode32 => 1,
-            thread::ThreadMode::Mode64 => 2,
-        });
-        set_arch_user_regs(&thread.cpu_state);
-
-        // 2. Switch to user mode via Arch primitive
         let (event, extra) = do_arch_execute();
 
-        // 3. Sync thread state FROM Arch (hardware returned an event)
-        get_arch_user_regs(&mut thread.cpu_state);
-        arch_save_root(&mut thread.root);
+        // Get current thread + REGS reference for handlers
+        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+        let regs = unsafe { &mut *(&raw mut REGS) };
 
-        match event {
-            // Syscall: dispatch using the thread's saved state
-            48 => {
-                if let Some(next) = crate::kernel::syscalls::dispatch(&mut thread.cpu_state) {
-                    tid = next;
-                }
-            }
-            // IRQs (32-47): drain queued events and deliver to thread
+        let new_tid = match event {
+            48 => crate::kernel::syscalls::dispatch(regs),
             32..=47 => {
-                if thread.mode == thread::ThreadMode::Mode16 {
-                    // VM86: deliver pending ticks + drain discrete events
-                    // Use raw pointer to split the borrow between thread and cpu_state
+                if regs.mode() == crate::UserMode::VM86 {
                     let tp = thread as *mut thread::Thread;
-                    let regs = unsafe { &mut (*tp).cpu_state };
                     let ticks = crate::arch::irq::take_pending_ticks();
                     for _ in 0..ticks {
                         crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(crate::arch::irq::Irq::Tick));
@@ -238,32 +220,32 @@ extern "C" fn event_loop(first_tid: usize) -> ! {
                         crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(evt));
                     });
                 } else {
-                    // Protected mode: feed scancodes to keyboard pipe
                     crate::arch::irq::drain(|evt| {
                         if let crate::arch::irq::Irq::Key(sc) = evt {
                             crate::kernel::keyboard::process_key(sc);
                         }
                     });
                 }
-                if let Some(next) = thread::schedule() {
-                    tid = next;
-                }
+                thread::schedule()
             }
-            // GP fault (13): VM86 monitor intercepts INT/IRET/IO/CLI/STI
-            13 if thread.mode == thread::ThreadMode::Mode16 => {
-                if let Some(next) = crate::kernel::vm86::vm86_monitor(&mut thread.cpu_state) {
-                    tid = next;
-                }
+            13 if regs.mode() == crate::UserMode::VM86 => {
+                crate::kernel::vm86::vm86_monitor(regs)
             }
-            // Page fault (14): arch passes fault address in extra (EDX).
-            14 => {
-                let fault_addr = extra as usize;
-                if let Some(next) = thread::signal_thread(thread, fault_addr) {
-                    tid = next;
-                }
+            14 => thread::signal_thread(thread, extra as usize),
+            _ => None,
+        };
+
+        if let Some(new_tid) = new_tid {
+            if new_tid != tid {
+                arch_switch_to(
+                    &mut thread::get_thread(tid).unwrap().cpu_state,
+                    &mut thread::get_thread(tid).unwrap().root,
+                    &thread::get_thread(new_tid).unwrap().cpu_state,
+                    &thread::get_thread(new_tid).unwrap().root,
+                );
+                tid = new_tid;
+                thread::set_current(tid);
             }
-            // Everything else: for now just re-execute
-            _ => {}
         }
     }
 }
@@ -287,58 +269,33 @@ fn do_arch_execute() -> (u32, u32) {
     (event, extra)
 }
 
-fn set_arch_user_pages(root: &crate::RootPageTable) {
+/// Switch threads: save outgoing regs+root, load incoming regs+root + mode toggle.
+pub fn arch_switch_to(
+    out_regs: &mut crate::Regs, out_root: &mut crate::RootPageTable,
+    in_regs: &crate::Regs, in_root: &crate::RootPageTable,
+) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::SET_USER_PAGES as u32,
-            in("edx") root as *const _ as u32,
+            in("eax") crate::arch::traps::arch_call::SWITCH_TO as u32,
+            in("edx") out_regs as *mut _ as u32,
+            in("ecx") out_root as *mut _ as u32,
+            in("ebx") in_regs as *const _ as u32,
+            in("edi") in_root as *const _ as u32,
         );
     }
 }
 
-fn set_arch_user_mode(mode: u32) {
+/// COW fork the current address space. Fills child root.
+/// Caller must save parent root after (fork modifies entries for COW).
+pub fn arch_user_fork(child_root: &mut crate::RootPageTable) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::SET_USER_MODE as u32,
-            in("edx") mode,
+            in("eax") crate::arch::traps::arch_call::FORK as u32,
+            in("edx") child_root as *mut _ as u32,
         );
     }
-}
-
-fn set_arch_user_regs(regs: &crate::Regs) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::traps::arch_call::SET_USER_REGS as u32,
-            in("edx") regs as *const _ as u32,
-        );
-    }
-}
-
-fn get_arch_user_regs(regs: &mut crate::Regs) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::traps::arch_call::GET_USER_REGS as u32,
-            in("edx") regs as *mut _ as u32,
-        );
-    }
-}
-
-/// Fork the current user address space. Fills `out` with the child's root page table.
-/// Returns the physical page number of the child's root.
-pub fn arch_user_fork(out: &mut crate::RootPageTable) -> u64 {
-    let new_root: u32;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inout("eax") crate::arch::traps::arch_call::FORK as u32 => new_root,
-            in("edx") out as *mut _ as u32,
-        );
-    }
-    new_root as u64
 }
 
 pub fn arch_user_clean() {
@@ -350,16 +307,7 @@ pub fn arch_user_clean() {
     }
 }
 
-pub fn arch_user_map(vpage: usize, ppage: u64) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::traps::arch_call::MAP as u32,
-            in("edx") vpage as u32,
-            in("ebx") ppage as u32,
-        );
-    }
-}
+
 
 /// Set page permissions for a range. flags: bit 0 = writable, bit 1 = executable.
 pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, executable: bool) {
@@ -396,16 +344,7 @@ pub fn arch_free_phys_page(phys: u64) {
     }
 }
 
-/// Save current address space root into a RootPageTable.
-pub fn arch_save_root(out: &mut crate::RootPageTable) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::traps::arch_call::SAVE_ROOT as u32,
-            in("edx") out as *mut _ as u32,
-        );
-    }
-}
+
 
 /// Toggle A20 gate for VM86 mode.
 pub fn arch_set_a20(enabled: bool, hma: &mut [u64; crate::kernel::vm86::HMA_PAGE_COUNT]) {

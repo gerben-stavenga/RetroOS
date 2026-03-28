@@ -6,7 +6,7 @@
 use crate::arch::descriptors::{USER_CS, USER_CS64, USER_DS};
 use crate::kernel::stacktrace::SymbolData;
 use crate::println;
-use crate::{Frame, Frame64, Regs};
+use crate::{Frame64, Regs};
 
 /// Maximum number of threads
 pub const MAX_THREADS: usize = 1024;
@@ -36,12 +36,12 @@ pub enum ThreadMode {
 /// Saved interrupt frame format
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameFormat {
-    Protected,  // Frame32 (saved in PAE/Legacy CPU mode)
-    Long,       // Frame64 (saved in Compat CPU mode)
+    Protected,  // Returned through 32-bit IRET path
+    Long,       // Returned through 64-bit IRETQ path
 }
 
 impl FrameFormat {
-    /// Frame format is always Long — arch normalizes all Regs to f64.
+    /// Regs are always normalized to Frame64 in Rust.
     pub fn current() -> Self {
         FrameFormat::Long
     }
@@ -53,7 +53,7 @@ impl FrameFormat {
 
 /// Initialize Regs for user processes (extends Regs with descriptor-aware methods)
 impl Regs {
-    /// Initialize for a 32-bit user process (always f64 — arch converts if needed)
+    /// Initialize for a 32-bit user process (stored as Frame64; arch converts on exit if needed)
     pub fn init_user_process(&mut self, entry: u32, stack: u32) {
         let ds = USER_DS as u64;
         const IF_FLAG: u64 = 1 << 9;
@@ -63,11 +63,12 @@ impl Regs {
         self.fs = ds;
         self.es = ds;
         self.ds = ds;
-        self.frame = Frame {
-            f64: Frame64 {
-                rip: entry as u64, cs: USER_CS as u64, rflags: IF_FLAG,
-                rsp: stack as u64, ss: USER_DS as u64,
-            }
+        self.frame = Frame64 {
+            rip: entry as u64,
+            cs: USER_CS as u64,
+            rflags: IF_FLAG,
+            rsp: stack as u64,
+            ss: USER_DS as u64,
         };
     }
 
@@ -81,11 +82,12 @@ impl Regs {
         self.fs = ds;
         self.es = ds;
         self.ds = ds;
-        self.frame = Frame {
-            f64: Frame64 {
-                rip: entry, cs: USER_CS64 as u64, rflags: IF_FLAG,
-                rsp: stack, ss: USER_DS as u64,
-            }
+        self.frame = Frame64 {
+            rip: entry,
+            cs: USER_CS64 as u64,
+            rflags: IF_FLAG,
+            rsp: stack,
+            ss: USER_DS as u64,
         };
     }
 }
@@ -228,7 +230,7 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 /// cs/ip/ss/sp are real-mode segment:offset values
 pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
     thread.mode = ThreadMode::Mode16;
-    thread.frame_format = FrameFormat::Protected; // VM86 always uses Frame32 (IRET in PAE mode)
+    thread.frame_format = FrameFormat::Protected; // VM86 returns through the 32-bit IRET path
     thread.vm86 = crate::kernel::vm86::Vm86State::new();
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode
@@ -246,15 +248,12 @@ pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, 
     state.fs = 0;
     state.gs = 0;
 
-    // Always f64 format — arch converts to f32 for VM86 IRET in PAE mode
-    state.frame = Frame {
-        f64: Frame64 {
-            rip: ip as u64,
-            cs: cs as u64,
-            rflags: (VM_FLAG | IF_FLAG | VIF_FLAG) as u64,
-            rsp: sp as u64,
-            ss: ss as u64,
-        }
+    state.frame = Frame64 {
+        rip: ip as u64,
+        cs: cs as u64,
+        rflags: (VM_FLAG | IF_FLAG | VIF_FLAG) as u64,
+        rsp: sp as u64,
+        ss: ss as u64,
     };
 }
 
@@ -423,14 +422,13 @@ pub fn init_threading() {
             THREADS.push(Thread::empty());
         }
 
-        // Thread 0 is the init/idle thread (uses current page directory)
+        // Thread 0 is the init/idle thread (uses boot page directory)
         THREADS[0].tid = 0;
         THREADS[0].pid = 0;
         THREADS[0].priority = 0;
         THREADS[0].parent_tid = -1;
         THREADS[0].state = ThreadState::Running;
-        crate::kernel::startup::arch_save_root(&mut THREADS[0].root);
-        crate::kernel::startup::arch_activate_root(&THREADS[0].root);
+        // root stays empty — idle thread doesn't use user pages
         // CURRENT_THREAD defaults to 0, which is correct
     }
 }

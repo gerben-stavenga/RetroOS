@@ -41,11 +41,6 @@ pub fn read_cr3() -> u32 {
 /// Write CR3 register (page directory base)
 #[inline]
 pub unsafe fn write_cr3(value: u32) {
-    // Ensure we are in Ring 0
-    let cs: u16;
-    unsafe { core::arch::asm!("mov {0:x}, cs", out(reg) cs); }
-    assert!(cs & 3 == 0, "write_cr3 called from ring {}", cs & 3);
-
     unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack)); }
 }
 

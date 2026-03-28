@@ -108,8 +108,8 @@ pub fn stack_trace() {
 /// mock frame into user space. At that point, if the current thread is 64-bit,
 /// we switch to 64-bit frame walking (rbp/rip pairs of 8 bytes each).
 pub fn stack_trace_from(mut bp: u32) {
-    unsafe extern "C" { fn ret_from_64(); }
-    let ret_from_64 = ret_from_64 as u32;
+    unsafe extern "C" { fn isr_return(); }
+    let isr_dispatch = isr_return as u32;
 
     // Skip the first frame (this function / trap handler)
     if bp != 0 {
@@ -154,11 +154,20 @@ pub fn stack_trace_from(mut bp: u32) {
                 break;
             }
 
-            // Detect call_isr_handler returning to 64-bit trampoline:
-            // the next frame is the mock frame with 64-bit [rbp(8), rip(8)]
-            if ip == ret_from_64 as u64 {
-                user_64 = true;
-                bp = next_bp;
+            // Detect ISR dispatch: next frame is a 16-byte mock frame
+            // [ebp/rbp_lo, eip/rbp_hi, 0/rip_lo, 0/rip_hi]
+            // rip==0 means 32-bit user, rip!=0 means 64-bit user
+            if ip == isr_dispatch as u64 {
+                let mock = next_bp as *const u64;
+                let rip = unsafe { *mock.add(1) };
+                if rip != 0 {
+                    // 64-bit user: rbp and rip are full 64-bit values
+                    user_64 = true;
+                    bp = unsafe { *mock } as u32;
+                } else {
+                    // 32-bit user: ebp and eip are in the low 32 bits
+                    bp = next_bp;
+                }
                 depth += 1;
                 continue;
             }
