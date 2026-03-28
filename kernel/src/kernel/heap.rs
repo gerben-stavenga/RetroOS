@@ -7,7 +7,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
-use crate::arch::paging2::PAGE_SIZE;
+const PAGE_SIZE: usize = 4096;
 
 /// Heap ends before the top of address space
 pub const HEAP_END: usize = 0xFFF0_0000;
@@ -82,7 +82,7 @@ impl AllocatorInner {
     fn extend_heap(&mut self, min_size: usize) -> bool {
         let pages_needed = (min_size + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages_needed = pages_needed.max(4); // Allocate at least 4 pages at a time
-        let temp_map_addr = crate::arch::paging2::temp_map_vaddr();
+        let temp_map_addr = crate::kernel::startup::arch_temp_map_addr();
 
         let mut region_start = self.mapped_end;
         let mut region_pages = 0;
