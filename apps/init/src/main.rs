@@ -1,6 +1,6 @@
 //! Init process for RetroOS
 //!
-//! Execs the shell. Respawns if it exits.
+//! Execs Norton Commander. Respawns if it exits.
 
 #![no_std]
 #![no_main]
@@ -15,14 +15,12 @@ pub fn main(_args: &[&str]) {
         crt::print_num(pid);
         crt::print("\n");
         if pid == 0 {
-            crt::print("child: exec shell.elf\n");
-            crt::exec("shell.elf", &["shell.elf"]);
-            crt::print("child: exec NC\n");
+            crt::print("child: exec NC.EXE\n");
             crt::exec("NC.EXE", &["NC.EXE"]);
             crt::exit(1);
         }
         crt::print("parent: waitpid\n");
         crt::waitpid(pid);
-        crt::print("init: shell exited, respawning\n");
+        crt::print("init: NC exited, respawning\n");
     }
 }

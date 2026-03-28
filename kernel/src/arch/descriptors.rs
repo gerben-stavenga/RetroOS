@@ -247,6 +247,7 @@ impl Tss {
 /// - Interrupt redirection: trap handled INTs to monitor, rest through IVT
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
+    const EMS_INT_ENABLED: bool = false;
     // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
     (*tss).iopb[120] = 0x00;
     (*tss).iopb[121] = 0x00;
@@ -255,8 +256,11 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     // Interrupt redirection: set bits for INTs we handle in the monitor.
     // Bit SET = #GP to monitor, bit CLEAR = through IVT directly.
     // Every INT with a handler in handle_vm86_int must be listed here.
-    for int_num in [0x20, 0x21, 0x28, 0x2E, 0x2F, 0x67, 0xF0u8] {
+    for int_num in [0x20, 0x21, 0x28, 0x2E, 0x2F, 0xF0u8] {
         (*tss).int_redir[(int_num / 8) as usize] |= 1 << (int_num % 8);
+    }
+    if EMS_INT_ENABLED {
+        (*tss).int_redir[(0x67 / 8) as usize] |= 1 << (0x67 % 8);
     }
 }
 
@@ -470,36 +474,33 @@ pub fn toggle_mode(new_cr3: u32) {
     x86::sti();
 }
 
-/// Drop from ring 0 to ring 1 and jump to the kernel entry point.
+/// Drop from ring 0 to ring 1 in place.
 ///
-/// Switches to KERNEL_STACK and jumps to `entry` with `arg` passed on the stack.
-pub fn enter_ring1(entry: extern "C" fn(usize) -> !, arg: usize) -> ! {
+/// IRETDs to the next instruction with ring-1 CS/SS selectors and IOPL=1.
+pub fn enter_ring1() {
     unsafe {
-        let kernel_stack_top = (crate::KERNEL_STACK.as_ptr_range().end) as u32;
-        
-        // Build a C call frame on KERNEL_STACK: [ESP]=ret_addr, [ESP+4]=arg
-        *((kernel_stack_top - 4) as *mut u32) = arg as u32;   // arg
-        *((kernel_stack_top - 8) as *mut u32) = 0;            // dummy return address
-        let esp_with_arg = kernel_stack_top - 8;
-
         core::arch::asm!(
+            // Load ring-1 data segments
             "mov ds, {ds:e}",
             "mov es, {ds:e}",
             "mov fs, {ds:e}",
             "mov gs, {ds:e}",
+            // Save ESP before pushes — this is the ESP we want after IRET
+            "mov {tmp:e}, esp",
+            // Build IRET frame: SS, ESP, EFLAGS, CS, EIP
             "push {ss:e}",            // SS = RING1_DS
-            "push {esp:e}",           // ESP = KERNEL_STACK_TOP (minus arg)
+            "push {tmp:e}",           // ESP = pre-push value (restored by IRET)
             "pushfd",                 // EFLAGS
             "or dword ptr [esp], 0x1000", // set IOPL=1 so ring-1 can do I/O
             "push {cs:e}",            // CS = RING1_CS
-            "push {eip:e}",           // EIP = entry
+            "lea {tmp:e}, [2f]",
+            "push {tmp:e}",           // EIP = label after IRET
             "iretd",
+            "2:",
+            tmp = out(reg) _,
             ss = in(reg) RING1_DS as u32,
-            esp = in(reg) esp_with_arg,
             cs = in(reg) RING1_CS as u32,
             ds = in(reg) RING1_DS as u32,
-            eip = in(reg) entry,
-            options(noreturn)
         );
     }
 }

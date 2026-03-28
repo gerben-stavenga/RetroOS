@@ -25,19 +25,6 @@ SwitchStack:
     call eax            ; should not return
     ud2                 ; trap if it does
 
-; Exit kernel mode and return to interrupted context
-; extern "C" fn exit_kernel(regs: *const Regs, is_64bit: u32) -> !
-global exit_kernel
-exit_kernel:
-    cli                     ; disable interrupts while manipulating stack
-    mov eax, [esp + 8]      ; is_64bit flag
-    mov esp, [esp + 4]      ; load regs pointer as stack
-    test eax, eax
-    jnz .exit_64
-    jmp exit_interrupt_32   ; 32-bit: restore registers and iret
-.exit_64:
-    jmp far [far_ptr_64]    ; 64-bit: switch to long mode and iretq
-
 ; Macro to push a 32-bit register as 64-bit (with high dword = 0)
 %macro push64_32 1
     push dword 0            ; high 32 bits
@@ -95,16 +82,14 @@ entry_wrapper_32:
     mov fs, eax
     mov gs, eax
 
-    ; Build mock stack frame bridging kernel → user for stack traces
-    ; Regs layout: gs/fs/es/ds (32) + r15-r8 (64) + rdi/rsi/rbp/... (64) + int/err (16) + frame (40)
-    ; Offset to Frame32.eip: 32 + 64 + 64 + 16 + 20 (Frame32._pad) = 196
-    ; Offset to rbp: 32 + 64 + 16 (rdi+rsi) = 112
+    ; Build 16-byte mock frame: [ebp, eip, 0, 0] — rip==0 signals 32-bit user
     mov eax, esp
-    push dword [eax + 196]  ; user's eip
-    push dword [eax + 112]  ; user's ebp (low 32 bits of rbp)
+    push dword 0
+    push dword 0
+    push dword [eax + 196]      ; user's eip
+    push dword [eax + 112]      ; user's ebp
     mov ebp, esp
-    call call_isr_handler
-    add esp, 8              ; clean up mock frame
+    jmp call_isr_handler
 
 exit_interrupt_32:
     ; Restore segment registers
@@ -151,25 +136,31 @@ exit_interrupt_32:
     iret
 
 ; =============================================================================
-; Common ISR handler call (32-bit)
-; Called from both 32-bit and 64-bit entry points
-; Caller sets up mock stack frame (ebp/eip pair), then calls this.
-; Input: EAX = pointer to Regs struct (set by caller before mock frame push)
-; This function has a standard prologue so the frame chain is:
-;   isr_handler → call_isr_handler → mock frame (user ebp/eip)
+; Common ISR dispatch
+; Jumped to from both 32-bit and 64-bit entry points.
+; Stack: [mock frame 16B] [Regs] [Frame] [VM86 segs]
+; EAX = pointer to FullRegs
 ; =============================================================================
 call_isr_handler:
-    push ebp
-    mov ebp, esp
-
-    cld                     ; clear direction flag
-    push eax                ; push pointer to saved registers (Regs struct)
+    cld
+    push eax                ; arg: pointer to FullRegs
 
     extern isr_handler
-    call isr_handler        ; call Rust interrupt handler
+    call isr_handler
+global isr_return
+isr_return:
+    add esp, 4              ; clean up arg
 
-    leave
-    ret
+    add esp, 16             ; clean up mock frame
+
+    ; Dispatch exit based on cpu-mode (EFER.LMA = long mode active)
+    mov ecx, 0xC0000080     ; EFER MSR
+    rdmsr
+    test eax, (1 << 10)     ; LMA bit
+    jnz .exit_long
+    jmp exit_interrupt_32
+.exit_long:
+    jmp far [far_ptr_64]
 
 ; =============================================================================
 ; Trampoline for 64-bit to 32-bit transition
@@ -184,18 +175,14 @@ trampoline_64_to_32:
     ; Build mock stack frame with full 64-bit rbp/rip values
     ; Offset to Frame64.rip: 32 + 64 + 64 + 16 = 176
     ; Offset to rbp: 112
+    ; Build 16-byte mock stack frame (64-bit ebp/eip for stack traces)
     mov eax, esp
     push dword [eax + 180]  ; user's rip high 32
     push dword [eax + 176]  ; user's rip low 32
     push dword [eax + 116]  ; user's rbp high 32
     push dword [eax + 112]  ; user's rbp low 32
     mov ebp, esp
-    call call_isr_handler
-global ret_from_64
-ret_from_64:
-    add esp, 16             ; clean up mock frame (2x 64-bit values)
-    ; Far jump back to 64-bit mode (indirect via memory)
-    jmp far [far_ptr_64]
+    jmp call_isr_handler
 
 
 ; =============================================================================

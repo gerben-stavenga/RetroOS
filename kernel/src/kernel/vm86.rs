@@ -23,9 +23,61 @@ const IF_FLAG: u32 = 1 << 9;
 const IOPL_MASK: u32 = 3 << 12;
 const VM_FLAG: u32 = 1 << 17;
 const VIF_FLAG: u32 = 1 << 19;
+const EMS_ENABLED: bool = false;
 
 /// Flags that VM86 code cannot change (IOPL, VM)
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
+
+#[inline]
+fn vm86_cs(regs: &Regs) -> u16 {
+    regs.code_seg()
+}
+
+#[inline]
+fn vm86_ip(regs: &Regs) -> u16 {
+    regs.ip32() as u16
+}
+
+#[inline]
+fn vm86_ss(regs: &Regs) -> u16 {
+    regs.stack_seg()
+}
+
+#[inline]
+fn vm86_sp(regs: &Regs) -> u16 {
+    regs.sp32() as u16
+}
+
+#[inline]
+fn vm86_flags(regs: &Regs) -> u32 {
+    regs.flags32()
+}
+
+#[inline]
+fn set_vm86_cs(regs: &mut Regs, cs: u16) {
+    regs.set_cs32(cs as u32);
+}
+
+#[inline]
+fn set_vm86_ip(regs: &mut Regs, ip: u16) {
+    regs.set_ip32(ip as u32);
+}
+
+#[inline]
+fn set_vm86_ss(regs: &mut Regs, ss: u16) {
+    regs.set_ss32(ss as u32);
+}
+
+#[inline]
+fn set_vm86_sp(regs: &mut Regs, sp: u16) {
+    let full = (regs.sp32() & 0xFFFF_0000) | sp as u32;
+    regs.set_sp32(full);
+}
+
+#[inline]
+fn set_vm86_flags(regs: &mut Regs, flags: u32) {
+    regs.set_flags32(flags);
+}
 
 
 
@@ -44,6 +96,7 @@ pub struct Vm86State {
     pub a20_enabled: bool,
     pub dta: u32,
     pub heap_seg: u16,
+    pub vpit: VirtualPit,
     pub vpic: VirtualPic,
     pub vkbd: VirtualKeyboard,
     pub exec_parent: Option<ExecParent>,
@@ -62,6 +115,7 @@ impl Vm86State {
             a20_enabled: false,
             dta: 0,
             heap_seg: 0xA000,
+            vpit: VirtualPit::new(),
             vpic: VirtualPic::new(),
             vkbd: VirtualKeyboard::new(),
             exec_parent: None,
@@ -70,6 +124,225 @@ impl Vm86State {
             ems: None,
             hma_pages,
         }
+    }
+}
+
+const PIT_INPUT_HZ: u64 = 1_193_182;
+const HOST_TIMER_HZ: u64 = 100;
+
+#[derive(Clone, Copy)]
+struct VirtualPitChannel {
+    reload: u16,
+    rw_mode: u8,
+    mode: u8,
+    write_lsb: Option<u8>,
+    read_lsb_next: bool,
+    latched: Option<u16>,
+    latch_lsb_next: bool,
+    start_cycle: u64,
+    next_irq_cycle: u64,
+    enabled: bool,
+}
+
+impl VirtualPitChannel {
+    const fn new() -> Self {
+        Self {
+            reload: 0,
+            rw_mode: 3,
+            mode: 3,
+            write_lsb: None,
+            read_lsb_next: true,
+            latched: None,
+            latch_lsb_next: true,
+            start_cycle: 0,
+            next_irq_cycle: 0,
+            enabled: true,
+        }
+    }
+
+    #[inline]
+    fn divisor(&self) -> u64 {
+        match self.reload {
+            0 => 65_536,
+            v => v as u64,
+        }
+    }
+
+    #[inline]
+    fn current_count(&self, now: u64) -> u16 {
+        if !self.enabled {
+            return self.reload;
+        }
+        let div = self.divisor();
+        let elapsed = now.saturating_sub(self.start_cycle);
+        let raw = match self.mode {
+            2 | 3 => {
+                let pos = elapsed % div;
+                let remaining = div - pos;
+                if remaining == div { div } else { remaining }
+            }
+            _ => {
+                if elapsed >= div { 0 } else { div - elapsed }
+            }
+        };
+        raw as u16
+    }
+
+    fn latch_count(&mut self, now: u64) {
+        self.latched = Some(self.current_count(now));
+        self.latch_lsb_next = true;
+    }
+
+    fn read_byte(&mut self, now: u64) -> u8 {
+        if let Some(latched) = self.latched {
+            let byte = if self.latch_lsb_next {
+                self.latch_lsb_next = false;
+                latched as u8
+            } else {
+                self.latched = None;
+                self.latch_lsb_next = true;
+                (latched >> 8) as u8
+            };
+            return byte;
+        }
+
+        let count = self.current_count(now);
+        match self.rw_mode {
+            1 => count as u8,
+            2 => (count >> 8) as u8,
+            _ => {
+                let byte = if self.read_lsb_next {
+                    count as u8
+                } else {
+                    (count >> 8) as u8
+                };
+                self.read_lsb_next = !self.read_lsb_next;
+                byte
+            }
+        }
+    }
+
+    fn load_count(&mut self, raw: u16, now: u64) {
+        self.reload = raw;
+        self.write_lsb = None;
+        self.read_lsb_next = true;
+        self.latched = None;
+        self.latch_lsb_next = true;
+        self.start_cycle = now;
+        self.enabled = true;
+        let div = self.divisor();
+        self.next_irq_cycle = match self.mode {
+            2 | 3 => now.saturating_add(div),
+            _ => now.saturating_add(div),
+        };
+    }
+
+    fn write_byte(&mut self, val: u8, now: u64) {
+        match self.rw_mode {
+            1 => self.load_count(val as u16, now),
+            2 => self.load_count((val as u16) << 8, now),
+            _ => {
+                if let Some(lo) = self.write_lsb.take() {
+                    self.load_count(((val as u16) << 8) | lo as u16, now);
+                } else {
+                    self.write_lsb = Some(val);
+                }
+            }
+        }
+    }
+
+    fn set_command(&mut self, rw_mode: u8, mode: u8) {
+        self.rw_mode = rw_mode;
+        self.mode = match mode {
+            6 => 2,
+            7 => 3,
+            v => v & 0x07,
+        };
+        self.write_lsb = None;
+        self.read_lsb_next = true;
+    }
+
+    fn take_irqs(&mut self, now: u64) -> u32 {
+        if !self.enabled {
+            return 0;
+        }
+        let div = self.divisor();
+        let mut count = 0u32;
+        match self.mode {
+            2 | 3 => {
+                while now >= self.next_irq_cycle {
+                    count = count.saturating_add(1);
+                    self.next_irq_cycle = self.next_irq_cycle.saturating_add(div);
+                }
+            }
+            _ => {
+                if now >= self.next_irq_cycle {
+                    count = 1;
+                    self.enabled = false;
+                }
+            }
+        }
+        count
+    }
+}
+
+pub struct VirtualPit {
+    last_host_tick: u64,
+    frac_accum: u64,
+    input_cycles: u64,
+    ch0: VirtualPitChannel,
+}
+
+impl VirtualPit {
+    fn new() -> Self {
+        let now = crate::arch::irq::get_ticks();
+        Self {
+            last_host_tick: now,
+            frac_accum: 0,
+            input_cycles: 0,
+            ch0: VirtualPitChannel::new(),
+        }
+    }
+
+    fn sync(&mut self) {
+        let now = crate::arch::irq::get_ticks();
+        let delta_ticks = now.saturating_sub(self.last_host_tick);
+        if delta_ticks == 0 {
+            return;
+        }
+        self.last_host_tick = now;
+        let total = self.frac_accum.saturating_add(delta_ticks.saturating_mul(PIT_INPUT_HZ));
+        self.input_cycles = self.input_cycles.saturating_add(total / HOST_TIMER_HZ);
+        self.frac_accum = total % HOST_TIMER_HZ;
+    }
+
+    fn read_counter0(&mut self) -> u8 {
+        self.sync();
+        self.ch0.read_byte(self.input_cycles)
+    }
+
+    fn write_counter0(&mut self, val: u8) {
+        self.sync();
+        self.ch0.write_byte(val, self.input_cycles);
+    }
+
+    fn write_command(&mut self, val: u8) {
+        self.sync();
+        let channel = (val >> 6) & 0x03;
+        if channel != 0 {
+            return;
+        }
+        let rw_mode = (val >> 4) & 0x03;
+        if rw_mode == 0 {
+            self.ch0.latch_count(self.input_cycles);
+            return;
+        }
+        self.ch0.set_command(rw_mode, (val >> 1) & 0x07);
+    }
+
+    fn take_pending_irqs(&mut self) -> u32 {
+        self.sync();
+        self.ch0.take_irqs(self.input_cycles)
     }
 }
 
@@ -168,13 +441,15 @@ pub struct VirtualKeyboard {
     tail: usize,
     /// Latched scancode visible via port 0x60 (set when INT 9 is reflected)
     pub port60: u8,
+    /// Port 0x61 state used by the BIOS keyboard IRQ handler handshake.
+    pub port61: u8,
     /// Output Buffer Full flag — port 0x64 bit 0
     pub obf: bool,
 }
 
 impl VirtualKeyboard {
     pub const fn new() -> Self {
-        Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, obf: false }
+        Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false }
     }
 
     /// Buffer a scancode from the real keyboard IRQ handler
@@ -208,6 +483,21 @@ impl VirtualKeyboard {
         self.obf
     }
 
+    pub fn read_port61(&self) -> u8 {
+        self.port61
+    }
+
+    pub fn write_port61(&mut self, val: u8) {
+        self.port61 = val;
+    }
+
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.port60 = 0;
+        self.obf = false;
+    }
+
     /// Pop next key-down scancode, skipping releases (for INT 16h AH=0)
     pub fn pop_key(&mut self) -> Option<u8> {
         while self.head != self.tail {
@@ -231,6 +521,14 @@ impl VirtualKeyboard {
             i = (i + 1) % KBD_BUF_SIZE;
         }
         None
+    }
+}
+
+fn clear_bios_keyboard_buffer() {
+    write_u16(0x40, 0x1A, 0x001E);
+    write_u16(0x40, 0x1C, 0x001E);
+    for off in (0x1E..0x3E).step_by(2) {
+        write_u16(0x40, off, 0);
     }
 }
 
@@ -551,15 +849,13 @@ fn emulate_inb(port: u16) -> Result<u8, Action> {
         // Master PIC data (read IMR)
         0x21 => Ok(thread::current().vm86.vpic.imr),
         // Keyboard data port — returns latched scancode (like real 8042 output buffer)
-        0x60 => {
-            let sc = thread::current().vm86.vkbd.read_port60();
-            if sc != 0 { dbg_println!("KBD: port 0x60 read -> {:02X}", sc); }
-            Ok(sc)
-        }
+        0x60 => Ok(thread::current().vm86.vkbd.read_port60()),
+        // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
+        0x61 => Ok(thread::current().vm86.vkbd.read_port61()),
         // Keyboard status port (bit 0 = output buffer full)
         0x64 => Ok(if thread::current().vm86.vkbd.has_data() { 1 } else { 0 }),
-        // PIT counter reads — pass through so timing loops see a changing value
-        0x40..=0x42 => Ok(crate::arch::x86::inb(port)),
+        0x40 => Ok(thread::current().vm86.vpit.read_counter0()),
+        0x41 | 0x42 => Ok(0),
         // PIT command register not readable
         0x43 => Ok(0xFF),
         // Unknown ports: return 0xFF (unpopulated bus)
@@ -597,15 +893,22 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
         0xA0 => Ok(()),
         // Slave PIC data
         0xA1 => Ok(()),
-        // Keyboard controller command
-        0x64 => Ok(()),
-        // PIT command — only allow latch commands (bits 5-4 = 00), block reprogramming
-        0x43 => {
-            if val & 0x30 == 0x00 { crate::arch::x86::outb(port, val); }
+        // Keyboard controller / speaker port
+        0x61 => {
+            thread::current().vm86.vkbd.write_port61(val);
             Ok(())
         }
-        // PIT counter data writes — ignore (don't let games reprogram kernel timer)
-        0x40..=0x42 => Ok(()),
+        // Keyboard controller command
+        0x64 => Ok(()),
+        0x43 => {
+            thread::current().vm86.vpit.write_command(val);
+            Ok(())
+        }
+        0x40 => {
+            thread::current().vm86.vpit.write_counter0(val);
+            Ok(())
+        }
+        0x41 | 0x42 => Ok(()),
         // Unknown ports: silently ignore (BIOS probes various ports during mode switches)
         _ => Ok(())
     }
@@ -627,7 +930,7 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
     // Fix: on each IRQ delivery, re-set GC5 bit 4 when in text mode.
     // Skip when CS >= C000 (BIOS ROM) — BIOS font loading needs GC5=0x00.
     unsafe {
-        let cs = regs.frame.f32.cs;
+        let cs = regs.cs32();
         if cs < 0xC000 {
             let mode = *(0x449 as *const u8);
             if mode <= 3 || mode == 7 {
@@ -642,16 +945,20 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
         }
     }
 
-    // Buffer discrete events (keyboard). Timer ticks are pumped separately in traps.rs.
+    // Buffer virtual IRQs for delivery through the guest IVT.
     use crate::arch::irq::Irq;
     if let Some(e) = event {
         match e {
             Irq::Key(sc) => {
-                dbg_println!("KEY: sc={:02X} vif={} isr={:02X}", sc, thread.vm86.vif, thread.vm86.vpic.isr);
                 thread.vm86.vkbd.push(sc);
                 thread.vm86.vpic.push(0x09);
             }
-            Irq::Tick => {} // handled via take_pending_ticks() in traps.rs
+            Irq::Tick => {
+                let due = thread.vm86.vpit.take_pending_irqs();
+                for _ in 0..due {
+                    thread.vm86.vpic.push(0x08);
+                }
+            }
         }
     }
     if !thread.vm86.vif {
@@ -659,7 +966,7 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
         // With VME: CPU will #GP on next STI, giving us a chance to deliver.
         // Without VME: VIP is informational but harmless.
         if thread.vm86.vpic.has_pending() {
-            unsafe { regs.frame.f32.eflags |= 1 << 20; } // VIP flag
+            regs.set_flag32(1 << 20); // VIP flag
         }
         return;
     }
@@ -686,7 +993,7 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
         thread.vm86.vpic.isr |= 1 << irq_num;
     }
     // Clear VIP — we're delivering now
-    unsafe { regs.frame.f32.eflags &= !(1 << 20); }
+    regs.clear_flag32(1 << 20);
     let saved_if = sync_vif(thread, regs);
     reflect_interrupt(regs, vec);
     restore_vif(thread, regs, saved_if);
@@ -696,39 +1003,37 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
 /// Arch guarantees VIF in EFLAGS is always valid (hardware-managed with VME,
 /// arch-preserved without VME). Returns the saved real IF value for restore_vif.
 fn sync_vif(thread: &mut thread::Thread, regs: &mut Regs) -> u32 {
-    unsafe {
-        let saved_if = regs.frame.f32.eflags & IF_FLAG;
-        // VIF in EFLAGS is authoritative (hardware maintains it with VME,
-        // and we maintain it in saved regs without VME — CPU preserves it either way)
-        thread.vm86.vif = regs.frame.f32.eflags & VIF_FLAG != 0;
-        if thread.vm86.vif { regs.frame.f32.eflags |= IF_FLAG; }
-        else { regs.frame.f32.eflags &= !IF_FLAG; }
-        saved_if
-    }
+    let saved_if = vm86_flags(regs) & IF_FLAG;
+    // VIF in EFLAGS is authoritative (hardware maintains it with VME,
+    // and we maintain it in saved regs without VME — CPU preserves it either way)
+    thread.vm86.vif = vm86_flags(regs) & VIF_FLAG != 0;
+    if thread.vm86.vif { regs.set_flag32(IF_FLAG); }
+    else { regs.clear_flag32(IF_FLAG); }
+    saved_if
 }
 
 /// Extract VIF from EFLAGS.IF back into thread, restore real IF.
 /// Writes VIF back to EFLAGS (arch propagates to hardware if VME active).
 fn restore_vif(thread: &mut thread::Thread, regs: &mut Regs, saved_if: u32) {
-    unsafe {
-        thread.vm86.vif = regs.frame.f32.eflags & IF_FLAG != 0;
-        if thread.vm86.vif { regs.frame.f32.eflags |= VIF_FLAG; }
-        else { regs.frame.f32.eflags &= !VIF_FLAG; }
-        regs.frame.f32.eflags = (regs.frame.f32.eflags & !IF_FLAG) | saved_if;
-    }
+    thread.vm86.vif = vm86_flags(regs) & IF_FLAG != 0;
+    if thread.vm86.vif { regs.set_flag32(VIF_FLAG); }
+    else { regs.clear_flag32(VIF_FLAG); }
+    set_vm86_flags(regs, (vm86_flags(regs) & !IF_FLAG) | saved_if);
 }
 
 /// Reflect an interrupt through the IVT: push FLAGS/CS/IP, clear IF, set CS:IP.
 /// Caller must ensure EFLAGS.IF reflects VIF (via sync_vif).
 fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
-    unsafe {
-        vm86_push(regs, regs.frame.f32.eflags as u16);
-        vm86_push(regs, regs.frame.f32.cs as u16);
-        vm86_push(regs, regs.frame.f32.eip as u16);
-        regs.frame.f32.eflags &= !IF_FLAG;
-        regs.frame.f32.eip = read_u16(0, (int_num as u32) * 4) as u32;
-        regs.frame.f32.cs = read_u16(0, (int_num as u32) * 4 + 2) as u32;
-    }
+    let old_cs = vm86_cs(regs);
+    let old_ip = vm86_ip(regs);
+    let new_ip = read_u16(0, (int_num as u32) * 4);
+    let new_cs = read_u16(0, (int_num as u32) * 4 + 2);
+    vm86_push(regs, vm86_flags(regs) as u16);
+    vm86_push(regs, old_cs);
+    vm86_push(regs, old_ip);
+    regs.clear_flag32(IF_FLAG);
+    set_vm86_ip(regs, new_ip);
+    set_vm86_cs(regs, new_cs);
 }
 
 // ============================================================================
@@ -742,11 +1047,11 @@ fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
 /// Read a byte from the VM86 address space at CS:IP and advance IP
 fn fetch_byte(regs: &mut Regs) -> u8 {
     unsafe {
-        let cs = regs.frame.f32.cs;
-        let ip = regs.frame.f32.eip;
+        let cs = regs.cs32();
+        let ip = regs.ip32();
         let linear = (cs << 4) + ip;
         let byte = *(linear as *const u8);
-        regs.frame.f32.eip = ip + 1;
+        regs.set_ip32(ip + 1);
         byte
     }
 }
@@ -794,21 +1099,17 @@ fn vm86_pop32(regs: &mut Regs) -> u32 {
 
 /// Push a u16 onto the VM86 stack (SS:SP)
 fn vm86_push(regs: &mut Regs, val: u16) {
-    unsafe {
-        let sp = (regs.frame.f32.esp as u16).wrapping_sub(2);
-        regs.frame.f32.esp = (regs.frame.f32.esp & 0xFFFF0000) | sp as u32;
-        write_u16(regs.frame.f32.ss, sp as u32, val);
-    }
+    let sp = vm86_sp(regs).wrapping_sub(2);
+    set_vm86_sp(regs, sp);
+    write_u16(regs.ss32(), sp as u32, val);
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
 fn vm86_pop(regs: &mut Regs) -> u16 {
-    unsafe {
-        let sp = regs.frame.f32.esp as u16;
-        let val = read_u16(regs.frame.f32.ss, sp as u32);
-        regs.frame.f32.esp = (regs.frame.f32.esp & 0xFFFF0000) | sp.wrapping_add(2) as u32;
-        val
-    }
+    let sp = vm86_sp(regs);
+    let val = read_u16(regs.ss32(), sp as u32);
+    set_vm86_sp(regs, sp.wrapping_add(2));
+    val
 }
 
 enum Action {
@@ -849,43 +1150,55 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             let int_num = fetch_byte(regs);
             handle_vm86_int(regs, int_num)
         }
+        // INT3 (0xCC) — single-byte software interrupt
+        0xCC => {
+            handle_vm86_int(regs, 0x03)
+        }
+        // INTO (0xCE) — software interrupt on overflow
+        0xCE => {
+            if vm86_flags(regs) & (1 << 11) != 0 {
+                handle_vm86_int(regs, 0x04)
+            } else {
+                Action::Done
+            }
+        }
+        // INT1 / ICEBP (0xF1) — single-byte software interrupt
+        0xF1 => {
+            handle_vm86_int(regs, 0x01)
+        }
         // IRET (0xCF) — pop IP, CS, FLAGS from VM86 stack
         // IOPL and VM are preserved (VM86 code cannot change them)
         0xCF => {
             let ip = vm86_pop(regs);
             let cs = vm86_pop(regs);
             let flags = vm86_pop(regs);
-            unsafe {
-                regs.frame.f32.eip = ip as u32;
-                regs.frame.f32.cs = cs as u32;
-                let preserved = regs.frame.f32.eflags & PRESERVED_FLAGS;
-                regs.frame.f32.eflags = (flags as u32 & !PRESERVED_FLAGS) | preserved;
-            }
+            set_vm86_ip(regs, ip);
+            set_vm86_cs(regs, cs);
+            let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
+            set_vm86_flags(regs, (flags as u32 & !PRESERVED_FLAGS) | preserved);
             Action::Done
         }
         // CLI (0xFA)
         0xFA => {
-            unsafe { regs.frame.f32.eflags &= !IF_FLAG; }
+            regs.clear_flag32(IF_FLAG);
             Action::Done
         }
         // STI (0xFB)
         0xFB => {
-            unsafe { regs.frame.f32.eflags |= IF_FLAG; }
+            regs.set_flag32(IF_FLAG);
             Action::Done
         }
         // PUSHF (0x9C) — push FLAGS (IF already reflects VIF)
         0x9C => {
-            vm86_push(regs, unsafe { regs.frame.f32.eflags as u16 });
+            vm86_push(regs, vm86_flags(regs) as u16);
             Action::Done
         }
         // POPF (0x9D) — pop FLAGS
         // IOPL and VM are preserved (VM86 code cannot change them)
         0x9D => {
             let flags = vm86_pop(regs);
-            unsafe {
-                let preserved = regs.frame.f32.eflags & PRESERVED_FLAGS;
-                regs.frame.f32.eflags = (flags as u32 & !PRESERVED_FLAGS) | preserved;
-            }
+            let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
+            set_vm86_flags(regs, (flags as u32 & !PRESERVED_FLAGS) | preserved);
             Action::Done
         }
         // INSB (0x6C) — IN byte from port DX to ES:DI, advance DI
@@ -893,7 +1206,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             let port = regs.rdx as u16;
             let val = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
             write_u16(regs.es as u32, regs.rdi as u32, val as u16);
-            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+            if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rdi = regs.rdi.wrapping_sub(1); // DF=1
             } else {
                 regs.rdi = regs.rdi.wrapping_add(1);
@@ -907,7 +1220,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             let hi = match emulate_inb(port + 1) { Ok(v) => v, Err(a) => return a };
             let val = (hi as u16) << 8 | lo as u16;
             write_u16(regs.es as u32, regs.rdi as u32, val);
-            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+            if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rdi = regs.rdi.wrapping_sub(2);
             } else {
                 regs.rdi = regs.rdi.wrapping_add(2);
@@ -919,7 +1232,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             let port = regs.rdx as u16;
             let val = read_u16(regs.ds as u32, regs.rsi as u32) as u8;
             if let Err(a) = emulate_outb(port, val) { return a; }
-            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+            if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(1);
             } else {
                 regs.rsi = regs.rsi.wrapping_add(1);
@@ -932,7 +1245,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             let val = read_u16(regs.ds as u32, regs.rsi as u32);
             if let Err(a) = emulate_outb(port, val as u8) { return a; }
             if let Err(a) = emulate_outb(port + 1, (val >> 8) as u8) { return a; }
-            if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+            if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(2);
             } else {
                 regs.rsi = regs.rsi.wrapping_add(2);
@@ -1003,16 +1316,14 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             match op {
                 // PUSHFD — push 32-bit EFLAGS
                 0x9C => {
-                    vm86_push32(regs, unsafe { regs.frame.f32.eflags } & 0xFFFF);
+                    vm86_push32(regs, vm86_flags(regs) & 0xFFFF);
                     Action::Done
                 }
                 // POPFD — pop 32-bit EFLAGS
                 0x9D => {
                     let flags = vm86_pop32(regs);
-                    unsafe {
-                        let preserved = regs.frame.f32.eflags & PRESERVED_FLAGS;
-                        regs.frame.f32.eflags = (flags & !PRESERVED_FLAGS) | preserved;
-                    }
+                    let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
+                    set_vm86_flags(regs, (flags & !PRESERVED_FLAGS) | preserved);
                     Action::Done
                 }
                 // IRETD — pop 32-bit EIP, CS, EFLAGS
@@ -1020,12 +1331,10 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                     let eip = vm86_pop32(regs);
                     let cs = vm86_pop32(regs);
                     let flags = vm86_pop32(regs);
-                    unsafe {
-                        regs.frame.f32.eip = eip;
-                        regs.frame.f32.cs = cs & 0xFFFF;
-                        let preserved = regs.frame.f32.eflags & PRESERVED_FLAGS;
-                        regs.frame.f32.eflags = (flags & !PRESERVED_FLAGS) | preserved;
-                    }
+                    regs.set_ip32(eip);
+                    regs.set_cs32(cs & 0xFFFF);
+                    let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
+                    set_vm86_flags(regs, (flags & !PRESERVED_FLAGS) | preserved);
                     Action::Done
                 }
                 // IN EAX, imm8
@@ -1082,7 +1391,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                         *((addr + 2) as *mut u8) = b2;
                         *((addr + 3) as *mut u8) = b3;
                     }
-                    if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+                    if vm86_flags(regs) & (1 << 10) != 0 {
                         regs.rdi = regs.rdi.wrapping_sub(4);
                     } else {
                         regs.rdi = regs.rdi.wrapping_add(4);
@@ -1099,7 +1408,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                         let _ = emulate_outb(port, *((addr + 2) as *const u8));
                         let _ = emulate_outb(port, *((addr + 3) as *const u8));
                     }
-                    if unsafe { regs.frame.f32.eflags } & (1 << 10) != 0 {
+                    if vm86_flags(regs) & (1 << 10) != 0 {
                         regs.rsi = regs.rsi.wrapping_sub(4);
                     } else {
                         regs.rsi = regs.rsi.wrapping_add(4);
@@ -1108,7 +1417,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                 }
                 _ => {
                     crate::println!("VM86: FATAL unhandled opcode 0x66 {:#04x} at {:04x}:{:04x}",
-                        op, unsafe { regs.frame.f32.cs }, unsafe { regs.frame.f32.eip } - 2);
+                        op, vm86_cs(regs), regs.ip32().wrapping_sub(2));
                     let next = thread::exit_thread(-11);
                     Action::Switch(next)
                 }
@@ -1120,7 +1429,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         }
         _ => {
             crate::println!("VM86: FATAL unhandled opcode {:#04x} at {:04x}:{:04x}",
-                opcode, unsafe { regs.frame.f32.cs }, unsafe { regs.frame.f32.eip } - 1);
+                opcode, vm86_cs(regs), regs.ip32().wrapping_sub(1));
             // Kill the VM86 thread
             let next = thread::exit_thread(-11);
             Action::Switch(next)
@@ -1182,10 +1491,10 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
                         crate::kernel::vfs::close(fd);
 
                         let child_seg = thread::current().vm86.heap_seg;
-                        let parent_ss = unsafe { regs.frame.f32.ss };
-                        let parent_sp = unsafe { regs.frame.f32.esp };
-                        let parent_cs = unsafe { regs.frame.f32.cs };
-                        let parent_ip = unsafe { regs.frame.f32.eip };
+                        let parent_ss = regs.ss32();
+                        let parent_sp = regs.sp32();
+                        let parent_cs = regs.cs32();
+                        let parent_ip = regs.ip32();
                         let parent_ds = regs.ds as u16;
                         let parent_es = regs.es as u16;
 
@@ -1193,12 +1502,10 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
                         // Advance heap past child (64K for COM)
                         let t = thread::current();
                         t.vm86.heap_seg = child_seg.wrapping_add(0x1000).max(t.vm86.heap_seg);
-                        unsafe {
-                            regs.frame.f32.cs = cs as u32;
-                            regs.frame.f32.eip = ip as u32;
-                            regs.frame.f32.ss = ss as u32;
-                            regs.frame.f32.esp = sp as u32;
-                        }
+                        regs.set_cs32(cs as u32);
+                        regs.set_ip32(ip as u32);
+                        regs.set_ss32(ss as u32);
+                        regs.set_sp32(sp as u32);
                         regs.ds = child_seg as u64;
                         regs.es = child_seg as u64;
 
@@ -1240,10 +1547,6 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
 fn int_21h(regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
     match ah {
-        0x02 | 0x06 | 0x09 | 0x0C | 0x0E | 0x19 | 0x1A | 0x25 | 0x29 | 0x2F | 0x33 | 0x4F => {}
-        _ => dbg_println!("INT21 AH={:02X} AX={:04X}", ah, regs.rax as u16),
-    }
-    match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
             vga::vga().putchar(regs.rdx as u8);
@@ -1254,7 +1557,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             let dl = regs.rdx as u8;
             if dl == 0xFF {
                 // Input: check keyboard, ZF=1 if no char
-                unsafe { regs.frame.f32.eflags |= 0x40; } // set ZF = no char available
+                regs.set_flag32(0x40); // set ZF = no char available
             } else {
                 vga::vga().putchar(dl);
             }
@@ -1280,7 +1583,6 @@ fn int_21h(regs: &mut Regs) -> Action {
             let int_num = regs.rax as u8;
             let off = regs.rdx as u16;
             let seg = regs.ds as u16;
-            dbg_println!("INT21/25: set IVT[{:02X}] = {:04X}:{:04X}", int_num, seg, off);
             write_u16(0, (int_num as u32) * 4, off);
             write_u16(0, (int_num as u32) * 4 + 2, seg);
             Action::Done
@@ -1310,8 +1612,8 @@ fn int_21h(regs: &mut Regs) -> Action {
                     pos += 1;
                 }
                 *((addr + pos as u32) as *mut u8) = 0; // NUL terminate
-                regs.frame.f32.eflags &= !1; // clear CF
             }
+            regs.clear_flag32(1); // clear CF
             Action::Done
         }
         // AH=0x19: Get current default drive (returns AL=drive, 0=A, 2=C)
@@ -1325,7 +1627,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             let sub_ah = regs.rax as u8;
             if sub_ah == 0x06 {
                 // Direct console I/O — return "no key"
-                unsafe { regs.frame.f32.eflags |= 0x40; } // ZF=1
+                regs.set_flag32(0x40); // ZF=1
             }
             // Other sub-functions: just return
             Action::Done
@@ -1384,7 +1686,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 *p.add(0x0D) = b':';
             }
             regs.rbx = (regs.rbx & !0xFFFF) | 1; // country code = 1 (USA)
-            unsafe { regs.frame.f32.eflags &= !1; }
+            regs.clear_flag32(1);
             Action::Done
         }
         // AH=0x3B: Change directory (DS:DX=ASCIIZ path)
@@ -1400,10 +1702,10 @@ fn int_21h(regs: &mut Regs) -> Action {
             }
             let result = crate::kernel::vfs::chdir(&path[..i]);
             if result < 0 {
-                unsafe { regs.frame.f32.eflags |= 1; } // set CF
+                regs.set_flag32(1); // set CF
                 regs.rax = (regs.rax & !0xFFFF) | 3; // AX=3 path not found
             } else {
-                unsafe { regs.frame.f32.eflags &= !1; } // clear CF
+                regs.clear_flag32(1); // clear CF
             }
             Action::Done
         }
@@ -1421,19 +1723,18 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 i += 1;
             }
-            dbg_println!("  Open: {}", unsafe { core::str::from_utf8_unchecked(&name[..i]) });
             // Check for device names
-            if name[..i].eq_ignore_ascii_case(b"EMMXXXX0") {
+            if EMS_ENABLED && name[..i].eq_ignore_ascii_case(b"EMMXXXX0") {
                 regs.rax = (regs.rax & !0xFFFF) | EMS_DEVICE_HANDLE as u64;
-                unsafe { regs.frame.f32.eflags &= !1; }
+                regs.clear_flag32(1);
             } else {
                 let fd = crate::kernel::vfs::open(&name[..i]);
                 if fd >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
-                    unsafe { regs.frame.f32.eflags &= !1; } // clear carry
+                    regs.clear_flag32(1); // clear carry
                 } else {
                     regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
-                    unsafe { regs.frame.f32.eflags |= 1; } // set carry
+                    regs.set_flag32(1); // set carry
                 }
             }
             Action::Done
@@ -1441,10 +1742,10 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
             let handle = regs.rbx as u16;
-            if handle != EMS_DEVICE_HANDLE {
+            if !EMS_ENABLED || handle != EMS_DEVICE_HANDLE {
                 crate::kernel::vfs::close(handle as i32);
             }
-            unsafe { regs.frame.f32.eflags &= !1; }
+            regs.clear_flag32(1);
             Action::Done
         }
         // AH=0x3F: Read from file (BX=handle, CX=count, DS:DX=buffer)
@@ -1456,19 +1757,19 @@ fn int_21h(regs: &mut Regs) -> Action {
                 // stdin — read from virtual keyboard
                 // Return 0 for now (no line-buffered stdin in VM86)
                 regs.rax = regs.rax & !0xFFFF;
-                unsafe { regs.frame.f32.eflags &= !1; }
+                regs.clear_flag32(1);
             } else if handle == 1 || handle == 2 {
                 regs.rax = regs.rax & !0xFFFF;
-                unsafe { regs.frame.f32.eflags &= !1; }
+                regs.clear_flag32(1);
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
                 let n = crate::kernel::vfs::read(handle, buf);
                 if n >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
-                    unsafe { regs.frame.f32.eflags &= !1; }
+                    regs.clear_flag32(1);
                 } else {
                     regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
-                    unsafe { regs.frame.f32.eflags |= 1; }
+                    regs.set_flag32(1);
                 }
             }
             Action::Done
@@ -1487,9 +1788,6 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 pat_len += 1;
             }
-            let cwd = thread::current().cwd_str();
-            let cwd_s = unsafe { core::str::from_utf8_unchecked(cwd) };
-            dbg_println!("  FindFirst: {} (cwd={})", unsafe { core::str::from_utf8_unchecked(&pat[..pat_len]) }, cwd_s);
             // Search from index 0
             find_matching_file(regs, &pat[..pat_len], 0)
         }
@@ -1525,20 +1823,18 @@ fn int_21h(regs: &mut Regs) -> Action {
                 let seg = t.vm86.heap_seg;
                 t.vm86.heap_seg += need;
                 regs.rax = (regs.rax & !0xFFFF) | seg as u64;
-                unsafe { regs.frame.f32.eflags &= !1; }
-                dbg_println!("  alloc {} para → seg {:04X} (heap now {:04X})", need, seg, t.vm86.heap_seg);
+                regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
                 regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
-                unsafe { regs.frame.f32.eflags |= 1; }
-                dbg_println!("  alloc FAIL: need {} avail {} heap={:04X}", need, avail, t.vm86.heap_seg);
+                regs.set_flag32(1);
             }
             Action::Done
         }
         // AH=0x49: Free memory (ES=segment)
         0x49 => {
             // Simple bump allocator — free is a no-op
-            unsafe { regs.frame.f32.eflags &= !1; }
+            regs.clear_flag32(1);
             Action::Done
         }
         // AH=0x4A: Resize memory block (ES=segment, BX=new size in paragraphs)
@@ -1548,13 +1844,13 @@ fn int_21h(regs: &mut Regs) -> Action {
             if new_end <= 0xA000 {
                 // Program resizing its block — free memory starts after it
                 thread::current().vm86.heap_seg = new_end;
-                unsafe { regs.frame.f32.eflags &= !1; }
+                regs.clear_flag32(1);
             } else {
                 // Not enough memory — report max available
                 let avail = 0xA000u16.saturating_sub(es);
                 regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
-                unsafe { regs.frame.f32.eflags |= 1; }
+                regs.set_flag32(1);
             }
             Action::Done
         }
@@ -1572,38 +1868,37 @@ fn int_21h(regs: &mut Regs) -> Action {
                             _ => 0x02, // stdout/stderr
                         };
                         regs.rdx = (regs.rdx & !0xFFFF) | info as u64;
-                        unsafe { regs.frame.f32.eflags &= !1; }
-                    } else if handle == EMS_DEVICE_HANDLE {
+                        regs.clear_flag32(1);
+                    } else if EMS_ENABLED && handle == EMS_DEVICE_HANDLE {
                         // EMMXXXX0 device: bit 7=1 (device)
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x80;
-                        unsafe { regs.frame.f32.eflags &= !1; }
+                        regs.clear_flag32(1);
                     } else {
                         // File handle: bit 7=0 (file), bit 6=0 (not EOF)
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x0000;
-                        unsafe { regs.frame.f32.eflags &= !1; }
+                        regs.clear_flag32(1);
                     }
                 }
                 // AL=0x07: Check device output status (BX=handle)
                 0x07 => {
                     // AL=FFh = ready
                     regs.rax = (regs.rax & !0xFF) | 0xFF;
-                    unsafe { regs.frame.f32.eflags &= !1; }
+                    regs.clear_flag32(1);
                 }
                 // AL=0x08: Check if block device is removable (BL=drive, 0=default,1=A,3=C)
                 0x08 => {
                     // AX=0 = removable, AX=1 = fixed
                     regs.rax = (regs.rax & !0xFFFF) | 1; // fixed disk
-                    unsafe { regs.frame.f32.eflags &= !1; } // clear CF
+                    regs.clear_flag32(1); // clear CF
                 }
                 // AL=0x09: Check if block device is remote (BL=drive)
                 0x09 => {
                     regs.rdx = (regs.rdx & !0xFFFF) | 0x0000; // bit 12=0 = local
-                    unsafe { regs.frame.f32.eflags &= !1; }
+                    regs.clear_flag32(1);
                 }
                 _ => {
-                    dbg_println!("  IOCTL AL={:02X} BX={:04X}", al, regs.rbx as u16);
                     regs.rax = (regs.rax & !0xFFFF) | 1;
-                    unsafe { regs.frame.f32.eflags |= 1; }
+                    regs.set_flag32(1);
                 }
             }
             Action::Done
@@ -1616,7 +1911,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x3C: Create file
         0x3C => {
             regs.rax = (regs.rax & !0xFFFF) | 5; // error 5 = access denied
-            unsafe { regs.frame.f32.eflags |= 1; }
+            regs.set_flag32(1);
             Action::Done
         }
         // AH=0x40: Write to file (BX=handle, CX=count, DS:DX=buffer)
@@ -1633,7 +1928,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
-                unsafe { regs.frame.f32.eflags |= 1; }
+                regs.set_flag32(1);
             }
             Action::Done
         }
@@ -1647,10 +1942,10 @@ fn int_21h(regs: &mut Regs) -> Action {
                 // Return new position in DX:AX
                 regs.rdx = (regs.rdx & !0xFFFF) | ((result as u32 >> 16) as u64);
                 regs.rax = (regs.rax & !0xFFFF) | (result as u16 as u64);
-                unsafe { regs.frame.f32.eflags &= !1; }
+                regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
-                unsafe { regs.frame.f32.eflags |= 1; }
+                regs.set_flag32(1);
             }
             Action::Done
         }
@@ -1679,10 +1974,10 @@ fn int_21h(regs: &mut Regs) -> Action {
                     regs.rcx = (regs.rcx & !0xFFFF) | 0x20;
                 }
                 // Set attributes: just succeed (read-only FS)
-                unsafe { regs.frame.f32.eflags &= !1; }
+                regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
-                unsafe { regs.frame.f32.eflags |= 1; }
+                regs.set_flag32(1);
             }
             Action::Done
         }
@@ -1798,9 +2093,9 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         _ => {
             dbg_println!("VM86: UNHANDLED INT 21h AH={:#04x} AX={:04X} from {:04x}:{:04x}",
-                ah, regs.rax as u16, unsafe { regs.frame.f32.cs }, unsafe { regs.frame.f32.eip });
+                ah, regs.rax as u16, vm86_cs(regs), vm86_ip(regs));
             // Return success (clear carry) so unhandled calls don't break callers
-            unsafe { regs.frame.f32.eflags &= !1; }
+            regs.clear_flag32(1);
             Action::Done
         }
     }
@@ -2539,6 +2834,12 @@ fn dos_open_program(name: &[u8]) -> i32 {
         let fd = crate::kernel::vfs::open(&buf[..len + 4]);
         if fd >= 0 { return fd; }
     }
+    // Try .ELF
+    if len + 4 <= buf.len() {
+        buf[len..len + 4].copy_from_slice(b".ELF");
+        let fd = crate::kernel::vfs::open(&buf[..len + 4]);
+        if fd >= 0 { return fd; }
+    }
     -2 // ENOENT
 }
 
@@ -2548,7 +2849,7 @@ fn exec_program(regs: &mut Regs) -> Action {
     let al = regs.rax as u8;
     if al != 0 {
         regs.rax = (regs.rax & !0xFFFF) | 1;
-        unsafe { regs.frame.f32.eflags |= 1; }
+        regs.set_flag32(1);
         return Action::Done;
     }
 
@@ -2602,92 +2903,142 @@ fn exec_program(regs: &mut Regs) -> Action {
     let fd = dos_open_program(prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
-        unsafe { regs.frame.f32.eflags |= 1; }
+        regs.set_flag32(1);
         return Action::Done;
     }
     let size = crate::kernel::vfs::seek(fd, 0, 2);
     if size <= 0 {
         crate::kernel::vfs::close(fd);
         regs.rax = (regs.rax & !0xFFFF) | 2;
-        unsafe { regs.frame.f32.eflags |= 1; }
+        regs.set_flag32(1);
         return Action::Done;
     }
     crate::kernel::vfs::seek(fd, 0, 0);
     let mut buf = alloc::vec![0u8; size as usize];
     crate::kernel::vfs::read_raw(fd, &mut buf);
     crate::kernel::vfs::close(fd);
-    let is_exe = is_mz_exe(&buf);
 
-    dbg_println!("EXEC fork: prog={}",
-        unsafe { core::str::from_utf8_unchecked(prog_name) });
+    // Detect file type: ELF, MZ .EXE, or .COM
+    let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
+    let is_exe = !is_elf && is_mz_exe(&buf);
+
+    dbg_println!("EXEC fork: prog={} elf={}",
+        unsafe { core::str::from_utf8_unchecked(prog_name) }, is_elf);
 
     // --- Fork a new address space for the child ---
-    let mut child_root = crate::RootPageTable::empty();
-    let new_root = crate::kernel::startup::arch_user_fork(&mut child_root);
-
-    // Save parent state
     let current = thread::current();
-    thread::save_state(current, regs);
+    let mut child_root = crate::RootPageTable::empty();
+    crate::kernel::startup::arch_user_fork(&mut child_root);
 
     // Create child thread
     let child = match thread::create_thread(Some(current), child_root, true) {
         Some(t) => t,
         None => {
-            crate::kernel::startup::arch_free_phys_page(new_root);
             regs.rax = (regs.rax & !0xFFFF) | 8;
-            unsafe { regs.frame.f64.rflags |= 1; }
+            regs.set_flag32(1);
             return Action::Done;
         }
     };
-    crate::kernel::startup::arch_free_phys_page(new_root);
     let child_tid = child.tid;
     let child_idx = child_tid as usize;
 
-    // Switch to child's address space: load child's page tables, then
-    // set up a fresh VM86 memory layout with full 640KB available.
-    crate::kernel::startup::arch_activate_root(&child.root);
+    // Switch to child's address space
+    crate::kernel::startup::arch_switch_to(
+        &mut current.cpu_state, &mut current.root,
+        &child.cpu_state, &child.root,
+    );
     crate::kernel::startup::arch_free_user_pages();
     crate::kernel::startup::arch_flush_tlb();
-    crate::kernel::startup::arch_map_low_mem();
-    setup_ivt();
 
-    // Load the program at COM_SEGMENT (full conventional memory)
-    let (cs, ip, ss, sp) = if is_exe {
-        match load_exe(&buf) {
-            Some(t) => t,
-            None => {
-                // Restore parent's address space and clean up
-                crate::kernel::startup::arch_activate_root(&current.root);
+    if is_elf {
+        // --- ELF execution path ---
+        let loaded = match crate::kernel::elf::load_elf(&buf) {
+            Ok(e) => e,
+            Err(_) => {
+                crate::kernel::startup::arch_switch_to(
+                    &mut child.cpu_state, &mut child.root,
+                    &current.cpu_state, &current.root,
+                );
                 thread::exit_thread(1);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
-                unsafe { regs.frame.f32.eflags |= 1; }
+                regs.set_flag32(1);
                 return Action::Done;
             }
+        };
+
+        let want_64 = loaded.class == crate::kernel::elf::ElfClass::Elf64;
+        let word = if want_64 { 8usize } else { 4usize };
+
+        let prog_arg = alloc::vec::Vec::from(prog_name);
+        let args = alloc::vec![prog_arg];
+        let stack = crate::kernel::syscalls::setup_user_stack(&args, want_64, word);
+
+        let symbols = crate::kernel::stacktrace::SymbolData::new(buf.into_boxed_slice());
+
+        // Switch back to parent
+        crate::kernel::startup::arch_switch_to(
+            &mut child.cpu_state, &mut child.root,
+            &current.cpu_state, &current.root,
+        );
+
+        // Set up child thread as protected-mode ELF process
+        if want_64 {
+            thread::init_process_thread_64(child, loaded.entry, stack.sp as u64);
+            child.cpu_state.rdi = stack.argc as u64;
+            child.cpu_state.rsi = stack.argv as u64;
+        } else {
+            thread::init_process_thread(child, loaded.entry as u32, stack.sp as u32);
         }
+        child.symbols = symbols;
     } else {
-        load_com(&buf)
-    };
+        // --- DOS execution path (COM / MZ EXE) ---
+        crate::kernel::startup::arch_map_low_mem();
+        setup_ivt();
 
-    dbg_println!("EXEC: cs={:04X} ip={:04X} ss={:04X} sp={:04X}", cs, ip, ss, sp);
+        let (cs, ip, ss, sp) = if is_exe {
+            match load_exe(&buf) {
+                Some(t) => t,
+                None => {
+                    crate::kernel::startup::arch_switch_to(
+                        &mut child.cpu_state, &mut child.root,
+                        &current.cpu_state, &current.root,
+                    );
+                    thread::exit_thread(1);
+                    regs.rax = (regs.rax & !0xFFFF) | 11;
+                    regs.set_flag32(1);
+                    return Action::Done;
+                }
+            }
+        } else {
+            load_com(&buf)
+        };
+        clear_bios_keyboard_buffer();
 
-    // Save child's address space and switch back to parent
-    crate::kernel::startup::arch_save_root(&mut child.root);
-    crate::kernel::startup::arch_activate_root(&current.root);
+        dbg_println!("EXEC: cs={:04X} ip={:04X} ss={:04X} sp={:04X}", cs, ip, ss, sp);
 
-    // Set up child thread as VM86
-    child.mode = thread::ThreadMode::Mode16;
-    thread::init_process_thread_vm86(child, cs, ip, ss, sp);
+        // Switch back to parent
+        crate::kernel::startup::arch_switch_to(
+            &mut child.cpu_state, &mut child.root,
+            &current.cpu_state, &current.root,
+        );
+
+        // Set up child thread as VM86
+        child.mode = thread::ThreadMode::Mode16;
+        thread::init_process_thread_vm86(child, cs, ip, ss, sp);
+        child.vm86.skip_irq = true;
+        child.vm86.vkbd.clear();
+        // setup_psp/load_exe set these on current() (parent) — copy to child
+        child.vm86.dta = current.vm86.dta;
+        child.vm86.heap_seg = current.vm86.heap_seg;
+    }
+
     // Inherit cwd from parent
     child.cwd = current.cwd;
     child.cwd_len = current.cwd_len;
-    child.vm86.skip_irq = true;
-    // setup_psp/load_exe set these on current() (parent) — copy to child
-    child.vm86.dta = current.vm86.dta;
-    child.vm86.heap_seg = current.vm86.heap_seg;
 
     // Block parent until child exits. Clear carry for when parent resumes.
     current.state = thread::ThreadState::Blocked;
-    unsafe { regs.frame.f32.eflags &= !1; }
+    regs.clear_flag32(1);
 
     // Switch to child
     Action::Switch(child_idx)
@@ -2726,13 +3077,11 @@ fn load_com_child(data: &[u8], child_seg: u16) -> (u16, u16, u16, u16) {
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
 fn exec_return(regs: &mut Regs, parent: &ExecParent) -> Action {
-    unsafe {
-        regs.frame.f32.cs = parent.cs as u32;
-        regs.frame.f32.eip = parent.ip as u32;
-        regs.frame.f32.ss = parent.ss as u32;
-        regs.frame.f32.esp = parent.sp as u32;
-        regs.frame.f32.eflags &= !1; // clear carry
-    }
+    regs.set_cs32(parent.cs as u32);
+    regs.set_ip32(parent.ip as u32);
+    regs.set_ss32(parent.ss as u32);
+    regs.set_sp32(parent.sp as u32);
+    regs.clear_flag32(1); // clear carry
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
     Action::Done
@@ -2854,15 +3203,14 @@ fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Ac
                         *p.add(0x1E + name_len) = 0;
                     }
                     // Clear carry = success
-                    unsafe { regs.frame.f32.eflags &= !1; }
-                    dbg_println!("  FindFirst matched: {} (dta={:05X})", unsafe { core::str::from_utf8_unchecked(&entry.name[..entry.name_len]) }, dta);
+                    regs.clear_flag32(1);
                     return Action::Done;
                 }
             }
             None => {
                 // No more files
                 regs.rax = (regs.rax & !0xFFFF) | 18; // no more files
-                unsafe { regs.frame.f32.eflags |= 1; } // set carry
+                regs.set_flag32(1); // set carry
                 return Action::Done;
             }
         }

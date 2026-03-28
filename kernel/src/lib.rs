@@ -56,13 +56,30 @@ static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
 /// Kernel pages - statically allocated page tables
 static mut KERNEL_PAGES: KernelPages = unsafe { core::mem::zeroed() };
 
+#[repr(C, align(16))]
+pub struct AlignedStack<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> AlignedStack<N> {
+    pub const fn new() -> Self {
+        Self([0; N])
+    }
+
+    pub fn top(&self) -> *const u8 {
+        self.0.as_ptr().wrapping_add(N)
+    }
+
+    pub fn top_mut(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr().wrapping_add(N)
+    }
+}
+
 /// Kernel stack - 128KB (used for Ring 1 event loop)
-pub static mut KERNEL_STACK: [u8; 128 * 1024] = [0; 128 * 1024];
+pub static mut KERNEL_STACK: AlignedStack<{ 128 * 1024 }> = AlignedStack::new();
 
 /// Ring-0 arch stack — used as TSS ESP0 so that interrupts from ring 1/3
 /// don't clobber the kernel's call frames.
 #[unsafe(link_section = ".data")]
-pub static mut ARCH_STACK: [u8; 128 * 1024] = [0; 128 * 1024];
+pub static mut ARCH_STACK: AlignedStack<{ 128 * 1024 }> = AlignedStack::new();
 
 // External assembly functions
 unsafe extern "C" {
@@ -110,7 +127,7 @@ pub unsafe extern "C" fn PrepareKernel(boot_data: *const BootData) -> ! {
         // Now paging is enabled, we're running at virtual address
         // Set up argument for KernelInit on the stack
         #[allow(static_mut_refs)]
-        let stack_top = unsafe { KERNEL_STACK.as_mut_ptr_range().end };
+        let stack_top = unsafe { KERNEL_STACK.top_mut() };
         // Push boot_data pointer (adjusted to LOW_MEM_BASE mapping)
         let boot_data_virt = (boot_data as usize + LOW_MEM_BASE) as *const BootData;
         let stack_with_arg = stack_top.sub(4) as *mut *const BootData;
@@ -178,7 +195,8 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
 
     // Setup GDT, IDT, TSS — use ARCH_STACK for TSS ESP0
     #[allow(static_mut_refs)]
-    let arch_stack_top = unsafe { (ARCH_STACK.as_ptr_range().end) as u32 };
+    // Reserve 16 bytes at top for VM86 segments (CPU pushes ES,DS,FS,GS)
+    let arch_stack_top = unsafe { ARCH_STACK.top() as u32 } - 16;
     arch::descriptors::setup_descriptor_tables(arch_stack_top);
     println!("Descriptors initialized");
 
@@ -192,9 +210,9 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     if arch::paging2::cpu_supports_long_mode() {
         arch::paging2::sync_hw_pdpt();
         arch::x86::flush_tlb();
-        arch::paging2::ensure_trampoline_mapped();
+        let saved = arch::paging2::ensure_trampoline_mapped();
         arch::descriptors::toggle_mode(arch::paging2::toggle_cr3(true));
-        arch::paging2::clear_trampoline();
+        arch::paging2::clear_trampoline(saved);
         println!("Switched to Compat mode");
     }
 
@@ -205,12 +223,15 @@ extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");
 
-    // Drop to ring 1 — kernel starts here
-    arch::descriptors::enter_ring1(kernel::startup::startup, boot_data.start_sector as usize);
+    // Drop to ring 1 — continues here at ring 1
+    arch::descriptors::enter_ring1();
+
+    kernel::startup::startup(boot_data.start_sector);
 }
 
-/// CPU-pushed interrupt frame for 32-bit mode
-/// Padded at start to match Frame64 size (40 bytes total)
+/// Raw CPU-pushed interrupt frame for 32-bit mode.
+/// This is only used by the 32-bit arch entry/exit path before conversion to
+/// the kernel-facing `Frame64` form.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Frame32 {
@@ -258,20 +279,9 @@ impl core::fmt::Debug for Frame64 {
     }
 }
 
-/// Union for CPU-pushed interrupt frame (32-bit or 64-bit)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union Frame {
-    pub f32: Frame32,
-    pub f64: Frame64,
-}
-
-impl core::fmt::Debug for Frame {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Default to 32-bit view for now
-        unsafe { self.f32.fmt(f) }
-    }
-}
+/// User execution mode, derived from register state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UserMode { VM86, Mode32, Mode64 }
 
 /// CPU register state saved by interrupt handler.
 /// Also used as the saved CPU state in Thread (identical layout).
@@ -304,8 +314,8 @@ pub struct Regs {
     // Interrupt info (software-pushed, zero-extended to 64-bit)
     pub int_num: u64,
     pub err_code: u64,
-    // CPU-pushed interrupt frame (layout depends on CPU mode)
-    pub frame: Frame,
+    // CPU-pushed interrupt frame normalized to Frame64 before the kernel sees it.
+    pub frame: Frame64,
 }
 
 impl Regs {
@@ -315,78 +325,134 @@ impl Regs {
             r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
             rdi: 0, rsi: 0, rbp: 0, rsp_dummy: 0, rbx: 0, rdx: 0, rcx: 0, rax: 0,
             int_num: 0, err_code: 0,
-            frame: Frame { f32: Frame32 { _pad: [0; 5], eip: 0, cs: 0, eflags: 0, esp: 0, ss: 0 } },
+            frame: Frame64 { rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0 },
         }
     }
 
-    /// Convert frame from Frame32 to Frame64 format
-    pub fn frame_to_64(&mut self) {
+    /// Convert the in-place raw 32-bit frame encoding to the normalized
+    /// `Frame64` representation.
+    pub fn from_32(&mut self) {
+        let raw = unsafe { core::ptr::read((&self.frame as *const Frame64).cast::<Frame32>()) };
+        self.frame = Frame64 {
+            rip: raw.eip as u64,
+            cs: raw.cs as u64,
+            rflags: raw.eflags as u64,
+            rsp: raw.esp as u64,
+            ss: raw.ss as u64,
+        };
+    }
+
+    /// Convert the normalized `Frame64` representation to the raw 32-bit frame
+    /// encoding expected by the 32-bit `iret` path.
+    pub fn to_32(&mut self) {
+        let raw = Frame32 {
+            _pad: [0; 5],
+            eip: self.frame.rip as u32,
+            cs: self.frame.cs as u32,
+            eflags: self.frame.rflags as u32,
+            esp: self.frame.rsp as u32,
+            ss: self.frame.ss as u32,
+        };
         unsafe {
-            let f = &self.frame.f32;
-            let (eip, cs, eflags, esp, ss) = (f.eip, f.cs, f.eflags, f.esp, f.ss);
-            self.frame = Frame {
-                f64: Frame64 {
-                    rip: eip as u64, cs: cs as u64, rflags: eflags as u64,
-                    rsp: esp as u64, ss: ss as u64,
-                }
-            };
+            core::ptr::write((&mut self.frame as *mut Frame64).cast::<Frame32>(), raw);
         }
     }
 
-    /// Convert frame from Frame64 to Frame32 format
-    pub fn frame_to_32(&mut self) {
-        unsafe {
-            let f = &self.frame.f64;
-            let (rip, cs, rflags, rsp, ss) = (f.rip, f.cs, f.rflags, f.rsp, f.ss);
-            self.frame = Frame {
-                f32: Frame32 {
-                    _pad: [0; 5],
-                    eip: rip as u32, cs: cs as u32, eflags: rflags as u32,
-                    esp: rsp as u32, ss: ss as u32,
-                }
-            };
-        }
+    pub fn ip32(&self) -> u32 {
+        self.frame.rip as u32
     }
 
-    /// Get IP from frame, using the given format
-    pub fn ip_as(&self, is_64: bool) -> u64 {
-        unsafe {
-            if is_64 { self.frame.f64.rip } else { self.frame.f32.eip as u64 }
-        }
+    pub fn set_ip32(&mut self, ip: u32) {
+        self.frame.rip = ip as u64;
     }
 
-    /// Get SP from frame, using the given format
-    pub fn sp_as(&self, is_64: bool) -> u64 {
-        unsafe {
-            if is_64 { self.frame.f64.rsp } else { self.frame.f32.esp as u64 }
-        }
+    pub fn cs32(&self) -> u32 {
+        self.frame.cs as u32
+    }
+
+    pub fn set_cs32(&mut self, cs: u32) {
+        self.frame.cs = cs as u64;
+    }
+
+    pub fn flags32(&self) -> u32 {
+        self.frame.rflags as u32
+    }
+
+    pub fn set_flags32(&mut self, flags: u32) {
+        self.frame.rflags = flags as u64;
+    }
+
+    pub fn set_flag32(&mut self, mask: u32) {
+        self.set_flags32(self.flags32() | mask);
+    }
+
+    pub fn clear_flag32(&mut self, mask: u32) {
+        self.set_flags32(self.flags32() & !mask);
+    }
+
+    pub fn sp32(&self) -> u32 {
+        self.frame.rsp as u32
+    }
+
+    pub fn set_sp32(&mut self, sp: u32) {
+        self.frame.rsp = sp as u64;
+    }
+
+    pub fn ss32(&self) -> u32 {
+        self.frame.ss as u32
+    }
+
+    pub fn set_ss32(&mut self, ss: u32) {
+        self.frame.ss = ss as u64;
     }
 
     /// Get instruction pointer.
-    /// Regs are always normalized to f64 format by arch before kernel sees them.
     pub fn ip(&self) -> u64 {
-        unsafe { self.frame.f64.rip }
+        self.frame.rip
     }
 
     /// Get code segment
     pub fn code_seg(&self) -> u16 {
-        unsafe { self.frame.f64.cs as u16 }
+        self.frame.cs as u16
     }
 
     /// Get flags
     pub fn flags(&self) -> u64 {
-        unsafe { self.frame.f64.rflags }
+        self.frame.rflags
+    }
+
+    /// Derive execution mode from canonical register state.
+    /// Checks CS first (64-bit wins over stale VM flag), then EFLAGS.VM.
+    /// Returns Mode32 for kernel regs (ring 1 CS) too.
+    pub fn mode(&self) -> UserMode {
+        if self.frame.cs == arch::descriptors::USER_CS64 as u64 {
+            UserMode::Mode64
+        } else if self.frame.rflags & (1 << 17) != 0 {
+            UserMode::VM86
+        } else {
+            UserMode::Mode32
+        }
     }
 
     /// Get stack pointer
     pub fn sp(&self) -> u64 {
-        unsafe { self.frame.f64.rsp }
+        self.frame.rsp
     }
 
     /// Get stack segment
     pub fn stack_seg(&self) -> u16 {
-        unsafe { self.frame.f64.ss as u16 }
+        self.frame.ss as u16
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn regs_from_32(regs: *mut Regs) {
+    unsafe { (*regs).from_32(); }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn regs_to_32(regs: *mut Regs) {
+    unsafe { (*regs).to_32(); }
 }
 
 impl core::fmt::Debug for Regs {

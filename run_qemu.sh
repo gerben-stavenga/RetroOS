@@ -18,10 +18,31 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Build image
-~/bin/bazelisk build //:image 2>&1 | tail -3
+find_bazel() {
+    if command -v bazelisk >/dev/null 2>&1; then
+        command -v bazelisk
+        return
+    fi
+    if [ -x "$HOME/bin/bazelisk" ]; then
+        printf '%s\n' "$HOME/bin/bazelisk"
+        return
+    fi
+    if [ -x "/home/gerben/bin/bazelisk" ]; then
+        printf '%s\n' "/home/gerben/bin/bazelisk"
+        return
+    fi
+    if command -v bazel >/dev/null 2>&1; then
+        command -v bazel
+        return
+    fi
+    echo "Could not find bazelisk or bazel" >&2
+    exit 1
+}
 
-IMAGE="$SCRIPT_DIR/bazel-bin/image.bin"
+# Build proprietary image
+"$(find_bazel)" build //:image_proprietary 2>&1 | tail -3
+
+IMAGE="$SCRIPT_DIR/bazel-bin/image_proprietary.bin"
 
 # Run with clean environment to avoid snap/glibc conflicts
 exec env -i \
