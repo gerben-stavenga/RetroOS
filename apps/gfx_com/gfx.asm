@@ -41,5 +41,9 @@ org 0x100
     xor ax, ax
     int 0x16
 
-    ; RET → PSP:0000 → restores mode 3 → INT 20h
+    ; Restore text mode 3 before exiting
+    mov ax, 0x0003
+    int 0x10
+
+    ; RET → PSP:0000 → INT 20h
     ret

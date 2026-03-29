@@ -371,6 +371,18 @@ impl VirtualPic {
         self.head != self.tail
     }
 
+    /// Check whether a specific vector is already queued.
+    pub fn has_pending_vec(&self, vec: u8) -> bool {
+        let mut i = self.head;
+        while i != self.tail {
+            if self.queue[i] == vec {
+                return true;
+            }
+            i = (i + 1) % VPIC_QUEUE_SIZE;
+        }
+        false
+    }
+
     /// Non-specific EOI: clear highest-priority (lowest-numbered) in-service bit
     pub fn eoi(&mut self) {
         if self.isr != 0 {
@@ -481,6 +493,11 @@ impl VirtualKeyboard {
     /// Check if data is available (port 0x64 bit 0)
     pub fn has_data(&self) -> bool {
         self.obf
+    }
+
+    /// Check if scancodes are buffered (not yet latched)
+    pub fn has_buffered(&self) -> bool {
+        self.head != self.tail
     }
 
     pub fn read_port61(&self) -> u8 {
@@ -848,12 +865,12 @@ fn emulate_inb(port: u16) -> Result<u8, Action> {
         0x20 => Ok(thread::current().vm86.vpic.isr),
         // Master PIC data (read IMR)
         0x21 => Ok(thread::current().vm86.vpic.imr),
-        // Keyboard data port — returns latched scancode (like real 8042 output buffer)
+        // Keyboard data port — returns latched scancode
         0x60 => Ok(thread::current().vm86.vkbd.read_port60()),
         // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
         0x61 => Ok(thread::current().vm86.vkbd.read_port61()),
         // Keyboard status port (bit 0 = output buffer full)
-        0x64 => Ok(if thread::current().vm86.vkbd.has_data() { 1 } else { 0 }),
+        0x64 => Ok(if thread::current().vm86.vkbd.obf { 1 } else { 0 }),
         0x40 => Ok(thread::current().vm86.vpit.read_counter0()),
         0x41 | 0x42 => Ok(0),
         // PIT command register not readable
@@ -877,10 +894,20 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
                 // Non-specific EOI
                 let t = thread::current();
                 // If keyboard IRQ (bit 1) was in service, clear output buffer flag
-                if t.vm86.vpic.isr & 0x02 != 0 {
+                let keyboard_in_service = t.vm86.vpic.isr & 0x02 != 0;
+                if keyboard_in_service {
                     t.vm86.vkbd.obf = false;
                 }
                 t.vm86.vpic.eoi();
+                // Real hardware effectively re-asserts IRQ1 if more scancodes are
+                // already buffered when the handler finishes. Model that here
+                // instead of queueing one virtual IRQ per scancode.
+                if keyboard_in_service
+                    && t.vm86.vkbd.has_buffered()
+                    && !t.vm86.vpic.has_pending_vec(0x09)
+                {
+                    t.vm86.vpic.push(0x09);
+                }
             }
             Ok(())
         }
@@ -951,7 +978,12 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
         match e {
             Irq::Key(sc) => {
                 thread.vm86.vkbd.push(sc);
-                thread.vm86.vpic.push(0x09);
+                // IRQ1 is "keyboard data available", not "one interrupt per
+                // buffered scancode". If one is already pending or in service,
+                // let the current BIOS handler / next EOI drain the rest.
+                if thread.vm86.vpic.isr & 0x02 == 0 && !thread.vm86.vpic.has_pending_vec(0x09) {
+                    thread.vm86.vpic.push(0x09);
+                }
             }
             Irq::Tick => {
                 let due = thread.vm86.vpit.take_pending_irqs();
@@ -984,7 +1016,8 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
     // For keyboard IRQ (INT 9): latch scancode into port 0x60 before reflecting
     if vec == 0x09 {
         if !thread.vm86.vkbd.latch() {
-            // No scancode available — spurious INT 9, drop it
+            // No scancode available yet — re-queue and try later
+            thread.vm86.vpic.push(0x09);
             return;
         }
     }

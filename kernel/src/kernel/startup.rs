@@ -201,33 +201,18 @@ fn event_loop(first_tid: usize) -> ! {
     thread::set_current(tid);
 
     loop {
+        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+        let regs = unsafe { &mut *(&raw mut REGS) };
+        drain_pending_irqs(thread, regs);
+
         let (event, extra) = do_arch_execute();
 
-        // Get current thread + REGS reference for handlers
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let regs = unsafe { &mut *(&raw mut REGS) };
 
         let new_tid = match event {
             48 => crate::kernel::syscalls::dispatch(regs),
-            32..=47 => {
-                if regs.mode() == crate::UserMode::VM86 {
-                    let tp = thread as *mut thread::Thread;
-                    let ticks = crate::arch::irq::take_pending_ticks();
-                    for _ in 0..ticks {
-                        crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(crate::arch::irq::Irq::Tick));
-                    }
-                    crate::arch::irq::drain(|evt| {
-                        crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(evt));
-                    });
-                } else {
-                    crate::arch::irq::drain(|evt| {
-                        if let crate::arch::irq::Irq::Key(sc) = evt {
-                            crate::kernel::keyboard::process_key(sc);
-                        }
-                    });
-                }
-                thread::schedule()
-            }
+            32..=47 => None, // thread::schedule(),
             13 if regs.mode() == crate::UserMode::VM86 => {
                 crate::kernel::vm86::vm86_monitor(regs)
             }
@@ -243,6 +228,27 @@ fn event_loop(first_tid: usize) -> ! {
                 thread::set_current(tid);
             }
         }
+    }
+}
+
+fn drain_pending_irqs(thread: &mut thread::Thread, regs: &mut crate::Regs) {
+    if regs.mode() == crate::UserMode::VM86 {
+        let tp = thread as *mut thread::Thread;
+        let ticks = crate::arch::irq::take_pending_ticks();
+        for _ in 0..ticks {
+            crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(crate::arch::irq::Irq::Tick));
+        }
+        crate::arch::irq::drain(|evt| {
+            crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(evt));
+        });
+        // Flush: try to deliver pending interrupts blocked by ISR in previous iterations.
+        crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, None);
+    } else {
+        crate::arch::irq::drain(|evt| {
+            if let crate::arch::irq::Irq::Key(sc) = evt {
+                crate::kernel::keyboard::process_key(sc);
+            }
+        });
     }
 }
 

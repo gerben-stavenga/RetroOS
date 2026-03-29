@@ -3,6 +3,32 @@
 A single 32-bit kernel binary that runs DOS, 32-bit, and 64-bit programs
 on any x86 from a 386 to a modern x86-64 processor.
 
+## Design principle: canonicalize and unify
+
+RetroOS should try to make different execution modes behave the same internally.
+The preferred shape is:
+
+- one canonical representation of CPU state
+- one canonical event loop in the kernel
+- one canonical paging model across x86 paging modes
+- one canonical set of core abstractions for processes, files, memory, and events
+
+When hardware forces special cases, the special case should be normalized at the
+boundary as early as possible.
+
+This is especially important for the `arch` layer. `arch` is the trust boundary:
+
+- it should stay small
+- it should avoid policy
+- it should avoid compatibility-specific hacks
+- it should expose a minimal, mode-independent interface upward
+
+Compatibility layers can be looser. DOS/Linux/Windows support may need pragmatic
+or application-specific behavior while being brought up, but that code should sit
+above the `arch` boundary. Ideally those compatibility layers share a common core
+library for reusable pieces such as image loading, path handling, handle tables,
+argv/environment marshaling, and ABI canonicalization.
+
 ## Arch and ring-1 kernel
 
 RetroOS is split into two layers with hardware-enforced isolation:
@@ -28,6 +54,8 @@ The guiding rule is:
 
 - if it requires privilege or isolation, it belongs in `arch`
 - if it is policy, interpretation, or emulation, it belongs in `kernel`
+- if it is a hardware-specific oddity, normalize it before it spreads upward
+- if it is a compatibility-specific quirk, keep it out of `arch`
 
 ## Privilege model
 
@@ -196,6 +224,9 @@ Typical events are:
 `arch` captures these events but does not interpret them beyond what is
 required for safety.
 
+The point is not just minimality. It is also canonicalization: different
+hardware modes should be translated into the same small kernel-facing model.
+
 ## Refcounted address spaces
 
 `arch` refcounts physical pages and page-table structures.
@@ -239,6 +270,10 @@ If 16-bit execution stops for a privileged reason, `execute()` returns a
 - DOS `EXEC` and parent/child semantics
 
 This keeps VM86 mechanism in `arch` and DOS policy in the `kernel`.
+
+The same rule should apply to future Linux and Windows compatibility work:
+keep the execution primitive and memory primitive generic, keep the ABI and API
+translation in compatibility code, and share common helpers wherever possible.
 
 ### Mode toggling for VM86
 
