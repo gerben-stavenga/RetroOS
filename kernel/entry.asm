@@ -303,14 +303,20 @@ far_ptr_64:
     dd exit_interrupt_64    ; 32-bit offset (in 32-bit mode, only low 32 bits used)
     dw 0x18                 ; 64-bit code segment
 
-; Each entry is 8 bytes (aligned), pushes interrupt number and jumps to entry_wrapper
+; Each entry is 8 bytes (aligned), pushes interrupt number and jumps to entry_wrapper.
+; Vectors 0-127: push imm8 (positive, 2 bytes). Vectors 128-255: push imm8 with
+; negative value (sign-extended by CPU); handler masks with & 0xFF to recover vector.
 align 64
 global int_vector
 int_vector:
 %assign i 0
-%rep 49
+%rep 256
     align 8
+%if i >= 128
+    push i - 256
+%else
     push i
+%endif
     ; Exceptions that push an error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30
 %if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
     jmp entry_wrapper_32
@@ -329,9 +335,13 @@ align 64
 global int_vector_64
 int_vector_64:
 %assign i 0
-%rep 49
+%rep 256
     align 8
+%if i >= 128
+    push i - 256
+%else
     push i
+%endif
 %if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
     jmp entry_wrapper_64
 %else

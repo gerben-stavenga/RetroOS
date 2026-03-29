@@ -32,8 +32,8 @@ pub const TSS64_SEL: u16 = 0x40;
 pub const RING1_CS: u16 = 0x50 | 1; // Ring 1
 pub const RING1_DS: u16 = 0x58 | 1; // Ring 1
 
-/// Number of IDT entries (0-48 for exceptions/IRQs, 0x80 for syscall)
-const IDT_ENTRIES: usize = 0x81;
+/// Number of IDT entries (full 256: 0x00-0x1F exceptions, 0x20-0x2F IRQs, 0x30-0xFF user-callable)
+const IDT_ENTRIES: usize = 256;
 
 /// GDT entry (8 bytes)
 #[repr(C, packed)]
@@ -247,21 +247,15 @@ impl Tss {
 /// - Interrupt redirection: trap handled INTs to monitor, rest through IVT
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
-    const EMS_INT_ENABLED: bool = false;
     // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
     (*tss).iopb[120] = 0x00;
     (*tss).iopb[121] = 0x00;
     (*tss).iopb[122] = 0x00;
     (*tss).iopb[123] = 0x00;
-    // Interrupt redirection: set bits for INTs we handle in the monitor.
-    // Bit SET = #GP to monitor, bit CLEAR = through IVT directly.
-    // Every INT with a handler in handle_vm86_int must be listed here.
-    for int_num in [0x20, 0x21, 0x28, 0x2E, 0x2F, 0xF0u8] {
-        (*tss).int_redir[(int_num / 8) as usize] |= 1 << (int_num % 8);
-    }
-    if EMS_INT_ENABLED {
-        (*tss).int_redir[(0x67 / 8) as usize] |= 1 << (0x67 % 8);
-    }
+    // Interrupt redirection: only INT F0h traps to monitor.
+    // All other intercepted INTs (20h, 21h, 28h, 2Eh, 2Fh) go through IVT
+    // to stubs that call INT F0h, which then traps here.
+    (*tss).int_redir[(0xF0 / 8) as usize] |= 1 << (0xF0 % 8);
 }
 
 /// Check whether INT n is intercepted (bit set in redirection bitmap).
@@ -282,8 +276,12 @@ const GDT_TSS64_LO: usize = 8;    // 0x40
 const GDT_TSS64_HI: usize = 9;    // 0x48 (null - upper 32 bits of base are 0)
 const GDT_RING1_CS: usize = 10;   // 0x50
 const GDT_RING1_DS: usize = 11;   // 0x58
+const GDT_LDT: usize = 12;        // 0x60
 
-const GDT_ENTRIES: usize = 12;
+const GDT_ENTRIES: usize = 13;
+
+/// LDT selector (GDT index 12 * 8 = 0x60)
+pub const LDT_SEL: u16 = 0x60;
 
 /// 32-bit Interrupt Descriptor Table
 #[repr(C, align(8))]
@@ -311,6 +309,7 @@ static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::null(),               // 0x48: TSS64 high (always null for <4GB)
     GdtEntry::segment32(true, 1),   // 0x50: Ring-1 Code 32-bit (flat, no wrapping yet)
     GdtEntry::segment32(false, 1),  // 0x58: Ring-1 Data (flat, no wrapping yet)
+    GdtEntry::null(),               // 0x60: LDT (filled at runtime by load_ldt)
 ];
 
 static mut IDT32: Idt32 = Idt32 {
@@ -326,8 +325,8 @@ pub static mut TSS64: Tss = Tss::new();
 
 // External: interrupt vector tables from entry.asm
 unsafe extern "C" {
-    static int_vector: [u64; 49];      // 32-bit handlers
-    static int_vector_64: [u64; 49];   // 64-bit handlers
+    static int_vector: [u64; 256];     // 32-bit handlers (8 bytes each)
+    static int_vector_64: [u64; 256];  // 64-bit handlers (8 bytes each)
 }
 
 /// Set the kernel stack in TSS for 32-bit mode
@@ -363,25 +362,24 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
         GDT[GDT_TSS64_LO] = GdtEntry::tss_low(tss64_addr, tss_limit);
         // GDT[GDT_TSS64_HI] stays null (base bits 63:32 = 0 for <4GB)
 
-        // Setup 32-bit IDT entries
+        // Setup 32-bit IDT entries (256 vectors)
+        // 0x00-0x1F: exceptions (DPL=0, except 3-5 = DPL=3 for INT3/INTO/BOUND)
+        // 0x20-0x2F: PIC IRQs (DPL=0)
+        // 0x30-0xFF: user-callable (DPL=3) — includes 0x80 syscall, 0x31 DPMI, 0xF0 VM86 stubs
         let vector_base_32 = int_vector.as_ptr() as u32;
-        for i in 0..48 {
-            let dpl = if (3..=5).contains(&i) { 3 } else { 0 };
+        for i in 0..256 {
+            let dpl = if (3..=5).contains(&i) || i >= 0x30 { 3 } else { 0 };
             let handler = vector_base_32 + (i as u32) * 8;
             IDT32.entries[i] = IdtEntry32::interrupt_gate(handler, dpl);
         }
-        let syscall_handler_32 = vector_base_32 + 48 * 8;
-        IDT32.entries[0x80] = IdtEntry32::interrupt_gate(syscall_handler_32, 3);
 
-        // Setup 64-bit IDT entries
+        // Setup 64-bit IDT entries (256 vectors, same DPL policy)
         let vector_base_64 = int_vector_64.as_ptr() as u32;
-        for i in 0..48 {
-            let dpl = if (3..=5).contains(&i) { 3 } else { 0 };
+        for i in 0..256 {
+            let dpl = if (3..=5).contains(&i) || i >= 0x30 { 3 } else { 0 };
             let handler = vector_base_64 + (i as u32) * 8;
             IDT64.entries[i] = IdtEntry64::interrupt_gate(handler, dpl);
         }
-        let syscall_handler_64 = vector_base_64 + 48 * 8;
-        IDT64.entries[0x80] = IdtEntry64::interrupt_gate(syscall_handler_64, 3);
 
         // Load GDT
         let gdt_ptr = GdtPtr {
@@ -440,6 +438,23 @@ pub fn load_long_mode_descriptors() {
         clear_tss_busy(GDT_TSS64_LO);
         x86::ltr(TSS64_SEL);
         // Don't reload CS - stay on 0x08 (32-bit compat mode)
+    }
+}
+
+/// Load an LDT: write base+limit into GDT[12] (LDT system descriptor) and execute LLDT.
+/// base = linear address of the LDT array, limit = byte size - 1.
+pub fn load_ldt(base: u32, limit: u32) {
+    unsafe {
+        // LDT system descriptor: type = 0x02 (LDT), Present, DPL=0
+        GDT[GDT_LDT] = GdtEntry {
+            limit_low: limit as u16,
+            base_low: base as u16,
+            base_mid: (base >> 16) as u8,
+            access: 0x82,  // Present(1) | DPL=0 | S=0 | Type=0x2 (LDT)
+            granularity: ((limit >> 16) & 0x0F) as u8,
+            base_high: (base >> 24) as u8,
+        };
+        x86::lldt(LDT_SEL);
     }
 }
 

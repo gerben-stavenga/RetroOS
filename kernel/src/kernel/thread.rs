@@ -25,6 +25,17 @@ pub enum ThreadState {
     Zombie,
 }
 
+/// Thread execution mode — determines event loop dispatch
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ThreadMode {
+    /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode via regs.mode())
+    Dos,
+    /// 32-bit Linux userspace
+    Linux32,
+    /// 64-bit Linux userspace
+    Linux64,
+}
+
 /// Initialize Regs for user processes (extends Regs with descriptor-aware methods)
 impl Regs {
     /// Initialize for a 32-bit user process (stored as Frame64; arch converts on exit if needed)
@@ -73,6 +84,7 @@ pub struct Thread {
     pub priority: i32,
     pub parent_tid: i32,
     pub state: ThreadState,
+    pub mode: ThreadMode,
     pub time: u32,
     pub root: crate::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
     pub num_fds: i32,
@@ -81,6 +93,7 @@ pub struct Thread {
     pub exit_code: i32,
     pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
     pub vm86: crate::kernel::vm86::Vm86State,
+    pub dpmi: Option<alloc::boxed::Box<crate::kernel::dpmi::DpmiState>>,
     pub cwd: [u8; 64],     // Current working directory (e.g. "WOLF3D/", "" for root)
     pub cwd_len: usize,
 }
@@ -93,6 +106,7 @@ impl Thread {
             priority: 0,
             parent_tid: -1,
             state: ThreadState::Unused,
+            mode: ThreadMode::Linux32,
             time: 0,
             root: crate::RootPageTable::empty(),
             num_fds: 0,
@@ -101,6 +115,7 @@ impl Thread {
             exit_code: 0,
             symbols: None,
             vm86: crate::kernel::vm86::Vm86State::new(),
+            dpmi: None,
             cwd: [0; 64],
             cwd_len: 0,
         }
@@ -205,6 +220,7 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 /// Initialize a thread for VM86 mode (.COM execution)
 /// cs/ip/ss/sp are real-mode segment:offset values
 pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
+    thread.mode = ThreadMode::Dos;
     thread.vm86 = crate::kernel::vm86::Vm86State::new();
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode

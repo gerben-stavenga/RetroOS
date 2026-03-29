@@ -157,6 +157,12 @@ pub unsafe fn ltr(selector: u16) {
     unsafe { asm!("ltr {:x}", in(reg) selector, options(nostack)); }
 }
 
+/// Load Local Descriptor Table register
+#[inline]
+pub unsafe fn lldt(selector: u16) {
+    unsafe { asm!("lldt {:x}", in(reg) selector, options(nostack)); }
+}
+
 /// Enable interrupts
 #[inline]
 pub fn sti() {

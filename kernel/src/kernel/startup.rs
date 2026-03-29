@@ -211,10 +211,16 @@ fn event_loop(first_tid: usize) -> ! {
         let regs = unsafe { &mut *(&raw mut REGS) };
 
         let new_tid = match event {
-            48 => crate::kernel::syscalls::dispatch(regs),
+            0x80 => crate::kernel::syscalls::dispatch(regs),
             32..=47 => None, // thread::schedule(),
             13 if regs.mode() == crate::UserMode::VM86 => {
                 crate::kernel::vm86::vm86_monitor(regs)
+            }
+            13 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
+                crate::kernel::dpmi::dpmi_monitor(thread, regs)
+            }
+            0x31 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
+                crate::kernel::dpmi::dpmi_int31(thread, regs)
             }
             14 => thread::signal_thread(thread, extra as usize),
             _ => None,
@@ -226,6 +232,13 @@ fn event_loop(first_tid: usize) -> ! {
                 arch_switch_to(&mut old.cpu_state, &mut old.root, &new.cpu_state, &new.root);
                 tid = new_tid;
                 thread::set_current(tid);
+                // Reload LDT if switching to a DPMI thread
+                let new_thread = thread::get_thread(tid).expect("Invalid thread");
+                if let Some(ref dpmi) = new_thread.dpmi {
+                    let ldt_ptr = dpmi.ldt.as_ptr() as u32;
+                    let ldt_limit = (256 * 8 - 1) as u32;
+                    arch_load_ldt(ldt_ptr, ldt_limit);
+                }
             }
         }
     }
@@ -442,6 +455,18 @@ pub fn arch_activate_root(root: &crate::RootPageTable) {
             "int 0x80",
             in("eax") crate::arch::traps::arch_call::ACTIVATE_ROOT as u32,
             in("edx") root as *const _ as u32,
+        );
+    }
+}
+
+/// Load LDT: write base+limit into GDT[12] and execute LLDT.
+pub fn arch_load_ldt(base: u32, limit: u32) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::LOAD_LDT as u32,
+            in("edx") base,
+            in("ecx") limit,
         );
     }
 }

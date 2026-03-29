@@ -96,6 +96,7 @@ pub struct Vm86State {
     pub a20_enabled: bool,
     pub dta: u32,
     pub heap_seg: u16,
+    pub dos_pending_char: Option<u8>,
     pub vpit: VirtualPit,
     pub vpic: VirtualPic,
     pub vkbd: VirtualKeyboard,
@@ -104,6 +105,7 @@ pub struct Vm86State {
     pub xms: Option<alloc::boxed::Box<XmsState>>,
     pub ems: Option<alloc::boxed::Box<EmsState>>,
     pub hma_pages: [u64; HMA_PAGE_COUNT],
+    pub e0_pending: bool,
 }
 
 impl Vm86State {
@@ -115,6 +117,7 @@ impl Vm86State {
             a20_enabled: false,
             dta: 0,
             heap_seg: 0xA000,
+            dos_pending_char: None,
             vpit: VirtualPit::new(),
             vpic: VirtualPic::new(),
             vkbd: VirtualKeyboard::new(),
@@ -123,12 +126,13 @@ impl Vm86State {
             xms: None,
             ems: None,
             hma_pages,
+            e0_pending: false,
         }
     }
 }
 
 const PIT_INPUT_HZ: u64 = 1_193_182;
-const HOST_TIMER_HZ: u64 = 100;
+const HOST_TIMER_HZ: u64 = 1000;
 
 #[derive(Clone, Copy)]
 struct VirtualPitChannel {
@@ -441,17 +445,15 @@ const KBD_BUF_SIZE: usize = 32;
 
 /// Virtual keyboard controller (scancode buffer)
 ///
-/// Models the 8042 output buffer.  Scancodes are queued by `push()` when a
-/// hardware IRQ arrives.  When INT 9 is reflected into the VM86 guest, the
-/// next scancode is *latched* into `port60` so that port 0x60 reads return it
-/// (idempotently — multiple reads give the same value, like real hardware).
-/// Port 0x64 bit 0 (OBF) is set when a scancode is latched and cleared after
-/// the guest's INT 9 handler EOIs.
+/// Models the 8042 output buffer. Incoming scancodes become visible in the
+/// controller as soon as the output buffer is free; IRQ1 is merely the
+/// notification that data is ready. That lets BIOS INT 9 handlers and games
+/// that poll ports 0x60/0x64 observe the same underlying device state.
 pub struct VirtualKeyboard {
     buffer: [u8; KBD_BUF_SIZE],
     head: usize,
     tail: usize,
-    /// Latched scancode visible via port 0x60 (set when INT 9 is reflected)
+    /// Current scancode visible via port 0x60
     pub port60: u8,
     /// Port 0x61 state used by the BIOS keyboard IRQ handler handshake.
     pub port61: u8,
@@ -464,8 +466,7 @@ impl VirtualKeyboard {
         Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false }
     }
 
-    /// Buffer a scancode from the real keyboard IRQ handler
-    pub fn push(&mut self, scancode: u8) {
+    fn queue_scancode(&mut self, scancode: u8) {
         let next = (self.tail + 1) % KBD_BUF_SIZE;
         if next != self.head {
             self.buffer[self.tail] = scancode;
@@ -473,10 +474,13 @@ impl VirtualKeyboard {
         }
     }
 
-    /// Latch the next scancode into port60 for INT 9 delivery.
-    /// Called just before reflecting INT 9 to the guest.
-    pub fn latch(&mut self) -> bool {
-        if self.head == self.tail { return false; }
+    fn fill_output(&mut self) -> bool {
+        if self.obf {
+            return true;
+        }
+        if self.head == self.tail {
+            return false;
+        }
         let sc = self.buffer[self.head];
         self.head = (self.head + 1) % KBD_BUF_SIZE;
         self.port60 = sc;
@@ -484,10 +488,28 @@ impl VirtualKeyboard {
         true
     }
 
-    /// Read port 0x60 — returns latched scancode and clears OBF (like real 8042)
+    /// Buffer a scancode from the real keyboard IRQ handler
+    pub fn push(&mut self, scancode: u8) {
+        if !self.obf {
+            self.port60 = scancode;
+            self.obf = true;
+        } else {
+            self.queue_scancode(scancode);
+        }
+    }
+
+    /// Ensure a scancode is visible in port60 for INT 9 delivery.
+    pub fn latch(&mut self) -> bool {
+        self.fill_output()
+    }
+
+    /// Read port 0x60 — returns current scancode and then exposes the next
+    /// queued byte if one is already waiting in the controller.
     pub fn read_port60(&mut self) -> u8 {
+        let sc = self.port60;
         self.obf = false;
-        self.port60
+        self.fill_output();
+        sc
     }
 
     /// Check if data is available (port 0x64 bit 0)
@@ -495,7 +517,7 @@ impl VirtualKeyboard {
         self.obf
     }
 
-    /// Check if scancodes are buffered (not yet latched)
+    /// Check if scancodes are queued behind the current output byte.
     pub fn has_buffered(&self) -> bool {
         self.head != self.tail
     }
@@ -512,6 +534,7 @@ impl VirtualKeyboard {
         self.head = 0;
         self.tail = 0;
         self.port60 = 0;
+        self.port61 = 0;
         self.obf = false;
     }
 
@@ -541,12 +564,52 @@ impl VirtualKeyboard {
     }
 }
 
+/// Strip PS/2 E0 prefix — DOS games expect XT-style scancodes.
+/// E0 is consumed; the following scancode passes through as its legacy equivalent.
+fn normalize_vm86_scancode(thread: &mut thread::Thread, scancode: u8) -> Option<u8> {
+    if scancode == 0xE0 {
+        thread.vm86.e0_pending = true;
+        return None;
+    }
+    if thread.vm86.e0_pending {
+        thread.vm86.e0_pending = false;
+    }
+    Some(scancode)
+}
+
 fn clear_bios_keyboard_buffer() {
     write_u16(0x40, 0x1A, 0x001E);
     write_u16(0x40, 0x1C, 0x001E);
     for off in (0x1E..0x3E).step_by(2) {
         write_u16(0x40, off, 0);
     }
+}
+
+fn pop_bios_keyboard_word() -> Option<u16> {
+    let head = read_u16(0x40, 0x1A);
+    let tail = read_u16(0x40, 0x1C);
+    if head == tail {
+        return None;
+    }
+    let word = read_u16(0x40, head as u32);
+    let next = if head + 2 >= 0x003E { 0x001E } else { head + 2 };
+    write_u16(0x40, 0x1A, next);
+    Some(word)
+}
+
+fn poll_dos_console_char() -> Option<u8> {
+    let vm86 = &mut thread::current().vm86;
+    if let Some(ch) = vm86.dos_pending_char.take() {
+        return Some(ch);
+    }
+
+    let word = pop_bios_keyboard_word()?;
+    let ascii = word as u8;
+    let scan = (word >> 8) as u8;
+    if ascii == 0 && scan != 0 {
+        vm86.dos_pending_char = Some(scan);
+    }
+    Some(ascii)
 }
 
 // ============================================================================
@@ -857,7 +920,7 @@ impl EmsState {
 // ============================================================================
 
 /// Emulate IN from a port.
-fn emulate_inb(port: u16) -> Result<u8, Action> {
+pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
     match port {
         // VGA ports — pass through to hardware (including 0x3DA retrace register)
         0x3C0..=0x3DF => Ok(crate::arch::x86::inb(port)),
@@ -865,12 +928,12 @@ fn emulate_inb(port: u16) -> Result<u8, Action> {
         0x20 => Ok(thread::current().vm86.vpic.isr),
         // Master PIC data (read IMR)
         0x21 => Ok(thread::current().vm86.vpic.imr),
-        // Keyboard data port — returns latched scancode
+        // Keyboard data port — returns current scancode from the virtual 8042.
         0x60 => Ok(thread::current().vm86.vkbd.read_port60()),
         // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
         0x61 => Ok(thread::current().vm86.vkbd.read_port61()),
         // Keyboard status port (bit 0 = output buffer full)
-        0x64 => Ok(if thread::current().vm86.vkbd.obf { 1 } else { 0 }),
+        0x64 => Ok(if thread::current().vm86.vkbd.has_data() { 1 } else { 0 }),
         0x40 => Ok(thread::current().vm86.vpit.read_counter0()),
         0x41 | 0x42 => Ok(0),
         // PIT command register not readable
@@ -881,7 +944,7 @@ fn emulate_inb(port: u16) -> Result<u8, Action> {
 }
 
 /// Emulate OUT to a port.
-fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
+pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
     match port {
         // VGA ports — pass through to hardware
         0x3C0..=0x3DF => {
@@ -893,17 +956,14 @@ fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
             if val == 0x20 {
                 // Non-specific EOI
                 let t = thread::current();
-                // If keyboard IRQ (bit 1) was in service, clear output buffer flag
+                // If keyboard IRQ (bit 1) was in service, and the virtual 8042
+                // still has data ready, IRQ1 should assert again after EOI.
                 let keyboard_in_service = t.vm86.vpic.isr & 0x02 != 0;
-                if keyboard_in_service {
-                    t.vm86.vkbd.obf = false;
-                }
                 t.vm86.vpic.eoi();
                 // Real hardware effectively re-asserts IRQ1 if more scancodes are
-                // already buffered when the handler finishes. Model that here
-                // instead of queueing one virtual IRQ per scancode.
+                // already visible in the controller when the handler finishes.
                 if keyboard_in_service
-                    && t.vm86.vkbd.has_buffered()
+                    && t.vm86.vkbd.has_data()
                     && !t.vm86.vpic.has_pending_vec(0x09)
                 {
                     t.vm86.vpic.push(0x09);
@@ -977,6 +1037,9 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
     if let Some(e) = event {
         match e {
             Irq::Key(sc) => {
+                let Some(sc) = normalize_vm86_scancode(thread, sc) else {
+                    return;
+                };
                 thread.vm86.vkbd.push(sc);
                 // IRQ1 is "keyboard data available", not "one interrupt per
                 // buffered scancode". If one is already pending or in service,
@@ -1090,7 +1153,7 @@ fn fetch_byte(regs: &mut Regs) -> u8 {
 }
 
 /// Read a u16 from a real-mode seg:off address (unaligned-safe, null-safe)
-fn read_u16(seg: u32, off: u32) -> u16 {
+pub(crate) fn read_u16(seg: u32, off: u32) -> u16 {
     let linear = (seg << 4) + off;
     let val: u16;
     unsafe {
@@ -1105,7 +1168,7 @@ fn read_u16(seg: u32, off: u32) -> u16 {
 }
 
 /// Write a u16 to a real-mode seg:off address (unaligned-safe, null-safe)
-fn write_u16(seg: u32, off: u32, val: u16) {
+pub(crate) fn write_u16(seg: u32, off: u32, val: u16) {
     let linear = (seg << 4) + off;
     unsafe {
         core::arch::asm!(
@@ -1131,21 +1194,21 @@ fn vm86_pop32(regs: &mut Regs) -> u32 {
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
-fn vm86_push(regs: &mut Regs, val: u16) {
+pub(crate) fn vm86_push(regs: &mut Regs, val: u16) {
     let sp = vm86_sp(regs).wrapping_sub(2);
     set_vm86_sp(regs, sp);
     write_u16(regs.ss32(), sp as u32, val);
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
-fn vm86_pop(regs: &mut Regs) -> u16 {
+pub(crate) fn vm86_pop(regs: &mut Regs) -> u16 {
     let sp = vm86_sp(regs);
     let val = read_u16(regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
     val
 }
 
-enum Action {
+pub(crate) enum Action {
     Done,
     Switch(usize),
     Yield,
@@ -1483,92 +1546,65 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
         return Action::Done;
     }
     match int_num {
-        0x20 => {
+        // INT F0h — Unified stub dispatch (all intercepted INTs route through IVT
+        // stubs that call INT F0h; dispatch by IP to identify the original INT)
+        STUB_INT => f0h_dispatch(regs),
+        _ => {
+            panic!("VM86: INT {:02X} intercepted in bitmap but has no handler", int_num);
+        }
+    }
+}
+
+// ============================================================================
+// F0h stub dispatch — routes INT F0h from IVT stubs by IP
+// ============================================================================
+
+/// Dispatch INT F0h from IVT stubs. The IP (past the CD F0 bytes) identifies
+/// which stub triggered the interrupt.
+fn f0h_dispatch(regs: &mut Regs) -> Action {
+    let ip = vm86_ip(regs);
+
+    // IVT-redirect stubs arrive here after the CPU processed the original INT.
+    // With VME the CPU cleared VIF; without VME reflect_interrupt cleared IF.
+    // The original IF/VIF is in the FLAGS the CPU pushed on the VM86 stack (SP+4).
+    // Restore IF from those saved FLAGS so restore_vif propagates correct VIF.
+    // Far-call stubs (XMS/DPMI/callback) have no FLAGS on stack — skip those.
+    let is_far_call = matches!(ip, F0_IP_XMS | F0_IP_DPMI_ENTRY | F0_IP_CALLBACK);
+    if !is_far_call {
+        let saved_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
+        if saved_flags as u32 & IF_FLAG != 0 {
+            regs.set_flag32(IF_FLAG);
+        } else {
+            regs.clear_flag32(IF_FLAG);
+        }
+    }
+
+    match ip {
+        F0_IP_XMS => xms_dispatch(regs),
+        F0_IP_DPMI_ENTRY => {
+            let thread = thread::current();
+            crate::kernel::dpmi::dpmi_enter(thread, regs);
+            Action::Done
+        }
+        F0_IP_CALLBACK => {
+            let thread = thread::current();
+            crate::kernel::dpmi::callback_return(thread, regs);
+            Action::Done
+        }
+        F0_IP_INT20 => {
             // INT 20h — DOS program terminate
-            // If we're in an EXEC'd child, return to parent instead of killing thread
             if let Some(parent) = thread::current().vm86.exec_parent.take() {
                 return exec_return(regs, &parent);
             }
             let next = thread::exit_thread(0);
             Action::Switch(next)
         }
-        0x21 => int_21h(regs),
-        // INT 2Eh — COMMAND.COM internal execute
-        // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
-        0x2E => {
-            let ds = regs.ds as u32;
-            let si = regs.rsi as u32;
-            let addr = (ds << 4) + si;
-            let len = unsafe { *(addr as *const u8) } as usize;
-            let mut cmd = [0u8; 128];
-            let copy = len.min(127);
-            unsafe {
-                core::ptr::copy_nonoverlapping((addr + 1) as *const u8, cmd.as_mut_ptr(), copy);
-            }
-            // Skip leading spaces
-            let mut start = 0;
-            while start < copy && cmd[start] == b' ' { start += 1; }
-            // Extract program name
-            let mut end = start;
-            while end < copy && cmd[end] != b' ' && cmd[end] != b'\r' && cmd[end] != 0 { end += 1; }
-            if end > start {
-                let prog = &cmd[start..end];
-                dbg_println!("INT 2E: exec {:?}", unsafe { core::str::from_utf8_unchecked(prog) });
-                let fd = dos_open_program(prog);
-                if fd >= 0 {
-                    let size = crate::kernel::vfs::seek(fd, 0, 2);
-                    crate::kernel::vfs::seek(fd, 0, 0);
-                    if size > 0 {
-                        let mut buf = alloc::vec![0u8; size as usize];
-                        crate::kernel::vfs::read_raw(fd, &mut buf);
-                        crate::kernel::vfs::close(fd);
-
-                        let child_seg = thread::current().vm86.heap_seg;
-                        let parent_ss = regs.ss32();
-                        let parent_sp = regs.sp32();
-                        let parent_cs = regs.cs32();
-                        let parent_ip = regs.ip32();
-                        let parent_ds = regs.ds as u16;
-                        let parent_es = regs.es as u16;
-
-                        let (cs, ip, ss, sp) = load_com_child(&buf, child_seg);
-                        // Advance heap past child (64K for COM)
-                        let t = thread::current();
-                        t.vm86.heap_seg = child_seg.wrapping_add(0x1000).max(t.vm86.heap_seg);
-                        regs.set_cs32(cs as u32);
-                        regs.set_ip32(ip as u32);
-                        regs.set_ss32(ss as u32);
-                        regs.set_sp32(sp as u32);
-                        regs.ds = child_seg as u64;
-                        regs.es = child_seg as u64;
-
-                        let t = thread::current();
-                        t.vm86.exec_parent = Some(ExecParent {
-                            ss: parent_ss as u16,
-                            sp: parent_sp as u16,
-                            cs: parent_cs as u16,
-                            ip: parent_ip as u16,
-                            ds: parent_ds,
-                            es: parent_es,
-                        });
-                        return Action::Done;
-                    }
-                    crate::kernel::vfs::close(fd);
-                }
-            }
-            // Command not found — just return
-            Action::Done
-        }
-        // INT 28h — DOS idle: yield to other threads
-        0x28 => Action::Done, // no-op, but could yield here if desired
-        // INT 2Fh — Multiplex interrupt (XMS installation check)
-        0x2F => int_2fh(regs),
-        // INT 67h — EMS driver (disabled: needs arch-layer phys page management)
-        // 0x67 => int_67h(regs),
-        // INT F0h — XMS dispatch (private, called via far-call stub)
-        XMS_INT => xms_dispatch(regs),
+        F0_IP_INT21 => int_21h(regs),
+        F0_IP_INT28 => Action::Done, // INT 28h — DOS idle
+        F0_IP_INT2E => int_2eh(regs),
+        F0_IP_INT2F => int_2fh(regs),
         _ => {
-            panic!("VM86: INT {:02X} intercepted in bitmap but has no handler", int_num);
+            panic!("VM86: INT F0h from unknown stub at IP={:#06x}", ip);
         }
     }
 }
@@ -1589,8 +1625,12 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x06 => {
             let dl = regs.rdx as u8;
             if dl == 0xFF {
-                // Input: check keyboard, ZF=1 if no char
-                regs.set_flag32(0x40); // set ZF = no char available
+                if let Some(ch) = poll_dos_console_char() {
+                    regs.rax = (regs.rax & !0xFF) | ch as u64;
+                    regs.clear_flag32(0x40); // clear ZF = char available
+                } else {
+                    regs.set_flag32(0x40); // set ZF = no char available
+                }
             } else {
                 vga::vga().putchar(dl);
             }
@@ -1656,11 +1696,17 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x0C: Flush input buffer then execute function in AL
         0x0C => {
+            clear_bios_keyboard_buffer();
+            thread::current().vm86.dos_pending_char = None;
             // Just execute the sub-function in AL
             let sub_ah = regs.rax as u8;
             if sub_ah == 0x06 {
-                // Direct console I/O — return "no key"
-                regs.set_flag32(0x40); // ZF=1
+                if let Some(ch) = poll_dos_console_char() {
+                    regs.rax = (regs.rax & !0xFF) | ch as u64;
+                    regs.clear_flag32(0x40);
+                } else {
+                    regs.set_flag32(0x40); // ZF=1
+                }
             }
             // Other sub-functions: just return
             Action::Done
@@ -2139,12 +2185,99 @@ fn int_21h(regs: &mut Regs) -> Action {
 /// Try to open a program file via VFS. If the name has no extension (no dot),
 /// try appending .COM and .EXE (DOS convention).
 // ============================================================================
-// INT 2Fh — Multiplex interrupt (XMS detection)
+// INT 2Eh — COMMAND.COM internal execute
+// ============================================================================
+
+fn int_2eh(regs: &mut Regs) -> Action {
+    // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
+    let ds = regs.ds as u32;
+    let si = regs.rsi as u32;
+    let addr = (ds << 4) + si;
+    let len = unsafe { *(addr as *const u8) } as usize;
+    let mut cmd = [0u8; 128];
+    let copy = len.min(127);
+    unsafe {
+        core::ptr::copy_nonoverlapping((addr + 1) as *const u8, cmd.as_mut_ptr(), copy);
+    }
+    // Skip leading spaces
+    let mut start = 0;
+    while start < copy && cmd[start] == b' ' { start += 1; }
+    // Extract program name
+    let mut end = start;
+    while end < copy && cmd[end] != b' ' && cmd[end] != b'\r' && cmd[end] != 0 { end += 1; }
+    if end > start {
+        let prog = &cmd[start..end];
+        dbg_println!("INT 2E: exec {:?}", unsafe { core::str::from_utf8_unchecked(prog) });
+        let fd = dos_open_program(prog);
+        if fd >= 0 {
+            let size = crate::kernel::vfs::seek(fd, 0, 2);
+            crate::kernel::vfs::seek(fd, 0, 0);
+            if size > 0 {
+                let mut buf = alloc::vec![0u8; size as usize];
+                crate::kernel::vfs::read_raw(fd, &mut buf);
+                crate::kernel::vfs::close(fd);
+
+                let child_seg = thread::current().vm86.heap_seg;
+                let parent_ss = regs.ss32();
+                let parent_sp = regs.sp32();
+                let parent_cs = regs.cs32();
+                let parent_ip = regs.ip32();
+                let parent_ds = regs.ds as u16;
+                let parent_es = regs.es as u16;
+
+                let (cs, ip, ss, sp) = load_com_child(&buf, child_seg);
+                // Advance heap past child (64K for COM)
+                let t = thread::current();
+                t.vm86.heap_seg = child_seg.wrapping_add(0x1000).max(t.vm86.heap_seg);
+                regs.set_cs32(cs as u32);
+                regs.set_ip32(ip as u32);
+                regs.set_ss32(ss as u32);
+                regs.set_sp32(sp as u32);
+                regs.ds = child_seg as u64;
+                regs.es = child_seg as u64;
+
+                let t = thread::current();
+                t.vm86.exec_parent = Some(ExecParent {
+                    ss: parent_ss as u16,
+                    sp: parent_sp as u16,
+                    cs: parent_cs as u16,
+                    ip: parent_ip as u16,
+                    ds: parent_ds,
+                    es: parent_es,
+                });
+                return Action::Done;
+            }
+            crate::kernel::vfs::close(fd);
+        }
+    }
+    // Command not found — just return
+    Action::Done
+}
+
+// ============================================================================
+// INT 2Fh — Multiplex interrupt (XMS + DPMI detection)
 // ============================================================================
 
 fn int_2fh(regs: &mut Regs) -> Action {
     let ax = regs.rax as u16;
     match ax {
+        // AX=1687h — DPMI installation check
+        0x1687 => {
+            regs.rax = regs.rax & !0xFFFF; // AX=0: DPMI available
+            // BX = flags (bit 0 = 32-bit programs supported)
+            regs.rbx = (regs.rbx & !0xFFFF) | 0x0001;
+            // CL = processor type (3 = 386)
+            regs.rcx = (regs.rcx & !0xFF) | 0x03;
+            // DX = DPMI version (0.90)
+            regs.rdx = (regs.rdx & !0xFFFF) | 0x005A; // 0x00=major, 0x5A=90 decimal
+            // SI = paragraph count for DPMI host private data (0 = none needed)
+            regs.rsi = regs.rsi & !0xFFFF;
+            // ES:DI = entry point (far call to switch to protected mode)
+            regs.es = STUB_SEG as u64;
+            regs.rdi = (regs.rdi & !0xFFFF) | 0x0003; // stub at 0x0050:0x0003
+            dbg_println!("INT 2F/1687: DPMI available, entry={:04X}:{:04X}", STUB_SEG, 0x0003);
+            Action::Done
+        }
         // AX=4300h — XMS installation check
         0x4300 => {
             regs.rax = (regs.rax & !0xFF) | 0x80; // AL=80h: XMS driver installed
@@ -2153,14 +2286,13 @@ fn int_2fh(regs: &mut Regs) -> Action {
         }
         // AX=4310h — Get XMS driver entry point
         0x4310 => {
-            regs.es = XMS_STUB_SEG as u64;
-            regs.rbx = (regs.rbx & !0xFFFF) | XMS_STUB_OFF as u64;
-            dbg_println!("INT 2F/4310: XMS entry = {:04X}:{:04X}", XMS_STUB_SEG, XMS_STUB_OFF);
+            regs.es = STUB_SEG as u64;
+            regs.rbx = regs.rbx & !0xFFFF; // offset 0x0000 (XMS stub)
+            dbg_println!("INT 2F/4310: XMS entry = {:04X}:{:04X}", STUB_SEG, 0x0000);
             Action::Done
         }
         _ => {
-            // Reflect to BIOS for unhandled multiplex functions
-            reflect_interrupt(regs, 0x2F);
+            // Unhandled — return "not installed" (AL unchanged)
             Action::Done
         }
     }
@@ -3256,25 +3388,68 @@ fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Ac
 /// handler does I/O (IN/OUT), it traps through the IOPB to our virtual
 /// PIC/keyboard, so BIOS code works transparently.
 ///
-/// Interrupts we emulate in the monitor (INT 10h, 20h, 21h) are trapped
-/// via the TSS interrupt redirection bitmap and never reach the IVT.
-/// Address of XMS entry stub (in conventional memory, after BDA)
-const XMS_STUB_ADDR: u32 = 0x0500;
-/// XMS stub segment:offset = 0050:0000
-const XMS_STUB_SEG: u16 = 0x0050;
-const XMS_STUB_OFF: u16 = 0x0000;
-/// Private interrupt number used by XMS far-call stub
-const XMS_INT: u8 = 0xF0;
+/// Stub area base in conventional memory (segment 0x0050, offset 0x0000)
+const STUB_BASE: u32 = 0x0500;
+pub(crate) const STUB_SEG: u16 = 0x0050;
+
+/// F0h dispatch IPs (IP after the CD F0 bytes in each stub)
+const F0_IP_XMS: u16 = 0x0002;
+const F0_IP_DPMI_ENTRY: u16 = 0x0005;
+const F0_IP_CALLBACK: u16 = 0x0008;
+const F0_IP_INT20: u16 = 0x000A;
+const F0_IP_INT21: u16 = 0x000F;
+const F0_IP_INT28: u16 = 0x0014;
+const F0_IP_INT2E: u16 = 0x0019;
+const F0_IP_INT2F: u16 = 0x001E;
+
+/// Private interrupt number used by IVT stubs (only one in TSS bitmap)
+const STUB_INT: u8 = 0xF0;
+
 /// Dummy file handle returned for device "EMMXXXX0" (EMS detection)
 const EMS_DEVICE_HANDLE: u16 = 0xFE;
 
 pub fn setup_ivt() {
-    // Install XMS entry stub at 0x0500: INT F0h + RETF (3 bytes)
+    // Install stubs at 0x0500 (segment 0x0050):
+    //   0x0500: CD F0 CB          ; XMS — INT F0h; RETF (far call)
+    //   0x0503: CD F0 CB          ; DPMI entry — INT F0h; RETF (far call)
+    //   0x0506: CD F0             ; Callback return — INT F0h (handler switches mode)
+    //   0x0508: CD F0 CA 02 00    ; INT 20h — INT F0h; RETF 2 (IVT call, discard FLAGS)
+    //   0x050D: CD F0 CA 02 00    ; INT 21h — INT F0h; RETF 2
+    //   0x0512: CD F0 CA 02 00    ; INT 28h — INT F0h; RETF 2
+    //   0x0517: CD F0 CA 02 00    ; INT 2Eh — INT F0h; RETF 2
+    //   0x051C: CD F0 CA 02 00    ; INT 2Fh — INT F0h; RETF 2
     unsafe {
-        let stub = XMS_STUB_ADDR as *mut u8;
-        *stub = 0xCD;           // INT
-        *stub.add(1) = XMS_INT; // F0h
-        *stub.add(2) = 0xCB;   // RETF
+        let b = STUB_BASE as *mut u8;
+        // XMS (far call): INT F0h; RETF
+        *b.add(0x00) = 0xCD; *b.add(0x01) = STUB_INT; *b.add(0x02) = 0xCB;
+        // DPMI entry (far call): INT F0h; RETF
+        *b.add(0x03) = 0xCD; *b.add(0x04) = STUB_INT; *b.add(0x05) = 0xCB;
+        // Callback return: INT F0h (handler does mode switch, never returns here)
+        *b.add(0x06) = 0xCD; *b.add(0x07) = STUB_INT;
+        // INT 20h: INT F0h; RETF 2
+        *b.add(0x08) = 0xCD; *b.add(0x09) = STUB_INT; *b.add(0x0A) = 0xCA; *b.add(0x0B) = 0x02; *b.add(0x0C) = 0x00;
+        // INT 21h: INT F0h; RETF 2
+        *b.add(0x0D) = 0xCD; *b.add(0x0E) = STUB_INT; *b.add(0x0F) = 0xCA; *b.add(0x10) = 0x02; *b.add(0x11) = 0x00;
+        // INT 28h: INT F0h; RETF 2
+        *b.add(0x12) = 0xCD; *b.add(0x13) = STUB_INT; *b.add(0x14) = 0xCA; *b.add(0x15) = 0x02; *b.add(0x16) = 0x00;
+        // INT 2Eh: INT F0h; RETF 2
+        *b.add(0x17) = 0xCD; *b.add(0x18) = STUB_INT; *b.add(0x19) = 0xCA; *b.add(0x1A) = 0x02; *b.add(0x1B) = 0x00;
+        // INT 2Fh: INT F0h; RETF 2
+        *b.add(0x1C) = 0xCD; *b.add(0x1D) = STUB_INT; *b.add(0x1E) = 0xCA; *b.add(0x1F) = 0x02; *b.add(0x20) = 0x00;
+    }
+
+    // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000)
+    // Format: IVT[n] = dword at n*4: offset(16), segment(16)
+    let ivt_stubs: [(u8, u16); 5] = [
+        (0x20, 0x0008),  // INT 20h stub at 0x0050:0x0008
+        (0x21, 0x000D),  // INT 21h stub at 0x0050:0x000D
+        (0x28, 0x0012),  // INT 28h stub at 0x0050:0x0012
+        (0x2E, 0x0017),  // INT 2Eh stub at 0x0050:0x0017
+        (0x2F, 0x001C),  // INT 2Fh stub at 0x0050:0x001C
+    ];
+    for &(int_num, off) in &ivt_stubs {
+        write_u16(0, (int_num as u32) * 4, off);
+        write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
 
     // Scan upper memory to find free pages for UMB/EMS

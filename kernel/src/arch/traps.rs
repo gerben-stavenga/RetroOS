@@ -54,6 +54,7 @@ pub mod arch_call {
     pub const INIT_HMA: u64 = 0x112;     // EDX=ptr to HMA save area
     pub const ACTIVATE_ROOT: u64 = 0x113; // EDX=ptr to RootPageTable
     pub const FLUSH_TLB: u64 = 0x114;    // Sync PDPT + re-write CR3
+    pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
 }
 
 fn arch_dispatch(regs: &mut Regs) {
@@ -122,6 +123,9 @@ fn arch_dispatch(regs: &mut Regs) {
             root.activate();
         }
         arch_call::FLUSH_TLB => paging2::flush_tlb(),
+        arch_call::LOAD_LDT => {
+            crate::arch::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
+        }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }
 }
@@ -233,7 +237,9 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
 }
 
 fn isr_handler_inner(regs: &mut Regs, vm86: bool) {
-    let int_num = regs.int_num;
+    // Mask to undo sign-extension from push imm8 for vectors >= 0x80
+    let int_num = regs.int_num & 0xFF;
+    regs.int_num = int_num;
     let source_ring = if vm86 { 3 } else { raw_code_seg(regs) & 3 };
 
     match source_ring {
@@ -253,7 +259,7 @@ fn isr_handler_inner(regs: &mut Regs, vm86: bool) {
                 }
             }
             32..=47 => handle_irq(regs),
-            48 => arch_dispatch(regs),
+            0x80 => arch_dispatch(regs),
             _ => panic_with_regs("Unexpected interrupt in kernel", regs),
         },
         // Arch (ring 0): boot-time or nested

@@ -3,6 +3,7 @@
 //! Policy, scheduling, syscalls, filesystems, DOS emulation — everything
 //! that gives the system meaning but doesn't require hardware privilege.
 
+pub mod dpmi;
 pub mod elf;
 pub mod hdd;
 pub mod heap;
