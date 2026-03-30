@@ -9,18 +9,12 @@
 pub fn main(_args: &[&str]) {
     crt::print("RetroOS init\n");
 
-    loop {
-        let pid = crt::fork();
-        crt::print("pid=");
-        crt::print_num(pid);
-        crt::print("\n");
-        if pid == 0 {
-            crt::print("child: exec NC.EXE\n");
-            crt::exec("NC.EXE", &["NC.EXE"]);
-            crt::exit(1);
-        }
-        crt::print("parent: waitpid\n");
-        crt::waitpid(pid);
-        crt::print("init: NC exited, respawning\n");
+    let pid = crt::fork();
+    if pid == 0 {
+        crt::exec("DOOM/DOOM.EXE", &["DOOM/DOOM.EXE"]);
+        crt::exit(1);
     }
+    crt::waitpid(pid);
+    crt::print("init: DOOM exited\n");
+    loop { crt::yield_cpu(); }
 }

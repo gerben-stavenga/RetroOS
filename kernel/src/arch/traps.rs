@@ -190,6 +190,27 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
     let full = unsafe { &mut *full };
     if paging2::cpu_mode() != paging2::CpuMode::Compat { full.regs.from_32(); }
 
+    // Fix ESP from IRET to 16-bit SS: CPU only loads SP, upper bits are
+    // kernel stack residue. Mask to 16 bits based on descriptor B bit.
+    if full.regs.frame.ss & 4 != 0 {
+        let ss = full.regs.frame.ss as u16;
+        let ar: u32;
+        let ok: u8;
+        unsafe {
+            core::arch::asm!(
+                "lar {ar:e}, {sel:e}",
+                "setz {ok}",
+                sel = in(reg) ss as u32,
+                ar = out(reg) ar,
+                ok = out(reg_byte) ok,
+            );
+        }
+        // LAR bit 22 = D/B (Big). If valid and B=0 → 16-bit stack.
+        if ok != 0 && ar & (1 << 22) == 0 {
+            full.regs.frame.rsp &= 0xFFFF;
+        }
+    }
+
     // VM86 canonicalization: swap segments in, restore VIF/VIP
     let vm86 = is_vm86(&full.regs);
     if vm86 {
@@ -233,17 +254,7 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
         full.regs.gs = 0;
     }
 
-    // Check before to_32 overwrites Frame64
-    let dpmi_return = full.regs.frame.cs as u32 & 4 != 0;
-
     if paging2::cpu_mode() != paging2::CpuMode::Compat { full.regs.to_32(); }
-
-    // Debug: dump Frame32 for DPMI returns
-    if dpmi_return {
-        let f32 = unsafe { core::ptr::read((&full.regs.frame as *const crate::Frame64).cast::<crate::Frame32>()) };
-        crate::dbg_println!("IRET32: eip={:#x} cs={:#x} efl={:#x} esp={:#x} ss={:#x} ds={:#x} es={:#x}",
-            f32.eip, f32.cs, f32.eflags, f32.esp, f32.ss, full.regs.ds as u32, full.regs.es as u32);
-    }
 }
 
 fn isr_handler_inner(regs: &mut Regs, vm86: bool) {
@@ -329,6 +340,10 @@ fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
     }
 
     // Dispatch based on mode
+    // HACK: DPMI code shares linear address space for code+data, so don't set NX
+    // on demand-paged pages when the faulting CS is an LDT selector.
+    // This should not belong in arch — move to a higher-level DPMI page fault handler.
+    let nx = paging2::nx_enabled() && !dos_mode;
     match paging2::entries() {
         paging2::Entries::E32(e) => {
             if present {
@@ -341,7 +356,7 @@ fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
             if present {
                 handle_protection_fault(e, fault_addr, page_index, write, user, instruction_fetch)?;
             } else {
-                demand_page(e, page_index, paging2::nx_enabled());
+                demand_page(e, page_index, nx);
             }
         }
     }

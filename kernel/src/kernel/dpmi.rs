@@ -53,6 +53,9 @@ pub struct DpmiState {
     /// Real-mode callbacks (INT 31h/0303h)
     /// Each entry: Some((pm_cs, pm_eip, rm_struct_sel, rm_struct_off))
     pub callbacks: [Option<(u16, u32, u16, u32)>; MAX_CALLBACKS],
+    /// Dedicated real-mode stack segment for INT 31h/0300h simulation.
+    /// Allocated from DOS heap so it doesn't overlap with the client's data.
+    pub rm_stack_seg: u16,
 }
 
 /// A DPMI linear memory block
@@ -81,6 +84,7 @@ impl DpmiState {
             pm_vectors: [(0, 0); 256],
             exc_vectors: [(0, 0); 32],
             callbacks: [None; MAX_CALLBACKS],
+            rm_stack_seg: 0,
         }
     }
 
@@ -333,6 +337,13 @@ pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
     let far_seg = u16::from_le_bytes([far_ptr[2], far_ptr[3]]);
     dbg_println!("Far ptr at DS:0E6C (linear {:#x}): {:04x}:{:04x}", far_ptr_addr, far_seg, far_off);
 
+    // Allocate a dedicated real-mode stack for INT 31h/0300h simulation.
+    // Must not overlap the client's data area. Grab 256 bytes (16 paragraphs)
+    // from the DOS heap.
+    let rm_stack_seg = thread.vm86.heap_seg;
+    thread.vm86.heap_seg = rm_stack_seg.wrapping_add(0x10); // 256 bytes
+    dpmi.rm_stack_seg = rm_stack_seg;
+
     // Store DPMI state on thread
     thread.dpmi = Some(Box::new(dpmi));
 
@@ -583,6 +594,13 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
         }
         _ => {
             // Not a sensitive instruction — dispatch to client exception handler
+            let modrm = unsafe { *((flat_eip.wrapping_add(offset + 1)) as *const u8) };
+            crate::println!("GP13 unhandled op={:#04x} modrm={:#04x} err={:#x} CS:EIP={:04x}:{:#x} AX={:04x} BX={:04x} CX={:04x} DX={:04x} DS={:04x} ES={:04x}",
+                opcode, modrm, regs.err_code, regs.code_seg(), regs.ip32(),
+                regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+                regs.ds as u16, regs.es as u16);
+            crate::dbg_println!("GP13 unhandled op={:#04x} modrm={:#04x} err={:#x} CS:EIP={:04x}:{:#x}",
+                opcode, modrm, regs.err_code, regs.code_seg(), regs.ip32());
             return dispatch_dpmi_exception(thread, regs, 13);
         }
     }
@@ -616,7 +634,7 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
     let cs_32 = seg_is_32(dpmi, regs.code_seg());
 
     let ax = regs.rax as u16;
-    if ax != 0x0204 && ax != 0x0205 && ax != 0xFF00 && ax != 0xFF01 {
+    if ax != 0x0202 && ax != 0x0203 && ax != 0x0204 && ax != 0x0205 && ax != 0xFF00 && ax != 0xFF01 {
         crate::dbg_println!("INT31 AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:#06x}:{:#x} SS:ESP={:#06x}:{:#x}",
             ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
             regs.frame.cs as u16, regs.ip32(), regs.frame.ss as u16, regs.sp32());
@@ -655,6 +673,20 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let idx = DpmiState::sel_to_idx(sel);
             dpmi.free_ldt(idx);
             clear_carry(regs);
+        }
+        // AX=0002h — Segment to Descriptor
+        // BX = real-mode segment. Returns: AX = selector (maps 64KB at seg<<4)
+        0x0002 => {
+            let seg = regs.rbx as u16;
+            let base = (seg as u32) << 4;
+            if let Some(idx) = dpmi.alloc_ldt() {
+                dpmi.ldt[idx] = DpmiState::make_data_desc_ex(base, 0xFFFF, false);
+                let sel = DpmiState::idx_to_sel(idx);
+                regs.rax = (regs.rax & !0xFFFF) | sel as u64;
+                clear_carry(regs);
+            } else {
+                set_carry(regs);
+            }
         }
         // AX=0003h — Get Selector Increment Value
         // Returns: AX = 8
@@ -848,7 +880,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
                 let (sel, off) = dpmi.exc_vectors[exc as usize];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
-                dbg_println!("  0202 get exc vec exc={} -> {:04x}:{:#x}", exc, sel, off);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -860,7 +891,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let exc = regs.rbx as u8;
             if (exc as usize) < 32 {
                 dpmi.exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
-                dbg_println!("  0203 set exc vec exc={} -> {:04x}:{:#x}", exc, regs.rcx as u16, regs.rdx as u32);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -873,7 +903,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let (sel, off) = dpmi.pm_vectors[int_num as usize];
             regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
             regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
-            dbg_println!("  0204 get pm vec int={:#04x} -> {:04x}:{:#x}", int_num, sel, off);
             clear_carry(regs);
         }
         // AX=0205h — Set Protected Mode Interrupt Vector
@@ -881,7 +910,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         0x0205 => {
             let int_num = regs.rbx as u8;
             dpmi.pm_vectors[int_num as usize] = (regs.rcx as u16, regs.rdx as u32);
-            dbg_println!("  0205 set pm vec int={:#04x} -> {:04x}:{:#x}", int_num, regs.rcx as u16, regs.rdx as u32);
             clear_carry(regs);
         }
         // AX=0300h — Simulate Real Mode Interrupt
@@ -1113,9 +1141,15 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         0xFF01 => {
             return raw_switch_pm_to_real(thread, regs);
         }
+        // AX=0507h — Set Page Attributes (DPMI 1.0)
+        // All our memory is committed, so this is a no-op.
+        0x0507 => {
+            clear_carry(regs);
+        }
         _ => {
-            crate::println!("DPMI: unhandled INT 31h AX={:04X}", ax);
-            set_carry(regs);
+            panic!("DPMI: unhandled INT 31h AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
+                ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+                regs.code_seg(), regs.ip32());
         }
     }
 
@@ -1164,9 +1198,26 @@ fn simulate_real_mode_int(thread: &mut thread::Thread, regs: &mut Regs, cs_32: b
     let ivt_off = vm86::read_u16(0, (int_num as u32) * 4);
     let ivt_seg = vm86::read_u16(0, (int_num as u32) * 4 + 2);
 
-    // Use SS:SP from structure if provided, else use a default
-    let rm_ss = if rm.ss != 0 { rm.ss } else { vm86::COM_SEGMENT };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { 0xFFFE };
+    // Diagnostic: check if IVT still points to our stub
+    if ivt_seg != vm86::STUB_SEG || ivt_off < 0x0008 || ivt_off > 0x0020 {
+        crate::println!("WARN: IVT[{:#04x}] = {:04X}:{:04X} (expected 0050:xxxx)",
+            int_num, ivt_seg, ivt_off);
+        // Dump IVT bytes at the entry
+        let lin = (int_num as u32) * 4;
+        let b0 = unsafe { *(lin as *const u8) };
+        let b1 = unsafe { *((lin+1) as *const u8) };
+        let b2 = unsafe { *((lin+2) as *const u8) };
+        let b3 = unsafe { *((lin+3) as *const u8) };
+        crate::println!("  IVT bytes at {:#x}: [{:02x} {:02x} {:02x} {:02x}]", lin, b0, b1, b2, b3);
+        // Also dump struct SS:SP
+        let (ax, ss, sp) = (rm.eax as u16, rm.ss, rm.sp);
+        crate::println!("  rm struct: AX={:04x} SS={:04x} SP={:04x}", ax, ss, sp);
+    }
+
+    // Use SS:SP from structure if provided, else use our dedicated RM stack.
+    // The default must NOT overlap the client's data area (COM_SEGMENT is unsafe).
+    let rm_ss = if rm.ss != 0 { rm.ss } else { dpmi.rm_stack_seg };
+    let rm_sp = if rm.sp != 0 { rm.sp } else { 0x00FE }; // top of 256-byte segment
 
     // Set up VM86 state
     regs.rax = rm.eax as u64;
@@ -1237,9 +1288,9 @@ fn reflect_int_to_real_mode(thread: &mut thread::Thread, regs: &mut Regs, vector
     let ivt_off = vm86::read_u16(0, (vector as u32) * 4);
     let ivt_seg = vm86::read_u16(0, (vector as u32) * 4 + 2);
 
-    // Use a temporary real-mode stack
-    let rm_ss = vm86::COM_SEGMENT;
-    let rm_sp: u16 = 0xFFFE;
+    // Use the dedicated DPMI real-mode stack (not COM_SEGMENT which overlaps client data)
+    let rm_ss = dpmi.rm_stack_seg;
+    let rm_sp: u16 = 0x00FE;
 
     regs.frame.ss = rm_ss as u64;
     regs.frame.rsp = rm_sp as u64;
@@ -1284,8 +1335,8 @@ fn call_real_mode_proc(thread: &mut thread::Thread, regs: &mut Regs, cs_32: bool
     const IF_FLAG: u32 = 1 << 9;
     const VIF_FLAG: u32 = 1 << 19;
 
-    let rm_ss = if rm.ss != 0 { rm.ss } else { vm86::COM_SEGMENT };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { 0xFFFE };
+    let rm_ss = if rm.ss != 0 { rm.ss } else { dpmi.rm_stack_seg };
+    let rm_sp = if rm.sp != 0 { rm.sp } else { 0x00FE };
 
     regs.rax = rm.eax as u64;
     regs.rbx = rm.ebx as u64;
@@ -1348,8 +1399,8 @@ fn call_real_mode_proc_iret(thread: &mut thread::Thread, regs: &mut Regs, cs_32:
     const IF_FLAG: u32 = 1 << 9;
     const VIF_FLAG: u32 = 1 << 19;
 
-    let rm_ss = if rm.ss != 0 { rm.ss } else { vm86::COM_SEGMENT };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { 0xFFFE };
+    let rm_ss = if rm.ss != 0 { rm.ss } else { dpmi.rm_stack_seg };
+    let rm_sp = if rm.sp != 0 { rm.sp } else { 0x00FE };
 
     regs.rax = rm.eax as u64;
     regs.rbx = rm.ebx as u64;
@@ -1485,6 +1536,12 @@ pub fn callback_return(thread: &mut thread::Thread, regs: &mut Regs) {
             sp: regs.sp32() as u16,
             ss: regs.stack_seg(),
         };
+        { let (a,b,c,d,si,di,ds,es) = (rm_struct.eax as u16, rm_struct.ebx as u16,
+            rm_struct.ecx as u16, rm_struct.edx as u16,
+            rm_struct.esi as u16, rm_struct.edi as u16,
+            rm_struct.ds, rm_struct.es);
+          crate::dbg_println!("  cb_ret struct@{:#x} AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+            saved.rm_struct_addr, a, b, c, d, si, di, ds, es); }
         unsafe { *(saved.rm_struct_addr as *mut RmCallStruct) = rm_struct; }
     } else {
         // Implicit INT reflection — propagate real-mode register results
@@ -1503,6 +1560,10 @@ pub fn callback_return(thread: &mut thread::Thread, regs: &mut Regs) {
     }
 
     // Restore protected-mode state
+    crate::dbg_println!("  cb_ret pm AX={:04x} BX={:04x} CX={:04x} DX={:04x} CS:EIP={:04x}:{:#x}",
+        saved.regs.rax as u16, saved.regs.rbx as u16,
+        saved.regs.rcx as u16, saved.regs.rdx as u16,
+        saved.regs.code_seg(), saved.regs.ip32());
     *regs = saved.regs;
     trace_client_selector_leak("callback_return.restore", regs);
 
