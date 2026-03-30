@@ -210,9 +210,59 @@ fn event_loop(first_tid: usize) -> ! {
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let regs = unsafe { &mut *(&raw mut REGS) };
 
+        if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() {
+            let ds = regs.ds as u16;
+            let es = regs.es as u16;
+            let fs = regs.fs as u16;
+            let gs = regs.gs as u16;
+            let cs = regs.frame.cs as u16;
+            let ss = regs.frame.ss as u16;
+            let user_cs = crate::arch::descriptors::USER_CS & !3;
+            let user_ds = crate::arch::descriptors::USER_DS & !3;
+            let user_cs64 = crate::arch::descriptors::USER_CS64 & !3;
+            let leak = |sel: u16| {
+                matches!(sel & !3, x if x == user_cs || x == user_ds || x == user_cs64)
+            };
+            if leak(ds) || leak(es) || leak(fs) || leak(gs) || leak(cs) || leak(ss) {
+                crate::dbg_println!(
+                    "event pre-dispatch: ev={:#x} AX={:04x} BX={:04x} CX={:04x} DX={:04x} CS:IP={:04x}:{:x} SS:SP={:04x}:{:x} DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
+                    event,
+                    regs.rax as u16,
+                    regs.rbx as u16,
+                    regs.rcx as u16,
+                    regs.rdx as u16,
+                    cs,
+                    regs.ip32(),
+                    ss,
+                    regs.sp32(),
+                    ds,
+                    es,
+                    fs,
+                    gs,
+                );
+            }
+        }
+
+        // Temp: trace ESP corruption
+        if regs.frame.cs & 4 != 0 && regs.sp32() > 0xFFFF {
+            crate::dbg_println!("!! ESP corrupt: rsp={:#x} cs={:#x} ev={:#x}",
+                regs.frame.rsp, regs.frame.cs, event);
+        }
+
+        // Debug: log non-routine events
+        if !(32..=47).contains(&event) {
+            if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() && event != 0x31 {
+                crate::dbg_println!("DPMI ev={:#x} CS:EIP={:#06x}:{:#x} SP={:#x}",
+                    event, regs.frame.cs as u16, regs.ip32(), regs.sp32() & 0xFFFF);
+            } else if regs.mode() == crate::UserMode::VM86 && event != 13 {
+                crate::dbg_println!("VM86 ev={:#x} CS:IP={:04x}:{:04x}",
+                    event, regs.code_seg(), regs.ip32() as u16);
+            }
+        }
+
         let new_tid = match event {
             0x80 => crate::kernel::syscalls::dispatch(regs),
-            32..=47 => None, // thread::schedule(),
+            32..=47 => None,
             13 if regs.mode() == crate::UserMode::VM86 => {
                 crate::kernel::vm86::vm86_monitor(regs)
             }
@@ -220,9 +270,55 @@ fn event_loop(first_tid: usize) -> ! {
                 crate::kernel::dpmi::dpmi_monitor(thread, regs)
             }
             0x31 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
-                crate::kernel::dpmi::dpmi_int31(thread, regs)
+                let ret = crate::kernel::dpmi::dpmi_int31(thread, regs);
+                crate::dbg_println!(
+                    "INT31 post flags={:#x} vm={} AX={:04x} CS={:04x} SS={:04x} DS={:04x} ES={:04x}",
+                    regs.flags(),
+                    (regs.flags() >> 17) & 1,
+                    regs.rax as u16,
+                    regs.code_seg(),
+                    regs.stack_seg(),
+                    regs.ds as u16,
+                    regs.es as u16,
+                );
+                if regs.mode() == crate::UserMode::Mode32 {
+                    let cs_ring = regs.code_seg() & 3;
+                    let ss_ring = regs.stack_seg() & 3;
+                    let ds_ring = regs.ds as u16 & 3;
+                    let es_ring = regs.es as u16 & 3;
+                    if ss_ring != cs_ring || ds_ring != cs_ring || es_ring != cs_ring {
+                        crate::dbg_println!(
+                            "INT31 return ring mismatch: AX={:04x} CS={:04x} SS={:04x} DS={:04x} ES={:04x}",
+                            regs.rax as u16,
+                            regs.code_seg(),
+                            regs.stack_seg(),
+                            regs.ds as u16,
+                            regs.es as u16,
+                        );
+                        panic!("INT31 return segment ring mismatch");
+                    }
+                }
+                ret
             }
             14 => thread::signal_thread(thread, extra as usize),
+            // DPMI exceptions 0-31 (except #GP and #PF which are handled above):
+            // dispatch to client exception handler
+            0..=31 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
+                crate::kernel::dpmi::dispatch_dpmi_exception(thread, regs, event)
+            }
+            _ if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
+                crate::println!("DPMI: unexpected event {} at CS:EIP={:#06x}:{:#x}",
+                    event, regs.frame.cs as u16, regs.ip32());
+                Some(thread::exit_thread(-11))
+            }
+            _ if regs.mode() == crate::UserMode::VM86 => {
+                let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
+                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                panic!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                    event, regs.code_seg(), regs.ip32() as u16, lin,
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7]);
+            }
             _ => None,
         };
 

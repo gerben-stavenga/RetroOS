@@ -233,7 +233,17 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
         full.regs.gs = 0;
     }
 
+    // Check before to_32 overwrites Frame64
+    let dpmi_return = full.regs.frame.cs as u32 & 4 != 0;
+
     if paging2::cpu_mode() != paging2::CpuMode::Compat { full.regs.to_32(); }
+
+    // Debug: dump Frame32 for DPMI returns
+    if dpmi_return {
+        let f32 = unsafe { core::ptr::read((&full.regs.frame as *const crate::Frame64).cast::<crate::Frame32>()) };
+        crate::dbg_println!("IRET32: eip={:#x} cs={:#x} efl={:#x} esp={:#x} ss={:#x} ds={:#x} es={:#x}",
+            f32.eip, f32.cs, f32.eflags, f32.esp, f32.ss, full.regs.ds as u32, full.regs.es as u32);
+    }
 }
 
 fn isr_handler_inner(regs: &mut Regs, vm86: bool) {
@@ -293,11 +303,13 @@ fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
     let page_index = page_idx(fault_addr);
 
     // Null pointer protection (first 64KB and last 64KB)
-    // Skip for VM86 (legitimate IVT/BDA access) and supervisor (ring-1 kernel
-    // setting up user memory, e.g. PSP/environment for DOS programs)
+    // Skip for VM86 and DPMI (legitimate IVT/BDA/conventional memory access)
+    // and supervisor (ring-1 kernel setting up user memory).
+    // DPMI code uses LDT selectors (TI=1); Linux uses GDT selectors (TI=0).
     const NULL_LIMIT: usize = 0x10000;
     let vm86 = is_vm86(regs);
-    if !vm86 && user && (fault_addr < NULL_LIMIT || fault_addr >= (0usize).wrapping_sub(NULL_LIMIT)) {
+    let dos_mode = vm86 || (regs.frame.cs & 4) != 0;
+    if !dos_mode && user && (fault_addr < NULL_LIMIT || fault_addr >= (0usize).wrapping_sub(NULL_LIMIT)) {
         return None; // Let kernel handle (segfault or panic)
     }
 

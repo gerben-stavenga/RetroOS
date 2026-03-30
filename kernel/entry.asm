@@ -92,19 +92,19 @@ entry_wrapper_32:
     jmp call_isr_handler
 
 exit_interrupt_32:
-    ; Restore segment registers
-    pop eax                 ; gs high (discard)
-    pop eax                 ; gs low
+    ; Restore segment registers (push64_32 stores low at [ESP], high at [ESP+4])
+    pop eax                 ; gs low (value)
     mov gs, ax
-    pop eax                 ; fs high (discard)
-    pop eax                 ; fs low
+    add esp, 4              ; skip gs high
+    pop eax                 ; fs low (value)
     mov fs, ax
-    pop eax                 ; es high (discard)
-    pop eax                 ; es low
+    add esp, 4              ; skip fs high
+    pop eax                 ; es low (value)
     mov es, ax
-    pop eax                 ; ds high (discard)
-    pop eax                 ; ds low
+    add esp, 4              ; skip es high
+    pop eax                 ; ds low (value)
     mov ds, ax
+    add esp, 4              ; skip ds high
 
     ; Skip r15-r8 (64 bytes = 8 registers * 8 bytes)
     add esp, 64

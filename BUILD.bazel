@@ -100,6 +100,9 @@ _PROPRIETARY_FILES = {
     "//apps-proprietary/prince:config.dat": "PRINCE/CONFIG.DAT",
     "//apps-proprietary/prince:setup.dat": "PRINCE/SETUP.DAT",
     "//apps-proprietary/prince:setup.cfg": "PRINCE/SETUP.CFG",
+    "//apps-proprietary/quake:QUAKE.EXE": "QUAKE/QUAKE.EXE",
+    "//apps-proprietary/quake:CWSDPMI.EXE": "QUAKE/CWSDPMI.EXE",
+    "//apps-proprietary/quake:id1/PAK0.PAK": "QUAKE/ID1/PAK0.PAK",
 }
 
 # Public image (shareware only)
@@ -119,14 +122,14 @@ genrule(
     name = "image",
     srcs = [":fs_tar"],
     outs = ["image.bin"],
-    cmd = "tail -c +513 $< > $@ && truncate -s 32M $@",
+    cmd = "tail -c +513 $< > $@ && truncate -s 64M $@",
 )
 
 genrule(
     name = "image_proprietary",
     srcs = [":fs_tar_proprietary"],
     outs = ["image_proprietary.bin"],
-    cmd = "tail -c +513 $< > $@ && truncate -s 32M $@",
+    cmd = "tail -c +513 $< > $@ && truncate -s 64M $@",
 )
 
 # Run QEMU with the disk image

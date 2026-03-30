@@ -1569,7 +1569,8 @@ fn f0h_dispatch(regs: &mut Regs) -> Action {
     // The original IF/VIF is in the FLAGS the CPU pushed on the VM86 stack (SP+4).
     // Restore IF from those saved FLAGS so restore_vif propagates correct VIF.
     // Far-call stubs (XMS/DPMI/callback) have no FLAGS on stack — skip those.
-    let is_far_call = matches!(ip, F0_IP_XMS | F0_IP_DPMI_ENTRY | F0_IP_CALLBACK);
+    let is_callback_entry = ip >= F0_IP_CB_ENTRY_BASE && ip < F0_IP_CB_ENTRY_BASE + 32;
+    let is_far_call = is_callback_entry || matches!(ip, F0_IP_XMS | F0_IP_DPMI_ENTRY | F0_IP_CALLBACK | F0_IP_RAW_REAL_TO_PM);
     if !is_far_call {
         let saved_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
         if saved_flags as u32 & IF_FLAG != 0 {
@@ -1603,6 +1604,17 @@ fn f0h_dispatch(regs: &mut Regs) -> Action {
         F0_IP_INT28 => Action::Done, // INT 28h — DOS idle
         F0_IP_INT2E => int_2eh(regs),
         F0_IP_INT2F => int_2fh(regs),
+        F0_IP_RAW_REAL_TO_PM => {
+            let thread = thread::current();
+            crate::kernel::dpmi::raw_switch_real_to_pm(thread, regs);
+            Action::Done
+        }
+        ip if ip >= F0_IP_CB_ENTRY_BASE && ip < F0_IP_CB_ENTRY_BASE + 32 => {
+            let cb_idx = ((ip - F0_IP_CB_ENTRY_BASE) / 2) as usize;
+            let thread = thread::current();
+            crate::kernel::dpmi::callback_entry(thread, regs, cb_idx);
+            Action::Done
+        }
         _ => {
             panic!("VM86: INT F0h from unknown stub at IP={:#06x}", ip);
         }
@@ -3160,8 +3172,15 @@ fn exec_program(regs: &mut Regs) -> Action {
         crate::kernel::startup::arch_map_low_mem();
         setup_ivt();
 
+        // Resolve program name relative to parent cwd for the PSP environment
+        let mut resolved_buf = [0u8; 164];
+        let resolved_name = crate::kernel::vfs::resolve(prog_name, &mut resolved_buf);
+        let mut resolved_copy = [0u8; 164];
+        let rlen = resolved_name.len().min(164);
+        resolved_copy[..rlen].copy_from_slice(&resolved_name[..rlen]);
+
         let (cs, ip, ss, sp) = if is_exe {
-            match load_exe(&buf) {
+            match load_exe(&buf, &resolved_copy[..rlen]) {
                 Some(t) => t,
                 None => {
                     crate::kernel::startup::arch_switch_to(
@@ -3175,7 +3194,7 @@ fn exec_program(regs: &mut Regs) -> Action {
                 }
             }
         } else {
-            load_com(&buf)
+            load_com(&buf, &resolved_copy[..rlen])
         };
         clear_bios_keyboard_buffer();
 
@@ -3401,6 +3420,9 @@ const F0_IP_INT21: u16 = 0x000F;
 const F0_IP_INT28: u16 = 0x0014;
 const F0_IP_INT2E: u16 = 0x0019;
 const F0_IP_INT2F: u16 = 0x001E;
+const F0_IP_RAW_REAL_TO_PM: u16 = 0x0023;
+/// F0h IP for callback entry stubs: IP = 0x0032 + n*2 for callback n
+const F0_IP_CB_ENTRY_BASE: u16 = 0x0032;
 
 /// Private interrupt number used by IVT stubs (only one in TSS bitmap)
 const STUB_INT: u8 = 0xF0;
@@ -3436,6 +3458,23 @@ pub fn setup_ivt() {
         *b.add(0x17) = 0xCD; *b.add(0x18) = STUB_INT; *b.add(0x19) = 0xCA; *b.add(0x1A) = 0x02; *b.add(0x1B) = 0x00;
         // INT 2Fh: INT F0h; RETF 2
         *b.add(0x1C) = 0xCD; *b.add(0x1D) = STUB_INT; *b.add(0x1E) = 0xCA; *b.add(0x1F) = 0x02; *b.add(0x20) = 0x00;
+        // Raw mode switch: real-to-PM (VM86 far call → INT F0h trap)
+        *b.add(0x21) = 0xCD; *b.add(0x22) = STUB_INT;
+        // Raw mode switch: PM-to-real (PUSH AX; MOV AX,0xFF01; INT 31h)
+        *b.add(0x23) = 0x50;                           // PUSH AX (save new DS)
+        *b.add(0x24) = 0xB8; *b.add(0x25) = 0x01; *b.add(0x26) = 0xFF; // MOV AX, 0xFF01
+        *b.add(0x27) = 0xCD; *b.add(0x28) = 0x31;     // INT 31h
+        // Exception handler return: MOV AX, 0xFF00; INT 31h
+        *b.add(0x2A) = 0xB8; *b.add(0x2B) = 0x00; *b.add(0x2C) = 0xFF;
+        *b.add(0x2D) = 0xCD; *b.add(0x2E) = 0x31;
+
+        // Real-mode callback entry stubs (16 slots, each 2 bytes: CD F0)
+        // Stub n at offset 0x0030 + n*2, F0h dispatch IP = 0x0032 + n*2
+        for i in 0..16u32 {
+            let off = 0x0030 + i * 2;
+            *b.add(off as usize) = 0xCD;
+            *b.add(off as usize + 1) = STUB_INT;
+        }
     }
 
     // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000)
@@ -3467,7 +3506,7 @@ pub fn setup_ivt() {
 ///
 /// Pages are written via demand paging (ring-1 writes trigger page faults
 /// that allocate fresh pages at ring 0).
-fn map_psp() {
+fn map_psp(prog_name: &[u8]) {
     const PSP_ADDR: usize = 0x10000;  // COM_SEGMENT << 4
     const ENV_ADDR: usize = 0x0F000;  // page before PSP
     const ENV_SEG: u16 = 0x0F00;      // ENV_ADDR >> 4
@@ -3491,8 +3530,17 @@ fn map_psp() {
         *env_ptr.add(off + 1) = 0x00;
         off += 2;
     }
-    let name = b"C:\\PROG.EXE\0";
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), env_ptr.add(off), name.len()); }
+    // Build "C:\<PROG_NAME>\0" from the actual program path.
+    // Convert forward slashes to backslashes and uppercase for DOS convention.
+    let prefix = b"C:\\";
+    unsafe { core::ptr::copy_nonoverlapping(prefix.as_ptr(), env_ptr.add(off), prefix.len()); }
+    off += prefix.len();
+    for &b in prog_name {
+        let c = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
+        unsafe { *env_ptr.add(off) = c; }
+        off += 1;
+    }
+    unsafe { *env_ptr.add(off) = 0; }
 
     // PSP page (linear 0x10000)
     let psp_ptr = PSP_ADDR as *mut u8;
@@ -3528,8 +3576,8 @@ pub fn is_mz_exe(data: &[u8]) -> bool {
 ///     0x0000-0x00FF: PSP (Program Segment Prefix)
 ///     0x0100-...:    .COM binary code
 ///   Stack at COM_SEGMENT:COM_SP (top of segment)
-pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
-    map_psp();
+pub fn load_com(data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16) {
+    map_psp(prog_name);
     // COM gets full 64K segment
     thread::current().vm86.heap_seg = COM_SEGMENT.wrapping_add(0x1000);
 
@@ -3561,7 +3609,7 @@ pub fn load_com(data: &[u8]) -> (u16, u16, u16, u16) {
 ///   0x14: initial IP
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
-pub fn load_exe(data: &[u8]) -> Option<(u16, u16, u16, u16)> {
+pub fn load_exe(data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16)> {
     if data.len() < 28 {
         return None;
     }
@@ -3596,7 +3644,7 @@ pub fn load_exe(data: &[u8]) -> Option<(u16, u16, u16, u16)> {
     let psp_segment = COM_SEGMENT;
     let load_segment = psp_segment + 0x10; // 256 bytes after PSP base
 
-    map_psp();
+    map_psp(prog_name);
 
     // Set initial heap past the loaded program (PSP + load image + min extra/BSS)
     let load_paras = ((load_size as u32 + 15) / 16) as u16;

@@ -202,7 +202,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
     // DOS executables use the VM86 exec path
     if is_com || is_exe {
-        let tid = exec_dos(&buffer, is_exe);
+        let tid = exec_dos(&buffer, is_exe, resolved);
         *regs = thread::current().cpu_state;
         // buffer and args dropped here by RAII
         return SyscallResult::switch(Some(tid));
@@ -244,7 +244,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
 /// Execute a DOS program (.COM or .EXE) in VM86 mode.
 /// Returns thread index to switch to.
-fn exec_dos(data: &[u8], is_exe: bool) -> usize {
+fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
     use crate::kernel::vm86;
 
     // Free current user pages + map first 1MB for VM86
@@ -256,12 +256,12 @@ fn exec_dos(data: &[u8], is_exe: bool) -> usize {
 
     // Load binary
     let (cs, ip, ss, sp) = if is_exe && vm86::is_mz_exe(data) {
-        vm86::load_exe(data).unwrap_or_else(|| {
+        vm86::load_exe(data, prog_name).unwrap_or_else(|| {
             crate::println!("Invalid MZ EXE");
             (0, 0, 0, 0)
         })
     } else {
-        vm86::load_com(data)
+        vm86::load_com(data, prog_name)
     };
 
     let current = thread::current();
