@@ -493,8 +493,19 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 let new_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
                 let new_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) } as u16;
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
-                crate::dbg_println!("IRET32 EIP={:#x} CS={:#x}",
-                    new_eip, new_cs);
+                crate::dbg_println!("IRET32 ss_base={:#x} sp={:#x} lin={:#x} → EIP={:#010x} CS={:#06x} FL={:#010x}",
+                    ss_base, sp, ss_base.wrapping_add(sp), new_eip, new_cs, new_flags);
+                if new_cs == 0 && new_eip == 0 {
+                    let lin = ss_base.wrapping_add(sp);
+                    crate::println!("IRET32 ZERO FRAME at lin={:#x} SS={:#06x} CS_at_iret={:#06x}",
+                        lin, regs.stack_seg(), regs.code_seg());
+                    for i in (0..64).step_by(16) {
+                        let a = lin.wrapping_sub(32).wrapping_add(i as u32);
+                        let b = unsafe { core::slice::from_raw_parts(a as *const u8, 16) };
+                        crate::println!("  {:#010x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            a, b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+                    }
+                }
                 set_sp(regs, sp.wrapping_add(12));
                 regs.set_ip32(new_eip);
                 regs.set_cs32(new_cs as u32);
@@ -1687,11 +1698,18 @@ pub fn deliver_hw_irq(thread: &mut thread::Thread, regs: &mut Regs, vector: u8) 
     } else {
         regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF));
     }
+    let lin = ss_base.wrapping_add(new_sp);
     unsafe {
-        let base = ss_base.wrapping_add(new_sp) as *mut u32;
+        let base = lin as *mut u32;
         core::ptr::write_unaligned(base, regs.ip32());
         core::ptr::write_unaligned(base.add(1), regs.code_seg() as u32);
         core::ptr::write_unaligned(base.add(2), regs.flags32());
+        let rb0 = core::ptr::read_unaligned(base);
+        let rb1 = core::ptr::read_unaligned(base.add(1));
+        if rb0 != regs.ip32() || rb1 != regs.code_seg() as u32 {
+            crate::println!("dHWirq WRITE FAILED at {:#x}: wrote {:#x}/{:#x} read {:#x}/{:#x}",
+                lin, regs.ip32(), regs.code_seg(), rb0, rb1);
+        }
     }
 
     regs.set_cs32(sel as u32);

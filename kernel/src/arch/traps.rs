@@ -201,7 +201,10 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
 
     // Fix ESP from IRET to 16-bit SS: CPU only loads SP, upper bits are
     // kernel stack residue. Mask to 16 bits based on descriptor B bit.
-    if full.regs.frame.ss & 4 != 0 {
+    // Only for ring transitions (VM86/user → kernel): same-privilege traps
+    // (ring 0 → ring 0) don't push SS, so frame.ss is stale garbage.
+    let ring_transition = is_vm86(&full.regs) || full.regs.frame.cs & 3 != 0;
+    if ring_transition && !is_vm86(&full.regs) && full.regs.frame.ss & 4 != 0 {
         let ss = full.regs.frame.ss as u16;
         let ar: u32;
         let ok: u8;
