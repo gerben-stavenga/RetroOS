@@ -210,17 +210,6 @@ fn event_loop(first_tid: usize) -> ! {
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let regs = unsafe { &mut *(&raw mut REGS) };
 
-        // Debug: log non-routine DPMI events
-        if !(32..=47).contains(&event) {
-            if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() && event != 0x31 {
-                crate::dbg_println!("DPMI ev={:#x} CS:EIP={:#06x}:{:#x} SP={:#x}",
-                    event, regs.frame.cs as u16, regs.ip32(), regs.sp32() & 0xFFFF);
-            } else if regs.mode() == crate::UserMode::VM86 && event != 13 {
-                crate::dbg_println!("VM86 ev={:#x} CS:IP={:04x}:{:04x}",
-                    event, regs.code_seg(), regs.ip32() as u16);
-            }
-        }
-
         let new_tid = match event {
             0x80 => crate::kernel::syscalls::dispatch(regs),
             32..=47 => None,

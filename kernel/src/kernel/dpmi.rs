@@ -228,8 +228,6 @@ fn build_descriptor(base: u32, limit: u32, access: u64, flags: u64) -> u64 {
 /// Called from f0h_dispatch when the DPMI entry stub executes.
 pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
-    dbg_println!("DPMI enter: AX={} ({}bit client)", client_type, if client_type != 0 { 32 } else { 16 });
-
     // Save VM86 register state for the FAR CALL return address
     // The FAR CALL pushed CS:IP on the real-mode stack.
     // Pop the return address so we know where to resume in PM.
@@ -286,9 +284,6 @@ pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
     let ldt_limit = (LDT_ENTRIES * 8 - 1) as u32;
     startup::arch_load_ldt(ldt_ptr, ldt_limit);
 
-    dbg_println!("DPMI enter: ret_cs={:#06x} ret_ip={:#06x} cs_base={:#x} ds_base={:#x} ss_base={:#x}",
-        ret_cs, ret_ip, cs_base, ds_base, ss_base);
-
     // Switch regs from VM86 to protected mode:
     // Clear VM flag, set PM selectors, set EIP to return offset
     const VM_FLAG: u64 = 1 << 17;
@@ -304,38 +299,6 @@ pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
     regs.es = es_sel as u64;
     regs.fs = 0;
     regs.gs = 0;
-
-    dbg_println!("DPMI enter: CS={:#06x}:{:#x} SS={:#06x}:{:#x} DS={:#06x} ES={:#06x}",
-        cs_sel, ret_ip, ss_sel, real_sp, ds_sel, es_sel);
-    dbg_println!(
-        "DPMI enter: sel 0x20 -> idx={} ti={} rpl={} base={:#x}",
-        DpmiState::sel_to_idx(0x20),
-        (0x20 >> 2) & 1,
-        0x20 & 3,
-        seg_base(&dpmi, 0x20),
-    );
-
-    // Dump code at the return point and at the 0306h failure handler
-    let flat_ret = cs_base.wrapping_add(ret_ip as u32);
-    let code: [u8; 256] = unsafe { core::ptr::read(flat_ret as *const [u8; 256]) };
-    for i in 0..4 {
-        dbg_println!("Code+{:02x}: {:02x?}", i*64, &code[i*64..(i+1)*64]);
-    }
-    let fallback_flat = cs_base.wrapping_add(0x713c);
-    let fallback_code: [u8; 64] = unsafe { core::ptr::read(fallback_flat as *const [u8; 64]) };
-    for i in 0..4 {
-        dbg_println!("Fallback713c+{:02x}: {:02x?}", i * 16, &fallback_code[i * 16..(i + 1) * 16]);
-    }
-    let pm_stub: [u8; 48] = unsafe { core::ptr::read(0x0500 as *const [u8; 48]) };
-    for i in 0..3 {
-        dbg_println!("PmStub+{:02x}: {:02x?}", i * 16, &pm_stub[i * 16..(i + 1) * 16]);
-    }
-    // Dump far pointer at DS:0x0E6C (used by CALL FAR [0x0E6C] in DOS4GW)
-    let far_ptr_addr = ds_base.wrapping_add(0x0E6C);
-    let far_ptr: [u8; 4] = unsafe { core::ptr::read(far_ptr_addr as *const [u8; 4]) };
-    let far_off = u16::from_le_bytes([far_ptr[0], far_ptr[1]]);
-    let far_seg = u16::from_le_bytes([far_ptr[2], far_ptr[3]]);
-    dbg_println!("Far ptr at DS:0E6C (linear {:#x}): {:04x}:{:04x}", far_ptr_addr, far_seg, far_off);
 
     // Allocate a dedicated real-mode stack for INT 31h/0300h simulation.
     // Must not overlap the client's data area. Grab 256 bytes (16 paragraphs)
@@ -355,9 +318,20 @@ pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
             dpmi.ldt[idx] = DpmiState::make_data_desc_ex(env_base, 0xFFFF, false);
             let env_sel = DpmiState::idx_to_sel(idx);
             unsafe { *((psp_base + 0x2C) as *mut u16) = env_sel; }
-            dbg_println!("DPMI enter: env seg {:#06x} -> sel {:#06x} idx={} base={:#x}",
-                env_seg, env_sel, idx, env_base);
         }
+    }
+
+    // Default PM handlers for ALL interrupt vectors (DPMI spec requires these).
+    // DOS extenders read them via 0204 and store as chain-to addresses.
+    // Without defaults, DOS/4GW stores 0:0 and crashes on IRETD when chaining.
+    let stub_sel = DpmiState::idx_to_sel(5);
+    const IRET_STUB: u32 = 0x0530;
+    unsafe {
+        *(IRET_STUB as *mut u8) = 0x66;       // operand-size override
+        *((IRET_STUB + 1) as *mut u8) = 0xCF; // IRETD
+    }
+    for vec in 0..=0xFFu16 {
+        dpmi.pm_vectors[vec as usize] = (stub_sel, IRET_STUB);
     }
 
     // Store DPMI state on thread
@@ -419,25 +393,6 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
     let opcode = unsafe { *((flat_eip.wrapping_add(offset)) as *const u8) };
     let mut advance = offset + 1;
 
-    crate::dbg_println!("GP13 EIP={:#x} op={:#04x} cs32={}", regs.ip32(), opcode, cs_32);
-    if opcode == 0x0F {
-        let op2 = unsafe { *((flat_eip.wrapping_add(offset + 1)) as *const u8) };
-        let modrm = unsafe { *((flat_eip.wrapping_add(offset + 2)) as *const u8) };
-        crate::dbg_println!(
-            "GP13 ext EIP={:#x} op2={:#04x} modrm={:#04x} AX={:04x} BX={:04x} CX={:04x} DX={:04x} DS={:04x} ES={:04x} SS={:04x}",
-            regs.ip32(),
-            op2,
-            modrm,
-            regs.rax as u16,
-            regs.rbx as u16,
-            regs.rcx as u16,
-            regs.rdx as u16,
-            regs.ds as u16,
-            regs.es as u16,
-            regs.stack_seg(),
-        );
-    }
-
     match opcode {
         // CLI — clear virtual IF
         0xFA => {
@@ -493,18 +448,9 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 let new_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
                 let new_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) } as u16;
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
-                crate::dbg_println!("IRET32 ss_base={:#x} sp={:#x} lin={:#x} → EIP={:#010x} CS={:#06x} FL={:#010x}",
-                    ss_base, sp, ss_base.wrapping_add(sp), new_eip, new_cs, new_flags);
-                if new_cs == 0 && new_eip == 0 {
-                    let lin = ss_base.wrapping_add(sp);
-                    crate::println!("IRET32 ZERO FRAME at lin={:#x} SS={:#06x} CS_at_iret={:#06x}",
-                        lin, regs.stack_seg(), regs.code_seg());
-                    for i in (0..64).step_by(16) {
-                        let a = lin.wrapping_sub(32).wrapping_add(i as u32);
-                        let b = unsafe { core::slice::from_raw_parts(a as *const u8, 16) };
-                        crate::println!("  {:#010x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                            a, b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
-                    }
+                if new_cs == 0 {
+                    let _ = dpmi;
+                    return dispatch_dpmi_exception(thread, regs, 13);
                 }
                 set_sp(regs, sp.wrapping_add(12));
                 regs.set_ip32(new_eip);
@@ -516,8 +462,10 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 let new_ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) };
                 let new_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) };
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u16) } as u32;
-                crate::dbg_println!("IRET16 ss_base={:#x} sp={:#x} → IP={:#06x} CS={:#06x} FL={:#06x}",
-                    ss_base, sp, new_ip, new_cs, new_flags);
+                if new_cs == 0 {
+                    let _ = dpmi;
+                    return dispatch_dpmi_exception(thread, regs, 13);
+                }
                 set_sp(regs, sp.wrapping_add(6));
                 regs.set_ip32(new_ip as u32);
                 regs.set_cs32(new_cs as u32);
@@ -622,12 +570,6 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
         _ => {
             // Not a sensitive instruction — dispatch to client exception handler
             let modrm = unsafe { *((flat_eip.wrapping_add(offset + 1)) as *const u8) };
-            crate::println!("GP13 unhandled op={:#04x} modrm={:#04x} err={:#x} CS:EIP={:04x}:{:#x} AX={:04x} BX={:04x} CX={:04x} DX={:04x} DS={:04x} ES={:04x}",
-                opcode, modrm, regs.err_code, regs.code_seg(), regs.ip32(),
-                regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-                regs.ds as u16, regs.es as u16);
-            crate::dbg_println!("GP13 unhandled op={:#04x} modrm={:#04x} err={:#x} CS:EIP={:04x}:{:#x}",
-                opcode, modrm, regs.err_code, regs.code_seg(), regs.ip32());
             return dispatch_dpmi_exception(thread, regs, 13);
         }
     }
@@ -695,12 +637,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
     let cs_32 = seg_is_32(dpmi, regs.code_seg());
 
     let ax = regs.rax as u16;
-    if ax != 0x0202 && ax != 0x0203 && ax != 0x0204 && ax != 0x0205 && ax != 0xFF00 && ax != 0xFF01 {
-        crate::dbg_println!("INT31 AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:#06x}:{:#x} SS:ESP={:#06x}:{:#x}",
-            ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-            regs.frame.cs as u16, regs.ip32(), regs.frame.ss as u16, regs.sp32());
-    }
-
     match ax {
         // AX=0000h — Allocate LDT Descriptors
         // CX = number of descriptors
@@ -721,7 +657,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
                     }
                     let sel = DpmiState::idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
-                    dbg_println!("  0000 alloc count={} -> sel={:#06x} idx={}", count, sel, idx);
                     clear_carry(regs);
                 }
                 None => set_carry(regs),
@@ -783,7 +718,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             if idx < LDT_ENTRIES {
                 let base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 DpmiState::set_desc_base(&mut dpmi.ldt[idx], base);
-                dbg_println!("  0007 set base sel={:#06x} idx={} base={:#x}", sel, idx, base);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -797,7 +731,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             if idx < LDT_ENTRIES {
                 let limit = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 DpmiState::set_desc_limit(&mut dpmi.ldt[idx], limit);
-                dbg_println!("  0008 set limit sel={:#06x} idx={} limit={:#x}", sel, idx, limit);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -815,7 +748,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
                 dpmi.ldt[idx] &= !0x00F0_FF00_0000_0000;
                 dpmi.ldt[idx] |= (cl as u64) << 40;
                 dpmi.ldt[idx] |= ((ch & 0xF0) as u64) << 48;
-                dbg_println!("  0009 set rights sel={:#06x} idx={} access={:#04x} ext={:#04x}", sel, idx, cl, ch);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -836,7 +768,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
                     dpmi.ldt[new_idx] = desc;
                     let new_sel = DpmiState::idx_to_sel(new_idx);
                     regs.rax = (regs.rax & !0xFFFF) | new_sel as u64;
-                    dbg_println!("  000A alias src={:#06x} -> sel={:#06x} idx={}", sel, new_sel, new_idx);
                     clear_carry(regs);
                 } else {
                     set_carry(regs);
@@ -853,10 +784,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             if idx < LDT_ENTRIES {
                 let dest = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
                 unsafe { core::ptr::write_unaligned(dest as *mut u64, dpmi.ldt[idx]); }
-                dbg_println!("  000B get sel={:#06x} idx={} desc={:#018x} base={:#x} lim={:#x} 32={}",
-                    sel, idx, dpmi.ldt[idx],
-                    DpmiState::desc_base(dpmi.ldt[idx]), DpmiState::desc_limit(dpmi.ldt[idx]),
-                    DpmiState::desc_is_32(dpmi.ldt[idx]));
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -868,22 +795,9 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let sel = regs.rbx as u16;
             let idx = DpmiState::sel_to_idx(sel);
             if idx < LDT_ENTRIES {
-                let es_base = seg_base(dpmi, regs.es as u16);
-                let es_32 = seg_is_32(dpmi, regs.es as u16);
                 let src = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
-                let raw_bytes = unsafe { core::slice::from_raw_parts(src as *const u8, 8) };
-                dbg_println!("  000C ES={:#06x} es_base={:#x} es_32={} EDI={:#010x} cs_32={} flat={:#010x} raw=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                    regs.es as u16, es_base, es_32,
-                    regs.rdi as u32, cs_32, src,
-                    raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3],
-                    raw_bytes[4], raw_bytes[5], raw_bytes[6], raw_bytes[7]);
                 let new_desc = unsafe { core::ptr::read_unaligned(src as *const u64) };
-                let old_desc = dpmi.ldt[idx];
                 dpmi.ldt[idx] = new_desc;
-                dbg_println!("  000C set sel={:#06x} idx={} old={:#018x} new={:#018x} base={:#x} lim={:#x} 32={}",
-                    sel, idx, old_desc, new_desc,
-                    DpmiState::desc_base(new_desc), DpmiState::desc_limit(new_desc),
-                    DpmiState::desc_is_32(new_desc));
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -904,8 +818,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
                 let sel = DpmiState::idx_to_sel(idx);
                 regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | sel as u64;
-                dbg_println!("  0100 alloc dos paragraphs={} rm_seg={:#06x} -> sel={:#06x} idx={} base={:#x} limit={:#x}",
-                    paragraphs, seg, sel, idx, base, limit);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -1013,8 +925,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
                     let rm_off = CB_STUB_OFFSET + (i as u16) * 2;
                     regs.rcx = (regs.rcx & !0xFFFF) | vm86::STUB_SEG as u64;
                     regs.rdx = (regs.rdx & !0xFFFF) | rm_off as u64;
-                    crate::dbg_println!("  0303 alloc callback {} → {:04x}:{:04x} handler={:04x}:{:x}",
-                        i, vm86::STUB_SEG, rm_off, regs.ds as u16, regs.rsi as u32);
                     clear_carry(regs);
                 }
                 None => set_carry(regs),
@@ -1187,7 +1097,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let stub_sel = DpmiState::idx_to_sel(5);
             regs.rsi = (regs.rsi & !0xFFFF) | stub_sel as u64;
             regs.rdi = (regs.rdi & !0xFFFF) | 0x0502;  // offset = linear addr (base=0)
-            dbg_println!("  0305 save/restore rm={:04x}:{:04x} pm={:04x}:{:#x}", vm86::STUB_SEG, 0x0002u16, stub_sel, 0x0502u16);
             clear_carry(regs);
         }
         // AX=0306h — Get Raw Mode Switch Addresses
@@ -1200,7 +1109,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let stub_sel = DpmiState::idx_to_sel(5);  // LDT[5]: base=0 code segment
             regs.rsi = (regs.rsi & !0xFFFF) | stub_sel as u64;
             regs.rdi = (regs.rdi & !0xFFFFFFFF) | 0x0523;  // offset of PUSH AX; MOV AX,FF01; INT 31h
-            dbg_println!("  0306 raw switch rm->pm={:04x}:{:04x} pm->rm={:04x}:{:#x}", vm86::STUB_SEG, 0x0021u16, stub_sel, 0x0523u16);
             clear_carry(regs);
         }
         // AX=FF00h — Private: exception handler return
@@ -1240,7 +1148,6 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             // Allocate virtual range from DPMI linear memory pool
             let base = dpmi.mem_next;
             dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
-            crate::dbg_println!("DPMI 0800h: phys={:#x} size={:#x} → virt={:#x}", phys, size, base);
             // Map physical pages at the allocated virtual address via ring-0 arch call
             let num_pages = aligned as usize / 4096;
             let vpage_start = base as usize / 4096;
@@ -1363,9 +1270,6 @@ fn reflect_int_to_real_mode(thread: &mut thread::Thread, regs: &mut Regs, vector
     let rm_fs = (seg_base(dpmi, regs.fs as u16) >> 4) as u16;
     let rm_gs = (seg_base(dpmi, regs.gs as u16) >> 4) as u16;
 
-    crate::dbg_println!("DPMI reflect INT {:#04x} AX={:04x} BX={:04x} CX={:04x} DX={:04x} DS={:04x}->{:04x} ES={:04x}->{:04x}",
-        vector, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-        regs.ds as u16, rm_ds, regs.es as u16, rm_es);
 
     // Save protected-mode state (rm_struct_addr=0 signals implicit reflection)
     dpmi.rm_save = Some(SavedPmState {
@@ -1457,16 +1361,6 @@ fn call_real_mode_proc(thread: &mut thread::Thread, regs: &mut Regs, cs_32: bool
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
     regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
-    crate::dbg_println!(
-        "  0302 handoff flags={:#x} vm={} CS={:04x} SS={:04x} DS={:04x} ES={:04x}",
-        regs.flags(),
-        (regs.flags() >> 17) & 1,
-        regs.code_seg(),
-        regs.stack_seg(),
-        regs.ds as u16,
-        regs.es as u16,
-    );
-
     None
 }
 
@@ -1475,13 +1369,7 @@ fn call_real_mode_proc_iret(thread: &mut thread::Thread, regs: &mut Regs, cs_32:
     let dpmi = thread.dpmi.as_mut().unwrap();
 
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
-    crate::dbg_println!("  0302 ES={:#06x} EDI={:#x} cs_32={} flat={:#x}",
-        regs.es as u16, regs.rdi as u32, cs_32, struct_addr);
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
-    let rm_cs_v = rm.cs; let rm_ip_v = rm.ip; let rm_ss_v = rm.ss; let rm_sp_v = rm.sp;
-    let rm_ds_v = rm.ds; let rm_es_v = rm.es; let rm_ax_v = rm.eax as u16;
-    crate::dbg_println!("  0302 rm CS:IP={:04x}:{:04x} SS:SP={:04x}:{:04x} DS={:04x} ES={:04x} AX={:04x}",
-        rm_cs_v, rm_ip_v, rm_ss_v, rm_sp_v, rm_ds_v, rm_es_v, rm_ax_v);
 
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
@@ -1544,7 +1432,7 @@ pub fn callback_entry(thread: &mut thread::Thread, regs: &mut Regs, cb_idx: usiz
         }
     };
 
-    crate::dbg_println!("DPMI: callback {} entry, handler={:04x}:{:#x}", cb_idx, pm_cs, pm_eip);
+
 
     // Save current real-mode regs into the register structure
     let struct_addr = seg_base(dpmi, rm_struct_sel).wrapping_add(rm_struct_off);
@@ -1629,12 +1517,6 @@ pub fn callback_return(thread: &mut thread::Thread, regs: &mut Regs) {
             sp: regs.sp32() as u16,
             ss: regs.stack_seg(),
         };
-        { let (a,b,c,d,si,di,ds,es) = (rm_struct.eax as u16, rm_struct.ebx as u16,
-            rm_struct.ecx as u16, rm_struct.edx as u16,
-            rm_struct.esi as u16, rm_struct.edi as u16,
-            rm_struct.ds, rm_struct.es);
-          crate::dbg_println!("  cb_ret struct@{:#x} AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
-            saved.rm_struct_addr, a, b, c, d, si, di, ds, es); }
         unsafe { *(saved.rm_struct_addr as *mut RmCallStruct) = rm_struct; }
     } else {
         // Implicit INT reflection — propagate real-mode register results
@@ -1653,10 +1535,6 @@ pub fn callback_return(thread: &mut thread::Thread, regs: &mut Regs) {
     }
 
     // Restore protected-mode state
-    crate::dbg_println!("  cb_ret pm AX={:04x} BX={:04x} CX={:04x} DX={:04x} CS:EIP={:04x}:{:#x}",
-        saved.regs.rax as u16, saved.regs.rbx as u16,
-        saved.regs.rcx as u16, saved.regs.rdx as u16,
-        saved.regs.code_seg(), saved.regs.ip32());
     *regs = saved.regs;
     trace_client_selector_leak("callback_return.restore", regs);
 
@@ -1704,12 +1582,6 @@ pub fn deliver_hw_irq(thread: &mut thread::Thread, regs: &mut Regs, vector: u8) 
         core::ptr::write_unaligned(base, regs.ip32());
         core::ptr::write_unaligned(base.add(1), regs.code_seg() as u32);
         core::ptr::write_unaligned(base.add(2), regs.flags32());
-        let rb0 = core::ptr::read_unaligned(base);
-        let rb1 = core::ptr::read_unaligned(base.add(1));
-        if rb0 != regs.ip32() || rb1 != regs.code_seg() as u32 {
-            crate::println!("dHWirq WRITE FAILED at {:#x}: wrote {:#x}/{:#x} read {:#x}/{:#x}",
-                lin, regs.ip32(), regs.code_seg(), rb0, rb1);
-        }
     }
 
     regs.set_cs32(sel as u32);
@@ -1791,47 +1663,6 @@ pub fn dispatch_dpmi_exception(thread: &mut thread::Thread, regs: &mut Regs, exc
     push32(&mut sp, stub_sel as u32);              // return CS
     push32(&mut sp, 0x052A);                       // return EIP
 
-    // Dump faulting instruction bytes
-    let fault_cs_base = seg_base(dpmi, regs.frame.cs as u16);
-    let fault_flat = fault_cs_base.wrapping_add(regs.ip32());
-    let fault_bytes: [u8; 8] = unsafe { core::ptr::read(fault_flat as *const [u8; 8]) };
-    let opcode = fault_bytes[0];
-    let handler_base = seg_base(dpmi, handler_sel);
-    let handler_flat = handler_base.wrapping_add(handler_off);
-    let handler_bytes: [u8; 64] = unsafe { core::ptr::read(handler_flat as *const [u8; 64]) };
-    dbg_println!("DPMI exc {} → handler {:04x}:{:#x} from {:04x}:{:#x} err={:#x} op={:#04x} bytes={:02x?}",
-        exc_num, handler_sel, handler_off, regs.frame.cs as u16, regs.ip32(), regs.err_code, opcode, fault_bytes);
-    dbg_println!(
-        "  regs: AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} BP={:04x} SP={:04x}",
-        regs.rax as u16,
-        regs.rbx as u16,
-        regs.rcx as u16,
-        regs.rdx as u16,
-        regs.rsi as u16,
-        regs.rdi as u16,
-        regs.rbp as u16,
-        regs.sp32() as u16,
-    );
-    dbg_println!(
-        "  segs: CS={:04x} IP={:04x} SS={:04x} SP32={:#x} DS={:04x} ES={:04x} FS={:04x} GS={:04x} FL={:#x}",
-        regs.frame.cs as u16,
-        regs.ip32() as u16,
-        regs.frame.ss as u16,
-        regs.sp32(),
-        regs.ds as u16,
-        regs.es as u16,
-        regs.fs as u16,
-        regs.gs as u16,
-        regs.flags32(),
-    );
-    for i in 0..4 {
-        dbg_println!("  handler+{:02x}: {:02x?}", i * 16, &handler_bytes[i * 16..(i + 1) * 16]);
-    }
-    trace_client_selector_leak("dispatch_dpmi_exception.in", regs);
-    if (regs.ds as u16) == 0x20 || (regs.es as u16) == 0x20 {
-        dump_ldt(dpmi, "dispatch_dpmi_exception.in");
-    }
-
     // Set up regs to call the exception handler
     if ss_32 {
         regs.set_sp32(sp);
@@ -1840,15 +1671,6 @@ pub fn dispatch_dpmi_exception(thread: &mut thread::Thread, regs: &mut Regs, exc
     }
     regs.frame.cs = handler_sel as u64;
     regs.set_ip32(handler_off);
-
-    dbg_println!("  frame: CS={:#x} EIP={:#x} FL={:#x} SS={:#x} ESP={:#x}",
-        regs.frame.cs, regs.frame.rip, regs.frame.rflags, regs.frame.ss, regs.frame.rsp);
-    dbg_println!("  DS={:#x} ES={:#x} FS={:#x} GS={:#x}",
-        regs.ds, regs.es, regs.fs, regs.gs);
-    trace_client_selector_leak("dispatch_dpmi_exception.out", regs);
-    if (regs.ds as u16) == 0x20 || (regs.es as u16) == 0x20 {
-        dump_ldt(dpmi, "dispatch_dpmi_exception.out");
-    }
 
     None
 }
@@ -1886,20 +1708,12 @@ fn exception_return(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
         val
     };
 
-    dbg_println!("exc_ret: ss_base={:#x} ss={:#x} sp={:#x}", ss_base, regs.stack_seg(), sp);
-    // Dump raw bytes at the exception frame
-    let frame_bytes: [u8; 24] = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const [u8; 24]) };
-    dbg_println!("exc_ret frame: {:02x?}", frame_bytes);
-
     let _error_code = pop32(&mut sp);
     let new_eip = pop32(&mut sp);
     let new_cs = pop32(&mut sp) as u16;
     let new_eflags = pop32(&mut sp);
     let new_esp = pop32(&mut sp);
     let new_ss = pop32(&mut sp) as u16;
-
-    dbg_println!("exc_ret: err={:#x} eip={:#x} cs={:#x} efl={:#x} esp={:#x} ss={:#x}",
-        _error_code, new_eip, new_cs, new_eflags, new_esp, new_ss);
 
     regs.frame.cs = new_cs as u64;
     regs.set_ip32(new_eip);
@@ -1929,21 +1743,6 @@ fn exception_return(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
 ///   DI = new real-mode IP
 fn raw_switch_pm_to_real(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize> {
     let dpmi = thread.dpmi.as_ref().unwrap();
-    crate::dbg_println!(
-        "Raw PM→real in: AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} CS:IP={:04x}:{:04x} SS:SP={:04x}:{:04x} DS={:04x} ES={:04x}",
-        regs.rax as u16,
-        regs.rbx as u16,
-        regs.rcx as u16,
-        regs.rdx as u16,
-        regs.rsi as u16,
-        regs.rdi as u16,
-        regs.code_seg(),
-        regs.ip32() as u16,
-        regs.stack_seg(),
-        regs.sp32() as u16,
-        regs.ds as u16,
-        regs.es as u16,
-    );
 
     // Read saved AX (new DS) from user stack — stub did PUSH AX before INT 31h
     let ss_base = seg_base(dpmi, regs.stack_seg());
@@ -1954,9 +1753,6 @@ fn raw_switch_pm_to_real(thread: &mut thread::Thread, regs: &mut Regs) -> Option
     let new_sp = regs.rbx as u16;
     let new_cs = regs.rsi as u16;
     let new_ip = regs.rdi as u16;
-
-    dbg_println!("Raw PM→real: CS:IP={:04x}:{:04x} SS:SP={:04x}:{:04x} DS={:04x} ES={:04x}",
-        new_cs, new_ip, new_ss, new_sp, new_ds, new_es);
 
     // Set VM86 mode
     const VM_FLAG: u64 = 1 << 17;
@@ -1971,23 +1767,6 @@ fn raw_switch_pm_to_real(thread: &mut thread::Thread, regs: &mut Regs) -> Option
     regs.es = new_es as u64;
     regs.fs = 0;
     regs.gs = 0;
-    crate::dbg_println!(
-        "Raw PM→real out: AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} CS:IP={:04x}:{:04x} SS:SP={:04x}:{:04x} DS={:04x} ES={:04x} FLAGS={:#x}",
-        regs.rax as u16,
-        regs.rbx as u16,
-        regs.rcx as u16,
-        regs.rdx as u16,
-        regs.rsi as u16,
-        regs.rdi as u16,
-        regs.code_seg(),
-        regs.ip32() as u16,
-        regs.stack_seg(),
-        regs.sp32() as u16,
-        regs.ds as u16,
-        regs.es as u16,
-        regs.flags(),
-    );
-    trace_client_selector_leak("raw_switch_pm_to_real.out", regs);
     None
 }
 
@@ -2009,9 +1788,6 @@ pub fn raw_switch_real_to_pm(thread: &mut thread::Thread, regs: &mut Regs) {
     let new_esp = regs.rbx as u32;
     let new_cs = regs.rsi as u16;
     let new_eip = regs.rdi as u32;
-
-    dbg_println!("Raw real→PM: CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x} DS={:04x} ES={:04x}",
-        new_cs, new_eip, new_ss, new_esp, new_ds, new_es);
 
     // Clear VM flag, enter protected mode
     const VM_FLAG: u64 = 1 << 17;
@@ -2071,69 +1847,7 @@ fn flat_addr(dpmi: &DpmiState, seg: u16, offset: u32, cs_32: bool) -> u32 {
     seg_base(dpmi, seg).wrapping_add(offset)
 }
 
-fn dump_ldt(dpmi: &DpmiState, tag: &str) {
-    dbg_println!("LDT dump [{}]:", tag);
-    for idx in 0..16 {
-        let desc = dpmi.ldt[idx];
-        if desc != 0 {
-            dbg_println!(
-                "  idx={} sel={:#06x} desc={:#018x} base={:#x} lim={:#x} 32={} code={}",
-                idx,
-                DpmiState::idx_to_sel(idx),
-                desc,
-                DpmiState::desc_base(desc),
-                DpmiState::desc_limit(desc),
-                DpmiState::desc_is_32(desc),
-                (desc >> 43) & 1 != 0,
-            );
-        }
-    }
-}
-
-fn trace_client_selector_leak(label: &str, regs: &Regs) {
-    let ds = regs.ds as u16;
-    let es = regs.es as u16;
-    let fs = regs.fs as u16;
-    let gs = regs.gs as u16;
-    let cs = regs.code_seg();
-    let ss = regs.stack_seg();
-
-    if !(is_flat_user_gdt(ds)
-        || is_flat_user_gdt(es)
-        || is_flat_user_gdt(fs)
-        || is_flat_user_gdt(gs)
-        || is_flat_user_gdt(cs)
-        || is_flat_user_gdt(ss))
-    {
-        return;
-    }
-
-    dbg_println!(
-        "DPMI selector leak [{}]: AX={:04x} BX={:04x} CX={:04x} DX={:04x} CS:IP={:04x}:{:x} SS:SP={:04x}:{:x} DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
-        label,
-        regs.rax as u16,
-        regs.rbx as u16,
-        regs.rcx as u16,
-        regs.rdx as u16,
-        cs,
-        regs.ip32(),
-        ss,
-        regs.sp32(),
-        ds,
-        es,
-        fs,
-        gs,
-    );
-}
-
-fn is_flat_user_gdt(sel: u16) -> bool {
-    matches!(
-        sel & !3,
-        x if x == (crate::arch::descriptors::USER_CS & !3)
-            || x == (crate::arch::descriptors::USER_DS & !3)
-            || x == (crate::arch::descriptors::USER_CS64 & !3)
-    )
-}
+fn trace_client_selector_leak(_label: &str, _regs: &Regs) {}
 
 fn set_carry(regs: &mut Regs) {
     regs.set_flag32(1); // CF
