@@ -455,6 +455,17 @@ pub fn close(fd: i32) -> i32 {
     0
 }
 
+/// Get the size of an open file descriptor. Returns 0 on error.
+pub fn file_size(fd: i32) -> u32 {
+    let fds = &crate::kernel::thread::current().fds;
+    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 { return 0; }
+    let table_idx = fds[fd as usize];
+    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 { return 0; }
+    let entry = unsafe { &FILE_TABLE[table_idx as usize] };
+    if entry.refcount == 0 { return 0; }
+    entry.vnode.size
+}
+
 /// Seek on an open file descriptor.
 /// whence: 0=SET, 1=CUR, 2=END
 /// Returns new offset or negative error.

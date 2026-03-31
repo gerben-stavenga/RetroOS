@@ -205,27 +205,12 @@ fn event_loop(first_tid: usize) -> ! {
         let regs = unsafe { &mut *(&raw mut REGS) };
         drain_pending_irqs(thread, regs);
 
-        // Trace: check VM86 frame before entering user mode
-        if regs.mode() == crate::UserMode::VM86 {
-            if thread.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some()) {
-                let ss = regs.frame.ss as u32;
-                let sp = regs.frame.rsp as u16;
-                let lin = ss * 16 + sp as u32;
-                let w0 = unsafe { *((lin) as *const u16) };
-                let w1 = unsafe { *((lin + 2) as *const u16) };
-                let w2 = unsafe { *((lin + 4) as *const u16) };
-                crate::dbg_println!("VM86 enter CS:IP={:04x}:{:04x} SS:SP={:04x}:{:04x} stack=[{:04x} {:04x} {:04x}]",
-                    regs.frame.cs as u16, regs.frame.rip as u16,
-                    ss as u16, sp, w0, w1, w2);
-            }
-        }
-
         let (event, extra) = do_arch_execute();
 
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let regs = unsafe { &mut *(&raw mut REGS) };
 
-        // Debug: log non-routine events
+        // Debug: log non-routine DPMI events
         if !(32..=47).contains(&event) {
             if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() && event != 0x31 {
                 crate::dbg_println!("DPMI ev={:#x} CS:EIP={:#06x}:{:#x} SP={:#x}",
@@ -253,6 +238,10 @@ fn event_loop(first_tid: usize) -> ! {
             // dispatch to client exception handler
             0..=31 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
                 crate::kernel::dpmi::dispatch_dpmi_exception(thread, regs, event)
+            }
+            // DPMI software INTs (0x30-0xFF have DPL=3, arrive as direct events)
+            0x30..=0xFF if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
+                crate::kernel::dpmi::dpmi_soft_int(thread, regs, event as u8)
             }
             _ if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
                 crate::println!("DPMI: unexpected event {} at CS:EIP={:#06x}:{:#x}",
@@ -304,6 +293,43 @@ fn drain_pending_irqs(thread: &mut thread::Thread, regs: &mut crate::Regs) {
         });
         // Flush: try to deliver pending interrupts blocked by ISR in previous iterations.
         crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, None);
+    } else if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() {
+        // DPMI protected-mode: queue into vpic/vkbd (same devices as VM86),
+        // then deliver via PM interrupt vectors instead of IVT.
+        let tp = thread as *mut thread::Thread;
+        let ticks = crate::arch::irq::take_pending_ticks();
+        for _ in 0..ticks {
+            let due = unsafe { &mut *tp }.vm86.vpit.take_pending_irqs();
+            for _ in 0..due {
+                unsafe { &mut *tp }.vm86.vpic.push(0x08);
+            }
+        }
+        crate::arch::irq::drain(|evt| {
+            let t = unsafe { &mut *tp };
+            match evt {
+                crate::arch::irq::Irq::Key(sc) => {
+                    t.vm86.vkbd.push(sc);
+                    if t.vm86.vpic.isr & 0x02 == 0 && !t.vm86.vpic.has_pending_vec(0x09) {
+                        t.vm86.vpic.push(0x09);
+                    }
+                }
+                crate::arch::irq::Irq::Tick => {
+                    t.vm86.vpic.push(0x08);
+                }
+            }
+        });
+        // Deliver one pending interrupt (same ISR/EOI discipline as VM86)
+        // Also respect VIF: don't deliver while client has virtual interrupts disabled
+        // (prevents delivery between EOI and IRET in handler)
+        let t = unsafe { &mut *tp };
+        let vif = t.dpmi.as_ref().map_or(true, |d| d.vif);
+        if t.vm86.vpic.isr == 0 && vif {
+            if let Some(vec) = t.vm86.vpic.pop() {
+                // Clear VIF before entering handler (DPMI spec)
+                t.dpmi.as_mut().unwrap().vif = false;
+                crate::kernel::dpmi::deliver_hw_irq(t, regs, vec);
+            }
+        }
     } else {
         crate::arch::irq::drain(|evt| {
             if let crate::arch::irq::Irq::Key(sc) = evt {
@@ -515,6 +541,19 @@ pub fn arch_load_ldt(base: u32, limit: u32) {
             in("eax") crate::arch::traps::arch_call::LOAD_LDT as u32,
             in("edx") base,
             in("ecx") limit,
+        );
+    }
+}
+
+/// Map a range of physical pages into user virtual space.
+pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::traps::arch_call::MAP_PHYS_RANGE as u32,
+            in("edx") vpage_start as u32,
+            in("ecx") num_pages as u32,
+            in("ebx") ppage_start as u32,
         );
     }
 }

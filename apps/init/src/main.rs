@@ -11,10 +11,10 @@ pub fn main(_args: &[&str]) {
 
     let pid = crt::fork();
     if pid == 0 {
-        crt::exec("DOOM/DOOM.EXE", &["DOOM/DOOM.EXE"]);
+        crt::exec("NC.EXE", &["NC.EXE"]);
         crt::exit(1);
     }
     crt::waitpid(pid);
-    crt::print("init: DOOM exited\n");
+    crt::print("init: child exited\n");
     loop { crt::yield_cpu(); }
 }

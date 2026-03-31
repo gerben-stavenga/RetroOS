@@ -73,13 +73,14 @@ impl<const N: usize> AlignedStack<N> {
     }
 }
 
-/// Kernel stack - 128KB (used for Ring 1 event loop)
-pub static mut KERNEL_STACK: AlignedStack<{ 128 * 1024 }> = AlignedStack::new();
+/// Kernel stack - 32KB (used for Ring 1 event loop)
+pub static mut KERNEL_STACK: AlignedStack<{ 32 * 1024 }> = AlignedStack::new();
 
 /// Ring-0 arch stack — used as TSS ESP0 so that interrupts from ring 1/3
-/// don't clobber the kernel's call frames.
+/// don't clobber the kernel's call frames.  Must be in .data (not BSS)
+/// so pages are physically backed even after fork marks BSS pages COW.
 #[unsafe(link_section = ".data")]
-pub static mut ARCH_STACK: AlignedStack<{ 128 * 1024 }> = AlignedStack::new();
+pub static mut ARCH_STACK: AlignedStack<{ 16 * 1024 }> = AlignedStack::new();
 
 // External assembly functions
 unsafe extern "C" {

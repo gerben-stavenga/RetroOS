@@ -247,6 +247,22 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
     use crate::kernel::vm86;
 
+    // Set CWD from the directory part of the program path.
+    // e.g. "QUAKE/QUAKE.EXE" → cwd = "QUAKE/"
+    {
+        let mut sep = 0;
+        let mut i = 0;
+        while i < prog_name.len() {
+            if prog_name[i] == b'/' || prog_name[i] == b'\\' {
+                sep = i + 1;
+            }
+            i += 1;
+        }
+        if sep > 0 {
+            thread::current().set_cwd(&prog_name[..sep]);
+        }
+    }
+
     // Free current user pages + map first 1MB for VM86
     startup::arch_user_clean();
     startup::arch_map_low_mem();

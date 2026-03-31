@@ -344,6 +344,22 @@ pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
     thread.vm86.heap_seg = rm_stack_seg.wrapping_add(0x10); // 256 bytes
     dpmi.rm_stack_seg = rm_stack_seg;
 
+    // Patch PSP environment segment to a PM selector.
+    // The PSP at offset 0x2C contains the real-mode environment segment (e.g. 0x0F00).
+    // DPMI clients read this via the PSP selector and expect a PM selector, not a
+    // raw segment. Allocate an LDT entry mapping the environment block.
+    let env_seg = unsafe { *((psp_base + 0x2C) as *const u16) };
+    if env_seg != 0 {
+        let env_base = (env_seg as u32) * 16;
+        if let Some(idx) = dpmi.alloc_ldt() {
+            dpmi.ldt[idx] = DpmiState::make_data_desc_ex(env_base, 0xFFFF, false);
+            let env_sel = DpmiState::idx_to_sel(idx);
+            unsafe { *((psp_base + 0x2C) as *mut u16) = env_sel; }
+            dbg_println!("DPMI enter: env seg {:#06x} -> sel {:#06x} idx={} base={:#x}",
+                env_seg, env_sel, idx, env_base);
+        }
+    }
+
     // Store DPMI state on thread
     thread.dpmi = Some(Box::new(dpmi));
 
@@ -477,8 +493,8 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 let new_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
                 let new_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) } as u16;
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
-                crate::dbg_println!("IRET32 ss_base={:#x} sp={:#x} → EIP={:#010x} CS={:#06x} FL={:#010x}",
-                    ss_base, sp, new_eip, new_cs, new_flags);
+                crate::dbg_println!("IRET32 EIP={:#x} CS={:#x}",
+                    new_eip, new_cs);
                 set_sp(regs, sp.wrapping_add(12));
                 regs.set_ip32(new_eip);
                 regs.set_cs32(new_cs as u32);
@@ -616,6 +632,40 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
 }
 
 // ============================================================================
+// DPMI software INT dispatch (vectors 0x30-0xFF, DPL=3 in IDT)
+// ============================================================================
+
+/// Handle a software INT from DPMI protected mode that arrived as a direct
+/// IDT event (DPL=3 vectors). Dispatch to PM handler if installed, else
+/// reflect to real mode via IVT.
+pub fn dpmi_soft_int(thread: &mut thread::Thread, regs: &mut Regs, vector: u8) -> Option<usize> {
+    let dpmi = thread.dpmi.as_ref().unwrap();
+    let (sel, off) = dpmi.pm_vectors[vector as usize];
+    if sel != 0 {
+        // PM handler installed — push IRET frame and dispatch
+        let ss_sel = regs.frame.ss as u16;
+        let ss_base = seg_base(dpmi, ss_sel);
+        let ss_32 = seg_is_32(dpmi, ss_sel);
+        let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
+        let new_sp = sp.wrapping_sub(12);
+        if ss_32 { regs.set_sp32(new_sp); }
+        else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
+        unsafe {
+            let base = ss_base.wrapping_add(new_sp) as *mut u32;
+            core::ptr::write_unaligned(base, regs.ip32());
+            core::ptr::write_unaligned(base.add(1), regs.code_seg() as u32);
+            core::ptr::write_unaligned(base.add(2), regs.flags32());
+        }
+        regs.set_cs32(sel as u32);
+        regs.set_ip32(off);
+        None
+    } else {
+        // No PM handler — reflect to real mode
+        reflect_int_to_real_mode(thread, regs, vector)
+    }
+}
+
+// ============================================================================
 // INT 31h — DPMI services
 // ============================================================================
 
@@ -672,6 +722,12 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let sel = regs.rbx as u16;
             let idx = DpmiState::sel_to_idx(sel);
             dpmi.free_ldt(idx);
+            // Null out any segment register still holding the freed selector,
+            // otherwise IRET back to user mode will GP fault.
+            if regs.ds as u16 == sel { regs.ds = 0; }
+            if regs.es as u16 == sel { regs.es = 0; }
+            if regs.fs as u16 == sel { regs.fs = 0; }
+            if regs.gs as u16 == sel { regs.gs = 0; }
             clear_carry(regs);
         }
         // AX=0002h — Segment to Descriptor
@@ -972,10 +1028,10 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             regs.rax = (regs.rax & !0xFFFF) | 0x005A; // version 0.90
             regs.rbx = (regs.rbx & !0xFFFF) | 0x0005; // 32-bit, no virtual memory
             regs.rcx = (regs.rcx & !0xFF) | 0x03;     // 386 processor
-            regs.rdx = (regs.rdx & !0xFFFF) | 0x70_20; // DH=0x20 master PIC, DL=0x70 slave PIC — wait, reversed
-            // DH = master PIC base (IRQ 0 = INT 20h), DL = slave PIC base (IRQ 8 = INT 70h)
-            // Actually DPMI convention: DH = master PIC base vector, DL = slave PIC base vector
-            regs.rdx = (regs.rdx & !0xFFFF) | ((0x20 << 8) | 0x70) as u64;
+            // DH = master PIC base vector, DL = slave PIC base vector
+            // Report 0x08/0x70 (matching real-mode BIOS mapping) so DJGPP hooks
+            // IRQ 1 as INT 9 (keyboard), IRQ 0 as INT 8 (timer), etc.
+            regs.rdx = (regs.rdx & !0xFFFF) | ((0x08 << 8) | 0x70) as u64;
             clear_carry(regs);
         }
         // AX=0500h — Get Free Memory Information
@@ -1051,15 +1107,20 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         0x0503 => {
             let new_size = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
-            // Simple approach: allocate new block (old memory is demand-paged anyway)
             let aligned = (new_size + 0xFFF) & !0xFFF;
-            let base = dpmi.mem_next;
-            dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
-            // Remove old block, add new
+            // Grow in place — all memory is demand-paged so we just update the size.
+            // This preserves existing data (pages already faulted in stay mapped).
+            let mut base = handle;
             for slot in dpmi.mem_blocks.iter_mut() {
                 if let Some(blk) = slot {
                     if blk.base == handle {
-                        *slot = Some(MemBlock { base, size: aligned });
+                        // Ensure mem_next covers the grown region
+                        let end = blk.base.wrapping_add(aligned);
+                        if end > dpmi.mem_next {
+                            dpmi.mem_next = end;
+                        }
+                        blk.size = aligned;
+                        base = blk.base;
                         break;
                     }
                 }
@@ -1146,6 +1207,43 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         0x0507 => {
             clear_carry(regs);
         }
+        // AX=0E00h — Get Coprocessor Status
+        // AX=0E01h — Set Coprocessor Emulation
+        // FPU is always available and not emulated.
+        0x0E00 => {
+            regs.rax = (regs.rax & !0xFFFF) | 0x0E00;
+            // BX: bit 0 = MPv (FPU exists), bits 4-7 = FPU type (4=487SX+)
+            regs.rbx = (regs.rbx & !0xFFFF) | 0x0041;
+            clear_carry(regs);
+        }
+        0x0E01 => {
+            clear_carry(regs);
+        }
+        // AX=0800h — Physical Address Mapping
+        // BX:CX = physical address, SI:DI = size
+        // Returns BX:CX = linear address
+        0x0800 => {
+            let phys = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
+            let size = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
+            let aligned = (size + 0xFFF) & !0xFFF;
+            // Allocate virtual range from DPMI linear memory pool
+            let base = dpmi.mem_next;
+            dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
+            crate::dbg_println!("DPMI 0800h: phys={:#x} size={:#x} → virt={:#x}", phys, size, base);
+            // Map physical pages at the allocated virtual address via ring-0 arch call
+            let num_pages = aligned as usize / 4096;
+            let vpage_start = base as usize / 4096;
+            let ppage_start = phys as u64 / 4096;
+            crate::kernel::startup::arch_map_phys_range(vpage_start, num_pages, ppage_start);
+            // Return linear address
+            regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
+            regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);
+            clear_carry(regs);
+        }
+        // AX=0801h — Free Physical Address Mapping (no-op, we don't track)
+        0x0801 => {
+            clear_carry(regs);
+        }
         _ => {
             panic!("DPMI: unhandled INT 31h AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
                 ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -1197,22 +1295,6 @@ fn simulate_real_mode_int(thread: &mut thread::Thread, regs: &mut Regs, cs_32: b
     // Get IVT entry for the interrupt
     let ivt_off = vm86::read_u16(0, (int_num as u32) * 4);
     let ivt_seg = vm86::read_u16(0, (int_num as u32) * 4 + 2);
-
-    // Diagnostic: check if IVT still points to our stub
-    if ivt_seg != vm86::STUB_SEG || ivt_off < 0x0008 || ivt_off > 0x0020 {
-        crate::println!("WARN: IVT[{:#04x}] = {:04X}:{:04X} (expected 0050:xxxx)",
-            int_num, ivt_seg, ivt_off);
-        // Dump IVT bytes at the entry
-        let lin = (int_num as u32) * 4;
-        let b0 = unsafe { *(lin as *const u8) };
-        let b1 = unsafe { *((lin+1) as *const u8) };
-        let b2 = unsafe { *((lin+2) as *const u8) };
-        let b3 = unsafe { *((lin+3) as *const u8) };
-        crate::println!("  IVT bytes at {:#x}: [{:02x} {:02x} {:02x} {:02x}]", lin, b0, b1, b2, b3);
-        // Also dump struct SS:SP
-        let (ax, ss, sp) = (rm.eax as u16, rm.ss, rm.sp);
-        crate::println!("  rm struct: AX={:04x} SS={:04x} SP={:04x}", ax, ss, sp);
-    }
 
     // Use SS:SP from structure if provided, else use our dedicated RM stack.
     // The default must NOT overlap the client's data area (COM_SEGMENT is unsafe).
@@ -1575,6 +1657,56 @@ pub fn callback_return(thread: &mut thread::Thread, regs: &mut Regs) {
 }
 
 // ============================================================================
+// DPMI hardware IRQ delivery to protected-mode handlers
+// ============================================================================
+
+/// Deliver a hardware interrupt to the DPMI client's PM interrupt handler.
+/// `vector` is the interrupt vector number (e.g. 0x09 for keyboard, 0x08 for timer).
+/// Pushes an IRET frame on the client stack and redirects CS:EIP.
+/// Returns true if delivered, false if no handler installed.
+pub fn deliver_hw_irq(thread: &mut thread::Thread, regs: &mut Regs, vector: u8) -> bool {
+    let dpmi = match thread.dpmi.as_ref() {
+        Some(d) => d,
+        None => return false,
+    };
+
+    let (sel, off) = dpmi.pm_vectors[vector as usize];
+    if sel == 0 {
+        return false;
+    }
+
+    let ss_sel = regs.frame.ss as u16;
+    let ss_base = seg_base(dpmi, ss_sel);
+    let ss_32 = seg_is_32(dpmi, ss_sel);
+
+    // Push 32-bit IRET frame: EFLAGS, CS, EIP
+    let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
+    let new_sp = sp.wrapping_sub(12);
+    if ss_32 {
+        regs.set_sp32(new_sp);
+    } else {
+        regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF));
+    }
+    unsafe {
+        let base = ss_base.wrapping_add(new_sp) as *mut u32;
+        core::ptr::write_unaligned(base, regs.ip32());
+        core::ptr::write_unaligned(base.add(1), regs.code_seg() as u32);
+        core::ptr::write_unaligned(base.add(2), regs.flags32());
+    }
+
+    regs.set_cs32(sel as u32);
+    regs.set_ip32(off);
+
+    // Set ISR bit so vpic won't deliver another interrupt until EOI
+    let irq_num = vector.wrapping_sub(8);
+    if irq_num < 8 {
+        thread.vm86.vpic.isr |= 1 << irq_num;
+    }
+
+    true
+}
+
+// ============================================================================
 // DPMI exception dispatch — route CPU exceptions to client handlers
 // ============================================================================
 
@@ -1893,7 +2025,7 @@ pub fn raw_switch_real_to_pm(thread: &mut thread::Thread, regs: &mut Regs) {
 
 /// Get the base address for any selector (GDT or LDT).
 /// GDT selectors (TI=0) are flat (base=0).
-fn seg_base(dpmi: &DpmiState, sel: u16) -> u32 {
+pub fn seg_base(dpmi: &DpmiState, sel: u16) -> u32 {
     if sel & 4 != 0 {
         // LDT selector (TI=1)
         let idx = (sel >> 3) as usize;

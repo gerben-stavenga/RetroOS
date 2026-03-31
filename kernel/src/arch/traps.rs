@@ -55,6 +55,7 @@ pub mod arch_call {
     pub const ACTIVATE_ROOT: u64 = 0x113; // EDX=ptr to RootPageTable
     pub const FLUSH_TLB: u64 = 0x114;    // Sync PDPT + re-write CR3
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
+    pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start, ECX=num_pages, EBX=ppage_start
 }
 
 fn arch_dispatch(regs: &mut Regs) {
@@ -125,6 +126,14 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::FLUSH_TLB => paging2::flush_tlb(),
         arch_call::LOAD_LDT => {
             crate::arch::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
+        }
+        arch_call::MAP_PHYS_RANGE => {
+            let vpage_start = regs.rdx as usize;
+            let num_pages = regs.rcx as usize;
+            let ppage_start = regs.rbx as u64;
+            for i in 0..num_pages {
+                paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64);
+            }
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }

@@ -25,6 +25,10 @@ const VM_FLAG: u32 = 1 << 17;
 const VIF_FLAG: u32 = 1 << 19;
 const EMS_ENABLED: bool = false;
 
+/// Dummy file handle returned by INT 21h/3Ch (Create file) on our read-only FS.
+/// Writes to this handle are silently discarded (/dev/null semantics).
+const NULL_FILE_HANDLE: u16 = 99;
+
 /// Flags that VM86 code cannot change (IOPL, VM)
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
 
@@ -344,7 +348,7 @@ impl VirtualPit {
         self.ch0.set_command(rw_mode, (val >> 1) & 0x07);
     }
 
-    fn take_pending_irqs(&mut self) -> u32 {
+    pub fn take_pending_irqs(&mut self) -> u32 {
         self.sync();
         self.ch0.take_irqs(self.input_cycles)
     }
@@ -1650,8 +1654,8 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x09: Display $-terminated string at DS:DX
         0x09 => {
-            let ds = regs.ds as u32;
-            let dx = regs.rdx as u32;
+            let ds = regs.ds as u16 as u32;
+            let dx = regs.rdx as u16 as u32;
             let mut addr = (ds << 4) + dx;
             loop {
                 let ch = unsafe { *(addr as *const u8) };
@@ -1685,9 +1689,14 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x47: Get current directory (DL=drive, DS:SI=64-byte buffer)
         // Returns ASCIIZ path without drive letter or leading backslash
         0x47 => {
-            let si = regs.rsi as u32;
-            let addr = ((regs.ds as u32) << 4) + si;
+            let si = regs.rsi as u16 as u32;
+            let addr = ((regs.ds as u16 as u32) << 4) + si;
             let cwd = thread::current().cwd_str();
+            if crate::kernel::thread::current().dpmi.is_some() {
+                crate::dbg_println!("DOS 47h getcwd DS:SI={:04x}:{:04x} lin={:#x} cwd={:?}",
+                    regs.ds as u16, si, addr,
+                    core::str::from_utf8(cwd).unwrap_or("?"));
+            }
             unsafe {
                 let mut pos = 0;
                 for &b in cwd {
@@ -1726,7 +1735,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x1A: Set DTA (Disk Transfer Area) address to DS:DX
         0x1A => {
             // Store DTA address — NC needs this for FindFirst/FindNext
-            let dta = ((regs.ds as u32) << 4) + regs.rdx as u32;
+            let dta = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
             thread::current().vm86.dta = dta;
             Action::Done
         }
@@ -1760,7 +1769,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         // Many programs (including NC 2.0) allocate only 32 bytes, so write
         // field-by-field rather than blindly zeroing 34 bytes.
         0x38 => {
-            let addr = ((regs.ds as u32) << 4) + regs.rdx as u32;
+            let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
             unsafe {
                 let p = addr as *mut u8;
                 core::ptr::write_bytes(p, 0, 24); // zero first 24 bytes (through case-map)
@@ -1782,7 +1791,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x3B: Change directory (DS:DX=ASCIIZ path)
         0x3B => {
-            let addr = ((regs.ds as u32) << 4) + regs.rdx as u32;
+            let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
             let mut path = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -1802,8 +1811,8 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x3D: Open file (DS:DX=ASCIIZ filename, AL=access mode)
         0x3D => {
-            let ds = regs.ds as u32;
-            let dx = regs.rdx as u32;
+            let ds = regs.ds as u16 as u32;
+            let dx = regs.rdx as u16 as u32;
             let mut addr = (ds << 4) + dx;
             let mut name = [0u8; 64];
             let mut i = 0;
@@ -1821,9 +1830,27 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 let fd = crate::kernel::vfs::open(&name[..i]);
                 if fd >= 0 {
+                    if crate::kernel::thread::current().dpmi.is_some() {
+                        crate::dbg_println!("DOS 3Dh OK DS:DX={:04x}:{:04x} fd={} name={}",
+                            ds, dx, fd, core::str::from_utf8(&name[..i]).unwrap_or("?"));
+                    }
+                    // Populate SFT entry and PSP JFT for this handle
+                    let size = crate::kernel::vfs::file_size(fd);
+                    sft_set_file(fd as u16, size);
+                    unsafe {
+                        let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
+                        if (fd as usize) < 20 { *psp.add(0x34 + fd as usize) = fd as u8; }
+                    }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
+                    if crate::kernel::thread::current().dpmi.is_some() {
+                        let lin = (ds << 4) + dx;
+                        let hex: [u8; 32] = unsafe { core::ptr::read(lin as *const [u8; 32]) };
+                        crate::dbg_println!("DOS 3Dh FAIL DS:DX={:04x}:{:04x} lin={:#x} hex={:02x?} name={}",
+                            ds, dx, lin, hex,
+                            core::str::from_utf8(&name[..i]).unwrap_or("?"));
+                    }
                     regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
                     regs.set_flag32(1); // set carry
                 }
@@ -1833,23 +1860,28 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
             let handle = regs.rbx as u16;
-            if !EMS_ENABLED || handle != EMS_DEVICE_HANDLE {
+            if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
                 crate::kernel::vfs::close(handle as i32);
+                sft_clear(handle);
             }
             regs.clear_flag32(1);
             Action::Done
         }
         // AH=0x3F: Read from file (BX=handle, CX=count, DS:DX=buffer)
         0x3F => {
-            let handle = regs.rbx as i32;
-            let count = regs.rcx as usize;
-            let buf_addr = ((regs.ds as u32) << 4) + regs.rdx as u32;
+            let handle = regs.rbx as u16 as i32;
+            let count = regs.rcx as u16 as usize;
+            let buf_addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
             if handle == 0 {
                 // stdin — read from virtual keyboard
                 // Return 0 for now (no line-buffered stdin in VM86)
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else if handle == 1 || handle == 2 {
+                regs.rax = regs.rax & !0xFFFF;
+                regs.clear_flag32(1);
+            } else if handle == NULL_FILE_HANDLE as i32 {
+                // /dev/null — return 0 bytes (EOF)
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else {
@@ -1867,8 +1899,8 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x4E: Find first matching file (CX=attr, DS:DX=filespec)
         0x4E => {
-            let ds = regs.ds as u32;
-            let dx = regs.rdx as u32;
+            let ds = regs.ds as u16 as u32;
+            let dx = regs.rdx as u16 as u32;
             let mut addr = (ds << 4) + dx;
             let mut pat = [0u8; 64];
             let mut pat_len = 0;
@@ -1999,10 +2031,10 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.rax = (regs.rax & !0xFF) | 3; // AL = number of logical drives
             Action::Done
         }
-        // AH=0x3C: Create file
+        // AH=0x3C: Create file — read-only FS, return /dev/null handle
         0x3C => {
-            regs.rax = (regs.rax & !0xFFFF) | 5; // error 5 = access denied
-            regs.set_flag32(1);
+            regs.rax = (regs.rax & !0xFFFF) | NULL_FILE_HANDLE as u64;
+            regs.clear_flag32(1);
             Action::Done
         }
         // AH=0x40: Write to file (BX=handle, CX=count, DS:DX=buffer)
@@ -2011,11 +2043,14 @@ fn int_21h(regs: &mut Regs) -> Action {
             let count = regs.rcx as u16;
             // Handle 1=stdout, 2=stderr
             if handle == 1 || handle == 2 {
-                let addr = ((regs.ds as u32) << 4) + regs.rdx as u32;
+                let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
                 for i in 0..count as u32 {
                     let ch = unsafe { *((addr + i) as *const u8) };
                     vga::vga().putchar(ch);
                 }
+                regs.rax = (regs.rax & !0xFFFF) | count as u64;
+            } else if handle == NULL_FILE_HANDLE {
+                // /dev/null — silently discard, report all bytes written
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
@@ -2025,18 +2060,25 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x42: Seek (BX=handle, CX:DX=offset, AL=origin)
         0x42 => {
-            let handle = regs.rbx as i32;
-            let offset = ((regs.rcx as u32) << 16 | regs.rdx as u16 as u32) as i32;
-            let whence = regs.rax as u8 as i32; // AL = origin
-            let result = crate::kernel::vfs::seek(handle, offset, whence);
-            if result >= 0 {
-                // Return new position in DX:AX
-                regs.rdx = (regs.rdx & !0xFFFF) | ((result as u32 >> 16) as u64);
-                regs.rax = (regs.rax & !0xFFFF) | (result as u16 as u64);
+            let handle = regs.rbx as u16 as i32;
+            if handle == NULL_FILE_HANDLE as i32 {
+                // /dev/null — always at position 0
+                regs.rdx = regs.rdx & !0xFFFF;
+                regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else {
-                regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
-                regs.set_flag32(1);
+                let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
+                let whence = regs.rax as u8 as i32; // AL = origin
+                let result = crate::kernel::vfs::seek(handle, offset, whence);
+                if result >= 0 {
+                    // Return new position in DX:AX
+                    regs.rdx = (regs.rdx & !0xFFFF) | ((result as u32 >> 16) as u64);
+                    regs.rax = (regs.rax & !0xFFFF) | (result as u16 as u64);
+                    regs.clear_flag32(1);
+                } else {
+                    regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
+                    regs.set_flag32(1);
+                }
             }
             Action::Done
         }
@@ -2044,8 +2086,8 @@ fn int_21h(regs: &mut Regs) -> Action {
         // DS:DX = ASCIIZ filename, CX = attributes (for set)
         0x43 => {
             let al = regs.rax as u8;
-            let ds = regs.ds as u32;
-            let dx = regs.rdx as u32;
+            let ds = regs.ds as u16 as u32;
+            let dx = regs.rdx as u16 as u32;
             let mut addr = (ds << 4) + dx;
             let mut name = [0u8; 64];
             let mut i = 0;
@@ -2182,12 +2224,97 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.rdx = (regs.rdx & !0xFFFF) | (secs << 8) as u64 | centisecs as u64;
             Action::Done
         }
-        _ => {
-            dbg_println!("VM86: UNHANDLED INT 21h AH={:#04x} AX={:04X} from {:04x}:{:04x}",
-                ah, regs.rax as u16, vm86_cs(regs), vm86_ip(regs));
-            // Return success (clear carry) so unhandled calls don't break callers
+        // AH=0x57: Get/Set File Date and Time (AL=0: get, AL=1: set, BX=handle)
+        0x57 => {
+            let al = regs.rax as u8;
+            if al == 0 {
+                // Get: return a fixed date/time (2026-03-22 12:00:00)
+                // DOS time: bits 15-11=hours, 10-5=minutes, 4-0=seconds/2
+                // DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
+                let time: u16 = (12 << 11) | (0 << 5) | 0; // 12:00:00
+                let date: u16 = (46 << 9) | (3 << 5) | 22; // 2026-03-22
+                regs.rcx = (regs.rcx & !0xFFFF) | time as u64;
+                regs.rdx = (regs.rdx & !0xFFFF) | date as u64;
+                regs.clear_flag32(1);
+            } else {
+                // Set: succeed silently (read-only FS)
+                regs.clear_flag32(1);
+            }
+            Action::Done
+        }
+        // AH=0x60: Canonicalize path (DS:SI=input, ES:DI=output buffer)
+        0x60 => {
+            let ds = regs.ds as u16 as u32;
+            let si = regs.rsi as u16 as u32;
+            let es = regs.es as u16 as u32;
+            let di = regs.rdi as u16 as u32;
+            let src = (ds << 4) + si;
+            let dst = (es << 4) + di;
+            // Read input path
+            let mut name = [0u8; 128];
+            let mut len = 0;
+            while len < 127 {
+                let ch = unsafe { *((src + len as u32) as *const u8) };
+                if ch == 0 { break; }
+                name[len] = ch;
+                len += 1;
+            }
+            // Build canonical path: if no drive letter, prepend "C:\"
+            let mut out = [0u8; 128];
+            let mut pos = 0;
+            if len >= 2 && name[1] == b':' {
+                // Already has drive letter — uppercase it
+                out[0] = name[0].to_ascii_uppercase();
+                out[1] = b':';
+                out[2] = b'\\';
+                pos = 3;
+                let skip = if len > 2 && (name[2] == b'/' || name[2] == b'\\') { 3 } else { 2 };
+                for i in skip..len {
+                    if pos >= 127 { break; }
+                    out[pos] = if name[i] == b'/' { b'\\' } else { name[i].to_ascii_uppercase() };
+                    pos += 1;
+                }
+            } else {
+                // Relative — prepend C:\ + CWD
+                out[0] = b'C'; out[1] = b':'; out[2] = b'\\';
+                pos = 3;
+                let cwd = thread::current().cwd_str();
+                for &ch in cwd {
+                    if pos >= 127 { break; }
+                    out[pos] = if ch == b'/' { b'\\' } else { ch.to_ascii_uppercase() };
+                    pos += 1;
+                }
+                if pos > 3 && out[pos - 1] != b'\\' { out[pos] = b'\\'; pos += 1; }
+                for i in 0..len {
+                    if pos >= 127 { break; }
+                    out[pos] = if name[i] == b'/' { b'\\' } else { name[i].to_ascii_uppercase() };
+                    pos += 1;
+                }
+            }
+            out[pos] = 0;
+            // Write to ES:DI
+            unsafe {
+                core::ptr::copy_nonoverlapping(out.as_ptr(), dst as *mut u8, pos + 1);
+            }
             regs.clear_flag32(1);
             Action::Done
+        }
+        // AH=0x52: Get List of Lists (returns ES:BX → DOS internal structure)
+        0x52 => {
+            regs.es = LOL_SEG as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | 0;
+            regs.clear_flag32(1);
+            Action::Done
+        }
+        // AH=0x62: Get PSP segment (returns BX=PSP segment)
+        0x62 => {
+            regs.rbx = (regs.rbx & !0xFFFF) | COM_SEGMENT as u64;
+            regs.clear_flag32(1);
+            Action::Done
+        }
+        _ => {
+            panic!("VM86: UNHANDLED INT 21h AH={:#04x} AX={:04X} from {:04x}:{:04x}",
+                ah, regs.rax as u16, vm86_cs(regs), vm86_ip(regs));
         }
     }
 }
@@ -2202,8 +2329,8 @@ fn int_21h(regs: &mut Regs) -> Action {
 
 fn int_2eh(regs: &mut Regs) -> Action {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
-    let ds = regs.ds as u32;
-    let si = regs.rsi as u32;
+    let ds = regs.ds as u16 as u32;
+    let si = regs.rsi as u16 as u32;
     let addr = (ds << 4) + si;
     let len = unsafe { *(addr as *const u8) } as usize;
     let mut cmd = [0u8; 128];
@@ -2593,8 +2720,8 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
 fn xms_move(regs: &mut Regs) {
-    let ds = regs.ds as u32;
-    let si = regs.rsi as u32;
+    let ds = regs.ds as u16 as u32;
+    let si = regs.rsi as u16 as u32;
     let addr = (ds << 4) + si;
 
     let length = unsafe { (addr as *const u32).read_unaligned() } as usize;
@@ -2867,8 +2994,8 @@ fn int_67h(regs: &mut Regs) -> Action {
             let al = regs.rax as u8;
             let count = regs.rcx as u16;
             let handle = regs.rdx as u16;
-            let ds = regs.ds as u32;
-            let si = regs.rsi as u32;
+            let ds = regs.ds as u16 as u32;
+            let si = regs.rsi as u16 as u32;
             let base_addr = (ds << 4) + si;
 
             let ems = ems_state();
@@ -3031,8 +3158,8 @@ fn exec_program(regs: &mut Regs) -> Action {
     }
 
     // Read ASCIIZ filename from DS:DX
-    let ds = regs.ds as u32;
-    let dx = regs.rdx as u32;
+    let ds = regs.ds as u16 as u32;
+    let dx = regs.rdx as u16 as u32;
     let mut addr = (ds << 4) + dx;
     let mut filename = [0u8; 128];
     let mut flen = 0;
@@ -3491,8 +3618,87 @@ pub fn setup_ivt() {
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
 
+    // Set up fake DOS internal structures (List of Lists + System File Table)
+    // so that DJGPP's fstat (which uses INT 21h/52h → SFT) can find file info.
+    setup_lol_sft();
+
     // Scan upper memory to find free pages for UMB/EMS
     scan_uma();
+}
+
+/// Linear address of the fake List of Lists structure.
+const LOL_ADDR: u32 = 0x0600;
+const LOL_SEG: u16 = 0x0060;
+/// Linear address of the fake SFT.
+const SFT_ADDR: u32 = 0x0640;
+const SFT_SEG: u16 = 0x0064;
+/// Number of SFT entries (matches MAX_FDS=16)
+const SFT_ENTRIES: u16 = 20;
+/// Size of one SFT entry (DOS 3.1+)
+const SFT_ENTRY_SIZE: u32 = 59;
+
+/// Write a little-endian u16 to an arbitrary (possibly unaligned) address.
+unsafe fn write_le16(addr: *mut u8, val: u16) {
+    *addr = val as u8;
+    *addr.add(1) = (val >> 8) as u8;
+}
+
+/// Write a little-endian u32 to an arbitrary (possibly unaligned) address.
+unsafe fn write_le32(addr: *mut u8, val: u32) {
+    *addr = val as u8;
+    *addr.add(1) = (val >> 8) as u8;
+    *addr.add(2) = (val >> 16) as u8;
+    *addr.add(3) = (val >> 24) as u8;
+}
+
+fn setup_lol_sft() {
+    unsafe {
+        // Zero the whole region (LoL + SFT)
+        let total = (SFT_ADDR - LOL_ADDR) as usize + 6 + SFT_ENTRIES as usize * SFT_ENTRY_SIZE as usize;
+        core::ptr::write_bytes(LOL_ADDR as *mut u8, 0, total);
+
+        // LoL: offset +4 = far pointer to SFT (offset:segment, little-endian)
+        let lol = LOL_ADDR as *mut u8;
+        write_le16(lol.add(4), 0x0000);   // SFT offset
+        write_le16(lol.add(6), SFT_SEG);  // SFT segment
+
+        // SFT header: next pointer = FFFF:FFFF (end of chain), count = SFT_ENTRIES
+        let sft = SFT_ADDR as *mut u8;
+        write_le32(sft, 0xFFFFFFFF);       // next = end
+        write_le16(sft.add(4), SFT_ENTRIES);
+
+        // Pre-populate entries 0-2 as character devices (stdin/stdout/stderr)
+        for i in 0..3u32 {
+            let entry = sft.add(6 + (i * SFT_ENTRY_SIZE) as usize);
+            write_le16(entry, 1); // refcount = 1
+            write_le16(entry.add(5), 0x80 | if i == 0 { 1 } else { 2 }); // device info
+        }
+    }
+}
+
+/// Populate SFT entry for a newly opened file handle.
+fn sft_set_file(handle: u16, size: u32) {
+    if handle as u32 >= SFT_ENTRIES as u32 { return; }
+    unsafe {
+        let entry = (SFT_ADDR as *mut u8).add(6 + handle as usize * SFT_ENTRY_SIZE as usize);
+        write_le16(entry.add(0x00), 1);       // refcount
+        write_le16(entry.add(0x02), 0);       // open mode (read)
+        *entry.add(0x04) = 0x20;              // attribute = archive
+        write_le16(entry.add(0x05), 0x0000);  // device info = file
+        write_le16(entry.add(0x0D), 0x6000);  // time: 12:00:00
+        write_le16(entry.add(0x0F), 0x5C76);  // date: 2026-03-22
+        write_le32(entry.add(0x11), size);    // file size
+        write_le32(entry.add(0x15), 0);       // position = 0
+    }
+}
+
+/// Clear SFT entry when a file handle is closed.
+fn sft_clear(handle: u16) {
+    if handle as u32 >= SFT_ENTRIES as u32 { return; }
+    unsafe {
+        let entry = (SFT_ADDR as *mut u8).add(6 + handle as usize * SFT_ENTRY_SIZE as usize);
+        write_le16(entry, 0); // refcount = 0
+    }
 }
 
 // ============================================================================
@@ -3555,6 +3761,17 @@ fn map_psp(prog_name: &[u8]) {
         *psp_ptr.add(0x17) = (COM_SEGMENT >> 8) as u8;
         *psp_ptr.add(0x2C) = ENV_SEG as u8;
         *psp_ptr.add(0x2D) = (ENV_SEG >> 8) as u8;
+        // JFT: pointer at PSP+0x18 → inline JFT at PSP+0x34
+        *(psp_ptr.add(0x18) as *mut u16) = 0x0034; // offset
+        *(psp_ptr.add(0x1A) as *mut u16) = COM_SEGMENT; // segment
+        *(psp_ptr.add(0x32) as *mut u16) = 20; // max open files
+        // Inline JFT (20 bytes at PSP+0x34): 0/1/2 = stdin/stdout/stderr, rest = 0xFF
+        *psp_ptr.add(0x34) = 0; // stdin → SFT 0
+        *psp_ptr.add(0x35) = 1; // stdout → SFT 1
+        *psp_ptr.add(0x36) = 2; // stderr → SFT 2
+        for i in 3..20usize {
+            *psp_ptr.add(0x34 + i) = 0xFF; // closed
+        }
         *psp_ptr.add(0x80) = 0; // command tail length
         *psp_ptr.add(0x81) = 0x0D; // CR
     }
