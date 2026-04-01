@@ -11,7 +11,7 @@ pub fn main(_args: &[&str]) {
 
     let pid = crt::fork();
     if pid == 0 {
-        crt::exec("NC.EXE", &["NC.EXE"]);
+        crt::exec("WOLF3D/WOLF3D.EXE", &["WOLF3D.EXE"]);
         crt::exit(1);
     }
     crt::waitpid(pid);

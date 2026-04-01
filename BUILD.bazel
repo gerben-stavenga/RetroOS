@@ -31,15 +31,14 @@ _BASE_FILES = {
     "//apps/keen4:Gamemaps.ck4": "KEEN4/GAMEMAPS.CK4",
     "//apps/keen4:SAVEGAM0.CK4": "KEEN4/SAVEGAM0.CK4",
     "//apps/wolf3d:WOLF3D.EXE": "WOLF3D/WOLF3D.EXE",
-    "//apps/wolf3d:AUDIOHED.WL6": "WOLF3D/AUDIOHED.WL6",
-    "//apps/wolf3d:AUDIOT.WL6": "WOLF3D/AUDIOT.WL6",
-    "//apps/wolf3d:CONFIG.WL6": "WOLF3D/CONFIG.WL6",
-    "//apps/wolf3d:GAMEMAPS.WL6": "WOLF3D/GAMEMAPS.WL6",
-    "//apps/wolf3d:MAPHEAD.WL6": "WOLF3D/MAPHEAD.WL6",
-    "//apps/wolf3d:VGADICT.WL6": "WOLF3D/VGADICT.WL6",
-    "//apps/wolf3d:VGAGRAPH.WL6": "WOLF3D/VGAGRAPH.WL6",
-    "//apps/wolf3d:VGAHEAD.WL6": "WOLF3D/VGAHEAD.WL6",
-    "//apps/wolf3d:VSWAP.WL6": "WOLF3D/VSWAP.WL6",
+    "//apps/wolf3d:AUDIOHED.WL1": "WOLF3D/AUDIOHED.WL1",
+    "//apps/wolf3d:AUDIOT.WL1": "WOLF3D/AUDIOT.WL1",
+    "//apps/wolf3d:GAMEMAPS.WL1": "WOLF3D/GAMEMAPS.WL1",
+    "//apps/wolf3d:MAPHEAD.WL1": "WOLF3D/MAPHEAD.WL1",
+    "//apps/wolf3d:VGADICT.WL1": "WOLF3D/VGADICT.WL1",
+    "//apps/wolf3d:VGAGRAPH.WL1": "WOLF3D/VGAGRAPH.WL1",
+    "//apps/wolf3d:VGAHEAD.WL1": "WOLF3D/VGAHEAD.WL1",
+    "//apps/wolf3d:VSWAP.WL1": "WOLF3D/VSWAP.WL1",
 }
 
 # Proprietary files (not for public distribution)

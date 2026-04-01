@@ -22,7 +22,6 @@ use crate::Regs;
 const IF_FLAG: u32 = 1 << 9;
 const IOPL_MASK: u32 = 3 << 12;
 const VM_FLAG: u32 = 1 << 17;
-const VIF_FLAG: u32 = 1 << 19;
 const EMS_ENABLED: bool = false;
 
 /// Dummy file handle returned by INT 21h/3Ch (Create file) on our read-only FS.
@@ -86,7 +85,8 @@ fn set_vm86_flags(regs: &mut Regs, flags: u32) {
 
 
 /// .COM load segment (standard DOS convention: PSP at seg:0000, code at seg:0100)
-pub const COM_SEGMENT: u16 = 0x1000;
+/// Low address maximizes conventional memory (stubs end at 0x0700, page 0 is COW).
+pub const COM_SEGMENT: u16 = 0x0080;
 /// .COM code offset within segment
 const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer (top of 64KB segment)
@@ -96,7 +96,6 @@ pub const HMA_PAGE_COUNT: usize = 16;
 
 /// Per-thread VM86 state.
 pub struct Vm86State {
-    pub vif: bool,
     pub a20_enabled: bool,
     pub dta: u32,
     pub heap_seg: u16,
@@ -117,7 +116,6 @@ impl Vm86State {
         let mut hma_pages = [0u64; HMA_PAGE_COUNT];
         crate::kernel::startup::arch_init_hma(&mut hma_pages);
         Self {
-            vif: true,
             a20_enabled: false,
             dta: 0,
             heap_seg: 0xA000,
@@ -926,8 +924,27 @@ impl EmsState {
 /// Emulate IN from a port.
 pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
     match port {
-        // VGA ports — pass through to hardware (including 0x3DA retrace register)
-        0x3C0..=0x3DF => Ok(crate::arch::x86::inb(port)),
+        // VGA Input Status 1: synthesize retrace signal.
+        // Cycle (32 reads): 0-15 display active (0x00), 16-23 HBL (0x01),
+        // 24-31 VBL (0x09).
+        // - VL_WaitVBL needs bit 3=1 (VBL phase)
+        // - VL_SetScreen needs 6+ consecutive bit0=1/bit3=0 (HBL phase)
+        // - VL_SetCRTC needs bit0=0 (display active phase)
+        0x3DA => {
+            static mut RETRACE_CTR: u8 = 0;
+            let ctr = unsafe {
+                RETRACE_CTR = RETRACE_CTR.wrapping_add(1);
+                RETRACE_CTR
+            };
+            let phase = ctr & 31;
+            let val = if phase < 16 { 0x00 } else if phase < 24 { 0x01 } else { 0x09 };
+            if ctr < 64 {
+                dbg_println!("[VGA] 3DA read #{} phase={} val={:#04x}", ctr, phase, val);
+            }
+            Ok(val)
+        }
+        // VGA ports — pass through to hardware
+        0x3C0..=0x3D9 | 0x3DB..=0x3DF => Ok(crate::arch::x86::inb(port)),
         // Master PIC command (read ISR)
         0x20 => Ok(thread::current().vm86.vpic.isr),
         // Master PIC data (read IMR)
@@ -959,6 +976,7 @@ pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
         0x20 => {
             if val == 0x20 {
                 // Non-specific EOI
+                crate::dbg_println!("[EOI] isr={:#04x}", thread::current().vm86.vpic.isr);
                 let t = thread::current();
                 // If keyboard IRQ (bit 1) was in service, and the virtual 8042
                 // still has data ready, IRQ1 should assert again after EOI.
@@ -1006,84 +1024,51 @@ pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
 }
 
 // ============================================================================
-// Signal delivery — reflect hardware IRQs to VM86 threads via IVT
+// Signal delivery — buffer hardware events and raise virtual interrupts
 // ============================================================================
 
-/// Deliver an IRQ event to a VM86 thread: buffer data, reflect through IVT.
-///
-/// Called from outside the monitor (traps.rs drain, switch_to_thread).
-/// EFLAGS.IF may not reflect VIF here, so we map VIF↔IF around reflects.
-pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<crate::arch::irq::Irq>) {
-    // QEMU VGA bug workaround: real VGA hardware forces Odd/Even read mode
-    // (GC5 bit 4) in text modes regardless of the register value. QEMU doesn't,
-    // so if a DOS program writes GC5=0x00 (e.g. Keen4 during VGA detection)
-    // and never restores it, text mode reads break (chars at 2x offset).
-    // Fix: on each IRQ delivery, re-set GC5 bit 4 when in text mode.
-    // Skip when CS >= C000 (BIOS ROM) — BIOS font loading needs GC5=0x00.
-    unsafe {
-        let cs = regs.cs32();
-        if cs < 0xC000 {
-            let mode = *(0x449 as *const u8);
-            if mode <= 3 || mode == 7 {
-                let saved_idx = crate::arch::x86::inb(0x3CE);
-                crate::arch::x86::outb(0x3CE, 5);
-                let gc5 = crate::arch::x86::inb(0x3CF);
-                if gc5 & 0x10 == 0 {
-                    crate::arch::x86::outb(0x3CF, gc5 | 0x10);
-                }
-                crate::arch::x86::outb(0x3CE, saved_idx);
-            }
-        }
-    }
-
-    // Buffer virtual IRQs for delivery through the guest IVT.
+/// Buffer a hardware event into the virtual PIC / keyboard buffer.
+/// Mode-independent: both VM86 and DPMI share the same virtual devices.
+pub fn queue_irq(thread: &mut thread::Thread, event: crate::arch::irq::Irq) {
     use crate::arch::irq::Irq;
-    if let Some(e) = event {
-        match e {
-            Irq::Key(sc) => {
-                let Some(sc) = normalize_vm86_scancode(thread, sc) else {
-                    return;
-                };
-                thread.vm86.vkbd.push(sc);
-                // IRQ1 is "keyboard data available", not "one interrupt per
-                // buffered scancode". If one is already pending or in service,
-                // let the current BIOS handler / next EOI drain the rest.
-                if thread.vm86.vpic.isr & 0x02 == 0 && !thread.vm86.vpic.has_pending_vec(0x09) {
-                    thread.vm86.vpic.push(0x09);
-                }
+    match event {
+        Irq::Key(sc) => {
+            let Some(sc) = normalize_vm86_scancode(thread, sc) else { return };
+            thread.vm86.vkbd.push(sc);
+            if thread.vm86.vpic.isr & 0x02 == 0 && !thread.vm86.vpic.has_pending_vec(0x09) {
+                thread.vm86.vpic.push(0x09);
             }
-            Irq::Tick => {
-                let due = thread.vm86.vpit.take_pending_irqs();
-                for _ in 0..due {
-                    thread.vm86.vpic.push(0x08);
-                }
+        }
+        Irq::Tick => {
+            let due = thread.vm86.vpit.take_pending_irqs();
+            for _ in 0..due {
+                thread.vm86.vpic.push(0x08);
             }
         }
     }
-    if !thread.vm86.vif {
-        // Set VIP (Virtual Interrupt Pending) when interrupts are queued.
-        // With VME: CPU will #GP on next STI, giving us a chance to deliver.
-        // Without VME: VIP is informational but harmless.
+}
+
+/// Try to deliver one pending interrupt from the virtual PIC.
+/// IF is the virtual interrupt flag (arch swaps VIF↔IF at ring 3 boundary).
+/// Works for both VM86 (IVT reflect) and DPMI (PM vector dispatch).
+pub fn raise_pending(thread: &mut thread::Thread, regs: &mut Regs) {
+    let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
+    let is_pm = regs.mode() != crate::UserMode::VM86;
+    if !vif && !is_pm {
         if thread.vm86.vpic.has_pending() {
-            regs.set_flag32(1 << 20); // VIP flag
+            regs.frame.rflags |= 1u64 << 20; // VIP
         }
         return;
     }
-    // Don't deliver while a handler is in service — prevents nesting into
-    // non-reentrant BIOS code (e.g. new timer IRQ injected inside keyboard handler
-    // after STI). Pending IRQs stay queued until all handlers EOI.
-    if thread.vm86.vpic.isr != 0 { return; }
-    // Deliver only ONE interrupt at a time to avoid overflowing small DOS stacks
-    // (e.g. Prince of Persia SP=0x0080). Remaining events stay queued in vpic
-    // and get delivered on subsequent traps after the handler EOIs.
+    if thread.vm86.vpic.isr != 0 {
+        return;
+    }
     let vec = match thread.vm86.vpic.pop() {
         Some(v) => v,
         None => return,
     };
-    // For keyboard IRQ (INT 9): latch scancode into port 0x60 before reflecting
     if vec == 0x09 {
         if !thread.vm86.vkbd.latch() {
-            // No scancode available yet — re-queue and try later
             thread.vm86.vpic.push(0x09);
             return;
         }
@@ -1092,42 +1077,36 @@ pub fn deliver_irq(thread: &mut thread::Thread, regs: &mut Regs, event: Option<c
     if irq_num < 8 {
         thread.vm86.vpic.isr |= 1 << irq_num;
     }
-    // Clear VIP — we're delivering now
-    regs.clear_flag32(1 << 20);
-    let saved_if = sync_vif(thread, regs);
-    reflect_interrupt(regs, vec);
-    restore_vif(thread, regs, saved_if);
+    // Clear VIP — interrupt is being serviced
+    regs.frame.rflags &= !(1u64 << 20);
+
+    if regs.mode() == crate::UserMode::VM86 {
+        // reflect_interrupt pushes original FLAGS (with IF=1) then clears IF
+        reflect_interrupt(regs, vec);
+    } else {
+        // DPMI: don't clear virtual IF — ring 3 IRET can't restore it.
+        // ISR prevents re-entry; client uses CLI/STI for critical sections.
+        crate::kernel::dpmi::deliver_hw_irq(thread, regs, vec);
+    }
 }
 
-/// Map VIF into EFLAGS.IF so handlers/reflect work with IF naturally.
-/// Arch guarantees VIF in EFLAGS is always valid (hardware-managed with VME,
-/// arch-preserved without VME). Returns the saved real IF value for restore_vif.
-fn sync_vif(thread: &mut thread::Thread, regs: &mut Regs) -> u32 {
-    let saved_if = vm86_flags(regs) & IF_FLAG;
-    // VIF in EFLAGS is authoritative (hardware maintains it with VME,
-    // and we maintain it in saved regs without VME — CPU preserves it either way)
-    thread.vm86.vif = vm86_flags(regs) & VIF_FLAG != 0;
-    if thread.vm86.vif { regs.set_flag32(IF_FLAG); }
-    else { regs.clear_flag32(IF_FLAG); }
-    saved_if
-}
-
-/// Extract VIF from EFLAGS.IF back into thread, restore real IF.
-/// Writes VIF back to EFLAGS (arch propagates to hardware if VME active).
-fn restore_vif(thread: &mut thread::Thread, regs: &mut Regs, saved_if: u32) {
-    thread.vm86.vif = vm86_flags(regs) & IF_FLAG != 0;
-    if thread.vm86.vif { regs.set_flag32(VIF_FLAG); }
-    else { regs.clear_flag32(VIF_FLAG); }
-    set_vm86_flags(regs, (vm86_flags(regs) & !IF_FLAG) | saved_if);
-}
 
 /// Reflect an interrupt through the IVT: push FLAGS/CS/IP, clear IF, set CS:IP.
-/// Caller must ensure EFLAGS.IF reflects VIF (via sync_vif).
 fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
     let old_cs = vm86_cs(regs);
     let old_ip = vm86_ip(regs);
     let new_ip = read_u16(0, (int_num as u32) * 4);
     let new_cs = read_u16(0, (int_num as u32) * 4 + 2);
+    if int_num == 0x08 {
+        static mut COUNT8: u32 = 0;
+        unsafe {
+            COUNT8 += 1;
+            if COUNT8 <= 5 {
+                dbg_println!("[IRQ] reflect INT 08 -> {:04X}:{:04X} (from {:04X}:{:04X})",
+                    new_cs, new_ip, old_cs, old_ip);
+            }
+        }
+    }
     vm86_push(regs, vm86_flags(regs) as u16);
     vm86_push(regs, old_cs);
     vm86_push(regs, old_ip);
@@ -1219,15 +1198,10 @@ pub(crate) enum Action {
 }
 
 /// VM86 monitor — called from GP fault handler when EFLAGS.VM=1.
-///
-/// Maps VIF↔IF on entry/exit so all opcode handlers work with EFLAGS.IF
-/// naturally (as if it were the real interrupt flag from the program's view).
-/// On return, extracts VIF from IF and restores real IF=1.
+/// Arch boundary swaps VIF↔IF, so IF is the virtual interrupt flag throughout.
 pub fn vm86_monitor(regs: &mut Regs) -> Option<usize> {
     let t = thread::current();
-    let saved_if = sync_vif(t, regs);
     let action = monitor_impl(regs);
-    restore_vif(t, regs, saved_if);
 
     match action {
         Action::Done => None,
@@ -1528,8 +1502,18 @@ fn monitor_impl(regs: &mut Regs) -> Action {
             Action::Yield
         }
         _ => {
-            crate::println!("VM86: FATAL unhandled opcode {:#04x} at {:04x}:{:04x}",
-                opcode, vm86_cs(regs), regs.ip32().wrapping_sub(1));
+            let fault_ip = regs.ip32().wrapping_sub(1);
+            let lin = (vm86_cs(regs) as u32) * 16 + fault_ip as u32;
+            let next_bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8.min(0x10_0000u32.saturating_sub(lin) as usize)) };
+            crate::println!("VM86: FATAL unhandled opcode {:#04x} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x?}] SS:SP={:04x}:{:04x} flags={:#x}",
+                opcode, vm86_cs(regs), fault_ip, lin, next_bytes,
+                vm86_ss(regs), vm86_sp(regs), vm86_flags(regs));
+            // Dump top of VM86 stack
+            let ss = vm86_ss(regs) as u32;
+            let sp = vm86_sp(regs) as u32;
+            crate::println!("  stack: [{:04x} {:04x} {:04x} {:04x} {:04x} {:04x}]",
+                read_u16(ss, sp), read_u16(ss, sp+2), read_u16(ss, sp+4),
+                read_u16(ss, sp+6), read_u16(ss, sp+8), read_u16(ss, sp+10));
             // Kill the VM86 thread
             let next = thread::exit_thread(-11);
             Action::Switch(next)
@@ -1545,14 +1529,16 @@ fn monitor_impl(regs: &mut Regs) -> Action {
 /// With VME, only INTs whose bit is SET in the redirection bitmap trap here.
 /// Without VME, all INTs trap — unintercepted ones are reflected through IVT.
 fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
+    crate::dbg_println!("[VM86] INT {:02X} at {:04X}:{:04X} AX={:04X}",
+        int_num, vm86_cs(regs), vm86_ip(regs), regs.rax as u16);
     if !crate::arch::descriptors::int_intercepted(int_num) {
         reflect_interrupt(regs, int_num);
         return Action::Done;
     }
     match int_num {
-        // INT F0h — Unified stub dispatch (all intercepted INTs route through IVT
-        // stubs that call INT F0h; dispatch by IP to identify the original INT)
-        STUB_INT => f0h_dispatch(regs),
+        // INT 31h — unified stub dispatch (all intercepted INTs route through
+        // IVT stubs that call INT 31h; dispatch by slot number)
+        STUB_INT => stub_dispatch(regs),
         _ => {
             panic!("VM86: INT {:02X} intercepted in bitmap but has no handler", int_num);
         }
@@ -1560,21 +1546,34 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
 }
 
 // ============================================================================
-// F0h stub dispatch — routes INT F0h from IVT stubs by IP
+// Stub dispatch — routes INT 31h from unified CD 31 array by slot number
 // ============================================================================
 
-/// Dispatch INT F0h from IVT stubs. The IP (past the CD F0 bytes) identifies
-/// which stub triggered the interrupt.
-fn f0h_dispatch(regs: &mut Regs) -> Action {
+/// Dispatch INT 31h from the unified stub array. Slot = (IP - 2) / 2.
+/// IVT-redirect stubs have a FLAGS/CS/IP frame on the VM86 stack from the
+/// original INT; far-call stubs have a CS/IP frame from CALL FAR.
+/// The kernel pops these frames directly — no RETF/RETF 2 in the stub.
+fn stub_dispatch(regs: &mut Regs) -> Action {
     let ip = vm86_ip(regs);
+    let cs = vm86_cs(regs);
 
-    // IVT-redirect stubs arrive here after the CPU processed the original INT.
-    // With VME the CPU cleared VIF; without VME reflect_interrupt cleared IF.
-    // The original IF/VIF is in the FLAGS the CPU pushed on the VM86 stack (SP+4).
-    // Restore IF from those saved FLAGS so restore_vif propagates correct VIF.
-    // Far-call stubs (XMS/DPMI/callback) have no FLAGS on stack — skip those.
-    let is_callback_entry = ip >= F0_IP_CB_ENTRY_BASE && ip < F0_IP_CB_ENTRY_BASE + 32;
-    let is_far_call = is_callback_entry || matches!(ip, F0_IP_XMS | F0_IP_DPMI_ENTRY | F0_IP_CALLBACK | F0_IP_RAW_REAL_TO_PM);
+    // If INT 31h came from outside the stub segment, reflect through IVT
+    if cs != STUB_SEG {
+        crate::dbg_println!("[VM86] INT 31h from non-stub {:04X}:{:04X}, reflecting", cs, ip);
+        reflect_interrupt(regs, 0x31);
+        return Action::Done;
+    }
+
+    let slot = ((ip.wrapping_sub(2)) / 2) as u8;
+    crate::dbg_println!("[VM86] stub slot={:02X} SS:SP={:04X}:{:04X}",
+        slot, vm86_ss(regs), vm86_sp(regs));
+
+    let is_far_call = matches!(slot,
+        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
+        || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
+
+    // IVT-redirect stubs: the original INT pushed FLAGS/CS/IP on the VM86 stack.
+    // Restore IF from those saved FLAGS (IF is the virtual interrupt flag).
     if !is_far_call {
         let saved_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
         if saved_flags as u32 & IF_FLAG != 0 {
@@ -1584,19 +1583,30 @@ fn f0h_dispatch(regs: &mut Regs) -> Action {
         }
     }
 
-    match ip {
-        F0_IP_XMS => xms_dispatch(regs),
-        F0_IP_DPMI_ENTRY => {
+    let action = match slot {
+        SLOT_XMS => xms_dispatch(regs),
+        SLOT_DPMI_ENTRY => {
             let thread = thread::current();
             crate::kernel::dpmi::dpmi_enter(thread, regs);
             Action::Done
         }
-        F0_IP_CALLBACK => {
+        SLOT_CALLBACK_RET => {
             let thread = thread::current();
             crate::kernel::dpmi::callback_return(thread, regs);
             Action::Done
         }
-        F0_IP_INT20 => {
+        SLOT_RAW_REAL_TO_PM => {
+            let thread = thread::current();
+            crate::kernel::dpmi::raw_switch_real_to_pm(thread, regs);
+            Action::Done
+        }
+        s if s >= SLOT_CB_ENTRY_BASE && s < SLOT_CB_ENTRY_END => {
+            let cb_idx = (s - SLOT_CB_ENTRY_BASE) as usize;
+            let thread = thread::current();
+            crate::kernel::dpmi::callback_entry(thread, regs, cb_idx);
+            Action::Done
+        }
+        0x20 => {
             // INT 20h — DOS program terminate
             if let Some(parent) = thread::current().vm86.exec_parent.take() {
                 return exec_return(regs, &parent);
@@ -1604,25 +1614,36 @@ fn f0h_dispatch(regs: &mut Regs) -> Action {
             let next = thread::exit_thread(0);
             Action::Switch(next)
         }
-        F0_IP_INT21 => int_21h(regs),
-        F0_IP_INT28 => Action::Done, // INT 28h — DOS idle
-        F0_IP_INT2E => int_2eh(regs),
-        F0_IP_INT2F => int_2fh(regs),
-        F0_IP_RAW_REAL_TO_PM => {
-            let thread = thread::current();
-            crate::kernel::dpmi::raw_switch_real_to_pm(thread, regs);
-            Action::Done
-        }
-        ip if ip >= F0_IP_CB_ENTRY_BASE && ip < F0_IP_CB_ENTRY_BASE + 32 => {
-            let cb_idx = ((ip - F0_IP_CB_ENTRY_BASE) / 2) as usize;
-            let thread = thread::current();
-            crate::kernel::dpmi::callback_entry(thread, regs, cb_idx);
-            Action::Done
-        }
+        0x21 => int_21h(regs),
+        0x28 => Action::Done, // INT 28h — DOS idle
+        0x2E => int_2eh(regs),
+        0x2F => int_2fh(regs),
+        SLOT_SAVE_RESTORE => Action::Done, // no-op far call (buffer size=0)
         _ => {
-            panic!("VM86: INT F0h from unknown stub at IP={:#06x}", ip);
+            panic!("VM86: INT 31h from unknown stub slot {:#04x} IP={:#06x}", slot, ip);
         }
+    };
+
+    // Pop the VM86 stack frame left by the caller before returning.
+    // IVT-redirect: original INT pushed FLAGS/CS/IP (6 bytes) — pop and return to caller.
+    // Far-call (XMS): CALL FAR pushed CS/IP (4 bytes) — pop and return to caller.
+    // Mode-switching stubs (DPMI entry, raw switch, callbacks) replace all regs — skip.
+    if !is_far_call {
+        let ret_ip = vm86_pop(regs);
+        let ret_cs = vm86_pop(regs);
+        let _flags = vm86_pop(regs); // discard (equivalent to old RETF 2)
+        set_vm86_ip(regs, ret_ip);
+        set_vm86_cs(regs, ret_cs);
+    } else if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
+        // Returns to caller — pop far-call return address
+        let ret_ip = vm86_pop(regs);
+        let ret_cs = vm86_pop(regs);
+        set_vm86_ip(regs, ret_ip);
+        set_vm86_cs(regs, ret_cs);
     }
+    // Other far-call stubs (DPMI entry, raw switch, callbacks) switch modes entirely
+
+    action
 }
 
 // ============================================================================
@@ -1942,6 +1963,8 @@ fn int_21h(regs: &mut Regs) -> Action {
             let need = regs.rbx as u16;
             let t = thread::current();
             let avail = 0xA000u16.saturating_sub(t.vm86.heap_seg);
+            dbg_println!("[MEM] 48 alloc BX={:#06x} heap={:#06x} avail={:#06x}",
+                need, t.vm86.heap_seg, avail);
             if need <= avail {
                 let seg = t.vm86.heap_seg;
                 t.vm86.heap_seg += need;
@@ -1963,14 +1986,18 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x4A: Resize memory block (ES=segment, BX=new size in paragraphs)
         0x4A => {
             let es = regs.es as u16;
-            let new_end = es.wrapping_add(regs.rbx as u16);
-            if new_end <= 0xA000 {
+            let new_end32 = es as u32 + regs.rbx as u16 as u32;
+            dbg_println!("[MEM] 4A resize ES={:#06x} BX={:#06x} new_end={:#06x} limit=0xA000",
+                es, regs.rbx as u16, new_end32);
+            if new_end32 <= 0xA000 {
+                let new_end = new_end32 as u16;
                 // Program resizing its block — free memory starts after it
                 thread::current().vm86.heap_seg = new_end;
                 regs.clear_flag32(1);
             } else {
                 // Not enough memory — report max available
                 let avail = 0xA000u16.saturating_sub(es);
+                dbg_println!("[MEM] 4A FAIL: need {:#06x} avail {:#06x}", regs.rbx as u16, avail);
                 regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
                 regs.set_flag32(1);
@@ -2306,6 +2333,16 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.clear_flag32(1);
             Action::Done
         }
+        // AH=0x67: Set Handle Count — stub success
+        0x67 => {
+            regs.clear_flag32(1);
+            Action::Done
+        }
+        // AH=0x41: Delete file — read-only FS, pretend success
+        0x41 => {
+            regs.clear_flag32(1);
+            Action::Done
+        }
         // AH=0x62: Get PSP segment (returns BX=PSP segment)
         0x62 => {
             regs.rbx = (regs.rbx & !0xFFFF) | COM_SEGMENT as u64;
@@ -2413,8 +2450,8 @@ fn int_2fh(regs: &mut Regs) -> Action {
             regs.rsi = regs.rsi & !0xFFFF;
             // ES:DI = entry point (far call to switch to protected mode)
             regs.es = STUB_SEG as u64;
-            regs.rdi = (regs.rdi & !0xFFFF) | 0x0003; // stub at 0x0050:0x0003
-            dbg_println!("INT 2F/1687: DPMI available, entry={:04X}:{:04X}", STUB_SEG, 0x0003);
+            regs.rdi = (regs.rdi & !0xFFFF) | slot_offset(SLOT_DPMI_ENTRY) as u64;
+            dbg_println!("INT 2F/1687: DPMI available, entry={:04X}:{:04X}", STUB_SEG, slot_offset(SLOT_DPMI_ENTRY));
             Action::Done
         }
         // AX=4300h — XMS installation check
@@ -2426,8 +2463,8 @@ fn int_2fh(regs: &mut Regs) -> Action {
         // AX=4310h — Get XMS driver entry point
         0x4310 => {
             regs.es = STUB_SEG as u64;
-            regs.rbx = regs.rbx & !0xFFFF; // offset 0x0000 (XMS stub)
-            dbg_println!("INT 2F/4310: XMS entry = {:04X}:{:04X}", STUB_SEG, 0x0000);
+            regs.rbx = (regs.rbx & !0xFFFF) | slot_offset(SLOT_XMS) as u64;
+            dbg_println!("INT 2F/4310: XMS entry = {:04X}:{:04X}", STUB_SEG, slot_offset(SLOT_XMS));
             Action::Done
         }
         _ => {
@@ -2438,7 +2475,7 @@ fn int_2fh(regs: &mut Regs) -> Action {
 }
 
 // ============================================================================
-// XMS dispatch (called via INT F0h from far-call stub)
+// XMS dispatch (called via stub slot SLOT_XMS)
 // ============================================================================
 
 /// Ensure XMS state exists for current thread, return mutable reference
@@ -3535,86 +3572,44 @@ fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Ac
 /// PIC/keyboard, so BIOS code works transparently.
 ///
 /// Stub area base in conventional memory (segment 0x0050, offset 0x0000)
-const STUB_BASE: u32 = 0x0500;
+pub(crate) const STUB_BASE: u32 = 0x0500;
 pub(crate) const STUB_SEG: u16 = 0x0050;
 
-/// F0h dispatch IPs (IP after the CD F0 bytes in each stub)
-const F0_IP_XMS: u16 = 0x0002;
-const F0_IP_DPMI_ENTRY: u16 = 0x0005;
-const F0_IP_CALLBACK: u16 = 0x0008;
-const F0_IP_INT20: u16 = 0x000A;
-const F0_IP_INT21: u16 = 0x000F;
-const F0_IP_INT28: u16 = 0x0014;
-const F0_IP_INT2E: u16 = 0x0019;
-const F0_IP_INT2F: u16 = 0x001E;
-const F0_IP_RAW_REAL_TO_PM: u16 = 0x0023;
-/// F0h IP for callback entry stubs: IP = 0x0032 + n*2 for callback n
-const F0_IP_CB_ENTRY_BASE: u16 = 0x0032;
+/// Trap vector for all stubs (only one in TSS bitmap)
+const STUB_INT: u8 = 0x31;
 
-/// Private interrupt number used by IVT stubs (only one in TSS bitmap)
-const STUB_INT: u8 = 0xF0;
+// Slot assignments in the unified CD 31 array (256 entries, 2 bytes each).
+// Slot N at offset N*2 from segment base. After CD 31, IP = N*2+2, slot = (IP-2)/2.
+const SLOT_XMS: u8 = 0x00;
+const SLOT_DPMI_ENTRY: u8 = 0x01;
+pub(crate) const SLOT_CALLBACK_RET: u8 = 0x02;
+pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
+pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
+pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
+pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
+pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
+pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
+
+/// Offset within STUB_SEG for a given slot number.
+pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
 /// Dummy file handle returned for device "EMMXXXX0" (EMS detection)
 const EMS_DEVICE_HANDLE: u16 = 0xFE;
 
 pub fn setup_ivt() {
-    // Install stubs at 0x0500 (segment 0x0050):
-    //   0x0500: CD F0 CB          ; XMS — INT F0h; RETF (far call)
-    //   0x0503: CD F0 CB          ; DPMI entry — INT F0h; RETF (far call)
-    //   0x0506: CD F0             ; Callback return — INT F0h (handler switches mode)
-    //   0x0508: CD F0 CA 02 00    ; INT 20h — INT F0h; RETF 2 (IVT call, discard FLAGS)
-    //   0x050D: CD F0 CA 02 00    ; INT 21h — INT F0h; RETF 2
-    //   0x0512: CD F0 CA 02 00    ; INT 28h — INT F0h; RETF 2
-    //   0x0517: CD F0 CA 02 00    ; INT 2Eh — INT F0h; RETF 2
-    //   0x051C: CD F0 CA 02 00    ; INT 2Fh — INT F0h; RETF 2
+    // Unified stub array: 256 entries × 2 bytes (CD 31) at 0x0500-0x06FF.
+    // Slot N at offset N*2. VM86 traps via TSS bitmap bit 31h; PM fires INT 31h (DPL=3).
     unsafe {
         let b = STUB_BASE as *mut u8;
-        // XMS (far call): INT F0h; RETF
-        *b.add(0x00) = 0xCD; *b.add(0x01) = STUB_INT; *b.add(0x02) = 0xCB;
-        // DPMI entry (far call): INT F0h; RETF
-        *b.add(0x03) = 0xCD; *b.add(0x04) = STUB_INT; *b.add(0x05) = 0xCB;
-        // Callback return: INT F0h (handler does mode switch, never returns here)
-        *b.add(0x06) = 0xCD; *b.add(0x07) = STUB_INT;
-        // INT 20h: INT F0h; RETF 2
-        *b.add(0x08) = 0xCD; *b.add(0x09) = STUB_INT; *b.add(0x0A) = 0xCA; *b.add(0x0B) = 0x02; *b.add(0x0C) = 0x00;
-        // INT 21h: INT F0h; RETF 2
-        *b.add(0x0D) = 0xCD; *b.add(0x0E) = STUB_INT; *b.add(0x0F) = 0xCA; *b.add(0x10) = 0x02; *b.add(0x11) = 0x00;
-        // INT 28h: INT F0h; RETF 2
-        *b.add(0x12) = 0xCD; *b.add(0x13) = STUB_INT; *b.add(0x14) = 0xCA; *b.add(0x15) = 0x02; *b.add(0x16) = 0x00;
-        // INT 2Eh: INT F0h; RETF 2
-        *b.add(0x17) = 0xCD; *b.add(0x18) = STUB_INT; *b.add(0x19) = 0xCA; *b.add(0x1A) = 0x02; *b.add(0x1B) = 0x00;
-        // INT 2Fh: INT F0h; RETF 2
-        *b.add(0x1C) = 0xCD; *b.add(0x1D) = STUB_INT; *b.add(0x1E) = 0xCA; *b.add(0x1F) = 0x02; *b.add(0x20) = 0x00;
-        // Raw mode switch: real-to-PM (VM86 far call → INT F0h trap)
-        *b.add(0x21) = 0xCD; *b.add(0x22) = STUB_INT;
-        // Raw mode switch: PM-to-real (PUSH AX; MOV AX,0xFF01; INT 31h)
-        *b.add(0x23) = 0x50;                           // PUSH AX (save new DS)
-        *b.add(0x24) = 0xB8; *b.add(0x25) = 0x01; *b.add(0x26) = 0xFF; // MOV AX, 0xFF01
-        *b.add(0x27) = 0xCD; *b.add(0x28) = 0x31;     // INT 31h
-        // Exception handler return: MOV AX, 0xFF00; INT 31h
-        *b.add(0x2A) = 0xB8; *b.add(0x2B) = 0x00; *b.add(0x2C) = 0xFF;
-        *b.add(0x2D) = 0xCD; *b.add(0x2E) = 0x31;
-
-        // Real-mode callback entry stubs (16 slots, each 2 bytes: CD F0)
-        // Stub n at offset 0x0030 + n*2, F0h dispatch IP = 0x0032 + n*2
-        for i in 0..16u32 {
-            let off = 0x0030 + i * 2;
-            *b.add(off as usize) = 0xCD;
-            *b.add(off as usize + 1) = STUB_INT;
+        for i in 0..256u32 {
+            *b.add((i * 2) as usize) = 0xCD;
+            *b.add((i * 2 + 1) as usize) = STUB_INT;
         }
     }
 
     // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000)
-    // Format: IVT[n] = dword at n*4: offset(16), segment(16)
-    let ivt_stubs: [(u8, u16); 5] = [
-        (0x20, 0x0008),  // INT 20h stub at 0x0050:0x0008
-        (0x21, 0x000D),  // INT 21h stub at 0x0050:0x000D
-        (0x28, 0x0012),  // INT 28h stub at 0x0050:0x0012
-        (0x2E, 0x0017),  // INT 2Eh stub at 0x0050:0x0017
-        (0x2F, 0x001C),  // INT 2Fh stub at 0x0050:0x001C
-    ];
-    for &(int_num, off) in &ivt_stubs {
-        write_u16(0, (int_num as u32) * 4, off);
+    for &int_num in &[0x20u8, 0x21, 0x28, 0x2E, 0x2F] {
+        write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
 
@@ -3626,12 +3621,12 @@ pub fn setup_ivt() {
     scan_uma();
 }
 
-/// Linear address of the fake List of Lists structure.
-const LOL_ADDR: u32 = 0x0600;
-const LOL_SEG: u16 = 0x0060;
+/// Linear address of the fake List of Lists structure (past stub array end at 0x0700).
+const LOL_ADDR: u32 = 0x0700;
+const LOL_SEG: u16 = 0x0070;
 /// Linear address of the fake SFT.
-const SFT_ADDR: u32 = 0x0640;
-const SFT_SEG: u16 = 0x0064;
+const SFT_ADDR: u32 = 0x0740;
+const SFT_SEG: u16 = 0x0074;
 /// Number of SFT entries (matches MAX_FDS=16)
 const SFT_ENTRIES: u16 = 20;
 /// Size of one SFT entry (DOS 3.1+)
@@ -3707,20 +3702,21 @@ fn sft_clear(handle: u16) {
 
 /// Map the PSP and environment for a DOS program.
 ///
-/// - PSP (256 bytes) at COM_SEGMENT:0000 = page 0x10, offset 0.
-/// - Environment block at page 0x0F (linear 0xF000, segment 0x0F00).
+/// - PSP (256 bytes) at COM_SEGMENT:0000.
+/// - Environment block 256 bytes before PSP.
 ///
 /// Pages are written via demand paging (ring-1 writes trigger page faults
 /// that allocate fresh pages at ring 0).
 fn map_psp(prog_name: &[u8]) {
-    const PSP_ADDR: usize = 0x10000;  // COM_SEGMENT << 4
-    const ENV_ADDR: usize = 0x0F000;  // page before PSP
-    const ENV_SEG: u16 = 0x0F00;      // ENV_ADDR >> 4
+    let psp_addr = (COM_SEGMENT as usize) << 4;
+    // Environment 256 bytes before PSP (one paragraph block)
+    let env_seg: u16 = COM_SEGMENT - 0x10;
+    let env_addr = (env_seg as usize) << 4;
 
-    // Environment page (linear 0xF000)
+    // Environment block (256 bytes before PSP)
     // Format: NUL-terminated strings, double NUL at end, then u16 count + program name
-    let env_ptr = ENV_ADDR as *mut u8;
-    unsafe { core::ptr::write_bytes(env_ptr, 0, 4096); }
+    let env_ptr = env_addr as *mut u8;
+    unsafe { core::ptr::write_bytes(env_ptr, 0, 256); }
     let mut off = 0;
     // COMSPEC — NC checks this to find the command interpreter
     let comspec = b"COMSPEC=C:\\COMMAND.COM\0";
@@ -3748,10 +3744,10 @@ fn map_psp(prog_name: &[u8]) {
     }
     unsafe { *env_ptr.add(off) = 0; }
 
-    // PSP page (linear 0x10000)
-    let psp_ptr = PSP_ADDR as *mut u8;
+    // PSP (256 bytes at COM_SEGMENT:0000)
+    let psp_ptr = psp_addr as *mut u8;
     unsafe {
-        core::ptr::write_bytes(psp_ptr, 0, 4096);
+        core::ptr::write_bytes(psp_ptr, 0, 256);
         *psp_ptr.add(0) = 0xCD; // INT 20h
         *psp_ptr.add(1) = 0x20;
         *psp_ptr.add(2) = 0x00; // top of memory = 0xA000
@@ -3759,8 +3755,8 @@ fn map_psp(prog_name: &[u8]) {
         // Parent PSP segment — point to ourselves (top-level process, like COMMAND.COM)
         *psp_ptr.add(0x16) = COM_SEGMENT as u8;
         *psp_ptr.add(0x17) = (COM_SEGMENT >> 8) as u8;
-        *psp_ptr.add(0x2C) = ENV_SEG as u8;
-        *psp_ptr.add(0x2D) = (ENV_SEG >> 8) as u8;
+        *psp_ptr.add(0x2C) = env_seg as u8;
+        *psp_ptr.add(0x2D) = (env_seg >> 8) as u8;
         // JFT: pointer at PSP+0x18 → inline JFT at PSP+0x34
         *(psp_ptr.add(0x18) as *mut u16) = 0x0034; // offset
         *(psp_ptr.add(0x1A) as *mut u16) = COM_SEGMENT; // segment
@@ -3789,7 +3785,7 @@ pub fn is_mz_exe(data: &[u8]) -> bool {
 /// Returns (cs, ip, ss, sp) for initializing the thread.
 ///
 /// Layout:
-///   Segment COM_SEGMENT (0x1000):
+///   Segment COM_SEGMENT:
 ///     0x0000-0x00FF: PSP (Program Segment Prefix)
 ///     0x0100-...:    .COM binary code
 ///   Stack at COM_SEGMENT:COM_SP (top of segment)

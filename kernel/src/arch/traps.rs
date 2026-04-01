@@ -223,21 +223,30 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
         }
     }
 
-    // VM86 canonicalization: swap segments in, restore VIF/VIP
+    // Ring 3 entry canonicalization: VM86 segments + VIF↔IF swap
     let vm86 = is_vm86(&full.regs);
+    let from_ring3 = vm86 || full.regs.frame.cs & 3 == 3;
     if vm86 {
         full.regs.es = full.vm86_es as u64;
         full.regs.ds = full.vm86_ds as u64;
         full.regs.fs = full.vm86_fs as u64;
         full.regs.gs = full.vm86_gs as u64;
-        // Without VME, CPU doesn't preserve VIF/VIP — restore from software state
-        if x86::read_cr4() & x86::cr4::VME == 0 {
+    }
+    if from_ring3 {
+        // VME: hardware maintained VIF/VIP — read into statics
+        if vm86 && x86::read_cr4() & x86::cr4::VME != 0 {
             unsafe {
-                if VIF { full.regs.frame.rflags |= 1 << 19; }
-                else { full.regs.frame.rflags &= !(1 << 19); }
-                if VIP { full.regs.frame.rflags |= 1 << 20; }
-                else { full.regs.frame.rflags &= !(1 << 20); }
+                VIF = full.regs.frame.rflags & (1 << 19) != 0;
+                VIP = full.regs.frame.rflags & (1 << 20) != 0;
             }
+        }
+        unsafe {
+            // IF = static_VIF (kernel uses IF as virtual interrupt flag)
+            if VIF { full.regs.frame.rflags |= 1 << 9; }
+            else { full.regs.frame.rflags &= !(1 << 9); }
+            // Restore VIP from static
+            if VIP { full.regs.frame.rflags |= 1 << 20; }
+            else { full.regs.frame.rflags &= !(1 << 20); }
         }
     }
 
@@ -246,16 +255,24 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
     // Mode toggle if output regs need different CPU mode
     toggle_mode_if_needed(&full.regs);
 
-    // VM86 decanonicalization: save VIF/VIP, swap segments out
-    if is_vm86(&full.regs) {
-        if x86::read_cr4() & x86::cr4::VME == 0 {
-            unsafe {
-                VIF = full.regs.frame.rflags & (1 << 19) != 0;
-                VIP = full.regs.frame.rflags & (1 << 20) != 0;
-            }
+    // Ring 3 exit decanonicalization: VIF↔IF swap + VM86 segments
+    let to_ring3 = is_vm86(&full.regs) || full.regs.frame.cs & 3 == 3;
+    if to_ring3 {
+        // Save virtual state to statics
+        unsafe {
+            VIF = full.regs.frame.rflags & (1 << 9) != 0;
+            VIP = full.regs.frame.rflags & (1 << 20) != 0;
         }
-        // Force IF=1 for VM86 IRET
+        // VME: write VIF/VIP into EFLAGS for hardware management
+        if is_vm86(&full.regs) && x86::read_cr4() & x86::cr4::VME != 0 {
+            if unsafe { VIF } { full.regs.frame.rflags |= 1 << 19; }
+            else { full.regs.frame.rflags &= !(1 << 19); }
+            // VIP already at bit 20
+        }
+        // Force IF=1 for real interrupt delivery
         full.regs.frame.rflags |= 0x200;
+    }
+    if is_vm86(&full.regs) {
         full.vm86_es = full.regs.es as u32;
         full.vm86_ds = full.regs.ds as u32;
         full.vm86_fs = full.regs.fs as u32;

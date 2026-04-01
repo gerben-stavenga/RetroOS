@@ -248,14 +248,15 @@ impl Tss {
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
+    // Except: trap 0x3DA (Input Status 1) so we can synthesize retrace signal
     (*tss).iopb[120] = 0x00;
     (*tss).iopb[121] = 0x00;
     (*tss).iopb[122] = 0x00;
-    (*tss).iopb[123] = 0x00;
-    // Interrupt redirection: only INT F0h traps to monitor.
+    (*tss).iopb[123] = 0x04; // trap bit 2 = port 0x3DA
+    // Interrupt redirection: only INT 31h traps to monitor.
     // All other intercepted INTs (20h, 21h, 28h, 2Eh, 2Fh) go through IVT
-    // to stubs that call INT F0h, which then traps here.
-    (*tss).int_redir[(0xF0 / 8) as usize] |= 1 << (0xF0 % 8);
+    // to stubs that call INT 31h, which then traps here.
+    (*tss).int_redir[(0x31 / 8) as usize] |= 1 << (0x31 % 8);
 }
 
 /// Check whether INT n is intercepted (bit set in redirection bitmap).

@@ -142,7 +142,7 @@ fn dump_thread_state(regs: &Regs) {
         let tid = if crate::thread::is_initialized() { crate::thread::current().tid } else { -1 };
         let vm86 = regs.flags32() & (1 << 17) != 0;
         if vm86 {
-            let vif = if crate::thread::is_initialized() { crate::thread::current().vm86.vif } else { false };
+            let vif = regs.flags32() & (1 << 9) != 0; // IF = virtual interrupt flag after arch swap
             let lin = (regs.cs32() << 4) + regs.ip32();
             let b = core::slice::from_raw_parts(lin as *const u8, 16);
             let ticks = *(0x46Cu32 as *const u32);

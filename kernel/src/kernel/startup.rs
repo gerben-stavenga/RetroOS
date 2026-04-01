@@ -205,10 +205,48 @@ fn event_loop(first_tid: usize) -> ! {
         let regs = unsafe { &mut *(&raw mut REGS) };
         drain_pending_irqs(thread, regs);
 
+        // Track IF transitions for debugging
+        {
+            static mut PREV_IF: bool = true;
+            static mut DUMPED: bool = false;
+            let cur_if = regs.frame.rflags & (1 << 9) != 0;
+            unsafe {
+                if PREV_IF && !cur_if {
+                    crate::dbg_println!("[IF] 1->0 before exec CS:EIP={:#06x}:{:#x}",
+                        regs.frame.cs as u16, regs.ip32());
+                } else if !PREV_IF && cur_if {
+                    crate::dbg_println!("[IF] 0->1 before exec CS:EIP={:#06x}:{:#x}",
+                        regs.frame.cs as u16, regs.ip32());
+                }
+                // One-shot dump: after 500 IF transitions, dump code bytes
+                static mut COUNT: u32 = 0;
+                if cur_if != PREV_IF {
+                    COUNT += 1;
+                    if COUNT == 500 && !DUMPED {
+                        DUMPED = true;
+                        let lin = if regs.mode() == crate::UserMode::VM86 {
+                            (regs.frame.cs as u32 & 0xFFFF) * 16 + regs.ip32()
+                        } else {
+                            regs.ip32()
+                        };
+                        // Dump from 0x9F-6 bytes before STI to see @@waitend and beyond
+                        let base = lin.wrapping_sub(6); // STI is at lin, 0x9F is ~6 before
+                        let bytes = core::slice::from_raw_parts(base as *const u8, 64);
+                        crate::dbg_println!("[DUMP] base_lin={:#x} (IP-6) 64 bytes={:02x?}", base, bytes);
+                    }
+                }
+                PREV_IF = cur_if;
+            }
+        }
+
         let (event, extra) = do_arch_execute();
 
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let regs = unsafe { &mut *(&raw mut REGS) };
+
+        if regs.mode() == crate::UserMode::Mode32 {
+            crate::dbg_println!("[evt] {} CS:EIP={:#06x}:{:#x}", event, regs.frame.cs as u16, regs.ip32());
+        }
 
         let new_tid = match event {
             0x80 => crate::kernel::syscalls::dispatch(regs),
@@ -248,6 +286,7 @@ fn event_loop(first_tid: usize) -> ! {
             _ => None,
         };
 
+
         if let Some(new_tid) = new_tid {
             if new_tid != tid {
                 let (old, new) = thread::get_two_threads(tid, new_tid);
@@ -267,64 +306,51 @@ fn event_loop(first_tid: usize) -> ! {
 }
 
 fn drain_pending_irqs(thread: &mut thread::Thread, regs: &mut crate::Regs) {
-    // Skip VM86 IRQ delivery during DPMI real-mode simulation (INT 31h/0300h).
-    // The VM86 mode was set up to run a single real-mode interrupt handler;
-    // injecting timer/keyboard IRQs would corrupt the carefully prepared frame.
+    let is_dos = regs.mode() == crate::UserMode::VM86
+        || (regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some());
+    // Skip during DPMI real-mode simulation — injecting IRQs would corrupt the frame.
     let dpmi_rm_call = thread.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some());
-    if regs.mode() == crate::UserMode::VM86 && !dpmi_rm_call {
+    if is_dos && !dpmi_rm_call {
+        // QEMU VGA workaround: re-set Odd/Even read mode for text modes.
+        if regs.mode() == crate::UserMode::VM86 {
+            qemu_vga_workaround(regs);
+        }
+        // Queue hardware events into virtual PIC/keyboard (shared devices)
         let tp = thread as *mut thread::Thread;
         let ticks = crate::arch::irq::take_pending_ticks();
         for _ in 0..ticks {
-            crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(crate::arch::irq::Irq::Tick));
+            crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, crate::arch::irq::Irq::Tick);
         }
         crate::arch::irq::drain(|evt| {
-            crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, Some(evt));
+            crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, evt);
         });
-        // Flush: try to deliver pending interrupts blocked by ISR in previous iterations.
-        crate::kernel::vm86::deliver_irq(unsafe { &mut *tp }, regs, None);
-    } else if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() {
-        // DPMI protected-mode: queue into vpic/vkbd (same devices as VM86),
-        // then deliver via PM interrupt vectors instead of IVT.
-        let tp = thread as *mut thread::Thread;
-        let ticks = crate::arch::irq::take_pending_ticks();
-        for _ in 0..ticks {
-            let due = unsafe { &mut *tp }.vm86.vpit.take_pending_irqs();
-            for _ in 0..due {
-                unsafe { &mut *tp }.vm86.vpic.push(0x08);
-            }
-        }
-        crate::arch::irq::drain(|evt| {
-            let t = unsafe { &mut *tp };
-            match evt {
-                crate::arch::irq::Irq::Key(sc) => {
-                    t.vm86.vkbd.push(sc);
-                    if t.vm86.vpic.isr & 0x02 == 0 && !t.vm86.vpic.has_pending_vec(0x09) {
-                        t.vm86.vpic.push(0x09);
-                    }
-                }
-                crate::arch::irq::Irq::Tick => {
-                    t.vm86.vpic.push(0x08);
-                }
-            }
-        });
-        // Deliver one pending interrupt (same ISR/EOI discipline as VM86)
-        // Also respect VIF: don't deliver while client has virtual interrupts disabled
-        // (prevents delivery between EOI and IRET in handler)
-        let t = unsafe { &mut *tp };
-        let vif = t.dpmi.as_ref().map_or(true, |d| d.vif);
-        if t.vm86.vpic.isr == 0 && vif {
-            if let Some(vec) = t.vm86.vpic.pop() {
-                // Clear VIF before entering handler (DPMI spec)
-                t.dpmi.as_mut().unwrap().vif = false;
-                crate::kernel::dpmi::deliver_hw_irq(t, regs, vec);
-            }
-        }
-    } else {
+        // Deliver one pending interrupt (shared VIF/VIP/ISR discipline)
+        crate::kernel::vm86::raise_pending(unsafe { &mut *tp }, regs);
+    } else if !is_dos {
         crate::arch::irq::drain(|evt| {
             if let crate::arch::irq::Irq::Key(sc) = evt {
                 crate::kernel::keyboard::process_key(sc);
             }
         });
+    }
+}
+
+/// QEMU VGA bug workaround: real VGA hardware forces Odd/Even read mode
+/// (GC5 bit 4) in text modes. QEMU doesn't, so re-set it on each trap.
+fn qemu_vga_workaround(regs: &crate::Regs) {
+    unsafe {
+        if regs.cs32() < 0xC000 {
+            let mode = *(0x449 as *const u8);
+            if mode <= 3 || mode == 7 {
+                let saved_idx = crate::arch::x86::inb(0x3CE);
+                crate::arch::x86::outb(0x3CE, 5);
+                let gc5 = crate::arch::x86::inb(0x3CF);
+                if gc5 & 0x10 == 0 {
+                    crate::arch::x86::outb(0x3CF, gc5 | 0x10);
+                }
+                crate::arch::x86::outb(0x3CE, saved_idx);
+            }
+        }
     }
 }
 

@@ -27,8 +27,6 @@ const MEM_BASE: u32 = 0x0050_0000;
 
 /// Maximum number of real-mode callbacks (INT 31h/0303h)
 const MAX_CALLBACKS: usize = 16;
-/// Base offset within STUB_SEG for callback entry stubs (each 2 bytes: CD F0)
-const CB_STUB_OFFSET: u16 = 0x0030;
 
 /// Per-thread DPMI state (heap-allocated, attached to Thread.dpmi)
 pub struct DpmiState {
@@ -42,8 +40,6 @@ pub struct DpmiState {
     pub mem_next: u32,
     /// Saved protected-mode state during real-mode callbacks (INT 31h/0300h)
     pub rm_save: Option<SavedPmState>,
-    /// Virtual interrupt flag for protected-mode code
-    pub vif: bool,
     /// Protected-mode interrupt vectors (set via INT 31h/0205h)
     /// (selector, offset) for each vector 0x00-0xFF
     pub pm_vectors: [(u16, u32); 256],
@@ -80,7 +76,6 @@ impl DpmiState {
             mem_blocks: [None; MAX_MEM_BLOCKS],
             mem_next: MEM_BASE,
             rm_save: None,
-            vif: true,
             pm_vectors: [(0, 0); 256],
             exc_vectors: [(0, 0); 32],
             callbacks: [None; MAX_CALLBACKS],
@@ -225,7 +220,7 @@ fn build_descriptor(base: u32, limit: u32, access: u64, flags: u64) -> u64 {
 // ============================================================================
 
 /// Switch from VM86 to 32-bit protected mode.
-/// Called from f0h_dispatch when the DPMI entry stub executes.
+/// Called from stub_dispatch when the DPMI entry stub executes.
 pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
     // Save VM86 register state for the FAR CALL return address
@@ -322,16 +317,14 @@ pub fn dpmi_enter(thread: &mut thread::Thread, regs: &mut Regs) {
     }
 
     // Default PM handlers for ALL interrupt vectors (DPMI spec requires these).
-    // DOS extenders read them via 0204 and store as chain-to addresses.
-    // Without defaults, DOS/4GW stores 0:0 and crashes on IRETD when chaining.
+    // Default PM vectors point into the unified CD 31 array at STUB_BASE.
+    // DOS extenders read them via INT 31h/0204h and store as chain-to addresses.
+    // When executed, CD 31 fires INT 31h (DPL=3) → dpmi_int31 detects stub_sel
+    // and reflects to real mode via IVT.
     let stub_sel = DpmiState::idx_to_sel(5);
-    const IRET_STUB: u32 = 0x0530;
-    unsafe {
-        *(IRET_STUB as *mut u8) = 0x66;       // operand-size override
-        *((IRET_STUB + 1) as *mut u8) = 0xCF; // IRETD
-    }
+    let stub_base = vm86::STUB_BASE;
     for vec in 0..=0xFFu16 {
-        dpmi.pm_vectors[vec as usize] = (stub_sel, IRET_STUB);
+        dpmi.pm_vectors[vec as usize] = (stub_sel, stub_base + (vec as u32) * 2);
     }
 
     // Store DPMI state on thread
@@ -396,16 +389,15 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
     match opcode {
         // CLI — clear virtual IF
         0xFA => {
-            dpmi.vif = false;
+            regs.frame.rflags &= !(1 << 9);
         }
         // STI — set virtual IF
         0xFB => {
-            dpmi.vif = true;
+            regs.frame.rflags |= 1 << 9;
         }
-        // PUSHF — push flags with virtual IF
+        // PUSHF — push flags (IF is already the virtual interrupt flag)
         0x9C => {
-            let mut flags = regs.flags32();
-            if dpmi.vif { flags |= 1 << 9; } else { flags &= !(1 << 9); }
+            let flags = regs.flags32();
             let sp = get_sp(regs);
             if op32 {
                 let new_sp = sp.wrapping_sub(4);
@@ -417,7 +409,7 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(new_sp)) as *mut u16, flags as u16); }
             }
         }
-        // POPF — pop flags, extract virtual IF
+        // POPF — pop flags (IF from popped value becomes virtual IF)
         0x9D => {
             let sp = get_sp(regs);
             let flags = if op32 {
@@ -429,7 +421,6 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 set_sp(regs, sp.wrapping_add(2));
                 v
             };
-            dpmi.vif = flags & (1 << 9) != 0;
             let preserved = regs.flags32() & (0x3000 | (1 << 17));
             regs.set_flags32((flags & !(0x3000 | (1 << 17))) | preserved);
         }
@@ -455,7 +446,6 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 set_sp(regs, sp.wrapping_add(12));
                 regs.set_ip32(new_eip);
                 regs.set_cs32(new_cs as u32);
-                dpmi.vif = new_flags & (1 << 9) != 0;
                 let preserved = regs.flags32() & (0x3000 | (1 << 17));
                 regs.set_flags32((new_flags & !(0x3000 | (1 << 17))) | preserved);
             } else {
@@ -469,7 +459,6 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
                 set_sp(regs, sp.wrapping_add(6));
                 regs.set_ip32(new_ip as u32);
                 regs.set_cs32(new_cs as u32);
-                dpmi.vif = new_flags & (1 << 9) != 0;
                 let preserved = regs.flags32() & (0x3000 | (1 << 17));
                 regs.set_flags32((new_flags & !(0x3000 | (1 << 17))) | preserved);
             }
@@ -538,6 +527,8 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
             advance = offset + 2;
             let new_ip = regs.ip32().wrapping_add(advance);
             let new_ip = if cs_32 { new_ip } else { new_ip & 0xFFFF };
+            // Note: stub-segment INT N no longer reaches here — stubs use CD 31
+            // (INT 31h, DPL=3) which goes to dpmi_int31 → pm_stub_dispatch.
             // Push 32-bit IRET frame on client stack.
             // DPMI interrupt dispatch uses 32-bit gates — always push dwords,
             // regardless of caller's operand size.  The handler's IRET (often
@@ -593,6 +584,8 @@ pub fn dpmi_monitor(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
 /// reflect to real mode via IVT.
 pub fn dpmi_soft_int(thread: &mut thread::Thread, regs: &mut Regs, vector: u8) -> Option<usize> {
     let dpmi = thread.dpmi.as_ref().unwrap();
+    // Note: stub-segment dispatch now goes through INT 31h → pm_stub_dispatch,
+    // so CS == stub_sel no longer reaches here.
     let (sel, off) = dpmi.pm_vectors[vector as usize];
     if sel != 0 {
         // PM handler installed — push IRET frame and dispatch
@@ -619,10 +612,70 @@ pub fn dpmi_soft_int(thread: &mut thread::Thread, regs: &mut Regs, vector: u8) -
 }
 
 // ============================================================================
+// PM stub dispatch — INT 31h from the unified CD 31 array
+// ============================================================================
+
+/// Dispatch INT 31h that came from the stub segment (CS == stub_sel).
+/// Slot = (EIP - STUB_BASE - 2) / 2.
+fn pm_stub_dispatch(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize> {
+    let eip = regs.ip32();
+    let stub_base = vm86::STUB_BASE;
+    let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
+
+    match slot {
+        vm86::SLOT_EXCEPTION_RET => {
+            return exception_return(thread, regs);
+        }
+        vm86::SLOT_PM_TO_REAL => {
+            return raw_switch_pm_to_real(thread, regs);
+        }
+        vm86::SLOT_SAVE_RESTORE => {
+            // No-op save/restore: pop the far-call return address and resume caller
+            let dpmi = thread.dpmi.as_ref().unwrap();
+            let ss_base = seg_base(dpmi, regs.stack_seg());
+            let ss_32 = seg_is_32(dpmi, regs.stack_seg());
+            let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
+            let ret_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
+            let ret_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
+            let new_sp = sp.wrapping_add(8);
+            if ss_32 { regs.set_sp32(new_sp); }
+            else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
+            regs.set_ip32(ret_eip);
+            regs.set_cs32(ret_cs);
+            None
+        }
+        _ => {
+            // Default: reflect to real mode via IVT.
+            // The CD 31 stub has no IRETD, so we must pop the IRET frame
+            // (pushed by deliver_hw_irq or INT dispatch) from the PM stack
+            // before saving state. This way callback_return restores to the
+            // original interrupted code, not the next stub entry.
+            let dpmi = thread.dpmi.as_ref().unwrap();
+            let ss_base = seg_base(dpmi, regs.stack_seg());
+            let ss_32 = seg_is_32(dpmi, regs.stack_seg());
+            let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
+            let ret_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
+            let ret_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
+            let ret_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
+            let new_sp = sp.wrapping_add(12);
+            if ss_32 { regs.set_sp32(new_sp); }
+            else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
+            regs.set_ip32(ret_eip);
+            regs.set_cs32(ret_cs);
+            let preserved = regs.flags32() & (0x3000 | (1 << 17));
+            regs.set_flags32((ret_flags & !(0x3000 | (1 << 17))) | preserved);
+            reflect_int_to_real_mode(thread, regs, slot)
+        }
+    }
+}
+
+// ============================================================================
 // INT 31h — DPMI services
 // ============================================================================
 
 /// Handle INT 31h from protected mode. Called from event loop when event=0x31.
+/// If CS is the stub segment, dispatch by slot number (reflect or PM-only stubs).
+/// Otherwise, dispatch as DPMI API by AX.
 pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize> {
     let dpmi = match thread.dpmi.as_mut() {
         Some(d) => d,
@@ -632,6 +685,12 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             return None;
         }
     };
+
+    // Unified stub array dispatch: CD 31 from stub segment → slot-based routing
+    let stub_sel = DpmiState::idx_to_sel(5);
+    if regs.code_seg() == stub_sel {
+        return pm_stub_dispatch(thread, regs);
+    }
 
     // Determine code segment address size — use16 means register offsets are 16-bit
     let cs_32 = seg_is_32(dpmi, regs.code_seg());
@@ -847,6 +906,7 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let int_num = regs.rbx as u8;
             let seg = regs.rcx as u16;
             let off = regs.rdx as u16;
+            crate::dbg_println!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
             vm86::write_u16(0, (int_num as u32) * 4, off);
             vm86::write_u16(0, (int_num as u32) * 4 + 2, seg);
             clear_carry(regs);
@@ -888,6 +948,7 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         // BL = interrupt number, CX:EDX = selector:offset
         0x0205 => {
             let int_num = regs.rbx as u8;
+            crate::dbg_println!("[DPMI] 0205 set vec {:02X} = {:04X}:{:#X}", int_num, regs.rcx as u16, regs.rdx as u32);
             dpmi.pm_vectors[int_num as usize] = (regs.rcx as u16, regs.rdx as u32);
             clear_carry(regs);
         }
@@ -921,8 +982,8 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
                         regs.es as u16,
                         regs.rdi as u32,
                     ));
-                    // Return real-mode address: STUB_SEG:(CB_STUB_OFFSET + i*2)
-                    let rm_off = CB_STUB_OFFSET + (i as u16) * 2;
+                    // Return real-mode address: STUB_SEG:slot_offset(SLOT_CB_ENTRY_BASE + i)
+                    let rm_off = vm86::slot_offset(vm86::SLOT_CB_ENTRY_BASE + i as u8);
                     regs.rcx = (regs.rcx & !0xFFFF) | vm86::STUB_SEG as u64;
                     regs.rdx = (regs.rdx & !0xFFFF) | rm_off as u64;
                     clear_carry(regs);
@@ -935,8 +996,10 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         0x0304 => {
             let dpmi = thread.dpmi.as_mut().unwrap();
             let off = regs.rdx as u16;
-            if off >= CB_STUB_OFFSET && off < CB_STUB_OFFSET + (MAX_CALLBACKS as u16) * 2 {
-                let idx = ((off - CB_STUB_OFFSET) / 2) as usize;
+            let cb_base = vm86::slot_offset(vm86::SLOT_CB_ENTRY_BASE);
+            let cb_end = vm86::slot_offset(vm86::SLOT_CB_ENTRY_END);
+            if off >= cb_base && off < cb_end {
+                let idx = ((off - cb_base) / 2) as usize;
                 dpmi.callbacks[idx] = None;
                 clear_carry(regs);
             } else {
@@ -1065,21 +1128,21 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         // AX=0900h — Get and Disable Virtual Interrupt State
         // Returns: AL = previous state (1=enabled, 0=disabled)
         0x0900 => {
-            let prev = if dpmi.vif { 1u64 } else { 0u64 };
-            dpmi.vif = false;
+            let prev = if regs.frame.rflags & (1 << 9) != 0 { 1u64 } else { 0u64 };
+            regs.frame.rflags &= !(1 << 9);
             regs.rax = (regs.rax & !0xFF) | prev;
             clear_carry(regs);
         }
         // AX=0901h — Get and Enable Virtual Interrupt State
         0x0901 => {
-            let prev = if dpmi.vif { 1u64 } else { 0u64 };
-            dpmi.vif = true;
+            let prev = if regs.frame.rflags & (1 << 9) != 0 { 1u64 } else { 0u64 };
+            regs.frame.rflags |= 1 << 9;
             regs.rax = (regs.rax & !0xFF) | prev;
             clear_carry(regs);
         }
         // AX=0902h — Get Virtual Interrupt State
         0x0902 => {
-            regs.rax = (regs.rax & !0xFF) | if dpmi.vif { 1 } else { 0 };
+            regs.rax = (regs.rax & !0xFF) | if regs.frame.rflags & (1 << 9) != 0 { 1 } else { 0 };
             clear_carry(regs);
         }
         // AX=0A00h — Get Vendor-Specific API Entry Point (not supported)
@@ -1090,13 +1153,13 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         // Returns buffer size and save/restore entry points
         0x0305 => {
             regs.rax = (regs.rax & !0xFFFF);  // AX=0: no buffer needed
-            // Real-mode save/restore: point to RETF in stub area (0x0050:0x0002)
+            // Real-mode save/restore: stub slot SLOT_SAVE_RESTORE
             regs.rbx = (regs.rbx & !0xFFFF) | vm86::STUB_SEG as u64;
-            regs.rcx = (regs.rcx & !0xFFFF) | 0x0002;  // offset of RETF byte
-            // Protected-mode save/restore: stub code selector:0x0502 (RETF at linear 0x0502)
+            regs.rcx = (regs.rcx & !0xFFFF) | vm86::slot_offset(vm86::SLOT_SAVE_RESTORE) as u64;
+            // Protected-mode save/restore: stub_sel:STUB_BASE + SLOT_SAVE_RESTORE*2
             let stub_sel = DpmiState::idx_to_sel(5);
             regs.rsi = (regs.rsi & !0xFFFF) | stub_sel as u64;
-            regs.rdi = (regs.rdi & !0xFFFF) | 0x0502;  // offset = linear addr (base=0)
+            regs.rdi = (regs.rdi & !0xFFFF) | (vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_SAVE_RESTORE) as u32) as u64;
             clear_carry(regs);
         }
         // AX=0306h — Get Raw Mode Switch Addresses
@@ -1104,22 +1167,12 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
         0x0306 => {
             // BX:CX = real-to-PM entry point (real-mode segment:offset)
             regs.rbx = (regs.rbx & !0xFFFF) | vm86::STUB_SEG as u64;
-            regs.rcx = (regs.rcx & !0xFFFF) | 0x0021;  // offset of real-to-PM stub
+            regs.rcx = (regs.rcx & !0xFFFF) | vm86::slot_offset(vm86::SLOT_RAW_REAL_TO_PM) as u64;
             // SI:(E)DI = PM-to-real entry point (selector:offset)
-            let stub_sel = DpmiState::idx_to_sel(5);  // LDT[5]: base=0 code segment
+            let stub_sel = DpmiState::idx_to_sel(5);
             regs.rsi = (regs.rsi & !0xFFFF) | stub_sel as u64;
-            regs.rdi = (regs.rdi & !0xFFFFFFFF) | 0x0523;  // offset of PUSH AX; MOV AX,FF01; INT 31h
+            regs.rdi = (regs.rdi & !0xFFFFFFFF) | (vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_PM_TO_REAL) as u32) as u64;
             clear_carry(regs);
-        }
-        // AX=FF00h — Private: exception handler return
-        0xFF00 => {
-            return exception_return(thread, regs);
-        }
-        // AX=FF01h — Private: raw mode switch PM→real
-        // Stub did PUSH AX (saved new DS) then MOV AX,FF01; INT 31h
-        // Remaining regs per raw switch convention: BX=SP, CX=ES, DX=SS, SI=CS, DI=IP
-        0xFF01 => {
-            return raw_switch_pm_to_real(thread, regs);
         }
         // AX=0507h — Set Page Attributes (DPMI 1.0)
         // All our memory is committed, so this is a no-op.
@@ -1233,8 +1286,8 @@ fn simulate_real_mode_int(thread: &mut thread::Thread, regs: &mut Regs, cs_32: b
     regs.gs = rm.gs as u64;
 
     // Push IRET frame for callback return: FLAGS, callback_stub_seg, callback_stub_off
-    // The callback stub at 0x0050:0x0006 does INT F0h which triggers callback_return
-    let callback_off: u16 = 0x0006;
+    // The callback stub (SLOT_CALLBACK_RET) does INT 31h which triggers callback_return
+    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
     let callback_seg: u16 = vm86::STUB_SEG;
 
     regs.frame.ss = rm_ss as u64;
@@ -1250,8 +1303,11 @@ fn simulate_real_mode_int(thread: &mut thread::Thread, regs: &mut Regs, cs_32: b
     regs.frame.rip = ivt_off as u64;
     regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
 
+    crate::dbg_println!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
+        int_num, ivt_seg, ivt_off, rm_ss, rm_sp.wrapping_sub(6));
+
     // Now in VM86 mode — the event loop will execute the BIOS handler.
-    // When it IRETs to callback_stub, INT F0h fires, and callback_return() is called.
+    // When it IRETs to callback_stub, INT 31h fires, and callback_return() is called.
     None
 }
 
@@ -1293,7 +1349,7 @@ fn reflect_int_to_real_mode(thread: &mut thread::Thread, regs: &mut Regs, vector
     regs.frame.rsp = rm_sp as u64;
 
     // Push callback return IRET frame on VM86 stack
-    let callback_off: u16 = 0x0006;
+    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
     let callback_seg: u16 = vm86::STUB_SEG;
     vm86::vm86_push(regs, 0); // flags
     vm86::vm86_push(regs, callback_seg);
@@ -1309,6 +1365,9 @@ fn reflect_int_to_real_mode(thread: &mut thread::Thread, regs: &mut Regs, vector
     regs.es = rm_es as u64;
     regs.fs = rm_fs as u64;
     regs.gs = rm_gs as u64;
+
+    crate::dbg_println!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
+        vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32());
 
     None
 }
@@ -1347,7 +1406,7 @@ fn call_real_mode_proc(thread: &mut thread::Thread, regs: &mut Regs, cs_32: bool
     regs.fs = rm.fs as u64;
     regs.gs = rm.gs as u64;
 
-    let callback_off: u16 = 0x0006;
+    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
     let callback_seg: u16 = vm86::STUB_SEG;
 
     regs.frame.ss = rm_ss as u64;
@@ -1395,7 +1454,7 @@ fn call_real_mode_proc_iret(thread: &mut thread::Thread, regs: &mut Regs, cs_32:
     regs.fs = rm.fs as u64;
     regs.gs = rm.gs as u64;
 
-    let callback_off: u16 = 0x0006;
+    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
     let callback_seg: u16 = vm86::STUB_SEG;
 
     regs.frame.ss = rm_ss as u64;
@@ -1478,7 +1537,7 @@ pub fn callback_entry(thread: &mut thread::Thread, regs: &mut Regs, cb_idx: usiz
 }
 
 /// Return from real-mode callback to protected mode.
-/// Called from f0h_dispatch when the callback return stub fires.
+/// Called from stub_dispatch when the callback return stub fires.
 pub fn callback_return(thread: &mut thread::Thread, regs: &mut Regs) {
     let dpmi = match thread.dpmi.as_mut() {
         Some(d) => d,
@@ -1584,6 +1643,12 @@ pub fn deliver_hw_irq(thread: &mut thread::Thread, regs: &mut Regs, vector: u8) 
         core::ptr::write_unaligned(base.add(2), regs.flags32());
     }
 
+    let handler_lin = seg_base(dpmi, sel).wrapping_add(off);
+    let bytes = unsafe { core::slice::from_raw_parts(handler_lin as *const u8, 16) };
+    crate::dbg_println!("[deliver_hw] vec={:#04x} -> {:04x}:{:#x} (lin={:#x}) [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+        vector, sel, off, handler_lin,
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
 
@@ -1658,10 +1723,10 @@ pub fn dispatch_dpmi_exception(thread: &mut thread::Thread, regs: &mut Regs, exc
     push32(&mut sp, regs.ip32());                  // faulting EIP
     push32(&mut sp, regs.err_code as u32);         // error code
     // Return address for the handler's RETF — point to our exception return stub
-    // at LDT[5]:0x052A which does MOV AX,0xFF00; INT 31h
+    // at LDT[5]:STUB_BASE + SLOT_EXCEPTION_RET*2 (CD 31 → pm_stub_dispatch)
     let stub_sel = DpmiState::idx_to_sel(5);
     push32(&mut sp, stub_sel as u32);              // return CS
-    push32(&mut sp, 0x052A);                       // return EIP
+    push32(&mut sp, (vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_EXCEPTION_RET) as u32));  // return EIP
 
     // Set up regs to call the exception handler
     if ss_32 {
@@ -1731,23 +1796,18 @@ fn exception_return(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usiz
 // ============================================================================
 
 /// PM-to-real raw mode switch.
-/// Called via INT 31h/0xFF01 from the stub: PUSH AX; MOV AX,0xFF01; INT 31h.
-/// The caller's AX (= new DS) was pushed on the user stack by the stub.
+/// Raw mode switch PM→real. Called via unified stub slot SLOT_PM_TO_REAL.
+/// AX has new DS directly (stub is just CD 31, no register clobbering).
 ///
 /// Register convention (set by caller before CALL FAR):
-///   AX = new real-mode DS  (saved on stack by stub, AX now = 0xFF01)
+///   AX = new real-mode DS
 ///   CX = new real-mode ES
 ///   DX = new real-mode SS
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize> {
-    let dpmi = thread.dpmi.as_ref().unwrap();
-
-    // Read saved AX (new DS) from user stack — stub did PUSH AX before INT 31h
-    let ss_base = seg_base(dpmi, regs.stack_seg());
-    let new_ds = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(regs.sp32())) as *const u16) };
-
+fn raw_switch_pm_to_real(_thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize> {
+    let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
     let new_sp = regs.rbx as u16;
@@ -1767,12 +1827,14 @@ fn raw_switch_pm_to_real(thread: &mut thread::Thread, regs: &mut Regs) -> Option
     regs.es = new_es as u64;
     regs.fs = 0;
     regs.gs = 0;
+    crate::dbg_println!("[DPMI] raw PM->RM {:04X}:{:04X} SS:SP={:04X}:{:04X}",
+        new_cs, new_ip, new_ss, new_sp);
     None
 }
 
 /// Real-to-PM raw mode switch.
-/// Called from f0h_dispatch when VM86 code executes `CALL FAR` to the
-/// real-to-PM entry stub (0x0050:0x0021 → INT F0h trap).
+/// Called from stub_dispatch when VM86 code executes `CALL FAR` to
+/// stub slot SLOT_RAW_REAL_TO_PM (INT 31h trap).
 ///
 /// Register convention (set by caller before CALL FAR):
 ///   AX = new PM DS selector
