@@ -39,6 +39,18 @@ _BASE_FILES = {
     "//apps/wolf3d:VGAGRAPH.WL1": "WOLF3D/VGAGRAPH.WL1",
     "//apps/wolf3d:VGAHEAD.WL1": "WOLF3D/VGAHEAD.WL1",
     "//apps/wolf3d:VSWAP.WL1": "WOLF3D/VSWAP.WL1",
+    "//apps/dn:DN.COM": "DN.COM",
+    "//apps/dn:DN.PRG": "DN.PRG",
+    "//apps/dn:DN.OVR": "DN.OVR",
+    "//apps/dn:DN.DLG": "DN.DLG",
+    "//apps/dn:DN.LNG": "DN.LNG",
+    "//apps/dn:DN.HLP": "DN.HLP",
+    "//apps/dn:DN.EDT": "DN.EDT",
+    "//apps/dn:DN.EXT": "DN.EXT",
+    "//apps/dn:DN.HGL": "DN.HGL",
+    "//apps/dn:DN.MNU": "DN.MNU",
+    "//apps/dn:DN.VWR": "DN.VWR",
+    "//apps/dn:DN.XRN": "DN.XRN",
 }
 
 # Proprietary files (not for public distribution)

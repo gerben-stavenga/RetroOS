@@ -28,6 +28,58 @@ const EMS_ENABLED: bool = false;
 /// Writes to this handle are silently discarded (/dev/null semantics).
 const NULL_FILE_HANDLE: u16 = 99;
 
+/// RAM-backed temporary file (for swap files, config writes, etc.)
+const TEMP_FILE_BASE: u16 = 80;
+const MAX_TEMP_FILES: usize = 8;
+
+struct TempFile {
+    data: alloc::vec::Vec<u8>,
+    pos: usize,
+    active: bool,
+}
+
+impl TempFile {
+    const fn empty() -> Self {
+        Self { data: alloc::vec::Vec::new(), pos: 0, active: false }
+    }
+}
+
+fn temp_files() -> &'static mut [TempFile; MAX_TEMP_FILES] {
+    static mut FILES: [TempFile; MAX_TEMP_FILES] = {
+        const EMPTY: TempFile = TempFile::empty();
+        [EMPTY; MAX_TEMP_FILES]
+    };
+    unsafe { &mut *core::ptr::addr_of_mut!(FILES) }
+}
+
+fn temp_file_alloc() -> Option<u16> {
+    let files = temp_files();
+    for i in 0..MAX_TEMP_FILES {
+        if !files[i].active {
+            files[i] = TempFile { data: alloc::vec::Vec::new(), pos: 0, active: true };
+            return Some(TEMP_FILE_BASE + i as u16);
+        }
+    }
+    None
+}
+
+fn temp_file_get(handle: u16) -> Option<&'static mut TempFile> {
+    if handle < TEMP_FILE_BASE || handle >= TEMP_FILE_BASE + MAX_TEMP_FILES as u16 {
+        return None;
+    }
+    let f = &mut temp_files()[(handle - TEMP_FILE_BASE) as usize];
+    if f.active { Some(f) } else { None }
+}
+
+fn temp_file_close(handle: u16) {
+    if handle >= TEMP_FILE_BASE && handle < TEMP_FILE_BASE + MAX_TEMP_FILES as u16 {
+        let f = &mut temp_files()[(handle - TEMP_FILE_BASE) as usize];
+        f.data = alloc::vec::Vec::new();
+        f.pos = 0;
+        f.active = false;
+    }
+}
+
 /// Flags that VM86 code cannot change (IOPL, VM)
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
 
@@ -85,8 +137,10 @@ fn set_vm86_flags(regs: &mut Regs, flags: u32) {
 
 
 /// .COM load segment (standard DOS convention: PSP at seg:0000, code at seg:0100)
-/// Low address maximizes conventional memory (stubs end at 0x0700, page 0 is COW).
-pub const COM_SEGMENT: u16 = 0x0080;
+/// Low address maximizes conventional memory.  Must be high enough that the
+/// environment block (COM_SEGMENT-0x10, 256 bytes) doesn't overlap the SFT
+/// which ends at ~0x0BE2.
+pub const COM_SEGMENT: u16 = 0x00D0;
 /// .COM code offset within segment
 const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer (top of 64KB segment)
@@ -1688,6 +1742,69 @@ fn int_21h(regs: &mut Regs) -> Action {
             }
             Action::Done
         }
+        // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready
+        0x0B => {
+            static mut OB_COUNT: u32 = 0;
+            unsafe {
+                OB_COUNT += 1;
+                if OB_COUNT == 1 {
+                    // BDA video state at 0040:0049
+                    let mode = *(0x449 as *const u8);
+                    let cols = (0x44A as *const u16).read_unaligned();
+                    let rows = *(0x484 as *const u8);
+                    let crtc = (0x463 as *const u16).read_unaligned();
+                    let page = *(0x462 as *const u8);
+                    dbg_println!("[BDA] mode={:02x} cols={} rows={} crtc={:04x} page={}",
+                        mode, cols, rows + 1, crtc, page);
+                    // Check VGA row 0
+                    let vga = core::slice::from_raw_parts(0xB8000 as *const u8, 160);
+                    let mut chars = [b'.'; 80];
+                    for c in 0..80 {
+                        let b = vga[c*2];
+                        if b >= 0x20 && b < 0x7F { chars[c] = b; }
+                    }
+                    dbg_println!("[VGA] pg0 row0: {} attr={:02x}", core::str::from_utf8(&chars).unwrap_or("?"), vga[1]);
+                    // Also check page 1 (offset 0x1000 = 4096)
+                    let vga1 = core::slice::from_raw_parts(0xB9000 as *const u8, 160);
+                    let mut chars1 = [b'.'; 80];
+                    for c in 0..80 {
+                        let b = vga1[c*2];
+                        if b >= 0x20 && b < 0x7F { chars1[c] = b; }
+                    }
+                    dbg_println!("[VGA] pg1 row0: {} attr={:02x}", core::str::from_utf8(&chars1).unwrap_or("?"), vga1[1]);
+                    // Check CRTC start address (regs 0Ch/0Dh)
+                    crate::arch::x86::outb(crtc as u16, 0x0C);
+                    let start_hi = crate::arch::x86::inb(crtc as u16 + 1);
+                    crate::arch::x86::outb(crtc as u16, 0x0D);
+                    let start_lo = crate::arch::x86::inb(crtc as u16 + 1);
+                    let start_addr = ((start_hi as u16) << 8) | start_lo as u16;
+                    dbg_println!("[VGA] CRTC start_addr={:#06x} (page={})", start_addr, start_addr / 0x800);
+                    // Check mono buffer B000:0000
+                    let mono = core::slice::from_raw_parts(0xB0000 as *const u8, 160);
+                    let mut mchars = [b'.'; 80];
+                    for c in 0..80 {
+                        let b = mono[c*2];
+                        if b >= 0x20 && b < 0x7F { mchars[c] = b; }
+                    }
+                    dbg_println!("[VGA] mono row0: {} attr={:02x}", core::str::from_utf8(&mchars).unwrap_or("?"), mono[1]);
+                    // Write test via kernel mapping (LOW_MEM_BASE + 0xB8000)
+                    let test = b"DN_TEST";
+                    let vga_k = (crate::arch::paging2::LOW_MEM_BASE + 0xB8000) as *mut u8;
+                    for (j, &ch) in test.iter().enumerate() {
+                        *vga_k.add(j * 2) = ch;
+                        *vga_k.add(j * 2 + 1) = 0x4F; // white on red
+                    }
+                    // Read PTE for page 0xB8 directly from page table memory
+                    let pte_addr = crate::arch::paging2::LOW_MEM_BASE + 0xB8000;
+                    let user_val = *(0xB8000 as *const u16);
+                    let kern_val = *(pte_addr as *const u16);
+                    dbg_println!("[VGA] user@B8000={:#06x} kern@{:#x}={:#06x} same={}",
+                        user_val, pte_addr, kern_val, user_val == kern_val);
+                }
+            }
+            regs.rax = (regs.rax & !0xFF) | 0x00; // no character available
+            Action::Done
+        }
         // AH=0x25: Set interrupt vector (AL=int, DS:DX=handler)
         0x25 => {
             let int_num = regs.rax as u8;
@@ -1851,10 +1968,8 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 let fd = crate::kernel::vfs::open(&name[..i]);
                 if fd >= 0 {
-                    if crate::kernel::thread::current().dpmi.is_some() {
-                        crate::dbg_println!("DOS 3Dh OK DS:DX={:04x}:{:04x} fd={} name={}",
-                            ds, dx, fd, core::str::from_utf8(&name[..i]).unwrap_or("?"));
-                    }
+                    crate::dbg_println!("DOS 3Dh OK fd={} name={}",
+                        fd, core::str::from_utf8(&name[..i]).unwrap_or("?"));
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd);
                     sft_set_file(fd as u16, size);
@@ -1865,13 +1980,8 @@ fn int_21h(regs: &mut Regs) -> Action {
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
-                    if crate::kernel::thread::current().dpmi.is_some() {
-                        let lin = (ds << 4) + dx;
-                        let hex: [u8; 32] = unsafe { core::ptr::read(lin as *const [u8; 32]) };
-                        crate::dbg_println!("DOS 3Dh FAIL DS:DX={:04x}:{:04x} lin={:#x} hex={:02x?} name={}",
-                            ds, dx, lin, hex,
-                            core::str::from_utf8(&name[..i]).unwrap_or("?"));
-                    }
+                    crate::dbg_println!("DOS 3Dh FAIL name={}",
+                        core::str::from_utf8(&name[..i]).unwrap_or("?"));
                     regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
                     regs.set_flag32(1); // set carry
                 }
@@ -1881,7 +1991,9 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
             let handle = regs.rbx as u16;
-            if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
+            if handle >= TEMP_FILE_BASE && handle < TEMP_FILE_BASE + MAX_TEMP_FILES as u16 {
+                temp_file_close(handle);
+            } else if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
                 crate::kernel::vfs::close(handle as i32);
                 sft_clear(handle);
             }
@@ -1904,6 +2016,17 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else if handle == NULL_FILE_HANDLE as i32 {
                 // /dev/null — return 0 bytes (EOF)
                 regs.rax = regs.rax & !0xFFFF;
+                regs.clear_flag32(1);
+            } else if let Some(tf) = temp_file_get(handle as u16) {
+                let avail = tf.data.len().saturating_sub(tf.pos);
+                let n = count.min(avail);
+                if n > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(tf.data.as_ptr().add(tf.pos), buf_addr as *mut u8, n);
+                    }
+                    tf.pos += n;
+                }
+                regs.rax = (regs.rax & !0xFFFF) | n as u64;
                 regs.clear_flag32(1);
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
@@ -2058,10 +2181,15 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.rax = (regs.rax & !0xFF) | 3; // AL = number of logical drives
             Action::Done
         }
-        // AH=0x3C: Create file — read-only FS, return /dev/null handle
+        // AH=0x3C: Create file — allocate RAM-backed temp file
         0x3C => {
-            regs.rax = (regs.rax & !0xFFFF) | NULL_FILE_HANDLE as u64;
-            regs.clear_flag32(1);
+            if let Some(handle) = temp_file_alloc() {
+                regs.rax = (regs.rax & !0xFFFF) | handle as u64;
+                regs.clear_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | 4; // too many open files
+                regs.set_flag32(1);
+            }
             Action::Done
         }
         // AH=0x40: Write to file (BX=handle, CX=count, DS:DX=buffer)
@@ -2076,8 +2204,20 @@ fn int_21h(regs: &mut Regs) -> Action {
                     vga::vga().putchar(ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
+            } else if let Some(tf) = temp_file_get(handle) {
+                let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+                let n = count as usize;
+                let end = tf.pos + n;
+                if end > tf.data.len() {
+                    tf.data.resize(end, 0);
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(addr as *const u8, tf.data.as_mut_ptr().add(tf.pos), n);
+                }
+                tf.pos = end;
+                regs.rax = (regs.rax & !0xFFFF) | count as u64;
+                regs.clear_flag32(1);
             } else if handle == NULL_FILE_HANDLE {
-                // /dev/null — silently discard, report all bytes written
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
@@ -2092,6 +2232,18 @@ fn int_21h(regs: &mut Regs) -> Action {
                 // /dev/null — always at position 0
                 regs.rdx = regs.rdx & !0xFFFF;
                 regs.rax = regs.rax & !0xFFFF;
+                regs.clear_flag32(1);
+            } else if let Some(tf) = temp_file_get(handle as u16) {
+                let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
+                let whence = regs.rax as u8;
+                let new_pos = match whence {
+                    0 => offset as usize,           // SEEK_SET
+                    1 => (tf.pos as i32 + offset) as usize, // SEEK_CUR
+                    _ => (tf.data.len() as i32 + offset) as usize, // SEEK_END
+                };
+                tf.pos = new_pos;
+                regs.rdx = (regs.rdx & !0xFFFF) | ((new_pos as u32 >> 16) as u64);
+                regs.rax = (regs.rax & !0xFFFF) | (new_pos as u16 as u64);
                 regs.clear_flag32(1);
             } else {
                 let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
@@ -2343,10 +2495,74 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.clear_flag32(1);
             Action::Done
         }
+        // AH=0x59: Get Extended Error Information
+        0x59 => {
+            // Return "file not found" as default extended error
+            regs.rax = (regs.rax & !0xFFFF) | 2; // AX = error code (file not found)
+            regs.rbx = (regs.rbx & !0xFFFF) | ((1 << 8) | 2); // BH=1 (class: out of resource), BL=2 (action: abort)
+            regs.rcx = (regs.rcx & !0xFFFF); // CH=0 (locus: unknown)
+            regs.clear_flag32(1);
+            Action::Done
+        }
+        // AH=0x4D: Get Return Code of Subprocess
+        0x4D => {
+            regs.rax = regs.rax & !0xFFFF; // AL=exit code 0, AH=0 (normal termination)
+            Action::Done
+        }
         // AH=0x62: Get PSP segment (returns BX=PSP segment)
         0x62 => {
             regs.rbx = (regs.rbx & !0xFFFF) | COM_SEGMENT as u64;
             regs.clear_flag32(1);
+            Action::Done
+        }
+        // AH=0x6C: Extended Open/Create (DOS 4.0+)
+        // BX=mode, CX=attributes, DX=action, DS:SI=ASCIIZ filename
+        // Action: bit0=open-if-exists, bit4=create-if-not-exists
+        0x6C => {
+            let action = regs.rdx as u16;
+            let ds = regs.ds as u16 as u32;
+            let si = regs.rsi as u16 as u32;
+            let mut addr = (ds << 4) + si;
+            let mut name = [0u8; 64];
+            let mut i = 0;
+            while i < 63 {
+                let ch = unsafe { *(addr as *const u8) };
+                if ch == 0 { break; }
+                name[i] = ch;
+                addr += 1;
+                i += 1;
+            }
+            let open_exists = action & 0x01 != 0;
+            let create_not = action & 0x10 != 0;
+
+            // Try open first
+            let fd = crate::kernel::vfs::open(&name[..i]);
+            if fd >= 0 && open_exists {
+                let size = crate::kernel::vfs::file_size(fd);
+                sft_set_file(fd as u16, size);
+                unsafe {
+                    let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
+                    if (fd as usize) < 20 { *psp.add(0x34 + fd as usize) = fd as u8; }
+                }
+                regs.rax = (regs.rax & !0xFFFF) | fd as u64;
+                regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
+                regs.clear_flag32(1);
+            } else if create_not {
+                // File doesn't exist — create RAM-backed temp file
+                if fd >= 0 { crate::kernel::vfs::close(fd); }
+                if let Some(handle) = temp_file_alloc() {
+                    regs.rax = (regs.rax & !0xFFFF) | handle as u64;
+                    regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
+                    regs.clear_flag32(1);
+                } else {
+                    regs.rax = (regs.rax & !0xFFFF) | 4;
+                    regs.set_flag32(1);
+                }
+            } else {
+                if fd >= 0 { crate::kernel::vfs::close(fd); }
+                regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
+                regs.set_flag32(1);
+            }
             Action::Done
         }
         _ => {
