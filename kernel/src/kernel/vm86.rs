@@ -136,11 +136,9 @@ fn set_vm86_flags(regs: &mut Regs, flags: u32) {
 
 
 
-/// .COM load segment (standard DOS convention: PSP at seg:0000, code at seg:0100)
-/// Low address maximizes conventional memory.  Must be high enough that the
-/// environment block (COM_SEGMENT-0x10, 256 bytes) doesn't overlap the SFT
-/// which ends at ~0x0BE2.
-pub const COM_SEGMENT: u16 = 0x00D0;
+/// .COM load segment — derived from DOS_AREA_END so the environment block
+/// (COM_SEGMENT-0x10, 256 bytes) never overlaps kernel structures.
+pub const COM_SEGMENT: u16 = ((DOS_AREA_END + 0xF) >> 4) as u16 + 0x10;
 /// .COM code offset within segment
 const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer (top of 64KB segment)
@@ -148,12 +146,176 @@ const COM_SP: u16 = 0xFFFE;
 
 pub const HMA_PAGE_COUNT: usize = 16;
 
-/// Per-thread VM86 state.
+/// Global VGA Attribute Controller flip-flop — tracks real hardware state.
+/// true = next write to 0x3C0 is an index byte; false = data byte.
+pub static mut VGA_AC_FLIPFLOP: bool = true;
+
+/// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
+/// Saved/restored on context switch so each process has its own screen.
+pub struct VgaState {
+    /// 4 planes × 64KB = 256KB framebuffer (flat: plane 0 at [0..65536], etc.)
+    pub planes: alloc::vec::Vec<u8>,
+    // ── Registers ──
+    pub misc_output: u8,
+    pub seq: [u8; 5],
+    pub crtc: [u8; 25],
+    pub gc: [u8; 9],
+    pub ac: [u8; 21],
+    pub dac: [u8; 768],
+    pub dac_mask: u8,
+    // ── Port index / state ──
+    pub seq_index: u8,
+    pub crtc_index: u8,
+    pub gc_index: u8,
+    pub ac_index: u8,
+    pub ac_flipflop: bool,
+    pub dac_read_index: u8,
+    pub dac_write_index: u8,
+    pub dac_rgb_pos: u8,
+}
+
+impl VgaState {
+    pub fn new() -> Self {
+        Self {
+            planes: alloc::vec::Vec::new(),
+            misc_output: 0,
+            seq: [0; 5],
+            crtc: [0; 25],
+            gc: [0; 9],
+            ac: [0; 21],
+            dac: [0; 768],
+            dac_mask: 0xFF,
+            seq_index: 0,
+            crtc_index: 0,
+            gc_index: 0,
+            ac_index: 0,
+            ac_flipflop: true,
+            dac_read_index: 0,
+            dac_write_index: 0,
+            dac_rgb_pos: 0,
+        }
+    }
+
+    /// Read current VGA hardware state into this struct.
+    pub fn save_from_hardware(&mut self) {
+        use crate::arch::x86::{inb, outb};
+        if self.planes.is_empty() {
+            self.planes = alloc::vec![0u8; 4 * 65536];
+        }
+        // Misc output
+        self.misc_output = inb(0x3CC);
+        // Sequencer
+        for i in 0..5u8 {
+            outb(0x3C4, i);
+            self.seq[i as usize] = inb(0x3C5);
+        }
+        self.seq_index = inb(0x3C4);
+        // CRTC
+        for i in 0..25u8 {
+            outb(0x3D4, i);
+            self.crtc[i as usize] = inb(0x3D5);
+        }
+        self.crtc_index = inb(0x3D4);
+        // Graphics Controller
+        for i in 0..9u8 {
+            outb(0x3CE, i);
+            self.gc[i as usize] = inb(0x3CF);
+        }
+        self.gc_index = inb(0x3CE);
+        // Attribute Controller — reset flipflop first
+        let _ = inb(0x3DA);
+        for i in 0..21u8 {
+            outb(0x3C0, i);
+            self.ac[i as usize] = inb(0x3C1);
+        }
+        // Re-enable display (AC index bit 5)
+        outb(0x3C0, 0x20);
+        // DAC
+        self.dac_mask = inb(0x3C6);
+        outb(0x3C7, 0); // read index = 0
+        for i in 0..768 {
+            self.dac[i] = inb(0x3C9);
+        }
+        // Save planes — set read plane via GC reg 4, read 64KB each
+        outb(0x3CE, 4); // select GC "Read Map Select" register
+        for plane in 0..4u8 {
+            outb(0x3CF, plane);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    0xA0000 as *const u8,
+                    self.planes[plane as usize * 65536..].as_mut_ptr(),
+                    65536,
+                );
+            }
+        }
+        // Restore GC index
+        outb(0x3CE, self.gc_index);
+    }
+
+    /// Write this struct's state to VGA hardware.
+    pub fn restore_to_hardware(&self) {
+        if self.planes.is_empty() { return; }
+        use crate::arch::x86::{inb, outb};
+        // Misc output
+        outb(0x3C2, self.misc_output);
+        // Sequencer
+        for i in 0..5u8 {
+            outb(0x3C4, i);
+            outb(0x3C5, self.seq[i as usize]);
+        }
+        // CRTC — unlock first (clear protect bit in reg 0x11)
+        outb(0x3D4, 0x11);
+        outb(0x3D5, self.crtc[0x11] & 0x7F);
+        for i in 0..25u8 {
+            outb(0x3D4, i);
+            outb(0x3D5, self.crtc[i as usize]);
+        }
+        // Graphics Controller
+        for i in 0..9u8 {
+            outb(0x3CE, i);
+            outb(0x3CF, self.gc[i as usize]);
+        }
+        // Attribute Controller
+        let _ = inb(0x3DA); // reset flipflop
+        for i in 0..21u8 {
+            outb(0x3C0, i);
+            outb(0x3C0, self.ac[i as usize]);
+        }
+        outb(0x3C0, 0x20); // re-enable display
+        // DAC
+        outb(0x3C6, self.dac_mask);
+        outb(0x3C8, 0); // write index = 0
+        for i in 0..768 {
+            outb(0x3C9, self.dac[i]);
+        }
+        // Restore planes — set write plane via SEQ reg 2, write 64KB each
+        for plane in 0..4u8 {
+            outb(0x3C4, 2); // Map Mask register
+            outb(0x3C5, 1 << plane);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.planes[plane as usize * 65536..].as_ptr(),
+                    0xA0000 as *mut u8,
+                    65536,
+                );
+            }
+        }
+        // Restore sequencer Map Mask
+        outb(0x3C4, 2);
+        outb(0x3C5, self.seq[2]);
+        // Restore index registers
+        outb(0x3C4, self.seq_index);
+        outb(0x3D4, self.crtc_index);
+        outb(0x3CE, self.gc_index);
+    }
+}
+
 pub struct Vm86State {
     pub a20_enabled: bool,
     pub dta: u32,
     pub heap_seg: u16,
     pub dos_pending_char: Option<u8>,
+    pub last_child_exit_code: u8,
     pub vpit: VirtualPit,
     pub vpic: VirtualPic,
     pub vkbd: VirtualKeyboard,
@@ -163,6 +325,7 @@ pub struct Vm86State {
     pub ems: Option<alloc::boxed::Box<EmsState>>,
     pub hma_pages: [u64; HMA_PAGE_COUNT],
     pub e0_pending: bool,
+    pub vga: VgaState,
 }
 
 impl Vm86State {
@@ -174,6 +337,7 @@ impl Vm86State {
             dta: 0,
             heap_seg: 0xA000,
             dos_pending_char: None,
+            last_child_exit_code: 0,
             vpit: VirtualPit::new(),
             vpic: VirtualPic::new(),
             vkbd: VirtualKeyboard::new(),
@@ -183,6 +347,7 @@ impl Vm86State {
             ems: None,
             hma_pages,
             e0_pending: false,
+            vga: VgaState::new(),
         }
     }
 }
@@ -985,6 +1150,9 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
         // - VL_SetScreen needs 6+ consecutive bit0=1/bit3=0 (HBL phase)
         // - VL_SetCRTC needs bit0=0 (display active phase)
         0x3DA => {
+            // Read real hardware to reset the AC flip-flop, and track it globally.
+            let _real = crate::arch::x86::inb(0x3DA);
+            unsafe { VGA_AC_FLIPFLOP = true; }
             static mut RETRACE_CTR: u8 = 0;
             let ctr = unsafe {
                 RETRACE_CTR = RETRACE_CTR.wrapping_add(1);
@@ -992,9 +1160,6 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
             };
             let phase = ctr & 31;
             let val = if phase < 16 { 0x00 } else if phase < 24 { 0x01 } else { 0x09 };
-            if ctr < 64 {
-                dbg_println!("[VGA] 3DA read #{} phase={} val={:#04x}", ctr, phase, val);
-            }
             Ok(val)
         }
         // VGA ports — pass through to hardware
@@ -1021,8 +1186,13 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
 /// Emulate OUT to a port.
 pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
     match port {
-        // VGA ports — pass through to hardware
-        0x3C0..=0x3DF => {
+        // VGA ports — pass through to hardware, track AC flip-flop
+        0x3C0 => {
+            unsafe { VGA_AC_FLIPFLOP = !VGA_AC_FLIPFLOP; }
+            crate::arch::x86::outb(port, val);
+            Ok(())
+        }
+        0x3C1..=0x3DF => {
             crate::arch::x86::outb(port, val);
             Ok(())
         }
@@ -1030,7 +1200,6 @@ pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
         0x20 => {
             if val == 0x20 {
                 // Non-specific EOI
-                crate::dbg_println!("[EOI] isr={:#04x}", thread::current().vm86.vpic.isr);
                 let t = thread::current();
                 // If keyboard IRQ (bit 1) was in service, and the virtual 8042
                 // still has data ready, IRQ1 should assert again after EOI.
@@ -1151,16 +1320,6 @@ fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
     let old_ip = vm86_ip(regs);
     let new_ip = read_u16(0, (int_num as u32) * 4);
     let new_cs = read_u16(0, (int_num as u32) * 4 + 2);
-    if int_num == 0x08 {
-        static mut COUNT8: u32 = 0;
-        unsafe {
-            COUNT8 += 1;
-            if COUNT8 <= 5 {
-                dbg_println!("[IRQ] reflect INT 08 -> {:04X}:{:04X} (from {:04X}:{:04X})",
-                    new_cs, new_ip, old_cs, old_ip);
-            }
-        }
-    }
     vm86_push(regs, vm86_flags(regs) as u16);
     vm86_push(regs, old_cs);
     vm86_push(regs, old_ip);
@@ -1182,9 +1341,9 @@ fn fetch_byte(regs: &mut Regs) -> u8 {
     unsafe {
         let cs = regs.cs32();
         let ip = regs.ip32();
-        let linear = (cs << 4) + ip;
+        let linear = (cs << 4).wrapping_add(ip);
         let byte = *(linear as *const u8);
-        regs.set_ip32(ip + 1);
+        regs.set_ip32(ip.wrapping_add(1));
         byte
     }
 }
@@ -1583,8 +1742,6 @@ fn monitor_impl(regs: &mut Regs) -> Action {
 /// With VME, only INTs whose bit is SET in the redirection bitmap trap here.
 /// Without VME, all INTs trap — unintercepted ones are reflected through IVT.
 fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
-    crate::dbg_println!("[VM86] INT {:02X} at {:04X}:{:04X} AX={:04X}",
-        int_num, vm86_cs(regs), vm86_ip(regs), regs.rax as u16);
     if !crate::arch::descriptors::int_intercepted(int_num) {
         reflect_interrupt(regs, int_num);
         return Action::Done;
@@ -1613,15 +1770,11 @@ fn stub_dispatch(regs: &mut Regs) -> Action {
 
     // If INT 31h came from outside the stub segment, reflect through IVT
     if cs != STUB_SEG {
-        crate::dbg_println!("[VM86] INT 31h from non-stub {:04X}:{:04X}, reflecting", cs, ip);
         reflect_interrupt(regs, 0x31);
         return Action::Done;
     }
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
-    crate::dbg_println!("[VM86] stub slot={:02X} SS:SP={:04X}:{:04X}",
-        slot, vm86_ss(regs), vm86_sp(regs));
-
     let is_far_call = matches!(slot,
         SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
@@ -1660,15 +1813,24 @@ fn stub_dispatch(regs: &mut Regs) -> Action {
             crate::kernel::dpmi::callback_entry(thread, regs, cb_idx);
             Action::Done
         }
+        0x13 => int_13h(regs),
         0x20 => {
             // INT 20h — DOS program terminate
             if let Some(parent) = thread::current().vm86.exec_parent.take() {
-                return exec_return(regs, &parent);
+                thread::current().vm86.last_child_exit_code = 0;
+                return exec_return(regs, parent);
             }
             let next = thread::exit_thread(0);
             Action::Switch(next)
         }
         0x21 => int_21h(regs),
+        // INT 25h/26h — Absolute Disk Read/Write — return error
+        0x25 | 0x26 => {
+            crate::dbg_println!("INT {:02X} drive AL={:02X}", slot, regs.rax as u8);
+            regs.rax = (regs.rax & !0xFF00) | (0x02 << 8); // AH=02 address mark not found
+            regs.set_flag32(1); // CF=1 error
+            Action::Done
+        }
         0x28 => Action::Done, // INT 28h — DOS idle
         0x2E => int_2eh(regs),
         0x2F => int_2fh(regs),
@@ -1701,11 +1863,63 @@ fn stub_dispatch(regs: &mut Regs) -> Action {
 }
 
 // ============================================================================
+// BIOS INT 13h — Disk services
+// ============================================================================
+
+fn int_13h(regs: &mut Regs) -> Action {
+    let ah = (regs.rax >> 8) as u8;
+    let dl = regs.rdx as u8; // drive number
+    // For floppy drives (DL < 0x80), return "drive not ready" error.
+    // Hard drives (DL >= 0x80) are also unsupported — return error.
+    match ah {
+        // AH=00h Reset Disk — just succeed
+        0x00 => {
+            regs.rax = regs.rax & !0xFF00; // AH=0 success
+            regs.clear_flag32(1);
+        }
+        // AH=08h Get Drive Parameters
+        0x08 => {
+            if dl < 0x80 {
+                // No floppy drives
+                regs.rax = (regs.rax & !0xFF00) | (0x07 << 8); // AH=07 drive parameter activity failed
+                regs.set_flag32(1);
+            } else {
+                // Report a minimal hard drive geometry
+                regs.rax = (regs.rax & !0xFF00); // AH=0 success
+                regs.rbx = (regs.rbx & !0xFF) | 0; // BL=drive type (0 for HD)
+                regs.rcx = (regs.rcx & !0xFFFF) | ((32 << 8) | 63); // CH=max cyl low, CL=max sect
+                regs.rdx = (regs.rdx & !0xFFFF) | ((1 << 8) | 1); // DH=max head, DL=number of drives
+                regs.clear_flag32(1);
+            }
+        }
+        // AH=15h Get Disk Type
+        0x15 => {
+            if dl < 0x80 {
+                // No floppy: AH=0 means "no such drive"
+                regs.rax = regs.rax & !0xFF00;
+                regs.set_flag32(1);
+            } else {
+                // Hard disk present
+                regs.rax = (regs.rax & !0xFF00) | (0x03 << 8); // AH=03 = hard disk
+                regs.clear_flag32(1);
+            }
+        }
+        _ => {
+            // All other functions: return error (drive not ready)
+            regs.rax = (regs.rax & !0xFF00) | (0x80 << 8); // AH=80h timeout/not ready
+            regs.set_flag32(1);
+        }
+    }
+    Action::Done
+}
+
+// ============================================================================
 // DOS INT 21h — DOS services
 // ============================================================================
 
 fn int_21h(regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
+    if ah != 0x2C && ah != 0x2A { crate::dbg_println!("D21 {:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}", ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16); }
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
@@ -1744,64 +1958,6 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready
         0x0B => {
-            static mut OB_COUNT: u32 = 0;
-            unsafe {
-                OB_COUNT += 1;
-                if OB_COUNT == 1 {
-                    // BDA video state at 0040:0049
-                    let mode = *(0x449 as *const u8);
-                    let cols = (0x44A as *const u16).read_unaligned();
-                    let rows = *(0x484 as *const u8);
-                    let crtc = (0x463 as *const u16).read_unaligned();
-                    let page = *(0x462 as *const u8);
-                    dbg_println!("[BDA] mode={:02x} cols={} rows={} crtc={:04x} page={}",
-                        mode, cols, rows + 1, crtc, page);
-                    // Check VGA row 0
-                    let vga = core::slice::from_raw_parts(0xB8000 as *const u8, 160);
-                    let mut chars = [b'.'; 80];
-                    for c in 0..80 {
-                        let b = vga[c*2];
-                        if b >= 0x20 && b < 0x7F { chars[c] = b; }
-                    }
-                    dbg_println!("[VGA] pg0 row0: {} attr={:02x}", core::str::from_utf8(&chars).unwrap_or("?"), vga[1]);
-                    // Also check page 1 (offset 0x1000 = 4096)
-                    let vga1 = core::slice::from_raw_parts(0xB9000 as *const u8, 160);
-                    let mut chars1 = [b'.'; 80];
-                    for c in 0..80 {
-                        let b = vga1[c*2];
-                        if b >= 0x20 && b < 0x7F { chars1[c] = b; }
-                    }
-                    dbg_println!("[VGA] pg1 row0: {} attr={:02x}", core::str::from_utf8(&chars1).unwrap_or("?"), vga1[1]);
-                    // Check CRTC start address (regs 0Ch/0Dh)
-                    crate::arch::x86::outb(crtc as u16, 0x0C);
-                    let start_hi = crate::arch::x86::inb(crtc as u16 + 1);
-                    crate::arch::x86::outb(crtc as u16, 0x0D);
-                    let start_lo = crate::arch::x86::inb(crtc as u16 + 1);
-                    let start_addr = ((start_hi as u16) << 8) | start_lo as u16;
-                    dbg_println!("[VGA] CRTC start_addr={:#06x} (page={})", start_addr, start_addr / 0x800);
-                    // Check mono buffer B000:0000
-                    let mono = core::slice::from_raw_parts(0xB0000 as *const u8, 160);
-                    let mut mchars = [b'.'; 80];
-                    for c in 0..80 {
-                        let b = mono[c*2];
-                        if b >= 0x20 && b < 0x7F { mchars[c] = b; }
-                    }
-                    dbg_println!("[VGA] mono row0: {} attr={:02x}", core::str::from_utf8(&mchars).unwrap_or("?"), mono[1]);
-                    // Write test via kernel mapping (LOW_MEM_BASE + 0xB8000)
-                    let test = b"DN_TEST";
-                    let vga_k = (crate::arch::paging2::LOW_MEM_BASE + 0xB8000) as *mut u8;
-                    for (j, &ch) in test.iter().enumerate() {
-                        *vga_k.add(j * 2) = ch;
-                        *vga_k.add(j * 2 + 1) = 0x4F; // white on red
-                    }
-                    // Read PTE for page 0xB8 directly from page table memory
-                    let pte_addr = crate::arch::paging2::LOW_MEM_BASE + 0xB8000;
-                    let user_val = *(0xB8000 as *const u16);
-                    let kern_val = *(pte_addr as *const u16);
-                    dbg_println!("[VGA] user@B8000={:#06x} kern@{:#x}={:#06x} same={}",
-                        user_val, pte_addr, kern_val, user_val == kern_val);
-                }
-            }
             regs.rax = (regs.rax & !0xFF) | 0x00; // no character available
             Action::Done
         }
@@ -1826,26 +1982,30 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x47: Get current directory (DL=drive, DS:SI=64-byte buffer)
         // Returns ASCIIZ path without drive letter or leading backslash
+        // DL: 0=default, 1=A, 2=B, 3=C
         0x47 => {
-            let si = regs.rsi as u16 as u32;
-            let addr = ((regs.ds as u16 as u32) << 4) + si;
-            let cwd = thread::current().cwd_str();
-            if crate::kernel::thread::current().dpmi.is_some() {
-                crate::dbg_println!("DOS 47h getcwd DS:SI={:04x}:{:04x} lin={:#x} cwd={:?}",
-                    regs.ds as u16, si, addr,
-                    core::str::from_utf8(cwd).unwrap_or("?"));
-            }
-            unsafe {
-                let mut pos = 0;
-                for &b in cwd {
-                    // Convert '/' to '\' for DOS, skip trailing slash
-                    if b == b'/' && pos + 1 >= cwd.len() { break; }
-                    *((addr + pos as u32) as *mut u8) = if b == b'/' { b'\\' } else { b };
-                    pos += 1;
+            let dl = regs.rdx as u8;
+            let drive = if dl == 0 { 3 } else { dl };
+            if drive != 3 {
+                // Invalid drive (A:/B:)
+                regs.rax = (regs.rax & !0xFFFF) | 0x0F;
+                regs.set_flag32(1);
+            } else {
+                let si = regs.rsi as u16 as u32;
+                let addr = ((regs.ds as u16 as u32) << 4) + si;
+                let cwd = thread::current().cwd_str();
+                unsafe {
+                    let mut pos = 0;
+                    for &b in cwd {
+                        // Convert '/' to '\' for DOS, skip trailing slash
+                        if b == b'/' && pos + 1 >= cwd.len() { break; }
+                        *((addr + pos as u32) as *mut u8) = if b == b'/' { b'\\' } else { b };
+                        pos += 1;
+                    }
+                    *((addr + pos as u32) as *mut u8) = 0; // NUL terminate
                 }
-                *((addr + pos as u32) as *mut u8) = 0; // NUL terminate
+                regs.clear_flag32(1);
             }
-            regs.clear_flag32(1); // clear CF
             Action::Done
         }
         // AH=0x19: Get current default drive (returns AL=drive, 0=A, 2=C)
@@ -1961,6 +2121,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 i += 1;
             }
+            let name_str = core::str::from_utf8(&name[..i]).unwrap_or("?");
             // Check for device names
             if EMS_ENABLED && name[..i].eq_ignore_ascii_case(b"EMMXXXX0") {
                 regs.rax = (regs.rax & !0xFFFF) | EMS_DEVICE_HANDLE as u64;
@@ -1968,8 +2129,6 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 let fd = crate::kernel::vfs::open(&name[..i]);
                 if fd >= 0 {
-                    crate::dbg_println!("DOS 3Dh OK fd={} name={}",
-                        fd, core::str::from_utf8(&name[..i]).unwrap_or("?"));
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd);
                     sft_set_file(fd as u16, size);
@@ -1977,11 +2136,11 @@ fn int_21h(regs: &mut Regs) -> Action {
                         let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
                         if (fd as usize) < 20 { *psp.add(0x34 + fd as usize) = fd as u8; }
                     }
+                    crate::dbg_println!("  -> fd={} {}", fd, name_str);
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
-                    crate::dbg_println!("DOS 3Dh FAIL name={}",
-                        core::str::from_utf8(&name[..i]).unwrap_or("?"));
+                    crate::dbg_println!("  -> FAIL {}", name_str);
                     regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
                     regs.set_flag32(1); // set carry
                 }
@@ -2027,6 +2186,9 @@ fn int_21h(regs: &mut Regs) -> Action {
                     tf.pos += n;
                 }
                 regs.rax = (regs.rax & !0xFFFF) | n as u64;
+                regs.clear_flag32(1);
+            } else if count == 0 || buf_addr == 0 {
+                regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
@@ -2075,7 +2237,8 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x4C => {
             // If we're in an EXEC'd child, return to parent
             if let Some(parent) = thread::current().vm86.exec_parent.take() {
-                return exec_return(regs, &parent);
+                thread::current().vm86.last_child_exit_code = regs.rax as u8;
+                return exec_return(regs, parent);
             }
             let code = regs.rax as u8;
             let next = thread::exit_thread(code as i32);
@@ -2086,8 +2249,6 @@ fn int_21h(regs: &mut Regs) -> Action {
             let need = regs.rbx as u16;
             let t = thread::current();
             let avail = 0xA000u16.saturating_sub(t.vm86.heap_seg);
-            dbg_println!("[MEM] 48 alloc BX={:#06x} heap={:#06x} avail={:#06x}",
-                need, t.vm86.heap_seg, avail);
             if need <= avail {
                 let seg = t.vm86.heap_seg;
                 t.vm86.heap_seg += need;
@@ -2110,8 +2271,6 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x4A => {
             let es = regs.es as u16;
             let new_end32 = es as u32 + regs.rbx as u16 as u32;
-            dbg_println!("[MEM] 4A resize ES={:#06x} BX={:#06x} new_end={:#06x} limit=0xA000",
-                es, regs.rbx as u16, new_end32);
             if new_end32 <= 0xA000 {
                 let new_end = new_end32 as u16;
                 // Program resizing its block — free memory starts after it
@@ -2120,7 +2279,6 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 // Not enough memory — report max available
                 let avail = 0xA000u16.saturating_sub(es);
-                dbg_println!("[MEM] 4A FAIL: need {:#06x} avail {:#06x}", regs.rbx as u16, avail);
                 regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
                 regs.set_flag32(1);
@@ -2147,8 +2305,8 @@ fn int_21h(regs: &mut Regs) -> Action {
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x80;
                         regs.clear_flag32(1);
                     } else {
-                        // File handle: bit 7=0 (file), bit 6=0 (not EOF)
-                        regs.rdx = (regs.rdx & !0xFFFF) | 0x0000;
+                        // File handle: bit 7=0 (file), bits 5-0=drive (2=C:)
+                        regs.rdx = (regs.rdx & !0xFFFF) | 0x0002;
                         regs.clear_flag32(1);
                     }
                 }
@@ -2220,8 +2378,9 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else if handle == NULL_FILE_HANDLE {
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
             } else {
-                regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
-                regs.set_flag32(1);
+                // VFS (read-only TAR): silently discard writes
+                regs.rax = (regs.rax & !0xFFFF) | count as u64;
+                regs.clear_flag32(1);
             }
             Action::Done
         }
@@ -2485,6 +2644,26 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.clear_flag32(1);
             Action::Done
         }
+        // AH=0x36: Get Disk Free Space (DL=drive, 0=default,1=A,2=B,3=C...)
+        // Returns: AX=sectors/cluster, BX=free clusters, CX=bytes/sector, DX=total clusters
+        // On error: AX=0xFFFF
+        0x36 => {
+            let dl = regs.rdx as u8;
+            // Map drive: 0=default(C), 1=A, 2=B, 3=C
+            let drive = if dl == 0 { 3 } else { dl };
+            if drive == 3 {
+                // C: drive — report fake 16MB disk, 8MB free
+                // 512 bytes/sector, 8 sectors/cluster (4KB), 4096 total clusters = 16MB
+                regs.rax = (regs.rax & !0xFFFF) | 8;    // AX = sectors per cluster
+                regs.rbx = (regs.rbx & !0xFFFF) | 2048; // BX = free clusters
+                regs.rcx = (regs.rcx & !0xFFFF) | 512;  // CX = bytes per sector
+                regs.rdx = (regs.rdx & !0xFFFF) | 4096; // DX = total clusters
+            } else {
+                // A:/B: or unknown — invalid drive
+                regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
+            }
+            Action::Done
+        }
         // AH=0x67: Set Handle Count — stub success
         0x67 => {
             regs.clear_flag32(1);
@@ -2506,7 +2685,8 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x4D: Get Return Code of Subprocess
         0x4D => {
-            regs.rax = regs.rax & !0xFFFF; // AL=exit code 0, AH=0 (normal termination)
+            let code = thread::current().vm86.last_child_exit_code;
+            regs.rax = (regs.rax & !0xFFFF) | code as u64; // AL=exit code, AH=0 (normal)
             Action::Done
         }
         // AH=0x62: Get PSP segment (returns BX=PSP segment)
@@ -2582,6 +2762,7 @@ fn int_21h(regs: &mut Regs) -> Action {
 
 fn int_2eh(regs: &mut Regs) -> Action {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
+    // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
     let ds = regs.ds as u16 as u32;
     let si = regs.rsi as u16 as u32;
     let addr = (ds << 4) + si;
@@ -2591,59 +2772,13 @@ fn int_2eh(regs: &mut Regs) -> Action {
     unsafe {
         core::ptr::copy_nonoverlapping((addr + 1) as *const u8, cmd.as_mut_ptr(), copy);
     }
-    // Skip leading spaces
     let mut start = 0;
     while start < copy && cmd[start] == b' ' { start += 1; }
-    // Extract program name
     let mut end = start;
     while end < copy && cmd[end] != b' ' && cmd[end] != b'\r' && cmd[end] != 0 { end += 1; }
-    if end > start {
-        let prog = &cmd[start..end];
-        dbg_println!("INT 2E: exec {:?}", unsafe { core::str::from_utf8_unchecked(prog) });
-        let fd = dos_open_program(prog);
-        if fd >= 0 {
-            let size = crate::kernel::vfs::seek(fd, 0, 2);
-            crate::kernel::vfs::seek(fd, 0, 0);
-            if size > 0 {
-                let mut buf = alloc::vec![0u8; size as usize];
-                crate::kernel::vfs::read_raw(fd, &mut buf);
-                crate::kernel::vfs::close(fd);
+    if end <= start { return Action::Done; }
 
-                let child_seg = thread::current().vm86.heap_seg;
-                let parent_ss = regs.ss32();
-                let parent_sp = regs.sp32();
-                let parent_cs = regs.cs32();
-                let parent_ip = regs.ip32();
-                let parent_ds = regs.ds as u16;
-                let parent_es = regs.es as u16;
-
-                let (cs, ip, ss, sp) = load_com_child(&buf, child_seg);
-                // Advance heap past child (64K for COM)
-                let t = thread::current();
-                t.vm86.heap_seg = child_seg.wrapping_add(0x1000).max(t.vm86.heap_seg);
-                regs.set_cs32(cs as u32);
-                regs.set_ip32(ip as u32);
-                regs.set_ss32(ss as u32);
-                regs.set_sp32(sp as u32);
-                regs.ds = child_seg as u64;
-                regs.es = child_seg as u64;
-
-                let t = thread::current();
-                t.vm86.exec_parent = Some(ExecParent {
-                    ss: parent_ss as u16,
-                    sp: parent_sp as u16,
-                    cs: parent_cs as u16,
-                    ip: parent_ip as u16,
-                    ds: parent_ds,
-                    es: parent_es,
-                });
-                return Action::Done;
-            }
-            crate::kernel::vfs::close(fd);
-        }
-    }
-    // Command not found — just return
-    Action::Done
+    fork_exec(regs, &cmd[start..end])
 }
 
 // ============================================================================
@@ -2667,20 +2802,17 @@ fn int_2fh(regs: &mut Regs) -> Action {
             // ES:DI = entry point (far call to switch to protected mode)
             regs.es = STUB_SEG as u64;
             regs.rdi = (regs.rdi & !0xFFFF) | slot_offset(SLOT_DPMI_ENTRY) as u64;
-            dbg_println!("INT 2F/1687: DPMI available, entry={:04X}:{:04X}", STUB_SEG, slot_offset(SLOT_DPMI_ENTRY));
             Action::Done
         }
         // AX=4300h — XMS installation check
         0x4300 => {
             regs.rax = (regs.rax & !0xFF) | 0x80; // AL=80h: XMS driver installed
-            dbg_println!("INT 2F/4300: XMS installed");
             Action::Done
         }
         // AX=4310h — Get XMS driver entry point
         0x4310 => {
             regs.es = STUB_SEG as u64;
             regs.rbx = (regs.rbx & !0xFFFF) | slot_offset(SLOT_XMS) as u64;
-            dbg_println!("INT 2F/4310: XMS entry = {:04X}:{:04X}", STUB_SEG, slot_offset(SLOT_XMS));
             Action::Done
         }
         _ => {
@@ -2705,7 +2837,6 @@ fn xms_state() -> &'static mut XmsState {
 
 fn xms_dispatch(regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
-    dbg_println!("XMS: AH={:02X}", ah);
     match ah {
         // AH=00h — Get XMS version
         0x00 => {
@@ -2766,7 +2897,6 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             let total = xms.free_kb();
             regs.rax = (regs.rax & !0xFFFF) | largest as u64; // largest free block (KB)
             regs.rdx = (regs.rdx & !0xFFFF) | total as u64;   // total free (KB)
-            dbg_println!("XMS: free={}KB largest={}KB", total, largest);
         }
         // AH=09h — Allocate extended memory block (DX=size in KB)
         0x09 => {
@@ -2791,7 +2921,6 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
                             });
                             regs.rax = (regs.rax & !0xFFFF) | 1;
                             regs.rdx = (regs.rdx & !0xFFFF) | (i + 1) as u64;
-                            dbg_println!("XMS: alloc {}KB @ {:#X} → handle {}", size_kb, base, i + 1);
                         }
                         None => {
                             regs.rax = (regs.rax & !0xFFFF);
@@ -2812,7 +2941,6 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
             if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
                 if xms.handles[handle as usize - 1].take().is_some() {
                     regs.rax = (regs.rax & !0xFFFF) | 1;
-                    dbg_println!("XMS: free handle {}", handle);
                 } else {
                     regs.rax = (regs.rax & !0xFFFF);
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
@@ -2936,7 +3064,6 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
                     regs.rax = (regs.rax & !0xFFFF) | 1; // success
                     regs.rbx = (regs.rbx & !0xFFFF) | seg as u64;
                     regs.rdx = (regs.rdx & !0xFFFF) | paras as u64;
-                    dbg_println!("XMS: UMB alloc {} paras → seg {:04X} ({} paras)", size, seg, paras);
                 }
                 None => {
                     let largest = umb_largest();
@@ -2982,9 +3109,6 @@ fn xms_move(regs: &mut Regs) {
     let src_offset = unsafe { ((addr + 6) as *const u32).read_unaligned() };
     let dst_handle = unsafe { ((addr + 10) as *const u16).read_unaligned() };
     let dst_offset = unsafe { ((addr + 12) as *const u32).read_unaligned() };
-
-    dbg_println!("XMS move: len={} src_h={} src_off={:#X} dst_h={} dst_off={:#X}",
-        length, src_handle, src_offset, dst_handle, dst_offset);
 
     if length == 0 {
         regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -3054,7 +3178,6 @@ fn ems_state() -> &'static mut EmsState {
 
 fn int_67h(regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
-    dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} DX={:04X}", ah, regs.rax as u16, regs.rbx as u16, regs.rdx as u16);
     match ah {
         // AH=40h — Get status
         0x40 => {
@@ -3109,7 +3232,6 @@ fn int_67h(regs: &mut Regs) -> Action {
                         ems.handles[i] = Some(EmsHandle { pages });
                         regs.rdx = (regs.rdx & !0xFFFF) | i as u64; // handle (0-based)
                         regs.rax = (regs.rax & !0xFF00); // AH=0
-                        dbg_println!("EMS: alloc {} pages → handle {}", pages_needed, i);
                     } else {
                         // Free any partially allocated pages
                         for group in &pages {
@@ -3189,7 +3311,6 @@ fn int_67h(regs: &mut Regs) -> Action {
                     }
                 }
                 regs.rax = (regs.rax & !0xFF00); // AH=0
-                dbg_println!("EMS: free handle {}", handle);
             } else {
                 regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
             }
@@ -3400,8 +3521,132 @@ fn dos_open_program(name: &[u8]) -> i32 {
     -2 // ENOENT
 }
 
-/// Fork+exec model: create a new VM86 thread with a fresh address space,
-/// load the program there (full 640KB available), block parent until child exits.
+/// Fork-exec a program (DOS or ELF) in a fresh address space.
+/// Opens the file, forks a child, loads the program, blocks the parent.
+/// Used by COMMAND.COM /C (INT 21h/4Bh) and INT 2Eh.
+fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
+    crate::println!("fork_exec: parent heap_seg={:#06x}", thread::current().vm86.heap_seg);
+    let fd = dos_open_program(prog_name);
+    if fd < 0 {
+        regs.rax = (regs.rax & !0xFFFF) | 2;
+        regs.set_flag32(1);
+        return Action::Done;
+    }
+    let size = crate::kernel::vfs::seek(fd, 0, 2);
+    if size <= 0 {
+        crate::kernel::vfs::close(fd);
+        regs.rax = (regs.rax & !0xFFFF) | 2;
+        regs.set_flag32(1);
+        return Action::Done;
+    }
+    crate::kernel::vfs::seek(fd, 0, 0);
+    let mut buf = alloc::vec![0u8; size as usize];
+    crate::kernel::vfs::read_raw(fd, &mut buf);
+    crate::kernel::vfs::close(fd);
+
+    let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
+    let is_exe = !is_elf && is_mz_exe(&buf);
+
+    let current = thread::current();
+    let mut child_root = crate::RootPageTable::empty();
+    crate::kernel::startup::arch_user_fork(&mut child_root);
+
+    let child = match thread::create_thread(Some(current), child_root, true) {
+        Some(t) => t,
+        None => {
+            regs.rax = (regs.rax & !0xFFFF) | 8;
+            regs.set_flag32(1);
+            return Action::Done;
+        }
+    };
+    let child_idx = child.tid as usize;
+
+    crate::kernel::startup::arch_switch_to(
+        &mut current.cpu_state, &mut current.root,
+        &child.cpu_state, &child.root,
+    );
+    if is_elf {
+        crate::kernel::startup::arch_free_user_pages();
+        crate::kernel::startup::arch_flush_tlb();
+        let loaded = match crate::kernel::elf::load_elf(&buf) {
+            Ok(e) => e,
+            Err(_) => {
+                crate::kernel::startup::arch_switch_to(
+                    &mut child.cpu_state, &mut child.root,
+                    &current.cpu_state, &current.root,
+                );
+                thread::exit_thread(1);
+                regs.rax = (regs.rax & !0xFFFF) | 11;
+                regs.set_flag32(1);
+                return Action::Done;
+            }
+        };
+
+        let want_64 = loaded.class == crate::kernel::elf::ElfClass::Elf64;
+        let word = if want_64 { 8usize } else { 4usize };
+        let prog_arg = alloc::vec::Vec::from(prog_name);
+        let args = alloc::vec![prog_arg];
+        let stack = crate::kernel::syscalls::setup_user_stack(&args, want_64, word);
+        let symbols = crate::kernel::stacktrace::SymbolData::new(buf.into_boxed_slice());
+
+        crate::kernel::startup::arch_switch_to(
+            &mut child.cpu_state, &mut child.root,
+            &current.cpu_state, &current.root,
+        );
+
+        if want_64 {
+            thread::init_process_thread_64(child, loaded.entry, stack.sp as u64);
+            child.cpu_state.rdi = stack.argc as u64;
+            child.cpu_state.rsi = stack.argv as u64;
+        } else {
+            thread::init_process_thread(child, loaded.entry as u32, stack.sp as u32);
+        }
+        child.symbols = symbols;
+    } else {
+        crate::kernel::startup::arch_user_clean();
+        crate::kernel::startup::arch_map_low_mem();
+        setup_ivt();
+
+        let (cs, ip, ss, sp, end_seg) = if is_exe {
+            match load_exe(&buf, prog_name) {
+                Some(t) => t,
+                None => {
+                    crate::kernel::startup::arch_switch_to(
+                        &mut child.cpu_state, &mut child.root,
+                        &current.cpu_state, &current.root,
+                    );
+                    thread::exit_thread(1);
+                    regs.rax = (regs.rax & !0xFFFF) | 11;
+                    regs.set_flag32(1);
+                    return Action::Done;
+                }
+            }
+        } else {
+            load_com(&buf, prog_name)
+        };
+
+        crate::kernel::startup::arch_switch_to(
+            &mut child.cpu_state, &mut child.root,
+            &current.cpu_state, &current.root,
+        );
+
+        child.mode = thread::ThreadMode::Dos;
+        thread::init_process_thread_vm86(child, COM_SEGMENT, cs, ip, ss, sp);
+        child.vm86.heap_seg = end_seg;
+        child.vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;
+    }
+
+    child.cwd = current.cwd;
+    child.cwd_len = current.cwd_len;
+
+    current.state = thread::ThreadState::Blocked;
+    regs.clear_flag32(1);
+    Action::Switch(child_idx)
+}
+
+/// DOS INT 4Bh EXEC — load and execute program.
+/// DOS programs: in-process exec (shared address space, like real DOS).
+/// ELF programs: fork into a separate thread.
 fn exec_program(regs: &mut Regs) -> Action {
     let al = regs.rax as u8;
     if al != 0 {
@@ -3438,25 +3683,29 @@ fn exec_program(regs: &mut Regs) -> Action {
         core::ptr::copy_nonoverlapping((cmdtail_addr + 1) as *const u8, tail.as_mut_ptr(), copy_len);
     }
 
-    // If COMMAND.COM /C, extract the real program name
-    let fname_upper: &[u8] = &filename[..flen];
-    let is_shell = fname_upper.windows(11).any(|w|
-        w.eq_ignore_ascii_case(b"COMMAND.COM"));
+    // If COMMAND.COM /C, extract the real program name — we don't have
+    // a real COMMAND.COM, just exec the target program directly.
+    let fname: &[u8] = &filename[..flen];
+    let is_shell = fname.windows(11).any(|w| w.eq_ignore_ascii_case(b"COMMAND.COM"));
     let mut ti = 0;
     while ti < copy_len && tail[ti] == b' ' { ti += 1; }
-    let (prog_name, _) = if is_shell && ti + 1 < copy_len
+    let prog_name: &[u8] = if is_shell && ti + 1 < copy_len
         && tail[ti] == b'/' && (tail[ti + 1] == b'C' || tail[ti + 1] == b'c')
     {
         let mut start = ti + 2;
         while start < copy_len && tail[start] == b' ' { start += 1; }
         let mut end = start;
         while end < copy_len && tail[end] != b' ' && tail[end] != b'\r' && tail[end] != 0 { end += 1; }
-        (&tail[start..end], end - start)
+        &tail[start..end]
     } else {
-        (&filename[..flen] as &[u8], flen)
+        fname
     };
 
-    // Open and read the program file
+    if is_shell {
+        return fork_exec(regs, prog_name);
+    }
+
+    // --- DOS program: in-process exec (shared address space) ---
     let fd = dos_open_program(prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
@@ -3475,136 +3724,66 @@ fn exec_program(regs: &mut Regs) -> Action {
     crate::kernel::vfs::read_raw(fd, &mut buf);
     crate::kernel::vfs::close(fd);
 
-    // Detect file type: ELF, MZ .EXE, or .COM
-    let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
-    let is_exe = !is_elf && is_mz_exe(&buf);
+    let is_exe = is_mz_exe(&buf);
+    let child_seg = thread::current().vm86.heap_seg;
+    crate::println!("EXEC in-process: heap_seg={:#06x}", child_seg);
 
-    dbg_println!("EXEC fork: prog={} elf={}",
-        unsafe { core::str::from_utf8_unchecked(prog_name) }, is_elf);
+    let mut resolved_buf = [0u8; 164];
+    let resolved_name = crate::kernel::vfs::resolve(prog_name, &mut resolved_buf);
+    let mut resolved_copy = [0u8; 164];
+    let rlen = resolved_name.len().min(164);
+    resolved_copy[..rlen].copy_from_slice(&resolved_name[..rlen]);
 
-    // --- Fork a new address space for the child ---
-    let current = thread::current();
-    let mut child_root = crate::RootPageTable::empty();
-    crate::kernel::startup::arch_user_fork(&mut child_root);
-
-    // Create child thread
-    let child = match thread::create_thread(Some(current), child_root, true) {
-        Some(t) => t,
-        None => {
-            regs.rax = (regs.rax & !0xFFFF) | 8;
-            regs.set_flag32(1);
-            return Action::Done;
-        }
-    };
-    let child_tid = child.tid;
-    let child_idx = child_tid as usize;
-
-    // Switch to child's address space
-    crate::kernel::startup::arch_switch_to(
-        &mut current.cpu_state, &mut current.root,
-        &child.cpu_state, &child.root,
-    );
-    crate::kernel::startup::arch_free_user_pages();
-    crate::kernel::startup::arch_flush_tlb();
-
-    if is_elf {
-        // --- ELF execution path ---
-        let loaded = match crate::kernel::elf::load_elf(&buf) {
-            Ok(e) => e,
-            Err(_) => {
-                crate::kernel::startup::arch_switch_to(
-                    &mut child.cpu_state, &mut child.root,
-                    &current.cpu_state, &current.root,
-                );
-                thread::exit_thread(1);
+    let (cs, ip, ss, sp, end_seg) = if is_exe {
+        match load_exe_at(child_seg, COM_SEGMENT, &buf, &resolved_copy[..rlen]) {
+            Some(t) => t,
+            None => {
                 regs.rax = (regs.rax & !0xFFFF) | 11;
                 regs.set_flag32(1);
                 return Action::Done;
             }
-        };
-
-        let want_64 = loaded.class == crate::kernel::elf::ElfClass::Elf64;
-        let word = if want_64 { 8usize } else { 4usize };
-
-        let prog_arg = alloc::vec::Vec::from(prog_name);
-        let args = alloc::vec![prog_arg];
-        let stack = crate::kernel::syscalls::setup_user_stack(&args, want_64, word);
-
-        let symbols = crate::kernel::stacktrace::SymbolData::new(buf.into_boxed_slice());
-
-        // Switch back to parent
-        crate::kernel::startup::arch_switch_to(
-            &mut child.cpu_state, &mut child.root,
-            &current.cpu_state, &current.root,
-        );
-
-        // Set up child thread as protected-mode ELF process
-        if want_64 {
-            thread::init_process_thread_64(child, loaded.entry, stack.sp as u64);
-            child.cpu_state.rdi = stack.argc as u64;
-            child.cpu_state.rsi = stack.argv as u64;
-        } else {
-            thread::init_process_thread(child, loaded.entry as u32, stack.sp as u32);
         }
-        child.symbols = symbols;
     } else {
-        // --- DOS execution path (COM / MZ EXE) ---
-        crate::kernel::startup::arch_map_low_mem();
-        setup_ivt();
+        load_com_at(child_seg, COM_SEGMENT, &buf, &resolved_copy[..rlen])
+    };
 
-        // Resolve program name relative to parent cwd for the PSP environment
-        let mut resolved_buf = [0u8; 164];
-        let resolved_name = crate::kernel::vfs::resolve(prog_name, &mut resolved_buf);
-        let mut resolved_copy = [0u8; 164];
-        let rlen = resolved_name.len().min(164);
-        resolved_copy[..rlen].copy_from_slice(&resolved_name[..rlen]);
-
-        let (cs, ip, ss, sp) = if is_exe {
-            match load_exe(&buf, &resolved_copy[..rlen]) {
-                Some(t) => t,
-                None => {
-                    crate::kernel::startup::arch_switch_to(
-                        &mut child.cpu_state, &mut child.root,
-                        &current.cpu_state, &current.root,
-                    );
-                    thread::exit_thread(1);
-                    regs.rax = (regs.rax & !0xFFFF) | 11;
-                    regs.set_flag32(1);
-                    return Action::Done;
-                }
-            }
-        } else {
-            load_com(&buf, &resolved_copy[..rlen])
-        };
-        clear_bios_keyboard_buffer();
-
-        dbg_println!("EXEC: cs={:04X} ip={:04X} ss={:04X} sp={:04X}", cs, ip, ss, sp);
-
-        // Switch back to parent
-        crate::kernel::startup::arch_switch_to(
-            &mut child.cpu_state, &mut child.root,
-            &current.cpu_state, &current.root,
-        );
-
-        // Set up child thread as VM86
-        thread::init_process_thread_vm86(child, cs, ip, ss, sp);
-        child.vm86.skip_irq = true;
-        child.vm86.vkbd.clear();
-        // setup_psp/load_exe set these on current() (parent) — copy to child
-        child.vm86.dta = current.vm86.dta;
-        child.vm86.heap_seg = current.vm86.heap_seg;
+    // Copy command tail to child's PSP at child_seg:0080
+    let child_psp = (child_seg as u32) << 4;
+    unsafe {
+        let tail_dst = (child_psp + 0x80) as *mut u8;
+        *tail_dst = copy_len as u8;
+        core::ptr::copy_nonoverlapping(tail.as_ptr(), tail_dst.add(1), copy_len);
+        *tail_dst.add(1 + copy_len) = 0x0D;
     }
 
-    // Inherit cwd from parent
-    child.cwd = current.cwd;
-    child.cwd_len = current.cwd_len;
+    // Save parent state. Parent's INT frame (IP/CS/FLAGS) is on the VM86
+    // stack at current SS:SP. exec_return restores SS:SP so stub_dispatch
+    // pops the frame and resumes the parent.
+    let t = thread::current();
+    let prev = t.vm86.exec_parent.take();
+    t.vm86.heap_seg = end_seg.max(t.vm86.heap_seg);
+    t.vm86.dta = (child_seg as u32) * 16 + 0x80;
+    t.vm86.exec_parent = Some(ExecParent {
+        ss: vm86_ss(regs),
+        sp: vm86_sp(regs),
+        ds: regs.ds as u16,
+        es: regs.es as u16,
+        heap_seg: child_seg,
+        prev: prev.map(alloc::boxed::Box::new),
+    });
 
-    // Block parent until child exits. Clear carry for when parent resumes.
-    current.state = thread::ThreadState::Blocked;
+    // Set child entry. Push child's CS:IP + FLAGS onto the child's stack
+    // so that stub_dispatch's pop restores them correctly.
+    regs.set_ss32(ss as u32);
+    regs.set_sp32(sp as u32);
+    let flags = vm86_flags(regs) as u16;
+    vm86_push(regs, flags);
+    vm86_push(regs, cs);
+    vm86_push(regs, ip);
+    regs.ds = child_seg as u64;
+    regs.es = child_seg as u64;
     regs.clear_flag32(1);
-
-    // Switch to child
-    Action::Switch(child_idx)
+    Action::Done
 }
 
 /// Load a .COM binary into VM86 memory at the child segment (above the parent).
@@ -3639,25 +3818,28 @@ fn load_com_child(data: &[u8], child_seg: u16) -> (u16, u16, u16, u16) {
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return(regs: &mut Regs, parent: &ExecParent) -> Action {
-    regs.set_cs32(parent.cs as u32);
-    regs.set_ip32(parent.ip as u32);
+fn exec_return(regs: &mut Regs, parent: ExecParent) -> Action {
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
-    regs.clear_flag32(1); // clear carry
+    regs.clear_flag32(1);
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
+    let t = thread::current();
+    crate::println!("exec_return: restoring heap_seg={:#06x} (was {:#06x})", parent.heap_seg, t.vm86.heap_seg);
+    t.vm86.heap_seg = parent.heap_seg;
+    t.vm86.exec_parent = parent.prev.map(|b| *b);
     Action::Done
 }
 
-/// Saved parent state for returning from EXEC'd child
+/// Saved parent state for returning from EXEC'd child.
+/// Chained via `prev` so nested exec works (e.g. DN.COM→DN.PRG→gfx.com).
 pub struct ExecParent {
     pub ss: u16,
     pub sp: u16,
-    pub cs: u16,
-    pub ip: u16,
     pub ds: u16,
     pub es: u16,
+    pub heap_seg: u16,
+    pub prev: Option<alloc::boxed::Box<ExecParent>>,
 }
 
 /// Match a filename against a DOS wildcard pattern (e.g. "*.*", "*.EXE").
@@ -3824,7 +4006,7 @@ pub fn setup_ivt() {
     }
 
     // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000)
-    for &int_num in &[0x20u8, 0x21, 0x28, 0x2E, 0x2F] {
+    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F] {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
@@ -3837,16 +4019,24 @@ pub fn setup_ivt() {
     scan_uma();
 }
 
-/// Linear address of the fake List of Lists structure (past stub array end at 0x0700).
-const LOL_ADDR: u32 = 0x0700;
-const LOL_SEG: u16 = 0x0070;
-/// Linear address of the fake SFT.
-const SFT_ADDR: u32 = 0x0740;
-const SFT_SEG: u16 = 0x0074;
-/// Number of SFT entries (matches MAX_FDS=16)
+// ── Low-memory layout (sequential from STUB_BASE) ──────────────────
+// Stubs: 256 × 2 bytes          0x0500–0x06FF
+// LoL:   0x40 bytes             0x0700–0x073F
+// SFT:   6 + 20×59 = 1186      0x0740–0x0BE1
+// CDS:   3 × 81 = 243          0x0BE2–0x0CD4
+// (env block starts at next paragraph + 0x100 gap for COM_SEGMENT)
+const LOL_ADDR: u32 = STUB_BASE + 256 * 2;                        // 0x0700
+const LOL_SIZE: u32 = 0x40;
+const SFT_ADDR: u32 = LOL_ADDR + LOL_SIZE;                        // 0x0740
 const SFT_ENTRIES: u16 = 20;
-/// Size of one SFT entry (DOS 3.1+)
 const SFT_ENTRY_SIZE: u32 = 59;
+const SFT_SIZE: u32 = 6 + SFT_ENTRIES as u32 * SFT_ENTRY_SIZE;    // 1186
+const CDS_ADDR: u32 = SFT_ADDR + SFT_SIZE;                        // 0x0BE2
+const CDS_ENTRY_SIZE: u32 = 81;
+const NUM_DRIVES: u8 = 3;
+const CDS_SIZE: u32 = NUM_DRIVES as u32 * CDS_ENTRY_SIZE;         // 243
+const DOS_AREA_END: u32 = CDS_ADDR + CDS_SIZE;                    // 0x0CD5
+const LOL_SEG: u16 = (LOL_ADDR >> 4) as u16;
 
 /// Write a little-endian u16 to an arbitrary (possibly unaligned) address.
 unsafe fn write_le16(addr: *mut u8, val: u16) {
@@ -3864,18 +4054,25 @@ unsafe fn write_le32(addr: *mut u8, val: u32) {
 
 fn setup_lol_sft() {
     unsafe {
-        // Zero the whole region (LoL + SFT)
-        let total = (SFT_ADDR - LOL_ADDR) as usize + 6 + SFT_ENTRIES as usize * SFT_ENTRY_SIZE as usize;
+        // Zero the whole region (LoL + SFT + CDS)
+        let total = (DOS_AREA_END - LOL_ADDR) as usize;
         core::ptr::write_bytes(LOL_ADDR as *mut u8, 0, total);
 
-        // LoL: offset +4 = far pointer to SFT (offset:segment, little-endian)
         let lol = LOL_ADDR as *mut u8;
-        write_le16(lol.add(4), 0x0000);   // SFT offset
-        write_le16(lol.add(6), SFT_SEG);  // SFT segment
+        // LoL+04h: far pointer to SFT
+        write_le16(lol.add(4), (SFT_ADDR & 0xF) as u16);
+        write_le16(lol.add(6), (SFT_ADDR >> 4) as u16);
+        // LoL+16h: far pointer to CDS array
+        write_le16(lol.add(0x16), (CDS_ADDR & 0xF) as u16);
+        write_le16(lol.add(0x18), (CDS_ADDR >> 4) as u16);
+        // LoL+20h: number of block devices
+        *lol.add(0x20) = 1; // one block device (C:)
+        // LoL+21h: LASTDRIVE
+        *lol.add(0x21) = NUM_DRIVES;
 
         // SFT header: next pointer = FFFF:FFFF (end of chain), count = SFT_ENTRIES
         let sft = SFT_ADDR as *mut u8;
-        write_le32(sft, 0xFFFFFFFF);       // next = end
+        write_le32(sft, 0xFFFFFFFF);
         write_le16(sft.add(4), SFT_ENTRIES);
 
         // Pre-populate entries 0-2 as character devices (stdin/stdout/stderr)
@@ -3884,6 +4081,19 @@ fn setup_lol_sft() {
             write_le16(entry, 1); // refcount = 1
             write_le16(entry.add(5), 0x80 | if i == 0 { 1 } else { 2 }); // device info
         }
+
+        // CDS entries: A: and B: invalid (flags=0), C: valid
+        let cds = CDS_ADDR as *mut u8;
+        // C: entry (index 2)
+        let c_entry = cds.add(2 * CDS_ENTRY_SIZE as usize);
+        // Path: "C:\" (67-byte ASCIIZ field)
+        *c_entry.add(0) = b'C';
+        *c_entry.add(1) = b':';
+        *c_entry.add(2) = b'\\';
+        // +43h: flags — 0x4000 = valid physical drive
+        write_le16(c_entry.add(0x43), 0x4000);
+        // +4Fh: backslash offset (points to the '\' in "C:\")
+        write_le16(c_entry.add(0x4F), 2);
     }
 }
 
@@ -3923,44 +4133,41 @@ fn sft_clear(handle: u16) {
 ///
 /// Pages are written via demand paging (ring-1 writes trigger page faults
 /// that allocate fresh pages at ring 0).
-fn map_psp(prog_name: &[u8]) {
-    let psp_addr = (COM_SEGMENT as usize) << 4;
-    // Environment 256 bytes before PSP (one paragraph block)
-    let env_seg: u16 = COM_SEGMENT - 0x10;
-    let env_addr = (env_seg as usize) << 4;
+fn map_psp(psp_seg: u16, parent_psp: u16, prog_name: &[u8]) {
+    let psp_addr = (psp_seg as usize) << 4;
 
-    // Environment block (256 bytes before PSP)
-    // Format: NUL-terminated strings, double NUL at end, then u16 count + program name
-    let env_ptr = env_addr as *mut u8;
-    unsafe { core::ptr::write_bytes(env_ptr, 0, 256); }
-    let mut off = 0;
-    // COMSPEC — NC checks this to find the command interpreter
-    let comspec = b"COMSPEC=C:\\COMMAND.COM\0";
-    unsafe { core::ptr::copy_nonoverlapping(comspec.as_ptr(), env_ptr.add(off), comspec.len()); }
-    off += comspec.len();
-    let path = b"PATH=C:\\\0";
-    unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), env_ptr.add(off), path.len()); }
-    off += path.len();
-    unsafe {
-        *env_ptr.add(off) = 0; // double NUL: end of environment
-        off += 1;
-        *env_ptr.add(off) = 0x01; // word count after env
-        *env_ptr.add(off + 1) = 0x00;
-        off += 2;
-    }
-    // Build "C:\<PROG_NAME>\0" from the actual program path.
-    // Convert forward slashes to backslashes and uppercase for DOS convention.
-    let prefix = b"C:\\";
-    unsafe { core::ptr::copy_nonoverlapping(prefix.as_ptr(), env_ptr.add(off), prefix.len()); }
-    off += prefix.len();
-    for &b in prog_name {
-        let c = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
-        unsafe { *env_ptr.add(off) = c; }
-        off += 1;
-    }
-    unsafe { *env_ptr.add(off) = 0; }
+    // Environment: create fresh for first load, inherit from parent for child exec
+    let env_seg = if psp_seg == parent_psp {
+        // First load — create env block below PSP
+        let env_seg: u16 = psp_seg - 0x10;
+        let env_ptr = ((env_seg as usize) << 4) as *mut u8;
+        unsafe { core::ptr::write_bytes(env_ptr, 0, 256); }
+        let mut off = 0;
+        let comspec = b"COMSPEC=C:\\COMMAND.COM\0";
+        unsafe { core::ptr::copy_nonoverlapping(comspec.as_ptr(), env_ptr.add(off), comspec.len()); }
+        off += comspec.len();
+        let path = b"PATH=C:\\\0";
+        unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), env_ptr.add(off), path.len()); }
+        off += path.len();
+        unsafe {
+            *env_ptr.add(off) = 0; off += 1;
+            *env_ptr.add(off) = 0x01; *env_ptr.add(off + 1) = 0x00; off += 2;
+        }
+        let prefix = b"C:\\";
+        unsafe { core::ptr::copy_nonoverlapping(prefix.as_ptr(), env_ptr.add(off), prefix.len()); }
+        off += prefix.len();
+        for &b in prog_name {
+            let c = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
+            unsafe { *env_ptr.add(off) = c; }
+            off += 1;
+        }
+        unsafe { *env_ptr.add(off) = 0; }
+        env_seg
+    } else {
+        // Child exec — inherit parent's env
+        unsafe { ((parent_psp as u32 * 16 + 0x2C) as *const u16).read_unaligned() }
+    };
 
-    // PSP (256 bytes at COM_SEGMENT:0000)
     let psp_ptr = psp_addr as *mut u8;
     unsafe {
         core::ptr::write_bytes(psp_ptr, 0, 256);
@@ -3968,14 +4175,14 @@ fn map_psp(prog_name: &[u8]) {
         *psp_ptr.add(1) = 0x20;
         *psp_ptr.add(2) = 0x00; // top of memory = 0xA000
         *psp_ptr.add(3) = 0xA0;
-        // Parent PSP segment — point to ourselves (top-level process, like COMMAND.COM)
-        *psp_ptr.add(0x16) = COM_SEGMENT as u8;
-        *psp_ptr.add(0x17) = (COM_SEGMENT >> 8) as u8;
+        // Parent PSP segment
+        *psp_ptr.add(0x16) = parent_psp as u8;
+        *psp_ptr.add(0x17) = (parent_psp >> 8) as u8;
         *psp_ptr.add(0x2C) = env_seg as u8;
         *psp_ptr.add(0x2D) = (env_seg >> 8) as u8;
         // JFT: pointer at PSP+0x18 → inline JFT at PSP+0x34
         *(psp_ptr.add(0x18) as *mut u16) = 0x0034; // offset
-        *(psp_ptr.add(0x1A) as *mut u16) = COM_SEGMENT; // segment
+        *(psp_ptr.add(0x1A) as *mut u16) = psp_seg; // segment
         *(psp_ptr.add(0x32) as *mut u16) = 20; // max open files
         // Inline JFT (20 bytes at PSP+0x34): 0/1/2 = stdin/stdout/stderr, rest = 0xFF
         *psp_ptr.add(0x34) = 0; // stdin → SFT 0
@@ -3988,8 +4195,6 @@ fn map_psp(prog_name: &[u8]) {
         *psp_ptr.add(0x81) = 0x0D; // CR
     }
 
-    // Default DTA is at PSP:0080h (linear = COM_SEGMENT*16 + 0x80)
-    crate::kernel::thread::current().vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;
 }
 
 /// Check if data starts with the MZ signature.
@@ -4005,13 +4210,17 @@ pub fn is_mz_exe(data: &[u8]) -> bool {
 ///     0x0000-0x00FF: PSP (Program Segment Prefix)
 ///     0x0100-...:    .COM binary code
 ///   Stack at COM_SEGMENT:COM_SP (top of segment)
-pub fn load_com(data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16) {
-    map_psp(prog_name);
-    // COM gets full 64K segment
-    thread::current().vm86.heap_seg = COM_SEGMENT.wrapping_add(0x1000);
+pub fn load_com(data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
+    load_com_at(COM_SEGMENT, COM_SEGMENT, data, prog_name)
+}
+
+/// Returns (cs, ip, ss, sp, end_seg) — caller sets heap_seg = end_seg.
+fn load_com_at(psp_seg: u16, parent_psp: u16, data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
+    map_psp(psp_seg, parent_psp, prog_name);
+    let end_seg = psp_seg.wrapping_add(0x1000);
 
     // Copy .COM data at offset 0x100
-    let base = (COM_SEGMENT as u32) << 4;
+    let base = (psp_seg as u32) << 4;
     let load_addr = base + COM_OFFSET as u32;
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -4021,7 +4230,7 @@ pub fn load_com(data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16) {
         );
     }
 
-    (COM_SEGMENT, COM_OFFSET, COM_SEGMENT, COM_SP)
+    (psp_seg, COM_OFFSET, psp_seg, COM_SP, end_seg)
 }
 
 /// Load an MZ .EXE binary into the VM86 address space.
@@ -4038,7 +4247,12 @@ pub fn load_com(data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16) {
 ///   0x14: initial IP
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
-pub fn load_exe(data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16)> {
+pub fn load_exe(data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
+    load_exe_at(COM_SEGMENT, COM_SEGMENT, data, prog_name)
+}
+
+/// Returns (cs, ip, ss, sp, end_seg) — caller sets heap_seg = end_seg.
+fn load_exe_at(psp_seg: u16, parent_psp: u16, data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
     if data.len() < 28 {
         return None;
     }
@@ -4069,16 +4283,14 @@ pub fn load_exe(data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16)> {
         return None;
     }
 
-    // Load segment: PSP is at COM_SEGMENT, load module starts one segment after
-    let psp_segment = COM_SEGMENT;
-    let load_segment = psp_segment + 0x10; // 256 bytes after PSP base
+    // Load segment: PSP is at psp_seg, load module starts one segment after
+    let load_segment = psp_seg + 0x10; // 256 bytes after PSP base
 
-    map_psp(prog_name);
+    map_psp(psp_seg, parent_psp, prog_name);
 
     // Set initial heap past the loaded program (PSP + load image + min extra/BSS)
     let load_paras = ((load_size as u32 + 15) / 16) as u16;
     let end_seg = load_segment.wrapping_add(load_paras).wrapping_add(min_extra as u16);
-    thread::current().vm86.heap_seg = end_seg;
 
     // Copy load module
     let load_base = (load_segment as u32) << 4;
@@ -4112,5 +4324,5 @@ pub fn load_exe(data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16)> {
     let cs = init_cs.wrapping_add(load_segment);
     let ss = init_ss.wrapping_add(load_segment);
 
-    Some((cs, init_ip, ss, init_sp))
+    Some((cs, init_ip, ss, init_sp, end_seg))
 }

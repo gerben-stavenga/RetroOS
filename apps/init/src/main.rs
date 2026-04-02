@@ -9,12 +9,5 @@
 pub fn main(_args: &[&str]) {
     crt::print("RetroOS init\n");
 
-    let pid = crt::fork();
-    if pid == 0 {
-        crt::exec("DN.COM", &["DN.COM"]);
-        crt::exit(1);
-    }
-    crt::waitpid(pid);
-    crt::print("init: child exited\n");
-    loop { crt::yield_cpu(); }
+    crt::exec("DN/DN.COM", &["DN.COM"]);
 }

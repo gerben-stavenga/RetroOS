@@ -1107,15 +1107,27 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
             "cow_entry: idx {:#x} is not a non-leaf recursive entry", idx);
         share_and_copy(entries, idx).expect("Out of memory during COW")
     } else {
-        // Leaf: copy from user VA (still maps old page during copy)
+        // Leaf: copy old page content into a new physical page.
         let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
-        temp_map(p);
-        unsafe {
-            let src = (idx * PAGE_SIZE) as *const u8;
-            let dst = temp_map_vaddr() as *mut u8;
-            core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
+        if idx == 0 {
+            // Page 0: can't read from VA 0 (null ptr). Copy via temp_map.
+            let mut buf = alloc::vec![0u8; PAGE_SIZE];
+            temp_map(old_phys);
+            unsafe { core::ptr::copy_nonoverlapping(
+                temp_map_vaddr() as *const u8, buf.as_mut_ptr(), PAGE_SIZE); }
+            temp_map(p);
+            unsafe { core::ptr::copy_nonoverlapping(
+                buf.as_ptr(), temp_map_vaddr() as *mut u8, PAGE_SIZE); }
+            temp_unmap();
+        } else {
+            // Other pages: read directly from user VA
+            temp_map(p);
+            unsafe {
+                let src = (idx * PAGE_SIZE) as *const u8;
+                core::ptr::copy_nonoverlapping(src, temp_map_vaddr() as *mut u8, PAGE_SIZE);
+            }
+            temp_unmap();
         }
-        temp_unmap();
         p
     };
 
@@ -1291,14 +1303,16 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
 }
 
 /// Map a physical page into the user address space.
-pub fn map_user_page_phys(vpage: usize, ppage: u64) {
+pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
     match entries() {
         Entries::E32(e) => {
-            let entry = Entry32::new(ppage, true, true);
+            let mut entry = Entry32::new(ppage, true, true);
+            entry.set_raw(entry.raw() | extra_flags);
             e[vpage] = entry;
         }
         Entries::E64(e) => {
-            let entry = Entry64::new(ppage, true, true);
+            let mut entry = Entry64::new(ppage, true, true);
+            entry.set_raw(entry.raw() | extra_flags);
             e[vpage] = entry;
         }
     }

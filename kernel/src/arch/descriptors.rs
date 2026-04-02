@@ -248,8 +248,9 @@ impl Tss {
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
-    // Except: trap 0x3DA (Input Status 1) so we can synthesize retrace signal
-    (*tss).iopb[120] = 0x00;
+    // Trap 0x3C0 (AC index/data) to track flip-flop state
+    // Trap 0x3DA (Input Status 1) to synthesize retrace + reset flip-flop
+    (*tss).iopb[120] = 0x01; // bit 0 = port 0x3C0
     (*tss).iopb[121] = 0x00;
     (*tss).iopb[122] = 0x00;
     (*tss).iopb[123] = 0x04; // trap bit 2 = port 0x3DA

@@ -205,48 +205,10 @@ fn event_loop(first_tid: usize) -> ! {
         let regs = unsafe { &mut *(&raw mut REGS) };
         drain_pending_irqs(thread, regs);
 
-        // Track IF transitions for debugging
-        {
-            static mut PREV_IF: bool = true;
-            static mut DUMPED: bool = false;
-            let cur_if = regs.frame.rflags & (1 << 9) != 0;
-            unsafe {
-                if PREV_IF && !cur_if {
-                    crate::dbg_println!("[IF] 1->0 before exec CS:EIP={:#06x}:{:#x}",
-                        regs.frame.cs as u16, regs.ip32());
-                } else if !PREV_IF && cur_if {
-                    crate::dbg_println!("[IF] 0->1 before exec CS:EIP={:#06x}:{:#x}",
-                        regs.frame.cs as u16, regs.ip32());
-                }
-                // One-shot dump: after 500 IF transitions, dump code bytes
-                static mut COUNT: u32 = 0;
-                if cur_if != PREV_IF {
-                    COUNT += 1;
-                    if COUNT == 500 && !DUMPED {
-                        DUMPED = true;
-                        let lin = if regs.mode() == crate::UserMode::VM86 {
-                            (regs.frame.cs as u32 & 0xFFFF) * 16 + regs.ip32()
-                        } else {
-                            regs.ip32()
-                        };
-                        // Dump from 0x9F-6 bytes before STI to see @@waitend and beyond
-                        let base = lin.wrapping_sub(6); // STI is at lin, 0x9F is ~6 before
-                        let bytes = core::slice::from_raw_parts(base as *const u8, 64);
-                        crate::dbg_println!("[DUMP] base_lin={:#x} (IP-6) 64 bytes={:02x?}", base, bytes);
-                    }
-                }
-                PREV_IF = cur_if;
-            }
-        }
-
         let (event, extra) = do_arch_execute();
 
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let regs = unsafe { &mut *(&raw mut REGS) };
-
-        if regs.mode() == crate::UserMode::Mode32 {
-            crate::dbg_println!("[evt] {} CS:EIP={:#06x}:{:#x}", event, regs.frame.cs as u16, regs.ip32());
-        }
 
         let new_tid = match event {
             0x80 => crate::kernel::syscalls::dispatch(regs),
@@ -290,7 +252,20 @@ fn event_loop(first_tid: usize) -> ! {
         if let Some(new_tid) = new_tid {
             if new_tid != tid {
                 let (old, new) = thread::get_two_threads(tid, new_tid);
+                // Persist current regs into old thread before switching
+                old.cpu_state = *regs;
+                // Save/restore VGA state when switching between VM86 threads
+                let old_vm86 = old.cpu_state.mode() == crate::UserMode::VM86;
+                let new_vm86 = new.cpu_state.mode() == crate::UserMode::VM86;
+                if old_vm86 {
+                    old.vm86.vga.ac_flipflop = unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP };
+                    old.vm86.vga.save_from_hardware();
+                }
                 arch_switch_to(&mut old.cpu_state, &mut old.root, &new.cpu_state, &new.root);
+                if new_vm86 {
+                    new.vm86.vga.restore_to_hardware();
+                    unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP = new.vm86.vga.ac_flipflop; }
+                }
                 tid = new_tid;
                 thread::set_current(tid);
                 // Reload LDT if switching to a DPMI thread
@@ -561,7 +536,7 @@ pub fn arch_load_ldt(base: u32, limit: u32) {
 }
 
 /// Map a range of physical pages into user virtual space.
-pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64) {
+pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -569,6 +544,7 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
             in("edx") vpage_start as u32,
             in("ecx") num_pages as u32,
             in("ebx") ppage_start as u32,
+            in("edi") flags as u32,
         );
     }
 }

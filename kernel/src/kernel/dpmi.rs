@@ -1205,7 +1205,7 @@ pub fn dpmi_int31(thread: &mut thread::Thread, regs: &mut Regs) -> Option<usize>
             let num_pages = aligned as usize / 4096;
             let vpage_start = base as usize / 4096;
             let ppage_start = phys as u64 / 4096;
-            crate::kernel::startup::arch_map_phys_range(vpage_start, num_pages, ppage_start);
+            crate::kernel::startup::arch_map_phys_range(vpage_start, num_pages, ppage_start, 0);
             // Return linear address
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
             regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);

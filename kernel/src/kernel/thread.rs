@@ -219,7 +219,7 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 
 /// Initialize a thread for VM86 mode (.COM execution)
 /// cs/ip/ss/sp are real-mode segment:offset values
-pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, sp: u16) {
+pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
     thread.mode = ThreadMode::Dos;
     thread.vm86 = crate::kernel::vm86::Vm86State::new();
 
@@ -231,10 +231,8 @@ pub fn init_process_thread_vm86(thread: &mut Thread, cs: u16, ip: u16, ss: u16, 
     *state = Regs::empty();
 
     // DS=ES=PSP segment for DOS programs, FS=GS=0
-    // For .COM: PSP = CS. For .EXE: PSP = CS - 0x10 (PSP precedes load module).
-    // Caller passes the load segment as CS; the PSP is always COM_SEGMENT.
-    state.ds = crate::kernel::vm86::COM_SEGMENT as u64;
-    state.es = crate::kernel::vm86::COM_SEGMENT as u64;
+    state.ds = psp_seg as u64;
+    state.es = psp_seg as u64;
     state.fs = 0;
     state.gs = 0;
 
@@ -331,6 +329,7 @@ pub fn exit_thread(exit_code: i32) -> usize {
             if parent.state == ThreadState::Blocked {
                 parent.state = ThreadState::Ready;
             }
+            parent.vm86.last_child_exit_code = exit_code as u8;
         }
 
         CURRENT_THREAD = 0;

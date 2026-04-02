@@ -247,22 +247,6 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
     use crate::kernel::vm86;
 
-    // Set CWD from the directory part of the program path.
-    // e.g. "QUAKE/QUAKE.EXE" → cwd = "QUAKE/"
-    {
-        let mut sep = 0;
-        let mut i = 0;
-        while i < prog_name.len() {
-            if prog_name[i] == b'/' || prog_name[i] == b'\\' {
-                sep = i + 1;
-            }
-            i += 1;
-        }
-        if sep > 0 {
-            thread::current().set_cwd(&prog_name[..sep]);
-        }
-    }
-
     // Free current user pages + map first 1MB for VM86
     startup::arch_user_clean();
     startup::arch_map_low_mem();
@@ -271,10 +255,10 @@ fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
     vm86::setup_ivt();
 
     // Load binary
-    let (cs, ip, ss, sp) = if is_exe && vm86::is_mz_exe(data) {
+    let (cs, ip, ss, sp, end_seg) = if is_exe && vm86::is_mz_exe(data) {
         vm86::load_exe(data, prog_name).unwrap_or_else(|| {
             crate::println!("Invalid MZ EXE");
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, 0)
         })
     } else {
         vm86::load_com(data, prog_name)
@@ -283,7 +267,10 @@ fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
     let current = thread::current();
     let tid = current.tid as usize;
 
-    thread::init_process_thread_vm86(current, cs, ip, ss, sp);
+    thread::init_process_thread_vm86(current, vm86::COM_SEGMENT, cs, ip, ss, sp);
+    // init_process_thread_vm86 resets Vm86State; restore heap_seg and DTA
+    current.vm86.heap_seg = end_seg;
+    current.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
     current.symbols = None;
 
     tid

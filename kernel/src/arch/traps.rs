@@ -131,8 +131,9 @@ fn arch_dispatch(regs: &mut Regs) {
             let vpage_start = regs.rdx as usize;
             let num_pages = regs.rcx as usize;
             let ppage_start = regs.rbx as u64;
+            let flags = regs.rdi;
             for i in 0..num_pages {
-                paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64);
+                paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64, flags);
             }
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),

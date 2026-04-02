@@ -12,6 +12,8 @@ exports_files(
         "DN.MNU",
         "DN.VWR",
         "DN.XRN",
+        "DN.FLG",
+        "DN.HIS",
     ],
     visibility = ["//visibility:public"],
 )
