@@ -3562,8 +3562,8 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
     let child_idx = child.tid as usize;
 
     crate::kernel::startup::arch_switch_to(
-        &mut current.cpu_state, &mut current.root,
-        &child.cpu_state, &child.root,
+        &mut child.cpu_state, &mut child.root,
+        core::ptr::null_mut(),
     );
     if is_elf {
         crate::kernel::startup::arch_free_user_pages();
@@ -3573,7 +3573,7 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
             Err(_) => {
                 crate::kernel::startup::arch_switch_to(
                     &mut child.cpu_state, &mut child.root,
-                    &current.cpu_state, &current.root,
+                    core::ptr::null_mut(),
                 );
                 thread::exit_thread(1);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
@@ -3591,7 +3591,7 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
 
         crate::kernel::startup::arch_switch_to(
             &mut child.cpu_state, &mut child.root,
-            &current.cpu_state, &current.root,
+            core::ptr::null_mut(),
         );
 
         if want_64 {
@@ -3613,7 +3613,7 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
                 None => {
                     crate::kernel::startup::arch_switch_to(
                         &mut child.cpu_state, &mut child.root,
-                        &current.cpu_state, &current.root,
+                        core::ptr::null_mut(),
                     );
                     thread::exit_thread(1);
                     regs.rax = (regs.rax & !0xFFFF) | 11;
@@ -3627,7 +3627,7 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
 
         crate::kernel::startup::arch_switch_to(
             &mut child.cpu_state, &mut child.root,
-            &current.cpu_state, &current.root,
+            core::ptr::null_mut(),
         );
 
         child.mode = thread::ThreadMode::Dos;

@@ -161,25 +161,38 @@ fn swap_regs(regs: &mut Regs) {
     unsafe { core::mem::swap(regs, &mut *(&raw mut REGS)); }
 }
 
-/// Switch threads: save outgoing regs+root, load incoming regs+root.
-/// Handles mode toggle and TSS update.
-/// SWITCH_TO: EDX=out_regs, ECX=out_root, EBX=in_regs, EDI=in_root
+/// Switch threads: swap live state with pointed-to state.
+/// SWITCH_TO: EDX=regs_ptr, ECX=root_ptr, EBX=hash_ptr (0 = no hashing)
+/// On entry: ptrs hold incoming state. On exit: ptrs hold saved outgoing state.
 fn arch_switch_to(regs: &mut Regs) {
-    let out_regs = regs.rdx as usize as *mut Regs;
-    let out_root = regs.rcx as usize as *mut paging2::RootPageTable;
-    let in_regs = regs.rbx as usize as *const Regs;
-    let in_root = regs.rdi as usize as *const paging2::RootPageTable;
+    let regs_ptr = regs.rdx as u32 as *mut Regs;
+    let root_ptr = regs.rcx as u32 as *mut paging2::RootPageTable;
+    let hash_ptr = regs.rbx as u32 as *mut u64;
 
-    // Save outgoing
+    let expected = if !hash_ptr.is_null() {
+        unsafe {
+            let exp = *hash_ptr;
+            *hash_ptr = paging2::hash_address_space();
+            exp
+        }
+    } else { 0 };
+
+    // Swap regs
+    unsafe { core::mem::swap(&mut *regs_ptr, &mut REGS); }
+
+    // Swap root
     unsafe {
-        *out_regs = REGS;
-        (*out_root).save();
+        let mut old_root = paging2::RootPageTable::empty();
+        old_root.save();
+        (&*root_ptr).activate();
+        *root_ptr = old_root;
     }
 
-    // Load incoming
-    unsafe {
-        REGS = *in_regs;
-        (&*in_root).activate();
+    if !hash_ptr.is_null() {
+        let new_hash = paging2::hash_address_space();
+        assert!(expected == 0 || expected == new_hash,
+            "Address space corrupted (expected {:#018x} got {:#018x})",
+            expected, new_hash);
     }
 }
 

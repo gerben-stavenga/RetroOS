@@ -96,6 +96,7 @@ pub struct Thread {
     pub dpmi: Option<alloc::boxed::Box<crate::kernel::dpmi::DpmiState>>,
     pub cwd: [u8; 64],     // Current working directory (e.g. "WOLF3D/", "" for root)
     pub cwd_len: usize,
+    pub addr_hash: u64,    // Debug: address space hash for corruption detection
 }
 
 impl Thread {
@@ -118,6 +119,7 @@ impl Thread {
             dpmi: None,
             cwd: [0; 64],
             cwd_len: 0,
+            addr_hash: 0,
         }
     }
 

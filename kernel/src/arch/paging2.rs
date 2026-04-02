@@ -613,6 +613,94 @@ pub fn is_pae() -> bool {
 // Runtime paging operations
 // =============================================================================
 
+/// Hash the user address space structure.
+/// Walks the page table tree, hashing canonical physical page indices
+/// (assigned sequentially as encountered) and stable permission bits
+/// (SOFT_RO, WRITE_THROUGH, USER, NO_EXECUTE — but not READ_WRITE/ACCESSED/DIRTY
+/// which are COW-flippable or hardware-updated).
+pub fn hash_address_space() -> u64 {
+    match entries() {
+        Entries::E32(e) => {
+            let mut ctx = HashCtx::new();
+            hash_walk(e, &mut ctx);
+            ctx.h
+        }
+        Entries::E64(e) => {
+            let mut ctx = HashCtx::new();
+            hash_walk(e, &mut ctx);
+            ctx.h
+        }
+    }
+}
+
+struct HashCtx {
+    h: u64,
+    phys_map: alloc::collections::BTreeMap<u64, u64>,
+    next_id: u64,
+}
+
+impl HashCtx {
+    fn new() -> Self {
+        Self { h: 0xcbf29ce484222325, phys_map: alloc::collections::BTreeMap::new(), next_id: 0 }
+    }
+
+    fn feed(&mut self, val: u64) {
+        self.h ^= val;
+        self.h = self.h.wrapping_mul(0x100000001b3);
+    }
+
+    fn canon_id(&mut self, phys: u64) -> u64 {
+        if let Some(&id) = self.phys_map.get(&phys) {
+            id
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.phys_map.insert(phys, id);
+            id
+        }
+    }
+}
+
+/// Stable bits to include in hash (not COW-flippable, not hw-updated)
+const HASH_MASK: u64 = flags::PRESENT | flags::SOFT_RO | flags::WRITE_THROUGH
+    | flags::USER | flags::NO_EXECUTE;
+
+fn hash_walk<E: Entry>(entries: &[E], ctx: &mut HashCtx) {
+    let root = root_base();
+    let user_count = recursive_idx() - root;
+    for i in 0..user_count {
+        hash_node(entries, root + i, ctx);
+    }
+}
+
+fn hash_node<E: Entry>(entries: &[E], idx: usize, ctx: &mut HashCtx) {
+    let e = entries[idx];
+    if !e.present() {
+        ctx.feed(0);
+        return;
+    }
+    let phys = e.page();
+    let id = if e.raw() & flags::WRITE_THROUGH != 0 { phys } else { ctx.canon_id(phys) };
+    ctx.feed(id | ((e.raw() & HASH_MASK) << 48));
+
+    if idx < PAGE_TABLE_BASE_IDX {
+        // Leaf — hash the 4K page data (skip volatile MMIO/WT pages)
+        if e.raw() & flags::WRITE_THROUGH == 0 {
+            let base = (idx * PAGE_SIZE) as *const u64;
+            for i in 0..(PAGE_SIZE / 8) {
+                ctx.feed(unsafe { *base.add(i) });
+            }
+        }
+    } else {
+        // Interior — recurse into children
+        let epp = entries_per_page::<E>();
+        let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
+        for j in 0..epp {
+            hash_node(entries, child_base + j, ctx);
+        }
+    }
+}
+
 /// Get page index from virtual address
 #[inline]
 pub const fn page_idx(vaddr: usize) -> usize {

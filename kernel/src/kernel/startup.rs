@@ -189,6 +189,8 @@ pub fn startup(start_sector: u32) -> ! {
     event_loop(init_thread.tid as usize);
 }
 
+const ASSERT_ADDR_HASH: bool = true;
+
 /// Ring-1 kernel event loop.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
 fn event_loop(first_tid: usize) -> ! {
@@ -252,8 +254,6 @@ fn event_loop(first_tid: usize) -> ! {
         if let Some(new_tid) = new_tid {
             if new_tid != tid {
                 let (old, new) = thread::get_two_threads(tid, new_tid);
-                // Persist current regs into old thread before switching
-                old.cpu_state = *regs;
                 // Save/restore VGA state when switching between VM86 threads
                 let old_vm86 = old.cpu_state.mode() == crate::UserMode::VM86;
                 let new_vm86 = new.cpu_state.mode() == crate::UserMode::VM86;
@@ -261,7 +261,17 @@ fn event_loop(first_tid: usize) -> ! {
                     old.vm86.vga.ac_flipflop = unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP };
                     old.vm86.vga.save_from_hardware();
                 }
-                arch_switch_to(&mut old.cpu_state, &mut old.root, &new.cpu_state, &new.root);
+                let mut swap_regs = new.cpu_state;
+                let mut swap_root = new.root;
+                if ASSERT_ADDR_HASH {
+                    let mut hash = new.addr_hash;
+                    arch_switch_to(&mut swap_regs, &mut swap_root, &mut hash);
+                    old.addr_hash = hash;
+                } else {
+                    arch_switch_to(&mut swap_regs, &mut swap_root, core::ptr::null_mut());
+                }
+                old.cpu_state = swap_regs;
+                old.root = swap_root;
                 if new_vm86 {
                     new.vm86.vga.restore_to_hardware();
                     unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP = new.vm86.vga.ac_flipflop; }
@@ -348,19 +358,21 @@ fn do_arch_execute() -> (u32, u32) {
     (event, extra)
 }
 
-/// Switch threads: save outgoing regs+root, load incoming regs+root + mode toggle.
+/// Switch threads: swap live state with pointed-to state.
+/// On entry: ptrs hold incoming state. On exit: ptrs hold saved outgoing state.
+/// hash_ptr: null = no hashing. Non-null: on entry = expected hash (0=don't check),
+/// on exit = old address space hash.
 pub fn arch_switch_to(
-    out_regs: &mut crate::Regs, out_root: &mut crate::RootPageTable,
-    in_regs: &crate::Regs, in_root: &crate::RootPageTable,
+    regs: &mut crate::Regs, root: &mut crate::RootPageTable,
+    hash_ptr: *mut u64,
 ) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
             in("eax") crate::arch::traps::arch_call::SWITCH_TO as u32,
-            in("edx") out_regs as *mut _ as u32,
-            in("ecx") out_root as *mut _ as u32,
-            in("ebx") in_regs as *const _ as u32,
-            in("edi") in_root as *const _ as u32,
+            in("edx") regs as *mut _ as u32,
+            in("ecx") root as *mut _ as u32,
+            in("ebx") hash_ptr as u32,
         );
     }
 }
