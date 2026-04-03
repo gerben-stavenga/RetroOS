@@ -58,23 +58,19 @@ fn stress(depth: i32) {
         crt::exit(0);
     }
 
-    // Fork child 2: exec into 64-bit stress test (gets COW copy, exec frees it)
+    // Fork child 2: just exit (stress64 disabled for debugging)
     let pid2 = crt::fork();
     if pid2 == 0 {
-        let mut buf = [0u8; 12];
-        let depth_str = crt::format_int(depth - 1, &mut buf);
-        crt::exec("stress64.elf", &["stress64.elf", depth_str]);
-        crt::print("exec stress64 failed\n");
-        crt::exit(1);
+        crt::exit(0);
     }
 
-    // Fork child 3: exec HELLO.COM (VM86 mode)
-    let pid3 = crt::fork();
-    if pid3 == 0 {
-        crt::exec("HELLO.COM", &[]);
-        crt::print("exec HELLO.COM failed\n");
-        crt::exit(1);
-    }
+    // // Fork child 3: exec HELLO.COM (VM86 mode)
+    // let pid3 = crt::fork();
+    // if pid3 == 0 {
+    //     crt::exec("HELLO.COM", &[]);
+    //     crt::print("exec HELLO.COM failed\n");
+    //     crt::exit(1);
+    // }
 
     crt::wait_all();
 

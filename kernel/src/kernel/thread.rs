@@ -3,7 +3,7 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
-use crate::arch::descriptors::{USER_CS, USER_CS64, USER_DS};
+use crate::arch::{USER_CS, USER_CS64, USER_DS};
 use crate::kernel::stacktrace::SymbolData;
 use crate::println;
 use crate::{Frame64, Regs};
@@ -185,24 +185,26 @@ pub fn create_thread(parent: Option<&Thread>, root: crate::RootPageTable, is_pro
     unsafe {
         for i in 0..MAX_THREADS {
             if THREADS[i].state == ThreadState::Unused {
-                let thread = &mut THREADS[i];
-                thread.tid = i as i32;
-                thread.pid = if is_process {
-                    i as i32
-                } else {
-                    parent.map(|p| p.pid).unwrap_or(0)
-                };
-                thread.priority = parent.map(|p| p.priority).unwrap_or(0);
-                thread.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
-                thread.state = ThreadState::Ready;
-                thread.time = crate::arch::irq::get_ticks() as u32;
-                thread.root = root;
-                thread.num_fds = 0;
-                for fd in &mut thread.fds {
-                    *fd = -1;
-                }
-                thread.cpu_state = Regs::empty();
-                return Some(thread);
+                let t = &mut THREADS[i];
+                t.tid = i as i32;
+                t.pid = if is_process { i as i32 } else { parent.map(|p| p.pid).unwrap_or(0) };
+                t.priority = parent.map(|p| p.priority).unwrap_or(0);
+                t.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
+                t.state = ThreadState::Ready;
+                t.mode = ThreadMode::Linux32;
+                t.time = crate::arch::get_ticks() as u32;
+                t.root = root;
+                t.num_fds = 0;
+                t.fds = [-1; MAX_FDS];
+                t.cpu_state = Regs::empty();
+                t.exit_code = 0;
+                t.symbols = None;
+                t.vm86 = crate::kernel::vm86::Vm86State::new();
+                t.dpmi = None;
+                t.cwd = [0; 64];
+                t.cwd_len = 0;
+                t.addr_hash = 0;
+                return Some(t);
             }
         }
         None
@@ -293,6 +295,36 @@ pub fn schedule() -> Option<usize> {
 /// Get the current thread index
 pub fn current_idx() -> usize {
     unsafe { CURRENT_THREAD }
+}
+
+/// F11 hotkey flag for thread cycling
+static mut SWITCH_REQUESTED: bool = false;
+
+pub fn request_switch() {
+    unsafe { core::ptr::write_volatile(&raw mut SWITCH_REQUESTED, true); }
+}
+
+pub fn take_switch_request() -> bool {
+    unsafe {
+        let v = core::ptr::read_volatile(&raw const SWITCH_REQUESTED);
+        if v { core::ptr::write_volatile(&raw mut SWITCH_REQUESTED, false); }
+        v
+    }
+}
+
+/// Round-robin: next Running/Ready thread after current (skips thread 0).
+pub fn cycle_next() -> Option<usize> {
+    unsafe {
+        let cur = CURRENT_THREAD;
+        for offset in 1..MAX_THREADS {
+            let i = (cur + offset) % MAX_THREADS;
+            if i == 0 { continue; }
+            if THREADS[i].state == ThreadState::Ready || THREADS[i].state == ThreadState::Running {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 /// Set the current thread index (called by event loop before executing)

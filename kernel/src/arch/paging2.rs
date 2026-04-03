@@ -190,6 +190,39 @@ impl RootPageTable {
         }
     }
 
+    /// Swap user entries between self and the constant root page, then reload CR3.
+    /// On return, self holds the old root entries and the constant root has self's former entries.
+    pub fn swap_and_activate(&mut self) {
+        match cpu_mode() {
+            CpuMode::Legacy => {
+                if let Entries::E32(e) = entries() {
+                    let root = root_base();
+                    let user_count = recursive_idx() - root;
+                    for i in 0..user_count {
+                        unsafe { core::mem::swap(&mut self.e32[i], &mut e[root + i]); }
+                    }
+                }
+            }
+            CpuMode::Pae | CpuMode::Compat => {
+                if let Entries::E64(e) = entries() {
+                    let root = root_base();
+                    let user_count = recursive_idx() - root;
+                    // Save PML4 phys from live root before swapping
+                    let pml4_page = e[root + 4].page();
+                    for i in 0..user_count {
+                        unsafe { core::mem::swap(&mut self.e64[i], &mut e[root + i]); }
+                    }
+                    // self.e64[3] now has PML4 phys from before swap; update to live root's
+                    unsafe { self.e64[3] = Entry64(pml4_page * PAGE_SIZE as u64); }
+                }
+            }
+        }
+        if cpu_mode() == CpuMode::Pae {
+            sync_hw_pdpt();
+        }
+        unsafe { crate::arch::x86::write_cr3(self.cr3() as u32); }
+    }
+
     /// Load user entries into constant root and reload CR3.
     /// Use when no mode toggle is needed.
     pub fn activate(&self) {
@@ -610,94 +643,205 @@ pub fn is_pae() -> bool {
 }
 
 // =============================================================================
-// Runtime paging operations
+// Address space tree snapshot (for corruption detection)
 // =============================================================================
 
-/// Hash the user address space structure.
-/// Walks the page table tree, hashing canonical physical page indices
-/// (assigned sequentially as encountered) and stable permission bits
-/// (SOFT_RO, WRITE_THROUGH, USER, NO_EXECUTE — but not READ_WRITE/ACCESSED/DIRTY
-/// which are COW-flippable or hardware-updated).
-pub fn hash_address_space() -> u64 {
-    match entries() {
-        Entries::E32(e) => {
-            let mut ctx = HashCtx::new();
-            hash_walk(e, &mut ctx);
-            ctx.h
-        }
-        Entries::E64(e) => {
-            let mut ctx = HashCtx::new();
-            hash_walk(e, &mut ctx);
-            ctx.h
-        }
-    }
+/// Stable entry bits: canonical page ID in low 48 bits, stable flags in upper bits.
+/// Excludes READ_WRITE (COW-flippable) and ACCESSED/DIRTY (hw-updated).
+const STABLE_MASK: u64 = flags::PRESENT | flags::SOFT_RO | flags::WRITE_THROUGH
+    | flags::CACHE_DISABLE | flags::USER | flags::NO_EXECUTE;
+
+/// Recursive page table tree node.
+/// `bits` = canonical page ID | (stable flags << 48).
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub enum Node {
+    Leaf { bits: u64, data_hash: u64 },
+    Internal { bits: u64, children: alloc::vec::Vec<(u16, Node)> },
 }
 
-struct HashCtx {
-    h: u64,
+/// Full user address space snapshot.
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub struct PageTree(pub alloc::vec::Vec<(u16, Node)>);
+
+struct CollectCtx {
     phys_map: alloc::collections::BTreeMap<u64, u64>,
     next_id: u64,
 }
 
-impl HashCtx {
-    fn new() -> Self {
-        Self { h: 0xcbf29ce484222325, phys_map: alloc::collections::BTreeMap::new(), next_id: 0 }
-    }
+impl CollectCtx {
+    fn new() -> Self { Self { phys_map: alloc::collections::BTreeMap::new(), next_id: 0 } }
 
-    fn feed(&mut self, val: u64) {
-        self.h ^= val;
-        self.h = self.h.wrapping_mul(0x100000001b3);
-    }
-
-    fn canon_id(&mut self, phys: u64) -> u64 {
-        if let Some(&id) = self.phys_map.get(&phys) {
-            id
+    fn canon_bits(&mut self, raw: u64) -> u64 {
+        let phys = (raw >> 12) & 0xF_FFFF_FFFF;
+        let id = if raw & (flags::WRITE_THROUGH | flags::CACHE_DISABLE) != 0 {
+            phys  // MMIO: use real phys, not canonical
         } else {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.phys_map.insert(phys, id);
-            id
+            *self.phys_map.entry(phys).or_insert_with(|| {
+                let id = self.next_id;
+                self.next_id += 1;
+                id
+            })
+        };
+        id | ((raw & STABLE_MASK) << 48)
+    }
+}
+
+impl PageTree {
+    pub fn collect() -> Self {
+        match entries() {
+            Entries::E32(e) => Self::collect_walk(e),
+            Entries::E64(e) => Self::collect_walk(e),
         }
     }
-}
 
-/// Stable bits to include in hash (not COW-flippable, not hw-updated)
-const HASH_MASK: u64 = flags::PRESENT | flags::SOFT_RO | flags::WRITE_THROUGH
-    | flags::USER | flags::NO_EXECUTE;
-
-fn hash_walk<E: Entry>(entries: &[E], ctx: &mut HashCtx) {
-    let root = root_base();
-    let user_count = recursive_idx() - root;
-    for i in 0..user_count {
-        hash_node(entries, root + i, ctx);
-    }
-}
-
-fn hash_node<E: Entry>(entries: &[E], idx: usize, ctx: &mut HashCtx) {
-    let e = entries[idx];
-    if !e.present() {
-        ctx.feed(0);
-        return;
-    }
-    let phys = e.page();
-    let id = if e.raw() & flags::WRITE_THROUGH != 0 { phys } else { ctx.canon_id(phys) };
-    ctx.feed(id | ((e.raw() & HASH_MASK) << 48));
-
-    if idx < PAGE_TABLE_BASE_IDX {
-        // Leaf — hash the 4K page data (skip volatile MMIO/WT pages)
-        if e.raw() & flags::WRITE_THROUGH == 0 {
-            let base = (idx * PAGE_SIZE) as *const u64;
-            for i in 0..(PAGE_SIZE / 8) {
-                ctx.feed(unsafe { *base.add(i) });
+    fn collect_walk<E: Entry>(ents: &[E]) -> Self {
+        let root = root_base();
+        let user_count = recursive_idx() - root;
+        let mut ctx = CollectCtx::new();
+        let mut nodes = alloc::vec::Vec::new();
+        for i in 0..user_count {
+            if ents[root + i].present() {
+                nodes.push((i as u16, Self::collect_node(ents, root + i, &mut ctx)));
             }
         }
-    } else {
-        // Interior — recurse into children
-        let epp = entries_per_page::<E>();
-        let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
-        for j in 0..epp {
-            hash_node(entries, child_base + j, ctx);
+        PageTree(nodes)
+    }
+
+    fn collect_node<E: Entry>(ents: &[E], idx: usize, ctx: &mut CollectCtx) -> Node {
+        let raw = ents[idx].raw();
+        let bits = ctx.canon_bits(raw);
+        if idx < PAGE_TABLE_BASE_IDX {
+            let dh = if raw & (flags::WRITE_THROUGH | flags::CACHE_DISABLE) == 0 {
+                hash_page_data(idx * PAGE_SIZE)
+            } else { 0 };
+            Node::Leaf { bits, data_hash: dh }
+        } else {
+            let epp = entries_per_page::<E>();
+            let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
+            let mut children = alloc::vec::Vec::new();
+            for j in 0..epp {
+                if ents[child_base + j].present() {
+                    children.push((j as u16, Self::collect_node(ents, child_base + j, ctx)));
+                }
+            }
+            Node::Internal { bits, children }
         }
+    }
+
+    /// Print diff between expected (self) and actual (other).
+    pub fn diff(&self, other: &PageTree) {
+        diff_children(&self.0, &other.0, 0);
+    }
+}
+
+fn node_bits(n: &Node) -> u64 {
+    match n { Node::Leaf { bits, .. } | Node::Internal { bits, .. } => *bits }
+}
+
+fn diff_children(a: &[(u16, Node)], b: &[(u16, Node)], depth: usize) {
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+    while ai < a.len() || bi < b.len() {
+        match (a.get(ai), b.get(bi)) {
+            (Some((aidx, an)), Some((bidx, bn))) if aidx == bidx => {
+                if an != bn { diff_node(*aidx, an, bn, depth); }
+                ai += 1; bi += 1;
+            }
+            (Some((aidx, an)), Some((bidx, _))) if aidx < bidx => {
+                crate::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                ai += 1;
+            }
+            (_, Some((bidx, bn))) => {
+                crate::println!("{:w$}+ [{}] bits={:#x}", "", bidx, node_bits(bn), w = depth * 2);
+                bi += 1;
+            }
+            (Some((aidx, an)), None) => {
+                crate::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                ai += 1;
+            }
+            (None, None) => break,
+        }
+    }
+}
+
+fn diff_node(idx: u16, a: &Node, b: &Node, depth: usize) {
+    match (a, b) {
+        (Node::Internal { bits: ab, children: ac }, Node::Internal { bits: bb, children: bc }) => {
+            if ab != bb {
+                crate::println!("{:w$}~ [{}] bits={:#x} -> {:#x}", "", idx, ab, bb, w = depth * 2);
+            } else {
+                crate::println!("{:w$}~ [{}] bits={:#x} (children changed)", "", idx, ab, w = depth * 2);
+            }
+            diff_children(ac, bc, depth + 1);
+        }
+        (Node::Leaf { bits: ab, data_hash: ah }, Node::Leaf { bits: bb, data_hash: bh }) => {
+            crate::println!("{:w$}~ [{}] bits={:#x}dh={:#x} -> bits={:#x}dh={:#x}",
+                "", idx, ab, ah, bb, bh, w = depth * 2);
+        }
+        _ => {
+            crate::println!("{:w$}~ [{}] node type changed!", "", idx, w = depth * 2);
+        }
+    }
+}
+
+fn hash_page_data(va: usize) -> u64 {
+    use core::hash::Hasher;
+    let mut h = FnvHasher(0xcbf29ce484222325);
+    let base = va as *const u64;
+    for i in 0..(PAGE_SIZE / 8) {
+        h.write_u64(unsafe { *base.add(i) });
+    }
+    h.finish()
+}
+
+/// FNV-1a hasher
+struct FnvHasher(u64);
+
+impl core::hash::Hasher for FnvHasher {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+fn fnv_hash(tree: &PageTree) -> u64 {
+    use core::hash::{Hash, Hasher};
+    let mut h = FnvHasher(0xcbf29ce484222325);
+    tree.hash(&mut h);
+    h.finish()
+}
+
+static mut RECORDED_TREES: Option<alloc::collections::BTreeMap<u64, PageTree>> = None;
+
+fn recorded_trees() -> &'static mut alloc::collections::BTreeMap<u64, PageTree> {
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(RECORDED_TREES);
+        if (*ptr).is_none() {
+            *ptr = Some(alloc::collections::BTreeMap::new());
+        }
+        (*ptr).as_mut().unwrap()
+    }
+}
+
+/// Collect tree, hash it, store snapshot. Returns the hash.
+pub fn hash_and_record() -> u64 {
+    let tree = PageTree::collect();
+    let h = fnv_hash(&tree);
+    recorded_trees().insert(h, tree);
+    h
+}
+
+/// Print diff between two recorded trees.
+pub fn print_recorded_diff(expected: u64, actual: u64) {
+    let map = recorded_trees();
+    let exp = map.get(&expected);
+    let act = map.get(&actual);
+    match (exp, act) {
+        (Some(e), Some(a)) => e.diff(a),
+        _ => crate::println!("  (trees not available for diff)"),
     }
 }
 
@@ -1073,11 +1217,14 @@ pub fn fork_current() -> Option<u64> {
 fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
     let new_root = share_and_copy(entries, recursive_idx())?;
 
-    // Deshare user root entries in PAE mode (PDPT[0..2]).
-    // PAE hardware ignores R/W on PDPT entries, so COW can't be enforced
-    // at that level — eagerly COW to push enforcement to PD level.
-    // Compat mode doesn't need this: PDPT entries are ordinary page table
-    // entries with full R/W enforcement, so cascading COW works naturally.
+    // Eagerly deshare all user PD/PDPT entries so that COW enforcement
+    // is pushed down to leaf PTEs.  This avoids cascading COW (where a
+    // PD-level fault must share_and_copy before the leaf fault can fire)
+    // which is fragile and hard to keep refcount-correct.
+    //
+    // PAE MUST do this (hardware ignores R/W on PDPT entries).
+    // Legacy benefits from the same simplification.
+    // Compat doesn't need it (PDPT entries have full R/W enforcement).
     if cpu_mode() == CpuMode::Pae {
         let root = root_base();
         let user_count = recursive_idx() - root;

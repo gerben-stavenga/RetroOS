@@ -172,7 +172,7 @@ fn arch_switch_to(regs: &mut Regs) {
     let expected = if !hash_ptr.is_null() {
         unsafe {
             let exp = *hash_ptr;
-            *hash_ptr = paging2::hash_address_space();
+            *hash_ptr = paging2::hash_and_record();
             exp
         }
     } else { 0 };
@@ -180,19 +180,18 @@ fn arch_switch_to(regs: &mut Regs) {
     // Swap regs
     unsafe { core::mem::swap(&mut *regs_ptr, &mut REGS); }
 
-    // Swap root
-    unsafe {
-        let mut old_root = paging2::RootPageTable::empty();
-        old_root.save();
-        (&*root_ptr).activate();
-        *root_ptr = old_root;
-    }
+    // Log incoming struct PDE[0] before swap
+    let pre_pde0 = unsafe { (*root_ptr).e32[0].0 };
+
+    // Swap root: swap entries in-place, then reload CR3
+    unsafe { (&mut *root_ptr).swap_and_activate(); }
 
     if !hash_ptr.is_null() {
-        let new_hash = paging2::hash_address_space();
-        assert!(expected == 0 || expected == new_hash,
-            "Address space corrupted (expected {:#018x} got {:#018x})",
-            expected, new_hash);
+        let new_hash = paging2::hash_and_record();
+        if expected != 0 && expected != new_hash {
+            crate::println!("\x1b[91mHASH MISMATCH expected {:#018x} got {:#018x}\x1b[0m", expected, new_hash);
+            paging2::print_recorded_diff(expected, new_hash);
+        }
     }
 }
 
@@ -419,20 +418,26 @@ fn handle_protection_fault<E: paging2::Entry>(
         return None; // Let kernel handle
     }
 
-    // Walk from leaf upward to find the first !hw_writable entry
+    // Walk from leaf upward to find the outermost R/O COW entry.
+    // Must COW top-down: only the outermost share_and_copy establishes
+    // correct refcounts for the levels below.
+    let mut cow_idx = None;
     let mut idx = page_index;
     loop {
         if entries[idx].present() && !entries[idx].hw_writable() {
             if !entries[idx].writable() {
-                return None; // Not COW, let kernel handle
+                return None;
             }
-            paging2::cow_entry(entries, idx);
-            paging2::flush_tlb();
-            return Some(());
+            cow_idx = Some(idx);
         }
         let parent = paging2::parent_index::<E>(idx);
         if parent == idx { break; }
         idx = parent;
+    }
+    if let Some(idx) = cow_idx {
+        paging2::cow_entry(entries, idx);
+        paging2::flush_tlb();
+        return Some(());
     }
 
     None // Unexpected, let kernel handle

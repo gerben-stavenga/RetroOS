@@ -25,10 +25,8 @@ pub use kernel::vm86;
 pub use lib::vga;
 pub use lib::{print, println, dbg_print, dbg_println};
 
-use arch::paging2::{KernelPages, PAGE_SIZE, LOW_MEM_BASE, RawPage};
-
 // Re-export arch types used as opaque blobs by kernel code
-pub use arch::paging2::RootPageTable;
+pub use arch::{RootPageTable, PAGE_SIZE, KernelPages, RawPage, LOW_MEM_BASE};
 
 /// Memory map entry from bootloader
 #[repr(C, packed)]
@@ -82,152 +80,12 @@ pub static mut KERNEL_STACK: AlignedStack<{ 32 * 1024 }> = AlignedStack::new();
 #[unsafe(link_section = ".data")]
 pub static mut ARCH_STACK: AlignedStack<{ 16 * 1024 }> = AlignedStack::new();
 
-// External assembly functions
-unsafe extern "C" {
-    fn SwitchStack(new_stack: *mut u8, func: *const ()) -> !;
-}
-
-// Linker symbols
+// Linker symbols (used by panic stack trace)
 unsafe extern "C" {
     static _start: u8;
     static _data: u8;
     static _edata: u8;
     static _end: u8;
-}
-
-/// PrepareKernel - Entry point called by bootloader
-///
-/// This function runs at physical address with paging disabled.
-/// The kernel is linked at KERNEL_BASE but loaded at arbitrary phys address.
-/// We use delta adjustment to access globals correctly.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PrepareKernel(boot_data: *const BootData) -> ! {
-    unsafe {
-        let phys_address = (*boot_data).kernel as usize;
-        let linked_address = core::ptr::addr_of!(_start) as usize;
-
-        // Delta between where we're loaded and where we're linked
-        let delta = phys_address.wrapping_sub(linked_address);
-
-        // Adjust a pointer from linked address to physical address
-        let adjust = |ptr: *const u8| -> *mut u8 {
-            (ptr as usize).wrapping_add(delta) as *mut u8
-        };
-
-        // Get adjusted pointers to kernel pages and scratch
-        let kpages = adjust(core::ptr::addr_of!(KERNEL_PAGES) as *const u8) as *mut KernelPages;
-        let scratch = adjust(core::ptr::addr_of!(SCRATCH) as *const u8) as *mut RawPage;
-
-        // Calculate kernel size in pages
-        let kernel_size = core::ptr::addr_of!(_end) as usize - linked_address;
-        let kernel_pages = (kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-        // Enable paging (auto-detects Legacy vs PAE)
-        arch::paging2::enable_paging(kpages, scratch, phys_address, kernel_pages);
-
-        // Now paging is enabled, we're running at virtual address
-        // Set up argument for KernelInit on the stack
-        #[allow(static_mut_refs)]
-        let stack_top = unsafe { KERNEL_STACK.top_mut() };
-        // Push boot_data pointer (adjusted to LOW_MEM_BASE mapping)
-        let boot_data_virt = (boot_data as usize + LOW_MEM_BASE) as *const BootData;
-        let stack_with_arg = stack_top.sub(4) as *mut *const BootData;
-        *stack_with_arg = boot_data_virt;
-
-        SwitchStack(stack_with_arg as *mut u8, KernelInit as *const ());
-    }
-}
-
-/// Main kernel initialization
-///
-/// This runs on the kernel stack with paging enabled.
-extern "C" fn KernelInit(boot_data: *const BootData) -> ! {
-    let boot_data = unsafe { &*boot_data };
-
-    println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
-
-    // Update VGA base to use LOW_MEM_BASE mapping before removing identity
-    vga::vga().base = LOW_MEM_BASE + 0xB8000;
-
-    // Finish paging setup (remove identity, enable NX, setup long mode, harden)
-    arch::paging2::finish_setup_paging();
-
-    let kernel_phys = boot_data.kernel as u64;
-    println!("kernel_phys: {:#x}", kernel_phys);
-
-    let kernel_size = core::ptr::addr_of!(_end) as u64 - core::ptr::addr_of!(_start) as u64;
-    let kernel_low_page = kernel_phys / PAGE_SIZE as u64;
-    let kernel_high_page = (kernel_phys + kernel_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
-
-    println!("Initializing phys_mm...");
-
-    // Initialize physical memory allocator
-    arch::phys_mm::init_phys_mm(
-        &boot_data.mmap_entries,
-        boot_data.mmap_count as usize,
-        kernel_low_page,
-        kernel_high_page,
-    );
-
-
-    println!("Physical memory: {:#x} pages free", arch::phys_mm::free_page_count());
-
-    // Initialize temp mapping for fork
-    arch::paging2::init_temp_map();
-
-    // Initialize kernel heap allocator
-    kernel::heap::init();
-    println!("Heap initialized");
-
-    // Print memory map
-    let boot_data = boot_data;
-    println!("Memory regions: {}", boot_data.mmap_count);
-
-    for i in 0..boot_data.mmap_count as usize {
-        if i >= 32 { break; }
-        let entry = boot_data.mmap_entries[i];
-        if entry.typ == 1 {
-            // Copy packed fields before use to avoid unaligned references
-            let base = entry.base;
-            let length = entry.length;
-            println!("  Available: {:#x} - {:#x}", base, base + length);
-        }
-    }
-
-    // Setup GDT, IDT, TSS — use ARCH_STACK for TSS ESP0
-    #[allow(static_mut_refs)]
-    // Reserve 16 bytes at top for VM86 segments (CPU pushes ES,DS,FS,GS)
-    let arch_stack_top = unsafe { ARCH_STACK.top() as u32 } - 16;
-    arch::descriptors::setup_descriptor_tables(arch_stack_top);
-    println!("Descriptors initialized");
-
-    // Setup PIC and enable interrupts (must happen before mode toggle,
-    // because toggle_mode calls sti() and unmapped PIC would crash)
-    arch::irq::init_interrupts();
-    println!("Interrupts initialized");
-
-    // If CPU supports long mode, switch to compat mode now.
-    // All code (32-bit and 64-bit user processes) runs in compat mode.
-    if arch::paging2::cpu_supports_long_mode() {
-        arch::paging2::sync_hw_pdpt();
-        arch::x86::flush_tlb();
-        let saved = arch::paging2::ensure_trampoline_mapped();
-        arch::descriptors::toggle_mode(arch::paging2::toggle_cr3(true));
-        arch::paging2::clear_trampoline(saved);
-        println!("Switched to Compat mode");
-    }
-
-    // Enable interrupts
-    arch::x86::sti();
-    println!("Interrupts enabled");
-
-    println!();
-    println!("\x1b[92mHello from Rust kernel!\x1b[0m");
-
-    // Drop to ring 1 — continues here at ring 1
-    arch::descriptors::enter_ring1();
-
-    kernel::startup::startup(boot_data.start_sector);
 }
 
 /// Raw CPU-pushed interrupt frame for 32-bit mode.
@@ -426,7 +284,7 @@ impl Regs {
     /// Checks CS first (64-bit wins over stale VM flag), then EFLAGS.VM.
     /// Returns Mode32 for kernel regs (ring 1 CS) too.
     pub fn mode(&self) -> UserMode {
-        if self.frame.cs == arch::descriptors::USER_CS64 as u64 {
+        if self.frame.cs == arch::USER_CS64 as u64 {
             UserMode::Mode64
         } else if self.frame.rflags & (1 << 17) != 0 {
             UserMode::VM86
@@ -477,7 +335,7 @@ impl core::fmt::Debug for Regs {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    arch::x86::cli();
+    arch::cli();
     println!();
     println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
 
@@ -494,7 +352,7 @@ fn panic(info: &PanicInfo) -> ! {
     kernel::stacktrace::stack_trace();
 
     loop {
-        arch::x86::cli();
-        arch::x86::hlt();
+        arch::cli();
+        arch::hlt();
     }
 }

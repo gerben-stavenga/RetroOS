@@ -24,61 +24,8 @@ const IOPL_MASK: u32 = 3 << 12;
 const VM_FLAG: u32 = 1 << 17;
 const EMS_ENABLED: bool = false;
 
-/// Dummy file handle returned by INT 21h/3Ch (Create file) on our read-only FS.
-/// Writes to this handle are silently discarded (/dev/null semantics).
+/// Dummy file handle returned for /dev/null semantics.
 const NULL_FILE_HANDLE: u16 = 99;
-
-/// RAM-backed temporary file (for swap files, config writes, etc.)
-const TEMP_FILE_BASE: u16 = 80;
-const MAX_TEMP_FILES: usize = 8;
-
-struct TempFile {
-    data: alloc::vec::Vec<u8>,
-    pos: usize,
-    active: bool,
-}
-
-impl TempFile {
-    const fn empty() -> Self {
-        Self { data: alloc::vec::Vec::new(), pos: 0, active: false }
-    }
-}
-
-fn temp_files() -> &'static mut [TempFile; MAX_TEMP_FILES] {
-    static mut FILES: [TempFile; MAX_TEMP_FILES] = {
-        const EMPTY: TempFile = TempFile::empty();
-        [EMPTY; MAX_TEMP_FILES]
-    };
-    unsafe { &mut *core::ptr::addr_of_mut!(FILES) }
-}
-
-fn temp_file_alloc() -> Option<u16> {
-    let files = temp_files();
-    for i in 0..MAX_TEMP_FILES {
-        if !files[i].active {
-            files[i] = TempFile { data: alloc::vec::Vec::new(), pos: 0, active: true };
-            return Some(TEMP_FILE_BASE + i as u16);
-        }
-    }
-    None
-}
-
-fn temp_file_get(handle: u16) -> Option<&'static mut TempFile> {
-    if handle < TEMP_FILE_BASE || handle >= TEMP_FILE_BASE + MAX_TEMP_FILES as u16 {
-        return None;
-    }
-    let f = &mut temp_files()[(handle - TEMP_FILE_BASE) as usize];
-    if f.active { Some(f) } else { None }
-}
-
-fn temp_file_close(handle: u16) {
-    if handle >= TEMP_FILE_BASE && handle < TEMP_FILE_BASE + MAX_TEMP_FILES as u16 {
-        let f = &mut temp_files()[(handle - TEMP_FILE_BASE) as usize];
-        f.data = alloc::vec::Vec::new();
-        f.pos = 0;
-        f.active = false;
-    }
-}
 
 /// Flags that VM86 code cannot change (IOPL, VM)
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
@@ -146,9 +93,11 @@ const COM_SP: u16 = 0xFFFE;
 
 pub const HMA_PAGE_COUNT: usize = 16;
 
-/// Global VGA Attribute Controller flip-flop — tracks real hardware state.
-/// true = next write to 0x3C0 is an index byte; false = data byte.
+/// Global VGA Attribute Controller state — tracks real hardware.
+/// Flipflop: true = next write to 0x3C0 is an index byte; false = data byte.
+/// Index: last index written (including PAS bit 5).
 pub static mut VGA_AC_FLIPFLOP: bool = true;
+pub static mut VGA_AC_INDEX: u8 = 0x20;
 
 /// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
 /// Saved/restored on context switch so each process has its own screen.
@@ -198,48 +147,56 @@ impl VgaState {
 
     /// Read current VGA hardware state into this struct.
     pub fn save_from_hardware(&mut self) {
-        use crate::arch::x86::{inb, outb};
+        use crate::arch::{inb, outb};
         if self.planes.is_empty() {
             self.planes = alloc::vec![0u8; 4 * 65536];
         }
-        // Misc output
-        self.misc_output = inb(0x3CC);
-        // Sequencer
-        for i in 0..5u8 {
-            outb(0x3C4, i);
-            self.seq[i as usize] = inb(0x3C5);
-        }
-        self.seq_index = inb(0x3C4);
-        // CRTC
-        for i in 0..25u8 {
-            outb(0x3D4, i);
-            self.crtc[i as usize] = inb(0x3D5);
-        }
-        self.crtc_index = inb(0x3D4);
-        // Graphics Controller
-        for i in 0..9u8 {
-            outb(0x3CE, i);
-            self.gc[i as usize] = inb(0x3CF);
-        }
-        self.gc_index = inb(0x3CE);
-        // Attribute Controller — reset flipflop first
+        // Capture tracked AC state, then reset flipflop to known index state.
+        self.ac_flipflop = unsafe { VGA_AC_FLIPFLOP };
+        self.ac_index = unsafe { VGA_AC_INDEX };
         let _ = inb(0x3DA);
+
+        // Save all registers
+        self.misc_output = inb(0x3CC);
+        for i in 0..5u8 { outb(0x3C4, i); self.seq[i as usize] = inb(0x3C5); }
+        self.seq_index = inb(0x3C4);
+        for i in 0..25u8 { outb(0x3D4, i); self.crtc[i as usize] = inb(0x3D5); }
+        self.crtc_index = inb(0x3D4);
+        for i in 0..9u8 { outb(0x3CE, i); self.gc[i as usize] = inb(0x3CF); }
+        self.gc_index = inb(0x3CE);
+        self.dac_mask = inb(0x3C6);
+        outb(0x3C7, 0);
+        for i in 0..768 { self.dac[i] = inb(0x3C9); }
+
+        // Attribute Controller — must reset flipflop EACH iteration.
+        // inb(0x3C1) reads the register but does NOT toggle the flipflop,
+        // so without a reset the next outb(0x3C0, i) would be a data write.
         for i in 0..21u8 {
+            let _ = inb(0x3DA);
             outb(0x3C0, i);
             self.ac[i as usize] = inb(0x3C1);
         }
-        // Re-enable display (AC index bit 5)
-        outb(0x3C0, 0x20);
-        // DAC
-        self.dac_mask = inb(0x3C6);
-        outb(0x3C7, 0); // read index = 0
-        for i in 0..768 {
-            self.dac[i] = inb(0x3C9);
+
+        // Restore hardware AC to the program's tracked state:
+        // inb(0x3DA) → index state, outb(0x3C0, idx) → sets index, goes to data state.
+        // If program was in index state, one more inb(0x3DA) resets back.
+        let _ = inb(0x3DA);
+        outb(0x3C0, self.ac_index);
+        if self.ac_flipflop {
+            let _ = inb(0x3DA);
         }
-        // Save planes — set read plane via GC reg 4, read 64KB each
-        outb(0x3CE, 4); // select GC "Read Map Select" register
+        unsafe { VGA_AC_FLIPFLOP = self.ac_flipflop; }
+
+        // Force flat planar mode for reading planes:
+        // SEQ mem mode = sequential access (no chain-4, no odd/even)
+        // GC mode = read mode 0, write mode 0
+        // GC misc = graphics mode, A0000/64K window, no chain odd/even
+        outb(0x3C4, 4); outb(0x3C5, 0x06);
+        outb(0x3CE, 5); outb(0x3CF, 0x00);
+        outb(0x3CE, 6); outb(0x3CF, 0x05);
+
         for plane in 0..4u8 {
-            outb(0x3CF, plane);
+            outb(0x3CE, 4); outb(0x3CF, plane);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     0xA0000 as *const u8,
@@ -248,50 +205,35 @@ impl VgaState {
                 );
             }
         }
-        // Restore GC index
+
+        // Restore registers we temporarily changed
+        outb(0x3C4, 4); outb(0x3C5, self.seq[4]);
+        outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
+        outb(0x3CE, 5); outb(0x3CF, self.gc[5]);
+        outb(0x3CE, 6); outb(0x3CF, self.gc[6]);
         outb(0x3CE, self.gc_index);
     }
 
     /// Write this struct's state to VGA hardware.
     pub fn restore_to_hardware(&self) {
         if self.planes.is_empty() { return; }
-        use crate::arch::x86::{inb, outb};
-        // Misc output
+        use crate::arch::{inb, outb};
+
+        // Reset AC flipflop to known (index) state before any VGA register work.
+        let _ = inb(0x3DA);
+
+        // Step 1: Write planes in forced flat planar mode.
+        // Need misc_output for clock source, but force sequential planar access.
+        outb(0x3C4, 0); outb(0x3C5, 0x01); // sync reset
         outb(0x3C2, self.misc_output);
-        // Sequencer
-        for i in 0..5u8 {
-            outb(0x3C4, i);
-            outb(0x3C5, self.seq[i as usize]);
-        }
-        // CRTC — unlock first (clear protect bit in reg 0x11)
-        outb(0x3D4, 0x11);
-        outb(0x3D5, self.crtc[0x11] & 0x7F);
-        for i in 0..25u8 {
-            outb(0x3D4, i);
-            outb(0x3D5, self.crtc[i as usize]);
-        }
-        // Graphics Controller
-        for i in 0..9u8 {
-            outb(0x3CE, i);
-            outb(0x3CF, self.gc[i as usize]);
-        }
-        // Attribute Controller
-        let _ = inb(0x3DA); // reset flipflop
-        for i in 0..21u8 {
-            outb(0x3C0, i);
-            outb(0x3C0, self.ac[i as usize]);
-        }
-        outb(0x3C0, 0x20); // re-enable display
-        // DAC
-        outb(0x3C6, self.dac_mask);
-        outb(0x3C8, 0); // write index = 0
-        for i in 0..768 {
-            outb(0x3C9, self.dac[i]);
-        }
-        // Restore planes — set write plane via SEQ reg 2, write 64KB each
+        outb(0x3C4, 2); outb(0x3C5, 0x0F); // map mask: all planes
+        outb(0x3C4, 4); outb(0x3C5, 0x06); // mem mode: sequential, no chain-4
+        outb(0x3C4, 0); outb(0x3C5, 0x03); // release reset
+        outb(0x3CE, 5); outb(0x3CF, 0x00); // GC mode: write mode 0
+        outb(0x3CE, 6); outb(0x3CF, 0x05); // GC misc: graphics, A0000/64K
+
         for plane in 0..4u8 {
-            outb(0x3C4, 2); // Map Mask register
-            outb(0x3C5, 1 << plane);
+            outb(0x3C4, 2); outb(0x3C5, 1 << plane);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.planes[plane as usize * 65536..].as_ptr(),
@@ -300,9 +242,35 @@ impl VgaState {
                 );
             }
         }
-        // Restore sequencer Map Mask
-        outb(0x3C4, 2);
-        outb(0x3C5, self.seq[2]);
+
+        // Step 2: Set target mode registers.
+        outb(0x3C4, 0); outb(0x3C5, 0x01); // sync reset
+        outb(0x3C2, self.misc_output);
+        for i in 1..5u8 { outb(0x3C4, i); outb(0x3C5, self.seq[i as usize]); }
+        outb(0x3C4, 0); outb(0x3C5, 0x03); // release reset
+
+        // CRTC — unlock first (clear protect bit in reg 0x11)
+        outb(0x3D4, 0x11); outb(0x3D5, self.crtc[0x11] & 0x7F);
+        for i in 0..25u8 { outb(0x3D4, i); outb(0x3D5, self.crtc[i as usize]); }
+        // Graphics Controller
+        for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]); }
+        // Attribute Controller — write all 21 registers
+        let _ = inb(0x3DA);
+        for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, self.ac[i as usize]); }
+        // Restore the program's AC index + flipflop state:
+        let _ = inb(0x3DA);                // → index state
+        outb(0x3C0, self.ac_index);        // set index, → data state
+        if self.ac_flipflop {
+            let _ = inb(0x3DA);            // → index state
+        }
+        unsafe {
+            VGA_AC_FLIPFLOP = self.ac_flipflop;
+            VGA_AC_INDEX = self.ac_index;
+        }
+        // DAC
+        outb(0x3C6, self.dac_mask);
+        outb(0x3C8, 0);
+        for i in 0..768 { outb(0x3C9, self.dac[i]); }
         // Restore index registers
         outb(0x3C4, self.seq_index);
         outb(0x3D4, self.crtc_index);
@@ -520,7 +488,7 @@ pub struct VirtualPit {
 
 impl VirtualPit {
     fn new() -> Self {
-        let now = crate::arch::irq::get_ticks();
+        let now = crate::arch::get_ticks();
         Self {
             last_host_tick: now,
             frac_accum: 0,
@@ -530,7 +498,7 @@ impl VirtualPit {
     }
 
     fn sync(&mut self) {
-        let now = crate::arch::irq::get_ticks();
+        let now = crate::arch::get_ticks();
         let delta_ticks = now.saturating_sub(self.last_host_tick);
         if delta_ticks == 0 {
             return;
@@ -1151,7 +1119,7 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
         // - VL_SetCRTC needs bit0=0 (display active phase)
         0x3DA => {
             // Read real hardware to reset the AC flip-flop, and track it globally.
-            let _real = crate::arch::x86::inb(0x3DA);
+            let _real = crate::arch::inb(0x3DA);
             unsafe { VGA_AC_FLIPFLOP = true; }
             static mut RETRACE_CTR: u8 = 0;
             let ctr = unsafe {
@@ -1163,7 +1131,7 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
             Ok(val)
         }
         // VGA ports — pass through to hardware
-        0x3C0..=0x3D9 | 0x3DB..=0x3DF => Ok(crate::arch::x86::inb(port)),
+        0x3C0..=0x3D9 | 0x3DB..=0x3DF => Ok(crate::arch::inb(port)),
         // Master PIC command (read ISR)
         0x20 => Ok(thread::current().vm86.vpic.isr),
         // Master PIC data (read IMR)
@@ -1186,14 +1154,19 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
 /// Emulate OUT to a port.
 pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
     match port {
-        // VGA ports — pass through to hardware, track AC flip-flop
+        // VGA ports — pass through to hardware, track AC flip-flop + index
         0x3C0 => {
-            unsafe { VGA_AC_FLIPFLOP = !VGA_AC_FLIPFLOP; }
-            crate::arch::x86::outb(port, val);
+            unsafe {
+                if VGA_AC_FLIPFLOP {
+                    VGA_AC_INDEX = val; // index write
+                }
+                VGA_AC_FLIPFLOP = !VGA_AC_FLIPFLOP;
+            }
+            crate::arch::outb(port, val);
             Ok(())
         }
         0x3C1..=0x3DF => {
-            crate::arch::x86::outb(port, val);
+            crate::arch::outb(port, val);
             Ok(())
         }
         // Master PIC command
@@ -1252,8 +1225,8 @@ pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
 
 /// Buffer a hardware event into the virtual PIC / keyboard buffer.
 /// Mode-independent: both VM86 and DPMI share the same virtual devices.
-pub fn queue_irq(thread: &mut thread::Thread, event: crate::arch::irq::Irq) {
-    use crate::arch::irq::Irq;
+pub fn queue_irq(thread: &mut thread::Thread, event: crate::arch::Irq) {
+    use crate::arch::Irq;
     match event {
         Irq::Key(sc) => {
             let Some(sc) = normalize_vm86_scancode(thread, sc) else { return };
@@ -1742,7 +1715,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
 /// With VME, only INTs whose bit is SET in the redirection bitmap trap here.
 /// Without VME, all INTs trap — unintercepted ones are reflected through IVT.
 fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
-    if !crate::arch::descriptors::int_intercepted(int_num) {
+    if !crate::arch::int_intercepted(int_num) {
         reflect_interrupt(regs, int_num);
         return Action::Done;
     }
@@ -2030,6 +2003,10 @@ fn int_21h(regs: &mut Regs) -> Action {
             // Other sub-functions: just return
             Action::Done
         }
+        // AH=0x0D: Disk Reset (flush buffers) — no-op on RAM-backed FS
+        0x0D => {
+            Action::Done
+        }
         // AH=0x1A: Set DTA (Disk Transfer Area) address to DS:DX
         0x1A => {
             // Store DTA address — NC needs this for FindFirst/FindNext
@@ -2150,9 +2127,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
             let handle = regs.rbx as u16;
-            if handle >= TEMP_FILE_BASE && handle < TEMP_FILE_BASE + MAX_TEMP_FILES as u16 {
-                temp_file_close(handle);
-            } else if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
+            if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
                 crate::kernel::vfs::close(handle as i32);
                 sft_clear(handle);
             }
@@ -2175,17 +2150,6 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else if handle == NULL_FILE_HANDLE as i32 {
                 // /dev/null — return 0 bytes (EOF)
                 regs.rax = regs.rax & !0xFFFF;
-                regs.clear_flag32(1);
-            } else if let Some(tf) = temp_file_get(handle as u16) {
-                let avail = tf.data.len().saturating_sub(tf.pos);
-                let n = count.min(avail);
-                if n > 0 {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(tf.data.as_ptr().add(tf.pos), buf_addr as *mut u8, n);
-                    }
-                    tf.pos += n;
-                }
-                regs.rax = (regs.rax & !0xFFFF) | n as u64;
                 regs.clear_flag32(1);
             } else if count == 0 || buf_addr == 0 {
                 regs.rax = regs.rax & !0xFFFF;
@@ -2339,10 +2303,24 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.rax = (regs.rax & !0xFF) | 3; // AL = number of logical drives
             Action::Done
         }
-        // AH=0x3C: Create file — allocate RAM-backed temp file
+        // AH=0x3C: Create file (CX=attr, DS:DX=filename) — RAM-backed via VFS overlay
         0x3C => {
-            if let Some(handle) = temp_file_alloc() {
-                regs.rax = (regs.rax & !0xFFFF) | handle as u64;
+            let ds = regs.ds as u16 as u32;
+            let dx = regs.rdx as u16 as u32;
+            let mut addr = (ds << 4) + dx;
+            let mut name = [0u8; 64];
+            let mut i = 0;
+            while i < 63 {
+                let ch = unsafe { *(addr as *const u8) };
+                if ch == 0 { break; }
+                name[i] = ch;
+                addr += 1;
+                i += 1;
+            }
+            let fd = crate::kernel::vfs::create(&name[..i]);
+            if fd >= 0 {
+                crate::dbg_println!("  -> create fd={} {}", fd, core::str::from_utf8(&name[..i]).unwrap_or("?"));
+                regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 4; // too many open files
@@ -2362,24 +2340,13 @@ fn int_21h(regs: &mut Regs) -> Action {
                     vga::vga().putchar(ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
-            } else if let Some(tf) = temp_file_get(handle) {
-                let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
-                let n = count as usize;
-                let end = tf.pos + n;
-                if end > tf.data.len() {
-                    tf.data.resize(end, 0);
-                }
-                unsafe {
-                    core::ptr::copy_nonoverlapping(addr as *const u8, tf.data.as_mut_ptr().add(tf.pos), n);
-                }
-                tf.pos = end;
-                regs.rax = (regs.rax & !0xFFFF) | count as u64;
-                regs.clear_flag32(1);
             } else if handle == NULL_FILE_HANDLE {
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
             } else {
-                // VFS (read-only TAR): silently discard writes
-                regs.rax = (regs.rax & !0xFFFF) | count as u64;
+                let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+                let data = unsafe { core::slice::from_raw_parts(addr as *const u8, count as usize) };
+                let n = crate::kernel::vfs::write(handle as i32, data);
+                regs.rax = (regs.rax & !0xFFFF) | if n >= 0 { n as u64 } else { count as u64 };
                 regs.clear_flag32(1);
             }
             Action::Done
@@ -2391,18 +2358,6 @@ fn int_21h(regs: &mut Regs) -> Action {
                 // /dev/null — always at position 0
                 regs.rdx = regs.rdx & !0xFFFF;
                 regs.rax = regs.rax & !0xFFFF;
-                regs.clear_flag32(1);
-            } else if let Some(tf) = temp_file_get(handle as u16) {
-                let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
-                let whence = regs.rax as u8;
-                let new_pos = match whence {
-                    0 => offset as usize,           // SEEK_SET
-                    1 => (tf.pos as i32 + offset) as usize, // SEEK_CUR
-                    _ => (tf.data.len() as i32 + offset) as usize, // SEEK_END
-                };
-                tf.pos = new_pos;
-                regs.rdx = (regs.rdx & !0xFFFF) | ((new_pos as u32 >> 16) as u64);
-                regs.rax = (regs.rax & !0xFFFF) | (new_pos as u16 as u64);
                 regs.clear_flag32(1);
             } else {
                 let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
@@ -2669,8 +2624,21 @@ fn int_21h(regs: &mut Regs) -> Action {
             regs.clear_flag32(1);
             Action::Done
         }
-        // AH=0x41: Delete file — read-only FS, pretend success
+        // AH=0x41: Delete file (DS:DX=filename)
         0x41 => {
+            let ds = regs.ds as u16 as u32;
+            let dx = regs.rdx as u16 as u32;
+            let mut addr = (ds << 4) + dx;
+            let mut name = [0u8; 64];
+            let mut i = 0;
+            while i < 63 {
+                let ch = unsafe { *(addr as *const u8) };
+                if ch == 0 { break; }
+                name[i] = ch;
+                addr += 1;
+                i += 1;
+            }
+            crate::kernel::vfs::delete(&name[..i]);
             regs.clear_flag32(1);
             Action::Done
         }
@@ -2728,10 +2696,11 @@ fn int_21h(regs: &mut Regs) -> Action {
                 regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
                 regs.clear_flag32(1);
             } else if create_not {
-                // File doesn't exist — create RAM-backed temp file
+                // File doesn't exist — create RAM-backed file via VFS overlay
                 if fd >= 0 { crate::kernel::vfs::close(fd); }
-                if let Some(handle) = temp_file_alloc() {
-                    regs.rax = (regs.rax & !0xFFFF) | handle as u64;
+                let new_fd = crate::kernel::vfs::create(&name[..i]);
+                if new_fd >= 0 {
+                    regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
                     regs.clear_flag32(1);
                 } else {
@@ -3216,7 +3185,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                     for _ in 0..pages_needed {
                         let mut group = [0u64; 4];
                         for p in &mut group {
-                            match crate::arch::phys_mm::alloc_phys_page() {
+                            match crate::arch::alloc_phys_page() {
                                 Some(page) => *p = page,
                                 None => { ok = false; break; }
                             }
@@ -3236,7 +3205,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                         // Free any partially allocated pages
                         for group in &pages {
                             for &p in group {
-                                if p != 0 { crate::arch::phys_mm::free_phys_page(p); }
+                                if p != 0 { crate::arch::free_phys_page(p); }
                             }
                         }
                         regs.rax = (regs.rax & !0xFF00) | (0x88 << 8); // AH=88: not enough pages
@@ -3306,7 +3275,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                 if let Some(h) = ems.handles[handle as usize].take() {
                     for group in &h.pages {
                         for &p in group {
-                            crate::arch::phys_mm::free_phys_page(p);
+                            crate::arch::free_phys_page(p);
                         }
                     }
                 }
@@ -3432,14 +3401,14 @@ fn int_67h(regs: &mut Regs) -> Action {
                             let mut group = [0u64; 4];
                             let mut ok = true;
                             for p in &mut group {
-                                match crate::arch::phys_mm::alloc_phys_page() {
+                                match crate::arch::alloc_phys_page() {
                                     Some(page) => *p = page,
                                     None => { ok = false; break; }
                                 }
                             }
                             if !ok {
                                 // Free partially allocated group
-                                for &p in &group { if p != 0 { crate::arch::phys_mm::free_phys_page(p); } }
+                                for &p in &group { if p != 0 { crate::arch::free_phys_page(p); } }
                                 regs.rax = (regs.rax & !0xFF00) | (0x88 << 8);
                                 return Action::Done;
                             }
@@ -3449,7 +3418,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                         // Shrink: free excess pages
                         for group in h.pages.drain(new_count as usize..) {
                             for &p in &group {
-                                crate::arch::phys_mm::free_phys_page(p);
+                                crate::arch::free_phys_page(p);
                             }
                         }
                     }
@@ -3639,7 +3608,6 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
     child.cwd = current.cwd;
     child.cwd_len = current.cwd_len;
 
-    current.state = thread::ThreadState::Blocked;
     regs.clear_flag32(1);
     Action::Switch(child_idx)
 }

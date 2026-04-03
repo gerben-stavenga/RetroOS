@@ -1,11 +1,8 @@
-//! Kernel startup - TAR filesystem and init loading
-//!
-//! Reads files from the TAR filesystem on disk and loads init.elf
+//! Kernel startup - TAR filesystem and DN.COM loader
 
 extern crate alloc;
 
 use alloc::vec;
-use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::{elf, hdd};
 use crate::println;
 use crate::kernel::thread;
@@ -129,72 +126,54 @@ pub fn read_data_at_block(block: u32, buffer: &mut [u8]) -> u32 {
     hdd::read_sectors(lba, buffer)
 }
 
-/// Startup: load and run init.elf, then enter event loop.
+/// Startup: initialize filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
 pub fn startup(start_sector: u32) -> ! {
+    use crate::kernel::vm86;
 
     crate::kernel::thread::init_threading();
 
     println!("Initializing filesystem at sector {:#x}", start_sector);
-
     init_fs(start_sector);
-
-    // Load symbol table for stack traces
     crate::kernel::stacktrace::init_from_tar();
 
-    // Find init.elf
-    println!("Loading init.elf");
+    loop {
+        let size = match find_file(b"DN/DN.COM") {
+            Some(s) => s,
+            None => panic!("DN/DN.COM not found"),
+        };
+        let mut buf = vec![0u8; size];
+        read_file(&mut buf);
 
-    let size = match find_file(b"init.elf") {
-        Some(s) => s,
-        None => panic!("init.elf not found"),
-    };
+        let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
+            .expect("Failed to create DN thread");
+        let tid = t.tid as usize;
 
-    println!("init.elf size: {:#x}", size);
+        // Set up VM86 address space in the current (boot) page tables.
+        // The thread's root stays empty — event_loop captures it on first switch-away.
+        arch_map_low_mem();
+        vm86::setup_ivt();
+        let (cs, ip, ss, sp, end_seg) = vm86::load_com(&buf, b"DN/DN.COM");
 
-    let mut elf_buffer = vec![0u8; size];
-    read_file(&mut elf_buffer);
+        t.mode = thread::ThreadMode::Dos;
+        thread::init_process_thread_vm86(t, vm86::COM_SEGMENT, cs, ip, ss, sp);
+        t.vm86.heap_seg = end_seg;
+        t.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
+        t.cwd_len = 0;
 
-    let loaded = match elf::load_elf(&elf_buffer) {
-        Ok(e) => e,
-        Err(_) => panic!("Failed to load init.elf"),
-    };
+        unsafe { *(&raw mut crate::arch::REGS) = t.cpu_state; }
 
-    let symbols = SymbolData::new(elf_buffer.into_boxed_slice());
-
-    println!("Entry point: {:#x}", loaded.entry);
-
-    // Set up user stack with argc=0 for _start(argc, argv)
-    let stack_top = elf::USER_STACK_TOP as u32;
-    let stack = stack_top - 12; // [dummy_ret=0] [argc=0] [argv=ptr]
-    unsafe {
-        *((stack_top - 4) as *mut u32) = stack;  // argv (non-null, never dereferenced since argc=0)
-        *((stack_top - 8) as *mut u32) = 0;      // argc
-        *((stack_top - 12) as *mut u32) = 0;     // dummy return address
+        println!("Starting DN...");
+        event_loop(tid);
     }
-    println!("User stack: {:#x}", stack);
-
-    // Create init thread — root is empty; switch_to captures it when we first switch away
-    let init_thread = thread::create_thread(None, crate::RootPageTable::empty(), true)
-        .expect("Failed to create init thread");
-
-    init_thread.symbols = symbols;
-    println!("Starting init process...");
-
-    // Thread 0 is running — its state goes in REGS, not cpu_state
-    unsafe {
-        (*(&raw mut crate::arch::traps::REGS)).init_user_process(loaded.entry as u32, stack);
-    }
-
-    event_loop(init_thread.tid as usize);
 }
 
 const ASSERT_ADDR_HASH: bool = true;
 
-/// Ring-1 kernel event loop.
+/// Ring-1 kernel event loop. Returns when no threads remain.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
-fn event_loop(first_tid: usize) -> ! {
-    use crate::arch::traps::REGS;
+fn event_loop(first_tid: usize) {
+    use crate::arch::REGS;
 
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut tid = first_tid;
@@ -251,7 +230,15 @@ fn event_loop(first_tid: usize) -> ! {
         };
 
 
+        // F11 hotkey: force round-robin thread cycle
+        let new_tid = if new_tid.is_none() && thread::take_switch_request() {
+            thread::cycle_next()
+        } else {
+            new_tid
+        };
+
         if let Some(new_tid) = new_tid {
+            if new_tid == 0 { return; } // no threads left — respawn DN
             if new_tid != tid {
                 let (old, new) = thread::get_two_threads(tid, new_tid);
                 // Save/restore VGA state when switching between VM86 threads
@@ -290,6 +277,9 @@ fn event_loop(first_tid: usize) -> ! {
     }
 }
 
+/// F11 scancode (press)
+const F11_PRESS: u8 = 0x57;
+
 fn drain_pending_irqs(thread: &mut thread::Thread, regs: &mut crate::Regs) {
     let is_dos = regs.mode() == crate::UserMode::VM86
         || (regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some());
@@ -302,19 +292,27 @@ fn drain_pending_irqs(thread: &mut thread::Thread, regs: &mut crate::Regs) {
         }
         // Queue hardware events into virtual PIC/keyboard (shared devices)
         let tp = thread as *mut thread::Thread;
-        let ticks = crate::arch::irq::take_pending_ticks();
+        let ticks = crate::arch::take_pending_ticks();
         for _ in 0..ticks {
-            crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, crate::arch::irq::Irq::Tick);
+            crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, crate::arch::Irq::Tick);
         }
-        crate::arch::irq::drain(|evt| {
-            crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, evt);
+        crate::arch::drain(|evt| {
+            if let crate::arch::Irq::Key(F11_PRESS) = evt {
+                thread::request_switch();
+            } else {
+                crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, evt);
+            }
         });
         // Deliver one pending interrupt (shared VIF/VIP/ISR discipline)
         crate::kernel::vm86::raise_pending(unsafe { &mut *tp }, regs);
     } else if !is_dos {
-        crate::arch::irq::drain(|evt| {
-            if let crate::arch::irq::Irq::Key(sc) = evt {
-                crate::kernel::keyboard::process_key(sc);
+        crate::arch::drain(|evt| {
+            if let crate::arch::Irq::Key(sc) = evt {
+                if sc == F11_PRESS {
+                    thread::request_switch();
+                } else {
+                    crate::kernel::keyboard::process_key(sc);
+                }
             }
         });
     }
@@ -327,13 +325,13 @@ fn qemu_vga_workaround(regs: &crate::Regs) {
         if regs.cs32() < 0xC000 {
             let mode = *(0x449 as *const u8);
             if mode <= 3 || mode == 7 {
-                let saved_idx = crate::arch::x86::inb(0x3CE);
-                crate::arch::x86::outb(0x3CE, 5);
-                let gc5 = crate::arch::x86::inb(0x3CF);
+                let saved_idx = crate::arch::inb(0x3CE);
+                crate::arch::outb(0x3CE, 5);
+                let gc5 = crate::arch::inb(0x3CF);
                 if gc5 & 0x10 == 0 {
-                    crate::arch::x86::outb(0x3CF, gc5 | 0x10);
+                    crate::arch::outb(0x3CF, gc5 | 0x10);
                 }
-                crate::arch::x86::outb(0x3CE, saved_idx);
+                crate::arch::outb(0x3CE, saved_idx);
             }
         }
     }
@@ -348,7 +346,7 @@ fn do_arch_execute() -> (u32, u32) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inout("eax") crate::arch::traps::arch_call::EXECUTE as u32 => event,
+            inout("eax") crate::arch::arch_call::EXECUTE as u32 => event,
             out("edx") extra,
             out("ecx") _,
             out("ebx") _,
@@ -369,7 +367,7 @@ pub fn arch_switch_to(
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::SWITCH_TO as u32,
+            in("eax") crate::arch::arch_call::SWITCH_TO as u32,
             in("edx") regs as *mut _ as u32,
             in("ecx") root as *mut _ as u32,
             in("ebx") hash_ptr as u32,
@@ -383,7 +381,7 @@ pub fn arch_user_fork(child_root: &mut crate::RootPageTable) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::FORK as u32,
+            in("eax") crate::arch::arch_call::FORK as u32,
             in("edx") child_root as *mut _ as u32,
         );
     }
@@ -393,7 +391,7 @@ pub fn arch_user_clean() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::CLEAN as u32,
+            in("eax") crate::arch::arch_call::CLEAN as u32,
         );
     }
 }
@@ -406,7 +404,7 @@ pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, exe
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::SET_PAGE_FLAGS as u32,
+            in("eax") crate::arch::arch_call::SET_PAGE_FLAGS as u32,
             in("edx") start_vpage as u32,
             in("ecx") count as u32,
             in("ebx") flags,
@@ -419,7 +417,7 @@ pub fn arch_map_low_mem() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::MAP_LOW_MEM as u32,
+            in("eax") crate::arch::arch_call::MAP_LOW_MEM as u32,
         );
     }
 }
@@ -429,7 +427,7 @@ pub fn arch_free_phys_page(phys: u64) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::FREE_PHYS_PAGE as u32,
+            in("eax") crate::arch::arch_call::FREE_PHYS_PAGE as u32,
             in("edx") phys as u32,
         );
     }
@@ -442,7 +440,7 @@ pub fn arch_set_a20(enabled: bool, hma: &mut [u64; crate::kernel::vm86::HMA_PAGE
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::SET_A20 as u32,
+            in("eax") crate::arch::arch_call::SET_A20 as u32,
             in("edx") enabled as u32,
             in("ecx") hma as *mut _ as u32,
         );
@@ -454,7 +452,7 @@ pub fn arch_zero_phys_page(phys: u64) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::ZERO_PHYS_PAGE as u32,
+            in("eax") crate::arch::arch_call::ZERO_PHYS_PAGE as u32,
             in("edx") phys as u32,
         );
     }
@@ -469,7 +467,7 @@ pub fn arch_map_ems_window(base_page: usize, window: usize, phys_pages: Option<&
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::MAP_EMS_WINDOW as u32,
+            in("eax") crate::arch::arch_call::MAP_EMS_WINDOW as u32,
             in("edx") base_page as u32,
             in("ecx") window as u32,
             in("ebx") ptr,
@@ -482,7 +480,7 @@ pub fn arch_map_umb(base_page: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::MAP_UMB as u32,
+            in("eax") crate::arch::arch_call::MAP_UMB as u32,
             in("edx") base_page as u32,
             in("ecx") count as u32,
         );
@@ -494,7 +492,7 @@ pub fn arch_unmap_umb(base_page: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::UNMAP_UMB as u32,
+            in("eax") crate::arch::arch_call::UNMAP_UMB as u32,
             in("edx") base_page as u32,
             in("ecx") count as u32,
         );
@@ -507,7 +505,7 @@ pub fn arch_temp_map_addr() -> usize {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inout("eax") crate::arch::traps::arch_call::GET_TEMP_MAP_ADDR as u32 => addr,
+            inout("eax") crate::arch::arch_call::GET_TEMP_MAP_ADDR as u32 => addr,
         );
     }
     addr as usize
@@ -518,7 +516,7 @@ pub fn arch_init_hma(hma: &mut [u64; crate::kernel::vm86::HMA_PAGE_COUNT]) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::INIT_HMA as u32,
+            in("eax") crate::arch::arch_call::INIT_HMA as u32,
             in("edx") hma as *mut _ as u32,
         );
     }
@@ -529,7 +527,7 @@ pub fn arch_activate_root(root: &crate::RootPageTable) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::ACTIVATE_ROOT as u32,
+            in("eax") crate::arch::arch_call::ACTIVATE_ROOT as u32,
             in("edx") root as *const _ as u32,
         );
     }
@@ -540,7 +538,7 @@ pub fn arch_load_ldt(base: u32, limit: u32) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::LOAD_LDT as u32,
+            in("eax") crate::arch::arch_call::LOAD_LDT as u32,
             in("edx") base,
             in("ecx") limit,
         );
@@ -552,7 +550,7 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::MAP_PHYS_RANGE as u32,
+            in("eax") crate::arch::arch_call::MAP_PHYS_RANGE as u32,
             in("edx") vpage_start as u32,
             in("ecx") num_pages as u32,
             in("ebx") ppage_start as u32,
@@ -566,7 +564,7 @@ pub fn arch_flush_tlb() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::FLUSH_TLB as u32,
+            in("eax") crate::arch::arch_call::FLUSH_TLB as u32,
         );
     }
 }
@@ -576,7 +574,7 @@ pub fn arch_free_user_pages() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::traps::arch_call::CLEAN as u32,
+            in("eax") crate::arch::arch_call::CLEAN as u32,
         );
     }
 }

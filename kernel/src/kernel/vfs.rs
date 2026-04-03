@@ -3,7 +3,13 @@
 //! Provides file open/read/close/seek via a global file table.
 //! Thread FD arrays index into this table. FDs 0/1/2 are reserved
 //! for stdin/stdout/stderr and handled directly in syscall handlers.
+//!
+//! Writable overlay: a BTreeMap<Vec<u8>, Vec<u8>> holds RAM-backed files
+//! created by DOS programs. create() inserts, open() checks overlay
+//! before TAR, read()/write()/seek() dispatch on the backing type.
 
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use crate::kernel::startup;
 
 /// Maximum simultaneous open files system-wide
@@ -15,10 +21,16 @@ const MAX_FDS: usize = 16;
 /// First usable file descriptor (0=stdin, 1=stdout, 2=stderr)
 const FIRST_FD: usize = 3;
 
+/// Sentinel: data_block value meaning "RAM-backed file"
+const RAM_SENTINEL: u32 = u32::MAX;
+
+/// Maximum length of a normalized path key
+const PATH_KEY_MAX: usize = 164;
+
 /// Identifies a file on a filesystem
 #[derive(Clone, Copy)]
 pub struct Vnode {
-    pub data_block: u32, // TarFS: starting data block (sector after header)
+    pub data_block: u32, // TarFS: starting data block; RAM_SENTINEL for overlay
     pub size: u32,
 }
 
@@ -27,6 +39,19 @@ pub struct FileEntry {
     pub vnode: Vnode,
     pub offset: u32,
     pub refcount: u16,
+    /// For RAM-backed files: normalized path key into RAM_FILES
+    pub ram_key: [u8; PATH_KEY_MAX],
+    pub ram_key_len: u8,
+}
+
+/// Writable file overlay — persists across open/close cycles
+static mut RAM_FILES: Option<BTreeMap<Vec<u8>, Vec<u8>>> = None;
+
+#[allow(static_mut_refs)]
+fn ram_files() -> &'static mut BTreeMap<Vec<u8>, Vec<u8>> {
+    unsafe {
+        RAM_FILES.get_or_insert_with(BTreeMap::new)
+    }
 }
 
 /// Directory entry returned by readdir
@@ -43,6 +68,8 @@ static mut FILE_TABLE: [FileEntry; MAX_OPEN_FILES] = {
         vnode: Vnode { data_block: 0, size: 0 },
         offset: 0,
         refcount: 0,
+        ram_key: [0; PATH_KEY_MAX],
+        ram_key_len: 0,
     };
     [EMPTY; MAX_OPEN_FILES]
 };
@@ -236,28 +263,53 @@ pub fn readdir(index: usize) -> Option<DirEntry> {
         return Some(de);
     }
 
-    // Phase 2: enumerate files (index offset by dir_count)
+    // Phase 2: enumerate TAR files (index offset by dir_count)
     let file_idx = index - dir_count;
     block = 0;
     let mut i = 0usize;
     loop {
-        let entry = startup::tar_entry_at_block(block)?;
-        let name = &entry.name[..entry.name_len];
-        if let Some(basename) = entry_in_dir(name, cwd) {
-            if i == file_idx {
+        match startup::tar_entry_at_block(block) {
+            Some(entry) => {
+                let name = &entry.name[..entry.name_len];
+                if let Some(basename) = entry_in_dir(name, cwd) {
+                    if i == file_idx {
+                        let mut de = DirEntry {
+                            name: [0; 100],
+                            name_len: basename.len(),
+                            size: entry.size,
+                            is_dir: false,
+                        };
+                        de.name[..basename.len()].copy_from_slice(basename);
+                        return Some(de);
+                    }
+                    i += 1;
+                }
+                block = entry.next_block;
+            }
+            None => break,
+        }
+    }
+
+    // Phase 3: enumerate RAM overlay files in cwd
+    let ram_idx = file_idx - i;
+    let mut j = 0usize;
+    for (key, data) in ram_files().iter() {
+        if let Some(basename) = entry_in_dir(key, cwd) {
+            if j == ram_idx {
                 let mut de = DirEntry {
                     name: [0; 100],
                     name_len: basename.len(),
-                    size: entry.size,
+                    size: data.len() as u32,
                     is_dir: false,
                 };
-                de.name[..basename.len()].copy_from_slice(basename);
+                let len = basename.len().min(100);
+                de.name[..len].copy_from_slice(&basename[..len]);
                 return Some(de);
             }
-            i += 1;
+            j += 1;
         }
-        block = entry.next_block;
     }
+    None
 }
 
 /// Change current directory. Path can be relative or absolute.
@@ -365,7 +417,42 @@ fn alloc_fd(fds: &mut [i32; MAX_FDS]) -> Option<usize> {
 // ============================================================================
 
 /// Open a file by path. Returns fd (>= 3) or negative error.
+/// Checks RAM overlay first, then falls back to TAR.
 pub fn open(path: &[u8]) -> i32 {
+    // Resolve path for RAM overlay lookup
+    let mut buf = [0u8; PATH_KEY_MAX];
+    let key = resolve_path(path, &mut buf);
+
+    // Check RAM overlay first
+    let ram = ram_files();
+    if let Some(data) = ram.get(key) {
+        let size = data.len() as u32;
+        let table_idx = match alloc_file_entry() {
+            Some(i) => i,
+            None => return -24,
+        };
+        let fds = &mut crate::kernel::thread::current().fds;
+        let fd = match alloc_fd(fds) {
+            Some(f) => f,
+            None => return -24,
+        };
+        let key_len = key.len().min(PATH_KEY_MAX) as u8;
+        let mut ram_key = [0u8; PATH_KEY_MAX];
+        ram_key[..key_len as usize].copy_from_slice(&key[..key_len as usize]);
+        unsafe {
+            FILE_TABLE[table_idx] = FileEntry {
+                vnode: Vnode { data_block: RAM_SENTINEL, size },
+                offset: 0,
+                refcount: 1,
+                ram_key,
+                ram_key_len: key_len,
+            };
+        }
+        fds[fd] = table_idx as i32;
+        return fd as i32;
+    }
+
+    // Fall back to TAR
     let vnode = match tar_open(path) {
         Some(v) => v,
         None => return -2, // ENOENT
@@ -387,6 +474,8 @@ pub fn open(path: &[u8]) -> i32 {
             vnode,
             offset: 0,
             refcount: 1,
+            ram_key: [0; PATH_KEY_MAX],
+            ram_key_len: 0,
         };
     }
     fds[fd] = table_idx as i32;
@@ -408,6 +497,21 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
     let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
     if entry.refcount == 0 {
         return -9; // EBADF
+    }
+
+    if entry.vnode.data_block == RAM_SENTINEL {
+        let key = &entry.ram_key[..entry.ram_key_len as usize];
+        let ram = ram_files();
+        if let Some(data) = ram.get(key) {
+            let off = entry.offset as usize;
+            if off >= data.len() { return 0; }
+            let avail = data.len() - off;
+            let n = buf.len().min(avail);
+            buf[..n].copy_from_slice(&data[off..off + n]);
+            entry.offset += n as u32;
+            return n as i32;
+        }
+        return 0;
     }
 
     let n = tar_read(&entry.vnode, entry.offset, buf);
@@ -455,6 +559,83 @@ pub fn close(fd: i32) -> i32 {
     0
 }
 
+/// Create (or truncate) a writable RAM-backed file. Returns fd or negative error.
+pub fn create(path: &[u8]) -> i32 {
+    let mut buf = [0u8; PATH_KEY_MAX];
+    let key = resolve_path(path, &mut buf);
+    let key_len = key.len().min(PATH_KEY_MAX) as u8;
+
+    // Insert or truncate in the overlay
+    ram_files().insert(key.to_vec(), Vec::new());
+
+    let table_idx = match alloc_file_entry() {
+        Some(i) => i,
+        None => return -24,
+    };
+    let fds = &mut crate::kernel::thread::current().fds;
+    let fd = match alloc_fd(fds) {
+        Some(f) => f,
+        None => return -24,
+    };
+
+    let mut ram_key = [0u8; PATH_KEY_MAX];
+    ram_key[..key_len as usize].copy_from_slice(&key[..key_len as usize]);
+    unsafe {
+        FILE_TABLE[table_idx] = FileEntry {
+            vnode: Vnode { data_block: RAM_SENTINEL, size: 0 },
+            offset: 0,
+            refcount: 1,
+            ram_key,
+            ram_key_len: key_len,
+        };
+    }
+    fds[fd] = table_idx as i32;
+    fd as i32
+}
+
+/// Write to an open file descriptor. Returns bytes written or negative error.
+pub fn write(fd: i32, data: &[u8]) -> i32 {
+    let fds = &crate::kernel::thread::current().fds;
+    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
+        return -9;
+    }
+    let table_idx = fds[fd as usize];
+    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
+        return -9;
+    }
+
+    let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
+    if entry.refcount == 0 {
+        return -9;
+    }
+    if entry.vnode.data_block != RAM_SENTINEL {
+        // TAR files are read-only; silently accept
+        return data.len() as i32;
+    }
+
+    let key = &entry.ram_key[..entry.ram_key_len as usize];
+    let ram = ram_files();
+    if let Some(file_data) = ram.get_mut(key) {
+        let off = entry.offset as usize;
+        let end = off + data.len();
+        if end > file_data.len() {
+            file_data.resize(end, 0);
+        }
+        file_data[off..end].copy_from_slice(data);
+        entry.offset = end as u32;
+        entry.vnode.size = file_data.len() as u32;
+        return data.len() as i32;
+    }
+    -9
+}
+
+/// Delete a RAM-backed file by path. Returns 0 on success, -2 if not found.
+pub fn delete(path: &[u8]) -> i32 {
+    let mut buf = [0u8; PATH_KEY_MAX];
+    let key = resolve_path(path, &mut buf);
+    if ram_files().remove(key).is_some() { 0 } else { -2 }
+}
+
 /// Get the size of an open file descriptor. Returns 0 on error.
 pub fn file_size(fd: i32) -> u32 {
     let fds = &crate::kernel::thread::current().fds;
@@ -463,6 +644,10 @@ pub fn file_size(fd: i32) -> u32 {
     if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 { return 0; }
     let entry = unsafe { &FILE_TABLE[table_idx as usize] };
     if entry.refcount == 0 { return 0; }
+    if entry.vnode.data_block == RAM_SENTINEL {
+        let key = &entry.ram_key[..entry.ram_key_len as usize];
+        return ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0);
+    }
     entry.vnode.size
 }
 
@@ -484,10 +669,17 @@ pub fn seek(fd: i32, offset: i32, whence: i32) -> i32 {
         return -9; // EBADF
     }
 
+    let size = if entry.vnode.data_block == RAM_SENTINEL {
+        let key = &entry.ram_key[..entry.ram_key_len as usize];
+        ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0)
+    } else {
+        entry.vnode.size
+    };
+
     let new_offset = match whence {
         0 => offset as i64,                                  // SEEK_SET
         1 => entry.offset as i64 + offset as i64,           // SEEK_CUR
-        2 => entry.vnode.size as i64 + offset as i64,       // SEEK_END
+        2 => size as i64 + offset as i64,                   // SEEK_END
         _ => return -22, // EINVAL
     };
 

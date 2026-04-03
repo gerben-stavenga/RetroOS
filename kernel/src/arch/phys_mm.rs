@@ -121,6 +121,9 @@ pub fn alloc_phys_page() -> Option<u64> {
     }
 }
 
+/// Poison pattern written to freed pages for use-after-free detection
+pub const POISON: u32 = 0xDEAD_BA6E;
+
 /// Free a physical page (decrement reference count)
 /// Returns true if the page is now free
 pub fn free_phys_page(page: u64) -> bool {
@@ -132,12 +135,22 @@ pub fn free_phys_page(page: u64) -> bool {
     unsafe {
         let count = PAGE_REFS[page as usize];
         if count == 0 || count == RESERVED {
-            // Already free or reserved, bug
             return false;
         }
 
         PAGE_REFS[page as usize] = count - 1;
-        count - 1 == 0
+        if count - 1 == 0 {
+            // Poison the freed page for use-after-free detection
+            crate::arch::paging2::temp_map(page);
+            let ptr = crate::arch::paging2::temp_map_vaddr() as *mut u32;
+            for i in 0..crate::arch::paging2::PAGE_SIZE / 4 {
+                *ptr.add(i) = POISON;
+            }
+            crate::arch::paging2::temp_unmap();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -159,6 +172,9 @@ pub fn inc_shared_count(page: u64) -> bool {
         }
 
         PAGE_REFS[page as usize] = count + 1;
+        if page >= 0x900 && page <= 0x910 {
+            crate::println!("inc {:#x} {}->{}",  page, count, count + 1);
+        }
         true
     }
 }
