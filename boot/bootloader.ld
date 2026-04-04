@@ -10,9 +10,19 @@ SECTIONS
 
     . = 0x7C00;
 
-    /* MBR section - must fit in 512 bytes with boot signature */
+    /* MBR section - must fit in 512 bytes with partition table + signature */
     .boot : {
         *(.boot)
+        . = 0x1BE;
+        FILL(0x00000000)
+        /* Partition entry 1: TAR filesystem */
+        BYTE(0x80)                              /* status: active */
+        BYTE(0) BYTE(0) BYTE(0)                 /* CHS first (unused, LBA mode) */
+        BYTE(0xDA)                              /* type: non-FS data */
+        BYTE(0) BYTE(0) BYTE(0)                 /* CHS last (unused) */
+        LONG((_edata - _start + 511) / 512)     /* LBA start = bootloader sectors */
+        LONG(0)                                 /* size in sectors */
+        /* Entries 2-4: zeroed by fill to 0x1FE */
         . = 0x1FE;
         SHORT(0xAA55)  /* MBR boot signature */
     }

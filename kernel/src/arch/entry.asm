@@ -41,8 +41,8 @@ _entry:
     ; addresses (0xC0B0xxxx) access physical memory correctly via
     ; 32-bit wrapping: 0xC0B0xxxx + 0x40600000 = 0x010xxxxx.
 
-    ; Save boot_data pointer (our bootloader passes in [esp+4])
-    mov esi, [esp + 4]
+    ; Save multiboot info pointer (EBX per Multiboot convention)
+    mov esi, ebx
 
     ; Load offset GDT — the GDT itself is at a linked address,
     ; so we need to adjust the GDTR pointer to physical.
@@ -63,10 +63,10 @@ _entry:
     lea esp, [KERNEL_STACK + 32 * 1024]
     xor ebp, ebp
 
-    ; Call PrepareKernel(boot_data)
+    ; Call boot_kernel(multiboot_info)
     push esi
-    extern PrepareKernel
-    call PrepareKernel
+    extern boot_kernel
+    call boot_kernel
     ud2
 
 ; =============================================================================

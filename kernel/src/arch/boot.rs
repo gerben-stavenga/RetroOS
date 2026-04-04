@@ -1,11 +1,11 @@
 //! Kernel boot sequence (ring 0)
 //!
 //! Entry flow:
-//! 1. _entry (asm stub: offset GDT, kernel stack, calls PrepareKernel)
-//! 2. PrepareKernel (enables paging, initializes kernel, drops to ring 1)
+//! 1. _entry (asm stub: offset GDT, kernel stack, calls boot_kernel)
+//! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
 use super::{paging2, phys_mm, descriptors, irq, x86};
-use crate::{vga, println};
+use crate::{vga, println, MultibootMmapEntry};
 use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
@@ -17,13 +17,15 @@ unsafe extern "C" {
     static _end: u8;
 }
 
-/// PrepareKernel - Entry point called by asm boot stub
+/// boot_kernel - Entry point called by asm boot stub
 ///
 /// Runs with offset segments (base = KERNEL_PHYS - KERNEL_BASE) so linked
 /// addresses access physical memory correctly. Paging is off on entry.
 /// Stack is already set to KERNEL_STACK by the asm stub.
+///
+/// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PrepareKernel(boot_data: *const crate::BootData) -> ! {
+pub unsafe extern "C" fn boot_kernel(info: *const crate::MultibootInfo) -> ! {
     let kernel_size = unsafe {
         core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_start) as usize
     };
@@ -48,8 +50,8 @@ pub unsafe extern "C" fn PrepareKernel(boot_data: *const crate::BootData) -> ! {
     let arch_stack_top = unsafe { crate::ARCH_STACK.top() as u32 } - 16;
     descriptors::setup_descriptor_tables(arch_stack_top);
 
-    // boot_data is in low memory — access through LOW_MEM_BASE mapping
-    let boot_data = unsafe { &*((boot_data as usize + LOW_MEM_BASE) as *const crate::BootData) };
+    // Multiboot info is in low memory — access through LOW_MEM_BASE mapping
+    let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const crate::MultibootInfo) };
 
     println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
@@ -60,9 +62,17 @@ pub unsafe extern "C" fn PrepareKernel(boot_data: *const crate::BootData) -> ! {
     let kernel_low_page = (KERNEL_PHYS / PAGE_SIZE) as u64;
     let kernel_high_page = ((KERNEL_PHYS + kernel_size + PAGE_SIZE - 1) / PAGE_SIZE) as u64;
 
+    // Parse Multiboot memory map
+    assert!(info.flags & (1 << 6) != 0, "No Multiboot memory map");
+    let mmap_addr = (info.mmap_addr as usize + LOW_MEM_BASE) as *const MultibootMmapEntry;
+    let mmap_length = info.mmap_length as usize;
+    let entry_size = core::mem::size_of::<MultibootMmapEntry>();
+    let mmap_count = mmap_length / entry_size;
+    let mmap_entries = unsafe { core::slice::from_raw_parts(mmap_addr, mmap_count) };
+
     phys_mm::init_phys_mm(
-        &boot_data.mmap_entries,
-        boot_data.mmap_count as usize,
+        mmap_entries,
+        mmap_count,
         kernel_low_page,
         kernel_high_page,
     );
@@ -74,10 +84,8 @@ pub unsafe extern "C" fn PrepareKernel(boot_data: *const crate::BootData) -> ! {
     crate::kernel::heap::init();
     println!("Heap initialized");
 
-    println!("Memory regions: {}", boot_data.mmap_count);
-    for i in 0..boot_data.mmap_count as usize {
-        if i >= 32 { break; }
-        let entry = boot_data.mmap_entries[i];
+    println!("Memory regions: {}", mmap_count);
+    for entry in mmap_entries {
         if entry.typ == 1 {
             let base = entry.base;
             let length = entry.length;
@@ -105,5 +113,5 @@ pub unsafe extern "C" fn PrepareKernel(boot_data: *const crate::BootData) -> ! {
 
     descriptors::enter_ring1();
 
-    crate::kernel::startup::startup(boot_data.start_sector);
+    crate::kernel::startup::startup();
 }

@@ -32,23 +32,39 @@ pub struct BiosRegs {
     pub es: u16,
 }
 
-/// Memory map entry from BIOS INT 0x15 E820
+/// Multiboot memory map entry (matches GRUB's format)
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-pub struct MMapEntry {
+pub struct MultibootMmapEntry {
+    pub size: u32,      // size of entry minus this field (= 20)
+    pub base: u64,
+    pub length: u64,
+    pub typ: u32,
+}
+
+/// Multiboot info structure (passed to kernel in EBX)
+#[repr(C)]
+pub struct MultibootInfo {
+    pub flags: u32,
+    pub mem_lower: u32,
+    pub mem_upper: u32,
+    pub boot_device: u32,
+    pub cmdline: u32,
+    pub mods_count: u32,
+    pub mods_addr: u32,
+    pub syms: [u32; 4],
+    pub mmap_length: u32,
+    pub mmap_addr: u32,
+}
+
+/// E820 entry used for BIOS call (has extra acpi field)
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct E820Entry {
     pub base: u64,
     pub length: u64,
     pub typ: u32,
     pub acpi: u32,
-}
-
-/// Boot data passed to kernel
-#[repr(C)]
-pub struct BootData {
-    pub start_sector: u32,
-    pub cursor_pos: u32,
-    pub mmap_count: i32,
-    pub mmap_entries: [MMapEntry; 32],
 }
 
 unsafe extern "C" {
@@ -170,34 +186,38 @@ fn enable_a20() {
     }
 }
 
-/// Get memory map using BIOS INT 0x15 E820
-fn get_memory_map(entries: &mut [MMapEntry]) -> i32 {
+/// Get memory map using BIOS INT 0x15 E820, store as Multiboot mmap entries
+fn get_memory_map(entries: &mut [MultibootMmapEntry; 32]) -> u32 {
     const SMAP_ID: u32 = 0x534D4150; // 'SMAP'
-    let mut count = 0i32;
+    let mut e820 = E820Entry { base: 0, length: 0, typ: 0, acpi: 1 };
+    let mut count = 0usize;
 
     unsafe {
         regs.es = 0;
         regs.bx = 0;
 
-        while (count as usize) < entries.len() {
-            entries[count as usize].acpi = 1;
+        while count < entries.len() {
+            e820.acpi = 1;
             regs.ax = 0xE820;
             regs.cx = 24;
             regs.dx = SMAP_ID;
-            regs.di = &mut entries[count as usize] as *mut _ as u32;
+            regs.di = &mut e820 as *mut _ as u32;
 
             let flags = generate_real_interrupt(0x15);
 
             if regs.ax != SMAP_ID {
-                return -1;
-            }
-            if (flags & 1) != 0 {
-                if count == 0 {
-                    return -1;
-                }
                 break;
             }
-            if (entries[count as usize].acpi & 1) != 0 {
+            if (flags & 1) != 0 {
+                break;
+            }
+            if (e820.acpi & 1) != 0 {
+                entries[count] = MultibootMmapEntry {
+                    size: 20,
+                    base: e820.base,
+                    length: e820.length,
+                    typ: e820.typ,
+                };
                 count += 1;
             }
             if regs.bx == 0 {
@@ -205,7 +225,7 @@ fn get_memory_map(entries: &mut [MMapEntry]) -> i32 {
             }
         }
     }
-    count
+    (count * core::mem::size_of::<MultibootMmapEntry>()) as u32
 }
 
 /// Find a file in TAR filesystem and return its LBA and size
@@ -270,11 +290,10 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
     enable_a20();
     println!("A20 enabled");
 
-    // Calculate filesystem LBA (TAR starts after bootloader)
+    // Read filesystem LBA from MBR partition table entry 1
     let fs_lba = unsafe {
-        let start = &_start as *const u8 as u32;
-        let edata = &_edata as *const u8 as u32;
-        (edata - start + 511) / 512
+        let partition_1_lba = &_start as *const u8 as u32 + 0x1BE + 8;
+        *(partition_1_lba as *const u32)
     };
 
     // Find MD5 checksum file
@@ -382,20 +401,35 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         }
     }
 
-    // Get memory map
-    let mut boot_data = BootData {
-        start_sector: fs_lba,
-        cursor_pos: 0,
-        mmap_count: 0,
-        mmap_entries: [MMapEntry { base: 0, length: 0, typ: 0, acpi: 0 }; 32],
+    // Get memory map and build Multiboot info
+    let mut mmap_entries = [MultibootMmapEntry { size: 20, base: 0, length: 0, typ: 0 }; 32];
+    let mmap_length = get_memory_map(&mut mmap_entries);
+
+    let multiboot_info = MultibootInfo {
+        flags: 1 << 6, // memory map present
+        mem_lower: 0,
+        mem_upper: 0,
+        boot_device: 0,
+        cmdline: 0,
+        mods_count: 0,
+        mods_addr: 0,
+        syms: [0; 4],
+        mmap_length,
+        mmap_addr: mmap_entries.as_ptr() as u32,
     };
-    boot_data.mmap_count = get_memory_map(&mut boot_data.mmap_entries);
 
     println!("Starting kernel...");
 
-    type KernelEntry = unsafe extern "C" fn(*const BootData) -> !;
-    let kernel_entry: KernelEntry = unsafe { core::mem::transmute(entry_phys) };
-    unsafe { kernel_entry(&boot_data) };
+    // Jump to kernel with EAX=magic, EBX=info pointer (Multiboot convention)
+    unsafe {
+        core::arch::asm!(
+            "jmp ecx",
+            in("ecx") entry_phys,
+            in("eax") 0x2BADB002u32,
+            in("ebx") &multiboot_info as *const _ as u32,
+            options(noreturn)
+        );
+    }
 }
 
 /// Panic handler - required for no_std

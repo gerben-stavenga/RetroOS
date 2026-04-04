@@ -6,7 +6,7 @@
 //! - 1-254 = reference count (for copy-on-write sharing)
 
 use crate::arch::paging2::PAGE_SIZE;
-use crate::MMapEntry;
+use crate::MultibootMmapEntry;
 
 /// Check if a page is the zero page (always shared, never freed)
 pub fn is_zero_page(page: u64) -> bool {
@@ -30,7 +30,7 @@ static mut NEXT_FREE: usize = 0;
 ///
 /// # Safety
 /// Must be called once during kernel init with valid memory map.
-pub fn init_phys_mm(mmap_entries: &[MMapEntry], mmap_count: usize, kernel_low: u64, kernel_high: u64) {
+pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kernel_low: u64, kernel_high: u64) {
     unsafe {
         // Mark all pages as reserved initially
         for i in 0..MAX_PAGES {

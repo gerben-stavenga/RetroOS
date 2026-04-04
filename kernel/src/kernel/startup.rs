@@ -128,11 +128,15 @@ pub fn read_data_at_block(block: u32, buffer: &mut [u8]) -> u32 {
 
 /// Startup: initialize filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
-pub fn startup(start_sector: u32) -> ! {
+pub fn startup() -> ! {
     use crate::kernel::vm86;
 
     crate::kernel::thread::init_threading();
 
+    // Read MBR sector 0 to get filesystem start from partition table
+    let mut mbr = [0u8; 512];
+    hdd::read_sectors(0, &mut mbr);
+    let start_sector = u32::from_le_bytes(mbr[0x1C6..0x1CA].try_into().unwrap());
     println!("Initializing filesystem at sector {:#x}", start_sector);
     init_fs(start_sector);
     crate::kernel::stacktrace::init_from_tar();

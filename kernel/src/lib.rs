@@ -1,8 +1,8 @@
 //! RetroOS Rust Kernel
 //!
 //! Entry flow:
-//! 1. _entry (asm stub: offset GDT, kernel stack, calls PrepareKernel)
-//! 2. PrepareKernel (enables paging, initializes kernel, drops to ring 1)
+//! 1. _entry (asm stub: offset GDT, kernel stack, calls boot_kernel)
+//! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
 #![no_std]
 #![no_main]
@@ -27,23 +27,29 @@ pub use lib::{print, println, dbg_print, dbg_println};
 // Re-export arch types used as opaque blobs by kernel code
 pub use arch::{RootPageTable, PAGE_SIZE, KernelPages, RawPage, LOW_MEM_BASE};
 
-/// Memory map entry from bootloader
+/// Multiboot memory map entry
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-pub struct MMapEntry {
+pub struct MultibootMmapEntry {
+    pub size: u32,
     pub base: u64,
     pub length: u64,
     pub typ: u32,
-    pub acpi: u32,
 }
 
-/// Boot data passed from bootloader
+/// Multiboot info structure (from GRUB or our bootloader)
 #[repr(C)]
-pub struct BootData {
-    pub start_sector: u32,
-    pub cursor_pos: u32,
-    pub mmap_count: i32,
-    pub mmap_entries: [MMapEntry; 32],
+pub struct MultibootInfo {
+    pub flags: u32,
+    pub mem_lower: u32,
+    pub mem_upper: u32,
+    pub boot_device: u32,
+    pub cmdline: u32,
+    pub mods_count: u32,
+    pub mods_addr: u32,
+    pub syms: [u32; 4],
+    pub mmap_length: u32,
+    pub mmap_addr: u32,
 }
 
 static ZERO_PAGE: RawPage = unsafe { core::mem::zeroed() };
