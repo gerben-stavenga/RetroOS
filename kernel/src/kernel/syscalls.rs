@@ -184,16 +184,16 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     // allocation can reuse it instead of extending the heap every iteration.
     thread::current().symbols = None;
 
-    // Resolve path relative to cwd, then find in TAR
+    // Resolve path relative to cwd, then open via VFS
     let mut path_buf = [0u8; 164];
     let resolved = vfs::resolve(path.as_bytes(), &mut path_buf);
-    let size = match startup::find_file(resolved) {
-        Some(s) => s,
-        None => return SyscallResult::val(ENOENT),
-    };
+    let fd = vfs::open(resolved);
+    if fd < 0 { return SyscallResult::val(ENOENT); }
+    let size = vfs::file_size(fd) as usize;
 
     let mut buffer = alloc::vec![0; size];
-    startup::read_file(&mut buffer);
+    vfs::read(fd, &mut buffer);
+    vfs::close(fd);
 
     let want_64 = match lib::elf::Elf::parse(&buffer) {
         Ok(e) => e.class() == lib::elf::ElfClass::Elf64,

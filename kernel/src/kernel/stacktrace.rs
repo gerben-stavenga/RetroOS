@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec;
 use crate::{print, println};
-use crate::kernel::{startup, thread};
+use crate::kernel::{vfs, thread};
 use core::arch::asm;
 use lib::elf::{SymbolTable, STT_FUNC};
 
@@ -62,19 +62,18 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 
 /// Initialize kernel symbol table by loading kernel.elf from TAR filesystem
 pub fn init_from_tar() {
-    let size = match startup::find_file(b"kernel.elf") {
-        Some(s) => s,
-        None => {
-            println!("stacktrace: kernel.elf not found");
-            return;
-        }
-    };
+    let fd = vfs::open(b"kernel.elf");
+    if fd < 0 {
+        println!("stacktrace: kernel.elf not found");
+        return;
+    }
+    let size = vfs::file_size(fd) as usize;
 
     println!("Loading kernel.elf ({} bytes) for symbols", size);
 
-    // Allocate buffer and read ELF
     let mut elf_data = vec![0u8; size];
-    startup::read_file(&mut elf_data);
+    vfs::read(fd, &mut elf_data);
+    vfs::close(fd);
 
     let elf_box: Box<[u8]> = elf_data.into_boxed_slice();
 

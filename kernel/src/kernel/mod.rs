@@ -12,6 +12,7 @@ pub mod keyboard;
 pub mod stacktrace;
 pub mod startup;
 pub mod syscalls;
+pub mod tarfs;
 pub mod thread;
 pub mod vfs;
 pub mod vm86;

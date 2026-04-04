@@ -1,132 +1,16 @@
-//! Kernel startup - TAR filesystem and DN.COM loader
+//! Kernel startup - filesystem mount and DN.COM loader
 
 extern crate alloc;
 
 use alloc::vec;
-use crate::kernel::{elf, hdd};
+use crate::kernel::{hdd, vfs, tarfs::TarFs};
 use crate::println;
 use crate::kernel::thread;
-use lib::tar::TarHeader;
 
-/// TAR block size (same as disk sector size)
-const BLOCK_SIZE: usize = 512;
+/// The root filesystem instance (static so it lives forever for &'static dyn)
+static mut ROOT_TARFS: TarFs = TarFs::new(0);
 
-/// Disk start sector for TAR filesystem
-static mut START_SECTOR: u32 = 0;
-
-/// Current TAR block position
-static mut CURRENT_BLOCK: u32 = 0;
-
-/// Initialize the filesystem with the start sector
-pub fn init_fs(start_sector: u32) {
-    unsafe {
-        START_SECTOR = start_sector;
-        CURRENT_BLOCK = 0;
-    }
-}
-
-/// Read sectors from disk using ATA PIO driver
-fn read_sectors(lba: u32, buffer: &mut [u8]) -> u32 {
-    hdd::read_sectors(lba, buffer)
-}
-
-/// Read TAR blocks
-fn read_blocks(buffer: &mut [u8]) {
-    unsafe {
-        CURRENT_BLOCK += read_sectors(START_SECTOR + CURRENT_BLOCK, buffer);
-    }
-}
-
-/// Skip TAR blocks
-fn skip_blocks(count: u32) {
-    unsafe {
-        CURRENT_BLOCK += count;
-    }
-}
-
-/// Seek to a specific block
-fn seek_block(block: u32) {
-    unsafe {
-        CURRENT_BLOCK = block;
-    }
-}
-
-/// Find a file in the TAR and return its size (or None if not found)
-/// Also positions the reader at the file data
-pub fn find_file(filename: &[u8]) -> Option<usize> {
-    seek_block(0);
-
-    let mut header_buf = [0u8; BLOCK_SIZE];
-
-    loop {
-        read_blocks(&mut header_buf);
-
-        let header = unsafe { &*(header_buf.as_ptr() as *const TarHeader) };
-
-        // Check for end of archive
-        if header.is_end() {
-            return None;
-        }
-
-        let file_size = header.filesize();
-        let data_blocks = header.data_blocks();
-        let name = header.filename();
-
-        // Compare filename
-        if name == filename {
-            return Some(file_size);
-        }
-
-        // Skip file data
-        skip_blocks(data_blocks);
-    }
-}
-
-/// Read file data (must be called after find_file positioned us correctly)
-pub fn read_file(buffer: &mut [u8]) {
-    read_blocks(buffer);
-}
-
-/// TAR entry metadata returned by tar_entry_at_block
-pub struct TarEntry {
-    pub name: [u8; 100],
-    pub name_len: usize,
-    pub size: u32,
-    pub data_block: u32,
-    pub next_block: u32,
-}
-
-/// Read a TAR entry at the given block offset without touching CURRENT_BLOCK.
-/// Returns None at end-of-archive.
-pub fn tar_entry_at_block(block: u32) -> Option<TarEntry> {
-    let mut buf = [0u8; BLOCK_SIZE];
-    let lba = unsafe { START_SECTOR } + block;
-    hdd::read_sectors(lba, &mut buf);
-    let header = unsafe { &*(buf.as_ptr() as *const TarHeader) };
-    if header.is_end() { return None; }
-    let size = header.filesize() as u32;
-    let data_blocks = header.data_blocks();
-    let name_bytes = header.filename();
-    let mut name = [0u8; 100];
-    let name_len = name_bytes.len().min(100);
-    name[..name_len].copy_from_slice(&name_bytes[..name_len]);
-    Some(TarEntry {
-        name,
-        name_len,
-        size,
-        data_block: block + 1,
-        next_block: block + 1 + data_blocks,
-    })
-}
-
-/// Read raw sectors at a given TAR data block offset into buffer.
-/// Returns number of sectors read.
-pub fn read_data_at_block(block: u32, buffer: &mut [u8]) -> u32 {
-    let lba = unsafe { START_SECTOR } + block;
-    hdd::read_sectors(lba, buffer)
-}
-
-/// Startup: initialize filesystem and run DN.COM in a loop.
+/// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
 pub fn startup() -> ! {
     use crate::kernel::vm86;
@@ -138,16 +22,23 @@ pub fn startup() -> ! {
     hdd::read_sectors(0, &mut mbr);
     let start_sector = u32::from_le_bytes(mbr[0x1C6..0x1CA].try_into().unwrap());
     println!("Initializing filesystem at sector {:#x}", start_sector);
-    init_fs(start_sector);
+
+    // Mount TAR filesystem
+    unsafe {
+        ROOT_TARFS = TarFs::new(start_sector);
+        #[allow(static_mut_refs)]
+        vfs::mount_root(&ROOT_TARFS);
+    }
     crate::kernel::stacktrace::init_from_tar();
 
     loop {
-        let size = match find_file(b"DN/DN.COM") {
-            Some(s) => s,
-            None => panic!("DN/DN.COM not found"),
-        };
+        // Open and read DN.COM via VFS
+        let fd = vfs::open(b"DN/DN.COM");
+        if fd < 0 { panic!("DN/DN.COM not found"); }
+        let size = vfs::file_size(fd) as usize;
         let mut buf = vec![0u8; size];
-        read_file(&mut buf);
+        vfs::read(fd, &mut buf);
+        vfs::close(fd);
 
         let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
             .expect("Failed to create DN thread");

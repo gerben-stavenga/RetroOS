@@ -6,11 +6,10 @@
 //!
 //! Writable overlay: a BTreeMap<Vec<u8>, Vec<u8>> holds RAM-backed files
 //! created by DOS programs. create() inserts, open() checks overlay
-//! before TAR, read()/write()/seek() dispatch on the backing type.
+//! before the backing filesystem, read()/write()/seek() dispatch on the backing type.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use crate::kernel::startup;
 
 /// Maximum simultaneous open files system-wide
 const MAX_OPEN_FILES: usize = 64;
@@ -21,17 +20,40 @@ const MAX_FDS: usize = 16;
 /// First usable file descriptor (0=stdin, 1=stdout, 2=stderr)
 const FIRST_FD: usize = 3;
 
-/// Sentinel: data_block value meaning "RAM-backed file"
-const RAM_SENTINEL: u32 = u32::MAX;
+/// Sentinel: handle value meaning "RAM-backed file"
+const RAM_SENTINEL: u64 = u64::MAX;
 
 /// Maximum length of a normalized path key
 const PATH_KEY_MAX: usize = 164;
 
+/// Filesystem trait — implemented by TarFs, Ext4Fs, etc.
+pub trait Filesystem {
+    /// Look up a file by normalized path. Returns vnode on match.
+    fn open(&self, path: &[u8]) -> Option<Vnode>;
+
+    /// Read from a file identified by handle at given byte offset.
+    fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
+
+    /// Enumerate directory entries at index. Returns None at end.
+    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry>;
+
+    /// Check if a directory path exists.
+    fn dir_exists(&self, path: &[u8]) -> bool;
+}
+
 /// Identifies a file on a filesystem
 #[derive(Clone, Copy)]
 pub struct Vnode {
-    pub data_block: u32, // TarFS: starting data block; RAM_SENTINEL for overlay
+    pub handle: u64,  // filesystem-specific opaque handle (RAM_SENTINEL for overlay)
     pub size: u32,
+}
+
+/// Directory entry returned by readdir
+pub struct DirEntry {
+    pub name: [u8; 100],
+    pub name_len: usize,
+    pub size: u32,
+    pub is_dir: bool,
 }
 
 /// An open file in the global file table
@@ -44,28 +66,31 @@ pub struct FileEntry {
     pub ram_key_len: u8,
 }
 
+/// The backing filesystem (set once at startup)
+static mut ROOT_FS: Option<&'static dyn Filesystem> = None;
+
 /// Writable file overlay — persists across open/close cycles
 static mut RAM_FILES: Option<BTreeMap<Vec<u8>, Vec<u8>>> = None;
 
 #[allow(static_mut_refs)]
 fn ram_files() -> &'static mut BTreeMap<Vec<u8>, Vec<u8>> {
-    unsafe {
-        RAM_FILES.get_or_insert_with(BTreeMap::new)
-    }
+    unsafe { RAM_FILES.get_or_insert_with(BTreeMap::new) }
 }
 
-/// Directory entry returned by readdir
-pub struct DirEntry {
-    pub name: [u8; 100],
-    pub name_len: usize,
-    pub size: u32,
-    pub is_dir: bool,
+#[allow(static_mut_refs)]
+fn root_fs() -> &'static dyn Filesystem {
+    unsafe { ROOT_FS.expect("VFS: no filesystem mounted") }
+}
+
+/// Mount a filesystem as the root. Must be called once at startup.
+pub fn mount_root(fs: &'static dyn Filesystem) {
+    unsafe { ROOT_FS = Some(fs); }
 }
 
 /// Global file table — slot is free when refcount == 0
 static mut FILE_TABLE: [FileEntry; MAX_OPEN_FILES] = {
     const EMPTY: FileEntry = FileEntry {
-        vnode: Vnode { data_block: 0, size: 0 },
+        vnode: Vnode { handle: 0, size: 0 },
         offset: 0,
         refcount: 0,
         ram_key: [0; PATH_KEY_MAX],
@@ -75,17 +100,15 @@ static mut FILE_TABLE: [FileEntry; MAX_OPEN_FILES] = {
 };
 
 // ============================================================================
-// TarFS operations
+// Path resolution (VFS-level, filesystem-agnostic)
 // ============================================================================
 
 /// Strip DOS path prefix (e.g. `C:\`, `.\`, `\`) from a path.
 fn strip_dos_prefix(path: &[u8]) -> &[u8] {
     let mut start = 0;
-    // Skip drive letter + colon (e.g. "C:")
     if path.len() >= 2 && path[1] == b':' && path[0].is_ascii_alphabetic() {
         start = 2;
     }
-    // Skip leading backslashes/slashes
     while start < path.len() && (path[start] == b'\\' || path[start] == b'/') {
         start += 1;
     }
@@ -93,16 +116,12 @@ fn strip_dos_prefix(path: &[u8]) -> &[u8] {
 }
 
 /// Case-insensitive comparison of two byte slices
-fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+pub fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
 }
 
 /// Resolve a path relative to the current working directory.
-/// Strips DOS prefix, normalizes slashes, prepends cwd for relative paths.
-/// Paths that had a drive prefix (C:\...) are treated as absolute (no cwd prepend).
-/// Returns the full TAR path in `buf`.
 fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
-    // Detect if path has a drive letter (absolute DOS path)
     let has_drive = path.len() >= 2 && path[1] == b':' && path[0].is_ascii_alphabetic();
     let stripped = strip_dos_prefix(path);
 
@@ -110,14 +129,12 @@ fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
         0
     } else {
         let mut pos = 0;
-        // Only prepend cwd for relative paths (no drive prefix)
         if !has_drive {
             let cwd = crate::kernel::thread::current().cwd_str();
             for &b in cwd {
                 if pos < buf.len() { buf[pos] = b; pos += 1; }
             }
         }
-        // Copy the path, normalizing backslashes
         for &b in stripped {
             if pos < buf.len() {
                 buf[pos] = if b == b'\\' { b'/' } else { b };
@@ -130,266 +147,14 @@ fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
 }
 
 /// Resolve a path relative to cwd (public, for use by exec).
-/// Strips DOS prefix, normalizes backslashes, prepends cwd.
 pub fn resolve<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
     resolve_path(path, buf)
-}
-
-/// Walk the TAR archive looking for `path`. Returns a Vnode on match.
-/// Resolves relative to cwd, strips DOS path prefixes, case-insensitive.
-fn tar_open(path: &[u8]) -> Option<Vnode> {
-    let mut buf = [0u8; 164];
-    let full_path = resolve_path(path, &mut buf);
-    let mut block: u32 = 0;
-    loop {
-        let entry = startup::tar_entry_at_block(block)?;
-        let name = &entry.name[..entry.name_len];
-        if eq_ignore_case(name, full_path) {
-            return Some(Vnode {
-                data_block: entry.data_block,
-                size: entry.size,
-            });
-        }
-        block = entry.next_block;
-    }
-}
-
-/// Read from a TarFS vnode at the given byte offset into `buf`.
-/// Returns number of bytes read.
-fn tar_read(vnode: &Vnode, offset: u32, buf: &mut [u8]) -> i32 {
-    if offset >= vnode.size {
-        return 0;
-    }
-    let remaining = (vnode.size - offset) as usize;
-    let to_read = buf.len().min(remaining);
-    if to_read == 0 {
-        return 0;
-    }
-
-    let mut done = 0usize;
-    let mut file_off = offset as usize;
-
-    // Sector-aligned buffer for disk reads
-    let mut sector_buf = [0u8; 512];
-
-    while done < to_read {
-        let block_index = file_off / 512;
-        let block_offset = file_off % 512;
-        let chunk = (512 - block_offset).min(to_read - done);
-
-        startup::read_data_at_block(vnode.data_block + block_index as u32, &mut sector_buf);
-        buf[done..done + chunk].copy_from_slice(&sector_buf[block_offset..block_offset + chunk]);
-
-        done += chunk;
-        file_off += chunk;
-    }
-
-    done as i32
-}
-
-/// Check if a TAR entry name is in the given directory.
-/// Returns the basename (part after the directory prefix) if it matches,
-/// or None if it's not in this directory or is in a deeper subdirectory.
-fn entry_in_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    // dir is "" for root or "WOLF3D/" for a subdirectory
-    if entry_name.len() <= dir.len() {
-        return None;
-    }
-    // Check prefix matches (case-insensitive)
-    if !dir.is_empty() {
-        if entry_name.len() < dir.len() { return None; }
-        let prefix = &entry_name[..dir.len()];
-        if !eq_ignore_case(prefix, dir) { return None; }
-    }
-    let rest = &entry_name[dir.len()..];
-    // Skip if it's in a deeper subdirectory (contains '/')
-    if rest.iter().any(|&b| b == b'/') {
-        return None;
-    }
-    Some(rest)
-}
-
-/// Enumerate current directory by index. Returns directories first, then files.
-/// Returns None at end.
-pub fn readdir(index: usize) -> Option<DirEntry> {
-    let cwd = crate::kernel::thread::current().cwd_str();
-
-    // Phase 1: collect unique subdirectory names
-    let mut dirs: [[u8; 64]; 32] = [[0; 64]; 32];
-    let mut dir_lens: [usize; 32] = [0; 32];
-    let mut dir_count = 0usize;
-    let mut block: u32 = 0;
-    loop {
-        let entry = match startup::tar_entry_at_block(block) {
-            Some(e) => e,
-            None => break,
-        };
-        let name = &entry.name[..entry.name_len];
-        if name.len() > cwd.len() {
-            let prefix = &name[..cwd.len()];
-            if cwd.is_empty() || eq_ignore_case(prefix, cwd) {
-                let rest = &name[cwd.len()..];
-                if let Some(slash) = rest.iter().position(|&b| b == b'/') {
-                    let dir_name = &rest[..slash];
-                    let mut dup = false;
-                    for j in 0..dir_count {
-                        if dir_lens[j] == dir_name.len() && eq_ignore_case(&dirs[j][..dir_lens[j]], dir_name) {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if !dup && dir_count < 32 {
-                        let len = dir_name.len().min(64);
-                        dirs[dir_count][..len].copy_from_slice(&dir_name[..len]);
-                        dir_lens[dir_count] = len;
-                        dir_count += 1;
-                    }
-                }
-            }
-        }
-        block = entry.next_block;
-    }
-
-    // Return directory entry if index falls in directory range
-    if index < dir_count {
-        let len = dir_lens[index];
-        let mut de = DirEntry {
-            name: [0; 100],
-            name_len: len,
-            size: 0,
-            is_dir: true,
-        };
-        de.name[..len].copy_from_slice(&dirs[index][..len]);
-        return Some(de);
-    }
-
-    // Phase 2: enumerate TAR files (index offset by dir_count)
-    let file_idx = index - dir_count;
-    block = 0;
-    let mut i = 0usize;
-    loop {
-        match startup::tar_entry_at_block(block) {
-            Some(entry) => {
-                let name = &entry.name[..entry.name_len];
-                if let Some(basename) = entry_in_dir(name, cwd) {
-                    if i == file_idx {
-                        let mut de = DirEntry {
-                            name: [0; 100],
-                            name_len: basename.len(),
-                            size: entry.size,
-                            is_dir: false,
-                        };
-                        de.name[..basename.len()].copy_from_slice(basename);
-                        return Some(de);
-                    }
-                    i += 1;
-                }
-                block = entry.next_block;
-            }
-            None => break,
-        }
-    }
-
-    // Phase 3: enumerate RAM overlay files in cwd
-    let ram_idx = file_idx - i;
-    let mut j = 0usize;
-    for (key, data) in ram_files().iter() {
-        if let Some(basename) = entry_in_dir(key, cwd) {
-            if j == ram_idx {
-                let mut de = DirEntry {
-                    name: [0; 100],
-                    name_len: basename.len(),
-                    size: data.len() as u32,
-                    is_dir: false,
-                };
-                let len = basename.len().min(100);
-                de.name[..len].copy_from_slice(&basename[..len]);
-                return Some(de);
-            }
-            j += 1;
-        }
-    }
-    None
-}
-
-/// Change current directory. Path can be relative or absolute.
-/// Returns 0 on success, negative error on failure.
-pub fn chdir(path: &[u8]) -> i32 {
-    let stripped = strip_dos_prefix(path);
-
-    // Handle ".." — go up one level
-    if stripped == b".." {
-        let t = crate::kernel::thread::current();
-        let cwd = t.cwd_str();
-        if cwd.is_empty() { return 0; } // already at root
-        // Remove trailing slash, then find the previous slash
-        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
-        let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
-            Some(pos) => pos + 1, // keep the slash
-            None => 0,            // back to root
-        };
-        t.cwd_len = new_len;
-        return 0;
-    }
-
-    // Handle "\" or "/" — go to root
-    if stripped.is_empty() || stripped == b"/" || stripped == b"\\" {
-        let t = crate::kernel::thread::current();
-        t.cwd_len = 0;
-        return 0;
-    }
-
-    // Build the new directory path and verify it exists in the TAR
-    let mut new_cwd = [0u8; 64];
-    let mut pos = 0;
-
-    // Start from cwd for relative paths
-    let t = crate::kernel::thread::current();
-    let cwd = t.cwd_str();
-    for &b in cwd {
-        if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
-    }
-    // Append the new directory name, normalizing backslashes
-    for &b in stripped {
-        if pos < new_cwd.len() {
-            new_cwd[pos] = if b == b'\\' { b'/' } else { b };
-            pos += 1;
-        }
-    }
-    // Ensure trailing slash
-    if pos > 0 && new_cwd[pos - 1] != b'/' {
-        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
-    }
-
-    // Verify the directory exists: check if any TAR entry starts with this prefix
-    let prefix = &new_cwd[..pos];
-    let mut block: u32 = 0;
-    let found = loop {
-        match startup::tar_entry_at_block(block) {
-            Some(entry) => {
-                let name = &entry.name[..entry.name_len];
-                if name.len() >= prefix.len() && eq_ignore_case(&name[..prefix.len()], prefix) {
-                    break true;
-                }
-                block = entry.next_block;
-            }
-            None => break false,
-        }
-    };
-
-    if !found {
-        return -2; // ENOENT
-    }
-
-    t.set_cwd(&new_cwd[..pos]);
-    0
 }
 
 // ============================================================================
 // Global file table helpers
 // ============================================================================
 
-/// Allocate a slot in the global file table. Returns index or None.
 fn alloc_file_entry() -> Option<usize> {
     unsafe {
         for i in 0..MAX_OPEN_FILES {
@@ -401,8 +166,6 @@ fn alloc_file_entry() -> Option<usize> {
     None
 }
 
-/// Allocate a file descriptor in the thread's FD array.
-/// Returns the fd number (>= FIRST_FD) or None.
 fn alloc_fd(fds: &mut [i32; MAX_FDS]) -> Option<usize> {
     for fd in FIRST_FD..MAX_FDS {
         if fds[fd] == -1 {
@@ -417,9 +180,7 @@ fn alloc_fd(fds: &mut [i32; MAX_FDS]) -> Option<usize> {
 // ============================================================================
 
 /// Open a file by path. Returns fd (>= 3) or negative error.
-/// Checks RAM overlay first, then falls back to TAR.
 pub fn open(path: &[u8]) -> i32 {
-    // Resolve path for RAM overlay lookup
     let mut buf = [0u8; PATH_KEY_MAX];
     let key = resolve_path(path, &mut buf);
 
@@ -441,7 +202,7 @@ pub fn open(path: &[u8]) -> i32 {
         ram_key[..key_len as usize].copy_from_slice(&key[..key_len as usize]);
         unsafe {
             FILE_TABLE[table_idx] = FileEntry {
-                vnode: Vnode { data_block: RAM_SENTINEL, size },
+                vnode: Vnode { handle: RAM_SENTINEL, size },
                 offset: 0,
                 refcount: 1,
                 ram_key,
@@ -452,21 +213,21 @@ pub fn open(path: &[u8]) -> i32 {
         return fd as i32;
     }
 
-    // Fall back to TAR
-    let vnode = match tar_open(path) {
+    // Fall back to mounted filesystem
+    let vnode = match root_fs().open(key) {
         Some(v) => v,
         None => return -2, // ENOENT
     };
 
     let table_idx = match alloc_file_entry() {
         Some(i) => i,
-        None => return -24, // EMFILE
+        None => return -24,
     };
 
     let fds = &mut crate::kernel::thread::current().fds;
     let fd = match alloc_fd(fds) {
         Some(f) => f,
-        None => return -24, // EMFILE
+        None => return -24,
     };
 
     unsafe {
@@ -487,19 +248,19 @@ pub fn open(path: &[u8]) -> i32 {
 pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
     let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9; // EBADF
+        return -9;
     }
     let table_idx = fds[fd as usize];
     if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9; // EBADF
+        return -9;
     }
 
     let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
     if entry.refcount == 0 {
-        return -9; // EBADF
+        return -9;
     }
 
-    if entry.vnode.data_block == RAM_SENTINEL {
+    if entry.vnode.handle == RAM_SENTINEL {
         let key = &entry.ram_key[..entry.ram_key_len as usize];
         let ram = ram_files();
         if let Some(data) = ram.get(key) {
@@ -514,7 +275,7 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
         return 0;
     }
 
-    let n = tar_read(&entry.vnode, entry.offset, buf);
+    let n = root_fs().read(entry.vnode.handle, entry.offset, buf, entry.vnode.size);
     if n > 0 {
         entry.offset += n as u32;
     }
@@ -522,7 +283,6 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
 }
 
 /// Read entire file contents via fd into a kernel buffer (ignores current offset).
-/// Used by EXEC to load program files.
 pub fn read_raw(fd: i32, buf: &mut [u8]) -> i32 {
     let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
@@ -536,18 +296,18 @@ pub fn read_raw(fd: i32, buf: &mut [u8]) -> i32 {
     if entry.refcount == 0 {
         return -9;
     }
-    tar_read(&entry.vnode, entry.offset, buf)
+    root_fs().read(entry.vnode.handle, entry.offset, buf, entry.vnode.size)
 }
 
-/// Close a file descriptor. Returns 0 or negative error.
+/// Close a file descriptor.
 pub fn close(fd: i32) -> i32 {
     let fds = &mut crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9; // EBADF
+        return -9;
     }
     let table_idx = fds[fd as usize];
     if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9; // EBADF
+        return -9;
     }
 
     fds[fd as usize] = -1;
@@ -559,13 +319,12 @@ pub fn close(fd: i32) -> i32 {
     0
 }
 
-/// Create (or truncate) a writable RAM-backed file. Returns fd or negative error.
+/// Create (or truncate) a writable RAM-backed file.
 pub fn create(path: &[u8]) -> i32 {
     let mut buf = [0u8; PATH_KEY_MAX];
     let key = resolve_path(path, &mut buf);
     let key_len = key.len().min(PATH_KEY_MAX) as u8;
 
-    // Insert or truncate in the overlay
     ram_files().insert(key.to_vec(), Vec::new());
 
     let table_idx = match alloc_file_entry() {
@@ -582,7 +341,7 @@ pub fn create(path: &[u8]) -> i32 {
     ram_key[..key_len as usize].copy_from_slice(&key[..key_len as usize]);
     unsafe {
         FILE_TABLE[table_idx] = FileEntry {
-            vnode: Vnode { data_block: RAM_SENTINEL, size: 0 },
+            vnode: Vnode { handle: RAM_SENTINEL, size: 0 },
             offset: 0,
             refcount: 1,
             ram_key,
@@ -593,7 +352,7 @@ pub fn create(path: &[u8]) -> i32 {
     fd as i32
 }
 
-/// Write to an open file descriptor. Returns bytes written or negative error.
+/// Write to an open file descriptor.
 pub fn write(fd: i32, data: &[u8]) -> i32 {
     let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
@@ -608,9 +367,8 @@ pub fn write(fd: i32, data: &[u8]) -> i32 {
     if entry.refcount == 0 {
         return -9;
     }
-    if entry.vnode.data_block != RAM_SENTINEL {
-        // TAR files are read-only; silently accept
-        return data.len() as i32;
+    if entry.vnode.handle != RAM_SENTINEL {
+        return data.len() as i32; // read-only FS; silently accept
     }
 
     let key = &entry.ram_key[..entry.ram_key_len as usize];
@@ -629,14 +387,14 @@ pub fn write(fd: i32, data: &[u8]) -> i32 {
     -9
 }
 
-/// Delete a RAM-backed file by path. Returns 0 on success, -2 if not found.
+/// Delete a RAM-backed file by path.
 pub fn delete(path: &[u8]) -> i32 {
     let mut buf = [0u8; PATH_KEY_MAX];
     let key = resolve_path(path, &mut buf);
     if ram_files().remove(key).is_some() { 0 } else { -2 }
 }
 
-/// Get the size of an open file descriptor. Returns 0 on error.
+/// Get the size of an open file descriptor.
 pub fn file_size(fd: i32) -> u32 {
     let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 { return 0; }
@@ -644,32 +402,30 @@ pub fn file_size(fd: i32) -> u32 {
     if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 { return 0; }
     let entry = unsafe { &FILE_TABLE[table_idx as usize] };
     if entry.refcount == 0 { return 0; }
-    if entry.vnode.data_block == RAM_SENTINEL {
+    if entry.vnode.handle == RAM_SENTINEL {
         let key = &entry.ram_key[..entry.ram_key_len as usize];
         return ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0);
     }
     entry.vnode.size
 }
 
-/// Seek on an open file descriptor.
-/// whence: 0=SET, 1=CUR, 2=END
-/// Returns new offset or negative error.
+/// Seek on an open file descriptor. whence: 0=SET, 1=CUR, 2=END
 pub fn seek(fd: i32, offset: i32, whence: i32) -> i32 {
     let fds = &crate::kernel::thread::current().fds;
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9; // EBADF
+        return -9;
     }
     let table_idx = fds[fd as usize];
     if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9; // EBADF
+        return -9;
     }
 
     let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
     if entry.refcount == 0 {
-        return -9; // EBADF
+        return -9;
     }
 
-    let size = if entry.vnode.data_block == RAM_SENTINEL {
+    let size = if entry.vnode.handle == RAM_SENTINEL {
         let key = &entry.ram_key[..entry.ram_key_len as usize];
         ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0)
     } else {
@@ -677,21 +433,116 @@ pub fn seek(fd: i32, offset: i32, whence: i32) -> i32 {
     };
 
     let new_offset = match whence {
-        0 => offset as i64,                                  // SEEK_SET
-        1 => entry.offset as i64 + offset as i64,           // SEEK_CUR
-        2 => size as i64 + offset as i64,                   // SEEK_END
-        _ => return -22, // EINVAL
+        0 => offset as i64,
+        1 => entry.offset as i64 + offset as i64,
+        2 => size as i64 + offset as i64,
+        _ => return -22,
     };
 
     if new_offset < 0 {
-        return -22; // EINVAL
+        return -22;
     }
 
     entry.offset = new_offset as u32;
     entry.offset as i32
 }
 
-/// Duplicate all FDs from src into dst (for fork). Bumps refcounts.
+/// Enumerate directory entries at index. Combines filesystem + RAM overlay.
+pub fn readdir(index: usize) -> Option<DirEntry> {
+    let cwd = crate::kernel::thread::current().cwd_str();
+
+    // Try filesystem first
+    if let Some(de) = root_fs().readdir(cwd, index) {
+        return Some(de);
+    }
+
+    // Count filesystem entries to compute RAM overlay offset
+    let mut fs_count = 0;
+    while root_fs().readdir(cwd, fs_count).is_some() {
+        fs_count += 1;
+    }
+
+    // RAM overlay files in cwd
+    let ram_idx = index - fs_count;
+    let mut j = 0usize;
+    for (key, data) in ram_files().iter() {
+        if let Some(basename) = entry_in_ram_dir(key, cwd) {
+            if j == ram_idx {
+                let mut de = DirEntry {
+                    name: [0; 100],
+                    name_len: basename.len(),
+                    size: data.len() as u32,
+                    is_dir: false,
+                };
+                let len = basename.len().min(100);
+                de.name[..len].copy_from_slice(&basename[..len]);
+                return Some(de);
+            }
+            j += 1;
+        }
+    }
+    None
+}
+
+fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
+    if entry_name.len() <= dir.len() { return None; }
+    if !dir.is_empty() && !eq_ignore_case(&entry_name[..dir.len()], dir) { return None; }
+    let rest = &entry_name[dir.len()..];
+    if rest.iter().any(|&b| b == b'/') { return None; }
+    Some(rest)
+}
+
+/// Change current directory.
+pub fn chdir(path: &[u8]) -> i32 {
+    let stripped = strip_dos_prefix(path);
+
+    if stripped == b".." {
+        let t = crate::kernel::thread::current();
+        let cwd = t.cwd_str();
+        if cwd.is_empty() { return 0; }
+        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
+        let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
+            Some(pos) => pos + 1,
+            None => 0,
+        };
+        t.cwd_len = new_len;
+        return 0;
+    }
+
+    if stripped.is_empty() || stripped == b"/" || stripped == b"\\" {
+        let t = crate::kernel::thread::current();
+        t.cwd_len = 0;
+        return 0;
+    }
+
+    let mut new_cwd = [0u8; 64];
+    let mut pos = 0;
+
+    let t = crate::kernel::thread::current();
+    let cwd = t.cwd_str();
+    for &b in cwd {
+        if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+    }
+    for &b in stripped {
+        if pos < new_cwd.len() {
+            new_cwd[pos] = if b == b'\\' { b'/' } else { b };
+            pos += 1;
+        }
+    }
+    if pos > 0 && new_cwd[pos - 1] != b'/' {
+        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
+    }
+
+    let prefix = &new_cwd[..pos];
+    if !root_fs().dir_exists(prefix) {
+        return -2;
+    }
+
+    t.set_cwd(prefix);
+    0
+}
+
+/// Duplicate all FDs from src into dst (for fork).
 pub fn dup_fds(src: &[i32; MAX_FDS], dst: &mut [i32; MAX_FDS]) {
     *dst = *src;
     unsafe {
@@ -703,7 +554,7 @@ pub fn dup_fds(src: &[i32; MAX_FDS], dst: &mut [i32; MAX_FDS]) {
     }
 }
 
-/// Close all FDs in the given array. Decrements refcounts.
+/// Close all FDs in the given array.
 pub fn close_all_fds(fds: &mut [i32; MAX_FDS]) {
     unsafe {
         for fd in fds.iter_mut() {
