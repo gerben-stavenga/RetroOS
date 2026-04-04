@@ -76,7 +76,7 @@ pub fn startup() -> ! {
 
     loop {
         // Open and read DN.COM via VFS (boot thread 0 = Linux)
-        let thread::ThreadMode::Linux(boot) = &mut thread::current().mode else { unreachable!() };
+        let thread::ThreadMode::Linux(boot) = &mut thread::get_thread(0).unwrap().mode else { unreachable!() };
         let fd = vfs::open(dn_path, &mut boot.fds);
         if fd < 0 { panic!("DN.COM not found"); }
         let size = vfs::file_size(fd, &boot.fds) as usize;
@@ -118,12 +118,48 @@ fn event_loop(first_tid: usize) {
     let mut tid = first_tid;
 
     // REGS already set up by startup, page tables correct from boot
-    thread::set_current(tid);
-
     loop {
-        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
-        let regs = unsafe { &mut *(&raw mut REGS) };
-        drain_pending_irqs(thread, regs);
+        crate::kernel::stacktrace::set_debug_tid(tid);
+        // Pre-execute: drain hardware events into OS personality
+        {
+            let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+            let regs = unsafe { &mut *(&raw mut REGS) };
+            match &mut thread.mode {
+                thread::ThreadMode::Dos(dos) => {
+                    // Skip during DPMI real-mode simulation — injecting IRQs would corrupt the frame.
+                    let dpmi_rm_call = dos.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some());
+                    if !dpmi_rm_call {
+                        if regs.mode() == crate::UserMode::VM86 {
+                            qemu_vga_workaround(regs);
+                        }
+                        let ticks = crate::arch::take_pending_ticks();
+                        for _ in 0..ticks {
+                            crate::kernel::vm86::queue_irq(dos, crate::arch::Irq::Tick);
+                        }
+                        let dp = dos as *mut thread::DosState;
+                        crate::arch::drain(|evt| {
+                            if let crate::arch::Irq::Key(F11_PRESS) = evt {
+                                thread::request_switch();
+                            } else {
+                                crate::kernel::vm86::queue_irq(unsafe { &mut *dp }, evt);
+                            }
+                        });
+                        crate::kernel::vm86::raise_pending(unsafe { &mut *dp }, regs);
+                    }
+                }
+                thread::ThreadMode::Linux(_linux) => {
+                    crate::arch::drain(|evt| {
+                        if let crate::arch::Irq::Key(sc) = evt {
+                            if sc == F11_PRESS {
+                                thread::request_switch();
+                            } else {
+                                crate::kernel::keyboard::process_key(sc);
+                            }
+                        }
+                    });
+                }
+            }
+        }
 
         let (event, extra) = do_arch_execute();
 
@@ -131,14 +167,14 @@ fn event_loop(first_tid: usize) {
         let regs = unsafe { &mut *(&raw mut REGS) };
 
         let new_tid = match event {
-            14 => thread::signal_thread(thread, extra as usize),
+            14 => thread::signal_thread(thread, tid, extra as usize),
             32..=47 => None,
 
             _ => match &mut thread.mode {
                 thread::ThreadMode::Dos(dos) => {
                     if regs.mode() == crate::UserMode::VM86 {
                         match event {
-                            13 => crate::kernel::vm86::vm86_monitor(dos, regs),
+                            13 => crate::kernel::vm86::vm86_monitor(tid, dos, regs),
                             _ => {
                                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                                 let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
@@ -150,14 +186,14 @@ fn event_loop(first_tid: usize) {
                         }
                     } else if dos.dpmi.is_some() {
                         match event {
-                            13 => crate::kernel::dpmi::dpmi_monitor(dos, regs),
+                            13 => crate::kernel::dpmi::dpmi_monitor(tid, dos, regs),
                             0x31 => crate::kernel::dpmi::dpmi_int31(dos, regs),
-                            0..=31 => crate::kernel::dpmi::dispatch_dpmi_exception(dos, regs, event),
+                            0..=31 => crate::kernel::dpmi::dispatch_dpmi_exception(tid, dos, regs, event),
                             0x30..=0xFF => crate::kernel::dpmi::dpmi_soft_int(dos, regs, event as u8),
                             _ => {
                                 crate::println!("DPMI: unexpected event {} at CS:EIP={:#06x}:{:#x}",
                                     event, regs.frame.cs as u16, regs.ip32());
-                                Some(thread::exit_thread(-11))
+                                Some(thread::exit_thread(tid, -11))
                             }
                         }
                     } else {
@@ -166,7 +202,7 @@ fn event_loop(first_tid: usize) {
                 }
                 thread::ThreadMode::Linux(_linux) => {
                     match event {
-                        0x80 => crate::kernel::syscalls::dispatch(regs),
+                        0x80 => crate::kernel::syscalls::dispatch(tid, regs),
                         _ => None,
                     }
                 }
@@ -176,7 +212,7 @@ fn event_loop(first_tid: usize) {
 
         // F11 hotkey: force round-robin thread cycle
         let new_tid = if new_tid.is_none() && thread::take_switch_request() {
-            thread::cycle_next()
+            thread::cycle_next(tid)
         } else {
             new_tid
         };
@@ -210,7 +246,6 @@ fn event_loop(first_tid: usize) {
                     unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP = dos.vm86.vga.ac_flipflop; }
                 }
                 tid = new_tid;
-                thread::set_current(tid);
                 // Reload LDT if switching to a DPMI thread
                 let new_thread = thread::get_thread(tid).expect("Invalid thread");
                 if let thread::ThreadMode::Dos(dos) = &new_thread.mode {
@@ -227,46 +262,6 @@ fn event_loop(first_tid: usize) {
 
 /// F11 scancode (press)
 const F11_PRESS: u8 = 0x57;
-
-fn drain_pending_irqs(thread: &mut thread::Thread, regs: &mut crate::Regs) {
-    let is_dos = thread.is_dos();
-    // Skip during DPMI real-mode simulation — injecting IRQs would corrupt the frame.
-    let dpmi_rm_call = if let thread::ThreadMode::Dos(dos) = &thread.mode {
-        dos.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some())
-    } else { false };
-    if is_dos && !dpmi_rm_call {
-        // QEMU VGA workaround: re-set Odd/Even read mode for text modes.
-        if regs.mode() == crate::UserMode::VM86 {
-            qemu_vga_workaround(regs);
-        }
-        let dos = thread.dos_mut();
-        // Queue hardware events into virtual PIC/keyboard (shared devices)
-        let ticks = crate::arch::take_pending_ticks();
-        for _ in 0..ticks {
-            crate::kernel::vm86::queue_irq(dos, crate::arch::Irq::Tick);
-        }
-        let dp = dos as *mut thread::DosState;
-        crate::arch::drain(|evt| {
-            if let crate::arch::Irq::Key(F11_PRESS) = evt {
-                thread::request_switch();
-            } else {
-                crate::kernel::vm86::queue_irq(unsafe { &mut *dp }, evt);
-            }
-        });
-        // Deliver one pending interrupt (shared VIF/VIP/ISR discipline)
-        crate::kernel::vm86::raise_pending(unsafe { &mut *dp }, regs);
-    } else if !is_dos {
-        crate::arch::drain(|evt| {
-            if let crate::arch::Irq::Key(sc) = evt {
-                if sc == F11_PRESS {
-                    thread::request_switch();
-                } else {
-                    crate::kernel::keyboard::process_key(sc);
-                }
-            }
-        });
-    }
-}
 
 /// QEMU VGA bug workaround: real VGA hardware forces Odd/Even read mode
 /// (GC5 bit 4) in text modes. QEMU doesn't, so re-set it on each trap.

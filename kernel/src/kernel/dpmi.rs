@@ -352,7 +352,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 /// Only handles sensitive instructions that cause #GP from ring 3:
 /// I/O, CLI/STI, PUSHF/POPF, HLT, IRET. INT instructions arrive as direct
 /// events via the IDT (DPL=3 for 0x30-0xFF).
-pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
@@ -442,11 +442,8 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
         0xF4 => {
             regs.set_ip32(regs.ip32().wrapping_add(advance));
             trace_client_selector_leak("dpmi_monitor.hlt", regs);
-            // Mark thread Ready and schedule — caller sets state via split borrow
-            let thread = thread::current();
-            thread.cpu_state = *regs;
-            thread.state = thread::ThreadState::Ready;
-            return thread::schedule();
+            // Mark thread Ready and schedule
+            return thread::yield_thread(tid, regs);
         }
         // IRET — pop IP/CS/FLAGS, size depends on operand size
         0xCF => {
@@ -457,7 +454,7 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
                 if new_cs == 0 {
                     let _ = dpmi;
-                    return dispatch_dpmi_exception(dos, regs, 13);
+                    return dispatch_dpmi_exception(tid, dos, regs, 13);
                 }
                 set_sp(regs, sp.wrapping_add(12));
                 regs.set_ip32(new_eip);
@@ -470,7 +467,7 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u16) } as u32;
                 if new_cs == 0 {
                     let _ = dpmi;
-                    return dispatch_dpmi_exception(dos, regs, 13);
+                    return dispatch_dpmi_exception(tid, dos, regs, 13);
                 }
                 set_sp(regs, sp.wrapping_add(6));
                 regs.set_ip32(new_ip as u32);
@@ -577,7 +574,7 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
         _ => {
             // Not a sensitive instruction — dispatch to client exception handler
             let modrm = unsafe { *((flat_eip.wrapping_add(offset + 1)) as *const u8) };
-            return dispatch_dpmi_exception(dos, regs, 13);
+            return dispatch_dpmi_exception(tid, dos, regs, 13);
         }
     }
 
@@ -1697,13 +1694,13 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -
 ///   [ESP+20] Faulting EFLAGS
 ///   [ESP+24] Faulting ESP (optional, for SS faults)
 ///   [ESP+28] Faulting SS (optional, for SS faults)
-pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> Option<usize> {
+pub fn dispatch_dpmi_exception(tid: usize, dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> Option<usize> {
     dpmi_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code);
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
         None => {
-            let next = thread::exit_thread(-(exc_num as i32));
+            let next = thread::exit_thread(tid, -(exc_num as i32));
             return Some(next);
         }
     };
@@ -1719,7 +1716,7 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
         crate::println!("{:?}", regs);
-        let next = thread::exit_thread(-(exc_num as i32));
+        let next = thread::exit_thread(tid, -(exc_num as i32));
         return Some(next);
     }
 

@@ -1377,16 +1377,19 @@ pub(crate) enum Action {
     Done,
     Switch(usize),
     Yield,
+    Exit(i32),
+    BlockAndSwitch(usize),
 }
 
 /// VM86 monitor — called from GP fault handler when EFLAGS.VM=1.
 /// Arch boundary swaps VIF↔IF, so IF is the virtual interrupt flag throughout.
-pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
-    let action = monitor_impl(dos, regs);
-    match action {
+pub fn vm86_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+    match monitor_impl(dos, regs) {
         Action::Done => None,
         Action::Switch(idx) => Some(idx),
-        Action::Yield => thread::yield_current(regs),
+        Action::Yield => thread::yield_thread(tid, regs),
+        Action::Exit(code) => Some(thread::exit_thread(tid, code)),
+        Action::BlockAndSwitch(child) => { thread::block_thread(tid); Some(child) }
     }
 }
 
@@ -1668,8 +1671,7 @@ fn monitor_impl(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
                 _ => {
                     crate::println!("VM86: FATAL unhandled opcode 0x66 {:#04x} at {:04x}:{:04x}",
                         op, vm86_cs(regs), regs.ip32().wrapping_sub(2));
-                    let next = thread::exit_thread(-11);
-                    Action::Switch(next)
+                    Action::Exit(-11)
                 }
             }
         }
@@ -1691,8 +1693,7 @@ fn monitor_impl(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
                 read_u16(ss, sp), read_u16(ss, sp+2), read_u16(ss, sp+4),
                 read_u16(ss, sp+6), read_u16(ss, sp+8), read_u16(ss, sp+10));
             // Kill the VM86 thread
-            let next = thread::exit_thread(-11);
-            Action::Switch(next)
+            Action::Exit(-11)
         }
     }
 }
@@ -1779,8 +1780,7 @@ fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
                 dos.vm86.last_child_exit_code = 0;
                 return exec_return(dos, regs, parent);
             }
-            let next = thread::exit_thread(0);
-            Action::Switch(next)
+            Action::Exit(0)
         }
         0x21 => int_21h(dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error
@@ -2195,8 +2195,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
                 return exec_return(dos, regs, parent);
             }
             let code = regs.rax as u8;
-            let next = thread::exit_thread(code as i32);
-            Action::Switch(next)
+            Action::Exit(code as i32)
         }
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
@@ -3527,7 +3526,7 @@ fn fork_exec(dos: &mut thread::DosState, regs: &mut Regs, prog_name: &[u8]) -> A
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
     let is_exe = !is_elf && is_mz_exe(&buf);
 
-    let parent_tid = thread::current_tid();
+    let parent_tid = dos.tid;
     let mut child_root = crate::RootPageTable::empty();
     crate::kernel::startup::arch_user_fork(&mut child_root);
 
@@ -3555,7 +3554,7 @@ fn fork_exec(dos: &mut thread::DosState, regs: &mut Regs, prog_name: &[u8]) -> A
                     &mut child.cpu_state, &mut child.root,
                     core::ptr::null_mut(),
                 );
-                thread::exit_thread(1);
+                thread::exit_thread(child_idx, 1);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
                 regs.set_flag32(1);
                 return Action::Done;
@@ -3608,7 +3607,7 @@ fn fork_exec(dos: &mut thread::DosState, regs: &mut Regs, prog_name: &[u8]) -> A
                         &mut child.cpu_state, &mut child.root,
                         core::ptr::null_mut(),
                     );
-                    thread::exit_thread(1);
+                    thread::exit_thread(child_idx, 1);
                     regs.rax = (regs.rax & !0xFFFF) | 11;
                     regs.set_flag32(1);
                     return Action::Done;
@@ -3636,7 +3635,7 @@ fn fork_exec(dos: &mut thread::DosState, regs: &mut Regs, prog_name: &[u8]) -> A
     crate::dbg_println!("fork_exec: child cwd={:?}", core::str::from_utf8(dos.cwd_str()));
 
     regs.clear_flag32(1);
-    Action::Switch(child_idx)
+    Action::BlockAndSwitch(child_idx)
 }
 
 /// DOS INT 4Bh EXEC — load and execute program.

@@ -110,7 +110,7 @@ impl SyscallResult {
 }
 
 /// Syscall handler type
-type SyscallFn = fn(&mut Regs) -> SyscallResult;
+type SyscallFn = fn(usize, &mut Regs) -> SyscallResult;
 
 /// Syscall table
 const SYSCALL_TABLE: [Option<SyscallFn>; 14] = [
@@ -131,7 +131,7 @@ const SYSCALL_TABLE: [Option<SyscallFn>; 14] = [
 ];
 
 /// Dispatch a syscall. Returns Some(idx) if a context switch is needed.
-pub fn dispatch(regs: &mut Regs) -> Option<usize> {
+pub fn dispatch(tid: usize, regs: &mut Regs) -> Option<usize> {
     // 64-bit syscall ABI uses different registers: rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4
     // Remap to the canonical layout (rdx=arg0, rcx=arg1, rbx=arg2, rsi=arg3, rdi=arg4)
     // so handlers don't need to know which mode the caller is in.
@@ -149,7 +149,7 @@ pub fn dispatch(regs: &mut Regs) -> Option<usize> {
 
     let result = if syscall_num < SYSCALL_TABLE.len() {
         if let Some(handler) = SYSCALL_TABLE[syscall_num] {
-            handler(regs)
+            handler(tid, regs)
         } else {
             SyscallResult::val(ENOSYS)
         }
@@ -163,27 +163,27 @@ pub fn dispatch(regs: &mut Regs) -> Option<usize> {
 
 /// Exit syscall (0)
 /// Terminates the current process
-fn sys_exit(regs: &mut Regs) -> SyscallResult {
+fn sys_exit(tid: usize, regs: &mut Regs) -> SyscallResult {
     let exit_code = regs.rdx as i32;
-    SyscallResult::switch(Some(thread::exit_thread(exit_code)))
+    SyscallResult::switch(Some(thread::exit_thread(tid, exit_code)))
 }
 
 /// Yield syscall (1)
 /// Yields CPU to another thread
-fn sys_yield(regs: &mut Regs) -> SyscallResult {
+fn sys_yield(tid: usize, regs: &mut Regs) -> SyscallResult {
     // Save current state and schedule another thread
-    let current = thread::current();
+    let current = thread::get_thread(tid).unwrap();
     thread::save_state(current, regs);
     thread::set_return(current, 0);  // Yield returns 0 when resumed
     current.state = thread::ThreadState::Ready;
-    SyscallResult::switch(thread::schedule())
+    SyscallResult::switch(thread::schedule(tid))
 }
 
 /// Fork syscall (4)
 /// Creates a copy of the current process
-fn sys_fork(regs: &mut Regs) -> SyscallResult {
-    let current = thread::current();
-    let current_tid = current.tid as usize;
+fn sys_fork(tid: usize, regs: &mut Regs) -> SyscallResult {
+    let current = thread::get_thread(tid).unwrap();
+    let current_tid = tid;
     let mut child_root = crate::RootPageTable::empty();
     startup::arch_user_fork(&mut child_root);
 
@@ -234,7 +234,7 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
 /// arg1 (rcx) = path length
 /// arg2 (rbx) = argv pointer (array of &str = [(ptr, len), ...])
 /// arg3 (rsi) = argc (number of &str elements)
-fn sys_exec(regs: &mut Regs) -> SyscallResult {
+fn sys_exec(tid: usize, regs: &mut Regs) -> SyscallResult {
     let path = unsafe { &*core::ptr::slice_from_raw_parts(regs.rdx as *const u8, regs.rcx as usize) };
 
     let Ok(path) = core::str::from_utf8(path) else {
@@ -255,16 +255,12 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let cwd_snapshot: [u8; 64];
     let cwd_len_snapshot: usize;
     {
-        let current = thread::current();
+        let current = thread::get_thread(tid).unwrap();
         match &mut current.mode {
             thread::ThreadMode::Dos(d) => {
                 vfs::close_all_fds(&mut d.fds);
                 cwd_snapshot = d.cwd;
                 cwd_len_snapshot = d.cwd_len;
-                // Drop old SymbolData before allocating the new buffer. The old symbols
-                // hold a Box<[u8]> with the entire previous ELF (~300-400K). Freeing it
-                // first lets the heap free list absorb the space, so the new buffer
-                // allocation can reuse it instead of extending the heap every iteration.
                 d.symbols = None;
             }
             thread::ThreadMode::Linux(l) => {
@@ -279,10 +275,11 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     // Resolve path relative to cwd, then open via VFS
     let mut path_buf = [0u8; 164];
     let resolved = resolve_path(path.as_bytes(), &cwd_snapshot[..cwd_len_snapshot], &mut path_buf);
-    let fds = match &mut thread::current().mode {
-        thread::ThreadMode::Dos(d) => &mut d.fds,
-        thread::ThreadMode::Linux(l) => &mut l.fds,
+    let fds = match &mut thread::get_thread(tid).unwrap().mode {
+        thread::ThreadMode::Dos(d) => &mut d.fds as *mut _,
+        thread::ThreadMode::Linux(l) => &mut l.fds as *mut _,
     };
+    let fds = unsafe { &mut *fds };
     let fd = vfs::open(resolved, fds);
     if fd < 0 { return SyscallResult::val(ENOENT); }
     let size = vfs::file_size(fd, fds) as usize;
@@ -298,8 +295,8 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
     // DOS executables use the VM86 exec path
     if is_com || is_exe {
-        let tid = exec_dos(&buffer, is_exe, resolved);
-        *regs = thread::current().cpu_state;
+        exec_dos(tid, &buffer, is_exe, resolved);
+        *regs = thread::get_thread(tid).unwrap().cpu_state;
         // buffer and args dropped here by RAII
         return SyscallResult::switch(Some(tid));
     }
@@ -309,13 +306,12 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
     let loaded = match elf::load_elf(&buffer) {
         Ok(e) => e,
-        Err(_) => { return SyscallResult::switch(Some(thread::exit_thread(-ENOEXEC))); },
+        Err(_) => { return SyscallResult::switch(Some(thread::exit_thread(tid, -ENOEXEC))); },
     };
 
     let symbols = SymbolData::new(buffer.into_boxed_slice());
 
-    let current = thread::current();
-    let tid = current.tid as usize;
+    let current = thread::get_thread(tid).unwrap();
 
     // Set up argv on the new user stack (demand-pages stack)
     let word = if want_64 { 8usize } else { 4usize };
@@ -343,7 +339,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
 /// Execute a DOS program (.COM or .EXE) in VM86 mode.
 /// Returns thread index to switch to.
-fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
+fn exec_dos(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8]) {
     use crate::kernel::vm86;
 
     // Free current user pages + map first 1MB for VM86
@@ -363,8 +359,7 @@ fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
         vm86::load_com(data, prog_name)
     };
 
-    let current = thread::current();
-    let tid = current.tid as usize;
+    let current = thread::get_thread(tid).unwrap();
 
     thread::init_process_thread_vm86(current, vm86::COM_SEGMENT, cs, ip, ss, sp);
     // init_process_thread_vm86 resets Vm86State; restore heap_seg and DTA
@@ -372,8 +367,6 @@ fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
     dos.vm86.heap_seg = end_seg;
     dos.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
     dos.symbols = None;
-
-    tid
 }
 
 /// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
@@ -476,7 +469,7 @@ pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool, word
 /// Open syscall (6)
 /// Opens a file and returns a file descriptor (or negative error)
 /// RDX = path pointer (null-terminated)
-fn sys_open(regs: &mut Regs) -> SyscallResult {
+fn sys_open(tid: usize, regs: &mut Regs) -> SyscallResult {
     let path_ptr = regs.rdx as *const u8;
 
     // Get path as slice (null-terminated)
@@ -491,7 +484,7 @@ fn sys_open(regs: &mut Regs) -> SyscallResult {
     };
 
     let mut buf = [0u8; 164];
-    let current = thread::current();
+    let current = thread::get_thread(tid).unwrap();
     let (cwd, fds) = match &mut current.mode {
         thread::ThreadMode::Dos(d) => (d.cwd_str() as *const [u8], &mut d.fds),
         thread::ThreadMode::Linux(l) => (l.cwd_str() as *const [u8], &mut l.fds),
@@ -505,11 +498,11 @@ fn sys_open(regs: &mut Regs) -> SyscallResult {
 /// Waits for a child process to exit
 /// RDX = pid (-1 for any child)
 /// Returns: child tid (or negative error)
-fn sys_wait(regs: &mut Regs) -> SyscallResult {
+fn sys_wait(tid: usize, regs: &mut Regs) -> SyscallResult {
     let pid = regs.rdx as i32;
-    let (tid, _code) = thread::waitpid(pid);
-    if tid >= 0 || tid == -10 {
-        return SyscallResult::val(tid);
+    let (child_tid, _code) = thread::waitpid(tid, pid);
+    if child_tid >= 0 || child_tid == -10 {
+        return SyscallResult::val(child_tid);
     }
     // EAGAIN: children exist but none exited yet — yield
     // Userspace must retry (busy-wait with yield)
@@ -518,7 +511,7 @@ fn sys_wait(regs: &mut Regs) -> SyscallResult {
 
 /// Read syscall (8)
 /// Reads from a file descriptor
-fn sys_read(regs: &mut Regs) -> SyscallResult {
+fn sys_read(tid: usize, regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx as i32;
     let buf = regs.rcx as *mut u8;
     let len = regs.rbx as usize;
@@ -530,7 +523,7 @@ fn sys_read(regs: &mut Regs) -> SyscallResult {
         SyscallResult::val(n as i32)
     } else if fd >= 3 {
         let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-        let fds = match &thread::current().mode {
+        let fds = match &thread::get_thread(tid).unwrap().mode {
             thread::ThreadMode::Dos(d) => &d.fds,
             thread::ThreadMode::Linux(l) => &l.fds,
         };
@@ -542,7 +535,7 @@ fn sys_read(regs: &mut Regs) -> SyscallResult {
 
 /// Write syscall (9)
 /// Writes to a file descriptor
-fn sys_write(regs: &mut Regs) -> SyscallResult {
+fn sys_write(_tid: usize, regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx;
     let buf = regs.rcx as *const u8;
     let len = regs.rbx as usize;
@@ -562,9 +555,9 @@ fn sys_write(regs: &mut Regs) -> SyscallResult {
 
 /// Close syscall (10)
 /// Closes a file descriptor
-fn sys_close(regs: &mut Regs) -> SyscallResult {
+fn sys_close(tid: usize, regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx as i32;
-    let fds = match &mut thread::current().mode {
+    let fds = match &mut thread::get_thread(tid).unwrap().mode {
         thread::ThreadMode::Dos(d) => &mut d.fds,
         thread::ThreadMode::Linux(l) => &mut l.fds,
     };
@@ -574,11 +567,11 @@ fn sys_close(regs: &mut Regs) -> SyscallResult {
 /// Seek syscall (11)
 /// Repositions file offset
 /// RDX = fd, RCX = offset, RBX = whence (0=SET, 1=CUR, 2=END)
-fn sys_seek(regs: &mut Regs) -> SyscallResult {
+fn sys_seek(tid: usize, regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx as i32;
     let offset = regs.rcx as i32;
     let whence = regs.rbx as i32;
-    let fds = match &thread::current().mode {
+    let fds = match &thread::get_thread(tid).unwrap().mode {
         thread::ThreadMode::Dos(d) => &d.fds,
         thread::ThreadMode::Linux(l) => &l.fds,
     };
@@ -587,11 +580,11 @@ fn sys_seek(regs: &mut Regs) -> SyscallResult {
 
 /// Change current directory
 /// RDX = pointer to path string, RCX = length
-fn sys_chdir(regs: &mut Regs) -> SyscallResult {
+fn sys_chdir(tid: usize, regs: &mut Regs) -> SyscallResult {
     let ptr = regs.rdx as usize as *const u8;
     let len = regs.rcx as usize;
     let path = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let (cwd, cwd_len) = match &mut thread::current().mode {
+    let (cwd, cwd_len) = match &mut thread::get_thread(tid).unwrap().mode {
         thread::ThreadMode::Dos(d) => (&mut d.cwd, &mut d.cwd_len),
         thread::ThreadMode::Linux(l) => (&mut l.cwd, &mut l.cwd_len),
     };
@@ -601,10 +594,10 @@ fn sys_chdir(regs: &mut Regs) -> SyscallResult {
 /// Get current directory
 /// RDX = pointer to buffer, RCX = buffer size
 /// Returns length written or negative error
-fn sys_getcwd(regs: &mut Regs) -> SyscallResult {
+fn sys_getcwd(tid: usize, regs: &mut Regs) -> SyscallResult {
     let ptr = regs.rdx as usize as *mut u8;
     let size = regs.rcx as usize;
-    let cwd = match &thread::current().mode {
+    let cwd = match &thread::get_thread(tid).unwrap().mode {
         thread::ThreadMode::Dos(d) => d.cwd_str(),
         thread::ThreadMode::Linux(l) => l.cwd_str(),
     };

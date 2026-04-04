@@ -56,6 +56,14 @@ impl SymbolData {
 
 static mut KERNEL_SYMBOLS: Option<SymbolData> = None;
 
+/// Debug-only: current thread index for panic stacktraces.
+/// Written by the event loop, read only by lookup_symbol during crash diagnostics.
+static mut DEBUG_TID: usize = 0;
+
+pub fn set_debug_tid(tid: usize) {
+    unsafe { DEBUG_TID = tid; }
+}
+
 fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
     unsafe { core::ptr::addr_of_mut!(KERNEL_SYMBOLS) }
 }
@@ -64,7 +72,7 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 pub fn init_from_tar() {
     // Try both mount layouts (TAR at root or at tar/)
     // Use boot thread's fds for kernel-internal VFS access
-    let fds = match &mut thread::current().mode {
+    let fds = match &mut thread::get_thread(0).unwrap().mode {
         thread::ThreadMode::Dos(d) => &mut d.fds,
         thread::ThreadMode::Linux(l) => &mut l.fds,
     };
@@ -212,16 +220,18 @@ fn lookup_symbol(addr: u64) -> (&'static str, u64) {
             }
         }
     } else {
-        // User address - use current thread's symbols
-        let syms = match &thread::current().mode {
-            thread::ThreadMode::Dos(d) => &d.symbols,
-            thread::ThreadMode::Linux(l) => &l.symbols,
-        };
-        if let Some(symbols) = syms {
-            let (name, offset) = symbols.lookup(addr);
-            if !name.is_empty() {
-                // SAFETY: thread symbols live as long as thread
-                return (unsafe { core::mem::transmute(name) }, offset);
+        // User address - use current thread's symbols (best-effort via debug tid)
+        let tid = unsafe { DEBUG_TID };
+        if let Some(thread) = thread::get_thread(tid) {
+            let syms = match &thread.mode {
+                thread::ThreadMode::Dos(d) => &d.symbols,
+                thread::ThreadMode::Linux(l) => &l.symbols,
+            };
+            if let Some(symbols) = syms {
+                let (name, offset) = symbols.lookup(addr);
+                if !name.is_empty() {
+                    return (unsafe { core::mem::transmute(name) }, offset);
+                }
             }
         }
     }

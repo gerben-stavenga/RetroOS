@@ -27,6 +27,7 @@ pub enum ThreadState {
 
 /// DOS-specific thread state: virtual hardware + optional DPMI protected mode
 pub struct DosState {
+    pub tid: usize,
     pub vm86: crate::kernel::vm86::Vm86State,
     pub dpmi: Option<alloc::boxed::Box<crate::kernel::dpmi::DpmiState>>,
     pub num_fds: i32,
@@ -37,8 +38,9 @@ pub struct DosState {
 }
 
 impl DosState {
-    pub fn new() -> Self {
+    pub fn new(tid: usize) -> Self {
         DosState {
+            tid,
             vm86: crate::kernel::vm86::Vm86State::new(),
             dpmi: None,
             num_fds: 0,
@@ -190,22 +192,23 @@ impl Thread {
 /// Thread array (heap-allocated to keep large RootPageTable out of .data)
 static mut THREADS: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
 
-/// Current running thread index (0 = idle/init, always valid after init)
-static mut CURRENT_THREAD: usize = 0;
-
-/// PRNG state for random scheduling
-static mut SEED: u64 = 0xcafe_babe_dead_beef;
-
 /// Check if threading system is initialized
 pub fn is_initialized() -> bool {
     unsafe { (*(&raw const THREADS)).len() > 0 }
 }
 
+pub fn prng() -> u64 {
+    /// PRNG state for random scheduling
+    static mut SEED: u64 = 0xcafe_babe_dead_beef;
 
-/// Get current thread (always valid — TID 0 is idle/init)
-pub fn current() -> &'static mut Thread {
-    unsafe { &mut THREADS[CURRENT_THREAD] }
+    unsafe {
+        const A: u64 = 0xdead_beed;
+        const C: u64 = 0x1234_5679;
+        SEED = A.wrapping_mul(SEED).wrapping_add(C);
+        SEED
+    }
 }
+
 
 /// Get thread by TID
 pub fn get_thread(tid: usize) -> Option<&'static mut Thread> {
@@ -270,7 +273,7 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 /// Initialize a thread for VM86 mode (.COM execution)
 /// cs/ip/ss/sp are real-mode segment:offset values
 pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
-    thread.mode = ThreadMode::Dos(DosState::new());
+    thread.mode = ThreadMode::Dos(DosState::new(thread.tid as usize));
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode
     const IF_FLAG: u32 = 1 << 9;   // Interrupt enable
@@ -299,14 +302,19 @@ pub fn save_state(thread: &mut Thread, regs: &Regs) {
     thread.cpu_state = *regs;
 }
 
-/// Yield the current thread: save regs, mark Ready, schedule next.
-pub fn yield_current(regs: &crate::Regs) -> Option<usize> {
+/// Block a thread (waiting for child exit).
+pub fn block_thread(tid: usize) {
+    unsafe { THREADS[tid].state = ThreadState::Blocked; }
+}
+
+/// Yield a thread: save regs, mark Ready, schedule next.
+pub fn yield_thread(tid: usize, regs: &crate::Regs) -> Option<usize> {
     unsafe {
-        let t = &mut THREADS[CURRENT_THREAD];
+        let t = &mut THREADS[tid];
         t.cpu_state = *regs;
         t.state = ThreadState::Ready;
     }
-    schedule()
+    schedule(tid)
 }
 
 /// Set return value in thread's saved state
@@ -316,14 +324,8 @@ pub fn set_return(thread: &mut Thread, ret: i32) {
 
 /// Schedule next thread (randomly selected from ready threads).
 /// Returns Some(idx) if a switch is needed, None to stay with current.
-pub fn schedule() -> Option<usize> {
+pub fn schedule(current_tid: usize) -> Option<usize> {
     unsafe {
-        const A: u64 = 0xdead_beed;
-        const C: u64 = 0x1234_5679;
-        SEED = A.wrapping_mul(SEED).wrapping_add(C);
-
-        let current_tid = CURRENT_THREAD;
-
         let mut next_idx: usize = usize::MAX;
         let mut count = 0u64;
 
@@ -333,7 +335,7 @@ pub fn schedule() -> Option<usize> {
             }
             if THREADS[i].state == ThreadState::Ready {
                 count += 1;
-                if SEED % count == 0 {
+                if prng() % count == 0 {
                     next_idx = i;
                 }
             }
@@ -345,11 +347,6 @@ pub fn schedule() -> Option<usize> {
             Some(next_idx)
         }
     }
-}
-
-/// Get the current thread index
-pub fn current_idx() -> usize {
-    unsafe { CURRENT_THREAD }
 }
 
 /// F11 hotkey flag for thread cycling
@@ -368,9 +365,9 @@ pub fn take_switch_request() -> bool {
 }
 
 /// Round-robin: next Running/Ready thread after current (skips thread 0).
-pub fn cycle_next() -> Option<usize> {
+pub fn cycle_next(current_tid: usize) -> Option<usize> {
     unsafe {
-        let cur = CURRENT_THREAD;
+        let cur = current_tid;
         for offset in 1..MAX_THREADS {
             let i = (cur + offset) % MAX_THREADS;
             if i == 0 { continue; }
@@ -382,21 +379,11 @@ pub fn cycle_next() -> Option<usize> {
     }
 }
 
-/// Get the current thread index
-pub fn current_tid() -> usize {
-    unsafe { CURRENT_THREAD }
-}
-
-/// Set the current thread index (called by event loop before executing)
-pub fn set_current(tid: usize) {
-    unsafe { CURRENT_THREAD = tid; }
-}
-
-/// Exit current thread and schedule next.
+/// Exit thread and schedule next.
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
-pub fn exit_thread(exit_code: i32) -> usize {
+pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
     unsafe {
-        let thread = &mut THREADS[CURRENT_THREAD];
+        let thread = &mut THREADS[tid];
         let parent_tid = thread.parent_tid;
         match &mut thread.mode {
             ThreadMode::Dos(dos) => {
@@ -435,17 +422,16 @@ pub fn exit_thread(exit_code: i32) -> usize {
             }
         }
 
-        CURRENT_THREAD = 0;
-        schedule().unwrap_or(0)
+        schedule(tid).unwrap_or(0)
     }
 }
 
 /// Wait for a child to exit. Returns (child_tid, exit_code) or -ECHILD if no children.
 /// If pid == -1, waits for any child. Otherwise waits for specific pid.
 /// Non-blocking: returns -EAGAIN if children exist but none have exited yet.
-pub fn waitpid(pid: i32) -> (i32, i32) {
+pub fn waitpid(current_tid: usize, pid: i32) -> (i32, i32) {
     unsafe {
-        let current_tid = THREADS[CURRENT_THREAD].tid;
+        let current_tid = THREADS[current_tid].tid;
         let mut has_children = false;
 
         for i in 1..MAX_THREADS {
@@ -471,7 +457,7 @@ pub fn waitpid(pid: i32) -> (i32, i32) {
 
 /// Signal thread (e.g., on segfault).
 /// Returns Some(idx) if a context switch is needed (current thread killed).
-pub fn signal_thread(thread: &mut Thread, fault_address: usize) -> Option<usize> {
+pub fn signal_thread(thread: &mut Thread, current_tid: usize, fault_address: usize) -> Option<usize> {
     if thread.pid == 0 {
         // Kernel thread - panic
         println!("\x1b[91mSEGV in init at {:#x}\x1b[0m", fault_address);
@@ -480,7 +466,7 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) -> Option<usize>
         println!("SEGV in thread {} at {:#x}", thread.tid, fault_address);
 
         unsafe {
-            if CURRENT_THREAD == thread.tid as usize {
+            if current_tid == thread.tid as usize {
                 crate::kernel::startup::arch_user_clean();
                 thread.state = ThreadState::Zombie;
                 thread.exit_code = -11;  // SIGSEGV
@@ -488,8 +474,7 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) -> Option<usize>
                     ThreadMode::Dos(dos) => dos.symbols = None,
                     ThreadMode::Linux(linux) => linux.symbols = None,
                 }
-                CURRENT_THREAD = 0;
-                Some(schedule().unwrap_or(0))
+                Some(schedule(current_tid).unwrap_or(0))
             } else {
                 // Not current thread — can't free pages here (wrong address space)
                 thread.state = ThreadState::Zombie;
@@ -516,6 +501,5 @@ pub fn init_threading() {
         THREADS[0].parent_tid = -1;
         THREADS[0].state = ThreadState::Running;
         // root stays empty — idle thread doesn't use user pages
-        // CURRENT_THREAD defaults to 0, which is correct
     }
 }
