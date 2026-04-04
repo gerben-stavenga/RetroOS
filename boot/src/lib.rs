@@ -15,7 +15,7 @@ const LOW_BUFFER: usize = 0x50000;
 const CHUNK_SIZE: usize = 0x10000; // 64KB chunks
 
 /// High memory buffer for ELF (above 1MB, accessible via A20)
-const ELF_HIGH_BUFFER: usize = 0x100000;
+const ELF_HIGH_BUFFER: usize = 0x400000;
 
 /// BIOS register structure for interrupt calls
 /// Must match the assembly REGS struct layout
@@ -45,7 +45,6 @@ pub struct MMapEntry {
 /// Boot data passed to kernel
 #[repr(C)]
 pub struct BootData {
-    pub kernel: *const u8,
     pub start_sector: u32,
     pub cursor_pos: u32,
     pub mmap_count: i32,
@@ -357,17 +356,15 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         }
     };
 
-    // Derive kernel base from lowest segment vaddr (no hardcoded coupling)
-    let kernel_base = elf.segments().map(|s| s.vaddr).min().unwrap_or(0) & !0xFFF;
+    // Compute entry point before loading (loading overwrites ELF buffer at 0x100000)
+    let seg0 = elf.segments().next().unwrap();
+    let entry_phys = elf.entry() as u32 - seg0.vaddr as u32 + seg0.paddr as u32;
 
-    // Calculate kernel physical base (page-aligned after ELF buffer in high memory)
-    let kernel_buffer = ((ELF_HIGH_BUFFER + kernel_size + 0xFFF) & !0xFFF) as *mut u8;
+    println!("Loading segments...");
 
-    println!("Loading segments at {:#x}", kernel_buffer as u32);
-
-    // Load ELF segments to their final physical addresses
+    // Load ELF segments at their physical addresses (p_paddr from AT() directives)
     for seg in elf.segments() {
-        let phys_addr = kernel_buffer as usize + seg.vaddr - kernel_base;
+        let phys_addr = seg.paddr;
         if let Some(data) = seg.data {
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), phys_addr as *mut u8, data.len());
@@ -387,7 +384,6 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
 
     // Get memory map
     let mut boot_data = BootData {
-        kernel: kernel_buffer,
         start_sector: fs_lba,
         cursor_pos: 0,
         mmap_count: 0,
@@ -397,8 +393,6 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
 
     println!("Starting kernel...");
 
-    // Jump to kernel entry (adjusted for physical address)
-    let entry_phys = kernel_buffer as u32 + elf.entry() as u32 - kernel_base as u32;
     type KernelEntry = unsafe extern "C" fn(*const BootData) -> !;
     let kernel_entry: KernelEntry = unsafe { core::mem::transmute(entry_phys) };
     unsafe { kernel_entry(&boot_data) };

@@ -1,17 +1,19 @@
 /* RetroOS Rust Kernel Linker Script */
-/* Kernel is loaded by bootloader at arbitrary page-aligned physical address */
-/* Entry code (PrepareKernel) adjusts for physical vs linked address */
+/* Kernel is linked at KERNEL_BASE, loaded at KERNEL_PHYS */
 
 KERNEL_BASE = 0xC0B00000;
+KERNEL_PHYS = 0x00100000;
 
-ENTRY(PrepareKernel)
+ENTRY(_entry)
 
 SECTIONS
 {
     . = KERNEL_BASE;
     _start = .;
 
-    .text ALIGN(4K) : {
+    .text ALIGN(4K) : AT(KERNEL_PHYS) {
+        *(.multiboot)
+        *(.entry)
         *(.text .text.*)
         *(.trampoline)
         KEEP(*(.note*))

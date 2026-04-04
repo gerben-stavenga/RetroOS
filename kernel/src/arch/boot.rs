@@ -1,19 +1,15 @@
 //! Kernel boot sequence (ring 0)
 //!
 //! Entry flow:
-//! 1. PrepareKernel (runs at physical address, paging off, uses delta adjustment)
-//! 2. SwitchStack (assembly, switches to kernel stack)
-//! 3. KernelInit (runs with paging, at KERNEL_BASE)
-//! 4. enter_ring1() → kernel::startup::startup()
+//! 1. _entry (asm stub: offset GDT, kernel stack, calls PrepareKernel)
+//! 2. PrepareKernel (enables paging, initializes kernel, drops to ring 1)
 
 use super::{paging2, phys_mm, descriptors, irq, x86};
 use crate::{vga, println};
 use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 
-// External assembly functions
-unsafe extern "C" {
-    fn SwitchStack(new_stack: *mut u8, func: *const ()) -> !;
-}
+/// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
+pub const KERNEL_PHYS: usize = 0x0010_0000;
 
 // Linker symbols
 unsafe extern "C" {
@@ -21,75 +17,49 @@ unsafe extern "C" {
     static _end: u8;
 }
 
-/// PrepareKernel - Entry point called by bootloader
+/// PrepareKernel - Entry point called by asm boot stub
 ///
-/// This function runs at physical address with paging disabled.
-/// The kernel is linked at KERNEL_BASE but loaded at arbitrary phys address.
-/// We use delta adjustment to access globals correctly.
+/// Runs with offset segments (base = KERNEL_PHYS - KERNEL_BASE) so linked
+/// addresses access physical memory correctly. Paging is off on entry.
+/// Stack is already set to KERNEL_STACK by the asm stub.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PrepareKernel(boot_data: *const crate::BootData) -> ! {
+    let kernel_size = unsafe {
+        core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_start) as usize
+    };
+    let kernel_pages = (kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // Enable paging (auto-detects Legacy vs PAE)
+    // With offset segments, linked pointers work directly — no delta adjustment needed
     unsafe {
-        let phys_address = (*boot_data).kernel as usize;
-        let linked_address = core::ptr::addr_of!(_start) as usize;
-
-        // Delta between where we're loaded and where we're linked
-        let delta = phys_address.wrapping_sub(linked_address);
-
-        // Adjust a pointer from linked address to physical address
-        let adjust = |ptr: *const u8| -> *mut u8 {
-            (ptr as usize).wrapping_add(delta) as *mut u8
-        };
-
-        // Get adjusted pointers to kernel pages and scratch
-        let kpages = adjust(core::ptr::addr_of!(crate::KERNEL_PAGES) as *const u8)
-            as *mut paging2::KernelPages;
-        let scratch = adjust(core::ptr::addr_of!(crate::SCRATCH) as *const u8)
-            as *mut paging2::RawPage;
-
-        // Calculate kernel size in pages
-        let kernel_size = core::ptr::addr_of!(_end) as usize - linked_address;
-        let kernel_pages = (kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-        // Enable paging (auto-detects Legacy vs PAE)
-        paging2::enable_paging(kpages, scratch, phys_address, kernel_pages);
-
-        // Now paging is enabled, we're running at virtual address
-        // Set up argument for KernelInit on the stack
-        #[allow(static_mut_refs)]
-        let stack_top = unsafe { crate::KERNEL_STACK.top_mut() };
-        // Push boot_data pointer (adjusted to LOW_MEM_BASE mapping)
-        let boot_data_virt = (boot_data as usize + LOW_MEM_BASE) as *const crate::BootData;
-        let stack_with_arg = stack_top.sub(4) as *mut *const crate::BootData;
-        *stack_with_arg = boot_data_virt;
-
-        SwitchStack(stack_with_arg as *mut u8, KernelInit as *const ());
+        paging2::enable_paging(
+            &raw mut crate::KERNEL_PAGES,
+            &raw mut crate::SCRATCH,
+            KERNEL_PHYS,
+            kernel_pages,
+        );
     }
-}
+    // Update VGA base for paged addressing before any println
+    vga::vga().base = LOW_MEM_BASE + 0xB8000;
 
-/// Main kernel initialization
-///
-/// This runs on the kernel stack with paging enabled.
-extern "C" fn KernelInit(boot_data: *const crate::BootData) -> ! {
-    let boot_data = unsafe { &*boot_data };
+    // Switch to flat GDT (base=0) + IDT + TSS immediately after paging.
+    // Offset segments are no longer needed — paging maps KERNEL_BASE to KERNEL_PHYS.
+    #[allow(static_mut_refs)]
+    let arch_stack_top = unsafe { crate::ARCH_STACK.top() as u32 } - 16;
+    descriptors::setup_descriptor_tables(arch_stack_top);
+
+    // boot_data is in low memory — access through LOW_MEM_BASE mapping
+    let boot_data = unsafe { &*((boot_data as usize + LOW_MEM_BASE) as *const crate::BootData) };
 
     println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
-    // Update VGA base to use LOW_MEM_BASE mapping before removing identity
-    vga::vga().base = LOW_MEM_BASE + 0xB8000;
-
-    // Finish paging setup (remove identity, enable NX, setup long mode, harden)
     paging2::finish_setup_paging();
 
-    let kernel_phys = boot_data.kernel as u64;
-    println!("kernel_phys: {:#x}", kernel_phys);
+    println!("kernel_phys: {:#x}", KERNEL_PHYS);
 
-    let kernel_size = core::ptr::addr_of!(_end) as u64 - core::ptr::addr_of!(_start) as u64;
-    let kernel_low_page = kernel_phys / PAGE_SIZE as u64;
-    let kernel_high_page = (kernel_phys + kernel_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
+    let kernel_low_page = (KERNEL_PHYS / PAGE_SIZE) as u64;
+    let kernel_high_page = ((KERNEL_PHYS + kernel_size + PAGE_SIZE - 1) / PAGE_SIZE) as u64;
 
-    println!("Initializing phys_mm...");
-
-    // Initialize physical memory allocator
     phys_mm::init_phys_mm(
         &boot_data.mmap_entries,
         boot_data.mmap_count as usize,
@@ -99,14 +69,11 @@ extern "C" fn KernelInit(boot_data: *const crate::BootData) -> ! {
 
     println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
-    // Initialize temp mapping for fork
     paging2::init_temp_map();
 
-    // Initialize kernel heap allocator
     crate::kernel::heap::init();
     println!("Heap initialized");
 
-    // Print memory map
     println!("Memory regions: {}", boot_data.mmap_count);
     for i in 0..boot_data.mmap_count as usize {
         if i >= 32 { break; }
@@ -118,17 +85,9 @@ extern "C" fn KernelInit(boot_data: *const crate::BootData) -> ! {
         }
     }
 
-    // Setup GDT, IDT, TSS — use ARCH_STACK for TSS ESP0
-    #[allow(static_mut_refs)]
-    let arch_stack_top = unsafe { crate::ARCH_STACK.top() as u32 } - 16;
-    descriptors::setup_descriptor_tables(arch_stack_top);
-    println!("Descriptors initialized");
-
-    // Setup PIC and enable interrupts
     irq::init_interrupts();
     println!("Interrupts initialized");
 
-    // If CPU supports long mode, switch to compat mode now.
     if paging2::cpu_supports_long_mode() {
         paging2::sync_hw_pdpt();
         x86::flush_tlb();
@@ -138,14 +97,12 @@ extern "C" fn KernelInit(boot_data: *const crate::BootData) -> ! {
         println!("Switched to Compat mode");
     }
 
-    // Enable interrupts
     x86::sti();
     println!("Interrupts enabled");
 
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");
 
-    // Drop to ring 1 — continues here at ring 1
     descriptors::enter_ring1();
 
     crate::kernel::startup::startup(boot_data.start_sector);

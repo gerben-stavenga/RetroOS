@@ -301,6 +301,7 @@ pub struct SegmentIter<'a> {
 /// A loadable ELF segment
 pub struct Segment<'a> {
     pub vaddr: usize,
+    pub paddr: usize,
     pub memsz: usize,
     pub flags: u32,
     pub data: Option<&'a [u8]>,
@@ -324,14 +325,14 @@ impl<'a> Iterator for SegmentIter<'a> {
             let ph_start = self.offset + self.index * self.size;
             self.index += 1;
 
-            let (typ, flags, off, vaddr, filesz, memsz) = match self.class {
+            let (typ, flags, off, vaddr, paddr, filesz, memsz) = match self.class {
                 ElfClass::Elf32 => {
                     if ph_start + core::mem::size_of::<ProgramHeader32>() > self.data.len() {
                         continue;
                     }
                     let ph = unsafe { &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader32) };
                     (ph.typ, ph.flags, ph.off as usize, ph.vaddr as usize,
-                     ph.filesz as usize, ph.memsz as usize)
+                     ph.paddr as usize, ph.filesz as usize, ph.memsz as usize)
                 }
                 ElfClass::Elf64 => {
                     if ph_start + core::mem::size_of::<ProgramHeader64>() > self.data.len() {
@@ -339,7 +340,7 @@ impl<'a> Iterator for SegmentIter<'a> {
                     }
                     let ph = unsafe { &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader64) };
                     (ph.typ, ph.flags, ph.off as usize, ph.vaddr as usize,
-                     ph.filesz as usize, ph.memsz as usize)
+                     ph.paddr as usize, ph.filesz as usize, ph.memsz as usize)
                 }
             };
 
@@ -350,7 +351,7 @@ impl<'a> Iterator for SegmentIter<'a> {
                     None
                 };
 
-                return Some(Segment { vaddr, memsz, flags, data: file_data });
+                return Some(Segment { vaddr, paddr, memsz, flags, data: file_data });
             }
         }
         None

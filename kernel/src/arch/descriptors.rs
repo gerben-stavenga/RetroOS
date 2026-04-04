@@ -389,7 +389,6 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
             base: core::ptr::addr_of!(GDT) as u32,
         };
         x86::lgdt(&gdt_ptr);
-
         x86::reload_segments(KERNEL_DS, KERNEL_CS);
     }
 

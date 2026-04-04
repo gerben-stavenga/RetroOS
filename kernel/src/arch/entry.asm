@@ -1,5 +1,5 @@
 ; RetroOS Kernel Entry Assembly
-; Stack switching and interrupt entry points
+; Multiboot header, boot stub with offset GDT, interrupt entry points
 ; Supports both 32-bit and 64-bit userspace with unified Regs struct
 
 %ifidn __OUTPUT_FORMAT__,elf
@@ -9,21 +9,98 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 section .note.GNU-stack noalloc noexec nowrite progbits
 %endif
 
+; Constants from linker script
+KERNEL_BASE equ 0xC0B00000
+KERNEL_PHYS equ 0x00100000
+SEG_OFFSET  equ KERNEL_PHYS - KERNEL_BASE  ; wraps to 0x40600000
+
+; =============================================================================
+; Multiboot header (must be in first 8KB of binary)
+; =============================================================================
+section .multiboot
+align 4
+MULTIBOOT_MAGIC  equ 0x1BADB002
+MULTIBOOT_FLAGS  equ 0x00000003  ; align modules + provide memory map
+MULTIBOOT_CHECK  equ -(MULTIBOOT_MAGIC + MULTIBOOT_FLAGS)
+
+dd MULTIBOOT_MAGIC
+dd MULTIBOOT_FLAGS
+dd MULTIBOOT_CHECK
+
+; =============================================================================
+; Boot entry stub — runs at physical address with offset segments
+; =============================================================================
+section .entry
+[bits 32]
+
+global _entry
+_entry:
+    ; We arrive here from the bootloader with paging off.
+    ; ELF was loaded at KERNEL_PHYS but linked at KERNEL_BASE.
+    ; Set up GDT segments with base = SEG_OFFSET so that linked
+    ; addresses (0xC0B0xxxx) access physical memory correctly via
+    ; 32-bit wrapping: 0xC0B0xxxx + 0x40600000 = 0x010xxxxx.
+
+    ; Save boot_data pointer (our bootloader passes in [esp+4])
+    mov esi, [esp + 4]
+
+    ; Load offset GDT — the GDT itself is at a linked address,
+    ; so we need to adjust the GDTR pointer to physical.
+    lgdt [boot_gdtr - KERNEL_BASE + KERNEL_PHYS]
+
+    ; Reload segments with offset-based descriptors
+    jmp 0x08:.reload_cs
+.reload_cs:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov fs, ax
+    mov gs, ax
+
+    ; Set kernel stack (linked address — works through offset segment)
+    extern KERNEL_STACK
+    lea esp, [KERNEL_STACK + 32 * 1024]
+    xor ebp, ebp
+
+    ; Call PrepareKernel(boot_data)
+    push esi
+    extern PrepareKernel
+    call PrepareKernel
+    ud2
+
+; =============================================================================
+; Boot GDT with offset segments
+; =============================================================================
+align 16
+boot_gdt:
+    ; Null descriptor
+    dq 0
+    ; Code segment (base = SEG_OFFSET = KERNEL_PHYS - KERNEL_BASE)
+    dw 0xFFFF                           ; limit low
+    dw (SEG_OFFSET & 0xFFFF)            ; base low
+    db (SEG_OFFSET >> 16) & 0xFF        ; base mid
+    db 0x9A                             ; access: present, ring 0, code, exec/read
+    db 0xCF                             ; flags: 4KB granularity, 32-bit + limit high
+    db (SEG_OFFSET >> 24) & 0xFF        ; base high
+    ; Data segment (base = SEG_OFFSET)
+    dw 0xFFFF
+    dw (SEG_OFFSET & 0xFFFF)
+    db (SEG_OFFSET >> 16) & 0xFF
+    db 0x92                             ; access: present, ring 0, data, read/write
+    db 0xCF
+    db (SEG_OFFSET >> 24) & 0xFF
+boot_gdt_end:
+
+boot_gdtr:
+    dw boot_gdt_end - boot_gdt - 1
+    dd boot_gdt - KERNEL_BASE + KERNEL_PHYS  ; physical address of GDT
+
 ; =============================================================================
 ; 32-bit code section
 ; =============================================================================
 section .text
 [bits 32]
-
-; Switch to a new stack and call a function
-; extern "C" fn switch_stack(new_stack: *mut u8, func: extern "C" fn()) -> !
-global SwitchStack
-SwitchStack:
-    mov eax, [esp + 8]  ; func arg
-    mov esp, [esp + 4]  ; new stack arg
-    xor ebp, ebp        ; ensure stack frame ends
-    call eax            ; should not return
-    ud2                 ; trap if it does
 
 ; Macro to push a 32-bit register as 64-bit (with high dword = 0)
 %macro push64_32 1

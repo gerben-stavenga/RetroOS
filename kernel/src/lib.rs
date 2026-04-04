@@ -1,9 +1,8 @@
 //! RetroOS Rust Kernel
 //!
 //! Entry flow:
-//! 1. PrepareKernel (runs at physical address, paging off, uses delta adjustment)
-//! 2. SwitchStack (assembly, switches to kernel stack)
-//! 3. KernelInit (runs with paging, at KERNEL_BASE)
+//! 1. _entry (asm stub: offset GDT, kernel stack, calls PrepareKernel)
+//! 2. PrepareKernel (enables paging, initializes kernel, drops to ring 1)
 
 #![no_std]
 #![no_main]
@@ -41,7 +40,6 @@ pub struct MMapEntry {
 /// Boot data passed from bootloader
 #[repr(C)]
 pub struct BootData {
-    pub kernel: *const u8,
     pub start_sector: u32,
     pub cursor_pos: u32,
     pub mmap_count: i32,
@@ -72,6 +70,7 @@ impl<const N: usize> AlignedStack<N> {
 }
 
 /// Kernel stack - 32KB (used for Ring 1 event loop)
+#[unsafe(no_mangle)]
 pub static mut KERNEL_STACK: AlignedStack<{ 32 * 1024 }> = AlignedStack::new();
 
 /// Ring-0 arch stack — used as TSS ESP0 so that interrupts from ring 1/3

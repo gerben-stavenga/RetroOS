@@ -373,16 +373,6 @@ impl Entry for Entry64 {
 #[repr(transparent)]
 pub struct PageTable32(pub RawPage);
 
-impl PageTable32 {
-    pub fn phys_addr(&self) -> u64 {
-        self as *const _ as u64
-    }
-
-    pub fn phys_page(&self) -> u64 {
-        self.phys_addr() >> 12
-    }
-}
-
 impl Index<usize> for PageTable32 {
     type Output = Entry32;
     fn index(&self, idx: usize) -> &Entry32 { 
@@ -400,16 +390,6 @@ impl IndexMut<usize> for PageTable32 {
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct PageTable64(pub RawPage);
-
-impl PageTable64 {
-    pub fn phys_addr(&self) -> u64 {
-        self as *const _ as u64
-    }
-
-    pub fn phys_page(&self) -> u64 {
-        self.phys_addr() >> 12
-    }
-}
 
 impl Index<usize> for PageTable64 {
     type Output = Entry64;
@@ -985,6 +965,15 @@ pub fn enable_nx() {
     }
 }
 
+fn boot_phys_page(page: &RawPage) -> u64 {
+    let va = page as *const _ as usize;
+    ((va - KERNEL_BASE + super::boot::KERNEL_PHYS) >> 12) as u64
+}
+
+fn boot_phys_addr(page: &RawPage) -> u64 {
+    boot_phys_page(page) << 12
+}
+
 /// Enable legacy paging (32-bit, 2-level)
 ///
 /// PD[0] = identity map first 4MB (uses scratch page, temporary)
@@ -1018,17 +1007,16 @@ pub fn enable_legacy(kpages: &mut LegacyPages, scratch: &mut PageTable32, kernel
 
     // Setup page directory
     // PD[0] = identity (first 4MB) using scratch
-    kpages.pd[0] = Entry32::new(scratch.phys_page(), true, false);
+    kpages.pd[0] = Entry32::new(boot_phys_page(&scratch.0), true, false);
 
     // PD[768] = recursive (0xC0000000 >> 22 = 768)
-    kpages.pd[768] = Entry32::new(kpages.pd.phys_page(), true, false);
+    kpages.pd[768] = Entry32::new(boot_phys_page(&kpages.pd.0), true, false);
 
     // PD[770] = kernel region (0xC0800000 >> 22 = 770)
-    kpages.pd[770] = Entry32::new(kpages.pt_kernel.phys_page(), true, false);
+    kpages.pd[770] = Entry32::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
 
     unsafe {
-        // Load CR3 and enable paging (phys_addr fits in 32 bits during boot)
-        crate::arch::x86::write_cr3(kpages.pd.phys_addr() as u32);
+        crate::arch::x86::write_cr3(boot_phys_addr(&kpages.pd.0) as u32);
         let cr0 = crate::arch::x86::read_cr0();
         crate::arch::x86::write_cr0(cr0 | crate::arch::x86::cr0::PG | crate::arch::x86::cr0::WP);
     }
@@ -1048,8 +1036,8 @@ pub fn enable_legacy(kpages: &mut LegacyPages, scratch: &mut PageTable32, kernel
 pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: usize) {
     // Identity map using scratch as PD: scratch[0] = scratch (self-ref PT for 0-2MB),
     // scratch[1] = pt_pml4 (PT for 2-4MB, temporarily borrowed)
-    scratch[0] = Entry64::new(scratch.phys_page(), true, false);
-    scratch[1] = Entry64::new(kpages.pt_pml4.phys_page(), true, false);
+    scratch[0] = Entry64::new(boot_phys_page(&scratch.0), true, false);
+    scratch[1] = Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false);
     for i in 2..512 {
         scratch[i] = Entry64::new(i as u64, true, false);
     }
@@ -1076,10 +1064,10 @@ pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys:
     }
 
     // Setup PDPT (virtual root — has R/W bits for COW tracking)
-    kpages.pdpt[0] = Entry64::new(scratch.phys_page(), true, false);
-    kpages.pdpt[3] = Entry64::new(kpages.pdpt.phys_page(), true, false);
-    kpages.pdpt[4] = Entry64::new(kpages.pt_pml4.phys_page(), true, false);
-    kpages.pdpt[5] = Entry64::new(kpages.pt_kernel.phys_page(), true, false);
+    kpages.pdpt[0] = Entry64::new(boot_phys_page(&scratch.0), true, false);
+    kpages.pdpt[3] = Entry64::new(boot_phys_page(&kpages.pdpt.0), true, false);
+    kpages.pdpt[4] = Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false);
+    kpages.pdpt[5] = Entry64::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
 
     // Boot with virtual root in CR3 directly (R/W bits in PDPT[0..3] are
     // technically reserved, but OK for boot — we switch to the thread's
@@ -1087,7 +1075,7 @@ pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys:
     let cr4 = crate::arch::x86::read_cr4();
     unsafe {
         crate::arch::x86::write_cr4(cr4 | crate::arch::x86::cr4::PAE);
-        crate::arch::x86::write_cr3(kpages.pdpt.phys_addr() as u32);
+        crate::arch::x86::write_cr3(boot_phys_addr(&kpages.pdpt.0) as u32);
         let cr0 = crate::arch::x86::read_cr0();
         crate::arch::x86::write_cr0(cr0 | crate::arch::x86::cr0::PG | crate::arch::x86::cr0::WP);
     }
