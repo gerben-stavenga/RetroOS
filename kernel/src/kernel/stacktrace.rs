@@ -63,19 +63,24 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 /// Initialize kernel symbol table by loading kernel.elf from TAR filesystem
 pub fn init_from_tar() {
     // Try both mount layouts (TAR at root or at tar/)
-    let mut fd = vfs::open(b"kernel.elf");
-    if fd < 0 { fd = vfs::open(b"tar/kernel.elf"); }
+    // Use boot thread's fds for kernel-internal VFS access
+    let fds = match &mut thread::current().mode {
+        thread::ThreadMode::Dos(d) => &mut d.fds,
+        thread::ThreadMode::Linux(l) => &mut l.fds,
+    };
+    let mut fd = vfs::open(b"kernel.elf", fds);
+    if fd < 0 { fd = vfs::open(b"tar/kernel.elf", fds); }
     if fd < 0 {
         println!("stacktrace: kernel.elf not found");
         return;
     }
-    let size = vfs::file_size(fd) as usize;
+    let size = vfs::file_size(fd, fds) as usize;
 
     println!("Loading kernel.elf ({} bytes) for symbols", size);
 
     let mut elf_data = vec![0u8; size];
-    vfs::read(fd, &mut elf_data);
-    vfs::close(fd);
+    vfs::read(fd, &mut elf_data, fds);
+    vfs::close(fd, fds);
 
     let elf_box: Box<[u8]> = elf_data.into_boxed_slice();
 
@@ -208,8 +213,11 @@ fn lookup_symbol(addr: u64) -> (&'static str, u64) {
         }
     } else {
         // User address - use current thread's symbols
-        let thread = thread::current();
-        if let Some(ref symbols) = thread.symbols {
+        let syms = match &thread::current().mode {
+            thread::ThreadMode::Dos(d) => &d.symbols,
+            thread::ThreadMode::Linux(l) => &l.symbols,
+        };
+        if let Some(symbols) = syms {
             let (name, offset) = symbols.lookup(addr);
             if !name.is_empty() {
                 // SAFETY: thread symbols live as long as thread

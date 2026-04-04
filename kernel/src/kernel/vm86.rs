@@ -755,13 +755,13 @@ impl VirtualKeyboard {
 
 /// Strip PS/2 E0 prefix — DOS games expect XT-style scancodes.
 /// E0 is consumed; the following scancode passes through as its legacy equivalent.
-fn normalize_vm86_scancode(thread: &mut thread::Thread, scancode: u8) -> Option<u8> {
+fn normalize_vm86_scancode(dos: &mut thread::DosState, scancode: u8) -> Option<u8> {
     if scancode == 0xE0 {
-        thread.vm86.e0_pending = true;
+        dos.vm86.e0_pending = true;
         return None;
     }
-    if thread.vm86.e0_pending {
-        thread.vm86.e0_pending = false;
+    if dos.vm86.e0_pending {
+        dos.vm86.e0_pending = false;
     }
     Some(scancode)
 }
@@ -786,8 +786,8 @@ fn pop_bios_keyboard_word() -> Option<u16> {
     Some(word)
 }
 
-fn poll_dos_console_char() -> Option<u8> {
-    let vm86 = &mut thread::current().vm86;
+fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
+    let vm86 = &mut dos.vm86;
     if let Some(ch) = vm86.dos_pending_char.take() {
         return Some(ch);
     }
@@ -1109,7 +1109,7 @@ impl EmsState {
 // ============================================================================
 
 /// Emulate IN from a port.
-pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
+pub(crate) fn emulate_inb(dos: &mut thread::DosState, port: u16) -> Result<u8, Action> {
     match port {
         // VGA Input Status 1: synthesize retrace signal.
         // Cycle (32 reads): 0-15 display active (0x00), 16-23 HBL (0x01),
@@ -1133,16 +1133,16 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
         // VGA ports — pass through to hardware
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => Ok(crate::arch::inb(port)),
         // Master PIC command (read ISR)
-        0x20 => Ok(thread::current().vm86.vpic.isr),
+        0x20 => Ok(dos.vm86.vpic.isr),
         // Master PIC data (read IMR)
-        0x21 => Ok(thread::current().vm86.vpic.imr),
+        0x21 => Ok(dos.vm86.vpic.imr),
         // Keyboard data port — returns current scancode from the virtual 8042.
-        0x60 => Ok(thread::current().vm86.vkbd.read_port60()),
+        0x60 => Ok(dos.vm86.vkbd.read_port60()),
         // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
-        0x61 => Ok(thread::current().vm86.vkbd.read_port61()),
+        0x61 => Ok(dos.vm86.vkbd.read_port61()),
         // Keyboard status port (bit 0 = output buffer full)
-        0x64 => Ok(if thread::current().vm86.vkbd.has_data() { 1 } else { 0 }),
-        0x40 => Ok(thread::current().vm86.vpit.read_counter0()),
+        0x64 => Ok(if dos.vm86.vkbd.has_data() { 1 } else { 0 }),
+        0x40 => Ok(dos.vm86.vpit.read_counter0()),
         0x41 | 0x42 => Ok(0),
         // PIT command register not readable
         0x43 => Ok(0xFF),
@@ -1152,7 +1152,7 @@ pub(crate) fn emulate_inb(port: u16) -> Result<u8, Action> {
 }
 
 /// Emulate OUT to a port.
-pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
+pub(crate) fn emulate_outb(dos: &mut thread::DosState, port: u16, val: u8) -> Result<(), Action> {
     match port {
         // VGA ports — pass through to hardware, track AC flip-flop + index
         0x3C0 => {
@@ -1173,25 +1173,24 @@ pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
         0x20 => {
             if val == 0x20 {
                 // Non-specific EOI
-                let t = thread::current();
                 // If keyboard IRQ (bit 1) was in service, and the virtual 8042
                 // still has data ready, IRQ1 should assert again after EOI.
-                let keyboard_in_service = t.vm86.vpic.isr & 0x02 != 0;
-                t.vm86.vpic.eoi();
+                let keyboard_in_service = dos.vm86.vpic.isr & 0x02 != 0;
+                dos.vm86.vpic.eoi();
                 // Real hardware effectively re-asserts IRQ1 if more scancodes are
                 // already visible in the controller when the handler finishes.
                 if keyboard_in_service
-                    && t.vm86.vkbd.has_data()
-                    && !t.vm86.vpic.has_pending_vec(0x09)
+                    && dos.vm86.vkbd.has_data()
+                    && !dos.vm86.vpic.has_pending_vec(0x09)
                 {
-                    t.vm86.vpic.push(0x09);
+                    dos.vm86.vpic.push(0x09);
                 }
             }
             Ok(())
         }
         // Master PIC data (write IMR)
         0x21 => {
-            thread::current().vm86.vpic.imr = val;
+            dos.vm86.vpic.imr = val;
             Ok(())
         }
         // Slave PIC command
@@ -1200,17 +1199,17 @@ pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
         0xA1 => Ok(()),
         // Keyboard controller / speaker port
         0x61 => {
-            thread::current().vm86.vkbd.write_port61(val);
+            dos.vm86.vkbd.write_port61(val);
             Ok(())
         }
         // Keyboard controller command
         0x64 => Ok(()),
         0x43 => {
-            thread::current().vm86.vpit.write_command(val);
+            dos.vm86.vpit.write_command(val);
             Ok(())
         }
         0x40 => {
-            thread::current().vm86.vpit.write_counter0(val);
+            dos.vm86.vpit.write_counter0(val);
             Ok(())
         }
         0x41 | 0x42 => Ok(()),
@@ -1225,20 +1224,20 @@ pub(crate) fn emulate_outb(port: u16, val: u8) -> Result<(), Action> {
 
 /// Buffer a hardware event into the virtual PIC / keyboard buffer.
 /// Mode-independent: both VM86 and DPMI share the same virtual devices.
-pub fn queue_irq(thread: &mut thread::Thread, event: crate::arch::Irq) {
+pub fn queue_irq(dos: &mut thread::DosState, event: crate::arch::Irq) {
     use crate::arch::Irq;
     match event {
         Irq::Key(sc) => {
-            let Some(sc) = normalize_vm86_scancode(thread, sc) else { return };
-            thread.vm86.vkbd.push(sc);
-            if thread.vm86.vpic.isr & 0x02 == 0 && !thread.vm86.vpic.has_pending_vec(0x09) {
-                thread.vm86.vpic.push(0x09);
+            let Some(sc) = normalize_vm86_scancode(dos, sc) else { return };
+            dos.vm86.vkbd.push(sc);
+            if dos.vm86.vpic.isr & 0x02 == 0 && !dos.vm86.vpic.has_pending_vec(0x09) {
+                dos.vm86.vpic.push(0x09);
             }
         }
         Irq::Tick => {
-            let due = thread.vm86.vpit.take_pending_irqs();
+            let due = dos.vm86.vpit.take_pending_irqs();
             for _ in 0..due {
-                thread.vm86.vpic.push(0x08);
+                dos.vm86.vpic.push(0x08);
             }
         }
     }
@@ -1247,42 +1246,39 @@ pub fn queue_irq(thread: &mut thread::Thread, event: crate::arch::Irq) {
 /// Try to deliver one pending interrupt from the virtual PIC.
 /// IF is the virtual interrupt flag (arch swaps VIF↔IF at ring 3 boundary).
 /// Works for both VM86 (IVT reflect) and DPMI (PM vector dispatch).
-pub fn raise_pending(thread: &mut thread::Thread, regs: &mut Regs) {
+pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
     let is_pm = regs.mode() != crate::UserMode::VM86;
     if !vif && !is_pm {
-        if thread.vm86.vpic.has_pending() {
+        if dos.vm86.vpic.has_pending() {
             regs.frame.rflags |= 1u64 << 20; // VIP
         }
         return;
     }
-    if thread.vm86.vpic.isr != 0 {
+    if dos.vm86.vpic.isr != 0 {
         return;
     }
-    let vec = match thread.vm86.vpic.pop() {
+    let vec = match dos.vm86.vpic.pop() {
         Some(v) => v,
         None => return,
     };
     if vec == 0x09 {
-        if !thread.vm86.vkbd.latch() {
-            thread.vm86.vpic.push(0x09);
+        if !dos.vm86.vkbd.latch() {
+            dos.vm86.vpic.push(0x09);
             return;
         }
     }
     let irq_num = vec.wrapping_sub(8);
     if irq_num < 8 {
-        thread.vm86.vpic.isr |= 1 << irq_num;
+        dos.vm86.vpic.isr |= 1 << irq_num;
     }
     // Clear VIP — interrupt is being serviced
     regs.frame.rflags &= !(1u64 << 20);
 
     if regs.mode() == crate::UserMode::VM86 {
-        // reflect_interrupt pushes original FLAGS (with IF=1) then clears IF
         reflect_interrupt(regs, vec);
     } else {
-        // DPMI: don't clear virtual IF — ring 3 IRET can't restore it.
-        // ISR prevents re-entry; client uses CLI/STI for critical sections.
-        crate::kernel::dpmi::deliver_hw_irq(thread, regs, vec);
+        crate::kernel::dpmi::deliver_hw_irq(dos, regs, vec);
     }
 }
 
@@ -1385,46 +1381,40 @@ pub(crate) enum Action {
 
 /// VM86 monitor — called from GP fault handler when EFLAGS.VM=1.
 /// Arch boundary swaps VIF↔IF, so IF is the virtual interrupt flag throughout.
-pub fn vm86_monitor(regs: &mut Regs) -> Option<usize> {
-    let t = thread::current();
-    let action = monitor_impl(regs);
-
+pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+    let action = monitor_impl(dos, regs);
     match action {
         Action::Done => None,
         Action::Switch(idx) => Some(idx),
-        Action::Yield => {
-            thread::save_state(t, regs);
-            t.state = thread::ThreadState::Ready;
-            thread::schedule()
-        }
+        Action::Yield => thread::yield_current(regs),
     }
 }
 
 /// Inner monitor — EFLAGS.IF reflects VIF throughout.
-fn monitor_impl(regs: &mut Regs) -> Action {
+fn monitor_impl(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     let opcode = fetch_byte(regs);
 
     match opcode {
         // INT n (0xCD nn)
         0xCD => {
             let int_num = fetch_byte(regs);
-            handle_vm86_int(regs, int_num)
+            handle_vm86_int(dos, regs, int_num)
         }
         // INT3 (0xCC) — single-byte software interrupt
         0xCC => {
-            handle_vm86_int(regs, 0x03)
+            handle_vm86_int(dos, regs, 0x03)
         }
         // INTO (0xCE) — software interrupt on overflow
         0xCE => {
             if vm86_flags(regs) & (1 << 11) != 0 {
-                handle_vm86_int(regs, 0x04)
+                handle_vm86_int(dos, regs, 0x04)
             } else {
                 Action::Done
             }
         }
         // INT1 / ICEBP (0xF1) — single-byte software interrupt
         0xF1 => {
-            handle_vm86_int(regs, 0x01)
+            handle_vm86_int(dos, regs, 0x01)
         }
         // IRET (0xCF) — pop IP, CS, FLAGS from VM86 stack
         // IOPL and VM are preserved (VM86 code cannot change them)
@@ -1464,7 +1454,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         // INSB (0x6C) — IN byte from port DX to ES:DI, advance DI
         0x6C => {
             let port = regs.rdx as u16;
-            let val = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
+            let val = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
             write_u16(regs.es as u32, regs.rdi as u32, val as u16);
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rdi = regs.rdi.wrapping_sub(1); // DF=1
@@ -1476,8 +1466,8 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         // INSW (0x6D) — IN word from port DX to ES:DI, advance DI
         0x6D => {
             let port = regs.rdx as u16;
-            let lo = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-            let hi = match emulate_inb(port + 1) { Ok(v) => v, Err(a) => return a };
+            let lo = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+            let hi = match emulate_inb(dos, port + 1) { Ok(v) => v, Err(a) => return a };
             let val = (hi as u16) << 8 | lo as u16;
             write_u16(regs.es as u32, regs.rdi as u32, val);
             if vm86_flags(regs) & (1 << 10) != 0 {
@@ -1491,7 +1481,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         0x6E => {
             let port = regs.rdx as u16;
             let val = read_u16(regs.ds as u32, regs.rsi as u32) as u8;
-            if let Err(a) = emulate_outb(port, val) { return a; }
+            if let Err(a) = emulate_outb(dos, port, val) { return a; }
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(1);
             } else {
@@ -1503,8 +1493,8 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         0x6F => {
             let port = regs.rdx as u16;
             let val = read_u16(regs.ds as u32, regs.rsi as u32);
-            if let Err(a) = emulate_outb(port, val as u8) { return a; }
-            if let Err(a) = emulate_outb(port + 1, (val >> 8) as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port, val as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port + 1, (val >> 8) as u8) { return a; }
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(2);
             } else {
@@ -1515,59 +1505,59 @@ fn monitor_impl(regs: &mut Regs) -> Action {
         // IN AL, imm8 (0xE4)
         0xE4 => {
             let port = fetch_byte(regs) as u16;
-            let val = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
+            let val = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
             regs.rax = (regs.rax & !0xFF) | val as u64;
             Action::Done
         }
         // IN AX, imm8 (0xE5)
         0xE5 => {
             let port = fetch_byte(regs) as u16;
-            let lo = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-            let hi = match emulate_inb(port + 1) { Ok(v) => v, Err(a) => return a };
+            let lo = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+            let hi = match emulate_inb(dos, port + 1) { Ok(v) => v, Err(a) => return a };
             regs.rax = (regs.rax & !0xFFFF) | (hi as u64) << 8 | lo as u64;
             Action::Done
         }
         // OUT imm8, AL (0xE6)
         0xE6 => {
             let port = fetch_byte(regs) as u16;
-            if let Err(a) = emulate_outb(port, regs.rax as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port, regs.rax as u8) { return a; }
             Action::Done
         }
         // OUT imm8, AX (0xE7)
         0xE7 => {
             let port = fetch_byte(regs) as u16;
             let val = regs.rax as u16;
-            if let Err(a) = emulate_outb(port, val as u8) { return a; }
-            if let Err(a) = emulate_outb(port + 1, (val >> 8) as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port, val as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port + 1, (val >> 8) as u8) { return a; }
             Action::Done
         }
         // IN AL, DX (0xEC)
         0xEC => {
             let port = regs.rdx as u16;
-            let val = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
+            let val = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
             regs.rax = (regs.rax & !0xFF) | val as u64;
             Action::Done
         }
         // IN AX, DX (0xED)
         0xED => {
             let port = regs.rdx as u16;
-            let lo = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-            let hi = match emulate_inb(port + 1) { Ok(v) => v, Err(a) => return a };
+            let lo = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+            let hi = match emulate_inb(dos, port + 1) { Ok(v) => v, Err(a) => return a };
             regs.rax = (regs.rax & !0xFFFF) | (hi as u64) << 8 | lo as u64;
             Action::Done
         }
         // OUT DX, AL (0xEE)
         0xEE => {
             let port = regs.rdx as u16;
-            if let Err(a) = emulate_outb(port, regs.rax as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port, regs.rax as u8) { return a; }
             Action::Done
         }
         // OUT DX, AX (0xEF)
         0xEF => {
             let port = regs.rdx as u16;
             let val = regs.rax as u16;
-            if let Err(a) = emulate_outb(port, val as u8) { return a; }
-            if let Err(a) = emulate_outb(port + 1, (val >> 8) as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port, val as u8) { return a; }
+            if let Err(a) = emulate_outb(dos, port + 1, (val >> 8) as u8) { return a; }
             Action::Done
         }
         // 0x66 prefix — operand-size override (32-bit in VM86 16-bit mode)
@@ -1600,10 +1590,10 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                 // IN EAX, imm8
                 0xE5 => {
                     let port = fetch_byte(regs) as u16;
-                    let b0 = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-                    let b1 = match emulate_inb(port + 1) { Ok(v) => v, Err(a) => return a };
-                    let b2 = match emulate_inb(port + 2) { Ok(v) => v, Err(a) => return a };
-                    let b3 = match emulate_inb(port + 3) { Ok(v) => v, Err(a) => return a };
+                    let b0 = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+                    let b1 = match emulate_inb(dos, port + 1) { Ok(v) => v, Err(a) => return a };
+                    let b2 = match emulate_inb(dos, port + 2) { Ok(v) => v, Err(a) => return a };
+                    let b3 = match emulate_inb(dos, port + 3) { Ok(v) => v, Err(a) => return a };
                     regs.rax = (regs.rax & !0xFFFFFFFF) | (b3 as u64) << 24 | (b2 as u64) << 16 | (b1 as u64) << 8 | b0 as u64;
                     Action::Done
                 }
@@ -1611,19 +1601,19 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                 0xE7 => {
                     let port = fetch_byte(regs) as u16;
                     let val = regs.rax as u32;
-                    if let Err(a) = emulate_outb(port, val as u8) { return a; }
-                    if let Err(a) = emulate_outb(port + 1, (val >> 8) as u8) { return a; }
-                    if let Err(a) = emulate_outb(port + 2, (val >> 16) as u8) { return a; }
-                    if let Err(a) = emulate_outb(port + 3, (val >> 24) as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port, val as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port + 1, (val >> 8) as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port + 2, (val >> 16) as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port + 3, (val >> 24) as u8) { return a; }
                     Action::Done
                 }
                 // IN EAX, DX
                 0xED => {
                     let port = regs.rdx as u16;
-                    let b0 = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-                    let b1 = match emulate_inb(port + 1) { Ok(v) => v, Err(a) => return a };
-                    let b2 = match emulate_inb(port + 2) { Ok(v) => v, Err(a) => return a };
-                    let b3 = match emulate_inb(port + 3) { Ok(v) => v, Err(a) => return a };
+                    let b0 = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+                    let b1 = match emulate_inb(dos, port + 1) { Ok(v) => v, Err(a) => return a };
+                    let b2 = match emulate_inb(dos, port + 2) { Ok(v) => v, Err(a) => return a };
+                    let b3 = match emulate_inb(dos, port + 3) { Ok(v) => v, Err(a) => return a };
                     regs.rax = (regs.rax & !0xFFFFFFFF) | (b3 as u64) << 24 | (b2 as u64) << 16 | (b1 as u64) << 8 | b0 as u64;
                     Action::Done
                 }
@@ -1631,19 +1621,19 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                 0xEF => {
                     let port = regs.rdx as u16;
                     let val = regs.rax as u32;
-                    if let Err(a) = emulate_outb(port, val as u8) { return a; }
-                    if let Err(a) = emulate_outb(port + 1, (val >> 8) as u8) { return a; }
-                    if let Err(a) = emulate_outb(port + 2, (val >> 16) as u8) { return a; }
-                    if let Err(a) = emulate_outb(port + 3, (val >> 24) as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port, val as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port + 1, (val >> 8) as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port + 2, (val >> 16) as u8) { return a; }
+                    if let Err(a) = emulate_outb(dos, port + 3, (val >> 24) as u8) { return a; }
                     Action::Done
                 }
                 // INSD
                 0x6D => {
                     let port = regs.rdx as u16;
-                    let b0 = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-                    let b1 = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-                    let b2 = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
-                    let b3 = match emulate_inb(port) { Ok(v) => v, Err(a) => return a };
+                    let b0 = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+                    let b1 = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+                    let b2 = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
+                    let b3 = match emulate_inb(dos, port) { Ok(v) => v, Err(a) => return a };
                     let addr = (regs.es as u32) * 16 + (regs.rdi as u16 as u32);
                     unsafe {
                         *(addr as *mut u8) = b0;
@@ -1663,10 +1653,10 @@ fn monitor_impl(regs: &mut Regs) -> Action {
                     let port = regs.rdx as u16;
                     let addr = (regs.ds as u32) * 16 + (regs.rsi as u16 as u32);
                     unsafe {
-                        let _ = emulate_outb(port, *(addr as *const u8));
-                        let _ = emulate_outb(port, *((addr + 1) as *const u8));
-                        let _ = emulate_outb(port, *((addr + 2) as *const u8));
-                        let _ = emulate_outb(port, *((addr + 3) as *const u8));
+                        let _ = emulate_outb(dos, port, *(addr as *const u8));
+                        let _ = emulate_outb(dos, port, *((addr + 1) as *const u8));
+                        let _ = emulate_outb(dos, port, *((addr + 2) as *const u8));
+                        let _ = emulate_outb(dos, port, *((addr + 3) as *const u8));
                     }
                     if vm86_flags(regs) & (1 << 10) != 0 {
                         regs.rsi = regs.rsi.wrapping_sub(4);
@@ -1714,7 +1704,7 @@ fn monitor_impl(regs: &mut Regs) -> Action {
 /// Handle INT n from VM86 mode.
 /// With VME, only INTs whose bit is SET in the redirection bitmap trap here.
 /// Without VME, all INTs trap — unintercepted ones are reflected through IVT.
-fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
+fn handle_vm86_int(dos: &mut thread::DosState, regs: &mut Regs, int_num: u8) -> Action {
     if !crate::arch::int_intercepted(int_num) {
         reflect_interrupt(regs, int_num);
         return Action::Done;
@@ -1722,7 +1712,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
     match int_num {
         // INT 31h — unified stub dispatch (all intercepted INTs route through
         // IVT stubs that call INT 31h; dispatch by slot number)
-        STUB_INT => stub_dispatch(regs),
+        STUB_INT => stub_dispatch(dos, regs),
         _ => {
             panic!("VM86: INT {:02X} intercepted in bitmap but has no handler", int_num);
         }
@@ -1737,7 +1727,7 @@ fn handle_vm86_int(regs: &mut Regs, int_num: u8) -> Action {
 /// IVT-redirect stubs have a FLAGS/CS/IP frame on the VM86 stack from the
 /// original INT; far-call stubs have a CS/IP frame from CALL FAR.
 /// The kernel pops these frames directly — no RETF/RETF 2 in the stub.
-fn stub_dispatch(regs: &mut Regs) -> Action {
+fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     let ip = vm86_ip(regs);
     let cs = vm86_cs(regs);
 
@@ -1764,39 +1754,35 @@ fn stub_dispatch(regs: &mut Regs) -> Action {
     }
 
     let action = match slot {
-        SLOT_XMS => xms_dispatch(regs),
+        SLOT_XMS => xms_dispatch(dos, regs),
         SLOT_DPMI_ENTRY => {
-            let thread = thread::current();
-            crate::kernel::dpmi::dpmi_enter(thread, regs);
+            crate::kernel::dpmi::dpmi_enter(dos, regs);
             Action::Done
         }
         SLOT_CALLBACK_RET => {
-            let thread = thread::current();
-            crate::kernel::dpmi::callback_return(thread, regs);
+            crate::kernel::dpmi::callback_return(dos, regs);
             Action::Done
         }
         SLOT_RAW_REAL_TO_PM => {
-            let thread = thread::current();
-            crate::kernel::dpmi::raw_switch_real_to_pm(thread, regs);
+            crate::kernel::dpmi::raw_switch_real_to_pm(dos, regs);
             Action::Done
         }
         s if s >= SLOT_CB_ENTRY_BASE && s < SLOT_CB_ENTRY_END => {
             let cb_idx = (s - SLOT_CB_ENTRY_BASE) as usize;
-            let thread = thread::current();
-            crate::kernel::dpmi::callback_entry(thread, regs, cb_idx);
+            crate::kernel::dpmi::callback_entry(dos, regs, cb_idx);
             Action::Done
         }
         0x13 => int_13h(regs),
         0x20 => {
             // INT 20h — DOS program terminate
-            if let Some(parent) = thread::current().vm86.exec_parent.take() {
-                thread::current().vm86.last_child_exit_code = 0;
-                return exec_return(regs, parent);
+            if let Some(parent) = dos.vm86.exec_parent.take() {
+                dos.vm86.last_child_exit_code = 0;
+                return exec_return(dos, regs, parent);
             }
             let next = thread::exit_thread(0);
             Action::Switch(next)
         }
-        0x21 => int_21h(regs),
+        0x21 => int_21h(dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error
         0x25 | 0x26 => {
             crate::dbg_println!("INT {:02X} drive AL={:02X}", slot, regs.rax as u8);
@@ -1805,8 +1791,8 @@ fn stub_dispatch(regs: &mut Regs) -> Action {
             Action::Done
         }
         0x28 => Action::Done, // INT 28h — DOS idle
-        0x2E => int_2eh(regs),
-        0x2F => int_2fh(regs),
+        0x2E => int_2eh(dos, regs),
+        0x2F => int_2fh(dos, regs),
         SLOT_SAVE_RESTORE => Action::Done, // no-op far call (buffer size=0)
         _ => {
             panic!("VM86: INT 31h from unknown stub slot {:#04x} IP={:#06x}", slot, ip);
@@ -1890,7 +1876,7 @@ fn int_13h(regs: &mut Regs) -> Action {
 // DOS INT 21h — DOS services
 // ============================================================================
 
-fn int_21h(regs: &mut Regs) -> Action {
+fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
     if ah != 0x2C && ah != 0x2A { crate::dbg_println!("D21 {:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}", ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16); }
     match ah {
@@ -1903,7 +1889,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x06 => {
             let dl = regs.rdx as u8;
             if dl == 0xFF {
-                if let Some(ch) = poll_dos_console_char() {
+                if let Some(ch) = poll_dos_console_char(dos) {
                     regs.rax = (regs.rax & !0xFF) | ch as u64;
                     regs.clear_flag32(0x40); // clear ZF = char available
                 } else {
@@ -1966,7 +1952,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 let si = regs.rsi as u16 as u32;
                 let addr = ((regs.ds as u16 as u32) << 4) + si;
-                let cwd = thread::current().cwd_str();
+                let cwd = dos.cwd_str();
                 unsafe {
                     let mut pos = 0;
                     for &b in cwd {
@@ -1989,11 +1975,11 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x0C: Flush input buffer then execute function in AL
         0x0C => {
             clear_bios_keyboard_buffer();
-            thread::current().vm86.dos_pending_char = None;
+            dos.vm86.dos_pending_char = None;
             // Just execute the sub-function in AL
             let sub_ah = regs.rax as u8;
             if sub_ah == 0x06 {
-                if let Some(ch) = poll_dos_console_char() {
+                if let Some(ch) = poll_dos_console_char(dos) {
                     regs.rax = (regs.rax & !0xFF) | ch as u64;
                     regs.clear_flag32(0x40);
                 } else {
@@ -2011,12 +1997,12 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x1A => {
             // Store DTA address — NC needs this for FindFirst/FindNext
             let dta = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
-            thread::current().vm86.dta = dta;
+            dos.vm86.dta = dta;
             Action::Done
         }
         // AH=0x2F: Get DTA address (returns ES:BX)
         0x2F => {
-            let dta = thread::current().vm86.dta;
+            let dta = dos.vm86.dta;
             regs.es = (dta >> 4) as u64;
             regs.rbx = (regs.rbx & !0xFFFF) | (dta & 0x0F) as u64;
             Action::Done
@@ -2076,7 +2062,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 i += 1;
             }
             let i = dos_normalize_path(&mut path, i);
-            let result = dos_chdir(&path[..i]);
+            let result = dos_chdir(dos, &path[..i]);
             if result < 0 {
                 regs.set_flag32(1); // set CF
                 regs.rax = (regs.rax & !0xFFFF) | 3; // AX=3 path not found
@@ -2106,12 +2092,12 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 let i = dos_normalize_path(&mut name, i);
                 let mut rbuf = [0u8; 164];
-                let resolved = dos_resolve_path(&name[..i], &mut rbuf);
+                let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
                 let name_str = core::str::from_utf8(resolved).unwrap_or("?");
-                let fd = crate::kernel::vfs::open(resolved);
+                let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
-                    let size = crate::kernel::vfs::file_size(fd);
+                    let size = crate::kernel::vfs::file_size(fd, &dos.fds);
                     sft_set_file(fd as u16, size);
                     unsafe {
                         let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
@@ -2132,7 +2118,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         0x3E => {
             let handle = regs.rbx as u16;
             if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
-                crate::kernel::vfs::close(handle as i32);
+                crate::kernel::vfs::close(handle as i32, &mut dos.fds);
                 sft_clear(handle);
             }
             regs.clear_flag32(1);
@@ -2160,7 +2146,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 regs.clear_flag32(1);
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
-                let n = crate::kernel::vfs::read(handle, buf);
+                let n = crate::kernel::vfs::read(handle, buf, &dos.fds);
                 if n >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     regs.clear_flag32(1);
@@ -2186,12 +2172,12 @@ fn int_21h(regs: &mut Regs) -> Action {
                 pat_len += 1;
             }
             // Search from index 0
-            find_matching_file(regs, &pat[..pat_len], 0)
+            find_matching_file(dos, regs, &pat[..pat_len], 0)
         }
         // AH=0x4F: Find next matching file
         0x4F => {
             // Read the stored search index from DTA reserved bytes
-            let dta = thread::current().vm86.dta as *const u8;
+            let dta = dos.vm86.dta as *const u8;
             let pat_len = unsafe { *dta } as usize;
             let search_idx = unsafe { (dta.add(1) as *const u16).read_unaligned() } as usize;
             let mut pat = [0u8; 64];
@@ -2199,14 +2185,14 @@ fn int_21h(regs: &mut Regs) -> Action {
             unsafe {
                 core::ptr::copy_nonoverlapping(dta.add(3), pat.as_mut_ptr(), copy_len);
             }
-            find_matching_file(regs, &pat[..copy_len], search_idx)
+            find_matching_file(dos, regs, &pat[..copy_len], search_idx)
         }
         // AH=0x4C: Terminate with return code (AL)
         0x4C => {
             // If we're in an EXEC'd child, return to parent
-            if let Some(parent) = thread::current().vm86.exec_parent.take() {
-                thread::current().vm86.last_child_exit_code = regs.rax as u8;
-                return exec_return(regs, parent);
+            if let Some(parent) = dos.vm86.exec_parent.take() {
+                dos.vm86.last_child_exit_code = regs.rax as u8;
+                return exec_return(dos, regs, parent);
             }
             let code = regs.rax as u8;
             let next = thread::exit_thread(code as i32);
@@ -2215,11 +2201,10 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
             let need = regs.rbx as u16;
-            let t = thread::current();
-            let avail = 0xA000u16.saturating_sub(t.vm86.heap_seg);
+            let avail = 0xA000u16.saturating_sub(dos.vm86.heap_seg);
             if need <= avail {
-                let seg = t.vm86.heap_seg;
-                t.vm86.heap_seg += need;
+                let seg = dos.vm86.heap_seg;
+                dos.vm86.heap_seg += need;
                 regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                 regs.clear_flag32(1);
             } else {
@@ -2242,7 +2227,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             if new_end32 <= 0xA000 {
                 let new_end = new_end32 as u16;
                 // Program resizing its block — free memory starts after it
-                thread::current().vm86.heap_seg = new_end;
+                dos.vm86.heap_seg = new_end;
                 regs.clear_flag32(1);
             } else {
                 // Not enough memory — report max available
@@ -2323,8 +2308,8 @@ fn int_21h(regs: &mut Regs) -> Action {
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
-            let fd = crate::kernel::vfs::create(resolved);
+            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
+            let fd = crate::kernel::vfs::create(resolved, &mut dos.fds);
             if fd >= 0 {
                 crate::dbg_println!("  -> create fd={} {}", fd, core::str::from_utf8(resolved).unwrap_or("?"));
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
@@ -2352,7 +2337,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
                 let data = unsafe { core::slice::from_raw_parts(addr as *const u8, count as usize) };
-                let n = crate::kernel::vfs::write(handle as i32, data);
+                let n = crate::kernel::vfs::write(handle as i32, data, &dos.fds);
                 regs.rax = (regs.rax & !0xFFFF) | if n >= 0 { n as u64 } else { count as u64 };
                 regs.clear_flag32(1);
             }
@@ -2369,7 +2354,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else {
                 let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
                 let whence = regs.rax as u8 as i32; // AL = origin
-                let result = crate::kernel::vfs::seek(handle, offset, whence);
+                let result = crate::kernel::vfs::seek(handle, offset, whence, &dos.fds);
                 if result >= 0 {
                     // Return new position in DX:AX
                     regs.rdx = (regs.rdx & !0xFFFF) | ((result as u32 >> 16) as u64);
@@ -2400,11 +2385,11 @@ fn int_21h(regs: &mut Regs) -> Action {
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
+            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
             // Check if file exists by trying to open it
-            let fd = crate::kernel::vfs::open(resolved);
+            let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
             if fd >= 0 {
-                crate::kernel::vfs::close(fd);
+                crate::kernel::vfs::close(fd, &mut dos.fds);
                 if al == 0 {
                     // Get attributes: return 0x20 (archive) in CX
                     regs.rcx = (regs.rcx & !0xFFFF) | 0x20;
@@ -2504,7 +2489,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         // AH=0x4B: EXEC — Load and Execute Program
         // AL=00: load+execute, DS:DX=ASCIIZ filename, ES:BX=param block
         0x4B => {
-            exec_program(regs)
+            exec_program(dos, regs)
         }
         // AH=2Ah — Get System Date
         0x2A => {
@@ -2581,7 +2566,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                 // Relative — prepend C:\ + CWD
                 out[0] = b'C'; out[1] = b':'; out[2] = b'\\';
                 pos = 3;
-                let cwd = thread::current().cwd_str();
+                let cwd = dos.cwd_str();
                 for &ch in cwd {
                     if pos >= 127 { break; }
                     out[pos] = if ch == b'/' { b'\\' } else { ch.to_ascii_uppercase() };
@@ -2650,7 +2635,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
+            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
             crate::kernel::vfs::delete(resolved);
             regs.clear_flag32(1);
             Action::Done
@@ -2666,7 +2651,7 @@ fn int_21h(regs: &mut Regs) -> Action {
         }
         // AH=0x4D: Get Return Code of Subprocess
         0x4D => {
-            let code = thread::current().vm86.last_child_exit_code;
+            let code = dos.vm86.last_child_exit_code;
             regs.rax = (regs.rax & !0xFFFF) | code as u64; // AL=exit code, AH=0 (normal)
             Action::Done
         }
@@ -2695,14 +2680,14 @@ fn int_21h(regs: &mut Regs) -> Action {
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
+            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
             let open_exists = action & 0x01 != 0;
             let create_not = action & 0x10 != 0;
 
             // Try open first
-            let fd = crate::kernel::vfs::open(resolved);
+            let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
             if fd >= 0 && open_exists {
-                let size = crate::kernel::vfs::file_size(fd);
+                let size = crate::kernel::vfs::file_size(fd, &dos.fds);
                 sft_set_file(fd as u16, size);
                 unsafe {
                     let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
@@ -2713,8 +2698,8 @@ fn int_21h(regs: &mut Regs) -> Action {
                 regs.clear_flag32(1);
             } else if create_not {
                 // File doesn't exist — create RAM-backed file via VFS overlay
-                if fd >= 0 { crate::kernel::vfs::close(fd); }
-                let new_fd = crate::kernel::vfs::create(resolved);
+                if fd >= 0 { crate::kernel::vfs::close(fd, &mut dos.fds); }
+                let new_fd = crate::kernel::vfs::create(resolved, &mut dos.fds);
                 if new_fd >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
@@ -2724,7 +2709,7 @@ fn int_21h(regs: &mut Regs) -> Action {
                     regs.set_flag32(1);
                 }
             } else {
-                if fd >= 0 { crate::kernel::vfs::close(fd); }
+                if fd >= 0 { crate::kernel::vfs::close(fd, &mut dos.fds); }
                 regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
                 regs.set_flag32(1);
             }
@@ -2745,7 +2730,7 @@ fn int_21h(regs: &mut Regs) -> Action {
 // INT 2Eh — COMMAND.COM internal execute
 // ============================================================================
 
-fn int_2eh(regs: &mut Regs) -> Action {
+fn int_2eh(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
     // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
     let ds = regs.ds as u16 as u32;
@@ -2767,14 +2752,14 @@ fn int_2eh(regs: &mut Regs) -> Action {
     let plen = end - start;
     cmd.copy_within(start..end, 0);
     let plen = dos_normalize_path(&mut cmd, plen);
-    fork_exec(regs, &cmd[..plen])
+    fork_exec(dos, regs, &cmd[..plen])
 }
 
 // ============================================================================
 // INT 2Fh — Multiplex interrupt (XMS + DPMI detection)
 // ============================================================================
 
-fn int_2fh(regs: &mut Regs) -> Action {
+fn int_2fh(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     let ax = regs.rax as u16;
     match ax {
         // AX=1687h — DPMI installation check
@@ -2816,15 +2801,15 @@ fn int_2fh(regs: &mut Regs) -> Action {
 // ============================================================================
 
 /// Ensure XMS state exists for current thread, return mutable reference
-fn xms_state() -> &'static mut XmsState {
-    let t = thread::current();
-    if t.vm86.xms.is_none() {
-        t.vm86.xms = Some(alloc::boxed::Box::new(XmsState::new()));
+fn xms_state(dos: &mut thread::DosState) -> &mut XmsState {
+    let vm86 = &mut dos.vm86;
+    if vm86.xms.is_none() {
+        vm86.xms = Some(alloc::boxed::Box::new(XmsState::new()));
     }
-    t.vm86.xms.as_deref_mut().unwrap()
+    vm86.xms.as_deref_mut().unwrap()
 }
 
-fn xms_dispatch(regs: &mut Regs) -> Action {
+fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — Get XMS version
@@ -2835,53 +2820,57 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         }
         // AH=03h — Global enable A20
         0x03 => {
-            let xms = xms_state();
+            let xms = xms_state(dos);
             xms.a20_global += 1;
-            crate::kernel::startup::arch_set_a20(true, &mut thread::current().vm86.hma_pages);
-            thread::current().vm86.a20_enabled = true;
+            let vm86 = &mut dos.vm86;
+            crate::kernel::startup::arch_set_a20(true, &mut vm86.hma_pages);
+            vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
             regs.rbx = (regs.rbx & !0xFFFF); // BL=0 no error
         }
         // AH=04h — Global disable A20
         0x04 => {
-            let xms = xms_state();
+            let xms = xms_state(dos);
             xms.a20_global = xms.a20_global.saturating_sub(1);
             if xms.a20_global == 0 && xms.a20_local == 0 {
-                crate::kernel::startup::arch_set_a20(false, &mut thread::current().vm86.hma_pages);
-                thread::current().vm86.a20_enabled = false;
+                let vm86 = &mut dos.vm86;
+                crate::kernel::startup::arch_set_a20(false, &mut vm86.hma_pages);
+                vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
         // AH=05h — Local enable A20
         0x05 => {
-            let xms = xms_state();
+            let xms = xms_state(dos);
             xms.a20_local += 1;
-            crate::kernel::startup::arch_set_a20(true, &mut thread::current().vm86.hma_pages);
-            thread::current().vm86.a20_enabled = true;
+            let vm86 = &mut dos.vm86;
+            crate::kernel::startup::arch_set_a20(true, &mut vm86.hma_pages);
+            vm86.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
         // AH=06h — Local disable A20
         0x06 => {
-            let xms = xms_state();
+            let xms = xms_state(dos);
             xms.a20_local = xms.a20_local.saturating_sub(1);
             if xms.a20_local == 0 && xms.a20_global == 0 {
-                crate::kernel::startup::arch_set_a20(false, &mut thread::current().vm86.hma_pages);
-                thread::current().vm86.a20_enabled = false;
+                let vm86 = &mut dos.vm86;
+                crate::kernel::startup::arch_set_a20(false, &mut vm86.hma_pages);
+                vm86.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
         // AH=07h — Query A20 state
         0x07 => {
-            let enabled = thread::current().vm86.a20_enabled;
+            let enabled = dos.vm86.a20_enabled;
             regs.rax = (regs.rax & !0xFFFF) | if enabled { 1 } else { 0 };
             regs.rbx = (regs.rbx & !0xFFFF);
         }
         // AH=08h — Query free extended memory
         0x08 => {
-            let xms = xms_state();
+            let xms = xms_state(dos);
             let largest = xms.largest_free_kb();
             let total = xms.free_kb();
             regs.rax = (regs.rax & !0xFFFF) | largest as u64; // largest free block (KB)
@@ -2890,7 +2879,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         // AH=09h — Allocate extended memory block (DX=size in KB)
         0x09 => {
             let size_kb = regs.rdx as u16;
-            let xms = xms_state();
+            let xms = xms_state(dos);
             let mut handle = None;
             for i in 0..MAX_XMS_HANDLES {
                 if xms.handles[i].is_none() {
@@ -2926,7 +2915,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         // AH=0Ah — Free extended memory block (DX=handle)
         0x0A => {
             let handle = regs.rdx as u16;
-            let xms = xms_state();
+            let xms = xms_state(dos);
             if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
                 if xms.handles[handle as usize - 1].take().is_some() {
                     regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -2941,12 +2930,12 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         }
         // AH=0Bh — Move extended memory block (DS:SI = move struct)
         0x0B => {
-            xms_move(regs);
+            xms_move(dos, regs);
         }
         // AH=0Ch — Lock extended memory block (DX=handle)
         0x0C => {
             let handle = regs.rdx as u16;
-            let xms = xms_state();
+            let xms = xms_state(dos);
             if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
                 if let Some(ref mut h) = xms.handles[handle as usize - 1] {
                     h.locked = true;
@@ -2966,7 +2955,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         // AH=0Dh — Unlock extended memory block (DX=handle)
         0x0D => {
             let handle = regs.rdx as u16;
-            let xms = xms_state();
+            let xms = xms_state(dos);
             if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
                 if let Some(ref mut h) = xms.handles[handle as usize - 1] {
                     h.locked = false;
@@ -2983,7 +2972,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         // AH=0Eh — Get EMB handle information (DX=handle)
         0x0E => {
             let handle = regs.rdx as u16;
-            let xms = xms_state();
+            let xms = xms_state(dos);
             if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
                 if let Some(ref h) = xms.handles[handle as usize - 1] {
                     let lock_count = if h.locked { 1u8 } else { 0 };
@@ -3006,7 +2995,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         0x0F => {
             let handle = regs.rdx as u16;
             let new_kb = regs.rbx as u16;
-            let xms = xms_state();
+            let xms = xms_state(dos);
             if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
                 if xms.handles[handle as usize - 1].is_some() {
                     let old = xms.handles[handle as usize - 1].take().unwrap();
@@ -3038,7 +3027,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
         }
         // AH=88h — Query free extended memory (32-bit, XMS 3.0)
         0x88 => {
-            let xms = xms_state();
+            let xms = xms_state(dos);
             let free = xms.free_kb() as u32;
             regs.rax = (regs.rax & !0xFFFF) | (free & 0xFFFF) as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | (free & 0xFFFF) as u64;
@@ -3088,7 +3077,7 @@ fn xms_dispatch(regs: &mut Regs) -> Action {
 ///   +06: u32 source offset (or seg:off if handle=0)
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
-fn xms_move(regs: &mut Regs) {
+fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
     let ds = regs.ds as u16 as u32;
     let si = regs.rsi as u16 as u32;
     let addr = (ds << 4) + si;
@@ -3106,7 +3095,7 @@ fn xms_move(regs: &mut Regs) {
     }
 
     // Resolve source to linear address
-    let xms = xms_state();
+    let xms = xms_state(dos);
     let src = if src_handle == 0 {
         // Conventional memory: offset is seg:off packed as off(16):seg(16)
         let seg = (src_offset >> 16) as u32;
@@ -3157,15 +3146,15 @@ fn xms_move(regs: &mut Regs) {
 // ============================================================================
 
 /// Ensure EMS state exists for current thread
-fn ems_state() -> &'static mut EmsState {
-    let t = thread::current();
-    if t.vm86.ems.is_none() {
-        t.vm86.ems = Some(alloc::boxed::Box::new(EmsState::new()));
+fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
+    let vm86 = &mut dos.vm86;
+    if vm86.ems.is_none() {
+        vm86.ems = Some(alloc::boxed::Box::new(EmsState::new()));
     }
-    t.vm86.ems.as_deref_mut().unwrap()
+    vm86.ems.as_deref_mut().unwrap()
 }
 
-fn int_67h(regs: &mut Regs) -> Action {
+fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=40h — Get status
@@ -3179,7 +3168,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         }
         // AH=42h — Get unallocated page count
         0x42 => {
-            let ems = ems_state();
+            let ems = ems_state(dos);
             let free = ems.alloc_pages();
             regs.rbx = (regs.rbx & !0xFFFF) | free as u64;     // BX = free pages
             regs.rdx = (regs.rdx & !0xFFFF) | EMS_TOTAL_PAGES as u64; // DX = total pages
@@ -3188,7 +3177,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         // AH=43h — Allocate handle (BX=pages needed, returns DX=handle)
         0x43 => {
             let pages_needed = regs.rbx as u16;
-            let ems = ems_state();
+            let ems = ems_state(dos);
             // Find free handle
             let mut handle = None;
             for i in 0..MAX_EMS_HANDLES {
@@ -3247,7 +3236,7 @@ fn int_67h(regs: &mut Regs) -> Action {
                 return Action::Done;
             }
 
-            let ems = ems_state();
+            let ems = ems_state(dos);
 
             // BX=FFFFh means unmap
             if log_page == 0xFFFF {
@@ -3280,7 +3269,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         // AH=45h — Release handle (DX=handle)
         0x45 => {
             let handle = regs.rdx as u16;
-            let ems = ems_state();
+            let ems = ems_state(dos);
             if (handle as usize) < MAX_EMS_HANDLES && ems.handles[handle as usize].is_some() {
                 // Unmap any windows using this handle
                 for w in 0..4 {
@@ -3311,7 +3300,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         }
         // AH=4Bh — Get number of open handles
         0x4B => {
-            let ems = ems_state();
+            let ems = ems_state(dos);
             let count = ems.handles.iter().filter(|h| h.is_some()).count() as u16;
             regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
             regs.rax = (regs.rax & !0xFF00);
@@ -3319,7 +3308,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         // AH=4Ch — Get pages allocated to handle (DX=handle)
         0x4C => {
             let handle = regs.rdx as u16;
-            let ems = ems_state();
+            let ems = ems_state(dos);
             if (handle as usize) < MAX_EMS_HANDLES {
                 if let Some(ref h) = ems.handles[handle as usize] {
                     regs.rbx = (regs.rbx & !0xFFFF) | h.pages.len() as u64;
@@ -3333,7 +3322,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         }
         // AH=4Dh — Get pages for all handles (ES:DI = buffer)
         0x4D => {
-            let ems = ems_state();
+            let ems = ems_state(dos);
             let es = regs.es as u32;
             let di = regs.rdi as u32;
             let mut addr = (es << 4) + di;
@@ -3361,7 +3350,7 @@ fn int_67h(regs: &mut Regs) -> Action {
             let si = regs.rsi as u16 as u32;
             let base_addr = (ds << 4) + si;
 
-            let ems = ems_state();
+            let ems = ems_state(dos);
             if (handle as usize) >= MAX_EMS_HANDLES || ems.handles[handle as usize].is_none() {
                 regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
                 return Action::Done;
@@ -3407,7 +3396,7 @@ fn int_67h(regs: &mut Regs) -> Action {
         0x51 => {
             let handle = regs.rdx as u16;
             let new_count = regs.rbx as u16;
-            let ems = ems_state();
+            let ems = ems_state(dos);
             if (handle as usize) >= MAX_EMS_HANDLES {
                 regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
                 return Action::Done;
@@ -3481,10 +3470,10 @@ fn int_67h(regs: &mut Regs) -> Action {
     Action::Done
 }
 
-fn dos_open_program(name: &[u8]) -> i32 {
+fn dos_open_program(dos: &mut thread::DosState, name: &[u8]) -> i32 {
     let mut rbuf = [0u8; 164];
-    let resolved = dos_resolve_path(name, &mut rbuf);
-    let fd = crate::kernel::vfs::open(resolved);
+    let resolved = dos_resolve_path(dos, name, &mut rbuf);
+    let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
     if fd >= 0 { return fd; }
     // If the name already has a dot, don't try extensions
     if name.iter().any(|&c| c == b'.') { return fd; }
@@ -3494,19 +3483,19 @@ fn dos_open_program(name: &[u8]) -> i32 {
     if rlen + 4 <= buf.len() {
         buf[..rlen].copy_from_slice(resolved);
         buf[rlen..rlen + 4].copy_from_slice(b".COM");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4]);
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut dos.fds);
         if fd >= 0 { return fd; }
     }
     // Try .EXE
     if rlen + 4 <= buf.len() {
         buf[rlen..rlen + 4].copy_from_slice(b".EXE");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4]);
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut dos.fds);
         if fd >= 0 { return fd; }
     }
     // Try .ELF
     if rlen + 4 <= buf.len() {
         buf[rlen..rlen + 4].copy_from_slice(b".ELF");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4]);
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut dos.fds);
         if fd >= 0 { return fd; }
     }
     -2 // ENOENT
@@ -3515,34 +3504,34 @@ fn dos_open_program(name: &[u8]) -> i32 {
 /// Fork-exec a program (DOS or ELF) in a fresh address space.
 /// Opens the file, forks a child, loads the program, blocks the parent.
 /// Used by COMMAND.COM /C (INT 21h/4Bh) and INT 2Eh.
-fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
-    crate::println!("fork_exec: parent heap_seg={:#06x}", thread::current().vm86.heap_seg);
-    let fd = dos_open_program(prog_name);
+fn fork_exec(dos: &mut thread::DosState, regs: &mut Regs, prog_name: &[u8]) -> Action {
+    crate::println!("fork_exec: parent heap_seg={:#06x}", dos.vm86.heap_seg);
+    let fd = dos_open_program(dos, prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
         regs.set_flag32(1);
         return Action::Done;
     }
-    let size = crate::kernel::vfs::seek(fd, 0, 2);
+    let size = crate::kernel::vfs::seek(fd, 0, 2, &dos.fds);
     if size <= 0 {
-        crate::kernel::vfs::close(fd);
+        crate::kernel::vfs::close(fd, &mut dos.fds);
         regs.rax = (regs.rax & !0xFFFF) | 2;
         regs.set_flag32(1);
         return Action::Done;
     }
-    crate::kernel::vfs::seek(fd, 0, 0);
+    crate::kernel::vfs::seek(fd, 0, 0, &dos.fds);
     let mut buf = alloc::vec![0u8; size as usize];
-    crate::kernel::vfs::read_raw(fd, &mut buf);
-    crate::kernel::vfs::close(fd);
+    crate::kernel::vfs::read_raw(fd, &mut buf, &dos.fds);
+    crate::kernel::vfs::close(fd, &mut dos.fds);
 
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
     let is_exe = !is_elf && is_mz_exe(&buf);
 
-    let current = thread::current();
+    let parent_tid = thread::current_tid();
     let mut child_root = crate::RootPageTable::empty();
     crate::kernel::startup::arch_user_fork(&mut child_root);
 
-    let child = match thread::create_thread(Some(current), child_root, true) {
+    let child = match thread::create_thread(Some(parent_tid), child_root, true) {
         Some(t) => t,
         None => {
             regs.rax = (regs.rax & !0xFFFF) | 8;
@@ -3592,14 +3581,27 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
         } else {
             thread::init_process_thread(child, loaded.entry as u32, stack.sp as u32);
         }
-        child.symbols = symbols;
+        match &mut child.mode {
+            thread::ThreadMode::Linux(l) => l.symbols = symbols,
+            thread::ThreadMode::Dos(d) => d.symbols = symbols,
+        }
     } else {
         crate::kernel::startup::arch_user_clean();
         crate::kernel::startup::arch_map_low_mem();
         setup_ivt();
 
+        // Resolve the full path so the PSP environment contains the complete
+        // pathname (e.g. "QUAKE/QUAKE.EXE" instead of just "QUAKE.EXE").
+        // DOS extenders like CWSDPMI read this to re-open the executable.
+        let mut resolved_buf = [0u8; 164];
+        let resolved = dos_resolve_path(dos, prog_name, &mut resolved_buf);
+        let rlen = resolved.len();
+        let mut resolved_copy = [0u8; 164];
+        resolved_copy[..rlen].copy_from_slice(resolved);
+        let resolved_name = &resolved_copy[..rlen];
+
         let (cs, ip, ss, sp, end_seg) = if is_exe {
-            match load_exe(&buf, prog_name) {
+            match load_exe(&buf, resolved_name) {
                 Some(t) => t,
                 None => {
                     crate::kernel::startup::arch_switch_to(
@@ -3613,7 +3615,7 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
                 }
             }
         } else {
-            load_com(&buf, prog_name)
+            load_com(&buf, resolved_name)
         };
 
         crate::kernel::startup::arch_switch_to(
@@ -3621,14 +3623,17 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
             core::ptr::null_mut(),
         );
 
-        child.mode = thread::ThreadMode::Dos;
         thread::init_process_thread_vm86(child, COM_SEGMENT, cs, ip, ss, sp);
-        child.vm86.heap_seg = end_seg;
-        child.vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;
+        child.dos_mut().vm86.heap_seg = end_seg;
+        child.dos_mut().vm86.dta = (COM_SEGMENT as u32) * 16 + 0x80;
     }
 
-    child.cwd = current.cwd;
-    child.cwd_len = current.cwd_len;
+    // Copy cwd from parent to child
+    match &mut child.mode {
+        thread::ThreadMode::Dos(d) => { d.cwd = dos.cwd; d.cwd_len = dos.cwd_len; }
+        thread::ThreadMode::Linux(l) => { l.cwd = dos.cwd; l.cwd_len = dos.cwd_len; }
+    }
+    crate::dbg_println!("fork_exec: child cwd={:?}", core::str::from_utf8(dos.cwd_str()));
 
     regs.clear_flag32(1);
     Action::Switch(child_idx)
@@ -3637,7 +3642,7 @@ fn fork_exec(regs: &mut Regs, prog_name: &[u8]) -> Action {
 /// DOS INT 4Bh EXEC — load and execute program.
 /// DOS programs: in-process exec (shared address space, like real DOS).
 /// ELF programs: fork into a separate thread.
-fn exec_program(regs: &mut Regs) -> Action {
+fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> Action {
     let al = regs.rax as u8;
     if al != 0 {
         regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -3701,34 +3706,34 @@ fn exec_program(regs: &mut Regs) -> Action {
     };
 
     if is_shell {
-        return fork_exec(regs, prog_name);
+        return fork_exec(dos, regs, prog_name);
     }
 
     // --- DOS program: in-process exec (shared address space) ---
-    let fd = dos_open_program(prog_name);
+    let fd = dos_open_program(dos, prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
         regs.set_flag32(1);
         return Action::Done;
     }
-    let size = crate::kernel::vfs::seek(fd, 0, 2);
+    let size = crate::kernel::vfs::seek(fd, 0, 2, &dos.fds);
     if size <= 0 {
-        crate::kernel::vfs::close(fd);
+        crate::kernel::vfs::close(fd, &mut dos.fds);
         regs.rax = (regs.rax & !0xFFFF) | 2;
         regs.set_flag32(1);
         return Action::Done;
     }
-    crate::kernel::vfs::seek(fd, 0, 0);
+    crate::kernel::vfs::seek(fd, 0, 0, &dos.fds);
     let mut buf = alloc::vec![0u8; size as usize];
-    crate::kernel::vfs::read_raw(fd, &mut buf);
-    crate::kernel::vfs::close(fd);
+    crate::kernel::vfs::read_raw(fd, &mut buf, &dos.fds);
+    crate::kernel::vfs::close(fd, &mut dos.fds);
 
     let is_exe = is_mz_exe(&buf);
-    let child_seg = thread::current().vm86.heap_seg;
+    let child_seg = dos.vm86.heap_seg;
     crate::println!("EXEC in-process: heap_seg={:#06x}", child_seg);
 
     let mut resolved_copy = [0u8; 164];
-    let resolved_name = dos_resolve_path(prog_name, &mut resolved_copy);
+    let resolved_name = dos_resolve_path(dos, prog_name, &mut resolved_copy);
     let rlen = resolved_name.len();
 
     let (cs, ip, ss, sp, end_seg) = if is_exe {
@@ -3756,11 +3761,10 @@ fn exec_program(regs: &mut Regs) -> Action {
     // Save parent state. Parent's INT frame (IP/CS/FLAGS) is on the VM86
     // stack at current SS:SP. exec_return restores SS:SP so stub_dispatch
     // pops the frame and resumes the parent.
-    let t = thread::current();
-    let prev = t.vm86.exec_parent.take();
-    t.vm86.heap_seg = end_seg.max(t.vm86.heap_seg);
-    t.vm86.dta = (child_seg as u32) * 16 + 0x80;
-    t.vm86.exec_parent = Some(ExecParent {
+    let prev = dos.vm86.exec_parent.take();
+    dos.vm86.heap_seg = end_seg.max(dos.vm86.heap_seg);
+    dos.vm86.dta = (child_seg as u32) * 16 + 0x80;
+    dos.vm86.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
         ds: regs.ds as u16,
@@ -3815,16 +3819,15 @@ fn load_com_child(data: &[u8], child_seg: u16) -> (u16, u16, u16, u16) {
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return(regs: &mut Regs, parent: ExecParent) -> Action {
+fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) -> Action {
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
     regs.clear_flag32(1);
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
-    let t = thread::current();
-    crate::println!("exec_return: restoring heap_seg={:#06x} (was {:#06x})", parent.heap_seg, t.vm86.heap_seg);
-    t.vm86.heap_seg = parent.heap_seg;
-    t.vm86.exec_parent = parent.prev.map(|b| *b);
+    crate::println!("exec_return: restoring heap_seg={:#06x} (was {:#06x})", parent.heap_seg, dos.vm86.heap_seg);
+    dos.vm86.heap_seg = parent.heap_seg;
+    dos.vm86.exec_parent = parent.prev.map(|b| *b);
     Action::Done
 }
 
@@ -3889,22 +3892,21 @@ fn dos_wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 
 /// Change working directory. Path is already normalized (no drive letters, forward slashes).
 /// Updates the thread's cwd after validating the directory exists.
-fn dos_chdir(path: &[u8]) -> i32 {
+fn dos_chdir(dos: &mut thread::DosState, path: &[u8]) -> i32 {
     if path == b".." {
-        let t = thread::current();
-        let cwd = t.cwd_str();
+        let cwd = dos.cwd_str();
         if cwd.is_empty() { return 0; }
         let without_slash = &cwd[..cwd.len().saturating_sub(1)];
         let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
             Some(pos) => pos + 1,
             None => 0,
         };
-        t.cwd_len = new_len;
+        dos.cwd_len = new_len;
         return 0;
     }
 
     if path.is_empty() || path == b"/" {
-        thread::current().cwd_len = 0;
+        dos.cwd_len = 0;
         return 0;
     }
 
@@ -3916,7 +3918,7 @@ fn dos_chdir(path: &[u8]) -> i32 {
             if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
         }
     } else {
-        let cwd = thread::current().cwd_str();
+        let cwd = dos.cwd_str();
         for &b in cwd {
             if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
         }
@@ -3933,14 +3935,14 @@ fn dos_chdir(path: &[u8]) -> i32 {
         return -2;
     }
 
-    thread::current().set_cwd(prefix);
+    dos.set_cwd(prefix);
     0
 }
 
 /// Resolve a normalized path to an absolute VFS path.
 /// Leading `/` = absolute (strip slash). Otherwise prepend cwd.
 /// Returns the resolved path length in `out`.
-fn dos_resolve_path<'a>(path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
+fn dos_resolve_path<'a>(dos: &mut thread::DosState, path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
     let mut pos = 0;
     if !path.is_empty() && path[0] == b'/' {
         // Absolute — skip leading slash
@@ -3949,7 +3951,7 @@ fn dos_resolve_path<'a>(path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
         }
     } else {
         // Relative — prepend cwd
-        let cwd = thread::current().cwd_str();
+        let cwd = dos.cwd_str();
         for &b in cwd {
             if pos < out.len() { out[pos] = b; pos += 1; }
         }
@@ -3957,7 +3959,11 @@ fn dos_resolve_path<'a>(path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
             if pos < out.len() { out[pos] = b; pos += 1; }
         }
     }
-    &out[..pos]
+    let result = &out[..pos];
+    crate::dbg_println!("dos_resolve_path({:?}) cwd={:?} -> {:?}",
+        core::str::from_utf8(path), core::str::from_utf8(dos.cwd_str()),
+        core::str::from_utf8(result));
+    result
 }
 
 /// Normalize a DOS path in-place: convert `\` to `/`, strip drive letter.
@@ -3991,9 +3997,9 @@ fn strip_dos_path(pat: &[u8]) -> &[u8] {
 }
 
 /// FindFirst/FindNext helper: search directory from `start_index`, fill DTA on match.
-fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Action {
+fn find_matching_file(dos: &mut thread::DosState, regs: &mut Regs, pattern: &[u8], start_index: usize) -> Action {
     let pat = strip_dos_path(pattern);
-    let cwd = thread::current().cwd_str();
+    let cwd = dos.cwd_str();
     let mut idx = start_index;
 
     loop {
@@ -4003,7 +4009,7 @@ fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Ac
                 let name = &entry.name[..entry.name_len];
                 if dos_wildcard_match(pat, name) {
                     // Fill DTA at thread.vm86.dta
-                    let dta = thread::current().vm86.dta;
+                    let dta = dos.vm86.dta;
                     // DTA layout (43 bytes):
                     //   0x00: reserved for FindNext (we store pattern_len + search_index + pattern)
                     //   0x15: attribute of matched file

@@ -146,7 +146,7 @@ fn dump_thread_state(regs: &Regs) {
             let lin = (regs.cs32() << 4) + regs.ip32();
             let b = core::slice::from_raw_parts(lin as *const u8, 16);
             let ticks = *(0x46Cu32 as *const u32);
-            let isr = if crate::thread::is_initialized() { crate::thread::current().vm86.vpic.isr } else { 0 };
+            let isr = if crate::thread::is_initialized() && crate::thread::current().is_dos() { crate::thread::current().dos_mut().vm86.vpic.isr } else { 0 };
             crate::dbg_println!("[DBG] tid={} VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ISR={:02X} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
                 tid, regs.code_seg(), regs.ip32(),
                 regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,

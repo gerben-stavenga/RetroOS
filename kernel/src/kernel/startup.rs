@@ -75,13 +75,14 @@ pub fn startup() -> ! {
     let dn_path: &[u8] = if has_ext4 { b"tar/DN/DN.COM" } else { b"DN/DN.COM" };
 
     loop {
-        // Open and read DN.COM via VFS
-        let fd = vfs::open(dn_path);
+        // Open and read DN.COM via VFS (boot thread 0 = Linux)
+        let thread::ThreadMode::Linux(boot) = &mut thread::current().mode else { unreachable!() };
+        let fd = vfs::open(dn_path, &mut boot.fds);
         if fd < 0 { panic!("DN.COM not found"); }
-        let size = vfs::file_size(fd) as usize;
+        let size = vfs::file_size(fd, &boot.fds) as usize;
         let mut buf = vec![0u8; size];
-        vfs::read(fd, &mut buf);
-        vfs::close(fd);
+        vfs::read(fd, &mut buf, &boot.fds);
+        vfs::close(fd, &mut boot.fds);
 
         let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
             .expect("Failed to create DN thread");
@@ -93,11 +94,11 @@ pub fn startup() -> ! {
         vm86::setup_ivt();
         let (cs, ip, ss, sp, end_seg) = vm86::load_com(&buf, dn_path);
 
-        t.mode = thread::ThreadMode::Dos;
         thread::init_process_thread_vm86(t, vm86::COM_SEGMENT, cs, ip, ss, sp);
-        t.vm86.heap_seg = end_seg;
-        t.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
-        t.cwd_len = 0;
+        let dos = t.dos_mut();
+        dos.vm86.heap_seg = end_seg;
+        dos.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
+        dos.cwd_len = 0;
 
         unsafe { *(&raw mut crate::arch::REGS) = t.cpu_state; }
 
@@ -106,7 +107,7 @@ pub fn startup() -> ! {
     }
 }
 
-const ASSERT_ADDR_HASH: bool = true;
+const ASSERT_ADDR_HASH: bool = false;
 
 /// Ring-1 kernel event loop. Returns when no threads remain.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
@@ -130,41 +131,46 @@ fn event_loop(first_tid: usize) {
         let regs = unsafe { &mut *(&raw mut REGS) };
 
         let new_tid = match event {
-            0x80 => crate::kernel::syscalls::dispatch(regs),
-            32..=47 => None,
-            13 if regs.mode() == crate::UserMode::VM86 => {
-                crate::kernel::vm86::vm86_monitor(regs)
-            }
-            13 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
-                crate::kernel::dpmi::dpmi_monitor(thread, regs)
-            }
-            0x31 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
-                crate::kernel::dpmi::dpmi_int31(thread, regs)
-            }
             14 => thread::signal_thread(thread, extra as usize),
-            // DPMI exceptions 0-31 (except #GP and #PF which are handled above):
-            // dispatch to client exception handler
-            0..=31 if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
-                crate::kernel::dpmi::dispatch_dpmi_exception(thread, regs, event)
-            }
-            // DPMI software INTs (0x30-0xFF have DPL=3, arrive as direct events)
-            0x30..=0xFF if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
-                crate::kernel::dpmi::dpmi_soft_int(thread, regs, event as u8)
-            }
-            _ if regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some() => {
-                crate::println!("DPMI: unexpected event {} at CS:EIP={:#06x}:{:#x}",
-                    event, regs.frame.cs as u16, regs.ip32());
-                Some(thread::exit_thread(-11))
-            }
-            _ if regs.mode() == crate::UserMode::VM86 => {
-                let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
-                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-                panic!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                    event, regs.code_seg(), regs.ip32() as u16, lin,
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7]);
-            }
-            _ => None,
+            32..=47 => None,
+
+            _ => match &mut thread.mode {
+                thread::ThreadMode::Dos(dos) => {
+                    if regs.mode() == crate::UserMode::VM86 {
+                        match event {
+                            13 => crate::kernel::vm86::vm86_monitor(dos, regs),
+                            _ => {
+                                let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
+                                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                                panic!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                                    event, regs.code_seg(), regs.ip32() as u16, lin,
+                                    bytes[0], bytes[1], bytes[2], bytes[3],
+                                    bytes[4], bytes[5], bytes[6], bytes[7]);
+                            }
+                        }
+                    } else if dos.dpmi.is_some() {
+                        match event {
+                            13 => crate::kernel::dpmi::dpmi_monitor(dos, regs),
+                            0x31 => crate::kernel::dpmi::dpmi_int31(dos, regs),
+                            0..=31 => crate::kernel::dpmi::dispatch_dpmi_exception(dos, regs, event),
+                            0x30..=0xFF => crate::kernel::dpmi::dpmi_soft_int(dos, regs, event as u8),
+                            _ => {
+                                crate::println!("DPMI: unexpected event {} at CS:EIP={:#06x}:{:#x}",
+                                    event, regs.frame.cs as u16, regs.ip32());
+                                Some(thread::exit_thread(-11))
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+                thread::ThreadMode::Linux(_linux) => {
+                    match event {
+                        0x80 => crate::kernel::syscalls::dispatch(regs),
+                        _ => None,
+                    }
+                }
+            },
         };
 
 
@@ -179,12 +185,13 @@ fn event_loop(first_tid: usize) {
             if new_tid == 0 { return; } // no threads left — respawn DN
             if new_tid != tid {
                 let (old, new) = thread::get_two_threads(tid, new_tid);
-                // Save/restore VGA state when switching between VM86 threads
-                let old_vm86 = old.cpu_state.mode() == crate::UserMode::VM86;
-                let new_vm86 = new.cpu_state.mode() == crate::UserMode::VM86;
-                if old_vm86 {
-                    old.vm86.vga.ac_flipflop = unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP };
-                    old.vm86.vga.save_from_hardware();
+                // Save/restore VGA state when switching between DOS threads
+                let old_dos = old.is_dos();
+                let new_dos = new.is_dos();
+                if old_dos {
+                    let dos = old.dos_mut();
+                    dos.vm86.vga.ac_flipflop = unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP };
+                    dos.vm86.vga.save_from_hardware();
                 }
                 let mut swap_regs = new.cpu_state;
                 let mut swap_root = new.root;
@@ -197,18 +204,21 @@ fn event_loop(first_tid: usize) {
                 }
                 old.cpu_state = swap_regs;
                 old.root = swap_root;
-                if new_vm86 {
-                    new.vm86.vga.restore_to_hardware();
-                    unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP = new.vm86.vga.ac_flipflop; }
+                if new_dos {
+                    let dos = new.dos_mut();
+                    dos.vm86.vga.restore_to_hardware();
+                    unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP = dos.vm86.vga.ac_flipflop; }
                 }
                 tid = new_tid;
                 thread::set_current(tid);
                 // Reload LDT if switching to a DPMI thread
                 let new_thread = thread::get_thread(tid).expect("Invalid thread");
-                if let Some(ref dpmi) = new_thread.dpmi {
-                    let ldt_ptr = dpmi.ldt.as_ptr() as u32;
-                    let ldt_limit = (256 * 8 - 1) as u32;
-                    arch_load_ldt(ldt_ptr, ldt_limit);
+                if let thread::ThreadMode::Dos(dos) = &new_thread.mode {
+                    if let Some(ref dpmi) = dos.dpmi {
+                        let ldt_ptr = dpmi.ldt.as_ptr() as u32;
+                        let ldt_limit = (256 * 8 - 1) as u32;
+                        arch_load_ldt(ldt_ptr, ldt_limit);
+                    }
                 }
             }
         }
@@ -219,30 +229,32 @@ fn event_loop(first_tid: usize) {
 const F11_PRESS: u8 = 0x57;
 
 fn drain_pending_irqs(thread: &mut thread::Thread, regs: &mut crate::Regs) {
-    let is_dos = regs.mode() == crate::UserMode::VM86
-        || (regs.mode() == crate::UserMode::Mode32 && thread.dpmi.is_some());
+    let is_dos = thread.is_dos();
     // Skip during DPMI real-mode simulation — injecting IRQs would corrupt the frame.
-    let dpmi_rm_call = thread.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some());
+    let dpmi_rm_call = if let thread::ThreadMode::Dos(dos) = &thread.mode {
+        dos.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some())
+    } else { false };
     if is_dos && !dpmi_rm_call {
         // QEMU VGA workaround: re-set Odd/Even read mode for text modes.
         if regs.mode() == crate::UserMode::VM86 {
             qemu_vga_workaround(regs);
         }
+        let dos = thread.dos_mut();
         // Queue hardware events into virtual PIC/keyboard (shared devices)
-        let tp = thread as *mut thread::Thread;
         let ticks = crate::arch::take_pending_ticks();
         for _ in 0..ticks {
-            crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, crate::arch::Irq::Tick);
+            crate::kernel::vm86::queue_irq(dos, crate::arch::Irq::Tick);
         }
+        let dp = dos as *mut thread::DosState;
         crate::arch::drain(|evt| {
             if let crate::arch::Irq::Key(F11_PRESS) = evt {
                 thread::request_switch();
             } else {
-                crate::kernel::vm86::queue_irq(unsafe { &mut *tp }, evt);
+                crate::kernel::vm86::queue_irq(unsafe { &mut *dp }, evt);
             }
         });
         // Deliver one pending interrupt (shared VIF/VIP/ISR discipline)
-        crate::kernel::vm86::raise_pending(unsafe { &mut *tp }, regs);
+        crate::kernel::vm86::raise_pending(unsafe { &mut *dp }, regs);
     } else if !is_dos {
         crate::arch::drain(|evt| {
             if let crate::arch::Irq::Key(sc) = evt {

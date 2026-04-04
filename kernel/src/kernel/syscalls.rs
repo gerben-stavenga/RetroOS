@@ -28,16 +28,15 @@ use crate::{print, println};
 /// Error: function not implemented
 const ENOSYS: i32 = -38;
 
-/// Resolve a path against the current thread's cwd.
+/// Resolve a path against a cwd.
 /// Leading `/` = absolute (strip it). Otherwise prepend cwd.
-fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
+pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
     let mut pos = 0;
     if !path.is_empty() && path[0] == b'/' {
         for &b in &path[1..] {
             if pos < buf.len() { buf[pos] = b; pos += 1; }
         }
     } else {
-        let cwd = thread::current().cwd_str();
         for &b in cwd {
             if pos < buf.len() { buf[pos] = b; pos += 1; }
         }
@@ -48,22 +47,21 @@ fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
     &buf[..pos]
 }
 
-/// Change cwd for the current thread. Validates directory exists.
-fn do_chdir(path: &[u8]) -> i32 {
+/// Change cwd. Validates directory exists. cwd/cwd_len are mutated in place.
+pub fn do_chdir(path: &[u8], cwd: &mut [u8; 64], cwd_len: &mut usize) -> i32 {
     if path == b".." {
-        let t = thread::current();
-        let cwd = t.cwd_str();
-        if cwd.is_empty() { return 0; }
-        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
+        let cur = &cwd[..*cwd_len];
+        if cur.is_empty() { return 0; }
+        let without_slash = &cur[..cur.len().saturating_sub(1)];
         let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
             Some(pos) => pos + 1,
             None => 0,
         };
-        t.cwd_len = new_len;
+        *cwd_len = new_len;
         return 0;
     }
     if path.is_empty() || path == b"/" {
-        thread::current().cwd_len = 0;
+        *cwd_len = 0;
         return 0;
     }
     let mut new_cwd = [0u8; 64];
@@ -73,8 +71,7 @@ fn do_chdir(path: &[u8]) -> i32 {
             if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
         }
     } else {
-        let cwd = thread::current().cwd_str();
-        for &b in cwd {
+        for &b in &cwd[..*cwd_len] {
             if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
         }
         for &b in path {
@@ -86,7 +83,9 @@ fn do_chdir(path: &[u8]) -> i32 {
     }
     let prefix = &new_cwd[..pos];
     if !vfs::dir_exists(prefix) { return -2; }
-    thread::current().set_cwd(prefix);
+    let len = pos.min(cwd.len());
+    cwd[..len].copy_from_slice(&new_cwd[..len]);
+    *cwd_len = len;
     0
 }
 
@@ -184,11 +183,12 @@ fn sys_yield(regs: &mut Regs) -> SyscallResult {
 /// Creates a copy of the current process
 fn sys_fork(regs: &mut Regs) -> SyscallResult {
     let current = thread::current();
+    let current_tid = current.tid as usize;
     let mut child_root = crate::RootPageTable::empty();
     startup::arch_user_fork(&mut child_root);
 
     // Create child thread with the pre-filled root page table
-    let child = match thread::create_thread(Some(current), child_root, true) {
+    let child = match thread::create_thread(Some(current_tid), child_root, true) {
         Some(t) => t,
         None => return SyscallResult::val(ENOMEM),
     };
@@ -196,12 +196,25 @@ fn sys_fork(regs: &mut Regs) -> SyscallResult {
     // Copy CPU state from REGS (running thread's state is in arch, not cpu_state)
     child.cpu_state = *regs;
 
-    // Inherit open file descriptors (bumps refcounts in global file table)
-    vfs::dup_fds(&current.fds, &mut child.fds);
-
-    // Inherit current working directory
-    child.cwd = current.cwd;
-    child.cwd_len = current.cwd_len;
+    // Inherit open fds and cwd from parent mode into child mode
+    {
+        let (src_fds, src_cwd, src_cwd_len) = match &current.mode {
+            thread::ThreadMode::Dos(d) => (&d.fds, d.cwd, d.cwd_len),
+            thread::ThreadMode::Linux(l) => (&l.fds, l.cwd, l.cwd_len),
+        };
+        match &mut child.mode {
+            thread::ThreadMode::Linux(cl) => {
+                vfs::dup_fds(src_fds, &mut cl.fds);
+                cl.cwd = src_cwd;
+                cl.cwd_len = src_cwd_len;
+            }
+            thread::ThreadMode::Dos(cd) => {
+                vfs::dup_fds(src_fds, &mut cd.fds);
+                cd.cwd = src_cwd;
+                cd.cwd_len = src_cwd_len;
+            }
+        }
+    }
 
     // Child returns 0
     thread::set_return(child, 0);
@@ -238,24 +251,45 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
     let args = read_argv(argv_ptr, argc, caller_64bit);
 
     // Close inherited file descriptors before loading the new program
-    vfs::close_all_fds(&mut thread::current().fds);
-
-    // Drop old SymbolData before allocating the new buffer. The old symbols
-    // hold a Box<[u8]> with the entire previous ELF (~300-400K). Freeing it
-    // first lets the heap free list absorb the space, so the new buffer
-    // allocation can reuse it instead of extending the heap every iteration.
-    thread::current().symbols = None;
+    // and drop old symbols. Extract fds/cwd/symbols from the thread mode.
+    let cwd_snapshot: [u8; 64];
+    let cwd_len_snapshot: usize;
+    {
+        let current = thread::current();
+        match &mut current.mode {
+            thread::ThreadMode::Dos(d) => {
+                vfs::close_all_fds(&mut d.fds);
+                cwd_snapshot = d.cwd;
+                cwd_len_snapshot = d.cwd_len;
+                // Drop old SymbolData before allocating the new buffer. The old symbols
+                // hold a Box<[u8]> with the entire previous ELF (~300-400K). Freeing it
+                // first lets the heap free list absorb the space, so the new buffer
+                // allocation can reuse it instead of extending the heap every iteration.
+                d.symbols = None;
+            }
+            thread::ThreadMode::Linux(l) => {
+                vfs::close_all_fds(&mut l.fds);
+                cwd_snapshot = l.cwd;
+                cwd_len_snapshot = l.cwd_len;
+                l.symbols = None;
+            }
+        }
+    }
 
     // Resolve path relative to cwd, then open via VFS
     let mut path_buf = [0u8; 164];
-    let resolved = resolve_path(path.as_bytes(), &mut path_buf);
-    let fd = vfs::open(resolved);
+    let resolved = resolve_path(path.as_bytes(), &cwd_snapshot[..cwd_len_snapshot], &mut path_buf);
+    let fds = match &mut thread::current().mode {
+        thread::ThreadMode::Dos(d) => &mut d.fds,
+        thread::ThreadMode::Linux(l) => &mut l.fds,
+    };
+    let fd = vfs::open(resolved, fds);
     if fd < 0 { return SyscallResult::val(ENOENT); }
-    let size = vfs::file_size(fd) as usize;
+    let size = vfs::file_size(fd, fds) as usize;
 
     let mut buffer = alloc::vec![0; size];
-    vfs::read(fd, &mut buffer);
-    vfs::close(fd);
+    vfs::read(fd, &mut buffer, fds);
+    vfs::close(fd, fds);
 
     let want_64 = match lib::elf::Elf::parse(&buffer) {
         Ok(e) => e.class() == lib::elf::ElfClass::Elf64,
@@ -296,7 +330,10 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
         thread::init_process_thread(current, loaded.entry as u32, stack.sp as u32);
     }
 
-    current.symbols = symbols;
+    match &mut current.mode {
+        thread::ThreadMode::Dos(d) => d.symbols = symbols,
+        thread::ThreadMode::Linux(l) => l.symbols = symbols,
+    }
 
     // Sync new state to REGS (event loop works on REGS, not thread.cpu_state)
     *regs = current.cpu_state;
@@ -331,9 +368,10 @@ fn exec_dos(data: &[u8], is_exe: bool, prog_name: &[u8]) -> usize {
 
     thread::init_process_thread_vm86(current, vm86::COM_SEGMENT, cs, ip, ss, sp);
     // init_process_thread_vm86 resets Vm86State; restore heap_seg and DTA
-    current.vm86.heap_seg = end_seg;
-    current.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
-    current.symbols = None;
+    let dos = current.dos_mut();
+    dos.vm86.heap_seg = end_seg;
+    dos.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
+    dos.symbols = None;
 
     tid
 }
@@ -453,8 +491,14 @@ fn sys_open(regs: &mut Regs) -> SyscallResult {
     };
 
     let mut buf = [0u8; 164];
-    let resolved = resolve_path(path, &mut buf);
-    SyscallResult::val(vfs::open(resolved))
+    let current = thread::current();
+    let (cwd, fds) = match &mut current.mode {
+        thread::ThreadMode::Dos(d) => (d.cwd_str() as *const [u8], &mut d.fds),
+        thread::ThreadMode::Linux(l) => (l.cwd_str() as *const [u8], &mut l.fds),
+    };
+    // Safety: cwd points into the thread struct which remains valid
+    let resolved = resolve_path(path, unsafe { &*cwd }, &mut buf);
+    SyscallResult::val(vfs::open(resolved, fds))
 }
 
 /// Waitpid syscall (7)
@@ -486,7 +530,11 @@ fn sys_read(regs: &mut Regs) -> SyscallResult {
         SyscallResult::val(n as i32)
     } else if fd >= 3 {
         let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-        SyscallResult::val(vfs::read(fd, user_buf))
+        let fds = match &thread::current().mode {
+            thread::ThreadMode::Dos(d) => &d.fds,
+            thread::ThreadMode::Linux(l) => &l.fds,
+        };
+        SyscallResult::val(vfs::read(fd, user_buf, fds))
     } else {
         SyscallResult::val(ENOSYS)
     }
@@ -516,7 +564,11 @@ fn sys_write(regs: &mut Regs) -> SyscallResult {
 /// Closes a file descriptor
 fn sys_close(regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx as i32;
-    SyscallResult::val(vfs::close(fd))
+    let fds = match &mut thread::current().mode {
+        thread::ThreadMode::Dos(d) => &mut d.fds,
+        thread::ThreadMode::Linux(l) => &mut l.fds,
+    };
+    SyscallResult::val(vfs::close(fd, fds))
 }
 
 /// Seek syscall (11)
@@ -526,7 +578,11 @@ fn sys_seek(regs: &mut Regs) -> SyscallResult {
     let fd = regs.rdx as i32;
     let offset = regs.rcx as i32;
     let whence = regs.rbx as i32;
-    SyscallResult::val(vfs::seek(fd, offset, whence))
+    let fds = match &thread::current().mode {
+        thread::ThreadMode::Dos(d) => &d.fds,
+        thread::ThreadMode::Linux(l) => &l.fds,
+    };
+    SyscallResult::val(vfs::seek(fd, offset, whence, fds))
 }
 
 /// Change current directory
@@ -535,7 +591,11 @@ fn sys_chdir(regs: &mut Regs) -> SyscallResult {
     let ptr = regs.rdx as usize as *const u8;
     let len = regs.rcx as usize;
     let path = unsafe { core::slice::from_raw_parts(ptr, len) };
-    SyscallResult::val(do_chdir(path))
+    let (cwd, cwd_len) = match &mut thread::current().mode {
+        thread::ThreadMode::Dos(d) => (&mut d.cwd, &mut d.cwd_len),
+        thread::ThreadMode::Linux(l) => (&mut l.cwd, &mut l.cwd_len),
+    };
+    SyscallResult::val(do_chdir(path, cwd, cwd_len))
 }
 
 /// Get current directory
@@ -544,7 +604,10 @@ fn sys_chdir(regs: &mut Regs) -> SyscallResult {
 fn sys_getcwd(regs: &mut Regs) -> SyscallResult {
     let ptr = regs.rdx as usize as *mut u8;
     let size = regs.rcx as usize;
-    let cwd = crate::kernel::thread::current().cwd_str();
+    let cwd = match &thread::current().mode {
+        thread::ThreadMode::Dos(d) => d.cwd_str(),
+        thread::ThreadMode::Linux(l) => l.cwd_str(),
+    };
     let len = cwd.len().min(size);
     unsafe { core::ptr::copy_nonoverlapping(cwd.as_ptr(), ptr, len); }
     SyscallResult::val(len as i32)

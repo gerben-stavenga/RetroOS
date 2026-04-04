@@ -25,15 +25,74 @@ pub enum ThreadState {
     Zombie,
 }
 
-/// Thread execution mode — determines event loop dispatch
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// DOS-specific thread state: virtual hardware + optional DPMI protected mode
+pub struct DosState {
+    pub vm86: crate::kernel::vm86::Vm86State,
+    pub dpmi: Option<alloc::boxed::Box<crate::kernel::dpmi::DpmiState>>,
+    pub num_fds: i32,
+    pub fds: [i32; MAX_FDS],
+    pub cwd: [u8; 64],
+    pub cwd_len: usize,
+    pub symbols: Option<SymbolData>,
+}
+
+impl DosState {
+    pub fn new() -> Self {
+        DosState {
+            vm86: crate::kernel::vm86::Vm86State::new(),
+            dpmi: None,
+            num_fds: 0,
+            fds: [-1; MAX_FDS],
+            cwd: [0; 64],
+            cwd_len: 0,
+            symbols: None,
+        }
+    }
+
+    pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
+
+    pub fn set_cwd(&mut self, path: &[u8]) {
+        let len = path.len().min(self.cwd.len());
+        self.cwd[..len].copy_from_slice(&path[..len]);
+        self.cwd_len = len;
+    }
+}
+
+/// Linux-specific thread state (will grow as Linux support develops)
+pub struct LinuxState {
+    pub num_fds: i32,
+    pub fds: [i32; MAX_FDS],
+    pub cwd: [u8; 64],
+    pub cwd_len: usize,
+    pub symbols: Option<SymbolData>,
+}
+
+impl LinuxState {
+    pub fn new() -> Self {
+        LinuxState {
+            num_fds: 0,
+            fds: [-1; MAX_FDS],
+            cwd: [0; 64],
+            cwd_len: 0,
+            symbols: None,
+        }
+    }
+
+    pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
+
+    pub fn set_cwd(&mut self, path: &[u8]) {
+        let len = path.len().min(self.cwd.len());
+        self.cwd[..len].copy_from_slice(&path[..len]);
+        self.cwd_len = len;
+    }
+}
+
+/// Thread execution mode — determines event loop dispatch and carries OS-specific state
 pub enum ThreadMode {
-    /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode via regs.mode())
-    Dos,
-    /// 32-bit Linux userspace
-    Linux32,
-    /// 64-bit Linux userspace
-    Linux64,
+    /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode)
+    Dos(DosState),
+    /// Linux userspace (32 or 64-bit, distinguished by CS descriptor)
+    Linux(LinuxState),
 }
 
 /// Initialize Regs for user processes (extends Regs with descriptor-aware methods)
@@ -87,15 +146,8 @@ pub struct Thread {
     pub mode: ThreadMode,
     pub time: u32,
     pub root: crate::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
-    pub num_fds: i32,
-    pub fds: [i32; MAX_FDS],
     pub cpu_state: Regs,
     pub exit_code: i32,
-    pub symbols: Option<SymbolData>,  // Debug symbols for userspace ELF
-    pub vm86: crate::kernel::vm86::Vm86State,
-    pub dpmi: Option<alloc::boxed::Box<crate::kernel::dpmi::DpmiState>>,
-    pub cwd: [u8; 64],     // Current working directory (e.g. "WOLF3D/", "" for root)
-    pub cwd_len: usize,
     pub addr_hash: u64,    // Debug: address space hash for corruption detection
 }
 
@@ -107,32 +159,31 @@ impl Thread {
             priority: 0,
             parent_tid: -1,
             state: ThreadState::Unused,
-            mode: ThreadMode::Linux32,
+            mode: ThreadMode::Linux(LinuxState::new()),
             time: 0,
             root: crate::RootPageTable::empty(),
-            num_fds: 0,
-            fds: [-1; MAX_FDS],
             cpu_state: Regs::empty(),
             exit_code: 0,
-            symbols: None,
-            vm86: crate::kernel::vm86::Vm86State::new(),
-            dpmi: None,
-            cwd: [0; 64],
-            cwd_len: 0,
             addr_hash: 0,
         }
     }
 
-    /// Get current working directory as a byte slice
-    pub fn cwd_str(&self) -> &[u8] {
-        &self.cwd[..self.cwd_len]
+    /// Check if this thread is a DOS thread (VM86 or DPMI)
+    pub fn is_dos(&self) -> bool {
+        matches!(self.mode, ThreadMode::Dos(_))
     }
 
-    /// Set current working directory. Path should end with '/' or be empty for root.
-    pub fn set_cwd(&mut self, path: &[u8]) {
-        let len = path.len().min(self.cwd.len());
-        self.cwd[..len].copy_from_slice(&path[..len]);
-        self.cwd_len = len;
+    /// Check if this DOS thread has DPMI state active
+    pub fn has_dpmi(&self) -> bool {
+        matches!(&self.mode, ThreadMode::Dos(dos) if dos.dpmi.is_some())
+    }
+
+    /// Get mutable reference to DosState (panics if not a DOS thread)
+    pub fn dos_mut(&mut self) -> &mut DosState {
+        match &mut self.mode {
+            ThreadMode::Dos(dos) => dos,
+            _ => panic!("dos_mut on non-DOS thread"),
+        }
     }
 }
 
@@ -149,6 +200,7 @@ static mut SEED: u64 = 0xcafe_babe_dead_beef;
 pub fn is_initialized() -> bool {
     unsafe { (*(&raw const THREADS)).len() > 0 }
 }
+
 
 /// Get current thread (always valid — TID 0 is idle/init)
 pub fn current() -> &'static mut Thread {
@@ -181,8 +233,9 @@ pub fn get_two_threads(a: usize, b: usize) -> (&'static mut Thread, &'static mut
 }
 
 /// Create a new thread with the given root page table.
-pub fn create_thread(parent: Option<&Thread>, root: crate::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
+pub fn create_thread(parent_tid: Option<usize>, root: crate::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
     unsafe {
+        let parent = parent_tid.map(|tid| &THREADS[tid]);
         for i in 0..MAX_THREADS {
             if THREADS[i].state == ThreadState::Unused {
                 let t = &mut THREADS[i];
@@ -191,18 +244,11 @@ pub fn create_thread(parent: Option<&Thread>, root: crate::RootPageTable, is_pro
                 t.priority = parent.map(|p| p.priority).unwrap_or(0);
                 t.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
                 t.state = ThreadState::Ready;
-                t.mode = ThreadMode::Linux32;
+                t.mode = ThreadMode::Linux(LinuxState::new());
                 t.time = crate::arch::get_ticks() as u32;
                 t.root = root;
-                t.num_fds = 0;
-                t.fds = [-1; MAX_FDS];
                 t.cpu_state = Regs::empty();
                 t.exit_code = 0;
-                t.symbols = None;
-                t.vm86 = crate::kernel::vm86::Vm86State::new();
-                t.dpmi = None;
-                t.cwd = [0; 64];
-                t.cwd_len = 0;
                 t.addr_hash = 0;
                 return Some(t);
             }
@@ -224,8 +270,7 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 /// Initialize a thread for VM86 mode (.COM execution)
 /// cs/ip/ss/sp are real-mode segment:offset values
 pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
-    thread.mode = ThreadMode::Dos;
-    thread.vm86 = crate::kernel::vm86::Vm86State::new();
+    thread.mode = ThreadMode::Dos(DosState::new());
 
     const VM_FLAG: u32 = 1 << 17;  // VM86 mode
     const IF_FLAG: u32 = 1 << 9;   // Interrupt enable
@@ -252,6 +297,16 @@ pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: 
 /// Save CPU state to thread.
 pub fn save_state(thread: &mut Thread, regs: &Regs) {
     thread.cpu_state = *regs;
+}
+
+/// Yield the current thread: save regs, mark Ready, schedule next.
+pub fn yield_current(regs: &crate::Regs) -> Option<usize> {
+    unsafe {
+        let t = &mut THREADS[CURRENT_THREAD];
+        t.cpu_state = *regs;
+        t.state = ThreadState::Ready;
+    }
+    schedule()
 }
 
 /// Set return value in thread's saved state
@@ -327,6 +382,11 @@ pub fn cycle_next() -> Option<usize> {
     }
 }
 
+/// Get the current thread index
+pub fn current_tid() -> usize {
+    unsafe { CURRENT_THREAD }
+}
+
 /// Set the current thread index (called by event loop before executing)
 pub fn set_current(tid: usize) {
     unsafe { CURRENT_THREAD = tid; }
@@ -338,24 +398,31 @@ pub fn exit_thread(exit_code: i32) -> usize {
     unsafe {
         let thread = &mut THREADS[CURRENT_THREAD];
         let parent_tid = thread.parent_tid;
-        crate::kernel::vfs::close_all_fds(&mut thread.fds);
-        if let Some(ref mut ems) = thread.vm86.ems {
-            ems.free_all_pages();
+        match &mut thread.mode {
+            ThreadMode::Dos(dos) => {
+                crate::kernel::vfs::close_all_fds(&mut dos.fds);
+                dos.symbols = None;
+                if let Some(ref mut ems) = dos.vm86.ems {
+                    ems.free_all_pages();
+                }
+                dos.vm86.ems = None;
+                dos.vm86.xms = None;
+                if !dos.vm86.a20_enabled {
+                    crate::kernel::startup::arch_set_a20(true, &mut dos.vm86.hma_pages);
+                    dos.vm86.a20_enabled = true;
+                }
+            }
+            ThreadMode::Linux(linux) => {
+                crate::kernel::vfs::close_all_fds(&mut linux.fds);
+                linux.symbols = None;
+            }
         }
-        thread.vm86.ems = None;
-        thread.vm86.xms = None;
-        if thread.cpu_state.mode() == crate::UserMode::VM86 && !thread.vm86.a20_enabled {
-            crate::kernel::startup::arch_set_a20(true, &mut thread.vm86.hma_pages);
-            thread.vm86.a20_enabled = true;
-        }
-        
+
         // Use arch primitive instead of direct paging call
         crate::kernel::startup::arch_user_clean();
 
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
-        // Symbols are dropped here by RAII when thread goes zombie
-        thread.symbols = None;
 
         // Wake blocked parent (e.g., waiting for EXEC'd child to finish)
         if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
@@ -363,7 +430,9 @@ pub fn exit_thread(exit_code: i32) -> usize {
             if parent.state == ThreadState::Blocked {
                 parent.state = ThreadState::Ready;
             }
-            parent.vm86.last_child_exit_code = exit_code as u8;
+            if let ThreadMode::Dos(dos) = &mut parent.mode {
+                dos.vm86.last_child_exit_code = exit_code as u8;
+            }
         }
 
         CURRENT_THREAD = 0;
@@ -415,7 +484,10 @@ pub fn signal_thread(thread: &mut Thread, fault_address: usize) -> Option<usize>
                 crate::kernel::startup::arch_user_clean();
                 thread.state = ThreadState::Zombie;
                 thread.exit_code = -11;  // SIGSEGV
-                thread.symbols = None;
+                match &mut thread.mode {
+                    ThreadMode::Dos(dos) => dos.symbols = None,
+                    ThreadMode::Linux(linux) => linux.symbols = None,
+                }
                 CURRENT_THREAD = 0;
                 Some(schedule().unwrap_or(0))
             } else {

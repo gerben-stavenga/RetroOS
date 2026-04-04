@@ -175,7 +175,7 @@ fn alloc_fd(fds: &mut [i32; MAX_FDS]) -> Option<usize> {
 // ============================================================================
 
 /// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
-pub fn open(path: &[u8]) -> i32 {
+pub fn open(path: &[u8], fds: &mut [i32; MAX_FDS]) -> i32 {
     // Check RAM overlay first
     let ram = ram_files();
     if let Some(data) = ram.get(path) {
@@ -184,7 +184,6 @@ pub fn open(path: &[u8]) -> i32 {
             Some(i) => i,
             None => return -24,
         };
-        let fds = &mut crate::kernel::thread::current().fds;
         let fd = match alloc_fd(fds) {
             Some(f) => f,
             None => return -24,
@@ -218,7 +217,6 @@ pub fn open(path: &[u8]) -> i32 {
         None => return -24,
     };
 
-    let fds = &mut crate::kernel::thread::current().fds;
     let fd = match alloc_fd(fds) {
         Some(f) => f,
         None => return -24,
@@ -240,8 +238,7 @@ pub fn open(path: &[u8]) -> i32 {
 }
 
 /// Read from an open file descriptor. Returns bytes read or negative error.
-pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
-    let fds = &crate::kernel::thread::current().fds;
+pub fn read(fd: i32, buf: &mut [u8], fds: &[i32; MAX_FDS]) -> i32 {
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9;
     }
@@ -278,8 +275,7 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
 }
 
 /// Read entire file contents via fd into a kernel buffer (ignores current offset).
-pub fn read_raw(fd: i32, buf: &mut [u8]) -> i32 {
-    let fds = &crate::kernel::thread::current().fds;
+pub fn read_raw(fd: i32, buf: &mut [u8], fds: &[i32; MAX_FDS]) -> i32 {
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9;
     }
@@ -295,8 +291,7 @@ pub fn read_raw(fd: i32, buf: &mut [u8]) -> i32 {
 }
 
 /// Close a file descriptor.
-pub fn close(fd: i32) -> i32 {
-    let fds = &mut crate::kernel::thread::current().fds;
+pub fn close(fd: i32, fds: &mut [i32; MAX_FDS]) -> i32 {
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9;
     }
@@ -315,7 +310,7 @@ pub fn close(fd: i32) -> i32 {
 }
 
 /// Create (or truncate) a writable RAM-backed file by absolute VFS path.
-pub fn create(path: &[u8]) -> i32 {
+pub fn create(path: &[u8], fds: &mut [i32; MAX_FDS]) -> i32 {
     let key_len = path.len().min(PATH_KEY_MAX) as u8;
 
     ram_files().insert(path.to_vec(), Vec::new());
@@ -324,7 +319,6 @@ pub fn create(path: &[u8]) -> i32 {
         Some(i) => i,
         None => return -24,
     };
-    let fds = &mut crate::kernel::thread::current().fds;
     let fd = match alloc_fd(fds) {
         Some(f) => f,
         None => return -24,
@@ -347,8 +341,7 @@ pub fn create(path: &[u8]) -> i32 {
 }
 
 /// Write to an open file descriptor.
-pub fn write(fd: i32, data: &[u8]) -> i32 {
-    let fds = &crate::kernel::thread::current().fds;
+pub fn write(fd: i32, data: &[u8], fds: &[i32; MAX_FDS]) -> i32 {
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9;
     }
@@ -387,8 +380,7 @@ pub fn delete(path: &[u8]) -> i32 {
 }
 
 /// Get the size of an open file descriptor.
-pub fn file_size(fd: i32) -> u32 {
-    let fds = &crate::kernel::thread::current().fds;
+pub fn file_size(fd: i32, fds: &[i32; MAX_FDS]) -> u32 {
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 { return 0; }
     let table_idx = fds[fd as usize];
     if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 { return 0; }
@@ -402,8 +394,7 @@ pub fn file_size(fd: i32) -> u32 {
 }
 
 /// Seek on an open file descriptor. whence: 0=SET, 1=CUR, 2=END
-pub fn seek(fd: i32, offset: i32, whence: i32) -> i32 {
-    let fds = &crate::kernel::thread::current().fds;
+pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[i32; MAX_FDS]) -> i32 {
     if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
         return -9;
     }
