@@ -23,6 +23,7 @@ _BASE_FILES = {
     "//apps/hello_com:hello_com": "HELLO.COM",
     "//apps/gfx_com:gfx_com": "GFX.COM",
     "//apps/hello_com:COMMAND.COM": "COMMAND.COM",
+    "//apps/hello_com:TEST.COM": "TEST.COM",
     "//apps/keen4:Keen4e.exe": "KEEN4/KEEN4E.EXE",
     "//apps/keen4:AUDIO.CK4": "KEEN4/AUDIO.CK4",
     "//apps/keen4:CONFIG.CK4": "KEEN4/CONFIG.CK4",
@@ -142,6 +143,80 @@ genrule(
     srcs = [":fs_tar_proprietary"],
     outs = ["image_proprietary.bin"],
     cmd = "tail -c +513 $< > $@ && truncate -s 64M $@",
+)
+
+# Image with ext4 test partition
+genrule(
+    name = "image_ext4",
+    srcs = [":image"],
+    outs = ["image_ext4.bin"],
+    cmd = """
+        cp $< $@
+        chmod +w $@
+
+        # Read TAR partition LBA from MBR entry 1
+        TAR_LBA=$$(python3 -c "
+import struct
+data = open('$@','rb').read(512)
+print(struct.unpack_from('<I', data, 0x1C6)[0])
+        ")
+
+        # ext4 partition: start at sector 16384 (8MB), 48MB size
+        EXT4_START=16384
+        EXT4_SECTORS=98304
+
+        # Populate test files
+        POPULATE=$$(mktemp -d)
+        mkdir -p "$$POPULATE/GAMES"
+        echo "Hello from ext4!" > "$$POPULATE/HELLO.TXT"
+        echo "This is a test file on the ext4 partition." > "$$POPULATE/GAMES/README.TXT"
+        printf '\\xB4\\x09\\xBA\\x0C\\x01\\xCD\\x21\\xB8\\x00\\x4C\\xCD\\x21Hello from ext4!\\x24' > "$$POPULATE/GAMES/TEST.COM"
+
+        # Create ext4 filesystem image
+        EXT4_IMG=$$(mktemp)
+        dd if=/dev/zero of="$$EXT4_IMG" bs=512 count=$$EXT4_SECTORS 2>/dev/null
+        mkfs.ext4 -q -b 1024 -L "RetroTest" -d "$$POPULATE" "$$EXT4_IMG"
+        rm -rf "$$POPULATE"
+
+        # Write ext4 into disk image
+        dd if="$$EXT4_IMG" of="$@" bs=512 seek=$$EXT4_START conv=notrunc 2>/dev/null
+        rm "$$EXT4_IMG"
+
+        # Patch MBR partition entry 2 (at 0x1CE)
+        python3 -c "
+import struct
+with open('$@', 'r+b') as f:
+    f.seek(0x1CE)
+    f.write(struct.pack('<BBBBBBBBII',
+        0x00, 0,0,0, 0x83, 0,0,0,
+        $$EXT4_START, $$EXT4_SECTORS))
+        "
+    """,
+)
+
+# GRUB bootable ISO (requires grub-mkrescue and mtools)
+# Boot: qemu -cdrom retroos_grub.iso -drive file=image_ext4.bin,snapshot=on -boot order=d
+genrule(
+    name = "grub_iso",
+    srcs = ["//kernel:kernel_elf"],
+    outs = ["retroos_grub.iso"],
+    cmd = """
+        DIR=$$(mktemp -d)
+        mkdir -p "$$DIR/boot/grub"
+        cp $< "$$DIR/boot/kernel.elf"
+        cat > "$$DIR/boot/grub/grub.cfg" << 'GRUBCFG'
+set timeout=1
+insmod vbe
+insmod vga
+set gfxpayload=text
+menuentry "RetroOS" {
+    multiboot /boot/kernel.elf
+    boot
+}
+GRUBCFG
+        grub-mkrescue -o $@ "$$DIR"
+        rm -rf "$$DIR"
+    """,
 )
 
 # Run QEMU with the disk image

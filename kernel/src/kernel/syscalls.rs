@@ -28,6 +28,68 @@ use crate::{print, println};
 /// Error: function not implemented
 const ENOSYS: i32 = -38;
 
+/// Resolve a path against the current thread's cwd.
+/// Leading `/` = absolute (strip it). Otherwise prepend cwd.
+fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
+    let mut pos = 0;
+    if !path.is_empty() && path[0] == b'/' {
+        for &b in &path[1..] {
+            if pos < buf.len() { buf[pos] = b; pos += 1; }
+        }
+    } else {
+        let cwd = thread::current().cwd_str();
+        for &b in cwd {
+            if pos < buf.len() { buf[pos] = b; pos += 1; }
+        }
+        for &b in path {
+            if pos < buf.len() { buf[pos] = b; pos += 1; }
+        }
+    }
+    &buf[..pos]
+}
+
+/// Change cwd for the current thread. Validates directory exists.
+fn do_chdir(path: &[u8]) -> i32 {
+    if path == b".." {
+        let t = thread::current();
+        let cwd = t.cwd_str();
+        if cwd.is_empty() { return 0; }
+        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
+        let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
+            Some(pos) => pos + 1,
+            None => 0,
+        };
+        t.cwd_len = new_len;
+        return 0;
+    }
+    if path.is_empty() || path == b"/" {
+        thread::current().cwd_len = 0;
+        return 0;
+    }
+    let mut new_cwd = [0u8; 64];
+    let mut pos = 0;
+    if path[0] == b'/' {
+        for &b in &path[1..] {
+            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+        }
+    } else {
+        let cwd = thread::current().cwd_str();
+        for &b in cwd {
+            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+        }
+        for &b in path {
+            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+        }
+    }
+    if pos > 0 && new_cwd[pos - 1] != b'/' {
+        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
+    }
+    let prefix = &new_cwd[..pos];
+    if !vfs::dir_exists(prefix) { return -2; }
+    thread::current().set_cwd(prefix);
+    0
+}
+
 /// Error: no memory
 const ENOMEM: i32 = -12;
 
@@ -186,7 +248,7 @@ fn sys_exec(regs: &mut Regs) -> SyscallResult {
 
     // Resolve path relative to cwd, then open via VFS
     let mut path_buf = [0u8; 164];
-    let resolved = vfs::resolve(path.as_bytes(), &mut path_buf);
+    let resolved = resolve_path(path.as_bytes(), &mut path_buf);
     let fd = vfs::open(resolved);
     if fd < 0 { return SyscallResult::val(ENOENT); }
     let size = vfs::file_size(fd) as usize;
@@ -390,7 +452,9 @@ fn sys_open(regs: &mut Regs) -> SyscallResult {
         core::slice::from_raw_parts(path_ptr, len)
     };
 
-    SyscallResult::val(vfs::open(path))
+    let mut buf = [0u8; 164];
+    let resolved = resolve_path(path, &mut buf);
+    SyscallResult::val(vfs::open(resolved))
 }
 
 /// Waitpid syscall (7)
@@ -471,7 +535,7 @@ fn sys_chdir(regs: &mut Regs) -> SyscallResult {
     let ptr = regs.rdx as usize as *const u8;
     let len = regs.rcx as usize;
     let path = unsafe { core::slice::from_raw_parts(ptr, len) };
-    SyscallResult::val(vfs::chdir(path))
+    SyscallResult::val(do_chdir(path))
 }
 
 /// Get current directory

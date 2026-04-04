@@ -19,7 +19,7 @@ rust_static_library(
         "-Crelocation-model=static",
         "-Cforce-frame-pointers=yes",
     ],
-    deps = ["//lib"],
+    deps = ["//lib", "@ext4_view//:ext4_view"],
 )
 
 genrule(

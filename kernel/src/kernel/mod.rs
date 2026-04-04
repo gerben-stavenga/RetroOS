@@ -5,6 +5,7 @@
 
 pub mod dpmi;
 pub mod elf;
+pub mod ext4fs;
 pub mod hdd;
 pub mod heap;
 pub mod keyboard;

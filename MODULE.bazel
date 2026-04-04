@@ -48,6 +48,38 @@ http_archive(
     build_file = "//stdlib:rustc_demangle.BUILD",
 )
 
+http_archive(
+    name = "bitflags",
+    url = "https://static.crates.io/crates/bitflags/bitflags-2.9.0.crate",
+    type = "tar.gz",
+    strip_prefix = "bitflags-2.9.0",
+    build_file = "//stdlib:bitflags.BUILD",
+)
+
+http_archive(
+    name = "crc_catalog",
+    url = "https://static.crates.io/crates/crc-catalog/crc-catalog-2.4.0.crate",
+    type = "tar.gz",
+    strip_prefix = "crc-catalog-2.4.0",
+    build_file = "//stdlib:crc_catalog.BUILD",
+)
+
+http_archive(
+    name = "crc",
+    url = "https://static.crates.io/crates/crc/crc-3.2.1.crate",
+    type = "tar.gz",
+    strip_prefix = "crc-3.2.1",
+    build_file = "//stdlib:crc.BUILD",
+)
+
+http_archive(
+    name = "ext4_view",
+    url = "https://static.crates.io/crates/ext4-view/ext4-view-0.9.3.crate",
+    type = "tar.gz",
+    strip_prefix = "ext4-view-0.9.3",
+    build_file = "//stdlib:ext4_view.BUILD",
+)
+
 # Register toolchains
 register_toolchains(
     "@rules_nasm//nasm/toolchain",

@@ -10,6 +10,7 @@
 use core::panic::PanicInfo;
 
 extern crate alloc;
+extern crate ext4_view;
 extern crate rustc_demangle;
 
 mod arch;
@@ -75,7 +76,9 @@ impl<const N: usize> AlignedStack<N> {
     }
 }
 
-/// Kernel stack - 32KB (used for Ring 1 event loop)
+/// Kernel stack - 32KB (used for Ring 1 event loop).
+/// ext4-view's call chain needs ~20KB in debug builds; keep opt-level >= 1
+/// or increase this (max ~60KB before exceeding PDE[770]'s 1MB kernel region).
 #[unsafe(no_mangle)]
 pub static mut KERNEL_STACK: AlignedStack<{ 32 * 1024 }> = AlignedStack::new();
 

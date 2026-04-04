@@ -34,6 +34,27 @@ mod cmd {
 
 /// Primary ATA controller base port
 const PRIMARY_BASE: u16 = 0x1F0;
+const PRIMARY_CTRL: u16 = 0x3F6;
+
+/// Reset the ATA controller and wait for the drive to become ready.
+/// Needed after GRUB boot, which may leave the controller idle.
+pub fn reset() {
+    // Software reset: set SRST bit (bit 2) in Device Control register
+    outb(PRIMARY_CTRL, 0x04);
+    // Wait a bit (ATA spec says >= 5µs, a few inb delays suffice)
+    for _ in 0..4 { inb(PRIMARY_CTRL); }
+    // Clear SRST
+    outb(PRIMARY_CTRL, 0x00);
+    // Select master drive
+    outb(PRIMARY_BASE + reg::LBA_24_27_FLAGS, 0xE0);
+    // Wait for drive to come ready (BSY clears, DRDY sets)
+    for _ in 0..100_000 {
+        let s = inb(PRIMARY_BASE + reg::STATUS);
+        if (s & (status::BSY | status::DRDY)) == status::DRDY {
+            return;
+        }
+    }
+}
 
 /// Wait for disk to be ready (not busy, ready to accept commands)
 fn wait_disk_ready(port: u16) {

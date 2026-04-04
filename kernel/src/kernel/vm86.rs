@@ -2075,7 +2075,8 @@ fn int_21h(regs: &mut Regs) -> Action {
                 path[i] = ch;
                 i += 1;
             }
-            let result = crate::kernel::vfs::chdir(&path[..i]);
+            let i = dos_normalize_path(&mut path, i);
+            let result = dos_chdir(&path[..i]);
             if result < 0 {
                 regs.set_flag32(1); // set CF
                 regs.rax = (regs.rax & !0xFFFF) | 3; // AX=3 path not found
@@ -2098,13 +2099,16 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 i += 1;
             }
-            let name_str = core::str::from_utf8(&name[..i]).unwrap_or("?");
-            // Check for device names
+            // Check for device names (before normalization)
             if EMS_ENABLED && name[..i].eq_ignore_ascii_case(b"EMMXXXX0") {
                 regs.rax = (regs.rax & !0xFFFF) | EMS_DEVICE_HANDLE as u64;
                 regs.clear_flag32(1);
             } else {
-                let fd = crate::kernel::vfs::open(&name[..i]);
+                let i = dos_normalize_path(&mut name, i);
+                let mut rbuf = [0u8; 164];
+                let resolved = dos_resolve_path(&name[..i], &mut rbuf);
+                let name_str = core::str::from_utf8(resolved).unwrap_or("?");
+                let fd = crate::kernel::vfs::open(resolved);
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd);
@@ -2317,9 +2321,12 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 i += 1;
             }
-            let fd = crate::kernel::vfs::create(&name[..i]);
+            let i = dos_normalize_path(&mut name, i);
+            let mut rbuf = [0u8; 164];
+            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
+            let fd = crate::kernel::vfs::create(resolved);
             if fd >= 0 {
-                crate::dbg_println!("  -> create fd={} {}", fd, core::str::from_utf8(&name[..i]).unwrap_or("?"));
+                crate::dbg_println!("  -> create fd={} {}", fd, core::str::from_utf8(resolved).unwrap_or("?"));
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
@@ -2391,8 +2398,11 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 i += 1;
             }
+            let i = dos_normalize_path(&mut name, i);
+            let mut rbuf = [0u8; 164];
+            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
             // Check if file exists by trying to open it
-            let fd = crate::kernel::vfs::open(&name[..i]);
+            let fd = crate::kernel::vfs::open(resolved);
             if fd >= 0 {
                 crate::kernel::vfs::close(fd);
                 if al == 0 {
@@ -2638,7 +2648,10 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 i += 1;
             }
-            crate::kernel::vfs::delete(&name[..i]);
+            let i = dos_normalize_path(&mut name, i);
+            let mut rbuf = [0u8; 164];
+            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
+            crate::kernel::vfs::delete(resolved);
             regs.clear_flag32(1);
             Action::Done
         }
@@ -2680,11 +2693,14 @@ fn int_21h(regs: &mut Regs) -> Action {
                 addr += 1;
                 i += 1;
             }
+            let i = dos_normalize_path(&mut name, i);
+            let mut rbuf = [0u8; 164];
+            let resolved = dos_resolve_path(&name[..i], &mut rbuf);
             let open_exists = action & 0x01 != 0;
             let create_not = action & 0x10 != 0;
 
             // Try open first
-            let fd = crate::kernel::vfs::open(&name[..i]);
+            let fd = crate::kernel::vfs::open(resolved);
             if fd >= 0 && open_exists {
                 let size = crate::kernel::vfs::file_size(fd);
                 sft_set_file(fd as u16, size);
@@ -2698,7 +2714,7 @@ fn int_21h(regs: &mut Regs) -> Action {
             } else if create_not {
                 // File doesn't exist — create RAM-backed file via VFS overlay
                 if fd >= 0 { crate::kernel::vfs::close(fd); }
-                let new_fd = crate::kernel::vfs::create(&name[..i]);
+                let new_fd = crate::kernel::vfs::create(resolved);
                 if new_fd >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
@@ -2747,7 +2763,11 @@ fn int_2eh(regs: &mut Regs) -> Action {
     while end < copy && cmd[end] != b' ' && cmd[end] != b'\r' && cmd[end] != 0 { end += 1; }
     if end <= start { return Action::Done; }
 
-    fork_exec(regs, &cmd[start..end])
+    // Normalize the program name (shift into start of cmd buffer)
+    let plen = end - start;
+    cmd.copy_within(start..end, 0);
+    let plen = dos_normalize_path(&mut cmd, plen);
+    fork_exec(regs, &cmd[..plen])
 }
 
 // ============================================================================
@@ -3462,29 +3482,31 @@ fn int_67h(regs: &mut Regs) -> Action {
 }
 
 fn dos_open_program(name: &[u8]) -> i32 {
-    let fd = crate::kernel::vfs::open(name);
+    let mut rbuf = [0u8; 164];
+    let resolved = dos_resolve_path(name, &mut rbuf);
+    let fd = crate::kernel::vfs::open(resolved);
     if fd >= 0 { return fd; }
     // If the name already has a dot, don't try extensions
     if name.iter().any(|&c| c == b'.') { return fd; }
     // Try .COM
-    let len = name.len();
-    let mut buf = [0u8; 132];
-    if len + 4 <= buf.len() {
-        buf[..len].copy_from_slice(name);
-        buf[len..len + 4].copy_from_slice(b".COM");
-        let fd = crate::kernel::vfs::open(&buf[..len + 4]);
+    let rlen = resolved.len();
+    let mut buf = [0u8; 168];
+    if rlen + 4 <= buf.len() {
+        buf[..rlen].copy_from_slice(resolved);
+        buf[rlen..rlen + 4].copy_from_slice(b".COM");
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4]);
         if fd >= 0 { return fd; }
     }
     // Try .EXE
-    if len + 4 <= buf.len() {
-        buf[len..len + 4].copy_from_slice(b".EXE");
-        let fd = crate::kernel::vfs::open(&buf[..len + 4]);
+    if rlen + 4 <= buf.len() {
+        buf[rlen..rlen + 4].copy_from_slice(b".EXE");
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4]);
         if fd >= 0 { return fd; }
     }
     // Try .ELF
-    if len + 4 <= buf.len() {
-        buf[len..len + 4].copy_from_slice(b".ELF");
-        let fd = crate::kernel::vfs::open(&buf[..len + 4]);
+    if rlen + 4 <= buf.len() {
+        buf[rlen..rlen + 4].copy_from_slice(b".ELF");
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4]);
         if fd >= 0 { return fd; }
     }
     -2 // ENOENT
@@ -3651,12 +3673,18 @@ fn exec_program(regs: &mut Regs) -> Action {
         core::ptr::copy_nonoverlapping((cmdtail_addr + 1) as *const u8, tail.as_mut_ptr(), copy_len);
     }
 
+    // Normalize the filename (drive letters, backslashes)
+    let flen = dos_normalize_path(&mut filename, flen);
+
     // If COMMAND.COM /C, extract the real program name — we don't have
     // a real COMMAND.COM, just exec the target program directly.
     let fname: &[u8] = &filename[..flen];
     let is_shell = fname.windows(11).any(|w| w.eq_ignore_ascii_case(b"COMMAND.COM"));
     let mut ti = 0;
     while ti < copy_len && tail[ti] == b' ' { ti += 1; }
+
+    // For shell /C: extract and normalize the program name from tail
+    let mut norm_prog = [0u8; 128];
     let prog_name: &[u8] = if is_shell && ti + 1 < copy_len
         && tail[ti] == b'/' && (tail[ti + 1] == b'C' || tail[ti + 1] == b'c')
     {
@@ -3664,9 +3692,12 @@ fn exec_program(regs: &mut Regs) -> Action {
         while start < copy_len && tail[start] == b' ' { start += 1; }
         let mut end = start;
         while end < copy_len && tail[end] != b' ' && tail[end] != b'\r' && tail[end] != 0 { end += 1; }
-        &tail[start..end]
+        let plen = (end - start).min(128);
+        norm_prog[..plen].copy_from_slice(&tail[start..start + plen]);
+        let plen = dos_normalize_path(&mut norm_prog, plen);
+        &norm_prog[..plen]
     } else {
-        fname
+        &filename[..flen]
     };
 
     if is_shell {
@@ -3696,11 +3727,9 @@ fn exec_program(regs: &mut Regs) -> Action {
     let child_seg = thread::current().vm86.heap_seg;
     crate::println!("EXEC in-process: heap_seg={:#06x}", child_seg);
 
-    let mut resolved_buf = [0u8; 164];
-    let resolved_name = crate::kernel::vfs::resolve(prog_name, &mut resolved_buf);
     let mut resolved_copy = [0u8; 164];
-    let rlen = resolved_name.len().min(164);
-    resolved_copy[..rlen].copy_from_slice(&resolved_name[..rlen]);
+    let resolved_name = dos_resolve_path(prog_name, &mut resolved_copy);
+    let rlen = resolved_name.len();
 
     let (cs, ip, ss, sp, end_seg) = if is_exe {
         match load_exe_at(child_seg, COM_SEGMENT, &buf, &resolved_copy[..rlen]) {
@@ -3858,6 +3887,95 @@ fn dos_wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
     true
 }
 
+/// Change working directory. Path is already normalized (no drive letters, forward slashes).
+/// Updates the thread's cwd after validating the directory exists.
+fn dos_chdir(path: &[u8]) -> i32 {
+    if path == b".." {
+        let t = thread::current();
+        let cwd = t.cwd_str();
+        if cwd.is_empty() { return 0; }
+        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
+        let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
+            Some(pos) => pos + 1,
+            None => 0,
+        };
+        t.cwd_len = new_len;
+        return 0;
+    }
+
+    if path.is_empty() || path == b"/" {
+        thread::current().cwd_len = 0;
+        return 0;
+    }
+
+    let mut new_cwd = [0u8; 64];
+    let mut pos = 0;
+
+    if path[0] == b'/' {
+        for &b in &path[1..] {
+            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+        }
+    } else {
+        let cwd = thread::current().cwd_str();
+        for &b in cwd {
+            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+        }
+        for &b in path {
+            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
+        }
+    }
+    if pos > 0 && new_cwd[pos - 1] != b'/' {
+        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
+    }
+
+    let prefix = &new_cwd[..pos];
+    if !crate::kernel::vfs::dir_exists(prefix) {
+        return -2;
+    }
+
+    thread::current().set_cwd(prefix);
+    0
+}
+
+/// Resolve a normalized path to an absolute VFS path.
+/// Leading `/` = absolute (strip slash). Otherwise prepend cwd.
+/// Returns the resolved path length in `out`.
+fn dos_resolve_path<'a>(path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
+    let mut pos = 0;
+    if !path.is_empty() && path[0] == b'/' {
+        // Absolute — skip leading slash
+        for &b in &path[1..] {
+            if pos < out.len() { out[pos] = b; pos += 1; }
+        }
+    } else {
+        // Relative — prepend cwd
+        let cwd = thread::current().cwd_str();
+        for &b in cwd {
+            if pos < out.len() { out[pos] = b; pos += 1; }
+        }
+        for &b in path {
+            if pos < out.len() { out[pos] = b; pos += 1; }
+        }
+    }
+    &out[..pos]
+}
+
+/// Normalize a DOS path in-place: convert `\` to `/`, strip drive letter.
+/// `C:\foo` → `/foo` (absolute), `C:foo` → `foo` (relative), `\foo` → `/foo`.
+/// Returns the new path length.
+fn dos_normalize_path(buf: &mut [u8], len: usize) -> usize {
+    // Convert backslashes to forward slashes
+    for i in 0..len {
+        if buf[i] == b'\\' { buf[i] = b'/'; }
+    }
+    // Strip drive letter prefix (X: or X:/)
+    if len >= 2 && buf[0].is_ascii_alphabetic() && buf[1] == b':' {
+        buf.copy_within(2..len, 0);
+        return len - 2;
+    }
+    len
+}
+
 /// Strip DOS path prefix (e.g. "C:\*.*" -> "*.*", ".\*.*" -> "*.*")
 fn strip_dos_path(pat: &[u8]) -> &[u8] {
     // Find last backslash or colon
@@ -3875,10 +3993,11 @@ fn strip_dos_path(pat: &[u8]) -> &[u8] {
 /// FindFirst/FindNext helper: search directory from `start_index`, fill DTA on match.
 fn find_matching_file(regs: &mut Regs, pattern: &[u8], start_index: usize) -> Action {
     let pat = strip_dos_path(pattern);
+    let cwd = thread::current().cwd_str();
     let mut idx = start_index;
 
     loop {
-        match crate::kernel::vfs::readdir(idx) {
+        match crate::kernel::vfs::readdir(cwd, idx) {
             Some(entry) => {
                 idx += 1;
                 let name = &entry.name[..entry.name_len];

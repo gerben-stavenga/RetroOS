@@ -2,13 +2,18 @@
 
 extern crate alloc;
 
+extern crate ext4_view;
+
 use alloc::vec;
-use crate::kernel::{hdd, vfs, tarfs::TarFs};
+use crate::kernel::{hdd, vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
 static mut ROOT_TARFS: TarFs = TarFs::new(0);
+
+/// Ext4 filesystem (heap-allocated at boot, leaked to get &'static)
+static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 
 /// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
@@ -17,24 +22,62 @@ pub fn startup() -> ! {
 
     crate::kernel::thread::init_threading();
 
-    // Read MBR sector 0 to get filesystem start from partition table
+    // Reset ATA controller (needed when booted via GRUB)
+    hdd::reset();
+
+    // Read MBR sector 0 to get partition table
     let mut mbr = [0u8; 512];
     hdd::read_sectors(0, &mut mbr);
-    let start_sector = u32::from_le_bytes(mbr[0x1C6..0x1CA].try_into().unwrap());
-    println!("Initializing filesystem at sector {:#x}", start_sector);
 
-    // Mount TAR filesystem
-    unsafe {
-        ROOT_TARFS = TarFs::new(start_sector);
-        #[allow(static_mut_refs)]
-        vfs::mount_root(&ROOT_TARFS);
+    // Scan MBR partition table: 4 entries at 0x1BE, each 16 bytes
+    // Entry: [status, CHS_start(3), type, CHS_end(3), LBA_start(4), LBA_size(4)]
+    let mut has_ext4 = false;
+    for i in 0..4 {
+        let base = 0x1BE + i * 16;
+        let ptype = mbr[base + 4];
+        let lba = u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap());
+        if ptype == 0 { continue; }
+
+        match ptype {
+            0xDA => {
+                // TAR filesystem
+                println!("Partition {}: TAR at sector {:#x}", i, lba);
+                unsafe {
+                    ROOT_TARFS = TarFs::new(lba);
+                }
+            }
+            0x83 if !has_ext4 => {
+                // Linux ext4
+                println!("Partition {}: ext4 at sector {:#x}", i, lba);
+                match Ext4Fs::new(lba) {
+                    Ok(fs) => {
+                        let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+                        unsafe { EXT4_FS = Some(leaked); }
+                        vfs::mount(b"", leaked);
+                        has_ext4 = true;
+                        println!("  ext4 mounted as root");
+                    }
+                    Err(e) => println!("  ext4 mount failed: {}", e),
+                }
+            }
+            _ => {}
+        }
     }
+
+    // Mount TAR: at "tar/" if ext4 is root, otherwise as root itself
+    let tar_prefix: &[u8] = if has_ext4 { b"tar/" } else { b"" };
+    #[allow(static_mut_refs)]
+    unsafe { vfs::mount(tar_prefix, &ROOT_TARFS); }
+
     crate::kernel::stacktrace::init_from_tar();
+
+    // DN.COM path depends on where TAR is mounted
+    let dn_path: &[u8] = if has_ext4 { b"tar/DN/DN.COM" } else { b"DN/DN.COM" };
 
     loop {
         // Open and read DN.COM via VFS
-        let fd = vfs::open(b"DN/DN.COM");
-        if fd < 0 { panic!("DN/DN.COM not found"); }
+        let fd = vfs::open(dn_path);
+        if fd < 0 { panic!("DN.COM not found"); }
         let size = vfs::file_size(fd) as usize;
         let mut buf = vec![0u8; size];
         vfs::read(fd, &mut buf);
@@ -48,7 +91,7 @@ pub fn startup() -> ! {
         // The thread's root stays empty — event_loop captures it on first switch-away.
         arch_map_low_mem();
         vm86::setup_ivt();
-        let (cs, ip, ss, sp, end_seg) = vm86::load_com(&buf, b"DN/DN.COM");
+        let (cs, ip, ss, sp, end_seg) = vm86::load_com(&buf, dn_path);
 
         t.mode = thread::ThreadMode::Dos;
         thread::init_process_thread_vm86(t, vm86::COM_SEGMENT, cs, ip, ss, sp);

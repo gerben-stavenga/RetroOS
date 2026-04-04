@@ -1,2 +1,3 @@
 build --platforms=//toolchain:i686_retro_none
 build --@rules_rust//rust/toolchain/channel=nightly
+build -c opt

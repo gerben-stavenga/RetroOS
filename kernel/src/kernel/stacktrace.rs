@@ -62,7 +62,9 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 
 /// Initialize kernel symbol table by loading kernel.elf from TAR filesystem
 pub fn init_from_tar() {
-    let fd = vfs::open(b"kernel.elf");
+    // Try both mount layouts (TAR at root or at tar/)
+    let mut fd = vfs::open(b"kernel.elf");
+    if fd < 0 { fd = vfs::open(b"tar/kernel.elf"); }
     if fd < 0 {
         println!("stacktrace: kernel.elf not found");
         return;

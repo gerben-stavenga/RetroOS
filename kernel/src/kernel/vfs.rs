@@ -61,13 +61,23 @@ pub struct FileEntry {
     pub vnode: Vnode,
     pub offset: u32,
     pub refcount: u16,
+    /// Index into MOUNTS table (which filesystem owns this file)
+    pub mount_idx: u8,
     /// For RAM-backed files: normalized path key into RAM_FILES
     pub ram_key: [u8; PATH_KEY_MAX],
     pub ram_key_len: u8,
 }
 
-/// The backing filesystem (set once at startup)
-static mut ROOT_FS: Option<&'static dyn Filesystem> = None;
+/// Mount table entry
+struct Mount {
+    prefix: &'static [u8],  // e.g. b"" for root, b"tar/" for sub-mount
+    fs: &'static dyn Filesystem,
+}
+
+/// Mount table — up to 4 mounts, checked longest-prefix-first
+const MAX_MOUNTS: usize = 4;
+static mut MOUNTS: [Option<Mount>; MAX_MOUNTS] = [None, None, None, None];
+static mut MOUNT_COUNT: usize = 0;
 
 /// Writable file overlay — persists across open/close cycles
 static mut RAM_FILES: Option<BTreeMap<Vec<u8>, Vec<u8>>> = None;
@@ -77,14 +87,45 @@ fn ram_files() -> &'static mut BTreeMap<Vec<u8>, Vec<u8>> {
     unsafe { RAM_FILES.get_or_insert_with(BTreeMap::new) }
 }
 
-#[allow(static_mut_refs)]
-fn root_fs() -> &'static dyn Filesystem {
-    unsafe { ROOT_FS.expect("VFS: no filesystem mounted") }
+/// Find the mount whose prefix matches `path`, returning (mount_index, fs, path-after-prefix).
+/// Longest prefix wins.
+fn resolve_mount(path: &[u8]) -> (u8, &'static dyn Filesystem, &[u8]) {
+    let mut best_idx = 0u8;
+    let mut best_len = 0usize;
+    let mut found = false;
+    unsafe {
+        for i in 0..MOUNT_COUNT {
+            if let Some(ref m) = MOUNTS[i] {
+                let plen = m.prefix.len();
+                if m.prefix.is_empty() || (path.len() >= plen
+                    && eq_ignore_case(&path[..plen], m.prefix))
+                {
+                    if !found || plen > best_len {
+                        best_idx = i as u8;
+                        best_len = plen;
+                        found = true;
+                    }
+                }
+            }
+        }
+    }
+    if !found { panic!("VFS: no filesystem mounted"); }
+    let m = unsafe { MOUNTS[best_idx as usize].as_ref().unwrap() };
+    (best_idx, m.fs, &path[best_len..])
 }
 
-/// Mount a filesystem as the root. Must be called once at startup.
-pub fn mount_root(fs: &'static dyn Filesystem) {
-    unsafe { ROOT_FS = Some(fs); }
+/// Get a filesystem by mount index.
+fn mount_fs(idx: u8) -> &'static dyn Filesystem {
+    unsafe { MOUNTS[idx as usize].as_ref().expect("VFS: invalid mount index").fs }
+}
+
+/// Mount a filesystem at a prefix. Empty prefix = root.
+pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
+    unsafe {
+        assert!(MOUNT_COUNT < MAX_MOUNTS, "VFS: mount table full");
+        MOUNTS[MOUNT_COUNT] = Some(Mount { prefix, fs });
+        MOUNT_COUNT += 1;
+    }
 }
 
 /// Global file table — slot is free when refcount == 0
@@ -93,62 +134,16 @@ static mut FILE_TABLE: [FileEntry; MAX_OPEN_FILES] = {
         vnode: Vnode { handle: 0, size: 0 },
         offset: 0,
         refcount: 0,
+        mount_idx: 0,
         ram_key: [0; PATH_KEY_MAX],
         ram_key_len: 0,
     };
     [EMPTY; MAX_OPEN_FILES]
 };
 
-// ============================================================================
-// Path resolution (VFS-level, filesystem-agnostic)
-// ============================================================================
-
-/// Strip DOS path prefix (e.g. `C:\`, `.\`, `\`) from a path.
-fn strip_dos_prefix(path: &[u8]) -> &[u8] {
-    let mut start = 0;
-    if path.len() >= 2 && path[1] == b':' && path[0].is_ascii_alphabetic() {
-        start = 2;
-    }
-    while start < path.len() && (path[start] == b'\\' || path[start] == b'/') {
-        start += 1;
-    }
-    &path[start..]
-}
-
 /// Case-insensitive comparison of two byte slices
 pub fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
-}
-
-/// Resolve a path relative to the current working directory.
-fn resolve_path<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
-    let has_drive = path.len() >= 2 && path[1] == b':' && path[0].is_ascii_alphabetic();
-    let stripped = strip_dos_prefix(path);
-
-    let len = if stripped.is_empty() {
-        0
-    } else {
-        let mut pos = 0;
-        if !has_drive {
-            let cwd = crate::kernel::thread::current().cwd_str();
-            for &b in cwd {
-                if pos < buf.len() { buf[pos] = b; pos += 1; }
-            }
-        }
-        for &b in stripped {
-            if pos < buf.len() {
-                buf[pos] = if b == b'\\' { b'/' } else { b };
-                pos += 1;
-            }
-        }
-        pos
-    };
-    &buf[..len]
-}
-
-/// Resolve a path relative to cwd (public, for use by exec).
-pub fn resolve<'a>(path: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
-    resolve_path(path, buf)
 }
 
 // ============================================================================
@@ -179,14 +174,11 @@ fn alloc_fd(fds: &mut [i32; MAX_FDS]) -> Option<usize> {
 // Public API — called by syscalls.rs and vm86.rs
 // ============================================================================
 
-/// Open a file by path. Returns fd (>= 3) or negative error.
+/// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
 pub fn open(path: &[u8]) -> i32 {
-    let mut buf = [0u8; PATH_KEY_MAX];
-    let key = resolve_path(path, &mut buf);
-
     // Check RAM overlay first
     let ram = ram_files();
-    if let Some(data) = ram.get(key) {
+    if let Some(data) = ram.get(path) {
         let size = data.len() as u32;
         let table_idx = match alloc_file_entry() {
             Some(i) => i,
@@ -197,14 +189,15 @@ pub fn open(path: &[u8]) -> i32 {
             Some(f) => f,
             None => return -24,
         };
-        let key_len = key.len().min(PATH_KEY_MAX) as u8;
+        let key_len = path.len().min(PATH_KEY_MAX) as u8;
         let mut ram_key = [0u8; PATH_KEY_MAX];
-        ram_key[..key_len as usize].copy_from_slice(&key[..key_len as usize]);
+        ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
         unsafe {
             FILE_TABLE[table_idx] = FileEntry {
                 vnode: Vnode { handle: RAM_SENTINEL, size },
                 offset: 0,
                 refcount: 1,
+                mount_idx: 0,
                 ram_key,
                 ram_key_len: key_len,
             };
@@ -214,7 +207,8 @@ pub fn open(path: &[u8]) -> i32 {
     }
 
     // Fall back to mounted filesystem
-    let vnode = match root_fs().open(key) {
+    let (midx, fs, subpath) = resolve_mount(path);
+    let vnode = match fs.open(subpath) {
         Some(v) => v,
         None => return -2, // ENOENT
     };
@@ -235,6 +229,7 @@ pub fn open(path: &[u8]) -> i32 {
             vnode,
             offset: 0,
             refcount: 1,
+            mount_idx: midx,
             ram_key: [0; PATH_KEY_MAX],
             ram_key_len: 0,
         };
@@ -275,7 +270,7 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
         return 0;
     }
 
-    let n = root_fs().read(entry.vnode.handle, entry.offset, buf, entry.vnode.size);
+    let n = mount_fs(entry.mount_idx).read(entry.vnode.handle, entry.offset, buf, entry.vnode.size);
     if n > 0 {
         entry.offset += n as u32;
     }
@@ -296,7 +291,7 @@ pub fn read_raw(fd: i32, buf: &mut [u8]) -> i32 {
     if entry.refcount == 0 {
         return -9;
     }
-    root_fs().read(entry.vnode.handle, entry.offset, buf, entry.vnode.size)
+    mount_fs(entry.mount_idx).read(entry.vnode.handle, entry.offset, buf, entry.vnode.size)
 }
 
 /// Close a file descriptor.
@@ -319,13 +314,11 @@ pub fn close(fd: i32) -> i32 {
     0
 }
 
-/// Create (or truncate) a writable RAM-backed file.
+/// Create (or truncate) a writable RAM-backed file by absolute VFS path.
 pub fn create(path: &[u8]) -> i32 {
-    let mut buf = [0u8; PATH_KEY_MAX];
-    let key = resolve_path(path, &mut buf);
-    let key_len = key.len().min(PATH_KEY_MAX) as u8;
+    let key_len = path.len().min(PATH_KEY_MAX) as u8;
 
-    ram_files().insert(key.to_vec(), Vec::new());
+    ram_files().insert(path.to_vec(), Vec::new());
 
     let table_idx = match alloc_file_entry() {
         Some(i) => i,
@@ -338,12 +331,13 @@ pub fn create(path: &[u8]) -> i32 {
     };
 
     let mut ram_key = [0u8; PATH_KEY_MAX];
-    ram_key[..key_len as usize].copy_from_slice(&key[..key_len as usize]);
+    ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
     unsafe {
         FILE_TABLE[table_idx] = FileEntry {
             vnode: Vnode { handle: RAM_SENTINEL, size: 0 },
             offset: 0,
             refcount: 1,
+            mount_idx: 0,
             ram_key,
             ram_key_len: key_len,
         };
@@ -387,11 +381,9 @@ pub fn write(fd: i32, data: &[u8]) -> i32 {
     -9
 }
 
-/// Delete a RAM-backed file by path.
+/// Delete a RAM-backed file by absolute VFS path.
 pub fn delete(path: &[u8]) -> i32 {
-    let mut buf = [0u8; PATH_KEY_MAX];
-    let key = resolve_path(path, &mut buf);
-    if ram_files().remove(key).is_some() { 0 } else { -2 }
+    if ram_files().remove(path).is_some() { 0 } else { -2 }
 }
 
 /// Get the size of an open file descriptor.
@@ -447,27 +439,46 @@ pub fn seek(fd: i32, offset: i32, whence: i32) -> i32 {
     entry.offset as i32
 }
 
-/// Enumerate directory entries at index. Combines filesystem + RAM overlay.
-pub fn readdir(index: usize) -> Option<DirEntry> {
-    let cwd = crate::kernel::thread::current().cwd_str();
+/// Enumerate directory entries at index. Combines filesystem + mount points + RAM overlay.
+pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
+    let (_midx, fs, subpath) = resolve_mount(dir);
+    let mut remaining = index;
 
-    // Try filesystem first
-    if let Some(de) = root_fs().readdir(cwd, index) {
+    // Filesystem entries first
+    if let Some(de) = fs.readdir(subpath, remaining) {
         return Some(de);
     }
-
-    // Count filesystem entries to compute RAM overlay offset
     let mut fs_count = 0;
-    while root_fs().readdir(cwd, fs_count).is_some() {
-        fs_count += 1;
+    while fs.readdir(subpath, fs_count).is_some() { fs_count += 1; }
+    remaining -= fs_count;
+
+    // Synthesize mount point directories visible in this dir
+    unsafe {
+        for i in 0..MOUNT_COUNT {
+            if let Some(ref m) = MOUNTS[i] {
+                if let Some(name) = mount_child_in_dir(m.prefix, dir) {
+                    if remaining == 0 {
+                        let name_len = name.len().min(100);
+                        let mut de = DirEntry {
+                            name: [0; 100],
+                            name_len,
+                            size: 0,
+                            is_dir: true,
+                        };
+                        de.name[..name_len].copy_from_slice(&name[..name_len]);
+                        return Some(de);
+                    }
+                    remaining -= 1;
+                }
+            }
+        }
     }
 
-    // RAM overlay files in cwd
-    let ram_idx = index - fs_count;
+    // RAM overlay files
     let mut j = 0usize;
     for (key, data) in ram_files().iter() {
-        if let Some(basename) = entry_in_ram_dir(key, cwd) {
-            if j == ram_idx {
+        if let Some(basename) = entry_in_ram_dir(key, dir) {
+            if j == remaining {
                 let mut de = DirEntry {
                     name: [0; 100],
                     name_len: basename.len(),
@@ -484,6 +495,19 @@ pub fn readdir(index: usize) -> Option<DirEntry> {
     None
 }
 
+/// If a mount prefix is a direct child of `dir`, return the child name.
+/// e.g. mount "tar/" in dir "" → Some("tar"), mount "a/b/" in dir "a/" → Some("b").
+fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
+    // Mount prefix must start with dir
+    if prefix.len() <= dir.len() { return None; }
+    if !dir.is_empty() && !eq_ignore_case(&prefix[..dir.len()], dir) { return None; }
+    let rest = &prefix[dir.len()..];
+    // rest should be "name/" — one component with trailing slash
+    let name = rest.strip_suffix(b"/")?;
+    if name.is_empty() || name.contains(&b'/') { return None; }
+    Some(name)
+}
+
 fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     if entry_name.len() <= dir.len() { return None; }
     if !dir.is_empty() && !eq_ignore_case(&entry_name[..dir.len()], dir) { return None; }
@@ -492,54 +516,10 @@ fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     Some(rest)
 }
 
-/// Change current directory.
-pub fn chdir(path: &[u8]) -> i32 {
-    let stripped = strip_dos_prefix(path);
-
-    if stripped == b".." {
-        let t = crate::kernel::thread::current();
-        let cwd = t.cwd_str();
-        if cwd.is_empty() { return 0; }
-        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
-        let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
-            Some(pos) => pos + 1,
-            None => 0,
-        };
-        t.cwd_len = new_len;
-        return 0;
-    }
-
-    if stripped.is_empty() || stripped == b"/" || stripped == b"\\" {
-        let t = crate::kernel::thread::current();
-        t.cwd_len = 0;
-        return 0;
-    }
-
-    let mut new_cwd = [0u8; 64];
-    let mut pos = 0;
-
-    let t = crate::kernel::thread::current();
-    let cwd = t.cwd_str();
-    for &b in cwd {
-        if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
-    }
-    for &b in stripped {
-        if pos < new_cwd.len() {
-            new_cwd[pos] = if b == b'\\' { b'/' } else { b };
-            pos += 1;
-        }
-    }
-    if pos > 0 && new_cwd[pos - 1] != b'/' {
-        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
-    }
-
-    let prefix = &new_cwd[..pos];
-    if !root_fs().dir_exists(prefix) {
-        return -2;
-    }
-
-    t.set_cwd(prefix);
-    0
+/// Check if a directory exists on a mounted filesystem.
+pub fn dir_exists(path: &[u8]) -> bool {
+    let (_midx, fs, subpath) = resolve_mount(path);
+    fs.dir_exists(subpath)
 }
 
 /// Duplicate all FDs from src into dst (for fork).
