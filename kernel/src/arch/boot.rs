@@ -49,6 +49,7 @@ pub unsafe extern "C" fn boot_kernel(info: *const crate::MultibootInfo) -> ! {
     #[allow(static_mut_refs)]
     let arch_stack_top = unsafe { crate::ARCH_STACK.top() as u32 } - 16;
     descriptors::setup_descriptor_tables(arch_stack_top);
+    descriptors::setup_syscall();
 
     // Multiboot info is in low memory — access through LOW_MEM_BASE mapping
     let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const crate::MultibootInfo) };

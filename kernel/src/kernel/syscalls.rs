@@ -81,7 +81,11 @@ pub fn dispatch_action(tid: usize, regs: &mut Regs) -> thread::KernelAction {
     let args = extract_args(regs);
     let nr = regs.rax as u32;
 
-    let result = dispatch_nr(tid, nr, &args, regs);
+    let result = if regs.mode() == crate::UserMode::Mode64 {
+        dispatch_nr_64(tid, nr, &args, regs)
+    } else {
+        dispatch_nr(tid, nr, &args, regs)
+    };
 
     regs.rax = result.retval as u64;
     match result.switch_to {
@@ -147,6 +151,67 @@ fn dispatch_nr(tid: usize, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult 
         355 => sys_getrandom(a),
         _ => {
             println!("unimplemented syscall {}", nr);
+            SyscallResult::val(-ENOSYS)
+        }
+    }
+}
+
+/// x86_64 syscall number table (different numbers, same implementations)
+fn dispatch_nr_64(tid: usize, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
+    println!("sc64 t{} nr={} a0={:#x} a1={:#x} a2={:#x}", tid, nr, a.a0, a.a1, a.a2);
+    match nr {
+        0   => sys_read(tid, a, regs),
+        1   => sys_write(tid, a),
+        2   => sys_open(tid, a),
+        3   => sys_close(tid, a),
+        4   => sys_stat64(tid, a),     // stat
+        5   => sys_fstat64(tid, a),    // fstat
+        6   => sys_stat64(tid, a),     // lstat = stat (no symlinks)
+        7   => sys_poll(tid, a),
+        8   => sys_lseek(tid, a),
+        9   => sys_mmap2(tid, a),      // mmap (offset in bytes, not pages)
+        10  => SyscallResult::val(0),  // mprotect
+        11  => sys_munmap(tid, a),
+        12  => sys_brk(tid, a),
+        13  => SyscallResult::val(0),  // rt_sigaction
+        14  => SyscallResult::val(0),  // rt_sigprocmask
+        16  => SyscallResult::val(-ENOTTY), // ioctl
+        20  => sys_writev(tid, a),
+        21  => sys_access(tid, a),
+        22  => sys_pipe(tid, a, false),
+        24  => sys_sched_yield(tid, regs),
+        33  => sys_dup2(tid, a),
+        35  => sys_nanosleep(),
+        39  => sys_getpid(tid),
+        56  => sys_clone(tid, a, regs),
+        57  => sys_fork(tid, a, regs),
+        59  => sys_execve(tid, a, regs),
+        60  => sys_exit(tid, a),
+        61  => sys_wait4(tid, a, regs),
+        72  => sys_fcntl(tid, a),
+        79  => sys_getcwd(tid, a),
+        80  => sys_chdir(tid, a),
+        89  => SyscallResult::val(-ENOENT), // readlink
+        96  => sys_clock_gettime(a),   // gettimeofday (reuse)
+        102 | 104 | 107 | 108 => SyscallResult::val(0), // get{u,g,eu,eg}id
+        110 => sys_getpid(tid),        // getppid (stub → pid)
+        131 => SyscallResult::val(0),  // sigaltstack
+        158 => sys_arch_prctl(tid, a, regs), // arch_prctl (TLS)
+        200 => sys_exit(tid, a),       // tkill → exit
+        202 => SyscallResult::val(0),  // futex
+        217 => sys_getdents64(tid, a),
+        218 => sys_set_tid_address(tid),
+        228 => sys_clock_gettime(a),
+        231 => sys_exit(tid, a),       // exit_group
+        234 => sys_exit(tid, a),       // tgkill → exit
+        257 => sys_openat(tid, a),
+        262 => sys_fstatat64(tid, a),  // newfstatat
+        267 => SyscallResult::val(-ENOENT), // readlinkat
+        293 => sys_pipe(tid, a, true), // pipe2
+        302 => SyscallResult::val(0),  // prlimit64
+        318 => sys_getrandom(a),
+        _ => {
+            println!("unimplemented x86_64 syscall {}", nr);
             SyscallResult::val(-ENOSYS)
         }
     }
@@ -1306,6 +1371,31 @@ fn sys_set_thread_area_with_tid(tid: usize, a: &Args) -> SyscallResult {
         }
     }
     result
+}
+
+/// arch_prctl(158) — x86_64 TLS via FS/GS base.
+/// Stores the base in regs.fs/gs — arch layer writes MSR on return to user.
+fn sys_arch_prctl(_tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
+    const ARCH_SET_GS: u64 = 0x1001;
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_FS: u64 = 0x1003;
+    const ARCH_GET_GS: u64 = 0x1004;
+
+    match a.a0 {
+        ARCH_SET_FS => { regs.fs = a.a1; SyscallResult::val(0) }
+        ARCH_SET_GS => { regs.gs = a.a1; SyscallResult::val(0) }
+        ARCH_GET_FS => {
+            let ptr = a.a1 as usize as *mut u64;
+            if !ptr.is_null() { unsafe { *ptr = regs.fs; } }
+            SyscallResult::val(0)
+        }
+        ARCH_GET_GS => {
+            let ptr = a.a1 as usize as *mut u64;
+            if !ptr.is_null() { unsafe { *ptr = regs.gs; } }
+            SyscallResult::val(0)
+        }
+        _ => SyscallResult::val(-EINVAL),
+    }
 }
 
 /// set_tid_address(258)

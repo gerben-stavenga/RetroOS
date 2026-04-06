@@ -290,8 +290,8 @@ impl Regs {
         const IF_FLAG: u64 = 1 << 9;
 
         *self = Self::empty();
-        self.gs = ds;
-        self.fs = ds;
+        self.gs = 0;   // FS/GS are MSR bases in 64-bit mode, 0 = no TLS yet
+        self.fs = 0;
         self.es = ds;
         self.ds = ds;
         self.frame = Frame64 {

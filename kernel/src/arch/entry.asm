@@ -153,7 +153,7 @@ entry_wrapper_32:
     push64_32 eax
 
     ; Set all segments to kernel data selector
-    mov eax, 0x10           ; kernel data selector
+    mov eax, 0x18           ; kernel data selector
     mov ds, eax
     mov es, eax
     mov fs, eax
@@ -247,7 +247,7 @@ trampoline_64_to_32:
     ; Now in 32-bit mode, ESP = low 32 bits of RSP (points to Regs)
     ; SS is null (long mode same-privilege interrupt sets SS=0).
     ; Must load a valid 32-bit data segment before any push/pop.
-    mov ax, 0x10
+    mov ax, 0x18
     mov ss, ax
     ; Build mock stack frame with full 64-bit rbp/rip values
     ; Offset to Frame64.rip: 32 + 64 + 64 + 16 = 176
@@ -295,19 +295,25 @@ entry_wrapper_64:
     push r14
     push r15
 
-    ; Save segment registers (zero-extended)
+    ; Save segment registers: DS/ES as selectors, FS/GS as MSR bases (64-bit TLS)
     xor rax, rax
     mov ax, ds
     push rax
     mov ax, es
     push rax
-    mov ax, fs
+    mov ecx, 0xC0000100     ; FS_BASE MSR
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
     push rax
-    mov ax, gs
+    mov ecx, 0xC0000101     ; GS_BASE MSR
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
     push rax
 
     ; Set segments to kernel data selector
-    mov ax, 0x10
+    mov ax, 0x18
     mov ds, ax
     mov es, ax
 
@@ -315,11 +321,19 @@ entry_wrapper_64:
     jmp far [rel far_ptr_32]
 
 exit_interrupt_64:
-    ; Restore segment registers
+    ; Restore GS base (MSR 0xC0000101)
     pop rax
-    mov gs, ax
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000101
+    wrmsr
+    ; Restore FS base (MSR 0xC0000100)
     pop rax
-    mov fs, ax
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000100
+    wrmsr
+    ; Restore ES, DS selectors
     pop rax
     mov es, ax
     pop rax
@@ -351,6 +365,72 @@ exit_interrupt_64:
     iretq
 
 ; =============================================================================
+; SYSCALL entry (64-bit)
+; CPU sets: RCX=user_rip, R11=user_rflags, CS=STAR[47:32], SS=STAR[47:32]+8
+; RSP unchanged (still user stack). RCX/R11 clobbered from user's perspective.
+; Builds a Regs frame identical to entry_wrapper_64, then joins the same path.
+; =============================================================================
+global syscall_entry_64
+syscall_entry_64:
+    ; Swap to kernel stack — save user RSP in scratch variable
+    mov [rel syscall_user_rsp], rsp
+    mov rsp, [rel syscall_kernel_rsp]
+
+    ; Build Frame64: SS, RSP, RFLAGS, CS, RIP (high address → low)
+    push qword 0x2B            ; SS  = USER_DS  (0x28 | 3)
+    push qword [rel syscall_user_rsp] ; RSP = user stack pointer
+    push r11                    ; RFLAGS (saved by SYSCALL)
+    push qword 0x33            ; CS  = USER_CS64 (0x30 | 3)
+    push rcx                    ; RIP (saved by SYSCALL)
+
+    ; int_num / err_code (match interrupt vector layout)
+    push qword 0               ; err_code
+    push qword 0x80            ; int_num = syscall
+
+    ; Save general-purpose registers (same order as entry_wrapper_64)
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    push rsp                    ; dummy rsp
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Save segment registers: DS/ES as selectors, FS/GS as MSR bases (64-bit TLS)
+    xor rax, rax
+    mov ax, ds
+    push rax
+    mov ax, es
+    push rax
+    mov ecx, 0xC0000100     ; FS_BASE MSR
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    push rax
+    mov ecx, 0xC0000101     ; GS_BASE MSR
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    push rax
+
+    ; Set segments to kernel data selector
+    mov ax, 0x18
+    mov ds, ax
+    mov es, ax
+
+    ; Join the common interrupt path (far jump to 32-bit trampoline)
+    jmp far [rel far_ptr_32]
+
+; =============================================================================
 ; Interrupt vector table (32-bit)
 ; =============================================================================
 [bits 32]
@@ -378,7 +458,15 @@ far_ptr_32:
 align 8
 far_ptr_64:
     dd exit_interrupt_64    ; 32-bit offset (in 32-bit mode, only low 32 bits used)
-    dw 0x18                 ; 64-bit code segment
+    dw 0x10                 ; 64-bit code segment
+
+section .bss
+align 8
+syscall_user_rsp:   resq 1
+global syscall_kernel_rsp
+syscall_kernel_rsp: resq 1
+
+section .text
 
 ; Each entry is 8 bytes (aligned), pushes interrupt number and jumps to entry_wrapper.
 ; Vectors 0-127: push imm8 (positive, 2 bytes). Vectors 128-255: push imm8 with

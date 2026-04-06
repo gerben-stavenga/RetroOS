@@ -36,6 +36,14 @@ platform(
 )
 
 platform(
+    name = "x86_64_linux_musl",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
     name = "x86_64_retro_none",
     constraint_values = [
         "@platforms//cpu:x86_64",
@@ -116,6 +124,30 @@ toolchain(
         "@platforms//os:linux",
     ],
     toolchain = ":bare_cc_toolchain_musl",
+    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
+)
+
+bare_cc_toolchain_config(name = "bare_cc_config_musl64")
+
+cc_toolchain(
+    name = "bare_cc_toolchain_musl64",
+    all_files = ":empty_files",
+    compiler_files = ":empty_files",
+    dwp_files = ":empty_files",
+    linker_files = ":empty_files",
+    objcopy_files = ":empty_files",
+    strip_files = ":empty_files",
+    toolchain_config = ":bare_cc_config_musl64",
+)
+
+toolchain(
+    name = "bare_cc_toolchain_musl64_def",
+    exec_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    toolchain = ":bare_cc_toolchain_musl64",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 

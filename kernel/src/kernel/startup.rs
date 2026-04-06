@@ -241,7 +241,11 @@ fn event_loop(first_tid: usize) {
         let regs = unsafe { &mut *(&raw mut REGS) };
 
         // signal_thread handles its own cleanup; wrap into KernelAction
+        // TODO: 64-bit child exit corrupts 32-bit parent's FS/TLS — parent
+        //       segfaults on TLS access (FS BASE=0) after resuming.
         if event == 14 {
+            let rip = regs.frame.rip;
+            crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, extra, regs.err_code);
             if let Some(next) = thread::signal_thread(thread, tid, extra as usize) {
                 tid = next;
                 if tid == 0 { return; }

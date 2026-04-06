@@ -7,7 +7,7 @@
 use crate::pipe::Pipe;
 
 const MAX_PIPES: usize = 64;
-const PIPE_BUF_SIZE: usize = 4096;
+const PIPE_BUF_SIZE: usize = 1024;
 
 /// A kernel pipe with refcounted endpoints
 struct KernelPipe {

@@ -54,6 +54,7 @@ _BASE_FILES = {
     "//apps/dn:DN.FLG": "DN/DN.FLG",
     "//apps/dn:DN.HIS": "DN/DN.HIS",
     "//apps/linux_test:hello_linux": "HI",
+    "//apps/hello64_linux:hello64_linux": "HI64",
 }
 
 # Public image (shareware only)

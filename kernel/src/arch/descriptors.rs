@@ -16,16 +16,14 @@
 
 use crate::arch::x86::{self, GdtPtr, IdtPtr};
 
-/// Segment selectors - 32-bit (compatibility mode)
+/// Segment selectors
 pub const KERNEL_CS: u16 = 0x08;
-pub const KERNEL_DS: u16 = 0x10;
-pub const USER_CS: u16 = 0x20 | 3; // Ring 3
-pub const USER_DS: u16 = 0x28 | 3; // Ring 3
-pub const TSS32_SEL: u16 = 0x38;
-
-/// Segment selectors - 64-bit (long mode)
-pub const KERNEL_CS64: u16 = 0x18;
+pub const KERNEL_CS64: u16 = 0x10;   // SYSCALL CS = STAR[47:32]
+pub const KERNEL_DS: u16 = 0x18;     // SYSCALL SS = STAR[47:32]+8
+pub const USER_CS: u16 = 0x20 | 3;   // Ring 3
+pub const USER_DS: u16 = 0x28 | 3;   // Ring 3
 pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
+pub const TSS32_SEL: u16 = 0x38;
 pub const TSS64_SEL: u16 = 0x40;
 
 /// Segment selectors - ring 1 (OS kernel)
@@ -268,11 +266,11 @@ pub fn int_intercepted(int_num: u8) -> bool {
 /// GDT entry indices
 const GDT_NULL: usize = 0;        // 0x00
 const GDT_KERNEL_CS: usize = 1;   // 0x08
-const GDT_KERNEL_DS: usize = 2;   // 0x10
-const GDT_KERNEL_CS64: usize = 3; // 0x18
-const GDT_USER_CS: usize = 4;     // 0x20
-const GDT_USER_DS: usize = 5;     // 0x28
-const GDT_USER_CS64: usize = 6;   // 0x30
+const GDT_KERNEL_CS64: usize = 2; // 0x10 — STAR[47:32], SYSCALL CS
+const GDT_KERNEL_DS: usize = 3;   // 0x18 — STAR[47:32]+8, SYSCALL SS
+const GDT_USER_CS: usize = 4;     // 0x20 — STAR[63:48], SYSRET base
+const GDT_USER_DS: usize = 5;     // 0x28 — SYSRET SS
+const GDT_USER_CS64: usize = 6;   // 0x30 — SYSRET CS (64-bit)
 const GDT_TSS32: usize = 7;       // 0x38
 const GDT_TSS64_LO: usize = 8;    // 0x40
 const GDT_TSS64_HI: usize = 9;    // 0x48 (null - upper 32 bits of base are 0)
@@ -303,11 +301,11 @@ struct Idt64 {
 static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::null(),               // 0x00: Null
     GdtEntry::segment32(true, 0),   // 0x08: Kernel Code 32-bit (ring 0)
-    GdtEntry::segment32(false, 0),  // 0x10: Kernel Data (ring 0)
-    GdtEntry::segment64(0),         // 0x18: Kernel Code 64-bit (ring 0)
-    GdtEntry::segment32(true, 3),   // 0x20: User Code 32-bit (ring 3)
-    GdtEntry::segment32(false, 3),  // 0x28: User Data (ring 3)
-    GdtEntry::segment64(3),         // 0x30: User Code 64-bit (ring 3)
+    GdtEntry::segment64(0),         // 0x10: Kernel Code 64-bit (SYSCALL CS)
+    GdtEntry::segment32(false, 0),  // 0x18: Kernel Data (SYSCALL SS)
+    GdtEntry::segment32(true, 3),   // 0x20: User Code 32-bit (SYSRET base)
+    GdtEntry::segment32(false, 3),  // 0x28: User Data (SYSRET SS)
+    GdtEntry::segment64(3),         // 0x30: User Code 64-bit (SYSRET CS)
     GdtEntry::null(),               // 0x38: TSS32 (filled at runtime)
     GdtEntry::null(),               // 0x40: TSS64 low (filled at runtime)
     GdtEntry::null(),               // 0x48: TSS64 high (always null for <4GB)
@@ -349,6 +347,9 @@ pub fn set_kernel_stack(stack: u32) {
 pub fn set_kernel_stack_64(stack: u64) {
     unsafe {
         TSS64.sp0 = stack;
+        // Keep SYSCALL entry's kernel RSP in sync
+        unsafe extern "C" { static mut syscall_kernel_rsp: u64; }
+        syscall_kernel_rsp = stack;
     }
 }
 
@@ -546,6 +547,44 @@ pub fn toggle_mode(new_cr3: u32) {
         load_prot_mode_descriptors();
     }
     x86::sti();
+}
+
+/// SYSCALL/SYSRET MSR addresses
+const STAR_MSR: u32 = 0xC0000081;
+const LSTAR_MSR: u32 = 0xC0000082;
+const FMASK_MSR: u32 = 0xC0000084;
+
+/// Set up SYSCALL MSRs for 64-bit user processes.
+/// Call once during init, after GDT/TSS are configured.
+pub fn setup_syscall() {
+    if !crate::arch::paging2::cpu_supports_long_mode() {
+        return;
+    }
+    unsafe {
+        // STAR: bits [47:32] = SYSCALL CS, bits [63:48] = SYSRET base
+        // SYSCALL loads CS=STAR[47:32], SS=STAR[47:32]+8
+        // SYSRET loads CS=STAR[63:48]|3 (32-bit) or STAR[63:48]+16|3 (64-bit), SS=STAR[63:48]+8|3
+        let star = ((USER_CS as u64 & !3) << 48) | ((KERNEL_CS64 as u64) << 32);
+        x86::wrmsr(STAR_MSR, star);
+
+        // LSTAR: 64-bit entry point for SYSCALL
+        unsafe extern "C" { static syscall_entry_64: u8; }
+        let entry_addr = &syscall_entry_64 as *const u8 as u64;
+        x86::wrmsr(LSTAR_MSR, entry_addr);
+
+        // FMASK: clear TF|IF|DF|IOPL|NT|AC on SYSCALL entry
+        x86::wrmsr(FMASK_MSR, 0x47700);
+
+        // Enable SYSCALL in EFER
+        let efer = x86::rdmsr(x86::EFER_MSR);
+        x86::wrmsr(x86::EFER_MSR, efer | x86::efer::SCE);
+
+        // Sync kernel RSP for SYSCALL entry
+        unsafe extern "C" { static mut syscall_kernel_rsp: u64; }
+        syscall_kernel_rsp = TSS64.sp0;
+    }
+
+    crate::println!("SYSCALL enabled");
 }
 
 /// Drop from ring 0 to ring 1 in place.
