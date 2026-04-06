@@ -16,14 +16,14 @@ _BASE_FILES = {
     ":kernel_md5": "kernel.elf.md5",
     "//kernel:kernel_elf": "kernel.elf",
     "//apps/printmsg:printmsg_elf": "printmsg.elf",
-    "//apps/hello64:hello64_elf": "hello64.elf",
     "//apps/stress:stress_elf": "stress.elf",
     "//apps/shell:shell_elf": "shell.elf",
-    "//apps/stress64:stress64_elf": "stress64.elf",
     "//apps/hello_com:hello_com": "HELLO.COM",
     "//apps/gfx_com:gfx_com": "GFX.COM",
-    "//apps/hello_com:COMMAND.COM": "COMMAND.COM",
+    "//apps/hello_com:command_com": "COMMAND.COM",
+    "//apps/command:command.c": "COMMAND.C",
     "//apps/hello_com:TEST.COM": "TEST.COM",
+    "//apps/hello_com:TEST.BAT": "TEST.BAT",
     "//apps/keen4:Keen4e.exe": "KEEN4/KEEN4E.EXE",
     "//apps/keen4:AUDIO.CK4": "KEEN4/AUDIO.CK4",
     "//apps/keen4:CONFIG.CK4": "KEEN4/CONFIG.CK4",
@@ -53,69 +53,7 @@ _BASE_FILES = {
     "//apps/dn:DN.XRN": "DN/DN.XRN",
     "//apps/dn:DN.FLG": "DN/DN.FLG",
     "//apps/dn:DN.HIS": "DN/DN.HIS",
-}
-
-# Proprietary files (not for public distribution)
-_PROPRIETARY_FILES = {
-    "//apps-proprietary:NC.EXE": "NC.EXE",
-    "//apps-proprietary:NC.INI": "NC.INI",
-    "//apps-proprietary/doom:DEFAULT.CFG": "DOOM/DEFAULT.CFG",
-    "//apps-proprietary/doom:DM.DOC": "DOOM/DM.DOC",
-    "//apps-proprietary/doom:DM.EXE": "DOOM/DM.EXE",
-    "//apps-proprietary/doom:DMFAQ66A.TXT": "DOOM/DMFAQ66A.TXT",
-    "//apps-proprietary/doom:DMFAQ66B.TXT": "DOOM/DMFAQ66B.TXT",
-    "//apps-proprietary/doom:DMFAQ66C.TXT": "DOOM/DMFAQ66C.TXT",
-    "//apps-proprietary/doom:DMFAQ66D.TXT": "DOOM/DMFAQ66D.TXT",
-    "//apps-proprietary/doom:DOOMORG.EXE": "DOOM/DOOM.EXE",
-    "//apps-proprietary/doom:DWANGO.DOC": "DOOM/DWANGO.DOC",
-    "//apps-proprietary/doom:DWANGO.EXE": "DOOM/DWANGO.EXE",
-    "//apps-proprietary/doom:DWANGO.SRV": "DOOM/DWANGO.SRV",
-    "//apps-proprietary/doom:DWANGO.STR": "DOOM/DWANGO.STR",
-    "//apps-proprietary/doom:HELPME.TXT": "DOOM/HELPME.TXT",
-    "//apps-proprietary/doom:IPXSETUP.EXE": "DOOM/IPXSETUP.EXE",
-    "//apps-proprietary/doom:MODEM.CFG": "DOOM/MODEM.CFG",
-    "//apps-proprietary/doom:MODEM.NUM": "DOOM/MODEM.NUM",
-    "//apps-proprietary/doom:MODEM.STR": "DOOM/MODEM.STR",
-    "//apps-proprietary/doom:ORDER.FRM": "DOOM/ORDER.FRM",
-    "//apps-proprietary/doom:README.TXT": "DOOM/README.TXT",
-    "//apps-proprietary/doom:SERSETUP.EXE": "DOOM/SERSETUP.EXE",
-    "//apps-proprietary/doom:SETUP.EXE": "DOOM/SETUP.EXE",
-    "//apps-proprietary/doom:SETUP.PIF": "DOOM/SETUP.PIF",
-    "//apps-proprietary/doom:doom.wad": "DOOM/DOOM.WAD",
-    "//apps-proprietary/prince:prince.exe": "PRINCE/PRINCE.EXE",
-    "//apps-proprietary/prince:prince.dat": "PRINCE/PRINCE.DAT",
-    "//apps-proprietary/prince:levels.dat": "PRINCE/LEVELS.DAT",
-    "//apps-proprietary/prince:title.dat": "PRINCE/TITLE.DAT",
-    "//apps-proprietary/prince:kid.dat": "PRINCE/KID.DAT",
-    "//apps-proprietary/prince:guard.dat": "PRINCE/GUARD.DAT",
-    "//apps-proprietary/prince:guard1.dat": "PRINCE/GUARD1.DAT",
-    "//apps-proprietary/prince:guard2.dat": "PRINCE/GUARD2.DAT",
-    "//apps-proprietary/prince:shadow.dat": "PRINCE/SHADOW.DAT",
-    "//apps-proprietary/prince:skel.dat": "PRINCE/SKEL.DAT",
-    "//apps-proprietary/prince:vizier.dat": "PRINCE/VIZIER.DAT",
-    "//apps-proprietary/prince:fat.dat": "PRINCE/FAT.DAT",
-    "//apps-proprietary/prince:pv.dat": "PRINCE/PV.DAT",
-    "//apps-proprietary/prince:vdungeon.dat": "PRINCE/VDUNGEON.DAT",
-    "//apps-proprietary/prince:vpalace.dat": "PRINCE/VPALACE.DAT",
-    "//apps-proprietary/prince:edungeon.dat": "PRINCE/EDUNGEON.DAT",
-    "//apps-proprietary/prince:epalace.dat": "PRINCE/EPALACE.DAT",
-    "//apps-proprietary/prince:cdungeon.dat": "PRINCE/CDUNGEON.DAT",
-    "//apps-proprietary/prince:cpalace.dat": "PRINCE/CPALACE.DAT",
-    "//apps-proprietary/prince:digisnd1.dat": "PRINCE/DIGISND1.DAT",
-    "//apps-proprietary/prince:digisnd2.dat": "PRINCE/DIGISND2.DAT",
-    "//apps-proprietary/prince:digisnd3.dat": "PRINCE/DIGISND3.DAT",
-    "//apps-proprietary/prince:ibm_snd1.dat": "PRINCE/IBM_SND1.DAT",
-    "//apps-proprietary/prince:ibm_snd2.dat": "PRINCE/IBM_SND2.DAT",
-    "//apps-proprietary/prince:midisnd1.dat": "PRINCE/MIDISND1.DAT",
-    "//apps-proprietary/prince:midisnd2.dat": "PRINCE/MIDISND2.DAT",
-    "//apps-proprietary/prince:mt32snd1.dat": "PRINCE/MT32SND1.DAT",
-    "//apps-proprietary/prince:mt32snd2.dat": "PRINCE/MT32SND2.DAT",
-    "//apps-proprietary/prince:config.dat": "PRINCE/CONFIG.DAT",
-    "//apps-proprietary/prince:setup.dat": "PRINCE/SETUP.DAT",
-    "//apps-proprietary/prince:setup.cfg": "PRINCE/SETUP.CFG",
-    "//apps-proprietary/quake:QUAKE.EXE": "QUAKE/QUAKE.EXE",
-    "//apps-proprietary/quake:CWSDPMI.EXE": "QUAKE/CWSDPMI.EXE",
-    "//apps-proprietary/quake:id1/PAK0.PAK": "QUAKE/ID1/PAK0.PAK",
+    "//apps/linux_test:hello_linux": "HI",
 }
 
 # Public image (shareware only)
@@ -124,10 +62,11 @@ pkg_tar(
     files = _BASE_FILES,
 )
 
-# Full image with proprietary binaries
+# Full image with proprietary binaries (auto-globbed from //apps-proprietary).
 pkg_tar(
     name = "fs_tar_proprietary",
-    files = dict(_BASE_FILES.items() + _PROPRIETARY_FILES.items()),
+    files = _BASE_FILES,
+    deps = ["//apps-proprietary:tar"],
 )
 
 # Strip first 512 bytes (TAR header) so bootloader starts at offset 0
@@ -142,7 +81,7 @@ genrule(
     name = "image_proprietary",
     srcs = [":fs_tar_proprietary"],
     outs = ["image_proprietary.bin"],
-    cmd = "tail -c +513 $< > $@ && truncate -s 64M $@",
+    cmd = "tail -c +513 $< > $@ && truncate -s 256M $@",
 )
 
 # Image with ext4 test partition

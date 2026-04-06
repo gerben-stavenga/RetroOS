@@ -11,6 +11,7 @@ rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
     versions = ["nightly/2025-01-15"],
+    extra_target_triples = ["i686-unknown-linux-musl"],
 )
 use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
@@ -87,4 +88,5 @@ register_toolchains(
     "//toolchain:retro_rust_toolchain_64",
     "//toolchain:bare_cc_toolchain_def",
     "//toolchain:bare_cc_toolchain_64_def",
+    "//toolchain:bare_cc_toolchain_musl_def",
 )

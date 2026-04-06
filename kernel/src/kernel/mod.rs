@@ -9,6 +9,7 @@ pub mod ext4fs;
 pub mod hdd;
 pub mod heap;
 pub mod keyboard;
+pub mod kpipe;
 // pipe.rs moved to crate root (shared between arch and kernel)
 pub mod stacktrace;
 pub mod startup;

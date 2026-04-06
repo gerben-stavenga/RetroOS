@@ -56,6 +56,7 @@ pub mod arch_call {
     pub const FLUSH_TLB: u64 = 0x114;    // Sync PDPT + re-write CR3
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start, ECX=num_pages, EBX=ppage_start
+    pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
 }
 
 fn arch_dispatch(regs: &mut Regs) {
@@ -135,6 +136,13 @@ fn arch_dispatch(regs: &mut Regs) {
             for i in 0..num_pages {
                 paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64, flags);
             }
+        }
+        arch_call::SET_TLS_ENTRY => {
+            let index = regs.rdx as i32;
+            let base = regs.rcx as u32;
+            let limit = regs.rbx as u32;
+            let limit_in_pages = regs.rdi != 0;
+            regs.rax = crate::arch::descriptors::set_tls_entry(index, base, limit, limit_in_pages) as u64;
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }

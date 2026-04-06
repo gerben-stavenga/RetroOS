@@ -1,22 +1,15 @@
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("//toolchain:musl_transition.bzl", "musl_binary")
 
-rust_static_library(
-    name = "printmsg_lib",
+rust_binary(
+    name = "printmsg_bin",
     srcs = ["src/main.rs"],
-    crate_name = "printmsg",
     edition = "2024",
-    rustc_flags = [
-        "-Cpanic=abort",
-        "-Crelocation-model=static",
-        "-Cforce-frame-pointers=yes",
-    ],
-    deps = ["//crt"],
+    rustc_flags = ["-Copt-level=s", "-Cstrip=symbols", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld", "-Ctarget-feature=-sse,-sse2"],
 )
 
-genrule(
+musl_binary(
     name = "printmsg_elf",
-    srcs = [":printmsg_lib", "//crt:user.ld"],
-    outs = ["printmsg.elf"],
-    cmd = "ld.lld -m elf_i386 -T $(location //crt:user.ld) -o $@ $(location :printmsg_lib)",
+    binary = ":printmsg_bin",
     visibility = ["//visibility:public"],
 )

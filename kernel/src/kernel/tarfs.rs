@@ -171,6 +171,75 @@ impl Filesystem for TarFs {
         None
     }
 
+    fn list_dir(&self, dir: &[u8], buf: &mut [DirEntry]) -> usize {
+        let mut count = 0usize;
+
+        // Phase 1: collect unique subdirectory names
+        let mut dirs: [[u8; 64]; 32] = [[0; 64]; 32];
+        let mut dir_lens: [usize; 32] = [0; 32];
+        let mut dir_count = 0usize;
+        let mut block: u32 = 0;
+        loop {
+            let entry = match self.read_header(block) {
+                Some(e) => e,
+                None => break,
+            };
+            let name = &entry.name[..entry.name_len];
+            if name.len() > dir.len() {
+                let prefix = &name[..dir.len()];
+                if dir.is_empty() || eq_ignore_case(prefix, dir) {
+                    let rest = &name[dir.len()..];
+                    if let Some(slash) = rest.iter().position(|&b| b == b'/') {
+                        let dir_name = &rest[..slash];
+                        let mut dup = false;
+                        for j in 0..dir_count {
+                            if dir_lens[j] == dir_name.len() && eq_ignore_case(&dirs[j][..dir_lens[j]], dir_name) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if !dup && dir_count < 32 {
+                            let len = dir_name.len().min(64);
+                            dirs[dir_count][..len].copy_from_slice(&dir_name[..len]);
+                            dir_lens[dir_count] = len;
+                            dir_count += 1;
+                        }
+                    }
+                }
+            }
+            block = entry.next_block;
+        }
+
+        // Emit directory entries
+        for i in 0..dir_count {
+            if count >= buf.len() { return count; }
+            let len = dir_lens[i];
+            buf[count] = DirEntry { name: [0; 100], name_len: len, size: 0, is_dir: true };
+            buf[count].name[..len].copy_from_slice(&dirs[i][..len]);
+            count += 1;
+        }
+
+        // Phase 2: emit files in one pass
+        block = 0;
+        loop {
+            match self.read_header(block) {
+                Some(entry) => {
+                    if count >= buf.len() { return count; }
+                    let name = &entry.name[..entry.name_len];
+                    if let Some(basename) = entry_in_dir(name, dir) {
+                        let blen = basename.len();
+                        buf[count] = DirEntry { name: [0; 100], name_len: blen, size: entry.size, is_dir: false };
+                        buf[count].name[..blen].copy_from_slice(basename);
+                        count += 1;
+                    }
+                    block = entry.next_block;
+                }
+                None => break,
+            }
+        }
+        count
+    }
+
     fn dir_exists(&self, path: &[u8]) -> bool {
         let mut block: u32 = 0;
         loop {

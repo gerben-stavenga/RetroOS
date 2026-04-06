@@ -71,24 +71,20 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 /// Initialize kernel symbol table by loading kernel.elf from TAR filesystem
 pub fn init_from_tar() {
     // Try both mount layouts (TAR at root or at tar/)
-    // Use boot thread's fds for kernel-internal VFS access
-    let fds = match &mut thread::get_thread(0).unwrap().mode {
-        thread::ThreadMode::Dos(d) => &mut d.fds,
-        thread::ThreadMode::Linux(l) => &mut l.fds,
-    };
-    let mut fd = vfs::open(b"kernel.elf", fds);
-    if fd < 0 { fd = vfs::open(b"tar/kernel.elf", fds); }
-    if fd < 0 {
+    // Use handle-based VFS access (no per-thread fd slot needed)
+    let mut handle = vfs::open_to_handle(b"kernel.elf");
+    if handle < 0 { handle = vfs::open_to_handle(b"tar/kernel.elf"); }
+    if handle < 0 {
         println!("stacktrace: kernel.elf not found");
         return;
     }
-    let size = vfs::file_size(fd, fds) as usize;
+    let size = vfs::file_size_by_handle(handle) as usize;
 
     println!("Loading kernel.elf ({} bytes) for symbols", size);
 
     let mut elf_data = vec![0u8; size];
-    vfs::read(fd, &mut elf_data, fds);
-    vfs::close(fd, fds);
+    vfs::read_by_handle(handle, &mut elf_data);
+    vfs::close_vfs_handle(handle);
 
     let elf_box: Box<[u8]> = elf_data.into_boxed_slice();
 

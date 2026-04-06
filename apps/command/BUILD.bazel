@@ -1,0 +1,1 @@
+exports_files(["command.c"], visibility = ["//visibility:public"])

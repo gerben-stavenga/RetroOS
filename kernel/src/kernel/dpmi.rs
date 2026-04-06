@@ -352,12 +352,12 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 /// Only handles sensitive instructions that cause #GP from ring 3:
 /// I/O, CLI/STI, PUSHF/POPF, HLT, IRET. INT instructions arrive as direct
 /// events via the IDT (DPL=3 for 0x30-0xFF).
-pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
             crate::println!("DPMI: GP fault but no DPMI state!");
-            return None;
+            return thread::KernelAction::Done;
         }
     };
 
@@ -443,7 +443,7 @@ pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> 
             regs.set_ip32(regs.ip32().wrapping_add(advance));
             trace_client_selector_leak("dpmi_monitor.hlt", regs);
             // Mark thread Ready and schedule
-            return thread::yield_thread(tid, regs);
+            return thread::KernelAction::Yield;
         }
         // IRET — pop IP/CS/FLAGS, size depends on operand size
         0xCF => {
@@ -454,7 +454,7 @@ pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> 
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
                 if new_cs == 0 {
                     let _ = dpmi;
-                    return dispatch_dpmi_exception(tid, dos, regs, 13);
+                    return dispatch_dpmi_exception(dos, regs, 13);
                 }
                 set_sp(regs, sp.wrapping_add(12));
                 regs.set_ip32(new_eip);
@@ -467,7 +467,7 @@ pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> 
                 let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u16) } as u32;
                 if new_cs == 0 {
                     let _ = dpmi;
-                    return dispatch_dpmi_exception(tid, dos, regs, 13);
+                    return dispatch_dpmi_exception(dos, regs, 13);
                 }
                 set_sp(regs, sp.wrapping_add(6));
                 regs.set_ip32(new_ip as u32);
@@ -476,63 +476,59 @@ pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> 
                 regs.set_flags32((new_flags & !(0x3000 | (1 << 17))) | preserved);
             }
             trace_client_selector_leak("dpmi_monitor.iret", regs);
-            return None; // Don't advance IP — we set it
+            return thread::KernelAction::Done; // Don't advance IP — we set it
         }
         // IN AL, imm8
         0xE4 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            match vm86::emulate_inb(dos, port) {
-                Ok(val) => { regs.rax = (regs.rax & !0xFF) | val as u64; }
-                Err(_) => {}
-            }
+            let val = vm86::emulate_inb(dos, port);
+            regs.rax = (regs.rax & !0xFF) | val as u64;
         }
         // IN AL, DX
         0xEC => {
             let port = regs.rdx as u16;
-            match vm86::emulate_inb(dos, port) {
-                Ok(val) => { regs.rax = (regs.rax & !0xFF) | val as u64; }
-                Err(_) => {}
-            }
+            let val = vm86::emulate_inb(dos, port);
+            regs.rax = (regs.rax & !0xFF) | val as u64;
         }
         // OUT imm8, AL
         0xE6 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            let _ = vm86::emulate_outb(dos, port, regs.rax as u8);
+            vm86::emulate_outb(dos, port, regs.rax as u8);
         }
         // OUT DX, AL
         0xEE => {
             let port = regs.rdx as u16;
-            let _ = vm86::emulate_outb(dos, port, regs.rax as u8);
+            vm86::emulate_outb(dos, port, regs.rax as u8);
         }
         // IN AX, imm8 (16-bit)
         0xE5 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            let lo = vm86::emulate_inb(dos, port).unwrap_or(0xFF);
-            let hi = vm86::emulate_inb(dos, port + 1).unwrap_or(0xFF);
+            let lo = vm86::emulate_inb(dos, port);
+            let hi = vm86::emulate_inb(dos, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | lo as u64 | ((hi as u64) << 8);
         }
         // IN AX, DX (16-bit)
         0xED => {
             let port = regs.rdx as u16;
-            let lo = vm86::emulate_inb(dos, port).unwrap_or(0xFF);
-            let hi = vm86::emulate_inb(dos, port + 1).unwrap_or(0xFF);
+            let lo = vm86::emulate_inb(dos, port);
+            let hi = vm86::emulate_inb(dos, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | lo as u64 | ((hi as u64) << 8);
         }
         // OUT imm8, AX (16-bit)
         0xE7 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            let _ = vm86::emulate_outb(dos, port, regs.rax as u8);
-            let _ = vm86::emulate_outb(dos, port + 1, (regs.rax >> 8) as u8);
+            vm86::emulate_outb(dos, port, regs.rax as u8);
+            vm86::emulate_outb(dos, port + 1, (regs.rax >> 8) as u8);
         }
         // OUT DX, AX (16-bit)
         0xEF => {
             let port = regs.rdx as u16;
-            let _ = vm86::emulate_outb(dos, port, regs.rax as u8);
-            let _ = vm86::emulate_outb(dos, port + 1, (regs.rax >> 8) as u8);
+            vm86::emulate_outb(dos, port, regs.rax as u8);
+            vm86::emulate_outb(dos, port + 1, (regs.rax >> 8) as u8);
         }
         // INT imm8 — software interrupt (GP faults because IDT DPL=0 for vectors < 0x30)
         0xCD => {
@@ -569,12 +565,12 @@ pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> 
                 return reflect_int_to_real_mode(dos, regs, vector);
             }
             trace_client_selector_leak("dpmi_monitor.int", regs);
-            return None;
+            return thread::KernelAction::Done;
         }
         _ => {
             // Not a sensitive instruction — dispatch to client exception handler
             let modrm = unsafe { *((flat_eip.wrapping_add(offset + 1)) as *const u8) };
-            return dispatch_dpmi_exception(tid, dos, regs, 13);
+            return dispatch_dpmi_exception(dos, regs, 13);
         }
     }
 
@@ -585,7 +581,7 @@ pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> 
         regs.set_ip32(new_ip & 0xFFFF);
     }
     trace_client_selector_leak("dpmi_monitor.step", regs);
-    None
+    thread::KernelAction::Done
 }
 
 // ============================================================================
@@ -595,7 +591,7 @@ pub fn dpmi_monitor(tid: usize, dos: &mut thread::DosState, regs: &mut Regs) -> 
 /// Handle a software INT from DPMI protected mode that arrived as a direct
 /// IDT event (DPL=3 vectors). Dispatch to PM handler if installed, else
 /// reflect to real mode via IVT.
-pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> Option<usize> {
+pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     dpmi_trace!("[DPMI] SOFTINT {:02X} CS:EIP={:04x}:{:#x}", vector, regs.code_seg(), regs.ip32());
     let dpmi = dos.dpmi.as_ref().unwrap();
     // Note: stub-segment dispatch now goes through INT 31h → pm_stub_dispatch,
@@ -618,7 +614,7 @@ pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) ->
         }
         regs.set_cs32(sel as u32);
         regs.set_ip32(off);
-        None
+        thread::KernelAction::Done
     } else {
         // No PM handler — reflect to real mode
         reflect_int_to_real_mode(dos, regs, vector)
@@ -631,7 +627,7 @@ pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) ->
 
 /// Dispatch INT 31h that came from the stub segment (CS == stub_sel).
 /// Slot = (EIP - STUB_BASE - 2) / 2.
-fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let stub_base = vm86::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
@@ -657,7 +653,7 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
             else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
             regs.set_ip32(ret_eip);
             regs.set_cs32(ret_cs);
-            None
+            thread::KernelAction::Done
         }
         _ => {
             // Default: reflect to real mode via IVT.
@@ -691,13 +687,13 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
 /// Handle INT 31h from protected mode. Called from event loop when event=0x31.
 /// If CS is the stub segment, dispatch by slot number (reflect or PM-only stubs).
 /// Otherwise, dispatch as DPMI API by AX.
-pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
             crate::println!("DPMI: INT 31h but no DPMI state!");
             set_carry(regs);
-            return None;
+            return thread::KernelAction::Done;
         }
     };
 
@@ -720,7 +716,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> 
         // Returns: AX = base selector
         0x0000 => {
             let count = (regs.rcx & 0xFFFF) as usize;
-            if count == 0 { set_carry(regs); return None; }
+            if count == 0 { set_carry(regs); return thread::KernelAction::Done; }
             // Allocate contiguous selectors (simplified: allocate one at a time)
             // DPMI spec: allocated descriptors must be present, DPL=3, data, writable
             let first = dpmi.alloc_ldt();
@@ -1067,7 +1063,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> 
         // BX:CX = size in bytes. Returns: BX:CX = linear address, SI:DI = handle
         0x0501 => {
             let size = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
-            if size == 0 { set_carry(regs); return None; }
+            if size == 0 { set_carry(regs); return thread::KernelAction::Done; }
             // Align to page boundary
             let aligned = (size + 0xFFF) & !0xFFF;
             let base = dpmi.mem_next;
@@ -1081,7 +1077,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> 
                     break;
                 }
             }
-            if !stored { set_carry(regs); return None; }
+            if !stored { set_carry(regs); return thread::KernelAction::Done; }
             // Return linear address in BX:CX
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | (base & 0xFFFF) as u64;
@@ -1242,7 +1238,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> 
     }
 
     trace_client_selector_leak("dpmi_int31.exit", regs);
-    None
+    thread::KernelAction::Done
 }
 
 // ============================================================================
@@ -1260,7 +1256,7 @@ struct RmCallStruct {
 }
 
 /// INT 31h/0300h — Simulate Real Mode Interrupt
-fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool) -> Option<usize> {
+fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool) -> thread::KernelAction {
     let dpmi = dos.dpmi.as_mut().unwrap();
     let int_num = regs.rbx as u8;
 
@@ -1327,7 +1323,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bo
 
     // Now in VM86 mode — the event loop will execute the BIOS handler.
     // When it IRETs to callback_stub, INT 31h fires, and callback_return() is called.
-    None
+    thread::KernelAction::Done
 }
 
 /// Reflect a software INT from protected mode to real mode via the IVT.
@@ -1336,7 +1332,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bo
 /// the low 16 bits of EAX/EBX/ECX/EDX/ESI/EDI/EBP + segment regs are
 /// forwarded to the real-mode handler.  On return (callback_return),
 /// the updated real-mode registers are copied back before resuming PM.
-fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> Option<usize> {
+fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     let dpmi = dos.dpmi.as_mut().unwrap();
 
     // Translate PM selector bases to real-mode segments (base >> 4)
@@ -1385,14 +1381,14 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     regs.fs = rm_fs as u64;
     regs.gs = rm_gs as u64;
 
-    crate::dbg_println!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
-        vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32());
+    crate::dbg_println!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X}",
+        vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), regs.rax as u16);
 
-    None
+    thread::KernelAction::Done
 }
 
 /// INT 31h/0301h — Call Real Mode Far Procedure
-fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool) -> Option<usize> {
+fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool) -> thread::KernelAction {
     let dpmi = dos.dpmi.as_mut().unwrap();
 
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
@@ -1439,11 +1435,11 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool)
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
     regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
-    None
+    thread::KernelAction::Done
 }
 
 /// INT 31h/0302h — Call Real Mode Procedure with IRET Frame
-fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool) -> Option<usize> {
+fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool) -> thread::KernelAction {
     let dpmi = dos.dpmi.as_mut().unwrap();
 
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
@@ -1488,7 +1484,7 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs, cs_32: 
     regs.frame.rip = rm.ip as u64;
     regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
 
-    None
+    thread::KernelAction::Done
 }
 
 /// Real-mode callback entry — real-mode code called one of our callback stubs.
@@ -1694,14 +1690,13 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -
 ///   [ESP+20] Faulting EFLAGS
 ///   [ESP+24] Faulting ESP (optional, for SS faults)
 ///   [ESP+28] Faulting SS (optional, for SS faults)
-pub fn dispatch_dpmi_exception(tid: usize, dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> Option<usize> {
+pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
     dpmi_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code);
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
         None => {
-            let next = thread::exit_thread(tid, -(exc_num as i32));
-            return Some(next);
+            return thread::KernelAction::Exit(-(exc_num as i32));
         }
     };
 
@@ -1716,8 +1711,7 @@ pub fn dispatch_dpmi_exception(tid: usize, dos: &mut thread::DosState, regs: &mu
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
         crate::println!("{:?}", regs);
-        let next = thread::exit_thread(tid, -(exc_num as i32));
-        return Some(next);
+        return thread::KernelAction::Exit(-(exc_num as i32));
     }
 
     // Build exception frame on client's stack
@@ -1755,7 +1749,7 @@ pub fn dispatch_dpmi_exception(tid: usize, dos: &mut thread::DosState, regs: &mu
     regs.frame.cs = handler_sel as u64;
     regs.set_ip32(handler_off);
 
-    None
+    thread::KernelAction::Done
 }
 
 /// Handle return from a DPMI exception handler (event 0xF2 from PM).
@@ -1771,10 +1765,10 @@ pub fn dispatch_dpmi_exception(tid: usize, dos: &mut thread::DosState, regs: &mu
 ///   [old ESP+12] faulting EFLAGS
 ///   [old ESP+16] faulting ESP
 ///   [old ESP+20] faulting SS
-fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
-        None => return None,
+        None => return thread::KernelAction::Done,
     };
 
     // The INT F2h trap saved the handler's CS:EIP (stub) and SS:ESP on kernel stack.
@@ -1806,7 +1800,7 @@ fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
     let preserved = regs.flags32() & (0x3000 | (1 << 17));
     regs.set_flags32((new_eflags & !(0x3000 | (1 << 17))) | preserved);
     trace_client_selector_leak("exception_return.out", regs);
-    None
+    thread::KernelAction::Done
 }
 
 // ============================================================================
@@ -1824,7 +1818,7 @@ fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> Option<usize> {
+fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -1847,7 +1841,7 @@ fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> Option
     regs.gs = 0;
     crate::dbg_println!("[DPMI] raw PM->RM {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         new_cs, new_ip, new_ss, new_sp);
-    None
+    thread::KernelAction::Done
 }
 
 /// Real-to-PM raw mode switch.

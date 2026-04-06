@@ -1,8 +1,7 @@
-//! Keyboard input — scancode-to-ASCII conversion and global input pipe
+//! Keyboard input — scancode-to-ASCII conversion tables and key state
 //!
-//! Ported from the C++ codebase's ProcessKey / key_pipe.
-
-use crate::pipe::Pipe;
+//! Pure utility: scancode tables and shift-state tracking.
+//! OS personalities (Linux TTY, DOS BIOS) call into this for conversion.
 
 const LSHIFT: u8 = 0x2A;
 const RSHIFT: u8 = 0x36;
@@ -57,43 +56,29 @@ const KBD_US_SHIFT: [i8; 128] = [
 /// Per-key up/down state (128 keys, 1 bit each = 16 bytes)
 static mut KEY_STATE: [u8; 16] = [0; 16];
 
-/// Global keyboard input pipe
-static mut KEY_PIPE: Pipe<u8, 1024> = Pipe::new(0);
-
 fn key_down(key: u8) -> bool {
     unsafe { KEY_STATE[(key >> 3) as usize] & (1 << (key & 7)) != 0 }
 }
 
-/// Process a raw PS/2 scancode (Set 1). Called from keyboard IRQ handler.
-pub fn process_key(scancode: u8) {
+/// Update key up/down state from a raw scancode. Returns true if key was pressed (not released).
+pub fn update_key_state(scancode: u8) -> bool {
     let key = scancode & 0x7F;
     let released = scancode & 0x80 != 0;
-
     unsafe {
         if released {
             KEY_STATE[(key >> 3) as usize] &= !(1 << (key & 7));
         } else {
             KEY_STATE[(key >> 3) as usize] |= 1 << (key & 7);
-
-            let shift = key_down(LSHIFT) || key_down(RSHIFT);
-            let c = if shift { KBD_US_SHIFT[key as usize] } else { KBD_US[key as usize] };
-            if c <= 0 { return; }
-
-            (*(&raw mut KEY_PIPE)).push(c as u8);
         }
     }
+    !released
 }
 
-/// Convert a scancode to ASCII (no state mutation). Returns 0 for non-printable keys.
+/// Convert a scancode to ASCII using current shift state. Returns 0 for non-printable keys.
 pub fn scancode_to_ascii(scancode: u8) -> u8 {
     let key = scancode & 0x7F;
     if key as usize >= KBD_US.len() { return 0; }
     let shift = key_down(LSHIFT) || key_down(RSHIFT);
     let c = if shift { KBD_US_SHIFT[key as usize] } else { KBD_US[key as usize] };
     if c <= 0 { 0 } else { c as u8 }
-}
-
-/// Read up to buf.len() bytes from the keyboard pipe. Returns count.
-pub fn read(buf: &mut [u8]) -> usize {
-    unsafe { (*(&raw mut KEY_PIPE)).read(buf) }
 }

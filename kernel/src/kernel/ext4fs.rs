@@ -219,6 +219,50 @@ impl Filesystem for Ext4Fs {
         None
     }
 
+    fn list_dir(&self, dir: &[u8], buf: &mut [DirEntry]) -> usize {
+        let mut path_buf = [0u8; 256];
+        let abs = if dir.is_empty() {
+            "/"
+        } else {
+            match make_absolute(dir, &mut path_buf) {
+                Some(s) => s,
+                None => return 0,
+            }
+        };
+
+        let read_dir = match self.fs.read_dir(abs) {
+            Ok(rd) => rd,
+            Err(_) => return 0,
+        };
+
+        let mut count = 0usize;
+        for entry_result in read_dir {
+            if count >= buf.len() { break; }
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name_path = entry.path();
+            let name_bytes: &[u8] = name_path.as_ref();
+            let basename = match name_bytes.iter().rposition(|&b| b == b'/') {
+                Some(pos) => &name_bytes[pos + 1..],
+                None => name_bytes,
+            };
+            if basename == b"." || basename == b".." || basename.is_empty() {
+                continue;
+            }
+            let is_dir = entry.file_type().ok().map_or(false, |ft| ft.is_dir());
+            let size = if is_dir { 0 } else {
+                entry.metadata().map(|m| m.len() as u32).unwrap_or(0)
+            };
+            let name_len = basename.len().min(100);
+            buf[count] = DirEntry { name: [0; 100], name_len, size, is_dir };
+            buf[count].name[..name_len].copy_from_slice(&basename[..name_len]);
+            count += 1;
+        }
+        count
+    }
+
     fn dir_exists(&self, path: &[u8]) -> bool {
         if path.is_empty() {
             return true;

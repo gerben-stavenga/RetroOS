@@ -17,14 +17,20 @@ pub const USER_STACK_PAGES: usize = 16;  // 64KB stack
 pub struct LoadedElf {
     pub entry: u64,
     pub class: ElfClass,
+    /// Highest virtual address used by any PT_LOAD segment (page-aligned up)
+    pub max_vaddr: usize,
 }
 
 /// Load an ELF executable into user address space
 pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
+    let mut max_vaddr = 0usize;
+
     // First pass: copy data (pages demand-allocated on access)
     for seg in elf.segments() {
+        let end = seg.vaddr + seg.memsz;
+        if end > max_vaddr { max_vaddr = end; }
         if let Some(data) = seg.data {
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), seg.vaddr as *mut u8, data.len());
@@ -52,5 +58,8 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
         }
     }
 
-    Ok(LoadedElf { entry: elf.entry(), class: elf.class() })
+    // Page-align max_vaddr up for use as heap base
+    max_vaddr = (max_vaddr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    Ok(LoadedElf { entry: elf.entry(), class: elf.class(), max_vaddr })
 }

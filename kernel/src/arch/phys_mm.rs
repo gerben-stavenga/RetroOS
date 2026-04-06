@@ -172,9 +172,6 @@ pub fn inc_shared_count(page: u64) -> bool {
         }
 
         PAGE_REFS[page as usize] = count + 1;
-        if page >= 0x900 && page <= 0x910 {
-            crate::println!("inc {:#x} {}->{}",  page, count, count + 1);
-        }
         true
     }
 }

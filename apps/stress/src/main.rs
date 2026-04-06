@@ -1,79 +1,93 @@
-#![no_std]
-#![no_main]
+use std::io::Write;
 
-/// 32-bit stress test: fork a binary tree to depth, alternating 32/64-bit execs.
-/// Verifies COW by filling pages with a marker before fork and checking after.
+/// Raw Linux i386 fork via INT 0x80
+fn fork() -> i32 {
+    let ret: i32;
+    unsafe { std::arch::asm!(
+        "int 0x80",
+        inout("eax") 2i32 => ret, // __NR_fork
+        out("ebx") _,
+        out("ecx") _,
+        out("edx") _,
+        options(nostack),
+    ); }
+    ret
+}
+
+/// Raw Linux i386 waitpid(-1, &status, 0)
+fn wait_all() {
+    loop {
+        let mut status: i32 = 0;
+        let ret: i32;
+        unsafe { std::arch::asm!(
+            "int 0x80",
+            inout("eax") 7i32 => ret, // __NR_waitpid
+            in("ebx") -1i32,
+            in("ecx") &mut status as *mut i32,
+            in("edx") 0i32,
+            options(nostack),
+        ); }
+        if ret < 0 { break; }
+    }
+}
 
 /// 4 pages of memory for COW verification
 const CHECK_WORDS: usize = 4 * 4096 / 4;
 static mut MEM_CHECK: [u32; CHECK_WORDS] = [0; CHECK_WORDS];
 
 fn fill_pages(marker: u32) {
-    let base = unsafe { &raw mut MEM_CHECK } as *mut u32;
+    let base = &raw mut MEM_CHECK as *mut u32;
     for i in 0..CHECK_WORDS {
         unsafe { core::ptr::write_volatile(base.add(i), marker); }
     }
 }
 
 fn check_pages(marker: u32) {
-    let base = unsafe { &raw const MEM_CHECK } as *const u32;
+    let base = &raw const MEM_CHECK as *const u32;
     for i in 0..CHECK_WORDS {
         let val = unsafe { core::ptr::read_volatile(base.add(i)) };
         if val != marker {
-            crt::print("FAIL: mem[");
-            crt::print_num(i as i32);
-            crt::print("] = ");
-            crt::print_num(val as i32);
-            crt::print(" expected ");
-            crt::print_num(marker as i32);
-            crt::print("\n");
-            crt::exit(2);
+            eprintln!("FAIL: mem[{}] = {:#x} expected {:#x}", i, val, marker);
+            std::process::exit(2);
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub fn main(args: &[&str]) {
-    let depth = if args.len() > 1 { crt::parse_int(args[1]) } else { 0 };
-    stress(depth);
-}
-
 fn stress(depth: i32) {
-    crt::print("s32 depth=");
-    crt::print_num(depth);
-    crt::print("\n");
+    print!("s32 depth={}\n", depth);
+    std::io::stdout().flush().ok();
 
-    if depth <= 0 {
-        return;
-    }
+    if depth <= 0 { return; }
 
-    // Fill pages with depth-unique marker before forking
     let marker = depth as u32 | 0xDEAD_0000;
     fill_pages(marker);
 
-    // Fork child 1: stays 32-bit, recurses (gets COW copy, will overwrite in recursive stress)
-    let pid1 = crt::fork();
+    // Fork child 1: recurse
+    let pid1 = fork();
     if pid1 == 0 {
         stress(depth - 1);
-        crt::exit(0);
+        std::process::exit(0);
     }
 
-    // Fork child 2: just exit (stress64 disabled for debugging)
-    let pid2 = crt::fork();
+    // Fork child 2: just exit
+    let pid2 = fork();
     if pid2 == 0 {
-        crt::exit(0);
+        std::process::exit(0);
     }
 
-    // // Fork child 3: exec HELLO.COM (VM86 mode)
-    // let pid3 = crt::fork();
-    // if pid3 == 0 {
-    //     crt::exec("HELLO.COM", &[]);
-    //     crt::print("exec HELLO.COM failed\n");
-    //     crt::exit(1);
-    // }
+    wait_all();
 
-    crt::wait_all();
-
-    // Verify our pages survived children's COW writes and exec
+    // Verify our pages survived children's COW writes
     check_pages(marker);
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let depth = if args.len() > 1 {
+        args[1].parse().unwrap_or(3)
+    } else {
+        3
+    };
+    stress(depth);
+    println!("stress OK");
 }

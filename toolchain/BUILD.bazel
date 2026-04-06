@@ -28,6 +28,14 @@ platform(
 )
 
 platform(
+    name = "i686_linux_musl",
+    constraint_values = [
+        "@platforms//cpu:x86_32",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
     name = "x86_64_retro_none",
     constraint_values = [
         "@platforms//cpu:x86_64",
@@ -36,11 +44,12 @@ platform(
 )
 
 # =============================================================================
-# CC toolchains (minimal, for bare-metal)
+# CC toolchains (minimal, for bare-metal and musl)
 # =============================================================================
 
 bare_cc_toolchain_config(name = "bare_cc_config")
 bare_cc_toolchain_config(name = "bare_cc_config_64")
+bare_cc_toolchain_config(name = "bare_cc_config_musl")
 
 cc_toolchain(
     name = "bare_cc_toolchain",
@@ -85,6 +94,28 @@ toolchain(
         "@platforms//os:none",
     ],
     toolchain = ":bare_cc_toolchain_64",
+    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
+)
+
+cc_toolchain(
+    name = "bare_cc_toolchain_musl",
+    all_files = ":empty_files",
+    compiler_files = ":empty_files",
+    dwp_files = ":empty_files",
+    linker_files = ":empty_files",
+    objcopy_files = ":empty_files",
+    strip_files = ":empty_files",
+    toolchain_config = ":bare_cc_config_musl",
+)
+
+toolchain(
+    name = "bare_cc_toolchain_musl_def",
+    exec_compatible_with = ["@platforms//os:linux"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_32",
+        "@platforms//os:linux",
+    ],
+    toolchain = ":bare_cc_toolchain_musl",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 

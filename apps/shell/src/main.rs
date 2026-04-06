@@ -1,94 +1,78 @@
-//! RetroOS interactive shell
+use std::io::{self, Write, BufRead};
+use std::process::Command;
 
-#![no_std]
-#![no_main]
-
-fn run(path: &str, args: &[&str]) {
-    let pid = crt::fork();
-    if pid == 0 {
-        crt::exec(path, args);
-        crt::print("not found: ");
-        crt::print(path);
-        crt::print("\n");
-        crt::exit(1);
+fn run(name: &str, args: &[&str]) {
+    match Command::new(name).args(args).status() {
+        Ok(status) => {
+            if !status.success() {
+                if let Some(code) = status.code() {
+                    eprintln!("{}: exited with code {}", name, code);
+                }
+            }
+        }
+        Err(e) => eprintln!("{}: {}", name, e),
     }
-    crt::waitpid(pid);
 }
 
-#[unsafe(no_mangle)]
-pub fn main(args: &[&str]) {
-    // If args are given (beyond argv[0]), run them as a command and exit
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // If args beyond argv[0], run as a command and exit
     if args.len() > 1 {
-        run(args[1], args);
+        let name = &args[1];
+        let rest: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
+        run(name, &rest);
         return;
     }
 
-    crt::print("RetroOS shell\nType 'help' for commands.\n");
-    let mut buf = [0u8; 128];
+    println!("RetroOS shell\nType 'help' for commands.");
+    let stdin = io::stdin();
     loop {
-        crt::print("> ");
-        let len = crt::read_line(&mut buf);
-        if len == 0 { continue; }
+        print!("> ");
+        io::stdout().flush().ok();
 
-        // Trim whitespace
-        let line = &buf[..len];
-        let mut start = 0;
-        let mut end = line.len();
-        while start < end && line[start] == b' ' { start += 1; }
-        while end > start && line[end - 1] == b' ' { end -= 1; }
-        if start >= end { continue; }
-        let trimmed = &line[start..end];
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            _ => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
 
-        // Safe: keyboard input is ASCII
-        let cmd = unsafe { core::str::from_utf8_unchecked(trimmed) };
-
-        // Split command and args at first space
-        let (name, rest) = match cmd.find(' ') {
-            Some(i) => (&cmd[..i], cmd[i+1..].trim_start()),
-            None => (cmd, ""),
-        };
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        let name = parts[0];
+        let rest = &parts[1..];
 
         match name {
             "exit" => return,
             "help" => {
-                crt::print("  cd <dir>    - change directory\n");
-                crt::print("  pwd         - print working directory\n");
-                crt::print("  stress [N]  - COW stress test (default depth 3)\n");
-                crt::print("  hello       - run HELLO.COM in VM86 mode\n");
-                crt::print("  <file>      - run .elf, .com, or .exe program\n");
-                crt::print("  exit        - exit shell\n");
+                println!("  cd <dir>    - change directory");
+                println!("  pwd         - print working directory");
+                println!("  cat <file>  - print file contents");
+                println!("  <file>      - run program");
+                println!("  exit        - exit shell");
             }
             "cd" => {
-                if rest.is_empty() {
-                    // cd with no args goes to root
-                    crt::chdir("/");
-                } else {
-                    let r = crt::chdir(rest);
-                    if r < 0 {
-                        crt::print("cd: no such directory: ");
-                        crt::print(rest);
-                        crt::print("\n");
-                    }
+                let dir = if rest.is_empty() { "/" } else { rest[0] };
+                if let Err(e) = std::env::set_current_dir(dir) {
+                    eprintln!("cd: {}: {}", dir, e);
                 }
             }
             "pwd" => {
-                let mut cwdbuf = [0u8; 64];
-                let len = crt::getcwd(&mut cwdbuf);
-                if len > 0 {
-                    crt::print("/");
-                    let s = unsafe { core::str::from_utf8_unchecked(&cwdbuf[..len as usize]) };
-                    crt::print(s);
-                    crt::print("\n");
-                } else {
-                    crt::print("/\n");
+                match std::env::current_dir() {
+                    Ok(p) => println!("{}", p.display()),
+                    Err(e) => eprintln!("pwd: {}", e),
                 }
             }
-            "stress" => {
-                let depth = if rest.is_empty() { "3" } else { rest };
-                run("stress.elf", &["stress.elf", depth]);
+            "cat" => {
+                for f in rest {
+                    match std::fs::read(f) {
+                        Ok(data) => { io::stdout().write_all(&data).ok(); }
+                        Err(e) => eprintln!("cat: {}: {}", f, e),
+                    }
+                }
             }
-            "hello" => run("HELLO.COM", &["HELLO.COM"]),
-            _ => run(name, &[cmd]),
+            _ => run(name, rest),
         }
     }
 }

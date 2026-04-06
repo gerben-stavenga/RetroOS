@@ -1,21 +1,21 @@
-//! Init process for RetroOS
-//!
-//! Execs DOS Navigator. Respawns if it exits.
+use std::process::Command;
 
-#![no_std]
-#![no_main]
+fn main() {
+    println!("RetroOS init");
 
-#[unsafe(no_mangle)]
-pub fn main(_args: &[&str]) {
-    crt::print("RetroOS init\n");
+    // Compile COMMAND.COM via BCC
+    println!("Building COMMAND.COM...");
+    let _ = Command::new("BORLANDC/BIN/BCC.EXE")
+        .args(&[
+            "BCC.EXE",
+            "-IBORLANDC\\INCLUDE",
+            "-LBORLANDC\\LIB",
+            "-mt",
+            "-eCOMMAND.COM",
+            "COMMAND.C",
+        ])
+        .status();
 
-    let pid = crt::fork();
-    if pid == 0 {
-        crt::exec("stress.elf", &["stress.elf", "4"]);
-        crt::print("exec stress.elf failed\n");
-        crt::exit(1);
-    }
-    crt::waitpid(pid);
-
-    crt::exec("DN/DN.COM", &["DN.COM"]);
+    // Run DN
+    let _ = Command::new("DN/DN.COM").arg("DN.COM").status();
 }

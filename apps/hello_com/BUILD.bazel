@@ -6,7 +6,15 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+genrule(
+    name = "command_com",
+    srcs = ["command.asm"],
+    outs = ["COMMAND.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
 exports_files(
-    ["COMMAND.COM", "TEST.COM"],
+    ["TEST.COM", "TEST.BAT"],
     visibility = ["//visibility:public"],
 )

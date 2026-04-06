@@ -1,24 +1,15 @@
-# Build init user program
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("//toolchain:musl_transition.bzl", "musl_binary")
 
-rust_static_library(
-    name = "init_lib",
+rust_binary(
+    name = "init_bin",
     srcs = ["src/main.rs"],
-    crate_name = "init",
     edition = "2024",
-    rustc_flags = [
-        "-Cpanic=abort",
-        "-Crelocation-model=static",
-        "-Cforce-frame-pointers=yes",
-    ],
-    deps = ["//crt"],
+    rustc_flags = ["-Copt-level=s", "-Cstrip=symbols", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld", "-Ctarget-feature=-sse,-sse2"],
 )
 
-# Link into ELF
-genrule(
+musl_binary(
     name = "init_elf",
-    srcs = [":init_lib", "//crt:user.ld"],
-    outs = ["init.elf"],
-    cmd = "ld.lld -m elf_i386 -T $(location //crt:user.ld) -o $@ $(location :init_lib)",
+    binary = ":init_bin",
     visibility = ["//visibility:public"],
 )

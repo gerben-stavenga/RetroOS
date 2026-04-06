@@ -1271,7 +1271,10 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
         for i in 0..epp {
             let mut e = entries[child_base + i];
             if e.present() {
-                if i < user_count {
+                // Cache-disabled pages are MMIO (e.g. VGA framebuffer) — share
+                // directly with hardware, never COW them into private copies.
+                let is_mmio = e.raw() & flags::CACHE_DISABLE != 0;
+                if i < user_count && !is_mmio {
                     e.set_hw_writable(false);
                 }
                 if e.page() == parent_phys {
@@ -1290,7 +1293,7 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
         let src = temp_map_vaddr() as *mut E;
         for i in 0..user_count {
             let e = &mut *src.add(i);
-            if e.present() {
+            if e.present() && e.raw() & flags::CACHE_DISABLE == 0 {
                 e.set_hw_writable(false);
                 phys_mm::inc_shared_count(e.page());
             }

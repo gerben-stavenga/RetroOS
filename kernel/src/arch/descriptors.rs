@@ -279,8 +279,10 @@ const GDT_TSS64_HI: usize = 9;    // 0x48 (null - upper 32 bits of base are 0)
 const GDT_RING1_CS: usize = 10;   // 0x50
 const GDT_RING1_DS: usize = 11;   // 0x58
 const GDT_LDT: usize = 12;        // 0x60
+const GDT_TLS_START: usize = 13;  // 0x68 — first of 3 per-thread TLS slots
+// 14 = 0x70, 15 = 0x78
 
-const GDT_ENTRIES: usize = 13;
+const GDT_ENTRIES: usize = 16;
 
 /// LDT selector (GDT index 12 * 8 = 0x60)
 pub const LDT_SEL: u16 = 0x60;
@@ -312,6 +314,9 @@ static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::segment32(true, 1),   // 0x50: Ring-1 Code 32-bit (flat, no wrapping yet)
     GdtEntry::segment32(false, 1),  // 0x58: Ring-1 Data (flat, no wrapping yet)
     GdtEntry::null(),               // 0x60: LDT (filled at runtime by load_ldt)
+    GdtEntry::null(),               // 0x68: TLS slot 0 (set_thread_area)
+    GdtEntry::null(),               // 0x70: TLS slot 1
+    GdtEntry::null(),               // 0x78: TLS slot 2
 ];
 
 static mut IDT32: Idt32 = Idt32 {
@@ -401,6 +406,17 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
         crate::println!("VME not supported, using software VM86 monitor");
     }
 
+    // Enable SSE for userspace (musl std requires it)
+    if edx & (1 << 25) != 0 {
+        unsafe {
+            // CR4: OSFXSR + OSXMMEXCPT
+            x86::write_cr4(x86::read_cr4() | x86::cr4::OSFXSR | x86::cr4::OSXMMEXCPT);
+            // CR0: clear EM, set MP
+            let cr0 = x86::read_cr0();
+            x86::write_cr0((cr0 & !x86::cr0::EM) | x86::cr0::MP);
+        }
+    }
+
     // Load initial protected mode IDT, TSS, and segments
     load_prot_mode_descriptors();
 }
@@ -440,6 +456,48 @@ pub fn load_long_mode_descriptors() {
         x86::ltr(TSS64_SEL);
         // Don't reload CS - stay on 0x08 (32-bit compat mode)
     }
+}
+
+/// Set a per-thread TLS GDT entry. `index` is the GDT slot (13-15).
+/// Returns the GDT index on success, or -1 if the index is invalid.
+/// If `index` is -1 (0xFFFFFFFF), auto-allocates the first free TLS slot.
+pub fn set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32 {
+    let idx = if index == -1 {
+        // Auto-allocate: pick first free (non-present) TLS slot
+        let mut found = -1i32;
+        unsafe {
+            for i in GDT_TLS_START..GDT_TLS_START + 3 {
+                if GDT[i].access & 0x80 == 0 { // not Present
+                    found = i as i32;
+                    break;
+                }
+            }
+        }
+        if found < 0 { return -1; }
+        found as usize
+    } else {
+        let i = index as usize;
+        if i < GDT_TLS_START || i >= GDT_TLS_START + 3 { return -1; }
+        i
+    };
+
+    // Build a Ring-3 data segment descriptor with the given base/limit
+    let limit_actual = if limit_in_pages { limit & 0xFFFFF } else { limit.min(0xFFFFF) };
+    let g_bit: u8 = if limit_in_pages { 0x80 } else { 0 };
+    let granularity = g_bit | 0x40 /*D/B=1*/ | ((limit_actual >> 16) as u8 & 0x0F);
+
+    unsafe {
+        GDT[idx] = GdtEntry {
+            limit_low: limit_actual as u16,
+            base_low: base as u16,
+            base_mid: (base >> 16) as u8,
+            access: 0x80 | (3 << 5) | 0x10 | 0x02, // Present, DPL=3, S=1, Data RW
+            granularity,
+            base_high: (base >> 24) as u8,
+        };
+    }
+
+    idx as i32
 }
 
 /// Load an LDT: write base+limit into GDT[12] (LDT system descriptor) and execute LLDT.
