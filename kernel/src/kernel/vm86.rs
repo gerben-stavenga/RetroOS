@@ -151,6 +151,7 @@ impl VgaState {
         if self.planes.is_empty() {
             self.planes = alloc::vec![0u8; 4 * 65536];
         }
+        crate::arch::cli();
         // Capture tracked AC state, then reset flipflop to known index state.
         self.ac_flipflop = unsafe { VGA_AC_FLIPFLOP };
         self.ac_index = unsafe { VGA_AC_INDEX };
@@ -216,12 +217,14 @@ impl VgaState {
         outb(0x3CE, 5); outb(0x3CF, self.gc[5]);
         outb(0x3CE, 6); outb(0x3CF, self.gc[6]);
         outb(0x3CE, self.gc_index);
+        crate::arch::sti();
     }
 
     /// Write this struct's state to VGA hardware.
     pub fn restore_to_hardware(&self) {
         if self.planes.is_empty() { return; }
         use crate::arch::{inb, outb};
+        crate::arch::cli();
 
         // Reset AC flipflop to known (index) state before any VGA register work.
         let _ = inb(0x3DA);
@@ -320,6 +323,7 @@ impl VgaState {
                 core::ptr::write_volatile(0x451 as *mut u8, row);
             }
         }
+        crate::arch::sti();
     }
 }
 
