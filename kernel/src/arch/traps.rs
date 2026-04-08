@@ -9,7 +9,7 @@ use crate::arch::irq::handle_irq;
 use crate::arch::paging2::{self, Entry, RawPage};
 use crate::{println, dbg_println};
 use crate::arch::x86;
-use crate::Regs;
+use crate::{Frame32, Frame64, Regs};
 
 // =============================================================================
 // Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
@@ -218,14 +218,26 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
     static mut VIP: bool = false;
 
     let full = unsafe { &mut *full };
+
+    // Detect ring transition from raw frame before any conversion.
+    // 32-bit same-privilege interrupts don't push ESP/SS, so from_32/to_32
+    // would read/write beyond the frame. Ring-0 gets its own minimal path.
+    let ring_transition = if paging2::cpu_mode() == paging2::CpuMode::Compat {
+        full.regs.frame.cs & 3 != 0
+    } else {
+        let raw = unsafe { (&full.regs.frame as *const Frame64).cast::<Frame32>().read() };
+        raw.eflags & VM_FLAG as u32 != 0 || raw.cs & 3 != 0
+    };
+    if !ring_transition {
+        handle_ring0(full.regs.int_num & 0xFF, full.regs.err_code);
+        return;
+    }
+
     if paging2::cpu_mode() != paging2::CpuMode::Compat { full.regs.from_32(); }
 
     // Fix ESP from IRET to 16-bit SS: CPU only loads SP, upper bits are
     // kernel stack residue. Mask to 16 bits based on descriptor B bit.
-    // Only for ring transitions (VM86/user → kernel): same-privilege traps
-    // (ring 0 → ring 0) don't push SS, so frame.ss is stale garbage.
-    let ring_transition = is_vm86(&full.regs) || full.regs.frame.cs & 3 != 0;
-    if ring_transition && !is_vm86(&full.regs) && full.regs.frame.ss & 4 != 0 {
+    if !is_vm86(&full.regs) && full.regs.frame.ss & 4 != 0 {
         let ss = full.regs.frame.ss as u16;
         let ar: u32;
         let ok: u8;
@@ -271,7 +283,7 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
         }
     }
 
-    isr_handler_inner(&mut full.regs, vm86);
+    isr_handler_inner(&mut full.regs, from_ring3);
 
     // Mode toggle if output regs need different CPU mode
     toggle_mode_if_needed(&full.regs);
@@ -307,42 +319,31 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
     if paging2::cpu_mode() != paging2::CpuMode::Compat { full.regs.to_32(); }
 }
 
-fn isr_handler_inner(regs: &mut Regs, vm86: bool) {
+fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
     // Mask to undo sign-extension from push imm8 for vectors >= 0x80
     let int_num = regs.int_num & 0xFF;
     regs.int_num = int_num;
-    let source_ring = if vm86 { 3 } else { raw_code_seg(regs) & 3 };
 
-    match source_ring {
+    if from_ring3 {
         // User (ring 3 / VM86): handle IRQ, try page fault, return event to kernel
-        3 => {
-            if (32..=47).contains(&int_num) { handle_irq(regs); }
-            if int_num == 14 && try_handle_page_fault(regs).is_some() { return; }
-            swap_regs(regs);
-            regs.rax = int_num;
-            if int_num == 14 { regs.rdx = x86::read_cr2() as u64; }
-        }
+        let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
+        if (32..=47).contains(&int_num) { handle_irq(regs); }
+        if int_num == 14 && try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
+        swap_regs(regs);
+        regs.rax = int_num;
+        if int_num == 14 { regs.rdx = x86::read_cr2() as u64; }
+    } else {
         // Kernel (ring 1): arch calls, page faults, IRQs
-        1 => match int_num {
+        match int_num {
             14 => {
-                if try_handle_page_fault(regs).is_none() {
+                if try_handle_page_fault(regs.err_code, false).is_none() {
                     panic_with_regs("Unhandled page fault in kernel", regs);
                 }
             }
             32..=47 => handle_irq(regs),
             0x80 => arch_dispatch(regs),
             _ => panic_with_regs("Unexpected interrupt in kernel", regs),
-        },
-        // Arch (ring 0): boot-time or nested
-        _ => match int_num {
-            14 => {
-                if try_handle_page_fault(regs).is_none() {
-                    panic_with_regs("Unhandled page fault in arch", regs);
-                }
-            }
-            32..=47 => handle_irq(regs),
-            _ => panic_with_regs("Unhandled exception in arch", regs),
-        },
+        }
     }
 }
 
@@ -351,11 +352,10 @@ fn isr_handler_inner(regs: &mut Regs, vm86: bool) {
 // =============================================================================
 
 /// Try to handle a page fault. Returns Some(()) if resolved, None if not.
-fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
+fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
     use crate::arch::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
 
     let fault_addr = x86::read_cr2() as usize;
-    let error = regs.err_code;
     let present = (error & 1) != 0;
     let write = (error & 2) != 0;
     let user = (error & 4) != 0;
@@ -364,13 +364,10 @@ fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
     let page_index = page_idx(fault_addr);
 
     // Null pointer protection (first 64KB and last 64KB)
-    // Skip for VM86 and DPMI (legitimate IVT/BDA/conventional memory access)
+    // Skip for legacy mode (VM86/DPMI: legitimate IVT/BDA/conventional memory access)
     // and supervisor (ring-1 kernel setting up user memory).
-    // DPMI code uses LDT selectors (TI=1); Linux uses GDT selectors (TI=0).
     const NULL_LIMIT: usize = 0x10000;
-    let vm86 = is_vm86(regs);
-    let dos_mode = vm86 || (regs.frame.cs & 4) != 0;
-    if !dos_mode && user && (fault_addr < NULL_LIMIT || fault_addr >= (0usize).wrapping_sub(NULL_LIMIT)) {
+    if !legacy_mode && user && (fault_addr < NULL_LIMIT || fault_addr >= (0usize).wrapping_sub(NULL_LIMIT)) {
         return None; // Let kernel handle (segfault or panic)
     }
 
@@ -389,11 +386,8 @@ fn try_handle_page_fault(regs: &mut Regs) -> Option<()> {
         return None;
     }
 
-    // Dispatch based on mode
-    // HACK: DPMI code shares linear address space for code+data, so don't set NX
-    // on demand-paged pages when the faulting CS is an LDT selector.
-    // This should not belong in arch — move to a higher-level DPMI page fault handler.
-    let nx = paging2::nx_enabled() && !dos_mode;
+    // Legacy mode (VM86/DPMI) shares code+data address space, so don't set NX
+    let nx = paging2::nx_enabled() && !legacy_mode;
     match paging2::entries() {
         paging2::Entries::E32(e) => {
             if present {
@@ -502,9 +496,23 @@ fn demand_page_kernel(fault_addr: usize) {
     paging2::flush_tlb();
 }
 
-/// Read code segment from raw interrupt frame (ring 0: knows CPU mode).
-fn raw_code_seg(regs: &Regs) -> u16 {
-    regs.frame.cs as u16
+/// Ring-0 interrupt handler. No frame conversion, no canonicalization.
+/// Called before from_32/to_32 since 32-bit same-privilege interrupts
+/// don't push ESP/SS.
+fn handle_ring0(int_num: u64, error: u64) {
+    match int_num {
+        14 => {
+            if try_handle_page_fault(error, false).is_none() {
+                panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
+            }
+        }
+        32..=47 => {
+            let mut regs = Regs::empty();
+            regs.int_num = int_num;
+            handle_irq(&mut regs);
+        }
+        _ => panic!("Unhandled exception in arch: int={:#x} err={:#x}", int_num, error),
+    }
 }
 
 const VM_FLAG: u64 = 1 << 17;
