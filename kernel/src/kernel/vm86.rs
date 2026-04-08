@@ -340,6 +340,12 @@ pub struct Vm86State {
     pub a20_enabled: bool,
     pub dta: u32,
     pub heap_seg: u16,
+    /// Current PSP segment as seen by INT 21h/AH=50h (set), 51h (get), and
+    /// 62h (get). Tracks which loaded program is "active" — exec_program sets
+    /// it to the child's segment, exec_return restores it via ExecParent.
+    /// Some DOS programs (and DPMI extenders) call AH=50h to temporarily
+    /// switch the active PSP and read it back via AH=51h.
+    pub current_psp: u16,
     pub dos_pending_char: Option<u8>,
     /// Last child termination status as returned by INT 21h/AH=4Dh.
     /// Low byte (AL) = return code passed by the child to AH=4Ch/AH=31h.
@@ -373,6 +379,7 @@ impl Vm86State {
             a20_enabled: false,
             dta: 0,
             heap_seg: 0xA000,
+            current_psp: COM_SEGMENT,
             dos_pending_char: None,
             last_child_exit_status: 0,
             vpit: VirtualPit::new(),
@@ -2827,9 +2834,22 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             regs.rax = (regs.rax & !0xFFFF) | status as u64;
             thread::KernelAction::Done
         }
+        // AH=0x50: Set Current Process ID (BX = new PSP segment)
+        // Undocumented in DOS 1-3, documented in 5+. Same backing field as
+        // AH=51h/62h. No return value other than the side effect.
+        0x50 => {
+            dos.vm86.current_psp = regs.rbx as u16;
+            thread::KernelAction::Done
+        }
+        // AH=0x51: Get Current Process ID (returns BX = current PSP segment)
+        // Undocumented sibling of AH=62h.
+        0x51 => {
+            regs.rbx = (regs.rbx & !0xFFFF) | dos.vm86.current_psp as u64;
+            thread::KernelAction::Done
+        }
         // AH=0x62: Get PSP segment (returns BX=PSP segment)
         0x62 => {
-            regs.rbx = (regs.rbx & !0xFFFF) | COM_SEGMENT as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | dos.vm86.current_psp as u64;
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -3899,14 +3919,17 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     // stack at current SS:SP. exec_return restores SS:SP so stub_dispatch
     // pops the frame and resumes the parent.
     let prev = dos.vm86.exec_parent.take();
+    let parent_psp = dos.vm86.current_psp;
     dos.vm86.heap_seg = end_seg.max(dos.vm86.heap_seg);
     dos.vm86.dta = (child_seg as u32) * 16 + 0x80;
+    dos.vm86.current_psp = child_seg;
     dos.vm86.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
         ds: regs.ds as u16,
         es: regs.es as u16,
         heap_seg: child_seg,
+        psp: parent_psp,
         prev: prev.map(alloc::boxed::Box::new),
     });
 
@@ -3963,6 +3986,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) 
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
     dos.vm86.heap_seg = parent.heap_seg;
+    dos.vm86.current_psp = parent.psp;
     dos.vm86.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }
@@ -3975,6 +3999,7 @@ pub struct ExecParent {
     pub ds: u16,
     pub es: u16,
     pub heap_seg: u16,
+    pub psp: u16,
     pub prev: Option<alloc::boxed::Box<ExecParent>>,
 }
 
