@@ -157,14 +157,16 @@ impl VgaState {
         self.ac_index = unsafe { VGA_AC_INDEX };
         let _ = inb(0x3DA);
 
+        // Capture index registers BEFORE the save loops overwrite them.
+        self.seq_index = inb(0x3C4);
+        self.crtc_index = inb(0x3D4);
+        self.gc_index = inb(0x3CE);
+
         // Save all registers
         self.misc_output = inb(0x3CC);
         for i in 0..5u8 { outb(0x3C4, i); self.seq[i as usize] = inb(0x3C5); }
-        self.seq_index = inb(0x3C4);
         for i in 0..25u8 { outb(0x3D4, i); self.crtc[i as usize] = inb(0x3D5); }
-        self.crtc_index = inb(0x3D4);
         for i in 0..9u8 { outb(0x3CE, i); self.gc[i as usize] = inb(0x3CF); }
-        self.gc_index = inb(0x3CE);
         self.dac_mask = inb(0x3C6);
         outb(0x3C7, 0);
         for i in 0..768 { self.dac[i] = inb(0x3C9); }
@@ -216,6 +218,9 @@ impl VgaState {
         outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
         outb(0x3CE, 5); outb(0x3CF, self.gc[5]);
         outb(0x3CE, 6); outb(0x3CF, self.gc[6]);
+        // Restore the program's tracked index registers
+        outb(0x3C4, self.seq_index);
+        outb(0x3D4, self.crtc_index);
         outb(0x3CE, self.gc_index);
         crate::arch::sti();
     }
@@ -282,47 +287,6 @@ impl VgaState {
         outb(0x3C4, self.seq_index);
         outb(0x3D4, self.crtc_index);
         outb(0x3CE, self.gc_index);
-
-        // Verify registers took effect
-        {
-            let mut v_seq4 = 0u8; let mut v_gc5 = 0u8; let mut v_gc6 = 0u8;
-            let mut v_crtc14 = 0u8; let mut v_crtc17 = 0u8;
-            outb(0x3C4, 4); v_seq4 = inb(0x3C5);
-            outb(0x3CE, 5); v_gc5 = inb(0x3CF);
-            outb(0x3CE, 6); v_gc6 = inb(0x3CF);
-            outb(0x3D4, 0x14); v_crtc14 = inb(0x3D5);
-            outb(0x3D4, 0x17); v_crtc17 = inb(0x3D5);
-            outb(0x3C4, self.seq_index);
-            outb(0x3CE, self.gc_index);
-            outb(0x3D4, self.crtc_index);
-            crate::dbg_println!("VGA restore: seq4={:02X}({:02X}) gc5={:02X}({:02X}) gc6={:02X}({:02X}) crtc14={:02X}({:02X}) crtc17={:02X}({:02X}) ac10={:02X} start={:04X}",
-                v_seq4, self.seq[4], v_gc5, self.gc[5], v_gc6, self.gc[6],
-                v_crtc14, self.crtc[0x14], v_crtc17, self.crtc[0x17], self.ac[0x10],
-                (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16);
-        }
-
-        // Text mode fixup: QEMU's B8000 text window doesn't see A0000
-        // flat-planar writes. Re-write chars (plane 0) and attrs (plane 1)
-        // through B8000 so QEMU's text renderer picks them up.
-        if self.ac[0x10] & 1 == 0 {
-            let p0 = &self.planes[0..65536];
-            let p1 = &self.planes[65536..131072];
-            unsafe {
-                let dst = 0xB8000 as *mut u8;
-                for i in 0..4000usize {
-                    core::ptr::write_volatile(dst.add(i * 2), p0[i]);
-                    core::ptr::write_volatile(dst.add(i * 2 + 1), p1[i]);
-                }
-            }
-            // Sync BDA cursor from restored CRTC cursor position
-            let cursor_off = (self.crtc[0x0E] as u16) << 8 | self.crtc[0x0F] as u16;
-            let col = (cursor_off % 80) as u8;
-            let row = (cursor_off / 80) as u8;
-            unsafe {
-                core::ptr::write_volatile(0x450 as *mut u8, col);
-                core::ptr::write_volatile(0x451 as *mut u8, row);
-            }
-        }
         crate::arch::sti();
     }
 }
