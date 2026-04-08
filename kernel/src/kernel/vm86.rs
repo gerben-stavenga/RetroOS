@@ -341,7 +341,12 @@ pub struct Vm86State {
     pub dta: u32,
     pub heap_seg: u16,
     pub dos_pending_char: Option<u8>,
-    pub last_child_exit_code: u8,
+    /// Last child termination status as returned by INT 21h/AH=4Dh.
+    /// Low byte (AL) = return code passed by the child to AH=4Ch/AH=31h.
+    /// High byte (AH) = termination type per RBIL:
+    ///   00h = normal (AH=4Ch), 01h = Ctrl-Break, 02h = critical error,
+    ///   03h = TSR (AH=31h).
+    pub last_child_exit_status: u16,
     pub vpit: VirtualPit,
     pub vpic: VirtualPic,
     pub vkbd: VirtualKeyboard,
@@ -369,7 +374,7 @@ impl Vm86State {
             dta: 0,
             heap_seg: 0xA000,
             dos_pending_char: None,
-            last_child_exit_code: 0,
+            last_child_exit_status: 0,
             vpit: VirtualPit::new(),
             vpic: VirtualPic::new(),
             vkbd: VirtualKeyboard::new(),
@@ -1805,9 +1810,9 @@ fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelA
         }
         0x13 => int_13h(regs),
         0x20 => {
-            // INT 20h — DOS program terminate
+            // INT 20h — DOS program terminate (equivalent to AH=4Ch with AL=0)
             if let Some(parent) = dos.vm86.exec_parent.take() {
-                dos.vm86.last_child_exit_code = 0;
+                dos.vm86.last_child_exit_status = 0x0000; // type=normal, code=0
                 return exec_return(dos, regs, parent);
             }
             thread::KernelAction::Exit(0)
@@ -1976,18 +1981,10 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
 fn dos_putchar(c: u8) {
-    use crate::arch::{outb, inb};
+    use crate::arch::outb;
     unsafe {
         let col = core::ptr::read_volatile(0x450 as *const u8) as usize;
         let row = core::ptr::read_volatile(0x451 as *const u8) as usize;
-        // Debug: show BDA vs CRTC cursor on first printable char
-        if c >= 0x20 && c < 0x7F {
-            outb(0x3D4, 0x0E); let ch = inb(0x3D5);
-            outb(0x3D4, 0x0F); let cl = inb(0x3D5);
-            let crtc_off = (ch as u16) << 8 | cl as u16;
-            crate::dbg_println!("dos_putchar '{}': BDA=({},{}) CRTC={} ({},{})",
-                c as char, col, row, crtc_off, crtc_off % 80, crtc_off / 80);
-        }
         let v = vga::vga();
         v.set_cursor_pos(col, row);
         v.putchar(c);
@@ -2342,8 +2339,32 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         0x4C => {
             // If we're in an EXEC'd child, return to parent
             if let Some(parent) = dos.vm86.exec_parent.take() {
-                dos.vm86.last_child_exit_code = regs.rax as u8;
+                // Termination type 00h (normal) | return code in AL.
+                dos.vm86.last_child_exit_status = (regs.rax as u8) as u16;
                 return exec_return(dos, regs, parent);
+            }
+            let code = regs.rax as u8;
+            thread::KernelAction::Exit(code as i32)
+        }
+        // AH=0x31: Terminate and Stay Resident (TSR)
+        // AL = return code, DX = paragraphs to keep (from child's PSP)
+        // Like AH=4Ch but the child's memory stays committed: heap_seg
+        // remains above the resident block so subsequent parent allocations
+        // don't overlap. INT vector hooks the child installed in the IVT
+        // remain valid because the IVT is part of the address space and the
+        // child's code at heap_seg+offset is still mapped.
+        0x31 => {
+            if let Some(parent) = dos.vm86.exec_parent.take() {
+                let keep = regs.rdx as u16;
+                let child_psp_seg = parent.heap_seg;
+                let resident_top = child_psp_seg.saturating_add(keep);
+                // Termination type 03h (TSR) | return code in AL.
+                dos.vm86.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
+                let action = exec_return(dos, regs, parent);
+                if resident_top > dos.vm86.heap_seg {
+                    dos.vm86.heap_seg = resident_top;
+                }
+                return action;
             }
             let code = regs.rax as u8;
             thread::KernelAction::Exit(code as i32)
@@ -2799,9 +2820,11 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             thread::KernelAction::Done
         }
         // AH=0x4D: Get Return Code of Subprocess
+        // Returns AL = code passed to AH=4Ch/AH=31h, AH = termination type
+        // (00h normal, 01h Ctrl-Break, 02h critical error, 03h TSR).
         0x4D => {
-            let code = dos.vm86.last_child_exit_code;
-            regs.rax = (regs.rax & !0xFFFF) | code as u64; // AL=exit code, AH=0 (normal)
+            let status = dos.vm86.last_child_exit_status;
+            regs.rax = (regs.rax & !0xFFFF) | status as u64;
             thread::KernelAction::Done
         }
         // AH=0x62: Get PSP segment (returns BX=PSP segment)

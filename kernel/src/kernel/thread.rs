@@ -499,7 +499,7 @@ pub fn cancel_parent_wait(child_tid: usize) {
         if parent.state != ThreadState::Blocked { return; }
         parent.state = ThreadState::Ready;
         if let ThreadMode::Dos(dos) = &mut parent.mode {
-            dos.vm86.last_child_exit_code = 0;
+            dos.vm86.last_child_exit_status = 0;
         }
         // Signal decoupled to parent's synth fork_exec_wait: AX = 1 (status=decoupled).
         parent.cpu_state.rax = (parent.cpu_state.rax & !0xFFFF) | 0x0001;
@@ -724,7 +724,8 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                 parent.cpu_state.rax = parent.cpu_state.rax & !0xFFFF;
             }
             if let ThreadMode::Dos(dos) = &mut parent.mode {
-                dos.vm86.last_child_exit_code = exit_code as u8;
+                // Termination type 00h (normal) | exit code in AL.
+                dos.vm86.last_child_exit_status = (exit_code as u8) as u16;
             }
         }
 
