@@ -93,11 +93,26 @@ const COM_SP: u16 = 0xFFFE;
 
 pub const HMA_PAGE_COUNT: usize = 16;
 
-/// Global VGA Attribute Controller state — tracks real hardware.
-/// Flipflop: true = next write to 0x3C0 is an index byte; false = data byte.
-/// Index: last index written (including PAS bit 5).
-static mut VGA_AC_FLIPFLOP: bool = true;
-static mut VGA_AC_INDEX: u8 = 0x20;
+/// VGA Attribute Controller port (0x3C0) state. The hardware has two
+/// independent pieces of state, neither readable from any port:
+///   - `index`:        last byte written in index state. Includes the PAS bit
+///                     (bit 5) which controls screen blanking. Persistent —
+///                     subsequent data writes do not change it.
+///   - `pending_data`: flip-flop position. `false` = next 0x3C0 write is an
+///                     index byte; `true` = next 0x3C0 write is its data.
+/// `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
+#[derive(Clone, Copy)]
+pub struct AcState {
+    pub index: u8,
+    pub pending_data: bool,
+}
+
+impl AcState {
+    const fn new() -> Self { Self { index: 0, pending_data: false } }
+}
+
+/// Global AC state, tracks real hardware across all processes.
+static mut VGA_AC_STATE: AcState = AcState::new();
 
 /// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
 /// Saved/restored on context switch so each process has its own screen.
@@ -106,6 +121,7 @@ pub struct VgaState {
     pub planes: alloc::vec::Vec<u8>,
     // ── Registers ──
     pub misc_output: u8,
+    pub feature_ctl: u8,
     pub seq: [u8; 5],
     pub crtc: [u8; 25],
     pub gc: [u8; 9],
@@ -116,11 +132,12 @@ pub struct VgaState {
     pub seq_index: u8,
     pub crtc_index: u8,
     pub gc_index: u8,
-    pub ac_index: u8,
-    pub ac_flipflop: bool,
-    pub dac_read_index: u8,
-    pub dac_write_index: u8,
-    pub dac_rgb_pos: u8,
+    /// AC port flip-flop + latched index. See `VGA_AC_STATE`.
+    pub ac_state: AcState,
+    /// DAC pixel-address latch (single shared index for read & write)
+    pub dac_index: u8,
+    /// DAC state byte from inb(0x3C7): 0x00 = write-mode, 0x03 = read-mode
+    pub dac_state: u8,
 }
 
 impl VgaState {
@@ -128,6 +145,7 @@ impl VgaState {
         Self {
             planes: alloc::vec::Vec::new(),
             misc_output: 0,
+            feature_ctl: 0,
             seq: [0; 5],
             crtc: [0; 25],
             gc: [0; 9],
@@ -137,11 +155,9 @@ impl VgaState {
             seq_index: 0,
             crtc_index: 0,
             gc_index: 0,
-            ac_index: 0,
-            ac_flipflop: true,
-            dac_read_index: 0,
-            dac_write_index: 0,
-            dac_rgb_pos: 0,
+            ac_state: AcState::new(),
+            dac_index: 0,
+            dac_state: 0,
         }
     }
 
@@ -153,8 +169,7 @@ impl VgaState {
         }
         crate::arch::cli();
         // Capture tracked AC state, then reset flipflop to known index state.
-        self.ac_flipflop = unsafe { VGA_AC_FLIPFLOP };
-        self.ac_index = unsafe { VGA_AC_INDEX };
+        self.ac_state = unsafe { VGA_AC_STATE };
         let _ = inb(0x3DA);
 
         // Capture index registers BEFORE the save loops overwrite them.
@@ -164,10 +179,15 @@ impl VgaState {
 
         // Save all registers
         self.misc_output = inb(0x3CC);
+        self.feature_ctl = inb(0x3CA);
         for i in 0..5u8 { outb(0x3C4, i); self.seq[i as usize] = inb(0x3C5); }
         for i in 0..25u8 { outb(0x3D4, i); self.crtc[i as usize] = inb(0x3D5); }
         for i in 0..9u8 { outb(0x3CE, i); self.gc[i as usize] = inb(0x3CF); }
         self.dac_mask = inb(0x3C6);
+        // Capture program-tracked DAC index latch + read/write mode before
+        // stomping it with our bulk read.
+        self.dac_index = inb(0x3C8);
+        self.dac_state = inb(0x3C7);
         outb(0x3C7, 0);
         for i in 0..768 { self.dac[i] = inb(0x3C9); }
 
@@ -180,15 +200,15 @@ impl VgaState {
             self.ac[i as usize] = inb(0x3C1);
         }
 
-        // Restore hardware AC to the program's tracked state:
-        // inb(0x3DA) → index state, outb(0x3C0, idx) → sets index, goes to data state.
-        // If program was in index state, one more inb(0x3DA) resets back.
+        // Restore hardware AC to the program's tracked state. Always write the
+        // latched index byte (carries the PAS bit, which the save loop above
+        // clobbered to 0). Then, if the program is in index state, do one more
+        // 0x3DA read to put the flipflop back.
         let _ = inb(0x3DA);
-        outb(0x3C0, self.ac_index);
-        if self.ac_flipflop {
+        outb(0x3C0, self.ac_state.index);
+        if !self.ac_state.pending_data {
             let _ = inb(0x3DA);
         }
-        unsafe { VGA_AC_FLIPFLOP = self.ac_flipflop; }
 
         crate::dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X}",
             self.seq[4], self.gc[5], self.gc[6], self.crtc[0x14], self.crtc[0x17], self.ac[0x10], self.misc_output,
@@ -202,6 +222,22 @@ impl VgaState {
         outb(0x3CE, 5); outb(0x3CF, 0x00);
         outb(0x3CE, 6); outb(0x3CF, 0x05);
 
+        // KNOWN GAP: GC read latches (4 bytes loaded by the most recent VGA
+        // memory read) are not preserved across save/restore. The bulk reads
+        // below clobber them, and the VGA exposes no port to read latches
+        // directly — the only way to extract them is to dump them to memory
+        // via write mode 1 and read them back, which would require sacrificing
+        // 4 bytes of plane RAM at a fixed scratch offset (any prior read to
+        // capture that user data would itself destroy the latches we want).
+        //
+        // Symptom: a mode-X latch blit preempted between its source read and
+        // destination write produces 4 wrong bytes when the program resumes:
+        //     mov al, [esi]   ; loads latches with src plane bytes
+        //     <-- preempt here -->
+        //     mov [edi], al   ; write mode 1: writes (wrong) latches to dst
+        // The window is 1–2 instructions wide so the hit rate is very low,
+        // and the visible artifact (one bad 4-byte stripe in one frame) is
+        // typically invisible. Left unfixed; revisit if we ever observe it.
         for plane in 0..4u8 {
             outb(0x3CE, 4); outb(0x3CF, plane);
             unsafe {
@@ -256,10 +292,14 @@ impl VgaState {
         }
 
         // Step 2: Set target mode registers.
-        outb(0x3C4, 0); outb(0x3C5, 0x01); // sync reset
+        // Bracket SEQ writes with sync reset so a dot-clock change in
+        // misc_output/seq[1] doesn't glitch the sequencer mid-cycle.
+        // Reverse iteration so SEQ[0] = self.seq[0] is the last write
+        // and naturally acts as the release.
+        outb(0x3C4, 0); outb(0x3C5, 0x01); // assert sync reset
         outb(0x3C2, self.misc_output);
-        for i in 1..5u8 { outb(0x3C4, i); outb(0x3C5, self.seq[i as usize]); }
-        outb(0x3C4, 0); outb(0x3C5, 0x03); // release reset
+        outb(0x3DA, self.feature_ctl); // FCR (color mode write port)
+        for i in (0..5u8).rev() { outb(0x3C4, i); outb(0x3C5, self.seq[i as usize]); }
 
         // CRTC — unlock first (clear protect bit in reg 0x11)
         outb(0x3D4, 0x11); outb(0x3D5, self.crtc[0x11] & 0x7F);
@@ -269,20 +309,25 @@ impl VgaState {
         // Attribute Controller — write all 21 registers
         let _ = inb(0x3DA);
         for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, self.ac[i as usize]); }
-        // Restore the program's AC index + flipflop state:
-        let _ = inb(0x3DA);                // → index state
-        outb(0x3C0, self.ac_index);        // set index, → data state
-        if self.ac_flipflop {
-            let _ = inb(0x3DA);            // → index state
+        // Restore the program's AC state. Same pattern as save_from_hardware.
+        let _ = inb(0x3DA);
+        outb(0x3C0, self.ac_state.index);
+        if !self.ac_state.pending_data {
+            let _ = inb(0x3DA);
         }
-        unsafe {
-            VGA_AC_FLIPFLOP = self.ac_flipflop;
-            VGA_AC_INDEX = self.ac_index;
-        }
+        unsafe { VGA_AC_STATE = self.ac_state; }
         // DAC
         outb(0x3C6, self.dac_mask);
         outb(0x3C8, 0);
         for i in 0..768 { outb(0x3C9, self.dac[i]); }
+        // Restore the program's DAC index latch + read/write mode.
+        // dac_state bits[1:0]: 0x03 = read-mode (set via 0x3C7),
+        //                      0x00 = write-mode (set via 0x3C8).
+        if self.dac_state & 3 == 3 {
+            outb(0x3C7, self.dac_index);
+        } else {
+            outb(0x3C8, self.dac_index);
+        }
         // Restore index registers
         outb(0x3C4, self.seq_index);
         outb(0x3D4, self.crtc_index);
@@ -1142,7 +1187,7 @@ pub(crate) fn emulate_inb(dos: &mut thread::DosState, port: u16) -> u8 {
         0x3DA => {
             // Read real hardware to reset the AC flip-flop, and track it globally.
             let _real = crate::arch::inb(0x3DA);
-            unsafe { VGA_AC_FLIPFLOP = true; }
+            unsafe { VGA_AC_STATE.pending_data = false; }
             // Synthesize retrace: games (Wolf3D, Keen) poll this in tight loops.
             // QEMU's real retrace is too fast/slow for the polling patterns.
             static mut RETRACE_CTR: u8 = 0;
@@ -1180,10 +1225,10 @@ pub(crate) fn emulate_outb(dos: &mut thread::DosState, port: u16, val: u8) {
         // VGA ports — pass through to hardware, track AC flip-flop + index
         0x3C0 => {
             unsafe {
-                if VGA_AC_FLIPFLOP {
-                    VGA_AC_INDEX = val; // index write
+                if !VGA_AC_STATE.pending_data {
+                    VGA_AC_STATE.index = val; // index write — latch full byte (incl. PAS)
                 }
-                VGA_AC_FLIPFLOP = !VGA_AC_FLIPFLOP;
+                VGA_AC_STATE.pending_data = !VGA_AC_STATE.pending_data;
             }
             crate::arch::outb(port, val);
         }
