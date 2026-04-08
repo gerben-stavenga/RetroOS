@@ -96,8 +96,8 @@ pub const HMA_PAGE_COUNT: usize = 16;
 /// Global VGA Attribute Controller state — tracks real hardware.
 /// Flipflop: true = next write to 0x3C0 is an index byte; false = data byte.
 /// Index: last index written (including PAS bit 5).
-pub static mut VGA_AC_FLIPFLOP: bool = true;
-pub static mut VGA_AC_INDEX: u8 = 0x20;
+static mut VGA_AC_FLIPFLOP: bool = true;
+static mut VGA_AC_INDEX: u8 = 0x20;
 
 /// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
 /// Saved/restored on context switch so each process has its own screen.
@@ -187,6 +187,10 @@ impl VgaState {
         }
         unsafe { VGA_AC_FLIPFLOP = self.ac_flipflop; }
 
+        crate::dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X}",
+            self.seq[4], self.gc[5], self.gc[6], self.crtc[0x14], self.crtc[0x17], self.ac[0x10], self.misc_output,
+            (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16);
+
         // Force flat planar mode for reading planes:
         // SEQ mem mode = sequential access (no chain-4, no odd/even)
         // GC mode = read mode 0, write mode 0
@@ -199,7 +203,7 @@ impl VgaState {
             outb(0x3CE, 4); outb(0x3CF, plane);
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    0xA0000 as *const u8,
+                    (0xA0000) as *const u8,
                     self.planes[plane as usize * 65536..].as_mut_ptr(),
                     65536,
                 );
@@ -237,7 +241,7 @@ impl VgaState {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.planes[plane as usize * 65536..].as_ptr(),
-                    0xA0000 as *mut u8,
+                    (0xA0000) as *mut u8,
                     65536,
                 );
             }
@@ -275,6 +279,47 @@ impl VgaState {
         outb(0x3C4, self.seq_index);
         outb(0x3D4, self.crtc_index);
         outb(0x3CE, self.gc_index);
+
+        // Verify registers took effect
+        {
+            let mut v_seq4 = 0u8; let mut v_gc5 = 0u8; let mut v_gc6 = 0u8;
+            let mut v_crtc14 = 0u8; let mut v_crtc17 = 0u8;
+            outb(0x3C4, 4); v_seq4 = inb(0x3C5);
+            outb(0x3CE, 5); v_gc5 = inb(0x3CF);
+            outb(0x3CE, 6); v_gc6 = inb(0x3CF);
+            outb(0x3D4, 0x14); v_crtc14 = inb(0x3D5);
+            outb(0x3D4, 0x17); v_crtc17 = inb(0x3D5);
+            outb(0x3C4, self.seq_index);
+            outb(0x3CE, self.gc_index);
+            outb(0x3D4, self.crtc_index);
+            crate::dbg_println!("VGA restore: seq4={:02X}({:02X}) gc5={:02X}({:02X}) gc6={:02X}({:02X}) crtc14={:02X}({:02X}) crtc17={:02X}({:02X}) ac10={:02X} start={:04X}",
+                v_seq4, self.seq[4], v_gc5, self.gc[5], v_gc6, self.gc[6],
+                v_crtc14, self.crtc[0x14], v_crtc17, self.crtc[0x17], self.ac[0x10],
+                (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16);
+        }
+
+        // Text mode fixup: QEMU's B8000 text window doesn't see A0000
+        // flat-planar writes. Re-write chars (plane 0) and attrs (plane 1)
+        // through B8000 so QEMU's text renderer picks them up.
+        if self.ac[0x10] & 1 == 0 {
+            let p0 = &self.planes[0..65536];
+            let p1 = &self.planes[65536..131072];
+            unsafe {
+                let dst = 0xB8000 as *mut u8;
+                for i in 0..4000usize {
+                    core::ptr::write_volatile(dst.add(i * 2), p0[i]);
+                    core::ptr::write_volatile(dst.add(i * 2 + 1), p1[i]);
+                }
+            }
+            // Sync BDA cursor from restored CRTC cursor position
+            let cursor_off = (self.crtc[0x0E] as u16) << 8 | self.crtc[0x0F] as u16;
+            let col = (cursor_off % 80) as u8;
+            let row = (cursor_off / 80) as u8;
+            unsafe {
+                core::ptr::write_volatile(0x450 as *mut u8, col);
+                core::ptr::write_volatile(0x451 as *mut u8, row);
+            }
+        }
     }
 }
 
@@ -1130,6 +1175,8 @@ pub(crate) fn emulate_inb(dos: &mut thread::DosState, port: u16) -> u8 {
             // Read real hardware to reset the AC flip-flop, and track it globally.
             let _real = crate::arch::inb(0x3DA);
             unsafe { VGA_AC_FLIPFLOP = true; }
+            // Synthesize retrace: games (Wolf3D, Keen) poll this in tight loops.
+            // QEMU's real retrace is too fast/slow for the polling patterns.
             static mut RETRACE_CTR: u8 = 0;
             let ctr = unsafe {
                 RETRACE_CTR = RETRACE_CTR.wrapping_add(1);
@@ -1912,6 +1959,35 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
     thread::KernelAction::Done
 }
 
+/// DOS character output — writes via VGA putchar and syncs the BDA cursor
+/// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
+/// cursor see the correct position.
+fn dos_putchar(c: u8) {
+    use crate::arch::{outb, inb};
+    unsafe {
+        let col = core::ptr::read_volatile(0x450 as *const u8) as usize;
+        let row = core::ptr::read_volatile(0x451 as *const u8) as usize;
+        // Debug: show BDA vs CRTC cursor on first printable char
+        if c >= 0x20 && c < 0x7F {
+            outb(0x3D4, 0x0E); let ch = inb(0x3D5);
+            outb(0x3D4, 0x0F); let cl = inb(0x3D5);
+            let crtc_off = (ch as u16) << 8 | cl as u16;
+            crate::dbg_println!("dos_putchar '{}': BDA=({},{}) CRTC={} ({},{})",
+                c as char, col, row, crtc_off, crtc_off % 80, crtc_off / 80);
+        }
+        let v = vga::vga();
+        v.set_cursor_pos(col, row);
+        v.putchar(c);
+        let (col, row) = v.cursor_pos();
+        core::ptr::write_volatile(0x450 as *mut u8, col as u8);
+        core::ptr::write_volatile(0x451 as *mut u8, row as u8);
+        // Update CRTC hardware cursor so save_from_hardware captures it
+        let offset = (row * 80 + col) as u16;
+        outb(0x3D4, 0x0E); outb(0x3D5, (offset >> 8) as u8);
+        outb(0x3D4, 0x0F); outb(0x3D5, offset as u8);
+    }
+}
+
 // ============================================================================
 // DOS INT 21h — DOS services
 // ============================================================================
@@ -1922,7 +1998,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
-            vga::vga().putchar(regs.rdx as u8);
+            dos_putchar(regs.rdx as u8);
             thread::KernelAction::Done
         }
         // AH=0x06: Direct console I/O (DL=0xFF=input, else output DL)
@@ -1936,7 +2012,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                     regs.set_flag32(0x40); // set ZF = no char available
                 }
             } else {
-                vga::vga().putchar(dl);
+                dos_putchar(dl);
             }
             thread::KernelAction::Done
         }
@@ -1948,7 +2024,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             loop {
                 let ch = unsafe { *(addr as *const u8) };
                 if ch == b'$' { break; }
-                vga::vga().putchar(ch);
+                dos_putchar(ch);
                 addr += 1;
                 // Safety limit
                 if addr > 0xFFFFF { break; }
@@ -2389,7 +2465,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
                 for i in 0..count as u32 {
                     let ch = unsafe { *((addr + i) as *const u8) };
-                    vga::vga().putchar(ch);
+                    dos_putchar(ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
             } else if handle == NULL_FILE_HANDLE {

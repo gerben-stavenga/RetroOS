@@ -616,30 +616,21 @@ pub fn schedule(current_tid: usize) -> Option<usize> {
     }
 }
 
-/// Copy target thread's saved VGA state into `dst` and restore to hardware.
+/// Take target thread's saved VGA state (swap, no data copy) and restore to hardware.
 /// `dst` is the running caller's VGA state; the caller adopts target's screen.
 /// Returns 0 on success, negative errno on failure.
 pub fn vga_take(dst: &mut crate::kernel::vm86::VgaState, target_tid: i32) -> i32 {
     if target_tid < 0 || (target_tid as usize) >= MAX_THREADS { return -22; } // EINVAL
     unsafe {
-        let target = &THREADS[target_tid as usize];
+        let target = &mut *(&raw mut THREADS[target_tid as usize]);
         if target.state == ThreadState::Unused { return -3; } // ESRCH
-        let src = match &target.mode {
-            ThreadMode::Dos(d) => &d.vm86.vga,
+        let src = match &mut target.mode {
+            ThreadMode::Dos(d) => &mut d.vm86.vga,
             _ => return -22, // target not DOS
         };
-        if src.planes.is_empty() { return -61; } // ENODATA — target has no saved screen
-        dst.planes = src.planes.clone();
-        dst.misc_output = src.misc_output;
-        dst.seq = src.seq;
-        dst.crtc = src.crtc;
-        dst.gc = src.gc;
-        dst.ac = src.ac;
-        dst.dac = src.dac;
-        dst.dac_mask = src.dac_mask;
-        dst.ac_flipflop = src.ac_flipflop;
+        if src.planes.is_empty() { return -61; }
+        core::mem::swap(dst, src);
         dst.restore_to_hardware();
-        crate::kernel::vm86::VGA_AC_FLIPFLOP = dst.ac_flipflop;
     }
     0
 }
@@ -689,7 +680,6 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                 // upcoming arch_user_clean tears down user pages. Each thread
                 // saves its own vga here; the normal switch-save would see
                 // unmapped memory and capture garbage.
-                dos.vm86.vga.ac_flipflop = unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP };
                 dos.vm86.vga.save_from_hardware();
                 crate::kernel::vfs::close_all_fds(&mut dos.fds);
                 dos.symbols = None;
@@ -725,17 +715,12 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
         thread.exit_code = exit_code;
         thread.state = ThreadState::Zombie;
 
-        // Wake blocked parent (e.g., waiting for EXEC'd child to finish).
-        // VGA state belongs to each thread — do NOT touch parent's vga here.
-        // The normal switch-save at context-switch time captures this thread's
-        // final screen into its own vga; the parent's own vga was saved when
-        // we switched away from it and will be restored on switch-back.
+        // Wake blocked parent.
         if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
             let parent = &mut THREADS[parent_tid as usize];
             let was_waiting = parent.state == ThreadState::Blocked;
             if was_waiting {
                 parent.state = ThreadState::Ready;
-                // Signal normal exit to parent's synth fork_exec_wait: AX = 0 (status=exited).
                 parent.cpu_state.rax = parent.cpu_state.rax & !0xFFFF;
             }
             if let ThreadMode::Dos(dos) = &mut parent.mode {

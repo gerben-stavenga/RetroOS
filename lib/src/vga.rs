@@ -66,6 +66,17 @@ impl Vga {
         unsafe { core::slice::from_raw_parts_mut(self.base as *mut u16, VGA_SIZE) }
     }
 
+    /// Returns (column, row) cursor position.
+    pub fn cursor_pos(&self) -> (usize, usize) {
+        (self.cursor_x, self.cursor_y)
+    }
+
+    /// Sets the cursor position.
+    pub fn set_cursor_pos(&mut self, col: usize, row: usize) {
+        self.cursor_x = col;
+        self.cursor_y = row;
+    }
+
     pub fn clear(&mut self) {
         let blank = (self.attr as u16) << 8 | b' ' as u16;
         for cell in self.buffer() {
@@ -117,8 +128,7 @@ impl Vga {
             EscState::Normal => {}
         }
 
-        // Scroll before writing so re-entrant calls (e.g. timer IRQ
-        // printing during putchar) never index past the buffer end.
+        // Scroll before writing so we never index past the buffer end.
         if self.cursor_y >= VGA_HEIGHT {
             self.scroll();
             self.cursor_y = VGA_HEIGHT - 1;
@@ -144,6 +154,13 @@ impl Vga {
                     self.cursor_y += 1;
                 }
             }
+        }
+
+        // Scroll immediately when cursor goes past bottom, so the cursor
+        // position is always valid (not deferred to next call).
+        if self.cursor_y >= VGA_HEIGHT {
+            self.scroll();
+            self.cursor_y = VGA_HEIGHT - 1;
         }
     }
 }

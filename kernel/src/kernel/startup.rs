@@ -129,6 +129,12 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8]) {
         *psp.add(0x81 + tail_len) = 0x0D;
     }
 
+    // Seed BDA cursor from kernel VGA cursor (one-time, before first DOS process).
+    let (col, row) = crate::vga::vga().cursor_pos();
+    unsafe {
+        core::ptr::write_volatile(0x450 as *mut u8, col as u8);
+        core::ptr::write_volatile(0x451 as *mut u8, row as u8);
+    }
     unsafe { *(&raw mut crate::arch::REGS) = t.cpu_state; }
     event_loop(tid);
 }
@@ -266,6 +272,10 @@ fn event_loop(first_tid: usize) {
                             _ => {
                                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                                 let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                                crate::dbg_println!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] tid={}",
+                                    event, regs.code_seg(), regs.ip32() as u16, lin,
+                                    bytes[0], bytes[1], bytes[2], bytes[3],
+                                    bytes[4], bytes[5], bytes[6], bytes[7], tid);
                                 panic!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
                                     event, regs.code_seg(), regs.ip32() as u16, lin,
                                     bytes[0], bytes[1], bytes[2], bytes[3],
@@ -341,7 +351,6 @@ fn event_loop(first_tid: usize) {
                 let new_dos = new.is_dos();
                 if old_dos {
                     let dos = old.dos_mut();
-                    dos.vm86.vga.ac_flipflop = unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP };
                     dos.vm86.vga.save_from_hardware();
                 }
                 let mut swap_regs = new.cpu_state;
@@ -358,7 +367,6 @@ fn event_loop(first_tid: usize) {
                 if new_dos {
                     let dos = new.dos_mut();
                     dos.vm86.vga.restore_to_hardware();
-                    unsafe { crate::kernel::vm86::VGA_AC_FLIPFLOP = dos.vm86.vga.ac_flipflop; }
                 }
                 tid = new_tid;
                 // Reload LDT if switching to a DPMI thread, TLS if switching to a Linux thread
@@ -499,6 +507,25 @@ fn handle_fork_exec(
         let dos = child.dos_mut();
         dos.vm86.heap_seg = end_seg;
         dos.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
+        // Snapshot parent's current VGA hardware state into child so it
+        // starts with the parent's screen (invariant: suspended thread's
+        // VGA state is materialized in memory).
+        dos.vm86.vga.save_from_hardware();
+        // Seed child's BDA cursor from CRTC hardware cursor so DOS/BIOS
+        // output starts at the correct position (DN sets CRTC cursor via
+        // INT 10h AH=02h but writes chars directly to B8000).
+        use crate::arch::{inb, outb};
+        outb(0x3D4, 0x0E);
+        let cursor_hi = inb(0x3D5) as u16;
+        outb(0x3D4, 0x0F);
+        let cursor_lo = inb(0x3D5) as u16;
+        let cursor_off = (cursor_hi << 8) | cursor_lo;
+        let col = (cursor_off % 80) as u8;
+        let row = (cursor_off / 80) as u8;
+        unsafe {
+            core::ptr::write_volatile(0x450 as *mut u8, col);
+            core::ptr::write_volatile(0x451 as *mut u8, row);
+        }
     }
 
     // Propagate cwd from parent to child
