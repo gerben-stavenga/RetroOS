@@ -63,6 +63,12 @@ pub struct DpmiState {
     /// Dedicated real-mode stack segment for INT 31h/0300h simulation.
     /// Allocated from DOS heap so it doesn't overlap with the client's data.
     pub rm_stack_seg: u16,
+    /// Client mode bit-width as declared at INT 2F/1687h → entry point.
+    /// Determines the operand size used for FAR CALL/INT frames the client
+    /// places on its own stack (4 vs 8 bytes for CALL FAR, 6 vs 12 bytes for
+    /// INT). The stub LDT segment itself is 16-bit, so we can't infer this
+    /// from the trapped CS — we must remember what the client declared.
+    pub client_use32: bool,
 }
 
 /// A DPMI linear memory block
@@ -91,6 +97,7 @@ impl DpmiState {
             exc_vectors: [(0, 0); 32],
             callbacks: [None; MAX_CALLBACKS],
             rm_stack_seg: 0,
+            client_use32: false,
         }
     }
 
@@ -246,6 +253,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 
     // Allocate DPMI state
     let mut dpmi = DpmiState::new();
+    dpmi.client_use32 = client_type != 0;
 
     // Set up initial LDT entries.
     // CS stays 16-bit: the return from mode switch is still 16-bit stub code.
@@ -328,16 +336,10 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
         }
     }
 
-    // Default PM handlers for ALL interrupt vectors (DPMI spec requires these).
-    // Default PM vectors point into the unified CD 31 array at STUB_BASE.
-    // DOS extenders read them via INT 31h/0204h and store as chain-to addresses.
-    // When executed, CD 31 fires INT 31h (DPL=3) → dpmi_int31 detects stub_sel
-    // and reflects to real mode via IVT.
-    let stub_sel = DpmiState::idx_to_sel(5);
-    let stub_base = vm86::STUB_BASE;
-    for vec in 0..=0xFFu16 {
-        dpmi.pm_vectors[vec as usize] = (stub_sel, stub_base + (vec as u32) * 2);
-    }
+    // pm_vectors stays zero-initialized: sel=0 means "no client handler",
+    // which signals reflect-to-real-mode in dpmi_monitor / dpmi_soft_int.
+    // INT 31h/0204h synthesizes the stub address on demand for clients that
+    // chain to the default handler.
 
     // Store DPMI state on thread
     dos.dpmi = Some(Box::new(dpmi));
@@ -538,32 +540,39 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
             let new_ip = if cs_32 { new_ip } else { new_ip & 0xFFFF };
             // Note: stub-segment INT N no longer reaches here — stubs use CD 31
             // (INT 31h, DPL=3) which goes to dpmi_int31 → pm_stub_dispatch.
-            // Push 32-bit IRET frame on client stack.
-            // DPMI interrupt dispatch uses 32-bit gates — always push dwords,
-            // regardless of caller's operand size.  The handler's IRET (often
-            // o32 IRET in use16 code) expects 32-bit values.
-            let sp = get_sp(regs);
-            let new_sp = sp.wrapping_sub(12);
-            set_sp(regs, new_sp);
-            unsafe {
-                core::ptr::write_unaligned((ss_base.wrapping_add(new_sp)) as *mut u32, new_ip);
-                core::ptr::write_unaligned((ss_base.wrapping_add(new_sp + 4)) as *mut u32, regs.code_seg() as u32);
-                core::ptr::write_unaligned((ss_base.wrapping_add(new_sp + 8)) as *mut u32, regs.flags32());
-            }
-            // Dispatch to PM interrupt handler
+            //
+            // Fast path: no client handler installed → reflect to real mode
+            // without touching the client stack at all (saves a round-trip
+            // through the stub array).
             let dpmi = dos.dpmi.as_ref().unwrap();
             let (sel, off) = dpmi.pm_vectors[vector as usize];
-            if sel != 0 {
-                regs.set_cs32(sel as u32);
-                regs.set_ip32(off);
-            } else {
-                // No PM handler installed — reflect to real mode via IVT.
-                // Undo the stack push (the PM IRET frame is not needed).
-                set_sp(regs, sp);
-                // Save PM state with IP past the INT instruction.
+            if sel == 0 {
                 regs.set_ip32(new_ip);
                 return reflect_int_to_real_mode(dos, regs, vector);
             }
+            // Client handler installed — push an IRET frame matching the
+            // client's bit-width (16-bit IRETW = 6 bytes, 32-bit IRETD = 12).
+            let use32 = dpmi.client_use32;
+            let sp = get_sp(regs);
+            let frame_size: u32 = if use32 { 12 } else { 6 };
+            let new_sp = sp.wrapping_sub(frame_size);
+            set_sp(regs, new_sp);
+            unsafe {
+                let base = ss_base.wrapping_add(new_sp);
+                if use32 {
+                    let p = base as *mut u32;
+                    core::ptr::write_unaligned(p, new_ip);
+                    core::ptr::write_unaligned(p.add(1), regs.code_seg() as u32);
+                    core::ptr::write_unaligned(p.add(2), regs.flags32());
+                } else {
+                    let p = base as *mut u16;
+                    core::ptr::write_unaligned(p, new_ip as u16);
+                    core::ptr::write_unaligned(p.add(1), regs.code_seg());
+                    core::ptr::write_unaligned(p.add(2), regs.flags32() as u16);
+                }
+            }
+            regs.set_cs32(sel as u32);
+            regs.set_ip32(off);
             trace_client_selector_leak("dpmi_monitor.int", regs);
             return thread::KernelAction::Done;
         }
@@ -598,19 +607,30 @@ pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) ->
     // so CS == stub_sel no longer reaches here.
     let (sel, off) = dpmi.pm_vectors[vector as usize];
     if sel != 0 {
-        // PM handler installed — push IRET frame and dispatch
+        // PM handler installed — push IRET frame and dispatch.
+        // 16-bit clients get a 6-byte IRETW frame; 32-bit a 12-byte IRETD frame.
+        let use32 = dpmi.client_use32;
         let ss_sel = regs.frame.ss as u16;
         let ss_base = seg_base(dpmi, ss_sel);
         let ss_32 = seg_is_32(dpmi, ss_sel);
         let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-        let new_sp = sp.wrapping_sub(12);
+        let frame_size: u32 = if use32 { 12 } else { 6 };
+        let new_sp = sp.wrapping_sub(frame_size);
         if ss_32 { regs.set_sp32(new_sp); }
         else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
         unsafe {
-            let base = ss_base.wrapping_add(new_sp) as *mut u32;
-            core::ptr::write_unaligned(base, regs.ip32());
-            core::ptr::write_unaligned(base.add(1), regs.code_seg() as u32);
-            core::ptr::write_unaligned(base.add(2), regs.flags32());
+            let base = ss_base.wrapping_add(new_sp);
+            if use32 {
+                let p = base as *mut u32;
+                core::ptr::write_unaligned(p, regs.ip32());
+                core::ptr::write_unaligned(p.add(1), regs.code_seg() as u32);
+                core::ptr::write_unaligned(p.add(2), regs.flags32());
+            } else {
+                let p = base as *mut u16;
+                core::ptr::write_unaligned(p, regs.ip32() as u16);
+                core::ptr::write_unaligned(p.add(1), regs.code_seg());
+                core::ptr::write_unaligned(p.add(2), regs.flags32() as u16);
+            }
         }
         regs.set_cs32(sel as u32);
         regs.set_ip32(off);
@@ -641,14 +661,24 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
             return raw_switch_pm_to_real(dos, regs);
         }
         vm86::SLOT_SAVE_RESTORE => {
-            // No-op save/restore: pop the far-call return address and resume caller
+            // No-op save/restore: pop the far-call return address and resume caller.
+            // Frame size depends on the client's operand size: 16-bit CALL FAR
+            // pushed IP+CS as 4 bytes; 32-bit CALL FAR pushed EIP+CS as 8 bytes.
             let dpmi = dos.dpmi.as_ref().unwrap();
+            let use32 = dpmi.client_use32;
             let ss_base = seg_base(dpmi, regs.stack_seg());
             let ss_32 = seg_is_32(dpmi, regs.stack_seg());
             let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-            let ret_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
-            let ret_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
-            let new_sp = sp.wrapping_add(8);
+            let (ret_eip, ret_cs, frame_size) = if use32 {
+                let eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
+                (eip, cs, 8u32)
+            } else {
+                let ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) } as u32;
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) } as u32;
+                (ip, cs, 4u32)
+            };
+            let new_sp = sp.wrapping_add(frame_size);
             if ss_32 { regs.set_sp32(new_sp); }
             else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
             regs.set_ip32(ret_eip);
@@ -661,14 +691,25 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
             // (pushed by deliver_hw_irq or INT dispatch) from the PM stack
             // before saving state. This way callback_return restores to the
             // original interrupted code, not the next stub entry.
+            // Frame width matches what we pushed in deliver_hw_irq/dpmi_soft_int:
+            // 16-bit clients get a 6-byte IRETW frame, 32-bit a 12-byte IRETD frame.
             let dpmi = dos.dpmi.as_ref().unwrap();
+            let use32 = dpmi.client_use32;
             let ss_base = seg_base(dpmi, regs.stack_seg());
             let ss_32 = seg_is_32(dpmi, regs.stack_seg());
             let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-            let ret_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
-            let ret_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
-            let ret_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
-            let new_sp = sp.wrapping_add(12);
+            let (ret_eip, ret_cs, ret_flags, frame_size) = if use32 {
+                let eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
+                let fl = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
+                (eip, cs, fl, 12u32)
+            } else {
+                let ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) } as u32;
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) } as u32;
+                let fl = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u16) } as u32;
+                (ip, cs, fl, 6u32)
+            };
+            let new_sp = sp.wrapping_add(frame_size);
             if ss_32 { regs.set_sp32(new_sp); }
             else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
             regs.set_ip32(ret_eip);
@@ -952,9 +993,18 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         }
         // AX=0204h — Get Protected Mode Interrupt Vector
         // BL = interrupt number. Returns: CX:EDX = selector:offset
+        // If no client handler is installed, synthesize the address of the
+        // default CD 31 stub slot — clients store this as a chain-to handler.
         0x0204 => {
             let int_num = regs.rbx as u8;
             let (sel, off) = dpmi.pm_vectors[int_num as usize];
+            let (sel, off) = if sel == 0 {
+                let stub_sel = DpmiState::idx_to_sel(5);
+                let stub_off = vm86::STUB_BASE + (int_num as u32) * 2;
+                (stub_sel, stub_off)
+            } else {
+                (sel, off)
+            };
             regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
             regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
             clear_carry(regs);
@@ -1626,26 +1676,32 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
 
 /// Deliver a hardware interrupt to the DPMI client's PM interrupt handler.
 /// `vector` is the interrupt vector number (e.g. 0x09 for keyboard, 0x08 for timer).
-/// Pushes an IRET frame on the client stack and redirects CS:EIP.
-/// Returns true if delivered, false if no handler installed.
-pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> bool {
+/// If a PM handler is installed (INT 31h/0205h), push an IRET frame on the
+/// client stack and redirect CS:EIP. Otherwise reflect the IRQ to real mode
+/// via the IVT — same fast path as `dpmi_monitor` uses for unhooked INT N.
+pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
-        None => return false,
+        None => return,
     };
 
     let (sel, off) = dpmi.pm_vectors[vector as usize];
     if sel == 0 {
-        return false;
+        // No PM handler — reflect to real mode via the IVT. Same path used
+        // by dpmi_monitor's INT branch when pm_vectors[vec] is unset.
+        let _ = reflect_int_to_real_mode(dos, regs, vector);
+        return;
     }
 
+    let use32 = dpmi.client_use32;
     let ss_sel = regs.frame.ss as u16;
     let ss_base = seg_base(dpmi, ss_sel);
     let ss_32 = seg_is_32(dpmi, ss_sel);
 
-    // Push 32-bit IRET frame: EFLAGS, CS, EIP
+    // Push IRET frame: 16-bit clients get IRETW (6 bytes), 32-bit IRETD (12 bytes).
     let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-    let new_sp = sp.wrapping_sub(12);
+    let frame_size: u32 = if use32 { 12 } else { 6 };
+    let new_sp = sp.wrapping_sub(frame_size);
     if ss_32 {
         regs.set_sp32(new_sp);
     } else {
@@ -1653,10 +1709,17 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -
     }
     let lin = ss_base.wrapping_add(new_sp);
     unsafe {
-        let base = lin as *mut u32;
-        core::ptr::write_unaligned(base, regs.ip32());
-        core::ptr::write_unaligned(base.add(1), regs.code_seg() as u32);
-        core::ptr::write_unaligned(base.add(2), regs.flags32());
+        if use32 {
+            let p = lin as *mut u32;
+            core::ptr::write_unaligned(p, regs.ip32());
+            core::ptr::write_unaligned(p.add(1), regs.code_seg() as u32);
+            core::ptr::write_unaligned(p.add(2), regs.flags32());
+        } else {
+            let p = lin as *mut u16;
+            core::ptr::write_unaligned(p, regs.ip32() as u16);
+            core::ptr::write_unaligned(p.add(1), regs.code_seg());
+            core::ptr::write_unaligned(p.add(2), regs.flags32() as u16);
+        }
     }
 
     dpmi_trace!("[DPMI] HW_IRQ vec={:#04x} -> {:04x}:{:#x} from {:04x}:{:#x}",
@@ -1669,8 +1732,6 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -
     if irq_num < 8 {
         dos.vm86.vpic.isr |= 1 << irq_num;
     }
-
-    true
 }
 
 // ============================================================================
