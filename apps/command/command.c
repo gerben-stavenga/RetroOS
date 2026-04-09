@@ -1,6 +1,6 @@
 /* COMMAND.COM — minimal shell for RetroOS
  *
- * Compiled inside RetroOS by BCC at boot (see apps/init/src/main.rs).
+ * Compiled inside RetroOS by BCC at boot.
  *
  * All parsing and dispatching lives in the kernel's synth INT 31h handler:
  *   AH=01h SYNTH_FORK_EXEC_WAIT: reads caller's own PSP cmdline, strips "/C",

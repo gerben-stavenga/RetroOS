@@ -3893,8 +3893,16 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     let resolved_name = dos_resolve_path(dos, prog_name, &mut resolved_copy);
     let rlen = resolved_name.len();
 
+    // Inherit parent's env block. In DPMI mode the parent's PSP[0x2C] has
+    // been patched to a selector, so use the saved original RM segment.
+    // Otherwise read the segment value straight out of the parent PSP.
+    let parent_env_seg = if let Some(dpmi) = dos.dpmi.as_ref() {
+        Some(dpmi.env_seg_orig)
+    } else {
+        Some(unsafe { ((COM_SEGMENT as u32 * 16 + 0x2C) as *const u16).read_unaligned() })
+    };
     let (cs, ip, ss, sp, end_seg) = if is_exe {
-        match load_exe_at(child_seg, COM_SEGMENT, &buf, &resolved_copy[..rlen]) {
+        match load_exe_at(child_seg, COM_SEGMENT, parent_env_seg, &buf, &resolved_copy[..rlen]) {
             Some(t) => t,
             None => {
                 regs.rax = (regs.rax & !0xFFFF) | 11;
@@ -3903,7 +3911,7 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             }
         }
     } else {
-        load_com_at(child_seg, COM_SEGMENT, &buf, &resolved_copy[..rlen])
+        load_com_at(child_seg, COM_SEGMENT, parent_env_seg, &buf, &resolved_copy[..rlen])
     };
 
     // Copy command tail to child's PSP at child_seg:0080
@@ -4402,13 +4410,19 @@ fn sft_clear(handle: u16) {
 /// - PSP (256 bytes) at COM_SEGMENT:0000.
 /// - Environment block 256 bytes before PSP.
 ///
+/// `parent_env_seg`: real-mode segment of the env block to inherit, or None
+/// to create a fresh env block. Callers running in DPMI mode must pass the
+/// original RM segment (DpmiState.env_seg_orig), not the patched selector.
+///
 /// Pages are written via demand paging (ring-1 writes trigger page faults
 /// that allocate fresh pages at ring 0).
-fn map_psp(psp_seg: u16, parent_psp: u16, prog_name: &[u8]) {
+fn map_psp(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, prog_name: &[u8]) {
     let psp_addr = (psp_seg as usize) << 4;
 
-    // Environment: create fresh for first load, inherit from parent for child exec
-    let env_seg = if psp_seg == parent_psp {
+    // Environment: create fresh when no parent env supplied, otherwise inherit
+    let env_seg = if let Some(env) = parent_env_seg {
+        env
+    } else {
         // First load — create env block below PSP
         let env_seg: u16 = psp_seg - 0x10;
         let env_ptr = ((env_seg as usize) << 4) as *mut u8;
@@ -4434,9 +4448,6 @@ fn map_psp(psp_seg: u16, parent_psp: u16, prog_name: &[u8]) {
         }
         unsafe { *env_ptr.add(off) = 0; }
         env_seg
-    } else {
-        // Child exec — inherit parent's env
-        unsafe { ((parent_psp as u32 * 16 + 0x2C) as *const u16).read_unaligned() }
     };
 
     // Parent-PSP segment for PSP[0x16]. For initial load (no real parent),
@@ -4487,12 +4498,12 @@ pub fn is_mz_exe(data: &[u8]) -> bool {
 ///     0x0100-...:    .COM binary code
 ///   Stack at COM_SEGMENT:COM_SP (top of segment)
 pub fn load_com(data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
-    load_com_at(COM_SEGMENT, COM_SEGMENT, data, prog_name)
+    load_com_at(COM_SEGMENT, COM_SEGMENT, None, data, prog_name)
 }
 
 /// Returns (cs, ip, ss, sp, end_seg) — caller sets heap_seg = end_seg.
-fn load_com_at(psp_seg: u16, parent_psp: u16, data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
-    map_psp(psp_seg, parent_psp, prog_name);
+fn load_com_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
+    map_psp(psp_seg, parent_psp, parent_env_seg, prog_name);
     let end_seg = psp_seg.wrapping_add(0x1000);
 
     // Copy .COM data at offset 0x100
@@ -4524,11 +4535,11 @@ fn load_com_at(psp_seg: u16, parent_psp: u16, data: &[u8], prog_name: &[u8]) -> 
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
 pub fn load_exe(data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
-    load_exe_at(COM_SEGMENT, COM_SEGMENT, data, prog_name)
+    load_exe_at(COM_SEGMENT, COM_SEGMENT, None, data, prog_name)
 }
 
 /// Returns (cs, ip, ss, sp, end_seg) — caller sets heap_seg = end_seg.
-fn load_exe_at(psp_seg: u16, parent_psp: u16, data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
+fn load_exe_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
     if data.len() < 28 {
         return None;
     }
@@ -4562,7 +4573,7 @@ fn load_exe_at(psp_seg: u16, parent_psp: u16, data: &[u8], prog_name: &[u8]) -> 
     // Load segment: PSP is at psp_seg, load module starts one segment after
     let load_segment = psp_seg + 0x10; // 256 bytes after PSP base
 
-    map_psp(psp_seg, parent_psp, prog_name);
+    map_psp(psp_seg, parent_psp, parent_env_seg, prog_name);
 
     // Set initial heap past the loaded program (PSP + load image + min extra/BSS)
     let load_paras = ((load_size as u32 + 15) / 16) as u16;

@@ -30,9 +30,9 @@ macro_rules! dpmi_trace {
 }
 
 /// Number of LDT entries
-const LDT_ENTRIES: usize = 256;
+const LDT_ENTRIES: usize = 8192;
 /// Maximum DPMI memory blocks
-const MAX_MEM_BLOCKS: usize = 32;
+const MAX_MEM_BLOCKS: usize = 256;
 /// Base address for DPMI linear memory allocations
 const MEM_BASE: u32 = 0x0050_0000;
 
@@ -43,8 +43,8 @@ const MAX_CALLBACKS: usize = 16;
 pub struct DpmiState {
     /// Local Descriptor Table entries
     pub ldt: Box<[u64; LDT_ENTRIES]>,
-    /// LDT allocation bitmap (1 = in use). 256 bits = 8 u32s.
-    pub ldt_alloc: [u32; 8],
+    /// LDT allocation bitmap (1 = in use). 8192 bits = 256 u32s.
+    pub ldt_alloc: [u32; LDT_ENTRIES / 32],
     /// Linear memory blocks allocated via INT 31h/0501h
     pub mem_blocks: [Option<MemBlock>; MAX_MEM_BLOCKS],
     /// Bump allocator for linear memory (next free address)
@@ -69,6 +69,11 @@ pub struct DpmiState {
     /// INT). The stub LDT segment itself is 16-bit, so we can't infer this
     /// from the trapped CS — we must remember what the client declared.
     pub client_use32: bool,
+    /// Original real-mode environment segment from PSP[0x2C] before we
+    /// patched it to a selector at dpmi_enter. Per DPMI 0.9 spec, the host
+    /// converts PSP[0x2C] to a descriptor on PM entry; we keep the original
+    /// segment so in-process child exec can inherit the env block.
+    pub env_seg_orig: u16,
 }
 
 /// A DPMI linear memory block
@@ -81,15 +86,30 @@ pub struct MemBlock {
 /// Saved protected-mode state for real-mode callbacks
 pub struct SavedPmState {
     pub regs: Regs,
-    /// Pointer to the 50-byte real-mode call structure (in PM address space)
+    /// Pointer to the 50-byte real-mode call structure (in PM address space).
+    /// 0 = implicit reflection (no register structure to update on return).
     pub rm_struct_addr: u32,
+    /// IVT vector that was reflected (only meaningful when rm_struct_addr == 0).
+    /// callback_return uses this to apply DPMI selector/segment translation
+    /// for INT 21h PSP-related calls (AH=51/62).
+    pub vector: u8,
 }
 
 impl DpmiState {
     pub fn new() -> Self {
+        // Allocate the 64KB LDT directly on the heap. `Box::new([0u64; N])`
+        // would materialize the array on the stack first and then copy it,
+        // overflowing the kernel stack for large N. `vec![0u64; N]` uses the
+        // `alloc_zeroed` specialization for primitive types and never touches
+        // the stack.
+        let ldt: Box<[u64; LDT_ENTRIES]> = alloc::vec![0u64; LDT_ENTRIES]
+            .into_boxed_slice()
+            .try_into()
+            .ok()
+            .expect("LDT size mismatch");
         Self {
-            ldt: Box::new([0u64; LDT_ENTRIES]),
-            ldt_alloc: [0u32; 8],
+            ldt,
+            ldt_alloc: [0u32; LDT_ENTRIES / 32],
             mem_blocks: [None; MAX_MEM_BLOCKS],
             mem_next: MEM_BASE,
             rm_save: None,
@@ -98,6 +118,7 @@ impl DpmiState {
             callbacks: [None; MAX_CALLBACKS],
             rm_stack_seg: 0,
             client_use32: false,
+            env_seg_orig: 0,
         }
     }
 
@@ -241,12 +262,14 @@ fn build_descriptor(base: u32, limit: u32, access: u64, flags: u64) -> u64 {
 /// Called from stub_dispatch when the DPMI entry stub executes.
 pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
-    dpmi_trace!("[DPMI] ENTER AX={} ({}bit client)", client_type, if client_type != 0 { 32 } else { 16 });
     // Save VM86 register state for the FAR CALL return address
     // The FAR CALL pushed CS:IP on the real-mode stack.
     // Pop the return address so we know where to resume in PM.
     let ret_ip = vm86::vm86_pop(regs);
     let ret_cs = vm86::vm86_pop(regs);
+    dpmi_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X}",
+        client_type, if client_type != 0 { 32 } else { 16 },
+        ret_cs, ret_ip, dos.vm86.current_psp);
 
     let real_ss = regs.stack_seg();
     let real_sp = regs.sp32() as u16;
@@ -278,8 +301,13 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     dpmi.ldt[3] = DpmiState::make_data_desc_ex(ss_base, 0xFFFF, use32);
     dpmi.ldt_alloc[0] |= 1 << 3;
 
-    // Index 4: ES — PSP selector (DPMI spec: ES=PSP on entry)
-    let psp_base = (vm86::COM_SEGMENT as u32) * 16;
+    // Index 4: ES — PSP selector. The DPMI 0.9 spec says limit=100h, but
+    // many real-world DOS extenders (DOS/4GW, etc.) reuse ES as a scratch
+    // data segment before reloading it, and crash if the limit is too tight.
+    // Give it a 64KB limit for compatibility. Use the current PSP, not a
+    // hardcoded segment, so child execs get a selector pointing at their own.
+    let psp_seg = dos.vm86.current_psp;
+    let psp_base = (psp_seg as u32) * 16;
     dpmi.ldt[4] = DpmiState::make_data_desc_ex(psp_base, 0xFFFF, false);
     dpmi.ldt_alloc[0] |= 1 << 4;
 
@@ -322,14 +350,18 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     dos.vm86.heap_seg = rm_stack_seg.wrapping_add(0x10); // 256 bytes
     dpmi.rm_stack_seg = rm_stack_seg;
 
-    // Patch PSP environment segment to a PM selector.
-    // The PSP at offset 0x2C contains the real-mode environment segment (e.g. 0x0F00).
-    // DPMI clients read this via the PSP selector and expect a PM selector, not a
-    // raw segment. Allocate an LDT entry mapping the environment block.
+    // DPMI 0.9 §4.1: "The environment pointer in the client program's PSP
+    // is automatically converted to a selector during the mode switch."
+    // 32-bit DOS extenders (DOS/4GW etc.) follow the spec and read PSP[0x2C]
+    // as a selector. 16-bit extenders (DOS/16M, used by Borland tools) are
+    // non-conformant and read PSP[0x2C] as a real-mode segment, shifting it
+    // left 4 to compute a base — so patching it for 16-bit clients corrupts
+    // their env-block selector. Patch only for 32-bit clients.
     let env_seg = unsafe { *((psp_base + 0x2C) as *const u16) };
-    if env_seg != 0 {
-        let env_base = (env_seg as u32) * 16;
+    dpmi.env_seg_orig = env_seg;
+    if use32 && env_seg != 0 {
         if let Some(idx) = dpmi.alloc_ldt() {
+            let env_base = (env_seg as u32) * 16;
             dpmi.ldt[idx] = DpmiState::make_data_desc_ex(env_base, 0xFFFF, false);
             let env_sel = DpmiState::idx_to_sel(idx);
             unsafe { *((psp_base + 0x2C) as *mut u16) = env_sel; }
@@ -577,8 +609,7 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
             return thread::KernelAction::Done;
         }
         _ => {
-            // Not a sensitive instruction — dispatch to client exception handler
-            let modrm = unsafe { *((flat_eip.wrapping_add(offset + 1)) as *const u8) };
+            // Not a sensitive instruction — dispatch to client exception handler.
             return dispatch_dpmi_exception(dos, regs, 13);
         }
     }
@@ -1321,6 +1352,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bo
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
+        vector: 0xFF,
     });
 
     // Set up VM86 regs for real-mode interrupt
@@ -1391,11 +1423,25 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     let rm_fs = (seg_base(dpmi, regs.fs as u16) >> 4) as u16;
     let rm_gs = (seg_base(dpmi, regs.gs as u16) >> 4) as u16;
 
+    // INT 21h PSP-related calls — DPMI clients pass PSPs as selectors, not
+    // real-mode segments. Translate inputs (AH=50h Set PSP) here so the
+    // real-mode handler sees a segment; AH=51h/62h outputs are translated
+    // back in callback_return.
+    if vector == 0x21 {
+        let ah = (regs.rax >> 8) as u8;
+        if ah == 0x50 {
+            let bx_sel = regs.rbx as u16;
+            let psp_seg = (seg_base(dpmi, bx_sel) >> 4) as u16;
+            regs.rbx = (regs.rbx & !0xFFFF) | psp_seg as u64;
+        }
+    }
+
 
     // Save protected-mode state (rm_struct_addr=0 signals implicit reflection)
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
         rm_struct_addr: 0,
+        vector,
     });
 
     const VM_FLAG: u32 = 1 << 17;
@@ -1450,6 +1496,7 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool)
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
+        vector: 0xFF,
     });
 
     const VM_FLAG: u32 = 1 << 17;
@@ -1498,6 +1545,7 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs, cs_32: 
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
+        vector: 0xFF,
     });
 
     const VM_FLAG: u32 = 1 << 17;
@@ -1586,6 +1634,7 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
+        vector: 0xFF,
     });
 
     // Switch to protected mode and call the PM handler
@@ -1646,6 +1695,11 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     } else {
         // Implicit INT reflection — propagate real-mode register results
         // back into the PM registers so the caller sees return values.
+        // Snapshot saved-PM AH before reborrowing for register propagation;
+        // it's the AH of the original (pre-reflection) PM call, which tells
+        // us whether to apply INT 21h PSP translation.
+        let saved_ah = (saved.regs.rax >> 8) as u8;
+        let saved_vec = saved.vector;
         let pm_regs = &mut saved.regs;
         pm_regs.rax = (pm_regs.rax & !0xFFFFFFFF) | regs.rax & 0xFFFFFFFF;
         pm_regs.rbx = (pm_regs.rbx & !0xFFFFFFFF) | regs.rbx & 0xFFFFFFFF;
@@ -1657,6 +1711,16 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
         // Propagate carry flag (for DOS error reporting)
         let rm_cf = regs.flags32() & 1;
         pm_regs.set_flags32((pm_regs.flags32() & !1) | rm_cf);
+
+        // INT 21h PSP-result translation — convert real-mode PSP segment in
+        // BX back to a PM selector for AH=51h (Get PSP) and AH=62h (Get PSP).
+        if saved_vec == 0x21 && (saved_ah == 0x51 || saved_ah == 0x62) {
+            let psp_seg = regs.rbx as u16;
+            let psp_sel = find_psp_selector(dpmi, psp_seg);
+            pm_regs.rbx = (pm_regs.rbx & !0xFFFF) | psp_sel as u64;
+            dpmi_trace!("[DPMI] AH={:02X} translate BX seg={:04X} -> sel={:04X}",
+                saved_ah, psp_seg, psp_sel);
+        }
     }
 
     // Restore protected-mode state
@@ -1741,16 +1805,29 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
 /// Dispatch a CPU exception to the client's exception handler (set via INT 31h/0203h).
 /// If no handler is set, kill the thread.
 ///
-/// DPMI exception handler calling convention (32-bit client):
-/// The handler is called with a FAR CALL. Stack frame:
+/// DPMI 0.9 exception handler calling convention. The handler is called with a
+/// FAR CALL. Frame width depends on the client type (16-bit clients get word
+/// fields, 32-bit clients get dword fields).
+///
+/// 32-bit client frame:
 ///   [ESP+0]  Return EIP (points to DPMI host retf stub)
 ///   [ESP+4]  Return CS (DPMI host code selector)
-///   [ESP+8]  Error code
+///   [ESP+8]  Error code (dword)
 ///   [ESP+12] Faulting EIP
 ///   [ESP+16] Faulting CS
 ///   [ESP+20] Faulting EFLAGS
-///   [ESP+24] Faulting ESP (optional, for SS faults)
-///   [ESP+28] Faulting SS (optional, for SS faults)
+///   [ESP+24] Faulting ESP
+///   [ESP+28] Faulting SS
+///
+/// 16-bit client frame (all fields are words):
+///   [SP+0]   Return IP
+///   [SP+2]   Return CS
+///   [SP+4]   Error code
+///   [SP+6]   Faulting IP
+///   [SP+8]   Faulting CS
+///   [SP+10]  Faulting FLAGS
+///   [SP+12]  Faulting SP
+///   [SP+14]  Faulting SS
 pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
     dpmi_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code);
@@ -1768,38 +1845,62 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     };
 
     if handler_sel == 0 && handler_off == 0 {
-        // No handler set — kill
+        // Per DPMI 0.9: software-INT exceptions (0/3/4 = #DE/#BP/#OF) reflect
+        // to the real-mode IVT when the client has not installed a handler —
+        // dpmiload uses INT 3 as "halt on error" and expects the real-mode
+        // handler (a bare IRET stub) to bring it back. Hardware faults like
+        // #GP (13) or #PF (14) must NOT be reflected: their IVT slots point
+        // at unrelated services (e.g. INT 13h is BIOS disk I/O), and the
+        // faulting instruction would just re-execute and refault, producing
+        // an infinite loop. Terminate the client instead.
+        if matches!(exc_num, 0 | 3 | 4) {
+            return reflect_int_to_real_mode(dos, regs, exc_num as u8);
+        }
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
         crate::println!("{:?}", regs);
         return thread::KernelAction::Exit(-(exc_num as i32));
     }
 
-    // Build exception frame on client's stack
+    // Build exception frame on client's stack — width depends on client type.
+    let use32 = dpmi.client_use32;
     let ss_base = seg_base(dpmi, regs.stack_seg());
     let ss_32 = seg_is_32(dpmi, regs.stack_seg());
 
     let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
 
-    // Push exception frame (growing down)
-    let push32 = |sp: &mut u32, val: u32| {
-        *sp = sp.wrapping_sub(4);
-        unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(*sp)) as *mut u32, val); }
-    };
-
-    // DPMI exception frame: pushed from high to low address
-    // The handler sees: [ESP] = retaddr_eip, [ESP+4] = retaddr_cs, [ESP+8] = error_code, ...
-    push32(&mut sp, regs.frame.ss as u32);        // faulting SS
-    push32(&mut sp, regs.sp32());                  // faulting ESP
-    push32(&mut sp, regs.flags32());               // faulting EFLAGS
-    push32(&mut sp, regs.frame.cs as u32);         // faulting CS
-    push32(&mut sp, regs.ip32());                  // faulting EIP
-    push32(&mut sp, regs.err_code as u32);         // error code
     // Return address for the handler's RETF — point to our exception return stub
     // at LDT[5]:STUB_BASE + SLOT_EXCEPTION_RET*2 (CD 31 → pm_stub_dispatch)
     let stub_sel = DpmiState::idx_to_sel(5);
-    push32(&mut sp, stub_sel as u32);              // return CS
-    push32(&mut sp, (vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_EXCEPTION_RET) as u32));  // return EIP
+    let stub_off = vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_EXCEPTION_RET) as u32;
+
+    if use32 {
+        let push32 = |sp: &mut u32, val: u32| {
+            *sp = sp.wrapping_sub(4);
+            unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(*sp)) as *mut u32, val); }
+        };
+        push32(&mut sp, regs.frame.ss as u32);        // faulting SS
+        push32(&mut sp, regs.sp32());                  // faulting ESP
+        push32(&mut sp, regs.flags32());               // faulting EFLAGS
+        push32(&mut sp, regs.frame.cs as u32);         // faulting CS
+        push32(&mut sp, regs.ip32());                  // faulting EIP
+        push32(&mut sp, regs.err_code as u32);         // error code
+        push32(&mut sp, stub_sel as u32);              // return CS
+        push32(&mut sp, stub_off);                     // return EIP
+    } else {
+        let push16 = |sp: &mut u32, val: u16| {
+            *sp = sp.wrapping_sub(2);
+            unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(*sp)) as *mut u16, val); }
+        };
+        push16(&mut sp, regs.frame.ss as u16);         // faulting SS
+        push16(&mut sp, regs.sp32() as u16);           // faulting SP
+        push16(&mut sp, regs.flags32() as u16);        // faulting FLAGS
+        push16(&mut sp, regs.frame.cs as u16);         // faulting CS
+        push16(&mut sp, regs.ip32() as u16);           // faulting IP
+        push16(&mut sp, regs.err_code as u16);         // error code
+        push16(&mut sp, stub_sel);                     // return CS
+        push16(&mut sp, stub_off as u16);              // return IP
+    }
 
     // Set up regs to call the exception handler
     if ss_32 {
@@ -1813,50 +1914,77 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     thread::KernelAction::Done
 }
 
-/// Handle return from a DPMI exception handler (event 0xF2 from PM).
-/// The handler did RETF which popped the return CS:EIP (our stub).
-/// The stub did INT F2h. Now we pop the exception frame from the stack
-/// and restore the (possibly modified) faulting context.
+/// Handle return from a DPMI exception handler. Reached when the handler RETFs
+/// to our stub (LDT[5]:SLOT_EXCEPTION_RET) which then executes CD 31, routed
+/// here via pm_stub_dispatch.
 ///
-/// Stack at this point (from the handler's perspective, the RETF already popped
-/// the return address; INT F2h pushed SS/ESP/EFLAGS/CS/EIP on kernel stack):
-///   [old ESP+0]  error code
-///   [old ESP+4]  faulting EIP (possibly modified by handler)
-///   [old ESP+8]  faulting CS
-///   [old ESP+12] faulting EFLAGS
-///   [old ESP+16] faulting ESP
-///   [old ESP+20] faulting SS
+/// At this point regs.SS:SP points to the exception frame minus the return
+/// address that the handler's RETF already popped. Frame width matches the
+/// client type (16-bit clients have word fields, 32-bit clients have dword
+/// fields).
+///
+/// 32-bit client frame remaining:
+///   [ESP+0]  error code (dword)
+///   [ESP+4]  faulting EIP (possibly modified)
+///   [ESP+8]  faulting CS
+///   [ESP+12] faulting EFLAGS
+///   [ESP+16] faulting ESP
+///   [ESP+20] faulting SS
+///
+/// 16-bit client frame remaining (all words):
+///   [SP+0]   error code
+///   [SP+2]   faulting IP
+///   [SP+4]   faulting CS
+///   [SP+6]   faulting FLAGS
+///   [SP+8]   faulting SP
+///   [SP+10]  faulting SS
 fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
         None => return thread::KernelAction::Done,
     };
 
-    // The INT F2h trap saved the handler's CS:EIP (stub) and SS:ESP on kernel stack.
-    // regs.frame.ss/rsp reflect the handler's stack AFTER the RETF popped return addr.
-    // The exception frame starts at the current ESP.
+    let use32 = dpmi.client_use32;
     let ss_base = seg_base(dpmi, regs.stack_seg());
     let ss_32 = seg_is_32(dpmi, regs.stack_seg());
 
     let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
 
-    let pop32 = |sp: &mut u32| -> u32 {
-        let val = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(*sp)) as *const u32) };
-        *sp = sp.wrapping_add(4);
-        val
-    };
-
-    let _error_code = pop32(&mut sp);
-    let new_eip = pop32(&mut sp);
-    let new_cs = pop32(&mut sp) as u16;
-    let new_eflags = pop32(&mut sp);
-    let new_esp = pop32(&mut sp);
-    let new_ss = pop32(&mut sp) as u16;
+    let (new_eip, new_cs, new_eflags, new_esp, new_ss);
+    if use32 {
+        let pop32 = |sp: &mut u32| -> u32 {
+            let val = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(*sp)) as *const u32) };
+            *sp = sp.wrapping_add(4);
+            val
+        };
+        let _error_code = pop32(&mut sp);
+        new_eip = pop32(&mut sp);
+        new_cs = pop32(&mut sp) as u16;
+        new_eflags = pop32(&mut sp);
+        new_esp = pop32(&mut sp);
+        new_ss = pop32(&mut sp) as u16;
+    } else {
+        let pop16 = |sp: &mut u32| -> u16 {
+            let val = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(*sp)) as *const u16) };
+            *sp = sp.wrapping_add(2);
+            val
+        };
+        let _error_code = pop16(&mut sp);
+        new_eip = pop16(&mut sp) as u32;
+        new_cs = pop16(&mut sp);
+        new_eflags = pop16(&mut sp) as u32;
+        new_esp = pop16(&mut sp) as u32;
+        new_ss = pop16(&mut sp);
+    }
 
     regs.frame.cs = new_cs as u64;
     regs.set_ip32(new_eip);
     regs.frame.ss = new_ss as u64;
-    regs.set_sp32(new_esp);
+    if ss_32 {
+        regs.set_sp32(new_esp);
+    } else {
+        regs.set_sp32((regs.sp32() & !0xFFFF) | (new_esp & 0xFFFF));
+    }
     // Restore EFLAGS but preserve IOPL and VM
     let preserved = regs.flags32() & (0x3000 | (1 << 17));
     regs.set_flags32((new_eflags & !(0x3000 | (1 << 17))) | preserved);
@@ -1920,9 +2048,20 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
-    let new_esp = regs.rbx as u32;
     let new_cs = regs.rsi as u16;
-    let new_eip = regs.rdi as u32;
+
+    // Determine destination operand size from the target CS/SS descriptors,
+    // so 16-bit clients don't pick up garbage in EBX/EDI upper bits.
+    let (new_esp, new_eip) = match dos.dpmi.as_ref() {
+        Some(dpmi) => {
+            let cs_32 = seg_is_32(dpmi, new_cs);
+            let ss_32 = seg_is_32(dpmi, new_ss);
+            let esp = if ss_32 { regs.rbx as u32 } else { regs.rbx as u32 & 0xFFFF };
+            let eip = if cs_32 { regs.rdi as u32 } else { regs.rdi as u32 & 0xFFFF };
+            (esp, eip)
+        }
+        None => (regs.rbx as u32 & 0xFFFF, regs.rdi as u32 & 0xFFFF),
+    };
 
     // Clear VM flag, enter protected mode
     const VM_FLAG: u64 = 1 << 17;
@@ -1938,7 +2077,8 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     regs.es = new_es as u64;
     regs.fs = 0;
     regs.gs = 0;
-    trace_client_selector_leak("raw_switch_real_to_pm.out", regs);
+    dpmi_trace!("[DPMI] raw RM->PM CS:EIP={:04X}:{:08X} SS:ESP={:04X}:{:08X} DS={:04X} ES={:04X}",
+        new_cs, new_eip, new_ss, new_esp, new_ds, new_es);
 
     // Reload LDT (thread must have DPMI state)
     if let Some(ref dpmi) = dos.dpmi {
@@ -1951,6 +2091,24 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Find an LDT selector whose base equals `psp_seg * 16`.
+/// Used to translate INT 21h AH=51/62 results from a real-mode PSP segment
+/// to the selector form that DPMI clients expect. Falls back to LDT[4]
+/// (the canonical PSP selector set up at dpmi_enter) when no match is found.
+fn find_psp_selector(dpmi: &DpmiState, psp_seg: u16) -> u16 {
+    let target_base = (psp_seg as u32) * 16;
+    for idx in 1..LDT_ENTRIES {
+        let word = idx / 32;
+        let bit = idx % 32;
+        if dpmi.ldt_alloc[word] & (1 << bit) != 0
+            && DpmiState::desc_base(dpmi.ldt[idx]) == target_base
+        {
+            return DpmiState::idx_to_sel(idx);
+        }
+    }
+    DpmiState::idx_to_sel(4)
+}
 
 /// Get the base address for any selector (GDT or LDT).
 /// GDT selectors (TI=0) are flat (base=0).
