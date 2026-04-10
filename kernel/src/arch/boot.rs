@@ -1,7 +1,7 @@
 //! Kernel boot sequence (ring 0)
 //!
 //! Entry flow:
-//! 1. _entry (asm stub: offset GDT, kernel stack, calls boot_kernel)
+//! 1. _start (asm stub: offset GDT, kernel stack, calls boot_kernel)
 //! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
 use super::{paging2, phys_mm, descriptors, irq, x86};
@@ -11,9 +11,12 @@ use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
 pub const KERNEL_PHYS: usize = 0x0010_0000;
 
+/// Magic value the Multiboot bootloader places in EAX before jumping to us.
+const MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2BAD_B002;
+
 // Linker symbols
 unsafe extern "C" {
-    static _start: u8;
+    static _kernel_start: u8;
     static _end: u8;
 }
 
@@ -23,11 +26,12 @@ unsafe extern "C" {
 /// addresses access physical memory correctly. Paging is off on entry.
 /// Stack is already set to KERNEL_STACK by the asm stub.
 ///
+/// `magic` is the Multiboot bootloader magic (EAX on entry).
 /// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn boot_kernel(info: *const crate::MultibootInfo) -> ! {
+pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootInfo) -> ! {
     let kernel_size = unsafe {
-        core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_start) as usize
+        core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
     };
     let kernel_pages = (kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -50,6 +54,13 @@ pub unsafe extern "C" fn boot_kernel(info: *const crate::MultibootInfo) -> ! {
     let arch_stack_top = unsafe { crate::ARCH_STACK.top() as u32 } - 16;
     descriptors::setup_descriptor_tables(arch_stack_top);
     descriptors::setup_syscall();
+
+    // Verify the bootloader is Multiboot-compliant before touching info.
+    assert!(
+        magic == MULTIBOOT_BOOTLOADER_MAGIC,
+        "Bad Multiboot magic: {:#x} (expected {:#x})",
+        magic, MULTIBOOT_BOOTLOADER_MAGIC
+    );
 
     // Multiboot info is in low memory — access through LOW_MEM_BASE mapping
     let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const crate::MultibootInfo) };

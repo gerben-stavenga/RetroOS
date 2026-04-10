@@ -80,6 +80,14 @@ impl GdtEntry {
         }
     }
 
+    /// Set the segment base. Used to build the boot-time offset GDT.
+    const fn with_base(mut self, base: u32) -> Self {
+        self.base_low = base as u16;
+        self.base_mid = (base >> 16) as u8;
+        self.base_high = (base >> 24) as u8;
+        self
+    }
+
     /// Create a 64-bit code segment descriptor
     /// dpl: privilege level (0 = kernel, 3 = user)
     const fn segment64(dpl: u8) -> Self {
@@ -297,6 +305,22 @@ struct Idt64 {
     entries: [IdtEntry64; IDT_ENTRIES],
 }
 
+/// Segment base applied to the boot GDT so that linked kernel addresses
+/// (0xC0Bxxxxx) resolve to physical memory (0x001xxxxx) via 32-bit segment
+/// wraparound, before paging is enabled.
+const BOOT_SEG_OFFSET: u32 =
+    (super::boot::KERNEL_PHYS as u32).wrapping_sub(super::paging2::KERNEL_BASE as u32);
+
+/// Boot GDT used by the asm `_start` stub until paging is enabled.
+/// Layout: null / code32 @ 0x08 / data32 @ 0x10. Referenced by name from
+/// entry.asm via `extern BOOT_GDT`.
+#[unsafe(no_mangle)]
+static BOOT_GDT: [GdtEntry; 3] = [
+    GdtEntry::null(),
+    GdtEntry::segment32(true, 0).with_base(BOOT_SEG_OFFSET),
+    GdtEntry::segment32(false, 0).with_base(BOOT_SEG_OFFSET),
+];
+
 // Static tables
 static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::null(),               // 0x00: Null
@@ -328,11 +352,20 @@ static mut IDT64: Idt64 = Idt64 {
 pub static mut TSS32: Tss = Tss::new();
 pub static mut TSS64: Tss = Tss::new();
 
-// External: interrupt vector tables from entry.asm
+// External: unified interrupt vector table from entry.asm.
+// Mode-agnostic encoding: the same table serves both IDT32 and IDT64.
 unsafe extern "C" {
-    static int_vector: [u64; 256];     // 32-bit handlers (8 bytes each)
-    static int_vector_64: [u64; 256];  // 64-bit handlers (8 bytes each)
+    static int_vector: [u64; 256];
 }
+
+/// Scratch slot for SYSCALL entry to stash user RSP before switching stacks.
+#[unsafe(no_mangle)]
+static mut SYSCALL_USER_RSP: u64 = 0;
+
+/// Kernel RSP loaded by the SYSCALL entry stub. Kept in sync with TSS64.sp0
+/// by `set_kernel_stack_64`.
+#[unsafe(no_mangle)]
+static mut SYSCALL_KERNEL_RSP: u64 = 0;
 
 /// Set the kernel stack in TSS for 32-bit mode
 /// Packs SS:ESP (SS in high 32 bits, ESP in low 32 bits)
@@ -347,9 +380,7 @@ pub fn set_kernel_stack(stack: u32) {
 pub fn set_kernel_stack_64(stack: u64) {
     unsafe {
         TSS64.sp0 = stack;
-        // Keep SYSCALL entry's kernel RSP in sync
-        unsafe extern "C" { static mut syscall_kernel_rsp: u64; }
-        syscall_kernel_rsp = stack;
+        SYSCALL_KERNEL_RSP = stack;
     }
 }
 
@@ -381,11 +412,10 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
             IDT32.entries[i] = IdtEntry32::interrupt_gate(handler, dpl);
         }
 
-        // Setup 64-bit IDT entries (256 vectors, same DPL policy)
-        let vector_base_64 = int_vector_64.as_ptr() as u32;
+        // Setup 64-bit IDT entries (same vector table, same DPL policy)
         for i in 0..256 {
             let dpl = if (3..=5).contains(&i) || i >= 0x30 { 3 } else { 0 };
-            let handler = vector_base_64 + (i as u32) * 8;
+            let handler = vector_base_32 + (i as u32) * 8;
             IDT64.entries[i] = IdtEntry64::interrupt_gate(handler, dpl);
         }
 
@@ -579,9 +609,7 @@ pub fn setup_syscall() {
         let efer = x86::rdmsr(x86::EFER_MSR);
         x86::wrmsr(x86::EFER_MSR, efer | x86::efer::SCE);
 
-        // Sync kernel RSP for SYSCALL entry
-        unsafe extern "C" { static mut syscall_kernel_rsp: u64; }
-        syscall_kernel_rsp = TSS64.sp0;
+        SYSCALL_KERNEL_RSP = TSS64.sp0;
     }
 
     crate::println!("SYSCALL enabled");

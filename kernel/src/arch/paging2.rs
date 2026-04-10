@@ -900,10 +900,6 @@ pub fn finish_setup_paging() {
             if lm {
                 crate::println!("CPU supports Long Mode (64-bit)");
 
-                // Before removing id map copy the compat <-> legacy protmode
-                // to identity mapped page
-                copy_trampoline();
-
                 // Set up long mode page tables
                 setup_long_mode_tables();
                 crate::println!("Long mode tables set up");
@@ -1436,17 +1432,16 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 // Mode switching trampoline support
 // =============================================================================
 
-/// Trampoline page physical address (last page of first 64KB)
-pub const TRAMPOLINE_PAGE: usize = 0xF;  // page 15 = address 0xF000
-pub const TRAMPOLINE_ADDR: usize = TRAMPOLINE_PAGE * PAGE_SIZE;
-
-/// Map the trampoline page (VA 0xF000) identity-mapped for a mode toggle.
-/// Returns the saved PTE to pass to `clear_trampoline()`.
+/// Identity-map the page holding `toggle_prot_compat` (first page of kernel
+/// `.text`, physical KERNEL_PHYS) so the function can run at its physical
+/// address while paging is briefly disabled during a mode toggle.
+/// Returns the previous PTE value to pass back to `clear_trampoline()`.
 pub fn ensure_trampoline_mapped() -> u64 {
+    let page = super::boot::KERNEL_PHYS / PAGE_SIZE;
     if let Entries::E64(e) = entries() {
-        let saved = e[TRAMPOLINE_PAGE].0;
-        e[TRAMPOLINE_PAGE] = Entry64::new(TRAMPOLINE_PAGE as u64, true, false);
-        crate::arch::x86::invlpg(TRAMPOLINE_ADDR);
+        let saved = e[page].0;
+        e[page] = Entry64::new(page as u64, true, false);
+        crate::arch::x86::invlpg(super::boot::KERNEL_PHYS);
         saved
     } else {
         0
@@ -1455,15 +1450,11 @@ pub fn ensure_trampoline_mapped() -> u64 {
 
 /// Restore the trampoline page's PTE after a mode toggle.
 pub fn clear_trampoline(saved: u64) {
-    match entries() {
-        Entries::E32(e) => {
-            e[TRAMPOLINE_PAGE] = Entry32(saved as u32);
-        }
-        Entries::E64(e) => {
-            e[TRAMPOLINE_PAGE] = Entry64(saved);
-        }
+    let page = super::boot::KERNEL_PHYS / PAGE_SIZE;
+    if let Entries::E64(e) = entries() {
+        e[page] = Entry64(saved);
     }
-    crate::arch::x86::invlpg(TRAMPOLINE_ADDR);
+    crate::arch::x86::invlpg(super::boot::KERNEL_PHYS);
 }
 
 /// Map the first 1MB of physical memory as user-accessible (for VM86 mode).
@@ -1666,26 +1657,6 @@ pub fn unmap_umb(base_page: usize, num_pages: usize) {
     flush_tlb();
 }
 
-/// Copy trampoline code to physical address 0xF000
-/// Uses LOW_MEM_BASE mapping to access the destination
-pub fn copy_trampoline() {
-    unsafe extern "C" {
-        static trampoline_start: u8;
-        static trampoline_end: u8;
-    }
-
-    unsafe {
-        let src = &raw const trampoline_start;
-        let end = &raw const trampoline_end;
-        let size = end as usize - src as usize;
-
-        // Destination is physical 0xF000, mapped at LOW_MEM_BASE + 0xF000
-        let dst = (LOW_MEM_BASE + TRAMPOLINE_ADDR) as *mut u8;
-
-        core::ptr::copy_nonoverlapping(src, dst, size);
-    }
-}
-
 /// Harden kernel memory permissions
 /// - .text: read-only, executable
 /// - .rodata: read-only, non-executable (if NX available)
@@ -1693,14 +1664,14 @@ pub fn copy_trampoline() {
 fn harden_kernel<E: Entry>(entries: &mut [E]) {
     // Get linker symbols
     unsafe extern "C" {
-        static _start: u8;
+        static _kernel_start: u8;
         static _etext: u8;
         static _erodata: u8;
         static _data: u8;
         static _end: u8;
     }
 
-    let text_start = (&raw const _start) as usize;
+    let text_start = (&raw const _kernel_start) as usize;
     let text_end = (&raw const _etext) as usize;
     let rodata_end = (&raw const _erodata) as usize;
     let data_start = (&raw const _data) as usize;

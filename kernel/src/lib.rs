@@ -1,7 +1,7 @@
 //! RetroOS Rust Kernel
 //!
 //! Entry flow:
-//! 1. _entry (asm stub: offset GDT, kernel stack, calls boot_kernel)
+//! 1. _start (asm stub: offset GDT, kernel stack, calls boot_kernel)
 //! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
 #![no_std]
@@ -90,7 +90,7 @@ pub static mut ARCH_STACK: AlignedStack<{ 16 * 1024 }> = AlignedStack::new();
 
 // Linker symbols (used by panic stack trace)
 unsafe extern "C" {
-    static _start: u8;
+    static _kernel_start: u8;
     static _data: u8;
     static _edata: u8;
     static _end: u8;

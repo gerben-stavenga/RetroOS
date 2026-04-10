@@ -4,18 +4,16 @@
 KERNEL_BASE = 0xC0B00000;
 KERNEL_PHYS = 0x00100000;
 
-ENTRY(_entry)
+ENTRY(_start)
 
 SECTIONS
 {
     . = KERNEL_BASE;
-    _start = .;
+    _kernel_start = .;
 
     .text ALIGN(4K) : AT(KERNEL_PHYS) {
         *(.multiboot)
-        *(.entry)
         *(.text .text.*)
-        *(.trampoline)
         KEEP(*(.note*))
     }
 

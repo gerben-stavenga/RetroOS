@@ -1,6 +1,6 @@
 ; RetroOS Kernel Entry Assembly
-; Multiboot header, boot stub with offset GDT, interrupt entry points
-; Supports both 32-bit and 64-bit userspace with unified Regs struct
+; Multiboot header, boot stub, interrupt entry points.
+; Supports both 32-bit and 64-bit userspace with unified Regs struct.
 
 %ifidn __OUTPUT_FORMAT__,elf
 section .note.GNU-stack noalloc noexec nowrite progbits
@@ -12,7 +12,14 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 ; Constants from linker script
 KERNEL_BASE equ 0xC0B00000
 KERNEL_PHYS equ 0x00100000
-SEG_OFFSET  equ KERNEL_PHYS - KERNEL_BASE  ; wraps to 0x40600000
+
+; External symbols defined in Rust
+extern BOOT_GDT            ; boot GDT table (descriptors.rs)
+extern KERNEL_STACK        ; kernel stack (lib.rs)
+extern boot_kernel         ; Rust entry point (arch/boot.rs)
+extern isr_handler         ; ISR dispatcher (arch/traps.rs)
+extern SYSCALL_USER_RSP    ; SYSCALL scratch slot (descriptors.rs)
+extern SYSCALL_KERNEL_RSP  ; SYSCALL kernel stack (descriptors.rs)
 
 ; =============================================================================
 ; Multiboot header (must be in first 8KB of binary)
@@ -28,79 +35,109 @@ dd MULTIBOOT_FLAGS
 dd MULTIBOOT_CHECK
 
 ; =============================================================================
-; Boot entry stub — runs at physical address with offset segments
+; 32-bit code: boot stub, mode toggle, protected-mode entry, ISR dispatch
 ; =============================================================================
-section .entry
+section .text
 [bits 32]
 
-global _entry
-_entry:
+; -----------------------------------------------------------------------------
+; Boot entry stub — runs at physical address with offset segments
+; -----------------------------------------------------------------------------
+global _start
+_start:
     ; We arrive here from the bootloader with paging off.
     ; ELF was loaded at KERNEL_PHYS but linked at KERNEL_BASE.
-    ; Set up GDT segments with base = SEG_OFFSET so that linked
-    ; addresses (0xC0B0xxxx) access physical memory correctly via
+    ; BOOT_GDT's segments have base = KERNEL_PHYS - KERNEL_BASE so that
+    ; linked addresses (0xC0B0xxxx) access physical memory correctly via
     ; 32-bit wrapping: 0xC0B0xxxx + 0x40600000 = 0x010xxxxx.
+    ;
+    ; Multiboot hands us: EAX = bootloader magic (0x2BADB002),
+    ;                     EBX = physical pointer to multiboot info.
+    ; Neither is touched by anything below (we use DX for segment loads),
+    ; so we can push them straight into the boot_kernel call.
 
-    ; Save multiboot info pointer (EBX per Multiboot convention)
-    mov esi, ebx
-
-    ; Load offset GDT — the GDT itself is at a linked address,
-    ; so we need to adjust the GDTR pointer to physical.
+    ; Load offset GDT — boot_gdtr/BOOT_GDT are at linked addresses,
+    ; so we adjust to physical.
     lgdt [boot_gdtr - KERNEL_BASE + KERNEL_PHYS]
 
     ; Reload segments with offset-based descriptors
     jmp 0x08:.reload_cs
 .reload_cs:
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov fs, ax
-    mov gs, ax
+    mov dx, 0x10
+    mov ds, dx
+    mov es, dx
+    mov ss, dx
+    mov fs, dx
+    mov gs, dx
 
     ; Set kernel stack (linked address — works through offset segment)
-    extern KERNEL_STACK
     lea esp, [KERNEL_STACK + 32 * 1024]
     xor ebp, ebp
 
-    ; Call boot_kernel(multiboot_info)
-    push esi
-    extern boot_kernel
+    ; Call boot_kernel(magic, info) — cdecl, push right-to-left
+    push ebx            ; arg 2: multiboot info pointer
+    push eax            ; arg 1: bootloader magic
     call boot_kernel
     ud2
 
-; =============================================================================
-; Boot GDT with offset segments
-; =============================================================================
-align 16
-boot_gdt:
-    ; Null descriptor
-    dq 0
-    ; Code segment (base = SEG_OFFSET = KERNEL_PHYS - KERNEL_BASE)
-    dw 0xFFFF                           ; limit low
-    dw (SEG_OFFSET & 0xFFFF)            ; base low
-    db (SEG_OFFSET >> 16) & 0xFF        ; base mid
-    db 0x9A                             ; access: present, ring 0, code, exec/read
-    db 0xCF                             ; flags: 4KB granularity, 32-bit + limit high
-    db (SEG_OFFSET >> 24) & 0xFF        ; base high
-    ; Data segment (base = SEG_OFFSET)
-    dw 0xFFFF
-    dw (SEG_OFFSET & 0xFFFF)
-    db (SEG_OFFSET >> 16) & 0xFF
-    db 0x92                             ; access: present, ring 0, data, read/write
-    db 0xCF
-    db (SEG_OFFSET >> 24) & 0xFF
-boot_gdt_end:
-
+; -----------------------------------------------------------------------------
+; GDTR pointing at BOOT_GDT (defined in descriptors.rs)
+; -----------------------------------------------------------------------------
 boot_gdtr:
-    dw boot_gdt_end - boot_gdt - 1
-    dd boot_gdt - KERNEL_BASE + KERNEL_PHYS  ; physical address of GDT
+    dw 3 * 8 - 1                              ; limit (3 entries)
+    dd BOOT_GDT - KERNEL_BASE + KERNEL_PHYS   ; physical address of GDT
 
-; =============================================================================
-; 32-bit code section
-; =============================================================================
-section .text
-[bits 32]
+; -----------------------------------------------------------------------------
+; toggle_prot_compat — switch between PAE and long/compat mode
+; fastcall: ECX = new CR3
+;
+; Placed early in .text so it lands in the first page (physical KERNEL_PHYS).
+; The caller (paging2::ensure_trampoline_mapped) installs an identity PTE
+; for that page; we jmp from the virtual linked address to the physical
+; address, toggle paging off, flip EFER.LME, load new CR3, re-enable paging,
+; then jmp back to the virtual address and return.
+; -----------------------------------------------------------------------------
+global toggle_prot_compat
+toggle_prot_compat:
+    jmp .phys - KERNEL_BASE + KERNEL_PHYS
+.phys:
+    mov eax, cr0
+    and eax, ~(1 << 31)
+    mov cr0, eax
+
+    mov cr3, ecx
+
+    mov ecx, 0xC0000080
+    rdmsr
+    xor eax, (1 << 8)
+    wrmsr
+
+    mov eax, cr0
+    or eax, (1 << 31)
+    mov cr0, eax
+
+    ret
+
+; -----------------------------------------------------------------------------
+; Shared dispatch entered from the unified vector table. Byte sequence is
+; mode-agnostic: same encoding under 32-bit and 64-bit CS, so both IDT32 and
+; IDT64 can point at `int_vector`. CS low byte distinguishes 0x08 vs 0x10.
+; -----------------------------------------------------------------------------
+common_dispatch_no_err:
+    push dword [esp]        ; dup int_num as err_code slot
+common_dispatch:
+    push eax
+    mov eax, cs             ; 2-byte form (no 66 prefix) — clobbers eax, pop restores
+    cmp al, 0x10
+    pop eax                 ; doesn't touch flags
+    je entry_wrapper_64
+    ; fall through to entry_wrapper_32
+
+; -----------------------------------------------------------------------------
+; Common 32-bit interrupt entry — saves all registers as 64-bit values
+; Stack on entry: [err_code], eip, cs, eflags [, esp, ss]
+; int_num was pushed by vector table
+; -----------------------------------------------------------------------------
 
 ; Macro to push a 32-bit register as 64-bit (with high dword = 0)
 %macro push64_32 1
@@ -108,12 +145,6 @@ section .text
     push %1                 ; low 32 bits
 %endmacro
 
-; Common 32-bit interrupt entry - saves all registers as 64-bit values
-; Stack on entry: [err_code], eip, cs, eflags [, esp, ss]
-; int_num was pushed by vector table
-entry_wrapper_32_no_error_code:
-    ; No error code - duplicate int_num as placeholder (matches original C++ approach)
-    push dword [esp]
 entry_wrapper_32:
     ; Stack: int_num(32), err_code(32), eip, cs, eflags [, esp, ss]
     ; Need: int_num(64), err_code(64), Frame32._pad(20), eip, ...
@@ -212,17 +243,17 @@ exit_interrupt_32:
     ; Return from interrupt (CPU pops eip, cs, eflags [, esp, ss])
     iret
 
-; =============================================================================
-; Common ISR dispatch
-; Jumped to from both 32-bit and 64-bit entry points.
+; -----------------------------------------------------------------------------
+; Common ISR dispatch — entered from 32-bit entry wrappers and (via the
+; 64→32 trampoline) from 64-bit entry wrappers. Dispatches exit based on
+; current CPU mode (EFER.LMA).
 ; Stack: [mock frame 16B] [Regs] [Frame] [VM86 segs]
 ; EAX = pointer to FullRegs
-; =============================================================================
+; -----------------------------------------------------------------------------
 call_isr_handler:
     cld
     push eax                ; arg: pointer to FullRegs
 
-    extern isr_handler
     call isr_handler
 global isr_return
 isr_return:
@@ -237,12 +268,14 @@ isr_return:
     jnz .exit_long
     jmp exit_interrupt_32
 .exit_long:
-    jmp far [far_ptr_64]
+    ; Direct far jump — valid in 32-bit mode (EA ptr16:32). CS=0x10 is the
+    ; 64-bit kernel code segment; CPU zero-extends the 32-bit offset to RIP.
+    jmp 0x10:exit_interrupt_64
 
-; =============================================================================
-; Trampoline for 64-bit to 32-bit transition
-; Called via far jump from 64-bit entry, jumps back via far jump
-; =============================================================================
+; -----------------------------------------------------------------------------
+; Trampoline for 64-bit → 32-bit transition.
+; Reached from 64-bit entry wrappers via `jmp far [rel far_ptr_32]`.
+; -----------------------------------------------------------------------------
 trampoline_64_to_32:
     ; Now in 32-bit mode, ESP = low 32 bits of RSP (points to Regs)
     ; SS is null (long mode same-privilege interrupt sets SS=0).
@@ -261,16 +294,44 @@ trampoline_64_to_32:
     mov ebp, esp
     jmp call_isr_handler
 
+; -----------------------------------------------------------------------------
+; Unified interrupt vector table.
+; Each entry is 8 bytes (aligned), pushes interrupt number and jumps to
+; common_dispatch. `push imm8` and `jmp rel32` have identical encodings in
+; 32-bit and 64-bit mode, so the same table serves both IDT32 and IDT64.
+; Vectors 0-127 push imm8 (positive, 2 bytes). Vectors 128-255 push imm8
+; with negative value (sign-extended by CPU); handler masks with & 0xFF.
+; -----------------------------------------------------------------------------
+align 64
+global int_vector
+int_vector:
+%assign i 0
+%rep 256
+    align 8
+%if i >= 128
+    push i - 256
+%else
+    push i
+%endif
+    ; Exceptions that push an error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30
+%if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
+    jmp common_dispatch
+%else
+    jmp common_dispatch_no_err
+%endif
+%assign i (i + 1)
+%endrep
 
 ; =============================================================================
-; 64-bit code section (for future use when kernel runs in long mode)
+; 64-bit code: long-mode interrupt entry, SYSCALL, vector table
 ; =============================================================================
 [bits 64]
 
-; Common 64-bit interrupt entry - saves all registers
-entry_wrapper_64_no_error_code:
-    ; No error code - duplicate int_num as placeholder (matches 32-bit approach)
-    push qword [rsp]
+; -----------------------------------------------------------------------------
+; Common 64-bit interrupt entry — saves all registers.
+; Entered via common_dispatch (below KERNEL_CS64 branch). int_num/err_code
+; (both 8 bytes) have already been pushed by the vector table + dispatch.
+; -----------------------------------------------------------------------------
 entry_wrapper_64:
     ; Stack: int_num, err_code, rip, cs, rflags, rsp, ss (all 64-bit)
     ; Frame64 is 40 bytes, no padding needed (unlike Frame32 which has 20-byte _pad)
@@ -317,7 +378,8 @@ entry_wrapper_64:
     mov ds, ax
     mov es, ax
 
-    ; Far jump to 32-bit trampoline (indirect via memory)
+    ; Far jump to 32-bit trampoline (indirect via memory; direct far jmp
+    ; is invalid in long mode).
     jmp far [rel far_ptr_32]
 
 exit_interrupt_64:
@@ -364,21 +426,21 @@ exit_interrupt_64:
 
     iretq
 
-; =============================================================================
+; -----------------------------------------------------------------------------
 ; SYSCALL entry (64-bit)
 ; CPU sets: RCX=user_rip, R11=user_rflags, CS=STAR[47:32], SS=STAR[47:32]+8
 ; RSP unchanged (still user stack). RCX/R11 clobbered from user's perspective.
 ; Builds a Regs frame identical to entry_wrapper_64, then joins the same path.
-; =============================================================================
+; -----------------------------------------------------------------------------
 global syscall_entry_64
 syscall_entry_64:
     ; Swap to kernel stack — save user RSP in scratch variable
-    mov [rel syscall_user_rsp], rsp
-    mov rsp, [rel syscall_kernel_rsp]
+    mov [rel SYSCALL_USER_RSP], rsp
+    mov rsp, [rel SYSCALL_KERNEL_RSP]
 
     ; Build Frame64: SS, RSP, RFLAGS, CS, RIP (high address → low)
     push qword 0x2B            ; SS  = USER_DS  (0x28 | 3)
-    push qword [rel syscall_user_rsp] ; RSP = user stack pointer
+    push qword [rel SYSCALL_USER_RSP] ; RSP = user stack pointer
     push r11                    ; RFLAGS (saved by SYSCALL)
     push qword 0x33            ; CS  = USER_CS64 (0x30 | 3)
     push rcx                    ; RIP (saved by SYSCALL)
@@ -387,173 +449,15 @@ syscall_entry_64:
     push qword 0               ; err_code
     push qword 0x80            ; int_num = syscall
 
-    ; Save general-purpose registers (same order as entry_wrapper_64)
-    push rax
-    push rcx
-    push rdx
-    push rbx
-    push rsp                    ; dummy rsp
-    push rbp
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
+    jmp entry_wrapper_64
 
-    ; Save segment registers: DS/ES as selectors, FS/GS as MSR bases (64-bit TLS)
-    xor rax, rax
-    mov ax, ds
-    push rax
-    mov ax, es
-    push rax
-    mov ecx, 0xC0000100     ; FS_BASE MSR
-    rdmsr
-    shl rdx, 32
-    or rax, rdx
-    push rax
-    mov ecx, 0xC0000101     ; GS_BASE MSR
-    rdmsr
-    shl rdx, 32
-    or rax, rdx
-    push rax
-
-    ; Set segments to kernel data selector
-    mov ax, 0x18
-    mov ds, ax
-    mov es, ax
-
-    ; Join the common interrupt path (far jump to 32-bit trampoline)
-    jmp far [rel far_ptr_32]
-
-; =============================================================================
-; Interrupt vector table (32-bit)
-; =============================================================================
-[bits 32]
-
-; =============================================================================
-; Mode toggle entry point - calls trampoline at 0xF000
-; fastcall: ECX = new CR3
-; =============================================================================
-global toggle_prot_compat
-toggle_prot_compat:
-    push ebp
-    mov ebp, esp
-    push ebx
-    mov ebx, ecx        ; save CR3 in callee-saved ebx
-    jmp 0xF000
-
-; =============================================================================
-; Far jump pointers for mode switching
-; =============================================================================
+; -----------------------------------------------------------------------------
+; Far jump pointer — needed only for 64-bit → 32-bit transitions because the
+; direct far-jump opcode (EA) is invalid in long mode. The reverse direction
+; uses a direct `jmp 0x10:exit_interrupt_64`.
+; -----------------------------------------------------------------------------
 align 8
 far_ptr_32:
     dq trampoline_64_to_32  ; 64-bit offset (used from 64-bit mode, m16:64)
     dw 0x08                 ; 32-bit code segment
 
-align 8
-far_ptr_64:
-    dd exit_interrupt_64    ; 32-bit offset (in 32-bit mode, only low 32 bits used)
-    dw 0x10                 ; 64-bit code segment
-
-section .bss
-align 8
-syscall_user_rsp:   resq 1
-global syscall_kernel_rsp
-syscall_kernel_rsp: resq 1
-
-section .text
-
-; Each entry is 8 bytes (aligned), pushes interrupt number and jumps to entry_wrapper.
-; Vectors 0-127: push imm8 (positive, 2 bytes). Vectors 128-255: push imm8 with
-; negative value (sign-extended by CPU); handler masks with & 0xFF to recover vector.
-align 64
-global int_vector
-int_vector:
-%assign i 0
-%rep 256
-    align 8
-%if i >= 128
-    push i - 256
-%else
-    push i
-%endif
-    ; Exceptions that push an error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30
-%if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
-    jmp entry_wrapper_32
-%else
-    jmp entry_wrapper_32_no_error_code
-%endif
-%assign i (i + 1)
-%endrep
-
-; =============================================================================
-; 64-bit interrupt vector table (for future use)
-; =============================================================================
-[bits 64]
-
-align 64
-global int_vector_64
-int_vector_64:
-%assign i 0
-%rep 256
-    align 8
-%if i >= 128
-    push i - 256
-%else
-    push i
-%endif
-%if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
-    jmp entry_wrapper_64
-%else
-    jmp entry_wrapper_64_no_error_code
-%endif
-%assign i (i + 1)
-%endrep
-
-; =============================================================================
-; Mode switching trampoline - copied to 0xF000 (identity-mapped)
-; fastcall: ECX = new CR3
-; Toggles between protected mode and long mode (compat) by XORing EFER.LME
-; =============================================================================
-section .trampoline progbits alloc exec nowrite
-global trampoline_start
-global trampoline_end
-[bits 32]
-trampoline_start:
-    ; ebx = new CR3 (set by toggle_prot_compat)
-    ; stack frame already set up by toggle_prot_compat
-
-    ; Disable paging
-    mov eax, cr0
-    and eax, ~(1 << 31)     ; Clear PG bit
-    mov cr0, eax
-    ; paging off — no stack access, only caller-saved regs + ebx
-
-    ; Toggle long mode in EFER MSR (clobbers EAX, EDX, ECX)
-    mov ecx, 0xC0000080     ; EFER MSR
-    rdmsr
-    xor eax, (1 << 8)       ; Toggle LME bit
-    wrmsr
-
-    ; Load new page tables (also flushes TLB)
-    mov cr3, ebx
-
-    ; Enable paging
-    mov eax, cr0
-    or eax, (1 << 31)       ; Set PG bit
-    mov cr0, eax
-
-    ; paging on — stack accessible again
-    pop ebx
-    leave
-    ret
-
-trampoline_toggle_end:
-
-align 16
-trampoline_end:
