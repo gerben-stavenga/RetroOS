@@ -1144,44 +1144,61 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
 // virtualized; other ports: IN returns 0xFF, OUT is no-op.
 // ============================================================================
 
+/// Outcome of one VM86 decode step. The monitor reports what the x86
+/// instruction meant at the machine level; translating that into kernel
+/// policy (yield, kill, dispatch to personality) is the dispatcher's job.
+enum Vm86Event {
+    /// Machine handled the instruction; resume user.
+    Continue,
+    /// HLT — guest is idle until an interrupt.
+    Halt,
+    /// Software INT (INT n / INT3 / INTO / INT1); personality must dispatch.
+    SoftInt(u8),
+    /// Unknown/illegal opcode; guest is unrecoverable.
+    Fault,
+}
+
 /// GP-fault monitor entry point for DOS threads. Dispatches to the VM86 or
 /// PM decode path based on the faulting CPU mode.
 pub fn monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     if regs.mode() == crate::UserMode::VM86 {
-        vm86_monitor(dos, regs)
+        match vm86_monitor(&mut dos.pc, regs) {
+            Vm86Event::Continue   => thread::KernelAction::Done,
+            Vm86Event::Halt       => thread::KernelAction::Yield,
+            Vm86Event::SoftInt(n) => crate::kernel::dos::handle_vm86_int(dos, regs, n),
+            Vm86Event::Fault      => thread::KernelAction::Exit(-11),
+        }
     } else {
         // PM decode path lives in dpmi.rs due to LDT segment-base coupling.
         crate::kernel::dos::dpmi::dpmi_monitor(dos, regs)
     }
 }
 
-/// VM86 decode path — called from `monitor` when EFLAGS.VM=1.
+/// VM86 decode path — pure x86 machine emulation, no personality coupling.
+/// Returns a `Vm86Event` describing what the faulting instruction meant;
+/// `monitor` translates that into the appropriate `KernelAction`.
 /// Arch boundary swaps VIF↔IF, so IF is the virtual interrupt flag throughout.
-fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn vm86_monitor(pc: &mut PcMachine, regs: &mut Regs) -> Vm86Event {
     let opcode = fetch_byte(regs);
 
     match opcode {
         // INT n (0xCD nn)
         0xCD => {
             let int_num = fetch_byte(regs);
-            crate::kernel::dos::handle_vm86_int(dos, regs, int_num)
+            Vm86Event::SoftInt(int_num)
         }
         // INT3 (0xCC) — single-byte software interrupt
-        0xCC => {
-            crate::kernel::dos::handle_vm86_int(dos, regs, 0x03)
-        }
+        0xCC => Vm86Event::SoftInt(0x03),
         // INTO (0xCE) — software interrupt on overflow
         0xCE => {
             if vm86_flags(regs) & (1 << 11) != 0 {
-                crate::kernel::dos::handle_vm86_int(dos, regs, 0x04)
+                Vm86Event::SoftInt(0x04)
             } else {
-                thread::KernelAction::Done
+                Vm86Event::Continue
             }
         }
         // INT1 / ICEBP (0xF1) — single-byte software interrupt
-        0xF1 => {
-            crate::kernel::dos::handle_vm86_int(dos, regs, 0x01)
-        }
+        0xF1 => Vm86Event::SoftInt(0x01),
         // IRET (0xCF) — pop IP, CS, FLAGS from VM86 stack
         // IOPL and VM are preserved (VM86 code cannot change them)
         0xCF => {
@@ -1192,22 +1209,22 @@ fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             set_vm86_cs(regs, cs);
             let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
             set_vm86_flags(regs, (flags as u32 & !PRESERVED_FLAGS) | preserved);
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // CLI (0xFA)
         0xFA => {
             regs.clear_flag32(IF_FLAG);
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // STI (0xFB)
         0xFB => {
             regs.set_flag32(IF_FLAG);
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // PUSHF (0x9C) — push FLAGS (IF already reflects VIF)
         0x9C => {
             vm86_push(regs, vm86_flags(regs) as u16);
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // POPF (0x9D) — pop FLAGS
         // IOPL and VM are preserved (VM86 code cannot change them)
@@ -1215,25 +1232,25 @@ fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             let flags = vm86_pop(regs);
             let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
             set_vm86_flags(regs, (flags as u32 & !PRESERVED_FLAGS) | preserved);
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // INSB (0x6C) — IN byte from port DX to ES:DI, advance DI
         0x6C => {
             let port = regs.rdx as u16;
-            let val = emulate_inb(&mut dos.pc, port);
+            let val = emulate_inb(pc, port);
             write_u16(regs.es as u32, regs.rdi as u32, val as u16);
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rdi = regs.rdi.wrapping_sub(1); // DF=1
             } else {
                 regs.rdi = regs.rdi.wrapping_add(1);
             }
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // INSW (0x6D) — IN word from port DX to ES:DI, advance DI
         0x6D => {
             let port = regs.rdx as u16;
-            let lo = emulate_inb(&mut dos.pc, port);
-            let hi = emulate_inb(&mut dos.pc, port + 1);
+            let lo = emulate_inb(pc, port);
+            let hi = emulate_inb(pc, port + 1);
             let val = (hi as u16) << 8 | lo as u16;
             write_u16(regs.es as u32, regs.rdi as u32, val);
             if vm86_flags(regs) & (1 << 10) != 0 {
@@ -1241,90 +1258,90 @@ fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             } else {
                 regs.rdi = regs.rdi.wrapping_add(2);
             }
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // OUTSB (0x6E) — OUT byte from DS:SI to port DX, advance SI
         0x6E => {
             let port = regs.rdx as u16;
             let val = read_u16(regs.ds as u32, regs.rsi as u32) as u8;
-            emulate_outb(&mut dos.pc, port, val);
+            emulate_outb(pc, port, val);
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(1);
             } else {
                 regs.rsi = regs.rsi.wrapping_add(1);
             }
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // OUTSW (0x6F) — OUT word from DS:SI to port DX, advance SI
         0x6F => {
             let port = regs.rdx as u16;
             let val = read_u16(regs.ds as u32, regs.rsi as u32);
-            emulate_outb(&mut dos.pc, port, val as u8);
-            emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
+            emulate_outb(pc, port, val as u8);
+            emulate_outb(pc, port + 1, (val >> 8) as u8);
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(2);
             } else {
                 regs.rsi = regs.rsi.wrapping_add(2);
             }
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // IN AL, imm8 (0xE4)
         0xE4 => {
             let port = fetch_byte(regs) as u16;
-            let val = emulate_inb(&mut dos.pc, port);
+            let val = emulate_inb(pc, port);
             regs.rax = (regs.rax & !0xFF) | val as u64;
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // IN AX, imm8 (0xE5)
         0xE5 => {
             let port = fetch_byte(regs) as u16;
-            let lo = emulate_inb(&mut dos.pc, port);
-            let hi = emulate_inb(&mut dos.pc, port + 1);
+            let lo = emulate_inb(pc, port);
+            let hi = emulate_inb(pc, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | (hi as u64) << 8 | lo as u64;
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // OUT imm8, AL (0xE6)
         0xE6 => {
             let port = fetch_byte(regs) as u16;
-            emulate_outb(&mut dos.pc, port, regs.rax as u8);
-            thread::KernelAction::Done
+            emulate_outb(pc, port, regs.rax as u8);
+            Vm86Event::Continue
         }
         // OUT imm8, AX (0xE7)
         0xE7 => {
             let port = fetch_byte(regs) as u16;
             let val = regs.rax as u16;
-            emulate_outb(&mut dos.pc, port, val as u8);
-            emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
-            thread::KernelAction::Done
+            emulate_outb(pc, port, val as u8);
+            emulate_outb(pc, port + 1, (val >> 8) as u8);
+            Vm86Event::Continue
         }
         // IN AL, DX (0xEC)
         0xEC => {
             let port = regs.rdx as u16;
-            let val = emulate_inb(&mut dos.pc, port);
+            let val = emulate_inb(pc, port);
             regs.rax = (regs.rax & !0xFF) | val as u64;
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // IN AX, DX (0xED)
         0xED => {
             let port = regs.rdx as u16;
-            let lo = emulate_inb(&mut dos.pc, port);
-            let hi = emulate_inb(&mut dos.pc, port + 1);
+            let lo = emulate_inb(pc, port);
+            let hi = emulate_inb(pc, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | (hi as u64) << 8 | lo as u64;
-            thread::KernelAction::Done
+            Vm86Event::Continue
         }
         // OUT DX, AL (0xEE)
         0xEE => {
             let port = regs.rdx as u16;
-            emulate_outb(&mut dos.pc, port, regs.rax as u8);
-            thread::KernelAction::Done
+            emulate_outb(pc, port, regs.rax as u8);
+            Vm86Event::Continue
         }
         // OUT DX, AX (0xEF)
         0xEF => {
             let port = regs.rdx as u16;
             let val = regs.rax as u16;
-            emulate_outb(&mut dos.pc, port, val as u8);
-            emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
-            thread::KernelAction::Done
+            emulate_outb(pc, port, val as u8);
+            emulate_outb(pc, port + 1, (val >> 8) as u8);
+            Vm86Event::Continue
         }
         // 0x66 prefix — operand-size override (32-bit in VM86 16-bit mode)
         0x66 => {
@@ -1333,14 +1350,14 @@ fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                 // PUSHFD — push 32-bit EFLAGS
                 0x9C => {
                     vm86_push32(regs, vm86_flags(regs) & 0xFFFF);
-                    thread::KernelAction::Done
+                    Vm86Event::Continue
                 }
                 // POPFD — pop 32-bit EFLAGS
                 0x9D => {
                     let flags = vm86_pop32(regs);
                     let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
                     set_vm86_flags(regs, (flags & !PRESERVED_FLAGS) | preserved);
-                    thread::KernelAction::Done
+                    Vm86Event::Continue
                 }
                 // IRETD — pop 32-bit EIP, CS, EFLAGS
                 0xCF => {
@@ -1351,55 +1368,55 @@ fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                     regs.set_cs32(cs & 0xFFFF);
                     let preserved = vm86_flags(regs) & PRESERVED_FLAGS;
                     set_vm86_flags(regs, (flags & !PRESERVED_FLAGS) | preserved);
-                    thread::KernelAction::Done
+                    Vm86Event::Continue
                 }
                 // IN EAX, imm8
                 0xE5 => {
                     let port = fetch_byte(regs) as u16;
-                    let b0 = emulate_inb(&mut dos.pc, port);
-                    let b1 = emulate_inb(&mut dos.pc, port + 1);
-                    let b2 = emulate_inb(&mut dos.pc, port + 2);
-                    let b3 = emulate_inb(&mut dos.pc, port + 3);
+                    let b0 = emulate_inb(pc, port);
+                    let b1 = emulate_inb(pc, port + 1);
+                    let b2 = emulate_inb(pc, port + 2);
+                    let b3 = emulate_inb(pc, port + 3);
                     regs.rax = (regs.rax & !0xFFFFFFFF) | (b3 as u64) << 24 | (b2 as u64) << 16 | (b1 as u64) << 8 | b0 as u64;
-                    thread::KernelAction::Done
+                    Vm86Event::Continue
                 }
                 // OUT imm8, EAX
                 0xE7 => {
                     let port = fetch_byte(regs) as u16;
                     let val = regs.rax as u32;
-                    emulate_outb(&mut dos.pc, port, val as u8);
-                    emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
-                    emulate_outb(&mut dos.pc, port + 2, (val >> 16) as u8);
-                    emulate_outb(&mut dos.pc, port + 3, (val >> 24) as u8);
-                    thread::KernelAction::Done
+                    emulate_outb(pc, port, val as u8);
+                    emulate_outb(pc, port + 1, (val >> 8) as u8);
+                    emulate_outb(pc, port + 2, (val >> 16) as u8);
+                    emulate_outb(pc, port + 3, (val >> 24) as u8);
+                    Vm86Event::Continue
                 }
                 // IN EAX, DX
                 0xED => {
                     let port = regs.rdx as u16;
-                    let b0 = emulate_inb(&mut dos.pc, port);
-                    let b1 = emulate_inb(&mut dos.pc, port + 1);
-                    let b2 = emulate_inb(&mut dos.pc, port + 2);
-                    let b3 = emulate_inb(&mut dos.pc, port + 3);
+                    let b0 = emulate_inb(pc, port);
+                    let b1 = emulate_inb(pc, port + 1);
+                    let b2 = emulate_inb(pc, port + 2);
+                    let b3 = emulate_inb(pc, port + 3);
                     regs.rax = (regs.rax & !0xFFFFFFFF) | (b3 as u64) << 24 | (b2 as u64) << 16 | (b1 as u64) << 8 | b0 as u64;
-                    thread::KernelAction::Done
+                    Vm86Event::Continue
                 }
                 // OUT DX, EAX
                 0xEF => {
                     let port = regs.rdx as u16;
                     let val = regs.rax as u32;
-                    emulate_outb(&mut dos.pc, port, val as u8);
-                    emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
-                    emulate_outb(&mut dos.pc, port + 2, (val >> 16) as u8);
-                    emulate_outb(&mut dos.pc, port + 3, (val >> 24) as u8);
-                    thread::KernelAction::Done
+                    emulate_outb(pc, port, val as u8);
+                    emulate_outb(pc, port + 1, (val >> 8) as u8);
+                    emulate_outb(pc, port + 2, (val >> 16) as u8);
+                    emulate_outb(pc, port + 3, (val >> 24) as u8);
+                    Vm86Event::Continue
                 }
                 // INSD
                 0x6D => {
                     let port = regs.rdx as u16;
-                    let b0 = emulate_inb(&mut dos.pc, port);
-                    let b1 = emulate_inb(&mut dos.pc, port);
-                    let b2 = emulate_inb(&mut dos.pc, port);
-                    let b3 = emulate_inb(&mut dos.pc, port);
+                    let b0 = emulate_inb(pc, port);
+                    let b1 = emulate_inb(pc, port);
+                    let b2 = emulate_inb(pc, port);
+                    let b3 = emulate_inb(pc, port);
                     let addr = (regs.es as u32) * 16 + (regs.rdi as u16 as u32);
                     unsafe {
                         *(addr as *mut u8) = b0;
@@ -1412,35 +1429,35 @@ fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                     } else {
                         regs.rdi = regs.rdi.wrapping_add(4);
                     }
-                    thread::KernelAction::Done
+                    Vm86Event::Continue
                 }
                 // OUTSD
                 0x6F => {
                     let port = regs.rdx as u16;
                     let addr = (regs.ds as u32) * 16 + (regs.rsi as u16 as u32);
                     unsafe {
-                        emulate_outb(&mut dos.pc, port, *(addr as *const u8));
-                        emulate_outb(&mut dos.pc, port, *((addr + 1) as *const u8));
-                        emulate_outb(&mut dos.pc, port, *((addr + 2) as *const u8));
-                        emulate_outb(&mut dos.pc, port, *((addr + 3) as *const u8));
+                        emulate_outb(pc, port, *(addr as *const u8));
+                        emulate_outb(pc, port, *((addr + 1) as *const u8));
+                        emulate_outb(pc, port, *((addr + 2) as *const u8));
+                        emulate_outb(pc, port, *((addr + 3) as *const u8));
                     }
                     if vm86_flags(regs) & (1 << 10) != 0 {
                         regs.rsi = regs.rsi.wrapping_sub(4);
                     } else {
                         regs.rsi = regs.rsi.wrapping_add(4);
                     }
-                    thread::KernelAction::Done
+                    Vm86Event::Continue
                 }
                 _ => {
                     crate::println!("VM86: FATAL unhandled opcode 0x66 {:#04x} at {:04x}:{:04x}",
                         op, vm86_cs(regs), regs.ip32().wrapping_sub(2));
-                    thread::KernelAction::Exit(-11)
+                    Vm86Event::Fault
                 }
             }
         }
         // HLT (0xF4) — yield to another thread
         0xF4 => {
-            thread::KernelAction::Yield
+            Vm86Event::Halt
         }
         _ => {
             let fault_ip = regs.ip32().wrapping_sub(1);
@@ -1456,7 +1473,7 @@ fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                 read_u16(ss, sp), read_u16(ss, sp+2), read_u16(ss, sp+4),
                 read_u16(ss, sp+6), read_u16(ss, sp+8), read_u16(ss, sp+10));
             // Kill the VM86 thread
-            thread::KernelAction::Exit(-11)
+            Vm86Event::Fault
         }
     }
 }
