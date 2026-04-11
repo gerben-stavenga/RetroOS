@@ -331,7 +331,7 @@ fn event_loop(first_tid: usize) {
                     // switch_to is the only scheduling decision.
                     // TODO: migrate syscalls to KernelAction natively
                     match event {
-                        0x80 => crate::kernel::syscalls::dispatch_action(tid, regs),
+                        0x80 => crate::kernel::linux::dispatch_action(tid, regs),
                         _ => thread::KernelAction::Done,
                     }
                 }
@@ -486,7 +486,7 @@ fn handle_fork_exec(
         let want_64 = loaded.class == crate::kernel::elf::ElfClass::Elf64;
         let prog_arg = alloc::vec::Vec::from(path);
         let args = alloc::vec![prog_arg];
-        let sp = crate::kernel::syscalls::setup_user_stack(&args, want_64);
+        let sp = crate::kernel::linux::setup_user_stack(&args, want_64);
         crate::dbg_println!("  stack={:#x} want_64={}", sp, want_64);
         let symbols = crate::kernel::stacktrace::SymbolData::new(buf.into_boxed_slice());
 

@@ -1,4 +1,9 @@
-//! Linux i386 syscall interface
+//! Linux personality — i386/x86_64 Linux syscall ABI.
+//!
+//! Sibling to the `dos` personality: the `dos` module implements the
+//! DOS/DPMI personality, this one implements the Linux personality.
+//! Linux `LinuxState` lives in `thread.rs` alongside `DosState` (mirroring
+//! the DOS layout) and this module owns the syscall dispatch + handlers.
 //!
 //! INT 0x80, EAX = syscall number (Linux i386 numbering)
 //! i386:   EBX=a0, ECX=a1, EDX=a2, ESI=a3, EDI=a4, EBP=a5
