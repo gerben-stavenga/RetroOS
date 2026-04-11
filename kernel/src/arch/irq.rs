@@ -130,43 +130,17 @@ pub fn init_interrupts() {
     init_pit(1000); // 1000 Hz timer
     unmask_irq(0);  // timer
     unmask_irq(1);  // keyboard
+    // Drain any byte left in the 8042 output buffer by the BIOS or by a key
+    // pressed before we unmasked IRQ1. The 8042 only edges IRQ1 when OBF
+    // transitions 0→1, so a stuck OBF locks out all subsequent keypresses.
+    while inb(0x64) & 1 != 0 {
+        let _ = inb(0x60);
+    }
 }
 
 // ============================================================================
 // IRQ dispatch
 // ============================================================================
-
-/// F12 debug: dump interrupted thread's CS:IP, BIOS timer, and code bytes
-fn dump_thread_state(regs: &Regs) {
-    unsafe {
-        let vm86 = regs.flags32() & (1 << 17) != 0;
-        if vm86 {
-            let vif = regs.flags32() & (1 << 9) != 0; // IF = virtual interrupt flag after arch swap
-            let lin = (regs.cs32() << 4) + regs.ip32();
-            let b = core::slice::from_raw_parts(lin as *const u8, 16);
-            let ticks = *(0x46Cu32 as *const u32);
-            crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                regs.code_seg(), regs.ip32(),
-                regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-                regs.ds as u16, regs.stack_seg(), regs.sp32(),
-                regs.flags32() as u16, vif, ticks,
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-            // Dump VGA text buffer (80x25, char+attr interleaved at 0xB8000)
-            let vga = core::slice::from_raw_parts(0xB8000 as *const u8, 4000);
-            for row in 0..25 {
-                let mut line = [b'.'; 80];
-                for col in 0..80 {
-                    let ch = vga[(row * 80 + col) * 2];
-                    line[col] = if ch >= 0x20 && ch < 0x7F { ch } else { b'.' };
-                }
-                crate::dbg_println!("[VGA {:02}] {}", row,
-                    core::str::from_utf8(&line).unwrap_or("???"));
-            }
-        } else {
-            crate::dbg_println!("[DBG] PM EIP={:#010x}", regs.ip32());
-        }
-    }
-}
 
 /// Handle an IRQ: PIC ACK, read hardware data, push typed event to queue.
 pub fn handle_irq(regs: &mut Regs) {
@@ -204,16 +178,7 @@ pub fn handle_irq(regs: &mut Regs) {
             }
             None // ticks use PENDING_TICKS counter, not the queue
         }
-        1 => {
-            let sc = inb(0x60);
-            if sc == 0x58 {
-                // F12: dump current thread's CS:IP for debugging hung VM86
-                dump_thread_state(regs);
-                None
-            } else {
-                Some(Irq::Key(sc))
-            }
-        }
+        1 => Some(Irq::Key(inb(0x60))),
         _ => None,
     };
 

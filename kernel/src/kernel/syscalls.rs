@@ -830,27 +830,27 @@ fn sys_execve(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
 
 /// Execute a DOS program (.COM or .EXE) in VM86 mode.
 fn exec_dos(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8]) {
-    use crate::kernel::vm86;
+    use crate::kernel::dos;
 
     startup::arch_user_clean();
     startup::arch_map_low_mem();
-    vm86::setup_ivt();
+    dos::setup_ivt();
 
-    let (cs, ip, ss, sp, end_seg) = if is_exe && vm86::is_mz_exe(data) {
-        vm86::load_exe(data, prog_name).unwrap_or_else(|| {
+    let (cs, ip, ss, sp, end_seg) = if is_exe && dos::is_mz_exe(data) {
+        dos::load_exe(data, prog_name).unwrap_or_else(|| {
             crate::println!("Invalid MZ EXE");
             (0, 0, 0, 0, 0)
         })
     } else {
-        vm86::load_com(data, prog_name)
+        dos::load_com(data, prog_name)
     };
 
     let current = thread::get_thread(tid).unwrap();
-    thread::init_process_thread_vm86(current, vm86::COM_SEGMENT, cs, ip, ss, sp);
-    let dos = current.dos_mut();
-    dos.vm86.heap_seg = end_seg;
-    dos.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
-    dos.symbols = None;
+    thread::init_process_thread_vm86(current, dos::COM_SEGMENT, cs, ip, ss, sp);
+    let dos_state = current.dos_mut();
+    dos_state.heap_seg = end_seg;
+    dos_state.dta = (dos::COM_SEGMENT as u32) * 16 + 0x80;
+    dos_state.symbols = None;
 }
 
 /// chdir(12)

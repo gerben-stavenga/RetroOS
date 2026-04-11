@@ -102,96 +102,83 @@ pub fn init_from_tar() {
     }
 }
 
-/// Print a stack trace starting from the current frame
+/// Print a stack trace starting from the caller of this function. Used by the
+/// panic handler; skips its own frame so the first line is whoever panicked.
 pub fn stack_trace() {
     let bp: usize;
-    unsafe {
-        asm!("mov {}, ebp", out(reg) bp);
-    }
-    stack_trace_from(bp as u32);
+    unsafe { asm!("mov {}, ebp", out(reg) bp); }
+    // Pre-advance one hop so `walk` starts at our caller's frame (panic's, say).
+    let caller_bp = if bp != 0 {
+        unsafe { *(bp as *const u32) as u64 }
+    } else { 0 };
+    println!("Stack trace:");
+    walk(caller_bp, 0, false);
 }
 
-/// Print a stack trace starting from a specific frame pointer.
-///
-/// Always starts walking 32-bit kernel frames (ebp chain with 4-byte pairs).
-/// When the return IP drops below KERNEL_BASE, we've crossed the entry.asm
-/// mock frame into user space. At that point, if the current thread is 64-bit,
-/// we switch to 64-bit frame walking (rbp/rip pairs of 8 bytes each).
-pub fn stack_trace_from(mut bp: u32) {
-    unsafe extern "C" { fn isr_return(); }
-    let isr_dispatch = isr_return as u32;
-
-    // Skip the first frame (this function / trap handler)
-    if bp != 0 {
-        let frame = bp as *const u32;
-        unsafe { bp = *frame; }
-    }
-
+/// Print a stack trace for a saved interrupt context (F12 debug hotkey, etc).
+/// Frame 0 is the exact IP that was interrupted; subsequent frames are walked
+/// from `regs.rbp`. `lookup_symbol` auto-picks between kernel and user symbol
+/// tables based on the address.
+pub fn stack_trace_regs(regs: &crate::Regs) {
     println!("Stack trace:");
+    let user_64 = regs.mode() == crate::UserMode::Mode64;
+    print_frame(0, regs.ip());
+    walk(regs.rbp, 1, user_64);
+}
 
-    let mut depth = 0;
+/// Print one line of the backtrace.
+fn print_frame(depth: usize, ip: u64) {
+    let (name, offset) = lookup_symbol(ip);
+    print!("  {:2}: {:#010x}", depth, ip);
+    if !name.is_empty() {
+        print!(" {}+{:#x}", rustc_demangle::demangle(name), offset);
+    }
+    println!();
+}
+
+/// Walk the ebp/rbp chain starting at `bp`. Each iteration reads the frame's
+/// saved-bp and return-ip pair, prints the return ip (i.e. the caller's
+/// current IP at the time of the call), and advances.
+///
+/// Starts in 32-bit mode unless `user_64` is true. When a return IP matches
+/// `isr_return`, the parent slot is an entry.asm mock frame; a non-zero rip
+/// there means the interrupted user was 64-bit and we switch to wide walking.
+fn walk(mut bp: u64, mut depth: usize, mut user_64: bool) {
+    unsafe extern "C" { fn isr_return(); }
+    let isr_dispatch = isr_return as u64;
     const MAX_DEPTH: usize = 20;
-    let mut user_64 = false;
 
-    while bp != 0 && depth < MAX_DEPTH {
-        if bp < 0x1000 {
-            break;
-        }
-
+    while depth < MAX_DEPTH && bp >= 0x1000 {
         if user_64 {
-            // 64-bit user frames: [rbp(8), rip(8)]
             let frame = bp as usize as *const u64;
             let (next_bp, ip) = unsafe { (*frame, *frame.add(1)) };
-
-            if ip == 0 || ip < 0x1000 {
-                break;
-            }
-
-            let (name, offset) = lookup_symbol(ip);
-            print!("  {:2}: {:#010x}", depth, ip);
-            if !name.is_empty() {
-                print!(" {}+{:#x}", rustc_demangle::demangle(name), offset);
-            }
-            println!();
-
-            bp = next_bp as u32;
+            if ip == 0 || ip < 0x1000 { break; }
+            print_frame(depth, ip);
+            bp = next_bp;
         } else {
-            // 32-bit frames: [ebp(4), eip(4)]
-            let frame = bp as *const u32;
+            let frame = (bp as u32) as *const u32;
             let (next_bp, ip) = unsafe { (*frame, *frame.add(1) as u64) };
+            if ip == 0 || ip < 0x1000 { break; }
 
-            if ip == 0 || ip < 0x1000 {
-                break;
-            }
-
-            // Detect ISR dispatch: next frame is a 16-byte mock frame
-            // [ebp/rbp_lo, eip/rbp_hi, 0/rip_lo, 0/rip_hi]
-            // rip==0 means 32-bit user, rip!=0 means 64-bit user
-            if ip == isr_dispatch as u64 {
-                let mock = next_bp as *const u64;
+            // Mock frame crossing into user space:
+            // [ebp/rbp_lo, eip/rbp_hi, 0/rip_lo, 0/rip_hi].
+            // Non-zero rip means 64-bit user.
+            if ip == isr_dispatch {
+                let mock = (next_bp as usize) as *const u64;
                 let rip = unsafe { *mock.add(1) };
                 if rip != 0 {
-                    // 64-bit user: rbp and rip are full 64-bit values
                     user_64 = true;
-                    bp = unsafe { *mock } as u32;
+                    bp = unsafe { *mock };
                 } else {
-                    // 32-bit user: ebp and eip are in the low 32 bits
-                    bp = next_bp;
+                    bp = next_bp as u64;
                 }
                 depth += 1;
                 continue;
             }
 
-            let (name, offset) = lookup_symbol(ip);
-            print!("  {:2}: {:#010x}", depth, ip);
-            if !name.is_empty() {
-                print!(" {}+{:#x}", rustc_demangle::demangle(name), offset);
-            }
-            println!();
-
-            bp = next_bp;
+            print_frame(depth, ip);
+            bp = next_bp as u64;
         }
-
         depth += 1;
     }
 

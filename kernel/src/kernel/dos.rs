@@ -1,87 +1,38 @@
-//! VM86 mode support for DOS program execution (.COM and .EXE)
+//! DOS personality — MS-DOS compatible execution environment.
 //!
-//! Provides:
-//! - VM86 monitor (handles GP faults from sensitive instructions)
-//! - DOS INT 21h emulation (basic character/string I/O, exit)
-//! - Virtual hardware (PIC, keyboard) for per-thread device emulation
-//! - Signal delivery (hardware IRQs reflected through BIOS IVT)
-//! - .COM and MZ .EXE file loaders
+//! Built on top of the policy-free `machine` layer (virtual 8259/8253/8042,
+//! VGA register set) and the kernel's VM86 execution mode. Provides:
+//! - VM86 GP-fault monitor that dispatches software INTs to DOS handlers
+//! - INT 21h (DOS services), INT 10h/13h/16h/1Ah (BIOS), INT 2Fh (multiplex)
+//! - XMS 3.0 / EMS 4.0 / UMB memory services
+//! - .COM and MZ .EXE program loaders, EXEC chain (fork/exec parent tracking)
+//! - PSP, SFT, CDS, LOL real-mode structures; FindFirst/FindNext state
 //!
 //! The BIOS ROM at 0xF0000-0xFFFFF and the BIOS IVT at 0x0000-0x03FF are
 //! preserved from the original hardware state (via COW page 0). BIOS handlers
 //! work transparently because their I/O instructions trap through the TSS IOPB
-//! to our virtual devices.
+//! to our virtual devices in the `machine` module.
 
 extern crate alloc;
 
 use crate::kernel::thread;
+use crate::kernel::machine::{
+    self,
+    IF_FLAG, PRESERVED_FLAGS,
+    emulate_inb, emulate_outb, fetch_byte, read_u16, write_u16,
+    vm86_cs, vm86_ip, vm86_ss, vm86_sp, vm86_flags,
+    set_vm86_cs, set_vm86_ip, set_vm86_flags,
+    vm86_push, vm86_pop, vm86_push32, vm86_pop32,
+    reflect_interrupt, clear_bios_keyboard_buffer, pop_bios_keyboard_word,
+};
 use crate::vga;
 use crate::dbg_println;
 use crate::Regs;
 
-const IF_FLAG: u32 = 1 << 9;
-const IOPL_MASK: u32 = 3 << 12;
-const VM_FLAG: u32 = 1 << 17;
 const EMS_ENABLED: bool = false;
 
 /// Dummy file handle returned for /dev/null semantics.
 const NULL_FILE_HANDLE: u16 = 99;
-
-/// Flags that VM86 code cannot change (IOPL, VM)
-const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
-
-#[inline]
-fn vm86_cs(regs: &Regs) -> u16 {
-    regs.code_seg()
-}
-
-#[inline]
-fn vm86_ip(regs: &Regs) -> u16 {
-    regs.ip32() as u16
-}
-
-#[inline]
-fn vm86_ss(regs: &Regs) -> u16 {
-    regs.stack_seg()
-}
-
-#[inline]
-fn vm86_sp(regs: &Regs) -> u16 {
-    regs.sp32() as u16
-}
-
-#[inline]
-fn vm86_flags(regs: &Regs) -> u32 {
-    regs.flags32()
-}
-
-#[inline]
-fn set_vm86_cs(regs: &mut Regs, cs: u16) {
-    regs.set_cs32(cs as u32);
-}
-
-#[inline]
-fn set_vm86_ip(regs: &mut Regs, ip: u16) {
-    regs.set_ip32(ip as u32);
-}
-
-#[inline]
-fn set_vm86_ss(regs: &mut Regs, ss: u16) {
-    regs.set_ss32(ss as u32);
-}
-
-#[inline]
-fn set_vm86_sp(regs: &mut Regs, sp: u16) {
-    let full = (regs.sp32() & 0xFFFF_0000) | sp as u32;
-    regs.set_sp32(full);
-}
-
-#[inline]
-fn set_vm86_flags(regs: &mut Regs, flags: u32) {
-    regs.set_flags32(flags);
-}
-
-
 
 /// .COM load segment — derived from DOS_AREA_END so the environment block
 /// (COM_SEGMENT-0x10, 256 bytes) never overlaps kernel structures.
@@ -91,783 +42,8 @@ const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer (top of 64KB segment)
 const COM_SP: u16 = 0xFFFE;
 
-pub const HMA_PAGE_COUNT: usize = 16;
-
-/// VGA Attribute Controller port (0x3C0) state. The hardware has two
-/// independent pieces of state, neither readable from any port:
-///   - `index`:        last byte written in index state. Includes the PAS bit
-///                     (bit 5) which controls screen blanking. Persistent —
-///                     subsequent data writes do not change it.
-///   - `pending_data`: flip-flop position. `false` = next 0x3C0 write is an
-///                     index byte; `true` = next 0x3C0 write is its data.
-/// `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
-#[derive(Clone, Copy)]
-pub struct AcState {
-    pub index: u8,
-    pub pending_data: bool,
-}
-
-impl AcState {
-    const fn new() -> Self { Self { index: 0, pending_data: false } }
-}
-
-/// Global AC state, tracks real hardware across all processes.
-static mut VGA_AC_STATE: AcState = AcState::new();
-
-/// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
-/// Saved/restored on context switch so each process has its own screen.
-pub struct VgaState {
-    /// 4 planes × 64KB = 256KB framebuffer (flat: plane 0 at [0..65536], etc.)
-    pub planes: alloc::vec::Vec<u8>,
-    // ── Registers ──
-    pub misc_output: u8,
-    pub feature_ctl: u8,
-    pub seq: [u8; 5],
-    pub crtc: [u8; 25],
-    pub gc: [u8; 9],
-    pub ac: [u8; 21],
-    pub dac: [u8; 768],
-    pub dac_mask: u8,
-    // ── Port index / state ──
-    pub seq_index: u8,
-    pub crtc_index: u8,
-    pub gc_index: u8,
-    /// AC port flip-flop + latched index. See `VGA_AC_STATE`.
-    pub ac_state: AcState,
-    /// DAC pixel-address latch (single shared index for read & write)
-    pub dac_index: u8,
-    /// DAC state byte from inb(0x3C7): 0x00 = write-mode, 0x03 = read-mode
-    pub dac_state: u8,
-}
-
-impl VgaState {
-    pub fn new() -> Self {
-        Self {
-            planes: alloc::vec::Vec::new(),
-            misc_output: 0,
-            feature_ctl: 0,
-            seq: [0; 5],
-            crtc: [0; 25],
-            gc: [0; 9],
-            ac: [0; 21],
-            dac: [0; 768],
-            dac_mask: 0xFF,
-            seq_index: 0,
-            crtc_index: 0,
-            gc_index: 0,
-            ac_state: AcState::new(),
-            dac_index: 0,
-            dac_state: 0,
-        }
-    }
-
-    /// Read current VGA hardware state into this struct.
-    pub fn save_from_hardware(&mut self) {
-        use crate::arch::{inb, outb};
-        if self.planes.is_empty() {
-            self.planes = alloc::vec![0u8; 4 * 65536];
-        }
-        crate::arch::cli();
-        // Capture tracked AC state, then reset flipflop to known index state.
-        self.ac_state = unsafe { VGA_AC_STATE };
-        let _ = inb(0x3DA);
-
-        // Capture index registers BEFORE the save loops overwrite them.
-        self.seq_index = inb(0x3C4);
-        self.crtc_index = inb(0x3D4);
-        self.gc_index = inb(0x3CE);
-
-        // Save all registers
-        self.misc_output = inb(0x3CC);
-        self.feature_ctl = inb(0x3CA);
-        for i in 0..5u8 { outb(0x3C4, i); self.seq[i as usize] = inb(0x3C5); }
-        for i in 0..25u8 { outb(0x3D4, i); self.crtc[i as usize] = inb(0x3D5); }
-        for i in 0..9u8 { outb(0x3CE, i); self.gc[i as usize] = inb(0x3CF); }
-        self.dac_mask = inb(0x3C6);
-        // Capture program-tracked DAC index latch + read/write mode before
-        // stomping it with our bulk read.
-        self.dac_index = inb(0x3C8);
-        self.dac_state = inb(0x3C7);
-        outb(0x3C7, 0);
-        for i in 0..768 { self.dac[i] = inb(0x3C9); }
-
-        // Attribute Controller — must reset flipflop EACH iteration.
-        // inb(0x3C1) reads the register but does NOT toggle the flipflop,
-        // so without a reset the next outb(0x3C0, i) would be a data write.
-        for i in 0..21u8 {
-            let _ = inb(0x3DA);
-            outb(0x3C0, i);
-            self.ac[i as usize] = inb(0x3C1);
-        }
-
-        // Restore hardware AC to the program's tracked state. Always write the
-        // latched index byte (carries the PAS bit, which the save loop above
-        // clobbered to 0). Then, if the program is in index state, do one more
-        // 0x3DA read to put the flipflop back.
-        let _ = inb(0x3DA);
-        outb(0x3C0, self.ac_state.index);
-        if !self.ac_state.pending_data {
-            let _ = inb(0x3DA);
-        }
-
-        crate::dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X}",
-            self.seq[4], self.gc[5], self.gc[6], self.crtc[0x14], self.crtc[0x17], self.ac[0x10], self.misc_output,
-            (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16);
-
-        // Force flat planar mode for reading planes:
-        // SEQ mem mode = sequential access (no chain-4, no odd/even)
-        // GC mode = read mode 0, write mode 0
-        // GC misc = graphics mode, A0000/64K window, no chain odd/even
-        outb(0x3C4, 4); outb(0x3C5, 0x06);
-        outb(0x3CE, 5); outb(0x3CF, 0x00);
-        outb(0x3CE, 6); outb(0x3CF, 0x05);
-
-        // KNOWN GAP: GC read latches (4 bytes loaded by the most recent VGA
-        // memory read) are not preserved across save/restore. The bulk reads
-        // below clobber them, and the VGA exposes no port to read latches
-        // directly — the only way to extract them is to dump them to memory
-        // via write mode 1 and read them back, which would require sacrificing
-        // 4 bytes of plane RAM at a fixed scratch offset (any prior read to
-        // capture that user data would itself destroy the latches we want).
-        //
-        // Symptom: a mode-X latch blit preempted between its source read and
-        // destination write produces 4 wrong bytes when the program resumes:
-        //     mov al, [esi]   ; loads latches with src plane bytes
-        //     <-- preempt here -->
-        //     mov [edi], al   ; write mode 1: writes (wrong) latches to dst
-        // The window is 1–2 instructions wide so the hit rate is very low,
-        // and the visible artifact (one bad 4-byte stripe in one frame) is
-        // typically invisible. Left unfixed; revisit if we ever observe it.
-        for plane in 0..4u8 {
-            outb(0x3CE, 4); outb(0x3CF, plane);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (0xA0000) as *const u8,
-                    self.planes[plane as usize * 65536..].as_mut_ptr(),
-                    65536,
-                );
-            }
-        }
-
-        // Restore registers we temporarily changed
-        outb(0x3C4, 4); outb(0x3C5, self.seq[4]);
-        outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
-        outb(0x3CE, 5); outb(0x3CF, self.gc[5]);
-        outb(0x3CE, 6); outb(0x3CF, self.gc[6]);
-        // Restore the program's tracked index registers
-        outb(0x3C4, self.seq_index);
-        outb(0x3D4, self.crtc_index);
-        outb(0x3CE, self.gc_index);
-        crate::arch::sti();
-    }
-
-    /// Write this struct's state to VGA hardware.
-    pub fn restore_to_hardware(&self) {
-        if self.planes.is_empty() { return; }
-        use crate::arch::{inb, outb};
-        crate::arch::cli();
-
-        // Reset AC flipflop to known (index) state before any VGA register work.
-        let _ = inb(0x3DA);
-
-        // Step 1: Write planes in forced flat planar mode.
-        // Need misc_output for clock source, but force sequential planar access.
-        outb(0x3C4, 0); outb(0x3C5, 0x01); // sync reset
-        outb(0x3C2, self.misc_output);
-        outb(0x3C4, 2); outb(0x3C5, 0x0F); // map mask: all planes
-        outb(0x3C4, 4); outb(0x3C5, 0x06); // mem mode: sequential, no chain-4
-        outb(0x3C4, 0); outb(0x3C5, 0x03); // release reset
-        outb(0x3CE, 5); outb(0x3CF, 0x00); // GC mode: write mode 0
-        outb(0x3CE, 6); outb(0x3CF, 0x05); // GC misc: graphics, A0000/64K
-
-        for plane in 0..4u8 {
-            outb(0x3C4, 2); outb(0x3C5, 1 << plane);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.planes[plane as usize * 65536..].as_ptr(),
-                    (0xA0000) as *mut u8,
-                    65536,
-                );
-            }
-        }
-
-        // Step 2: Set target mode registers.
-        // Bracket SEQ writes with sync reset so a dot-clock change in
-        // misc_output/seq[1] doesn't glitch the sequencer mid-cycle.
-        // Reverse iteration so SEQ[0] = self.seq[0] is the last write
-        // and naturally acts as the release.
-        outb(0x3C4, 0); outb(0x3C5, 0x01); // assert sync reset
-        outb(0x3C2, self.misc_output);
-        outb(0x3DA, self.feature_ctl); // FCR (color mode write port)
-        for i in (0..5u8).rev() { outb(0x3C4, i); outb(0x3C5, self.seq[i as usize]); }
-
-        // CRTC — unlock first (clear protect bit in reg 0x11)
-        outb(0x3D4, 0x11); outb(0x3D5, self.crtc[0x11] & 0x7F);
-        for i in 0..25u8 { outb(0x3D4, i); outb(0x3D5, self.crtc[i as usize]); }
-        // Graphics Controller
-        for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]); }
-        // Attribute Controller — write all 21 registers
-        let _ = inb(0x3DA);
-        for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, self.ac[i as usize]); }
-        // Restore the program's AC state. Same pattern as save_from_hardware.
-        let _ = inb(0x3DA);
-        outb(0x3C0, self.ac_state.index);
-        if !self.ac_state.pending_data {
-            let _ = inb(0x3DA);
-        }
-        unsafe { VGA_AC_STATE = self.ac_state; }
-        // DAC
-        outb(0x3C6, self.dac_mask);
-        outb(0x3C8, 0);
-        for i in 0..768 { outb(0x3C9, self.dac[i]); }
-        // Restore the program's DAC index latch + read/write mode.
-        // dac_state bits[1:0]: 0x03 = read-mode (set via 0x3C7),
-        //                      0x00 = write-mode (set via 0x3C8).
-        if self.dac_state & 3 == 3 {
-            outb(0x3C7, self.dac_index);
-        } else {
-            outb(0x3C8, self.dac_index);
-        }
-        // Restore index registers
-        outb(0x3C4, self.seq_index);
-        outb(0x3D4, self.crtc_index);
-        outb(0x3CE, self.gc_index);
-        crate::arch::sti();
-    }
-}
-
-pub struct Vm86State {
-    pub a20_enabled: bool,
-    pub dta: u32,
-    pub heap_seg: u16,
-    /// Current PSP segment as seen by INT 21h/AH=50h (set), 51h (get), and
-    /// 62h (get). Tracks which loaded program is "active" — exec_program sets
-    /// it to the child's segment, exec_return restores it via ExecParent.
-    /// Some DOS programs (and DPMI extenders) call AH=50h to temporarily
-    /// switch the active PSP and read it back via AH=51h.
-    pub current_psp: u16,
-    pub dos_pending_char: Option<u8>,
-    /// Last child termination status as returned by INT 21h/AH=4Dh.
-    /// Low byte (AL) = return code passed by the child to AH=4Ch/AH=31h.
-    /// High byte (AH) = termination type per RBIL:
-    ///   00h = normal (AH=4Ch), 01h = Ctrl-Break, 02h = critical error,
-    ///   03h = TSR (AH=31h).
-    pub last_child_exit_status: u16,
-    pub vpit: VirtualPit,
-    pub vpic: VirtualPic,
-    pub vkbd: VirtualKeyboard,
-    pub exec_parent: Option<ExecParent>,
-    pub skip_irq: bool,
-    pub xms: Option<alloc::boxed::Box<XmsState>>,
-    pub ems: Option<alloc::boxed::Box<EmsState>>,
-    pub hma_pages: [u64; HMA_PAGE_COUNT],
-    pub e0_pending: bool,
-    pub vga: VgaState,
-    // FindFirst/FindNext search state. Stored per-thread since the full
-    // resolved path doesn't fit in the 21-byte DTA reserved area. DN does
-    // one active enumeration at a time.
-    pub find_path: [u8; 96],
-    pub find_path_len: u8,
-    pub find_idx: u16,
-}
-
-impl Vm86State {
-    pub fn new() -> Self {
-        let mut hma_pages = [0u64; HMA_PAGE_COUNT];
-        crate::kernel::startup::arch_init_hma(&mut hma_pages);
-        Self {
-            a20_enabled: false,
-            dta: 0,
-            heap_seg: 0xA000,
-            current_psp: COM_SEGMENT,
-            dos_pending_char: None,
-            last_child_exit_status: 0,
-            vpit: VirtualPit::new(),
-            vpic: VirtualPic::new(),
-            vkbd: VirtualKeyboard::new(),
-            exec_parent: None,
-            skip_irq: false,
-            xms: None,
-            ems: None,
-            hma_pages,
-            e0_pending: false,
-            vga: VgaState::new(),
-            find_path: [0; 96],
-            find_path_len: 0,
-            find_idx: 0,
-        }
-    }
-}
-
-const PIT_INPUT_HZ: u64 = 1_193_182;
-const HOST_TIMER_HZ: u64 = 1000;
-
-#[derive(Clone, Copy)]
-struct VirtualPitChannel {
-    reload: u16,
-    rw_mode: u8,
-    mode: u8,
-    write_lsb: Option<u8>,
-    read_lsb_next: bool,
-    latched: Option<u16>,
-    latch_lsb_next: bool,
-    start_cycle: u64,
-    next_irq_cycle: u64,
-    enabled: bool,
-}
-
-impl VirtualPitChannel {
-    const fn new() -> Self {
-        Self {
-            reload: 0,
-            rw_mode: 3,
-            mode: 3,
-            write_lsb: None,
-            read_lsb_next: true,
-            latched: None,
-            latch_lsb_next: true,
-            start_cycle: 0,
-            next_irq_cycle: 0,
-            enabled: true,
-        }
-    }
-
-    #[inline]
-    fn divisor(&self) -> u64 {
-        match self.reload {
-            0 => 65_536,
-            v => v as u64,
-        }
-    }
-
-    #[inline]
-    fn current_count(&self, now: u64) -> u16 {
-        if !self.enabled {
-            return self.reload;
-        }
-        let div = self.divisor();
-        let elapsed = now.saturating_sub(self.start_cycle);
-        let raw = match self.mode {
-            2 | 3 => {
-                let pos = elapsed % div;
-                let remaining = div - pos;
-                if remaining == div { div } else { remaining }
-            }
-            _ => {
-                if elapsed >= div { 0 } else { div - elapsed }
-            }
-        };
-        raw as u16
-    }
-
-    fn latch_count(&mut self, now: u64) {
-        self.latched = Some(self.current_count(now));
-        self.latch_lsb_next = true;
-    }
-
-    fn read_byte(&mut self, now: u64) -> u8 {
-        if let Some(latched) = self.latched {
-            let byte = if self.latch_lsb_next {
-                self.latch_lsb_next = false;
-                latched as u8
-            } else {
-                self.latched = None;
-                self.latch_lsb_next = true;
-                (latched >> 8) as u8
-            };
-            return byte;
-        }
-
-        let count = self.current_count(now);
-        match self.rw_mode {
-            1 => count as u8,
-            2 => (count >> 8) as u8,
-            _ => {
-                let byte = if self.read_lsb_next {
-                    count as u8
-                } else {
-                    (count >> 8) as u8
-                };
-                self.read_lsb_next = !self.read_lsb_next;
-                byte
-            }
-        }
-    }
-
-    fn load_count(&mut self, raw: u16, now: u64) {
-        self.reload = raw;
-        self.write_lsb = None;
-        self.read_lsb_next = true;
-        self.latched = None;
-        self.latch_lsb_next = true;
-        self.start_cycle = now;
-        self.enabled = true;
-        let div = self.divisor();
-        self.next_irq_cycle = match self.mode {
-            2 | 3 => now.saturating_add(div),
-            _ => now.saturating_add(div),
-        };
-    }
-
-    fn write_byte(&mut self, val: u8, now: u64) {
-        match self.rw_mode {
-            1 => self.load_count(val as u16, now),
-            2 => self.load_count((val as u16) << 8, now),
-            _ => {
-                if let Some(lo) = self.write_lsb.take() {
-                    self.load_count(((val as u16) << 8) | lo as u16, now);
-                } else {
-                    self.write_lsb = Some(val);
-                }
-            }
-        }
-    }
-
-    fn set_command(&mut self, rw_mode: u8, mode: u8) {
-        self.rw_mode = rw_mode;
-        self.mode = match mode {
-            6 => 2,
-            7 => 3,
-            v => v & 0x07,
-        };
-        self.write_lsb = None;
-        self.read_lsb_next = true;
-    }
-
-    fn take_irqs(&mut self, now: u64) -> u32 {
-        if !self.enabled {
-            return 0;
-        }
-        let div = self.divisor();
-        let mut count = 0u32;
-        match self.mode {
-            2 | 3 => {
-                while now >= self.next_irq_cycle {
-                    count = count.saturating_add(1);
-                    self.next_irq_cycle = self.next_irq_cycle.saturating_add(div);
-                }
-            }
-            _ => {
-                if now >= self.next_irq_cycle {
-                    count = 1;
-                    self.enabled = false;
-                }
-            }
-        }
-        count
-    }
-}
-
-pub struct VirtualPit {
-    last_host_tick: u64,
-    frac_accum: u64,
-    input_cycles: u64,
-    ch0: VirtualPitChannel,
-}
-
-impl VirtualPit {
-    fn new() -> Self {
-        let now = crate::arch::get_ticks();
-        Self {
-            last_host_tick: now,
-            frac_accum: 0,
-            input_cycles: 0,
-            ch0: VirtualPitChannel::new(),
-        }
-    }
-
-    fn sync(&mut self) {
-        let now = crate::arch::get_ticks();
-        let delta_ticks = now.saturating_sub(self.last_host_tick);
-        if delta_ticks == 0 {
-            return;
-        }
-        self.last_host_tick = now;
-        let total = self.frac_accum.saturating_add(delta_ticks.saturating_mul(PIT_INPUT_HZ));
-        self.input_cycles = self.input_cycles.saturating_add(total / HOST_TIMER_HZ);
-        self.frac_accum = total % HOST_TIMER_HZ;
-    }
-
-    fn read_counter0(&mut self) -> u8 {
-        self.sync();
-        self.ch0.read_byte(self.input_cycles)
-    }
-
-    fn write_counter0(&mut self, val: u8) {
-        self.sync();
-        self.ch0.write_byte(val, self.input_cycles);
-    }
-
-    fn write_command(&mut self, val: u8) {
-        self.sync();
-        let channel = (val >> 6) & 0x03;
-        if channel != 0 {
-            return;
-        }
-        let rw_mode = (val >> 4) & 0x03;
-        if rw_mode == 0 {
-            self.ch0.latch_count(self.input_cycles);
-            return;
-        }
-        self.ch0.set_command(rw_mode, (val >> 1) & 0x07);
-    }
-
-    pub fn take_pending_irqs(&mut self) -> u32 {
-        self.sync();
-        self.ch0.take_irqs(self.input_cycles)
-    }
-}
-
-// ============================================================================
-// Virtual hardware — per-thread PIC and keyboard emulation
-// ============================================================================
-
-const VPIC_QUEUE_SIZE: usize = 64;
-
-/// Virtual 8259 PIC (one per thread, master only)
-pub struct VirtualPic {
-    pub isr: u8,  // In-Service Register
-    pub imr: u8,  // Interrupt Mask Register
-    queue: [u8; VPIC_QUEUE_SIZE],  // pending interrupt vectors
-    head: usize,
-    tail: usize,
-}
-
-impl VirtualPic {
-    pub const fn new() -> Self {
-        Self { isr: 0, imr: 0, queue: [0; VPIC_QUEUE_SIZE], head: 0, tail: 0 }
-    }
-
-    /// Check if there are pending interrupt vectors in the queue.
-    pub fn has_pending(&self) -> bool {
-        self.head != self.tail
-    }
-
-    /// Check whether a specific vector is already queued.
-    pub fn has_pending_vec(&self, vec: u8) -> bool {
-        let mut i = self.head;
-        while i != self.tail {
-            if self.queue[i] == vec {
-                return true;
-            }
-            i = (i + 1) % VPIC_QUEUE_SIZE;
-        }
-        false
-    }
-
-    /// Non-specific EOI: clear highest-priority (lowest-numbered) in-service bit
-    pub fn eoi(&mut self) {
-        if self.isr != 0 {
-            self.isr &= self.isr - 1; // clear lowest set bit
-        }
-    }
-
-    /// Queue a pending interrupt vector.
-    /// Timer ticks (0x08) are coalesced: only one pending tick is kept.
-    /// This prevents timer floods from starving keyboard and other IRQs.
-    pub fn push(&mut self, vec: u8) {
-        if vec == 0x08 {
-            // Check if a timer tick is already queued — if so, skip
-            let mut i = self.head;
-            while i != self.tail {
-                if self.queue[i] == 0x08 { return; }
-                i = (i + 1) % VPIC_QUEUE_SIZE;
-            }
-        }
-        let next = (self.tail + 1) % VPIC_QUEUE_SIZE;
-        if next != self.head {
-            self.queue[self.tail] = vec;
-            self.tail = next;
-        }
-    }
-
-    /// Pop next pending interrupt vector, prioritizing keyboard (0x09) over timer.
-    pub fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail { return None; }
-        // Scan for a keyboard IRQ and deliver it first
-        let mut i = self.head;
-        while i != self.tail {
-            if self.queue[i] == 0x09 {
-                let vec = self.queue[i];
-                // Remove from queue by shifting
-                let mut j = i;
-                loop {
-                    let next = (j + 1) % VPIC_QUEUE_SIZE;
-                    if next == self.tail { break; }
-                    self.queue[j] = self.queue[next];
-                    j = next;
-                }
-                self.tail = if self.tail == 0 { VPIC_QUEUE_SIZE - 1 } else { self.tail - 1 };
-                return Some(vec);
-            }
-            i = (i + 1) % VPIC_QUEUE_SIZE;
-        }
-        // No keyboard IRQ — pop normally
-        let vec = self.queue[self.head];
-        self.head = (self.head + 1) % VPIC_QUEUE_SIZE;
-        Some(vec)
-    }
-}
-
-const KBD_BUF_SIZE: usize = 32;
-
-/// Virtual keyboard controller (scancode buffer)
-///
-/// Models the 8042 output buffer. Incoming scancodes become visible in the
-/// controller as soon as the output buffer is free; IRQ1 is merely the
-/// notification that data is ready. That lets BIOS INT 9 handlers and games
-/// that poll ports 0x60/0x64 observe the same underlying device state.
-pub struct VirtualKeyboard {
-    buffer: [u8; KBD_BUF_SIZE],
-    head: usize,
-    tail: usize,
-    /// Current scancode visible via port 0x60
-    pub port60: u8,
-    /// Port 0x61 state used by the BIOS keyboard IRQ handler handshake.
-    pub port61: u8,
-    /// Output Buffer Full flag — port 0x64 bit 0
-    pub obf: bool,
-}
-
-impl VirtualKeyboard {
-    pub const fn new() -> Self {
-        Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false }
-    }
-
-    fn queue_scancode(&mut self, scancode: u8) {
-        let next = (self.tail + 1) % KBD_BUF_SIZE;
-        if next != self.head {
-            self.buffer[self.tail] = scancode;
-            self.tail = next;
-        }
-    }
-
-    fn fill_output(&mut self) -> bool {
-        if self.obf {
-            return true;
-        }
-        if self.head == self.tail {
-            return false;
-        }
-        let sc = self.buffer[self.head];
-        self.head = (self.head + 1) % KBD_BUF_SIZE;
-        self.port60 = sc;
-        self.obf = true;
-        true
-    }
-
-    /// Buffer a scancode from the real keyboard IRQ handler
-    pub fn push(&mut self, scancode: u8) {
-        if !self.obf {
-            self.port60 = scancode;
-            self.obf = true;
-        } else {
-            self.queue_scancode(scancode);
-        }
-    }
-
-    /// Ensure a scancode is visible in port60 for INT 9 delivery.
-    pub fn latch(&mut self) -> bool {
-        self.fill_output()
-    }
-
-    /// Read port 0x60 — returns current scancode and then exposes the next
-    /// queued byte if one is already waiting in the controller.
-    pub fn read_port60(&mut self) -> u8 {
-        let sc = self.port60;
-        self.obf = false;
-        self.fill_output();
-        sc
-    }
-
-    /// Check if data is available (port 0x64 bit 0)
-    pub fn has_data(&self) -> bool {
-        self.obf
-    }
-
-    /// Check if scancodes are queued behind the current output byte.
-    pub fn has_buffered(&self) -> bool {
-        self.head != self.tail
-    }
-
-    pub fn read_port61(&self) -> u8 {
-        self.port61
-    }
-
-    pub fn write_port61(&mut self, val: u8) {
-        self.port61 = val;
-    }
-
-    pub fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-        self.port60 = 0;
-        self.port61 = 0;
-        self.obf = false;
-    }
-
-    /// Pop next key-down scancode, skipping releases (for INT 16h AH=0)
-    pub fn pop_key(&mut self) -> Option<u8> {
-        while self.head != self.tail {
-            let sc = self.buffer[self.head];
-            self.head = (self.head + 1) % KBD_BUF_SIZE;
-            if sc & 0x80 == 0 {
-                return Some(sc);
-            }
-        }
-        None
-    }
-
-    /// Peek next key-down scancode without consuming (for INT 16h AH=1)
-    pub fn peek_key(&self) -> Option<u8> {
-        let mut i = self.head;
-        while i != self.tail {
-            let sc = self.buffer[i];
-            if sc & 0x80 == 0 {
-                return Some(sc);
-            }
-            i = (i + 1) % KBD_BUF_SIZE;
-        }
-        None
-    }
-}
-
-/// Strip PS/2 E0 prefix — DOS games expect XT-style scancodes.
-/// E0 is consumed; the following scancode passes through as its legacy equivalent.
-fn normalize_vm86_scancode(dos: &mut thread::DosState, scancode: u8) -> Option<u8> {
-    if scancode == 0xE0 {
-        dos.vm86.e0_pending = true;
-        return None;
-    }
-    if dos.vm86.e0_pending {
-        dos.vm86.e0_pending = false;
-    }
-    Some(scancode)
-}
-
-fn clear_bios_keyboard_buffer() {
-    write_u16(0x40, 0x1A, 0x001E);
-    write_u16(0x40, 0x1C, 0x001E);
-    for off in (0x1E..0x3E).step_by(2) {
-        write_u16(0x40, off, 0);
-    }
-}
-
-fn pop_bios_keyboard_word() -> Option<u16> {
-    let head = read_u16(0x40, 0x1A);
-    let tail = read_u16(0x40, 0x1C);
-    if head == tail {
-        return None;
-    }
-    let word = read_u16(0x40, head as u32);
-    let next = if head + 2 >= 0x003E { 0x001E } else { head + 2 };
-    write_u16(0x40, 0x1A, next);
-    Some(word)
-}
-
 fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
-    let vm86 = &mut dos.vm86;
-    if let Some(ch) = vm86.dos_pending_char.take() {
+    if let Some(ch) = dos.dos_pending_char.take() {
         return Some(ch);
     }
 
@@ -875,7 +51,7 @@ fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
     let ascii = word as u8;
     let scan = (word >> 8) as u8;
     if ascii == 0 && scan != 0 {
-        vm86.dos_pending_char = Some(scan);
+        dos.dos_pending_char = Some(scan);
     }
     Some(ascii)
 }
@@ -1183,180 +359,6 @@ impl EmsState {
     }
 }
 
-// ============================================================================
-// Virtual I/O port emulation
-// ============================================================================
-
-/// Emulate IN from a port.
-pub(crate) fn emulate_inb(dos: &mut thread::DosState, port: u16) -> u8 {
-    match port {
-        // VGA Input Status 1: synthesize retrace signal.
-        // Cycle (32 reads): 0-15 display active (0x00), 16-23 HBL (0x01),
-        // 24-31 VBL (0x09).
-        // - VL_WaitVBL needs bit 3=1 (VBL phase)
-        // - VL_SetScreen needs 6+ consecutive bit0=1/bit3=0 (HBL phase)
-        // - VL_SetCRTC needs bit0=0 (display active phase)
-        0x3DA => {
-            // Read real hardware to reset the AC flip-flop, and track it globally.
-            let _real = crate::arch::inb(0x3DA);
-            unsafe { VGA_AC_STATE.pending_data = false; }
-            // Synthesize retrace: games (Wolf3D, Keen) poll this in tight loops.
-            // QEMU's real retrace is too fast/slow for the polling patterns.
-            static mut RETRACE_CTR: u8 = 0;
-            let ctr = unsafe {
-                RETRACE_CTR = RETRACE_CTR.wrapping_add(1);
-                RETRACE_CTR
-            };
-            let phase = ctr & 31;
-            if phase < 16 { 0x00 } else if phase < 24 { 0x01 } else { 0x09 }
-        }
-        // VGA ports — pass through to hardware
-        0x3C0..=0x3D9 | 0x3DB..=0x3DF => crate::arch::inb(port),
-        // Master PIC command (read ISR)
-        0x20 => dos.vm86.vpic.isr,
-        // Master PIC data (read IMR)
-        0x21 => dos.vm86.vpic.imr,
-        // Keyboard data port — returns current scancode from the virtual 8042.
-        0x60 => dos.vm86.vkbd.read_port60(),
-        // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
-        0x61 => dos.vm86.vkbd.read_port61(),
-        // Keyboard status port (bit 0 = output buffer full)
-        0x64 => if dos.vm86.vkbd.has_data() { 1 } else { 0 },
-        0x40 => dos.vm86.vpit.read_counter0(),
-        0x41 | 0x42 => 0,
-        // PIT command register not readable
-        0x43 => 0xFF,
-        // Unknown ports: return 0xFF (unpopulated bus)
-        _ => 0xFF,
-    }
-}
-
-/// Emulate OUT to a port.
-pub(crate) fn emulate_outb(dos: &mut thread::DosState, port: u16, val: u8) {
-    match port {
-        // VGA ports — pass through to hardware, track AC flip-flop + index
-        0x3C0 => {
-            unsafe {
-                if !VGA_AC_STATE.pending_data {
-                    VGA_AC_STATE.index = val; // index write — latch full byte (incl. PAS)
-                }
-                VGA_AC_STATE.pending_data = !VGA_AC_STATE.pending_data;
-            }
-            crate::arch::outb(port, val);
-        }
-        0x3C1..=0x3DF => crate::arch::outb(port, val),
-        // Master PIC command
-        0x20 => {
-            if val == 0x20 {
-                // Non-specific EOI
-                // If keyboard IRQ (bit 1) was in service, and the virtual 8042
-                // still has data ready, IRQ1 should assert again after EOI.
-                let keyboard_in_service = dos.vm86.vpic.isr & 0x02 != 0;
-                dos.vm86.vpic.eoi();
-                // Real hardware effectively re-asserts IRQ1 if more scancodes are
-                // already visible in the controller when the handler finishes.
-                if keyboard_in_service
-                    && dos.vm86.vkbd.has_data()
-                    && !dos.vm86.vpic.has_pending_vec(0x09)
-                {
-                    dos.vm86.vpic.push(0x09);
-                }
-            }
-        }
-        // Master PIC data (write IMR)
-        0x21 => dos.vm86.vpic.imr = val,
-        // Slave PIC command / data
-        0xA0 | 0xA1 => {}
-        // Keyboard controller / speaker port
-        0x61 => dos.vm86.vkbd.write_port61(val),
-        // Keyboard controller command
-        0x64 => {}
-        0x43 => dos.vm86.vpit.write_command(val),
-        0x40 => dos.vm86.vpit.write_counter0(val),
-        0x41 | 0x42 => {}
-        // Unknown ports: silently ignore (BIOS probes various ports during mode switches)
-        _ => {}
-    }
-}
-
-// ============================================================================
-// Signal delivery — buffer hardware events and raise virtual interrupts
-// ============================================================================
-
-/// Buffer a hardware event into the virtual PIC / keyboard buffer.
-/// Mode-independent: both VM86 and DPMI share the same virtual devices.
-pub fn queue_irq(dos: &mut thread::DosState, event: crate::arch::Irq) {
-    use crate::arch::Irq;
-    match event {
-        Irq::Key(sc) => {
-            let Some(sc) = normalize_vm86_scancode(dos, sc) else { return };
-            dos.vm86.vkbd.push(sc);
-            if dos.vm86.vpic.isr & 0x02 == 0 && !dos.vm86.vpic.has_pending_vec(0x09) {
-                dos.vm86.vpic.push(0x09);
-            }
-        }
-        Irq::Tick => {
-            let due = dos.vm86.vpit.take_pending_irqs();
-            for _ in 0..due {
-                dos.vm86.vpic.push(0x08);
-            }
-        }
-    }
-}
-
-/// Try to deliver one pending interrupt from the virtual PIC.
-/// IF is the virtual interrupt flag (arch swaps VIF↔IF at ring 3 boundary).
-/// Works for both VM86 (IVT reflect) and DPMI (PM vector dispatch).
-pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
-    let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
-    let is_pm = regs.mode() != crate::UserMode::VM86;
-    if !vif && !is_pm {
-        if dos.vm86.vpic.has_pending() {
-            regs.frame.rflags |= 1u64 << 20; // VIP
-        }
-        return;
-    }
-    if dos.vm86.vpic.isr != 0 {
-        return;
-    }
-    let vec = match dos.vm86.vpic.pop() {
-        Some(v) => v,
-        None => return,
-    };
-    if vec == 0x09 {
-        if !dos.vm86.vkbd.latch() {
-            dos.vm86.vpic.push(0x09);
-            return;
-        }
-    }
-    let irq_num = vec.wrapping_sub(8);
-    if irq_num < 8 {
-        dos.vm86.vpic.isr |= 1 << irq_num;
-    }
-    // Clear VIP — interrupt is being serviced
-    regs.frame.rflags &= !(1u64 << 20);
-
-    if regs.mode() == crate::UserMode::VM86 {
-        reflect_interrupt(regs, vec);
-    } else {
-        crate::kernel::dpmi::deliver_hw_irq(dos, regs, vec);
-    }
-}
-
-
-/// Reflect an interrupt through the IVT: push FLAGS/CS/IP, clear IF, set CS:IP.
-fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
-    let old_cs = vm86_cs(regs);
-    let old_ip = vm86_ip(regs);
-    let new_ip = read_u16(0, (int_num as u32) * 4);
-    let new_cs = read_u16(0, (int_num as u32) * 4 + 2);
-    vm86_push(regs, vm86_flags(regs) as u16);
-    vm86_push(regs, old_cs);
-    vm86_push(regs, old_ip);
-    regs.clear_flag32(IF_FLAG);
-    set_vm86_ip(regs, new_ip);
-    set_vm86_cs(regs, new_cs);
-}
 
 // ============================================================================
 // VM86 monitor — handles GP faults for sensitive instructions
@@ -1365,74 +367,6 @@ fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
 // VGA ports (0x3C0-0x3DF) are passed through to hardware.
 // PIC/keyboard are virtualized. Other ports: IN returns 0xFF, OUT is no-op.
 // ============================================================================
-
-/// Read a byte from the VM86 address space at CS:IP and advance IP
-fn fetch_byte(regs: &mut Regs) -> u8 {
-    unsafe {
-        let cs = regs.cs32();
-        let ip = regs.ip32();
-        let linear = (cs << 4).wrapping_add(ip);
-        let byte = *(linear as *const u8);
-        regs.set_ip32(ip.wrapping_add(1));
-        byte
-    }
-}
-
-/// Read a u16 from a real-mode seg:off address (unaligned-safe, null-safe)
-pub(crate) fn read_u16(seg: u32, off: u32) -> u16 {
-    let linear = (seg << 4) + off;
-    let val: u16;
-    unsafe {
-        core::arch::asm!(
-            "movzx {val:e}, word ptr [{addr}]",
-            addr = in(reg) linear,
-            val = out(reg) val,
-            options(readonly, nostack),
-        );
-    }
-    val
-}
-
-/// Write a u16 to a real-mode seg:off address (unaligned-safe, null-safe)
-pub(crate) fn write_u16(seg: u32, off: u32, val: u16) {
-    let linear = (seg << 4) + off;
-    unsafe {
-        core::arch::asm!(
-            "mov word ptr [{addr}], {val:x}",
-            addr = in(reg) linear,
-            val = in(reg) val,
-            options(nostack),
-        );
-    }
-}
-
-/// Push a u32 onto the VM86 stack (SS:SP) as two 16-bit halves
-fn vm86_push32(regs: &mut Regs, val: u32) {
-    vm86_push(regs, (val >> 16) as u16);
-    vm86_push(regs, val as u16);
-}
-
-/// Pop a u32 from the VM86 stack (SS:SP) as two 16-bit halves
-fn vm86_pop32(regs: &mut Regs) -> u32 {
-    let lo = vm86_pop(regs) as u32;
-    let hi = vm86_pop(regs) as u32;
-    (hi << 16) | lo
-}
-
-/// Push a u16 onto the VM86 stack (SS:SP)
-pub(crate) fn vm86_push(regs: &mut Regs, val: u16) {
-    let sp = vm86_sp(regs).wrapping_sub(2);
-    set_vm86_sp(regs, sp);
-    write_u16(regs.ss32(), sp as u32, val);
-}
-
-/// Pop a u16 from the VM86 stack (SS:SP)
-pub(crate) fn vm86_pop(regs: &mut Regs) -> u16 {
-    let sp = vm86_sp(regs);
-    let val = read_u16(regs.ss32(), sp as u32);
-    set_vm86_sp(regs, sp.wrapping_add(2));
-    val
-}
 
 /// VM86 monitor — called from GP fault handler when EFLAGS.VM=1.
 /// Arch boundary swaps VIF↔IF, so IF is the virtual interrupt flag throughout.
@@ -1499,7 +433,7 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         // INSB (0x6C) — IN byte from port DX to ES:DI, advance DI
         0x6C => {
             let port = regs.rdx as u16;
-            let val = emulate_inb(dos, port);
+            let val = emulate_inb(&mut dos.pc, port);
             write_u16(regs.es as u32, regs.rdi as u32, val as u16);
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rdi = regs.rdi.wrapping_sub(1); // DF=1
@@ -1511,8 +445,8 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         // INSW (0x6D) — IN word from port DX to ES:DI, advance DI
         0x6D => {
             let port = regs.rdx as u16;
-            let lo = emulate_inb(dos, port);
-            let hi = emulate_inb(dos, port + 1);
+            let lo = emulate_inb(&mut dos.pc, port);
+            let hi = emulate_inb(&mut dos.pc, port + 1);
             let val = (hi as u16) << 8 | lo as u16;
             write_u16(regs.es as u32, regs.rdi as u32, val);
             if vm86_flags(regs) & (1 << 10) != 0 {
@@ -1526,7 +460,7 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         0x6E => {
             let port = regs.rdx as u16;
             let val = read_u16(regs.ds as u32, regs.rsi as u32) as u8;
-            emulate_outb(dos, port, val);
+            emulate_outb(&mut dos.pc, port, val);
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(1);
             } else {
@@ -1538,8 +472,8 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         0x6F => {
             let port = regs.rdx as u16;
             let val = read_u16(regs.ds as u32, regs.rsi as u32);
-            emulate_outb(dos, port, val as u8);
-            emulate_outb(dos, port + 1, (val >> 8) as u8);
+            emulate_outb(&mut dos.pc, port, val as u8);
+            emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
             if vm86_flags(regs) & (1 << 10) != 0 {
                 regs.rsi = regs.rsi.wrapping_sub(2);
             } else {
@@ -1550,59 +484,59 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         // IN AL, imm8 (0xE4)
         0xE4 => {
             let port = fetch_byte(regs) as u16;
-            let val = emulate_inb(dos, port);
+            let val = emulate_inb(&mut dos.pc, port);
             regs.rax = (regs.rax & !0xFF) | val as u64;
             thread::KernelAction::Done
         }
         // IN AX, imm8 (0xE5)
         0xE5 => {
             let port = fetch_byte(regs) as u16;
-            let lo = emulate_inb(dos, port);
-            let hi = emulate_inb(dos, port + 1);
+            let lo = emulate_inb(&mut dos.pc, port);
+            let hi = emulate_inb(&mut dos.pc, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | (hi as u64) << 8 | lo as u64;
             thread::KernelAction::Done
         }
         // OUT imm8, AL (0xE6)
         0xE6 => {
             let port = fetch_byte(regs) as u16;
-            emulate_outb(dos, port, regs.rax as u8);
+            emulate_outb(&mut dos.pc, port, regs.rax as u8);
             thread::KernelAction::Done
         }
         // OUT imm8, AX (0xE7)
         0xE7 => {
             let port = fetch_byte(regs) as u16;
             let val = regs.rax as u16;
-            emulate_outb(dos, port, val as u8);
-            emulate_outb(dos, port + 1, (val >> 8) as u8);
+            emulate_outb(&mut dos.pc, port, val as u8);
+            emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
             thread::KernelAction::Done
         }
         // IN AL, DX (0xEC)
         0xEC => {
             let port = regs.rdx as u16;
-            let val = emulate_inb(dos, port);
+            let val = emulate_inb(&mut dos.pc, port);
             regs.rax = (regs.rax & !0xFF) | val as u64;
             thread::KernelAction::Done
         }
         // IN AX, DX (0xED)
         0xED => {
             let port = regs.rdx as u16;
-            let lo = emulate_inb(dos, port);
-            let hi = emulate_inb(dos, port + 1);
+            let lo = emulate_inb(&mut dos.pc, port);
+            let hi = emulate_inb(&mut dos.pc, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | (hi as u64) << 8 | lo as u64;
             thread::KernelAction::Done
         }
         // OUT DX, AL (0xEE)
         0xEE => {
             let port = regs.rdx as u16;
-            emulate_outb(dos, port, regs.rax as u8);
+            emulate_outb(&mut dos.pc, port, regs.rax as u8);
             thread::KernelAction::Done
         }
         // OUT DX, AX (0xEF)
         0xEF => {
             let port = regs.rdx as u16;
             let val = regs.rax as u16;
-            emulate_outb(dos, port, val as u8);
-            emulate_outb(dos, port + 1, (val >> 8) as u8);
+            emulate_outb(&mut dos.pc, port, val as u8);
+            emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
             thread::KernelAction::Done
         }
         // 0x66 prefix — operand-size override (32-bit in VM86 16-bit mode)
@@ -1635,10 +569,10 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
                 // IN EAX, imm8
                 0xE5 => {
                     let port = fetch_byte(regs) as u16;
-                    let b0 = emulate_inb(dos, port);
-                    let b1 = emulate_inb(dos, port + 1);
-                    let b2 = emulate_inb(dos, port + 2);
-                    let b3 = emulate_inb(dos, port + 3);
+                    let b0 = emulate_inb(&mut dos.pc, port);
+                    let b1 = emulate_inb(&mut dos.pc, port + 1);
+                    let b2 = emulate_inb(&mut dos.pc, port + 2);
+                    let b3 = emulate_inb(&mut dos.pc, port + 3);
                     regs.rax = (regs.rax & !0xFFFFFFFF) | (b3 as u64) << 24 | (b2 as u64) << 16 | (b1 as u64) << 8 | b0 as u64;
                     thread::KernelAction::Done
                 }
@@ -1646,19 +580,19 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
                 0xE7 => {
                     let port = fetch_byte(regs) as u16;
                     let val = regs.rax as u32;
-                    emulate_outb(dos, port, val as u8);
-                    emulate_outb(dos, port + 1, (val >> 8) as u8);
-                    emulate_outb(dos, port + 2, (val >> 16) as u8);
-                    emulate_outb(dos, port + 3, (val >> 24) as u8);
+                    emulate_outb(&mut dos.pc, port, val as u8);
+                    emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
+                    emulate_outb(&mut dos.pc, port + 2, (val >> 16) as u8);
+                    emulate_outb(&mut dos.pc, port + 3, (val >> 24) as u8);
                     thread::KernelAction::Done
                 }
                 // IN EAX, DX
                 0xED => {
                     let port = regs.rdx as u16;
-                    let b0 = emulate_inb(dos, port);
-                    let b1 = emulate_inb(dos, port + 1);
-                    let b2 = emulate_inb(dos, port + 2);
-                    let b3 = emulate_inb(dos, port + 3);
+                    let b0 = emulate_inb(&mut dos.pc, port);
+                    let b1 = emulate_inb(&mut dos.pc, port + 1);
+                    let b2 = emulate_inb(&mut dos.pc, port + 2);
+                    let b3 = emulate_inb(&mut dos.pc, port + 3);
                     regs.rax = (regs.rax & !0xFFFFFFFF) | (b3 as u64) << 24 | (b2 as u64) << 16 | (b1 as u64) << 8 | b0 as u64;
                     thread::KernelAction::Done
                 }
@@ -1666,19 +600,19 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
                 0xEF => {
                     let port = regs.rdx as u16;
                     let val = regs.rax as u32;
-                    emulate_outb(dos, port, val as u8);
-                    emulate_outb(dos, port + 1, (val >> 8) as u8);
-                    emulate_outb(dos, port + 2, (val >> 16) as u8);
-                    emulate_outb(dos, port + 3, (val >> 24) as u8);
+                    emulate_outb(&mut dos.pc, port, val as u8);
+                    emulate_outb(&mut dos.pc, port + 1, (val >> 8) as u8);
+                    emulate_outb(&mut dos.pc, port + 2, (val >> 16) as u8);
+                    emulate_outb(&mut dos.pc, port + 3, (val >> 24) as u8);
                     thread::KernelAction::Done
                 }
                 // INSD
                 0x6D => {
                     let port = regs.rdx as u16;
-                    let b0 = emulate_inb(dos, port);
-                    let b1 = emulate_inb(dos, port);
-                    let b2 = emulate_inb(dos, port);
-                    let b3 = emulate_inb(dos, port);
+                    let b0 = emulate_inb(&mut dos.pc, port);
+                    let b1 = emulate_inb(&mut dos.pc, port);
+                    let b2 = emulate_inb(&mut dos.pc, port);
+                    let b3 = emulate_inb(&mut dos.pc, port);
                     let addr = (regs.es as u32) * 16 + (regs.rdi as u16 as u32);
                     unsafe {
                         *(addr as *mut u8) = b0;
@@ -1698,10 +632,10 @@ pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
                     let port = regs.rdx as u16;
                     let addr = (regs.ds as u32) * 16 + (regs.rsi as u16 as u32);
                     unsafe {
-                        emulate_outb(dos, port, *(addr as *const u8));
-                        emulate_outb(dos, port, *((addr + 1) as *const u8));
-                        emulate_outb(dos, port, *((addr + 2) as *const u8));
-                        emulate_outb(dos, port, *((addr + 3) as *const u8));
+                        emulate_outb(&mut dos.pc, port, *(addr as *const u8));
+                        emulate_outb(&mut dos.pc, port, *((addr + 1) as *const u8));
+                        emulate_outb(&mut dos.pc, port, *((addr + 2) as *const u8));
+                        emulate_outb(&mut dos.pc, port, *((addr + 3) as *const u8));
                     }
                     if vm86_flags(regs) & (1 << 10) != 0 {
                         regs.rsi = regs.rsi.wrapping_sub(4);
@@ -1818,8 +752,8 @@ fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelA
         0x13 => int_13h(regs),
         0x20 => {
             // INT 20h — DOS program terminate (equivalent to AH=4Ch with AL=0)
-            if let Some(parent) = dos.vm86.exec_parent.take() {
-                dos.vm86.last_child_exit_status = 0x0000; // type=normal, code=0
+            if let Some(parent) = dos.exec_parent.take() {
+                dos.last_child_exit_status = 0x0000; // type=normal, code=0
                 return exec_return(dos, regs, parent);
             }
             thread::KernelAction::Exit(0)
@@ -1879,7 +813,7 @@ fn synth_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         // Output: AX = 0 on success, errno on failure; CF reflects error.
         0x00 => {
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            let rv = thread::vga_take(&mut dos.vm86.vga, pid);
+            let rv = thread::vga_take(&mut dos.pc.vga, pid);
             regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
             if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
             thread::KernelAction::Done
@@ -2011,7 +945,12 @@ fn dos_putchar(c: u8) {
 
 fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
-    if ah != 0x2C && ah != 0x2A { crate::dbg_println!("D21 {:02X} AX={:04X}", ah, regs.rax as u16); }
+    if ah != 0x2C && ah != 0x2A {
+        crate::dbg_println!("D21 {:02X} AX={:04X} BX={:04X} cs:ip={:04X}:{:04X} heap={:04X} psp={:04X}",
+            ah, regs.rax as u16, regs.rbx as u16,
+            regs.code_seg(), regs.ip32() as u16,
+            dos.heap_seg, dos.current_psp);
+    }
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
@@ -2117,7 +1056,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // AH=0x0C: Flush input buffer then execute function in AL
         0x0C => {
             clear_bios_keyboard_buffer();
-            dos.vm86.dos_pending_char = None;
+            dos.dos_pending_char = None;
             // Just execute the sub-function in AL
             let sub_ah = regs.rax as u8;
             if sub_ah == 0x06 {
@@ -2139,12 +1078,12 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         0x1A => {
             // Store DTA address — NC needs this for FindFirst/FindNext
             let dta = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
-            dos.vm86.dta = dta;
+            dos.dta = dta;
             thread::KernelAction::Done
         }
         // AH=0x2F: Get DTA address (returns ES:BX)
         0x2F => {
-            let dta = dos.vm86.dta;
+            let dta = dos.dta;
             regs.es = (dta >> 4) as u64;
             regs.rbx = (regs.rbx & !0xFFFF) | (dta & 0x0F) as u64;
             thread::KernelAction::Done
@@ -2332,10 +1271,10 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 rlen
             };
             // Store in find state
-            let store_len = res_len.min(dos.vm86.find_path.len());
-            dos.vm86.find_path[..store_len].copy_from_slice(&resolved[..store_len]);
-            dos.vm86.find_path_len = store_len as u8;
-            dos.vm86.find_idx = 0;
+            let store_len = res_len.min(dos.find_path.len());
+            dos.find_path[..store_len].copy_from_slice(&resolved[..store_len]);
+            dos.find_path_len = store_len as u8;
+            dos.find_idx = 0;
             find_matching_file(dos, regs)
         }
         // AH=0x4F: Find next matching file
@@ -2345,9 +1284,9 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // AH=0x4C: Terminate with return code (AL)
         0x4C => {
             // If we're in an EXEC'd child, return to parent
-            if let Some(parent) = dos.vm86.exec_parent.take() {
+            if let Some(parent) = dos.exec_parent.take() {
                 // Termination type 00h (normal) | return code in AL.
-                dos.vm86.last_child_exit_status = (regs.rax as u8) as u16;
+                dos.last_child_exit_status = (regs.rax as u8) as u16;
                 return exec_return(dos, regs, parent);
             }
             let code = regs.rax as u8;
@@ -2361,15 +1300,15 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // remain valid because the IVT is part of the address space and the
         // child's code at heap_seg+offset is still mapped.
         0x31 => {
-            if let Some(parent) = dos.vm86.exec_parent.take() {
+            if let Some(parent) = dos.exec_parent.take() {
                 let keep = regs.rdx as u16;
                 let child_psp_seg = parent.heap_seg;
                 let resident_top = child_psp_seg.saturating_add(keep);
                 // Termination type 03h (TSR) | return code in AL.
-                dos.vm86.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
+                dos.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
                 let action = exec_return(dos, regs, parent);
-                if resident_top > dos.vm86.heap_seg {
-                    dos.vm86.heap_seg = resident_top;
+                if resident_top > dos.heap_seg {
+                    dos.heap_seg = resident_top;
                 }
                 return action;
             }
@@ -2379,10 +1318,10 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
             let need = regs.rbx as u16;
-            let avail = 0xA000u16.saturating_sub(dos.vm86.heap_seg);
+            let avail = 0xA000u16.saturating_sub(dos.heap_seg);
             if need <= avail {
-                let seg = dos.vm86.heap_seg;
-                dos.vm86.heap_seg += need;
+                let seg = dos.heap_seg;
+                dos.heap_seg += need;
                 regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                 regs.clear_flag32(1);
             } else {
@@ -2405,7 +1344,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             if new_end32 <= 0xA000 {
                 let new_end = new_end32 as u16;
                 // Program resizing its block — free memory starts after it
-                dos.vm86.heap_seg = new_end;
+                dos.heap_seg = new_end;
                 regs.clear_flag32(1);
             } else {
                 // Not enough memory — report max available
@@ -2830,7 +1769,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // Returns AL = code passed to AH=4Ch/AH=31h, AH = termination type
         // (00h normal, 01h Ctrl-Break, 02h critical error, 03h TSR).
         0x4D => {
-            let status = dos.vm86.last_child_exit_status;
+            let status = dos.last_child_exit_status;
             regs.rax = (regs.rax & !0xFFFF) | status as u64;
             thread::KernelAction::Done
         }
@@ -2838,18 +1777,18 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // Undocumented in DOS 1-3, documented in 5+. Same backing field as
         // AH=51h/62h. No return value other than the side effect.
         0x50 => {
-            dos.vm86.current_psp = regs.rbx as u16;
+            dos.current_psp = regs.rbx as u16;
             thread::KernelAction::Done
         }
         // AH=0x51: Get Current Process ID (returns BX = current PSP segment)
         // Undocumented sibling of AH=62h.
         0x51 => {
-            regs.rbx = (regs.rbx & !0xFFFF) | dos.vm86.current_psp as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | dos.current_psp as u64;
             thread::KernelAction::Done
         }
         // AH=0x62: Get PSP segment (returns BX=PSP segment)
         0x62 => {
-            regs.rbx = (regs.rbx & !0xFFFF) | dos.vm86.current_psp as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | dos.current_psp as u64;
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -3026,11 +1965,10 @@ fn int_2fh(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 
 /// Ensure XMS state exists for current thread, return mutable reference
 fn xms_state(dos: &mut thread::DosState) -> &mut XmsState {
-    let vm86 = &mut dos.vm86;
-    if vm86.xms.is_none() {
-        vm86.xms = Some(alloc::boxed::Box::new(XmsState::new()));
+    if dos.xms.is_none() {
+        dos.xms = Some(alloc::boxed::Box::new(XmsState::new()));
     }
-    vm86.xms.as_deref_mut().unwrap()
+    dos.xms.as_deref_mut().unwrap()
 }
 
 fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
@@ -3046,9 +1984,8 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x03 => {
             let xms = xms_state(dos);
             xms.a20_global += 1;
-            let vm86 = &mut dos.vm86;
-            crate::kernel::startup::arch_set_a20(true, &mut vm86.hma_pages);
-            vm86.a20_enabled = true;
+            crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
+            dos.pc.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
             regs.rbx = (regs.rbx & !0xFFFF); // BL=0 no error
         }
@@ -3056,10 +1993,10 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x04 => {
             let xms = xms_state(dos);
             xms.a20_global = xms.a20_global.saturating_sub(1);
-            if xms.a20_global == 0 && xms.a20_local == 0 {
-                let vm86 = &mut dos.vm86;
-                crate::kernel::startup::arch_set_a20(false, &mut vm86.hma_pages);
-                vm86.a20_enabled = false;
+            let both_zero = xms.a20_global == 0 && xms.a20_local == 0;
+            if both_zero {
+                crate::kernel::startup::arch_set_a20(false, &mut dos.pc.hma_pages);
+                dos.pc.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
@@ -3068,9 +2005,8 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x05 => {
             let xms = xms_state(dos);
             xms.a20_local += 1;
-            let vm86 = &mut dos.vm86;
-            crate::kernel::startup::arch_set_a20(true, &mut vm86.hma_pages);
-            vm86.a20_enabled = true;
+            crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
+            dos.pc.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
@@ -3078,17 +2014,17 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x06 => {
             let xms = xms_state(dos);
             xms.a20_local = xms.a20_local.saturating_sub(1);
-            if xms.a20_local == 0 && xms.a20_global == 0 {
-                let vm86 = &mut dos.vm86;
-                crate::kernel::startup::arch_set_a20(false, &mut vm86.hma_pages);
-                vm86.a20_enabled = false;
+            let both_zero = xms.a20_local == 0 && xms.a20_global == 0;
+            if both_zero {
+                crate::kernel::startup::arch_set_a20(false, &mut dos.pc.hma_pages);
+                dos.pc.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = (regs.rbx & !0xFFFF);
         }
         // AH=07h — Query A20 state
         0x07 => {
-            let enabled = dos.vm86.a20_enabled;
+            let enabled = dos.pc.a20_enabled;
             regs.rax = (regs.rax & !0xFFFF) | if enabled { 1 } else { 0 };
             regs.rbx = (regs.rbx & !0xFFFF);
         }
@@ -3371,11 +2307,10 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
 
 /// Ensure EMS state exists for current thread
 fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
-    let vm86 = &mut dos.vm86;
-    if vm86.ems.is_none() {
-        vm86.ems = Some(alloc::boxed::Box::new(EmsState::new()));
+    if dos.ems.is_none() {
+        dos.ems = Some(alloc::boxed::Box::new(EmsState::new()));
     }
-    vm86.ems.as_deref_mut().unwrap()
+    dos.ems.as_deref_mut().unwrap()
 }
 
 fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
@@ -3887,7 +2822,9 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     crate::kernel::vfs::close(fd, &mut dos.fds);
 
     let is_exe = is_mz_exe(&buf);
-    let child_seg = dos.vm86.heap_seg;
+    let child_seg = dos.heap_seg;
+    crate::dbg_println!("  exec_program: {:?} size={} exe={} child_seg={:04X} parent_psp={:04X}",
+        core::str::from_utf8(prog_name), size, is_exe, child_seg, dos.current_psp);
 
     let mut resolved_copy = [0u8; 164];
     let resolved_name = dos_resolve_path(dos, prog_name, &mut resolved_copy);
@@ -3926,12 +2863,12 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     // Save parent state. Parent's INT frame (IP/CS/FLAGS) is on the VM86
     // stack at current SS:SP. exec_return restores SS:SP so stub_dispatch
     // pops the frame and resumes the parent.
-    let prev = dos.vm86.exec_parent.take();
-    let parent_psp = dos.vm86.current_psp;
-    dos.vm86.heap_seg = end_seg.max(dos.vm86.heap_seg);
-    dos.vm86.dta = (child_seg as u32) * 16 + 0x80;
-    dos.vm86.current_psp = child_seg;
-    dos.vm86.exec_parent = Some(ExecParent {
+    let prev = dos.exec_parent.take();
+    let parent_psp = dos.current_psp;
+    dos.heap_seg = end_seg.max(dos.heap_seg);
+    dos.dta = (child_seg as u32) * 16 + 0x80;
+    dos.current_psp = child_seg;
+    dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
         ds: regs.ds as u16,
@@ -3952,6 +2889,8 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     regs.ds = child_seg as u64;
     regs.es = child_seg as u64;
     regs.clear_flag32(1);
+    crate::dbg_println!("  exec_program loaded: cs:ip={:04X}:{:04X} ss:sp={:04X}:{:04X} end_seg={:04X} heap_seg={:04X}",
+        cs, ip, ss, sp, end_seg, dos.heap_seg);
     thread::KernelAction::Done
 }
 
@@ -3988,14 +2927,18 @@ fn load_com_child(data: &[u8], child_seg: u16) -> (u16, u16, u16, u16) {
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
 fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) -> thread::KernelAction {
+    crate::dbg_println!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X}",
+        dos.heap_seg, parent.heap_seg,
+        dos.current_psp, parent.psp,
+        parent.ss, parent.sp);
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
     regs.clear_flag32(1);
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
-    dos.vm86.heap_seg = parent.heap_seg;
-    dos.vm86.current_psp = parent.psp;
-    dos.vm86.exec_parent = parent.prev.map(|b| *b);
+    dos.heap_seg = parent.heap_seg;
+    dos.current_psp = parent.psp;
+    dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }
 
@@ -4148,15 +3091,15 @@ fn dos_normalize_path(buf: &mut [u8], len: usize) -> usize {
     len
 }
 
-/// FindFirst/FindNext helper: resume search from dos.vm86.find_idx,
+/// FindFirst/FindNext helper: resume search from dos.find_idx,
 /// updating it in place. Directory and pattern come from find_path.
 fn find_matching_file(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     // Split find_path into directory and pattern components.
     // find_path is an absolute VFS path like "DN/DN*.SWP" or "*.*".
     // The directory part includes any trailing slash; the pattern is
     // the basename (filespec with wildcards).
-    let path_len = dos.vm86.find_path_len as usize;
-    let full = &dos.vm86.find_path[..path_len];
+    let path_len = dos.find_path_len as usize;
+    let full = &dos.find_path[..path_len];
     let split = full.iter().rposition(|&b| b == b'/').map(|i| i + 1).unwrap_or(0);
     let dir_buf = {
         let mut b = [0u8; 96];
@@ -4172,7 +3115,7 @@ fn find_matching_file(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
     let dir = &dir_buf.0[..dir_buf.1];
     let pat = &pat_buf.0[..pat_buf.1];
 
-    let mut idx = dos.vm86.find_idx as usize;
+    let mut idx = dos.find_idx as usize;
 
     loop {
         match crate::kernel::vfs::readdir(dir, idx) {
@@ -4180,9 +3123,9 @@ fn find_matching_file(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
                 idx += 1;
                 let name = &entry.name[..entry.name_len];
                 if dos_wildcard_match(pat, name) {
-                    dos.vm86.find_idx = idx as u16;
-                    // Fill DTA at dos.vm86.dta
-                    let dta = dos.vm86.dta;
+                    dos.find_idx = idx as u16;
+                    // Fill DTA at dos.dta
+                    let dta = dos.dta;
                     // DTA layout (43 bytes):
                     //   0x00-0x14: reserved (unused by us — state lives in DosState)
                     //   0x15: attribute of matched file
@@ -4588,6 +3531,20 @@ fn load_exe_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data:
             load_base as *mut u8,
             load_size,
         );
+    }
+
+    // Zero BSS from end of load module up to end_seg. Real DOS doesn't do
+    // this, but in-process EXEC reuses the same physical pages across
+    // invocations, so leaving leftover data in BSS makes CRT startup
+    // non-deterministic when it reads a pointer/flag from BSS before
+    // clearing it. Seen with DN.PRG after ~6 iterations: a wild far jump
+    // into stale memory because its Borland CRT skipped a re-init step.
+    let bss_start = load_base + load_size as u32;
+    let bss_end = (end_seg as u32) << 4;
+    if bss_end > bss_start {
+        unsafe {
+            core::ptr::write_bytes(bss_start as *mut u8, 0, (bss_end - bss_start) as usize);
+        }
     }
 
     // Apply relocations: each entry is (offset, segment) within the load module.

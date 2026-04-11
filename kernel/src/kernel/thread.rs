@@ -51,9 +51,36 @@ pub enum ThreadState {
     Zombie,
 }
 
-/// DOS-specific thread state: virtual hardware + optional DPMI protected mode
+/// DOS-specific thread state: virtual hardware machine + DOS personality + optional DPMI.
+///
+/// Split into three logical groups:
+///   - `pc`: PC machine virtualization (policy-free peripherals — vpic/vpit/vkbd/vga,
+///     A20 gate, HMA pages, skip_irq latch, e0 scancode-prefix latch). Shared by
+///     both the DOS personality and DPMI.
+///   - DOS personality fields (flattened): PSP tracking, DTA, heap/free segment,
+///     XMS/EMS state, FindFirst/FindNext state, exec-parent chain.
+///   - `dpmi`: optional DPMI protected-mode state (LDT, memory blocks, callbacks).
 pub struct DosState {
-    pub vm86: crate::kernel::vm86::Vm86State,
+    /// Policy-free PC machine state: virtual 8259 PIC, 8253 PIT, PS/2 keyboard,
+    /// VGA register set, A20 gate, HMA page tracking.
+    pub pc: crate::kernel::machine::PcMachine,
+
+    // ── DOS personality fields ────────────────────────────────────────
+    pub dta: u32,
+    pub heap_seg: u16,
+    /// Current PSP segment as seen by INT 21h/AH=50h (set), 51h (get), 62h (get).
+    pub current_psp: u16,
+    pub dos_pending_char: Option<u8>,
+    /// Last child termination status (INT 21h/AH=4Dh): AL = code, AH = type.
+    pub last_child_exit_status: u16,
+    pub exec_parent: Option<crate::kernel::dos::ExecParent>,
+    pub xms: Option<alloc::boxed::Box<crate::kernel::dos::XmsState>>,
+    pub ems: Option<alloc::boxed::Box<crate::kernel::dos::EmsState>>,
+    /// FindFirst/FindNext search state (per-thread, one active enumeration).
+    pub find_path: [u8; 96],
+    pub find_path_len: u8,
+    pub find_idx: u16,
+
     pub dpmi: Option<alloc::boxed::Box<crate::kernel::dpmi::DpmiState>>,
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
@@ -65,7 +92,18 @@ pub struct DosState {
 impl DosState {
     pub fn new() -> Self {
         DosState {
-            vm86: crate::kernel::vm86::Vm86State::new(),
+            pc: crate::kernel::machine::PcMachine::new(),
+            dta: 0,
+            heap_seg: 0xA000,
+            current_psp: crate::kernel::dos::COM_SEGMENT,
+            dos_pending_char: None,
+            last_child_exit_status: 0,
+            exec_parent: None,
+            xms: None,
+            ems: None,
+            find_path: [0; 96],
+            find_path_len: 0,
+            find_idx: 0,
             dpmi: None,
             num_fds: 0,
             fds: [-1; MAX_FDS],
@@ -85,7 +123,7 @@ impl DosState {
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
     pub fn process_key(&mut self, scancode: u8) {
-        crate::kernel::vm86::queue_irq(self, crate::arch::Irq::Key(scancode));
+        crate::kernel::machine::queue_irq(&mut self.pc, crate::arch::Irq::Key(scancode));
     }
 }
 
@@ -317,6 +355,27 @@ pub struct Thread {
     pub cpu_state: Regs,
     pub exit_code: i32,
     pub addr_hash: u64,    // Debug: address space hash for corruption detection
+    pub cpu_hash: u64,     // Debug: FNV hash of cpu_state, verified on switch-in
+}
+
+/// FNV-1a hash of a Regs struct (raw byte view).
+/// Used to detect whether a saved thread's CPU state is modified while
+/// the thread is not running.
+pub fn hash_regs(r: &Regs) -> u64 {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(r as *const _ as *const u8, core::mem::size_of::<Regs>())
+    };
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Recompute a thread's cpu_hash after an out-of-band modification to cpu_state.
+pub fn refresh_cpu_hash(t: &mut Thread) {
+    t.cpu_hash = hash_regs(&t.cpu_state);
 }
 
 impl Thread {
@@ -333,6 +392,7 @@ impl Thread {
             cpu_state: Regs::empty(),
             exit_code: 0,
             addr_hash: 0,
+            cpu_hash: 0,
         }
     }
 
@@ -425,6 +485,7 @@ pub fn create_thread(parent_tid: Option<usize>, root: crate::RootPageTable, is_p
                 t.cpu_state = Regs::empty();
                 t.exit_code = 0;
                 t.addr_hash = 0;
+                t.cpu_hash = 0;
                 return Some(t);
             }
         }
@@ -445,11 +506,8 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
 /// Initialize a thread for VM86 mode (.COM execution)
 /// cs/ip/ss/sp are real-mode segment:offset values
 pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
+    use crate::kernel::machine::{VM_FLAG, IF_FLAG, VIF_FLAG};
     thread.mode = ThreadMode::Dos(DosState::new());
-
-    const VM_FLAG: u32 = 1 << 17;  // VM86 mode
-    const IF_FLAG: u32 = 1 << 9;   // Interrupt enable
-    const VIF_FLAG: u32 = 1 << 19; // Virtual interrupts enabled by default (hardware VIF)
 
     let state = &mut thread.cpu_state;
     *state = Regs::empty();
@@ -499,10 +557,11 @@ pub fn cancel_parent_wait(child_tid: usize) {
         if parent.state != ThreadState::Blocked { return; }
         parent.state = ThreadState::Ready;
         if let ThreadMode::Dos(dos) = &mut parent.mode {
-            dos.vm86.last_child_exit_status = 0;
+            dos.last_child_exit_status = 0;
         }
         // Signal decoupled to parent's synth fork_exec_wait: AX = 1 (status=decoupled).
         parent.cpu_state.rax = (parent.cpu_state.rax & !0xFFFF) | 0x0001;
+        refresh_cpu_hash(parent);
     }
 }
 
@@ -619,13 +678,13 @@ pub fn schedule(current_tid: usize) -> Option<usize> {
 /// Take target thread's saved VGA state (swap, no data copy) and restore to hardware.
 /// `dst` is the running caller's VGA state; the caller adopts target's screen.
 /// Returns 0 on success, negative errno on failure.
-pub fn vga_take(dst: &mut crate::kernel::vm86::VgaState, target_tid: i32) -> i32 {
+pub fn vga_take(dst: &mut crate::kernel::machine::VgaState, target_tid: i32) -> i32 {
     if target_tid < 0 || (target_tid as usize) >= MAX_THREADS { return -22; } // EINVAL
     unsafe {
         let target = &mut *(&raw mut THREADS[target_tid as usize]);
         if target.state == ThreadState::Unused { return -3; } // ESRCH
         let src = match &mut target.mode {
-            ThreadMode::Dos(d) => &mut d.vm86.vga,
+            ThreadMode::Dos(d) => &mut d.pc.vga,
             _ => return -22, // target not DOS
         };
         if src.planes.is_empty() { return -61; }
@@ -680,17 +739,17 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                 // upcoming arch_user_clean tears down user pages. Each thread
                 // saves its own vga here; the normal switch-save would see
                 // unmapped memory and capture garbage.
-                dos.vm86.vga.save_from_hardware();
+                dos.pc.vga.save_from_hardware();
                 crate::kernel::vfs::close_all_fds(&mut dos.fds);
                 dos.symbols = None;
-                if let Some(ref mut ems) = dos.vm86.ems {
+                if let Some(ref mut ems) = dos.ems {
                     ems.free_all_pages();
                 }
-                dos.vm86.ems = None;
-                dos.vm86.xms = None;
-                if !dos.vm86.a20_enabled {
-                    crate::kernel::startup::arch_set_a20(true, &mut dos.vm86.hma_pages);
-                    dos.vm86.a20_enabled = true;
+                dos.ems = None;
+                dos.xms = None;
+                if !dos.pc.a20_enabled {
+                    crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
+                    dos.pc.a20_enabled = true;
                 }
             }
             ThreadMode::Linux(linux) => {
@@ -722,10 +781,11 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
             if was_waiting {
                 parent.state = ThreadState::Ready;
                 parent.cpu_state.rax = parent.cpu_state.rax & !0xFFFF;
+                refresh_cpu_hash(parent);
             }
             if let ThreadMode::Dos(dos) = &mut parent.mode {
                 // Termination type 00h (normal) | exit code in AL.
-                dos.vm86.last_child_exit_status = (exit_code as u8) as u16;
+                dos.last_child_exit_status = (exit_code as u8) as u16;
             }
         }
 

@@ -18,8 +18,6 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 /// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
 pub fn startup() -> ! {
-    use crate::kernel::vm86;
-
     crate::kernel::thread::init_threading();
 
     // Reset ATA controller (needed when booted via GRUB)
@@ -75,9 +73,7 @@ pub fn startup() -> ! {
     let console_pipe = crate::kernel::kpipe::alloc().expect("Failed to allocate console pipe");
     crate::kernel::thread::set_console_pipe(console_pipe);
 
-    // DN.COM path depends on where TAR is mounted
     let dn_path: &[u8] = if has_ext4 { b"tar/DN/DN.COM" } else { b"DN/DN.COM" };
-
     loop {
         println!("Starting DN...");
         run_dos_program(dn_path, b"");
@@ -88,7 +84,7 @@ pub fn startup() -> ! {
 /// event loop until it exits. `cmdline_tail` is written to PSP:0080h (without
 /// the length byte or terminator; those are added automatically).
 fn run_dos_program(path: &[u8], cmdline_tail: &[u8]) {
-    use crate::kernel::vm86;
+    use crate::kernel::dos;
 
     // Read binary via handle-based VFS access (no per-thread fd needed).
     let handle = vfs::open_to_handle(path);
@@ -105,22 +101,22 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8]) {
     // Set up VM86 address space in the current (boot) page tables.
     // The thread's root stays empty — event_loop captures it on first switch-away.
     arch_map_low_mem();
-    vm86::setup_ivt();
-    let is_exe = vm86::is_mz_exe(&buf);
+    dos::setup_ivt();
+    let is_exe = dos::is_mz_exe(&buf);
     let (cs, ip, ss, sp, end_seg) = if is_exe {
-        vm86::load_exe(&buf, path).expect("load_exe failed")
+        dos::load_exe(&buf, path).expect("load_exe failed")
     } else {
-        vm86::load_com(&buf, path)
+        dos::load_com(&buf, path)
     };
 
-    thread::init_process_thread_vm86(t, vm86::COM_SEGMENT, cs, ip, ss, sp);
-    let dos = t.dos_mut();
-    dos.vm86.heap_seg = end_seg;
-    dos.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
-    dos.cwd_len = 0;
+    thread::init_process_thread_vm86(t, dos::COM_SEGMENT, cs, ip, ss, sp);
+    let dos_state = t.dos_mut();
+    dos_state.heap_seg = end_seg;
+    dos_state.dta = (dos::COM_SEGMENT as u32) * 16 + 0x80;
+    dos_state.cwd_len = 0;
 
     // Write command tail to PSP at 0x80: [len][bytes][0x0D].
-    let psp_base = (vm86::COM_SEGMENT as u32) << 4;
+    let psp_base = (dos::COM_SEGMENT as u32) << 4;
     let tail_len = cmdline_tail.len().min(126);
     unsafe {
         let psp = psp_base as *mut u8;
@@ -139,7 +135,37 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8]) {
     event_loop(tid);
 }
 
-const ASSERT_ADDR_HASH: bool = false;
+const ASSERT_ADDR_HASH: bool = true;
+
+/// Verify that a thread's saved cpu_state still matches the hash recorded on
+/// the last switch-out. Print a diff-style dump on mismatch.
+/// `tag` is printed in the header ("switch-in" / "reblock" / ...).
+fn verify_cpu_hash(t: &thread::Thread, tag: &str) {
+    if t.cpu_hash == 0 { return; } // not yet tracked
+    let actual = thread::hash_regs(&t.cpu_state);
+    if actual == t.cpu_hash { return; }
+    crate::println!(
+        "\x1b[91mCPU STATE CORRUPTION [{}] tid={} expected={:#018x} actual={:#018x}\x1b[0m",
+        tag, t.tid, t.cpu_hash, actual,
+    );
+    let r = &t.cpu_state;
+    crate::println!(
+        "  cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x} flags={:08x}",
+        r.code_seg(), r.ip32(), r.stack_seg(), r.sp32(), r.flags32(),
+    );
+    crate::println!(
+        "  ds={:04x} es={:04x} fs={:04x} gs={:04x}",
+        r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16,
+    );
+    crate::println!(
+        "  eax={:08x} ebx={:08x} ecx={:08x} edx={:08x}",
+        r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32,
+    );
+    crate::println!(
+        "  esi={:08x} edi={:08x} ebp={:08x} int={:02x} err={:08x}",
+        r.rsi as u32, r.rdi as u32, r.rbp as u32, r.int_num as u32, r.err_code as u32,
+    );
+}
 
 /// Ring-1 kernel event loop. Returns when no threads remain.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
@@ -167,12 +193,14 @@ fn event_loop(first_tid: usize) {
                         }
                         let ticks = crate::arch::take_pending_ticks();
                         for _ in 0..ticks {
-                            crate::kernel::vm86::queue_irq(dos, crate::arch::Irq::Tick);
+                            crate::kernel::machine::queue_irq(&mut dos.pc, crate::arch::Irq::Tick);
                         }
                         let dp = dos as *mut thread::DosState;
                         crate::arch::drain(|evt| {
                             if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
                                 thread::request_switch();
+                            } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
+                                dump_interrupted_thread(regs, Some(unsafe { &*dp }));
                             } else if is_blocked {
                                 // DOS parent is blocked waiting for child — route keys
                                 // to console pipe so Linux children can read stdin
@@ -191,12 +219,12 @@ fn event_loop(first_tid: usize) {
                                 if let crate::arch::Irq::Key(sc) = evt {
                                     unsafe { (*dp).process_key(sc); }
                                 } else {
-                                    crate::kernel::vm86::queue_irq(unsafe { &mut *dp }, evt);
+                                    crate::kernel::machine::queue_irq(unsafe { &mut (*dp).pc }, evt);
                                 }
                             }
                         });
                         if !is_blocked {
-                            crate::kernel::vm86::raise_pending(unsafe { &mut *dp }, regs);
+                            crate::kernel::machine::raise_pending(unsafe { &mut *dp }, regs);
                         }
                     }
                 }
@@ -206,6 +234,8 @@ fn event_loop(first_tid: usize) {
                         if let crate::arch::Irq::Key(sc) = evt {
                             if sc == F11_PRESS {
                                 thread::request_switch();
+                            } else if sc == F12_PRESS {
+                                dump_interrupted_thread(regs, None);
                             } else {
                                 unsafe { (*lp).process_key(sc); }
                             }
@@ -230,8 +260,10 @@ fn event_loop(first_tid: usize) {
                         if next == 0 { return; }
                         if next != tid {
                             let (old, new) = thread::get_two_threads(tid, next);
+                            verify_cpu_hash(new, "reblock switch-in");
                             arch_switch_to(&mut new.cpu_state, &mut new.root, core::ptr::null_mut());
                             old.cpu_state = unsafe { *(&raw const REGS) };
+                            old.cpu_hash = thread::hash_regs(&old.cpu_state);
                             tid = next;
                         }
                     }
@@ -268,7 +300,7 @@ fn event_loop(first_tid: usize) {
                 thread::ThreadMode::Dos(dos) => {
                     if regs.mode() == crate::UserMode::VM86 {
                         match event {
-                            13 => crate::kernel::vm86::vm86_monitor(dos, regs),
+                            13 => crate::kernel::dos::vm86_monitor(dos, regs),
                             _ => {
                                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                                 let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
@@ -351,8 +383,9 @@ fn event_loop(first_tid: usize) {
                 let new_dos = new.is_dos();
                 if old_dos {
                     let dos = old.dos_mut();
-                    dos.vm86.vga.save_from_hardware();
+                    dos.pc.vga.save_from_hardware();
                 }
+                verify_cpu_hash(new, "switch-in");
                 let mut swap_regs = new.cpu_state;
                 let mut swap_root = new.root;
                 if ASSERT_ADDR_HASH {
@@ -364,9 +397,10 @@ fn event_loop(first_tid: usize) {
                 }
                 old.cpu_state = swap_regs;
                 old.root = swap_root;
+                old.cpu_hash = thread::hash_regs(&old.cpu_state);
                 if new_dos {
                     let dos = new.dos_mut();
-                    dos.vm86.vga.restore_to_hardware();
+                    dos.pc.vga.restore_to_hardware();
                 }
                 tid = new_tid;
                 // Reload LDT if switching to a DPMI thread, TLS if switching to a Linux thread
@@ -402,7 +436,7 @@ fn handle_fork_exec(
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
 ) -> Option<usize> {
-    use crate::kernel::vm86;
+    use crate::kernel::dos;
 
     // Open file via handle-based VFS (no per-thread fd slot needed)
     let parent = thread::get_thread(parent_tid).expect("fork_exec: invalid parent");
@@ -421,7 +455,7 @@ fn handle_fork_exec(
     vfs::close_vfs_handle(handle);
 
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
-    let is_exe = !is_elf && vm86::is_mz_exe(&buf);
+    let is_exe = !is_elf && dos::is_mz_exe(&buf);
     crate::dbg_println!("handle_fork_exec: {:?} size={} elf={} exe={}", core::str::from_utf8(path), size, is_elf, is_exe);
     // Anything that isn't ELF or MZ is treated as a flat .COM image.
     // COMMAND.COM is responsible for never sending us non-executables (.BAT, etc).
@@ -485,10 +519,10 @@ fn handle_fork_exec(
     } else {
         arch_user_clean();
         arch_map_low_mem();
-        vm86::setup_ivt();
+        dos::setup_ivt();
 
         let (cs, ip, ss, sp, end_seg) = if is_exe {
-            match vm86::load_exe(&buf, path) {
+            match dos::load_exe(&buf, path) {
                 Some(t) => t,
                 None => {
                     arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut());
@@ -498,19 +532,19 @@ fn handle_fork_exec(
                 }
             }
         } else {
-            vm86::load_com(&buf, path)
+            dos::load_com(&buf, path)
         };
 
         arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut());
 
-        thread::init_process_thread_vm86(child, vm86::COM_SEGMENT, cs, ip, ss, sp);
-        let dos = child.dos_mut();
-        dos.vm86.heap_seg = end_seg;
-        dos.vm86.dta = (vm86::COM_SEGMENT as u32) * 16 + 0x80;
+        thread::init_process_thread_vm86(child, dos::COM_SEGMENT, cs, ip, ss, sp);
+        let dos_state = child.dos_mut();
+        dos_state.heap_seg = end_seg;
+        dos_state.dta = (dos::COM_SEGMENT as u32) * 16 + 0x80;
         // Snapshot parent's current VGA hardware state into child so it
         // starts with the parent's screen (invariant: suspended thread's
         // VGA state is materialized in memory).
-        dos.vm86.vga.save_from_hardware();
+        dos_state.pc.vga.save_from_hardware();
         // Seed child's BDA cursor from CRTC hardware cursor so DOS/BIOS
         // output starts at the correct position (DN sets CRTC cursor via
         // INT 10h AH=02h but writes chars directly to B8000).
@@ -543,6 +577,76 @@ fn handle_fork_exec(
 
 /// F11 scancode (press)
 const F11_PRESS: u8 = 0x57;
+
+/// F12 scancode (press) — debug dump hotkey
+const F12_PRESS: u8 = 0x58;
+
+/// F12 handler: dump the user thread state that was interrupted when F12 was
+/// pressed. `regs` is always a user frame — the kernel event loop is never
+/// interrupted by hardware IRQs.
+/// - VM86: print guest CS:IP, common registers, BIOS timer, code bytes, and
+///   the 80x25 VGA text buffer (for diagnosing hung DOS programs).
+/// - PM: Rust stack trace via frame-pointer walking through user symbols.
+/// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
+/// stuck IRQ delivery (e.g. vpic.isr never cleared by a missed EOI).
+fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
+    let vm86 = regs.flags32() & (1 << 17) != 0;
+    if vm86 {
+        let vif = regs.flags32() & (1 << 9) != 0;
+        let lin = (regs.cs32() << 4) + regs.ip32();
+        let b = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+        let ticks = unsafe { *(0x46Cu32 as *const u32) };
+        crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} IF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            regs.code_seg(), regs.ip32(),
+            regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+            regs.ds as u16, regs.stack_seg(), regs.sp32(),
+            regs.flags32() as u16, vif as u8, ticks,
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+        if let Some(d) = dos { dump_virtual_hw(d); }
+        // Dump VGA text buffer (80x25, char+attr interleaved at 0xB8000)
+        let vga = unsafe { core::slice::from_raw_parts(0xB8000 as *const u8, 4000) };
+        for row in 0..25 {
+            let mut line = [b'.'; 80];
+            for col in 0..80 {
+                let ch = vga[(row * 80 + col) * 2];
+                line[col] = if ch >= 0x20 && ch < 0x7F { ch } else { b'.' };
+            }
+            crate::dbg_println!("[VGA {:02}] {}", row,
+                core::str::from_utf8(&line).unwrap_or("???"));
+        }
+    } else {
+        let fl = regs.flags32();
+        crate::dbg_println!("[DBG] PM EIP={:#010x} EFLAGS={:#010x} IF={}",
+            regs.ip32(), fl, (fl >> 9) & 1);
+        if let Some(d) = dos { dump_virtual_hw(d); }
+        crate::kernel::stacktrace::stack_trace_regs(regs);
+    }
+}
+
+/// Print virtual PIC/PIT state — the actual IRQ-delivery gating lives here,
+/// so hangs that look like "timer stopped" almost always show up as a stuck
+/// vpic.isr bit (any bit blocks all deliveries in raise_pending).
+fn dump_virtual_hw(dos: &thread::DosState) {
+    let vpic = &dos.pc.vpic;
+    let (q, n) = vpic.debug_queue();
+    let mut pending = [0u8; 32];
+    let mut plen = 0;
+    for i in 0..n.min(8) {
+        let hi = q[i] >> 4;
+        let lo = q[i] & 0xF;
+        pending[plen] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 }; plen += 1;
+        pending[plen] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 }; plen += 1;
+        if i + 1 < n { pending[plen] = b','; plen += 1; }
+    }
+    let pending_str = core::str::from_utf8(&pending[..plen]).unwrap_or("?");
+    crate::dbg_println!("[DBG] vpic isr={:#04x} imr={:#04x} pending=[{}] ({}),",
+        vpic.isr, vpic.imr, pending_str, n);
+
+    let (en, mode, reload, now, next) = dos.pc.vpit.debug_state();
+    let delta = (next as i64).wrapping_sub(now as i64);
+    crate::dbg_println!("[DBG] vpit ch0 en={} mode={} reload={} now={} next={} (next-now={})",
+        en, mode, reload, now, next, delta);
+}
 
 /// QEMU VGA bug workaround: real VGA hardware forces Odd/Even read mode
 /// (GC5 bit 4) in text modes. QEMU doesn't, so re-set it on each trap.
@@ -662,7 +766,7 @@ pub fn arch_free_phys_page(phys: u64) {
 
 
 /// Toggle A20 gate for VM86 mode.
-pub fn arch_set_a20(enabled: bool, hma: &mut [u64; crate::kernel::vm86::HMA_PAGE_COUNT]) {
+pub fn arch_set_a20(enabled: bool, hma: &mut [u64; crate::kernel::machine::HMA_PAGE_COUNT]) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -738,7 +842,7 @@ pub fn arch_temp_map_addr() -> usize {
 }
 
 /// Initialize HMA save area with zero-page entries.
-pub fn arch_init_hma(hma: &mut [u64; crate::kernel::vm86::HMA_PAGE_COUNT]) {
+pub fn arch_init_hma(hma: &mut [u64; crate::kernel::machine::HMA_PAGE_COUNT]) {
     unsafe {
         core::arch::asm!(
             "int 0x80",

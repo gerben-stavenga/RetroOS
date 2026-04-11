@@ -97,7 +97,7 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::FREE_PHYS_PAGE => { crate::arch::phys_mm::free_phys_page(regs.rdx); }
         arch_call::SET_A20 => {
             let enabled = regs.rdx != 0;
-            let hma = unsafe { &mut *(regs.rcx as usize as *mut [paging2::Entry64; crate::vm86::HMA_PAGE_COUNT]) };
+            let hma = unsafe { &mut *(regs.rcx as usize as *mut [paging2::Entry64; crate::machine::HMA_PAGE_COUNT]) };
             paging2::set_a20(enabled, hma);
         }
         arch_call::ZERO_PHYS_PAGE => {
@@ -115,7 +115,7 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::UNMAP_UMB => paging2::unmap_umb(regs.rdx as usize, regs.rcx as usize),
         arch_call::GET_TEMP_MAP_ADDR => { regs.rax = paging2::temp_map_vaddr() as u64; }
         arch_call::INIT_HMA => {
-            let out = regs.rdx as usize as *mut [u64; crate::vm86::HMA_PAGE_COUNT];
+            let out = regs.rdx as usize as *mut [u64; crate::machine::HMA_PAGE_COUNT];
             let zero_page = paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
             let zero_entry = paging2::Entry64::new(zero_page, false, true);
             unsafe { for slot in (*out).iter_mut() { *slot = zero_entry.0; } }

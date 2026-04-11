@@ -14,7 +14,8 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use crate::kernel::thread;
-use crate::kernel::vm86;
+use crate::kernel::dos;
+use crate::kernel::machine;
 use crate::kernel::startup;
 use crate::{Regs, dbg_println};
 
@@ -265,11 +266,11 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // Save VM86 register state for the FAR CALL return address
     // The FAR CALL pushed CS:IP on the real-mode stack.
     // Pop the return address so we know where to resume in PM.
-    let ret_ip = vm86::vm86_pop(regs);
-    let ret_cs = vm86::vm86_pop(regs);
+    let ret_ip = machine::vm86_pop(regs);
+    let ret_cs = machine::vm86_pop(regs);
     dpmi_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X}",
         client_type, if client_type != 0 { 32 } else { 16 },
-        ret_cs, ret_ip, dos.vm86.current_psp);
+        ret_cs, ret_ip, dos.current_psp);
 
     let real_ss = regs.stack_seg();
     let real_sp = regs.sp32() as u16;
@@ -306,7 +307,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // data segment before reloading it, and crash if the limit is too tight.
     // Give it a 64KB limit for compatibility. Use the current PSP, not a
     // hardcoded segment, so child execs get a selector pointing at their own.
-    let psp_seg = dos.vm86.current_psp;
+    let psp_seg = dos.current_psp;
     let psp_base = (psp_seg as u32) * 16;
     dpmi.ldt[4] = DpmiState::make_data_desc_ex(psp_base, 0xFFFF, false);
     dpmi.ldt_alloc[0] |= 1 << 4;
@@ -329,11 +330,8 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 
     // Switch regs from VM86 to protected mode:
     // Clear VM flag, set PM selectors, set EIP to return offset
-    const VM_FLAG: u64 = 1 << 17;
-    const IF_FLAG: u64 = 1 << 9;
-
-    regs.frame.rflags &= !VM_FLAG;
-    regs.frame.rflags |= IF_FLAG;
+    regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    regs.frame.rflags |= machine::IF_FLAG as u64;
     regs.frame.cs = cs_sel as u64;
     regs.frame.rip = ret_ip as u64;
     regs.frame.ss = ss_sel as u64;
@@ -346,8 +344,8 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // Allocate a dedicated real-mode stack for INT 31h/0300h simulation.
     // Must not overlap the client's data area. Grab 256 bytes (16 paragraphs)
     // from the DOS heap.
-    let rm_stack_seg = dos.vm86.heap_seg;
-    dos.vm86.heap_seg = rm_stack_seg.wrapping_add(0x10); // 256 bytes
+    let rm_stack_seg = dos.heap_seg;
+    dos.heap_seg = rm_stack_seg.wrapping_add(0x10); // 256 bytes
     dpmi.rm_stack_seg = rm_stack_seg;
 
     // DPMI 0.9 §4.1: "The environment pointer in the client program's PSP
@@ -437,11 +435,11 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
     match opcode {
         // CLI — clear virtual IF
         0xFA => {
-            regs.frame.rflags &= !(1 << 9);
+            regs.frame.rflags &= !(machine::IF_FLAG as u64);
         }
         // STI — set virtual IF
         0xFB => {
-            regs.frame.rflags |= 1 << 9;
+            regs.frame.rflags |= machine::IF_FLAG as u64;
         }
         // PUSHF — push flags (IF is already the virtual interrupt flag)
         0x9C => {
@@ -469,8 +467,8 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
                 set_sp(regs, sp.wrapping_add(2));
                 v
             };
-            let preserved = regs.flags32() & (0x3000 | (1 << 17));
-            regs.set_flags32((flags & !(0x3000 | (1 << 17))) | preserved);
+            let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
+            regs.set_flags32((flags & !machine::PRESERVED_FLAGS) | preserved);
         }
         // HLT — yield (event loop handles state save + Ready)
         0xF4 => {
@@ -493,8 +491,8 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
                 set_sp(regs, sp.wrapping_add(12));
                 regs.set_ip32(new_eip);
                 regs.set_cs32(new_cs as u32);
-                let preserved = regs.flags32() & (0x3000 | (1 << 17));
-                regs.set_flags32((new_flags & !(0x3000 | (1 << 17))) | preserved);
+                let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
+                regs.set_flags32((new_flags & !machine::PRESERVED_FLAGS) | preserved);
             } else {
                 let new_ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) };
                 let new_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) };
@@ -506,8 +504,8 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
                 set_sp(regs, sp.wrapping_add(6));
                 regs.set_ip32(new_ip as u32);
                 regs.set_cs32(new_cs as u32);
-                let preserved = regs.flags32() & (0x3000 | (1 << 17));
-                regs.set_flags32((new_flags & !(0x3000 | (1 << 17))) | preserved);
+                let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
+                regs.set_flags32((new_flags & !machine::PRESERVED_FLAGS) | preserved);
             }
             trace_client_selector_leak("dpmi_monitor.iret", regs);
             return thread::KernelAction::Done; // Don't advance IP — we set it
@@ -516,53 +514,53 @@ pub fn dpmi_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         0xE4 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            let val = vm86::emulate_inb(dos, port);
+            let val = machine::emulate_inb(&mut dos.pc, port);
             regs.rax = (regs.rax & !0xFF) | val as u64;
         }
         // IN AL, DX
         0xEC => {
             let port = regs.rdx as u16;
-            let val = vm86::emulate_inb(dos, port);
+            let val = machine::emulate_inb(&mut dos.pc, port);
             regs.rax = (regs.rax & !0xFF) | val as u64;
         }
         // OUT imm8, AL
         0xE6 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            vm86::emulate_outb(dos, port, regs.rax as u8);
+            machine::emulate_outb(&mut dos.pc, port, regs.rax as u8);
         }
         // OUT DX, AL
         0xEE => {
             let port = regs.rdx as u16;
-            vm86::emulate_outb(dos, port, regs.rax as u8);
+            machine::emulate_outb(&mut dos.pc, port, regs.rax as u8);
         }
         // IN AX, imm8 (16-bit)
         0xE5 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            let lo = vm86::emulate_inb(dos, port);
-            let hi = vm86::emulate_inb(dos, port + 1);
+            let lo = machine::emulate_inb(&mut dos.pc, port);
+            let hi = machine::emulate_inb(&mut dos.pc, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | lo as u64 | ((hi as u64) << 8);
         }
         // IN AX, DX (16-bit)
         0xED => {
             let port = regs.rdx as u16;
-            let lo = vm86::emulate_inb(dos, port);
-            let hi = vm86::emulate_inb(dos, port + 1);
+            let lo = machine::emulate_inb(&mut dos.pc, port);
+            let hi = machine::emulate_inb(&mut dos.pc, port + 1);
             regs.rax = (regs.rax & !0xFFFF) | lo as u64 | ((hi as u64) << 8);
         }
         // OUT imm8, AX (16-bit)
         0xE7 => {
             let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
             advance = 2;
-            vm86::emulate_outb(dos, port, regs.rax as u8);
-            vm86::emulate_outb(dos, port + 1, (regs.rax >> 8) as u8);
+            machine::emulate_outb(&mut dos.pc, port, regs.rax as u8);
+            machine::emulate_outb(&mut dos.pc, port + 1, (regs.rax >> 8) as u8);
         }
         // OUT DX, AX (16-bit)
         0xEF => {
             let port = regs.rdx as u16;
-            vm86::emulate_outb(dos, port, regs.rax as u8);
-            vm86::emulate_outb(dos, port + 1, (regs.rax >> 8) as u8);
+            machine::emulate_outb(&mut dos.pc, port, regs.rax as u8);
+            machine::emulate_outb(&mut dos.pc, port + 1, (regs.rax >> 8) as u8);
         }
         // INT imm8 — software interrupt (GP faults because IDT DPL=0 for vectors < 0x30)
         0xCD => {
@@ -680,18 +678,18 @@ pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) ->
 /// Slot = (EIP - STUB_BASE - 2) / 2.
 fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
-    let stub_base = vm86::STUB_BASE;
+    let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
     dpmi_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
 
     match slot {
-        vm86::SLOT_EXCEPTION_RET => {
+        dos::SLOT_EXCEPTION_RET => {
             return exception_return(dos, regs);
         }
-        vm86::SLOT_PM_TO_REAL => {
+        dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
         }
-        vm86::SLOT_SAVE_RESTORE => {
+        dos::SLOT_SAVE_RESTORE => {
             // No-op save/restore: pop the far-call return address and resume caller.
             // Frame size depends on the client's operand size: 16-bit CALL FAR
             // pushed IP+CS as 4 bytes; 32-bit CALL FAR pushed EIP+CS as 8 bytes.
@@ -745,8 +743,8 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
             else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
             regs.set_ip32(ret_eip);
             regs.set_cs32(ret_cs);
-            let preserved = regs.flags32() & (0x3000 | (1 << 17));
-            regs.set_flags32((ret_flags & !(0x3000 | (1 << 17))) | preserved);
+            let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
+            regs.set_flags32((ret_flags & !machine::PRESERVED_FLAGS) | preserved);
             reflect_int_to_real_mode(dos, regs, slot)
         }
     }
@@ -953,8 +951,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         0x0100 => {
             let paragraphs = regs.rbx as u16;
             // Allocate from DOS conventional memory (simplified: use heap_seg)
-            let seg = dos.vm86.heap_seg;
-            dos.vm86.heap_seg = seg.wrapping_add(paragraphs);
+            let seg = dos.heap_seg;
+            dos.heap_seg = seg.wrapping_add(paragraphs);
             // Create a data descriptor for this block
             let dpmi = dos.dpmi.as_mut().unwrap();
             if let Some(idx) = dpmi.alloc_ldt() {
@@ -981,8 +979,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         // BL = interrupt number. Returns: CX:DX = seg:off
         0x0200 => {
             let int_num = regs.rbx as u8;
-            let off = vm86::read_u16(0, (int_num as u32) * 4);
-            let seg = vm86::read_u16(0, (int_num as u32) * 4 + 2);
+            let off = machine::read_u16(0, (int_num as u32) * 4);
+            let seg = machine::read_u16(0, (int_num as u32) * 4 + 2);
             regs.rcx = (regs.rcx & !0xFFFF) | seg as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | off as u64;
             clear_carry(regs);
@@ -994,8 +992,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             let seg = regs.rcx as u16;
             let off = regs.rdx as u16;
             crate::dbg_println!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
-            vm86::write_u16(0, (int_num as u32) * 4, off);
-            vm86::write_u16(0, (int_num as u32) * 4 + 2, seg);
+            machine::write_u16(0, (int_num as u32) * 4, off);
+            machine::write_u16(0, (int_num as u32) * 4 + 2, seg);
             clear_carry(regs);
         }
         // AX=0202h — Get Processor Exception Handler Vector
@@ -1031,7 +1029,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             let (sel, off) = dpmi.pm_vectors[int_num as usize];
             let (sel, off) = if sel == 0 {
                 let stub_sel = DpmiState::idx_to_sel(5);
-                let stub_off = vm86::STUB_BASE + (int_num as u32) * 2;
+                let stub_off = dos::STUB_BASE + (int_num as u32) * 2;
                 (stub_sel, stub_off)
             } else {
                 (sel, off)
@@ -1079,8 +1077,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
                         regs.rdi as u32,
                     ));
                     // Return real-mode address: STUB_SEG:slot_offset(SLOT_CB_ENTRY_BASE + i)
-                    let rm_off = vm86::slot_offset(vm86::SLOT_CB_ENTRY_BASE + i as u8);
-                    regs.rcx = (regs.rcx & !0xFFFF) | vm86::STUB_SEG as u64;
+                    let rm_off = dos::slot_offset(dos::SLOT_CB_ENTRY_BASE + i as u8);
+                    regs.rcx = (regs.rcx & !0xFFFF) | dos::STUB_SEG as u64;
                     regs.rdx = (regs.rdx & !0xFFFF) | rm_off as u64;
                     clear_carry(regs);
                 }
@@ -1092,8 +1090,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         0x0304 => {
             let dpmi = dos.dpmi.as_mut().unwrap();
             let off = regs.rdx as u16;
-            let cb_base = vm86::slot_offset(vm86::SLOT_CB_ENTRY_BASE);
-            let cb_end = vm86::slot_offset(vm86::SLOT_CB_ENTRY_END);
+            let cb_base = dos::slot_offset(dos::SLOT_CB_ENTRY_BASE);
+            let cb_end = dos::slot_offset(dos::SLOT_CB_ENTRY_END);
             if off >= cb_base && off < cb_end {
                 let idx = ((off - cb_base) / 2) as usize;
                 dpmi.callbacks[idx] = None;
@@ -1250,24 +1248,24 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         0x0305 => {
             regs.rax = (regs.rax & !0xFFFF);  // AX=0: no buffer needed
             // Real-mode save/restore: stub slot SLOT_SAVE_RESTORE
-            regs.rbx = (regs.rbx & !0xFFFF) | vm86::STUB_SEG as u64;
-            regs.rcx = (regs.rcx & !0xFFFF) | vm86::slot_offset(vm86::SLOT_SAVE_RESTORE) as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | dos::STUB_SEG as u64;
+            regs.rcx = (regs.rcx & !0xFFFF) | dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u64;
             // Protected-mode save/restore: stub_sel:STUB_BASE + SLOT_SAVE_RESTORE*2
             let stub_sel = DpmiState::idx_to_sel(5);
             regs.rsi = (regs.rsi & !0xFFFF) | stub_sel as u64;
-            regs.rdi = (regs.rdi & !0xFFFF) | (vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_SAVE_RESTORE) as u32) as u64;
+            regs.rdi = (regs.rdi & !0xFFFF) | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u32) as u64;
             clear_carry(regs);
         }
         // AX=0306h — Get Raw Mode Switch Addresses
         // Returns real-to-PM and PM-to-real switch entry points
         0x0306 => {
             // BX:CX = real-to-PM entry point (real-mode segment:offset)
-            regs.rbx = (regs.rbx & !0xFFFF) | vm86::STUB_SEG as u64;
-            regs.rcx = (regs.rcx & !0xFFFF) | vm86::slot_offset(vm86::SLOT_RAW_REAL_TO_PM) as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | dos::STUB_SEG as u64;
+            regs.rcx = (regs.rcx & !0xFFFF) | dos::slot_offset(dos::SLOT_RAW_REAL_TO_PM) as u64;
             // SI:(E)DI = PM-to-real entry point (selector:offset)
             let stub_sel = DpmiState::idx_to_sel(5);
             regs.rsi = (regs.rsi & !0xFFFF) | stub_sel as u64;
-            regs.rdi = (regs.rdi & !0xFFFFFFFF) | (vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_PM_TO_REAL) as u32) as u64;
+            regs.rdi = (regs.rdi & !0xFFFFFFFF) | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_TO_REAL) as u32) as u64;
             clear_carry(regs);
         }
         // AX=0507h — Set Page Attributes (DPMI 1.0)
@@ -1355,14 +1353,9 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bo
         vector: 0xFF,
     });
 
-    // Set up VM86 regs for real-mode interrupt
-    const VM_FLAG: u32 = 1 << 17;
-    const IF_FLAG: u32 = 1 << 9;
-    const VIF_FLAG: u32 = 1 << 19;
-
     // Get IVT entry for the interrupt
-    let ivt_off = vm86::read_u16(0, (int_num as u32) * 4);
-    let ivt_seg = vm86::read_u16(0, (int_num as u32) * 4 + 2);
+    let ivt_off = machine::read_u16(0, (int_num as u32) * 4);
+    let ivt_seg = machine::read_u16(0, (int_num as u32) * 4 + 2);
 
     // Use SS:SP from structure if provided, else use our dedicated RM stack.
     // The default must NOT overlap the client's data area (COM_SEGMENT is unsafe).
@@ -1384,21 +1377,21 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bo
 
     // Push IRET frame for callback return: FLAGS, callback_stub_seg, callback_stub_off
     // The callback stub (SLOT_CALLBACK_RET) does INT 31h which triggers callback_return
-    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
-    let callback_seg: u16 = vm86::STUB_SEG;
+    let callback_off: u16 = dos::slot_offset(dos::SLOT_CALLBACK_RET);
+    let callback_seg: u16 = dos::STUB_SEG;
 
     regs.frame.ss = rm_ss as u64;
     regs.frame.rsp = rm_sp as u64;
 
     // Push return IRET frame on VM86 stack
-    vm86::vm86_push(regs, rm.flags);
-    vm86::vm86_push(regs, callback_seg);
-    vm86::vm86_push(regs, callback_off);
+    machine::vm86_push(regs, rm.flags);
+    machine::vm86_push(regs, callback_seg);
+    machine::vm86_push(regs, callback_off);
 
     // Set CS:IP to the IVT handler
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
+    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG) as u64;
 
     crate::dbg_println!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         int_num, ivt_seg, ivt_off, rm_ss, rm_sp.wrapping_sub(6));
@@ -1444,13 +1437,9 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
         vector,
     });
 
-    const VM_FLAG: u32 = 1 << 17;
-    const IF_FLAG: u32 = 1 << 9;
-    const VIF_FLAG: u32 = 1 << 19;
-
     // Get IVT entry
-    let ivt_off = vm86::read_u16(0, (vector as u32) * 4);
-    let ivt_seg = vm86::read_u16(0, (vector as u32) * 4 + 2);
+    let ivt_off = machine::read_u16(0, (vector as u32) * 4);
+    let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
 
     // Use the dedicated DPMI real-mode stack (not COM_SEGMENT which overlaps client data)
     let rm_ss = dpmi.rm_stack_seg;
@@ -1460,16 +1449,16 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     regs.frame.rsp = rm_sp as u64;
 
     // Push callback return IRET frame on VM86 stack
-    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
-    let callback_seg: u16 = vm86::STUB_SEG;
-    vm86::vm86_push(regs, 0); // flags
-    vm86::vm86_push(regs, callback_seg);
-    vm86::vm86_push(regs, callback_off);
+    let callback_off: u16 = dos::slot_offset(dos::SLOT_CALLBACK_RET);
+    let callback_seg: u16 = dos::STUB_SEG;
+    machine::vm86_push(regs, 0); // flags
+    machine::vm86_push(regs, callback_seg);
+    machine::vm86_push(regs, callback_off);
 
     // Set VM86 entry to IVT handler
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
+    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG) as u64;
 
     // Set translated real-mode segments
     regs.ds = rm_ds as u64;
@@ -1499,10 +1488,6 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool)
         vector: 0xFF,
     });
 
-    const VM_FLAG: u32 = 1 << 17;
-    const IF_FLAG: u32 = 1 << 9;
-    const VIF_FLAG: u32 = 1 << 19;
-
     let rm_ss = if rm.ss != 0 { rm.ss } else { dpmi.rm_stack_seg };
     let rm_sp = if rm.sp != 0 { rm.sp } else { 0x00FE };
 
@@ -1518,20 +1503,20 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool)
     regs.fs = rm.fs as u64;
     regs.gs = rm.gs as u64;
 
-    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
-    let callback_seg: u16 = vm86::STUB_SEG;
+    let callback_off: u16 = dos::slot_offset(dos::SLOT_CALLBACK_RET);
+    let callback_seg: u16 = dos::STUB_SEG;
 
     regs.frame.ss = rm_ss as u64;
     regs.frame.rsp = rm_sp as u64;
 
     // For FAR CALL: push return address (callback stub) as FAR return
-    vm86::vm86_push(regs, callback_seg);
-    vm86::vm86_push(regs, callback_off);
+    machine::vm86_push(regs, callback_seg);
+    machine::vm86_push(regs, callback_off);
 
     // Jump to the far procedure
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
-    regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
+    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG) as u64;
     thread::KernelAction::Done
 }
 
@@ -1548,10 +1533,6 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs, cs_32: 
         vector: 0xFF,
     });
 
-    const VM_FLAG: u32 = 1 << 17;
-    const IF_FLAG: u32 = 1 << 9;
-    const VIF_FLAG: u32 = 1 << 19;
-
     let rm_ss = if rm.ss != 0 { rm.ss } else { dpmi.rm_stack_seg };
     let rm_sp = if rm.sp != 0 { rm.sp } else { 0x00FE };
 
@@ -1567,20 +1548,20 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs, cs_32: 
     regs.fs = rm.fs as u64;
     regs.gs = rm.gs as u64;
 
-    let callback_off: u16 = vm86::slot_offset(vm86::SLOT_CALLBACK_RET);
-    let callback_seg: u16 = vm86::STUB_SEG;
+    let callback_off: u16 = dos::slot_offset(dos::SLOT_CALLBACK_RET);
+    let callback_seg: u16 = dos::STUB_SEG;
 
     regs.frame.ss = rm_ss as u64;
     regs.frame.rsp = rm_sp as u64;
 
     // For IRET frame: push FLAGS, CS, IP (callback return stub)
-    vm86::vm86_push(regs, rm.flags);
-    vm86::vm86_push(regs, callback_seg);
-    vm86::vm86_push(regs, callback_off);
+    machine::vm86_push(regs, rm.flags);
+    machine::vm86_push(regs, callback_seg);
+    machine::vm86_push(regs, callback_off);
 
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
-    regs.frame.rflags = (VM_FLAG | IF_FLAG | VIF_FLAG) as u64;
+    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG) as u64;
 
     thread::KernelAction::Done
 }
@@ -1640,8 +1621,7 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     // Switch to protected mode and call the PM handler
     // DS:SI = selector:offset pointing to real-mode SS:SP
     // ES:DI = selector:offset pointing to register structure
-    const VM_FLAG: u64 = 1 << 17;
-    regs.frame.rflags &= !VM_FLAG;
+    regs.frame.rflags &= !(machine::VM_FLAG as u64);
     regs.frame.cs = pm_cs as u64;
     regs.set_ip32(pm_eip);
     regs.ds = rm_struct_sel as u64;  // DS:ESI = register structure
@@ -1794,7 +1774,7 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     // Set ISR bit so vpic won't deliver another interrupt until EOI
     let irq_num = vector.wrapping_sub(8);
     if irq_num < 8 {
-        dos.vm86.vpic.isr |= 1 << irq_num;
+        dos.pc.vpic.isr |= 1 << irq_num;
     }
 }
 
@@ -1872,7 +1852,7 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     // Return address for the handler's RETF — point to our exception return stub
     // at LDT[5]:STUB_BASE + SLOT_EXCEPTION_RET*2 (CD 31 → pm_stub_dispatch)
     let stub_sel = DpmiState::idx_to_sel(5);
-    let stub_off = vm86::STUB_BASE + vm86::slot_offset(vm86::SLOT_EXCEPTION_RET) as u32;
+    let stub_off = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET) as u32;
 
     if use32 {
         let push32 = |sp: &mut u32, val: u32| {
@@ -1986,8 +1966,8 @@ fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         regs.set_sp32((regs.sp32() & !0xFFFF) | (new_esp & 0xFFFF));
     }
     // Restore EFLAGS but preserve IOPL and VM
-    let preserved = regs.flags32() & (0x3000 | (1 << 17));
-    regs.set_flags32((new_eflags & !(0x3000 | (1 << 17))) | preserved);
+    let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
+    regs.set_flags32((new_eflags & !machine::PRESERVED_FLAGS) | preserved);
     trace_client_selector_leak("exception_return.out", regs);
     thread::KernelAction::Done
 }
@@ -2016,10 +1996,7 @@ fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> thread
     let new_ip = regs.rdi as u16;
 
     // Set VM86 mode
-    const VM_FLAG: u64 = 1 << 17;
-    const IF_FLAG: u64 = 1 << 9;
-
-    regs.frame.rflags |= VM_FLAG | IF_FLAG;
+    regs.frame.rflags |= (machine::VM_FLAG | machine::IF_FLAG) as u64;
     regs.frame.cs = new_cs as u64;
     regs.frame.rip = new_ip as u64;
     regs.frame.ss = new_ss as u64;
@@ -2064,11 +2041,8 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     };
 
     // Clear VM flag, enter protected mode
-    const VM_FLAG: u64 = 1 << 17;
-    const IF_FLAG: u64 = 1 << 9;
-
-    regs.frame.rflags &= !VM_FLAG;
-    regs.frame.rflags |= IF_FLAG;
+    regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    regs.frame.rflags |= machine::IF_FLAG as u64;
     regs.frame.cs = new_cs as u64;
     regs.frame.rip = new_eip as u64;
     regs.frame.ss = new_ss as u64;

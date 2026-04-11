@@ -1558,14 +1558,14 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
 /// Set A20 gate state for VM86 mode.
 /// When disabled (default): virtual 0x100000-0x10FFFF → physical 0x00000-0x0FFFF (wrap)
 /// When enabled: virtual 0x100000-0x10FFFF → the thread's saved HMA mappings.
-pub fn set_a20(enabled: bool, hma: &mut [Entry64; crate::vm86::HMA_PAGE_COUNT]) {
+pub fn set_a20(enabled: bool, hma: &mut [Entry64; crate::machine::HMA_PAGE_COUNT]) {
     match entries() {
         Entries::E32(e) => set_a20_generic_32(e, enabled, hma),
         Entries::E64(e) => set_a20_generic_64(e, enabled, hma),
     }
 }
 
-fn set_a20_generic_64(entries: &mut [Entry64], enabled: bool, hma: &mut [Entry64; crate::vm86::HMA_PAGE_COUNT]) {
+fn set_a20_generic_64(entries: &mut [Entry64], enabled: bool, hma: &mut [Entry64; crate::machine::HMA_PAGE_COUNT]) {
     for i in 0..16usize {
         let idx = 0x100 + i;
         if enabled {
@@ -1578,7 +1578,7 @@ fn set_a20_generic_64(entries: &mut [Entry64], enabled: bool, hma: &mut [Entry64
     flush_tlb();
 }
 
-fn set_a20_generic_32(entries: &mut [Entry32], enabled: bool, hma: &mut [Entry64; crate::vm86::HMA_PAGE_COUNT]) {
+fn set_a20_generic_32(entries: &mut [Entry32], enabled: bool, hma: &mut [Entry64; crate::machine::HMA_PAGE_COUNT]) {
     for i in 0..16usize {
         let idx = 0x100 + i;
         if enabled {

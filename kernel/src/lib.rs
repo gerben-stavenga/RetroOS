@@ -17,9 +17,10 @@ mod arch;
 mod kernel;
 pub mod pipe;  // Shared utility: ring buffer used by both arch and kernel
 
-// Re-export kernel submodules so arch/ code can use crate::thread, crate::vm86, etc.
+// Re-export kernel submodules so arch/ code can use crate::thread, crate::machine, etc.
+pub use kernel::dos;
+pub use kernel::machine;
 pub use kernel::thread;
-pub use kernel::vm86;
 
 // Re-export lib's vga module and macros
 pub use lib::vga;
