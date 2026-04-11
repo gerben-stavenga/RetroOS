@@ -1130,32 +1130,54 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
 // ============================================================================
 // GP-fault monitor — single entry point for sensitive-instruction faults
 //
-// There is conceptually one monitor; the CPU mode at fault time selects the
-// decode path:
-//   - EFLAGS.VM=1 → real-mode decode at CS*16+IP (vm86_monitor)
-//   - protected mode → 16/32-bit decode via LDT segment base (dpmi_monitor)
+// Conceptually one monitor; CPU mode at fault time picks the decode path:
+//   - EFLAGS.VM=1 → real-mode decode at CS*16+IP       (vm86_monitor)
+//   - protected  → 16/32-bit decode via LDT seg base   (dpmi::dpmi_monitor)
 //
-// Machine-level concerns (I/O emulation, IRET framing, PUSHF/POPF, CLI/STI)
-// live here. Two narrow callouts cross into personalities:
-//   - software INT dispatch in VM86 → `dos::handle_vm86_int`
-//   - the entire PM path → `dpmi::dpmi_monitor` (LDT-coupled)
-// With IOPL=0 all I/O traps here regardless of IOPB.
-// VGA ports (0x3C0-0x3DF) are passed through to hardware; PIC/keyboard are
-// virtualized; other ports: IN returns 0xFF, OUT is no-op.
+// Both decoders are pure x86 emulation. They take only the minimum state
+// they need (PcMachine for I/O, plus SegCtx in the PM case for LDT-resolved
+// segment bases) and return an event enum describing what happened:
+//   - Continue / Halt / SoftInt(n) / Fault
+// The dispatcher in `monitor()` translates events into kernel policy and is
+// the only place machine code calls into the personality:
+//   - VM86 SoftInt  → dos::handle_vm86_int
+//   - PM   SoftInt  → dos::dpmi::pm_soft_int_dispatch
+//   - PM   Fault    → dos::dpmi::dispatch_dpmi_exception
+//
+// With IOPL=0 all I/O traps here regardless of IOPB. VGA ports (0x3C0-0x3DF)
+// are passed through to hardware; PIC/keyboard are virtualized; other ports:
+// IN returns 0xFF, OUT is no-op.
 // ============================================================================
 
-/// Outcome of one VM86 decode step. The monitor reports what the x86
-/// instruction meant at the machine level; translating that into kernel
-/// policy (yield, kill, dispatch to personality) is the dispatcher's job.
+/// Outcome of one monitor decode step. Both the VM86 and PM decoders
+/// report what the x86 instruction meant at the machine level; kernel
+/// policy (yield, kill, dispatch to personality) lives in the dispatcher.
 enum Vm86Event {
-    /// Machine handled the instruction; resume user.
+    Continue,
+    Halt,
+    SoftInt(u8),
+    Fault,
+}
+
+pub enum PmEvent {
+    /// Machine handled the instruction; IP already set, resume user.
     Continue,
     /// HLT — guest is idle until an interrupt.
     Halt,
-    /// Software INT (INT n / INT3 / INTO / INT1); personality must dispatch.
+    /// INT imm8 in PM — personality dispatches (PM vector or RM reflect).
+    /// IP has already been advanced past the INT instruction.
     SoftInt(u8),
-    /// Unknown/illegal opcode; guest is unrecoverable.
+    /// Unknown/illegal opcode or illegal state — caller reflects as #GP.
     Fault,
+}
+
+/// Segmentation view the PM decoder needs from the LDT. Built once per
+/// fault by the dispatcher so the decoder stays oblivious to the LDT.
+pub struct SegCtx {
+    pub cs_base: u32,
+    pub cs_32: bool,
+    pub ss_base: u32,
+    pub ss_32: bool,
 }
 
 /// GP-fault monitor entry point for DOS threads. Dispatches to the VM86 or
@@ -1169,8 +1191,23 @@ pub fn monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAct
             Vm86Event::Fault      => thread::KernelAction::Exit(-11),
         }
     } else {
-        // PM decode path lives in dpmi.rs due to LDT segment-base coupling.
-        crate::kernel::dos::dpmi::dpmi_monitor(dos, regs)
+        // Resolve segment context from the LDT, then run pure PM decode.
+        // The LDT read and the PcMachine borrow are on disjoint fields of
+        // DosState, so borrow-split is fine.
+        let seg = {
+            let Some(dpmi) = dos.dpmi.as_ref() else {
+                crate::println!("DPMI: GP fault but no DPMI state!");
+                return thread::KernelAction::Done;
+            };
+            crate::kernel::dos::dpmi::build_seg_ctx(dpmi, regs)
+        };
+        let event = crate::kernel::dos::dpmi::dpmi_monitor(&mut dos.pc, &seg, regs);
+        match event {
+            PmEvent::Continue   => thread::KernelAction::Done,
+            PmEvent::Halt       => thread::KernelAction::Yield,
+            PmEvent::SoftInt(n) => crate::kernel::dos::dpmi::pm_soft_int_dispatch(dos, regs, n),
+            PmEvent::Fault      => crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, 13),
+        }
     }
 }
 
