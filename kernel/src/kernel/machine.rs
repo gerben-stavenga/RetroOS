@@ -1057,7 +1057,17 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
     let is_pm = regs.mode() != crate::UserMode::VM86;
-    if !vif && !is_pm {
+    // DIAGNOSTIC: mask IRQ delivery while DN's LZEXE decompressor stub runs.
+    // The stub's stack (SP=0x100) sits immediately above its code region, so
+    // a reflect push at SP-6 lands in unexecuted code bytes and corrupts them.
+    // Remove once confirmed / fixed.
+    if !is_pm && vm86_cs(regs) == 0x3D65 {
+        if pc.vpic.has_pending() {
+            regs.frame.rflags |= 1u64 << 20; // VIP
+        }
+        return None;
+    }
+    if !vif {
         if pc.vpic.has_pending() {
             regs.frame.rflags |= 1u64 << 20; // VIP
         }
@@ -1154,6 +1164,16 @@ pub fn vm86_pop(regs: &mut Regs) -> u16 {
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let Some(vec) = pick_pending_vec(&mut dos.pc, regs) else { return };
     if regs.mode() == crate::UserMode::VM86 {
+        if vec == 0x08 {
+            let lin = (vm86_cs(regs) as u32) * 16 + vm86_ip(regs) as u32;
+            let b = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+            let bda_ticks = unsafe { *(0x46Cu32 as *const u32) };
+            crate::dbg_println!("[tick] cs:ip={:04x}:{:04x} ss:sp={:04x}:{:04x} bda_46c={} bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                vm86_cs(regs), vm86_ip(regs),
+                regs.ss32() as u16, vm86_sp(regs),
+                bda_ticks,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+        }
         reflect_interrupt(regs, vec);
     } else {
         crate::kernel::dos::dpmi::deliver_hw_irq(dos, regs, vec);

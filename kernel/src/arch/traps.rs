@@ -176,6 +176,7 @@ fn arch_switch_to(regs: &mut Regs) {
     let regs_ptr = regs.rdx as u32 as *mut Regs;
     let root_ptr = regs.rcx as u32 as *mut paging2::RootPageTable;
     let hash_ptr = regs.rbx as u32 as *mut u64;
+    let fx_ptr   = regs.rsi as u32 as *mut crate::arch::x86::FxState;
 
     let expected = if !hash_ptr.is_null() {
         unsafe {
@@ -184,6 +185,18 @@ fn arch_switch_to(regs: &mut Regs) {
             exp
         }
     } else { 0 };
+
+    // Swap x87/SSE state eagerly: save outgoing into a temp, load incoming
+    // from the thread's area, then move temp into the thread's area so it
+    // holds the outgoing state on return (mirrors the regs swap semantics).
+    // Null fx_ptr = skip (used by kernel-only transient swaps that never
+    // touch the FPU between entry and exit).
+    if !fx_ptr.is_null() {
+        let mut tmp = crate::arch::x86::FxState::zeroed();
+        tmp.save();
+        unsafe { (*fx_ptr).restore(); }
+        unsafe { *fx_ptr = tmp; }
+    }
 
     // Swap regs
     unsafe { core::mem::swap(&mut *regs_ptr, &mut REGS); }
@@ -329,12 +342,28 @@ fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
         // and bubble it up. `#GP` runs the sensitive-instruction monitor
         // first — on `Resume` we iret straight to user. `#PF` and IRQs are
         // handled inline by arch before bubbling.
-        use crate::arch::monitor::{monitor, KernelEvent as KE, MonitorResult};
+        use crate::arch::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult};
+        use crate::UserMode;
         let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
         let kevent: KE = match int_num {
+            // #DB: only armed by `step_virtual_if` to single-step PM regions
+            // where virtual IF is 0. The hardware just executed one insn
+            // under TF; decide what to do about the NEXT one.
+            1 => {
+                let _ = step_virtual_if(regs);
+                return;
+            }
             13 => match monitor(regs) {
                 MonitorResult::Resume   => {
-                    if regs.flags32() & ((1 << 9) | (1 << 20)) != (1 << 9) | (1 << 20) { 
+                    // If the monitor just cleared virtual IF in PM (e.g. a
+                    // CLI), kick off the single-step interpreter so POPF/
+                    // IRET get intercepted before hardware runs them.
+                    if regs.mode() != UserMode::VM86
+                        && regs.flags32() & (1 << 9) == 0
+                    {
+                        let _ = step_virtual_if(regs);
+                    }
+                    if regs.flags32() & ((1 << 9) | (1 << 20)) != (1 << 9) | (1 << 20) {
                         return;
                     }
                     KE::Irq

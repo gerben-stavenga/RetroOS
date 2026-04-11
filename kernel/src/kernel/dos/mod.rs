@@ -2878,6 +2878,7 @@ pub(crate) const SLOT_CALLBACK_RET: u8 = 0x02;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
 pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
+pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
@@ -3230,12 +3231,11 @@ fn load_exe_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data:
         );
     }
 
-    // Zero BSS from end of load module up to end_seg. Real DOS doesn't do
-    // this, but in-process EXEC reuses the same physical pages across
-    // invocations, so leaving leftover data in BSS makes CRT startup
-    // non-deterministic when it reads a pointer/flag from BSS before
-    // clearing it. Seen with DN.PRG after ~6 iterations: a wild far jump
-    // into stale memory because its Borland CRT skipped a re-init step.
+    // Zero BSS from end of load module up to end_seg. DOS itself does not
+    // do this — the MZ loader just copies the image and allocates extra
+    // paragraphs uninitialized; real CRTs (Borland c0, Watcom cstart, ...)
+    // zero BSS from linker-emitted symbols. We zero here to be defensive
+    // on re-exec, where the backing pages may retain prior-run data.
     let bss_start = load_base + load_size as u32;
     let bss_end = (end_seg as u32) << 4;
     if bss_end > bss_start {

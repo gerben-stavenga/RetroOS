@@ -784,6 +784,7 @@ fn sys_execve(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
             &mut thread::get_thread(tid).unwrap().cpu_state,
             &mut new_root,
             core::ptr::null_mut(),
+            core::ptr::null_mut(),
         );
         // Now running in a blank address space — set it as this thread's root
         thread::get_thread(tid).unwrap().root = new_root;

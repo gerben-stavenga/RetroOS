@@ -444,10 +444,20 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
         unsafe {
             // CR4: OSFXSR + OSXMMEXCPT
             x86::write_cr4(x86::read_cr4() | x86::cr4::OSFXSR | x86::cr4::OSXMMEXCPT);
-            // CR0: clear EM, set MP
+            // CR0: clear EM, set MP, set NE (internal #MF reporting).
+            // Without NE, unmasked x87 exceptions report via FERR#/IRQ13 —
+            // fine for the host kernel but bypasses DPMI clients' vector 16
+            // exception handlers.
             let cr0 = x86::read_cr0();
-            x86::write_cr0((cr0 & !x86::cr0::EM) | x86::cr0::MP);
+            x86::write_cr0(((cr0 & !x86::cr0::EM) | x86::cr0::MP) | x86::cr0::NE);
+            // Initialize x87 state: BIOS/QEMU may leave the FSW with stale
+            // exception flags set, which would fire a spurious #MF at the
+            // first WAIT/FPU op in user code.
+            core::arch::asm!("fninit", options(nomem, nostack));
         }
+        // Snapshot the clean FPU state — new threads are initialized from
+        // this template so they don't inherit whatever user code ran last.
+        x86::capture_clean_fx_template();
     }
 
     // Load initial protected mode IDT, TSS, and segments

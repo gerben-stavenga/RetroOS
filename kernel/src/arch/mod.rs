@@ -32,6 +32,7 @@ pub use x86::{cli, sti, hlt};
 
 // TODO: migrate to arch calls
 pub use x86::{inb, outb, inw};
+pub use x86::{FxState, clean_fx_template};
 pub use irq::{get_ticks, take_pending_ticks, drain};
 pub use descriptors::int_intercepted;
 pub use phys_mm::{alloc_phys_page, free_phys_page, free_page_count};

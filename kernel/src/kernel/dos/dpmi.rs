@@ -75,6 +75,13 @@ pub struct DpmiState {
     /// converts PSP[0x2C] to a descriptor on PM entry; we keep the original
     /// segment so in-process child exec can inherit the env block.
     pub env_seg_orig: u16,
+    /// Stack of interrupted PM frames saved by `deliver_hw_irq`. The client's
+    /// PM HW IRQ handler IRETs to a host trampoline stub (SLOT_HW_IRQ_RET)
+    /// instead of directly to the interrupted code, because ring-3 IRET with
+    /// IOPL=0 silently discards the IF bit being popped — the host has to do
+    /// the IF restore by hand. Each entry is (cs, eip, flags) of the frame
+    /// that was executing when the IRQ fired. Nested HW IRQs push, returns pop.
+    pub hw_irq_frames: alloc::vec::Vec<(u16, u32, u32)>,
 }
 
 /// A DPMI linear memory block
@@ -120,6 +127,7 @@ impl DpmiState {
             rm_stack_seg: 0,
             client_use32: false,
             env_seg_orig: 0,
+            hw_irq_frames: alloc::vec::Vec::new(),
         }
     }
 
@@ -390,17 +398,36 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 /// reflect to real mode via IVT.
 pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     dpmi_trace!("[DPMI] SOFTINT {:02X} CS:EIP={:04x}:{:#x}", vector, regs.code_seg(), regs.ip32());
-    let dpmi = dos.dpmi.as_ref().unwrap();
+    let dpmi = dos.dpmi.as_mut().unwrap();
     // Note: stub-segment dispatch now goes through INT 31h → pm_stub_dispatch,
     // so CS == stub_sel no longer reaches here.
     let (sel, off) = dpmi.pm_vectors[vector as usize];
     if sel != 0 {
-        // PM handler installed — push IRET frame and dispatch.
+        // PM handler installed — push a host trampoline IRET frame and dispatch.
+        //
+        // We cannot push the interrupted CS:EIP directly, because when the
+        // client handler IRETs, ring-3 IRET with IOPL=0 silently discards the
+        // popped IF bit. Any handler that does CLI in its body (DOS32A's
+        // INT 21h shim does) would leave the client with IF=0 forever.
+        //
+        // Instead we route the return through SLOT_HW_IRQ_RET (same trampoline
+        // used by HW IRQ delivery): the frame we push points at the stub's
+        // `CD 31`; when the client IRETs it lands there, we pop the snapshot
+        // from `hw_irq_frames` and restore CS:EIP/IF/VIP by hand.
+        //
         // 16-bit clients get a 6-byte IRETW frame; 32-bit a 12-byte IRETD frame.
         let use32 = dpmi.client_use32;
         let ss_sel = regs.frame.ss as u16;
         let ss_base = seg_base(dpmi, ss_sel);
         let ss_32 = seg_is_32(dpmi, ss_sel);
+
+        let saved_cs = regs.code_seg();
+        let saved_eip = regs.ip32();
+        let saved_flags = regs.flags32();
+
+        let stub_sel = DpmiState::idx_to_sel(5);
+        let stub_eip = dos::STUB_BASE + (dos::SLOT_HW_IRQ_RET as u32) * 2;
+
         let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
         let frame_size: u32 = if use32 { 12 } else { 6 };
         let new_sp = sp.wrapping_sub(frame_size);
@@ -410,16 +437,17 @@ pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) ->
             let base = ss_base.wrapping_add(new_sp);
             if use32 {
                 let p = base as *mut u32;
-                core::ptr::write_unaligned(p, regs.ip32());
-                core::ptr::write_unaligned(p.add(1), regs.code_seg() as u32);
-                core::ptr::write_unaligned(p.add(2), regs.flags32());
+                core::ptr::write_unaligned(p, stub_eip);
+                core::ptr::write_unaligned(p.add(1), stub_sel as u32);
+                core::ptr::write_unaligned(p.add(2), saved_flags);
             } else {
                 let p = base as *mut u16;
-                core::ptr::write_unaligned(p, regs.ip32() as u16);
-                core::ptr::write_unaligned(p.add(1), regs.code_seg());
-                core::ptr::write_unaligned(p.add(2), regs.flags32() as u16);
+                core::ptr::write_unaligned(p, stub_eip as u16);
+                core::ptr::write_unaligned(p.add(1), stub_sel);
+                core::ptr::write_unaligned(p.add(2), saved_flags as u16);
             }
         }
+        dpmi.hw_irq_frames.push((saved_cs, saved_eip, saved_flags));
         regs.set_cs32(sel as u32);
         regs.set_ip32(off);
         thread::KernelAction::Done
@@ -444,6 +472,9 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
     match slot {
         dos::SLOT_EXCEPTION_RET => {
             return exception_return(dos, regs);
+        }
+        dos::SLOT_HW_IRQ_RET => {
+            return hw_irq_return(dos, regs);
         }
         dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
@@ -1483,15 +1514,16 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
 /// client stack and redirect CS:EIP. Otherwise reflect the IRQ to real mode
 /// via the IVT — same fast path as `dpmi_soft_int` uses for unhooked INT N.
 pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
-    let dpmi = match dos.dpmi.as_ref() {
+    let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => return,
     };
 
     let (sel, off) = dpmi.pm_vectors[vector as usize];
     if sel == 0 {
-        // No PM handler — reflect to real mode via the IVT. Same path used
-        // by dpmi_soft_int when pm_vectors[vec] is unset.
+        // No PM handler — reflect to real mode via the IVT (DPMI 0.9 spec:
+        // the default PM handler for HW IRQs is a stub that reflects to the
+        // real-mode handler, which the client may then chain to).
         let _ = reflect_int_to_real_mode(dos, regs, vector);
         return;
     }
@@ -1500,6 +1532,22 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     let ss_sel = regs.frame.ss as u16;
     let ss_base = seg_base(dpmi, ss_sel);
     let ss_32 = seg_is_32(dpmi, ss_sel);
+
+    // Snapshot the interrupted frame before any mutation. The client's HW IRQ
+    // handler will IRET to a host trampoline stub, not back here directly, so
+    // we stash these for `hw_irq_return` to restore when the stub fires.
+    let saved_cs = regs.code_seg();
+    let saved_eip = regs.ip32();
+    let saved_flags = regs.flags32();
+
+    // The frame we push on the client stack points at the host trampoline
+    // stub (SLOT_HW_IRQ_RET). When the client handler IRETs, it lands there;
+    // the stub's `CD 31` then traps back into the kernel via `hw_irq_return`.
+    // Note: ring-3 IRET with IOPL=0 silently ignores the popped IF bit, so
+    // we cannot rely on stacked flags to restore vIF — that's done by hand
+    // in `hw_irq_return` from `saved_flags`.
+    let stub_sel = DpmiState::idx_to_sel(5);
+    let stub_eip = dos::STUB_BASE + (dos::SLOT_HW_IRQ_RET as u32) * 2;
 
     // Push IRET frame: 16-bit clients get IRETW (6 bytes), 32-bit IRETD (12 bytes).
     let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
@@ -1514,27 +1562,73 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     unsafe {
         if use32 {
             let p = lin as *mut u32;
-            core::ptr::write_unaligned(p, regs.ip32());
-            core::ptr::write_unaligned(p.add(1), regs.code_seg() as u32);
-            core::ptr::write_unaligned(p.add(2), regs.flags32());
+            core::ptr::write_unaligned(p, stub_eip);
+            core::ptr::write_unaligned(p.add(1), stub_sel as u32);
+            core::ptr::write_unaligned(p.add(2), saved_flags);
         } else {
             let p = lin as *mut u16;
-            core::ptr::write_unaligned(p, regs.ip32() as u16);
-            core::ptr::write_unaligned(p.add(1), regs.code_seg());
-            core::ptr::write_unaligned(p.add(2), regs.flags32() as u16);
+            core::ptr::write_unaligned(p, stub_eip as u16);
+            core::ptr::write_unaligned(p.add(1), stub_sel);
+            core::ptr::write_unaligned(p.add(2), saved_flags as u16);
         }
     }
 
+    dpmi.hw_irq_frames.push((saved_cs, saved_eip, saved_flags));
+
     dpmi_trace!("[DPMI] HW_IRQ vec={:#04x} -> {:04x}:{:#x} from {:04x}:{:#x}",
-        vector, sel, off, regs.code_seg(), regs.ip32());
+        vector, sel, off, saved_cs, saved_eip);
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
+
+    // Interrupt-gate semantics: clear virtual IF on entry. vIF will be
+    // restored from `saved_flags` by `hw_irq_return`.
+    regs.frame.rflags &= !(1u64 << 9);
 
     // Set ISR bit so vpic won't deliver another interrupt until EOI
     let irq_num = vector.wrapping_sub(8);
     if irq_num < 8 {
         dos.pc.vpic.isr |= 1 << irq_num;
     }
+}
+
+/// Trampoline fired when the client IRETs out of a PM HW IRQ handler.
+///
+/// `deliver_hw_irq` pushed a fake IRET frame on the client stack whose CS:EIP
+/// points at the SLOT_HW_IRQ_RET stub (`CD 31`). The client handler's IRET
+/// pops that frame — SS:SP is now back at the value the interrupted code
+/// had when the IRQ fired (assuming the handler kept its stack balanced) —
+/// lands at the stub, which traps into `pm_stub_dispatch` → here.
+///
+/// We pop the saved frame from `hw_irq_frames` and restore CS:EIP plus the
+/// saved vIF, because ring-3 IRET with IOPL=0 silently drops the IF bit and
+/// could not have restored it on its own. All other flag bits were already
+/// popped correctly by the client's IRET, so we only patch bits 9 (IF) and
+/// 20 (VIP) from the saved image.
+pub fn hw_irq_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let dpmi = match dos.dpmi.as_mut() {
+        Some(d) => d,
+        None => {
+            crate::println!("DPMI: hw_irq_return but no DPMI state!");
+            return thread::KernelAction::Done;
+        }
+    };
+    let (cs, eip, flags) = match dpmi.hw_irq_frames.pop() {
+        Some(f) => f,
+        None => {
+            crate::println!("DPMI: hw_irq_return with empty saved stack");
+            return thread::KernelAction::Done;
+        }
+    };
+    regs.set_cs32(cs as u32);
+    regs.set_ip32(eip);
+    // Restore vIF and VIP from the snapshot. Leave IOPL/VM alone.
+    const IF_BIT: u64 = 1 << 9;
+    const VIP_BIT: u64 = 1 << 20;
+    let saved_if = (flags as u64) & IF_BIT;
+    let saved_vip = (flags as u64) & VIP_BIT;
+    regs.frame.rflags = (regs.frame.rflags & !(IF_BIT | VIP_BIT)) | saved_if | saved_vip;
+    dpmi_trace!("[DPMI] HW_IRQ_RET -> {:04x}:{:#x} flags={:#x}", cs, eip, flags);
+    thread::KernelAction::Done
 }
 
 // ============================================================================

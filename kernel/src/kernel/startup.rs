@@ -185,44 +185,40 @@ fn event_loop(first_tid: usize) {
             match &mut thread.mode {
                 thread::ThreadMode::Dos(dos) => {
                     let is_blocked = thread.state == thread::ThreadState::Blocked;
-                    // Skip during DPMI real-mode simulation — injecting IRQs would corrupt the frame.
-                    let dpmi_rm_call = dos.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some());
-                    if !dpmi_rm_call {
-                        let ticks = crate::arch::take_pending_ticks();
-                        for _ in 0..ticks {
-                            crate::kernel::machine::queue_irq(&mut dos.pc, crate::arch::Irq::Tick);
-                        }
-                        let dp = dos as *mut thread::DosState;
-                        crate::arch::drain(|evt| {
-                            if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
-                                thread::request_switch();
-                            } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
-                                dump_interrupted_thread(regs, Some(unsafe { &*dp }));
-                            } else if is_blocked {
-                                // DOS parent is blocked waiting for child — route keys
-                                // to console pipe so Linux children can read stdin
-                                if let crate::arch::Irq::Key(sc) = evt {
-                                    // Reuse Linux TTY path for echo + pipe write
-                                    if crate::kernel::keyboard::update_key_state(sc) {
-                                        let c = crate::kernel::keyboard::scancode_to_ascii(sc);
-                                        if c != 0 {
-                                            crate::vga::vga().putchar(c);
-                                            let cpipe = thread::console_pipe();
-                                            crate::kernel::kpipe::write(cpipe, &[c]);
-                                        }
+                    let ticks = crate::arch::take_pending_ticks();
+                    for _ in 0..ticks {
+                        crate::kernel::machine::queue_irq(&mut dos.pc, crate::arch::Irq::Tick);
+                    }
+                    let dp = dos as *mut thread::DosState;
+                    crate::arch::drain(|evt| {
+                        if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
+                            thread::request_switch();
+                        } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
+                            dump_interrupted_thread(regs, Some(unsafe { &*dp }));
+                        } else if is_blocked {
+                            // DOS parent is blocked waiting for child — route keys
+                            // to console pipe so Linux children can read stdin
+                            if let crate::arch::Irq::Key(sc) = evt {
+                                // Reuse Linux TTY path for echo + pipe write
+                                if crate::kernel::keyboard::update_key_state(sc) {
+                                    let c = crate::kernel::keyboard::scancode_to_ascii(sc);
+                                    if c != 0 {
+                                        crate::vga::vga().putchar(c);
+                                        let cpipe = thread::console_pipe();
+                                        crate::kernel::kpipe::write(cpipe, &[c]);
                                     }
                                 }
-                            } else {
-                                if let crate::arch::Irq::Key(sc) = evt {
-                                    unsafe { (*dp).process_key(sc); }
-                                } else {
-                                    crate::kernel::machine::queue_irq(unsafe { &mut (*dp).pc }, evt);
-                                }
                             }
-                        });
-                        if !is_blocked {
-                            crate::kernel::machine::raise_pending(unsafe { &mut *dp }, regs);
+                        } else {
+                            if let crate::arch::Irq::Key(sc) = evt {
+                                unsafe { (*dp).process_key(sc); }
+                            } else {
+                                crate::kernel::machine::queue_irq(unsafe { &mut (*dp).pc }, evt);
+                            }
                         }
+                    });
+                    if !is_blocked {
+                        crate::kernel::machine::raise_pending(unsafe { &mut *dp }, regs);
                     }
                 }
                 thread::ThreadMode::Linux(linux) => {
@@ -276,12 +272,15 @@ fn event_loop(first_tid: usize) {
                             if is_vm86 {
                                 crate::kernel::dos::handle_vm86_int(dos, regs, n)
                             } else if dos.dpmi.is_some() {
-                                // DPMI clients treat user INT n with n<32 as
-                                // an exception-handler invocation (matches
-                                // CWSDPMI / DOS32A / real-world extenders).
-                                if (n as u32) < 32 {
-                                    crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
-                                } else if n == 0x31 {
+                                // DPMI 0.9: software INT n from PM goes through
+                                // normal INT dispatch (pm_vectors[n] → reflect
+                                // to RM IVT). CPU exceptions are delivered via
+                                // KE::Exception, not KE::SoftInt, so a SoftInt
+                                // opcode (CD nn) must not be treated as an
+                                // exception even when n matches an exception
+                                // vector — BIOS ranges like INT 10h/13h/16h
+                                // live inside 0..0x20 and must reflect.
+                                if n == 0x31 {
                                     crate::kernel::dos::dpmi::dpmi_int31(dos, regs)
                                 } else {
                                     crate::kernel::dos::dpmi::dpmi_soft_int(dos, regs, n)
@@ -294,8 +293,8 @@ fn event_loop(first_tid: usize) {
                             if dos.dpmi.is_some() {
                                 crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
                             } else {
-                                crate::println!("DOS: CPU exception {} in non-DPMI thread at CS:EIP={:#06x}:{:#x}",
-                                    n, regs.frame.cs as u16, regs.ip32());
+                                crate::println!("DOS: CPU exception {} in non-DPMI thread at CS:EIP={:#x}:{:#x}",
+                                    n, regs.code_seg(), regs.ip32());
                                 thread::KernelAction::Exit(-11)
                             }
                         }
@@ -396,15 +395,17 @@ fn event_loop(first_tid: usize) {
                 verify_cpu_hash(new, "switch-in");
                 let mut swap_regs = new.cpu_state;
                 let mut swap_root = new.root;
+                let mut swap_fx = new.fx_state;
                 if ASSERT_ADDR_HASH {
                     let mut hash = new.addr_hash;
-                    arch_switch_to(&mut swap_regs, &mut swap_root, &mut hash);
+                    arch_switch_to(&mut swap_regs, &mut swap_root, &mut hash, &mut swap_fx);
                     old.addr_hash = hash;
                 } else {
-                    arch_switch_to(&mut swap_regs, &mut swap_root, core::ptr::null_mut());
+                    arch_switch_to(&mut swap_regs, &mut swap_root, core::ptr::null_mut(), &mut swap_fx);
                 }
                 old.cpu_state = swap_regs;
                 old.root = swap_root;
+                old.fx_state = swap_fx;
                 old.cpu_hash = thread::hash_regs(&old.cpu_state);
                 if new_dos {
                     let dos = new.dos_mut();
@@ -479,7 +480,7 @@ fn handle_fork_exec(
     let child_tid = child.tid as usize;
 
     // Switch into child address space to load binary
-    arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut());
+    arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut(), core::ptr::null_mut());
 
     if is_elf {
         crate::dbg_println!("  fork done, loading ELF...");
@@ -488,7 +489,7 @@ fn handle_fork_exec(
         let loaded = match crate::kernel::elf::load_elf(&buf) {
             Ok(e) => e,
             Err(_) => {
-                arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut());
+                arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut(), core::ptr::null_mut());
                 thread::exit_thread(child_tid, 1);
                 on_error(regs, 11);
                 return None;
@@ -502,7 +503,7 @@ fn handle_fork_exec(
         crate::dbg_println!("  stack={:#x} want_64={}", sp, want_64);
         let symbols = crate::kernel::stacktrace::SymbolData::new(buf.into_boxed_slice());
 
-        arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut());
+        arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut(), core::ptr::null_mut());
 
         if want_64 {
             thread::init_process_thread_64(child, loaded.entry, sp as u64);
@@ -533,7 +534,7 @@ fn handle_fork_exec(
             match dos::load_exe(&buf, path) {
                 Some(t) => t,
                 None => {
-                    arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut());
+                    arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut(), core::ptr::null_mut());
                     thread::exit_thread(child_tid, 1);
                     on_error(regs, 11);
                     return None;
@@ -543,7 +544,7 @@ fn handle_fork_exec(
             dos::load_com(&buf, path)
         };
 
-        arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut());
+        arch_switch_to(&mut child.cpu_state, &mut child.root, core::ptr::null_mut(), core::ptr::null_mut());
 
         thread::init_process_thread_vm86(child, dos::COM_SEGMENT, cs, ip, ss, sp);
         let dos_state = child.dos_mut();
@@ -624,8 +625,8 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
         }
     } else {
         let fl = regs.flags32();
-        crate::dbg_println!("[DBG] PM EIP={:#010x} EFLAGS={:#010x} IF={}",
-            regs.ip32(), fl, (fl >> 9) & 1);
+        crate::dbg_println!("[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} IF={}",
+            regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), fl, (fl >> 9) & 1);
         if let Some(d) = dos { dump_virtual_hw(d); }
         crate::kernel::stacktrace::stack_trace_regs(regs);
     }
@@ -684,10 +685,16 @@ fn do_arch_execute() -> crate::arch::monitor::KernelEvent {
 pub fn arch_switch_to(
     regs: &mut crate::Regs, root: &mut crate::RootPageTable,
     hash_ptr: *mut u64,
+    fx_ptr: *mut crate::arch::FxState,
 ) {
+    // LLVM reserves ESI/EDI for its own use in inline asm on x86, so we
+    // can't name them directly. Stash fx_ptr in ESI around the int 0x80.
     unsafe {
         core::arch::asm!(
+            "xchg esi, {fx}",
             "int 0x80",
+            "xchg esi, {fx}",
+            fx = inout(reg) fx_ptr as u32 => _,
             in("eax") crate::arch::arch_call::SWITCH_TO as u32,
             in("edx") regs as *mut _ as u32,
             in("ecx") root as *mut _ as u32,

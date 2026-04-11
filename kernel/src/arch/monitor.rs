@@ -156,6 +156,7 @@ pub use crate::arch::descriptors::{seg_base, seg_is_32};
 // =============================================================================
 
 const IF_FLAG:    u32 = 1 << 9;
+const TF_FLAG:    u32 = 1 << 8;
 const IOPL_MASK:  u32 = 3 << 12;
 const VM_FLAG:    u32 = 1 << 17;
 const OF_FLAG:    u32 = 1 << 11;
@@ -287,13 +288,15 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
     match opcode {
         // ----- Flag / stack instructions (fast path) -----
 
-        // CLI
+        // CLI — clear virtual IF. The caller (#GP path or step_virtual_if)
+        // is responsible for arming TF=1 so POPF/IRET that would silently
+        // drop the IF bit at CPL>IOPL get intercepted.
         0xFA => {
             advance_ip(regs, cs_32, advance);
             regs.clear_flag32(IF_FLAG);
             MonitorResult::Resume
         }
-        // STI
+        // STI — re-enable virtual IF.
         0xFB => {
             advance_ip(regs, cs_32, advance);
             regs.set_flag32(IF_FLAG);
@@ -471,4 +474,71 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
 
         _ => Event(E::Fault),
     }
+}
+
+// =============================================================================
+// Virtual-IF single-step driver
+// =============================================================================
+//
+// DPMI protected mode runs CPL=3 with IOPL=0. At CPL>IOPL, `POPF`/`IRET`
+// silently drop the IF bit instead of `#GP`-ing, so we can't use the `#GP`
+// monitor alone to track virtual IF. The workaround: after the client clears
+// virtual IF (via `CLI`), walk the instruction stream until virtual IF comes
+// back on, emulating every sensitive opcode in software so hardware never
+// gets a chance to silently drop the IF bit. For non-sensitive instructions
+// we arm `TF=1` and let hardware run exactly one instruction, then come back
+// via `#DB` to inspect the next opcode.
+//
+// Invariants:
+// - `regs.ip32()` always points to the next instruction to execute.
+// - Only called in PM mode with virtual IF already == 0.
+// - TF management lives entirely inside this function; individual opcode
+//   handlers in `monitor()` do not touch TF.
+
+pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
+    // Upper bound on how many sensitive instructions we emulate before
+    // yielding back to hardware. Prevents a runaway interpret loop on e.g.
+    // `POPF; POPF; POPF; ...`.
+    const BUDGET: usize = 64;
+
+    for _ in 0..BUDGET {
+        // Fast path: virtual IF came back on — stop stepping.
+        if regs.flags32() & IF_FLAG != 0 {
+            regs.clear_flag32(TF_FLAG);
+            return MonitorResult::Resume;
+        }
+
+        // Peek the next opcode (skipping legacy prefixes we care about) to
+        // decide if we MUST emulate it. Only the flag-touching instructions
+        // that would silently drop IF need software emulation here.
+        let (cs_base, _) = code_view(regs);
+        let mut p = regs.ip32();
+        loop {
+            let b = peek_byte(cs_base, p);
+            if b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 {
+                p = p.wrapping_add(1);
+            } else {
+                break;
+            }
+        }
+        let op = peek_byte(cs_base, p);
+        // 0x9C PUSHF, 0x9D POPF, 0xCF IRET, 0xFA CLI, 0xFB STI.
+        let must_emulate = matches!(op, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB);
+        if !must_emulate {
+            // Non-sensitive instruction — let hardware execute one step,
+            // then #DB brings us back to re-check.
+            regs.set_flag32(TF_FLAG);
+            return MonitorResult::Resume;
+        }
+
+        // Sensitive: emulate via the monitor decoder and loop to re-check.
+        match monitor(regs) {
+            MonitorResult::Resume => continue,
+            ev @ MonitorResult::Event(_) => return ev,
+        }
+    }
+
+    // Budget exhausted — back off to hardware stepping for a while.
+    regs.set_flag32(TF_FLAG);
+    MonitorResult::Resume
 }

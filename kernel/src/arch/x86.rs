@@ -2,6 +2,44 @@
 
 use core::arch::asm;
 
+/// x87/SSE state save area used by `fxsave`/`fxrstor`.
+/// Must be 16-byte aligned. Size is 512 bytes.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FxState(pub [u8; 512]);
+
+impl FxState {
+    pub const fn zeroed() -> Self { Self([0; 512]) }
+
+    /// Save the live x87/SSE register file into this area.
+    #[inline]
+    pub fn save(&mut self) {
+        unsafe { asm!("fxsave [{}]", in(reg) self as *mut _ as *mut u8, options(nostack)); }
+    }
+
+    /// Restore the x87/SSE register file from this area.
+    #[inline]
+    pub fn restore(&self) {
+        unsafe { asm!("fxrstor [{}]", in(reg) self as *const _ as *const u8, options(nostack)); }
+    }
+}
+
+/// Clean FPU template captured at boot after `fninit` — used to seed new
+/// threads so they don't inherit stale FPU state from whoever ran before.
+static mut CLEAN_FX: FxState = FxState::zeroed();
+
+/// Capture the current (just-initialized) FPU state as the template for new
+/// threads. Call once, immediately after `fninit`, during host bring-up.
+pub fn capture_clean_fx_template() {
+    unsafe { (*(&raw mut CLEAN_FX)).save(); }
+}
+
+/// Return a copy of the clean FPU template for initializing a new thread's
+/// save area.
+pub fn clean_fx_template() -> FxState {
+    unsafe { *(&raw const CLEAN_FX) }
+}
+
 /// Read CR0 register
 #[inline]
 pub fn read_cr0() -> u32 {

@@ -354,6 +354,7 @@ pub struct Thread {
     pub time: u32,
     pub root: crate::RootPageTable,  // Root page table (union: u32 phys or [u64; 4] pdpt)
     pub cpu_state: Regs,
+    pub fx_state: crate::arch::FxState, // x87/SSE save area (16-byte aligned)
     pub exit_code: i32,
     pub addr_hash: u64,    // Debug: address space hash for corruption detection
     pub cpu_hash: u64,     // Debug: FNV hash of cpu_state, verified on switch-in
@@ -391,6 +392,7 @@ impl Thread {
             time: 0,
             root: crate::RootPageTable::empty(),
             cpu_state: Regs::empty(),
+            fx_state: crate::arch::FxState::zeroed(),
             exit_code: 0,
             addr_hash: 0,
             cpu_hash: 0,
@@ -484,6 +486,7 @@ pub fn create_thread(parent_tid: Option<usize>, root: crate::RootPageTable, is_p
                 t.time = crate::arch::get_ticks() as u32;
                 t.root = root;
                 t.cpu_state = Regs::empty();
+                t.fx_state = crate::arch::clean_fx_template();
                 t.exit_code = 0;
                 t.addr_hash = 0;
                 t.cpu_hash = 0;
@@ -691,7 +694,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                     // so arch_user_clean doesn't free parent's pages.
                     let mut empty = crate::RootPageTable::empty();
                     crate::kernel::startup::arch_switch_to(
-                        &mut thread.cpu_state, &mut empty, core::ptr::null_mut(),
+                        &mut thread.cpu_state, &mut empty, core::ptr::null_mut(), core::ptr::null_mut(),
                     );
                     thread.root = empty;
                     unblock_thread(parent_tid);
