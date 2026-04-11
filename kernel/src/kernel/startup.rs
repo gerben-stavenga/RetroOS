@@ -300,7 +300,7 @@ fn event_loop(first_tid: usize) {
                 thread::ThreadMode::Dos(dos) => {
                     if regs.mode() == crate::UserMode::VM86 {
                         match event {
-                            13 => crate::kernel::dos::vm86_monitor(dos, regs),
+                            13 => crate::kernel::machine::vm86_monitor(dos, regs),
                             _ => {
                                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                                 let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
