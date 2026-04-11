@@ -4,7 +4,6 @@
 //! that gives the system meaning but doesn't require hardware privilege.
 
 pub mod dos;
-pub mod dpmi;
 pub mod elf;
 pub mod ext4fs;
 pub mod hdd;

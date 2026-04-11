@@ -1110,7 +1110,7 @@ pub fn vm86_pop(regs: &mut Regs) -> u16 {
 // ============================================================================
 // Raise helper — drain the next pending IRQ and dispatch to the active
 // personality. This is the one place the machine layer calls back out to
-// the personality (via `crate::kernel::dpmi::deliver_hw_irq` for PM mode
+// the personality (via `crate::kernel::dos::dpmi::deliver_hw_irq` for PM mode
 // and `reflect_interrupt` directly for VM86); it lives here so the event
 // loop has one canonical entry point.
 // ============================================================================
@@ -1123,7 +1123,7 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     if regs.mode() == crate::UserMode::VM86 {
         reflect_interrupt(regs, vec);
     } else {
-        crate::kernel::dpmi::deliver_hw_irq(dos, regs, vec);
+        crate::kernel::dos::dpmi::deliver_hw_irq(dos, regs, vec);
     }
 }
 
@@ -1151,7 +1151,7 @@ pub fn monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAct
         vm86_monitor(dos, regs)
     } else {
         // PM decode path lives in dpmi.rs due to LDT segment-base coupling.
-        crate::kernel::dpmi::dpmi_monitor(dos, regs)
+        crate::kernel::dos::dpmi::dpmi_monitor(dos, regs)
     }
 }
 

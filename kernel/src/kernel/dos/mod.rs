@@ -1,17 +1,26 @@
-//! DOS personality — MS-DOS compatible execution environment.
+//! DOS/DPMI personality — MS-DOS compatible execution environment with a
+//! DPMI 0.9 host layered on top.
 //!
 //! Built on top of the `machine` layer which owns the GP-fault monitor,
-//! virtual 8259/8253/8042, and VGA register set. This module provides:
+//! virtual 8259/8253/8042, and VGA register set. This module provides the
+//! DOS half of the personality directly:
 //! - `handle_vm86_int` — dispatched by `machine::monitor` on software INT in VM86
 //! - INT 21h (DOS services), INT 10h/13h/16h/1Ah (BIOS), INT 2Fh (multiplex)
 //! - XMS 3.0 / EMS 4.0 / UMB memory services
 //! - .COM and MZ .EXE program loaders, EXEC chain (fork/exec parent tracking)
 //! - PSP, SFT, CDS, LOL real-mode structures; FindFirst/FindNext state
 //!
+//! The DPMI extender (submodule `dpmi`) owns the PM half: LDT/descriptor
+//! management, PM GP-fault decode, INT 31h, exception/soft-INT reflection,
+//! real-mode callbacks, and locked memory handles. PM→RM INT translation in
+//! `dpmi::dpmi_soft_int` reflects down into the DOS handlers here.
+//!
 //! The BIOS ROM at 0xF0000-0xFFFFF and the BIOS IVT at 0x0000-0x03FF are
 //! preserved from the original hardware state (via COW page 0). BIOS handlers
 //! work transparently because their I/O instructions trap through the TSS IOPB
 //! to our virtual devices in the `machine` module.
+
+pub mod dpmi;
 
 extern crate alloc;
 
@@ -420,20 +429,20 @@ fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelA
     let action = match slot {
         SLOT_XMS => xms_dispatch(dos, regs),
         SLOT_DPMI_ENTRY => {
-            crate::kernel::dpmi::dpmi_enter(dos, regs);
+            dpmi::dpmi_enter(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_CALLBACK_RET => {
-            crate::kernel::dpmi::callback_return(dos, regs);
+            dpmi::callback_return(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RAW_REAL_TO_PM => {
-            crate::kernel::dpmi::raw_switch_real_to_pm(dos, regs);
+            dpmi::raw_switch_real_to_pm(dos, regs);
             thread::KernelAction::Done
         }
         s if s >= SLOT_CB_ENTRY_BASE && s < SLOT_CB_ENTRY_END => {
             let cb_idx = (s - SLOT_CB_ENTRY_BASE) as usize;
-            crate::kernel::dpmi::callback_entry(dos, regs, cb_idx);
+            dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
         }
         0x13 => int_13h(regs),

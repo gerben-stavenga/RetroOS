@@ -81,7 +81,7 @@ pub struct DosState {
     pub find_path_len: u8,
     pub find_idx: u16,
 
-    pub dpmi: Option<alloc::boxed::Box<crate::kernel::dpmi::DpmiState>>,
+    pub dpmi: Option<alloc::boxed::Box<crate::kernel::dos::dpmi::DpmiState>>,
     pub num_fds: i32,
     pub fds: [i32; MAX_FDS],
     pub cwd: [u8; 64],

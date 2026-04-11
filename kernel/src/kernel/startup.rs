@@ -313,9 +313,9 @@ fn event_loop(first_tid: usize) {
                             bytes[4], bytes[5], bytes[6], bytes[7]);
                     } else if dos.dpmi.is_some() {
                         match event {
-                            0x31 => crate::kernel::dpmi::dpmi_int31(dos, regs),
-                            0..=31 => crate::kernel::dpmi::dispatch_dpmi_exception(dos, regs, event),
-                            0x30..=0xFF => crate::kernel::dpmi::dpmi_soft_int(dos, regs, event as u8),
+                            0x31 => crate::kernel::dos::dpmi::dpmi_int31(dos, regs),
+                            0..=31 => crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, event),
+                            0x30..=0xFF => crate::kernel::dos::dpmi::dpmi_soft_int(dos, regs, event as u8),
                             _ => {
                                 crate::println!("DPMI: unexpected event {} at CS:EIP={:#06x}:{:#x}",
                                     event, regs.frame.cs as u16, regs.ip32());
