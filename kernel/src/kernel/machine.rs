@@ -1128,22 +1128,36 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
 }
 
 // ============================================================================
-// VM86 monitor — GP fault handler for sensitive instructions in real mode
+// GP-fault monitor — single entry point for sensitive-instruction faults
 //
+// There is conceptually one monitor; the CPU mode at fault time selects the
+// decode path:
+//   - EFLAGS.VM=1 → real-mode decode at CS*16+IP (vm86_monitor)
+//   - protected mode → 16/32-bit decode via LDT segment base (dpmi_monitor)
+//
+// Machine-level concerns (I/O emulation, IRET framing, PUSHF/POPF, CLI/STI)
+// live here. Two narrow callouts cross into personalities:
+//   - software INT dispatch in VM86 → `dos::handle_vm86_int`
+//   - the entire PM path → `dpmi::dpmi_monitor` (LDT-coupled)
 // With IOPL=0 all I/O traps here regardless of IOPB.
-// VGA ports (0x3C0-0x3DF) are passed through to hardware.
-// PIC/keyboard are virtualized. Other ports: IN returns 0xFF, OUT is no-op.
-//
-// This is machine-level: instruction decode, I/O emulation, IRET framing,
-// PUSHF/POPF, CLI/STI. The one callout to the personality is for software
-// INT dispatch (INT n / INT3 / INTO / INT1) which routes through
-// `crate::kernel::dos::handle_vm86_int` — DOS owns the intercepted INT
-// handlers (21h/10h/13h/16h/1Ah/2Fh/31h).
+// VGA ports (0x3C0-0x3DF) are passed through to hardware; PIC/keyboard are
+// virtualized; other ports: IN returns 0xFF, OUT is no-op.
 // ============================================================================
 
-/// VM86 monitor — called from GP fault handler when EFLAGS.VM=1.
+/// GP-fault monitor entry point for DOS threads. Dispatches to the VM86 or
+/// PM decode path based on the faulting CPU mode.
+pub fn monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    if regs.mode() == crate::UserMode::VM86 {
+        vm86_monitor(dos, regs)
+    } else {
+        // PM decode path lives in dpmi.rs due to LDT segment-base coupling.
+        crate::kernel::dpmi::dpmi_monitor(dos, regs)
+    }
+}
+
+/// VM86 decode path — called from `monitor` when EFLAGS.VM=1.
 /// Arch boundary swaps VIF↔IF, so IF is the virtual interrupt flag throughout.
-pub fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn vm86_monitor(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let opcode = fetch_byte(regs);
 
     match opcode {

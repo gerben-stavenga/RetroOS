@@ -264,7 +264,7 @@ impl LinuxState {
 }
 
 /// What the OS personality wants the kernel to do.
-/// Returned by vm86_monitor, dpmi_monitor, syscall dispatch.
+/// Returned by machine::monitor, syscall dispatch, and DPMI INT/exception paths.
 /// The event loop acts on it — personality code never touches scheduling.
 pub enum KernelAction {
     /// Nothing to do, continue current thread.

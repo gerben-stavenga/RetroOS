@@ -1,8 +1,8 @@
 //! DOS personality — MS-DOS compatible execution environment.
 //!
-//! Built on top of the `machine` layer which owns the VM86 GP-fault monitor,
+//! Built on top of the `machine` layer which owns the GP-fault monitor,
 //! virtual 8259/8253/8042, and VGA register set. This module provides:
-//! - `handle_vm86_int` — dispatched by `machine::vm86_monitor` on software INT
+//! - `handle_vm86_int` — dispatched by `machine::monitor` on software INT in VM86
 //! - INT 21h (DOS services), INT 10h/13h/16h/1Ah (BIOS), INT 2Fh (multiplex)
 //! - XMS 3.0 / EMS 4.0 / UMB memory services
 //! - .COM and MZ .EXE program loaders, EXEC chain (fork/exec parent tracking)

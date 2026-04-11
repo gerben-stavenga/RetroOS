@@ -298,25 +298,21 @@ fn event_loop(first_tid: usize) {
 
             _ => match &mut thread.mode {
                 thread::ThreadMode::Dos(dos) => {
-                    if regs.mode() == crate::UserMode::VM86 {
-                        match event {
-                            13 => crate::kernel::machine::vm86_monitor(dos, regs),
-                            _ => {
-                                let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
-                                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-                                crate::dbg_println!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] tid={}",
-                                    event, regs.code_seg(), regs.ip32() as u16, lin,
-                                    bytes[0], bytes[1], bytes[2], bytes[3],
-                                    bytes[4], bytes[5], bytes[6], bytes[7], tid);
-                                panic!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                                    event, regs.code_seg(), regs.ip32() as u16, lin,
-                                    bytes[0], bytes[1], bytes[2], bytes[3],
-                                    bytes[4], bytes[5], bytes[6], bytes[7]);
-                            }
-                        }
+                    if event == 13 {
+                        crate::kernel::machine::monitor(dos, regs)
+                    } else if regs.mode() == crate::UserMode::VM86 {
+                        let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
+                        let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                        crate::dbg_println!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] tid={}",
+                            event, regs.code_seg(), regs.ip32() as u16, lin,
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                            bytes[4], bytes[5], bytes[6], bytes[7], tid);
+                        panic!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                            event, regs.code_seg(), regs.ip32() as u16, lin,
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                            bytes[4], bytes[5], bytes[6], bytes[7]);
                     } else if dos.dpmi.is_some() {
                         match event {
-                            13 => crate::kernel::dpmi::dpmi_monitor(dos, regs),
                             0x31 => crate::kernel::dpmi::dpmi_int31(dos, regs),
                             0..=31 => crate::kernel::dpmi::dispatch_dpmi_exception(dos, regs, event),
                             0x30..=0xFF => crate::kernel::dpmi::dpmi_soft_int(dos, regs, event as u8),
