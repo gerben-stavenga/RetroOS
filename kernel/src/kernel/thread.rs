@@ -264,8 +264,9 @@ impl LinuxState {
 }
 
 /// What the OS personality wants the kernel to do.
-/// Returned by machine::monitor, syscall dispatch, and DPMI INT/exception paths.
-/// The event loop acts on it — personality code never touches scheduling.
+/// Returned by the KernelEvent dispatch in `startup::event_loop`, by syscall
+/// dispatch, and by DPMI INT/exception paths. The event loop acts on it —
+/// personality code never touches scheduling.
 pub enum KernelAction {
     /// Nothing to do, continue current thread.
     Done,
@@ -563,74 +564,6 @@ pub fn cancel_parent_wait(child_tid: usize) {
         parent.cpu_state.rax = (parent.cpu_state.rax & !0xFFFF) | 0x0001;
         refresh_cpu_hash(parent);
     }
-}
-
-/// Wake any thread blocked on a pending read, if data is now available.
-/// Called from event loop after draining keyboard events.
-/// Only marks the thread Ready — the actual read is completed by
-/// `complete_pending_read` once the thread's address space is active.
-pub fn wake_blocked_readers() {
-    unsafe {
-        for i in 1..MAX_THREADS {
-            let t = &mut THREADS[i];
-            if t.state != ThreadState::Blocked { continue; }
-            if let ThreadMode::Linux(ref linux) = t.mode {
-                if let Some(ref pr) = linux.pending_read {
-                    let ready = match pr.fd_kind {
-                        FdKind::PipeRead(idx) => {
-                            crate::kernel::kpipe::has_data(idx)
-                                || !crate::kernel::kpipe::has_writers(idx)
-                        }
-                        _ => false,
-                    };
-                    if ready {
-                        t.state = ThreadState::Ready;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Complete a pending read for the current thread (address space is active).
-/// Called from event loop before executing userspace.
-/// Returns None if no pending read, Some(true) if completed, Some(false) if re-blocked.
-pub fn complete_pending_read(tid: usize, regs: &mut crate::Regs) -> Option<bool> {
-    unsafe {
-        let t = &mut THREADS[tid];
-        if let ThreadMode::Linux(ref mut linux) = t.mode {
-            if let Some(ref pr) = linux.pending_read {
-                let (fd_kind, buf_ptr, buf_len) = (pr.fd_kind, pr.buf_ptr, pr.buf_len);
-                let user_buf = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len);
-                match fd_kind {
-                    FdKind::PipeRead(idx) => {
-                        let n = crate::kernel::kpipe::read(idx, user_buf);
-                        if n > 0 {
-                            linux.pending_read = None;
-                            regs.rax = n as u64;
-                            return Some(true);
-                        }
-                        // No data — if no writers, return EOF
-                        if !crate::kernel::kpipe::has_writers(idx) {
-                            linux.pending_read = None;
-                            regs.rax = 0; // EOF
-                            return Some(true);
-                        }
-                        // Still waiting — re-block
-                        t.state = ThreadState::Blocked;
-                        return Some(false);
-                    }
-                    _ => {
-                        // Unknown fd kind for pending read — cancel
-                        linux.pending_read = None;
-                        regs.rax = (-9i32) as u64; // EBADF
-                        return Some(true);
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Yield a thread: save regs, mark Ready, schedule next.

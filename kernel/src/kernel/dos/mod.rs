@@ -1,10 +1,11 @@
 //! DOS/DPMI personality — MS-DOS compatible execution environment with a
 //! DPMI 0.9 host layered on top.
 //!
-//! Built on top of the `machine` layer which owns the GP-fault monitor,
-//! virtual 8259/8253/8042, and VGA register set. This module provides the
-//! DOS half of the personality directly:
-//! - `handle_vm86_int` — dispatched by `machine::monitor` on software INT in VM86
+//! Built on top of the `machine` layer which owns the virtual 8259/8253/8042
+//! and VGA register set, and `arch::monitor` which decodes #GP-faulting
+//! sensitive instructions. This module provides the DOS half of the
+//! personality directly:
+//! - `handle_vm86_int` — called from the event loop on a VM86 `SoftInt`
 //! - INT 21h (DOS services), INT 10h/13h/16h/1Ah (BIOS), INT 2Fh (multiplex)
 //! - XMS 3.0 / EMS 4.0 / UMB memory services
 //! - .COM and MZ .EXE program loaders, EXEC chain (fork/exec parent tracking)

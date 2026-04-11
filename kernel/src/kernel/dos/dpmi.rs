@@ -367,276 +367,19 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     }
 
     // pm_vectors stays zero-initialized: sel=0 means "no client handler",
-    // which signals reflect-to-real-mode in dpmi_monitor / dpmi_soft_int.
-    // INT 31h/0204h synthesizes the stub address on demand for clients that
-    // chain to the default handler.
+    // which signals reflect-to-real-mode in dpmi_soft_int. INT 31h/0204h
+    // synthesizes the stub address on demand for clients that chain to the
+    // default handler.
 
     // Store DPMI state on thread
     dos.dpmi = Some(Box::new(dpmi));
 
 }
 
-// ============================================================================
-// DPMI monitor — GP fault handler for protected-mode DOS code
-// ============================================================================
-
-/// Build the segment context the PM decoder needs. Called by the
-/// dispatcher in `machine::monitor` before `dpmi_monitor` runs.
-pub fn build_seg_ctx(dpmi: &DpmiState, regs: &Regs) -> machine::SegCtx {
-    machine::SegCtx {
-        cs_base: seg_base(dpmi, regs.code_seg()),
-        cs_32:   seg_is_32(dpmi, regs.code_seg()),
-        ss_base: seg_base(dpmi, regs.stack_seg()),
-        ss_32:   seg_is_32(dpmi, regs.stack_seg()),
-    }
-}
-
-/// PM decode path — pure x86 machine emulation for #GP faults in 16/32-bit
-/// protected mode. Takes only the PC machine, a pre-resolved segment view,
-/// and the register frame; no DPMI state, no DosState, no KernelAction.
-///
-/// Returns a `PmEvent` the dispatcher translates into kernel policy.
-/// Handles sensitive instructions that #GP from ring 3: CLI/STI, PUSHF/POPF,
-/// IN/OUT, HLT, IRET, and INT imm8. INT imm8 reports `SoftInt(vector)` so
-/// the personality can consult `pm_vectors` and either dispatch a PM
-/// handler or reflect to real mode.
-pub fn dpmi_monitor(pc: &mut machine::PcMachine, seg: &machine::SegCtx, regs: &mut Regs) -> machine::PmEvent {
-    let cs_32 = seg.cs_32;
-    let flat_eip = seg.cs_base.wrapping_add(regs.ip32());
-    let ss_base = seg.ss_base;
-    let ss_32 = seg.ss_32;
-
-    // Helper: get/set SP respecting SS B bit
-    let get_sp = |regs: &Regs| -> u32 {
-        if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF }
-    };
-    let set_sp = |regs: &mut Regs, val: u32| {
-        if ss_32 {
-            regs.set_sp32(val);
-        } else {
-            regs.set_sp32((regs.sp32() & !0xFFFF) | (val & 0xFFFF));
-        }
-    };
-
-    // Parse prefix bytes
-    let mut offset = 0u32;
-    let mut op_size_override = false;
-    loop {
-        let b = unsafe { *((flat_eip.wrapping_add(offset)) as *const u8) };
-        match b {
-            0x66 => { op_size_override = true; offset += 1; }
-            _ => break,
-        }
-    }
-
-    // Effective operand size: 32 if (cs_32 XOR override)
-    let op32 = cs_32 ^ op_size_override;
-
-    // Read instruction byte(s)
-    let opcode = unsafe { *((flat_eip.wrapping_add(offset)) as *const u8) };
-    let mut advance = offset + 1;
-
-    dpmi_trace!("[DPMI] GP#{} CS:EIP={:04x}:{:#x} op={:#04x}", 13, regs.code_seg(), regs.ip32(), opcode);
-
-    // Advance IP by `n` bytes, respecting the code segment's B bit.
-    let advance_ip = |regs: &mut Regs, n: u32| {
-        let new_ip = regs.ip32().wrapping_add(n);
-        if cs_32 { regs.set_ip32(new_ip); } else { regs.set_ip32(new_ip & 0xFFFF); }
-    };
-
-    match opcode {
-        // CLI — clear virtual IF
-        0xFA => {
-            regs.frame.rflags &= !(machine::IF_FLAG as u64);
-        }
-        // STI — set virtual IF
-        0xFB => {
-            regs.frame.rflags |= machine::IF_FLAG as u64;
-        }
-        // PUSHF — push flags (IF is already the virtual interrupt flag)
-        0x9C => {
-            let flags = regs.flags32();
-            let sp = get_sp(regs);
-            if op32 {
-                let new_sp = sp.wrapping_sub(4);
-                set_sp(regs, new_sp);
-                unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(new_sp)) as *mut u32, flags); }
-            } else {
-                let new_sp = sp.wrapping_sub(2);
-                set_sp(regs, new_sp);
-                unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(new_sp)) as *mut u16, flags as u16); }
-            }
-        }
-        // POPF — pop flags (IF from popped value becomes virtual IF)
-        0x9D => {
-            let sp = get_sp(regs);
-            let flags = if op32 {
-                let v = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
-                set_sp(regs, sp.wrapping_add(4));
-                v
-            } else {
-                let v = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) } as u32;
-                set_sp(regs, sp.wrapping_add(2));
-                v
-            };
-            let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
-            regs.set_flags32((flags & !machine::PRESERVED_FLAGS) | preserved);
-        }
-        // HLT — guest idle; dispatcher yields
-        0xF4 => {
-            advance_ip(regs, advance);
-            trace_client_selector_leak("dpmi_monitor.hlt", regs);
-            return machine::PmEvent::Halt;
-        }
-        // IRET — pop IP/CS/FLAGS, size depends on operand size
-        0xCF => {
-            let sp = get_sp(regs);
-            if op32 {
-                let new_eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
-                let new_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) } as u16;
-                let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 8)) as *const u32) };
-                if new_cs == 0 {
-                    return machine::PmEvent::Fault;
-                }
-                set_sp(regs, sp.wrapping_add(12));
-                regs.set_ip32(new_eip);
-                regs.set_cs32(new_cs as u32);
-                let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
-                regs.set_flags32((new_flags & !machine::PRESERVED_FLAGS) | preserved);
-            } else {
-                let new_ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) };
-                let new_cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) };
-                let new_flags = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u16) } as u32;
-                if new_cs == 0 {
-                    return machine::PmEvent::Fault;
-                }
-                set_sp(regs, sp.wrapping_add(6));
-                regs.set_ip32(new_ip as u32);
-                regs.set_cs32(new_cs as u32);
-                let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
-                regs.set_flags32((new_flags & !machine::PRESERVED_FLAGS) | preserved);
-            }
-            trace_client_selector_leak("dpmi_monitor.iret", regs);
-            return machine::PmEvent::Continue; // IP already set
-        }
-        // IN AL, imm8
-        0xE4 => {
-            let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
-            advance = 2;
-            let val = machine::emulate_inb(pc, port);
-            regs.rax = (regs.rax & !0xFF) | val as u64;
-        }
-        // IN AL, DX
-        0xEC => {
-            let port = regs.rdx as u16;
-            let val = machine::emulate_inb(pc, port);
-            regs.rax = (regs.rax & !0xFF) | val as u64;
-        }
-        // OUT imm8, AL
-        0xE6 => {
-            let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
-            advance = 2;
-            machine::emulate_outb(pc, port, regs.rax as u8);
-        }
-        // OUT DX, AL
-        0xEE => {
-            let port = regs.rdx as u16;
-            machine::emulate_outb(pc, port, regs.rax as u8);
-        }
-        // IN AX, imm8 (16-bit)
-        0xE5 => {
-            let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
-            advance = 2;
-            let lo = machine::emulate_inb(pc, port);
-            let hi = machine::emulate_inb(pc, port + 1);
-            regs.rax = (regs.rax & !0xFFFF) | lo as u64 | ((hi as u64) << 8);
-        }
-        // IN AX, DX (16-bit)
-        0xED => {
-            let port = regs.rdx as u16;
-            let lo = machine::emulate_inb(pc, port);
-            let hi = machine::emulate_inb(pc, port + 1);
-            regs.rax = (regs.rax & !0xFFFF) | lo as u64 | ((hi as u64) << 8);
-        }
-        // OUT imm8, AX (16-bit)
-        0xE7 => {
-            let port = unsafe { *(flat_eip.wrapping_add(1) as *const u8) } as u16;
-            advance = 2;
-            machine::emulate_outb(pc, port, regs.rax as u8);
-            machine::emulate_outb(pc, port + 1, (regs.rax >> 8) as u8);
-        }
-        // OUT DX, AX (16-bit)
-        0xEF => {
-            let port = regs.rdx as u16;
-            machine::emulate_outb(pc, port, regs.rax as u8);
-            machine::emulate_outb(pc, port + 1, (regs.rax >> 8) as u8);
-        }
-        // INT imm8 — software interrupt (GP faults because IDT DPL=0 for
-        // vectors < 0x30). Decoder advances IP past the INT and hands the
-        // vector to the dispatcher; `pm_soft_int_dispatch` does the
-        // `pm_vectors` lookup and PM handler push / RM reflect.
-        0xCD => {
-            let vector = unsafe { *((flat_eip.wrapping_add(offset + 1)) as *const u8) };
-            advance_ip(regs, offset + 2);
-            return machine::PmEvent::SoftInt(vector);
-        }
-        _ => {
-            // Not a sensitive instruction — reflect as #GP.
-            return machine::PmEvent::Fault;
-        }
-    }
-
-    advance_ip(regs, advance);
-    trace_client_selector_leak("dpmi_monitor.step", regs);
-    machine::PmEvent::Continue
-}
-
-/// Dispatch a PM software INT that `dpmi_monitor` peeled off. If a client
-/// handler is installed in `pm_vectors`, push the appropriate IRET frame
-/// (16- or 32-bit by client bit-width) and jump to it; otherwise reflect
-/// to real mode through the IVT.
-///
-/// IP has already been advanced past the INT instruction by the decoder,
-/// so `regs.ip32()` is the correct return address to push.
-pub fn pm_soft_int_dispatch(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    let dpmi = dos.dpmi.as_ref().unwrap();
-    let (sel, off) = dpmi.pm_vectors[vector as usize];
-    if sel == 0 {
-        return reflect_int_to_real_mode(dos, regs, vector);
-    }
-    // Client handler installed — push an IRET frame matching the client's
-    // bit-width (16-bit IRETW = 6 bytes, 32-bit IRETD = 12).
-    let use32 = dpmi.client_use32;
-    let ss_base = seg_base(dpmi, regs.stack_seg());
-    let ss_32 = seg_is_32(dpmi, regs.stack_seg());
-    let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-    let frame_size: u32 = if use32 { 12 } else { 6 };
-    let new_sp = sp.wrapping_sub(frame_size);
-    if ss_32 {
-        regs.set_sp32(new_sp);
-    } else {
-        regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF));
-    }
-    let return_ip = regs.ip32();
-    unsafe {
-        let base = ss_base.wrapping_add(new_sp);
-        if use32 {
-            let p = base as *mut u32;
-            core::ptr::write_unaligned(p, return_ip);
-            core::ptr::write_unaligned(p.add(1), regs.code_seg() as u32);
-            core::ptr::write_unaligned(p.add(2), regs.flags32());
-        } else {
-            let p = base as *mut u16;
-            core::ptr::write_unaligned(p, return_ip as u16);
-            core::ptr::write_unaligned(p.add(1), regs.code_seg());
-            core::ptr::write_unaligned(p.add(2), regs.flags32() as u16);
-        }
-    }
-    regs.set_cs32(sel as u32);
-    regs.set_ip32(off);
-    trace_client_selector_leak("pm_soft_int_dispatch", regs);
-    thread::KernelAction::Done
-}
+// PM #GP monitor lives in `arch/monitor.rs`. The arch decoder handles
+// CLI/STI/PUSHF/POPF/IRET directly (fast-path iret to user) and bubbles
+// INT/HLT/IN/OUT/INS/OUTS up as `KernelEvent`s. PM software-INT dispatch
+// for installed DPMI client vectors is handled by `dpmi_soft_int` below.
 
 // ============================================================================
 // DPMI software INT dispatch (vectors 0x30-0xFF, DPL=3 in IDT)
@@ -1738,7 +1481,7 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
 /// `vector` is the interrupt vector number (e.g. 0x09 for keyboard, 0x08 for timer).
 /// If a PM handler is installed (INT 31h/0205h), push an IRET frame on the
 /// client stack and redirect CS:EIP. Otherwise reflect the IRQ to real mode
-/// via the IVT — same fast path as `dpmi_monitor` uses for unhooked INT N.
+/// via the IVT — same fast path as `dpmi_soft_int` uses for unhooked INT N.
 pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
@@ -1748,7 +1491,7 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     let (sel, off) = dpmi.pm_vectors[vector as usize];
     if sel == 0 {
         // No PM handler — reflect to real mode via the IVT. Same path used
-        // by dpmi_monitor's INT branch when pm_vectors[vec] is unset.
+        // by dpmi_soft_int when pm_vectors[vec] is unset.
         let _ = reflect_int_to_real_mode(dos, regs, vector);
         return;
     }

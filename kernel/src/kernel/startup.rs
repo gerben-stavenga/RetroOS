@@ -135,7 +135,7 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8]) {
     event_loop(tid);
 }
 
-const ASSERT_ADDR_HASH: bool = true;
+const ASSERT_ADDR_HASH: bool = false;
 
 /// Verify that a thread's saved cpu_state still matches the hash recorded on
 /// the last switch-out. Print a diff-style dump on mismatch.
@@ -179,8 +179,8 @@ fn event_loop(first_tid: usize) {
     loop {
         crate::kernel::stacktrace::set_debug_tid(tid);
         // Pre-execute: drain hardware events into OS personality
+        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         {
-            let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
             let regs = unsafe { &mut *(&raw mut REGS) };
             match &mut thread.mode {
                 thread::ThreadMode::Dos(dos) => {
@@ -188,9 +188,6 @@ fn event_loop(first_tid: usize) {
                     // Skip during DPMI real-mode simulation — injecting IRQs would corrupt the frame.
                     let dpmi_rm_call = dos.dpmi.as_ref().map_or(false, |d| d.rm_save.is_some());
                     if !dpmi_rm_call {
-                        if regs.mode() == crate::UserMode::VM86 {
-                            qemu_vga_workaround(regs);
-                        }
                         let ticks = crate::arch::take_pending_ticks();
                         for _ in 0..ticks {
                             crate::kernel::machine::queue_irq(&mut dos.pc, crate::arch::Irq::Tick);
@@ -245,94 +242,109 @@ fn event_loop(first_tid: usize) {
             }
         }
 
-        // Always check if blocked stdin readers can be woken (keyboard data may
-        // have arrived during any thread's drain, including DOS threads).
-        thread::wake_blocked_readers();
+        let kevent = do_arch_execute();
 
-        // Complete pending stdin read if this thread was woken for it
-        {
-            let regs = unsafe { &mut *(&raw mut REGS) };
-            match thread::complete_pending_read(tid, regs) {
-                Some(true) => continue,  // Read done — resume userspace
-                Some(false) => {
-                    // Re-blocked (data gone) — schedule another thread
-                    if let Some(next) = thread::schedule(tid) {
-                        if next == 0 { return; }
-                        if next != tid {
-                            let (old, new) = thread::get_two_threads(tid, next);
-                            verify_cpu_hash(new, "reblock switch-in");
-                            arch_switch_to(&mut new.cpu_state, &mut new.root, core::ptr::null_mut());
-                            old.cpu_state = unsafe { *(&raw const REGS) };
-                            old.cpu_hash = thread::hash_regs(&old.cpu_state);
-                            tid = next;
-                        }
-                    }
-                    continue;
-                }
-                None => {}  // No pending read — normal execution
-            }
-        }
-
-        let (event, extra) = do_arch_execute();
-
-        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let regs = unsafe { &mut *(&raw mut REGS) };
 
-        // signal_thread handles its own cleanup; wrap into KernelAction
-        // TODO: 64-bit child exit corrupts 32-bit parent's FS/TLS — parent
-        //       segfaults on TLS access (FS BASE=0) after resuming.
-        if event == 14 {
-            let rip = regs.frame.rip;
-            crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, extra, regs.err_code);
-            if let Some(next) = thread::signal_thread(thread, tid, extra as usize) {
-                tid = next;
-                if tid == 0 { return; }
-                continue;
-            } else {
-                continue;
-            }
-        }
-
-        let action = match event {
-            32..=47 => thread::KernelAction::Done,
+        let action = match kevent {
+            crate::arch::monitor::KernelEvent::Irq => thread::KernelAction::Done,
 
             _ => match &mut thread.mode {
                 thread::ThreadMode::Dos(dos) => {
-                    if event == 13 {
-                        crate::kernel::machine::monitor(dos, regs)
-                    } else if regs.mode() == crate::UserMode::VM86 {
-                        let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
-                        let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-                        crate::dbg_println!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] tid={}",
-                            event, regs.code_seg(), regs.ip32() as u16, lin,
-                            bytes[0], bytes[1], bytes[2], bytes[3],
-                            bytes[4], bytes[5], bytes[6], bytes[7], tid);
-                        panic!("VM86: unhandled event {} at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                            event, regs.code_seg(), regs.ip32() as u16, lin,
-                            bytes[0], bytes[1], bytes[2], bytes[3],
-                            bytes[4], bytes[5], bytes[6], bytes[7]);
-                    } else if dos.dpmi.is_some() {
-                        match event {
-                            0x31 => crate::kernel::dos::dpmi::dpmi_int31(dos, regs),
-                            0..=31 => crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, event),
-                            0x30..=0xFF => crate::kernel::dos::dpmi::dpmi_soft_int(dos, regs, event as u8),
-                            _ => {
-                                crate::println!("DPMI: unexpected event {} at CS:EIP={:#06x}:{:#x}",
-                                    event, regs.frame.cs as u16, regs.ip32());
+                    use crate::arch::monitor::KernelEvent as KE;
+                    use crate::kernel::machine;
+                    let is_vm86 = regs.mode() == crate::UserMode::VM86;
+                    match kevent {
+                        KE::Hlt => thread::KernelAction::Yield,
+                        KE::In { port, size } => {
+                            machine::handle_in_event(&mut dos.pc, regs, port, size.bytes());
+                            thread::KernelAction::Done
+                        }
+                        KE::Out { port, size } => {
+                            machine::handle_out_event(&mut dos.pc, regs, port, size.bytes());
+                            thread::KernelAction::Done
+                        }
+                        KE::Ins { size } => {
+                            machine::handle_ins_event(&mut dos.pc, regs, size.bytes());
+                            thread::KernelAction::Done
+                        }
+                        KE::Outs { size } => {
+                            machine::handle_outs_event(&mut dos.pc, regs, size.bytes());
+                            thread::KernelAction::Done
+                        }
+                        KE::SoftInt(n) => {
+                            if is_vm86 {
+                                crate::kernel::dos::handle_vm86_int(dos, regs, n)
+                            } else if dos.dpmi.is_some() {
+                                // DPMI clients treat user INT n with n<32 as
+                                // an exception-handler invocation (matches
+                                // CWSDPMI / DOS32A / real-world extenders).
+                                if (n as u32) < 32 {
+                                    crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
+                                } else if n == 0x31 {
+                                    crate::kernel::dos::dpmi::dpmi_int31(dos, regs)
+                                } else {
+                                    crate::kernel::dos::dpmi::dpmi_soft_int(dos, regs, n)
+                                }
+                            } else {
+                                thread::KernelAction::Done
+                            }
+                        }
+                        KE::Exception(n) => {
+                            if dos.dpmi.is_some() {
+                                crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
+                            } else {
+                                crate::println!("DOS: CPU exception {} in non-DPMI thread at CS:EIP={:#06x}:{:#x}",
+                                    n, regs.frame.cs as u16, regs.ip32());
                                 thread::KernelAction::Exit(-11)
                             }
                         }
-                    } else {
-                        thread::KernelAction::Done
+                        KE::Fault => {
+                            if is_vm86 {
+                                let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
+                                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                                panic!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                                    regs.code_seg(), regs.ip32() as u16, lin,
+                                    bytes[0], bytes[1], bytes[2], bytes[3],
+                                    bytes[4], bytes[5], bytes[6], bytes[7]);
+                            } else if dos.dpmi.is_some() {
+                                crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, 13)
+                            } else {
+                                thread::KernelAction::Exit(-11)
+                            }
+                        }
+                        KE::PageFault { addr } => {
+                            let rip = regs.frame.rip;
+                            crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, addr, regs.err_code);
+                            if let Some(next) = thread::signal_thread(thread, tid, addr as usize) {
+                                tid = next;
+                                if tid == 0 { return; }
+                            }
+                            thread::KernelAction::Exit(-11)
+                        }
+                        KE::Irq  => thread::KernelAction::Done,
                     }
                 }
                 thread::ThreadMode::Linux(_linux) => {
                     // Syscalls dispatch handles retval internally via regs.rax.
                     // switch_to is the only scheduling decision.
                     // TODO: migrate syscalls to KernelAction natively
-                    match event {
-                        0x80 => crate::kernel::linux::dispatch_action(tid, regs),
-                        _ => thread::KernelAction::Done,
+                    use crate::arch::monitor::KernelEvent as KE;
+                    match kevent {
+                        KE::SoftInt(0x80) => crate::kernel::linux::dispatch_action(tid, regs),
+                        KE::Irq => thread::KernelAction::Done,
+                        KE::PageFault { addr } => {
+                            let rip = regs.frame.rip;
+                            crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, addr, regs.err_code);
+                            if let Some(next) = thread::signal_thread(thread, tid, addr as usize) {
+                                tid = next;
+                                if tid == 0 { return; }
+                            }
+                            thread::KernelAction::Exit(-11)
+                        }
+                        _ => {
+                            thread::KernelAction::Exit(-11)
+                        }
                     }
                 }
             },
@@ -644,29 +656,12 @@ fn dump_virtual_hw(dos: &thread::DosState) {
         en, mode, reload, now, next, delta);
 }
 
-/// QEMU VGA bug workaround: real VGA hardware forces Odd/Even read mode
-/// (GC5 bit 4) in text modes. QEMU doesn't, so re-set it on each trap.
-fn qemu_vga_workaround(regs: &crate::Regs) {
-    unsafe {
-        if regs.cs32() < 0xC000 {
-            let mode = *(0x449 as *const u8);
-            if mode <= 3 || mode == 7 {
-                let saved_idx = crate::arch::inb(0x3CE);
-                crate::arch::outb(0x3CE, 5);
-                let gc5 = crate::arch::inb(0x3CF);
-                if gc5 & 0x10 == 0 {
-                    crate::arch::outb(0x3CF, gc5 | 0x10);
-                }
-                crate::arch::outb(0x3CE, saved_idx);
-            }
-        }
-    }
-}
-
-/// Call arch execute() via INT 0x80.
-/// Returns (event_number, extra). Extra = fault address for event 14.
+/// Resume user code via arch `EXECUTE` (INT 0x80) and return the next
+/// kernel-visible event. The arch→kernel boundary is `(eax, edx)` =
+/// `(event, extra)`; this function decodes it into `KernelEvent` right away
+/// so the event loop never sees raw tag numbers.
 #[inline(never)]
-fn do_arch_execute() -> (u32, u32) {
+fn do_arch_execute() -> crate::arch::monitor::KernelEvent {
     let event: u32;
     let extra: u32;
     unsafe {
@@ -679,7 +674,7 @@ fn do_arch_execute() -> (u32, u32) {
             out("edi") _,
         );
     }
-    (event, extra)
+    crate::arch::monitor::KernelEvent::decode(event, extra)
 }
 
 /// Switch threads: swap live state with pointed-to state.

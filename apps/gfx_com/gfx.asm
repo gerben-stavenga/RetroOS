@@ -38,12 +38,12 @@ org 0x100
     jb .diag
 
     ; Wait for keypress
-    xor ax, ax
+    mov ah, 0x00
     int 0x16
 
     ; Restore text mode 3 before exiting
     mov ax, 0x0003
     int 0x10
 
-    ; RET → PSP:0000 → INT 20h
+    ; RET → PSP:0000 → INT 20h → exit_thread
     ret

@@ -325,13 +325,39 @@ fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
     regs.int_num = int_num;
 
     if from_ring3 {
-        // User (ring 3 / VM86): handle IRQ, try page fault, return event to kernel
+        // User (ring 3 / VM86): classify the x86 vector into a `KernelEvent`
+        // and bubble it up. `#GP` runs the sensitive-instruction monitor
+        // first — on `Resume` we iret straight to user. `#PF` and IRQs are
+        // handled inline by arch before bubbling.
+        use crate::arch::monitor::{monitor, KernelEvent as KE, MonitorResult};
         let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
-        if (32..=47).contains(&int_num) { handle_irq(regs); }
-        if int_num == 14 && try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
+        let kevent: KE = match int_num {
+            13 => match monitor(regs) {
+                MonitorResult::Resume   => {
+                    if regs.flags32() & ((1 << 9) | (1 << 20)) != (1 << 9) | (1 << 20) { 
+                        return;
+                    }
+                    KE::Irq
+                }
+                MonitorResult::Event(e) => e,
+            },
+            14 => {
+                if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
+                KE::PageFault { addr: x86::read_cr2() as u32 }
+            }
+            32..=47 => { handle_irq(regs); KE::Irq }
+            // Vectors 3/4 (#BP/#OF) are only reachable from user `INT3`/`INTO`,
+            // so they're soft ints. Other n<32 are genuine CPU exceptions.
+            3 | 4 => KE::SoftInt(int_num as u8),
+            0..=31 => KE::Exception(int_num as u8),
+            // Direct-IDT soft interrupts: 0x30..=0xFF (plus VM86 `INT3`/`0xCC`
+            // bypass of VME landing here too).
+            _ => KE::SoftInt(int_num as u8),
+        };
         swap_regs(regs);
-        regs.rax = int_num;
-        if int_num == 14 { regs.rdx = x86::read_cr2() as u64; }
+        let (event, extra) = kevent.encode();
+        regs.rax = event as u64;
+        regs.rdx = extra as u64;
     } else {
         // Kernel (ring 1): arch calls, page faults, IRQs
         match int_num {

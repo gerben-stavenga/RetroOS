@@ -402,19 +402,21 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
         // GDT[GDT_TSS64_HI] stays null (base bits 63:32 = 0 for <4GB)
 
         // Setup 32-bit IDT entries (256 vectors)
-        // 0x00-0x1F: exceptions (DPL=0, except 3-5 = DPL=3 for INT3/INTO/BOUND)
+        // 0x00-0x1F: CPU exceptions (DPL=0), except 3 (#BP/INT3) and 4 (#OF/INTO)
+        //            which are DPL=3 so user `INT3`/`INTO` can reach them. Vector
+        //            5 (#BR) is CPU-raised by BOUND and stays DPL=0.
         // 0x20-0x2F: PIC IRQs (DPL=0)
         // 0x30-0xFF: user-callable (DPL=3) — includes 0x80 syscall, 0x31 DPMI, 0xF0 VM86 stubs
         let vector_base_32 = int_vector.as_ptr() as u32;
         for i in 0..256 {
-            let dpl = if (3..=5).contains(&i) || i >= 0x30 { 3 } else { 0 };
+            let dpl = if i == 3 || i == 4 || i >= 0x30 { 3 } else { 0 };
             let handler = vector_base_32 + (i as u32) * 8;
             IDT32.entries[i] = IdtEntry32::interrupt_gate(handler, dpl);
         }
 
         // Setup 64-bit IDT entries (same vector table, same DPL policy)
         for i in 0..256 {
-            let dpl = if (3..=5).contains(&i) || i >= 0x30 { 3 } else { 0 };
+            let dpl = if i == 3 || i == 4 || i >= 0x30 { 3 } else { 0 };
             let handler = vector_base_32 + (i as u32) * 8;
             IDT64.entries[i] = IdtEntry64::interrupt_gate(handler, dpl);
         }
@@ -546,6 +548,52 @@ pub fn load_ldt(base: u32, limit: u32) {
         };
         x86::lldt(LDT_SEL);
     }
+}
+
+/// Read a raw segment descriptor from the GDT or LDT.
+///
+/// The selector's TI bit picks the table: TI=0 reads from the GDT, TI=1
+/// reads from the current LDT (whose base lives in `GDT[GDT_LDT]`). The
+/// DPL and RPL bits are ignored — this is a pure table lookup.
+///
+/// Returns 0 for the null selector or out-of-range indices.
+fn read_descriptor(sel: u16) -> u64 {
+    if sel == 0 { return 0; }
+    let idx = (sel >> 3) as usize;
+    let table_base: u32 = if sel & 4 != 0 {
+        // LDT: base encoded in GDT[GDT_LDT] system descriptor
+        let g = unsafe { &GDT[GDT_LDT] };
+        (g.base_low as u32)
+            | ((g.base_mid as u32) << 16)
+            | ((g.base_high as u32) << 24)
+    } else {
+        unsafe { &raw const GDT as *const _ as u32 }
+    };
+    // Limit is stored in the same descriptor; skip the check and let a bad
+    // selector read whatever's there — consistent with the x86 behavior where
+    // the monitor is decoding an already-trapped instruction.
+    unsafe { core::ptr::read_unaligned((table_base + (idx as u32) * 8) as *const u64) }
+}
+
+/// Get the linear base address of the segment referenced by `sel`.
+///
+/// Works for both GDT and LDT selectors. Flat GDT segments (the kernel/user
+/// code/data descriptors set up at boot) have base 0; LDT-resident DPMI
+/// segments get their configured base.
+pub fn seg_base(sel: u16) -> u32 {
+    let desc = read_descriptor(sel);
+    let b0 = ((desc >> 16) & 0xFFFF) as u32;
+    let b1 = ((desc >> 32) & 0xFF) as u32;
+    let b2 = ((desc >> 56) & 0xFF) as u32;
+    b0 | (b1 << 16) | (b2 << 24)
+}
+
+/// True if the segment's D/B bit is set (32-bit default operand/stack size).
+/// The null selector reports true — matches x86 behavior for a flat 32-bit
+/// kernel where CS=0 never actually happens.
+pub fn seg_is_32(sel: u16) -> bool {
+    if sel == 0 { return true; }
+    read_descriptor(sel) & (1u64 << 54) != 0
 }
 
 // =============================================================================

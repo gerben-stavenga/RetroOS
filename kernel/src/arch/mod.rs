@@ -10,6 +10,7 @@
 mod boot;
 mod descriptors;
 mod irq;
+pub mod monitor;
 mod paging2;
 mod phys_mm;
 mod traps;
