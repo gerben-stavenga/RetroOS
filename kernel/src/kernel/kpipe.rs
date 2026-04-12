@@ -76,6 +76,11 @@ pub fn write(idx: u8, data: &[u8]) -> i32 {
     }
 }
 
+/// Remove the last written byte (for backspace line editing). Returns true if removed.
+pub fn pop_back(idx: u8) -> bool {
+    unsafe { PIPES[idx as usize].buffer.pop_back() }
+}
+
 /// Check if pipe has data available for reading.
 pub fn has_data(idx: u8) -> bool {
     unsafe { !PIPES[idx as usize].buffer.is_empty() }

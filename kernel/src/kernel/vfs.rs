@@ -10,6 +10,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use crate::kernel::thread::FdKind;
 
 /// Maximum simultaneous open files system-wide
 const MAX_OPEN_FILES: usize = 64;
@@ -190,13 +191,22 @@ fn alloc_file_entry() -> Option<usize> {
     None
 }
 
-fn alloc_fd(fds: &mut [i32; MAX_FDS]) -> Option<usize> {
+fn alloc_fd(fds: &[FdKind; MAX_FDS]) -> Option<usize> {
     for fd in FIRST_FD..MAX_FDS {
-        if fds[fd] == -1 {
+        if fds[fd].is_none() {
             return Some(fd);
         }
     }
     None
+}
+
+/// Extract VFS handle from an FdKind, or return -9 (EBADF).
+fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
+    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 { return Err(-9); }
+    match fds[fd as usize] {
+        FdKind::Vfs(idx) => Ok(idx),
+        _ => Err(-9),
+    }
 }
 
 // ============================================================================
@@ -204,153 +214,60 @@ fn alloc_fd(fds: &mut [i32; MAX_FDS]) -> Option<usize> {
 // ============================================================================
 
 /// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
-pub fn open(path: &[u8], fds: &mut [i32; MAX_FDS]) -> i32 {
-    // Check RAM overlay first
-    let ram = ram_files();
-    if let Some(data) = ram.get(path) {
-        let size = data.len() as u32;
-        let table_idx = match alloc_file_entry() {
-            Some(i) => i,
-            None => return -24,
-        };
-        let fd = match alloc_fd(fds) {
-            Some(f) => f,
-            None => return -24,
-        };
-        let key_len = path.len().min(PATH_KEY_MAX) as u8;
-        let mut ram_key = [0u8; PATH_KEY_MAX];
-        ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-        unsafe {
-            FILE_TABLE[table_idx] = FileEntry {
-                vnode: Vnode { handle: RAM_SENTINEL, size },
-                offset: 0,
-                refcount: 1,
-                mount_idx: 0,
-                ram_key,
-                ram_key_len: key_len,
-            };
-        }
-        fds[fd] = table_idx as i32;
-        return fd as i32;
-    }
-
-    // Fall back to mounted filesystem
-    let (midx, fs, subpath) = resolve_mount(path);
-    let vnode = match fs.open(subpath) {
-        Some(v) => v,
-        None => return -2, // ENOENT
-    };
-
-    let table_idx = match alloc_file_entry() {
-        Some(i) => i,
-        None => return -24,
-    };
-
+pub fn open(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
+    let handle = open_to_handle(path);
+    if handle < 0 { return handle; }
     let fd = match alloc_fd(fds) {
         Some(f) => f,
-        None => return -24,
+        None => { close_vfs_handle(handle); return -24; }
     };
-
-    unsafe {
-        FILE_TABLE[table_idx] = FileEntry {
-            vnode,
-            offset: 0,
-            refcount: 1,
-            mount_idx: midx,
-            ram_key: [0; PATH_KEY_MAX],
-            ram_key_len: 0,
-        };
-    }
-    fds[fd] = table_idx as i32;
-
+    fds[fd] = FdKind::Vfs(handle);
     fd as i32
 }
 
 /// Read from an open file descriptor. Returns bytes read or negative error.
-pub fn read(fd: i32, buf: &mut [u8], fds: &[i32; MAX_FDS]) -> i32 {
-    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9;
+pub fn read(fd: i32, buf: &mut [u8], fds: &[FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => read_by_handle(handle, buf),
+        Err(e) => e,
     }
-    let table_idx = fds[fd as usize];
-    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9;
-    }
-
-    let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
-    if entry.refcount == 0 {
-        return -9;
-    }
-
-    if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        let ram = ram_files();
-        if let Some(data) = ram.get(key) {
-            let off = entry.offset as usize;
-            if off >= data.len() { return 0; }
-            let avail = data.len() - off;
-            let n = buf.len().min(avail);
-            buf[..n].copy_from_slice(&data[off..off + n]);
-            entry.offset += n as u32;
-            return n as i32;
-        }
-        return 0;
-    }
-
-    let n = mount_fs(entry.mount_idx).read(entry.vnode.handle, entry.offset, buf, entry.vnode.size);
-    if n > 0 {
-        entry.offset += n as u32;
-    }
-    n
 }
 
 /// Read entire file contents via fd into a kernel buffer (ignores current offset).
-pub fn read_raw(fd: i32, buf: &mut [u8], fds: &[i32; MAX_FDS]) -> i32 {
-    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9;
+pub fn read_raw(fd: i32, buf: &mut [u8], fds: &[FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => read_by_handle(handle, buf),
+        Err(e) => e,
     }
-    let table_idx = fds[fd as usize];
-    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9;
-    }
-    let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
-    if entry.refcount == 0 {
-        return -9;
-    }
-    if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        if let Some(data) = ram_files().get(key) {
-            let n = buf.len().min(data.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            return n as i32;
-        }
-        return 0;
-    }
-    mount_fs(entry.mount_idx).read(entry.vnode.handle, entry.offset, buf, entry.vnode.size)
 }
 
 /// Close a file descriptor.
-pub fn close(fd: i32, fds: &mut [i32; MAX_FDS]) -> i32 {
-    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9;
+pub fn close(fd: i32, fds: &mut [FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => {
+            fds[fd as usize] = FdKind::None;
+            close_vfs_handle(handle);
+            0
+        }
+        Err(e) => e,
     }
-    let table_idx = fds[fd as usize];
-    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9;
-    }
-
-    fds[fd as usize] = -1;
-
-    let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
-    if entry.refcount > 0 {
-        entry.refcount -= 1;
-    }
-    0
 }
 
 /// Create (or truncate) a writable RAM-backed file by absolute VFS path.
-pub fn create(path: &[u8], fds: &mut [i32; MAX_FDS]) -> i32 {
-    let key_len = path.len().min(PATH_KEY_MAX) as u8;
+pub fn create(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
+    let handle = create_to_handle(path);
+    if handle < 0 { return handle; }
+    let fd = match alloc_fd(fds) {
+        Some(f) => f,
+        None => { close_vfs_handle(handle); return -24; }
+    };
+    fds[fd] = FdKind::Vfs(handle);
+    fd as i32
+}
 
+/// Create (or truncate) a writable RAM-backed file. Returns handle or negative error.
+pub fn create_to_handle(path: &[u8]) -> i32 {
+    let key_len = path.len().min(PATH_KEY_MAX) as u8;
     ram_files().insert(path.to_vec(), Vec::new());
     invalidate_dir_cache();
 
@@ -358,11 +275,6 @@ pub fn create(path: &[u8], fds: &mut [i32; MAX_FDS]) -> i32 {
         Some(i) => i,
         None => return -24,
     };
-    let fd = match alloc_fd(fds) {
-        Some(f) => f,
-        None => return -24,
-    };
-
     let mut ram_key = [0u8; PATH_KEY_MAX];
     ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
     unsafe {
@@ -375,42 +287,15 @@ pub fn create(path: &[u8], fds: &mut [i32; MAX_FDS]) -> i32 {
             ram_key_len: key_len,
         };
     }
-    fds[fd] = table_idx as i32;
-    fd as i32
+    table_idx as i32
 }
 
 /// Write to an open file descriptor.
-pub fn write(fd: i32, data: &[u8], fds: &[i32; MAX_FDS]) -> i32 {
-    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9;
+pub fn write(fd: i32, data: &[u8], fds: &[FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => write_by_handle(handle, data),
+        Err(e) => e,
     }
-    let table_idx = fds[fd as usize];
-    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9;
-    }
-
-    let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
-    if entry.refcount == 0 {
-        return -9;
-    }
-    if entry.vnode.handle != RAM_SENTINEL {
-        return data.len() as i32; // read-only FS; silently accept
-    }
-
-    let key = &entry.ram_key[..entry.ram_key_len as usize];
-    let ram = ram_files();
-    if let Some(file_data) = ram.get_mut(key) {
-        let off = entry.offset as usize;
-        let end = off + data.len();
-        if end > file_data.len() {
-            file_data.resize(end, 0);
-        }
-        file_data[off..end].copy_from_slice(data);
-        entry.offset = end as u32;
-        entry.vnode.size = file_data.len() as u32;
-        return data.len() as i32;
-    }
-    -9
 }
 
 /// Delete a RAM-backed file by absolute VFS path.
@@ -422,54 +307,19 @@ pub fn delete(path: &[u8]) -> i32 {
 }
 
 /// Get the size of an open file descriptor.
-pub fn file_size(fd: i32, fds: &[i32; MAX_FDS]) -> u32 {
-    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 { return 0; }
-    let table_idx = fds[fd as usize];
-    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 { return 0; }
-    let entry = unsafe { &FILE_TABLE[table_idx as usize] };
-    if entry.refcount == 0 { return 0; }
-    if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        return ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0);
+pub fn file_size(fd: i32, fds: &[FdKind; MAX_FDS]) -> u32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => file_size_by_handle(handle),
+        Err(_) => 0,
     }
-    entry.vnode.size
 }
 
 /// Seek on an open file descriptor. whence: 0=SET, 1=CUR, 2=END
-pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[i32; MAX_FDS]) -> i32 {
-    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 {
-        return -9;
+pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => seek_by_handle(handle, offset, whence),
+        Err(e) => e,
     }
-    let table_idx = fds[fd as usize];
-    if table_idx < 0 || table_idx >= MAX_OPEN_FILES as i32 {
-        return -9;
-    }
-
-    let entry = unsafe { &mut FILE_TABLE[table_idx as usize] };
-    if entry.refcount == 0 {
-        return -9;
-    }
-
-    let size = if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0)
-    } else {
-        entry.vnode.size
-    };
-
-    let new_offset = match whence {
-        0 => offset as i64,
-        1 => entry.offset as i64 + offset as i64,
-        2 => size as i64 + offset as i64,
-        _ => return -22,
-    };
-
-    if new_offset < 0 {
-        return -22;
-    }
-
-    entry.offset = new_offset as u32;
-    entry.offset as i32
 }
 
 /// Populate directory cache for the given directory (single pass).
@@ -570,33 +420,6 @@ fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 pub fn dir_exists(path: &[u8]) -> bool {
     let (_midx, fs, subpath) = resolve_mount(path);
     fs.dir_exists(subpath)
-}
-
-/// Duplicate all FDs from src into dst (for fork). DOS fd tables only.
-pub fn dup_fds(src: &[i32; MAX_FDS], dst: &mut [i32; MAX_FDS]) {
-    *dst = *src;
-    unsafe {
-        for &idx in dst.iter() {
-            if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
-                FILE_TABLE[idx as usize].refcount += 1;
-            }
-        }
-    }
-}
-
-/// Close all FDs in the given array. DOS fd tables only.
-pub fn close_all_fds(fds: &mut [i32; MAX_FDS]) {
-    unsafe {
-        for fd in fds.iter_mut() {
-            if *fd >= 0 && (*fd as usize) < MAX_OPEN_FILES {
-                let entry = &mut FILE_TABLE[*fd as usize];
-                if entry.refcount > 0 {
-                    entry.refcount -= 1;
-                }
-            }
-            *fd = -1;
-        }
-    }
 }
 
 /// Decrement refcount for a VFS file table entry (used by Linux FdKind::Vfs close).

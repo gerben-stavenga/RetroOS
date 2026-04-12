@@ -44,6 +44,16 @@ impl<T: Copy, const N: usize> Pipe<T, N> {
         }
     }
 
+    /// Remove the last pushed element (if any). Returns true if removed.
+    pub fn pop_back(&mut self) -> bool {
+        if self.write_pos > self.read_pos {
+            self.write_pos -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Discard all entries.
     pub fn clear(&mut self) {
         self.read_pos = self.write_pos;

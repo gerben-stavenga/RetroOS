@@ -21,40 +21,40 @@ _BASE_FILES = {
     "//apps/hello_com:hello_com": "HELLO.COM",
     "//apps/gfx_com:gfx_com": "GFX.COM",
     "//apps/hello_com:command_com": "COMMAND.COM",
-    "//apps/command:command.c": "COMMAND.C",
+    "apps/command/command.c": "COMMAND.C",
     "//apps/hello_com:TEST.COM": "TEST.COM",
     "//apps/hello_com:TEST.BAT": "TEST.BAT",
-    "//apps/keen4:Keen4e.exe": "KEEN4/KEEN4E.EXE",
-    "//apps/keen4:AUDIO.CK4": "KEEN4/AUDIO.CK4",
-    "//apps/keen4:CONFIG.CK4": "KEEN4/CONFIG.CK4",
-    "//apps/keen4:Egagraph.ck4": "KEEN4/EGAGRAPH.CK4",
-    "//apps/keen4:Gamemaps.ck4": "KEEN4/GAMEMAPS.CK4",
-    "//apps/keen4:SAVEGAM0.CK4": "KEEN4/SAVEGAM0.CK4",
-    "//apps/wolf3d:WOLF3D.EXE": "WOLF3D/WOLF3D.EXE",
-    "//apps/wolf3d:AUDIOHED.WL1": "WOLF3D/AUDIOHED.WL1",
-    "//apps/wolf3d:AUDIOT.WL1": "WOLF3D/AUDIOT.WL1",
-    "//apps/wolf3d:GAMEMAPS.WL1": "WOLF3D/GAMEMAPS.WL1",
-    "//apps/wolf3d:MAPHEAD.WL1": "WOLF3D/MAPHEAD.WL1",
-    "//apps/wolf3d:VGADICT.WL1": "WOLF3D/VGADICT.WL1",
-    "//apps/wolf3d:VGAGRAPH.WL1": "WOLF3D/VGAGRAPH.WL1",
-    "//apps/wolf3d:VGAHEAD.WL1": "WOLF3D/VGAHEAD.WL1",
-    "//apps/wolf3d:VSWAP.WL1": "WOLF3D/VSWAP.WL1",
-    "//apps/dn:DN.COM": "DN/DN.COM",
-    "//apps/dn:DN.PRG": "DN/DN.PRG",
-    "//apps/dn:DN.OVR": "DN/DN.OVR",
-    "//apps/dn:DN.DLG": "DN/DN.DLG",
-    "//apps/dn:DN.LNG": "DN/DN.LNG",
-    "//apps/dn:DN.HLP": "DN/DN.HLP",
-    "//apps/dn:DN.EDT": "DN/DN.EDT",
-    "//apps/dn:DN.EXT": "DN/DN.EXT",
-    "//apps/dn:DN.HGL": "DN/DN.HGL",
-    "//apps/dn:DN.MNU": "DN/DN.MNU",
-    "//apps/dn:DN.VWR": "DN/DN.VWR",
-    "//apps/dn:DN.XRN": "DN/DN.XRN",
-    "//apps/dn:DN.FLG": "DN/DN.FLG",
-    "//apps/dn:DN.HIS": "DN/DN.HIS",
-    "//apps/linux_test:hello_linux": "HI",
-    "//apps/hello64_linux:hello64_linux": "HI64",
+    "apps/keen4/Keen4e.exe": "KEEN4/KEEN4E.EXE",
+    "apps/keen4/AUDIO.CK4": "KEEN4/AUDIO.CK4",
+    "apps/keen4/CONFIG.CK4": "KEEN4/CONFIG.CK4",
+    "apps/keen4/Egagraph.ck4": "KEEN4/EGAGRAPH.CK4",
+    "apps/keen4/Gamemaps.ck4": "KEEN4/GAMEMAPS.CK4",
+    "apps/keen4/SAVEGAM0.CK4": "KEEN4/SAVEGAM0.CK4",
+    "apps/wolf3d/WOLF3D.EXE": "WOLF3D/WOLF3D.EXE",
+    "apps/wolf3d/AUDIOHED.WL1": "WOLF3D/AUDIOHED.WL1",
+    "apps/wolf3d/AUDIOT.WL1": "WOLF3D/AUDIOT.WL1",
+    "apps/wolf3d/GAMEMAPS.WL1": "WOLF3D/GAMEMAPS.WL1",
+    "apps/wolf3d/MAPHEAD.WL1": "WOLF3D/MAPHEAD.WL1",
+    "apps/wolf3d/VGADICT.WL1": "WOLF3D/VGADICT.WL1",
+    "apps/wolf3d/VGAGRAPH.WL1": "WOLF3D/VGAGRAPH.WL1",
+    "apps/wolf3d/VGAHEAD.WL1": "WOLF3D/VGAHEAD.WL1",
+    "apps/wolf3d/VSWAP.WL1": "WOLF3D/VSWAP.WL1",
+    "apps/dn/DN.COM": "DN/DN.COM",
+    "apps/dn/DN.PRG": "DN/DN.PRG",
+    "apps/dn/DN.OVR": "DN/DN.OVR",
+    "apps/dn/DN.DLG": "DN/DN.DLG",
+    "apps/dn/DN.LNG": "DN/DN.LNG",
+    "apps/dn/DN.HLP": "DN/DN.HLP",
+    "apps/dn/DN.EDT": "DN/DN.EDT",
+    "apps/dn/DN.EXT": "DN/DN.EXT",
+    "apps/dn/DN.HGL": "DN/DN.HGL",
+    "apps/dn/DN.MNU": "DN/DN.MNU",
+    "apps/dn/DN.VWR": "DN/DN.VWR",
+    "apps/dn/DN.XRN": "DN/DN.XRN",
+    "apps/dn/DN.FLG": "DN/DN.FLG",
+    "apps/dn/DN.HIS": "DN/DN.HIS",
+    "apps/linux_test/hello_linux": "HI",
+    "apps/hello64_linux/hello64_linux": "HI64",
 }
 
 # Public image (shareware only)
@@ -131,6 +131,43 @@ with open('$@', 'r+b') as f:
         0x00, 0,0,0, 0x83, 0,0,0,
         $$EXT4_START, $$EXT4_SECTORS))
         "
+    """,
+)
+
+# FAT16 data disk for FreeDOS (all apps from the proprietary TAR)
+genrule(
+    name = "freedos_apps",
+    srcs = [":fs_tar_proprietary"],
+    outs = ["freedos_apps.img"],
+    cmd = """
+        IMG="$$(pwd)/$@"
+        # Create 256MB FAT16 superfloppy
+        dd if=/dev/zero of="$$IMG" bs=1M count=256 status=none
+        mformat -i "$$IMG" -c 8 -h 16 -s 63 -T $$((256 * 2048)) ::
+
+        # Extract TAR and copy files to FAT image
+        TMPDIR=$$(mktemp -d)
+        tar xf "$$(pwd)/$<" -C "$$TMPDIR"
+        # Skip non-DOS files (kernel, ELF binaries, md5, bootloader)
+        cd "$$TMPDIR"
+        for f in $$(find . -type f | sort); do
+            # Skip kernel/bootloader/ELF/linux files
+            case "$$f" in
+                ./A|./kernel.elf|./kernel.elf.md5|./printmsg.elf|./stress.elf|./shell.elf|./HI|./HI64|./COMMAND.C) continue ;;
+            esac
+            DIR=$$(dirname "$$f" | sed 's|^\\./||')
+            if [ "$$DIR" != "." ]; then
+                # Create all parent dirs
+                P=""
+                IFS=/; for COMP in $$DIR; do
+                    P="$${P:+$$P/}$$COMP"
+                    mmd -D s -i "$$IMG" "::$$P" 2>/dev/null || true
+                done
+                unset IFS
+            fi
+            mcopy -D o -i "$$IMG" "$$f" "::$$f" 2>/dev/null || true
+        done
+        rm -rf "$$TMPDIR"
     """,
 )
 

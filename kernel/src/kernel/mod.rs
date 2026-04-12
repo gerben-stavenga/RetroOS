@@ -5,8 +5,10 @@
 
 pub mod dos;
 pub mod elf;
+pub mod exec;
 pub mod ext4fs;
 pub mod hdd;
+pub mod hostfs;
 pub mod heap;
 pub mod keyboard;
 pub mod kpipe;

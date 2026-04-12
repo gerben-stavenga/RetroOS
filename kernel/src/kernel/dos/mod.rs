@@ -26,6 +26,7 @@ pub mod dpmi;
 extern crate alloc;
 
 use crate::kernel::thread;
+use thread::MAX_FDS;
 use crate::kernel::machine::{
     self,
     IF_FLAG,
@@ -43,6 +44,82 @@ const EMS_ENABLED: bool = false;
 
 /// Dummy file handle returned for /dev/null semantics.
 const NULL_FILE_HANDLE: u16 = 99;
+
+/// DOS-specific thread state: virtual hardware machine + DOS personality + optional DPMI.
+///
+/// Split into three logical groups:
+///   - `pc`: PC machine virtualization (policy-free peripherals — vpic/vpit/vkbd/vga,
+///     A20 gate, HMA pages, skip_irq latch, e0 scancode-prefix latch). Shared by
+///     both the DOS personality and DPMI.
+///   - DOS personality fields (flattened): PSP tracking, DTA, heap/free segment,
+///     XMS/EMS state, FindFirst/FindNext state, exec-parent chain.
+///   - `dpmi`: optional DPMI protected-mode state (LDT, memory blocks, callbacks).
+pub struct DosState {
+    /// Policy-free PC machine state: virtual 8259 PIC, 8253 PIT, PS/2 keyboard,
+    /// VGA register set, A20 gate, HMA page tracking.
+    pub pc: crate::kernel::machine::PcMachine,
+
+    // ── DOS personality fields ────────────────────────────────────────
+    pub dta: u32,
+    pub heap_seg: u16,
+    /// Current PSP segment as seen by INT 21h/AH=50h (set), 51h (get), 62h (get).
+    pub current_psp: u16,
+    pub dos_pending_char: Option<u8>,
+    /// Last child termination status (INT 21h/AH=4Dh): AL = code, AH = type.
+    pub last_child_exit_status: u16,
+    pub exec_parent: Option<crate::kernel::dos::ExecParent>,
+    pub xms: Option<alloc::boxed::Box<crate::kernel::dos::XmsState>>,
+    pub ems: Option<alloc::boxed::Box<crate::kernel::dos::EmsState>>,
+    /// FindFirst/FindNext search state (per-thread, one active enumeration).
+    pub find_path: [u8; 96],
+    pub find_path_len: u8,
+    pub find_idx: u16,
+
+    pub dpmi: Option<alloc::boxed::Box<crate::kernel::dos::dpmi::DpmiState>>,
+}
+
+impl DosState {
+    pub fn new() -> Self {
+        DosState {
+            pc: crate::kernel::machine::PcMachine::new(),
+            dta: 0,
+            heap_seg: 0xA000,
+            current_psp: crate::kernel::dos::COM_SEGMENT,
+            dos_pending_char: None,
+            last_child_exit_status: 0,
+            exec_parent: None,
+            xms: None,
+            ems: None,
+            find_path: [0; 96],
+            find_path_len: 0,
+            find_idx: 0,
+            dpmi: None,
+        }
+    }
+
+    /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
+    pub fn process_key(&mut self, scancode: u8) {
+        crate::kernel::machine::queue_irq(&mut self.pc, crate::arch::Irq::Key(scancode));
+    }
+}
+
+/// Translate a `seg:off` client pointer to a flat linear address.
+///
+/// In V86 mode `seg` is a real-mode paragraph and `off` is masked to 16 bits.
+/// In protected mode `seg` is an LDT/GDT selector and we resolve the descriptor
+/// base via the DPMI state. Offset width follows the client CS D/B bit.
+#[inline]
+fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
+    if regs.frame.rflags as u32 & machine::VM_FLAG != 0 {
+        ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
+    } else if let Some(dpmi) = dos.dpmi.as_ref() {
+        let cs_32 = dpmi::seg_is_32(dpmi, regs.frame.cs as u16);
+        let off = if cs_32 { off } else { off & 0xFFFF };
+        dpmi::seg_base(dpmi, seg).wrapping_add(off)
+    } else {
+        ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
+    }
+}
 
 /// .COM load segment — derived from DOS_AREA_END so the environment block
 /// (COM_SEGMENT-0x10, 256 bytes) never overlaps kernel structures.
@@ -378,15 +455,13 @@ impl EmsState {
 /// Handle INT n from VM86 mode.
 /// With VME, only INTs whose bit is SET in the redirection bitmap trap here.
 /// Without VME, all INTs trap — unintercepted ones are reflected through IVT.
-pub fn handle_vm86_int(dos: &mut thread::DosState, regs: &mut Regs, int_num: u8) -> thread::KernelAction {
+pub fn handle_vm86_int(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs, int_num: u8) -> thread::KernelAction {
     if !crate::arch::int_intercepted(int_num) {
         reflect_interrupt(regs, int_num);
         return thread::KernelAction::Done;
     }
     match int_num {
-        // INT 31h — unified stub dispatch (all intercepted INTs route through
-        // IVT stubs that call INT 31h; dispatch by slot number)
-        STUB_INT => stub_dispatch(dos, regs),
+        STUB_INT => stub_dispatch(kt, dos, regs),
         _ => {
             panic!("VM86: INT {:02X} intercepted in bitmap but has no handler", int_num);
         }
@@ -397,18 +472,52 @@ pub fn handle_vm86_int(dos: &mut thread::DosState, regs: &mut Regs, int_num: u8)
 // Stub dispatch — routes INT 31h from unified CD 31 array by slot number
 // ============================================================================
 
+/// Dispatch a kernel-owned DOS/BIOS vector directly (no V86 detour).
+///
+/// Used by both the V86 stub dispatcher and the DPMI PM soft-int fast path.
+/// The caller is responsible for any mode-specific frame housekeeping after
+/// the call (V86 stack pop, PM return-frame restore, etc.).
+pub(crate) fn dispatch_kernel_syscall(
+    kt: &mut thread::KernelThread,
+    dos: &mut thread::DosState,
+    regs: &mut Regs,
+    vector: u8,
+) -> thread::KernelAction {
+    match vector {
+        0x13 => int_13h(regs),
+        0x20 => {
+            if let Some(parent) = dos.exec_parent.take() {
+                dos.last_child_exit_status = 0x0000;
+                return exec_return(dos, regs, parent);
+            }
+            thread::KernelAction::Exit(0)
+        }
+        0x21 => int_21h(kt, dos, regs),
+        // INT 25h/26h — Absolute Disk Read/Write — return error
+        0x25 | 0x26 => {
+            regs.rax = (regs.rax & !0xFF00) | (0x02 << 8); // AH=02 address mark not found
+            regs.set_flag32(1); // CF=1 error
+            thread::KernelAction::Done
+        }
+        0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
+        0x2E => int_2eh(kt, dos, regs),
+        0x2F => int_2fh(dos, regs),
+        _ => thread::KernelAction::Done,
+    }
+}
+
 /// Dispatch INT 31h from the unified stub array. Slot = (IP - 2) / 2.
 /// IVT-redirect stubs have a FLAGS/CS/IP frame on the VM86 stack from the
 /// original INT; far-call stubs have a CS/IP frame from CALL FAR.
 /// The kernel pops these frames directly — no RETF/RETF 2 in the stub.
-fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     let cs = vm86_cs(regs);
 
     // INT 31h from user code (outside the stub segment) = synth syscall.
     // AH selects the subfunction. Unknown subfunctions fall through to IVT reflect.
     if cs != STUB_SEG {
-        return synth_dispatch(dos, regs);
+        return synth_dispatch(kt, dos, regs);
     }
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
@@ -446,25 +555,14 @@ fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelA
             dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
         }
-        0x13 => int_13h(regs),
-        0x20 => {
-            // INT 20h — DOS program terminate (equivalent to AH=4Ch with AL=0)
-            if let Some(parent) = dos.exec_parent.take() {
-                dos.last_child_exit_status = 0x0000; // type=normal, code=0
-                return exec_return(dos, regs, parent);
+        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F => {
+            let action = dispatch_kernel_syscall(kt, dos, regs, slot);
+            // exec_return / Exit replace thread state — skip the VM86 frame pop below.
+            if !matches!(action, thread::KernelAction::Done) {
+                return action;
             }
-            thread::KernelAction::Exit(0)
+            action
         }
-        0x21 => int_21h(dos, regs),
-        // INT 25h/26h — Absolute Disk Read/Write — return error
-        0x25 | 0x26 => {
-            regs.rax = (regs.rax & !0xFF00) | (0x02 << 8); // AH=02 address mark not found
-            regs.set_flag32(1); // CF=1 error
-            thread::KernelAction::Done
-        }
-        0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
-        0x2E => int_2eh(dos, regs),
-        0x2F => int_2fh(dos, regs),
         SLOT_SAVE_RESTORE => thread::KernelAction::Done, // no-op far call (buffer size=0)
         _ => {
             panic!("VM86: INT 31h from unknown stub slot {:#04x} IP={:#06x}", slot, ip);
@@ -502,7 +600,7 @@ fn stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelA
 /// INT 31h from user code. AH selects subfunction.
 /// On success: AX=0, CF=0. On error: AX=errno (unsigned), CF=1.
 /// Unknown AH reflects through IVT (legacy DPMI int-31 path).
-fn synth_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — SYNTH_VGA_TAKE: adopt target thread's screen.
@@ -526,7 +624,7 @@ fn synth_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         // Output on error (CF=1):
         //          AX = errno
         0x01 => {
-            let psp = (regs.ds as u16 as u32) << 4;
+            let psp = linear(dos, regs, regs.ds as u16, 0);
             let tail_len = unsafe { *((psp + 0x80) as *const u8) } as usize;
             let read = |i: usize| -> u8 {
                 unsafe { *((psp + 0x81 + i as u32) as *const u8) }
@@ -553,8 +651,8 @@ fn synth_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             }
             let flen = dos_normalize_path(&mut filename, flen);
             // If the name is a .BAT, expand to its first executable command.
-            let flen = expand_bat(dos, &mut filename, flen);
-            fork_exec(dos, &filename[..flen])
+            let flen = expand_bat(dos, &mut filename, flen, kt);
+            fork_exec(dos, &filename[..flen], kt)
         }
         // Unknown AH: reflect through IVT for legacy/DPMI compatibility.
         _ => {
@@ -640,7 +738,7 @@ fn dos_putchar(c: u8) {
 // DOS INT 21h — DOS services
 // ============================================================================
 
-fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     if ah != 0x2C && ah != 0x2A {
         crate::dbg_println!("D21 {:02X} AX={:04X} BX={:04X} cs:ip={:04X}:{:04X} heap={:04X} psp={:04X}",
@@ -671,16 +769,15 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x09: Display $-terminated string at DS:DX
         0x09 => {
-            let ds = regs.ds as u16 as u32;
-            let dx = regs.rdx as u16 as u32;
-            let mut addr = (ds << 4) + dx;
+            let start = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
+            let mut addr = start;
             loop {
                 let ch = unsafe { *(addr as *const u8) };
                 if ch == b'$' { break; }
                 dos_putchar(ch);
-                addr += 1;
-                // Safety limit
-                if addr > 0xFFFFF { break; }
+                addr = addr.wrapping_add(1);
+                // Safety limit: cap at 64 KiB from start
+                if addr.wrapping_sub(start) > 0xFFFF { break; }
             }
             thread::KernelAction::Done
         }
@@ -713,8 +810,13 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // guest's perspective (kernel services calls synchronously), so
         // point at a permanently-zero byte inside SYSPSP.
         0x34 => {
-            regs.es = SYSPSP_SEG as u64;
-            regs.rbx = INDOS_FLAG_OFFSET as u64;
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                regs.es = dpmi::LOW_MEM_SEL as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | (SYSPSP_ADDR + INDOS_FLAG_OFFSET as u32) as u64;
+            } else {
+                regs.es = SYSPSP_SEG as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | INDOS_FLAG_OFFSET as u64;
+            }
             thread::KernelAction::Done
         }
         // AH=0x47: Get current directory (DL=drive, DS:SI=64-byte buffer)
@@ -728,14 +830,13 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 regs.rax = (regs.rax & !0xFFFF) | 0x0F;
                 regs.set_flag32(1);
             } else {
-                let si = regs.rsi as u16 as u32;
-                let addr = ((regs.ds as u16 as u32) << 4) + si;
-                let cwd = dos.cwd_str();
+                let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
+                let cwds = kt.cwd_str();
                 unsafe {
                     let mut pos = 0;
-                    for &b in cwd {
+                    for &b in cwds {
                         // Convert '/' to '\' for DOS, skip trailing slash
-                        if b == b'/' && pos + 1 >= cwd.len() { break; }
+                        if b == b'/' && pos + 1 >= cwds.len() { break; }
                         *((addr + pos as u32) as *mut u8) = if b == b'/' { b'\\' } else { b };
                         pos += 1;
                     }
@@ -774,15 +875,20 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // AH=0x1A: Set DTA (Disk Transfer Area) address to DS:DX
         0x1A => {
             // Store DTA address — NC needs this for FindFirst/FindNext
-            let dta = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+            let dta = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             dos.dta = dta;
             thread::KernelAction::Done
         }
         // AH=0x2F: Get DTA address (returns ES:BX)
         0x2F => {
             let dta = dos.dta;
-            regs.es = (dta >> 4) as u64;
-            regs.rbx = (regs.rbx & !0xFFFF) | (dta & 0x0F) as u64;
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                regs.es = dpmi::LOW_MEM_SEL as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | dta as u64;
+            } else {
+                regs.es = (dta >> 4) as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | (dta & 0x0F) as u64;
+            }
             thread::KernelAction::Done
         }
         // AH=0x30: Get DOS version (return AL=major, AH=minor)
@@ -798,8 +904,16 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             let int_num = regs.rax as u8;
             let off = read_u16(0, (int_num as u32) * 4);
             let seg = read_u16(0, (int_num as u32) * 4 + 2);
-            regs.rbx = off as u64;
-            regs.es = seg as u64;
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                // PM client: return LOW_MEM_SEL:linear so the selector is valid.
+                let linear = ((seg as u32) << 4).wrapping_add(off as u32);
+                regs.es = dpmi::LOW_MEM_SEL as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | (linear & 0xFFFF) as u64;
+            } else {
+                // V86 / real mode: return the raw IVT seg:off pair.
+                regs.es = seg as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | off as u64;
+            }
             thread::KernelAction::Done
         }
         // AH=0x38: Get country information — return minimal stub
@@ -808,7 +922,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // Many programs (including NC 2.0) allocate only 32 bytes, so write
         // field-by-field rather than blindly zeroing 34 bytes.
         0x38 => {
-            let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+            let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             unsafe {
                 let p = addr as *mut u8;
                 core::ptr::write_bytes(p, 0, 24); // zero first 24 bytes (through case-map)
@@ -830,7 +944,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x3B: Change directory (DS:DX=ASCIIZ path)
         0x3B => {
-            let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+            let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut path = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -840,7 +954,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 i += 1;
             }
             let i = dos_normalize_path(&mut path, i);
-            let result = dos_chdir(dos, &path[..i]);
+            let result = dos_chdir(kt, &path[..i]);
             if result < 0 {
                 regs.set_flag32(1); // set CF
                 regs.rax = (regs.rax & !0xFFFF) | 3; // AX=3 path not found
@@ -851,9 +965,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x3D: Open file (DS:DX=ASCIIZ filename, AL=access mode)
         0x3D => {
-            let ds = regs.ds as u16 as u32;
-            let dx = regs.rdx as u16 as u32;
-            let mut addr = (ds << 4) + dx;
+            let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -870,12 +982,12 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             } else {
                 let i = dos_normalize_path(&mut name, i);
                 let mut rbuf = [0u8; 164];
-                let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
+                let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
                 let name_str = core::str::from_utf8(resolved).unwrap_or("?");
-                let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
+                let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
-                    let size = crate::kernel::vfs::file_size(fd, &dos.fds);
+                    let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(fd as u16, size);
                     unsafe {
                         let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
@@ -894,7 +1006,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         0x3E => {
             let handle = regs.rbx as u16;
             if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
-                crate::kernel::vfs::close(handle as i32, &mut dos.fds);
+                crate::kernel::vfs::close(handle as i32, &mut kt.fds);
                 sft_clear(handle);
             }
             regs.clear_flag32(1);
@@ -904,7 +1016,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         0x3F => {
             let handle = regs.rbx as u16 as i32;
             let count = regs.rcx as u16 as usize;
-            let buf_addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+            let buf_addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             if handle == 0 {
                 // stdin — read from virtual keyboard
                 // Return 0 for now (no line-buffered stdin in VM86)
@@ -922,7 +1034,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 regs.clear_flag32(1);
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
-                let n = crate::kernel::vfs::read(handle, buf, &dos.fds);
+                let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
                 if n >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     regs.clear_flag32(1);
@@ -935,9 +1047,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x4E: Find first matching file (CX=attr, DS:DX=filespec)
         0x4E => {
-            let ds = regs.ds as u16 as u32;
-            let dx = regs.rdx as u16 as u32;
-            let mut addr = (ds << 4) + dx;
+            let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut raw = [0u8; 80];
             let mut raw_len = 0;
             while raw_len < 79 {
@@ -958,7 +1068,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                         if rlen < resolved.len() { resolved[rlen] = raw[i]; rlen += 1; }
                     }
                 } else {
-                    for &b in dos.cwd_str() {
+                    for &b in kt.cwd_str() {
                         if rlen < resolved.len() { resolved[rlen] = b; rlen += 1; }
                     }
                     for i in 0..norm_len {
@@ -1108,9 +1218,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x3C: Create file (CX=attr, DS:DX=filename) — RAM-backed via VFS overlay
         0x3C => {
-            let ds = regs.ds as u16 as u32;
-            let dx = regs.rdx as u16 as u32;
-            let mut addr = (ds << 4) + dx;
+            let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -1122,8 +1230,8 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
-            let fd = crate::kernel::vfs::create(resolved, &mut dos.fds);
+            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
+            let fd = crate::kernel::vfs::create(resolved, &mut kt.fds);
             if fd >= 0 {
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
@@ -1139,7 +1247,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             let count = regs.rcx as u16;
             // Handle 1=stdout, 2=stderr
             if handle == 1 || handle == 2 {
-                let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+                let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = unsafe { *((addr + i) as *const u8) };
                     dos_putchar(ch);
@@ -1148,9 +1256,9 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             } else if handle == NULL_FILE_HANDLE {
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
             } else {
-                let addr = ((regs.ds as u16 as u32) << 4) + regs.rdx as u16 as u32;
+                let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 let data = unsafe { core::slice::from_raw_parts(addr as *const u8, count as usize) };
-                let n = crate::kernel::vfs::write(handle as i32, data, &dos.fds);
+                let n = crate::kernel::vfs::write(handle as i32, data, &kt.fds);
                 regs.rax = (regs.rax & !0xFFFF) | if n >= 0 { n as u64 } else { count as u64 };
                 regs.clear_flag32(1);
             }
@@ -1167,7 +1275,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             } else {
                 let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
                 let whence = regs.rax as u8 as i32; // AL = origin
-                let result = crate::kernel::vfs::seek(handle, offset, whence, &dos.fds);
+                let result = crate::kernel::vfs::seek(handle, offset, whence, &kt.fds);
                 if result >= 0 {
                     // Return new position in DX:AX
                     regs.rdx = (regs.rdx & !0xFFFF) | ((result as u32 >> 16) as u64);
@@ -1184,9 +1292,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // DS:DX = ASCIIZ filename, CX = attributes (for set)
         0x43 => {
             let al = regs.rax as u8;
-            let ds = regs.ds as u16 as u32;
-            let dx = regs.rdx as u16 as u32;
-            let mut addr = (ds << 4) + dx;
+            let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -1198,11 +1304,11 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
+            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
             // Check if file exists by trying to open it
-            let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
+            let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
             if fd >= 0 {
-                crate::kernel::vfs::close(fd, &mut dos.fds);
+                crate::kernel::vfs::close(fd, &mut kt.fds);
                 if al == 0 {
                     // Get attributes: return 0x20 (archive) in CX
                     regs.rcx = (regs.rcx & !0xFFFF) | 0x20;
@@ -1219,17 +1325,15 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // AL bits: 0=skip leading separators, 1=set drive only if specified,
         //          2=set filename only if specified, 3=set extension only if specified
         0x29 => {
-            let ds = regs.ds as u32;
+            let ds_base = linear(dos, regs, regs.ds as u16, 0);
             let mut si = regs.rsi as u16;
-            let es = regs.es as u32;
-            let di = regs.rdi as u16;
-            let fcb = (es << 4) + di as u32;
+            let fcb = linear(dos, regs, regs.es as u16, regs.rdi as u32);
 
             // Skip leading whitespace/separators if bit 0 set
             let flags = regs.rax as u8;
             if flags & 1 != 0 {
                 loop {
-                    let ch = unsafe { *(((ds << 4) + si as u32) as *const u8) };
+                    let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
                     if ch == b' ' || ch == b'\t' || ch == b';' || ch == b',' {
                         si += 1;
                     } else {
@@ -1242,8 +1346,8 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             unsafe { core::ptr::write_bytes((fcb + 1) as *mut u8, b' ', 11); }
 
             // Check for drive letter (e.g., "C:")
-            let ch0 = unsafe { *(((ds << 4) + si as u32) as *const u8) };
-            let ch1 = unsafe { *(((ds << 4) + si as u32 + 1) as *const u8) };
+            let ch0 = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
+            let ch1 = unsafe { *(ds_base.wrapping_add(si as u32 + 1) as *const u8) };
             if ch1 == b':' && ch0.is_ascii_alphabetic() {
                 unsafe { *(fcb as *mut u8) = ch0.to_ascii_uppercase() - b'A' + 1; }
                 si += 2;
@@ -1254,7 +1358,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             // Parse filename (up to 8 chars) into FCB+1
             let mut pos = 0u32;
             loop {
-                let ch = unsafe { *(((ds << 4) + si as u32) as *const u8) };
+                let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
                 if ch == b'.' || ch == 0 || ch == b' ' || ch == b'/' || ch == b'\\' || ch == b'\r' { break; }
                 if ch == b'*' {
                     while pos < 8 { unsafe { *((fcb + 1 + pos) as *mut u8) = b'?'; } pos += 1; }
@@ -1269,12 +1373,12 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             }
 
             // Parse extension (up to 3 chars) into FCB+9
-            let ch = unsafe { *(((ds << 4) + si as u32) as *const u8) };
+            let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
             if ch == b'.' {
                 si += 1;
                 pos = 0;
                 loop {
-                    let ch = unsafe { *(((ds << 4) + si as u32) as *const u8) };
+                    let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
                     if ch == 0 || ch == b' ' || ch == b'/' || ch == b'\\' || ch == b'\r' { break; }
                     if ch == b'*' {
                         while pos < 3 { unsafe { *((fcb + 9 + pos) as *mut u8) = b'?'; } pos += 1; }
@@ -1302,7 +1406,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // AH=0x4B: EXEC — Load and Execute Program
         // AL=00: load+execute, DS:DX=ASCIIZ filename, ES:BX=param block
         0x4B => {
-            exec_program(dos, regs)
+            exec_program(kt, dos, regs)
         }
         // AH=2Ah — Get System Date
         0x2A => {
@@ -1345,12 +1449,8 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x60: Canonicalize path (DS:SI=input, ES:DI=output buffer)
         0x60 => {
-            let ds = regs.ds as u16 as u32;
-            let si = regs.rsi as u16 as u32;
-            let es = regs.es as u16 as u32;
-            let di = regs.rdi as u16 as u32;
-            let src = (ds << 4) + si;
-            let dst = (es << 4) + di;
+            let src = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
+            let dst = linear(dos, regs, regs.es as u16, regs.rdi as u32);
             // Read input path
             let mut name = [0u8; 128];
             let mut len = 0;
@@ -1379,8 +1479,8 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 // Relative — prepend C:\ + CWD
                 out[0] = b'C'; out[1] = b':'; out[2] = b'\\';
                 pos = 3;
-                let cwd = dos.cwd_str();
-                for &ch in cwd {
+                let cwds = kt.cwd_str();
+                for &ch in cwds {
                     if pos >= 127 { break; }
                     out[pos] = if ch == b'/' { b'\\' } else { ch.to_ascii_uppercase() };
                     pos += 1;
@@ -1402,8 +1502,13 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x52: Get List of Lists (returns ES:BX → DOS internal structure)
         0x52 => {
-            regs.es = LOL_SEG as u64;
-            regs.rbx = (regs.rbx & !0xFFFF) | 0;
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                regs.es = dpmi::LOW_MEM_SEL as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | LOL_ADDR as u64;
+            } else {
+                regs.es = LOL_SEG as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | 0u64;
+            }
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -1434,9 +1539,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         }
         // AH=0x41: Delete file (DS:DX=filename)
         0x41 => {
-            let ds = regs.ds as u16 as u32;
-            let dx = regs.rdx as u16 as u32;
-            let mut addr = (ds << 4) + dx;
+            let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -1448,7 +1551,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
+            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
             crate::kernel::vfs::delete(resolved);
             regs.clear_flag32(1);
             thread::KernelAction::Done
@@ -1494,9 +1597,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         // Action: bit0=open-if-exists, bit4=create-if-not-exists
         0x6C => {
             let action = regs.rdx as u16;
-            let ds = regs.ds as u16 as u32;
-            let si = regs.rsi as u16 as u32;
-            let mut addr = (ds << 4) + si;
+            let mut addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -1508,14 +1609,14 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             }
             let i = dos_normalize_path(&mut name, i);
             let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(dos, &name[..i], &mut rbuf);
+            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
             let open_exists = action & 0x01 != 0;
             let create_not = action & 0x10 != 0;
 
             // Try open first
-            let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
+            let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
             if fd >= 0 && open_exists {
-                let size = crate::kernel::vfs::file_size(fd, &dos.fds);
+                let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                 sft_set_file(fd as u16, size);
                 unsafe {
                     let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
@@ -1526,8 +1627,8 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 regs.clear_flag32(1);
             } else if create_not {
                 // File doesn't exist — create RAM-backed file via VFS overlay
-                if fd >= 0 { crate::kernel::vfs::close(fd, &mut dos.fds); }
-                let new_fd = crate::kernel::vfs::create(resolved, &mut dos.fds);
+                if fd >= 0 { crate::kernel::vfs::close(fd, &mut kt.fds); }
+                let new_fd = crate::kernel::vfs::create(resolved, &mut kt.fds);
                 if new_fd >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
@@ -1537,7 +1638,7 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                     regs.set_flag32(1);
                 }
             } else {
-                if fd >= 0 { crate::kernel::vfs::close(fd, &mut dos.fds); }
+                if fd >= 0 { crate::kernel::vfs::close(fd, &mut kt.fds); }
                 regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
                 regs.set_flag32(1);
             }
@@ -1552,8 +1653,13 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 //   always be swapped. Point at SYSPSP (zeroed) with a nominal
                 //   size; DPMILOAD just needs a plausible pointer.
                 0x06 => {
-                    regs.ds = SYSPSP_SEG as u64;
-                    regs.rsi = 0;
+                    if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                        regs.ds = dpmi::LOW_MEM_SEL as u64;
+                        regs.rsi = (regs.rsi & !0xFFFF) | SYSPSP_ADDR as u64;
+                    } else {
+                        regs.ds = SYSPSP_SEG as u64;
+                        regs.rsi = (regs.rsi & !0xFFFF) | 0u64;
+                    }
                     regs.rcx = (regs.rcx & !0xFFFF) | SYSPSP_SIZE as u64;
                     regs.rdx = (regs.rdx & !0xFFFF) | SYSPSP_SIZE as u64;
                     regs.clear_flag32(1);
@@ -1590,12 +1696,10 @@ fn int_21h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 // INT 2Eh — COMMAND.COM internal execute
 // ============================================================================
 
-fn int_2eh(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
     // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
-    let ds = regs.ds as u16 as u32;
-    let si = regs.rsi as u16 as u32;
-    let addr = (ds << 4) + si;
+    let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
     let len = unsafe { *(addr as *const u8) } as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
@@ -1612,7 +1716,7 @@ fn int_2eh(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
     let plen = end - start;
     cmd.copy_within(start..end, 0);
     let plen = dos_normalize_path(&mut cmd, plen);
-    fork_exec(dos, &cmd[..plen])
+    fork_exec(dos, &cmd[..plen], kt)
 }
 
 // ============================================================================
@@ -1935,9 +2039,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
 fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
-    let ds = regs.ds as u16 as u32;
-    let si = regs.rsi as u16 as u32;
-    let addr = (ds << 4) + si;
+    let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
 
     let length = unsafe { (addr as *const u32).read_unaligned() } as usize;
     let src_handle = unsafe { ((addr + 4) as *const u16).read_unaligned() };
@@ -2326,10 +2428,10 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
     thread::KernelAction::Done
 }
 
-fn dos_open_program(dos: &mut thread::DosState, name: &[u8]) -> i32 {
+fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, name: &[u8]) -> i32 {
     let mut rbuf = [0u8; 164];
-    let resolved = dos_resolve_path(dos, name, &mut rbuf);
-    let fd = crate::kernel::vfs::open(resolved, &mut dos.fds);
+    let resolved = dos_resolve_path(kt, name, &mut rbuf);
+    let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
     if fd >= 0 { return fd; }
     // If the name already has a dot, don't try extensions
     if name.iter().any(|&c| c == b'.') { return fd; }
@@ -2339,19 +2441,19 @@ fn dos_open_program(dos: &mut thread::DosState, name: &[u8]) -> i32 {
     if rlen + 4 <= buf.len() {
         buf[..rlen].copy_from_slice(resolved);
         buf[rlen..rlen + 4].copy_from_slice(b".COM");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut dos.fds);
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut kt.fds);
         if fd >= 0 { return fd; }
     }
     // Try .EXE
     if rlen + 4 <= buf.len() {
         buf[rlen..rlen + 4].copy_from_slice(b".EXE");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut dos.fds);
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut kt.fds);
         if fd >= 0 { return fd; }
     }
     // Try .ELF
     if rlen + 4 <= buf.len() {
         buf[rlen..rlen + 4].copy_from_slice(b".ELF");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut dos.fds);
+        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut kt.fds);
         if fd >= 0 { return fd; }
     }
     -2 // ENOENT
@@ -2366,7 +2468,7 @@ fn dos_open_program(dos: &mut thread::DosState, name: &[u8]) -> i32 {
 ///
 /// Only the first command is executed — multi-line BAT semantics (loops,
 /// conditionals, state) are out of scope for this basic handler.
-fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize) -> usize {
+fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize, kt: &mut thread::KernelThread) -> usize {
     // Case-insensitive suffix check for ".BAT"
     if flen < 4 { return flen; }
     let tail = &filename[flen - 4..flen];
@@ -2376,16 +2478,16 @@ fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize)
         && (tail[3] & 0xDF) == b'T') { return flen; }
 
     let mut resolved = [0u8; 164];
-    let res = dos_resolve_path(dos, &filename[..flen], &mut resolved);
+    let res = dos_resolve_path(kt, &filename[..flen], &mut resolved);
     let rlen = res.len();
     let mut path = [0u8; 164];
     path[..rlen].copy_from_slice(&resolved[..rlen]);
-    let fd = crate::kernel::vfs::open(&path[..rlen], &mut dos.fds);
+    let fd = crate::kernel::vfs::open(&path[..rlen], &mut kt.fds);
     if fd < 0 { return flen; }
 
     let mut buf = [0u8; 512];
-    let n = crate::kernel::vfs::read_raw(fd, &mut buf, &dos.fds);
-    crate::kernel::vfs::close(fd, &mut dos.fds);
+    let n = crate::kernel::vfs::read_raw(fd, &mut buf, &kt.fds);
+    crate::kernel::vfs::close(fd, &mut kt.fds);
     if n <= 0 { return flen; }
     let n = n as usize;
 
@@ -2429,10 +2531,10 @@ fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize)
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8]) -> thread::KernelAction {
+fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], kt: &mut thread::KernelThread) -> thread::KernelAction {
     // Resolve to full path using DOS cwd
     let mut path = [0u8; 164];
-    let resolved = dos_resolve_path(dos, prog_name, &mut path);
+    let resolved = dos_resolve_path(kt, prog_name, &mut path);
     let path_len = resolved.len();
 
     fn on_error(regs: &mut Regs, err: i32) {
@@ -2459,7 +2561,7 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8]) -> thread::KernelActi
 /// Parent resumes via exec_return on child INT 20h / 4C00.
 /// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C
 /// which uses synth INT 31h AH=01h to fork+exec+wait a separate thread.
-fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let al = regs.rax as u8;
     if al != 0 {
         regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -2468,9 +2570,7 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     }
 
     // Read ASCIIZ filename from DS:DX
-    let ds = regs.ds as u16 as u32;
-    let dx = regs.rdx as u16 as u32;
-    let mut addr = (ds << 4) + dx;
+    let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
     let mut filename = [0u8; 128];
     let mut flen = 0;
     while flen < 127 {
@@ -2482,9 +2582,7 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     }
 
     // Read parameter block at ES:BX
-    let es = regs.es as u32;
-    let bx = regs.rbx as u32;
-    let pb = (es << 4) + bx;
+    let pb = linear(dos, regs, regs.es as u16, regs.rbx as u32);
     let cmdtail_off = unsafe { ((pb + 2) as *const u16).read_unaligned() } as u32;
     let cmdtail_seg = unsafe { ((pb + 4) as *const u16).read_unaligned() } as u32;
     let cmdtail_addr = (cmdtail_seg << 4) + cmdtail_off;
@@ -2500,23 +2598,30 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
     let prog_name: &[u8] = &filename[..flen];
 
     // --- DOS program: in-process exec (shared address space) ---
-    let fd = dos_open_program(dos, prog_name);
+    let fd = dos_open_program(kt, dos, prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
         regs.set_flag32(1);
         return thread::KernelAction::Done;
     }
-    let size = crate::kernel::vfs::seek(fd, 0, 2, &dos.fds);
+    let size = crate::kernel::vfs::seek(fd, 0, 2, &kt.fds);
     if size <= 0 {
-        crate::kernel::vfs::close(fd, &mut dos.fds);
+        crate::kernel::vfs::close(fd, &mut kt.fds);
         regs.rax = (regs.rax & !0xFFFF) | 2;
         regs.set_flag32(1);
         return thread::KernelAction::Done;
     }
-    crate::kernel::vfs::seek(fd, 0, 0, &dos.fds);
+    crate::kernel::vfs::seek(fd, 0, 0, &kt.fds);
     let mut buf = alloc::vec![0u8; size as usize];
-    crate::kernel::vfs::read_raw(fd, &mut buf, &dos.fds);
-    crate::kernel::vfs::close(fd, &mut dos.fds);
+    crate::kernel::vfs::read_raw(fd, &mut buf, &kt.fds);
+    crate::kernel::vfs::close(fd, &mut kt.fds);
+
+    // ELF binaries need a separate address space — route through fork_exec.
+    let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
+    crate::dbg_println!("  exec_program: {:?} size={} elf={}", core::str::from_utf8(prog_name), size, is_elf);
+    if is_elf {
+        return fork_exec(dos, prog_name, kt);
+    }
 
     let is_exe = is_mz_exe(&buf);
     let child_seg = dos.heap_seg;
@@ -2524,7 +2629,7 @@ fn exec_program(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         core::str::from_utf8(prog_name), size, is_exe, child_seg, dos.current_psp);
 
     let mut resolved_copy = [0u8; 164];
-    let resolved_name = dos_resolve_path(dos, prog_name, &mut resolved_copy);
+    let resolved_name = dos_resolve_path(kt, prog_name, &mut resolved_copy);
     let rlen = resolved_name.len();
 
     // Inherit parent's env block. In DPMI mode the parent's PSP[0x2C] has
@@ -2701,21 +2806,21 @@ fn dos_wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 
 /// Change working directory. Path is already normalized (no drive letters, forward slashes).
 /// Updates the thread's cwd after validating the directory exists.
-fn dos_chdir(dos: &mut thread::DosState, path: &[u8]) -> i32 {
+fn dos_chdir(kt: &mut thread::KernelThread, path: &[u8]) -> i32 {
     if path == b".." {
-        let cwd = dos.cwd_str();
-        if cwd.is_empty() { return 0; }
-        let without_slash = &cwd[..cwd.len().saturating_sub(1)];
+        let cwds_len = kt.cwd_len;
+        if cwds_len == 0 { return 0; }
+        let without_slash = &kt.cwd[..cwds_len.saturating_sub(1)];
         let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
             Some(pos) => pos + 1,
             None => 0,
         };
-        dos.cwd_len = new_len;
+        kt.cwd_len = new_len;
         return 0;
     }
 
     if path.is_empty() || path == b"/" {
-        dos.cwd_len = 0;
+        kt.cwd_len = 0;
         return 0;
     }
 
@@ -2727,8 +2832,7 @@ fn dos_chdir(dos: &mut thread::DosState, path: &[u8]) -> i32 {
             if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
         }
     } else {
-        let cwd = dos.cwd_str();
-        for &b in cwd {
+        for &b in kt.cwd_str() {
             if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
         }
         for &b in path {
@@ -2744,32 +2848,28 @@ fn dos_chdir(dos: &mut thread::DosState, path: &[u8]) -> i32 {
         return -2;
     }
 
-    dos.set_cwd(prefix);
+    kt.set_cwd(prefix);
     0
 }
 
 /// Resolve a normalized path to an absolute VFS path.
 /// Leading `/` = absolute (strip slash). Otherwise prepend cwd.
 /// Returns the resolved path length in `out`.
-fn dos_resolve_path<'a>(dos: &mut thread::DosState, path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
+fn dos_resolve_path<'a>(kt: &thread::KernelThread, path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
     let mut pos = 0;
     if !path.is_empty() && path[0] == b'/' {
-        // Absolute — skip leading slash
         for &b in &path[1..] {
             if pos < out.len() { out[pos] = b; pos += 1; }
         }
     } else {
-        // Relative — prepend cwd
-        let cwd = dos.cwd_str();
-        for &b in cwd {
+        for &b in kt.cwd_str() {
             if pos < out.len() { out[pos] = b; pos += 1; }
         }
         for &b in path {
             if pos < out.len() { out[pos] = b; pos += 1; }
         }
     }
-    let result = &out[..pos];
-    result
+    &out[..pos]
 }
 
 /// Normalize a DOS path in-place: convert `\` to `/`, strip drive letter.
@@ -2780,8 +2880,21 @@ fn dos_normalize_path(buf: &mut [u8], len: usize) -> usize {
     for i in 0..len {
         if buf[i] == b'\\' { buf[i] = b'/'; }
     }
-    // Strip drive letter prefix (X: or X:/)
+    // Map drive letters: H: → host/ prefix, others strip drive letter
     if len >= 2 && buf[0].is_ascii_alphabetic() && buf[1] == b':' {
+        if buf[0] == b'H' || buf[0] == b'h' {
+            // H:\foo → /host/foo, H:foo → /host/foo
+            let rest_start = 2;
+            let has_slash = rest_start < len && buf[rest_start] == b'/';
+            let prefix = if has_slash { b"/host" as &[u8] } else { b"/host/" };
+            let rest_len = len - rest_start;
+            let new_len = prefix.len() + rest_len;
+            if new_len <= buf.len() {
+                buf.copy_within(rest_start..len, prefix.len());
+                buf[..prefix.len()].copy_from_slice(prefix);
+                return new_len;
+            }
+        }
         buf.copy_within(2..len, 0);
         return len - 2;
     }
@@ -2941,7 +3054,7 @@ const SFT_ENTRY_SIZE: u32 = 59;
 const SFT_SIZE: u32 = 6 + SFT_ENTRIES as u32 * SFT_ENTRY_SIZE;    // 1186
 const CDS_ADDR: u32 = SFT_ADDR + SFT_SIZE;                        // 0x0CE2
 const CDS_ENTRY_SIZE: u32 = 81;
-const NUM_DRIVES: u8 = 3;
+const NUM_DRIVES: u8 = 8; // A..H (H: = hostfs)
 const CDS_SIZE: u32 = NUM_DRIVES as u32 * CDS_ENTRY_SIZE;         // 243
 const DOS_AREA_END: u32 = CDS_ADDR + CDS_SIZE;                    // 0x0DD5
 const LOL_SEG: u16 = (LOL_ADDR >> 4) as u16;
@@ -3014,6 +3127,14 @@ fn setup_lol_sft() {
         write_le16(c_entry.add(0x43), 0x4000);
         // +4Fh: backslash offset (points to the '\' in "C:\")
         write_le16(c_entry.add(0x4F), 2);
+
+        // H: entry (index 7) — hostfs
+        let h_entry = cds.add(7 * CDS_ENTRY_SIZE as usize);
+        *h_entry.add(0) = b'H';
+        *h_entry.add(1) = b':';
+        *h_entry.add(2) = b'\\';
+        write_le16(h_entry.add(0x43), 0x4000);
+        write_le16(h_entry.add(0x4F), 2);
     }
 }
 
@@ -3123,6 +3244,33 @@ fn map_psp(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, prog_name
         *psp_ptr.add(0x81) = 0x0D; // CR
     }
 
+}
+
+/// Load a DOS binary (.COM or .EXE) and initialize the thread for VM86 mode.
+/// Handles full address space setup: clean + low mem + IVT + binary load + thread init.
+/// Called from kernel exec fan-out.
+pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8]) {
+    use crate::kernel::{startup, thread};
+
+    startup::arch_user_clean();
+    startup::arch_map_low_mem();
+    setup_ivt();
+
+    let (cs, ip, ss, sp, end_seg) = if is_exe && is_mz_exe(data) {
+        load_exe(data, prog_name).unwrap_or_else(|| {
+            crate::println!("Invalid MZ EXE");
+            (0, 0, 0, 0, 0)
+        })
+    } else {
+        load_com(data, prog_name)
+    };
+
+    let current = thread::get_thread(tid).unwrap();
+    thread::init_process_thread_vm86(current, COM_SEGMENT, cs, ip, ss, sp);
+    let dos_state = current.dos_mut();
+    dos_state.heap_seg = end_seg;
+    dos_state.dta = (COM_SEGMENT as u32) * 16 + 0x80;
+    current.kernel.symbols = None;
 }
 
 /// Check if data starts with the MZ signature.

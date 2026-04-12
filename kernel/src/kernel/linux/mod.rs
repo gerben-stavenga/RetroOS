@@ -14,6 +14,7 @@ use crate::kernel::elf;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::startup;
 use crate::kernel::thread;
+use crate::kernel::thread::{FdKind, PendingRead, MAX_FDS};
 use crate::kernel::vfs;
 use crate::vga;
 use crate::Regs;
@@ -41,6 +42,57 @@ const ESPIPE: i32 = 29;
 const EPIPE: i32 = 32;
 const ENOSYS: i32 = 38;
 const ENODATA: i32 = 61;
+
+/// Linux-specific thread state
+pub struct LinuxState {
+    pub heap_base: usize,
+    pub heap_end: usize,
+    pub mmap_cursor: usize,
+    pub tls_entry: i32,            // GDT index for TLS (13-15), -1 = none
+    pub tls_base: u32,
+    pub tls_limit: u32,
+    pub tls_limit_in_pages: bool,
+    pub pending_read: Option<PendingRead>,  // Blocked read on any fd kind
+    pub vfork_parent: Option<usize>,       // If set, this is a CLONE_VM|CLONE_VFORK child
+}
+
+impl LinuxState {
+    pub fn new() -> Self {
+        LinuxState {
+            heap_base: 0,
+            heap_end: 0,
+            mmap_cursor: crate::kernel::elf::USER_STACK_TOP - 0x0100_0000,
+            tls_entry: -1,
+            tls_base: 0,
+            tls_limit: 0,
+            tls_limit_in_pages: false,
+            pending_read: None,
+            vfork_parent: None,
+        }
+    }
+
+    /// Process a raw PS/2 scancode — the Linux TTY line discipline.
+    /// Updates key state, converts to ASCII, echoes to VGA, writes to stdin pipe.
+    /// `fds` is the thread's fd table (lives on Thread, not LinuxState).
+    pub fn process_key(&self, fds: &[FdKind; MAX_FDS], scancode: u8) {
+        if !crate::kernel::keyboard::update_key_state(scancode) { return; }
+        let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
+        if c == 0 { return; }
+        if let FdKind::PipeRead(idx) = fds[0] {
+            if c == 8 {
+                if crate::kernel::kpipe::pop_back(idx) {
+                    let vga = crate::vga::vga();
+                    vga.putchar(8);
+                    vga.putchar(b' ');
+                    vga.putchar(8);
+                }
+                return;
+            }
+            crate::vga::vga().putchar(c);
+            crate::kernel::kpipe::write(idx, &[c]);
+        }
+    }
+}
 
 // =============================================================================
 // Extracted syscall arguments (mode-independent)
@@ -82,14 +134,14 @@ impl SyscallResult {
 }
 
 /// Dispatch returning KernelAction.
-pub fn dispatch_action(tid: usize, regs: &mut Regs) -> thread::KernelAction {
+pub fn dispatch_action(kt: &mut thread::KernelThread, linux: &mut LinuxState, regs: &mut Regs) -> thread::KernelAction {
     let args = extract_args(regs);
     let nr = regs.rax as u32;
 
     let result = if regs.mode() == crate::UserMode::Mode64 {
-        dispatch_nr_64(tid, nr, &args, regs)
+        dispatch_nr_64(kt, linux, nr, &args, regs)
     } else {
-        dispatch_nr(tid, nr, &args, regs)
+        dispatch_nr(kt, linux, nr, &args, regs)
     };
 
     regs.rax = result.retval as u64;
@@ -99,60 +151,60 @@ pub fn dispatch_action(tid: usize, regs: &mut Regs) -> thread::KernelAction {
     }
 }
 
-fn dispatch_nr(tid: usize, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
+    let tid = kt.tid as usize;
     match nr {
-        // Tier 0: startup
         1   => sys_exit(tid, a),
-        2   => sys_fork(tid, a, regs),
-        3   => sys_read(tid, a, regs),
-        4   => sys_write(tid, a),
-        5   => sys_open(tid, a),
-        6   => sys_close(tid, a),
-        11  => sys_execve(tid, a, regs),
-        12  => sys_chdir(tid, a),
+        2   => sys_fork(kt, linux, a, regs),
+        3   => sys_read(kt, linux, a, regs),
+        4   => sys_write(kt, a),
+        5   => sys_open(kt, a),
+        6   => sys_close(kt, a),
+        11  => sys_execve(kt, linux, a, regs),
+        12  => sys_chdir(kt, a),
         13  => sys_time(a),
-        19  => sys_lseek(tid, a),
-        20  => sys_getpid(tid),
-        24 | 49 | 47 | 50 => SyscallResult::val(0), // get{u,eu,g,eg}id
-        33  => sys_access(tid, a),
-        42  => sys_pipe(tid, a, false),
-        45  => sys_brk(tid, a),
-        54  => SyscallResult::val(-ENOTTY), // ioctl
-        55  => sys_fcntl(tid, a),
-        63  => sys_dup2(tid, a),
-        85  => SyscallResult::val(-ENOENT), // readlink
-        91  => sys_munmap(tid, a),
-        114 => sys_wait4(tid, a, regs),
-        120 => sys_clone(tid, a, regs),
+        19  => sys_lseek(kt, a),
+        20  => SyscallResult::val(kt.tid),
+        24 | 49 | 47 | 50 => SyscallResult::val(0),
+        33  => sys_access(kt, a),
+        42  => sys_pipe(kt, a, false),
+        45  => sys_brk(linux, a),
+        54  => SyscallResult::val(-ENOTTY),
+        55  => sys_fcntl(kt, a),
+        63  => sys_dup2(kt, a),
+        85  => SyscallResult::val(-ENOENT),
+        91  => sys_munmap(linux, a),
+        114 => sys_wait4(kt, a, regs),
+        120 => sys_clone(kt, linux, a, regs),
         122 => sys_uname(a),
-        125 => SyscallResult::val(0), // mprotect
-        140 => sys_llseek(tid, a),
-        146 => sys_writev(tid, a),
-        158 => sys_sched_yield(tid, regs),
+        125 => SyscallResult::val(0),
+        140 => sys_llseek(kt, a),
+        146 => sys_writev(kt, a),
+        158 => sys_sched_yield(kt, regs),
         162 => sys_nanosleep(),
-        168 => sys_poll(tid, a),
-        174 => SyscallResult::val(0), // rt_sigaction
-        175 => SyscallResult::val(0), // rt_sigprocmask
-        183 => sys_getcwd(tid, a),
-        186 => SyscallResult::val(0), // sigaltstack
-        192 => sys_mmap2(tid, a),
-        195 => sys_stat64(tid, a),
-        196 => sys_stat64(tid, a), // lstat64 = stat64 (no symlinks)
-        197 => sys_fstat64(tid, a),
-        220 => sys_getdents64(tid, a),
-        221 => sys_fcntl(tid, a), // fcntl64
-        238 => sys_exit(tid, a), // tkill → exit
-        240 => SyscallResult::val(0), // futex
-        243 => sys_set_thread_area_with_tid(tid, a),
-        252 => sys_exit(tid, a), // exit_group
-        258 => sys_set_tid_address(tid),
+        168 => sys_poll(kt, a),
+        174 => SyscallResult::val(0),
+        175 => SyscallResult::val(0),
+        183 => sys_getcwd(kt, a),
+        186 => SyscallResult::val(0),
+        192 => sys_mmap2(linux, a),
+        195 => sys_stat64(kt, a),
+        196 => sys_stat64(kt, a),
+        197 => sys_fstat64(kt, a),
+        220 => sys_getdents64(kt, a),
+        221 => sys_fcntl(kt, a),
+        238 => sys_exit(tid, a),
+        240 => SyscallResult::val(0),
+        243 => sys_set_thread_area(kt, linux, a),
+        252 => sys_exit(tid, a),
+        258 => SyscallResult::val(kt.tid),
         265 => sys_clock_gettime(a),
-        270 => sys_exit(tid, a), // tgkill → exit
-        295 => sys_openat(tid, a),
-        300 => sys_fstatat64(tid, a),
-        305 => SyscallResult::val(-ENOENT), // readlinkat
-        331 => sys_pipe(tid, a, true),  // pipe2
-        340 => SyscallResult::val(0), // prlimit64
+        270 => sys_exit(tid, a),
+        295 => sys_openat(kt, a),
+        300 => sys_fstatat64(kt, a),
+        305 => SyscallResult::val(-ENOENT),
+        331 => sys_pipe(kt, a, true),
+        340 => SyscallResult::val(0),
         355 => sys_getrandom(a),
         _ => {
             println!("unimplemented syscall {}", nr);
@@ -162,58 +214,59 @@ fn dispatch_nr(tid: usize, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult 
 }
 
 /// x86_64 syscall number table (different numbers, same implementations)
-fn dispatch_nr_64(tid: usize, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
+    let tid = kt.tid as usize;
     println!("sc64 t{} nr={} a0={:#x} a1={:#x} a2={:#x}", tid, nr, a.a0, a.a1, a.a2);
     match nr {
-        0   => sys_read(tid, a, regs),
-        1   => sys_write(tid, a),
-        2   => sys_open(tid, a),
-        3   => sys_close(tid, a),
-        4   => sys_stat64(tid, a),     // stat
-        5   => sys_fstat64(tid, a),    // fstat
-        6   => sys_stat64(tid, a),     // lstat = stat (no symlinks)
-        7   => sys_poll(tid, a),
-        8   => sys_lseek(tid, a),
-        9   => sys_mmap2(tid, a),      // mmap (offset in bytes, not pages)
-        10  => SyscallResult::val(0),  // mprotect
-        11  => sys_munmap(tid, a),
-        12  => sys_brk(tid, a),
-        13  => SyscallResult::val(0),  // rt_sigaction
-        14  => SyscallResult::val(0),  // rt_sigprocmask
-        16  => SyscallResult::val(-ENOTTY), // ioctl
-        20  => sys_writev(tid, a),
-        21  => sys_access(tid, a),
-        22  => sys_pipe(tid, a, false),
-        24  => sys_sched_yield(tid, regs),
-        33  => sys_dup2(tid, a),
+        0   => sys_read(kt, linux, a, regs),
+        1   => sys_write(kt, a),
+        2   => sys_open(kt, a),
+        3   => sys_close(kt, a),
+        4   => sys_stat64(kt, a),
+        5   => sys_fstat64(kt, a),
+        6   => sys_stat64(kt, a),
+        7   => sys_poll(kt, a),
+        8   => sys_lseek(kt, a),
+        9   => sys_mmap2(linux, a),
+        10  => SyscallResult::val(0),
+        11  => sys_munmap(linux, a),
+        12  => sys_brk(linux, a),
+        13  => SyscallResult::val(0),
+        14  => SyscallResult::val(0),
+        16  => SyscallResult::val(-ENOTTY),
+        20  => sys_writev(kt, a),
+        21  => sys_access(kt, a),
+        22  => sys_pipe(kt, a, false),
+        24  => sys_sched_yield(kt, regs),
+        33  => sys_dup2(kt, a),
         35  => sys_nanosleep(),
-        39  => sys_getpid(tid),
-        56  => sys_clone(tid, a, regs),
-        57  => sys_fork(tid, a, regs),
-        59  => sys_execve(tid, a, regs),
+        39  => SyscallResult::val(kt.tid),
+        56  => sys_clone(kt, linux, a, regs),
+        57  => sys_fork(kt, linux, a, regs),
+        59  => sys_execve(kt, linux, a, regs),
         60  => sys_exit(tid, a),
-        61  => sys_wait4(tid, a, regs),
-        72  => sys_fcntl(tid, a),
-        79  => sys_getcwd(tid, a),
-        80  => sys_chdir(tid, a),
-        89  => SyscallResult::val(-ENOENT), // readlink
-        96  => sys_clock_gettime(a),   // gettimeofday (reuse)
-        102 | 104 | 107 | 108 => SyscallResult::val(0), // get{u,g,eu,eg}id
-        110 => sys_getpid(tid),        // getppid (stub → pid)
-        131 => SyscallResult::val(0),  // sigaltstack
-        158 => sys_arch_prctl(tid, a, regs), // arch_prctl (TLS)
-        200 => sys_exit(tid, a),       // tkill → exit
-        202 => SyscallResult::val(0),  // futex
-        217 => sys_getdents64(tid, a),
-        218 => sys_set_tid_address(tid),
+        61  => sys_wait4(kt, a, regs),
+        72  => sys_fcntl(kt, a),
+        79  => sys_getcwd(kt, a),
+        80  => sys_chdir(kt, a),
+        89  => SyscallResult::val(-ENOENT),
+        96  => sys_clock_gettime(a),
+        102 | 104 | 107 | 108 => SyscallResult::val(0),
+        110 => SyscallResult::val(kt.tid),
+        131 => SyscallResult::val(0),
+        158 => sys_arch_prctl(kt, linux, a, regs),
+        200 => sys_exit(tid, a),
+        202 => SyscallResult::val(0),
+        217 => sys_getdents64(kt, a),
+        218 => SyscallResult::val(kt.tid),
         228 => sys_clock_gettime(a),
-        231 => sys_exit(tid, a),       // exit_group
-        234 => sys_exit(tid, a),       // tgkill → exit
-        257 => sys_openat(tid, a),
-        262 => sys_fstatat64(tid, a),  // newfstatat
-        267 => SyscallResult::val(-ENOENT), // readlinkat
-        293 => sys_pipe(tid, a, true), // pipe2
-        302 => SyscallResult::val(0),  // prlimit64
+        231 => sys_exit(tid, a),
+        234 => sys_exit(tid, a),
+        257 => sys_openat(kt, a),
+        262 => sys_fstatat64(kt, a),
+        267 => SyscallResult::val(-ENOENT),
+        293 => sys_pipe(kt, a, true),
+        302 => SyscallResult::val(0),
         318 => sys_getrandom(a),
         _ => {
             println!("unimplemented x86_64 syscall {}", nr);
@@ -237,21 +290,7 @@ unsafe fn read_c_str(ptr: usize, max: usize) -> &'static [u8] {
 /// Resolve a path (NUL-terminated user pointer) against cwd.
 /// Leading `/` = absolute (strip it). Otherwise prepend cwd.
 pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
-    let mut pos = 0;
-    if !path.is_empty() && path[0] == b'/' {
-        let trimmed = &path[path.iter().position(|&b| b != b'/').unwrap_or(path.len())..];
-        for &b in trimmed {
-            if pos < buf.len() { buf[pos] = b; pos += 1; }
-        }
-    } else {
-        for &b in cwd {
-            if pos < buf.len() { buf[pos] = b; pos += 1; }
-        }
-        for &b in path {
-            if pos < buf.len() { buf[pos] = b; pos += 1; }
-        }
-    }
-    &buf[..pos]
+    crate::kernel::exec::resolve_path(path, cwd, buf)
 }
 
 /// Change cwd. Validates directory exists. cwd/cwd_len are mutated in place.
@@ -296,32 +335,7 @@ pub fn do_chdir(path: &[u8], cwd: &mut [u8; 64], cwd_len: &mut usize) -> i32 {
     0
 }
 
-/// Get mutable reference to LinuxState for a thread (panics if not Linux).
-fn linux_state(tid: usize) -> &'static mut thread::LinuxState {
-    let t = thread::get_thread(tid).unwrap();
-    match &mut t.mode {
-        thread::ThreadMode::Linux(l) => l,
-        _ => panic!("linux_state on non-Linux thread"),
-    }
-}
-
-/// Get cwd slice for the thread.
-fn thread_cwd(tid: usize) -> &'static [u8] {
-    let t = thread::get_thread(tid).unwrap();
-    match &t.mode {
-        thread::ThreadMode::Dos(d) => d.cwd_str(),
-        thread::ThreadMode::Linux(l) => l.cwd_str(),
-    }
-}
-
 /// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
-fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
-    path.len() >= 4 && path[path.len() - 4] == b'.'
-        && path[path.len() - 3].to_ascii_uppercase() == ext[0]
-        && path[path.len() - 2].to_ascii_uppercase() == ext[1]
-        && path[path.len() - 1].to_ascii_uppercase() == ext[2]
-}
-
 /// Read a C `char**` (NULL-terminated) from 32-bit user memory into Vec<Vec<u8>>.
 fn read_c_argv32(ptr: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
     let mut args = alloc::vec::Vec::new();
@@ -469,6 +483,36 @@ pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool) -> u
 }
 
 // =============================================================================
+// ELF exec — called from kernel exec fan-out
+// =============================================================================
+
+/// Load an ELF binary into the current address space and initialize the thread.
+/// Caller must have already cleaned/prepared the address space.
+pub fn exec_elf_into(tid: usize, data: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
+    let loaded = elf::load_elf(data).map_err(|_| 8)?; // ENOEXEC
+
+    let want_64 = loaded.class == elf::ElfClass::Elf64;
+    let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
+    let sp = setup_user_stack(args, want_64);
+
+    let current = thread::get_thread(tid).unwrap();
+    if want_64 {
+        thread::init_process_thread_64(current, loaded.entry, sp as u64);
+    } else {
+        thread::init_process_thread(current, loaded.entry as u32, sp as u32);
+    }
+    current.kernel.symbols = symbols;
+
+    if let thread::Personality::Linux(l) = &mut current.personality {
+        l.heap_base = loaded.max_vaddr;
+        l.heap_end = loaded.max_vaddr;
+        l.mmap_cursor = elf::USER_STACK_TOP - 0x0100_0000;
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // Syscall handlers
 // =============================================================================
 
@@ -479,8 +523,8 @@ fn sys_exit(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// fork(2)
-fn sys_fork(tid: usize, _a: &Args, regs: &mut Regs) -> SyscallResult {
-    let current = thread::get_thread(tid).unwrap();
+fn sys_fork(kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, regs: &mut Regs) -> SyscallResult {
+    let tid = kt.tid as usize;
     let mut child_root = crate::RootPageTable::empty();
     startup::arch_user_fork(&mut child_root);
 
@@ -489,41 +533,32 @@ fn sys_fork(tid: usize, _a: &Args, regs: &mut Regs) -> SyscallResult {
         None => return SyscallResult::val(-ENOMEM),
     };
 
-    child.cpu_state = *regs;
+    child.kernel.cpu_state = *regs;
+    child.kernel.cwd = kt.cwd;
+    child.kernel.cwd_len = kt.cwd_len;
 
-    // Inherit fds, cwd, and heap state
-    match (&current.mode, &mut child.mode) {
-        (thread::ThreadMode::Linux(pl), thread::ThreadMode::Linux(cl)) => {
-            pl.dup_all_fds(cl);
-            cl.cwd = pl.cwd;
-            cl.cwd_len = pl.cwd_len;
-            cl.heap_base = pl.heap_base;
-            cl.heap_end = pl.heap_end;
-            cl.mmap_cursor = pl.mmap_cursor;
-            cl.tls_entry = pl.tls_entry;
-            cl.tls_base = pl.tls_base;
-            cl.tls_limit = pl.tls_limit;
-            cl.tls_limit_in_pages = pl.tls_limit_in_pages;
-        }
-        (thread::ThreadMode::Dos(pd), thread::ThreadMode::Linux(cl)) => {
-            // DOS parent forking Linux child (shouldn't happen, but handle gracefully)
-            cl.cwd = pd.cwd;
-            cl.cwd_len = pd.cwd_len;
-        }
-        _ => {}
+    kt.dup_all_fds(&mut child.kernel);
+    if let thread::Personality::Linux(cl) = &mut child.personality {
+        cl.heap_base = linux.heap_base;
+        cl.heap_end = linux.heap_end;
+        cl.mmap_cursor = linux.mmap_cursor;
+        cl.tls_entry = linux.tls_entry;
+        cl.tls_base = linux.tls_base;
+        cl.tls_limit = linux.tls_limit;
+        cl.tls_limit_in_pages = linux.tls_limit_in_pages;
     }
 
-    // Child returns 0
     thread::set_return(child, 0);
-    current.state = thread::ThreadState::Ready;
-    let child_tid = child.tid;
+    kt.state = thread::ThreadState::Ready;
+    let child_tid = child.kernel.tid;
     SyscallResult { retval: child_tid as i64, switch_to: Some(child_tid as usize) }
 }
 
 /// clone(120) — fork-like clone with optional child_stack
 /// Supports plain fork (flags=SIGCHLD, stack=0) and posix_spawn-style
 /// vfork (CLONE_VM|CLONE_VFORK|SIGCHLD, stack=child_stack).
-fn sys_clone(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_clone(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+    let tid = kt.tid as usize;
     let flags = a.a0 as u32;
     let child_stack = a.a1 as usize;
     const SIGCHLD: u32 = 17;
@@ -539,52 +574,46 @@ fn sys_clone(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
     if is_vfork {
         // CLONE_VM|CLONE_VFORK: not a fork. Child borrows parent's address
         // space with a different stack. Parent frozen until child execs/exits.
-        let current = thread::get_thread(tid).unwrap();
-
-        // Copy parent's root entries so context switches work. No COW — just
-        // the directory pointers. Parent is frozen so there's no conflict.
-        let child_root = current.root;
+        let child_root = kt.root;
         let child = match thread::create_thread(Some(tid), child_root, true) {
             Some(t) => t,
             None => return SyscallResult::val(-ENOMEM),
         };
 
-        child.cpu_state = *regs;
-        child.cpu_state.frame.rsp = child_stack as u64;
+        child.kernel.cpu_state = *regs;
+        child.kernel.cpu_state.frame.rsp = child_stack as u64;
 
-        if let (thread::ThreadMode::Linux(pl), thread::ThreadMode::Linux(cl)) =
-            (&current.mode, &mut child.mode)
-        {
-            pl.dup_all_fds(cl);
-            cl.cwd = pl.cwd;
-            cl.cwd_len = pl.cwd_len;
-            cl.heap_base = pl.heap_base;
-            cl.heap_end = pl.heap_end;
-            cl.mmap_cursor = pl.mmap_cursor;
-            cl.tls_entry = pl.tls_entry;
-            cl.tls_base = pl.tls_base;
-            cl.tls_limit = pl.tls_limit;
-            cl.tls_limit_in_pages = pl.tls_limit_in_pages;
+        child.kernel.cwd = kt.cwd;
+        child.kernel.cwd_len = kt.cwd_len;
+        kt.dup_all_fds(&mut child.kernel);
+        if let thread::Personality::Linux(cl) = &mut child.personality {
+            cl.heap_base = linux.heap_base;
+            cl.heap_end = linux.heap_end;
+            cl.mmap_cursor = linux.mmap_cursor;
+            cl.tls_entry = linux.tls_entry;
+            cl.tls_base = linux.tls_base;
+            cl.tls_limit = linux.tls_limit;
+            cl.tls_limit_in_pages = linux.tls_limit_in_pages;
             cl.vfork_parent = Some(tid);
         }
 
         thread::set_return(child, 0);
-        let child_tid = child.tid;
+        let child_tid = child.kernel.tid;
 
         // Block parent until child execs or exits
-        current.cpu_state = *regs;
-        current.cpu_state.rax = child_tid as u64;
+        kt.cpu_state = *regs;
+        kt.cpu_state.rax = child_tid as u64;
         thread::block_thread(tid);
 
         SyscallResult { retval: child_tid as i64, switch_to: Some(child_tid as usize) }
     } else {
         // Plain fork (SIGCHLD only, or SIGCHLD with child_stack)
-        let result = sys_fork(tid, a, regs);
+        let result = sys_fork(kt, linux, a, regs);
 
         if child_stack != 0 {
             if let Some(child_tid) = result.switch_to {
                 if let Some(child) = thread::get_thread(child_tid) {
-                    child.cpu_state.frame.rsp = child_stack as u64;
+                    child.kernel.cpu_state.frame.rsp = child_stack as u64;
                 }
             }
         }
@@ -594,14 +623,13 @@ fn sys_clone(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
 }
 
 /// read(3)
-fn sys_read(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     let fd = a.a0 as usize;
     let buf = a.a1 as usize;
     let len = a.a2 as usize;
 
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    let linux = linux_state(tid);
-    let fd_kind = linux.fds[fd];
+    let fd_kind = kt.fds[fd];
 
     match fd_kind {
         thread::FdKind::PipeRead(idx) => {
@@ -615,16 +643,14 @@ fn sys_read(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
                 return SyscallResult::val(0); // EOF
             }
             // Block until data arrives
-            let current = thread::get_thread(tid).unwrap();
-            thread::save_state(current, regs);
-            current.state = thread::ThreadState::Blocked;
-            if let thread::ThreadMode::Linux(ref mut l) = current.mode {
-                l.pending_read = Some(thread::PendingRead {
-                    fd_kind,
-                    buf_ptr: buf,
-                    buf_len: len,
-                });
-            }
+            kt.cpu_state = *regs;
+            kt.state = thread::ThreadState::Blocked;
+            linux.pending_read = Some(thread::PendingRead {
+                fd_kind,
+                buf_ptr: buf,
+                buf_len: len,
+            });
+            let tid = kt.tid as usize;
             let next = thread::schedule(tid).unwrap_or(tid);
             SyscallResult { retval: 0, switch_to: Some(next) }
         }
@@ -640,14 +666,13 @@ fn sys_read(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
 }
 
 /// write(4)
-fn sys_write(tid: usize, a: &Args) -> SyscallResult {
+fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     let buf = a.a1 as usize as *const u8;
     let len = a.a2 as usize;
 
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    let linux = linux_state(tid);
-    let fd_kind = linux.fds[fd];
+    let fd_kind = kt.fds[fd];
 
     match fd_kind {
         thread::FdKind::ConsoleOut => {
@@ -678,20 +703,18 @@ fn sys_write(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// open(5)
-fn sys_open(tid: usize, a: &Args) -> SyscallResult {
+fn sys_open(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let path = unsafe { read_c_str(path_ptr, 256) };
 
     let mut buf = [0u8; 164];
-    let cwd = thread_cwd(tid);
-    let resolved = resolve_path(path, cwd, &mut buf);
+    let resolved = resolve_path(path, kt.cwd_str(), &mut buf);
     let handle = vfs::open_to_handle(resolved);
     if handle < 0 { return SyscallResult::val(handle); }
 
-    let linux = linux_state(tid);
-    match linux.alloc_fd(3) {
+    match kt.alloc_fd(3) {
         Some(fd) => {
-            linux.fds[fd] = thread::FdKind::Vfs(handle);
+            kt.fds[fd] = thread::FdKind::Vfs(handle);
             SyscallResult::val(fd as i32)
         }
         None => {
@@ -702,171 +725,75 @@ fn sys_open(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// close(6)
-fn sys_close(tid: usize, a: &Args) -> SyscallResult {
+fn sys_close(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    let linux = linux_state(tid);
-    if linux.fds[fd].is_none() { return SyscallResult::val(-EBADF); }
-    linux.close_fd(fd);
+    if kt.fds[fd].is_none() { return SyscallResult::val(-EBADF); }
+    kt.close_fd(fd);
     SyscallResult::val(0)
 }
 
 /// execve(11)
-fn sys_execve(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+    use crate::kernel::exec;
+
+    let tid = kt.tid as usize;
     let path_ptr = a.a0 as usize;
     let argv_ptr = a.a1 as usize;
     let _envp_ptr = a.a2 as usize;
 
     let path = unsafe { read_c_str(path_ptr, 256) };
 
-    let is_com = has_ext(path, b"COM");
-    let is_exe = has_ext(path, b"EXE");
-
     // Read argv from caller's address space before we free it
     let args = read_c_argv32(argv_ptr);
 
-    // Snapshot cwd, close CLOEXEC fds, drop symbols
-    let cwd_snapshot: [u8; 64];
-    let cwd_len_snapshot: usize;
-    {
-        let current = thread::get_thread(tid).unwrap();
-        match &mut current.mode {
-            thread::ThreadMode::Dos(d) => {
-                vfs::close_all_fds(&mut d.fds);
-                cwd_snapshot = d.cwd;
-                cwd_len_snapshot = d.cwd_len;
-                d.symbols = None;
-            }
-            thread::ThreadMode::Linux(l) => {
-                l.close_cloexec();
-                cwd_snapshot = l.cwd;
-                cwd_len_snapshot = l.cwd_len;
-                l.symbols = None;
-            }
-        }
-    }
-
-    // Resolve path + open via handle-based VFS
-    let mut path_buf = [0u8; 164];
-    let resolved = resolve_path(path, &cwd_snapshot[..cwd_len_snapshot], &mut path_buf);
-    let handle = vfs::open_to_handle(resolved);
-    if handle < 0 { return SyscallResult::val(-ENOENT); }
-    let size = vfs::file_size_by_handle(handle) as usize;
-    let mut buffer = alloc::vec![0; size];
-    vfs::read_by_handle(handle, &mut buffer);
-    vfs::close_vfs_handle(handle);
-
-    let want_64 = match lib::elf::Elf::parse(&buffer) {
-        Ok(e) => e.class() == lib::elf::ElfClass::Elf64,
-        Err(_) => false,
+    // Load file (resolves path against cwd)
+    let buffer = match exec::load_file(path, kt.cwd_str()) {
+        Ok(b) => b,
+        Err(_) => return SyscallResult::val(-ENOENT),
     };
 
-    // DOS executables
-    if is_com || is_exe {
-        exec_dos(tid, &buffer, is_exe, resolved);
-        *regs = thread::get_thread(tid).unwrap().cpu_state;
-        return SyscallResult { retval: 0, switch_to: Some(tid) };
-    }
+    // Point of no return — close CLOEXEC fds and drop symbols
+    kt.symbols = None;
+    kt.close_cloexec();
 
-    // Check if this is a vfork child (shares parent's address space)
-    let vfork_parent = {
-        let current = thread::get_thread(tid).unwrap();
-        match &current.mode {
-            thread::ThreadMode::Linux(l) => l.vfork_parent,
-            _ => None,
-        }
-    };
+    let format = exec::detect_format(&buffer, path);
 
-    if vfork_parent.is_some() {
-        // Vfork child: allocate a fresh address space, don't touch parent's pages.
-        let mut new_root = crate::RootPageTable::empty();
-        startup::arch_switch_to(
-            &mut thread::get_thread(tid).unwrap().cpu_state,
-            &mut new_root,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-        );
-        // Now running in a blank address space — set it as this thread's root
-        thread::get_thread(tid).unwrap().root = new_root;
-    } else {
-        // Normal execve: free old address space
-        startup::arch_user_clean();
-    }
-
-    let loaded = match elf::load_elf(&buffer) {
-        Ok(e) => e,
-        Err(_) => {
-            return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, -ENOEXEC)) };
-        }
-    };
-
-    let symbols = SymbolData::new(buffer.into_boxed_slice());
-
-    let current = thread::get_thread(tid).unwrap();
-
-    // Set up Linux-style argv on new user stack
-    let sp = setup_user_stack(&args, want_64);
-
-    if want_64 {
-        thread::init_process_thread_64(current, loaded.entry, sp as u64);
-    } else {
-        thread::init_process_thread(current, loaded.entry as u32, sp as u32);
-    }
-
-    // Initialize heap state (fds 0/1/2 survive from parent — only CLOEXEC fds were closed)
-    match &mut current.mode {
-        thread::ThreadMode::Linux(l) => {
-            l.symbols = symbols;
-            l.heap_base = loaded.max_vaddr;
-            l.heap_end = loaded.max_vaddr;
-            l.mmap_cursor = elf::USER_STACK_TOP - 0x0100_0000;
-            // Clear vfork flag and unblock parent
-            if let Some(parent_tid) = l.vfork_parent.take() {
-                thread::unblock_thread(parent_tid);
-            }
-        }
-        thread::ThreadMode::Dos(d) => {
-            d.symbols = symbols;
+    // ELF address space prep (DOS handles its own inside exec_dos_into)
+    if matches!(format, exec::BinaryFormat::Elf) {
+        if linux.vfork_parent.is_some() {
+            let mut new_root = crate::RootPageTable::empty();
+            startup::arch_switch_to(
+                &mut kt.cpu_state,
+                &mut new_root,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+            kt.root = new_root;
+        } else {
+            startup::arch_user_clean();
         }
     }
 
-    *regs = current.cpu_state;
+    if let Err(_) = exec::init_thread(tid, &buffer, path, &args) {
+        return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, -ENOEXEC)) };
+    }
+
+    // Clear vfork flag and unblock parent (ELF only)
+    if let Some(parent_tid) = linux.vfork_parent.take() {
+        thread::unblock_thread(parent_tid);
+    }
+
+    // Reload regs from thread (init_thread sets them via get_thread)
+    *regs = thread::get_thread(tid).unwrap().kernel.cpu_state;
     SyscallResult { retval: 0, switch_to: Some(tid) }
 }
 
-/// Execute a DOS program (.COM or .EXE) in VM86 mode.
-fn exec_dos(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8]) {
-    use crate::kernel::dos;
-
-    startup::arch_user_clean();
-    startup::arch_map_low_mem();
-    dos::setup_ivt();
-
-    let (cs, ip, ss, sp, end_seg) = if is_exe && dos::is_mz_exe(data) {
-        dos::load_exe(data, prog_name).unwrap_or_else(|| {
-            crate::println!("Invalid MZ EXE");
-            (0, 0, 0, 0, 0)
-        })
-    } else {
-        dos::load_com(data, prog_name)
-    };
-
-    let current = thread::get_thread(tid).unwrap();
-    thread::init_process_thread_vm86(current, dos::COM_SEGMENT, cs, ip, ss, sp);
-    let dos_state = current.dos_mut();
-    dos_state.heap_seg = end_seg;
-    dos_state.dta = (dos::COM_SEGMENT as u32) * 16 + 0x80;
-    dos_state.symbols = None;
-}
 
 /// chdir(12)
-fn sys_chdir(tid: usize, a: &Args) -> SyscallResult {
+fn sys_chdir(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let path = unsafe { read_c_str(a.a0 as usize, 256) };
-    let (cwd, cwd_len) = match &mut thread::get_thread(tid).unwrap().mode {
-        thread::ThreadMode::Dos(d) => (&mut d.cwd, &mut d.cwd_len),
-        thread::ThreadMode::Linux(l) => (&mut l.cwd, &mut l.cwd_len),
-    };
-    SyscallResult::val(do_chdir(path, cwd, cwd_len))
+    SyscallResult::val(do_chdir(path, &mut kt.cwd, &mut kt.cwd_len))
 }
 
 /// time(13) — stub
@@ -879,29 +806,23 @@ fn sys_time(a: &Args) -> SyscallResult {
 }
 
 /// lseek(19)
-fn sys_lseek(tid: usize, a: &Args) -> SyscallResult {
+fn sys_lseek(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     let offset = a.a1 as i32;
     let whence = a.a2 as i32;
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    match linux_state(tid).fds[fd] {
+    match kt.fds[fd] {
         thread::FdKind::Vfs(handle) => SyscallResult::val(vfs::seek_by_handle(handle, offset, whence)),
         thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => SyscallResult::val(-ESPIPE),
         _ => SyscallResult::val(-EBADF),
     }
 }
 
-/// getpid(20)
-fn sys_getpid(tid: usize) -> SyscallResult {
-    SyscallResult::val(tid as i32)
-}
-
 /// access(33) — check file existence via VFS stat
-fn sys_access(tid: usize, a: &Args) -> SyscallResult {
+fn sys_access(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let path = unsafe { read_c_str(a.a0 as usize, 256) };
     let mut buf = [0u8; 164];
-    let cwd = thread_cwd(tid);
-    let resolved = resolve_path(path, cwd, &mut buf);
+    let resolved = resolve_path(path, kt.cwd_str(), &mut buf);
     let handle = vfs::open_to_handle(resolved);
     if handle < 0 {
         return SyscallResult::val(-ENOENT);
@@ -911,13 +832,8 @@ fn sys_access(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// brk(45)
-fn sys_brk(tid: usize, a: &Args) -> SyscallResult {
+fn sys_brk(linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let addr = a.a0 as usize;
-    let t = thread::get_thread(tid).unwrap();
-    let linux = match &mut t.mode {
-        thread::ThreadMode::Linux(l) => l,
-        _ => return SyscallResult::val64(0),
-    };
 
     if addr == 0 {
         // Query current brk
@@ -930,12 +846,11 @@ fn sys_brk(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// fcntl(55) / fcntl64(221)
-fn sys_fcntl(tid: usize, a: &Args) -> SyscallResult {
+fn sys_fcntl(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     let cmd = a.a1 as i32;
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    let linux = linux_state(tid);
-    if linux.fds[fd].is_none() { return SyscallResult::val(-EBADF); }
+    if kt.fds[fd].is_none() { return SyscallResult::val(-EBADF); }
 
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
@@ -945,15 +860,15 @@ fn sys_fcntl(tid: usize, a: &Args) -> SyscallResult {
 
     match cmd {
         F_GETFD => {
-            let cloexec = if linux.cloexec & (1 << fd) != 0 { FD_CLOEXEC } else { 0 };
+            let cloexec = if kt.cloexec & (1 << fd) != 0 { FD_CLOEXEC } else { 0 };
             SyscallResult::val(cloexec)
         }
         F_SETFD => {
             let arg = a.a2 as i32;
             if arg & FD_CLOEXEC != 0 {
-                linux.cloexec |= 1 << fd;
+                kt.cloexec |= 1 << fd;
             } else {
-                linux.cloexec &= !(1 << fd);
+                kt.cloexec &= !(1 << fd);
             }
             SyscallResult::val(0)
         }
@@ -963,7 +878,7 @@ fn sys_fcntl(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// munmap(91)
-fn sys_munmap(tid: usize, a: &Args) -> SyscallResult {
+fn sys_munmap(_linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let addr = a.a0 as usize;
     let length = a.a1 as usize;
     if addr & 0xFFF != 0 { return SyscallResult::val(-EINVAL); }
@@ -982,7 +897,8 @@ fn sys_munmap(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// wait4(114)
-fn sys_wait4(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_wait4(kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> SyscallResult {
+    let tid = kt.tid as usize;
     let pid = a.a0 as i32;
     let status_ptr = a.a1 as usize;
     let _options = a.a2 as i32;
@@ -990,7 +906,6 @@ fn sys_wait4(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
     let (child_tid, exit_code) = thread::waitpid(tid, pid);
 
     if child_tid >= 0 {
-        // Write status: Linux encodes as (exit_code << 8) for normal exit
         if status_ptr != 0 {
             unsafe { *(status_ptr as *mut i32) = (exit_code & 0xFF) << 8; }
         }
@@ -998,14 +913,12 @@ fn sys_wait4(tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
     }
 
     if child_tid == -10 {
-        // ECHILD — no children
         return SyscallResult::val(-ECHILD);
     }
 
     // EAGAIN — children exist but none exited. Block and yield.
-    let current = thread::get_thread(tid).unwrap();
-    thread::save_state(current, regs);
-    current.state = thread::ThreadState::Blocked;
+    kt.cpu_state = *regs;
+    kt.state = thread::ThreadState::Blocked;
     let next = thread::schedule(tid).unwrap_or(0);
     SyscallResult { retval: 0, switch_to: Some(next) }
 }
@@ -1034,7 +947,7 @@ fn sys_uname(a: &Args) -> SyscallResult {
 }
 
 /// _llseek(140) — 64-bit lseek
-fn sys_llseek(tid: usize, a: &Args) -> SyscallResult {
+fn sys_llseek(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     let offset_hi = a.a1 as u32;
     let offset_lo = a.a2 as u32;
@@ -1042,7 +955,7 @@ fn sys_llseek(tid: usize, a: &Args) -> SyscallResult {
     let whence = a.a4 as i32;
 
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    let handle = match linux_state(tid).fds[fd] {
+    let handle = match kt.fds[fd] {
         thread::FdKind::Vfs(h) => h,
         thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => return SyscallResult::val(-ESPIPE),
         _ => return SyscallResult::val(-EBADF),
@@ -1059,14 +972,14 @@ fn sys_llseek(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// writev(146)
-fn sys_writev(tid: usize, a: &Args) -> SyscallResult {
+fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     let iov_ptr = a.a1 as usize;
     let iovcnt = a.a2 as usize;
 
     if iovcnt > 1024 { return SyscallResult::val(-EINVAL); }
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    let fd_kind = linux_state(tid).fds[fd];
+    let fd_kind = kt.fds[fd];
 
     let mut total = 0i32;
 
@@ -1107,11 +1020,11 @@ fn sys_writev(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// sched_yield(158)
-fn sys_sched_yield(tid: usize, regs: &mut Regs) -> SyscallResult {
-    let current = thread::get_thread(tid).unwrap();
-    thread::save_state(current, regs);
-    thread::set_return(current, 0);
-    current.state = thread::ThreadState::Ready;
+fn sys_sched_yield(kt: &mut thread::KernelThread, regs: &mut Regs) -> SyscallResult {
+    let tid = kt.tid as usize;
+    kt.cpu_state = *regs;
+    kt.cpu_state.rax = 0;
+    kt.state = thread::ThreadState::Ready;
     SyscallResult { retval: 0, switch_to: thread::schedule(tid) }
 }
 
@@ -1121,10 +1034,9 @@ fn sys_nanosleep() -> SyscallResult {
 }
 
 /// poll(168) — report readability/writability based on FdKind
-fn sys_poll(tid: usize, a: &Args) -> SyscallResult {
+fn sys_poll(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fds_ptr = a.a0 as usize;
     let nfds = a.a1 as usize;
-    let linux = linux_state(tid);
 
     // struct pollfd { int fd; short events; short revents; } = 8 bytes
     let mut ready = 0i32;
@@ -1137,7 +1049,7 @@ fn sys_poll(tid: usize, a: &Args) -> SyscallResult {
         const POLLOUT: i16 = 4;
 
         if fd < thread::MAX_FDS {
-            match linux.fds[fd] {
+            match kt.fds[fd] {
                 thread::FdKind::PipeRead(idx) => {
                     if (events & POLLIN) != 0 && crate::kernel::kpipe::has_data(idx) {
                         revents |= POLLIN;
@@ -1164,13 +1076,10 @@ fn sys_poll(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// getcwd(183)
-fn sys_getcwd(tid: usize, a: &Args) -> SyscallResult {
+fn sys_getcwd(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let ptr = a.a0 as usize as *mut u8;
     let size = a.a1 as usize;
-    let cwd = match &thread::get_thread(tid).unwrap().mode {
-        thread::ThreadMode::Dos(d) => d.cwd_str(),
-        thread::ThreadMode::Linux(l) => l.cwd_str(),
-    };
+    let cwd = kt.cwd_str();
     // Linux getcwd returns absolute path with leading /
     if size < cwd.len() + 2 { return SyscallResult::val(-EINVAL); }
     unsafe {
@@ -1182,7 +1091,7 @@ fn sys_getcwd(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// mmap2(192) — anonymous private only
-fn sys_mmap2(tid: usize, a: &Args) -> SyscallResult {
+fn sys_mmap2(linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let addr_hint = a.a0 as usize;
     let length = a.a1 as usize;
     let _prot = a.a2 as u32;
@@ -1205,12 +1114,6 @@ fn sys_mmap2(tid: usize, a: &Args) -> SyscallResult {
     let num_pages = (length + 0xFFF) / 0x1000;
     if num_pages == 0 { return SyscallResult::val(-EINVAL); }
 
-    let t = thread::get_thread(tid).unwrap();
-    let linux = match &mut t.mode {
-        thread::ThreadMode::Linux(l) => l,
-        _ => return SyscallResult::val64(-ENOSYS as i64),
-    };
-
     // Pick address: grow mmap_cursor downward
     let alloc_size = num_pages * 0x1000;
     if linux.mmap_cursor < linux.heap_end + alloc_size {
@@ -1231,14 +1134,13 @@ fn sys_mmap2(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// stat64(195) / lstat64(196)
-fn sys_stat64(tid: usize, a: &Args) -> SyscallResult {
+fn sys_stat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let stat_buf = a.a1 as usize;
     let path = unsafe { read_c_str(path_ptr, 256) };
 
     let mut pbuf = [0u8; 164];
-    let cwd = thread_cwd(tid);
-    let resolved = resolve_path(path, cwd, &mut pbuf);
+    let resolved = resolve_path(path, kt.cwd_str(), &mut pbuf);
 
     // Check if it's a directory
     if vfs::dir_exists(resolved) {
@@ -1255,12 +1157,12 @@ fn sys_stat64(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// fstat64(197)
-fn sys_fstat64(tid: usize, a: &Args) -> SyscallResult {
+fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     let stat_buf = a.a1 as usize;
 
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    match linux_state(tid).fds[fd] {
+    match kt.fds[fd] {
         thread::FdKind::ConsoleOut | thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => {
             // stdin/stdout/stderr / pipes — character device / pipe
             write_stat64(stat_buf, 0o20666, 0); // S_IFCHR
@@ -1276,11 +1178,11 @@ fn sys_fstat64(tid: usize, a: &Args) -> SyscallResult {
 }
 
 /// fstatat64(300)
-fn sys_fstatat64(tid: usize, a: &Args) -> SyscallResult {
+fn sys_fstatat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let _dirfd = a.a0 as i32;
     // Treat as stat64 on the path (a.a1 = path, a.a2 = stat buf)
     let shifted = Args { a0: a.a1, a1: a.a2, a2: a.a3, a3: a.a4, a4: a.a5, a5: 0 };
-    sys_stat64(tid, &shifted)
+    sys_stat64(kt, &shifted)
 }
 
 /// Write a minimal Linux stat64 struct to user memory.
@@ -1300,18 +1202,13 @@ fn write_stat64(buf: usize, mode: u32, size: u32) {
 }
 
 /// getdents64(220)
-fn sys_getdents64(tid: usize, a: &Args) -> SyscallResult {
+fn sys_getdents64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as i32;
     let dirp = a.a1 as usize;
     let count = a.a2 as usize;
 
     // We don't have directory fds — use the thread's cwd as the directory.
-    // This is a simplification: real getdents64 works with an fd from openat.
-    // For now: if fd matches an open fd, check if it's a directory path.
-    let cwd = match &thread::get_thread(tid).unwrap().mode {
-        thread::ThreadMode::Dos(d) => &d.cwd[..d.cwd_len],
-        thread::ThreadMode::Linux(l) => &l.cwd[..l.cwd_len],
-    };
+    let cwd = kt.cwd_str();
 
     let mut offset = 0usize;
     let mut index = 0usize;
@@ -1343,8 +1240,8 @@ fn sys_getdents64(tid: usize, a: &Args) -> SyscallResult {
     SyscallResult::val(offset as i32)
 }
 
-/// set_thread_area(243) — parse user_desc struct, set GDT TLS entry
-fn sys_set_thread_area(a: &Args) -> SyscallResult {
+/// set_thread_area(243) — parse user_desc struct, set GDT TLS entry, save to LinuxState
+fn sys_set_thread_area(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let u_info = a.a0 as usize;
     if u_info == 0 { return SyscallResult::val(-EFAULT); }
 
@@ -1360,28 +1257,19 @@ fn sys_set_thread_area(a: &Args) -> SyscallResult {
 
     // Write back the allocated entry number
     unsafe { *(u_info as *mut i32) = idx; }
-    SyscallResult::val(0)
-}
 
-/// sys_set_thread_area variant that also saves TLS state to LinuxState for context-switch restore
-fn sys_set_thread_area_with_tid(tid: usize, a: &Args) -> SyscallResult {
-    let result = sys_set_thread_area(a);
-    if result.retval == 0 {
-        let u_info = a.a0 as usize;
-        let t = thread::get_thread(tid).unwrap();
-        if let thread::ThreadMode::Linux(l) = &mut t.mode {
-            l.tls_entry = unsafe { *(u_info as *const i32) };
-            l.tls_base = unsafe { *((u_info + 4) as *const u32) };
-            l.tls_limit = unsafe { *((u_info + 8) as *const u32) };
-            l.tls_limit_in_pages = unsafe { *((u_info + 12) as *const u32) } & (1 << 4) != 0;
-        }
-    }
-    result
+    // Save TLS state for context-switch restore
+    linux.tls_entry = idx;
+    linux.tls_base = base_addr;
+    linux.tls_limit = limit;
+    linux.tls_limit_in_pages = limit_in_pages;
+
+    SyscallResult::val(0)
 }
 
 /// arch_prctl(158) — x86_64 TLS via FS/GS base.
 /// Stores the base in regs.fs/gs — arch layer writes MSR on return to user.
-fn sys_arch_prctl(_tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_arch_prctl(_kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     const ARCH_SET_GS: u64 = 0x1001;
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
@@ -1404,11 +1292,6 @@ fn sys_arch_prctl(_tid: usize, a: &Args, regs: &mut Regs) -> SyscallResult {
     }
 }
 
-/// set_tid_address(258)
-fn sys_set_tid_address(tid: usize) -> SyscallResult {
-    SyscallResult::val(tid as i32)
-}
-
 /// clock_gettime(265) — monotonic from tick counter
 fn sys_clock_gettime(a: &Args) -> SyscallResult {
     let _clock_id = a.a0 as u32;
@@ -1427,15 +1310,14 @@ fn sys_clock_gettime(a: &Args) -> SyscallResult {
 }
 
 /// openat(295) — treat AT_FDCWD as cwd-relative, else EBADF
-fn sys_openat(tid: usize, a: &Args) -> SyscallResult {
+fn sys_openat(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let dirfd = a.a0 as i32;
     const AT_FDCWD: i32 = -100;
     if dirfd != AT_FDCWD && dirfd < 0 {
         return SyscallResult::val(-EBADF);
     }
-    // Shift args: a1=path, a2=flags, a3=mode → treat as open(path, flags, mode)
     let shifted = Args { a0: a.a1, a1: a.a2, a2: a.a3, a3: 0, a4: 0, a5: 0 };
-    sys_open(tid, &shifted)
+    sys_open(kt, &shifted)
 }
 
 /// getrandom(355) — stub: fill with PRNG output
@@ -1452,7 +1334,7 @@ fn sys_getrandom(a: &Args) -> SyscallResult {
 }
 
 /// pipe(42) / pipe2(359)
-fn sys_pipe(tid: usize, a: &Args, is_pipe2: bool) -> SyscallResult {
+fn sys_pipe(kt: &mut thread::KernelThread, a: &Args, is_pipe2: bool) -> SyscallResult {
     let pipefd_ptr = a.a0 as usize;
     let flags = if is_pipe2 { a.a1 as u32 } else { 0 };
     const O_CLOEXEC: u32 = 0o2000000;
@@ -1462,8 +1344,7 @@ fn sys_pipe(tid: usize, a: &Args, is_pipe2: bool) -> SyscallResult {
         None => return SyscallResult::val(-24), // EMFILE
     };
 
-    let linux = linux_state(tid);
-    let read_fd = match linux.alloc_fd(0) {
+    let read_fd = match kt.alloc_fd(0) {
         Some(fd) => fd,
         None => {
             crate::kernel::kpipe::close_reader(pipe_idx);
@@ -1471,23 +1352,22 @@ fn sys_pipe(tid: usize, a: &Args, is_pipe2: bool) -> SyscallResult {
             return SyscallResult::val(-24);
         }
     };
-    linux.fds[read_fd] = thread::FdKind::PipeRead(pipe_idx);
+    kt.fds[read_fd] = thread::FdKind::PipeRead(pipe_idx);
 
-    let write_fd = match linux.alloc_fd(0) {
+    let write_fd = match kt.alloc_fd(0) {
         Some(fd) => fd,
         None => {
-            linux.close_fd(read_fd);
+            kt.close_fd(read_fd);
             crate::kernel::kpipe::close_writer(pipe_idx);
             return SyscallResult::val(-24);
         }
     };
-    linux.fds[write_fd] = thread::FdKind::PipeWrite(pipe_idx);
+    kt.fds[write_fd] = thread::FdKind::PipeWrite(pipe_idx);
 
     if flags & O_CLOEXEC != 0 {
-        linux.cloexec |= (1 << read_fd) | (1 << write_fd);
+        kt.cloexec |= (1 << read_fd) | (1 << write_fd);
     }
 
-    // Write [read_fd, write_fd] to user pointer
     unsafe {
         *(pipefd_ptr as *mut i32) = read_fd as i32;
         *((pipefd_ptr + 4) as *mut i32) = write_fd as i32;
@@ -1496,7 +1376,7 @@ fn sys_pipe(tid: usize, a: &Args, is_pipe2: bool) -> SyscallResult {
 }
 
 /// dup2(63)
-fn sys_dup2(tid: usize, a: &Args) -> SyscallResult {
+fn sys_dup2(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let oldfd = a.a0 as usize;
     let newfd = a.a1 as usize;
 
@@ -1504,28 +1384,23 @@ fn sys_dup2(tid: usize, a: &Args) -> SyscallResult {
         return SyscallResult::val(-EBADF);
     }
 
-    let linux = linux_state(tid);
-    if linux.fds[oldfd].is_none() { return SyscallResult::val(-EBADF); }
+    if kt.fds[oldfd].is_none() { return SyscallResult::val(-EBADF); }
 
-    // If same fd, just return it
     if oldfd == newfd { return SyscallResult::val(newfd as i32); }
 
-    // Close newfd if open
-    if !linux.fds[newfd].is_none() {
-        linux.close_fd(newfd);
+    if !kt.fds[newfd].is_none() {
+        kt.close_fd(newfd);
     }
 
-    // Copy fd kind and increment refcount
-    let kind = linux.fds[oldfd];
+    let kind = kt.fds[oldfd];
     match kind {
         thread::FdKind::Vfs(handle) => vfs::add_vfs_ref(handle),
         thread::FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
         thread::FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
         thread::FdKind::ConsoleOut | thread::FdKind::None => {}
     }
-    linux.fds[newfd] = kind;
-    // dup2 does NOT inherit cloexec
-    linux.cloexec &= !(1 << newfd);
+    kt.fds[newfd] = kind;
+    kt.cloexec &= !(1 << newfd);
 
     SyscallResult::val(newfd as i32)
 }

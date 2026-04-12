@@ -32,6 +32,14 @@ macro_rules! dpmi_trace {
 
 /// Number of LDT entries
 const LDT_ENTRIES: usize = 8192;
+
+/// LDT index of the "low memory" selector. Base=0, limit=1MB, 16-bit.
+/// DOS handlers that need to return a pointer to a fixed low-memory byte
+/// (INDOS flag, LOL, IVT vectors) use this as ES; BX is the linear address.
+pub const LOW_MEM_LDT_IDX: usize = 6;
+
+/// Selector value for LOW_MEM_LDT_IDX (TI=1, RPL=3).
+pub const LOW_MEM_SEL: u16 = ((LOW_MEM_LDT_IDX as u16) << 3) | 4 | 3;
 /// Maximum DPMI memory blocks
 const MAX_MEM_BLOCKS: usize = 256;
 /// Base address for DPMI linear memory allocations
@@ -325,6 +333,14 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     dpmi.ldt[5] = DpmiState::make_code_desc_ex(0, 0x0FFF, false);
     dpmi.ldt_alloc[0] |= 1 << 5;
 
+    // Index 6: low-memory data selector (base=0, limit=1MB, 16-bit).
+    // Used by DOS handlers that need to return a pointer to a fixed
+    // low-memory structure (INDOS flag, LOL, DTA, IVT vectors): the PM
+    // client gets ES = LOW_MEM_SEL and BX = full 20-bit linear address
+    // (all conventional-memory structs fit in the low 64KB).
+    dpmi.ldt[LOW_MEM_LDT_IDX] = DpmiState::make_data_desc_ex(0, 0xFFFFF, false);
+    dpmi.ldt_alloc[0] |= 1 << LOW_MEM_LDT_IDX;
+
     let cs_sel = DpmiState::idx_to_sel(1);
     let ds_sel = DpmiState::idx_to_sel(2);
     let ss_sel = DpmiState::idx_to_sel(3);
@@ -396,12 +412,13 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 /// Handle a software INT from DPMI protected mode that arrived as a direct
 /// IDT event (DPL=3 vectors). Dispatch to PM handler if installed, else
 /// reflect to real mode via IVT.
-pub fn dpmi_soft_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
+pub fn dpmi_soft_int(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     dpmi_trace!("[DPMI] SOFTINT {:02X} CS:EIP={:04x}:{:#x}", vector, regs.code_seg(), regs.ip32());
+    let (sel, off) = dos.dpmi.as_ref().unwrap().pm_vectors[vector as usize];
+    if sel == 0 && matches!(vector, 0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F) {
+        return dos::dispatch_kernel_syscall(kt, dos, regs, vector);
+    }
     let dpmi = dos.dpmi.as_mut().unwrap();
-    // Note: stub-segment dispatch now goes through INT 31h → pm_stub_dispatch,
-    // so CS == stub_sel no longer reaches here.
-    let (sel, off) = dpmi.pm_vectors[vector as usize];
     if sel != 0 {
         // PM handler installed — push a host trampoline IRET frame and dispatch.
         //
@@ -1100,9 +1117,11 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             clear_carry(regs);
         }
         _ => {
-            panic!("DPMI: unhandled INT 31h AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
+            crate::dbg_println!("  DPMI: unhandled INT 31h AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
                 ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
                 regs.code_seg(), regs.ip32());
+            set_carry(regs);
+            regs.rax = (regs.rax & !0xFFFF) | 0x8001; // unsupported function
         }
     }
 
@@ -1951,7 +1970,7 @@ pub fn seg_base(dpmi: &DpmiState, sel: u16) -> u32 {
 
 /// Get the D/B (default size) bit for any selector.
 /// GDT selectors are treated as 32-bit.
-fn seg_is_32(dpmi: &DpmiState, sel: u16) -> bool {
+pub fn seg_is_32(dpmi: &DpmiState, sel: u16) -> bool {
     if sel & 4 != 0 {
         let idx = (sel >> 3) as usize;
         if idx < LDT_ENTRIES { DpmiState::desc_is_32(dpmi.ldt[idx]) } else { true }

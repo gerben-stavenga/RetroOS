@@ -206,11 +206,7 @@ fn lookup_symbol(addr: u64) -> (&'static str, u64) {
         // User address - use current thread's symbols (best-effort via debug tid)
         let tid = unsafe { DEBUG_TID };
         if let Some(thread) = thread::get_thread(tid) {
-            let syms = match &thread.mode {
-                thread::ThreadMode::Dos(d) => &d.symbols,
-                thread::ThreadMode::Linux(l) => &l.symbols,
-            };
-            if let Some(symbols) = syms {
+            if let Some(symbols) = &thread.kernel.symbols {
                 let (name, offset) = symbols.lookup(addr);
                 if !name.is_empty() {
                     return (unsafe { core::mem::transmute(name) }, offset);
