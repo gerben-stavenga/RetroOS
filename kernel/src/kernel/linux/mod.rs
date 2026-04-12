@@ -53,7 +53,8 @@ pub struct LinuxState {
     pub tls_limit: u32,
     pub tls_limit_in_pages: bool,
     pub pending_read: Option<PendingRead>,  // Blocked read on any fd kind
-    pub vfork_parent: Option<usize>,       // If set, this is a CLONE_VM|CLONE_VFORK child
+    pub wait_status_ptr: usize,            // Deferred wait4 status write
+    pub wait_exit_code: i32,
 }
 
 impl LinuxState {
@@ -67,7 +68,8 @@ impl LinuxState {
             tls_limit: 0,
             tls_limit_in_pages: false,
             pending_read: None,
-            vfork_parent: None,
+            wait_status_ptr: 0,
+            wait_exit_code: 0,
         }
     }
 
@@ -157,6 +159,7 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
         1   => sys_exit(tid, a),
         2   => sys_fork(kt, linux, a, regs),
         3   => sys_read(kt, linux, a, regs),
+        7   => sys_wait4(kt, a, regs),
         4   => sys_write(kt, a),
         5   => sys_open(kt, a),
         6   => sys_close(kt, a),
@@ -216,7 +219,6 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
 /// x86_64 syscall number table (different numbers, same implementations)
 fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
     let tid = kt.tid as usize;
-    println!("sc64 t{} nr={} a0={:#x} a1={:#x} a2={:#x}", tid, nr, a.a0, a.a1, a.a2);
     match nr {
         0   => sys_read(kt, linux, a, regs),
         1   => sys_write(kt, a),
@@ -554,72 +556,21 @@ fn sys_fork(kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, re
     SyscallResult { retval: child_tid as i64, switch_to: Some(child_tid as usize) }
 }
 
-/// clone(120) — fork-like clone with optional child_stack
-/// Supports plain fork (flags=SIGCHLD, stack=0) and posix_spawn-style
-/// vfork (CLONE_VM|CLONE_VFORK|SIGCHLD, stack=child_stack).
+/// clone(120) — always COW fork, with optional child_stack override.
 fn sys_clone(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
-    let tid = kt.tid as usize;
-    let flags = a.a0 as u32;
     let child_stack = a.a1 as usize;
-    const SIGCHLD: u32 = 17;
-    const CLONE_VM: u32 = 0x100;
-    const CLONE_VFORK: u32 = 0x4000;
 
-    if flags & 0xFF != SIGCHLD {
-        return SyscallResult::val(-ENOSYS);
-    }
+    let result = sys_fork(kt, linux, a, regs);
 
-    let is_vfork = flags & (CLONE_VM | CLONE_VFORK) == (CLONE_VM | CLONE_VFORK);
-
-    if is_vfork {
-        // CLONE_VM|CLONE_VFORK: not a fork. Child borrows parent's address
-        // space with a different stack. Parent frozen until child execs/exits.
-        let child_root = kt.root;
-        let child = match thread::create_thread(Some(tid), child_root, true) {
-            Some(t) => t,
-            None => return SyscallResult::val(-ENOMEM),
-        };
-
-        child.kernel.cpu_state = *regs;
-        child.kernel.cpu_state.frame.rsp = child_stack as u64;
-
-        child.kernel.cwd = kt.cwd;
-        child.kernel.cwd_len = kt.cwd_len;
-        kt.dup_all_fds(&mut child.kernel);
-        if let thread::Personality::Linux(cl) = &mut child.personality {
-            cl.heap_base = linux.heap_base;
-            cl.heap_end = linux.heap_end;
-            cl.mmap_cursor = linux.mmap_cursor;
-            cl.tls_entry = linux.tls_entry;
-            cl.tls_base = linux.tls_base;
-            cl.tls_limit = linux.tls_limit;
-            cl.tls_limit_in_pages = linux.tls_limit_in_pages;
-            cl.vfork_parent = Some(tid);
-        }
-
-        thread::set_return(child, 0);
-        let child_tid = child.kernel.tid;
-
-        // Block parent until child execs or exits
-        kt.cpu_state = *regs;
-        kt.cpu_state.rax = child_tid as u64;
-        thread::block_thread(tid);
-
-        SyscallResult { retval: child_tid as i64, switch_to: Some(child_tid as usize) }
-    } else {
-        // Plain fork (SIGCHLD only, or SIGCHLD with child_stack)
-        let result = sys_fork(kt, linux, a, regs);
-
-        if child_stack != 0 {
-            if let Some(child_tid) = result.switch_to {
-                if let Some(child) = thread::get_thread(child_tid) {
-                    child.kernel.cpu_state.frame.rsp = child_stack as u64;
-                }
+    if child_stack != 0 {
+        if let Some(child_tid) = result.switch_to {
+            if let Some(child) = thread::get_thread(child_tid) {
+                child.kernel.cpu_state.frame.rsp = child_stack as u64;
             }
         }
-
-        result
     }
+
+    result
 }
 
 /// read(3)
@@ -761,27 +712,11 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
 
     // ELF address space prep (DOS handles its own inside exec_dos_into)
     if matches!(format, exec::BinaryFormat::Elf) {
-        if linux.vfork_parent.is_some() {
-            let mut new_root = crate::RootPageTable::empty();
-            startup::arch_switch_to(
-                &mut kt.cpu_state,
-                &mut new_root,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            );
-            kt.root = new_root;
-        } else {
-            startup::arch_user_clean();
-        }
+        startup::arch_user_clean();
     }
 
     if let Err(_) = exec::init_thread(tid, &buffer, path, &args) {
         return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, -ENOEXEC)) };
-    }
-
-    // Clear vfork flag and unblock parent (ELF only)
-    if let Some(parent_tid) = linux.vfork_parent.take() {
-        thread::unblock_thread(parent_tid);
     }
 
     // Reload regs from thread (init_thread sets them via get_thread)

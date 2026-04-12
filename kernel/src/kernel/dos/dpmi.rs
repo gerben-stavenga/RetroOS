@@ -20,7 +20,7 @@ use crate::kernel::startup;
 use crate::{Regs, dbg_println};
 
 /// Trace DPMI calls when enabled. Toggle with DPMI_TRACE.
-const DPMI_TRACE: bool = true;
+const DPMI_TRACE: bool = false;
 
 macro_rules! dpmi_trace {
     ($($arg:tt)*) => {

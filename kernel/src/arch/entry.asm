@@ -356,12 +356,26 @@ entry_wrapper_64:
     push r14
     push r15
 
-    ; Save segment registers: DS/ES as selectors, FS/GS as MSR bases (64-bit TLS)
+    ; Save segment registers: DS/ES as selectors, FS/GS depends on interrupted mode
     xor rax, rax
     mov ax, ds
     push rax
     mov ax, es
     push rax
+    ; Check interrupted CS: 0x33 = 64-bit user, 0x23 = 32-bit compat
+    ; Offset: ES(8) + DS(8) + r15-r8(64) + rdi-rax(64) + int_num(8) + err_code(8) + rip(8) = 168
+    cmp dword [rsp + 168], 0x33
+    je .save_fs_gs_msr
+    ; 32-bit: save FS/GS as selectors (zero-extended to 64-bit)
+    xor rax, rax
+    mov ax, fs
+    push rax
+    xor rax, rax
+    mov ax, gs
+    push rax
+    jmp .fs_gs_done
+.save_fs_gs_msr:
+    ; 64-bit: save FS_BASE / GS_BASE MSRs
     mov ecx, 0xC0000100     ; FS_BASE MSR
     rdmsr
     shl rdx, 32
@@ -372,6 +386,7 @@ entry_wrapper_64:
     shl rdx, 32
     or rax, rdx
     push rax
+.fs_gs_done:
 
     ; Set segments to kernel data selector
     mov ax, 0x18
@@ -383,18 +398,29 @@ entry_wrapper_64:
     jmp far [rel far_ptr_32]
 
 exit_interrupt_64:
-    ; Restore GS base (MSR 0xC0000101)
+    ; Check return CS: 0x33 = 64-bit user → restore MSRs, else → restore selectors
+    cmp dword [rsp + 184], 0x33
+    je .restore_fs_gs_msr
+    ; 32-bit: restore FS/GS as selectors
+    pop rax
+    mov gs, ax
+    pop rax
+    mov fs, ax
+    jmp .restore_ds_es
+.restore_fs_gs_msr:
+    ; 64-bit: restore GS_BASE MSR
     pop rax
     mov rdx, rax
     shr rdx, 32
     mov ecx, 0xC0000101
     wrmsr
-    ; Restore FS base (MSR 0xC0000100)
+    ; Restore FS_BASE MSR
     pop rax
     mov rdx, rax
     shr rdx, 32
     mov ecx, 0xC0000100
     wrmsr
+.restore_ds_es:
     ; Restore ES, DS selectors
     pop rax
     mov es, ax

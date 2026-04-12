@@ -143,6 +143,9 @@ fn arch_dispatch(regs: &mut Regs) {
             let limit = regs.rbx as u32;
             let limit_in_pages = regs.rdi != 0;
             regs.rax = crate::arch::descriptors::set_tls_entry(index, base, limit, limit_in_pages) as u64;
+            // Also write FS_BASE MSR so 32-bit compat mode picks up the
+            // correct hidden base (the 32-bit iret path doesn't touch the MSR).
+            unsafe { crate::arch::x86::wrmsr(0xC000_0100, base as u64); }
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }

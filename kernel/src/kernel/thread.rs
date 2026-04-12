@@ -577,41 +577,33 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                     dos.pc.a20_enabled = true;
                 }
             }
-            Personality::Linux(linux) => {
-                if let Some(parent_tid) = linux.vfork_parent.take() {
-                    let mut empty = crate::RootPageTable::empty();
-                    crate::kernel::startup::arch_switch_to(
-                        &mut thread.kernel.cpu_state, &mut empty, core::ptr::null_mut(), core::ptr::null_mut(),
-                    );
-                    thread.kernel.root = empty;
-                    unblock_thread(parent_tid);
-                }
-            }
+            Personality::Linux(_) => {}
         }
 
         thread.kernel.close_all_fds();
         thread.kernel.symbols = None;
 
-        crate::kernel::startup::arch_user_clean();
-
         thread.kernel.exit_code = exit_code;
-        thread.kernel.state = ThreadState::Zombie;
 
-        // Wake blocked parent.
+        // Wake blocked parent and write status BEFORE arch_user_clean —
+        // the parent's stack is still accessible through COW-shared pages.
         if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
             let parent = &mut THREADS[parent_tid as usize];
             let was_waiting = parent.kernel.state == ThreadState::Blocked;
             if was_waiting {
                 parent.kernel.state = ThreadState::Ready;
-                match &parent.personality {
+                match &mut parent.personality {
                     Personality::Dos(_) => {
                         parent.kernel.cpu_state.rax = parent.kernel.cpu_state.rax & !0xFFFF;
                     }
-                    Personality::Linux(_) => {
+                    Personality::Linux(linux) => {
                         parent.kernel.cpu_state.rax = thread.kernel.tid as u64;
+                        // Defer status write to thread switch (when
+                        // parent's address space is loaded).
                         let status_ptr = parent.kernel.cpu_state.rcx as usize;
                         if status_ptr != 0 {
-                            unsafe { *(status_ptr as *mut i32) = (exit_code & 0xFF) << 8; }
+                            linux.wait_status_ptr = status_ptr;
+                            linux.wait_exit_code = exit_code;
                         }
                     }
                 }
@@ -621,6 +613,9 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                 dos.last_child_exit_status = (exit_code as u8) as u16;
             }
         }
+
+        crate::kernel::startup::arch_user_clean();
+        thread.kernel.state = ThreadState::Zombie;
 
         schedule(tid).unwrap_or(0)
     }
@@ -662,7 +657,12 @@ pub fn signal_thread(thread: &mut Thread, current_tid: usize, fault_address: usi
         println!("\x1b[91mSEGV in init at {:#x}\x1b[0m", fault_address);
         loop { core::hint::spin_loop(); }
     } else {
-        println!("SEGV in thread {} at {:#x}", thread.kernel.tid, fault_address);
+        println!("SEGV in thread {} at {:#x} rip={:#x} cs={:#x} rsp={:#x} ss={:#x} fl={:#x} rax={:#x} rbx={:#x} rcx={:#x}",
+            thread.kernel.tid, fault_address,
+            thread.kernel.cpu_state.frame.rip, thread.kernel.cpu_state.frame.cs,
+            thread.kernel.cpu_state.frame.rsp, thread.kernel.cpu_state.frame.ss,
+            thread.kernel.cpu_state.frame.rflags,
+            thread.kernel.cpu_state.rax, thread.kernel.cpu_state.rbx, thread.kernel.cpu_state.rcx);
 
         unsafe {
             if current_tid == thread.kernel.tid as usize {

@@ -425,7 +425,7 @@ fn event_loop(first_tid: usize) {
                 }
                 tid = new_tid;
                 let new_thread = thread::get_thread(tid).expect("Invalid thread");
-                match &new_thread.personality {
+                match &mut new_thread.personality {
                     thread::Personality::Dos(dos) => {
                         if let Some(ref dpmi) = dos.dpmi {
                             let ldt_ptr = dpmi.ldt.as_ptr() as u32;
@@ -439,6 +439,13 @@ fn event_loop(first_tid: usize) {
                                 linux.tls_entry, linux.tls_base,
                                 linux.tls_limit, linux.tls_limit_in_pages,
                             );
+                        }
+                        if linux.wait_status_ptr != 0 {
+                            unsafe {
+                                *(linux.wait_status_ptr as *mut i32) =
+                                    (linux.wait_exit_code & 0xFF) << 8;
+                            }
+                            linux.wait_status_ptr = 0;
                         }
                     }
                 }
