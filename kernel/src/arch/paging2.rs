@@ -1095,47 +1095,28 @@ pub fn enable_paging(kpages: *mut KernelPages, scratch: *mut RawPage, kernel_phy
 // Temporary mapping for fork operations
 // =============================================================================
 
-/// Pointer to the page table page that controls the temp mapping
-static mut TEMP_MAP_PT: *mut RawPage = core::ptr::null_mut();
+/// Page-aligned BSS buffer whose virtual address is the temp mapping slot.
+/// We never use the buffer itself — we repurpose its PTE to map arbitrary
+/// physical pages. Being in BSS means the heap never needs to skip it.
+#[repr(C, align(4096))]
+struct TempPage([u8; PAGE_SIZE]);
+static mut TEMP_PAGE: TempPage = TempPage([0; PAGE_SIZE]);
 
-/// Entry index within TEMP_MAP_PT
-static mut TEMP_MAP_ENTRY: usize = 0;
-
-/// Temp mapping virtual address (set by init_temp_map)
-static mut TEMP_MAP_VADDR_MUT: usize = 0;
-
+/// Temp mapping virtual address.
 pub fn temp_map_vaddr() -> usize {
-    unsafe { TEMP_MAP_VADDR_MUT }
+    unsafe { &raw const TEMP_PAGE as usize }
 }
 
-/// Initialize temp mapping (call after paging enabled, before fork)
-///
-/// Uses the last entry of pt_kernel in both modes.
-/// Legacy: pt_kernel = pages[1], 1024 entries, last entry VA = 0xC0BFF000
-/// PAE:    pt_kernel = pages[2],  512 entries, last entry VA = 0xC0BFF000
-pub fn init_temp_map() {
-    unsafe {
-        if is_pae() {
-            TEMP_MAP_PT = &raw mut crate::KERNEL_PAGES.pages[2];
-            TEMP_MAP_ENTRY = entries_per_page::<Entry64>() - 1;
-        } else {
-            TEMP_MAP_PT = &raw mut crate::KERNEL_PAGES.pages[1];
-            TEMP_MAP_ENTRY = entries_per_page::<Entry32>() - 1;
-        }
-        TEMP_MAP_VADDR_MUT = 0xC0BFF000;
-    }
-}
-
-/// Map a physical page at the temp mapping address
+/// Map a physical page at the temp mapping address.
 pub fn temp_map(phys_page: u64) {
+    let vpage = temp_map_vaddr() / PAGE_SIZE;
     unsafe {
-        let idx = TEMP_MAP_ENTRY;
         if is_pae() {
-            let pt = TEMP_MAP_PT as *mut Entry64;
-            *pt.add(idx) = Entry64::new(phys_page, true, false);
+            let entries = PAGE_TABLE_BASE as *mut Entry64;
+            *entries.add(vpage) = Entry64::new(phys_page, true, false);
         } else {
-            let pt = TEMP_MAP_PT as *mut Entry32;
-            *pt.add(idx) = Entry32::new(phys_page, true, false);
+            let entries = PAGE_TABLE_BASE as *mut Entry32;
+            *entries.add(vpage) = Entry32::new(phys_page, true, false);
         }
     }
     invalidate_tlb();
@@ -1143,14 +1124,14 @@ pub fn temp_map(phys_page: u64) {
 
 /// Unmap the temp mapping
 pub fn temp_unmap() {
+    let vpage = temp_map_vaddr() / PAGE_SIZE;
     unsafe {
-        let idx = TEMP_MAP_ENTRY;
         if is_pae() {
-            let pt = TEMP_MAP_PT as *mut Entry64;
-            *pt.add(idx) = Entry64::default();
+            let entries = PAGE_TABLE_BASE as *mut Entry64;
+            *entries.add(vpage) = Entry64::default();
         } else {
-            let pt = TEMP_MAP_PT as *mut Entry32;
-            *pt.add(idx) = Entry32::default();
+            let entries = PAGE_TABLE_BASE as *mut Entry32;
+            *entries.add(vpage) = Entry32::default();
         }
     }
     invalidate_tlb();

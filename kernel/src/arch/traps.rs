@@ -46,11 +46,8 @@ pub mod arch_call {
     pub const MAP_LOW_MEM: u64 = 0x109;  // Map first 1MB user-accessible for VM86
     pub const COPY_PAGE_ENTRIES: u64 = 0x10C; // EDX=src_vpage, ECX=dst_vpage, EBX=count — copy entries src→dst
     pub const SWAP_PAGE_ENTRIES: u64 = 0x10E; // EDX=a_vpage, ECX=b_vpage, EBX=count — swap entries a↔b
-    pub const ZERO_PHYS_PAGE: u64 = 0x10D; // EDX=phys page number
     pub const UNMAP_RANGE: u64 = 0x10F;  // EDX=vpage_start, ECX=count — clear entries to absent
     pub const FREE_RANGE: u64 = 0x110;   // EDX=vpage_start, ECX=count — free phys + identity-map RO
-    pub const GET_TEMP_MAP_ADDR: u64 = 0x111; // Returns vaddr in EAX
-    pub const FLUSH_TLB: u64 = 0x114;    // Sync PDPT + re-write CR3
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start, ECX=num_pages, EBX=ppage_start
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
@@ -97,15 +94,8 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::SWAP_PAGE_ENTRIES => {
             paging2::swap_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
         }
-        arch_call::ZERO_PHYS_PAGE => {
-            paging2::temp_map(regs.rdx);
-            unsafe { core::ptr::write_bytes(paging2::temp_map_vaddr() as *mut u8, 0, paging2::PAGE_SIZE); }
-            paging2::temp_unmap();
-        }
         arch_call::UNMAP_RANGE => paging2::unmap_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::FREE_RANGE => paging2::free_range(regs.rdx as usize, regs.rcx as usize),
-        arch_call::GET_TEMP_MAP_ADDR => { regs.rax = paging2::temp_map_vaddr() as u64; }
-        arch_call::FLUSH_TLB => paging2::flush_tlb(),
         arch_call::LOAD_LDT => {
             crate::arch::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }

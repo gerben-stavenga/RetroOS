@@ -82,7 +82,6 @@ impl AllocatorInner {
     fn extend_heap(&mut self, min_size: usize) -> bool {
         let pages_needed = (min_size + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages_needed = pages_needed.max(4); // Allocate at least 4 pages at a time
-        let temp_map_addr = crate::kernel::startup::arch_temp_map_addr();
 
         let mut region_start = self.mapped_end;
         let mut region_pages = 0;
@@ -91,18 +90,6 @@ impl AllocatorInner {
             if self.mapped_end >= HEAP_END {
                 break;
             }
-
-            // Skip the temp_map reserved page
-            if self.mapped_end == temp_map_addr {
-                if region_pages > 0 {
-                    self.add_free_region(region_start, region_pages * PAGE_SIZE);
-                    region_pages = 0;
-                }
-                self.mapped_end += PAGE_SIZE;
-                region_start = self.mapped_end;
-                continue;
-            }
-
             self.mapped_end += PAGE_SIZE;
             region_pages += 1;
         }

@@ -499,7 +499,6 @@ fn handle_fork_exec(
     if matches!(format, exec::BinaryFormat::Elf) {
         crate::dbg_println!("  fork done, loading ELF...");
         arch_free_user_pages();
-        arch_flush_tlb();
     }
 
     let prog_arg = alloc::vec::Vec::from(path);
@@ -749,19 +748,6 @@ pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
     }
 }
 
-#[allow(dead_code)]
-/// Zero a physical page.
-pub fn arch_zero_phys_page(phys: u64) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::arch_call::ZERO_PHYS_PAGE as u32,
-            in("edx") phys as u32,
-        );
-    }
-}
-
-
 /// Clear page entries to absent (enables demand paging on next access).
 pub fn arch_unmap_range(base_page: usize, count: usize) {
     unsafe {
@@ -787,17 +773,7 @@ pub fn arch_free_range(base_page: usize, count: usize) {
 }
 
 
-/// Get the temp-map reserved virtual address (heap must skip this page).
-pub fn arch_temp_map_addr() -> usize {
-    let addr: u32;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inout("eax") crate::arch::arch_call::GET_TEMP_MAP_ADDR as u32 => addr,
-        );
-    }
-    addr as usize
-}
+
 
 /// Load LDT: write base+limit into GDT[12] and execute LLDT.
 pub fn arch_load_ldt(base: u32, limit: u32) {
@@ -839,16 +815,6 @@ pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: boo
         );
     }
     result as i32
-}
-
-/// Flush TLB.
-pub fn arch_flush_tlb() {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::arch_call::FLUSH_TLB as u32,
-        );
-    }
 }
 
 /// Free user pages in current address space (arch CLEAN call).

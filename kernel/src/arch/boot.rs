@@ -89,8 +89,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
 
     println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
-    paging2::init_temp_map();
-
     crate::kernel::heap::init();
     println!("Heap initialized");
 

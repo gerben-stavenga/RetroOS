@@ -61,15 +61,6 @@ pub fn take_pending_ticks() -> u32 {
     }
 }
 
-/// Discard all queued IRQ events.
-#[allow(dead_code)]
-pub fn drain_discard() {
-    unsafe {
-        (*(&raw mut QUEUE)).clear();
-        core::ptr::write_volatile(&raw mut PENDING_TICKS, 0);
-    }
-}
-
 // ============================================================================
 // PIC initialization
 // ============================================================================
@@ -193,13 +184,4 @@ pub fn handle_irq(regs: &mut Regs) {
 /// Get timer ticks
 pub fn get_ticks() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const TIMER_TICKS) }
-}
-
-/// Sleep for N timer ticks (blocks with interrupts enabled)
-#[allow(dead_code)]
-pub fn sleep_ticks(ticks: u64) {
-    let target = get_ticks() + ticks;
-    while get_ticks() < target {
-        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
-    }
 }

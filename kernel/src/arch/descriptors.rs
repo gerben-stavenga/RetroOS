@@ -369,25 +369,6 @@ static mut SYSCALL_USER_RSP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut SYSCALL_KERNEL_RSP: u64 = 0;
 
-/// Set the kernel stack in TSS for 32-bit mode
-/// Packs SS:ESP (SS in high 32 bits, ESP in low 32 bits)
-#[allow(dead_code)]
-pub fn set_kernel_stack(stack: u32) {
-    unsafe {
-        TSS32.sp0 = ((KERNEL_DS as u64) << 32) | (stack as u64);
-    }
-}
-
-/// Set the kernel stack in TSS for 64-bit mode
-/// Just the raw 64-bit address
-#[allow(dead_code)]
-pub fn set_kernel_stack_64(stack: u64) {
-    unsafe {
-        TSS64.sp0 = stack;
-        SYSCALL_KERNEL_RSP = stack;
-    }
-}
-
 /// Setup GDT, IDT, and TSS
 pub fn setup_descriptor_tables(kernel_stack_top: u32) {
     unsafe {
