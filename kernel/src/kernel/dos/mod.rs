@@ -120,9 +120,9 @@ fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
     }
 }
 
-/// .COM load segment — derived from DOS_AREA_END so the environment block
-/// (COM_SEGMENT-0x10, 256 bytes) never overlaps kernel structures.
-pub const COM_SEGMENT: u16 = ((DOS_AREA_END + 0xF) >> 4) as u16 + 0x10;
+/// .COM load segment — derived from low-memory layout end so the environment
+/// block (COM_SEGMENT-0x10, 256 bytes) never overlaps kernel structures.
+pub const COM_SEGMENT: u16 = (((IRQ_STACK_ADDR + IRQ_STACK_SIZE) + 0xF) >> 4) as u16 + 0x10;
 /// .COM code offset within segment
 const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer (top of 64KB segment)
@@ -504,6 +504,7 @@ pub(crate) fn dispatch_kernel_syscall(
     vector: u8,
 ) -> thread::KernelAction {
     match vector {
+        0x08 => thread::KernelAction::Done, // timer — handled via VM86 IRQ reflect path
         0x13 => int_13h(regs),
         0x20 => {
             if let Some(parent) = dos.exec_parent.take() {
@@ -576,6 +577,12 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
         }
+        SLOT_HW_IRQ0 => {
+            // Hardware IRQ0 (timer): chain to BIOS on private stack.
+            // Reflect frame (FLAGS/CS/IP) stays on current stack — BIOS IRET pops it.
+            hw_irq_reflect(dos, regs);
+            return thread::KernelAction::Done;
+        }
         0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F | 0x67 => {
             let action = dispatch_kernel_syscall(kt, dos, regs, slot);
             // exec_return / Exit replace thread state — skip the VM86 frame pop below.
@@ -583,6 +590,15 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
                 return action;
             }
             action
+        }
+        SLOT_HW_IRQ_RET => {
+            // BIOS handler IRET'd to trampoline. Restore original SS:SP —
+            // the reflect frame (FLAGS/CS/IP) is still on that stack.
+            // Fall through to post-match code which pops it normally.
+            let (ss, sp) = dos.pc.irq_saved_sssp.take().expect("HW_IRQ_RET without saved SS:SP");
+            crate::kernel::machine::set_vm86_ss(regs, ss);
+            crate::kernel::machine::set_vm86_sp(regs, sp);
+            thread::KernelAction::Done
         }
         SLOT_SAVE_RESTORE => thread::KernelAction::Done, // no-op far call (buffer size=0)
         _ => {
@@ -686,6 +702,40 @@ fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, reg
 // ============================================================================
 // BIOS INT 13h — Disk services
 // ============================================================================
+
+/// INT 08h — Timer tick (IRQ0).
+/// Replaces the BIOS handler: increment BDA tick counter, call INT 1Ch.
+/// Handled in kernel to avoid BIOS handler's stack usage on the program's
+/// stack (which can corrupt tiny .COM stubs like LZEXE decompressors).
+/// Saved BIOS INT 08h vector (before we hook it with our stub).
+static mut BIOS_INT08_IP: u16 = 0;
+static mut BIOS_INT08_CS: u16 = 0;
+
+/// INT 08h — Timer tick (IRQ0).
+/// Switch to private IRQ stack, then chain to BIOS handler.
+/// When the BIOS handler IRETs, it returns to SLOT_HW_IRQ_RET which
+/// traps back to kernel to restore the original SS:SP.
+/// Hardware IRQ reflect with private stack.
+/// The reflect frame (FLAGS/CS/IP) stays on the original VM86 stack.
+/// We switch to a private stack, push a trampoline, and jump to the
+/// saved BIOS handler.  BIOS IRETs to trampoline → SLOT_HW_IRQ_RET
+/// restores SS:SP → post-match pops the reflect frame → done.
+fn hw_irq_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
+    if dos.pc.irq_saved_sssp.is_none() {
+        // First hardware IRQ: switch to private stack, push trampoline.
+        dos.pc.irq_saved_sssp = Some((vm86_ss(regs), vm86_sp(regs)));
+        crate::kernel::machine::set_vm86_ss(regs, IRQ_STACK_SEG);
+        crate::kernel::machine::set_vm86_sp(regs, IRQ_STACK_TOP);
+
+        vm86_push(regs, vm86_flags(regs) as u16);
+        vm86_push(regs, STUB_SEG);
+        vm86_push(regs, slot_offset(SLOT_HW_IRQ_RET));
+    }
+    // Reflect frame (FLAGS/CS/IP) is on the current stack (original or IRQ).
+    set_vm86_ip(regs, unsafe { BIOS_INT08_IP });
+    set_vm86_cs(regs, unsafe { BIOS_INT08_CS });
+    regs.clear_flag32(IF_FLAG);
+}
 
 fn int_13h(regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
@@ -2999,6 +3049,7 @@ pub(crate) const SLOT_CALLBACK_RET: u8 = 0x02;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
 pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
+pub(crate) const SLOT_HW_IRQ0: u8 = 0xFB;
 pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
@@ -3022,10 +3073,19 @@ pub fn setup_ivt() {
     }
 
     // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000)
+    // Save original BIOS INT 08h vector before we overwrite it.
+    // Our INT 08h handler chains to the BIOS via a private stack.
+    unsafe {
+        BIOS_INT08_IP = read_u16(0, 0x08 * 4);
+        BIOS_INT08_CS = read_u16(0, 0x08 * 4 + 2);
+    }
     for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x67] {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
+    // INT 08h uses a dedicated slot outside the callback range.
+    write_u16(0, 0x08 * 4, slot_offset(SLOT_HW_IRQ0));
+    write_u16(0, 0x08 * 4 + 2, STUB_SEG);
 
     // Set up fake DOS internal structures (List of Lists + System File Table)
     // so that DJGPP's fstat (which uses INT 21h/52h → SFT) can find file info.
@@ -3036,12 +3096,14 @@ pub fn setup_ivt() {
 }
 
 // ── Low-memory layout (sequential from STUB_BASE) ──────────────────
-// Stubs:   256 × 2 bytes         0x0500–0x06FF
-// SYSPSP:  256 bytes             0x0700–0x07FF   (seg 0x70)
-// LoL:     0x40 bytes            0x0800–0x083F   (seg 0x80)
-// SFT:     6 + 20×59 = 1186      0x0840–0x0CE1
-// CDS:     3 × 81 = 243          0x0CE2–0x0DD4
-// (env block starts at next paragraph + 0x100 gap for COM_SEGMENT)
+// Stubs:     256 × 2 bytes       0x0500–0x06FF
+// SYSPSP:    256 bytes           0x0700–0x07FF   (seg 0x70)
+// LoL:       0x40 bytes          0x0800–0x083F   (seg 0x80)
+// SFT:       6 + 20×59 = 1186   0x0840–0x0CE1
+// CDS:       8 × 81 = 648       0x0CE2–0x0DD4
+// IRQ stack: 256 bytes           0x0DE0–0x0EDF   (seg 0xDE)
+// Env block: (COM_SEG-0x10)      0x0EE0–0x0EFF   (seg 0xEE)
+// COM/EXE:   load area           0x0FE0–...      (seg 0xFE)
 //
 // SYSPSP is a minimal "system" PSP whose parent-PSP field points to itself,
 // matching real DOS: COMMAND.COM's PSP[0x16] points to a distinct SYSPSP
@@ -3065,6 +3127,12 @@ const CDS_ENTRY_SIZE: u32 = 81;
 const NUM_DRIVES: u8 = 8; // A..H (H: = hostfs)
 const CDS_SIZE: u32 = NUM_DRIVES as u32 * CDS_ENTRY_SIZE;         // 243
 const DOS_AREA_END: u32 = CDS_ADDR + CDS_SIZE;                    // 0x0DD5
+/// Private stack for hardware IRQ reflection (avoids using program's stack).
+/// 256 bytes, paragraph-aligned. Stack grows down, so SP starts at top.
+const IRQ_STACK_ADDR: u32 = (DOS_AREA_END + 15) & !15;            // 0x0DE0
+const IRQ_STACK_SIZE: u32 = 256;
+pub(crate) const IRQ_STACK_SEG: u16 = (IRQ_STACK_ADDR >> 4) as u16;
+pub(crate) const IRQ_STACK_TOP: u16 = IRQ_STACK_SIZE as u16;      // SP starts here
 const LOL_SEG: u16 = (LOL_ADDR >> 4) as u16;
 
 /// Write a little-endian u16 to an arbitrary (possibly unaligned) address.

@@ -354,6 +354,12 @@ pub struct PcMachine {
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: VgaState,
+    /// Saved SS:SP during hardware IRQ stack-switch reflection.
+    /// When a hardware IRQ is reflected in VM86, we switch to a private
+    /// stack to avoid corrupting tiny program stacks. The handler's IRET
+    /// returns to SLOT_HW_IRQ_RET which restores this saved SS:SP.
+    /// Saved SS:SP from before hardware IRQ stack switch. None when not on IRQ stack.
+    pub irq_saved_sssp: Option<(u16, u16)>,
 }
 
 impl PcMachine {
@@ -370,6 +376,7 @@ impl PcMachine {
             skip_irq: false,
             e0_pending: false,
             vga: VgaState::new(),
+            irq_saved_sssp: None,
         }
     }
 
@@ -1070,16 +1077,6 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
     let is_pm = regs.mode() != crate::UserMode::VM86;
-    // DIAGNOSTIC: mask IRQ delivery while DN's LZEXE decompressor stub runs.
-    // The stub's stack (SP=0x100) sits immediately above its code region, so
-    // a reflect push at SP-6 lands in unexecuted code bytes and corrupts them.
-    // Remove once confirmed / fixed.
-    if !is_pm && vm86_cs(regs) == 0x3D65 {
-        if pc.vpic.has_pending() {
-            regs.frame.rflags |= 1u64 << 20; // VIP
-        }
-        return None;
-    }
     if !vif {
         if pc.vpic.has_pending() {
             regs.frame.rflags |= 1u64 << 20; // VIP
