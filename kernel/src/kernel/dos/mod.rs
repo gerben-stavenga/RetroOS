@@ -39,7 +39,7 @@ use crate::vga;
 use crate::dbg_println;
 use crate::Regs;
 
-const EMS_ENABLED: bool = false;
+const EMS_ENABLED: bool = true;
 
 /// Dummy file handle returned for /dev/null semantics.
 const NULL_FILE_HANDLE: u16 = 99;
@@ -147,10 +147,16 @@ fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
 // ============================================================================
 
 const MAX_XMS_HANDLES: usize = 16;
-/// XMS address space: linear 0x110000 (after HMA) to ~0xA00000 (below VGA)
-/// This is virtual address space in the VM86 process — demand paging provides backing.
-const XMS_BASE: u32 = 0x110000; // after HMA (1MB + 64KB)
+/// XMS address space: linear 0x120000 (after HMA + shadow region) to ~0x500000.
+/// Pages 0x100-0x10F = HMA, 0x110-0x11F = A20 shadow. XMS starts after both.
+const XMS_BASE: u32 = 0x120000; // after HMA + shadow (1MB + 128KB)
 const XMS_END: u32 = 0x500000;  // 5MB — plenty for DOS games
+
+/// EMS backing region: virtual address space for EMS logical pages.
+/// Each EMS page = 16KB = 4 virtual pages. Demand paging provides backing.
+const EMS_BACKING_BASE: u32 = 0x500000;
+/// Virtual page number for EMS logical page N = EMS_BACKING_VPAGE + N * 4
+const EMS_BACKING_VPAGE: usize = (EMS_BACKING_BASE / 0x1000) as usize;
 const XMS_TOTAL_KB: u16 = ((XMS_END - XMS_BASE) / 1024) as u16;
 
 /// A single XMS handle — contiguous range in VM86 linear address space
@@ -284,9 +290,14 @@ pub fn scan_uma() {
     }
     unsafe { UMA_FREE = free; }
 
-    // EMS disabled: needs arch-layer phys page management
-    // let ems_offset = find_contiguous_run(free, 16, 0xD0 - UMA_BASE);
-    // if let Some(off) = ems_offset { ... }
+    // Find 16 contiguous free pages for the EMS page frame (64KB).
+    // Prefer 0xD000 (standard EMS frame address).
+    if let Some(off) = find_contiguous_run(free, 16, 0xD0 - UMA_BASE) {
+        unsafe { EMS_BASE_PAGE = UMA_BASE + off; }
+        // Reserve EMS frame pages from UMB allocation
+        let mask = ((1u64 << 16) - 1) << off;
+        unsafe { UMA_FREE &= !mask; }
+    }
 
     // Log results
     let umb_free = unsafe { UMA_FREE };
@@ -298,7 +309,6 @@ pub fn scan_uma() {
 }
 
 /// Find `count` contiguous set bits in `bitmap`, preferring `hint` offset.
-#[allow(dead_code)]
 fn find_contiguous_run(bitmap: u64, count: usize, hint: usize) -> Option<usize> {
     // Try starting at hint first
     if hint + count <= UMA_PAGES {
@@ -346,7 +356,7 @@ fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
                 }
                 unsafe { UMB_ALLOC |= alloc_mask; }
                 let base_page = UMA_BASE + run_start;
-                crate::kernel::startup::arch_map_umb(base_page, pages_needed);
+                crate::kernel::startup::arch_unmap_range(base_page, pages_needed);
                 let seg = (base_page as u16) * 0x100; // page to segment
                 let paras = (pages_needed as u16) * 0x100;
                 return Some((seg, paras));
@@ -376,7 +386,7 @@ fn umb_free(segment: u16) -> bool {
     }
     let count = (i - offset) as usize;
     unsafe { UMB_ALLOC &= !mask; }
-    crate::kernel::startup::arch_unmap_umb(page, count);
+    crate::kernel::startup::arch_free_range(page, count);
     true
 }
 
@@ -402,38 +412,41 @@ fn umb_largest() -> u16 {
 
 const MAX_EMS_HANDLES: usize = 16;
 /// Total EMS pages available (256 × 16KB = 4MB)
-#[allow(dead_code)]
 const EMS_TOTAL_PAGES: u16 = 256;
 /// EMS page frame segment — set dynamically by scan_uma()
 pub fn ems_frame_seg() -> u16 {
     (unsafe { EMS_BASE_PAGE } as u16) * 0x100
 }
 
-#[allow(dead_code)]
 fn ems_base_page() -> usize {
     unsafe { EMS_BASE_PAGE }
 }
 
+/// Swap an EMS window with a backing region.
+fn swap_ems_window(window: usize, backing_vpage: usize) {
+    let frame = ems_base_page() + window * 4;
+    crate::kernel::startup::arch_swap_page_entries(backing_vpage, frame, 4);
+}
+
 /// Per-thread EMS driver state
-#[allow(dead_code)]
 pub struct EmsState {
-    /// Each handle: list of physical page groups (4 physical pages per EMS page)
     handles: [Option<EmsHandle>; MAX_EMS_HANDLES],
-    /// Current mapping: handles[window].0 = handle, .1 = logical page (None = unmapped)
+    /// Current mapping: frame[window] = (handle, logical_page) or None
     frame: [Option<(u8, u16)>; 4],
+    /// Next EMS backing page index to allocate (bump allocator)
+    next_page: u16,
 }
 
-#[allow(dead_code)]
 struct EmsHandle {
-    /// Physical page numbers for each logical page (4 contiguous phys pages per EMS page)
-    pages: alloc::vec::Vec<[u64; 4]>,
+    /// Backing virtual page for each logical page (each = 4 contiguous vpages).
+    /// Demand paging provides physical backing on first access.
+    pages: alloc::vec::Vec<usize>,
 }
 
-#[allow(dead_code)]
 impl EmsState {
     fn new() -> Self {
         const NONE_H: Option<EmsHandle> = None;
-        Self { handles: [NONE_H; MAX_EMS_HANDLES], frame: [None; 4] }
+        Self { handles: [NONE_H; MAX_EMS_HANDLES], frame: [None; 4], next_page: 0 }
     }
 
     fn alloc_pages(&self) -> u16 {
@@ -446,9 +459,10 @@ impl EmsState {
         EMS_TOTAL_PAGES.saturating_sub(used)
     }
 
-    /// Free all physical pages held by all handles
+    /// Clean up: backing pages are freed when the address space is torn down.
     pub fn free_all_pages(&mut self) {
-        // EMS disabled: no physical pages to free
+        self.handles = core::array::from_fn(|_| None);
+        self.frame = [None; 4];
     }
 }
 
@@ -508,6 +522,7 @@ pub(crate) fn dispatch_kernel_syscall(
         0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
         0x2E => int_2eh(kt, dos, regs),
         0x2F => int_2fh(dos, regs),
+        0x67 => int_67h(dos, regs),
         _ => thread::KernelAction::Done,
     }
 }
@@ -561,7 +576,7 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
         }
-        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F => {
+        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F | 0x67 => {
             let action = dispatch_kernel_syscall(kt, dos, regs, slot);
             // exec_return / Exit replace thread state — skip the VM86 frame pop below.
             if !matches!(action, thread::KernelAction::Done) {
@@ -1791,8 +1806,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x03 => {
             let xms = xms_state(dos);
             xms.a20_global += 1;
-            crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
-            dos.pc.a20_enabled = true;
+            dos.pc.set_a20(true);
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
             regs.rbx = regs.rbx & !0xFFFF; // BL=0 no error
         }
@@ -1800,10 +1814,8 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x04 => {
             let xms = xms_state(dos);
             xms.a20_global = xms.a20_global.saturating_sub(1);
-            let both_zero = xms.a20_global == 0 && xms.a20_local == 0;
-            if both_zero {
-                crate::kernel::startup::arch_set_a20(false, &mut dos.pc.hma_pages);
-                dos.pc.a20_enabled = false;
+            if xms.a20_global == 0 && xms.a20_local == 0 {
+                dos.pc.set_a20(false);
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = regs.rbx & !0xFFFF;
@@ -1812,8 +1824,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x05 => {
             let xms = xms_state(dos);
             xms.a20_local += 1;
-            crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
-            dos.pc.a20_enabled = true;
+            dos.pc.set_a20(true);
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = regs.rbx & !0xFFFF;
         }
@@ -1821,10 +1832,8 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
         0x06 => {
             let xms = xms_state(dos);
             xms.a20_local = xms.a20_local.saturating_sub(1);
-            let both_zero = xms.a20_local == 0 && xms.a20_global == 0;
-            if both_zero {
-                crate::kernel::startup::arch_set_a20(false, &mut dos.pc.hma_pages);
-                dos.pc.a20_enabled = false;
+            if xms.a20_local == 0 && xms.a20_global == 0 {
+                dos.pc.set_a20(false);
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = regs.rbx & !0xFFFF;
@@ -2110,7 +2119,6 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
 // INT 67h — EMS driver
 // ============================================================================
 
-#[allow(dead_code)]
 /// Ensure EMS state exists for current thread
 fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
     if dos.ems.is_none() {
@@ -2119,9 +2127,17 @@ fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
     dos.ems.as_deref_mut().unwrap()
 }
 
-#[allow(dead_code)]
 fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
+    dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
+        ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
+    let result = int_67h_inner(dos, regs, ah);
+    dbg_println!("EMS: -> AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
+        regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
+    result
+}
+
+fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Regs, ah: u8) -> thread::KernelAction {
     match ah {
         // AH=40h — Get status
         0x40 => {
@@ -2154,40 +2170,23 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             }
             match handle {
                 Some(i) => {
-                    // Allocate physical pages for each EMS page (4 × 4KB per EMS 16KB page)
-                    let mut pages = alloc::vec::Vec::with_capacity(pages_needed as usize);
-                    let mut ok = true;
-                    for _ in 0..pages_needed {
-                        let mut group = [0u64; 4];
-                        for p in &mut group {
-                            match crate::arch::alloc_phys_page() {
-                                Some(page) => *p = page,
-                                None => { ok = false; break; }
-                            }
-                        }
-                        if !ok { break; }
-                        // Zero the allocated pages
-                        for &p in &group {
-                            crate::kernel::startup::arch_zero_phys_page(p);
-                        }
-                        pages.push(group);
-                    }
-                    if ok {
-                        ems.handles[i] = Some(EmsHandle { pages });
-                        regs.rdx = (regs.rdx & !0xFFFF) | i as u64; // handle (0-based)
-                        regs.rax = regs.rax & !0xFF00; // AH=0
+                    if ems.next_page + pages_needed > EMS_TOTAL_PAGES {
+                        regs.rax = (regs.rax & !0xFF00) | (0x88 << 8); // not enough pages
                     } else {
-                        // Free any partially allocated pages
-                        for group in &pages {
-                            for &p in group {
-                                if p != 0 { crate::arch::free_phys_page(p); }
-                            }
+                        // Allocate backing vpages from the EMS region (demand-paged)
+                        let mut pages = alloc::vec::Vec::with_capacity(pages_needed as usize);
+                        for _ in 0..pages_needed {
+                            let vpage = EMS_BACKING_VPAGE + ems.next_page as usize * 4;
+                            ems.next_page += 1;
+                            pages.push(vpage);
                         }
-                        regs.rax = (regs.rax & !0xFF00) | (0x88 << 8); // AH=88: not enough pages
+                        ems.handles[i] = Some(EmsHandle { pages });
+                        regs.rdx = (regs.rdx & !0xFFFF) | i as u64;
+                        regs.rax = regs.rax & !0xFF00; // AH=0
                     }
                 }
                 None => {
-                    regs.rax = (regs.rax & !0xFF00) | (0x85 << 8); // AH=85: no more handles
+                    regs.rax = (regs.rax & !0xFF00) | (0x85 << 8); // no more handles
                 }
             }
         }
@@ -2206,8 +2205,13 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 
             // BX=FFFFh means unmap
             if log_page == 0xFFFF {
+                // Save current frame content back to its backing
+                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
+                    if let Some(ref h) = ems.handles[old_h as usize] {
+                        swap_ems_window(phys_page as usize, h.pages[old_lp as usize]);
+                    }
+                }
                 ems.frame[phys_page as usize] = None;
-                crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, None);
                 regs.rax = regs.rax & !0xFF00; // AH=0
                 return thread::KernelAction::Done;
             }
@@ -2219,8 +2223,15 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 
             match &ems.handles[handle as usize] {
                 Some(h) if (log_page as usize) < h.pages.len() => {
-                    let phys_pages = &h.pages[log_page as usize];
-                    crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
+                    let backing_vpage = h.pages[log_page as usize];
+                    // Save current frame content back to old backing
+                    if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
+                        if let Some(ref oh) = ems.handles[old_h as usize] {
+                            swap_ems_window(phys_page as usize, oh.pages[old_lp as usize]);
+                        }
+                    }
+                    // Load new backing into frame
+                    swap_ems_window(phys_page as usize, backing_vpage);
                     ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                     regs.rax = regs.rax & !0xFF00; // AH=0
                 }
@@ -2239,21 +2250,17 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             if (handle as usize) < MAX_EMS_HANDLES && ems.handles[handle as usize].is_some() {
                 // Unmap any windows using this handle
                 for w in 0..4 {
-                    if let Some((h, _)) = ems.frame[w] {
+                    if let Some((h, lp)) = ems.frame[w] {
                         if h == handle as u8 {
+                            if let Some(ref hnd) = ems.handles[h as usize] {
+                                swap_ems_window(w, hnd.pages[lp as usize]);
+                            }
                             ems.frame[w] = None;
-                            crate::kernel::startup::arch_map_ems_window(ems_base_page(), w, None);
                         }
                     }
                 }
-                // Free physical pages
-                if let Some(h) = ems.handles[handle as usize].take() {
-                    for group in &h.pages {
-                        for &p in group {
-                            crate::arch::free_phys_page(p);
-                        }
-                    }
-                }
+                // Release handle (backing pages freed with address space)
+                ems.handles[handle as usize] = None;
                 regs.rax = regs.rax & !0xFF00; // AH=0
             } else {
                 regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
@@ -2339,14 +2346,20 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                     return thread::KernelAction::Done;
                 }
 
+                // Save current frame content back to old backing
+                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
+                    if let Some(ref oh) = ems.handles[old_h as usize] {
+                        swap_ems_window(phys_page as usize, oh.pages[old_lp as usize]);
+                    }
+                }
+
                 if log_page == 0xFFFF {
                     ems.frame[phys_page as usize] = None;
-                    crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, None);
                 } else {
                     match &ems.handles[handle as usize] {
                         Some(h) if (log_page as usize) < h.pages.len() => {
-                            let phys_pages = &h.pages[log_page as usize];
-                            crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
+                            let backing_vpage = h.pages[log_page as usize];
+                            swap_ems_window(phys_page as usize, backing_vpage);
                             ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                         }
                         _ => {
@@ -2371,31 +2384,17 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 Some(h) => {
                     let old_count = h.pages.len();
                     if (new_count as usize) > old_count {
-                        // Grow: allocate new pages
+                        if ems.next_page + (new_count - old_count as u16) > EMS_TOTAL_PAGES {
+                            regs.rax = (regs.rax & !0xFF00) | (0x88 << 8);
+                            return thread::KernelAction::Done;
+                        }
                         for _ in old_count..(new_count as usize) {
-                            let mut group = [0u64; 4];
-                            let mut ok = true;
-                            for p in &mut group {
-                                match crate::arch::alloc_phys_page() {
-                                    Some(page) => *p = page,
-                                    None => { ok = false; break; }
-                                }
-                            }
-                            if !ok {
-                                // Free partially allocated group
-                                for &p in &group { if p != 0 { crate::arch::free_phys_page(p); } }
-                                regs.rax = (regs.rax & !0xFF00) | (0x88 << 8);
-                                return thread::KernelAction::Done;
-                            }
-                            h.pages.push(group);
+                            let vpage = EMS_BACKING_VPAGE + ems.next_page as usize * 4;
+                            ems.next_page += 1;
+                            h.pages.push(vpage);
                         }
                     } else if (new_count as usize) < old_count {
-                        // Shrink: free excess pages
-                        for group in h.pages.drain(new_count as usize..) {
-                            for &p in &group {
-                                crate::arch::free_phys_page(p);
-                            }
-                        }
+                        h.pages.truncate(new_count as usize);
                     }
                     regs.rax = regs.rax & !0xFF00;
                     regs.rbx = (regs.rbx & !0xFFFF) | new_count as u64;
@@ -3023,7 +3022,7 @@ pub fn setup_ivt() {
     }
 
     // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000)
-    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F] {
+    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x67] {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }

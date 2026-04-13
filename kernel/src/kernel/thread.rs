@@ -572,10 +572,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                 }
                 dos.ems = None;
                 dos.xms = None;
-                if !dos.pc.a20_enabled {
-                    crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
-                    dos.pc.a20_enabled = true;
-                }
+                dos.pc.set_a20(true);
             }
             Personality::Linux(_) => {}
         }

@@ -724,28 +724,27 @@ pub fn arch_map_low_mem() {
     }
 }
 
-#[allow(dead_code)]
-/// Free a physical page.
-pub fn arch_free_phys_page(phys: u64) {
+/// Copy page table entries from src to dst.
+pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::FREE_PHYS_PAGE as u32,
-            in("edx") phys as u32,
+            in("eax") crate::arch::arch_call::COPY_PAGE_ENTRIES as u32,
+            in("edx") src_vpage as u32,
+            in("ecx") dst_vpage as u32,
+            in("ebx") count as u32,
         );
     }
 }
 
-
-
-/// Toggle A20 gate for VM86 mode.
-pub fn arch_set_a20(enabled: bool, hma: &mut [u64; crate::kernel::machine::HMA_PAGE_COUNT]) {
+pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::SET_A20 as u32,
-            in("edx") enabled as u32,
-            in("ecx") hma as *mut _ as u32,
+            in("eax") crate::arch::arch_call::SWAP_PAGE_ENTRIES as u32,
+            in("edx") a_vpage as u32,
+            in("ecx") b_vpage as u32,
+            in("ebx") count as u32,
         );
     }
 }
@@ -762,47 +761,31 @@ pub fn arch_zero_phys_page(phys: u64) {
     }
 }
 
-#[allow(dead_code)]
-/// Map/unmap an EMS page frame window.
-pub fn arch_map_ems_window(base_page: usize, window: usize, phys_pages: Option<&[u64; 4]>) {
-    let ptr = match phys_pages {
-        Some(p) => p as *const _ as u32,
-        None => 0u32,
-    };
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::arch_call::MAP_EMS_WINDOW as u32,
-            in("edx") base_page as u32,
-            in("ecx") window as u32,
-            in("ebx") ptr,
-        );
-    }
-}
 
-/// Enable UMB region (clear page entries for demand paging).
-pub fn arch_map_umb(base_page: usize, count: usize) {
+/// Clear page entries to absent (enables demand paging on next access).
+pub fn arch_unmap_range(base_page: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::MAP_UMB as u32,
+            in("eax") crate::arch::arch_call::UNMAP_RANGE as u32,
             in("edx") base_page as u32,
             in("ecx") count as u32,
         );
     }
 }
 
-/// Disable UMB region (restore identity mapping).
-pub fn arch_unmap_umb(base_page: usize, count: usize) {
+/// Free physical pages and restore identity-mapped read-only entries.
+pub fn arch_free_range(base_page: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::UNMAP_UMB as u32,
+            in("eax") crate::arch::arch_call::FREE_RANGE as u32,
             in("edx") base_page as u32,
             in("ecx") count as u32,
         );
     }
 }
+
 
 /// Get the temp-map reserved virtual address (heap must skip this page).
 pub fn arch_temp_map_addr() -> usize {
@@ -814,29 +797,6 @@ pub fn arch_temp_map_addr() -> usize {
         );
     }
     addr as usize
-}
-
-/// Initialize HMA save area with zero-page entries.
-pub fn arch_init_hma(hma: &mut [u64; crate::kernel::machine::HMA_PAGE_COUNT]) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::arch_call::INIT_HMA as u32,
-            in("edx") hma as *mut _ as u32,
-        );
-    }
-}
-
-#[allow(dead_code)]
-/// Activate a root page table (switch CR3).
-pub fn arch_activate_root(root: &crate::RootPageTable) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::arch_call::ACTIVATE_ROOT as u32,
-            in("edx") root as *const _ as u32,
-        );
-    }
 }
 
 /// Load LDT: write base+limit into GDT[12] and execute LLDT.

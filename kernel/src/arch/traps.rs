@@ -44,15 +44,12 @@ pub mod arch_call {
     pub const CLEAN: u64 = 0x106;        // Free all user pages + flush TLB
     pub const SET_PAGE_FLAGS: u64 = 0x108; // EDX=start_vpage, ECX=count, EBX=flags (bit0=W, bit1=X)
     pub const MAP_LOW_MEM: u64 = 0x109;  // Map first 1MB user-accessible for VM86
-    pub const FREE_PHYS_PAGE: u64 = 0x10A; // EDX=phys_page_number
-    pub const SET_A20: u64 = 0x10C;      // EDX=enabled, ECX=HMA save area ptr
+    pub const COPY_PAGE_ENTRIES: u64 = 0x10C; // EDX=src_vpage, ECX=dst_vpage, EBX=count — copy entries src→dst
+    pub const SWAP_PAGE_ENTRIES: u64 = 0x10E; // EDX=a_vpage, ECX=b_vpage, EBX=count — swap entries a↔b
     pub const ZERO_PHYS_PAGE: u64 = 0x10D; // EDX=phys page number
-    pub const MAP_EMS_WINDOW: u64 = 0x10E; // EDX=base_page, ECX=window, EBX=phys_pages ptr
-    pub const MAP_UMB: u64 = 0x10F;      // EDX=base_page, ECX=count
-    pub const UNMAP_UMB: u64 = 0x110;    // EDX=base_page, ECX=count
+    pub const UNMAP_RANGE: u64 = 0x10F;  // EDX=vpage_start, ECX=count — clear entries to absent
+    pub const FREE_RANGE: u64 = 0x110;   // EDX=vpage_start, ECX=count — free phys + identity-map RO
     pub const GET_TEMP_MAP_ADDR: u64 = 0x111; // Returns vaddr in EAX
-    pub const INIT_HMA: u64 = 0x112;     // EDX=ptr to HMA save area
-    pub const ACTIVATE_ROOT: u64 = 0x113; // EDX=ptr to RootPageTable
     pub const FLUSH_TLB: u64 = 0x114;    // Sync PDPT + re-write CR3
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start, ECX=num_pages, EBX=ppage_start
@@ -94,36 +91,20 @@ fn arch_dispatch(regs: &mut Regs) {
             paging2::flush_tlb();
         }
         arch_call::MAP_LOW_MEM => paging2::map_low_mem_user(),
-        arch_call::FREE_PHYS_PAGE => { crate::arch::phys_mm::free_phys_page(regs.rdx); }
-        arch_call::SET_A20 => {
-            let enabled = regs.rdx != 0;
-            let hma = unsafe { &mut *(regs.rcx as usize as *mut [paging2::Entry64; crate::machine::HMA_PAGE_COUNT]) };
-            paging2::set_a20(enabled, hma);
+        arch_call::COPY_PAGE_ENTRIES => {
+            paging2::copy_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
+        }
+        arch_call::SWAP_PAGE_ENTRIES => {
+            paging2::swap_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
         }
         arch_call::ZERO_PHYS_PAGE => {
             paging2::temp_map(regs.rdx);
             unsafe { core::ptr::write_bytes(paging2::temp_map_vaddr() as *mut u8, 0, paging2::PAGE_SIZE); }
             paging2::temp_unmap();
         }
-        arch_call::MAP_EMS_WINDOW => {
-            let phys_ptr = regs.rbx as usize;
-            let phys_pages = if phys_ptr == 0 { None }
-                else { Some(unsafe { &*(phys_ptr as *const [u64; 4]) }) };
-            paging2::map_ems_window(regs.rdx as usize, regs.rcx as usize, phys_pages);
-        }
-        arch_call::MAP_UMB => paging2::map_umb(regs.rdx as usize, regs.rcx as usize),
-        arch_call::UNMAP_UMB => paging2::unmap_umb(regs.rdx as usize, regs.rcx as usize),
+        arch_call::UNMAP_RANGE => paging2::unmap_range(regs.rdx as usize, regs.rcx as usize),
+        arch_call::FREE_RANGE => paging2::free_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::GET_TEMP_MAP_ADDR => { regs.rax = paging2::temp_map_vaddr() as u64; }
-        arch_call::INIT_HMA => {
-            let out = regs.rdx as usize as *mut [u64; crate::machine::HMA_PAGE_COUNT];
-            let zero_page = paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
-            let zero_entry = paging2::Entry64::new(zero_page, false, true);
-            unsafe { for slot in (*out).iter_mut() { *slot = zero_entry.0; } }
-        }
-        arch_call::ACTIVATE_ROOT => {
-            let root = unsafe { &*(regs.rdx as usize as *const paging2::RootPageTable) };
-            root.activate();
-        }
         arch_call::FLUSH_TLB => paging2::flush_tlb(),
         arch_call::LOAD_LDT => {
             crate::arch::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);

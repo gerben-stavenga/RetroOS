@@ -26,7 +26,11 @@ pub const VIF_FLAG: u32 = 1 << 19;
 /// Flags that VM86 code cannot change (IOPL, VM)
 pub const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
 
-pub const HMA_PAGE_COUNT: usize = 16;
+/// HMA spans 16 pages (64KB) starting at page 0x100.
+const HMA_PAGE: usize = 0x100;
+const HMA_PAGE_COUNT: usize = 16;
+/// Shadow region for A20 gate: swap HMA entries here when A20 is off.
+const HMA_SHADOW_PAGE: usize = HMA_PAGE + HMA_PAGE_COUNT;
 
 // ============================================================================
 // VM86 register helpers — 16-bit views of the 32-bit user frame
@@ -348,25 +352,34 @@ pub struct PcMachine {
     pub vpic: VirtualPic,
     pub vkbd: VirtualKeyboard,
     pub skip_irq: bool,
-    pub hma_pages: [u64; HMA_PAGE_COUNT],
     pub e0_pending: bool,
     pub vga: VgaState,
 }
 
 impl PcMachine {
     pub fn new() -> Self {
-        let mut hma_pages = [0u64; HMA_PAGE_COUNT];
-        crate::kernel::startup::arch_init_hma(&mut hma_pages);
+        // Save real HMA content (identity-mapped 0x100-0x10F) into shadow,
+        // then set HMA to wrap (copy of page 0). A20 starts disabled.
+        crate::kernel::startup::arch_copy_page_entries(HMA_PAGE, HMA_SHADOW_PAGE, HMA_PAGE_COUNT);
+        crate::kernel::startup::arch_copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
         Self {
             a20_enabled: false,
             vpit: VirtualPit::new(),
             vpic: VirtualPic::new(),
             vkbd: VirtualKeyboard::new(),
             skip_irq: false,
-            hma_pages,
             e0_pending: false,
             vga: VgaState::new(),
         }
+    }
+
+    /// Toggle A20 gate: HMA either sees shadow (real content) or wraps to page 0.
+    pub fn set_a20(&mut self, enabled: bool) {
+        if enabled == self.a20_enabled { return; }
+        // Shadow always holds the opposite of what's in HMA.
+        // Swap them to toggle.
+        crate::kernel::startup::arch_swap_page_entries(HMA_SHADOW_PAGE, HMA_PAGE, HMA_PAGE_COUNT);
+        self.a20_enabled = enabled;
     }
 }
 

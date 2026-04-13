@@ -1561,84 +1561,62 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
 /// Set A20 gate state for VM86 mode.
 /// When disabled (default): virtual 0x100000-0x10FFFF → physical 0x00000-0x0FFFF (wrap)
 /// When enabled: virtual 0x100000-0x10FFFF → the thread's saved HMA mappings.
-pub fn set_a20(enabled: bool, hma: &mut [Entry64; crate::machine::HMA_PAGE_COUNT]) {
+/// Copy page table entries from src range to dst range.
+pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
     match entries() {
-        Entries::E32(e) => set_a20_generic_32(e, enabled, hma),
-        Entries::E64(e) => set_a20_generic_64(e, enabled, hma),
-    }
-}
-
-fn set_a20_generic_64(entries: &mut [Entry64], enabled: bool, hma: &mut [Entry64; crate::machine::HMA_PAGE_COUNT]) {
-    for i in 0..16usize {
-        let idx = 0x100 + i;
-        if enabled {
-            entries[idx] = hma[i];
-        } else {
-            hma[i] = entries[idx];
-            entries[idx] = Entry64::new(i as u64, true, true);
-        }
+        Entries::E32(e) => { for i in 0..count { e[dst_vpage + i] = e[src_vpage + i]; } }
+        Entries::E64(e) => { for i in 0..count { e[dst_vpage + i] = e[src_vpage + i]; } }
     }
     flush_tlb();
 }
 
-fn set_a20_generic_32(entries: &mut [Entry32], enabled: bool, hma: &mut [Entry64; crate::machine::HMA_PAGE_COUNT]) {
-    for i in 0..16usize {
-        let idx = 0x100 + i;
-        if enabled {
-            let saved = hma[i];
-            let mut e = Entry32::new(saved.page(), saved.hw_writable(), saved.user());
-            e.set_writable(saved.writable());
-            entries[idx] = e;
-        } else {
-            let mut saved = Entry64::new(entries[idx].page(), entries[idx].hw_writable(), entries[idx].user());
-            saved.set_writable(entries[idx].writable());
-            hma[i] = saved;
-            entries[idx] = Entry32::new(i as u64, true, true);
-        }
-    }
-    flush_tlb();
-}
-
-/// Map an EMS page frame window (0-3) to the given 4 physical pages.
-/// `base_page` is the EMS page frame start (from scan_uma).
-/// Window N maps to virtual pages base_page + N*4 .. base_page + N*4 + 3.
-/// Pass phys_pages = None to unmap the window.
-pub fn map_ems_window(base_page: usize, window: usize, phys_pages: Option<&[u64; 4]>) {
-    assert!(window < 4);
-    let base = base_page + window * 4;
+/// Swap page table entries between two ranges (no refcount changes).
+pub fn swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
     match entries() {
-        Entries::E32(e) => map_ems_window_generic(e, base, phys_pages),
-        Entries::E64(e) => map_ems_window_generic(e, base, phys_pages),
-    }
-    flush_tlb();
-}
-
-fn map_ems_window_generic<E: Entry>(entries: &mut [E], base: usize, phys_pages: Option<&[u64; 4]>) {
-    match phys_pages {
-        Some(pages) => {
-            for i in 0..4 {
-                entries[base + i] = E::new(pages[i], true, true);
+        Entries::E32(e) => {
+            for i in 0..count {
+                let tmp = e[a_vpage + i];
+                e[a_vpage + i] = e[b_vpage + i];
+                e[b_vpage + i] = tmp;
             }
         }
-        None => {
-            for i in 0..4 {
-                entries[base + i] = E::default();
+        Entries::E64(e) => {
+            for i in 0..count {
+                let tmp = e[a_vpage + i];
+                e[a_vpage + i] = e[b_vpage + i];
+                e[b_vpage + i] = tmp;
             }
         }
     }
+    flush_tlb();
 }
 
-/// Enable UMB region: clear RO identity mapping so demand paging provides RAM on first access.
-pub fn map_umb(base_page: usize, num_pages: usize) {
+/// Clear page entries to absent (enables demand paging on next access).
+pub fn unmap_range(base_page: usize, num_pages: usize) {
+    use crate::arch::phys_mm;
     match entries() {
-        Entries::E32(e) => { for i in 0..num_pages { e[base_page + i] = Entry32::default(); } }
-        Entries::E64(e) => { for i in 0..num_pages { e[base_page + i] = Entry64::default(); } }
+        Entries::E32(e) => {
+            for i in 0..num_pages {
+                if e[base_page + i].present() {
+                    phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                }
+                e[base_page + i] = Entry32::default();
+            }
+        }
+        Entries::E64(e) => {
+            for i in 0..num_pages {
+                if e[base_page + i].present() {
+                    phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                }
+                e[base_page + i] = Entry64::default();
+            }
+        }
     }
     flush_tlb();
 }
 
-/// Disable UMB region: free physical pages and restore RO identity mapping.
-pub fn unmap_umb(base_page: usize, num_pages: usize) {
+/// Free physical pages and restore identity-mapped read-only entries.
+pub fn free_range(base_page: usize, num_pages: usize) {
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
