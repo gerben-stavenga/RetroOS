@@ -16,6 +16,13 @@ config_setting(
 )
 
 # =============================================================================
+# Constraints
+# =============================================================================
+
+constraint_setting(name = "libc")
+constraint_value(name = "musl", constraint_setting = ":libc")
+
+# =============================================================================
 # Platforms
 # =============================================================================
 
@@ -32,6 +39,7 @@ platform(
     constraint_values = [
         "@platforms//cpu:x86_32",
         "@platforms//os:linux",
+        ":musl",
     ],
 )
 
@@ -40,6 +48,7 @@ platform(
     constraint_values = [
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
+        ":musl",
     ],
 )
 
@@ -122,6 +131,7 @@ toolchain(
     target_compatible_with = [
         "@platforms//cpu:x86_32",
         "@platforms//os:linux",
+        ":musl",
     ],
     toolchain = ":bare_cc_toolchain_musl",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
@@ -146,6 +156,7 @@ toolchain(
     target_compatible_with = [
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
+        ":musl",
     ],
     toolchain = ":bare_cc_toolchain_musl64",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
@@ -273,5 +284,31 @@ toolchain(
         "@platforms//os:none",
     ],
     toolchain = ":retro_rust_toolchain_64_impl",
+    toolchain_type = "@rules_rust//rust:toolchain_type",
+)
+
+# Musl Rust toolchain wrappers — add :musl constraint so these are
+# preferred over the default gnu toolchains when the platform has :musl.
+toolchain(
+    name = "musl_rust_toolchain_i686",
+    exec_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_32",
+        "@platforms//os:linux",
+        ":musl",
+    ],
+    toolchain = "@rust_linux_x86_64__i686-unknown-linux-musl__nightly_tools//:rust_toolchain",
+    toolchain_type = "@rules_rust//rust:toolchain_type",
+)
+
+toolchain(
+    name = "musl_rust_toolchain_x86_64",
+    exec_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        ":musl",
+    ],
+    toolchain = "@rust_linux_x86_64__x86_64-unknown-linux-musl__nightly_tools//:rust_toolchain",
     toolchain_type = "@rules_rust//rust:toolchain_type",
 )

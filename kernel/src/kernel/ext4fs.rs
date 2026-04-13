@@ -13,22 +13,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::error::Error;
-use core::fmt;
 
 use ext4_view::{Ext4, Ext4Read};
 use crate::kernel::{hdd, vfs::{Filesystem, Vnode, DirEntry}};
 
-/// IO error for disk reads.
-#[derive(Debug)]
-struct DiskIoError;
-
-impl fmt::Display for DiskIoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "disk I/O error")
-    }
-}
-
-impl Error for DiskIoError {}
 
 /// Reader that implements Ext4Read by reading from an ATA partition.
 struct DiskReader {

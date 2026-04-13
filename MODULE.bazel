@@ -13,7 +13,18 @@ rust.toolchain(
     versions = ["nightly/2025-01-15"],
     extra_target_triples = ["i686-unknown-linux-musl", "x86_64-unknown-linux-musl"],
 )
-use_repo(rust, "rust_toolchains")
+use_repo(
+    rust,
+    "rust_toolchains",
+    "rust_linux_x86_64__i686-unknown-linux-musl__nightly_tools",
+    "rust_linux_x86_64__x86_64-unknown-linux-musl__nightly_tools",
+)
+# Our musl wrappers must be registered BEFORE @rust_toolchains so they
+# win over the default x86_64-unknown-linux-gnu toolchain.
+register_toolchains(
+    "//toolchain:musl_rust_toolchain_i686",
+    "//toolchain:musl_rust_toolchain_x86_64",
+)
 register_toolchains("@rust_toolchains//:all")
 
 # Download rustc toolchain
@@ -89,4 +100,5 @@ register_toolchains(
     "//toolchain:bare_cc_toolchain_def",
     "//toolchain:bare_cc_toolchain_64_def",
     "//toolchain:bare_cc_toolchain_musl_def",
+    "//toolchain:bare_cc_toolchain_musl64_def",
 )

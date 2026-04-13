@@ -18,30 +18,24 @@ use crate::kernel::thread::{FdKind, PendingRead, MAX_FDS};
 use crate::kernel::vfs;
 use crate::vga;
 use crate::Regs;
-use crate::{print, println};
+use crate::println;
 
 // =============================================================================
 // errno constants (positive values; returned as negative)
 // =============================================================================
 
-const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
-const EINTR: i32 = 4;
-const EIO: i32 = 5;
 const ENOEXEC: i32 = 8;
 const EBADF: i32 = 9;
 const ECHILD: i32 = 10;
-const EAGAIN: i32 = 11;
 const ENOMEM: i32 = 12;
-const EACCES: i32 = 13;
 const EFAULT: i32 = 14;
 const ENOTTY: i32 = 25;
 const EINVAL: i32 = 22;
 const ESPIPE: i32 = 29;
 const EPIPE: i32 = 32;
 const ENOSYS: i32 = 38;
-const ENODATA: i32 = 61;
 
 /// Linux-specific thread state
 pub struct LinuxState {
@@ -132,7 +126,6 @@ pub struct SyscallResult {
 impl SyscallResult {
     fn val(v: i32) -> Self { Self { retval: v as i64, switch_to: None } }
     fn val64(v: i64) -> Self { Self { retval: v, switch_to: None } }
-    fn switch(next: Option<usize>) -> Self { Self { retval: 0, switch_to: next } }
 }
 
 /// Dispatch returning KernelAction.
@@ -283,10 +276,12 @@ fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32
 
 /// Read a NUL-terminated C string from user memory. Returns slice excluding NUL.
 unsafe fn read_c_str(ptr: usize, max: usize) -> &'static [u8] {
-    let p = ptr as *const u8;
-    let mut len = 0;
-    while len < max && *p.add(len) != 0 { len += 1; }
-    core::slice::from_raw_parts(p, len)
+    unsafe {
+        let p = ptr as *const u8;
+        let mut len = 0;
+        while len < max && *p.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(p, len)
+    }
 }
 
 /// Resolve a path (NUL-terminated user pointer) against cwd.
@@ -339,17 +334,21 @@ pub fn do_chdir(path: &[u8], cwd: &mut [u8; 64], cwd_len: &mut usize) -> i32 {
 
 /// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
 /// Read a C `char**` (NULL-terminated) from 32-bit user memory into Vec<Vec<u8>>.
-fn read_c_argv32(ptr: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+fn read_c_argv(ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
     let mut args = alloc::vec::Vec::new();
     if ptr == 0 { return args; }
-    let mut p = ptr as *const u32;
     unsafe {
+        let mut offset = 0usize;
         loop {
-            let arg_ptr = *p as usize;
+            let arg_ptr = if wide {
+                *((ptr + offset) as *const u64) as usize
+            } else {
+                *((ptr + offset) as *const u32) as usize
+            };
             if arg_ptr == 0 { break; }
             let s = read_c_str(arg_ptr, 4096);
             args.push(s.to_vec());
-            p = p.add(1);
+            offset += if wide { 8 } else { 4 };
         }
     }
     args
@@ -685,7 +684,7 @@ fn sys_close(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// execve(11)
-fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_execve(kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     use crate::kernel::exec;
 
     let tid = kt.tid as usize;
@@ -696,7 +695,8 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
     let path = unsafe { read_c_str(path_ptr, 256) };
 
     // Read argv from caller's address space before we free it
-    let args = read_c_argv32(argv_ptr);
+    let wide = regs.mode() == crate::UserMode::Mode64;
+    let args = read_c_argv(argv_ptr, wide);
 
     // Load file (resolves path against cwd)
     let buffer = match exec::load_file(path, kt.cwd_str()) {
@@ -852,6 +852,10 @@ fn sys_wait4(kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> Syscal
     }
 
     // EAGAIN — children exist but none exited. Block and yield.
+    // Save status_ptr now (we know the ABI); exit_thread will set exit_code.
+    if let thread::Personality::Linux(linux) = &mut thread::get_thread(tid).unwrap().personality {
+        linux.wait_status_ptr = status_ptr;
+    }
     kt.cpu_state = *regs;
     kt.state = thread::ThreadState::Blocked;
     let next = thread::schedule(tid).unwrap_or(0);
@@ -993,7 +997,7 @@ fn sys_poll(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
                 thread::FdKind::ConsoleOut => {
                     if (events & POLLOUT) != 0 { revents |= POLLOUT; }
                 }
-                thread::FdKind::PipeWrite(idx) => {
+                thread::FdKind::PipeWrite(_idx) => {
                     if (events & POLLOUT) != 0 { revents |= POLLOUT; }
                 }
                 thread::FdKind::Vfs(_) => {
@@ -1035,7 +1039,6 @@ fn sys_mmap2(linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let _offset_pages = a.a5 as u32;
 
     const MAP_ANONYMOUS: u32 = 0x20;
-    const MAP_PRIVATE: u32 = 0x02;
     const MAP_FIXED: u32 = 0x10;
 
     // Only support MAP_ANONYMOUS | MAP_PRIVATE
@@ -1138,7 +1141,7 @@ fn write_stat64(buf: usize, mode: u32, size: u32) {
 
 /// getdents64(220)
 fn sys_getdents64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
-    let fd = a.a0 as i32;
+    let _fd = a.a0 as i32;
     let dirp = a.a1 as usize;
     let count = a.a2 as usize;
 
@@ -1176,7 +1179,7 @@ fn sys_getdents64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// set_thread_area(243) — parse user_desc struct, set GDT TLS entry, save to LinuxState
-fn sys_set_thread_area(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_set_thread_area(_kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let u_info = a.a0 as usize;
     if u_info == 0 { return SyscallResult::val(-EFAULT); }
 

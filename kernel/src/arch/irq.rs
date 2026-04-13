@@ -62,6 +62,7 @@ pub fn take_pending_ticks() -> u32 {
 }
 
 /// Discard all queued IRQ events.
+#[allow(dead_code)]
 pub fn drain_discard() {
     unsafe {
         (*(&raw mut QUEUE)).clear();
@@ -195,6 +196,7 @@ pub fn get_ticks() -> u64 {
 }
 
 /// Sleep for N timer ticks (blocks with interrupts enabled)
+#[allow(dead_code)]
 pub fn sleep_ticks(ticks: u64) {
     let target = get_ticks() + ticks;
     while get_ticks() < target {

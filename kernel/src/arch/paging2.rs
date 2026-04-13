@@ -240,7 +240,7 @@ impl RootPageTable {
     pub fn cr3(&self) -> u64 {
         match cpu_mode() {
             CpuMode::Legacy => current_root_phys(),
-            CpuMode::Pae => unsafe {
+            CpuMode::Pae => {
                 let vaddr = (&raw const HW_PDPT) as usize;
                 let page = physical_page(vaddr);
                 page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64
@@ -296,9 +296,9 @@ pub mod flags {
     pub const USER: u64 = 1 << 2;
     pub const WRITE_THROUGH: u64 = 1 << 3;
     pub const CACHE_DISABLE: u64 = 1 << 4;
-    pub const ACCESSED: u64 = 1 << 5;
-    pub const DIRTY: u64 = 1 << 6;
-    pub const PAGE_SIZE_BIT: u64 = 1 << 7;
+    #[allow(dead_code)] pub const ACCESSED: u64 = 1 << 5;
+    #[allow(dead_code)] pub const DIRTY: u64 = 1 << 6;
+    #[allow(dead_code)] pub const PAGE_SIZE_BIT: u64 = 1 << 7;
     /// Software read-only flag - page is semantically read-only
     /// When set, page can never become writable (e.g., .text, .rodata)
     /// When clear (default), page is semantically writable
@@ -329,6 +329,7 @@ pub trait Entry: Copy + Sized + Default + 'static {
         else { self.set_raw(self.raw() & !flag); }
     }
 
+    #[allow(dead_code)]
     fn set_present(&mut self, v: bool) { self.set_flag(flags::PRESENT, v); }
     fn set_hw_writable(&mut self, v: bool) { self.set_flag(flags::READ_WRITE, v); }
     fn set_user(&mut self, v: bool) { self.set_flag(flags::USER, v); }
@@ -468,7 +469,7 @@ static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 /// and corrupts PML4 entries.
 pub fn setup_long_mode_tables() {
     let pdpt_phys = crate::arch::x86::read_cr3() as u64;
-    let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
+    let pml4_phys = physical_page((&raw const PML4) as usize);
 
     // PML4[0] = PDPT (so long mode uses same mappings)
     unsafe { PML4[0] = Entry64::new(pdpt_phys >> 12, true, true); }
@@ -481,16 +482,17 @@ pub fn setup_long_mode_tables() {
 
 /// Get the root CR3 value (constant PD/PML4 phys).
 /// For legacy: PD phys. For PAE: HW_PDPT phys. For compat: PML4 phys.
+#[allow(dead_code)]
 pub fn root_cr3() -> u64 {
     match cpu_mode() {
         CpuMode::Legacy => current_root_phys(),
-        CpuMode::Pae => unsafe {
+        CpuMode::Pae => {
             let vaddr = (&raw const HW_PDPT) as usize;
             let page = physical_page(vaddr);
             page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64
         },
         CpuMode::Compat => {
-            let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
+            let pml4_phys = physical_page((&raw const PML4) as usize);
             pml4_phys * PAGE_SIZE as u64
         },
     }
@@ -503,15 +505,13 @@ pub fn root_cr3() -> u64 {
 pub fn toggle_cr3(want_64: bool) -> u32 {
     if want_64 {
         // Target is long/compat mode → CR3 = PML4 phys
-        let pml4_phys = physical_page(unsafe { (&raw const PML4) as usize });
+        let pml4_phys = physical_page((&raw const PML4) as usize);
         (pml4_phys * PAGE_SIZE as u64) as u32
     } else {
         // Target is PAE → CR3 = HW_PDPT phys
-        unsafe {
-            let vaddr = (&raw const HW_PDPT) as usize;
-            let page = physical_page(vaddr);
-            (page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64) as u32
-        }
+        let vaddr = (&raw const HW_PDPT) as usize;
+        let page = physical_page(vaddr);
+        (page * PAGE_SIZE as u64 + (vaddr % PAGE_SIZE) as u64) as u32
     }
 }
 
@@ -552,7 +552,7 @@ pub enum CpuMode {
 pub fn cpu_mode() -> CpuMode {
     if crate::arch::x86::read_cr4() & crate::arch::x86::cr4::PAE == 0 {
         CpuMode::Legacy
-    } else if !cpu_supports_long_mode() || unsafe { crate::arch::x86::rdmsr(crate::arch::x86::EFER_MSR) } & crate::arch::x86::efer::LME == 0 {
+    } else if !cpu_supports_long_mode() || crate::arch::x86::rdmsr(crate::arch::x86::EFER_MSR) & crate::arch::x86::efer::LME == 0 {
         CpuMode::Pae
     } else {
         CpuMode::Compat
@@ -842,6 +842,7 @@ pub fn physical_page(vaddr: usize) -> u64 {
 
 
 /// Get current CR3 value (page directory physical address)
+#[allow(dead_code)]
 pub fn current_cr3() -> u64 {
     (crate::arch::x86::read_cr3() & !(PAGE_SIZE as u32 - 1)) as u64
 }
@@ -1171,6 +1172,7 @@ pub fn parent_index<E: Entry>(idx: usize) -> usize {
 
 /// Alias: PDE index for a leaf page
 #[inline]
+#[allow(dead_code)]
 pub fn pde_index<E: Entry>(page: usize) -> usize {
     parent_index::<E>(page)
 }
@@ -1538,6 +1540,7 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
 
 /// Allocate a physical page, fill it with `data` (zero-padded to PAGE_SIZE),
 /// and map it at user virtual page `page_idx` (writable, user-accessible).
+#[allow(dead_code)]
 pub fn map_user_page(page_idx: usize, data: &[u8]) {
     assert!(data.len() <= PAGE_SIZE);
     let phys = crate::arch::phys_mm::alloc_phys_page().expect("alloc user page");

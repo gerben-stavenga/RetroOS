@@ -598,13 +598,10 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                     }
                     Personality::Linux(linux) => {
                         parent.kernel.cpu_state.rax = thread.kernel.tid as u64;
-                        // Defer status write to thread switch (when
-                        // parent's address space is loaded).
-                        let status_ptr = parent.kernel.cpu_state.rcx as usize;
-                        if status_ptr != 0 {
-                            linux.wait_status_ptr = status_ptr;
-                            linux.wait_exit_code = exit_code;
-                        }
+                        // status_ptr was saved in sys_wait4 when parent blocked.
+                        // Just set the exit code; the deferred write happens
+                        // during thread switch when parent's address space is loaded.
+                        linux.wait_exit_code = exit_code;
                     }
                 }
                 refresh_cpu_hash(parent);
@@ -664,17 +661,15 @@ pub fn signal_thread(thread: &mut Thread, current_tid: usize, fault_address: usi
             thread.kernel.cpu_state.frame.rflags,
             thread.kernel.cpu_state.rax, thread.kernel.cpu_state.rbx, thread.kernel.cpu_state.rcx);
 
-        unsafe {
-            if current_tid == thread.kernel.tid as usize {
-                crate::kernel::startup::arch_user_clean();
-                thread.kernel.state = ThreadState::Zombie;
-                thread.kernel.exit_code = -11;
-                thread.kernel.symbols = None;
-                Some(schedule(current_tid).unwrap_or(0))
-            } else {
-                thread.kernel.state = ThreadState::Zombie;
-                None
-            }
+        if current_tid == thread.kernel.tid as usize {
+            crate::kernel::startup::arch_user_clean();
+            thread.kernel.state = ThreadState::Zombie;
+            thread.kernel.exit_code = -11;
+            thread.kernel.symbols = None;
+            Some(schedule(current_tid).unwrap_or(0))
+        } else {
+            thread.kernel.state = ThreadState::Zombie;
+            None
         }
     }
 }

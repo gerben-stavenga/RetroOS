@@ -256,14 +256,16 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
     // Trap 0x3C0 (AC index/data) to track flip-flop state
     // Trap 0x3DA (Input Status 1) to synthesize retrace + reset flip-flop
-    (*tss).iopb[120] = 0x01; // bit 0 = port 0x3C0
-    (*tss).iopb[121] = 0x00;
-    (*tss).iopb[122] = 0x00;
-    (*tss).iopb[123] = 0x04; // trap bit 2 = port 0x3DA
-    // Interrupt redirection: only INT 31h traps to monitor.
-    // All other intercepted INTs (20h, 21h, 28h, 2Eh, 2Fh) go through IVT
-    // to stubs that call INT 31h, which then traps here.
-    (*tss).int_redir[(0x31 / 8) as usize] |= 1 << (0x31 % 8);
+    unsafe {
+        (*tss).iopb[120] = 0x01; // bit 0 = port 0x3C0
+        (*tss).iopb[121] = 0x00;
+        (*tss).iopb[122] = 0x00;
+        (*tss).iopb[123] = 0x04; // trap bit 2 = port 0x3DA
+        // Interrupt redirection: only INT 31h traps to monitor.
+        // All other intercepted INTs (20h, 21h, 28h, 2Eh, 2Fh) go through IVT
+        // to stubs that call INT 31h, which then traps here.
+        (*tss).int_redir[(0x31 / 8) as usize] |= 1 << (0x31 % 8);
+    }
 }
 
 /// Check whether INT n is intercepted (bit set in redirection bitmap).
@@ -272,18 +274,18 @@ pub fn int_intercepted(int_num: u8) -> bool {
 }
 
 /// GDT entry indices
-const GDT_NULL: usize = 0;        // 0x00
-const GDT_KERNEL_CS: usize = 1;   // 0x08
-const GDT_KERNEL_CS64: usize = 2; // 0x10 — STAR[47:32], SYSCALL CS
-const GDT_KERNEL_DS: usize = 3;   // 0x18 — STAR[47:32]+8, SYSCALL SS
-const GDT_USER_CS: usize = 4;     // 0x20 — STAR[63:48], SYSRET base
-const GDT_USER_DS: usize = 5;     // 0x28 — SYSRET SS
-const GDT_USER_CS64: usize = 6;   // 0x30 — SYSRET CS (64-bit)
+#[allow(dead_code)] const GDT_NULL: usize = 0;        // 0x00
+#[allow(dead_code)] const GDT_KERNEL_CS: usize = 1;   // 0x08
+#[allow(dead_code)] const GDT_KERNEL_CS64: usize = 2; // 0x10 — STAR[47:32], SYSCALL CS
+#[allow(dead_code)] const GDT_KERNEL_DS: usize = 3;   // 0x18 — STAR[47:32]+8, SYSCALL SS
+#[allow(dead_code)] const GDT_USER_CS: usize = 4;     // 0x20 — STAR[63:48], SYSRET base
+#[allow(dead_code)] const GDT_USER_DS: usize = 5;     // 0x28 — SYSRET SS
+#[allow(dead_code)] const GDT_USER_CS64: usize = 6;   // 0x30 — SYSRET CS (64-bit)
 const GDT_TSS32: usize = 7;       // 0x38
 const GDT_TSS64_LO: usize = 8;    // 0x40
-const GDT_TSS64_HI: usize = 9;    // 0x48 (null - upper 32 bits of base are 0)
-const GDT_RING1_CS: usize = 10;   // 0x50
-const GDT_RING1_DS: usize = 11;   // 0x58
+#[allow(dead_code)] const GDT_TSS64_HI: usize = 9;    // 0x48 (null - upper 32 bits of base are 0)
+#[allow(dead_code)] const GDT_RING1_CS: usize = 10;   // 0x50
+#[allow(dead_code)] const GDT_RING1_DS: usize = 11;   // 0x58
 const GDT_LDT: usize = 12;        // 0x60
 const GDT_TLS_START: usize = 13;  // 0x68 — first of 3 per-thread TLS slots
 // 14 = 0x70, 15 = 0x78
@@ -369,6 +371,7 @@ static mut SYSCALL_KERNEL_RSP: u64 = 0;
 
 /// Set the kernel stack in TSS for 32-bit mode
 /// Packs SS:ESP (SS in high 32 bits, ESP in low 32 bits)
+#[allow(dead_code)]
 pub fn set_kernel_stack(stack: u32) {
     unsafe {
         TSS32.sp0 = ((KERNEL_DS as u64) << 32) | (stack as u64);
@@ -377,6 +380,7 @@ pub fn set_kernel_stack(stack: u32) {
 
 /// Set the kernel stack in TSS for 64-bit mode
 /// Just the raw 64-bit address
+#[allow(dead_code)]
 pub fn set_kernel_stack_64(stack: u64) {
     unsafe {
         TSS64.sp0 = stack;
@@ -468,9 +472,11 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
 unsafe fn clear_tss_busy(gdt_index: usize) {
     // TSS descriptor access byte bit 1 = busy bit
     // Access byte is at offset 5 in the GDT entry
-    let entry_ptr = core::ptr::addr_of_mut!(GDT[gdt_index]) as *mut u8;
-    let access_ptr = entry_ptr.add(5);
-    *access_ptr &= !0x02;
+    unsafe {
+        let entry_ptr = core::ptr::addr_of_mut!(GDT[gdt_index]) as *mut u8;
+        let access_ptr = entry_ptr.add(5);
+        *access_ptr &= !0x02;
+    }
 }
 
 /// Load 32-bit IDT, TSS, and reload segments (call when switching to protected mode)
@@ -506,18 +512,9 @@ pub fn load_long_mode_descriptors() {
 /// If `index` is -1 (0xFFFFFFFF), auto-allocates the first free TLS slot.
 pub fn set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32 {
     let idx = if index == -1 {
-        // Auto-allocate: pick first free (non-present) TLS slot
-        let mut found = -1i32;
-        unsafe {
-            for i in GDT_TLS_START..GDT_TLS_START + 3 {
-                if GDT[i].access & 0x80 == 0 { // not Present
-                    found = i as i32;
-                    break;
-                }
-            }
-        }
-        if found < 0 { return -1; }
-        found as usize
+        // Auto-allocate: always use first TLS slot (single-core, one
+        // Linux thread active at a time — context switch restores TLS).
+        GDT_TLS_START
     } else {
         let i = index as usize;
         if i < GDT_TLS_START || i >= GDT_TLS_START + 3 { return -1; }
@@ -577,7 +574,7 @@ fn read_descriptor(sel: u16) -> u64 {
             | ((g.base_mid as u32) << 16)
             | ((g.base_high as u32) << 24)
     } else {
-        unsafe { &raw const GDT as *const _ as u32 }
+        &raw const GDT as *const _ as u32
     };
     // Limit is stored in the same descriptor; skip the check and let a bad
     // selector read whatever's there — consistent with the x86 behavior where

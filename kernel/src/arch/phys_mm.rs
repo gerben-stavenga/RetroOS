@@ -77,6 +77,7 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
 }
 
 /// Mark a range of pages as reserved
+#[allow(dead_code)]
 pub fn mark_reserved(low_page: u64, high_page: u64) {
     for page in low_page..high_page {
         if (page as usize) < MAX_PAGES {
@@ -86,6 +87,7 @@ pub fn mark_reserved(low_page: u64, high_page: u64) {
 }
 
 /// Mark a range of pages as used (reference count = 1)
+#[allow(dead_code)]
 pub fn mark_used(low_page: u64, high_page: u64) {
     for page in low_page..high_page {
         if (page as usize) < MAX_PAGES {
@@ -186,6 +188,7 @@ pub fn get_ref_count(page: u64) -> u8 {
 }
 
 /// Check if a page is shared (ref count > 1)
+#[allow(dead_code)]
 pub fn is_shared(page: u64) -> bool {
     if page as usize >= MAX_PAGES {
         return false;

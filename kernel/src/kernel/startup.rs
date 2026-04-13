@@ -4,7 +4,7 @@ extern crate alloc;
 
 extern crate ext4_view;
 
-use alloc::vec;
+
 use crate::kernel::{hdd, vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
@@ -463,7 +463,7 @@ fn handle_fork_exec(
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
 ) -> Option<usize> {
-    use crate::kernel::{dos, exec};
+    use crate::kernel::exec;
 
     let parent = thread::get_thread(parent_tid).expect("fork_exec: invalid parent");
     let parent_cwd = parent.kernel.cwd;
@@ -724,6 +724,7 @@ pub fn arch_map_low_mem() {
     }
 }
 
+#[allow(dead_code)]
 /// Free a physical page.
 pub fn arch_free_phys_page(phys: u64) {
     unsafe {
@@ -749,6 +750,7 @@ pub fn arch_set_a20(enabled: bool, hma: &mut [u64; crate::kernel::machine::HMA_P
     }
 }
 
+#[allow(dead_code)]
 /// Zero a physical page.
 pub fn arch_zero_phys_page(phys: u64) {
     unsafe {
@@ -760,6 +762,7 @@ pub fn arch_zero_phys_page(phys: u64) {
     }
 }
 
+#[allow(dead_code)]
 /// Map/unmap an EMS page frame window.
 pub fn arch_map_ems_window(base_page: usize, window: usize, phys_pages: Option<&[u64; 4]>) {
     let ptr = match phys_pages {
@@ -824,6 +827,7 @@ pub fn arch_init_hma(hma: &mut [u64; crate::kernel::machine::HMA_PAGE_COUNT]) {
     }
 }
 
+#[allow(dead_code)]
 /// Activate a root page table (switch CR3).
 pub fn arch_activate_root(root: &crate::RootPageTable) {
     unsafe {

@@ -135,6 +135,7 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
 }
 
 /// CR4 flags
+#[allow(dead_code)]
 pub mod cr4 {
     pub const VME: u32 = 1 << 0;   // Virtual 8086 Mode Extensions
     pub const PVI: u32 = 1 << 1;   // Protected-mode Virtual Interrupts
@@ -240,6 +241,7 @@ pub struct IdtPtr {
 }
 
 /// CR0 flags
+#[allow(dead_code)]
 pub mod cr0 {
     pub const PE: u32 = 1 << 0;  // Protected Mode Enable
     pub const MP: u32 = 1 << 1;  // Monitor Co-Processor

@@ -1,28 +1,15 @@
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
-load("//toolchain:transitions.bzl", "x86_64_target")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("//toolchain:musl_transition.bzl", "musl64_binary")
 
-rust_static_library(
-    name = "stress64_lib",
+rust_binary(
+    name = "stress64_bin",
     srcs = ["src/main.rs"],
-    crate_name = "stress64",
     edition = "2024",
-    rustc_flags = [
-        "-Cpanic=abort",
-        "-Crelocation-model=static",
-        "-Cforce-frame-pointers=yes",
-    ],
-    deps = ["//crt"],
+    rustc_flags = ["-Copt-level=s", "-Cstrip=symbols", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld", "-Crelocation-model=static"],
 )
 
-genrule(
-    name = "stress64_elf_raw",
-    srcs = [":stress64_lib", "//crt:user64.ld"],
-    outs = ["stress64.elf"],
-    cmd = "ld.lld -m elf_x86_64 -T $(location //crt:user64.ld) -o $@ $(location :stress64_lib)",
-)
-
-x86_64_target(
+musl64_binary(
     name = "stress64_elf",
-    dep = ":stress64_elf_raw",
+    binary = ":stress64_bin",
     visibility = ["//visibility:public"],
 )

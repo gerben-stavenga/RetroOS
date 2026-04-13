@@ -30,21 +30,19 @@ unsafe extern "C" {
 /// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootInfo) -> ! {
-    let kernel_size = unsafe {
+    let kernel_size =
         core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
-    };
+    ;
     let kernel_pages = (kernel_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
     // Enable paging (auto-detects Legacy vs PAE)
     // With offset segments, linked pointers work directly — no delta adjustment needed
-    unsafe {
-        paging2::enable_paging(
-            &raw mut crate::KERNEL_PAGES,
-            &raw mut crate::SCRATCH,
-            KERNEL_PHYS,
-            kernel_pages,
-        );
-    }
+    paging2::enable_paging(
+        &raw mut crate::KERNEL_PAGES,
+        &raw mut crate::SCRATCH,
+        KERNEL_PHYS,
+        kernel_pages,
+    );
     // Update VGA base for paged addressing before any println
     vga::vga().base = LOW_MEM_BASE + 0xB8000;
 

@@ -10,8 +10,6 @@ pub use lib::elf::{ElfError, ElfClass};
 /// User stack top address (just below kernel space)
 pub const USER_STACK_TOP: usize = 0xC000_0000;
 
-/// User stack size in pages
-pub const USER_STACK_PAGES: usize = 16;  // 64KB stack
 
 /// Loaded ELF info
 pub struct LoadedElf {

@@ -17,6 +17,7 @@ _BASE_FILES = {
     "//kernel:kernel_elf": "kernel.elf",
     "//apps/printmsg:printmsg_elf": "printmsg.elf",
     "//apps/stress:stress_elf": "stress.elf",
+    "//apps/stress64:stress64_elf": "stress64.elf",
     "//apps/shell:shell_elf": "shell.elf",
     "//apps/hello_com:hello_com": "HELLO.COM",
     "//apps/gfx_com:gfx_com": "GFX.COM",
@@ -153,7 +154,7 @@ genrule(
         for f in $$(find . -type f | sort); do
             # Skip kernel/bootloader/ELF/linux files
             case "$$f" in
-                ./A|./kernel.elf|./kernel.elf.md5|./printmsg.elf|./stress.elf|./shell.elf|./HI|./HI64|./COMMAND.C) continue ;;
+                ./A|./kernel.elf|./kernel.elf.md5|./printmsg.elf|./stress.elf|./stress64.elf|./shell.elf|./HI|./HI64|./COMMAND.C) continue ;;
             esac
             DIR=$$(dirname "$$f" | sed 's|^\\./||')
             if [ "$$DIR" != "." ]; then

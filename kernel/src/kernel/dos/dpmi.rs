@@ -17,7 +17,7 @@ use crate::kernel::thread;
 use crate::kernel::dos;
 use crate::kernel::machine;
 use crate::kernel::startup;
-use crate::{Regs, dbg_println};
+use crate::Regs;
 
 /// Trace DPMI calls when enabled. Toggle with DPMI_TRACE.
 const DPMI_TRACE: bool = false;
@@ -204,6 +204,7 @@ impl DpmiState {
     }
 
     /// Build a 32-bit code descriptor (present, DPL=3, readable)
+    #[allow(dead_code)]
     fn make_code_desc(base: u32, limit: u32) -> u64 {
         Self::make_code_desc_ex(base, limit, true)
     }
@@ -217,6 +218,7 @@ impl DpmiState {
     }
 
     /// Get the limit from an LDT descriptor (taking G bit into account)
+    #[allow(dead_code)]
     fn desc_limit(desc: u64) -> u32 {
         let l0 = (desc & 0xFFFF) as u32;
         let l1 = ((desc >> 48) & 0x0F) as u32;
@@ -1053,7 +1055,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         // AX=0305h — Get State Save/Restore Addresses
         // Returns buffer size and save/restore entry points
         0x0305 => {
-            regs.rax = (regs.rax & !0xFFFF);  // AX=0: no buffer needed
+            regs.rax = regs.rax & !0xFFFF;  // AX=0: no buffer needed
             // Real-mode save/restore: stub slot SLOT_SAVE_RESTORE
             regs.rbx = (regs.rbx & !0xFFFF) | dos::STUB_SEG as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u64;
@@ -1152,8 +1154,8 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bo
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
 
-    let rm_cs = rm.cs;
-    let rm_ip = rm.ip;
+    let _rm_cs = rm.cs;
+    let _rm_ip = rm.ip;
 
     // Save current protected-mode state
     dpmi.rm_save = Some(SavedPmState {
@@ -1288,8 +1290,8 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bool)
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
 
-    let rm_cs = rm.cs;
-    let rm_ip = rm.ip;
+    let _rm_cs = rm.cs;
+    let _rm_ip = rm.ip;
 
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,

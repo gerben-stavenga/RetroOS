@@ -10,7 +10,7 @@ use alloc::vec;
 use crate::{print, println};
 use crate::kernel::{vfs, thread};
 use core::arch::asm;
-use lib::elf::{SymbolTable, STT_FUNC};
+use lib::elf::SymbolTable;
 
 /// Owned symbol data - keeps ELF data alive for SymbolTable references
 #[derive(Clone)]
@@ -65,7 +65,7 @@ pub fn set_debug_tid(tid: usize) {
 }
 
 fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
-    unsafe { core::ptr::addr_of_mut!(KERNEL_SYMBOLS) }
+    core::ptr::addr_of_mut!(KERNEL_SYMBOLS)
 }
 
 /// Initialize kernel symbol table by loading kernel.elf from TAR filesystem

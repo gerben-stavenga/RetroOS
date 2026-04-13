@@ -8,7 +8,6 @@ use crate::arch::{inb, inw, outb};
 /// ATA register offsets from base port
 mod reg {
     pub const DATA: u16 = 0;           // Read/Write data (16-bit)
-    pub const ERROR: u16 = 1;          // Error register (read)
     pub const FEATURES: u16 = 1;       // Features register (write)
     pub const SECTOR_COUNT: u16 = 2;   // Number of sectors
     pub const LBA_0_7: u16 = 3;        // LBA bits 0-7
@@ -24,7 +23,6 @@ mod status {
     pub const BSY: u8 = 0x80;  // Busy
     pub const DRDY: u8 = 0x40; // Drive ready
     pub const DRQ: u8 = 0x08;  // Data request (ready to transfer)
-    pub const ERR: u8 = 0x01;  // Error
 }
 
 /// ATA commands
@@ -123,7 +121,7 @@ pub fn read_sectors(lba: u32, mut  buffer: &mut [u8]) -> u32 {
             // Read 256 words (512 bytes) per sector
             let mut tmp = [0u8; 512];
             for i in 0..256 {
-                let data = unsafe { inw(port + reg::DATA) };
+                let data = inw(port + reg::DATA);
                 tmp[2 * i] = data as u8;
                 tmp[2 * i + 1] = (data >> 8) as u8;
             }

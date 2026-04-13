@@ -6,8 +6,8 @@
 #![allow(static_mut_refs)]
 
 use crate::arch::irq::handle_irq;
-use crate::arch::paging2::{self, Entry, RawPage};
-use crate::{println, dbg_println};
+use crate::arch::paging2::{self, Entry};
+use crate::println;
 use crate::arch::x86;
 use crate::{Frame32, Frame64, Regs};
 
@@ -205,7 +205,7 @@ fn arch_switch_to(regs: &mut Regs) {
     unsafe { core::mem::swap(&mut *regs_ptr, &mut REGS); }
 
     // Log incoming struct PDE[0] before swap
-    let pre_pde0 = unsafe { (*root_ptr).e32[0].0 };
+    let _pre_pde0 = unsafe { (*root_ptr).e32[0].0 };
 
     // Swap root: swap entries in-place, then reload CR3
     unsafe { (&mut *root_ptr).swap_and_activate(); }
@@ -229,6 +229,7 @@ fn arch_switch_to(regs: &mut Regs) {
 /// Ring 3 (user): save state, return event to ring-1 kernel.
 /// Ring 0 (boot): page fault → demand paging. IRQ → ACK+queue. Rest → panic.
 #[unsafe(no_mangle)]
+#[allow(private_interfaces)]
 pub extern "C" fn isr_handler(full: *mut FullRegs) {
     static mut VIF: bool = false;
     static mut VIP: bool = false;

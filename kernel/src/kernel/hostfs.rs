@@ -90,6 +90,7 @@ fn recv_u8() -> u8 {
 
 const CMD_OPEN: u8 = 0x01;
 const CMD_READ: u8 = 0x02;
+#[allow(dead_code)]
 const CMD_CLOSE: u8 = 0x03;
 const CMD_STAT: u8 = 0x04;
 const CMD_READDIR: u8 = 0x05;
@@ -177,6 +178,7 @@ impl Filesystem for HostFs {
 /// Close a hostfs handle (called when VFS file entry is freed).
 /// Note: the VFS doesn't currently call close on the Filesystem trait,
 /// so hostfs handles leak. This is acceptable for now.
+#[allow(dead_code)]
 pub fn close_handle(handle: u32) {
     if !is_ready() { return; }
     send_byte(CMD_CLOSE);

@@ -26,11 +26,10 @@ pub mod dpmi;
 extern crate alloc;
 
 use crate::kernel::thread;
-use thread::MAX_FDS;
 use crate::kernel::machine::{
     self,
     IF_FLAG,
-    emulate_inb, emulate_outb, read_u16, write_u16,
+    read_u16, write_u16,
     vm86_cs, vm86_ip, vm86_ss, vm86_sp, vm86_flags,
     set_vm86_cs, set_vm86_ip,
     vm86_push, vm86_pop,
@@ -263,6 +262,7 @@ static mut UMA_FREE: u64 = 0;
 static mut UMB_ALLOC: u64 = 0;
 
 /// Bitmap of pages reserved for EMS (16 pages for 64KB page frame).
+#[allow(dead_code)]
 static mut EMS_PAGES: u64 = 0;
 
 /// EMS page frame base page (set by scan_uma)
@@ -298,6 +298,7 @@ pub fn scan_uma() {
 }
 
 /// Find `count` contiguous set bits in `bitmap`, preferring `hint` offset.
+#[allow(dead_code)]
 fn find_contiguous_run(bitmap: u64, count: usize, hint: usize) -> Option<usize> {
     // Try starting at hint first
     if hint + count <= UMA_PAGES {
@@ -401,17 +402,20 @@ fn umb_largest() -> u16 {
 
 const MAX_EMS_HANDLES: usize = 16;
 /// Total EMS pages available (256 × 16KB = 4MB)
+#[allow(dead_code)]
 const EMS_TOTAL_PAGES: u16 = 256;
 /// EMS page frame segment — set dynamically by scan_uma()
 pub fn ems_frame_seg() -> u16 {
     (unsafe { EMS_BASE_PAGE } as u16) * 0x100
 }
 
+#[allow(dead_code)]
 fn ems_base_page() -> usize {
     unsafe { EMS_BASE_PAGE }
 }
 
 /// Per-thread EMS driver state
+#[allow(dead_code)]
 pub struct EmsState {
     /// Each handle: list of physical page groups (4 physical pages per EMS page)
     handles: [Option<EmsHandle>; MAX_EMS_HANDLES],
@@ -419,11 +423,13 @@ pub struct EmsState {
     frame: [Option<(u8, u16)>; 4],
 }
 
+#[allow(dead_code)]
 struct EmsHandle {
     /// Physical page numbers for each logical page (4 contiguous phys pages per EMS page)
     pages: alloc::vec::Vec<[u64; 4]>,
 }
 
+#[allow(dead_code)]
 impl EmsState {
     fn new() -> Self {
         const NONE_H: Option<EmsHandle> = None;
@@ -685,7 +691,7 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
                 regs.set_flag32(1);
             } else {
                 // Report a minimal hard drive geometry
-                regs.rax = (regs.rax & !0xFF00); // AH=0 success
+                regs.rax = regs.rax & !0xFF00; // AH=0 success
                 regs.rbx = (regs.rbx & !0xFF) | 0; // BL=drive type (0 for HD)
                 regs.rcx = (regs.rcx & !0xFFFF) | ((32 << 8) | 63); // CH=max cyl low, CL=max sect
                 regs.rdx = (regs.rdx & !0xFFFF) | ((1 << 8) | 1); // DH=max head, DL=number of drives
@@ -799,7 +805,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x33 => {
             let al = regs.rax as u8;
             match al {
-                0x00 => { regs.rdx = (regs.rdx & !0xFF); } // DL=0: break checking off
+                0x00 => { regs.rdx = regs.rdx & !0xFF; } // DL=0: break checking off
                 0x01 => {} // set break — ignore
                 _ => {}
             }
@@ -983,7 +989,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let i = dos_normalize_path(&mut name, i);
                 let mut rbuf = [0u8; 164];
                 let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
-                let name_str = core::str::from_utf8(resolved).unwrap_or("?");
+                let _name_str = core::str::from_utf8(resolved).unwrap_or("?");
                 let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
@@ -1462,7 +1468,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             // Build canonical path: if no drive letter, prepend "C:\"
             let mut out = [0u8; 128];
-            let mut pos = 0;
+            let mut pos;
             if len >= 2 && name[1] == b':' {
                 // Already has drive letter — uppercase it
                 out[0] = name[0].to_ascii_uppercase();
@@ -1561,7 +1567,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             // Return "file not found" as default extended error
             regs.rax = (regs.rax & !0xFFFF) | 2; // AX = error code (file not found)
             regs.rbx = (regs.rbx & !0xFFFF) | ((1 << 8) | 2); // BH=1 (class: out of resource), BL=2 (action: abort)
-            regs.rcx = (regs.rcx & !0xFFFF); // CH=0 (locus: unknown)
+            regs.rcx = regs.rcx & !0xFFFF; // CH=0 (locus: unknown)
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -1723,7 +1729,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
 // INT 2Fh — Multiplex interrupt (XMS + DPMI detection)
 // ============================================================================
 
-fn int_2fh(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ax = regs.rax as u16;
     match ax {
         // AX=1687h — DPMI installation check
@@ -1788,7 +1794,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
             dos.pc.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
-            regs.rbx = (regs.rbx & !0xFFFF); // BL=0 no error
+            regs.rbx = regs.rbx & !0xFFFF; // BL=0 no error
         }
         // AH=04h — Global disable A20
         0x04 => {
@@ -1800,7 +1806,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                 dos.pc.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = (regs.rbx & !0xFFFF);
+            regs.rbx = regs.rbx & !0xFFFF;
         }
         // AH=05h — Local enable A20
         0x05 => {
@@ -1809,7 +1815,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             crate::kernel::startup::arch_set_a20(true, &mut dos.pc.hma_pages);
             dos.pc.a20_enabled = true;
             regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = (regs.rbx & !0xFFFF);
+            regs.rbx = regs.rbx & !0xFFFF;
         }
         // AH=06h — Local disable A20
         0x06 => {
@@ -1821,13 +1827,13 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                 dos.pc.a20_enabled = false;
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = (regs.rbx & !0xFFFF);
+            regs.rbx = regs.rbx & !0xFFFF;
         }
         // AH=07h — Query A20 state
         0x07 => {
             let enabled = dos.pc.a20_enabled;
             regs.rax = (regs.rax & !0xFFFF) | if enabled { 1 } else { 0 };
-            regs.rbx = (regs.rbx & !0xFFFF);
+            regs.rbx = regs.rbx & !0xFFFF;
         }
         // AH=08h — Query free extended memory
         0x08 => {
@@ -1862,13 +1868,13 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                             regs.rdx = (regs.rdx & !0xFFFF) | (i + 1) as u64;
                         }
                         None => {
-                            regs.rax = (regs.rax & !0xFFFF);
+                            regs.rax = regs.rax & !0xFFFF;
                             regs.rbx = (regs.rbx & !0xFF) | 0xA0;
                         }
                     }
                 }
                 None => {
-                    regs.rax = (regs.rax & !0xFFFF);
+                    regs.rax = regs.rax & !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA1;
                 }
             }
@@ -1881,11 +1887,11 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                 if xms.handles[handle as usize - 1].take().is_some() {
                     regs.rax = (regs.rax & !0xFFFF) | 1;
                 } else {
-                    regs.rax = (regs.rax & !0xFFFF);
+                    regs.rax = regs.rax & !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
                 }
             } else {
-                regs.rax = (regs.rax & !0xFFFF);
+                regs.rax = regs.rax & !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
@@ -1905,11 +1911,11 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                     regs.rbx = (regs.rbx & !0xFFFF) | (addr & 0xFFFF) as u64;
                     regs.rax = (regs.rax & !0xFFFF) | 1;
                 } else {
-                    regs.rax = (regs.rax & !0xFFFF);
+                    regs.rax = regs.rax & !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
                 }
             } else {
-                regs.rax = (regs.rax & !0xFFFF);
+                regs.rax = regs.rax & !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
@@ -1922,11 +1928,11 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                     h.locked = false;
                     regs.rax = (regs.rax & !0xFFFF) | 1;
                 } else {
-                    regs.rax = (regs.rax & !0xFFFF);
+                    regs.rax = regs.rax & !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
                 }
             } else {
-                regs.rax = (regs.rax & !0xFFFF);
+                regs.rax = regs.rax & !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
@@ -1943,11 +1949,11 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                     regs.rdx = (regs.rdx & !0xFFFF) | h.size_kb as u64;
                     regs.rax = (regs.rax & !0xFFFF) | 1;
                 } else {
-                    regs.rax = (regs.rax & !0xFFFF);
+                    regs.rax = regs.rax & !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
                 }
             } else {
-                regs.rax = (regs.rax & !0xFFFF);
+                regs.rax = regs.rax & !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
@@ -1973,16 +1979,16 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                         None => {
                             // Restore old handle
                             xms.handles[handle as usize - 1] = Some(old);
-                            regs.rax = (regs.rax & !0xFFFF);
+                            regs.rax = regs.rax & !0xFFFF;
                             regs.rbx = (regs.rbx & !0xFF) | 0xA0;
                         }
                     }
                 } else {
-                    regs.rax = (regs.rax & !0xFFFF);
+                    regs.rax = regs.rax & !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
                 }
             } else {
-                regs.rax = (regs.rax & !0xFFFF);
+                regs.rax = regs.rax & !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
@@ -1993,7 +1999,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             regs.rax = (regs.rax & !0xFFFF) | (free & 0xFFFF) as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | (free & 0xFFFF) as u64;
             regs.rcx = (regs.rcx & !0xFFFFFFFF) | (XMS_END - 1) as u64;
-            regs.rbx = (regs.rbx & !0xFFFF);
+            regs.rbx = regs.rbx & !0xFFFF;
         }
         // AH=10h — Request Upper Memory Block (DX=size in paragraphs)
         0x10 => {
@@ -2006,7 +2012,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
                 }
                 None => {
                     let largest = umb_largest();
-                    regs.rax = (regs.rax & !0xFFFF); // failure
+                    regs.rax = regs.rax & !0xFFFF; // failure
                     regs.rbx = (regs.rbx & !0xFF) | if largest > 0 { 0xB0 } else { 0xB1 };
                     regs.rdx = (regs.rdx & !0xFFFF) | largest as u64;
                 }
@@ -2018,13 +2024,13 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             if umb_free(seg) {
                 regs.rax = (regs.rax & !0xFFFF) | 1; // success
             } else {
-                regs.rax = (regs.rax & !0xFFFF); // failure
+                regs.rax = regs.rax & !0xFFFF; // failure
                 regs.rbx = (regs.rbx & !0xFF) | 0xB2; // invalid UMB segment
             }
         }
         _ => {
             dbg_println!("XMS: UNHANDLED AH={:02X}", ah);
-            regs.rax = (regs.rax & !0xFFFF); // failure
+            regs.rax = regs.rax & !0xFFFF; // failure
             regs.rbx = (regs.rbx & !0xFF) | 0x80; // not implemented
         }
     }
@@ -2049,7 +2055,7 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
 
     if length == 0 {
         regs.rax = (regs.rax & !0xFFFF) | 1;
-        regs.rbx = (regs.rbx & !0xFFFF);
+        regs.rbx = regs.rbx & !0xFFFF;
         return;
     }
 
@@ -2067,7 +2073,7 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
                 h.base + src_offset
             }
             _ => {
-                regs.rax = (regs.rax & !0xFFFF);
+                regs.rax = regs.rax & !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA3;
                 return;
             }
@@ -2086,7 +2092,7 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
                 h.base + dst_offset
             }
             _ => {
-                regs.rax = (regs.rax & !0xFFFF);
+                regs.rax = regs.rax & !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA5;
                 return;
             }
@@ -2097,13 +2103,14 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
         core::ptr::copy(src as *const u8, dst as *mut u8, length);
     }
     regs.rax = (regs.rax & !0xFFFF) | 1;
-    regs.rbx = (regs.rbx & !0xFFFF);
+    regs.rbx = regs.rbx & !0xFFFF;
 }
 
 // ============================================================================
 // INT 67h — EMS driver
 // ============================================================================
 
+#[allow(dead_code)]
 /// Ensure EMS state exists for current thread
 fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
     if dos.ems.is_none() {
@@ -2112,17 +2119,18 @@ fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
     dos.ems.as_deref_mut().unwrap()
 }
 
+#[allow(dead_code)]
 fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=40h — Get status
         0x40 => {
-            regs.rax = (regs.rax & !0xFF00); // AH=0: OK
+            regs.rax = regs.rax & !0xFF00; // AH=0: OK
         }
         // AH=41h — Get page frame segment
         0x41 => {
             regs.rbx = (regs.rbx & !0xFFFF) | ems_frame_seg() as u64;
-            regs.rax = (regs.rax & !0xFF00); // AH=0
+            regs.rax = regs.rax & !0xFF00; // AH=0
         }
         // AH=42h — Get unallocated page count
         0x42 => {
@@ -2130,7 +2138,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             let free = ems.alloc_pages();
             regs.rbx = (regs.rbx & !0xFFFF) | free as u64;     // BX = free pages
             regs.rdx = (regs.rdx & !0xFFFF) | EMS_TOTAL_PAGES as u64; // DX = total pages
-            regs.rax = (regs.rax & !0xFF00); // AH=0
+            regs.rax = regs.rax & !0xFF00; // AH=0
         }
         // AH=43h — Allocate handle (BX=pages needed, returns DX=handle)
         0x43 => {
@@ -2167,7 +2175,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                     if ok {
                         ems.handles[i] = Some(EmsHandle { pages });
                         regs.rdx = (regs.rdx & !0xFFFF) | i as u64; // handle (0-based)
-                        regs.rax = (regs.rax & !0xFF00); // AH=0
+                        regs.rax = regs.rax & !0xFF00; // AH=0
                     } else {
                         // Free any partially allocated pages
                         for group in &pages {
@@ -2200,7 +2208,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             if log_page == 0xFFFF {
                 ems.frame[phys_page as usize] = None;
                 crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, None);
-                regs.rax = (regs.rax & !0xFF00); // AH=0
+                regs.rax = regs.rax & !0xFF00; // AH=0
                 return thread::KernelAction::Done;
             }
 
@@ -2214,7 +2222,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                     let phys_pages = &h.pages[log_page as usize];
                     crate::kernel::startup::arch_map_ems_window(ems_base_page(), phys_page as usize, Some(phys_pages));
                     ems.frame[phys_page as usize] = Some((handle as u8, log_page));
-                    regs.rax = (regs.rax & !0xFF00); // AH=0
+                    regs.rax = regs.rax & !0xFF00; // AH=0
                 }
                 Some(_) => {
                     regs.rax = (regs.rax & !0xFF00) | (0x8A << 8); // logical page out of range
@@ -2246,7 +2254,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                         }
                     }
                 }
-                regs.rax = (regs.rax & !0xFF00); // AH=0
+                regs.rax = regs.rax & !0xFF00; // AH=0
             } else {
                 regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
             }
@@ -2261,7 +2269,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             let ems = ems_state(dos);
             let count = ems.handles.iter().filter(|h| h.is_some()).count() as u16;
             regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
-            regs.rax = (regs.rax & !0xFF00);
+            regs.rax = regs.rax & !0xFF00;
         }
         // AH=4Ch — Get pages allocated to handle (DX=handle)
         0x4C => {
@@ -2270,7 +2278,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
             if (handle as usize) < MAX_EMS_HANDLES {
                 if let Some(ref h) = ems.handles[handle as usize] {
                     regs.rbx = (regs.rbx & !0xFFFF) | h.pages.len() as u64;
-                    regs.rax = (regs.rax & !0xFF00);
+                    regs.rax = regs.rax & !0xFF00;
                 } else {
                     regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
                 }
@@ -2296,7 +2304,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                 }
             }
             regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
-            regs.rax = (regs.rax & !0xFF00);
+            regs.rax = regs.rax & !0xFF00;
         }
         // AH=50h — Map multiple pages (AL=0: phys page mode, AL=1: segment mode)
         // CX=count, DX=handle, DS:SI=mapping array
@@ -2348,7 +2356,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                     }
                 }
             }
-            regs.rax = (regs.rax & !0xFF00); // AH=0
+            regs.rax = regs.rax & !0xFF00; // AH=0
         }
         // AH=51h — Reallocate pages for handle (DX=handle, BX=new count)
         0x51 => {
@@ -2389,7 +2397,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                             }
                         }
                     }
-                    regs.rax = (regs.rax & !0xFF00);
+                    regs.rax = regs.rax & !0xFF00;
                     regs.rbx = (regs.rbx & !0xFFFF) | new_count as u64;
                 }
                 None => {
@@ -2413,11 +2421,11 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
                     }
                 }
                 regs.rcx = (regs.rcx & !0xFFFF) | 4; // 4 mappable pages
-                regs.rax = (regs.rax & !0xFF00);
+                regs.rax = regs.rax & !0xFF00;
             } else {
                 // Sub 1: just return count
                 regs.rcx = (regs.rcx & !0xFFFF) | 4;
-                regs.rax = (regs.rax & !0xFF00);
+                regs.rax = regs.rax & !0xFF00;
             }
         }
         _ => {
@@ -2428,7 +2436,7 @@ fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
     thread::KernelAction::Done
 }
 
-fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, name: &[u8]) -> i32 {
+fn dos_open_program(kt: &mut thread::KernelThread, _dos: &mut thread::DosState, name: &[u8]) -> i32 {
     let mut rbuf = [0u8; 164];
     let resolved = dos_resolve_path(kt, name, &mut rbuf);
     let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
@@ -2468,7 +2476,7 @@ fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, n
 ///
 /// Only the first command is executed — multi-line BAT semantics (loops,
 /// conditionals, state) are out of scope for this basic handler.
-fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize, kt: &mut thread::KernelThread) -> usize {
+fn expand_bat(_dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize, kt: &mut thread::KernelThread) -> usize {
     // Case-insensitive suffix check for ".BAT"
     if flen < 4 { return flen; }
     let tail = &filename[flen - 4..flen];
@@ -2531,7 +2539,7 @@ fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize,
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], kt: &mut thread::KernelThread) -> thread::KernelAction {
+fn fork_exec(_dos: &mut thread::DosState, prog_name: &[u8], kt: &mut thread::KernelThread) -> thread::KernelAction {
     // Resolve to full path using DOS cwd
     let mut path = [0u8; 164];
     let resolved = dos_resolve_path(kt, prog_name, &mut path);
@@ -2696,6 +2704,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     thread::KernelAction::Done
 }
 
+#[allow(dead_code)]
 /// Load a .COM binary into VM86 memory at the child segment (above the parent).
 /// Creates a minimal PSP at child_seg:0000 and loads code at child_seg:0100.
 fn load_com_child(data: &[u8], child_seg: u16) -> (u16, u16, u16, u16) {
@@ -3061,16 +3070,20 @@ const LOL_SEG: u16 = (LOL_ADDR >> 4) as u16;
 
 /// Write a little-endian u16 to an arbitrary (possibly unaligned) address.
 unsafe fn write_le16(addr: *mut u8, val: u16) {
-    *addr = val as u8;
-    *addr.add(1) = (val >> 8) as u8;
+    unsafe {
+        *addr = val as u8;
+        *addr.add(1) = (val >> 8) as u8;
+    }
 }
 
 /// Write a little-endian u32 to an arbitrary (possibly unaligned) address.
 unsafe fn write_le32(addr: *mut u8, val: u32) {
-    *addr = val as u8;
-    *addr.add(1) = (val >> 8) as u8;
-    *addr.add(2) = (val >> 16) as u8;
-    *addr.add(3) = (val >> 24) as u8;
+    unsafe {
+        *addr = val as u8;
+        *addr.add(1) = (val >> 8) as u8;
+        *addr.add(2) = (val >> 16) as u8;
+        *addr.add(3) = (val >> 24) as u8;
+    }
 }
 
 fn setup_lol_sft() {
