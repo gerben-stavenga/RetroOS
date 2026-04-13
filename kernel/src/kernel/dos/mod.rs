@@ -544,7 +544,8 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
-        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
+        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
+        | SLOT_HW_IRQ0 | SLOT_HW_IRQ_RET)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
     // IVT-redirect stubs: the original INT pushed FLAGS/CS/IP on the VM86 stack.
@@ -592,13 +593,19 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             action
         }
         SLOT_HW_IRQ_RET => {
-            // BIOS handler IRET'd to trampoline. Restore original SS:SP —
-            // the reflect frame (FLAGS/CS/IP) is still on that stack.
-            // Fall through to post-match code which pops it normally.
+            // BIOS handler IRET'd to trampoline. Restore original SS:SP,
+            // pop the reflect frame, and restore flags (IRQs must not
+            // clobber the interrupted code's flags).
             let (ss, sp) = dos.pc.irq_saved_sssp.take().expect("HW_IRQ_RET without saved SS:SP");
             crate::kernel::machine::set_vm86_ss(regs, ss);
             crate::kernel::machine::set_vm86_sp(regs, sp);
-            thread::KernelAction::Done
+            let ret_ip = vm86_pop(regs);
+            let ret_cs = vm86_pop(regs);
+            let ret_flags = vm86_pop(regs);
+            set_vm86_ip(regs, ret_ip);
+            set_vm86_cs(regs, ret_cs);
+            crate::kernel::machine::set_vm86_flags(regs, ret_flags as u32);
+            return thread::KernelAction::Done;
         }
         SLOT_SAVE_RESTORE => thread::KernelAction::Done, // no-op far call (buffer size=0)
         _ => {
@@ -613,7 +620,7 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
     if !is_far_call {
         let ret_ip = vm86_pop(regs);
         let ret_cs = vm86_pop(regs);
-        let _flags = vm86_pop(regs); // discard (equivalent to old RETF 2)
+        let _flags = vm86_pop(regs);
         set_vm86_ip(regs, ret_ip);
         set_vm86_cs(regs, ret_cs);
     } else if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {

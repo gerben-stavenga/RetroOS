@@ -84,7 +84,8 @@ pub fn set_vm86_sp(regs: &mut Regs, sp: u16) {
 
 #[inline]
 pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
-    regs.set_flags32(flags);
+    // Merge low 16 bits (user-visible flags), preserve upper EFLAGS (VM, IOPL, VIF, VIP).
+    regs.frame.rflags = (regs.frame.rflags & !0xFFFF) | (flags as u64 & 0xFFFF);
 }
 
 // ============================================================================
