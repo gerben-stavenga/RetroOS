@@ -1202,7 +1202,11 @@ pub fn fork_current(child_root: &mut RootPageTable) {
 /// PAE only: deshare user entries [0..recursive) because PAE hardware
 /// ignores R/W on PDPT entries.
 fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
-    share_and_copy(entries, recursive_idx(), dst);
+    let root = root_base();
+    let epp = entries_per_page::<E>();
+    let user_count = recursive_idx() - root;
+    let parent_phys = entries[recursive_idx()].page();
+    share_and_copy(&entries[root..root + epp], &mut dst[..epp], parent_phys, user_count);
 
     // Eagerly deshare all user PD/PDPT entries so that COW enforcement
     // is pushed down to leaf PTEs.  This avoids cascading COW (where a
@@ -1229,47 +1233,29 @@ fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
 // COW fault handling
 // =============================================================================
 
-/// Build a COW copy of a page table page into `dst`.
-/// Reads parent entries from the recursive view, writes the child copy
-/// into `dst` with user entries marked R/O. Also marks the parent's
-/// user entries R/O and increments their ref counts.
-fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize, dst: &mut [E]) {
+/// Build a COW copy of a page table page.
+///
+/// Copies `src` entries into `dst`, marking user entries (`0..user_count`)
+/// R/O in the child copy. Then temp-maps the parent physical page at
+/// `parent_phys` to mark the parent's user entries R/O and increment
+/// their ref counts. (Writing through the recursive view is unsafe —
+/// ancestor entries may be R/O.)
+fn share_and_copy<E: Entry>(src: &[E], dst: &mut [E], parent_phys: u64, user_count: usize) {
     use crate::arch::phys_mm;
 
-    debug_assert!(idx >= PAGE_TABLE_BASE_IDX,
-        "share_and_copy: idx {} is a leaf page, not a page table entry", idx);
+    let epp = src.len();
+    debug_assert_eq!(epp, dst.len());
 
-    let epp = entries_per_page::<E>();
-    let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
-
-    debug_assert!(child_base + epp <= NUM_PAGES,
-        "share_and_copy: idx {:#x} children {:#x}..{:#x} > NUM_PAGES {:#x}",
-        idx, child_base, child_base + epp, NUM_PAGES);
-
-    // For the root page table, only mark user entries R/O (below recursive entry).
-    // Kernel entries stay writable — shared between all processes.
-    let user_count = if idx == recursive_idx() {
-        recursive_idx() - child_base
-    } else {
-        epp
-    };
-
-    // Build child copy, marking user entries R/O.
+    // Copy entries to dst, marking user entries R/O in child.
     for i in 0..epp {
-        let mut e = entries[child_base + i];
-        if e.present() {
-            let is_mmio = e.raw() & flags::CACHE_DISABLE != 0;
-            if i < user_count && !is_mmio {
-                e.set_hw_writable(false);
-            }
+        let mut e = src[i];
+        if e.present() && i < user_count && e.raw() & flags::CACHE_DISABLE == 0 {
+            e.set_hw_writable(false);
         }
         dst[i] = e;
     }
 
     // Mark parent user entries R/O and inc ref counts via temp_map.
-    // Can't use recursive view — ancestor entries may be R/O, causing
-    // write faults through the recursive mapping.
-    let parent_phys = entries[idx].page();
     temp_map(parent_phys);
     unsafe {
         let parent = temp_map_vaddr() as *mut E;
@@ -1312,9 +1298,12 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         debug_assert!(child_base + epp <= NUM_PAGES,
             "cow_entry: idx {:#x} is not a non-leaf recursive entry", idx);
         let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
+        // temp_map new page as dst. share_and_copy's second loop will
+        // re-temp_map old_phys (clobbering dst), but all dst writes
+        // happen in the first loop before that.
         temp_map(p);
         let dst = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
-        share_and_copy(entries, idx, dst);
+        share_and_copy(&entries[child_base..child_base + epp], dst, old_phys, epp);
         temp_unmap();
         p
     } else {
