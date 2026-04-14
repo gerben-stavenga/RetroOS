@@ -60,10 +60,8 @@ fn arch_dispatch(regs: &mut Regs) {
         // FORK: EDX=child_root out. COW fork, fill child, free temp page.
         arch_call::FORK => {
             let child_root = regs.rdx as usize as *mut paging2::RootPageTable;
-            let new_root_phys = paging2::fork_current().expect("Arch: Fork failed (OOM)");
             let mut cr = paging2::RootPageTable::empty();
-            cr.init_fork(new_root_phys);
-            crate::arch::phys_mm::free_phys_page(new_root_phys);
+            paging2::fork_current(&mut cr);
             unsafe { *child_root = cr; }
         }
         arch_call::CLEAN => paging2::free_user_pages(),

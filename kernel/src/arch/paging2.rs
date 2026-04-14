@@ -1170,29 +1170,39 @@ pub fn pde_index<E: Entry>(page: usize) -> usize {
 ///
 /// share_and_copy's the root page table. All child page tables are shared
 /// read-only. Returns the new root's physical page number.
-pub fn fork_current() -> Option<u64> {
+/// Fork the current address space (COW).
+/// Marks parent user entries R/O, increments ref counts, and fills
+/// `child_root` with the child's user root entries.
+pub fn fork_current(child_root: &mut RootPageTable) {
+    let user_count = recursive_idx() - root_base();
+    // Use a stack buffer for the full root page copy.
+    // share_and_copy writes all entries (including kernel), but we only
+    // need user entries for child_root.
     match entries() {
-        Entries::E32(e) => fork_generic(e),
-        Entries::E64(e) => fork_generic(e),
+        Entries::E32(e) => {
+            let mut buf = [Entry32::default(); PAGE_SIZE / core::mem::size_of::<Entry32>()];
+            fork_generic(e, &mut buf);
+            for i in 0..user_count {
+                unsafe { child_root.e32[i] = buf[i]; }
+            }
+        }
+        Entries::E64(e) => {
+            let mut buf = [Entry64::default(); PAGE_SIZE / core::mem::size_of::<Entry64>()];
+            fork_generic(e, &mut buf);
+            for i in 0..user_count {
+                unsafe { child_root.e64[i] = buf[i]; }
+            }
+        }
     }
 }
 
 /// Fork the current address space (COW).
 ///
 /// All modes: share_and_copy the root (PD for legacy, PDPT for PAE/compat).
-/// Caller allocates the new root and passes it to share_and_copy via temp_map.
 /// PAE only: deshare user entries [0..recursive) because PAE hardware
 /// ignores R/W on PDPT entries.
-///
-/// Returns the new root's physical page number.
-fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
-    use crate::arch::phys_mm;
-    let epp = entries_per_page::<E>();
-    let new_root = phys_mm::alloc_phys_page()?;
-    temp_map(new_root);
-    let dst = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
+fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
     share_and_copy(entries, recursive_idx(), dst);
-    temp_unmap();
 
     // Eagerly deshare all user PD/PDPT entries so that COW enforcement
     // is pushed down to leaf PTEs.  This avoids cascading COW (where a
@@ -1213,7 +1223,6 @@ fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
     }
 
     flush_tlb();
-    Some(new_root)
 }
 
 // =============================================================================
@@ -1257,13 +1266,21 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize, dst: &mut [E]) {
         dst[i] = e;
     }
 
-    // Mark parent user entries R/O and inc ref counts (via recursive view).
-    for i in 0..user_count {
-        if entries[child_base + i].present() && entries[child_base + i].raw() & flags::CACHE_DISABLE == 0 {
-            entries[child_base + i].set_hw_writable(false);
-            phys_mm::inc_shared_count(entries[child_base + i].page());
+    // Mark parent user entries R/O and inc ref counts via temp_map.
+    // Can't use recursive view — ancestor entries may be R/O, causing
+    // write faults through the recursive mapping.
+    let parent_phys = entries[idx].page();
+    temp_map(parent_phys);
+    unsafe {
+        let parent = temp_map_vaddr() as *mut E;
+        for i in 0..user_count {
+            if (*parent.add(i)).present() && (*parent.add(i)).raw() & flags::CACHE_DISABLE == 0 {
+                (*parent.add(i)).set_hw_writable(false);
+                phys_mm::inc_shared_count((*parent.add(i)).page());
+            }
         }
     }
+    temp_unmap();
 
     invalidate_tlb();
 }
