@@ -2,25 +2,42 @@
 
 use core::arch::asm;
 
-/// x87/SSE state save area used by `fxsave`/`fxrstor`.
-/// Must be 16-byte aligned. Size is 512 bytes.
+/// FPU/SSE state save area.
+/// 512 bytes, 16-byte aligned (required by FXSAVE; FSAVE only uses 108
+/// bytes but fits fine).
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct FxState(pub [u8; 512]);
 
+/// Check if FXSAVE/FXRSTOR is available (CR4.OSFXSR set during boot).
+#[inline]
+fn has_fxsr() -> bool { read_cr4() & cr4::OSFXSR != 0 }
+
 impl FxState {
     pub const fn zeroed() -> Self { Self([0; 512]) }
 
-    /// Save the live x87/SSE register file into this area.
+    /// Save the live FPU/SSE state into this area.
     #[inline]
     pub fn save(&mut self) {
-        unsafe { asm!("fxsave [{}]", in(reg) self as *mut _ as *mut u8, options(nostack)); }
+        unsafe {
+            if has_fxsr() {
+                asm!("fxsave [{}]", in(reg) self as *mut _ as *mut u8, options(nostack));
+            } else {
+                asm!("fsave [{}]", in(reg) self as *mut _ as *mut u8, options(nostack));
+            }
+        }
     }
 
-    /// Restore the x87/SSE register file from this area.
+    /// Restore the FPU/SSE state from this area.
     #[inline]
     pub fn restore(&self) {
-        unsafe { asm!("fxrstor [{}]", in(reg) self as *const _ as *const u8, options(nostack)); }
+        unsafe {
+            if has_fxsr() {
+                asm!("fxrstor [{}]", in(reg) self as *const _ as *const u8, options(nostack));
+            } else {
+                asm!("frstor [{}]", in(reg) self as *const _ as *const u8, options(nostack));
+            }
+        }
     }
 }
 
