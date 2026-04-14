@@ -1293,8 +1293,8 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize, dst: &mut [E]) {
 pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     use crate::arch::phys_mm;
 
-    debug_assert!(idx != recursive_idx(),
-        "cow_entry: idx {} is the recursive entry, must never be COW'd", idx);
+    debug_assert!(idx < recursive_idx(),
+        "cow_entry: idx {} is at or above recursive entry, must be a user entry", idx);
 
     let old_phys = entries[idx].page();
     let ref_count = phys_mm::get_ref_count(old_phys);
