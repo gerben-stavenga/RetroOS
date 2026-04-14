@@ -1209,10 +1209,9 @@ pub fn fork_current(child_root: &mut RootPageTable) {
 /// PAE only: deshare user entries [0..recursive) because PAE hardware
 /// ignores R/W on PDPT entries.
 fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
-    let epp = entries_per_page::<E>();
-    let user_count = recursive_idx() - root_base();
-    let parent_phys = entries[recursive_idx()].page();
-    share_and_copy(&mut dst[..epp], parent_phys, user_count);
+    let root = root_base();
+    let user_count = recursive_idx() - root;
+    share_and_copy(&mut entries[root..root + user_count], &mut dst[..user_count]);
 
     // Eagerly deshare all user PD/PDPT entries so that COW enforcement
     // is pushed down to leaf PTEs.  This avoids cascading COW (where a
@@ -1239,31 +1238,22 @@ fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
 // COW fault handling
 // =============================================================================
 
-/// Build a COW copy of a page table page.
-///
-/// Temp-maps the parent physical page, copies its entries into `dst`
-/// with user entries (`0..user_count`) marked R/O, marks the parent's
-/// user entries R/O, and increments their ref counts.
-///
-/// `dst` must NOT be backed by temp_map (it would be clobbered).
-fn share_and_copy<E: Entry>(dst: &mut [E], parent_phys: u64, user_count: usize) {
+/// COW-share a page table page: mark each present non-MMIO entry R/O
+/// in `src`, increment its ref count, and write the R/O copy to `dst`.
+fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
     use crate::arch::phys_mm;
 
-    let epp = dst.len();
-    temp_map(parent_phys);
-    unsafe {
-        let parent = temp_map_vaddr() as *mut E;
-        for i in 0..epp {
-            let mut e = *parent.add(i);
-            if e.present() && i < user_count && e.raw() & flags::CACHE_DISABLE == 0 {
-                e.set_hw_writable(false);
-                (*parent.add(i)).set_hw_writable(false);
-                phys_mm::inc_shared_count((*parent.add(i)).page());
-            }
-            dst[i] = e;
+    debug_assert_eq!(src.len(), dst.len());
+
+    for i in 0..src.len() {
+        let mut e = src[i];
+        if e.present() && e.raw() & flags::CACHE_DISABLE == 0 {
+            e.set_hw_writable(false);
+            src[i].set_hw_writable(false);
+            phys_mm::inc_shared_count(src[i].page());
         }
+        dst[i] = e;
     }
-    temp_unmap();
 
     invalidate_tlb();
 }
@@ -1298,7 +1288,10 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
             let buf = &raw mut COW_BUF;
             core::slice::from_raw_parts_mut(buf as *mut E, epp)
         };
-        share_and_copy(dst, old_phys, epp);
+        temp_map(old_phys);
+        let src = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
+        share_and_copy(src, dst);
+        temp_unmap();
         let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
         temp_map(p);
         unsafe { core::ptr::copy_nonoverlapping(
