@@ -1106,6 +1106,13 @@ pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: us
 struct TempPage([u8; PAGE_SIZE]);
 static mut TEMP_PAGE: TempPage = TempPage([0; PAGE_SIZE]);
 
+/// Scratch buffer for cow_entry's non-leaf path (needs a full page but
+/// can't use the stack on the 16KB arch stack, and heap allocation during
+/// fork is unsafe). Non-reentrant — only used with interrupts disabled.
+#[repr(C, align(8))]
+struct CowBuf([u64; PAGE_SIZE / 8]);
+static mut COW_BUF: CowBuf = CowBuf([0; PAGE_SIZE / 8]);
+
 /// Temp mapping virtual address.
 fn temp_map_vaddr() -> usize {
     &raw const TEMP_PAGE as usize
@@ -1202,11 +1209,10 @@ pub fn fork_current(child_root: &mut RootPageTable) {
 /// PAE only: deshare user entries [0..recursive) because PAE hardware
 /// ignores R/W on PDPT entries.
 fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
-    let root = root_base();
     let epp = entries_per_page::<E>();
-    let user_count = recursive_idx() - root;
+    let user_count = recursive_idx() - root_base();
     let parent_phys = entries[recursive_idx()].page();
-    share_and_copy(&entries[root..root + epp], &mut dst[..epp], parent_phys, user_count);
+    share_and_copy(&mut dst[..epp], parent_phys, user_count);
 
     // Eagerly deshare all user PD/PDPT entries so that COW enforcement
     // is pushed down to leaf PTEs.  This avoids cascading COW (where a
@@ -1235,35 +1241,26 @@ fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
 
 /// Build a COW copy of a page table page.
 ///
-/// Copies `src` entries into `dst`, marking user entries (`0..user_count`)
-/// R/O in the child copy. Then temp-maps the parent physical page at
-/// `parent_phys` to mark the parent's user entries R/O and increment
-/// their ref counts. (Writing through the recursive view is unsafe —
-/// ancestor entries may be R/O.)
-fn share_and_copy<E: Entry>(src: &[E], dst: &mut [E], parent_phys: u64, user_count: usize) {
+/// Temp-maps the parent physical page, copies its entries into `dst`
+/// with user entries (`0..user_count`) marked R/O, marks the parent's
+/// user entries R/O, and increments their ref counts.
+///
+/// `dst` must NOT be backed by temp_map (it would be clobbered).
+fn share_and_copy<E: Entry>(dst: &mut [E], parent_phys: u64, user_count: usize) {
     use crate::arch::phys_mm;
 
-    let epp = src.len();
-    debug_assert_eq!(epp, dst.len());
-
-    // Copy entries to dst, marking user entries R/O in child.
-    for i in 0..epp {
-        let mut e = src[i];
-        if e.present() && i < user_count && e.raw() & flags::CACHE_DISABLE == 0 {
-            e.set_hw_writable(false);
-        }
-        dst[i] = e;
-    }
-
-    // Mark parent user entries R/O and inc ref counts via temp_map.
+    let epp = dst.len();
     temp_map(parent_phys);
     unsafe {
         let parent = temp_map_vaddr() as *mut E;
-        for i in 0..user_count {
-            if (*parent.add(i)).present() && (*parent.add(i)).raw() & flags::CACHE_DISABLE == 0 {
+        for i in 0..epp {
+            let mut e = *parent.add(i);
+            if e.present() && i < user_count && e.raw() & flags::CACHE_DISABLE == 0 {
+                e.set_hw_writable(false);
                 (*parent.add(i)).set_hw_writable(false);
                 phys_mm::inc_shared_count((*parent.add(i)).page());
             }
+            dst[i] = e;
         }
     }
     temp_unmap();
@@ -1297,13 +1294,15 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
         debug_assert!(child_base + epp <= NUM_PAGES,
             "cow_entry: idx {:#x} is not a non-leaf recursive entry", idx);
+        let dst = unsafe {
+            let buf = &raw mut COW_BUF;
+            core::slice::from_raw_parts_mut(buf as *mut E, epp)
+        };
+        share_and_copy(dst, old_phys, epp);
         let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
-        // temp_map new page as dst. share_and_copy's second loop will
-        // re-temp_map old_phys (clobbering dst), but all dst writes
-        // happen in the first loop before that.
         temp_map(p);
-        let dst = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
-        share_and_copy(&entries[child_base..child_base + epp], dst, old_phys, epp);
+        unsafe { core::ptr::copy_nonoverlapping(
+            &raw const COW_BUF as *const u8, temp_map_vaddr() as *mut u8, PAGE_SIZE); }
         temp_unmap();
         p
     } else {
