@@ -57,9 +57,6 @@ pub struct MultibootInfo {
 static ZERO_PAGE: RawPage = unsafe { core::mem::zeroed() };
 static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
 
-/// Kernel pages - statically allocated page tables
-static mut KERNEL_PAGES: KernelPages = unsafe { core::mem::zeroed() };
-
 #[repr(C, align(16))]
 pub struct AlignedStack<const N: usize>(pub [u8; N]);
 

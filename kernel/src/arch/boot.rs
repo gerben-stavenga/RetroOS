@@ -38,7 +38,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
     // Enable paging (auto-detects Legacy vs PAE)
     // With offset segments, linked pointers work directly — no delta adjustment needed
     paging2::enable_paging(
-        &raw mut crate::KERNEL_PAGES,
         &raw mut crate::SCRATCH,
         KERNEL_PHYS,
         kernel_pages,

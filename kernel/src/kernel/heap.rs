@@ -83,7 +83,7 @@ impl AllocatorInner {
         let pages_needed = (min_size + PAGE_SIZE - 1) / PAGE_SIZE;
         let pages_needed = pages_needed.max(4); // Allocate at least 4 pages at a time
 
-        let mut region_start = self.mapped_end;
+        let region_start = self.mapped_end;
         let mut region_pages = 0;
 
         while region_pages < pages_needed {

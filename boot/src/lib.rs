@@ -7,7 +7,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use lib::{elf::Elf, md5, print, println, tar::TarHeader, vga};
+use lib::{elf::Elf, md5, println, tar::TarHeader, vga};
 
 /// Low memory buffer for BIOS disk reads (must be below 640KB)
 /// Placed at 320KB to avoid bootloader which is at 0x7C00-~0x40000

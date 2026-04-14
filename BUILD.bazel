@@ -54,6 +54,11 @@ _BASE_FILES = {
     "apps/dn/DN.XRN": "DN/DN.XRN",
     "apps/dn/DN.FLG": "DN/DN.FLG",
     "apps/dn/DN.HIS": "DN/DN.HIS",
+    "apps/DOOMS/DOOM.EXE": "DOOM/DOOM.EXE",
+    "apps/DOOMS/DOOM1.WAD": "DOOM/DOOM1.WAD",
+    "apps/quake/QUAKE.EXE": "QUAKE/QUAKE.EXE",
+    "apps/quake/CWSDPMI.EXE": "QUAKE/CWSDPMI.EXE",
+    "apps/quake/id1/PAK0.PAK": "QUAKE/ID1/PAK0.PAK",
     "apps/linux_test/hello_linux": "HI",
     "apps/hello64_linux/hello64_linux": "HI64",
 }

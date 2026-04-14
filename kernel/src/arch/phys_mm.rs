@@ -123,36 +123,20 @@ pub fn alloc_phys_page() -> Option<u64> {
     }
 }
 
-/// Poison pattern written to freed pages for use-after-free detection
-pub const POISON: u32 = 0xDEAD_BA6E;
-
 /// Free a physical page (decrement reference count)
 /// Returns true if the page is now free
-pub fn free_phys_page(page: u64) -> bool {
-    if is_zero_page(page) { return false; }
-    if page as usize >= MAX_PAGES {
-        return false;
-    }
+pub fn free_phys_page(page: u64) {
+    assert!((page as usize) < MAX_PAGES , "invalid page to free: {:#x}", page);
 
+    if is_zero_page(page) { return; }
     unsafe {
         let count = PAGE_REFS[page as usize];
-        if count == 0 || count == RESERVED {
-            return false;
+        assert!(count > 0, "double free or invalid page: {:#x}", page);
+        if count == RESERVED {
+            return;
         }
-
-        PAGE_REFS[page as usize] = count - 1;
-        if count - 1 == 0 {
-            // Poison the freed page for use-after-free detection
-            crate::arch::paging2::temp_map(page);
-            let ptr = crate::arch::paging2::temp_map_vaddr() as *mut u32;
-            for i in 0..crate::arch::paging2::PAGE_SIZE / 4 {
-                *ptr.add(i) = POISON;
-            }
-            crate::arch::paging2::temp_unmap();
-            true
-        } else {
-            false
-        }
+        let count = count - 1;
+        PAGE_REFS[page as usize] = count;
     }
 }
 

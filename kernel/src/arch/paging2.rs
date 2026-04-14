@@ -443,9 +443,7 @@ pub struct PaePages {
 }
 
 /// Kernel page tables (3 pages for PAE, 2 for legacy)
-pub struct KernelPages {
-    pages: [RawPage; 3]
-}
+pub struct KernelPages([RawPage; 3]);
 
 impl KernelPages {
     pub fn legacy(&mut self) -> &mut LegacyPages {
@@ -458,6 +456,9 @@ impl KernelPages {
         }
     }
 }
+
+/// Kernel pages - statically allocated page tables
+static mut KERNEL_PAGES: KernelPages = KernelPages([const { RawPage([0; PAGE_SIZE]) }; 3]);
 
 /// PML4 for long mode - shared with PAE via PML4[0] = PDPT
 static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
@@ -979,7 +980,9 @@ fn boot_phys_addr(page: &RawPage) -> u64 {
 ///   PT[0-511]: PML4 region (0xC0800000-0xC09FFFFF)
 ///   PT[512-767]: low mem (0xC0A00000-0xC0AFFFFF)
 ///   PT[768-1023]: kernel (0xC0B00000-0xC0BFFFFF)
-pub fn enable_legacy(kpages: &mut LegacyPages, scratch: &mut PageTable32, kernel_phys: usize, kernel_pages: usize) {
+pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages: usize) {
+    #[allow(static_mut_refs)]
+    let kpages = unsafe { KERNEL_PAGES.legacy() };
     // Identity map first 4MB (1024 pages) using scratch page
     for i in 0..1024 {
         scratch[i] = Entry32::new(i as u64, true, false);
@@ -1030,7 +1033,9 @@ pub fn enable_legacy(kpages: &mut LegacyPages, scratch: &mut PageTable32, kernel
 /// PDPT[5] = pt_kernel (0xC0A00000-0xC0BFFFFF, low mem + kernel)
 /// Assumes kernel < 1MB (same as legacy mode)
 ///
-pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: usize) {
+pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: usize) {
+    #[allow(static_mut_refs)]
+    let kpages = unsafe { KERNEL_PAGES.pae() };
     // Identity map using scratch as PD: scratch[0] = scratch (self-ref PT for 0-2MB),
     // scratch[1] = pt_pml4 (PT for 2-4MB, temporarily borrowed)
     scratch[0] = Entry64::new(boot_phys_page(&scratch.0), true, false);
@@ -1080,14 +1085,14 @@ pub fn enable_pae(kpages: &mut PaePages, scratch: &mut PageTable64, kernel_phys:
 
 /// Enable paging with auto-detected mode
 /// scratch is used for identity mapping (temporary, can be reused after remove_identity_mapping)
-pub fn enable_paging(kpages: *mut KernelPages, scratch: *mut RawPage, kernel_phys: usize, kernel_pages: usize) {
+pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: usize) {
     // Note: physical_page() not available until page tables are set up
     if !cpu_supports_pae() {
         let scratch32 = unsafe { &mut *(scratch as *mut PageTable32) };
-        enable_legacy(unsafe { (*kpages).legacy() }, scratch32, kernel_phys, kernel_pages);
+        enable_legacy(scratch32, kernel_phys, kernel_pages);
     } else {
         let scratch64 = unsafe { &mut *(scratch as *mut PageTable64) };
-        enable_pae(unsafe { (*kpages).pae() }, scratch64, kernel_phys, kernel_pages);
+        enable_pae(scratch64, kernel_phys, kernel_pages);
     }
 }
 
@@ -1103,8 +1108,8 @@ struct TempPage([u8; PAGE_SIZE]);
 static mut TEMP_PAGE: TempPage = TempPage([0; PAGE_SIZE]);
 
 /// Temp mapping virtual address.
-pub fn temp_map_vaddr() -> usize {
-    unsafe { &raw const TEMP_PAGE as usize }
+fn temp_map_vaddr() -> usize {
+    &raw const TEMP_PAGE as usize
 }
 
 /// Map a physical page at the temp mapping address.
@@ -1544,9 +1549,16 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
 /// When enabled: virtual 0x100000-0x10FFFF → the thread's saved HMA mappings.
 /// Copy page table entries from src range to dst range.
 pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
+    use crate::arch::phys_mm;
     match entries() {
-        Entries::E32(e) => { for i in 0..count { e[dst_vpage + i] = e[src_vpage + i]; } }
-        Entries::E64(e) => { for i in 0..count { e[dst_vpage + i] = e[src_vpage + i]; } }
+        Entries::E32(e) => { for i in 0..count {
+            e[dst_vpage + i] = e[src_vpage + i];
+            if e[src_vpage + i].present() { phys_mm::inc_shared_count(e[src_vpage + i].page()); }
+        }}
+        Entries::E64(e) => { for i in 0..count {
+            e[dst_vpage + i] = e[src_vpage + i];
+            if e[src_vpage + i].present() { phys_mm::inc_shared_count(e[src_vpage + i].page()); }
+        }}
     }
     flush_tlb();
 }

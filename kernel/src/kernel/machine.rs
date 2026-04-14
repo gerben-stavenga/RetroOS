@@ -1077,7 +1077,6 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
 /// (see `reflect_interrupt` for VM86 or `dpmi::deliver_hw_irq` for PM).
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
-    let is_pm = regs.mode() != crate::UserMode::VM86;
     if !vif {
         if pc.vpic.has_pending() {
             regs.frame.rflags |= 1u64 << 20; // VIP
