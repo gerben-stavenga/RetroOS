@@ -248,41 +248,6 @@ impl RootPageTable {
         }
     }
 
-    /// Initialize for a forked child.
-    /// Copies user entries from the forked root page (via temp_map)
-    /// and sets CR3.
-    pub fn init_fork(&mut self, new_root_phys: u64) {
-        match cpu_mode() {
-            CpuMode::Legacy => {
-                let user_count = recursive_idx() - root_base();
-                let old = temp_swap(new_root_phys);
-                unsafe {
-                    let src = temp_map_vaddr() as *const Entry32;
-                    for i in 0..user_count {
-                        self.e32[i] = *src.add(i);
-                    }
-                }
-                let _ = temp_swap(old);
-            }
-            CpuMode::Pae | CpuMode::Compat => {
-                let user_count = recursive_idx() - root_base();
-                let old = temp_swap(new_root_phys);
-                unsafe {
-                    let src = temp_map_vaddr() as *const Entry64;
-                    for i in 0..user_count {
-                        self.e64[i] = *src.add(i);
-                    }
-                    // (init_fork debug removed)
-                }
-                let _ = temp_swap(old);
-                // Read PML4 phys from live constant root (not parent's saved root which may be empty)
-                if let Entries::E64(e) = entries() {
-                    let pml4_page = e[root_base() + 4].page();
-                    unsafe { self.e64[3] = Entry64(pml4_page * PAGE_SIZE as u64); }
-                }
-            }
-        }
-    }
 }
 
 // =============================================================================
@@ -1277,11 +1242,10 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
         entries[idx] = E::new(p, true, user);
         invalidate_tlb();
-        let old = temp_swap(old_phys);
+        let saved = temp_swap(old_phys);
         let src = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
         share_and_copy(src, &mut entries[child_base..child_base + epp]);
-        let _ = temp_swap(old);
-        phys_mm::free_phys_page(old_phys);
+        phys_mm::free_phys_page(temp_swap(saved));
         return;
     } else {
         // Leaf: copy old page content into a new physical page.
@@ -1289,23 +1253,22 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         if idx == 0 {
             // Page 0: can't read from VA 0 (null ptr). Copy via temp_map.
             let mut buf = alloc::vec![0u8; PAGE_SIZE];
-            let old = temp_swap(old_phys);
+            let saved = temp_swap(old_phys);
             unsafe { core::ptr::copy_nonoverlapping(
                 temp_map_vaddr() as *const u8, buf.as_mut_ptr(), PAGE_SIZE); }
             let _ = temp_swap(p);
             unsafe { core::ptr::copy_nonoverlapping(
                 buf.as_ptr(), temp_map_vaddr() as *mut u8, PAGE_SIZE); }
-            let _ = temp_swap(old);
+            temp_swap(saved)
         } else {
             // Other pages: read directly from user VA
-            let old = temp_swap(p);
+            let saved = temp_swap(p);
             unsafe {
                 let src = (idx * PAGE_SIZE) as *const u8;
                 core::ptr::copy_nonoverlapping(src, temp_map_vaddr() as *mut u8, PAGE_SIZE);
             }
-            let _ = temp_swap(old);
+            temp_swap(saved)
         }
-        p
     };
 
     let user = entries[idx].user();
@@ -1425,8 +1388,7 @@ pub fn map_low_mem_user() {
 fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     // Page 0 (BIOS IVT + BDA): allocate a private copy so each VM86 process
     // has its own IVT. Copy via temp mapping to avoid null pointer issues.
-    let page0_copy = crate::arch::phys_mm::alloc_phys_page().expect("alloc page 0 copy");
-    let old = temp_swap(0); // map physical page 0 at temp VA
+    let saved = temp_swap(0); // map physical page 0 at temp VA
     let mut buf = [0u8; PAGE_SIZE];
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -1435,7 +1397,7 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
             PAGE_SIZE,
         );
     }
-    let _ = temp_swap(page0_copy); // map fresh page at temp VA
+    let _ = temp_swap(crate::arch::phys_mm::alloc_phys_page().expect("alloc page 0 copy"));
     unsafe {
         core::ptr::copy_nonoverlapping(
             buf.as_ptr(),
@@ -1443,8 +1405,7 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
             PAGE_SIZE,
         );
     }
-    let _ = temp_swap(old);
-    entries[0] = E::new(page0_copy, true, true);
+    entries[0] = E::new(temp_swap(saved), true, true);
 
     // Pages 1-0x9F: conventional memory — left unmapped (demand-paged zero)
     // Each process gets private zeroed pages on first access.
@@ -1496,14 +1457,13 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
 #[allow(dead_code)]
 pub fn map_user_page(page_idx: usize, data: &[u8]) {
     assert!(data.len() <= PAGE_SIZE);
-    let phys = crate::arch::phys_mm::alloc_phys_page().expect("alloc user page");
-    let old = temp_swap(phys);
+    let saved = temp_swap(crate::arch::phys_mm::alloc_phys_page().expect("alloc user page"));
     unsafe {
         let dst = temp_map_vaddr() as *mut u8;
         core::ptr::write_bytes(dst, 0, PAGE_SIZE);
         core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
-    let _ = temp_swap(old);
+    let phys = temp_swap(saved);
     match entries() {
         Entries::E32(e) => { e[page_idx] = Entry32::new(phys, true, true); }
         Entries::E64(e) => { e[page_idx] = Entry64::new(phys, true, true); }
