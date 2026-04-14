@@ -51,7 +51,7 @@
 //! ```
 //!
 //! - CR3 = PD phys (constant)
-//! - Fork: share_and_copy(PD). Auto-patches PD[768]→self. Done.
+//! - Fork: share_and_copy(PD). Done.
 //!
 //! ## Compat mode (x86-64, 4-level, 32-bit kernel in compatibility mode)
 //!
@@ -67,8 +67,7 @@
 //! ```
 //!
 //! - CR3 = PML4 phys (constant, unless 64-bit process deshares PML4)
-//! - Fork: share_and_copy(PDPT). Auto-patches PDPT[3]→self.
-//!   Shares PDPT[0..2] (user PDs) and PDPT[4] (PML4). Done.
+//! - Fork: share_and_copy(PDPT). Shares PDPT[0..2] (user PDs). Done.
 //!
 //! ## PAE mode (pre-x86-64, 3-level)
 //!
@@ -84,7 +83,7 @@
 //! ## Fork (all modes)
 //!
 //! share_and_copy the root (PD for legacy, PDPT for PAE/compat).
-//! Self-referential entries are auto-patched. PAE deshares [0..2].
+//! PAE deshares [0..2].
 
 use core::ops::{Index, IndexMut};
 
@@ -1181,13 +1180,19 @@ pub fn fork_current() -> Option<u64> {
 /// Fork the current address space (COW).
 ///
 /// All modes: share_and_copy the root (PD for legacy, PDPT for PAE/compat).
-/// Self-referential entries are auto-patched by share_and_copy.
+/// Caller allocates the new root and passes it to share_and_copy via temp_map.
 /// PAE only: deshare user entries [0..recursive) because PAE hardware
 /// ignores R/W on PDPT entries.
 ///
 /// Returns the new root's physical page number.
 fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
-    let new_root = share_and_copy(entries, recursive_idx())?;
+    use crate::arch::phys_mm;
+    let epp = entries_per_page::<E>();
+    let new_root = phys_mm::alloc_phys_page()?;
+    temp_map(new_root);
+    let dst = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
+    share_and_copy(entries, recursive_idx(), dst);
+    temp_unmap();
 
     // Eagerly deshare all user PD/PDPT entries so that COW enforcement
     // is pushed down to leaf PTEs.  This avoids cascading COW (where a
@@ -1215,10 +1220,11 @@ fn fork_generic<E: Entry>(entries: &mut [E]) -> Option<u64> {
 // COW fault handling
 // =============================================================================
 
-/// Copy a page table page and mark children as shared R/O in both copies.
-/// All writes go through temp_map to avoid faulting on the self-mapped entries.
-/// Returns the new page's physical page number.
-fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
+/// Build a COW copy of a page table page into `dst`.
+/// Reads parent entries from the recursive view, writes the child copy
+/// into `dst` with user entries marked R/O. Also marks the parent's
+/// user entries R/O and increments their ref counts.
+fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize, dst: &mut [E]) {
     use crate::arch::phys_mm;
 
     debug_assert!(idx >= PAGE_TABLE_BASE_IDX,
@@ -1231,62 +1237,35 @@ fn share_and_copy<E: Entry>(entries: &mut [E], idx: usize) -> Option<u64> {
         "share_and_copy: idx {:#x} children {:#x}..{:#x} > NUM_PAGES {:#x}",
         idx, child_base, child_base + epp, NUM_PAGES);
 
-    // Get physical page of the parent page table (the one that entries[child_base..] maps)
-    let parent_phys = entries[idx].page();
-
-    // Allocate new page for child copy
-    let new_phys = phys_mm::alloc_phys_page()?;
-
     // For the root page table, only mark user entries R/O (below recursive entry).
     // Kernel entries stay writable — shared between all processes.
-    // For non-root page tables, all entries are user.
     let user_count = if idx == recursive_idx() {
         recursive_idx() - child_base
     } else {
         epp
     };
 
-    // Copy parent -> child via temp_map, marking user entries R/O.
-    // Self-referential entries (e.g. PDPT[3] recursive) are patched
-    // to point to the new copy.
-    temp_map(new_phys);
-    unsafe {
-        let dst = temp_map_vaddr() as *mut E;
-        for i in 0..epp {
-            let mut e = entries[child_base + i];
-            if e.present() {
-                // Cache-disabled pages are MMIO (e.g. VGA framebuffer) — share
-                // directly with hardware, never COW them into private copies.
-                let is_mmio = e.raw() & flags::CACHE_DISABLE != 0;
-                if i < user_count && !is_mmio {
-                    e.set_hw_writable(false);
-                }
-                if e.page() == parent_phys {
-                    // Self-referential → point to new copy
-                    e = E::new(new_phys, true, false);
-                }
-            }
-            *dst.add(i) = e;
-        }
-    }
-    temp_unmap();
-
-    // Mark parent user entries R/O and inc ref counts via temp_map
-    temp_map(parent_phys);
-    unsafe {
-        let src = temp_map_vaddr() as *mut E;
-        for i in 0..user_count {
-            let e = &mut *src.add(i);
-            if e.present() && e.raw() & flags::CACHE_DISABLE == 0 {
+    // Build child copy, marking user entries R/O.
+    for i in 0..epp {
+        let mut e = entries[child_base + i];
+        if e.present() {
+            let is_mmio = e.raw() & flags::CACHE_DISABLE != 0;
+            if i < user_count && !is_mmio {
                 e.set_hw_writable(false);
-                phys_mm::inc_shared_count(e.page());
             }
         }
+        dst[i] = e;
     }
-    temp_unmap();
+
+    // Mark parent user entries R/O and inc ref counts (via recursive view).
+    for i in 0..user_count {
+        if entries[child_base + i].present() && entries[child_base + i].raw() & flags::CACHE_DISABLE == 0 {
+            entries[child_base + i].set_hw_writable(false);
+            phys_mm::inc_shared_count(entries[child_base + i].page());
+        }
+    }
 
     invalidate_tlb();
-    Some(new_phys)
 }
 
 /// COW a single entry (leaf data page or page table).
@@ -1315,7 +1294,12 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
         debug_assert!(child_base + epp <= NUM_PAGES,
             "cow_entry: idx {:#x} is not a non-leaf recursive entry", idx);
-        share_and_copy(entries, idx).expect("Out of memory during COW")
+        let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
+        temp_map(p);
+        let dst = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
+        share_and_copy(entries, idx, dst);
+        temp_unmap();
+        p
     } else {
         // Leaf: copy old page content into a new physical page.
         let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
