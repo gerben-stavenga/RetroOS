@@ -1064,24 +1064,15 @@ pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: us
 // Temporary mapping for fork operations
 // =============================================================================
 
-/// Page-aligned BSS buffer whose virtual address is the temp mapping slot.
-/// We never use the buffer itself — we repurpose its PTE to map arbitrary
-/// physical pages. Being in BSS means the heap never needs to skip it.
-#[repr(C, align(4096))]
-struct TempPage([u8; PAGE_SIZE]);
-static mut TEMP_PAGE: TempPage = TempPage([0; PAGE_SIZE]);
-
-
-/// Temp mapping virtual address.
-fn temp_map_vaddr() -> usize {
-    &raw const TEMP_PAGE as usize
-}
+/// Page-aligned BSS page whose PTE is repurposed to map arbitrary physical
+/// pages. Callers access it via `&mut TEMP_PAGE` after temp_swap.
+static mut TEMP_PAGE: RawPage = RawPage([0; PAGE_SIZE]);
 
 /// Map a physical page at the temp mapping address. Returns the page
 /// that was previously mapped (pass back to restore).
 #[must_use]
 pub fn temp_swap(page: u64) -> u64 {
-    let vpage = temp_map_vaddr() / PAGE_SIZE;
+    let vpage = (&raw const TEMP_PAGE as usize) / PAGE_SIZE;
     let old_page = unsafe {
         if is_pae() {
             let entries = PAGE_TABLE_BASE as *mut Entry64;
@@ -1097,6 +1088,13 @@ pub fn temp_swap(page: u64) -> u64 {
     };
     invalidate_tlb();
     old_page
+}
+
+/// Allocate a fresh physical page and map it at the temp VA.
+/// Returns the saved page (pass to temp_swap to restore and get the new page back).
+#[must_use]
+fn fresh_temp_page() -> u64 {
+    temp_swap(crate::arch::phys_mm::alloc_phys_page().expect("out of memory"))
 }
 
 /// Get entries per page for an Entry type
@@ -1243,29 +1241,28 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         entries[idx] = E::new(p, true, user);
         invalidate_tlb();
         let saved = temp_swap(old_phys);
-        let src = unsafe { core::slice::from_raw_parts_mut(temp_map_vaddr() as *mut E, epp) };
+        let src = unsafe { core::slice::from_raw_parts_mut((*&raw mut TEMP_PAGE).0.as_mut_ptr() as *mut E, epp) };
         share_and_copy(src, &mut entries[child_base..child_base + epp]);
         phys_mm::free_phys_page(temp_swap(saved));
         return;
     } else {
         // Leaf: copy old page content into a new physical page.
-        let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
         if idx == 0 {
             // Page 0: can't read from VA 0 (null ptr). Copy via temp_map.
-            let mut buf = alloc::vec![0u8; PAGE_SIZE];
+            let scratch = &raw mut crate::SCRATCH;
             let saved = temp_swap(old_phys);
             unsafe { core::ptr::copy_nonoverlapping(
-                temp_map_vaddr() as *const u8, buf.as_mut_ptr(), PAGE_SIZE); }
-            let _ = temp_swap(p);
+                (*&raw const TEMP_PAGE).0.as_ptr(), (*scratch).0.as_mut_ptr(), PAGE_SIZE); }
+            let _ = fresh_temp_page();
             unsafe { core::ptr::copy_nonoverlapping(
-                buf.as_ptr(), temp_map_vaddr() as *mut u8, PAGE_SIZE); }
+                (*scratch).0.as_ptr(), (*&raw mut TEMP_PAGE).0.as_mut_ptr(), PAGE_SIZE); }
             temp_swap(saved)
         } else {
             // Other pages: read directly from user VA
-            let saved = temp_swap(p);
+            let saved = fresh_temp_page();
             unsafe {
                 let src = (idx * PAGE_SIZE) as *const u8;
-                core::ptr::copy_nonoverlapping(src, temp_map_vaddr() as *mut u8, PAGE_SIZE);
+                core::ptr::copy_nonoverlapping(src, (*&raw mut TEMP_PAGE).0.as_mut_ptr(), PAGE_SIZE);
             }
             temp_swap(saved)
         }
@@ -1392,16 +1389,16 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     let mut buf = [0u8; PAGE_SIZE];
     unsafe {
         core::ptr::copy_nonoverlapping(
-            temp_map_vaddr() as *const u8,
+            (*&raw const TEMP_PAGE).0.as_ptr(),
             buf.as_mut_ptr(),
             PAGE_SIZE,
         );
     }
-    let _ = temp_swap(crate::arch::phys_mm::alloc_phys_page().expect("alloc page 0 copy"));
+    let _ = fresh_temp_page();
     unsafe {
         core::ptr::copy_nonoverlapping(
             buf.as_ptr(),
-            temp_map_vaddr() as *mut u8,
+            (*&raw mut TEMP_PAGE).0.as_mut_ptr(),
             PAGE_SIZE,
         );
     }
@@ -1457,9 +1454,9 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
 #[allow(dead_code)]
 pub fn map_user_page(page_idx: usize, data: &[u8]) {
     assert!(data.len() <= PAGE_SIZE);
-    let saved = temp_swap(crate::arch::phys_mm::alloc_phys_page().expect("alloc user page"));
+    let saved = fresh_temp_page();
     unsafe {
-        let dst = temp_map_vaddr() as *mut u8;
+        let dst = (*&raw mut TEMP_PAGE).0.as_mut_ptr();
         core::ptr::write_bytes(dst, 0, PAGE_SIZE);
         core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
