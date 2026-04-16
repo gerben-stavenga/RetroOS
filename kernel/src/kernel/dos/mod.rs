@@ -21,9 +21,21 @@
 //! work transparently because their I/O instructions trap through the TSS IOPB
 //! to our virtual devices in the `machine` module.
 
-pub mod dpmi;
-
 extern crate alloc;
+
+/// Trace DOS/DPMI calls when enabled.
+pub(crate) const DOS_TRACE: bool = true;
+
+macro_rules! dos_trace {
+    ($($arg:tt)*) => {
+        if $crate::kernel::dos::DOS_TRACE {
+            $crate::dbg_println!($($arg)*);
+        }
+    };
+}
+pub(crate) use dos_trace;
+
+pub mod dpmi;
 
 use crate::kernel::thread;
 use crate::kernel::machine::{
@@ -544,20 +556,8 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
-        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
-        | SLOT_HW_IRQ0 | SLOT_HW_IRQ_RET)
+        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
-
-    // IVT-redirect stubs: the original INT pushed FLAGS/CS/IP on the VM86 stack.
-    // Restore IF from those saved FLAGS (IF is the virtual interrupt flag).
-    if !is_far_call {
-        let saved_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
-        if saved_flags as u32 & IF_FLAG != 0 {
-            regs.set_flag32(IF_FLAG);
-        } else {
-            regs.clear_flag32(IF_FLAG);
-        }
-    }
 
     let action = match slot {
         SLOT_XMS => xms_dispatch(dos, regs),
@@ -573,43 +573,44 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             dpmi::raw_switch_real_to_pm(dos, regs);
             thread::KernelAction::Done
         }
-        s if s >= SLOT_CB_ENTRY_BASE && s < SLOT_CB_ENTRY_END => {
-            let cb_idx = (s - SLOT_CB_ENTRY_BASE) as usize;
+        SLOT_CB_ENTRY_BASE..SLOT_CB_ENTRY_END => {
+            let cb_idx = (slot - SLOT_CB_ENTRY_BASE) as usize;
             dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
         }
-        SLOT_HW_IRQ0 => {
-            // Hardware IRQ0 (timer): chain to BIOS on private stack.
+        SLOT_HW_IRQ_BASE..SLOT_HW_IRQ_END => {
+            // Hardware IRQ N: chain to BIOS handler on private stack.
             // Reflect frame (FLAGS/CS/IP) stays on current stack — BIOS IRET pops it.
-            hw_irq_reflect(dos, regs);
+            hw_irq_reflect(dos, regs, slot - SLOT_HW_IRQ_BASE);
             return thread::KernelAction::Done;
         }
         0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F | 0x67 => {
+            // Restore caller FLAGS into regs so handlers may mutate them
+            // (CF/ZF returns); then write back so normal IRET-style pop
+            // restores the handler's result to the caller.
+            let caller_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
+            crate::kernel::machine::set_vm86_flags(regs, caller_flags as u32);
             let action = dispatch_kernel_syscall(kt, dos, regs, slot);
             // exec_return / Exit replace thread state — skip the VM86 frame pop below.
             if !matches!(action, thread::KernelAction::Done) {
                 return action;
             }
+            write_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4),
+                      crate::kernel::machine::vm86_flags(regs) as u16);
             action
         }
         SLOT_HW_IRQ_RET => {
-            // BIOS handler IRET'd to trampoline. Restore original SS:SP,
-            // pop the reflect frame, and restore flags (IRQs must not
-            // clobber the interrupted code's flags).
+            // BIOS handler IRET'd to trampoline. Restore original SS:SP;
+            // the common pop below IRETs the reflect frame back to the
+            // interrupted code (including its flags).
             let (ss, sp) = dos.pc.irq_saved_sssp.take().expect("HW_IRQ_RET without saved SS:SP");
             crate::kernel::machine::set_vm86_ss(regs, ss);
             crate::kernel::machine::set_vm86_sp(regs, sp);
-            let ret_ip = vm86_pop(regs);
-            let ret_cs = vm86_pop(regs);
-            let ret_flags = vm86_pop(regs);
-            set_vm86_ip(regs, ret_ip);
-            set_vm86_cs(regs, ret_cs);
-            crate::kernel::machine::set_vm86_flags(regs, ret_flags as u32);
-            return thread::KernelAction::Done;
+            thread::KernelAction::Done
         }
         SLOT_SAVE_RESTORE => thread::KernelAction::Done, // no-op far call (buffer size=0)
         _ => {
-            panic!("VM86: INT 31h from unknown stub slot {:#04x} IP={:#06x}", slot, ip);
+            panic!("VM86: INT 31h unknown stub slot {:#04x} CS:IP={:04x}:{:#06x}", slot, cs, ip);
         }
     };
 
@@ -620,9 +621,10 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
     if !is_far_call {
         let ret_ip = vm86_pop(regs);
         let ret_cs = vm86_pop(regs);
-        let _flags = vm86_pop(regs);
+        let ret_flags = vm86_pop(regs);
         set_vm86_ip(regs, ret_ip);
         set_vm86_cs(regs, ret_cs);
+        crate::kernel::machine::set_vm86_flags(regs, ret_flags as u32);
     } else if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
         // Returns to caller — pop far-call return address
         let ret_ip = vm86_pop(regs);
@@ -714,9 +716,15 @@ fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, reg
 /// Replaces the BIOS handler: increment BDA tick counter, call INT 1Ch.
 /// Handled in kernel to avoid BIOS handler's stack usage on the program's
 /// stack (which can corrupt tiny .COM stubs like LZEXE decompressors).
-/// Saved BIOS INT 08h vector (before we hook it with our stub).
-static mut BIOS_INT08_IP: u16 = 0;
-static mut BIOS_INT08_CS: u16 = 0;
+/// Saved BIOS IRQ handlers (before we hook the IVT). Indexed by IRQ number
+/// 0..15 (not interrupt vector). IRQ 0..7 = INT 0x08..0x0F, IRQ 8..15 =
+/// INT 0x70..0x77.
+static mut BIOS_HW_IRQ: [(u16, u16); 16] = [(0, 0); 16];
+
+/// Convert IRQ number (0..15) to its real-mode interrupt vector.
+fn irq_to_vector(irq: u8) -> u8 {
+    if irq < 8 { 0x08 + irq } else { 0x70 + (irq - 8) }
+}
 
 /// INT 08h — Timer tick (IRQ0).
 /// Switch to private IRQ stack, then chain to BIOS handler.
@@ -727,7 +735,7 @@ static mut BIOS_INT08_CS: u16 = 0;
 /// We switch to a private stack, push a trampoline, and jump to the
 /// saved BIOS handler.  BIOS IRETs to trampoline → SLOT_HW_IRQ_RET
 /// restores SS:SP → post-match pops the reflect frame → done.
-fn hw_irq_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
+fn hw_irq_reflect(dos: &mut thread::DosState, regs: &mut Regs, irq: u8) {
     if dos.pc.irq_saved_sssp.is_none() {
         // First hardware IRQ: switch to private stack, push trampoline.
         dos.pc.irq_saved_sssp = Some((vm86_ss(regs), vm86_sp(regs)));
@@ -739,8 +747,9 @@ fn hw_irq_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
         vm86_push(regs, slot_offset(SLOT_HW_IRQ_RET));
     }
     // Reflect frame (FLAGS/CS/IP) is on the current stack (original or IRQ).
-    set_vm86_ip(regs, unsafe { BIOS_INT08_IP });
-    set_vm86_cs(regs, unsafe { BIOS_INT08_CS });
+    let (bios_cs, bios_ip) = unsafe { BIOS_HW_IRQ[irq as usize] };
+    set_vm86_ip(regs, bios_ip);
+    set_vm86_cs(regs, bios_cs);
     regs.clear_flag32(IF_FLAG);
 }
 
@@ -819,7 +828,7 @@ fn dos_putchar(c: u8) {
 fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     if ah != 0x2C && ah != 0x2A {
-        crate::dbg_println!("D21 {:02X} AX={:04X} BX={:04X} cs:ip={:04X}:{:04X} heap={:04X} psp={:04X}",
+        dos_trace!("D21 {:02X} AX={:04X} BX={:04X} cs:ip={:04X}:{:04X} heap={:04X} psp={:04X}",
             ah, regs.rax as u16, regs.rbx as u16,
             regs.code_seg(), regs.ip32() as u16,
             dos.heap_seg, dos.current_psp);
@@ -971,8 +980,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=0x30: Get DOS version (return AL=major, AH=minor)
         0x30 => {
-            // Report DOS 3.30
-            regs.rax = (regs.rax & !0xFFFF) | 0x1E03; // AL=3 (major), AH=30 (minor)
+            // Report DOS 5.00 (DOS/32A and other extenders require >= 4.0)
+            regs.rax = (regs.rax & !0xFFFF) | 0x0005; // AL=5 (major), AH=0 (minor)
             regs.rbx = 0; // OEM serial
             regs.rcx = 0;
             thread::KernelAction::Done
@@ -1062,6 +1071,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let mut rbuf = [0u8; 164];
                 let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
                 let _name_str = core::str::from_utf8(resolved).unwrap_or("?");
+                dos_trace!("D21 3D open \"{}\"", _name_str);
                 let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
@@ -1114,6 +1124,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
                 let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
                 if n >= 0 {
+                    if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     regs.clear_flag32(1);
                 } else {
@@ -1371,6 +1382,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x43 => {
             let al = regs.rax as u8;
             let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
+            { let p = addr as *const u8; let mut hex = [0u8; 32];
+              for j in 0..16usize { let b = unsafe { *p.add(j) }; hex[j*2] = b"0123456789ABCDEF"[(b>>4) as usize]; hex[j*2+1] = b"0123456789ABCDEF"[(b&0xF) as usize]; }
+              dos_trace!("D21 43 addr={:08X} hex={}", addr, core::str::from_utf8(&hex).unwrap()); }
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
@@ -1757,7 +1771,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             thread::KernelAction::Done
         }
         _ => {
-            crate::dbg_println!("VM86: unhandled INT 21h AH={:#04x} AX={:04X}", ah, regs.rax as u16);
+            dos_trace!("VM86: unhandled INT 21h AH={:#04x} AX={:04X}", ah, regs.rax as u16);
             // Return "function not supported" (AX=1, carry set)
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.set_flag32(1);
@@ -1801,23 +1815,27 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
 // INT 2Fh — Multiplex interrupt (XMS + DPMI detection)
 // ============================================================================
 
+/// Fill regs with DPMI 0.90 installation-check reply (shared by INT 2F/1687h
+/// and DOS/32A's INT 21h AX=FF87h probe).
+fn dpmi_install_check(regs: &mut Regs) {
+    regs.rax = regs.rax & !0xFFFF; // AX=0: DPMI available
+    regs.rbx = (regs.rbx & !0xFFFF) | 0x0001; // BX bit0 = 32-bit supported
+    regs.rcx = (regs.rcx & !0xFF) | 0x03; // CL = 386
+    regs.rdx = (regs.rdx & !0xFFFF) | 0x005A; // DX = DPMI 0.90
+    regs.rsi = regs.rsi & !0xFFFF; // SI = 0 paragraphs needed
+    regs.es = STUB_SEG as u64;
+    regs.rdi = (regs.rdi & !0xFFFF) | slot_offset(SLOT_DPMI_ENTRY) as u64;
+}
+
 fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ax = regs.rax as u16;
+    dos_trace!("D2F {:04X} BX={:04X} CX={:04X} DX={:04X} cs:ip={:04X}:{:04X}",
+        ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+        regs.code_seg(), regs.ip32() as u16);
     match ax {
         // AX=1687h — DPMI installation check
         0x1687 => {
-            regs.rax = regs.rax & !0xFFFF; // AX=0: DPMI available
-            // BX = flags (bit 0 = 32-bit programs supported)
-            regs.rbx = (regs.rbx & !0xFFFF) | 0x0001;
-            // CL = processor type (3 = 386)
-            regs.rcx = (regs.rcx & !0xFF) | 0x03;
-            // DX = DPMI version (0.90)
-            regs.rdx = (regs.rdx & !0xFFFF) | 0x005A; // 0x00=major, 0x5A=90 decimal
-            // SI = paragraph count for DPMI host private data (0 = none needed)
-            regs.rsi = regs.rsi & !0xFFFF;
-            // ES:DI = entry point (far call to switch to protected mode)
-            regs.es = STUB_SEG as u64;
-            regs.rdi = (regs.rdi & !0xFFFF) | slot_offset(SLOT_DPMI_ENTRY) as u64;
+            dpmi_install_check(regs);
             thread::KernelAction::Done
         }
         // AX=4300h — XMS installation check
@@ -2095,7 +2113,7 @@ fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAc
             }
         }
         _ => {
-            dbg_println!("XMS: UNHANDLED AH={:02X}", ah);
+            dos_trace!("XMS: UNHANDLED AH={:02X}", ah);
             regs.rax = regs.rax & !0xFFFF; // failure
             regs.rbx = (regs.rbx & !0xFF) | 0x80; // not implemented
         }
@@ -3056,7 +3074,11 @@ pub(crate) const SLOT_CALLBACK_RET: u8 = 0x02;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
 pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
-pub(crate) const SLOT_HW_IRQ0: u8 = 0xFB;
+/// Slots SLOT_HW_IRQ_BASE + N are entered from a stub-hooked IVT for hardware
+/// IRQ N (0..15). INT 08h..0Fh and INT 70h..77h all funnel through here so
+/// their BIOS handlers run on a private IRQ stack, not the user's stack.
+pub(crate) const SLOT_HW_IRQ_BASE: u8 = 0xE0;
+pub(crate) const SLOT_HW_IRQ_END: u8 = 0xF0; // exclusive (16 IRQs)
 pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
@@ -3079,20 +3101,22 @@ pub fn setup_ivt() {
         }
     }
 
-    // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000)
-    // Save original BIOS INT 08h vector before we overwrite it.
-    // Our INT 08h handler chains to the BIOS via a private stack.
-    unsafe {
-        BIOS_INT08_IP = read_u16(0, 0x08 * 4);
-        BIOS_INT08_CS = read_u16(0, 0x08 * 4 + 2);
+    // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000).
+    // Save original BIOS HW IRQ vectors before we hook them — all 16 IRQs are
+    // routed through private-stack slots so their BIOS handlers never run on
+    // the user's (possibly tiny) stack.
+    for irq in 0u8..16 {
+        let vec = irq_to_vector(irq);
+        let ip = read_u16(0, (vec as u32) * 4);
+        let cs = read_u16(0, (vec as u32) * 4 + 2);
+        unsafe { BIOS_HW_IRQ[irq as usize] = (cs, ip); }
+        write_u16(0, (vec as u32) * 4, slot_offset(SLOT_HW_IRQ_BASE + irq));
+        write_u16(0, (vec as u32) * 4 + 2, STUB_SEG);
     }
     for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x67] {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
-    // INT 08h uses a dedicated slot outside the callback range.
-    write_u16(0, 0x08 * 4, slot_offset(SLOT_HW_IRQ0));
-    write_u16(0, 0x08 * 4 + 2, STUB_SEG);
 
     // Set up fake DOS internal structures (List of Lists + System File Table)
     // so that DJGPP's fstat (which uses INT 21h/52h → SFT) can find file info.

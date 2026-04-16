@@ -1,0 +1,14 @@
+exports_files(
+    [
+        "AUDIOHED.WL1",
+        "AUDIOT.WL1",
+        "GAMEMAPS.WL1",
+        "MAPHEAD.WL1",
+        "VGADICT.WL1",
+        "VGAGRAPH.WL1",
+        "VGAHEAD.WL1",
+        "VSWAP.WL1",
+        "WOLF3D.EXE",
+    ],
+    visibility = ["//visibility:public"],
+)

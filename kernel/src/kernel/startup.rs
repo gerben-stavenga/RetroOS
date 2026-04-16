@@ -80,17 +80,43 @@ pub fn startup() -> ! {
     let console_pipe = crate::kernel::kpipe::alloc().expect("Failed to allocate console pipe");
     crate::kernel::thread::set_console_pipe(console_pipe);
 
+    // Host may select a program via QEMU `-fw_cfg name=opt/cmdline,string=PATH`.
+    // If absent, run DN.COM in a loop (default interactive shell).
+    let mut cmdline_buf = [0u8; 256];
+    if let Some(raw) = fw_cfg_read(b"opt/cmdline", &mut cmdline_buf) {
+        let cmdline = trim_ascii(raw);
+        let mut path_buf = [0u8; 260];
+        let path: &[u8] = if has_ext4 {
+            let n = 4 + cmdline.len();
+            path_buf[..4].copy_from_slice(b"tar/");
+            path_buf[4..n].copy_from_slice(cmdline);
+            &path_buf[..n]
+        } else {
+            // cmdline borrows cmdline_buf; copy into path_buf so lifetimes line up
+            path_buf[..cmdline.len()].copy_from_slice(cmdline);
+            &path_buf[..cmdline.len()]
+        };
+        let cwd_end = path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
+        let cwd = &path[..cwd_end];
+        println!("Starting {}...", core::str::from_utf8(path).unwrap_or("?"));
+        run_dos_program(path, b"", cwd);
+        println!("Program exited.");
+        loop { core::hint::spin_loop(); }
+    }
+
     let dn_path: &[u8] = if has_ext4 { b"tar/DN/DN.COM" } else { b"DN/DN.COM" };
+    let dn_cwd: &[u8] = if has_ext4 { b"tar/" } else { b"" };
     loop {
         println!("Starting DN...");
-        run_dos_program(dn_path, b"");
+        run_dos_program(dn_path, b"", dn_cwd);
+        println!("DN exited.");
     }
 }
 
 /// Load a DOS program (.COM or MZ .EXE) into a fresh VM86 thread and run the
 /// event loop until it exits. `cmdline_tail` is written to PSP:0080h (without
 /// the length byte or terminator; those are added automatically).
-fn run_dos_program(path: &[u8], cmdline_tail: &[u8]) {
+fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
     use crate::kernel::{dos, exec};
 
     let buf = exec::load_file_resolved(path)
@@ -113,7 +139,12 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8]) {
     let dos_state = t.dos_mut();
     dos_state.heap_seg = end_seg;
     dos_state.dta = (dos::COM_SEGMENT as u32) * 16 + 0x80;
-    t.kernel.cwd_len = 0;
+    if !cwd.is_empty() {
+        t.kernel.cwd[..cwd.len()].copy_from_slice(cwd);
+        t.kernel.cwd_len = cwd.len();
+    } else {
+        t.kernel.cwd_len = 0;
+    }
 
     let psp_base = (dos::COM_SEGMENT as u32) << 4;
     let tail_len = cmdline_tail.len().min(126);
@@ -825,4 +856,56 @@ pub fn arch_free_user_pages() {
             in("eax") crate::arch::arch_call::CLEAN as u32,
         );
     }
+}
+
+// --- QEMU fw_cfg reader --------------------------------------------------
+// Lets the host select which program to run via:
+//   -fw_cfg name=opt/cmdline,string=PATH
+// Selector register is big-endian over the wire; data port is byte-stream.
+const FW_CFG_SEL: u16 = 0x510;
+const FW_CFG_DATA: u16 = 0x511;
+const FW_CFG_SIG: u16 = 0x0000;
+const FW_CFG_FILE_DIR: u16 = 0x0019;
+
+fn fw_cfg_select(sel: u16) {
+    crate::arch::outw(FW_CFG_SEL, sel);
+}
+
+fn fw_cfg_read_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() { *b = crate::arch::inb(FW_CFG_DATA); }
+}
+
+fn fw_cfg_present() -> bool {
+    fw_cfg_select(FW_CFG_SIG);
+    let mut sig = [0u8; 4];
+    fw_cfg_read_bytes(&mut sig);
+    &sig == b"QEMU"
+}
+
+fn fw_cfg_read<'a>(name: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    if !fw_cfg_present() { return None; }
+    fw_cfg_select(FW_CFG_FILE_DIR);
+    let mut count_be = [0u8; 4];
+    fw_cfg_read_bytes(&mut count_be);
+    let count = u32::from_be_bytes(count_be);
+    for _ in 0..count {
+        let mut entry = [0u8; 64];
+        fw_cfg_read_bytes(&mut entry);
+        let size = u32::from_be_bytes(entry[0..4].try_into().unwrap()) as usize;
+        let sel = u16::from_be_bytes(entry[4..6].try_into().unwrap());
+        let name_end = entry[8..].iter().position(|&c| c == 0).unwrap_or(56);
+        if &entry[8..8 + name_end] == name {
+            let n = size.min(buf.len());
+            fw_cfg_select(sel);
+            fw_cfg_read_bytes(&mut buf[..n]);
+            return Some(&buf[..n]);
+        }
+    }
+    None
+}
+
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&c| c > b' ').unwrap_or(s.len());
+    let end = s.iter().rposition(|&c| c > b' ').map_or(start, |i| i + 1);
+    &s[start..end]
 }
