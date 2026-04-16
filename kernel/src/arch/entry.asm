@@ -118,11 +118,39 @@ toggle_prot_compat:
 
     ret
 
+; =============================================================================
+; Mode-agnostic entry: int_vector + common_dispatch. Every instruction below
+; has the same encoding under 32-bit and 64-bit CS, so the same table serves
+; both IDT32 and IDT64. CS low byte distinguishes 0x08 vs 0x10.
+; =============================================================================
+
 ; -----------------------------------------------------------------------------
-; Shared dispatch entered from the unified vector table. Byte sequence is
-; mode-agnostic: same encoding under 32-bit and 64-bit CS, so both IDT32 and
-; IDT64 can point at `int_vector`. CS low byte distinguishes 0x08 vs 0x10.
+; Unified interrupt vector table.
+; Each entry is 8 bytes (aligned), pushes interrupt number and jumps to
+; common_dispatch. Vectors 0-127 push imm8 (positive, 2 bytes). Vectors
+; 128-255 push imm8 with negative value (sign-extended by CPU); handler
+; masks with & 0xFF.
 ; -----------------------------------------------------------------------------
+align 64
+global int_vector
+int_vector:
+%assign i 0
+%rep 256
+    align 8
+%if i >= 128
+    push i - 256
+%else
+    push i
+%endif
+    ; Exceptions that push an error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30
+%if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
+    jmp common_dispatch
+%else
+    jmp common_dispatch_no_err
+%endif
+%assign i (i + 1)
+%endrep
+
 common_dispatch_no_err:
     push dword [esp]        ; dup int_num as err_code slot
 common_dispatch:
@@ -132,6 +160,10 @@ common_dispatch:
     pop eax                 ; doesn't touch flags
     je entry_wrapper_64
     ; fall through to entry_wrapper_32
+
+; =============================================================================
+; 32-bit-only code: entry_wrapper_32, call_isr_handler, exit_interrupt_32
+; =============================================================================
 
 ; -----------------------------------------------------------------------------
 ; Common 32-bit interrupt entry — saves all registers as 64-bit values
@@ -168,9 +200,8 @@ entry_wrapper_32:
     push64_32 esi
     push64_32 edi
 
-    ; Push r8-r15 as zeros (not available in 32-bit mode)
-    times 8 push dword 0    ; r8 low
-    times 8 push dword 0    ; r8 high ... r15 high (8 registers * 8 bytes = 64 bytes total, but need 16 pushes)
+    ; Push r8-r15 as zeros (not available in 32-bit mode): 8 regs * 8 bytes
+    times 16 push dword 0
 
     ; Save segment registers (zero-extended to 64-bit)
     xor eax, eax
@@ -183,21 +214,49 @@ entry_wrapper_32:
     mov ax, gs
     push64_32 eax
 
-    ; Set all segments to kernel data selector
-    mov eax, 0x18           ; kernel data selector
+    ; Build 16-byte mock frame: [ebp, eip, 0, 0] — rip==0 signals 32-bit user
+    push dword 0
+    push dword 0
+    push dword [esp + 196 + 8]  ; user's eip (+8 for two pushes above)
+    push dword [esp + 112 + 12] ; user's ebp (+12 for three pushes above)
+    mov ebp, esp
+    ; fall through to call_isr_handler
+
+; -----------------------------------------------------------------------------
+; Common ISR dispatch — entered by fall-through from entry_wrapper_32 and via
+; far jmp from entry_wrapper_64. Computes FullRegs pointer from ESP and
+; dispatches exit based on current CPU mode (EFER.LMA).
+; Stack: [mock frame 16B] [Regs] [Frame] [VM86 segs]
+; -----------------------------------------------------------------------------
+call_isr_handler:
+    cld
+    ; Set kernel data selectors. SS *must* be reloaded before any push: on
+    ; the 64→32 path long-mode same-privilege interrupt clears SS. FS/GS on
+    ; the 64-bit path are inert — exit restores FS_BASE/GS_BASE MSRs.
+    mov eax, 0x18
+    mov ss, eax
     mov ds, eax
     mov es, eax
     mov fs, eax
     mov gs, eax
+    ; FullRegs lives directly above the 16-byte mock frame.
+    lea eax, [esp + 16]
+    push eax                ; cdecl arg: pointer to FullRegs
+    call isr_handler
+global isr_return
+isr_return:
+    add esp, 4              ; clean up arg
 
-    ; Build 16-byte mock frame: [ebp, eip, 0, 0] — rip==0 signals 32-bit user
-    mov eax, esp
-    push dword 0
-    push dword 0
-    push dword [eax + 196]      ; user's eip
-    push dword [eax + 112]      ; user's ebp
-    mov ebp, esp
-    jmp call_isr_handler
+    add esp, 16             ; clean up mock frame
+
+    ; Dispatch exit based on cpu-mode (EFER.LMA = long mode active)
+    mov ecx, 0xC0000080     ; EFER MSR
+    rdmsr
+    test eax, (1 << 10)     ; LMA bit
+    jz exit_interrupt_32
+    ; Direct far jump — valid in 32-bit mode (EA ptr16:32). CS=0x10 is the
+    ; 64-bit kernel code segment; CPU zero-extends the 32-bit offset to RIP.
+    jmp 0x10:exit_interrupt_64
 
 exit_interrupt_32:
     ; Restore segment registers (push64_32 stores low at [ESP], high at [ESP+4])
@@ -243,87 +302,8 @@ exit_interrupt_32:
     ; Return from interrupt (CPU pops eip, cs, eflags [, esp, ss])
     iret
 
-; -----------------------------------------------------------------------------
-; Common ISR dispatch — entered from 32-bit entry wrappers and (via the
-; 64→32 trampoline) from 64-bit entry wrappers. Dispatches exit based on
-; current CPU mode (EFER.LMA).
-; Stack: [mock frame 16B] [Regs] [Frame] [VM86 segs]
-; EAX = pointer to FullRegs
-; -----------------------------------------------------------------------------
-call_isr_handler:
-    cld
-    push eax                ; arg: pointer to FullRegs
-
-    call isr_handler
-global isr_return
-isr_return:
-    add esp, 4              ; clean up arg
-
-    add esp, 16             ; clean up mock frame
-
-    ; Dispatch exit based on cpu-mode (EFER.LMA = long mode active)
-    mov ecx, 0xC0000080     ; EFER MSR
-    rdmsr
-    test eax, (1 << 10)     ; LMA bit
-    jnz .exit_long
-    jmp exit_interrupt_32
-.exit_long:
-    ; Direct far jump — valid in 32-bit mode (EA ptr16:32). CS=0x10 is the
-    ; 64-bit kernel code segment; CPU zero-extends the 32-bit offset to RIP.
-    jmp 0x10:exit_interrupt_64
-
-; -----------------------------------------------------------------------------
-; Trampoline for 64-bit → 32-bit transition.
-; Reached from 64-bit entry wrappers via `jmp far [rel far_ptr_32]`.
-; -----------------------------------------------------------------------------
-trampoline_64_to_32:
-    ; Now in 32-bit mode, ESP = low 32 bits of RSP (points to Regs)
-    ; SS is null (long mode same-privilege interrupt sets SS=0).
-    ; Must load a valid 32-bit data segment before any push/pop.
-    mov ax, 0x18
-    mov ss, ax
-    ; Build mock stack frame with full 64-bit rbp/rip values
-    ; Offset to Frame64.rip: 32 + 64 + 64 + 16 = 176
-    ; Offset to rbp: 112
-    ; Build 16-byte mock stack frame (64-bit ebp/eip for stack traces)
-    mov eax, esp
-    push dword [eax + 180]  ; user's rip high 32
-    push dword [eax + 176]  ; user's rip low 32
-    push dword [eax + 116]  ; user's rbp high 32
-    push dword [eax + 112]  ; user's rbp low 32
-    mov ebp, esp
-    jmp call_isr_handler
-
-; -----------------------------------------------------------------------------
-; Unified interrupt vector table.
-; Each entry is 8 bytes (aligned), pushes interrupt number and jumps to
-; common_dispatch. `push imm8` and `jmp rel32` have identical encodings in
-; 32-bit and 64-bit mode, so the same table serves both IDT32 and IDT64.
-; Vectors 0-127 push imm8 (positive, 2 bytes). Vectors 128-255 push imm8
-; with negative value (sign-extended by CPU); handler masks with & 0xFF.
-; -----------------------------------------------------------------------------
-align 64
-global int_vector
-int_vector:
-%assign i 0
-%rep 256
-    align 8
-%if i >= 128
-    push i - 256
-%else
-    push i
-%endif
-    ; Exceptions that push an error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30
-%if i == 8 || i == 10 || i == 11 || i == 12 || i == 13 || i == 14 || i == 17 || i == 21 || i == 29 || i == 30
-    jmp common_dispatch
-%else
-    jmp common_dispatch_no_err
-%endif
-%assign i (i + 1)
-%endrep
-
 ; =============================================================================
-; 64-bit code: long-mode interrupt entry, SYSCALL, vector table
+; 64-bit-only code: long-mode interrupt entry, SYSCALL
 ; =============================================================================
 [bits 64]
 
@@ -388,10 +368,11 @@ entry_wrapper_64:
     push rax
 .fs_gs_done:
 
-    ; Set segments to kernel data selector
-    mov ax, 0x18
-    mov ds, ax
-    mov es, ax
+    ; Build 16-byte mock frame (rbp, rip) for stack-trace walking.
+    ; At this point: rip at rsp+176, rbp at rsp+112.
+    push qword [rsp + 176]      ; rip
+    push qword [rsp + 120]      ; rbp (was at 112, now +8 after rip push)
+    mov rbp, rsp
 
     ; Far jump to 32-bit trampoline (indirect via memory; direct far jmp
     ; is invalid in long mode).
@@ -484,6 +465,6 @@ syscall_entry_64:
 ; -----------------------------------------------------------------------------
 align 8
 far_ptr_32:
-    dq trampoline_64_to_32  ; 64-bit offset (used from 64-bit mode, m16:64)
+    dq call_isr_handler     ; 64-bit offset (used from 64-bit mode, m16:64)
     dw 0x08                 ; 32-bit code segment
 
