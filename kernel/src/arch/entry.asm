@@ -249,10 +249,8 @@ isr_return:
 
     add esp, 16             ; clean up mock frame
 
-    ; Dispatch exit based on cpu-mode (EFER.LMA = long mode active)
-    mov ecx, 0xC0000080     ; EFER MSR
-    rdmsr
-    test eax, (1 << 10)     ; LMA bit
+    ; isr_handler returned: AL = 1 if target is long mode, 0 if 32-bit.
+    test al, al
     jz exit_interrupt_32
     ; Direct far jump — valid in 32-bit mode (EA ptr16:32). CS=0x10 is the
     ; 64-bit kernel code segment; CPU zero-extends the 32-bit offset to RIP.

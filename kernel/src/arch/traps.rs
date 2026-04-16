@@ -120,21 +120,20 @@ fn arch_dispatch(regs: &mut Regs) {
     }
 }
 
-fn toggle_mode_if_needed(regs: &Regs) {
+fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
     use crate::UserMode;
-    let need_toggle = match (paging2::cpu_mode(), regs.mode()) {
-        (paging2::CpuMode::Pae, UserMode::Mode64) => true,
-        (paging2::CpuMode::Compat, UserMode::VM86) => true,
-        _ => false,
-    };
-    if need_toggle {
-        paging2::sync_hw_pdpt();
-        x86::flush_tlb();
-        let saved = paging2::ensure_trampoline_mapped();
-        let want_64 = regs.mode() == UserMode::Mode64;
-        crate::arch::descriptors::toggle_mode(paging2::toggle_cr3(want_64));
-        paging2::clear_trampoline(saved);
+    let want_64 = regs.mode() == UserMode::Mode64;
+    let is_vm86 = regs.mode() == UserMode::VM86;
+    let need_toggle = (!is_long && want_64) || (is_long && is_vm86);
+    if !need_toggle {
+        return is_long;
     }
+    paging2::sync_hw_pdpt();
+    x86::flush_tlb();
+    let saved = paging2::ensure_trampoline_mapped();
+    crate::arch::descriptors::toggle_mode(paging2::toggle_cr3(want_64));
+    paging2::clear_trampoline(saved);
+    !is_long
 }
 
 fn swap_regs(regs: &mut Regs) {
@@ -199,16 +198,19 @@ fn arch_switch_to(regs: &mut Regs) {
 /// Ring 0 (boot): page fault → demand paging. IRQ → ACK+queue. Rest → panic.
 #[unsafe(no_mangle)]
 #[allow(private_interfaces)]
-pub extern "C" fn isr_handler(full: *mut FullRegs) {
+pub extern "C" fn isr_handler(full: *mut FullRegs) -> bool {
     static mut VIF: bool = false;
     static mut VIP: bool = false;
 
     let full = unsafe { &mut *full };
 
+    // Snapshot CPU mode once; refreshed by toggle_mode_if_needed below.
+    let is_long = paging2::cpu_mode() == paging2::CpuMode::Compat;
+
     // Detect ring transition from raw frame before any conversion.
     // 32-bit same-privilege interrupts don't push ESP/SS, so from_32/to_32
     // would read/write beyond the frame. Ring-0 gets its own minimal path.
-    let ring_transition = if paging2::cpu_mode() == paging2::CpuMode::Compat {
+    let ring_transition = if is_long {
         full.regs.frame.cs & 3 != 0
     } else {
         let raw = unsafe { (&full.regs.frame as *const Frame64).cast::<Frame32>().read() };
@@ -216,10 +218,10 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
     };
     if !ring_transition {
         handle_ring0(full.regs.int_num & 0xFF, full.regs.err_code);
-        return;
+        return is_long;
     }
 
-    if paging2::cpu_mode() != paging2::CpuMode::Compat { full.regs.from_32(); }
+    if !is_long { full.regs.from_32(); }
 
     // Fix ESP from IRET to 16-bit SS: CPU only loads SP, upper bits are
     // kernel stack residue. Mask to 16 bits based on descriptor B bit.
@@ -272,7 +274,7 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
     isr_handler_inner(&mut full.regs, from_ring3);
 
     // Mode toggle if output regs need different CPU mode
-    toggle_mode_if_needed(&full.regs);
+    let is_long = toggle_mode_if_needed(&full.regs, is_long);
 
     // Ring 3 exit decanonicalization: VIF↔IF swap + VM86 segments
     let to_ring3 = is_vm86(&full.regs) || full.regs.frame.cs & 3 == 3;
@@ -302,7 +304,8 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) {
         full.regs.gs = 0;
     }
 
-    if paging2::cpu_mode() != paging2::CpuMode::Compat { full.regs.to_32(); }
+    if !is_long { full.regs.to_32(); }
+    is_long
 }
 
 fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
