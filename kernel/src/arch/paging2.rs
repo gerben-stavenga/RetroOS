@@ -1329,8 +1329,10 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
                 // Intermediate level — recurse
                 free_subtree(entries, child);
             } else if entries[child].present() {
-                // Leaf page — free directly
-                phys_mm::free_phys_page(entries[child].page());
+                // Leaf page — free unless MMIO (cache-disabled)
+                if entries[child].raw() & flags::CACHE_DISABLE == 0 {
+                    phys_mm::free_phys_page(entries[child].page());
+                }
                 entries[child] = E::default();
             }
         }

@@ -19,16 +19,7 @@ use crate::kernel::machine;
 use crate::kernel::startup;
 use crate::Regs;
 
-/// Trace DPMI calls when enabled. Toggle with DPMI_TRACE.
-const DPMI_TRACE: bool = false;
-
-macro_rules! dpmi_trace {
-    ($($arg:tt)*) => {
-        if DPMI_TRACE {
-            crate::dbg_println!($($arg)*);
-        }
-    };
-}
+use super::dos_trace;
 
 /// Number of LDT entries
 const LDT_ENTRIES: usize = 8192;
@@ -286,7 +277,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // Pop the return address so we know where to resume in PM.
     let ret_ip = machine::vm86_pop(regs);
     let ret_cs = machine::vm86_pop(regs);
-    dpmi_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X}",
+    dos_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X}",
         client_type, if client_type != 0 { 32 } else { 16 },
         ret_cs, ret_ip, dos.current_psp);
 
@@ -415,7 +406,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 /// IDT event (DPL=3 vectors). Dispatch to PM handler if installed, else
 /// reflect to real mode via IVT.
 pub fn dpmi_soft_int(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    dpmi_trace!("[DPMI] SOFTINT {:02X} CS:EIP={:04x}:{:#x}", vector, regs.code_seg(), regs.ip32());
+    dos_trace!("[DPMI] SOFTINT {:02X} CS:EIP={:04x}:{:#x}", vector, regs.code_seg(), regs.ip32());
     let (sel, off) = dos.dpmi.as_ref().unwrap().pm_vectors[vector as usize];
     if sel == 0 && matches!(vector, 0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F) {
         return dos::dispatch_kernel_syscall(kt, dos, regs, vector);
@@ -486,7 +477,7 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
-    dpmi_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
+    dos_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
 
     match slot {
         dos::SLOT_EXCEPTION_RET => {
@@ -586,7 +577,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
     let cs_32 = seg_is_32(dpmi, regs.code_seg());
 
     let ax = regs.rax as u16;
-    dpmi_trace!("[DPMI] INT31 AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
+    dos_trace!("[DPMI] INT31 AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16, regs.code_seg(), regs.ip32());
 
     match ax {
@@ -655,6 +646,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             let idx = DpmiState::sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let base = DpmiState::desc_base(dpmi.ldt[idx]);
+                dos_trace!("[DPMI] 0006 sel={:04X} -> base={:08X}", sel, base);
                 regs.rcx = (regs.rcx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | (base & 0xFFFF) as u64;
                 clear_carry(regs);
@@ -670,6 +662,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             if idx < LDT_ENTRIES {
                 let base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 DpmiState::set_desc_base(&mut dpmi.ldt[idx], base);
+                dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -750,6 +743,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
                 let src = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
                 let new_desc = unsafe { core::ptr::read_unaligned(src as *const u64) };
                 dpmi.ldt[idx] = new_desc;
+                dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
+                    DpmiState::desc_base(new_desc), new_desc);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -800,7 +795,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             let int_num = regs.rbx as u8;
             let seg = regs.rcx as u16;
             let off = regs.rdx as u16;
-            crate::dbg_println!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
+            dos_trace!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
             machine::write_u16(0, (int_num as u32) * 4, off);
             machine::write_u16(0, (int_num as u32) * 4 + 2, seg);
             clear_carry(regs);
@@ -851,7 +846,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         // BL = interrupt number, CX:EDX = selector:offset
         0x0205 => {
             let int_num = regs.rbx as u8;
-            crate::dbg_println!("[DPMI] 0205 set vec {:02X} = {:04X}:{:#X}", int_num, regs.rcx as u16, regs.rdx as u32);
+            dos_trace!("[DPMI] 0205 set vec {:02X} = {:04X}:{:#X}", int_num, regs.rcx as u16, regs.rdx as u32);
             dpmi.pm_vectors[int_num as usize] = (regs.rcx as u16, regs.rdx as u32);
             clear_carry(regs);
         }
@@ -967,6 +962,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             }
             if !stored { set_carry(regs); return thread::KernelAction::Done; }
             // Return linear address in BX:CX
+            dos_trace!("[DPMI] 0501 alloc size={:#x} -> base={:#x}", size, base);
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | (base & 0xFFFF) as u64;
             // Return handle in SI:DI (use base address as handle)
@@ -1108,7 +1104,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             let num_pages = aligned as usize / 4096;
             let vpage_start = base as usize / 4096;
             let ppage_start = phys as u64 / 4096;
-            crate::kernel::startup::arch_map_phys_range(vpage_start, num_pages, ppage_start, 0);
+            // PWT (bit 3) + PCD (bit 4): write-through, cache-disable for MMIO
+            crate::kernel::startup::arch_map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
             // Return linear address
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
             regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);
@@ -1204,7 +1201,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs, cs_32: bo
     regs.frame.rip = ivt_off as u64;
     regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG) as u64;
 
-    crate::dbg_println!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
+    dos_trace!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         int_num, ivt_seg, ivt_off, rm_ss, rm_sp.wrapping_sub(6));
 
     // Now in VM86 mode — the event loop will execute the BIOS handler.
@@ -1277,7 +1274,7 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     regs.fs = rm_fs as u64;
     regs.gs = rm_gs as u64;
 
-    crate::dbg_println!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X}",
+    dos_trace!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X}",
         vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), regs.rax as u16);
 
     thread::KernelAction::Done
@@ -1337,6 +1334,9 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs, cs_32: 
 
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, cs_32);
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
+
+    { let (cs, ip, ax) = (rm.cs, rm.ip, rm.eax as u16);
+      dos_trace!("[DPMI] 0302 @{:08X} CS:IP={:04X}:{:04X} AX={:04X}", struct_addr, cs, ip, ax); }
 
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
@@ -1444,7 +1444,7 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
 /// Return from real-mode callback to protected mode.
 /// Called from stub_dispatch when the callback return stub fires.
 pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
-    dpmi_trace!("[DPMI] CALLBACK_RET from {:04x}:{:04x}", regs.code_seg(), regs.ip32() as u16);
+    dos_trace!("[DPMI] CALLBACK_RET from {:04x}:{:04x}", regs.code_seg(), regs.ip32() as u16);
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
@@ -1509,7 +1509,7 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
             let psp_seg = regs.rbx as u16;
             let psp_sel = find_psp_selector(dpmi, psp_seg);
             pm_regs.rbx = (pm_regs.rbx & !0xFFFF) | psp_sel as u64;
-            dpmi_trace!("[DPMI] AH={:02X} translate BX seg={:04X} -> sel={:04X}",
+            dos_trace!("[DPMI] AH={:02X} translate BX seg={:04X} -> sel={:04X}",
                 saved_ah, psp_seg, psp_sel);
         }
     }
@@ -1596,7 +1596,7 @@ pub fn deliver_hw_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
 
     dpmi.hw_irq_frames.push((saved_cs, saved_eip, saved_flags));
 
-    dpmi_trace!("[DPMI] HW_IRQ vec={:#04x} -> {:04x}:{:#x} from {:04x}:{:#x}",
+    dos_trace!("[DPMI] HW_IRQ vec={:#04x} -> {:04x}:{:#x} from {:04x}:{:#x}",
         vector, sel, off, saved_cs, saved_eip);
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
@@ -1648,7 +1648,7 @@ pub fn hw_irq_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ker
     let saved_if = (flags as u64) & IF_BIT;
     let saved_vip = (flags as u64) & VIP_BIT;
     regs.frame.rflags = (regs.frame.rflags & !(IF_BIT | VIP_BIT)) | saved_if | saved_vip;
-    dpmi_trace!("[DPMI] HW_IRQ_RET -> {:04x}:{:#x} flags={:#x}", cs, eip, flags);
+    dos_trace!("[DPMI] HW_IRQ_RET -> {:04x}:{:#x} flags={:#x}", cs, eip, flags);
     thread::KernelAction::Done
 }
 
@@ -1683,7 +1683,7 @@ pub fn hw_irq_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ker
 ///   [SP+12]  Faulting SP
 ///   [SP+14]  Faulting SS
 pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
-    dpmi_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x}",
+    dos_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code);
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
@@ -1879,7 +1879,7 @@ fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> thread
     regs.es = new_es as u64;
     regs.fs = 0;
     regs.gs = 0;
-    crate::dbg_println!("[DPMI] raw PM->RM {:04X}:{:04X} SS:SP={:04X}:{:04X}",
+    dos_trace!("[DPMI] raw PM->RM {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         new_cs, new_ip, new_ss, new_sp);
     thread::KernelAction::Done
 }
@@ -1925,7 +1925,7 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     regs.es = new_es as u64;
     regs.fs = 0;
     regs.gs = 0;
-    dpmi_trace!("[DPMI] raw RM->PM CS:EIP={:04X}:{:08X} SS:ESP={:04X}:{:08X} DS={:04X} ES={:04X}",
+    dos_trace!("[DPMI] raw RM->PM CS:EIP={:04X}:{:08X} SS:ESP={:04X}:{:08X} DS={:04X} ES={:04X}",
         new_cs, new_eip, new_ss, new_esp, new_ds, new_es);
 
     // Reload LDT (thread must have DPMI state)

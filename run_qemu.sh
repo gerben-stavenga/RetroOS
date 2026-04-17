@@ -9,8 +9,12 @@ ARCH="${1:-386}"
 shift 2>/dev/null || true
 IMG="${1:-proprietary}"
 shift 2>/dev/null || true
-HOSTFS_DIR="${1:-}"
-shift 2>/dev/null || true
+# Treat 3rd positional as HOSTFS_DIR only if present and not a flag.
+HOSTFS_DIR=""
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    HOSTFS_DIR="$1"
+    shift
+fi
 
 case "$ARCH" in
     386)  QEMU=qemu-system-i386;   CPU="-cpu 486" ;;

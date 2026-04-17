@@ -195,6 +195,14 @@ pub fn outb(port: u16, value: u8) {
     }
 }
 
+/// Write word (16-bit) to I/O port
+#[inline]
+pub fn outw(port: u16, value: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack));
+    }
+}
+
 /// Load Global Descriptor Table
 #[inline]
 pub unsafe fn lgdt(gdt_ptr: &GdtPtr) {

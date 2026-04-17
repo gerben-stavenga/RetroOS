@@ -1,4 +1,0 @@
-exports_files(
-    ["hello64_linux"],
-    visibility = ["//visibility:public"],
-)
