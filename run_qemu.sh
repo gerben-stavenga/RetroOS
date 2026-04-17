@@ -1,26 +1,31 @@
 #!/bin/bash
 # Run RetroOS in QEMU with debugcon output
-# Usage: ./run_qemu.sh [386|686|x64] [extra qemu args...]
+# Usage: ./run_qemu.sh [386|686|x64] [-i image] [-r binary] [-h hostfs_dir] [extra qemu args...]
 
 set -e
 set -o pipefail
 
 ARCH="${1:-386}"
 shift 2>/dev/null || true
-IMG="${1:-proprietary}"
-shift 2>/dev/null || true
-# Treat 3rd positional as HOSTFS_DIR only if present and not a flag.
-HOSTFS_DIR=""
-if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
-    HOSTFS_DIR="$1"
-    shift
-fi
+
+IMG="proprietary"
+START_BIN=""
+HOSTFS_DIR="$HOME"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -i) IMG="$2";        shift 2 ;;
+        -r) START_BIN="$2";  shift 2 ;;
+        -h) HOSTFS_DIR="$2"; shift 2 ;;
+        *)  break ;;
+    esac
+done
 
 case "$ARCH" in
     386)  QEMU=qemu-system-i386;   CPU="-cpu 486" ;;
     686)  QEMU=qemu-system-i386;   CPU="" ;;
     x64)  QEMU=qemu-system-x86_64; CPU="" ;;
-    *)    echo "Usage: $0 [386|686|x64] [image|proprietary|ext4] [extra qemu args...]"; exit 1 ;;
+    *)    echo "Usage: $0 [386|686|x64] [-i image] [-r binary] [-h hostfs_dir] [extra qemu args...]"; exit 1 ;;
 esac
 
 case "$IMG" in
@@ -139,6 +144,10 @@ elif [ "$IMG" = "freedos" ]; then
         "$@"
 else
     IMAGE="$SCRIPT_DIR/bazel-bin/$IMAGE_FILE"
+    FWCFG_ARGS=""
+    if [ -n "$START_BIN" ]; then
+        FWCFG_ARGS="-fw_cfg name=opt/cmdline,string=$START_BIN"
+    fi
     HOSTFS_ARGS=""
     if [ -n "$HOSTFS_DIR" ]; then
         HOSTFS_SOCK="/tmp/retroos-hostfs.sock"
@@ -157,6 +166,7 @@ else
         $CPU \
         -drive "file=$IMAGE,format=raw,snapshot=on" \
         -debugcon stdio \
+        $FWCFG_ARGS \
         $HOSTFS_ARGS \
         -no-reboot \
         "$@"
