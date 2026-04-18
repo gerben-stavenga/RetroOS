@@ -420,7 +420,7 @@ pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: 
     state.frame = Frame64 {
         rip: ip as u64,
         cs: cs as u64,
-        rflags: (VM_FLAG | IF_FLAG | VIF_FLAG) as u64,
+        rflags: (VM_FLAG | IF_FLAG | VIF_FLAG | 0x1000) as u64,
         rsp: sp as u64,
         ss: ss as u64,
     };

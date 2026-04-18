@@ -384,7 +384,10 @@ fn event_loop(first_tid: usize) {
                                 KE::SoftInt(0x80) => crate::kernel::linux::dispatch_action(kt, linux, regs),
                                 KE::Irq => thread::KernelAction::Done,
                                 KE::PageFault { .. } => unreachable!(),
-                                _ => thread::KernelAction::Exit(-11),
+                                _ => {
+                                    crate::dbg_println!("[LINUX] fatal {:?} at EIP={:#x} tid={}", kevent, regs.ip32(), tid);
+                                    thread::KernelAction::Exit(-11)
+                                }
                             }
                         }
                     }

@@ -10,6 +10,16 @@
 //! x86_64: RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4, R9=a5
 //! Return: EAX/RAX (negative = -errno)
 
+const LINUX_TRACE: bool = true;
+
+macro_rules! linux_trace {
+    ($($arg:tt)*) => {
+        if LINUX_TRACE {
+            $crate::dbg_println!($($arg)*);
+        }
+    };
+}
+
 use crate::kernel::elf;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::startup;
@@ -133,12 +143,16 @@ pub fn dispatch_action(kt: &mut thread::KernelThread, linux: &mut LinuxState, re
     let args = extract_args(regs);
     let nr = regs.rax as u32;
 
+    linux_trace!("[LINUX] syscall {} a0={:#x} a1={:#x} a2={:#x} tid={}",
+        nr, args.a0, args.a1, args.a2, kt.tid);
+
     let result = if regs.mode() == crate::UserMode::Mode64 {
         dispatch_nr_64(kt, linux, nr, &args, regs)
     } else {
         dispatch_nr(kt, linux, nr, &args, regs)
     };
 
+    linux_trace!("[LINUX] syscall {} => {}", nr, result.retval);
     regs.rax = result.retval as u64;
     match result.switch_to {
         Some(next) => thread::KernelAction::Switch(next),

@@ -55,7 +55,10 @@ pub mod arch_call {
 
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
-        arch_call::EXECUTE => swap_regs(regs),
+        arch_call::EXECUTE => {
+            swap_regs(regs);
+            regs.frame.rflags &= !(1 << 14); // HACK: strip NT
+        }
         arch_call::SWITCH_TO => arch_switch_to(regs),
         // FORK: EDX=child_root out. COW fork, fill child, free temp page.
         arch_call::FORK => {
@@ -354,6 +357,26 @@ fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
             // Vectors 3/4 (#BP/#OF) are only reachable from user `INT3`/`INTO`,
             // so they're soft ints. Other n<32 are genuine CPU exceptions.
             3 | 4 => KE::SoftInt(int_num as u8),
+            10 => {
+                let cs_base = if regs.mode() == UserMode::VM86 {
+                    (regs.code_seg() as u32) << 4
+                } else {
+                    crate::arch::monitor::seg_base(regs.code_seg())
+                };
+                let lin = cs_base.wrapping_add(regs.ip32());
+                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                let ss_base = if regs.mode() == UserMode::VM86 {
+                    (regs.stack_seg() as u32) << 4
+                } else {
+                    crate::arch::monitor::seg_base(regs.stack_seg())
+                };
+                let sp = regs.sp32();
+                let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
+                crate::dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
+                    regs.code_seg(), regs.ip32(), regs.err_code, bytes,
+                    regs.stack_seg(), sp, stack);
+                KE::Exception(int_num as u8)
+            }
             0..=31 => KE::Exception(int_num as u8),
             // Direct-IDT soft interrupts: 0x30..=0xFF (plus VM86 `INT3`/`0xCC`
             // bypass of VME landing here too).

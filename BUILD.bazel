@@ -56,14 +56,18 @@ _BASE_FILES = {
     "apps/dn/DN.HIS": "DN/DN.HIS",
     "apps/DOOMS/DOOM.EXE": "DOOMS/DOOM.EXE",
     "apps/DOOMS/DOOM1.WAD": "DOOMS/DOOM1.WAD",
+    "apps/DOOMS/doomst.exe": "DOOMS/DOOMST.EXE",
     "apps/2nd_real/SECOND.EXE": "SECREAL/SECOND.EXE",
     "apps/2nd_real/REALITY.FC": "SECREAL/REALITY.FC",
     "apps/cd2/CD2.EXE": "CD2/CD2.EXE",
     "apps/quake/QUAKE.EXE": "QUAKE/QUAKE.EXE",
     "apps/quake/CWSDPMI.EXE": "QUAKE/CWSDPMI.EXE",
     "apps/quake/id1/PAK0.PAK": "QUAKE/ID1/PAK0.PAK",
-    "apps/linux_test/hello_linux": "HI",
-    "apps/hello64_linux/hello64_linux": "HI64",
+    "apps/linux_test/hello_linux": "HI.ELF",
+    "apps/hello64_linux/hello64_linux": "HI64.ELF",
+    "apps/dos32a/dos32a.exe": "DOS32A/DOS32A.EXE",
+    "apps/dos32a/stub32a.exe": "DOS32A/STUB32A.EXE",
+    "apps/dos32a/sver.exe": "DOS32A/SVER.EXE",
 }
 
 # Public image (shareware only)

@@ -73,6 +73,8 @@ pub struct DosState {
     // ── DOS personality fields ────────────────────────────────────────
     pub dta: u32,
     pub heap_seg: u16,
+    pub alloc_strategy: u16,
+    pub umb_link_state: u16,
     /// Current PSP segment as seen by INT 21h/AH=50h (set), 51h (get), 62h (get).
     pub current_psp: u16,
     pub dos_pending_char: Option<u8>,
@@ -95,6 +97,8 @@ impl DosState {
             pc: crate::kernel::machine::PcMachine::new(),
             dta: 0,
             heap_seg: 0xA000,
+            alloc_strategy: 0,
+            umb_link_state: 0,
             current_psp: crate::kernel::dos::COM_SEGMENT,
             dos_pending_char: None,
             last_child_exit_status: 0,
@@ -608,7 +612,10 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             crate::kernel::machine::set_vm86_sp(regs, sp);
             thread::KernelAction::Done
         }
-        SLOT_SAVE_RESTORE => thread::KernelAction::Done, // no-op far call (buffer size=0)
+        SLOT_SAVE_RESTORE => {
+            dpmi::save_restore_protected_mode_state(dos, regs);
+            thread::KernelAction::Done
+        }
         _ => {
             panic!("VM86: INT 31h unknown stub slot {:#04x} CS:IP={:04x}:{:#06x}", slot, cs, ip);
         }
@@ -1657,6 +1664,33 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
+        // AH=0x58: DOS 5+ allocation strategy / UMB link state
+        0x58 => {
+            let al = regs.rax as u8;
+            match al {
+                0x00 => {
+                    regs.rax = (regs.rax & !0xFFFF) | dos.alloc_strategy as u64;
+                    regs.clear_flag32(1);
+                }
+                0x01 => {
+                    dos.alloc_strategy = regs.rbx as u16;
+                    regs.clear_flag32(1);
+                }
+                0x02 => {
+                    regs.rax = (regs.rax & !0xFFFF) | dos.umb_link_state as u64;
+                    regs.clear_flag32(1);
+                }
+                0x03 => {
+                    dos.umb_link_state = regs.rbx as u16;
+                    regs.clear_flag32(1);
+                }
+                _ => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
+                    regs.set_flag32(1);
+                }
+            }
+            thread::KernelAction::Done
+        }
         // AH=0x4D: Get Return Code of Subprocess
         // Returns AL = code passed to AH=4Ch/AH=31h, AH = termination type
         // (00h normal, 01h Ctrl-Break, 02h critical error, 03h TSR).
@@ -1770,9 +1804,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             regs.set_flag32(1);
             thread::KernelAction::Done
         }
+        0xFF => {
+            dos_trace!("VM86: INT 21h AX={:04X} BX={:04X}", regs.rax as u16, regs.rbx as u16);
+            regs.set_flag32(1);
+            thread::KernelAction::Done
+        }
         _ => {
             dos_trace!("VM86: unhandled INT 21h AH={:#04x} AX={:04X}", ah, regs.rax as u16);
-            // Return "function not supported" (AX=1, carry set)
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.set_flag32(1);
             thread::KernelAction::Done
@@ -3079,6 +3117,12 @@ pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
 /// their BIOS handlers run on a private IRQ stack, not the user's stack.
 pub(crate) const SLOT_HW_IRQ_BASE: u8 = 0xE0;
 pub(crate) const SLOT_HW_IRQ_END: u8 = 0xF0; // exclusive (16 IRQs)
+/// PM return trampoline for both soft-INT and HW-IRQ handlers. The handler's
+/// IRET lands here; `pm_int_return` pops the saved client state.
+/// `vector_stub_reflect` also saves the PM resume-EIP here so that RM
+/// reflection unwinds to the same trampoline on the way back.
+pub(crate) const SLOT_PM_INT_RET: u8 = 0xFB;
+/// VM86-only: BIOS HW IRQ handler IRET trampoline (restores pre-reflect SS:SP).
 pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;

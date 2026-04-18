@@ -23,8 +23,9 @@ pub const IOPL_MASK: u32 = 3 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
 pub const VIF_FLAG: u32 = 1 << 19;
 
-/// Flags that VM86 code cannot change (IOPL, VM)
-pub const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
+pub const NT_FLAG: u32 = 1 << 14;
+/// Flags that user code cannot change (IOPL, VM, NT)
+pub const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG | NT_FLAG;
 
 /// HMA spans 16 pages (64KB) starting at page 0x100.
 const HMA_PAGE: usize = 0x100;
@@ -1074,7 +1075,7 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
 /// interrupt flag and in-service register. Returns the vector to deliver
 /// (and marks it in-service on the master PIC), or `None` if nothing is
 /// ready. The caller is responsible for pushing the interrupt frame
-/// (see `reflect_interrupt` for VM86 or `dpmi::deliver_hw_irq` for PM).
+/// (see `reflect_interrupt` for VM86 or `dpmi::deliver_pm_int` for PM).
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
     if !vif {
@@ -1163,7 +1164,7 @@ pub fn vm86_pop(regs: &mut Regs) -> u16 {
 // ============================================================================
 // Raise helper — drain the next pending IRQ and dispatch to the active
 // personality. This is the one place the machine layer calls back out to
-// the personality (via `crate::kernel::dos::dpmi::deliver_hw_irq` for PM mode
+// the personality (via `crate::kernel::dos::dpmi::deliver_pm_int` for PM mode
 // and `reflect_interrupt` directly for VM86); it lives here so the event
 // loop has one canonical entry point.
 // ============================================================================
@@ -1176,7 +1177,7 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     if regs.mode() == crate::UserMode::VM86 {
         reflect_interrupt(regs, vec);
     } else {
-        crate::kernel::dos::dpmi::deliver_hw_irq(dos, regs, vec);
+        crate::kernel::dos::dpmi::deliver_pm_int(dos, regs, vec);
     }
 }
 
