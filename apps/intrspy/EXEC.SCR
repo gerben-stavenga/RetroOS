@@ -1,0 +1,25 @@
+; EXEC.SCR
+structure param_block fields
+    env_seg (word,hex)
+    args (dword,ptr)
+
+intercept 21h
+    function 0ah
+        on_exit output (ds:dx[1]->byte,string,60)
+    function 4bh 
+        on_entry 
+            output (0:046Ch->dword,dec) "   "                ; time
+                   (ds:dx->byte,asciiz,64)                   ; executable
+                   (es:bx->param_block.args->byte,string,32) ; cmdline args
+        on_exit
+            if (cflag == 1) sameline " [FAIL " ax "]"
+    function 00h 4ch
+        on_entry sameline " [RET " al "]"
+    function 31h
+        on_entry sameline " [TSR " al "]"
+            
+intercept 20h
+    on_entry sameline " [RET20 " al "]"
+
+intercept 27h
+    on_entry sameline " [TSR27 " al "]"

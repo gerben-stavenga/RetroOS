@@ -1,0 +1,81 @@
+"""Build CWSDPMI.EXE from source via DOSBox-X + Borland C++ 3.1.
+
+This is non-hermetic: it requires DOSBox-X (flatpak) and a Borland C++ 3.1
+install on the host. Set BORLANDC_DIR env var to override the default path.
+"""
+
+filegroup(
+    name = "sources",
+    srcs = glob([
+        "*.c",
+        "*.h",
+        "*.asm",
+        "*.inc",
+        "makefile",
+        "*.RNG",
+    ]),
+    visibility = ["//visibility:private"],
+)
+
+genrule(
+    name = "cwsdpmi_exe",
+    srcs = [":sources"],
+    outs = ["CWSDPMI.EXE"],
+    cmd = """
+        set -e
+        : "$${HOME:=$$(getent passwd $$(id -u) | cut -d: -f6)}"
+        : "$${BORLANDC_DIR:=$$HOME/dosbox/BORLANDC}"
+        if [ ! -d "$$BORLANDC_DIR" ]; then
+            echo "ERROR: Borland C++ 3.1 install not found at $$BORLANDC_DIR" >&2
+            echo "Set BORLANDC_DIR env var or install at $$HOME/dosbox/BORLANDC" >&2
+            exit 1
+        fi
+        if ! command -v flatpak >/dev/null || ! flatpak info com.dosbox_x.DOSBox-X >/dev/null 2>&1; then
+            echo "ERROR: DOSBox-X flatpak (com.dosbox_x.DOSBox-X) is required" >&2
+            exit 1
+        fi
+
+        # DOSBox-X via flatpak only sees $$HOME — stage there, not /tmp.
+        mkdir -p "$$HOME/.cache/cwsdpmi-bazel"
+        STAGE=$$(mktemp -d -p "$$HOME/.cache/cwsdpmi-bazel")
+        trap "rm -rf $$STAGE" EXIT
+        mkdir -p "$$STAGE/cwsdpmi" "$$STAGE/BORLANDC"
+        echo "[cwsdpmi build] stage=$$STAGE" >&2
+
+        # Stage source files (flatten, strip apps/cwsdpmi/ prefix)
+        for f in $(SRCS); do
+            cp "$$f" "$$STAGE/cwsdpmi/$$(basename $$f)"
+        done
+
+        # Symlink (or copy) Borland tools
+        cp -r "$$BORLANDC_DIR"/* "$$STAGE/BORLANDC/"
+
+        cat > "$$STAGE/build.conf" <<EOF
+[autoexec]
+mount c $$STAGE
+c:
+SET PATH=C:\\\\BORLANDC\\\\BIN;%PATH%
+SET INCLUDE=C:\\\\BORLANDC\\\\INCLUDE
+SET LIB=C:\\\\BORLANDC\\\\LIB
+cd \\\\cwsdpmi
+make > build.log
+echo BUILD_DONE
+exit
+EOF
+
+        timeout 240 flatpak run com.dosbox_x.DOSBox-X \
+            -conf "$$STAGE/build.conf" \
+            -fastlaunch -nogui -nomenu -silent \
+            >&2 || echo "[cwsdpmi build] DOSBox-X exit=$$?" >&2
+
+        if [ ! -f "$$STAGE/cwsdpmi/CWSDPMI.EXE" ]; then
+            echo "ERROR: CWSDPMI.EXE not produced. Build log:" >&2
+            cat "$$STAGE/cwsdpmi/BUILD.LOG" >&2 2>/dev/null || true
+            exit 1
+        fi
+        cp "$$STAGE/cwsdpmi/CWSDPMI.EXE" $@
+    """,
+    local = 1,
+    tags = ["no-sandbox", "no-cache"],
+    visibility = ["//visibility:public"],
+)

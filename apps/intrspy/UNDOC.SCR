@@ -1,0 +1,36 @@
+;; ****** 
+;; UNDOC.SCR (abridged version)
+;; This does not show undocumented redirector (Int 2Fh) calls
+intercept 21h
+    function 1fh on_exit output "211F: Get Default DPB: " DS ":" BX
+    function 32h on_entry output "2132: Get DPB: " DL
+    function 34h on_exit output "2134: InDOS flag: " ES ":" BX
+    function 50h on_entry output "2150: Set PSP: " BX
+    function 51h on_exit output "2151: Get PSP: " BX
+    function 52h on_exit output "2152: Get List of Lists: " ES ":" BX
+    function 53h on_exit output "2153: Translate BPB"
+    function 5dh subfunction 06h 
+        on_exit output "215D06: Get DOSSWAP: " DS ":" SI
+    function 60h
+        on_entry output "2160: Canon File: " (DS:SI->byte,asciiz,64)
+        on_exit sameline " ==> " (ES:DI->byte,asciiz,64)
+    function 25h
+        on_entry
+            if (al == 28h) output "SetVect INT 28h: KBD busy loop"
+;; ******
+;; Use the next functions and ints 20h and 27h to show which
+;; program made the undoc DOS call, and to show termination
+;;
+    function 4bh
+        subfunction 00h
+            on_entry 
+                output (DS:DX->byte,asciiz,64)
+        subfunction 01h
+            on_entry 
+                output "214B01: EXEC debug: " (DS:DX->byte,asciiz,64)
+    function 4ch on_entry output "-------------------------"
+    function 31h on_entry output "--------- TSR -----------"
+intercept 20h on_entry output "-------------------------"
+intercept 27h on_entry output "--------- TSR -----------"
+
+intercept 2eh on_entry output "2E: Execute command"

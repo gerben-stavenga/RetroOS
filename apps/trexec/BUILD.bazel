@@ -1,0 +1,7 @@
+genrule(
+    name = "trexec_com",
+    srcs = ["trexec.asm"],
+    outs = ["TREXEC.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

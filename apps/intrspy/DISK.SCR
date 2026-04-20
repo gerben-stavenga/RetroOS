@@ -1,0 +1,136 @@
+;   DISK.SCR
+;   This script relates DOS disk calls to the hard disk
+;   BIOS calls involved.
+;
+
+; DOS 4+/Compaq DOS 3.31+ >32M partition
+structure big fields
+    sector (dword,hex)
+    num (word,hex)
+    addr (dword,ptr)
+
+intercept 21h
+    function 32h
+        on_entry output "2132: Get DPB drive " dl
+    function 40h
+        ; hook Write just to see messages (e.g., from FORMAT)
+        on_entry if (bx == 1)   ; stdout
+            output (ds:dx->byte,asciiz,cx)
+    function 44h
+        subfunction 09h
+            on_entry output "214409: IOCTL drive " bl " Remote? "
+        subfunction 0dh
+            on_entry output "21440D: IOCTL drive " bl 
+                if (cl == 40h) sameline " [40: Set Device Parameters]"
+                if (cl == 42h) sameline " [42: Format and Verify Track]"
+                if (cl == 60h) sameline " [60: Get Device Parameters]"
+        subfunction 0fh
+            on_entry output "21440F: IOCTL Set Logical Drive " bl 
+            on_exit if (cflag == 0) sameline " ==> " al
+    function 60h
+        on_entry output "2160: Canon " (ds:si->byte,asciiz,32) " ==> "
+        on_exit sameline (es:di->byte,asciiz,32)
+
+intercept 25h
+    on_entry 
+        output "25: Abs Disk Read drv " al ", at sectr "
+        if (cx == 0FFFFh)
+            sameline (ds:bx->big.sector->dword) ", " 
+                     (ds:bx->big.num->word) " sctrs"
+        if (cx != 0FFFFh)
+            sameline dx ", " cx " sctrs"
+    on_exit if (cflag==1) sameline " [fail]"
+
+intercept 26h
+    on_entry
+        output "26: Abs Disk Write drv " al ", at sectr "
+        if (cx == 0FFFFh)
+            sameline (ds:bx->big.sector->dword) ", " 
+                     (ds:bx->big.num->word) " sctrs"
+        if (cx != 0FFFFh)
+            sameline dx ", " cx " sctrs"
+    on_exit if (cflag==1) sameline " [fail]"
+
+intercept 13h
+    function 0 on_entry output "1300: Recalibrate drive " dl
+    function 1 on_exit output "1301: Disk system status " al 
+    function 2
+        on_entry
+            output "1302: Read " al " sctrs: drv " dl ", head " dh 
+                ", sctr " cl ", trk " ch 
+        on_exit if (cflag==1)
+            sameline " - FAILED (" ah ")"
+    function 3
+        on_entry
+            output "1303: Write " al " sctrs: drv " dl ", head " dh 
+                ", sctr " cl ", trk " ch 
+        on_exit if (cflag==1)
+            sameline " - FAILED (" ah ")"
+    function 4
+        on_entry
+            output "1304: Verify " al " sctrs: drv " dl ", head " dh 
+                ", sctr " cl ", trk " ch
+        on_exit if (cflag==1)
+            sameline " - FAILED (" ah ")"
+    function 5
+        on_entry
+            output "1305: Format " al " sctrs: drv " dl ", head " dh 
+                ", sctr " cl ", trk " ch
+        on_exit if (cflag==1)
+            sameline " - FAILED (" ah ")"
+    function 8
+        on_entry
+            output "1308: Get drive params for " dl
+        on_exit
+            if (cflag==1) sameline " - FAILED (" ah ")"
+            if (cflag==0)
+                output "Type " bl ", " dl " drvs, max head " dh 
+                    ", max sctr " cl ", max cyls " ch
+    function 0ch
+        on_entry output "130C: Seek to cyl " ch ", drv " dl ", head " dh
+        on_exit if (cflag==1) sameline " - FAILED (" ah ")"
+    function 0dh
+        on_entry output "130D: Alternate reset drive " dl
+        on_exit if (cflag==1) sameline " - FAILED (" ah ")"
+    function 10h
+        on_entry output "1310: Test drive " dl
+        on_exit sameline " - status " ah
+    function 15h
+        on_entry output "1315: Get type drv " dl
+        on_exit
+            sameline ": "
+            if (ah==0) sameline "No disk present"
+            if (ah==1) sameline "Floppy - Not changed"
+            if (ah==2) sameline "Floppy - changed"
+            if (ah==3) sameline "Fixed disk"
+        on_exit
+            sameline " : sctrs " cx dx
+    function 16h
+        on_entry output "1316: Get media change drv " dl ": "
+        on_exit
+            if (ah==0) sameline "Unchanged"
+            if (ah==6) sameline "Changed"
+    function 17h
+        on_entry
+            output "1317: Set type drv " dl ": "
+            if (al==0) sameline "no disk"
+            if (al==1) sameline "reg disk in reg drv"
+            if (al==2) sameline "reg disk in high dens. drv"
+            if (al==3) sameline "high dens. disk in high dens. drv"
+            if (al==4) sameline "720k disk in 720k drv"
+            if (al==5) sameline "720k disk in 1.44M drv"
+            if (al==6) sameline "1.44M disk in 1.44M drv"
+    function 18h
+        on_entry
+            output "1318: Set media type drv " dl ": sctrs/trk " cl 
+                ", trks " ch ": "
+        on_exit
+            if (ah==0) sameline "OK"
+            if (ah==1) sameline "Not available"
+            if (ah==0ch) sameline "Not supported"
+            if (ah==80h) sameline "No disk in drive"
+
+run "%1 %2 %3 %4"
+report "disk.out"
+report ""
+stop

@@ -1,0 +1,42 @@
+; BC.SCR -- trace EXEC, file open, chdir, get-cwd for BC debugging
+; Usage: CMDSPY COMPILE BC
+
+intercept 21h
+    ; AH=4B EXEC
+    function 4bh
+        on_entry output "EXEC al=" al "  prog=\""
+                        (ds:dx->byte,asciiz,80) "\""
+        on_exit
+            if (cflag == 1) sameline "  [FAIL ax=" ax "]"
+
+    ; AH=3D OPEN
+    function 3dh
+        on_entry output "OPEN al=" al "  \""
+                        (ds:dx->byte,asciiz,80) "\""
+        on_exit
+            if (cflag == 0) sameline "  -> handle=" ax
+            if (cflag == 1) sameline "  [FAIL ax=" ax "]"
+
+    ; AH=3B CHDIR
+    function 3bh
+        on_entry output "CHDIR \"" (ds:dx->byte,asciiz,80) "\""
+        on_exit
+            if (cflag == 1) sameline "  [FAIL ax=" ax "]"
+
+    ; AH=47 GET CWD  (DL=drive, DS:SI=buffer, filled on return)
+    function 47h
+        on_entry output "GETCWD dl=" dl
+        on_exit
+            if (cflag == 0) sameline "  \"" (ds:si->byte,asciiz,64) "\""
+            if (cflag == 1) sameline "  [FAIL ax=" ax "]"
+
+    ; AH=60 TRUENAME / canonicalize
+    function 60h
+        on_entry output "TRUENAME in=\"" (ds:si->byte,asciiz,80) "\""
+        on_exit
+            if (cflag == 0) sameline "  out=\"" (es:di->byte,asciiz,80) "\""
+            if (cflag == 1) sameline "  [FAIL ax=" ax "]"
+
+    ; AH=4C / AH=00 terminate
+    function 00h 4ch
+        on_entry sameline "  [TERM al=" al "]"
