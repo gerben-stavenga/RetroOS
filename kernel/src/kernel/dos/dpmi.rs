@@ -32,6 +32,12 @@ pub const LOW_MEM_LDT_IDX: usize = 6;
 /// Selector value for LOW_MEM_LDT_IDX (TI=1, RPL=3).
 pub const LOW_MEM_SEL: u16 = ((LOW_MEM_LDT_IDX as u16) << 3) | 4 | 3;
 
+/// LDT index of the PSP selector (ES on return from dpmi_enter).
+pub const PSP_LDT_IDX: usize = 4;
+
+/// Selector value for PSP_LDT_IDX (TI=1, RPL=3).
+pub const PSP_SEL: u16 = ((PSP_LDT_IDX as u16) << 3) | 4 | 3;
+
 /// LDT index of the vector-default stub segment. Base=0, limit=0x0FFF, 16-bit.
 /// Every entry in `pm_vectors` that the client has not installed points into
 /// this segment at STUB_BASE + vec*2 (a `CD 31` that traps back to the host).
@@ -91,11 +97,6 @@ pub struct DpmiState {
     /// INT). The stub LDT segment itself is 16-bit, so we can't infer this
     /// from the trapped CS — we must remember what the client declared.
     pub client_use32: bool,
-    /// Original real-mode environment segment from PSP[0x2C] before we
-    /// patched it to a selector at dpmi_enter. Per DPMI 0.9 spec, the host
-    /// converts PSP[0x2C] to a descriptor on PM entry; we keep the original
-    /// segment so in-process child exec can inherit the env block.
-    pub env_seg_orig: u16,
     /// Client CS:EIP and SS:ESP captured at the ring-3 → ring-0 transition.
     /// Flags flow through the IRET frame the host pushed, so no flags snapshot
     /// is needed. Nesting is detected by `saved_client_state.is_some()`: the
@@ -106,6 +107,23 @@ pub struct DpmiState {
     /// Host-provided locked PM stack for interrupt handler dispatch.
     /// (selector, linear base, size). Handler code runs on this stack.
     pub host_stack: (u16, u32, u32),
+    /// RM PSP segment captured on the most recent RM→PM transition (initial
+    /// `dpmi_enter` or `raw_switch_real_to_pm`). The matching PM→RM transition
+    /// uses this to restore `dos.current_psp`. While in PM, `dos.current_psp`
+    /// is fixed at `PSP_SEL` and this field names the RM PSP that PSP_SEL's
+    /// LDT[4] descriptor points at.
+    pub saved_rm_psp: u16,
+    /// Original PSP[0x2C] value (RM env paragraph) captured on the most
+    /// recent RM→PM transition. For 32-bit clients we patch PSP[0x2C] with
+    /// an env selector during PM execution; PM→RM restores from this field.
+    /// For 16-bit clients PSP[0x2C] is left untouched but we still capture
+    /// it so callers that want the RM env segment have a single source.
+    pub saved_rm_env: u16,
+    /// LDT slot of the env selector allocated for 32-bit clients on RM→PM,
+    /// or 0 if none is currently allocated (16-bit client, null env, or
+    /// PM→RM has run since the last RM→PM). Non-zero implies PSP[0x2C] of
+    /// `saved_rm_psp` is currently patched with `idx_to_sel(env_ldt_idx)`.
+    pub env_ldt_idx: usize,
 }
 
 /// A DPMI linear memory block
@@ -172,9 +190,11 @@ impl DpmiState {
             callbacks: [None; MAX_CALLBACKS],
             rm_stack_seg: 0,
             client_use32: false,
-            env_seg_orig: 0,
             saved_client_state: None,
             host_stack: (0, 0, 0),
+            saved_rm_psp: 0,
+            saved_rm_env: 0,
+            env_ldt_idx: 0,
         }
     }
 
@@ -185,9 +205,11 @@ impl DpmiState {
             let bit = idx % 32;
             if self.ldt_alloc[word] & (1 << bit) == 0 {
                 self.ldt_alloc[word] |= 1 << bit;
+                dos_trace!("[DPMI] alloc_ldt -> idx={} sel={:04X}", idx, Self::idx_to_sel(idx));
                 return Some(idx);
             }
         }
+        dos_trace!("[DPMI] alloc_ldt FAILED (LDT full)");
         None
     }
 
@@ -210,8 +232,12 @@ impl DpmiState {
                 let bit = idx % 32;
                 self.ldt_alloc[word] |= 1 << bit;
             }
+            dos_trace!("[DPMI] alloc_ldt_range({}) -> idx={}..{} sel={:04X}..{:04X}",
+                count, first, first + count - 1,
+                Self::idx_to_sel(first), Self::idx_to_sel(first + count - 1));
             return Some(first);
         }
+        dos_trace!("[DPMI] alloc_ldt_range({}) FAILED", count);
         None
     }
 
@@ -223,6 +249,15 @@ impl DpmiState {
             self.ldt_alloc[word] &= !(1 << bit);
             self.ldt[idx] = 0;
         }
+    }
+
+    fn ldt_is_allocated(&self, idx: usize) -> bool {
+        if idx >= LDT_ENTRIES {
+            return false;
+        }
+        let word = idx / 32;
+        let bit = idx % 32;
+        self.ldt_alloc[word] & (1 << bit) != 0
     }
 
     /// Convert LDT index to selector (TI=1, RPL=3)
@@ -281,8 +316,7 @@ impl DpmiState {
     }
 
     /// Get the limit from an LDT descriptor (taking G bit into account)
-    #[allow(dead_code)]
-    fn desc_limit(desc: u64) -> u32 {
+    pub fn desc_limit(desc: u64) -> u32 {
         let l0 = (desc & 0xFFFF) as u32;
         let l1 = ((desc >> 48) & 0x0F) as u32;
         let raw = l0 | (l1 << 16);
@@ -304,6 +338,22 @@ impl DpmiState {
     /// Check if a descriptor has the D/B (default operation size) bit set (32-bit)
     fn desc_is_32(desc: u64) -> bool {
         desc & (1u64 << 54) != 0
+    }
+
+    /// Match CWSDPMI's "segment to descriptor" reuse heuristic:
+    /// 64 KiB byte-granularity descriptor with base == seg << 4.
+    fn desc_is_seg_alias(desc: u64, base: u32) -> bool {
+        let lim0 = (desc & 0xFFFF) as u16;
+        let lim1 = ((desc >> 48) & 0xFF) as u8;
+        let base0 = ((desc >> 16) & 0xFFFF) as u16;
+        let base1 = ((desc >> 32) & 0xFF) as u8;
+        let base2 = ((desc >> 56) & 0xFF) as u8;
+
+        lim0 == 0xFFFF
+            && lim1 == 0
+            && base2 == 0
+            && base0 == (base as u16)
+            && base1 == ((base >> 16) as u8)
     }
 
     /// Set limit in a descriptor (adjusts G bit)
@@ -385,15 +435,11 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     dpmi.ldt[3] = DpmiState::make_data_desc_ex(ss_base, 0xFFFF, use32);
     dpmi.ldt_alloc[0] |= 1 << 3;
 
-    // Index 4: ES — PSP selector. The DPMI 0.9 spec says limit=100h, but
-    // many real-world DOS extenders (DOS/4GW, etc.) reuse ES as a scratch
-    // data segment before reloading it, and crash if the limit is too tight.
-    // Give it a 64KB limit for compatibility. Use the current PSP, not a
-    // hardcoded segment, so child execs get a selector pointing at their own.
-    let psp_seg = dos.current_psp;
-    let psp_base = (psp_seg as u32) * 16;
-    dpmi.ldt[4] = DpmiState::make_data_desc_ex(psp_base, 0xFFFF, false);
-    dpmi.ldt_alloc[0] |= 1 << 4;
+    // Index 4 (PSP_SEL) is built per RM→PM transition by `enter_pm_psp_view`
+    // so it always reflects the active RM PSP (changes after exec/return).
+    // Reserve the slot now so subsequent `alloc_ldt()` calls (host_stack
+    // below, INT 31h/0000h from the client) don't grab the fixed PSP slot.
+    dpmi.ldt_alloc[0] |= 1 << PSP_LDT_IDX;
 
     // Vector-default stub segment (base=0, limit=0x0FFF, 16-bit code).
     // Every PM interrupt vector the client has not installed points here at
@@ -424,32 +470,15 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let cs_sel = DpmiState::idx_to_sel(1);
     let ds_sel = DpmiState::idx_to_sel(2);
     let ss_sel = DpmiState::idx_to_sel(3);
-    let es_sel = DpmiState::idx_to_sel(4);
-
-
-    // Load LDT via arch call
-    let ldt_ptr = dpmi.ldt.as_ptr() as u32;
-    let ldt_limit = (LDT_ENTRIES * 8 - 1) as u32;
-    startup::arch_load_ldt(ldt_ptr, ldt_limit);
-
-    // Switch regs from VM86 to protected mode:
-    // Clear VM flag, set PM selectors, set EIP to return offset
-    regs.frame.rflags &= !(machine::VM_FLAG as u64);
-    regs.frame.rflags |= machine::IF_FLAG as u64;
-    regs.frame.cs = cs_sel as u64;
-    regs.frame.rip = ret_ip as u64;
-    regs.frame.ss = ss_sel as u64;
-    regs.frame.rsp = real_sp as u64;
-    regs.ds = ds_sel as u64;
-    regs.es = es_sel as u64;
-    regs.fs = 0;
-    regs.gs = 0;
 
     // Allocate a dedicated real-mode stack for INT 31h/0300h simulation.
-    // Must not overlap the client's data area. Grab 256 bytes (16 paragraphs)
-    // from the DOS heap.
-    let rm_stack_seg = dos.heap_seg;
-    dos.heap_seg = rm_stack_seg.wrapping_add(0x10); // 256 bytes
+    // Must go through dos_alloc_block so it's registered as a DosMemBlock —
+    // otherwise a later AH=48 / INT 31h/0100 walking from heap_base_seg
+    // would hand the same paragraphs back to the client and the next reflected
+    // INT (which writes via that buffer) would clobber the IRET frame we
+    // pushed for the unwind. 0x10 paragraphs = 256 bytes.
+    let rm_stack_seg = dos::dos_alloc_block(dos, 0x10)
+        .expect("DPMI init: out of DOS memory for RM stack");
     dpmi.rm_stack_seg = rm_stack_seg;
 
     // Allocate a locked PM stack for host-dispatched interrupt handlers.
@@ -461,32 +490,50 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let host_stack_sel = DpmiState::idx_to_sel(host_stack_idx);
     dpmi.host_stack = (host_stack_sel, host_stack_base, host_stack_size);
 
-    // DPMI 0.9 §4.1: "The environment pointer in the client program's PSP
-    // is automatically converted to a selector during the mode switch."
-    // 32-bit DOS extenders (DOS/4GW etc.) follow the spec and read PSP[0x2C]
-    // as a selector. 16-bit extenders (DOS/16M, used by Borland tools) are
-    // non-conformant and read PSP[0x2C] as a real-mode segment, shifting it
-    // left 4 to compute a base — so patching it for 16-bit clients corrupts
-    // their env-block selector. Patch only for 32-bit clients.
-    let env_seg = unsafe { *((psp_base + 0x2C) as *const u16) };
-    dpmi.env_seg_orig = env_seg;
-    if use32 && env_seg != 0 {
-        if let Some(idx) = dpmi.alloc_ldt() {
-            let env_base = (env_seg as u32) * 16;
-            dpmi.ldt[idx] = DpmiState::make_data_desc_ex(env_base, 0xFFFF, false);
-            let env_sel = DpmiState::idx_to_sel(idx);
-            unsafe { *((psp_base + 0x2C) as *mut u16) = env_sel; }
-        }
-    }
-
     // pm_vectors stays zero-initialized: sel=0 means "no client handler",
     // which signals reflect-to-real-mode in dpmi_soft_int. INT 31h/0204h
     // synthesizes the stub address on demand for clients that chain to the
     // default handler.
 
-    // Store DPMI state on thread
+    // Attach DPMI state to thread, then build the per-RM→PM PSP view: this
+    // builds LDT[4] (PSP_SEL) for the active RM PSP, captures saved_rm_psp /
+    // saved_rm_env, and (for 32-bit clients) allocates an env selector and
+    // patches PSP[0x2C] per DPMI 0.9 §4.1. Sets `dos.current_psp = PSP_SEL`.
     dos.dpmi = Some(Box::new(dpmi));
+    enter_pm_psp_view(dos);
 
+    // Load LDT via arch call (after enter_pm_psp_view so LDT[4] is valid).
+    let dpmi_ref = dos.dpmi.as_ref().unwrap();
+    let ldt_ptr = dpmi_ref.ldt.as_ptr() as u32;
+    let ldt_limit = (LDT_ENTRIES * 8 - 1) as u32;
+    startup::arch_load_ldt(ldt_ptr, ldt_limit);
+
+    // One-time LDT dump for DPMI client init (debugging RM-segment alias logic
+    // in protected-mode loaders like DOS/4GW that compute paragraph segments
+    // from PM descriptor bases).
+    {
+        let dpmi_ref = dos.dpmi.as_ref().unwrap();
+        for i in 1..8 {
+            let d = dpmi_ref.ldt[i];
+            if d != 0 {
+                dos_trace!("[DPMI] INIT_LDT idx={} sel={:04X} base={:08X} raw={:016X}",
+                    i, DpmiState::idx_to_sel(i), DpmiState::desc_base(d), d);
+            }
+        }
+    }
+
+    // Switch regs from VM86 to protected mode:
+    // Clear VM flag, set PM selectors, set EIP to return offset
+    regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    regs.frame.rflags |= machine::IF_FLAG as u64;
+    regs.frame.cs = cs_sel as u64;
+    regs.frame.rip = ret_ip as u64;
+    regs.frame.ss = ss_sel as u64;
+    regs.frame.rsp = real_sp as u64;
+    regs.ds = ds_sel as u64;
+    regs.es = PSP_SEL as u64;
+    regs.fs = 0;
+    regs.gs = 0;
 }
 
 // PM #GP monitor lives in `arch/monitor.rs`. The arch decoder handles
@@ -549,8 +596,9 @@ pub fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
 
-    // Interrupt-gate semantics: clear virtual IF on entry.
-    regs.frame.rflags &= !(1u64 << 9);
+    // Don't touch vIF: spec leaves soft-INT handlers' IF state untouched
+    // and HW-IRQ handlers must STI before IRET themselves. The default-stub
+    // path synthesizes that STI in SLOT_RM_INT_RET.
 
     dos_trace!("[DPMI] PM_INT vec={:02X} -> {:04x}:{:#x} (nested={})",
         vector, sel, off, nested as u8);
@@ -558,7 +606,9 @@ pub fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
 
 /// Thin wrapper preserving the old event-loop entry signature.
 pub fn dpmi_soft_int(_kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    dos_trace!("[DPMI] SOFTINT {:02X} AX={:04X} CS:EIP={:04x}:{:#x}", vector, regs.rax as u16, regs.code_seg(), regs.ip32());
+    dos_trace!("[DPMI] SOFTINT {:02X} AX={:04X} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} EDX={:08X} EDI={:08X}",
+        vector, regs.rax as u16, regs.code_seg(), regs.ip32(),
+        regs.ds as u16, regs.es as u16, regs.rdx as u32, regs.rdi as u32);
     deliver_pm_int(dos, regs, vector);
     thread::KernelAction::Done
 }
@@ -629,8 +679,9 @@ fn pop_iret_frame(dpmi: &DpmiState, regs: &mut Regs) -> (u32, u16, u32) {
 fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
-    dos_trace!("[DPMI] VECSTUB vec={:#04x} SS:ESP={:04x}:{:#x} CS:EIP={:04x}:{:#x}",
-        vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip);
+    dos_trace!("[DPMI] VECSTUB vec={:#04x} SS:ESP={:04x}:{:#x} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} DX={:04X} DI={:04X}",
+        vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
+        regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
 
     let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(dos.dpmi.as_ref().unwrap(), regs);
     regs.set_ip32(ret_eip);
@@ -727,8 +778,9 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
     let cs_32 = dpmi.client_use32;
 
     let ax = regs.rax as u16;
-    dos_trace!("[DPMI] INT31 AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
-        ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16, regs.code_seg(), regs.ip32());
+    dos_trace!(force "[INT31] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+        ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
 
     match ax {
         // AX=0000h — Allocate LDT Descriptors
@@ -755,6 +807,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         0x0001 => {
             let sel = regs.rbx as u16;
             let idx = DpmiState::sel_to_idx(sel);
+            dos_trace!("[DPMI] 0001 free sel={:04X} idx={}", sel, idx);
             dpmi.free_ldt(idx);
             // Null out any segment register still holding the freed selector,
             // otherwise IRET back to user mode will GP fault.
@@ -769,10 +822,20 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         0x0002 => {
             let seg = regs.rbx as u16;
             let base = (seg as u32) << 4;
+            for idx in 1..LDT_ENTRIES {
+                if dpmi.ldt_is_allocated(idx) && DpmiState::desc_is_seg_alias(dpmi.ldt[idx], base) {
+                    let sel = DpmiState::idx_to_sel(idx);
+                    regs.rax = (regs.rax & !0xFFFF) | sel as u64;
+                    dos_trace!("[DPMI] 0002 seg={:04X} -> reuse sel={:04X} base={:08X}", seg, sel, base);
+                    clear_carry(regs);
+                    return thread::KernelAction::Done;
+                }
+            }
             if let Some(idx) = dpmi.alloc_ldt() {
                 dpmi.ldt[idx] = DpmiState::make_data_desc_ex(base, 0xFFFF, false);
                 let sel = DpmiState::idx_to_sel(idx);
                 regs.rax = (regs.rax & !0xFFFF) | sel as u64;
+                dos_trace!("[DPMI] 0002 seg={:04X} -> sel={:04X} base={:08X}", seg, sel, base);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -807,7 +870,7 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             if idx < LDT_ENTRIES {
                 let base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 DpmiState::set_desc_base(&mut dpmi.ldt[idx], base);
-                dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
+                dos_trace!(force "[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -834,10 +897,11 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             if idx < LDT_ENTRIES {
                 let cl = regs.rcx as u8;
                 let ch = (regs.rcx >> 8) as u8;
-                // Replace access byte (bits 40-47) and flags nibble (bits 52-55)
+                // Match CWSDPMI: force the descriptor to stay code/data (S=1)
+                // and only accept G/D/B/AVL in the high nibble.
                 dpmi.ldt[idx] &= !0x00F0_FF00_0000_0000;
-                dpmi.ldt[idx] |= (cl as u64) << 40;
-                dpmi.ldt[idx] |= ((ch & 0xF0) as u64) << 48;
+                dpmi.ldt[idx] |= ((0x10 | cl) as u64) << 40;
+                dpmi.ldt[idx] |= ((ch & 0xD0) as u64) << 48;
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -858,6 +922,8 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
                     dpmi.ldt[new_idx] = desc;
                     let new_sel = DpmiState::idx_to_sel(new_idx);
                     regs.rax = (regs.rax & !0xFFFF) | new_sel as u64;
+                    dos_trace!("[DPMI] 000A alias src_sel={:04X} -> new_sel={:04X} base={:08X}",
+                        sel, new_sel, DpmiState::desc_base(desc));
                     clear_carry(regs);
                 } else {
                     set_carry(regs);
@@ -873,7 +939,10 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             let idx = DpmiState::sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let dest = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-                unsafe { core::ptr::write_unaligned(dest as *mut u64, dpmi.ldt[idx]); }
+                let desc = dpmi.ldt[idx];
+                unsafe { core::ptr::write_unaligned(dest as *mut u64, desc); }
+                dos_trace!(force "[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
+                    DpmiState::desc_base(desc), desc);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -886,9 +955,11 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             let idx = DpmiState::sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let src = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-                let new_desc = unsafe { core::ptr::read_unaligned(src as *const u64) };
+                let mut new_desc = unsafe { core::ptr::read_unaligned(src as *const u64) };
+                // Match CWSDPMI: force the descriptor to stay non-system.
+                new_desc |= 1u64 << 44;
                 dpmi.ldt[idx] = new_desc;
-                dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
+                dos_trace!(force "[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
                     DpmiState::desc_base(new_desc), new_desc);
                 clear_carry(regs);
             } else {
@@ -899,21 +970,34 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         // BX = paragraphs. Returns: AX = real-mode segment, DX = selector
         0x0100 => {
             let paragraphs = regs.rbx as u16;
-            // Allocate from DOS conventional memory (simplified: use heap_seg)
-            let seg = dos.heap_seg;
-            dos.heap_seg = seg.wrapping_add(paragraphs);
-            // Create a data descriptor for this block
-            let dpmi = dos.dpmi.as_mut().unwrap();
-            if let Some(idx) = dpmi.alloc_ldt() {
-                let base = (seg as u32) * 16;
-                let limit = (paragraphs as u32) * 16 - 1;
-                dpmi.ldt[idx] = DpmiState::make_data_desc(base, limit);
-                let sel = DpmiState::idx_to_sel(idx);
-                regs.rax = (regs.rax & !0xFFFF) | seg as u64;
-                regs.rdx = (regs.rdx & !0xFFFF) | sel as u64;
-                clear_carry(regs);
-            } else {
-                set_carry(regs);
+            match dos::dos_alloc_block(dos, paragraphs) {
+                Ok(seg) => {
+                    let idx = {
+                        let dpmi = dos.dpmi.as_mut().unwrap();
+                        dpmi.alloc_ldt()
+                    };
+                    if let Some(idx) = idx {
+                        let base = (seg as u32) * 16;
+                        let limit = (paragraphs as u32).saturating_mul(16).saturating_sub(1);
+                        let dpmi = dos.dpmi.as_mut().unwrap();
+                        dpmi.ldt[idx] = DpmiState::make_data_desc(base, limit);
+                        let sel = DpmiState::idx_to_sel(idx);
+                        regs.rax = (regs.rax & !0xFFFF) | seg as u64;
+                        regs.rdx = (regs.rdx & !0xFFFF) | sel as u64;
+                        dos_trace!("[DPMI] 0100 alloc paragraphs={:04X} -> seg={:04X} sel={:04X} base={:08X}",
+                            paragraphs, seg, sel, base);
+                        clear_carry(regs);
+                    } else {
+                        let _ = dos::dos_free_block(dos, seg);
+                        regs.rax = (regs.rax & !0xFFFF) | 8;
+                        set_carry(regs);
+                    }
+                }
+                Err(max) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 8;
+                    regs.rbx = (regs.rbx & !0xFFFF) | max as u64;
+                    set_carry(regs);
+                }
             }
         }
         // AX=0101h — Free DOS Memory Block
@@ -946,10 +1030,11 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             clear_carry(regs);
         }
         // AX=0202h — Get Processor Exception Handler Vector
-        // BL = exception number (0x00-0x1F). Returns: CX:EDX = selector:offset
+        // BL = exception number. DPMI 0.9 only defines 0..14 (CPU exceptions);
+        // higher indices return CF=1 to match CWSDPMI.
         0x0202 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 32 {
+            if (exc as usize) < 15 {
                 let (sel, off) = dpmi.exc_vectors[exc as usize];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
@@ -959,10 +1044,10 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
             }
         }
         // AX=0203h — Set Processor Exception Handler Vector
-        // BL = exception number (0x00-0x1F), CX:EDX = selector:offset
+        // BL = exception number, CX:EDX = selector:offset. Same 0..14 range.
         0x0203 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 32 {
+            if (exc as usize) < 15 {
                 dpmi.exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
                 clear_carry(regs);
             } else {
@@ -1262,6 +1347,10 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         }
     }
 
+    dos_trace!(force "[INT31 RET] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x} CF={:x}",
+        regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16,
+        regs.frame.rflags & 1);
     trace_client_selector_leak("dpmi_int31.exit", regs);
     thread::KernelAction::Done
 }
@@ -1289,9 +1378,10 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, dpmi.client_use32);
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
 
-    { let (ax, ds, dx, cs, ip) = (rm.eax as u16, rm.ds, rm.edx as u16, rm.cs, rm.ip);
-      dos_trace!("[DPMI] 0302 @{:08X} CS:IP={:04X}:{:04X} AX={:04X} DS:DX={:04X}:{:04X}",
-          struct_addr, cs, ip, ax, ds, dx); }
+    { let (ax, bx, cx, dx, ds, es, edi) =
+        (rm.eax as u16, rm.ebx as u16, rm.ecx as u16, rm.edx as u16, rm.ds, rm.es, rm.edi);
+      dos_trace!("[DPMI] 0300 int={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} ES={:04X} EDI={:08X}",
+        int_num, ax, bx, cx, dx, ds, es, edi); }
 
     // Save current protected-mode state
     dpmi.rm_save = Some(SavedPmState {
@@ -1305,7 +1395,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     let ivt_seg = machine::read_u16(0, (int_num as u32) * 4 + 2);
 
     // Use SS:SP from structure if provided, else use our dedicated RM stack.
-    // The default must NOT overlap the client's data area (COM_SEGMENT is unsafe).
+    // The default must NOT overlap the client's data area (PSP_SEGMENT is unsafe).
     let rm_ss = if rm.ss != 0 { rm.ss } else { dpmi.rm_stack_seg };
     let rm_sp = if rm.sp != 0 { rm.sp } else { 0x00FE }; // top of 256-byte segment
 
@@ -1350,32 +1440,17 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
 
 /// Reflect a software INT from protected mode to real mode via the IVT.
 /// Used when a DPMI client executes `INT xx` and no PM handler is installed.
-/// The current PM registers (with IP already past the INT) are saved;
-/// the low 16 bits of EAX/EBX/ECX/EDX/ESI/EDI/EBP + segment regs are
-/// forwarded to the real-mode handler.  On return (callback_return),
-/// the updated real-mode registers are copied back before resuming PM.
+/// Per DPMI 0.9 §2.4 / §3.2: EAX/EBX/ECX/EDX/ESI/EDI/EBP and flags are
+/// passed unaltered; segment registers are undefined in real mode. Any API
+/// that passes pointers via segments is the DOS extender's responsibility
+/// to translate via its own INT 21h hook — not the host's.
 fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     let dpmi = dos.dpmi.as_mut().unwrap();
 
-    // Translate PM selector bases to real-mode segments (base >> 4)
-    let rm_ds = (seg_base(dpmi, regs.ds as u16) >> 4) as u16;
-    let rm_es = (seg_base(dpmi, regs.es as u16) >> 4) as u16;
-    let rm_fs = (seg_base(dpmi, regs.fs as u16) >> 4) as u16;
-    let rm_gs = (seg_base(dpmi, regs.gs as u16) >> 4) as u16;
-
-    // INT 21h PSP-related calls — DPMI clients pass PSPs as selectors, not
-    // real-mode segments. Translate inputs (AH=50h Set PSP) here so the
-    // real-mode handler sees a segment; AH=51h/62h outputs are translated
-    // back in callback_return.
-    if vector == 0x21 {
-        let ah = (regs.rax >> 8) as u8;
-        if ah == 0x50 {
-            let bx_sel = regs.rbx as u16;
-            let psp_seg = (seg_base(dpmi, bx_sel) >> 4) as u16;
-            regs.rbx = (regs.rbx & !0xFFFF) | psp_seg as u64;
-        }
-    }
-
+    // Suppress the [INT31 RET] in callback_return — this implicit reflection
+    // never had a matching [INT31] enter. SLOT_RM_INT_RET dispatch sets the
+    // flag back to true on unwind.
+    dos::DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
 
     // Save protected-mode state (rm_struct_addr=0 signals implicit reflection)
     dpmi.rm_save = Some(SavedPmState {
@@ -1388,33 +1463,33 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
     let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
 
-    // Use the dedicated DPMI real-mode stack (not COM_SEGMENT which overlaps client data)
+    // Use the dedicated DPMI real-mode stack (not PSP_SEGMENT which overlaps client data)
     let rm_ss = dpmi.rm_stack_seg;
     let rm_sp: u16 = 0x00FE;
 
     regs.frame.ss = rm_ss as u64;
     regs.frame.rsp = rm_sp as u64;
 
-    // Push callback return IRET frame on VM86 stack
-    let callback_off: u16 = dos::slot_offset(dos::SLOT_CALLBACK_RET);
-    let callback_seg: u16 = dos::STUB_SEG;
+    // Push RM IRET frame targeting SLOT_RM_INT_RET so the unwind path
+    // synthesizes the spec-required STI on behalf of the default stub.
+    let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_INT_RET);
+    let ret_seg: u16 = dos::STUB_SEG;
     machine::vm86_push(regs, 0); // flags
-    machine::vm86_push(regs, callback_seg);
-    machine::vm86_push(regs, callback_off);
+    machine::vm86_push(regs, ret_seg);
+    machine::vm86_push(regs, ret_off);
 
     // Set VM86 entry to IVT handler
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
     regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG | 0x1000) as u64;
 
-    // Set translated real-mode segments
-    regs.ds = rm_ds as u64;
-    regs.es = rm_es as u64;
-    regs.fs = rm_fs as u64;
-    regs.gs = rm_gs as u64;
+    // Per DPMI, the host must not translate PM selectors into RM paragraphs
+    // when reflecting a software interrupt. The extender/client is responsible
+    // for any DOS-call marshaling that requires real-mode segment values.
 
-    dos_trace!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X}",
-        vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), regs.rax as u16);
+    dos_trace!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X} DS={:04X} ES={:04X}",
+        vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), regs.rax as u16,
+        regs.ds as u16, regs.es as u16);
 
     thread::KernelAction::Done
 }
@@ -1474,9 +1549,10 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
     let struct_addr = flat_addr(dpmi, regs.es as u16, regs.rdi as u32, dpmi.client_use32);
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
 
-    { let (ax, ds, dx, cs, ip) = (rm.eax as u16, rm.ds, rm.edx as u16, rm.cs, rm.ip);
-      dos_trace!("[DPMI] 0302 @{:08X} CS:IP={:04X}:{:04X} AX={:04X} DS:DX={:04X}:{:04X}",
-          struct_addr, cs, ip, ax, ds, dx); }
+    { let (ax, bx, cx, dx, ds, es, edi, cs, ip) =
+        (rm.eax as u16, rm.ebx as u16, rm.ecx as u16, rm.edx as u16, rm.ds, rm.es, rm.edi, rm.cs, rm.ip);
+      dos_trace!("[DPMI] 0302 AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} ES={:04X} EDI={:08X} CS:IP={:04X}:{:04X}",
+        ax, bx, cx, dx, ds, es, edi, cs, ip); }
 
     dpmi.rm_save = Some(SavedPmState {
         regs: *regs,
@@ -1624,13 +1700,10 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
         };
         unsafe { *(saved.rm_struct_addr as *mut RmCallStruct) = rm_struct; }
     } else {
-        // Implicit INT reflection — propagate real-mode register results
-        // back into the PM registers so the caller sees return values.
-        // Snapshot saved-PM AH before reborrowing for register propagation;
-        // it's the AH of the original (pre-reflection) PM call, which tells
-        // us whether to apply INT 21h PSP translation.
-        let saved_ah = (saved.regs.rax >> 8) as u8;
-        let saved_vec = saved.vector;
+        // Implicit INT reflection — per DPMI 0.9 §2.4/§3.2, EAX/EBX/ECX/EDX/
+        // ESI/EDI/EBP and flags round-trip between modes; segment registers
+        // and SP do not. Propagate the low 32 bits of each GP reg back into
+        // the saved PM regs so the PM caller sees return values.
         let pm_regs = &mut saved.regs;
         pm_regs.rax = (pm_regs.rax & !0xFFFFFFFF) | regs.rax & 0xFFFFFFFF;
         pm_regs.rbx = (pm_regs.rbx & !0xFFFFFFFF) | regs.rbx & 0xFFFFFFFF;
@@ -1639,23 +1712,20 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
         pm_regs.rsi = (pm_regs.rsi & !0xFFFFFFFF) | regs.rsi & 0xFFFFFFFF;
         pm_regs.rdi = (pm_regs.rdi & !0xFFFFFFFF) | regs.rdi & 0xFFFFFFFF;
         pm_regs.rbp = (pm_regs.rbp & !0xFFFFFFFF) | regs.rbp & 0xFFFFFFFF;
-        // Propagate carry flag (for DOS error reporting)
-        let rm_cf = regs.flags32() & 1;
-        pm_regs.set_flags32((pm_regs.flags32() & !1) | rm_cf);
-
-        // INT 21h PSP-result translation — convert real-mode PSP segment in
-        // BX back to a PM selector for AH=51h (Get PSP) and AH=62h (Get PSP).
-        if saved_vec == 0x21 && (saved_ah == 0x51 || saved_ah == 0x62) {
-            let psp_seg = regs.rbx as u16;
-            let psp_sel = find_psp_selector(dpmi, psp_seg);
-            pm_regs.rbx = (pm_regs.rbx & !0xFFFF) | psp_sel as u64;
-            dos_trace!("[DPMI] AH={:02X} translate BX seg={:04X} -> sel={:04X}",
-                saved_ah, psp_seg, psp_sel);
-        }
+        // Overlay only status flags (CF,PF,AF,ZF,SF,OF,DF) — leave VM/IOPL/IF/
+        // TF/RF/NT driven by the saved PM state. Copying RM's EFLAGS verbatim
+        // would set VM=1 in PM regs and the next iretq drops us into vm86.
+        const STATUS_MASK: u32 = 0x0CD5;
+        let arith = regs.flags32() & STATUS_MASK;
+        pm_regs.set_flags32((pm_regs.flags32() & !STATUS_MASK) | arith);
     }
 
     // Restore protected-mode state
     *regs = saved.regs;
+    dos_trace!(force "[INT31 RET] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x} CF={:x}",
+        regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16,
+        regs.flags32() & 1);
     dos_trace!("[DPMI] CB_RESTORE CS:EIP={:04x}:{:#x} DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS={:04x}",
         regs.code_seg(), regs.ip32(), regs.ds as u16, regs.es as u16,
         regs.fs as u16, regs.gs as u16, regs.stack_seg());
@@ -1686,6 +1756,7 @@ pub fn pm_int_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ker
     regs.frame.ss = ss as u64;
     regs.set_sp32(esp);
     dos_trace!("[DPMI] PM_INT_RET -> {:04x}:{:#x}", cs, eip);
+    dos::DOS_TRACE_HW_RT.store(true, core::sync::atomic::Ordering::Relaxed);
     thread::KernelAction::Done
 }
 
@@ -1724,6 +1795,9 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
         regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16,
         regs.stack_seg(), regs.sp32());
+    if exc_num == 13 || exc_num == 14 {
+        startup::arch_dump_exception(dos, regs);
+    }
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
         None => {
@@ -1751,7 +1825,7 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         }
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
-        crate::println!("{:?}", regs);
+        startup::arch_dump_exception(dos, regs);
         return thread::KernelAction::Exit(-(exc_num as i32));
     }
 
@@ -1889,6 +1963,73 @@ fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
 // Raw mode switch (INT 31h/0306h)
 // ============================================================================
 
+/// RM→PM transition: build the PM-side PSP view from the active RM PSP.
+///
+/// Captures the current RM PSP segment and PSP[0x2C] (so PM→RM can restore
+/// them), rebuilds the fixed `PSP_SEL` LDT[4] descriptor with base = current
+/// RM PSP * 16, and (for 32-bit clients per DPMI 0.9 §4.1) allocates a fresh
+/// env selector and patches PSP[0x2C] to point at it. Finally sets
+/// `dos.current_psp = PSP_SEL` so PM-side AH=51/62 reflections return a value
+/// the client can load into ES.
+///
+/// 16-bit clients (DOS/16M) read PSP[0x2C] as an RM segment, so leave it
+/// unpatched — the env_ldt_idx stays 0 and PM→RM has nothing to undo.
+fn enter_pm_psp_view(dos: &mut thread::DosState) {
+    let rm_psp = dos.current_psp;
+    let psp_base = (rm_psp as u32) * 16;
+    let env_seg = unsafe { core::ptr::read_volatile((psp_base + 0x2C) as *const u16) };
+
+    let dpmi = match dos.dpmi.as_mut() {
+        Some(d) => d,
+        None => return,
+    };
+
+    dpmi.saved_rm_psp = rm_psp;
+    dpmi.saved_rm_env = env_seg;
+
+    // PSP_SEL descriptor: base = active RM PSP, limit = 64K. Spec says
+    // limit=100h but real extenders (DOS/4GW) reuse ES as scratch and need
+    // the full 64K window.
+    dpmi.ldt[PSP_LDT_IDX] = DpmiState::make_data_desc_ex(psp_base, 0xFFFF, false);
+    dpmi.ldt_alloc[0] |= 1 << PSP_LDT_IDX;
+
+    dpmi.env_ldt_idx = 0;
+    if dpmi.client_use32 && env_seg != 0 {
+        if let Some(idx) = dpmi.alloc_ldt() {
+            let env_base = (env_seg as u32) * 16;
+            dpmi.ldt[idx] = DpmiState::make_data_desc_ex(env_base, 0xFFFF, false);
+            let env_sel = DpmiState::idx_to_sel(idx);
+            unsafe { core::ptr::write_volatile((psp_base + 0x2C) as *mut u16, env_sel); }
+            dpmi.env_ldt_idx = idx;
+        }
+    }
+
+    dos.current_psp = PSP_SEL;
+}
+
+/// PM→RM transition: undo the PM-side PSP view set up by `enter_pm_psp_view`.
+///
+/// Restores the original PSP[0x2C] (32-bit clients), frees the env selector
+/// LDT slot, and sets `dos.current_psp` back to the RM PSP segment captured
+/// on entry so reflected AH=51/62 returns an RM-loadable value.
+fn restore_rm_psp_view(dos: &mut thread::DosState) {
+    let dpmi = match dos.dpmi.as_mut() {
+        Some(d) => d,
+        None => return,
+    };
+    let rm_psp = dpmi.saved_rm_psp;
+    let psp_base = (rm_psp as u32) * 16;
+
+    if dpmi.env_ldt_idx != 0 {
+        unsafe { core::ptr::write_volatile((psp_base + 0x2C) as *mut u16, dpmi.saved_rm_env); }
+        let idx = dpmi.env_ldt_idx;
+        dpmi.free_ldt(idx);
+        dpmi.env_ldt_idx = 0;
+    }
+
+    dos.current_psp = rm_psp;
+}
+
 /// PM-to-real raw mode switch.
 /// Raw mode switch PM→real. Called via unified stub slot SLOT_PM_TO_REAL.
 /// AX has new DS directly (stub is just CD 31, no register clobbering).
@@ -1911,6 +2052,7 @@ fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs) -> thread:
     if let Some(dpmi) = dos.dpmi.as_mut() {
         dpmi.raw_pm_state = capture_protected_mode_state(regs);
     }
+    restore_rm_psp_view(dos);
 
     // Set VM86 mode
     regs.frame.rflags |= (machine::VM_FLAG | machine::IF_FLAG) as u64;
@@ -1967,6 +2109,7 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     if let Some(dpmi) = dos.dpmi.as_mut() {
         dpmi.raw_rm_state = saved_rm_state;
     }
+    enter_pm_psp_view(dos);
 
     // Clear VM flag, enter protected mode
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
@@ -1993,24 +2136,6 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Find an LDT selector whose base equals `psp_seg * 16`.
-/// Used to translate INT 21h AH=51/62 results from a real-mode PSP segment
-/// to the selector form that DPMI clients expect. Falls back to LDT[4]
-/// (the canonical PSP selector set up at dpmi_enter) when no match is found.
-fn find_psp_selector(dpmi: &DpmiState, psp_seg: u16) -> u16 {
-    let target_base = (psp_seg as u32) * 16;
-    for idx in 1..LDT_ENTRIES {
-        let word = idx / 32;
-        let bit = idx % 32;
-        if dpmi.ldt_alloc[word] & (1 << bit) != 0
-            && DpmiState::desc_base(dpmi.ldt[idx]) == target_base
-        {
-            return DpmiState::idx_to_sel(idx);
-        }
-    }
-    DpmiState::idx_to_sel(4)
-}
 
 /// Get the base address for any selector (GDT or LDT).
 /// GDT selectors (TI=0) are flat (base=0).
@@ -2083,7 +2208,8 @@ fn save_restore_real_mode_state(dos: &mut thread::DosState, regs: &Regs) {
     match regs.rax as u8 {
         0 => unsafe { core::ptr::write_unaligned(buf_addr as *mut RawModeState, dpmi.raw_rm_state) },
         1 => unsafe { dpmi.raw_rm_state = core::ptr::read_unaligned(buf_addr as *const RawModeState) },
-        _ => {}
+        al => crate::kernel::dos::dos_trace!(
+            "DPMI save_restore_raw_mode unsupported AL={:02X}", al),
     }
 }
 
@@ -2096,7 +2222,8 @@ pub fn save_restore_protected_mode_state(dos: &mut thread::DosState, regs: &Regs
     match regs.rax as u8 {
         0 => unsafe { core::ptr::write_unaligned(buf_addr as *mut RawModeState, dpmi.raw_pm_state) },
         1 => unsafe { dpmi.raw_pm_state = core::ptr::read_unaligned(buf_addr as *const RawModeState) },
-        _ => {}
+        al => crate::kernel::dos::dos_trace!(
+            "DPMI save_restore_pm_state unsupported AL={:02X}", al),
     }
 }
 

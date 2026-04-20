@@ -11,12 +11,25 @@
 ;          that because child runs in its own thread with its own vga. The
 ;          take copies the child's saved vga back into our own so DN (our
 ;          4B00 caller) resumes from the child's farewell screen.
+;   AH=02h TRACE_ON / AH=03h TRACE_OFF: bracket the FORK_EXEC_WAIT so the
+;          kernel trace log captures only the executed program, not the
+;          surrounding DN/launcher noise.
 ;
 ; Assemble: nasm -f bin -o COMMAND.COM command.asm
 org 0x100
 
+    mov ah, 0x02            ; trace ON — only the launched program is logged
+    int 0x31
     mov ah, 0x01
     int 0x31
+    pushf                   ; preserve CF/ZF across trace-off call
+    push ax
+    push bx
+    mov ah, 0x03            ; trace OFF
+    int 0x31
+    pop bx
+    pop ax
+    popf
     jc .err
     test ax, ax
     jnz .bg

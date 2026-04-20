@@ -129,24 +129,22 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
     arch_map_low_mem();
     dos::setup_ivt();
     let is_exe = dos::is_mz_exe(&buf);
+    // Convert VFS-form path to DOS-form for the PSP env suffix.
+    let mut dos_name = [0u8; dos::dfs::DFS_PATH_MAX];
+    let dos_len = dos::dfs::vfs_to_dos(path, &mut dos_name);
+    let dos_name = &dos_name[..dos_len];
     let (cs, ip, ss, sp, end_seg) = if is_exe {
-        dos::load_exe(&buf, path).expect("load_exe failed")
+        dos::load_exe(&buf, dos_name, None).expect("load_exe failed")
     } else {
-        dos::load_com(&buf, path)
+        dos::load_com(&buf, dos_name, None)
     };
 
-    thread::init_process_thread_vm86(t, dos::COM_SEGMENT, cs, ip, ss, sp);
+    thread::init_process_thread_vm86(t, dos::PSP_SEGMENT, cs, ip, ss, sp, cwd);
     let dos_state = t.dos_mut();
     dos_state.heap_seg = end_seg;
-    dos_state.dta = (dos::COM_SEGMENT as u32) * 16 + 0x80;
-    if !cwd.is_empty() {
-        t.kernel.cwd[..cwd.len()].copy_from_slice(cwd);
-        t.kernel.cwd_len = cwd.len();
-    } else {
-        t.kernel.cwd_len = 0;
-    }
+    dos_state.dta = (dos::PSP_SEGMENT as u32) * 16 + 0x80;
 
-    let psp_base = (dos::COM_SEGMENT as u32) << 4;
+    let psp_base = (dos::PSP_SEGMENT as u32) << 4;
     let tail_len = cmdline_tail.len().min(126);
     unsafe {
         let psp = psp_base as *mut u8;
@@ -500,8 +498,44 @@ fn handle_fork_exec(
     use crate::kernel::exec;
 
     let parent = thread::get_thread(parent_tid).expect("fork_exec: invalid parent");
-    let parent_cwd = parent.kernel.cwd;
-    let parent_cwd_len = parent.kernel.cwd_len;
+
+    // Snapshot the parent's cwd and (DOS-only) env block while we're still in
+    // the parent's address space. The COW fork + arch_user_clean inside
+    // exec_dos_into tears the parent's pages out from under us, so anything
+    // the child needs from parent memory must be copied to the kernel heap.
+    //
+    // cwd lives in the personality state (`DfsState` for DOS, `LinuxState`
+    // for Linux); convert to common VFS-form (lowercase, forward-slash) for
+    // child init.
+    let mut parent_cwd_buf = [0u8; 64];
+    let parent_cwd_len: usize;
+    let parent_env_snapshot: Option<alloc::vec::Vec<u8>>;
+    match &parent.personality {
+        thread::Personality::Dos(dos) => {
+            let dos_cwd = dos.dfs.get_cwd();
+            let n = dos_cwd.len().min(parent_cwd_buf.len());
+            for i in 0..n {
+                parent_cwd_buf[i] = if dos_cwd[i] == b'\\' { b'/' } else { dos_cwd[i] };
+            }
+            parent_cwd_len = n;
+
+            let psp_seg = dos.current_psp;
+            // In PM, dos.current_psp is PSP_SEL (not an RM seg) and PSP[0x2C]
+            // may have been patched with an env selector — read the captured
+            // RM env paragraph from DpmiState. In RM, PSP[0x2C] is authoritative.
+            let env_seg = match dos.dpmi.as_ref() {
+                Some(dpmi) if psp_seg == crate::kernel::dos::dpmi::PSP_SEL => dpmi.saved_rm_env,
+                _ => unsafe { (((psp_seg as u32) * 16 + 0x2C) as *const u16).read_unaligned() },
+            };
+            parent_env_snapshot = Some(crate::kernel::dos::snapshot_env(env_seg));
+        }
+        thread::Personality::Linux(lin) => {
+            let cwd = lin.cwd_str();
+            parent_cwd_buf[..cwd.len()].copy_from_slice(cwd);
+            parent_cwd_len = cwd.len();
+            parent_env_snapshot = None;
+        }
+    }
 
     let buf = match exec::load_file_resolved(path) {
         Ok(b) => b,
@@ -537,7 +571,9 @@ fn handle_fork_exec(
 
     let prog_arg = alloc::vec::Vec::from(path);
     let args = alloc::vec![prog_arg];
-    if let Err(_) = exec::init_thread(child_tid, &buf, path, &args) {
+    let env_slice = parent_env_snapshot.as_deref();
+    let parent_cwd_slice = &parent_cwd_buf[..parent_cwd_len];
+    if let Err(_) = exec::init_thread(child_tid, &buf, path, &args, env_slice, parent_cwd_slice) {
         let child = thread::get_thread(child_tid).unwrap();
         arch_switch_to(&mut child.kernel.cpu_state, &mut child.kernel.root, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(child_tid, 1);
@@ -555,7 +591,11 @@ fn handle_fork_exec(
     *regs = parent_regs;
 
     match &mut child.personality {
-        thread::Personality::Linux(_) => {
+        thread::Personality::Linux(lin) => {
+            // Inherit cwd from parent. (DOS path seeds DfsState inside
+            // init_process_thread_vm86; Linux child stores cwd in LinuxState.)
+            lin.cwd[..parent_cwd_len].copy_from_slice(parent_cwd_slice);
+            lin.cwd_len = parent_cwd_len;
             let cpipe = thread::console_pipe();
             child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
             child.kernel.fds[1] = thread::FdKind::ConsoleOut;
@@ -580,10 +620,6 @@ fn handle_fork_exec(
         }
     }
 
-    let child = thread::get_thread(child_tid).unwrap();
-    child.kernel.cwd = parent_cwd;
-    child.kernel.cwd_len = parent_cwd_len;
-
     // Block parent, switch to child
     crate::dbg_println!("  child tid={}, blocking parent tid={}", child_tid, parent_tid);
     thread::block_thread(parent_tid);
@@ -605,6 +641,10 @@ const F12_PRESS: u8 = 0x58;
 /// - PM: Rust stack trace via frame-pointer walking through user symbols.
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. vpic.isr never cleared by a missed EOI).
+pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::Regs) {
+    dump_interrupted_thread(regs, Some(dos));
+}
+
 fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
@@ -634,7 +674,51 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
         let fl = regs.flags32();
         crate::dbg_println!("[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} IF={}",
             regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), fl, (fl >> 9) & 1);
-        if let Some(d) = dos { dump_virtual_hw(d); }
+        crate::dbg_println!("[DBG] AX={:08x} BX={:08x} CX={:08x} DX={:08x} SI={:08x} DI={:08x} BP={:08x}",
+            regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
+            regs.rsi as u32, regs.rdi as u32, regs.rbp as u32);
+        crate::dbg_println!("[DBG] DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
+            regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16);
+        if let Some(d) = dos {
+            if let Some(dpmi) = d.dpmi.as_ref() {
+                // Dump the descriptor backing every loaded segment register so
+                // limit/base mismatches versus what INT31/000C set are visible
+                // at panic time. (CPU shadow may differ from the LDT entry if
+                // the client never re-MOV'd the selector after a SetDescriptor.)
+                for (name, sel) in [
+                    ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
+                    ("DS", regs.ds as u16), ("ES", regs.es as u16),
+                    ("FS", regs.fs as u16), ("GS", regs.gs as u16),
+                ] {
+                    if sel == 0 { continue; }
+                    if sel & 4 == 0 { continue; } // skip GDT (flat)
+                    let idx = (sel >> 3) as usize;
+                    if idx >= dpmi.ldt.len() { continue; }
+                    let raw = dpmi.ldt[idx];
+                    let base = crate::kernel::dos::dpmi::DpmiState::desc_base(raw);
+                    let limit = crate::kernel::dos::dpmi::DpmiState::desc_limit(raw);
+                    crate::dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
+                        name, sel, idx, base, limit, raw);
+                }
+                let cs_base = crate::kernel::dos::dpmi::seg_base(dpmi, regs.code_seg());
+                let ss_base = crate::kernel::dos::dpmi::seg_base(dpmi, regs.stack_seg());
+                let cs_32 = crate::kernel::dos::dpmi::seg_is_32(dpmi, regs.code_seg());
+                let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
+                let sp_lin = ss_base.wrapping_add(regs.sp32());
+                let pre = ip_lin.wrapping_sub(16);
+                let cp = unsafe { core::slice::from_raw_parts(pre as *const u8, 32) };
+                crate::dbg_println!("[DBG] code @{:08x} (-16..+16):", pre);
+                crate::dbg_println!("[DBG]   {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} | {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                    cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
+                    cp[8], cp[9], cp[10], cp[11], cp[12], cp[13], cp[14], cp[15],
+                    cp[16], cp[17], cp[18], cp[19], cp[20], cp[21], cp[22], cp[23],
+                    cp[24], cp[25], cp[26], cp[27], cp[28], cp[29], cp[30], cp[31]);
+                let sw = unsafe { core::slice::from_raw_parts(sp_lin as *const u32, 8) };
+                crate::dbg_println!("[DBG] stack @{:08x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                    sp_lin, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
+            }
+            dump_virtual_hw(d);
+        }
         crate::kernel::stacktrace::stack_trace_regs(regs);
     }
 }

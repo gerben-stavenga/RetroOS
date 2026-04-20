@@ -154,8 +154,6 @@ pub struct KernelThread {
     pub exit_code: i32,
     pub addr_hash: u64,
     pub cpu_hash: u64,
-    pub cwd: [u8; 64],
-    pub cwd_len: usize,
     pub symbols: Option<SymbolData>,
     pub fds: [FdKind; MAX_FDS],
     pub cloexec: u16,
@@ -202,20 +200,10 @@ impl KernelThread {
             exit_code: 0,
             addr_hash: 0,
             cpu_hash: 0,
-            cwd: [0; 64],
-            cwd_len: 0,
             symbols: None,
             fds: [FdKind::None; MAX_FDS],
             cloexec: 0,
         }
-    }
-
-    pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
-
-    pub fn set_cwd(&mut self, path: &[u8]) {
-        let len = path.len().min(self.cwd.len());
-        self.cwd[..len].copy_from_slice(&path[..len]);
-        self.cwd_len = len;
     }
 
     /// Find a free fd slot (starting from `from`). Returns fd number or None.
@@ -402,11 +390,15 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
     thread.kernel.cpu_state.init_user_process_64(entry, stack);
 }
 
-/// Initialize a thread for VM86 mode (.COM execution)
-/// cs/ip/ss/sp are real-mode segment:offset values
-pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
+/// Initialize a thread for VM86 mode (.COM execution).
+/// `cwd` is the parent's cwd in VFS form (lowercase, forward-slash); used to
+/// seed `DfsState`. Pass `&[]` for an initial load with no parent.
+/// cs/ip/ss/sp are real-mode segment:offset values.
+pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16, cwd: &[u8]) {
     use crate::kernel::machine::{VM_FLAG, IF_FLAG, VIF_FLAG};
-    thread.personality = Personality::Dos(DosState::new());
+    let mut dos_state = DosState::new();
+    dos_state.dfs.init_from_vfs(cwd);
+    thread.personality = Personality::Dos(dos_state);
 
     let state = &mut thread.kernel.cpu_state;
     *state = Regs::empty();

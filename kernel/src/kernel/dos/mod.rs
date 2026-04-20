@@ -24,11 +24,43 @@
 extern crate alloc;
 
 /// Trace DOS/DPMI calls when enabled.
+/// Compile-time master kill switch; constant-fold removes all trace calls
+/// when false.
 pub(crate) const DOS_TRACE: bool = true;
+pub(crate) const DOS_TRACE_HW_IRG: bool = false;
+
+/// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
+/// Lets COMMAND.COM bracket a single exec so the log only captures that
+/// child program, not surrounding shell/launcher noise. Default OFF so
+/// boot/init/DN startup are silent until something explicitly enables it.
+pub(crate) static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Independent gate for hardware-IRQ-vector trace lines (timer 0x08, key 0x09,
+/// etc). Default OFF so a noisy timer tick doesn't drown the per-call DPMI
+/// trace. Toggled by INT 31h synth AH=04 (on) / AH=05 (off). Both gates
+/// (general + HW) must be ON for an HW-vector trace to fire.
+pub(crate) static DOS_TRACE_HW_RT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Returns true if a trace line tied to interrupt vector `vec` should fire.
+/// Combines the general gate with the HW-vector gate so an HW-IRQ-noisy site
+/// can wrap its `dos_trace!` in a single check.
+#[inline]
+pub(crate) fn should_trace() -> bool {
+    // TEMP: silenced to keep the DPMI log compact for diffing against CWSDPMI.
+    // Use `dos_trace!(force ...)` to bypass this gate.
+    false
+}
 
 macro_rules! dos_trace {
+    (force $($arg:tt)*) => {
+        if crate::kernel::dos::DOS_TRACE_HW_RT.load(core::sync::atomic::Ordering::Relaxed) {
+            $crate::dbg_println!($($arg)*);
+        }
+    };
     ($($arg:tt)*) => {
-        if $crate::kernel::dos::DOS_TRACE {
+        if crate::kernel::dos::should_trace() {
             $crate::dbg_println!($($arg)*);
         }
     };
@@ -36,6 +68,7 @@ macro_rules! dos_trace {
 pub(crate) use dos_trace;
 
 pub mod dpmi;
+pub mod dfs;
 
 use crate::kernel::thread;
 use crate::kernel::machine::{
@@ -73,6 +106,7 @@ pub struct DosState {
     // ── DOS personality fields ────────────────────────────────────────
     pub dta: u32,
     pub heap_seg: u16,
+    pub heap_base_seg: u16,
     pub alloc_strategy: u16,
     pub umb_link_state: u16,
     /// Current PSP segment as seen by INT 21h/AH=50h (set), 51h (get), 62h (get).
@@ -88,7 +122,18 @@ pub struct DosState {
     pub find_path_len: u8,
     pub find_idx: u16,
 
+    /// DOS File System wrapper — sole DOS↔VFS translator.
+    /// Tracks cwd in DOS form (uppercase, backslashes, no drive/root).
+    pub dfs: dfs::DfsState,
+    pub dos_blocks: alloc::vec::Vec<DosMemBlock>,
+
     pub dpmi: Option<alloc::boxed::Box<crate::kernel::dos::dpmi::DpmiState>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct DosMemBlock {
+    pub seg: u16,
+    pub paras: u16,
 }
 
 impl DosState {
@@ -97,9 +142,10 @@ impl DosState {
             pc: crate::kernel::machine::PcMachine::new(),
             dta: 0,
             heap_seg: 0xA000,
+            heap_base_seg: 0xA000,
             alloc_strategy: 0,
             umb_link_state: 0,
-            current_psp: crate::kernel::dos::COM_SEGMENT,
+            current_psp: crate::kernel::dos::PSP_SEGMENT,
             dos_pending_char: None,
             last_child_exit_status: 0,
             exec_parent: None,
@@ -108,6 +154,8 @@ impl DosState {
             find_path: [0; 96],
             find_path_len: 0,
             find_idx: 0,
+            dfs: dfs::DfsState::new(),
+            dos_blocks: alloc::vec::Vec::new(),
             dpmi: None,
         }
     }
@@ -115,6 +163,129 @@ impl DosState {
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
     pub fn process_key(&mut self, scancode: u8) {
         crate::kernel::machine::queue_irq(&mut self.pc, crate::arch::Irq::Key(scancode));
+    }
+}
+
+fn next_dos_block_limit(dos: &DosState, seg: u16, skip_seg: Option<u16>) -> u16 {
+    let mut limit = 0xA000u16;
+    for block in &dos.dos_blocks {
+        if Some(block.seg) == skip_seg || block.seg < seg {
+            continue;
+        }
+        if block.seg < limit {
+            limit = block.seg;
+        }
+    }
+    limit
+}
+
+fn sync_heap_seg(dos: &mut DosState) {
+    let mut first_free = dos.heap_base_seg;
+    loop {
+        let mut advanced = false;
+        for block in &dos.dos_blocks {
+            if block.seg == first_free {
+                first_free = block.seg.saturating_add(block.paras);
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    dos.heap_seg = first_free.min(0xA000);
+}
+
+fn largest_dos_block(dos: &DosState) -> u16 {
+    let mut largest = 0u16;
+    let mut cur = dos.heap_base_seg;
+    let mut blocks = dos.dos_blocks.clone();
+    blocks.sort_by_key(|b| b.seg);
+    for block in blocks {
+        if block.seg > cur {
+            largest = largest.max(block.seg - cur);
+        }
+        let end = block.seg.saturating_add(block.paras);
+        if end > cur {
+            cur = end;
+        }
+    }
+    largest.max(0xA000u16.saturating_sub(cur))
+}
+
+pub(crate) fn dos_reset_blocks(dos: &mut DosState, base_seg: u16) {
+    dos.heap_base_seg = base_seg;
+    dos.heap_seg = base_seg;
+    dos.dos_blocks.clear();
+}
+
+pub(crate) fn dos_alloc_block(dos: &mut DosState, need: u16) -> Result<u16, u16> {
+    let mut cur = dos.heap_base_seg;
+    let mut blocks = dos.dos_blocks.clone();
+    blocks.sort_by_key(|b| b.seg);
+
+    for block in blocks {
+        if block.seg > cur {
+            let gap = block.seg - cur;
+            if need <= gap {
+                if need != 0 {
+                    dos.dos_blocks.push(DosMemBlock { seg: cur, paras: need });
+                }
+                sync_heap_seg(dos);
+                return Ok(cur);
+            }
+        }
+        let end = block.seg.saturating_add(block.paras);
+        if end > cur {
+            cur = end;
+        }
+    }
+
+    let avail = 0xA000u16.saturating_sub(cur);
+    if need <= avail {
+        if need != 0 {
+            dos.dos_blocks.push(DosMemBlock { seg: cur, paras: need });
+        }
+        sync_heap_seg(dos);
+        Ok(cur)
+    } else {
+        Err(largest_dos_block(dos))
+    }
+}
+
+pub(crate) fn dos_free_block(dos: &mut DosState, seg: u16) -> Result<(), u16> {
+    if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
+        dos.dos_blocks.remove(idx);
+        sync_heap_seg(dos);
+        Ok(())
+    } else {
+        Err(9)
+    }
+}
+
+pub(crate) fn dos_resize_block(dos: &mut DosState, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
+    if seg == dos.current_psp {
+        let max = next_dos_block_limit(dos, seg, None).saturating_sub(seg);
+        if paras <= max {
+            dos.heap_base_seg = seg.saturating_add(paras);
+            sync_heap_seg(dos);
+            return Ok(());
+        }
+        return Err((8, max));
+    }
+
+    if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
+        let max = next_dos_block_limit(dos, seg, Some(seg)).saturating_sub(seg);
+        if paras <= max {
+            dos.dos_blocks[idx].paras = paras;
+            sync_heap_seg(dos);
+            Ok(())
+        } else {
+            Err((8, max))
+        }
+    } else {
+        Err((9, 0))
     }
 }
 
@@ -136,12 +307,15 @@ fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
     }
 }
 
-/// .COM load segment — derived from low-memory layout end so the environment
-/// block (COM_SEGMENT-0x10, 256 bytes) never overlaps kernel structures.
-pub const COM_SEGMENT: u16 = (((IRQ_STACK_ADDR + IRQ_STACK_SIZE) + 0xF) >> 4) as u16 + 0x10;
-/// .COM code offset within segment
+/// PSP segment for the initial DOS program — derived from low-memory layout
+/// end so the environment block at `PSP_SEGMENT-0x10` (256 bytes) never
+/// overlaps kernel structures. The .COM/.EXE load module begins at
+/// `PSP_SEGMENT+0x10` (256 bytes past the PSP). For .COM programs DOS sets
+/// CS=DS=ES=SS=PSP_SEGMENT, IP=0x100.
+pub const PSP_SEGMENT: u16 = (((IRQ_STACK_ADDR + IRQ_STACK_SIZE) + 0xF) >> 4) as u16 + 0x10;
+/// .COM entry IP (relative to its PSP segment). Equivalent to `(psp+0x10):0000`.
 const COM_OFFSET: u16 = 0x0100;
-/// Initial stack pointer (top of 64KB segment)
+/// Initial stack pointer for .COM (top of PSP's 64KB segment)
 const COM_SP: u16 = 0xFFFE;
 
 fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
@@ -540,7 +714,10 @@ pub(crate) fn dispatch_kernel_syscall(
         0x2E => int_2eh(kt, dos, regs),
         0x2F => int_2fh(dos, regs),
         0x67 => int_67h(dos, regs),
-        _ => thread::KernelAction::Done,
+        _ => {
+            dos_trace!("dispatch_kernel_syscall: unhandled vector {:#04x}", vector);
+            thread::KernelAction::Done
+        }
     }
 }
 
@@ -560,7 +737,8 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
-        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
+        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RM_INT_RET
+        | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
     let action = match slot {
@@ -571,6 +749,16 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
         }
         SLOT_CALLBACK_RET => {
             dpmi::callback_return(dos, regs);
+            thread::KernelAction::Done
+        }
+        SLOT_RM_INT_RET => {
+            // Implicit INT reflection (no PM handler installed). Same
+            // unwind as a callback, then synthesize the STI that DPMI
+            // requires IRQ handlers to perform before IRET — our default
+            // stub is the nominal handler here.
+            dpmi::callback_return(dos, regs);
+            regs.frame.rflags |= crate::kernel::machine::IF_FLAG as u64;
+            DOS_TRACE_HW_RT.store(true, core::sync::atomic::Ordering::Relaxed);
             thread::KernelAction::Done
         }
         SLOT_RAW_REAL_TO_PM => {
@@ -702,10 +890,18 @@ fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, reg
                 regs.set_flag32(1);
                 return thread::KernelAction::Done;
             }
-            let flen = dos_normalize_path(&mut filename, flen);
             // If the name is a .BAT, expand to its first executable command.
             let flen = expand_bat(dos, &mut filename, flen, kt);
             fork_exec(dos, &filename[..flen], kt)
+        }
+        // AH=02h — TRACE_ON: enable runtime DOS/DPMI trace gate.
+        // AH=03h — TRACE_OFF: disable it.
+        // No DPMI 0.9 collision (RM-only path; PM DPMI is dispatched separately).
+        0x02 | 0x03 => {
+            DOS_TRACE_RT.store(ah == 0x02, core::sync::atomic::Ordering::Relaxed);
+            regs.rax &= !0xFFFF;
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
         }
         // Unknown AH: reflect through IVT for legacy/DPMI compatibility.
         _ => {
@@ -835,10 +1031,9 @@ fn dos_putchar(c: u8) {
 fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     if ah != 0x2C && ah != 0x2A {
-        dos_trace!("D21 {:02X} AX={:04X} BX={:04X} cs:ip={:04X}:{:04X} heap={:04X} psp={:04X}",
-            ah, regs.rax as u16, regs.rbx as u16,
-            regs.code_seg(), regs.ip32() as u16,
-            dos.heap_seg, dos.current_psp);
+        dos_trace!(force "[INT21] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+            regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+            regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
     }
     match ah {
         // AH=0x02: Display character (DL)
@@ -895,7 +1090,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             match al {
                 0x00 => { regs.rdx = regs.rdx & !0xFF; } // DL=0: break checking off
                 0x01 => {} // set break — ignore
-                _ => {}
+                _ => {
+                    dos_trace!("D21 33 unsupported AL={:02X}", al);
+                }
             }
             thread::KernelAction::Done
         }
@@ -925,17 +1122,15 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.set_flag32(1);
             } else {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
-                let cwds = kt.cwd_str();
+                let cwd = dos.dfs.get_cwd();
                 unsafe {
-                    let mut pos = 0;
-                    for &b in cwds {
-                        // Convert '/' to '\' for DOS, skip trailing slash
-                        if b == b'/' && pos + 1 >= cwds.len() { break; }
-                        *((addr + pos as u32) as *mut u8) = if b == b'/' { b'\\' } else { b };
-                        pos += 1;
+                    for (i, &b) in cwd.iter().enumerate() {
+                        *((addr + i as u32) as *mut u8) = b;
                     }
-                    *((addr + pos as u32) as *mut u8) = 0; // NUL terminate
+                    *((addr + cwd.len() as u32) as *mut u8) = 0;
                 }
+                dos_trace!("D21 47 DL={:02X} out=\"{}\"",
+                    dl, core::str::from_utf8(cwd).unwrap_or("?"));
                 regs.clear_flag32(1);
             }
             thread::KernelAction::Done
@@ -1047,13 +1242,12 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 path[i] = ch;
                 i += 1;
             }
-            let i = dos_normalize_path(&mut path, i);
-            let result = dos_chdir(kt, &path[..i]);
-            if result < 0 {
-                regs.set_flag32(1); // set CF
-                regs.rax = (regs.rax & !0xFFFF) | 3; // AX=3 path not found
+            let err = dos.dfs.chdir(&path[..i]);
+            if err != 0 {
+                regs.set_flag32(1);
+                regs.rax = (regs.rax & !0xFFFF) | err as u64;
             } else {
-                regs.clear_flag32(1); // clear CF
+                regs.clear_flag32(1);
             }
             thread::KernelAction::Done
         }
@@ -1074,18 +1268,23 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.rax = (regs.rax & !0xFFFF) | EMS_DEVICE_HANDLE as u64;
                 regs.clear_flag32(1);
             } else {
-                let i = dos_normalize_path(&mut name, i);
-                let mut rbuf = [0u8; 164];
-                let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
-                let _name_str = core::str::from_utf8(resolved).unwrap_or("?");
-                dos_trace!("D21 3D open \"{}\"", _name_str);
-                let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
+                let raw_name_str = core::str::from_utf8(&name[..i]).unwrap_or("?");
+                dos_trace!("D21 3D raw=\"{}\" cwd=\"{}\"", raw_name_str,
+                    core::str::from_utf8(dos.dfs.get_cwd()).unwrap_or("?"));
+                let fd = match dfs_open_existing(dos, &name[..i]) {
+                    Ok(buf) => {
+                        let (ref path, len) = buf;
+                        dos_trace!("D21 3D open \"{}\"", core::str::from_utf8(&path[..len]).unwrap_or("?"));
+                        crate::kernel::vfs::open(&path[..len], &mut kt.fds)
+                    }
+                    Err(e) => -e,
+                };
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(fd as u16, size);
                     unsafe {
-                        let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
+                        let psp = ((dos.current_psp as u32) * 16) as *mut u8;
                         if (fd as usize) < 20 { *psp.add(0x34 + fd as usize) = fd as u8; }
                     }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
@@ -1129,7 +1328,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.clear_flag32(1);
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
+                crate::dbg_println!("D21 3F enter h={} req={:#X} buf={:08X}", handle, count, buf_addr);
                 let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
+                crate::dbg_println!("D21 3F exit  h={} req={:#X} got={:#X}", handle, count, n);
                 if n >= 0 {
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
@@ -1153,30 +1354,44 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 addr += 1;
                 raw_len += 1;
             }
-            // Normalize: backslash -> slash, strip drive letter
-            let norm_len = dos_normalize_path(&mut raw, raw_len);
-            // Resolve against cwd (handle absolute vs relative)
-            let mut resolved = [0u8; 96];
-            let res_len = {
-                let mut rlen = 0;
-                if norm_len > 0 && raw[0] == b'/' {
-                    for i in 1..norm_len {
-                        if rlen < resolved.len() { resolved[rlen] = raw[i]; rlen += 1; }
-                    }
-                } else {
-                    for &b in kt.cwd_str() {
-                        if rlen < resolved.len() { resolved[rlen] = b; rlen += 1; }
-                    }
-                    for i in 0..norm_len {
-                        if rlen < resolved.len() { resolved[rlen] = raw[i]; rlen += 1; }
-                    }
+            // Resolve DOS path (last component may be a wildcard pattern).
+            // Walk the directory components via DFS; append the pattern verbatim.
+            let mut abs = [0u8; dfs::DFS_PATH_MAX];
+            let alen = match dos.dfs.resolve(&raw[..raw_len], &mut abs) {
+                Ok(n) => n,
+                Err(_) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 3;
+                    regs.set_flag32(1);
+                    return thread::KernelAction::Done;
                 }
-                rlen
             };
-            // Store in find state
-            let store_len = res_len.min(dos.find_path.len());
-            dos.find_path[..store_len].copy_from_slice(&resolved[..store_len]);
-            dos.find_path_len = store_len as u8;
+            // Split at last '\' to separate dir from pattern.
+            let split = abs[..alen].iter().rposition(|&b| b == b'\\').unwrap_or(0);
+            let dir_dos = &abs[..split + 1]; // includes trailing '\'
+            let pat = &abs[split + 1..alen];
+            // Strip trailing '\' for walk (keep "X:\" if dir_dos is exactly that).
+            let dir_for_walk = if dir_dos.len() > 3 { &dir_dos[..dir_dos.len() - 1] } else { dir_dos };
+            let mut vfs_dir = [0u8; dfs::DFS_PATH_MAX];
+            let vlen = match dfs::DfsState::to_vfs_open(dir_for_walk, &mut vfs_dir) {
+                Ok(n) => n,
+                Err(e) => {
+                    regs.rax = (regs.rax & !0xFFFF) | e as u64;
+                    regs.set_flag32(1);
+                    return thread::KernelAction::Done;
+                }
+            };
+            // Compose "vfs_dir/pat" in dos.find_path.
+            let mut pos = 0;
+            for &b in &vfs_dir[..vlen] {
+                if pos < dos.find_path.len() { dos.find_path[pos] = b; pos += 1; }
+            }
+            if vlen > 0 && pos < dos.find_path.len() {
+                dos.find_path[pos] = b'/'; pos += 1;
+            }
+            for &b in pat {
+                if pos < dos.find_path.len() { dos.find_path[pos] = b; pos += 1; }
+            }
+            dos.find_path_len = pos as u8;
             dos.find_idx = 0;
             find_matching_file(dos, regs)
         }
@@ -1211,7 +1426,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 dos.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
                 let action = exec_return(dos, regs, parent);
                 if resident_top > dos.heap_seg {
-                    dos.heap_seg = resident_top;
+                    dos_reset_blocks(dos, resident_top);
                 }
                 return action;
             }
@@ -1221,40 +1436,39 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
             let need = regs.rbx as u16;
-            let avail = 0xA000u16.saturating_sub(dos.heap_seg);
-            if need <= avail {
-                let seg = dos.heap_seg;
-                dos.heap_seg += need;
-                regs.rax = (regs.rax & !0xFFFF) | seg as u64;
-                regs.clear_flag32(1);
-            } else {
-                regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
-                regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
-                regs.set_flag32(1);
+            match dos_alloc_block(dos, need) {
+                Ok(seg) => {
+                    regs.rax = (regs.rax & !0xFFFF) | seg as u64;
+                    regs.clear_flag32(1);
+                }
+                Err(avail) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
+                    regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
+                    regs.set_flag32(1);
+                }
             }
             thread::KernelAction::Done
         }
         // AH=0x49: Free memory (ES=segment)
         0x49 => {
-            // Simple bump allocator — free is a no-op
-            regs.clear_flag32(1);
+            match dos_free_block(dos, regs.es as u16) {
+                Ok(()) => regs.clear_flag32(1),
+                Err(err) => {
+                    regs.rax = (regs.rax & !0xFFFF) | err as u64;
+                    regs.set_flag32(1);
+                }
+            }
             thread::KernelAction::Done
         }
         // AH=0x4A: Resize memory block (ES=segment, BX=new size in paragraphs)
         0x4A => {
-            let es = regs.es as u16;
-            let new_end32 = es as u32 + regs.rbx as u16 as u32;
-            if new_end32 <= 0xA000 {
-                let new_end = new_end32 as u16;
-                // Program resizing its block — free memory starts after it
-                dos.heap_seg = new_end;
-                regs.clear_flag32(1);
-            } else {
-                // Not enough memory — report max available
-                let avail = 0xA000u16.saturating_sub(es);
-                regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
-                regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
-                regs.set_flag32(1);
+            match dos_resize_block(dos, regs.es as u16, regs.rbx as u16) {
+                Ok(()) => regs.clear_flag32(1),
+                Err((err, max)) => {
+                    regs.rax = (regs.rax & !0xFFFF) | err as u64;
+                    regs.rbx = (regs.rbx & !0xFFFF) | max as u64;
+                    regs.set_flag32(1);
+                }
             }
             thread::KernelAction::Done
         }
@@ -1301,6 +1515,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     regs.clear_flag32(1);
                 }
                 _ => {
+                    dos_trace!("D21 44 (IOCTL) unsupported AL={:02X} BX={:04X} CX={:04X}",
+                        al, regs.rbx as u16, regs.rcx as u16);
                     regs.rax = (regs.rax & !0xFFFF) | 1;
                     regs.set_flag32(1);
                 }
@@ -1324,10 +1540,10 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 addr += 1;
                 i += 1;
             }
-            let i = dos_normalize_path(&mut name, i);
-            let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
-            let fd = crate::kernel::vfs::create(resolved, &mut kt.fds);
+            let fd = match dfs_create_path(dos, &name[..i]) {
+                Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
+                Err(e) => -e,
+            };
             if fd >= 0 {
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
@@ -1372,6 +1588,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let offset = ((regs.rcx as u16 as u32) << 16 | regs.rdx as u16 as u32) as i32;
                 let whence = regs.rax as u8 as i32; // AL = origin
                 let result = crate::kernel::vfs::seek(handle, offset, whence, &kt.fds);
+                dos_trace!("D21 42 h={} whence={} off={:#X} -> {:#X}", handle, whence, offset as u32, result);
                 if result >= 0 {
                     // Return new position in DX:AX
                     regs.rdx = (regs.rdx & !0xFFFF) | ((result as u32 >> 16) as u64);
@@ -1401,11 +1618,10 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 addr += 1;
                 i += 1;
             }
-            let i = dos_normalize_path(&mut name, i);
-            let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
-            // Check if file exists by trying to open it
-            let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
+            let fd = match dfs_open_existing(dos, &name[..i]) {
+                Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
+                Err(e) => -e,
+            };
             if fd >= 0 {
                 crate::kernel::vfs::close(fd, &mut kt.fds);
                 if al == 0 {
@@ -1559,6 +1775,12 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 name[len] = ch;
                 len += 1;
             }
+            {
+                let cs = regs.frame.cs as u16;
+                let ip = regs.frame.rip as u32;
+                dos_trace!("D21 60 in=\"{}\" cs:ip={:04X}:{:08X}",
+                    core::str::from_utf8(&name[..len]).unwrap_or("?"), cs, ip);
+            }
             // Build canonical path: if no drive letter, prepend "C:\"
             let mut out = [0u8; 128];
             let mut pos;
@@ -1575,13 +1797,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     pos += 1;
                 }
             } else {
-                // Relative — prepend C:\ + CWD
+                // Relative — prepend C:\ + CWD (DFS already in DOS form).
                 out[0] = b'C'; out[1] = b':'; out[2] = b'\\';
                 pos = 3;
-                let cwds = kt.cwd_str();
+                let cwds = dos.dfs.get_cwd();
                 for &ch in cwds {
                     if pos >= 127 { break; }
-                    out[pos] = if ch == b'/' { b'\\' } else { ch.to_ascii_uppercase() };
+                    out[pos] = ch;
                     pos += 1;
                 }
                 if pos > 3 && out[pos - 1] != b'\\' { out[pos] = b'\\'; pos += 1; }
@@ -1648,10 +1870,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 addr += 1;
                 i += 1;
             }
-            let i = dos_normalize_path(&mut name, i);
-            let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
-            crate::kernel::vfs::delete(resolved);
+            if let Ok((path, len)) = dfs_open_existing(dos, &name[..i]) {
+                crate::kernel::vfs::delete(&path[..len]);
+            }
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -1685,6 +1906,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     regs.clear_flag32(1);
                 }
                 _ => {
+                    dos_trace!("D21 58 unsupported AL={:02X}", al);
                     regs.rax = (regs.rax & !0xFFFF) | 1;
                     regs.set_flag32(1);
                 }
@@ -1710,12 +1932,20 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // Undocumented sibling of AH=62h.
         0x51 => {
             regs.rbx = (regs.rbx & !0xFFFF) | dos.current_psp as u64;
+            let cs = regs.frame.cs as u16;
+            let ip = regs.frame.rip as u32;
+            dos_trace!("D21 51 -> BX={:04X} cs:ip={:04X}:{:08X}",
+                dos.current_psp, cs, ip);
             thread::KernelAction::Done
         }
         // AH=0x62: Get PSP segment (returns BX=PSP segment)
         0x62 => {
             regs.rbx = (regs.rbx & !0xFFFF) | dos.current_psp as u64;
             regs.clear_flag32(1);
+            let cs = regs.frame.cs as u16;
+            let ip = regs.frame.rip as u32;
+            dos_trace!("D21 62 -> BX={:04X} cs:ip={:04X}:{:08X}",
+                dos.current_psp, cs, ip);
             thread::KernelAction::Done
         }
         // AH=0x6C: Extended Open/Create (DOS 4.0+)
@@ -1733,19 +1963,19 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 addr += 1;
                 i += 1;
             }
-            let i = dos_normalize_path(&mut name, i);
-            let mut rbuf = [0u8; 164];
-            let resolved = dos_resolve_path(kt, &name[..i], &mut rbuf);
             let open_exists = action & 0x01 != 0;
             let create_not = action & 0x10 != 0;
 
             // Try open first
-            let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
+            let fd = match dfs_open_existing(dos, &name[..i]) {
+                Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
+                Err(e) => -e,
+            };
             if fd >= 0 && open_exists {
                 let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                 sft_set_file(fd as u16, size);
                 unsafe {
-                    let psp = (COM_SEGMENT as u32 * 16) as *mut u8;
+                    let psp = ((dos.current_psp as u32) * 16) as *mut u8;
                     if (fd as usize) < 20 { *psp.add(0x34 + fd as usize) = fd as u8; }
                 }
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
@@ -1754,7 +1984,10 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             } else if create_not {
                 // File doesn't exist — create RAM-backed file via VFS overlay
                 if fd >= 0 { crate::kernel::vfs::close(fd, &mut kt.fds); }
-                let new_fd = crate::kernel::vfs::create(resolved, &mut kt.fds);
+                let new_fd = match dfs_create_path(dos, &name[..i]) {
+                    Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
+                    Err(e) => -e,
+                };
                 if new_fd >= 0 {
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
@@ -1791,6 +2024,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     regs.clear_flag32(1);
                 }
                 _ => {
+                    dos_trace!("D21 5D unsupported AL={:02X}", al);
                     regs.rax = (regs.rax & !0xFFFF) | 1; // invalid function
                     regs.set_flag32(1);
                 }
@@ -1842,10 +2076,9 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     while end < copy && cmd[end] != b' ' && cmd[end] != b'\r' && cmd[end] != 0 { end += 1; }
     if end <= start { return thread::KernelAction::Done; }
 
-    // Normalize the program name (shift into start of cmd buffer)
+    // Shift the program name to the start of the buffer.
     let plen = end - start;
     cmd.copy_within(start..end, 0);
-    let plen = dos_normalize_path(&mut cmd, plen);
     fork_exec(dos, &cmd[..plen], kt)
 }
 
@@ -1888,7 +2121,10 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction
             thread::KernelAction::Done
         }
         _ => {
-            // Unhandled — return "not installed" (AL unchanged)
+            // Unhandled — return "not installed" (AL unchanged). Multiplex
+            // probes use this as the protocol, so it's not always a bug —
+            // log so a missing-real-TSR bug doesn't hide as "silent miss".
+            dos_trace!("D2F unsupported AX={:04X} (returning not-installed)", ax);
             thread::KernelAction::Done
         }
     }
@@ -2548,32 +2784,26 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Regs, ah: u8) -> thread:
     thread::KernelAction::Done
 }
 
-fn dos_open_program(kt: &mut thread::KernelThread, _dos: &mut thread::DosState, name: &[u8]) -> i32 {
-    let mut rbuf = [0u8; 164];
-    let resolved = dos_resolve_path(kt, name, &mut rbuf);
-    let fd = crate::kernel::vfs::open(resolved, &mut kt.fds);
+fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, name: &[u8]) -> i32 {
+    let try_open = |dos: &thread::DosState, kt: &mut thread::KernelThread, n: &[u8]| -> i32 {
+        match dfs_open_existing(dos, n) {
+            Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
+            Err(_) => -2,
+        }
+    };
+
+    let fd = try_open(dos, kt, name);
     if fd >= 0 { return fd; }
     // If the name already has a dot, don't try extensions
     if name.iter().any(|&c| c == b'.') { return fd; }
-    // Try .COM
-    let rlen = resolved.len();
-    let mut buf = [0u8; 168];
-    if rlen + 4 <= buf.len() {
-        buf[..rlen].copy_from_slice(resolved);
-        buf[rlen..rlen + 4].copy_from_slice(b".COM");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut kt.fds);
-        if fd >= 0 { return fd; }
-    }
-    // Try .EXE
-    if rlen + 4 <= buf.len() {
-        buf[rlen..rlen + 4].copy_from_slice(b".EXE");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut kt.fds);
-        if fd >= 0 { return fd; }
-    }
-    // Try .ELF
-    if rlen + 4 <= buf.len() {
-        buf[rlen..rlen + 4].copy_from_slice(b".ELF");
-        let fd = crate::kernel::vfs::open(&buf[..rlen + 4], &mut kt.fds);
+    // Try .COM / .EXE / .ELF in turn
+    let mut buf = [0u8; 132];
+    let nlen = name.len();
+    if nlen + 4 > buf.len() { return -2; }
+    buf[..nlen].copy_from_slice(name);
+    for ext in [b".COM", b".EXE", b".ELF"] {
+        buf[nlen..nlen + 4].copy_from_slice(ext);
+        let fd = try_open(dos, kt, &buf[..nlen + 4]);
         if fd >= 0 { return fd; }
     }
     -2 // ENOENT
@@ -2588,7 +2818,7 @@ fn dos_open_program(kt: &mut thread::KernelThread, _dos: &mut thread::DosState, 
 ///
 /// Only the first command is executed — multi-line BAT semantics (loops,
 /// conditionals, state) are out of scope for this basic handler.
-fn expand_bat(_dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize, kt: &mut thread::KernelThread) -> usize {
+fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize, kt: &mut thread::KernelThread) -> usize {
     // Case-insensitive suffix check for ".BAT"
     if flen < 4 { return flen; }
     let tail = &filename[flen - 4..flen];
@@ -2597,12 +2827,11 @@ fn expand_bat(_dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize
         && (tail[2] & 0xDF) == b'A'
         && (tail[3] & 0xDF) == b'T') { return flen; }
 
-    let mut resolved = [0u8; 164];
-    let res = dos_resolve_path(kt, &filename[..flen], &mut resolved);
-    let rlen = res.len();
-    let mut path = [0u8; 164];
-    path[..rlen].copy_from_slice(&resolved[..rlen]);
-    let fd = crate::kernel::vfs::open(&path[..rlen], &mut kt.fds);
+    let (vfs_path, vfs_len) = match dfs_open_existing(dos, &filename[..flen]) {
+        Ok(v) => v,
+        Err(_) => return flen,
+    };
+    let fd = crate::kernel::vfs::open(&vfs_path[..vfs_len], &mut kt.fds);
     if fd < 0 { return flen; }
 
     let mut buf = [0u8; 512];
@@ -2644,18 +2873,26 @@ fn expand_bat(_dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize
         // Zero the buffer first so leftover bytes don't leak
         for b in filename.iter_mut() { *b = 0; }
         filename[..tok_len].copy_from_slice(&buf[start..start + tok_len]);
-        return dos_normalize_path(filename, tok_len);
+        return tok_len;
     }
     flen
 }
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec(_dos: &mut thread::DosState, prog_name: &[u8], kt: &mut thread::KernelThread) -> thread::KernelAction {
-    // Resolve to full path using DOS cwd
+fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], _kt: &mut thread::KernelThread) -> thread::KernelAction {
+    // Resolve raw DOS name → VFS path via DFS.
     let mut path = [0u8; 164];
-    let resolved = dos_resolve_path(kt, prog_name, &mut path);
-    let path_len = resolved.len();
+    let path_len = match dfs_open_existing(dos, prog_name) {
+        Ok((p, len)) => {
+            path[..len].copy_from_slice(&p[..len]);
+            len
+        }
+        Err(_) => {
+            // Let the event loop handle ENOENT by reporting failure.
+            return thread::KernelAction::Done;
+        }
+    };
 
     fn on_error(regs: &mut Regs, err: i32) {
         regs.rax = (regs.rax & !0xFFFF) | err as u64;
@@ -2683,10 +2920,17 @@ fn fork_exec(_dos: &mut thread::DosState, prog_name: &[u8], kt: &mut thread::Ker
 /// which uses synth INT 31h AH=01h to fork+exec+wait a separate thread.
 fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let al = regs.rax as u8;
-    if al != 0 {
-        regs.rax = (regs.rax & !0xFFFF) | 1;
-        regs.set_flag32(1);
-        return thread::KernelAction::Done;
+    match al {
+        0x00 => {}                                  // load & execute — fall through
+        0x03 => return exec_load_overlay(kt, dos, regs),
+        // AL=01 (load only) and AL=02 (reserved) not implemented. Borland BC
+        // and Watcom tools use 00/03 exclusively; surface others so we notice.
+        _ => {
+            dos_trace!("D21 4B unsupported AL={:02X}", al);
+            regs.rax = (regs.rax & !0xFFFF) | 1;
+            regs.set_flag32(1);
+            return thread::KernelAction::Done;
+        }
     }
 
     // Read ASCIIZ filename from DS:DX
@@ -2713,9 +2957,21 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         core::ptr::copy_nonoverlapping((cmdtail_addr + 1) as *const u8, tail.as_mut_ptr(), copy_len);
     }
 
-    // Normalize the filename (drive letters, backslashes)
-    let flen = dos_normalize_path(&mut filename, flen);
     let prog_name: &[u8] = &filename[..flen];
+
+    // TRACE: log cmdtail and filename BC passes to EXEC
+    {
+        let mut tail_vis = [0u8; 80];
+        let vis_len = copy_len.min(80);
+        for i in 0..vis_len {
+            let b = tail[i];
+            tail_vis[i] = if b < 32 || b >= 127 { b'?' } else { b };
+        }
+        dos_trace!("EXEC prog={:?} cmdtail_len={} tail={:?}",
+            core::str::from_utf8(prog_name).unwrap_or("?"),
+            copy_len,
+            core::str::from_utf8(&tail_vis[..vis_len]).unwrap_or("?"));
+    }
 
     // --- DOS program: in-process exec (shared address space) ---
     let fd = dos_open_program(kt, dos, prog_name);
@@ -2744,24 +3000,33 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     }
 
     let is_exe = is_mz_exe(&buf);
-    let child_seg = dos.heap_seg;
+    // Layout the child's two arenas above the parent's heap end: env block
+    // first (0x10 paragraphs), then PSP+code/BSS. `map_psp` places env at
+    // `psp_seg - 0x10`, so `child_seg = heap_seg + 0x10` keeps the env safely
+    // inside the child's own allocation and never inside parent memory.
+    let child_seg = dos.heap_seg + 0x10;
     crate::dbg_println!("  exec_program: {:?} size={} exe={} child_seg={:04X} parent_psp={:04X}",
         core::str::from_utf8(prog_name), size, is_exe, child_seg, dos.current_psp);
 
-    let mut resolved_copy = [0u8; 164];
-    let resolved_name = dos_resolve_path(kt, prog_name, &mut resolved_copy);
-    let rlen = resolved_name.len();
+    // Resolve the DOS-form absolute path for the env program-path suffix.
+    // Must be drive-qualified uppercase (e.g. "C:\BIN\PROG.EXE") — DOS
+    // extenders derive their cwd estimate from this field.
+    let mut abs_dos = [0u8; dfs::DFS_PATH_MAX];
+    let abs_len = dos.dfs.resolve(prog_name, &mut abs_dos).unwrap_or(0);
 
-    // Inherit parent's env block. In DPMI mode the parent's PSP[0x2C] has
-    // been patched to a selector, so use the saved original RM segment.
-    // Otherwise read the segment value straight out of the parent PSP.
-    let parent_env_seg = if let Some(dpmi) = dos.dpmi.as_ref() {
-        Some(dpmi.env_seg_orig)
-    } else {
-        Some(unsafe { ((COM_SEGMENT as u32 * 16 + 0x2C) as *const u16).read_unaligned() })
+    // Snapshot parent's env block. In PM the parent's PSP[0x2C] may hold a
+    // selector (32-bit client) and dos.current_psp is PSP_SEL — read the
+    // captured RM env paragraph from DpmiState. In RM PSP[0x2C] is the RM
+    // segment. Same address space here, but read into a Vec so map_psp's
+    // signature matches the cross-address-space fork+exec path.
+    let parent_psp = dos.current_psp;
+    let parent_env_seg = match dos.dpmi.as_ref() {
+        Some(dpmi) if parent_psp == dpmi::PSP_SEL => dpmi.saved_rm_env,
+        _ => unsafe { (((parent_psp as u32) * 16 + 0x2C) as *const u16).read_unaligned() },
     };
+    let parent_env_vec = snapshot_env(parent_env_seg);
     let (cs, ip, ss, sp, end_seg) = if is_exe {
-        match load_exe_at(child_seg, COM_SEGMENT, parent_env_seg, &buf, &resolved_copy[..rlen]) {
+        match load_exe_at(child_seg, parent_psp, Some(&parent_env_vec), &buf, &abs_dos[..abs_len]) {
             Some(t) => t,
             None => {
                 regs.rax = (regs.rax & !0xFFFF) | 11;
@@ -2770,7 +3035,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
             }
         }
     } else {
-        load_com_at(child_seg, COM_SEGMENT, parent_env_seg, &buf, &resolved_copy[..rlen])
+        load_com_at(child_seg, parent_psp, Some(&parent_env_vec), &buf, &abs_dos[..abs_len])
     };
 
     // Copy command tail to child's PSP at child_seg:0080
@@ -2786,8 +3051,12 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // stack at current SS:SP. exec_return restores SS:SP so stub_dispatch
     // pops the frame and resumes the parent.
     let prev = dos.exec_parent.take();
-    let parent_psp = dos.current_psp;
+    let parent_heap = dos.heap_seg;
+    let parent_heap_base = dos.heap_base_seg;
+    let parent_blocks = dos.dos_blocks.clone();
     dos.heap_seg = end_seg.max(dos.heap_seg);
+    dos.heap_base_seg = dos.heap_seg;
+    dos.dos_blocks.clear();
     dos.dta = (child_seg as u32) * 16 + 0x80;
     dos.current_psp = child_seg;
     dos.exec_parent = Some(ExecParent {
@@ -2795,8 +3064,10 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         sp: vm86_sp(regs),
         ds: regs.ds as u16,
         es: regs.es as u16,
-        heap_seg: child_seg,
+        heap_seg: parent_heap,
+        heap_base_seg: parent_heap_base,
         psp: parent_psp,
+        dos_blocks: parent_blocks,
         prev: prev.map(alloc::boxed::Box::new),
     });
 
@@ -2816,36 +3087,112 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     thread::KernelAction::Done
 }
 
-#[allow(dead_code)]
-/// Load a .COM binary into VM86 memory at the child segment (above the parent).
-/// Creates a minimal PSP at child_seg:0000 and loads code at child_seg:0100.
-fn load_com_child(data: &[u8], child_seg: u16) -> (u16, u16, u16, u16) {
-    let base = (child_seg as u32) << 4;
-    // Minimal child PSP: INT 20h at offset 0, parent PSP, env segment
-    unsafe {
-        let psp = base as *mut u8;
-        core::ptr::write_bytes(psp, 0, 256);
-        *psp = 0xCD;                         // INT 20h
-        *psp.add(1) = 0x20;
-        *psp.add(2) = 0x00;                  // top of memory
-        *psp.add(3) = 0xA0;                  // = 0xA000
-        // parent PSP = COM_SEGMENT (the original PSP)
-        (psp.add(0x16) as *mut u16).write_unaligned(COM_SEGMENT);
-        // copy env segment from parent PSP
-        let parent_env = ((COM_SEGMENT as u32 * 16 + 0x2C) as *const u16).read_unaligned();
-        (psp.add(0x2C) as *mut u16).write_unaligned(parent_env);
-        // command tail
-        *psp.add(0x80) = 0;
-        *psp.add(0x81) = 0x0D;
+/// DOS INT 21h/4B AL=03 — Load Overlay.
+/// Loads a program into caller-chosen memory. No PSP, no control transfer,
+/// no address-space changes. Parameter block at ES:BX:
+///   WORD 0: load_segment  — where the file image goes
+///   WORD 2: reloc_factor  — value added to each relocated word for MZ EXE
+/// For .COM / flat binaries the file is copied verbatim at load_seg:0.
+/// For MZ .EXE the load module is copied at load_seg:0 and each relocation
+/// entry gets `reloc_factor` added (NOT load_seg — the spec leaves it to
+/// the caller, e.g. Borland C passes the segment of the overlay frame).
+fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    // ASCIIZ filename at DS:DX
+    let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
+    let mut filename = [0u8; 128];
+    let mut flen = 0;
+    while flen < 127 {
+        let ch = unsafe { *(addr as *const u8) };
+        if ch == 0 { break; }
+        filename[flen] = ch;
+        flen += 1;
+        addr += 1;
     }
-    // Load .COM code at child_seg:0100
-    let load_addr = base + COM_OFFSET as u32;
-    unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), load_addr as *mut u8, data.len());
-    }
-    (child_seg, COM_OFFSET, child_seg, COM_SP)
-}
+    let prog_name: &[u8] = &filename[..flen];
 
+    // Parameter block at ES:BX — two WORDs.
+    let pb = linear(dos, regs, regs.es as u16, regs.rbx as u32);
+    let load_seg = unsafe { (pb as *const u16).read_unaligned() };
+    let reloc_factor = unsafe { ((pb + 2) as *const u16).read_unaligned() };
+    dos_trace!("D21 4B03 LOAD_OVERLAY prog={:?} load_seg={:04X} reloc_factor={:04X}",
+        core::str::from_utf8(prog_name).unwrap_or("?"), load_seg, reloc_factor);
+
+    let fd = dos_open_program(kt, dos, prog_name);
+    if fd < 0 {
+        dos_trace!("D21 4B03 open failed: {:?}", core::str::from_utf8(prog_name).unwrap_or("?"));
+        regs.rax = (regs.rax & !0xFFFF) | 2;
+        regs.set_flag32(1);
+        return thread::KernelAction::Done;
+    }
+    let size = crate::kernel::vfs::seek(fd, 0, 2, &kt.fds);
+    if size <= 0 {
+        crate::kernel::vfs::close(fd, &mut kt.fds);
+        regs.rax = (regs.rax & !0xFFFF) | 2;
+        regs.set_flag32(1);
+        return thread::KernelAction::Done;
+    }
+    crate::kernel::vfs::seek(fd, 0, 0, &kt.fds);
+    let mut buf = alloc::vec![0u8; size as usize];
+    crate::kernel::vfs::read_raw(fd, &mut buf, &kt.fds);
+    crate::kernel::vfs::close(fd, &mut kt.fds);
+
+    let load_base = (load_seg as u32) << 4;
+    if is_mz_exe(&buf) {
+        let data = &buf[..];
+        let w = |off: usize| u16::from_le_bytes([data[off], data[off + 1]]);
+        let last_page_bytes = w(0x02) as u32;
+        let total_pages = w(0x04) as u32;
+        let reloc_count = w(0x06) as usize;
+        let header_paragraphs = w(0x08) as u32;
+        let reloc_offset = w(0x18) as usize;
+
+        let file_size = if last_page_bytes == 0 {
+            total_pages * 512
+        } else {
+            (total_pages - 1) * 512 + last_page_bytes
+        };
+        let header_size = header_paragraphs * 16;
+        let load_size = file_size.saturating_sub(header_size) as usize;
+        let reloc_end = reloc_offset + reloc_count * 4;
+
+        if header_size as usize > data.len()
+            || load_size > data.len() - header_size as usize
+            || reloc_end > data.len()
+        {
+            dos_trace!("D21 4B03 bad MZ header");
+            regs.rax = (regs.rax & !0xFFFF) | 11;
+            regs.set_flag32(1);
+            return thread::KernelAction::Done;
+        }
+
+        let img = &data[header_size as usize..header_size as usize + load_size];
+        unsafe {
+            core::ptr::copy_nonoverlapping(img.as_ptr(), load_base as *mut u8, load_size);
+        }
+        // Apply relocations using caller's reloc_factor (not load_seg).
+        for i in 0..reloc_count {
+            let entry = reloc_offset + i * 4;
+            let off = w(entry) as u32;
+            let seg = w(entry + 2) as u32;
+            let a = load_base + (seg << 4) + off;
+            unsafe {
+                let p = a as *mut u16;
+                let v = p.read_unaligned();
+                p.write_unaligned(v.wrapping_add(reloc_factor));
+            }
+        }
+        dos_trace!("D21 4B03 MZ loaded: load_size={} relocs={}", load_size, reloc_count);
+    } else {
+        // Raw / .COM: copy file verbatim at load_seg:0.
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), load_base as *mut u8, buf.len());
+        }
+        dos_trace!("D21 4B03 raw loaded: size={}", buf.len());
+    }
+
+    regs.clear_flag32(1);
+    thread::KernelAction::Done
+}
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
@@ -2860,7 +3207,9 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) 
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
     dos.heap_seg = parent.heap_seg;
+    dos.heap_base_seg = parent.heap_base_seg;
     dos.current_psp = parent.psp;
+    dos.dos_blocks = parent.dos_blocks;
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }
@@ -2873,7 +3222,9 @@ pub struct ExecParent {
     pub ds: u16,
     pub es: u16,
     pub heap_seg: u16,
+    pub heap_base_seg: u16,
     pub psp: u16,
+    pub dos_blocks: alloc::vec::Vec<DosMemBlock>,
     pub prev: Option<alloc::boxed::Box<ExecParent>>,
 }
 
@@ -2925,101 +3276,29 @@ fn dos_wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
     true
 }
 
-/// Change working directory. Path is already normalized (no drive letters, forward slashes).
-/// Updates the thread's cwd after validating the directory exists.
-fn dos_chdir(kt: &mut thread::KernelThread, path: &[u8]) -> i32 {
-    if path == b".." {
-        let cwds_len = kt.cwd_len;
-        if cwds_len == 0 { return 0; }
-        let without_slash = &kt.cwd[..cwds_len.saturating_sub(1)];
-        let new_len = match without_slash.iter().rposition(|&b| b == b'/') {
-            Some(pos) => pos + 1,
-            None => 0,
-        };
-        kt.cwd_len = new_len;
-        return 0;
-    }
-
-    if path.is_empty() || path == b"/" {
-        kt.cwd_len = 0;
-        return 0;
-    }
-
-    let mut new_cwd = [0u8; 64];
-    let mut pos = 0;
-
-    if path[0] == b'/' {
-        for &b in &path[1..] {
-            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
-        }
-    } else {
-        for &b in kt.cwd_str() {
-            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
-        }
-        for &b in path {
-            if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
-        }
-    }
-    if pos > 0 && new_cwd[pos - 1] != b'/' {
-        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
-    }
-
-    let prefix = &new_cwd[..pos];
-    if !crate::kernel::vfs::dir_exists(prefix) {
-        return -2;
-    }
-
-    kt.set_cwd(prefix);
-    0
+/// Resolve a raw DOS path to a VFS path for OPEN (all components must exist).
+/// Returns `([u8; DFS_PATH_MAX], len)` on success, DOS error code on failure
+/// (2 = file not found, 3 = path not found, 15 = invalid drive).
+pub(crate) fn dfs_open_existing(dos: &thread::DosState, dos_in: &[u8])
+    -> Result<([u8; dfs::DFS_PATH_MAX], usize), i32>
+{
+    let mut abs = [0u8; dfs::DFS_PATH_MAX];
+    let alen = dos.dfs.resolve(dos_in, &mut abs)?;
+    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    let vlen = dfs::DfsState::to_vfs_open(&abs[..alen], &mut out)?;
+    Ok((out, vlen))
 }
 
-/// Resolve a normalized path to an absolute VFS path.
-/// Leading `/` = absolute (strip slash). Otherwise prepend cwd.
-/// Returns the resolved path length in `out`.
-fn dos_resolve_path<'a>(kt: &thread::KernelThread, path: &[u8], out: &'a mut [u8; 164]) -> &'a [u8] {
-    let mut pos = 0;
-    if !path.is_empty() && path[0] == b'/' {
-        for &b in &path[1..] {
-            if pos < out.len() { out[pos] = b; pos += 1; }
-        }
-    } else {
-        for &b in kt.cwd_str() {
-            if pos < out.len() { out[pos] = b; pos += 1; }
-        }
-        for &b in path {
-            if pos < out.len() { out[pos] = b; pos += 1; }
-        }
-    }
-    &out[..pos]
-}
-
-/// Normalize a DOS path in-place: convert `\` to `/`, strip drive letter.
-/// `C:\foo` → `/foo` (absolute), `C:foo` → `foo` (relative), `\foo` → `/foo`.
-/// Returns the new path length.
-fn dos_normalize_path(buf: &mut [u8], len: usize) -> usize {
-    // Convert backslashes to forward slashes
-    for i in 0..len {
-        if buf[i] == b'\\' { buf[i] = b'/'; }
-    }
-    // Map drive letters: H: → host/ prefix, others strip drive letter
-    if len >= 2 && buf[0].is_ascii_alphabetic() && buf[1] == b':' {
-        if buf[0] == b'H' || buf[0] == b'h' {
-            // H:\foo → /host/foo, H:foo → /host/foo
-            let rest_start = 2;
-            let has_slash = rest_start < len && buf[rest_start] == b'/';
-            let prefix = if has_slash { b"/host" as &[u8] } else { b"/host/" };
-            let rest_len = len - rest_start;
-            let new_len = prefix.len() + rest_len;
-            if new_len <= buf.len() {
-                buf.copy_within(rest_start..len, prefix.len());
-                buf[..prefix.len()].copy_from_slice(prefix);
-                return new_len;
-            }
-        }
-        buf.copy_within(2..len, 0);
-        return len - 2;
-    }
-    len
+/// Resolve a raw DOS path to a VFS path for CREATE (final component may not
+/// exist yet). Intermediate dirs must exist.
+pub(crate) fn dfs_create_path(dos: &thread::DosState, dos_in: &[u8])
+    -> Result<([u8; dfs::DFS_PATH_MAX], usize), i32>
+{
+    let mut abs = [0u8; dfs::DFS_PATH_MAX];
+    let alen = dos.dfs.resolve(dos_in, &mut abs)?;
+    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    let vlen = dfs::DfsState::to_vfs_create(&abs[..alen], &mut out)?;
+    Ok((out, vlen))
 }
 
 /// FindFirst/FindNext helper: resume search from dos.find_idx,
@@ -3117,6 +3396,11 @@ pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
 /// their BIOS handlers run on a private IRQ stack, not the user's stack.
 pub(crate) const SLOT_HW_IRQ_BASE: u8 = 0xE0;
 pub(crate) const SLOT_HW_IRQ_END: u8 = 0xF0; // exclusive (16 IRQs)
+/// VM86-only: RM IRET target for implicit INT reflection (no PM handler
+/// installed, default stub reflected to RM). `rm_int_return` restores PM
+/// state and synthesizes the STI that DPMI spec requires IRQ handlers to
+/// perform before IRET — our default stub is the nominal handler here.
+pub(crate) const SLOT_RM_INT_RET: u8 = 0xFA;
 /// PM return trampoline for both soft-INT and HW-IRQ handlers. The handler's
 /// IRET lands here; `pm_int_return` pops the saved client state.
 /// `vector_stub_reflect` also saves the PM resume-EIP here so that RM
@@ -3238,7 +3522,7 @@ fn setup_lol_sft() {
         // points to itself, terminating the PSP parent chain. Real DOS
         // does the same for COMMAND.COM. This is what the initial program's
         // PSP[0x16] points to, so DPMILOAD's grandparent check succeeds
-        // (grandparent = SYSPSP_SEG != parent = COM_SEGMENT).
+        // (grandparent = SYSPSP_SEG != parent = PSP_SEGMENT).
         let syspsp = SYSPSP_ADDR as *mut u8;
         *syspsp.add(0) = 0xCD;                // INT 20h
         *syspsp.add(1) = 0x20;
@@ -3324,48 +3608,68 @@ fn sft_clear(handle: u16) {
 
 /// Map the PSP and environment for a DOS program.
 ///
-/// - PSP (256 bytes) at COM_SEGMENT:0000.
-/// - Environment block 256 bytes before PSP.
+/// - PSP (256 bytes) at `psp_seg:0000`.
+/// - Environment block 256 bytes before PSP (at `(psp_seg - 0x10):0000`).
 ///
-/// `parent_env_seg`: real-mode segment of the env block to inherit, or None
-/// to create a fresh env block. Callers running in DPMI mode must pass the
-/// original RM segment (DpmiState.env_seg_orig), not the patched selector.
+/// Per DOS EXEC (AH=4B) semantics the child always gets a FRESH env arena:
+///   - If `parent_env_data` is `Some`, copy its variable strings (up to `00 00`).
+///     The slice is the raw env block (kernel-side snapshot — must survive the
+///     parent's address space being torn down across fork+exec).
+///   - Otherwise write default COMSPEC/PATH.
+///   - Always append the DOS 3+ suffix `01 00 <prog_name> 00` — child's own
+///     path, not the parent's.
 ///
 /// Pages are written via demand paging (ring-1 writes trigger page faults
 /// that allocate fresh pages at ring 0).
-fn map_psp(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, prog_name: &[u8]) {
+fn map_psp(psp_seg: u16, parent_psp: u16, parent_env_data: Option<&[u8]>, prog_name: &[u8]) {
     let psp_addr = (psp_seg as usize) << 4;
 
-    // Environment: create fresh when no parent env supplied, otherwise inherit
-    let env_seg = if let Some(env) = parent_env_seg {
-        env
+    // Always allocate a fresh env arena for the child at psp_seg - 0x10.
+    // Env arena is 0x10 paragraphs = 256 bytes. Reserve space for the DOS 3+
+    // suffix (2 + prog_name + 1 NUL); cap the inherited-variable copy so it
+    // always fits.
+    const ENV_SIZE: usize = 256;
+    let suffix_need = 2 + prog_name.len() + 1;
+    let vars_cap = ENV_SIZE.saturating_sub(suffix_need);
+    let env_seg: u16 = psp_seg - 0x10;
+    let env_ptr = ((env_seg as usize) << 4) as *mut u8;
+    unsafe { core::ptr::write_bytes(env_ptr, 0, ENV_SIZE); }
+    let mut off = 0usize;
+    if let Some(src) = parent_env_data {
+        // Copy parent's variable strings up to and including the `00 00` terminator.
+        let mut i = 0usize;
+        let mut prev_was_nul = false;
+        while off < vars_cap && i < src.len() {
+            let b = src[i];
+            unsafe { *env_ptr.add(off) = b; }
+            i += 1; off += 1;
+            if b == 0 && prev_was_nul { break; }
+            prev_was_nul = b == 0;
+        }
     } else {
-        // First load — create env block below PSP
-        let env_seg: u16 = psp_seg - 0x10;
-        let env_ptr = ((env_seg as usize) << 4) as *mut u8;
-        unsafe { core::ptr::write_bytes(env_ptr, 0, 256); }
-        let mut off = 0;
-        let comspec = b"COMSPEC=C:\\COMMAND.COM\0";
-        unsafe { core::ptr::copy_nonoverlapping(comspec.as_ptr(), env_ptr.add(off), comspec.len()); }
-        off += comspec.len();
-        let path = b"PATH=C:\\\0";
-        unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), env_ptr.add(off), path.len()); }
-        off += path.len();
-        unsafe {
-            *env_ptr.add(off) = 0; off += 1;
-            *env_ptr.add(off) = 0x01; *env_ptr.add(off + 1) = 0x00; off += 2;
+        // Initial program — synthesize default env.
+        for src in [&b"COMSPEC=C:\\COMMAND.COM\0"[..], &b"PATH=C:\\\0"[..]] {
+            if off + src.len() > vars_cap { break; }
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), env_ptr.add(off), src.len()); }
+            off += src.len();
         }
-        let prefix = b"C:\\";
-        unsafe { core::ptr::copy_nonoverlapping(prefix.as_ptr(), env_ptr.add(off), prefix.len()); }
-        off += prefix.len();
-        for &b in prog_name {
-            let c = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
-            unsafe { *env_ptr.add(off) = c; }
-            off += 1;
-        }
-        unsafe { *env_ptr.add(off) = 0; }
-        env_seg
-    };
+        unsafe { *env_ptr.add(off) = 0; }   // double-NUL terminator
+        off += 1;
+    }
+    // DOS 3+ suffix: word 01 00, then child's own program pathname, then NUL.
+    // Drive-qualified uppercase DOS form (e.g. "C:\BIN\PROG.EXE"). DOS
+    // extenders (BC, dos4gw, dos16m) parse this field back to derive a
+    // cwd estimate — it must be in real DOS form, not VFS-form.
+    unsafe {
+        *env_ptr.add(off) = 0x01; *env_ptr.add(off + 1) = 0x00;
+    }
+    off += 2;
+    for &b in prog_name {
+        if off + 1 >= ENV_SIZE { break; }
+        unsafe { *env_ptr.add(off) = b; }
+        off += 1;
+    }
+    unsafe { *env_ptr.add(off) = 0; }
 
     // Parent-PSP segment for PSP[0x16]. For initial load (no real parent),
     // point at SYSPSP — matches real DOS, where COMMAND.COM's parent is the
@@ -3399,32 +3703,76 @@ fn map_psp(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, prog_name
         *psp_ptr.add(0x81) = 0x0D; // CR
     }
 
+    // TRACE: dump env block (first 160 bytes after suffix marker) and prog_name
+    unsafe {
+        let env_base = (env_seg as u32) * 16;
+        let p = env_base as *const u8;
+        let mut dump = [0u8; 80];
+        for i in 0..80usize {
+            let b = *p.add(i);
+            dump[i] = if b == 0 { b'.' } else if b < 32 || b >= 127 { b'?' } else { b };
+        }
+        dos_trace!("map_psp psp={:04X} env={:04X} parent_psp={:04X} prog={:?} env[0..80]={:?}",
+            psp_seg, env_seg, parent_psp,
+            core::str::from_utf8(prog_name).unwrap_or("?"),
+            core::str::from_utf8(&dump).unwrap_or("?"));
+    }
+}
+
+/// Snapshot a DOS env block (variable strings up to and including the
+/// `00 00` terminator) into a heap Vec. Used so the parent's env survives
+/// the COW fork's address-space teardown that happens before `map_psp` runs
+/// in the child.
+pub fn snapshot_env(env_seg: u16) -> alloc::vec::Vec<u8> {
+    let src = ((env_seg as usize) << 4) as *const u8;
+    let mut out = alloc::vec::Vec::new();
+    let mut prev_was_nul = false;
+    let mut i = 0usize;
+    // Cap at one paragraph-aligned env arena (256 bytes) to bound work
+    // even if the terminator is absent.
+    while i < 32768 {
+        let b = unsafe { *src.add(i) };
+        out.push(b);
+        i += 1;
+        if b == 0 && prev_was_nul { break; }
+        prev_was_nul = b == 0;
+    }
+    out
 }
 
 /// Load a DOS binary (.COM or .EXE) and initialize the thread for VM86 mode.
 /// Handles full address space setup: clean + low mem + IVT + binary load + thread init.
-/// Called from kernel exec fan-out.
-pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8]) {
+/// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
+/// snapshot (taken before the address space was torn down), or None for an
+/// initial load with no parent (synthesizes default COMSPEC/PATH).
+pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], parent_env_data: Option<&[u8]>, parent_cwd: &[u8]) {
     use crate::kernel::{startup, thread};
 
     startup::arch_user_clean();
     startup::arch_map_low_mem();
     setup_ivt();
 
+    // prog_name is VFS-form (from exec fan-out); convert to drive-qualified
+    // DOS form for the PSP environment suffix. DOS extenders parse that
+    // field back, so it must look like "C:\BIN\PROG.EXE".
+    let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
+    let dos_len = dfs::vfs_to_dos(prog_name, &mut dos_name);
+    let dos_name = &dos_name[..dos_len];
+
     let (cs, ip, ss, sp, end_seg) = if is_exe && is_mz_exe(data) {
-        load_exe(data, prog_name).unwrap_or_else(|| {
+        load_exe(data, dos_name, parent_env_data).unwrap_or_else(|| {
             crate::println!("Invalid MZ EXE");
             (0, 0, 0, 0, 0)
         })
     } else {
-        load_com(data, prog_name)
+        load_com(data, dos_name, parent_env_data)
     };
 
     let current = thread::get_thread(tid).unwrap();
-    thread::init_process_thread_vm86(current, COM_SEGMENT, cs, ip, ss, sp);
+    thread::init_process_thread_vm86(current, PSP_SEGMENT, cs, ip, ss, sp, parent_cwd);
     let dos_state = current.dos_mut();
-    dos_state.heap_seg = end_seg;
-    dos_state.dta = (COM_SEGMENT as u32) * 16 + 0x80;
+    dos_reset_blocks(dos_state, end_seg);
+    dos_state.dta = (PSP_SEGMENT as u32) * 16 + 0x80;
     current.kernel.symbols = None;
 }
 
@@ -3437,22 +3785,21 @@ pub fn is_mz_exe(data: &[u8]) -> bool {
 /// Returns (cs, ip, ss, sp) for initializing the thread.
 ///
 /// Layout:
-///   Segment COM_SEGMENT:
+///   Segment PSP_SEGMENT:
 ///     0x0000-0x00FF: PSP (Program Segment Prefix)
-///     0x0100-...:    .COM binary code
-///   Stack at COM_SEGMENT:COM_SP (top of segment)
-pub fn load_com(data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
-    load_com_at(COM_SEGMENT, COM_SEGMENT, None, data, prog_name)
+///     0x0100-...:    .COM binary code (= segment (PSP_SEGMENT+0x10):0000)
+///   Stack at PSP_SEGMENT:COM_SP (top of segment)
+pub fn load_com(data: &[u8], prog_name: &[u8], parent_env_data: Option<&[u8]>) -> (u16, u16, u16, u16, u16) {
+    load_com_at(PSP_SEGMENT, PSP_SEGMENT, parent_env_data, data, prog_name)
 }
 
 /// Returns (cs, ip, ss, sp, end_seg) — caller sets heap_seg = end_seg.
-fn load_com_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
-    map_psp(psp_seg, parent_psp, parent_env_seg, prog_name);
+fn load_com_at(psp_seg: u16, parent_psp: u16, parent_env_data: Option<&[u8]>, data: &[u8], prog_name: &[u8]) -> (u16, u16, u16, u16, u16) {
+    map_psp(psp_seg, parent_psp, parent_env_data, prog_name);
     let end_seg = psp_seg.wrapping_add(0x1000);
 
-    // Copy .COM data at offset 0x100
-    let base = (psp_seg as u32) << 4;
-    let load_addr = base + COM_OFFSET as u32;
+    // Load .COM code at psp_seg:0x100 (= (psp_seg+0x10):0).
+    let load_addr = ((psp_seg as u32) << 4) + COM_OFFSET as u32;
     unsafe {
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
@@ -3478,12 +3825,12 @@ fn load_com_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data:
 ///   0x14: initial IP
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
-pub fn load_exe(data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
-    load_exe_at(COM_SEGMENT, COM_SEGMENT, None, data, prog_name)
+pub fn load_exe(data: &[u8], prog_name: &[u8], parent_env_data: Option<&[u8]>) -> Option<(u16, u16, u16, u16, u16)> {
+    load_exe_at(PSP_SEGMENT, PSP_SEGMENT, parent_env_data, data, prog_name)
 }
 
 /// Returns (cs, ip, ss, sp, end_seg) — caller sets heap_seg = end_seg.
-fn load_exe_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
+fn load_exe_at(psp_seg: u16, parent_psp: u16, parent_env_data: Option<&[u8]>, data: &[u8], prog_name: &[u8]) -> Option<(u16, u16, u16, u16, u16)> {
     if data.len() < 28 {
         return None;
     }
@@ -3514,10 +3861,10 @@ fn load_exe_at(psp_seg: u16, parent_psp: u16, parent_env_seg: Option<u16>, data:
         return None;
     }
 
-    // Load segment: PSP is at psp_seg, load module starts one segment after
-    let load_segment = psp_seg + 0x10; // 256 bytes after PSP base
+    // Load module starts 0x10 paragraphs (256 bytes) after the PSP.
+    let load_segment = psp_seg + 0x10;
 
-    map_psp(psp_seg, parent_psp, parent_env_seg, prog_name);
+    map_psp(psp_seg, parent_psp, parent_env_data, prog_name);
 
     // Set initial heap past the loaded program (PSP + load image + min extra/BSS)
     let load_paras = ((load_size as u32 + 15) / 16) as u16;

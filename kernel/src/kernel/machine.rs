@@ -1177,6 +1177,7 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     if regs.mode() == crate::UserMode::VM86 {
         reflect_interrupt(regs, vec);
     } else {
+        crate::kernel::dos::DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
         crate::kernel::dos::dpmi::deliver_pm_int(dos, regs, vec);
     }
 }

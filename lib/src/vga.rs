@@ -94,11 +94,6 @@ impl Vga {
     }
 
     pub fn putchar(&mut self, c: u8) {
-        // Output to QEMU debug console (port 0xE9)
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") c);
-        }
-
         if !self.screen_enabled {
             return;
         }
