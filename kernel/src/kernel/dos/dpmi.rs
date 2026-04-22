@@ -57,19 +57,12 @@ pub const VECTOR_STUB_LDT_IDX: usize = 4;
 
 /// LDT index of the host "special stub" segment. Base=0, limit=0x0FFF, 16-bit.
 /// Addresses handed back to the client for host services (0305h PM save/restore,
-/// 0306h PM-to-real switch) and return trampolines the host pushes on behalf
-/// of the client (SLOT_PM_INT_RET, SLOT_EXCEPTION_RET) all live in this
-/// segment. When dpmi_int31 sees CS == this selector, pm_stub_dispatch
-/// routes by slot. Keeping this separate from VECTOR_STUB_LDT_IDX prevents the
-/// ambiguity between default-vector stubs 0xFB-0xFF and the special slots at
-/// the same offsets.
+/// 0306h PM-to-real switch) and the `SLOT_EXCEPTION_RET` return trampoline
+/// live in this segment. When dpmi_int31 sees CS == this selector,
+/// pm_stub_dispatch routes by slot. Keeping this separate from
+/// VECTOR_STUB_LDT_IDX prevents the ambiguity between default-vector stubs
+/// 0xFB-0xFF and the special slots at the same offsets.
 pub const SPECIAL_STUB_LDT_IDX: usize = 7;
-
-/// LDT index of the host PM interrupt stack selector — data segment pointing
-/// at a locked 4KB page used by host-dispatched PM interrupt handlers. Placed
-/// in the same "DPL=1 host-stub" bank as the other internal stubs so LDT[1..15]
-/// stays within CWSDPMI's reserved null range from the client's perspective.
-pub const HOST_STACK_LDT_IDX: usize = 6;
 
 /// LDT indices for the client's initial CS/DS/SS. Matches CWSDPMI's
 /// l_acode=16, l_adata=17, l_apsp=18 layout. SS lives at l_aenv=19 (CWSDPMI
@@ -121,16 +114,6 @@ pub struct DpmiState {
     /// INT). The stub LDT segment itself is 16-bit, so we can't infer this
     /// from the trapped CS — we must remember what the client declared.
     pub client_use32: bool,
-    /// Client CS:EIP and SS:ESP captured at the ring-3 → ring-0 transition.
-    /// Flags flow through the IRET frame the host pushed, so no flags snapshot
-    /// is needed. Nesting is detected by `saved_client_state.is_some()`: the
-    /// outermost arrival saves and switches to the host stack; nested arrivals
-    /// push a natural IRET frame on the host stack so innermost IRET returns
-    /// up the nest. `SLOT_PM_INT_RET` pops this slot on the outermost return.
-    pub saved_client_state: Option<(u16, u32, u16, u32)>,
-    /// Host-provided locked PM stack for interrupt handler dispatch.
-    /// (selector, linear base, size). Handler code runs on this stack.
-    pub host_stack: (u16, u32, u32),
     /// RM PSP segment captured on the most recent RM→PM transition (initial
     /// `dpmi_enter` or `raw_switch_real_to_pm`). The matching PM→RM transition
     /// uses this to restore `dos.current_psp`. While in PM, `dos.current_psp`
@@ -214,8 +197,6 @@ impl DpmiState {
             callbacks: [None; MAX_CALLBACKS],
             rm_stack_seg: 0,
             client_use32: false,
-            saved_client_state: None,
-            host_stack: (0, 0, 0),
             saved_rm_psp: 0,
             saved_rm_env: 0,
             env_ldt_idx: 0,
@@ -517,22 +498,6 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
         .expect("DPMI init: out of DOS memory for RM stack");
     dpmi.rm_stack_seg = rm_stack_seg;
 
-    // Allocate a locked PM stack for host-dispatched interrupt handlers.
-    // Placed at HOST_STACK_LDT_IDX (= 203, out of band) so it doesn't consume
-    // a low-index alloc slot — keeps DOS/4GW's view of LDT[20+] selector
-    // numbers aligned with CWSDPMI's first dynamic alloc.
-    let host_stack_size: u32 = 4096;
-    let host_stack_base = dpmi.mem_next;
-    dpmi.mem_next = dpmi.mem_next.wrapping_add(host_stack_size);
-    // DPL=3: the host dispatcher loads SS=HOST_STACK as part of ring-transition
-    // stack swap on PM interrupt dispatch; CPU requires SS.DPL == new CPL and
-    // SS.RPL == new CPL, and we dispatch into client ring (3).
-    dpmi.ldt[HOST_STACK_LDT_IDX] =
-        DpmiState::make_data_desc_ex(host_stack_base, host_stack_size - 1, use32);
-    dpmi.ldt_alloc[HOST_STACK_LDT_IDX / 32] |= 1 << (HOST_STACK_LDT_IDX % 32);
-    let host_stack_sel = DpmiState::idx_to_sel(HOST_STACK_LDT_IDX);
-    dpmi.host_stack = (host_stack_sel, host_stack_base, host_stack_size);
-
     // Round client allocation pool up to a 1 MB boundary. DOS/4GW appears to
     // treat the first 0501 base as a slab origin and takes a private code path
     // when it is not MB-aligned (matches CWSDPMI's VADDR_START=0x400000).
@@ -595,62 +560,31 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 
 /// Deliver a protected-mode interrupt (soft INT from the client, HW IRQ, or
 /// nested delivery from another handler) to the DPMI client handler for
-/// `vector`. Ring-3 → ring-0 (host) trap model:
+/// `vector`. Textbook INT-gate semantics, done in software:
 ///
-///   - Outermost (`saved_client_state` is None): save the client's CS:EIP and
-///     SS:ESP, switch to the locked host stack, push a synthetic IRET frame
-///     targeting `SLOT_PM_INT_RET` so the handler's IRET traps to
-///     `pm_int_return`, which restores the saved client state.
-///   - Nested (`saved_client_state` is Some): we're already on the host stack.
-///     Push a natural IRET frame capturing the current handler's CS:EIP so
-///     its IRET returns up the nest. No host bookkeeping change.
+///   - Push a 3-dword IRET frame (EIP, CS, EFLAGS) on the **client's own**
+///     stack capturing the state we were about to resume at CPL=3.
+///   - Redirect CS:EIP to the installed handler, clear TF so we don't
+///     single-step into it, and let the CPU run the handler on the client's
+///     stack. The handler's IRET pops the frame we just pushed and resumes
+///     the interrupted code — no host trampoline, no saved state, no stack
+///     switch. Nested deliveries use the same code path automatically.
 ///
-/// Either way the handler runs on the host stack at `pm_vectors[vector]`; if
-/// the client never installed one, that's the default vector stub whose
-/// CD 31 routes to `vector_stub_reflect` and reflects the vector to real
-/// mode. Virtual IF is cleared for interrupt-gate semantics.
+/// If no handler is installed, `pm_vectors[vector]` points at our default
+/// stub in the VECTOR_STUB segment whose CD 31 routes to
+/// `vector_stub_reflect` and reflects the vector to real mode. The reflected
+/// path restores the saved PM regs (including the IRET frame we just pushed)
+/// via `callback_return`, so the eventual unwind is the same as for a
+/// client-installed handler that IRETs.
 pub fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => return,
     };
     let (sel, off) = dpmi.pm_vectors[vector as usize];
-    let (host_ss, _host_base, host_size) = dpmi.host_stack;
-    // "Nested" means we're already on the host stack inside an outer handler,
-    // not merely that `saved_client_state` is Some. DOS/4GW's PM INT handlers
-    // chain to the client hook via far-JMP (no IRET through SLOT_PM_INT_RET),
-    // so `saved_client_state` can outlive the outer invocation. Trust SS: if
-    // we're back on the client stack, we're outermost — drop any stale state.
-    let nested = (regs.frame.ss as u16) == host_ss;
-    if !nested && dpmi.saved_client_state.is_some() {
-        dos_trace!("[DPMI] deliver_pm_int: dropping stale saved_client_state (SS={:04x} != host_ss={:04x})",
-            regs.frame.ss as u16, host_ss);
-        dpmi.saved_client_state = None;
-    }
-
-    let (ret_eip, ret_cs) = if nested {
-        // Nested: push a natural IRET frame on the current stack pointing at
-        // the outer handler's CS:EIP. The outer handler owns its SS:SP; don't
-        // switch. Handler's IRET pops this frame and resumes the outer handler.
-        (regs.ip32(), regs.code_seg())
-    } else {
-        // Outermost: save the client frame, switch to the host stack, and
-        // target SLOT_PM_INT_RET so pm_int_return unwinds on handler IRET.
-        dpmi.saved_client_state = Some((
-            regs.code_seg(),
-            regs.ip32(),
-            regs.frame.ss as u16,
-            regs.sp32(),
-        ));
-        regs.frame.ss = host_ss as u64;
-        regs.set_sp32(host_size);
-        let stub_sel = DpmiState::idx_to_sel(SPECIAL_STUB_LDT_IDX);
-        let stub_eip = dos::STUB_BASE + (dos::SLOT_PM_INT_RET as u32) * 2;
-        (stub_eip, stub_sel)
-    };
 
     let flags = regs.flags32();
-    push_iret_frame(dpmi, regs, ret_eip, ret_cs, flags);
+    push_iret_frame(dpmi, regs, regs.ip32(), regs.code_seg(), flags);
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
 
@@ -662,11 +596,8 @@ pub fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     // the caller's TF=1, so IRET restores stepping when the handler returns.
     regs.clear_flag32(1 << 8);
 
-    dos_trace!("[DPMI] PM_INT vec={:02X} -> target CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x} (nested={} caller_cs={:04x} caller_ip={:#x})",
-        vector, sel, off,
-        regs.frame.ss as u16, regs.sp32(),
-        nested as u8,
-        regs.code_seg(), regs.ip32());
+    dos_trace!("[DPMI] PM_INT vec={:02X} -> target CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x}",
+        vector, sel, off, regs.frame.ss as u16, regs.sp32());
 }
 
 /// Thin wrapper preserving the old event-loop entry signature.
@@ -674,7 +605,8 @@ pub fn dpmi_soft_int(_kt: &mut thread::KernelThread, dos: &mut thread::DosState,
     dos_trace!("[DPMI] SOFTINT {:02X} AX={:04X} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} EDX={:08X} EDI={:08X}",
         vector, regs.rax as u16, regs.code_seg(), regs.ip32(),
         regs.ds as u16, regs.es as u16, regs.rdx as u32, regs.rdi as u32);
-    let arm_step = vector == 0x21 && (regs.rax as u16) == 0x4300;
+    let arm_step = false; // disabled while debugging non-traced behavior
+    let _ = vector == 0x21 && (regs.rax as u16) == 0x4300;
     if arm_step {
         if let Some(dpmi) = dos.dpmi.as_ref() {
             let base = seg_base(dpmi, regs.ds as u16);
@@ -758,13 +690,11 @@ fn pop_iret_frame(dpmi: &DpmiState, regs: &mut Regs) -> (u32, u16, u32) {
 }
 
 /// Synthetic trap for an uninstalled PM vector. `deliver_pm_int` pushed a
-/// valid IRET frame on the current stack (targeting SLOT_PM_INT_RET for the
-/// outermost entry, or the outer handler's CS:EIP for nested) and dispatched
-/// to this 2-byte `CD 31` stub. We consume that frame as the "return
-/// address/flags" save for the synthetic trap, flip to real mode, and push
-/// an RM IRET frame pointing at SLOT_CALLBACK_RET so real-mode reflection
-/// lands back in `callback_return`, which restores the PM regs — whose
-/// CS:EIP now reflect the popped IRET target.
+/// natural IRET frame on the client's stack capturing the interrupted PM
+/// state and dispatched to this 2-byte `CD 31` default stub. Pop that frame
+/// — it's the PM resume state — and reflect the interrupt to real mode; the
+/// RM unwind path (`callback_return`) will restore the PM regs we saved in
+/// `reflect_int_to_real_mode`, landing at the original interrupted CS:EIP.
 fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
@@ -773,31 +703,6 @@ fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
 
     let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(dos.dpmi.as_ref().unwrap(), regs);
-    dos_trace!("[DPMI] VECSTUB popped ret_cs={:04x} ret_eip={:#x} flags={:#x} saved_some={}",
-        ret_cs, ret_eip, ret_flags, dos.dpmi.as_ref().unwrap().saved_client_state.is_some());
-
-    // If the popped IRET frame points at our SLOT_PM_INT_RET trampoline, the
-    // outermost `deliver_pm_int` dispatched straight to the default stub — no
-    // handler ran that would ever walk back through SLOT_PM_INT_RET. Consume
-    // `saved_client_state` here and resume the client directly; otherwise a
-    // subsequent PM_INT would observe stale state and misroute as `nested=1`
-    // onto the client stack.
-    let stub_sel = DpmiState::idx_to_sel(SPECIAL_STUB_LDT_IDX);
-    let pm_int_ret_eip = dos::STUB_BASE + (dos::SLOT_PM_INT_RET as u32) * 2;
-    if ret_cs == stub_sel && ret_eip == pm_int_ret_eip {
-        let dpmi = dos.dpmi.as_mut().unwrap();
-        if let Some((cs, eip, ss, esp)) = dpmi.saved_client_state.take() {
-            dos_trace!("[DPMI] VECSTUB consumed saved_client_state -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
-                cs, eip, ss, esp);
-            regs.set_cs32(cs as u32);
-            regs.set_ip32(eip);
-            regs.frame.ss = ss as u64;
-            regs.set_sp32(esp);
-            regs.set_flags32(ret_flags);
-            return reflect_int_to_real_mode(dos, regs, vector);
-        }
-    }
-
     regs.set_ip32(ret_eip);
     regs.set_cs32(ret_cs as u32);
     regs.set_flags32(ret_flags);
@@ -811,8 +716,8 @@ fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
 
 /// Dispatch INT 31h that came from the special-stub segment. Only host-
 /// initiated return trampolines and entry points live here, so the slot is
-/// always one of SLOT_EXCEPTION_RET / SLOT_PM_INT_RET / SLOT_PM_TO_REAL /
-/// SLOT_SAVE_RESTORE. Slot = (EIP - STUB_BASE - 2) / 2.
+/// always one of SLOT_EXCEPTION_RET / SLOT_PM_TO_REAL / SLOT_SAVE_RESTORE.
+/// Slot = (EIP - STUB_BASE - 2) / 2.
 fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
@@ -822,9 +727,6 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
     match slot {
         dos::SLOT_EXCEPTION_RET => {
             return exception_return(dos, regs);
-        }
-        dos::SLOT_PM_INT_RET => {
-            return pm_int_return(dos, regs);
         }
         dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
@@ -898,7 +800,9 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
 
     // Trace DOS/4GW init: arm TF single-step on the very first INT 31 (covers
     // most of DOS/4GW's stub from the start). Only fires once per process.
-    {
+    // Disabled while debugging non-traced behavior.
+    #[allow(unreachable_code, dead_code)]
+    if false {
         use core::sync::atomic::Ordering;
         if dos::PM_STEP_BUDGET.load(Ordering::Relaxed) == 0 {
             static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1947,28 +1851,6 @@ pub fn callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     let ldt_limit = (LDT_ENTRIES * 8 - 1) as u32;
     startup::arch_load_ldt(ldt_ptr, ldt_limit);
 
-}
-
-// ============================================================================
-// DPMI PM interrupt return trampoline
-// ============================================================================
-
-/// Trampoline fired when the outermost PM INT/IRQ handler IRETs. The IRET
-/// frame on the host stack pointed at SLOT_PM_INT_RET; its CD 31 lands here
-/// via pm_stub_dispatch. Restore the saved client CS:EIP and SS:ESP from the
-/// ring-3 → ring-0 transition. Flags are left as they emerged from the
-/// handler's IRET (DOS CF-convention returns flow through naturally).
-pub fn pm_int_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
-    let dpmi = dos.dpmi.as_mut().unwrap();
-    let (cs, eip, ss, esp) = dpmi.saved_client_state.take()
-        .expect("pm_int_return: no saved client state");
-    regs.set_cs32(cs as u32);
-    regs.set_ip32(eip);
-    regs.frame.ss = ss as u64;
-    regs.set_sp32(esp);
-    dos_trace!("[DPMI] PM_INT_RET -> {:04x}:{:#x}", cs, eip);
-    dos::DOS_TRACE_HW_RT.store(true, core::sync::atomic::Ordering::Relaxed);
-    thread::KernelAction::Done
 }
 
 // ============================================================================

@@ -3426,11 +3426,6 @@ pub(crate) const SLOT_HW_IRQ_END: u8 = 0xF0; // exclusive (16 IRQs)
 /// state and synthesizes the STI that DPMI spec requires IRQ handlers to
 /// perform before IRET — our default stub is the nominal handler here.
 pub(crate) const SLOT_RM_INT_RET: u8 = 0xFA;
-/// PM return trampoline for both soft-INT and HW-IRQ handlers. The handler's
-/// IRET lands here; `pm_int_return` pops the saved client state.
-/// `vector_stub_reflect` also saves the PM resume-EIP here so that RM
-/// reflection unwinds to the same trampoline on the way back.
-pub(crate) const SLOT_PM_INT_RET: u8 = 0xFB;
 /// VM86-only: BIOS HW IRQ handler IRET trampoline (restores pre-reflect SS:SP).
 pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
