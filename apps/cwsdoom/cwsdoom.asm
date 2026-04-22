@@ -76,8 +76,8 @@ print_exit:
     mov  ax, 0x4C01
     int  0x21
 
-path_cws    db 'C:\CWSDPMI.EXE', 0
-path_doom   db 'C:\DOOMS\DOOM.EXE', 0
+path_cws    db 'CWSDPMI.EXE', 0
+path_doom   db 'DOOMS\DOOM.EXE', 0
 
 tail_cws    db 3, ' -p', 0x0D
 tail_doom   db 0, 0x0D

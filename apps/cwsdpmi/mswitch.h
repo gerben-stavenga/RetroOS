@@ -21,3 +21,8 @@ extern void near protect_entry(void);
 
 extern char was_exception;
 extern word32 dr[8];
+void set_hw_dr0_dr7(word32 dr0_val, word32 dr7_val);
+word32 read_hw_dr0(void);
+word32 read_hw_dr7(void);
+void trampoline21(void);
+void trampoline21_imm(void);

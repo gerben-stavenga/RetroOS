@@ -43,6 +43,31 @@ pub(crate) static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
 pub(crate) static DOS_TRACE_HW_RT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
+/// Single-step tracing budget. Armed by specific DPMI handlers to watch the
+/// client's code path right after a suspicious return. Decremented on each
+/// PM `#DB`; at zero, tracing stops and TF is cleared.
+pub(crate) static PM_STEP_BUDGET: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Log one PM step: CS:EIP + key regs, plus the first few opcode bytes.
+pub(crate) fn pm_step_log(regs: &crate::Regs) {
+    let cs_base = crate::arch::monitor::seg_base(regs.code_seg());
+    let lin = cs_base.wrapping_add(regs.ip32());
+    let mut b = [0u8; 8];
+    for i in 0..8 {
+        b[i] = unsafe { core::ptr::read_volatile((lin + i as u32) as *const u8) };
+    }
+    crate::dbg_println!(
+        "[STEP] {:04X}:{:08X} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} SS:SP={:04X}:{:08X} DS={:04X} ES={:04X}",
+        regs.code_seg(), regs.ip32(),
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
+        regs.rsi as u32, regs.rdi as u32, regs.rbp as u32,
+        regs.frame.ss as u16, regs.sp32(),
+        regs.ds as u16, regs.es as u16,
+    );
+}
+
 /// Returns true if a trace line tied to interrupt vector `vec` should fire.
 /// Combines the general gate with the HW-vector gate so an HW-IRQ-noisy site
 /// can wrap its `dos_trace!` in a single check.
@@ -50,7 +75,7 @@ pub(crate) static DOS_TRACE_HW_RT: core::sync::atomic::AtomicBool =
 pub(crate) fn should_trace() -> bool {
     // TEMP: silenced to keep the DPMI log compact for diffing against CWSDPMI.
     // Use `dos_trace!(force ...)` to bypass this gate.
-    false
+    true
 }
 
 macro_rules! dos_trace {
@@ -1030,8 +1055,8 @@ fn dos_putchar(c: u8) {
 
 fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
-    if ah != 0x2C && ah != 0x2A {
-        dos_trace!(force "[INT21] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+    if ah != 0x2C && ah != 0x2A && regs.mode() == crate::UserMode::VM86 {
+        dos_trace!(force "[INT21] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
             regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
     }

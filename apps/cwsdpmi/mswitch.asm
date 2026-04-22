@@ -44,6 +44,7 @@
 	start_bss
 
 	public	_dr
+	public	_dr6
 _dr	label	dword
 _dr0	dd	?
 _dr1	dd	?
@@ -446,6 +447,41 @@ waitkb1:
 _set_a20 endp
 
 ;------------------------------------------------------------------------
+; void set_hw_dr0_dr7(word32 dr0_val, word32 dr7_val);
+; Program CPU DR0/DR7 directly so a breakpoint armed from a C handler
+; takes effect on the current PM task without waiting for a real-mode
+; round-trip through go_protect_far_jump (which is the only other place
+; that copies _dr0/_dr7 into the CPU).
+
+	public	_set_hw_dr0_dr7
+_set_hw_dr0_dr7 proc near
+	push	bp
+	mov	bp,sp
+	mov	eax,[bp+4]	; dr0 value
+	mov	dr0,eax
+	mov	eax,[bp+8]	; dr7 value
+	mov	dr7,eax
+	pop	bp
+	ret
+_set_hw_dr0_dr7 endp
+
+	public	_read_hw_dr0
+_read_hw_dr0 proc near
+	mov	eax,dr0
+	mov	edx,eax
+	shr	edx,16
+	ret
+_read_hw_dr0 endp
+
+	public	_read_hw_dr7
+_read_hw_dr7 proc near
+	mov	eax,dr7
+	mov	edx,eax
+	shr	edx,16
+	ret
+_read_hw_dr7 endp
+
+;------------------------------------------------------------------------
 
 	public	_cpumode	; 0=real mode, 1=V86
 _cpumode:
@@ -538,6 +574,38 @@ cpuflipflag:		; Try to flip flag #Al in Eflags, Return C=1 if possible
 	bt	eax,esi
 	pop	si
 	ret
+;------------------------------------------------------------------------
+; PM INT 21 trampoline. Installed at IDT[0x21] when DOS/4GW issues 0205
+; BX=0x21 — instead of putting DOS/4GW's hook in the IDT directly, we
+; install this trampoline so we can intercept the hook entry without
+; going through _interrupt_common (which would consume the CPU-pushed
+; INT frame). DOS/4GW's "previous handler" (saved by it via 0204 BEFORE
+; our 0205) still points at the original ivec0+0x21*n → i_21 → RM
+; reflect, so its chain breaks the loop.
+;
+; Entered via 32-bit interrupt gate (DPL=3), no privilege change. Stack:
+;   [esp+0]  = saved EIP    [esp+4]  = saved CS    [esp+8]  = saved EFLAGS
+; CS = g_pcode (16-bit code segment, same base as g_rcode), CPL=3.
+; AX = client AX (service number).
+;
+; If AX==0x4300 we set TF in the running EFLAGS so DOS/4GW's hook
+; single-steps from its first instruction, then far-jmp to the saved hook.
+; The far-jmp target is patched by the C 0205 handler (self-modified).
+
+	public	_trampoline21
+	public	_trampoline21_imm
+_trampoline21	proc	near
+	cmp	ax,4300h
+	jne	short t21_jmp
+	pushfd				; save EFLAGS, set TF, restore so the
+	or	byte ptr [esp+1],1	; far-jmp (next instr) executes with TF=1,
+	popfd				; making dos4g's hook single-step.
+t21_jmp:
+	db	66h, 0EAh
+_trampoline21_imm:
+	dd	0
+	dw	0
+_trampoline21	endp
 ;------------------------------------------------------------------------
 
 	end_code16

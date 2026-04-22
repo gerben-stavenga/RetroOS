@@ -362,6 +362,9 @@ pub struct PcMachine {
     /// returns to SLOT_HW_IRQ_RET which restores this saved SS:SP.
     /// Saved SS:SP from before hardware IRQ stack switch. None when not on IRQ stack.
     pub irq_saved_sssp: Option<(u16, u16)>,
+    /// Last value written to CMOS index port 0x70 (NMI bit masked off).
+    /// Reads of port 0x71 pass through to the host CMOS using this index.
+    pub cmos_index: u8,
 }
 
 impl PcMachine {
@@ -379,6 +382,7 @@ impl PcMachine {
             e0_pending: false,
             vga: VgaState::new(),
             irq_saved_sssp: None,
+            cmos_index: 0,
         }
     }
 
@@ -931,6 +935,15 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         0x41 | 0x42 => 0,
         // PIT command register not readable
         0x43 => 0xFF,
+        // CMOS index port: read returns the last index byte (rare).
+        0x70 => pc.cmos_index,
+        // CMOS data port: pass through to host RTC at the saved index.
+        // Host CMOS isn't used by the kernel itself, so this is safe; the
+        // guest sees real time-of-day plus a UIP/VRT-correct status block.
+        0x71 => {
+            crate::arch::outb(0x70, pc.cmos_index);
+            crate::arch::inb(0x71)
+        }
         // Unknown ports: return 0xFF (unpopulated bus)
         _ => 0xFF,
     }
@@ -979,6 +992,12 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         0x43 => pc.vpit.write_command(val),
         0x40 => pc.vpit.write_counter0(val),
         0x41 | 0x42 => {}
+        // CMOS index: latch for the next data-port read. Mask off the NMI
+        // disable bit (0x80) — we never want guest writes to toggle host NMI.
+        0x70 => pc.cmos_index = val & 0x7F,
+        // CMOS data writes are dropped — never let the guest mutate host CMOS
+        // (BIOS settings, time-of-day, alarm, etc.).
+        0x71 => {}
         // Unknown ports: silently ignore (BIOS probes various ports during mode switches)
         _ => {}
     }

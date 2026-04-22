@@ -113,7 +113,16 @@ word8 hard_slave_lo=0x70,  hard_slave_hi=0x77;
 static char cntrls_initted = 0;
 static char far * oldvec;
 
-static int i_21(void), i_2f(void), i_31(void);
+static int i_01(void), i_21(void), i_2f(void), i_31(void);
+static word16 sel_to_ldt_index(word16 reg);
+
+static char trace_on = 0;
+static word16 trace_budget = 0;
+#define TRACE_BUDGET_MAX 65000
+char trace_arm_pending = 0;
+word32 hook21_lin_lo = 0, hook21_lin_hi = 0;
+word16 hook21_sel = 0;
+word32 hook21_off = 0;
 
 #if 0
 void segfault(word32 v)
@@ -352,7 +361,7 @@ static int page_in_user(void)
 #define UE user_exception
 typedef int (*FUNC)(void);
 static FUNC exception_handler_list[] = {
-  UE, UE, generic_handler, UE, UE, UE, UE, UE,	/* NMI passed - laptops/green */
+  UE, i_01, generic_handler, UE, UE, UE, UE, UE,	/* NMI passed - laptops/green */
   /* 08 */ U,			/* Double fault */
   UE, UE, UE, UE, UE,
   /* 0e */ page_in_user,
@@ -397,10 +406,62 @@ int exception_handler(void)
     return generic_handler();
 }
 
+/* #DB trap (vector 1) — TF single-step. The trampoline sets TF in EFLAGS only
+   when it sees AX=4300, so any TF #DB that arrives here is part of the
+   AX=4300 hook execution. Log when CS:EIP is in the hook range, re-arm TF
+   for the next step, stop after TRACE_BUDGET_MAX steps. */
+static int i_01(void)
+{
+  word32 lin;
+  word16 idx;
+
+  idx = sel_to_ldt_index((word16)tss_ptr->tss_cs);
+  if (idx == 0xffff) {
+    lin = 0;
+  } else {
+    lin = ((word32)ldt[idx].base0
+         | ((word32)ldt[idx].base1 << 16)
+         | ((word32)ldt[idx].base2 << 24))
+        + tss_ptr->tss_eip;
+  }
+
+  /* Always log the step (in or out of hook range) and keep TF on until budget
+     is exhausted. Matches RetroOS's pm_step_log which traces unconditionally
+     so we can see HW-IRQ delivery, DPMI 0302 reflections etc. inline. */
+  {
+    word8 b[8];
+    memget((word16)tss_ptr->tss_cs, tss_ptr->tss_eip, b, 8);
+    errmsg("[STEP] %04x:%08lx op=%02x%02x%02x%02x%02x%02x%02x%02x EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx ESI=%08lx EDI=%08lx EBP=%08lx SS:SP=%04x:%08lx DS=%04x ES=%04x\n",
+      (word16)(tss_ptr->tss_cs), (unsigned long)(tss_ptr->tss_eip),
+      b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+      (unsigned long)tss_ptr->tss_eax, (unsigned long)tss_ptr->tss_ebx,
+      (unsigned long)tss_ptr->tss_ecx, (unsigned long)tss_ptr->tss_edx,
+      (unsigned long)tss_ptr->tss_esi, (unsigned long)tss_ptr->tss_edi,
+      (unsigned long)tss_ptr->tss_ebp,
+      (word16)tss_ptr->tss_ss, (unsigned long)tss_ptr->tss_esp,
+      (word16)tss_ptr->tss_ds, (word16)tss_ptr->tss_es);
+  }
+  if (++trace_budget >= TRACE_BUDGET_MAX) {
+    (word16)tss_ptr->tss_eflags &= ~0x100;
+    dr[6] &= ~0x400FL;
+    errmsg("[TRACE] budget exhausted, disarming\n");
+    return 0;
+  }
+  (word16)tss_ptr->tss_eflags |= 0x100;
+  dr[6] &= ~0x400FL;
+  return 0;
+}
+
 static int i_21(void)
 {
   word8 ah;
   ah = (word8)((word16)(tss_ptr->tss_eax) >> 8);
+  errmsg("[PMINT21] AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x ES=%04x DI=%04x SI=%04x CS:EIP=%04x:%lx\n",
+    (word16)(tss_ptr->tss_eax),
+    (word16)(tss_ptr->tss_ebx), (word16)(tss_ptr->tss_ecx), (word16)(tss_ptr->tss_edx),
+    (word16)(tss_ptr->tss_ds),  (word16)(tss_ptr->tss_es),
+    (word16)(tss_ptr->tss_edi), (word16)(tss_ptr->tss_esi),
+    (word16)(tss_ptr->tss_cs),  (unsigned long)(tss_ptr->tss_eip));
   if(ah == 0x4c)
       cleanup((word16)(tss_ptr->tss_eax));
   return generic_handler();
@@ -569,7 +630,27 @@ static void set_para_limit(word16 i, word16 npara)
 
 static int i_31(void)
 {
-  errmsg("[INT31] AX=%04x\n", (word16)(tss_ptr->tss_eax));
+  extern word32 dr0_at_intr, dr7_at_intr;
+  static char first_int31 = 1;
+  if (first_int31) {
+    first_int31 = 0;
+    trace_on = 1;
+    trace_budget = 0;
+    /* Arm TF on the IRET back to client so DOS/4GW init starts being stepped */
+    (word16)tss_ptr->tss_eflags |= 0x100;
+    /* hook21_lin_lo/hi may be 0 here — make i_01 trace everything by setting
+       an open range covering the client code area. */
+    hook21_lin_lo = 0;
+    hook21_lin_hi = 0xFFFFFFFFL;
+    errmsg("[TRACE] armed at first INT 31 (DOS/4GW init)\n");
+  }
+  errmsg("[CWS31] AX=%04x | BX=%04x CX=%04x DX=%04x SI=%04x DI=%04x DS=%04x ES=%04x CS:EIP=%04x:%lx cpuDR0=%08lx cpuDR7=%08lx\n",
+    (word16)(tss_ptr->tss_eax),
+    (word16)(tss_ptr->tss_ebx), (word16)(tss_ptr->tss_ecx), (word16)(tss_ptr->tss_edx),
+    (word16)(tss_ptr->tss_esi), (word16)(tss_ptr->tss_edi),
+    (word16)(tss_ptr->tss_ds), (word16)(tss_ptr->tss_es),
+    (word16)(tss_ptr->tss_cs), (unsigned long)(tss_ptr->tss_eip),
+    (unsigned long)dr0_at_intr, (unsigned long)dr7_at_intr);
   (word8)tss_ptr->tss_eflags &= ~1;	/* Clear carry, only set on failure */
 #if 0	/* Testing code for 16-bit */
   tss_ptr->tss_edx = (word16)tss_ptr->tss_edx;
@@ -684,19 +765,25 @@ static int i_31(void)
     case 0x000b: /* Get Descriptor.  */
       {
       word16 i;
+      word32 *raw;
       CHECK_POINTER(tss_ptr->tss_es, tss_ptr->tss_edi);
       ASSIGN_LDT_INDEX(i, ebx);
       memput(tss_ptr->tss_es, tss_ptr->tss_edi, &ldt[i], 8);
+      raw = (word32 *)&ldt[i];
+      errmsg("[CWS] 000B sel=%04x raw=%08lx%08lx\n", (word16)tss_ptr->tss_ebx, raw[1], raw[0]);
       EXIT_OK;
       }
 
     case 0x000c: /* Set Descriptor.  */
       {
       word16 i;
+      word32 *raw;
       CHECK_POINTER(tss_ptr->tss_es, tss_ptr->tss_edi);
       ASSIGN_LDT_INDEX(i, ebx);
       memget(tss_ptr->tss_es, tss_ptr->tss_edi, &ldt[i], 8);
       ldt[i].stype |= 0x10;		/* Make sure non-system, non-zero */
+      raw = (word32 *)&ldt[i];
+      errmsg("[CWS] 000C sel=%04x raw=%08lx%08lx\n", (word16)tss_ptr->tss_ebx, raw[1], raw[0]);
       EXIT_OK;
       }
 
@@ -942,6 +1029,16 @@ static int i_31(void)
         tss_ptr->tss_edx = user_interrupt_handler[hwirq].offset32;
         EXIT_OK;
       }
+      /* For vector 0x21 IDT[0x21] points at our trampoline, but DOS/4GW reading
+         that back via 0204 would save the trampoline as its "previous" — and
+         then chain back to the trampoline = infinite loop. Return the actually
+         saved dos4g hook (or fall through to the original ivec stub if no hook
+         has been installed yet). */
+      if (i == 0x21 && hook21_sel) {
+        (word16)tss_ptr->tss_ecx = hook21_sel;
+        tss_ptr->tss_edx = hook21_off;
+        EXIT_OK;
+      }
       if(idt[i].selector == g_rcode*8)
         (word16)tss_ptr->tss_ecx = GDT_SEL(g_pcode);	/* Allow chaining */
       else
@@ -1008,8 +1105,53 @@ static int i_31(void)
           }
         }
 #endif
-      } else if(i == 7 || i >= hard_master_lo && i <= hard_master_hi)
-        EXIT_OK; /* Must ignore it or DOS/4G apps fail */
+      } else if(i == 1 || i == 7 || i >= hard_master_lo && i <= hard_master_hi)
+        EXIT_OK; /* Vec 1: keep TF hook. 7: ignore. */
+      if (i == 0x21) {
+        /* Install our asm trampoline at IDT[0x21] (NOT DOS/4GW's hook directly)
+           and patch the trampoline's far-jmp immediate with DOS/4GW's hook addr.
+           DOS/4GW's "previous" (read via 0204 BEFORE this 0205) still points at
+           the original ivec0+0x21*n stub → i_21 → RM reflect — so DOS/4GW's
+           chain doesn't loop back into the trampoline. */
+        word16 idx = sel_to_ldt_index((word16)tss_ptr->tss_ecx);
+        word32 tramp_off;
+        word32 far *imm_off_p;
+        word16 far *imm_sel_p;
+        if (idx != 0xffff) {
+          word32 base = (word32)ldt[idx].base0
+                      | ((word32)ldt[idx].base1 << 16)
+                      | ((word32)ldt[idx].base2 << 24);
+          hook21_sel = (word16)tss_ptr->tss_ecx;
+          hook21_off = tss_ptr->tss_edx;
+          hook21_lin_lo = base + tss_ptr->tss_edx;
+          hook21_lin_hi = hook21_lin_lo + 0x2000;
+          errmsg("[TRACE] DOS/4GW PM INT21 hook recorded sel=%04x off=%08lx lin=%08lx\n",
+                 hook21_sel, (unsigned long)hook21_off, (unsigned long)hook21_lin_lo);
+        }
+        /* Patch trampoline's far-jmp imm32:imm16 with DOS/4GW's address */
+        imm_off_p = (word32 far *)MK_FP(_CS, FP_OFF(trampoline21_imm));
+        imm_sel_p = (word16 far *)MK_FP(_CS, FP_OFF(trampoline21_imm) + 4);
+        *imm_off_p = tss_ptr->tss_edx;
+        *imm_sel_p = (word16)tss_ptr->tss_ecx;
+        /* Install trampoline in IDT[0x21] */
+        tramp_off = FP_OFF(trampoline21);
+        idt[0x21].selector = GDT_SEL(g_pcode);
+        idt[0x21].offset0 = (word16)tramp_off;
+        idt[0x21].offset1 = (word16)(tramp_off >> 16);
+        {
+          word8 far *bp = (word8 far *)MK_FP(_CS, FP_OFF(trampoline21));
+          errmsg("[TRAMP] installed at idt[21]: sel=%04x off=%08lx tramp_off=%lx _CS=%04x\n",
+                 idt[0x21].selector, (unsigned long)tramp_off,
+                 (unsigned long)tramp_off, _CS);
+          errmsg("[TRAMP] tramp bytes @ _CS:%04x = %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 (word16)tramp_off,
+                 bp[0], bp[1], bp[2], bp[3], bp[4], bp[5], bp[6], bp[7]);
+          errmsg("[TRAMP] readback patched imm: off=%08lx sel=%04x (expected off=%08lx sel=%04x)\n",
+                 (unsigned long)*imm_off_p, *imm_sel_p,
+                 (unsigned long)tss_ptr->tss_edx, (word16)tss_ptr->tss_ecx);
+        }
+        EXIT_OK;
+      }
       idt[i].selector = (word16)(tss_ptr->tss_ecx);
       idt[i].offset0 = (word16)(tss_ptr->tss_edx);
       idt[i].offset1 = (word16)(tss_ptr->tss_edx >> 16);
@@ -1062,18 +1204,17 @@ static int i_31(void)
         dpmisim_regs[22] = peek(0, (word8)tss_ptr->tss_ebx * 4 + 2);
       }
 
-#if 0
-      errmsg("[CWS] %x int=%x AX=%x BX=%x CX=%x DX=%x DS:DI=%x:%lx ES:DI=%x:%lx CS:IP=%x:%x\n",
-        (word16)tss_ptr->tss_eax,
-        (word16)tss_ptr->tss_ebx,
-        dpmisim_regs[14],
-        dpmisim_regs[8],
-        dpmisim_regs[12],
-        dpmisim_regs[10],
-        dpmisim_regs[18], dpmisim_regs[0],
-        dpmisim_regs[17], dpmisim_regs[0],
+      /* Log every simulate-RM-INT / RM call with its RMCS. DOS/4GW uses 0302
+         to invoke RM INT 21 directly (bypassing BL=21), so we need to inspect
+         RMCS AX rather than BL.  Arm single-step on RMCS AX=4300. */
+      errmsg("[DPMISIM] AX=%04x BL=%02x RMCS: AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x ES=%04x DI=%04x SI=%04x CS:IP=%04x:%04x\n",
+        (word16)(tss_ptr->tss_eax),
+        (word8)(tss_ptr->tss_ebx),
+        dpmisim_regs[14], dpmisim_regs[8], dpmisim_regs[12], dpmisim_regs[10],
+        dpmisim_regs[18], dpmisim_regs[17],
+        dpmisim_regs[0],  dpmisim_regs[2],
         dpmisim_regs[22], dpmisim_regs[21]);
-#endif
+      /* Arming now done via DR0 breakpoint on DOS/4GW's PM INT21 hook. */
 
       dpmisim();
 
@@ -1458,8 +1599,20 @@ static int i_31(void)
 i31_exit_error:
   SET_CARRY;
 i31_exit:
-  errmsg("[INT31 RET] AX=%04x CF=%x\n",
+  errmsg("[INT31 RET] AX=%04x CF=%x | BX=%04x CX=%04x DX=%04x SI=%04x DI=%04x DS=%04x ES=%04x\n",
     (word16)(tss_ptr->tss_eax),
-    (word16)((word16)(tss_ptr->tss_eflags) & 1));
+    (word16)((word16)(tss_ptr->tss_eflags) & 1),
+    (word16)(tss_ptr->tss_ebx), (word16)(tss_ptr->tss_ecx), (word16)(tss_ptr->tss_edx),
+    (word16)(tss_ptr->tss_esi), (word16)(tss_ptr->tss_edi),
+    (word16)(tss_ptr->tss_ds), (word16)(tss_ptr->tss_es));
+  if (trace_arm_pending && !trace_on) {
+    trace_on = 1;
+    trace_budget = 0;
+    errmsg("[TRACE] TF tracing engaged (range %08lx..%08lx)\n",
+      (unsigned long)hook21_lin_lo, (unsigned long)hook21_lin_hi);
+    trace_arm_pending = 0;
+  }
+  if (trace_on)
+    (word16)tss_ptr->tss_eflags |= 0x100;	/* Arm TF for next PM instr */
   return 0;
 }

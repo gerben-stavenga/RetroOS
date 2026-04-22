@@ -329,6 +329,14 @@ fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
             // where virtual IF is 0. The hardware just executed one insn
             // under TF; decide what to do about the NEXT one.
             1 => {
+                use core::sync::atomic::Ordering;
+                let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
+                if budget > 0 && !is_vm86(regs) {
+                    crate::kernel::dos::pm_step_log(regs);
+                    crate::kernel::dos::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
+                    regs.set_flag32(1 << 8); // keep TF on
+                    return;
+                }
                 let _ = step_virtual_if(regs);
                 return;
             }

@@ -298,7 +298,7 @@ void main1(void)	/* int argc, char **argv) */
   for(i=0;i<nc;i++) {
     if(ptr[i] == '-') {
       char test = 0x20 | ptr[++i];	/* make lower case if upper */
-      errmsg("CWSDPMI V0.90+ (r7) Copyright (C) 2010 CW Sandmann  ABSOLUTELY NO WARRANTY\n");
+      errmsg("CWSDPMI V0.90+ (r7-PATCHED) Copyright (C) 2010 CW Sandmann  ABSOLUTELY NO WARRANTY\n");
       if(test == 'p')			/* persistent, permanent */
         one_pass = 0;
       else if(test == 'x')		/* no eXtensions */

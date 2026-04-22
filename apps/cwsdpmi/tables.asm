@@ -43,6 +43,11 @@ ivec_number	dw	?
 	extrn	_locked_count:byte
 	extrn	_user_interrupt_handler:fword
 	extrn	_dpmisim_regs:dword
+	extrn	_dr6:dword
+	public _dr0_at_intr
+_dr0_at_intr	dd	?
+	public _dr7_at_intr
+_dr7_at_intr	dd	?
 	end_bss
 
 ;------------------------------------------------------------------------
@@ -78,6 +83,14 @@ _interrupt_common:
 	mov	bx,_tss_ptr
 	mov	ax,ivec_number
 	mov	[bx].tss_irqn,al
+	push	eax
+	mov	eax,dr6			; snapshot DR6 for i_01 (#DB status)
+	mov	_dr6,eax
+	mov	eax,dr0			; snapshot CPU DR0 seen at interrupt
+	mov	_dr0_at_intr,eax
+	mov	eax,dr7			; snapshot CPU DR7 seen at interrupt
+	mov	_dr7_at_intr,eax
+	pop	eax
 	mov	esi,[bx].tss_esp
 	mov	fs,[bx].tss_ss		; fs:esi -> stack
 	cmp	al,15
