@@ -122,43 +122,7 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
     let buf = exec::load_file_resolved(path)
         .unwrap_or_else(|_| panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
 
-    let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
-        .expect("Failed to create DOS thread");
-    let tid = t.kernel.tid as usize;
-
-    arch_map_low_mem();
-    dos::setup_ivt();
-    let is_exe = dos::is_mz_exe(&buf);
-    // Convert VFS-form path to DOS-form for the PSP env suffix.
-    let mut dos_name = [0u8; dos::dfs::DFS_PATH_MAX];
-    let dos_len = dos::dfs::vfs_to_dos(path, &mut dos_name);
-    let dos_name = &dos_name[..dos_len];
-    let (cs, ip, ss, sp, end_seg) = if is_exe {
-        dos::load_exe(&buf, dos_name, None).expect("load_exe failed")
-    } else {
-        dos::load_com(&buf, dos_name, None)
-    };
-
-    thread::init_process_thread_vm86(t, dos::PSP_SEGMENT, cs, ip, ss, sp, cwd);
-    let dos_state = t.dos_mut();
-    dos_state.heap_seg = end_seg;
-    dos_state.dta = (dos::PSP_SEGMENT as u32) * 16 + 0x80;
-
-    let psp_base = (dos::PSP_SEGMENT as u32) << 4;
-    let tail_len = cmdline_tail.len().min(126);
-    unsafe {
-        let psp = psp_base as *mut u8;
-        *psp.add(0x80) = tail_len as u8;
-        core::ptr::copy_nonoverlapping(cmdline_tail.as_ptr(), psp.add(0x81), tail_len);
-        *psp.add(0x81 + tail_len) = 0x0D;
-    }
-
-    let (col, row) = crate::vga::vga().cursor_pos();
-    unsafe {
-        core::ptr::write_volatile(0x450 as *mut u8, col as u8);
-        core::ptr::write_volatile(0x451 as *mut u8, row as u8);
-    }
-    unsafe { *(&raw mut crate::arch::REGS) = t.kernel.cpu_state; }
+    let tid = dos::run_init_program(&buf, path, cmdline_tail, cwd);
     event_loop(tid);
 }
 
@@ -216,7 +180,7 @@ fn event_loop(first_tid: usize) {
                     let is_blocked = kt.state == thread::ThreadState::Blocked;
                     let ticks = crate::arch::take_pending_ticks();
                     for _ in 0..ticks {
-                        crate::kernel::machine::queue_irq(&mut dos.pc, crate::arch::Irq::Tick);
+                        crate::kernel::dos::queue_irq(dos, crate::arch::Irq::Tick);
                     }
                     let dp = dos as *mut thread::DosState;
                     crate::arch::drain(|evt| {
@@ -239,12 +203,12 @@ fn event_loop(first_tid: usize) {
                             if let crate::arch::Irq::Key(sc) = evt {
                                 unsafe { (*dp).process_key(sc); }
                             } else {
-                                crate::kernel::machine::queue_irq(unsafe { &mut (*dp).pc }, evt);
+                                crate::kernel::dos::queue_irq(unsafe { &mut *dp }, evt);
                             }
                         }
                     });
                     if !is_blocked {
-                        crate::kernel::machine::raise_pending(unsafe { &mut *dp }, regs);
+                        crate::kernel::dos::raise_pending(unsafe { &mut *dp }, regs);
                     }
                 }
                 thread::Personality::Linux(linux) => {
@@ -291,106 +255,23 @@ fn event_loop(first_tid: usize) {
 
         let regs = unsafe { &mut *(&raw mut REGS) };
 
-        let action = match kevent {
-            crate::arch::monitor::KernelEvent::Irq => thread::KernelAction::Done,
-
-            crate::arch::monitor::KernelEvent::SoftInt(n) if matches!(thread.personality, thread::Personality::Dos(_)) => {
-                let is_vm86 = regs.mode() == crate::UserMode::VM86;
-                let kt = &mut thread.kernel;
-                let dos = match &mut thread.personality {
-                    thread::Personality::Dos(d) => d,
-                    _ => unreachable!(),
-                };
-                if is_vm86 {
-                    crate::kernel::dos::handle_vm86_int(kt, dos, regs, n)
-                } else if dos.dpmi.is_some() {
-                    if n == 0x31 {
-                        crate::kernel::dos::dpmi::dpmi_int31(dos, regs)
-                    } else {
-                        crate::kernel::dos::dpmi::dpmi_soft_int(kt, dos, regs, n)
-                    }
-                } else {
-                    thread::KernelAction::Done
-                }
+        // PageFault is handled at the loop level because `signal_thread`
+        // needs the full `&mut Thread`. Everything else dispatches through
+        // the personality's `handle_event`.
+        let action = if let crate::arch::monitor::KernelEvent::PageFault { addr } = kevent {
+            let rip = regs.frame.rip;
+            crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, addr, regs.err_code);
+            if let Some(next) = thread::signal_thread(thread, tid, addr as usize) {
+                tid = next;
+                if tid == 0 { return; }
             }
-
-            _ => {
-                use crate::arch::monitor::KernelEvent as KE;
-                // Handle PageFault before the personality split — signal_thread needs &mut Thread
-                if let KE::PageFault { addr } = kevent {
-                    let rip = regs.frame.rip;
-                    crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, addr, regs.err_code);
-                    if let Some(next) = thread::signal_thread(thread, tid, addr as usize) {
-                        tid = next;
-                        if tid == 0 { return; }
-                    }
-                    thread::KernelAction::Exit(-11)
-                } else {
-                    let kt = &mut thread.kernel;
-                    match &mut thread.personality {
-                        thread::Personality::Dos(dos) => {
-                            use crate::kernel::machine;
-                            let is_vm86 = regs.mode() == crate::UserMode::VM86;
-                            match kevent {
-                                KE::Hlt => thread::KernelAction::Yield,
-                                KE::In { port, size } => {
-                                    machine::handle_in_event(&mut dos.pc, regs, port, size.bytes());
-                                    thread::KernelAction::Done
-                                }
-                                KE::Out { port, size } => {
-                                    machine::handle_out_event(&mut dos.pc, regs, port, size.bytes());
-                                    thread::KernelAction::Done
-                                }
-                                KE::Ins { size } => {
-                                    machine::handle_ins_event(&mut dos.pc, regs, size.bytes());
-                                    thread::KernelAction::Done
-                                }
-                                KE::Outs { size } => {
-                                    machine::handle_outs_event(&mut dos.pc, regs, size.bytes());
-                                    thread::KernelAction::Done
-                                }
-                                KE::SoftInt(_) => unreachable!(),
-                                KE::Exception(n) => {
-                                    if dos.dpmi.is_some() {
-                                        crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
-                                    } else {
-                                        crate::println!("DOS: CPU exception {} in non-DPMI thread at CS:EIP={:#x}:{:#x}",
-                                            n, regs.code_seg(), regs.ip32());
-                                        thread::KernelAction::Exit(-11)
-                                    }
-                                }
-                                KE::Fault => {
-                                    if is_vm86 {
-                                        let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
-                                        let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-                                        panic!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                                            regs.code_seg(), regs.ip32() as u16, lin,
-                                            bytes[0], bytes[1], bytes[2], bytes[3],
-                                            bytes[4], bytes[5], bytes[6], bytes[7]);
-                                    } else if dos.dpmi.is_some() {
-                                        crate::kernel::dos::dpmi::dispatch_dpmi_exception(dos, regs, 13)
-                                    } else {
-                                        thread::KernelAction::Exit(-11)
-                                    }
-                                }
-                                KE::PageFault { .. } => unreachable!(),
-                                KE::Irq => thread::KernelAction::Done,
-                            }
-                        }
-                        thread::Personality::Linux(linux) => {
-                            match kevent {
-                                KE::SoftInt(0x80) => crate::kernel::linux::dispatch_action(kt, linux, regs),
-                                KE::Irq => thread::KernelAction::Done,
-                                KE::PageFault { .. } => unreachable!(),
-                                _ => {
-                                    crate::dbg_println!("[LINUX] fatal {:?} at EIP={:#x} tid={}", kevent, regs.ip32(), tid);
-                                    thread::KernelAction::Exit(-11)
-                                }
-                            }
-                        }
-                    }
-                }
-            },
+            thread::KernelAction::Exit(-11)
+        } else {
+            let kt = &mut thread.kernel;
+            match &mut thread.personality {
+                thread::Personality::Dos(dos) => crate::kernel::dos::handle_event(kt, dos, regs, kevent),
+                thread::Personality::Linux(linux) => crate::kernel::linux::handle_event(kt, linux, regs, kevent),
+            }
         };
 
 
@@ -519,15 +400,7 @@ fn handle_fork_exec(
             }
             parent_cwd_len = n;
 
-            let psp_seg = dos.current_psp;
-            // In PM, dos.current_psp is PSP_SEL (not an RM seg) and PSP[0x2C]
-            // may have been patched with an env selector — read the captured
-            // RM env paragraph from DpmiState. In RM, PSP[0x2C] is authoritative.
-            let env_seg = match dos.dpmi.as_ref() {
-                Some(dpmi) if psp_seg == crate::kernel::dos::dpmi::PSP_SEL => dpmi.saved_rm_env,
-                _ => unsafe { (((psp_seg as u32) * 16 + 0x2C) as *const u16).read_unaligned() },
-            };
-            parent_env_snapshot = Some(crate::kernel::dos::snapshot_env(env_seg));
+            parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(dos));
         }
         thread::Personality::Linux(lin) => {
             let cwd = lin.cwd_str();
@@ -680,43 +553,7 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
         crate::dbg_println!("[DBG] DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
             regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16);
         if let Some(d) = dos {
-            if let Some(dpmi) = d.dpmi.as_ref() {
-                // Dump the descriptor backing every loaded segment register so
-                // limit/base mismatches versus what INT31/000C set are visible
-                // at panic time. (CPU shadow may differ from the LDT entry if
-                // the client never re-MOV'd the selector after a SetDescriptor.)
-                for (name, sel) in [
-                    ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
-                    ("DS", regs.ds as u16), ("ES", regs.es as u16),
-                    ("FS", regs.fs as u16), ("GS", regs.gs as u16),
-                ] {
-                    if sel == 0 { continue; }
-                    if sel & 4 == 0 { continue; } // skip GDT (flat)
-                    let idx = (sel >> 3) as usize;
-                    if idx >= dpmi.ldt.len() { continue; }
-                    let raw = dpmi.ldt[idx];
-                    let base = crate::kernel::dos::dpmi::DpmiState::desc_base(raw);
-                    let limit = crate::kernel::dos::dpmi::DpmiState::desc_limit(raw);
-                    crate::dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
-                        name, sel, idx, base, limit, raw);
-                }
-                let cs_base = crate::kernel::dos::dpmi::seg_base(dpmi, regs.code_seg());
-                let ss_base = crate::kernel::dos::dpmi::seg_base(dpmi, regs.stack_seg());
-                let cs_32 = crate::kernel::dos::dpmi::seg_is_32(dpmi, regs.code_seg());
-                let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
-                let sp_lin = ss_base.wrapping_add(regs.sp32());
-                let pre = ip_lin.wrapping_sub(16);
-                let cp = unsafe { core::slice::from_raw_parts(pre as *const u8, 32) };
-                crate::dbg_println!("[DBG] code @{:08x} (-16..+16):", pre);
-                crate::dbg_println!("[DBG]   {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} | {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                    cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
-                    cp[8], cp[9], cp[10], cp[11], cp[12], cp[13], cp[14], cp[15],
-                    cp[16], cp[17], cp[18], cp[19], cp[20], cp[21], cp[22], cp[23],
-                    cp[24], cp[25], cp[26], cp[27], cp[28], cp[29], cp[30], cp[31]);
-                let sw = unsafe { core::slice::from_raw_parts(sp_lin as *const u32, 8) };
-                crate::dbg_println!("[DBG] stack @{:08x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                    sp_lin, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
-            }
+            crate::kernel::dos::dump_dpmi_state(d, regs);
             dump_virtual_hw(d);
         }
         crate::kernel::stacktrace::stack_trace_regs(regs);

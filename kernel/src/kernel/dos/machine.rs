@@ -15,7 +15,6 @@
 
 extern crate alloc;
 
-use crate::kernel::thread;
 use crate::Regs;
 
 pub const IF_FLAG: u32 = 1 << 9;
@@ -1178,27 +1177,6 @@ pub fn vm86_pop(regs: &mut Regs) -> u16 {
     let val = read_u16(regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
     val
-}
-
-// ============================================================================
-// Raise helper — drain the next pending IRQ and dispatch to the active
-// personality. This is the one place the machine layer calls back out to
-// the personality (via `crate::kernel::dos::dpmi::deliver_pm_int` for PM mode
-// and `reflect_interrupt` directly for VM86); it lives here so the event
-// loop has one canonical entry point.
-// ============================================================================
-
-/// Try to deliver one pending interrupt from the virtual PIC.
-/// IF is the virtual interrupt flag (arch swaps VIF↔IF at ring 3 boundary).
-/// Works for both VM86 (IVT reflect) and DPMI (PM vector dispatch).
-pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
-    let Some(vec) = pick_pending_vec(&mut dos.pc, regs) else { return };
-    if regs.mode() == crate::UserMode::VM86 {
-        reflect_interrupt(regs, vec);
-    } else {
-        crate::kernel::dos::DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
-        crate::kernel::dos::dpmi::deliver_pm_int(dos, regs, vec);
-    }
 }
 
 // GP-fault monitor lives in `arch/monitor.rs` now. Kernel only sees the

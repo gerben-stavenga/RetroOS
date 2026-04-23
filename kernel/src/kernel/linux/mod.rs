@@ -148,6 +148,27 @@ impl SyscallResult {
     fn val64(v: i64) -> Self { Self { retval: v, switch_to: None } }
 }
 
+/// Single entry point the event loop calls for the Linux personality.
+/// Handles syscalls (INT 0x80) and treats other CPU events as fatal.
+/// `PageFault` is excluded — the loop handles it inline.
+pub fn handle_event(
+    kt: &mut thread::KernelThread,
+    linux: &mut LinuxState,
+    regs: &mut Regs,
+    kevent: crate::arch::monitor::KernelEvent,
+) -> thread::KernelAction {
+    use crate::arch::monitor::KernelEvent as KE;
+    match kevent {
+        KE::Irq => thread::KernelAction::Done,
+        KE::SoftInt(0x80) => dispatch_action(kt, linux, regs),
+        KE::PageFault { .. } => unreachable!("PageFault handled in event loop"),
+        _ => {
+            crate::dbg_println!("[LINUX] fatal {:?} at EIP={:#x} tid={}", kevent, regs.ip32(), kt.tid);
+            thread::KernelAction::Exit(-11)
+        }
+    }
+}
+
 /// Dispatch returning KernelAction.
 pub fn dispatch_action(kt: &mut thread::KernelThread, linux: &mut LinuxState, regs: &mut Regs) -> thread::KernelAction {
     let args = extract_args(regs);

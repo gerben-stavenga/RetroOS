@@ -26,14 +26,14 @@ extern crate alloc;
 /// Trace DOS/DPMI calls when enabled.
 /// Compile-time master kill switch; constant-fold removes all trace calls
 /// when false.
-pub(crate) const DOS_TRACE: bool = true;
-pub(crate) const DOS_TRACE_HW_IRG: bool = false;
+const DOS_TRACE: bool = true;
+const DOS_TRACE_HW_IRG: bool = false;
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
 /// Lets COMMAND.COM bracket a single exec so the log only captures that
 /// child program, not surrounding shell/launcher noise. Default OFF so
 /// boot/init/DN startup are silent until something explicitly enables it.
-pub(crate) static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
+static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
 /// Independent gate for hardware-IRQ-vector trace lines (timer 0x08, key 0x09,
@@ -51,15 +51,23 @@ pub(crate) static PM_STEP_BUDGET: core::sync::atomic::AtomicUsize =
 
 /// Log one PM step: CS:EIP + key regs, plus the first few opcode bytes.
 pub(crate) fn pm_step_log(regs: &crate::Regs) {
-    let cs_base = crate::arch::monitor::seg_base(regs.code_seg());
-    let lin = cs_base.wrapping_add(regs.ip32());
+    let is_vm86 = regs.frame.rflags & (1u64 << 17) != 0;
+    let (cs_base, mode) = if is_vm86 {
+        ((regs.code_seg() as u32) << 4, "RM")
+    } else {
+        let cs = regs.code_seg();
+        let m = if crate::arch::monitor::seg_is_32(cs) { "PM32" } else { "PM16" };
+        (crate::arch::monitor::seg_base(cs), m)
+    };
+    let ip = if mode == "PM32" { regs.ip32() } else { regs.ip32() & 0xFFFF };
+    let lin = cs_base.wrapping_add(ip);
     let mut b = [0u8; 8];
     for i in 0..8 {
         b[i] = unsafe { core::ptr::read_volatile((lin + i as u32) as *const u8) };
     }
     crate::dbg_println!(
-        "[STEP] {:04X}:{:08X} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} SS:SP={:04X}:{:08X} DS={:04X} ES={:04X}",
-        regs.code_seg(), regs.ip32(),
+        "[STEP {}] {:04X}:{:08X} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} SS:SP={:04X}:{:08X} DS={:04X} ES={:04X}",
+        mode, regs.code_seg(), ip,
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
         regs.rsi as u32, regs.rdi as u32, regs.rbp as u32,
@@ -72,7 +80,7 @@ pub(crate) fn pm_step_log(regs: &crate::Regs) {
 /// Combines the general gate with the HW-vector gate so an HW-IRQ-noisy site
 /// can wrap its `dos_trace!` in a single check.
 #[inline]
-pub(crate) fn should_trace() -> bool {
+fn should_trace() -> bool {
     // TEMP: silenced to keep the DPMI log compact for diffing against CWSDPMI.
     // Use `dos_trace!(force ...)` to bypass this gate.
     true
@@ -92,12 +100,12 @@ macro_rules! dos_trace {
 }
 pub(crate) use dos_trace;
 
-pub mod dpmi;
-pub mod dfs;
+mod dpmi;
+mod dfs;
+mod machine;
 
 use crate::kernel::thread;
-use crate::kernel::machine::{
-    self,
+use self::machine::{
     IF_FLAG,
     read_u16, write_u16,
     vm86_cs, vm86_ip, vm86_ss, vm86_sp, vm86_flags,
@@ -109,7 +117,10 @@ use crate::vga;
 use crate::dbg_println;
 use crate::Regs;
 
-const EMS_ENABLED: bool = true;
+mod xms;
+mod ems;
+use ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};
+use xms::xms_dispatch;
 
 /// Dummy file handle returned for /dev/null semantics.
 const NULL_FILE_HANDLE: u16 = 99;
@@ -126,7 +137,7 @@ const NULL_FILE_HANDLE: u16 = 99;
 pub struct DosState {
     /// Policy-free PC machine state: virtual 8259 PIC, 8253 PIT, PS/2 keyboard,
     /// VGA register set, A20 gate, HMA page tracking.
-    pub pc: crate::kernel::machine::PcMachine,
+    pub pc: machine::PcMachine,
 
     // ── DOS personality fields ────────────────────────────────────────
     pub dta: u32,
@@ -140,8 +151,8 @@ pub struct DosState {
     /// Last child termination status (INT 21h/AH=4Dh): AL = code, AH = type.
     pub last_child_exit_status: u16,
     pub exec_parent: Option<crate::kernel::dos::ExecParent>,
-    pub xms: Option<alloc::boxed::Box<crate::kernel::dos::XmsState>>,
-    pub ems: Option<alloc::boxed::Box<crate::kernel::dos::EmsState>>,
+    pub xms: Option<alloc::boxed::Box<xms::XmsState>>,
+    pub ems: Option<alloc::boxed::Box<ems::EmsState>>,
     /// FindFirst/FindNext search state (per-thread, one active enumeration).
     pub find_path: [u8; 96],
     pub find_path_len: u8,
@@ -164,7 +175,7 @@ pub struct DosMemBlock {
 impl DosState {
     pub fn new() -> Self {
         DosState {
-            pc: crate::kernel::machine::PcMachine::new(),
+            pc: machine::PcMachine::new(),
             dta: 0,
             heap_seg: 0xA000,
             heap_base_seg: 0xA000,
@@ -187,7 +198,7 @@ impl DosState {
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
     pub fn process_key(&mut self, scancode: u8) {
-        crate::kernel::machine::queue_irq(&mut self.pc, crate::arch::Irq::Key(scancode));
+        machine::queue_irq(&mut self.pc, crate::arch::Irq::Key(scancode));
     }
 }
 
@@ -316,20 +327,41 @@ pub(crate) fn dos_resize_block(dos: &mut DosState, seg: u16, paras: u16) -> Resu
 
 /// Translate a `seg:off` client pointer to a flat linear address.
 ///
-/// In V86 mode `seg` is a real-mode paragraph and `off` is masked to 16 bits.
-/// In protected mode `seg` is an LDT/GDT selector and we resolve the descriptor
-/// base via the DPMI state. Offset width follows the client CS D/B bit.
+/// All callers run inside our DOS handlers (`int_21h` etc.), which are reached
+/// only via the V86 dispatch — for both real V86 callers (DOS .COM/.EXE) and
+/// PM callers reflected through `reflect_int_to_real_mode`. So `seg` is
+/// normally a real-mode paragraph.
+///
+/// One exception: a 16-bit DPMI client whose PM INT 21 was reflected via the
+/// default-stub path without an in-chain hook translating segments. Then the
+/// client's PM selector is sitting in DS/ES verbatim — we'd read the wrong
+/// memory if we treated it as a paragraph. `dpmi.rm_save` carries the PM regs
+/// at reflect time; if the current `seg` still equals what was saved (i.e.
+/// nothing in the hook chain rewrote it to a real paragraph), resolve via the
+/// LDT base. This handles selectors with bases above 1 MB too — no truncation.
 #[inline]
-fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
-    if regs.frame.rflags as u32 & machine::VM_FLAG != 0 {
-        ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
-    } else if let Some(dpmi) = dos.dpmi.as_ref() {
-        let cs_32 = dpmi::seg_is_32(dpmi, regs.frame.cs as u16);
-        let off = if cs_32 { off } else { off & 0xFFFF };
-        dpmi::seg_base(dpmi, seg).wrapping_add(off)
-    } else {
-        ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
+fn linear(dos: &thread::DosState, _regs: &Regs, seg: u16, off: u32) -> u32 {
+    if let Some(dpmi) = dos.dpmi.as_ref() {
+        if !dpmi.client_use32 {
+            if let Some(saved) = dpmi.rm_save.as_ref() {
+                // rm_struct_addr == 0 → implicit reflect (vs explicit 0x0300/02
+                // call where the client filled an RMCS with real paragraphs).
+                if saved.rm_struct_addr == 0
+                    && (seg as u64 == saved.regs.ds || seg as u64 == saved.regs.es)
+                {
+                    let base = dpmi::seg_base(dpmi, seg);
+                    let addr = base.wrapping_add(off);
+                    dos_trace!("[LIN] PM-sel seg={:04x} off={:#x} base={:#x} -> {:#x} (saved.ds={:04x} es={:04x})",
+                        seg, off, base, addr, saved.regs.ds as u16, saved.regs.es as u16);
+                    return addr;
+                }
+                dos_trace!("[LIN] paragraph seg={:04x} off={:#x} -> {:#x} (saved.ds={:04x} es={:04x} rm_struct={:#x})",
+                    seg, off, ((seg as u32) << 4).wrapping_add(off & 0xFFFF),
+                    saved.regs.ds as u16, saved.regs.es as u16, saved.rm_struct_addr);
+            }
+        }
     }
+    ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
 }
 
 /// PSP segment for the initial DOS program — derived from low-memory layout
@@ -361,110 +393,9 @@ fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
 // XMS (Extended Memory Specification) state
 // ============================================================================
 
-const MAX_XMS_HANDLES: usize = 16;
-/// XMS address space: linear 0x120000 (after HMA + shadow region) to ~0x500000.
-/// Pages 0x100-0x10F = HMA, 0x110-0x11F = A20 shadow. XMS starts after both.
-const XMS_BASE: u32 = 0x120000; // after HMA + shadow (1MB + 128KB)
-const XMS_END: u32 = 0x500000;  // 5MB — plenty for DOS games
-
-/// EMS backing region: virtual address space for EMS logical pages.
-/// Each EMS page = 16KB = 4 virtual pages. Demand paging provides backing.
-const EMS_BACKING_BASE: u32 = 0x500000;
-/// Virtual page number for EMS logical page N = EMS_BACKING_VPAGE + N * 4
-const EMS_BACKING_VPAGE: usize = (EMS_BACKING_BASE / 0x1000) as usize;
-const XMS_TOTAL_KB: u16 = ((XMS_END - XMS_BASE) / 1024) as u16;
-
-/// A single XMS handle — contiguous range in VM86 linear address space
-struct XmsHandle {
-    base: u32,    // linear address
-    size_kb: u16,
-    locked: bool,
-}
-
-/// Per-thread XMS driver state.
-/// Pure bookkeeping over the VM86 linear address space above HMA.
-/// Physical backing is provided by the kernel's demand paging.
-pub struct XmsState {
-    handles: [Option<XmsHandle>; MAX_XMS_HANDLES],
-    a20_local: u16,
-    a20_global: u16,
-}
-
-impl XmsState {
-    fn new() -> Self {
-        const NONE: Option<XmsHandle> = None;
-        Self { handles: [NONE; MAX_XMS_HANDLES], a20_local: 0, a20_global: 0 }
-    }
-
-    /// Find a contiguous free region of `size` bytes. Returns linear address or None.
-    fn find_free(&self, size: u32) -> Option<u32> {
-        if size == 0 { return Some(XMS_BASE); }
-
-        // Collect allocated ranges, sorted by base
-        let mut ranges: [(u32, u32); MAX_XMS_HANDLES] = [(0, 0); MAX_XMS_HANDLES];
-        let mut count = 0;
-        for h in &self.handles {
-            if let Some(h) = h {
-                ranges[count] = (h.base, h.size_kb as u32 * 1024);
-                count += 1;
-            }
-        }
-        for i in 1..count {
-            let mut j = i;
-            while j > 0 && ranges[j].0 < ranges[j - 1].0 {
-                ranges.swap(j, j - 1);
-                j -= 1;
-            }
-        }
-
-        let mut start = XMS_BASE;
-        for i in 0..count {
-            let gap = ranges[i].0.saturating_sub(start);
-            if gap >= size { return Some(start); }
-            start = ranges[i].0 + ranges[i].1;
-        }
-        if XMS_END.saturating_sub(start) >= size { return Some(start); }
-        None
-    }
-
-    fn free_kb(&self) -> u16 {
-        let mut used: u32 = 0;
-        for h in &self.handles {
-            if let Some(h) = h {
-                used += h.size_kb as u32;
-            }
-        }
-        XMS_TOTAL_KB.saturating_sub(used as u16)
-    }
-
-    fn largest_free_kb(&self) -> u16 {
-        let mut ranges: [(u32, u32); MAX_XMS_HANDLES] = [(0, 0); MAX_XMS_HANDLES];
-        let mut count = 0;
-        for h in &self.handles {
-            if let Some(h) = h {
-                ranges[count] = (h.base, h.size_kb as u32 * 1024);
-                count += 1;
-            }
-        }
-        for i in 1..count {
-            let mut j = i;
-            while j > 0 && ranges[j].0 < ranges[j - 1].0 {
-                ranges.swap(j, j - 1);
-                j -= 1;
-            }
-        }
-        let mut largest = 0u32;
-        let mut start = XMS_BASE;
-        for i in 0..count {
-            let gap = ranges[i].0.saturating_sub(start);
-            if gap > largest { largest = gap; }
-            start = ranges[i].0 + ranges[i].1;
-        }
-        let gap = XMS_END.saturating_sub(start);
-        if gap > largest { largest = gap; }
-        (largest / 1024) as u16
-    }
-}
+// XMS state lives in xms.rs; EMS state lives in ems.rs.
+// Both are private to this module — referenced via xms::XmsState / ems::EmsState
+// from `DosState`, with no surface outside `dos::`.
 
 // ============================================================================
 // UMA (Upper Memory Area) scan and UMB allocation
@@ -486,7 +417,8 @@ static mut UMB_ALLOC: u64 = 0;
 #[allow(dead_code)]
 static mut EMS_PAGES: u64 = 0;
 
-/// EMS page frame base page (set by scan_uma)
+/// EMS page frame base page (set by scan_uma); read by `ems` submodule.
+/// Private — child modules can access private items of the parent.
 static mut EMS_BASE_PAGE: usize = 0xD0;
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
@@ -621,67 +553,7 @@ fn umb_largest() -> u16 {
     (largest as u16) * 0x100
 }
 
-// ============================================================================
-// EMS (Expanded Memory Specification) state
-// ============================================================================
-
-const MAX_EMS_HANDLES: usize = 16;
-/// Total EMS pages available (256 × 16KB = 4MB)
-const EMS_TOTAL_PAGES: u16 = 256;
-/// EMS page frame segment — set dynamically by scan_uma()
-pub fn ems_frame_seg() -> u16 {
-    (unsafe { EMS_BASE_PAGE } as u16) * 0x100
-}
-
-fn ems_base_page() -> usize {
-    unsafe { EMS_BASE_PAGE }
-}
-
-/// Swap an EMS window with a backing region.
-fn swap_ems_window(window: usize, backing_vpage: usize) {
-    let frame = ems_base_page() + window * 4;
-    crate::kernel::startup::arch_swap_page_entries(backing_vpage, frame, 4);
-}
-
-/// Per-thread EMS driver state
-pub struct EmsState {
-    handles: [Option<EmsHandle>; MAX_EMS_HANDLES],
-    /// Current mapping: frame[window] = (handle, logical_page) or None
-    frame: [Option<(u8, u16)>; 4],
-    /// Next EMS backing page index to allocate (bump allocator)
-    next_page: u16,
-}
-
-struct EmsHandle {
-    /// Backing virtual page for each logical page (each = 4 contiguous vpages).
-    /// Demand paging provides physical backing on first access.
-    pages: alloc::vec::Vec<usize>,
-}
-
-impl EmsState {
-    fn new() -> Self {
-        const NONE_H: Option<EmsHandle> = None;
-        Self { handles: [NONE_H; MAX_EMS_HANDLES], frame: [None; 4], next_page: 0 }
-    }
-
-    fn alloc_pages(&self) -> u16 {
-        let mut used: u16 = 0;
-        for h in &self.handles {
-            if let Some(h) = h {
-                used += h.pages.len() as u16;
-            }
-        }
-        EMS_TOTAL_PAGES.saturating_sub(used)
-    }
-
-    /// Clean up: backing pages are freed when the address space is torn down.
-    pub fn free_all_pages(&mut self) {
-        self.handles = core::array::from_fn(|_| None);
-        self.frame = [None; 4];
-    }
-}
-
-
+// XMS / EMS state and dispatchers live in xms.rs and ems.rs respectively.
 
 // ============================================================================
 // INT dispatch — intercept DOS/BIOS calls, reflect others via IVT
@@ -700,6 +572,81 @@ pub fn handle_vm86_int(kt: &mut thread::KernelThread, dos: &mut thread::DosState
         _ => {
             panic!("VM86: INT {:02X} intercepted in bitmap but has no handler", int_num);
         }
+    }
+}
+
+/// Single entry point the event loop calls for the DOS personality.
+/// All DOS/DPMI-specific knowledge (VM86 INT routing, DPMI INT 31, soft INT
+/// reflection, In/Out/Ins/Outs port virtualization, exception → DPMI exception
+/// handler, GP-fault classification) lives here, not in `startup.rs`.
+///
+/// `PageFault` is excluded — the loop handles it inline because it needs
+/// access to the full `Thread` (for `signal_thread`).
+pub fn handle_event(
+    kt: &mut thread::KernelThread,
+    dos: &mut thread::DosState,
+    regs: &mut Regs,
+    kevent: crate::arch::monitor::KernelEvent,
+) -> thread::KernelAction {
+    use crate::arch::monitor::KernelEvent as KE;
+
+    let is_vm86 = regs.mode() == crate::UserMode::VM86;
+    match kevent {
+        KE::Irq => thread::KernelAction::Done,
+        KE::Hlt => thread::KernelAction::Yield,
+        KE::SoftInt(n) => {
+            if is_vm86 {
+                handle_vm86_int(kt, dos, regs, n)
+            } else if dos.dpmi.is_some() {
+                if n == 0x31 {
+                    dpmi::dpmi_int31(dos, regs)
+                } else {
+                    dpmi::dpmi_soft_int(kt, dos, regs, n)
+                }
+            } else {
+                thread::KernelAction::Done
+            }
+        }
+        KE::In { port, size } => {
+            machine::handle_in_event(&mut dos.pc, regs, port, size.bytes());
+            thread::KernelAction::Done
+        }
+        KE::Out { port, size } => {
+            machine::handle_out_event(&mut dos.pc, regs, port, size.bytes());
+            thread::KernelAction::Done
+        }
+        KE::Ins { size } => {
+            machine::handle_ins_event(&mut dos.pc, regs, size.bytes());
+            thread::KernelAction::Done
+        }
+        KE::Outs { size } => {
+            machine::handle_outs_event(&mut dos.pc, regs, size.bytes());
+            thread::KernelAction::Done
+        }
+        KE::Exception(n) => {
+            if dos.dpmi.is_some() {
+                dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
+            } else {
+                crate::println!("DOS: CPU exception {} in non-DPMI thread at CS:EIP={:#x}:{:#x}",
+                    n, regs.code_seg(), regs.ip32());
+                thread::KernelAction::Exit(-11)
+            }
+        }
+        KE::Fault => {
+            if is_vm86 {
+                let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
+                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                panic!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                    regs.code_seg(), regs.ip32() as u16, lin,
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7]);
+            } else if dos.dpmi.is_some() {
+                dpmi::dispatch_dpmi_exception(dos, regs, 13)
+            } else {
+                thread::KernelAction::Exit(-11)
+            }
+        }
+        KE::PageFault { .. } => unreachable!("PageFault handled in event loop"),
     }
 }
 
@@ -782,7 +729,7 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             // requires IRQ handlers to perform before IRET — our default
             // stub is the nominal handler here.
             dpmi::callback_return(dos, regs);
-            regs.frame.rflags |= crate::kernel::machine::IF_FLAG as u64;
+            regs.frame.rflags |= machine::IF_FLAG as u64;
             DOS_TRACE_HW_RT.store(true, core::sync::atomic::Ordering::Relaxed);
             thread::KernelAction::Done
         }
@@ -806,14 +753,14 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             // (CF/ZF returns); then write back so normal IRET-style pop
             // restores the handler's result to the caller.
             let caller_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
-            crate::kernel::machine::set_vm86_flags(regs, caller_flags as u32);
+            machine::set_vm86_flags(regs, caller_flags as u32);
             let action = dispatch_kernel_syscall(kt, dos, regs, slot);
             // exec_return / Exit replace thread state — skip the VM86 frame pop below.
             if !matches!(action, thread::KernelAction::Done) {
                 return action;
             }
             write_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4),
-                      crate::kernel::machine::vm86_flags(regs) as u16);
+                      machine::vm86_flags(regs) as u16);
             action
         }
         SLOT_HW_IRQ_RET => {
@@ -821,8 +768,8 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             // the common pop below IRETs the reflect frame back to the
             // interrupted code (including its flags).
             let (ss, sp) = dos.pc.irq_saved_sssp.take().expect("HW_IRQ_RET without saved SS:SP");
-            crate::kernel::machine::set_vm86_ss(regs, ss);
-            crate::kernel::machine::set_vm86_sp(regs, sp);
+            machine::set_vm86_ss(regs, ss);
+            machine::set_vm86_sp(regs, sp);
             thread::KernelAction::Done
         }
         SLOT_SAVE_RESTORE => {
@@ -844,7 +791,7 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
         let ret_flags = vm86_pop(regs);
         set_vm86_ip(regs, ret_ip);
         set_vm86_cs(regs, ret_cs);
-        crate::kernel::machine::set_vm86_flags(regs, ret_flags as u32);
+        machine::set_vm86_flags(regs, ret_flags as u32);
     } else if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
         // Returns to caller — pop far-call return address
         let ret_ip = vm86_pop(regs);
@@ -874,7 +821,16 @@ fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, reg
         // Output: AX = 0 on success, errno on failure; CF reflects error.
         0x00 => {
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            let rv = thread::vga_take(&mut dos.pc.vga, pid);
+            let dst = &mut dos.pc.vga as *mut machine::VgaState;
+            let rv = thread::with_target_dos(pid, |target| {
+                let src = &mut target.pc.vga;
+                if src.planes.is_empty() { return -61; }
+                unsafe {
+                    core::mem::swap(&mut *dst, src);
+                    (*dst).restore_to_hardware();
+                }
+                0
+            });
             regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
             if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
             thread::KernelAction::Done
@@ -967,8 +923,8 @@ fn hw_irq_reflect(dos: &mut thread::DosState, regs: &mut Regs, irq: u8) {
     if dos.pc.irq_saved_sssp.is_none() {
         // First hardware IRQ: switch to private stack, push trampoline.
         dos.pc.irq_saved_sssp = Some((vm86_ss(regs), vm86_sp(regs)));
-        crate::kernel::machine::set_vm86_ss(regs, IRQ_STACK_SEG);
-        crate::kernel::machine::set_vm86_sp(regs, IRQ_STACK_TOP);
+        machine::set_vm86_ss(regs, IRQ_STACK_SEG);
+        machine::set_vm86_sp(regs, IRQ_STACK_TOP);
 
         vm86_push(regs, vm86_flags(regs) as u16);
         vm86_push(regs, STUB_SEG);
@@ -979,6 +935,9 @@ fn hw_irq_reflect(dos: &mut thread::DosState, regs: &mut Regs, irq: u8) {
     set_vm86_ip(regs, bios_ip);
     set_vm86_cs(regs, bios_cs);
     regs.clear_flag32(IF_FLAG);
+    // Suppress TF inside the BIOS handler. The flags pushed above still have
+    // TF=caller's value, so IRET restores stepping when BIOS returns.
+    regs.clear_flag32(1 << 8);
 }
 
 fn int_13h(regs: &mut Regs) -> thread::KernelAction {
@@ -2155,659 +2114,6 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction
     }
 }
 
-// ============================================================================
-// XMS dispatch (called via stub slot SLOT_XMS)
-// ============================================================================
-
-/// Ensure XMS state exists for current thread, return mutable reference
-fn xms_state(dos: &mut thread::DosState) -> &mut XmsState {
-    if dos.xms.is_none() {
-        dos.xms = Some(alloc::boxed::Box::new(XmsState::new()));
-    }
-    dos.xms.as_deref_mut().unwrap()
-}
-
-fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
-    let ah = (regs.rax >> 8) as u8;
-    match ah {
-        // AH=00h — Get XMS version
-        0x00 => {
-            regs.rax = (regs.rax & !0xFFFF) | 0x0300; // XMS 3.00
-            regs.rbx = (regs.rbx & !0xFFFF) | 0x0001; // driver internal revision
-            regs.rdx = (regs.rdx & !0xFFFF) | 0x0001; // HMA exists
-        }
-        // AH=03h — Global enable A20
-        0x03 => {
-            let xms = xms_state(dos);
-            xms.a20_global += 1;
-            dos.pc.set_a20(true);
-            regs.rax = (regs.rax & !0xFFFF) | 1; // success
-            regs.rbx = regs.rbx & !0xFFFF; // BL=0 no error
-        }
-        // AH=04h — Global disable A20
-        0x04 => {
-            let xms = xms_state(dos);
-            xms.a20_global = xms.a20_global.saturating_sub(1);
-            if xms.a20_global == 0 && xms.a20_local == 0 {
-                dos.pc.set_a20(false);
-            }
-            regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=05h — Local enable A20
-        0x05 => {
-            let xms = xms_state(dos);
-            xms.a20_local += 1;
-            dos.pc.set_a20(true);
-            regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=06h — Local disable A20
-        0x06 => {
-            let xms = xms_state(dos);
-            xms.a20_local = xms.a20_local.saturating_sub(1);
-            if xms.a20_local == 0 && xms.a20_global == 0 {
-                dos.pc.set_a20(false);
-            }
-            regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=07h — Query A20 state
-        0x07 => {
-            let enabled = dos.pc.a20_enabled;
-            regs.rax = (regs.rax & !0xFFFF) | if enabled { 1 } else { 0 };
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=08h — Query free extended memory
-        0x08 => {
-            let xms = xms_state(dos);
-            let largest = xms.largest_free_kb();
-            let total = xms.free_kb();
-            regs.rax = (regs.rax & !0xFFFF) | largest as u64; // largest free block (KB)
-            regs.rdx = (regs.rdx & !0xFFFF) | total as u64;   // total free (KB)
-        }
-        // AH=09h — Allocate extended memory block (DX=size in KB)
-        0x09 => {
-            let size_kb = regs.rdx as u16;
-            let xms = xms_state(dos);
-            let mut handle = None;
-            for i in 0..MAX_XMS_HANDLES {
-                if xms.handles[i].is_none() {
-                    handle = Some(i);
-                    break;
-                }
-            }
-            match handle {
-                Some(i) => {
-                    let size_bytes = size_kb as u32 * 1024;
-                    match xms.find_free(size_bytes) {
-                        Some(base) => {
-                            xms.handles[i] = Some(XmsHandle {
-                                base,
-                                size_kb,
-                                locked: false,
-                            });
-                            regs.rax = (regs.rax & !0xFFFF) | 1;
-                            regs.rdx = (regs.rdx & !0xFFFF) | (i + 1) as u64;
-                        }
-                        None => {
-                            regs.rax = regs.rax & !0xFFFF;
-                            regs.rbx = (regs.rbx & !0xFF) | 0xA0;
-                        }
-                    }
-                }
-                None => {
-                    regs.rax = regs.rax & !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA1;
-                }
-            }
-        }
-        // AH=0Ah — Free extended memory block (DX=handle)
-        0x0A => {
-            let handle = regs.rdx as u16;
-            let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if xms.handles[handle as usize - 1].take().is_some() {
-                    regs.rax = (regs.rax & !0xFFFF) | 1;
-                } else {
-                    regs.rax = regs.rax & !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-                }
-            } else {
-                regs.rax = regs.rax & !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-            }
-        }
-        // AH=0Bh — Move extended memory block (DS:SI = move struct)
-        0x0B => {
-            xms_move(dos, regs);
-        }
-        // AH=0Ch — Lock extended memory block (DX=handle)
-        0x0C => {
-            let handle = regs.rdx as u16;
-            let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if let Some(ref mut h) = xms.handles[handle as usize - 1] {
-                    h.locked = true;
-                    let addr = h.base;
-                    regs.rdx = (regs.rdx & !0xFFFF) | (addr >> 16) as u64;
-                    regs.rbx = (regs.rbx & !0xFFFF) | (addr & 0xFFFF) as u64;
-                    regs.rax = (regs.rax & !0xFFFF) | 1;
-                } else {
-                    regs.rax = regs.rax & !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-                }
-            } else {
-                regs.rax = regs.rax & !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-            }
-        }
-        // AH=0Dh — Unlock extended memory block (DX=handle)
-        0x0D => {
-            let handle = regs.rdx as u16;
-            let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if let Some(ref mut h) = xms.handles[handle as usize - 1] {
-                    h.locked = false;
-                    regs.rax = (regs.rax & !0xFFFF) | 1;
-                } else {
-                    regs.rax = regs.rax & !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-                }
-            } else {
-                regs.rax = regs.rax & !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-            }
-        }
-        // AH=0Eh — Get EMB handle information (DX=handle)
-        0x0E => {
-            let handle = regs.rdx as u16;
-            let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if let Some(ref h) = xms.handles[handle as usize - 1] {
-                    let lock_count = if h.locked { 1u8 } else { 0 };
-                    let free_handles = xms.handles.iter().filter(|h| h.is_none()).count() as u8;
-                    // BH=lock count, BL=free handles
-                    regs.rbx = (regs.rbx & !0xFFFF) | (lock_count as u64) << 8 | free_handles as u64;
-                    regs.rdx = (regs.rdx & !0xFFFF) | h.size_kb as u64;
-                    regs.rax = (regs.rax & !0xFFFF) | 1;
-                } else {
-                    regs.rax = regs.rax & !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-                }
-            } else {
-                regs.rax = regs.rax & !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-            }
-        }
-        // AH=0Fh — Reallocate extended memory block (DX=handle, BX=new size KB)
-        // Simple: free old, alloc new (no data preservation — rare in practice)
-        0x0F => {
-            let handle = regs.rdx as u16;
-            let new_kb = regs.rbx as u16;
-            let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if xms.handles[handle as usize - 1].is_some() {
-                    let old = xms.handles[handle as usize - 1].take().unwrap();
-                    let new_bytes = new_kb as u32 * 1024;
-                    match xms.find_free(new_bytes) {
-                        Some(base) => {
-                            xms.handles[handle as usize - 1] = Some(XmsHandle {
-                                base,
-                                size_kb: new_kb,
-                                locked: old.locked,
-                            });
-                            regs.rax = (regs.rax & !0xFFFF) | 1;
-                        }
-                        None => {
-                            // Restore old handle
-                            xms.handles[handle as usize - 1] = Some(old);
-                            regs.rax = regs.rax & !0xFFFF;
-                            regs.rbx = (regs.rbx & !0xFF) | 0xA0;
-                        }
-                    }
-                } else {
-                    regs.rax = regs.rax & !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-                }
-            } else {
-                regs.rax = regs.rax & !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA2;
-            }
-        }
-        // AH=88h — Query free extended memory (32-bit, XMS 3.0)
-        0x88 => {
-            let xms = xms_state(dos);
-            let free = xms.free_kb() as u32;
-            regs.rax = (regs.rax & !0xFFFF) | (free & 0xFFFF) as u64;
-            regs.rdx = (regs.rdx & !0xFFFF) | (free & 0xFFFF) as u64;
-            regs.rcx = (regs.rcx & !0xFFFFFFFF) | (XMS_END - 1) as u64;
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=10h — Request Upper Memory Block (DX=size in paragraphs)
-        0x10 => {
-            let size = regs.rdx as u16;
-            match umb_alloc(size) {
-                Some((seg, paras)) => {
-                    regs.rax = (regs.rax & !0xFFFF) | 1; // success
-                    regs.rbx = (regs.rbx & !0xFFFF) | seg as u64;
-                    regs.rdx = (regs.rdx & !0xFFFF) | paras as u64;
-                }
-                None => {
-                    let largest = umb_largest();
-                    regs.rax = regs.rax & !0xFFFF; // failure
-                    regs.rbx = (regs.rbx & !0xFF) | if largest > 0 { 0xB0 } else { 0xB1 };
-                    regs.rdx = (regs.rdx & !0xFFFF) | largest as u64;
-                }
-            }
-        }
-        // AH=11h — Release Upper Memory Block (DX=segment)
-        0x11 => {
-            let seg = regs.rdx as u16;
-            if umb_free(seg) {
-                regs.rax = (regs.rax & !0xFFFF) | 1; // success
-            } else {
-                regs.rax = regs.rax & !0xFFFF; // failure
-                regs.rbx = (regs.rbx & !0xFF) | 0xB2; // invalid UMB segment
-            }
-        }
-        _ => {
-            dos_trace!("XMS: UNHANDLED AH={:02X}", ah);
-            regs.rax = regs.rax & !0xFFFF; // failure
-            regs.rbx = (regs.rbx & !0xFF) | 0x80; // not implemented
-        }
-    }
-    thread::KernelAction::Done
-}
-
-/// XMS function 0Bh: Move extended memory block
-/// DS:SI points to a move structure:
-///   +00: u32 length (bytes)
-///   +04: u16 source handle (0=conventional)
-///   +06: u32 source offset (or seg:off if handle=0)
-///   +0A: u16 dest handle (0=conventional)
-///   +0C: u32 dest offset (or seg:off if handle=0)
-fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
-    let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
-
-    let length = unsafe { (addr as *const u32).read_unaligned() } as usize;
-    let src_handle = unsafe { ((addr + 4) as *const u16).read_unaligned() };
-    let src_offset = unsafe { ((addr + 6) as *const u32).read_unaligned() };
-    let dst_handle = unsafe { ((addr + 10) as *const u16).read_unaligned() };
-    let dst_offset = unsafe { ((addr + 12) as *const u32).read_unaligned() };
-
-    if length == 0 {
-        regs.rax = (regs.rax & !0xFFFF) | 1;
-        regs.rbx = regs.rbx & !0xFFFF;
-        return;
-    }
-
-    // Resolve source to linear address
-    let xms = xms_state(dos);
-    let src = if src_handle == 0 {
-        // Conventional memory: offset is seg:off packed as off(16):seg(16)
-        let seg = (src_offset >> 16) as u32;
-        let off = (src_offset & 0xFFFF) as u32;
-        (seg << 4) + off
-    } else {
-        let idx = src_handle as usize - 1;
-        match xms.handles.get(idx).and_then(|h| h.as_ref()) {
-            Some(h) if (src_offset as usize) + length <= h.size_kb as usize * 1024 => {
-                h.base + src_offset
-            }
-            _ => {
-                regs.rax = regs.rax & !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA3;
-                return;
-            }
-        }
-    };
-
-    // Resolve dest to linear address
-    let dst = if dst_handle == 0 {
-        let seg = (dst_offset >> 16) as u32;
-        let off = (dst_offset & 0xFFFF) as u32;
-        (seg << 4) + off
-    } else {
-        let idx = dst_handle as usize - 1;
-        match xms.handles.get(idx).and_then(|h| h.as_ref()) {
-            Some(h) if (dst_offset as usize) + length <= h.size_kb as usize * 1024 => {
-                h.base + dst_offset
-            }
-            _ => {
-                regs.rax = regs.rax & !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA5;
-                return;
-            }
-        }
-    };
-
-    unsafe {
-        core::ptr::copy(src as *const u8, dst as *mut u8, length);
-    }
-    regs.rax = (regs.rax & !0xFFFF) | 1;
-    regs.rbx = regs.rbx & !0xFFFF;
-}
-
-// ============================================================================
-// INT 67h — EMS driver
-// ============================================================================
-
-/// Ensure EMS state exists for current thread
-fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
-    if dos.ems.is_none() {
-        dos.ems = Some(alloc::boxed::Box::new(EmsState::new()));
-    }
-    dos.ems.as_deref_mut().unwrap()
-}
-
-fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
-    let ah = (regs.rax >> 8) as u8;
-    dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
-        ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
-    let result = int_67h_inner(dos, regs, ah);
-    dbg_println!("EMS: -> AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
-        regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
-    result
-}
-
-fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Regs, ah: u8) -> thread::KernelAction {
-    match ah {
-        // AH=40h — Get status
-        0x40 => {
-            regs.rax = regs.rax & !0xFF00; // AH=0: OK
-        }
-        // AH=41h — Get page frame segment
-        0x41 => {
-            regs.rbx = (regs.rbx & !0xFFFF) | ems_frame_seg() as u64;
-            regs.rax = regs.rax & !0xFF00; // AH=0
-        }
-        // AH=42h — Get unallocated page count
-        0x42 => {
-            let ems = ems_state(dos);
-            let free = ems.alloc_pages();
-            regs.rbx = (regs.rbx & !0xFFFF) | free as u64;     // BX = free pages
-            regs.rdx = (regs.rdx & !0xFFFF) | EMS_TOTAL_PAGES as u64; // DX = total pages
-            regs.rax = regs.rax & !0xFF00; // AH=0
-        }
-        // AH=43h — Allocate handle (BX=pages needed, returns DX=handle)
-        0x43 => {
-            let pages_needed = regs.rbx as u16;
-            let ems = ems_state(dos);
-            // Find free handle
-            let mut handle = None;
-            for i in 0..MAX_EMS_HANDLES {
-                if ems.handles[i].is_none() {
-                    handle = Some(i);
-                    break;
-                }
-            }
-            match handle {
-                Some(i) => {
-                    if ems.next_page + pages_needed > EMS_TOTAL_PAGES {
-                        regs.rax = (regs.rax & !0xFF00) | (0x88 << 8); // not enough pages
-                    } else {
-                        // Allocate backing vpages from the EMS region (demand-paged)
-                        let mut pages = alloc::vec::Vec::with_capacity(pages_needed as usize);
-                        for _ in 0..pages_needed {
-                            let vpage = EMS_BACKING_VPAGE + ems.next_page as usize * 4;
-                            ems.next_page += 1;
-                            pages.push(vpage);
-                        }
-                        ems.handles[i] = Some(EmsHandle { pages });
-                        regs.rdx = (regs.rdx & !0xFFFF) | i as u64;
-                        regs.rax = regs.rax & !0xFF00; // AH=0
-                    }
-                }
-                None => {
-                    regs.rax = (regs.rax & !0xFF00) | (0x85 << 8); // no more handles
-                }
-            }
-        }
-        // AH=44h — Map page (AL=physical page 0-3, BX=logical page, DX=handle)
-        0x44 => {
-            let phys_page = regs.rax as u8; // AL
-            let log_page = regs.rbx as u16;
-            let handle = regs.rdx as u16;
-
-            if phys_page > 3 {
-                regs.rax = (regs.rax & !0xFF00) | (0x8B << 8); // invalid physical page
-                return thread::KernelAction::Done;
-            }
-
-            let ems = ems_state(dos);
-
-            // BX=FFFFh means unmap
-            if log_page == 0xFFFF {
-                // Save current frame content back to its backing
-                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
-                    if let Some(ref h) = ems.handles[old_h as usize] {
-                        swap_ems_window(phys_page as usize, h.pages[old_lp as usize]);
-                    }
-                }
-                ems.frame[phys_page as usize] = None;
-                regs.rax = regs.rax & !0xFF00; // AH=0
-                return thread::KernelAction::Done;
-            }
-
-            if (handle as usize) >= MAX_EMS_HANDLES {
-                regs.rax = (regs.rax & !0xFF00) | (0x83 << 8); // invalid handle
-                return thread::KernelAction::Done;
-            }
-
-            match &ems.handles[handle as usize] {
-                Some(h) if (log_page as usize) < h.pages.len() => {
-                    let backing_vpage = h.pages[log_page as usize];
-                    // Save current frame content back to old backing
-                    if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
-                        if let Some(ref oh) = ems.handles[old_h as usize] {
-                            swap_ems_window(phys_page as usize, oh.pages[old_lp as usize]);
-                        }
-                    }
-                    // Load new backing into frame
-                    swap_ems_window(phys_page as usize, backing_vpage);
-                    ems.frame[phys_page as usize] = Some((handle as u8, log_page));
-                    regs.rax = regs.rax & !0xFF00; // AH=0
-                }
-                Some(_) => {
-                    regs.rax = (regs.rax & !0xFF00) | (0x8A << 8); // logical page out of range
-                }
-                None => {
-                    regs.rax = (regs.rax & !0xFF00) | (0x83 << 8); // invalid handle
-                }
-            }
-        }
-        // AH=45h — Release handle (DX=handle)
-        0x45 => {
-            let handle = regs.rdx as u16;
-            let ems = ems_state(dos);
-            if (handle as usize) < MAX_EMS_HANDLES && ems.handles[handle as usize].is_some() {
-                // Unmap any windows using this handle
-                for w in 0..4 {
-                    if let Some((h, lp)) = ems.frame[w] {
-                        if h == handle as u8 {
-                            if let Some(ref hnd) = ems.handles[h as usize] {
-                                swap_ems_window(w, hnd.pages[lp as usize]);
-                            }
-                            ems.frame[w] = None;
-                        }
-                    }
-                }
-                // Release handle (backing pages freed with address space)
-                ems.handles[handle as usize] = None;
-                regs.rax = regs.rax & !0xFF00; // AH=0
-            } else {
-                regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
-            }
-        }
-        // AH=46h — Get version
-        0x46 => {
-            regs.rax = (regs.rax & !0xFF00) | (0x00 << 8); // AH=0
-            regs.rax = (regs.rax & !0xFF) | 0x40; // AL=40h = version 4.0
-        }
-        // AH=4Bh — Get number of open handles
-        0x4B => {
-            let ems = ems_state(dos);
-            let count = ems.handles.iter().filter(|h| h.is_some()).count() as u16;
-            regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
-            regs.rax = regs.rax & !0xFF00;
-        }
-        // AH=4Ch — Get pages allocated to handle (DX=handle)
-        0x4C => {
-            let handle = regs.rdx as u16;
-            let ems = ems_state(dos);
-            if (handle as usize) < MAX_EMS_HANDLES {
-                if let Some(ref h) = ems.handles[handle as usize] {
-                    regs.rbx = (regs.rbx & !0xFFFF) | h.pages.len() as u64;
-                    regs.rax = regs.rax & !0xFF00;
-                } else {
-                    regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
-                }
-            } else {
-                regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
-            }
-        }
-        // AH=4Dh — Get pages for all handles (ES:DI = buffer)
-        0x4D => {
-            let ems = ems_state(dos);
-            let es = regs.es as u32;
-            let di = regs.rdi as u32;
-            let mut addr = (es << 4) + di;
-            let mut count = 0u16;
-            for i in 0..MAX_EMS_HANDLES {
-                if let Some(ref h) = ems.handles[i] {
-                    unsafe {
-                        (addr as *mut u16).write_unaligned(i as u16);
-                        ((addr + 2) as *mut u16).write_unaligned(h.pages.len() as u16);
-                    }
-                    addr += 4;
-                    count += 1;
-                }
-            }
-            regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
-            regs.rax = regs.rax & !0xFF00;
-        }
-        // AH=50h — Map multiple pages (AL=0: phys page mode, AL=1: segment mode)
-        // CX=count, DX=handle, DS:SI=mapping array
-        0x50 => {
-            let al = regs.rax as u8;
-            let count = regs.rcx as u16;
-            let handle = regs.rdx as u16;
-            let ds = regs.ds as u16 as u32;
-            let si = regs.rsi as u16 as u32;
-            let base_addr = (ds << 4) + si;
-
-            let ems = ems_state(dos);
-            if (handle as usize) >= MAX_EMS_HANDLES || ems.handles[handle as usize].is_none() {
-                regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
-                return thread::KernelAction::Done;
-            }
-
-            for i in 0..count as u32 {
-                let log_page = unsafe { ((base_addr + i * 4) as *const u16).read_unaligned() };
-                let phys_raw = unsafe { ((base_addr + i * 4 + 2) as *const u16).read_unaligned() };
-
-                let phys_page = if al == 0 {
-                    phys_raw as u8
-                } else {
-                    // Segment mode: convert segment to physical page index
-                    let seg_offset = phys_raw.wrapping_sub(ems_frame_seg());
-                    (seg_offset / 0x0400) as u8 // each window is 0x400 paragraphs (16KB)
-                };
-
-                if phys_page > 3 {
-                    regs.rax = (regs.rax & !0xFF00) | (0x8B << 8);
-                    return thread::KernelAction::Done;
-                }
-
-                // Save current frame content back to old backing
-                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
-                    if let Some(ref oh) = ems.handles[old_h as usize] {
-                        swap_ems_window(phys_page as usize, oh.pages[old_lp as usize]);
-                    }
-                }
-
-                if log_page == 0xFFFF {
-                    ems.frame[phys_page as usize] = None;
-                } else {
-                    match &ems.handles[handle as usize] {
-                        Some(h) if (log_page as usize) < h.pages.len() => {
-                            let backing_vpage = h.pages[log_page as usize];
-                            swap_ems_window(phys_page as usize, backing_vpage);
-                            ems.frame[phys_page as usize] = Some((handle as u8, log_page));
-                        }
-                        _ => {
-                            regs.rax = (regs.rax & !0xFF00) | (0x8A << 8);
-                            return thread::KernelAction::Done;
-                        }
-                    }
-                }
-            }
-            regs.rax = regs.rax & !0xFF00; // AH=0
-        }
-        // AH=51h — Reallocate pages for handle (DX=handle, BX=new count)
-        0x51 => {
-            let handle = regs.rdx as u16;
-            let new_count = regs.rbx as u16;
-            let ems = ems_state(dos);
-            if (handle as usize) >= MAX_EMS_HANDLES {
-                regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
-                return thread::KernelAction::Done;
-            }
-            match &mut ems.handles[handle as usize] {
-                Some(h) => {
-                    let old_count = h.pages.len();
-                    if (new_count as usize) > old_count {
-                        if ems.next_page + (new_count - old_count as u16) > EMS_TOTAL_PAGES {
-                            regs.rax = (regs.rax & !0xFF00) | (0x88 << 8);
-                            return thread::KernelAction::Done;
-                        }
-                        for _ in old_count..(new_count as usize) {
-                            let vpage = EMS_BACKING_VPAGE + ems.next_page as usize * 4;
-                            ems.next_page += 1;
-                            h.pages.push(vpage);
-                        }
-                    } else if (new_count as usize) < old_count {
-                        h.pages.truncate(new_count as usize);
-                    }
-                    regs.rax = regs.rax & !0xFF00;
-                    regs.rbx = (regs.rbx & !0xFFFF) | new_count as u64;
-                }
-                None => {
-                    regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
-                }
-            }
-        }
-        // AH=58h — Get mappable physical page array
-        0x58 => {
-            let al = regs.rax as u8;
-            if al == 0 {
-                // Sub 0: fill array at ES:DI with (segment, physical_page) pairs
-                let es = regs.es as u32;
-                let di = regs.rdi as u32;
-                let base = (es << 4) + di;
-                for i in 0..4u32 {
-                    let seg = ems_frame_seg() + (i as u16) * 0x0400;
-                    unsafe {
-                        ((base + i * 4) as *mut u16).write_unaligned(seg);
-                        ((base + i * 4 + 2) as *mut u16).write_unaligned(i as u16);
-                    }
-                }
-                regs.rcx = (regs.rcx & !0xFFFF) | 4; // 4 mappable pages
-                regs.rax = regs.rax & !0xFF00;
-            } else {
-                // Sub 1: just return count
-                regs.rcx = (regs.rcx & !0xFFFF) | 4;
-                regs.rax = regs.rax & !0xFF00;
-            }
-        }
-        _ => {
-            dbg_println!("EMS: UNHANDLED AH={:02X}", ah);
-            regs.rax = (regs.rax & !0xFF00) | (0x84 << 8); // AH=84: function not supported
-        }
-    }
-    thread::KernelAction::Done
-}
 
 fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, name: &[u8]) -> i32 {
     let try_open = |dos: &thread::DosState, kt: &mut thread::KernelThread, n: &[u8]| -> i32 {
@@ -3435,8 +2741,7 @@ pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// Offset within STUB_SEG for a given slot number.
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
-/// Dummy file handle returned for device "EMMXXXX0" (EMS detection)
-const EMS_DEVICE_HANDLE: u16 = 0xFE;
+// EMS_DEVICE_HANDLE moved to ems.rs.
 
 pub fn setup_ivt() {
     // Unified stub array: 256 entries × 2 bytes (CD 31) at 0x0500-0x06FF.
@@ -3743,7 +3048,7 @@ fn map_psp(psp_seg: u16, parent_psp: u16, parent_env_data: Option<&[u8]>, prog_n
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
-pub fn snapshot_env(env_seg: u16) -> alloc::vec::Vec<u8> {
+fn snapshot_env(env_seg: u16) -> alloc::vec::Vec<u8> {
     let src = ((env_seg as usize) << 4) as *const u8;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;
@@ -3765,6 +3070,33 @@ pub fn snapshot_env(env_seg: u16) -> alloc::vec::Vec<u8> {
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
+/// Initialize a thread for VM86 mode (.COM/.EXE execution).
+/// `cwd` is the parent's cwd in VFS form (lowercase, forward-slash); used to
+/// seed `DfsState`. Pass `&[]` for an initial load with no parent.
+/// cs/ip/ss/sp are real-mode segment:offset values.
+fn init_process_thread_vm86(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16, cwd: &[u8]) {
+    use machine::{VM_FLAG, IF_FLAG, VIF_FLAG};
+    let mut dos_state = DosState::new();
+    dos_state.dfs.init_from_vfs(cwd);
+    thread.personality = thread::Personality::Dos(dos_state);
+
+    let state = &mut thread.kernel.cpu_state;
+    *state = Regs::empty();
+
+    state.ds = psp_seg as u64;
+    state.es = psp_seg as u64;
+    state.fs = 0;
+    state.gs = 0;
+
+    state.frame = crate::Frame64 {
+        rip: ip as u64,
+        cs: cs as u64,
+        rflags: (VM_FLAG | IF_FLAG | VIF_FLAG | 0x1000) as u64,
+        rsp: sp as u64,
+        ss: ss as u64,
+    };
+}
+
 pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], parent_env_data: Option<&[u8]>, parent_cwd: &[u8]) {
     use crate::kernel::{startup, thread};
 
@@ -3789,11 +3121,124 @@ pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], pa
     };
 
     let current = thread::get_thread(tid).unwrap();
-    thread::init_process_thread_vm86(current, PSP_SEGMENT, cs, ip, ss, sp, parent_cwd);
+    init_process_thread_vm86(current, PSP_SEGMENT, cs, ip, ss, sp, parent_cwd);
     let dos_state = current.dos_mut();
     dos_reset_blocks(dos_state, end_seg);
     dos_state.dta = (PSP_SEGMENT as u32) * 16 + 0x80;
     current.kernel.symbols = None;
+}
+
+/// Set up the initial DOS thread for a fresh program load (no parent).
+/// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
+/// Returns the new tid; caller drives the event loop.
+pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) -> usize {
+    use crate::kernel::startup;
+
+    let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
+        .expect("Failed to create DOS thread");
+    let tid = t.kernel.tid as usize;
+
+    startup::arch_map_low_mem();
+    setup_ivt();
+
+    let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
+    let dos_len = dfs::vfs_to_dos(path, &mut dos_name);
+    let dos_name = &dos_name[..dos_len];
+
+    let (cs, ip, ss, sp, end_seg) = if is_mz_exe(buf) {
+        load_exe(buf, dos_name, None).expect("load_exe failed")
+    } else {
+        load_com(buf, dos_name, None)
+    };
+
+    init_process_thread_vm86(t, PSP_SEGMENT, cs, ip, ss, sp, cwd);
+    let dos_state = t.dos_mut();
+    dos_state.heap_seg = end_seg;
+    dos_state.dta = (PSP_SEGMENT as u32) * 16 + 0x80;
+
+    let psp_base = (PSP_SEGMENT as u32) << 4;
+    let tail_len = cmdline_tail.len().min(126);
+    unsafe {
+        let psp = psp_base as *mut u8;
+        *psp.add(0x80) = tail_len as u8;
+        core::ptr::copy_nonoverlapping(cmdline_tail.as_ptr(), psp.add(0x81), tail_len);
+        *psp.add(0x81 + tail_len) = 0x0D;
+    }
+
+    let (col, row) = vga::vga().cursor_pos();
+    unsafe {
+        core::ptr::write_volatile(0x450 as *mut u8, col as u8);
+        core::ptr::write_volatile(0x451 as *mut u8, row as u8);
+    }
+    unsafe { *(&raw mut crate::arch::REGS) = t.kernel.cpu_state; }
+    tid
+}
+
+/// Snapshot the parent's DOS environment block for fork+exec inheritance.
+/// In PM, `current_psp == PSP_SEL` and the env paragraph lives in `dpmi.saved_rm_env`
+/// (PSP[0x2C] may have been patched with an env selector). In RM, PSP[0x2C] is
+/// authoritative.
+pub fn snapshot_parent_env(dos: &thread::DosState) -> alloc::vec::Vec<u8> {
+    let psp_seg = dos.current_psp;
+    let env_seg = match dos.dpmi.as_ref() {
+        Some(dpmi) if psp_seg == dpmi::PSP_SEL => dpmi.saved_rm_env,
+        _ => unsafe { (((psp_seg as u32) * 16 + 0x2C) as *const u16).read_unaligned() },
+    };
+    snapshot_env(env_seg)
+}
+
+/// F12 / panic dump: print DPMI LDT entries and PM stack/code bytes.
+/// No-op when the thread isn't a DPMI client.
+pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
+    let Some(dpmi) = dos.dpmi.as_ref() else { return };
+    for (name, sel) in [
+        ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
+        ("DS", regs.ds as u16), ("ES", regs.es as u16),
+        ("FS", regs.fs as u16), ("GS", regs.gs as u16),
+    ] {
+        if sel == 0 { continue; }
+        if sel & 4 == 0 { continue; }
+        let idx = (sel >> 3) as usize;
+        if idx >= dpmi.ldt.len() { continue; }
+        let raw = dpmi.ldt[idx];
+        let base = dpmi::DpmiState::desc_base(raw);
+        let limit = dpmi::DpmiState::desc_limit(raw);
+        crate::dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
+            name, sel, idx, base, limit, raw);
+    }
+    let cs_base = dpmi::seg_base(dpmi, regs.code_seg());
+    let ss_base = dpmi::seg_base(dpmi, regs.stack_seg());
+    let cs_32 = dpmi::seg_is_32(dpmi, regs.code_seg());
+    let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
+    let sp_lin = ss_base.wrapping_add(regs.sp32());
+    let pre = ip_lin.wrapping_sub(16);
+    let cp = unsafe { core::slice::from_raw_parts(pre as *const u8, 32) };
+    crate::dbg_println!("[DBG] code @{:08x} (-16..+16):", pre);
+    crate::dbg_println!("[DBG]   {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} | {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
+        cp[8], cp[9], cp[10], cp[11], cp[12], cp[13], cp[14], cp[15],
+        cp[16], cp[17], cp[18], cp[19], cp[20], cp[21], cp[22], cp[23],
+        cp[24], cp[25], cp[26], cp[27], cp[28], cp[29], cp[30], cp[31]);
+    let sw = unsafe { core::slice::from_raw_parts(sp_lin as *const u32, 8) };
+    crate::dbg_println!("[DBG] stack @{:08x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        sp_lin, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
+}
+
+/// Queue an arch IRQ into this thread's virtual PIC.
+pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
+    machine::queue_irq(&mut dos.pc, irq);
+}
+
+/// Try to deliver one pending interrupt from the virtual PIC. Works for both
+/// VM86 (IVT reflect) and DPMI (PM vector dispatch).
+pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
+    let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
+    if regs.mode() == crate::UserMode::VM86 {
+        machine::reflect_interrupt(regs, vec);
+    } else {
+        DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
+        dpmi::deliver_pm_int(dos, regs, vec);
+    }
 }
 
 /// Check if data starts with the MZ signature.

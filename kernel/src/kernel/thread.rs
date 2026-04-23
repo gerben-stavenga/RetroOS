@@ -390,34 +390,6 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
     thread.kernel.cpu_state.init_user_process_64(entry, stack);
 }
 
-/// Initialize a thread for VM86 mode (.COM execution).
-/// `cwd` is the parent's cwd in VFS form (lowercase, forward-slash); used to
-/// seed `DfsState`. Pass `&[]` for an initial load with no parent.
-/// cs/ip/ss/sp are real-mode segment:offset values.
-pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16, cwd: &[u8]) {
-    use crate::kernel::machine::{VM_FLAG, IF_FLAG, VIF_FLAG};
-    let mut dos_state = DosState::new();
-    dos_state.dfs.init_from_vfs(cwd);
-    thread.personality = Personality::Dos(dos_state);
-
-    let state = &mut thread.kernel.cpu_state;
-    *state = Regs::empty();
-
-    // DS=ES=PSP segment for DOS programs, FS=GS=0
-    state.ds = psp_seg as u64;
-    state.es = psp_seg as u64;
-    state.fs = 0;
-    state.gs = 0;
-
-    state.frame = Frame64 {
-        rip: ip as u64,
-        cs: cs as u64,
-        rflags: (VM_FLAG | IF_FLAG | VIF_FLAG | 0x1000) as u64,
-        rsp: sp as u64,
-        ss: ss as u64,
-    };
-}
-
 /// Save CPU state to thread.
 pub fn save_state(thread: &mut Thread, regs: &Regs) {
     thread.kernel.cpu_state = *regs;
@@ -498,23 +470,18 @@ pub fn schedule(current_tid: usize) -> Option<usize> {
     }
 }
 
-/// Take target thread's saved VGA state (swap, no data copy) and restore to hardware.
-/// `dst` is the running caller's VGA state; the caller adopts target's screen.
-/// Returns 0 on success, negative errno on failure.
-pub fn vga_take(dst: &mut crate::kernel::machine::VgaState, target_tid: i32) -> i32 {
+/// Borrow another thread's `DosState` for a swap-style operation.
+/// Returns the target's DosState if the target is a DOS thread, else an errno.
+pub fn with_target_dos<F: FnOnce(&mut DosState) -> i32>(target_tid: i32, f: F) -> i32 {
     if target_tid < 0 || (target_tid as usize) >= MAX_THREADS { return -22; } // EINVAL
     unsafe {
         let target = &mut *(&raw mut THREADS[target_tid as usize]);
         if target.kernel.state == ThreadState::Unused { return -3; } // ESRCH
-        let src = match &mut target.personality {
-            Personality::Dos(d) => &mut d.pc.vga,
-            _ => return -22, // target not DOS
-        };
-        if src.planes.is_empty() { return -61; }
-        core::mem::swap(dst, src);
-        dst.restore_to_hardware();
+        match &mut target.personality {
+            Personality::Dos(d) => f(d),
+            _ => -22, // target not DOS
+        }
     }
-    0
 }
 
 /// F11 hotkey flag for thread cycling

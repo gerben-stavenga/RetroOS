@@ -331,7 +331,9 @@ fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
             1 => {
                 use core::sync::atomic::Ordering;
                 let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
-                if budget > 0 && !is_vm86(regs) {
+                if budget > 0 {
+                    // Log step in PM and VM86 — VM86 logging needed to trace
+                    // RM execution after a raw PM->RM switch.
                     crate::kernel::dos::pm_step_log(regs);
                     crate::kernel::dos::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
                     regs.set_flag32(1 << 8); // keep TF on

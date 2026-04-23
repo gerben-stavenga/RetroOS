@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use crate::kernel::thread;
 use crate::kernel::dos;
-use crate::kernel::machine;
+use super::machine;
 use crate::kernel::startup;
 use crate::Regs;
 
@@ -150,6 +150,20 @@ pub struct SavedPmState {
     /// callback_return uses this to apply DPMI selector/segment translation
     /// for INT 21h PSP-related calls (AH=51/62).
     pub vector: u8,
+}
+
+/// Set `dpmi.rm_save`, panicking if it was already `Some` — that would mean a
+/// PM→RM transition is being entered while a previous one hasn't unwound
+/// through `callback_return`, which silently destroys the outer save.
+fn set_rm_save(dpmi: &mut DpmiState, new: SavedPmState) {
+    if let Some(prev) = dpmi.rm_save.as_ref() {
+        panic!(
+            "rm_save aliased: prev vec={:#x} cs={:04x} eip={:#x} | new vec={:#x} cs={:04x} eip={:#x}",
+            prev.vector, prev.regs.code_seg(), prev.regs.ip32() as u32,
+            new.vector, new.regs.code_seg(), new.regs.ip32() as u32,
+        );
+    }
+    dpmi.rm_save = Some(new);
 }
 
 /// Host-private alternate-mode state saved/restored by INT 31h/0305h.
@@ -639,9 +653,19 @@ pub fn dpmi_soft_int(_kt: &mut thread::KernelThread, dos: &mut thread::DosState,
 fn push_iret_frame(dpmi: &DpmiState, regs: &mut Regs, eip: u32, cs: u16, flags: u32) {
     let base = seg_base(dpmi, regs.frame.ss as u16);
     let use32 = dpmi.client_use32;
-    let mut sp = regs.sp32();
+    let sp_in = regs.sp32();
+    let sp = if use32 {
+        sp_in.wrapping_sub(12)
+    } else {
+        // 16-bit client: SP is 16-bit only. Panic on stale upper bits.
+        if sp_in & 0xFFFF_0000 != 0 {
+            panic!("push_iret_frame: 16-bit SP has non-zero upper bits: SS={:04x} sp={:#x}",
+                   regs.frame.ss as u16, sp_in);
+        }
+        // 16-bit arithmetic with wrap.
+        ((sp_in as u16).wrapping_sub(6)) as u32
+    };
     if use32 {
-        sp = sp.wrapping_sub(12);
         unsafe {
             let p = base.wrapping_add(sp) as *mut u32;
             core::ptr::write_unaligned(p, eip);
@@ -649,7 +673,6 @@ fn push_iret_frame(dpmi: &DpmiState, regs: &mut Regs, eip: u32, cs: u16, flags: 
             core::ptr::write_unaligned(p.add(2), flags);
         }
     } else {
-        sp = sp.wrapping_sub(6);
         unsafe {
             let p = base.wrapping_add(sp) as *mut u16;
             core::ptr::write_unaligned(p, eip as u16);
@@ -665,27 +688,31 @@ fn push_iret_frame(dpmi: &DpmiState, regs: &mut Regs, eip: u32, cs: u16, flags: 
 fn pop_iret_frame(dpmi: &DpmiState, regs: &mut Regs) -> (u32, u16, u32) {
     let base = seg_base(dpmi, regs.frame.ss as u16);
     let use32 = dpmi.client_use32;
-    let mut sp = regs.sp32();
-    let frame = if use32 {
+    let sp_in = regs.sp32();
+    if !use32 && sp_in & 0xFFFF_0000 != 0 {
+        panic!("pop_iret_frame: 16-bit SP has non-zero upper bits: SS={:04x} sp={:#x}",
+               regs.frame.ss as u16, sp_in);
+    }
+    let (frame, new_sp) = if use32 {
         unsafe {
-            let p = base.wrapping_add(sp) as *const u32;
+            let p = base.wrapping_add(sp_in) as *const u32;
             let eip = core::ptr::read_unaligned(p);
             let cs = core::ptr::read_unaligned(p.add(1)) as u16;
             let flags = core::ptr::read_unaligned(p.add(2));
-            sp = sp.wrapping_add(12);
-            (eip, cs, flags)
+            ((eip, cs, flags), sp_in.wrapping_add(12))
         }
     } else {
         unsafe {
-            let p = base.wrapping_add(sp) as *const u16;
+            let p = base.wrapping_add(sp_in) as *const u16;
             let ip = core::ptr::read_unaligned(p) as u32;
             let cs = core::ptr::read_unaligned(p.add(1));
             let flags = core::ptr::read_unaligned(p.add(2)) as u32;
-            sp = sp.wrapping_add(6);
-            (ip, cs, flags)
+            // 16-bit arithmetic with wrap.
+            let new_sp = ((sp_in as u16).wrapping_add(6)) as u32;
+            ((ip, cs, flags), new_sp)
         }
     };
-    regs.set_sp32(sp);
+    regs.set_sp32(new_sp);
     frame
 }
 
@@ -798,18 +825,16 @@ pub fn dpmi_int31(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kernel
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
         regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
 
-    // Trace DOS/4GW init: arm TF single-step on the very first INT 31 (covers
-    // most of DOS/4GW's stub from the start). Only fires once per process.
-    // Disabled while debugging non-traced behavior.
-    #[allow(unreachable_code, dead_code)]
+    // PM TF single-step arming (disabled — flip the `if false` to re-enable).
+    #[allow(dead_code)]
     if false {
         use core::sync::atomic::Ordering;
         if dos::PM_STEP_BUDGET.load(Ordering::Relaxed) == 0 {
             static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
             if !ONCE.swap(true, Ordering::Relaxed) {
-                dos::PM_STEP_BUDGET.store(65000, Ordering::Relaxed);
+                dos::PM_STEP_BUDGET.store(200_000, Ordering::Relaxed);
                 regs.set_flag32(1 << 8); // TF on return to client
-                dos_trace!(force "[STEP] armed 65000 steps at first INT 31 (DOS/4GW init)");
+                dos_trace!(force "[STEP] armed 200000 steps at first INT 31 (PM init)");
             }
         }
     }
@@ -1494,7 +1519,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
       dump_ds_dx(ds, rm.edx); }
 
     // Save current protected-mode state
-    dpmi.rm_save = Some(SavedPmState {
+    set_rm_save(dpmi, SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
         vector: 0xFF,
@@ -1563,7 +1588,7 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     dos::DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
 
     // Save protected-mode state (rm_struct_addr=0 signals implicit reflection)
-    dpmi.rm_save = Some(SavedPmState {
+    set_rm_save(dpmi, SavedPmState {
         regs: *regs,
         rm_struct_addr: 0,
         vector,
@@ -1614,7 +1639,7 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     let _rm_cs = rm.cs;
     let _rm_ip = rm.ip;
 
-    dpmi.rm_save = Some(SavedPmState {
+    set_rm_save(dpmi, SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
         vector: 0xFF,
@@ -1669,7 +1694,7 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
         edi_f, esi_f, ebp_f, ebx_f, edx_f, ecx_f, eax_f, flags_f);
       dump_ds_dx(ds, rm.edx); }
 
-    dpmi.rm_save = Some(SavedPmState {
+    set_rm_save(dpmi, SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
         vector: 0xFF,
@@ -1754,7 +1779,7 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     unsafe { *(struct_addr as *mut RmCallStruct) = rm_call; }
 
     // Save real-mode state so callback_return can restore it
-    dpmi.rm_save = Some(SavedPmState {
+    set_rm_save(dpmi, SavedPmState {
         regs: *regs,
         rm_struct_addr: struct_addr,
         vector: 0xFF,
