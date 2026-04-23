@@ -168,7 +168,7 @@ impl DosState {
             heap_base_seg: 0xA000,
             alloc_strategy: 0,
             umb_link_state: 0,
-            current_psp: dos::PSP_SEGMENT,
+            current_psp: dos::heap_start() + 0x10,
             dos_pending_char: None,
             last_child_exit_status: 0,
             exec_parent: None,
@@ -373,20 +373,29 @@ pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], pa
     let dos_len = dfs::vfs_to_dos(prog_name, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
 
-    let (cs, ip, ss, sp, end_seg) = if is_exe && dos::is_mz_exe(data) {
-        dos::load_exe(data, dos_name, parent_env_data).unwrap_or_else(|| {
-            crate::println!("Invalid MZ EXE");
-            (0, 0, 0, 0, 0)
+    // Parent: either an env snapshot (with sys's PSP as the segment, since
+    // the actual parent is not in this address space) or just sys.
+    let parent = match parent_env_data {
+        Some(env) => dos::ParentRef { psp_seg: dos::sys_psp_seg(), env },
+        None => dos::sys_program().as_parent(),
+    };
+    let loaded = if is_exe && dos::is_mz_exe(data) {
+        dos::load_exe(dos::heap_start(), &parent, data, dos_name).unwrap_or_else(|| {
+            panic!("Invalid MZ EXE");
         })
     } else {
-        dos::load_com(data, dos_name, parent_env_data)
+        dos::load_com(dos::heap_start(), &parent, data, dos_name)
     };
 
+    let psp_seg = loaded.program.psp_seg();
+    let end_seg = loaded.end_seg;
+    let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
+
     let current = thread::get_thread(tid).unwrap();
-    init_process_thread_vm86(current, dos::PSP_SEGMENT, cs, ip, ss, sp, parent_cwd);
+    init_process_thread_vm86(current, psp_seg, cs, ip, ss, sp, parent_cwd);
     let dos_state = current.dos_mut();
     dos_reset_blocks(dos_state, end_seg);
-    dos_state.dta = (dos::PSP_SEGMENT as u32) * 16 + 0x80;
+    dos_state.dta = (psp_seg as u32) * 16 + 0x80;
     current.kernel.symbols = None;
 }
 
@@ -407,18 +416,23 @@ pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]
     let dos_len = dfs::vfs_to_dos(path, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
 
-    let (cs, ip, ss, sp, end_seg) = if dos::is_mz_exe(buf) {
-        dos::load_exe(buf, dos_name, None).expect("load_exe failed")
+    let parent = dos::sys_program().as_parent();
+    let loaded = if dos::is_mz_exe(buf) {
+        dos::load_exe(dos::heap_start(), &parent, buf, dos_name).expect("load_exe failed")
     } else {
-        dos::load_com(buf, dos_name, None)
+        dos::load_com(dos::heap_start(), &parent, buf, dos_name)
     };
 
-    init_process_thread_vm86(t, dos::PSP_SEGMENT, cs, ip, ss, sp, cwd);
+    let psp_seg = loaded.program.psp_seg();
+    let end_seg = loaded.end_seg;
+    let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
+
+    init_process_thread_vm86(t, psp_seg, cs, ip, ss, sp, cwd);
     let dos_state = t.dos_mut();
     dos_state.heap_seg = end_seg;
-    dos_state.dta = (dos::PSP_SEGMENT as u32) * 16 + 0x80;
+    dos_state.dta = (psp_seg as u32) * 16 + 0x80;
 
-    dos::install_cmdline(dos::PSP_SEGMENT, cmdline_tail);
+    loaded.program.set_cmdline(cmdline_tail);
 
     let (col, row) = vga::vga().cursor_pos();
     unsafe {
@@ -456,7 +470,7 @@ pub fn snapshot_parent_env(dos: &thread::DosState) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if psp_seg == dpmi::PSP_SEL => dpmi.saved_rm_env,
-        _ => dos::psp_env_seg(psp_seg),
+        _ => dos::program_at(psp_seg).psp.env_seg,
     };
     snapshot_env(env_seg)
 }
