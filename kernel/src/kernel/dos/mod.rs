@@ -418,14 +418,7 @@ pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]
     dos_state.heap_seg = end_seg;
     dos_state.dta = (dos::PSP_SEGMENT as u32) * 16 + 0x80;
 
-    let psp_base = (dos::PSP_SEGMENT as u32) << 4;
-    let tail_len = cmdline_tail.len().min(126);
-    unsafe {
-        let psp = psp_base as *mut u8;
-        *psp.add(0x80) = tail_len as u8;
-        core::ptr::copy_nonoverlapping(cmdline_tail.as_ptr(), psp.add(0x81), tail_len);
-        *psp.add(0x81 + tail_len) = 0x0D;
-    }
+    dos::install_cmdline(dos::PSP_SEGMENT, cmdline_tail);
 
     let (col, row) = vga::vga().cursor_pos();
     unsafe {
@@ -463,7 +456,7 @@ pub fn snapshot_parent_env(dos: &thread::DosState) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if psp_seg == dpmi::PSP_SEL => dpmi.saved_rm_env,
-        _ => unsafe { (((psp_seg as u32) * 16 + 0x2C) as *const u16).read_unaligned() },
+        _ => dos::psp_env_seg(psp_seg),
     };
     snapshot_env(env_seg)
 }

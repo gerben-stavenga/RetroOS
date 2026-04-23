@@ -687,10 +687,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(fd as u16, size);
-                    unsafe {
-                        let psp = ((dos.current_psp as u32) * 16) as *mut u8;
-                        if (fd as usize) < 20 { *psp.add(0x34 + fd as usize) = fd as u8; }
-                    }
+                    set_jft(dos.current_psp, fd as usize, fd as u8);
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
@@ -1378,10 +1375,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if fd >= 0 && open_exists {
                 let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                 sft_set_file(fd as u16, size);
-                unsafe {
-                    let psp = ((dos.current_psp as u32) * 16) as *mut u8;
-                    if (fd as usize) < 20 { *psp.add(0x34 + fd as usize) = fd as u8; }
-                }
+                set_jft(dos.current_psp, fd as usize, fd as u8);
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
                 regs.clear_flag32(1);
@@ -1773,7 +1767,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let parent_psp = dos.current_psp;
     let parent_env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if parent_psp == dpmi::PSP_SEL => dpmi.saved_rm_env,
-        _ => unsafe { (((parent_psp as u32) * 16 + 0x2C) as *const u16).read_unaligned() },
+        _ => psp_env_seg(parent_psp),
     };
     let parent_env_vec = snapshot_env(parent_env_seg);
     let (cs, ip, ss, sp, end_seg) = if is_exe {
@@ -1790,13 +1784,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     };
 
     // Copy command tail to child's PSP at child_seg:0080
-    let child_psp = (child_seg as u32) << 4;
-    unsafe {
-        let tail_dst = (child_psp + 0x80) as *mut u8;
-        *tail_dst = copy_len as u8;
-        core::ptr::copy_nonoverlapping(tail.as_ptr(), tail_dst.add(1), copy_len);
-        *tail_dst.add(1 + copy_len) = 0x0D;
-    }
+    install_cmdline(child_seg, &tail[..copy_len]);
 
     // Save parent state. Parent's INT frame (IP/CS/FLAGS) is on the VM86
     // stack at current SS:SP. exec_return restores SS:SP so stub_dispatch
@@ -2124,6 +2112,40 @@ const LOW_MEM_BASE: u32 = 0x500;
 const NUM_DRIVES: u8 = 8;
 const SFT_ENTRIES: usize = 20;
 
+/// Program Segment Prefix (DOS 3+, 256 bytes). Only the fields we read or
+/// write are named; the rest is reserved padding so byte offsets stay stable
+/// for any guest code that walks the structure directly.
+///
+/// Note: the spec puts the inline JFT at 0x18 and a far-pointer to it at 0x34;
+/// the kernel here puts the JFT at 0x34 and the far-pointer (→0x34) at 0x18.
+/// Existing programs (DJGPP, BC, dos4gw, dos16m) use INT 21 for handles, so
+/// neither layout is observable — preserved here unchanged.
+#[repr(C, packed)]
+struct Psp {
+    int_20:           [u8; 2],   // 0x00 — CD 20 (terminate)
+    top_of_mem:       u16,        // 0x02 — segment past program (paragraphs)
+    _reserved_04:     u8,         // 0x04
+    _cpm_call:        [u8; 5],    // 0x05 — far call to CP/M dispatcher
+    _terminate_addr:  u32,        // 0x0A — INT 22h vector
+    _ctrl_break_addr: u32,        // 0x0E — INT 23h vector
+    _critical_err:    u32,        // 0x12 — INT 24h vector
+    parent_psp:       u16,        // 0x16 — parent PSP segment
+    jft_far_off:      u16,        // 0x18 — (kernel layout: JFT pointer offset)
+    jft_far_seg:      u16,        // 0x1A — (kernel layout: JFT pointer segment)
+    _reserved_1c:     [u8; 0x10], // 0x1C-0x2B
+    env_seg:          u16,        // 0x2C — environment segment (or 0)
+    _ss_sp:           u32,        // 0x2E — SS:SP at last INT 21
+    max_files:        u16,        // 0x32 — JFT size
+    jft:              [u8; 20],   // 0x34 — inline JFT (kernel layout)
+    _reserved_48:     [u8; 0x80 - 0x48], // 0x48-0x7F
+    cmdline_len:      u8,         // 0x80
+    cmdline:          [u8; 127],  // 0x81-0xFF (CR-terminated)
+}
+const _: () = assert!(core::mem::size_of::<Psp>() == 256);
+impl Default for Psp {
+    fn default() -> Self { unsafe { core::mem::zeroed() } }
+}
+
 /// One System File Table entry (DOS 3+ format, 59 bytes).
 #[repr(C, packed)]
 struct SftEntry {
@@ -2194,7 +2216,7 @@ impl Default for CdsEntry {
 #[repr(C, packed)]
 struct LowMem {
     stubs:     [[u8; 2]; 256],        // 0x500
-    syspsp:    [u8; 256],              // 0x700, seg 0x70
+    syspsp:    Psp,                    // 0x700, seg 0x70
     lol:       Lol,                    // 0x800, seg 0x80
     sft:       Sft,                    // 0x840
     cds:       [CdsEntry; NUM_DRIVES as usize], // 0xCE2
@@ -2291,87 +2313,100 @@ pub(super) fn setup_ivt() {
 }
 
 fn setup_lol_sft() {
-    use core::ptr::addr_of_mut;
-    unsafe {
-        let lm = LOW_MEM;
+    let lm = unsafe { &mut *LOW_MEM };
 
-        // Zero the regions we don't fully overwrite below (SYSPSP, SFT, CDS).
-        core::ptr::write_bytes(addr_of_mut!((*lm).syspsp) as *mut u8, 0, 256);
-        core::ptr::write_bytes(addr_of_mut!((*lm).sft) as *mut u8, 0, core::mem::size_of::<Sft>());
-        core::ptr::write_bytes(addr_of_mut!((*lm).cds) as *mut u8, 0, core::mem::size_of_val(&(*lm).cds));
+    // SYSPSP: minimal "system" PSP. INT 20h prefix + top-of-memory at
+    // 0xA000, with parent-PSP self-reference (terminates the parent chain
+    // — DPMILOAD checks grandparent != parent).
+    lm.syspsp = Psp {
+        int_20: [0xCD, 0x20],
+        top_of_mem: 0xA000,
+        parent_psp: SYSPSP_SEG,
+        ..Default::default()
+    };
 
-        // SYSPSP: minimal "system" PSP. INT 20h prefix + top-of-memory at
-        // 0xA000, with parent-PSP self-reference at +0x16.
-        let syspsp = addr_of_mut!((*lm).syspsp) as *mut u8;
-        *syspsp.add(0) = 0xCD;
-        *syspsp.add(1) = 0x20;
-        *syspsp.add(2) = 0x00;
-        *syspsp.add(3) = 0xA0;
-        addr_of_mut!(*(syspsp.add(0x16) as *mut u16)).write_unaligned(SYSPSP_SEG);
+    lm.lol = Lol {
+        sft_off: (SFT_ADDR & 0xF) as u16,
+        sft_seg: (SFT_ADDR >> 4) as u16,
+        cds_off: (CDS_ADDR & 0xF) as u16,
+        cds_seg: (CDS_ADDR >> 4) as u16,
+        block_devs: 1,
+        last_drive: NUM_DRIVES,
+        ..Default::default()
+    };
 
-        addr_of_mut!((*lm).lol).write_unaligned(Lol {
-            sft_off: (SFT_ADDR & 0xF) as u16,
-            sft_seg: (SFT_ADDR >> 4) as u16,
-            cds_off: (CDS_ADDR & 0xF) as u16,
-            cds_seg: (CDS_ADDR >> 4) as u16,
-            block_devs: 1,
-            last_drive: NUM_DRIVES,
+    // SFT header: end-of-chain link, entry count + zeroed entries; then
+    // pre-populate stdin/stdout/stderr as character devices.
+    lm.sft = unsafe { core::mem::zeroed() };
+    lm.sft.next = 0xFFFF_FFFF;
+    lm.sft.count = SFT_ENTRIES as u16;
+    for fd in 0..3 {
+        lm.sft.entries[fd] = SftEntry {
+            refcount: 1,
+            device_info: if fd == 0 { 0x81 } else { 0x82 },
             ..Default::default()
-        });
-
-        // SFT header: end-of-chain link, entry count.
-        addr_of_mut!((*lm).sft.next).write_unaligned(0xFFFF_FFFF);
-        addr_of_mut!((*lm).sft.count).write_unaligned(SFT_ENTRIES as u16);
-
-        // Stdin/stdout/stderr as character devices.
-        for fd in 0..3usize {
-            let dev_info = if fd == 0 { 0x81u16 } else { 0x82 };
-            addr_of_mut!((*lm).sft.entries[fd]).write_unaligned(SftEntry {
-                refcount: 1,
-                device_info: dev_info,
-                ..Default::default()
-            });
-        }
-
-        // CDS: drive 2 = C:\, drive 7 = H:\ (hostfs). Others stay invalid.
-        let mk = |drive_letter: u8| -> CdsEntry {
-            let mut e = CdsEntry::default();
-            e.path[0] = drive_letter;
-            e.path[1] = b':';
-            e.path[2] = b'\\';
-            e.flags = 0x4000;
-            e.backslash_off = 2;
-            e
         };
-        addr_of_mut!((*lm).cds[2]).write_unaligned(mk(b'C'));
-        addr_of_mut!((*lm).cds[7]).write_unaligned(mk(b'H'));
     }
+
+    // CDS: drive 2 = C:\, drive 7 = H:\ (hostfs). Others stay invalid.
+    let mk = |drive_letter: u8| -> CdsEntry {
+        let mut e = CdsEntry::default();
+        e.path[0] = drive_letter;
+        e.path[1] = b':';
+        e.path[2] = b'\\';
+        e.flags = 0x4000;
+        e.backslash_off = 2;
+        e
+    };
+    lm.cds = [(); NUM_DRIVES as usize].map(|_| CdsEntry::default());
+    lm.cds[2] = mk(b'C');
+    lm.cds[7] = mk(b'H');
+}
+
+/// Borrow the PSP at the given segment as a typed reference.
+fn psp_at(seg: u16) -> &'static mut Psp {
+    unsafe { &mut *(((seg as u32) << 4) as *mut Psp) }
+}
+
+/// Install a child handle's JFT entry (called when an Open/Create succeeds).
+fn set_jft(psp_seg: u16, fd: usize, sft_index: u8) {
+    let psp = psp_at(psp_seg);
+    if fd < psp.jft.len() { psp.jft[fd] = sft_index; }
+}
+
+/// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
+pub(super) fn install_cmdline(psp_seg: u16, tail: &[u8]) {
+    let psp = psp_at(psp_seg);
+    let n = tail.len().min(psp.cmdline.len() - 1);
+    psp.cmdline_len = n as u8;
+    psp.cmdline[..n].copy_from_slice(&tail[..n]);
+    psp.cmdline[n] = 0x0D;
+}
+
+/// Read the env-segment field of a PSP (PSP[0x2C]).
+pub(super) fn psp_env_seg(psp_seg: u16) -> u16 {
+    psp_at(psp_seg).env_seg
 }
 
 /// Populate SFT entry for a newly opened file handle.
 fn sft_set_file(handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
-    unsafe {
-        core::ptr::addr_of_mut!((*LOW_MEM).sft.entries[handle as usize]).write_unaligned(
-            SftEntry {
-                refcount: 1,
-                attribute: 0x20,         // archive
-                time: 0x6000,            // 12:00:00
-                date: 0x5C76,            // 2026-03-22
-                size,
-                ..Default::default()
-            },
-        );
-    }
+    let lm = unsafe { &mut *LOW_MEM };
+    lm.sft.entries[handle as usize] = SftEntry {
+        refcount: 1,
+        attribute: 0x20,    // archive
+        time: 0x6000,       // 12:00:00
+        date: 0x5C76,       // 2026-03-22
+        size,
+        ..Default::default()
+    };
 }
 
 /// Clear SFT entry when a file handle is closed.
 fn sft_clear(handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
-    unsafe {
-        core::ptr::addr_of_mut!((*LOW_MEM).sft.entries[handle as usize].refcount)
-            .write_unaligned(0);
-    }
+    let lm = unsafe { &mut *LOW_MEM };
+    lm.sft.entries[handle as usize].refcount = 0;
 }
 
 // ============================================================================
@@ -2448,32 +2483,26 @@ fn map_psp(psp_seg: u16, parent_psp: u16, parent_env_data: Option<&[u8]>, prog_n
     // system PSP (not itself). DPMILOAD relies on grandparent != parent.
     let parent_field = if psp_seg == parent_psp { SYSPSP_SEG } else { parent_psp };
 
-    let psp_ptr = psp_addr as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(psp_ptr, 0, 256);
-        *psp_ptr.add(0) = 0xCD; // INT 20h
-        *psp_ptr.add(1) = 0x20;
-        *psp_ptr.add(2) = 0x00; // top of memory = 0xA000
-        *psp_ptr.add(3) = 0xA0;
-        // Parent PSP segment
-        *psp_ptr.add(0x16) = parent_field as u8;
-        *psp_ptr.add(0x17) = (parent_field >> 8) as u8;
-        *psp_ptr.add(0x2C) = env_seg as u8;
-        *psp_ptr.add(0x2D) = (env_seg >> 8) as u8;
-        // JFT: pointer at PSP+0x18 → inline JFT at PSP+0x34
-        *(psp_ptr.add(0x18) as *mut u16) = 0x0034; // offset
-        *(psp_ptr.add(0x1A) as *mut u16) = psp_seg; // segment
-        *(psp_ptr.add(0x32) as *mut u16) = 20; // max open files
-        // Inline JFT (20 bytes at PSP+0x34): 0/1/2 = stdin/stdout/stderr, rest = 0xFF
-        *psp_ptr.add(0x34) = 0; // stdin → SFT 0
-        *psp_ptr.add(0x35) = 1; // stdout → SFT 1
-        *psp_ptr.add(0x36) = 2; // stderr → SFT 2
-        for i in 3..20usize {
-            *psp_ptr.add(0x34 + i) = 0xFF; // closed
-        }
-        *psp_ptr.add(0x80) = 0; // command tail length
-        *psp_ptr.add(0x81) = 0x0D; // CR
-    }
+    let mut jft = [0xFFu8; 20];
+    jft[0] = 0; jft[1] = 1; jft[2] = 2;   // stdin/stdout/stderr → SFT 0/1/2
+
+    let mut cmdline = [0u8; 127];
+    cmdline[0] = 0x0D;                      // empty tail terminated by CR
+
+    let psp = unsafe { &mut *(psp_addr as *mut Psp) };
+    *psp = Psp {
+        int_20: [0xCD, 0x20],
+        top_of_mem: 0xA000,
+        parent_psp: parent_field,
+        jft_far_off: 0x0034,                // far ptr at PSP[0x18] → inline JFT at PSP[0x34]
+        jft_far_seg: psp_seg,
+        env_seg,
+        max_files: 20,
+        jft,
+        cmdline_len: 0,
+        cmdline,
+        ..Default::default()
+    };
 
     // TRACE: dump env block (first 160 bytes after suffix marker) and prog_name
     unsafe {
