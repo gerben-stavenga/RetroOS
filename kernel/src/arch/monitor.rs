@@ -223,6 +223,34 @@ unsafe fn pop16(regs: &mut Regs, ss_base: u32, ss_32: bool) -> u16 {
     val
 }
 
+/// SW equivalent of the CPU's VM86 INT dispatch, for hosts without VME.
+/// Reads CS:IP from the RM IVT at `(vector*4)`, pushes FLAGS/CS/IP on the
+/// current VM86 stack, clears IF/TF, and loads the new CS:IP. The monitor
+/// calls this for INTs whose redirection-bitmap bit is clear so upstream
+/// never sees a "not for us" VM86 INT.
+#[inline]
+unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
+    // IVT lives at linear 0. Unaligned reads are fine here (real-mode IVT
+    // is paragraph-aligned; entries are 4 bytes each).
+    let ivt_addr = (vector as u32) * 4;
+    let new_ip = unsafe { core::ptr::read_unaligned(ivt_addr as *const u16) };
+    let new_cs = unsafe { core::ptr::read_unaligned((ivt_addr + 2) as *const u16) };
+
+    let ss_base = (regs.stack_seg() as u32) << 4;
+    let flags = regs.flags32() as u16;
+    let old_cs = regs.code_seg();
+    let old_ip = regs.ip32() as u16;
+    unsafe {
+        push16(regs, ss_base, false, flags);
+        push16(regs, ss_base, false, old_cs);
+        push16(regs, ss_base, false, old_ip);
+    }
+    regs.clear_flag32(IF_FLAG);
+    regs.clear_flag32(TF_FLAG);
+    regs.set_cs32(new_cs as u32);
+    regs.set_ip32(new_ip as u32);
+}
+
 #[inline]
 unsafe fn push32(regs: &mut Regs, ss_base: u32, ss_32: bool, val: u32) {
     let new_sp = get_sp(regs, ss_32).wrapping_sub(4);
@@ -356,12 +384,27 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
 
         // ----- Software interrupts (bubble as SoftInt(n)) -----
 
-        // INT imm8
+        // INT imm8. Two CPU behaviors at the VM86 boundary:
+        //   - With CR4.VME=1, the CPU consults the TSS interrupt-redirection
+        //     bitmap: bits SET trap here, bits CLEAR are IVT-redirected by
+        //     hardware and never reach us.
+        //   - Without VME (386/486 SX / QEMU TCG), every VM86 `CD nn` #GPs
+        //     into the monitor regardless.
+        // Present a uniform interface upward: if the vector's bit is set,
+        // bubble it as `SoftInt(vec)`; otherwise do the IVT reflect here in
+        // arch so the kernel never sees a "not for us" VM86 INT.
         0xCD => {
             let vector = peek_byte(cs_base, start_ip.wrapping_add(advance));
             advance += 1;
             advance_ip(regs, cs_32, advance);
-            Event(E::SoftInt(vector))
+            if regs.mode() == UserMode::VM86
+                && !crate::arch::descriptors::int_intercepted(vector)
+            {
+                unsafe { sw_reflect_vm86_int(regs, vector); }
+                MonitorResult::Resume
+            } else {
+                Event(E::SoftInt(vector))
+            }
         }
         // INT3
         0xCC => {

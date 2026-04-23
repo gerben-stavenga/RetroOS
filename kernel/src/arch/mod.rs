@@ -34,4 +34,3 @@ pub use x86::{cli, sti, hlt};
 pub use x86::{inb, outb, inw, outw};
 pub use x86::{FxState, clean_fx_template};
 pub use irq::{get_ticks, take_pending_ticks, drain};
-pub use descriptors::int_intercepted;

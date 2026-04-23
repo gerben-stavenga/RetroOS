@@ -54,19 +54,13 @@ fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
     Some(ascii)
 }
 
-/// Handle INT n from VM86 mode.
-/// With VME, only INTs whose bit is SET in the redirection bitmap trap here.
-/// Without VME, all INTs trap — unintercepted ones are reflected through IVT.
+/// Handle INT n from VM86 mode. Only bitmap-trapped INTs bubble up here;
+/// arch does the SW IVT reflect for the rest. In our setup only `STUB_INT`
+/// is in the bitmap.
 pub(super) fn handle_vm86_int(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs, int_num: u8) -> thread::KernelAction {
-    if !crate::arch::int_intercepted(int_num) {
-        reflect_interrupt(regs, int_num);
-        return thread::KernelAction::Done;
-    }
     match int_num {
         STUB_INT => stub_dispatch(kt, dos, regs),
-        _ => {
-            panic!("VM86: INT {:02X} intercepted in bitmap but has no handler", int_num);
-        }
+        _ => panic!("VM86: INT {:02X} bubbled to dos but only STUB_INT should trap", int_num),
     }
 }
 
