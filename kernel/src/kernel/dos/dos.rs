@@ -19,7 +19,7 @@ use super::{
     dos_reset_blocks, dos_alloc_block, dos_free_block, dos_resize_block,
     DOS_TRACE_RT, DOS_TRACE_HW_RT,
 };
-use super::{dpmi, dfs, machine, uma};
+use super::{dpmi, dfs, machine, xms};
 use super::ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};
 use super::xms::xms_dispatch;
 use super::dos_trace;
@@ -35,12 +35,6 @@ use super::machine::{
 /// Dummy file handle returned for /dev/null semantics.
 const NULL_FILE_HANDLE: u16 = 99;
 
-/// PSP segment for the initial DOS program — derived from low-memory layout
-/// end so the environment block at `PSP_SEGMENT-0x10` (256 bytes) never
-/// overlaps kernel structures. The .COM/.EXE load module begins at
-/// `PSP_SEGMENT+0x10` (256 bytes past the PSP). For .COM programs DOS sets
-/// CS=DS=ES=SS=PSP_SEGMENT, IP=0x100.
-pub(super) const PSP_SEGMENT: u16 = (((IRQ_STACK_ADDR + IRQ_STACK_SIZE) + 0xF) >> 4) as u16 + 0x10;
 /// .COM entry IP (relative to its PSP segment). Equivalent to `(psp+0x10):0000`.
 const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer for .COM (top of PSP's 64KB segment)
@@ -2119,57 +2113,164 @@ fn find_matching_file(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
 /// handler does I/O (IN/OUT), it traps through the IOPB to our virtual
 /// PIC/keyboard, so BIOS code works transparently.
 ///
-/// Stub area base in conventional memory (segment 0x0050, offset 0x0000)
-pub(crate) const STUB_BASE: u32 = 0x0500;
-pub(crate) const STUB_SEG: u16 = 0x0050;
+// ── Low-memory layout ────────────────────────────────────────────────
+// Single struct at LOW_MEM_BASE so field offsets propagate automatically
+// when sizes change. The fake DOS internal structures (PSP, LoL, SFT, CDS)
+// are typed sub-structs; the stub array and IRQ stack are byte arrays.
+// `PSP_SEGMENT` is computed from the layout's end so the user-visible
+// program PSP never overlaps kernel-owned memory.
 
-/// Trap vector for all stubs (only one in TSS bitmap)
+const LOW_MEM_BASE: u32 = 0x500;
+const NUM_DRIVES: u8 = 8;
+const SFT_ENTRIES: usize = 20;
+
+/// One System File Table entry (DOS 3+ format, 59 bytes).
+#[repr(C, packed)]
+struct SftEntry {
+    refcount: u16,        // 0x00
+    open_mode: u16,       // 0x02
+    attribute: u8,        // 0x04
+    device_info: u16,     // 0x05
+    _reserved_07: [u8; 6],// 0x07
+    time: u16,            // 0x0D
+    date: u16,            // 0x0F
+    size: u32,            // 0x11
+    position: u32,        // 0x15
+    _trailer: [u8; 34],   // 0x19-0x3A (filename + DOS-internal fields we don't fill)
+}
+const _: () = assert!(core::mem::size_of::<SftEntry>() == 59);
+impl Default for SftEntry {
+    fn default() -> Self { unsafe { core::mem::zeroed() } }
+}
+
+/// SFT header followed by the entry array. Total 1186 bytes.
+#[repr(C, packed)]
+struct Sft {
+    next: u32,                       // 0x00 — far ptr to next SFT block (FFFF:FFFF = end)
+    count: u16,                      // 0x04
+    entries: [SftEntry; SFT_ENTRIES],
+}
+
+/// List-of-Lists (DOS internal). Only the fields we actually fill are named;
+/// the rest is reserved padding.
+#[repr(C, packed)]
+struct Lol {
+    _reserved_00: [u8; 4],
+    sft_off: u16,                    // 0x04 — far ptr to SFT (off, seg)
+    sft_seg: u16,
+    _reserved_08: [u8; 14],
+    cds_off: u16,                    // 0x16 — far ptr to CDS array
+    cds_seg: u16,
+    _reserved_1a: [u8; 6],
+    block_devs: u8,                  // 0x20
+    last_drive: u8,                  // 0x21
+    _trailer: [u8; 30],
+}
+const _: () = assert!(core::mem::size_of::<Lol>() == 0x40);
+impl Default for Lol {
+    fn default() -> Self { unsafe { core::mem::zeroed() } }
+}
+
+/// Current Directory Structure (one per drive letter, DOS 3.3 format).
+#[repr(C, packed)]
+struct CdsEntry {
+    path: [u8; 67],                  // 0x00 — ASCIIZ (e.g. "C:\")
+    flags: u16,                      // 0x43 — 0x4000 = valid physical drive
+    _reserved_45: [u8; 10],
+    backslash_off: u16,              // 0x4F — offset of '\' in `path`
+}
+const _: () = assert!(core::mem::size_of::<CdsEntry>() == 81);
+impl Default for CdsEntry {
+    fn default() -> Self { unsafe { core::mem::zeroed() } }
+}
+
+/// Fixed kernel-owned region in conventional memory.
+///
+/// The CD 31 stub array, the system PSP (a stand-in for COMMAND.COM whose
+/// parent-PSP field self-references to terminate the chain — DPMILOAD checks
+/// grandparent != parent), the LoL → SFT chain DJGPP's fstat walks, the CDS
+/// array some programs read, and a private IRQ-reflect stack so BIOS handlers
+/// don't trample the user's (possibly tiny) stack.
+#[repr(C, packed)]
+struct LowMem {
+    stubs:     [[u8; 2]; 256],        // 0x500
+    syspsp:    [u8; 256],              // 0x700, seg 0x70
+    lol:       Lol,                    // 0x800, seg 0x80
+    sft:       Sft,                    // 0x840
+    cds:       [CdsEntry; NUM_DRIVES as usize], // 0xCE2
+    _pad:      [u8; 6],                // align irq_stack to a paragraph boundary
+    irq_stack: [u8; 256],              // 0xF70, seg 0xF7
+}
+
+const LOW_MEM: *mut LowMem = LOW_MEM_BASE as *mut LowMem;
+
+const _: () = assert!(
+    (LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_stack)) % 16 == 0,
+    "irq_stack base must be paragraph-aligned (adjust LowMem._pad)",
+);
+
+// ── Derived address / segment constants ────────────────────────────────
+pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
+pub(crate) const STUB_SEG: u16 = (LOW_MEM_BASE >> 4) as u16;
+const SYSPSP_ADDR: u32 = LOW_MEM_BASE + core::mem::offset_of!(LowMem, syspsp) as u32;
+const SYSPSP_SEG: u16 = (SYSPSP_ADDR >> 4) as u16;
+const SYSPSP_SIZE: u32 = 256;
+const LOL_ADDR: u32 = LOW_MEM_BASE + core::mem::offset_of!(LowMem, lol) as u32;
+const LOL_SEG: u16 = (LOL_ADDR >> 4) as u16;
+const SFT_ADDR: u32 = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
+const CDS_ADDR: u32 = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
+pub(crate) const IRQ_STACK_SEG: u16 =
+    ((LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_stack)) >> 4) as u16;
+pub(crate) const IRQ_STACK_TOP: u16 = 256;
+/// Offset within SYSPSP of the INDOS flag byte (permanently zero).
+/// Placed in the "command tail" area since the system PSP never runs.
+const INDOS_FLAG_OFFSET: u16 = 0xFE;
+
+/// PSP segment for the initial DOS program — first paragraph past the
+/// kernel-owned low-mem area, plus 0x10 so the env block at PSP-0x10 doesn't
+/// overlap. The .COM/.EXE load module starts at PSP+0x10. For .COM programs
+/// DOS sets CS=DS=ES=SS=PSP_SEGMENT, IP=0x100.
+pub(super) const PSP_SEGMENT: u16 = {
+    let end = LOW_MEM_BASE as usize + core::mem::size_of::<LowMem>();
+    ((end + 15) >> 4) as u16 + 0x10
+};
+
+// ── Stub vector / slot assignments ─────────────────────────────────────
+// Slot N at offset N*2 from STUB_SEG. After CD 31, IP = N*2+2, slot = (IP-2)/2.
+// VM86 traps via TSS bitmap bit 31h; PM fires INT 31h directly (DPL=3).
 const STUB_INT: u8 = 0x31;
-
-// Slot assignments in the unified CD 31 array (256 entries, 2 bytes each).
-// Slot N at offset N*2 from segment base. After CD 31, IP = N*2+2, slot = (IP-2)/2.
 const SLOT_XMS: u8 = 0x00;
 const SLOT_DPMI_ENTRY: u8 = 0x01;
 pub(crate) const SLOT_CALLBACK_RET: u8 = 0x02;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
 pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
-/// Slots SLOT_HW_IRQ_BASE + N are entered from a stub-hooked IVT for hardware
-/// IRQ N (0..15). INT 08h..0Fh and INT 70h..77h all funnel through here so
-/// their BIOS handlers run on a private IRQ stack, not the user's stack.
+/// Slots SLOT_HW_IRQ_BASE + N route IRQ N (0..15) so its BIOS handler runs
+/// on a private IRQ stack, not the user's stack.
 pub(crate) const SLOT_HW_IRQ_BASE: u8 = 0xE0;
-pub(crate) const SLOT_HW_IRQ_END: u8 = 0xF0; // exclusive (16 IRQs)
+pub(crate) const SLOT_HW_IRQ_END: u8 = 0xF0;
 /// VM86-only: RM IRET target for implicit INT reflection (no PM handler
-/// installed, default stub reflected to RM). `rm_int_return` restores PM
-/// state and synthesizes the STI that DPMI spec requires IRQ handlers to
-/// perform before IRET — our default stub is the nominal handler here.
+/// installed). `rm_int_return` restores PM state and synthesizes the STI
+/// the DPMI spec requires our default stub to perform before IRET.
 pub(crate) const SLOT_RM_INT_RET: u8 = 0xFA;
-/// VM86-only: BIOS HW IRQ handler IRET trampoline (restores pre-reflect SS:SP).
 pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 
-/// Offset within STUB_SEG for a given slot number.
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
-// EMS_DEVICE_HANDLE moved to ems.rs.
-
 pub(super) fn setup_ivt() {
-    // Unified stub array: 256 entries × 2 bytes (CD 31) at 0x0500-0x06FF.
-    // Slot N at offset N*2. VM86 traps via TSS bitmap bit 31h; PM fires INT 31h (DPL=3).
     unsafe {
-        let b = STUB_BASE as *mut u8;
-        for i in 0..256u32 {
-            *b.add((i * 2) as usize) = 0xCD;
-            *b.add((i * 2 + 1) as usize) = STUB_INT;
+        // Fill the stub array with `CD 31` so any slot reached by an IVT
+        // entry (or PM CALL FAR) traps to STUB_INT and the slot dispatcher.
+        for i in 0..256 {
+            (*LOW_MEM).stubs[i] = [0xCD, STUB_INT];
         }
     }
 
-    // Patch IVT entries to point to our stubs (IVT lives at linear 0x0000).
-    // Save original BIOS HW IRQ vectors before we hook them — all 16 IRQs are
-    // routed through private-stack slots so their BIOS handlers never run on
-    // the user's (possibly tiny) stack.
+    // Hook BIOS HW IRQ vectors (0x08-0x0F + 0x70-0x77) through private-stack
+    // slots; save the original BIOS pointers so hw_irq_reflect can chain.
     for irq in 0u8..16 {
         let vec = irq_to_vector(irq);
         let ip = read_u16(0, (vec as u32) * 4);
@@ -2178,164 +2279,98 @@ pub(super) fn setup_ivt() {
         write_u16(0, (vec as u32) * 4, slot_offset(SLOT_HW_IRQ_BASE + irq));
         write_u16(0, (vec as u32) * 4 + 2, STUB_SEG);
     }
+    // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
+    // dispatcher (slot index = INT vector).
     for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x67] {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
 
-    // Set up fake DOS internal structures (List of Lists + System File Table)
-    // so that DJGPP's fstat (which uses INT 21h/52h → SFT) can find file info.
     setup_lol_sft();
-
-    // Scan upper memory to find free pages for UMB/EMS
-    uma::scan_uma();
-}
-
-// ── Low-memory layout (sequential from STUB_BASE) ──────────────────
-// Stubs:     256 × 2 bytes       0x0500–0x06FF
-// SYSPSP:    256 bytes           0x0700–0x07FF   (seg 0x70)
-// LoL:       0x40 bytes          0x0800–0x083F   (seg 0x80)
-// SFT:       6 + 20×59 = 1186   0x0840–0x0CE1
-// CDS:       8 × 81 = 648       0x0CE2–0x0DD4
-// IRQ stack: 256 bytes           0x0DE0–0x0EDF   (seg 0xDE)
-// Env block: (COM_SEG-0x10)      0x0EE0–0x0EFF   (seg 0xEE)
-// COM/EXE:   load area           0x0FE0–...      (seg 0xFE)
-//
-// SYSPSP is a minimal "system" PSP whose parent-PSP field points to itself,
-// matching real DOS: COMMAND.COM's PSP[0x16] points to a distinct SYSPSP
-// segment, and SYSPSP[0x16] self-references (terminating the chain).
-// DPMILOAD checks grandparent != parent and refuses to run if they match,
-// so we must never make the initial program self-parenting.
-const SYSPSP_ADDR: u32 = STUB_BASE + 256 * 2;                     // 0x0700
-const SYSPSP_SIZE: u32 = 256;
-const SYSPSP_SEG: u16 = (SYSPSP_ADDR >> 4) as u16;                // 0x70
-/// Offset within SYSPSP of the INDOS flag byte (permanently zero).
-/// Placed in the "command tail" area since the system PSP never runs.
-const INDOS_FLAG_OFFSET: u16 = 0xFE;
-const LOL_ADDR: u32 = SYSPSP_ADDR + SYSPSP_SIZE;                  // 0x0800
-const LOL_SIZE: u32 = 0x40;
-const SFT_ADDR: u32 = LOL_ADDR + LOL_SIZE;                        // 0x0840
-const SFT_ENTRIES: u16 = 20;
-const SFT_ENTRY_SIZE: u32 = 59;
-const SFT_SIZE: u32 = 6 + SFT_ENTRIES as u32 * SFT_ENTRY_SIZE;    // 1186
-const CDS_ADDR: u32 = SFT_ADDR + SFT_SIZE;                        // 0x0CE2
-const CDS_ENTRY_SIZE: u32 = 81;
-const NUM_DRIVES: u8 = 8; // A..H (H: = hostfs)
-const CDS_SIZE: u32 = NUM_DRIVES as u32 * CDS_ENTRY_SIZE;         // 243
-const DOS_AREA_END: u32 = CDS_ADDR + CDS_SIZE;                    // 0x0DD5
-/// Private stack for hardware IRQ reflection (avoids using program's stack).
-/// 256 bytes, paragraph-aligned. Stack grows down, so SP starts at top.
-const IRQ_STACK_ADDR: u32 = (DOS_AREA_END + 15) & !15;            // 0x0DE0
-const IRQ_STACK_SIZE: u32 = 256;
-pub(crate) const IRQ_STACK_SEG: u16 = (IRQ_STACK_ADDR >> 4) as u16;
-pub(crate) const IRQ_STACK_TOP: u16 = IRQ_STACK_SIZE as u16;      // SP starts here
-const LOL_SEG: u16 = (LOL_ADDR >> 4) as u16;
-
-/// Write a little-endian u16 to an arbitrary (possibly unaligned) address.
-unsafe fn write_le16(addr: *mut u8, val: u16) {
-    unsafe {
-        *addr = val as u8;
-        *addr.add(1) = (val >> 8) as u8;
-    }
-}
-
-/// Write a little-endian u32 to an arbitrary (possibly unaligned) address.
-unsafe fn write_le32(addr: *mut u8, val: u32) {
-    unsafe {
-        *addr = val as u8;
-        *addr.add(1) = (val >> 8) as u8;
-        *addr.add(2) = (val >> 16) as u8;
-        *addr.add(3) = (val >> 24) as u8;
-    }
+    xms::scan_uma();
 }
 
 fn setup_lol_sft() {
+    use core::ptr::addr_of_mut;
     unsafe {
-        // Zero the whole DOS area (SYSPSP + LoL + SFT + CDS)
-        let total = (DOS_AREA_END - SYSPSP_ADDR) as usize;
-        core::ptr::write_bytes(SYSPSP_ADDR as *mut u8, 0, total);
+        let lm = LOW_MEM;
 
-        // SYSPSP: a stand-in for COMMAND.COM's PSP. Its parent-PSP field
-        // points to itself, terminating the PSP parent chain. Real DOS
-        // does the same for COMMAND.COM. This is what the initial program's
-        // PSP[0x16] points to, so DPMILOAD's grandparent check succeeds
-        // (grandparent = SYSPSP_SEG != parent = PSP_SEGMENT).
-        let syspsp = SYSPSP_ADDR as *mut u8;
-        *syspsp.add(0) = 0xCD;                // INT 20h
+        // Zero the regions we don't fully overwrite below (SYSPSP, SFT, CDS).
+        core::ptr::write_bytes(addr_of_mut!((*lm).syspsp) as *mut u8, 0, 256);
+        core::ptr::write_bytes(addr_of_mut!((*lm).sft) as *mut u8, 0, core::mem::size_of::<Sft>());
+        core::ptr::write_bytes(addr_of_mut!((*lm).cds) as *mut u8, 0, core::mem::size_of_val(&(*lm).cds));
+
+        // SYSPSP: minimal "system" PSP. INT 20h prefix + top-of-memory at
+        // 0xA000, with parent-PSP self-reference at +0x16.
+        let syspsp = addr_of_mut!((*lm).syspsp) as *mut u8;
+        *syspsp.add(0) = 0xCD;
         *syspsp.add(1) = 0x20;
-        *syspsp.add(2) = 0x00;                // top of memory = 0xA000
+        *syspsp.add(2) = 0x00;
         *syspsp.add(3) = 0xA0;
-        write_le16(syspsp.add(0x16), SYSPSP_SEG); // self-reference
+        addr_of_mut!(*(syspsp.add(0x16) as *mut u16)).write_unaligned(SYSPSP_SEG);
 
-        let lol = LOL_ADDR as *mut u8;
-        // LoL+04h: far pointer to SFT
-        write_le16(lol.add(4), (SFT_ADDR & 0xF) as u16);
-        write_le16(lol.add(6), (SFT_ADDR >> 4) as u16);
-        // LoL+16h: far pointer to CDS array
-        write_le16(lol.add(0x16), (CDS_ADDR & 0xF) as u16);
-        write_le16(lol.add(0x18), (CDS_ADDR >> 4) as u16);
-        // LoL+20h: number of block devices
-        *lol.add(0x20) = 1; // one block device (C:)
-        // LoL+21h: LASTDRIVE
-        *lol.add(0x21) = NUM_DRIVES;
+        addr_of_mut!((*lm).lol).write_unaligned(Lol {
+            sft_off: (SFT_ADDR & 0xF) as u16,
+            sft_seg: (SFT_ADDR >> 4) as u16,
+            cds_off: (CDS_ADDR & 0xF) as u16,
+            cds_seg: (CDS_ADDR >> 4) as u16,
+            block_devs: 1,
+            last_drive: NUM_DRIVES,
+            ..Default::default()
+        });
 
-        // SFT header: next pointer = FFFF:FFFF (end of chain), count = SFT_ENTRIES
-        let sft = SFT_ADDR as *mut u8;
-        write_le32(sft, 0xFFFFFFFF);
-        write_le16(sft.add(4), SFT_ENTRIES);
+        // SFT header: end-of-chain link, entry count.
+        addr_of_mut!((*lm).sft.next).write_unaligned(0xFFFF_FFFF);
+        addr_of_mut!((*lm).sft.count).write_unaligned(SFT_ENTRIES as u16);
 
-        // Pre-populate entries 0-2 as character devices (stdin/stdout/stderr)
-        for i in 0..3u32 {
-            let entry = sft.add(6 + (i * SFT_ENTRY_SIZE) as usize);
-            write_le16(entry, 1); // refcount = 1
-            write_le16(entry.add(5), 0x80 | if i == 0 { 1 } else { 2 }); // device info
+        // Stdin/stdout/stderr as character devices.
+        for fd in 0..3usize {
+            let dev_info = if fd == 0 { 0x81u16 } else { 0x82 };
+            addr_of_mut!((*lm).sft.entries[fd]).write_unaligned(SftEntry {
+                refcount: 1,
+                device_info: dev_info,
+                ..Default::default()
+            });
         }
 
-        // CDS entries: A: and B: invalid (flags=0), C: valid
-        let cds = CDS_ADDR as *mut u8;
-        // C: entry (index 2)
-        let c_entry = cds.add(2 * CDS_ENTRY_SIZE as usize);
-        // Path: "C:\" (67-byte ASCIIZ field)
-        *c_entry.add(0) = b'C';
-        *c_entry.add(1) = b':';
-        *c_entry.add(2) = b'\\';
-        // +43h: flags — 0x4000 = valid physical drive
-        write_le16(c_entry.add(0x43), 0x4000);
-        // +4Fh: backslash offset (points to the '\' in "C:\")
-        write_le16(c_entry.add(0x4F), 2);
-
-        // H: entry (index 7) — hostfs
-        let h_entry = cds.add(7 * CDS_ENTRY_SIZE as usize);
-        *h_entry.add(0) = b'H';
-        *h_entry.add(1) = b':';
-        *h_entry.add(2) = b'\\';
-        write_le16(h_entry.add(0x43), 0x4000);
-        write_le16(h_entry.add(0x4F), 2);
+        // CDS: drive 2 = C:\, drive 7 = H:\ (hostfs). Others stay invalid.
+        let mk = |drive_letter: u8| -> CdsEntry {
+            let mut e = CdsEntry::default();
+            e.path[0] = drive_letter;
+            e.path[1] = b':';
+            e.path[2] = b'\\';
+            e.flags = 0x4000;
+            e.backslash_off = 2;
+            e
+        };
+        addr_of_mut!((*lm).cds[2]).write_unaligned(mk(b'C'));
+        addr_of_mut!((*lm).cds[7]).write_unaligned(mk(b'H'));
     }
 }
 
 /// Populate SFT entry for a newly opened file handle.
 fn sft_set_file(handle: u16, size: u32) {
-    if handle as u32 >= SFT_ENTRIES as u32 { return; }
+    if handle as usize >= SFT_ENTRIES { return; }
     unsafe {
-        let entry = (SFT_ADDR as *mut u8).add(6 + handle as usize * SFT_ENTRY_SIZE as usize);
-        write_le16(entry.add(0x00), 1);       // refcount
-        write_le16(entry.add(0x02), 0);       // open mode (read)
-        *entry.add(0x04) = 0x20;              // attribute = archive
-        write_le16(entry.add(0x05), 0x0000);  // device info = file
-        write_le16(entry.add(0x0D), 0x6000);  // time: 12:00:00
-        write_le16(entry.add(0x0F), 0x5C76);  // date: 2026-03-22
-        write_le32(entry.add(0x11), size);    // file size
-        write_le32(entry.add(0x15), 0);       // position = 0
+        core::ptr::addr_of_mut!((*LOW_MEM).sft.entries[handle as usize]).write_unaligned(
+            SftEntry {
+                refcount: 1,
+                attribute: 0x20,         // archive
+                time: 0x6000,            // 12:00:00
+                date: 0x5C76,            // 2026-03-22
+                size,
+                ..Default::default()
+            },
+        );
     }
 }
 
 /// Clear SFT entry when a file handle is closed.
 fn sft_clear(handle: u16) {
-    if handle as u32 >= SFT_ENTRIES as u32 { return; }
+    if handle as usize >= SFT_ENTRIES { return; }
     unsafe {
-        let entry = (SFT_ADDR as *mut u8).add(6 + handle as usize * SFT_ENTRY_SIZE as usize);
-        write_le16(entry, 0); // refcount = 0
+        core::ptr::addr_of_mut!((*LOW_MEM).sft.entries[handle as usize].refcount)
+            .write_unaligned(0);
     }
 }
 
