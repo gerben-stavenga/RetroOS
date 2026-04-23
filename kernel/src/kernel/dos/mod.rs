@@ -93,7 +93,6 @@ mod dfs;
 mod machine;
 mod xms;
 mod ems;
-mod uma;
 mod dos;
 
 // Stub array / slot table / IRQ-stack constants live in `dos.rs` (alongside
@@ -187,6 +186,18 @@ impl DosState {
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
     pub fn process_key(&mut self, scancode: u8) {
         machine::queue_irq(&mut self.pc, crate::arch::Irq::Key(scancode));
+    }
+
+    /// Per-thread cleanup at exit: persist VGA, free EMS-backed pages, drop
+    /// XMS/EMS state, restore A20. Called from `thread::exit_thread`.
+    pub fn on_exit(&mut self) {
+        self.pc.vga.save_from_hardware();
+        if let Some(ref mut ems) = self.ems {
+            ems.free_all_pages();
+        }
+        self.ems = None;
+        self.xms = None;
+        self.pc.set_a20(true);
     }
 }
 

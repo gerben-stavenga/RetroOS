@@ -524,15 +524,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
         let thread = &mut THREADS[tid];
         let parent_tid = thread.kernel.parent_tid;
         match &mut thread.personality {
-            Personality::Dos(dos) => {
-                dos.pc.vga.save_from_hardware();
-                if let Some(ref mut ems) = dos.ems {
-                    ems.free_all_pages();
-                }
-                dos.ems = None;
-                dos.xms = None;
-                dos.pc.set_a20(true);
-            }
+            Personality::Dos(dos) => dos.on_exit(),
             Personality::Linux(_) => {}
         }
 

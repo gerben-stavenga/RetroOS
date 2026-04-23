@@ -4,7 +4,7 @@
 //! of 16KB each (4MB total) backed by the kernel's demand paging.
 
 use crate::dbg_println;
-use super::uma::EMS_BASE_PAGE;
+use super::xms::EMS_BASE_PAGE;
 use crate::kernel::startup;
 use crate::kernel::thread;
 use crate::Regs;
