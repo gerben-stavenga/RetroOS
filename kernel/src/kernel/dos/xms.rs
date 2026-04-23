@@ -4,7 +4,8 @@
 //! shadow region. Physical backing comes from the kernel's demand paging.
 
 use crate::kernel::dos::dos_trace;
-use crate::kernel::dos::{linear, umb_alloc, umb_free, umb_largest};
+use crate::kernel::dos::linear;
+use super::uma::{umb_alloc, umb_free, umb_largest};
 use crate::kernel::thread;
 use crate::Regs;
 

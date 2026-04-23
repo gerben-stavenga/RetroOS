@@ -3,8 +3,8 @@
 //! 64KB page-frame in upper memory (set up by `scan_uma`), 256 logical pages
 //! of 16KB each (4MB total) backed by the kernel's demand paging.
 
-use crate::kernel::dos::dbg_println;
-use super::EMS_BASE_PAGE;
+use crate::dbg_println;
+use super::uma::EMS_BASE_PAGE;
 use crate::kernel::startup;
 use crate::kernel::thread;
 use crate::Regs;
