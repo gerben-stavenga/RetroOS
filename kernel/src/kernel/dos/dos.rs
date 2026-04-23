@@ -298,9 +298,11 @@ fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, reg
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
-        // Unknown AH: reflect through IVT for legacy/DPMI compatibility.
+        // Unknown AH: RetroOS synth space is kernel-owned; anything outside
+        // the documented subfunctions is a guest bug. Return AX=errno/CF=1.
         _ => {
-            reflect_interrupt(regs, 0x31);
+            regs.rax = (regs.rax & !0xFFFF) | 1; // invalid function
+            regs.set_flag32(1);
             thread::KernelAction::Done
         }
     }
