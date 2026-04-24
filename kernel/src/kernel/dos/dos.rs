@@ -2222,12 +2222,22 @@ struct LowMem {
     sft:       Sft,                    // 0x940
     cds:       [CdsEntry; NUM_DRIVES as usize],
     _pad:      [u8; 6],                // align irq_stack to a paragraph boundary
-    irq_stack: [u8; 256],
+    /// Kernel-shared RM stack for PM→RM reflections (BIOS chain, soft-INT
+    /// reflects, real-mode far calls). Used by both `reflect_int_to_real_mode`
+    /// and the unified HW IRQ default-stub RM excursion.
+    irq_rm_stack:   [u8; 256],
+    /// Kernel-shared 16-bit PM stack for HW IRQ delivery to PM16 handlers.
+    /// Used when the installed handler's CS is 16-bit (B=0).
+    irq_pm16_stack: [u8; 4096],
+    /// Kernel-shared 32-bit PM stack for HW IRQ delivery to PM32 handlers.
+    /// Used when the installed handler's CS is 32-bit (B=1), including the
+    /// default vector stub which lives in a 32-bit kernel selector.
+    irq_pm32_stack: [u8; 4096],
 }
 
 const _: () = assert!(
-    (LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_stack)) % 16 == 0,
-    "irq_stack base must be paragraph-aligned (adjust LowMem._pad)",
+    (LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_rm_stack)) % 16 == 0,
+    "irq_rm_stack base must be paragraph-aligned (adjust LowMem._pad)",
 );
 
 /// Borrow the kernel-owned low-mem area as a typed `&'static mut`.
@@ -2241,7 +2251,7 @@ fn low_mem() -> &'static mut LowMem {
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
 pub(crate) const STUB_SEG: u16 = (LOW_MEM_BASE >> 4) as u16;
 pub(crate) const IRQ_STACK_SEG: u16 =
-    ((LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_stack)) >> 4) as u16;
+    ((LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_rm_stack)) >> 4) as u16;
 pub(crate) const IRQ_STACK_TOP: u16 = 256;
 /// Offset within SYSPSP of the INDOS flag byte (permanently zero).
 /// Placed in the "command tail" area since the system PSP never runs.
