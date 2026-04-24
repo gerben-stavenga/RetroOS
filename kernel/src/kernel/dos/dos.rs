@@ -2271,6 +2271,21 @@ pub(super) fn sys_program() -> &'static mut Program {
 }
 pub(super) fn sys_psp_seg() -> u16 { sys_program().psp_seg() }
 
+/// Base linear addresses + sizes of the kernel-shared HW IRQ stacks,
+/// consumed by dpmi when building the per-thread LDT selectors.
+pub(super) fn irq_pm16_stack_base() -> u32 {
+    &raw const low_mem().irq_pm16_stack as u32
+}
+pub(super) fn irq_pm16_stack_size() -> u32 {
+    core::mem::size_of_val(&low_mem().irq_pm16_stack) as u32
+}
+pub(super) fn irq_pm32_stack_base() -> u32 {
+    &raw const low_mem().irq_pm32_stack as u32
+}
+pub(super) fn irq_pm32_stack_size() -> u32 {
+    core::mem::size_of_val(&low_mem().irq_pm32_stack) as u32
+}
+
 /// One DOS program's env arena + PSP, laid out contiguously in real-mode
 /// memory: env at offset 0 (256 bytes), PSP at offset 256 (256 bytes).
 /// Hence `psp_seg = env_seg + 0x10`.
@@ -2345,6 +2360,13 @@ pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
+/// Cross-mode HW IRQ delivery return targets. Handler IRETs land here via
+/// CD 31 → we restore the saved client context from the kernel IRQ stack.
+/// Separate slots per handler bitness so the stub knows whether a 6-byte or
+/// 12-byte IRET frame was popped and where on the kernel stack the saved
+/// context lives.
+pub(crate) const SLOT_IRQ_RET_PM16: u8 = 0xF8;
+pub(crate) const SLOT_IRQ_RET_PM32: u8 = 0xF9;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 

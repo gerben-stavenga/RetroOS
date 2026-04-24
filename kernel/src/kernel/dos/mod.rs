@@ -106,7 +106,10 @@ use dos::{
     SLOT_CALLBACK_RET, SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_RM_INT_RET, SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_PM_TO_REAL,
+    SLOT_IRQ_RET_PM16, SLOT_IRQ_RET_PM32,
     slot_offset,
+    irq_pm16_stack_base, irq_pm16_stack_size,
+    irq_pm32_stack_base, irq_pm32_stack_size,
 };
 
 use crate::kernel::thread;

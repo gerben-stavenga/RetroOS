@@ -72,6 +72,15 @@ pub const SPECIAL_STUB_LDT_IDX: usize = 7;
 pub const CLIENT_CS_LDT_IDX: usize = 16;
 pub const CLIENT_DS_LDT_IDX: usize = 17;
 pub const CLIENT_SS_LDT_IDX: usize = 19;
+
+/// LDT indices for the kernel-shared HW IRQ delivery stacks. Each selector
+/// points at the matching `LowMem.irq_pmXX_stack` buffer; the bitness
+/// difference (B=0 vs B=1) controls whether push/pop uses SP or ESP. These
+/// are host-internal — not handed to the client.
+pub const IRQ_PM16_STACK_LDT_IDX: usize = 8;
+pub const IRQ_PM32_STACK_LDT_IDX: usize = 9;
+pub const IRQ_PM16_STACK_SEL: u16 = ((IRQ_PM16_STACK_LDT_IDX as u16) << 3) | 4 | 3;
+pub const IRQ_PM32_STACK_SEL: u16 = ((IRQ_PM32_STACK_LDT_IDX as u16) << 3) | 4 | 3;
 /// Maximum DPMI memory blocks
 const MAX_MEM_BLOCKS: usize = 256;
 /// Base address for DPMI linear memory allocations
@@ -135,9 +144,9 @@ pub struct DpmiState {
 
 /// A DPMI linear memory block
 #[derive(Clone, Copy)]
-pub struct MemBlock {
-    pub base: u32,
-    pub size: u32,
+struct MemBlock {
+    base: u32,
+    size: u32,
 }
 
 /// Saved protected-mode state for real-mode callbacks
@@ -174,16 +183,16 @@ fn set_rm_save(dpmi: &mut DpmiState, new: SavedPmState) {
 /// the non-current mode here so raw mode switches can be nested safely.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct RawModeState {
-    pub flags: u32,
-    pub cs: u16,
-    pub ip: u32,
-    pub ss: u16,
-    pub sp: u32,
-    pub ds: u16,
-    pub es: u16,
-    pub fs: u16,
-    pub gs: u16,
+struct RawModeState {
+    flags: u32,
+    cs: u16,
+    ip: u32,
+    ss: u16,
+    sp: u32,
+    ds: u16,
+    es: u16,
+    fs: u16,
+    gs: u16,
 }
 
 impl DpmiState {
@@ -497,6 +506,20 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // distinguishes "default vector reflection" from "host-initiated CD 31".
     dpmi.ldt[SPECIAL_STUB_LDT_IDX] = DpmiState::make_code_desc_ex(0, 0x0FFF, false);
     dpmi.ldt_alloc[SPECIAL_STUB_LDT_IDX / 32] |= 1 << (SPECIAL_STUB_LDT_IDX % 32);
+
+    // Kernel-shared PM IRQ stacks. Base = LowMem.irq_pm{16,32}_stack, limit
+    // = buffer size - 1 (so the top-of-stack address is in-range), B matches
+    // handler bitness. DPL=3 so a client-bitness IRET that loads SS finds
+    // the selector at the same privilege as its CS — the delivery path
+    // always pushes the correct pair.
+    let pm16_base = dos::irq_pm16_stack_base();
+    let pm16_limit = dos::irq_pm16_stack_size() - 1;
+    dpmi.ldt[IRQ_PM16_STACK_LDT_IDX] = DpmiState::make_data_desc_ex(pm16_base, pm16_limit, false);
+    dpmi.ldt_alloc[IRQ_PM16_STACK_LDT_IDX / 32] |= 1 << (IRQ_PM16_STACK_LDT_IDX % 32);
+    let pm32_base = dos::irq_pm32_stack_base();
+    let pm32_limit = dos::irq_pm32_stack_size() - 1;
+    dpmi.ldt[IRQ_PM32_STACK_LDT_IDX] = DpmiState::make_data_desc_ex(pm32_base, pm32_limit, true);
+    dpmi.ldt_alloc[IRQ_PM32_STACK_LDT_IDX / 32] |= 1 << (IRQ_PM32_STACK_LDT_IDX % 32);
 
     let cs_sel = DpmiState::idx_to_sel(CLIENT_CS_LDT_IDX);
     let ds_sel = DpmiState::idx_to_sel(CLIENT_DS_LDT_IDX);
