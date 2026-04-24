@@ -153,6 +153,15 @@ pub struct DosState {
     pub dfs: dfs::DfsState,
     pub dos_blocks: alloc::vec::Vec<DosMemBlock>,
 
+    /// PMDOS infrastructure — always present, independent of whether a DPMI
+    /// client has entered. Hosts the LDT (with kernel-owned slots populated
+    /// at thread init) and the PM interrupt-vector table (default-filled with
+    /// vector-stub entries). A DPMI client layers its CLIENT_CS/DS/SS plus
+    /// dynamic allocations on top; `dos.dpmi.is_some()` marks that layering.
+    pub ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]>,
+    pub ldt_alloc: [u32; dpmi::LDT_ENTRIES / 32],
+    pub pm_vectors: [(u16, u32); 256],
+
     pub dpmi: Option<alloc::boxed::Box<dpmi::DpmiState>>,
 }
 
@@ -164,7 +173,14 @@ pub struct DosMemBlock {
 
 impl DosState {
     pub fn new() -> Self {
-        DosState {
+        // LDT: allocate on heap (64KB — overflows stack if we try `Box::new([0; N])`).
+        let ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> =
+            alloc::vec![0u64; dpmi::LDT_ENTRIES]
+                .into_boxed_slice()
+                .try_into()
+                .ok()
+                .expect("LDT size mismatch");
+        let mut dos = DosState {
             pc: machine::PcMachine::new(),
             dta: 0,
             heap_seg: 0xA000,
@@ -182,8 +198,13 @@ impl DosState {
             find_idx: 0,
             dfs: dfs::DfsState::new(),
             dos_blocks: alloc::vec::Vec::new(),
+            ldt,
+            ldt_alloc: [0u32; dpmi::LDT_ENTRIES / 32],
+            pm_vectors: [(0, 0); 256],
             dpmi: None,
-        }
+        };
+        dpmi::install_kernel_ldt_slots(&mut dos);
+        dos
     }
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.

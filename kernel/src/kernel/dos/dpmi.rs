@@ -22,7 +22,7 @@ use crate::Regs;
 use super::dos_trace;
 
 /// Number of LDT entries
-const LDT_ENTRIES: usize = 8192;
+pub(super) const LDT_ENTRIES: usize = 8192;
 
 /// LDT index of the "low memory" selector. Base=0, limit=1MB, 16-bit.
 /// DOS handlers that need to return a pointer to a fixed low-memory byte
@@ -422,6 +422,35 @@ fn build_descriptor(base: u32, limit: u32, access: u64, flags: u64) -> u64 {
     desc |= byte6 << 48;                                       // bits 48-55
     desc |= (((base >> 24) & 0xFF) as u64) << 56;             // bits 56-63: Base[31:24]
     desc
+}
+
+/// Populate the kernel-owned LDT slots and default pm_vectors. Called from
+/// `DosState::new()` so the PMDOS infrastructure is always live — HW IRQ
+/// routing can use it even before any DPMI client has called dpmi_enter.
+pub(super) fn install_kernel_ldt_slots(dos: &mut thread::DosState) {
+    // Reserve + install each kernel slot.
+    let mark = |dos: &mut thread::DosState, idx: usize, desc: u64| {
+        dos.ldt[idx] = desc;
+        dos.ldt_alloc[idx / 32] |= 1 << (idx % 32);
+    };
+    mark(dos, VECTOR_STUB_LDT_IDX,  DpmiState::make_code_desc_ex(0, 0x0FFF, false));
+    mark(dos, SPECIAL_STUB_LDT_IDX, DpmiState::make_code_desc_ex(0, 0x0FFF, false));
+    mark(dos, LOW_MEM_LDT_IDX,      DpmiState::make_data_desc_ex(0, 0xFFFFF, false));
+    let pm16_base = dos::irq_pm16_stack_base();
+    let pm16_limit = dos::irq_pm16_stack_size() - 1;
+    mark(dos, IRQ_PM16_STACK_LDT_IDX, DpmiState::make_data_desc_ex(pm16_base, pm16_limit, false));
+    let pm32_base = dos::irq_pm32_stack_base();
+    let pm32_limit = dos::irq_pm32_stack_size() - 1;
+    mark(dos, IRQ_PM32_STACK_LDT_IDX, DpmiState::make_data_desc_ex(pm32_base, pm32_limit, true));
+    // PSP_LDT_IDX is written per RM→PM by `enter_pm_psp_view`; just reserve.
+    dos.ldt_alloc[PSP_LDT_IDX / 32] |= 1 << (PSP_LDT_IDX % 32);
+
+    // Default pm_vectors — each vector traps to its vector_stub slot; the
+    // CD 31 there routes to `vector_stub_reflect` for RM IVT reflection.
+    let vector_stub_sel = DpmiState::idx_to_sel(VECTOR_STUB_LDT_IDX);
+    for i in 0..256 {
+        dos.pm_vectors[i] = (vector_stub_sel, dos::STUB_BASE + (i as u32) * 2);
+    }
 }
 
 // ============================================================================
