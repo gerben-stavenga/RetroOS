@@ -1799,6 +1799,10 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     dos.dos_blocks.clear();
     dos.dta = (child_seg as u32) * 16 + 0x80;
     dos.current_psp = child_seg;
+    // DPMI host obligation: parent's PM state must not be observable to the
+    // child (no PM handlers fire; child's DPMI entry, if any, allocates a
+    // fresh DpmiState). Suspend here, restore in `exec_return`.
+    let suspended_dpmi = dos.dpmi.take();
     dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
@@ -1808,6 +1812,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         heap_base_seg: parent_heap_base,
         psp: parent_psp,
         dos_blocks: parent_blocks,
+        dpmi: suspended_dpmi,
         prev: prev.map(alloc::boxed::Box::new),
     });
 
@@ -1950,6 +1955,10 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) 
     dos.heap_base_seg = parent.heap_base_seg;
     dos.current_psp = parent.psp;
     dos.dos_blocks = parent.dos_blocks;
+    // Restore parent's suspended DPMI state (if any). A child's own DPMI
+    // state, if it entered DPMI, is dropped here — the child-allocated
+    // DpmiState currently in `dos.dpmi` gets replaced.
+    dos.dpmi = parent.dpmi;
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }

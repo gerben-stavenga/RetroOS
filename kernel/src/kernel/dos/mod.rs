@@ -215,6 +215,12 @@ pub struct ExecParent {
     pub heap_base_seg: u16,
     pub psp: u16,
     pub dos_blocks: alloc::vec::Vec<DosMemBlock>,
+    /// Parent's DPMI state, suspended during child execution. Per DPMI 0.9:
+    /// each DPMI client has independent state (LDT, pm_vectors, etc.); a
+    /// DPMI parent's state must not be observable to a (non-DPMI) child.
+    /// Restored on `exec_return`. A child that itself enters DPMI allocates
+    /// its own DpmiState (independent of parent's, dropped on child exit).
+    pub dpmi: Option<alloc::boxed::Box<dpmi::DpmiState>>,
     pub prev: Option<alloc::boxed::Box<ExecParent>>,
 }
 
