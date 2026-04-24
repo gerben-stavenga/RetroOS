@@ -296,6 +296,13 @@ impl DpmiState {
         ((idx as u16) << 3) | 4 | 3
     }
 
+    /// Default vector-stub selector. pm_vectors entries compare against this
+    /// to distinguish "client installed a real handler" from "still the host's
+    /// reflect-to-RM default".
+    pub fn vector_stub_sel() -> u16 {
+        Self::idx_to_sel(VECTOR_STUB_LDT_IDX)
+    }
+
     /// Convert selector to LDT index
     fn sel_to_idx(sel: u16) -> usize {
         (sel >> 3) as usize
@@ -671,6 +678,156 @@ pub fn dpmi_soft_int(_kt: &mut thread::KernelThread, dos: &mut thread::DosState,
     thread::KernelAction::Done
 }
 
+/// Client context saved on the kernel IRQ stack during a VM86→PM cross-mode
+/// HW IRQ delivery. Laid out at the top of the kernel stack below the handler's
+/// IRET frame. Restored by the SLOT_IRQ_RET_PM{16,32} stub on handler return.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct SavedCtx {
+    eip:    u32,
+    cs:     u32,       // low 16 = selector; for VM86 the paragraph fits here
+    esp:    u32,
+    ss:     u32,       // low 16 = segment/selector
+    eflags: u32,       // includes VM_FLAG (tells restore whether to re-enter VM86)
+    ds:     u16,
+    es:     u16,
+    fs:     u16,
+    gs:     u16,
+}
+
+/// Deliver a HW IRQ to a PM handler when the client is currently in VM86.
+/// Snapshots the VM86 context onto a kernel IRQ stack, pushes an IRET frame
+/// whose return target is our kernel return stub, and switches the CPU into
+/// PM at the handler. The handler's IRET pops the IRET frame and lands at
+/// our stub (CD 31 in SPECIAL_STUB segment at SLOT_IRQ_RET_PM{16,32}) which
+/// reads the saved context and restores the VM86 state.
+///
+/// Also valid from a PM-current client — SavedCtx's EFLAGS.VM_FLAG tells the
+/// restore path which mode to come back to.
+pub fn cross_mode_deliver(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
+    let dpmi = match dos.dpmi.as_mut() {
+        Some(d) => d,
+        None => return,
+    };
+    let (sel, off) = dpmi.pm_vectors[vector as usize];
+    let handler_is_32 = seg_is_32(dpmi, sel);
+
+    // Pick kernel stack by handler bitness.
+    let (stack_sel, stack_base, stack_size) = if handler_is_32 {
+        (IRQ_PM32_STACK_SEL, dos::irq_pm32_stack_base(), dos::irq_pm32_stack_size())
+    } else {
+        (IRQ_PM16_STACK_SEL, dos::irq_pm16_stack_base(), dos::irq_pm16_stack_size())
+    };
+
+    // Snapshot current client state at the top of the kernel stack.
+    let saved = SavedCtx {
+        eip:    regs.ip32(),
+        cs:     regs.code_seg() as u32,
+        esp:    regs.sp32(),
+        ss:     regs.stack_seg() as u32,
+        eflags: regs.flags32(),
+        ds:     regs.ds as u16,
+        es:     regs.es as u16,
+        fs:     regs.fs as u16,
+        gs:     regs.gs as u16,
+    };
+    let ctx_size = core::mem::size_of::<SavedCtx>() as u32;
+    let ctx_esp = stack_size - ctx_size;
+    unsafe {
+        core::ptr::write_unaligned(
+            (stack_base + ctx_esp) as *mut SavedCtx,
+            saved,
+        );
+    }
+
+    // Push the handler's IRET frame below the saved context. Handler's IRET
+    // pops this and lands at the kernel return stub.
+    let stub_cs = DpmiState::idx_to_sel(SPECIAL_STUB_LDT_IDX);
+    let ret_slot = if handler_is_32 { dos::SLOT_IRQ_RET_PM32 } else { dos::SLOT_IRQ_RET_PM16 };
+    let stub_eip = dos::STUB_BASE + dos::slot_offset(ret_slot) as u32;
+    // Handler starts with IF=TF=0; other flag bits follow the current EFLAGS.
+    let handler_flags = regs.flags32() & !((1u32 << 9) | (1u32 << 8) | machine::VM_FLAG);
+
+    let iret_frame_size: u32 = if handler_is_32 { 12 } else { 6 };
+    let iret_esp = ctx_esp - iret_frame_size;
+    let iret_addr = stack_base + iret_esp;
+    unsafe {
+        if handler_is_32 {
+            let p = iret_addr as *mut u32;
+            core::ptr::write_unaligned(p,           stub_eip);
+            core::ptr::write_unaligned(p.add(1),    stub_cs as u32);
+            core::ptr::write_unaligned(p.add(2),    handler_flags);
+        } else {
+            let p = iret_addr as *mut u16;
+            core::ptr::write_unaligned(p,           (stub_eip & 0xFFFF) as u16);
+            core::ptr::write_unaligned(p.add(1),    stub_cs);
+            core::ptr::write_unaligned(p.add(2),    handler_flags as u16);
+        }
+    }
+
+    // Switch CPU state: leave VM86, point at handler, SS:ESP = kernel stack.
+    regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
+    regs.frame.cs  = sel as u64;
+    regs.frame.rip = off as u64;
+    regs.frame.ss  = stack_sel as u64;
+    regs.frame.rsp = iret_esp as u64;
+    regs.ds = 0;
+    regs.es = 0;
+    regs.fs = 0;
+    regs.gs = 0;
+
+    dos_trace!(force "[DPMI] XMODE IRQ vec={:02X} -> {:04X}:{:#x} kstk={:04X}:{:#x} saved_ctx={:#x}",
+        vector, sel, off, stack_sel, iret_esp, ctx_esp);
+}
+
+/// Pop the SavedCtx from the kernel IRQ stack and restore the client state.
+/// Called from pm_stub_dispatch when the handler's IRET landed at our stub.
+fn cross_mode_restore(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    // At this point SS:ESP points at the SavedCtx on the kernel stack (handler
+    // just popped its IRET frame; the kernel stub's CD 31 left SS:ESP unchanged
+    // from the IRET-pop point because the trap pushed its own frame but we read
+    // regs.sp32() from the pre-trap state in arch monitor).
+    //
+    // Actually the monitor decodes `CD 31` and bubbles SoftInt before the CPU
+    // pushes a trap frame (we're in PM, IOPL<CPL so CD 31 #GPs and the monitor
+    // processes the instruction without the CPU having pushed anything yet).
+    // So regs.sp is where the IRET left it — at ctx_esp.
+    //
+    // But `advance_ip` in arch/monitor.rs has already moved EIP past the CD 31.
+    // That's fine: we overwrite CS:EIP from SavedCtx anyway.
+    let ss_sel = regs.stack_seg();
+    let ss_base = if let Some(dpmi) = _dos.dpmi.as_ref() { seg_base(dpmi, ss_sel) } else { 0 };
+    let ctx_addr = ss_base.wrapping_add(regs.sp32());
+    let saved = unsafe { core::ptr::read_unaligned(ctx_addr as *const SavedCtx) };
+
+    // Copy fields out before using in macros (packed struct — can't take refs).
+    let eip = saved.eip;
+    let cs  = saved.cs;
+    let esp = saved.esp;
+    let ss  = saved.ss;
+    let eflags = saved.eflags;
+    let ds = saved.ds;
+    let es = saved.es;
+    let fs = saved.fs;
+    let gs = saved.gs;
+
+    regs.set_ip32(eip);
+    regs.set_cs32(cs);
+    regs.set_sp32(esp);
+    regs.frame.ss  = ss as u64;
+    regs.set_flags32(eflags);
+    regs.ds = ds as u64;
+    regs.es = es as u64;
+    regs.fs = fs as u64;
+    regs.gs = gs as u64;
+
+    dos_trace!(force "[DPMI] XMODE RESTORE -> {:04X}:{:#x} SS:ESP={:04X}:{:#x} VM={}",
+        cs as u16, eip, ss as u16, esp,
+        eflags & machine::VM_FLAG != 0);
+
+    thread::KernelAction::Done
+}
+
 /// Push an IRET frame on the stack addressed by `regs.ss:regs.sp`, updating
 /// regs.sp. 12-byte frame for 32-bit clients, 6-byte for 16-bit.
 fn push_iret_frame(dpmi: &DpmiState, regs: &mut Regs, eip: u32, cs: u16, flags: u32) {
@@ -780,6 +937,9 @@ fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Kern
         }
         dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
+        }
+        dos::SLOT_IRQ_RET_PM16 | dos::SLOT_IRQ_RET_PM32 => {
+            return cross_mode_restore(dos, regs);
         }
         dos::SLOT_SAVE_RESTORE => {
             save_restore_real_mode_state(dos, regs);

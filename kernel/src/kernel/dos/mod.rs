@@ -520,10 +520,30 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
     machine::queue_irq(&mut dos.pc, irq);
 }
 
-/// Try to deliver one pending interrupt from the virtual PIC. Works for both
-/// VM86 (IVT reflect) and DPMI (PM vector dispatch).
+/// Try to deliver one pending interrupt from the virtual PIC.
+///
+/// If a DPMI client installed a PM handler for this vector, deliver to it
+/// regardless of the current execution mode — a cross-mode switch from VM86
+/// snapshots the VM86 state and restores it on handler IRET. Without a PM
+/// handler, VM86 reflects to RM IVT and PM goes through the default stub
+/// which reflects to RM.
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
+
+    if let Some(dpmi_ref) = dos.dpmi.as_ref() {
+        let (sel, _off) = dpmi_ref.pm_vectors[vec as usize];
+        let default_sel = dpmi::DpmiState::vector_stub_sel();
+        if sel != default_sel {
+            DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
+            if regs.mode() == crate::UserMode::VM86 {
+                dpmi::cross_mode_deliver(dos, regs, vec);
+            } else {
+                dpmi::deliver_pm_int(dos, regs, vec);
+            }
+            return;
+        }
+    }
+
     if regs.mode() == crate::UserMode::VM86 {
         machine::reflect_interrupt(regs, vec);
     } else {
