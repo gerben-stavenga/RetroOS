@@ -626,9 +626,12 @@ pub fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
         None => return,
     };
     let (sel, off) = dpmi.pm_vectors[vector as usize];
+    // Frame width follows the *handler's* CS.D — a 32-bit client that hooked
+    // with a 16-bit handler gets a 6-byte frame and a matching 16-bit IRET.
+    let handler_is_32 = seg_is_32(dpmi, sel);
 
     let flags = regs.flags32();
-    push_iret_frame(dpmi, regs, regs.ip32(), regs.code_seg(), flags);
+    push_iret_frame(dpmi, regs, handler_is_32, regs.ip32(), regs.code_seg(), flags);
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
 
@@ -829,23 +832,25 @@ fn cross_mode_restore(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
 }
 
 /// Push an IRET frame on the stack addressed by `regs.ss:regs.sp`, updating
-/// regs.sp. 12-byte frame for 32-bit clients, 6-byte for 16-bit.
-fn push_iret_frame(dpmi: &DpmiState, regs: &mut Regs, eip: u32, cs: u16, flags: u32) {
+/// regs.sp. Frame width matches the *handler's* bitness — 12 bytes for a
+/// 32-bit handler (D=1), 6 bytes for 16-bit (D=0). This is the width the
+/// handler's `IRET` will use on its way back, so push and matching pop must
+/// agree on handler bitness, regardless of the client's overall size.
+fn push_iret_frame(dpmi: &DpmiState, regs: &mut Regs, handler_is_32: bool,
+                   eip: u32, cs: u16, flags: u32) {
     let base = seg_base(dpmi, regs.frame.ss as u16);
-    let use32 = dpmi.client_use32;
     let sp_in = regs.sp32();
-    let sp = if use32 {
+    let sp = if handler_is_32 {
         sp_in.wrapping_sub(12)
     } else {
-        // 16-bit client: SP is 16-bit only. Panic on stale upper bits.
+        // 16-bit frame: SP is 16-bit. Panic on stale upper bits.
         if sp_in & 0xFFFF_0000 != 0 {
-            panic!("push_iret_frame: 16-bit SP has non-zero upper bits: SS={:04x} sp={:#x}",
+            panic!("push_iret_frame: 16-bit handler but SS={:04x} has upper SP bits: sp={:#x}",
                    regs.frame.ss as u16, sp_in);
         }
-        // 16-bit arithmetic with wrap.
         ((sp_in as u16).wrapping_sub(6)) as u32
     };
-    if use32 {
+    if handler_is_32 {
         unsafe {
             let p = base.wrapping_add(sp) as *mut u32;
             core::ptr::write_unaligned(p, eip);
@@ -863,17 +868,16 @@ fn push_iret_frame(dpmi: &DpmiState, regs: &mut Regs, eip: u32, cs: u16, flags: 
     regs.set_sp32(sp);
 }
 
-/// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp. Mirrors
-/// push_iret_frame.
-fn pop_iret_frame(dpmi: &DpmiState, regs: &mut Regs) -> (u32, u16, u32) {
+/// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp. `handler_is_32`
+/// must match the width used at push time.
+fn pop_iret_frame(dpmi: &DpmiState, regs: &mut Regs, handler_is_32: bool) -> (u32, u16, u32) {
     let base = seg_base(dpmi, regs.frame.ss as u16);
-    let use32 = dpmi.client_use32;
     let sp_in = regs.sp32();
-    if !use32 && sp_in & 0xFFFF_0000 != 0 {
-        panic!("pop_iret_frame: 16-bit SP has non-zero upper bits: SS={:04x} sp={:#x}",
+    if !handler_is_32 && sp_in & 0xFFFF_0000 != 0 {
+        panic!("pop_iret_frame: 16-bit handler but SS={:04x} has upper SP bits: sp={:#x}",
                regs.frame.ss as u16, sp_in);
     }
-    let (frame, new_sp) = if use32 {
+    let (frame, new_sp) = if handler_is_32 {
         unsafe {
             let p = base.wrapping_add(sp_in) as *const u32;
             let eip = core::ptr::read_unaligned(p);
@@ -887,7 +891,6 @@ fn pop_iret_frame(dpmi: &DpmiState, regs: &mut Regs) -> (u32, u16, u32) {
             let ip = core::ptr::read_unaligned(p) as u32;
             let cs = core::ptr::read_unaligned(p.add(1));
             let flags = core::ptr::read_unaligned(p.add(2)) as u32;
-            // 16-bit arithmetic with wrap.
             let new_sp = ((sp_in as u16).wrapping_add(6)) as u32;
             ((ip, cs, flags), new_sp)
         }
@@ -909,7 +912,9 @@ fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
         regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
 
-    let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(dos.dpmi.as_ref().unwrap(), regs);
+    // Default stub (VECTOR_STUB_LDT_IDX) is always 16-bit — so the frame
+    // deliver_pm_int pushed for it is 6 bytes, regardless of client bitness.
+    let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(dos.dpmi.as_ref().unwrap(), regs, false);
     regs.set_ip32(ret_eip);
     regs.set_cs32(ret_cs as u32);
     regs.set_flags32(ret_flags);
