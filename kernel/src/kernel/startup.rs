@@ -340,11 +340,7 @@ fn event_loop(first_tid: usize) {
                 let new_thread = thread::get_thread(tid).expect("Invalid thread");
                 match &mut new_thread.personality {
                     thread::Personality::Dos(dos) => {
-                        if let Some(ref dpmi) = dos.dpmi {
-                            let ldt_ptr = dpmi.ldt.as_ptr() as u32;
-                            let ldt_limit = (256 * 8 - 1) as u32;
-                            arch_load_ldt(ldt_ptr, ldt_limit);
-                        }
+                        dos.on_resume();
                     }
                     thread::Personality::Linux(linux) => {
                         if linux.tls_entry >= 0 {

@@ -103,13 +103,12 @@ mod dos;
 #[allow(unused_imports)]
 use dos::{
     STUB_BASE, STUB_SEG,
-    SLOT_CALLBACK_RET, SLOT_RAW_REAL_TO_PM,
+    SLOT_RM_IRET_REFLECT, SLOT_RM_IRET_CALL, SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
-    SLOT_RM_INT_RET, SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_PM_TO_REAL,
-    SLOT_IRQ_RET_PM16, SLOT_IRQ_RET_PM32,
+    SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_PM_TO_REAL,
+    SLOT_PM_IRET,
     slot_offset,
-    irq_pm16_stack_base, irq_pm16_stack_size,
-    irq_pm32_stack_base, irq_pm32_stack_size,
+    host_stack_base, host_stack_size,
 };
 
 use crate::kernel::thread;
@@ -171,15 +170,21 @@ pub struct DosMemBlock {
     pub paras: u16,
 }
 
+/// Allocate a zero-filled LDT on the heap. 64KB; we use a `vec![0; N]` route
+/// because `Box::new([0u64; N])` materializes the array on the stack first
+/// and overflows the kernel stack, whereas `vec!` uses the `alloc_zeroed`
+/// specialization for primitives and never touches the stack.
+pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
+    alloc::vec![0u64; dpmi::LDT_ENTRIES]
+        .into_boxed_slice()
+        .try_into()
+        .ok()
+        .expect("LDT size mismatch")
+}
+
 impl DosState {
     pub fn new() -> Self {
-        // LDT: allocate on heap (64KB — overflows stack if we try `Box::new([0; N])`).
-        let ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> =
-            alloc::vec![0u64; dpmi::LDT_ENTRIES]
-                .into_boxed_slice()
-                .try_into()
-                .ok()
-                .expect("LDT size mismatch");
+        let ldt = fresh_ldt();
         let mut dos = DosState {
             pc: machine::PcMachine::new(),
             dta: 0,
@@ -223,6 +228,16 @@ impl DosState {
         self.xms = None;
         self.pc.set_a20(true);
     }
+
+    /// Called by the context-switch code when this thread becomes the running
+    /// DOS thread. Encapsulates any per-resume side effects (right now: point
+    /// LDTR at this thread's LDT). Keeps the LDT layout private to the dos
+    /// module — external code never touches `self.ldt`.
+    pub fn on_resume(&self) {
+        let ldt_ptr = self.ldt.as_ptr() as u32;
+        let ldt_limit = (dpmi::LDT_ENTRIES * 8 - 1) as u32;
+        crate::kernel::startup::arch_load_ldt(ldt_ptr, ldt_limit);
+    }
 }
 
 /// Saved parent state for returning from EXEC'd child.
@@ -242,44 +257,65 @@ pub struct ExecParent {
     /// Restored on `exec_return`. A child that itself enters DPMI allocates
     /// its own DpmiState (independent of parent's, dropped on child exit).
     pub dpmi: Option<alloc::boxed::Box<dpmi::DpmiState>>,
+    /// Parent's PM interrupt-vector table, suspended alongside dpmi so the
+    /// child sees the default (reflect-to-RM) stubs for every vector. The
+    /// child may install its own hooks (e.g. it enters DPMI itself) and those
+    /// get dropped here on return; parent's hooks are reinstated by
+    /// `exec_return`.
+    pub pm_vectors: [(u16, u32); 256],
+    /// Parent's LDT + alloc bitmap. Swapped out on EXEC so the child starts
+    /// with a clean (kernel-slots-only) LDT and can't observe or clobber
+    /// parent's dynamic selector allocations. Swapping the box is cheap; only
+    /// the fresh child-LDT allocation happens in the EXEC fast path.
+    pub ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]>,
+    pub ldt_alloc: [u32; dpmi::LDT_ENTRIES / 32],
     pub prev: Option<alloc::boxed::Box<ExecParent>>,
 }
 
 /// Translate a `seg:off` client pointer to a flat linear address.
 ///
-/// All callers run inside our DOS handlers (`int_21h` etc.), which are reached
-/// only via the V86 dispatch — for both real V86 callers (DOS .COM/.EXE) and
-/// PM callers reflected through `reflect_int_to_real_mode`. So `seg` is
-/// normally a real-mode paragraph.
+/// All callers run inside our DOS handlers (`int_21h` etc.), reached via
+/// the V86 dispatch — both real V86 callers (DOS .COM/.EXE) and PM
+/// callers reflected through `reflect_int_to_real_mode`. By the time we
+/// reach a handler the regs are VM86, so `seg` is a paragraph.
 ///
-/// One exception: a 16-bit DPMI client whose PM INT 21 was reflected via the
-/// default-stub path without an in-chain hook translating segments. Then the
-/// client's PM selector is sitting in DS/ES verbatim — we'd read the wrong
-/// memory if we treated it as a paragraph. `dpmi.rm_save` carries the PM regs
-/// at reflect time; if the current `seg` still equals what was saved (i.e.
-/// nothing in the hook chain rewrote it to a real paragraph), resolve via the
-/// LDT base. This handles selectors with bases above 1 MB too — no truncation.
+/// Per `feedback_dpmi_host_no_seg_xlate`, the DPMI host doesn't translate
+/// PM selectors during reflection — that's the extender/client's
+/// responsibility. We don't second-guess `seg` based on saved PM state.
 #[inline]
-fn linear(dos: &thread::DosState, _regs: &Regs, seg: u16, off: u32) -> u32 {
-    if let Some(dpmi) = dos.dpmi.as_ref() {
-        if !dpmi.client_use32 {
-            if let Some(saved) = dpmi.rm_save.as_ref() {
-                if saved.rm_struct_addr == 0
-                    && (seg as u64 == saved.regs.ds || seg as u64 == saved.regs.es)
-                {
-                    let base = dpmi::seg_base(dpmi, seg);
-                    let addr = base.wrapping_add(off);
-                    dos_trace!("[LIN] PM-sel seg={:04x} off={:#x} base={:#x} -> {:#x} (saved.ds={:04x} es={:04x})",
-                        seg, off, base, addr, saved.regs.ds as u16, saved.regs.es as u16);
-                    return addr;
-                }
-                dos_trace!("[LIN] paragraph seg={:04x} off={:#x} -> {:#x} (saved.ds={:04x} es={:04x} rm_struct={:#x})",
-                    seg, off, ((seg as u32) << 4).wrapping_add(off & 0xFFFF),
-                    saved.regs.ds as u16, saved.regs.es as u16, saved.rm_struct_addr);
-            }
-        }
-    }
+fn linear(_dos: &thread::DosState, _regs: &Regs, seg: u16, off: u32) -> u32 {
     ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
+}
+
+/// INT 31h is the kernel's unified syscall trap. Every kernel-owned exit
+/// trampoline ends in `CD 31`, and PM clients also raise `INT 31h` directly
+/// to call the DPMI services API. Mode + CS is the discriminator:
+///
+/// | Mode | CS                | Routes to                     | Slot space                          |
+/// |------|-------------------|-------------------------------|-------------------------------------|
+/// | VM86 | `STUB_SEG`        | `dos::rm_stub_dispatch`       | RM IVT redirects + far-call entries |
+/// | VM86 | else              | `dos::synth_dispatch`         | Synth INT 31h (AH-dispatched)       |
+/// | PM   | `VECTOR_STUB`     | `dpmi::vector_stub_reflect`   | Per-vector default reflection       |
+/// | PM   | `SPECIAL_STUB`    | `dpmi::pm_stub_dispatch`      | PM host-stub return trampolines     |
+/// | PM   | client selector   | `dpmi::dpmi_api`              | DPMI services (by AX)               |
+///
+/// Lives at the personality root because INT 31h spans both submodules
+/// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi.rs`).
+pub fn syscall(
+    kt: &mut thread::KernelThread,
+    dos: &mut thread::DosState,
+    regs: &mut Regs,
+) -> thread::KernelAction {
+    use crate::UserMode;
+    let mode = regs.mode();
+    let cs = if mode == UserMode::VM86 { machine::vm86_cs(regs) } else { regs.code_seg() };
+    match (mode, cs) {
+        (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(kt, dos, regs),
+        (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
+        (_, dpmi::VECTOR_STUB_SEL)              => dpmi::vector_stub_reflect(dos, regs),
+        (_, dpmi::SPECIAL_STUB_SEL)             => dpmi::pm_stub_dispatch(dos, regs),
+        _                                       => dpmi::dpmi_api(dos, regs),
+    }
 }
 
 /// Single entry point the event loop calls for the DOS personality.
@@ -302,16 +338,21 @@ pub fn handle_event(
         KE::Irq => thread::KernelAction::Done,
         KE::Hlt => thread::KernelAction::Yield,
         KE::SoftInt(n) => {
-            if is_vm86 {
-                dos::handle_vm86_int(kt, dos, regs, n)
-            } else if dos.dpmi.is_some() {
-                if n == 0x31 {
-                    dpmi::dpmi_int31(dos, regs)
-                } else {
-                    dpmi::dpmi_soft_int(kt, dos, regs, n)
-                }
+            if n == 0x31 {
+                // Kernel syscall — `syscall` branches on mode + CS to reach
+                // the right RM/PM dispatcher. Runs even on non-DPMI threads
+                // (HW-IRQ default reflection lands here too).
+                syscall(kt, dos, regs)
             } else {
-                thread::KernelAction::Done
+                // Invariants: VM86 only ever traps INT 31h (only entry in
+                // the TSS bitmap), and the only path into PM is DPMI. So a
+                // non-31 SoftInt here is necessarily a PM client soft INT
+                // delivered through an active DPMI session.
+                assert!(!is_vm86,
+                    "VM86 SoftInt({:#x}) bubbled to dos — only INT 31h should trap", n);
+                assert!(dos.dpmi.is_some(),
+                    "PM SoftInt({:#x}) without an active DPMI session", n);
+                dpmi::dpmi_soft_int(kt, dos, regs, n)
             }
         }
         KE::In { port, size } => {
@@ -470,6 +511,10 @@ pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]
         core::ptr::write_volatile(0x451 as *mut u8, row as u8);
     }
     unsafe { *(&raw mut crate::arch::REGS) = t.kernel.cpu_state; }
+    // Initial thread never goes through a context switch, so load LDTR
+    // directly here. Subsequent threads pick this up via `on_resume` in the
+    // event-loop switch path.
+    t.dos_mut().on_resume();
     tid
 }
 
@@ -508,7 +553,7 @@ pub fn snapshot_parent_env(dos: &thread::DosState) -> alloc::vec::Vec<u8> {
 /// F12 / panic dump: print DPMI LDT entries and PM stack/code bytes.
 /// No-op when the thread isn't a DPMI client.
 pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
-    let Some(dpmi) = dos.dpmi.as_ref() else { return };
+    if dos.dpmi.is_none() { return; }
     for (name, sel) in [
         ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
         ("DS", regs.ds as u16), ("ES", regs.es as u16),
@@ -517,16 +562,16 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
         if sel == 0 { continue; }
         if sel & 4 == 0 { continue; }
         let idx = (sel >> 3) as usize;
-        if idx >= dpmi.ldt.len() { continue; }
-        let raw = dpmi.ldt[idx];
+        if idx >= dos.ldt.len() { continue; }
+        let raw = dos.ldt[idx];
         let base = dpmi::DpmiState::desc_base(raw);
         let limit = dpmi::DpmiState::desc_limit(raw);
         crate::dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
             name, sel, idx, base, limit, raw);
     }
-    let cs_base = dpmi::seg_base(dpmi, regs.code_seg());
-    let ss_base = dpmi::seg_base(dpmi, regs.stack_seg());
-    let cs_32 = dpmi::seg_is_32(dpmi, regs.code_seg());
+    let cs_base = dpmi::seg_base(&dos.ldt[..], regs.code_seg());
+    let ss_base = dpmi::seg_base(&dos.ldt[..], regs.stack_seg());
+    let cs_32 = dpmi::seg_is_32(&dos.ldt[..], regs.code_seg());
     let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
     let sp_lin = ss_base.wrapping_add(regs.sp32());
     let pre = ip_lin.wrapping_sub(16);
@@ -547,36 +592,20 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
     machine::queue_irq(&mut dos.pc, irq);
 }
 
-/// Try to deliver one pending interrupt from the virtual PIC.
-///
-/// If a DPMI client installed a PM handler for this vector, deliver to it
-/// regardless of the current execution mode — a cross-mode switch from VM86
-/// snapshots the VM86 state and restores it on handler IRET. Without a PM
-/// handler, VM86 reflects to RM IVT and PM goes through the default stub
-/// which reflects to RM.
+/// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery
+/// is uniform regardless of the client's current mode: `deliver_pm_irq`
+/// snapshots the client state on a kernel IRQ stack and switches to the
+/// handler at `pm_vectors[vec].sel:off`. When the handler IRETs it lands at
+/// `SLOT_PM_RET_{16,32}` → `cross_mode_restore` → back to the client's
+/// original state (VM86 or PM). If `pm_vectors[vec]` is the default stub
+/// (no PM handler installed), `vector_stub_reflect` runs `cross_mode_restore`
+/// and then reflects the IRQ to BIOS — via `machine::reflect_interrupt`
+/// when the restored state is VM86, via `reflect_int_to_real_mode` when
+/// it's PM.
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
-
-    if let Some(dpmi_ref) = dos.dpmi.as_ref() {
-        let (sel, _off) = dpmi_ref.pm_vectors[vec as usize];
-        let default_sel = dpmi::DpmiState::vector_stub_sel();
-        if sel != default_sel {
-            DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
-            if regs.mode() == crate::UserMode::VM86 {
-                dpmi::cross_mode_deliver(dos, regs, vec);
-            } else {
-                dpmi::deliver_pm_int(dos, regs, vec);
-            }
-            return;
-        }
-    }
-
-    if regs.mode() == crate::UserMode::VM86 {
-        machine::reflect_interrupt(regs, vec);
-    } else {
-        DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
-        dpmi::deliver_pm_int(dos, regs, vec);
-    }
+    DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
+    dpmi::deliver_pm_irq(dos, regs, vec);
 }
 
 // ── Block-allocator helpers used by INT 21h handlers in `dos.rs` ────────

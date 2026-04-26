@@ -24,12 +24,11 @@ use super::ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};
 use super::xms::xms_dispatch;
 use super::dos_trace;
 use super::machine::{
-    IF_FLAG,
     read_u16, write_u16,
     vm86_cs, vm86_ip, vm86_ss, vm86_sp, vm86_flags,
     set_vm86_cs, set_vm86_ip,
     vm86_push, vm86_pop,
-    reflect_interrupt, clear_bios_keyboard_buffer, pop_bios_keyboard_word,
+    clear_bios_keyboard_buffer, pop_bios_keyboard_word,
 };
 
 /// Dummy file handle returned for /dev/null semantics.
@@ -54,18 +53,8 @@ fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
     Some(ascii)
 }
 
-/// Handle INT n from VM86 mode. Only bitmap-trapped INTs bubble up here;
-/// arch does the SW IVT reflect for the rest. In our setup only `STUB_INT`
-/// is in the bitmap.
-pub(super) fn handle_vm86_int(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs, int_num: u8) -> thread::KernelAction {
-    match int_num {
-        STUB_INT => stub_dispatch(kt, dos, regs),
-        _ => panic!("VM86: INT {:02X} bubbled to dos but only STUB_INT should trap", int_num),
-    }
-}
-
 // ============================================================================
-// Stub dispatch — routes INT 31h from unified CD 31 array by slot number
+// RM INT 31h dispatch — routes from the unified CD 31 array by slot number
 // ============================================================================
 
 /// Dispatch a kernel-owned DOS/BIOS vector directly (no V86 detour).
@@ -107,23 +96,19 @@ pub(crate) fn dispatch_kernel_syscall(
     }
 }
 
-/// Dispatch INT 31h from the unified stub array. Slot = (IP - 2) / 2.
-/// IVT-redirect stubs have a FLAGS/CS/IP frame on the VM86 stack from the
-/// original INT; far-call stubs have a CS/IP frame from CALL FAR.
-/// The kernel pops these frames directly — no RETF/RETF 2 in the stub.
-fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+/// Dispatch INT 31h from the RM stub array (CS == STUB_SEG).
+/// Slot = (IP - 2) / 2. IVT-redirect stubs have a FLAGS/CS/IP frame on the
+/// VM86 stack from the original INT; far-call stubs have a CS/IP frame from
+/// CALL FAR. The kernel pops these frames directly — no RETF/RETF 2 in the
+/// stub. Caller (`syscall`) has already checked CS == STUB_SEG.
+pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     let cs = vm86_cs(regs);
-
-    // INT 31h from user code (outside the stub segment) = synth syscall.
-    // AH selects the subfunction. Unknown subfunctions fall through to IVT reflect.
-    if cs != STUB_SEG {
-        return synth_dispatch(kt, dos, regs);
-    }
+    debug_assert_eq!(cs, STUB_SEG, "rm_stub_dispatch: CS must be STUB_SEG");
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
-        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_CALLBACK_RET | SLOT_RM_INT_RET
+        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RM_IRET_REFLECT | SLOT_RM_IRET_CALL
         | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
@@ -133,18 +118,16 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             dpmi::dpmi_enter(dos, regs);
             thread::KernelAction::Done
         }
-        SLOT_CALLBACK_RET => {
-            dpmi::callback_return(dos, regs);
+        SLOT_RM_IRET_REFLECT => {
+            // Implicit reflection unwind: pop ModeSave, propagate low 32
+            // bits of GP regs PM→RM (§2.4), OR IF=1 (default-stub spec).
+            dpmi::rm_iret_reflect(dos, regs);
             thread::KernelAction::Done
         }
-        SLOT_RM_INT_RET => {
-            // Implicit INT reflection (no PM handler installed). Same
-            // unwind as a callback, then synthesize the STI that DPMI
-            // requires IRQ handlers to perform before IRET — our default
-            // stub is the nominal handler here.
-            dpmi::callback_return(dos, regs);
-            regs.frame.rflags |= machine::IF_FLAG as u64;
-            DOS_TRACE_HW_RT.store(true, core::sync::atomic::Ordering::Relaxed);
+        SLOT_RM_IRET_CALL => {
+            // Explicit PM→RM call unwind: pop rm_struct_addr stub-arg,
+            // write current RM regs back to RmCallStruct, pop ModeSave.
+            dpmi::rm_iret_call(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RAW_REAL_TO_PM => {
@@ -155,12 +138,6 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             let cb_idx = (slot - SLOT_CB_ENTRY_BASE) as usize;
             dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
-        }
-        SLOT_HW_IRQ_BASE..SLOT_HW_IRQ_END => {
-            // Hardware IRQ N: chain to BIOS handler on private stack.
-            // Reflect frame (FLAGS/CS/IP) stays on current stack — BIOS IRET pops it.
-            hw_irq_reflect(dos, regs, slot - SLOT_HW_IRQ_BASE);
-            return thread::KernelAction::Done;
         }
         0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F | 0x67 => {
             // Restore caller FLAGS into regs so handlers may mutate them
@@ -176,15 +153,6 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
             write_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4),
                       machine::vm86_flags(regs) as u16);
             action
-        }
-        SLOT_HW_IRQ_RET => {
-            // BIOS handler IRET'd to trampoline. Restore original SS:SP;
-            // the common pop below IRETs the reflect frame back to the
-            // interrupted code (including its flags).
-            let (ss, sp) = dos.pc.irq_saved_sssp.take().expect("HW_IRQ_RET without saved SS:SP");
-            machine::set_vm86_ss(regs, ss);
-            machine::set_vm86_sp(regs, sp);
-            thread::KernelAction::Done
         }
         SLOT_SAVE_RESTORE => {
             dpmi::save_restore_protected_mode_state(dos, regs);
@@ -218,16 +186,9 @@ fn stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs
     action
 }
 
-// ============================================================================
-// Synth syscalls — invoked by user-code INT 31h (outside STUB_SEG).
-// Modeled as a tiny set of primitives that COMMAND.COM (or any program)
-// can call to coordinate processes + VGA across threads.
-// ============================================================================
-
-/// INT 31h from user code. AH selects subfunction.
+/// INT 31h from real mode user code. AH selects subfunction.
 /// On success: AX=0, CF=0. On error: AX=errno (unsigned), CF=1.
-/// Unknown AH reflects through IVT (legacy DPMI int-31 path).
-fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — SYNTH_VGA_TAKE: adopt target thread's screen.
@@ -311,50 +272,6 @@ fn synth_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, reg
 // ============================================================================
 // BIOS INT 13h — Disk services
 // ============================================================================
-
-/// INT 08h — Timer tick (IRQ0).
-/// Replaces the BIOS handler: increment BDA tick counter, call INT 1Ch.
-/// Handled in kernel to avoid BIOS handler's stack usage on the program's
-/// stack (which can corrupt tiny .COM stubs like LZEXE decompressors).
-/// Saved BIOS IRQ handlers (before we hook the IVT). Indexed by IRQ number
-/// 0..15 (not interrupt vector). IRQ 0..7 = INT 0x08..0x0F, IRQ 8..15 =
-/// INT 0x70..0x77.
-static mut BIOS_HW_IRQ: [(u16, u16); 16] = [(0, 0); 16];
-
-/// Convert IRQ number (0..15) to its real-mode interrupt vector.
-fn irq_to_vector(irq: u8) -> u8 {
-    if irq < 8 { 0x08 + irq } else { 0x70 + (irq - 8) }
-}
-
-/// INT 08h — Timer tick (IRQ0).
-/// Switch to private IRQ stack, then chain to BIOS handler.
-/// When the BIOS handler IRETs, it returns to SLOT_HW_IRQ_RET which
-/// traps back to kernel to restore the original SS:SP.
-/// Hardware IRQ reflect with private stack.
-/// The reflect frame (FLAGS/CS/IP) stays on the original VM86 stack.
-/// We switch to a private stack, push a trampoline, and jump to the
-/// saved BIOS handler.  BIOS IRETs to trampoline → SLOT_HW_IRQ_RET
-/// restores SS:SP → post-match pops the reflect frame → done.
-fn hw_irq_reflect(dos: &mut thread::DosState, regs: &mut Regs, irq: u8) {
-    if dos.pc.irq_saved_sssp.is_none() {
-        // First hardware IRQ: switch to private stack, push trampoline.
-        dos.pc.irq_saved_sssp = Some((vm86_ss(regs), vm86_sp(regs)));
-        machine::set_vm86_ss(regs, IRQ_STACK_SEG);
-        machine::set_vm86_sp(regs, IRQ_STACK_TOP);
-
-        vm86_push(regs, vm86_flags(regs) as u16);
-        vm86_push(regs, STUB_SEG);
-        vm86_push(regs, slot_offset(SLOT_HW_IRQ_RET));
-    }
-    // Reflect frame (FLAGS/CS/IP) is on the current stack (original or IRQ).
-    let (bios_cs, bios_ip) = unsafe { BIOS_HW_IRQ[irq as usize] };
-    set_vm86_ip(regs, bios_ip);
-    set_vm86_cs(regs, bios_cs);
-    regs.clear_flag32(IF_FLAG);
-    // Suppress TF inside the BIOS handler. The flags pushed above still have
-    // TF=caller's value, so IRET restores stepping when BIOS returns.
-    regs.clear_flag32(1 << 8);
-}
 
 fn int_13h(regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
@@ -1788,7 +1705,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     loaded.program.set_cmdline(&tail[..copy_len]);
 
     // Save parent state. Parent's INT frame (IP/CS/FLAGS) is on the VM86
-    // stack at current SS:SP. exec_return restores SS:SP so stub_dispatch
+    // stack at current SS:SP. exec_return restores SS:SP so rm_int31_dispatch
     // pops the frame and resumes the parent.
     let prev = dos.exec_parent.take();
     let parent_heap = dos.heap_seg;
@@ -1801,8 +1718,21 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     dos.current_psp = child_seg;
     // DPMI host obligation: parent's PM state must not be observable to the
     // child (no PM handlers fire; child's DPMI entry, if any, allocates a
-    // fresh DpmiState). Suspend here, restore in `exec_return`.
+    // fresh DpmiState). Suspend DPMI state + pm_vectors + LDT, restore in
+    // `exec_return`. Swapping the LDT box is cheap (pointer move); the only
+    // per-EXEC allocation is the fresh 64KB child LDT.
     let suspended_dpmi = dos.dpmi.take();
+    let suspended_pm_vectors = dos.pm_vectors;
+    let suspended_ldt = core::mem::replace(&mut dos.ldt, super::fresh_ldt());
+    let suspended_ldt_alloc = core::mem::replace(
+        &mut dos.ldt_alloc,
+        [0u32; super::dpmi::LDT_ENTRIES / 32],
+    );
+    super::dpmi::install_kernel_ldt_slots(dos);
+    super::dpmi::reset_pm_vectors(dos);
+    // LDTR still points at parent's LDT box (which now lives in ExecParent).
+    // Reload so the CPU sees the fresh child LDT if child enters DPMI.
+    dos.on_resume();
     dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
@@ -1813,11 +1743,14 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         psp: parent_psp,
         dos_blocks: parent_blocks,
         dpmi: suspended_dpmi,
+        pm_vectors: suspended_pm_vectors,
+        ldt: suspended_ldt,
+        ldt_alloc: suspended_ldt_alloc,
         prev: prev.map(alloc::boxed::Box::new),
     });
 
     // Set child entry. Push child's CS:IP + FLAGS onto the child's stack
-    // so that stub_dispatch's pop restores them correctly.
+    // so that rm_int31_dispatch's pop restores them correctly.
     regs.set_ss32(ss as u32);
     regs.set_sp32(sp as u32);
     let flags = vm86_flags(regs) as u16;
@@ -1957,8 +1890,15 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) 
     dos.dos_blocks = parent.dos_blocks;
     // Restore parent's suspended DPMI state (if any). A child's own DPMI
     // state, if it entered DPMI, is dropped here — the child-allocated
-    // DpmiState currently in `dos.dpmi` gets replaced.
+    // DpmiState currently in `dos.dpmi` gets replaced. pm_vectors + LDT are
+    // suspended alongside dpmi so any descriptors/hooks the child installed
+    // are dropped and parent's are reinstated.
     dos.dpmi = parent.dpmi;
+    dos.pm_vectors = parent.pm_vectors;
+    dos.ldt = parent.ldt;
+    dos.ldt_alloc = parent.ldt_alloc;
+    // LDTR currently points at the child's (now-dropped) LDT — reload.
+    dos.on_resume();
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }
@@ -2230,24 +2170,15 @@ struct LowMem {
     lol:       Lol,                    // 0x900
     sft:       Sft,                    // 0x940
     cds:       [CdsEntry; NUM_DRIVES as usize],
-    _pad:      [u8; 6],                // align irq_stack to a paragraph boundary
-    /// Kernel-shared RM stack for PM→RM reflections (BIOS chain, soft-INT
-    /// reflects, real-mode far calls). Used by both `reflect_int_to_real_mode`
-    /// and the unified HW IRQ default-stub RM excursion.
-    irq_rm_stack:   [u8; 256],
-    /// Kernel-shared 16-bit PM stack for HW IRQ delivery to PM16 handlers.
-    /// Used when the installed handler's CS is 16-bit (B=0).
-    irq_pm16_stack: [u8; 4096],
-    /// Kernel-shared 32-bit PM stack for HW IRQ delivery to PM32 handlers.
-    /// Used when the installed handler's CS is 32-bit (B=1), including the
-    /// default vector stub which lives in a 32-bit kernel selector.
-    irq_pm32_stack: [u8; 4096],
+    /// DPMI 0.9 §3.1.2 locked PM stack (referred to as "host_stack" in
+    /// the implementation). 4 KB host-provided buffer used for HW IRQ /
+    /// exception / RM-callback handling in PM. Switched onto on the
+    /// first reflection to PM and switched away from on outermost
+    /// return. Two aliasing LDT selectors (PM16 with B=0, PM32 with
+    /// B=1) point at this same buffer so SP values are portable across
+    /// client bitness.
+    host_stack: [u8; 4096],
 }
-
-const _: () = assert!(
-    (LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_rm_stack)) % 16 == 0,
-    "irq_rm_stack base must be paragraph-aligned (adjust LowMem._pad)",
-);
 
 /// Borrow the kernel-owned low-mem area as a typed `&'static mut`.
 /// Single-threaded kernel; the borrow checker treats successive calls as
@@ -2259,9 +2190,6 @@ fn low_mem() -> &'static mut LowMem {
 
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
 pub(crate) const STUB_SEG: u16 = (LOW_MEM_BASE >> 4) as u16;
-pub(crate) const IRQ_STACK_SEG: u16 =
-    ((LOW_MEM_BASE as usize + core::mem::offset_of!(LowMem, irq_rm_stack)) >> 4) as u16;
-pub(crate) const IRQ_STACK_TOP: u16 = 256;
 /// Offset within SYSPSP of the INDOS flag byte (permanently zero).
 /// Placed in the "command tail" area since the system PSP never runs.
 const INDOS_FLAG_OFFSET: u16 = 0xFE;
@@ -2280,19 +2208,14 @@ pub(super) fn sys_program() -> &'static mut Program {
 }
 pub(super) fn sys_psp_seg() -> u16 { sys_program().psp_seg() }
 
-/// Base linear addresses + sizes of the kernel-shared HW IRQ stacks,
-/// consumed by dpmi when building the per-thread LDT selectors.
-pub(super) fn irq_pm16_stack_base() -> u32 {
-    &raw const low_mem().irq_pm16_stack as u32
+/// Base linear address + size of the kernel-shared host stack, consumed
+/// by dpmi when building the three aliasing LDT selectors (PM16, PM32,
+/// VM86 paragraph) that all point at this same buffer.
+pub(super) fn host_stack_base() -> u32 {
+    &raw const low_mem().host_stack as u32
 }
-pub(super) fn irq_pm16_stack_size() -> u32 {
-    core::mem::size_of_val(&low_mem().irq_pm16_stack) as u32
-}
-pub(super) fn irq_pm32_stack_base() -> u32 {
-    &raw const low_mem().irq_pm32_stack as u32
-}
-pub(super) fn irq_pm32_stack_size() -> u32 {
-    core::mem::size_of_val(&low_mem().irq_pm32_stack) as u32
+pub(super) fn host_stack_size() -> u32 {
+    core::mem::size_of_val(&low_mem().host_stack) as u32
 }
 
 /// One DOS program's env arena + PSP, laid out contiguously in real-mode
@@ -2353,29 +2276,38 @@ pub(super) struct Loaded {
 const STUB_INT: u8 = 0x31;
 const SLOT_XMS: u8 = 0x00;
 const SLOT_DPMI_ENTRY: u8 = 0x01;
-pub(crate) const SLOT_CALLBACK_RET: u8 = 0x02;
+/// RM-side return stub for the implicit IVT-reflection path
+/// (`reflect_int_to_real_mode`). The `CD 31` byte at this slot is the IRET
+/// target the kernel pushed on the RM stack when reflecting a PM client
+/// INT into BIOS. On RM IRET the kernel pops the `ModeSave` from
+/// host_stack, propagates the low 32 bits of GP regs from RM back to PM
+/// (per DPMI 0.9 §2.4/§3.2 round-trip rule), and ORs IF=1 into the
+/// restored EFLAGS — the spec's "default IRQ stub must STI before IRET"
+/// requirement (see `feedback_dpmi_default_stub_sti`).
+pub(crate) const SLOT_RM_IRET_REFLECT: u8 = 0x02;
+/// RM-side return stub for explicit PM→RM excursions: `INT 31h/0300h`
+/// (`simulate_real_mode_int`), `0301h` (`call_real_mode_proc`), `0302h`
+/// (`call_real_mode_proc_iret`), and `callback_entry` (RM→PM). Each entry
+/// pushes a `ModeSave` followed by a `rm_struct_addr` stub-arg on
+/// host_stack. On RM IRET the kernel pops the stub-arg, writes the
+/// current RM regs back into the RmCallStruct at that address (spec
+/// requires results in the structure), then pops the ModeSave and
+/// restores PM.
+pub(crate) const SLOT_RM_IRET_CALL: u8 = 0xF9;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
 pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
-/// Slots SLOT_HW_IRQ_BASE + N route IRQ N (0..15) so its BIOS handler runs
-/// on a private IRQ stack, not the user's stack.
-pub(crate) const SLOT_HW_IRQ_BASE: u8 = 0xE0;
-pub(crate) const SLOT_HW_IRQ_END: u8 = 0xF0;
-/// VM86-only: RM IRET target for implicit INT reflection (no PM handler
-/// installed). `rm_int_return` restores PM state and synthesizes the STI
-/// the DPMI spec requires our default stub to perform before IRET.
-pub(crate) const SLOT_RM_INT_RET: u8 = 0xFA;
-pub(crate) const SLOT_HW_IRQ_RET: u8 = 0xFC;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
-/// Cross-mode HW IRQ delivery return targets. Handler IRETs land here via
-/// CD 31 → we restore the saved client context from the kernel IRQ stack.
-/// Separate slots per handler bitness so the stub knows whether a 6-byte or
-/// 12-byte IRET frame was popped and where on the kernel stack the saved
-/// context lives.
-pub(crate) const SLOT_IRQ_RET_PM16: u8 = 0xF8;
-pub(crate) const SLOT_IRQ_RET_PM32: u8 = 0xF9;
+/// Outermost-relative PM-handler IRET target. Pushed as the IRET-frame
+/// `CS:EIP` by `deliver_pm_irq`'s cross-mode branch so the handler's IRET
+/// lands here; the `CD 31` then traps to the kernel, which pops the
+/// `ModeSave` from host_stack and restores the interrupted state via
+/// `cross_mode_restore`. One slot serves both 16-bit and 32-bit handlers:
+/// bitness is encoded in the frame width on the push side; either IRET
+/// width lands at the same `CD 31` byte pair.
+pub(crate) const SLOT_PM_IRET: u8 = 0xF8;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
@@ -2386,16 +2318,11 @@ pub(super) fn setup_ivt() {
         *entry = [0xCD, STUB_INT];
     }
 
-    // Hook BIOS HW IRQ vectors (0x08-0x0F + 0x70-0x77) through private-stack
-    // slots; save the original BIOS pointers so hw_irq_reflect can chain.
-    for irq in 0u8..16 {
-        let vec = irq_to_vector(irq);
-        let ip = read_u16(0, (vec as u32) * 4);
-        let cs = read_u16(0, (vec as u32) * 4 + 2);
-        unsafe { BIOS_HW_IRQ[irq as usize] = (cs, ip); }
-        write_u16(0, (vec as u32) * 4, slot_offset(SLOT_HW_IRQ_BASE + irq));
-        write_u16(0, (vec as u32) * 4 + 2, STUB_SEG);
-    }
+    // HW IRQ vectors (0x08-0x0F + 0x70-0x77) are left pointing at the
+    // original BIOS handlers — `raise_pending` delivers IRQs through the
+    // pm_vectors table (cross-mode to PM and back for VM86 clients), so the
+    // IVT never needs redirection for HW IRQ delivery.
+
     // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
     // dispatcher (slot index = INT vector).
     for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x67] {

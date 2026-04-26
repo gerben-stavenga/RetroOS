@@ -193,7 +193,7 @@ macro_rules! println {
     () => { $crate::vga::vga().putchar(b'\n') };
     ($($arg:tt)*) => {{
         $crate::print!($($arg)*);
-        $crate::vga::vga().putchar(b'\n');
+        $crate::print!("\n");
     }};
 }
 
