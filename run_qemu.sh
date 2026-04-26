@@ -134,6 +134,7 @@ elif [ "$IMG" = "freedos" ]; then
         XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
         $QEMU \
         $CPU \
+        -debugcon stdio \
         -m 32 \
         -k en-us \
         -global i8042.kbd-throttle=on \

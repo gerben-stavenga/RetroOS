@@ -68,14 +68,18 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 /// - **ELF**: caller must have already cleaned the address space.
 /// - **DOS**: address space setup (clean + low mem + IVT) is handled internally.
 /// - `args` is used for ELF argv; ignored for DOS.
-pub fn init_thread(tid: usize, data: &[u8], path: &[u8], args: &[Vec<u8>]) -> Result<(), i32> {
+/// - `parent_env_data` is the parent DOS env snapshot (DOS-only path); pass
+///   None for initial loads or non-DOS execs.
+/// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
+///   (ignored by ELF, which preserves the caller's LinuxState in-place).
+pub fn init_thread(tid: usize, data: &[u8], path: &[u8], args: &[Vec<u8>], parent_env_data: Option<&[u8]>, parent_cwd: &[u8]) -> Result<(), i32> {
     match detect_format(data, path) {
         BinaryFormat::Elf => {
             crate::kernel::linux::exec_elf_into(tid, data, args)
         }
         fmt => {
             let is_exe = matches!(fmt, BinaryFormat::MzExe);
-            crate::kernel::dos::exec_dos_into(tid, data, is_exe, path);
+            crate::kernel::dos::exec_dos_into(tid, data, is_exe, path, parent_env_data, parent_cwd);
             Ok(())
         }
     }

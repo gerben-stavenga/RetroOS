@@ -15,7 +15,6 @@
 
 extern crate alloc;
 
-use crate::kernel::thread;
 use crate::Regs;
 
 pub const IF_FLAG: u32 = 1 << 9;
@@ -23,8 +22,9 @@ pub const IOPL_MASK: u32 = 3 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
 pub const VIF_FLAG: u32 = 1 << 19;
 
-/// Flags that VM86 code cannot change (IOPL, VM)
-pub const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
+pub const NT_FLAG: u32 = 1 << 14;
+/// Flags that user code cannot change (IOPL, VM, NT)
+pub const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG | NT_FLAG;
 
 /// HMA spans 16 pages (64KB) starting at page 0x100.
 const HMA_PAGE: usize = 0x100;
@@ -69,11 +69,6 @@ pub fn set_vm86_cs(regs: &mut Regs, cs: u16) {
 #[inline]
 pub fn set_vm86_ip(regs: &mut Regs, ip: u16) {
     regs.set_ip32(ip as u32);
-}
-
-#[inline]
-pub fn set_vm86_ss(regs: &mut Regs, ss: u16) {
-    regs.set_ss32(ss as u32);
 }
 
 #[inline]
@@ -355,12 +350,17 @@ pub struct PcMachine {
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: VgaState,
-    /// Saved SS:SP during hardware IRQ stack-switch reflection.
-    /// When a hardware IRQ is reflected in VM86, we switch to a private
-    /// stack to avoid corrupting tiny program stacks. The handler's IRET
-    /// returns to SLOT_HW_IRQ_RET which restores this saved SS:SP.
-    /// Saved SS:SP from before hardware IRQ stack switch. None when not on IRQ stack.
-    pub irq_saved_sssp: Option<(u16, u16)>,
+    /// Last value written to CMOS index port 0x70 (NMI bit masked off).
+    /// Reads of port 0x71 pass through to the host CMOS using this index.
+    pub cmos_index: u8,
+    /// Cursor for the locked PM stack (`host_stack`). Points at the
+    /// lowest used byte (the topmost live record); next first-entry push
+    /// reserves space below by subtracting record size. Initialized to
+    /// `host_stack_size()` (empty); returns there once all in-flight
+    /// excursions unwind. Per DPMI 0.9 §3.1.2 the locked PM stack is
+    /// switched onto on the first entry from the client and is reused
+    /// (without further switches) by nested entries.
+    pub host_stack_sp: u32,
 }
 
 impl PcMachine {
@@ -377,7 +377,8 @@ impl PcMachine {
             skip_irq: false,
             e0_pending: false,
             vga: VgaState::new(),
-            irq_saved_sssp: None,
+            cmos_index: 0,
+            host_stack_sp: super::dos::host_stack_size(),
         }
     }
 
@@ -930,6 +931,15 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         0x41 | 0x42 => 0,
         // PIT command register not readable
         0x43 => 0xFF,
+        // CMOS index port: read returns the last index byte (rare).
+        0x70 => pc.cmos_index,
+        // CMOS data port: pass through to host RTC at the saved index.
+        // Host CMOS isn't used by the kernel itself, so this is safe; the
+        // guest sees real time-of-day plus a UIP/VRT-correct status block.
+        0x71 => {
+            crate::arch::outb(0x70, pc.cmos_index);
+            crate::arch::inb(0x71)
+        }
         // Unknown ports: return 0xFF (unpopulated bus)
         _ => 0xFF,
     }
@@ -978,6 +988,12 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         0x43 => pc.vpit.write_command(val),
         0x40 => pc.vpit.write_counter0(val),
         0x41 | 0x42 => {}
+        // CMOS index: latch for the next data-port read. Mask off the NMI
+        // disable bit (0x80) — we never want guest writes to toggle host NMI.
+        0x70 => pc.cmos_index = val & 0x7F,
+        // CMOS data writes are dropped — never let the guest mutate host CMOS
+        // (BIOS settings, time-of-day, alarm, etc.).
+        0x71 => {}
         // Unknown ports: silently ignore (BIOS probes various ports during mode switches)
         _ => {}
     }
@@ -1074,7 +1090,7 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
 /// interrupt flag and in-service register. Returns the vector to deliver
 /// (and marks it in-service on the master PIC), or `None` if nothing is
 /// ready. The caller is responsible for pushing the interrupt frame
-/// (see `reflect_interrupt` for VM86 or `dpmi::deliver_hw_irq` for PM).
+/// (see `reflect_interrupt` for VM86 or `dpmi::deliver_pm_int` for PM).
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
     if !vif {
@@ -1158,26 +1174,6 @@ pub fn vm86_pop(regs: &mut Regs) -> u16 {
     let val = read_u16(regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
     val
-}
-
-// ============================================================================
-// Raise helper — drain the next pending IRQ and dispatch to the active
-// personality. This is the one place the machine layer calls back out to
-// the personality (via `crate::kernel::dos::dpmi::deliver_hw_irq` for PM mode
-// and `reflect_interrupt` directly for VM86); it lives here so the event
-// loop has one canonical entry point.
-// ============================================================================
-
-/// Try to deliver one pending interrupt from the virtual PIC.
-/// IF is the virtual interrupt flag (arch swaps VIF↔IF at ring 3 boundary).
-/// Works for both VM86 (IVT reflect) and DPMI (PM vector dispatch).
-pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
-    let Some(vec) = pick_pending_vec(&mut dos.pc, regs) else { return };
-    if regs.mode() == crate::UserMode::VM86 {
-        reflect_interrupt(regs, vec);
-    } else {
-        crate::kernel::dos::dpmi::deliver_hw_irq(dos, regs, vec);
-    }
 }
 
 // GP-fault monitor lives in `arch/monitor.rs` now. Kernel only sees the

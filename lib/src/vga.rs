@@ -94,11 +94,6 @@ impl Vga {
     }
 
     pub fn putchar(&mut self, c: u8) {
-        // Output to QEMU debug console (port 0xE9)
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") c);
-        }
-
         if !self.screen_enabled {
             return;
         }
@@ -169,6 +164,7 @@ impl Write for Vga {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
             self.putchar(byte);
+            unsafe { core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") byte); }
         }
         Ok(())
     }
@@ -197,7 +193,7 @@ macro_rules! println {
     () => { $crate::vga::vga().putchar(b'\n') };
     ($($arg:tt)*) => {{
         $crate::print!($($arg)*);
-        $crate::vga::vga().putchar(b'\n');
+        $crate::print!("\n");
     }};
 }
 

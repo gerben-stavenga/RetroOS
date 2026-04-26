@@ -1,0 +1,11 @@
+; VEC.SCR
+
+intercept 21h
+	function 25h
+		subfunction 1bh
+			on_entry
+				output "Set at " ds ":" dx
+	function 35h
+		subfunction 1bh
+			on_exit
+				output "Get at " es ":" bx

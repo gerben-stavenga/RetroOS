@@ -154,8 +154,6 @@ pub struct KernelThread {
     pub exit_code: i32,
     pub addr_hash: u64,
     pub cpu_hash: u64,
-    pub cwd: [u8; 64],
-    pub cwd_len: usize,
     pub symbols: Option<SymbolData>,
     pub fds: [FdKind; MAX_FDS],
     pub cloexec: u16,
@@ -202,20 +200,10 @@ impl KernelThread {
             exit_code: 0,
             addr_hash: 0,
             cpu_hash: 0,
-            cwd: [0; 64],
-            cwd_len: 0,
             symbols: None,
             fds: [FdKind::None; MAX_FDS],
             cloexec: 0,
         }
-    }
-
-    pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
-
-    pub fn set_cwd(&mut self, path: &[u8]) {
-        let len = path.len().min(self.cwd.len());
-        self.cwd[..len].copy_from_slice(&path[..len]);
-        self.cwd_len = len;
     }
 
     /// Find a free fd slot (starting from `from`). Returns fd number or None.
@@ -402,30 +390,6 @@ pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
     thread.kernel.cpu_state.init_user_process_64(entry, stack);
 }
 
-/// Initialize a thread for VM86 mode (.COM execution)
-/// cs/ip/ss/sp are real-mode segment:offset values
-pub fn init_process_thread_vm86(thread: &mut Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
-    use crate::kernel::machine::{VM_FLAG, IF_FLAG, VIF_FLAG};
-    thread.personality = Personality::Dos(DosState::new());
-
-    let state = &mut thread.kernel.cpu_state;
-    *state = Regs::empty();
-
-    // DS=ES=PSP segment for DOS programs, FS=GS=0
-    state.ds = psp_seg as u64;
-    state.es = psp_seg as u64;
-    state.fs = 0;
-    state.gs = 0;
-
-    state.frame = Frame64 {
-        rip: ip as u64,
-        cs: cs as u64,
-        rflags: (VM_FLAG | IF_FLAG | VIF_FLAG) as u64,
-        rsp: sp as u64,
-        ss: ss as u64,
-    };
-}
-
 /// Save CPU state to thread.
 pub fn save_state(thread: &mut Thread, regs: &Regs) {
     thread.kernel.cpu_state = *regs;
@@ -506,23 +470,18 @@ pub fn schedule(current_tid: usize) -> Option<usize> {
     }
 }
 
-/// Take target thread's saved VGA state (swap, no data copy) and restore to hardware.
-/// `dst` is the running caller's VGA state; the caller adopts target's screen.
-/// Returns 0 on success, negative errno on failure.
-pub fn vga_take(dst: &mut crate::kernel::machine::VgaState, target_tid: i32) -> i32 {
+/// Borrow another thread's `DosState` for a swap-style operation.
+/// Returns the target's DosState if the target is a DOS thread, else an errno.
+pub fn with_target_dos<F: FnOnce(&mut DosState) -> i32>(target_tid: i32, f: F) -> i32 {
     if target_tid < 0 || (target_tid as usize) >= MAX_THREADS { return -22; } // EINVAL
     unsafe {
         let target = &mut *(&raw mut THREADS[target_tid as usize]);
         if target.kernel.state == ThreadState::Unused { return -3; } // ESRCH
-        let src = match &mut target.personality {
-            Personality::Dos(d) => &mut d.pc.vga,
-            _ => return -22, // target not DOS
-        };
-        if src.planes.is_empty() { return -61; }
-        core::mem::swap(dst, src);
-        dst.restore_to_hardware();
+        match &mut target.personality {
+            Personality::Dos(d) => f(d),
+            _ => -22, // target not DOS
+        }
     }
-    0
 }
 
 /// F11 hotkey flag for thread cycling
@@ -565,15 +524,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
         let thread = &mut THREADS[tid];
         let parent_tid = thread.kernel.parent_tid;
         match &mut thread.personality {
-            Personality::Dos(dos) => {
-                dos.pc.vga.save_from_hardware();
-                if let Some(ref mut ems) = dos.ems {
-                    ems.free_all_pages();
-                }
-                dos.ems = None;
-                dos.xms = None;
-                dos.pc.set_a20(true);
-            }
+            Personality::Dos(dos) => dos.on_exit(),
             Personality::Linux(_) => {}
         }
 
