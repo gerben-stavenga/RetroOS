@@ -430,7 +430,7 @@ fn init_process_thread_vm86(thread: &mut thread::Thread, psp_seg: u16, cs: u16, 
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
-pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], parent_env_data: Option<&[u8]>, parent_cwd: &[u8]) {
+pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], cmdtail: &[u8], parent_env_data: Option<&[u8]>, parent_cwd: &[u8]) {
     use crate::kernel::startup;
 
     startup::arch_user_clean();
@@ -457,6 +457,7 @@ pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], pa
     } else {
         dos::load_com(dos::heap_start(), &parent, data, dos_name)
     };
+    loaded.program.set_cmdline(cmdtail);
 
     let psp_seg = loaded.program.psp_seg();
     let end_seg = loaded.end_seg;

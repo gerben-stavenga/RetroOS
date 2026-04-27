@@ -102,7 +102,14 @@ pub struct AcState {
 }
 
 impl AcState {
-    const fn new() -> Self { Self { index: 0, pending_data: false } }
+    // PAS=1 (bit 5 of index) matches BIOS-default boot state where the
+    // display is enabled. The tracker is needed because the AC flip-flop
+    // can't be read from hardware. A `0` default is wrong: programs that
+    // never write AC (any program that sticks to text mode and DOS I/O)
+    // would have save_from_hardware write index=0 back to 0x3C0,
+    // clearing PAS and blanking the display. Default to `0x20` so the
+    // tracker matches HW from the moment the kernel boots.
+    const fn new() -> Self { Self { index: 0x20, pending_data: false } }
 }
 
 /// Global AC state, tracks real hardware across all processes.

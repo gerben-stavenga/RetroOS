@@ -296,6 +296,10 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) -> bool {
         // Force IF=1 for real interrupt delivery
         full.regs.frame.rflags |= 0x200;
     }
+    crate::dbg_println!("[traps exit] rflags={:08X} vm={} cs={:04X} ds={:04X}",
+        full.regs.frame.rflags as u32,
+        (full.regs.frame.rflags & (1 << 17)) != 0,
+        full.regs.frame.cs, full.regs.ds);
     if is_vm86(&full.regs) {
         full.vm86_es = full.regs.es as u32;
         full.vm86_ds = full.regs.ds as u32;

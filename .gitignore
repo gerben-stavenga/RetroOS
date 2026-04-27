@@ -20,3 +20,32 @@ rust-project.json
 
 # Proprietary binaries (not for public distribution)
 apps-proprietary/
+
+# FreeDOS install media + persistent HDD (huge binaries; user-local)
+freedos/*.iso
+freedos/*.ISO
+freedos/*.img
+freedos/*.IMG
+freedos/.installed
+.freedos-cache/
+
+# Loose images / debug artifacts at repo root
+freedos_apps.img
+freedos_proprietary.img
+image_ext4_test.bin
+*.log
+tmp/
+traces/
+
+# Claude Code session state
+.claude/
+
+# Bazel-built kernel lockfile (regenerated)
+kernel/Cargo.lock
+
+# Stray DOS build artifacts at repo root (DOSBox/in-OS COMMAND build outputs)
+/COMMAND.COM
+/COMMAND.OBJ
+/CWSDPMI.MAP
+/CWSLNK.RSP
+/turboc.$ln

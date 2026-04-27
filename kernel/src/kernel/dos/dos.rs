@@ -72,6 +72,8 @@ pub(crate) fn dispatch_kernel_syscall(
         0x08 => thread::KernelAction::Done, // timer — handled via VM86 IRQ reflect path
         0x13 => int_13h(regs),
         0x20 => {
+            dos_trace!("INT 20 exit CS:IP={:04X}:{:04X}",
+                regs.code_seg(), regs.ip32() as u16);
             if let Some(parent) = dos.exec_parent.take() {
                 dos.last_child_exit_status = 0x0000;
                 return exec_return(dos, regs, parent);
@@ -190,6 +192,8 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 /// On success: AX=0, CF=0. On error: AX=errno (unsigned), CF=1.
 pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
+    dos_trace!("D31 SYNTH AH={:02X} CS:IP={:04X}:{:04X}",
+        ah, regs.code_seg(), regs.ip32() as u16);
     match ah {
         // AH=00h — SYNTH_VGA_TAKE: adopt target thread's screen.
         // Input:  BX = target pid
@@ -210,16 +214,13 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
             if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
             thread::KernelAction::Done
         }
-        // AH=01h — SYNTH_FORK_EXEC_WAIT: fork+exec program and wait for it.
+        // AH=01h — SYNTH_FORK_EXEC: fork+exec program. Non-blocking.
         // Reads the caller's own PSP cmdline at DS:0080h (byte-count + text),
         // strips leading whitespace and an optional "/C", takes the first
         // whitespace-delimited token as the program name.
-        // Output on success (CF=0):
-        //          BX = child pid (valid in both exit and decoupled cases)
-        //          AX = 0 on normal exit (exit code via INT 21h/4Dh)
-        //          AX = 1 on decoupled (F11 broke wait)
-        // Output on error (CF=1):
-        //          AX = errno
+        // Output on success (CF=0): AX=0, BX = child pid.
+        // Output on error   (CF=1): AX = errno.
+        // Caller polls AH=04 (SYNTH_WAITPID) to wait/probe for child exit.
         0x01 => {
             let psp = linear(dos, regs, regs.ds as u16, 0);
             let tail_len = unsafe { *((psp + 0x80) as *const u8) } as usize;
@@ -246,9 +247,55 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
                 regs.set_flag32(1);
                 return thread::KernelAction::Done;
             }
+            // Skip whitespace after the program name; the rest is the
+            // arg string we forward to the child's PSP[0x80].
+            while i < tail_len && matches!(read(i), b' ' | b'\t') { i += 1; }
+            let mut tail = [0u8; 128];
+            let mut tlen = 0;
+            while i < tail_len && tlen < 127 {
+                let c = read(i);
+                if matches!(c, b'\r' | 0) { break; }
+                tail[tlen] = c;
+                tlen += 1;
+                i += 1;
+            }
+            // Trim trailing whitespace.
+            while tlen > 0 && matches!(tail[tlen - 1], b' ' | b'\t') { tlen -= 1; }
             // If the name is a .BAT, expand to its first executable command.
             let flen = expand_bat(dos, &mut filename, flen, kt);
-            fork_exec(dos, &filename[..flen], kt)
+            fork_exec(dos, &filename[..flen], &tail[..tlen], kt)
+        }
+        // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
+        // BX = child pid (from a prior AH=01).
+        // Output:
+        //   CF=0, AX=0, BX=child_pid: child has exited; status reaped into
+        //                             last_child_exit_status (read via 4Dh).
+        //   CF=0, AX=1: child still running, caller should retry / do work.
+        //   CF=1, AX=errno: bad pid (-ECHILD, EAGAIN-but-no-children, etc).
+        //
+        // The focused thread is always running (event loop), so polling here
+        // is just a status query — no kernel-side blocking, no spurious-wake
+        // plumbing. command.com loops AH=04 + INT 21h AH=06 (kbd poll) and
+        // owns the policy for what to do on user input.
+        0x04 => {
+            let pid = regs.rbx as i16 as i32;
+            let (tid, _code) = thread::waitpid(kt.tid as usize, pid);
+            if tid >= 0 {
+                // Child exited. last_child_exit_status was already set by
+                // exit_thread with the proper termination-type encoding
+                // (e.g., 0x0300|AL for TSR, AL for normal exit).
+                regs.rax = regs.rax & !0xFFFF;                         // AX=0 exited
+                regs.rbx = (regs.rbx & !0xFFFF) | (tid as u16) as u64; // BX=child_pid
+                regs.clear_flag32(1);
+            } else if tid == -11 {
+                // EAGAIN: children alive, none exited.
+                regs.rax = (regs.rax & !0xFFFF) | 1; // AX=1 still running
+                regs.clear_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | (-tid) as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
         }
         // AH=02h — TRACE_ON: enable runtime DOS/DPMI trace gate.
         // AH=03h — TRACE_OFF: disable it.
@@ -323,8 +370,13 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
 /// DOS character output — writes via VGA putchar and syncs the BDA cursor
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
+const HEX: &[u8] = b"0123456789ABCDEF";
+
 fn dos_putchar(c: u8) {
     use crate::arch::outb;
+    // Mirror to QEMU debugcon (port 0xE9) so DOS console output (TCC errors,
+    // etc.) shows up in out.log alongside trace events.
+    outb(0xE9, c);
     unsafe {
         let col = core::ptr::read_volatile(0x450 as *const u8) as usize;
         let row = core::ptr::read_volatile(0x451 as *const u8) as usize;
@@ -560,6 +612,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 i += 1;
             }
             let err = dos.dfs.chdir(&path[..i]);
+            dos_trace!("D21 3B chdir({:?}) -> err={}",
+                core::str::from_utf8(&path[..i]).unwrap_or("?"), err);
             if err != 0 {
                 regs.set_flag32(1);
                 regs.rax = (regs.rax & !0xFFFF) | err as u64;
@@ -613,6 +667,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
             let handle = regs.rbx as u16;
+            let size = if handle < 20 { crate::kernel::vfs::file_size(handle as i32, &kt.fds) } else { 0 };
+            dos_trace!("D21 3E close h={} size=0x{:X}", handle, size);
             if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
                 crate::kernel::vfs::close(handle as i32, &mut kt.fds);
                 sft_clear(handle);
@@ -715,6 +771,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=0x4C: Terminate with return code (AL)
         0x4C => {
+            dos_trace!("D21 4C exit AL={:02X} CS:IP={:04X}:{:04X}",
+                regs.rax as u8, regs.code_seg(), regs.ip32() as u16);
             // If we're in an EXEC'd child, return to parent
             if let Some(parent) = dos.exec_parent.take() {
                 // Termination type 00h (normal) | return code in AL.
@@ -854,10 +912,21 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 addr += 1;
                 i += 1;
             }
+            let raw_name_str = core::str::from_utf8(&name[..i]).unwrap_or("?");
+            dos_trace!("D21 3C raw=\"{}\" cwd=\"{}\"", raw_name_str,
+                core::str::from_utf8(dos.dfs.get_cwd()).unwrap_or("?"));
             let fd = match dfs_create_path(dos, &name[..i]) {
-                Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
-                Err(e) => -e,
+                Ok((path, len)) => {
+                    dos_trace!("D21 3C create \"{}\"",
+                        core::str::from_utf8(&path[..len]).unwrap_or("?"));
+                    crate::kernel::vfs::create(&path[..len], &mut kt.fds)
+                }
+                Err(e) => {
+                    dos_trace!("D21 3C resolve-err {}", e);
+                    -e
+                }
             };
+            dos_trace!("D21 3C -> fd={}", fd);
             if fd >= 0 {
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
@@ -885,6 +954,19 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 let data = unsafe { core::slice::from_raw_parts(addr as *const u8, count as usize) };
                 let n = crate::kernel::vfs::write(handle as i32, data, &kt.fds);
+                dos_trace!("D21 40 write h={} req=0x{:X} -> {}", handle, count, n);
+                if handle != 1 && handle != 2 {
+                    let dump = data.len().min(512);
+                    let mut hex = [0u8; 512 * 3];
+                    let mut p = 0;
+                    for &b in &data[..dump] {
+                        hex[p] = HEX[(b >> 4) as usize]; p += 1;
+                        hex[p] = HEX[(b & 0xF) as usize]; p += 1;
+                        hex[p] = b' '; p += 1;
+                    }
+                    dos_trace!("    hex=[{}]",
+                        core::str::from_utf8(&hex[..p]).unwrap_or(""));
+                }
                 regs.rax = (regs.rax & !0xFFFF) | if n >= 0 { n as u64 } else { count as u64 };
                 regs.clear_flag32(1);
             }
@@ -1392,7 +1474,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     // Shift the program name to the start of the buffer.
     let plen = end - start;
     cmd.copy_within(start..end, 0);
-    fork_exec(dos, &cmd[..plen], kt)
+    fork_exec(dos, &cmd[..plen], b"", kt)
 }
 
 // ============================================================================
@@ -1540,7 +1622,7 @@ fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize,
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], _kt: &mut thread::KernelThread) -> thread::KernelAction {
+fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], _kt: &mut thread::KernelThread) -> thread::KernelAction {
     // Resolve raw DOS name → VFS path via DFS.
     let mut path = [0u8; 164];
     let path_len = match dfs_open_existing(dos, prog_name) {
@@ -1560,13 +1642,20 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], _kt: &mut thread::Ker
     }
 
     fn on_success(regs: &mut Regs, child_tid: i32) {
+        regs.rax = regs.rax & !0xFFFF;                            // AX=0 success
         regs.rbx = (regs.rbx & !0xFFFF) | ((child_tid as u16) as u64);
         regs.clear_flag32(1);
     }
 
+    let mut cmdtail_buf = [0u8; 128];
+    let cmdtail_len = cmdtail.len().min(127);
+    cmdtail_buf[..cmdtail_len].copy_from_slice(&cmdtail[..cmdtail_len]);
+
     thread::KernelAction::ForkExec {
         path,
         path_len,
+        cmdtail: cmdtail_buf,
+        cmdtail_len,
         on_error,
         on_success,
     }
@@ -1635,12 +1724,14 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
 
     // --- DOS program: in-process exec (shared address space) ---
     let fd = dos_open_program(kt, dos, prog_name);
+    crate::dbg_println!("  exec_program: open fd={}", fd);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
         regs.set_flag32(1);
         return thread::KernelAction::Done;
     }
     let size = crate::kernel::vfs::seek(fd, 0, 2, &kt.fds);
+    crate::dbg_println!("  exec_program: size={}", size);
     if size <= 0 {
         crate::kernel::vfs::close(fd, &mut kt.fds);
         regs.rax = (regs.rax & !0xFFFF) | 2;
@@ -1649,14 +1740,16 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     }
     crate::kernel::vfs::seek(fd, 0, 0, &kt.fds);
     let mut buf = alloc::vec![0u8; size as usize];
-    crate::kernel::vfs::read_raw(fd, &mut buf, &kt.fds);
+    crate::dbg_println!("  exec_program: alloc ok len={}", buf.len());
+    let n = crate::kernel::vfs::read_raw(fd, &mut buf, &kt.fds);
+    crate::dbg_println!("  exec_program: read n={}", n);
     crate::kernel::vfs::close(fd, &mut kt.fds);
 
     // ELF binaries need a separate address space — route through fork_exec.
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
     crate::dbg_println!("  exec_program: {:?} size={} elf={}", core::str::from_utf8(prog_name), size, is_elf);
     if is_elf {
-        return fork_exec(dos, prog_name, kt);
+        return fork_exec(dos, prog_name, b"", kt);
     }
 
     let is_exe = is_mz_exe(&buf);
@@ -2346,7 +2439,16 @@ fn setup_lol_sft() {
     // PSP[0x16] upward.
     lm.sys = unsafe { core::mem::zeroed() };
     let mut sys_env_off = 0;
-    for src in [&b"COMSPEC=C:\\COMMAND.COM\0"[..], &b"PATH=C:\\\0"[..]] {
+    for src in [
+        &b"COMSPEC=C:\\COMMAND.COM\0"[..],
+        &b"PATH=C:\\;C:\\TC\0"[..],
+        // TC 2.01 (TCC) and BC++ 3.1 (BCC/TASM/TLINK) both look up headers
+        // and libs via INCLUDE / LIB env. Both toolchains share these
+        // defaults; per-tool config files in their BIN dir take precedence
+        // when present.
+        &b"INCLUDE=C:\\TC\\INCLUDE\0"[..],
+        &b"LIB=C:\\TC\\LIB\0"[..],
+    ] {
         lm.sys.env[sys_env_off..sys_env_off + src.len()].copy_from_slice(src);
         sys_env_off += src.len();
     }

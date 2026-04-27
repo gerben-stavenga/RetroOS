@@ -1,0 +1,16 @@
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+
+# All files under this tree are auto-included in the games tar with their
+# paths uppercased and prefixed with "GAMES/" (e.g. doom/DOOM.EXE → GAMES/DOOM/
+# DOOM.EXE). Drop a game's files into a subdirectory and they ship on next
+# build — no per-file wiring.
+_SRCS = glob(
+    ["**/*"],
+    exclude = ["BUILD.bazel"],
+)
+
+pkg_tar(
+    name = "tar",
+    files = {":" + s: "GAMES/" + s.upper() for s in _SRCS},
+    visibility = ["//visibility:public"],
+)

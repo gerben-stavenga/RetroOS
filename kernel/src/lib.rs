@@ -341,18 +341,25 @@ impl core::fmt::Debug for Regs {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     arch::cli();
+    // Mirror to both VGA (println) and debugcon (dbg_println) so panic
+    // shows up in out.log too, not just on the QEMU display.
     println!();
     println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
+    dbg_println!();
+    dbg_println!("!!! KERNEL PANIC !!!");
 
     if let Some(location) = info.location() {
         println!("at {}:{}", location.file(), location.line());
+        dbg_println!("at {}:{}", location.file(), location.line());
     } else {
         println!("at <unknown location>");
+        dbg_println!("at <unknown location>");
     }
 
-    // PanicMessage implements Display
     println!("  {}", info.message());
+    dbg_println!("  {}", info.message());
     println!();
+    dbg_println!();
 
     kernel::stacktrace::stack_trace();
 

@@ -993,9 +993,13 @@ fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u1
 pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
-    dos_trace!("[DPMI] VECSTUB vec={:#04x} SS:ESP={:04x}:{:#x} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} DX={:04X} DI={:04X}",
-        vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
-        regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
+    // HW IRQ vectors (timer 0x08, keyboard 0x09, etc.) fire on every tick —
+    // log only the soft-INT reflections (vec >= 0x10) by default.
+    if vector >= 0x10 {
+        dos_trace!("[DPMI] VECSTUB vec={:#04x} SS:ESP={:04x}:{:#x} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} DX={:04X} DI={:04X}",
+            vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
+            regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
+    }
 
     // The frame width matches what `deliver_pm_irq`/`deliver_pm_int` pushed,
     // which follows the client's bitness per DPMI 0.9 §10.6 (32-bit clients

@@ -16,6 +16,8 @@ Commands:
   0x03 CLOSE:   handle(u32)                 → status(i32)
   0x04 STAT:    path_len(u16) path          → status(i32) size(u32) is_dir(u8)
   0x05 READDIR: path_len(u16) path index(u32) → status(i32) name_len(u8) name size(u32) is_dir(u8)
+  0x06 CREATE:  path_len(u16) path          → status(i32) handle(u32)
+  0x07 WRITE:   handle(u32) offset(u32) len(u32) data → status(i32) written(u32)
 """
 
 import os
@@ -28,6 +30,8 @@ CMD_READ = 0x02
 CMD_CLOSE = 0x03
 CMD_STAT = 0x04
 CMD_READDIR = 0x05
+CMD_CREATE = 0x06
+CMD_WRITE = 0x07
 
 class HostFs:
     def __init__(self, root_dir):
@@ -35,16 +39,18 @@ class HostFs:
         self.handles = {}  # handle -> open file object
         self.next_handle = 1
 
-    def _resolve(self, path):
-        """Resolve guest path to host path, case-insensitive, preventing escapes."""
+    def _resolve(self, path, allow_missing_last=False):
+        """Resolve guest path to host path, case-insensitive, preventing escapes.
+        If allow_missing_last is True, the final path component may not yet
+        exist (used for CREATE)."""
         p = path.replace(b'\\', b'/').lstrip(b'/').decode('ascii', errors='replace')
-        # Walk each component case-insensitively
         cur = self.root
         if p and p != '.':
-            for component in p.split('/'):
+            parts = p.split('/')
+            for i, component in enumerate(parts):
                 if not component:
                     continue
-                # Try exact match first, then case-insensitive
+                is_last = i == len(parts) - 1
                 exact = os.path.join(cur, component)
                 if os.path.exists(exact):
                     cur = exact
@@ -59,6 +65,9 @@ class HostFs:
                 except OSError:
                     return None
                 if not found:
+                    if is_last and allow_missing_last:
+                        cur = exact
+                        break
                     return None
         full = os.path.normpath(cur)
         if not full.startswith(self.root):
@@ -148,8 +157,43 @@ class HostFs:
         conn.sendall(name)
         conn.sendall(struct.pack('<IB', size & 0xFFFFFFFF, is_dir))
 
+    def handle_create(self, conn):
+        path_len = struct.unpack('<H', recvall(conn, 2))[0]
+        path = recvall(conn, path_len)
+        full = self._resolve(path, allow_missing_last=True)
+        print(f" {path!r} -> {full}", file=sys.stderr)
+        if full is None:
+            conn.sendall(struct.pack('<iI', -2, 0))
+            return
+        try:
+            f = open(full, 'w+b')
+        except OSError:
+            conn.sendall(struct.pack('<iI', -5, 0))
+            return
+        h = self.next_handle
+        self.next_handle += 1
+        self.handles[h] = f
+        conn.sendall(struct.pack('<iI', 0, h))
+
+    def handle_write(self, conn):
+        handle, offset, length = struct.unpack('<III', recvall(conn, 12))
+        data = recvall(conn, length) if length > 0 else b''
+        f = self.handles.get(handle)
+        if f is None:
+            conn.sendall(struct.pack('<iI', -9, 0))
+            return
+        try:
+            f.seek(offset)
+            f.write(data)
+            f.flush()
+        except OSError:
+            conn.sendall(struct.pack('<iI', -5, 0))
+            return
+        conn.sendall(struct.pack('<iI', 0, len(data)))
+
     def dispatch(self, conn):
-        CMD_NAMES = {1: 'OPEN', 2: 'READ', 3: 'CLOSE', 4: 'STAT', 5: 'READDIR'}
+        CMD_NAMES = {1: 'OPEN', 2: 'READ', 3: 'CLOSE', 4: 'STAT',
+                     5: 'READDIR', 6: 'CREATE', 7: 'WRITE'}
         while True:
             cmd_byte = conn.recv(1)
             if not cmd_byte:
@@ -166,6 +210,10 @@ class HostFs:
                 self.handle_stat(conn)
             elif cmd == CMD_READDIR:
                 self.handle_readdir(conn)
+            elif cmd == CMD_CREATE:
+                self.handle_create(conn)
+            elif cmd == CMD_WRITE:
+                self.handle_write(conn)
             else:
                 print(f"\nUnknown command: 0x{cmd:02x}", file=sys.stderr)
                 break

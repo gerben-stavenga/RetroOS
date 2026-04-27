@@ -80,28 +80,65 @@ pub fn startup() -> ! {
     let console_pipe = crate::kernel::kpipe::alloc().expect("Failed to allocate console pipe");
     crate::kernel::thread::set_console_pipe(console_pipe);
 
-    // Host may select a program via QEMU `-fw_cfg name=opt/cmdline,string=PATH`.
-    // If absent, run DN.COM in a loop (default interactive shell).
-    let mut cmdline_buf = [0u8; 256];
+    // Host may select a program via QEMU `-fw_cfg name=opt/cmdline,string=...`.
+    // Multiple commands separated by `;` are run in sequence; the machine
+    // shuts down when the last one exits. If absent, run DN.COM in a loop
+    // (default interactive shell).
+    let mut cmdline_buf = [0u8; 4096];
     if let Some(raw) = fw_cfg_read(b"opt/cmdline", &mut cmdline_buf) {
-        let cmdline = trim_ascii(raw);
-        let mut path_buf = [0u8; 260];
-        let path: &[u8] = if has_ext4 {
-            let n = 4 + cmdline.len();
-            path_buf[..4].copy_from_slice(b"tar/");
-            path_buf[4..n].copy_from_slice(cmdline);
-            &path_buf[..n]
-        } else {
-            // cmdline borrows cmdline_buf; copy into path_buf so lifetimes line up
-            path_buf[..cmdline.len()].copy_from_slice(cmdline);
-            &path_buf[..cmdline.len()]
-        };
-        let cwd_end = path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
-        let cwd = &path[..cwd_end];
-        println!("Starting {}...", core::str::from_utf8(path).unwrap_or("?"));
-        run_dos_program(path, b"", cwd);
-        println!("Program exited.");
-        loop { core::hint::spin_loop(); }
+        // CWD: explicit `opt/cwd` fw_cfg key wins; else fall back to each
+        // program's own directory.
+        let mut cwd_buf = [0u8; 256];
+        let explicit_cwd = fw_cfg_read(b"opt/cwd", &mut cwd_buf).map(trim_ascii);
+
+        for one in raw.split(|&b| b == b';') {
+            let cmdline = trim_ascii(one);
+            if cmdline.is_empty() { continue; }
+            // First token = program path, rest = cmdline tail (PSP:0080h).
+            let split = cmdline.iter().position(|&b| b == b' ').unwrap_or(cmdline.len());
+            let prog = &cmdline[..split];
+            let tail_raw = if split < cmdline.len() { &cmdline[split + 1..] } else { &[][..] };
+            let tail = trim_ascii(tail_raw);
+
+            let mut path_buf = [0u8; 260];
+            let path: &[u8] = if has_ext4 {
+                let n = 4 + prog.len();
+                path_buf[..4].copy_from_slice(b"tar/");
+                path_buf[4..n].copy_from_slice(prog);
+                &path_buf[..n]
+            } else {
+                path_buf[..prog.len()].copy_from_slice(prog);
+                &path_buf[..prog.len()]
+            };
+
+            let cwd: &[u8] = match explicit_cwd {
+                Some(c) => c,
+                None => {
+                    let cwd_end = path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
+                    &path_buf[..cwd_end]
+                }
+            };
+            println!("Starting {} {} (cwd={})...",
+                core::str::from_utf8(path).unwrap_or("?"),
+                core::str::from_utf8(tail).unwrap_or(""),
+                core::str::from_utf8(cwd).unwrap_or("?"));
+            run_dos_program(path, tail, cwd);
+        }
+        println!("All commands done — shutting down.");
+        crate::arch::shutdown();
+    }
+
+    // Self-build: if Turbo C is on the image, compile SRC\COMMAND.C →
+    // root COMMAND.COM via TC at boot. The output lands in the VFS RAM
+    // overlay, shadowing the BC++-built COMMAND.COM that ships in the
+    // tar. DN's EXEC of "COMMAND.COM /C ..." then picks up the freshly-
+    // built one. With TC absent (empty apps/tc/), the tar's pre-built
+    // COMMAND.COM is what runs.
+    let tcc_path: &[u8] = if has_ext4 { b"tar/TC/TCC.EXE" } else { b"TC/TCC.EXE" };
+    if crate::kernel::exec::load_file_resolved(tcc_path).is_ok() {
+        println!("Building COMMAND.COM from SRC\\COMMAND.C via TC...");
+        run_dos_program(tcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
+        println!("Build done.");
     }
 
     let dn_path: &[u8] = if has_ext4 { b"tar/DN/DN.COM" } else { b"DN/DN.COM" };
@@ -280,8 +317,8 @@ fn event_loop(first_tid: usize) {
             thread::KernelAction::Yield => thread::yield_thread(tid, regs),
             thread::KernelAction::Exit(code) => Some(thread::exit_thread(tid, code)),
             thread::KernelAction::Switch(next) => Some(next),
-            thread::KernelAction::ForkExec { path, path_len, on_error, on_success } => {
-                handle_fork_exec(tid, regs, &path[..path_len], on_error, on_success)
+            thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, on_error, on_success } => {
+                handle_fork_exec(tid, regs, &path[..path_len], &cmdtail[..cmdtail_len], on_error, on_success)
             }
             thread::KernelAction::Fork(_) => {
                 // TODO: implement Fork in event loop
@@ -293,12 +330,10 @@ fn event_loop(first_tid: usize) {
             }
         };
 
-        // F11 hotkey: force round-robin thread cycle (only when action didn't already switch).
-        // F11 is Ctrl-Z: the parent's waitpid returns early. If the current thread's
-        // parent is blocked-in-waitpid, cancel the wait — unblock parent so it becomes
-        // an independent peer. Child keeps running, VGA becomes fully independent.
+        // F11: round-robin thread cycle. Pure focus shift — does not wake any
+        // blocked thread or break any waitpid. The shell (command.com) decides
+        // backgrounding semantics by polling SYNTH_WAITPID + reading kbd.
         let new_tid = if new_tid.is_none() && thread::take_switch_request() {
-            thread::cancel_parent_wait(tid);
             thread::cycle_next(tid)
         } else {
             new_tid
@@ -369,6 +404,7 @@ fn handle_fork_exec(
     parent_tid: usize,
     regs: &mut crate::Regs,
     path: &[u8],
+    cmdtail: &[u8],
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
 ) -> Option<usize> {
@@ -442,7 +478,7 @@ fn handle_fork_exec(
     let args = alloc::vec![prog_arg];
     let env_slice = parent_env_snapshot.as_deref();
     let parent_cwd_slice = &parent_cwd_buf[..parent_cwd_len];
-    if let Err(_) = exec::init_thread(child_tid, &buf, path, &args, env_slice, parent_cwd_slice) {
+    if let Err(_) = exec::init_thread(child_tid, &buf, path, &args, cmdtail, env_slice, parent_cwd_slice) {
         let child = thread::get_thread(child_tid).unwrap();
         arch_switch_to(&mut child.kernel.cpu_state, &mut child.kernel.root, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(child_tid, 1);
@@ -489,9 +525,10 @@ fn handle_fork_exec(
         }
     }
 
-    // Block parent, switch to child
-    crate::dbg_println!("  child tid={}, blocking parent tid={}", child_tid, parent_tid);
-    thread::block_thread(parent_tid);
+    // Switch focus to child. Parent stays Ready; it'll poll SYNTH_WAITPID
+    // when focus returns to it. No kernel-side blocking — the focused thread
+    // runs continuously, so polling is just a status query.
+    crate::dbg_println!("  child tid={}, parent tid={} continues without blocking", child_tid, parent_tid);
     on_success(regs, child_tid as i32);
     Some(child_tid)
 }
@@ -528,6 +565,34 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
             regs.flags32() as u16, vif as u8, ticks,
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
         if let Some(d) = dos { dump_virtual_hw(d); }
+        // Dump VGA hardware register state (which one differs vs working
+        // is the first thing to check when buffer paints but screen is
+        // black — most often SEQ[1] bit 5 = screen-off, GC[6] framebuffer
+        // mapping, or AC mode register text-vs-graphics).
+        unsafe {
+            use crate::arch::{inb, outb};
+            crate::arch::cli();
+            let _ = inb(0x3DA);
+            let misc = inb(0x3CC);
+            let mut seq = [0u8; 5];
+            for i in 0..5u8 { outb(0x3C4, i); seq[i as usize] = inb(0x3C5); }
+            let mut crtc = [0u8; 25];
+            for i in 0..25u8 { outb(0x3D4, i); crtc[i as usize] = inb(0x3D5); }
+            let mut gc = [0u8; 9];
+            for i in 0..9u8 { outb(0x3CE, i); gc[i as usize] = inb(0x3CF); }
+            let _ = inb(0x3DA);
+            let mut ac = [0u8; 21];
+            for i in 0..21u8 { let _ = inb(0x3DA); outb(0x3C0, i | 0x20); ac[i as usize] = inb(0x3C1); }
+            let _ = inb(0x3DA);
+            outb(0x3C0, 0x20);   // re-enable display by setting PAS
+            crate::arch::sti();
+            crate::dbg_println!("[VGA HW] misc={:02X} seq=[{:02X} {:02X} {:02X} {:02X} {:02X}]",
+                misc, seq[0], seq[1], seq[2], seq[3], seq[4]);
+            crate::dbg_println!("[VGA HW] gc=[{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}]",
+                gc[0], gc[1], gc[2], gc[3], gc[4], gc[5], gc[6], gc[7], gc[8]);
+            crate::dbg_println!("[VGA HW] ac[10..14]={:02X} {:02X} {:02X} {:02X}  crtc[0C..0F]={:02X} {:02X} {:02X} {:02X}",
+                ac[0x10], ac[0x11], ac[0x12], ac[0x13], crtc[0x0C], crtc[0x0D], crtc[0x0E], crtc[0x0F]);
+        }
         // Dump VGA text buffer (80x25, char+attr interleaved at 0xB8000)
         let vga = unsafe { core::slice::from_raw_parts(0xB8000 as *const u8, 4000) };
         for row in 0..25 {

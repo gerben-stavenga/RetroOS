@@ -28,7 +28,7 @@ pub use traps::arch_call;
 pub(crate) use traps::REGS;
 
 // Panic handler needs these
-pub use x86::{cli, sti, hlt};
+pub use x86::{cli, sti, hlt, shutdown};
 
 // TODO: migrate to arch calls
 pub use x86::{inb, outb, inw, outw};

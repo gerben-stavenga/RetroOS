@@ -8,7 +8,10 @@ set -o pipefail
 ARCH="${1:-386}"
 shift 2>/dev/null || true
 
-IMG="proprietary"
+# Default to the open-source image so fresh checkouts work out of the box.
+# Pass `-i proprietary` to use the full image with proprietary binaries
+# (requires apps-proprietary/ to be populated).
+IMG="image"
 START_BIN=""
 HOSTFS_DIR="$HOME"
 
@@ -83,26 +86,54 @@ if [ "$IMG" = "grub" ]; then
         -no-reboot \
         "$@"
 elif [ "$IMG" = "freedos" ]; then
-    FDOS_DIR="$SCRIPT_DIR/apps/freedos"
-    APPS_IMG="$SCRIPT_DIR/bazel-bin/freedos_apps.img"
-    # Find FreeDOS boot media (ISO or IMG)
-    FDOS_ISO=""; FDOS_HDD=""
-    for f in "$FDOS_DIR"/FD*.iso "$FDOS_DIR"/FD*.ISO; do
-        [ -f "$f" ] && FDOS_ISO="$f" && break
-    done
-    for f in "$FDOS_DIR"/FD*.img "$FDOS_DIR"/FD*.IMG; do
-        [ -f "$f" ] && FDOS_HDD="$f" && break
-    done
+    # Look for FreeDOS install media + HDD + apps disk in a few candidate
+    # locations. Override any of them with FDOS_DIR / FDOS_ISO / FDOS_HDD /
+    # APPS_IMG env vars.
+    FDOS_DIR="${FDOS_DIR:-$SCRIPT_DIR/freedos}"
+
+    # FreeDOS install ISO/IMG (boot media). Search FDOS_DIR, then project
+    # root, then ~/Downloads.
+    if [ -z "${FDOS_ISO:-}" ]; then
+        for d in "$FDOS_DIR" "$SCRIPT_DIR" "$HOME/Downloads"; do
+            for f in "$d"/FD*.iso "$d"/FD*.ISO; do
+                [ -f "$f" ] && FDOS_ISO="$f" && break 2
+            done
+        done
+    fi
+    FDOS_HDD="${FDOS_HDD:-}"
+    if [ -z "$FDOS_HDD" ]; then
+        for d in "$FDOS_DIR" "$SCRIPT_DIR" "$HOME/Downloads"; do
+            for f in "$d"/FD*.img "$d"/FD*.IMG; do
+                [ -f "$f" ] && FDOS_HDD="$f" && break 2
+            done
+        done
+    fi
     if [ -z "$FDOS_ISO" ] && [ -z "$FDOS_HDD" ]; then
-        echo "No FreeDOS image found in $FDOS_DIR/"
-        echo "Download from https://www.freedos.org/download/ and place .iso or .img there."
+        echo "No FreeDOS install media found."
+        echo "Looked in: $FDOS_DIR/, $SCRIPT_DIR/, $HOME/Downloads/"
+        echo "Download from https://www.freedos.org/download/ and place .iso or .img there,"
+        echo "or set FDOS_ISO / FDOS_HDD env var to its full path."
         exit 1
     fi
-    if [ ! -f "$APPS_IMG" ]; then
-        echo "Apps disk not found. Bazel should have built it."
+
+    # Apps disk: bazel-built first, then make_freedos_image.sh output at root.
+    if [ -z "${APPS_IMG:-}" ]; then
+        for cand in \
+            "$SCRIPT_DIR/bazel-bin/freedos_apps.img" \
+            "$SCRIPT_DIR/freedos_apps.img" \
+            "$SCRIPT_DIR/freedos_proprietary.img"; do
+            [ -f "$cand" ] && APPS_IMG="$cand" && break
+        done
+    fi
+    if [ -z "${APPS_IMG:-}" ] || [ ! -f "$APPS_IMG" ]; then
+        echo "Apps disk not found. Build with 'bazelisk build //:freedos_apps'"
+        echo "or run ./make_freedos_image.sh, or set APPS_IMG=<path>."
         exit 1
     fi
-    HDD_IMG="$FDOS_DIR/freedos_hdd.img"
+    echo "Using apps disk: $APPS_IMG"
+
+    # Persistent FreeDOS HDD lives next to the install media by default.
+    HDD_IMG="${HDD_IMG:-$FDOS_DIR/freedos_hdd.img}"
     FDOS_ARGS=""
     APPS_DRIVE=""
     FDOS_INSTALLED="$FDOS_DIR/.installed"
@@ -111,6 +142,10 @@ elif [ "$IMG" = "freedos" ]; then
         echo "Creating 256MB FreeDOS hard disk..."
         qemu-img create -f raw "$HDD_IMG" 256M
         rm -f "$FDOS_INSTALLED"
+    elif [ ! -f "$FDOS_INSTALLED" ]; then
+        # HDD pre-existed (e.g. you copied in a ready-made install). Trust
+        # it and skip the installer.
+        touch "$FDOS_INSTALLED"
     fi
     if [ ! -f "$FDOS_INSTALLED" ]; then
         # Not yet installed: boot from ISO
@@ -145,18 +180,34 @@ elif [ "$IMG" = "freedos" ]; then
         "$@"
 else
     IMAGE="$SCRIPT_DIR/bazel-bin/$IMAGE_FILE"
-    FWCFG_ARGS=""
+    FWCFG_ARGS=()
+    FWCFG_TMPDIR=""
     if [ -n "$START_BIN" ]; then
-        FWCFG_ARGS="-fw_cfg name=opt/cmdline,string=$START_BIN"
+        # Write the cmdline to a tempfile and use fw_cfg's file= form. The
+        # string= form word-splits on commas, which collide with TLINK's
+        # arg separator.
+        FWCFG_TMPDIR=$(mktemp -d -t retroos-fwcfg.XXXXXX)
+        printf '%s' "$START_BIN" > "$FWCFG_TMPDIR/cmdline"
+        FWCFG_ARGS+=(-fw_cfg "name=opt/cmdline,file=$FWCFG_TMPDIR/cmdline")
+        # When -h is also given, default cwd to host/ so relative paths in
+        # the program's args resolve against the host workspace.
+        if [ -n "$HOSTFS_DIR" ]; then
+            FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=host/")
+        fi
     fi
-    HOSTFS_ARGS=""
+    HOSTFS_ARGS=()
     if [ -n "$HOSTFS_DIR" ]; then
         HOSTFS_SOCK="/tmp/retroos-hostfs.sock"
-        HOSTFS_ARGS="-serial chardev:hostfs -chardev socket,id=hostfs,path=$HOSTFS_SOCK,server=on,wait=off"
+        HOSTFS_ARGS=(
+            -serial chardev:hostfs
+            -chardev "socket,id=hostfs,path=$HOSTFS_SOCK,server=on,wait=off"
+        )
         # Launch hostfs server in background, kill on exit
         "$SCRIPT_DIR/hostfs.py" "$HOSTFS_DIR" "$HOSTFS_SOCK" &
         HOSTFS_PID=$!
-        trap "kill $HOSTFS_PID 2>/dev/null" EXIT
+        trap "kill $HOSTFS_PID 2>/dev/null; [ -n \"$FWCFG_TMPDIR\" ] && rm -rf \"$FWCFG_TMPDIR\"" EXIT
+    elif [ -n "$FWCFG_TMPDIR" ]; then
+        trap "rm -rf $FWCFG_TMPDIR" EXIT
     fi
     exec env -i \
         PATH="/usr/bin:/bin:/usr/local/bin" \
@@ -167,8 +218,8 @@ else
         $CPU \
         -drive "file=$IMAGE,format=raw,snapshot=on" \
         -debugcon stdio \
-        $FWCFG_ARGS \
-        $HOSTFS_ARGS \
+        "${FWCFG_ARGS[@]}" \
+        "${HOSTFS_ARGS[@]}" \
         -no-reboot \
         "$@"
 fi

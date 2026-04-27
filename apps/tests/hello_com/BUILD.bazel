@@ -1,0 +1,12 @@
+genrule(
+    name = "hello_com",
+    srcs = ["hello.asm"],
+    outs = ["HELLO.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
+exports_files(
+    ["TEST.COM", "TEST.BAT"],
+    visibility = ["//visibility:public"],
+)

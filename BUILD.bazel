@@ -2,6 +2,22 @@ load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 
 exports_files(["i686-retro-none.json"])
 
+# Pristine drop-in dirs: contents auto-shipped under the given DOS prefix.
+# Drop files into apps/tc/ or apps/TP70/ and they appear at C:\TC\... or
+# C:\TP70\... in the image on the next build — no per-file wiring.
+_TC_SRCS = glob(["apps/tc/**/*"], allow_empty = True)
+_TP70_SRCS = glob(["apps/TP70/**/*"], allow_empty = True)
+
+pkg_tar(
+    name = "tc_tar",
+    files = {":" + s: "TC/" + s[len("apps/tc/"):].upper() for s in _TC_SRCS},
+)
+
+pkg_tar(
+    name = "tp70_tar",
+    files = {":" + s: "TP70/" + s[len("apps/TP70/"):].upper() for s in _TP70_SRCS},
+)
+
 # Compute MD5 of kernel ELF
 genrule(
     name = "kernel_md5",
@@ -10,35 +26,22 @@ genrule(
     cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
 )
 
-# Base files (open source)
+# Base files (open source). Layout:
+#   - root: bootloader, kernel, COMMAND.COM, CWSDPMI.EXE, shell.elf, DN/...
+#   - GAMES/...: games
+#   - TESTS/...: test programs and example .COM/.ELF binaries
 _BASE_FILES = {
     "//boot:bootloader_bin": "A",
     ":kernel_md5": "kernel.elf.md5",
     "//kernel:kernel_elf": "kernel.elf",
-    "//apps/printmsg:printmsg_elf": "printmsg.elf",
-    "//apps/stress:stress_elf": "stress.elf",
-    "//apps/stress64:stress64_elf": "stress64.elf",
     "//apps/shell:shell_elf": "shell.elf",
-    "//apps/hello_com:hello_com": "HELLO.COM",
-    "//apps/gfx_com:gfx_com": "GFX.COM",
-    "//apps/hello_com:command_com": "COMMAND.COM",
-    "//apps/hello_com:TEST.COM": "TEST.COM",
-    "//apps/hello_com:TEST.BAT": "TEST.BAT",
-    "apps/keen4/Keen4e.exe": "KEEN4/KEEN4E.EXE",
-    "apps/keen4/AUDIO.CK4": "KEEN4/AUDIO.CK4",
-    "apps/keen4/CONFIG.CK4": "KEEN4/CONFIG.CK4",
-    "apps/keen4/Egagraph.ck4": "KEEN4/EGAGRAPH.CK4",
-    "apps/keen4/Gamemaps.ck4": "KEEN4/GAMEMAPS.CK4",
-    "apps/keen4/SAVEGAM0.CK4": "KEEN4/SAVEGAM0.CK4",
-    "apps/wolf3d/WOLF3D.EXE": "WOLF3D/WOLF3D.EXE",
-    "apps/wolf3d/AUDIOHED.WL1": "WOLF3D/AUDIOHED.WL1",
-    "apps/wolf3d/AUDIOT.WL1": "WOLF3D/AUDIOT.WL1",
-    "apps/wolf3d/GAMEMAPS.WL1": "WOLF3D/GAMEMAPS.WL1",
-    "apps/wolf3d/MAPHEAD.WL1": "WOLF3D/MAPHEAD.WL1",
-    "apps/wolf3d/VGADICT.WL1": "WOLF3D/VGADICT.WL1",
-    "apps/wolf3d/VGAGRAPH.WL1": "WOLF3D/VGAGRAPH.WL1",
-    "apps/wolf3d/VGAHEAD.WL1": "WOLF3D/VGAHEAD.WL1",
-    "apps/wolf3d/VSWAP.WL1": "WOLF3D/VSWAP.WL1",
+    # CWSDPMI.EXE deliberately omitted from the RetroOS image — RetroOS
+    # provides DPMI natively. The build artifact ships in the FreeDOS apps
+    # disk only (see make_freedos_image.sh).
+    # COMMAND.COM is built at boot by TC compiling SRC/COMMAND.C —
+    # output lands in the VFS RAM overlay at /COMMAND.COM. No prebuilt
+    # binary in the tar.
+    "//apps/command:command.c":          "SRC/COMMAND.C",
     "apps/dn/DN.COM": "DN/DN.COM",
     "apps/dn/DN.PRG": "DN/DN.PRG",
     "apps/dn/DN.OVR": "DN/DN.OVR",
@@ -53,30 +56,42 @@ _BASE_FILES = {
     "apps/dn/DN.XRN": "DN/DN.XRN",
     "apps/dn/DN.FLG": "DN/DN.FLG",
     "apps/dn/DN.HIS": "DN/DN.HIS",
-    "apps/DOOMS/DOOM.EXE": "DOOMS/DOOM.EXE",
-    "apps/DOOMS/DOOM1.WAD": "DOOMS/DOOM1.WAD",
-    "apps/DOOMS/doomst.exe": "DOOMS/DOOMST.EXE",
-    "apps/quake/QUAKE.EXE": "QUAKE/QUAKE.EXE",
-    "apps/quake/id1/PAK0.PAK": "QUAKE/ID1/PAK0.PAK",
-    "apps/linux_test/hello_linux": "HI.ELF",
-    "apps/hello64_linux/hello64_linux": "HI64.ELF",
-    "//apps/trexec:trexec_com": "TREXEC.COM",
-    "//apps/cwsdoom:cwsdoom_com": "CWSDOOM.COM",
-    "//apps/cwsdpmi:cwsdpmi_exe": "CWSDPMI.EXE",
-    "apps/freedos/AUTOEXEC.BAT": "AUTOEXEC.BAT",
+    # Tests
+    "//apps/tests/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
+    "//apps/tests/stress:stress_elf":       "TESTS/stress.elf",
+    "//apps/tests/stress64:stress64_elf":   "TESTS/stress64.elf",
+    "//apps/tests/hello_com:hello_com":     "TESTS/HELLO.COM",
+    "//apps/tests/gfx_com:gfx_com":         "TESTS/GFX.COM",
+    "//apps/tests/hello_com:TEST.COM":      "TESTS/TEST.COM",
+    "//apps/tests/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
+    "//apps/tests/trexec:trexec_com":       "TESTS/TREXEC.COM",
+    "apps/tests/linux_test/hello_linux":    "TESTS/HI.ELF",
+    "apps/tests/hello64_linux/hello64_linux": "TESTS/HI64.ELF",
 }
 
-# Public image (shareware only)
+# Public image (shareware only). Games auto-globbed from //apps/games.
+# apps/tc and apps/TP70 are empty by default — drop in toolchain files to
+# enable the in-OS self-build of COMMAND.COM at boot, or to ship Turbo Pascal.
 pkg_tar(
     name = "fs_tar",
     files = _BASE_FILES,
+    deps = [
+        "//apps/games:tar",
+        ":tc_tar",
+        ":tp70_tar",
+    ],
 )
 
 # Full image with proprietary binaries (auto-globbed from //apps-proprietary).
 pkg_tar(
     name = "fs_tar_proprietary",
     files = _BASE_FILES,
-    deps = ["//apps-proprietary:tar"],
+    deps = [
+        "//apps/games:tar",
+        ":tc_tar",
+        ":tp70_tar",
+        "//apps-proprietary:tar",
+    ],
 )
 
 # Strip first 512 bytes (TAR header) so bootloader starts at offset 0
@@ -162,7 +177,9 @@ genrule(
         for f in $$(find . -type f | sort); do
             # Skip kernel/bootloader/ELF/linux files
             case "$$f" in
-                ./A|./kernel.elf|./kernel.elf.md5|./printmsg.elf|./stress.elf|./stress64.elf|./shell.elf|./HI|./HI64|./COMMAND.C) continue ;;
+                ./A|./kernel.elf|./kernel.elf.md5|./shell.elf) continue ;;
+                ./TESTS/printmsg.elf|./TESTS/stress.elf|./TESTS/stress64.elf) continue ;;
+                ./TESTS/HI.ELF|./TESTS/HI64.ELF) continue ;;
             esac
             DIR=$$(dirname "$$f" | sed 's|^\\./||')
             if [ "$$DIR" != "." ]; then

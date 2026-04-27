@@ -94,6 +94,8 @@ const CMD_READ: u8 = 0x02;
 const CMD_CLOSE: u8 = 0x03;
 const CMD_STAT: u8 = 0x04;
 const CMD_READDIR: u8 = 0x05;
+const CMD_CREATE: u8 = 0x06;
+const CMD_WRITE: u8 = 0x07;
 
 pub struct HostFs;
 
@@ -172,6 +174,32 @@ impl Filesystem for HostFs {
         let _size = recv_u32();
         let is_dir = recv_u8();
         status == 0 && is_dir != 0
+    }
+
+    fn create(&self, path: &[u8]) -> Option<Vnode> {
+        if !is_ready() { return None; }
+        send_byte(CMD_CREATE);
+        send_u16(path.len() as u16);
+        send_bytes(path);
+
+        let status = recv_i32();
+        let handle = recv_u32();
+        if status < 0 { return None; }
+        Some(Vnode { handle: handle as u64, size: 0 })
+    }
+
+    fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
+        if !is_ready() { return -5; }
+        send_byte(CMD_WRITE);
+        send_u32(handle as u32);
+        send_u32(offset);
+        send_u32(data.len() as u32);
+        send_bytes(data);
+
+        let status = recv_i32();
+        let written = recv_u32();
+        if status < 0 { return status; }
+        written as i32
     }
 }
 

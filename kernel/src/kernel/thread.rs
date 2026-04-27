@@ -16,7 +16,7 @@ pub use crate::kernel::linux::LinuxState;
 pub const MAX_THREADS: usize = 1024;
 
 /// Maximum file descriptors per thread
-pub const MAX_FDS: usize = 16;
+pub const MAX_FDS: usize = 32;
 
 /// What a file descriptor refers to
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,11 +70,16 @@ pub enum KernelAction {
     Fork(fn(&mut crate::Regs, i32)),
     /// Switch to a specific thread (already resolved by caller).
     Switch(usize),
-    /// ForkExec: fork a child, exec the given path, block parent.
-    /// Callbacks set ABI-specific output on parent's regs.
+    /// ForkExec: fork a child, exec the given path.
+    /// `cmdtail` is the raw DOS-style argument string (everything after the
+    /// program name in the parent's PSP cmdline) — written verbatim to the
+    /// child's PSP[0x80] so DOS programs see their args. Empty for callers
+    /// that don't pass args.
     ForkExec {
         path: [u8; 164],
         path_len: usize,
+        cmdtail: [u8; 128],
+        cmdtail_len: usize,
         on_error: fn(&mut crate::Regs, i32),
         on_success: fn(&mut crate::Regs, child_tid: i32),
     },
@@ -405,26 +410,6 @@ pub fn unblock_thread(tid: usize) {
         if tid < MAX_THREADS && THREADS[tid].kernel.state == ThreadState::Blocked {
             THREADS[tid].kernel.state = ThreadState::Ready;
         }
-    }
-}
-
-/// F11 / Ctrl-Z: cancel the parent's waitpid if it was blocked waiting on us.
-/// After this call, parent and child are independent peers.
-/// Signals "decoupled" to parent via AX=1 (synth fork_exec_wait return).
-pub fn cancel_parent_wait(child_tid: usize) {
-    unsafe {
-        let child = &THREADS[child_tid];
-        let parent_tid = child.kernel.parent_tid;
-        if parent_tid < 0 || (parent_tid as usize) >= MAX_THREADS { return; }
-        let parent = &mut THREADS[parent_tid as usize];
-        if parent.kernel.state != ThreadState::Blocked { return; }
-        parent.kernel.state = ThreadState::Ready;
-        if let Personality::Dos(dos) = &mut parent.personality {
-            dos.last_child_exit_status = 0;
-        }
-        // Signal decoupled to parent's synth fork_exec_wait: AX = 1 (status=decoupled).
-        parent.kernel.cpu_state.rax = (parent.kernel.cpu_state.rax & !0xFFFF) | 0x0001;
-        refresh_cpu_hash(parent);
     }
 }
 

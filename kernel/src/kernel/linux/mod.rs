@@ -764,7 +764,7 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
         startup::arch_user_clean();
     }
 
-    if let Err(_) = exec::init_thread(tid, &buffer, path, &args, None, &cwd_snapshot) {
+    if let Err(_) = exec::init_thread(tid, &buffer, path, &args, b"", None, &cwd_snapshot) {
         return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, -ENOEXEC)) };
     }
 

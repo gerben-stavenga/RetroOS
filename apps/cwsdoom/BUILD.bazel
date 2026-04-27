@@ -1,7 +1,0 @@
-genrule(
-    name = "cwsdoom_com",
-    srcs = ["cwsdoom.asm"],
-    outs = ["CWSDOOM.COM"],
-    cmd = "nasm -f bin -o $@ $<",
-    visibility = ["//visibility:public"],
-)

@@ -57,10 +57,24 @@ for d in "$APPS_DIR"/*/; do
     copy_dir "$d" "$dname" "$OUTPUT"
 done
 
+# Overlay freedos-only files (CWSDPMI.EXE for Quake/Doom on plain DOS, etc.)
+FREEDOS_DIR="$SCRIPT_DIR/freedos"
+if [ -d "$FREEDOS_DIR" ]; then
+    for d in "$FREEDOS_DIR"/*/; do
+        [ -d "$d" ] || continue
+        dname=$(basename "$d" | tr '[:lower:]' '[:upper:]')
+        # Skip the FreeDOS-system stuff (FD14LIVE.iso, freedos_hdd.img live
+        # at the FREEDOS_DIR top level, not in a subdir, so they're not hit
+        # here anyway). Subdirs are app overlays.
+        echo "  $dname (freedos-only overlay)"
+        copy_dir "$d" "$dname" "$OUTPUT"
+    done
+fi
+
 echo ""
 echo "Done: $OUTPUT (${IMG_SIZE}MB)"
 echo ""
-echo "To run, place FreeDOS image at apps/freedos/FD13LIVE.img then:"
-echo "  ./run_qemu.sh 386 freedos"
+echo "To run, place FreeDOS image at freedos/FD14LIVE.iso then:"
+echo "  ./run_qemu.sh 386 -i freedos"
 echo ""
 echo "Apps will be on D:\\"

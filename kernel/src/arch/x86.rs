@@ -251,6 +251,17 @@ pub fn hlt() {
     }
 }
 
+/// Shut the machine down. Writes the QEMU/Bochs ACPI shutdown ports —
+/// QEMU exits cleanly. On real hardware this is a no-op fallback to a
+/// halt loop; the user can power off manually.
+pub fn shutdown() -> ! {
+    cli();
+    outw(0x604, 0x2000);   // QEMU PIIX (i440FX) ACPI shutdown
+    outw(0xB004, 0x2000);  // QEMU pre-1.7 / Bochs
+    outw(0x4004, 0x3400);  // VirtualBox
+    loop { hlt(); }
+}
+
 /// GDT pointer structure
 #[repr(C, packed)]
 pub struct GdtPtr {
