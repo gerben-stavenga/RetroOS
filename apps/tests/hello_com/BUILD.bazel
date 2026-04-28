@@ -7,6 +7,6 @@ genrule(
 )
 
 exports_files(
-    ["TEST.COM", "TEST.BAT"],
+    ["TEST.BAT"],
     visibility = ["//visibility:public"],
 )

@@ -191,9 +191,14 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
-        // AH=00h — SYNTH_VGA_TAKE: adopt target thread's screen.
-        // Input:  BX = target pid
+        // AH=00h — SYNTH_VGA_TAKE: adopt a (still-zombie) child's farewell
+        // screen, then reap the slot.
+        // Input:  BX = child pid (must be a zombie of the caller)
         // Output: AX = 0 on success, errno on failure; CF reflects error.
+        // The child's on_exit() snapshotted its VGA into its DosState; this
+        // call swaps it into ours, restores it to hardware, and recycles
+        // the thread slot. Pair with AH=04 SYNTH_WAITPID (peek), then call
+        // this once the peek reports "exited".
         0x00 => {
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
             let dst = &mut dos.pc.vga as *mut machine::VgaState;
@@ -206,6 +211,7 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
                 }
                 0
             });
+            if rv >= 0 { thread::reap(pid); }
             regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
             if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
             thread::KernelAction::Done
@@ -256,7 +262,10 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
         // owns the policy for what to do on user input.
         0x04 => {
             let pid = regs.rbx as i16 as i32;
-            let (tid, _code) = thread::waitpid(kt.tid as usize, pid);
+            // Peek only — the slot stays Zombie so AH=00 can grab the VGA.
+            // Reap happens in AH=00 (or via thread::reap if the caller
+            // doesn't care about the screen).
+            let (tid, _code) = thread::peek_zombie_child(kt.tid as usize, pid);
             if tid >= 0 {
                 // Child exited. last_child_exit_status was already set by
                 // exit_thread with the proper termination-type encoding
@@ -669,9 +678,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.clear_flag32(1);
             } else {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
-                crate::dbg_println!("D21 3F enter h={} req={:#X} buf={:08X}", handle, count, buf_addr);
                 let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
-                crate::dbg_println!("D21 3F exit  h={} req={:#X} got={:#X}", handle, count, n);
                 if n >= 0 {
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
@@ -1620,7 +1627,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
 
     // ELF binaries need a separate address space — route through fork_exec.
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
-    crate::dbg_println!("  exec_program: {:?} size={} elf={}", core::str::from_utf8(prog_name), size, is_elf);
+    dos_trace!("  exec_program: {:?} size={} elf={}", core::str::from_utf8(prog_name), size, is_elf);
     if is_elf {
         return fork_exec(dos, prog_name, b"", kt);
     }
@@ -1631,7 +1638,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // `psp_seg - 0x10`, so `child_seg = heap_seg + 0x10` keeps the env safely
     // inside the child's own allocation and never inside parent memory.
     let child_seg = dos.heap_seg + 0x10;
-    crate::dbg_println!("  exec_program: {:?} size={} exe={} child_seg={:04X} parent_psp={:04X}",
+    dos_trace!("  exec_program: {:?} size={} exe={} child_seg={:04X} parent_psp={:04X}",
         core::str::from_utf8(prog_name), size, is_exe, child_seg, dos.current_psp);
 
     // Resolve the DOS-form absolute path for the env program-path suffix.
@@ -1726,7 +1733,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     regs.ds = child_seg as u64;
     regs.es = child_seg as u64;
     regs.clear_flag32(1);
-    crate::dbg_println!("  exec_program loaded: cs:ip={:04X}:{:04X} ss:sp={:04X}:{:04X} end_seg={:04X} heap_seg={:04X}",
+    dos_trace!("  exec_program loaded: cs:ip={:04X}:{:04X} ss:sp={:04X}:{:04X} end_seg={:04X} heap_seg={:04X}",
         cs, ip, ss, sp, end_seg, dos.heap_seg);
     thread::KernelAction::Done
 }
@@ -1841,7 +1848,7 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
 fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) -> thread::KernelAction {
-    crate::dbg_println!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X}",
+    dos_trace!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X}",
         dos.heap_seg, parent.heap_seg,
         dos.current_psp, parent.psp,
         parent.ss, parent.sp);

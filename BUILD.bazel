@@ -62,11 +62,10 @@ _BASE_FILES = {
     "//apps/tests/stress64:stress64_elf":   "TESTS/stress64.elf",
     "//apps/tests/hello_com:hello_com":     "TESTS/HELLO.COM",
     "//apps/tests/gfx_com:gfx_com":         "TESTS/GFX.COM",
-    "//apps/tests/hello_com:TEST.COM":      "TESTS/TEST.COM",
     "//apps/tests/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
     "//apps/tests/trexec:trexec_com":       "TESTS/TREXEC.COM",
-    "apps/tests/linux_test/hello_linux":    "TESTS/HI.ELF",
-    "apps/tests/hello64_linux/hello64_linux": "TESTS/HI64.ELF",
+    "//apps/tests/hello32_linux:hello32_linux": "TESTS/HI.ELF",
+    "//apps/tests/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
 }
 
 # Public image (shareware only). Games auto-globbed from //apps/games.

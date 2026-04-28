@@ -11,7 +11,9 @@
  *                            ES:BX -> ASCIIZ args (use "" for none)
  *                            -> CF=0 AX=0 BX=child_pid; CF=1 AX=errno
  *   AH=04h SYNTH_WAITPID     BX=pid -> CF=0 AX=0 exited / AX=1 alive
- *   AH=00h SYNTH_VGA_TAKE    BX=pid -> adopt child's farewell screen
+ *                            (peek only; slot stays Zombie until AH=00).
+ *   AH=00h SYNTH_VGA_TAKE    BX=pid -> adopt the zombie child's farewell
+ *                            screen and reap the slot.
  *   AH=02/03h TRACE_ON/OFF
  *
  * No shell logic in the kernel: filename parsing, .BAT, /C, and built-in

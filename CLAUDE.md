@@ -36,7 +36,6 @@ Build outputs (via Bazel):
   - `kernel/src/kernel/heap.rs` - Kernel heap allocator
   - `kernel/src/arch/phys_mm.rs` - Physical page allocator
 - `lib/` - Freestanding library (VGA, ELF, TAR, MD5)
-- `crt/` - C runtime / user linker scripts
 - `apps/` - User applications, stress tests, and DOS binaries
 - `toolchain/` - Bazel toolchain configuration for bare-metal Rust
 

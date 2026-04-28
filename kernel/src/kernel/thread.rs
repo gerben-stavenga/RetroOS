@@ -551,33 +551,49 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
     }
 }
 
-/// Wait for a child to exit. Returns (child_tid, exit_code) or -ECHILD if no children.
-/// If pid == -1, waits for any child. Otherwise waits for specific pid.
-/// Non-blocking: returns -EAGAIN if children exist but none have exited yet.
-pub fn waitpid(current_tid: usize, pid: i32) -> (i32, i32) {
+/// Look for an exited child without reaping it. Returns (child_tid, exit_code)
+/// if a matching zombie exists, -EAGAIN if children are alive but none exited,
+/// -ECHILD if no children at all. The slot stays in `Zombie` state so the
+/// caller can still inspect the child's per-personality state (e.g. DOS pulls
+/// the final VGA snapshot via `with_target_dos`) before calling `reap`.
+pub fn peek_zombie_child(current_tid: usize, pid: i32) -> (i32, i32) {
     unsafe {
         let current_tid = THREADS[current_tid].kernel.tid;
         let mut has_children = false;
 
         for i in 1..MAX_THREADS {
-            let k = &mut THREADS[i].kernel;
+            let k = &THREADS[i].kernel;
             if k.parent_tid == current_tid && k.state != ThreadState::Unused {
                 has_children = true;
                 if k.state == ThreadState::Zombie && (pid == -1 || k.tid == pid) {
-                    let tid = k.tid;
-                    let code = k.exit_code;
-                    k.state = ThreadState::Unused;
-                    return (tid, code);
+                    return (k.tid, k.exit_code);
                 }
             }
         }
 
-        if has_children {
-            (-11, 0)  // EAGAIN
-        } else {
-            (-10, 0)  // ECHILD
+        if has_children { (-11, 0) } else { (-10, 0) }
+    }
+}
+
+/// Recycle a Zombie thread slot. No-op if the tid isn't a zombie.
+pub fn reap(tid: i32) {
+    if tid < 0 || (tid as usize) >= MAX_THREADS { return; }
+    unsafe {
+        let k = &mut THREADS[tid as usize].kernel;
+        if k.state == ThreadState::Zombie {
+            k.state = ThreadState::Unused;
         }
     }
+}
+
+/// Atomic peek + reap. Returns (child_tid, exit_code) or the peek error code.
+/// Use when there's no per-personality state to grab from the zombie (the
+/// only current caller is Linux sys_wait4, which has nothing to retrieve
+/// once the parent has the exit code).
+pub fn waitpid(current_tid: usize, pid: i32) -> (i32, i32) {
+    let r = peek_zombie_child(current_tid, pid);
+    if r.0 >= 0 { reap(r.0); }
+    r
 }
 
 /// Signal thread (e.g., on segfault).
