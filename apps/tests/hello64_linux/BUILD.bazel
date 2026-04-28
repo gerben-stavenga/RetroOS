@@ -5,7 +5,7 @@ rust_binary(
     name = "hello64_linux_bin",
     srcs = ["src/main.rs"],
     edition = "2024",
-    rustc_flags = ["-Copt-level=s", "-Cstrip=symbols", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld"],
+    rustc_flags = ["-Copt-level=s", "-Cstrip=symbols", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld", "-Crelocation-model=static"],
 )
 
 musl64_binary(

@@ -1,0 +1,7 @@
+# Static-linked busybox 1.31 (i686-uclibc) — single-binary userland for the
+# Linux personality. Provides sh + coreutils via the standalone-shell-mode
+# applet dispatch (basename(argv[0]) -> applet).
+exports_files(
+    ["busybox"],
+    visibility = ["//visibility:public"],
+)

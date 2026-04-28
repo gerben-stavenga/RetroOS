@@ -238,11 +238,17 @@ impl VgaState {
         // The window is 1–2 instructions wide so the hit rate is very low,
         // and the visible artifact (one bad 4-byte stripe in one frame) is
         // typically invisible. Left unfixed; revisit if we ever observe it.
+        // Read planes through the kernel-side low-memory mapping
+        // (LOW_MEM_BASE + 0xA0000) so this works regardless of which
+        // personality's user pages are currently mapped — Linux threads
+        // don't have a 0xA0000 identity mapping at all, so a bare access
+        // would fault when suspending shell.elf.
+        let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *const u8;
         for plane in 0..4u8 {
             outb(0x3CE, 4); outb(0x3CF, plane);
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    (0xA0000) as *const u8,
+                    vga_window,
                     self.planes[plane as usize * 65536..].as_mut_ptr(),
                     65536,
                 );
@@ -278,12 +284,15 @@ impl VgaState {
         outb(0x3CE, 5); outb(0x3CF, 0x00); // GC mode: write mode 0
         outb(0x3CE, 6); outb(0x3CF, 0x05); // GC misc: graphics, A0000/64K
 
+        // Write planes through the kernel-side low-memory mapping (see
+        // save_from_hardware for the rationale).
+        let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *mut u8;
         for plane in 0..4u8 {
             outb(0x3C4, 2); outb(0x3C5, 1 << plane);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.planes[plane as usize * 65536..].as_ptr(),
-                    (0xA0000) as *mut u8,
+                    vga_window,
                     65536,
                 );
             }

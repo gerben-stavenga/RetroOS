@@ -97,6 +97,11 @@ mod xms;
 mod ems;
 mod dos;
 
+// VgaState is hardware-shaped (4 planes + register snapshot), not DOS policy.
+// Re-export so the Linux personality can hold its own console snapshot — DOS
+// machine emulation stays private otherwise.
+pub use machine::VgaState;
+
 // Stub array / slot table / IRQ-stack constants live in `dos.rs` (alongside
 // the INT handlers that own them); the `dpmi` sibling module also reads them
 // when wiring PM↔RM control flow. Re-import here so both can write
@@ -219,10 +224,11 @@ impl DosState {
         machine::queue_irq(&mut self.pc, crate::arch::Irq::Key(scancode));
     }
 
-    /// Per-thread cleanup at exit: persist VGA, free EMS-backed pages, drop
-    /// XMS/EMS state, restore A20. Called from `thread::exit_thread`.
+    /// Per-thread cleanup at exit: free EMS-backed pages, drop XMS/EMS
+    /// state, restore A20. The screen snapshot is handled by `suspend`,
+    /// which `exit_thread` calls separately before `arch_user_clean`
+    /// unmaps the 0xA0000 framebuffer. Called from `thread::exit_thread`.
     pub fn on_exit(&mut self) {
-        self.pc.vga.save_from_hardware();
         if let Some(ref mut ems) = self.ems {
             ems.free_all_pages();
         }
@@ -239,6 +245,19 @@ impl DosState {
         let ldt_ptr = self.ldt.as_ptr() as u32;
         let ldt_limit = (dpmi::LDT_ENTRIES * 8 - 1) as u32;
         crate::kernel::startup::arch_load_ldt(ldt_ptr, ldt_limit);
+    }
+
+    /// Called when the thread loses focus. Snapshots the VGA framebuffer
+    /// + register set so the screen can be repainted on materialize.
+    pub fn suspend(&mut self) {
+        self.pc.vga.save_from_hardware();
+    }
+
+    /// Called when the thread regains focus. Repaints the VGA framebuffer
+    /// from the suspend snapshot. CPU-binding side effects live in
+    /// `on_resume` and happen on every swap-in regardless of focus.
+    pub fn materialize(&mut self) {
+        self.pc.vga.restore_to_hardware();
     }
 }
 

@@ -409,6 +409,21 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             thread::KernelAction::Done
         }
+        // AH=0x07: Direct STDIN read, no echo, no Ctrl-C check.
+        // AH=0x08: STDIN read, no echo (Ctrl-C raises INT 23h — we don't).
+        // Both block until a key is available. TC's getch() uses AH=07h;
+        // without this AX falls through unmodified and getch() returns
+        // garbage (often the AL=0xFF that AH=0Bh just set on kbhit).
+        0x07 | 0x08 => {
+            if let Some(ch) = poll_dos_console_char(dos) {
+                regs.rax = (regs.rax & !0xFF) | ch as u64;
+            } else {
+                // Buffer empty — re-issue the syscall after the next
+                // event-loop iteration so a key has a chance to arrive.
+                regs.set_ip32(regs.ip32().wrapping_sub(2));
+            }
+            thread::KernelAction::Done
+        }
         // AH=0x09: Display $-terminated string at DS:DX
         0x09 => {
             let start = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
@@ -423,9 +438,15 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             thread::KernelAction::Done
         }
-        // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready
+        // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready.
+        // Reflect the BIOS keyboard buffer state (head != tail = char ready).
+        // Some Borland C builds back kbhit() with this rather than INT 16h
+        // AH=01h, so a hardcoded "no char" silently breaks polling.
         0x0B => {
-            regs.rax = (regs.rax & !0xFF) | 0x00; // no character available
+            let head = read_u16(0x40, 0x1A);
+            let tail = read_u16(0x40, 0x1C);
+            let al = if head != tail { 0xFFu8 } else { 0u8 };
+            regs.rax = (regs.rax & !0xFF) | al as u64;
             thread::KernelAction::Done
         }
         // AH=0x25: Set interrupt vector (AL=int, DS:DX=handler)

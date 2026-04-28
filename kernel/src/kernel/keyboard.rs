@@ -5,6 +5,7 @@
 
 const LSHIFT: u8 = 0x2A;
 const RSHIFT: u8 = 0x36;
+const LCTRL: u8 = 0x1D;
 
 /// Scancode-to-ASCII table (US layout, unshifted)
 /// Negative values = special keys (ignored), 0 = undefined, positive = ASCII
@@ -74,11 +75,18 @@ pub fn update_key_state(scancode: u8) -> bool {
     !released
 }
 
-/// Convert a scancode to ASCII using current shift state. Returns 0 for non-printable keys.
+/// Convert a scancode to ASCII using current shift/ctrl state. Returns 0 for non-printable keys.
 pub fn scancode_to_ascii(scancode: u8) -> u8 {
     let key = scancode & 0x7F;
     if key as usize >= KBD_US.len() { return 0; }
     let shift = key_down(LSHIFT) || key_down(RSHIFT);
     let c = if shift { KBD_US_SHIFT[key as usize] } else { KBD_US[key as usize] };
-    if c <= 0 { 0 } else { c as u8 }
+    if c <= 0 { return 0; }
+    let c = c as u8;
+    // Ctrl-A..Ctrl-Z → 0x01..0x1A; case-insensitive.
+    if key_down(LCTRL) {
+        let lower = c | 0x20;
+        if (b'a'..=b'z').contains(&lower) { return lower - b'a' + 1; }
+    }
+    c
 }

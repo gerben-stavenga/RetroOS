@@ -88,20 +88,60 @@ pub fn init_thread(tid: usize, data: &[u8], path: &[u8], args: &[Vec<u8>], cmdta
 // ── Path utilities ──────────────────────────────────────────────────────
 
 /// Resolve a path against a working directory. Absolute paths ignore cwd.
+/// Normalizes `.`/`./` and `..`/`../` segments. Returns a slice of `buf`
+/// holding the resolved path with no leading slash.
 pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
-    let mut pos = 0;
-    if !path.is_empty() && path[0] == b'/' {
-        let trimmed = &path[path.iter().position(|&b| b != b'/').unwrap_or(path.len())..];
-        for &b in trimmed {
-            if pos < buf.len() { buf[pos] = b; pos += 1; }
-        }
+    // Build the raw concatenation first (cwd + path for relatives).
+    let mut tmp = [0u8; 164];
+    let mut tlen = 0;
+    let raw: &[u8] = if !path.is_empty() && path[0] == b'/' {
+        // Absolute — strip leading slashes.
+        &path[path.iter().position(|&b| b != b'/').unwrap_or(path.len())..]
     } else {
         for &b in cwd {
-            if pos < buf.len() { buf[pos] = b; pos += 1; }
+            if tlen < tmp.len() { tmp[tlen] = b; tlen += 1; }
+        }
+        if tlen > 0 && tmp[tlen - 1] != b'/' && tlen < tmp.len() {
+            tmp[tlen] = b'/'; tlen += 1;
         }
         for &b in path {
-            if pos < buf.len() { buf[pos] = b; pos += 1; }
+            if tlen < tmp.len() { tmp[tlen] = b; tlen += 1; }
         }
+        &tmp[..tlen]
+    };
+
+    // Walk segments, skipping "." and applying ".." by popping.
+    let mut pos = 0;
+    let mut start = 0;
+    while start < raw.len() {
+        let end = raw[start..]
+            .iter()
+            .position(|&b| b == b'/')
+            .map(|p| start + p)
+            .unwrap_or(raw.len());
+        let seg = &raw[start..end];
+        if seg.is_empty() || seg == b"." {
+            // skip
+        } else if seg == b".." {
+            // pop one component (find last '/' before pos-1)
+            if pos > 0 {
+                pos -= 1; // step over implicit trailing slash if any
+                while pos > 0 && buf[pos - 1] != b'/' { pos -= 1; }
+            }
+        } else {
+            for &b in seg {
+                if pos < buf.len() { buf[pos] = b; pos += 1; }
+            }
+            if end < raw.len() && pos < buf.len() {
+                buf[pos] = b'/'; pos += 1;
+            }
+        }
+        start = end + 1;
+    }
+    // If the original path had a trailing slash, keep it; otherwise strip.
+    let trailing = !raw.is_empty() && raw.last() == Some(&b'/');
+    if !trailing && pos > 0 && buf[pos - 1] == b'/' {
+        pos -= 1;
     }
     &buf[..pos]
 }

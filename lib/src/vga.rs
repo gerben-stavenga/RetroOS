@@ -112,6 +112,11 @@ impl Vga {
             EscState::Csi => {
                 if c.is_ascii_digit() {
                     self.esc_param = self.esc_param.saturating_mul(10).saturating_add(c - b'0');
+                } else if c == b';' {
+                    // Multi-parameter SGR (e.g. `\e[01;34m`): apply the
+                    // accumulated param now and start collecting the next.
+                    self.handle_sgr(self.esc_param);
+                    self.esc_param = 0;
                 } else if c == b'm' {
                     self.handle_sgr(self.esc_param);
                     self.esc_state = EscState::Normal;

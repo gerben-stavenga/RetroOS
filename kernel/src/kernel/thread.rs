@@ -31,6 +31,10 @@ pub enum FdKind {
     PipeWrite(u8),
     /// Console stdout/stderr (VGA putchar)
     ConsoleOut,
+    /// Open directory (for opendir/getdents). The u32 is the next entry
+    /// index to return; getdents64 advances it on each call so a sequential
+    /// reader sees each entry exactly once and EOF after the last.
+    Dir(u32),
 }
 
 impl FdKind {
@@ -42,6 +46,14 @@ pub struct PendingRead {
     pub fd_kind: FdKind,   // what we're reading from (PipeRead or ConsoleOut won't happen)
     pub buf_ptr: usize,
     pub buf_len: usize,
+}
+
+/// A pending blocked poll — re-evaluated on each event-loop tick until any
+/// monitored fd becomes ready or the timeout expires.
+pub struct PendingPoll {
+    pub fds_ptr: usize,    // user-space pointer to pollfd[]
+    pub nfds: usize,
+    pub timeout_ms: i32,   // -1 = infinite
 }
 
 /// Thread state
@@ -97,6 +109,38 @@ pub enum Personality {
     Dos(DosState),
     /// Linux userspace (32 or 64-bit, distinguished by CS descriptor)
     Linux(LinuxState),
+}
+
+impl Personality {
+    /// Out-focus hook: snapshot whatever state lives only in hardware (VGA
+    /// framebuffer + register set, shared TTY console buffer).
+    pub fn suspend(&mut self) {
+        match self {
+            Self::Dos(d) => d.suspend(),
+            Self::Linux(l) => l.suspend(),
+        }
+    }
+
+    /// In-focus hook: repaint the suspended screen state to hardware.
+    /// Visual rematerialization only — CPU-binding side effects (LDT, TLS,
+    /// deferred wait_status writeout) live in `on_resume` and run
+    /// independently of focus changes.
+    pub fn materialize(&mut self) {
+        match self {
+            Self::Dos(d) => d.materialize(),
+            Self::Linux(l) => l.materialize(),
+        }
+    }
+
+    /// Swap-in hook: rebind per-thread CPU state. Called every time a thread
+    /// becomes the running thread, regardless of whether it's also taking
+    /// focus visually.
+    pub fn on_resume(&mut self) {
+        match self {
+            Self::Dos(d) => d.on_resume(),
+            Self::Linux(l) => l.on_resume(),
+        }
+    }
 }
 
 /// Backward compat alias
@@ -234,7 +278,7 @@ impl KernelThread {
             FdKind::PipeWrite(idx) => {
                 crate::kernel::kpipe::close_writer(idx);
             }
-            FdKind::ConsoleOut | FdKind::None => {}
+            FdKind::ConsoleOut | FdKind::None | FdKind::Dir(_) => {}
         }
         self.fds[fd] = FdKind::None;
         self.cloexec &= !(1 << fd);
@@ -272,7 +316,7 @@ impl KernelThread {
                 FdKind::PipeWrite(idx) => {
                     crate::kernel::kpipe::add_writer(idx);
                 }
-                FdKind::ConsoleOut | FdKind::None => {}
+                FdKind::ConsoleOut | FdKind::None | FdKind::Dir(_) => {}
             }
         }
     }
@@ -508,6 +552,11 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
     unsafe {
         let thread = &mut THREADS[tid];
         let parent_tid = thread.kernel.parent_tid;
+        // Snapshot the dying thread's screen NOW — `arch_user_clean` below
+        // unmaps 0xA0000, after which save_from_hardware would fault. The
+        // snapshot stays in the zombie's slot until the parent either
+        // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
+        thread.personality.suspend();
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(),
             Personality::Linux(_) => {}
@@ -520,6 +569,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
 
         // Wake blocked parent and write status BEFORE arch_user_clean —
         // the parent's stack is still accessible through COW-shared pages.
+        let mut woke_parent = false;
         if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
             let parent = &mut THREADS[parent_tid as usize];
             let was_waiting = parent.kernel.state == ThreadState::Blocked;
@@ -538,6 +588,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                     }
                 }
                 refresh_cpu_hash(parent);
+                woke_parent = true;
             }
             if let Personality::Dos(dos) = &mut parent.personality {
                 dos.last_child_exit_status = (exit_code as u8) as u16;
@@ -547,6 +598,21 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
         crate::kernel::startup::arch_user_clean();
         thread.kernel.state = ThreadState::Zombie;
 
+        // Hand focus back to the parent that spawned us — it's the
+        // natural caller of wait4. Covers both "parent was Blocked on
+        // wait4 and we just woke it" and "parent never got CPU to call
+        // wait4 yet but is Ready" (typical Rust Command::status flow:
+        // fork stays on child, parent only reaches wait4 after we exit).
+        // If the parent is gone or stuck (Blocked on something else,
+        // Zombie/Unused), fall through to the regular scheduler.
+        if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
+            let parent_state = THREADS[parent_tid as usize].kernel.state;
+            if woke_parent
+                || matches!(parent_state, ThreadState::Ready | ThreadState::Running)
+            {
+                return parent_tid as usize;
+            }
+        }
         schedule(tid).unwrap_or(0)
     }
 }

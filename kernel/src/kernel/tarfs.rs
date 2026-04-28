@@ -25,7 +25,20 @@ impl TarFs {
         let mut name = [0u8; 100];
         let name_len = name_bytes.len().min(100);
         name[..name_len].copy_from_slice(&name_bytes[..name_len]);
-        Some(TarEntry { name, name_len, size, data_block: block + 1, next_block: block + 1 + data_blocks })
+        let mut link = [0u8; 100];
+        let mut link_len = 0;
+        if header.is_symlink() {
+            let lt = header.link_target();
+            link_len = lt.len().min(100);
+            link[..link_len].copy_from_slice(&lt[..link_len]);
+        }
+        Some(TarEntry {
+            name, name_len, size,
+            data_block: block + 1,
+            next_block: block + 1 + data_blocks,
+            is_symlink: header.is_symlink(),
+            link, link_len,
+        })
     }
 }
 
@@ -35,6 +48,10 @@ struct TarEntry {
     size: u32,
     data_block: u32,
     next_block: u32,
+    is_symlink: bool,
+    /// Symlink target (relative or absolute). Only valid when `is_symlink`.
+    link: [u8; 100],
+    link_len: usize,
 }
 
 fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
@@ -60,15 +77,52 @@ fn entry_in_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 
 impl Filesystem for TarFs {
     fn open(&self, path: &[u8]) -> Option<Vnode> {
-        let mut block: u32 = 0;
-        loop {
-            let entry = self.read_header(block)?;
-            let name = &entry.name[..entry.name_len];
-            if eq_ignore_case(name, path) {
+        // Bounded recursion: chase at most 8 symlink hops to avoid loops.
+        let mut current: [u8; 164] = [0u8; 164];
+        let mut current_len = path.len().min(current.len());
+        current[..current_len].copy_from_slice(&path[..current_len]);
+
+        for _ in 0..8 {
+            let mut block: u32 = 0;
+            let mut found: Option<TarEntry> = None;
+            loop {
+                let entry = match self.read_header(block) {
+                    Some(e) => e,
+                    None => break,
+                };
+                let name = &entry.name[..entry.name_len];
+                if eq_ignore_case(name, &current[..current_len]) {
+                    found = Some(entry);
+                    break;
+                }
+                block = entry.next_block;
+            }
+            let entry = found?;
+            if !entry.is_symlink {
                 return Some(Vnode { handle: entry.data_block as u64, size: entry.size });
             }
-            block = entry.next_block;
+            // Resolve link target relative to the symlink's directory.
+            let dir_end = (&current[..current_len])
+                .iter()
+                .rposition(|&b| b == b'/')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let link = &entry.link[..entry.link_len];
+            if !link.is_empty() && link[0] == b'/' {
+                // Absolute target — strip leading '/'.
+                let lstart = link.iter().position(|&b| b != b'/').unwrap_or(link.len());
+                let n = (link.len() - lstart).min(current.len());
+                current[..n].copy_from_slice(&link[lstart..lstart + n]);
+                current_len = n;
+            } else {
+                let n = (dir_end + link.len()).min(current.len());
+                // dir prefix already in current[..dir_end]; append link.
+                let copy_n = (n - dir_end).min(link.len());
+                current[dir_end..dir_end + copy_n].copy_from_slice(&link[..copy_n]);
+                current_len = dir_end + copy_n;
+            }
         }
+        None
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32 {
@@ -241,12 +295,22 @@ impl Filesystem for TarFs {
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
+        // A directory exists when *some* entry has it as a strict prefix —
+        // i.e. the next byte is '/'. The previous version's prefix-only
+        // check matched the file itself ("bin/busybox" satisfies the
+        // prefix of "bin/busybox"), making files masquerade as dirs and
+        // breaking access(X_OK) on executable lookups.
+        if path.is_empty() { return true; }
+        let pat_with_slash = path.last().copied() == Some(b'/');
         let mut block: u32 = 0;
         loop {
             match self.read_header(block) {
                 Some(entry) => {
                     let name = &entry.name[..entry.name_len];
-                    if name.len() >= path.len() && eq_ignore_case(&name[..path.len()], path) {
+                    if name.len() > path.len()
+                        && eq_ignore_case(&name[..path.len()], path)
+                        && (pat_with_slash || name[path.len()] == b'/')
+                    {
                         return true;
                     }
                     block = entry.next_block;

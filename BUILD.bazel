@@ -1,6 +1,28 @@
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
 exports_files(["i686-retro-none.json"])
+
+# Convenient applet shims for busybox: each is a tar symlink "bin/<name>"
+# pointing at "busybox" (relative within /bin), so PATH=/bin lookup of
+# `ls`, `cat`, etc. resolves to the busybox binary which dispatches via
+# basename(argv[0]).
+_BUSYBOX_APPLETS = [
+    "ls", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "touch",
+    "echo", "printf", "pwd", "true", "false",
+    "grep", "sed", "awk", "wc", "sort", "uniq", "head", "tail", "cut", "tr",
+    "find", "du", "df", "stat", "chmod",
+    "ps", "kill", "sleep", "time", "id", "tty", "uname",
+    "cmp", "diff", "tar", "gzip", "gunzip", "dd",
+    "vi", "ed", "more", "less",
+    "sh", "ash", "env", "which", "test", "[",
+]
+
+[pkg_mklink(
+    name = "lnk_bin_" + a,
+    link_name = "bin/" + a,
+    target = "busybox",
+) for a in _BUSYBOX_APPLETS]
 
 # Pristine drop-in dirs: contents auto-shipped under the given DOS prefix.
 # Drop files into apps/tc/ or apps/TP70/ and they appear at C:\TC\... or
@@ -66,6 +88,10 @@ _BASE_FILES = {
     "//apps/tests/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//apps/tests/hello32_linux:hello32_linux": "TESTS/HI.ELF",
     "//apps/tests/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
+    # Static i686 busybox — single-binary Unix userland (sh + coreutils).
+    # Standalone-shell mode dispatches applets via basename(argv[0]); the
+    # binary's compiled-in re-exec path is /bin/busybox, hence the location.
+    "//apps/busybox:busybox":               "bin/busybox",
 }
 
 # Public image (shareware only). Games auto-globbed from //apps/games.
@@ -74,6 +100,7 @@ _BASE_FILES = {
 pkg_tar(
     name = "fs_tar",
     files = _BASE_FILES,
+    srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
         "//apps/games:tar",
         ":tc_tar",
@@ -85,6 +112,7 @@ pkg_tar(
 pkg_tar(
     name = "fs_tar_proprietary",
     files = _BASE_FILES,
+    srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
         "//apps/games:tar",
         ":tc_tar",

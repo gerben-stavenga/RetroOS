@@ -82,8 +82,13 @@ pub fn startup() -> ! {
 
     crate::kernel::stacktrace::init_from_tar();
 
-    // Allocate console stdin pipe (keyboard → Linux stdin)
+    // Allocate console stdin pipe (keyboard → Linux stdin). The kernel
+    // itself is the writer (via process_key during the event loop drain),
+    // so register a phantom writer permanently — without it, has_writers
+    // returns false and the first read on fd 0 reports EOF immediately,
+    // which makes busybox/sh bail out at startup.
     let console_pipe = crate::kernel::kpipe::alloc().expect("Failed to allocate console pipe");
+    crate::kernel::kpipe::add_writer(console_pipe);
     crate::kernel::thread::set_console_pipe(console_pipe);
 
     // Host may select a program via QEMU `-fw_cfg name=opt/cmdline,string=...`.
@@ -213,10 +218,12 @@ fn event_loop(first_tid: usize) {
     // REGS already set up by startup, page tables correct from boot
     loop {
         crate::kernel::stacktrace::set_debug_tid(tid);
-        // Pre-execute: drain hardware events into OS personality
-        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+        let regs = unsafe { &mut *(&raw mut REGS) };
+
+        // Phase 1: drain hardware events into the running thread's personality,
+        // then try to satisfy any pending pipe read.
         {
-            let regs = unsafe { &mut *(&raw mut REGS) };
+            let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
             let kt = &mut thread.kernel;
             match &mut thread.personality {
                 thread::Personality::Dos(dos) => {
@@ -285,15 +292,36 @@ fn event_loop(first_tid: usize) {
                                 kt.state = thread::ThreadState::Ready;
                             }
                         }
+                    } else if let Some(ref pp) = linux.pending_poll {
+                        let ready = crate::kernel::linux::run_poll(kt, pp.fds_ptr, pp.nfds);
+                        if ready > 0 {
+                            regs.rax = ready as u64;
+                            linux.pending_poll = None;
+                            kt.state = thread::ThreadState::Ready;
+                        }
                     }
-                }
-                if kt.state == thread::ThreadState::Blocked {
-                    core::hint::spin_loop();
-                    continue;
                 }
             }
         }
 
+        // Phase 2: if still parked, honour F11 (cycle focus) or spin. The
+        // take_switch_request consumer below the do_arch_execute path is
+        // unreachable from here, so we re-implement the switch step inline.
+        if thread::get_thread(tid).expect("Invalid thread").kernel.state
+            == thread::ThreadState::Blocked
+        {
+            if thread::take_switch_request() {
+                if let Some(next) = thread::cycle_next(tid) {
+                    tid = switch_thread(tid, next);
+                    continue;
+                }
+            }
+            core::hint::spin_loop();
+            continue;
+        }
+
+        // Phase 3: run user code and dispatch the resulting event.
+        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let kevent = do_arch_execute();
 
         let regs = unsafe { &mut *(&raw mut REGS) };
@@ -347,61 +375,48 @@ fn event_loop(first_tid: usize) {
 
         if let Some(new_tid) = new_tid {
             if new_tid == 0 { return; } // no threads left — respawn DN
-            if new_tid != tid {
-                let (old, new) = thread::get_two_threads(tid, new_tid);
-                // Save/restore VGA state when switching between DOS threads.
-                // Zombies already snapshotted in exit_thread (before arch_user_clean
-                // unmaps 0xA0000); re-reading here would capture unmapped garbage.
-                let old_dos = old.is_dos() && old.kernel.state != thread::ThreadState::Zombie;
-                let new_dos = new.is_dos();
-                if old_dos {
-                    let dos = old.dos_mut();
-                    dos.pc.vga.save_from_hardware();
-                }
-                verify_cpu_hash(new, "switch-in");
-                let mut swap_regs = new.kernel.cpu_state;
-                let mut swap_root = new.kernel.root;
-                let mut swap_fx = new.kernel.fx_state;
-                if ASSERT_ADDR_HASH {
-                    let mut hash = new.kernel.addr_hash;
-                    arch_switch_to(&mut swap_regs, &mut swap_root, &mut hash, &mut swap_fx);
-                    old.kernel.addr_hash = hash;
-                } else {
-                    arch_switch_to(&mut swap_regs, &mut swap_root, core::ptr::null_mut(), &mut swap_fx);
-                }
-                old.kernel.cpu_state = swap_regs;
-                old.kernel.root = swap_root;
-                old.kernel.fx_state = swap_fx;
-                old.kernel.cpu_hash = thread::hash_regs(&old.kernel.cpu_state);
-                if new_dos {
-                    let dos = new.dos_mut();
-                    dos.pc.vga.restore_to_hardware();
-                }
-                tid = new_tid;
-                let new_thread = thread::get_thread(tid).expect("Invalid thread");
-                match &mut new_thread.personality {
-                    thread::Personality::Dos(dos) => {
-                        dos.on_resume();
-                    }
-                    thread::Personality::Linux(linux) => {
-                        if linux.tls_entry >= 0 {
-                            arch_set_tls_entry(
-                                linux.tls_entry, linux.tls_base,
-                                linux.tls_limit, linux.tls_limit_in_pages,
-                            );
-                        }
-                        if linux.wait_status_ptr != 0 {
-                            unsafe {
-                                *(linux.wait_status_ptr as *mut i32) =
-                                    (linux.wait_exit_code & 0xFF) << 8;
-                            }
-                            linux.wait_status_ptr = 0;
-                        }
-                    }
-                }
-            }
+            tid = switch_thread(tid, new_tid);
         }
     }
+}
+
+/// Swap CPU state, address space, FPU, and the VGA framebuffer to make
+/// `new_tid` the running thread. No-op when `new_tid == tid`. Returns the
+/// new tid.
+///
+/// Lifecycle hooks live on the personalities:
+///   - `suspend`     — snapshot screen state on out-focus.
+///   - `materialize` — repaint screen state on in-focus.
+///   - `on_resume`   — rebind CPU state (LDT/TLS/...) on every swap-in.
+///
+/// Zombies skip the suspend here because `exit_thread` already called it
+/// before `arch_user_clean` unmapped 0xA0000 (re-reading would fault). If
+/// a parent wants the dying child's farewell screen to persist, it calls
+/// `SYNTH_VGA_TAKE` explicitly — the kernel makes no inheritance policy.
+fn switch_thread(tid: usize, new_tid: usize) -> usize {
+    if new_tid == tid { return tid; }
+    let (old, new) = thread::get_two_threads(tid, new_tid);
+    if old.kernel.state != thread::ThreadState::Zombie {
+        old.personality.suspend();
+    }
+    verify_cpu_hash(new, "switch-in");
+    let mut swap_regs = new.kernel.cpu_state;
+    let mut swap_root = new.kernel.root;
+    let mut swap_fx = new.kernel.fx_state;
+    if ASSERT_ADDR_HASH {
+        let mut hash = new.kernel.addr_hash;
+        arch_switch_to(&mut swap_regs, &mut swap_root, &mut hash, &mut swap_fx);
+        old.kernel.addr_hash = hash;
+    } else {
+        arch_switch_to(&mut swap_regs, &mut swap_root, core::ptr::null_mut(), &mut swap_fx);
+    }
+    old.kernel.cpu_state = swap_regs;
+    old.kernel.root = swap_root;
+    old.kernel.fx_state = swap_fx;
+    old.kernel.cpu_hash = thread::hash_regs(&old.kernel.cpu_state);
+    new.personality.materialize();
+    new.personality.on_resume();
+    new_tid
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
@@ -429,8 +444,10 @@ fn handle_fork_exec(
     let mut parent_cwd_buf = [0u8; 64];
     let parent_cwd_len: usize;
     let parent_env_snapshot: Option<alloc::vec::Vec<u8>>;
+    let parent_is_dos: bool;
     match &parent.personality {
         thread::Personality::Dos(dos) => {
+            parent_is_dos = true;
             let dos_cwd = dos.dfs.get_cwd();
             let n = dos_cwd.len().min(parent_cwd_buf.len());
             for i in 0..n {
@@ -441,6 +458,7 @@ fn handle_fork_exec(
             parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(dos));
         }
         thread::Personality::Linux(lin) => {
+            parent_is_dos = false;
             let cwd = lin.cwd_str();
             parent_cwd_buf[..cwd.len()].copy_from_slice(cwd);
             parent_cwd_len = cwd.len();
@@ -514,8 +532,17 @@ fn handle_fork_exec(
             crate::kernel::kpipe::add_reader(cpipe);
         }
         thread::Personality::Dos(_) => {
-            let dos_state = child.dos_mut();
-            dos_state.pc.vga.save_from_hardware();
+            // Only inherit the parent's screen if the parent is also DOS —
+            // otherwise we'd save Linux console content into a DOS thread's
+            // vga buffer, and the child would later "restore" Linux output
+            // when focus returned to it. Cross-personality forks just leave
+            // the child's vga empty; switch_thread's restore is a no-op on
+            // empty planes, so the hardware shows whatever the previous
+            // restore put up — the child draws on top.
+            if parent_is_dos {
+                let dos_state = child.dos_mut();
+                dos_state.pc.vga.save_from_hardware();
+            }
             use crate::arch::{inb, outb};
             outb(0x3D4, 0x0E);
             let cursor_hi = inb(0x3D5) as u16;

@@ -57,6 +57,16 @@ impl TarHeader {
         &self.filename[..strlen(&self.filename)]
     }
 
+    /// Get link target as byte slice (only meaningful for symlinks).
+    pub fn link_target(&self) -> &[u8] {
+        &self.link_target[..strlen(&self.link_target)]
+    }
+
+    /// True if this entry is a symbolic link (USTAR typeflag '2').
+    pub fn is_symlink(&self) -> bool {
+        self.typeflag == b'2'
+    }
+
     /// Get file size from header
     pub fn filesize(&self) -> usize {
         parse_octal(&self.filesize) as usize
