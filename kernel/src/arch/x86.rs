@@ -229,7 +229,7 @@ pub unsafe fn lldt(selector: u16) {
 
 /// Enable interrupts
 #[inline]
-pub fn sti() {
+pub(super) fn sti() {
     unsafe {
         asm!("sti", options(nomem, nostack));
     }
@@ -237,7 +237,7 @@ pub fn sti() {
 
 /// Disable interrupts
 #[inline]
-pub fn cli() {
+pub(super) fn cli() {
     unsafe {
         asm!("cli", options(nomem, nostack));
     }

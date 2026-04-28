@@ -296,10 +296,6 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) -> bool {
         // Force IF=1 for real interrupt delivery
         full.regs.frame.rflags |= 0x200;
     }
-    crate::dbg_println!("[traps exit] rflags={:08X} vm={} cs={:04X} ds={:04X}",
-        full.regs.frame.rflags as u32,
-        (full.regs.frame.rflags & (1 << 17)) != 0,
-        full.regs.frame.cs, full.regs.ds);
     if is_vm86(&full.regs) {
         full.vm86_es = full.regs.es as u32;
         full.vm86_ds = full.regs.ds as u32;
@@ -442,6 +438,17 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
     // User tried to access kernel memory
     if user && fault_addr >= PAGE_TABLE_BASE {
         return None; // Let kernel handle (segfault)
+    }
+
+    // Kernel-stack-guard hit: the unmapped page directly below KERNEL_STACK.
+    // Reaching it means ring-1 kernel stack overflow. (The arch-stack guard
+    // is unmapped too but can't be reported here — its overflow #PFs on the
+    // already-overflowed ARCH_STACK and triple-faults.)
+    {
+        let kguard = (&raw const crate::KERNEL_STACK_GUARD) as usize;
+        if fault_addr >= kguard && fault_addr < kguard + 4096 {
+            panic!("KERNEL STACK OVERFLOW at {:#x} (guard {:#x})", fault_addr, kguard);
+        }
     }
 
     // Kernel fault in heap region: demand-page a real writable page

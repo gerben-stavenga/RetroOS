@@ -18,6 +18,12 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 /// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
 pub fn startup() -> ! {
+    // Heap must be live before any kernel code allocates. Arch only depends
+    // on phys_mm during boot; everything heap-using lives at or below this
+    // entry point.
+    crate::kernel::heap::init();
+    println!("Heap initialized");
+
     crate::kernel::thread::init_threading();
 
     // Reset ATA controller (needed when booted via GRUB)
@@ -571,7 +577,6 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
         // mapping, or AC mode register text-vs-graphics).
         unsafe {
             use crate::arch::{inb, outb};
-            crate::arch::cli();
             let _ = inb(0x3DA);
             let misc = inb(0x3CC);
             let mut seq = [0u8; 5];
@@ -585,7 +590,6 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
             for i in 0..21u8 { let _ = inb(0x3DA); outb(0x3C0, i | 0x20); ac[i as usize] = inb(0x3C1); }
             let _ = inb(0x3DA);
             outb(0x3C0, 0x20);   // re-enable display by setting PAS
-            crate::arch::sti();
             crate::dbg_println!("[VGA HW] misc={:02X} seq=[{:02X} {:02X} {:02X} {:02X} {:02X}]",
                 misc, seq[0], seq[1], seq[2], seq[3], seq[4]);
             crate::dbg_println!("[VGA HW] gc=[{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}]",

@@ -47,8 +47,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
 
     // Switch to flat GDT (base=0) + IDT + TSS immediately after paging.
     // Offset segments are no longer needed — paging maps KERNEL_BASE to KERNEL_PHYS.
-    #[allow(static_mut_refs)]
-    let arch_stack_top = unsafe { crate::ARCH_STACK.top() as u32 } - 16;
+    let arch_stack_top = (&raw const crate::ARCH_STACK_TOP) as u32 - 16;
     descriptors::setup_descriptor_tables(arch_stack_top);
     descriptors::setup_syscall();
 
@@ -88,9 +87,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
 
     println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
-    crate::kernel::heap::init();
-    println!("Heap initialized");
-
     println!("Memory regions: {}", mmap_count);
     for entry in mmap_entries {
         if entry.typ == 1 {
@@ -114,6 +110,16 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
 
     x86::sti();
     println!("Interrupts enabled");
+
+    // Install stack guard pages: unmap the page directly below each stack
+    // so any overflow takes a clean #PF (caught and labeled in
+    // try_handle_page_fault) instead of silently corrupting adjacent
+    // memory. Must be done at ring 0 because entries() reads CR4.
+    let kstack_guard = (&raw const crate::KERNEL_STACK_GUARD) as usize;
+    let astack_guard = (&raw const crate::ARCH_STACK_GUARD) as usize;
+    paging2::unmap_kernel_page(kstack_guard);
+    paging2::unmap_kernel_page(astack_guard);
+    println!("Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
 
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");

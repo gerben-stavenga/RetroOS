@@ -15,7 +15,7 @@ KERNEL_PHYS equ 0x00100000
 
 ; External symbols defined in Rust
 extern BOOT_GDT            ; boot GDT table (descriptors.rs)
-extern KERNEL_STACK        ; kernel stack (lib.rs)
+extern KERNEL_STACK_TOP    ; top of kernel stack (kernel.ld)
 extern boot_kernel         ; Rust entry point (arch/boot.rs)
 extern isr_handler         ; ISR dispatcher (arch/traps.rs)
 extern SYSCALL_USER_RSP    ; SYSCALL scratch slot (descriptors.rs)
@@ -70,8 +70,9 @@ _start:
     mov fs, dx
     mov gs, dx
 
-    ; Set kernel stack (linked address — works through offset segment)
-    lea esp, [KERNEL_STACK + 32 * 1024]
+    ; Set kernel stack (linked address — works through offset segment).
+    ; KERNEL_STACK_TOP is a linker symbol at the high end of the stack.
+    mov esp, KERNEL_STACK_TOP
     xor ebp, ebp
 
     ; Call boot_kernel(magic, info) — cdecl, push right-to-left

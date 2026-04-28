@@ -15,6 +15,7 @@ rust_static_library(
     crate_features = ["kernel"],
     edition = "2024",
     rustc_flags = [
+        "-Copt-level=s",
         "-Cpanic=abort",
         "-Crelocation-model=static",
         "-Cforce-frame-pointers=yes",

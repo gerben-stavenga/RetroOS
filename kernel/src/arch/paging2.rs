@@ -796,6 +796,18 @@ pub const fn page_idx(vaddr: usize) -> usize {
     vaddr / PAGE_SIZE
 }
 
+/// Mark a kernel virtual page as not-present and flush its TLB entry.
+/// Used to install a guard page below the kernel stack so overflow
+/// page-faults instead of silently corrupting adjacent .data.
+pub fn unmap_kernel_page(vaddr: usize) {
+    let idx = page_idx(vaddr);
+    match entries() {
+        Entries::E32(e) => { e[idx] = Entry32(0); }
+        Entries::E64(e) => { e[idx] = Entry64(0); }
+    }
+    crate::arch::x86::invlpg(vaddr);
+}
+
 /// Get physical page number for a virtual address
 pub fn physical_page(vaddr: usize) -> u64 {
     let idx = page_idx(vaddr);
@@ -1050,6 +1062,16 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
 /// Enable paging with auto-detected mode
 /// scratch is used for identity mapping (temporary, can be reused after remove_identity_mapping)
 pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: usize) {
+    // The kernel mapping is hard-wired to PDE[770]'s last 1 MB
+    // (0xC0B00000-0xC0BFFFFF = 256 pages). Anything beyond gets silently
+    // truncated by `kernel_pages.min(256)` in enable_legacy/enable_pae and
+    // page-faults at runtime — see kernel/src/lib.rs:78. Trip a clear assert
+    // before that happens.
+    assert!(kernel_pages <= 256,
+        "kernel too large: {} pages (>{} pages = 1 MB). Either shrink the \
+         kernel or extend the mapping in enable_legacy/enable_pae to also \
+         populate PDE[771]+.",
+        kernel_pages, 256);
     // Note: physical_page() not available until page tables are set up
     if !cpu_supports_pae() {
         let scratch32 = unsafe { &mut *(scratch as *mut PageTable32) };

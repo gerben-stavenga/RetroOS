@@ -36,6 +36,22 @@ SECTIONS
     .bss ALIGN(4K) : {
         *(.bss .bss.*)
         *(COMMON)
+        /* Stacks live at the END of .bss, each preceded by a guard page
+         * that boot.rs unmaps so overflow page-faults instead of silently
+         * corrupting adjacent memory. KERNEL_STACK overflow is caught
+         * cleanly by traps.rs (handler runs on ARCH_STACK). ARCH_STACK
+         * overflow can't be reported — #PF would be delivered on the
+         * overflowed stack itself — but the unmapped guard turns silent
+         * corruption into a triple fault, which is easy to diagnose.
+         * Addresses are linker symbols — Rust references them via extern. */
+        . = ALIGN(4K);
+        KERNEL_STACK_GUARD = .;     . += 0x1000;   /* 4 KB */
+        KERNEL_STACK       = .;     . += 0x10000;  /* 64 KB */
+        KERNEL_STACK_TOP   = .;
+        . = ALIGN(4K);
+        ARCH_STACK_GUARD   = .;     . += 0x1000;   /* 4 KB */
+        ARCH_STACK         = .;     . += 0x4000;   /* 16 KB */
+        ARCH_STACK_TOP     = .;
     }
     _end = .;
 

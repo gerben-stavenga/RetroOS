@@ -56,41 +56,21 @@ pub struct MultibootInfo {
 static ZERO_PAGE: RawPage = unsafe { core::mem::zeroed() };
 static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
 
-#[repr(C, align(16))]
-pub struct AlignedStack<const N: usize>(pub [u8; N]);
-
-impl<const N: usize> AlignedStack<N> {
-    pub const fn new() -> Self {
-        Self([0; N])
-    }
-
-    pub fn top(&self) -> *const u8 {
-        self.0.as_ptr().wrapping_add(N)
-    }
-
-    pub fn top_mut(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr().wrapping_add(N)
-    }
-}
-
-/// Kernel stack - 32KB (used for Ring 1 event loop).
-/// ext4-view's call chain needs ~20KB in debug builds; keep opt-level >= 1
-/// or increase this (max ~60KB before exceeding PDE[770]'s 1MB kernel region).
-#[unsafe(no_mangle)]
-pub static mut KERNEL_STACK: AlignedStack<{ 32 * 1024 }> = AlignedStack::new();
-
-/// Ring-0 arch stack — used as TSS ESP0 so that interrupts from ring 1/3
-/// don't clobber the kernel's call frames.  Must be in .data (not BSS)
-/// so pages are physically backed even after fork marks BSS pages COW.
-#[unsafe(link_section = ".data")]
-pub static mut ARCH_STACK: AlignedStack<{ 16 * 1024 }> = AlignedStack::new();
-
-// Linker symbols (used by panic stack trace)
+// Linker symbols. Stacks and their guard pages live at the tail of .bss
+// (see kernel.ld); only their addresses matter to Rust, so they're declared
+// as opaque externs. Guard pages get unmapped at boot so kernel-stack
+// overflow takes a clean #PF instead of corrupting adjacent memory.
 unsafe extern "C" {
     static _kernel_start: u8;
     static _data: u8;
     static _edata: u8;
     static _end: u8;
+    pub static KERNEL_STACK_GUARD: u8;
+    pub static KERNEL_STACK: u8;
+    pub static KERNEL_STACK_TOP: u8;
+    pub static ARCH_STACK_GUARD: u8;
+    pub static ARCH_STACK: u8;
+    pub static ARCH_STACK_TOP: u8;
 }
 
 /// Raw CPU-pushed interrupt frame for 32-bit mode.
@@ -340,7 +320,6 @@ impl core::fmt::Debug for Regs {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    arch::cli();
     // Mirror to both VGA (println) and debugcon (dbg_println) so panic
     // shows up in out.log too, not just on the QEMU display.
     println!();
@@ -363,8 +342,5 @@ fn panic(info: &PanicInfo) -> ! {
 
     kernel::stacktrace::stack_trace();
 
-    loop {
-        arch::cli();
-        arch::hlt();
-    }
+    arch::halt_forever();
 }
