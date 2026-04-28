@@ -18,7 +18,7 @@ extern crate alloc;
 /// Trace DOS/DPMI calls when enabled.
 /// Compile-time master kill switch; constant-fold removes all trace calls
 /// when false.
-const DOS_TRACE: bool = true;
+const DOS_TRACE: bool = false;
 const DOS_TRACE_HW_IRG: bool = false;
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
@@ -26,14 +26,14 @@ const DOS_TRACE_HW_IRG: bool = false;
 /// child program, not surrounding shell/launcher noise. Default OFF so
 /// boot/init/DN startup are silent until something explicitly enables it.
 static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Independent gate for hardware-IRQ-vector trace lines (timer 0x08, key 0x09,
 /// etc). Default OFF so a noisy timer tick doesn't drown the per-call DPMI
 /// trace. Toggled by INT 31h synth AH=04 (on) / AH=05 (off). Both gates
 /// (general + HW) must be ON for an HW-vector trace to fire.
 pub(crate) static DOS_TRACE_HW_RT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Single-step tracing budget. Armed by specific DPMI handlers to watch the
 /// client's code path right after a suspicious return. Decremented on each
@@ -68,10 +68,12 @@ pub(crate) fn pm_step_log(regs: &crate::Regs) {
     );
 }
 
-/// Returns true if a trace line tied to interrupt vector `vec` should fire.
+/// Returns true if a trace line should fire. Folds away to `false` when the
+/// compile-time `DOS_TRACE` master switch is off, so disabled traces cost
+/// nothing in the binary.
 #[inline]
 fn should_trace() -> bool {
-    true
+    DOS_TRACE && DOS_TRACE_RT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 macro_rules! dos_trace {

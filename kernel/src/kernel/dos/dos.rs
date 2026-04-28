@@ -211,54 +211,35 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
             thread::KernelAction::Done
         }
         // AH=01h — SYNTH_FORK_EXEC: fork+exec program. Non-blocking.
-        // Reads the caller's own PSP cmdline at DS:0080h (byte-count + text),
-        // strips leading whitespace and an optional "/C", takes the first
-        // whitespace-delimited token as the program name.
+        // Input:  DS:DX -> ASCIIZ program filename (no shell parsing here)
+        //         ES:BX -> ASCIIZ command tail (use "" for no args; kernel
+        //                  installs it at the child's PSP[0x80] in DOS form
+        //                  with length byte and trailing CR).
         // Output on success (CF=0): AX=0, BX = child pid.
         // Output on error   (CF=1): AX = errno.
-        // Caller polls AH=04 (SYNTH_WAITPID) to wait/probe for child exit.
+        // Caller polls AH=04 (SYNTH_WAITPID) for exit. Shell concerns
+        // (parsing, /C, .BAT, built-ins) live entirely in COMMAND.COM.
         0x01 => {
-            let psp = linear(dos, regs, regs.ds as u16, 0);
-            let tail_len = unsafe { *((psp + 0x80) as *const u8) } as usize;
-            let read = |i: usize| -> u8 {
-                unsafe { *((psp + 0x81 + i as u32) as *const u8) }
+            let read_asciiz = |seg: u16, off: u32, dst: &mut [u8; 128]| -> usize {
+                let base = linear(dos, regs, seg, off);
+                let mut n = 0;
+                while n < 127 {
+                    let c = unsafe { *((base + n as u32) as *const u8) };
+                    if c == 0 { break; }
+                    dst[n] = c;
+                    n += 1;
+                }
+                n
             };
-            let mut i = 0;
-            while i < tail_len && matches!(read(i), b' ' | b'\t') { i += 1; }
-            if i + 1 < tail_len && read(i) == b'/' && (read(i + 1) & 0xDF) == b'C' {
-                i += 2;
-                while i < tail_len && matches!(read(i), b' ' | b'\t') { i += 1; }
-            }
             let mut filename = [0u8; 128];
-            let mut flen = 0;
-            while i < tail_len && flen < 127 {
-                let c = read(i);
-                if matches!(c, b' ' | b'\t' | b'\r' | 0) { break; }
-                filename[flen] = c;
-                flen += 1;
-                i += 1;
-            }
+            let flen = read_asciiz(regs.ds as u16, regs.rdx as u32, &mut filename);
             if flen == 0 {
                 regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
                 regs.set_flag32(1);
                 return thread::KernelAction::Done;
             }
-            // Skip whitespace after the program name; the rest is the
-            // arg string we forward to the child's PSP[0x80].
-            while i < tail_len && matches!(read(i), b' ' | b'\t') { i += 1; }
             let mut tail = [0u8; 128];
-            let mut tlen = 0;
-            while i < tail_len && tlen < 127 {
-                let c = read(i);
-                if matches!(c, b'\r' | 0) { break; }
-                tail[tlen] = c;
-                tlen += 1;
-                i += 1;
-            }
-            // Trim trailing whitespace.
-            while tlen > 0 && matches!(tail[tlen - 1], b' ' | b'\t') { tlen -= 1; }
-            // If the name is a .BAT, expand to its first executable command.
-            let flen = expand_bat(dos, &mut filename, flen, kt);
+            let tlen = read_asciiz(regs.es as u16, regs.rbx as u32, &mut tail);
             fork_exec(dos, &filename[..flen], &tail[..tlen], kt)
         }
         // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
@@ -394,7 +375,7 @@ fn dos_putchar(c: u8) {
 fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     if ah != 0x2C && ah != 0x2A && regs.mode() == crate::UserMode::VM86 {
-        dos_trace!(force "[INT21] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+        dos_trace!("[INT21] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
             regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
     }
@@ -1515,75 +1496,6 @@ fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, n
     -2 // ENOENT
 }
 
-/// Expand a .BAT file to its first executable command.
-///
-/// If `filename[..flen]` names a .BAT file, open it, find the first line
-/// that isn't blank / REM / `@echo off` / `:label`, strip a leading `@`,
-/// and copy the first whitespace-delimited token back into `filename`.
-/// Returns the new length. For non-.BAT names, returns `flen` unchanged.
-///
-/// Only the first command is executed — multi-line BAT semantics (loops,
-/// conditionals, state) are out of scope for this basic handler.
-fn expand_bat(dos: &mut thread::DosState, filename: &mut [u8; 128], flen: usize, kt: &mut thread::KernelThread) -> usize {
-    // Case-insensitive suffix check for ".BAT"
-    if flen < 4 { return flen; }
-    let tail = &filename[flen - 4..flen];
-    if !(tail[0] == b'.'
-        && (tail[1] & 0xDF) == b'B'
-        && (tail[2] & 0xDF) == b'A'
-        && (tail[3] & 0xDF) == b'T') { return flen; }
-
-    let (vfs_path, vfs_len) = match dfs_open_existing(dos, &filename[..flen]) {
-        Ok(v) => v,
-        Err(_) => return flen,
-    };
-    let fd = crate::kernel::vfs::open(&vfs_path[..vfs_len], &mut kt.fds);
-    if fd < 0 { return flen; }
-
-    let mut buf = [0u8; 512];
-    let n = crate::kernel::vfs::read_raw(fd, &mut buf, &kt.fds);
-    crate::kernel::vfs::close(fd, &mut kt.fds);
-    if n <= 0 { return flen; }
-    let n = n as usize;
-
-    // Walk lines, find the first real command.
-    let mut p = 0usize;
-    while p < n {
-        // Skip leading whitespace
-        while p < n && matches!(buf[p], b' ' | b'\t') { p += 1; }
-        // Blank line?
-        if p >= n || matches!(buf[p], b'\r' | b'\n') {
-            while p < n && matches!(buf[p], b'\r' | b'\n') { p += 1; }
-            continue;
-        }
-        // Optional leading '@' (suppress echo) — strip it
-        let mut q = p;
-        if buf[q] == b'@' { q += 1; }
-        // REM / ECHO OFF / label — skip whole line
-        let lower = |i: usize| -> u8 { if i < n { buf[i] & 0xDF } else { 0 } };
-        let end_of_word = |i: usize| -> bool {
-            i >= n || matches!(buf[i], b' ' | b'\t' | b'\r' | b'\n')
-        };
-        let is_rem = lower(q) == b'R' && lower(q+1) == b'E' && lower(q+2) == b'M' && end_of_word(q+3);
-        let is_echo = lower(q) == b'E' && lower(q+1) == b'C' && lower(q+2) == b'H' && lower(q+3) == b'O' && end_of_word(q+4);
-        let is_label = buf[q] == b':';
-        if is_rem || is_echo || is_label {
-            while p < n && !matches!(buf[p], b'\r' | b'\n') { p += 1; }
-            continue;
-        }
-        // Real command — extract first whitespace-delimited token
-        let start = q;
-        let mut end = q;
-        while end < n && !matches!(buf[end], b' ' | b'\t' | b'\r' | b'\n') { end += 1; }
-        let tok_len = (end - start).min(127);
-        // Zero the buffer first so leftover bytes don't leak
-        for b in filename.iter_mut() { *b = 0; }
-        filename[..tok_len].copy_from_slice(&buf[start..start + tok_len]);
-        return tok_len;
-    }
-    flen
-}
-
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
 fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], _kt: &mut thread::KernelThread) -> thread::KernelAction {
@@ -1630,7 +1542,8 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], _kt: 
 /// shares the address space with the parent, and transfers control.
 /// Parent resumes via exec_return on child INT 20h / 4C00.
 /// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C
-/// which uses synth INT 31h AH=01h to fork+exec+wait a separate thread.
+/// which interprets BAT itself and uses synth INT 31h AH=01h to
+/// fork+exec+wait each external command in a separate thread.
 fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let al = regs.rax as u8;
     match al {
