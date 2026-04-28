@@ -357,7 +357,12 @@ pub fn handle_event(
     let is_vm86 = regs.mode() == crate::UserMode::VM86;
     match kevent {
         KE::Irq => thread::KernelAction::Done,
-        KE::Hlt => thread::KernelAction::Yield,
+        // Cooperative focus: HLT means "park me until an IRQ arrives". It
+        // must NOT yield/schedule — that would hand focus to the next Ready
+        // thread on the very first idle cycle, defeating F11. The Phase 1
+        // drain re-runs raise_pending each iteration, so any pending IRQ
+        // gets injected on the next round.
+        KE::Hlt => thread::KernelAction::Done,
         KE::SoftInt(n) => {
             if n == 0x31 {
                 // Kernel syscall — `syscall` branches on mode + CS to reach
@@ -424,7 +429,7 @@ pub fn handle_event(
 /// seed `DfsState`. Pass `&[]` for an initial load with no parent.
 /// cs/ip/ss/sp are real-mode segment:offset values.
 fn init_process_thread_vm86(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16, cwd: &[u8]) {
-    use machine::{VM_FLAG, IF_FLAG, VIF_FLAG};
+    use machine::{VM_FLAG, IF_FLAG, IOPL_VM86};
     let mut dos_state = DosState::new();
     dos_state.dfs.init_from_vfs(cwd);
     thread.personality = thread::Personality::Dos(dos_state);
@@ -440,7 +445,7 @@ fn init_process_thread_vm86(thread: &mut thread::Thread, psp_seg: u16, cs: u16, 
     state.frame = crate::Frame64 {
         rip: ip as u64,
         cs: cs as u64,
-        rflags: (VM_FLAG | IF_FLAG | VIF_FLAG | 0x1000) as u64,
+        rflags: (VM_FLAG | IF_FLAG | IOPL_VM86) as u64,
         rsp: sp as u64,
         ss: ss as u64,
     };
@@ -621,9 +626,9 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 /// `SLOT_PM_RET_{16,32}` → `cross_mode_restore` → back to the client's
 /// original state (VM86 or PM). If `pm_vectors[vec]` is the default stub
 /// (no PM handler installed), `vector_stub_reflect` runs `cross_mode_restore`
-/// and then reflects the IRQ to BIOS — via `machine::reflect_interrupt`
-/// when the restored state is VM86, via `reflect_int_to_real_mode` when
-/// it's PM.
+/// and then reflects the IRQ to BIOS via `reflect_int_to_real_mode` —
+/// uniformly for VM86 and PM clients. BIOS executes on a kernel-owned RM
+/// frame allocated from host_stack, never on the client's own stack.
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
     DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);

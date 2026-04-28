@@ -19,8 +19,13 @@ use crate::Regs;
 
 pub const IF_FLAG: u32 = 1 << 9;
 pub const IOPL_MASK: u32 = 3 << 12;
+/// IOPL=1 — kernel-set value for VM86 threads. With IOPL<3 and VME,
+/// CLI/STI/PUSHF/POPF/INT/IRET virtualize through VIF instead of touching
+/// real IF, which is exactly what the cooperative IRQ-injection model
+/// needs. IOPL=0 would also virtualize but trap on a few extras; IOPL=3
+/// would let the guest manipulate real IF and bypass the gate.
+pub const IOPL_VM86: u32 = 1 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
-pub const VIF_FLAG: u32 = 1 << 19;
 
 pub const NT_FLAG: u32 = 1 << 14;
 /// Flags that user code cannot change (IOPL, VM, NT)
@@ -1102,7 +1107,7 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
 /// interrupt flag and in-service register. Returns the vector to deliver
 /// (and marks it in-service on the master PIC), or `None` if nothing is
 /// ready. The caller is responsible for pushing the interrupt frame
-/// (see `reflect_interrupt` for VM86 or `dpmi::deliver_pm_int` for PM).
+/// (see `dpmi::reflect_int_to_real_mode` / `dpmi::deliver_pm_irq`).
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
     if !vif {
@@ -1128,21 +1133,6 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     // Clear VIP — interrupt is being serviced
     regs.frame.rflags &= !(1u64 << 20);
     Some(vec)
-}
-
-/// Reflect an interrupt through the real-mode IVT: push FLAGS/CS/IP,
-/// clear IF, load CS:IP from the vector table.
-pub fn reflect_interrupt(regs: &mut Regs, int_num: u8) {
-    let old_cs = vm86_cs(regs);
-    let old_ip = vm86_ip(regs);
-    let new_ip = read_u16(0, (int_num as u32) * 4);
-    let new_cs = read_u16(0, (int_num as u32) * 4 + 2);
-    vm86_push(regs, vm86_flags(regs) as u16);
-    vm86_push(regs, old_cs);
-    vm86_push(regs, old_ip);
-    regs.clear_flag32(IF_FLAG);
-    set_vm86_ip(regs, new_ip);
-    set_vm86_cs(regs, new_cs);
 }
 
 /// Read a u16 from a real-mode seg:off address (unaligned-safe, null-safe)

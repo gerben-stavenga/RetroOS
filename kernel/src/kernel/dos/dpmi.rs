@@ -213,6 +213,29 @@ fn host_stack_read_save(cursor: u32) -> ModeSave {
     unsafe { core::ptr::read_unaligned(addr as *const ModeSave) }
 }
 
+/// Size of an RM IRQ stack frame allocated from host_stack. Each
+/// `reflect_int_to_real_mode` carves one of these out below its ModeSave;
+/// BIOS runs on it, then `rm_iret_reflect` frees it. 0x200 is plenty for a
+/// BIOS IRQ handler's working set and matches the size DPMI extenders
+/// typically allocate per-session for the same purpose.
+pub(super) const RM_IRQ_FRAME_SIZE: u32 = 0x200;
+
+/// Allocate an `RM_IRQ_FRAME_SIZE` slab from host_stack at the given cursor
+/// and return (new_cursor, ss, sp_top) suitable for a VM86 BIOS handler.
+/// Used by `reflect_int_to_real_mode` instead of a per-DPMI rm_stack_seg —
+/// nested IRQ reflections each get their own slab so they can't trample
+/// the outer handler's stack. ss/sp are computed from the slab's linear
+/// address: ss is the paragraph-aligned floor, sp lands two bytes below
+/// the slab's top byte (matching the per-session `RM_STACK_TOP` convention
+/// — leaves the top word free so 32-bit pushes can never overflow).
+fn host_stack_alloc_rm_frame(cursor: u32) -> (u32, u16, u16) {
+    let new_cursor = cursor - RM_IRQ_FRAME_SIZE;
+    let linear = dos::host_stack_base() + new_cursor;
+    let ss = (linear >> 4) as u16;
+    let sp = (RM_IRQ_FRAME_SIZE as u16 - 2) + ((linear & 0xF) as u16);
+    (new_cursor, ss, sp)
+}
+
 /// Write a `CallStubFrame` at the cursor. Returns the new (lower) cursor.
 fn host_stack_write_call_args(cursor: u32, frame: CallStubFrame) -> u32 {
     let new_cursor = cursor - CALL_STUB_SIZE;
@@ -983,8 +1006,9 @@ fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u1
 ///     host-snapshotted PM delivery (HW IRQ via `deliver_pm_irq` or PM
 ///     soft INT via `deliver_pm_int`). Pop the snapshot via
 ///     `cross_mode_restore`, which puts us back in the client's original
-///     mode, then reflect the INT to BIOS with `machine::reflect_interrupt`
-///     (VM86) or `reflect_int_to_real_mode` (PM).
+///     mode, then reflect the INT to BIOS via `reflect_int_to_real_mode`
+///     uniformly (VM86 and PM clients alike — BIOS always runs on a
+///     kernel-owned RM frame allocated from host_stack).
 ///
 ///   - Target is anything else → the pushed frame carries an outer
 ///     handler's CS:EIP, i.e. we're nested inside a still-live handler.
@@ -1014,10 +1038,10 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
     if is_outermost {
         let _ = (ret_eip, ret_cs, ret_flags);
         cross_mode_restore(dos, regs);
-        if regs.frame.rflags & (machine::VM_FLAG as u64) != 0 {
-            machine::reflect_interrupt(regs, vector);
-            return thread::KernelAction::Done;
-        }
+        // BIOS reflection runs on a kernel-owned RM frame for both VM86
+        // and PM clients — never on the client's own stack. Avoids the
+        // class of bugs where a HW IRQ pushes onto a client whose stack
+        // is in a sensitive state (e.g. immediately after exec_return).
         return reflect_int_to_real_mode(dos, regs, vector);
     }
 
@@ -1837,7 +1861,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     // Set CS:IP to the IVT handler
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG | 0x1000) as u64;
+    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
 
     dos_trace!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         int_num, ivt_seg, ivt_off, rm_ss, rm_sp.wrapping_sub(6));
@@ -1858,15 +1882,17 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     // matching [INT31] enter. SLOT_RM_IRET_REFLECT dispatch re-enables.
     dos::DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
 
-    // Save PM state on host_stack. The slot identity (REFLECT vs CALL)
-    // encodes the unwind behavior — no `synth_sti`/`rm_struct_addr` tag
-    // in the save itself.
+    // Save client state on host_stack, then carve a fresh RM IRQ frame
+    // immediately below it. BIOS runs on the slab — never on the client's
+    // own VM86 stack — so a HW IRQ landing during a sensitive moment in the
+    // client (e.g. just after exec_return) can't trample the client's
+    // saved registers / return address. Nested IRQs each allocate their
+    // own slab; the SLOT_RM_IRET_REFLECT unwind frees both records.
+    // Works for VM86 and PM clients alike — no DPMI session required.
     let save = ModeSave::capture(regs);
     dos.pc.host_stack_sp = host_stack_write_save(dos.pc.host_stack_sp, save);
-
-    let dpmi = dos.dpmi.as_ref().unwrap();
-    let rm_ss = dpmi.rm_stack_seg;
-    let rm_sp: u16 = RM_STACK_TOP;
+    let (new_cursor, rm_ss, rm_sp) = host_stack_alloc_rm_frame(dos.pc.host_stack_sp);
+    dos.pc.host_stack_sp = new_cursor;
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
@@ -1876,16 +1902,31 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     regs.frame.rsp = rm_sp as u64;
 
     // Push RM IRET frame targeting SLOT_RM_IRET_REFLECT.
+    // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
+    // own INT n in real mode would push: FLAGS / CS / IP. FLAGS is the
+    // client's flags *unmodified* — that's what real-mode INT writes,
+    // and it's what BIOS IRET pops back. The handler runs with IF=0
+    // because we set it on `regs.frame.rflags` below, not by mutating
+    // the on-stack frame. Pushing 0 (or modifying flags here) would let
+    // `rm_iret_reflect`'s status-flag passthrough (CF/ZF/DF/...) snapshot
+    // wrong values and silently corrupt the client across the IRQ.
+    let ret_flags = regs.flags32() as u16;
     let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET_REFLECT);
     let ret_seg: u16 = dos::STUB_SEG;
-    machine::vm86_push(regs, 0); // flags
+    machine::vm86_push(regs, ret_flags);
     machine::vm86_push(regs, ret_seg);
     machine::vm86_push(regs, ret_off);
 
-    // Set VM86 entry to IVT handler
+    // Enter the BIOS handler in VM86 with IF cleared — matches what the
+    // CPU's own INT n does in real mode (preserves status flags, just
+    // clears IF). VIF is owned by the arch layer (VME virtualization),
+    // not us. IOPL=1 keeps cli/sti virtualized.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG | 0x1000) as u64;
+    let flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
+        | machine::VM_FLAG
+        | machine::IOPL_VM86;
+    regs.frame.rflags = flags as u64;
 
     // Per DPMI, the host must not translate PM selectors into RM paragraphs
     // when reflecting a software interrupt. The extender/client is responsible
@@ -1940,7 +1981,7 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     // Jump to the far procedure
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
-    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG | 0x1000) as u64;
+    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
     thread::KernelAction::Done
 }
 
@@ -1995,7 +2036,7 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
 
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
-    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::VIF_FLAG | 0x1000) as u64;
+    regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
 
     thread::KernelAction::Done
 }
@@ -2079,8 +2120,10 @@ pub fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5; // CF,PF,AF,ZF,SF,OF,DF
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    let save = host_stack_read_save(dos.pc.host_stack_sp);
-    dos.pc.host_stack_sp += MODE_SAVE_SIZE;
+    // The RM IRQ slab sits below the ModeSave: free both. ModeSave is at
+    // host_stack_sp + RM_IRQ_FRAME_SIZE; cursor advances past both.
+    let save = host_stack_read_save(dos.pc.host_stack_sp + RM_IRQ_FRAME_SIZE);
+    dos.pc.host_stack_sp += RM_IRQ_FRAME_SIZE + MODE_SAVE_SIZE;
     save.restore(regs);
 
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
