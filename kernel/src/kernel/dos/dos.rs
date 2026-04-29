@@ -246,7 +246,7 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
             }
             let mut tail = [0u8; 128];
             let tlen = read_asciiz(regs.es as u16, regs.rbx as u32, &mut tail);
-            fork_exec(dos, &filename[..flen], &tail[..tlen], kt)
+            fork_exec(dos, &filename[..flen], &tail[..tlen], regs, kt)
         }
         // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
         // BX = child pid (from a prior AH=01).
@@ -1468,7 +1468,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     // Shift the program name to the start of the buffer.
     let plen = end - start;
     cmd.copy_within(start..end, 0);
-    fork_exec(dos, &cmd[..plen], b"", kt)
+    fork_exec(dos, &cmd[..plen], b"", regs, kt)
 }
 
 // ============================================================================
@@ -1520,35 +1520,21 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction
 }
 
 
+/// Open a DOS program file by literal name. No extension probing, no
+/// PATH search -- those are shell concerns and live in COMMAND.COM,
+/// matching real DOS where INT 21h AH=4B takes a fully-qualified name.
 fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, name: &[u8]) -> i32 {
-    let try_open = |dos: &thread::DosState, kt: &mut thread::KernelThread, n: &[u8]| -> i32 {
-        match dfs_open_existing(dos, n) {
-            Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
-            Err(_) => -2,
-        }
-    };
-
-    let fd = try_open(dos, kt, name);
-    if fd >= 0 { return fd; }
-    // If the name already has a dot, don't try extensions
-    if name.iter().any(|&c| c == b'.') { return fd; }
-    // Try .COM / .EXE / .ELF in turn
-    let mut buf = [0u8; 132];
-    let nlen = name.len();
-    if nlen + 4 > buf.len() { return -2; }
-    buf[..nlen].copy_from_slice(name);
-    for ext in [b".COM", b".EXE", b".ELF"] {
-        buf[nlen..nlen + 4].copy_from_slice(ext);
-        let fd = try_open(dos, kt, &buf[..nlen + 4]);
-        if fd >= 0 { return fd; }
+    match dfs_open_existing(dos, name) {
+        Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
+        Err(_) => -2,
     }
-    -2 // ENOENT
 }
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], _kt: &mut thread::KernelThread) -> thread::KernelAction {
-    // Resolve raw DOS name → VFS path via DFS.
+fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs: &mut Regs, _kt: &mut thread::KernelThread) -> thread::KernelAction {
+    // Resolve raw DOS name → VFS path via DFS. No extension probing or
+    // PATH search here -- those live in COMMAND.COM, matching real DOS.
     let mut path = [0u8; 164];
     let path_len = match dfs_open_existing(dos, prog_name) {
         Ok((p, len)) => {
@@ -1556,7 +1542,8 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], _kt: 
             len
         }
         Err(_) => {
-            // Let the event loop handle ENOENT by reporting failure.
+            regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
+            regs.set_flag32(1);
             return thread::KernelAction::Done;
         }
     };
@@ -1671,7 +1658,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
     dos_trace!("  exec_program: {:?} size={} elf={}", core::str::from_utf8(prog_name), size, is_elf);
     if is_elf {
-        return fork_exec(dos, prog_name, b"", kt);
+        return fork_exec(dos, prog_name, b"", regs, kt);
     }
 
     let is_exe = is_mz_exe(&buf);
