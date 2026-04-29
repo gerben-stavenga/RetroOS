@@ -34,6 +34,7 @@ static union REGS r;
 static struct SREGS s;
 static int echo_on = 1;
 static int should_exit = 0;     /* set by EXIT builtin to break out of BAT */
+static int trace_active = 0;    /* /T flag: kernel DOS trace is on for this run */
 static const char empty_str[] = "";
 
 /* ----- thin INT wrappers ----- */
@@ -71,24 +72,17 @@ static void trace(int on) {
 static char loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
 static int  loadfix_count = 0;
 
-static int strieq(const char *a, const char *b) {
-    while (*a && *b) {
-        char ca = (char)toupper((unsigned char)*a);
-        char cb = (char)toupper((unsigned char)*b);
-        if (ca != cb) return 0;
-        a++; b++;
-    }
-    return *a == 0 && *b == 0;
-}
-
+/* Last component of a DOS path: skip past any '\\', '/', or ':'. */
 static const char *basename_of(const char *path) {
     const char *p = path;
-    const char *base = path;
-    while (*p) {
-        if (*p == '\\' || *p == '/' || *p == ':') base = p + 1;
-        p++;
-    }
-    return base;
+    const char *q;
+    while ((q = strpbrk(p, "\\/:")) != 0) p = q + 1;
+    return p;
+}
+
+static int has_ext(const char *name, const char *ext) {
+    const char *dot = strrchr(name, '.');
+    return dot && stricmp(dot, ext) == 0;
 }
 
 static void load_loadfix_cfg(void) {
@@ -97,16 +91,10 @@ static void load_loadfix_cfg(void) {
     f = fopen("C:\\LOADFIX.CFG", "r");
     if (!f) return;
     while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
-        char *p = line;
-        char *q;
-        int n;
-        while (*p == ' ' || *p == '\t') p++;
+        char *p = line + strspn(line, " \t");
         if (*p == 0 || *p == ';' || *p == '#' || *p == '\r' || *p == '\n') continue;
-        q = p;
-        while (*q && *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') q++;
-        *q = 0;
-        n = (int)strlen(p);
-        if (n == 0 || n >= LF_NAME_LEN) continue;
+        p[strcspn(p, " \t\r\n")] = 0;
+        if (strlen(p) == 0 || strlen(p) >= LF_NAME_LEN) continue;
         strcpy(loadfix_names[loadfix_count++], p);
     }
     fclose(f);
@@ -116,30 +104,69 @@ static int is_loadfix(const char *name) {
     const char *base = basename_of(name);
     int i;
     for (i = 0; i < loadfix_count; i++) {
-        if (strieq(base, loadfix_names[i])) return 1;
+        if (stricmp(base, loadfix_names[i]) == 0) return 1;
     }
     return 0;
 }
 
-/* ----- string helpers ----- */
+/* ----- program resolution -----
+ *
+ * Real DOS keeps INT 21h AH=4B raw: it takes a fully-qualified filename
+ * and that's it. PATH search and extension probing live in COMMAND.COM,
+ * and we do the same -- the kernel never sees a bare "command", only
+ * "C:\\COMMAND.COM" once we've resolved it. */
 
-static int istreq(const char *a, const char *b) {
-    while (*a && *b) {
-        char ca = (char)toupper((unsigned char)*a);
-        char cb = (char)toupper((unsigned char)*b);
-        if (ca != cb) return 1;
-        a++; b++;
-    }
-    return *a != *b;
+static int file_exists(const char *p) {
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
 }
 
-static int ends_with_bat(const char *name) {
-    int n = (int)strlen(name);
-    if (n < 4) return 0;
-    return (name[n-4] == '.' &&
-            (name[n-3] & 0xDF) == 'B' &&
-            (name[n-2] & 0xDF) == 'A' &&
-            (name[n-1] & 0xDF) == 'T');
+/* Probe `prefix` + `name`, optionally trying .COM/.EXE/.BAT if the name
+ * has no extension. Writes resolved path to `out` and returns 1 on hit. */
+static int try_resolve(const char *prefix, const char *name, char *out) {
+    static const char *exts[] = { ".COM", ".EXE", ".BAT" };
+    int i;
+    if (strchr(name, '.')) {
+        sprintf(out, "%s%s", prefix, name);
+        return file_exists(out);
+    }
+    for (i = 0; i < 3; i++) {
+        sprintf(out, "%s%s%s", prefix, name, exts[i]);
+        if (file_exists(out)) return 1;
+    }
+    return 0;
+}
+
+/* Resolve a program name like real COMMAND.COM:
+ *   - drive/dir-qualified: take as-is, just probe extensions.
+ *   - bare: probe cwd, then walk PATH dirs.
+ * .COM beats .EXE beats .BAT. Returns 1 on hit, 0 on "not found". */
+static int resolve_program(const char *name, char *out) {
+    char *path_env, *p;
+    char dir[80];
+    int qualified = strpbrk(name, "\\/") != 0
+                 || (name[0] && name[1] == ':');
+
+    if (qualified) return try_resolve("", name, out);
+    if (try_resolve("", name, out)) return 1;
+
+    path_env = getenv("PATH");
+    if (!path_env) return 0;
+    p = path_env;
+    while (*p) {
+        size_t dlen = strcspn(p, ";");
+        if (dlen > 0 && dlen < sizeof(dir) - 1) {
+            memcpy(dir, p, dlen);
+            dir[dlen] = 0;
+            if (!strchr("\\/:", dir[dlen-1])) strcat(dir, "\\");
+            if (try_resolve(dir, name, out)) return 1;
+        }
+        p += dlen;
+        if (*p == ';') p++;
+    }
+    return 0;
 }
 
 static char *skipws(char *p) {
@@ -291,14 +318,21 @@ static int run_external_raw(const char *name, const char *args, int poll_kbd) {
  * keeps the interactive shell free to multitask. */
 static int run_loadfix_via_trampoline(const char *prog, const char *args, int poll_kbd) {
     static char tail[128];
-    if (args && *args) sprintf(tail, "/L %s %s", prog, args);
-    else               sprintf(tail, "/L %s", prog);
+    const char *tpfx = trace_active ? "/T " : "";
+    if (args && *args) sprintf(tail, "%s/L %s %s", tpfx, prog, args);
+    else               sprintf(tail, "%s/L %s", tpfx, prog);
     return run_external_raw("C:\\COMMAND.COM", tail, poll_kbd);
 }
 
 static int run_external(const char *name, const char *args, int poll_kbd) {
-    if (is_loadfix(name)) return run_loadfix_via_trampoline(name, args, poll_kbd);
-    return run_external_raw(name, args, poll_kbd);
+    char resolved[80];
+    if (!resolve_program(name, resolved)) {
+        puts("Bad command or file name");
+        return 255;
+    }
+    if (has_ext(resolved, ".BAT")) return run_bat_file(resolved);
+    if (is_loadfix(resolved)) return run_loadfix_via_trampoline(resolved, args, poll_kbd);
+    return run_external_raw(resolved, args, poll_kbd);
 }
 
 /* ----- built-ins ----- */
@@ -373,14 +407,14 @@ static int builtin_pause(void) {
 /* If `name` is a built-in, run it and store its exit code in *exit_code,
  * then return 1. Otherwise return 0. EXIT terminates the process directly. */
 static int try_builtin(const char *name, char *args, int *exit_code) {
-    if (istreq(name, "REM") == 0)   { *exit_code = 0; return 1; }
-    if (istreq(name, "ECHO") == 0)  { *exit_code = builtin_echo(args);  return 1; }
-    if (istreq(name, "CD") == 0 ||
-        istreq(name, "CHDIR") == 0) { *exit_code = builtin_cd(args);    return 1; }
-    if (istreq(name, "CLS") == 0)   { *exit_code = builtin_cls();       return 1; }
-    if (istreq(name, "TYPE") == 0)  { *exit_code = builtin_type(args);  return 1; }
-    if (istreq(name, "PAUSE") == 0) { *exit_code = builtin_pause();     return 1; }
-    if (istreq(name, "EXIT") == 0) {
+    if (stricmp(name, "REM") == 0)   { *exit_code = 0; return 1; }
+    if (stricmp(name, "ECHO") == 0)  { *exit_code = builtin_echo(args);  return 1; }
+    if (stricmp(name, "CD") == 0 ||
+        stricmp(name, "CHDIR") == 0) { *exit_code = builtin_cd(args);    return 1; }
+    if (stricmp(name, "CLS") == 0)   { *exit_code = builtin_cls();       return 1; }
+    if (stricmp(name, "TYPE") == 0)  { *exit_code = builtin_type(args);  return 1; }
+    if (stricmp(name, "PAUSE") == 0) { *exit_code = builtin_pause();     return 1; }
+    if (stricmp(name, "EXIT") == 0) {
         *exit_code = atoi(skipws(args));
         should_exit = 1;
         return 1;
@@ -433,22 +467,30 @@ int main(void) {
     char *p, *prog, *args;
     int exit_code = 0;
 
-    trace(1);
     load_loadfix_cfg();
 
     read_cmdline(cmdline, sizeof(cmdline));
     p = skipws(cmdline);
 
+    /* /T -- enable kernel DOS trace for this command. Off by default;
+     * DN's "Ctrl+Enter" path turns it on via DN.EXT overrides. */
+    if (p[0] == '/' && (p[1] == 'T' || p[1] == 't') &&
+        (p[2] == 0 || p[2] == ' ' || p[2] == '\t')) {
+        trace_active = 1;
+        trace(1);
+        p = skipws(p + 2);
+    }
+
     /* /L progname [args] -- LOADFIX trampoline entry. The interactive
      * COMMAND.COM forks us with this when it sees a name in loadfix.cfg;
-     * we alloc a low dummy block and EXEC the program in-process so its
-     * PSP lands above segment 0x1000 (dodging EXEPACK's load-low bug). */
+     * we EXEC the program in-process so its PSP lands above segment
+     * 0x1000 (dodging EXEPACK's load-low bug). */
     if (p[0] == '/' && (p[1] == 'L' || p[1] == 'l') &&
         (p[2] == ' ' || p[2] == '\t')) {
         p = skipws(p + 2);
         prog = split_first(p, &args);
         exit_code = run_loadfix_inplace(prog, args);
-        trace(0);
+        if (trace_active) trace(0);
         return exit_code;
     }
 
@@ -464,16 +506,12 @@ int main(void) {
          * which we hand straight to the kernel for the child's PSP[0x80]. */
         prog = split_first(p, &args);
 
-        if (try_builtin(prog, args, &exit_code)) {
-            /* handled */
-        } else if (ends_with_bat(prog)) {
-            exit_code = run_bat_file(prog);
-        } else {
+        if (!try_builtin(prog, args, &exit_code)) {
             /* External -- interactive launcher mode (Ctrl-Z backgrounds). */
             exit_code = run_external(prog, args, 1);
         }
     }
 
-    trace(0);
+    if (trace_active) trace(0);
     return exit_code;
 }

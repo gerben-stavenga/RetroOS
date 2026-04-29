@@ -69,6 +69,13 @@ fxp{    foxprol !.!}
 elf{    !.!}
 elf(    !.!)
 
+; ~~~~~~~~~~~~~~~~~~~~~~   DOS native + trace   ~~~~~~~~~~~~~~~~~~~~~~~~
+; Ctrl+Enter on a native binary launches it through COMMAND /T /C, which
+; turns on the kernel DOS trace for just that run (off again on exit).
+exe(    command /t /c !.!)
+com(    command /t /c !.!)
+bat(    command /t /c !.!)
+
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~   Misc   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 stm{    ..\StMod ! F}
 bak{    del *.bak}
