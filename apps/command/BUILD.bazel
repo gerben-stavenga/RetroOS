@@ -1,6 +1,6 @@
 # COMMAND.COM is built at boot inside RetroOS by TC compiling SRC/COMMAND.C.
 # Just export the source so the root tar can ship it at SRC/COMMAND.C.
 exports_files(
-    ["command.c"],
+    ["command.c", "LOADFIX.CFG"],
     visibility = ["//visibility:public"],
 )

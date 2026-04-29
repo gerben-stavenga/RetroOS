@@ -43,6 +43,84 @@ static void trace(int on) {
     int86(0x31, &r, &r);
 }
 
+/* ----- LOADFIX list -----
+ *
+ * EXEPACK-compressed binaries (Borland CHESS, plenty of early-90s tools)
+ * have a relocator bug that crashes when loaded below segment 0x1000.
+ * Real DOS shipped LOADFIX.COM which allocated ~64 KB low, pushing the
+ * program above 0x1000. RetroOS has no DOS resident eating low memory,
+ * so every program loads below 0x1000 by default and EXEPACK trips on
+ * "Packed file is corrupt".
+ *
+ * loadfix.cfg lists basenames (e.g. "CHESS.EXE") that need the
+ * push-up. The kernel knows nothing about LOADFIX. We implement it
+ * entirely here:
+ *   1) interactive COMMAND.COM sees is_loadfix(name) and fork-execs
+ *      itself with cmdline "/L <name> [args]" (multitasking preserved);
+ *   2) the trampoline child takes the /L branch in main() and EXECs
+ *      the target in-process via INT 21h AH=4B AL=00.
+ *
+ * The trampoline alone is the push-up: our COMMAND.COM is a tiny-model
+ * .COM and so claims a full 64 KB block, exactly the shift real LOADFIX
+ * provided. The EXEC'd child loads at PSP > 0x1000 and EXEPACK is happy.
+ * No extra dummy alloc -- adding one would steal headroom from programs
+ * with large minalloc (CHESS.EXE asks for ~440 KB) and break the load. */
+
+#define LF_MAX_NAMES 32
+#define LF_NAME_LEN  16
+static char loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
+static int  loadfix_count = 0;
+
+static int strieq(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = (char)toupper((unsigned char)*a);
+        char cb = (char)toupper((unsigned char)*b);
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static const char *basename_of(const char *path) {
+    const char *p = path;
+    const char *base = path;
+    while (*p) {
+        if (*p == '\\' || *p == '/' || *p == ':') base = p + 1;
+        p++;
+    }
+    return base;
+}
+
+static void load_loadfix_cfg(void) {
+    FILE *f;
+    char line[64];
+    f = fopen("C:\\LOADFIX.CFG", "r");
+    if (!f) return;
+    while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
+        char *p = line;
+        char *q;
+        int n;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == 0 || *p == ';' || *p == '#' || *p == '\r' || *p == '\n') continue;
+        q = p;
+        while (*q && *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') q++;
+        *q = 0;
+        n = (int)strlen(p);
+        if (n == 0 || n >= LF_NAME_LEN) continue;
+        strcpy(loadfix_names[loadfix_count++], p);
+    }
+    fclose(f);
+}
+
+static int is_loadfix(const char *name) {
+    const char *base = basename_of(name);
+    int i;
+    for (i = 0; i < loadfix_count; i++) {
+        if (strieq(base, loadfix_names[i])) return 1;
+    }
+    return 0;
+}
+
 /* ----- string helpers ----- */
 
 static int istreq(const char *a, const char *b) {
@@ -100,6 +178,8 @@ static void read_cmdline(char *dst, int max) {
 
 /* ----- kernel synth syscalls ----- */
 
+static unsigned char get_child_exit_code(void);
+
 static int synth_fork_exec(const char *name, const char *args) {
     segread(&s);
     r.h.ah = 0x01;
@@ -108,6 +188,53 @@ static int synth_fork_exec(const char *name, const char *args) {
     int86x(0x31, &r, &r, &s);
     if (r.x.cflag) return -1;
     return (int)r.x.bx;
+}
+
+/* In-process EXEC via INT 21h AH=4Bh AL=00h. Child loads in our address
+ * space at our heap_seg, runs, exits, control returns here. Used by the
+ * LOADFIX trampoline path (see /L handling below): we alloc a dummy
+ * low block first, then EXEC, so the child's PSP lands above segment
+ * 0x1000 -- far enough to dodge EXEPACK's load-low relocation overflow. */
+static int dos_exec_inplace(const char *name, const char *args) {
+    static char cmdtail[130];
+    static struct {
+        unsigned env_seg;
+        unsigned cmdline_off;
+        unsigned cmdline_seg;
+        unsigned long fcb1;
+        unsigned long fcb2;
+    } pb;
+    int alen = (int)strlen(args);
+    if (alen > 127) alen = 127;
+    cmdtail[0] = (unsigned char)alen;
+    memcpy(cmdtail + 1, args, alen);
+    cmdtail[1 + alen] = 0x0D;
+
+    segread(&s);
+    pb.env_seg     = 0;             /* 0 = inherit our env */
+    pb.cmdline_off = (unsigned)cmdtail;
+    pb.cmdline_seg = s.ds;
+    pb.fcb1        = 0;
+    pb.fcb2        = 0;
+
+    r.x.ax = 0x4B00;
+    r.x.dx = (unsigned)name;
+    r.x.bx = (unsigned)&pb;
+    s.es = s.ds;
+    int86x(0x21, &r, &r, &s);
+    if (r.x.cflag) return 255;
+    return (int)get_child_exit_code();
+}
+
+/* /L handler: just EXEC in-process. Our trampoline COMMAND.COM is
+ * itself a full 64 KB .COM block, so the EXEC'd child already lands
+ * with its PSP well above segment 0x1000 -- no extra dummy alloc is
+ * needed. (Real DOS LOADFIX existed because its COMMAND.COM resident
+ * was only a few KB; ours isn't.) Adding a dummy here would actually
+ * break the load: CHESS.EXE asks for ~440 KB minalloc and any extra
+ * low alloc pushes us past the 640 KB conventional ceiling. */
+static int run_loadfix_inplace(const char *prog, const char *args) {
+    return dos_exec_inplace(prog, args);
 }
 
 static int synth_waitpid(int pid) {
@@ -130,9 +257,10 @@ static unsigned char get_child_exit_code(void) {
     return r.h.al;
 }
 
-/* Run a single external program. `poll_kbd` enables the Ctrl-Z = background
- * gesture used by the interactive launcher path; batch lines pass 0. */
-static int run_external(const char *name, const char *args, int poll_kbd) {
+/* Fork-exec a child and wait for it. `poll_kbd` enables the Ctrl-Z =
+ * background gesture used by the interactive launcher path; batch
+ * lines pass 0. */
+static int run_external_raw(const char *name, const char *args, int poll_kbd) {
     int pid = synth_fork_exec(name, args ? args : empty_str);
     int rc;
     if (pid < 0) {
@@ -154,6 +282,23 @@ static int run_external(const char *name, const char *args, int poll_kbd) {
     }
     vga_take(pid);
     return (int)get_child_exit_code();
+}
+
+/* LOADFIX trampoline: re-fork COMMAND.COM with cmdline "/L prog [args]".
+ * The trampoline child handles /L by running run_loadfix_inplace, which
+ * dummy-allocs low memory and EXECs the program in its own address
+ * space. Going through fork+exec (rather than EXEC-ing in this process)
+ * keeps the interactive shell free to multitask. */
+static int run_loadfix_via_trampoline(const char *prog, const char *args, int poll_kbd) {
+    static char tail[128];
+    if (args && *args) sprintf(tail, "/L %s %s", prog, args);
+    else               sprintf(tail, "/L %s", prog);
+    return run_external_raw("C:\\COMMAND.COM", tail, poll_kbd);
+}
+
+static int run_external(const char *name, const char *args, int poll_kbd) {
+    if (is_loadfix(name)) return run_loadfix_via_trampoline(name, args, poll_kbd);
+    return run_external_raw(name, args, poll_kbd);
 }
 
 /* ----- built-ins ----- */
@@ -289,9 +434,23 @@ int main(void) {
     int exit_code = 0;
 
     trace(1);
+    load_loadfix_cfg();
 
     read_cmdline(cmdline, sizeof(cmdline));
     p = skipws(cmdline);
+
+    /* /L progname [args] -- LOADFIX trampoline entry. The interactive
+     * COMMAND.COM forks us with this when it sees a name in loadfix.cfg;
+     * we alloc a low dummy block and EXEC the program in-process so its
+     * PSP lands above segment 0x1000 (dodging EXEPACK's load-low bug). */
+    if (p[0] == '/' && (p[1] == 'L' || p[1] == 'l') &&
+        (p[2] == ' ' || p[2] == '\t')) {
+        p = skipws(p + 2);
+        prog = split_first(p, &args);
+        exit_code = run_loadfix_inplace(prog, args);
+        trace(0);
+        return exit_code;
+    }
 
     /* Optional /C -- accept and skip (case-insensitive). */
     if (p[0] == '/' && (p[1] == 'C' || p[1] == 'c') &&

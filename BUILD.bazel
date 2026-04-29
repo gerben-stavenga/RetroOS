@@ -64,6 +64,7 @@ _BASE_FILES = {
     # output lands in the VFS RAM overlay at /COMMAND.COM. No prebuilt
     # binary in the tar.
     "//apps/command:command.c":          "SRC/COMMAND.C",
+    "//apps/command:LOADFIX.CFG":        "LOADFIX.CFG",
     "apps/dn/DN.COM": "DN/DN.COM",
     "apps/dn/DN.PRG": "DN/DN.PRG",
     "apps/dn/DN.OVR": "DN/DN.OVR",
