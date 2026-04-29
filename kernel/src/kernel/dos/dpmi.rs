@@ -1124,7 +1124,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     };
 
     let ax = regs.rax as u16;
-    dos_trace!(force "[INT31] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+    dos_trace!("[INT31] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
         regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
 
@@ -1230,7 +1230,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             if idx < LDT_ENTRIES {
                 let base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 DpmiState::set_desc_base(&mut dos.ldt[idx], base);
-                dos_trace!(force "[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
+                dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -1301,7 +1301,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let desc = dos.ldt[idx];
                 unsafe { core::ptr::write_unaligned(dest as *mut u64, desc); }
-                dos_trace!(force "[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
+                dos_trace!("[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
                     DpmiState::desc_base(desc), desc);
                 clear_carry(regs);
             } else {
@@ -1319,7 +1319,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 // Match CWSDPMI: force the descriptor to stay non-system.
                 new_desc |= 1u64 << 44;
                 dos.ldt[idx] = new_desc;
-                dos_trace!(force "[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
+                dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
                     DpmiState::desc_base(new_desc), new_desc);
                 clear_carry(regs);
             } else {
@@ -1468,16 +1468,6 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             let sel = regs.rcx as u16;
             let off = regs.rdx as u32;
             dos_trace!("[DPMI] 0205 set vec {:02X} = {:04X}:{:#X}", int_num, sel, off);
-            if int_num == 0x21 {
-                let base = seg_base(&dos.ldt[..], sel);
-                let lin = base.wrapping_add(off) as usize;
-                crate::dbg_print!("[DUMP] INT21 handler linear={:#010x} bytes=", lin);
-                for i in 0..1024usize {
-                    let b = unsafe { core::ptr::read_volatile((lin + i) as *const u8) };
-                    crate::dbg_print!("{:02X}", b);
-                }
-                crate::dbg_println!();
-            }
             dos.pm_vectors[int_num as usize] = (sel, off);
             clear_carry(regs);
         }
@@ -1746,7 +1736,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             clear_carry(regs);
         }
         _ => {
-            crate::dbg_println!("  DPMI: unhandled INT 31h AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
+            dos_trace!("  DPMI: unhandled INT 31h AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
                 ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
                 regs.code_seg(), regs.ip32());
             set_carry(regs);
@@ -1754,7 +1744,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         }
     }
 
-    dos_trace!(force "[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+    dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
         regs.rax as u16, regs.frame.rflags & 1,
         regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
         regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
@@ -1878,10 +1868,6 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
 /// that passes pointers via segments is the DOS extender's responsibility
 /// to translate via its own INT 21h hook — not the host's.
 fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    // Suppress the [INT31 RET] trace — this implicit reflection has no
-    // matching [INT31] enter. SLOT_RM_IRET_REFLECT dispatch re-enables.
-    dos::DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
-
     // Save client state on host_stack, then carve a fresh RM IRQ frame
     // immediately below it. BIOS runs on the slab — never on the client's
     // own VM86 stack — so a HW IRQ landing during a sensitive moment in the
@@ -2128,7 +2114,6 @@ pub fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
 
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
     regs.frame.rflags |= machine::IF_FLAG as u64;
-    dos::DOS_TRACE_HW_RT.store(true, core::sync::atomic::Ordering::Relaxed);
 
     dos_trace!("[DPMI] RM_IRET_REFLECT -> CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x}",
         regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
@@ -2173,7 +2158,7 @@ pub fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     stub.restore_gp(regs);
     save.restore(regs);
 
-    dos_trace!(force "[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+    dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
         regs.rax as u16, regs.flags32() & 1,
         regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
         regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);

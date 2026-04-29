@@ -30,8 +30,9 @@ static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
 
 /// Independent gate for hardware-IRQ-vector trace lines (timer 0x08, key 0x09,
 /// etc). Default OFF so a noisy timer tick doesn't drown the per-call DPMI
-/// trace. Toggled by INT 31h synth AH=04 (on) / AH=05 (off). Both gates
-/// (general + HW) must be ON for an HW-vector trace to fire.
+/// trace. No user-visible toggle yet -- flip the default here when debugging
+/// HW IRQ paths. Independent of DOS_TRACE_RT: general trace can be on without
+/// HW noise.
 pub(crate) static DOS_TRACE_HW_RT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
