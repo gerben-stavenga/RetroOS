@@ -18,7 +18,7 @@ extern crate alloc;
 /// Trace DOS/DPMI calls when enabled.
 /// Compile-time master kill switch; constant-fold removes all trace calls
 /// when false.
-const DOS_TRACE: bool = false;
+const DOS_TRACE: bool = true;
 const DOS_TRACE_HW_IRG: bool = false;
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).

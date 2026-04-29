@@ -2344,7 +2344,11 @@ pub(crate) const SLOT_RM_IRET_REFLECT: u8 = 0x02;
 pub(crate) const SLOT_RM_IRET_CALL: u8 = 0xF9;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
 pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
-pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x14; // exclusive (16 callbacks)
+// Exclusive end. Stops at 0x13 because slot 0x13 collides with INT 13h
+// (disk service) — the callback range MUST NOT shadow any IVT-redirected
+// INT vector (INT 0x13 / 0x20 / 0x21 / 0x25 / 0x26 / 0x28 / 0x2E / 0x2F /
+// 0x67). 15 callbacks at slots 0x04..0x12.
+pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x13;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
