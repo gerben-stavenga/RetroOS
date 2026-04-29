@@ -424,32 +424,6 @@ pub fn handle_event(
     }
 }
 
-/// Initialize a thread for VM86 mode (.COM/.EXE execution).
-/// `cwd` is the parent's cwd in VFS form (lowercase, forward-slash); used to
-/// seed `DfsState`. Pass `&[]` for an initial load with no parent.
-/// cs/ip/ss/sp are real-mode segment:offset values.
-fn init_process_thread_vm86(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16, cwd: &[u8]) {
-    use machine::{VM_FLAG, IF_FLAG, IOPL_VM86};
-    let mut dos_state = DosState::new();
-    dos_state.dfs.init_from_vfs(cwd);
-    thread.personality = thread::Personality::Dos(dos_state);
-
-    let state = &mut thread.kernel.cpu_state;
-    *state = Regs::empty();
-
-    state.ds = psp_seg as u64;
-    state.es = psp_seg as u64;
-    state.fs = 0;
-    state.gs = 0;
-
-    state.frame = crate::Frame64 {
-        rip: ip as u64,
-        cs: cs as u64,
-        rflags: (VM_FLAG | IF_FLAG | IOPL_VM86) as u64,
-        rsp: sp as u64,
-        ss: ss as u64,
-    };
-}
 
 /// Load a DOS binary (.COM or .EXE) and initialize the thread for VM86 mode.
 /// Handles full address space setup: clean + low mem + IVT + binary load + thread init.
@@ -470,31 +444,56 @@ pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], cm
     let dos_len = dfs::vfs_to_dos(prog_name, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
 
+    let current = thread::get_thread(tid).unwrap();
+
+    // Initialize a fresh DosState and seed the heap chain at heap_start so
+    // the upcoming dos_alloc_block calls (env, then program block) carve
+    // env_seg = heap_start + 1, psp_seg = env_seg + 0x10 = heap_start + 17.
+    let mut new_state = DosState::new();
+    new_state.dfs.init_from_vfs(parent_cwd);
+    current.personality = thread::Personality::Dos(new_state);
+    let dos_state = current.dos_mut();
+    dos_reset_blocks(dos_state, dos::heap_start());
+
     // Parent: either an env snapshot (with sys's PSP as the segment, since
     // the actual parent is not in this address space) or just sys.
     let parent = match parent_env_data {
-        Some(env) => dos::ParentRef { psp_seg: dos::sys_psp_seg(), env },
-        None => dos::sys_program().as_parent(),
+        Some(env) => dos::ParentRef { psp_seg: dos::boot_psp_seg(), env },
+        None => dos::boot_parent(),
     };
     let loaded = if is_exe && dos::is_mz_exe(data) {
-        dos::load_exe(dos::heap_start(), &parent, data, dos_name).unwrap_or_else(|| {
-            panic!("Invalid MZ EXE");
-        })
+        dos::load_exe(dos_state, &parent, data, dos_name).expect("Invalid MZ EXE")
     } else {
-        dos::load_com(dos::heap_start(), &parent, data, dos_name)
+        dos::load_com(dos_state, &parent, data, dos_name)
     };
-    loaded.program.set_cmdline(cmdtail);
+    dos::Psp::at(loaded.psp_seg).set_cmdline(cmdtail);
 
-    let psp_seg = loaded.program.psp_seg();
-    let end_seg = loaded.end_seg;
+    let psp_seg = loaded.psp_seg;
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
 
-    let current = thread::get_thread(tid).unwrap();
-    init_process_thread_vm86(current, psp_seg, cs, ip, ss, sp, parent_cwd);
+    init_process_thread_vm86_state(current, psp_seg, cs, ip, ss, sp);
     let dos_state = current.dos_mut();
-    dos_reset_blocks(dos_state, end_seg);
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
     current.kernel.symbols = None;
+}
+
+/// Helper: write CPU state for a freshly loaded VM86 program. Caller has
+/// already populated `current.personality` and run the loader.
+fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
+    use machine::{VM_FLAG, IF_FLAG, IOPL_VM86};
+    let state = &mut thread.kernel.cpu_state;
+    *state = Regs::empty();
+    state.ds = psp_seg as u64;
+    state.es = psp_seg as u64;
+    state.fs = 0;
+    state.gs = 0;
+    state.frame = crate::Frame64 {
+        rip: ip as u64,
+        cs: cs as u64,
+        rflags: (VM_FLAG | IF_FLAG | IOPL_VM86) as u64,
+        rsp: sp as u64,
+        ss: ss as u64,
+    };
 }
 
 /// Set up the initial DOS thread for a fresh program load (no parent).
@@ -514,23 +513,27 @@ pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]
     let dos_len = dfs::vfs_to_dos(path, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
 
-    let parent = dos::sys_program().as_parent();
+    let mut new_state = DosState::new();
+    new_state.dfs.init_from_vfs(cwd);
+    t.personality = thread::Personality::Dos(new_state);
+    let dos_state = t.dos_mut();
+    dos_reset_blocks(dos_state, dos::heap_start());
+
+    let parent = dos::boot_parent();
     let loaded = if dos::is_mz_exe(buf) {
-        dos::load_exe(dos::heap_start(), &parent, buf, dos_name).expect("load_exe failed")
+        dos::load_exe(dos_state, &parent, buf, dos_name).expect("load_exe failed")
     } else {
-        dos::load_com(dos::heap_start(), &parent, buf, dos_name)
+        dos::load_com(dos_state, &parent, buf, dos_name)
     };
 
-    let psp_seg = loaded.program.psp_seg();
-    let end_seg = loaded.end_seg;
+    let psp_seg = loaded.psp_seg;
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
 
-    init_process_thread_vm86(t, psp_seg, cs, ip, ss, sp, cwd);
+    init_process_thread_vm86_state(t, psp_seg, cs, ip, ss, sp);
     let dos_state = t.dos_mut();
-    dos_state.heap_seg = end_seg;
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
 
-    loaded.program.set_cmdline(cmdline_tail);
+    dos::Psp::at(loaded.psp_seg).set_cmdline(cmdline_tail);
 
     let (col, row) = vga::vga().cursor_pos();
     unsafe {
@@ -572,7 +575,7 @@ pub fn snapshot_parent_env(dos: &thread::DosState) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if psp_seg == dpmi::PSP_SEL => dpmi.saved_rm_env,
-        _ => dos::program_at(psp_seg).psp.env_seg,
+        _ => dos::Psp::at(psp_seg).env_seg,
     };
     snapshot_env(env_seg)
 }
@@ -636,6 +639,72 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
 }
 
 // ── Block-allocator helpers used by INT 21h handlers in `dos.rs` ────────
+//
+// Convention (matches real DOS):
+//   - Each block in `dos.dos_blocks` records its data segment and data
+//     paragraph count. A 1-paragraph MCB header lives at `block.seg - 1`.
+//   - Total conventional consumption per allocation is `paras + 1`.
+//   - `heap_base_seg` is the seg of the *first MCB* in the chain (i.e.,
+//     the first paragraph available for the chain — everything below is
+//     occupied by the program block, env, system structures).
+//   - The chain extends from `heap_base_seg` up to 0xA000, walkable by
+//     reading [mcb_seg]: sig + owner + paras, then advancing to
+//     `mcb_seg + 1 + paras` for the next MCB.
+//
+// `dos_blocks` is the source of truth. Guest writes to MCB memory are
+// ignored; every alloc/free/resize/reset re-emits the chain via
+// `sync_mcb_chain`. This keeps the kernel safe from buggy or hostile
+// guests that scribble on MCB memory while still presenting a
+// consistent chain to programs that walk it (extender stubs, MEM-style
+// utilities, TSR detectors).
+
+/// Mirror `dos.dos_blocks` out as a real DOS Memory Control Block chain
+/// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
+/// walks contiguously from `heap_base_seg` up to 0xA000.
+fn sync_mcb_chain(dos: &DosState) {
+    let owner = dos.current_psp;
+    let mut blocks = dos.dos_blocks.clone();
+    blocks.sort_by_key(|b| b.seg);
+
+    // Update the LOL-1 first-MCB pointer. AH=52h returns ES:BX = LOL, and
+    // programs (DOS/4G stubs, MEM utilities) read [LOL - 2] = first MCB
+    // segment to walk the chain head.
+    dos::set_first_mcb_seg(dos.heap_base_seg);
+
+    let mut entries: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
+
+    let mut walk = dos.heap_base_seg;
+    for block in &blocks {
+        let block_mcb = block.seg.saturating_sub(1);
+        if block_mcb > walk {
+            // Free MCB at walk; data [walk+1, block_mcb), paras=block_mcb-walk-1.
+            let paras = block_mcb - walk - 1;
+            entries.push((walk, 0, paras));
+        }
+        // Owned MCB at block_mcb (= block.seg - 1).
+        entries.push((block_mcb, owner, block.paras));
+        walk = block.seg.saturating_add(block.paras);
+    }
+    if walk < 0xA000 {
+        let paras = 0xA000u16 - walk - 1;
+        entries.push((walk, 0, paras));
+    }
+
+    let last_idx = entries.len();
+    for (i, &(mcb_seg, ow, paras)) in entries.iter().enumerate() {
+        let sig = if i + 1 == last_idx { b'Z' } else { b'M' };
+        let addr = (mcb_seg as u32) << 4;
+        unsafe {
+            let p = addr as *mut u8;
+            *p = sig;
+            ((addr + 1) as *mut u16).write_unaligned(ow);
+            ((addr + 3) as *mut u16).write_unaligned(paras);
+            for off in 5..16 {
+                *((addr + off) as *mut u8) = 0;
+            }
+        }
+    }
+}
 
 fn next_dos_block_limit(dos: &DosState, seg: u16, skip_seg: Option<u16>) -> u16 {
     let mut limit = 0xA000u16;
@@ -650,12 +719,16 @@ fn next_dos_block_limit(dos: &DosState, seg: u16, skip_seg: Option<u16>) -> u16 
     limit
 }
 
+/// `heap_seg` = first paragraph past the contiguous run of allocated blocks
+/// starting at `heap_base_seg`. Used for the in-process EXEC fan-out as the
+/// "where does the child's arena start" hint.
 fn sync_heap_seg(dos: &mut DosState) {
     let mut first_free = dos.heap_base_seg;
     loop {
         let mut advanced = false;
         for block in &dos.dos_blocks {
-            if block.seg == first_free {
+            // Block's MCB sits at first_free; data at first_free+1.
+            if block.seg == first_free.saturating_add(1) {
                 first_free = block.seg.saturating_add(block.paras);
                 advanced = true;
                 break;
@@ -668,67 +741,92 @@ fn sync_heap_seg(dos: &mut DosState) {
     dos.heap_seg = first_free.min(0xA000);
 }
 
+/// Largest free *data* paragraphs across all gaps + trailing region.
+/// Each gap loses 1 paragraph to MCB overhead.
 fn largest_dos_block(dos: &DosState) -> u16 {
-    let mut largest = 0u16;
+    let mut largest_data = 0u16;
     let mut cur = dos.heap_base_seg;
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
     for block in blocks {
-        if block.seg > cur {
-            largest = largest.max(block.seg - cur);
+        let block_mcb = block.seg.saturating_sub(1);
+        if block_mcb > cur {
+            let region = block_mcb - cur;
+            largest_data = largest_data.max(region.saturating_sub(1));
         }
         let end = block.seg.saturating_add(block.paras);
         if end > cur {
             cur = end;
         }
     }
-    largest.max(0xA000u16.saturating_sub(cur))
+    if cur < 0xA000 {
+        let region = 0xA000 - cur;
+        largest_data = largest_data.max(region.saturating_sub(1));
+    }
+    largest_data
 }
 
 fn dos_reset_blocks(dos: &mut DosState, base_seg: u16) {
     dos.heap_base_seg = base_seg;
     dos.heap_seg = base_seg;
     dos.dos_blocks.clear();
+    sync_mcb_chain(dos);
 }
 
 fn dos_alloc_block(dos: &mut DosState, need: u16) -> Result<u16, u16> {
+    // Each alloc consumes 1 MCB paragraph + `need` data paragraphs. Quirk
+    // preserved from pre-MCB code: AH=48 BX=0 silently succeeds without
+    // recording a block (returns the would-be data segment).
+    let total = if need == 0 { 1u16 } else { need.saturating_add(1) };
+    if need != 0 && total < need {
+        return Err(0);
+    }
+
     let mut cur = dos.heap_base_seg;
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
+    let mut max_data = 0u16;
 
-    for block in blocks {
-        if block.seg > cur {
-            let gap = block.seg - cur;
-            if need <= gap {
+    for block in &blocks {
+        let block_mcb = block.seg.saturating_sub(1);
+        if block_mcb > cur {
+            let region = block_mcb - cur;
+            if region >= total {
+                let data_seg = cur.saturating_add(1);
                 if need != 0 {
-                    dos.dos_blocks.push(DosMemBlock { seg: cur, paras: need });
+                    dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need });
                 }
                 sync_heap_seg(dos);
-                return Ok(cur);
+                sync_mcb_chain(dos);
+                return Ok(data_seg);
             }
+            max_data = max_data.max(region.saturating_sub(1));
         }
-        let end = block.seg.saturating_add(block.paras);
-        if end > cur {
-            cur = end;
-        }
+        cur = block.seg.saturating_add(block.paras);
     }
 
-    let avail = 0xA000u16.saturating_sub(cur);
-    if need <= avail {
-        if need != 0 {
-            dos.dos_blocks.push(DosMemBlock { seg: cur, paras: need });
+    if cur < 0xA000 {
+        let region = 0xA000 - cur;
+        if region >= total {
+            let data_seg = cur.saturating_add(1);
+            if need != 0 {
+                dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need });
+            }
+            sync_heap_seg(dos);
+            sync_mcb_chain(dos);
+            return Ok(data_seg);
         }
-        sync_heap_seg(dos);
-        Ok(cur)
-    } else {
-        Err(largest_dos_block(dos))
+        max_data = max_data.max(region.saturating_sub(1));
     }
+
+    Err(max_data)
 }
 
 fn dos_free_block(dos: &mut DosState, seg: u16) -> Result<(), u16> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         dos.dos_blocks.remove(idx);
         sync_heap_seg(dos);
+        sync_mcb_chain(dos);
         Ok(())
     } else {
         Err(9)
@@ -736,21 +834,19 @@ fn dos_free_block(dos: &mut DosState, seg: u16) -> Result<(), u16> {
 }
 
 fn dos_resize_block(dos: &mut DosState, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
-    if seg == dos.current_psp {
-        let max = next_dos_block_limit(dos, seg, None).saturating_sub(seg);
-        if paras <= max {
-            dos.heap_base_seg = seg.saturating_add(paras);
-            sync_heap_seg(dos);
-            return Ok(());
-        }
-        return Err((8, max));
-    }
-
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
-        let max = next_dos_block_limit(dos, seg, Some(seg)).saturating_sub(seg);
+        // Block resize: data must end before next block's MCB (or at 0xA000
+        // if no next block).
+        let next_limit = next_dos_block_limit(dos, seg, Some(seg));
+        let max = if next_limit < 0xA000 {
+            next_limit.saturating_sub(seg).saturating_sub(1)
+        } else {
+            next_limit.saturating_sub(seg)
+        };
         if paras <= max {
             dos.dos_blocks[idx].paras = paras;
             sync_heap_seg(dos);
+            sync_mcb_chain(dos);
             Ok(())
         } else {
             Err((8, max))

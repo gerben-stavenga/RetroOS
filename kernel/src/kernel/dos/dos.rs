@@ -477,9 +477,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x34 => {
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | (&raw const low_mem().sys.psp as u32 + INDOS_FLAG_OFFSET as u32) as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | (&raw const low_mem().boot_psp as u32 + INDOS_FLAG_OFFSET as u32) as u64;
             } else {
-                regs.es = (&raw const low_mem().sys.psp as u32 >> 4) as u64;
+                regs.es = (&raw const low_mem().boot_psp as u32 >> 4) as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | INDOS_FLAG_OFFSET as u64;
             }
             thread::KernelAction::Done
@@ -657,7 +657,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(fd as u16, size);
-                    if (fd as usize) < 20 { program_at(dos.current_psp).psp.jft[fd as usize] = fd as u8; }
+                    if (fd as usize) < 20 { Psp::at(dos.current_psp).jft[fd as usize] = fd as u8; }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
@@ -861,8 +861,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x80;
                         regs.clear_flag32(1);
                     } else {
-                        // File handle: bit 7=0 (file), bits 5-0=drive (2=C:)
-                        regs.rdx = (regs.rdx & !0xFFFF) | 0x0002;
+                        // File handle: bit 7=0 (file), bit 6=1 (not written via
+                        // this handle since open), bits 5-0=drive (2=C:).
+                        regs.rdx = (regs.rdx & !0xFFFF) | 0x0042;
                         regs.clear_flag32(1);
                     }
                 }
@@ -1191,13 +1192,17 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             thread::KernelAction::Done
         }
         // AH=0x52: Get List of Lists (returns ES:BX → DOS internal structure)
+        // Programs read [ES:BX - 2] WORD = first MCB segment (the chain
+        // head). LOL doesn't need to be paragraph-aligned: ES:BX expresses
+        // any linear address.
         0x52 => {
+            let lol_addr = &raw const low_mem().lol as u32;
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | (&raw const low_mem().lol as u32) as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | lol_addr as u64;
             } else {
-                regs.es = (&raw const low_mem().lol as u32 >> 4) as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | 0u64;
+                regs.es = (lol_addr >> 4) as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | (lol_addr & 0xF) as u64;
             }
             regs.clear_flag32(1);
             thread::KernelAction::Done
@@ -1343,7 +1348,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if fd >= 0 && open_exists {
                 let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                 sft_set_file(fd as u16, size);
-                if (fd as usize) < 20 { program_at(dos.current_psp).psp.jft[fd as usize] = fd as u8; }
+                if (fd as usize) < 20 { Psp::at(dos.current_psp).jft[fd as usize] = fd as u8; }
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
                 regs.clear_flag32(1);
@@ -1378,7 +1383,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 //   always be swapped. Point at SYSPSP (zeroed) with a nominal
                 //   size; DPMILOAD just needs a plausible pointer.
                 0x06 => {
-                    let syspsp_addr = &raw const low_mem().sys.psp as u32;
+                    let syspsp_addr = &raw const low_mem().boot_psp as u32;
                     if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                         regs.ds = dpmi::LOW_MEM_SEL as u64;
                         regs.rsi = (regs.rsi & !0xFFFF) | syspsp_addr as u64;
@@ -1675,12 +1680,27 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let parent_psp = dos.current_psp;
     let parent_env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if parent_psp == dpmi::PSP_SEL => dpmi.saved_rm_env,
-        _ => Program::at(parent_psp.wrapping_sub(0x10)).psp.env_seg,
+        _ => Psp::at(parent_psp).env_seg,
     };
     let parent_env_vec = snapshot_env(parent_env_seg);
     let parent = ParentRef { psp_seg: parent_psp, env: &parent_env_vec };
+
+    // Save parent state before reseating the heap chain for the child.
+    // INT frame (IP/CS/FLAGS) is on the VM86 stack at current SS:SP;
+    // exec_return restores SS:SP so rm_int31_dispatch pops it and resumes.
+    let prev = dos.exec_parent.take();
+    let parent_heap = dos.heap_seg;
+    let parent_heap_base = dos.heap_base_seg;
+    let parent_blocks = dos.dos_blocks.clone();
+
+    // Reset the chain to start at parent.heap_seg (= first paragraph past
+    // parent's owned blocks). load_exe / load_com will dos_alloc_block the
+    // child's env + program block from there, exactly like a fresh
+    // fork+exec.
+    super::dos_reset_blocks(dos, parent_heap);
+
     let loaded = if is_exe {
-        match load_exe(dos.heap_seg, &parent, &buf, &abs_dos[..abs_len]) {
+        match load_exe(dos, &parent, &buf, &abs_dos[..abs_len]) {
             Some(l) => l,
             None => {
                 regs.rax = (regs.rax & !0xFFFF) | 11;
@@ -1689,27 +1709,14 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
             }
         }
     } else {
-        load_com(dos.heap_seg, &parent, &buf, &abs_dos[..abs_len])
+        load_com(dos, &parent, &buf, &abs_dos[..abs_len])
     };
-    let child_seg = loaded.program.psp_seg();
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
-    let end_seg = loaded.end_seg;
+    let psp_seg = loaded.psp_seg;
 
-    // Copy command tail to child's PSP at child_seg:0080
-    loaded.program.set_cmdline(&tail[..copy_len]);
-
-    // Save parent state. Parent's INT frame (IP/CS/FLAGS) is on the VM86
-    // stack at current SS:SP. exec_return restores SS:SP so rm_int31_dispatch
-    // pops the frame and resumes the parent.
-    let prev = dos.exec_parent.take();
-    let parent_heap = dos.heap_seg;
-    let parent_heap_base = dos.heap_base_seg;
-    let parent_blocks = dos.dos_blocks.clone();
-    dos.heap_seg = end_seg.max(dos.heap_seg);
-    dos.heap_base_seg = dos.heap_seg;
-    dos.dos_blocks.clear();
-    dos.dta = (child_seg as u32) * 16 + 0x80;
-    dos.current_psp = child_seg;
+    // Copy command tail to child's PSP at psp_seg:0080
+    Psp::at(loaded.psp_seg).set_cmdline(&tail[..copy_len]);
+    dos.dta = (psp_seg as u32) * 16 + 0x80;
     // DPMI host obligation: parent's PM state must not be observable to the
     // child (no PM handlers fire; child's DPMI entry, if any, allocates a
     // fresh DpmiState). Suspend DPMI state + pm_vectors + LDT, restore in
@@ -1751,11 +1758,11 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     vm86_push(regs, flags);
     vm86_push(regs, cs);
     vm86_push(regs, ip);
-    regs.ds = child_seg as u64;
-    regs.es = child_seg as u64;
+    regs.ds = psp_seg as u64;
+    regs.es = psp_seg as u64;
     regs.clear_flag32(1);
-    dos_trace!("  exec_program loaded: cs:ip={:04X}:{:04X} ss:sp={:04X}:{:04X} end_seg={:04X} heap_seg={:04X}",
-        cs, ip, ss, sp, end_seg, dos.heap_seg);
+    dos_trace!("  exec_program loaded: cs:ip={:04X}:{:04X} ss:sp={:04X}:{:04X} heap_seg={:04X}",
+        cs, ip, ss, sp, dos.heap_seg);
     thread::KernelAction::Done
 }
 
@@ -1882,6 +1889,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) 
     dos.heap_base_seg = parent.heap_base_seg;
     dos.current_psp = parent.psp;
     dos.dos_blocks = parent.dos_blocks;
+    super::sync_mcb_chain(dos);
     // Restore parent's suspended DPMI state (if any). A child's own DPMI
     // state, if it entered DPMI, is dropped here — the child-allocated
     // DpmiState currently in `dos.dpmi` gets replaced. pm_vectors + LDT are
@@ -2086,6 +2094,22 @@ pub(super) struct Psp {
     pub cmdline:          [u8; 127],  // 0x81-0xFF (CR-terminated)
 }
 const _: () = assert!(core::mem::size_of::<Psp>() == 256);
+impl Psp {
+    /// Borrow the PSP at `psp_seg`. The 256-byte PSP is `[psp_seg<<4 ..
+    /// (psp_seg+0x10)<<4)`. Single-threaded kernel; the borrow checker
+    /// treats successive calls as independent borrows.
+    pub fn at(psp_seg: u16) -> &'static mut Self {
+        unsafe { &mut *(((psp_seg as u32) << 4) as *mut Self) }
+    }
+    pub fn psp_seg(&self) -> u16 { (self as *const _ as u32 >> 4) as u16 }
+    /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
+    pub fn set_cmdline(&mut self, tail: &[u8]) {
+        let n = tail.len().min(self.cmdline.len() - 1);
+        self.cmdline_len = n as u8;
+        self.cmdline[..n].copy_from_slice(&tail[..n]);
+        self.cmdline[n] = 0x0D;
+    }
+}
 impl Default for Psp {
     fn default() -> Self { unsafe { core::mem::zeroed() } }
 }
@@ -2160,8 +2184,21 @@ impl Default for CdsEntry {
 #[repr(C, packed)]
 struct LowMem {
     stubs:     [[u8; 2]; 256],        // 0x500
-    sys:       Program,                // 0x700: env + psp = 512 bytes
-    lol:       Lol,                    // 0x900
+    /// Bootstrap sentinel PSP. Acts as the parent_psp / chain terminator
+    /// for the very first program loaded (and as a fixed segment we hand
+    /// out as a parent reference for cross-AS fork+exec where the actual
+    /// parent's PSP isn't reachable). Real DOS keeps an analogous internal
+    /// PSP in its resident kernel data — it lives below `heap_start` and
+    /// is *not* part of the MCB chain.
+    boot_psp:  Psp,                    // 0x700: 256 bytes
+    /// First MCB seg in the DOS memory chain. Real DOS stores this at
+    /// `[LOL - 2]` (one WORD before the List of Lists structure). Programs
+    /// (DOS/4G stubs, MEM utilities, etc.) call AH=52h to get the LOL
+    /// pointer and then read the WORD just below it to find the chain
+    /// head. `sync_mcb_chain` writes the current `dos.heap_base_seg` here
+    /// every time the chain is updated.
+    first_mcb_seg: u16,
+    lol:       Lol,                    // 0x900 — adjust offset
     sft:       Sft,                    // 0x940
     cds:       [CdsEntry; NUM_DRIVES as usize],
     /// DPMI 0.9 §3.1.2 locked PM stack (referred to as "host_stack" in
@@ -2182,6 +2219,13 @@ fn low_mem() -> &'static mut LowMem {
     unsafe { &mut *(LOW_MEM_BASE as *mut LowMem) }
 }
 
+/// Update the chain-head pointer that lives at `[LOL - 2]`. Called from
+/// `sync_mcb_chain` so AH=52h-style chain walkers see the current
+/// `heap_base_seg`.
+pub(super) fn set_first_mcb_seg(seg: u16) {
+    low_mem().first_mcb_seg = seg;
+}
+
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
 pub(crate) const STUB_SEG: u16 = (LOW_MEM_BASE >> 4) as u16;
 /// Offset within SYSPSP of the INDOS flag byte (permanently zero).
@@ -2197,10 +2241,18 @@ pub(super) fn heap_start() -> u16 {
 
 /// The system Program (master env + stand-in PSP) used as bootstrap parent
 /// for the initial DOS thread and as chain-terminator for PSP[0x16].
-pub(super) fn sys_program() -> &'static mut Program {
-    &mut low_mem().sys
+pub(super) fn boot_psp() -> &'static mut Psp {
+    &mut low_mem().boot_psp
 }
-pub(super) fn sys_psp_seg() -> u16 { sys_program().psp_seg() }
+pub(super) fn boot_psp_seg() -> u16 {
+    (&raw const low_mem().boot_psp as u32 >> 4) as u16
+}
+/// Bootstrap parent reference for the initial program load. The env is the
+/// kernel's compiled-in `MASTER_ENV` (no allocation needed); the parent
+/// PSP is the boot sentinel.
+pub(super) fn boot_parent() -> ParentRef<'static> {
+    ParentRef { psp_seg: boot_psp_seg(), env: MASTER_ENV }
+}
 
 /// Base linear address + size of the kernel-shared host stack, consumed
 /// by dpmi when building the three aliasing LDT selectors (PM16, PM32,
@@ -2212,33 +2264,34 @@ pub(super) fn host_stack_size() -> u32 {
     core::mem::size_of_val(&low_mem().host_stack) as u32
 }
 
-/// One DOS program's env arena + PSP, laid out contiguously in real-mode
-/// memory: env at offset 0 (256 bytes), PSP at offset 256 (256 bytes).
-/// Hence `psp_seg = env_seg + 0x10`.
-#[repr(C, packed)]
-pub(super) struct Program {
-    pub env: [u8; 256],
-    pub psp: Psp,
-}
-const _: () = assert!(core::mem::size_of::<Program>() == 512);
+/// Default size of an env block in paragraphs. Env is allocated from the
+/// MCB chain like any other AH=48 block — its size is decided at alloc
+/// time, not baked into a static struct.
+pub(super) const ENV_PARAS: u16 = 32;       // = 512 bytes (DOS5 typical /E:512)
 
-impl Program {
-    /// Borrow the program at `env_seg` (where its env arena begins).
-    pub fn at(env_seg: u16) -> &'static mut Self {
-        unsafe { &mut *(((env_seg as u32) << 4) as *mut Self) }
+/// Bootstrap env defaults — copied into the freshly-allocated env block of
+/// the very first program loaded (boot path). For subsequent children,
+/// inheritance comes from the actual parent's env block, not from here.
+pub(super) const MASTER_ENV: &[u8] = b"\
+COMSPEC=C:\\COMMAND.COM\0\
+PATH=C:\\;C:\\TC\0\
+INCLUDE=C:\\TC\\INCLUDE\0\
+LIB=C:\\TC\\LIB\0\0";
+
+/// Borrow `len` bytes of an env block at `env_seg` as a writable slice.
+/// Used by `fill_env` to populate a freshly-allocated env block.
+pub(super) fn env_bytes_mut(env_seg: u16, len: usize) -> &'static mut [u8] {
+    unsafe {
+        core::slice::from_raw_parts_mut(((env_seg as u32) << 4) as *mut u8, len)
     }
-    pub fn env_seg(&self) -> u16 { (self as *const _ as u32 >> 4) as u16 }
-    pub fn psp_seg(&self) -> u16 { self.env_seg() + 0x10 }
-    /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
-    pub fn set_cmdline(&mut self, tail: &[u8]) {
-        let n = tail.len().min(self.psp.cmdline.len() - 1);
-        self.psp.cmdline_len = n as u8;
-        self.psp.cmdline[..n].copy_from_slice(&tail[..n]);
-        self.psp.cmdline[n] = 0x0D;
-    }
-    /// Borrow as the parent for child loads (PSP segment + env block).
-    pub fn as_parent(&self) -> ParentRef<'_> {
-        ParentRef { psp_seg: self.psp_seg(), env: &self.env }
+}
+
+/// Borrow the env block at `env_seg` as a read-only slice up to the
+/// `00 00` terminator (or `len` bytes max). Used to inherit a parent's
+/// env into a child via `fill_env`.
+pub(super) fn env_bytes(env_seg: u16, len: usize) -> &'static [u8] {
+    unsafe {
+        core::slice::from_raw_parts(((env_seg as u32) << 4) as *const u8, len)
     }
 }
 
@@ -2252,15 +2305,16 @@ pub(super) struct ParentRef<'a> {
     pub env: &'a [u8],
 }
 
-/// Output of a successful binary load — the program's address space view
-/// plus initial CPU register values for the VM86 thread.
+/// Output of a successful binary load — segment layout plus initial CPU
+/// register values for the VM86 thread.
 pub(super) struct Loaded {
-    pub program: &'static mut Program,
+    pub env_seg: u16,
+    pub psp_seg: u16,
     pub cs: u16,
     pub ip: u16,
     pub ss: u16,
     pub sp: u16,
-    /// First paragraph past the loaded image; used to set the new heap base.
+    /// First paragraph past the loaded image (= `psp_seg + program_paras`).
     pub end_seg: u16,
 }
 
@@ -2334,33 +2388,16 @@ fn setup_lol_sft() {
 
     let lm = low_mem();
 
-    // System program: master env (COMSPEC/PATH defaults) + a placeholder PSP
-    // that self-references its parent field. Acts as the bootstrap parent for
-    // the initial DOS thread and the chain-terminator for any tool that walks
-    // PSP[0x16] upward.
-    lm.sys = unsafe { core::mem::zeroed() };
-    let mut sys_env_off = 0;
-    for src in [
-        &b"COMSPEC=C:\\COMMAND.COM\0"[..],
-        &b"PATH=C:\\;C:\\TC\0"[..],
-        // TC 2.01 (TCC) and BC++ 3.1 (BCC/TASM/TLINK) both look up headers
-        // and libs via INCLUDE / LIB env. Both toolchains share these
-        // defaults; per-tool config files in their BIN dir take precedence
-        // when present.
-        &b"INCLUDE=C:\\TC\\INCLUDE\0"[..],
-        &b"LIB=C:\\TC\\LIB\0"[..],
-    ] {
-        lm.sys.env[sys_env_off..sys_env_off + src.len()].copy_from_slice(src);
-        sys_env_off += src.len();
-    }
-    lm.sys.env[sys_env_off] = 0;     // double-NUL terminator (no DOS 3+ suffix)
-    let sys_psp_seg = lm.sys.psp_seg();
-    let sys_env_seg = lm.sys.env_seg();
-    lm.sys.psp = Psp {
+    // Bootstrap sentinel PSP: self-referencing parent_psp terminates any
+    // PSP[0x16] walk, env_seg = 0 (env defaults live in MASTER_ENV
+    // const, not on the chain). The cmdline area at 0x80+ is otherwise
+    // unused and gives us a permanent zero byte at the INDOS-flag offset.
+    let boot_seg = (&raw const lm.boot_psp as u32 >> 4) as u16;
+    lm.boot_psp = Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
-        parent_psp: sys_psp_seg,      // self-ref terminates the parent chain
-        env_seg: sys_env_seg,
+        parent_psp: boot_seg,         // self-ref terminates the parent chain
+        env_seg: 0,
         ..Default::default()
     };
 
@@ -2402,10 +2439,6 @@ fn setup_lol_sft() {
     lm.cds[7] = mk(b'H');
 }
 
-/// Borrow the program containing the PSP at `psp_seg` (env starts at psp_seg-0x10).
-pub(super) fn program_at(psp_seg: u16) -> &'static mut Program {
-    Program::at(psp_seg.wrapping_sub(0x10))
-}
 
 /// Populate SFT entry for a newly opened file handle.
 fn sft_set_file(handle: u16, size: u32) {
@@ -2434,8 +2467,12 @@ fn sft_clear(handle: u16) {
 /// `00 00` terminator), then append the DOS 3+ suffix `01 00 <prog_name> 00`.
 /// Per DOS EXEC (AH=4B), the child always gets a fresh arena — the parent's
 /// env is *copied*, never shared.
-fn fill_env(env: &mut [u8; 256], parent_env: &[u8], prog_name: &[u8]) {
-    *env = [0; 256];
+/// Populate a freshly-allocated env block. Copies parent's variable
+/// strings (up to the `00 00` terminator) into `env`, then appends the
+/// DOS 3+ suffix `01 00 <prog_name> 00`. Per DOS EXEC (AH=4B), each
+/// child gets a fresh arena — the parent's env is *copied*, never shared.
+fn fill_env(env: &mut [u8], parent_env: &[u8], prog_name: &[u8]) {
+    for b in env.iter_mut() { *b = 0; }
     let suffix_need = 2 + prog_name.len() + 1;
     let vars_cap = env.len().saturating_sub(suffix_need);
     let mut off = 0usize;
@@ -2461,21 +2498,18 @@ fn fill_env(env: &mut [u8; 256], parent_env: &[u8], prog_name: &[u8]) {
     env[off] = 0;
 }
 
-/// Initialize a freshly-placed program's env arena and PSP from a parent.
-fn map_program(prog: &mut Program, parent: &ParentRef, prog_name: &[u8]) {
-    fill_env(&mut prog.env, parent.env, prog_name);
-
-    let env_seg = prog.env_seg();
-    let psp_seg = prog.psp_seg();
+/// Initialize a freshly-allocated PSP at `psp_seg` to point at its env
+/// block at `env_seg`, with parent_psp / JFT / cmdline default fields set.
+fn init_psp(psp_seg: u16, env_seg: u16, parent_psp: u16) {
     let mut jft = [0xFFu8; 20];
     jft[0] = 0; jft[1] = 1; jft[2] = 2;   // stdin/stdout/stderr → SFT 0/1/2
     let mut cmdline = [0u8; 127];
     cmdline[0] = 0x0D;                      // empty tail terminated by CR
 
-    prog.psp = Psp {
+    *Psp::at(psp_seg) = Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
-        parent_psp: parent.psp_seg,
+        parent_psp,
         jft_far_off: 0x0034,                // far ptr at PSP[0x18] → inline JFT at PSP[0x34]
         jft_far_seg: psp_seg,
         env_seg,
@@ -2487,13 +2521,13 @@ fn map_program(prog: &mut Program, parent: &ParentRef, prog_name: &[u8]) {
     };
 
     // TRACE: dump env block (first 80 bytes) for debugging.
+    let env = env_bytes(env_seg, 80);
     let mut dump = [0u8; 80];
-    for (i, &b) in prog.env.iter().take(80).enumerate() {
+    for (i, &b) in env.iter().enumerate() {
         dump[i] = if b == 0 { b'.' } else if b < 32 || b >= 127 { b'?' } else { b };
     }
-    dos_trace!("map_psp psp={:04X} env={:04X} parent_psp={:04X} prog={:?} env[0..80]={:?}",
-        psp_seg, env_seg, parent.psp_seg,
-        core::str::from_utf8(prog_name).unwrap_or("?"),
+    dos_trace!("map_psp psp={:04X} env={:04X} parent_psp={:04X} env[0..80]={:?}",
+        psp_seg, env_seg, parent_psp,
         core::str::from_utf8(&dump).unwrap_or("?"));
 }
 
@@ -2502,13 +2536,39 @@ pub(super) fn is_mz_exe(data: &[u8]) -> bool {
     data.len() >= 28 && data[0] == b'M' && data[1] == b'Z'
 }
 
-/// Load a .COM binary at `heap_end` (env_seg). Stack at PSP:COM_SP (top of
-/// 64KB segment), code at (psp+0x10):0000. Caller advances heap to `end_seg`.
-pub(super) fn load_com(heap_end: u16, parent: &ParentRef,
+/// Allocate the env block (`ENV_PARAS` paragraphs) and program block as
+/// separate AH=48-style allocations on `dos`'s MCB chain, exactly like
+/// real DOS does on `INT 21h AH=4B EXEC`. Returns `(env_seg, psp_seg,
+/// end_seg)`.
+fn alloc_program_blocks(dos: &mut thread::DosState, prog_paras: u16)
+    -> Result<(u16, u16, u16), ()>
+{
+    let env_seg = dos_alloc_block(dos, ENV_PARAS).map_err(|_| ())?;
+    let psp_seg = dos_alloc_block(dos, prog_paras).map_err(|_| ())?;
+    let end_seg = psp_seg.wrapping_add(prog_paras);
+    Ok((env_seg, psp_seg, end_seg))
+}
+
+/// Populate the env block + PSP + load module for a freshly-allocated
+/// program. Common to `load_exe` and `load_com`. Sets `dos.current_psp`
+/// and re-syncs the MCB chain so block ownership reflects the new PSP.
+fn populate_program(dos: &mut thread::DosState, env_seg: u16, psp_seg: u16,
+                    parent: &ParentRef, prog_name: &[u8]) {
+    fill_env(env_bytes_mut(env_seg, (ENV_PARAS as usize) * 16),
+             parent.env, prog_name);
+    init_psp(psp_seg, env_seg, parent.psp_seg);
+    dos.current_psp = psp_seg;
+    super::sync_mcb_chain(dos);
+}
+
+/// Load a .COM binary. Allocates env + program block (1000h paragraphs =
+/// 64 KB, the standard .COM arena), populates env/PSP/code. Stack at
+/// PSP:COM_SP (top of 64 KB segment), code at (psp+0x10):0000.
+pub(super) fn load_com(dos: &mut thread::DosState, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Loaded {
-    let prog = Program::at(heap_end);
-    map_program(prog, parent, prog_name);
-    let psp_seg = prog.psp_seg();
+    let (env_seg, psp_seg, end_seg) = alloc_program_blocks(dos, 0x1000)
+        .expect("load_com: allocation failed");
+    populate_program(dos, env_seg, psp_seg, parent, prog_name);
 
     // Load .COM code at psp_seg:0x100 (= (psp_seg+0x10):0).
     let load_addr = ((psp_seg as u32) << 4) + COM_OFFSET as u32;
@@ -2517,9 +2577,9 @@ pub(super) fn load_com(heap_end: u16, parent: &ParentRef,
     }
 
     Loaded {
+        env_seg, psp_seg,
         cs: psp_seg, ip: COM_OFFSET, ss: psp_seg, sp: COM_SP,
-        end_seg: psp_seg.wrapping_add(0x1000),
-        program: prog,
+        end_seg,
     }
 }
 
@@ -2536,7 +2596,7 @@ pub(super) fn load_com(heap_end: u16, parent: &ParentRef,
 ///   0x14: initial IP
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
-pub(super) fn load_exe(heap_end: u16, parent: &ParentRef,
+pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Option<Loaded> {
     if data.len() < 28 { return None; }
 
@@ -2547,6 +2607,7 @@ pub(super) fn load_exe(heap_end: u16, parent: &ParentRef,
     let reloc_count = w(0x06) as usize;
     let header_paragraphs = w(0x08) as u32;
     let min_extra = w(0x0A) as u32;
+    let max_extra = w(0x0C) as u32;
     let init_ss = w(0x0E);
     let init_sp = w(0x10);
     let init_ip = w(0x14);
@@ -2565,14 +2626,23 @@ pub(super) fn load_exe(heap_end: u16, parent: &ParentRef,
         return None;
     }
 
-    let prog = Program::at(heap_end);
-    map_program(prog, parent, prog_name);
-    let psp_seg = prog.psp_seg();
+    let load_paras = ((load_size as u32 + 15) / 16) as u16;
+    // Real DOS gives the program min(e_maxalloc, available_conv_mem) extra
+    // paragraphs above the load module. Programs with e_maxalloc=0xFFFF
+    // (Watcom, BC, most Turbo) expect to receive ALL conventional memory
+    // and then `AH=4A` it back down — DOS/4G stubs in particular base
+    // their PSP-grow target on this initial size. Reserve 1 paragraph for
+    // the env-block MCB and `ENV_PARAS` for env data + 1 for program-block
+    // MCB + 0x10 for PSP, then the rest is load module + extra.
+    let overhead = 1u32 + (ENV_PARAS as u32) + 1 + 0x10 + load_paras as u32;
+    let max_avail_paras = 0xA000u32.saturating_sub(dos.heap_base_seg as u32 + overhead);
+    let extra = (max_avail_paras.min(max_extra).max(min_extra)) as u16;
+    let prog_paras = 0x10u16.saturating_add(load_paras).saturating_add(extra);
+    let (env_seg, psp_seg, end_seg) = alloc_program_blocks(dos, prog_paras).ok()?;
+    populate_program(dos, env_seg, psp_seg, parent, prog_name);
 
     // Load module starts 0x10 paragraphs after the PSP.
     let load_segment = psp_seg + 0x10;
-    let load_paras = ((load_size as u32 + 15) / 16) as u16;
-    let end_seg = load_segment.wrapping_add(load_paras).wrapping_add(min_extra as u16);
 
     let load_base = (load_segment as u32) << 4;
     let load_data = &data[header_size as usize..header_size as usize + load_size];
@@ -2608,11 +2678,11 @@ pub(super) fn load_exe(heap_end: u16, parent: &ParentRef,
     }
 
     Some(Loaded {
+        env_seg, psp_seg,
         cs: init_cs.wrapping_add(load_segment),
         ip: init_ip,
         ss: init_ss.wrapping_add(load_segment),
         sp: init_sp,
         end_seg,
-        program: prog,
     })
 }
