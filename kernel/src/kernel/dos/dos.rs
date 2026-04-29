@@ -409,18 +409,34 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             thread::KernelAction::Done
         }
+        // AH=0x01: STDIN read with echo. Blocks; echoes the char.
         // AH=0x07: Direct STDIN read, no echo, no Ctrl-C check.
         // AH=0x08: STDIN read, no echo (Ctrl-C raises INT 23h — we don't).
-        // Both block until a key is available. TC's getch() uses AH=07h;
-        // without this AX falls through unmodified and getch() returns
-        // garbage (often the AL=0xFF that AH=0Bh just set on kbhit).
-        0x07 | 0x08 => {
+        // All three block until a key is available. TC's getch() uses
+        // AH=07h; without this AX falls through unmodified and getch()
+        // returns garbage (often the AL=0xFF that AH=0Bh just set on
+        // kbhit).
+        0x01 | 0x07 | 0x08 => {
             if let Some(ch) = poll_dos_console_char(dos) {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
+                if ah == 0x01 { dos_putchar(ch); }
             } else {
-                // Buffer empty — re-issue the syscall after the next
-                // event-loop iteration so a key has a chance to arrive.
-                regs.set_ip32(regs.ip32().wrapping_sub(2));
+                // HACK: poor-man's "block on no key". Rewind the user's
+                // saved IP on the VM86 stack so the stub dispatcher's
+                // IRET-frame pop drops us back onto the CD 21 and the
+                // next event-loop iteration re-traps. Modifying
+                // regs.frame.rip alone would be a no-op -- that's the
+                // stub's IP, and the dispatcher pops user CS:IP off
+                // SS:SP and overwrites frame.rip from there. So we
+                // mutate the saved IP word in user memory directly.
+                // Brittle: leaks the IRET-frame layout (IP at SS:SP+0)
+                // out of the dispatcher. Cleaner replacement is a
+                // KernelAction::Retry that the dispatcher honours
+                // post-pop, or real thread blocking on a kbd waitqueue.
+                let ss = regs.ss32();
+                let sp = vm86_sp(regs) as u32;
+                let ip = read_u16(ss, sp);
+                write_u16(ss, sp, ip.wrapping_sub(2));
             }
             thread::KernelAction::Done
         }
