@@ -2200,9 +2200,9 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
         regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16,
         regs.stack_seg(), regs.sp32());
-    if exc_num == 13 || exc_num == 14 {
-        startup::arch_dump_exception(dos, regs);
-    }
+    // No verbose dump on handled #GP/#PF -- DPMI clients routinely take
+    // these for sensitive-insn emulation; the dump goes to VGA and clobbers
+    // the user screen. The unhandled-exception path below still dumps.
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
         None => {

@@ -364,6 +364,7 @@ pub struct PcMachine {
     pub vpit: VirtualPit,
     pub vpic: VirtualPic,
     pub vkbd: VirtualKeyboard,
+    pub mouse: MouseState,
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: VgaState,
@@ -380,6 +381,159 @@ pub struct PcMachine {
     pub host_stack_sp: u32,
 }
 
+/// Microsoft Mouse driver (INT 33h) state. Updated by the IRQ 12 packet
+/// stream queued via `queue_irq`; queried by INT 33h subfunctions in dos.rs.
+pub struct MouseState {
+    /// Absolute cursor position, clipped to `[min_x..=max_x]` × `[min_y..=max_y]`.
+    pub x: i16,
+    pub y: i16,
+    /// Current button state. bit 0 = left, 1 = right, 2 = middle.
+    pub buttons: u8,
+    /// User-set clip range. Defaults match a 640×200 mode.
+    pub min_x: i16, pub max_x: i16,
+    pub min_y: i16, pub max_y: i16,
+    /// AX=0Bh delta accumulators since the last read. Reset by `take_motion()`.
+    pub accum_dx: i32,
+    pub accum_dy: i32,
+    /// AX=01/02 hide-show counter. Cursor is visible iff `show_count <= 0`.
+    /// Starts at 1 (hidden); AX=01 decrements, AX=02 increments.
+    pub show_count: i8,
+    /// Text-mode cursor rendering: where (cell offset 0..2000) we currently
+    /// have an inverted attribute, and the original attribute value at that
+    /// cell. `None` means no cursor is currently drawn.
+    pub drawn_at: Option<u16>,
+    pub saved_attr: u8,
+    /// AX=0Ch event handler. CX=mask, ES:DX=handler far address. `mask=0`
+    /// means no handler installed.
+    pub cb_mask: u16,
+    pub cb_seg: u16,
+    pub cb_off: u16,
+    /// Pending event-condition bits since last delivery, plus the deltas
+    /// from the last packet that triggered. Read & cleared by the SLOT_INT74
+    /// dispatcher when it sets up the user-handler call.
+    pub pending_cond: u16,
+    pub last_dx: i16,
+    pub last_dy: i16,
+    /// User GP regs saved across the AX=0Ch handler far-call. ModeSave only
+    /// covers CS/EIP/SS/ESP/EFLAGS/segs; we clobber AX/BX/CX/DX/SI/DI to set
+    /// up the call, so they have to be bracket-saved here and restored by
+    /// the SLOT_INT74_MOUSE_CB_RET slot when the handler RETFs.
+    pub saved_rax: u64,
+    pub saved_rbx: u64,
+    pub saved_rcx: u64,
+    pub saved_rdx: u64,
+    pub saved_rsi: u64,
+    pub saved_rdi: u64,
+}
+
+const VGA_TEXT_BASE: u32 = 0xB8000;
+
+impl MouseState {
+    pub const fn new() -> Self {
+        Self { x: 0, y: 0, buttons: 0,
+               min_x: 0, max_x: 639, min_y: 0, max_y: 199,
+               accum_dx: 0, accum_dy: 0,
+               show_count: 1, drawn_at: None, saved_attr: 0,
+               cb_mask: 0, cb_seg: 0, cb_off: 0,
+               pending_cond: 0, last_dx: 0, last_dy: 0,
+               saved_rax: 0, saved_rbx: 0, saved_rcx: 0,
+               saved_rdx: 0, saved_rsi: 0, saved_rdi: 0 }
+    }
+    /// Apply one PS/2 packet: accumulate raw delta, advance clipped position,
+    /// redraw the cursor at the new cell if it's visible. Returns the
+    /// AX=0Ch condition bits that fired this packet (so the caller can OR
+    /// against the registered event mask and decide to deliver IRQ 12).
+    ///
+    /// AX=0Ch condition bits (from the spec):
+    ///   0x01 = mouse moved
+    ///   0x02 = left button pressed
+    ///   0x04 = left button released
+    ///   0x08 = right button pressed
+    ///   0x10 = right button released
+    ///   0x20 = middle button pressed
+    ///   0x40 = middle button released
+    pub fn apply_packet(&mut self, dx: i16, dy: i16, buttons: u8) -> u16 {
+        self.accum_dx = self.accum_dx.saturating_add(dx as i32);
+        self.accum_dy = self.accum_dy.saturating_add(dy as i32);
+        self.x = (self.x as i32 + dx as i32).clamp(self.min_x as i32, self.max_x as i32) as i16;
+        self.y = (self.y as i32 + dy as i32).clamp(self.min_y as i32, self.max_y as i32) as i16;
+        let prev = self.buttons;
+        let cur = buttons;
+        self.buttons = cur;
+        self.render_if_visible();
+
+        let mut cond: u16 = 0;
+        if dx != 0 || dy != 0 { cond |= 0x01; }
+        let pressed = !prev & cur;
+        let released = prev & !cur;
+        if pressed  & 0x01 != 0 { cond |= 0x02; }
+        if released & 0x01 != 0 { cond |= 0x04; }
+        if pressed  & 0x02 != 0 { cond |= 0x08; }
+        if released & 0x02 != 0 { cond |= 0x10; }
+        if pressed  & 0x04 != 0 { cond |= 0x20; }
+        if released & 0x04 != 0 { cond |= 0x40; }
+
+        // Coalesce condition bits across multiple packets into one delivery;
+        // last_dx/dy reflect only the latest packet (real drivers fire once
+        // per packet, but our delivery is gated on the IRQ-loop tick).
+        self.pending_cond |= cond;
+        self.last_dx = dx;
+        self.last_dy = dy;
+        cond
+    }
+    /// Take and clear the accumulated delta (for INT 33h AX=0Bh).
+    pub fn take_motion(&mut self) -> (i32, i32) {
+        let dx = self.accum_dx;
+        let dy = self.accum_dy;
+        self.accum_dx = 0;
+        self.accum_dy = 0;
+        (dx, dy)
+    }
+
+    /// Text-mode cursor: invert (xor 0x77) the attribute byte at `(x>>3, y>>3)`
+    /// using the standard 8×8 mickey-to-cell ratio. No-op if hidden or
+    /// already drawn at this cell. Real Microsoft Mouse drivers also do this
+    /// in graphics modes via a sprite — we don't (yet); games that go to
+    /// mode 13h hide the driver cursor and draw their own anyway.
+    pub fn render_if_visible(&mut self) {
+        if self.show_count > 0 { return; }
+        let col = (self.x >> 3) as u32;
+        let row = (self.y >> 3) as u32;
+        if col >= 80 || row >= 25 { return; }
+        let offset = (row * 80 + col) as u16;
+        if Some(offset) == self.drawn_at { return; }
+        self.erase_cursor();
+        unsafe {
+            let attr = (VGA_TEXT_BASE + offset as u32 * 2 + 1) as *mut u8;
+            self.saved_attr = core::ptr::read_volatile(attr);
+            core::ptr::write_volatile(attr, self.saved_attr ^ 0x77);
+        }
+        self.drawn_at = Some(offset);
+    }
+
+    /// Restore the original attribute under the current cursor cell.
+    pub fn erase_cursor(&mut self) {
+        if let Some(old) = self.drawn_at.take() {
+            unsafe {
+                let attr = (VGA_TEXT_BASE + old as u32 * 2 + 1) as *mut u8;
+                core::ptr::write_volatile(attr, self.saved_attr);
+            }
+        }
+    }
+
+    /// AX=01h — show cursor: decrement counter; if it just reached 0, draw.
+    pub fn show(&mut self) {
+        self.show_count -= 1;
+        self.render_if_visible();
+    }
+
+    /// AX=02h — hide cursor: increment counter; if it was 0, erase.
+    pub fn hide(&mut self) {
+        if self.show_count <= 0 { self.erase_cursor(); }
+        self.show_count += 1;
+    }
+}
+
 impl PcMachine {
     pub fn new() -> Self {
         // Save real HMA content (identity-mapped 0x100-0x10F) into shadow,
@@ -391,6 +545,7 @@ impl PcMachine {
             vpit: VirtualPit::new(),
             vpic: VirtualPic::new(),
             vkbd: VirtualKeyboard::new(),
+            mouse: MouseState::new(),
             skip_irq: false,
             e0_pending: false,
             vga: VgaState::new(),
@@ -1098,6 +1253,17 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             let due = pc.vpit.take_pending_irqs();
             for _ in 0..due {
                 pc.vpic.push(0x08);
+            }
+        }
+        Irq::Mouse { dx, dy, buttons } => {
+            let cond = pc.mouse.apply_packet(dx, dy, buttons);
+            // Raise IRQ 12 (vec 0x74) into the virtual PIC iff the user
+            // registered a handler whose mask intersects this packet's
+            // condition bits. The IVT[0x74] stub at slot SLOT_INT74_MOUSE_CB
+            // will trap to kernel, set up callback args, and far-call the
+            // user handler.
+            if pc.mouse.cb_mask & cond != 0 && !pc.vpic.has_pending_vec(0x74) {
+                pc.vpic.push(0x74);
             }
         }
     }

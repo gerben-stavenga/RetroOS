@@ -79,6 +79,7 @@ pub(crate) fn dispatch_kernel_syscall(
             thread::KernelAction::Exit(0)
         }
         0x21 => int_21h(kt, dos, regs),
+        0x33 => int_33h(dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error
         0x25 | 0x26 => {
             regs.rax = (regs.rax & !0xFF00) | (0x02 << 8); // AH=02 address mark not found
@@ -109,7 +110,8 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
         SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RM_IRET_REFLECT | SLOT_RM_IRET_CALL
-        | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE)
+        | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
+        | SLOT_INT74_MOUSE_CB | SLOT_INT74_MOUSE_CB_RET)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
     let action = match slot {
@@ -139,7 +141,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
         }
-        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F | 0x67 => {
+        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F | 0x33 | 0x67 => {
             // Restore caller FLAGS into regs so handlers may mutate them
             // (CF/ZF returns); then write back so normal IRET-style pop
             // restores the handler's result to the caller.
@@ -156,6 +158,14 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
         }
         SLOT_SAVE_RESTORE => {
             dpmi::save_restore_protected_mode_state(dos, regs);
+            thread::KernelAction::Done
+        }
+        SLOT_INT74_MOUSE_CB => {
+            mouse_callback_invoke(dos, regs);
+            thread::KernelAction::Done
+        }
+        SLOT_INT74_MOUSE_CB_RET => {
+            mouse_callback_return(dos, regs);
             thread::KernelAction::Done
         }
         _ => {
@@ -1519,6 +1529,172 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction
     }
 }
 
+// ============================================================================
+// INT 33h — Microsoft Mouse driver
+// ============================================================================
+
+/// INT 33h — Microsoft Mouse Driver API. Minimal implementation covering
+/// the subfunctions DOS games actually use: install check, show/hide cursor
+/// (counter only — we don't draw), get/set position, button press/release
+/// info (degenerate: returns current state, no history), set range, read
+/// motion counters.
+///
+/// Mouse hardware state lives on `dos.pc.mouse` and is updated by the IRQ 12
+/// packet stream queued through `machine::queue_irq`.
+fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let ax = regs.rax as u16;
+    dos_trace!("D33 AX={:04X} BX={:04X} CX={:04X} DX={:04X} ES={:04X}",
+        ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16, regs.es as u16);
+    let m = &mut dos.pc.mouse;
+    match ax {
+        // AX=0000h — reset / installation check.
+        // Returns: AX=0xFFFF (driver installed), BX=number of buttons (2).
+        0x0000 => {
+            m.erase_cursor();
+            *m = super::machine::MouseState::new();
+            regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
+            regs.rbx = (regs.rbx & !0xFFFF) | 2;
+        }
+        // AX=0001h — show cursor. AX=0002h — hide cursor.
+        0x0001 => m.show(),
+        0x0002 => m.hide(),
+        // AX=0003h — get position and button status.
+        // BX=button mask, CX=x, DX=y.
+        0x0003 => {
+            regs.rbx = (regs.rbx & !0xFFFF) | m.buttons as u64;
+            regs.rcx = (regs.rcx & !0xFFFF) | (m.x as u16) as u64;
+            regs.rdx = (regs.rdx & !0xFFFF) | (m.y as u16) as u64;
+        }
+        // AX=0004h — set position. CX=x, DX=y.
+        0x0004 => {
+            m.x = (regs.rcx as i16).clamp(m.min_x, m.max_x);
+            m.y = (regs.rdx as i16).clamp(m.min_y, m.max_y);
+            m.render_if_visible();
+        }
+        // AX=0005h — get button press info. BX=button (0=left, 1=right, 2=mid).
+        // Returns AX=button mask, BX=press count since last call (degenerate
+        // 0 — we don't track press history), CX=x at last press, DX=y.
+        // AX=0006h — same shape for button release.
+        0x0005 | 0x0006 => {
+            regs.rax = (regs.rax & !0xFFFF) | m.buttons as u64;
+            regs.rbx = regs.rbx & !0xFFFF;
+            regs.rcx = (regs.rcx & !0xFFFF) | (m.x as u16) as u64;
+            regs.rdx = (regs.rdx & !0xFFFF) | (m.y as u16) as u64;
+        }
+        // AX=0007h — set horizontal range. CX=min, DX=max.
+        0x0007 => {
+            let (a, b) = (regs.rcx as i16, regs.rdx as i16);
+            m.min_x = a.min(b);
+            m.max_x = a.max(b);
+            m.x = m.x.clamp(m.min_x, m.max_x);
+        }
+        // AX=0008h — set vertical range. CX=min, DX=max.
+        0x0008 => {
+            let (a, b) = (regs.rcx as i16, regs.rdx as i16);
+            m.min_y = a.min(b);
+            m.max_y = a.max(b);
+            m.y = m.y.clamp(m.min_y, m.max_y);
+        }
+        // AX=000Bh — read motion counters (mickeys since last call).
+        // CX=dx, DX=dy as signed 16-bit. Resets the accumulators.
+        0x000B => {
+            let (dx, dy) = m.take_motion();
+            regs.rcx = (regs.rcx & !0xFFFF) | (dx as i16 as u16) as u64;
+            regs.rdx = (regs.rdx & !0xFFFF) | (dy as i16 as u16) as u64;
+        }
+        // AX=000Ch — install event handler.
+        // CX = condition mask (which events fire the handler), ES:DX = far
+        // handler address. CX=0 uninstalls.
+        0x000C => {
+            m.cb_mask = regs.rcx as u16;
+            m.cb_seg  = regs.es as u16;
+            m.cb_off  = regs.rdx as u16;
+            m.pending_cond = 0;
+        }
+        _ => {
+            dos_trace!("D33 unsupported AX={:04X}", ax);
+        }
+    }
+    thread::KernelAction::Done
+}
+
+/// SLOT_INT74_MOUSE_CB dispatch: HW IRQ 12 was reflected to IVT[0x74], landed
+/// at our stub. Set up the AX=0Ch handler far-call and jump the user there.
+///
+/// Bracket-saves the user GP regs we're about to clobber (AX/BX/CX/DX/SI/DI)
+/// since `ModeSave` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
+/// returns via SLOT_INT74_MOUSE_CB_RET which restores them and then unwinds
+/// the IRQ via the standard `rm_iret_reflect`.
+///
+/// Stack at entry (RM slab pushed by `reflect_int_to_real_mode`):
+///   top: trap-IP, trap-CS, trap-FLAGS (the CD 31 IRET frame).
+///   below: outer IRET frame targeting SLOT_RM_IRET_REFLECT.
+fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
+    use super::machine::{vm86_pop, vm86_push};
+    // Discard the CD 31 trap iret-frame (slot is is_far_call, dispatcher
+    // doesn't auto-pop it).
+    let _ = vm86_pop(regs); // trap ip
+    let _ = vm86_pop(regs); // trap cs
+    let _ = vm86_pop(regs); // trap flags
+
+    let m = &mut dos.pc.mouse;
+    // Bracket-save the user GP regs we're about to clobber.
+    m.saved_rax = regs.rax;
+    m.saved_rbx = regs.rbx;
+    m.saved_rcx = regs.rcx;
+    m.saved_rdx = regs.rdx;
+    m.saved_rsi = regs.rsi;
+    m.saved_rdi = regs.rdi;
+
+    let cond = m.pending_cond;
+    let buttons = m.buttons as u16;
+    let x = m.x as u16;
+    let y = m.y as u16;
+    let dx = m.last_dx as u16;
+    let dy = m.last_dy as u16;
+    let cb_seg = m.cb_seg;
+    let cb_off = m.cb_off;
+    m.pending_cond = 0;
+
+    // Push retf frame: handler RETFs to SLOT_INT74_MOUSE_CB_RET which
+    // restores the saved GP regs and then unwinds the IRQ.
+    vm86_push(regs, STUB_SEG);
+    vm86_push(regs, slot_offset(SLOT_INT74_MOUSE_CB_RET));
+
+    // Load AX=0Ch convention.
+    regs.rax = (regs.rax & !0xFFFF) | cond as u64;
+    regs.rbx = (regs.rbx & !0xFFFF) | buttons as u64;
+    regs.rcx = (regs.rcx & !0xFFFF) | x as u64;
+    regs.rdx = (regs.rdx & !0xFFFF) | y as u64;
+    regs.rsi = (regs.rsi & !0xFFFF) | dx as u64;
+    regs.rdi = (regs.rdi & !0xFFFF) | dy as u64;
+
+    super::machine::set_vm86_cs(regs, cb_seg);
+    super::machine::set_vm86_ip(regs, cb_off);
+    dos_trace!("[MOUSE] CB enter cond={:04X} buttons={:02X} x={} y={} dx={} dy={} -> {:04X}:{:04X}",
+        cond, buttons, x as i16, y as i16, dx as i16, dy as i16, cb_seg, cb_off);
+}
+
+/// SLOT_INT74_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
+/// Restore the GP regs `mouse_callback_invoke` clobbered, then unwind the
+/// IRQ via the same `rm_iret_reflect` that SLOT_RM_IRET_REFLECT uses.
+fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
+    use super::machine::vm86_pop;
+    // Discard the CD 31 trap iret-frame.
+    let _ = vm86_pop(regs);
+    let _ = vm86_pop(regs);
+    let _ = vm86_pop(regs);
+
+    let m = &dos.pc.mouse;
+    regs.rax = m.saved_rax;
+    regs.rbx = m.saved_rbx;
+    regs.rcx = m.saved_rcx;
+    regs.rdx = m.saved_rdx;
+    regs.rsi = m.saved_rsi;
+    regs.rdi = m.saved_rdi;
+
+    super::dpmi::rm_iret_reflect(dos, regs);
+}
 
 /// Open a DOS program file by literal name. No extension probing, no
 /// PATH search -- those are shell concerns and live in COMMAND.COM,
@@ -2352,6 +2528,18 @@ pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 // INT vector (INT 0x13 / 0x20 / 0x21 / 0x25 / 0x26 / 0x28 / 0x2E / 0x2F /
 // 0x67). 15 callbacks at slots 0x04..0x12.
 pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x13;
+/// IVT[0x74] target. When IRQ 12 (= INT 0x74) is reflected into the user via
+/// the standard `reflect_int_to_real_mode` path, control lands here. The
+/// CD 31 traps to kernel; `mouse_callback_invoke` sets up the AX=0Ch
+/// event-handler call: pops the trap frame, bracket-saves the user GP regs
+/// we're about to clobber, loads condition / button / x / y / dx / dy into
+/// AX/BX/CX/DX/SI/DI, pushes a retf frame pointing at SLOT_INT74_MOUSE_CB_RET,
+/// and jumps the user to the handler.
+pub(crate) const SLOT_INT74_MOUSE_CB: u8 = 0x74;
+/// Handler RETFs to this slot. `mouse_callback_return` restores the
+/// bracket-saved GP regs (ModeSave doesn't cover them) and then unwinds the
+/// IRQ via the standard `rm_iret_reflect` path.
+pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
@@ -2380,10 +2568,14 @@ pub(super) fn setup_ivt() {
 
     // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
     // dispatcher (slot index = INT vector).
-    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x67] {
+    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x33, 0x67] {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
+    // IVT[0x74] = STUB_SEG:slot_offset(SLOT_INT74_MOUSE_CB). HW IRQ 12
+    // reflection lands here so the kernel can dispatch the AX=0Ch handler.
+    write_u16(0, (0x74u32) * 4,     slot_offset(SLOT_INT74_MOUSE_CB));
+    write_u16(0, (0x74u32) * 4 + 2, STUB_SEG);
 
     setup_lol_sft();
     xms::scan_uma();
