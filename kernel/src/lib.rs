@@ -73,33 +73,6 @@ unsafe extern "C" {
     pub static ARCH_STACK_TOP: u8;
 }
 
-/// Raw CPU-pushed interrupt frame for 32-bit mode.
-/// This is only used by the 32-bit arch entry/exit path before conversion to
-/// the kernel-facing `Frame64` form.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Frame32 {
-    /// Padding to align with 64-bit frame layout
-    pub _pad: [u32; 5],
-    pub eip: u32,
-    pub cs: u32,
-    pub eflags: u32,
-    pub esp: u32,
-    pub ss: u32,
-}
-
-impl core::fmt::Debug for Frame32 {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Frame32")
-            .field("eip", &format_args!("{:#010x}", self.eip))
-            .field("cs", &format_args!("{:#06x}", self.cs))
-            .field("eflags", &format_args!("{:#010x}", self.eflags))
-            .field("esp", &format_args!("{:#010x}", self.esp))
-            .field("ss", &format_args!("{:#06x}", self.ss))
-            .finish()
-    }
-}
-
 /// CPU-pushed interrupt frame for 64-bit mode
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -170,35 +143,6 @@ impl Regs {
             rdi: 0, rsi: 0, rbp: 0, rsp_dummy: 0, rbx: 0, rdx: 0, rcx: 0, rax: 0,
             int_num: 0, err_code: 0,
             frame: Frame64 { rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0 },
-        }
-    }
-
-    /// Convert the in-place raw 32-bit frame encoding to the normalized
-    /// `Frame64` representation.
-    pub fn from_32(&mut self) {
-        let raw = unsafe { core::ptr::read((&self.frame as *const Frame64).cast::<Frame32>()) };
-        self.frame = Frame64 {
-            rip: raw.eip as u64,
-            cs: raw.cs as u64,
-            rflags: raw.eflags as u64,
-            rsp: raw.esp as u64,
-            ss: raw.ss as u64,
-        };
-    }
-
-    /// Convert the normalized `Frame64` representation to the raw 32-bit frame
-    /// encoding expected by the 32-bit `iret` path.
-    pub fn to_32(&mut self) {
-        let raw = Frame32 {
-            _pad: [0; 5],
-            eip: self.frame.rip as u32,
-            cs: self.frame.cs as u32,
-            eflags: self.frame.rflags as u32,
-            esp: self.frame.rsp as u32,
-            ss: self.frame.ss as u32,
-        };
-        unsafe {
-            core::ptr::write((&mut self.frame as *mut Frame64).cast::<Frame32>(), raw);
         }
     }
 
@@ -287,16 +231,6 @@ impl Regs {
     pub fn stack_seg(&self) -> u16 {
         self.frame.ss as u16
     }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn regs_from_32(regs: *mut Regs) {
-    unsafe { (*regs).from_32(); }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn regs_to_32(regs: *mut Regs) {
-    unsafe { (*regs).to_32(); }
 }
 
 impl core::fmt::Debug for Regs {

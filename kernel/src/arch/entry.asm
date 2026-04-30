@@ -163,143 +163,94 @@ common_dispatch:
     ; fall through to entry_wrapper_32
 
 ; =============================================================================
-; 32-bit-only code: entry_wrapper_32, call_isr_handler, exit_interrupt_32
+; 32-bit-only code: entry_wrapper_32, common_call, exit_interrupt_32
+;
+; Stack layout matches `Raw32` in arch/traps.rs (216 bytes total):
+;   [low ↑]  gs, fs, es, ds                            (4 segs as u32)
+;            edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax  (pushad order)
+;            <140 bytes of pad — fills the slots Regs uses for r8..r15
+;             and the high halves of segs/GP; left uninitialized>
+;            int_num, err_code                         (sw-pushed)
+;            eip, cs, eflags, esp, ss                  (CPU-pushed IRET)
+;
+; VM86 segs (CPU-pushed only when EFLAGS.VM=1) sit just past the Raw32 slot
+; and are accessed by Rust via `vm86_segs_after()` — not part of the struct.
 ; =============================================================================
 
-; -----------------------------------------------------------------------------
-; Common 32-bit interrupt entry — saves all registers as 64-bit values
-; Stack on entry: [err_code], eip, cs, eflags [, esp, ss]
-; int_num was pushed by vector table
-; -----------------------------------------------------------------------------
-
-; Macro to push a 32-bit register as 64-bit (with high dword = 0)
-%macro push64_32 1
-    push dword 0            ; high 32 bits
-    push %1                 ; low 32 bits
-%endmacro
-
 entry_wrapper_32:
-    ; Stack: int_num(32), err_code(32), eip, cs, eflags [, esp, ss]
-    ; Need: int_num(64), err_code(64), Frame32._pad(20), eip, ...
-    sub esp, 12             ; partial space for padding
-    ; Push 64-bit err_code (high=0, low=value)
-    push dword 0
-    push dword [esp+20]     ; err_code was at ESP+4, now at ESP+20
-    ; Push 64-bit int_num (high=0, low=value)
-    push dword 0
-    push dword [esp+24]     ; int_num was at ESP+0, now at ESP+24
-    ; Layout: int_num(64), err_code(64), 12-byte gap, old_int/err(8), eip
-    ; Padding between err_code and eip = 12 + 8 = 20 bytes
+    ; CPU pushed (lowest-up): err_code (or none), eip, cs, eflags
+    ; cross-priv adds: esp, ss; VM86 adds: es, ds, fs, gs.
+    ; int_vector pushed int_num; common_dispatch[_no_err] ensured an
+    ; err_code slot above it (either real or duplicated int_num).
 
-    ; Save general purpose registers (zero-extended to 64-bit)
-    push64_32 eax
-    push64_32 ecx
-    push64_32 edx
-    push64_32 ebx
-    push64_32 esp           ; dummy esp
-    push64_32 ebp
-    push64_32 esi
-    push64_32 edi
+    ; Allocate the 140-byte pad. Asm-32 pushes natively below; the upper
+    ; portion of Raw32 (where Regs would put r8..r15) sits here unused.
+    sub esp, 140
+    ; Save 8 GP regs in pushad order: edi (low addr) ... eax (high).
+    pushad
+    ; Save segment regs as u32 selectors. Order on stack: gs at lowest.
+    push ds
+    push es
+    push fs
+    push gs
+    ; ESP now points at offset 0 of Raw32 (= gs).
 
-    ; Push r8-r15 as zeros (not available in 32-bit mode): 8 regs * 8 bytes
-    times 16 push dword 0
-
-    ; Save segment registers (zero-extended to 64-bit)
-    xor eax, eax
-    mov ax, ds
-    push64_32 eax
-    mov ax, es
-    push64_32 eax
-    mov ax, fs
-    push64_32 eax
-    mov ax, gs
-    push64_32 eax
-
-    ; Build 16-byte mock frame: [ebp, eip, 0, 0] — rip==0 signals 32-bit user
+    ; Build 16-byte mock frame [ebp, eip, 0, 0] for stack-trace walking.
+    ; Raw32.eip is at offset 196; Raw32.ebp is at offset 24 (pushad slot).
     push dword 0
     push dword 0
-    push dword [esp + 196 + 8]  ; user's eip (+8 for two pushes above)
-    push dword [esp + 112 + 12] ; user's ebp (+12 for three pushes above)
-    mov ebp, esp
-    ; fall through to call_isr_handler
+    push dword [esp + 8 + 196]    ; user eip
+    push dword [esp + 12 + 24]    ; user ebp
+
+    xor ebx, ebx                  ; ebx = from_64 = false
+    jmp common_call
 
 ; -----------------------------------------------------------------------------
-; Common ISR dispatch — entered by fall-through from entry_wrapper_32 and via
-; far jmp from entry_wrapper_64. Computes FullRegs pointer from ESP and
-; dispatches exit based on current CPU mode (EFER.LMA).
-; Stack: [mock frame 16B] [Regs] [Frame] [VM86 segs]
+; common_call: shared dispatch tail. Caller has:
+;   - pushed StackFrame (216B) — its own native form (Raw32 or Regs)
+;   - pushed 16-byte mock frame [ebp_user, eip_user, 0, 0]
+;   - set ebx = from_64 flag
 ; -----------------------------------------------------------------------------
-call_isr_handler:
+common_call:
     cld
     ; Set kernel data selectors. SS *must* be reloaded before any push: on
-    ; the 64→32 path long-mode same-privilege interrupt clears SS. FS/GS on
-    ; the 64-bit path are inert — exit restores FS_BASE/GS_BASE MSRs.
+    ; the 64→32 path the same-privilege long-mode interrupt clears SS.
     mov eax, 0x18
     mov ss, eax
     mov ds, eax
     mov es, eax
     mov fs, eax
     mov gs, eax
-    ; FullRegs lives directly above the 16-byte mock frame.
-    lea eax, [esp + 16]
-    push eax                ; cdecl arg: pointer to FullRegs
+
+    mov ebp, esp                  ; rbp = mock frame for backtrace
+
+    ; Call isr_handler(stack_ptr, from_64). cdecl: args right-to-left.
+    push ebx                      ; from_64
+    lea eax, [esp + 4 + 16]       ; ptr to StackFrame (skip from_64 + mock)
+    push eax                      ; stack_ptr
     call isr_handler
+    add esp, 8                    ; pop args
+    add esp, 16                   ; pop mock frame
+
 global isr_return
 isr_return:
-    add esp, 4              ; clean up arg
-
-    add esp, 16             ; clean up mock frame
-
-    ; isr_handler returned: AL = 1 if target is long mode, 0 if 32-bit.
+    ; AL = 1 → long-mode exit; AL = 0 → 32-bit exit.
     test al, al
     jz exit_interrupt_32
-    ; Direct far jump — valid in 32-bit mode (EA ptr16:32). CS=0x10 is the
-    ; 64-bit kernel code segment; CPU zero-extends the 32-bit offset to RIP.
+    ; Direct far jmp 0x10:offset is valid in 32-bit; CPU zero-extends offset
+    ; to RIP. Reaches exit_interrupt_64 in 64-bit code seg.
     jmp 0x10:exit_interrupt_64
 
 exit_interrupt_32:
-    ; Restore segment registers (push64_32 stores low at [ESP], high at [ESP+4])
-    pop eax                 ; gs low (value)
-    mov gs, ax
-    add esp, 4              ; skip gs high
-    pop eax                 ; fs low (value)
-    mov fs, ax
-    add esp, 4              ; skip fs high
-    pop eax                 ; es low (value)
-    mov es, ax
-    add esp, 4              ; skip es high
-    pop eax                 ; ds low (value)
-    mov ds, ax
-    add esp, 4              ; skip ds high
-
-    ; Skip r15-r8 (64 bytes = 8 registers * 8 bytes)
-    add esp, 64
-
-    ; Restore general purpose registers (skip high dwords)
-    pop edi
-    add esp, 4              ; skip high dword
-    pop esi
-    add esp, 4
-    pop ebp
-    add esp, 4
-    add esp, 8              ; skip rsp_dummy
-    pop ebx
-    add esp, 4
-    pop edx
-    add esp, 4
-    pop ecx
-    add esp, 4
-    pop eax
-    add esp, 4
-
-    ; Skip int_num and err_code (16 bytes total, both 64-bit)
-    add esp, 16
-
-    ; Remove frame padding (20 bytes)
-    add esp, 20
-
-    ; Return from interrupt (CPU pops eip, cs, eflags [, esp, ss])
-    iret
+    ; ESP at Raw32 offset 0. Pop in reverse of entry_wrapper_32.
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popad
+    add esp, 140                ; skip pad
+    add esp, 8                  ; skip int_num + err_code
+    iret                        ; CPU pops eip, cs, eflags [, esp, ss [, vm86 segs]]
 
 ; =============================================================================
 ; 64-bit-only code: long-mode interrupt entry, SYSCALL
@@ -335,37 +286,18 @@ entry_wrapper_64:
     push r14
     push r15
 
-    ; Save segment registers: DS/ES as selectors, FS/GS depends on interrupted mode
+    ; Save segment registers as selectors (zero-extended to u64). For 64-bit
+    ; user (CS=0x33) the relevant FS/GS state is the FS_BASE/GS_BASE MSRs --
+    ; isr_handler reads/writes those in Rust after canonicalization.
     xor rax, rax
     mov ax, ds
     push rax
     mov ax, es
     push rax
-    ; Check interrupted CS: 0x33 = 64-bit user, 0x23 = 32-bit compat
-    ; Offset: ES(8) + DS(8) + r15-r8(64) + rdi-rax(64) + int_num(8) + err_code(8) + rip(8) = 168
-    cmp dword [rsp + 168], 0x33
-    je .save_fs_gs_msr
-    ; 32-bit: save FS/GS as selectors (zero-extended to 64-bit)
-    xor rax, rax
     mov ax, fs
     push rax
-    xor rax, rax
     mov ax, gs
     push rax
-    jmp .fs_gs_done
-.save_fs_gs_msr:
-    ; 64-bit: save FS_BASE / GS_BASE MSRs
-    mov ecx, 0xC0000100     ; FS_BASE MSR
-    rdmsr
-    shl rdx, 32
-    or rax, rdx
-    push rax
-    mov ecx, 0xC0000101     ; GS_BASE MSR
-    rdmsr
-    shl rdx, 32
-    or rax, rdx
-    push rax
-.fs_gs_done:
 
     ; Build 16-byte mock frame (rbp, rip) for stack-trace walking.
     ; At this point: rip at rsp+176, rbp at rsp+112.
@@ -373,35 +305,22 @@ entry_wrapper_64:
     push qword [rsp + 120]      ; rbp (was at 112, now +8 after rip push)
     mov rbp, rsp
 
-    ; Far jump to 32-bit trampoline (indirect via memory; direct far jmp
+    ; Tell common_call we entered via the 64-bit path (from_64 = 1).
+    mov ebx, 1
+
+    ; Far jump to 32-bit common_call (indirect via memory; direct far jmp
     ; is invalid in long mode).
     jmp far [rel far_ptr_32]
 
 exit_interrupt_64:
-    ; Check return CS: 0x33 = 64-bit user → restore MSRs, else → restore selectors
-    cmp dword [rsp + 184], 0x33
-    je .restore_fs_gs_msr
-    ; 32-bit: restore FS/GS as selectors
+    ; Restore segments uniformly as selectors. For 64-bit user, isr_handler
+    ; already wrote FS_BASE/GS_BASE via wrmsr and zeroed the saved fs/gs
+    ; slots, so `mov fs/gs, ax` here loads a null selector -- harmless in
+    ; long mode where flat addressing is used.
     pop rax
     mov gs, ax
     pop rax
     mov fs, ax
-    jmp .restore_ds_es
-.restore_fs_gs_msr:
-    ; 64-bit: restore GS_BASE MSR
-    pop rax
-    mov rdx, rax
-    shr rdx, 32
-    mov ecx, 0xC0000101
-    wrmsr
-    ; Restore FS_BASE MSR
-    pop rax
-    mov rdx, rax
-    shr rdx, 32
-    mov ecx, 0xC0000100
-    wrmsr
-.restore_ds_es:
-    ; Restore ES, DS selectors
     pop rax
     mov es, ax
     pop rax
@@ -464,6 +383,6 @@ syscall_entry_64:
 ; -----------------------------------------------------------------------------
 align 8
 far_ptr_32:
-    dq call_isr_handler     ; 64-bit offset (used from 64-bit mode, m16:64)
+    dq common_call          ; 64-bit offset (used from 64-bit mode, m16:64)
     dw 0x08                 ; 32-bit code segment
 

@@ -9,7 +9,7 @@ use crate::arch::irq::handle_irq;
 use crate::arch::paging2::{self, Entry};
 use crate::println;
 use crate::arch::x86;
-use crate::{Frame32, Frame64, Regs};
+use crate::{Frame64, Regs};
 
 // =============================================================================
 // Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
@@ -20,16 +20,59 @@ use crate::{Frame32, Frame64, Regs};
 // =============================================================================
 
 
-/// Full interrupt frame including optional VM86 segments.
-/// CPU pushes ES, DS, FS, GS after SS:ESP for VM86 interrupts.
-/// TSS ESP0 is set 16 bytes below stack top to always reserve room.
+/// Raw 32-bit register save layout, what `entry_wrapper_32` pushes natively.
+/// Total size matches `Regs` (216 bytes) so the two share a common stack slot
+/// via `StackFrame`. Layout from low to high address (matches push order):
+///   - 4 segment selectors (low offset; pushed last by asm)
+///   - 8 GP regs in `pushad` order: edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax
+///   - 140 bytes of internal padding (covers the slots `Regs` uses for r8..r15
+///     and the high halves of segs/GP)
+///   - int_num, err_code (sw-pushed by `int_vector` / `common_dispatch`)
+///   - Frame32 IRET payload (eip, cs, eflags [, esp, ss for cross-priv])
+///
+/// VM86 segs (es, ds, fs, gs) the CPU pushes above the IRET frame for VM86
+/// entries are *not* part of `Raw32` — they sit at stack offsets immediately
+/// past `ss`, accessed via `vm86_segs_after()` only when the saved EFLAGS.VM
+/// bit is set.
 #[repr(C)]
-struct FullRegs {
-    regs: Regs,
-    vm86_es: u32,
-    vm86_ds: u32,
-    vm86_fs: u32,
-    vm86_gs: u32,
+#[derive(Clone, Copy)]
+pub struct Raw32 {
+    pub gs: u32, pub fs: u32, pub es: u32, pub ds: u32,
+    pub edi: u32, pub esi: u32, pub ebp: u32, pub esp_dummy: u32,
+    pub ebx: u32, pub edx: u32, pub ecx: u32, pub eax: u32,
+    pub _pad: [u8; 140],
+    pub int_num: u32, pub err_code: u32,
+    pub eip: u32, pub cs: u32, pub eflags: u32, pub esp: u32, pub ss: u32,
+}
+
+/// 4 VM86 segment selectors the CPU pushes above the IRET frame on a VM86
+/// trap. Lives in stack memory immediately after a `Raw32` slot — Rust reads
+/// it via `(stack as *mut u8).add(sizeof::<StackFrame>())` only when EFLAGS.VM
+/// is set on entry.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vm86Segs {
+    pub es: u32, pub ds: u32, pub fs: u32, pub gs: u32,
+}
+
+/// Stack-side view of a saved interrupt frame. Two arms over the same 216-byte
+/// slot: `regs` is the canonical 64-bit form, `raw32` is what `entry_wrapper_32`
+/// pushes natively. `isr_handler` picks the live arm via its `from_64` parameter.
+#[repr(C)]
+pub union StackFrame {
+    pub regs: Regs,
+    pub raw32: Raw32,
+}
+
+const _: () = assert!(core::mem::size_of::<Regs>() == core::mem::size_of::<Raw32>());
+const _: () = assert!(core::mem::size_of::<StackFrame>() == core::mem::size_of::<Regs>());
+
+/// Pointer to the VM86 segment block that sits in stack memory immediately
+/// past a `StackFrame` slot. Only valid to dereference when the saved
+/// EFLAGS.VM bit is set on the entry/exit.
+#[inline]
+unsafe fn vm86_segs_after(stack: *mut StackFrame) -> *mut Vm86Segs {
+    unsafe { (stack as *mut u8).add(core::mem::size_of::<StackFrame>()) as *mut Vm86Segs }
 }
 
 /// Register swap buffer. Holds user regs when kernel runs.
@@ -199,37 +242,89 @@ fn arch_switch_to(regs: &mut Regs) {
 /// Ring 1 (kernel): IRQ → ACK+queue+return. INT 0x80 → arch call. Trap → panic.
 /// Ring 3 (user): save state, return event to ring-1 kernel.
 /// Ring 0 (boot): page fault → demand paging. IRQ → ACK+queue. Rest → panic.
+///
+/// `stack` is the raw saved state on the kernel stack — a `StackFrame` union
+/// over the same 216-byte slot. `from_64` tells us which arm holds live data:
+/// the 64-bit form pushed by `entry_wrapper_64`, or the 32-bit form pushed by
+/// `entry_wrapper_32`. We canonicalize to `Regs` (always the 64-bit form), let
+/// the kernel run on it, then denormalize back if exiting to 32-bit user.
+///
+/// Returns true if the kernel wants to iret to long mode (the 64-bit exit path).
 #[unsafe(no_mangle)]
 #[allow(private_interfaces)]
-pub extern "C" fn isr_handler(full: *mut FullRegs) -> bool {
+pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     static mut VIF: bool = false;
     static mut VIP: bool = false;
-
-    let full = unsafe { &mut *full };
-
-    // Snapshot CPU mode once; refreshed by toggle_mode_if_needed below.
-    let is_long = paging2::cpu_mode() == paging2::CpuMode::Compat;
-
-    // Detect ring transition from raw frame before any conversion.
-    // 32-bit same-privilege interrupts don't push ESP/SS, so from_32/to_32
-    // would read/write beyond the frame. Ring-0 gets its own minimal path.
-    let ring_transition = if is_long {
-        full.regs.frame.cs & 3 != 0
+    // Read just enough raw fields to classify the trap before canonicalizing.
+    // Same-priv (ring 0 → ring 0) traps don't push SS/ESP and never reach VM86
+    // segs, so canonicalizing would read residue. Cross-priv traps (ring 1
+    // kernel or ring 3 user → arch ring 0) get full canonicalization.
+    let (raw_eflags, raw_cs, raw_int_num, raw_err_code) = if from_64 {
+        let r = unsafe { &(*stack).regs };
+        (r.frame.rflags, r.frame.cs, r.int_num, r.err_code)
     } else {
-        let raw = unsafe { (&full.regs.frame as *const Frame64).cast::<Frame32>().read() };
-        raw.eflags & VM_FLAG as u32 != 0 || raw.cs & 3 != 0
+        let r = unsafe { &(*stack).raw32 };
+        (r.eflags as u64, r.cs as u64, r.int_num as u64, r.err_code as u64)
     };
-    if !ring_transition {
-        handle_ring0(full.regs.int_num & 0xFF, full.regs.err_code);
-        return is_long;
+    let vm86 = raw_eflags & VM_FLAG != 0;
+    let same_priv = !vm86 && (raw_cs & 3) == 0;
+    if same_priv {
+        handle_ring0(raw_int_num & 0xFF, raw_err_code);
+        return from_64;
+    }
+    // Only ring 3 / VM86 needs the full user-emulation cleanup (VIF/VIP swap,
+    // VM86 seg promotion). Ring 1 kernel just needs the layout normalized.
+    let from_ring3 = vm86 || (raw_cs & 3) == 3;
+
+    // Canonicalize: write a `Regs` into the stack slot via the union, picking
+    // fields conditionally so we never read residue (SS/ESP only valid on
+    // ring transition; VM86 segs only valid in VM86).
+    if !from_64 {
+        let r = unsafe { &(*stack).raw32 };
+        // VM86 supplies segs in the CPU-pushed slots that sit just past the
+        // StackFrame; non-VM86 ring-3 already has the user selectors in the
+        // asm-pushed seg slots inside Raw32.
+        let v = if vm86 { unsafe { &*vm86_segs_after(stack) } } else { &Vm86Segs { es:0, ds:0, fs:0, gs:0 } };
+        let canonical = Regs {
+            gs: if vm86 { v.gs as u64 } else { r.gs as u64 },
+            fs: if vm86 { v.fs as u64 } else { r.fs as u64 },
+            es: if vm86 { v.es as u64 } else { r.es as u64 },
+            ds: if vm86 { v.ds as u64 } else { r.ds as u64 },
+            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+            rdi: r.edi as u64,
+            rsi: r.esi as u64,
+            rbp: r.ebp as u64,
+            rsp_dummy: r.esp_dummy as u64,
+            rbx: r.ebx as u64,
+            rdx: r.edx as u64,
+            rcx: r.ecx as u64,
+            rax: r.eax as u64,
+            int_num: raw_int_num,
+            err_code: raw_err_code,
+            frame: Frame64 {
+                rip: r.eip as u64,
+                cs: raw_cs,
+                rflags: raw_eflags,
+                rsp: r.esp as u64,
+                ss: r.ss as u64,
+            },
+        };
+        unsafe { (*stack).regs = canonical; }
+    }
+    let regs = unsafe { &mut (*stack).regs };
+
+    // 64-bit user: asm-64 saved FS/GS as selectors only; substitute the FS_BASE
+    // / GS_BASE MSRs (which is what 64-bit code actually uses) so the kernel
+    // can preserve them across the trap.
+    if from_64 && regs.frame.cs == 0x33 {
+        regs.fs = x86::rdmsr(0xC000_0100);
+        regs.gs = x86::rdmsr(0xC000_0101);
     }
 
-    if !is_long { full.regs.from_32(); }
-
-    // Fix ESP from IRET to 16-bit SS: CPU only loads SP, upper bits are
-    // kernel stack residue. Mask to 16 bits based on descriptor B bit.
-    if !is_vm86(&full.regs) && full.regs.frame.ss & 4 != 0 {
-        let ss = full.regs.frame.ss as u16;
+    // 16-bit SS sanity-fix: CPU only loads low 16 bits of SP for B=0 stacks;
+    // upper bits are kernel residue.
+    if !vm86 && regs.frame.ss & 4 != 0 {
+        let ss = regs.frame.ss as u16;
         let ar: u32;
         let ok: u8;
         unsafe {
@@ -241,73 +336,103 @@ pub extern "C" fn isr_handler(full: *mut FullRegs) -> bool {
                 ok = out(reg_byte) ok,
             );
         }
-        // LAR bit 22 = D/B (Big). If valid and B=0 → 16-bit stack.
         if ok != 0 && ar & (1 << 22) == 0 {
-            full.regs.frame.rsp &= 0xFFFF;
+            regs.frame.rsp &= 0xFFFF;
         }
     }
 
-    // Ring 3 entry canonicalization: VM86 segments + VIF↔IF swap
-    let vm86 = is_vm86(&full.regs);
-    let from_ring3 = vm86 || full.regs.frame.cs & 3 == 3;
-    if vm86 {
-        full.regs.es = full.vm86_es as u64;
-        full.regs.ds = full.vm86_ds as u64;
-        full.regs.fs = full.vm86_fs as u64;
-        full.regs.gs = full.vm86_gs as u64;
-    }
+    // VIF↔IF entry swap (ring 3 / VM86 only). With VME the hardware maintains
+    // VIF/VIP in EFLAGS bits 19/20; otherwise we keep them in statics across
+    // the kernel run.
     if from_ring3 {
-        // VME: hardware maintained VIF/VIP — read into statics
         if vm86 && x86::read_cr4() & x86::cr4::VME != 0 {
             unsafe {
-                VIF = full.regs.frame.rflags & (1 << 19) != 0;
-                VIP = full.regs.frame.rflags & (1 << 20) != 0;
+                VIF = regs.frame.rflags & (1 << 19) != 0;
+                VIP = regs.frame.rflags & (1 << 20) != 0;
             }
         }
         unsafe {
-            // IF = static_VIF (kernel uses IF as virtual interrupt flag)
-            if VIF { full.regs.frame.rflags |= 1 << 9; }
-            else { full.regs.frame.rflags &= !(1 << 9); }
-            // Restore VIP from static
-            if VIP { full.regs.frame.rflags |= 1 << 20; }
-            else { full.regs.frame.rflags &= !(1 << 20); }
+            if VIF { regs.frame.rflags |= 1 << 9; }
+            else   { regs.frame.rflags &= !(1 << 9); }
+            if VIP { regs.frame.rflags |= 1 << 20; }
+            else   { regs.frame.rflags &= !(1 << 20); }
         }
     }
 
-    isr_handler_inner(&mut full.regs, from_ring3);
+    isr_handler_inner(regs, from_ring3);
 
-    // Mode toggle if output regs need different CPU mode
-    let is_long = toggle_mode_if_needed(&full.regs, is_long);
+    // Mode-toggle the CPU if the kernel's output mode differs from entry.
+    let is_long = toggle_mode_if_needed(regs, from_64);
 
-    // Ring 3 exit decanonicalization: VIF↔IF swap + VM86 segments
-    let to_ring3 = is_vm86(&full.regs) || full.regs.frame.cs & 3 == 3;
+    // VIF↔IF exit swap (ring 3 / VM86 only); force real IF=1 so HW IRQs can be
+    // delivered to user.
+    let to_vm86 = is_vm86(regs);
+    let to_ring3 = to_vm86 || (regs.frame.cs & 3) == 3;
     if to_ring3 {
-        // Save virtual state to statics
         unsafe {
-            VIF = full.regs.frame.rflags & (1 << 9) != 0;
-            VIP = full.regs.frame.rflags & (1 << 20) != 0;
+            VIF = regs.frame.rflags & (1 << 9) != 0;
+            VIP = regs.frame.rflags & (1 << 20) != 0;
         }
-        // VME: write VIF/VIP into EFLAGS for hardware management
-        if is_vm86(&full.regs) && x86::read_cr4() & x86::cr4::VME != 0 {
-            if unsafe { VIF } { full.regs.frame.rflags |= 1 << 19; }
-            else { full.regs.frame.rflags &= !(1 << 19); }
-            // VIP already at bit 20
+        if to_vm86 && x86::read_cr4() & x86::cr4::VME != 0 {
+            if unsafe { VIF } { regs.frame.rflags |= 1 << 19; }
+            else              { regs.frame.rflags &= !(1 << 19); }
         }
-        // Force IF=1 for real interrupt delivery
-        full.regs.frame.rflags |= 0x200;
-    }
-    if is_vm86(&full.regs) {
-        full.vm86_es = full.regs.es as u32;
-        full.vm86_ds = full.regs.ds as u32;
-        full.vm86_fs = full.regs.fs as u32;
-        full.vm86_gs = full.regs.gs as u32;
-        full.regs.es = 0;
-        full.regs.ds = 0;
-        full.regs.fs = 0;
-        full.regs.gs = 0;
+        regs.frame.rflags |= 0x200;
     }
 
-    if !is_long { full.regs.to_32(); }
+    // 64-bit user exit: write FS_BASE/GS_BASE MSRs (what asm pops as selectors
+    // is meaningless for 64-bit code — null those slots so the asm `mov fs/gs,
+    // ax` loads a null selector, harmless in 64-bit mode).
+    if is_long && regs.frame.cs == 0x33 {
+        unsafe {
+            x86::wrmsr(0xC000_0100, regs.fs);
+            x86::wrmsr(0xC000_0101, regs.gs);
+        }
+        regs.fs = 0;
+        regs.gs = 0;
+    }
+
+    // Denormalize back to the 32-bit push form if exiting to 32-bit/VM86.
+    if !is_long {
+        let r = unsafe { core::ptr::read(regs) };
+        // For VM86 exit, the user's segs go into the CPU's vm86 slots (popped
+        // by iret); the kernel-side seg slots must be NULL or kernel selectors
+        // because asm's `pop gs/fs/es/ds` in PM ring 0 validates them as
+        // descriptors before iret takes over.
+        let (gs, fs, es, ds) = if to_vm86 {
+            (0, 0, 0, 0)
+        } else {
+            (r.gs as u32, r.fs as u32, r.es as u32, r.ds as u32)
+        };
+        let raw32 = Raw32 {
+            gs, fs, es, ds,
+            edi: r.rdi as u32,
+            esi: r.rsi as u32,
+            ebp: r.rbp as u32,
+            esp_dummy: r.rsp_dummy as u32,
+            ebx: r.rbx as u32,
+            edx: r.rdx as u32,
+            ecx: r.rcx as u32,
+            eax: r.rax as u32,
+            _pad: [0; 140],
+            int_num: r.int_num as u32,
+            err_code: r.err_code as u32,
+            eip: r.frame.rip as u32,
+            cs: r.frame.cs as u32,
+            eflags: r.frame.rflags as u32,
+            esp: r.frame.rsp as u32,
+            ss: r.frame.ss as u32,
+        };
+        unsafe { (*stack).raw32 = raw32; }
+        if to_vm86 {
+            unsafe {
+                *vm86_segs_after(stack) = Vm86Segs {
+                    es: r.es as u32, ds: r.ds as u32,
+                    fs: r.fs as u32, gs: r.gs as u32,
+                };
+            }
+        }
+    }
     is_long
 }
 
