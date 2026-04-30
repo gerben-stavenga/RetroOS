@@ -422,6 +422,8 @@ pub fn handle_event(
             }
         }
         KE::PageFault { .. } => unreachable!("PageFault handled in event loop"),
+        // DOS personality has no syscall ABI — segfault the thread.
+        KE::Syscall => thread::KernelAction::Exit(-11),
     }
 }
 

@@ -31,9 +31,9 @@ use crate::{Frame64, Regs};
 ///   - Frame32 IRET payload (eip, cs, eflags [, esp, ss for cross-priv])
 ///
 /// VM86 segs (es, ds, fs, gs) the CPU pushes above the IRET frame for VM86
-/// entries are *not* part of `Raw32` — they sit at stack offsets immediately
-/// past `ss`, accessed via `vm86_segs_after()` only when the saved EFLAGS.VM
-/// bit is set.
+/// entries are *not* part of `Raw32` — they form the second component of the
+/// 32-bit `StackFrame` arm `(Raw32, Vm86Segs)`, valid only when EFLAGS.VM is
+/// set on entry/exit.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Raw32 {
@@ -46,34 +46,31 @@ pub struct Raw32 {
 }
 
 /// 4 VM86 segment selectors the CPU pushes above the IRET frame on a VM86
-/// trap. Lives in stack memory immediately after a `Raw32` slot — Rust reads
-/// it via `(stack as *mut u8).add(sizeof::<StackFrame>())` only when EFLAGS.VM
-/// is set on entry.
+/// trap. Bytes are valid only when EFLAGS.VM is set on entry/exit; otherwise
+/// kernel-stack residue.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Vm86Segs {
     pub es: u32, pub ds: u32, pub fs: u32, pub gs: u32,
 }
 
-/// Stack-side view of a saved interrupt frame. Two arms over the same 216-byte
-/// slot: `regs` is the canonical 64-bit form, `raw32` is what `entry_wrapper_32`
-/// pushes natively. `isr_handler` picks the live arm via its `from_64` parameter.
+/// Stack-side view of a saved interrupt frame. Two arms: `regs` is the
+/// canonical 64-bit form (216B); the 32-bit arm is `(Raw32, Vm86Segs)` — the
+/// native push slot plus the optional VM86 seg tail. `isr_handler` picks the
+/// live arm via `from_64`.
+///
+/// The 16-byte `Vm86Segs` tail is always safe to read/write: TSS.sp0 is
+/// pinned 16 bytes below the kernel stack top (see `arch/boot.rs`), and ring
+/// transitions are the only path that lands here, so the spare 16 bytes
+/// above the IRET frame always exist. For VM86 entries the CPU pushed real
+/// vm86 segs there; for non-VM86 it's spare bytes we can scribble on.
 #[repr(C)]
 pub union StackFrame {
     pub regs: Regs,
-    pub raw32: Raw32,
+    pub raw32: (Raw32, Vm86Segs),
 }
 
 const _: () = assert!(core::mem::size_of::<Regs>() == core::mem::size_of::<Raw32>());
-const _: () = assert!(core::mem::size_of::<StackFrame>() == core::mem::size_of::<Regs>());
-
-/// Pointer to the VM86 segment block that sits in stack memory immediately
-/// past a `StackFrame` slot. Only valid to dereference when the saved
-/// EFLAGS.VM bit is set on the entry/exit.
-#[inline]
-unsafe fn vm86_segs_after(stack: *mut StackFrame) -> *mut Vm86Segs {
-    unsafe { (stack as *mut u8).add(core::mem::size_of::<StackFrame>()) as *mut Vm86Segs }
-}
 
 /// Register swap buffer. Holds user regs when kernel runs.
 pub(crate) static mut REGS: Regs = Regs::empty();
@@ -259,32 +256,40 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // Same-priv (ring 0 → ring 0) traps don't push SS/ESP and never reach VM86
     // segs, so canonicalizing would read residue. Cross-priv traps (ring 1
     // kernel or ring 3 user → arch ring 0) get full canonicalization.
-    let (raw_eflags, raw_cs, raw_int_num, raw_err_code) = if from_64 {
+    let (vm86, raw_cs, raw_int_num, raw_err_code) = if from_64 {
+        // EFLAGS.VM is reserved in long mode -- 64-bit entry is never VM86.
         let r = unsafe { &(*stack).regs };
-        (r.frame.rflags, r.frame.cs, r.int_num, r.err_code)
+        (false, r.frame.cs, r.int_num, r.err_code)
     } else {
-        let r = unsafe { &(*stack).raw32 };
-        (r.eflags as u64, r.cs as u64, r.int_num as u64, r.err_code as u64)
+        let r = unsafe { &(*stack).raw32.0 };
+        (r.eflags as u64 & VM_FLAG != 0, r.cs as u64, r.int_num as u64, r.err_code as u64)
     };
-    let vm86 = raw_eflags & VM_FLAG != 0;
-    let same_priv = !vm86 && (raw_cs & 3) == 0;
-    if same_priv {
-        handle_ring0(raw_int_num & 0xFF, raw_err_code);
+    // Mask int_num to 8 bits to undo sign-extension from `push imm8` for
+    // vectors >= 0x80. `syscall_entry_64` pushes 256 (out of IDT range) as a
+    // sentinel — preserve it so ring3 can route it to `KE::Syscall`.
+    let raw_int_num = if raw_int_num == 256 { 256 } else { raw_int_num & 0xFF };
+
+    if !vm86 && (raw_cs & 3) == 0 {  // from ring 0?
+        handle_ring0(raw_int_num, raw_err_code);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss
         return from_64;
     }
-    // Only ring 3 / VM86 needs the full user-emulation cleanup (VIF/VIP swap,
-    // VM86 seg promotion). Ring 1 kernel just needs the layout normalized.
-    let from_ring3 = vm86 || (raw_cs & 3) == 3;
 
     // Canonicalize: write a `Regs` into the stack slot via the union, picking
     // fields conditionally so we never read residue (SS/ESP only valid on
     // ring transition; VM86 segs only valid in VM86).
-    if !from_64 {
-        let r = unsafe { &(*stack).raw32 };
-        // VM86 supplies segs in the CPU-pushed slots that sit just past the
-        // StackFrame; non-VM86 ring-3 already has the user selectors in the
-        // asm-pushed seg slots inside Raw32.
-        let v = if vm86 { unsafe { &*vm86_segs_after(stack) } } else { &Vm86Segs { es:0, ds:0, fs:0, gs:0 } };
+    let regs = unsafe { &mut (*stack).regs };
+    if from_64 {
+        // 64-bit user: asm-64 saved FS/GS as selectors only; substitute the
+        // FS_BASE / GS_BASE MSRs (what 64-bit code actually uses).
+        if regs.frame.cs == 0x33 {
+            regs.fs = x86::rdmsr(0xC000_0100);
+            regs.gs = x86::rdmsr(0xC000_0101);
+        }
+        regs.int_num = raw_int_num;
+    } else {
+        let (r, v) = unsafe { &(*stack).raw32 };
+        // VM86 supplies segs in the CPU-pushed `Vm86Segs` tail; non-VM86
+        // ring-3 already has the user selectors in `Raw32`'s seg slots.
         let canonical = Regs {
             gs: if vm86 { v.gs as u64 } else { r.gs as u64 },
             fs: if vm86 { v.fs as u64 } else { r.fs as u64 },
@@ -304,21 +309,12 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
             frame: Frame64 {
                 rip: r.eip as u64,
                 cs: raw_cs,
-                rflags: raw_eflags,
+                rflags: r.eflags as u64,
                 rsp: r.esp as u64,
                 ss: r.ss as u64,
             },
         };
-        unsafe { (*stack).regs = canonical; }
-    }
-    let regs = unsafe { &mut (*stack).regs };
-
-    // 64-bit user: asm-64 saved FS/GS as selectors only; substitute the FS_BASE
-    // / GS_BASE MSRs (which is what 64-bit code actually uses) so the kernel
-    // can preserve them across the trap.
-    if from_64 && regs.frame.cs == 0x33 {
-        regs.fs = x86::rdmsr(0xC000_0100);
-        regs.gs = x86::rdmsr(0xC000_0101);
+        *regs = canonical;
     }
 
     // 16-bit SS sanity-fix: CPU only loads low 16 bits of SP for B=0 stacks;
@@ -341,9 +337,13 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         }
     }
 
+    // Only ring 3 / VM86 needs the full user-emulation cleanup (VIF/VIP swap,
+    // VM86 seg promotion). Ring 1 kernel just needs the layout normalized.
+
     // VIF↔IF entry swap (ring 3 / VM86 only). With VME the hardware maintains
     // VIF/VIP in EFLAGS bits 19/20; otherwise we keep them in statics across
     // the kernel run.
+    let from_ring3 = vm86 || (raw_cs & 3) == 3;
     if from_ring3 {
         if vm86 && x86::read_cr4() & x86::cr4::VME != 0 {
             unsafe {
@@ -357,12 +357,13 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
             if VIP { regs.frame.rflags |= 1 << 20; }
             else   { regs.frame.rflags &= !(1 << 20); }
         }
+        isr_handler_ring3(regs);
+    } else {
+        isr_handler_ring1(regs);
     }
 
-    isr_handler_inner(regs, from_ring3);
-
     // Mode-toggle the CPU if the kernel's output mode differs from entry.
-    let is_long = toggle_mode_if_needed(regs, from_64);
+    let to_64 = toggle_mode_if_needed(regs, from_64);
 
     // VIF↔IF exit swap (ring 3 / VM86 only); force real IF=1 so HW IRQs can be
     // delivered to user.
@@ -380,25 +381,27 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         regs.frame.rflags |= 0x200;
     }
 
-    // 64-bit user exit: write FS_BASE/GS_BASE MSRs (what asm pops as selectors
-    // is meaningless for 64-bit code — null those slots so the asm `mov fs/gs,
-    // ax` loads a null selector, harmless in 64-bit mode).
-    if is_long && regs.frame.cs == 0x33 {
-        unsafe {
-            x86::wrmsr(0xC000_0100, regs.fs);
-            x86::wrmsr(0xC000_0101, regs.gs);
-        }
-        regs.fs = 0;
-        regs.gs = 0;
-    }
-
     // Denormalize back to the 32-bit push form if exiting to 32-bit/VM86.
-    if !is_long {
-        let r = unsafe { core::ptr::read(regs) };
-        // For VM86 exit, the user's segs go into the CPU's vm86 slots (popped
-        // by iret); the kernel-side seg slots must be NULL or kernel selectors
-        // because asm's `pop gs/fs/es/ds` in PM ring 0 validates them as
-        // descriptors before iret takes over.
+    if to_64 {
+        // 64-bit user exit: write FS_BASE/GS_BASE MSRs (what asm pops as selectors
+        // is meaningless for 64-bit code — null those slots so the asm `mov fs/gs,
+        // ax` loads a null selector, harmless in 64-bit mode).
+        if regs.frame.cs == 0x33 {
+            unsafe {
+                x86::wrmsr(0xC000_0100, regs.fs);
+                x86::wrmsr(0xC000_0101, regs.gs);
+            }
+            regs.fs = 0;
+            regs.gs = 0;
+        }
+    } else {
+        // Decouple from `regs` before we overwrite the same memory via the
+        // union's other arm: shadow it with a value-copy (Regs is Copy).
+        let r = *regs;
+        // For VM86 exit, the user's segs go into the `Vm86Segs` tail (popped
+        // by iret); the kernel-side seg slots in `Raw32` must be NULL because
+        // asm's `pop gs/fs/es/ds` in PM ring 0 validates them as descriptors
+        // before iret takes over.
         let (gs, fs, es, ds) = if to_vm86 {
             (0, 0, 0, 0)
         } else {
@@ -423,116 +426,115 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
             esp: r.frame.rsp as u32,
             ss: r.frame.ss as u32,
         };
-        unsafe { (*stack).raw32 = raw32; }
-        if to_vm86 {
-            unsafe {
-                *vm86_segs_after(stack) = Vm86Segs {
-                    es: r.es as u32, ds: r.ds as u32,
-                    fs: r.fs as u32, gs: r.gs as u32,
-                };
-            }
-        }
+        // Unconditionally copy user segs into the Vm86Segs tail: iret only
+        // pops it on VM86 exit, and the 16 bytes are the TSS.sp0 reserve
+        // (see StackFrame doc) so a stray write is harmless either way.
+        let v = Vm86Segs {
+            es: r.es as u32, ds: r.ds as u32,
+            fs: r.fs as u32, gs: r.gs as u32,
+        };
+        unsafe { (*stack).raw32 = (raw32, v); }
     }
-    is_long
+    to_64
 }
 
-fn isr_handler_inner(regs: &mut Regs, from_ring3: bool) {
-    // Mask to undo sign-extension from push imm8 for vectors >= 0x80
-    let int_num = regs.int_num & 0xFF;
-    regs.int_num = int_num;
-
-    if from_ring3 {
-        // User (ring 3 / VM86): classify the x86 vector into a `KernelEvent`
-        // and bubble it up. `#GP` runs the sensitive-instruction monitor
-        // first — on `Resume` we iret straight to user. `#PF` and IRQs are
-        // handled inline by arch before bubbling.
-        use crate::arch::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult};
-        use crate::UserMode;
-        let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
-        let kevent: KE = match int_num {
-            // #DB: only armed by `step_virtual_if` to single-step PM regions
-            // where virtual IF is 0. The hardware just executed one insn
-            // under TF; decide what to do about the NEXT one.
-            1 => {
-                use core::sync::atomic::Ordering;
-                let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
-                if budget > 0 {
-                    // Log step in PM and VM86 — VM86 logging needed to trace
-                    // RM execution after a raw PM->RM switch.
-                    crate::kernel::dos::pm_step_log(regs);
-                    crate::kernel::dos::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
-                    regs.set_flag32(1 << 8); // keep TF on
-                    return;
-                }
-                let _ = step_virtual_if(regs);
+/// Ring-3 / VM86 trap dispatch. Classifies the x86 vector into a
+/// `KernelEvent` and bubbles it up to the ring-1 kernel via swap_regs;
+/// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
+/// are handled inline by arch before bubbling.
+fn isr_handler_ring3(regs: &mut Regs) {
+    use crate::arch::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult};
+    use crate::UserMode;
+    let int_num = regs.int_num;
+    let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
+    let kevent: KE = match int_num {
+        // #DB: only armed by `step_virtual_if` to single-step PM regions
+        // where virtual IF is 0. The hardware just executed one insn under
+        // TF; decide what to do about the NEXT one.
+        1 => {
+            use core::sync::atomic::Ordering;
+            let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
+            if budget > 0 {
+                // Log step in PM and VM86 — VM86 logging needed to trace
+                // RM execution after a raw PM->RM switch.
+                crate::kernel::dos::pm_step_log(regs);
+                crate::kernel::dos::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
+                regs.set_flag32(1 << 8); // keep TF on
                 return;
             }
-            13 => match monitor(regs) {
-                MonitorResult::Resume   => {
-                    // If the monitor just cleared virtual IF in PM (e.g. a
-                    // CLI), kick off the single-step interpreter so POPF/
-                    // IRET get intercepted before hardware runs them.
-                    if regs.mode() != UserMode::VM86
-                        && regs.flags32() & (1 << 9) == 0
-                    {
-                        let _ = step_virtual_if(regs);
-                    }
-                    if regs.flags32() & ((1 << 9) | (1 << 20)) != (1 << 9) | (1 << 20) {
-                        return;
-                    }
-                    KE::Irq
-                }
-                MonitorResult::Event(e) => e,
-            },
-            14 => {
-                if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
-                KE::PageFault { addr: x86::read_cr2() as u32 }
-            }
-            32..=47 => { handle_irq(regs); KE::Irq }
-            // Vectors 3/4 (#BP/#OF) are only reachable from user `INT3`/`INTO`,
-            // so they're soft ints. Other n<32 are genuine CPU exceptions.
-            3 | 4 => KE::SoftInt(int_num as u8),
-            10 => {
-                let cs_base = if regs.mode() == UserMode::VM86 {
-                    (regs.code_seg() as u32) << 4
-                } else {
-                    crate::arch::monitor::seg_base(regs.code_seg())
-                };
-                let lin = cs_base.wrapping_add(regs.ip32());
-                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-                let ss_base = if regs.mode() == UserMode::VM86 {
-                    (regs.stack_seg() as u32) << 4
-                } else {
-                    crate::arch::monitor::seg_base(regs.stack_seg())
-                };
-                let sp = regs.sp32();
-                let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
-                crate::dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
-                    regs.code_seg(), regs.ip32(), regs.err_code, bytes,
-                    regs.stack_seg(), sp, stack);
-                KE::Exception(int_num as u8)
-            }
-            0..=31 => KE::Exception(int_num as u8),
-            // Direct-IDT soft interrupts: 0x30..=0xFF (plus VM86 `INT3`/`0xCC`
-            // bypass of VME landing here too).
-            _ => KE::SoftInt(int_num as u8),
-        };
-        swap_regs(regs);
-        let (event, extra) = kevent.encode();
-        regs.rax = event as u64;
-        regs.rdx = extra as u64;
-    } else {
-        // Kernel (ring 1): arch calls, page faults, IRQs
-        match int_num {
-            14 => {
-                if try_handle_page_fault(regs.err_code, false).is_none() {
-                    panic_with_regs("Unhandled page fault in kernel", regs);
-                }
-            }
-            32..=47 => handle_irq(regs),
-            0x80 => arch_dispatch(regs),
-            _ => panic_with_regs("Unexpected interrupt in kernel", regs),
+            let _ = step_virtual_if(regs);
+            return;
         }
+        13 => match monitor(regs) {
+            MonitorResult::Resume => {
+                // If the monitor just cleared virtual IF in PM (e.g. a CLI),
+                // kick off the single-step interpreter so POPF/IRET get
+                // intercepted before hardware runs them.
+                if regs.mode() != UserMode::VM86 && regs.flags32() & (1 << 9) == 0 {
+                    let _ = step_virtual_if(regs);
+                }
+                if regs.flags32() & ((1 << 9) | (1 << 20)) != (1 << 9) | (1 << 20) {
+                    return;
+                }
+                KE::Irq
+            }
+            MonitorResult::Event(e) => e,
+        },
+        14 => {
+            if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
+            KE::PageFault { addr: x86::read_cr2() as u32 }
+        }
+        32..=47 => { handle_irq(regs); KE::Irq }
+        // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
+        // they're soft ints. Other n<32 are genuine CPU exceptions.
+        3 | 4 => KE::SoftInt(int_num as u8),
+        10 => {
+            let cs_base = if regs.mode() == UserMode::VM86 {
+                (regs.code_seg() as u32) << 4
+            } else {
+                crate::arch::monitor::seg_base(regs.code_seg())
+            };
+            let lin = cs_base.wrapping_add(regs.ip32());
+            let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+            let ss_base = if regs.mode() == UserMode::VM86 {
+                (regs.stack_seg() as u32) << 4
+            } else {
+                crate::arch::monitor::seg_base(regs.stack_seg())
+            };
+            let sp = regs.sp32();
+            let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
+            crate::dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
+                regs.code_seg(), regs.ip32(), regs.err_code, bytes,
+                regs.stack_seg(), sp, stack);
+            KE::Exception(int_num as u8)
+        }
+        0..=31 => KE::Exception(int_num as u8),
+        // SYSCALL instruction: `syscall_entry_64` tags it with the synthetic
+        // 256, distinct from any IDT vector — keep it before the catch-all so
+        // `INT 0x80` (which lands as SoftInt(0x80)) stays a different event.
+        256 => KE::Syscall,
+        // Direct-IDT soft interrupts: 0x30..=0xFF (plus VM86 INT3/0xCC bypass
+        // of VME landing here too).
+        _ => KE::SoftInt(int_num as u8),
+    };
+    swap_regs(regs);
+    let (event, extra) = kevent.encode();
+    regs.rax = event as u64;
+    regs.rdx = extra as u64;
+}
+
+/// Ring-1 (kernel) trap dispatch: arch calls, page faults, IRQs. Anything
+/// else from kernel context is a bug.
+fn isr_handler_ring1(regs: &mut Regs) {
+    match regs.int_num {
+        14 => {
+            if try_handle_page_fault(regs.err_code, false).is_none() {
+                panic_with_regs("Unhandled page fault in kernel", regs);
+            }
+        }
+        32..=47 => handle_irq(regs),
+        0x80 => arch_dispatch(regs),
+        _ => panic_with_regs("Unexpected interrupt in kernel", regs),
     }
 }
 

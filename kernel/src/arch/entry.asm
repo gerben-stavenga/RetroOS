@@ -195,21 +195,20 @@ entry_wrapper_32:
     push gs
     ; ESP now points at offset 0 of Raw32 (= gs).
 
-    ; Build 16-byte mock frame [ebp, eip, 0, 0] for stack-trace walking.
-    ; Raw32.eip is at offset 196; Raw32.ebp is at offset 24 (pushad slot).
-    push dword 0
-    push dword 0
-    push dword [esp + 8 + 196]    ; user eip
-    push dword [esp + 12 + 24]    ; user ebp
-
     xor ebx, ebx                  ; ebx = from_64 = false
     jmp common_call
 
 ; -----------------------------------------------------------------------------
 ; common_call: shared dispatch tail. Caller has:
 ;   - pushed StackFrame (216B) — its own native form (Raw32 or Regs)
-;   - pushed 16-byte mock frame [ebp_user, eip_user, 0, 0]
 ;   - set ebx = from_64 flag
+;
+; ebp is left untouched between trap entry and `call isr_handler`. For ring-1
+; entries the trapped ebp is a valid C frame pointer, and Rust's prologue
+; saves it as `isr_handler`'s prev_ebp -- the stack-trace walker can then
+; chain naturally from a panic into the ring-1 call site. For ring-0 / ring-3
+; / VM86 the trapped ebp is junk-or-untrusted; the walker stops at the
+; `isr_return` boundary (see stacktrace.rs) and uses regs.rip explicitly.
 ; -----------------------------------------------------------------------------
 common_call:
     cld
@@ -222,15 +221,12 @@ common_call:
     mov fs, eax
     mov gs, eax
 
-    mov ebp, esp                  ; rbp = mock frame for backtrace
-
     ; Call isr_handler(stack_ptr, from_64). cdecl: args right-to-left.
     push ebx                      ; from_64
-    lea eax, [esp + 4 + 16]       ; ptr to StackFrame (skip from_64 + mock)
+    lea eax, [esp + 4]             ; ptr to StackFrame (skip from_64 we just pushed)
     push eax                      ; stack_ptr
     call isr_handler
     add esp, 8                    ; pop args
-    add esp, 16                   ; pop mock frame
 
 global isr_return
 isr_return:
@@ -299,11 +295,7 @@ entry_wrapper_64:
     mov ax, gs
     push rax
 
-    ; Build 16-byte mock frame (rbp, rip) for stack-trace walking.
-    ; At this point: rip at rsp+176, rbp at rsp+112.
-    push qword [rsp + 176]      ; rip
-    push qword [rsp + 120]      ; rbp (was at 112, now +8 after rip push)
-    mov rbp, rsp
+    ; rbp is left untouched -- see common_call's comment for why.
 
     ; Tell common_call we entered via the 64-bit path (from_64 = 1).
     mov ebx, 1
@@ -370,9 +362,11 @@ syscall_entry_64:
     push qword 0x33            ; CS  = USER_CS64 (0x30 | 3)
     push rcx                    ; RIP (saved by SYSCALL)
 
-    ; int_num / err_code (match interrupt vector layout)
+    ; int_num / err_code (match interrupt vector layout). int_num = 256
+    ; (out of the 0..255 IDT range) so `isr_handler` can distinguish a
+    ; SYSCALL instruction from an `INT 0x80` soft interrupt.
     push qword 0               ; err_code
-    push qword 0x80            ; int_num = syscall
+    push qword 256             ; int_num = SYSCALL sentinel
 
     jmp entry_wrapper_64
 

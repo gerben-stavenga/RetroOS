@@ -217,7 +217,9 @@ pub fn handle_event(
     use crate::arch::monitor::KernelEvent as KE;
     match kevent {
         KE::Irq => thread::KernelAction::Done,
-        KE::SoftInt(0x80) => dispatch_action(kt, linux, regs),
+        // 32-bit user uses INT 0x80 (lands as SoftInt); 64-bit user uses the
+        // SYSCALL instruction (lands as Syscall). Both reach the same dispatch.
+        KE::SoftInt(0x80) | KE::Syscall => dispatch_action(kt, linux, regs),
         KE::PageFault { .. } => unreachable!("PageFault handled in event loop"),
         _ => {
             crate::dbg_println!("[LINUX] fatal {:?} at EIP={:#x} tid={}", kevent, regs.ip32(), kt.tid);

@@ -76,8 +76,15 @@ pub enum KernelEvent {
     Exception(u8),
     /// User-executed `INT n` — either monitor-decoded from a #GP'd `INT n` or
     /// delivered directly through a DPL=3 IDT gate (vectors 3, 4, 0x30..=0xFF,
-    /// plus VM86 `INT3`/`0xCC` which bypasses VME).
+    /// plus VM86 `INT3`/`0xCC` which bypasses VME). Note that `INT 0x80` lands
+    /// here too — it's not the same thing as the `SYSCALL` instruction, which
+    /// has its own `Syscall` event.
     SoftInt(u8),
+    /// User executed the `SYSCALL` instruction (64-bit only). Distinct from
+    /// `SoftInt(0x80)`: the IDT gate path and the SYSCALL fast-path land at
+    /// different arch entries (`int_vector` vs `syscall_entry_64`); arch tags
+    /// the SYSCALL one with int_num=256 so this stays unambiguous.
+    Syscall,
     /// HLT from user code — scheduler yields.
     Hlt,
     /// Port `IN` (AL/AX/EAX ← port). Kernel emulates, writes back into rax.
@@ -107,6 +114,7 @@ impl KernelEvent {
     const INS:        u32 = 8;
     const OUTS:       u32 = 9;
     const FAULT:      u32 = 10;
+    const SYSCALL:    u32 = 11;
 
     /// Encode into the `(event, extra)` u32 pair that flows across the
     /// arch→kernel boundary as `(eax, edx)`. Total over all variants.
@@ -118,6 +126,7 @@ impl KernelEvent {
             KernelEvent::PageFault { addr }   => (Self::PAGE_FAULT, addr),
             KernelEvent::Exception(n)         => (Self::EXCEPTION, n as u32),
             KernelEvent::SoftInt(n)           => (Self::SOFT_INT, n as u32),
+            KernelEvent::Syscall              => (Self::SYSCALL, 0),
             KernelEvent::Hlt                  => (Self::HLT, 0),
             KernelEvent::In  { port, size }   => (Self::IN,  (port as u32) | ((size as u32) << 16)),
             KernelEvent::Out { port, size }   => (Self::OUT, (port as u32) | ((size as u32) << 16)),
@@ -134,6 +143,7 @@ impl KernelEvent {
             Self::PAGE_FAULT => KernelEvent::PageFault { addr: extra },
             Self::EXCEPTION  => KernelEvent::Exception(extra as u8),
             Self::SOFT_INT   => KernelEvent::SoftInt(extra as u8),
+            Self::SYSCALL    => KernelEvent::Syscall,
             Self::HLT        => KernelEvent::Hlt,
             Self::IN         => KernelEvent::In  { port: extra as u16, size: IoSize::from_u32(extra >> 16) },
             Self::OUT        => KernelEvent::Out { port: extra as u16, size: IoSize::from_u32(extra >> 16) },

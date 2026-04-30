@@ -116,14 +116,19 @@ pub fn stack_trace() {
 }
 
 /// Print a stack trace for a saved interrupt context (F12 debug hotkey, etc).
-/// Frame 0 is the exact IP that was interrupted; subsequent frames are walked
-/// from `regs.rbp`. `lookup_symbol` auto-picks between kernel and user symbol
-/// tables based on the address.
+/// Frame 0 is the exact IP that was interrupted. Whether to chain past it
+/// depends on what was interrupted:
+///   - Ring 1 (kernel): `regs.rbp` is a valid C-style frame pointer into the
+///     ring-1 call chain — walk it.
+///   - Ring 0 (arch self-reentry): rbp is mid-asm garbage — stop.
+///   - Ring 3 / VM86 (user): rbp points into untrusted user memory — stop.
 pub fn stack_trace_regs(regs: &crate::Regs) {
     println!("Stack trace:");
-    let user_64 = regs.mode() == crate::UserMode::Mode64;
     print_frame(0, regs.ip());
-    walk(regs.rbp, 1, user_64);
+    if (regs.frame.cs & 3) == 1 {
+        let user_64 = regs.mode() == crate::UserMode::Mode64;
+        walk(regs.rbp, 1, user_64);
+    }
 }
 
 /// Print one line of the backtrace.
@@ -140,45 +145,29 @@ fn print_frame(depth: usize, ip: u64) {
 /// saved-bp and return-ip pair, prints the return ip (i.e. the caller's
 /// current IP at the time of the call), and advances.
 ///
-/// Starts in 32-bit mode unless `user_64` is true. When a return IP matches
-/// `isr_return`, the parent slot is an entry.asm mock frame; a non-zero rip
-/// there means the interrupted user was 64-bit and we switch to wide walking.
-fn walk(mut bp: u64, mut depth: usize, mut user_64: bool) {
+/// Stops at the trap-entry boundary: when a return IP matches `isr_return`,
+/// we've crossed from a kernel frame into arch's trap-handling code. Going
+/// further would require interpreting whatever was in ebp at trap time —
+/// junk for ring-0/arch self-reentry, untrusted for ring-3 user. The trap
+/// context itself is shown via `stack_trace_regs`, which prints regs.rip
+/// up front and decides whether to chain into ring-1 from there.
+fn walk(mut bp: u64, mut depth: usize, user_64: bool) {
     unsafe extern "C" { fn isr_return(); }
     let isr_dispatch = isr_return as u64;
     const MAX_DEPTH: usize = 20;
 
     while depth < MAX_DEPTH && bp >= 0x1000 {
-        if user_64 {
+        let (next_bp, ip) = if user_64 {
             let frame = bp as usize as *const u64;
-            let (next_bp, ip) = unsafe { (*frame, *frame.add(1)) };
-            if ip == 0 || ip < 0x1000 { break; }
-            print_frame(depth, ip);
-            bp = next_bp;
+            unsafe { (*frame, *frame.add(1)) }
         } else {
             let frame = (bp as u32) as *const u32;
-            let (next_bp, ip) = unsafe { (*frame, *frame.add(1) as u64) };
-            if ip == 0 || ip < 0x1000 { break; }
-
-            // Mock frame crossing into user space:
-            // [ebp/rbp_lo, eip/rbp_hi, 0/rip_lo, 0/rip_hi].
-            // Non-zero rip means 64-bit user.
-            if ip == isr_dispatch {
-                let mock = (next_bp as usize) as *const u64;
-                let rip = unsafe { *mock.add(1) };
-                if rip != 0 {
-                    user_64 = true;
-                    bp = unsafe { *mock };
-                } else {
-                    bp = next_bp as u64;
-                }
-                depth += 1;
-                continue;
-            }
-
-            print_frame(depth, ip);
-            bp = next_bp as u64;
-        }
+            unsafe { (*frame as u64, *frame.add(1) as u64) }
+        };
+        if ip == 0 || ip < 0x1000 { break; }
+        if ip == isr_dispatch { break; }
+        print_frame(depth, ip);
+        bp = next_bp;
         depth += 1;
     }
 
