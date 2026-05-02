@@ -827,13 +827,13 @@ pub fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
             regs.ip32(), regs.code_seg(), handler_flags);
         regs.frame.rsp = new_esp as u64;
     } else {
-        // First entry: switch to the locked PM stack, push ModeSave +
-        // iret-to-SLOT_PM_IRET so the kernel restores SS:ESP on unwind.
-        let save = ModeSave::capture(regs);
-        let cursor1 = host_stack_write_save(dos.pc.host_stack_sp, save);
+        // First entry: push a ModeSave (kernel-side save area) + plant
+        // an iret-to-SLOT_PM_IRET frame so the eventual handler IRET
+        // round-trips through the kernel for unwinding.
+        super::locked_stack::push_save(dos, regs);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
         let cursor2 = host_stack_write_iret(
-            cursor1, client_use32,
+            dos.pc.host_stack_sp, client_use32,
             stub_eip, SPECIAL_STUB_SEL, handler_flags);
         dos.pc.host_stack_sp = cursor2;
 
@@ -862,14 +862,11 @@ pub fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
 /// regs.ESP now points at the ModeSave on host_stack. After restoring,
 /// `host_stack_sp` is bumped back up past both records.
 fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
-    let cursor = regs.sp32();
     debug_assert!(regs.stack_seg() == HOST_STACK_PM16_SEL ||
                   regs.stack_seg() == HOST_STACK_PM32_SEL,
                   "cross_mode_restore: SS not host_stack");
-    let save = host_stack_read_save(cursor);
-    save.restore(regs);
 
-    dos.pc.host_stack_sp = cursor + MODE_SAVE_SIZE;
+    let save = super::locked_stack::pop_save(dos, regs);
 
     let (cs, eip, ss, esp, vm) =
         (save.cs as u16, save.eip, save.ss as u16, save.esp,
@@ -1842,8 +1839,7 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     // saved registers / return address. Nested IRQs each allocate their
     // own slab; the SLOT_RM_IRET_REFLECT unwind frees both records.
     // Works for VM86 and PM clients alike — no DPMI session required.
-    let save = ModeSave::capture(regs);
-    dos.pc.host_stack_sp = host_stack_write_save(dos.pc.host_stack_sp, save);
+    super::locked_stack::push_save(dos, regs);
     let (new_cursor, rm_ss, rm_sp) = host_stack_alloc_rm_frame(dos.pc.host_stack_sp);
     dos.pc.host_stack_sp = new_cursor;
 

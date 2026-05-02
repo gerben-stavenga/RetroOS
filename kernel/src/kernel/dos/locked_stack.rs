@@ -60,6 +60,8 @@
 //! trapping return-stub (CD 31 at well-known addresses) to the matching
 //! recipe.
 
+use super::dos;
+use super::thread;
 use crate::Regs;
 
 /// Per-thread state tracking for the locked stack and the dedicated
@@ -163,4 +165,37 @@ impl ModeSave {
         regs.fs        = self.fs as u64;
         regs.gs        = self.gs as u64;
     }
+}
+
+// ─── Foundation primitives ────────────────────────────────────────────
+
+/// Capture current regs as a ModeSave and push it onto the locked
+/// stack. Increments the handler-context `depth`. While the legacy
+/// `host_stack_sp` cursor is still in use elsewhere, this primitive
+/// keeps it in sync (writes at `host_stack_sp - MODE_SAVE_SIZE` and
+/// decrements). Once all recipes migrate, the field goes away and
+/// this writes via `regs.SS:ESP` / `tos` per the documented model.
+pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) {
+    let save = ModeSave::capture(regs);
+    let cursor = dos.pc.host_stack_sp - MODE_SAVE_SIZE;
+    let addr = dos::host_stack_base() + cursor;
+    unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
+    dos.pc.host_stack_sp = cursor;
+    dos.pc.locked_stack.depth = dos.pc.locked_stack.depth.saturating_add(1);
+}
+
+/// Pop the topmost ModeSave off the locked stack and restore regs.
+/// The save is at `regs.sp32()` because the user just IRETed across
+/// the iret frame the recipe planted, advancing ESP onto the save's
+/// position. Resyncs `host_stack_sp` past the popped save and
+/// decrements `depth`. Returns the popped save for callers that
+/// want to inspect it (typically for tracing).
+pub(super) fn pop_save(dos: &mut thread::DosState, regs: &mut Regs) -> ModeSave {
+    let cursor = regs.sp32();
+    let addr = dos::host_stack_base() + cursor;
+    let save = unsafe { core::ptr::read_unaligned(addr as *const ModeSave) };
+    save.restore(regs);
+    dos.pc.host_stack_sp = cursor + MODE_SAVE_SIZE;
+    dos.pc.locked_stack.depth = dos.pc.locked_stack.depth.saturating_sub(1);
+    save
 }
