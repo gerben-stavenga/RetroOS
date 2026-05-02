@@ -309,7 +309,7 @@ fn linear(_dos: &thread::DosState, _regs: &Regs, seg: u16, off: u32) -> u32 {
 /// | VM86 | `STUB_SEG`        | `dos::rm_stub_dispatch`       | RM IVT redirects + far-call entries |
 /// | VM86 | else              | `dos::synth_dispatch`         | Synth INT 31h (AH-dispatched)       |
 /// | PM   | `VECTOR_STUB`     | `mode_transitions::vector_stub_reflect`   | Per-vector default reflection       |
-/// | PM   | `SPECIAL_STUB`    | `mode_transitions::pm_stub_dispatch`      | PM host-stub return trampolines     |
+/// | PM   | `SPECIAL_STUB`    | `dpmi::pm_stub_dispatch`      | PM host-stub return trampolines     |
 /// | PM   | client selector   | `dpmi::dpmi_api`              | DPMI services (by AX)               |
 ///
 /// Lives at the personality root because INT 31h spans both submodules
@@ -326,7 +326,7 @@ pub fn syscall(
         (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)              => mode_transitions::vector_stub_reflect(dos, regs),
-        (_, mode_transitions::SPECIAL_STUB_SEL)             => mode_transitions::pm_stub_dispatch(dos, regs),
+        (_, mode_transitions::SPECIAL_STUB_SEL)             => dpmi::pm_stub_dispatch(dos, regs),
         _                                       => dpmi::dpmi_api(dos, regs),
     }
 }
@@ -593,9 +593,9 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
         crate::dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
             name, sel, idx, base, limit, raw);
     }
-    let cs_base = dpmi::seg_base(&dos.ldt[..], regs.code_seg());
-    let ss_base = dpmi::seg_base(&dos.ldt[..], regs.stack_seg());
-    let cs_32 = dpmi::seg_is_32(&dos.ldt[..], regs.code_seg());
+    let cs_base = mode_transitions::seg_base(&dos.ldt[..], regs.code_seg());
+    let ss_base = mode_transitions::seg_base(&dos.ldt[..], regs.stack_seg());
+    let cs_32 = mode_transitions::seg_is_32(&dos.ldt[..], regs.code_seg());
     let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
     let sp_lin = ss_base.wrapping_add(regs.sp32());
     let pre = ip_lin.wrapping_sub(16);

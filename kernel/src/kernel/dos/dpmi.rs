@@ -16,6 +16,7 @@ use alloc::boxed::Box;
 use crate::kernel::thread;
 use crate::kernel::dos;
 use super::machine;
+use super::mode_transitions::{seg_base, seg_is_32, RmCallStruct};
 use crate::kernel::startup;
 use crate::Regs;
 
@@ -1205,15 +1206,6 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
 // Real-mode callbacks (INT 31h/0300h, 0301h)
 // ============================================================================
 
-/// DPMI real-mode call structure (50 bytes at ES:EDI)
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(super) struct RmCallStruct {
-    pub edi: u32, pub esi: u32, pub ebp: u32, pub _reserved: u32,
-    pub ebx: u32, pub edx: u32, pub ecx: u32, pub eax: u32,
-    pub flags: u16, pub es: u16, pub ds: u16, pub fs: u16, pub gs: u16,
-    pub ip: u16, pub cs: u16, pub sp: u16, pub ss: u16,
-}
 
 /// INT 31h/0300h — Simulate Real Mode Interrupt
 /// Trace helper: peek 16 bytes at RM linear (ds<<4)+edx and print ASCII.
@@ -1794,6 +1786,62 @@ pub(super) fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs)
     thread::KernelAction::Done
 }
 
+/// Dispatch INT 31h that came from the special-stub segment. Only host-
+/// initiated return trampolines and entry points live here, so the slot is
+/// always one of SLOT_EXCEPTION_RET / SLOT_PM_TO_REAL / SLOT_SAVE_RESTORE.
+/// Slot = (EIP - STUB_BASE - 2) / 2.
+pub(super) fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let eip = regs.ip32();
+    let stub_base = dos::STUB_BASE;
+    let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
+    dos_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
+
+    match slot {
+        dos::SLOT_EXCEPTION_RET => {
+            return exception_return(dos, regs);
+        }
+        dos::SLOT_PM_TO_REAL => {
+            return raw_switch_pm_to_real(dos, regs);
+        }
+        dos::SLOT_PM_IRET => {
+            let r = super::mode_transitions::cross_mode_restore(dos, regs);
+            // PM-handler path for HW IRQ: client handler ran, IRETed
+            // through our stub, cross_mode_restore put us back at the
+            // interrupted client state. IRQ context is over.
+            super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
+            return r;
+        }
+        dos::SLOT_SAVE_RESTORE => {
+            save_restore_real_mode_state(dos, regs);
+
+            // Pop the far-call return address and resume caller. Frame size
+            // depends on the client's operand size: 16-bit CALL FAR pushed
+            // IP+CS as 4 bytes; 32-bit CALL FAR pushed EIP+CS as 8 bytes.
+            let dpmi = dos.dpmi.as_ref().unwrap();
+            let use32 = dpmi.client_use32;
+            let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
+            let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
+            let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
+            let (ret_eip, ret_cs, frame_size) = if use32 {
+                let eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
+                (eip, cs, 8u32)
+            } else {
+                let ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) } as u32;
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) } as u32;
+                (ip, cs, 4u32)
+            };
+            let new_sp = sp.wrapping_add(frame_size);
+            if ss_32 { regs.set_sp32(new_sp); }
+            else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
+            regs.set_ip32(ret_eip);
+            regs.set_cs32(ret_cs);
+            thread::KernelAction::Done
+        }
+        _ => panic!("pm_stub_dispatch: unhandled slot {:#04x}", slot),
+    }
+}
+
 /// Real-to-PM raw mode switch.
 /// Called from rm_int31_dispatch when VM86 code executes `CALL FAR` to
 /// stub slot SLOT_RAW_REAL_TO_PM (INT 31h trap).
@@ -1855,29 +1903,6 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
 // Helpers
 // ============================================================================
 
-/// Get the base address for any selector (GDT or LDT).
-/// GDT selectors (TI=0) are flat (base=0).
-/// Takes `ldt` as a slice (not `&DosState`) so the borrow checker accepts
-/// calls from contexts where another field of DosState is held mutably.
-pub fn seg_base(ldt: &[u64], sel: u16) -> u32 {
-    if sel & 4 != 0 {
-        let idx = (sel >> 3) as usize;
-        if idx < ldt.len() { DpmiState::desc_base(ldt[idx]) } else { 0 }
-    } else {
-        0
-    }
-}
-
-/// Get the D/B (default size) bit for any selector.
-/// GDT selectors are treated as 32-bit.
-pub fn seg_is_32(ldt: &[u64], sel: u16) -> bool {
-    if sel & 4 != 0 {
-        let idx = (sel >> 3) as usize;
-        if idx < ldt.len() { DpmiState::desc_is_32(ldt[idx]) } else { true }
-    } else {
-        true
-    }
-}
 
 /// Compute flat address from selector:offset.
 /// Address size (16 vs 32 bit offset) determined by CS descriptor's D/B bit.
