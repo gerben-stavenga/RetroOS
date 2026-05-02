@@ -951,12 +951,41 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
 
     if is_outermost {
         let _ = (ret_eip, ret_cs, ret_flags);
-        cross_mode_restore(dos, regs);
-        // BIOS reflection runs on a kernel-owned RM frame for both VM86
-        // and PM clients — never on the client's own stack. Avoids the
-        // class of bugs where a HW IRQ pushes onto a client whose stack
-        // is in a sensitive state (e.g. immediately after exec_return).
-        return reflect_int_to_real_mode(dos, regs, vector);
+        // HW IRQ default-stub bridge: tail-replace into RM at the BIOS
+        // handler. The OUTER ModeSave from `deliver_pm_irq` stays on
+        // the locked stack untouched. We snapshot the dedicated RM
+        // stack, set up RM execution, and plant an iret frame that
+        // returns through SLOT_RM_IRET_FORWARD instead of
+        // SLOT_RM_IRET_REFLECT — the FORWARD handler synthesizes
+        // PM-at-SLOT_PM_IRET so the existing outer-save unwind path
+        // (cross_mode_restore) fires next. Net result: a single
+        // ModeSave through the entire HW IRQ flow.
+        super::locked_stack::push_rm_snapshot(dos);
+
+        let ivt_off = machine::read_u16(0, (vector as u32) * 4);
+        let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
+
+        regs.frame.ss = dos::rm_stack_seg() as u64;
+        regs.frame.rsp = super::locked_stack::rm_stack_top() as u64;
+
+        let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET_FORWARD);
+        let ret_seg: u16 = dos::STUB_SEG;
+        let ret_flags = regs.flags32() as u16;
+        machine::vm86_push(regs, ret_flags);
+        machine::vm86_push(regs, ret_seg);
+        machine::vm86_push(regs, ret_off);
+
+        regs.frame.cs = ivt_seg as u64;
+        regs.frame.rip = ivt_off as u64;
+        let flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
+            | machine::VM_FLAG
+            | machine::IOPL_VM86;
+        regs.frame.rflags = flags as u64;
+
+        dos_trace!("[DPMI] BRIDGE INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
+            vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32());
+
+        return thread::KernelAction::Done;
     }
 
     regs.set_ip32(ret_eip);
@@ -2042,6 +2071,62 @@ pub fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
 
     dos_trace!("[DPMI] RM_IRET_REFLECT -> CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x}",
         regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+}
+
+/// SLOT_RM_IRET_FORWARD dispatch — HW-IRQ default-stub bridge return.
+///
+/// Called when BIOS IRETs in RM after the kernel set up an RM excursion
+/// via `vector_stub_reflect`'s outermost branch. The locked stack still
+/// carries the *outer* `ModeSave` from `deliver_pm_irq`'s cross-mode
+/// entry; we want it unwound by the standard SLOT_PM_IRET → cross_mode_restore
+/// path (a single ModeSave through the whole HW IRQ flow).
+///
+/// Steps:
+/// 1. Restore the dedicated RM stack from its snapshot.
+/// 2. Synthesize regs to "PM at SLOT_PM_IRET on locked_stack at the outer
+///    save's cursor" — `host_stack_sp` after `pop_rm_snapshot` already
+///    points at the outer save, so SS:ESP = (LOCKED_STACK_PM*_SEL,
+///    host_stack_sp).
+///
+/// Hardware IRET on return takes the user to SLOT_PM_IRET, the CD 31
+/// there fires, `pm_stub_dispatch` runs `cross_mode_restore` →
+/// `pop_save` → outer client state restored. Net result for the HW IRQ
+/// default-stub flow: a single ModeSave, single unwind via
+/// `cross_mode_restore`.
+pub fn rm_iret_forward_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
+    // Snapshot RM arithmetic flags before we overwrite EFLAGS — same
+    // discipline as rm_iret_reflect (BIOS may have set CF/ZF/etc that
+    // the client expects to see preserved across the IRQ).
+    const STATUS_MASK: u32 = 0x0CD5;
+    let rm_arith = regs.flags32() & STATUS_MASK;
+
+    super::locked_stack::pop_rm_snapshot(dos);
+
+    // After pop_rm_snapshot, host_stack_sp still points at the iret
+    // frame deliver_pm_irq planted (not at the outer ModeSave above
+    // it). The user already consumed that iret frame with the
+    // hardware iret that took them into vector_stub_reflect, so the
+    // iret frame's bytes are logically dead — advance host_stack_sp
+    // past them so it points at the ModeSave start, where
+    // cross_mode_restore's pop_save will read.
+    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    let iret_size: u32 = if client_use32 { 12 } else { 6 };
+    dos.pc.host_stack_sp += iret_size;
+
+    // Synthesize PM regs at SLOT_PM_IRET. SS selector matches the
+    // bitness deliver_pm_irq used (PM16 vs PM32, both have base=0).
+    let pm_iret_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
+    regs.frame.cs  = SPECIAL_STUB_SEL as u64;
+    regs.set_ip32(pm_iret_eip);
+    regs.frame.ss  = if client_use32 { HOST_STACK_PM32_SEL } else { HOST_STACK_PM16_SEL } as u64;
+    regs.frame.rsp = dos.pc.host_stack_sp as u64;
+    let flags = (regs.flags32() & !(machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8) | STATUS_MASK))
+        | rm_arith
+        | machine::IF_FLAG;
+    regs.set_flags32(flags);
+
+    dos_trace!("[DPMI] RM_IRET_FORWARD -> SLOT_PM_IRET SS:ESP={:04X}:{:#x}",
+        regs.stack_seg(), regs.sp32());
 }
 
 /// SLOT_RM_IRET_CALL dispatch — explicit PM→RM call unwind (0x0300/01/02
