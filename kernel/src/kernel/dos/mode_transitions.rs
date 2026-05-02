@@ -440,9 +440,6 @@ fn host_stack_write_iret(cursor: u32, client_use32: bool,
 ///     client directly — no kernel involvement, no snapshot, no stack
 ///     switch.
 pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    dos_trace!("[DPMI] SOFTINT {:02X} AX={:04X} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} EDX={:08X} EDI={:08X}",
-        vector, regs.rax as u16, regs.code_seg(), regs.ip32(),
-        regs.ds as u16, regs.es as u16, regs.rdx as u32, regs.rdi as u32);
     let (sel, off) = dos.pm_vectors[vector as usize];
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
@@ -461,12 +458,12 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
 }
 
 /// Deliver a HW IRQ to a PM handler. Per DPMI 0.9 §3.1.2 the host
-/// switches to the locked PM stack (`host_stack`) on the *first* entry
-/// from the client's stack OR from VM86; nested entries already on the
-/// locked stack reuse it without switching.
+/// switches to the locked PM stack on the *first* entry from a non-
+/// handler context (the client's PM stack or VM86); nested entries
+/// already inside a handler context reuse the existing stack chain.
 ///
-///   - **First entry** (regs.SS is not the locked PM stack): push a
-///     `ModeSave` capturing the interrupted regs onto `host_stack` at
+///   - **First entry** (handler depth == 0): push a `ModeSave`
+///     capturing the interrupted regs onto `host_stack` at
 ///     `pc.host_stack_sp`, push an iret frame above it targeting
 ///     `SLOT_PM_IRET`. Switch SS:ESP to the `HOST_STACK_PM*` alias. The
 ///     handler's IRET pops the iret frame and traps to the kernel via
@@ -474,15 +471,16 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
 ///     restores the interrupted state — including SS:ESP, which a
 ///     same-priv hardware IRET could not have done.
 ///
-///   - **Nested on the locked PM stack** (regs in PM and SS is a
-///     `HOST_STACK_PM*` alias): push only the iret frame at
-///     `regs.ESP - frame_size` targeting the outer's CS:EIP. No
-///     ModeSave; hardware same-priv IRET handles the unwind directly.
-///
-/// The two cases collapse to: "is the CPU currently on the locked PM
-/// stack in PM mode?". In VM86 the SS register is a paragraph and
-/// numerically comparing it to a PM selector value would be a category
-/// error, so the mode check has to come first.
+///   - **Nested in a handler context** (handler depth > 0): push only
+///     the iret frame at `regs.ESP - frame_size` targeting the outer's
+///     CS:EIP. No ModeSave; hardware same-priv IRET handles the unwind
+///     directly. We must NOT use a `regs.SS == HOST_STACK_PM*` check
+///     to detect nesting — DPMI 0.9 §3.1.2 lets the handler switch SS
+///     to its own locked stack mid-execution, so the nested case can
+///     run with `SS != HOST_STACK_PM*`. The `depth` counter on
+///     `LockedStackState` is incremented on every handler entry and
+///     decremented on every unwind, so it tracks "are we inside a
+///     handler" reliably regardless of stack switching.
 ///
 /// Works for non-DPMI threads too: `install_kernel_ldt_slots` makes the
 /// LDT + kernel-owned selectors (VECTOR_STUB, SPECIAL_STUB, HOST_STACK_PM*)
@@ -501,15 +499,10 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     // Handler starts with IF=TF=0; other flag bits follow the current EFLAGS.
     let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8) | machine::VM_FLAG);
 
-    let in_pm = regs.mode() != crate::UserMode::VM86;
-    let cur_ss = regs.stack_seg();
-    let nested_on_host_stack = in_pm
-        && (cur_ss == HOST_STACK_PM16_SEL || cur_ss == HOST_STACK_PM32_SEL);
-
-    if nested_on_host_stack {
-        // Nested on the locked PM stack: just push iret_frame targeting
-        // outer's CS:EIP at current ESP - frame_size. Hardware same-priv
-        // IRET unwinds inline, no kernel involvement.
+    if dos.pc.locked_stack.in_handler() {
+        // Nested in an already-active handler context: just push iret_frame
+        // targeting outer's CS:EIP at current ESP - frame_size. Hardware
+        // same-priv IRET unwinds inline, no kernel involvement.
         let new_esp = host_stack_write_iret(
             regs.sp32(), client_use32,
             regs.ip32(), regs.code_seg(), handler_flags);
