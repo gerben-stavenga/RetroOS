@@ -203,13 +203,6 @@ fn host_stack_write_iret(cursor: u32, client_use32: bool,
     new_cursor
 }
 
-/// DPMI 0.9 §3.1.3 real-mode stack: spec minimum 0x200 bytes (512).
-/// Allocated on `dpmi_enter` from the DOS heap and parked at
-/// `dpmi.rm_stack_seg`. Initial SP for new RM excursions is `RM_STACK_TOP`
-/// (top minus 2 to leave room for the small frames the host pushes).
-const RM_STACK_BYTES: u16 = 0x200;
-const RM_STACK_PARAS: u16 = RM_STACK_BYTES / 16;
-const RM_STACK_TOP: u16 = RM_STACK_BYTES - 2;
 /// Maximum DPMI memory blocks
 const MAX_MEM_BLOCKS: usize = 256;
 /// Base address for DPMI linear memory allocations
@@ -237,9 +230,6 @@ pub struct DpmiState {
     /// Real-mode callbacks (INT 31h/0303h)
     /// Each entry: Some((pm_cs, pm_eip, rm_struct_sel, rm_struct_off))
     pub callbacks: [Option<(u16, u32, u16, u32)>; MAX_CALLBACKS],
-    /// Dedicated real-mode stack segment for INT 31h/0300h simulation.
-    /// Allocated from DOS heap so it doesn't overlap with the client's data.
-    pub rm_stack_seg: u16,
     /// Client mode bit-width as declared at INT 2F/1687h → entry point.
     /// Determines the operand size used for FAR CALL/INT frames the client
     /// places on its own stack (4 vs 8 bytes for CALL FAR, 6 vs 12 bytes for
@@ -301,7 +291,6 @@ impl DpmiState {
             raw_pm_state: RawModeState::default(),
             exc_vectors: [(0, 0); 32],
             callbacks: [None; MAX_CALLBACKS],
-            rm_stack_seg: 0,
             client_use32: false,
             saved_rm_psp: 0,
             saved_rm_env: 0,
@@ -604,17 +593,11 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let ds_sel = DpmiState::idx_to_sel(CLIENT_DS_LDT_IDX);
     let ss_sel = DpmiState::idx_to_sel(CLIENT_SS_LDT_IDX);
 
-    // Allocate the DPMI 0.9 §3.1.3 real-mode stack (`RM_STACK_BYTES` =
-    // 0x200, the spec minimum). Locked, host-provided. Used for RM-side
-    // reflections and 0x0300/01/02 translation calls. Must go through
-    // dos_alloc_block so it's registered as a DosMemBlock — otherwise a
-    // later AH=48 / INT 31h 0x0100 walking from heap_base_seg would hand
-    // the same paragraphs back to the client and the next reflected INT
-    // (which writes via that buffer) would clobber the IRET frame we
-    // pushed for the unwind.
-    let rm_stack_seg = dos::dos_alloc_block(dos, RM_STACK_PARAS)
-        .expect("DPMI init: out of DOS memory for RM stack");
-    dpmi.rm_stack_seg = rm_stack_seg;
+    // The DPMI 0.9 §3.1.3 real-mode stack lives in `LowMem.rm_stack`
+    // (kernel-managed, paragraph-aligned, 0x200 bytes — the spec
+    // minimum). Shared by all kernel-orchestrated RM excursions; nested
+    // use is reentrant via the snapshot-on-locked-stack discipline. No
+    // DOS-heap allocation needed.
 
     // Round client allocation pool up to a 1 MB boundary. DOS/4GW appears to
     // treat the first 0501 base as a slab origin and takes a private code path
