@@ -202,3 +202,58 @@ pub(super) fn pop_save(dos: &mut thread::DosState) -> ModeSave {
     dos.pc.locked_stack.depth = dos.pc.locked_stack.depth.saturating_sub(1);
     save
 }
+
+// ─── Dedicated RM stack ───────────────────────────────────────────────
+//
+// The dedicated RM stack is a per-thread paragraph-aligned buffer in
+// low memory (`dos::rm_stack_base()` / `dos::rm_stack_size()`). All
+// kernel-orchestrated RM execution — BIOS reflection from PM, DPMI
+// 0300/0301/0302 calls, RM-side of callbacks — runs on it.
+//
+// Reentrance for nested kernel-orchestrated RM use is achieved by
+// `push_rm_snapshot` (copies the buffer's current contents onto the
+// locked stack) before the new excursion starts. `pop_rm_snapshot`
+// copies them back on the way out. A nested excursion thus starts on
+// a "fresh" RM stack from `rm_stack_top()`, and the outer excursion
+// resumes with its bytes intact.
+
+/// Top-of-stack offset for a fresh RM excursion: SP starts here and
+/// pushes go below. Subtract two to leave a 16-bit guard word so a
+/// 32-bit `pushd` near the top doesn't roll past the buffer end.
+pub(super) fn rm_stack_top() -> u16 {
+    (dos::rm_stack_size() as u16) - 2
+}
+
+/// Snapshot the entire dedicated RM stack onto the locked stack.
+/// Decrements `host_stack_sp` by the buffer size; the contents at
+/// `host_stack_sp..host_stack_sp + size` mirror `rm_stack` byte for
+/// byte. Caller is responsible for tracking that an `RmSnapshot`
+/// frame now sits atop the locked stack so the matching
+/// `pop_rm_snapshot` runs on the unwind path.
+pub(super) fn push_rm_snapshot(dos: &mut thread::DosState) {
+    let size = dos::rm_stack_size();
+    let cursor = dos.pc.host_stack_sp - size;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            dos::rm_stack_base() as *const u8,
+            (dos::host_stack_base() + cursor) as *mut u8,
+            size as usize,
+        );
+    }
+    dos.pc.host_stack_sp = cursor;
+}
+
+/// Restore the dedicated RM stack contents from the topmost
+/// `RmSnapshot` frame on the locked stack. Advances `host_stack_sp`
+/// past the snapshot.
+pub(super) fn pop_rm_snapshot(dos: &mut thread::DosState) {
+    let size = dos::rm_stack_size();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (dos::host_stack_base() + dos.pc.host_stack_sp) as *const u8,
+            dos::rm_stack_base() as *mut u8,
+            size as usize,
+        );
+    }
+    dos.pc.host_stack_sp += size;
+}

@@ -2388,6 +2388,17 @@ struct LowMem {
     /// B=1) point at this same buffer so SP values are portable across
     /// client bitness.
     host_stack: [u8; 4096],
+
+    /// Dedicated RM stack — 4 KB host-provided buffer used by all
+    /// kernel-orchestrated RM execution (BIOS reflection from PM, DPMI
+    /// 0300/0301/0302 PM->RM calls, RM-side of callbacks). Single
+    /// per-thread buffer reused across excursions; reentrance for
+    /// nested kernel-orchestrated RM use is achieved by snapshotting
+    /// the buffer's current contents onto the locked stack on the way
+    /// in and copying back on the way out. Paragraph-aligned naturally
+    /// because `host_stack` precedes it and is a multiple of 16 in
+    /// size.
+    rm_stack: [u8; 4096],
 }
 
 /// Borrow the kernel-owned low-mem area as a typed `&'static mut`.
@@ -2441,6 +2452,21 @@ pub(super) fn host_stack_base() -> u32 {
 }
 pub(super) fn host_stack_size() -> u32 {
     core::mem::size_of_val(&low_mem().host_stack) as u32
+}
+
+/// Base linear address + size of the per-thread dedicated RM stack.
+/// `rm_stack_seg()` returns the paragraph-aligned segment for use in
+/// RM `SS:SP` register pairs.
+pub(super) fn rm_stack_base() -> u32 {
+    &raw const low_mem().rm_stack as u32
+}
+pub(super) fn rm_stack_size() -> u32 {
+    core::mem::size_of_val(&low_mem().rm_stack) as u32
+}
+pub(super) fn rm_stack_seg() -> u16 {
+    debug_assert_eq!(rm_stack_base() & 0xF, 0,
+        "rm_stack must be paragraph-aligned for RM addressing");
+    (rm_stack_base() >> 4) as u16
 }
 
 /// Default size of an env block in paragraphs. Env is allocated from the
