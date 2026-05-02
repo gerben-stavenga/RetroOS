@@ -461,7 +461,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     dpmi.mem_next = (dpmi.mem_next + 0xFFFFF) & !0xFFFFF;
 
     // pm_vectors stays zero-initialized: sel=0 means "no client handler",
-    // which signals reflect-to-real-mode in dpmi_soft_int. INT 31h/0204h
+    // which signals reflect-to-real-mode in deliver_pm_int. INT 31h/0204h
     // synthesizes the stub address on demand for clients that chain to the
     // default handler.
 
@@ -505,46 +505,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 // PM #GP monitor lives in `arch/monitor.rs`. The arch decoder handles
 // CLI/STI/PUSHF/POPF/IRET directly (fast-path iret to user) and bubbles
 // INT/HLT/IN/OUT/INS/OUTS up as `KernelEvent`s. PM software-INT dispatch
-// for installed DPMI client vectors is handled by `dpmi_soft_int` below.
-
-// ============================================================================
-// DPMI software INT dispatch (vectors 0x30-0xFF, DPL=3 in IDT)
-// ============================================================================
-
-
-/// Thin wrapper preserving the old event-loop entry signature.
-pub fn dpmi_soft_int(_kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    dos_trace!("[DPMI] SOFTINT {:02X} AX={:04X} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} EDX={:08X} EDI={:08X}",
-        vector, regs.rax as u16, regs.code_seg(), regs.ip32(),
-        regs.ds as u16, regs.es as u16, regs.rdx as u32, regs.rdi as u32);
-    let arm_step = false; // disabled while debugging non-traced behavior
-    let _ = vector == 0x21 && (regs.rax as u16) == 0x4300;
-    if arm_step {
-        if dos.dpmi.is_some() {
-            let base = seg_base(&dos.ldt[..], regs.ds as u16);
-            let addr = base.wrapping_add(regs.rdx as u32);
-            let mut hex = [0u8; 32];
-            for j in 0..16usize {
-                let b = unsafe { *((addr as *const u8).add(j)) };
-                hex[j*2] = b"0123456789ABCDEF"[(b >> 4) as usize];
-                hex[j*2+1] = b"0123456789ABCDEF"[(b & 0xF) as usize];
-            }
-            dos_trace!("[DPMI] PM DS:EDX={:04X}:{:08X} -> linear={:08X} hex={}",
-                regs.ds as u16, regs.rdx as u32, addr,
-                core::str::from_utf8(&hex).unwrap());
-        }
-    }
-    super::mode_transitions::deliver_pm_int(dos, regs, vector);
-    if arm_step {
-        use core::sync::atomic::Ordering;
-        if dos::PM_STEP_BUDGET.load(Ordering::Relaxed) == 0 {
-            dos::PM_STEP_BUDGET.store(65000, Ordering::Relaxed);
-            regs.set_flag32(1 << 8); // TF on entry to hook
-            dos_trace!("[STEP] armed 65000 steps at INT 21 AX=4300 hook entry");
-        }
-    }
-    thread::KernelAction::Done
-}
+// for installed client vectors is `mode_transitions::deliver_pm_int`.
 
 
 

@@ -370,7 +370,7 @@ pub fn handle_event(
                     "VM86 SoftInt({:#x}) bubbled to dos — only INT 31h should trap", n);
                 assert!(dos.dpmi.is_some(),
                     "PM SoftInt({:#x}) without an active DPMI session", n);
-                dpmi::dpmi_soft_int(kt, dos, regs, n)
+                mode_transitions::deliver_pm_int(dos, regs, n)
             }
         }
         KE::In { port, size } => {

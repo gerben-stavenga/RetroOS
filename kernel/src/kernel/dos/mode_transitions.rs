@@ -439,11 +439,14 @@ fn host_stack_write_iret(cursor: u32, client_use32: bool,
 ///   - Run. The handler's eventual IRET pops the frame and resumes the
 ///     client directly — no kernel involvement, no snapshot, no stack
 ///     switch.
-pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
+pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
+    dos_trace!("[DPMI] SOFTINT {:02X} AX={:04X} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} EDX={:08X} EDI={:08X}",
+        vector, regs.rax as u16, regs.code_seg(), regs.ip32(),
+        regs.ds as u16, regs.es as u16, regs.rdx as u32, regs.rdi as u32);
     let (sel, off) = dos.pm_vectors[vector as usize];
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
-        None => return,
+        None => return thread::KernelAction::Done,
     };
     let client_use32 = dpmi.client_use32;
     let handler_flags = regs.flags32() & !(1u32 << 8);
@@ -454,6 +457,7 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
     regs.clear_flag32(1 << 8);
     dos_trace!("[DPMI] PM_INT vec={:02X} -> {:04x}:{:#x} on client SS:ESP={:04x}:{:#x}",
         vector, sel, off, regs.frame.ss as u16, regs.sp32());
+    thread::KernelAction::Done
 }
 
 /// Deliver a HW IRQ to a PM handler. Per DPMI 0.9 §3.1.2 the host
