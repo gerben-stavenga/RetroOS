@@ -100,7 +100,7 @@ pub use machine::VgaState;
 #[allow(unused_imports)]
 use dos::{
     STUB_BASE, STUB_SEG,
-    SLOT_RM_IRET_REFLECT, SLOT_RM_IRET_CALL, SLOT_RM_IRET_FORWARD,
+    SLOT_RM_IRET_REFLECT, SLOT_RM_IRET_CALL,
     SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_PM_TO_REAL,
@@ -325,8 +325,8 @@ pub fn syscall(
     match (mode, cs) {
         (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
-        (_, mode_transitions::VECTOR_STUB_SEL)              => mode_transitions::vector_stub_reflect(dos, regs),
-        (_, mode_transitions::SPECIAL_STUB_SEL)             => dpmi::pm_stub_dispatch(dos, regs),
+        (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(dos, regs),
+        (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(dos, regs),
         _                                       => dpmi::dpmi_api(dos, regs),
     }
 }

@@ -110,7 +110,6 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
         SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RM_IRET_REFLECT | SLOT_RM_IRET_CALL
-        | SLOT_RM_IRET_FORWARD
         | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
         | SLOT_INT74_MOUSE_CB | SLOT_INT74_MOUSE_CB_RET)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
@@ -125,14 +124,6 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             // Implicit reflection unwind: pop ModeSave, propagate low 32
             // bits of GP regs PM→RM (§2.4), OR IF=1 (default-stub spec).
             mode_transitions::rm_iret_reflect(dos, regs);
-            thread::KernelAction::Done
-        }
-        SLOT_RM_IRET_FORWARD => {
-            // HW-IRQ default-stub bridge return. BIOS just IRETed in RM;
-            // restore the dedicated RM stack snapshot, synthesize regs to
-            // PM-at-SLOT_PM_IRET so the natural CD-31 trap on SLOT_PM_IRET
-            // unwinds the outer ModeSave next.
-            mode_transitions::rm_iret_forward_to_pm(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RM_IRET_CALL => {
@@ -2595,20 +2586,6 @@ pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// bitness is encoded in the frame width on the push side; either IRET
 /// width lands at the same `CD 31` byte pair.
 pub(crate) const SLOT_PM_IRET: u8 = 0xF8;
-
-/// RM-side return stub for the HW-IRQ default-stub bridge. When a HW IRQ
-/// arrives for a client without a PM handler installed (or with the
-/// kernel default stub installed), `vector_stub_reflect` outermost
-/// branch tail-replaces into RM at the BIOS handler with the dedicated
-/// RM stack carrying an iret-frame to *this* slot. On RM IRET from
-/// BIOS, this slot's CD 31 traps to the kernel; the handler restores
-/// the dedicated RM stack from its snapshot and synthesizes regs to
-/// "PM at SLOT_PM_IRET on the locked stack at the outer ModeSave's
-/// cursor," so the natural CD-31 trap on `SLOT_PM_IRET` then unwinds
-/// the outer ModeSave via `cross_mode_restore`. Net result for the
-/// HW-IRQ default-stub flow: a single ModeSave (deliver_pm_irq's),
-/// single unwind site (`cross_mode_restore`).
-pub(crate) const SLOT_RM_IRET_FORWARD: u8 = 0xFA;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
