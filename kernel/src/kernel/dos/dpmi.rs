@@ -107,11 +107,10 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 // outer handler's CS:EIP and stack already hold the chain, so a plain
 // hardware IRET back to outer is sufficient.
 
-// `ModeSave` (and `MODE_SAVE_SIZE`) are owned by `super::locked_stack` —
-// the eventual home of the foundation primitives that read/write them.
-// Re-imported here while in-flight DPMI recipes still operate on the
-// raw `host_stack_write_save` / `host_stack_read_save` helpers below.
-use super::locked_stack::{ModeSave, MODE_SAVE_SIZE};
+// CPU state snapshots and the primitives that read/write them
+// (`push_save` / `pop_save` / `pop_save_at` / `peek_save_at` /
+// `consume_save_at`) live in [`super::locked_stack`]. This module
+// composes them with DPMI policy.
 
 /// Stub-frame for `SLOT_RM_IRET_CALL` — pushed above the `ModeSave` by
 /// every explicit PM→RM-call entry (`0300/01/02` and `callback_entry`).
@@ -158,21 +157,6 @@ impl CallStubFrame {
         regs.rdi = (regs.rdi & !0xFFFFFFFF) | self.edi as u64;
         regs.rbp = (regs.rbp & !0xFFFFFFFF) | self.ebp as u64;
     }
-}
-
-/// Push a ModeSave at the given cursor on host_stack. Returns the new
-/// cursor (lower address). Caller updates `pc.host_stack_sp`.
-fn host_stack_write_save(cursor: u32, save: ModeSave) -> u32 {
-    let new_cursor = cursor - MODE_SAVE_SIZE;
-    let addr = dos::host_stack_base() + new_cursor;
-    unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
-    new_cursor
-}
-
-/// Read the ModeSave at the given cursor on host_stack.
-fn host_stack_read_save(cursor: u32) -> ModeSave {
-    let addr = dos::host_stack_base() + cursor;
-    unsafe { core::ptr::read_unaligned(addr as *const ModeSave) }
 }
 
 /// Size of an RM IRQ stack frame allocated from host_stack. Each
@@ -866,7 +850,11 @@ fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
                   regs.stack_seg() == HOST_STACK_PM32_SEL,
                   "cross_mode_restore: SS not host_stack");
 
-    let save = super::locked_stack::pop_save(dos, regs);
+    // Resync host_stack_sp from the user's post-iret cursor: hardware
+    // IRET advanced ESP past the iret frame onto the save's start.
+    dos.pc.host_stack_sp = regs.sp32();
+    let save = super::locked_stack::pop_save(dos);
+    save.restore(regs);
 
     let (cs, eip, ss, esp, vm) =
         (save.cs as u16, save.eip, save.ss as u16, save.esp,
@@ -1773,10 +1761,9 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
       dump_ds_dx(ds, rm.edx); }
 
     // Save PM state + rm_struct_addr stub-arg on host_stack (CALL slot).
-    let save = ModeSave::capture(regs);
     let stub = CallStubFrame::capture(regs, struct_addr);
-    let cursor1 = host_stack_write_save(dos.pc.host_stack_sp, save);
-    dos.pc.host_stack_sp = host_stack_write_call_args(cursor1, stub);
+    super::locked_stack::push_save(dos, regs);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     // Get IVT entry for the interrupt
     let ivt_off = machine::read_u16(0, (int_num as u32) * 4);
@@ -1897,10 +1884,9 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
 
     // Save PM state + rm_struct_addr stub-arg on host_stack (CALL slot).
-    let save = ModeSave::capture(regs);
     let stub = CallStubFrame::capture(regs, struct_addr);
-    let cursor1 = host_stack_write_save(dos.pc.host_stack_sp, save);
-    dos.pc.host_stack_sp = host_stack_write_call_args(cursor1, stub);
+    super::locked_stack::push_save(dos, regs);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     let rm_ss = if rm.ss != 0 { rm.ss } else { rm_stack_seg };
     let rm_sp = if rm.sp != 0 { rm.sp } else { RM_STACK_TOP };
@@ -1952,10 +1938,9 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
         edi_f, esi_f, ebp_f, ebx_f, edx_f, ecx_f, eax_f, flags_f);
       dump_ds_dx(ds, rm.edx); }
 
-    let save = ModeSave::capture(regs);
     let stub = CallStubFrame::capture(regs, struct_addr);
-    let cursor1 = host_stack_write_save(dos.pc.host_stack_sp, save);
-    dos.pc.host_stack_sp = host_stack_write_call_args(cursor1, stub);
+    super::locked_stack::push_save(dos, regs);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     let rm_ss = if rm.ss != 0 { rm.ss } else { rm_stack_seg };
     let rm_sp = if rm.sp != 0 { rm.sp } else { RM_STACK_TOP };
@@ -2037,10 +2022,9 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     // Save RM state + rm_struct_addr stub-arg on host_stack (CALL slot
     // — the PM callback's eventual unwind writes its post-handler RM
     // regs back into the RmCallStruct).
-    let save = ModeSave::capture(regs);
     let stub = CallStubFrame::capture(regs, struct_addr);
-    let cursor1 = host_stack_write_save(dos.pc.host_stack_sp, save);
-    dos.pc.host_stack_sp = host_stack_write_call_args(cursor1, stub);
+    super::locked_stack::push_save(dos, regs);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     // Switch to protected mode and call the PM handler.
     // DS:SI = selector:offset pointing to real-mode SS:SP
@@ -2069,11 +2053,11 @@ pub fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5; // CF,PF,AF,ZF,SF,OF,DF
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    // The RM IRQ slab sits below the ModeSave: free both. ModeSave is at
-    // host_stack_sp + RM_IRQ_FRAME_SIZE; cursor advances past both.
-    let save = host_stack_read_save(dos.pc.host_stack_sp + RM_IRQ_FRAME_SIZE);
-    dos.pc.host_stack_sp += RM_IRQ_FRAME_SIZE + MODE_SAVE_SIZE;
-    save.restore(regs);
+    // The RM IRQ slab sits below the ModeSave on the locked stack.
+    // Free the slab first (advance host_stack_sp past it), then pop
+    // the save and restore regs.
+    dos.pc.host_stack_sp += RM_IRQ_FRAME_SIZE;
+    super::locked_stack::pop_save(dos).restore(regs);
 
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
     regs.frame.rflags |= machine::IF_FLAG as u64;
@@ -2091,8 +2075,7 @@ pub fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
 pub fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     let stub = host_stack_read_call_args(dos.pc.host_stack_sp);
     dos.pc.host_stack_sp += CALL_STUB_SIZE;
-    let save = host_stack_read_save(dos.pc.host_stack_sp);
-    dos.pc.host_stack_sp += MODE_SAVE_SIZE;
+    let save = super::locked_stack::pop_save(dos);
 
     // Writeback current RM regs into RmCallStruct so the PM caller sees
     // results. Must happen *before* GP-restore overwrites regs.

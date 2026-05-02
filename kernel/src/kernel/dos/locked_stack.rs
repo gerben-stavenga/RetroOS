@@ -168,13 +168,18 @@ impl ModeSave {
 }
 
 // ─── Foundation primitives ────────────────────────────────────────────
+//
+// All save primitives operate at `dos.pc.host_stack_sp` (the
+// kernel-tracked top of the locked-stack chain). No cursor parameters
+// at the call site. Cursor-driven callers (where the user's
+// post-iret SS:ESP lands on the save and host_stack_sp hasn't been
+// synced) resync `host_stack_sp = regs.sp32()` themselves before
+// invoking these — the resync is the cursor-driven step, not part of
+// the primitive.
 
 /// Capture current regs as a ModeSave and push it onto the locked
-/// stack. Increments the handler-context `depth`. While the legacy
-/// `host_stack_sp` cursor is still in use elsewhere, this primitive
-/// keeps it in sync (writes at `host_stack_sp - MODE_SAVE_SIZE` and
-/// decrements). Once all recipes migrate, the field goes away and
-/// this writes via `regs.SS:ESP` / `tos` per the documented model.
+/// stack at `host_stack_sp - MODE_SAVE_SIZE`. Decrements
+/// `host_stack_sp`, increments `depth`.
 pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) {
     let save = ModeSave::capture(regs);
     let cursor = dos.pc.host_stack_sp - MODE_SAVE_SIZE;
@@ -184,18 +189,16 @@ pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) {
     dos.pc.locked_stack.depth = dos.pc.locked_stack.depth.saturating_add(1);
 }
 
-/// Pop the topmost ModeSave off the locked stack and restore regs.
-/// The save is at `regs.sp32()` because the user just IRETed across
-/// the iret frame the recipe planted, advancing ESP onto the save's
-/// position. Resyncs `host_stack_sp` past the popped save and
-/// decrements `depth`. Returns the popped save for callers that
-/// want to inspect it (typically for tracing).
-pub(super) fn pop_save(dos: &mut thread::DosState, regs: &mut Regs) -> ModeSave {
-    let cursor = regs.sp32();
-    let addr = dos::host_stack_base() + cursor;
+/// Pop the topmost ModeSave off the locked stack. Reads at
+/// `host_stack_sp`, advances `host_stack_sp` past the save,
+/// decrements `depth`. Does NOT touch regs — the caller calls
+/// `save.restore(regs)` when ready (which may be immediately, or
+/// after computing things from current regs first as `rm_iret_call`
+/// does for its RmCallStruct writeback).
+pub(super) fn pop_save(dos: &mut thread::DosState) -> ModeSave {
+    let addr = dos::host_stack_base() + dos.pc.host_stack_sp;
     let save = unsafe { core::ptr::read_unaligned(addr as *const ModeSave) };
-    save.restore(regs);
-    dos.pc.host_stack_sp = cursor + MODE_SAVE_SIZE;
+    dos.pc.host_stack_sp += MODE_SAVE_SIZE;
     dos.pc.locked_stack.depth = dos.pc.locked_stack.depth.saturating_sub(1);
     save
 }
