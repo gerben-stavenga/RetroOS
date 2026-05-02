@@ -2389,16 +2389,19 @@ struct LowMem {
     /// client bitness.
     host_stack: [u8; 4096],
 
-    /// Dedicated RM stack — 4 KB host-provided buffer used by all
+    /// Dedicated RM stack — 512 B host-provided buffer used by all
     /// kernel-orchestrated RM execution (BIOS reflection from PM, DPMI
-    /// 0300/0301/0302 PM->RM calls, RM-side of callbacks). Single
-    /// per-thread buffer reused across excursions; reentrance for
-    /// nested kernel-orchestrated RM use is achieved by snapshotting
-    /// the buffer's current contents onto the locked stack on the way
-    /// in and copying back on the way out. Paragraph-aligned naturally
-    /// because `host_stack` precedes it and is a multiple of 16 in
-    /// size.
-    rm_stack: [u8; 4096],
+    /// 0300/0301/0302 PM->RM calls, RM-side of callbacks). Sized to
+    /// DPMI 0.9 §3.1.3's "at least 200H bytes" minimum, which is what
+    /// real DPMI extenders allocate per session. Single per-thread
+    /// buffer reused across excursions; reentrance for nested
+    /// kernel-orchestrated RM use is achieved by snapshotting this
+    /// buffer onto the locked stack on the way in and copying back on
+    /// the way out — a 4 KB snapshot would dominate host_stack, so
+    /// keeping rm_stack small keeps the snapshot small. Paragraph-
+    /// aligned naturally because `host_stack` precedes it and is a
+    /// multiple of 16 in size.
+    rm_stack: [u8; 0x200],
 }
 
 /// Borrow the kernel-owned low-mem area as a typed `&'static mut`.
