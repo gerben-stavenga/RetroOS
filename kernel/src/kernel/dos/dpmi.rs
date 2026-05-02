@@ -109,7 +109,7 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 
 // CPU state snapshots and the primitives that read/write them
 // (`push_save` / `pop_save` / `pop_save_at` / `peek_save_at` /
-// `consume_save_at`) live in [`super::locked_stack`]. This module
+// `consume_save_at`) live in [`super::mode_transitions`]. This module
 // composes them with DPMI policy.
 
 /// Stub-frame for `SLOT_RM_IRET_CALL` — pushed above the `ModeSave` by
@@ -781,7 +781,7 @@ pub fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
         // First entry: push a ModeSave (kernel-side save area) + plant
         // an iret-to-SLOT_PM_IRET frame so the eventual handler IRET
         // round-trips through the kernel for unwinding.
-        super::locked_stack::push_save(dos, regs);
+        super::mode_transitions::push_save(dos, regs);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
         let cursor2 = host_stack_write_iret(
             dos.pc.host_stack_sp, client_use32,
@@ -820,7 +820,7 @@ fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
     // Resync host_stack_sp from the user's post-iret cursor: hardware
     // IRET advanced ESP past the iret frame onto the save's start.
     dos.pc.host_stack_sp = regs.sp32();
-    let save = super::locked_stack::pop_save(dos);
+    let save = super::mode_transitions::pop_save(dos);
     save.restore(regs);
 
     let (cs, eip, ss, esp, vm) =
@@ -960,13 +960,13 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
         // PM-at-SLOT_PM_IRET so the existing outer-save unwind path
         // (cross_mode_restore) fires next. Net result: a single
         // ModeSave through the entire HW IRQ flow.
-        super::locked_stack::push_rm_snapshot(dos);
+        super::mode_transitions::push_rm_snapshot(dos);
 
         let ivt_off = machine::read_u16(0, (vector as u32) * 4);
         let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
 
         regs.frame.ss = dos::rm_stack_seg() as u64;
-        regs.frame.rsp = super::locked_stack::rm_stack_top() as u64;
+        regs.frame.rsp = super::mode_transitions::rm_stack_top() as u64;
 
         let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET_FORWARD);
         let ret_seg: u16 = dos::STUB_SEG;
@@ -1759,7 +1759,7 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     // The default must NOT overlap the client's data area (PSP_SEGMENT is unsafe).
     let used_dedicated = rm.ss == 0;
     let rm_ss = if rm.ss != 0 { rm.ss } else { dos::rm_stack_seg() };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { super::locked_stack::rm_stack_top() };
+    let rm_sp = if rm.sp != 0 { rm.sp } else { super::mode_transitions::rm_stack_top() };
 
     // Save PM state + rm_struct_addr stub-arg on locked stack (CALL slot).
     // When using the dedicated RM stack, snapshot it first so a nested
@@ -1767,8 +1767,8 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     // intact on unwind. The stub records this so SLOT_RM_IRET_CALL knows
     // whether to pop the snapshot.
     let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
-    super::locked_stack::push_save(dos, regs);
-    if used_dedicated { super::locked_stack::push_rm_snapshot(dos); }
+    super::mode_transitions::push_save(dos, regs);
+    if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
     dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     // Get IVT entry for the interrupt
@@ -1829,15 +1829,15 @@ fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector:
     // the locked stack provides reentrance for nested kernel-orchestrated
     // RM excursions. Works for VM86 and PM clients alike — no DPMI
     // session required.
-    super::locked_stack::push_save(dos, regs);
-    super::locked_stack::push_rm_snapshot(dos);
+    super::mode_transitions::push_save(dos, regs);
+    super::mode_transitions::push_rm_snapshot(dos);
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
     let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
 
     regs.frame.ss = dos::rm_stack_seg() as u64;
-    regs.frame.rsp = super::locked_stack::rm_stack_top() as u64;
+    regs.frame.rsp = super::mode_transitions::rm_stack_top() as u64;
 
     // Push RM IRET frame targeting SLOT_RM_IRET_REFLECT.
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
@@ -1886,13 +1886,13 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
 
     let used_dedicated = rm.ss == 0;
     let rm_ss = if rm.ss != 0 { rm.ss } else { dos::rm_stack_seg() };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { super::locked_stack::rm_stack_top() };
+    let rm_sp = if rm.sp != 0 { rm.sp } else { super::mode_transitions::rm_stack_top() };
 
     // Save PM state + rm_struct_addr stub-arg on locked stack (CALL slot).
     // Snapshot dedicated RM stack iff we're using it (see simulate_real_mode_int).
     let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
-    super::locked_stack::push_save(dos, regs);
-    if used_dedicated { super::locked_stack::push_rm_snapshot(dos); }
+    super::mode_transitions::push_save(dos, regs);
+    if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
     dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     regs.rax = rm.eax as u64;
@@ -1943,11 +1943,11 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
 
     let used_dedicated = rm.ss == 0;
     let rm_ss = if rm.ss != 0 { rm.ss } else { dos::rm_stack_seg() };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { super::locked_stack::rm_stack_top() };
+    let rm_sp = if rm.sp != 0 { rm.sp } else { super::mode_transitions::rm_stack_top() };
 
     let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
-    super::locked_stack::push_save(dos, regs);
-    if used_dedicated { super::locked_stack::push_rm_snapshot(dos); }
+    super::mode_transitions::push_save(dos, regs);
+    if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
     dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     regs.rax = rm.eax as u64;
@@ -2030,7 +2030,7 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     // runs on locked PM stack, dedicated RM stack is untouched, so no
     // RmSnapshot push.
     let stub = CallStubFrame::capture(regs, struct_addr, /*used_dedicated_rm=*/ false);
-    super::locked_stack::push_save(dos, regs);
+    super::mode_transitions::push_save(dos, regs);
     dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     // Switch to protected mode and call the PM handler.
@@ -2063,8 +2063,8 @@ pub fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
     // Restore the dedicated RM stack from its snapshot on the locked
     // stack, then pop the save and restore regs to the original PM
     // (or VM86) caller state.
-    super::locked_stack::pop_rm_snapshot(dos);
-    super::locked_stack::pop_save(dos).restore(regs);
+    super::mode_transitions::pop_rm_snapshot(dos);
+    super::mode_transitions::pop_save(dos).restore(regs);
 
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
     regs.frame.rflags |= machine::IF_FLAG as u64;
@@ -2097,7 +2097,7 @@ pub fn rm_iret_forward_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    super::locked_stack::pop_rm_snapshot(dos);
+    super::mode_transitions::pop_rm_snapshot(dos);
 
     // host_stack_sp now points at the iret frame deliver_pm_irq planted;
     // those bytes are logically dead (the user consumed the iret with
@@ -2107,7 +2107,7 @@ pub fn rm_iret_forward_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     let iret_size: u32 = if client_use32 { 12 } else { 6 };
     dos.pc.host_stack_sp += iret_size;
 
-    super::locked_stack::pop_save(dos).restore(regs);
+    super::mode_transitions::pop_save(dos).restore(regs);
 
     // Pass through BIOS's status-flag updates and force IF=1
     // (default-stub STI rule the host owes the client per DPMI 0.9).
@@ -2135,9 +2135,9 @@ pub fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     // means BIOS pushed onto the user's stack; our dedicated buffer
     // was never touched, no snapshot to restore.
     if stub.used_dedicated_rm != 0 {
-        super::locked_stack::pop_rm_snapshot(dos);
+        super::mode_transitions::pop_rm_snapshot(dos);
     }
-    let save = super::locked_stack::pop_save(dos);
+    let save = super::mode_transitions::pop_save(dos);
 
     // Writeback current RM regs into RmCallStruct so the PM caller sees
     // results. Must happen *before* GP-restore overwrites regs.

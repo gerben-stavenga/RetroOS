@@ -2470,7 +2470,7 @@ pub(super) fn host_stack_size() -> u32 {
 /// `rm_stack_seg()` returns the paragraph floor of the buffer's base;
 /// callers must add `(base & 0xF)` to any in-segment offset they pass
 /// to BIOS as SP, to compensate for any sub-paragraph alignment of
-/// the buffer's start within the LowMem layout. `locked_stack::rm_stack_top`
+/// the buffer's start within the LowMem layout. `mode_transitions::rm_stack_top`
 /// does this for the standard "fresh-excursion top of stack" SP.
 pub(super) fn rm_stack_base() -> u32 {
     &raw const low_mem().rm_stack as u32

@@ -381,16 +381,16 @@ pub struct PcMachine {
     ///
     /// In-flight: this field is the kernel-side ToS used by the legacy
     /// `host_stack_write_save` / `host_stack_read_save` recipes. The new
-    /// foundation in [`super::locked_stack`] tracks the same information
-    /// inside [`super::locked_stack::LockedStackState::tos`] (active only
+    /// foundation in [`super::mode_transitions`] tracks the same information
+    /// inside [`super::mode_transitions::LockedStackState::tos`] (active only
     /// while in RM-in-locked) plus regs.SS:ESP (authoritative in
     /// PM-in-locked). Once recipes migrate, this field goes away.
     pub host_stack_sp: u32,
 
     /// PM/RM transition state (depth + RM-in-locked ToS) used by the
-    /// new [`super::locked_stack`] recipes as they migrate over from the
+    /// new [`super::mode_transitions`] recipes as they migrate over from the
     /// legacy `host_stack_sp`-based bookkeeping.
-    pub locked_stack: super::locked_stack::LockedStackState,
+    pub locked_stack: super::mode_transitions::LockedStackState,
 }
 
 /// Microsoft Mouse driver (INT 33h) state. Updated by the IRQ 12 packet
@@ -563,7 +563,7 @@ impl PcMachine {
             vga: VgaState::new(),
             cmos_index: 0,
             host_stack_sp: super::dos::host_stack_size(),
-            locked_stack: super::locked_stack::LockedStackState::new(),
+            locked_stack: super::mode_transitions::LockedStackState::new(),
         }
     }
 
