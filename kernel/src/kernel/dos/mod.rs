@@ -106,6 +106,7 @@ use dos::{
     SLOT_PM_IRET,
     slot_offset,
     host_stack_base, host_stack_size,
+    rm_stack_base, rm_stack_size, rm_stack_seg,
 };
 
 use crate::kernel::thread;

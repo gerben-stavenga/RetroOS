@@ -159,29 +159,6 @@ impl CallStubFrame {
     }
 }
 
-/// Size of an RM IRQ stack frame allocated from host_stack. Each
-/// `reflect_int_to_real_mode` carves one of these out below its ModeSave;
-/// BIOS runs on it, then `rm_iret_reflect` frees it. 0x200 is plenty for a
-/// BIOS IRQ handler's working set and matches the size DPMI extenders
-/// typically allocate per-session for the same purpose.
-pub(super) const RM_IRQ_FRAME_SIZE: u32 = 0x200;
-
-/// Allocate an `RM_IRQ_FRAME_SIZE` slab from host_stack at the given cursor
-/// and return (new_cursor, ss, sp_top) suitable for a VM86 BIOS handler.
-/// Used by `reflect_int_to_real_mode` instead of a per-DPMI rm_stack_seg —
-/// nested IRQ reflections each get their own slab so they can't trample
-/// the outer handler's stack. ss/sp are computed from the slab's linear
-/// address: ss is the paragraph-aligned floor, sp lands two bytes below
-/// the slab's top byte (matching the per-session `RM_STACK_TOP` convention
-/// — leaves the top word free so 32-bit pushes can never overflow).
-fn host_stack_alloc_rm_frame(cursor: u32) -> (u32, u16, u16) {
-    let new_cursor = cursor - RM_IRQ_FRAME_SIZE;
-    let linear = dos::host_stack_base() + new_cursor;
-    let ss = (linear >> 4) as u16;
-    let sp = (RM_IRQ_FRAME_SIZE as u16 - 2) + ((linear & 0xF) as u16);
-    (new_cursor, ss, sp)
-}
-
 /// Write a `CallStubFrame` at the cursor. Returns the new (lower) cursor.
 fn host_stack_write_call_args(cursor: u32, frame: CallStubFrame) -> u32 {
     let new_cursor = cursor - CALL_STUB_SIZE;
@@ -1819,23 +1796,24 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
 /// that passes pointers via segments is the DOS extender's responsibility
 /// to translate via its own INT 21h hook — not the host's.
 fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    // Save client state on host_stack, then carve a fresh RM IRQ frame
-    // immediately below it. BIOS runs on the slab — never on the client's
-    // own VM86 stack — so a HW IRQ landing during a sensitive moment in the
+    // Save client state, snapshot the dedicated RM stack onto the
+    // locked stack, then run BIOS on a fresh dedicated RM stack. BIOS
+    // runs on a kernel-owned RM stack — never on the client's own VM86
+    // stack — so a HW IRQ landing during a sensitive moment in the
     // client (e.g. just after exec_return) can't trample the client's
-    // saved registers / return address. Nested IRQs each allocate their
-    // own slab; the SLOT_RM_IRET_REFLECT unwind frees both records.
-    // Works for VM86 and PM clients alike — no DPMI session required.
+    // saved registers / return address. The snapshot+restore pair on
+    // the locked stack provides reentrance for nested kernel-orchestrated
+    // RM excursions. Works for VM86 and PM clients alike — no DPMI
+    // session required.
     super::locked_stack::push_save(dos, regs);
-    let (new_cursor, rm_ss, rm_sp) = host_stack_alloc_rm_frame(dos.pc.host_stack_sp);
-    dos.pc.host_stack_sp = new_cursor;
+    super::locked_stack::push_rm_snapshot(dos);
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
     let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
 
-    regs.frame.ss = rm_ss as u64;
-    regs.frame.rsp = rm_sp as u64;
+    regs.frame.ss = dos::rm_stack_seg() as u64;
+    regs.frame.rsp = super::locked_stack::rm_stack_top() as u64;
 
     // Push RM IRET frame targeting SLOT_RM_IRET_REFLECT.
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
@@ -2053,10 +2031,10 @@ pub fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5; // CF,PF,AF,ZF,SF,OF,DF
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    // The RM IRQ slab sits below the ModeSave on the locked stack.
-    // Free the slab first (advance host_stack_sp past it), then pop
-    // the save and restore regs.
-    dos.pc.host_stack_sp += RM_IRQ_FRAME_SIZE;
+    // Restore the dedicated RM stack from its snapshot on the locked
+    // stack, then pop the save and restore regs to the original PM
+    // (or VM86) caller state.
+    super::locked_stack::pop_rm_snapshot(dos);
     super::locked_stack::pop_save(dos).restore(regs);
 
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
