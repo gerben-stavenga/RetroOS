@@ -109,8 +109,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
-        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RM_IRET_REFLECT | SLOT_RM_IRET_CALL
-        | SLOT_RM_IRET_STUB
+        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RM_IRET | SLOT_RM_IRET_CALL
         | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
         | SLOT_INT74_MOUSE_CB | SLOT_INT74_MOUSE_CB_RET)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
@@ -121,16 +120,10 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             dpmi::dpmi_enter(dos, regs);
             thread::KernelAction::Done
         }
-        SLOT_RM_IRET_REFLECT => {
-            // Implicit reflection unwind: pop ModeSave, propagate low 32
-            // bits of GP regs PM→RM (§2.4), OR IF=1 (default-stub spec).
-            mode_transitions::rm_iret_reflect(dos, regs);
-            thread::KernelAction::Done
-        }
-        SLOT_RM_IRET_STUB => {
-            // Stub-emulation tail: pop save, sti, synth-iret the planted
-            // iret-frame on the user's stack.
-            mode_transitions::rm_iret_stub(dos, regs);
+        SLOT_RM_IRET => {
+            // RM-INT-return: pop save, sti, synth-iret the iret-frame the
+            // caller planted on the user's stack.
+            mode_transitions::rm_iret(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RM_IRET_CALL => {
@@ -1631,11 +1624,11 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 /// Bracket-saves the user GP regs we're about to clobber (AX/BX/CX/DX/SI/DI)
 /// since `ModeSave` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
 /// returns via SLOT_INT74_MOUSE_CB_RET which restores them and then unwinds
-/// the IRQ via the standard `rm_iret_reflect`.
+/// the IRQ via the standard `rm_iret`.
 ///
 /// Stack at entry (RM slab pushed by `reflect_int_to_real_mode`):
 ///   top: trap-IP, trap-CS, trap-FLAGS (the CD 31 IRET frame).
-///   below: outer IRET frame targeting SLOT_RM_IRET_REFLECT.
+///   below: outer IRET frame targeting SLOT_RM_IRET.
 fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
     use super::machine::{vm86_pop, vm86_push};
     // Discard the CD 31 trap iret-frame (slot is is_far_call, dispatcher
@@ -1684,7 +1677,7 @@ fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
 
 /// SLOT_INT74_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
 /// Restore the GP regs `mouse_callback_invoke` clobbered, then unwind the
-/// IRQ via the same `rm_iret_reflect` that SLOT_RM_IRET_REFLECT uses.
+/// IRQ via the same `rm_iret` that SLOT_RM_IRET uses.
 fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     use super::machine::vm86_pop;
     // Discard the CD 31 trap iret-frame.
@@ -1700,7 +1693,7 @@ fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     regs.rsi = m.saved_rsi;
     regs.rdi = m.saved_rdi;
 
-    super::mode_transitions::rm_iret_reflect(dos, regs);
+    super::mode_transitions::rm_iret(dos, regs);
 }
 
 /// Open a DOS program file by literal name. No extension probing, no
@@ -2545,15 +2538,6 @@ pub(super) struct Loaded {
 const STUB_INT: u8 = 0x31;
 const SLOT_XMS: u8 = 0x00;
 const SLOT_DPMI_ENTRY: u8 = 0x01;
-/// RM-side return stub for the implicit IVT-reflection path
-/// (`reflect_int_to_real_mode`). The `CD 31` byte at this slot is the IRET
-/// target the kernel pushed on the RM stack when reflecting a PM client
-/// INT into BIOS. On RM IRET the kernel pops the `ModeSave` from
-/// host_stack, propagates the low 32 bits of GP regs from RM back to PM
-/// (per DPMI 0.9 §2.4/§3.2 round-trip rule), and ORs IF=1 into the
-/// restored EFLAGS — the spec's "default IRQ stub must STI before IRET"
-/// requirement (see `feedback_dpmi_default_stub_sti`).
-pub(crate) const SLOT_RM_IRET_REFLECT: u8 = 0x02;
 /// RM-side return stub for explicit PM→RM excursions: `INT 31h/0300h`
 /// (`simulate_real_mode_int`), `0301h` (`call_real_mode_proc`), `0302h`
 /// (`call_real_mode_proc_iret`), and `callback_entry` (RM→PM). Each entry
@@ -2580,7 +2564,7 @@ pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x13;
 pub(crate) const SLOT_INT74_MOUSE_CB: u8 = 0x74;
 /// Handler RETFs to this slot. `mouse_callback_return` restores the
 /// bracket-saved GP regs (ModeSave doesn't cover them) and then unwinds the
-/// IRQ via the standard `rm_iret_reflect` path.
+/// IRQ via the standard `rm_iret` path.
 pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
@@ -2594,13 +2578,16 @@ pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// width lands at the same `CD 31` byte pair.
 pub(crate) const SLOT_PM_IRET: u8 = 0xF8;
 
-/// RM-side return stub for `vector_stub_reflect`'s stub-emulation flow.
-/// BIOS IRETs through this slot when the kernel reflected an INT via
-/// the per-vector default stub. The handler runs the stub's tail:
-/// `pop_save / sti / synth-iret of the planted iret-frame` — landing
-/// regs at the iret-target the planter chose (SLOT_PM_IRET for
+/// Kernel-owned PM return target for `reflect_int_to_real_mode` —
+/// the CS:EIP the caller asks reflect to come back at after the RM INT
+/// returns. Has to be a kernel-trapped address because the RM→PM mode
+/// flip on the way back needs kernel mediation. The handler at this
+/// slot (`mode_transitions::rm_iret`) runs the standard tail: pop the
+/// captured ModeSave, OR IF=1 (default-stub-STI rule), and synth-iret
+/// the iret-frame the caller planted on the user's stack — landing
+/// regs at whatever target the caller chose (SLOT_PM_IRET for
 /// cross-mode HW-IRQ, the outer caller's CS:EIP otherwise).
-pub(crate) const SLOT_RM_IRET_STUB: u8 = 0xFA;
+pub(crate) const SLOT_RM_IRET: u8 = 0x02;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 

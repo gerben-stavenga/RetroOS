@@ -1500,6 +1500,14 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         // faulting instruction would just re-execute and refault, producing
         // an infinite loop. Terminate the client instead.
         if matches!(exc_num, 0 | 3 | 4) {
+            // Plant an iret-frame on the user's stack pointing at the
+            // faulting CS:EIP so that `rm_iret`'s synth-iret tail (after
+            // BIOS returns) lands the user back at the faulting
+            // instruction. Frame width follows client bitness.
+            let client_use32 = dpmi.client_use32;
+            let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8));
+            super::mode_transitions::push_iret_frame(&dos.ldt[..], regs, client_use32,
+                regs.ip32(), regs.code_seg(), handler_flags);
             return super::mode_transitions::reflect_int_to_real_mode(dos, regs, exc_num as u8);
         }
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",

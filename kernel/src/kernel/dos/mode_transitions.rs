@@ -20,7 +20,7 @@
 //!                    that switched-to stack also counts as the locked
 //!                    stack until the handler switches back.
 //! - `RmInLocked`   — RM running on the dedicated RM stack (a separate
-//!                    per-thread buffer in low memory). BIOS reflection
+//!                    per-thread buffer in low memory). RM-INT reflection
 //!                    from PM, DPMI 0300/0301/0302 calls, etc.
 //!
 //! ### State tracking
@@ -209,7 +209,7 @@ pub(super) fn pop_save(dos: &mut thread::DosState) -> ModeSave {
 //
 // The dedicated RM stack is a per-thread paragraph-aligned buffer in
 // low memory (`dos::rm_stack_base()` / `dos::rm_stack_size()`). All
-// kernel-orchestrated RM execution — BIOS reflection from PM, DPMI
+// kernel-orchestrated RM execution — RM-INT reflection from PM, DPMI
 // 0300/0301/0302 calls, RM-side of callbacks — runs on it.
 //
 // Reentrance for nested kernel-orchestrated RM use is achieved by
@@ -317,7 +317,7 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 // ─── Cross-mode save lane on host_stack ─────────────────────────────────
 //
 // Every PM-handler entry from a non-host-stack mode (HW IRQ outermost or
-// BIOS-mid-handler) pushes a `ModeSave` capturing the interrupted regs
+// RM-INT-mid-handler) pushes a `ModeSave` capturing the interrupted regs
 // onto host_stack at `pc.host_stack_sp`, then an iret_frame above it
 // targeting `SLOT_PM_IRET`. The handler's IRET pops the iret_frame
 // (hardware), traps to the kernel via the stub, kernel pops the ModeSave
@@ -336,7 +336,7 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 /// On unwind, `rm_iret_call` writes the post-RM regs into the
 /// RmCallStruct at `rm_struct_addr`, then restores the saved GP regs
 /// (PM caller's for `0300/01/02`; RM caller's for `callback_entry`).
-/// Other slots (`SLOT_PM_IRET`, `SLOT_RM_IRET_REFLECT`) don't need this
+/// Other slots (`SLOT_PM_IRET`, `SLOT_RM_IRET`) don't need this
 /// — handler preservation / spec round-trip handle their GP regs.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -349,9 +349,9 @@ pub(super) struct CallStubFrame {
     esi: u32,
     edi: u32,
     ebp: u32,
-    /// 1 if the recipe pushed an `RmSnapshot` (because BIOS will run
+    /// 1 if the recipe pushed an `RmSnapshot` (because the RM handler will run
     /// on our dedicated RM stack); 0 if the user supplied their own
-    /// SS:SP via the RmCallStruct (BIOS runs there, our dedicated
+    /// SS:SP via the RmCallStruct (RM handler runs there, our dedicated
     /// stack is untouched, no snapshot needed). On unwind the
     /// SLOT_RM_IRET_CALL handler conditionally pops the snapshot.
     used_dedicated_rm: u32,
@@ -575,7 +575,7 @@ pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) ->
 /// 32-bit handler (D=1), 6 bytes for 16-bit (D=0). This is the width the
 /// handler's `IRET` will use on its way back, so push and matching pop must
 /// agree on handler bitness, regardless of the client's overall size.
-fn push_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
+pub(super) fn push_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
                    eip: u32, cs: u16, flags: u32) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
@@ -653,15 +653,15 @@ fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u1
 /// Per-vector default stub trap. Mimics, in kernel space, the canonical
 /// PM stub a DOS extender would install:
 ///
-///   push_regs              ← `push_save`           (in `reflect_int_to_bios`)
-///   call simulate_rm_int   ← BIOS round-trip       (in `reflect_int_to_bios`)
-///   pop_regs               ← `pop_save`            (in `rm_iret_stub`)
-///   sti                                             (in `rm_iret_stub`)
-///   iret                   ← synthetic iret-pop    (in `rm_iret_stub`)
+///   push_regs              ← `push_save`           (in `reflect_int_to_real_mode`)
+///   call simulate_rm_int   ← RM-INT round-trip       (in `reflect_int_to_real_mode`)
+///   pop_regs               ← `pop_save`            (in `rm_iret`)
+///   sti                                             (in `rm_iret`)
+///   iret                   ← synthetic iret-pop    (in `rm_iret`)
 ///
 /// Uniform — no discrimination by iret-target. The planted iret-frame
 /// (deliver_pm_irq or deliver_pm_int wrote it) is consumed at the
-/// synthetic-iret tail in `rm_iret_stub`, landing regs at whatever
+/// synthetic-iret tail in `rm_iret`, landing regs at whatever
 /// target the planter chose:
 ///   - `SLOT_PM_IRET` for cross-mode HW-IRQ first-entry → next CD 31
 ///     traps `cross_mode_restore` to pop the outer save.
@@ -674,29 +674,29 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
             vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
             regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
     }
-    reflect_int_to_bios(dos, regs, vector, dos::SLOT_RM_IRET_STUB)
+    reflect_int_to_real_mode(dos, regs, vector)
 }
 
 
-/// Reflect a software INT from protected mode to real mode via the IVT.
-/// Used when a DPMI client executes `INT xx` and no PM handler is installed.
-/// Per DPMI 0.9 §2.4 / §3.2: EAX/EBX/ECX/EDX/ESI/EDI/EBP and flags are
-/// passed unaltered; segment registers are undefined in real mode. Any API
-/// that passes pointers via segments is the DOS extender's responsibility
-/// to translate via its own INT 21h hook — not the host's.
+/// Reflect an INT to real mode via the IVT. Whether the IVT entry points
+/// at BIOS, DOS, or a user-installed hook is irrelevant — it's just
+/// "execute INT N in RM, come back when it's done". Used by the
+/// per-vector default stub (`vector_stub_reflect`) and by the unhandled-
+/// exception fallback (`dispatch_dpmi_exception`).
+///
+/// On the way out: push_save, push_rm_snapshot, set up regs to enter
+/// the IVT handler in VM86 with the trampoline iret-frame on rm_stack
+/// pointing back at SLOT_RM_IRET. Per DPMI 0.9 §2.4 / §3.2:
+/// EAX/EBX/ECX/EDX/ESI/EDI/EBP and flags are passed unaltered; segment
+/// registers are undefined in real mode.
+///
+/// On the way back: RM IRET pops the trampoline frame, lands at
+/// SLOT_RM_IRET, kernel runs `rm_iret` — pop_rm_snapshot, pop_save,
+/// sti, synth-iret of the iret-frame the caller planted on the user's
+/// stack (CS:EIP they want resumed at).
 pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    reflect_int_to_bios(dos, regs, vector, dos::SLOT_RM_IRET_REFLECT)
-}
-
-/// Like `reflect_int_to_real_mode` but parameterized by the RM-side
-/// return slot the BIOS handler IRETs through. Direct callers pick the
-/// slot whose unwind handler matches what they want to happen on the
-/// way back: `SLOT_RM_IRET_REFLECT` for plain "restore captured state",
-/// `SLOT_RM_IRET_STUB` for "stub-style: restore + sti + synth-iret of
-/// the iret-frame the planter left on the user's stack".
-pub(super) fn reflect_int_to_bios(dos: &mut thread::DosState, regs: &mut Regs, vector: u8, return_slot: u8) -> thread::KernelAction {
     // Save client state, snapshot the dedicated RM stack onto the
-    // locked stack, then run BIOS on a fresh dedicated RM stack. BIOS
+    // locked stack, then run the RM handler on a fresh dedicated RM stack. The handler
     // runs on a kernel-owned RM stack — never on the client's own VM86
     // stack — so a HW IRQ landing during a sensitive moment in the
     // client (e.g. just after exec_return) can't trample the client's
@@ -717,19 +717,19 @@ pub(super) fn reflect_int_to_bios(dos: &mut thread::DosState, regs: &mut Regs, v
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
     // own INT n in real mode would push: FLAGS / CS / IP. FLAGS is the
     // client's flags *unmodified* — that's what real-mode INT writes,
-    // and it's what BIOS IRET pops back. The handler runs with IF=0
+    // and it's what RM IRET pops back. The handler runs with IF=0
     // because we set it on `regs.frame.rflags` below, not by mutating
     // the on-stack frame. Pushing 0 (or modifying flags here) would let
     // the unwind handler's status-flag passthrough (CF/ZF/DF/...) snapshot
     // wrong values and silently corrupt the client across the IRQ.
     let ret_flags = regs.flags32() as u16;
-    let ret_off: u16 = dos::slot_offset(return_slot);
+    let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET);
     let ret_seg: u16 = dos::STUB_SEG;
     machine::vm86_push(regs, ret_flags);
     machine::vm86_push(regs, ret_seg);
     machine::vm86_push(regs, ret_off);
 
-    // Enter the BIOS handler in VM86 with IF cleared — matches what the
+    // Enter the RM handler in VM86 with IF cleared — matches what the
     // CPU's own INT n does in real mode (preserves status flags, just
     // clears IF). VIF is owned by the arch layer (VME virtualization),
     // not us. IOPL=1 keeps cli/sti virtualized.
@@ -751,45 +751,18 @@ pub(super) fn reflect_int_to_bios(dos: &mut thread::DosState, regs: &mut Regs, v
     thread::KernelAction::Done
 }
 
-/// SLOT_RM_IRET_REFLECT dispatch — implicit IVT-reflection unwind.
-/// Called when VM86 IRETs from a BIOS handler we entered via
-/// `reflect_int_to_real_mode`. Pops the `ModeSave` and restores
-/// CS/EIP/SS/ESP/EFLAGS/segregs. GP regs are *not* in `ModeSave` — per
-/// DPMI 0.9 §2.4 they round-trip through real mode (BIOS modifies them,
-/// PM caller sees the modified values). Then ORs IF=1 into EFLAGS per
-/// the spec's "default IRQ stub must STI before IRET" rule
-/// (`feedback_dpmi_default_stub_sti`).
-pub(super) fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
-    // Snapshot RM arithmetic flags before restore overwrites EFLAGS.
-    // VM/IOPL/IF/TF/RF/NT must come from the saved PM state — copying
-    // RM EFLAGS verbatim would set VM=1 and drop us back into VM86.
-    const STATUS_MASK: u32 = 0x0CD5; // CF,PF,AF,ZF,SF,OF,DF
-    let rm_arith = regs.flags32() & STATUS_MASK;
-
-    // Restore the dedicated RM stack from its snapshot on the locked
-    // stack, then pop the save and restore regs to the original PM
-    // (or VM86) caller state.
-    pop_rm_snapshot(dos);
-    pop_save(dos).restore(regs);
-
-    regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
-    regs.frame.rflags |= machine::IF_FLAG as u64;
-
-    dos_trace!("[DPMI] RM_IRET_REFLECT -> CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x}",
-        regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
-}
-
-/// SLOT_RM_IRET_STUB dispatch — `vector_stub_reflect`'s stub-emulation
-/// tail. Mirrors `pop_regs / sti / iret` of the canonical default-stub:
+/// SLOT_RM_IRET dispatch — RM-INT-return unwind.
+/// Mirrors the canonical PM default-stub's tail in kernel space:
 ///
-///   - Pop the rm_snapshot and the ModeSave the entry-side push_save'd.
-///   - OR IF=1 into the captured EFLAGS (default-stub STI rule).
-///   - Synthetic IRET: pop the iret-frame the planter (`deliver_pm_irq`
-///     or `deliver_pm_int`) wrote on the user's stack, install
+///   - Pop the rm_snapshot and the ModeSave that `reflect_int_to_real_mode`
+///     pushed on entry.
+///   - OR IF=1 into EFLAGS (default-stub STI rule per DPMI 0.9).
+///   - Synthetic IRET: pop the iret-frame the caller planted on the
+///     user's stack (whatever CS:EIP they want resumed at), install
 ///     CS:EIP/EFLAGS from it, advance regs.SP, and — if the user is on
 ///     host_stack — advance `host_stack_sp` in lockstep so subsequent
 ///     pushes don't overlap the now-consumed iret-frame area.
-pub(super) fn rm_iret_stub(dos: &mut thread::DosState, regs: &mut Regs) {
+pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
@@ -827,7 +800,7 @@ pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     dos.pc.host_stack_sp += CALL_STUB_SIZE;
     // Restore the dedicated RM stack iff this excursion ran on it
     // (the recipe recorded the choice on push). User-supplied SS:SP
-    // means BIOS pushed onto the user's stack; our dedicated buffer
+    // means the RM handler pushed onto the user's stack; our dedicated buffer
     // was never touched, no snapshot to restore.
     if stub.used_dedicated_rm != 0 {
         pop_rm_snapshot(dos);
