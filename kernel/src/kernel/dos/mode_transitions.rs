@@ -61,6 +61,9 @@
 //! recipe.
 
 use super::dos;
+use super::dos_trace;
+use super::dpmi::{self, seg_base, seg_is_32, RmCallStruct};
+use super::machine;
 use super::thread;
 use crate::Regs;
 
@@ -261,3 +264,715 @@ pub(super) fn pop_rm_snapshot(dos: &mut thread::DosState) {
     }
     dos.pc.host_stack_sp += size;
 }
+
+// =============================================================================
+// Stub-segment LDT layout
+// =============================================================================
+//
+// The stub bytes themselves live at `dos::host_stack_base() ... STUB_BASE`
+// (a fixed CD-31 array set up by `dos::setup_ivt`); these LDT slots are the
+// PM views onto that memory. `dpmi::install_kernel_ldt_slots` allocates and
+// programs them at thread init.
+
+/// LDT index of the vector-default stub segment. Base=0, limit=0x0FFF, 16-bit.
+/// Every entry in `pm_vectors` that the client has not installed points into
+/// this segment at STUB_BASE + vec*2 (a `CD 31` that traps back to the host).
+/// When dpmi_int31 sees CS == this selector, the trap is a default-vector
+/// reflection: route to `vector_stub_reflect` which dispatches the vector to
+/// the real-mode IVT.
+///
+/// Placed at LDT[200] — well above the CWSDPMI [1..127] range.
+pub const VECTOR_STUB_LDT_IDX: usize = 4;
+
+/// LDT index of the host "special stub" segment. Base=0, limit=0x0FFF, 16-bit.
+/// Addresses handed back to the client for host services (0305h PM save/restore,
+/// 0306h PM-to-real switch) and the `SLOT_EXCEPTION_RET` return trampoline
+/// live in this segment. When dpmi_int31 sees CS == this selector,
+/// pm_stub_dispatch routes by slot. Keeping this separate from
+/// VECTOR_STUB_LDT_IDX prevents the ambiguity between default-vector stubs
+/// 0xFB-0xFF and the special slots at the same offsets.
+pub const SPECIAL_STUB_LDT_IDX: usize = 7;
+
+/// Selector value (TI=1, RPL=3) for the kernel-owned VECTOR_STUB segment
+/// that holds the per-vector default INT-reflection stubs.
+pub(super) const VECTOR_STUB_SEL: u16 = ((VECTOR_STUB_LDT_IDX as u16) << 3) | 4 | 3;
+
+/// Selector value (TI=1, RPL=3) for the kernel-owned SPECIAL_STUB segment
+/// that holds the host's PM return trampolines (HW-IRQ unwind, exception
+/// return, raw mode switch, save/restore).
+pub(super) const SPECIAL_STUB_SEL: u16 = ((SPECIAL_STUB_LDT_IDX as u16) << 3) | 4 | 3;
+
+/// LDT indices for the kernel-shared host stack — three aliasing
+/// selectors at the same base (`dos::host_stack_base()`), one with B=0
+/// for 16-bit clients and one with B=1 for 32-bit clients. The bitness
+/// difference only controls whether push/pop uses SP or ESP; the
+/// physical buffer is the same. The third alias is a VM86 paragraph
+/// (`dos::host_stack_vm86_paragraph()`) consumed when ring-0 transiently
+/// runs VM86 code (e.g. nested 0x0302 RM excursion). Host-internal —
+/// not handed to the client.
+pub const HOST_STACK_PM16_LDT_IDX: usize = 8;
+pub const HOST_STACK_PM32_LDT_IDX: usize = 9;
+pub const HOST_STACK_PM16_SEL: u16 = ((HOST_STACK_PM16_LDT_IDX as u16) << 3) | 4 | 3;
+pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4 | 3;
+
+// ─── Cross-mode save lane on host_stack ─────────────────────────────────
+//
+// Every PM-handler entry from a non-host-stack mode (HW IRQ outermost or
+// BIOS-mid-handler) pushes a `ModeSave` capturing the interrupted regs
+// onto host_stack at `pc.host_stack_sp`, then an iret_frame above it
+// targeting `SLOT_PM_IRET`. The handler's IRET pops the iret_frame
+// (hardware), traps to the kernel via the stub, kernel pops the ModeSave
+// and restores. Pure nested-on-host-stack entries (handler-mid-execution
+// IRQ where regs.SS is already HOST_STACK_PM) skip the ModeSave — the
+// outer handler's CS:EIP and stack already hold the chain, so a plain
+// hardware IRET back to outer is sufficient.
+
+// CPU state snapshots and the primitives that read/write them
+// (`push_save` / `pop_save` / `pop_save_at` / `peek_save_at` /
+// `consume_save_at`) live in [`super::mode_transitions`]. This module
+// composes them with DPMI policy.
+
+/// Stub-frame for `SLOT_RM_IRET_CALL` — pushed above the `ModeSave` by
+/// every explicit PM→RM-call entry (`0300/01/02` and `callback_entry`).
+/// On unwind, `rm_iret_call` writes the post-RM regs into the
+/// RmCallStruct at `rm_struct_addr`, then restores the saved GP regs
+/// (PM caller's for `0300/01/02`; RM caller's for `callback_entry`).
+/// Other slots (`SLOT_PM_IRET`, `SLOT_RM_IRET_REFLECT`) don't need this
+/// — handler preservation / spec round-trip handle their GP regs.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub(super) struct CallStubFrame {
+    rm_struct_addr: u32,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+    esi: u32,
+    edi: u32,
+    ebp: u32,
+    /// 1 if the recipe pushed an `RmSnapshot` (because BIOS will run
+    /// on our dedicated RM stack); 0 if the user supplied their own
+    /// SS:SP via the RmCallStruct (BIOS runs there, our dedicated
+    /// stack is untouched, no snapshot needed). On unwind the
+    /// SLOT_RM_IRET_CALL handler conditionally pops the snapshot.
+    used_dedicated_rm: u32,
+}
+
+const CALL_STUB_SIZE: u32 = core::mem::size_of::<CallStubFrame>() as u32;
+
+impl CallStubFrame {
+    pub(super) fn capture(regs: &Regs, rm_struct_addr: u32, used_dedicated_rm: bool) -> Self {
+        Self {
+            rm_struct_addr,
+            eax: regs.rax as u32,
+            ebx: regs.rbx as u32,
+            ecx: regs.rcx as u32,
+            edx: regs.rdx as u32,
+            esi: regs.rsi as u32,
+            edi: regs.rdi as u32,
+            ebp: regs.rbp as u32,
+            used_dedicated_rm: used_dedicated_rm as u32,
+        }
+    }
+
+    pub(super) fn restore_gp(&self, regs: &mut Regs) {
+        regs.rax = (regs.rax & !0xFFFFFFFF) | self.eax as u64;
+        regs.rbx = (regs.rbx & !0xFFFFFFFF) | self.ebx as u64;
+        regs.rcx = (regs.rcx & !0xFFFFFFFF) | self.ecx as u64;
+        regs.rdx = (regs.rdx & !0xFFFFFFFF) | self.edx as u64;
+        regs.rsi = (regs.rsi & !0xFFFFFFFF) | self.esi as u64;
+        regs.rdi = (regs.rdi & !0xFFFFFFFF) | self.edi as u64;
+        regs.rbp = (regs.rbp & !0xFFFFFFFF) | self.ebp as u64;
+    }
+}
+
+/// Write a `CallStubFrame` at the cursor. Returns the new (lower) cursor.
+pub(super) fn host_stack_write_call_args(cursor: u32, frame: CallStubFrame) -> u32 {
+    let new_cursor = cursor - CALL_STUB_SIZE;
+    let addr = dos::host_stack_base() + new_cursor;
+    unsafe { core::ptr::write_unaligned(addr as *mut CallStubFrame, frame); }
+    new_cursor
+}
+
+/// Read a `CallStubFrame` at the cursor.
+fn host_stack_read_call_args(cursor: u32) -> CallStubFrame {
+    let addr = dos::host_stack_base() + cursor;
+    unsafe { core::ptr::read_unaligned(addr as *const CallStubFrame) }
+}
+
+/// Push an IRET frame for a PM handler entry at the given cursor. Returns
+/// the new cursor. Width follows client bitness per DPMI 0.9 §10.6.
+fn host_stack_write_iret(cursor: u32, client_use32: bool,
+                         ret_eip: u32, ret_cs: u16, ret_flags: u32) -> u32 {
+    let frame_size: u32 = if client_use32 { 12 } else { 6 };
+    let new_cursor = cursor - frame_size;
+    let addr = dos::host_stack_base() + new_cursor;
+    unsafe {
+        if client_use32 {
+            let p = addr as *mut u32;
+            core::ptr::write_unaligned(p,        ret_eip);
+            core::ptr::write_unaligned(p.add(1), ret_cs as u32);
+            core::ptr::write_unaligned(p.add(2), ret_flags);
+        } else {
+            let p = addr as *mut u16;
+            core::ptr::write_unaligned(p,        ret_eip as u16);
+            core::ptr::write_unaligned(p.add(1), ret_cs);
+            core::ptr::write_unaligned(p.add(2), ret_flags as u16);
+        }
+    }
+    new_cursor
+}
+
+/// Deliver a PM soft INT to the installed handler.
+///
+/// Per DPMI 0.9 §3.1.2: software interrupts do **not** switch stacks —
+/// the handler runs on the client's own PM stack. Standard hardware-INT
+/// semantics done in software:
+///
+///   - Push an IRET frame on `regs.ss:regs.sp` (the client's stack) with
+///     return CS:EIP:EFLAGS pointing back at the interrupted client.
+///     Frame width follows `dpmi.client_use32` per §10.6 (32-bit client →
+///     12-byte IRETD frame; 16-bit → 6-byte IRET frame). The handler
+///     owns matching its IRET width to the client's.
+///   - Set CS:EIP to the installed handler. Clear TF so we don't
+///     single-step into the handler. IF/IOPL/etc. follow the caller's
+///     EFLAGS unchanged (spec leaves soft-INT handler IF state alone).
+///   - Run. The handler's eventual IRET pops the frame and resumes the
+///     client directly — no kernel involvement, no snapshot, no stack
+///     switch.
+pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
+    let (sel, off) = dos.pm_vectors[vector as usize];
+    let dpmi = match dos.dpmi.as_ref() {
+        Some(d) => d,
+        None => return,
+    };
+    let client_use32 = dpmi.client_use32;
+    let handler_flags = regs.flags32() & !(1u32 << 8);
+    push_iret_frame(&dos.ldt[..], regs, client_use32,
+        regs.ip32(), regs.code_seg(), handler_flags);
+    regs.set_cs32(sel as u32);
+    regs.set_ip32(off);
+    regs.clear_flag32(1 << 8);
+    dos_trace!("[DPMI] PM_INT vec={:02X} -> {:04x}:{:#x} on client SS:ESP={:04x}:{:#x}",
+        vector, sel, off, regs.frame.ss as u16, regs.sp32());
+}
+
+/// Deliver a HW IRQ to a PM handler. Per DPMI 0.9 §3.1.2 the host
+/// switches to the locked PM stack (`host_stack`) on the *first* entry
+/// from the client's stack OR from VM86; nested entries already on the
+/// locked stack reuse it without switching.
+///
+///   - **First entry** (regs.SS is not the locked PM stack): push a
+///     `ModeSave` capturing the interrupted regs onto `host_stack` at
+///     `pc.host_stack_sp`, push an iret frame above it targeting
+///     `SLOT_PM_IRET`. Switch SS:ESP to the `HOST_STACK_PM*` alias. The
+///     handler's IRET pops the iret frame and traps to the kernel via
+///     the stub, which pops the ModeSave (via `cross_mode_restore`) and
+///     restores the interrupted state — including SS:ESP, which a
+///     same-priv hardware IRET could not have done.
+///
+///   - **Nested on the locked PM stack** (regs in PM and SS is a
+///     `HOST_STACK_PM*` alias): push only the iret frame at
+///     `regs.ESP - frame_size` targeting the outer's CS:EIP. No
+///     ModeSave; hardware same-priv IRET handles the unwind directly.
+///
+/// The two cases collapse to: "is the CPU currently on the locked PM
+/// stack in PM mode?". In VM86 the SS register is a paragraph and
+/// numerically comparing it to a PM selector value would be a category
+/// error, so the mode check has to come first.
+///
+/// Works for non-DPMI threads too: `install_kernel_ldt_slots` makes the
+/// LDT + kernel-owned selectors (VECTOR_STUB, SPECIAL_STUB, HOST_STACK_PM*)
+/// available at thread init. When `pm_vectors[vec]` is the default stub,
+/// the round-trip lands in `vector_stub_reflect` which discriminates the
+/// first-entry case by the IRET target == `SLOT_PM_IRET`.
+pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
+    let (sel, off) = dos.pm_vectors[vector as usize];
+    // DPMI 0.9 §10.6: frame width follows the *client*'s bitness, not the
+    // handler segment's D bit. A 32-bit client routinely installs a
+    // 16-bit-segment handler that issues `66 CF` (32-bit IRETD) — clients
+    // own that contract end-to-end. Non-DPMI threads default to 16-bit
+    // (the host default-stub path is 16-bit).
+    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+
+    // Handler starts with IF=TF=0; other flag bits follow the current EFLAGS.
+    let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8) | machine::VM_FLAG);
+
+    let in_pm = regs.mode() != crate::UserMode::VM86;
+    let cur_ss = regs.stack_seg();
+    let nested_on_host_stack = in_pm
+        && (cur_ss == HOST_STACK_PM16_SEL || cur_ss == HOST_STACK_PM32_SEL);
+
+    if nested_on_host_stack {
+        // Nested on the locked PM stack: just push iret_frame targeting
+        // outer's CS:EIP at current ESP - frame_size. Hardware same-priv
+        // IRET unwinds inline, no kernel involvement.
+        let new_esp = host_stack_write_iret(
+            regs.sp32(), client_use32,
+            regs.ip32(), regs.code_seg(), handler_flags);
+        regs.frame.rsp = new_esp as u64;
+    } else {
+        // First entry: push a ModeSave (kernel-side save area) + plant
+        // an iret-to-SLOT_PM_IRET frame so the eventual handler IRET
+        // round-trips through the kernel for unwinding.
+        push_save(dos, regs);
+        let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
+        let cursor2 = host_stack_write_iret(
+            dos.pc.host_stack_sp, client_use32,
+            stub_eip, SPECIAL_STUB_SEL, handler_flags);
+        dos.pc.host_stack_sp = cursor2;
+
+        regs.ds = 0;
+        regs.es = 0;
+        regs.fs = 0;
+        regs.gs = 0;
+
+        let stk_sel = if client_use32 { HOST_STACK_PM32_SEL } else { HOST_STACK_PM16_SEL };
+        regs.frame.ss  = stk_sel as u64;
+        regs.frame.rsp = cursor2 as u64;
+    }
+
+    regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
+    regs.frame.cs  = sel as u64;
+    regs.frame.rip = off as u64;
+}
+
+/// Pop the ModeSave pushed by the outermost-relative PM-handler entry
+/// (`deliver_pm_irq` taking the cross-mode branch). Called from
+/// `pm_stub_dispatch` when SLOT_PM_IRET fires (client handler IRETed
+/// through our stub) and from `vector_stub_reflect` when the default
+/// stub catches an IRQ that has no PM handler installed.
+///
+/// At entry: hardware IRET advanced regs.ESP past the iret_frame, so
+/// regs.ESP now points at the ModeSave on host_stack. After restoring,
+/// `host_stack_sp` is bumped back up past both records.
+pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    debug_assert!(regs.stack_seg() == HOST_STACK_PM16_SEL ||
+                  regs.stack_seg() == HOST_STACK_PM32_SEL,
+                  "cross_mode_restore: SS not host_stack");
+
+    // Resync host_stack_sp from the user's post-iret cursor: hardware
+    // IRET advanced ESP past the iret frame onto the save's start.
+    dos.pc.host_stack_sp = regs.sp32();
+    let save = pop_save(dos);
+    save.restore(regs);
+
+    let (cs, eip, ss, esp, vm) =
+        (save.cs as u16, save.eip, save.ss as u16, save.esp,
+         save.eflags & machine::VM_FLAG != 0);
+    dos_trace!("[DPMI] IRQ RESTORE -> {:04X}:{:#x} SS:ESP={:04X}:{:#x} VM={}",
+        cs, eip, ss, esp, vm);
+
+    thread::KernelAction::Done
+}
+
+/// Push an IRET frame on the stack addressed by `regs.ss:regs.sp`, updating
+/// regs.sp. Frame width matches the *handler's* bitness — 12 bytes for a
+/// 32-bit handler (D=1), 6 bytes for 16-bit (D=0). This is the width the
+/// handler's `IRET` will use on its way back, so push and matching pop must
+/// agree on handler bitness, regardless of the client's overall size.
+fn push_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
+                   eip: u32, cs: u16, flags: u32) {
+    let ss = regs.frame.ss as u16;
+    let base = seg_base(ldt, ss);
+    let stack_is_32 = seg_is_32(ldt, ss);
+    let frame_size: u32 = if handler_is_32 { 12 } else { 6 };
+    // Frame width follows handler.D — what handler's IRET will pop.
+    // SP semantics follow SS.B — full ESP wraps within seg-limit on a
+    // 32-bit stack; SP wraps within 0x10000 with upper-ESP preserved on
+    // a 16-bit stack. The two bits are independent (see Intel SDM 6.12).
+    let sp_in = regs.sp32();
+    let sp = if stack_is_32 {
+        sp_in.wrapping_sub(frame_size)
+    } else {
+        let new_sp16 = (sp_in as u16).wrapping_sub(frame_size as u16);
+        (sp_in & !0xFFFF) | new_sp16 as u32
+    };
+    let eff_sp = if stack_is_32 { sp } else { sp & 0xFFFF };
+    let addr = base.wrapping_add(eff_sp);
+    if handler_is_32 {
+        unsafe {
+            let p = addr as *mut u32;
+            core::ptr::write_unaligned(p, eip);
+            core::ptr::write_unaligned(p.add(1), cs as u32);
+            core::ptr::write_unaligned(p.add(2), flags);
+        }
+    } else {
+        unsafe {
+            let p = addr as *mut u16;
+            core::ptr::write_unaligned(p, eip as u16);
+            core::ptr::write_unaligned(p.add(1), cs);
+            core::ptr::write_unaligned(p.add(2), flags as u16);
+        }
+    }
+    regs.set_sp32(sp);
+}
+
+/// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp.
+/// `handler_is_32` must match the width used at push time. Frame width
+/// follows handler.D; SP semantics follow SS.B (see `push_iret_frame`).
+fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u16, u32) {
+    let ss = regs.frame.ss as u16;
+    let base = seg_base(ldt, ss);
+    let stack_is_32 = seg_is_32(ldt, ss);
+    let frame_size: u32 = if handler_is_32 { 12 } else { 6 };
+    let sp_in = regs.sp32();
+    let eff_sp = if stack_is_32 { sp_in } else { sp_in & 0xFFFF };
+    let addr = base.wrapping_add(eff_sp);
+    let frame = if handler_is_32 {
+        unsafe {
+            let p = addr as *const u32;
+            let eip = core::ptr::read_unaligned(p);
+            let cs = core::ptr::read_unaligned(p.add(1)) as u16;
+            let flags = core::ptr::read_unaligned(p.add(2));
+            (eip, cs, flags)
+        }
+    } else {
+        unsafe {
+            let p = addr as *const u16;
+            let ip = core::ptr::read_unaligned(p) as u32;
+            let cs = core::ptr::read_unaligned(p.add(1));
+            let flags = core::ptr::read_unaligned(p.add(2)) as u32;
+            (ip, cs, flags)
+        }
+    };
+    let new_sp = if stack_is_32 {
+        sp_in.wrapping_add(frame_size)
+    } else {
+        let new_sp16 = (sp_in as u16).wrapping_add(frame_size as u16);
+        (sp_in & !0xFFFF) | new_sp16 as u32
+    };
+    regs.set_sp32(new_sp);
+    frame
+}
+
+/// Synthetic trap for an uninstalled PM vector. The CD 31 at
+/// `VECTOR_STUB:STUB_BASE+vec*2` traps here; we pop the IRET frame the
+/// delivery path pushed and decide what to do by inspecting its target:
+///
+///   - Target is our `SLOT_PM_RET_{16,32}` stub → this was the outermost
+///     host-snapshotted PM delivery (HW IRQ via `deliver_pm_irq` or PM
+///     soft INT via `deliver_pm_int`). Pop the snapshot via
+///     `cross_mode_restore`, which puts us back in the client's original
+///     mode, then reflect the INT to BIOS via `reflect_int_to_real_mode`
+///     uniformly (VM86 and PM clients alike — BIOS always runs on a
+///     kernel-owned RM frame allocated from host_stack).
+///
+///   - Target is anything else → the pushed frame carries an outer
+///     handler's CS:EIP, i.e. we're nested inside a still-live handler.
+///     Install the popped state in regs and reflect via the DPMI PM→RM
+///     path.
+pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let eip = regs.ip32();
+    let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
+    // HW IRQ vectors (timer 0x08, keyboard 0x09, etc.) fire on every tick —
+    // log only the soft-INT reflections (vec >= 0x10) by default.
+    if vector >= 0x10 {
+        dos_trace!("[DPMI] VECSTUB vec={:#04x} SS:ESP={:04x}:{:#x} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} DX={:04X} DI={:04X}",
+            vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
+            regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
+    }
+
+    // The frame width matches what `deliver_pm_irq`/`deliver_pm_int` pushed,
+    // which follows the client's bitness per DPMI 0.9 §10.6 (32-bit clients
+    // get 12-byte IRETD frames, 16-bit clients get 6-byte IRET frames).
+    // Non-DPMI threads default to 16-bit (host default-stub semantics).
+    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, client_use32);
+
+    let pm_iret_off = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
+    let is_outermost = ret_cs == SPECIAL_STUB_SEL && ret_eip == pm_iret_off;
+
+    if is_outermost {
+        let _ = (ret_eip, ret_cs, ret_flags);
+        // HW IRQ default-stub bridge: tail-replace into RM at the BIOS
+        // handler. The OUTER ModeSave from `deliver_pm_irq` stays on
+        // the locked stack untouched. We snapshot the dedicated RM
+        // stack, set up RM execution, and plant an iret frame that
+        // returns through SLOT_RM_IRET_FORWARD instead of
+        // SLOT_RM_IRET_REFLECT — the FORWARD handler synthesizes
+        // PM-at-SLOT_PM_IRET so the existing outer-save unwind path
+        // (cross_mode_restore) fires next. Net result: a single
+        // ModeSave through the entire HW IRQ flow.
+        push_rm_snapshot(dos);
+
+        let ivt_off = machine::read_u16(0, (vector as u32) * 4);
+        let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
+
+        regs.frame.ss = dos::rm_stack_seg() as u64;
+        regs.frame.rsp = rm_stack_top() as u64;
+
+        let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET_FORWARD);
+        let ret_seg: u16 = dos::STUB_SEG;
+        let ret_flags = regs.flags32() as u16;
+        machine::vm86_push(regs, ret_flags);
+        machine::vm86_push(regs, ret_seg);
+        machine::vm86_push(regs, ret_off);
+
+        regs.frame.cs = ivt_seg as u64;
+        regs.frame.rip = ivt_off as u64;
+        let flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
+            | machine::VM_FLAG
+            | machine::IOPL_VM86;
+        regs.frame.rflags = flags as u64;
+
+        dos_trace!("[DPMI] BRIDGE INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
+            vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32());
+
+        return thread::KernelAction::Done;
+    }
+
+    regs.set_ip32(ret_eip);
+    regs.set_cs32(ret_cs as u32);
+    regs.set_flags32(ret_flags);
+    reflect_int_to_real_mode(dos, regs, vector)
+}
+
+/// Dispatch INT 31h that came from the special-stub segment. Only host-
+/// initiated return trampolines and entry points live here, so the slot is
+/// always one of SLOT_EXCEPTION_RET / SLOT_PM_TO_REAL / SLOT_SAVE_RESTORE.
+/// Slot = (EIP - STUB_BASE - 2) / 2.
+pub(super) fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let eip = regs.ip32();
+    let stub_base = dos::STUB_BASE;
+    let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
+    dos_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
+
+    match slot {
+        dos::SLOT_EXCEPTION_RET => {
+            return dpmi::exception_return(dos, regs);
+        }
+        dos::SLOT_PM_TO_REAL => {
+            return dpmi::raw_switch_pm_to_real(dos, regs);
+        }
+        dos::SLOT_PM_IRET => {
+            let r = cross_mode_restore(dos, regs);
+            // PM-handler path for HW IRQ: client handler ran, IRETed
+            // through our stub, cross_mode_restore put us back at the
+            // interrupted client state. IRQ context is over.
+            crate::kernel::dos::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
+            return r;
+        }
+        dos::SLOT_SAVE_RESTORE => {
+            dpmi::save_restore_real_mode_state(dos, regs);
+
+            // Pop the far-call return address and resume caller. Frame size
+            // depends on the client's operand size: 16-bit CALL FAR pushed
+            // IP+CS as 4 bytes; 32-bit CALL FAR pushed EIP+CS as 8 bytes.
+            let dpmi = dos.dpmi.as_ref().unwrap();
+            let use32 = dpmi.client_use32;
+            let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
+            let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
+            let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
+            let (ret_eip, ret_cs, frame_size) = if use32 {
+                let eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
+                (eip, cs, 8u32)
+            } else {
+                let ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) } as u32;
+                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) } as u32;
+                (ip, cs, 4u32)
+            };
+            let new_sp = sp.wrapping_add(frame_size);
+            if ss_32 { regs.set_sp32(new_sp); }
+            else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
+            regs.set_ip32(ret_eip);
+            regs.set_cs32(ret_cs);
+            thread::KernelAction::Done
+        }
+        _ => panic!("pm_stub_dispatch: unhandled slot {:#04x}", slot),
+    }
+}
+
+/// Reflect a software INT from protected mode to real mode via the IVT.
+/// Used when a DPMI client executes `INT xx` and no PM handler is installed.
+/// Per DPMI 0.9 §2.4 / §3.2: EAX/EBX/ECX/EDX/ESI/EDI/EBP and flags are
+/// passed unaltered; segment registers are undefined in real mode. Any API
+/// that passes pointers via segments is the DOS extender's responsibility
+/// to translate via its own INT 21h hook — not the host's.
+pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
+    // Save client state, snapshot the dedicated RM stack onto the
+    // locked stack, then run BIOS on a fresh dedicated RM stack. BIOS
+    // runs on a kernel-owned RM stack — never on the client's own VM86
+    // stack — so a HW IRQ landing during a sensitive moment in the
+    // client (e.g. just after exec_return) can't trample the client's
+    // saved registers / return address. The snapshot+restore pair on
+    // the locked stack provides reentrance for nested kernel-orchestrated
+    // RM excursions. Works for VM86 and PM clients alike — no DPMI
+    // session required.
+    push_save(dos, regs);
+    push_rm_snapshot(dos);
+
+    // Get IVT entry
+    let ivt_off = machine::read_u16(0, (vector as u32) * 4);
+    let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
+
+    regs.frame.ss = dos::rm_stack_seg() as u64;
+    regs.frame.rsp = rm_stack_top() as u64;
+
+    // Push RM IRET frame targeting SLOT_RM_IRET_REFLECT.
+    // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
+    // own INT n in real mode would push: FLAGS / CS / IP. FLAGS is the
+    // client's flags *unmodified* — that's what real-mode INT writes,
+    // and it's what BIOS IRET pops back. The handler runs with IF=0
+    // because we set it on `regs.frame.rflags` below, not by mutating
+    // the on-stack frame. Pushing 0 (or modifying flags here) would let
+    // `rm_iret_reflect`'s status-flag passthrough (CF/ZF/DF/...) snapshot
+    // wrong values and silently corrupt the client across the IRQ.
+    let ret_flags = regs.flags32() as u16;
+    let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET_REFLECT);
+    let ret_seg: u16 = dos::STUB_SEG;
+    machine::vm86_push(regs, ret_flags);
+    machine::vm86_push(regs, ret_seg);
+    machine::vm86_push(regs, ret_off);
+
+    // Enter the BIOS handler in VM86 with IF cleared — matches what the
+    // CPU's own INT n does in real mode (preserves status flags, just
+    // clears IF). VIF is owned by the arch layer (VME virtualization),
+    // not us. IOPL=1 keeps cli/sti virtualized.
+    regs.frame.cs = ivt_seg as u64;
+    regs.frame.rip = ivt_off as u64;
+    let flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
+        | machine::VM_FLAG
+        | machine::IOPL_VM86;
+    regs.frame.rflags = flags as u64;
+
+    // Per DPMI, the host must not translate PM selectors into RM paragraphs
+    // when reflecting a software interrupt. The extender/client is responsible
+    // for any DOS-call marshaling that requires real-mode segment values.
+
+    dos_trace!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X} DS={:04X} ES={:04X}",
+        vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), regs.rax as u16,
+        regs.ds as u16, regs.es as u16);
+
+    thread::KernelAction::Done
+}
+
+/// SLOT_RM_IRET_REFLECT dispatch — implicit IVT-reflection unwind.
+/// Called when VM86 IRETs from a BIOS handler we entered via
+/// `reflect_int_to_real_mode`. Pops the `ModeSave` and restores
+/// CS/EIP/SS/ESP/EFLAGS/segregs. GP regs are *not* in `ModeSave` — per
+/// DPMI 0.9 §2.4 they round-trip through real mode (BIOS modifies them,
+/// PM caller sees the modified values). Then ORs IF=1 into EFLAGS per
+/// the spec's "default IRQ stub must STI before IRET" rule
+/// (`feedback_dpmi_default_stub_sti`).
+pub(super) fn rm_iret_reflect(dos: &mut thread::DosState, regs: &mut Regs) {
+    // Snapshot RM arithmetic flags before restore overwrites EFLAGS.
+    // VM/IOPL/IF/TF/RF/NT must come from the saved PM state — copying
+    // RM EFLAGS verbatim would set VM=1 and drop us back into VM86.
+    const STATUS_MASK: u32 = 0x0CD5; // CF,PF,AF,ZF,SF,OF,DF
+    let rm_arith = regs.flags32() & STATUS_MASK;
+
+    // Restore the dedicated RM stack from its snapshot on the locked
+    // stack, then pop the save and restore regs to the original PM
+    // (or VM86) caller state.
+    pop_rm_snapshot(dos);
+    pop_save(dos).restore(regs);
+
+    regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
+    regs.frame.rflags |= machine::IF_FLAG as u64;
+
+    dos_trace!("[DPMI] RM_IRET_REFLECT -> CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x}",
+        regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+}
+
+/// SLOT_RM_IRET_FORWARD dispatch — HW-IRQ default-stub bridge return.
+///
+/// Called when BIOS IRETs in RM after the kernel set up an RM excursion
+/// via `vector_stub_reflect`'s outermost branch. The locked stack carries
+/// the *outer* `ModeSave` from `deliver_pm_irq`'s cross-mode entry, the
+/// dead iret frame deliver_pm_irq planted, and the rm_stack snapshot
+/// pushed by `vector_stub_reflect`. We unwind all three synchronously
+/// here — net result for the HW IRQ default-stub flow: a single
+/// ModeSave, popped here.
+///
+/// We can't route this back through SLOT_PM_IRET via a synthesized iret
+/// frame: between this fn returning and the user's CD 31 trap on
+/// SLOT_PM_IRET, `raise_pending` runs at the next loop iteration and
+/// will see `regs.SS == HOST_STACK_PM*_SEL`, take its
+/// nested-on-host-stack branch, plant a new iret frame, and the new
+/// vector_stub_reflect will misclassify the synthesized SLOT_PM_IRET
+/// target as outermost — pushing a second rm_snapshot atop the live
+/// outer save and corrupting the chain.
+pub(super) fn rm_iret_forward_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
+    // Snapshot RM arithmetic flags before restore overwrites EFLAGS
+    // (BIOS may have set CF/ZF/etc that the client expects preserved).
+    const STATUS_MASK: u32 = 0x0CD5;
+    let rm_arith = regs.flags32() & STATUS_MASK;
+
+    pop_rm_snapshot(dos);
+
+    // host_stack_sp now points at the iret frame deliver_pm_irq planted;
+    // those bytes are logically dead (the user consumed the iret with
+    // the hardware iret that took them into vector_stub_reflect).
+    // Advance past them so pop_save reads the outer ModeSave.
+    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    let iret_size: u32 = if client_use32 { 12 } else { 6 };
+    dos.pc.host_stack_sp += iret_size;
+
+    pop_save(dos).restore(regs);
+
+    // Pass through BIOS's status-flag updates and force IF=1
+    // (default-stub STI rule the host owes the client per DPMI 0.9).
+    regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
+    regs.frame.rflags |= machine::IF_FLAG as u64;
+
+    // HW-IRQ context ends here (parallels SLOT_PM_IRET → cross_mode_restore).
+    crate::kernel::dos::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
+
+    dos_trace!("[DPMI] RM_IRET_FORWARD -> CS:EIP={:04x}:{:#x} SS:ESP={:04x}:{:#x}",
+        regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+}
+
+/// SLOT_RM_IRET_CALL dispatch — explicit PM→RM call unwind (0x0300/01/02
+/// and `callback_entry`). Pops the `CallStubFrame`, writes current RM regs
+/// (the post-call values) into the RmCallStruct at `rm_struct_addr`, then
+/// restores the saved GP regs and pops the `ModeSave`. Restoration order
+/// is critical: writeback uses *current* (post-RM) regs, so it must run
+/// before `restore_gp` overwrites them.
+pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
+    let stub = host_stack_read_call_args(dos.pc.host_stack_sp);
+    dos.pc.host_stack_sp += CALL_STUB_SIZE;
+    // Restore the dedicated RM stack iff this excursion ran on it
+    // (the recipe recorded the choice on push). User-supplied SS:SP
+    // means BIOS pushed onto the user's stack; our dedicated buffer
+    // was never touched, no snapshot to restore.
+    if stub.used_dedicated_rm != 0 {
+        pop_rm_snapshot(dos);
+    }
+    let save = pop_save(dos);
+
+    // Writeback current RM regs into RmCallStruct so the PM caller sees
+    // results. Must happen *before* GP-restore overwrites regs.
+    let rm_struct_addr = { let f = stub; f.rm_struct_addr };
+    let rm_struct = RmCallStruct {
+        edi: regs.rdi as u32,
+        esi: regs.rsi as u32,
+        ebp: regs.rbp as u32,
+        _reserved: 0,
+        ebx: regs.rbx as u32,
+        edx: regs.rdx as u32,
+        ecx: regs.rcx as u32,
+        eax: regs.rax as u32,
+        flags: regs.flags32() as u16,
+        es: regs.es as u16,
+        ds: regs.ds as u16,
+        fs: regs.fs as u16,
+        gs: regs.gs as u16,
+        ip: regs.ip32() as u16,
+        cs: regs.code_seg(),
+        sp: regs.sp32() as u16,
+        ss: regs.stack_seg(),
+    };
+    unsafe { *(rm_struct_addr as *mut RmCallStruct) = rm_struct; }
+
+    stub.restore_gp(regs);
+    save.restore(regs);
+
+    dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+        regs.rax as u16, regs.flags32() & 1,
+        regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
+
+}
+

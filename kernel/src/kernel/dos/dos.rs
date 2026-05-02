@@ -19,7 +19,7 @@ use super::{
     dos_reset_blocks, dos_alloc_block, dos_free_block, dos_resize_block,
     DOS_TRACE_RT,
 };
-use super::{dpmi, dfs, machine, xms};
+use super::{dpmi, dfs, machine, mode_transitions, xms};
 use super::ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};
 use super::xms::xms_dispatch;
 use super::dos_trace;
@@ -124,7 +124,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
         SLOT_RM_IRET_REFLECT => {
             // Implicit reflection unwind: pop ModeSave, propagate low 32
             // bits of GP regs PM→RM (§2.4), OR IF=1 (default-stub spec).
-            dpmi::rm_iret_reflect(dos, regs);
+            mode_transitions::rm_iret_reflect(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RM_IRET_FORWARD => {
@@ -132,13 +132,13 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             // restore the dedicated RM stack snapshot, synthesize regs to
             // PM-at-SLOT_PM_IRET so the natural CD-31 trap on SLOT_PM_IRET
             // unwinds the outer ModeSave next.
-            dpmi::rm_iret_forward_to_pm(dos, regs);
+            mode_transitions::rm_iret_forward_to_pm(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RM_IRET_CALL => {
             // Explicit PM→RM call unwind: pop rm_struct_addr stub-arg,
             // write current RM regs back to RmCallStruct, pop ModeSave.
-            dpmi::rm_iret_call(dos, regs);
+            mode_transitions::rm_iret_call(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RAW_REAL_TO_PM => {
@@ -1702,7 +1702,7 @@ fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     regs.rsi = m.saved_rsi;
     regs.rdi = m.saved_rdi;
 
-    super::dpmi::rm_iret_reflect(dos, regs);
+    super::mode_transitions::rm_iret_reflect(dos, regs);
 }
 
 /// Open a DOS program file by literal name. No extension probing, no

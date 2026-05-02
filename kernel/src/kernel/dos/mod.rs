@@ -308,8 +308,8 @@ fn linear(_dos: &thread::DosState, _regs: &Regs, seg: u16, off: u32) -> u32 {
 /// |------|-------------------|-------------------------------|-------------------------------------|
 /// | VM86 | `STUB_SEG`        | `dos::rm_stub_dispatch`       | RM IVT redirects + far-call entries |
 /// | VM86 | else              | `dos::synth_dispatch`         | Synth INT 31h (AH-dispatched)       |
-/// | PM   | `VECTOR_STUB`     | `dpmi::vector_stub_reflect`   | Per-vector default reflection       |
-/// | PM   | `SPECIAL_STUB`    | `dpmi::pm_stub_dispatch`      | PM host-stub return trampolines     |
+/// | PM   | `VECTOR_STUB`     | `mode_transitions::vector_stub_reflect`   | Per-vector default reflection       |
+/// | PM   | `SPECIAL_STUB`    | `mode_transitions::pm_stub_dispatch`      | PM host-stub return trampolines     |
 /// | PM   | client selector   | `dpmi::dpmi_api`              | DPMI services (by AX)               |
 ///
 /// Lives at the personality root because INT 31h spans both submodules
@@ -325,8 +325,8 @@ pub fn syscall(
     match (mode, cs) {
         (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
-        (_, dpmi::VECTOR_STUB_SEL)              => dpmi::vector_stub_reflect(dos, regs),
-        (_, dpmi::SPECIAL_STUB_SEL)             => dpmi::pm_stub_dispatch(dos, regs),
+        (_, mode_transitions::VECTOR_STUB_SEL)              => mode_transitions::vector_stub_reflect(dos, regs),
+        (_, mode_transitions::SPECIAL_STUB_SEL)             => mode_transitions::pm_stub_dispatch(dos, regs),
         _                                       => dpmi::dpmi_api(dos, regs),
     }
 }
@@ -629,7 +629,7 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
     IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
-    dpmi::deliver_pm_irq(dos, regs, vec);
+    mode_transitions::deliver_pm_irq(dos, regs, vec);
 }
 
 // ── Block-allocator helpers used by INT 21h handlers in `dos.rs` ────────
