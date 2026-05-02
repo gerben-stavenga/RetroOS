@@ -85,6 +85,7 @@ mod machine;
 mod xms;
 mod ems;
 mod dos;
+mod locked_stack;
 
 // VgaState is hardware-shaped (4 planes + register snapshot), not DOS policy.
 // Re-export so the Linux personality can hold its own console snapshot — DOS

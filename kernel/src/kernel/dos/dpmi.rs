@@ -107,49 +107,11 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 // outer handler's CS:EIP and stack already hold the chain, so a plain
 // hardware IRET back to outer is sufficient.
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(super) struct ModeSave {
-    pub cs:     u32,
-    pub eip:    u32,
-    pub eflags: u32,
-    pub ss:     u32,
-    pub esp:    u32,
-    pub ds:     u16,
-    pub es:     u16,
-    pub fs:     u16,
-    pub gs:     u16,
-}
-
-const MODE_SAVE_SIZE: u32 = core::mem::size_of::<ModeSave>() as u32;
-
-impl ModeSave {
-    fn capture(regs: &Regs) -> Self {
-        Self {
-            cs:     regs.code_seg() as u32,
-            eip:    regs.ip32(),
-            eflags: regs.flags32(),
-            ss:     regs.stack_seg() as u32,
-            esp:    regs.sp32(),
-            ds:     regs.ds as u16,
-            es:     regs.es as u16,
-            fs:     regs.fs as u16,
-            gs:     regs.gs as u16,
-        }
-    }
-
-    fn restore(&self, regs: &mut Regs) {
-        regs.frame.cs    = self.cs as u64;
-        regs.frame.rip   = self.eip as u64;
-        regs.set_flags32(self.eflags);
-        regs.frame.ss    = self.ss as u64;
-        regs.frame.rsp   = self.esp as u64;
-        regs.ds          = self.ds as u64;
-        regs.es          = self.es as u64;
-        regs.fs          = self.fs as u64;
-        regs.gs          = self.gs as u64;
-    }
-}
+// `ModeSave` (and `MODE_SAVE_SIZE`) are owned by `super::locked_stack` —
+// the eventual home of the foundation primitives that read/write them.
+// Re-imported here while in-flight DPMI recipes still operate on the
+// raw `host_stack_write_save` / `host_stack_read_save` helpers below.
+use super::locked_stack::{ModeSave, MODE_SAVE_SIZE};
 
 /// Stub-frame for `SLOT_RM_IRET_CALL` — pushed above the `ModeSave` by
 /// every explicit PM→RM-call entry (`0300/01/02` and `callback_entry`).
