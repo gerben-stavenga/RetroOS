@@ -597,6 +597,8 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
 
         crate::kernel::startup::arch_user_clean();
         thread.kernel.state = ThreadState::Zombie;
+        crate::dbg_println!("[mem] exit tid={} code={} free_pages={}",
+            tid, exit_code, crate::arch::free_page_count());
 
         // Hand focus back to the parent that spawned us — it's the
         // natural caller of wait4. Covers both "parent was Blocked on
@@ -662,31 +664,22 @@ pub fn waitpid(current_tid: usize, pid: i32) -> (i32, i32) {
     r
 }
 
-/// Signal thread (e.g., on segfault).
-/// Returns Some(idx) if a context switch is needed (current thread killed).
-pub fn signal_thread(thread: &mut Thread, current_tid: usize, fault_address: usize) -> Option<usize> {
+/// Print a SEGV diagnostic for a thread. Halts forever if the faulting
+/// thread is init (pid 0) — no parent to escalate to. The caller is
+/// expected to dispatch `KernelAction::Exit(-11)` against the faulting
+/// `tid` so `exit_thread` does the regular cleanup (parent wake,
+/// `last_child_exit_status`, `arch_user_clean`, personality `on_exit`).
+pub fn signal_thread(thread: &Thread, fault_address: usize) {
     if thread.kernel.pid == 0 {
         println!("\x1b[91mSEGV in init at {:#x}\x1b[0m", fault_address);
         loop { core::hint::spin_loop(); }
-    } else {
-        println!("SEGV in thread {} at {:#x} rip={:#x} cs={:#x} rsp={:#x} ss={:#x} fl={:#x} rax={:#x} rbx={:#x} rcx={:#x}",
-            thread.kernel.tid, fault_address,
-            thread.kernel.cpu_state.frame.rip, thread.kernel.cpu_state.frame.cs,
-            thread.kernel.cpu_state.frame.rsp, thread.kernel.cpu_state.frame.ss,
-            thread.kernel.cpu_state.frame.rflags,
-            thread.kernel.cpu_state.rax, thread.kernel.cpu_state.rbx, thread.kernel.cpu_state.rcx);
-
-        if current_tid == thread.kernel.tid as usize {
-            crate::kernel::startup::arch_user_clean();
-            thread.kernel.state = ThreadState::Zombie;
-            thread.kernel.exit_code = -11;
-            thread.kernel.symbols = None;
-            Some(schedule(current_tid).unwrap_or(0))
-        } else {
-            thread.kernel.state = ThreadState::Zombie;
-            None
-        }
     }
+    println!("SEGV in thread {} at {:#x} rip={:#x} cs={:#x} rsp={:#x} ss={:#x} fl={:#x} rax={:#x} rbx={:#x} rcx={:#x}",
+        thread.kernel.tid, fault_address,
+        thread.kernel.cpu_state.frame.rip, thread.kernel.cpu_state.frame.cs,
+        thread.kernel.cpu_state.frame.rsp, thread.kernel.cpu_state.frame.ss,
+        thread.kernel.cpu_state.frame.rflags,
+        thread.kernel.cpu_state.rax, thread.kernel.cpu_state.rbx, thread.kernel.cpu_state.rcx);
 }
 
 /// Initialize threading system with init thread

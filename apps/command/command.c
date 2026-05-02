@@ -44,33 +44,39 @@ static void trace(int on) {
     int86(0x31, &r, &r);
 }
 
-/* ----- LOADFIX list -----
+/* ----- per-program launch overrides (LOADFIX.CFG) -----
  *
- * EXEPACK-compressed binaries (Borland CHESS, plenty of early-90s tools)
- * have a relocator bug that crashes when loaded below segment 0x1000.
- * Real DOS shipped LOADFIX.COM which allocated ~64 KB low, pushing the
- * program above 0x1000. RetroOS has no DOS resident eating low memory,
- * so every program loads below 0x1000 by default and EXEPACK trips on
- * "Packed file is corrupt".
+ * Two kinds of override are wired through here:
  *
- * loadfix.cfg lists basenames (e.g. "CHESS.EXE") that need the
- * push-up. The kernel knows nothing about LOADFIX. We implement it
- * entirely here:
- *   1) interactive COMMAND.COM sees is_loadfix(name) and fork-execs
- *      itself with cmdline "/L <name> [args]" (multitasking preserved);
- *   2) the trampoline child takes the /L branch in main() and EXECs
- *      the target in-process via INT 21h AH=4B AL=00.
+ *   loadfix: EXEPACK-compressed binaries (Borland CHESS, plenty of
+ *     early-90s tools) have a relocator bug that crashes when loaded
+ *     below segment 0x1000. Real DOS shipped LOADFIX.COM which allocated
+ *     ~64 KB low, pushing the program above 0x1000. Implemented here as
+ *     a trampoline: parent forks COMMAND.COM with "/L <name> [args]";
+ *     the child takes the /L branch and EXECs the program in-process via
+ *     INT 21h AH=4B AL=00. The trampoline itself is the push-up -- our
+ *     COMMAND.COM is a tiny-model .COM and claims a full 64 KB block,
+ *     exactly the shift real LOADFIX provided.
  *
- * The trampoline alone is the push-up: our COMMAND.COM is a tiny-model
- * .COM and so claims a full 64 KB block, exactly the shift real LOADFIX
- * provided. The EXEC'd child loads at PSP > 0x1000 and EXEPACK is happy.
- * No extra dummy alloc -- adding one would steal headroom from programs
- * with large minalloc (CHESS.EXE asks for ~440 KB) and break the load. */
+ *   dos32a:  DOS/4GW-bound games that don't run cleanly under our DPMI
+ *     host. Wrapped by spawning C:\DOS32A.EXE with "<prog> [args]" as
+ *     command tail; DOS/32A is a near-drop-in DOS/4GW replacement that
+ *     follows DPMI 0.9 more strictly.
+ *
+ * LOADFIX.CFG format: BASENAME [keyword [keyword...]]. Keywords:
+ *   loadfix (default if none), dos32a. Combinable.
+ *
+ * The kernel knows nothing about either override -- both are implemented
+ * entirely in this file. */
 
 #define LF_MAX_NAMES 32
 #define LF_NAME_LEN  16
-static char loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
-static int  loadfix_count = 0;
+#define LF_F_LOADFIX 0x01
+#define LF_F_DOS32A  0x02
+
+static char          loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
+static unsigned char loadfix_flags[LF_MAX_NAMES];
+static int           loadfix_count = 0;
 
 /* Last component of a DOS path: skip past any '\\', '/', or ':'. */
 static const char *basename_of(const char *path) {
@@ -85,26 +91,50 @@ static int has_ext(const char *name, const char *ext) {
     return dot && stricmp(dot, ext) == 0;
 }
 
+/* Parse a flag token; 0 = unrecognised. */
+static unsigned char parse_flag(const char *tok) {
+    if (stricmp(tok, "loadfix") == 0) return LF_F_LOADFIX;
+    if (stricmp(tok, "dos32a")  == 0) return LF_F_DOS32A;
+    return 0;
+}
+
 static void load_loadfix_cfg(void) {
     FILE *f;
-    char line[64];
+    char line[80];
     f = fopen("C:\\LOADFIX.CFG", "r");
     if (!f) return;
     while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
         char *p = line + strspn(line, " \t");
+        char *name, *tok;
+        unsigned char flags = 0;
         if (*p == 0 || *p == ';' || *p == '#' || *p == '\r' || *p == '\n') continue;
-        p[strcspn(p, " \t\r\n")] = 0;
-        if (strlen(p) == 0 || strlen(p) >= LF_NAME_LEN) continue;
-        strcpy(loadfix_names[loadfix_count++], p);
+        /* Strip CR/LF terminator but leave inline whitespace for tokenising. */
+        p[strcspn(p, "\r\n")] = 0;
+        name = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) { *p++ = 0; }
+        if (strlen(name) == 0 || strlen(name) >= LF_NAME_LEN) continue;
+        for (;;) {
+            p += strspn(p, " \t");
+            if (*p == 0) break;
+            tok = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = 0;
+            flags |= parse_flag(tok);
+        }
+        if (flags == 0) flags = LF_F_LOADFIX;   /* legacy default */
+        strcpy(loadfix_names[loadfix_count], name);
+        loadfix_flags[loadfix_count] = flags;
+        loadfix_count++;
     }
     fclose(f);
 }
 
-static int is_loadfix(const char *name) {
+static unsigned char lookup_flags(const char *name) {
     const char *base = basename_of(name);
     int i;
     for (i = 0; i < loadfix_count; i++) {
-        if (stricmp(base, loadfix_names[i]) == 0) return 1;
+        if (stricmp(base, loadfix_names[i]) == 0) return loadfix_flags[i];
     }
     return 0;
 }
@@ -324,14 +354,27 @@ static int run_loadfix_via_trampoline(const char *prog, const char *args, int po
     return run_external_raw("C:\\COMMAND.COM", tail, poll_kbd);
 }
 
+/* DOS/32A wrapper: launch C:\DOS32A.EXE with the original program and
+ * args appended as command tail. DOS/32A loads the target itself and
+ * supplies a stricter DPMI 0.9 environment than DOS/4GW's embedded one. */
+static int run_via_dos32a(const char *prog, const char *args, int poll_kbd) {
+    static char tail[200];
+    if (args && *args) sprintf(tail, "%s %s", prog, args);
+    else               strcpy(tail, prog);
+    return run_external_raw("C:\\DOS32A.EXE", tail, poll_kbd);
+}
+
 static int run_external(const char *name, const char *args, int poll_kbd) {
     char resolved[80];
+    unsigned char flags;
     if (!resolve_program(name, resolved)) {
         puts("Bad command or file name");
         return 255;
     }
     if (has_ext(resolved, ".BAT")) return run_bat_file(resolved);
-    if (is_loadfix(resolved)) return run_loadfix_via_trampoline(resolved, args, poll_kbd);
+    flags = lookup_flags(resolved);
+    if (flags & LF_F_DOS32A)  return run_via_dos32a(resolved, args, poll_kbd);
+    if (flags & LF_F_LOADFIX) return run_loadfix_via_trampoline(resolved, args, poll_kbd);
     return run_external_raw(resolved, args, poll_kbd);
 }
 

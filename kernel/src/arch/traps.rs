@@ -443,14 +443,16 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 /// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
 /// are handled inline by arch before bubbling.
 fn isr_handler_ring3(regs: &mut Regs) {
-    use crate::arch::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult};
+    use crate::arch::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult, TF_VIRTUAL_IF_STEPPING};
     use crate::UserMode;
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
     let kevent: KE = match int_num {
         // #DB: only armed by `step_virtual_if` to single-step PM regions
         // where virtual IF is 0. The hardware just executed one insn under
-        // TF; decide what to do about the NEXT one.
+        // TF; decide what to do about the NEXT one. When TF stepping is
+        // disabled, defensively clear TF and resume — nothing in the
+        // kernel arms it, but a stale bit in client flags would loop.
         1 => {
             use core::sync::atomic::Ordering;
             let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
@@ -462,15 +464,25 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 regs.set_flag32(1 << 8); // keep TF on
                 return;
             }
-            let _ = step_virtual_if(regs);
+            if TF_VIRTUAL_IF_STEPPING {
+                let _ = step_virtual_if(regs);
+            } else {
+                regs.clear_flag32(1 << 8);
+            }
             return;
         }
         13 => match monitor(regs) {
             MonitorResult::Resume => {
                 // If the monitor just cleared virtual IF in PM (e.g. a CLI),
                 // kick off the single-step interpreter so POPF/IRET get
-                // intercepted before hardware runs them.
-                if regs.mode() != UserMode::VM86 && regs.flags32() & (1 << 9) == 0 {
+                // intercepted before hardware runs them. Skipped when TF
+                // stepping is disabled — DPMI 0.9 §2.13 says POPF/IRET
+                // aren't required to affect virtual IF, so spec-conforming
+                // clients use CLI/STI/AX=0900-0902 only.
+                if TF_VIRTUAL_IF_STEPPING
+                    && regs.mode() != UserMode::VM86
+                    && regs.flags32() & (1 << 9) == 0
+                {
                     let _ = step_virtual_if(regs);
                 }
                 if regs.flags32() & ((1 << 9) | (1 << 20)) != (1 << 9) | (1 << 20) {

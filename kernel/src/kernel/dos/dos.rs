@@ -17,7 +17,7 @@ use super::{
     ExecParent,
     linear, snapshot_env,
     dos_reset_blocks, dos_alloc_block, dos_free_block, dos_resize_block,
-    DOS_TRACE_RT, DOS_TRACE_HW_RT,
+    DOS_TRACE_RT,
 };
 use super::{dpmi, dfs, machine, xms};
 use super::ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};

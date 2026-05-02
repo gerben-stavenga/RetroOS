@@ -804,7 +804,7 @@ pub fn dpmi_soft_int(_kt: &mut thread::KernelThread, dos: &mut thread::DosState,
         if dos::PM_STEP_BUDGET.load(Ordering::Relaxed) == 0 {
             dos::PM_STEP_BUDGET.store(65000, Ordering::Relaxed);
             regs.set_flag32(1 << 8); // TF on entry to hook
-            dos_trace!(force "[STEP] armed 65000 steps at INT 21 AX=4300 hook entry");
+            dos_trace!("[STEP] armed 65000 steps at INT 21 AX=4300 hook entry");
         }
     }
     thread::KernelAction::Done
@@ -912,7 +912,7 @@ fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
     let (cs, eip, ss, esp, vm) =
         (save.cs as u16, save.eip, save.ss as u16, save.esp,
          save.eflags & machine::VM_FLAG != 0);
-    dos_trace!(force "[DPMI] IRQ RESTORE -> {:04X}:{:#x} SS:ESP={:04X}:{:#x} VM={}",
+    dos_trace!("[DPMI] IRQ RESTORE -> {:04X}:{:#x} SS:ESP={:04X}:{:#x} VM={}",
         cs, eip, ss, esp, vm);
 
     thread::KernelAction::Done
@@ -1073,7 +1073,12 @@ pub(super) fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> t
             return raw_switch_pm_to_real(dos, regs);
         }
         dos::SLOT_PM_IRET => {
-            return cross_mode_restore(dos, regs);
+            let r = cross_mode_restore(dos, regs);
+            // PM-handler path for HW IRQ: client handler ran, IRETed
+            // through our stub, cross_mode_restore put us back at the
+            // interrupted client state. IRQ context is over.
+            super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
+            return r;
         }
         dos::SLOT_SAVE_RESTORE => {
             save_restore_real_mode_state(dos, regs);
@@ -1137,7 +1142,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             if !ONCE.swap(true, Ordering::Relaxed) {
                 dos::PM_STEP_BUDGET.store(200_000, Ordering::Relaxed);
                 regs.set_flag32(1 << 8); // TF on return to client
-                dos_trace!(force "[STEP] armed 200000 steps at first INT 31 (PM init)");
+                dos_trace!("[STEP] armed 200000 steps at first INT 31 (PM init)");
             }
         }
     }

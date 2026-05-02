@@ -173,6 +173,17 @@ const OF_FLAG:    u32 = 1 << 11;
 /// Flags VM86/PM user code cannot modify via POPF/IRET (IOPL, VM).
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
 
+/// When true, after a PM client clears virtual IF (via `CLI`), arm TF=1
+/// and walk the instruction stream so POPF/IRET can be intercepted. Per
+/// DPMI 0.9 §2.13 ("Memory access through PUSHF and POPF and the IRETx
+/// instruction may not actually access this flag"), spec-conforming
+/// clients use only CLI/STI and AX=0900-0902 to manipulate virtual IF,
+/// so TF stepping is belt-and-braces for non-conforming clients and
+/// extremely expensive (one #DB per instruction inside any CLI region).
+/// Flip to `false` to skip TF stepping; flip to `true` to restore the
+/// pre-instrumentation behaviour for A/B comparison.
+pub const TF_VIRTUAL_IF_STEPPING: bool = false;
+
 // =============================================================================
 // Segment views
 // =============================================================================

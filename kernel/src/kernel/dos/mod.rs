@@ -15,12 +15,6 @@
 
 extern crate alloc;
 
-/// Trace DOS/DPMI calls when enabled.
-/// Compile-time master kill switch; constant-fold removes all trace calls
-/// when false.
-const DOS_TRACE: bool = true;
-const DOS_TRACE_HW_IRG: bool = false;
-
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
 /// Lets COMMAND.COM bracket a single exec so the log only captures that
 /// child program, not surrounding shell/launcher noise. Default OFF so
@@ -28,12 +22,8 @@ const DOS_TRACE_HW_IRG: bool = false;
 static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Independent gate for hardware-IRQ-vector trace lines (timer 0x08, key 0x09,
-/// etc). Default OFF so a noisy timer tick doesn't drown the per-call DPMI
-/// trace. No user-visible toggle yet -- flip the default here when debugging
-/// HW IRQ paths. Independent of DOS_TRACE_RT: general trace can be on without
-/// HW noise.
-pub(crate) static DOS_TRACE_HW_RT: core::sync::atomic::AtomicBool =
+/// Track whether we're currently running in a hardware IRQ context.
+pub(crate) static IN_HW_IRQ_CONTEXT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Single-step tracing budget. Armed by specific DPMI handlers to watch the
@@ -74,14 +64,12 @@ pub(crate) fn pm_step_log(regs: &crate::Regs) {
 /// nothing in the binary.
 #[inline]
 fn should_trace() -> bool {
-    DOS_TRACE && DOS_TRACE_RT.load(core::sync::atomic::Ordering::Relaxed)
+    DOS_TRACE_RT.load(core::sync::atomic::Ordering::Relaxed) && !IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 macro_rules! dos_trace {
     (force $($arg:tt)*) => {
-        if crate::kernel::dos::DOS_TRACE_HW_RT.load(core::sync::atomic::Ordering::Relaxed) {
-            $crate::dbg_println!($($arg)*);
-        }
+        $crate::dbg_println!($($arg)*);
     };
     ($($arg:tt)*) => {
         if crate::kernel::dos::should_trace() {
@@ -637,7 +625,7 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 /// frame allocated from host_stack, never on the client's own stack.
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
-    DOS_TRACE_HW_RT.store(false, core::sync::atomic::Ordering::Relaxed);
+    IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
     dpmi::deliver_pm_irq(dos, regs, vec);
 }
 

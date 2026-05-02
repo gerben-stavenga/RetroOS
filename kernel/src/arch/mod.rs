@@ -42,3 +42,9 @@ pub fn halt_forever() -> ! {
 pub use x86::{inb, outb, inw, outw};
 pub use x86::{FxState, clean_fx_template};
 pub use irq::{get_ticks, take_pending_ticks, drain};
+
+/// Physical free-page count, for diagnostic logging. Walks PAGE_REFS;
+/// O(MAX_PAGES) but small (~64 KB scan) and only called from instrumentation.
+pub fn free_page_count() -> usize {
+    phys_mm::free_page_count()
+}

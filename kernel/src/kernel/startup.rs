@@ -215,8 +215,27 @@ fn event_loop(first_tid: usize) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut tid = first_tid;
 
+    // Page-allocator instrumentation: every MEM_DUMP_PERIOD iterations,
+    // log free physical pages and the running low-water mark. Watch the
+    // line for monotonic decrease to find leaks. Print to debug serial
+    // only — does not clobber user VGA.
+    const MEM_DUMP_PERIOD: u64 = 1000;
+    let mut event_counter: u64 = 0;
+    let mut min_free: usize = crate::arch::free_page_count();
+    let mut last_free: usize = min_free;
+    crate::dbg_println!("[mem] start free={}", min_free);
+
     // REGS already set up by startup, page tables correct from boot
     loop {
+        event_counter = event_counter.wrapping_add(1);
+        if event_counter % MEM_DUMP_PERIOD == 0 {
+            let free = crate::arch::free_page_count();
+            if free < min_free { min_free = free; }
+            let delta = (free as i64) - (last_free as i64);
+            crate::dbg_println!("[mem] iter={} free={} delta={} min={}",
+                event_counter, free, delta, min_free);
+            last_free = free;
+        }
         crate::kernel::stacktrace::set_debug_tid(tid);
         let regs = unsafe { &mut *(&raw mut REGS) };
 
@@ -327,15 +346,15 @@ fn event_loop(first_tid: usize) {
         let regs = unsafe { &mut *(&raw mut REGS) };
 
         // PageFault is handled at the loop level because `signal_thread`
-        // needs the full `&mut Thread`. Everything else dispatches through
-        // the personality's `handle_event`.
+        // needs the full `&Thread`. Everything else dispatches through
+        // the personality's `handle_event`. The `Exit(-11)` below runs
+        // against the faulting `tid` so `exit_thread` does the standard
+        // cleanup (parent wake, last_child_exit_status, arch_user_clean,
+        // on_exit) — exactly what a normal program exit does.
         let action = if let crate::arch::monitor::KernelEvent::PageFault { addr } = kevent {
             let rip = regs.frame.rip;
             crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, addr, regs.err_code);
-            if let Some(next) = thread::signal_thread(thread, tid, addr as usize) {
-                tid = next;
-                if tid == 0 { return; }
-            }
+            thread::signal_thread(thread, addr as usize);
             thread::KernelAction::Exit(-11)
         } else {
             let kt = &mut thread.kernel;
@@ -472,8 +491,10 @@ fn handle_fork_exec(
     };
 
     let format = exec::detect_format(&buf, path);
-    crate::dbg_println!("handle_fork_exec: {:?} size={} format={}", core::str::from_utf8(path), buf.len(),
-        match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" });
+    crate::dbg_println!("handle_fork_exec: {:?} size={} format={} free_pages={}",
+        core::str::from_utf8(path), buf.len(),
+        match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" },
+        crate::arch::free_page_count());
 
     // COW-fork parent address space for child
     let mut child_root = crate::RootPageTable::empty();
