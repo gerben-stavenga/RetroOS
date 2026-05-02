@@ -2467,8 +2467,11 @@ pub(super) fn host_stack_size() -> u32 {
 }
 
 /// Base linear address + size of the per-thread dedicated RM stack.
-/// `rm_stack_seg()` returns the paragraph-aligned segment for use in
-/// RM `SS:SP` register pairs.
+/// `rm_stack_seg()` returns the paragraph floor of the buffer's base;
+/// callers must add `(base & 0xF)` to any in-segment offset they pass
+/// to BIOS as SP, to compensate for any sub-paragraph alignment of
+/// the buffer's start within the LowMem layout. `locked_stack::rm_stack_top`
+/// does this for the standard "fresh-excursion top of stack" SP.
 pub(super) fn rm_stack_base() -> u32 {
     &raw const low_mem().rm_stack as u32
 }
@@ -2476,9 +2479,12 @@ pub(super) fn rm_stack_size() -> u32 {
     core::mem::size_of_val(&low_mem().rm_stack) as u32
 }
 pub(super) fn rm_stack_seg() -> u16 {
-    debug_assert_eq!(rm_stack_base() & 0xF, 0,
-        "rm_stack must be paragraph-aligned for RM addressing");
     (rm_stack_base() >> 4) as u16
+}
+/// Sub-paragraph offset of the buffer's base within `rm_stack_seg()`.
+/// `rm_stack_seg() << 4 + rm_stack_align_offset()` == `rm_stack_base()`.
+pub(super) fn rm_stack_align_offset() -> u16 {
+    (rm_stack_base() & 0xF) as u16
 }
 
 /// Default size of an env block in paragraphs. Env is allocated from the

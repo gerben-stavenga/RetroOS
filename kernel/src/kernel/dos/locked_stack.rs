@@ -218,10 +218,14 @@ pub(super) fn pop_save(dos: &mut thread::DosState) -> ModeSave {
 // resumes with its bytes intact.
 
 /// Top-of-stack offset for a fresh RM excursion: SP starts here and
-/// pushes go below. Subtract two to leave a 16-bit guard word so a
-/// 32-bit `pushd` near the top doesn't roll past the buffer end.
+/// pushes go below. The (base & 0xF) prefix accounts for the buffer's
+/// possible sub-paragraph alignment within LowMem — `rm_stack_seg()`
+/// floors to the paragraph, so SP needs to be offset back up to land
+/// inside the buffer. Subtract two on top of that to leave a 16-bit
+/// guard word so a 32-bit `pushd` near the top doesn't roll past the
+/// buffer end.
 pub(super) fn rm_stack_top() -> u16 {
-    (dos::rm_stack_size() as u16) - 2
+    dos::rm_stack_align_offset() + (dos::rm_stack_size() as u16) - 2
 }
 
 /// Snapshot the entire dedicated RM stack onto the locked stack.
