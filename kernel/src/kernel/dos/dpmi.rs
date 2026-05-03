@@ -1269,7 +1269,7 @@ fn host_stack_read_call_args(ldt: &[u64], cursor: (u16, u32)) -> CallStubFrame {
 pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     // User just RM-IRETed onto rm side; pm cursor lives in other_stack.
     // CallStubFrame is the topmost record, ModeSave below it.
-    let cursor0 = super::mode_transitions::pm_cursor(dos, regs);
+    let cursor0 = super::mode_transitions::pm_get_stack(dos, regs);
     let stub = host_stack_read_call_args(&dos.ldt[..], cursor0);
     let save = super::mode_transitions::pop_save_at(
         &dos.ldt[..],

@@ -170,18 +170,20 @@ pub(super) fn host_stack_pm_seg(dos: &thread::DosState) -> u16 {
     }
 }
 
-/// The pm-side cursor as a (SS, SP) pair.
+/// Provides the pm-side stack `(SS, SP)` for the next push or pop —
+/// "give me the stack to use for the pm side".
 ///
-///   - chain empty (`other_stack=None`): default to host_stack at empty
-///     TOS — what first-entry will switch onto.
-///   - in chain, user on pm side (`mode != VM86`): regs.SS:SP itself.
-///     Works whether SS is HOST_STACK_PM* or some handler-owned locked
-///     stack; we just track wherever pm currently is.
+///   - chain empty (`other_stack=None`): a fresh host_stack at empty
+///     TOS. First-entry will switch the user onto it.
+///   - in chain, user on pm side (`mode != VM86`): the user's current
+///     `regs.SS:SP`. Works whether SS is HOST_STACK_PM* or a
+///     handler-owned locked stack; we just track wherever pm
+///     currently is.
 ///   - in chain, user on rm side (`mode == VM86`): pm side's
-///     (SS, SP) was stashed in other_stack at the toggle that put us
-///     on rm. Read it back.
+///     `(SS, SP)` was stashed in `other_stack` at the toggle that put
+///     us on rm. Read it back.
 #[inline]
-pub(super) fn pm_cursor(dos: &thread::DosState, regs: &Regs) -> (u16, u32) {
+pub(super) fn pm_get_stack(dos: &thread::DosState, regs: &Regs) -> (u16, u32) {
     match dos.pc.locked_stack.other_stack {
         None => (host_stack_pm_seg(dos), dos::host_stack_empty_sp()),
         Some(p) if regs.mode() == crate::UserMode::VM86 => p,
@@ -197,24 +199,24 @@ fn pm_addr(ldt: &[u64], cursor: (u16, u32)) -> u32 {
 }
 
 /// Capture current regs as a ModeSave and write it at
-/// `pm_cursor.SP − MODE_SAVE_SIZE` on `pm_cursor.SS`. Returns the
+/// `(pm_get_stack.SS, pm_get_stack.SP − MODE_SAVE_SIZE)`. Returns the
 /// post-push (SS, SP) — caller is responsible for stashing it
 /// (via regs.SS:SP if landing the user on pm side, or `other_stack`
 /// if landing on rm side).
 pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) -> (u16, u32) {
     let save = ModeSave::capture(regs, dos.pc.locked_stack.other_stack);
-    let (ss, sp) = pm_cursor(dos, regs);
+    let (ss, sp) = pm_get_stack(dos, regs);
     let new_sp = sp - MODE_SAVE_SIZE;
     let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
     unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
     (ss, new_sp)
 }
 
-/// Read the topmost ModeSave at `pm_cursor`. Doesn't write back — the
+/// Read the topmost ModeSave on the pm side. Doesn't write back — the
 /// caller follows with `save.restore(regs)` which clobbers SS:SP and
 /// other_stack, so the post-pop cursor doesn't need to live anywhere.
 pub(super) fn pop_save(dos: &thread::DosState, regs: &Regs) -> ModeSave {
-    pop_save_at(&dos.ldt[..], pm_cursor(dos, regs))
+    pop_save_at(&dos.ldt[..], pm_get_stack(dos, regs))
 }
 
 /// Read a ModeSave at an explicit (SS, SP). Used by `rm_iret_call`
@@ -424,7 +426,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     //                   pm side at the post-push position, leave the
     //                   prior rm SS:SP captured in the save for unwind.
     //   (_,    None) → first-entry from client: pm side is empty, so
-    //                   pm_cursor defaults to host_stack:empty_sp.
+    //                   pm_get_stack defaults to host_stack:empty_sp.
     //                   Same path as toggle, plus the empty default.
     let in_pm = regs.mode() != crate::UserMode::VM86;
     let nested_on_pm = in_pm && dos.pc.locked_stack.other_stack.is_some();
@@ -484,7 +486,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
 ///
 /// At entry: hardware IRET advanced regs.ESP past the iret_frame, so
 /// regs.SS:SP now points at the ModeSave on whichever pm stack the
-/// handler used (host_stack or its own locked stack). pm_cursor reads
+/// handler used (host_stack or its own locked stack). pm_get_stack reads
 /// it directly off (regs.SS, regs.SP); save.restore then clobbers SS:SP
 /// with the pre-toggle values.
 pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
@@ -711,7 +713,7 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    // pm_cursor reads from other_stack here (we're in VM86 with
+    // pm_get_stack reads from other_stack here (we're in VM86 with
     // other_stack=Some); pop_save fetches the save from wherever pm
     // last was.
     let save = pop_save(dos, regs);

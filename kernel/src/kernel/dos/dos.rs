@@ -2459,7 +2459,7 @@ pub(super) fn host_stack_size() -> u32 {
 /// SP value within `HOST_STACK_PM*_SEL` for an empty locked stack. The
 /// selectors have base = host_stack_base() and limit = size−1, so the
 /// post-init SP that pushes decrement from is exactly `size`. Used by
-/// [`super::mode_transitions::pm_cursor`] as the chain-empty default.
+/// [`super::mode_transitions::pm_get_stack`] as the chain-empty default.
 pub(super) fn host_stack_empty_sp() -> u32 {
     host_stack_size()
 }
