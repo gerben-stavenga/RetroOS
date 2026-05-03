@@ -1648,52 +1648,56 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     let stub_off = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET) as u32;
     let err_code = regs.err_code as u32;
 
+    // Capture faulting u16 view *before* switch_to_pm_side mutates regs;
+    // 16-bit branch needs these to seed the duplicated spec frame.
+    let f_ip    = regs.ip32() as u16;
+    let f_cs    = regs.code_seg();
+    let f_flags = regs.flags32() as u16;
+    let f_sp    = regs.sp32() as u16;
+    let f_ss    = regs.stack_seg();
+
+    let pm_save_at = super::mode_transitions::switch_to_pm_side(dos, regs);
+    let pm_seg_base = super::mode_transitions::seg_base(&dos.ldt[..], pm_save_at.0);
+    let new_sp;
+
     if use32 {
-        // 32-bit: locked-stack delivery via switch_to_pm_side + 3-dword
-        // prefix [ret_eip, ret_cs, err_code]. ModeSave's hw-stack-compat
-        // layout means its `eip/cs/eflags/esp/ss` fields land at the
-        // exact offsets the spec frame's faulting portion lives at —
-        // no separate copy of the faulting state, no spec/ModeSave
-        // divergence. Handler modifications to those fields land in
-        // ModeSave directly; `save.restore` on unwind picks them up.
-        let pm_save_at = super::mode_transitions::switch_to_pm_side(dos, regs);
+        // 32-bit: 3-dword prefix [ret_eip, ret_cs, err_code]. ModeSave's
+        // hw-stack-compat layout means its `eip/cs/eflags/esp/ss` fields
+        // land at the exact offsets the spec frame's faulting portion
+        // lives at — no separate copy of faulting state. Handler
+        // modifications land in ModeSave directly; save.restore picks
+        // them up on unwind.
         let prefix_size = 12u32;
-        let new_sp = pm_save_at.1 - prefix_size;
-        let addr = super::mode_transitions::seg_base(&dos.ldt[..], pm_save_at.0)
-            .wrapping_add(new_sp);
+        new_sp = pm_save_at.1 - prefix_size;
+        let addr = pm_seg_base.wrapping_add(new_sp);
         unsafe {
             let p = addr as *mut u32;
             core::ptr::write_unaligned(p,        stub_off);
             core::ptr::write_unaligned(p.add(1), super::mode_transitions::SPECIAL_STUB_SEL as u32);
             core::ptr::write_unaligned(p.add(2), err_code);
         }
-        regs.frame.rsp = new_sp as u64;
     } else {
         // 16-bit: spec frame uses u16 fields, can't overlap with our
-        // u32 ModeSave. Build the frame on client's stack as before;
-        // exception_return pops it back from there.
-        let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
-        let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
-        let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-        let push16 = |sp: &mut u32, val: u16| {
-            *sp = sp.wrapping_sub(2);
-            unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(*sp)) as *mut u16, val); }
-        };
-        push16(&mut sp, regs.frame.ss as u16);
-        push16(&mut sp, regs.sp32() as u16);
-        push16(&mut sp, regs.flags32() as u16);
-        push16(&mut sp, regs.frame.cs as u16);
-        push16(&mut sp, regs.ip32() as u16);
-        push16(&mut sp, err_code as u16);
-        push16(&mut sp, super::mode_transitions::SPECIAL_STUB_SEL);
-        push16(&mut sp, stub_off as u16);
-        if ss_32 {
-            regs.set_sp32(sp);
-        } else {
-            regs.set_sp32((regs.sp32() & !0xFFFF) | (sp & 0xFFFF));
+        // u32 ModeSave. Lay a separate 16-byte spec frame above
+        // ModeSave; exception_return copies any handler modifications
+        // back into ModeSave's low-16 bits before save.restore.
+        let frame_size = 16u32;
+        new_sp = pm_save_at.1 - frame_size;
+        let addr = pm_seg_base.wrapping_add(new_sp);
+        unsafe {
+            let p = addr as *mut u16;
+            core::ptr::write_unaligned(p,        stub_off as u16);
+            core::ptr::write_unaligned(p.add(1), super::mode_transitions::SPECIAL_STUB_SEL);
+            core::ptr::write_unaligned(p.add(2), err_code as u16);
+            core::ptr::write_unaligned(p.add(3), f_ip);
+            core::ptr::write_unaligned(p.add(4), f_cs);
+            core::ptr::write_unaligned(p.add(5), f_flags);
+            core::ptr::write_unaligned(p.add(6), f_sp);
+            core::ptr::write_unaligned(p.add(7), f_ss);
         }
     }
 
+    regs.frame.rsp = new_sp as u64;
     regs.frame.cs = handler_sel as u64;
     regs.set_ip32(handler_off);
 
@@ -1732,44 +1736,39 @@ pub(super) fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> t
     let use32 = dpmi.client_use32;
 
     if use32 {
-        // 32-bit unwind path mirrors the dispatch overlap: handler
-        // RETFed past ret_eip+ret_cs, regs.SS:SP now points at err_code
-        // on host_stack with ModeSave at +4. Skip err_code and let
-        // pop_save read ModeSave at the natural pm cursor —
-        // save.restore picks up any handler modifications to the
-        // overlapping faulting fields.
+        // 32-bit overlap: handler RETFed past ret_eip+ret_cs, regs.SS:SP
+        // now points at err_code on host_stack with ModeSave at +4.
+        // Skip err_code and let pop_save read ModeSave at the natural
+        // pm cursor — save.restore picks up any handler modifications
+        // to the overlapping faulting fields.
         regs.set_sp32(regs.sp32() + 4);
         let save = super::mode_transitions::pop_save(dos, regs);
         save.restore(regs);
         dos.pc.locked_stack.other_stack = save.other_stack();
     } else {
-        // 16-bit: pop the spec frame from client's stack (where the
-        // 16-bit dispatch path put it). No ModeSave on locked stack
-        // for this case.
-        let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
-        let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
-        let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-        let pop16 = |sp: &mut u32| -> u16 {
-            let val = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(*sp)) as *const u16) };
-            *sp = sp.wrapping_add(2);
-            val
+        // 16-bit duplicated frame: handler RETFed past ret_IP+ret_CS,
+        // regs.SS:SP at err on host_stack with the remaining 12 bytes
+        // of spec frame (err + 5 × u16 faulting fields) above ModeSave.
+        // Read the (possibly modified) u16 faulting fields, advance
+        // past the remainder to ModeSave, patch ModeSave's low-16 bits
+        // with the handler's modifications, then save.restore.
+        let ss_base = super::mode_transitions::seg_base(&dos.ldt[..], regs.stack_seg());
+        let frame_addr = ss_base.wrapping_add(regs.sp32());
+        let (new_ip, new_cs, new_flags, new_sp_lo, new_ss) = unsafe {
+            let p = frame_addr as *const u16;
+            // p[0] is err_code (discarded)
+            (*p.add(1), *p.add(2), *p.add(3), *p.add(4), *p.add(5))
         };
-        let _err = pop16(&mut sp);
-        let new_eip = pop16(&mut sp) as u32;
-        let new_cs = pop16(&mut sp);
-        let new_eflags = pop16(&mut sp) as u32;
-        let new_esp = pop16(&mut sp) as u32;
-        let new_ss = pop16(&mut sp);
-        regs.frame.cs = new_cs as u64;
-        regs.set_ip32(new_eip);
-        regs.frame.ss = new_ss as u64;
-        if ss_32 {
-            regs.set_sp32(new_esp);
-        } else {
-            regs.set_sp32((regs.sp32() & !0xFFFF) | (new_esp & 0xFFFF));
-        }
-        let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
-        regs.set_flags32((new_eflags & !machine::PRESERVED_FLAGS) | preserved);
+        regs.set_sp32(regs.sp32() + 12);
+        let cursor = (regs.stack_seg(), regs.sp32());
+        let mut save = super::mode_transitions::pop_save_at(&dos.ldt[..], cursor);
+        save.eip    = (save.eip    & 0xFFFF_0000) | new_ip    as u32;
+        save.cs     = new_cs as u32;
+        save.eflags = (save.eflags & 0xFFFF_0000) | new_flags as u32;
+        save.esp    = (save.esp    & 0xFFFF_0000) | new_sp_lo as u32;
+        save.ss     = new_ss as u32;
+        save.restore(regs);
+        dos.pc.locked_stack.other_stack = save.other_stack();
     }
 
     trace_client_selector_leak("exception_return.out", regs);
