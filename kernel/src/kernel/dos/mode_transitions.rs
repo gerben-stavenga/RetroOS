@@ -331,73 +331,6 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 // `consume_save_at`) live in [`super::mode_transitions`]. This module
 // composes them with DPMI policy.
 
-/// Stub-frame for `SLOT_RM_IRET_CALL` — pushed above the `ModeSave` by
-/// every explicit PM→RM-call entry (`0300/01/02` and `callback_entry`).
-/// On unwind, `rm_iret_call` writes the post-RM regs into the
-/// RmCallStruct at `rm_struct_addr`, then restores the saved GP regs
-/// (PM caller's for `0300/01/02`; RM caller's for `callback_entry`).
-/// Other slots (`SLOT_PM_IRET`, `SLOT_RM_IRET`) don't need this
-/// — handler preservation / spec round-trip handle their GP regs.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(super) struct CallStubFrame {
-    rm_struct_addr: u32,
-    eax: u32,
-    ebx: u32,
-    ecx: u32,
-    edx: u32,
-    esi: u32,
-    edi: u32,
-    ebp: u32,
-    /// 1 if the recipe pushed an `RmSnapshot` (because the RM handler will run
-    /// on our dedicated RM stack); 0 if the user supplied their own
-    /// SS:SP via the RmCallStruct (RM handler runs there, our dedicated
-    /// stack is untouched, no snapshot needed). On unwind the
-    /// SLOT_RM_IRET_CALL handler conditionally pops the snapshot.
-    used_dedicated_rm: u32,
-}
-
-const CALL_STUB_SIZE: u32 = core::mem::size_of::<CallStubFrame>() as u32;
-
-impl CallStubFrame {
-    pub(super) fn capture(regs: &Regs, rm_struct_addr: u32, used_dedicated_rm: bool) -> Self {
-        Self {
-            rm_struct_addr,
-            eax: regs.rax as u32,
-            ebx: regs.rbx as u32,
-            ecx: regs.rcx as u32,
-            edx: regs.rdx as u32,
-            esi: regs.rsi as u32,
-            edi: regs.rdi as u32,
-            ebp: regs.rbp as u32,
-            used_dedicated_rm: used_dedicated_rm as u32,
-        }
-    }
-
-    pub(super) fn restore_gp(&self, regs: &mut Regs) {
-        regs.rax = (regs.rax & !0xFFFFFFFF) | self.eax as u64;
-        regs.rbx = (regs.rbx & !0xFFFFFFFF) | self.ebx as u64;
-        regs.rcx = (regs.rcx & !0xFFFFFFFF) | self.ecx as u64;
-        regs.rdx = (regs.rdx & !0xFFFFFFFF) | self.edx as u64;
-        regs.rsi = (regs.rsi & !0xFFFFFFFF) | self.esi as u64;
-        regs.rdi = (regs.rdi & !0xFFFFFFFF) | self.edi as u64;
-        regs.rbp = (regs.rbp & !0xFFFFFFFF) | self.ebp as u64;
-    }
-}
-
-/// Write a `CallStubFrame` at the cursor. Returns the new (lower) cursor.
-pub(super) fn host_stack_write_call_args(cursor: u32, frame: CallStubFrame) -> u32 {
-    let new_cursor = cursor - CALL_STUB_SIZE;
-    let addr = dos::host_stack_base() + new_cursor;
-    unsafe { core::ptr::write_unaligned(addr as *mut CallStubFrame, frame); }
-    new_cursor
-}
-
-/// Read a `CallStubFrame` at the cursor.
-fn host_stack_read_call_args(cursor: u32) -> CallStubFrame {
-    let addr = dos::host_stack_base() + cursor;
-    unsafe { core::ptr::read_unaligned(addr as *const CallStubFrame) }
-}
 
 /// Push an IRET frame for a PM handler entry at the given cursor. Returns
 /// the new cursor. Width follows client bitness per DPMI 0.9 §10.6.
@@ -798,57 +731,6 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
         ret_cs, ret_eip, regs.stack_seg(), regs.sp32());
 }
 
-/// SLOT_RM_IRET_CALL dispatch — explicit PM→RM call unwind (0x0300/01/02
-/// and `callback_entry`). Pops the `CallStubFrame`, writes current RM regs
-/// (the post-call values) into the RmCallStruct at `rm_struct_addr`, then
-/// restores the saved GP regs and pops the `ModeSave`. Restoration order
-/// is critical: writeback uses *current* (post-RM) regs, so it must run
-/// before `restore_gp` overwrites them.
-pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
-    let stub = host_stack_read_call_args(dos.pc.host_stack_sp);
-    dos.pc.host_stack_sp += CALL_STUB_SIZE;
-    // Restore the dedicated RM stack iff this excursion ran on it
-    // (the recipe recorded the choice on push). User-supplied SS:SP
-    // means the RM handler pushed onto the user's stack; our dedicated buffer
-    // was never touched, no snapshot to restore.
-    if stub.used_dedicated_rm != 0 {
-        pop_rm_snapshot(dos);
-    }
-    let save = pop_save(dos);
-
-    // Writeback current RM regs into RmCallStruct so the PM caller sees
-    // results. Must happen *before* GP-restore overwrites regs.
-    let rm_struct_addr = { let f = stub; f.rm_struct_addr };
-    let rm_struct = RmCallStruct {
-        edi: regs.rdi as u32,
-        esi: regs.rsi as u32,
-        ebp: regs.rbp as u32,
-        _reserved: 0,
-        ebx: regs.rbx as u32,
-        edx: regs.rdx as u32,
-        ecx: regs.rcx as u32,
-        eax: regs.rax as u32,
-        flags: regs.flags32() as u16,
-        es: regs.es as u16,
-        ds: regs.ds as u16,
-        fs: regs.fs as u16,
-        gs: regs.gs as u16,
-        ip: regs.ip32() as u16,
-        cs: regs.code_seg(),
-        sp: regs.sp32() as u16,
-        ss: regs.stack_seg(),
-    };
-    unsafe { *(rm_struct_addr as *mut RmCallStruct) = rm_struct; }
-
-    stub.restore_gp(regs);
-    save.restore(regs);
-
-    dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
-        regs.rax as u16, regs.flags32() & 1,
-        regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
-
-}
 
 
 // =============================================================================
@@ -878,16 +760,3 @@ pub(super) fn seg_is_32(ldt: &[u64], sel: u16) -> bool {
     ldt[idx] & (1u64 << 54) != 0
 }
 
-/// DPMI real-mode call structure (50 bytes at ES:EDI). Filled by the client
-/// before a 0300/0301/0302 INT 31h call; written back by `rm_iret_call` with
-/// the post-RM register state. Kept here because the writeback is part of
-/// the unwind machinery — the API parsing in `dpmi::call_real_mode_proc` etc.
-/// hands us the buffer address at entry.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(super) struct RmCallStruct {
-    pub edi: u32, pub esi: u32, pub ebp: u32, pub _reserved: u32,
-    pub ebx: u32, pub edx: u32, pub ecx: u32, pub eax: u32,
-    pub flags: u16, pub es: u16, pub ds: u16, pub fs: u16, pub gs: u16,
-    pub ip: u16, pub cs: u16, pub sp: u16, pub ss: u16,
-}

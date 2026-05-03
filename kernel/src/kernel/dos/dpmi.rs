@@ -16,7 +16,7 @@ use alloc::boxed::Box;
 use crate::kernel::thread;
 use crate::kernel::dos;
 use super::machine;
-use super::mode_transitions::{seg_base, seg_is_32, RmCallStruct};
+use super::mode_transitions::{seg_base, seg_is_32};
 use crate::kernel::startup;
 use crate::Regs;
 
@@ -1194,6 +1194,144 @@ fn printable(b: u8) -> char {
     if (0x20..0x7F).contains(&b) { b as char } else { '.' }
 }
 
+// ============================================================================
+// DPMI 0300/0301/0302 — explicit PM→RM call mechanics
+// ============================================================================
+
+/// Stub-frame for `SLOT_RM_IRET_CALL` — pushed above the `ModeSave` by
+/// every explicit PM→RM-call entry (`0300/01/02` and `callback_entry`).
+/// On unwind, `rm_iret_call` writes the post-RM regs into the
+/// RmCallStruct at `rm_struct_addr`, then restores the saved GP regs
+/// (PM caller's for `0300/01/02`; RM caller's for `callback_entry`).
+/// Other slots (`SLOT_PM_IRET`, `SLOT_RM_IRET`) don't need this
+/// — handler preservation / spec round-trip handle their GP regs.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct CallStubFrame {
+    rm_struct_addr: u32,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+    esi: u32,
+    edi: u32,
+    ebp: u32,
+    /// 1 if the recipe pushed an `RmSnapshot` (because the RM handler will run
+    /// on our dedicated RM stack); 0 if the user supplied their own
+    /// SS:SP via the RmCallStruct (RM handler runs there, our dedicated
+    /// stack is untouched, no snapshot needed). On unwind the
+    /// SLOT_RM_IRET_CALL handler conditionally pops the snapshot.
+    used_dedicated_rm: u32,
+}
+
+const CALL_STUB_SIZE: u32 = core::mem::size_of::<CallStubFrame>() as u32;
+
+impl CallStubFrame {
+    fn capture(regs: &Regs, rm_struct_addr: u32, used_dedicated_rm: bool) -> Self {
+        Self {
+            rm_struct_addr,
+            eax: regs.rax as u32,
+            ebx: regs.rbx as u32,
+            ecx: regs.rcx as u32,
+            edx: regs.rdx as u32,
+            esi: regs.rsi as u32,
+            edi: regs.rdi as u32,
+            ebp: regs.rbp as u32,
+            used_dedicated_rm: used_dedicated_rm as u32,
+        }
+    }
+
+    fn restore_gp(&self, regs: &mut Regs) {
+        regs.rax = (regs.rax & !0xFFFFFFFF) | self.eax as u64;
+        regs.rbx = (regs.rbx & !0xFFFFFFFF) | self.ebx as u64;
+        regs.rcx = (regs.rcx & !0xFFFFFFFF) | self.ecx as u64;
+        regs.rdx = (regs.rdx & !0xFFFFFFFF) | self.edx as u64;
+        regs.rsi = (regs.rsi & !0xFFFFFFFF) | self.esi as u64;
+        regs.rdi = (regs.rdi & !0xFFFFFFFF) | self.edi as u64;
+        regs.rbp = (regs.rbp & !0xFFFFFFFF) | self.ebp as u64;
+    }
+}
+
+/// Write a `CallStubFrame` at the cursor. Returns the new (lower) cursor.
+fn host_stack_write_call_args(cursor: u32, frame: CallStubFrame) -> u32 {
+    let new_cursor = cursor - CALL_STUB_SIZE;
+    let addr = dos::host_stack_base() + new_cursor;
+    unsafe { core::ptr::write_unaligned(addr as *mut CallStubFrame, frame); }
+    new_cursor
+}
+
+/// Read a `CallStubFrame` at the cursor.
+fn host_stack_read_call_args(cursor: u32) -> CallStubFrame {
+    let addr = dos::host_stack_base() + cursor;
+    unsafe { core::ptr::read_unaligned(addr as *const CallStubFrame) }
+}
+
+/// SLOT_RM_IRET_CALL dispatch — explicit PM→RM call unwind (0x0300/01/02
+/// and `callback_entry`). Pops the `CallStubFrame`, writes current RM regs
+/// (the post-call values) into the RmCallStruct at `rm_struct_addr`, then
+/// restores the saved GP regs and pops the `ModeSave`. Restoration order
+/// is critical: writeback uses *current* (post-RM) regs, so it must run
+/// before `restore_gp` overwrites them.
+pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
+    let stub = host_stack_read_call_args(dos.pc.host_stack_sp);
+    dos.pc.host_stack_sp += CALL_STUB_SIZE;
+    // Restore the dedicated RM stack iff this excursion ran on it
+    // (the recipe recorded the choice on push). User-supplied SS:SP
+    // means the RM handler pushed onto the user's stack; our dedicated buffer
+    // was never touched, no snapshot to restore.
+    if stub.used_dedicated_rm != 0 {
+        super::mode_transitions::pop_rm_snapshot(dos);
+    }
+    let save = super::mode_transitions::pop_save(dos);
+
+    // Writeback current RM regs into RmCallStruct so the PM caller sees
+    // results. Must happen *before* GP-restore overwrites regs.
+    let rm_struct_addr = { let f = stub; f.rm_struct_addr };
+    let rm_struct = RmCallStruct {
+        edi: regs.rdi as u32,
+        esi: regs.rsi as u32,
+        ebp: regs.rbp as u32,
+        _reserved: 0,
+        ebx: regs.rbx as u32,
+        edx: regs.rdx as u32,
+        ecx: regs.rcx as u32,
+        eax: regs.rax as u32,
+        flags: regs.flags32() as u16,
+        es: regs.es as u16,
+        ds: regs.ds as u16,
+        fs: regs.fs as u16,
+        gs: regs.gs as u16,
+        ip: regs.ip32() as u16,
+        cs: regs.code_seg(),
+        sp: regs.sp32() as u16,
+        ss: regs.stack_seg(),
+    };
+    unsafe { *(rm_struct_addr as *mut RmCallStruct) = rm_struct; }
+
+    stub.restore_gp(regs);
+    save.restore(regs);
+
+    dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+        regs.rax as u16, regs.flags32() & 1,
+        regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
+        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
+
+}
+
+/// DPMI real-mode call structure (50 bytes at ES:EDI). Filled by the client
+/// before a 0300/0301/0302 INT 31h call; written back by `rm_iret_call` with
+/// the post-RM register state. Kept here because the writeback is part of
+/// the unwind machinery — the API parsing in `dpmi::call_real_mode_proc` etc.
+/// hands us the buffer address at entry.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RmCallStruct {
+    edi: u32, esi: u32, ebp: u32, _reserved: u32,
+    ebx: u32, edx: u32, ecx: u32, eax: u32,
+    flags: u16, es: u16, ds: u16, fs: u16, gs: u16,
+    ip: u16, cs: u16, sp: u16, ss: u16,
+}
+
 fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let int_num = regs.rbx as u8;
 
@@ -1220,10 +1358,10 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     // RM excursion can run on a fresh stack and the outer caller resumes
     // intact on unwind. The stub records this so SLOT_RM_IRET_CALL knows
     // whether to pop the snapshot.
-    let stub = super::mode_transitions::CallStubFrame::capture(regs, struct_addr, used_dedicated);
+    let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
     super::mode_transitions::push_save(dos, regs);
     if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
-    dos.pc.host_stack_sp = super::mode_transitions::host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     // Get IVT entry for the interrupt
     let ivt_off = machine::read_u16(0, (int_num as u32) * 4);
@@ -1281,10 +1419,10 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
 
     // Save PM state + rm_struct_addr stub-arg on locked stack (CALL slot).
     // Snapshot dedicated RM stack iff we're using it (see simulate_real_mode_int).
-    let stub = super::mode_transitions::CallStubFrame::capture(regs, struct_addr, used_dedicated);
+    let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
     super::mode_transitions::push_save(dos, regs);
     if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
-    dos.pc.host_stack_sp = super::mode_transitions::host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     regs.rax = rm.eax as u64;
     regs.rbx = rm.ebx as u64;
@@ -1336,10 +1474,10 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
     let rm_ss = if rm.ss != 0 { rm.ss } else { dos::rm_stack_seg() };
     let rm_sp = if rm.sp != 0 { rm.sp } else { super::mode_transitions::rm_stack_top() };
 
-    let stub = super::mode_transitions::CallStubFrame::capture(regs, struct_addr, used_dedicated);
+    let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
     super::mode_transitions::push_save(dos, regs);
     if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
-    dos.pc.host_stack_sp = super::mode_transitions::host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     regs.rax = rm.eax as u64;
     regs.rbx = rm.ebx as u64;
@@ -1420,9 +1558,9 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     // regs back into the RmCallStruct). RM→PM transition: PM handler
     // runs on locked PM stack, dedicated RM stack is untouched, so no
     // RmSnapshot push.
-    let stub = super::mode_transitions::CallStubFrame::capture(regs, struct_addr, /*used_dedicated_rm=*/ false);
+    let stub = CallStubFrame::capture(regs, struct_addr, /*used_dedicated_rm=*/ false);
     super::mode_transitions::push_save(dos, regs);
-    dos.pc.host_stack_sp = super::mode_transitions::host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     // Switch to protected mode and call the PM handler.
     // DS:SI = selector:offset pointing to real-mode SS:SP

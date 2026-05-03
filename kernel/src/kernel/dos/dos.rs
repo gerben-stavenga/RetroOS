@@ -129,7 +129,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
         SLOT_RM_IRET_CALL => {
             // Explicit PM→RM call unwind: pop rm_struct_addr stub-arg,
             // write current RM regs back to RmCallStruct, pop ModeSave.
-            mode_transitions::rm_iret_call(dos, regs);
+            dpmi::rm_iret_call(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RAW_REAL_TO_PM => {
