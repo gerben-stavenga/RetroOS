@@ -74,7 +74,7 @@ pub(crate) fn dispatch_kernel_syscall(
         0x20 => {
             if let Some(parent) = dos.exec_parent.take() {
                 dos.last_child_exit_status = 0x0000;
-                return exec_return(dos, regs, parent);
+                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
             }
             thread::KernelAction::Exit(0)
         }
@@ -800,7 +800,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if let Some(parent) = dos.exec_parent.take() {
                 // Termination type 00h (normal) | return code in AL.
                 dos.last_child_exit_status = (regs.rax as u8) as u16;
-                return exec_return(dos, regs, parent);
+                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
             }
             let code = regs.rax as u8;
             thread::KernelAction::Exit(code as i32)
@@ -819,7 +819,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let resident_top = child_psp_seg.saturating_add(keep);
                 // Termination type 03h (TSR) | return code in AL.
                 dos.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
-                let action = exec_return(dos, regs, parent);
+                // TSR: preserve child's PM env (LDT/dpmi/pm_vectors) so a
+                // DPMI host installer like Borland's dpmiload — which
+                // calls dpmi_enter, sets up host services, switches back
+                // to RM via 0306, then TSRs — leaves the PM session usable
+                // by subsequent programs that enter via the raw-switch
+                // trampoline.
+                let action = exec_return(dos, regs, parent, /*preserve_pm_env=*/true);
                 if resident_top > dos.heap_seg {
                     dos_reset_blocks(dos, resident_top);
                 }
@@ -2054,11 +2060,13 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) -> thread::KernelAction {
-    dos_trace!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X}",
+fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
+               preserve_pm_env: bool) -> thread::KernelAction {
+    dos_trace!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X} pm_env={}",
         dos.heap_seg, parent.heap_seg,
         dos.current_psp, parent.psp,
-        parent.ss, parent.sp);
+        parent.ss, parent.sp,
+        if preserve_pm_env && dos.dpmi.is_some() { "kept" } else { "restored" });
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
     regs.clear_flag32(1);
@@ -2069,16 +2077,27 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) 
     dos.current_psp = parent.psp;
     dos.dos_blocks = parent.dos_blocks;
     super::sync_mcb_chain(dos);
-    // Restore parent's suspended DPMI state (if any). A child's own DPMI
-    // state, if it entered DPMI, is dropped here — the child-allocated
-    // DpmiState currently in `dos.dpmi` gets replaced. pm_vectors + LDT are
-    // suspended alongside dpmi so any descriptors/hooks the child installed
-    // are dropped and parent's are reinstated.
-    dos.dpmi = parent.dpmi;
-    dos.pm_vectors = parent.pm_vectors;
-    dos.ldt = parent.ldt;
-    dos.ldt_alloc = parent.ldt_alloc;
-    // LDTR currently points at the child's (now-dropped) LDT — reload.
+    // PM-environment handling on exec_return:
+    //   - Normal exit (AH=4Ch): drop child's dpmi/ldt/pm_vectors, restore
+    //     parent's. Child's PM state vanishes with the process.
+    //   - TSR exit (AH=31h) when child entered DPMI: keep child's dpmi/ldt/
+    //     pm_vectors alive — DPMI host installers (Borland's dpmiload,
+    //     CWSDPMI when run as a TSR, etc.) install PM services, switch to
+    //     RM via 0306, and TSR. The host's LDT entries, INT vectors and
+    //     dpmi state must outlive the TSR so subsequent programs can use
+    //     the same PM session via the raw-switch trampoline.
+    //   - TSR exit when child has no dpmi: nothing to preserve, fall back
+    //     to parent's (might itself be Some if parent is the DPMI client).
+    if preserve_pm_env && dos.dpmi.is_some() {
+        // Drop parent's saved PM env; keep what's already in dos.*.
+    } else {
+        dos.dpmi = parent.dpmi;
+        dos.pm_vectors = parent.pm_vectors;
+        dos.ldt = parent.ldt;
+        dos.ldt_alloc = parent.ldt_alloc;
+    }
+    // LDTR currently points at the child's LDT — reload (same box if we
+    // preserved it, parent's box if we restored).
     dos.on_resume();
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
