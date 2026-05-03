@@ -198,12 +198,21 @@ fn pm_addr(ldt: &[u64], cursor: (u16, u32)) -> u32 {
     seg_base(ldt, cursor.0).wrapping_add(cursor.1)
 }
 
+/// rm-side stack provider: live rm cursor if tracked in other_stack
+/// (chain in flight), else rm_dedicated:rm_TOS (first-entry default).
+/// Used by `switch_to_rm_side` callers when the recipe doesn't have a
+/// user-supplied rm SS:SP.
+pub(super) fn rm_get_stack(dos: &thread::DosState) -> (u16, u32) {
+    dos.pc.locked_stack.other_stack
+        .unwrap_or_else(|| (dos::rm_stack_seg(), rm_stack_top() as u32))
+}
+
 /// Capture current regs as a ModeSave and write it at
 /// `(pm_get_stack.SS, pm_get_stack.SP − MODE_SAVE_SIZE)`. Returns the
-/// post-push (SS, SP) — caller is responsible for stashing it
-/// (via regs.SS:SP if landing the user on pm side, or `other_stack`
-/// if landing on rm side).
-pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) -> (u16, u32) {
+/// post-push (SS, SP). Private — recipes go through `switch_to_pm_side`
+/// or `switch_to_rm_side`, the only entry points to the locked-stack
+/// chain.
+fn push_save(dos: &mut thread::DosState, regs: &Regs) -> (u16, u32) {
     let save = ModeSave::capture(regs, dos.pc.locked_stack.other_stack);
     let (ss, sp) = pm_get_stack(dos, regs);
     let new_sp = sp - MODE_SAVE_SIZE;
@@ -224,6 +233,68 @@ pub(super) fn pop_save(dos: &thread::DosState, regs: &Regs) -> ModeSave {
 pub(super) fn pop_save_at(ldt: &[u64], cursor: (u16, u32)) -> ModeSave {
     let addr = pm_addr(ldt, cursor);
     unsafe { core::ptr::read_unaligned(addr as *const ModeSave) }
+}
+
+// ─── Cross-mode toggle primitives ────────────────────────────────────
+//
+// These are the *only* way to push a ModeSave onto the pm side and
+// open/extend the chain bracket. Every recipe that switches the user
+// across the pm/rm boundary calls one of them. Direction is implicit
+// from `regs.mode()` at entry; the toggles capture pre-transition rm
+// (or pm) state into other_stack so unwind round-trips cleanly even
+// when nested inside an outer rm excursion.
+
+/// Switch the user to the pm side. Pushes a ModeSave on pm side,
+/// lands `regs.SS:SP` on top of the save, clears VM_FLAG. Captures
+/// pre-transition rm SS:SP into `other_stack` so a subsequent
+/// PM→RM toggle resumes below it (LIFO sharing of rm_dedicated).
+///
+/// Returns the post-push pm `(SS, SP)`. Caller may write additional
+/// pm-side bookkeeping above the save (iret-frame, CallStubFrame),
+/// then adjust `regs.SP` to land the user on top of the full layout.
+/// Caller also sets `regs.CS:EIP` and any flags beyond VM_FLAG.
+///
+/// Used by: `deliver_pm_irq` (toggle/first-entry branch), `callback_entry`.
+pub(super) fn switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs) -> (u16, u32) {
+    // Capture rm side's live cursor before push_save reads anything.
+    //   VM86 entry: regs.SS:SP IS rm side.
+    //   PM entry  : either `other_stack` already tracks rm (chain in
+    //               flight), or the chain is empty (first-entry from
+    //               PM client) and rm side defaults to rm_TOS.
+    let rm_cursor_was = if regs.mode() == crate::UserMode::VM86 {
+        (regs.stack_seg(), regs.sp32())
+    } else {
+        rm_get_stack(dos)
+    };
+    let pm_save_at = push_save(dos, regs);
+    regs.frame.ss  = pm_save_at.0 as u64;
+    regs.frame.rsp = pm_save_at.1 as u64;
+    regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    dos.pc.locked_stack.other_stack = Some(rm_cursor_was);
+    pm_save_at
+}
+
+/// Switch the user to the rm side. Pushes a ModeSave on pm side, sets
+/// `regs.SS:SP` to `rm_dest`, sets VM_FLAG. Records the post-push pm
+/// cursor in `other_stack` so an unwind via SLOT_RM_IRET / SLOT_RM_IRET_CALL
+/// can locate the save. Caller may overwrite `other_stack` with a later
+/// pm cursor if it writes additional pm-side bookkeeping (CallStubFrame
+/// for 0300/01/02).
+///
+/// Returns the post-push pm `(SS, SP)` — where the save lives, and
+/// where any caller-written pm-side bookkeeping (CallStubFrame) goes
+/// above. Caller also sets `regs.CS:EIP` and any flags beyond VM_FLAG.
+///
+/// Used by: `reflect_int_to_real_mode`, `simulate_real_mode_int`,
+/// `call_real_mode_proc`, `call_real_mode_proc_iret`.
+pub(super) fn switch_to_rm_side(dos: &mut thread::DosState, regs: &mut Regs,
+                                rm_dest: (u16, u32)) -> (u16, u32) {
+    let pm_save_at = push_save(dos, regs);
+    regs.frame.ss  = rm_dest.0 as u64;
+    regs.frame.rsp = rm_dest.1 as u64;
+    regs.frame.rflags |= machine::VM_FLAG as u64;
+    dos.pc.locked_stack.other_stack = Some(pm_save_at);
+    pm_save_at
 }
 
 // ─── Dedicated RM stack ───────────────────────────────────────────────
@@ -436,41 +507,23 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
             regs.ip32(), regs.code_seg(), handler_flags);
         regs.frame.rsp = new_esp as u64;
     } else {
-        // Capture pre-toggle rm side for other_stack. In the toggle
-        // case (VM86, Some) regs.SS:SP IS the rm cursor — recording
-        // it lets a nested reflect_int_to_real_mode push its iret
-        // frame *below* this position instead of clobbering at
-        // rm_stack_top. In the first-entry case (None) rm is empty,
-        // so default to rm_TOS.
-        let rm_cursor = if regs.mode() == crate::UserMode::VM86 {
-            (regs.stack_seg(), regs.sp32())
-        } else {
-            (dos::rm_stack_seg(),
-             (dos::rm_stack_align_offset() as u32) + dos::rm_stack_size())
-        };
-
-        // Push save on pm side. push_save returns the post-push
-        // (SS, SP) — that's where the iret-frame will go above the
-        // save, and where regs.SS:SP will land for the handler.
-        let cursor1 = push_save(dos, regs);
+        // First-entry from client OR toggle from rm: switch_to_pm_side
+        // pushes ModeSave, lands user on top of the save, captures pre-
+        // toggle rm SS:SP into other_stack (rm_TOS for first-entry from
+        // PM client). Recipe layers an iret-to-SLOT_PM_IRET frame above
+        // the save so the eventual handler IRET round-trips through
+        // the kernel for unwind.
+        let pm_save_at = switch_to_pm_side(dos, regs);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
         let new_sp = host_stack_write_iret(
-            cursor1.1, client_use32,
+            pm_save_at.1, client_use32,
             stub_eip, SPECIAL_STUB_SEL, handler_flags);
 
         regs.ds = 0;
         regs.es = 0;
         regs.fs = 0;
         regs.gs = 0;
-
-        regs.frame.ss  = cursor1.0 as u64;
         regs.frame.rsp = new_sp as u64;
-
-        // other_stack tracks rm side's live cursor (so a nested
-        // reflect_int_to_real_mode resumes below it instead of at
-        // rm_TOS, sharing the dedicated buffer LIFO-style without
-        // a snapshot copy).
-        dos.pc.locked_stack.other_stack = Some(rm_cursor);
     }
 
     regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
@@ -630,66 +683,51 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
 /// sti, synth-iret of the iret-frame the caller planted on the user's
 /// stack (CS:EIP they want resumed at).
 pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    // Save client state, then run the RM handler on the dedicated RM
-    // stack. The handler runs on a kernel-owned RM stack — never on
-    // the client's own VM86 stack — so a HW IRQ landing during a
-    // sensitive moment in the client (e.g. just after exec_return)
-    // can't trample the client's saved registers / return address.
-    // Works for VM86 and PM clients alike — no DPMI session required.
+    // Run the RM handler on the dedicated RM stack — never the
+    // client's own VM86 stack — so a HW IRQ landing during a sensitive
+    // moment in the client (e.g. just after exec_return) can't trample
+    // saved registers / return address. Works for VM86 and PM clients
+    // alike, no DPMI session required.
     //
-    // Read rm side's live cursor *before* push_save so a nested
-    // excursion (e.g. HW IRQ during a 0300 BIOS call → default-stub
-    // reflect → here again) lands its iret-frame *below* the outer
-    // excursion's data, sharing rm_dedicated LIFO-style. The outer
-    // entry (deliver_pm_irq toggle, or simulate_real_mode_int) wrote
-    // the live rm SS:SP into other_stack at toggle time. None means
-    // first-entry from client — rm is empty, default to rm_TOS.
-    let rm_cursor = match dos.pc.locked_stack.other_stack {
-        Some(p) => p,
-        None => (dos::rm_stack_seg(), rm_stack_top() as u32),
-    };
-    let pm_after_push = push_save(dos, regs);
+    // Capture the client's flags before switch_to_rm_side mutates them
+    // (it sets VM_FLAG) — these go on the rm iret-frame so RM IRET
+    // restores them unmodified per CPU's own INT-n semantics. Pushing
+    // 0 or current handler flags would corrupt status bits across the
+    // round-trip.
+    let ret_flags = regs.flags32() as u16;
+
+    // rm_get_stack: live rm cursor if a chain is in flight (e.g., we're
+    // a nested reflect inside an outer 0300 BIOS call), else rm_TOS.
+    // The toggle pushes its iret-frame *below* this cursor, sharing
+    // rm_dedicated LIFO-style without a snapshot copy.
+    let rm_dest = rm_get_stack(dos);
+    let _save_at = switch_to_rm_side(dos, regs, rm_dest);
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
     let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
 
-    regs.frame.ss  = rm_cursor.0 as u64;
-    regs.frame.rsp = rm_cursor.1 as u64;
-
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
-    // own INT n in real mode would push: FLAGS / CS / IP. FLAGS is the
-    // client's flags *unmodified* — that's what real-mode INT writes,
-    // and it's what RM IRET pops back. The handler runs with IF=0
-    // because we set it on `regs.frame.rflags` below, not by mutating
-    // the on-stack frame. Pushing 0 (or modifying flags here) would let
-    // the unwind handler's status-flag passthrough (CF/ZF/DF/...) snapshot
-    // wrong values and silently corrupt the client across the IRQ.
-    let ret_flags = regs.flags32() as u16;
+    // own INT n in real mode would push: FLAGS / CS / IP.
     let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET);
     let ret_seg: u16 = dos::STUB_SEG;
     machine::vm86_push(regs, ret_flags);
     machine::vm86_push(regs, ret_seg);
     machine::vm86_push(regs, ret_off);
 
-    // Enter the RM handler in VM86 with IF cleared — matches what the
-    // CPU's own INT n does in real mode (preserves status flags, just
-    // clears IF). VIF is owned by the arch layer (VME virtualization),
-    // not us. IOPL=1 keeps cli/sti virtualized.
+    // Enter the RM handler with IF cleared (matches CPU's INT-n: clears
+    // IF, preserves status flags) and IOPL=1 (cli/sti virtualized via
+    // VME's VIF). VM_FLAG already set by switch_to_rm_side and
+    // preserved by the read-modify-write.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    let flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
-        | machine::VM_FLAG
-        | machine::IOPL_VM86;
-    regs.frame.rflags = flags as u64;
+    let new_flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
+                  | machine::IOPL_VM86;
+    regs.frame.rflags = new_flags as u64;
 
     // Per DPMI, the host must not translate PM selectors into RM paragraphs
     // when reflecting a software interrupt. The extender/client is responsible
     // for any DOS-call marshaling that requires real-mode segment values.
-
-    // User now on rm side; stash the post-push pm (SS, SP) in
-    // other_stack so the unwind path can locate the save.
-    dos.pc.locked_stack.other_stack = Some(pm_after_push);
 
     dos_trace!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X} DS={:04X} ES={:04X}",
         vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), regs.rax as u16,
