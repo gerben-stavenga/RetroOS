@@ -1644,51 +1644,56 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         return thread::KernelAction::Exit(-(exc_num as i32));
     }
 
-    // Build exception frame on client's stack — width depends on client type.
     let use32 = dpmi.client_use32;
-    let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
-    let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
-
-    let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-
-    // Return address for the handler's RETF — point to our exception return
-    // stub in the special-stub segment (CD 31 → pm_stub_dispatch).
     let stub_off = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET) as u32;
+    let err_code = regs.err_code as u32;
 
     if use32 {
-        let push32 = |sp: &mut u32, val: u32| {
-            *sp = sp.wrapping_sub(4);
-            unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(*sp)) as *mut u32, val); }
-        };
-        push32(&mut sp, regs.frame.ss as u32);        // faulting SS
-        push32(&mut sp, regs.sp32());                  // faulting ESP
-        push32(&mut sp, regs.flags32());               // faulting EFLAGS
-        push32(&mut sp, regs.frame.cs as u32);         // faulting CS
-        push32(&mut sp, regs.ip32());                  // faulting EIP
-        push32(&mut sp, regs.err_code as u32);         // error code
-        push32(&mut sp, super::mode_transitions::SPECIAL_STUB_SEL as u32);      // return CS
-        push32(&mut sp, stub_off);                     // return EIP
+        // 32-bit: locked-stack delivery via switch_to_pm_side + 3-dword
+        // prefix [ret_eip, ret_cs, err_code]. ModeSave's hw-stack-compat
+        // layout means its `eip/cs/eflags/esp/ss` fields land at the
+        // exact offsets the spec frame's faulting portion lives at —
+        // no separate copy of the faulting state, no spec/ModeSave
+        // divergence. Handler modifications to those fields land in
+        // ModeSave directly; `save.restore` on unwind picks them up.
+        let pm_save_at = super::mode_transitions::switch_to_pm_side(dos, regs);
+        let prefix_size = 12u32;
+        let new_sp = pm_save_at.1 - prefix_size;
+        let addr = super::mode_transitions::seg_base(&dos.ldt[..], pm_save_at.0)
+            .wrapping_add(new_sp);
+        unsafe {
+            let p = addr as *mut u32;
+            core::ptr::write_unaligned(p,        stub_off);
+            core::ptr::write_unaligned(p.add(1), super::mode_transitions::SPECIAL_STUB_SEL as u32);
+            core::ptr::write_unaligned(p.add(2), err_code);
+        }
+        regs.frame.rsp = new_sp as u64;
     } else {
+        // 16-bit: spec frame uses u16 fields, can't overlap with our
+        // u32 ModeSave. Build the frame on client's stack as before;
+        // exception_return pops it back from there.
+        let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
+        let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
+        let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
         let push16 = |sp: &mut u32, val: u16| {
             *sp = sp.wrapping_sub(2);
             unsafe { core::ptr::write_unaligned((ss_base.wrapping_add(*sp)) as *mut u16, val); }
         };
-        push16(&mut sp, regs.frame.ss as u16);         // faulting SS
-        push16(&mut sp, regs.sp32() as u16);           // faulting SP
-        push16(&mut sp, regs.flags32() as u16);        // faulting FLAGS
-        push16(&mut sp, regs.frame.cs as u16);         // faulting CS
-        push16(&mut sp, regs.ip32() as u16);           // faulting IP
-        push16(&mut sp, regs.err_code as u16);         // error code
-        push16(&mut sp, super::mode_transitions::SPECIAL_STUB_SEL);             // return CS
-        push16(&mut sp, stub_off as u16);              // return IP
+        push16(&mut sp, regs.frame.ss as u16);
+        push16(&mut sp, regs.sp32() as u16);
+        push16(&mut sp, regs.flags32() as u16);
+        push16(&mut sp, regs.frame.cs as u16);
+        push16(&mut sp, regs.ip32() as u16);
+        push16(&mut sp, err_code as u16);
+        push16(&mut sp, super::mode_transitions::SPECIAL_STUB_SEL);
+        push16(&mut sp, stub_off as u16);
+        if ss_32 {
+            regs.set_sp32(sp);
+        } else {
+            regs.set_sp32((regs.sp32() & !0xFFFF) | (sp & 0xFFFF));
+        }
     }
 
-    // Set up regs to call the exception handler
-    if ss_32 {
-        regs.set_sp32(sp);
-    } else {
-        regs.set_sp32((regs.sp32() & !0xFFFF) | (sp & 0xFFFF));
-    }
     regs.frame.cs = handler_sel as u64;
     regs.set_ip32(handler_off);
 
@@ -1724,51 +1729,49 @@ pub(super) fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> t
         Some(d) => d,
         None => return thread::KernelAction::Done,
     };
-
     let use32 = dpmi.client_use32;
-    let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
-    let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
 
-    let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
-
-    let (new_eip, new_cs, new_eflags, new_esp, new_ss);
     if use32 {
-        let pop32 = |sp: &mut u32| -> u32 {
-            let val = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(*sp)) as *const u32) };
-            *sp = sp.wrapping_add(4);
-            val
-        };
-        let _error_code = pop32(&mut sp);
-        new_eip = pop32(&mut sp);
-        new_cs = pop32(&mut sp) as u16;
-        new_eflags = pop32(&mut sp);
-        new_esp = pop32(&mut sp);
-        new_ss = pop32(&mut sp) as u16;
+        // 32-bit unwind path mirrors the dispatch overlap: handler
+        // RETFed past ret_eip+ret_cs, regs.SS:SP now points at err_code
+        // on host_stack with ModeSave at +4. Skip err_code and let
+        // pop_save read ModeSave at the natural pm cursor —
+        // save.restore picks up any handler modifications to the
+        // overlapping faulting fields.
+        regs.set_sp32(regs.sp32() + 4);
+        let save = super::mode_transitions::pop_save(dos, regs);
+        save.restore(regs);
+        dos.pc.locked_stack.other_stack = save.other_stack();
     } else {
+        // 16-bit: pop the spec frame from client's stack (where the
+        // 16-bit dispatch path put it). No ModeSave on locked stack
+        // for this case.
+        let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
+        let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
+        let mut sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
         let pop16 = |sp: &mut u32| -> u16 {
             let val = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(*sp)) as *const u16) };
             *sp = sp.wrapping_add(2);
             val
         };
-        let _error_code = pop16(&mut sp);
-        new_eip = pop16(&mut sp) as u32;
-        new_cs = pop16(&mut sp);
-        new_eflags = pop16(&mut sp) as u32;
-        new_esp = pop16(&mut sp) as u32;
-        new_ss = pop16(&mut sp);
+        let _err = pop16(&mut sp);
+        let new_eip = pop16(&mut sp) as u32;
+        let new_cs = pop16(&mut sp);
+        let new_eflags = pop16(&mut sp) as u32;
+        let new_esp = pop16(&mut sp) as u32;
+        let new_ss = pop16(&mut sp);
+        regs.frame.cs = new_cs as u64;
+        regs.set_ip32(new_eip);
+        regs.frame.ss = new_ss as u64;
+        if ss_32 {
+            regs.set_sp32(new_esp);
+        } else {
+            regs.set_sp32((regs.sp32() & !0xFFFF) | (new_esp & 0xFFFF));
+        }
+        let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
+        regs.set_flags32((new_eflags & !machine::PRESERVED_FLAGS) | preserved);
     }
 
-    regs.frame.cs = new_cs as u64;
-    regs.set_ip32(new_eip);
-    regs.frame.ss = new_ss as u64;
-    if ss_32 {
-        regs.set_sp32(new_esp);
-    } else {
-        regs.set_sp32((regs.sp32() & !0xFFFF) | (new_esp & 0xFFFF));
-    }
-    // Restore EFLAGS but preserve IOPL and VM
-    let preserved = regs.flags32() & machine::PRESERVED_FLAGS;
-    regs.set_flags32((new_eflags & !machine::PRESERVED_FLAGS) | preserved);
     trace_client_selector_leak("exception_return.out", regs);
     thread::KernelAction::Done
 }

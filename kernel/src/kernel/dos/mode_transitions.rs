@@ -89,14 +89,43 @@ impl LockedStackState {
 /// handler / RM code, and recipes that need to preserve them across
 /// an explicit call (DPMI 0300-02) lay their own typed frame above
 /// the ModeSave.
+///
+/// ### Hardware-stack-compat layout
+///
+/// The first five `u32` fields are ordered `eip, cs, eflags, esp, ss`
+/// to mirror what a 32-bit CPU pushes on a fault/interrupt with stack
+/// switch (`ESP` → low: EIP, CS, EFLAGS, ESP, SS). This lets recipes
+/// expose a spec-mandated frame to the client by writing only a small
+/// prefix above the ModeSave instead of duplicating the faulting
+/// state:
+///
+///   - **DPMI 0.9 §6 PM exception frame** (32-bit): a 3-dword prefix
+///     `[ret_eip, ret_cs, err_code]` above ModeSave gives the handler
+///     the exact 8-field spec layout — faulting `EIP/CS/EFLAGS/ESP/SS`
+///     at offsets `+12/+16/+20/+24/+28` from the handler's ESP coincide
+///     with ModeSave's first five u32 fields. Handler modifications
+///     to those fields land in ModeSave directly, and `save.restore`
+///     picks them up on unwind without a copy step.
+///   - **HW IRQ entry**: the iret-frame `[eip, cs, eflags]` pushed
+///     above ModeSave (with control values, not faulting state)
+///     follows the same field order, so a hardware IRET pops it and
+///     leaves `regs.SS:SP` aligned at the start of ModeSave for the
+///     trap-back stub to find.
+///
+/// 16-bit clients don't get the overlap (their spec frame uses u16
+/// fields, not u32) — those recipes write a separate compact frame
+/// and pay the small redundancy.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub(super) struct ModeSave {
-    pub cs:     u32,
+    // Hardware-stack-compat layout: matches CPU iret-frame field order
+    // (eip, cs, eflags) so the spec exception frame's faulting portion
+    // can overlap with ModeSave's first 5 u32 fields for 32-bit clients.
     pub eip:    u32,
+    pub cs:     u32,
     pub eflags: u32,
-    pub ss:     u32,
     pub esp:    u32,
+    pub ss:     u32,
     pub ds:     u16,
     pub es:     u16,
     pub fs:     u16,
@@ -115,11 +144,11 @@ impl ModeSave {
     pub fn capture(regs: &Regs, other_stack: Option<(u16, u32)>) -> Self {
         let (other_ss, other_sp) = other_stack.unwrap_or((0, 0));
         Self {
-            cs:     regs.code_seg() as u32,
             eip:    regs.ip32(),
+            cs:     regs.code_seg() as u32,
             eflags: regs.flags32(),
-            ss:     regs.stack_seg() as u32,
             esp:    regs.sp32(),
+            ss:     regs.stack_seg() as u32,
             ds:     regs.ds as u16,
             es:     regs.es as u16,
             fs:     regs.fs as u16,
