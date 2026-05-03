@@ -1275,13 +1275,6 @@ fn host_stack_read_call_args(cursor: u32) -> CallStubFrame {
 pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     let stub = host_stack_read_call_args(dos.pc.host_stack_sp);
     dos.pc.host_stack_sp += CALL_STUB_SIZE;
-    // Restore the dedicated RM stack iff this excursion ran on it
-    // (the recipe recorded the choice on push). User-supplied SS:SP
-    // means the RM handler pushed onto the user's stack; our dedicated buffer
-    // was never touched, no snapshot to restore.
-    if stub.used_dedicated_rm != 0 {
-        super::mode_transitions::pop_rm_snapshot(dos);
-    }
     let save = super::mode_transitions::pop_save(dos);
 
     // Writeback current RM regs into RmCallStruct so the PM caller sees
@@ -1361,7 +1354,6 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     // whether to pop the snapshot.
     let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
     super::mode_transitions::push_save(dos, regs);
-    if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
     dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     // Get IVT entry for the interrupt
@@ -1422,7 +1414,6 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     // Snapshot dedicated RM stack iff we're using it (see simulate_real_mode_int).
     let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
     super::mode_transitions::push_save(dos, regs);
-    if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
     dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     regs.rax = rm.eax as u64;
@@ -1477,7 +1468,6 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
 
     let stub = CallStubFrame::capture(regs, struct_addr, used_dedicated);
     super::mode_transitions::push_save(dos, regs);
-    if used_dedicated { super::mode_transitions::push_rm_snapshot(dos); }
     dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
 
     regs.rax = rm.eax as u64;

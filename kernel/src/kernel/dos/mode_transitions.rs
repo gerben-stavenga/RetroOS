@@ -635,7 +635,6 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // RM excursions. Works for VM86 and PM clients alike — no DPMI
     // session required.
     push_save(dos, regs);
-    push_rm_snapshot(dos);
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
@@ -696,7 +695,6 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    pop_rm_snapshot(dos);
     let save = pop_save(dos);
     save.restore(regs);
     dos.pc.locked_stack.other_stack = save.other_stack();
