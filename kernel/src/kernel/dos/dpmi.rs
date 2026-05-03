@@ -1310,6 +1310,7 @@ pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
 
     stub.restore_gp(regs);
     save.restore(regs);
+    dos.pc.locked_stack.other_stack = save.other_stack();
 
     dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
         regs.rax as u16, regs.flags32() & 1,

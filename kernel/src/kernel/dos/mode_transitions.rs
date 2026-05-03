@@ -124,12 +124,19 @@ pub(super) struct ModeSave {
     pub es:     u16,
     pub fs:     u16,
     pub gs:     u16,
+    /// `dos.pc.locked_stack.other_stack` value at push time. Sentinel
+    /// `(0, 0)` means `None` (selector 0 is never a valid stack
+    /// selector, so the encoding is unambiguous). pop_save's caller
+    /// restores `dos.pc.locked_stack.other_stack` from these fields.
+    pub other_ss: u16,
+    pub other_sp: u32,
 }
 
 pub(super) const MODE_SAVE_SIZE: u32 = core::mem::size_of::<ModeSave>() as u32;
 
 impl ModeSave {
-    pub fn capture(regs: &Regs) -> Self {
+    pub fn capture(regs: &Regs, other_stack: Option<(u16, u32)>) -> Self {
+        let (other_ss, other_sp) = other_stack.unwrap_or((0, 0));
         Self {
             cs:     regs.code_seg() as u32,
             eip:    regs.ip32(),
@@ -140,6 +147,8 @@ impl ModeSave {
             es:     regs.es as u16,
             fs:     regs.fs as u16,
             gs:     regs.gs as u16,
+            other_ss,
+            other_sp,
         }
     }
 
@@ -153,6 +162,13 @@ impl ModeSave {
         regs.es        = self.es as u64;
         regs.fs        = self.fs as u64;
         regs.gs        = self.gs as u64;
+    }
+
+    /// Decode the captured `other_stack` value. `(0, 0)` ⇒ None.
+    pub fn other_stack(&self) -> Option<(u16, u32)> {
+        let ss = self.other_ss;
+        let sp = self.other_sp;
+        if ss == 0 { None } else { Some((ss, sp)) }
     }
 }
 
@@ -170,7 +186,7 @@ impl ModeSave {
 /// stack at `host_stack_sp - MODE_SAVE_SIZE`. Decrements
 /// `host_stack_sp`, increments `depth`.
 pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) {
-    let save = ModeSave::capture(regs);
+    let save = ModeSave::capture(regs, dos.pc.locked_stack.other_stack);
     let cursor = dos.pc.host_stack_sp - MODE_SAVE_SIZE;
     let addr = dos::host_stack_base() + cursor;
     unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
@@ -498,6 +514,9 @@ pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) ->
     dos.pc.host_stack_sp = regs.sp32();
     let save = pop_save(dos);
     save.restore(regs);
+    // Restore the other_stack that was current at push time (None at
+    // outermost-from-client entry, Some at nested entries).
+    dos.pc.locked_stack.other_stack = save.other_stack();
 
     let (cs, eip, ss, esp, vm) =
         (save.cs as u16, save.eip, save.ss as u16, save.esp,
@@ -505,8 +524,6 @@ pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) ->
     dos_trace!("[DPMI] IRQ RESTORE -> {:04X}:{:#x} SS:ESP={:04X}:{:#x} VM={}",
         cs, eip, ss, esp, vm);
 
-    // Cross-mode bracket closed — back to client mode.
-    dos.pc.locked_stack.other_stack = None;
     thread::KernelAction::Done
 }
 
@@ -707,7 +724,9 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     let rm_arith = regs.flags32() & STATUS_MASK;
 
     pop_rm_snapshot(dos);
-    pop_save(dos).restore(regs);
+    let save = pop_save(dos);
+    save.restore(regs);
+    dos.pc.locked_stack.other_stack = save.other_stack();
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
     regs.frame.rflags |= machine::IF_FLAG as u64;
 
