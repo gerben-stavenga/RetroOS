@@ -499,8 +499,17 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     // Handler starts with IF=TF=0; other flag bits follow the current EFLAGS.
     let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8) | machine::VM_FLAG);
 
-    if dos.pc.locked_stack.in_handler() {
-        // Nested in an already-active handler context: just push iret_frame
+    // Nested only counts when the user is *already in PM* on a stack
+    // we can plant a PM iret-frame on. If the user is in VM86 (e.g.
+    // because a kernel-orchestrated RM excursion put them there for a
+    // 0300/0301/0302 RM call), a HW IRQ delivery from here is a fresh
+    // mode crossing — first-entry path that switches SS to host_stack.
+    // Without this, the nested branch would flip CS to a PM selector
+    // while leaving SS as the VM86 paragraph, and iret-to-PM with a
+    // paragraph as SS → #GP.
+    let in_pm = regs.mode() != crate::UserMode::VM86;
+    if in_pm && dos.pc.locked_stack.in_handler() {
+        // Nested in an already-active PM handler context: just push iret_frame
         // targeting outer's CS:EIP at current ESP - frame_size. Hardware
         // same-priv IRET unwinds inline, no kernel involvement.
         let new_esp = host_stack_write_iret(
