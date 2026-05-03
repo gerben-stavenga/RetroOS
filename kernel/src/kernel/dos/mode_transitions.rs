@@ -725,12 +725,29 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // round-trip.
     let ret_flags = regs.flags32() as u16;
 
+    // 16-bit DPMI clients (Borland's dpmiload, etc.) expect the host
+    // to translate paragraph-aligned 16-bit data segments to their RM
+    // equivalents on PM→RM reflect — they put data at PM-DS:offset
+    // expecting RM-DS:offset to point at the same linear bytes. 32-bit
+    // clients (DOOM/Quake/Duke3D via CWSDPMI) marshal explicitly via
+    // INT 31 0300 and want the spec-strict pass-through. Translation
+    // happens *after* push_save below so save.restore on unwind brings
+    // the original PM selector values back.
+    let translate_segs = !dos.dpmi.as_ref().map_or(true, |d| d.client_use32);
+
     // rm_get_stack: live rm cursor if a chain is in flight (e.g., we're
     // a nested reflect inside an outer 0300 BIOS call), else rm_TOS.
     // The toggle pushes its iret-frame *below* this cursor, sharing
     // rm_dedicated LIFO-style without a snapshot copy.
     let rm_dest = rm_get_stack(dos);
     let _save_at = switch_to_rm_side(dos, regs, rm_dest);
+
+    if translate_segs {
+        regs.ds = translate_rm_equivalent(&dos.ldt[..], regs.ds as u16) as u64;
+        regs.es = translate_rm_equivalent(&dos.ldt[..], regs.es as u16) as u64;
+        regs.fs = translate_rm_equivalent(&dos.ldt[..], regs.fs as u16) as u64;
+        regs.gs = translate_rm_equivalent(&dos.ldt[..], regs.gs as u16) as u64;
+    }
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
@@ -823,6 +840,27 @@ pub(super) fn seg_base(ldt: &[u64], sel: u16) -> u32 {
     let b1 = ((d >> 32) & 0xFF) as u32;
     let b2 = ((d >> 56) & 0xFF) as u32;
     b0 | (b1 << 16) | (b2 << 24)
+}
+
+/// Translate a PM selector to its RM-equivalent paragraph value, for
+/// 16-bit clients on PM→RM INT reflection. Returns `base/16` when the
+/// selector is "RM-equivalent" — 16-bit (D=0) with a paragraph-aligned
+/// base — otherwise passes the selector value through unchanged.
+///
+/// This violates DPMI 0.9 §2.4's "DS/ES undefined" letter (and matches
+/// what DOS/16M, EMM386 and Microsoft Windows DPMI hosts do, but not
+/// CWSDPMI). We only enable it for 16-bit clients (`client_use32 == false`)
+/// — Borland's `dpmiload` and similar 16-bit DPMI clients put data at
+/// `PM-DS:offset` and expect the host to deliver the same linear bytes
+/// as `RM-DS:offset` after the reflect. 32-bit clients (CWSDPMI's
+/// typical DJGPP DOS programs) use INT 31 0300 with explicit RmCallStruct
+/// for marshaling and don't need translation; passing PM selectors
+/// through unchanged matches their expectations.
+pub(super) fn translate_rm_equivalent(ldt: &[u64], sel: u16) -> u16 {
+    if sel == 0 { return 0; }
+    let base = seg_base(ldt, sel);
+    if seg_is_32(ldt, sel) || (base & 0xF) != 0 { return sel; }
+    (base >> 4) as u16
 }
 
 /// Get the D/B (default operand size) bit. GDT selectors are treated as 32-bit.
