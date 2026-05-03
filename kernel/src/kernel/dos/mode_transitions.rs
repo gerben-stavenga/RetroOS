@@ -25,22 +25,14 @@
 //!
 //! ### State tracking
 //!
-//! Per-thread tracking lives in [`LockedStackState`]:
-//!
-//! - `depth`: nesting count of *handler-context* entries. 0 means we
-//!   are in `ClientPm` or `ClientRm`. >0 means a handler is active —
-//!   could be `PmInLocked` or `RmInLocked` (or further nesting).
-//!   `enter_locked_pm` increments; `leave_locked_pm` decrements. Used
-//!   to discriminate first-entry vs nested HW IRQ delivery without
-//!   relying on `regs.SS`, which can be the user's switched-to stack.
-//!
-//! - `tos: (sel, esp)`: only meaningful while in `RmInLocked`. Records
-//!   the SS:ESP that was current immediately before we transitioned
-//!   into RM-in-locked, so that on return (or on a nested PM excursion
-//!   from RM) we know where on the locked stack the snapshot/save
-//!   chain lives. While the user is on the locked stack
-//!   (`PmInLocked`), `regs.SS:ESP` is authoritative — the field is
-//!   ignored.
+//! Per-thread tracking lives in [`LockedStackState::other_stack`]:
+//! `Option<(SS, SP)>`. `None` ⇒ user is in client mode (not on either
+//! dedicated stack). `Some((ss, sp))` ⇒ kernel cross-mode entry has
+//! put the user on a dedicated stack and we remember the cursor of
+//! the *other* dedicated stack we'd ping-pong to.
+//! `regs.SS:SP` is authoritative for whichever stack the user is
+//! currently on; `other_stack` tracks the cursor of the not-current
+//! one. ModeSave captures and restores `other_stack` symmetrically.
 //!
 //! ### Frame kinds on the locked stack
 //!
@@ -76,32 +68,17 @@ use crate::Regs;
 /// currently on; `other_stack` tracks the cursor of the not-current
 /// one.
 ///
-/// Toggled exclusively at the cross-mode bracket boundaries:
-///   - Set at `deliver_pm_irq` first-entry (kernel cross-modes
-///     client→PM-handler-on-host_stack).
-///   - Cleared at `cross_mode_restore` (kernel returns to client
-///     state).
-///
-/// `depth` is retained as the legacy nesting counter (still
-/// incremented/decremented by push_save/pop_save). The two are
-/// maintained in parallel during this transition; the long-term plan
-/// is to drop `depth` once `other_stack` is wired through cursor
-/// arithmetic too.
+/// Maintained automatically via `ModeSave`'s capture/restore: every
+/// `push_save` records the current value, every matching `pop_save`'s
+/// caller restores it. Bracket boundaries (`deliver_pm_irq`
+/// first-entry, etc.) update it explicitly when transitioning state.
 pub(super) struct LockedStackState {
-    pub depth: u8,
     pub other_stack: Option<(u16, u32)>,
 }
 
 impl LockedStackState {
     pub fn new() -> Self {
-        Self {
-            depth: 0,
-            other_stack: None,
-        }
-    }
-
-    pub fn in_handler(&self) -> bool {
-        self.depth > 0
+        Self { other_stack: None }
     }
 }
 
@@ -183,28 +160,24 @@ impl ModeSave {
 // the primitive.
 
 /// Capture current regs as a ModeSave and push it onto the locked
-/// stack at `host_stack_sp - MODE_SAVE_SIZE`. Decrements
-/// `host_stack_sp`, increments `depth`.
+/// stack at `host_stack_sp - MODE_SAVE_SIZE`. Decrements `host_stack_sp`.
 pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) {
     let save = ModeSave::capture(regs, dos.pc.locked_stack.other_stack);
     let cursor = dos.pc.host_stack_sp - MODE_SAVE_SIZE;
     let addr = dos::host_stack_base() + cursor;
     unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
     dos.pc.host_stack_sp = cursor;
-    dos.pc.locked_stack.depth = dos.pc.locked_stack.depth.saturating_add(1);
 }
 
 /// Pop the topmost ModeSave off the locked stack. Reads at
-/// `host_stack_sp`, advances `host_stack_sp` past the save,
-/// decrements `depth`. Does NOT touch regs — the caller calls
-/// `save.restore(regs)` when ready (which may be immediately, or
-/// after computing things from current regs first as `rm_iret_call`
-/// does for its RmCallStruct writeback).
+/// `host_stack_sp`, advances `host_stack_sp` past the save. Does NOT
+/// touch regs — the caller calls `save.restore(regs)` when ready
+/// (which may be immediately, or after computing things from current
+/// regs first as `rm_iret_call` does for its RmCallStruct writeback).
 pub(super) fn pop_save(dos: &mut thread::DosState) -> ModeSave {
     let addr = dos::host_stack_base() + dos.pc.host_stack_sp;
     let save = unsafe { core::ptr::read_unaligned(addr as *const ModeSave) };
     dos.pc.host_stack_sp += MODE_SAVE_SIZE;
-    dos.pc.locked_stack.depth = dos.pc.locked_stack.depth.saturating_sub(1);
     save
 }
 
