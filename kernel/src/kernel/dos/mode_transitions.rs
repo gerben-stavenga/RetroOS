@@ -66,53 +66,40 @@ use super::machine;
 use super::thread;
 use crate::Regs;
 
-/// Per-thread state tracking for the locked stack and the dedicated
-/// RM stack. Lives on `dos.pc` alongside the existing PC machine
-/// fields.
+/// Per-thread tracking for kernel-mediated PM/RM crossings.
+///
+/// `other_stack` is the central state: `None` when the user is in
+/// client mode (not on either dedicated stack), `Some((ss, sp))` when
+/// kernel cross-mode entry has put the user on a dedicated stack and
+/// remembers the cursor of the *other* dedicated stack we'd ping-pong
+/// to. `regs.SS:SP` is authoritative for whichever stack the user is
+/// currently on; `other_stack` tracks the cursor of the not-current
+/// one.
+///
+/// Toggled exclusively at the cross-mode bracket boundaries:
+///   - Set at `deliver_pm_irq` first-entry (kernel cross-modes
+///     client→PM-handler-on-host_stack).
+///   - Cleared at `cross_mode_restore` (kernel returns to client
+///     state).
+///
+/// `depth` is retained as the legacy nesting counter (still
+/// incremented/decremented by push_save/pop_save). The two are
+/// maintained in parallel during this transition; the long-term plan
+/// is to drop `depth` once `other_stack` is wired through cursor
+/// arithmetic too.
 pub(super) struct LockedStackState {
-    /// Handler-context nesting count.
-    /// - 0 = client context (`ClientPm` / `ClientRm`).
-    /// - >0 = handler context (`PmInLocked` / `RmInLocked` /
-    ///   further-nested PM excursions during RM-in-locked).
-    /// Updated only at recipe boundaries (`enter_locked_pm` /
-    /// `leave_locked_pm` and the RM/PM excursion variants).
     pub depth: u8,
-
-    /// SS:ESP captured at the moment we transitioned into
-    /// `RmInLocked`. Tells the kernel where on the locked stack the
-    /// chain (RmSnapshot + any saves) lives, since `regs.SS:ESP`
-    /// while in `RmInLocked` is on the dedicated RM stack, not the
-    /// locked stack. Inert when not in `RmInLocked`.
-    ///
-    /// Selector is part of the pair because the outer's `SS` may be
-    /// our `LOCKED_STACK_PM*_SEL` *or* a selector the handler
-    /// switched to (DPMI 0.9 §3.1.2 "If the client switches off this
-    /// stack, the new stack must also be locked and will become the
-    /// protected mode stack until it switches back").
-    pub tos: LockedStackTos,
-}
-
-/// SS:ESP pair recording where on the locked stack the kernel-managed
-/// chain lives at the moment of an RM-in-locked transition.
-#[derive(Clone, Copy, Default)]
-pub(super) struct LockedStackTos {
-    pub sel: u16,
-    pub esp: u32,
+    pub other_stack: Option<(u16, u32)>,
 }
 
 impl LockedStackState {
     pub fn new() -> Self {
         Self {
             depth: 0,
-            tos: LockedStackTos::default(),
+            other_stack: None,
         }
     }
 
-    /// True while a handler context is active anywhere up the chain.
-    /// Equivalent to "user is in `PmInLocked` or `RmInLocked` (or
-    /// further nesting)". Replaces the old `SS == LOCKED_STACK_PM*_SEL`
-    /// heuristic used for nest-vs-first-entry decisions, since that
-    /// heuristic breaks when a handler switches stacks mid-execution.
     pub fn in_handler(&self) -> bool {
         self.depth > 0
     }
@@ -432,19 +419,20 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     // Handler starts with IF=TF=0; other flag bits follow the current EFLAGS.
     let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8) | machine::VM_FLAG);
 
-    // Nested only counts when the user is *already in PM* on a stack
-    // we can plant a PM iret-frame on. If the user is in VM86 (e.g.
-    // because a kernel-orchestrated RM excursion put them there for a
-    // 0300/0301/0302 RM call), a HW IRQ delivery from here is a fresh
-    // mode crossing — first-entry path that switches SS to host_stack.
-    // Without this, the nested branch would flip CS to a PM selector
-    // while leaving SS as the VM86 paragraph, and iret-to-PM with a
-    // paragraph as SS → #GP.
+    // Discriminate via (regs.mode, other_stack):
+    //   (PM,   Some) → nested on pm_dedicated; plant iret-frame at
+    //                   regs.SP - frame_size. Hardware same-priv IRET
+    //                   unwinds inline, no kernel involvement.
+    //   (VM86, Some) → toggle: we're on rm_dedicated for a
+    //                   kernel-orchestrated RM excursion. Take the
+    //                   first-entry path so `cross_mode_restore` later
+    //                   restores the rm state and we resume the
+    //                   excursion. (Same as None case here.)
+    //   (_,    None) → first-entry: client mode → cross-mode to PM
+    //                   handler on host_stack.
     let in_pm = regs.mode() != crate::UserMode::VM86;
-    if in_pm && dos.pc.locked_stack.in_handler() {
-        // Nested in an already-active PM handler context: just push iret_frame
-        // targeting outer's CS:EIP at current ESP - frame_size. Hardware
-        // same-priv IRET unwinds inline, no kernel involvement.
+    let nested_on_pm = in_pm && dos.pc.locked_stack.other_stack.is_some();
+    if nested_on_pm {
         let new_esp = host_stack_write_iret(
             regs.sp32(), client_use32,
             regs.ip32(), regs.code_seg(), handler_flags);
@@ -458,8 +446,8 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
             dos.pc.host_stack_sp = new_esp;
         }
     } else {
-        // First entry: push a ModeSave (kernel-side save area) + plant
-        // an iret-to-SLOT_PM_IRET frame so the eventual handler IRET
+        // First entry / toggle: push a ModeSave + plant an
+        // iret-to-SLOT_PM_IRET frame so the eventual handler IRET
         // round-trips through the kernel for unwinding.
         push_save(dos, regs);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
@@ -476,6 +464,14 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         let stk_sel = if client_use32 { HOST_STACK_PM32_SEL } else { HOST_STACK_PM16_SEL };
         regs.frame.ss  = stk_sel as u64;
         regs.frame.rsp = cursor2 as u64;
+
+        // Mark cross-mode bracket open. The other dedicated stack
+        // (rm_dedicated) is empty at this point, hence rm_TOS as the
+        // saved cursor.
+        dos.pc.locked_stack.other_stack = Some((
+            dos::rm_stack_seg(),
+            (dos::rm_stack_align_offset() as u32) + dos::rm_stack_size(),
+        ));
     }
 
     regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
@@ -509,6 +505,8 @@ pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) ->
     dos_trace!("[DPMI] IRQ RESTORE -> {:04X}:{:#x} SS:ESP={:04X}:{:#x} VM={}",
         cs, eip, ss, esp, vm);
 
+    // Cross-mode bracket closed — back to client mode.
+    dos.pc.locked_stack.other_stack = None;
     thread::KernelAction::Done
 }
 
