@@ -1245,17 +1245,18 @@ impl CallStubFrame {
     }
 }
 
-/// Write a `CallStubFrame` at the cursor. Returns the new (lower) cursor.
-fn host_stack_write_call_args(cursor: u32, frame: CallStubFrame) -> u32 {
-    let new_cursor = cursor - CALL_STUB_SIZE;
-    let addr = dos::host_stack_base() + new_cursor;
+/// Write a `CallStubFrame` at the (SS, SP) cursor. Returns the new
+/// (lower) (SS, SP).
+fn host_stack_write_call_args(ldt: &[u64], cursor: (u16, u32), frame: CallStubFrame) -> (u16, u32) {
+    let new_sp = cursor.1 - CALL_STUB_SIZE;
+    let addr = super::mode_transitions::seg_base(ldt, cursor.0).wrapping_add(new_sp);
     unsafe { core::ptr::write_unaligned(addr as *mut CallStubFrame, frame); }
-    new_cursor
+    (cursor.0, new_sp)
 }
 
-/// Read a `CallStubFrame` at the cursor.
-fn host_stack_read_call_args(cursor: u32) -> CallStubFrame {
-    let addr = dos::host_stack_base() + cursor;
+/// Read a `CallStubFrame` at the (SS, SP) cursor.
+fn host_stack_read_call_args(ldt: &[u64], cursor: (u16, u32)) -> CallStubFrame {
+    let addr = super::mode_transitions::seg_base(ldt, cursor.0).wrapping_add(cursor.1);
     unsafe { core::ptr::read_unaligned(addr as *const CallStubFrame) }
 }
 
@@ -1266,9 +1267,14 @@ fn host_stack_read_call_args(cursor: u32) -> CallStubFrame {
 /// is critical: writeback uses *current* (post-RM) regs, so it must run
 /// before `restore_gp` overwrites them.
 pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
-    let stub = host_stack_read_call_args(dos.pc.host_stack_sp);
-    dos.pc.host_stack_sp += CALL_STUB_SIZE;
-    let save = super::mode_transitions::pop_save(dos);
+    // User just RM-IRETed onto rm side; pm cursor lives in other_stack.
+    // CallStubFrame is the topmost record, ModeSave below it.
+    let cursor0 = super::mode_transitions::pm_cursor(dos, regs);
+    let stub = host_stack_read_call_args(&dos.ldt[..], cursor0);
+    let save = super::mode_transitions::pop_save_at(
+        &dos.ldt[..],
+        (cursor0.0, cursor0.1 + CALL_STUB_SIZE),
+    );
 
     // Writeback current RM regs into RmCallStruct so the PM caller sees
     // results. Must happen *before* GP-restore overwrites regs.
@@ -1334,19 +1340,24 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
         int_num, ax, bx, cx, dx, ds, es, edi);
       dump_ds_dx(ds, rm.edx); }
 
-    // Use SS:SP from structure if provided, else our dedicated RM stack.
-    // The default must NOT overlap the client's data area (PSP_SEGMENT is unsafe).
-    let rm_ss = if rm.ss != 0 { rm.ss } else { dos::rm_stack_seg() };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { super::mode_transitions::rm_stack_top() };
+    // Use SS:SP from structure if provided, else our dedicated RM stack
+    // resumed *below* the outer excursion's live cursor (LIFO sharing,
+    // no snapshot copy). other_stack carries the rm side's live (SS, SP);
+    // None ⇒ first-entry from client, rm side is empty so default to
+    // rm_TOS.
+    let (default_rm_ss, default_rm_sp) = match dos.pc.locked_stack.other_stack {
+        Some(p) => p,
+        None => (dos::rm_stack_seg(), super::mode_transitions::rm_stack_top() as u32),
+    };
+    let rm_ss = if rm.ss != 0 { rm.ss } else { default_rm_ss };
+    let rm_sp = if rm.sp != 0 { rm.sp as u32 } else { default_rm_sp };
 
-    // Save PM state + rm_struct_addr stub-arg on locked stack (CALL slot).
-    // When using the dedicated RM stack, snapshot it first so a nested
-    // RM excursion can run on a fresh stack and the outer caller resumes
-    // intact on unwind. The stub records this so SLOT_RM_IRET_CALL knows
-    // whether to pop the snapshot.
+    // Save PM state + rm_struct_addr stub-arg on pm side (above the
+    // ModeSave). push_save returns post-push pm (SS, SP); we write the
+    // CallStubFrame at that cursor.
     let stub = CallStubFrame::capture(regs, struct_addr);
-    super::mode_transitions::push_save(dos, regs);
-    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    let cursor1 = super::mode_transitions::push_save(dos, regs);
+    let cursor2 = host_stack_write_call_args(&dos.ldt[..], cursor1, stub);
 
     // Get IVT entry for the interrupt
     let ivt_off = machine::read_u16(0, (int_num as u32) * 4);
@@ -1382,6 +1393,9 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     regs.frame.rip = ivt_off as u64;
     regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
 
+    // User now on rm side; stash post-push pm (SS, SP).
+    dos.pc.locked_stack.other_stack = Some(cursor2);
+
     dos_trace!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         int_num, ivt_seg, ivt_off, rm_ss, rm_sp.wrapping_sub(6));
 
@@ -1398,14 +1412,18 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
     let rm = unsafe { *(struct_addr as *const RmCallStruct) };
 
-    let rm_ss = if rm.ss != 0 { rm.ss } else { dos::rm_stack_seg() };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { super::mode_transitions::rm_stack_top() };
+    // Same LIFO-share rule as simulate_real_mode_int.
+    let (default_rm_ss, default_rm_sp) = match dos.pc.locked_stack.other_stack {
+        Some(p) => p,
+        None => (dos::rm_stack_seg(), super::mode_transitions::rm_stack_top() as u32),
+    };
+    let rm_ss = if rm.ss != 0 { rm.ss } else { default_rm_ss };
+    let rm_sp = if rm.sp != 0 { rm.sp as u32 } else { default_rm_sp };
 
-    // Save PM state + rm_struct_addr stub-arg on locked stack (CALL slot).
-    // Snapshot dedicated RM stack iff we're using it (see simulate_real_mode_int).
+    // Save PM state + rm_struct_addr stub-arg on pm side.
     let stub = CallStubFrame::capture(regs, struct_addr);
-    super::mode_transitions::push_save(dos, regs);
-    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    let cursor1 = super::mode_transitions::push_save(dos, regs);
+    let cursor2 = host_stack_write_call_args(&dos.ldt[..], cursor1, stub);
 
     regs.rax = rm.eax as u64;
     regs.rbx = rm.ebx as u64;
@@ -1433,6 +1451,9 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
     regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
+
+    // User now on rm side; stash post-push pm (SS, SP).
+    dos.pc.locked_stack.other_stack = Some(cursor2);
     thread::KernelAction::Done
 }
 
@@ -1453,12 +1474,17 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
         edi_f, esi_f, ebp_f, ebx_f, edx_f, ecx_f, eax_f, flags_f);
       dump_ds_dx(ds, rm.edx); }
 
-    let rm_ss = if rm.ss != 0 { rm.ss } else { dos::rm_stack_seg() };
-    let rm_sp = if rm.sp != 0 { rm.sp } else { super::mode_transitions::rm_stack_top() };
+    // Same LIFO-share rule as simulate_real_mode_int.
+    let (default_rm_ss, default_rm_sp) = match dos.pc.locked_stack.other_stack {
+        Some(p) => p,
+        None => (dos::rm_stack_seg(), super::mode_transitions::rm_stack_top() as u32),
+    };
+    let rm_ss = if rm.ss != 0 { rm.ss } else { default_rm_ss };
+    let rm_sp = if rm.sp != 0 { rm.sp as u32 } else { default_rm_sp };
 
     let stub = CallStubFrame::capture(regs, struct_addr);
-    super::mode_transitions::push_save(dos, regs);
-    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    let cursor1 = super::mode_transitions::push_save(dos, regs);
+    let cursor2 = host_stack_write_call_args(&dos.ldt[..], cursor1, stub);
 
     regs.rax = rm.eax as u64;
     regs.rbx = rm.ebx as u64;
@@ -1487,6 +1513,8 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
     regs.frame.rip = rm.ip as u64;
     regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
 
+    // User now on rm side; stash post-push pm (SS, SP).
+    dos.pc.locked_stack.other_stack = Some(cursor2);
     thread::KernelAction::Done
 }
 
@@ -1534,25 +1562,37 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     };
     unsafe { *(struct_addr as *mut RmCallStruct) = rm_call; }
 
-    // Save RM state + rm_struct_addr stub-arg on locked stack (CALL slot
-    // — the PM callback's eventual unwind writes its post-handler RM
-    // regs back into the RmCallStruct). RM→PM transition: PM handler
-    // runs on locked PM stack, dedicated RM stack is untouched, so no
-    // RmSnapshot push.
+    // Capture rm caller's live SS:SP for other_stack — same LIFO-share
+    // rule as deliver_pm_irq toggle case. Reading regs *before*
+    // push_save modifies them.
+    let rm_caller = (regs.stack_seg(), regs.sp32());
+
+    // Save RM state + rm_struct_addr stub-arg on pm side (DPMI 0.9
+    // §3.1.4: PM handler runs on locked PM stack). push_save returns
+    // the post-push pm (SS, SP) — we write the CallStubFrame above
+    // that, then land the handler on top of both records.
     let stub = CallStubFrame::capture(regs, struct_addr);
-    super::mode_transitions::push_save(dos, regs);
-    dos.pc.host_stack_sp = host_stack_write_call_args(dos.pc.host_stack_sp, stub);
+    let cursor1 = super::mode_transitions::push_save(dos, regs);
+    let cursor2 = host_stack_write_call_args(&dos.ldt[..], cursor1, stub);
 
     // Switch to protected mode and call the PM handler.
     // DS:SI = selector:offset pointing to real-mode SS:SP
     // ES:DI = selector:offset pointing to register structure
+    // SS:ESP -> locked PM stack (pm side at cursor2)
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
     regs.frame.cs = pm_cs as u64;
     regs.set_ip32(pm_eip);
+    regs.frame.ss  = cursor2.0 as u64;
+    regs.frame.rsp = cursor2.1 as u64;
     regs.ds = rm_struct_sel as u64;  // DS:ESI = register structure
     regs.rsi = rm_struct_off as u64;
     regs.es = rm_struct_sel as u64;  // ES:EDI = register structure
     regs.rdi = rm_struct_off as u64;
+
+    // User now on pm side. other_stack carries rm caller's live SS:SP
+    // so a nested PM→RM transition (e.g. handler does INT 31 0300)
+    // resumes below it instead of clobbering at rm_TOS.
+    dos.pc.locked_stack.other_stack = Some(rm_caller);
 }
 
 

@@ -151,34 +151,77 @@ impl ModeSave {
 
 // ─── Foundation primitives ────────────────────────────────────────────
 //
-// All save primitives operate at `dos.pc.host_stack_sp` (the
-// kernel-tracked top of the locked-stack chain). No cursor parameters
-// at the call site. Cursor-driven callers (where the user's
-// post-iret SS:ESP lands on the save and host_stack_sp hasn't been
-// synced) resync `host_stack_sp = regs.sp32()` themselves before
-// invoking these — the resync is the cursor-driven step, not part of
-// the primitive.
+// The pm-side cursor is tracked as a full (SS, SP) pair — never just
+// an SP — so that handlers which switch SS off the kernel-shared
+// host_stack onto their own locked stack (DPMI 0.9 §3.1.2) round-trip
+// correctly. When user is on the pm side, the cursor is `regs.SS:SP`
+// (whatever stack they're on right now). When user is on the rm side,
+// it's been stashed in `other_stack` at toggle time, capturing both
+// segment and offset of wherever pm last was.
 
-/// Capture current regs as a ModeSave and push it onto the locked
-/// stack at `host_stack_sp - MODE_SAVE_SIZE`. Decrements `host_stack_sp`.
-pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) {
-    let save = ModeSave::capture(regs, dos.pc.locked_stack.other_stack);
-    let cursor = dos.pc.host_stack_sp - MODE_SAVE_SIZE;
-    let addr = dos::host_stack_base() + cursor;
-    unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
-    dos.pc.host_stack_sp = cursor;
+/// Pick the pm-side stack selector for a fresh first-entry. 32-bit
+/// clients get the PM32 alias (D=1), 16-bit clients PM16. Both alias
+/// the same physical buffer at `host_stack_base()`.
+pub(super) fn host_stack_pm_seg(dos: &thread::DosState) -> u16 {
+    if dos.dpmi.as_ref().map_or(false, |d| d.client_use32) {
+        HOST_STACK_PM32_SEL
+    } else {
+        HOST_STACK_PM16_SEL
+    }
 }
 
-/// Pop the topmost ModeSave off the locked stack. Reads at
-/// `host_stack_sp`, advances `host_stack_sp` past the save. Does NOT
-/// touch regs — the caller calls `save.restore(regs)` when ready
-/// (which may be immediately, or after computing things from current
-/// regs first as `rm_iret_call` does for its RmCallStruct writeback).
-pub(super) fn pop_save(dos: &mut thread::DosState) -> ModeSave {
-    let addr = dos::host_stack_base() + dos.pc.host_stack_sp;
-    let save = unsafe { core::ptr::read_unaligned(addr as *const ModeSave) };
-    dos.pc.host_stack_sp += MODE_SAVE_SIZE;
-    save
+/// The pm-side cursor as a (SS, SP) pair.
+///
+///   - chain empty (`other_stack=None`): default to host_stack at empty
+///     TOS — what first-entry will switch onto.
+///   - in chain, user on pm side (`mode != VM86`): regs.SS:SP itself.
+///     Works whether SS is HOST_STACK_PM* or some handler-owned locked
+///     stack; we just track wherever pm currently is.
+///   - in chain, user on rm side (`mode == VM86`): pm side's
+///     (SS, SP) was stashed in other_stack at the toggle that put us
+///     on rm. Read it back.
+#[inline]
+pub(super) fn pm_cursor(dos: &thread::DosState, regs: &Regs) -> (u16, u32) {
+    match dos.pc.locked_stack.other_stack {
+        None => (host_stack_pm_seg(dos), dos::host_stack_empty_sp()),
+        Some(p) if regs.mode() == crate::UserMode::VM86 => p,
+        Some(_) => (regs.stack_seg(), regs.sp32()),
+    }
+}
+
+/// Resolve a (SS, SP) pair to a linear address, using the LDT for SS
+/// base. Used by push_save / pop_save to read/write a save at an
+/// arbitrary pm-side cursor.
+fn pm_addr(ldt: &[u64], cursor: (u16, u32)) -> u32 {
+    seg_base(ldt, cursor.0).wrapping_add(cursor.1)
+}
+
+/// Capture current regs as a ModeSave and write it at
+/// `pm_cursor.SP − MODE_SAVE_SIZE` on `pm_cursor.SS`. Returns the
+/// post-push (SS, SP) — caller is responsible for stashing it
+/// (via regs.SS:SP if landing the user on pm side, or `other_stack`
+/// if landing on rm side).
+pub(super) fn push_save(dos: &mut thread::DosState, regs: &Regs) -> (u16, u32) {
+    let save = ModeSave::capture(regs, dos.pc.locked_stack.other_stack);
+    let (ss, sp) = pm_cursor(dos, regs);
+    let new_sp = sp - MODE_SAVE_SIZE;
+    let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
+    unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
+    (ss, new_sp)
+}
+
+/// Read the topmost ModeSave at `pm_cursor`. Doesn't write back — the
+/// caller follows with `save.restore(regs)` which clobbers SS:SP and
+/// other_stack, so the post-pop cursor doesn't need to live anywhere.
+pub(super) fn pop_save(dos: &thread::DosState, regs: &Regs) -> ModeSave {
+    pop_save_at(&dos.ldt[..], pm_cursor(dos, regs))
+}
+
+/// Read a ModeSave at an explicit (SS, SP). Used by `rm_iret_call`
+/// which has to skip past a CallStubFrame first.
+pub(super) fn pop_save_at(ldt: &[u64], cursor: (u16, u32)) -> ModeSave {
+    let addr = pm_addr(ldt, cursor);
+    unsafe { core::ptr::read_unaligned(addr as *const ModeSave) }
 }
 
 // ─── Dedicated RM stack ───────────────────────────────────────────────
@@ -370,16 +413,19 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8) | machine::VM_FLAG);
 
     // Discriminate via (regs.mode, other_stack):
-    //   (PM,   Some) → nested on pm_dedicated; plant iret-frame at
-    //                   regs.SP - frame_size. Hardware same-priv IRET
-    //                   unwinds inline, no kernel involvement.
-    //   (VM86, Some) → toggle: we're on rm_dedicated for a
-    //                   kernel-orchestrated RM excursion. Take the
-    //                   first-entry path so `cross_mode_restore` later
-    //                   restores the rm state and we resume the
-    //                   excursion. (Same as None case here.)
-    //   (_,    None) → first-entry: client mode → cross-mode to PM
-    //                   handler on host_stack.
+    //   (PM,   Some) → nested on pm side; plant iret-frame at
+    //                   regs.SP − frame_size on whatever stack the
+    //                   handler is currently using. Hardware same-priv
+    //                   IRET unwinds inline; no kernel save needed
+    //                   because regs.SS:SP IS the cursor and we can
+    //                   trust hardware to put it back.
+    //   (VM86, Some) → toggle from rm side: push save on pm side
+    //                   (whose cursor is in other_stack), switch to
+    //                   pm side at the post-push position, leave the
+    //                   prior rm SS:SP captured in the save for unwind.
+    //   (_,    None) → first-entry from client: pm side is empty, so
+    //                   pm_cursor defaults to host_stack:empty_sp.
+    //                   Same path as toggle, plus the empty default.
     let in_pm = regs.mode() != crate::UserMode::VM86;
     let nested_on_pm = in_pm && dos.pc.locked_stack.other_stack.is_some();
     if nested_on_pm {
@@ -387,41 +433,42 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
             regs.sp32(), client_use32,
             regs.ip32(), regs.code_seg(), handler_flags);
         regs.frame.rsp = new_esp as u64;
-        // Stack-cursor discipline: if the iret-frame landed on host_stack,
-        // advance the kernel-tracked cursor so subsequent push_save calls
-        // don't overlap. If the handler had switched off host_stack to its
-        // own locked stack (per DPMI 0.9 §3.1.2), the iret-frame is on that
-        // other stack and host_stack_sp is unaffected.
-        if regs.stack_seg() == HOST_STACK_PM16_SEL || regs.stack_seg() == HOST_STACK_PM32_SEL {
-            dos.pc.host_stack_sp = new_esp;
-        }
     } else {
-        // First entry / toggle: push a ModeSave + plant an
-        // iret-to-SLOT_PM_IRET frame so the eventual handler IRET
-        // round-trips through the kernel for unwinding.
-        push_save(dos, regs);
+        // Capture pre-toggle rm side for other_stack. In the toggle
+        // case (VM86, Some) regs.SS:SP IS the rm cursor — recording
+        // it lets a nested reflect_int_to_real_mode push its iret
+        // frame *below* this position instead of clobbering at
+        // rm_stack_top. In the first-entry case (None) rm is empty,
+        // so default to rm_TOS.
+        let rm_cursor = if regs.mode() == crate::UserMode::VM86 {
+            (regs.stack_seg(), regs.sp32())
+        } else {
+            (dos::rm_stack_seg(),
+             (dos::rm_stack_align_offset() as u32) + dos::rm_stack_size())
+        };
+
+        // Push save on pm side. push_save returns the post-push
+        // (SS, SP) — that's where the iret-frame will go above the
+        // save, and where regs.SS:SP will land for the handler.
+        let cursor1 = push_save(dos, regs);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
-        let cursor2 = host_stack_write_iret(
-            dos.pc.host_stack_sp, client_use32,
+        let new_sp = host_stack_write_iret(
+            cursor1.1, client_use32,
             stub_eip, SPECIAL_STUB_SEL, handler_flags);
-        dos.pc.host_stack_sp = cursor2;
 
         regs.ds = 0;
         regs.es = 0;
         regs.fs = 0;
         regs.gs = 0;
 
-        let stk_sel = if client_use32 { HOST_STACK_PM32_SEL } else { HOST_STACK_PM16_SEL };
-        regs.frame.ss  = stk_sel as u64;
-        regs.frame.rsp = cursor2 as u64;
+        regs.frame.ss  = cursor1.0 as u64;
+        regs.frame.rsp = new_sp as u64;
 
-        // Mark cross-mode bracket open. The other dedicated stack
-        // (rm_dedicated) is empty at this point, hence rm_TOS as the
-        // saved cursor.
-        dos.pc.locked_stack.other_stack = Some((
-            dos::rm_stack_seg(),
-            (dos::rm_stack_align_offset() as u32) + dos::rm_stack_size(),
-        ));
+        // other_stack tracks rm side's live cursor (so a nested
+        // reflect_int_to_real_mode resumes below it instead of at
+        // rm_TOS, sharing the dedicated buffer LIFO-style without
+        // a snapshot copy).
+        dos.pc.locked_stack.other_stack = Some(rm_cursor);
     }
 
     regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
@@ -436,17 +483,12 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
 /// stub catches an IRQ that has no PM handler installed.
 ///
 /// At entry: hardware IRET advanced regs.ESP past the iret_frame, so
-/// regs.ESP now points at the ModeSave on host_stack. After restoring,
-/// `host_stack_sp` is bumped back up past both records.
+/// regs.SS:SP now points at the ModeSave on whichever pm stack the
+/// handler used (host_stack or its own locked stack). pm_cursor reads
+/// it directly off (regs.SS, regs.SP); save.restore then clobbers SS:SP
+/// with the pre-toggle values.
 pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
-    debug_assert!(regs.stack_seg() == HOST_STACK_PM16_SEL ||
-                  regs.stack_seg() == HOST_STACK_PM32_SEL,
-                  "cross_mode_restore: SS not host_stack");
-
-    // Resync host_stack_sp from the user's post-iret cursor: hardware
-    // IRET advanced ESP past the iret frame onto the save's start.
-    dos.pc.host_stack_sp = regs.sp32();
-    let save = pop_save(dos);
+    let save = pop_save(dos, regs);
     save.restore(regs);
     // Restore the other_stack that was current at push time (None at
     // outermost-from-client entry, Some at nested entries).
@@ -586,23 +628,32 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
 /// sti, synth-iret of the iret-frame the caller planted on the user's
 /// stack (CS:EIP they want resumed at).
 pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
-    // Save client state, snapshot the dedicated RM stack onto the
-    // locked stack, then run the RM handler on a fresh dedicated RM stack. The handler
-    // runs on a kernel-owned RM stack — never on the client's own VM86
-    // stack — so a HW IRQ landing during a sensitive moment in the
-    // client (e.g. just after exec_return) can't trample the client's
-    // saved registers / return address. The snapshot+restore pair on
-    // the locked stack provides reentrance for nested kernel-orchestrated
-    // RM excursions. Works for VM86 and PM clients alike — no DPMI
-    // session required.
-    push_save(dos, regs);
+    // Save client state, then run the RM handler on the dedicated RM
+    // stack. The handler runs on a kernel-owned RM stack — never on
+    // the client's own VM86 stack — so a HW IRQ landing during a
+    // sensitive moment in the client (e.g. just after exec_return)
+    // can't trample the client's saved registers / return address.
+    // Works for VM86 and PM clients alike — no DPMI session required.
+    //
+    // Read rm side's live cursor *before* push_save so a nested
+    // excursion (e.g. HW IRQ during a 0300 BIOS call → default-stub
+    // reflect → here again) lands its iret-frame *below* the outer
+    // excursion's data, sharing rm_dedicated LIFO-style. The outer
+    // entry (deliver_pm_irq toggle, or simulate_real_mode_int) wrote
+    // the live rm SS:SP into other_stack at toggle time. None means
+    // first-entry from client — rm is empty, default to rm_TOS.
+    let rm_cursor = match dos.pc.locked_stack.other_stack {
+        Some(p) => p,
+        None => (dos::rm_stack_seg(), rm_stack_top() as u32),
+    };
+    let pm_after_push = push_save(dos, regs);
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
     let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
 
-    regs.frame.ss = dos::rm_stack_seg() as u64;
-    regs.frame.rsp = rm_stack_top() as u64;
+    regs.frame.ss  = rm_cursor.0 as u64;
+    regs.frame.rsp = rm_cursor.1 as u64;
 
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
     // own INT n in real mode would push: FLAGS / CS / IP. FLAGS is the
@@ -634,6 +685,10 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // when reflecting a software interrupt. The extender/client is responsible
     // for any DOS-call marshaling that requires real-mode segment values.
 
+    // User now on rm side; stash the post-push pm (SS, SP) in
+    // other_stack so the unwind path can locate the save.
+    dos.pc.locked_stack.other_stack = Some(pm_after_push);
+
     dos_trace!("[DPMI] reflect INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X} AX={:04X} DS={:04X} ES={:04X}",
         vector, ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), regs.rax as u16,
         regs.ds as u16, regs.es as u16);
@@ -656,7 +711,10 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x0CD5;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    let save = pop_save(dos);
+    // pm_cursor reads from other_stack here (we're in VM86 with
+    // other_stack=Some); pop_save fetches the save from wherever pm
+    // last was.
+    let save = pop_save(dos, regs);
     save.restore(regs);
     dos.pc.locked_stack.other_stack = save.other_stack();
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
@@ -664,14 +722,11 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
 
     // Planted iret-frame width follows client bitness (DPMI 0.9 §10.6),
     // matching what host_stack_write_iret used on the entry side.
+    // pop_iret_frame advances regs.SP — which IS the pm cursor while
+    // user is on pm side, so the frame's bytes are released
+    // automatically.
     let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
-    let frame_size: u32 = if client_use32 { 12 } else { 6 };
-    let on_host_stack = regs.stack_seg() == HOST_STACK_PM16_SEL
-        || regs.stack_seg() == HOST_STACK_PM32_SEL;
     let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, client_use32);
-    if on_host_stack {
-        dos.pc.host_stack_sp += frame_size;
-    }
     regs.set_ip32(ret_eip);
     regs.set_cs32(ret_cs as u32);
     regs.set_flags32(ret_flags | machine::IF_FLAG);

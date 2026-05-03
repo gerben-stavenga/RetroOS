@@ -106,8 +106,8 @@ use dos::{
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_PM_TO_REAL,
     SLOT_PM_IRET,
     slot_offset,
-    host_stack_base, host_stack_size,
-    rm_stack_base, rm_stack_size, rm_stack_seg,
+    host_stack_base, host_stack_size, host_stack_empty_sp,
+    rm_stack_base, rm_stack_size, rm_stack_seg, rm_stack_align_offset,
 };
 
 use crate::kernel::thread;

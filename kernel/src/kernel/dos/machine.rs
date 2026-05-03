@@ -371,25 +371,11 @@ pub struct PcMachine {
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
-    /// Cursor for the locked PM stack (`host_stack`). Points at the
-    /// lowest used byte (the topmost live record); next first-entry push
-    /// reserves space below by subtracting record size. Initialized to
-    /// `host_stack_size()` (empty); returns there once all in-flight
-    /// excursions unwind. Per DPMI 0.9 §3.1.2 the locked PM stack is
-    /// switched onto on the first entry from the client and is reused
-    /// (without further switches) by nested entries.
-    ///
-    /// In-flight: this field is the kernel-side ToS used by the legacy
-    /// `host_stack_write_save` / `host_stack_read_save` recipes. The new
-    /// foundation in [`super::mode_transitions`] tracks the same information
-    /// inside [`super::mode_transitions::LockedStackState::tos`] (active only
-    /// while in RM-in-locked) plus regs.SS:ESP (authoritative in
-    /// PM-in-locked). Once recipes migrate, this field goes away.
-    pub host_stack_sp: u32,
 
-    /// PM/RM transition state (depth + RM-in-locked ToS) used by the
-    /// new [`super::mode_transitions`] recipes as they migrate over from the
-    /// legacy `host_stack_sp`-based bookkeeping.
+    /// PM/RM transition state. The pm-side cursor isn't a separate
+    /// field — it's `regs.SS:SP` when user is on pm side, or
+    /// `locked_stack.other_stack` (an `(SS, SP)` pair) when user is on
+    /// rm side. See [`super::mode_transitions::pm_cursor`].
     pub locked_stack: super::mode_transitions::LockedStackState,
 }
 
@@ -562,7 +548,6 @@ impl PcMachine {
             e0_pending: false,
             vga: VgaState::new(),
             cmos_index: 0,
-            host_stack_sp: super::dos::host_stack_size(),
             locked_stack: super::mode_transitions::LockedStackState::new(),
         }
     }

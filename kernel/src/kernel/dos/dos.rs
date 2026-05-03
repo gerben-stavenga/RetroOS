@@ -2456,6 +2456,13 @@ pub(super) fn host_stack_base() -> u32 {
 pub(super) fn host_stack_size() -> u32 {
     core::mem::size_of_val(&low_mem().host_stack) as u32
 }
+/// SP value within `HOST_STACK_PM*_SEL` for an empty locked stack. The
+/// selectors have base = host_stack_base() and limit = size−1, so the
+/// post-init SP that pushes decrement from is exactly `size`. Used by
+/// [`super::mode_transitions::pm_cursor`] as the chain-empty default.
+pub(super) fn host_stack_empty_sp() -> u32 {
+    host_stack_size()
+}
 
 /// Base linear address + size of the per-thread dedicated RM stack.
 /// `rm_stack_seg()` returns the paragraph floor of the buffer's base;
