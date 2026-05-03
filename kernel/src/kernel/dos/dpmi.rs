@@ -1311,9 +1311,6 @@ pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     stub.restore_gp(regs);
     save.restore(regs);
 
-    // Re-entered ring0 from VM86 RM excursion (the 0300/0301/0302 call).
-    dos.pc.locked_stack.in_locked_stack = true;
-
     dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
         regs.rax as u16, regs.flags32() & 1,
         regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -1403,11 +1400,8 @@ fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread
     dos_trace!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         int_num, ivt_seg, ivt_off, rm_ss, rm_sp.wrapping_sub(6));
 
-    // Leaving ring0 — about to iret-out to VM86 RM excursion.
-    dos.pc.locked_stack.in_locked_stack = false;
-
-    // Now in VM86 mode — the event loop will execute the RM handler.
-    // When it IRETs to callback_stub, INT 31h fires, and rm_iret_call() runs.
+    // Now in VM86 mode — the event loop will execute the BIOS handler.
+    // When it IRETs to callback_stub, INT 31h fires, and callback_return() is called.
     thread::KernelAction::Done
 }
 
@@ -1456,9 +1450,6 @@ fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
     regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
-
-    // Leaving ring0 — about to iret-out to VM86 RM excursion.
-    dos.pc.locked_stack.in_locked_stack = false;
     thread::KernelAction::Done
 }
 
@@ -1515,8 +1506,6 @@ fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thre
     regs.frame.rip = rm.ip as u64;
     regs.frame.rflags = (machine::VM_FLAG | machine::IF_FLAG | machine::IOPL_VM86) as u64;
 
-    // Leaving ring0 — about to iret-out to VM86 RM excursion.
-    dos.pc.locked_stack.in_locked_stack = false;
     thread::KernelAction::Done
 }
 
@@ -1583,9 +1572,6 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     regs.rsi = rm_struct_off as u64;
     regs.es = rm_struct_sel as u64;  // ES:EDI = register structure
     regs.rdi = rm_struct_off as u64;
-
-    // Entering ring0 — RM→PM transition into the callback handler.
-    dos.pc.locked_stack.in_locked_stack = true;
 }
 
 
