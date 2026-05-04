@@ -74,7 +74,7 @@ pub(crate) fn dispatch_kernel_syscall(
         0x20 => {
             if let Some(parent) = dos.exec_parent.take() {
                 dos.last_child_exit_status = 0x0000;
-                return exec_return(dos, regs, parent);
+                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
             }
             thread::KernelAction::Exit(0)
         }
@@ -89,7 +89,17 @@ pub(crate) fn dispatch_kernel_syscall(
         0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
         0x2E => int_2eh(kt, dos, regs),
         0x2F => int_2fh(dos, regs),
-        0x67 => int_67h(dos, regs),
+        0x67 => {
+            if !EMS_ENABLED {
+                // No EMS host: AH=80 ("invalid function in handle") so
+                // detection probes (AH=40 "get status" / AH=41 "get page
+                // frame") see a plain failure instead of getting a stale
+                // page-frame paragraph back.
+                regs.rax = (regs.rax & !0xFF00) | 0x80_00;
+                return thread::KernelAction::Done;
+            }
+            int_67h(dos, regs)
+        }
         _ => {
             dos_trace!("dispatch_kernel_syscall: unhandled vector {:#04x}", vector);
             thread::KernelAction::Done
@@ -152,8 +162,15 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             if !matches!(action, thread::KernelAction::Done) {
                 return action;
             }
-            write_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4),
-                      machine::vm86_flags(regs) as u16);
+            // Flag-writeback only when we're still in VM86. AH=4C with a
+            // PM parent flips mode to PM mid-dispatch via exec_return; in
+            // that case regs.SS:SP is the parent's PM stack and the flag
+            // writeback would scribble garbage. finish_dos_call below
+            // takes the PM branch and merges flags through pop_iret_frame.
+            if regs.mode() == crate::UserMode::VM86 {
+                write_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4),
+                          machine::vm86_flags(regs) as u16);
+            }
             action
         }
         SLOT_SAVE_RESTORE => {
@@ -173,17 +190,18 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
         }
     };
 
-    // Pop the VM86 stack frame left by the caller before returning.
+    // Pop the stack frame left by the caller before returning.
     // IVT-redirect: original INT pushed FLAGS/CS/IP (6 bytes) — pop and return to caller.
     // Far-call (XMS): CALL FAR pushed CS/IP (4 bytes) — pop and return to caller.
     // Mode-switching stubs (DPMI entry, raw switch, callbacks) replace all regs — skip.
+    //
+    // The pop is mode-aware: a child of a PM parent (VM86 client of bcc-
+    // via-PMDOS) issuing AH=4C runs `exec_return`, which restores the PM
+    // parent's SS:SP and clears VM_FLAG. We're then logically resuming a
+    // PM caller and must pop the iret-frame `deliver_pm_int` planted on
+    // the parent's PM stack, not a VM86-style frame.
     if !is_far_call {
-        let ret_ip = vm86_pop(regs);
-        let ret_cs = vm86_pop(regs);
-        let ret_flags = vm86_pop(regs);
-        set_vm86_ip(regs, ret_ip);
-        set_vm86_cs(regs, ret_cs);
-        machine::set_vm86_flags(regs, ret_flags as u32);
+        finish_dos_call(dos, regs);
     } else if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
         // Returns to caller — pop far-call return address
         let ret_ip = vm86_pop(regs);
@@ -194,6 +212,54 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
     // Other far-call stubs (DPMI entry, raw switch, callbacks) switch modes entirely
 
     action
+}
+
+/// PMDOS INT 21 short-circuit. PM client issued `int 21h`; the host's
+/// PM int dispatcher (`deliver_pm_int`) routed to this slot via
+/// `dos.pm_vectors[0x21] = (SPECIAL_STUB_SEL, STUB_BASE + SLOT_PMDOS_INT21*2)`,
+/// which `dpmi_enter` installs when `client_use32 == false`.
+///
+/// We service the call directly with PM regs — no `switch_to_rm_side`,
+/// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
+/// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
+/// On exit `finish_dos_call` does the mode-aware iret-frame pop.
+pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let action = int_21h(kt, dos, regs);
+    if !matches!(action, thread::KernelAction::Done) { return action; }
+    finish_dos_call(dos, regs);
+    thread::KernelAction::Done
+}
+
+/// Resume the user after a kernel-serviced DOS call. Mode-aware: the call
+/// might have flipped mode (AH=4B EXEC sets up a VM86 child, AH=4C/31
+/// restores parent which may be VM86 or PM), so check `regs.mode()`
+/// post-handler rather than assuming.
+///
+///   - VM86: standard `vm86_pop` ×3 — pops FLAGS/CS/IP off regs.SS:SP
+///     (which is either the child's stack with the entry frame from
+///     `exec_program`, or a VM86 parent's stack with the original INT
+///     21 frame).
+///   - PM: synth-iret the frame `deliver_pm_int` planted on the PM
+///     stack. Status-flag merge mirrors `rm_iret` so DOS-call CF/AX
+///     results survive.
+fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Regs) {
+    const STATUS_MASK: u32 = 0x0CD5;
+    if regs.mode() == crate::UserMode::VM86 {
+        let ret_ip = vm86_pop(regs);
+        let ret_cs = vm86_pop(regs);
+        let ret_flags = vm86_pop(regs);
+        set_vm86_ip(regs, ret_ip);
+        set_vm86_cs(regs, ret_cs);
+        machine::set_vm86_flags(regs, ret_flags as u32);
+    } else {
+        let post_handler_status = regs.flags32() & STATUS_MASK;
+        let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+        let (ret_eip, ret_cs, ret_flags) =
+            super::mode_transitions::pop_iret_frame(&dos.ldt[..], regs, client_use32);
+        regs.set_ip32(ret_eip);
+        regs.set_cs32(ret_cs as u32);
+        regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status | machine::IF_FLAG);
+    }
 }
 
 /// INT 31h from real mode user code. AH selects subfunction.
@@ -393,7 +459,11 @@ fn dos_putchar(c: u8) {
 
 fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
-    if ah != 0x2C && ah != 0x2A && regs.mode() == crate::UserMode::VM86 {
+    // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
+    // running clients), 02/06/09 (character/string output — exception
+    // handlers and CRT printf each char separately, splicing trace lines
+    // through the user's text output).
+    if !matches!(ah, 0x2C | 0x2A | 0x02 | 0x06 | 0x09) {
         dos_trace!("[INT21] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
             regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
@@ -728,6 +798,14 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
                 if n >= 0 {
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
+                    let dump_n = (n as usize).min(16);
+                    let mut hex = [0u8; 16];
+                    hex[..dump_n].copy_from_slice(&buf[..dump_n]);
+                    dos_trace!(
+                        "D21 3F h={} req={} got={} bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                        handle, count, n,
+                        hex[0], hex[1], hex[2], hex[3], hex[4], hex[5], hex[6], hex[7],
+                        hex[8], hex[9], hex[10], hex[11], hex[12], hex[13], hex[14], hex[15]);
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     regs.clear_flag32(1);
                 } else {
@@ -800,7 +878,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if let Some(parent) = dos.exec_parent.take() {
                 // Termination type 00h (normal) | return code in AL.
                 dos.last_child_exit_status = (regs.rax as u8) as u16;
-                return exec_return(dos, regs, parent);
+                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
             }
             let code = regs.rax as u8;
             thread::KernelAction::Exit(code as i32)
@@ -815,11 +893,23 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x31 => {
             if let Some(parent) = dos.exec_parent.take() {
                 let keep = regs.rdx as u16;
-                let child_psp_seg = parent.heap_seg;
+                // DX is paragraphs from the *child's* PSP, not from parent's
+                // heap seg. They differ by the env block + MCB overhead
+                // (ENV_PARAS + 2). Using parent.heap_seg here under-counts
+                // and leaves the gap between (parent.heap_seg + keep) and
+                // the actual resident-block end available for subsequent
+                // allocs — overlapping the still-live TSR's image+stack.
+                let child_psp_seg = dos.current_psp;
                 let resident_top = child_psp_seg.saturating_add(keep);
                 // Termination type 03h (TSR) | return code in AL.
                 dos.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
-                let action = exec_return(dos, regs, parent);
+                // TSR: preserve child's PM env (LDT/dpmi/pm_vectors) so a
+                // DPMI host installer like Borland's dpmiload — which
+                // calls dpmi_enter, sets up host services, switches back
+                // to RM via 0306, then TSRs — leaves the PM session usable
+                // by subsequent programs that enter via the raw-switch
+                // trampoline.
+                let action = exec_return(dos, regs, parent, /*preserve_pm_env=*/true);
                 if resident_top > dos.heap_seg {
                     dos_reset_blocks(dos, resident_top);
                 }
@@ -835,11 +925,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 Ok(seg) => {
                     regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                     regs.clear_flag32(1);
+                    dos_trace!("D21 48 need={:04X} -> seg={:04X} CF=0", need, seg);
                 }
                 Err(avail) => {
                     regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
                     regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
                     regs.set_flag32(1);
+                    dos_trace!("D21 48 need={:04X} -> avail={:04X} AX=8 CF=1", need, avail);
                 }
             }
             thread::KernelAction::Done
@@ -1786,8 +1878,11 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // Read parameter block at ES:BX
     let pb = linear(dos, regs, regs.es as u16, regs.rbx as u32);
     let cmdtail_off = unsafe { ((pb + 2) as *const u16).read_unaligned() } as u32;
-    let cmdtail_seg = unsafe { ((pb + 4) as *const u16).read_unaligned() } as u32;
-    let cmdtail_addr = (cmdtail_seg << 4) + cmdtail_off;
+    let cmdtail_seg = unsafe { ((pb + 4) as *const u16).read_unaligned() };
+    // The embedded (segment, offset) far pointer is a PM selector:offset
+    // when the caller is in PM, an RM paragraph:offset in VM86 — same
+    // discriminator linear() uses for buffer addresses elsewhere.
+    let cmdtail_addr = linear(dos, regs, cmdtail_seg, cmdtail_off);
     let tail_len = unsafe { *(cmdtail_addr as *const u8) } as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
@@ -1903,6 +1998,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // per-EXEC allocation is the fresh 64KB child LDT.
     let suspended_dpmi = dos.dpmi.take();
     let suspended_pm_vectors = dos.pm_vectors;
+    let suspended_pm_dos = core::mem::replace(&mut dos.pm_dos, false);
     let suspended_ldt = core::mem::replace(&mut dos.ldt, super::fresh_ldt());
     let suspended_ldt_alloc = core::mem::replace(
         &mut dos.ldt_alloc,
@@ -1913,6 +2009,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // LDTR still points at parent's LDT box (which now lives in ExecParent).
     // Reload so the CPU sees the fresh child LDT if child enters DPMI.
     dos.on_resume();
+    let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
     dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
@@ -1926,6 +2023,8 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         pm_vectors: suspended_pm_vectors,
         ldt: suspended_ldt,
         ldt_alloc: suspended_ldt_alloc,
+        pm_dos: suspended_pm_dos,
+        pm_mode: parent_pm_mode,
         prev: prev.map(alloc::boxed::Box::new),
     });
 
@@ -1940,6 +2039,12 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     regs.ds = psp_seg as u64;
     regs.es = psp_seg as u64;
     regs.clear_flag32(1);
+    // The child is a fresh DOS program — runs in VM86 regardless of who
+    // EXEC'd it. If the EXEC originated from a PM client (bcc via
+    // dpmiload's PMDOS path), regs was PM on entry; flip VM_FLAG so the
+    // dispatch tail (rm_stub_dispatch's vm86_pop or pmdos_int21_handler's
+    // mode-discriminator branch) treats it as a VM86 entry.
+    regs.frame.rflags |= machine::VM_FLAG as u64;
     dos_trace!("  exec_program loaded: cs:ip={:04X}:{:04X} ss:sp={:04X}:{:04X} heap_seg={:04X}",
         cs, ip, ss, sp, dos.heap_seg);
     thread::KernelAction::Done
@@ -2054,31 +2159,53 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent) -> thread::KernelAction {
-    dos_trace!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X}",
+fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
+               preserve_pm_env: bool) -> thread::KernelAction {
+    dos_trace!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X} pm_env={}",
         dos.heap_seg, parent.heap_seg,
         dos.current_psp, parent.psp,
-        parent.ss, parent.sp);
+        parent.ss, parent.sp,
+        if preserve_pm_env && dos.dpmi.is_some() { "kept" } else { "restored" });
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
     regs.clear_flag32(1);
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
+    // Restore parent's mode. The child was always VM86; if the parent
+    // was PM, clear VM_FLAG so the dispatch tail runs the PM iret-frame
+    // pop on parent's PM stack instead of the VM86 one.
+    if parent.pm_mode {
+        regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    } else {
+        regs.frame.rflags |= machine::VM_FLAG as u64;
+    }
     dos.heap_seg = parent.heap_seg;
     dos.heap_base_seg = parent.heap_base_seg;
     dos.current_psp = parent.psp;
     dos.dos_blocks = parent.dos_blocks;
     super::sync_mcb_chain(dos);
-    // Restore parent's suspended DPMI state (if any). A child's own DPMI
-    // state, if it entered DPMI, is dropped here — the child-allocated
-    // DpmiState currently in `dos.dpmi` gets replaced. pm_vectors + LDT are
-    // suspended alongside dpmi so any descriptors/hooks the child installed
-    // are dropped and parent's are reinstated.
-    dos.dpmi = parent.dpmi;
-    dos.pm_vectors = parent.pm_vectors;
-    dos.ldt = parent.ldt;
-    dos.ldt_alloc = parent.ldt_alloc;
-    // LDTR currently points at the child's (now-dropped) LDT — reload.
+    // PM-environment handling on exec_return:
+    //   - Normal exit (AH=4Ch): drop child's dpmi/ldt/pm_vectors, restore
+    //     parent's. Child's PM state vanishes with the process.
+    //   - TSR exit (AH=31h) when child entered DPMI: keep child's dpmi/ldt/
+    //     pm_vectors alive — DPMI host installers (Borland's dpmiload,
+    //     CWSDPMI when run as a TSR, etc.) install PM services, switch to
+    //     RM via 0306, and TSR. The host's LDT entries, INT vectors and
+    //     dpmi state must outlive the TSR so subsequent programs can use
+    //     the same PM session via the raw-switch trampoline.
+    //   - TSR exit when child has no dpmi: nothing to preserve, fall back
+    //     to parent's (might itself be Some if parent is the DPMI client).
+    if preserve_pm_env && dos.dpmi.is_some() {
+        // Drop parent's saved PM env; keep what's already in dos.*.
+    } else {
+        dos.dpmi = parent.dpmi;
+        dos.pm_vectors = parent.pm_vectors;
+        dos.ldt = parent.ldt;
+        dos.ldt_alloc = parent.ldt_alloc;
+        dos.pm_dos = parent.pm_dos;
+    }
+    // LDTR currently points at the child's LDT — reload (same box if we
+    // preserved it, parent's box if we restored).
     dos.on_resume();
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
@@ -2576,6 +2703,15 @@ pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
+/// PMDOS INT 21 short-circuit. When `dpmi.pm_dos` is set (16-bit DPMI
+/// clients by default), `pm_vectors[0x21]` points here instead of the
+/// generic vector stub. The CD 31 traps to `pmdos_int21_handler` which
+/// runs the DOS INT 21 dispatcher with PM regs intact (no mode switch),
+/// then synth-irets the frame `deliver_pm_int` planted on the client's
+/// PM stack. `linear()` sees `regs.mode() == PM` and resolves DS:DX via
+/// LDT base lookup — so high-memory PM-block buffers (the case Borland's
+/// `dpmiload` hits) are addressed correctly without bounce buffering.
+pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
 /// Outermost-relative PM-handler IRET target. Pushed as the IRET-frame
 /// `CS:EIP` by `deliver_pm_irq`'s cross-mode branch so the handler's IRET
 /// lands here; the `CD 31` then traps to the kernel, which pops the

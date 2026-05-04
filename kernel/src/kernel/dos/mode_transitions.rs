@@ -467,8 +467,14 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
     regs.clear_flag32(1 << 8);
-    dos_trace!("[DPMI] PM_INT vec={:02X} -> {:04x}:{:#x} on client SS:ESP={:04x}:{:#x}",
-        vector, sel, off, regs.frame.ss as u16, regs.sp32());
+    // Skip per-call trace for noisy INT 21 character-output AHs so the
+    // exception-handler dump and CRT printf output stay readable.
+    let ah = (regs.rax >> 8) as u8;
+    let chatty = vector == 0x21 && matches!(ah, 0x02 | 0x06 | 0x09);
+    if !chatty {
+        dos_trace!("[DPMI] PM_INT vec={:02X} -> {:04x}:{:#x} on client SS:ESP={:04x}:{:#x}",
+            vector, sel, off, regs.frame.ss as u16, regs.sp32());
+    }
     thread::KernelAction::Done
 }
 
@@ -632,7 +638,7 @@ pub(super) fn push_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
 /// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp.
 /// `handler_is_32` must match the width used at push time. Frame width
 /// follows handler.D; SP semantics follow SS.B (see `push_iret_frame`).
-fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u16, u32) {
+pub(super) fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u16, u32) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
     let stack_is_32 = seg_is_32(ldt, ss);
@@ -729,6 +735,14 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // a nested reflect inside an outer 0300 BIOS call), else rm_TOS.
     // The toggle pushes its iret-frame *below* this cursor, sharing
     // rm_dedicated LIFO-style without a snapshot copy.
+    //
+    // Per DPMI 0.9 §2.4 / §3.2 segment registers are "undefined" in real
+    // mode after PM→RM int reflection. We pass the PM selector values
+    // through unchanged — RM-side BIOS/DOS code that would dereference
+    // them gets nonsense paragraphs (the spec's "undefined"), which is
+    // fine since none does. Our own DOS handlers route buffer addressing
+    // through `linear()` which is PM-aware, or via the dedicated
+    // pmdos_int21_handler short-circuit for 16-bit clients (`pm_dos`).
     let rm_dest = rm_get_stack(dos);
     let _save_at = switch_to_rm_side(dos, regs, rm_dest);
 
@@ -794,11 +808,23 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     // pop_iret_frame advances regs.SP — which IS the pm cursor while
     // user is on pm side, so the frame's bytes are released
     // automatically.
+    //
+    // Preserve handler-set status flags across the synth-iret. The
+    // planted iret-frame holds the *caller's* pre-INT flags (planted
+    // by deliver_pm_int with handler_flags = caller's flags & ~TF). A
+    // plain `regs.flags = ret_flags` wipes the handler's CF/PF/AF/ZF/
+    // SF/DF/OF — DOS calls return success/failure via CF, so the
+    // caller would see its own pre-INT CF instead of our handler's
+    // result. Borland's `dpmiload` PM loader specifically does
+    // `int 0x21 AH=3F; jnc 0x3B1; jmp 0x414` immediately after the
+    // read; without this merge it sees CF=1 (caller's stale flag) and
+    // bails with the "Application load & execute error FFFB".
+    let post_handler_status = regs.flags32() & STATUS_MASK;
     let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
     let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, client_use32);
     regs.set_ip32(ret_eip);
     regs.set_cs32(ret_cs as u32);
-    regs.set_flags32(ret_flags | machine::IF_FLAG);
+    regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status | machine::IF_FLAG);
 
     dos_trace!("[DPMI] RM_IRET_STUB -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
         ret_cs, ret_eip, regs.stack_seg(), regs.sp32());

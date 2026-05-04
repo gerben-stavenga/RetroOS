@@ -48,6 +48,7 @@ pub fn startup() -> ! {
                 println!("Partition {}: TAR at sector {:#x}", i, lba);
                 unsafe {
                     ROOT_TARFS = TarFs::new(lba);
+                    (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
                 }
             }
             0x83 if !has_ext4 => {
@@ -223,7 +224,44 @@ fn event_loop(first_tid: usize) {
     let mut event_counter: u64 = 0;
     let mut min_free: usize = crate::arch::free_page_count();
     let mut last_free: usize = min_free;
-    crate::dbg_println!("[mem] start free={}", min_free);
+    // crate::dbg_println!("[mem] start free={}", min_free);
+
+    // User/kernel cycle accounting. We bracket `do_arch_execute()` with
+    // rdtsc; every iteration adds a chunk to USER_CYCLES and a chunk to
+    // KERNEL_CYCLES. The split tells you whether app code is the
+    // bottleneck or our trap/event handling is.
+    let mut user_cycles: u64 = 0;
+    let mut kernel_cycles: u64 = 0;
+    let mut last_kernel_entry = crate::arch::rdtsc();
+    let mut last_profile_dump = last_kernel_entry;
+    // Roughly assume 2 GHz host; only used to format the dump as ms. Off
+    // by a constant factor across runs but the user/kernel ratio is exact.
+    const PROFILE_DUMP_CYCLES: u64 = 2_000_000_000; // ~1 second on 2GHz host
+    // Per-event-type counts for the same window, to identify which trap
+    // kind is dominating when kernel% is high.
+    let mut ev_irq: u32 = 0;
+    let mut ev_softint: u32 = 0;
+    let mut ev_hlt: u32 = 0;
+    let mut ev_in: u32 = 0;
+    let mut ev_out: u32 = 0;
+    let mut ev_ins: u32 = 0;
+    let mut ev_outs: u32 = 0;
+    let mut ev_fault: u32 = 0;
+    let mut ev_pf: u32 = 0;
+    let mut ev_exc: u32 = 0;
+    let mut ev_syscall: u32 = 0;
+    // Cycle time spent in each phase, accumulated over a profile period:
+    //   - phase1_cycles: arch::drain + queue_irq + raise_pending in Phase 1.
+    //   - dispatch_cycles: handle_event after the user trap.
+    //   - max_dispatch: largest single handle_event call this period.
+    let mut phase1_cycles: u64 = 0;
+    let mut dispatch_cycles: u64 = 0;
+    let mut max_dispatch: u64 = 0;
+    // Per-INT-vector counts so when softint=N is high we can see whether
+    // it's INT 21 (DOS), INT 67 (EMS), INT 31 (DPMI), etc.
+    let mut ev_softint_hist: [u32; 256] = [0; 256];
+    let mut ev_in_hist: [u32; 16] = [0; 16];   // bucketed by port high-nibble
+    let mut ev_out_hist: [u32; 16] = [0; 16];
 
     // REGS already set up by startup, page tables correct from boot
     loop {
@@ -231,9 +269,9 @@ fn event_loop(first_tid: usize) {
         if event_counter % MEM_DUMP_PERIOD == 0 {
             let free = crate::arch::free_page_count();
             if free < min_free { min_free = free; }
-            let delta = (free as i64) - (last_free as i64);
-            crate::dbg_println!("[mem] iter={} free={} delta={} min={}",
-                event_counter, free, delta, min_free);
+            let _delta = (free as i64) - (last_free as i64);
+            // crate::dbg_println!("[mem] iter={} free={} delta={} min={}",
+            //     event_counter, free, delta, min_free);
             last_free = free;
         }
         crate::kernel::stacktrace::set_debug_tid(tid);
@@ -341,7 +379,40 @@ fn event_loop(first_tid: usize) {
 
         // Phase 3: run user code and dispatch the resulting event.
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+        let ts_before_user = crate::arch::rdtsc();
+        kernel_cycles = kernel_cycles.wrapping_add(ts_before_user.wrapping_sub(last_kernel_entry));
         let kevent = do_arch_execute();
+        let ts_after_user = crate::arch::rdtsc();
+        user_cycles = user_cycles.wrapping_add(ts_after_user.wrapping_sub(ts_before_user));
+        last_kernel_entry = ts_after_user;
+        match &kevent {
+            crate::arch::monitor::KernelEvent::Irq => ev_irq += 1,
+            crate::arch::monitor::KernelEvent::SoftInt(_) => ev_softint += 1,
+            crate::arch::monitor::KernelEvent::Hlt => ev_hlt += 1,
+            crate::arch::monitor::KernelEvent::In { .. } => ev_in += 1,
+            crate::arch::monitor::KernelEvent::Out { .. } => ev_out += 1,
+            crate::arch::monitor::KernelEvent::Ins { .. } => ev_ins += 1,
+            crate::arch::monitor::KernelEvent::Outs { .. } => ev_outs += 1,
+            crate::arch::monitor::KernelEvent::Fault => ev_fault += 1,
+            crate::arch::monitor::KernelEvent::PageFault { .. } => ev_pf += 1,
+            crate::arch::monitor::KernelEvent::Exception(_) => ev_exc += 1,
+            crate::arch::monitor::KernelEvent::Syscall => ev_syscall += 1,
+        }
+        if ts_after_user.wrapping_sub(last_profile_dump) >= PROFILE_DUMP_CYCLES {
+            let total = user_cycles.wrapping_add(kernel_cycles);
+            let user_pct = if total > 0 { user_cycles.wrapping_mul(100) / total } else { 0 };
+            let kern_pct = if total > 0 { kernel_cycles.wrapping_mul(100) / total } else { 0 };
+            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={}",
+                user_pct, kern_pct,
+                ev_irq, ev_softint, ev_hlt, ev_in, ev_out, ev_ins, ev_outs,
+                ev_pf, ev_exc, ev_fault, ev_syscall);
+            user_cycles = 0;
+            kernel_cycles = 0;
+            ev_irq = 0; ev_softint = 0; ev_hlt = 0;
+            ev_in = 0; ev_out = 0; ev_ins = 0; ev_outs = 0;
+            ev_fault = 0; ev_pf = 0; ev_exc = 0; ev_syscall = 0;
+            last_profile_dump = ts_after_user;
+        }
 
         let regs = unsafe { &mut *(&raw mut REGS) };
 

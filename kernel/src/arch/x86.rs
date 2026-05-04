@@ -131,6 +131,18 @@ pub unsafe fn write_cr4(value: u32) {
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nostack)); }
 }
 
+/// Read the time-stamp counter (RDTSC). Wall-clock-ish in cycles, advances
+/// at CPU base frequency. Useful for cheap user/kernel-time accounting.
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
 /// Execute CPUID instruction
 #[inline]
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {

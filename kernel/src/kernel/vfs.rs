@@ -29,8 +29,16 @@ const PATH_KEY_MAX: usize = 164;
 
 /// Filesystem trait — implemented by TarFs, Ext4Fs, etc.
 pub trait Filesystem {
-    /// Look up a file by normalized path. Returns vnode on match.
+    /// Look up a file by normalized path, case-sensitively (POSIX). Used
+    /// by the Linux personality.
     fn open(&self, path: &[u8]) -> Option<Vnode>;
+
+    /// Look up a file by normalized path, case-insensitively (DOS). Used
+    /// by DFS so DOS programs see the legacy "any-case matches" behaviour
+    /// without paying the per-component canonical-case walk. Default
+    /// implementation falls back to case-sensitive `open` — backends
+    /// should override when they can search efficiently.
+    fn open_ci(&self, path: &[u8]) -> Option<Vnode> { self.open(path) }
 
     /// Read from a file identified by handle at given byte offset.
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
@@ -226,9 +234,11 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
 // Public API — called by syscalls.rs and vm86.rs
 // ============================================================================
 
-/// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
+/// Open a file by absolute VFS path, case-insensitively. Returns fd (>= 3)
+/// or negative error. Used by the DOS personality, which has DOS-style
+/// case-insensitive semantics throughout.
 pub fn open(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
-    let handle = open_to_handle(path);
+    let handle = open_to_handle_ci(path);
     if handle < 0 { return handle; }
     let fd = match alloc_fd(fds) {
         Some(f) => f,
@@ -507,6 +517,58 @@ pub fn open_to_handle(path: &[u8]) -> i32 {
 
     let (midx, fs, subpath) = resolve_mount(path);
     let vnode = match fs.open(subpath) {
+        Some(v) => v,
+        None => return -2,
+    };
+
+    let table_idx = match alloc_file_entry() {
+        Some(i) => i,
+        None => return -24,
+    };
+
+    unsafe {
+        FILE_TABLE[table_idx] = FileEntry {
+            vnode,
+            offset: 0,
+            refcount: 1,
+            mount_idx: midx,
+            ram_key: [0; PATH_KEY_MAX],
+            ram_key_len: 0,
+        };
+    }
+
+    table_idx as i32
+}
+
+/// Same as `open_to_handle` but resolves case-insensitively (DOS).
+pub fn open_to_handle_ci(path: &[u8]) -> i32 {
+    // RAM overlay first — keys are stored as-is, so try case-sensitive
+    // hit first, then fall through to FS for the case-insensitive path.
+    let ram = ram_files();
+    if let Some(data) = ram.get(path) {
+        let size = data.len() as u32;
+        let table_idx = match alloc_file_entry() {
+            Some(i) => i,
+            None => return -24,
+        };
+        let key_len = path.len().min(PATH_KEY_MAX) as u8;
+        let mut ram_key = [0u8; PATH_KEY_MAX];
+        ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
+        unsafe {
+            FILE_TABLE[table_idx] = FileEntry {
+                vnode: Vnode { handle: RAM_SENTINEL, size },
+                offset: 0,
+                refcount: 1,
+                mount_idx: 0,
+                ram_key,
+                ram_key_len: key_len,
+            };
+        }
+        return table_idx as i32;
+    }
+
+    let (midx, fs, subpath) = resolve_mount(path);
+    let vnode = match fs.open_ci(subpath) {
         Some(v) => v,
         None => return -2,
     };

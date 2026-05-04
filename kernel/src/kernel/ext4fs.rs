@@ -114,19 +114,19 @@ fn resolve_case<'a>(fs: &Ext4, path: &str, buf: &'a mut [u8; 256]) -> Option<&'a
     None
 }
 
-impl Filesystem for Ext4Fs {
-    fn open(&self, path: &[u8]) -> Option<Vnode> {
+impl Ext4Fs {
+    fn open_inner(&self, path: &[u8], allow_ci: bool) -> Option<Vnode> {
         let mut buf = [0u8; 256];
         let abs = make_absolute(path, &mut buf)?;
 
-        // Try direct read, fall back to case-insensitive lookup
         let data = match self.fs.read(abs) {
             Ok(d) => d,
-            Err(_) => {
+            Err(_) if allow_ci => {
                 let mut case_buf = [0u8; 256];
                 let resolved = resolve_case(&self.fs, abs, &mut case_buf)?;
                 self.fs.read(resolved).ok()?
             }
+            Err(_) => return None,
         };
         let size = data.len() as u32;
 
@@ -137,6 +137,19 @@ impl Filesystem for Ext4Fs {
         self.cache.borrow_mut().insert(handle, data);
 
         Some(Vnode { handle, size })
+    }
+}
+
+impl Filesystem for Ext4Fs {
+    fn open(&self, path: &[u8]) -> Option<Vnode> {
+        // POSIX: case-sensitive only.
+        self.open_inner(path, false)
+    }
+
+    fn open_ci(&self, path: &[u8]) -> Option<Vnode> {
+        // DOS: try case-sensitive first (fast path for already-correct
+        // names), fall back to a directory scan for case-folded match.
+        self.open_inner(path, true)
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32 {
