@@ -53,14 +53,31 @@ fn recv_byte() -> u8 {
 }
 
 fn send_bytes(data: &[u8]) {
-    for &b in data {
-        send_byte(b);
+    // Batch into 16-byte FIFO bursts: when LSR.THRE fires the FIFO is
+    // empty, so we can write up to 16 bytes before having to wait again.
+    // This cuts ~16x off the LSR-poll overhead versus per-byte send.
+    let mut i = 0;
+    while i < data.len() {
+        while inb(COM1 + 5) & 0x20 == 0 {}
+        let chunk = (data.len() - i).min(16);
+        for _ in 0..chunk {
+            outb(COM1, data[i]);
+            i += 1;
+        }
     }
 }
 
 fn recv_bytes(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = recv_byte();
+    // Drain the RX FIFO while LSR.DR is set, only reblocking on the
+    // initial-byte wait. Cuts the LSR-poll overhead vs. checking before
+    // every single byte.
+    let mut i = 0;
+    while i < buf.len() {
+        while inb(COM1 + 5) & 0x01 == 0 {}
+        while i < buf.len() && (inb(COM1 + 5) & 0x01) != 0 {
+            buf[i] = inb(COM1);
+            i += 1;
+        }
     }
 }
 

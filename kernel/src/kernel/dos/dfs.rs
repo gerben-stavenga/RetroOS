@@ -107,13 +107,19 @@ impl DfsState {
         Ok(pos)
     }
 
-    /// Walk an absolute DOS path (output of `resolve`) component-by-
-    /// component, matching each component case-insensitively against real
-    /// on-disk entries via `vfs::readdir`. Returns the real-case VFS path
-    /// ready for `vfs::open`. All components must exist.
+    /// Convert an absolute DOS path (output of `resolve`) to the VFS form
+    /// `vfs::open` expects: drive prefix mapped, `\` → `/`, components
+    /// passed through as-is. Both backing filesystems (`tarfs`, `ext4fs`)
+    /// match names case-insensitively, so we don't need the
+    /// component-by-component canonical-case walk that walked the index
+    /// O(N) per component for every open.
     pub fn to_vfs_open(abs_dos: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {
         let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
-        walk_existing(rest, out, &mut pos, /*allow_missing_last=*/false)?;
+        for &b in rest {
+            if pos >= out.len() { return Err(3); }
+            out[pos] = if b == b'\\' { b'/' } else { b };
+            pos += 1;
+        }
         Ok(pos)
     }
 
