@@ -1,0 +1,66 @@
+                                ÚÄÄÄÄÄÄÄÄÄÄÄÄÄÄ¿
+                                ³DUKE v1.1 INFO³
+                                ÀÄÄÄÄÄÄÄÄÄÄÄÄÄÄÙ
+
+Here is a listing of what is fixed/new in v1.1 of Duke Nukem 3D over v1.0.
+
+* Restore game bug fixed.
+* AWE32 doesn't need E620 in the SET BLASTER parameters anymore.
+* Added optional mouse aiming method by popular demand.  Press "U" while
+  playing the game.  You can then use the mouse to aim up/down.  You will
+  need to re-configure your keys to get optimum performance.  Also experiment
+  with making a mouse button do this.
+* Added optional crosshair toggle by popular demand.  Press "I" while in the
+  game to toggle the crosshairs.
+* You can now run with the GamePad; everything else works as it should.
+* Added Enhanced Joystick Support (FlightStick/SideWinder/throttle/etc).
+* Added HAT support for joysticks.
+* Duke screams in DukeMatch now when he dies.
+* Can detonate Pipe Bombs while looking in monitors.  This is great.  Lay
+  some bombs in a spot that can be seen in a monitor, look in the monitor, and
+  wait for a victim.  Press FIRE.  Boom.
+* Can back out of monitors with up/down movements.  This is good for when
+  you get surprised.
+* Removed much more bad language from Parental lock.  Now safe for kids, and
+  overly sensitive adults. :)
+* "Adult Content" added to title screen.
+* Mouse strafing speed improved.
+* Mouse left/right movements are now equal.
+* More variable range for pipe bombs, plus you can DUCK and place one in
+  specific place, without it rolling around.
+* Fixed crashing when exiting some levels by improving memory detection.  (was
+  due to low memory).  If you only have 8 megs, BOOT CLEAN!
+* Can be shrunk in GOD mode now.  Far less annoying.
+* Can redefine "D" or "N" key and STILL activate cheats.
+* Steroids key added to hot keys list.  Press "R".
+* Longer demos allowed.  No real limit now.
+* Duke doesn't disappear off the map now when zooming far away.
+* Lowering a weapon, then getting a new one bug fixed.
+* Play with the "Doomed Space Marine".  By popular request.
+* F1 help screen updated.
+* NexGen CPU's can be fixed with a patch they provide.  See DN3DHELP.EXE for
+  more details.
+* HoloDuke lasts longer (about a minute and a half).  Have fun.
+* Reversed Stereo setting in SETUP is carried over into game correctly.
+* Duke flashes better now when he shoots in DukeMatch.
+
+Known problems
+==============
+* Game might get out of sync from either slow computers mixed with faster
+  ones in net play, or the use of too many monsters in DukeMatch.  We are
+  looking into these.
+
+* If the game gets out of sync at the very start of a level, restart.  You
+  might also check to be sure you have the same *.CON files.
+
+* Sound problems in OS/2.  We might look at this if we get a chance.  Thanks
+  to all of those who wrote about it.  Don't get your hopes up, but we will at
+  least look into it for you.
+
+* Daughterboard sound problems.  We are still looking into this.  Will try
+  to address it in v1.2.
+
+Please see the DN3DHELP.EXE file for more info about v1.1 of Duke3D.
+
+Joe Siegler
+3D Realms Entertainment
