@@ -104,6 +104,7 @@ use dos::{
     SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_PM_TO_REAL,
+    SLOT_PMDOS_INT21,
     SLOT_PM_IRET,
     slot_offset,
     host_stack_base, host_stack_size, host_stack_empty_sp,
@@ -161,6 +162,17 @@ pub struct DosState {
     pub pm_vectors: [(u16, u32); 256],
 
     pub dpmi: Option<alloc::boxed::Box<dpmi::DpmiState>>,
+
+    /// PMDOS short-circuit for INT 21 from PM. When set, `pm_vectors[0x21]`
+    /// targets `SLOT_PMDOS_INT21` instead of the generic vector stub —
+    /// the kernel services INT 21 with PM regs intact, so DS:DX with a
+    /// high-base PM-block selector resolves correctly via LDT lookup
+    /// instead of being silently truncated by an RM-paragraph translation.
+    /// Default-on for 16-bit DPMI clients (Borland's `dpmiload` etc.);
+    /// 32-bit clients (DJGPP via CWSDPMI) marshal explicitly via INT 31
+    /// 0300 and don't need this — leaving it off for them keeps spec-strict
+    /// reflect-to-RM behaviour for INT 21 hooks installed in the IVT.
+    pub pm_dos: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +218,7 @@ impl DosState {
             ldt_alloc: [0u32; dpmi::LDT_ENTRIES / 32],
             pm_vectors: [(0, 0); 256],
             dpmi: None,
+            pm_dos: false,
         };
         dpmi::install_kernel_ldt_slots(&mut dos);
         dos
@@ -282,6 +295,9 @@ pub struct ExecParent {
     /// the fresh child-LDT allocation happens in the EXEC fast path.
     pub ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]>,
     pub ldt_alloc: [u32; dpmi::LDT_ENTRIES / 32],
+    /// Parent's PMDOS routing flag, suspended alongside dpmi/pm_vectors so
+    /// the child runs with the default reflect-to-RM INT 21 path.
+    pub pm_dos: bool,
     pub prev: Option<alloc::boxed::Box<ExecParent>>,
 }
 
@@ -292,12 +308,20 @@ pub struct ExecParent {
 /// callers reflected through `reflect_int_to_real_mode`. By the time we
 /// reach a handler the regs are VM86, so `seg` is a paragraph.
 ///
-/// Per `feedback_dpmi_host_no_seg_xlate`, the DPMI host doesn't translate
-/// PM selectors during reflection — that's the extender/client's
-/// responsibility. We don't second-guess `seg` based on saved PM state.
+/// Resolve a (seg, off) buffer address to a linear address. Mode-aware:
+/// in PM, `seg` is an LDT/GDT selector — look up the descriptor base.
+/// In VM86 it's an RM paragraph — shift by 4. The two paths only diverge
+/// for the 16-bit-DPMI PMDOS short-circuit (`pmdos_int21_handler`), where
+/// the DOS handler runs with PM regs and high-base PM selectors as buffer
+/// pointers; the regular reflect-to-RM path always reaches the handler in
+/// VM86 with RM-paragraph regs.
 #[inline]
-fn linear(_dos: &thread::DosState, _regs: &Regs, seg: u16, off: u32) -> u32 {
-    ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
+fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
+    if regs.mode() == crate::UserMode::VM86 {
+        ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
+    } else {
+        mode_transitions::seg_base(&dos.ldt[..], seg).wrapping_add(off)
+    }
 }
 
 /// INT 31h is the kernel's unified syscall trap. Every kernel-owned exit
@@ -326,7 +350,7 @@ pub fn syscall(
         (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(dos, regs),
-        (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(dos, regs),
+        (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(kt, dos, regs),
         _                                       => dpmi::dpmi_api(dos, regs),
     }
 }

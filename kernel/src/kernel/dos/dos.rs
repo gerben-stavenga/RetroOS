@@ -89,7 +89,17 @@ pub(crate) fn dispatch_kernel_syscall(
         0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
         0x2E => int_2eh(kt, dos, regs),
         0x2F => int_2fh(dos, regs),
-        0x67 => int_67h(dos, regs),
+        0x67 => {
+            if !EMS_ENABLED {
+                // No EMS host: AH=80 ("invalid function in handle") so
+                // detection probes (AH=40 "get status" / AH=41 "get page
+                // frame") see a plain failure instead of getting a stale
+                // page-frame paragraph back.
+                regs.rax = (regs.rax & !0xFF00) | 0x80_00;
+                return thread::KernelAction::Done;
+            }
+            int_67h(dos, regs)
+        }
         _ => {
             dos_trace!("dispatch_kernel_syscall: unhandled vector {:#04x}", vector);
             thread::KernelAction::Done
@@ -194,6 +204,33 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
     // Other far-call stubs (DPMI entry, raw switch, callbacks) switch modes entirely
 
     action
+}
+
+/// PMDOS INT 21 short-circuit. PM client issued `int 21h`; the host's
+/// PM int dispatcher (`deliver_pm_int`) routed to this slot via
+/// `dos.pm_vectors[0x21] = (SPECIAL_STUB_SEL, STUB_BASE + SLOT_PMDOS_INT21*2)`,
+/// which `dpmi_enter` installs when `client_use32 == false`.
+///
+/// We service the call directly with PM regs — no `switch_to_rm_side`,
+/// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
+/// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
+/// On exit, synth-iret the frame `deliver_pm_int` planted on the client's
+/// PM stack: pop (eip, cs, flags), restore CS:EIP, and merge handler
+/// status flags so DOS-call CF/AX results survive (same pattern as
+/// `rm_iret`'s synth-iret — see its docstring).
+pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    const STATUS_MASK: u32 = 0x0CD5;
+    let action = int_21h(kt, dos, regs);
+    if !matches!(action, thread::KernelAction::Done) { return action; }
+
+    let post_handler_status = regs.flags32() & STATUS_MASK;
+    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    let (ret_eip, ret_cs, ret_flags) =
+        super::mode_transitions::pop_iret_frame(&dos.ldt[..], regs, client_use32);
+    regs.set_ip32(ret_eip);
+    regs.set_cs32(ret_cs as u32);
+    regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status | machine::IF_FLAG);
+    thread::KernelAction::Done
 }
 
 /// INT 31h from real mode user code. AH selects subfunction.
@@ -393,7 +430,11 @@ fn dos_putchar(c: u8) {
 
 fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
-    if ah != 0x2C && ah != 0x2A && regs.mode() == crate::UserMode::VM86 {
+    // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
+    // running clients), 02/06/09 (character/string output — exception
+    // handlers and CRT printf each char separately, splicing trace lines
+    // through the user's text output).
+    if !matches!(ah, 0x2C | 0x2A | 0x02 | 0x06 | 0x09) {
         dos_trace!("[INT21] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
             regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
@@ -728,6 +769,14 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
                 if n >= 0 {
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
+                    let dump_n = (n as usize).min(16);
+                    let mut hex = [0u8; 16];
+                    hex[..dump_n].copy_from_slice(&buf[..dump_n]);
+                    dos_trace!(
+                        "D21 3F h={} req={} got={} bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                        handle, count, n,
+                        hex[0], hex[1], hex[2], hex[3], hex[4], hex[5], hex[6], hex[7],
+                        hex[8], hex[9], hex[10], hex[11], hex[12], hex[13], hex[14], hex[15]);
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     regs.clear_flag32(1);
                 } else {
@@ -815,7 +864,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x31 => {
             if let Some(parent) = dos.exec_parent.take() {
                 let keep = regs.rdx as u16;
-                let child_psp_seg = parent.heap_seg;
+                // DX is paragraphs from the *child's* PSP, not from parent's
+                // heap seg. They differ by the env block + MCB overhead
+                // (ENV_PARAS + 2). Using parent.heap_seg here under-counts
+                // and leaves the gap between (parent.heap_seg + keep) and
+                // the actual resident-block end available for subsequent
+                // allocs — overlapping the still-live TSR's image+stack.
+                let child_psp_seg = dos.current_psp;
                 let resident_top = child_psp_seg.saturating_add(keep);
                 // Termination type 03h (TSR) | return code in AL.
                 dos.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
@@ -841,11 +896,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 Ok(seg) => {
                     regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                     regs.clear_flag32(1);
+                    dos_trace!("D21 48 need={:04X} -> seg={:04X} CF=0", need, seg);
                 }
                 Err(avail) => {
                     regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory
                     regs.rbx = (regs.rbx & !0xFFFF) | avail as u64;
                     regs.set_flag32(1);
+                    dos_trace!("D21 48 need={:04X} -> avail={:04X} AX=8 CF=1", need, avail);
                 }
             }
             thread::KernelAction::Done
@@ -1909,6 +1966,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // per-EXEC allocation is the fresh 64KB child LDT.
     let suspended_dpmi = dos.dpmi.take();
     let suspended_pm_vectors = dos.pm_vectors;
+    let suspended_pm_dos = core::mem::replace(&mut dos.pm_dos, false);
     let suspended_ldt = core::mem::replace(&mut dos.ldt, super::fresh_ldt());
     let suspended_ldt_alloc = core::mem::replace(
         &mut dos.ldt_alloc,
@@ -1932,6 +1990,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         pm_vectors: suspended_pm_vectors,
         ldt: suspended_ldt,
         ldt_alloc: suspended_ldt_alloc,
+        pm_dos: suspended_pm_dos,
         prev: prev.map(alloc::boxed::Box::new),
     });
 
@@ -2095,6 +2154,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
         dos.pm_vectors = parent.pm_vectors;
         dos.ldt = parent.ldt;
         dos.ldt_alloc = parent.ldt_alloc;
+        dos.pm_dos = parent.pm_dos;
     }
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
@@ -2595,6 +2655,15 @@ pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
+/// PMDOS INT 21 short-circuit. When `dpmi.pm_dos` is set (16-bit DPMI
+/// clients by default), `pm_vectors[0x21]` points here instead of the
+/// generic vector stub. The CD 31 traps to `pmdos_int21_handler` which
+/// runs the DOS INT 21 dispatcher with PM regs intact (no mode switch),
+/// then synth-irets the frame `deliver_pm_int` planted on the client's
+/// PM stack. `linear()` sees `regs.mode() == PM` and resolves DS:DX via
+/// LDT base lookup — so high-memory PM-block buffers (the case Borland's
+/// `dpmiload` hits) are addressed correctly without bounce buffering.
+pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
 /// Outermost-relative PM-handler IRET target. Pushed as the IRET-frame
 /// `CS:EIP` by `deliver_pm_irq`'s cross-mode branch so the handler's IRET
 /// lands here; the `CD 31` then traps to the kernel, which pops the

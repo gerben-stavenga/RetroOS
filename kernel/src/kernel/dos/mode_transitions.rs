@@ -467,8 +467,14 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
     regs.clear_flag32(1 << 8);
-    dos_trace!("[DPMI] PM_INT vec={:02X} -> {:04x}:{:#x} on client SS:ESP={:04x}:{:#x}",
-        vector, sel, off, regs.frame.ss as u16, regs.sp32());
+    // Skip per-call trace for noisy INT 21 character-output AHs so the
+    // exception-handler dump and CRT printf output stay readable.
+    let ah = (regs.rax >> 8) as u8;
+    let chatty = vector == 0x21 && matches!(ah, 0x02 | 0x06 | 0x09);
+    if !chatty {
+        dos_trace!("[DPMI] PM_INT vec={:02X} -> {:04x}:{:#x} on client SS:ESP={:04x}:{:#x}",
+            vector, sel, off, regs.frame.ss as u16, regs.sp32());
+    }
     thread::KernelAction::Done
 }
 
@@ -632,7 +638,7 @@ pub(super) fn push_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
 /// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp.
 /// `handler_is_32` must match the width used at push time. Frame width
 /// follows handler.D; SP semantics follow SS.B (see `push_iret_frame`).
-fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u16, u32) {
+pub(super) fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u16, u32) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
     let stack_is_32 = seg_is_32(ldt, ss);
@@ -725,29 +731,20 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // round-trip.
     let ret_flags = regs.flags32() as u16;
 
-    // 16-bit DPMI clients (Borland's dpmiload, etc.) expect the host
-    // to translate paragraph-aligned 16-bit data segments to their RM
-    // equivalents on PM→RM reflect — they put data at PM-DS:offset
-    // expecting RM-DS:offset to point at the same linear bytes. 32-bit
-    // clients (DOOM/Quake/Duke3D via CWSDPMI) marshal explicitly via
-    // INT 31 0300 and want the spec-strict pass-through. Translation
-    // happens *after* push_save below so save.restore on unwind brings
-    // the original PM selector values back.
-    let translate_segs = !dos.dpmi.as_ref().map_or(true, |d| d.client_use32);
-
     // rm_get_stack: live rm cursor if a chain is in flight (e.g., we're
     // a nested reflect inside an outer 0300 BIOS call), else rm_TOS.
     // The toggle pushes its iret-frame *below* this cursor, sharing
     // rm_dedicated LIFO-style without a snapshot copy.
+    //
+    // Per DPMI 0.9 §2.4 / §3.2 segment registers are "undefined" in real
+    // mode after PM→RM int reflection. We pass the PM selector values
+    // through unchanged — RM-side BIOS/DOS code that would dereference
+    // them gets nonsense paragraphs (the spec's "undefined"), which is
+    // fine since none does. Our own DOS handlers route buffer addressing
+    // through `linear()` which is PM-aware, or via the dedicated
+    // pmdos_int21_handler short-circuit for 16-bit clients (`pm_dos`).
     let rm_dest = rm_get_stack(dos);
     let _save_at = switch_to_rm_side(dos, regs, rm_dest);
-
-    if translate_segs {
-        regs.ds = translate_rm_equivalent(&dos.ldt[..], regs.ds as u16) as u64;
-        regs.es = translate_rm_equivalent(&dos.ldt[..], regs.es as u16) as u64;
-        regs.fs = translate_rm_equivalent(&dos.ldt[..], regs.fs as u16) as u64;
-        regs.gs = translate_rm_equivalent(&dos.ldt[..], regs.gs as u16) as u64;
-    }
 
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
@@ -811,11 +808,23 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     // pop_iret_frame advances regs.SP — which IS the pm cursor while
     // user is on pm side, so the frame's bytes are released
     // automatically.
+    //
+    // Preserve handler-set status flags across the synth-iret. The
+    // planted iret-frame holds the *caller's* pre-INT flags (planted
+    // by deliver_pm_int with handler_flags = caller's flags & ~TF). A
+    // plain `regs.flags = ret_flags` wipes the handler's CF/PF/AF/ZF/
+    // SF/DF/OF — DOS calls return success/failure via CF, so the
+    // caller would see its own pre-INT CF instead of our handler's
+    // result. Borland's `dpmiload` PM loader specifically does
+    // `int 0x21 AH=3F; jnc 0x3B1; jmp 0x414` immediately after the
+    // read; without this merge it sees CF=1 (caller's stale flag) and
+    // bails with the "Application load & execute error FFFB".
+    let post_handler_status = regs.flags32() & STATUS_MASK;
     let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
     let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, client_use32);
     regs.set_ip32(ret_eip);
     regs.set_cs32(ret_cs as u32);
-    regs.set_flags32(ret_flags | machine::IF_FLAG);
+    regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status | machine::IF_FLAG);
 
     dos_trace!("[DPMI] RM_IRET_STUB -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
         ret_cs, ret_eip, regs.stack_seg(), regs.sp32());
@@ -840,27 +849,6 @@ pub(super) fn seg_base(ldt: &[u64], sel: u16) -> u32 {
     let b1 = ((d >> 32) & 0xFF) as u32;
     let b2 = ((d >> 56) & 0xFF) as u32;
     b0 | (b1 << 16) | (b2 << 24)
-}
-
-/// Translate a PM selector to its RM-equivalent paragraph value, for
-/// 16-bit clients on PM→RM INT reflection. Returns `base/16` when the
-/// selector is "RM-equivalent" — 16-bit (D=0) with a paragraph-aligned
-/// base — otherwise passes the selector value through unchanged.
-///
-/// This violates DPMI 0.9 §2.4's "DS/ES undefined" letter (and matches
-/// what DOS/16M, EMM386 and Microsoft Windows DPMI hosts do, but not
-/// CWSDPMI). We only enable it for 16-bit clients (`client_use32 == false`)
-/// — Borland's `dpmiload` and similar 16-bit DPMI clients put data at
-/// `PM-DS:offset` and expect the host to deliver the same linear bytes
-/// as `RM-DS:offset` after the reflect. 32-bit clients (CWSDPMI's
-/// typical DJGPP DOS programs) use INT 31 0300 with explicit RmCallStruct
-/// for marshaling and don't need translation; passing PM selectors
-/// through unchanged matches their expectations.
-pub(super) fn translate_rm_equivalent(ldt: &[u64], sel: u16) -> u16 {
-    if sel == 0 { return 0; }
-    let base = seg_base(ldt, sel);
-    if seg_is_32(ldt, sel) || (base & 0xF) != 0 { return sel; }
-    (base >> 4) as u16
 }
 
 /// Get the D/B (default operand size) bit. GDT selectors are treated as 32-bit.

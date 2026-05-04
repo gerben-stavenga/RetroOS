@@ -223,7 +223,7 @@ fn event_loop(first_tid: usize) {
     let mut event_counter: u64 = 0;
     let mut min_free: usize = crate::arch::free_page_count();
     let mut last_free: usize = min_free;
-    crate::dbg_println!("[mem] start free={}", min_free);
+    // crate::dbg_println!("[mem] start free={}", min_free);
 
     // REGS already set up by startup, page tables correct from boot
     loop {
@@ -231,9 +231,9 @@ fn event_loop(first_tid: usize) {
         if event_counter % MEM_DUMP_PERIOD == 0 {
             let free = crate::arch::free_page_count();
             if free < min_free { min_free = free; }
-            let delta = (free as i64) - (last_free as i64);
-            crate::dbg_println!("[mem] iter={} free={} delta={} min={}",
-                event_counter, free, delta, min_free);
+            let _delta = (free as i64) - (last_free as i64);
+            // crate::dbg_println!("[mem] iter={} free={} delta={} min={}",
+            //     event_counter, free, delta, min_free);
             last_free = free;
         }
         crate::kernel::stacktrace::set_debug_tid(tid);

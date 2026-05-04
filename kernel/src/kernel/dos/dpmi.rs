@@ -413,6 +413,11 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let mut dpmi = DpmiState::new();
     dpmi.client_use32 = client_type != 0;
     dpmi.raw_rm_state = entry_rm_state;
+    // 16-bit DPMI clients (Borland) issue INT 21 directly from PM with
+    // high-base PM selector buffers and rely on the host to handle them.
+    // PMDOS short-circuits INT 21 to a kernel handler that services the
+    // call with PM regs intact — see SLOT_PMDOS_INT21 docstring.
+    dos.pm_dos = !dpmi.client_use32;
 
     // Set up initial LDT entries.
     // Kernel slots (VECTOR_STUB, SPECIAL_STUB, LOW_MEM, IRQ_PM16/32_STACK) plus
@@ -471,6 +476,14 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // patches PSP[0x2C] per DPMI 0.9 §4.1. Sets `dos.current_psp = PSP_SEL`.
     dos.dpmi = Some(Box::new(dpmi));
     enter_pm_psp_view(dos);
+
+    // PMDOS: route PM INT 21 to the kernel's direct-service handler.
+    if dos.pm_dos {
+        dos.pm_vectors[0x21] = (
+            super::mode_transitions::SPECIAL_STUB_SEL,
+            dos::STUB_BASE + dos::slot_offset(dos::SLOT_PMDOS_INT21) as u32,
+        );
+    }
 
     // No arch_load_ldt here: `dos.ldt` is a fixed per-thread buffer allocated
     // at thread init, and the context switch into this thread already pointed
@@ -560,11 +573,18 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         0x0000 => {
             let count = (regs.rcx & 0xFFFF) as usize;
             if count == 0 { set_carry(regs); return thread::KernelAction::Done; }
+            // DPMI 0.9 §0000: allocated descriptors should match the
+            // client's bitness — 16-bit clients get D=0, 32-bit get D=1.
+            // Borland's dpmiload (16-bit client) inspects descriptor flags
+            // after alloc; getting D=1 for a 16-bit client trips its
+            // sanity check and trips the "Application load & execute
+            // error FFFB" bail.
+            let use32 = dos.dpmi.as_ref().map_or(true, |d| d.client_use32);
             // DPMI requires the returned descriptors to be a contiguous run.
             match alloc_ldt_range(&mut dos.ldt_alloc, count) {
                 Some(idx) => {
                     for extra in idx..(idx + count) {
-                        dos.ldt[extra] = DpmiState::make_data_desc(0, 0);
+                        dos.ldt[extra] = DpmiState::make_data_desc_ex(0, 0, use32);
                     }
                     let sel = DpmiState::idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
@@ -1300,6 +1320,15 @@ pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     };
     unsafe { *(rm_struct_addr as *mut RmCallStruct) = rm_struct; }
 
+    {
+        let (eax, ebx, ecx, edx, esi, edi, flags, ds, es) = (
+            rm_struct.eax, rm_struct.ebx, rm_struct.ecx, rm_struct.edx,
+            rm_struct.esi, rm_struct.edi, rm_struct.flags, rm_struct.ds, rm_struct.es);
+        dos_trace!("[0300 RET-WB] addr={:08X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} SI={:04X} DI={:04X} DS={:04X} ES={:04X} FL={:04X}",
+            rm_struct_addr, eax as u16, ebx as u16, ecx as u16, edx as u16,
+            esi as u16, edi as u16, ds, es, flags);
+    }
+
     stub.restore_gp(regs);
     save.restore(regs);
     dos.pc.locked_stack.other_stack = save.other_stack();
@@ -1885,17 +1914,26 @@ pub(super) fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs)
     thread::KernelAction::Done
 }
 
-/// Dispatch INT 31h that came from the special-stub segment. Only host-
-/// initiated return trampolines and entry points live here, so the slot is
-/// always one of SLOT_EXCEPTION_RET / SLOT_PM_TO_REAL / SLOT_SAVE_RESTORE.
+/// Dispatch INT 31h that came from the special-stub segment. Host-
+/// initiated return trampolines, entry points, and the PMDOS INT 21
+/// short-circuit live here.
 /// Slot = (EIP - STUB_BASE - 2) / 2.
-pub(super) fn pm_stub_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn pm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
-    dos_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
+    // Skip the slot trace for PMDOS INT 21 character-output AHs to keep
+    // the exception-handler dump and CRT printf output readable in the log.
+    let pmdos_chatty = slot == dos::SLOT_PMDOS_INT21
+        && matches!((regs.rax >> 8) as u8, 0x02 | 0x06 | 0x09);
+    if !pmdos_chatty {
+        dos_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
+    }
 
     match slot {
+        dos::SLOT_PMDOS_INT21 => {
+            return super::dos::pmdos_int21_handler(kt, dos, regs);
+        }
         dos::SLOT_EXCEPTION_RET => {
             return exception_return(dos, regs);
         }
