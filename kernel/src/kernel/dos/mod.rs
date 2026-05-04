@@ -298,6 +298,10 @@ pub struct ExecParent {
     /// Parent's PMDOS routing flag, suspended alongside dpmi/pm_vectors so
     /// the child runs with the default reflect-to-RM INT 21 path.
     pub pm_dos: bool,
+    /// Parent was running in PM at EXEC time. The child is always VM86;
+    /// `exec_return` uses this to flip `VM_FLAG` back so the dispatch tail
+    /// runs the PM iret-frame pop instead of the VM86 one.
+    pub pm_mode: bool,
     pub prev: Option<alloc::boxed::Box<ExecParent>>,
 }
 
@@ -414,11 +418,17 @@ pub fn handle_event(
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
-            if dos.dpmi.is_some() {
+            // DPMI exception delivery is for PM clients. A DPMI session
+            // can outlive its initial entry (TSR'd PM hosts like dpmiload
+            // keep `dos.dpmi` Some while running RM-side code), so
+            // `dpmi.is_some()` is not the right gate — `regs.mode()` is.
+            // Otherwise a #UD in VM86 code lands in dispatch_dpmi_exception
+            // which tries to load PM-shaped saved regs and #GPs the kernel.
+            if !is_vm86 && dos.dpmi.is_some() {
                 dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
             } else {
-                crate::println!("DOS: CPU exception {} in non-DPMI thread at CS:EIP={:#x}:{:#x}",
-                    n, regs.code_seg(), regs.ip32());
+                crate::println!("DOS: CPU exception {} at CS:EIP={:#x}:{:#x} (vm86={})",
+                    n, regs.code_seg(), regs.ip32(), is_vm86);
                 thread::KernelAction::Exit(-11)
             }
         }
