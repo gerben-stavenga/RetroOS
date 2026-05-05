@@ -1342,6 +1342,7 @@ pub fn vm86_pop(regs: &mut Regs) -> u16 {
     val
 }
 
+
 // GP-fault monitor lives in `arch/monitor.rs` now. Kernel only sees the
 // resulting `KernelEvent`s via `do_arch_execute()`; the completion helpers
 // for In/Out/Ins/Outs live at the top of this file (handle_in_event, etc.).

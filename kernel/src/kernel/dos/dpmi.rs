@@ -1637,7 +1637,7 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
         None => {
-            return thread::KernelAction::Exit(-(exc_num as i32));
+            return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
         }
     };
 
@@ -1670,7 +1670,7 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
         startup::arch_dump_exception(dos, regs);
-        return thread::KernelAction::Exit(-(exc_num as i32));
+        return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
     }
 
     let use32 = dpmi.client_use32;

@@ -153,12 +153,14 @@ pub fn startup() -> ! {
         println!("Build done.");
     }
 
+    println!("Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
+
     let dn_path: &[u8] = if has_ext4 { b"tar/DN/DN.COM" } else { b"DN/DN.COM" };
     let dn_cwd: &[u8] = if has_ext4 { b"tar/" } else { b"" };
+    println!("Starting DN...");
     loop {
-        println!("Starting DN...");
         run_dos_program(dn_path, b"", dn_cwd);
-        println!("DN exited.");
+        println!("DN exited, restarting...");
     }
 }
 

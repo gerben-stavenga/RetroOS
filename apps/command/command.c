@@ -235,13 +235,21 @@ static void read_cmdline(char *dst, int max) {
 
 /* ----- kernel synth syscalls ----- */
 
-static unsigned char get_child_exit_code(void);
+static unsigned int get_child_exit_status(void);
 
 static int synth_fork_exec(const char *name, const char *args) {
-    segread(&s);
+    /* Take far pointers so the segments come from the pointers
+     * themselves rather than whatever ES happens to be at the
+     * call site (HW-IRQ delivery clears ES). The tiny-model
+     * `const char *` arguments auto-convert to `const char far *`
+     * with DS as the segment. */
+    const char far *fname = name;
+    const char far *fargs = args ? args : empty_str;
     r.h.ah = 0x01;
-    r.x.dx = (unsigned)name;
-    r.x.bx = (unsigned)args;
+    r.x.dx = FP_OFF(fname);
+    r.x.bx = FP_OFF(fargs);
+    s.ds   = FP_SEG(fname);
+    s.es   = FP_SEG(fargs);
     int86x(0x31, &r, &r, &s);
     if (r.x.cflag) return -1;
     return (int)r.x.bx;
@@ -280,7 +288,7 @@ static int dos_exec_inplace(const char *name, const char *args) {
     s.es = s.ds;
     int86x(0x21, &r, &r, &s);
     if (r.x.cflag) return 255;
-    return (int)get_child_exit_code();
+    return (int)(get_child_exit_status() & 0xFF);
 }
 
 /* /L handler: just EXEC in-process. Our trampoline COMMAND.COM is
@@ -308,26 +316,38 @@ static void vga_take(int pid) {
     int86(0x31, &r, &r);
 }
 
-static unsigned char get_child_exit_code(void) {
+/* INT 31h AH=05h: reap a zombie child without touching VGA. Use this
+ * when the child terminated abnormally (high byte of AH=4Dh status =
+ * 0x02) and its VGA state is suspect. */
+static void synth_reap(int pid) {
+    r.h.ah = 0x05;
+    r.x.bx = (unsigned)pid;
+    int86(0x31, &r, &r);
+}
+
+/* INT 21h AH=4Dh: full child exit status word. High byte = termination
+ * type (00=normal, 01=Ctrl-Break, 02=fault, 03=TSR), low byte = AL/vector. */
+static unsigned int get_child_exit_status(void) {
     r.h.ah = 0x4D;
     int86(0x21, &r, &r);
-    return r.h.al;
+    return (unsigned int)r.x.ax;
 }
 
 /* Fork-exec a child and wait for it. `poll_kbd` enables the Ctrl-Z =
  * background gesture used by the interactive launcher path; batch
  * lines pass 0. */
 static int run_external_raw(const char *name, const char *args, int poll_kbd) {
-    int pid = synth_fork_exec(name, args ? args : empty_str);
+    int pid;
     int rc;
+    pid = synth_fork_exec(name, args);
     if (pid < 0) {
-        puts("Bad command or file name");
+        printf("Bad command or file name: '%s'\r\n", name);
         return 255;
     }
     for (;;) {
         rc = synth_waitpid(pid);
-        if (rc < 0) return 255;
-        if (rc == 0) break;
+        if (rc < 0) return 255;          /* no such child / EINVAL */
+        if (rc == 0) break;              /* exited */
         if (poll_kbd) {
             while (kbhit()) {
                 if (getch() == 0x1A) {
@@ -337,8 +357,23 @@ static int run_external_raw(const char *name, const char *args, int poll_kbd) {
             }
         }
     }
-    vga_take(pid);
-    return (int)get_child_exit_code();
+    {
+        unsigned int status = get_child_exit_status();
+        unsigned char term_type = (unsigned char)(status >> 8);
+        unsigned char exit_al   = (unsigned char)(status & 0xFF);
+        if (term_type == 0x02) {
+            /* Critical error / fault: skip vga_take (the dying child's
+             * VGA is suspect), just reap. Our own VGA context (already
+             * text mode from when we were suspended) gets restored by
+             * the kernel's materialize on the next thread-switch. */
+            printf("Aborted (critical error)\r\n");
+            synth_reap(pid);
+            printf("Reaped child %d with exit status %02Xh\r\n", pid, exit_al);
+            return 1;
+        }
+        vga_take(pid);
+        return (int)exit_al;
+    }
 }
 
 /* LOADFIX trampoline: re-fork COMMAND.COM with cmdline "/L prog [args]".
@@ -368,7 +403,7 @@ static int run_external(const char *name, const char *args, int poll_kbd) {
     char resolved[80];
     unsigned char flags;
     if (!resolve_program(name, resolved)) {
-        puts("Bad command or file name");
+        printf("Bad command or file name: '%s'\r\n", name);
         return 255;
     }
     if (has_ext(resolved, ".BAT")) return run_bat_file(resolved);
@@ -513,6 +548,7 @@ int main(void) {
     load_loadfix_cfg();
 
     read_cmdline(cmdline, sizeof(cmdline));
+    printf("CMD psp=%04X cmdline='%s'\r\n", _psp, cmdline);
     p = skipws(cmdline);
 
     /* /T -- enable kernel DOS trace for this command. Off by default;

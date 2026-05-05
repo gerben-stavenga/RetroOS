@@ -591,7 +591,10 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                 woke_parent = true;
             }
             if let Personality::Dos(dos) = &mut parent.personality {
-                dos.last_child_exit_status = (exit_code as u8) as u16;
+                // exit_code from the DOS personality already encodes
+                // termination type in bits 8..15 (00=normal, 02=fault,
+                // 03=TSR) and AL/vector in bits 0..7 — copy verbatim.
+                dos.last_child_exit_status = exit_code as u16;
             }
         }
 

@@ -392,13 +392,27 @@ pub fn handle_event(
             } else {
                 // Invariants: VM86 only ever traps INT 31h (only entry in
                 // the TSS bitmap), and the only path into PM is DPMI. So a
-                // non-31 SoftInt here is necessarily a PM client soft INT
-                // delivered through an active DPMI session.
-                assert!(!is_vm86,
-                    "VM86 SoftInt({:#x}) bubbled to dos — only INT 31h should trap", n);
-                assert!(dos.dpmi.is_some(),
-                    "PM SoftInt({:#x}) without an active DPMI session", n);
-                mode_transitions::deliver_pm_int(dos, regs, n)
+                // PM clients deliver via DPMI's soft-INT path. VM86
+                // software INTs go through the IDT-redirect bitmap to
+                // RM IVT[n] without trapping; the only VM86 soft-INTs
+                // that *do* land here are the DPL=3 IDT vectors (3 and
+                // 4 — `int3` debugger, `into` overflow). DOS's default
+                // IVT[3]/[4] entry is a bare `IRET`, and the CPU already
+                // saved IP-after-the-instruction in regs.eip during the
+                // ring-3→ring-0 trap, so a no-op return is equivalent
+                // to executing that default IRET in user mode. Compilers
+                // that emit `INTO` for unchecked overflow detection
+                // (Borland TP/TC) rely on exactly that behaviour when
+                // no debugger has hooked the vector.
+                if is_vm86 {
+                    debug_assert!(matches!(n, 3 | 4),
+                        "VM86 SoftInt({:#x}) bubbled to dos — only INT 3/4 should trap from VM86", n);
+                    thread::KernelAction::Done
+                } else {
+                    debug_assert!(dos.dpmi.is_some(),
+                        "PM SoftInt({:#x}) without an active DPMI session", n);
+                    mode_transitions::deliver_pm_int(dos, regs, n)
+                }
             }
         }
         KE::In { port, size } => {
@@ -427,9 +441,22 @@ pub fn handle_event(
             if !is_vm86 && dos.dpmi.is_some() {
                 dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
             } else {
-                crate::println!("DOS: CPU exception {} at CS:EIP={:#x}:{:#x} (vm86={})",
-                    n, regs.code_seg(), regs.ip32(), is_vm86);
-                thread::KernelAction::Exit(-11)
+                let lin = if is_vm86 {
+                    ((regs.code_seg() as u32) << 4).wrapping_add(regs.ip32())
+                } else {
+                    crate::arch::monitor::seg_base(regs.code_seg()).wrapping_add(regs.ip32())
+                };
+                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                let liq = unsafe { mode_transitions::LAST_IRQ };
+                crate::println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} (vm86={}) bytes={:02x?} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
+                    n, regs.code_seg(), regs.ip32(),
+                    regs.stack_seg(), regs.sp32(),
+                    is_vm86, bytes,
+                    liq.0, liq.1, liq.2, liq.3, liq.4, liq.5, liq.6);
+                // DOS termination type 02h (critical error) | low byte = vector.
+                // exit_thread copies this verbatim into parent's
+                // last_child_exit_status, where AH=4Dh exposes it.
+                thread::KernelAction::Exit(0x0200 | (n as i32 & 0xFF))
             }
         }
         KE::Fault => {
@@ -443,12 +470,12 @@ pub fn handle_event(
             } else if dos.dpmi.is_some() {
                 dpmi::dispatch_dpmi_exception(dos, regs, 13)
             } else {
-                thread::KernelAction::Exit(-11)
+                thread::KernelAction::Exit(0x0200 | 13) // #GP
             }
         }
         KE::PageFault { .. } => unreachable!("PageFault handled in event loop"),
         // DOS personality has no syscall ABI — segfault the thread.
-        KE::Syscall => thread::KernelAction::Exit(-11),
+        KE::Syscall => thread::KernelAction::Exit(0x0200),
     }
 }
 
@@ -494,6 +521,9 @@ pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], cm
     } else {
         dos::load_com(dos_state, &parent, data, dos_name)
     };
+    crate::dbg_println!("exec_dos_into tid={} psp_seg={:04X} cmdtail.len={} cmdtail={:?}",
+        tid, loaded.psp_seg, cmdtail.len(),
+        core::str::from_utf8(cmdtail).unwrap_or("<non-utf8>"));
     dos::Psp::at(loaded.psp_seg).set_cmdline(cmdtail);
 
     let psp_seg = loaded.psp_seg;

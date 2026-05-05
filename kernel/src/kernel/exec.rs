@@ -18,9 +18,16 @@ pub fn load_file(path: &[u8], cwd: &[u8]) -> Result<Vec<u8>, i32> {
     load_file_resolved(resolved)
 }
 
-/// Load a file by already-resolved path into a heap buffer.
+/// Load a file by already-resolved path into a heap buffer. Tries
+/// case-sensitive lookup first (Linux/POSIX semantics), then falls
+/// back to case-insensitive (DOS): paths from dfs_open_existing arrive
+/// uppercased while tar entries can be mixed-case (e.g. `shell.elf`),
+/// so a strict open would miss them.
 pub fn load_file_resolved(path: &[u8]) -> Result<Vec<u8>, i32> {
-    let handle = vfs::open_to_handle(path);
+    let handle = {
+        let h = vfs::open_to_handle(path);
+        if h >= 0 { h } else { vfs::open_to_handle_ci(path) }
+    };
     if handle < 0 { return Err(2); } // ENOENT
     let size = vfs::file_size_by_handle(handle) as usize;
     if size == 0 { vfs::close_vfs_handle(handle); return Err(2); }

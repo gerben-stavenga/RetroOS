@@ -285,21 +285,40 @@ pub(super) fn pop_save_at(ldt: &[u64], cursor: (u16, u32)) -> ModeSave {
 ///
 /// Used by: `deliver_pm_irq` (toggle/first-entry branch), `callback_entry`.
 pub(super) fn switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs) -> (u16, u32) {
-    // Capture rm side's live cursor before push_save reads anything.
-    //   VM86 entry: regs.SS:SP IS rm side.
-    //   PM entry  : either `other_stack` already tracks rm (chain in
-    //               flight), or the chain is empty (first-entry from
-    //               PM client) and rm side defaults to rm_TOS.
-    let rm_cursor_was = if regs.mode() == crate::UserMode::VM86 {
-        (regs.stack_seg(), regs.sp32())
+    // Compute the rm cursor to track in `other_stack` for the duration
+    // of this excursion. The cursor's role is to tell a subsequent
+    // PM→RM toggle (`switch_to_rm_side` via `rm_get_stack`) where to
+    // land the BIOS handler / RM target.
+    //
+    // - chain in flight (other_stack==Some): we're nesting on top of
+    //   an outer rm excursion — capture the live rm cursor (regs.SS:SP
+    //   for VM86 entry, the outer cursor for PM entry) so the inner
+    //   toggle resumes below it (LIFO sharing of rm_dedicated).
+    //
+    // - first entry (other_stack==None): regs.SS:SP for VM86 entry is
+    //   the *user's own stack*, NOT a usable rm landing site — DN's
+    //   decompression code runs with a tiny ~few-hundred-byte stack
+    //   right above its execution loop. Routing a BIOS-handler reflect
+    //   onto that stack overflows it, corrupts adjacent code, and
+    //   crashes DN at random sites after AH=4Bh return. Default to
+    //   rm_dedicated:rm_TOS instead.
+    //
+    // ModeSave's own ss/esp fields capture the user's actual SS:SP for
+    // cross_mode_restore, independent of `other_stack`.
+    let next_rm_cursor = if dos.pc.locked_stack.other_stack.is_some() {
+        if regs.mode() == crate::UserMode::VM86 {
+            (regs.stack_seg(), regs.sp32())
+        } else {
+            rm_get_stack(dos)
+        }
     } else {
-        rm_get_stack(dos)
+        (dos::rm_stack_seg(), rm_stack_top() as u32)
     };
     let pm_save_at = push_save(dos, regs);
     regs.frame.ss  = pm_save_at.0 as u64;
     regs.frame.rsp = pm_save_at.1 as u64;
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
-    dos.pc.locked_stack.other_stack = Some(rm_cursor_was);
+    dos.pc.locked_stack.other_stack = Some(next_rm_cursor);
     pm_save_at
 }
 
@@ -508,8 +527,18 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
 /// available at thread init. When `pm_vectors[vec]` is the default stub,
 /// the round-trip lands in `vector_stub_reflect` which discriminates the
 /// first-entry case by the IRET target == `SLOT_PM_IRET`.
+/// Diagnostic: last HW-IRQ delivery info, printed by the exception
+/// dispatcher when a non-DPMI VM86 thread faults — lets us see whether
+/// a HW IRQ was just delivered (and where) right before the crash.
+/// Layout: (vec, target_sel, target_off, src_cs, src_ip, src_ss, src_sp).
+pub(super) static mut LAST_IRQ: (u8, u16, u32, u16, u32, u16, u32) = (0xFF, 0, 0, 0, 0, 0, 0);
+
 pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     let (sel, off) = dos.pm_vectors[vector as usize];
+    unsafe {
+        LAST_IRQ = (vector, sel, off, regs.code_seg(), regs.ip32(),
+                    regs.stack_seg(), regs.sp32());
+    }
     // DPMI 0.9 §10.6: frame width follows the *client*'s bitness, not the
     // handler segment's D bit. A 32-bit client routinely installs a
     // 16-bit-segment handler that issues `66 CF` (32-bit IRETD) — clients

@@ -158,8 +158,13 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             let caller_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
             machine::set_vm86_flags(regs, caller_flags as u32);
             let action = dispatch_kernel_syscall(kt, dos, regs, slot);
-            // exec_return / Exit replace thread state — skip the VM86 frame pop below.
-            if !matches!(action, thread::KernelAction::Done) {
+            // Exit replaces thread state outright — skip the iret-frame
+            // pop entirely. Anything else (Done, ForkExec, Yield, Switch)
+            // leaves the issuing thread alive and needs regs.CS:EIP
+            // popped to the user's post-INT instruction; otherwise the
+            // saved cpu_state retains the kernel stub address and the
+            // thread re-traps on its next slice.
+            if matches!(action, thread::KernelAction::Exit(_)) {
                 return action;
             }
             // Flag-writeback only when we're still in VM86. AH=4C with a
@@ -313,6 +318,8 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
                 }
                 n
             };
+            crate::dbg_println!("synth_fork_exec entry: ds={:04X} dx={:04X} es={:04X} bx={:04X}",
+                regs.ds as u16, regs.rdx as u16, regs.es as u16, regs.rbx as u16);
             let mut filename = [0u8; 128];
             let flen = read_asciiz(regs.ds as u16, regs.rdx as u32, &mut filename);
             if flen == 0 {
@@ -322,6 +329,9 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
             }
             let mut tail = [0u8; 128];
             let tlen = read_asciiz(regs.es as u16, regs.rbx as u32, &mut tail);
+            crate::dbg_println!("synth_fork_exec: filename={:?} tail.len={} tail_first8={:02x?}",
+                core::str::from_utf8(&filename[..flen]).unwrap_or("<non-utf8>"),
+                tlen, &tail[..tlen.min(8)]);
             fork_exec(dos, &filename[..flen], &tail[..tlen], regs, kt)
         }
         // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
@@ -364,6 +374,18 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
         // No DPMI 0.9 collision (RM-only path; PM DPMI is dispatched separately).
         0x02 | 0x03 => {
             DOS_TRACE_RT.store(ah == 0x02, core::sync::atomic::Ordering::Relaxed);
+            regs.rax &= !0xFFFF;
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
+        // AH=05h — SYNTH_REAP: reap a zombie child without touching VGA.
+        // Use after AH=04h waitpid reports CF=0/AX=0 when the caller doesn't
+        // want to adopt the child's farewell screen — typically because the
+        // child terminated by fault (last_child_exit_status high byte = 0x02)
+        // and its VGA state is suspect. BX = child pid.
+        0x05 => {
+            let pid = (regs.rbx & 0xFFFF) as i16 as i32;
+            thread::reap(pid);
             regs.rax &= !0xFFFF;
             regs.clear_flag32(1);
             thread::KernelAction::Done
@@ -462,8 +484,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
     // running clients), 02/06/09 (character/string output — exception
     // handlers and CRT printf each char separately, splicing trace lines
-    // through the user's text output).
-    if !matches!(ah, 0x2C | 0x2A | 0x02 | 0x06 | 0x09) {
+    // through the user's text output), 40 (write-to-handle — printf in
+    // newer CRTs goes here byte-by-byte, same flooding problem as 02/09).
+    if !matches!(ah, 0x2C | 0x2A | 0x02 | 0x06 | 0x09 | 0x40) {
         dos_trace!("[INT21] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
             regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
@@ -915,8 +938,11 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 }
                 return action;
             }
+            // No exec_parent: cross-thread TSR. Encode termination type 03h
+            // | AL into exit_code so the parent's last_child_exit_status
+            // (set by exit_thread) carries the TSR marker per AH=4Dh spec.
             let code = regs.rax as u8;
-            thread::KernelAction::Exit(code as i32)
+            thread::KernelAction::Exit(0x0300 | (code as i32))
         }
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
@@ -2161,6 +2187,15 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
 fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
+    crate::dbg_println!("exec_return: parent ss:sp={:04X}:{:04X} ds={:04X} es={:04X} heap={:04X} psp={:04X}",
+        parent.ss, parent.sp, parent.ds, parent.es, parent.heap_seg, parent.psp);
+    // Peek the IRET frame waiting on parent's stack.
+    let lin = ((parent.ss as u32) << 4) + (parent.sp as u32);
+    let ret_ip = unsafe { *(lin as *const u16) };
+    let ret_cs = unsafe { *((lin + 2) as *const u16) };
+    let ret_flags = unsafe { *((lin + 4) as *const u16) };
+    crate::dbg_println!("exec_return: parent IRET frame at {:04X}:{:04X} -> ip={:04X} cs={:04X} flags={:04X}",
+        parent.ss, parent.sp, ret_ip, ret_cs, ret_flags);
     dos_trace!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X} pm_env={}",
         dos.heap_seg, parent.heap_seg,
         dos.current_psp, parent.psp,
