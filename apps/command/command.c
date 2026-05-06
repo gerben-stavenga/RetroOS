@@ -23,6 +23,7 @@
  * Build: tiny model .COM via Borland C++ 3.1 (DS=ES=CS=SS=PSP segment).
  */
 
+#include <assert.h>
 #include <dos.h>
 #include <dir.h>
 #include <conio.h>
@@ -204,22 +205,27 @@ static char *skipws(char *p) {
     return p;
 }
 
-/* Split off the first whitespace-delimited token in `line` in place:
- * returns a pointer to the token (NUL-terminated), and *rest_out points
- * past the following whitespace at the start of the remainder. */
-static char *split_first(char *line, char **rest_out) {
-    char *tok = skipws(line);
-    char *p = tok;
-    while (*p && *p != ' ' && *p != '\t') p++;
-    if (*p) { *p++ = 0; p = skipws(p); }
-    *rest_out = p;
-    return tok;
+#define MAX_ARGV 16
+
+/* Tokenize `line` in place: NUL-terminate each whitespace-delimited token
+ * and write pointers into argv[]. Returns argc, capped at max-1 to leave
+ * room for a NULL sentinel that we don't actually write (callers use argc).
+ * Modifies `line` (writes NULs over separators). */
+static int tokenize(char *line, char **argv, int max) {
+    int n = 0;
+    char *p = skipws(line);
+    while (*p && n < max) {
+        argv[n++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) { *p++ = 0; p = skipws(p); }
+    }
+    return n;
 }
 
 /* Join argv[start..argc-1] into dst as a single space-separated string,
  * NUL-terminated. Used to rebuild the cmdline tail to hand off to a child
  * (the kernel writes the tail verbatim to the child's PSP[0x80]). */
-static void join_args(char *dst, int max, char *argv[], int start, int argc) {
+static void join_args(char *dst, int max, char **argv, int start, int argc) {
     int len = 0;
     int i, n;
     for (i = start; i < argc; i++) {
@@ -268,37 +274,29 @@ static int dos_exec_inplace(const char *name, const char *args) {
         unsigned long fcb1;
         unsigned long fcb2;
     } pb;
+    const char far *fname    = name;
+    const char far *fcmdtail = cmdtail;
+    void far       *fpb      = &pb;
     int alen = (int)strlen(args);
     if (alen > 127) alen = 127;
     cmdtail[0] = (unsigned char)alen;
     memcpy(cmdtail + 1, args, alen);
     cmdtail[1 + alen] = 0x0D;
 
-    segread(&s);
     pb.env_seg     = 0;             /* 0 = inherit our env */
-    pb.cmdline_off = (unsigned)cmdtail;
-    pb.cmdline_seg = s.ds;
+    pb.cmdline_off = FP_OFF(fcmdtail);
+    pb.cmdline_seg = FP_SEG(fcmdtail);
     pb.fcb1        = 0;
     pb.fcb2        = 0;
 
     r.x.ax = 0x4B00;
-    r.x.dx = (unsigned)name;
-    r.x.bx = (unsigned)&pb;
-    s.es = s.ds;
+    r.x.dx = FP_OFF(fname);
+    r.x.bx = FP_OFF(fpb);
+    s.ds   = FP_SEG(fname);
+    s.es   = FP_SEG(fpb);
     int86x(0x21, &r, &r, &s);
     if (r.x.cflag) return 255;
     return (int)(get_child_exit_status() & 0xFF);
-}
-
-/* /L handler: just EXEC in-process. Our trampoline COMMAND.COM is
- * itself a full 64 KB .COM block, so the EXEC'd child already lands
- * with its PSP well above segment 0x1000 -- no extra dummy alloc is
- * needed. (Real DOS LOADFIX existed because its COMMAND.COM resident
- * was only a few KB; ours isn't.) Adding a dummy here would actually
- * break the load: CHESS.EXE asks for ~440 KB minalloc and any extra
- * low alloc pushes us past the 640 KB conventional ceiling. */
-static int run_loadfix_inplace(const char *prog, const char *args) {
-    return dos_exec_inplace(prog, args);
 }
 
 static int synth_waitpid(int pid) {
@@ -332,15 +330,18 @@ static unsigned int get_child_exit_status(void) {
     return (unsigned int)r.x.ax;
 }
 
-/* Fork-exec a child and wait for it. `poll_kbd` enables the Ctrl-Z =
- * background gesture used by the interactive launcher path; batch
- * lines pass 0. */
-static int run_external_raw(const char *name, const char *args, int poll_kbd) {
-    int pid;
-    int rc;
-    pid = synth_fork_exec(name, args);
+/* Fork-exec a child and wait for it. argv[0] = program path,
+ * argv[1..argc-1] = args. The args are joined into the cmdline tail
+ * right here at the synth call boundary so callers stay tokenised.
+ * `poll_kbd` enables the Ctrl-Z = background gesture used by the
+ * interactive launcher path; batch lines pass 0. */
+static int run_external_raw(char **argv, int argc, int poll_kbd) {
+    char tail[128];
+    int pid, rc;
+    join_args(tail, sizeof(tail), argv, 1, argc);
+    pid = synth_fork_exec(argv[0], tail);
     if (pid < 0) {
-        printf("Bad command or file name: '%s'\r\n", name);
+        printf("Bad command or file name: '%s'\r\n", argv[0]);
         return 255;
     }
     for (;;) {
@@ -375,160 +376,151 @@ static int run_external_raw(const char *name, const char *args, int poll_kbd) {
     }
 }
 
-/* LOADFIX trampoline: re-fork COMMAND.COM with cmdline "/L prog [args]".
- * The trampoline child handles /L by running run_loadfix_inplace, which
- * dummy-allocs low memory and EXECs the program in its own address
- * space. Going through fork+exec (rather than EXEC-ing in this process)
- * keeps the interactive shell free to multitask. */
-static int run_loadfix_via_trampoline(const char *prog, const char *args, int poll_kbd) {
-    static char tail[128];
-    if (args && *args) sprintf(tail, "/L %s %s", prog, args);
-    else               sprintf(tail, "/L %s", prog);
-    return run_external_raw("C:\\COMMAND.COM", tail, poll_kbd);
-}
-
-/* DOS/32A wrapper: launch C:\DOS32A.EXE with the original program and
- * args appended as command tail. DOS/32A loads the target itself and
- * supplies a stricter DPMI 0.9 environment than DOS/4GW's embedded one. */
-static int run_via_dos32a(const char *prog, const char *args, int poll_kbd) {
-    static char tail[200];
-    if (args && *args) sprintf(tail, "%s %s", prog, args);
-    else               strcpy(tail, prog);
-    return run_external_raw("C:\\DOS32A.EXE", tail, poll_kbd);
-}
-
-static int run_external(const char *name, const char *args, int poll_kbd) {
+/* Dispatch an external program. argv[prog_idx] is the program to run;
+ * argv[prog_idx-1] and argv[prog_idx-2] are scratch slots the caller has
+ * reserved for trampoline prefixes (this function may mutate them, plus
+ * argv[prog_idx] which gets replaced with the resolved full path).
+ *
+ * Caller layouts:
+ *   - main(): argv[0]="COMMAND.COM" argv[1]="/C" argv[2..]=prog,args
+ *             -> prog_idx=2, both scratch slots present.
+ *   - run_bat_line(): tokenises into argv[2..], leaves argv[0..1] empty
+ *                     -> prog_idx=2, both scratch slots present.
+ *
+ * No copy: the trampoline-prefix injection writes back into the caller's
+ * own argv slots and we hand a pointer slice to run_external_raw. */
+static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) {
     char resolved[80];
     unsigned char flags;
-    if (!resolve_program(name, resolved)) {
-        printf("Bad command or file name: '%s'\r\n", name);
+    if (prog_idx >= argc) return 0;
+    assert(prog_idx >= 2);
+    if (!resolve_program(argv[prog_idx], resolved)) {
+        printf("Bad command or file name: '%s'\r\n", argv[prog_idx]);
         return 255;
     }
     if (has_ext(resolved, ".BAT")) return run_bat_file(resolved);
+    argv[prog_idx] = resolved;
     flags = lookup_flags(resolved);
-    if (flags & LF_F_DOS32A)  return run_via_dos32a(resolved, args, poll_kbd);
-    if (flags & LF_F_LOADFIX) return run_loadfix_via_trampoline(resolved, args, poll_kbd);
-    return run_external_raw(resolved, args, poll_kbd);
-}
-
-/* ----- built-ins ----- */
-
-/* Does `p` start with `word` followed by end-of-string or whitespace? */
-static int word_eq(const char *p, const char *word) {
-    int i = 0;
-    while (word[i]) {
-        if (toupper((unsigned char)p[i]) != toupper((unsigned char)word[i])) return 0;
-        i++;
+    if (flags & LF_F_DOS32A) {
+        /* Spawn DOS/32A.EXE with prog + args as its tail. DOS/32A loads
+         * the target itself and provides a stricter DPMI 0.9 environment
+         * than DOS/4GW's embedded one. */
+        prog_idx--;   /* shift back to overwrite caller's argv[prog_idx-1] with DOS/32A.EXE */ 
+        argv[prog_idx] = "C:\\DOS32A.EXE";
+    } else if (flags & LF_F_LOADFIX) {
+        /* Re-fork COMMAND.COM with cmdline "/L prog [args]". The trampoline
+         * child takes the /L branch in main() and EXECs the program
+         * in-process -- its PSP lands above seg 0x1000, dodging EXEPACK's
+         * load-low bug. */
+         prog_idx -= 2;   /* shift back to overwrite caller's argv[prog_idx-2] with COMMAND.COM */
+        argv[prog_idx] = "C:\\COMMAND.COM";
+        argv[prog_idx + 1] = "/L";
     }
-    return p[i] == 0 || p[i] == ' ' || p[i] == '\t';
+    return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd);
 }
 
-static int builtin_echo(char *args) {
-    char *p = skipws(args);
-    if (*p == 0) {
-        puts(echo_on ? "ECHO is on" : "ECHO is off");
+/* ----- built-ins -----
+ *
+ * All builtins take (argv, argc) where argv[0] is the command name (so
+ * argv[1..argc-1] are the arguments). Mirrors the int main() convention,
+ * keeps tokenisation in a single place (the BAT-line / cmdline parser). */
+
+/* Run the command at argv[prog_idx] with arguments at argv[prog_idx+1..argc-1].
+ * Built-ins (REM/ECHO/CD/CLS/TYPE/PAUSE/TRACE/EXIT) are matched first and
+ * handled inline; if none match, dispatch_external takes over at the tail.
+ * argv[prog_idx-1] and argv[prog_idx-2] (when prog_idx >= 1 / >= 2) must be
+ * caller-reserved scratch slots that dispatch_external may overwrite for
+ * trampoline-prefix injection. Returns the command's exit code. */
+static int run_command(char **argv, int prog_idx, int argc, int poll_kbd) {
+    const char *name;
+    int args = prog_idx + 1;            /* index of first argument token */
+    int nargs = argc - args;            /* number of argument tokens */
+
+    if (prog_idx >= argc) return 0;
+    name = argv[prog_idx];
+
+    if (stricmp(name, "REM") == 0) return 0;
+    if (stricmp(name, "ECHO") == 0) {
+        char joined[128];
+        if (nargs <= 0) {
+            puts(echo_on ? "ECHO is on" : "ECHO is off");
+        } else if (nargs == 1 && stricmp(argv[args], "ON")  == 0) {
+            echo_on = 1;
+        } else if (nargs == 1 && stricmp(argv[args], "OFF") == 0) {
+            echo_on = 0;
+        } else {
+            join_args(joined, sizeof(joined), argv, args, argc);
+            puts(joined);
+        }
         return 0;
     }
-    if (word_eq(p, "ON"))  { echo_on = 1; return 0; }
-    if (word_eq(p, "OFF")) { echo_on = 0; return 0; }
-    puts(p);
-    return 0;
-}
-
-static int builtin_cd(char *args) {
-    char path[MAXPATH];
-    char *p = skipws(args);
-    int n;
-    if (*p == 0) {
-        if (getcwd(path, sizeof(path)) == 0) { puts("getcwd failed"); return 1; }
-        puts(path);
+    if (stricmp(name, "CD") == 0 || stricmp(name, "CHDIR") == 0) {
+        char path[MAXPATH];
+        if (nargs <= 0) {
+            if (getcwd(path, sizeof(path)) == 0) { puts("getcwd failed"); return 1; }
+            puts(path);
+            return 0;
+        }
+        if (chdir(argv[args]) != 0) { puts("Invalid directory"); return 1; }
         return 0;
     }
-    n = 0;
-    while (*p && *p != ' ' && *p != '\t' && n < (int)sizeof(path) - 1) path[n++] = *p++;
-    path[n] = 0;
-    if (chdir(path) != 0) { puts("Invalid directory"); return 1; }
-    return 0;
-}
-
-static int builtin_cls(void) {
-    clrscr();
-    return 0;
-}
-
-static int builtin_type(char *args) {
-    char path[128];
-    char buf[256];
-    char *p = skipws(args);
-    FILE *f;
-    int n, k = 0;
-    if (*p == 0) { puts("Required parameter missing"); return 1; }
-    while (*p && *p != ' ' && *p != '\t' && k < 127) path[k++] = *p++;
-    path[k] = 0;
-    f = fopen(path, "rb");
-    if (f == 0) { puts("File not found"); return 1; }
-    while ((n = (int)fread(buf, 1, sizeof(buf), f)) > 0) {
-        fwrite(buf, 1, (size_t)n, stdout);
+    if (stricmp(name, "CLS") == 0) {
+        clrscr();
+        return 0;
     }
-    fclose(f);
-    return 0;
-}
-
-static int builtin_pause(void) {
-    printf("Press any key to continue . . .\n");
-    getch();
-    return 0;
-}
-
-static int try_builtin(const char *name, char *args, int *exit_code);
-
-/* `trace <prog> [args]` -- enable the kernel DOS trace, run the given
- * command in the current process (no extra COMMAND.COM trampoline), then
- * disable trace before returning. The DN.EXT Ctrl+Enter binding uses this. */
-static int builtin_trace(char *args) {
-    char *p = skipws(args);
-    char *prog, *prog_args;
-    int exit_code = 0;
-    if (*p == 0) {
-        printf("Usage: trace <program> [args]\r\n");
-        return 1;
+    if (stricmp(name, "TYPE") == 0) {
+        char buf[256];
+        FILE *f;
+        int n;
+        if (nargs <= 0) { puts("Required parameter missing"); return 1; }
+        f = fopen(argv[args], "rb");
+        if (!f) { puts("File not found"); return 1; }
+        while ((n = (int)fread(buf, 1, sizeof(buf), f)) > 0) {
+            fwrite(buf, 1, (size_t)n, stdout);
+        }
+        fclose(f);
+        return 0;
     }
-    prog = split_first(p, &prog_args);
-    trace(1);
-    if (!try_builtin(prog, prog_args, &exit_code)) {
-        exit_code = run_external(prog, prog_args, 1);
+    if (stricmp(name, "PAUSE") == 0) {
+        printf("Press any key to continue . . .\n");
+        getch();
+        return 0;
     }
-    trace(0);
-    return exit_code;
-}
-
-/* If `name` is a built-in, run it and store its exit code in *exit_code,
- * then return 1. Otherwise return 0. EXIT terminates the process directly. */
-static int try_builtin(const char *name, char *args, int *exit_code) {
-    if (stricmp(name, "REM") == 0)   { *exit_code = 0; return 1; }
-    if (stricmp(name, "ECHO") == 0)  { *exit_code = builtin_echo(args);  return 1; }
-    if (stricmp(name, "CD") == 0 ||
-        stricmp(name, "CHDIR") == 0) { *exit_code = builtin_cd(args);    return 1; }
-    if (stricmp(name, "CLS") == 0)   { *exit_code = builtin_cls();       return 1; }
-    if (stricmp(name, "TYPE") == 0)  { *exit_code = builtin_type(args);  return 1; }
-    if (stricmp(name, "PAUSE") == 0) { *exit_code = builtin_pause();     return 1; }
-    if (stricmp(name, "TRACE") == 0) { *exit_code = builtin_trace(args); return 1; }
+    if (stricmp(name, "TRACE") == 0) {
+        /* Recurse on the inner command at args (prog_idx + 1). The original
+         * scratch slots before prog_idx stay available, and argv[prog_idx]
+         * ("TRACE", already consumed) becomes an additional reusable slot,
+         * so the inner program sees at least as many scratch slots as the
+         * outer dispatch -- no degradation for LOADFIX/DOS32A wrapping. */
+        int rc;
+        if (nargs <= 0) {
+            printf("Usage: trace <program> [args]\r\n");
+            return 1;
+        }
+        trace(1);
+        rc = run_command(argv, args, argc, poll_kbd);
+        trace(0);
+        return rc;
+    }
     if (stricmp(name, "EXIT") == 0) {
-        *exit_code = atoi(skipws(args));
         should_exit = 1;
-        return 1;
+        return (nargs > 0) ? atoi(argv[args]) : 0;
     }
-    return 0;
+
+    /* Tail: not a built-in -- spawn as external program. */
+    return dispatch_external(argv, prog_idx, argc, poll_kbd);
 }
 
 /* ----- batch interpreter ----- */
 
-/* Execute one line of a .BAT file (no trailing CR/LF, NUL-terminated). */
+/* Execute one line of a .BAT file (no trailing CR/LF, NUL-terminated).
+ * Tokenises the line into argv[2..] (leaving argv[0..1] as scratch slots
+ * for trampoline-prefix injection in dispatch_external), then dispatches. */
 static int run_bat_line(char *line) {
+    char *argv[MAX_ARGV];
     char *p = skipws(line);
-    char *prog, *args;
     int suppress_echo = 0;
-    int exit_code = 0;
+    int n;
 
     if (*p == 0)   return 0;   /* blank */
     if (*p == ':') return 0;   /* label */
@@ -536,11 +528,10 @@ static int run_bat_line(char *line) {
 
     if (echo_on && !suppress_echo) puts(p);
 
-    prog = split_first(p, &args);
-    if (*prog == 0) return 0;
+    n = tokenize(p, &argv[2], MAX_ARGV - 2);
+    if (n == 0) return 0;
 
-    if (try_builtin(prog, args, &exit_code)) return exit_code;
-    return run_external(prog, args, 0);
+    return run_command(argv, 2, n + 2, 0);
 }
 
 static int run_bat_file(const char *path) {
@@ -570,41 +561,38 @@ static int is_flag(const char *arg, char letter) {
 }
 
 int main(int argc, char *argv[]) {
-    char args_buf[128];
-    int exit_code = 0;
-    int i = 1;
-    int j;
-
     load_loadfix_cfg();
 
-    printf("CMD argc=%d", argc);
-    for (j = 1; j < argc; j++) printf(" [%s]", argv[j]);
-    printf("\r\n");
+    /* Invocation contract: COMMAND.COM is always called as
+     *   COMMAND.COM /L prog [args]   (LOADFIX trampoline)
+     * or
+     *   COMMAND.COM /C prog [args]   (one-shot run)
+     *
+     * Mandating one of /L or /C guarantees argv[0] ("COMMAND.COM") and
+     * argv[1] (the flag) are both writable scratch slots in front of
+     * argv[2] (the program) -- exactly what dispatch_external needs to
+     * inject trampoline prefixes in place without an extra buffer. */
+    if (argc < 2 || (!is_flag(argv[1], 'L') && !is_flag(argv[1], 'C'))) {
+        printf("Usage: COMMAND.COM /C cmdline   (or /L for LOADFIX)\r\n");
+        return 1;
+    }
 
     /* /L progname [args] -- LOADFIX trampoline entry. The interactive
      * COMMAND.COM forks us with this when it sees a name in loadfix.cfg;
      * we EXEC the program in-process so its PSP lands above segment
      * 0x1000 (dodging EXEPACK's load-low bug). */
-    if (i < argc && is_flag(argv[i], 'L')) {
-        i++;
-        if (i >= argc) {
+    if (is_flag(argv[1], 'L')) {
+        char tail[128];
+        if (argc < 3) {
             printf("/L requires program name\r\n");
             return 1;
         }
-        join_args(args_buf, sizeof(args_buf), argv, i + 1, argc);
-        return run_loadfix_inplace(argv[i], args_buf);
+        join_args(tail, sizeof(tail), argv, 3, argc);
+        return dos_exec_inplace(argv[2], tail);
     }
 
-    /* Optional /C -- accept and skip (case-insensitive). */
-    if (i < argc && is_flag(argv[i], 'C')) i++;
-
-    if (i < argc) {
-        join_args(args_buf, sizeof(args_buf), argv, i + 1, argc);
-        if (!try_builtin(argv[i], args_buf, &exit_code)) {
-            /* External -- interactive launcher mode (Ctrl-Z backgrounds). */
-            exit_code = run_external(argv[i], args_buf, 1);
-        }
-    }
-
-    return exit_code;
+    /* /C path: argv[2] is the program/builtin, argv[3..] are its args.
+     * argv[0] and argv[1] are guaranteed scratch for trampoline prefixes.
+     * Interactive launcher mode -- poll kbd so Ctrl-Z backgrounds. */
+    return run_command(argv, 2, argc, 1);
 }
