@@ -167,13 +167,25 @@ impl Vga {
 
 impl Write for Vga {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        let to_screen = KERNEL_OWNS_SCREEN.load(core::sync::atomic::Ordering::Relaxed);
         for byte in s.bytes() {
-            self.putchar(byte);
+            if to_screen {
+                self.putchar(byte);
+            }
             unsafe { core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") byte); }
         }
         Ok(())
     }
 }
+
+/// Whether `println!`/`print!` should write to the VGA framebuffer in addition
+/// to debugcon. True at boot so kernel POST messages appear on screen; flipped
+/// to false once the first DOS thread starts running, so kernel runtime logs
+/// stop trampling the user's framebuffer (which is especially harmful in
+/// CGA/EGA graphics modes where char+attr writes corrupt pixel data).
+/// `dos_putchar` calls `vga().putchar(c)` directly and is not gated by this.
+pub static KERNEL_OWNS_SCREEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 /// Global VGA state
 static mut VGA: Vga = Vga::new();

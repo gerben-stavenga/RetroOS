@@ -70,11 +70,12 @@ elf{    !.!}
 elf(    !.!)
 
 ; ~~~~~~~~~~~~~~~~~~~~~~   DOS native + trace   ~~~~~~~~~~~~~~~~~~~~~~~~
-; Ctrl+Enter on a native binary launches it through COMMAND /T /C, which
-; turns on the kernel DOS trace for just that run (off again on exit).
-exe(    command /t /c !.!)
-com(    command /t /c !.!)
-bat(    command /t /c !.!)
+; Ctrl+Enter on a native binary launches it through the COMMAND.COM
+; built-in `trace`, which turns on the kernel DOS trace for just that
+; run (off again on exit) without spawning an extra COMMAND.COM.
+exe(    trace !.!)
+com(    trace !.!)
+bat(    trace !.!)
 
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~   Misc   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 stm{    ..\StMod ! F}

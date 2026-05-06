@@ -91,6 +91,7 @@ pub mod arch_call {
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start, ECX=num_pages, EBX=ppage_start
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
+    pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
 }
 
 fn arch_dispatch(regs: &mut Regs) {

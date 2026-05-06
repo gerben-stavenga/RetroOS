@@ -534,9 +534,12 @@ impl MouseState {
 
 impl PcMachine {
     pub fn new() -> Self {
-        // Save real HMA content (identity-mapped 0x100-0x10F) into shadow,
-        // then set HMA to wrap (copy of page 0). A20 starts disabled.
-        crate::kernel::startup::arch_copy_page_entries(HMA_PAGE, HMA_SHADOW_PAGE, HMA_PAGE_COUNT);
+        // A20 starts disabled. HMA_PAGE wraps to user's private low memory
+        // by copying entries[0..16]. HMA_SHADOW_PAGE is left not-present
+        // (arch_user_clean cleared it; map_low_mem_user doesn't touch it),
+        // which is the correct A20-on state when no extended memory is
+        // allocated — set_a20(true) will swap not-present into HMA_PAGE
+        // so HMA accesses fault until XMS maps real extended memory.
         crate::kernel::startup::arch_copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
         Self {
             a20_enabled: false,
@@ -1087,6 +1090,10 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         }
         // VGA ports — pass through to hardware
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => crate::arch::inb(port),
+        // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
+        // to configure QEMU's emulated VGA, even for legacy modes.
+        // Pass through so SeaBIOS sees real VBE state.
+        0x01CE | 0x01CF | 0x01D0 => crate::arch::inb(port),
         // Master PIC command (read ISR)
         0x20 => pc.vpic.isr,
         // Master PIC data (read IMR)
@@ -1110,8 +1117,13 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
             crate::arch::outb(0x70, pc.cmos_index);
             crate::arch::inb(0x71)
         }
-        // Unknown ports: return 0xFF (unpopulated bus)
-        _ => 0xFF,
+        // Unknown ports: return 0xFF (unpopulated bus). Diagnostic — log to
+        // surface ports the BIOS or guest expects responses on but we don't
+        // virtualize.
+        _ => {
+            crate::dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
+            0xFF
+        }
     }
 }
 
@@ -1129,6 +1141,8 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
             crate::arch::outb(port, val);
         }
         0x3C1..=0x3DF => crate::arch::outb(port, val),
+        // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.
+        0x01CE | 0x01CF | 0x01D0 => crate::arch::outb(port, val),
         // Master PIC command
         0x20 => {
             if val == 0x20 {
@@ -1164,8 +1178,12 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         // CMOS data writes are dropped — never let the guest mutate host CMOS
         // (BIOS settings, time-of-day, alarm, etc.).
         0x71 => {}
-        // Unknown ports: silently ignore (BIOS probes various ports during mode switches)
-        _ => {}
+        // Unknown ports: silently ignore (BIOS probes various ports during mode switches).
+        // Diagnostic — log so we can spot ports SeaBIOS / guest writes to
+        // that we need to virtualize but currently drop.
+        _ => {
+            crate::dbg_println!("[port] out {:04X} <- {:02X} (unhandled)", port, val);
+        }
     }
 }
 

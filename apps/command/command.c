@@ -1,8 +1,9 @@
 /* COMMAND.COM -- minimal DOS shell launcher for RetroOS.
  *
  * Invoked one-shot as `COMMAND.COM /C cmdline` (or `COMMAND.COM cmdline`).
- * Parses its own PSP cmdline at DS:80h, then either:
- *   - runs a built-in (REM/ECHO/CD/CLS/TYPE/PAUSE/EXIT),
+ * Reads its arguments through ANSI `int main(int argc, char *argv[])` (the
+ * Borland C startup parses the PSP tail into argv); then either:
+ *   - runs a built-in (REM/ECHO/CD/CLS/TYPE/PAUSE/TRACE/EXIT),
  *   - interprets a .BAT file line by line,
  *   - or fork+execs an external program and waits for it.
  *
@@ -34,7 +35,6 @@ static union REGS r;
 static struct SREGS s;
 static int echo_on = 1;
 static int should_exit = 0;     /* set by EXIT builtin to break out of BAT */
-static int trace_active = 0;    /* /T flag: kernel DOS trace is on for this run */
 static const char empty_str[] = "";
 
 /* ----- thin INT wrappers ----- */
@@ -216,21 +216,20 @@ static char *split_first(char *line, char **rest_out) {
     return tok;
 }
 
-/* Copy our own PSP cmdline tail (DS:80h) into dst, NUL-terminated.
- * We work from PSP directly (not argc/argv) because DOS itself is flat:
- * INT 21h AH=4Bh wants a single command-tail string for the child's
- * PSP[0x80], not tokens, so we just slice this buffer in place. */
-static void read_cmdline(char *dst, int max) {
-    unsigned char far *psp = MK_FP(_psp, 0x80);
-    int len = psp[0];
-    int i;
-    if (len > max - 1) len = max - 1;
-    for (i = 0; i < len; i++) {
-        unsigned char c = psp[1 + i];
-        if (c == '\r') break;
-        dst[i] = (char)c;
+/* Join argv[start..argc-1] into dst as a single space-separated string,
+ * NUL-terminated. Used to rebuild the cmdline tail to hand off to a child
+ * (the kernel writes the tail verbatim to the child's PSP[0x80]). */
+static void join_args(char *dst, int max, char *argv[], int start, int argc) {
+    int len = 0;
+    int i, n;
+    for (i = start; i < argc; i++) {
+        n = (int)strlen(argv[i]);
+        if (len + (i > start ? 1 : 0) + n + 1 > max) break;
+        if (i > start) dst[len++] = ' ';
+        memcpy(dst + len, argv[i], (size_t)n);
+        len += n;
     }
-    dst[i] = 0;
+    dst[len] = 0;
 }
 
 /* ----- kernel synth syscalls ----- */
@@ -383,9 +382,8 @@ static int run_external_raw(const char *name, const char *args, int poll_kbd) {
  * keeps the interactive shell free to multitask. */
 static int run_loadfix_via_trampoline(const char *prog, const char *args, int poll_kbd) {
     static char tail[128];
-    const char *tpfx = trace_active ? "/T " : "";
-    if (args && *args) sprintf(tail, "%s/L %s %s", tpfx, prog, args);
-    else               sprintf(tail, "%s/L %s", tpfx, prog);
+    if (args && *args) sprintf(tail, "/L %s %s", prog, args);
+    else               sprintf(tail, "/L %s", prog);
     return run_external_raw("C:\\COMMAND.COM", tail, poll_kbd);
 }
 
@@ -482,6 +480,28 @@ static int builtin_pause(void) {
     return 0;
 }
 
+static int try_builtin(const char *name, char *args, int *exit_code);
+
+/* `trace <prog> [args]` -- enable the kernel DOS trace, run the given
+ * command in the current process (no extra COMMAND.COM trampoline), then
+ * disable trace before returning. The DN.EXT Ctrl+Enter binding uses this. */
+static int builtin_trace(char *args) {
+    char *p = skipws(args);
+    char *prog, *prog_args;
+    int exit_code = 0;
+    if (*p == 0) {
+        printf("Usage: trace <program> [args]\r\n");
+        return 1;
+    }
+    prog = split_first(p, &prog_args);
+    trace(1);
+    if (!try_builtin(prog, prog_args, &exit_code)) {
+        exit_code = run_external(prog, prog_args, 1);
+    }
+    trace(0);
+    return exit_code;
+}
+
 /* If `name` is a built-in, run it and store its exit code in *exit_code,
  * then return 1. Otherwise return 0. EXIT terminates the process directly. */
 static int try_builtin(const char *name, char *args, int *exit_code) {
@@ -492,6 +512,7 @@ static int try_builtin(const char *name, char *args, int *exit_code) {
     if (stricmp(name, "CLS") == 0)   { *exit_code = builtin_cls();       return 1; }
     if (stricmp(name, "TYPE") == 0)  { *exit_code = builtin_type(args);  return 1; }
     if (stricmp(name, "PAUSE") == 0) { *exit_code = builtin_pause();     return 1; }
+    if (stricmp(name, "TRACE") == 0) { *exit_code = builtin_trace(args); return 1; }
     if (stricmp(name, "EXIT") == 0) {
         *exit_code = atoi(skipws(args));
         should_exit = 1;
@@ -540,57 +561,50 @@ static int run_bat_file(const char *path) {
 
 /* ----- entry point ----- */
 
-int main(void) {
-    char cmdline[128];
-    char *p, *prog, *args;
+/* Returns 1 iff argv[i] is exactly "/<flag>" or "/<flag>" with case-insensitive
+ * match on a single ASCII letter. Used for /C and /L parsing. */
+static int is_flag(const char *arg, char letter) {
+    return arg[0] == '/' &&
+           (arg[1] == letter || arg[1] == (letter ^ 0x20)) &&
+           arg[2] == 0;
+}
+
+int main(int argc, char *argv[]) {
+    char args_buf[128];
     int exit_code = 0;
+    int i = 1;
+    int j;
 
     load_loadfix_cfg();
 
-    read_cmdline(cmdline, sizeof(cmdline));
-    printf("CMD psp=%04X cmdline='%s'\r\n", _psp, cmdline);
-    p = skipws(cmdline);
-
-    /* /T -- enable kernel DOS trace for this command. Off by default;
-     * DN's "Ctrl+Enter" path turns it on via DN.EXT overrides. */
-    if (p[0] == '/' && (p[1] == 'T' || p[1] == 't') &&
-        (p[2] == 0 || p[2] == ' ' || p[2] == '\t')) {
-        trace_active = 1;
-        trace(1);
-        p = skipws(p + 2);
-    }
+    printf("CMD argc=%d", argc);
+    for (j = 1; j < argc; j++) printf(" [%s]", argv[j]);
+    printf("\r\n");
 
     /* /L progname [args] -- LOADFIX trampoline entry. The interactive
      * COMMAND.COM forks us with this when it sees a name in loadfix.cfg;
      * we EXEC the program in-process so its PSP lands above segment
      * 0x1000 (dodging EXEPACK's load-low bug). */
-    if (p[0] == '/' && (p[1] == 'L' || p[1] == 'l') &&
-        (p[2] == ' ' || p[2] == '\t')) {
-        p = skipws(p + 2);
-        prog = split_first(p, &args);
-        exit_code = run_loadfix_inplace(prog, args);
-        if (trace_active) trace(0);
-        return exit_code;
+    if (i < argc && is_flag(argv[i], 'L')) {
+        i++;
+        if (i >= argc) {
+            printf("/L requires program name\r\n");
+            return 1;
+        }
+        join_args(args_buf, sizeof(args_buf), argv, i + 1, argc);
+        return run_loadfix_inplace(argv[i], args_buf);
     }
 
     /* Optional /C -- accept and skip (case-insensitive). */
-    if (p[0] == '/' && (p[1] == 'C' || p[1] == 'c') &&
-        (p[2] == 0 || p[2] == ' ' || p[2] == '\t')) {
-        p = skipws(p + 2);
-    }
+    if (i < argc && is_flag(argv[i], 'C')) i++;
 
-    if (*p != 0) {
-        /* Split program name from args in place -- no copy, no join.
-         * `args` ends up pointing at the verbatim tail of our own cmdline,
-         * which we hand straight to the kernel for the child's PSP[0x80]. */
-        prog = split_first(p, &args);
-
-        if (!try_builtin(prog, args, &exit_code)) {
+    if (i < argc) {
+        join_args(args_buf, sizeof(args_buf), argv, i + 1, argc);
+        if (!try_builtin(argv[i], args_buf, &exit_code)) {
             /* External -- interactive launcher mode (Ctrl-Z backgrounds). */
-            exit_code = run_external(prog, args, 1);
+            exit_code = run_external(argv[i], args_buf, 1);
         }
     }
 
-    if (trace_active) trace(0);
     return exit_code;
 }

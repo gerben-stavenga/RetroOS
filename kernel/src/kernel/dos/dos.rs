@@ -87,6 +87,14 @@ pub(crate) fn dispatch_kernel_syscall(
             thread::KernelAction::Done
         }
         0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
+        // INT 29h — DOS FAST_CON_OUT: AL = char to display. Routes through
+        // dos_putchar so the char hits the same VGA + debugcon path as
+        // INT 21h text output. Programs that bypass INT 21h (calling
+        // INT 29h directly for speed) now show up in out.log too.
+        0x29 => {
+            dos_putchar(regs.rax as u8);
+            thread::KernelAction::Done
+        }
         0x2E => int_2eh(kt, dos, regs),
         0x2F => int_2fh(dos, regs),
         0x67 => {
@@ -2783,7 +2791,7 @@ pub(super) fn setup_ivt() {
 
     // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
     // dispatcher (slot index = INT vector).
-    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x2E, 0x2F, 0x33, 0x67] {
+    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67] {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }

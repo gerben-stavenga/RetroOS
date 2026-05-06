@@ -581,10 +581,18 @@ pub fn entries() -> Entries {
     }
 }
 
-/// Check if using 64-bit entries (PAE or compat)
+/// Cached `is_pae()` result. `cpu_mode()` reads CR4 + EFER (ring-0-only),
+/// so any caller outside the arch syscall handlers (e.g. ring-1 kernel
+/// code calling `entries()`) would #GP. The mode is fixed once
+/// `enable_paging` returns; cache it there and read from this static.
+static IS_PAE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Check if using 64-bit entries (PAE or compat). Reads the cache set by
+/// `enable_pae` — safe from any ring.
 #[inline]
 pub fn is_pae() -> bool {
-    cpu_mode() != CpuMode::Legacy
+    IS_PAE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // =============================================================================
@@ -1057,6 +1065,7 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
         let cr0 = crate::arch::x86::read_cr0();
         crate::arch::x86::write_cr0(cr0 | crate::arch::x86::cr0::PG | crate::arch::x86::cr0::WP);
     }
+    IS_PAE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Enable paging with auto-detected mode
@@ -1428,7 +1437,29 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     }
     entries[0] = E::new(temp_swap(saved), true, true);
 
-    // Pages 1-0x9F: conventional memory — left unmapped (demand-paged zero)
+    // Pages 1..0x10 (low 64KB excluding page 0): eager-alloc as zero pages
+    // so the A20-disabled HMA wrap (PcMachine::new copies entries[0..0x10]
+    // into HMA_PAGE) reliably aliases across the process lifetime. If these
+    // were left as demand-paged-zero, the first write to virt 0x1000 would
+    // alloc phys X for entries[1] while entries[0x101] still held the
+    // not-present copy from PcMachine::new — a subsequent read of virt
+    // 0x101000 would alloc its OWN phys Y, breaking the alias. Pre-
+    // allocating ensures both PTEs reference the same phys page from the
+    // start.
+    for i in 1..0x10usize {
+        let saved2 = fresh_temp_page();
+        unsafe {
+            core::ptr::write_bytes(
+                (*&raw mut TEMP_PAGE).0.as_mut_ptr(),
+                0,
+                PAGE_SIZE,
+            );
+        }
+        let new_phys = temp_swap(saved2);
+        entries[i] = E::new(new_phys, true, true);
+    }
+
+    // Pages 0x10-0x9F: conventional memory — left unmapped (demand-paged zero)
     // Each process gets private zeroed pages on first access.
 
     // Pages 0xA0-0xBF: VGA framebuffer — identity mapped RW, cache disabled
@@ -1446,12 +1477,16 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
         entries[i] = E::new(i as u64, false, true);
     }
 
-    // A20 disabled by default: map pages 0x100-0x10F → physical 0x000-0x00F
-    // (wrap-around aliasing of first 64KB at the 1MB boundary)
-    for i in 0..16usize {
-        let e = E::new(i as u64, true, true);
-        entries[0x100 + i] = e;
-    }
+    // HMA (virt 0x100000..0x10FFFF) is set up by `PcMachine::new` in the DOS
+    // personality, which copies entries[0..16] (user's private low memory)
+    // into HMA_PAGE for the A20-disabled wrap. Seeding HMA_PAGE here with
+    // direct phys 0..15 was a bug: PcMachine::new's first arch_copy_page_entries
+    // moved that mapping into HMA_SHADOW (virt 0x110000..0x11FFFF), where it
+    // remained user-accessible for the process lifetime — every write into
+    // HMA_SHADOW landed at real phys 0..15, corrupting the master BIOS IVT/BDA.
+    // Leaving entries[0x100..] not-present here means HMA_SHADOW also ends up
+    // not-present after PcMachine::new's copy, which is the correct A20-on
+    // state when no extended memory has been allocated.
 
     flush_tlb();
 }

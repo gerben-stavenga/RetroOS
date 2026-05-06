@@ -173,6 +173,14 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
     let buf = exec::load_file_resolved(path)
         .unwrap_or_else(|_| panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
 
+    // Hand the screen off to the user. From here on, kernel println!/print!
+    // go to debugcon only — VGA writes from the kernel would otherwise
+    // corrupt user-space pixel data when the program is in graphics mode
+    // (CGA modes use B8000 as a pixel framebuffer, identical address to
+    // text-mode char+attr storage). dos_putchar's direct VGA writes are
+    // not gated by this flag and continue to work for text-mode programs.
+    crate::vga::KERNEL_OWNS_SCREEN.store(false, core::sync::atomic::Ordering::Relaxed);
+
     let tid = dos::run_init_program(&buf, path, cmdline_tail, cwd);
     event_loop(tid);
 }
