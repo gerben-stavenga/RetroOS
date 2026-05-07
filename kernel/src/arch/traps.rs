@@ -280,12 +280,10 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // ring transition; VM86 segs only valid in VM86).
     let regs = unsafe { &mut (*stack).regs };
     if from_64 {
-        // 64-bit user: asm-64 saved FS/GS as selectors only; substitute the
-        // FS_BASE / GS_BASE MSRs (what 64-bit code actually uses).
-        if regs.frame.cs == 0x33 {
-            regs.fs = x86::rdmsr(0xC000_0100);
-            regs.gs = x86::rdmsr(0xC000_0101);
-        }
+        // 64-bit user: entry_wrapper_64 already pushed the right FS/GS
+        // shape (FS_BASE/GS_BASE for cs=0x33, selectors otherwise) into
+        // the regs slot, and exit_interrupt_64 will restore it via wrmsr
+        // or `mov fs/gs, sel`. Nothing to do here.
         regs.int_num = raw_int_num;
     } else {
         let (r, v) = unsafe { &(*stack).raw32 };
@@ -384,17 +382,9 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 
     // Denormalize back to the 32-bit push form if exiting to 32-bit/VM86.
     if to_64 {
-        // 64-bit user exit: write FS_BASE/GS_BASE MSRs (what asm pops as selectors
-        // is meaningless for 64-bit code — null those slots so the asm `mov fs/gs,
-        // ax` loads a null selector, harmless in 64-bit mode).
-        if regs.frame.cs == 0x33 {
-            unsafe {
-                x86::wrmsr(0xC000_0100, regs.fs);
-                x86::wrmsr(0xC000_0101, regs.gs);
-            }
-            regs.fs = 0;
-            regs.gs = 0;
-        }
+        // 64-bit-mode exit. exit_interrupt_64 owns FS/GS restore (rdmsr/
+        // wrmsr for 64-bit user, mov fs/gs for 32-bit compat user). regs.fs
+        // / regs.gs hold whatever shape entry pushed; no fixup needed here.
     } else {
         // Decouple from `regs` before we overwrite the same memory via the
         // union's other arm: shadow it with a value-copy (Regs is Copy).

@@ -282,18 +282,43 @@ entry_wrapper_64:
     push r14
     push r15
 
-    ; Save segment registers as selectors (zero-extended to u64). For 64-bit
-    ; user (CS=0x33) the relevant FS/GS state is the FS_BASE/GS_BASE MSRs --
-    ; isr_handler reads/writes those in Rust after canonicalization.
     xor rax, rax
     mov ax, ds
     push rax
     mov ax, es
     push rax
+
+    ; FS/GS save format depends on user mode (long-mode IDT routes both
+    ; 64-bit users and 32-bit-compat users through here):
+    ;   - 64-bit user (cs=0x33): the meaningful state is the FS_BASE /
+    ;     GS_BASE MSRs (selectors are typically null and unused). rdmsr
+    ;     them and push the 64-bit bases.
+    ;   - 32-bit user (cs=0x23) / compat: TLS rides on the descriptor
+    ;     loaded via `mov fs/gs, sel`, so push the selectors.
+    ; User CS sits at [rsp + 168]: 16 bytes (es+ds we just pushed) + 64
+    ; bytes (r8..r15) + 64 bytes (rax..rdi) + 16 bytes (int_num+err_code)
+    ; below the trap-pushed `cs` slot.
+    cmp qword [rsp + 168], 0x33
+    jne .save_segs_32
+
+    mov ecx, 0xC0000100         ; IA32_FS_BASE
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    push rax
+    mov ecx, 0xC0000101         ; IA32_GS_BASE
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    push rax
+    jmp .save_segs_done
+.save_segs_32:
+    xor rax, rax
     mov ax, fs
     push rax
     mov ax, gs
     push rax
+.save_segs_done:
 
     ; rbp is left untouched -- see common_call's comment for why.
 
@@ -305,14 +330,31 @@ entry_wrapper_64:
     jmp far [rel far_ptr_32]
 
 exit_interrupt_64:
-    ; Restore segments uniformly as selectors. For 64-bit user, isr_handler
-    ; already wrote FS_BASE/GS_BASE via wrmsr and zeroed the saved fs/gs
-    ; slots, so `mov fs/gs, ax` here loads a null selector -- harmless in
-    ; long mode where flat addressing is used.
-    pop rax
+    ; Restore FS/GS in the inverse format chosen on entry. CS sits at
+    ; [rsp + 184] = 16 (gs+fs) + 16 (es+ds) + 64 (r8..r15) + 64 (rax..rdi)
+    ; + 16 (int_num+err_code) below the trap-pushed cs slot. wrmsr in 64-
+    ; bit code (here, before `mov ds/es`) so a same-CPL `mov fs/gs, sel`
+    ; in compat mode can never undo it.
+    cmp qword [rsp + 184], 0x33
+    jne .rest_segs_32
+
+    pop rax                     ; saved GS_BASE
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000101
+    wrmsr
+    pop rax                     ; saved FS_BASE
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000100
+    wrmsr
+    jmp .rest_segs_done
+.rest_segs_32:
+    pop rax                     ; saved gs selector
     mov gs, ax
-    pop rax
+    pop rax                     ; saved fs selector
     mov fs, ax
+.rest_segs_done:
     pop rax
     mov es, ax
     pop rax
