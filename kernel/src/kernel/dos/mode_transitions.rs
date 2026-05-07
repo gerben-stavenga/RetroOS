@@ -775,6 +775,30 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     let rm_dest = rm_get_stack(dos);
     let _save_at = switch_to_rm_side(dos, regs, rm_dest);
 
+    // HACK: a correct ISR reloads its own DGROUP, so this restore
+    // shouldn't be needed. But Prince of Persia's timer ISR at
+    // 0F11:B110 — `push ax; inc word [0x2C]; out 20h, al; pop ax; iret`
+    // — trusts DS=caller's DGROUP. With our deliver_pm_irq DS=0 (set so
+    // the PM stub IRET doesn't #GP on a paragraph), the inc lands at
+    // phys 0x2C and PoP's poll on [1D95:0x2C] never advances. Restore
+    // the original VM86 segs from ModeSave1 to match real-DOS preserve-
+    // across-IRQ semantics. Revisit by stashing client segs explicitly
+    // in DosState alongside the cross-mode primitives.
+    if _save_at.0 == host_stack_pm_seg(dos) {
+        // host_stack_pm layout (SS=host_stack_pm, SP grows down):
+        //   ModeSave1     ← deliver_pm_irq's switch_to_pm_side
+        //   iret-frame    ← deliver_pm_irq's host_stack_write_iret (frame_size)
+        //   ModeSave2     ← our switch_to_rm_side push_save; `_save_at.1` here
+        let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+        let frame_size: u32 = if client_use32 { 12 } else { 6 };
+        let save = pop_save_at(&dos.ldt[..],
+            (_save_at.0, _save_at.1 + MODE_SAVE_SIZE + frame_size));
+        regs.ds = save.ds as u64;
+        regs.es = save.es as u64;
+        regs.fs = save.fs as u64;
+        regs.gs = save.gs as u64;
+    }
+
     // Get IVT entry
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
     let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
