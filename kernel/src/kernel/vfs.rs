@@ -39,19 +39,6 @@ pub trait Filesystem {
     /// Enumerate directory entries at index. Returns None at end.
     fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry>;
 
-    /// Bulk-collect directory entries in a single pass. Returns count stored.
-    /// Default falls back to readdir loop; backends should override for O(n).
-    fn list_dir(&self, dir: &[u8], buf: &mut [DirEntry]) -> usize {
-        let mut count = 0;
-        while count < buf.len() {
-            match self.readdir(dir, count) {
-                Some(e) => { buf[count] = e; count += 1; }
-                None => break,
-            }
-        }
-        count
-    }
-
     /// Check if a directory path exists.
     fn dir_exists(&self, path: &[u8]) -> bool;
 
@@ -109,17 +96,12 @@ const MAX_MOUNTS: usize = 4;
 static mut MOUNTS: [Option<Mount>; MAX_MOUNTS] = [None, None, None, None];
 static mut MOUNT_COUNT: usize = 0;
 
-/// Directory listing cache — avoids O(n²) re-scanning for sequential readdir.
-/// Sized to fit medium flat dirs. One directory cached at a time,
-/// ~116 bytes per entry. Larger dirs get truncated past this limit.
-const DIR_CACHE_MAX: usize = 128;
+/// Directory listing cache — avoids O(n²) re-scanning for sequential
+/// readdir. One directory cached at a time, growable so a flat dir with
+/// hundreds of entries (e.g. TP70 with ~230 files) doesn't get truncated.
 static mut DIR_CACHE_DIR: [u8; 96] = [0; 96];
 static mut DIR_CACHE_DIR_LEN: usize = 0;
-static mut DIR_CACHE_ENTRIES: [DirEntry; DIR_CACHE_MAX] = {
-    const EMPTY: DirEntry = DirEntry { name: [0; 100], name_len: 0, size: 0, is_dir: false, mode: 0 };
-    [EMPTY; DIR_CACHE_MAX]
-};
-static mut DIR_CACHE_COUNT: usize = 0;
+static mut DIR_CACHE_ENTRIES: Vec<DirEntry> = Vec::new();
 static mut DIR_CACHE_VALID: bool = false;
 
 /// Invalidate the directory cache (call after file create/delete).
@@ -370,44 +352,47 @@ pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
 fn populate_dir_cache(dir: &[u8]) {
     unsafe {
         let cache_dir = &raw mut DIR_CACHE_DIR;
-        let cache_entries = &raw mut DIR_CACHE_ENTRIES;
+        let entries = &mut *(&raw mut DIR_CACHE_ENTRIES);
         let dlen = dir.len().min((*cache_dir).len());
         (*cache_dir)[..dlen].copy_from_slice(&dir[..dlen]);
         DIR_CACHE_DIR_LEN = dlen;
 
+        entries.clear();
+
         let (_midx, fs, subpath) = resolve_mount(dir);
-        let mut count = fs.list_dir(subpath, &mut *cache_entries);
+        let mut idx = 0usize;
+        while let Some(e) = fs.readdir(subpath, idx) {
+            entries.push(e);
+            idx += 1;
+        }
 
         // Synthesize mount point directories
         for i in 0..MOUNT_COUNT {
-            if count >= DIR_CACHE_MAX { break; }
             if let Some(ref m) = MOUNTS[i] {
                 if let Some(name) = mount_child_in_dir(m.prefix, dir) {
                     let name_len = name.len().min(100);
-                    (*cache_entries)[count] = DirEntry {
+                    let mut de = DirEntry {
                         name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
                     };
-                    (*cache_entries)[count].name[..name_len].copy_from_slice(&name[..name_len]);
-                    count += 1;
+                    de.name[..name_len].copy_from_slice(&name[..name_len]);
+                    entries.push(de);
                 }
             }
         }
 
         // RAM overlay files
         for (key, data) in ram_files().iter() {
-            if count >= DIR_CACHE_MAX { break; }
             if let Some(basename) = entry_in_ram_dir(key, dir) {
                 let len = basename.len().min(100);
-                (*cache_entries)[count] = DirEntry {
+                let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: data.len() as u32,
                     is_dir: false, mode: 0o644,
                 };
-                (*cache_entries)[count].name[..len].copy_from_slice(&basename[..len]);
-                count += 1;
+                de.name[..len].copy_from_slice(&basename[..len]);
+                entries.push(de);
             }
         }
 
-        DIR_CACHE_COUNT = count;
         DIR_CACHE_VALID = true;
     }
 }
@@ -416,18 +401,14 @@ fn populate_dir_cache(dir: &[u8]) {
 pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
     unsafe {
         let cache_dir = &raw const DIR_CACHE_DIR;
-        let cache_entries = &raw const DIR_CACHE_ENTRIES;
+        let entries = &*(&raw const DIR_CACHE_ENTRIES);
         // Check if cache is valid for this directory
         if !DIR_CACHE_VALID || DIR_CACHE_DIR_LEN != dir.len()
             || (*cache_dir)[..DIR_CACHE_DIR_LEN] != *dir
         {
             populate_dir_cache(dir);
         }
-        if index < DIR_CACHE_COUNT {
-            Some(clone_dir_entry(&(*cache_entries)[index]))
-        } else {
-            None
-        }
+        entries.get(index).map(clone_dir_entry)
     }
 }
 
