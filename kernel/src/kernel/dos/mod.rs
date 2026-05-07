@@ -173,6 +173,19 @@ pub struct DosState {
     /// 0300 and don't need this — leaving it off for them keeps spec-strict
     /// reflect-to-RM behaviour for INT 21 hooks installed in the IVT.
     pub pm_dos: bool,
+
+    /// Pending in-kernel "block-and-retry" callback. Set by syscall handlers
+    /// that can't complete synchronously (e.g. AH=08 with no keystroke
+    /// ready). While set, the user's CS:IP is parked at `SLOT_RESUME` —
+    /// every event-loop iteration re-traps and re-invokes the closure
+    /// without unwinding the cross-mode chain. The closure is taken
+    /// (FnOnce) on each invocation: if the operation is still pending it
+    /// installs a fresh closure into `pending_resume` itself; if it's
+    /// done, it leaves `pending_resume = None` (and writes the result
+    /// back to `regs`), and SLOT_RESUME's dispatch sees the empty slot
+    /// and runs the standard soft-INT iret-frame pop to unwind.
+    pub pending_resume: Option<alloc::boxed::Box<
+        dyn FnOnce(&mut thread::KernelThread, &mut DosState, &mut crate::Regs)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -219,6 +232,7 @@ impl DosState {
             pm_vectors: [(0, 0); 256],
             dpmi: None,
             pm_dos: false,
+            pending_resume: None,
         };
         dpmi::install_kernel_ldt_slots(&mut dos);
         dos

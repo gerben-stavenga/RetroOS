@@ -129,7 +129,8 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
     let is_far_call = matches!(slot,
         SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RM_IRET | SLOT_RM_IRET_CALL
         | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
-        | SLOT_INT74_MOUSE_CB | SLOT_INT74_MOUSE_CB_RET)
+        | SLOT_INT74_MOUSE_CB | SLOT_INT74_MOUSE_CB_RET
+        | SLOT_RESUME)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
     let action = match slot {
@@ -196,6 +197,27 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
         }
         SLOT_INT74_MOUSE_CB_RET => {
             mouse_callback_return(dos, regs);
+            thread::KernelAction::Done
+        }
+        SLOT_RESUME => {
+            // Take the parked closure and call it (FnOnce). The closure
+            // either completes (writes its result to regs, leaves
+            // pending_resume empty) or re-installs a fresh closure to
+            // keep waiting. After the call, an empty pending_resume
+            // means we're done — run the same iret-frame pop the
+            // original soft-INT slot would have done, unwinding the
+            // chain naturally.
+            let cb = dos.pending_resume.take()
+                .expect("SLOT_RESUME fired without pending_resume");
+            cb(kt, dos, regs);
+            if dos.pending_resume.is_none() {
+                let ret_ip = vm86_pop(regs);
+                let ret_cs = vm86_pop(regs);
+                let ret_flags = vm86_pop(regs);
+                machine::set_vm86_ip(regs, ret_ip);
+                machine::set_vm86_cs(regs, ret_cs);
+                machine::set_vm86_flags(regs, ret_flags as u32);
+            }
             thread::KernelAction::Done
         }
         _ => {
@@ -460,6 +482,26 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
 }
 
 /// DOS character output — writes via VGA putchar and syncs the BDA cursor
+/// Install a `pending_resume` closure that polls the console keyboard and
+/// completes (or re-installs itself) each time SLOT_RESUME re-traps.
+/// `echo`: whether to also `dos_putchar` the read character (AH=01h does
+/// this; AH=07h/AH=08h don't).
+fn install_read_key_resume(dos: &mut thread::DosState, echo: bool) {
+    dos.pending_resume = Some(alloc::boxed::Box::new(
+        move |_kt: &mut thread::KernelThread,
+              dos: &mut thread::DosState,
+              regs: &mut Regs| {
+            if let Some(ch) = poll_dos_console_char(dos) {
+                regs.rax = (regs.rax & !0xFF) | ch as u64;
+                if echo { dos_putchar(ch); }
+                // Done: leave pending_resume = None for the dispatcher
+                // to run the soft-INT iret-frame pop.
+            } else {
+                install_read_key_resume(dos, echo);
+            }
+        }));
+}
+
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
 fn dos_putchar(c: u8) {
@@ -526,28 +568,19 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // All three block until a key is available. TC's getch() uses
         // AH=07h; without this AX falls through unmodified and getch()
         // returns garbage (often the AL=0xFF that AH=0Bh just set on
-        // kbhit).
+        // kbhit). Block-and-retry via SLOT_RESUME — the parked closure
+        // re-polls each event-loop iteration without unwinding the
+        // cross-mode chain, so PM clients (DPMI) and VM86 clients use
+        // the same path with no risk of corrupting the trampoline IRET
+        // frame on rm_dedicated.
         0x01 | 0x07 | 0x08 => {
             if let Some(ch) = poll_dos_console_char(dos) {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
                 if ah == 0x01 { dos_putchar(ch); }
             } else {
-                // HACK: poor-man's "block on no key". Rewind the user's
-                // saved IP on the VM86 stack so the stub dispatcher's
-                // IRET-frame pop drops us back onto the CD 21 and the
-                // next event-loop iteration re-traps. Modifying
-                // regs.frame.rip alone would be a no-op -- that's the
-                // stub's IP, and the dispatcher pops user CS:IP off
-                // SS:SP and overwrites frame.rip from there. So we
-                // mutate the saved IP word in user memory directly.
-                // Brittle: leaks the IRET-frame layout (IP at SS:SP+0)
-                // out of the dispatcher. Cleaner replacement is a
-                // KernelAction::Retry that the dispatcher honours
-                // post-pop, or real thread blocking on a kbd waitqueue.
-                let ss = regs.ss32();
-                let sp = vm86_sp(regs) as u32;
-                let ip = read_u16(ss, sp);
-                write_u16(ss, sp, ip.wrapping_sub(2));
+                install_read_key_resume(dos, ah == 0x01);
+                machine::set_vm86_cs(regs, STUB_SEG);
+                machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
             }
             thread::KernelAction::Done
         }
@@ -2747,6 +2780,15 @@ pub(crate) const SLOT_INT74_MOUSE_CB: u8 = 0x74;
 /// bracket-saved GP regs (ModeSave doesn't cover them) and then unwinds the
 /// IRQ via the standard `rm_iret` path.
 pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
+/// Generic block-and-retry resume slot. A syscall that can't complete
+/// synchronously (e.g. AH=08 with no key in the buffer) stashes a closure
+/// in `dos.pending_resume` and parks user CS:IP at this stub. Each
+/// event-loop iteration re-traps here, the dispatcher re-invokes the
+/// closure; when it returns true (= completed) we run the same iret-frame
+/// pop the original soft-INT slot would have run, unwinding the chain
+/// naturally. `is_far_call`-tagged so the dispatch tail's auto-pop is
+/// suppressed — the SLOT_RESUME handler manages the pop itself.
+pub(crate) const SLOT_RESUME: u8 = 0x76;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
