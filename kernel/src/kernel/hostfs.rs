@@ -134,7 +134,10 @@ impl Filesystem for HostFs {
         let size = recv_u32();
         if status < 0 { return None; }
 
-        Some(Vnode { handle: handle as u64, size })
+        // Hostfs serves a Linux directory; the host knows real mode bits
+        // but the protocol doesn't carry them yet. Default to a generic
+        // file mode — extend the protocol when we need accurate POSIX bits.
+        Some(Vnode { handle: handle as u64, size, mode: 0o644 })
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
@@ -178,7 +181,10 @@ impl Filesystem for HostFs {
         let size = recv_u32();
         let is_dir = recv_u8() != 0;
 
-        Some(DirEntry { name, name_len: n, size, is_dir })
+        Some(DirEntry {
+            name, name_len: n, size, is_dir,
+            mode: if is_dir { 0o755 } else { 0o644 },
+        })
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
@@ -202,7 +208,7 @@ impl Filesystem for HostFs {
         let status = recv_i32();
         let handle = recv_u32();
         if status < 0 { return None; }
-        Some(Vnode { handle: handle as u64, size: 0 })
+        Some(Vnode { handle: handle as u64, size: 0, mode: 0o644 })
     }
 
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {

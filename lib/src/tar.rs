@@ -72,6 +72,13 @@ impl TarHeader {
         parse_octal(&self.filesize) as usize
     }
 
+    /// POSIX file mode bits (lower 12 bits — perms + setuid/setgid/sticky).
+    /// USTAR stores them as a NUL-terminated octal string; missing/zero
+    /// fields parse as 0, callers may want to default to a sensible value.
+    pub fn filemode(&self) -> u16 {
+        (parse_octal(&self.filemode) & 0xFFF) as u16
+    }
+
     /// Number of 512-byte blocks for file data
     pub fn data_blocks(&self) -> u32 {
         ((self.filesize() + 511) / 512) as u32

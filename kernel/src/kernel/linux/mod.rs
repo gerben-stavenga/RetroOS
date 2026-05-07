@@ -1333,8 +1333,9 @@ fn sys_stat64(linux: &LinuxState, a: &Args) -> SyscallResult {
     let handle = vfs::open_to_handle(resolved);
     if handle < 0 { return SyscallResult::val(-ENOENT); }
     let size = vfs::file_size_by_handle(handle);
+    let posix_mode = vfs::file_mode_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat64(stat_buf, 0o100755, size);
+    write_stat64(stat_buf, 0o100000 | posix_mode as u32, size);
     SyscallResult::val(0)
 }
 
@@ -1352,7 +1353,8 @@ fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
-            write_stat64(stat_buf, 0o100755, size); // S_IFREG
+            let mode = vfs::file_mode_by_handle(handle);
+            write_stat64(stat_buf, 0o100000 | mode as u32, size);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {
@@ -1415,8 +1417,9 @@ fn sys_stat_old(linux: &LinuxState, a: &Args) -> SyscallResult {
     let handle = vfs::open_to_handle(resolved);
     if handle < 0 { return SyscallResult::val(-ENOENT); }
     let size = vfs::file_size_by_handle(handle);
+    let mode = vfs::file_mode_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat_old(stat_buf, 0o100755, size);
+    write_stat_old(stat_buf, 0o100000 | mode as u32, size);
     SyscallResult::val(0)
 }
 
@@ -1432,7 +1435,8 @@ fn sys_fstat_old(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
-            write_stat_old(stat_buf, 0o100755, size);
+            let mode = vfs::file_mode_by_handle(handle);
+            write_stat_old(stat_buf, 0o100000 | mode as u32, size);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {

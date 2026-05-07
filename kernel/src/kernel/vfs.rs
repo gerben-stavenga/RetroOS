@@ -27,18 +27,11 @@ const RAM_SENTINEL: u64 = u64::MAX;
 /// Maximum length of a normalized path key
 const PATH_KEY_MAX: usize = 164;
 
-/// Filesystem trait — implemented by TarFs, Ext4Fs, etc.
+/// Filesystem trait — implemented by TarFs, Ext4Fs, etc. POSIX-strict; the
+/// DOS personality wraps this layer with its own case-folding cache (DFS).
 pub trait Filesystem {
-    /// Look up a file by normalized path, case-sensitively (POSIX). Used
-    /// by the Linux personality.
+    /// Look up a file by normalized path, case-sensitively (POSIX).
     fn open(&self, path: &[u8]) -> Option<Vnode>;
-
-    /// Look up a file by normalized path, case-insensitively (DOS). Used
-    /// by DFS so DOS programs see the legacy "any-case matches" behaviour
-    /// without paying the per-component canonical-case walk. Default
-    /// implementation falls back to case-sensitive `open` — backends
-    /// should override when they can search efficiently.
-    fn open_ci(&self, path: &[u8]) -> Option<Vnode> { self.open(path) }
 
     /// Read from a file identified by handle at given byte offset.
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
@@ -77,6 +70,10 @@ pub trait Filesystem {
 pub struct Vnode {
     pub handle: u64,  // filesystem-specific opaque handle (RAM_SENTINEL for overlay)
     pub size: u32,
+    /// POSIX permission bits (lower 12 — perms + setuid/setgid/sticky).
+    /// Carried through from the backing filesystem (TAR's USTAR mode field,
+    /// ext4's stat, etc.). Linux personality returns these in stat64.
+    pub mode: u16,
 }
 
 /// Directory entry returned by readdir
@@ -85,6 +82,8 @@ pub struct DirEntry {
     pub name_len: usize,
     pub size: u32,
     pub is_dir: bool,
+    /// POSIX permission bits (same convention as `Vnode::mode`).
+    pub mode: u16,
 }
 
 /// An open file in the global file table
@@ -117,7 +116,7 @@ const DIR_CACHE_MAX: usize = 128;
 static mut DIR_CACHE_DIR: [u8; 96] = [0; 96];
 static mut DIR_CACHE_DIR_LEN: usize = 0;
 static mut DIR_CACHE_ENTRIES: [DirEntry; DIR_CACHE_MAX] = {
-    const EMPTY: DirEntry = DirEntry { name: [0; 100], name_len: 0, size: 0, is_dir: false };
+    const EMPTY: DirEntry = DirEntry { name: [0; 100], name_len: 0, size: 0, is_dir: false, mode: 0 };
     [EMPTY; DIR_CACHE_MAX]
 };
 static mut DIR_CACHE_COUNT: usize = 0;
@@ -182,7 +181,7 @@ pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
 /// Global file table — slot is free when refcount == 0
 static mut FILE_TABLE: [FileEntry; MAX_OPEN_FILES] = {
     const EMPTY: FileEntry = FileEntry {
-        vnode: Vnode { handle: 0, size: 0 },
+        vnode: Vnode { handle: 0, size: 0, mode: 0 },
         offset: 0,
         refcount: 0,
         mount_idx: 0,
@@ -234,11 +233,11 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
 // Public API — called by syscalls.rs and vm86.rs
 // ============================================================================
 
-/// Open a file by absolute VFS path, case-insensitively. Returns fd (>= 3)
-/// or negative error. Used by the DOS personality, which has DOS-style
-/// case-insensitive semantics throughout.
+/// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
+/// POSIX-strict case-sensitive lookup. DOS callers must resolve through DFS
+/// (which case-folds via its CI cache) before reaching here.
 pub fn open(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
-    let handle = open_to_handle_ci(path);
+    let handle = open_to_handle(path);
     if handle < 0 { return handle; }
     let fd = match alloc_fd(fds) {
         Some(f) => f,
@@ -324,7 +323,7 @@ pub fn create_to_handle(path: &[u8]) -> i32 {
     ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
     unsafe {
         FILE_TABLE[table_idx] = FileEntry {
-            vnode: Vnode { handle: RAM_SENTINEL, size: 0 },
+            vnode: Vnode { handle: RAM_SENTINEL, size: 0, mode: 0o644 },
             offset: 0,
             refcount: 1,
             mount_idx: 0,
@@ -386,7 +385,7 @@ fn populate_dir_cache(dir: &[u8]) {
                 if let Some(name) = mount_child_in_dir(m.prefix, dir) {
                     let name_len = name.len().min(100);
                     (*cache_entries)[count] = DirEntry {
-                        name: [0; 100], name_len, size: 0, is_dir: true,
+                        name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
                     };
                     (*cache_entries)[count].name[..name_len].copy_from_slice(&name[..name_len]);
                     count += 1;
@@ -400,7 +399,8 @@ fn populate_dir_cache(dir: &[u8]) {
             if let Some(basename) = entry_in_ram_dir(key, dir) {
                 let len = basename.len().min(100);
                 (*cache_entries)[count] = DirEntry {
-                    name: [0; 100], name_len: len, size: data.len() as u32, is_dir: false,
+                    name: [0; 100], name_len: len, size: data.len() as u32,
+                    is_dir: false, mode: 0o644,
                 };
                 (*cache_entries)[count].name[..len].copy_from_slice(&basename[..len]);
                 count += 1;
@@ -437,6 +437,7 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
         name_len: e.name_len,
         size: e.size,
         is_dir: e.is_dir,
+        mode: e.mode,
     }
 }
 
@@ -504,7 +505,7 @@ pub fn open_to_handle(path: &[u8]) -> i32 {
         ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
         unsafe {
             FILE_TABLE[table_idx] = FileEntry {
-                vnode: Vnode { handle: RAM_SENTINEL, size },
+                vnode: Vnode { handle: RAM_SENTINEL, size, mode: 0o644 },
                 offset: 0,
                 refcount: 1,
                 mount_idx: 0,
@@ -517,58 +518,6 @@ pub fn open_to_handle(path: &[u8]) -> i32 {
 
     let (midx, fs, subpath) = resolve_mount(path);
     let vnode = match fs.open(subpath) {
-        Some(v) => v,
-        None => return -2,
-    };
-
-    let table_idx = match alloc_file_entry() {
-        Some(i) => i,
-        None => return -24,
-    };
-
-    unsafe {
-        FILE_TABLE[table_idx] = FileEntry {
-            vnode,
-            offset: 0,
-            refcount: 1,
-            mount_idx: midx,
-            ram_key: [0; PATH_KEY_MAX],
-            ram_key_len: 0,
-        };
-    }
-
-    table_idx as i32
-}
-
-/// Same as `open_to_handle` but resolves case-insensitively (DOS).
-pub fn open_to_handle_ci(path: &[u8]) -> i32 {
-    // RAM overlay first — keys are stored as-is, so try case-sensitive
-    // hit first, then fall through to FS for the case-insensitive path.
-    let ram = ram_files();
-    if let Some(data) = ram.get(path) {
-        let size = data.len() as u32;
-        let table_idx = match alloc_file_entry() {
-            Some(i) => i,
-            None => return -24,
-        };
-        let key_len = path.len().min(PATH_KEY_MAX) as u8;
-        let mut ram_key = [0u8; PATH_KEY_MAX];
-        ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-        unsafe {
-            FILE_TABLE[table_idx] = FileEntry {
-                vnode: Vnode { handle: RAM_SENTINEL, size },
-                offset: 0,
-                refcount: 1,
-                mount_idx: 0,
-                ram_key,
-                ram_key_len: key_len,
-            };
-        }
-        return table_idx as i32;
-    }
-
-    let (midx, fs, subpath) = resolve_mount(path);
-    let vnode = match fs.open_ci(subpath) {
         Some(v) => v,
         None => return -2,
     };
@@ -681,4 +630,12 @@ pub fn file_size_by_handle(handle: i32) -> u32 {
         return ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0);
     }
     entry.vnode.size
+}
+
+/// Get POSIX mode bits by VFS handle. Returns 0 for an invalid handle.
+pub fn file_mode_by_handle(handle: i32) -> u16 {
+    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+    let entry = unsafe { &FILE_TABLE[handle as usize] };
+    if entry.refcount == 0 { return 0; }
+    entry.vnode.mode
 }

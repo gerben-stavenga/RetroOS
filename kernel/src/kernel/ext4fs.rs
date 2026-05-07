@@ -75,59 +75,13 @@ fn make_absolute<'a>(path: &[u8], buf: &'a mut [u8; 256]) -> Option<&'a str> {
     core::str::from_utf8(&buf[..total]).ok()
 }
 
-/// Case-insensitive path resolution: if exact path fails, scan parent dir for match.
-fn resolve_case<'a>(fs: &Ext4, path: &str, buf: &'a mut [u8; 256]) -> Option<&'a str> {
-    // Try exact case first
-    if fs.exists(path).unwrap_or(false) {
-        let len = path.len().min(256);
-        buf[..len].copy_from_slice(path.as_bytes());
-        return core::str::from_utf8(&buf[..len]).ok();
-    }
-    // Split into parent dir + filename
-    let path_bytes = path.as_bytes();
-    let slash = path_bytes.iter().rposition(|&b| b == b'/')?;
-    let parent = core::str::from_utf8(&path_bytes[..slash]).ok()?;
-    let parent_dir = if parent.is_empty() { "/" } else { parent };
-    let target = &path_bytes[slash + 1..];
-    // Scan parent directory for case-insensitive match
-    let read_dir = fs.read_dir(parent_dir).ok()?;
-    for entry_result in read_dir {
-        let entry = entry_result.ok()?;
-        let entry_path = entry.path();
-        let entry_bytes: &[u8] = entry_path.as_ref();
-        let entry_name = match entry_bytes.iter().rposition(|&b| b == b'/') {
-            Some(pos) => &entry_bytes[pos + 1..],
-            None => entry_bytes,
-        };
-        if entry_name.len() == target.len()
-            && entry_name.iter().zip(target).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
-        {
-            // Reconstruct path with correct case
-            let mut pos = slash + 1;
-            if pos + entry_name.len() > 256 { return None; }
-            buf[..pos].copy_from_slice(&path_bytes[..pos]);
-            buf[pos..pos + entry_name.len()].copy_from_slice(entry_name);
-            pos += entry_name.len();
-            return core::str::from_utf8(&buf[..pos]).ok();
-        }
-    }
-    None
-}
 
-impl Ext4Fs {
-    fn open_inner(&self, path: &[u8], allow_ci: bool) -> Option<Vnode> {
+impl Filesystem for Ext4Fs {
+    fn open(&self, path: &[u8]) -> Option<Vnode> {
+        // POSIX: case-sensitive only. DOS callers go through DFS's CI cache.
         let mut buf = [0u8; 256];
         let abs = make_absolute(path, &mut buf)?;
-
-        let data = match self.fs.read(abs) {
-            Ok(d) => d,
-            Err(_) if allow_ci => {
-                let mut case_buf = [0u8; 256];
-                let resolved = resolve_case(&self.fs, abs, &mut case_buf)?;
-                self.fs.read(resolved).ok()?
-            }
-            Err(_) => return None,
-        };
+        let data = self.fs.read(abs).ok()?;
         let size = data.len() as u32;
 
         let mut handle_ref = self.next_handle.borrow_mut();
@@ -136,20 +90,10 @@ impl Ext4Fs {
 
         self.cache.borrow_mut().insert(handle, data);
 
-        Some(Vnode { handle, size })
-    }
-}
-
-impl Filesystem for Ext4Fs {
-    fn open(&self, path: &[u8]) -> Option<Vnode> {
-        // POSIX: case-sensitive only.
-        self.open_inner(path, false)
-    }
-
-    fn open_ci(&self, path: &[u8]) -> Option<Vnode> {
-        // DOS: try case-sensitive first (fast path for already-correct
-        // names), fall back to a directory scan for case-folded match.
-        self.open_inner(path, true)
+        // ext4-view's read API doesn't surface mode bits — default to a
+        // generic file mode. Worth replacing with a stat-based lookup if
+        // we need accurate POSIX bits from the ext4 partition.
+        Some(Vnode { handle, size, mode: 0o644 })
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32 {
@@ -211,6 +155,7 @@ impl Filesystem for Ext4Fs {
                     name_len,
                     size,
                     is_dir,
+                    mode: if is_dir { 0o755 } else { 0o644 },
                 };
                 de.name[..name_len].copy_from_slice(&basename[..name_len]);
                 return Some(de);
@@ -257,7 +202,10 @@ impl Filesystem for Ext4Fs {
                 entry.metadata().map(|m| m.len() as u32).unwrap_or(0)
             };
             let name_len = basename.len().min(100);
-            buf[count] = DirEntry { name: [0; 100], name_len, size, is_dir };
+            buf[count] = DirEntry {
+                name: [0; 100], name_len, size, is_dir,
+                mode: if is_dir { 0o755 } else { 0o644 },
+            };
             buf[count].name[..name_len].copy_from_slice(&basename[..name_len]);
             count += 1;
         }

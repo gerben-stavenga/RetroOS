@@ -13,39 +13,31 @@ const BLOCK_SIZE: usize = 512;
 /// from RAM after that.
 struct IndexEntry {
     name: [u8; 100],
-    /// Same bytes as `name` with ASCII letters uppercased. Lets the
-    /// case-insensitive open path be a memcmp against pre-normalized
-    /// keys instead of a per-byte to-upper loop on every comparison.
-    name_upper: [u8; 100],
     name_len: u16,
     data_block: u32,
     size: u32,
     is_symlink: bool,
     link: [u8; 100],
     link_len: u16,
+    /// POSIX mode bits from USTAR header (filemode field, parsed octal).
+    mode: u16,
 }
 
 pub struct TarFs {
     start_sector: u32,
-    /// Entries sorted by original (case-sensitive) name — POSIX lookup.
+    /// Entries sorted by name (POSIX-strict). DOS callers go through DFS,
+    /// which keeps a separate per-dir 8.3-alias cache and translates DOS
+    /// names to canonical VFS names before reaching here.
     index: Vec<IndexEntry>,
-    /// Permutation of `index` sorted by `name_upper` — DOS lookup.
-    index_ci: Vec<u32>,
 }
 
 impl TarFs {
     pub const fn new(start_sector: u32) -> Self {
-        Self { start_sector, index: Vec::new(), index_ci: Vec::new() }
+        Self { start_sector, index: Vec::new() }
     }
 
     /// Walk the on-disk TAR header chain once and cache entries in RAM.
-    /// Entry name is kept in its original case; we also store an
-    /// uppercase variant so DOS-side case-insensitive lookups can use a
-    /// pre-normalized memcmp against `name_upper` instead of running a
-    /// per-byte to-upper loop on every comparison. Both views are sorted
-    /// to allow O(log N) lookups: `index` by original name (POSIX,
-    /// `open`), `index_ci` as indices into `index` sorted by
-    /// `name_upper` (DOS, `open_ci`).
+    /// Entries sorted by name allow O(log N) `open()` lookups.
     pub fn build_index(&mut self) {
         let mut block: u32 = 0;
         loop {
@@ -53,59 +45,30 @@ impl TarFs {
                 Some(e) => e,
                 None => break,
             };
-            let mut name_upper = entry.name;
-            for b in &mut name_upper[..entry.name_len] {
-                b.make_ascii_uppercase();
-            }
             self.index.push(IndexEntry {
                 name: entry.name,
-                name_upper,
                 name_len: entry.name_len as u16,
                 data_block: entry.data_block,
                 size: entry.size,
                 is_symlink: entry.is_symlink,
                 link: entry.link,
                 link_len: entry.link_len as u16,
+                mode: entry.mode,
             });
             block = entry.next_block;
         }
         self.index.sort_by(|a, b| {
             a.name[..a.name_len as usize].cmp(&b.name[..b.name_len as usize])
         });
-        // Build the case-insensitive view as a permutation of the main
-        // index sorted by uppercase name.
-        self.index_ci = (0..self.index.len() as u32).collect();
-        let idx_ref = &self.index;
-        self.index_ci.sort_by(|&a, &b| {
-            let ea = &idx_ref[a as usize];
-            let eb = &idx_ref[b as usize];
-            ea.name_upper[..ea.name_len as usize].cmp(&eb.name_upper[..eb.name_len as usize])
-        });
         crate::println!("TAR: indexed {} entries from sector {:#x}",
             self.index.len(), self.start_sector);
     }
 
-    /// O(log N) case-sensitive lookup. POSIX-faithful for Linux callers.
+    /// O(log N) case-sensitive lookup.
     fn find_cs(&self, path: &[u8]) -> Option<&IndexEntry> {
         self.index.binary_search_by(|e| {
             e.name[..e.name_len as usize].cmp(path)
         }).ok().map(|i| &self.index[i])
-    }
-
-    /// O(log N) case-insensitive lookup. Uppercases the query into a
-    /// stack buffer, binary-searches `index_ci` against `name_upper`.
-    fn find_ci(&self, path: &[u8]) -> Option<&IndexEntry> {
-        let mut buf = [0u8; 200];
-        let n = path.len().min(buf.len());
-        for i in 0..n {
-            buf[i] = path[i].to_ascii_uppercase();
-        }
-        let needle = &buf[..n];
-        let idx_ref = &self.index;
-        self.index_ci.binary_search_by(|&i| {
-            let e = &idx_ref[i as usize];
-            e.name_upper[..e.name_len as usize].cmp(needle)
-        }).ok().map(|pos| &self.index[self.index_ci[pos] as usize])
     }
 
     fn read_header(&self, block: u32) -> Option<TarEntry> {
@@ -132,6 +95,7 @@ impl TarFs {
             next_block: block + 1 + data_blocks,
             is_symlink: header.is_symlink(),
             link, link_len,
+            mode: header.filemode(),
         })
     }
 }
@@ -146,10 +110,7 @@ struct TarEntry {
     /// Symlink target (relative or absolute). Only valid when `is_symlink`.
     link: [u8; 100],
     link_len: usize,
-}
-
-fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
+    mode: u16,
 }
 
 /// Check if a TAR entry name is in the given directory.
@@ -158,10 +119,7 @@ fn entry_in_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     if entry_name.len() <= dir.len() {
         return None;
     }
-    if !dir.is_empty() {
-        let prefix = &entry_name[..dir.len()];
-        if !eq_ignore_case(prefix, dir) { return None; }
-    }
+    if !dir.is_empty() && &entry_name[..dir.len()] != dir { return None; }
     let rest = &entry_name[dir.len()..];
     if rest.iter().any(|&b| b == b'/') {
         return None;
@@ -169,21 +127,20 @@ fn entry_in_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     Some(rest)
 }
 
-impl TarFs {
-    /// Symlink-chasing open core. The lookup function is parameterised so
-    /// case-sensitive (POSIX `open`) and case-insensitive (DOS `open_ci`)
-    /// variants share the symlink resolution loop.
-    fn open_with<F>(&self, path: &[u8], lookup: F) -> Option<Vnode>
-    where F: for<'a> Fn(&'a Self, &[u8]) -> Option<&'a IndexEntry>,
-    {
+impl Filesystem for TarFs {
+    fn open(&self, path: &[u8]) -> Option<Vnode> {
         let mut current: [u8; 164] = [0u8; 164];
         let mut current_len = path.len().min(current.len());
         current[..current_len].copy_from_slice(&path[..current_len]);
 
         for _ in 0..8 {
-            let entry = lookup(self, &current[..current_len])?;
+            let entry = self.find_cs(&current[..current_len])?;
             if !entry.is_symlink {
-                return Some(Vnode { handle: entry.data_block as u64, size: entry.size });
+                return Some(Vnode {
+                    handle: entry.data_block as u64,
+                    size: entry.size,
+                    mode: entry.mode,
+                });
             }
             let dir_end = current[..current_len]
                 .iter()
@@ -204,16 +161,6 @@ impl TarFs {
             }
         }
         None
-    }
-}
-
-impl Filesystem for TarFs {
-    fn open(&self, path: &[u8]) -> Option<Vnode> {
-        self.open_with(path, |fs, p| fs.find_cs(p))
-    }
-
-    fn open_ci(&self, path: &[u8]) -> Option<Vnode> {
-        self.open_with(path, |fs, p| fs.find_ci(p))
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32 {
@@ -254,14 +201,14 @@ impl Filesystem for TarFs {
         for entry in &self.index {
             let name = &entry.name[..entry.name_len as usize];
             if name.len() > dir.len() {
-                let prefix = &name[..dir.len()];
-                if dir.is_empty() || eq_ignore_case(prefix, dir) {
+                let matches = if dir.is_empty() { true } else { &name[..dir.len()] == dir };
+                if matches {
                     let rest = &name[dir.len()..];
                     if let Some(slash) = rest.iter().position(|&b| b == b'/') {
                         let dir_name = &rest[..slash];
                         let mut dup = false;
                         for j in 0..dir_count {
-                            if dir_lens[j] == dir_name.len() && eq_ignore_case(&dirs[j][..dir_lens[j]], dir_name) {
+                            if dir_lens[j] == dir_name.len() && &dirs[j][..dir_lens[j]] == dir_name {
                                 dup = true;
                                 break;
                             }
@@ -280,7 +227,7 @@ impl Filesystem for TarFs {
         // Return directory entry if index falls in directory range
         if index < dir_count {
             let len = dir_lens[index];
-            let mut de = DirEntry { name: [0; 100], name_len: len, size: 0, is_dir: true };
+            let mut de = DirEntry { name: [0; 100], name_len: len, size: 0, is_dir: true, mode: 0o755 };
             de.name[..len].copy_from_slice(&dirs[index][..len]);
             return Some(de);
         }
@@ -292,7 +239,13 @@ impl Filesystem for TarFs {
             let name = &entry.name[..entry.name_len as usize];
             if let Some(basename) = entry_in_dir(name, dir) {
                 if i == file_idx {
-                    let mut de = DirEntry { name: [0; 100], name_len: basename.len(), size: entry.size, is_dir: false };
+                    let mut de = DirEntry {
+                        name: [0; 100],
+                        name_len: basename.len(),
+                        size: entry.size,
+                        is_dir: false,
+                        mode: entry.mode,
+                    };
                     de.name[..basename.len()].copy_from_slice(basename);
                     return Some(de);
                 }
@@ -318,14 +271,14 @@ impl Filesystem for TarFs {
             };
             let name = &entry.name[..entry.name_len];
             if name.len() > dir.len() {
-                let prefix = &name[..dir.len()];
-                if dir.is_empty() || eq_ignore_case(prefix, dir) {
+                let matches = if dir.is_empty() { true } else { &name[..dir.len()] == dir };
+                if matches {
                     let rest = &name[dir.len()..];
                     if let Some(slash) = rest.iter().position(|&b| b == b'/') {
                         let dir_name = &rest[..slash];
                         let mut dup = false;
                         for j in 0..dir_count {
-                            if dir_lens[j] == dir_name.len() && eq_ignore_case(&dirs[j][..dir_lens[j]], dir_name) {
+                            if dir_lens[j] == dir_name.len() && &dirs[j][..dir_lens[j]] == dir_name {
                                 dup = true;
                                 break;
                             }
@@ -346,7 +299,10 @@ impl Filesystem for TarFs {
         for i in 0..dir_count {
             if count >= buf.len() { return count; }
             let len = dir_lens[i];
-            buf[count] = DirEntry { name: [0; 100], name_len: len, size: 0, is_dir: true };
+            buf[count] = DirEntry {
+                name: [0; 100], name_len: len,
+                size: 0, is_dir: true, mode: 0o755,
+            };
             buf[count].name[..len].copy_from_slice(&dirs[i][..len]);
             count += 1;
         }
@@ -360,7 +316,10 @@ impl Filesystem for TarFs {
                     let name = &entry.name[..entry.name_len];
                     if let Some(basename) = entry_in_dir(name, dir) {
                         let blen = basename.len();
-                        buf[count] = DirEntry { name: [0; 100], name_len: blen, size: entry.size, is_dir: false };
+                        buf[count] = DirEntry {
+                            name: [0; 100], name_len: blen,
+                            size: entry.size, is_dir: false, mode: entry.mode,
+                        };
                         buf[count].name[..blen].copy_from_slice(basename);
                         count += 1;
                     }
@@ -386,7 +345,7 @@ impl Filesystem for TarFs {
                 Some(entry) => {
                     let name = &entry.name[..entry.name_len];
                     if name.len() > path.len()
-                        && eq_ignore_case(&name[..path.len()], path)
+                        && &name[..path.len()] == path
                         && (pat_with_slash || name[path.len()] == b'/')
                     {
                         return true;

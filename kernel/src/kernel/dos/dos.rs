@@ -1065,7 +1065,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 i += 1;
             }
             let fd = match dfs_create_path(dos, &name[..i]) {
-                Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
+                Ok((path, len)) => {
+                    // Invalidate the parent dir's CI cache so the new file
+                    // becomes visible to find_first/find_next on next walk.
+                    let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                    dfs::ci::invalidate(&path[..parent_end]);
+                    crate::kernel::vfs::create(&path[..len], &mut kt.fds)
+                }
                 Err(e) => -e,
             };
             if fd >= 0 {
@@ -1399,6 +1405,10 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 i += 1;
             }
             if let Ok((path, len)) = dfs_open_existing(dos, &name[..i]) {
+                // Invalidate parent dir CI cache before delete so a stale
+                // alias→missing-file mapping doesn't confuse later lookups.
+                let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                dfs::ci::invalidate(&path[..parent_end]);
                 crate::kernel::vfs::delete(&path[..len]);
             }
             regs.clear_flag32(1);
@@ -2355,33 +2365,25 @@ fn find_matching_file(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
 
     let mut idx = dos.find_idx as usize;
 
+    // Iterate DFS's per-dir CI cache. Keys are 8.3 aliases (uppercase),
+    // already in the form DOS expects in the DTA filename slot — long VFS
+    // names live as `BASE~N.EXT` aliases here. Wildcard match runs against
+    // the alias, not the long name.
+    let dir_for_ci = if dir.last() == Some(&b'/') { &dir[..dir.len() - 1] } else { dir };
     loop {
-        match crate::kernel::vfs::readdir(dir, idx) {
-            Some(entry) => {
+        match dfs::ci::entry_at(dir_for_ci, idx) {
+            Some((alias, size, is_dir)) => {
                 idx += 1;
-                let name = &entry.name[..entry.name_len];
-                if dos_wildcard_match(pat, name) {
+                if dos_wildcard_match(pat, alias) {
                     dos.find_idx = idx as u16;
-                    // Fill DTA at dos.dta
                     let dta = dos.dta;
-                    // DTA layout (43 bytes):
-                    //   0x00-0x14: reserved (unused by us — state lives in DosState)
-                    //   0x15: attribute of matched file
-                    //   0x16: file time (2 bytes)
-                    //   0x18: file date (2 bytes)
-                    //   0x1A: file size (4 bytes, little-endian)
-                    //   0x1E: filename (13 bytes, null-terminated, 8.3 format)
                     unsafe {
                         let p = dta as *mut u8;
                         core::ptr::write_bytes(p, 0, 43);
-                        *p.add(0x15) = if entry.is_dir { 0x10 } else { 0x20 };
-                        (p.add(0x1A) as *mut u32).write_unaligned(entry.size);
-                        let name_len = entry.name_len.min(12);
-                        core::ptr::copy_nonoverlapping(
-                            entry.name.as_ptr(),
-                            p.add(0x1E),
-                            name_len,
-                        );
+                        *p.add(0x15) = if is_dir { 0x10 } else { 0x20 };
+                        (p.add(0x1A) as *mut u32).write_unaligned(size);
+                        let name_len = alias.len().min(12);
+                        core::ptr::copy_nonoverlapping(alias.as_ptr(), p.add(0x1E), name_len);
                         *p.add(0x1E + name_len) = 0;
                     }
                     regs.clear_flag32(1);

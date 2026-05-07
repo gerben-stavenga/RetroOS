@@ -16,9 +16,183 @@
 //! no leading or trailing backslash. Root is the empty string. e.g.
 //! `"BORLANDC\BIN"`.
 use crate::kernel::vfs;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 pub const DFS_PATH_MAX: usize = 128;
 pub const DFS_CWD_MAX: usize = 64;
+
+// ─── CI cache ──────────────────────────────────────────────────────────────
+//
+// Per-VFS-dir cache mapping `8.3 alias` (uppercased, DOS-visible) → original
+// VFS name. The DOS personality is the only place case-folding lives;
+// the VFS itself is POSIX-strict.
+//
+// Cache key: VFS dir path with no trailing `/` ("" = root).
+// Entries are kept sorted by alias for O(log N) lookup and cheap iteration
+// (find_first/find_next walks in alias order).
+//
+// Long names that don't fit 8.3 (legal-char, ≤8 base, ≤3 ext) get an alias
+// of the form `BASE~N.EXT` (FAT-style) so DOS programs can both see them in
+// dir walks and reach them by name.
+
+pub mod ci {
+    use super::*;
+
+    pub struct Entry {
+        pub original: Vec<u8>,
+        pub size: u32,
+        pub is_dir: bool,
+    }
+
+    /// Per-dir mapping `alias → entry`, sorted by alias.
+    type DirCi = Vec<(Vec<u8>, Entry)>;
+
+    static mut CI_CACHE: BTreeMap<Vec<u8>, DirCi> = BTreeMap::new();
+
+    fn cache() -> &'static mut BTreeMap<Vec<u8>, DirCi> {
+        unsafe { &mut *(&raw mut CI_CACHE) }
+    }
+
+    /// Trim trailing `/` so cache keys are canonical.
+    fn norm(vfs_dir: &[u8]) -> &[u8] {
+        if vfs_dir.last() == Some(&b'/') { &vfs_dir[..vfs_dir.len() - 1] } else { vfs_dir }
+    }
+
+    fn build(vfs_dir: &[u8]) -> DirCi {
+        // VFS readdir wants the prefix with a trailing `/` (or empty for root).
+        let mut readdir_key = vfs_dir.to_vec();
+        if !readdir_key.is_empty() && readdir_key.last() != Some(&b'/') {
+            readdir_key.push(b'/');
+        }
+        let mut entries: DirCi = Vec::new();
+        let mut idx = 0usize;
+        while let Some(e) = vfs::readdir(&readdir_key, idx) {
+            let original = e.name[..e.name_len].to_vec();
+            let alias = compute_alias_8_3(&original, &entries);
+            entries.push((alias, Entry { original, size: e.size, is_dir: e.is_dir }));
+            idx += 1;
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    fn ensure_cached(vfs_dir: &[u8]) -> &'static DirCi {
+        let key = norm(vfs_dir);
+        let c = cache();
+        if !c.contains_key(key) {
+            let built = build(key);
+            c.insert(key.to_vec(), built);
+        }
+        c.get(key).unwrap()
+    }
+
+    /// Look up `alias` (uppercase 8.3) in `vfs_dir`. Returns the original VFS
+    /// name on hit. Populates the cache on miss.
+    pub fn lookup(vfs_dir: &[u8], alias: &[u8]) -> Option<&'static [u8]> {
+        let dir = ensure_cached(vfs_dir);
+        dir.binary_search_by(|(k, _)| k.as_slice().cmp(alias)).ok()
+            .map(|i| dir[i].1.original.as_slice())
+    }
+
+    /// Get the entry at `idx` in the cache's alias order. Returns `(alias,
+    /// size, is_dir)`. Used by find_first/find_next.
+    pub fn entry_at(vfs_dir: &[u8], idx: usize) -> Option<(&'static [u8], u32, bool)> {
+        let dir = ensure_cached(vfs_dir);
+        dir.get(idx).map(|(a, e)| (a.as_slice(), e.size, e.is_dir))
+    }
+
+    /// Drop cached entries for `vfs_dir`. Call after writes that can change
+    /// the dir's contents (create / unlink / rename).
+    pub fn invalidate(vfs_dir: &[u8]) {
+        cache().remove(norm(vfs_dir));
+    }
+}
+
+/// FAT-style 8.3 chars: A-Z 0-9 plus a small set of punctuation. Lowercase
+/// letters are "legal" too (they uppercase fine); space and other punct are
+/// not. Used to decide whether a name fits 8.3 and to filter chars when
+/// generating an alias.
+fn is_dos_legal(b: u8) -> bool {
+    matches!(b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+        | b'!' | b'#' | b'$' | b'%' | b'&' | b'\''
+        | b'(' | b')' | b'-' | b'@' | b'^' | b'_'
+        | b'`' | b'{' | b'}' | b'~')
+}
+
+/// True if the name fits a strict DOS 8.3 (single dot, ≤8 base, ≤3 ext, all
+/// legal chars) — in which case its uppercase form IS the alias, no `~N`.
+fn fits_8_3(name: &[u8]) -> bool {
+    let dots: usize = name.iter().filter(|&&b| b == b'.').count();
+    if dots > 1 { return false; }
+    let (base, ext) = match name.iter().position(|&b| b == b'.') {
+        Some(p) => (&name[..p], &name[p + 1..]),
+        None => (&name[..], &b""[..]),
+    };
+    if base.len() > 8 || ext.len() > 3 { return false; }
+    if base.is_empty() && ext.is_empty() { return false; }
+    base.iter().all(|&b| is_dos_legal(b))
+        && ext.iter().all(|&b| is_dos_legal(b))
+}
+
+/// Generate the 8.3 alias for `name`, avoiding collisions in `existing`.
+/// Short legal names → uppercased verbatim. Long/illegal → `BASE~N.EXT` with
+/// N grown until unique; base shrinks as digits grow so alias stays ≤8 base.
+fn compute_alias_8_3(name: &[u8], existing: &[(Vec<u8>, ci::Entry)]) -> Vec<u8> {
+    if fits_8_3(name) {
+        return name.iter().map(|b| b.to_ascii_uppercase()).collect();
+    }
+
+    let last_dot = name.iter().rposition(|&b| b == b'.').unwrap_or(name.len());
+    let base_src = &name[..last_dot];
+    let ext_src = if last_dot < name.len() { &name[last_dot + 1..] } else { &b""[..] };
+
+    let base_clean: Vec<u8> = base_src.iter()
+        .filter(|&&b| is_dos_legal(b))
+        .map(|b| b.to_ascii_uppercase())
+        .collect();
+    let ext_clean: Vec<u8> = ext_src.iter()
+        .filter(|&&b| is_dos_legal(b))
+        .map(|b| b.to_ascii_uppercase())
+        .take(3)
+        .collect();
+
+    let alias_taken = |a: &[u8], existing: &[(Vec<u8>, ci::Entry)]| -> bool {
+        existing.iter().any(|(k, _)| k.as_slice() == a)
+    };
+
+    for n in 1u32..=999_999 {
+        let mut digits = [0u8; 8];
+        let mut dlen = 0;
+        let mut nn = n;
+        let mut tmp = [0u8; 8];
+        let mut tlen = 0;
+        if nn == 0 { tmp[0] = b'0'; tlen = 1; }
+        while nn > 0 { tmp[tlen] = b'0' + (nn % 10) as u8; tlen += 1; nn /= 10; }
+        for i in 0..tlen { digits[i] = tmp[tlen - 1 - i]; }
+        let dn = &digits[..tlen];
+
+        // base + ~ + dn ≤ 8 chars; reserve room for `~` and the digits.
+        let max_base = 8usize.saturating_sub(1 + dn.len());
+        let prefix_len = base_clean.len().min(max_base);
+
+        let mut alias = Vec::with_capacity(8 + 1 + 3);
+        alias.extend_from_slice(&base_clean[..prefix_len]);
+        alias.push(b'~');
+        alias.extend_from_slice(dn);
+        if !ext_clean.is_empty() {
+            alias.push(b'.');
+            alias.extend_from_slice(&ext_clean);
+        }
+        if !alias_taken(&alias, existing) {
+            return alias;
+        }
+    }
+    // Ran out of digits — fall back to a guaranteed-unique key. Shouldn't
+    // happen in practice (>1M same-prefix files in one dir).
+    name.iter().map(|b| b.to_ascii_uppercase()).collect()
+}
 
 /// Per-thread DOS filesystem state.
 pub struct DfsState {
@@ -115,18 +289,12 @@ impl DfsState {
     }
 
     /// Convert an absolute DOS path (output of `resolve`) to the VFS form
-    /// `vfs::open` expects: drive prefix mapped, `\` → `/`, components
-    /// passed through as-is. Both backing filesystems (`tarfs`, `ext4fs`)
-    /// match names case-insensitively, so we don't need the
-    /// component-by-component canonical-case walk that walked the index
-    /// O(N) per component for every open.
+    /// `vfs::open` expects. Walks each DOS component through DFS's per-dir
+    /// CI cache to recover the canonical (mixed-case) VFS name; the VFS
+    /// itself is POSIX-strict.
     pub fn to_vfs_open(abs_dos: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {
         let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
-        for &b in rest {
-            if pos >= out.len() { return Err(3); }
-            out[pos] = if b == b'\\' { b'/' } else { b };
-            pos += 1;
-        }
+        walk_components(rest, out, &mut pos, /*allow_missing_last=*/false)?;
         Ok(pos)
     }
 
@@ -136,7 +304,7 @@ impl DfsState {
     /// Use for CREATE / UNLINK / RENAME (destination) / MKDIR.
     pub fn to_vfs_create(abs_dos: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {
         let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
-        walk_existing(rest, out, &mut pos, /*allow_missing_last=*/true)?;
+        walk_components(rest, out, &mut pos, /*allow_missing_last=*/true)?;
         Ok(pos)
     }
 
@@ -205,7 +373,7 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
     }
     let prefix: &[u8] = match abs_dos[0] {
         b'C' => b"",
-        b'H' => b"host/",
+        b'H' => b"host",
         _ => return Err(15),
     };
     let mut pos = 0;
@@ -215,9 +383,16 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
     Ok((pos, &abs_dos[3..]))
 }
 
-/// Split `rest` on `\`, look each component up in the current VFS dir
-/// (`out[..*pos]`), append the real-case name. Writes `/` separators.
-fn walk_existing(
+/// Walk DOS path components, mapping each through the CI cache to its
+/// VFS-canonical name. Each component arrives uppercased (output of
+/// `resolve`); the cache key is also uppercase so it's a direct match.
+/// Writes the resolved VFS path into `out` starting at `*pos`.
+///
+/// `allow_missing_last`: when true, a final component that's not in the
+/// cache is written verbatim (used by CREATE — the basename doesn't exist
+/// yet). Otherwise a missing final component is `2` (file not found) and a
+/// missing intermediate is `3` (path not found).
+fn walk_components(
     rest: &[u8],
     out: &mut [u8; DFS_PATH_MAX],
     pos: &mut usize,
@@ -233,22 +408,31 @@ fn walk_existing(
         let is_last = i == rest.len();
 
         if comp.is_empty() {
-            // Double backslash — skip.
             if !is_last { i += 1; }
             continue;
         }
 
-        // Look up `comp` case-insensitively in the directory at out[..*pos].
+        // `pos > 0` ⇒ we've already written a parent path, append a slash
+        // before the next component. The `out[..*pos]` slice (without the
+        // trailing slash) is the cache key.
         let dir_slice = &out[..*pos];
-        match find_entry_ci(dir_slice, comp) {
-            Some((real, rlen)) => {
-                for k in 0..rlen {
+        match ci::lookup(dir_slice, comp) {
+            Some(original) => {
+                if *pos > 0 {
                     if *pos >= out.len() { return Err(3); }
-                    out[*pos] = real[k]; *pos += 1;
+                    out[*pos] = b'/'; *pos += 1;
+                }
+                for &b in original {
+                    if *pos >= out.len() { return Err(3); }
+                    out[*pos] = b; *pos += 1;
                 }
             }
             None => {
                 if is_last && allow_missing_last {
+                    if *pos > 0 {
+                        if *pos >= out.len() { return Err(3); }
+                        out[*pos] = b'/'; *pos += 1;
+                    }
                     for &b in comp {
                         if *pos >= out.len() { return Err(3); }
                         out[*pos] = b; *pos += 1;
@@ -261,34 +445,9 @@ fn walk_existing(
             }
         }
 
-        if !is_last {
-            if *pos >= out.len() { return Err(3); }
-            out[*pos] = b'/'; *pos += 1;
-            i += 1; // skip '\'
-        }
+        if !is_last { i += 1; }
     }
     Ok(())
-}
-
-/// Case-insensitive lookup of `name` in directory `dir`. Returns the
-/// real-case entry name (up to 100 bytes — TarFs's DirEntry name size).
-fn find_entry_ci(dir: &[u8], name: &[u8]) -> Option<([u8; 100], usize)> {
-    let mut idx = 0usize;
-    loop {
-        let entry = vfs::readdir(dir, idx)?;
-        let entry_name = &entry.name[..entry.name_len];
-        if eq_ignore_case(entry_name, name) {
-            let mut buf = [0u8; 100];
-            buf[..entry.name_len].copy_from_slice(entry_name);
-            return Some((buf, entry.name_len));
-        }
-        idx += 1;
-    }
-}
-
-fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
 }
 
 /// Collapse `.` and `..` components in an absolute DOS path
