@@ -744,6 +744,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 i += 1;
             }
             let err = dos.dfs.chdir(&path[..i]);
+            dos_trace!("D21 3B raw={:?} err={}",
+                core::str::from_utf8(&path[..i]).unwrap_or("<non-utf8>"), err);
             if err != 0 {
                 regs.set_flag32(1);
                 regs.rax = (regs.rax & !0xFFFF) | err as u64;

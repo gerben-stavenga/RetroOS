@@ -101,6 +101,13 @@ impl DfsState {
             pos += 1;
         }
 
+        // Collapse `.` and `..` components in place. NC issues
+        // INT 21 AH=3Bh with literal ".." when navigating up; DN tracks
+        // cwd itself and sends the parent absolute path, which is why
+        // it never tripped this. Without collapsing, we hand
+        // "C:\GAMES\PRINCE\.." to the VFS and get path-not-found.
+        pos = collapse_dots(out, pos);
+
         // Collapse any trailing '\' except the one right after "X:"
         while pos > 3 && out[pos-1] == b'\\' { pos -= 1; }
 
@@ -282,4 +289,42 @@ fn find_entry_ci(dir: &[u8], name: &[u8]) -> Option<([u8; 100], usize)> {
 fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
+}
+
+/// Collapse `.` and `..` components in an absolute DOS path
+/// `"X:\..."`. `..` pops the previous component; never goes below the
+/// `"X:\"` root. Returns new length.
+fn collapse_dots(buf: &mut [u8], len: usize) -> usize {
+    const ROOT_END: usize = 3; // "X:\"
+    if len <= ROOT_END { return len; }
+    let mut write = ROOT_END;
+    let mut read = ROOT_END;
+    while read < len {
+        while read < len && buf[read] == b'\\' { read += 1; }
+        if read >= len { break; }
+        let comp_start = read;
+        while read < len && buf[read] != b'\\' { read += 1; }
+        let comp_len = read - comp_start;
+        let is_dot = comp_len == 1 && buf[comp_start] == b'.';
+        let is_dotdot = comp_len == 2 && buf[comp_start] == b'.' && buf[comp_start + 1] == b'.';
+        if is_dot {
+            // skip
+        } else if is_dotdot {
+            // pop last written component (and its leading '\')
+            while write > ROOT_END && buf[write - 1] != b'\\' { write -= 1; }
+            if write > ROOT_END { write -= 1; }
+        } else {
+            if write > ROOT_END {
+                buf[write] = b'\\';
+                write += 1;
+            }
+            // write <= comp_start always (read advances first), so the
+            // forward in-place copy can't clobber unread source bytes.
+            for i in 0..comp_len {
+                buf[write + i] = buf[comp_start + i];
+            }
+            write += comp_len;
+        }
+    }
+    write
 }
