@@ -446,14 +446,21 @@ pub fn handle_event(
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
-            // DPMI exception delivery is for PM clients. A DPMI session
-            // can outlive its initial entry (TSR'd PM hosts like dpmiload
-            // keep `dos.dpmi` Some while running RM-side code), so
-            // `dpmi.is_some()` is not the right gate — `regs.mode()` is.
-            // Otherwise a #UD in VM86 code lands in dispatch_dpmi_exception
-            // which tries to load PM-shaped saved regs and #GPs the kernel.
-            if !is_vm86 && dos.dpmi.is_some() {
+            // DPMI session active: route to client's exception handler
+            // regardless of current mode. switch_to_pm_side handles the
+            // VM86→PM toggle if needed; save.restore puts us back in
+            // VM86 on the unwind.
+            if dos.dpmi.is_some() {
                 dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
+            } else if is_vm86 && matches!(n, 0 | 3 | 4) {
+                // Bare VM86 (no DPMI), #DE / #BP / #OF: same vectors as
+                // software INTs 0/3/4. Real-mode CPU delivers to IVT[n];
+                // programs (e.g. Test Drive 1) install their own INT 0
+                // handler that fixes up DX:AX and advances EIP past the
+                // DIV. Reflect instead of killing — this matches what
+                // FreeDOS does.
+                unsafe { crate::arch::monitor::sw_reflect_vm86_int(regs, n as u8); }
+                thread::KernelAction::Done
             } else {
                 let lin = if is_vm86 {
                     ((regs.code_seg() as u32) << 4).wrapping_add(regs.ip32())

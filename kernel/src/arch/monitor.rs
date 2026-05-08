@@ -249,8 +249,16 @@ unsafe fn pop16(regs: &mut Regs, ss_base: u32, ss_32: bool) -> u16 {
 /// current VM86 stack, clears IF/TF, and loads the new CS:IP. The monitor
 /// calls this for INTs whose redirection-bitmap bit is clear so upstream
 /// never sees a "not for us" VM86 INT.
+/// Synthesize an INT-n in real mode by pushing FLAGS/CS/IP onto the
+/// user's VM86 stack and jumping to IVT[vector]. Mirrors what the CPU
+/// does for `INT n` in real mode. Used both by the `0xCD` opcode handler
+/// for software INTs that aren't intercepted, and by the kernel's
+/// exception-dispatch path for #DE/#BP/#OF in VM86 mode (those vectors
+/// are also reachable as software INTs, so reflecting to the real-mode
+/// IVT handler matches what real DOS does — programs install their own
+/// INT 0 handler and the host must invoke it).
 #[inline]
-unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
+pub unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
     // IVT lives at linear 0. Unaligned reads are fine here (real-mode IVT
     // is paragraph-aligned; entries are 4 bytes each).
     let ivt_addr = (vector as u32) * 4;
