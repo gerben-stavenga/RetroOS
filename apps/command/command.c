@@ -313,6 +313,18 @@ static void vga_take(int pid) {
     int86(0x31, &r, &r);
 }
 
+/* INT 31h AH=06h: peek the zombie child's VGA mode without taking it.
+ * Returns 0 = text, 1 = graphics, -1 = error. Used to skip vga_take when
+ * the child exited in graphics mode (the leftover planar framebuffer
+ * doesn't compose with a fresh text-mode redraw by the next program). */
+static int synth_vga_is_graphics(int pid) {
+    r.h.ah = 0x06;
+    r.x.bx = (unsigned)pid;
+    int86(0x31, &r, &r);
+    if (r.x.cflag) return -1;
+    return (int)r.h.al;
+}
+
 /* INT 31h AH=05h: reap a zombie child without touching VGA. Use this
  * when the child terminated abnormally (high byte of AH=4Dh status =
  * 0x02) and its VGA state is suspect. */
@@ -371,7 +383,16 @@ static int run_external_raw(char **argv, int argc, int poll_kbd) {
             printf("Reaped child %d with exit status %02Xh\r\n", pid, exit_al);
             return 1;
         }
-        vga_take(pid);
+        /* Only adopt the farewell screen if the child exited in text
+         * mode. Graphics-mode leftovers (e.g. Alley Cat aborted with
+         * Ctrl-Y) don't compose with the next program's text redraw —
+         * the planar framebuffer interprets text bytes as pixels and
+         * the user sees tiled garbage. */
+        if (synth_vga_is_graphics(pid) == 0) {
+            vga_take(pid);
+        } else {
+            synth_reap(pid);
+        }
         return (int)exit_al;
     }
 }

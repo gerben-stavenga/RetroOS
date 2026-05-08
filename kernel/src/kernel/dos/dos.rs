@@ -422,6 +422,30 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
+        // AH=06h — SYNTH_VGA_PEEK_MODE: query the saved VGA state of a
+        // zombie child without taking it. BX = child pid.
+        // Output: AL = 0 if text mode, 1 if graphics, CF=0; CF=1/AX=errno.
+        // GC[6] bit 0 is the VGA Misc/Graphics-Mode register's alpha-graphics
+        // select: 0 = text (alphanumeric), 1 = graphics. The caller (typically
+        // COMMAND.COM) uses this to decide whether the child's farewell
+        // screen is worth adopting — graphics-mode garbage left over after,
+        // e.g., a Ctrl-Y abort doesn't compose with the next program's
+        // text-mode redraw.
+        0x06 => {
+            let pid = (regs.rbx & 0xFFFF) as i16 as i32;
+            let rv = thread::with_target_dos(pid, |target| {
+                if target.pc.vga.planes.is_empty() { return -61; }
+                (target.pc.vga.gc[6] & 1) as i32
+            });
+            if rv < 0 {
+                regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
+                regs.set_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFF) | (rv as u64);
+                regs.clear_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
         // Unknown AH: RetroOS synth space is kernel-owned; anything outside
         // the documented subfunctions is a guest bug. Return AX=errno/CF=1.
         _ => {
