@@ -1204,6 +1204,12 @@ fn seg_base_for(regs: &Regs, sel: u16) -> u32 {
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
 /// bytes through `emulate_inb` and writes the result into `regs.rax`.
 pub fn handle_in_event(pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+    if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
+        let val = crate::arch::inw(port) as u64;
+        regs.rax = (regs.rax & !0xFFFF) | val;
+        return;
+    }
+
     let mut val: u64 = 0;
     for i in 0..size {
         val |= (emulate_inb(pc, port + i as u16) as u64) << (i * 8);
@@ -1215,6 +1221,11 @@ pub fn handle_in_event(pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
 pub fn handle_out_event(pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     let val = regs.rax;
+    if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
+        crate::arch::outw(port, val as u16);
+        return;
+    }
+
     for i in 0..size {
         emulate_outb(pc, port + i as u16, (val >> (i * 8)) as u8);
     }
