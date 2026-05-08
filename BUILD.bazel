@@ -86,7 +86,6 @@ _BASE_FILES = {
     "//apps/tests/stress64:stress64_elf":   "TESTS/stress64.elf",
     "//apps/tests/hello_com:hello_com":     "TESTS/HELLO.COM",
     "//apps/tests/gfx_com:gfx_com":         "TESTS/GFX.COM",
-    "//apps/tests/gfx_cga:gfx_cga":         "TESTS/GFX_CGA.COM",
     "//apps/tests/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
     "//apps/tests/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//apps/tests/hello32_linux:hello32_linux": "TESTS/HI.ELF",
