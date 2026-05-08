@@ -821,7 +821,9 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
 ///     host_stack — advance `host_stack_sp` in lockstep so subsequent
 ///     pushes don't overlap the now-consumed iret-frame area.
 pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
-    const STATUS_MASK: u32 = 0x0CD5;
+    // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
+    // is a control flag — handler-set CLD/STD must not leak into caller.
+    const STATUS_MASK: u32 = 0x08D5;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
     // pm_get_stack reads from other_stack here (we're in VM86 with
@@ -843,9 +845,9 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     // planted iret-frame holds the *caller's* pre-INT flags (planted
     // by deliver_pm_int with handler_flags = caller's flags & ~TF). A
     // plain `regs.flags = ret_flags` wipes the handler's CF/PF/AF/ZF/
-    // SF/DF/OF — DOS calls return success/failure via CF, so the
-    // caller would see its own pre-INT CF instead of our handler's
-    // result. Borland's `dpmiload` PM loader specifically does
+    // SF/OF — DOS calls return success/failure via CF, so the caller
+    // would see its own pre-INT CF instead of our handler's result.
+    // Borland's `dpmiload` PM loader specifically does
     // `int 0x21 AH=3F; jnc 0x3B1; jmp 0x414` immediately after the
     // read; without this merge it sees CF=1 (caller's stale flag) and
     // bails with the "Application load & execute error FFFB".

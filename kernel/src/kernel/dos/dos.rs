@@ -278,7 +278,9 @@ pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut threa
 ///     stack. Status-flag merge mirrors `rm_iret` so DOS-call CF/AX
 ///     results survive.
 fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Regs) {
-    const STATUS_MASK: u32 = 0x0CD5;
+    // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
+    // is a control flag — handler-set CLD/STD must not leak into caller.
+    const STATUS_MASK: u32 = 0x08D5;
     if regs.mode() == crate::UserMode::VM86 {
         let ret_ip = vm86_pop(regs);
         let ret_cs = vm86_pop(regs);
