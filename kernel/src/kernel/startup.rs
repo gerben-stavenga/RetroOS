@@ -78,7 +78,7 @@ pub fn startup() -> ! {
     if crate::kernel::hostfs::init() {
         static HOSTFS: crate::kernel::hostfs::HostFs = crate::kernel::hostfs::HostFs::new();
         vfs::mount(b"host/", &HOSTFS);
-        println!("hostfs mounted on H:");
+        println!("hostfs mounted at /host");
     }
 
     crate::kernel::stacktrace::init_from_tar();

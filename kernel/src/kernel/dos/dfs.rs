@@ -337,23 +337,16 @@ impl DfsState {
 
 /// Convert a VFS-form path back to drive-qualified DOS form. Used only on
 /// the initial exec path, where we have an already-resolved VFS path and
-/// need a DOS form for the env program-path suffix. `host/foo` → `H:\FOO`,
-/// anything else → `C:\REST` (uppercased, `/` → `\`).
+/// need a DOS form for the env program-path suffix: `C:\REST` (uppercased,
+/// `/` → `\`). One drive (C:); `host/` is just a subdirectory.
 pub fn vfs_to_dos(vfs: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> usize {
     let mut s = vfs;
     while s.first() == Some(&b'/') { s = &s[1..]; }
-    let (drive, rest) = if s.len() >= 5 && s[..5].eq_ignore_ascii_case(b"host/") {
-        (b'H', &s[5..])
-    } else if s.len() == 4 && s.eq_ignore_ascii_case(b"host") {
-        (b'H', &b""[..])
-    } else {
-        (b'C', s)
-    };
     let mut pos = 0;
     if pos + 3 > out.len() { return pos; }
-    out[pos] = drive; out[pos+1] = b':'; out[pos+2] = b'\\';
+    out[pos] = b'C'; out[pos+1] = b':'; out[pos+2] = b'\\';
     pos += 3;
-    for &b in rest {
+    for &b in s {
         if pos >= out.len() { break; }
         out[pos] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
         pos += 1;
@@ -373,7 +366,6 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
     }
     let prefix: &[u8] = match abs_dos[0] {
         b'C' => b"",
-        b'H' => b"host",
         _ => return Err(15),
     };
     let mut pos = 0;
