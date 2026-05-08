@@ -1,17 +1,12 @@
 # DOS Game Compatibility — Bug Sprint
 
-## INT 10h teletype rendering (shared root cause)
-- [ ] BIOS `INT 10h AH=0Eh` (teletype char) doesn't render text in graphics
-      modes under our VM86 setup. SeaBIOS's CGA/EGA/VGA-mode teletype path
-      bitmap-blits glyphs into the framebuffer; the same SeaBIOS image
-      works in FreeDOS+JEMM386, so the hole is somewhere in our V86
-      passthrough (port/MMIO/IVT) — not SeaBIOS.
-- [ ] Affects: Alley Cat (intro prompt unreadable), Digger (intro prompt
-      unreadable), and likely several others. Both games run otherwise.
-- [ ] Resolution options:
-      (a) Find what's missing in V86 so SeaBIOS teletype works as-is.
-      (b) Implement an in-kernel INT 10h hook for AH=00/02/03/09/0E with
-      our own bitmap-font glyph rendering. ~150–200 lines. Self-contained.
+## INT 10h teletype rendering
+- [x] Fixed: word-sized passthrough for Bochs VBE ports 0x01CE/0x01CF/0x01D0
+      in `handle_in_event`/`handle_out_event`. SeaBIOS's graphics-mode
+      teletype reads/writes those to program the display; our byte-wise
+      emulator returned zeros, so glyph-blit math computed a junk
+      framebuffer offset and nothing rendered. Alley Cat, Digger and
+      similar now show text in graphics modes.
 
 ## Offroad
 - [ ] Doesn't work — failure mode TBD (capture trace)
