@@ -1681,6 +1681,18 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction
             dpmi_install_check(regs);
             thread::KernelAction::Done
         }
+        // AX=168Ah — DPMI 1.0 Get Vendor-Specific API Entry Point.
+        // Spec: ES:DI = ASCIIZ vendor name; returns AL=0 + ES:DI entry
+        // point on success. Borland's 16-bit DPMI loader (RTM) gates on
+        // this — without "yes, supported" it bails with "no DOS extensions
+        // in the DPMI server". We already provide DOS-translation services
+        // through `pmdos_int21_handler`, which runs INT 21 with PM regs
+        // intact. RTM doesn't actually call the entry point; AL=0 is
+        // enough for it to proceed.
+        0x168A => {
+            regs.rax = regs.rax & !0xFF; // AL=0: success
+            thread::KernelAction::Done
+        }
         // AX=4300h — XMS installation check
         0x4300 => {
             regs.rax = (regs.rax & !0xFF) | 0x80; // AL=80h: XMS driver installed
