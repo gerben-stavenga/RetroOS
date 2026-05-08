@@ -134,14 +134,19 @@ pub fn init_interrupts() {
     remap_pic();
     init_pit(1000); // 1000 Hz timer
     unmask_irq(0);  // timer
-    unmask_irq(1);  // keyboard
-    init_mouse();
-    // Drain any byte left in the 8042 output buffer by the BIOS or by a key
-    // pressed before we unmasked IRQ1. The 8042 only edges IRQ1 when OBF
-    // transitions 0→1, so a stuck OBF locks out all subsequent keypresses.
+    // Drain any byte left in the 8042 output buffer by BIOS or a key pressed
+    // before our handler is in place. Must happen BEFORE init_mouse: that
+    // function reads 0x60 expecting the controller config byte, but if a
+    // scancode is sitting in OBF it'd read that instead and write it back
+    // as cfg — typically clearing bit 0 (KBD IRQ) and setting bit 4 (KBD
+    // clock disable), silently killing the keyboard for the rest of the
+    // boot. Also, the 8042 only edges IRQ1 when OBF transitions 0→1, so a
+    // stuck OBF locks out subsequent keypresses regardless.
     while inb(0x64) & 1 != 0 {
         let _ = inb(0x60);
     }
+    unmask_irq(1);  // keyboard
+    init_mouse();
 }
 
 // ============================================================================
