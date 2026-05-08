@@ -26,15 +26,12 @@
 - [x] AH=08 IP-rewind HACK on PM-via-VECSTUB path — fixed by `SLOT_RESUME`
       block-and-retry closure mechanism. Game now boots through intro and
       menu.
-- [ ] Crashes on "Begin Mission" with `#DE` at linear `0x31` (inside the
-      IVT — junk PC). `bytes=[d4, 00, ...]` = `AAM 0` (divide by zero).
-      `last_irq=vec74` (mouse IRQ 12) fired while user was at
-      `0050:0004` (`STUB_SEG:slot_offset(SLOT_RM_IRET)` — sitting on our
-      RM-IRET trampoline). Mouse callback dispatch returned to junk.
-      Suspect: HW IRQ delivery path interacting with RM-IRET trampoline +
-      INT 33 mouse callback unwind. Reproduce, then trace the
-      mouse_callback_invoke / mouse_callback_return path with the IRQ
-      arrival.
+- [x] Mouse-click crash on "Begin Mission" — DPMI 0303 callback dispatch
+      was missing the IRET return frame, planting `STUB_BASE` in the EIP,
+      and DPMI 0.9 §6.1.1 DS:(E)SI semantics. Also fixed an unrelated
+      `deliver_pm_irq` bug where `host_stack_write_iret` hardcoded
+      `host_stack_base()` instead of resolving through `regs.frame.ss`
+      (broke nested IRQ delivery on a non-host-stack handler stack).
 
 ## Hexen
 - [ ] Doesn't boot. Launches via DOS32A; loads `HEXEN.CFG` and `HEXEN.WAD`,

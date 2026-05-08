@@ -433,29 +433,6 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 // composes them with DPMI policy.
 
 
-/// Push an IRET frame for a PM handler entry at the given cursor. Returns
-/// the new cursor. Width follows client bitness per DPMI 0.9 §10.6.
-fn host_stack_write_iret(cursor: u32, client_use32: bool,
-                         ret_eip: u32, ret_cs: u16, ret_flags: u32) -> u32 {
-    let frame_size: u32 = if client_use32 { 12 } else { 6 };
-    let new_cursor = cursor - frame_size;
-    let addr = dos::host_stack_base() + new_cursor;
-    unsafe {
-        if client_use32 {
-            let p = addr as *mut u32;
-            core::ptr::write_unaligned(p,        ret_eip);
-            core::ptr::write_unaligned(p.add(1), ret_cs as u32);
-            core::ptr::write_unaligned(p.add(2), ret_flags);
-        } else {
-            let p = addr as *mut u16;
-            core::ptr::write_unaligned(p,        ret_eip as u16);
-            core::ptr::write_unaligned(p.add(1), ret_cs);
-            core::ptr::write_unaligned(p.add(2), ret_flags as u16);
-        }
-    }
-    new_cursor
-}
-
 /// Deliver a PM soft INT to the installed handler.
 ///
 /// Per DPMI 0.9 §3.1.2: software interrupts do **not** switch stacks —
@@ -566,10 +543,12 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     let in_pm = regs.mode() != crate::UserMode::VM86;
     let nested_on_pm = in_pm && dos.pc.locked_stack.other_stack.is_some();
     if nested_on_pm {
-        let new_esp = host_stack_write_iret(
-            regs.sp32(), client_use32,
+        // Plant iret-frame at regs.SS:[SP-frame_size]; push_iret_frame
+        // uses regs.frame.ss to look up the segment base, so this writes
+        // to whatever stack the handler is currently on (DPMI 0.9 §3.1.2
+        // permits handler SS != HOST_STACK_PM*).
+        push_iret_frame(&dos.ldt[..], regs, client_use32,
             regs.ip32(), regs.code_seg(), handler_flags);
-        regs.frame.rsp = new_esp as u64;
     } else {
         // First-entry from client OR toggle from rm: switch_to_pm_side
         // pushes ModeSave, lands user on top of the save, captures pre-
@@ -577,17 +556,15 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         // PM client). Recipe layers an iret-to-SLOT_PM_IRET frame above
         // the save so the eventual handler IRET round-trips through
         // the kernel for unwind.
-        let pm_save_at = switch_to_pm_side(dos, regs);
+        switch_to_pm_side(dos, regs);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
-        let new_sp = host_stack_write_iret(
-            pm_save_at.1, client_use32,
+        push_iret_frame(&dos.ldt[..], regs, client_use32,
             stub_eip, SPECIAL_STUB_SEL, handler_flags);
 
         regs.ds = 0;
         regs.es = 0;
         regs.fs = 0;
         regs.gs = 0;
-        regs.frame.rsp = new_sp as u64;
     }
 
     regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
@@ -787,7 +764,7 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     if _save_at.0 == host_stack_pm_seg(dos) {
         // host_stack_pm layout (SS=host_stack_pm, SP grows down):
         //   ModeSave1     ← deliver_pm_irq's switch_to_pm_side
-        //   iret-frame    ← deliver_pm_irq's host_stack_write_iret (frame_size)
+        //   iret-frame    ← deliver_pm_irq's push_iret_frame (frame_size)
         //   ModeSave2     ← our switch_to_rm_side push_save; `_save_at.1` here
         let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
         let frame_size: u32 = if client_use32 { 12 } else { 6 };

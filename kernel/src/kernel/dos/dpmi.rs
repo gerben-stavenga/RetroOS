@@ -1333,6 +1333,19 @@ pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     save.restore(regs);
     dos.pc.locked_stack.other_stack = save.other_stack();
 
+    // callback_entry path: ModeSave captured RM, so we just restored to
+    // VM86 with cs:ip = STUB_SEG:slot+2 (the trap-incremented IP, which
+    // points at the *next* slot's CD 31). The RM caller reached us via
+    // CALL FAR, so pop the 4-byte return frame from the RM stack to land
+    // at the post-CALL-FAR continuation. simulate_real_mode_int and
+    // call_real_mode_proc{_iret} restore PM and don't take this branch.
+    if regs.mode() == crate::UserMode::VM86 {
+        let ret_ip = machine::vm86_pop(regs);
+        let ret_cs = machine::vm86_pop(regs);
+        machine::set_vm86_ip(regs, ret_ip);
+        machine::set_vm86_cs(regs, ret_cs);
+    }
+
     dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
         regs.rax as u16, regs.flags32() & 1,
         regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -1577,20 +1590,45 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
     // saved RM GP regs for post-handler writeback / restore); we land
     // the user's regs.SP on top of *both* records and update
     // other_stack stays as set by the toggle (rm caller's SS:SP).
+    // DPMI 0.9 §6.1.1: DS:(E)SI must point at the RM stack location
+    // where the caller's return addresses are pushed — handler reads
+    // CS:IP from there. Capture before switch_to_pm_side mutates regs.
+    let rm_ss_sp_linear = (regs.stack_seg() as u32).wrapping_shl(4)
+        .wrapping_add(regs.sp32());
+
     let stub = CallStubFrame::capture(regs, struct_addr);
     let pm_save_at = super::mode_transitions::switch_to_pm_side(dos, regs);
     let pm_post = host_stack_write_call_args(&dos.ldt[..], pm_save_at, stub);
 
-    // DS:SI = selector:offset pointing to real-mode SS:SP
-    // ES:DI = selector:offset pointing to register structure
-    // SS already set by toggle; just adjust SP past the CallStubFrame.
+    // Plant an iret-frame below the CallStubFrame: the PM handler IRETs
+    // to SPECIAL_STUB_SEL:SLOT_RM_IRET_CALL which dispatches `rm_iret_call`
+    // (writeback + GP/save restore + return-to-RM-caller via CALL FAR pop).
+    // Per DPMI 0.9 §6.1.1 the PM callback procedure must execute IRET.
+    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    regs.frame.rsp = pm_post.1 as u64;
+    super::mode_transitions::push_iret_frame(
+        &dos.ldt[..], regs, client_use32,
+        dos::STUB_BASE + dos::slot_offset(dos::SLOT_RM_IRET_CALL) as u32,
+        super::mode_transitions::SPECIAL_STUB_SEL,
+        0x202, // IF=1
+    );
+
+    // DS:(E)SI = pointer to RM SS:SP (where IRET frame is pushed) — via
+    // the flat low-mem selector so the handler can both read the caller's
+    // CS:IP and modify the RM stack if needed.
+    // ES:(E)DI = pointer to PM register structure.
     regs.frame.cs = pm_cs as u64;
     regs.set_ip32(pm_eip);
-    regs.frame.rsp = pm_post.1 as u64;
-    regs.ds = rm_struct_sel as u64;  // DS:ESI = register structure
-    regs.rsi = rm_struct_off as u64;
-    regs.es = rm_struct_sel as u64;  // ES:EDI = register structure
+    regs.ds = LOW_MEM_SEL as u64;
+    regs.rsi = rm_ss_sp_linear as u64;
+    regs.es = rm_struct_sel as u64;
     regs.rdi = rm_struct_off as u64;
+    // FS/GS still hold the RM caller's real-mode segment values (e.g.
+    // DOS32A leaves arbitrary values there). In PM these would be
+    // validated as selectors at exit-iret and #GP on bad GDT/LDT lookup.
+    // Spec doesn't promise FS/GS to the PM callback — null them out.
+    regs.fs = 0;
+    regs.gs = 0;
 }
 
 
@@ -1939,6 +1977,13 @@ pub(super) fn pm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
         }
         dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
+        }
+        dos::SLOT_RM_IRET_CALL => {
+            // PM callback IRETed back to us: writeback + restore the RM
+            // caller (callback_entry path). 0300/01/02 path lands here via
+            // RM `CD 31` in slot from the RM-side stub instead.
+            rm_iret_call(dos, regs);
+            return thread::KernelAction::Done;
         }
         dos::SLOT_PM_IRET => {
             let r = super::mode_transitions::cross_mode_restore(dos, regs);
