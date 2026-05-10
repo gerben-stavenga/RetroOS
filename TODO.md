@@ -12,7 +12,7 @@
 - [ ] Doesn't work — failure mode TBD (capture trace)
 
 ## Test Drive 1
-- [ ] Crashes — capture fault vector / address
+- [x] Works.
 
 ## Borland C IDE
 - [ ] Still throws an exception — identify vector and trigger
@@ -41,5 +41,35 @@
       around CLI/STI virtualization.
 - [ ] Fix: instrument virtual-IF state at every CLI/STI/POPF/IRET site,
       re-run, find where IF=1→0 isn't paired with a 0→1.
-</content>
-</invoke>
+
+## Monkey Island 1 / Indiana Jones IV (Atlantis) — SCUMM
+- [ ] Both hang at startup before the LucasArts logo paints. Same trap
+      point: stuck inside SeaBIOS `wait_irq` (`STI; HLT; CLI; CLD; RETD`
+      at F000:B7C0) reached via `INT 15h` from the game (atlantis's
+      caller is at `1222:0x1c89`).
+- [ ] BIOS time-of-day at `0040:006C` IS advancing (~18 Hz, confirmed by
+      vector_stub_reflect trace), and the BIOS keyboard ring tail
+      advances when keys are pressed — but the game never reads from
+      head, so it isn't waiting on INT 16. Likely AH=86 (Wait us) with
+      a long count, AH=83 (Event Wait), or a per-tick callback that
+      isn't firing the way SCUMM expects.
+- [ ] Diagnosis: hook IVT[0x15] at boot via a CD-31 + JMP FAR stub so
+      we see the entry AX/CX/DX of every INT 15h call (we don't trap
+      these otherwise — IVT goes through real-mode dispatch).
+
+## Pinball Fantasies
+- [ ] Doesn't boot. INTRO.PRG loads, sets mode 13h, never paints the
+      LucasArts/intro logo. Spends ~80 % of runtime in a tight VSYNC-
+      counter loop at `3E93:1BC8` (`linesync` macro from INTRO.ASM line
+      3342, followed by `INC BX; JNZ outer; CLI`). The outer loop wraps
+      a full 0x10000 INC BX iterations.
+- [ ] Loop progresses (BX values change between F12 dumps: 2871, 815E,
+      E05C, 2FF8…) so the inner spin DOES exit, but the game stays in
+      this routine — likely an outer animation/wait loop calling it
+      many times waiting on something else.
+- [ ] Source from historicalsource/pinballfantasies confirms the
+      pattern; file containing the outer-loop call site isn't in the
+      open-source drop (probably a sound/mod-player .OBJ linked in).
+- [ ] Diagnosis: capture more of the surrounding code (extend prof
+      F12 dump to a full instruction window) or single-step the outer
+      loop after the inner exits to find what condition it's polling.
