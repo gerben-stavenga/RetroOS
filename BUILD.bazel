@@ -207,13 +207,16 @@ genrule(
         ":fs_tar_proprietary",
         "freedos/quake/CWSDPMI.EXE",
         "freedos/ctmouse/CTMOUSE.EXE",
+        "freedos/hx/HDPMI16.EXE",
+        "freedos/hx/HDPMI32.EXE",
+        "freedos/hx/SETUPBC.BAT",
     ],
     outs = ["freedos_apps.img"],
     cmd = """
         IMG="$$(pwd)/$@"
-        # Create 256MB FAT16 superfloppy
-        dd if=/dev/zero of="$$IMG" bs=1M count=256 status=none
-        mformat -i "$$IMG" -c 8 -h 16 -s 63 -T $$((256 * 2048)) ::
+        # 1GB FAT16 superfloppy: BORLANDC + games push past 256MB.
+        dd if=/dev/zero of="$$IMG" bs=1M count=1024 status=none
+        mformat -i "$$IMG" -c 32 -h 16 -s 63 -T $$((1024 * 2048)) ::
 
         # Extract TAR and copy files to FAT image
         TMPDIR=$$(mktemp -d)
@@ -252,6 +255,18 @@ genrule(
         # launching mouse-aware games (e.g. Indy: Fate of Atlantis) to
         # install an INT 33h handler.
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/ctmouse/CTMOUSE.EXE" "::CTMOUSE.EXE"
+
+        # Japheth HX HDPMI16/HDPMI32 — open-source 16/32-bit DPMI hosts at
+        # D:\\HDPMI16.EXE / D:\\HDPMI32.EXE. Load `HDPMI16` (TSR) before
+        # BCC.EXE so BCC's runtime sees an existing DPMI host via INT 2F
+        # AX=1687h instead of installing its own DPMI16BI.OVL — useful
+        # for diagnosing whether a BCC behavior is host-side (DPMI16BI
+        # quirk) or BCC-side (would reproduce under HDPMI16 too).
+        mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI16.EXE" "::HDPMI16.EXE"
+        mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI32.EXE" "::HDPMI32.EXE"
+        # SETUPBC.BAT — sets PATH/INCLUDE/LIB for BCC on D: (FreeDOS).
+        # Run `D:\\SETUPBC` once after booting to make BCC find its headers.
+        mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/SETUPBC.BAT" "::SETUPBC.BAT"
     """,
 )
 

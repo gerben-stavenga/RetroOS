@@ -146,10 +146,15 @@ pub fn startup() -> ! {
     // tar. DN's EXEC of "COMMAND.COM /C ..." then picks up the freshly-
     // built one. With TC absent (empty apps/tc/), the tar's pre-built
     // COMMAND.COM is what runs.
-    let tcc_path: &[u8] = if has_ext4 { b"tar/TC/TCC.EXE" } else { b"TC/TCC.EXE" };
-    if crate::kernel::exec::load_file_resolved(tcc_path).is_ok() {
-        println!("Building COMMAND.COM from SRC\\COMMAND.C via TC...");
-        run_dos_program(tcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
+    let bcc_path: &[u8] = if has_ext4 { b"tar/BORLANDC/BIN/BCC.EXE" } else { b"BORLANDC/BIN/BCC.EXE" };
+    if crate::kernel::exec::load_file_resolved(bcc_path).is_ok() {
+        // BCC compiles, then EXECs TLINK from the PATH. The TLINK that
+        // works in our DPMI host is the old TC 2.01 one (apps/tc/TLINK.EXE,
+        // 21KB) — newer TLINK 5.x (TC 3.0 / BORLANDC) trip a startup-time
+        // #UD inside their C runtime that we haven't isolated yet.
+        // PATH=C:\;C:\TC routes BCC's PATH search to the working binary.
+        println!("Building COMMAND.COM from SRC\\COMMAND.C via BCC + TC TLINK...");
+        run_dos_program(bcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
         println!("Build done.");
     }
 
