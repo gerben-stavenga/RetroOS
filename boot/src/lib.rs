@@ -9,6 +9,13 @@
 use core::panic::PanicInfo;
 use lib::{elf::Elf, md5, println, tar::TarHeader, vga};
 
+/// Verify the MD5 of the loaded kernel against `kernel.elf.md5` in the TAR
+/// before jumping to it. Useful when iterating on the bootloader itself, to
+/// rule out the suspicion of a stale/corrupted kernel image; the MD5 hash
+/// over ~1 MB takes a couple of seconds under QEMU TCG so it's off in the
+/// normal build. Flip to `true` when developing the bootloader.
+const VERIFY_MD5: bool = false;
+
 /// Low memory buffer for BIOS disk reads (must be below 640KB)
 /// Placed at 320KB to avoid bootloader which is at 0x7C00-~0x40000
 const LOW_BUFFER: usize = 0x50000;
@@ -296,27 +303,30 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         *(partition_1_lba as *const u32)
     };
 
-    // Find MD5 checksum file
-    let md5_path = b"kernel.elf.md5";
-    let (md5_lba, md5_size) = match tar_find_file(drive, fs_lba, md5_path) {
-        Some(result) => result,
-        None => {
-            println!("Error: kernel.elf.md5 not found");
+    // Find MD5 checksum file (only consulted when VERIFY_MD5 is on).
+    let expected_md5: [u8; 16] = if VERIFY_MD5 {
+        let md5_path = b"kernel.elf.md5";
+        let (md5_lba, md5_size) = match tar_find_file(drive, fs_lba, md5_path) {
+            Some(result) => result,
+            None => {
+                println!("Error: kernel.elf.md5 not found");
+                halt();
+            }
+        };
+        if md5_size != 16 {
+            println!("Error: invalid md5 file size");
             halt();
         }
+        // Need a 512-byte buffer since TAR reads full blocks.
+        let mut md5_block = [0u8; 512];
+        if !tar_read_file(drive, md5_lba, md5_block.as_mut_ptr(), 16) {
+            println!("Error: failed to read md5 file");
+            halt();
+        }
+        md5_block[..16].try_into().unwrap()
+    } else {
+        [0u8; 16]
     };
-    if md5_size != 16 {
-        println!("Error: invalid md5 file size");
-        halt();
-    }
-
-    // Read expected MD5 (need 512-byte buffer since TAR reads full blocks)
-    let mut md5_block = [0u8; 512];
-    if !tar_read_file(drive, md5_lba, md5_block.as_mut_ptr(), 16) {
-        println!("Error: failed to read md5 file");
-        halt();
-    }
-    let expected_md5: [u8; 16] = md5_block[..16].try_into().unwrap();
 
     // Find kernel ELF
     let kernel_path = b"kernel.elf";
@@ -354,17 +364,17 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         offset += chunk;
     }
 
-    // Verify MD5 from high memory copy
     let elf_slice = unsafe { core::slice::from_raw_parts(high_buf, kernel_size) };
 
-    let mut computed_md5 = [0u8; 16];
-    md5::compute(elf_slice, &mut computed_md5);
-
-    if expected_md5 != computed_md5 {
-        println!("Error: kernel MD5 mismatch!");
-        halt();
+    if VERIFY_MD5 {
+        let mut computed_md5 = [0u8; 16];
+        md5::compute(elf_slice, &mut computed_md5);
+        if expected_md5 != computed_md5 {
+            println!("Error: kernel MD5 mismatch!");
+            halt();
+        }
+        println!("MD5 verified");
     }
-    println!("MD5 verified");
 
     // Parse ELF from high memory
     let elf = match Elf::parse(elf_slice) {
