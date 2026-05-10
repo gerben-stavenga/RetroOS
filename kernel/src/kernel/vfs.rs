@@ -117,6 +117,22 @@ fn ram_files() -> &'static mut BTreeMap<Vec<u8>, Vec<u8>> {
     unsafe { RAM_FILES.get_or_insert_with(BTreeMap::new) }
 }
 
+/// Path-keyed vnode cache. Sits in front of `fs.open()` so repeated opens
+/// of the same path skip the underlying filesystem walk entirely (matters
+/// most for ext4 where each open re-reads the inode chain + file content).
+///
+/// Caches the (mount_idx, Vnode) returned by `fs.open`. Multiple FILE_TABLE
+/// entries can share the same vnode handle -- the FS sees parallel reads at
+/// different offsets, which is fine for read-only mounts. RAM overlay
+/// shadows the cache (overlay is checked first in `open_to_handle`), so
+/// writes/creates don't need to invalidate this layer.
+static mut PATH_CACHE: Option<BTreeMap<Vec<u8>, (u8, Vnode)>> = None;
+
+#[allow(static_mut_refs)]
+fn path_cache() -> &'static mut BTreeMap<Vec<u8>, (u8, Vnode)> {
+    unsafe { PATH_CACHE.get_or_insert_with(BTreeMap::new) }
+}
+
 /// Find the mount whose prefix matches `path`, returning (mount_index, fs, path-after-prefix).
 /// Longest prefix wins. A path equal to a mount prefix sans trailing `/`
 /// (e.g. `"host"` for mount `"host/"`) resolves to that mount's root.
@@ -497,11 +513,30 @@ pub fn open_to_handle(path: &[u8]) -> i32 {
         return table_idx as i32;
     }
 
+    // Path cache: skip fs.open if we've already resolved this path. The
+    // cached vnode's FS-internal handle is shared across FILE_TABLE entries;
+    // each FILE_TABLE entry still has its own offset.
+    if let Some(&(midx, vnode)) = path_cache().get(path) {
+        let table_idx = match alloc_file_entry() {
+            Some(i) => i,
+            None => return -24,
+        };
+        unsafe {
+            FILE_TABLE[table_idx] = FileEntry {
+                vnode, offset: 0, refcount: 1, mount_idx: midx,
+                ram_key: [0; PATH_KEY_MAX], ram_key_len: 0,
+            };
+        }
+        return table_idx as i32;
+    }
+
     let (midx, fs, subpath) = resolve_mount(path);
     let vnode = match fs.open(subpath) {
         Some(v) => v,
         None => return -2,
     };
+
+    path_cache().insert(path.to_vec(), (midx, vnode));
 
     let table_idx = match alloc_file_entry() {
         Some(i) => i,

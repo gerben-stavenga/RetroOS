@@ -1,0 +1,7 @@
+# RetroOS boot config -- read by the kernel before the first DOS program
+# runs. Each non-comment line is KEY=VALUE; lines override or extend the
+# kernel's built-in master env (PATH only). Edit freely -- this file
+# lives on the ext4 root (read/write).
+
+COMSPEC=C:\COMMAND.COM
+PATH=C:\;C:\BOOT\TC

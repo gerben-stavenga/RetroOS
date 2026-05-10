@@ -79,6 +79,12 @@ pub fn startup() -> ! {
 
     crate::kernel::stacktrace::init_from_tar();
 
+    // /CONFIG.SYS provides the master env handed to DN and any user-driven
+    // launches. KEY=VALUE lines, `#` comments. Missing is fine -- yields an
+    // empty env; the boot self-build below uses its own self-contained env.
+    let config = crate::kernel::exec::load_file_resolved(b"CONFIG.SYS").unwrap_or_default();
+    let master_env = crate::kernel::dos::parse_config_env(&config);
+
     // Allocate console stdin pipe (keyboard → Linux stdin). The kernel
     // itself is the writer (via process_key during the event loop drain),
     // so register a phantom writer permanently — without it, has_writers
@@ -121,7 +127,7 @@ pub fn startup() -> ! {
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            run_dos_program(path, tail, cwd);
+            run_dos_program(path, tail, cwd, &master_env);
         }
         println!("All commands done — shutting down.");
         crate::arch::shutdown();
@@ -136,7 +142,14 @@ pub fn startup() -> ! {
     // self-build chain is publicly redistributable.
     if crate::kernel::exec::load_file_resolved(b"boot/TC/TCC.EXE").is_ok() {
         println!("Building COMMAND.COM from BOOT\\SRC\\COMMAND.C via TC...");
-        run_dos_program(b"boot/TC/TCC.EXE", b"-mt -lt BOOT\\SRC\\COMMAND.C", b"");
+        // Self-contained env: only PATH so TCC can find TLINK. Bypasses
+        // CONFIG.SYS so the build is hermetic w.r.t. user config.
+        run_dos_program(
+            b"boot/TC/TCC.EXE",
+            b"-mt -lt BOOT\\SRC\\COMMAND.C",
+            b"",
+            b"PATH=C:\\BOOT\\TC\0\0",
+        );
         println!("Build done.");
     }
 
@@ -144,7 +157,7 @@ pub fn startup() -> ! {
 
     println!("Starting DN...");
     loop {
-        run_dos_program(b"boot/DN/DN.COM", b"", b"");
+        run_dos_program(b"boot/DN/DN.COM", b"", b"", &master_env);
         println!("DN exited, restarting...");
     }
 }
@@ -152,11 +165,15 @@ pub fn startup() -> ! {
 /// Load a DOS program (.COM or MZ .EXE) into a fresh VM86 thread and run the
 /// event loop until it exits. `cmdline_tail` is written to PSP:0080h (without
 /// the length byte or terminator; those are added automatically).
-fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
+fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8]) {
     use crate::kernel::{dos, exec};
 
     let buf = exec::load_file_resolved(path)
         .unwrap_or_else(|_| panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
+    let args = alloc::vec![path.to_vec()];
+    let cmdline_tail = cmdline_tail.to_vec();
+    let cwd = cwd.to_vec();
+    let env = env.to_vec();
 
     // Hand the screen off to the user. From here on, kernel println!/print!
     // go to debugcon only — VGA writes from the kernel would otherwise
@@ -168,7 +185,7 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
 
     set_debug_watch(None);
 
-    let tid = dos::run_init_program(&buf, path, cmdline_tail, cwd);
+    let tid = dos::run_init_program(buf, args, cmdline_tail, cwd, env);
 
     if let Some((addr0, addr1)) = debug_watch_config() {
         set_debug_watch(Some((addr0, addr1)));
@@ -654,11 +671,11 @@ fn handle_fork_exec(
         arch_free_user_pages();
     }
 
-    let prog_arg = alloc::vec::Vec::from(path);
-    let args = alloc::vec![prog_arg];
-    let env_slice = parent_env_snapshot.as_deref();
-    let parent_cwd_slice = &parent_cwd_buf[..parent_cwd_len];
-    if let Err(_) = exec::init_thread(child_tid, &buf, path, &args, cmdtail, env_slice, parent_cwd_slice) {
+    let args = alloc::vec![path.to_vec()];
+    let cmdtail = cmdtail.to_vec();
+    let env = parent_env_snapshot.unwrap_or_default();
+    let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
+    if let Err(_) = exec::init_thread(child_tid, buf, args, cmdtail, env, cwd) {
         let child = thread::get_thread(child_tid).unwrap();
         arch_switch_to(&mut child.kernel.cpu_state, &mut child.kernel.root, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(child_tid, 1);
@@ -679,7 +696,7 @@ fn handle_fork_exec(
         thread::Personality::Linux(lin) => {
             // Inherit cwd from parent. (DOS path seeds DfsState inside
             // init_process_thread_vm86; Linux child stores cwd in LinuxState.)
-            lin.cwd[..parent_cwd_len].copy_from_slice(parent_cwd_slice);
+            lin.cwd[..parent_cwd_len].copy_from_slice(&parent_cwd_buf[..parent_cwd_len]);
             lin.cwd_len = parent_cwd_len;
             let cpipe = thread::console_pipe();
             child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);

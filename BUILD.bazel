@@ -85,6 +85,7 @@ _BOOT_FILES = {
 # monolithic open-source image). Linux-personality binaries, test programs,
 # and busybox.
 _EXTRA_FILES = {
+    "etc/CONFIG.SYS": "CONFIG.SYS",
     "//apps/shell:shell_elf": "shell.elf",
     "//apps/tests/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
     "//apps/tests/stress:stress_elf":       "TESTS/stress.elf",

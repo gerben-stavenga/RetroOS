@@ -14,6 +14,7 @@
 //! to our virtual devices in the `machine` module.
 
 extern crate alloc;
+use alloc::vec::Vec;
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
 /// Lets COMMAND.COM bracket a single exec so the log only captures that
@@ -91,6 +92,7 @@ mod mode_transitions;
 // Re-export so the Linux personality can hold its own console snapshot — DOS
 // machine emulation stays private otherwise.
 pub use machine::VgaState;
+pub use dos::parse_config_env;
 
 // Stub array / slot table / IRQ-stack constants live in `dos.rs` (alongside
 // the INT handlers that own them); the `dpmi` sibling module also reads them
@@ -546,16 +548,17 @@ pub fn handle_event(
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
-pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], cmdtail: &[u8], parent_env_data: Option<&[u8]>, parent_cwd: &[u8]) {
+pub fn exec_dos_into(tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) {
     use crate::kernel::startup;
 
     startup::arch_user_clean();
     startup::arch_map_low_mem();
     dos::setup_ivt();
 
-    // prog_name is VFS-form (from exec fan-out); convert to drive-qualified
+    // args[0] is VFS-form (from exec fan-out); convert to drive-qualified
     // DOS form for the PSP environment suffix. DOS extenders parse that
     // field back, so it must look like "C:\BIN\PROG.EXE".
+    let prog_name = args.first().expect("exec_dos_into: args[0] must be the program path");
     let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
     let dos_len = dfs::vfs_to_dos(prog_name, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
@@ -566,26 +569,23 @@ pub fn exec_dos_into(tid: usize, data: &[u8], is_exe: bool, prog_name: &[u8], cm
     // the upcoming dos_alloc_block calls (env, then program block) carve
     // env_seg = heap_start + 1, psp_seg = env_seg + 0x10 = heap_start + 17.
     let mut new_state = DosState::new();
-    new_state.dfs.init_from_vfs(parent_cwd);
+    new_state.dfs.init_from_vfs(&parent_cwd);
     current.personality = thread::Personality::Dos(new_state);
     let dos_state = current.dos_mut();
     dos_reset_blocks(dos_state, dos::heap_start());
 
-    // Parent: either an env snapshot (with sys's PSP as the segment, since
-    // the actual parent is not in this address space) or just sys.
-    let parent = match parent_env_data {
-        Some(env) => dos::ParentRef { psp_seg: dos::boot_psp_seg(), env },
-        None => dos::boot_parent(),
-    };
-    let loaded = if is_exe && dos::is_mz_exe(data) {
-        dos::load_exe(dos_state, &parent, data, dos_name).expect("Invalid MZ EXE")
+    // Parent: env snapshot with sys's PSP as the segment, since the actual
+    // parent is not in this address space (or doesn't exist, e.g. boot).
+    let parent = dos::boot_parent_with_env(&parent_env_data);
+    let loaded = if is_exe && dos::is_mz_exe(&data) {
+        dos::load_exe(dos_state, &parent, &data, dos_name).expect("Invalid MZ EXE")
     } else {
-        dos::load_com(dos_state, &parent, data, dos_name)
+        dos::load_com(dos_state, &parent, &data, dos_name)
     };
     crate::dbg_println!("exec_dos_into tid={} psp_seg={:04X} cmdtail.len={} cmdtail={:?}",
         tid, loaded.psp_seg, cmdtail.len(),
-        core::str::from_utf8(cmdtail).unwrap_or("<non-utf8>"));
-    dos::Psp::at(loaded.psp_seg).set_cmdline(cmdtail);
+        core::str::from_utf8(&cmdtail).unwrap_or("<non-utf8>"));
+    dos::Psp::at(loaded.psp_seg).set_cmdline(&cmdtail);
 
     let psp_seg = loaded.psp_seg;
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
@@ -618,7 +618,7 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
 /// Set up the initial DOS thread for a fresh program load (no parent).
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
-pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) -> usize {
+pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
     use crate::kernel::startup;
 
     let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
@@ -629,20 +629,21 @@ pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]
     dos::setup_ivt();
 
     let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
+    let path = args.first().expect("run_init_program: args[0] must be the program path");
     let dos_len = dfs::vfs_to_dos(path, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
 
     let mut new_state = DosState::new();
-    new_state.dfs.init_from_vfs(cwd);
+    new_state.dfs.init_from_vfs(&cwd);
     t.personality = thread::Personality::Dos(new_state);
     let dos_state = t.dos_mut();
     dos_reset_blocks(dos_state, dos::heap_start());
 
-    let parent = dos::boot_parent();
-    let loaded = if dos::is_mz_exe(buf) {
-        dos::load_exe(dos_state, &parent, buf, dos_name).expect("load_exe failed")
+    let parent = dos::boot_parent_with_env(&env);
+    let loaded = if dos::is_mz_exe(&buf) {
+        dos::load_exe(dos_state, &parent, &buf, dos_name).expect("load_exe failed")
     } else {
-        dos::load_com(dos_state, &parent, buf, dos_name)
+        dos::load_com(dos_state, &parent, &buf, dos_name)
     };
 
     let psp_seg = loaded.psp_seg;
@@ -652,7 +653,7 @@ pub fn run_init_program(buf: &[u8], path: &[u8], cmdline_tail: &[u8], cwd: &[u8]
     let dos_state = t.dos_mut();
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
 
-    dos::Psp::at(loaded.psp_seg).set_cmdline(cmdline_tail);
+    dos::Psp::at(loaded.psp_seg).set_cmdline(&cmdline_tail);
 
     let (col, row) = vga::vga().cursor_pos();
     unsafe {

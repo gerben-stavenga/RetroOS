@@ -67,21 +67,29 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 /// Initialize a thread from a loaded binary. Detects format and fans out
 /// to the right personality for thread setup.
 ///
+/// **Ownership note**: every byte-buffer parameter is taken by value
+/// (`Vec<u8>`), not by reference. Internally we tear down and rebuild the
+/// caller's address space, so a `&[u8]` borrowing user memory would dangle.
+/// Owning Vecs makes that bug impossible to express -- the caller must hand
+/// us kernel-heap data.
+///
 /// - **ELF**: caller must have already cleaned the address space.
 /// - **DOS**: address space setup (clean + low mem + IVT) is handled internally.
-/// - `args` is used for ELF argv; ignored for DOS.
-/// - `parent_env_data` is the parent DOS env snapshot (DOS-only path); pass
-///   None for initial loads or non-DOS execs.
+/// - `args[0]` is the program path (load source + argv[0]). Subsequent
+///   entries are extra argv for ELF; ignored for DOS.
+/// - `parent_env_data` is the parent DOS env snapshot (DOS-only path);
+///   pass `Vec::new()` for non-DOS execs or initial loads with no parent.
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
-pub fn init_thread(tid: usize, data: &[u8], path: &[u8], args: &[Vec<u8>], cmdtail: &[u8], parent_env_data: Option<&[u8]>, parent_cwd: &[u8]) -> Result<(), i32> {
-    match detect_format(data, path) {
+pub fn init_thread(tid: usize, data: Vec<u8>, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) -> Result<(), i32> {
+    let path = args.first().expect("init_thread: args must contain program path as args[0]");
+    match detect_format(&data, path) {
         BinaryFormat::Elf => {
-            crate::kernel::linux::exec_elf_into(tid, data, args)
+            crate::kernel::linux::exec_elf_into(tid, &data, &args)
         }
         fmt => {
             let is_exe = matches!(fmt, BinaryFormat::MzExe);
-            crate::kernel::dos::exec_dos_into(tid, data, is_exe, path, cmdtail, parent_env_data, parent_cwd);
+            crate::kernel::dos::exec_dos_into(tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd);
             Ok(())
         }
     }

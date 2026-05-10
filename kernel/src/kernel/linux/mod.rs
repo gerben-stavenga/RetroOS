@@ -842,9 +842,14 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
         raw_path
     };
 
-    // Read argv from caller's address space before we free it
+    // Read argv from caller's address space before we free it. argv[0] is
+    // forced to `path` so init_thread (which uses args[0] for both load
+    // reference and argv[0]) sees a consistent value. POSIX permits an
+    // argv[0] that differs from the loaded path -- we don't honor that.
     let wide = regs.mode() == crate::UserMode::Mode64;
-    let args = read_c_argv(argv_ptr, wide);
+    let mut args = read_c_argv(argv_ptr, wide);
+    if args.is_empty() { args.push(alloc::vec::Vec::new()); }
+    args[0] = path.to_vec();
 
     // Snapshot cwd up front — execve preserves it across the address-space
     // teardown, but `linux` borrows from the thread we're about to clobber.
@@ -867,7 +872,7 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
         startup::arch_user_clean();
     }
 
-    if let Err(_) = exec::init_thread(tid, &buffer, path, &args, b"", None, &cwd_snapshot) {
+    if let Err(_) = exec::init_thread(tid, buffer, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
         return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, -ENOEXEC)) };
     }
 
