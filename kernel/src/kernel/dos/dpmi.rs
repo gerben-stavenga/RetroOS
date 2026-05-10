@@ -62,7 +62,7 @@ pub const CLIENT_SS_LDT_IDX: usize = 19;
 /// Maximum DPMI memory blocks
 const MAX_MEM_BLOCKS: usize = 256;
 /// Base address for DPMI linear memory allocations
-const MEM_BASE: u32 = 0x0050_0000;
+pub(super) const MEM_BASE: u32 = 0x0050_0000;
 
 /// Maximum number of real-mode callbacks (INT 31h/0303h)
 const MAX_CALLBACKS: usize = 16;
@@ -416,16 +416,16 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // Pop the return address so we know where to resume in PM.
     let ret_ip = machine::vm86_pop(regs);
     let ret_cs = machine::vm86_pop(regs);
-    dos_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X}",
-        client_type, if client_type != 0 { 32 } else { 16 },
-        ret_cs, ret_ip, dos.current_psp);
-
     let real_ss = regs.stack_seg();
     let real_sp = regs.sp32() as u16;
+    dos_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X} rm_ss:sp={:04X}:{:04X} ds={:04X} es={:04X}",
+        client_type, if client_type != 0 { 32 } else { 16 },
+        ret_cs, ret_ip, dos.current_psp, real_ss, real_sp, regs.ds as u16, regs.es as u16);
     let entry_rm_state = capture_real_mode_state(regs, ret_cs, ret_ip, real_ss, real_sp);
 
     // Allocate DPMI state
     let mut dpmi = DpmiState::new();
+    dpmi.mem_next = dos.dpmi_mem_next;
     dpmi.client_use32 = client_type != 0;
     dpmi.raw_rm_state = entry_rm_state;
     // 16-bit DPMI clients (Borland) issue INT 21 directly from PM with
@@ -479,6 +479,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // treat the first 0501 base as a slab origin and takes a private code path
     // when it is not MB-aligned (matches CWSDPMI's VADDR_START=0x400000).
     dpmi.mem_next = (dpmi.mem_next + 0xFFFFF) & !0xFFFFF;
+    dos.dpmi_mem_next = dpmi.mem_next;
 
     // pm_vectors stays zero-initialized: sel=0 means "no client handler",
     // which signals reflect-to-real-mode in deliver_pm_int. INT 31h/0204h
@@ -528,6 +529,9 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     regs.es = PSP_SEL as u64;
     regs.fs = 0;
     regs.gs = 0;
+    dos_trace!("[DPMI] ENTER -> pm cs:eip={:04X}:{:08X} ss:esp={:04X}:{:08X} ds={:04X} es={:04X}",
+        regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(),
+        regs.ds as u16, regs.es as u16);
 }
 
 // PM #GP monitor lives in `arch/monitor.rs`. The arch decoder handles
@@ -908,6 +912,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             let exc = regs.rbx as u8;
             if (exc as usize) < 15 {
                 dpmi.exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
+                dos_trace!("[DPMI] 0203 set exception {:02X} = {:04X}:{:08X}",
+                    exc, regs.rcx as u16, regs.rdx as u32);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -1033,6 +1039,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             let aligned = (size + 0xFFF) & !0xFFF;
             let base = dpmi.mem_next;
             dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
+            dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
             // Keep the DPMI 0.9 handle equal to the base address. Several
             // extenders assume this CWSDPMI-compatible handle shape.
             let handle = base;
@@ -1087,6 +1094,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                         if end > dpmi.mem_next {
                             dpmi.mem_next = end;
                         }
+                        dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
                         blk.size = aligned;
                         base = blk.base;
                         found = true;
@@ -1188,6 +1196,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             // Allocate virtual range from DPMI linear memory pool
             let base = dpmi.mem_next;
             dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
+            dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
             // Map physical pages at the allocated virtual address via ring-0 arch call
             let num_pages = aligned as usize / 4096;
             let vpage_start = base as usize / 4096;
@@ -1805,6 +1814,10 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         // faulting instruction would just re-execute and refault, producing
         // an infinite loop. Terminate the client instead.
         if matches!(exc_num, 0 | 3 | 4) {
+            let ivt_off = machine::read_u16(0, exc_num * 4);
+            let ivt_seg = machine::read_u16(0, exc_num * 4 + 2);
+            dos_trace!("[DPMI] reflect exception {} to IVT {:04X}:{:04X} from {:04X}:{:08X} flags={:04X}",
+                exc_num, ivt_seg, ivt_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
             // Plant an iret-frame on the user's stack pointing at the
             // faulting CS:EIP so that `rm_iret`'s synth-iret tail (after
             // BIOS returns) lands the user back at the faulting
@@ -1821,6 +1834,9 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         startup::arch_dump_exception(dos, regs);
         return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
     }
+
+    dos_trace!("[DPMI] dispatch exception {} to {:04X}:{:08X} from {:04X}:{:08X} flags={:04X}",
+        exc_num, handler_sel, handler_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
 
     let use32 = dpmi.client_use32;
     let stub_off = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET) as u32;

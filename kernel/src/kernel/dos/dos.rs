@@ -39,6 +39,8 @@ const NULL_FILE_HANDLE: u16 = 99;
 const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer for .COM (top of PSP's 64KB segment)
 const COM_SP: u16 = 0xFFFE;
+const EXEC_SAVED_IVT_VECTORS: [u8; 12] =
+    [0x13, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67, 0x74];
 
 fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
     if let Some(ch) = dos.dos_pending_char.take() {
@@ -656,8 +658,25 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x25: Set interrupt vector (AL=int, DS:DX=handler)
         0x25 => {
             let int_num = regs.rax as u8;
-            let off = regs.rdx as u16;
-            let seg = regs.ds as u16;
+            let (seg, off) = if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                let sel = regs.ds as u16;
+                let off = regs.rdx as u16;
+                let shadow = dos.pm_rm_vector_shadow[int_num as usize];
+                if sel == dpmi::LOW_MEM_SEL && shadow.2 == off {
+                    (shadow.0, shadow.1)
+                } else {
+                    let base = mode_transitions::seg_base(&dos.ldt[..], sel);
+                    let addr = base.wrapping_add(off as u32);
+                    if base <= 0xFFFF0 && (base & 0x0F) == 0 && addr <= 0xFFFFF {
+                        ((base >> 4) as u16, off)
+                    } else {
+                        let linear = addr & 0xFFFFF;
+                        ((linear >> 4) as u16, (linear & 0x0F) as u16)
+                    }
+                }
+            } else {
+                (regs.ds as u16, regs.rdx as u16)
+            };
             write_u16(0, (int_num as u32) * 4, off);
             write_u16(0, (int_num as u32) * 4 + 2, seg);
             thread::KernelAction::Done
@@ -779,12 +798,11 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let off = read_u16(0, (int_num as u32) * 4);
             let seg = read_u16(0, (int_num as u32) * 4 + 2);
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
-                // PM client: return LOW_MEM_SEL:linear so the selector is valid.
                 let linear = ((seg as u32) << 4).wrapping_add(off as u32);
+                dos.pm_rm_vector_shadow[int_num as usize] = (seg, off, (linear & 0xFFFF) as u16);
                 regs.es = dpmi::LOW_MEM_SEL as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | (linear & 0xFFFF) as u64;
             } else {
-                // V86 / real mode: return the raw IVT seg:off pair.
                 regs.es = seg as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | off as u64;
             }
@@ -2397,12 +2415,26 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         &mut dos.ldt_alloc,
         [0u32; super::dpmi::LDT_ENTRIES / 32],
     );
+    let suspended_pm_rm_vector_shadow = core::mem::replace(
+        &mut dos.pm_rm_vector_shadow,
+        [(0, 0, 0); 256],
+    );
+    let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
+    let mut parent_ivt = [(0u8, 0u16, 0u16); 12];
+    for (slot, &int_num) in parent_ivt.iter_mut().zip(EXEC_SAVED_IVT_VECTORS.iter()) {
+        let off = read_u16(0, (int_num as u32) * 4);
+        let seg = read_u16(0, (int_num as u32) * 4 + 2);
+        *slot = (int_num, off, seg);
+        if parent_pm_mode {
+            write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
+            write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
+        }
+    }
     super::dpmi::install_kernel_ldt_slots(dos);
     super::dpmi::reset_pm_vectors(dos);
     // LDTR still points at parent's LDT box (which now lives in ExecParent).
     // Reload so the CPU sees the fresh child LDT if child enters DPMI.
     dos.on_resume();
-    let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
     dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
@@ -2413,10 +2445,12 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         psp: parent_rm_psp,
         dta: parent_dta,
         dos_blocks: parent_blocks,
+        ivt_vectors: parent_ivt,
         dpmi: suspended_dpmi,
         pm_vectors: suspended_pm_vectors,
         ldt: suspended_ldt,
         ldt_alloc: suspended_ldt_alloc,
+        pm_rm_vector_shadow: suspended_pm_rm_vector_shadow,
         pm_dos: suspended_pm_dos,
         pm_mode: parent_pm_mode,
         prev: prev.map(alloc::boxed::Box::new),
@@ -2590,6 +2624,12 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
     dos.dta = parent.dta;
     dos.dos_blocks = parent.dos_blocks;
     super::sync_mcb_chain(dos);
+    if parent.pm_mode && !preserve_pm_env {
+        for &(int_num, off, seg) in parent.ivt_vectors.iter() {
+            write_u16(0, (int_num as u32) * 4, off);
+            write_u16(0, (int_num as u32) * 4 + 2, seg);
+        }
+    }
     // PM-environment handling on exec_return:
     //   - Normal exit (AH=4Ch): drop child's dpmi/ldt/pm_vectors, restore
     //     parent's. Child's PM state vanishes with the process.
@@ -2608,6 +2648,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
         dos.pm_vectors = parent.pm_vectors;
         dos.ldt = parent.ldt;
         dos.ldt_alloc = parent.ldt_alloc;
+        dos.pm_rm_vector_shadow = parent.pm_rm_vector_shadow;
         dos.pm_dos = parent.pm_dos;
     }
     // LDTR currently points at the child's LDT — reload (same box if we
@@ -3016,7 +3057,7 @@ pub(super) const ENV_PARAS: u16 = 32;       // = 512 bytes (DOS5 typical /E:512)
 /// inheritance comes from the actual parent's env block, not from here.
 pub(super) const MASTER_ENV: &[u8] = b"\
 COMSPEC=C:\\COMMAND.COM\0\
-PATH=C:\\;C:\\TC\0\
+PATH=C:\\;C:\\BORLANDC\\BIN;C:\\TC\0\
 INCLUDE=C:\\BORLANDC\\INCLUDE\0\
 LIB=C:\\BORLANDC\\LIB\0\0";
 

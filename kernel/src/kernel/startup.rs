@@ -140,20 +140,17 @@ pub fn startup() -> ! {
         crate::arch::shutdown();
     }
 
-    // Self-build: if Turbo C is on the image, compile SRC\COMMAND.C →
-    // root COMMAND.COM via TC at boot. The output lands in the VFS RAM
+    // Self-build: if Borland C is on the image, compile SRC\COMMAND.C →
+    // root COMMAND.COM via BCC at boot. The output lands in the VFS RAM
     // overlay, shadowing the BC++-built COMMAND.COM that ships in the
     // tar. DN's EXEC of "COMMAND.COM /C ..." then picks up the freshly-
-    // built one. With TC absent (empty apps/tc/), the tar's pre-built
+    // built one. With BCC absent, the tar's pre-built
     // COMMAND.COM is what runs.
     let bcc_path: &[u8] = if has_ext4 { b"tar/BORLANDC/BIN/BCC.EXE" } else { b"BORLANDC/BIN/BCC.EXE" };
     if crate::kernel::exec::load_file_resolved(bcc_path).is_ok() {
-        // BCC compiles, then EXECs TLINK from the PATH. The TLINK that
-        // works in our DPMI host is the old TC 2.01 one (apps/tc/TLINK.EXE,
-        // 21KB) — newer TLINK 5.x (TC 3.0 / BORLANDC) trip a startup-time
-        // #UD inside their C runtime that we haven't isolated yet.
-        // PATH=C:\;C:\TC routes BCC's PATH search to the working binary.
-        println!("Building COMMAND.COM from SRC\\COMMAND.C via BCC + TC TLINK...");
+        // BCC compiles, then EXECs TLINK from PATH. MASTER_ENV prefers
+        // C:\BORLANDC\BIN so this exercises Borland C's DPMI TLINK.
+        println!("Building COMMAND.COM from SRC\\COMMAND.C via BCC + Borland TLINK...");
         run_dos_program(bcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
         println!("Build done.");
     }

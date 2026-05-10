@@ -166,6 +166,16 @@ pub struct DosState {
     pub ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]>,
     pub ldt_alloc: [u32; dpmi::LDT_ENTRIES / 32],
     pub pm_vectors: [(u16, u32); 256],
+    /// Monotonic DPMI linear-memory high-water mark shared across nested
+    /// clients. EXEC suspends the parent's DPMI state, but the child's
+    /// allocations still live in the same linear address space and must not
+    /// overlap the parent's protected-mode stack or heap blocks.
+    pub dpmi_mem_next: u32,
+    /// Exact RM IVT values most recently returned through PM INT 21h/AH=35h.
+    /// PM callers receive LOW_MEM_SEL:linear for addressability, but AH=25h
+    /// must round-trip that value back to the original real seg:off where
+    /// possible because interrupt handlers can depend on their CS:IP shape.
+    pub pm_rm_vector_shadow: [(u16, u16, u16); 256],
 
     pub dpmi: Option<alloc::boxed::Box<dpmi::DpmiState>>,
 
@@ -239,6 +249,8 @@ impl DosState {
             ldt,
             ldt_alloc: [0u32; dpmi::LDT_ENTRIES / 32],
             pm_vectors: [(0, 0); 256],
+            dpmi_mem_next: dpmi::MEM_BASE,
+            pm_rm_vector_shadow: [(0, 0, 0); 256],
             dpmi: None,
             pm_dos: false,
             pending_resume: None,
@@ -301,6 +313,10 @@ pub struct ExecParent {
     pub psp: u16,
     pub dta: u32,
     pub dos_blocks: alloc::vec::Vec<DosMemBlock>,
+    /// Real-mode IVT entries owned by kernel services. PM parents may have
+    /// installed transient hooks into their own address space; the child runs
+    /// with clean kernel stubs and normal exits restore the parent view.
+    pub ivt_vectors: [(u8, u16, u16); 12],
     /// Parent's DPMI state, suspended during child execution. Per DPMI 0.9:
     /// each DPMI client has independent state (LDT, pm_vectors, etc.); a
     /// DPMI parent's state must not be observable to a (non-DPMI) child.
@@ -319,6 +335,7 @@ pub struct ExecParent {
     /// the fresh child-LDT allocation happens in the EXEC fast path.
     pub ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]>,
     pub ldt_alloc: [u32; dpmi::LDT_ENTRIES / 32],
+    pub pm_rm_vector_shadow: [(u16, u16, u16); 256],
     /// Parent's PMDOS routing flag, suspended alongside dpmi/pm_vectors so
     /// the child runs with the default reflect-to-RM INT 21 path.
     pub pm_dos: bool,
@@ -478,11 +495,24 @@ pub fn handle_event(
                     crate::arch::monitor::seg_base(regs.code_seg()).wrapping_add(regs.ip32())
                 };
                 let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                let ss_lin = if is_vm86 {
+                    ((regs.stack_seg() as u32) << 4).wrapping_add(regs.sp32() & 0xFFFF)
+                } else {
+                    crate::arch::monitor::seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
+                };
+                let s0 = unsafe { core::ptr::read_unaligned(ss_lin as *const u16) };
+                let s1 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(2) as *const u16) };
+                let s2 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(4) as *const u16) };
+                let s3 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(6) as *const u16) };
+                let s4 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(8) as *const u16) };
+                let s5 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(10) as *const u16) };
                 let liq = unsafe { mode_transitions::LAST_IRQ };
-                crate::println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} (vm86={}) bytes={:02x?} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
+                crate::println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} psp={:04x} (vm86={}) bytes={:02x?} stack={:04x} {:04x} {:04x} {:04x} {:04x} {:04x} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     n, regs.code_seg(), regs.ip32(),
                     regs.stack_seg(), regs.sp32(),
+                    dos.current_psp,
                     is_vm86, bytes,
+                    s0, s1, s2, s3, s4, s5,
                     liq.0, liq.1, liq.2, liq.3, liq.4, liq.5, liq.6);
                 // DOS termination type 02h (critical error) | low byte = vector.
                 // exit_thread copies this verbatim into parent's
