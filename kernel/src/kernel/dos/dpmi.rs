@@ -622,10 +622,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             if sel & 0x0004 == 0 || idx < 16 || !ldt_is_allocated(&dos.ldt_alloc, idx) {
                 dos_trace!(
                     "[DPMI] 0001 ignoring non-owned/free selector sel={:04X} idx={} caller={:04X}:{:04X}",
-                    sel,
-                    idx,
-                    regs.code_seg(),
-                    regs.ip32() as u16,
+                    sel, idx, regs.code_seg(), regs.ip32() as u16,
                 );
                 clear_carry(regs);
                 return thread::KernelAction::Done;
@@ -1757,6 +1754,58 @@ fn dump_dpmi_fault_context(dos: &thread::DosState, regs: &Regs, exc_num: u32) {
     dump_words("stack BP", bp_addr);
 }
 
+/// FAR-CALL return frame the host pushes below the spec exception
+/// frame. Handler pops it via RETF, landing at our `SLOT_EXCEPTION_RET`
+/// stub which traps to `exception_return` via INT 31h.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RetF32 { ret_eip: u32, ret_cs: u32 }
+
+/// 16-bit RETF return frame (4 bytes).
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RetF16 { ret_ip: u16, ret_cs: u16 }
+
+/// 32-bit DPMI 1.0 exception spec frame. Sits above `RetF32` on the
+/// host stack as its own region, distinct from `ModeSave`. dispatch
+/// writes the whole struct seeded from the pre-fault register state;
+/// exception_return reads it back and copies handler-modified
+/// faulting fields into `ModeSave`. The DPMI 1.0 extension fields
+/// (ds/es/fs/gs/cr2) are seeded with pre-fault values; modifications
+/// are discarded -- the bytes the handler leaves there are
+/// register-spill scratch, not intentional segment values.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ExcFrame32 {
+    err_code: u32,
+    eip:      u32,
+    cs:       u32,
+    eflags:   u32,
+    esp:      u32,
+    ss:       u32,
+    ds:       u32,
+    es:       u32,
+    fs:       u32,
+    gs:       u32,
+    cr2:      u32,
+}
+
+/// 16-bit DPMI 0.9 exception spec frame. Sits above `RetF16` on the
+/// host stack as its own region (u16 fields don't share offsets with
+/// ModeSave's u32 fields). dispatch writes the whole struct;
+/// exception_return reads it back, copies handler-modified faulting
+/// fields into the low halves of ModeSave's u32 fields.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ExcFrame16 {
+    err_code: u16,
+    ip:       u16,
+    cs:       u16,
+    flags:    u16,
+    sp:       u16,
+    ss:       u16,
+}
+
 /// Dispatch a CPU exception to the client's exception handler (set via INT 31h/0203h).
 /// If no handler is set, kill the thread.
 ///
@@ -1842,52 +1891,66 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     let stub_off = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET) as u32;
     let err_code = regs.err_code as u32;
 
-    // Capture faulting u16 view *before* switch_to_pm_side mutates regs;
-    // 16-bit branch needs these to seed the duplicated spec frame.
-    let f_ip    = regs.ip32() as u16;
-    let f_cs    = regs.code_seg();
-    let f_flags = regs.flags32() as u16;
-    let f_sp    = regs.sp32() as u16;
-    let f_ss    = regs.stack_seg();
+    // Capture faulting state *before* switch_to_pm_side mutates regs.
+    let f_eip    = regs.ip32();
+    let f_cs     = regs.code_seg();
+    let f_eflags = regs.flags32();
+    let f_esp    = regs.sp32();
+    let f_ss     = regs.stack_seg();
+    let f_ds     = regs.ds as u16;
+    let f_es     = regs.es as u16;
+    let f_fs     = regs.fs as u16;
+    let f_gs     = regs.gs as u16;
 
     let pm_save_at = super::mode_transitions::switch_to_pm_side(dos, regs);
     let pm_seg_base = super::mode_transitions::seg_base(&dos.ldt[..], pm_save_at.0);
     let new_sp;
 
+    let sel_stub = super::mode_transitions::SPECIAL_STUB_SEL;
     if use32 {
-        // 32-bit: 3-dword prefix [ret_eip, ret_cs, err_code]. ModeSave's
-        // hw-stack-compat layout means its `eip/cs/eflags/esp/ss` fields
-        // land at the exact offsets the spec frame's faulting portion
-        // lives at — no separate copy of faulting state. Handler
-        // modifications land in ModeSave directly; save.restore picks
-        // them up on unwind.
-        let prefix_size = 12u32;
-        new_sp = pm_save_at.1 - prefix_size;
+        // 32-bit: RetF32 + ExcFrame32 (DPMI 1.0 spec frame, separate
+        // region from ModeSave). All faulting state seeded from the
+        // pre-switch capture above so the handler sees the game's
+        // SS/ESP, not our host-stack scratch.
+        let retf = RetF32 { ret_eip: stub_off, ret_cs: sel_stub as u32 };
+        let frame = ExcFrame32 {
+            err_code,
+            eip: f_eip, cs: f_cs as u32, eflags: f_eflags,
+            esp: f_esp, ss: f_ss as u32,
+            ds: f_ds as u32, es: f_es as u32,
+            fs: f_fs as u32, gs: f_gs as u32,
+            cr2: 0,
+        };
+        new_sp = pm_save_at.1
+            - core::mem::size_of::<RetF32>() as u32
+            - core::mem::size_of::<ExcFrame32>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp);
         unsafe {
-            let p = addr as *mut u32;
-            core::ptr::write_unaligned(p,        stub_off);
-            core::ptr::write_unaligned(p.add(1), super::mode_transitions::SPECIAL_STUB_SEL as u32);
-            core::ptr::write_unaligned(p.add(2), err_code);
+            core::ptr::write_unaligned(addr as *mut RetF32, retf);
+            core::ptr::write_unaligned(
+                addr.wrapping_add(core::mem::size_of::<RetF32>() as u32) as *mut ExcFrame32,
+                frame,
+            );
         }
     } else {
-        // 16-bit: spec frame uses u16 fields, can't overlap with our
-        // u32 ModeSave. Lay a separate 16-byte spec frame above
-        // ModeSave; exception_return copies any handler modifications
-        // back into ModeSave's low-16 bits before save.restore.
-        let frame_size = 16u32;
-        new_sp = pm_save_at.1 - frame_size;
+        // 16-bit: u16 fields don't overlap with u32 ModeSave; write
+        // RetF16 + ExcFrame16 as a separate region above ModeSave.
+        let retf = RetF16 { ret_ip: stub_off as u16, ret_cs: sel_stub };
+        let frame = ExcFrame16 {
+            err_code: err_code as u16,
+            ip: f_eip as u16, cs: f_cs, flags: f_eflags as u16,
+            sp: f_esp as u16, ss: f_ss,
+        };
+        new_sp = pm_save_at.1
+            - core::mem::size_of::<RetF16>() as u32
+            - core::mem::size_of::<ExcFrame16>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp);
         unsafe {
-            let p = addr as *mut u16;
-            core::ptr::write_unaligned(p,        stub_off as u16);
-            core::ptr::write_unaligned(p.add(1), super::mode_transitions::SPECIAL_STUB_SEL);
-            core::ptr::write_unaligned(p.add(2), err_code as u16);
-            core::ptr::write_unaligned(p.add(3), f_ip);
-            core::ptr::write_unaligned(p.add(4), f_cs);
-            core::ptr::write_unaligned(p.add(5), f_flags);
-            core::ptr::write_unaligned(p.add(6), f_sp);
-            core::ptr::write_unaligned(p.add(7), f_ss);
+            core::ptr::write_unaligned(addr as *mut RetF16, retf);
+            core::ptr::write_unaligned(
+                addr.wrapping_add(core::mem::size_of::<RetF16>() as u32) as *mut ExcFrame16,
+                frame,
+            );
         }
     }
 
@@ -1930,37 +1993,46 @@ pub(super) fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> t
     let use32 = dpmi.client_use32;
 
     if use32 {
-        // 32-bit overlap: handler RETFed past ret_eip+ret_cs, regs.SS:SP
-        // now points at err_code on host_stack with ModeSave at +4.
-        // Skip err_code and let pop_save read ModeSave at the natural
-        // pm cursor — save.restore picks up any handler modifications
-        // to the overlapping faulting fields.
-        regs.set_sp32(regs.sp32() + 4);
-        let save = super::mode_transitions::pop_save(dos, regs);
+        // Handler may have done its own stack manipulation (locals,
+        // pushes, etc.) and not fully restored ESP before RETF, so
+        // regs.SS:SP at trap entry isn't reliably the spec-frame
+        // address. Instead, locate ExcFrame32 from the *known*
+        // host_stack position it was written to: top of host_stack -
+        // sizeof::<ModeSave>() - sizeof::<ExcFrame32>(). ModeSave is
+        // just above it (at host_stack_top - sizeof::<ModeSave>()).
+        let host_seg = super::mode_transitions::host_stack_pm_seg(dos);
+        let host_base = super::mode_transitions::seg_base(&dos.ldt[..], host_seg);
+        let mode_save_sp = dos::host_stack_empty_sp() - super::mode_transitions::MODE_SAVE_SIZE;
+        let frame_sp = mode_save_sp - core::mem::size_of::<ExcFrame32>() as u32;
+        let frame = unsafe {
+            core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrame32)
+        };
+        let mut save = super::mode_transitions::pop_save_at(&dos.ldt[..], (host_seg, mode_save_sp));
+        save.eip    = frame.eip;
+        save.cs     = frame.cs;
+        save.eflags = frame.eflags;
+        save.esp    = frame.esp;
+        save.ss     = frame.ss;
         save.restore(regs);
         dos.pc.locked_stack.other_stack = save.other_stack();
     } else {
-        // 16-bit duplicated frame: handler RETFed past ret_IP+ret_CS,
-        // regs.SS:SP at err on host_stack with the remaining 12 bytes
-        // of spec frame (err + 5 × u16 faulting fields) above ModeSave.
-        // Read the (possibly modified) u16 faulting fields, advance
-        // past the remainder to ModeSave, patch ModeSave's low-16 bits
-        // with the handler's modifications, then save.restore.
+        // 16-bit: handler RETFed past RetF16 (4 bytes); regs.SS:SP
+        // points at ExcFrame16. Read it, skip past the frame to
+        // reach ModeSave, patch ModeSave's low halves with handler-
+        // modified faulting fields.
         let ss_base = super::mode_transitions::seg_base(&dos.ldt[..], regs.stack_seg());
         let frame_addr = ss_base.wrapping_add(regs.sp32());
-        let (new_ip, new_cs, new_flags, new_sp_lo, new_ss) = unsafe {
-            let p = frame_addr as *const u16;
-            // p[0] is err_code (discarded)
-            (*p.add(1), *p.add(2), *p.add(3), *p.add(4), *p.add(5))
+        let frame = unsafe {
+            core::ptr::read_unaligned(frame_addr as *const ExcFrame16)
         };
-        regs.set_sp32(regs.sp32() + 12);
+        regs.set_sp32(regs.sp32() + core::mem::size_of::<ExcFrame16>() as u32);
         let cursor = (regs.stack_seg(), regs.sp32());
         let mut save = super::mode_transitions::pop_save_at(&dos.ldt[..], cursor);
-        save.eip    = (save.eip    & 0xFFFF_0000) | new_ip    as u32;
-        save.cs     = new_cs as u32;
-        save.eflags = (save.eflags & 0xFFFF_0000) | new_flags as u32;
-        save.esp    = (save.esp    & 0xFFFF_0000) | new_sp_lo as u32;
-        save.ss     = new_ss as u32;
+        save.eip    = (save.eip    & 0xFFFF_0000) | frame.ip    as u32;
+        save.cs     = frame.cs as u32;
+        save.eflags = (save.eflags & 0xFFFF_0000) | frame.flags as u32;
+        save.esp    = (save.esp    & 0xFFFF_0000) | frame.sp    as u32;
+        save.ss     = frame.ss as u32;
         save.restore(regs);
         dos.pc.locked_stack.other_stack = save.other_stack();
     }

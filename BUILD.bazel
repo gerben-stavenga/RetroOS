@@ -56,15 +56,7 @@ _BOOT_FILES = {
     "//boot:bootloader_bin": "A",
     ":kernel_md5": "kernel.elf.md5",
     "//kernel:kernel_elf": "kernel.elf",
-    # CWSDPMI.EXE deliberately omitted from the RetroOS image — RetroOS
-    # provides DPMI natively. The build artifact ships in the FreeDOS apps
-    # disk only (see make_freedos_image.sh).
-    # COMMAND.COM is built at boot by TC compiling SRC/COMMAND.C —
-    # output lands in the VFS RAM overlay at /COMMAND.COM. No prebuilt
-    # binary in the tar.
     "//apps-boot/command:command.c":     "SRC/COMMAND.C",
-    "//apps-boot/command:LOADFIX.CFG":   "LOADFIX.CFG",
-    "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
     "apps-boot/dn/DN.COM": "DN/DN.COM",
     "apps-boot/dn/DN.PRG": "DN/DN.PRG",
     "apps-boot/dn/DN.OVR": "DN/DN.OVR",
@@ -86,6 +78,8 @@ _BOOT_FILES = {
 # and busybox.
 _EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
+    "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
+    "//apps-boot/command:LOADFIX.CFG": "LOADFIX.CFG",
     "//apps/shell:shell_elf": "shell.elf",
     "//apps/tests/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
     "//apps/tests/stress:stress_elf":       "TESTS/stress.elf",
@@ -96,6 +90,8 @@ _EXTRA_FILES = {
     "//apps/tests/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//apps/tests/hello32_linux:hello32_linux": "TESTS/HI.ELF",
     "//apps/tests/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
+    # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
+    "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).
     # Standalone-shell mode dispatches applets via basename(argv[0]); the
     # binary's compiled-in re-exec path is /bin/busybox, hence the location.

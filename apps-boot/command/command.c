@@ -425,8 +425,25 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
     if (flags & LF_F_DOS32A) {
         /* Spawn DOS/32A.EXE with prog + args as its tail. DOS/32A loads
          * the target itself and provides a stricter DPMI 0.9 environment
-         * than DOS/4GW's embedded one. */
-        prog_idx--;   /* shift back to overwrite caller's argv[prog_idx-1] with DOS/32A.EXE */ 
+         * than DOS/4GW's embedded one.
+         *
+         * Pass the full drive-qualified path: DOS/32A relays it as
+         * argv[0] to the wrapped program, and DOS/4GW games (Dark
+         * Forces, Hexen, Duke3D) parse argv[0] to find their install
+         * dir. With just a basename they fall back to drive root and
+         * fail to find data files (LOCAL.MSG, *.GOB, ...). */
+        static char fullpath[80];
+        if (!strchr(resolved, '\\') && !strchr(resolved, ':')) {
+            char dir[80];
+            if (getcwd(dir, sizeof(dir)) != 0) {
+                /* getcwd returns "DRIVE:\path" or "DRIVE:\" at root. */
+                size_t dlen = strlen(dir);
+                int needs_sep = dlen == 0 || dir[dlen - 1] != '\\';
+                sprintf(fullpath, "%s%s%s", dir, needs_sep ? "\\" : "", resolved);
+                argv[prog_idx] = fullpath;
+            }
+        }
+        prog_idx--;   /* shift back to overwrite caller's argv[prog_idx-1] with DOS/32A.EXE */
         argv[prog_idx] = "C:\\DOS32A.EXE";
     } else if (flags & LF_F_LOADFIX) {
         /* Re-fork COMMAND.COM with cmdline "/L prog [args]". The trampoline

@@ -4,4 +4,4 @@
 # lives on the ext4 root (read/write).
 
 COMSPEC=C:\COMMAND.COM
-PATH=C:\;C:\BOOT\TC
+PATH=C:\;C:\BORLANDC\BIN
