@@ -181,32 +181,76 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
     // not gated by this flag and continue to work for text-mode programs.
     crate::vga::KERNEL_OWNS_SCREEN.store(false, core::sync::atomic::Ordering::Relaxed);
 
-    let watch_bc = path.ends_with(b"BORLANDC/BIN/BC.EXE");
-    if !watch_bc {
-        unsafe {
-            core::arch::asm!(
-                "int 0x80",
-                in("eax") crate::arch::arch_call::SET_DEBUG_WATCH as u32,
-                in("ebx") 0u32,
-            );
-        }
-    }
+    set_debug_watch(None);
 
     let tid = dos::run_init_program(&buf, path, cmdline_tail, cwd);
 
-    if watch_bc {
-        unsafe {
-            core::arch::asm!(
-                "int 0x80",
-                in("eax") crate::arch::arch_call::SET_DEBUG_WATCH as u32,
-                in("ebx") 1u32,
-                in("edx") 0x0054_1A3Au32,
-                in("ecx") 0x0054_1A4Cu32,
-            );
+    if let Some((addr0, addr1)) = debug_watch_config() {
+        set_debug_watch(Some((addr0, addr1)));
+        if addr1 != 0 {
+            crate::dbg_println!("[WATCH] armed write watchpoints at {:08X} and {:08X}", addr0, addr1);
+        } else {
+            crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
-        crate::dbg_println!("[BCWATCH] armed write watchpoints at 00541A3A and 00541A4C");
     }
     event_loop(tid);
+}
+
+fn set_debug_watch(addrs: Option<(u32, u32)>) {
+    let (count, addr0, addr1) = match addrs {
+        Some((addr0, addr1)) if addr1 != 0 => (2u32, addr0, addr1),
+        Some((addr0, _)) => (1u32, addr0, 0),
+        None => (0u32, 0, 0),
+    };
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::arch_call::SET_DEBUG_WATCH as u32,
+            in("ebx") count,
+            in("edx") addr0,
+            in("ecx") addr1,
+        );
+    }
+}
+
+fn debug_watch_config() -> Option<(u32, u32)> {
+    let mut buf = [0u8; 64];
+    let raw = fw_cfg_read(b"opt/debug-watch", &mut buf)?;
+    let raw = trim_ascii(raw);
+    if raw.is_empty() {
+        return None;
+    }
+
+    let split = raw.iter().position(|&b| b == b',' || b == b' ' || b == b';');
+    let addr0 = parse_u32(raw.get(..split.unwrap_or(raw.len()))?)?;
+    let addr1 = match split {
+        Some(idx) => parse_u32(trim_ascii(&raw[idx + 1..])).unwrap_or(0),
+        None => 0,
+    };
+    Some((addr0, addr1))
+}
+
+fn parse_u32(mut s: &[u8]) -> Option<u32> {
+    s = trim_ascii(s);
+    if s.starts_with(b"0x") || s.starts_with(b"0X") {
+        s = &s[2..];
+    }
+    if s.is_empty() {
+        return None;
+    }
+
+    let mut value = 0u32;
+    for &b in s {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a' + 10) as u32,
+            b'A'..=b'F' => (b - b'A' + 10) as u32,
+            b'_' => continue,
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(digit)?;
+    }
+    Some(value)
 }
 
 const ASSERT_ADDR_HASH: bool = false;

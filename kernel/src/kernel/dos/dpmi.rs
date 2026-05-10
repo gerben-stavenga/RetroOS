@@ -280,10 +280,12 @@ fn build_descriptor(base: u32, limit: u32, access: u64, flags: u64) -> u64 {
     desc
 }
 
-fn trace_borland_desc(label: &str, sel: u16, desc: u64) {
-    if matches!(sel, 0x00BF | 0x0397 | 0x0587 | 0x0BB7 | 0x0C17 | 0x0C37) {
+const TRACE_DPMI_SELECTORS: &[u16] = &[];
+
+fn trace_dpmi_desc(label: &str, sel: u16, desc: u64) {
+    if TRACE_DPMI_SELECTORS.contains(&sel) {
         crate::println!(
-            "BC desc {} sel={:04X} base={:08X} limit={:08X} raw={:016X}",
+            "[DPMI-DESC] {} sel={:04X} base={:08X} limit={:08X} raw={:016X}",
             label,
             sel,
             DpmiState::desc_base(desc),
@@ -598,7 +600,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 Some(idx) => {
                     for extra in idx..(idx + count) {
                         dos.ldt[extra] = DpmiState::make_data_desc_ex(0, 0, use32);
-                        trace_borland_desc("0000 alloc", DpmiState::idx_to_sel(extra), dos.ldt[extra]);
+                        trace_dpmi_desc("0000 alloc", DpmiState::idx_to_sel(extra), dos.ldt[extra]);
                     }
                     let sel = DpmiState::idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
@@ -686,7 +688,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             if idx < LDT_ENTRIES {
                 let base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 DpmiState::set_desc_base(&mut dos.ldt[idx], base);
-                trace_borland_desc("0007 base", sel, dos.ldt[idx]);
+                trace_dpmi_desc("0007 base", sel, dos.ldt[idx]);
                 dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
                 clear_carry(regs);
             } else {
@@ -701,7 +703,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             if idx < LDT_ENTRIES {
                 let limit = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 DpmiState::set_desc_limit(&mut dos.ldt[idx], limit);
-                trace_borland_desc("0008 limit", sel, dos.ldt[idx]);
+                trace_dpmi_desc("0008 limit", sel, dos.ldt[idx]);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -720,7 +722,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 dos.ldt[idx] &= !0x00F0_FF00_0000_0000;
                 dos.ldt[idx] |= ((0x10 | cl) as u64) << 40;
                 dos.ldt[idx] |= ((ch & 0xD0) as u64) << 48;
-                trace_borland_desc("0009 rights", sel, dos.ldt[idx]);
+                trace_dpmi_desc("0009 rights", sel, dos.ldt[idx]);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -740,7 +742,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                     desc |= 1u64 << 41;    // set writable
                     dos.ldt[new_idx] = desc;
                     let new_sel = DpmiState::idx_to_sel(new_idx);
-                    trace_borland_desc("000A alias", new_sel, desc);
+                    trace_dpmi_desc("000A alias", new_sel, desc);
                     regs.rax = (regs.rax & !0xFFFF) | new_sel as u64;
                     dos_trace!("[DPMI] 000A alias src_sel={:04X} -> new_sel={:04X} base={:08X}",
                         sel, new_sel, DpmiState::desc_base(desc));
@@ -779,7 +781,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 // Match CWSDPMI: force the descriptor to stay non-system.
                 new_desc |= 1u64 << 44;
                 dos.ldt[idx] = new_desc;
-                trace_borland_desc("000C set", sel, new_desc);
+                trace_dpmi_desc("000C set", sel, new_desc);
                 dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
                     DpmiState::desc_base(new_desc), new_desc);
                 clear_carry(regs);
@@ -1031,9 +1033,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             let aligned = (size + 0xFFF) & !0xFFF;
             let base = dpmi.mem_next;
             dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
-            // Keep the DPMI 0.9 handle equal to the base address. Treating it
-            // as an unrelated opaque id moves Borland C onto a different,
-            // earlier DPMIMEM failure path.
+            // Keep the DPMI 0.9 handle equal to the base address. Several
+            // extenders assume this CWSDPMI-compatible handle shape.
             let handle = base;
             // Record the block
             let mut stored = false;
@@ -1675,181 +1676,76 @@ pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize
 // DPMI exception dispatch — route CPU exceptions to client handlers
 // ============================================================================
 
-fn dump_borland_vga_state() {
-    unsafe {
-        use crate::arch::{inb, outb};
-        let _ = inb(0x3DA);
-        let misc = inb(0x3CC);
-        let mut seq = [0u8; 5];
-        for i in 0..5u8 {
-            outb(0x3C4, i);
-            seq[i as usize] = inb(0x3C5);
-        }
-        let mut crtc = [0u8; 25];
-        for i in 0..25u8 {
-            outb(0x3D4, i);
-            crtc[i as usize] = inb(0x3D5);
-        }
-        let mut gc = [0u8; 9];
-        for i in 0..9u8 {
-            outb(0x3CE, i);
-            gc[i as usize] = inb(0x3CF);
-        }
-        let _ = inb(0x3DA);
-        let mut ac = [0u8; 21];
-        for i in 0..21u8 {
-            let _ = inb(0x3DA);
-            outb(0x3C0, i | 0x20);
-            ac[i as usize] = inb(0x3C1);
-        }
-        let _ = inb(0x3DA);
-        outb(0x3C0, 0x20);
-        crate::dbg_println!(
-            "[BCVGA] misc={:02X} seq={:02X} {:02X} {:02X} {:02X} {:02X} gc={:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-            misc, seq[0], seq[1], seq[2], seq[3], seq[4],
-            gc[0], gc[1], gc[2], gc[3], gc[4], gc[5], gc[6], gc[7], gc[8],
+fn dump_selector(label: &str, dos: &thread::DosState, sel: u16) {
+    let idx = DpmiState::sel_to_idx(sel);
+    if idx < LDT_ENTRIES {
+        let desc = dos.ldt[idx];
+        crate::println!(
+            "  {} {:04X}: base={:08X} limit={:08X} raw={:016X}",
+            label,
+            sel,
+            DpmiState::desc_base(desc),
+            DpmiState::desc_limit(desc),
+            desc,
         );
-        crate::dbg_println!(
-            "[BCVGA] ac10..14={:02X} {:02X} {:02X} {:02X} crtc_start={:02X}{:02X} cursor={:02X}{:02X}",
-            ac[0x10], ac[0x11], ac[0x12], ac[0x13],
-            crtc[0x0C], crtc[0x0D], crtc[0x0E], crtc[0x0F],
-        );
-    }
-
-    let vga = unsafe { core::slice::from_raw_parts(0xB8000 as *const u8, 4000) };
-    let mut bg_hist = [0u16; 16];
-    let mut fg_hist = [0u16; 16];
-    let mut non_space = 0u16;
-    for cell in 0..2000 {
-        let ch = vga[cell * 2];
-        let attr = vga[cell * 2 + 1];
-        bg_hist[(attr >> 4) as usize] = bg_hist[(attr >> 4) as usize].saturating_add(1);
-        fg_hist[(attr & 0x0F) as usize] = fg_hist[(attr & 0x0F) as usize].saturating_add(1);
-        if ch != b' ' && ch != 0 {
-            non_space = non_space.saturating_add(1);
-        }
-    }
-    crate::dbg_println!(
-        "[BCVGA] text cells nonspace={} bg_hist={:?} fg_hist={:?}",
-        non_space, bg_hist, fg_hist,
-    );
-    for row in 0..8 {
-        let mut line = [b'.'; 80];
-        for col in 0..80 {
-            let ch = vga[(row * 80 + col) * 2];
-            line[col] = if (0x20..0x7F).contains(&ch) { ch } else { b'.' };
-        }
-        let a0 = vga[row * 160 + 1];
-        let a20 = vga[row * 160 + 41];
-        let a40 = vga[row * 160 + 81];
-        let a60 = vga[row * 160 + 121];
-        crate::dbg_println!(
-            "[BCVGA {:02}] attr={:02X}/{:02X}/{:02X}/{:02X} {}",
-            row,
-            a0,
-            a20,
-            a40,
-            a60,
-            core::str::from_utf8(&line).unwrap_or("???"),
-        );
+    } else {
+        crate::println!("  {} {:04X}: outside LDT", label, sel);
     }
 }
 
-fn dump_borland_dpmi_block_fault(dos: &mut thread::DosState, regs: &Regs) -> bool {
-    let ds_base = seg_base(&dos.ldt[..], regs.ds as u16);
-    let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
-    let bp = regs.rbp as u16;
-    let block = regs.rbx as u16;
-    let block_addr = ds_base.wrapping_add(block as u32);
-    let stack_addr = ss_base.wrapping_add(bp as u32);
+fn dump_words(label: &str, addr: u32) {
+    let w0 = unsafe { core::ptr::read_unaligned(addr as *const u16) };
+    let w1 = unsafe { core::ptr::read_unaligned(addr.wrapping_add(2) as *const u16) };
+    let w2 = unsafe { core::ptr::read_unaligned(addr.wrapping_add(4) as *const u16) };
+    let w3 = unsafe { core::ptr::read_unaligned(addr.wrapping_add(6) as *const u16) };
+    let w4 = unsafe { core::ptr::read_unaligned(addr.wrapping_add(8) as *const u16) };
+    let w5 = unsafe { core::ptr::read_unaligned(addr.wrapping_add(10) as *const u16) };
+    let w6 = unsafe { core::ptr::read_unaligned(addr.wrapping_add(12) as *const u16) };
+    let w7 = unsafe { core::ptr::read_unaligned(addr.wrapping_add(14) as *const u16) };
+    crate::println!(
+        "  {} @{:08X}: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
+        label, addr, w0, w1, w2, w3, w4, w5, w6, w7,
+    );
+}
 
-    let b0 = unsafe { core::ptr::read_unaligned(block_addr as *const u16) };
-    let b1 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(2) as *const u16) };
-    let b2 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(4) as *const u16) };
-    let b3 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(6) as *const u16) };
-    let b4 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(8) as *const u16) };
-    let b5 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(10) as *const u16) };
-    let b6 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(12) as *const u16) };
-    let b7 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(14) as *const u16) };
-    let b8 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(16) as *const u16) };
-    let b9 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(18) as *const u16) };
-    let b10 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(20) as *const u16) };
-    let b11 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(22) as *const u16) };
-    let b12 = unsafe { core::ptr::read_unaligned(block_addr.wrapping_add(24) as *const u16) };
-
-    let s0 = unsafe { core::ptr::read_unaligned(stack_addr as *const u16) };
-    let s1 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(2) as *const u16) };
-    let s2 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(4) as *const u16) };
-    let s3 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(6) as *const u16) };
-    let s4 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(8) as *const u16) };
-    let s5 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(10) as *const u16) };
-    let s6 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(12) as *const u16) };
-    let s7 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(14) as *const u16) };
-    let caller_bp = s0;
-    let caller_addr = ss_base.wrapping_add(caller_bp as u32);
-    let c0 = unsafe { core::ptr::read_unaligned(caller_addr as *const u16) };
-    let c1 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(2) as *const u16) };
-    let c2 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(4) as *const u16) };
-    let c3 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(6) as *const u16) };
-    let c4 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(8) as *const u16) };
-    let c5 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(10) as *const u16) };
-    let c6 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(12) as *const u16) };
-    let c7 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(14) as *const u16) };
-    let c8 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(16) as *const u16) };
-    let c9 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(18) as *const u16) };
+fn dump_dpmi_fault_context(dos: &thread::DosState, regs: &Regs, exc_num: u32) {
     let cs_base = seg_base(&dos.ldt[..], regs.code_seg());
-    let master_sel = unsafe { core::ptr::read_unaligned(cs_base.wrapping_add(0x3c2a) as *const u16) };
-    let master_base = seg_base(&dos.ldt[..], master_sel);
-    let src_seg = unsafe { core::ptr::read_unaligned(master_base.wrapping_add(0x40 + (c3 as u32) * 2) as *const u16) };
-    let src_base = seg_base(&dos.ldt[..], src_seg);
-    let src_addr = src_base.wrapping_add(c2 as u32);
-    let o0 = unsafe { core::ptr::read_unaligned(src_addr as *const u16) };
-    let o1 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(2) as *const u16) };
-    let o2 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(4) as *const u16) };
-    let o3 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(6) as *const u16) };
-    let o4 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(8) as *const u16) };
-    let o5 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(10) as *const u16) };
-    let o6 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(12) as *const u16) };
-    let o7 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(14) as *const u16) };
-    let o8 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(16) as *const u16) };
-    let o9 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(18) as *const u16) };
-    let o10 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(20) as *const u16) };
-    let o11 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(22) as *const u16) };
-    let o12 = unsafe { core::ptr::read_unaligned(src_addr.wrapping_add(24) as *const u16) };
+    let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
+    let ip_addr = cs_base.wrapping_add(regs.ip32());
+    let sp_addr = ss_base.wrapping_add(regs.sp32());
+    let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
+    let bytes = unsafe { core::slice::from_raw_parts(ip_addr as *const u8, 16) };
 
     crate::println!(
-        "BC DPMIMEM fault trace: exc=0D at {:04X}:{:04X} err={:04X} DS={:04X} BX={:04X} block_addr={:08X} SS:BP={:04X}:{:04X}",
+        "[DPMI-FAULT] exc={} at {:04X}:{:08X} err={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X}",
+        exc_num,
         regs.code_seg(),
-        regs.ip32() as u16,
+        regs.ip32(),
         regs.err_code as u16,
+        regs.rax as u32,
+        regs.rbx as u32,
+        regs.rcx as u32,
+        regs.rdx as u32,
+        regs.rsi as u32,
+        regs.rdi as u32,
+        regs.rbp as u32,
+    );
+    crate::println!(
+        "  DS={:04X} ES={:04X} FS={:04X} GS={:04X} SS:SP={:04X}:{:08X} code={:02X?}",
         regs.ds as u16,
-        block,
-        block_addr,
+        regs.es as u16,
+        regs.fs as u16,
+        regs.gs as u16,
         regs.stack_seg(),
-        bp,
+        regs.sp32(),
+        bytes,
     );
-    crate::println!(
-        "  stack BP: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-        s0, s1, s2, s3, s4, s5, s6, s7,
-    );
-    crate::println!(
-        "  caller BP {:04X}: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-        caller_bp, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9,
-    );
-    crate::println!(
-        "  source block master={:04X} class={} sel={:04X} off={:04X} addr={:08X}: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-        master_sel, c3, src_seg, c2, src_addr, o0, o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12,
-    );
-    crate::println!(
-        "  block {:04X}: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-        block, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12,
-    );
-    crate::println!(
-        "  block pointer fields: +12={:04X}:{:04X} +18={:04X}:{:04X}",
-        b10, b9, b12, b11,
-    );
-    dump_borland_vga_state();
-    false
+    dump_selector("CS", dos, regs.code_seg());
+    dump_selector("DS", dos, regs.ds as u16);
+    dump_selector("ES", dos, regs.es as u16);
+    dump_selector("SS", dos, regs.stack_seg());
+    dump_words("stack SP", sp_addr);
+    dump_words("stack BP", bp_addr);
 }
 
 /// Dispatch a CPU exception to the client's exception handler (set via INT 31h/0203h).
@@ -1883,142 +1779,6 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
         regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16,
         regs.stack_seg(), regs.sp32());
-    if exc_num == 13 && (regs.ip32() as u16) == 0x2921 {
-        dump_borland_dpmi_block_fault(dos, regs);
-    } else if exc_num == 13 && (regs.err_code as u16) == 0xD000 {
-        let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
-        let bp = regs.rbp as u16;
-        let stack_addr = ss_base.wrapping_add(bp as u32);
-        let s0 = unsafe { core::ptr::read_unaligned(stack_addr as *const u16) };
-        let s1 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(2) as *const u16) };
-        let s2 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(4) as *const u16) };
-        let s3 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(6) as *const u16) };
-        let s4 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(8) as *const u16) };
-        let s5 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(10) as *const u16) };
-        let s6 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(12) as *const u16) };
-        let s7 = unsafe { core::ptr::read_unaligned(stack_addr.wrapping_add(14) as *const u16) };
-        let caller_addr = ss_base.wrapping_add(s0 as u32);
-        let c0 = unsafe { core::ptr::read_unaligned(caller_addr as *const u16) };
-        let c1 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(2) as *const u16) };
-        let c2 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(4) as *const u16) };
-        let c3 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(6) as *const u16) };
-        let c4 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(8) as *const u16) };
-        let c5 = unsafe { core::ptr::read_unaligned(caller_addr.wrapping_add(10) as *const u16) };
-        let caller_cs_base = seg_base(&dos.ldt[..], 0x0457);
-        let code_addr = caller_cs_base.wrapping_add(0x0AF0);
-        let code = unsafe { core::slice::from_raw_parts(code_addr as *const u8, 0x40) };
-        let helper_cs_base = seg_base(&dos.ldt[..], 0x0497);
-        let helper_addr = helper_cs_base.wrapping_add(0x03F0);
-        let helper = unsafe { core::slice::from_raw_parts(helper_addr as *const u8, 0x100) };
-        let mapper_cs_base = seg_base(&dos.ldt[..], 0x0397);
-        let mapper_addr = mapper_cs_base.wrapping_add(0x0080);
-        let mapper = unsafe { core::slice::from_raw_parts(mapper_addr as *const u8, 0xA0) };
-        let thunk_cs_base = seg_base(&dos.ldt[..], 0x04B7);
-        let thunk_addr = thunk_cs_base.wrapping_add(0x0240);
-        let thunks = unsafe { core::slice::from_raw_parts(thunk_addr as *const u8, 0x80) };
-        let map_call1_off = unsafe { core::ptr::read_unaligned(mapper_cs_base.wrapping_add(0x00B9) as *const u16) };
-        let map_call1_sel = unsafe { core::ptr::read_unaligned(mapper_cs_base.wrapping_add(0x00BB) as *const u16) };
-        let map_call2_off = unsafe { core::ptr::read_unaligned(mapper_cs_base.wrapping_add(0x00C8) as *const u16) };
-        let map_call2_sel = unsafe { core::ptr::read_unaligned(mapper_cs_base.wrapping_add(0x00CA) as *const u16) };
-        let thunk0264_off = unsafe { core::ptr::read_unaligned(thunk_cs_base.wrapping_add(0x0265) as *const u16) };
-        let thunk0264_sel = unsafe { core::ptr::read_unaligned(thunk_cs_base.wrapping_add(0x0267) as *const u16) };
-        let thunk0269_off = unsafe { core::ptr::read_unaligned(thunk_cs_base.wrapping_add(0x026A) as *const u16) };
-        let thunk0269_sel = unsafe { core::ptr::read_unaligned(thunk_cs_base.wrapping_add(0x026C) as *const u16) };
-        let thunk0278_off = unsafe { core::ptr::read_unaligned(thunk_cs_base.wrapping_add(0x0279) as *const u16) };
-        let thunk0278_sel = unsafe { core::ptr::read_unaligned(thunk_cs_base.wrapping_add(0x027B) as *const u16) };
-        let target_cs_base = seg_base(&dos.ldt[..], 0x0B97);
-        let target_addr = target_cs_base.wrapping_add(0x40C0);
-        let target = unsafe { core::slice::from_raw_parts(target_addr as *const u8, 0x80) };
-        let desc_0397 = dos.ldt[DpmiState::sel_to_idx(0x0397)];
-        let desc_04b7 = dos.ldt[DpmiState::sel_to_idx(0x04B7)];
-        let desc_0b97 = dos.ldt[DpmiState::sel_to_idx(0x0B97)];
-        let helper_ds_base = seg_base(&dos.ldt[..], regs.ds as u16);
-        let table_seg_addr = helper_ds_base.wrapping_add(0x9BC6);
-        let table_seg = unsafe { core::ptr::read_unaligned(table_seg_addr as *const u16) };
-        let table_base = seg_base(&dos.ldt[..], table_seg);
-        let idx_05af = (0x05AFu16.wrapping_sub(0x7007) >> 2) as u32;
-        let table_05af = unsafe { core::ptr::read_unaligned(table_base.wrapping_add(idx_05af * 2) as *const u16) };
-        let idx_d000 = (0xD000u16.wrapping_sub(0x7007) >> 2) as u32;
-        let table_d000 = unsafe { core::ptr::read_unaligned(table_base.wrapping_add(idx_d000 * 2) as *const u16) };
-        crate::println!(
-            "BC legacy fault trace: exc=0D at {:04X}:{:04X} err={:04X} DS={:04X} ES={:04X} SS:BP={:04X}:{:04X} ss_base={:08X} arg_addr={:08X}",
-            regs.code_seg(),
-            regs.ip32() as u16,
-            regs.err_code as u16,
-            regs.ds as u16,
-            regs.es as u16,
-            regs.stack_seg(),
-            bp,
-            ss_base,
-            stack_addr.wrapping_add(8),
-        );
-        crate::println!(
-            "  stack BP: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-            s0, s1, s2, s3, s4, s5, s6, s7,
-        );
-        crate::println!(
-            "  caller BP {:04X}: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-            s0, c0, c1, c2, c3, c4, c5,
-        );
-        crate::println!(
-            "  code 0457:0AF0: {:02X?}",
-            code,
-        );
-        crate::println!(
-            "  helper 0497:03F0: {:02X?}",
-            helper,
-        );
-        crate::println!(
-            "  mapper 0397:0080: {:02X?}",
-            mapper,
-        );
-        crate::println!(
-            "  mapper calls: 0397:00B8 -> {:04X}:{:04X}, 0397:00C7 -> {:04X}:{:04X}",
-            map_call1_sel,
-            map_call1_off,
-            map_call2_sel,
-            map_call2_off,
-        );
-        crate::println!(
-            "  thunks 04B7:0240: {:02X?}",
-            thunks,
-        );
-        crate::println!(
-            "  thunk jmps: 0264 -> {:04X}:{:04X}, 0269 -> {:04X}:{:04X}, 0278 -> {:04X}:{:04X}",
-            thunk0264_sel,
-            thunk0264_off,
-            thunk0269_sel,
-            thunk0269_off,
-            thunk0278_sel,
-            thunk0278_off,
-        );
-        crate::println!(
-            "  descs: 0397 base={:08X} lim={:08X} raw={:016X}; 04B7 base={:08X} lim={:08X} raw={:016X}; 0B97 base={:08X} lim={:08X} raw={:016X}",
-            DpmiState::desc_base(desc_0397),
-            DpmiState::desc_limit(desc_0397),
-            desc_0397,
-            DpmiState::desc_base(desc_04b7),
-            DpmiState::desc_limit(desc_04b7),
-            desc_04b7,
-            DpmiState::desc_base(desc_0b97),
-            DpmiState::desc_limit(desc_0b97),
-            desc_0b97,
-        );
-        crate::println!(
-            "  target 0B97:40C0: {:02X?}",
-            target,
-        );
-        crate::println!(
-            "  helper table ds:9BC6={:04X} base={:08X} idx05AF={:04X}->{:04X} idxD000={:04X}->{:04X}",
-            table_seg,
-            table_base,
-            idx_05af as u16,
-            table_05af,
-            idx_d000 as u16,
-            table_d000,
-        );
-        dump_borland_vga_state();
-    }
     // No verbose dump on handled #GP/#PF -- DPMI clients routinely take
     // these for sensitive-insn emulation; the dump goes to VGA and clobbers
     // the user screen. The unhandled-exception path below still dumps.
@@ -2057,6 +1817,7 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         }
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
+        dump_dpmi_fault_context(dos, regs, exc_num);
         startup::arch_dump_exception(dos, regs);
         return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
     }
