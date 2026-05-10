@@ -285,6 +285,7 @@ pub(super) fn pop_save_at(ldt: &[u64], cursor: (u16, u32)) -> ModeSave {
 ///
 /// Used by: `deliver_pm_irq` (toggle/first-entry branch), `callback_entry`.
 pub(super) fn switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs) -> (u16, u32) {
+    let from_rm = regs.mode() == crate::UserMode::VM86;
     // Compute the rm cursor to track in `other_stack` for the duration
     // of this excursion. The cursor's role is to tell a subsequent
     // PM→RM toggle (`switch_to_rm_side` via `rm_get_stack`) where to
@@ -318,6 +319,9 @@ pub(super) fn switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs) -> 
     regs.frame.ss  = pm_save_at.0 as u64;
     regs.frame.rsp = pm_save_at.1 as u64;
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    if from_rm {
+        super::dpmi::enter_pm_psp_view(dos);
+    }
     dos.pc.locked_stack.other_stack = Some(next_rm_cursor);
     pm_save_at
 }
@@ -341,6 +345,7 @@ pub(super) fn switch_to_rm_side(dos: &mut thread::DosState, regs: &mut Regs,
     regs.frame.ss  = rm_dest.0 as u64;
     regs.frame.rsp = rm_dest.1 as u64;
     regs.frame.rflags |= machine::VM_FLAG as u64;
+    super::dpmi::restore_rm_psp_view(dos);
     dos.pc.locked_stack.other_stack = Some(pm_save_at);
     pm_save_at
 }
@@ -586,6 +591,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
 pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let save = pop_save(dos, regs);
     save.restore(regs);
+    super::dpmi::sync_psp_view_for_regs(dos, regs);
     // Restore the other_stack that was current at push time (None at
     // outermost-from-client entry, Some at nested entries).
     dos.pc.locked_stack.other_stack = save.other_stack();
@@ -831,6 +837,7 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     // last was.
     let save = pop_save(dos, regs);
     save.restore(regs);
+    super::dpmi::sync_psp_view_for_regs(dos, regs);
     dos.pc.locked_stack.other_stack = save.other_stack();
     regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
     regs.frame.rflags |= machine::IF_FLAG as u64;
@@ -890,4 +897,3 @@ pub(super) fn seg_is_32(ldt: &[u64], sel: u16) -> bool {
     if idx >= ldt.len() { return true; }
     ldt[idx] & (1u64 << 54) != 0
 }
-

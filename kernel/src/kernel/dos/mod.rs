@@ -192,6 +192,7 @@ pub struct DosState {
 pub struct DosMemBlock {
     pub seg: u16,
     pub paras: u16,
+    pub owner: u16,
 }
 
 /// Allocate a zero-filled LDT on the heap. 64KB; we use a `vec![0; N]` route
@@ -290,6 +291,7 @@ pub struct ExecParent {
     pub heap_seg: u16,
     pub heap_base_seg: u16,
     pub psp: u16,
+    pub dta: u32,
     pub dos_blocks: alloc::vec::Vec<DosMemBlock>,
     /// Parent's DPMI state, suspended during child execution. Per DPMI 0.9:
     /// each DPMI client has independent state (LDT, pm_vectors, etc.); a
@@ -720,8 +722,9 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
 // ── Block-allocator helpers used by INT 21h handlers in `dos.rs` ────────
 //
 // Convention (matches real DOS):
-//   - Each block in `dos.dos_blocks` records its data segment and data
-//     paragraph count. A 1-paragraph MCB header lives at `block.seg - 1`.
+//   - Each block in `dos.dos_blocks` records its data segment, data
+//     paragraph count, and owning PSP. A 1-paragraph MCB header lives at
+//     `block.seg - 1`.
 //   - Total conventional consumption per allocation is `paras + 1`.
 //   - `heap_base_seg` is the seg of the *first MCB* in the chain (i.e.,
 //     the first paragraph available for the chain — everything below is
@@ -741,7 +744,6 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
 /// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
 /// walks contiguously from `heap_base_seg` up to 0xA000.
 fn sync_mcb_chain(dos: &DosState) {
-    let owner = dos.current_psp;
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
 
@@ -761,7 +763,7 @@ fn sync_mcb_chain(dos: &DosState) {
             entries.push((walk, 0, paras));
         }
         // Owned MCB at block_mcb (= block.seg - 1).
-        entries.push((block_mcb, owner, block.paras));
+        entries.push((block_mcb, block.owner, block.paras));
         walk = block.seg.saturating_add(block.paras);
     }
     if walk < 0xA000 {
@@ -852,6 +854,13 @@ fn dos_reset_blocks(dos: &mut DosState, base_seg: u16) {
     sync_mcb_chain(dos);
 }
 
+fn current_mcb_owner(dos: &DosState) -> u16 {
+    match dos.dpmi.as_ref() {
+        Some(dpmi) if dos.current_psp == dpmi::PSP_SEL => dpmi.saved_rm_psp,
+        _ => dos.current_psp,
+    }
+}
+
 fn dos_alloc_block(dos: &mut DosState, need: u16) -> Result<u16, u16> {
     // Each alloc consumes 1 MCB paragraph + `need` data paragraphs. Quirk
     // preserved from pre-MCB code: AH=48 BX=0 silently succeeds without
@@ -865,6 +874,7 @@ fn dos_alloc_block(dos: &mut DosState, need: u16) -> Result<u16, u16> {
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
     let mut max_data = 0u16;
+    let owner = current_mcb_owner(dos);
 
     for block in &blocks {
         let block_mcb = block.seg.saturating_sub(1);
@@ -873,7 +883,7 @@ fn dos_alloc_block(dos: &mut DosState, need: u16) -> Result<u16, u16> {
             if region >= total {
                 let data_seg = cur.saturating_add(1);
                 if need != 0 {
-                    dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need });
+                    dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need, owner });
                 }
                 sync_heap_seg(dos);
                 sync_mcb_chain(dos);
@@ -889,7 +899,7 @@ fn dos_alloc_block(dos: &mut DosState, need: u16) -> Result<u16, u16> {
         if region >= total {
             let data_seg = cur.saturating_add(1);
             if need != 0 {
-                dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need });
+                dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need, owner });
             }
             sync_heap_seg(dos);
             sync_mcb_chain(dos);
@@ -910,6 +920,27 @@ fn dos_free_block(dos: &mut DosState, seg: u16) -> Result<(), u16> {
     } else {
         Err(9)
     }
+}
+
+fn dos_set_program_block_owner(dos: &mut DosState, env_seg: u16, psp_seg: u16, owner: u16) {
+    for block in &mut dos.dos_blocks {
+        if block.seg == env_seg || block.seg == psp_seg {
+            block.owner = owner;
+        }
+    }
+    sync_mcb_chain(dos);
+}
+
+fn dos_keep_resident_block(dos: &mut DosState, seg: u16, paras: u16, owner: u16) {
+    let paras = paras.min(0xA000u16.saturating_sub(seg));
+    if paras == 0 {
+        sync_mcb_chain(dos);
+        return;
+    }
+
+    dos.dos_blocks.push(DosMemBlock { seg, paras, owner });
+    sync_heap_seg(dos);
+    sync_mcb_chain(dos);
 }
 
 fn dos_resize_block(dos: &mut DosState, seg: u16, paras: u16) -> Result<(), (u16, u16)> {

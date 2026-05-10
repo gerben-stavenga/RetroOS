@@ -89,6 +89,16 @@ pub(crate) fn int_67h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::Ke
     let ah = (regs.rax >> 8) as u8;
     dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
+    // Hide EMS from DPMI clients. The page-frame segment we'd report
+    // (e.g. 0xD000) is a real-mode segment, not a PM selector. Borland
+    // C++ 3.1 writes it into overlay tables and later dereferences it in
+    // protected mode. PM clients should use DPMI memory services instead.
+    if dos.dpmi.is_some() {
+        regs.rax = (regs.rax & !0xFF00) | 0x80_00; // AH=80: not present
+        dbg_println!("EMS: -> AX={:04X} (DPMI active, hidden from PM client)",
+            regs.rax as u16);
+        return thread::KernelAction::Done;
+    }
     let result = int_67h_inner(dos, regs, ah);
     dbg_println!("EMS: -> AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);

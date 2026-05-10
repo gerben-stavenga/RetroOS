@@ -92,6 +92,7 @@ pub mod arch_call {
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start, ECX=num_pages, EBX=ppage_start
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
+    pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=enable, EDX/ECX=watched linear addrs
 }
 
 fn arch_dispatch(regs: &mut Regs) {
@@ -159,6 +160,19 @@ fn arch_dispatch(regs: &mut Regs) {
             // Also write FS_BASE MSR so 32-bit compat mode picks up the
             // correct hidden base (the 32-bit iret path doesn't touch the MSR).
             unsafe { crate::arch::x86::wrmsr(0xC000_0100, base as u64); }
+        }
+        arch_call::SET_DEBUG_WATCH => {
+            unsafe {
+                if regs.rbx != 0 {
+                    x86::write_dr0(regs.rdx as u32);
+                    x86::write_dr1(regs.rcx as u32);
+                    x86::write_dr6(0);
+                    x86::write_dr7(0x0055_0005);
+                } else {
+                    x86::write_dr7(0);
+                    x86::write_dr6(0);
+                }
+            }
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }
@@ -446,6 +460,52 @@ fn isr_handler_ring3(regs: &mut Regs) {
         // kernel arms it, but a stale bit in client flags would loop.
         1 => {
             use core::sync::atomic::Ordering;
+            let dr6 = unsafe { x86::read_dr6() };
+            if dr6 & 0x3 != 0 {
+                static mut BC_WATCH_HITS: u32 = 0;
+                let hits = unsafe {
+                    BC_WATCH_HITS = BC_WATCH_HITS.wrapping_add(1);
+                    BC_WATCH_HITS
+                };
+                let w0 = unsafe { core::ptr::read_unaligned(0x0054_1A3A as *const u16) };
+                let w1 = unsafe { core::ptr::read_unaligned(0x0054_1A4C as *const u16) };
+                if hits <= 32 || w0 == 0xD000 || w1 == 0xD000 {
+                    let cs_base = if regs.mode() == UserMode::VM86 {
+                        (regs.code_seg() as u32) << 4
+                    } else {
+                        crate::arch::monitor::seg_base(regs.code_seg())
+                    };
+                    let ip = regs.ip32();
+                    let lin = cs_base.wrapping_add(ip);
+                    let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                    let ss_base = if regs.mode() == UserMode::VM86 {
+                        (regs.stack_seg() as u32) << 4
+                    } else {
+                        crate::arch::monitor::seg_base(regs.stack_seg())
+                    };
+                    let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
+                    let st0 = unsafe { core::ptr::read_unaligned(bp_addr as *const u16) };
+                    let st1 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(2) as *const u16) };
+                    let st2 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(4) as *const u16) };
+                    let st3 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(6) as *const u16) };
+                    let st4 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(8) as *const u16) };
+                    let st5 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(10) as *const u16) };
+                    crate::dbg_println!(
+                        "[BCWATCH] hit={} dr6={:08X} after {:04X}:{:08X} next={:02X?} watch3A={:04X} watch4C={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X} DS={:04X} ES={:04X} SS:SP={:04X}:{:08X} stack={:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
+                        hits, dr6, regs.code_seg(), ip, bytes, w0, w1,
+                        regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
+                        regs.rsi as u32, regs.rdi as u32, regs.rbp as u32,
+                        regs.ds as u16, regs.es as u16, regs.stack_seg(), regs.sp32(),
+                        st0, st1, st2, st3, st4, st5,
+                    );
+                }
+                if w0 == 0xD000 || w1 == 0xD000 {
+                    unsafe { x86::write_dr7(0); }
+                    crate::dbg_println!("[BCWATCH] disabled after D000 write");
+                }
+                unsafe { x86::write_dr6(0); }
+                return;
+            }
             let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
             if budget > 0 {
                 // Log step in PM and VM86 — VM86 logging needed to trace
@@ -530,6 +590,42 @@ fn isr_handler_ring3(regs: &mut Regs) {
 /// else from kernel context is a bug.
 fn isr_handler_ring1(regs: &mut Regs) {
     match regs.int_num {
+        1 => {
+            let dr6 = unsafe { x86::read_dr6() };
+            if dr6 & 0x3 != 0 {
+                static mut BC_KERNEL_WATCH_HITS: u32 = 0;
+                let hits = unsafe {
+                    BC_KERNEL_WATCH_HITS = BC_KERNEL_WATCH_HITS.wrapping_add(1);
+                    BC_KERNEL_WATCH_HITS
+                };
+                let w0 = unsafe { core::ptr::read_unaligned(0x0054_1A3A as *const u16) };
+                let w1 = unsafe { core::ptr::read_unaligned(0x0054_1A4C as *const u16) };
+                if hits <= 32 || w0 == 0xD000 || w1 == 0xD000 {
+                    crate::dbg_println!(
+                        "[BCWATCH-K] hit={} dr6={:08X} at {:04X}:{:08X} watch3A={:04X} watch4C={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X}",
+                        hits,
+                        dr6,
+                        regs.code_seg(),
+                        regs.ip32(),
+                        w0,
+                        w1,
+                        regs.rax as u32,
+                        regs.rbx as u32,
+                        regs.rcx as u32,
+                        regs.rdx as u32,
+                        regs.rsi as u32,
+                        regs.rdi as u32,
+                    );
+                }
+                if w0 == 0xD000 || w1 == 0xD000 {
+                    unsafe { x86::write_dr7(0); }
+                    crate::dbg_println!("[BCWATCH-K] disabled after D000 write");
+                }
+                unsafe { x86::write_dr6(0); }
+                return;
+            }
+            panic_with_regs("Unexpected debug exception in kernel", regs);
+        }
         14 => {
             if try_handle_page_fault(regs.err_code, false).is_none() {
                 panic_with_regs("Unhandled page fault in kernel", regs);

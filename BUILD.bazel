@@ -135,7 +135,20 @@ genrule(
     name = "image_proprietary",
     srcs = [":fs_tar_proprietary"],
     outs = ["image_proprietary.bin"],
-    cmd = "tail -c +513 $< > $@ && truncate -s 256M $@",
+    # 1G truncate leaves headroom for BC5/LIB and the games. Sparse, so
+    # the on-disk size is roughly the actual TAR payload, not 1 GiB. The
+    # check fails loudly if the TAR ever outgrows the budget so we don't
+    # silently chop entries again.
+    cmd = """
+        SIZE=$$(stat -c%s $<)
+        STRIPPED=$$((SIZE - 512))
+        BUDGET=$$((1024 * 1024 * 1024))
+        if [ "$$STRIPPED" -gt "$$BUDGET" ]; then
+            echo "fs_tar_proprietary stripped size $$STRIPPED B exceeds image budget $$BUDGET B" >&2
+            exit 1
+        fi
+        tail -c +513 $< > $@ && truncate -s 1G $@
+    """,
 )
 
 # Image with ext4 test partition

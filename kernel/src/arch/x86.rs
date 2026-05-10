@@ -215,6 +215,33 @@ pub fn outw(port: u16, value: u16) {
     }
 }
 
+#[inline]
+pub(super) unsafe fn read_dr6() -> u32 {
+    let value: u32;
+    unsafe { asm!("mov {}, dr6", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
+#[inline]
+pub(super) unsafe fn write_dr6(value: u32) {
+    unsafe { asm!("mov dr6, {}", in(reg) value, options(nomem, nostack)); }
+}
+
+#[inline]
+pub(super) unsafe fn write_dr0(value: u32) {
+    unsafe { asm!("mov dr0, {}", in(reg) value, options(nomem, nostack)); }
+}
+
+#[inline]
+pub(super) unsafe fn write_dr1(value: u32) {
+    unsafe { asm!("mov dr1, {}", in(reg) value, options(nomem, nostack)); }
+}
+
+#[inline]
+pub(super) unsafe fn write_dr7(value: u32) {
+    unsafe { asm!("mov dr7, {}", in(reg) value, options(nomem, nostack)); }
+}
+
 /// Load Global Descriptor Table
 #[inline]
 pub unsafe fn lgdt(gdt_ptr: &GdtPtr) {

@@ -16,7 +16,8 @@ use crate::Regs;
 use super::{
     ExecParent,
     linear, snapshot_env,
-    dos_reset_blocks, dos_alloc_block, dos_free_block, dos_resize_block,
+    dos_alloc_block, dos_free_block, dos_resize_block,
+    dos_set_program_block_owner, dos_keep_resident_block,
     DOS_TRACE_RT,
 };
 use super::{dpmi, dfs, machine, mode_transitions, xms};
@@ -551,6 +552,23 @@ fn dos_putchar(c: u8) {
     }
 }
 
+fn psp_struct_seg(dos: &thread::DosState) -> u16 {
+    match dos.dpmi.as_ref() {
+        Some(dpmi) if dos.current_psp == dpmi::PSP_SEL => dpmi.saved_rm_psp,
+        _ => dos.current_psp,
+    }
+}
+
+fn dos_error_from_errno(err: i32) -> u16 {
+    match -err {
+        2 => 2,   // file not found
+        9 => 6,   // invalid handle
+        13 => 5,  // access denied
+        24 => 4,  // too many open files
+        _ => 1,   // invalid function / generic failure
+    }
+}
+
 // ============================================================================
 // DOS INT 21h — DOS services
 // ============================================================================
@@ -648,10 +666,17 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x33 => {
             let al = regs.rax as u8;
             match al {
-                0x00 => { regs.rdx = regs.rdx & !0xFF; } // DL=0: break checking off
-                0x01 => {} // set break — ignore
+                0x00 => {
+                    regs.rdx = regs.rdx & !0xFF; // DL=0: break checking off
+                    regs.clear_flag32(1);
+                }
+                0x01 => {
+                    regs.clear_flag32(1); // set break — accepted but ignored
+                }
                 _ => {
                     dos_trace!("D21 33 unsupported AL={:02X}", al);
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
+                    regs.set_flag32(1);
                 }
             }
             thread::KernelAction::Done
@@ -845,7 +870,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(fd as u16, size);
-                    if (fd as usize) < 20 { Psp::at(dos.current_psp).jft[fd as usize] = fd as u8; }
+                    if (fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
@@ -858,11 +883,20 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
             let handle = regs.rbx as u16;
-            if handle != NULL_FILE_HANDLE && (!EMS_ENABLED || handle != EMS_DEVICE_HANDLE) {
-                crate::kernel::vfs::close(handle as i32, &mut kt.fds);
-                sft_clear(handle);
+            if handle <= 2 || handle == NULL_FILE_HANDLE || (EMS_ENABLED && handle == EMS_DEVICE_HANDLE) {
+                if (handle as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[handle as usize] = 0xFF; }
+                regs.clear_flag32(1);
+            } else {
+                let rv = crate::kernel::vfs::close(handle as i32, &mut kt.fds);
+                if rv >= 0 {
+                    sft_clear(handle);
+                    if (handle as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[handle as usize] = 0xFF; }
+                    regs.clear_flag32(1);
+                } else {
+                    regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rv) as u64;
+                    regs.set_flag32(1);
+                }
             }
-            regs.clear_flag32(1);
             thread::KernelAction::Done
         }
         // AH=0x3F: Read from file (BX=handle, CX=count, DS:DX=buffer)
@@ -1002,9 +1036,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 // by subsequent programs that enter via the raw-switch
                 // trampoline.
                 let action = exec_return(dos, regs, parent, /*preserve_pm_env=*/true);
-                if resident_top > dos.heap_seg {
-                    dos_reset_blocks(dos, resident_top);
-                }
+                dos_keep_resident_block(dos, child_psp_seg, keep, child_psp_seg);
+                dos_trace!("D21 31 TSR kept resident block {:04X}+{:04X} top={:04X}",
+                    child_psp_seg, keep, resident_top);
                 return action;
             }
             // No exec_parent: cross-thread TSR. Encode termination type 03h
@@ -1134,6 +1168,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 Err(e) => -e,
             };
             if fd >= 0 {
+                sft_set_file(fd as u16, 0);
+                if (fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
@@ -1154,14 +1190,23 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     dos_putchar(ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
+                regs.clear_flag32(1);
             } else if handle == NULL_FILE_HANDLE {
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
+                regs.clear_flag32(1);
             } else {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 let data = unsafe { core::slice::from_raw_parts(addr as *const u8, count as usize) };
                 let n = crate::kernel::vfs::write(handle as i32, data, &kt.fds);
-                regs.rax = (regs.rax & !0xFFFF) | if n >= 0 { n as u64 } else { count as u64 };
-                regs.clear_flag32(1);
+                if n >= 0 {
+                    let size = crate::kernel::vfs::file_size(handle as i32, &kt.fds);
+                    sft_set_file(handle, size);
+                    regs.rax = (regs.rax & !0xFFFF) | n as u64;
+                    regs.clear_flag32(1);
+                } else {
+                    regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(n) as u64;
+                    regs.set_flag32(1);
+                }
             }
             thread::KernelAction::Done
         }
@@ -1213,12 +1258,21 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             };
             if fd >= 0 {
                 crate::kernel::vfs::close(fd, &mut kt.fds);
-                if al == 0 {
-                    // Get attributes: return 0x20 (archive) in CX
-                    regs.rcx = (regs.rcx & !0xFFFF) | 0x20;
+                match al {
+                    0 => {
+                        // Get attributes: return 0x20 (archive) in CX
+                        regs.rcx = (regs.rcx & !0xFFFF) | 0x20;
+                        regs.clear_flag32(1);
+                    }
+                    1 => {
+                        regs.rax = (regs.rax & !0xFFFF) | 5; // access denied: attrs are not mutable
+                        regs.set_flag32(1);
+                    }
+                    _ => {
+                        regs.rax = (regs.rax & !0xFFFF) | 1;
+                        regs.set_flag32(1);
+                    }
                 }
-                // Set attributes: just succeed (read-only FS)
-                regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
                 regs.set_flag32(1);
@@ -1345,9 +1399,12 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.rcx = (regs.rcx & !0xFFFF) | time as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | date as u64;
                 regs.clear_flag32(1);
+            } else if al == 1 {
+                regs.rax = (regs.rax & !0xFFFF) | 5; // access denied: timestamps are not mutable
+                regs.set_flag32(1);
             } else {
-                // Set: succeed silently (read-only FS)
-                regs.clear_flag32(1);
+                regs.rax = (regs.rax & !0xFFFF) | 1;
+                regs.set_flag32(1);
             }
             thread::KernelAction::Done
         }
@@ -1446,9 +1503,16 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             thread::KernelAction::Done
         }
-        // AH=0x67: Set Handle Count — stub success
+        // AH=0x67: Set Handle Count
         0x67 => {
-            regs.clear_flag32(1);
+            let requested = regs.rbx as u16;
+            if requested <= 20 {
+                Psp::at(psp_struct_seg(dos)).max_files = requested;
+                regs.clear_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory for an external JFT
+                regs.set_flag32(1);
+            }
             thread::KernelAction::Done
         }
         // AH=0x41: Delete file (DS:DX=filename)
@@ -1463,14 +1527,25 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 addr += 1;
                 i += 1;
             }
-            if let Ok((path, len)) = dfs_open_existing(dos, &name[..i]) {
-                // Invalidate parent dir CI cache before delete so a stale
-                // alias→missing-file mapping doesn't confuse later lookups.
-                let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                dfs::ci::invalidate(&path[..parent_end]);
-                crate::kernel::vfs::delete(&path[..len]);
+            match dfs_open_existing(dos, &name[..i]) {
+                Ok((path, len)) => {
+                    // Invalidate parent dir CI cache before delete so a stale
+                    // alias→missing-file mapping doesn't confuse later lookups.
+                    let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                    dfs::ci::invalidate(&path[..parent_end]);
+                    let rv = crate::kernel::vfs::delete(&path[..len]);
+                    if rv >= 0 {
+                        regs.clear_flag32(1);
+                    } else {
+                        regs.rax = (regs.rax & !0xFFFF) | 5;
+                        regs.set_flag32(1);
+                    }
+                }
+                Err(e) => {
+                    regs.rax = (regs.rax & !0xFFFF) | e as u64;
+                    regs.set_flag32(1);
+                }
             }
-            regs.clear_flag32(1);
             thread::KernelAction::Done
         }
         // AH=0x59: Get Extended Error Information
@@ -1547,7 +1622,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=0x6C: Extended Open/Create (DOS 4.0+)
         // BX=mode, CX=attributes, DX=action, DS:SI=ASCIIZ filename
-        // Action: bit0=open-if-exists, bit4=create-if-not-exists
+        // Action: bit0=open-if-exists, bit1=replace-if-exists, bit4=create-if-not-exists
         0x6C => {
             let action = regs.rdx as u16;
             let mut addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
@@ -1561,6 +1636,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 i += 1;
             }
             let open_exists = action & 0x01 != 0;
+            let replace_exists = action & 0x02 != 0;
             let create_not = action & 0x10 != 0;
 
             // Try open first
@@ -1568,30 +1644,51 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
                 Err(e) => -e,
             };
-            if fd >= 0 && open_exists {
-                let size = crate::kernel::vfs::file_size(fd, &kt.fds);
-                sft_set_file(fd as u16, size);
-                if (fd as usize) < 20 { Psp::at(dos.current_psp).jft[fd as usize] = fd as u8; }
-                regs.rax = (regs.rax & !0xFFFF) | fd as u64;
-                regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
-                regs.clear_flag32(1);
+            if fd >= 0 {
+                if open_exists {
+                    let size = crate::kernel::vfs::file_size(fd, &kt.fds);
+                    sft_set_file(fd as u16, size);
+                    if (fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
+                    regs.rax = (regs.rax & !0xFFFF) | fd as u64;
+                    regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
+                    regs.clear_flag32(1);
+                } else if replace_exists {
+                    crate::kernel::vfs::close(fd, &mut kt.fds);
+                    let new_fd = match dfs_create_path(dos, &name[..i]) {
+                        Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
+                        Err(e) => -e,
+                    };
+                    if new_fd >= 0 {
+                        sft_set_file(new_fd as u16, 0);
+                        if (new_fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[new_fd as usize] = new_fd as u8; }
+                        regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
+                        regs.rcx = (regs.rcx & !0xFFFF) | 3; // CX=3: file replaced
+                        regs.clear_flag32(1);
+                    } else {
+                        regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(new_fd) as u64;
+                        regs.set_flag32(1);
+                    }
+                } else {
+                    crate::kernel::vfs::close(fd, &mut kt.fds);
+                    regs.rax = (regs.rax & !0xFFFF) | 80; // file exists
+                    regs.set_flag32(1);
+                }
             } else if create_not {
-                // File doesn't exist — create RAM-backed file via VFS overlay
-                if fd >= 0 { crate::kernel::vfs::close(fd, &mut kt.fds); }
                 let new_fd = match dfs_create_path(dos, &name[..i]) {
                     Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
                     Err(e) => -e,
                 };
                 if new_fd >= 0 {
+                    sft_set_file(new_fd as u16, 0);
+                    if (new_fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[new_fd as usize] = new_fd as u8; }
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
                     regs.clear_flag32(1);
                 } else {
-                    regs.rax = (regs.rax & !0xFFFF) | 4;
+                    regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(new_fd) as u64;
                     regs.set_flag32(1);
                 }
             } else {
-                if fd >= 0 { crate::kernel::vfs::close(fd, &mut kt.fds); }
                 regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
                 regs.set_flag32(1);
             }
@@ -1706,15 +1803,10 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction
             thread::KernelAction::Done
         }
         // AX=168Ah — DPMI 1.0 Get Vendor-Specific API Entry Point.
-        // Spec: ES:DI = ASCIIZ vendor name; returns AL=0 + ES:DI entry
-        // point on success. Borland's 16-bit DPMI loader (RTM) gates on
-        // this — without "yes, supported" it bails with "no DOS extensions
-        // in the DPMI server". We already provide DOS-translation services
-        // through `pmdos_int21_handler`, which runs INT 21 with PM regs
-        // intact. RTM doesn't actually call the entry point; AL=0 is
-        // enough for it to proceed.
+        // We do not implement any vendor-specific entry points. Return
+        // failure; AL=0 is the success value for this multiplex call.
         0x168A => {
-            regs.rax = regs.rax & !0xFF; // AL=0: success
+            regs.rax = (regs.rax & !0xFF) | 0x80; // AL!=0: unsupported
             thread::KernelAction::Done
         }
         // AX=4300h — XMS installation check
@@ -2064,17 +2156,18 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let mut abs_dos = [0u8; dfs::DFS_PATH_MAX];
     let abs_len = dos.dfs.resolve(prog_name, &mut abs_dos).unwrap_or(0);
 
-    // Build parent reference. In PM the parent's PSP[0x2C] may hold a
-    // selector (32-bit client) and dos.current_psp is PSP_SEL — read the
-    // captured RM env paragraph from DpmiState. In RM PSP[0x2C] is the RM
-    // segment.
+    // Build parent reference. In PM, dos.current_psp is PSP_SEL and the
+    // real PSP[0x2C] may be patched to an env selector, but the child PSP's
+    // parent link and copied env must use real-mode paragraphs.
     let parent_psp = dos.current_psp;
-    let parent_env_seg = match dos.dpmi.as_ref() {
-        Some(dpmi) if parent_psp == dpmi::PSP_SEL => dpmi.saved_rm_env,
-        _ => Psp::at(parent_psp).env_seg,
+    let (parent_rm_psp, parent_env_seg, parent_dpmi_pm) = match dos.dpmi.as_ref() {
+        Some(dpmi) if parent_psp == dpmi::PSP_SEL => {
+            (dpmi.saved_rm_psp, dpmi.saved_rm_env, true)
+        }
+        _ => (parent_psp, Psp::at(parent_psp).env_seg, false),
     };
     let parent_env_vec = snapshot_env(parent_env_seg);
-    let parent = ParentRef { psp_seg: parent_psp, env: &parent_env_vec };
+    let parent = ParentRef { psp_seg: parent_rm_psp, env: &parent_env_vec };
 
     // Save parent state before reseating the heap chain for the child.
     // INT frame (IP/CS/FLAGS) is on the VM86 stack at current SS:SP;
@@ -2083,6 +2176,11 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let parent_heap = dos.heap_seg;
     let parent_heap_base = dos.heap_base_seg;
     let parent_blocks = dos.dos_blocks.clone();
+    let parent_dta = dos.dta;
+
+    if parent_dpmi_pm {
+        super::dpmi::restore_rm_psp_view(dos);
+    }
 
     // Reset the chain to start at parent.heap_seg (= first paragraph past
     // parent's owned blocks). load_exe / load_com will dos_alloc_block the
@@ -2094,6 +2192,15 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         match load_exe(dos, &parent, &buf, &abs_dos[..abs_len]) {
             Some(l) => l,
             None => {
+                dos.heap_seg = parent_heap;
+                dos.heap_base_seg = parent_heap_base;
+                dos.current_psp = parent_rm_psp;
+                if parent_dpmi_pm {
+                    super::dpmi::enter_pm_psp_view(dos);
+                }
+                dos.dta = parent_dta;
+                dos.dos_blocks = parent_blocks;
+                super::sync_mcb_chain(dos);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
                 regs.set_flag32(1);
                 return thread::KernelAction::Done;
@@ -2134,7 +2241,8 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         es: regs.es as u16,
         heap_seg: parent_heap,
         heap_base_seg: parent_heap_base,
-        psp: parent_psp,
+        psp: parent_rm_psp,
+        dta: parent_dta,
         dos_blocks: parent_blocks,
         dpmi: suspended_dpmi,
         pm_vectors: suspended_pm_vectors,
@@ -2280,13 +2388,15 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
     crate::dbg_println!("exec_return: parent ss:sp={:04X}:{:04X} ds={:04X} es={:04X} heap={:04X} psp={:04X}",
         parent.ss, parent.sp, parent.ds, parent.es, parent.heap_seg, parent.psp);
-    // Peek the IRET frame waiting on parent's stack.
-    let lin = ((parent.ss as u32) << 4) + (parent.sp as u32);
-    let ret_ip = unsafe { *(lin as *const u16) };
-    let ret_cs = unsafe { *((lin + 2) as *const u16) };
-    let ret_flags = unsafe { *((lin + 4) as *const u16) };
-    crate::dbg_println!("exec_return: parent IRET frame at {:04X}:{:04X} -> ip={:04X} cs={:04X} flags={:04X}",
-        parent.ss, parent.sp, ret_ip, ret_cs, ret_flags);
+    if !parent.pm_mode {
+        // Peek the IRET frame waiting on the real-mode parent's stack.
+        let lin = ((parent.ss as u32) << 4) + (parent.sp as u32);
+        let ret_ip = unsafe { *(lin as *const u16) };
+        let ret_cs = unsafe { *((lin + 2) as *const u16) };
+        let ret_flags = unsafe { *((lin + 4) as *const u16) };
+        crate::dbg_println!("exec_return: parent IRET frame at {:04X}:{:04X} -> ip={:04X} cs={:04X} flags={:04X}",
+            parent.ss, parent.sp, ret_ip, ret_cs, ret_flags);
+    }
     dos_trace!("  exec_return: restoring heap={:04X}->{:04X} psp={:04X}->{:04X} ss:sp={:04X}:{:04X} pm_env={}",
         dos.heap_seg, parent.heap_seg,
         dos.current_psp, parent.psp,
@@ -2308,6 +2418,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
     dos.heap_seg = parent.heap_seg;
     dos.heap_base_seg = parent.heap_base_seg;
     dos.current_psp = parent.psp;
+    dos.dta = parent.dta;
     dos.dos_blocks = parent.dos_blocks;
     super::sync_mcb_chain(dos);
     // PM-environment handling on exec_return:
@@ -2333,6 +2444,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
     dos.on_resume();
+    super::dpmi::sync_psp_view_for_regs(dos, regs);
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }
@@ -2492,10 +2604,6 @@ const SFT_ENTRIES: usize = 20;
 /// write are named; the rest is reserved padding so byte offsets stay stable
 /// for any guest code that walks the structure directly.
 ///
-/// Note: the spec puts the inline JFT at 0x18 and a far-pointer to it at 0x34;
-/// the kernel here puts the JFT at 0x34 and the far-pointer (→0x34) at 0x18.
-/// Existing programs (DJGPP, BC, dos4gw, dos16m) use INT 21 for handles, so
-/// neither layout is observable — preserved here unchanged.
 #[repr(C, packed)]
 pub(super) struct Psp {
     pub int_20:           [u8; 2],   // 0x00 — CD 20 (terminate)
@@ -2506,14 +2614,13 @@ pub(super) struct Psp {
     _ctrl_break_addr:     u32,        // 0x0E — INT 23h vector
     _critical_err:        u32,        // 0x12 — INT 24h vector
     pub parent_psp:       u16,        // 0x16 — parent PSP segment
-    pub jft_far_off:      u16,        // 0x18 — (kernel layout: JFT pointer offset)
-    pub jft_far_seg:      u16,        // 0x1A — (kernel layout: JFT pointer segment)
-    _reserved_1c:         [u8; 0x10], // 0x1C-0x2B
+    pub jft:              [u8; 20],   // 0x18 — inline Job File Table
     pub env_seg:          u16,        // 0x2C — environment segment (or 0)
     _ss_sp:               u32,        // 0x2E — SS:SP at last INT 21
     pub max_files:        u16,        // 0x32 — JFT size
-    pub jft:              [u8; 20],   // 0x34 — inline JFT (kernel layout)
-    _reserved_48:         [u8; 0x80 - 0x48], // 0x48-0x7F
+    pub jft_far_off:      u16,        // 0x34 — far ptr to active JFT
+    pub jft_far_seg:      u16,        // 0x36
+    _reserved_38:         [u8; 0x80 - 0x38], // 0x38-0x7F
     pub cmdline_len:      u8,         // 0x80
     pub cmdline:          [u8; 127],  // 0x81-0xFF (CR-terminated)
 }
@@ -3016,11 +3123,11 @@ fn init_psp(psp_seg: u16, env_seg: u16, parent_psp: u16) {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
         parent_psp,
-        jft_far_off: 0x0034,                // far ptr at PSP[0x18] → inline JFT at PSP[0x34]
-        jft_far_seg: psp_seg,
         env_seg,
-        max_files: 20,
         jft,
+        max_files: 20,
+        jft_far_off: 0x0018,
+        jft_far_seg: psp_seg,
         cmdline_len: 0,
         cmdline,
         ..Default::default()
@@ -3064,7 +3171,7 @@ fn populate_program(dos: &mut thread::DosState, env_seg: u16, psp_seg: u16,
              parent.env, prog_name);
     init_psp(psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
-    super::sync_mcb_chain(dos);
+    dos_set_program_block_owner(dos, env_seg, psp_seg, psp_seg);
 }
 
 /// Load a .COM binary. Allocates env + program block (1000h paragraphs =

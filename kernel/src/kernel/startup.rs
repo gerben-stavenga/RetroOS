@@ -181,7 +181,31 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8]) {
     // not gated by this flag and continue to work for text-mode programs.
     crate::vga::KERNEL_OWNS_SCREEN.store(false, core::sync::atomic::Ordering::Relaxed);
 
+    let watch_bc = path.ends_with(b"BORLANDC/BIN/BC.EXE");
+    if !watch_bc {
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                in("eax") crate::arch::arch_call::SET_DEBUG_WATCH as u32,
+                in("ebx") 0u32,
+            );
+        }
+    }
+
     let tid = dos::run_init_program(&buf, path, cmdline_tail, cwd);
+
+    if watch_bc {
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                in("eax") crate::arch::arch_call::SET_DEBUG_WATCH as u32,
+                in("ebx") 1u32,
+                in("edx") 0x0054_1A3Au32,
+                in("ecx") 0x0054_1A4Cu32,
+            );
+        }
+        crate::dbg_println!("[BCWATCH] armed write watchpoints at 00541A3A and 00541A4C");
+    }
     event_loop(tid);
 }
 
@@ -412,10 +436,11 @@ fn event_loop(first_tid: usize) {
             let total = user_cycles.wrapping_add(kernel_cycles);
             let user_pct = if total > 0 { user_cycles.wrapping_mul(100) / total } else { 0 };
             let kern_pct = if total > 0 { kernel_cycles.wrapping_mul(100) / total } else { 0 };
-            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={}",
+            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
                 user_pct, kern_pct,
                 ev_irq, ev_softint, ev_hlt, ev_in, ev_out, ev_ins, ev_outs,
-                ev_pf, ev_exc, ev_fault, ev_syscall);
+                ev_pf, ev_exc, ev_fault, ev_syscall,
+                regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
             user_cycles = 0;
             kernel_cycles = 0;
             ev_irq = 0; ev_softint = 0; ev_hlt = 0;
