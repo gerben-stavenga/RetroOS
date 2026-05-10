@@ -73,7 +73,7 @@ pub fn init_from_tar() {
     // Try both mount layouts (TAR at root or at tar/)
     // Use handle-based VFS access (no per-thread fd slot needed)
     let mut handle = vfs::open_to_handle(b"kernel.elf");
-    if handle < 0 { handle = vfs::open_to_handle(b"tar/kernel.elf"); }
+    if handle < 0 { handle = vfs::open_to_handle(b"boot/kernel.elf"); }
     if handle < 0 {
         println!("stacktrace: kernel.elf not found");
         return;

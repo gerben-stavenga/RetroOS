@@ -69,8 +69,10 @@ pub fn startup() -> ! {
         }
     }
 
-    // Mount TAR: at "tar/" if ext4 is root, otherwise as root itself
-    let tar_prefix: &[u8] = if has_ext4 { b"tar/" } else { b"" };
+    // Mount TAR: at "boot/" if ext4 is root, otherwise as root itself.
+    // The TAR holds the boot-critical bundle (kernel, TC, DN,
+    // COMMAND.C); "boot/" is more accurate than the legacy "tar/".
+    let tar_prefix: &[u8] = if has_ext4 { b"boot/" } else { b"" };
     #[allow(static_mut_refs)]
     unsafe { vfs::mount(tar_prefix, &ROOT_TARFS); }
 
@@ -114,9 +116,9 @@ pub fn startup() -> ! {
 
             let mut path_buf = [0u8; 260];
             let path: &[u8] = if has_ext4 {
-                let n = 4 + prog.len();
-                path_buf[..4].copy_from_slice(b"tar/");
-                path_buf[4..n].copy_from_slice(prog);
+                let n = 5 + prog.len();
+                path_buf[..5].copy_from_slice(b"boot/");
+                path_buf[5..n].copy_from_slice(prog);
                 &path_buf[..n]
             } else {
                 path_buf[..prog.len()].copy_from_slice(prog);
@@ -149,7 +151,7 @@ pub fn startup() -> ! {
     // TC 2.01 is freeware (Borland Antique Software), so this entire
     // self-build chain is publicly redistributable -- no proprietary
     // compiler in the boot path.
-    let tcc_path: &[u8] = if has_ext4 { b"tar/TC/TCC.EXE" } else { b"TC/TCC.EXE" };
+    let tcc_path: &[u8] = if has_ext4 { b"boot/TC/TCC.EXE" } else { b"TC/TCC.EXE" };
     if crate::kernel::exec::load_file_resolved(tcc_path).is_ok() {
         println!("Building COMMAND.COM from SRC\\COMMAND.C via TC...");
         run_dos_program(tcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
@@ -158,8 +160,8 @@ pub fn startup() -> ! {
 
     println!("Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
 
-    let dn_path: &[u8] = if has_ext4 { b"tar/DN/DN.COM" } else { b"DN/DN.COM" };
-    let dn_cwd: &[u8] = if has_ext4 { b"tar/" } else { b"" };
+    let dn_path: &[u8] = if has_ext4 { b"boot/DN/DN.COM" } else { b"DN/DN.COM" };
+    let dn_cwd: &[u8] = if has_ext4 { b"boot/" } else { b"" };
     println!("Starting DN...");
     loop {
         run_dos_program(dn_path, b"", dn_cwd);

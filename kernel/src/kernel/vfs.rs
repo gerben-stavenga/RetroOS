@@ -87,7 +87,7 @@ pub struct FileEntry {
 
 /// Mount table entry
 struct Mount {
-    prefix: &'static [u8],  // e.g. b"" for root, b"tar/" for sub-mount
+    prefix: &'static [u8],  // e.g. b"" for root, b"boot/" for sub-mount
     fs: &'static dyn Filesystem,
 }
 
@@ -423,7 +423,7 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
 }
 
 /// If a mount prefix is a direct child of `dir`, return the child name.
-/// e.g. mount "tar/" in dir "" → Some("tar"), mount "a/b/" in dir "a/" → Some("b").
+/// e.g. mount "boot/" in dir "" → Some("boot"), mount "a/b/" in dir "a/" → Some("b").
 fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     // Mount prefix must start with dir
     if prefix.len() <= dir.len() { return None; }
