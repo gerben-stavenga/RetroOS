@@ -25,14 +25,14 @@ _BUSYBOX_APPLETS = [
 ) for a in _BUSYBOX_APPLETS]
 
 # Pristine drop-in dirs: contents auto-shipped under the given DOS prefix.
-# Drop files into apps/tc/ or apps/TP70/ and they appear at C:\TC\... or
+# Drop files into apps-boot/tc/ or apps/TP70/ and they appear at C:\TC\... or
 # C:\TP70\... in the image on the next build — no per-file wiring.
-_TC_SRCS = glob(["apps/tc/**/*"], allow_empty = True)
+_TC_SRCS = glob(["apps-boot/tc/**/*"], allow_empty = True)
 _TP70_SRCS = glob(["apps/TP70/**/*"], allow_empty = True)
 
 pkg_tar(
     name = "tc_tar",
-    files = {":" + s: "TC/" + s[len("apps/tc/"):].upper() for s in _TC_SRCS},
+    files = {":" + s: "TC/" + s[len("apps-boot/tc/"):].upper() for s in _TC_SRCS},
 )
 
 pkg_tar(
@@ -63,23 +63,23 @@ _BASE_FILES = {
     # COMMAND.COM is built at boot by TC compiling SRC/COMMAND.C —
     # output lands in the VFS RAM overlay at /COMMAND.COM. No prebuilt
     # binary in the tar.
-    "//apps/command:command.c":          "SRC/COMMAND.C",
-    "//apps/command:LOADFIX.CFG":        "LOADFIX.CFG",
+    "//apps-boot/command:command.c":          "SRC/COMMAND.C",
+    "//apps-boot/command:LOADFIX.CFG":        "LOADFIX.CFG",
     "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
-    "apps/dn/DN.COM": "DN/DN.COM",
-    "apps/dn/DN.PRG": "DN/DN.PRG",
-    "apps/dn/DN.OVR": "DN/DN.OVR",
-    "apps/dn/DN.DLG": "DN/DN.DLG",
-    "apps/dn/DN.LNG": "DN/DN.LNG",
-    "apps/dn/DN.HLP": "DN/DN.HLP",
-    "apps/dn/DN.EDT": "DN/DN.EDT",
-    "apps/dn/DN.EXT": "DN/DN.EXT",
-    "apps/dn/DN.HGL": "DN/DN.HGL",
-    "apps/dn/DN.MNU": "DN/DN.MNU",
-    "apps/dn/DN.VWR": "DN/DN.VWR",
-    "apps/dn/DN.XRN": "DN/DN.XRN",
-    "apps/dn/DN.FLG": "DN/DN.FLG",
-    "apps/dn/DN.HIS": "DN/DN.HIS",
+    "apps-boot/dn/DN.COM": "DN/DN.COM",
+    "apps-boot/dn/DN.PRG": "DN/DN.PRG",
+    "apps-boot/dn/DN.OVR": "DN/DN.OVR",
+    "apps-boot/dn/DN.DLG": "DN/DN.DLG",
+    "apps-boot/dn/DN.LNG": "DN/DN.LNG",
+    "apps-boot/dn/DN.HLP": "DN/DN.HLP",
+    "apps-boot/dn/DN.EDT": "DN/DN.EDT",
+    "apps-boot/dn/DN.EXT": "DN/DN.EXT",
+    "apps-boot/dn/DN.HGL": "DN/DN.HGL",
+    "apps-boot/dn/DN.MNU": "DN/DN.MNU",
+    "apps-boot/dn/DN.VWR": "DN/DN.VWR",
+    "apps-boot/dn/DN.XRN": "DN/DN.XRN",
+    "apps-boot/dn/DN.FLG": "DN/DN.FLG",
+    "apps-boot/dn/DN.HIS": "DN/DN.HIS",
     # Tests
     "//apps/tests/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
     "//apps/tests/stress:stress_elf":       "TESTS/stress.elf",
@@ -97,7 +97,7 @@ _BASE_FILES = {
 }
 
 # Public image (shareware only). Games auto-globbed from //apps/games.
-# apps/tc and apps/TP70 are empty by default — drop in toolchain files to
+# apps-boot/tc and apps/TP70 are empty by default — drop in toolchain files to
 # enable the in-OS self-build of COMMAND.COM at boot, or to ship Turbo Pascal.
 pkg_tar(
     name = "fs_tar",
