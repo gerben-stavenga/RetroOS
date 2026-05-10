@@ -35,7 +35,7 @@ pub fn startup() -> ! {
 
     // Scan MBR partition table: 4 entries at 0x1BE, each 16 bytes
     // Entry: [status, CHS_start(3), type, CHS_end(3), LBA_start(4), LBA_size(4)]
-    let mut has_ext4 = false;
+    // Layout: 0xDA boot bundle TAR (mounts at /boot/) + 0x83 ext4 (root).
     for i in 0..4 {
         let base = 0x1BE + i * 16;
         let ptype = mbr[base + 4];
@@ -44,37 +44,31 @@ pub fn startup() -> ! {
 
         match ptype {
             0xDA => {
-                // TAR filesystem
                 println!("Partition {}: TAR at sector {:#x}", i, lba);
                 unsafe {
                     ROOT_TARFS = TarFs::new(lba);
                     (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
                 }
             }
-            0x83 if !has_ext4 => {
-                // Linux ext4
+            0x83 => {
                 println!("Partition {}: ext4 at sector {:#x}", i, lba);
                 match Ext4Fs::new(lba) {
                     Ok(fs) => {
                         let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                         unsafe { EXT4_FS = Some(leaked); }
                         vfs::mount(b"", leaked);
-                        has_ext4 = true;
                         println!("  ext4 mounted as root");
                     }
-                    Err(e) => println!("  ext4 mount failed: {}", e),
+                    Err(e) => panic!("ext4 mount failed: {}", e),
                 }
             }
             _ => {}
         }
     }
 
-    // Mount TAR: at "boot/" if ext4 is root, otherwise as root itself.
-    // The TAR holds the boot-critical bundle (kernel, TC, DN,
-    // COMMAND.C); "boot/" is more accurate than the legacy "tar/".
-    let tar_prefix: &[u8] = if has_ext4 { b"boot/" } else { b"" };
+    // Boot bundle TAR mounts at /boot/; the ext4 root holds everything else.
     #[allow(static_mut_refs)]
-    unsafe { vfs::mount(tar_prefix, &ROOT_TARFS); }
+    unsafe { vfs::mount(b"boot/", &ROOT_TARFS); }
 
     // Mount host filesystem on COM1 serial (hostfs.py must be running)
     if crate::kernel::hostfs::init() {
@@ -114,22 +108,13 @@ pub fn startup() -> ! {
             let tail_raw = if split < cmdline.len() { &cmdline[split + 1..] } else { &[][..] };
             let tail = trim_ascii(tail_raw);
 
-            let mut path_buf = [0u8; 260];
-            let path: &[u8] = if has_ext4 {
-                let n = 5 + prog.len();
-                path_buf[..5].copy_from_slice(b"boot/");
-                path_buf[5..n].copy_from_slice(prog);
-                &path_buf[..n]
-            } else {
-                path_buf[..prog.len()].copy_from_slice(prog);
-                &path_buf[..prog.len()]
-            };
+            let path = prog;
 
             let cwd: &[u8] = match explicit_cwd {
                 Some(c) => c,
                 None => {
                     let cwd_end = path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
-                    &path_buf[..cwd_end]
+                    &path[..cwd_end]
                 }
             };
             println!("Starting {} {} (cwd={})...",
@@ -142,29 +127,24 @@ pub fn startup() -> ! {
         crate::arch::shutdown();
     }
 
-    // Self-build: if Turbo C is on the image, compile SRC\COMMAND.C
-    // -> root COMMAND.COM via TC at boot. The output lands in the VFS
-    // RAM overlay, shadowing any pre-built COMMAND.COM that ships in
-    // the tar. DN's EXEC of "COMMAND.COM /C ..." then picks up the
-    // freshly-built one.
+    // Self-build: if Turbo C is on the image, compile BOOT\SRC\COMMAND.C
+    // -> root COMMAND.COM via TC at boot. cwd="" so TCC writes the linker
+    // output to the drive root (C:\COMMAND.COM, on the ext4 partition);
+    // DN's EXEC of "COMMAND.COM /C ..." then picks up the freshly-built one.
     //
     // TC 2.01 is freeware (Borland Antique Software), so this entire
-    // self-build chain is publicly redistributable -- no proprietary
-    // compiler in the boot path.
-    let tcc_path: &[u8] = if has_ext4 { b"boot/TC/TCC.EXE" } else { b"TC/TCC.EXE" };
-    if crate::kernel::exec::load_file_resolved(tcc_path).is_ok() {
-        println!("Building COMMAND.COM from SRC\\COMMAND.C via TC...");
-        run_dos_program(tcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
+    // self-build chain is publicly redistributable.
+    if crate::kernel::exec::load_file_resolved(b"boot/TC/TCC.EXE").is_ok() {
+        println!("Building COMMAND.COM from BOOT\\SRC\\COMMAND.C via TC...");
+        run_dos_program(b"boot/TC/TCC.EXE", b"-mt -lt BOOT\\SRC\\COMMAND.C", b"");
         println!("Build done.");
     }
 
     println!("Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
 
-    let dn_path: &[u8] = if has_ext4 { b"boot/DN/DN.COM" } else { b"DN/DN.COM" };
-    let dn_cwd: &[u8] = if has_ext4 { b"boot/" } else { b"" };
     println!("Starting DN...");
     loop {
-        run_dos_program(dn_path, b"", dn_cwd);
+        run_dos_program(b"boot/DN/DN.COM", b"", b"");
         println!("DN exited, restarting...");
     }
 }

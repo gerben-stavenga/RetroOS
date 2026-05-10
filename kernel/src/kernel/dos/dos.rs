@@ -3057,9 +3057,7 @@ pub(super) const ENV_PARAS: u16 = 32;       // = 512 bytes (DOS5 typical /E:512)
 /// inheritance comes from the actual parent's env block, not from here.
 pub(super) const MASTER_ENV: &[u8] = b"\
 COMSPEC=C:\\COMMAND.COM\0\
-PATH=C:\\;C:\\TC\0\
-INCLUDE=C:\\TC\\INCLUDE\0\
-LIB=C:\\TC\\LIB\0\0";
+PATH=C:\\;C:\\BOOT\\TC\0\0";
 
 /// Borrow `len` bytes of an env block at `env_seg` as a writable slice.
 /// Used by `fill_env` to populate a freshly-allocated env block.
