@@ -140,18 +140,19 @@ pub fn startup() -> ! {
         crate::arch::shutdown();
     }
 
-    // Self-build: if Borland C is on the image, compile SRC\COMMAND.C →
-    // root COMMAND.COM via BCC at boot. The output lands in the VFS RAM
-    // overlay, shadowing the BC++-built COMMAND.COM that ships in the
-    // tar. DN's EXEC of "COMMAND.COM /C ..." then picks up the freshly-
-    // built one. With BCC absent, the tar's pre-built
-    // COMMAND.COM is what runs.
-    let bcc_path: &[u8] = if has_ext4 { b"tar/BORLANDC/BIN/BCC.EXE" } else { b"BORLANDC/BIN/BCC.EXE" };
-    if crate::kernel::exec::load_file_resolved(bcc_path).is_ok() {
-        // BCC compiles, then EXECs TLINK from PATH. MASTER_ENV prefers
-        // C:\BORLANDC\BIN so this exercises Borland C's DPMI TLINK.
-        println!("Building COMMAND.COM from SRC\\COMMAND.C via BCC + Borland TLINK...");
-        run_dos_program(bcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
+    // Self-build: if Turbo C is on the image, compile SRC\COMMAND.C
+    // -> root COMMAND.COM via TC at boot. The output lands in the VFS
+    // RAM overlay, shadowing any pre-built COMMAND.COM that ships in
+    // the tar. DN's EXEC of "COMMAND.COM /C ..." then picks up the
+    // freshly-built one.
+    //
+    // TC 2.01 is freeware (Borland Antique Software), so this entire
+    // self-build chain is publicly redistributable -- no proprietary
+    // compiler in the boot path.
+    let tcc_path: &[u8] = if has_ext4 { b"tar/TC/TCC.EXE" } else { b"TC/TCC.EXE" };
+    if crate::kernel::exec::load_file_resolved(tcc_path).is_ok() {
+        println!("Building COMMAND.COM from SRC\\COMMAND.C via TC...");
+        run_dos_program(tcc_path, b"-mt -lt SRC\\COMMAND.C", b"");
         println!("Build done.");
     }
 
