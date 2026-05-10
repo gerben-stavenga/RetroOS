@@ -146,6 +146,12 @@ pub struct DosState {
     pub find_path: [u8; 96],
     pub find_path_len: u8,
     pub find_idx: u16,
+    /// FCB-FindFirst (AH=11h) state remembered across to FindNext (AH=12h):
+    /// the drive number to report in the DTA result FCB and whether the
+    /// caller used an extended FCB (0xFF prefix in their input FCB) so the
+    /// DTA write reproduces the same prefix layout.
+    pub fcb_search_drive: u8,
+    pub fcb_search_ext: bool,
 
     /// DOS File System wrapper — sole DOS↔VFS translator.
     /// Tracks cwd in DOS form (uppercase, backslashes, no drive/root).
@@ -226,6 +232,8 @@ impl DosState {
             find_path: [0; 96],
             find_path_len: 0,
             find_idx: 0,
+            fcb_search_drive: 0,
+            fcb_search_ext: false,
             dfs: dfs::DfsState::new(),
             dos_blocks: alloc::vec::Vec::new(),
             ldt,

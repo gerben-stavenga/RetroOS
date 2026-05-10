@@ -1279,6 +1279,175 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             thread::KernelAction::Done
         }
+        // AH=0x11h FCB FindFirst / AH=0x12h FCB FindNext.
+        //
+        // The CP/M-era file-find API. Caller fills an "unopened FCB"
+        // at DS:DX with `drive(1B) + name(8B,space-pad) + ext(3B,
+        // space-pad)`; DOS scans the drive's directory for matches
+        // against the (`?`/`*`-wildcarded) pattern, writes a
+        // "search FCB" into the current DTA on a hit, returns AL=00
+        // (found) or AL=FF (no match). FindNext (AH=12) takes no
+        // input — it reads the previous DTA + our find_idx state
+        // and continues the scan.
+        //
+        // Standard FCB layout in DTA after FindFirst:
+        //   off 0x00 : drive (1=A, 2=B, ...) of matched file
+        //   off 0x01 : 8-byte matched filename, space-padded
+        //   off 0x09 : 3-byte matched extension, space-padded
+        //   off 0x0C : 2B current block (we set 0)
+        //   off 0x0E : 2B record size (we set 128)
+        //   off 0x10 : 4B file size (DWORD)
+        //   off 0x14 : 2B date (DOS format)
+        //   off 0x16 : 2B time (DOS format)
+        //   off 0x18 : 8B reserved (DOS-internal next-search state)
+        //
+        // Extended FCB (caller's FCB[0] == 0xFF): 7-byte prefix
+        // before the standard FCB. Marker, 5 reserved, attribute
+        // byte. Our DTA write mirrors that prefix.
+        0x11 | 0x12 => {
+            if ah == 0x11 {
+                // FindFirst: parse FCB → compose DOS path → seed
+                // dos.find_path / dos.find_idx, then drop into the
+                // shared scan loop below.
+                let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
+                let (is_ext, fcb_off) = unsafe {
+                    if *(addr as *const u8) == 0xFF { (true, 7) } else { (false, 0) }
+                };
+                let fcb_base = addr.wrapping_add(fcb_off);
+                let drive_byte = unsafe { *(fcb_base as *const u8) };
+                let name = unsafe { core::slice::from_raw_parts((fcb_base + 1) as *const u8, 8) };
+                let ext = unsafe { core::slice::from_raw_parts((fcb_base + 9) as *const u8, 3) };
+                // Build "[X:][cwd\]NAME[.EXT]" — wildcards stay as-is
+                // ('?' for single, real chars for literal). resolve()
+                // uppercases and applies cwd.
+                let mut dos_path = [0u8; 96];
+                let mut dpos = 0;
+                if drive_byte != 0 && drive_byte <= 26 {
+                    dos_path[0] = b'A' - 1 + drive_byte;
+                    dos_path[1] = b':';
+                    dos_path[2] = b'\\';
+                    dpos = 3;
+                }
+                let mut k = 0;
+                for &c in name { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; k += 1; }
+                let _ = k;
+                let mut has_ext = false;
+                for &c in ext { if c != b' ' { has_ext = true; break; } }
+                if has_ext {
+                    dos_path[dpos] = b'.'; dpos += 1;
+                    for &c in ext { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; }
+                }
+                let mut abs = [0u8; dfs::DFS_PATH_MAX];
+                let alen = match dos.dfs.resolve(&dos_path[..dpos], &mut abs) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        regs.rax = (regs.rax & !0xFF) | 0xFF;
+                        return thread::KernelAction::Done;
+                    }
+                };
+                let split = abs[..alen].iter().rposition(|&b| b == b'\\').unwrap_or(0);
+                let dir_dos = &abs[..split + 1];
+                let pat = &abs[split + 1..alen];
+                let dir_for_walk = if dir_dos.len() > 3 { &dir_dos[..dir_dos.len() - 1] } else { dir_dos };
+                let mut vfs_dir = [0u8; dfs::DFS_PATH_MAX];
+                let vlen = match dfs::DfsState::to_vfs_open(dir_for_walk, &mut vfs_dir) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        regs.rax = (regs.rax & !0xFF) | 0xFF;
+                        return thread::KernelAction::Done;
+                    }
+                };
+                let mut pos = 0;
+                for &b in &vfs_dir[..vlen] {
+                    if pos < dos.find_path.len() { dos.find_path[pos] = b; pos += 1; }
+                }
+                if vlen > 0 && pos < dos.find_path.len() {
+                    dos.find_path[pos] = b'/'; pos += 1;
+                }
+                for &b in pat {
+                    if pos < dos.find_path.len() { dos.find_path[pos] = b; pos += 1; }
+                }
+                dos.find_path_len = pos as u8;
+                dos.find_idx = 0;
+                // Stash the drive number + extended-marker for the
+                // DTA write below. Drive 0 in the FCB means "current",
+                // which our DTA result must report as the actual drive.
+                dos.fcb_search_drive = if drive_byte == 0 {
+                    // Default drive: derive from resolved abs path.
+                    if alen >= 2 && abs[1] == b':' { abs[0] - b'A' + 1 } else { 3 /* C: */ }
+                } else { drive_byte };
+                dos.fcb_search_ext = is_ext;
+            }
+            // Shared FindFirst/FindNext scan: walk DFS CI cache from
+            // dos.find_idx, return on first match.
+            let path_len = dos.find_path_len as usize;
+            let full = &dos.find_path[..path_len];
+            let split = full.iter().rposition(|&b| b == b'/').map(|i| i + 1).unwrap_or(0);
+            let dir = &full[..split];
+            let mut pat_buf = [0u8; 32];
+            let plen = (path_len - split).min(pat_buf.len());
+            pat_buf[..plen].copy_from_slice(&full[split..split + plen]);
+            let pat = &pat_buf[..plen];
+            let dir_for_ci = if dir.last() == Some(&b'/') { &dir[..dir.len() - 1] } else { dir };
+            let mut idx = dos.find_idx as usize;
+            let drive = dos.fcb_search_drive;
+            let is_ext = dos.fcb_search_ext;
+            loop {
+                match dfs::ci::entry_at(dir_for_ci, idx) {
+                    Some((alias, size, is_dir)) => {
+                        idx += 1;
+                        if !dos_wildcard_match(pat, alias) { continue; }
+                        dos.find_idx = idx as u16;
+                        // Write search FCB into DTA. Layout above.
+                        let dta = dos.dta;
+                        unsafe {
+                            let p = dta as *mut u8;
+                            // Zero the (extended-prefix + 32-byte) area first.
+                            let total = if is_ext { 7 + 32 } else { 32 };
+                            core::ptr::write_bytes(p, 0, total);
+                            let fcb_base = if is_ext {
+                                *p = 0xFF;
+                                *p.add(6) = if is_dir { 0x10 } else { 0x20 };
+                                p.add(7)
+                            } else {
+                                p
+                            };
+                            *fcb_base = drive;
+                            // Split alias (e.g. "CIV.EXE" or "AUTOEXEC.BAT")
+                            // into 8-char name + 3-char ext, space-padded.
+                            let mut name_buf = [b' '; 8];
+                            let mut ext_buf = [b' '; 3];
+                            let dot = alias.iter().position(|&c| c == b'.');
+                            let (n, e) = match dot {
+                                Some(d) => (&alias[..d], &alias[d + 1..]),
+                                None => (alias, &[][..]),
+                            };
+                            for (i, &c) in n.iter().take(8).enumerate() {
+                                name_buf[i] = c.to_ascii_uppercase();
+                            }
+                            for (i, &c) in e.iter().take(3).enumerate() {
+                                ext_buf[i] = c.to_ascii_uppercase();
+                            }
+                            core::ptr::copy_nonoverlapping(name_buf.as_ptr(), fcb_base.add(1), 8);
+                            core::ptr::copy_nonoverlapping(ext_buf.as_ptr(), fcb_base.add(9), 3);
+                            // current block = 0 (offsets 0x0C-0x0D), record
+                            // size = 128 (0x0E-0x0F), file size at 0x10-0x13.
+                            (fcb_base.add(0x0E) as *mut u16).write_unaligned(128);
+                            (fcb_base.add(0x10) as *mut u32).write_unaligned(size);
+                            // Date = 1980-01-01 (0x0021), time = 00:00:00.
+                            (fcb_base.add(0x14) as *mut u16).write_unaligned(0x0021);
+                            (fcb_base.add(0x16) as *mut u16).write_unaligned(0);
+                        }
+                        regs.rax = regs.rax & !0xFF;
+                        return thread::KernelAction::Done;
+                    }
+                    None => {
+                        regs.rax = (regs.rax & !0xFF) | 0xFF;
+                        return thread::KernelAction::Done;
+                    }
+                }
+            }
+        }
         // AH=0x29: Parse filename into FCB (DS:SI=string, ES:DI=FCB)
         // AL bits: 0=skip leading separators, 1=set drive only if specified,
         //          2=set filename only if specified, 3=set extension only if specified
