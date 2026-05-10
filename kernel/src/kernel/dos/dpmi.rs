@@ -1374,7 +1374,6 @@ pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
 
     stub.restore_gp(regs);
     save.restore(regs);
-    sync_psp_view_for_regs(dos, regs);
     dos.pc.locked_stack.other_stack = save.other_stack();
 
     // callback_entry path: ModeSave captured RM, so we just restored to
