@@ -57,6 +57,18 @@
       we see the entry AX/CX/DX of every INT 15h call (we don't trap
       these otherwise — IVT goes through real-mode dispatch).
 
+## Duke Nukem 3D — via DOS/4GW (no LOADFIX wrap)
+- [ ] With DOS32A wrap (LOADFIX) it works; without, DOS/4GW triggers an
+      infinite exception loop. PM #13 fires → DOS/4GW handler RETFs with
+      ExcFrame32 modified to resume in VM86 at `0000:0x10B` (an IVT-area
+      address) → #UD → DOS/4GW's #UD handler is a decode/skip emulator
+      that advances EIP into more IVT garbage → loop, leaking ~60 stack
+      bytes per iteration. DOS/4GW evidently expects its RM panic stub
+      to be present at some low-memory address that we don't set up.
+      Kernel panic on the *first* loop iteration was fixed by zeroing
+      DS/ES/FS/GS in VM86-source dispatch (DPMI 0.9 §6.1.4); the loop
+      itself is a DOS/4GW-internal issue.
+
 ## Pinball Fantasies
 - [ ] Doesn't boot. INTRO.PRG loads, sets mode 13h, never paints the
       LucasArts/intro logo. Spends ~80 % of runtime in a tight VSYNC-
