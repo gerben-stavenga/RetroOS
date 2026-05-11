@@ -1891,6 +1891,7 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     let err_code = regs.err_code as u32;
 
     // Capture faulting state *before* switch_to_pm_side mutates regs.
+    let from_vm86 = regs.mode() == crate::UserMode::VM86;
     let f_eip    = regs.ip32();
     let f_cs     = regs.code_seg();
     let f_eflags = regs.flags32();
@@ -1956,6 +1957,18 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     regs.frame.rsp = new_sp as u64;
     regs.frame.cs = handler_sel as u64;
     regs.set_ip32(handler_off);
+
+    // DPMI 0.9 §6.1.4: when a VM86-source fault is reflected to a PM
+    // handler, DS/ES/FS/GS are "undefined" -- most hosts zero them.
+    // Without this, the kernel's IRET-to-handler tries to load the
+    // user's old VM86 paragraph values (e.g. DS=0xBE74) as PM selectors
+    // and #GPs in ring 0. PM-origin faults keep the cached PM segs.
+    if from_vm86 {
+        regs.ds = 0;
+        regs.es = 0;
+        regs.fs = 0;
+        regs.gs = 0;
+    }
 
     thread::KernelAction::Done
 }
