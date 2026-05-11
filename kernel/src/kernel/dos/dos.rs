@@ -3168,7 +3168,17 @@ pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
 /// suppressed — the SLOT_RESUME handler manages the pop itself.
 pub(crate) const SLOT_RESUME: u8 = 0x76;
 pub(crate) const SLOT_SAVE_RESTORE: u8 = 0xFD;
+/// DPMI 0.9 exception RETF target. Handler installed via Function
+/// 0203H pops the FAR-call return at the bottom of the spec frame and
+/// lands here; kernel reads handler-modified faulting fields from the
+/// 0.9 portion (at +00..+1FH in the frame) and discards the rest.
 pub(crate) const SLOT_EXCEPTION_RET: u8 = 0xFE;
+/// DPMI 1.0 expanded-frame exception RETF target. Handler installed
+/// via Function 0212H/0213H does `ADD (E)SP, 0x20; RETF` to skip past
+/// the 0.9 portion and pops the FAR-call return at the +20H slot of
+/// the expanded frame, landing here; kernel reads handler-modified
+/// faulting fields from the 1.0 expanded portion (at +20H..+57H).
+pub(crate) const SLOT_EXCEPTION_RET_V10: u8 = 0xFB;
 pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// PMDOS INT 21 short-circuit. When `dpmi.pm_dos` is set (16-bit DPMI
 /// clients by default), `pm_vectors[0x21]` points here instead of the

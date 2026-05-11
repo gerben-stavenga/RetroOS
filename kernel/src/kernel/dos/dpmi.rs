@@ -80,9 +80,24 @@ pub struct DpmiState {
     pub raw_rm_state: RawModeState,
     /// Hidden protected-mode state for raw mode switches (INT 31h/0305h/0306h).
     pub raw_pm_state: RawModeState,
-    /// Exception handler vectors (set via INT 31h/0203h)
-    /// (selector, offset) for exceptions 0x00-0x1F
+    /// DPMI 0.9 exception handler vectors (set via INT 31h/0203H).
+    /// A 0.9 handler covers BOTH PM-origin and VM86-origin faults for
+    /// the vector; it serves as the fallback whenever the matching
+    /// 1.0-specific table below has slot (0, 0). Spec-defined range
+    /// is 0..14, but we keep 32 slots so the lookup tables share an
+    /// index basis.
     pub exc_vectors: [(u16, u32); 32],
+    /// DPMI 1.0 protected-mode exception handler vectors (set via
+    /// INT 31h/0212H). Consulted first when a fault originated in PM
+    /// (`from_vm86 == false`); takes precedence over the 0.9 fallback.
+    pub pm_exc_vectors: [(u16, u32); 32],
+    /// DPMI 1.0 real-mode exception handler vectors (set via INT
+    /// 31h/0213H). Consulted first when a fault originated in VM86
+    /// (`from_vm86 == true`); takes precedence over the 0.9 fallback.
+    /// Per DPMI 1.0 §6.1.4 the handler runs in PM with an implied
+    /// mode switch — the selector:offset is a PM target, not a real
+    /// segment:offset.
+    pub rm_exc_vectors: [(u16, u32); 32],
     /// Real-mode callbacks (INT 31h/0303h)
     /// Each entry: Some((pm_cs, pm_eip, rm_struct_sel, rm_struct_off))
     pub callbacks: [Option<(u16, u32, u16, u32)>; MAX_CALLBACKS],
@@ -146,6 +161,8 @@ impl DpmiState {
             raw_rm_state: RawModeState::default(),
             raw_pm_state: RawModeState::default(),
             exc_vectors: [(0, 0); 32],
+            pm_exc_vectors: [(0, 0); 32],
+            rm_exc_vectors: [(0, 0); 32],
             callbacks: [None; MAX_CALLBACKS],
             client_use32: false,
             saved_rm_psp: 0,
@@ -916,6 +933,68 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 set_carry(regs);
             }
         }
+        // AX=0210h — Get Extended Processor Exception Handler Vector (PM)
+        // BL = exception number (00H-1FH). Returns CX:(E)DX = selector:offset
+        // of the 1.0 PM handler. Range is the full 0..31, vs 0..14 for 0202H.
+        0x0210 => {
+            let exc = regs.rbx as u8;
+            if (exc as usize) < 32 {
+                let (sel, off) = dpmi.pm_exc_vectors[exc as usize];
+                regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
+                regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
+                clear_carry(regs);
+            } else {
+                regs.rax = 0x8021;
+                set_carry(regs);
+            }
+        }
+        // AX=0211h — Get Extended Processor Exception Handler Vector (RM)
+        // BL = exception number (00H-1FH). Returns CX:(E)DX = selector:offset
+        // of the 1.0 RM handler (PM target — host does implied mode switch).
+        0x0211 => {
+            let exc = regs.rbx as u8;
+            if (exc as usize) < 32 {
+                let (sel, off) = dpmi.rm_exc_vectors[exc as usize];
+                regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
+                regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
+                clear_carry(regs);
+            } else {
+                regs.rax = 0x8021;
+                set_carry(regs);
+            }
+        }
+        // AX=0212h — Set Extended Processor Exception Handler Vector (PM)
+        // BL = exception number (00H-1FH), CX:(E)DX = handler. Installs into
+        // the PM-origin table, leaving the 0.9 slot (exc_vectors) untouched
+        // so it remains the fallback for vectors without a 1.0 handler.
+        0x0212 => {
+            let exc = regs.rbx as u8;
+            if (exc as usize) < 32 {
+                dpmi.pm_exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
+                dos_trace!("[DPMI] 0212 set PM exception {:02X} = {:04X}:{:08X}",
+                    exc, regs.rcx as u16, regs.rdx as u32);
+                clear_carry(regs);
+            } else {
+                regs.rax = 0x8021;
+                set_carry(regs);
+            }
+        }
+        // AX=0213h — Set Extended Processor Exception Handler Vector (RM)
+        // BL = exception number (00H-1FH), CX:(E)DX = handler (PM target).
+        // Installs into the RM-origin table; host does an implied mode switch
+        // to PM to invoke the handler when a VM86-origin fault hits.
+        0x0213 => {
+            let exc = regs.rbx as u8;
+            if (exc as usize) < 32 {
+                dpmi.rm_exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
+                dos_trace!("[DPMI] 0213 set RM exception {:02X} = {:04X}:{:08X}",
+                    exc, regs.rcx as u16, regs.rdx as u32);
+                clear_carry(regs);
+            } else {
+                regs.rax = 0x8021;
+                set_carry(regs);
+            }
+        }
         // AX=0204h — Get Protected Mode Interrupt Vector
         // BL = interrupt number. Returns: CX:EDX = selector:offset
         // If no client handler is installed, synthesize the address of the
@@ -993,14 +1072,44 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         }
         // AX=0400h — Get DPMI Version
         // Returns: AH=major, AL=minor, BX=flags, CL=processor, DH=master PIC, DL=slave PIC
+        // BX bits: 0=32-bit, 1=returns to RM (else VM86), 2=virtual memory
+        // supported. We're 32-bit with demand-paged VM (0501H allocations are
+        // lazy-committed via #PF — see `mem_next` bump-only logic at the
+        // allocator), so bits 0 and 2 are set.
         0x0400 => {
-            regs.rax = (regs.rax & !0xFFFF) | 0x005A; // version 0.90
-            regs.rbx = (regs.rbx & !0xFFFF) | 0x0005; // 32-bit, no virtual memory
+            regs.rax = (regs.rax & !0xFFFF) | 0x0100; // version 1.00
+            regs.rbx = (regs.rbx & !0xFFFF) | 0x0005; // 32-bit + VM
             regs.rcx = (regs.rcx & !0xFF) | 0x03;     // 386 processor
             // DH = master PIC base vector, DL = slave PIC base vector
             // Report 0x08/0x70 (matching real-mode BIOS mapping) so DJGPP hooks
             // IRQ 1 as INT 9 (keyboard), IRQ 0 as INT 8 (timer), etc.
             regs.rdx = (regs.rdx & !0xFFFF) | ((0x08 << 8) | 0x70) as u64;
+            clear_carry(regs);
+        }
+        // AX=0401h — Get DPMI Capabilities (DPMI 1.0)
+        // ES:(E)DI = 128-byte buffer for host major/minor + vendor string.
+        // Returns AX=capability flags, CX=DX=0 (reserved). All optional 1.0
+        // features (page A/D, device mapping, demand zero-fill, write-protect)
+        // are reported as not-supported — we're a no-frills demand-paged host
+        // and clients should fall back to plain 0501H/0502H allocation. The
+        // spec allows AX=0 even under VM, since every cap here is optional
+        // when virtual memory is supported.
+        0x0401 => {
+            regs.rax = regs.rax & !0xFFFF;            // AX = 0  (no optional caps)
+            regs.rcx = regs.rcx & !0xFFFF;            // CX = 0  (reserved)
+            regs.rdx = regs.rdx & !0xFFFF;            // DX = 0  (reserved)
+            let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
+            // Buffer layout (DPMI 1.0 §3.4): [0]=major (decimal), [1]=minor,
+            // [2..]=ASCIIZ vendor identifier (≤126 bytes).
+            const VENDOR: &[u8] = b"RetroOS DPMI Host\0";
+            unsafe {
+                let buf = dest as *mut u8;
+                core::ptr::write(buf, 1);             // host major = 1
+                core::ptr::write(buf.add(1), 0);      // host minor = 0
+                for (i, &b) in VENDOR.iter().enumerate() {
+                    core::ptr::write(buf.add(2 + i), b);
+                }
+            }
             clear_carry(regs);
         }
         // AX=0500h — Get Free Memory Information
@@ -1765,28 +1874,44 @@ struct RetF32 { ret_eip: u32, ret_cs: u32 }
 #[derive(Clone, Copy)]
 struct RetF16 { ret_ip: u16, ret_cs: u16 }
 
-/// 32-bit DPMI 1.0 exception spec frame. Sits above `RetF32` on the
-/// host stack as its own region, distinct from `ModeSave`. dispatch
-/// writes the whole struct seeded from the pre-fault register state;
-/// exception_return reads it back and copies handler-modified
-/// faulting fields into `ModeSave`. The DPMI 1.0 extension fields
-/// (ds/es/fs/gs/cr2) are seeded with pre-fault values; modifications
-/// are discarded -- the bytes the handler leaves there are
-/// register-spill scratch, not intentional segment values.
+/// 32-bit DPMI 0.9 exception spec frame body (24 bytes). Sits above
+/// `RetF32` on the host stack. Per DPMI 0.9 §6.1.4, handler entry SS:ESP
+/// points at RetF32, the 0.9 body lives at +08H..+1FH.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ExcFrame32 {
-    err_code: u32,
-    eip:      u32,
-    cs:       u32,
-    eflags:   u32,
-    esp:      u32,
-    ss:       u32,
-    ds:       u32,
-    es:       u32,
-    fs:       u32,
-    gs:       u32,
-    cr2:      u32,
+    err_code: u32,    // +08H
+    eip:      u32,    // +0CH
+    cs:       u32,    // +10H  (low 16 = CS, high 16 = reserved)
+    eflags:   u32,    // +14H
+    esp:      u32,    // +18H
+    ss:       u32,    // +1CH  (low 16 = SS, high 16 = reserved)
+}
+
+/// DPMI 1.0 expanded exception frame body (56 bytes). Sits at
+/// SS:(E)SP+20H regardless of client/handler bitness — per spec, the
+/// expanded frame always uses 32-bit fields and lives above the 0.9
+/// frame. We unconditionally write this on every dispatch so a future
+/// 0212H/0213H install path has the data already in place; a 0.9
+/// handler (Function 0203H install) reads only the +0..+1FH portion
+/// and is oblivious to the bytes above.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ExcFrameV10 {
+    ret_eip:   u32,   // +20H  Return EIP (or CS:IP for 16-bit handler)
+    ret_cs:    u32,   // +24H  Return CS (low 16) + Reserved (high 16)
+    err_code:  u32,   // +28H  Error code (duplicate of 0.9 +08H)
+    eip:       u32,   // +2CH  Faulting EIP (duplicate of 0.9 +0CH)
+    cs_xinfo:  u32,   // +30H  Faulting CS (low 16) + ExceptionInfoBits (high 16)
+    eflags:    u32,   // +34H  Faulting EFLAGS (duplicate of 0.9 +14H)
+    esp:       u32,   // +38H  Faulting ESP (duplicate of 0.9 +18H)
+    ss:        u32,   // +3CH  Faulting SS (low 16) + Reserved (high 16)
+    es:        u32,   // +40H  ES (low 16) + Reserved (high 16)
+    ds:        u32,   // +44H  DS (low 16) + Reserved (high 16)
+    fs:        u32,   // +48H  FS (low 16) + Reserved (high 16)
+    gs:        u32,   // +4CH  GS (low 16) + Reserved (high 16)
+    cr2:       u32,   // +50H  CR2 (valid only for #PF / INT 0EH)
+    pte:       u32,   // +54H  PTE (valid only for #PF / INT 0EH)
 }
 
 /// 16-bit DPMI 0.9 exception spec frame. Sits above `RetF16` on the
@@ -1794,43 +1919,69 @@ struct ExcFrame32 {
 /// ModeSave's u32 fields). dispatch writes the whole struct;
 /// exception_return reads it back, copies handler-modified faulting
 /// fields into the low halves of ModeSave's u32 fields.
+///
+/// The trailing `_pad` bytes bring `RetF16 + ExcFrame16` to exactly 32
+/// bytes (0x20). A 16-bit 0.9 handler reads at +00H..+0FH and is
+/// oblivious to the padding above; but the constant 0x20 footprint
+/// leaves a stable +20H offset to drop the DPMI 1.0 expanded frame
+/// into when/if a 0212H/0213H handler is installed.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ExcFrame16 {
-    err_code: u16,
-    ip:       u16,
-    cs:       u16,
-    flags:    u16,
-    sp:       u16,
-    ss:       u16,
+    err_code: u16,    // +04H from SS:SP
+    ip:       u16,    // +06H
+    cs:       u16,    // +08H
+    flags:    u16,    // +0AH
+    sp:       u16,    // +0CH
+    ss:       u16,    // +0EH
+    _pad:     [u16; 8], // +10H..+1FH (reserved for 1.0 expanded-frame slot)
 }
 
 /// Dispatch a CPU exception to the client's exception handler (set via INT 31h/0203h).
 /// If no handler is set, kill the thread.
 ///
-/// DPMI 0.9 exception handler calling convention. The handler is called with a
-/// FAR CALL. Frame width depends on the client type (16-bit clients get word
-/// fields, 32-bit clients get dword fields).
+/// We unconditionally write the full DPMI 1.0 layout on every dispatch:
+/// the 0.9 portion (sized for client_use32) at +00..+1FH, followed by
+/// the 1.0 expanded frame at +20H..+57H. A 0.9 (0203H) handler reads
+/// only the +0..+1FH portion; a 1.0 (0212H/0213H, not yet implemented)
+/// handler additionally reads the expanded portion. Total = 88 bytes.
 ///
-/// 32-bit client frame:
-///   [ESP+0]  Return EIP (points to DPMI host retf stub)
-///   [ESP+4]  Return CS (DPMI host code selector)
-///   [ESP+8]  Error code (dword)
-///   [ESP+12] Faulting EIP
-///   [ESP+16] Faulting CS
-///   [ESP+20] Faulting EFLAGS
-///   [ESP+24] Faulting ESP
-///   [ESP+28] Faulting SS
+/// 32-bit client 0.9 portion:
+///   [ESP+0]   Return EIP (points to SLOT_EXCEPTION_RET stub)
+///   [ESP+4]   Return CS  (special-stub selector)
+///   [ESP+8]   Error code (dword)
+///   [ESP+12]  Faulting EIP
+///   [ESP+16]  Faulting CS (low 16) + Reserved
+///   [ESP+20]  Faulting EFLAGS
+///   [ESP+24]  Faulting ESP
+///   [ESP+28]  Faulting SS (low 16) + Reserved
 ///
-/// 16-bit client frame (all fields are words):
-///   [SP+0]   Return IP
-///   [SP+2]   Return CS
-///   [SP+4]   Error code
-///   [SP+6]   Faulting IP
-///   [SP+8]   Faulting CS
-///   [SP+10]  Faulting FLAGS
-///   [SP+12]  Faulting SP
-///   [SP+14]  Faulting SS
+/// 16-bit client 0.9 portion (word fields, then padding to +1FH):
+///   [SP+0]    Return IP
+///   [SP+2]    Return CS
+///   [SP+4]    Error code
+///   [SP+6]    Faulting IP
+///   [SP+8]    Faulting CS
+///   [SP+10]   Faulting FLAGS
+///   [SP+12]   Faulting SP
+///   [SP+14]   Faulting SS
+///   [SP+16..+31] Reserved padding
+///
+/// 1.0 expanded portion (always 32-bit fields, written at +20H..+57H):
+///   [ESP+0x20] Return EIP (for ADD ESP,0x20; RETF path — same stub)
+///   [ESP+0x24] Return CS  + Reserved
+///   [ESP+0x28] Error code (duplicate)
+///   [ESP+0x2C] Faulting EIP (duplicate)
+///   [ESP+0x30] Faulting CS (low 16) + ExceptionInfoBits (high 16)
+///   [ESP+0x34] Faulting EFLAGS (duplicate)
+///   [ESP+0x38] Faulting ESP (duplicate)
+///   [ESP+0x3C] Faulting SS (low 16) + Reserved
+///   [ESP+0x40] ES + Reserved
+///   [ESP+0x44] DS + Reserved
+///   [ESP+0x48] FS + Reserved
+///   [ESP+0x4C] GS + Reserved
+///   [ESP+0x50] CR2 (valid for #PF)
+///   [ESP+0x54] PTE (valid for #PF)
 pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
     dos_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x} DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS:ESP={:04x}:{:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
@@ -1846,8 +1997,21 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
         }
     };
 
+    // Lookup precedence: a DPMI 1.0 mode-specific handler (0212H for
+    // PM-origin, 0213H for VM86-origin) takes priority; the 0.9 0203H
+    // handler is the fallback if no 1.0 handler is installed. The 0.9
+    // handler covers both origins by spec, so this gives 1.0 clients
+    // mode-specific routing without losing 0.9-compat for vectors that
+    // only have the legacy install.
+    let from_vm86 = regs.mode() == crate::UserMode::VM86;
     let (handler_sel, handler_off) = if (exc_num as usize) < 32 {
-        dpmi.exc_vectors[exc_num as usize]
+        let n = exc_num as usize;
+        let v10 = if from_vm86 {
+            dpmi.rm_exc_vectors[n]
+        } else {
+            dpmi.pm_exc_vectors[n]
+        };
+        if v10 != (0, 0) { v10 } else { dpmi.exc_vectors[n] }
     } else {
         (0, 0)
     };
@@ -1888,10 +2052,11 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
 
     let use32 = dpmi.client_use32;
     let stub_off = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET) as u32;
+    let stub_off_v10 = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET_V10) as u32;
     let err_code = regs.err_code as u32;
 
     // Capture faulting state *before* switch_to_pm_side mutates regs.
-    let from_vm86 = regs.mode() == crate::UserMode::VM86;
+    // `from_vm86` was already captured above for the handler-table lookup.
     let f_eip    = regs.ip32();
     let f_cs     = regs.code_seg();
     let f_eflags = regs.flags32();
@@ -1907,23 +2072,71 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     let new_sp;
 
     let sel_stub = super::mode_transitions::SPECIAL_STUB_SEL;
+
+    // 1.0 expanded frame (faulting-state portion is always 32-bit
+    // fields; same layout for both client bitnesses). Sits at
+    // SS:(E)SP+20H regardless of who installed the handler — a 0.9
+    // (0203H) handler simply doesn't read past +1FH. The expanded
+    // RETF target at +20H points at our SAME exception-return stub so
+    // a future 1.0 handler that does `ADD (E)SP, 0x20; RETF` lands in
+    // exception_return as well. Width of that RETF target depends on
+    // handler bitness: a 32-bit handler pops EIP at +20H + CS at +24H;
+    // a 16-bit handler pops IP at +20H + CS at +22H.
+    let (v10_ret_eip, v10_ret_cs) = if use32 {
+        (stub_off_v10, sel_stub as u32)
+    } else {
+        // Pack IP at +20H..+21H and CS at +22H..+23H into the low
+        // dword; +24H..+27H stays reserved for the 32-bit slot a
+        // 16-bit handler never reads.
+        ((stub_off_v10 & 0xFFFF) | ((sel_stub as u32) << 16), 0)
+    };
+    // ExceptionInfoBits (DPMI 1.0 §4.3, at SS:(E)SP+32H, high 16 of
+    // the +30H dword):
+    //   bit 0 = 0  (fault occurred in client, not in host)
+    //   bit 1 = 0  (exception is retriable — handler may fix and resume)
+    //   bit 2 = 0  (host-default: retry after handler returns; handler
+    //               may set this to 1 to indicate it redirected
+    //               execution rather than fixing the cause)
+    // All three meaningful bits being zero is the spec's normal-fault
+    // value; remaining bits (3..15) are reserved/zero.
+    let exc_info_bits: u16 = 0;
+    // CR2 / PTE are only meaningful for page faults (INT 0EH), and
+    // #PF never reaches this dispatcher: the event loop catches
+    // `KE::PageFault` upstream and kills the thread via
+    // `signal_thread`. So `exc_num == 14` is unreachable here and
+    // both fields stay zero.
+    let (v10_cr2, v10_pte) = (0u32, 0u32);
+    let v10 = ExcFrameV10 {
+        ret_eip:  v10_ret_eip,
+        ret_cs:   v10_ret_cs,
+        err_code,
+        eip:      f_eip,
+        cs_xinfo: (f_cs as u32) | ((exc_info_bits as u32) << 16),
+        eflags:   f_eflags,
+        esp:      f_esp,
+        ss:       f_ss as u32,
+        es:       f_es as u32,
+        ds:       f_ds as u32,
+        fs:       f_fs as u32,
+        gs:       f_gs as u32,
+        cr2:      v10_cr2,
+        pte:      v10_pte,
+    };
+
     if use32 {
-        // 32-bit: RetF32 + ExcFrame32 (DPMI 1.0 spec frame, separate
-        // region from ModeSave). All faulting state seeded from the
-        // pre-switch capture above so the handler sees the game's
-        // SS/ESP, not our host-stack scratch.
+        // 32-bit: RetF32 (8) + ExcFrame32 (24) + ExcFrameV10 (56) = 88 bytes.
+        // The 0.9 portion at +00..+1FH is what a 0203H-installed handler
+        // sees; the 1.0 expanded portion at +20H..+57H is invisible to it.
         let retf = RetF32 { ret_eip: stub_off, ret_cs: sel_stub as u32 };
         let frame = ExcFrame32 {
             err_code,
             eip: f_eip, cs: f_cs as u32, eflags: f_eflags,
             esp: f_esp, ss: f_ss as u32,
-            ds: f_ds as u32, es: f_es as u32,
-            fs: f_fs as u32, gs: f_gs as u32,
-            cr2: 0,
         };
         new_sp = pm_save_at.1
             - core::mem::size_of::<RetF32>() as u32
-            - core::mem::size_of::<ExcFrame32>() as u32;
+            - core::mem::size_of::<ExcFrame32>() as u32
+            - core::mem::size_of::<ExcFrameV10>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp);
         unsafe {
             core::ptr::write_unaligned(addr as *mut RetF32, retf);
@@ -1931,25 +2144,40 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
                 addr.wrapping_add(core::mem::size_of::<RetF32>() as u32) as *mut ExcFrame32,
                 frame,
             );
+            core::ptr::write_unaligned(
+                addr.wrapping_add(
+                    (core::mem::size_of::<RetF32>() + core::mem::size_of::<ExcFrame32>()) as u32
+                ) as *mut ExcFrameV10,
+                v10,
+            );
         }
     } else {
-        // 16-bit: u16 fields don't overlap with u32 ModeSave; write
-        // RetF16 + ExcFrame16 as a separate region above ModeSave.
+        // 16-bit: RetF16 (4) + ExcFrame16 (28, padded) + ExcFrameV10 (56) = 88 bytes.
+        // 0.9 handler reads +00..+0FH; padding fills +10H..+1FH so the
+        // 1.0 expanded frame still lands at the spec's +20H slot.
         let retf = RetF16 { ret_ip: stub_off as u16, ret_cs: sel_stub };
         let frame = ExcFrame16 {
             err_code: err_code as u16,
             ip: f_eip as u16, cs: f_cs, flags: f_eflags as u16,
             sp: f_esp as u16, ss: f_ss,
+            _pad: [0; 8],
         };
         new_sp = pm_save_at.1
             - core::mem::size_of::<RetF16>() as u32
-            - core::mem::size_of::<ExcFrame16>() as u32;
+            - core::mem::size_of::<ExcFrame16>() as u32
+            - core::mem::size_of::<ExcFrameV10>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp);
         unsafe {
             core::ptr::write_unaligned(addr as *mut RetF16, retf);
             core::ptr::write_unaligned(
                 addr.wrapping_add(core::mem::size_of::<RetF16>() as u32) as *mut ExcFrame16,
                 frame,
+            );
+            core::ptr::write_unaligned(
+                addr.wrapping_add(
+                    (core::mem::size_of::<RetF16>() + core::mem::size_of::<ExcFrame16>()) as u32
+                ) as *mut ExcFrameV10,
+                v10,
             );
         }
     }
@@ -1997,57 +2225,95 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
 ///   [SP+6]   faulting FLAGS
 ///   [SP+8]   faulting SP
 ///   [SP+10]  faulting SS
-pub(super) fn exception_return(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+/// Which exception-frame view the handler returned through. Selected
+/// by the stub slot the handler RETFed into: 0.9 handlers (Function
+/// 0203H install) target `SLOT_EXCEPTION_RET` and we read modified
+/// faulting state from the 0.9 portion at +00..+1FH; 1.0 handlers
+/// (Function 0212H/0213H install) do `ADD (E)SP, 0x20; RETF` and
+/// target `SLOT_EXCEPTION_RET_V10`, and we read from the 1.0
+/// expanded portion at +20H..+57H.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum ExcReturnVia { V09, V10 }
+
+pub(super) fn exception_return(
+    dos: &mut thread::DosState,
+    regs: &mut Regs,
+    via: ExcReturnVia,
+) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_ref() {
         Some(d) => d,
         None => return thread::KernelAction::Done,
     };
     let use32 = dpmi.client_use32;
 
-    if use32 {
-        // Handler may have done its own stack manipulation (locals,
-        // pushes, etc.) and not fully restored ESP before RETF, so
-        // regs.SS:SP at trap entry isn't reliably the spec-frame
-        // address. Instead, locate ExcFrame32 from the *known*
-        // host_stack position it was written to: top of host_stack -
-        // sizeof::<ModeSave>() - sizeof::<ExcFrame32>(). ModeSave is
-        // just above it (at host_stack_top - sizeof::<ModeSave>()).
-        let host_seg = super::mode_transitions::host_stack_pm_seg(dos);
-        let host_base = super::mode_transitions::seg_base(&dos.ldt[..], host_seg);
-        let mode_save_sp = dos::host_stack_empty_sp() - super::mode_transitions::MODE_SAVE_SIZE;
-        let frame_sp = mode_save_sp - core::mem::size_of::<ExcFrame32>() as u32;
-        let frame = unsafe {
-            core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrame32)
-        };
-        let mut save = super::mode_transitions::pop_save_at(&dos.ldt[..], (host_seg, mode_save_sp));
-        save.eip    = frame.eip;
-        save.cs     = frame.cs;
-        save.eflags = frame.eflags;
-        save.esp    = frame.esp;
-        save.ss     = frame.ss;
-        save.restore(regs);
-        dos.pc.locked_stack.other_stack = save.other_stack();
+    // Host-stack layout on entry (low addr → high addr):
+    //   new_sp:               RetF{16,32}
+    //   new_sp + 4 or 8:      ExcFrame{16,32}   (0.9 spec frame body)
+    //   new_sp + 0x20:        ExcFrameV10       (1.0 expanded frame)
+    //   pm_save_at.1:         ModeSave
+    let host_seg = super::mode_transitions::host_stack_pm_seg(dos);
+    let host_base = super::mode_transitions::seg_base(&dos.ldt[..], host_seg);
+    let mode_save_sp = dos::host_stack_empty_sp() - super::mode_transitions::MODE_SAVE_SIZE;
+
+    // Read whichever view the handler modified. Both views share the
+    // same host_stack region; we just index into the right portion.
+    // The handler's own SS:SP after RETF is irrelevant to us — it may
+    // have moved arbitrarily (locals, pushes that weren't fully popped)
+    // and the host stack is the authoritative scratchpad either way.
+    let (new_eip, new_cs, new_eflags, new_esp, new_ss) = match via {
+        ExcReturnVia::V09 => {
+            if use32 {
+                let frame_sp = mode_save_sp
+                    - core::mem::size_of::<ExcFrameV10>() as u32
+                    - core::mem::size_of::<ExcFrame32>() as u32;
+                let f = unsafe {
+                    core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrame32)
+                };
+                (f.eip, f.cs, f.eflags, f.esp, f.ss)
+            } else {
+                let frame_sp = mode_save_sp
+                    - core::mem::size_of::<ExcFrameV10>() as u32
+                    - core::mem::size_of::<ExcFrame16>() as u32;
+                let f = unsafe {
+                    core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrame16)
+                };
+                // 16-bit fields fold into the low halves of the saved
+                // 32-bit registers; upper halves come from the pre-fault
+                // capture in ModeSave below.
+                (f.ip as u32, f.cs as u32, f.flags as u32, f.sp as u32, f.ss as u32)
+            }
+        }
+        ExcReturnVia::V10 => {
+            // 1.0 expanded frame is always 32-bit fields regardless of
+            // client bitness (DPMI 1.0 §4.3). Sits at +20H..+57H from
+            // the frame base, i.e. just below ModeSave on host_stack.
+            let frame_sp = mode_save_sp - core::mem::size_of::<ExcFrameV10>() as u32;
+            let f = unsafe {
+                core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrameV10)
+            };
+            // CS lives in low 16 of cs_xinfo; high 16 is ExceptionInfoBits.
+            (f.eip, f.cs_xinfo & 0xFFFF, f.eflags, f.esp, f.ss)
+        }
+    };
+
+    let mut save = super::mode_transitions::pop_save_at(&dos.ldt[..], (host_seg, mode_save_sp));
+    if use32 || via == ExcReturnVia::V10 {
+        save.eip    = new_eip;
+        save.cs     = new_cs;
+        save.eflags = new_eflags;
+        save.esp    = new_esp;
+        save.ss     = new_ss;
     } else {
-        // 16-bit: handler RETFed past RetF16 (4 bytes); regs.SS:SP
-        // points at ExcFrame16. Read it, skip past the frame to
-        // reach ModeSave, patch ModeSave's low halves with handler-
-        // modified faulting fields.
-        let ss_base = super::mode_transitions::seg_base(&dos.ldt[..], regs.stack_seg());
-        let frame_addr = ss_base.wrapping_add(regs.sp32());
-        let frame = unsafe {
-            core::ptr::read_unaligned(frame_addr as *const ExcFrame16)
-        };
-        regs.set_sp32(regs.sp32() + core::mem::size_of::<ExcFrame16>() as u32);
-        let cursor = (regs.stack_seg(), regs.sp32());
-        let mut save = super::mode_transitions::pop_save_at(&dos.ldt[..], cursor);
-        save.eip    = (save.eip    & 0xFFFF_0000) | frame.ip    as u32;
-        save.cs     = frame.cs as u32;
-        save.eflags = (save.eflags & 0xFFFF_0000) | frame.flags as u32;
-        save.esp    = (save.esp    & 0xFFFF_0000) | frame.sp    as u32;
-        save.ss     = frame.ss as u32;
-        save.restore(regs);
-        dos.pc.locked_stack.other_stack = save.other_stack();
+        // 0.9 16-bit view: fold word-width modifications into the low
+        // 16 bits of ModeSave's 32-bit slots.
+        save.eip    = (save.eip    & 0xFFFF_0000) | new_eip;
+        save.cs     = new_cs;
+        save.eflags = (save.eflags & 0xFFFF_0000) | new_eflags;
+        save.esp    = (save.esp    & 0xFFFF_0000) | new_esp;
+        save.ss     = new_ss;
     }
+    save.restore(regs);
+    dos.pc.locked_stack.other_stack = save.other_stack();
 
     trace_client_selector_leak("exception_return.out", regs);
     thread::KernelAction::Done
@@ -2200,7 +2466,10 @@ pub(super) fn pm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             return super::dos::pmdos_int21_handler(kt, dos, regs);
         }
         dos::SLOT_EXCEPTION_RET => {
-            return exception_return(dos, regs);
+            return exception_return(dos, regs, ExcReturnVia::V09);
+        }
+        dos::SLOT_EXCEPTION_RET_V10 => {
+            return exception_return(dos, regs, ExcReturnVia::V10);
         }
         dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
