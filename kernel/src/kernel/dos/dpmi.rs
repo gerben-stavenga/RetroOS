@@ -584,9 +584,10 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
     };
 
     let ax = regs.rax as u16;
-    dos_trace!("[INT31] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
+    dos_trace!("[INT31] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x} cs:ip={:04X}:{:04X}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
+        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16,
+        regs.code_seg(), regs.ip32() as u16);
 
     // PM TF single-step arming (disabled — flip the `if false` to re-enable).
     #[allow(dead_code)]
