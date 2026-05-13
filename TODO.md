@@ -69,6 +69,66 @@
       DS/ES/FS/GS in VM86-source dispatch (DPMI 0.9 §6.1.4); the loop
       itself is a DOS/4GW-internal issue.
 
+## Zone 66 (PMODE/W extender)
+- [x] Original "PMODE doesn't work" hang fixed by two virtual-PC
+      pieces. Root cause was NOT the extender — PMODE/W is a normal
+      DPMI 0.9 client and INT 2F AX=1687 ENTER worked fine. The actual
+      blocker was INTRO.EXE busy-polling port 0x61 for a DRAM
+      refresh-bit edge (the classic ~15 µs sub-tick timer) which our
+      `read_port61` never produced. Fix: XOR bit 4 on each read in
+      `kernel/src/kernel/dos/machine.rs`. Also added a minimal PS/2
+      keyboard command/ACK handler for `OUT 0x60` (was previously
+      dropped silently) so the prior `OUT 0xED` set-LEDs path queues
+      0xFA correctly — needed for full PS/2 detection paths (probably
+      shared with Operation Wolf and others).
+- [ ] Downstream crash: INTRO.EXE later issues `INT 31 AX=BA02`
+      (DPMI 1.0 vendor / phys-mapping group, unhandled by us → returns
+      AX=8001 CF=1) and shortly after SEGVs at RM `0269:003E`. Need to
+      identify what BA02 should do for PMODE/W and either implement
+      it or stub it more sympathetically.
+
+## Jazz Jackrabbit
+- [ ] Get it working — its bundled DPMI host rejects us. Jazz ships with
+      its own extender (not CWSDPMI / DOS32A / DOS/4GW), and that host
+      bails out before reaching the game. Capture the failing INT 2Fh
+      AX=1687 / DPMI entry sequence and the host's first few PM
+      requests to identify which service or expectation we miss
+      (likely a 0.9 detail it probes for before installing).
+
+## Operation Wolf
+- [x] Mouse worked all along — runtime input choice was pinned in
+      `OWconfig.dat`. Trace showed exactly one `INT 33h AX=0000`
+      install check at startup (we correctly returned AX=FFFF) and
+      no further mouse calls; the game just used whatever device the
+      config named. Deleting `OWconfig.dat` forces the startup menu
+      to re-prompt; selecting "Mouse" routes input through our INT
+      33h driver normally. No code change needed; lesson: when a DOS
+      game ignores an obviously-detected device, check for a saved-
+      config file before chasing emulation bugs.
+
+## Epic Pinball
+- [x] "Runs unplayably fast" was the 0x3DA retrace-emulation bug
+      (fixed in commit `efe5911`): we advanced the retrace phase
+      per-read instead of per-host-millisecond, so `VL_WaitVBL`
+      completed in microseconds instead of ~14 ms. With wallclock-
+      derived phase the engine paces correctly at 70 Hz.
+
+## One Must Fall 2097
+- [x] Playable with the in-game "Game Speed" slider set to 1
+      (minimum). OMF has no wallclock timer — diagnosed via trace
+      + Vogons: doesn't reprogram the PIT, doesn't read `40:6C`,
+      doesn't poll INT 1A, doesn't even use 0x3DA. Game loop just
+      runs as fast as the CPU executes it; on a 486DX2/66 (target
+      hw) this landed near 30–60 fps because file streaming + 8bpp
+      blitting saturated the CPU. The shipped speed slider bounds
+      work per frame and is enough on RetroOS.
+- [ ] (Optional) Generic guest-CPU-throttle knob (à la DOSBox
+      `cpu cycles fixed`) — gate event-loop iterations against
+      `get_ticks()` so any DOS guest runs at a chosen effective
+      MIPS. Would help Wing Commander, Pinball Fantasies' linesync
+      loop, and the rest of the Vogons CPU-sensitive list without
+      per-game in-engine knobs.
+
 ## Pinball Fantasies
 - [ ] Doesn't boot. INTRO.PRG loads, sets mode 13h, never paints the
       LucasArts/intro logo. Spends ~80 % of runtime in a tight VSYNC-

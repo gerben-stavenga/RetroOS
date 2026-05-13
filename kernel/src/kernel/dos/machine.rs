@@ -219,6 +219,14 @@ impl VgaState {
             self.seq[4], self.gc[5], self.gc[6], self.crtc[0x14], self.crtc[0x17], self.ac[0x10], self.misc_output,
             (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16);
 
+        // Blank the display for the rest of the save. The flat-planar
+        // overrides below mis-interpret the current framebuffer if the
+        // guest was in chain-4 / chain-2 / odd-even, so without screen-off
+        // the user sees a brief frame of scrambled pixels.
+        // SEQ Index 1 bit 5 = "Screen Off" — DAC output forced to 0
+        // without touching any other register. Restored at the bottom.
+        outb(0x3C4, 1); outb(0x3C5, self.seq[1] | 0x20);
+
         // Force flat planar mode for reading planes:
         // SEQ mem mode = sequential access (no chain-4, no odd/even)
         // GC mode = read mode 0, write mode 0
@@ -260,7 +268,8 @@ impl VgaState {
             }
         }
 
-        // Restore registers we temporarily changed
+        // Restore registers we temporarily changed (incl. SEQ[1] to unblank)
+        outb(0x3C4, 1); outb(0x3C5, self.seq[1]);
         outb(0x3C4, 4); outb(0x3C5, self.seq[4]);
         outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
         outb(0x3CE, 5); outb(0x3CF, self.gc[5]);
@@ -278,6 +287,16 @@ impl VgaState {
 
         // Reset AC flipflop to known (index) state before any VGA register work.
         let _ = inb(0x3DA);
+
+        // Blank the display for the entire mode-set so the user doesn't see
+        // intermediate state — the prior mode's CRTC/AC/DAC settings vs. the
+        // new mode's plane data is a parade of garbage otherwise. SEQ Index 1
+        // bit 5 = "Screen Off" forces DAC output to 0 without touching any
+        // other state. The full-mode SEQ restore below intentionally OR-s bit
+        // 5 back in (so the rest of CRTC/GC/AC/DAC reprogramming stays dark);
+        // an explicit final write of SEQ[1] unblanks once everything is set.
+        outb(0x3C4, 1);
+        outb(0x3C5, inb(0x3C5) | 0x20);
 
         // Step 1: Write planes in forced flat planar mode.
         // Need misc_output for clock source, but force sequential planar access.
@@ -311,7 +330,13 @@ impl VgaState {
         outb(0x3C4, 0); outb(0x3C5, 0x01); // assert sync reset
         outb(0x3C2, self.misc_output);
         outb(0x3DA, self.feature_ctl); // FCR (color mode write port)
-        for i in (0..5u8).rev() { outb(0x3C4, i); outb(0x3C5, self.seq[i as usize]); }
+        // SEQ restore: hold screen-off (bit 5) through SEQ[1] so the CRTC/AC/DAC
+        // reprogramming below stays dark. The final explicit SEQ[1] write at
+        // the end of this function unblanks.
+        for i in (0..5u8).rev() {
+            let v = if i == 1 { self.seq[1] | 0x20 } else { self.seq[i as usize] };
+            outb(0x3C4, i); outb(0x3C5, v);
+        }
 
         // CRTC — unlock first (clear protect bit in reg 0x11)
         outb(0x3D4, 0x11); outb(0x3D5, self.crtc[0x11] & 0x7F);
@@ -340,6 +365,11 @@ impl VgaState {
         } else {
             outb(0x3C8, self.dac_index);
         }
+        // Unblank: rewrite SEQ[1] with the saved (bit-5-cleared) value now
+        // that CRTC/GC/AC/DAC are all loaded. Has to happen before the index
+        // restore below, which sets SEQ index to whatever the program had.
+        outb(0x3C4, 1); outb(0x3C5, self.seq[1]);
+
         // Restore index registers
         outb(0x3C4, self.seq_index);
         outb(0x3D4, self.crtc_index);
@@ -921,11 +951,16 @@ pub struct VirtualKeyboard {
     pub port61: u8,
     /// Output Buffer Full flag — port 0x64 bit 0
     pub obf: bool,
+    /// Set after a multi-byte keyboard command (0xED/0xF0/0xF3) consumed its
+    /// opcode and is waiting for the parameter byte. The parameter is ACKed
+    /// but otherwise discarded — we don't actually drive LEDs, change scancode
+    /// sets, or honor typematic rates.
+    awaiting_cmd_param: bool,
 }
 
 impl VirtualKeyboard {
     pub const fn new() -> Self {
-        Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false }
+        Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false, awaiting_cmd_param: false }
     }
 
     fn queue_scancode(&mut self, scancode: u8) {
@@ -984,12 +1019,57 @@ impl VirtualKeyboard {
         self.head != self.tail
     }
 
-    pub fn read_port61(&self) -> u8 {
+    pub fn read_port61(&mut self) -> u8 {
+        // Bit 4 mirrors the DRAM refresh request line — toggles every ~15µs
+        // on real hardware. Several DOS games (Zone 66 / Tran's PMODE/W
+        // titles, various Adlib drivers) busy-loop until they observe an
+        // edge here, treating it as a sub-tick timer. Flip on every read so
+        // a `cmp / je` polling loop exits on the second sample.
+        self.port61 ^= 0x10;
         self.port61
     }
 
     pub fn write_port61(&mut self, val: u8) {
         self.port61 = val;
+    }
+
+    /// Host write to port 0x60 — a command (or parameter) directed at the
+    /// PS/2 keyboard. We don't model the device, only its protocol: queue
+    /// the right ACK / response bytes back into the output buffer so the
+    /// guest's polling loop unblocks. Returns true if a response byte was
+    /// made visible (caller raises IRQ1).
+    pub fn write_port60(&mut self, val: u8) -> bool {
+        if self.awaiting_cmd_param {
+            self.awaiting_cmd_param = false;
+            self.push(0xFA);
+            return true;
+        }
+        match val {
+            // Multi-byte commands: ACK opcode now, ACK parameter on next write.
+            0xED | 0xF0 | 0xF3 => {
+                self.awaiting_cmd_param = true;
+                self.push(0xFA);
+            }
+            // Echo — keyboard returns 0xEE, no ACK.
+            0xEE => self.push(0xEE),
+            // Read ID — ACK then 2-byte MF2 keyboard ID.
+            0xF2 => {
+                self.push(0xFA);
+                self.push(0xAB);
+                self.push(0x83);
+            }
+            // Single-byte commands that just want an ACK.
+            // 0xF4 enable scanning, 0xF5 disable, 0xF6 set defaults, 0xFE resend.
+            0xF4 | 0xF5 | 0xF6 | 0xFE => self.push(0xFA),
+            // Reset — ACK then BAT-complete.
+            0xFF => {
+                self.push(0xFA);
+                self.push(0xAA);
+            }
+            // Unknown opcode — keyboard asks the host to resend.
+            _ => self.push(0xFE),
+        }
+        true
     }
 
     pub fn clear(&mut self) {
@@ -998,6 +1078,7 @@ impl VirtualKeyboard {
         self.port60 = 0;
         self.port61 = 0;
         self.obf = false;
+        self.awaiting_cmd_param = false;
     }
 
     /// Pop next key-down scancode, skipping releases (for INT 16h AH=0)
@@ -1179,6 +1260,14 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         0x21 => pc.vpic.imr = val,
         // Slave PIC command / data
         0xA0 | 0xA1 => {}
+        // Keyboard data port — host-to-device command / parameter byte.
+        // The keyboard's response (ACK, BAT, ID, …) becomes visible at port
+        // 0x60 and asserts IRQ1, exactly as on real hardware.
+        0x60 => {
+            if pc.vkbd.write_port60(val) && !pc.vpic.has_pending_vec(0x09) {
+                pc.vpic.push(0x09);
+            }
+        }
         // Keyboard controller / speaker port
         0x61 => pc.vkbd.write_port61(val),
         // Keyboard controller command
