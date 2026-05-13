@@ -1068,24 +1068,26 @@ pub fn pop_bios_keyboard_word() -> Option<u16> {
 /// Emulate IN from a port using the virtual peripherals.
 pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
     match port {
-        // VGA Input Status 1: synthesize retrace signal.
-        // Cycle (32 reads): 0-15 display active (0x00), 16-23 HBL (0x01),
-        // 24-31 VBL (0x09).
-        // - VL_WaitVBL needs bit 3=1 (VBL phase)
+        // VGA Input Status 1: synthesize retrace signal tied to host wall
+        // time so vsync busy-waits actually wait. Mode 13h refresh ~70 Hz
+        // (14.286 ms/frame), mapped to a 32-step phase:
+        //   phase  0..16 — display active (0x00)            bit0=0 bit3=0
+        //   phase 16..24 — horizontal blank (0x01)          bit0=1 bit3=0
+        //   phase 24..32 — vertical blank   (0x09)          bit0=1 bit3=1
+        // - VL_WaitVBL needs bit3=1 (VBL phase)
         // - VL_SetScreen needs 6+ consecutive bit0=1/bit3=0 (HBL phase)
         // - VL_SetCRTC needs bit0=0 (display active phase)
+        // Phase formula: (ticks_ms * 70 cycles/s * 32 phases) / 1000 ms/s,
+        // taken mod 32. With ms-resolution ticks the phase advances ~2.24
+        // steps per host ms, so a tight busy-wait sees the same phase for
+        // many successive reads (gives VL_SetScreen its "consecutive 6+"
+        // criterion for free) but bit transitions happen on real wallclock.
         0x3DA => {
             // Read real hardware to reset the AC flip-flop, and track it globally.
             let _real = crate::arch::inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
-            // Synthesize retrace: games (Wolf3D, Keen) poll this in tight loops.
-            // QEMU's real retrace is too fast/slow for the polling patterns.
-            static mut RETRACE_CTR: u8 = 0;
-            let ctr = unsafe {
-                RETRACE_CTR = RETRACE_CTR.wrapping_add(1);
-                RETRACE_CTR
-            };
-            let phase = ctr & 31;
+            let ticks = crate::arch::get_ticks();
+            let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
             if phase < 16 { 0x00 } else if phase < 24 { 0x01 } else { 0x09 }
         }
         // VGA ports — pass through to hardware
@@ -1094,6 +1096,14 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // to configure QEMU's emulated VGA, even for legacy modes.
         // Pass through so SeaBIOS sees real VBE state.
         0x01CE | 0x01CF | 0x01D0 => crate::arch::inb(port),
+        // Gameport (joystick): we don't model a Sound Blaster or dedicated
+        // gameport card, so on the ISA bus 0x201 is unpopulated — reads of
+        // an unpopulated port return 0xFF (floating data lines, weakly
+        // pulled high by the chipset). Range 0x200-0x207 because gameport
+        // cards typically decode only the low 3 bits; same "no card on bus"
+        // behavior across the whole window. Explicit arm just to suppress
+        // the unhandled-port log during a game's joystick detection sweep.
+        0x200..=0x207 => 0xFF,
         // Master PIC command (read ISR)
         0x20 => pc.vpic.isr,
         // Master PIC data (read IMR)
@@ -1161,6 +1171,10 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 }
             }
         }
+        // Gameport one-shot trigger: no card on this ISA bus address (see
+        // emulate_inb above). Writes to absent devices are dropped on real
+        // hardware too — silently swallow rather than flooding the log.
+        0x200..=0x207 => {}
         // Master PIC data (write IMR)
         0x21 => pc.vpic.imr = val,
         // Slave PIC command / data

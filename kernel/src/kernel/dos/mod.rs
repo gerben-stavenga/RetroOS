@@ -195,16 +195,19 @@ pub struct DosState {
     /// Pending in-kernel "block-and-retry" callback. Set by syscall handlers
     /// that can't complete synchronously (e.g. AH=08 with no keystroke
     /// ready). While set, the user's CS:IP is parked at `SLOT_RESUME` —
-    /// every event-loop iteration re-traps and re-invokes the closure
-    /// without unwinding the cross-mode chain. The closure is taken
-    /// (FnOnce) on each invocation: if the operation is still pending it
-    /// installs a fresh closure into `pending_resume` itself; if it's
-    /// done, it leaves `pending_resume = None` (and writes the result
-    /// back to `regs`), and SLOT_RESUME's dispatch sees the empty slot
-    /// and runs the standard soft-INT iret-frame pop to unwind.
-    pub pending_resume: Option<alloc::boxed::Box<
-        dyn FnOnce(&mut thread::KernelThread, &mut DosState, &mut crate::Regs)>>,
+    /// every event-loop iteration re-traps and re-invokes the closure.
+    /// The closure returns `Some(next)` to stay parked with a new state,
+    /// or `None` to signal completion (SLOT_RESUME then unwinds via the
+    /// standard soft-INT iret-frame pop). The return-based contract makes
+    /// the "still waiting vs done" decision explicit at every call site
+    /// instead of leaning on a side-channel into `dos.pending_resume`.
+    pub pending_resume: Option<ResumeCallback>,
 }
+
+/// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
+/// so the FnOnce can return another `ResumeCallback` (recursive type).
+pub struct ResumeCallback(pub alloc::boxed::Box<
+    dyn FnOnce(&mut thread::KernelThread, &mut DosState, &mut crate::Regs) -> Option<ResumeCallback>>);
 
 #[derive(Clone, Copy)]
 pub struct DosMemBlock {

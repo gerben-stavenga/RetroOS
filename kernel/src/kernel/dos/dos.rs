@@ -203,23 +203,26 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             thread::KernelAction::Done
         }
         SLOT_RESUME => {
-            // Take the parked closure and call it (FnOnce). The closure
-            // either completes (writes its result to regs, leaves
-            // pending_resume empty) or re-installs a fresh closure to
-            // keep waiting. After the call, an empty pending_resume
-            // means we're done — run the same iret-frame pop the
-            // original soft-INT slot would have done, unwinding the
-            // chain naturally.
+            // Take the parked closure and call it (FnOnce). It returns
+            // `Some(next)` to stay parked (we re-store, rewind IP to the
+            // CD 31 so the next fetch re-traps here), or `None` to signal
+            // completion (we run the soft-INT iret-frame pop the original
+            // slot would have done, unwinding the chain naturally).
             let cb = dos.pending_resume.take()
                 .expect("SLOT_RESUME fired without pending_resume");
-            cb(kt, dos, regs);
-            if dos.pending_resume.is_none() {
-                let ret_ip = vm86_pop(regs);
-                let ret_cs = vm86_pop(regs);
-                let ret_flags = vm86_pop(regs);
-                machine::set_vm86_ip(regs, ret_ip);
-                machine::set_vm86_cs(regs, ret_cs);
-                machine::set_vm86_flags(regs, ret_flags as u32);
+            match (cb.0)(kt, dos, regs) {
+                Some(next) => {
+                    dos.pending_resume = Some(next);
+                    machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
+                }
+                None => {
+                    let ret_ip = vm86_pop(regs);
+                    let ret_cs = vm86_pop(regs);
+                    let ret_flags = vm86_pop(regs);
+                    machine::set_vm86_ip(regs, ret_ip);
+                    machine::set_vm86_cs(regs, ret_cs);
+                    machine::set_vm86_flags(regs, ret_flags as u32);
+                }
             }
             thread::KernelAction::Done
         }
@@ -238,7 +241,12 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
     // parent's SS:SP and clears VM_FLAG. We're then logically resuming a
     // PM caller and must pop the iret-frame `deliver_pm_int` planted on
     // the parent's PM stack, not a VM86-style frame.
-    if !is_far_call {
+    if !is_far_call && dos.pending_resume.is_none() {
+        // A pending resume means the handler intentionally redirected CS:IP
+        // to SLOT_RESUME to block (AH=01/07/08/0A waiting on the keyboard).
+        // Popping the iret frame here would clobber the redirect and the
+        // user code would race past the supposedly-blocking INT — SLOT_RESUME
+        // owns the unwind once the input arrives.
         finish_dos_call(dos, regs);
     } else if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
         // Returns to caller — pop far-call return address
@@ -264,7 +272,9 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let action = int_21h(kt, dos, regs);
     if !matches!(action, thread::KernelAction::Done) { return action; }
-    finish_dos_call(dos, regs);
+    if dos.pending_resume.is_none() {
+        finish_dos_call(dos, regs);
+    }
     thread::KernelAction::Done
 }
 
@@ -510,25 +520,73 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
     thread::KernelAction::Done
 }
 
-/// DOS character output — writes via VGA putchar and syncs the BDA cursor
-/// Install a `pending_resume` closure that polls the console keyboard and
-/// completes (or re-installs itself) each time SLOT_RESUME re-traps.
-/// `echo`: whether to also `dos_putchar` the read character (AH=01h does
-/// this; AH=07h/AH=08h don't).
-fn install_read_key_resume(dos: &mut thread::DosState, echo: bool) {
-    dos.pending_resume = Some(alloc::boxed::Box::new(
+/// Build a `pending_resume` closure for AH=0Ah Buffered Keyboard Input:
+/// accumulates typed chars in the caller's DS:DX buffer until Enter is
+/// pressed (or the buffer fills, which rings the bell). Backspace erases.
+/// On completion, writes count to buffer[1] and appends 0x0D at
+/// buffer[count+2], echoes CR+LF. Returns `Some(next)` while still
+/// gathering input; `None` once Enter is pressed.
+fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::ResumeCallback {
+    super::ResumeCallback(alloc::boxed::Box::new(
         move |_kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
-              regs: &mut Regs| {
+              _regs: &mut Regs| -> Option<super::ResumeCallback> {
+            let Some(ch) = poll_dos_console_char(dos) else {
+                return Some(buffered_input_resume(buf_lin, max_chars, count));
+            };
+            match ch {
+                0x0D => {
+                    unsafe {
+                        *((buf_lin + 1) as *mut u8) = count;
+                        *((buf_lin + 2 + count as u32) as *mut u8) = 0x0D;
+                    }
+                    dos_putchar(0x0D);
+                    dos_putchar(0x0A);
+                    None
+                }
+                0x08 => {
+                    if count > 0 {
+                        dos_putchar(0x08);
+                        dos_putchar(b' ');
+                        dos_putchar(0x08);
+                        Some(buffered_input_resume(buf_lin, max_chars, count - 1))
+                    } else {
+                        Some(buffered_input_resume(buf_lin, max_chars, count))
+                    }
+                }
+                _ => {
+                    if (count as u32) + 1 < max_chars as u32 {
+                        unsafe { *((buf_lin + 2 + count as u32) as *mut u8) = ch; }
+                        dos_putchar(ch);
+                        Some(buffered_input_resume(buf_lin, max_chars, count + 1))
+                    } else {
+                        dos_putchar(0x07); // bell — no room
+                        Some(buffered_input_resume(buf_lin, max_chars, count))
+                    }
+                }
+            }
+        }))
+}
+
+/// DOS character output — writes via VGA putchar and syncs the BDA cursor
+/// Build a `pending_resume` closure that polls the console keyboard.
+/// Returns `Some(self)` while waiting; on Some(ch), writes AL=ch (and
+/// optionally echoes) then returns `None` to signal completion.
+/// `echo`: whether to also `dos_putchar` the read character (AH=01h does
+/// this; AH=07h/AH=08h don't).
+fn read_key_resume(echo: bool) -> super::ResumeCallback {
+    super::ResumeCallback(alloc::boxed::Box::new(
+        move |_kt: &mut thread::KernelThread,
+              dos: &mut thread::DosState,
+              regs: &mut Regs| -> Option<super::ResumeCallback> {
             if let Some(ch) = poll_dos_console_char(dos) {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
                 if echo { dos_putchar(ch); }
-                // Done: leave pending_resume = None for the dispatcher
-                // to run the soft-INT iret-frame pop.
+                None
             } else {
-                install_read_key_resume(dos, echo);
+                Some(read_key_resume(echo))
             }
-        }));
+        }))
 }
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
@@ -624,7 +682,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
                 if ah == 0x01 { dos_putchar(ch); }
             } else {
-                install_read_key_resume(dos, ah == 0x01);
+                dos.pending_resume = Some(read_key_resume(ah == 0x01));
                 machine::set_vm86_cs(regs, STUB_SEG);
                 machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
             }
@@ -643,6 +701,26 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 if addr.wrapping_sub(start) > 0xFFFF { break; }
             }
             thread::KernelAction::Done
+        }
+        // AH=0x0A: Buffered Keyboard Input. DS:DX → buffer.
+        //   buffer[0] = max chars including the CR terminator (caller sets)
+        //   buffer[1] = count actually typed, NOT including CR (we set)
+        //   buffer[2..count+2] = typed characters
+        //   buffer[count+2]    = 0x0D (CR terminator)
+        // Blocks until Enter; backspace erases. Sokoban's "ENTER YOUR SYSTEM:"
+        // prompt is the canonical reason this needs to exist — without it the
+        // game spins forever asking for input.
+        0x0A => {
+            let buf_lin = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
+            let max_chars = unsafe { *(buf_lin as *const u8) };
+            if max_chars == 0 {
+                unsafe { *((buf_lin + 1) as *mut u8) = 0; }
+                return thread::KernelAction::Done;
+            }
+            dos.pending_resume = Some(buffered_input_resume(buf_lin, max_chars, 0));
+            machine::set_vm86_cs(regs, STUB_SEG);
+            machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
+            return thread::KernelAction::Done;
         }
         // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready.
         // Reflect the BIOS keyboard buffer state (head != tail = char ready).
