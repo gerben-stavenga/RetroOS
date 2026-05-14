@@ -31,10 +31,16 @@ case "$ARCH" in
     *)    echo "Usage: $0 [386|686|x64] [-i image] [-r binary] [-h hostfs_dir] [extra qemu args...]"; exit 1 ;;
 esac
 
-# AdLib (YM3812 / OPL2) on ports 0x388-0x389. Override audio backend with
-# AUDIO_BACKEND=alsa|sdl|... if pulseaudio isn't available.
+# AdLib (YM3812 / OPL2) on 0x388-0x389 for FM music passthrough; virtio-sound
+# as the PCM sink for the upcoming Layer 1 / Layer 2 audio stack (kernel as DMA
+# replacement, DOS SB façade above). Override backend with AUDIO_BACKEND=alsa|
+# sdl|... if pulseaudio isn't available.
 AUDIO_BACKEND="${AUDIO_BACKEND:-pa}"
-AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0" -device adlib,audiodev=snd0)
+AUDIO_ARGS=(
+    -audiodev "${AUDIO_BACKEND},id=snd0"
+    -device adlib,audiodev=snd0
+    -device virtio-sound-pci,audiodev=snd0
+)
 
 case "$IMG" in
     image)       BAZEL_TARGET="//:image";             IMAGE_FILE="image.bin" ;;
