@@ -69,6 +69,22 @@
       DS/ES/FS/GS in VM86-source dispatch (DPMI 0.9 §6.1.4); the loop
       itself is a DOS/4GW-internal issue.
 
+## Duke Nukem 3D — palette fades super-slow
+- [ ] After commit `efe5911` (wallclock-paced 0x3DA), Build engine's
+      `palto()` palette fades take ~20 s each instead of <1 s. Trace
+      shows the inner spin pinned at PM EIP `00c7:0x005455CE-D8` doing
+      ~140 k `inb 0x3DA` per second with `irq=` count in [prof] dropped
+      ~5× vs. boot-time (timer IRQ starvation under heavy #GP traffic),
+      so `get_ticks()` advances slower than wall-time → wallclock vsync
+      cycle stretches well past 14.3 ms.
+- [ ] Suspect: `let _real = crate::arch::inb(0x3DA);` in `emulate_inb`
+      runs a real-hardware PIO per trapped read to keep the AC
+      flip-flop synchronized — that's a host-exit on every iteration
+      of the guest's spin and likely the dominant cost / IRQ-blocking
+      culprit. Move it behind a "VGA state changed since last save"
+      guard or drop it for the synthesized 0x3DA path.
+- [ ] Don't revert `efe5911` — Epic Pinball's pacing fix lives there.
+
 ## Zone 66 (PMODE/W extender)
 - [x] Original "PMODE doesn't work" hang fixed by two virtual-PC
       pieces. Root cause was NOT the extender — PMODE/W is a normal
@@ -128,6 +144,20 @@
       MIPS. Would help Wing Commander, Pinball Fantasies' linesync
       loop, and the rest of the Vogons CPU-sensitive list without
       per-game in-engine knobs.
+
+## Kernel — virtual IF gets stuck at 0
+- [ ] Intermittent across games: a program runs fine for a while then
+      freezes. F12 dump shows EFLAGS.IF=0 — some interrupt sequence
+      (INT reflect / IRET / exception dispatch / mode transition) is
+      leaving the user's virtual IF cleared and never restoring it.
+      vPIC IRQs queue up but never get delivered, so anything waiting
+      on a timer/keyboard IRQ wedges. Related to the Hexen hang above
+      (same symptom, also IF=0 + VIP=1), but here it's not game-specific
+      so the IF=1→0-without-pairing path is somewhere on a common code
+      path, not Hexen-specific.
+- [ ] Diagnosis: instrument every CLI/STI/POPF/IRET/PM-INT-deliver site
+      with a "virtual IF state changed" trace, run a session, watch for
+      a 1→0 transition with no matching 0→1 before the freeze.
 
 ## Pinball Fantasies
 - [ ] Doesn't boot. INTRO.PRG loads, sets mode 13h, never paints the
