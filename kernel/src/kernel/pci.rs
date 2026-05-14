@@ -44,11 +44,16 @@ const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 
 const REG_VENDOR_DEVICE: u8 = 0x00;
+const REG_STATUS: u8 = 0x06;
 const REG_REVISION_CLASS: u8 = 0x08;
 /// Offset of the header_type byte. Sits in the dword at 0x0C (which also
 /// holds cache-line size, latency timer, and BIST); read_config_u8 takes
 /// the byte-granular offset and does the right shift internally.
 const REG_HEADER_TYPE: u8 = 0x0E;
+const REG_BAR0: u8 = 0x10;
+const REG_CAP_POINTER: u8 = 0x34;
+
+const STATUS_CAP_LIST: u16 = 1 << 4;
 
 /// (bus, device, function) tuple identifying a PCI configuration target.
 #[derive(Clone, Copy)]
@@ -157,6 +162,9 @@ fn log_device(d: &PciDevice) {
         d.class, d.subclass, d.prog_if,
         class_desc(d.class, d.subclass, d.vendor, d.device),
     );
+    if let Some(v) = crate::kernel::virtio::try_attach(d) {
+        crate::kernel::virtio::log_device(&v);
+    }
 }
 
 /// Human-readable hint for the (class, subclass) pair. Falls through to
@@ -164,6 +172,81 @@ fn log_device(d: &PciDevice) {
 /// Vendor/device override for a couple of devices that don't carry an
 /// informative class (virtio devices report generic codes; the device id
 /// 0x1009-0x103F is the giveaway).
+/// One PCI Base Address Register decoded.
+#[derive(Clone, Copy, Debug)]
+pub enum Bar {
+    /// 32-bit memory BAR.
+    Mem32 { base: u32, prefetchable: bool },
+    /// 64-bit memory BAR (consumes two consecutive BAR slots).
+    Mem64 { base: u64, prefetchable: bool },
+    /// I/O-port BAR.
+    Io { port: u16 },
+}
+
+/// Read BAR `index` (0..=5). Returns the decoded BAR and the number of
+/// BAR slots it occupies (1 for 32-bit/IO, 2 for 64-bit). Returns None
+/// if the slot is empty (BAR reads as 0) or out of range.
+pub fn read_bar(addr: PciAddr, index: u8) -> Option<(Bar, u8)> {
+    if index >= 6 {
+        return None;
+    }
+    let off = REG_BAR0 + index * 4;
+    let lo = read_config_u32(addr, off);
+    if lo == 0 {
+        return None;
+    }
+    if lo & 1 != 0 {
+        Some((Bar::Io { port: (lo & !0x3) as u16 }, 1))
+    } else {
+        let prefetchable = lo & 0x08 != 0;
+        let bar_type = (lo >> 1) & 0x03;
+        let base_lo = (lo & !0xF) as u64;
+        if bar_type == 0x02 {
+            if index >= 5 {
+                return None;
+            }
+            let hi = read_config_u32(addr, off + 4) as u64;
+            Some((Bar::Mem64 { base: (hi << 32) | base_lo, prefetchable }, 2))
+        } else {
+            Some((Bar::Mem32 { base: base_lo as u32, prefetchable }, 1))
+        }
+    }
+}
+
+/// Iterator over the entries of a PCI device's capability list. Yields
+/// each capability's byte offset in configuration space. Caller reads
+/// the cap header (id, next, ...) at that offset.
+pub struct CapIter {
+    addr: PciAddr,
+    next: u8,
+}
+
+impl Iterator for CapIter {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        if self.next == 0 {
+            return None;
+        }
+        let here = self.next;
+        // Next-pointer lives in byte 1 of every cap header; mask the low
+        // 2 bits per spec (cap entries are dword-aligned).
+        self.next = read_config_u8(self.addr, here + 1) & 0xFC;
+        Some(here)
+    }
+}
+
+/// Walk the capability list, if present. Returns an empty iterator if
+/// the device has no capabilities (status bit 4 clear).
+pub fn capabilities(addr: PciAddr) -> CapIter {
+    let status = read_config_u16(addr, REG_STATUS);
+    let next = if status & STATUS_CAP_LIST != 0 {
+        read_config_u8(addr, REG_CAP_POINTER) & 0xFC
+    } else {
+        0
+    };
+    CapIter { addr, next }
+}
+
 fn class_desc(class: u8, subclass: u8, vendor: u16, device: u16) -> &'static str {
     // Virtio: vendor 0x1AF4. Legacy device IDs 0x1000-0x103F encode the
     // subsystem; transitional/modern use the same vendor with 0x1040+.

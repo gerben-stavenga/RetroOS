@@ -14,6 +14,7 @@ pub mod keyboard;
 pub mod kpipe;
 pub mod linux;
 pub mod pci;
+pub mod virtio;
 // pipe.rs moved to crate root (shared between arch and kernel)
 pub mod stacktrace;
 pub mod startup;
