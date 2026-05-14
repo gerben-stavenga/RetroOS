@@ -31,6 +31,11 @@ case "$ARCH" in
     *)    echo "Usage: $0 [386|686|x64] [-i image] [-r binary] [-h hostfs_dir] [extra qemu args...]"; exit 1 ;;
 esac
 
+# AdLib (YM3812 / OPL2) on ports 0x388-0x389. Override audio backend with
+# AUDIO_BACKEND=alsa|sdl|... if pulseaudio isn't available.
+AUDIO_BACKEND="${AUDIO_BACKEND:-pa}"
+AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0" -device adlib,audiodev=snd0)
+
 case "$IMG" in
     image)       BAZEL_TARGET="//:image";             IMAGE_FILE="image.bin" ;;
     proprietary) BAZEL_TARGET="//:image_proprietary";  IMAGE_FILE="image_proprietary.bin" ;;
@@ -77,12 +82,14 @@ if [ "$IMG" = "grub" ]; then
         HOME="$HOME" \
         DISPLAY="${DISPLAY:-}" \
         XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
         $QEMU \
         $CPU \
         -cdrom "$ISO" \
         -drive "file=$DISK,format=raw,snapshot=on" \
         -boot order=d \
         -debugcon stdio \
+        "${AUDIO_ARGS[@]}" \
         -no-reboot \
         "$@"
 elif [ "$IMG" = "freedos" ]; then
@@ -167,6 +174,7 @@ elif [ "$IMG" = "freedos" ]; then
         HOME="$HOME" \
         DISPLAY="${DISPLAY:-}" \
         XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
         $QEMU \
         $CPU \
         -debugcon stdio \
@@ -176,6 +184,7 @@ elif [ "$IMG" = "freedos" ]; then
         -drive "file=$HDD_IMG,format=raw" \
         $APPS_DRIVE \
         $FDOS_ARGS \
+        "${AUDIO_ARGS[@]}" \
         -no-reboot \
         "$@"
 else
@@ -214,12 +223,14 @@ else
         HOME="$HOME" \
         DISPLAY="${DISPLAY:-}" \
         XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
         $QEMU \
         $CPU \
         -drive "file=$IMAGE,format=raw,snapshot=on" \
         -debugcon stdio \
         "${FWCFG_ARGS[@]}" \
         "${HOSTFS_ARGS[@]}" \
+        "${AUDIO_ARGS[@]}" \
         -no-reboot \
         "$@"
 fi

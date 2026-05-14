@@ -202,7 +202,8 @@ impl IdtEntry64 {
     }
 }
 
-/// IOPB covers ports 0x000-0x3DF (VGA ports end at 0x3DF).
+/// IOPB covers ports 0x000-0x3DF (VGA ports end at 0x3DF; AdLib OPL2 at
+/// 0x388-0x389 also lives in this range).
 /// Byte count: (0x3DF / 8) + 1 = 124 data bytes + 1 terminating 0xFF = 125.
 /// Ports above 0x3DF fall outside the IOPB (beyond TSS limit) and are denied.
 const IOPB_SIZE: usize = 125;
@@ -249,7 +250,8 @@ impl Tss {
 }
 
 /// Set up TSS bitmaps for VM86:
-/// - IOPB: allow VGA ports (0x3C0-0x3DF), deny everything else
+/// - IOPB: allow VGA ports (0x3C0-0x3DF) + AdLib OPL2 (0x388-0x389),
+///   deny everything else
 /// - Interrupt redirection: trap handled INTs to monitor, rest through IVT
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
@@ -261,6 +263,9 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
         (*tss).iopb[121] = 0x00;
         (*tss).iopb[122] = 0x00;
         (*tss).iopb[123] = 0x04; // trap bit 2 = port 0x3DA
+        // AdLib OPL2 status/index (0x388) + data (0x389): bits 0-1 of byte
+        // 113. Pass through to QEMU's emulated YM3812; no IRQ, no DMA.
+        (*tss).iopb[113] &= !0x03;
         // Interrupt redirection: only INT 31h traps to monitor.
         // All other intercepted INTs (20h, 21h, 28h, 2Eh, 2Fh) go through IVT
         // to stubs that call INT 31h, which then traps here.
