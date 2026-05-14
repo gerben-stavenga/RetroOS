@@ -215,6 +215,24 @@ pub fn outw(port: u16, value: u16) {
     }
 }
 
+/// Read dword (32-bit) from I/O port
+#[inline]
+pub fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack));
+    }
+    value
+}
+
+/// Write dword (32-bit) to I/O port
+#[inline]
+pub fn outl(port: u16, value: u32) {
+    unsafe {
+        asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack));
+    }
+}
+
 #[inline]
 pub(super) unsafe fn read_dr6() -> u32 {
     let value: u32;

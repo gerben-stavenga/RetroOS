@@ -24,6 +24,8 @@ pub fn startup() -> ! {
     crate::kernel::heap::init();
     println!("Heap initialized");
 
+    crate::kernel::pci::enumerate_and_log();
+
     crate::kernel::thread::init_threading();
 
     // Reset ATA controller (needed when booted via GRUB)

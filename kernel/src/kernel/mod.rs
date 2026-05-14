@@ -13,6 +13,7 @@ pub mod heap;
 pub mod keyboard;
 pub mod kpipe;
 pub mod linux;
+pub mod pci;
 // pipe.rs moved to crate root (shared between arch and kernel)
 pub mod stacktrace;
 pub mod startup;

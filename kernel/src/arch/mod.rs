@@ -39,7 +39,7 @@ pub fn halt_forever() -> ! {
 }
 
 // TODO: migrate to arch calls
-pub use x86::{inb, outb, inw, outw};
+pub use x86::{inb, outb, inw, outw, inl, outl};
 pub use x86::rdtsc;
 pub use x86::{FxState, clean_fx_template};
 pub use irq::{get_ticks, take_pending_ticks, drain};
