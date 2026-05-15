@@ -158,6 +158,22 @@
 - [ ] Diagnosis: instrument every CLI/STI/POPF/IRET/PM-INT-deliver site
       with a "virtual IF state changed" trace, run a session, watch for
       a 1→0 transition with no matching 0→1 before the freeze.
+- [ ] Repro 2 (regression, SB-façade-triggered, sound DISABLED in
+      setup so no S_Init/playback ran): launch Doom, exit back to DN.
+      `exec_return` restores parent with flags=0x1202 (IF=1), then the
+      VM86 guest ends up tight-polling port 0x608 at F000:754F with
+      flags=0x1002 (IF=0), vpic pending=[] isr=0 imr=0. Kernel ticks
+      advance but the guest's timer-ISR-updated poll variable can't
+      (IF=0 blocks IRQ0 delivery) → deadlock. Since SB playback code
+      never ran, the trigger is the SB/DMA *port trapping* itself
+      (handling 0x00-0x0F + 0x220-0x22F instead of defaulting) pushing
+      a detection/timing path into an interrupts-off wait it never
+      exits. The unpaired IF 1→0 site is still unidentified — needs
+      the CLI/STI/POPF/IRET instrumentation below. NOTE: with
+      TF_VIRTUAL_IF_STEPPING=false, POPF/IRET do NOT update virtual
+      IF — only CLI/STI (#GP-trapped) and DPMI AX=0900-0902 do. A
+      non-conforming client that restores IF via POPF/IRET inside a
+      CLI region would get stuck exactly like this.
 - [ ] Sharpest repro: Doom SETUP.EXE after SB16 detection succeeds.
       `S_Init: Setting up sound.` → DPMI sound-timing calibration →
       tight poll at PM `01df:0x006343dc`
