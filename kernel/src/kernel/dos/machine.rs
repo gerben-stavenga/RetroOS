@@ -398,6 +398,10 @@ pub struct PcMachine {
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: VgaState,
+    /// SB16 façade — DSP state machine that traps the guest's
+    /// 0x220-0x22F port writes/reads. Detection works today; the
+    /// rest of the protocol is incremental.
+    pub sb: SbState,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -580,6 +584,7 @@ impl PcMachine {
             skip_irq: false,
             e0_pending: false,
             vga: VgaState::new(),
+            sb: SbState::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
         }
@@ -1143,6 +1148,178 @@ pub fn pop_bios_keyboard_word() -> Option<u16> {
 }
 
 // ============================================================================
+// Sound Blaster 16 façade — DSP state machine
+// ============================================================================
+//
+// Layer 2 in the Layer-1 (virtio-sound) / Layer-2 (this) audio
+// architecture. The guest sees a fully-decoded SB16 at I/O base
+// 0x220; we trap every port write/read, run a small state machine
+// over the DSP command stream, and (eventually) route playback bytes
+// upward into the kernel's audio sink via the SoundConsumer API.
+//
+// Currently implemented: just enough for detection probes to succeed —
+// reset (0x226 1→0 → 0xAA in read buffer), DSP version query (0xE1 →
+// 4.05), and the busy/data-available status bits on 0x22C/0x22E.
+// PCM setup (0x40/0x48) and playback start (0x14/0x1C/0xB0-CF) are
+// stubs that swallow the bytes; they'll be filled in as we wire the
+// data path through to virtio-sound.
+//
+// SB16 port layout (offset from base 0x220):
+//   +0x00 (0x220) Mixer index
+//   +0x01 (0x221) Mixer data
+//   +0x06 (0x226) DSP reset
+//   +0x0A (0x22A) DSP read data
+//   +0x0C (0x22C) DSP write command/data (also: write-busy status on read)
+//   +0x0E (0x22E) DSP read-buffer status (also: 8-bit IRQ ack)
+//   +0x0F (0x22F) 16-bit IRQ ack
+
+const SB_VERSION_MAJOR: u8 = 4;
+const SB_VERSION_MINOR: u8 = 5;
+
+pub struct SbState {
+    /// Bytes the DSP is going to hand the driver next on reads of
+    /// 0x22A. Empty = read returns 0xFF (or status bit shows "no
+    /// data"). We push at the back, pop from the front.
+    read_queue: [u8; 8],
+    read_len: u8,
+    /// Last command byte the driver wrote to 0x22C, if we're still
+    /// waiting for argument bytes. 0 = idle / no pending command.
+    pending_cmd: u8,
+    /// Number of argument bytes we still want for `pending_cmd`.
+    pending_args: u8,
+    /// Captured args, in order received. Sized for the longest cmd
+    /// we currently care about (0x48 + 2 args, 0xB0 + 3 args).
+    args: [u8; 4],
+}
+
+impl SbState {
+    pub const fn new() -> Self {
+        Self {
+            read_queue: [0; 8],
+            read_len: 0,
+            pending_cmd: 0,
+            pending_args: 0,
+            args: [0; 4],
+        }
+    }
+
+    fn push_read(&mut self, byte: u8) {
+        if (self.read_len as usize) < self.read_queue.len() {
+            self.read_queue[self.read_len as usize] = byte;
+            self.read_len += 1;
+        }
+    }
+
+    fn pop_read(&mut self) -> u8 {
+        if self.read_len == 0 {
+            return 0xFF;
+        }
+        let b = self.read_queue[0];
+        for i in 1..self.read_len as usize {
+            self.read_queue[i - 1] = self.read_queue[i];
+        }
+        self.read_len -= 1;
+        b
+    }
+
+    fn read_available(&self) -> bool { self.read_len > 0 }
+
+    /// Reset (0x226 written 0). Spec says: queue a single 0xAA byte
+    /// in the read buffer, return to idle. The driver detects SB by
+    /// polling 0x22E for "data available" then reading 0x22A and
+    /// seeing 0xAA.
+    fn reset(&mut self) {
+        self.read_len = 0;
+        self.pending_cmd = 0;
+        self.pending_args = 0;
+        self.push_read(0xAA);
+    }
+
+    /// Process a DSP command (or one of its argument bytes) written
+    /// to 0x22C.
+    fn dsp_write(&mut self, b: u8) {
+        if self.pending_args > 0 {
+            let slot = (self.args.len() - self.pending_args as usize).min(self.args.len() - 1);
+            self.args[slot] = b;
+            self.pending_args -= 1;
+            if self.pending_args == 0 {
+                self.complete_command();
+            }
+            return;
+        }
+        // New command. Decide how many args we expect.
+        self.pending_cmd = b;
+        self.pending_args = match b {
+            0xE1 => 0,           // get version, no args
+            0x40 => 1,           // set time constant (1 byte)
+            0x48 => 2,           // set DMA block size (lo, hi)
+            0x14 | 0x24 => 2,    // single-cycle DMA 8-bit: 2 length bytes
+            0x1C | 0x2C => 0,    // auto-init DMA 8-bit, no args (uses 0x48 block)
+            0xB0..=0xBF | 0xC0..=0xCF => 3,  // SB16 DMA: format + length lo + length hi
+            0xD0 | 0xD3 | 0xD4 | 0xDA => 0,  // pause / spkr off / resume / exit auto-init
+            _ => 0,
+        };
+        if self.pending_args == 0 {
+            self.complete_command();
+        }
+    }
+
+    fn complete_command(&mut self) {
+        match self.pending_cmd {
+            0xE1 => {
+                // Get version: respond with major then minor.
+                self.push_read(SB_VERSION_MAJOR);
+                self.push_read(SB_VERSION_MINOR);
+            }
+            // All other commands are accepted-and-dropped for now.
+            // Playback start (0x1C / 0xB0-CF / 0xC0-CF) will hook
+            // into Layer 1 when the data path lands.
+            _ => {}
+        }
+        self.pending_cmd = 0;
+    }
+}
+
+/// Read from one of the SB ports (0x220-0x22F).
+pub fn sb_read(sb: &mut SbState, port: u16) -> u8 {
+    match port {
+        // 0x22A: DSP read data port — pop one byte from the read queue.
+        0x22A => sb.pop_read(),
+        // 0x22C: bit 7 = DSP-busy (we're never busy from the driver's
+        // POV — always ready to accept the next byte). Lower bits 0.
+        0x22C => 0x00,
+        // 0x22E: bit 7 = data-available in the read buffer. Reading
+        // also acts as the 8-bit IRQ ACK on real hardware; until we
+        // generate vIRQs we just report the buffer status.
+        0x22E => if sb.read_available() { 0x80 } else { 0x00 },
+        // 0x22F: 16-bit IRQ ACK on real hardware; pre-detection it
+        // just reads back 0.
+        0x22F => 0x00,
+        // Mixer index/data — not yet wired. Return 0xFF (== "no card"
+        // for a probing driver, but our DSP detection already
+        // succeeded by here).
+        _ => 0xFF,
+    }
+}
+
+/// Write to one of the SB ports (0x220-0x22F).
+pub fn sb_write(sb: &mut SbState, port: u16, val: u8) {
+    match port {
+        // 0x226: DSP reset. Spec is "write 1, wait ≥ 3 µs, write 0".
+        // We act on the 0-write (transition from any state to reset).
+        0x226 => {
+            if val == 0 {
+                sb.reset();
+            }
+        }
+        // 0x22C: DSP command/data byte.
+        0x22C => sb.dsp_write(val),
+        // Mixer / IRQ ACK writes — accepted, no side effects yet.
+        _ => {}
+    }
+}
+
+// ============================================================================
 // I/O port emulation
 // ============================================================================
 
@@ -1185,6 +1362,9 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // behavior across the whole window. Explicit arm just to suppress
         // the unhandled-port log during a game's joystick detection sweep.
         0x200..=0x207 => 0xFF,
+        // Sound Blaster 16 — DSP state machine + (eventually) PCM
+        // route through to virtio-sound.
+        0x220..=0x22F => sb_read(&mut pc.sb, port),
         // Master PIC command (read ISR)
         0x20 => pc.vpic.isr,
         // Master PIC data (read IMR)
@@ -1256,6 +1436,8 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         // emulate_inb above). Writes to absent devices are dropped on real
         // hardware too — silently swallow rather than flooding the log.
         0x200..=0x207 => {}
+        // Sound Blaster 16 — DSP state machine.
+        0x220..=0x22F => sb_write(&mut pc.sb, port, val),
         // Master PIC data (write IMR)
         0x21 => pc.vpic.imr = val,
         // Slave PIC command / data
