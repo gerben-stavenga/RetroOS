@@ -158,6 +158,17 @@
 - [ ] Diagnosis: instrument every CLI/STI/POPF/IRET/PM-INT-deliver site
       with a "virtual IF state changed" trace, run a session, watch for
       a 1→0 transition with no matching 0→1 before the freeze.
+- [ ] Sharpest repro: Doom SETUP.EXE after SB16 detection succeeds.
+      `S_Init: Setting up sound.` → DPMI sound-timing calibration →
+      tight poll at PM `01df:0x006343dc`
+      (`cmp eax,[0x0068E820]; jz $-8`) with EFLAGS=0x00101046 →
+      IF=0, VIP=1. vPIC pending=[08,09] (timer + kbd) undeliverable;
+      `0x0068E820` only advances in the game's IRQ0 ISR which can't
+      run with IF=0 → deadlock. Cleaner than Hexen: single tight
+      loop, exact EIP, deterministic trigger (any SB-detecting DPMI
+      game that does a PIT-paced sound calibration). Reproduce by
+      running Doom SETUP with BLASTER set; bisect virtual-IF from
+      the `S_Init` log line forward.
 
 ## Pinball Fantasies
 - [ ] Doesn't boot. INTRO.PRG loads, sets mode 13h, never paints the
