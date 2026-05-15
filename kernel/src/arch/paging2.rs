@@ -388,7 +388,7 @@ pub struct LegacyPages {
     pub pt_kernel: PageTable32,
 }
 
-/// PAE mode kernel page tables (3 pages = 12KB)
+/// PAE mode kernel page tables (4 pages = 16KB)
 ///
 /// With PDPT[3] = PDPT (recursive), the PDPT acts as a 512-entry "virtual PD"
 /// for addresses 0xC0000000-0xFFFFFFFF. PDPT[4-511] become kernel PD entries.
@@ -398,16 +398,22 @@ pub struct LegacyPages {
 #[repr(C)]
 pub struct PaePages {
     /// PDPT - also acts as "virtual PD" via PDPT[3] recursion
-    /// PDPT[0] = scratch (identity), PDPT[3] = PDPT, PDPT[4] = pt_pml4, PDPT[5] = pt_kernel
+    /// PDPT[0] = scratch (identity), PDPT[3] = PDPT, PDPT[4] = pt_pml4,
+    /// PDPT[5] = pt_kernel, PDPT[6] = pt_dev
     pub pdpt: PageTable64,
     /// Page table for PML4 region (PDPT[4], covers 0xC0800000-0xC09FFFFF)
     pub pt_pml4: PageTable64,
     /// Page table for low mem + kernel (PDPT[5], 0xC0A00000-0xC0BFFFFF)
     pub pt_kernel: PageTable64,
+    /// Page table for device-MMIO + DMA-buffer mappings (PDPT[6],
+    /// covers 0xC0C00000-0xC0DFFFFF). Sits OUTSIDE pt_kernel so the
+    /// heap can grow up to the top of pt_kernel without colliding
+    /// with PCI BAR mappings.
+    pub pt_dev: PageTable64,
 }
 
-/// Kernel page tables (3 pages for PAE, 2 for legacy)
-pub struct KernelPages([RawPage; 3]);
+/// Kernel page tables (4 pages for PAE, 2 for legacy)
+pub struct KernelPages([RawPage; 4]);
 
 impl KernelPages {
     pub fn legacy(&mut self) -> &mut LegacyPages {
@@ -422,7 +428,7 @@ impl KernelPages {
 }
 
 /// Kernel pages - statically allocated page tables
-static mut KERNEL_PAGES: KernelPages = KernelPages([const { RawPage([0; PAGE_SIZE]) }; 3]);
+static mut KERNEL_PAGES: KernelPages = KernelPages([const { RawPage([0; PAGE_SIZE]) }; 4]);
 
 /// PML4 for long mode - shared with PAE via PML4[0] = PDPT
 static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
@@ -1054,6 +1060,9 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     kpages.pdpt[3] = Entry64::new(boot_phys_page(&kpages.pdpt.0), true, false);
     kpages.pdpt[4] = Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false);
     kpages.pdpt[5] = Entry64::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
+    // PDPT[6] = pt_dev: device-MMIO window at 0xC0C00000-0xC0DFFFFF,
+    // separate from pt_kernel so heap growth can't clobber BARs.
+    kpages.pdpt[6] = Entry64::new(boot_phys_page(&kpages.pt_dev.0), true, false);
 
     // Boot with virtual root in CR3 directly (R/W bits in PDPT[0..3] are
     // technically reserved, but OK for boot — we switch to the thread's

@@ -63,13 +63,14 @@ pub fn pcm_out_buf() -> Option<(*mut u8, u64)> {
     }
 }
 
-/// Kernel device-mapping window. Sits at the top of pt_kernel's pre-
-/// mapped 2 MB range (0xC0A00000-0xC0BFFFFF), leaving ~30 pages below
-/// for kernel image growth. Used for both MMIO BAR mappings
-/// (uncached) and DMA-shared kernel pages (cached). Bump-allocated;
-/// never freed in this prototype.
-const DEVICE_VBASE: usize = 0xC0BF_0000;
-const DEVICE_PAGES: usize = 16; // 64 KB
+/// Kernel device-mapping window. Lives in PDPT[6]'s dedicated PT
+/// (pt_dev, 0xC0C00000-0xC0DFFFFF) — deliberately OUTSIDE pt_kernel,
+/// so the kernel heap (which grows up through pt_kernel) can never
+/// demand-page over a PCI BAR / DMA-buffer mapping. Used for both
+/// MMIO BAR mappings (uncached) and DMA-shared kernel pages (cached).
+/// Bump-allocated; never freed in this prototype.
+const DEVICE_VBASE: usize = 0xC0C0_0000;
+const DEVICE_PAGES: usize = 256; // 1 MB (pt_dev's range is 2 MB)
 static NEXT_DEVICE_VPAGE: AtomicUsize = AtomicUsize::new(DEVICE_VBASE / 4096);
 
 fn bump_device_vpages(num_pages: usize) -> usize {
