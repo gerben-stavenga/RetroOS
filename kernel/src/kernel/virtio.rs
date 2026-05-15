@@ -647,6 +647,31 @@ pub fn log_device(d: &VirtioPciDevice) {
             "    snd ctl: SET_PARAMS={} PREPARE={} START={}",
             set_ok, prep_ok, start_ok,
         );
+        // If the stream is running, push one period (~23 ms) of a
+        // 440 Hz square wave so something audible comes out of the
+        // host audio backend.
+        if start_ok {
+            if let Some((buf_virt, buf_phys)) = alloc_dma_page() {
+                const PERIOD_BYTES: u32 = 4096;
+                const FRAMES: usize = (PERIOD_BYTES as usize) / 4;
+                const SAMPLE_RATE: usize = 44100;
+                const FREQ: usize = 440;
+                const HALF_PERIOD: usize = SAMPLE_RATE / (2 * FREQ); // ≈ 50 samples
+                const AMPLITUDE: i16 = 8000;
+                let samples = buf_virt as *mut i16;
+                unsafe {
+                    for i in 0..FRAMES {
+                        let val = if (i / HALF_PERIOD) & 1 == 0 { AMPLITUDE } else { -AMPLITUDE };
+                        core::ptr::write_volatile(samples.add(2 * i), val);     // L
+                        core::ptr::write_volatile(samples.add(2 * i + 1), val); // R
+                    }
+                }
+                match dev.snd_tx(0, buf_phys, PERIOD_BYTES) {
+                    Some(s) => crate::println!("    snd tx: status={:#x}", s),
+                    None => crate::println!("    snd tx: dma alloc failed"),
+                }
+            }
+        }
     } else {
         crate::println!("    init: FAILED");
     }
@@ -781,6 +806,69 @@ impl VirtioDevice {
     pub fn snd_start(&mut self, stream_id: u32) -> bool {
         let req = SndPcmHdr { hdr: SndHdr { code: SND_R_PCM_START }, stream_id };
         self.ctl_submit(&req).map_or(false, |s| s == SND_S_OK)
+    }
+
+    /// Submit one period of PCM samples on the TX queue and poll
+    /// for completion. The buffer is read by the device and dropped
+    /// once the period has been consumed by the audio backend.
+    ///
+    /// `audio_phys` must be a phys-contig region of `audio_len`
+    /// bytes that the device can DMA from. The caller fills it with
+    /// `period_bytes` worth of samples in the format set up by
+    /// `snd_set_params` (S16 LE, channel-interleaved).
+    pub fn snd_tx(&mut self, stream_id: u32, audio_phys: u64, audio_len: u32) -> Option<u32> {
+        // Scratch page for xfer header (at offset 0) and pcm_status
+        // (at offset 64). 64-byte separation is generous; only the
+        // first 4 + 8 bytes are touched but having them in distinct
+        // cachelines avoids any false-sharing fuss.
+        let (hdr_virt, hdr_phys) = alloc_dma_page()?;
+        const STATUS_OFF: usize = 64;
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct SndPcmXfer { stream_id: u32 }
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct SndPcmStatus { status: u32, latency_bytes: u32 }
+        unsafe {
+            write_volatile(hdr_virt as *mut SndPcmXfer, SndPcmXfer { stream_id });
+            write_volatile(
+                hdr_virt.add(STATUS_OFF) as *mut SndPcmStatus,
+                SndPcmStatus { status: 0, latency_bytes: 0 },
+            );
+        }
+        let q = &mut self.queues[SND_Q_TX];
+        unsafe {
+            // desc[0]: xfer header (read by device, has NEXT).
+            write_volatile(q.desc.add(0), VirtqDesc {
+                addr: hdr_phys,
+                len: core::mem::size_of::<SndPcmXfer>() as u32,
+                flags: DESC_F_NEXT, next: 1,
+            });
+            // desc[1]: audio data (read by device, has NEXT).
+            write_volatile(q.desc.add(1), VirtqDesc {
+                addr: audio_phys,
+                len: audio_len,
+                flags: DESC_F_NEXT, next: 2,
+            });
+            // desc[2]: pcm_status (written by device, last in chain).
+            write_volatile(q.desc.add(2), VirtqDesc {
+                addr: hdr_phys + STATUS_OFF as u64,
+                len: core::mem::size_of::<SndPcmStatus>() as u32,
+                flags: DESC_F_WRITE, next: 0,
+            });
+        }
+        q.publish_avail(0);
+        self.notify(SND_Q_TX as u16);
+        // Poll TX used ring. Device completes after consuming the
+        // period (or on stop/error).
+        loop {
+            if let Some(_elem) = self.queues[SND_Q_TX].pop_used() {
+                let st = unsafe {
+                    read_volatile(hdr_virt.add(STATUS_OFF) as *const SndPcmStatus)
+                };
+                return Some(st.status);
+            }
+        }
     }
 }
 
