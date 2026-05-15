@@ -23,9 +23,35 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kernel::pci::{self, Bar, PciAddr, PciDevice};
 use crate::kernel::pci::{read_config_u8, read_config_u32};
+
+/// Kernel MMIO virtual window. Sits at the top of pt_kernel's pre-
+/// mapped 2 MB range (0xC0A00000-0xC0BFFFFF), leaving ~30 pages below
+/// for kernel image growth. Bump-allocated; never freed in this
+/// prototype.
+const MMIO_VBASE: usize = 0xC0BF_0000;
+const MMIO_PAGES: usize = 16; // 64 KB
+static NEXT_MMIO_VPAGE: AtomicUsize = AtomicUsize::new(MMIO_VBASE / 4096);
+
+/// Bump-allocate a kernel virtual range from the MMIO window and map
+/// `num_pages` starting at physical page `ppage_start` into it with
+/// uncached, supervisor-only flags. Returns a kernel pointer to the
+/// first byte. Panics if the window is exhausted.
+fn map_mmio_pages(ppage_start: u64, num_pages: usize) -> *mut u8 {
+    let start = NEXT_MMIO_VPAGE.fetch_add(num_pages, Ordering::Relaxed);
+    let limit = (MMIO_VBASE + MMIO_PAGES * 4096) / 4096;
+    assert!(start + num_pages <= limit, "kernel MMIO window exhausted");
+    use crate::arch::page_flags::{READ_WRITE, WRITE_THROUGH, CACHE_DISABLE};
+    crate::kernel::startup::arch_map_phys_range(
+        start, num_pages, ppage_start,
+        READ_WRITE | WRITE_THROUGH | CACHE_DISABLE,
+    );
+    (start * 4096) as *mut u8
+}
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 /// Modern virtio device IDs sit in 0x1040..=0x107F; the low 6 bits are
@@ -89,6 +115,89 @@ impl VirtioPciDevice {
 
     pub fn find_cap(&self, cfg_type: VirtioCfgType) -> Option<&VirtioCap> {
         self.caps.iter().find(|c| c.cfg_type == cfg_type)
+    }
+
+    /// Map a capability region into kernel MMIO space and return a
+    /// pointer to its first byte. Returns None if the cap isn't present
+    /// or its BAR isn't memory-mapped.
+    pub fn map_cap(&self, cfg_type: VirtioCfgType) -> Option<*mut u8> {
+        let cap = self.find_cap(cfg_type)?;
+        let bar_base = bar_phys_base(self.addr, cap.bar)?;
+        let region_phys = bar_base.wrapping_add(cap.offset as u64);
+        let first_page = region_phys & !((crate::arch::PAGE_SIZE as u64) - 1);
+        let intra_off = (region_phys - first_page) as usize;
+        let span = intra_off + cap.length as usize;
+        let pages = span.div_ceil(crate::arch::PAGE_SIZE);
+        let base_va = map_mmio_pages(first_page >> 12, pages);
+        Some(unsafe { base_va.add(intra_off) })
+    }
+}
+
+fn bar_phys_base(addr: PciAddr, bar_idx: u8) -> Option<u64> {
+    match pci::read_bar(addr, bar_idx)?.0 {
+        Bar::Mem32 { base, .. } => Some(base as u64),
+        Bar::Mem64 { base, .. } => Some(base),
+        Bar::Io { .. } => None,
+    }
+}
+
+/// Common configuration block (virtio 1.x §4.1.4.3). The first region
+/// every virtio driver consults: feature bits, queue count, device
+/// status, plus per-queue control via the `queue_select` window.
+///
+/// All accesses must be volatile — the device updates fields between
+/// our reads, and our writes are commands.
+#[repr(C)]
+pub struct CommonCfg {
+    pub device_feature_select: u32,
+    pub device_feature: u32,
+    pub driver_feature_select: u32,
+    pub driver_feature: u32,
+    pub msix_config: u16,
+    pub num_queues: u16,
+    pub device_status: u8,
+    pub config_generation: u8,
+    pub queue_select: u16,
+    pub queue_size: u16,
+    pub queue_msix_vector: u16,
+    pub queue_enable: u16,
+    pub queue_notify_off: u16,
+    pub queue_desc: u64,
+    pub queue_driver: u64,
+    pub queue_device: u64,
+}
+
+/// Volatile-read wrapper around a mapped CommonCfg pointer.
+pub struct CommonCfgRegs(*mut CommonCfg);
+
+impl CommonCfgRegs {
+    pub fn from_ptr(p: *mut u8) -> Self {
+        Self(p as *mut CommonCfg)
+    }
+
+    pub fn num_queues(&self) -> u16 {
+        unsafe { read_volatile(core::ptr::addr_of!((*self.0).num_queues)) }
+    }
+
+    pub fn device_status(&self) -> u8 {
+        unsafe { read_volatile(core::ptr::addr_of!((*self.0).device_status)) }
+    }
+
+    pub fn set_device_status(&self, v: u8) {
+        unsafe { write_volatile(core::ptr::addr_of_mut!((*self.0).device_status), v) }
+    }
+
+    pub fn config_generation(&self) -> u8 {
+        unsafe { read_volatile(core::ptr::addr_of!((*self.0).config_generation)) }
+    }
+
+    /// Read the device-advertised feature bits for word `select`
+    /// (0 = features 0..32, 1 = features 32..64).
+    pub fn read_device_features(&self, select: u32) -> u32 {
+        unsafe {
+            write_volatile(core::ptr::addr_of_mut!((*self.0).device_feature_select), select);
+            read_volatile(core::ptr::addr_of!((*self.0).device_feature))
+        }
     }
 }
 
@@ -176,6 +285,17 @@ pub fn log_device(d: &VirtioPciDevice) {
                 idx += consumed;
             }
         }
+    }
+    // Map COMMON cfg and dump the registers the driver will care about.
+    if let Some(p) = d.map_cap(VirtioCfgType::Common) {
+        let cfg = CommonCfgRegs::from_ptr(p);
+        let feat_lo = cfg.read_device_features(0);
+        let feat_hi = cfg.read_device_features(1);
+        crate::println!(
+            "    common: num_queues={} device_status={:#x} config_gen={} features={:08x}_{:08x}",
+            cfg.num_queues(), cfg.device_status(), cfg.config_generation(),
+            feat_hi, feat_lo,
+        );
     }
 }
 

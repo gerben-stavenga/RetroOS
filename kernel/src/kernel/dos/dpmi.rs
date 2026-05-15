@@ -1308,8 +1308,12 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             let num_pages = aligned as usize / 4096;
             let vpage_start = base as usize / 4096;
             let ppage_start = phys as u64 / 4096;
-            // PWT (bit 3) + PCD (bit 4): write-through, cache-disable for MMIO
-            crate::kernel::startup::arch_map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
+            // User-accessible uncached MMIO mapping.
+            use crate::arch::page_flags::{READ_WRITE, USER, WRITE_THROUGH, CACHE_DISABLE};
+            crate::kernel::startup::arch_map_phys_range(
+                vpage_start, num_pages, ppage_start,
+                READ_WRITE | USER | WRITE_THROUGH | CACHE_DISABLE,
+            );
             // Return linear address
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
             regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);

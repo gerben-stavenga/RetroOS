@@ -20,6 +20,9 @@ mod x86;
 
 // Types
 pub use paging2::{KernelPages, RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE, unmap_kernel_page};
+/// PTE flag bits for callers of `MAP_PHYS_RANGE`. PRESENT is supplied
+/// implicitly by the arch handler; callers OR these as needed.
+pub use paging2::flags as page_flags;
 pub use irq::Irq;
 pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 

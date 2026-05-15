@@ -1491,19 +1491,17 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     flush_tlb();
 }
 
-/// Map a physical page into the user address space.
-pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
+/// Map a physical page into the current address space. PRESENT is set
+/// implicitly; every other bit (READ_WRITE, USER, CACHE_DISABLE,
+/// WRITE_THROUGH, NO_EXECUTE) must be specified by the caller via
+/// `extra_flags`. Use this for both user-page mappings (include
+/// `flags::USER | flags::READ_WRITE`) and supervisor-only kernel MMIO
+/// (include `flags::READ_WRITE | flags::CACHE_DISABLE | flags::WRITE_THROUGH`).
+pub fn map_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
+    let raw = (ppage << 12) | flags::PRESENT | extra_flags;
     match entries() {
-        Entries::E32(e) => {
-            let mut entry = Entry32::new(ppage, true, true);
-            entry.set_raw(entry.raw() | extra_flags);
-            e[vpage] = entry;
-        }
-        Entries::E64(e) => {
-            let mut entry = Entry64::new(ppage, true, true);
-            entry.set_raw(entry.raw() | extra_flags);
-            e[vpage] = entry;
-        }
+        Entries::E32(e) => e[vpage] = Entry32(raw as u32),
+        Entries::E64(e) => e[vpage] = Entry64(raw),
     }
     flush_tlb();
 }

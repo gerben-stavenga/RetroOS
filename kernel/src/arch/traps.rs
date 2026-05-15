@@ -89,7 +89,10 @@ pub mod arch_call {
     pub const UNMAP_RANGE: u64 = 0x10F;  // EDX=vpage_start, ECX=count — clear entries to absent
     pub const FREE_RANGE: u64 = 0x110;   // EDX=vpage_start, ECX=count — free phys + identity-map RO
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
-    pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start, ECX=num_pages, EBX=ppage_start
+    /// EDX=vpage_start, ECX=num_pages, EBX=ppage_start, EDI=flags
+    /// (full PTE flag set minus PRESENT; include USER+READ_WRITE for
+    /// user mappings, omit USER for kernel MMIO).
+    pub const MAP_PHYS_RANGE: u64 = 0x116;
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
     pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=count, EDX/ECX=watched linear addrs
@@ -231,7 +234,7 @@ fn arch_dispatch(regs: &mut Regs) {
             let ppage_start = regs.rbx as u64;
             let flags = regs.rdi;
             for i in 0..num_pages {
-                paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64, flags);
+                paging2::map_page_phys(vpage_start + i, ppage_start + i as u64, flags);
             }
         }
         arch_call::SET_TLS_ENTRY => {
