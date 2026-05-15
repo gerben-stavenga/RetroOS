@@ -1009,6 +1009,22 @@ pub fn arch_load_ldt(base: u32, limit: u32) {
     }
 }
 
+/// Allocate one physical page from the arch allocator. Returns the
+/// page number (multiply by PAGE_SIZE for the byte address), or None
+/// on out-of-memory. Caller is responsible for mapping it into the
+/// desired virtual range via `arch_map_phys_range`. Page number fits
+/// in 32 bits because we cap total RAM at 4 GB.
+pub fn arch_alloc_phys_page() -> Option<u32> {
+    let page: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("eax") crate::arch::arch_call::ALLOC_PHYS_PAGE as u32 => page,
+        );
+    }
+    if page == 0 { None } else { Some(page) }
+}
+
 /// Map a range of physical pages into user virtual space.
 pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
     unsafe {

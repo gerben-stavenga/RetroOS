@@ -96,6 +96,10 @@ pub mod arch_call {
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
     pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=count, EDX/ECX=watched linear addrs
+    /// Allocate one physical page from the arch phys allocator. Returns
+    /// the page number (not byte address) in EAX, or 0 if out of memory.
+    /// Caller maps it into the desired virtual range via MAP_PHYS_RANGE.
+    pub const ALLOC_PHYS_PAGE: u64 = 0x11A;
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -227,6 +231,9 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::FREE_RANGE => paging2::free_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::LOAD_LDT => {
             crate::arch::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
+        }
+        arch_call::ALLOC_PHYS_PAGE => {
+            regs.rax = crate::arch::phys_mm::alloc_phys_page().unwrap_or(0);
         }
         arch_call::MAP_PHYS_RANGE => {
             let vpage_start = regs.rdx as usize;

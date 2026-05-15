@@ -29,28 +29,52 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::kernel::pci::{self, Bar, PciAddr, PciDevice};
 use crate::kernel::pci::{read_config_u8, read_config_u32};
 
-/// Kernel MMIO virtual window. Sits at the top of pt_kernel's pre-
+/// Kernel device-mapping window. Sits at the top of pt_kernel's pre-
 /// mapped 2 MB range (0xC0A00000-0xC0BFFFFF), leaving ~30 pages below
-/// for kernel image growth. Bump-allocated; never freed in this
-/// prototype.
-const MMIO_VBASE: usize = 0xC0BF_0000;
-const MMIO_PAGES: usize = 16; // 64 KB
-static NEXT_MMIO_VPAGE: AtomicUsize = AtomicUsize::new(MMIO_VBASE / 4096);
+/// for kernel image growth. Used for both MMIO BAR mappings
+/// (uncached) and DMA-shared kernel pages (cached). Bump-allocated;
+/// never freed in this prototype.
+const DEVICE_VBASE: usize = 0xC0BF_0000;
+const DEVICE_PAGES: usize = 16; // 64 KB
+static NEXT_DEVICE_VPAGE: AtomicUsize = AtomicUsize::new(DEVICE_VBASE / 4096);
 
-/// Bump-allocate a kernel virtual range from the MMIO window and map
-/// `num_pages` starting at physical page `ppage_start` into it with
-/// uncached, supervisor-only flags. Returns a kernel pointer to the
-/// first byte. Panics if the window is exhausted.
+fn bump_device_vpages(num_pages: usize) -> usize {
+    let start = NEXT_DEVICE_VPAGE.fetch_add(num_pages, Ordering::Relaxed);
+    let limit = (DEVICE_VBASE + DEVICE_PAGES * 4096) / 4096;
+    assert!(start + num_pages <= limit, "kernel device window exhausted");
+    start
+}
+
+/// Map `num_pages` physical pages into the kernel device window with
+/// MMIO flags (uncached, supervisor-only, writable). Returns a kernel
+/// pointer to the first byte.
 fn map_mmio_pages(ppage_start: u64, num_pages: usize) -> *mut u8 {
-    let start = NEXT_MMIO_VPAGE.fetch_add(num_pages, Ordering::Relaxed);
-    let limit = (MMIO_VBASE + MMIO_PAGES * 4096) / 4096;
-    assert!(start + num_pages <= limit, "kernel MMIO window exhausted");
+    let start = bump_device_vpages(num_pages);
     use crate::arch::page_flags::{READ_WRITE, WRITE_THROUGH, CACHE_DISABLE};
     crate::kernel::startup::arch_map_phys_range(
         start, num_pages, ppage_start,
         READ_WRITE | WRITE_THROUGH | CACHE_DISABLE,
     );
     (start * 4096) as *mut u8
+}
+
+/// Allocate one physical page from the arch allocator and map it into
+/// the kernel device window with cached, supervisor-only, writable
+/// flags. Returns `(kernel_virt_ptr, phys_addr_bytes)` — the phys
+/// half is what gets handed to a device's DMA registers; the virt
+/// half is what kernel code reads/writes. None on out-of-memory.
+fn alloc_dma_page() -> Option<(*mut u8, u64)> {
+    let ppage = crate::kernel::startup::arch_alloc_phys_page()?;
+    let vpage = bump_device_vpages(1);
+    use crate::arch::page_flags::READ_WRITE;
+    crate::kernel::startup::arch_map_phys_range(
+        vpage, 1, ppage as u64, READ_WRITE,
+    );
+    let ptr = (vpage * 4096) as *mut u8;
+    // Zero the page so freshly-allocated descriptor tables / rings
+    // start in a known state.
+    unsafe { core::ptr::write_bytes(ptr, 0, 4096); }
+    Some((ptr, (ppage as u64) * 4096))
 }
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -166,6 +190,161 @@ pub struct CommonCfg {
     pub queue_driver: u64,
     pub queue_device: u64,
 }
+
+// =============================================================================
+// Virtqueue (virtio 1.x §2.6)
+// =============================================================================
+//
+// Each virtqueue is three shared-memory areas:
+//
+//   1. Descriptor table: array of (phys_addr, len, flags, next).
+//   2. Available ring:   driver→device "process these descriptor heads".
+//   3. Used ring:        device→driver "I'm done with these heads".
+//
+// We pack all three into a single 4 KB phys-contig page for queue
+// sizes up to ~128 entries (4 KB / (16+2+8) ≈ 156). Layout within
+// the page (queue_size = N):
+//
+//   offset 0                  desc table:  N * 16 = up to 2048 B
+//   offset 0x800              avail ring:  6 + 2N + 2  bytes
+//   offset 0xC00              used ring:   6 + 8N + 2 bytes
+//
+// All three structures need natural alignment; 16/0x800/0xC00 are
+// generously aligned for the sizes we use.
+
+const QUEUE_SIZE: u16 = 64;
+
+const DESC_F_NEXT: u16 = 1;
+const DESC_F_WRITE: u16 = 2;
+#[allow(dead_code)] const DESC_F_INDIRECT: u16 = 4;
+
+const AVAIL_OFFSET: usize = 0x800;
+const USED_OFFSET: usize = 0xC00;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VirtqDesc {
+    pub addr: u64,
+    pub len: u32,
+    pub flags: u16,
+    pub next: u16,
+}
+
+#[repr(C)]
+pub struct VirtqAvail {
+    pub flags: u16,
+    pub idx: u16,
+    pub ring: [u16; QUEUE_SIZE as usize],
+    pub used_event: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VirtqUsedElem {
+    pub id: u32,
+    pub len: u32,
+}
+
+#[repr(C)]
+pub struct VirtqUsed {
+    pub flags: u16,
+    pub idx: u16,
+    pub ring: [VirtqUsedElem; QUEUE_SIZE as usize],
+    pub avail_event: u16,
+}
+
+/// One allocated virtqueue (descriptor table + avail + used) in a
+/// single phys-contig 4 KB page.
+pub struct Virtqueue {
+    desc: *mut VirtqDesc,
+    avail: *mut VirtqAvail,
+    used: *mut VirtqUsed,
+    /// Physical address of the descriptor table (= page base; avail
+    /// and used are at fixed offsets above this).
+    pub desc_phys: u64,
+    /// Driver-side index of the next position to fill in the avail
+    /// ring and the next used-elem we haven't yet processed.
+    next_avail: u16,
+    last_used: u16,
+}
+
+impl Virtqueue {
+    pub const SIZE: u16 = QUEUE_SIZE;
+
+    /// Allocate a fresh virtqueue page and lay out the three rings in
+    /// it. Returns None if phys allocation fails.
+    pub fn new() -> Option<Self> {
+        let (virt, phys) = alloc_dma_page()?;
+        let desc = virt as *mut VirtqDesc;
+        let avail = unsafe { virt.add(AVAIL_OFFSET) as *mut VirtqAvail };
+        let used = unsafe { virt.add(USED_OFFSET) as *mut VirtqUsed };
+        Some(Self {
+            desc, avail, used,
+            desc_phys: phys,
+            next_avail: 0,
+            last_used: 0,
+        })
+    }
+
+    pub fn avail_phys(&self) -> u64 { self.desc_phys + AVAIL_OFFSET as u64 }
+    pub fn used_phys(&self) -> u64 { self.desc_phys + USED_OFFSET as u64 }
+
+    /// Write a single descriptor (one-buffer transfer, no chaining).
+    /// `idx` is the slot in the descriptor table (caller's choice;
+    /// for simple cases, just `next_avail`).
+    pub fn write_desc(&mut self, idx: u16, addr: u64, len: u32, write: bool) {
+        let d = VirtqDesc {
+            addr, len,
+            flags: if write { DESC_F_WRITE } else { 0 },
+            next: 0,
+        };
+        unsafe { write_volatile(self.desc.add(idx as usize), d); }
+    }
+
+    /// Add descriptor head `idx` to the avail ring and bump the
+    /// driver-visible avail index. Doesn't notify the device.
+    pub fn publish_avail(&mut self, idx: u16) {
+        unsafe {
+            let slot = self.next_avail % QUEUE_SIZE;
+            write_volatile(
+                core::ptr::addr_of_mut!((*self.avail).ring[slot as usize]),
+                idx,
+            );
+            self.next_avail = self.next_avail.wrapping_add(1);
+            // Memory barrier: the device must see the ring entry
+            // before it sees the bumped idx. On x86 plain stores are
+            // already store-ordered, but emit a compiler fence to
+            // keep the optimizer from reordering across the bump.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            write_volatile(
+                core::ptr::addr_of_mut!((*self.avail).idx),
+                self.next_avail,
+            );
+        }
+    }
+
+    /// Read the device-published used-ring head index. Returns the
+    /// next used-elem if there's one we haven't processed yet, else
+    /// None.
+    pub fn pop_used(&mut self) -> Option<VirtqUsedElem> {
+        let device_idx = unsafe {
+            read_volatile(core::ptr::addr_of!((*self.used).idx))
+        };
+        if device_idx == self.last_used {
+            return None;
+        }
+        let slot = self.last_used % QUEUE_SIZE;
+        let elem = unsafe {
+            read_volatile(core::ptr::addr_of!((*self.used).ring[slot as usize]))
+        };
+        self.last_used = self.last_used.wrapping_add(1);
+        Some(elem)
+    }
+}
+
+// =============================================================================
+// Common config (virtio 1.x §4.1.4.3)
+// =============================================================================
 
 /// Volatile-read wrapper around a mapped CommonCfg pointer.
 pub struct CommonCfgRegs(*mut CommonCfg);
