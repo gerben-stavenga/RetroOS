@@ -42,6 +42,89 @@ const COM_SP: u16 = 0xFFFE;
 const EXEC_SAVED_IVT_VECTORS: [u8; 12] =
     [0x13, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67, 0x74];
 
+const PIT_INPUT_HZ: u64 = 1_193_182;
+const BIOS_TICK_DIVISOR: u64 = 65_536;
+
+fn bios_time_of_day() -> (u8, u8, u8, u8) {
+    // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
+    // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
+    // of approximating the tick rate as 18 Hz.
+    let ticks = unsafe { core::ptr::read_volatile(0x46C as *const u32) } as u64;
+    let total_centis = ticks
+        .saturating_mul(BIOS_TICK_DIVISOR)
+        .saturating_mul(100)
+        / PIT_INPUT_HZ;
+    let total_secs = total_centis / 100;
+
+    (
+        ((total_secs / 3600) % 24) as u8,
+        ((total_secs / 60) % 60) as u8,
+        (total_secs % 60) as u8,
+        (total_centis % 100) as u8,
+    )
+}
+
+fn cmos_read(index: u8) -> u8 {
+    crate::arch::outb(0x70, index);
+    crate::arch::inb(0x71)
+}
+
+fn cmos_decode(value: u8, binary: bool) -> u8 {
+    if binary {
+        value
+    } else {
+        (value & 0x0F).saturating_add((value >> 4).saturating_mul(10))
+    }
+}
+
+fn day_of_week(mut year: u16, mut month: u8, day: u8) -> u8 {
+    // Sakamoto algorithm, returns 0=Sunday .. 6=Saturday (DOS convention).
+    const OFFSETS: [u8; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    if month < 3 {
+        year = year.saturating_sub(1);
+    }
+    month = month.clamp(1, 12);
+    let y = year as u32;
+    ((y + y / 4 - y / 100 + y / 400 + OFFSETS[month as usize - 1] as u32 + day as u32) % 7) as u8
+}
+
+fn cmos_date() -> (u16, u8, u8, u8) {
+    for _ in 0..10_000 {
+        if cmos_read(0x0A) & 0x80 == 0 {
+            break;
+        }
+    }
+
+    let status_b = cmos_read(0x0B);
+    let binary = status_b & 0x04 != 0;
+    let day = cmos_decode(cmos_read(0x07), binary);
+    let month = cmos_decode(cmos_read(0x08), binary);
+    let year_lo = cmos_decode(cmos_read(0x09), binary);
+    let century = cmos_decode(cmos_read(0x32), binary);
+
+    let year = if (19..=99).contains(&century) {
+        century as u16 * 100 + year_lo as u16
+    } else if year_lo >= 80 {
+        1900 + year_lo as u16
+    } else {
+        2000 + year_lo as u16
+    };
+
+    if !(1980..=2099).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return (2026, 3, 22, 6);
+    }
+
+    (year, month, day, day_of_week(year, month, day))
+}
+
+fn current_dos_timestamp() -> (u16, u16) {
+    let (hour, min, sec, _) = bios_time_of_day();
+    let (year, month, day, _) = cmos_date();
+    let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
+    let dos_date = ((year.saturating_sub(1980)) << 9) | ((month as u16) << 5) | day as u16;
+    (dos_time, dos_date)
+}
+
 fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
     if let Some(ch) = dos.dos_pending_char.take() {
         return Some(ch);
@@ -1633,34 +1716,26 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=2Ah — Get System Date
         0x2A => {
-            // Return a fixed date: 2026-03-22 (Saturday)
-            regs.rcx = (regs.rcx & !0xFFFF) | 2026; // CX = year
-            regs.rdx = (regs.rdx & !0xFFFF) | (3 << 8) | 22; // DH = month, DL = day
-            regs.rax = (regs.rax & !0xFF) | 6; // AL = day of week (0=Sun, 6=Sat)
+            let (year, month, day, dow) = cmos_date();
+            regs.rcx = (regs.rcx & !0xFFFF) | year as u64; // CX = year
+            regs.rdx = (regs.rdx & !0xFFFF) | ((month as u64) << 8) | day as u64; // DH = month, DL = day
+            regs.rax = (regs.rax & !0xFF) | dow as u64; // AL = day of week (0=Sun, 6=Sat)
             thread::KernelAction::Done
         }
         // AH=2Ch — Get System Time
         0x2C => {
-            // Derive from BIOS tick count at 0040:006C (18.2 ticks/sec)
-            let ticks = unsafe { *((0x46C) as *const u32) };
-            let total_secs = ticks / 18;
-            let hours = (total_secs / 3600) % 24;
-            let mins = (total_secs / 60) % 60;
-            let secs = total_secs % 60;
-            let centisecs = ((ticks % 18) * 100) / 18;
-            regs.rcx = (regs.rcx & !0xFFFF) | (hours << 8) as u64 | mins as u64;
-            regs.rdx = (regs.rdx & !0xFFFF) | (secs << 8) as u64 | centisecs as u64;
+            let (hours, mins, secs, centisecs) = bios_time_of_day();
+            regs.rcx = (regs.rcx & !0xFFFF) | ((hours as u64) << 8) | mins as u64;
+            regs.rdx = (regs.rdx & !0xFFFF) | ((secs as u64) << 8) | centisecs as u64;
             thread::KernelAction::Done
         }
         // AH=0x57: Get/Set File Date and Time (AL=0: get, AL=1: set, BX=handle)
         0x57 => {
             let al = regs.rax as u8;
             if al == 0 {
-                // Get: return a fixed date/time (2026-03-22 12:00:00)
                 // DOS time: bits 15-11=hours, 10-5=minutes, 4-0=seconds/2
                 // DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
-                let time: u16 = (12 << 11) | (0 << 5) | 0; // 12:00:00
-                let date: u16 = (46 << 9) | (3 << 5) | 22; // 2026-03-22
+                let (time, date) = current_dos_timestamp();
                 regs.rcx = (regs.rcx & !0xFFFF) | time as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | date as u64;
                 regs.clear_flag32(1);
