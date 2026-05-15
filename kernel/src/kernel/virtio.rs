@@ -346,6 +346,17 @@ impl Virtqueue {
 // Common config (virtio 1.x §4.1.4.3)
 // =============================================================================
 
+// Device status bits (virtio 1.x §2.1).
+pub const STATUS_ACKNOWLEDGE: u8 = 1;
+pub const STATUS_DRIVER: u8 = 2;
+pub const STATUS_DRIVER_OK: u8 = 4;
+pub const STATUS_FEATURES_OK: u8 = 8;
+pub const STATUS_DEVICE_NEEDS_RESET: u8 = 64;
+pub const STATUS_FAILED: u8 = 128;
+
+// Transport feature bits we care about.
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
 /// Volatile-read wrapper around a mapped CommonCfg pointer.
 pub struct CommonCfgRegs(*mut CommonCfg);
 
@@ -378,6 +389,121 @@ impl CommonCfgRegs {
             read_volatile(core::ptr::addr_of!((*self.0).device_feature))
         }
     }
+
+    /// Write the driver's chosen feature bits for word `select`.
+    pub fn write_driver_features(&self, select: u32, value: u32) {
+        unsafe {
+            write_volatile(core::ptr::addr_of_mut!((*self.0).driver_feature_select), select);
+            write_volatile(core::ptr::addr_of_mut!((*self.0).driver_feature), value);
+        }
+    }
+
+    /// Select a virtqueue for subsequent per-queue register accesses.
+    pub fn select_queue(&self, q: u16) {
+        unsafe {
+            write_volatile(core::ptr::addr_of_mut!((*self.0).queue_select), q);
+        }
+    }
+
+    /// Read the selected queue's max supported size (= device's
+    /// suggestion; we can shrink by writing a smaller value back).
+    pub fn queue_size(&self) -> u16 {
+        unsafe { read_volatile(core::ptr::addr_of!((*self.0).queue_size)) }
+    }
+
+    pub fn set_queue_size(&self, n: u16) {
+        unsafe { write_volatile(core::ptr::addr_of_mut!((*self.0).queue_size), n); }
+    }
+
+    /// Read the per-queue notify offset used for doorbell address
+    /// computation (`notify_base + notify_off * multiplier`).
+    pub fn queue_notify_off(&self) -> u16 {
+        unsafe { read_volatile(core::ptr::addr_of!((*self.0).queue_notify_off)) }
+    }
+
+    pub fn set_queue_addrs(&self, desc: u64, driver: u64, device: u64) {
+        unsafe {
+            write_volatile(core::ptr::addr_of_mut!((*self.0).queue_desc), desc);
+            write_volatile(core::ptr::addr_of_mut!((*self.0).queue_driver), driver);
+            write_volatile(core::ptr::addr_of_mut!((*self.0).queue_device), device);
+        }
+    }
+
+    pub fn enable_queue(&self) {
+        unsafe { write_volatile(core::ptr::addr_of_mut!((*self.0).queue_enable), 1); }
+    }
+}
+
+/// A virtio device that has completed the init handshake. Holds its
+/// common-config window and one virtqueue per declared queue index.
+pub struct VirtioDevice {
+    pub cfg: CommonCfgRegs,
+    pub queues: Vec<Virtqueue>,
+}
+
+/// Run the virtio 1.x init protocol: reset → ACKNOWLEDGE → DRIVER →
+/// negotiate features (we require VIRTIO_F_VERSION_1, reject all
+/// else) → FEATURES_OK → allocate every advertised queue and write
+/// its phys addresses → enable queues → DRIVER_OK.
+///
+/// Returns the live device on success. On any failure, sets STATUS_
+/// FAILED on the device and returns None — the device will need a
+/// fresh reset before another attempt.
+pub fn init_device(d: &VirtioPciDevice) -> Option<VirtioDevice> {
+    let common_ptr = d.map_cap(VirtioCfgType::Common)?;
+    let cfg = CommonCfgRegs::from_ptr(common_ptr);
+
+    // (1) reset
+    cfg.set_device_status(0);
+    while cfg.device_status() != 0 {}
+
+    // (2,3) acknowledge + driver
+    cfg.set_device_status(STATUS_ACKNOWLEDGE);
+    cfg.set_device_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+
+    // (4,5) negotiate features. We require VERSION_1 (bit 32) and
+    // explicitly accept *only* that bit. Everything else (event-idx,
+    // packed-ring, indirect-desc, etc.) is left disabled for
+    // simplicity in this first cut.
+    let dev_lo = cfg.read_device_features(0);
+    let dev_hi = cfg.read_device_features(1);
+    if dev_hi & (1 << 0) == 0 {
+        crate::println!("virtio: device doesn't advertise VERSION_1 — bailing");
+        cfg.set_device_status(STATUS_FAILED);
+        return None;
+    }
+    cfg.write_driver_features(0, 0);
+    cfg.write_driver_features(1, 1); // just VIRTIO_F_VERSION_1
+
+    // (6,7) features_ok + verify
+    cfg.set_device_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
+    if cfg.device_status() & STATUS_FEATURES_OK == 0 {
+        crate::println!("virtio: FEATURES_OK rejected (device wanted features we declined)");
+        cfg.set_device_status(STATUS_FAILED);
+        return None;
+    }
+    let _ = (dev_lo, dev_hi); // for logging if we want it later
+
+    // (8) allocate queues. virtio-sound has 4: control, event, TX, RX.
+    let nq = cfg.num_queues();
+    let mut queues = Vec::with_capacity(nq as usize);
+    for q in 0..nq {
+        cfg.select_queue(q);
+        let dev_max = cfg.queue_size();
+        let our_size = QUEUE_SIZE.min(dev_max);
+        cfg.set_queue_size(our_size);
+        let vq = Virtqueue::new()?;
+        cfg.set_queue_addrs(vq.desc_phys, vq.avail_phys(), vq.used_phys());
+        cfg.enable_queue();
+        queues.push(vq);
+    }
+
+    // (9) driver_ok — device is live.
+    cfg.set_device_status(
+        STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+    );
+
+    Some(VirtioDevice { cfg, queues })
 }
 
 /// Try to recognize a PCI device as a modern virtio device and parse
@@ -475,6 +601,23 @@ pub fn log_device(d: &VirtioPciDevice) {
             cfg.num_queues(), cfg.device_status(), cfg.config_generation(),
             feat_hi, feat_lo,
         );
+    }
+
+    // Drive the init handshake. After this completes, device_status
+    // should read 0xF (ACK|DRIVER|FEATURES_OK|DRIVER_OK).
+    if let Some(dev) = init_device(d) {
+        crate::println!(
+            "    init: OK — device_status={:#x}, {} queues attached",
+            dev.cfg.device_status(), dev.queues.len(),
+        );
+        for (i, q) in dev.queues.iter().enumerate() {
+            crate::println!(
+                "      q{}: desc_phys={:#x} avail_phys={:#x} used_phys={:#x}",
+                i, q.desc_phys, q.avail_phys(), q.used_phys(),
+            );
+        }
+    } else {
+        crate::println!("    init: FAILED");
     }
 }
 
