@@ -182,7 +182,16 @@ const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
 /// extremely expensive (one #DB per instruction inside any CLI region).
 /// Flip to `false` to skip TF stepping; flip to `true` to restore the
 /// pre-instrumentation behaviour for A/B comparison.
-pub const TF_VIRTUAL_IF_STEPPING: bool = false;
+///
+/// MUST stay `true`: real-world DPMI clients (Hexen via DOS32A, plus
+/// the sporadic IF=0 hangs in other titles) re-enable interrupts via
+/// `POPF`/`IRET` rather than `STI`/AX=0901. With stepping off those
+/// transitions are invisible, virtual IF stays stuck at 0 after the
+/// first CLI, the timer IRQ never delivers, and any tick-paced delay
+/// loop (e.g. Hexen's Sound Blaster DSP-reset wait) deadlocks. The
+/// gate defaulted to `false` in dc8feaf for instrumentation; that
+/// regressed every non-conforming client.
+pub const TF_VIRTUAL_IF_STEPPING: bool = true;
 
 // =============================================================================
 // Segment views
