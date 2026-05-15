@@ -435,10 +435,29 @@ impl CommonCfgRegs {
 }
 
 /// A virtio device that has completed the init handshake. Holds its
-/// common-config window and one virtqueue per declared queue index.
+/// common-config window, the notify region, one virtqueue per
+/// declared queue index, and per-queue notify offsets.
 pub struct VirtioDevice {
     pub cfg: CommonCfgRegs,
     pub queues: Vec<Virtqueue>,
+    notify_base: *mut u8,
+    notify_off_mult: u32,
+    /// Per-queue `queue_notify_off`, captured at init while we held
+    /// the queue selection. Doorbell address for queue Q is
+    /// `notify_base + queue_notify_off[Q] * notify_off_mult`.
+    queue_notify_off: Vec<u16>,
+}
+
+impl VirtioDevice {
+    /// Ring the doorbell for queue `q`. Writes the queue index as a
+    /// u16 to the queue's notify slot (per virtio 1.x §4.1.5.2; since
+    /// we didn't negotiate VIRTIO_F_NOTIFICATION_DATA, the value is
+    /// just the queue index).
+    pub fn notify(&self, q: u16) {
+        let offset = self.queue_notify_off[q as usize] as u32 * self.notify_off_mult;
+        let addr = unsafe { self.notify_base.add(offset as usize) as *mut u16 };
+        unsafe { write_volatile(addr, q); }
+    }
 }
 
 /// Run the virtio 1.x init protocol: reset → ACKNOWLEDGE → DRIVER →
@@ -484,9 +503,14 @@ pub fn init_device(d: &VirtioPciDevice) -> Option<VirtioDevice> {
     }
     let _ = (dev_lo, dev_hi); // for logging if we want it later
 
+    // Notify region — needed for doorbells. Map alongside common.
+    let notify_base = d.map_cap(VirtioCfgType::Notify)?;
+    let notify_off_mult = d.find_cap(VirtioCfgType::Notify)?.notify_off_multiplier;
+
     // (8) allocate queues. virtio-sound has 4: control, event, TX, RX.
     let nq = cfg.num_queues();
     let mut queues = Vec::with_capacity(nq as usize);
+    let mut queue_notify_off = Vec::with_capacity(nq as usize);
     for q in 0..nq {
         cfg.select_queue(q);
         let dev_max = cfg.queue_size();
@@ -494,6 +518,7 @@ pub fn init_device(d: &VirtioPciDevice) -> Option<VirtioDevice> {
         cfg.set_queue_size(our_size);
         let vq = Virtqueue::new()?;
         cfg.set_queue_addrs(vq.desc_phys, vq.avail_phys(), vq.used_phys());
+        queue_notify_off.push(cfg.queue_notify_off());
         cfg.enable_queue();
         queues.push(vq);
     }
@@ -503,7 +528,7 @@ pub fn init_device(d: &VirtioPciDevice) -> Option<VirtioDevice> {
         STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
     );
 
-    Some(VirtioDevice { cfg, queues })
+    Some(VirtioDevice { cfg, queues, notify_base, notify_off_mult, queue_notify_off })
 }
 
 /// Try to recognize a PCI device as a modern virtio device and parse
@@ -605,19 +630,157 @@ pub fn log_device(d: &VirtioPciDevice) {
 
     // Drive the init handshake. After this completes, device_status
     // should read 0xF (ACK|DRIVER|FEATURES_OK|DRIVER_OK).
-    if let Some(dev) = init_device(d) {
+    if let Some(mut dev) = init_device(d) {
         crate::println!(
             "    init: OK — device_status={:#x}, {} queues attached",
             dev.cfg.device_status(), dev.queues.len(),
         );
-        for (i, q) in dev.queues.iter().enumerate() {
-            crate::println!(
-                "      q{}: desc_phys={:#x} avail_phys={:#x} used_phys={:#x}",
-                i, q.desc_phys, q.avail_phys(), q.used_phys(),
-            );
-        }
+        // Try the control-queue protocol on stream 0 (the first PCM
+        // output). 44.1 kHz, signed 16-bit stereo — QEMU's
+        // virtio-sound rejects U8/mono with "Stream format is not
+        // supported" so we use the format most virtual audio backends
+        // do support. 4 KB single-period for now.
+        let set_ok = dev.snd_set_params(0, 4096, 4096, 2, SND_PCM_FMT_S16, SND_PCM_RATE_44100);
+        let prep_ok = if set_ok { dev.snd_prepare(0) } else { false };
+        let start_ok = if prep_ok { dev.snd_start(0) } else { false };
+        crate::println!(
+            "    snd ctl: SET_PARAMS={} PREPARE={} START={}",
+            set_ok, prep_ok, start_ok,
+        );
     } else {
         crate::println!("    init: FAILED");
+    }
+}
+
+// =============================================================================
+// virtio-sound protocol (subset enough for one-stream playback)
+// =============================================================================
+
+// Queue indices per virtio-sound spec §5.14.2.
+pub const SND_Q_CTL: usize = 0;
+#[allow(dead_code)] pub const SND_Q_EVT: usize = 1;
+pub const SND_Q_TX: usize = 2;
+#[allow(dead_code)] pub const SND_Q_RX: usize = 3;
+
+// Control-queue request codes (subset).
+const SND_R_PCM_INFO: u32 = 0x0100;
+const SND_R_PCM_SET_PARAMS: u32 = 0x0101;
+const SND_R_PCM_PREPARE: u32 = 0x0102;
+#[allow(dead_code)] const SND_R_PCM_RELEASE: u32 = 0x0103;
+const SND_R_PCM_START: u32 = 0x0104;
+#[allow(dead_code)] const SND_R_PCM_STOP: u32 = 0x0105;
+
+// Response status codes.
+const SND_S_OK: u32 = 0x8000;
+
+// Format codes for SET_PARAMS.
+const SND_PCM_FMT_U8: u8 = 1;
+#[allow(dead_code)] const SND_PCM_FMT_S16: u8 = 5;
+
+// Rate codes for SET_PARAMS.
+#[allow(dead_code)] const SND_PCM_RATE_8000: u8 = 0;
+const SND_PCM_RATE_22050: u8 = 4;
+#[allow(dead_code)] const SND_PCM_RATE_44100: u8 = 6;
+#[allow(dead_code)] const SND_PCM_RATE_48000: u8 = 7;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SndHdr { code: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SndPcmHdr { hdr: SndHdr, stream_id: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SndPcmSetParams {
+    pcm_hdr: SndPcmHdr,
+    buffer_bytes: u32,
+    period_bytes: u32,
+    features: u32,
+    channels: u8,
+    format: u8,
+    rate: u8,
+    padding: u8,
+}
+
+impl VirtioDevice {
+    /// Submit one request → response on the control queue, polling
+    /// the used ring until the device completes. Both buffers live
+    /// in a freshly-allocated DMA page; the page is leaked (one per
+    /// command) since this is one-shot init-time work.
+    ///
+    /// Returns the device's reply status code (`SND_S_OK` on success).
+    fn ctl_submit<Req: Copy>(&mut self, req: &Req) -> Option<u32> {
+        let req_size = core::mem::size_of::<Req>() as u32;
+        let resp_size = core::mem::size_of::<SndHdr>() as u32;
+        let (buf_virt, buf_phys) = alloc_dma_page()?;
+        unsafe {
+            // Write request at offset 0, zero response slot at +req_size.
+            core::ptr::write_volatile(buf_virt as *mut Req, *req);
+            core::ptr::write_volatile(
+                buf_virt.add(req_size as usize) as *mut SndHdr,
+                SndHdr { code: 0 },
+            );
+        }
+        // Two-descriptor chain: [0]=read req, [1]=write response.
+        let q = &mut self.queues[SND_Q_CTL];
+        q.write_desc(0, buf_phys, req_size, false);
+        // For chaining, desc 0 needs NEXT flag pointing at desc 1.
+        // Rewrite slot 0 with NEXT|next=1, then write slot 1.
+        unsafe {
+            write_volatile(q.desc.add(0), VirtqDesc {
+                addr: buf_phys, len: req_size,
+                flags: DESC_F_NEXT, next: 1,
+            });
+            write_volatile(q.desc.add(1), VirtqDesc {
+                addr: buf_phys + req_size as u64, len: resp_size,
+                flags: DESC_F_WRITE, next: 0,
+            });
+        }
+        q.publish_avail(0);
+        self.notify(SND_Q_CTL as u16);
+        // Poll until completion. No timeout for now — if the device
+        // never replies we'd hang here; acceptable for a first cut.
+        loop {
+            if let Some(elem) = self.queues[SND_Q_CTL].pop_used() {
+                let _ = elem;
+                let resp = unsafe {
+                    read_volatile(buf_virt.add(req_size as usize) as *const SndHdr)
+                };
+                return Some(resp.code);
+            }
+        }
+    }
+
+    /// Issue `SET_PARAMS` for `stream_id`. Returns true on OK.
+    pub fn snd_set_params(
+        &mut self, stream_id: u32,
+        buffer_bytes: u32, period_bytes: u32,
+        channels: u8, format: u8, rate: u8,
+    ) -> bool {
+        let req = SndPcmSetParams {
+            pcm_hdr: SndPcmHdr {
+                hdr: SndHdr { code: SND_R_PCM_SET_PARAMS },
+                stream_id,
+            },
+            buffer_bytes, period_bytes,
+            features: 0,
+            channels, format, rate, padding: 0,
+        };
+        self.ctl_submit(&req).map_or(false, |s| s == SND_S_OK)
+    }
+
+    /// Issue `PCM_PREPARE` for `stream_id`.
+    pub fn snd_prepare(&mut self, stream_id: u32) -> bool {
+        let req = SndPcmHdr { hdr: SndHdr { code: SND_R_PCM_PREPARE }, stream_id };
+        self.ctl_submit(&req).map_or(false, |s| s == SND_S_OK)
+    }
+
+    /// Issue `PCM_START` for `stream_id`.
+    pub fn snd_start(&mut self, stream_id: u32) -> bool {
+        let req = SndPcmHdr { hdr: SndHdr { code: SND_R_PCM_START }, stream_id };
+        self.ctl_submit(&req).map_or(false, |s| s == SND_S_OK)
     }
 }
 
