@@ -29,6 +29,40 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::kernel::pci::{self, Bar, PciAddr, PciDevice};
 use crate::kernel::pci::{read_config_u8, read_config_u32};
 
+/// Process-global audio sink: the initialized virtio-sound device.
+/// Set once at boot in `log_device`; subsequently used by the DOS SB
+/// façade to push PCM. None until init succeeds; never set back to
+/// None after that.
+static mut AUDIO_SINK: Option<VirtioDevice> = None;
+
+/// Reusable phys-contig buffer for SB→virtio PCM submission. Filled
+/// per call by the SB façade's format-conversion code; passed to
+/// `snd_tx`. Allocated lazily on first use.
+static mut PCM_OUT_VIRT: *mut u8 = core::ptr::null_mut();
+static mut PCM_OUT_PHYS: u64 = 0;
+
+/// Take an exclusive reference to the audio sink, if it's been
+/// initialized. Returns `None` before virtio-sound init completes
+/// (or if it failed). Safety: caller is the only one accessing the
+/// device — we're single-threaded inside DOS port traps.
+pub fn audio_sink() -> Option<&'static mut VirtioDevice> {
+    unsafe { (*core::ptr::addr_of_mut!(AUDIO_SINK)).as_mut() }
+}
+
+/// Get (or lazily allocate) the kernel-side PCM output buffer.
+/// Returns `(virt, phys)`. One 4 KB page — enough for one period of
+/// S16 stereo at 44.1 kHz (1024 frames = ~23 ms).
+pub fn pcm_out_buf() -> Option<(*mut u8, u64)> {
+    unsafe {
+        if PCM_OUT_VIRT.is_null() {
+            let (v, p) = alloc_dma_page()?;
+            PCM_OUT_VIRT = v;
+            PCM_OUT_PHYS = p;
+        }
+        Some((PCM_OUT_VIRT, PCM_OUT_PHYS))
+    }
+}
+
 /// Kernel device-mapping window. Sits at the top of pt_kernel's pre-
 /// mapped 2 MB range (0xC0A00000-0xC0BFFFFF), leaving ~30 pages below
 /// for kernel image growth. Used for both MMIO BAR mappings
@@ -628,6 +662,11 @@ pub fn log_device(d: &VirtioPciDevice) {
         );
     }
 
+    // Only the virtio-sound device becomes the audio sink. (Future:
+    // dispatch by device_type when we add virtio-net etc.)
+    if d.device_type() != 25 {
+        return;
+    }
     // Drive the init handshake. After this completes, device_status
     // should read 0xF (ACK|DRIVER|FEATURES_OK|DRIVER_OK).
     if let Some(mut dev) = init_device(d) {
@@ -672,6 +711,8 @@ pub fn log_device(d: &VirtioPciDevice) {
                 }
             }
         }
+        // Stash for the SB façade to push PCM into later.
+        unsafe { AUDIO_SINK = Some(dev); }
     } else {
         crate::println!("    init: FAILED");
     }

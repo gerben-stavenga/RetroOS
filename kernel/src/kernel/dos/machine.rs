@@ -1190,6 +1190,31 @@ pub struct SbState {
     /// Captured args, in order received. Sized for the longest cmd
     /// we currently care about (0x48 + 2 args, 0xB0 + 3 args).
     args: [u8; 4],
+    /// Last sample-rate time constant set via DSP cmd 0x40. Rate is
+    /// `1_000_000 / (256 - tc)`. 0 = uninitialized.
+    time_const: u8,
+    /// Block size set via DSP cmd 0x48 (low+high → u16, +1 for the
+    /// "count is N-1" convention used by some commands).
+    block_size: u16,
+    /// 8237 channel-1 DMA state (8-bit playback). Captured from
+    /// guest writes to DMAC1 ports + page register 0x83.
+    dma_addr: u16,
+    dma_page: u8,
+    dma_count: u16,
+    /// Flip-flop for the byte-pair writes to DMAC1 addr/count. The
+    /// 8237 takes addr/count in two byte writes; the flip-flop
+    /// selects which half. Cleared by writes to 0x0C or 0x0D.
+    dma_flipflop_high: bool,
+    /// Playback session state. When `playback_active`, every read
+    /// of 0x22E (the SB's IRQ ack) submits the next block.
+    playback_active: bool,
+    /// Byte offset within the guest's DMA buffer where SB has
+    /// "consumed" up to; wraps at `dma_count + 1` for auto-init.
+    playback_pos: u32,
+    /// Whether the playback command was auto-init (0x1C / 0x2C /
+    /// the AI variants of 0xB0-CF). Single-cycle commands stop after
+    /// one buffer-full instead of looping.
+    auto_init: bool,
 }
 
 impl SbState {
@@ -1200,8 +1225,39 @@ impl SbState {
             pending_cmd: 0,
             pending_args: 0,
             args: [0; 4],
+            time_const: 0,
+            block_size: 0,
+            dma_addr: 0,
+            dma_page: 0,
+            dma_count: 0,
+            dma_flipflop_high: false,
+            playback_active: false,
+            playback_pos: 0,
+            auto_init: false,
         }
     }
+
+    /// Compute the guest's chosen sample rate (Hz) from the SB
+    /// time-constant register. Default to 22050 if not yet set.
+    pub fn sample_rate(&self) -> u32 {
+        if self.time_const == 0 {
+            22050
+        } else {
+            1_000_000 / (256u32.saturating_sub(self.time_const as u32).max(1))
+        }
+    }
+
+    /// VM86 linear address of the DMA buffer base (= the address an
+    /// 8237 page register + 16-bit base form together, which is the
+    /// same as the DOS linear address since low memory is identity-
+    /// mapped at vpage = ppage in the guest's address space).
+    pub fn dma_linear(&self) -> u32 {
+        ((self.dma_page as u32) << 16) | (self.dma_addr as u32)
+    }
+
+    /// Total byte count of the DMA buffer (the 8237 counts down from
+    /// the programmed value, so the buffer length is count + 1).
+    pub fn dma_total(&self) -> u32 { self.dma_count as u32 + 1 }
 
     fn push_read(&mut self, byte: u8) {
         if (self.read_len as usize) < self.read_queue.len() {
@@ -1271,27 +1327,166 @@ impl SbState {
                 self.push_read(SB_VERSION_MAJOR);
                 self.push_read(SB_VERSION_MINOR);
             }
-            // All other commands are accepted-and-dropped for now.
-            // Playback start (0x1C / 0xB0-CF / 0xC0-CF) will hook
-            // into Layer 1 when the data path lands.
+            0x40 => {
+                // Set time constant (sample rate). args[0] = tc.
+                self.time_const = self.args[0];
+            }
+            0x48 => {
+                // Set DMA block size: args[0]=lo, args[1]=hi.
+                // Convention: programmed value is N-1.
+                self.block_size = (self.args[0] as u16) | ((self.args[1] as u16) << 8);
+            }
+            0x14 => {
+                // Single-cycle 8-bit DMA playback. args = length-1
+                // (low, high). Override block_size for this single
+                // shot; auto_init = false.
+                self.block_size = (self.args[0] as u16) | ((self.args[1] as u16) << 8);
+                self.start_playback(false);
+            }
+            0x1C => {
+                // Auto-init 8-bit DMA playback. block size was set
+                // by a prior 0x48.
+                self.start_playback(true);
+            }
+            0xB0..=0xBF | 0xC0..=0xCF => {
+                // SB16 16-bit / 8-bit DMA: args = format byte,
+                // length-1 low, length-1 high. We don't decode the
+                // format byte yet (S16/stereo/etc.) — just assume
+                // 8-bit mono. Subset that handles classic games;
+                // SB16-specific titles may sound wrong.
+                self.block_size = (self.args[1] as u16) | ((self.args[2] as u16) << 8);
+                // Auto-init = bit 2 of command code. SB16 cmds 0xB6
+                // / 0xC6 etc. set this; 0xB0 / 0xC0 don't.
+                let ai = (self.pending_cmd & 0x04) != 0;
+                self.start_playback(ai);
+            }
+            0xD0 | 0xD3 | 0xDA => {
+                // Pause / speaker off / exit auto-init: stop playback.
+                self.playback_active = false;
+            }
+            0xD4 => {
+                // Resume DMA — re-enter playback if we have a block.
+                if self.block_size > 0 {
+                    self.playback_active = true;
+                }
+            }
             _ => {}
         }
         self.pending_cmd = 0;
     }
+
+    fn start_playback(&mut self, auto_init: bool) {
+        // Need a non-trivial buffer or there's nothing to read. If
+        // the game hasn't programmed a DMA buffer (count = 0) or
+        // hasn't set a block size, bail without touching kernel
+        // memory or virtio-sound — but leave playback_active false
+        // so we don't loop fruitlessly on 0x22E reads.
+        if self.dma_count == 0 || self.block_size == 0 {
+            crate::dbg_println!(
+                "[sb] playback start ignored: dma_count={:#x} block={:#x} cmd={:#x}",
+                self.dma_count, self.block_size, self.pending_cmd,
+            );
+            return;
+        }
+        crate::dbg_println!(
+            "[sb] playback start: cmd={:#x} auto_init={} linear={:#x} total={:#x} block={:#x} rate={}",
+            self.pending_cmd, auto_init, self.dma_linear(), self.dma_total(),
+            self.block_size + 1, self.sample_rate(),
+        );
+        self.playback_active = true;
+        self.playback_pos = 0;
+        self.auto_init = auto_init;
+        submit_pcm_block(self);
+    }
+}
+
+/// Read `count` bytes of U8 PCM from VM86 linear address `linear`,
+/// upsample to S16 stereo at 44.1 kHz (our virtio-sound init format),
+/// and write into the kernel-side PCM buffer. Returns the number of
+/// output bytes produced. Caps at one virtio-sound period (4 KB).
+fn convert_u8_mono_to_s16_stereo(
+    linear: u32, count: u32, src_rate: u32,
+    out_buf: *mut u8, out_max: usize,
+) -> usize {
+    const DST_RATE: u32 = 44100;
+    // Each input sample becomes (DST_RATE/src_rate) output frames,
+    // each frame = 4 bytes (S16 L + S16 R).
+    let bytes_per_input = (DST_RATE / src_rate.max(1)).max(1) as usize * 4;
+    let max_input = out_max / bytes_per_input;
+    let in_count = (count as usize).min(max_input);
+    let mut wp = 0usize;
+    let src = linear as *const u8;
+    unsafe {
+        for i in 0..in_count {
+            let b = core::ptr::read_volatile(src.add(i));
+            // U8 unsigned → S16 signed: center at 0, scale up.
+            let s = ((b as i16) - 128).wrapping_mul(256);
+            let reps = bytes_per_input / 4;
+            for _ in 0..reps {
+                if wp + 4 > out_max { break; }
+                let dst = out_buf.add(wp) as *mut i16;
+                core::ptr::write_volatile(dst, s);          // L
+                core::ptr::write_volatile(dst.add(1), s);   // R
+                wp += 4;
+            }
+        }
+    }
+    wp
+}
+
+/// Submit one block of the guest's DMA buffer to virtio-sound and
+/// schedule an SB IRQ. Caller advances `playback_pos` afterward.
+fn submit_pcm_block(sb: &mut SbState) {
+    let Some((out_virt, out_phys)) = crate::kernel::virtio::pcm_out_buf() else { return };
+    let Some(dev) = crate::kernel::virtio::audio_sink() else { return };
+    let block = sb.block_size as u32 + 1;
+    let pos = sb.playback_pos;
+    let linear = sb.dma_linear() + pos;
+    let rate = sb.sample_rate();
+    let out_bytes = convert_u8_mono_to_s16_stereo(linear, block, rate, out_virt, 4096);
+    if out_bytes > 0 {
+        let _ = dev.snd_tx(0, out_phys, out_bytes as u32);
+    }
+    // Advance position; wrap for auto-init, clamp+stop for single.
+    let total = sb.dma_total();
+    let new_pos = pos + block;
+    if new_pos >= total {
+        if sb.auto_init {
+            sb.playback_pos = new_pos % total;
+        } else {
+            sb.playback_pos = total;
+            sb.playback_active = false;
+        }
+    } else {
+        sb.playback_pos = new_pos;
+    }
+    // Queue the SB IRQ in the read buffer's status bit and push to
+    // the vPIC. Caller's outer scope (emulate_outb) has the PcMachine
+    // but we only have SbState here — defer the vpic push to the
+    // dispatcher (sb_write returns "needs IRQ"); easier to just have
+    // emulate_outb push it after the call. See sb_write / sb_read.
 }
 
 /// Read from one of the SB ports (0x220-0x22F).
-pub fn sb_read(sb: &mut SbState, port: u16) -> u8 {
+pub fn sb_read(pc: &mut PcMachine, port: u16) -> u8 {
     match port {
         // 0x22A: DSP read data port — pop one byte from the read queue.
-        0x22A => sb.pop_read(),
+        0x22A => pc.sb.pop_read(),
         // 0x22C: bit 7 = DSP-busy (we're never busy from the driver's
         // POV — always ready to accept the next byte). Lower bits 0.
         0x22C => 0x00,
         // 0x22E: bit 7 = data-available in the read buffer. Reading
-        // also acts as the 8-bit IRQ ACK on real hardware; until we
-        // generate vIRQs we just report the buffer status.
-        0x22E => if sb.read_available() { 0x80 } else { 0x00 },
+        // also acts as the 8-bit IRQ ack — if playback is active and
+        // SB has "consumed" a block, queue the next block + raise
+        // the next vIRQ 5.
+        0x22E => {
+            let avail = pc.sb.read_available();
+            if pc.sb.playback_active {
+                submit_pcm_block(&mut pc.sb);
+                queue_sb_irq(pc);
+            }
+            if avail { 0x80 } else { 0x00 }
+        }
         // 0x22F: 16-bit IRQ ACK on real hardware; pre-detection it
         // just reads back 0.
         0x22F => 0x00,
@@ -1303,18 +1498,68 @@ pub fn sb_read(sb: &mut SbState, port: u16) -> u8 {
 }
 
 /// Write to one of the SB ports (0x220-0x22F).
-pub fn sb_write(sb: &mut SbState, port: u16, val: u8) {
+pub fn sb_write(pc: &mut PcMachine, port: u16, val: u8) {
     match port {
         // 0x226: DSP reset. Spec is "write 1, wait ≥ 3 µs, write 0".
         // We act on the 0-write (transition from any state to reset).
         0x226 => {
             if val == 0 {
-                sb.reset();
+                pc.sb.reset();
             }
         }
-        // 0x22C: DSP command/data byte.
-        0x22C => sb.dsp_write(val),
+        // 0x22C: DSP command/data byte. May trigger playback —
+        // queue the first SB IRQ after submission.
+        0x22C => {
+            let was_active = pc.sb.playback_active;
+            pc.sb.dsp_write(val);
+            if !was_active && pc.sb.playback_active {
+                queue_sb_irq(pc);
+            }
+        }
         // Mixer / IRQ ACK writes — accepted, no side effects yet.
+        _ => {}
+    }
+}
+
+/// Push SB's IRQ 5 onto the vPIC. Vector = 0x0D (BIOS-remapped
+/// master-PIC IRQ 5).
+fn queue_sb_irq(pc: &mut PcMachine) {
+    if !pc.vpic.has_pending_vec(0x0D) {
+        pc.vpic.push(0x0D);
+    }
+}
+
+/// Handle a write to one of the DMAC1 / page-register ports we trap
+/// so we can capture the guest's SB DMA buffer location.
+pub fn dma_write(sb: &mut SbState, port: u16, val: u8) {
+    match port {
+        // Channel 1 base address byte (low then high via flip-flop).
+        0x02 => {
+            if !sb.dma_flipflop_high {
+                sb.dma_addr = (sb.dma_addr & 0xFF00) | (val as u16);
+            } else {
+                sb.dma_addr = (sb.dma_addr & 0x00FF) | ((val as u16) << 8);
+            }
+            sb.dma_flipflop_high = !sb.dma_flipflop_high;
+        }
+        // Channel 1 count byte (low then high).
+        0x03 => {
+            if !sb.dma_flipflop_high {
+                sb.dma_count = (sb.dma_count & 0xFF00) | (val as u16);
+            } else {
+                sb.dma_count = (sb.dma_count & 0x00FF) | ((val as u16) << 8);
+            }
+            sb.dma_flipflop_high = !sb.dma_flipflop_high;
+        }
+        // Clear flip-flop / master reset clear the byte-pair state.
+        0x0C | 0x0D => sb.dma_flipflop_high = false,
+        // Channel 1 page register (high 8 bits of phys address).
+        0x83 => sb.dma_page = val,
+        // mask / mode / others — accept without side effects so we
+        // don't fall into the "unhandled port" log. We don't model
+        // unmask/mask gating because we don't actually drive a real
+        // DMAC — the kernel-side reader just pulls bytes when the
+        // SB DSP says playback is active.
         _ => {}
     }
 }
@@ -1362,9 +1607,13 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // behavior across the whole window. Explicit arm just to suppress
         // the unhandled-port log during a game's joystick detection sweep.
         0x200..=0x207 => 0xFF,
-        // Sound Blaster 16 — DSP state machine + (eventually) PCM
-        // route through to virtio-sound.
-        0x220..=0x22F => sb_read(&mut pc.sb, port),
+        // Sound Blaster 16 — DSP state machine + PCM route through
+        // to virtio-sound (Layer 2).
+        0x220..=0x22F => sb_read(pc, port),
+        // 8237 DMAC1: reads aren't actively used by SB drivers
+        // (they write-then-fire) but return 0 to suppress the
+        // unhandled-port log.
+        0x00..=0x0F | 0x83 => 0,
         // Master PIC command (read ISR)
         0x20 => pc.vpic.isr,
         // Master PIC data (read IMR)
@@ -1436,8 +1685,15 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         // emulate_inb above). Writes to absent devices are dropped on real
         // hardware too — silently swallow rather than flooding the log.
         0x200..=0x207 => {}
-        // Sound Blaster 16 — DSP state machine.
-        0x220..=0x22F => sb_write(&mut pc.sb, port, val),
+        // Sound Blaster 16 — DSP state machine + PCM route through
+        // to virtio-sound (Layer 2).
+        0x220..=0x22F => sb_write(pc, port, val),
+        // 8237 DMAC1 (channels 0-3) + channel-1 page register: we
+        // observe the guest's DMA setup writes to learn the SB
+        // buffer's linear address + length, but we never program a
+        // real 8237 — the kernel reads guest memory directly when
+        // submitting to virtio-sound.
+        0x00..=0x0F | 0x83 => dma_write(&mut pc.sb, port, val),
         // Master PIC data (write IMR)
         0x21 => pc.vpic.imr = val,
         // Slave PIC command / data
