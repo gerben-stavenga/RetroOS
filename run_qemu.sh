@@ -45,6 +45,11 @@ case "$IMG" in
     *)           echo "Unknown image type: $IMG (choose: image, proprietary, ext4, grub, freedos)"; exit 1 ;;
 esac
 
+# DOS-era systems treat the RTC as local wall-clock time. QEMU defaults to UTC,
+# which makes DOS file managers display host-local time with the timezone
+# offset applied.
+RTC_ARGS=(-rtc base=localtime)
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -90,6 +95,7 @@ if [ "$IMG" = "grub" ]; then
         -boot order=d \
         -debugcon stdio \
         "${AUDIO_ARGS[@]}" \
+        "${RTC_ARGS[@]}" \
         -no-reboot \
         "$@"
 elif [ "$IMG" = "freedos" ]; then
@@ -185,6 +191,7 @@ elif [ "$IMG" = "freedos" ]; then
         $APPS_DRIVE \
         $FDOS_ARGS \
         "${AUDIO_ARGS[@]}" \
+        "${RTC_ARGS[@]}" \
         -no-reboot \
         "$@"
 else
@@ -231,6 +238,7 @@ else
         "${FWCFG_ARGS[@]}" \
         "${HOSTFS_ARGS[@]}" \
         "${AUDIO_ARGS[@]}" \
+        "${RTC_ARGS[@]}" \
         -no-reboot \
         "$@"
 fi
