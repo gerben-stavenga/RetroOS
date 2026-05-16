@@ -1148,6 +1148,14 @@ pub fn pop_bios_keyboard_word() -> Option<u16> {
 
 /// Emulate IN from a port using the virtual peripherals.
 pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
+    // ISA decodes only A0-A9, so I/O ports alias mod 0x400 (e.g. a
+    // gameport at 0x208 also answers 0x608). DOS-era code relies on
+    // this; the whole DOS I/O surface is <= 0x3FF. Fold the alias
+    // once here so every handler sees the canonical 10-bit address.
+    // Wide-decode I/O (PCI/PnP/ACPI/EISA) is out of scope for the
+    // VM86 guest — we model none of it — and kernel PCI uses a
+    // separate path (arch::inl/outl), not this emulator.
+    let port = port & 0x3FF;
     match port {
         // VGA Input Status 1: synthesize retrace signal tied to host wall
         // time so vsync busy-waits actually wait. Mode 13h refresh ~70 Hz
@@ -1178,13 +1186,15 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // Pass through so SeaBIOS sees real VBE state.
         0x01CE | 0x01CF | 0x01D0 => crate::arch::inb(port),
         // Gameport (joystick): we don't model a Sound Blaster or dedicated
-        // gameport card, so on the ISA bus 0x201 is unpopulated — reads of
-        // an unpopulated port return 0xFF (floating data lines, weakly
-        // pulled high by the chipset). Range 0x200-0x207 because gameport
-        // cards typically decode only the low 3 bits; same "no card on bus"
-        // behavior across the whole window. Explicit arm just to suppress
-        // the unhandled-port log during a game's joystick detection sweep.
-        0x200..=0x207 => 0xFF,
+        // gameport card, so on the ISA bus the gameport is unpopulated —
+        // reads return 0xFF (floating data lines, weakly pulled high by
+        // the chipset). Full 0x200-0x20F window: gameport cards decode
+        // loosely and the canonical port is 0x201, but games hit mirrors
+        // across the whole block (and, via 10-bit aliasing folded above,
+        // 0x6xx/0xAxx images of it — e.g. Sokoban polling 0x608-0x60B).
+        // "No card on bus" for the entire window; explicit arm just
+        // suppresses the unhandled-port log during joystick probes.
+        0x200..=0x20F => 0xFF,
         // Master PIC command (read ISR)
         0x20 => pc.vpic.isr,
         // Master PIC data (read IMR)
@@ -1220,6 +1230,8 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
 
 /// Emulate OUT to a port.
 pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
+    // ISA 10-bit I/O decode — fold the alias mod 0x400. See `emulate_inb`.
+    let port = port & 0x3FF;
     match port {
         // VGA ports — pass through to hardware, track AC flip-flop + index
         0x3C0 => {
@@ -1252,10 +1264,11 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 }
             }
         }
-        // Gameport one-shot trigger: no card on this ISA bus address (see
-        // emulate_inb above). Writes to absent devices are dropped on real
-        // hardware too — silently swallow rather than flooding the log.
-        0x200..=0x207 => {}
+        // Gameport one-shot trigger: no card on this ISA bus window (see
+        // emulate_inb above; full 0x200-0x20F to match the read side and
+        // the 10-bit alias fold). Writes to absent devices are dropped on
+        // real hardware too — silently swallow rather than flood the log.
+        0x200..=0x20F => {}
         // Master PIC data (write IMR)
         0x21 => pc.vpic.imr = val,
         // Slave PIC command / data
