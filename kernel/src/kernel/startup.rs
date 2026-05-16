@@ -1021,6 +1021,34 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
     }
 }
 
+/// Allocate `num_pages` physically contiguous, ISA-DMA-safe pages
+/// (< 16 MB, not crossing a `1 << boundary_log2` boundary). Returns the
+/// starting physical page number, or 0 on failure.
+pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
+    let r: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("eax") crate::arch::arch_call::ALLOC_PHYS_CONTIG as u32 => r,
+            in("edx") num_pages as u32,
+            in("ecx") boundary_log2,
+        );
+    }
+    r as u64
+}
+
+/// Free a contiguous run previously returned by `arch_alloc_phys_contig`.
+pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::arch_call::FREE_PHYS_CONTIG as u32,
+            in("edx") start_page as u32,
+            in("ecx") num_pages as u32,
+        );
+    }
+}
+
 /// Set a per-thread TLS GDT entry. Returns the GDT index or -1 on error.
 pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32 {
     let result: u32;

@@ -794,6 +794,14 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // preserved by the read-modify-write.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
+    // SB IRQ5 (vec 0x0D): confirm the guest's ISR is actually entered
+    // and where, so we can tell "no 0x22E ack" = ISR not run vs ISR run
+    // but doesn't ack. Unconditional (not behind DOS_TRACE).
+    if vector == 0x0D {
+        crate::dbg_println!(
+            "[SB-DMA] enter guest IRQ5 ISR -> IVT[0D]={:04X}:{:04X} on SS:SP={:04X}:{:04X}",
+            ivt_seg, ivt_off, regs.stack_seg(), regs.sp32());
+    }
     let new_flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
                   | machine::IOPL_VM86;
     regs.frame.rflags = new_flags as u64;

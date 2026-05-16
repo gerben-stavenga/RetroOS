@@ -34,7 +34,13 @@ esac
 # AdLib (YM3812 / OPL2) on ports 0x388-0x389. Override audio backend with
 # AUDIO_BACKEND=alsa|sdl|... if pulseaudio isn't available.
 AUDIO_BACKEND="${AUDIO_BACKEND:-pa}"
-AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0" -device adlib,audiodev=snd0)
+# adlib = OPL2 FM at 0x388 (music). sb16 = DSP + ISA DMA digital audio at
+# 0x220/IRQ5/DMA1/DMA16=5 — matches CONFIG.SYS BLASTER and the SbDmaState
+# defaults. The kernel virtualizes only the 8237; DSP/mixer/OPL pass
+# through to these QEMU devices.
+AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0"
+            -device adlib,audiodev=snd0
+            -device sb16,audiodev=snd0)
 
 case "$IMG" in
     image)       BAZEL_TARGET="//:image";             IMAGE_FILE="image.bin" ;;

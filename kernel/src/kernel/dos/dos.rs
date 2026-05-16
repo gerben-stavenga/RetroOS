@@ -3565,6 +3565,10 @@ fn populate_program(dos: &mut thread::DosState, env_seg: u16, psp_seg: u16,
                     parent: &ParentRef, prog_name: &[u8]) {
     fill_env(env_bytes_mut(env_seg, (ENV_PARAS as usize) * 16),
              parent.env, prog_name);
+    // Latch this program's BLASTER A/I/D/H into the SB-DMA layer so the
+    // virtual 8237 traps the right channel and the IRQ relay uses the
+    // right vector. Missing BLASTER leaves the SB16 defaults.
+    dos.pc.sb.configure_from_env(env_bytes(env_seg, (ENV_PARAS as usize) * 16));
     init_psp(psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
     dos_set_program_block_owner(dos, env_seg, psp_seg, psp_seg);
