@@ -1617,6 +1617,14 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
             if p != 0x388 && p != 0x389 {
                 crate::dbg_println!("[SB-IO] in  {:04X} -> {:02X}", p, v);
             }
+            // SB DMA-completion ack: the guest ISR reads DSP read-status
+            // (base+0x0E, 8-bit DMA) or base+0x0F (16-bit DMA) to ack the
+            // SB IRQ. The passthrough above just made QEMU-sb16 deassert
+            // its IRQ line, so now re-arm the host SB IRQ line that
+            // handle_irq deliberately left masked (deferred-ack rule).
+            if p == pc.sb.io_base + 0x0E || p == pc.sb.io_base + 0x0F {
+                crate::kernel::startup::arch_rearm_irq(pc.sb.irq);
+            }
             v
         }
         // Virtual 8237 DMA controller (generic; SB-DMA layer reads this).

@@ -1049,6 +1049,19 @@ pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
     }
 }
 
+/// Re-arm (re-unmask) an IRQ line that `handle_irq` left masked because
+/// its ack is deferred to the guest. Call once the guest's device-ack
+/// has passed through, so the next interrupt on that line can fire.
+pub fn arch_rearm_irq(line: u8) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::arch_call::REARM_IRQ as u32,
+            in("edx") line as u32,
+        );
+    }
+}
+
 /// Set a per-thread TLS GDT entry. Returns the GDT index or -1 on error.
 pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32 {
     let result: u32;

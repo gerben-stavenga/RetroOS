@@ -255,7 +255,25 @@ pub fn handle_irq(regs: &mut Regs) {
         unsafe { (*(&raw mut QUEUE)).push(e); }
     }
 
-    outb(data_port, mask);
+    // Re-unmask only lines we acked *inline* above (kbd/mouse read 0x60,
+    // timer is edge-pulsed) — their device has already deasserted, so the
+    // line won't re-fire. `Irq::Hw` lines (e.g. SB IRQ5) are level-held
+    // by the device until the *guest* ISR acks it, which happens later
+    // and asynchronously; re-unmasking here would re-fire in a tight
+    // host-side storm until then. Leave them masked; the kernel re-arms
+    // the line via `unmask_irq` once the guest's device-ack passes
+    // through (mirrors the "deassert before re-arm" rule, ack deferred).
+    let inline_acked = matches!(irq, 0 | 1 | 12);
+    if inline_acked {
+        outb(data_port, mask);
+    }
+}
+
+/// Re-arm an IRQ line previously left masked by `handle_irq` (a deferred-
+/// ack `Irq::Hw` line). Called from the kernel once the guest has acked
+/// the device so the next interrupt can be delivered.
+pub fn rearm_irq(irq: u8) {
+    unmask_irq(irq);
 }
 
 /// Get timer ticks
