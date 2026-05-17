@@ -285,6 +285,8 @@ pub(super) fn pop_save_at(ldt: &[u64], cursor: (u16, u32)) -> ModeSave {
 ///
 /// Used by: `deliver_pm_irq` (toggle/first-entry branch), `callback_entry`.
 pub(super) fn switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs) -> (u16, u32) {
+    if_record(IF_SWITCH_PM, regs, if_bit(regs), if_bit(regs),
+        dos.pc.locked_stack.other_stack);
     // Compute the rm cursor to track in `other_stack` for the duration
     // of this excursion. The cursor's role is to tell a subsequent
     // PM→RM toggle (`switch_to_rm_side` via `rm_get_stack`) where to
@@ -457,9 +459,8 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
         None => return thread::KernelAction::Done,
     };
     let client_use32 = dpmi.client_use32;
-    let handler_flags = regs.flags32() & !(1u32 << 8);
     push_iret_frame(&dos.ldt[..], regs, client_use32,
-        regs.ip32(), regs.code_seg(), handler_flags);
+        regs.ip32(), regs.code_seg(), regs.flags32());
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
     regs.clear_flag32(1 << 8);
@@ -510,6 +511,84 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
 /// Layout: (vec, target_sel, target_off, src_cs, src_ip, src_ss, src_sp).
 pub(super) static mut LAST_IRQ: (u8, u16, u32, u16, u32, u16, u32) = (0xFF, 0, 0, 0, 0, 0, 0);
 
+// ── Zero-perturbation virtual-IF trace ring ──────────────────────────────
+// One entry per PM-IRQ-chain event, written inline (pure stores, no I/O,
+// no formatting) so it doesn't change instruction timing — the Sokoban
+// stuck-IF=0 hang is a Heisenbug that print-tracing hides. Dumped only on
+// the F12 state key via `dump_if_ring()`.
+#[derive(Clone, Copy)]
+pub(super) struct IfEvt {
+    pub tag: u8,        // IF_* tag below
+    pub vm86: bool,     // true = guest in VM86 at this point
+    pub cs: u16,
+    pub ip: u32,
+    pub if_in: bool,    // virtual IF before this event
+    pub if_out: bool,   // virtual IF after this event
+    pub other: (u16, u32), // locked_stack.other_stack at this point
+}
+pub(super) const IF_SWITCH_PM: u8 = 1; // switch_to_pm_side (first/toggle entry)
+pub(super) const IF_REFLECT_RM: u8 = 2; // reflect_int_to_real_mode (clears IF)
+pub(super) const IF_RM_IRET: u8 = 3;    // rm_iret (forces IF=1)
+pub(super) const IF_XRESTORE: u8 = 4;   // cross_mode_restore (pops ModeSave)
+
+const IF_RING_LEN: usize = 128;
+pub(super) static mut IF_RING: [IfEvt; IF_RING_LEN] = [IfEvt {
+    tag: 0, vm86: false, cs: 0, ip: 0, if_in: false, if_out: false, other: (0, 0),
+}; IF_RING_LEN];
+pub(super) static mut IF_RING_POS: usize = 0;
+
+#[inline]
+pub(super) fn if_record(tag: u8, regs: &Regs, if_in: bool, if_out: bool,
+                        other: Option<(u16, u32)>) {
+    unsafe {
+        let i = IF_RING_POS % IF_RING_LEN;
+        IF_RING[i] = IfEvt {
+            tag,
+            vm86: regs.mode() == crate::UserMode::VM86,
+            cs: regs.code_seg(),
+            ip: regs.ip32(),
+            if_in,
+            if_out,
+            other: other.unwrap_or((0, 0)),
+        };
+        IF_RING_POS = IF_RING_POS.wrapping_add(1);
+    }
+}
+
+#[inline]
+fn if_bit(regs: &Regs) -> bool {
+    regs.frame.rflags & (machine::IF_FLAG as u64) != 0
+}
+
+/// Dump the IF trace ring oldest→newest (called from the F12 state dump).
+pub(super) fn dump_if_ring() {
+    let (pos, ring) = unsafe { (IF_RING_POS, IF_RING) };
+    if pos == 0 {
+        crate::dbg_println!("[IFR] (empty)");
+        return;
+    }
+    let n = pos.min(IF_RING_LEN);
+    let start = pos.saturating_sub(n);
+    crate::dbg_println!("[IFR] last {} virtual-IF chain events (oldest first):", n);
+    for k in 0..n {
+        let e = ring[(start + k) % IF_RING_LEN];
+        let name = match e.tag {
+            IF_SWITCH_PM => "SWITCH_PM ",
+            IF_REFLECT_RM => "REFLECT_RM",
+            IF_RM_IRET => "RM_IRET   ",
+            IF_XRESTORE => "XRESTORE  ",
+            _ => "????      ",
+        };
+        crate::dbg_println!(
+            "[IFR] {} {} {:04X}:{:08X} IF {}->{} other={:04X}:{:X}",
+            name,
+            if e.vm86 { "VM86" } else { "PM  " },
+            e.cs, e.ip,
+            e.if_in as u8, e.if_out as u8,
+            e.other.0, e.other.1);
+    }
+}
+
 pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
     let (sel, off) = dos.pm_vectors[vector as usize];
     unsafe {
@@ -522,9 +601,6 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     // own that contract end-to-end. Non-DPMI threads default to 16-bit
     // (the host default-stub path is 16-bit).
     let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
-
-    // Handler starts with IF=TF=0; other flag bits follow the current EFLAGS.
-    let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8) | machine::VM_FLAG);
 
     // Discriminate via (regs.mode, other_stack):
     //   (PM,   Some) → nested on pm side; plant iret-frame at
@@ -548,7 +624,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         // to whatever stack the handler is currently on (DPMI 0.9 §3.1.2
         // permits handler SS != HOST_STACK_PM*).
         push_iret_frame(&dos.ldt[..], regs, client_use32,
-            regs.ip32(), regs.code_seg(), handler_flags);
+            regs.ip32(), regs.code_seg(), regs.flags32());
     } else {
         // First-entry from client OR toggle from rm: switch_to_pm_side
         // pushes ModeSave, lands user on top of the save, captures pre-
@@ -559,7 +635,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         switch_to_pm_side(dos, regs);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
         push_iret_frame(&dos.ldt[..], regs, client_use32,
-            stub_eip, SPECIAL_STUB_SEL, handler_flags);
+            stub_eip, SPECIAL_STUB_SEL, regs.flags32());
 
         regs.ds = 0;
         regs.es = 0;
@@ -584,11 +660,14 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
 /// it directly off (regs.SS, regs.SP); save.restore then clobbers SS:SP
 /// with the pre-toggle values.
 pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let xr_if_in = if_bit(regs);
     let save = pop_save(dos, regs);
     save.restore(regs);
     // Restore the other_stack that was current at push time (None at
     // outermost-from-client entry, Some at nested entries).
     dos.pc.locked_stack.other_stack = save.other_stack();
+    if_record(IF_XRESTORE, regs, xr_if_in, if_bit(regs),
+        dos.pc.locked_stack.other_stack);
 
     let (cs, eip, ss, esp, vm) =
         (save.cs as u16, save.eip, save.ss as u16, save.esp,
@@ -798,13 +877,57 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // and where, so we can tell "no 0x22E ack" = ISR not run vs ISR run
     // but doesn't ack. Unconditional (not behind DOS_TRACE).
     if vector == 0x0D {
+        // The driver's ISR services the SB only if the software flag
+        // [cs:0x166] != 0 at IRQ time (it's armed by "start speech",
+        // consumed by the ISR). [cs:0x14C] is the completion flag the
+        // main loop waits on. Log both at every delivery so we see the
+        // in-game speech IRQ, not just the first detection probe.
+        let seg = ivt_seg as u32;
+        let armed = unsafe {
+            core::ptr::read_volatile(((seg << 4) + 0x166) as *const u8)
+        };
+        let donew = unsafe {
+            core::ptr::read_volatile(((seg << 4) + 0x14C) as *const u16)
+        };
         crate::dbg_println!(
-            "[SB-DMA] enter guest IRQ5 ISR -> IVT[0D]={:04X}:{:04X} on SS:SP={:04X}:{:04X}",
-            ivt_seg, ivt_off, regs.stack_seg(), regs.sp32());
+            "[SB-DMA] enter guest IRQ5 ISR -> IVT[0D]={:04X}:{:04X} SS:SP={:04X}:{:04X} armed[166]={:02X} done[14C]={:04X}",
+            ivt_seg, ivt_off, regs.stack_seg(), regs.sp32(), armed, donew);
+        // One-shot raw dump of the guest SB ISR + the post-speech wait
+        // loop + its flag word, so we can ndisasm exactly how the driver
+        // re-arms / signals completion (runtime CS is relocated, so
+        // static EXE-offset mapping is unreliable; dump live instead).
+        static DUMPED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            let seg = ivt_seg as u32;
+            let dump = |tag: &str, off: u32, n: u32| {
+                let base = (seg << 4) + off;
+                let mut i = 0u32;
+                while i < n {
+                    let mut line = [0u8; 16];
+                    let cnt = core::cmp::min(16, n - i);
+                    for j in 0..cnt {
+                        line[j as usize] = unsafe {
+                            core::ptr::read_volatile((base + i + j) as *const u8)
+                        };
+                    }
+                    crate::dbg_println!("[SBISR] {} {:04X}:{:04X} {:02X?}",
+                        tag, ivt_seg, off + i, &line[..cnt as usize]);
+                    i += 16;
+                }
+            };
+            dump("ISR ", ivt_off as u32, 192);
+            dump("SRC ", 0x04C0, 176);   // 0x4D8 IRQ-source-check sub
+            dump("DATA", 0x0100, 0x80);  // incl cs:0x166 SB-armed flag
+            dump("LOOP", 0x1228, 48);
+        }
     }
+    let if_was = if_bit(regs);
     let new_flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
                   | machine::IOPL_VM86;
     regs.frame.rflags = new_flags as u64;
+    if_record(IF_REFLECT_RM, regs, if_was, if_bit(regs),
+        dos.pc.locked_stack.other_stack);
 
     // Per DPMI, the host must not translate PM selectors into RM paragraphs
     // when reflecting a software interrupt. The extender/client is responsible
@@ -832,6 +955,8 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
     // is a control flag — handler-set CLD/STD must not leak into caller.
     const STATUS_MASK: u32 = 0x08D5;
+    let rm_iret_if_in = if_bit(regs);
+    let rm_iret_other = dos.pc.locked_stack.other_stack;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
     // pm_get_stack reads from other_stack here (we're in VM86 with
@@ -865,6 +990,7 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
     regs.set_ip32(ret_eip);
     regs.set_cs32(ret_cs as u32);
     regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status | machine::IF_FLAG);
+    if_record(IF_RM_IRET, regs, rm_iret_if_in, if_bit(regs), rm_iret_other);
 
     dos_trace!("[DPMI] RM_IRET_STUB -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
         ret_cs, ret_eip, regs.stack_seg(), regs.sp32());

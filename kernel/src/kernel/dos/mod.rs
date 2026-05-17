@@ -705,6 +705,11 @@ pub fn snapshot_parent_env(dos: &thread::DosState) -> alloc::vec::Vec<u8> {
 
 /// F12 / panic dump: print DPMI LDT entries and PM stack/code bytes.
 /// No-op when the thread isn't a DPMI client.
+/// Dump the zero-perturbation virtual-IF chain ring (F12 state key).
+pub fn dump_if_ring() {
+    mode_transitions::dump_if_ring();
+}
+
 pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
     if dos.dpmi.is_none() { return; }
     for (name, sel) in [

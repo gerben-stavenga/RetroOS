@@ -848,6 +848,8 @@ fn dump_virtual_hw(dos: &thread::DosState) {
     let delta = (next as i64).wrapping_sub(now as i64);
     crate::dbg_println!("[DBG] vpit ch0 en={} mode={} reload={} now={} next={} (next-now={})",
         en, mode, reload, now, next, delta);
+
+    crate::kernel::dos::dump_if_ring();
 }
 
 /// Resume user code via arch `EXECUTE` (INT 0x80) and return the next
