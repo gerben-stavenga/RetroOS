@@ -402,9 +402,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
             let v = crate::arch::inb(p);
-            if p != 0x388 && p != 0x389 {
-                crate::dbg_println!("[SB-IO] in  {:04X} -> {:02X}", p, v);
-            }
+            // [SB-IO] in trace disabled per request.
             v
         }
         // Virtual 8237 DMA controller. SB channel count register is
@@ -447,7 +445,11 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 // If keyboard IRQ (bit 1) was in service, and the virtual 8042
                 // still has data ready, IRQ1 should assert again after EOI.
                 let keyboard_in_service = pc.vpic.isr & 0x02 != 0;
+                let sb_in_service = pc.sb.irq < 8 && pc.vpic.isr & (1 << pc.sb.irq) != 0;
                 pc.vpic.eoi();
+                if sb_in_service {
+                    crate::kernel::startup::arch_rearm_irq(5);
+                }
                 // Real hardware effectively re-asserts IRQ1 if more scancodes are
                 // already visible in the controller when the handler finishes.
                 if keyboard_in_service
@@ -490,9 +492,7 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            if p != 0x388 && p != 0x389 {
-                crate::dbg_println!("[SB-IO] out {:04X} <- {:02X}", p, val);
-            }
+            // [SB-IO] out trace disabled per request.
             crate::arch::outb(p, val);
         }
         // Virtual 8237 DMA controller (generic). After capturing the
@@ -601,6 +601,11 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             }
         }
         Irq::Tick => {
+            // DIAG: while an SB block is armed, sample QEMU's i8257 ch1
+            // count every tick to see the now[COUNT] trajectory across
+            // the block (climbs to 0xFFFF => ordering; flat at base =>
+            // sb16 not driving this channel's counter).
+            // [SB-DMA] per-tick host-count sampling disabled per request.
             let due = pc.vpit.take_pending_irqs();
             for _ in 0..due {
                 pc.vpic.push(0x08);
@@ -618,36 +623,17 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             }
         }
         Irq::Hw(line) => {
-            // Real SB completion IRQ → relay to the guest vPIC at the
-            // BLASTER-declared vector (IRQ 0-7 → 0x08+line, 8-15 →
-            // 0x70+line-8). Ignore other host lines.
-            if line == pc.sb.irq {
-                // The SB channel's single-cycle transfer just completed:
-                // latch terminal count so a count-register readback
-                // returns 0xFFFF (Dune2's ISR uses this to identify the
-                // IRQ when its software arm flag isn't set).
-                pc.sb.dma.tc[pc.sb.dma8 as usize] = true;
-                pc.sb.dma.tc[pc.sb.dma16 as usize] = true;
-                let vec = if line < 8 { 0x08 + line } else { 0x70 + (line - 8) };
-                if !pc.vpic.has_pending_vec(vec) {
-                    pc.vpic.push(vec);
-                    crate::dbg_println!(
-                        "[SB-DMA] relay SB IRQ{} -> vPIC vec {:#04X} (imr={:#04X} isr={:#04X})",
-                        line, vec, pc.vpic.imr, pc.vpic.isr);
-                }
-                // Ack QEMU-sb16 ourselves (read DSP read-status: 0x22E
-                // 8-bit / 0x22F 16-bit DMA), then re-arm the host line.
-                // This is the host-side device deassert — our concern,
-                // like the host PIC EOI / 8042 read — restoring the
-                // real-hw "device-ack then re-enable" order that the
-                // 8259 in-service bit provides on metal. The guest's
-                // own later 0x22E passthrough read is then a benign
-                // redundant status read. handle_irq still masks the
-                // line on entry; we deassert+unmask here, independent
-                // of if/when the guest ISR runs.
-                crate::arch::inb(pc.sb.io_base + 0x0E);
-                crate::arch::inb(pc.sb.io_base + 0x0F);
-                crate::kernel::startup::arch_rearm_irq(pc.sb.irq);
+            if line != 5 {
+                return;
+            }
+            // Real QEMU sb16 is wired to host IRQ5. Relay it to the guest's
+            // BLASTER-declared IRQ line, but leave the host IRQ masked until
+            // the guest completes the virtual interrupt with a PIC EOI.
+            let line = pc.sb.irq;
+            let vec = if line < 8 { 0x08 + line } else { 0x70 + (line - 8) };
+            if !pc.vpic.has_pending_vec(vec) {
+                pc.vpic.push(vec);
+                // [SB-DMA] relay log + diag host-count sampling disabled per request.
             }
         }
     }
@@ -676,11 +662,7 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
             return None;
         }
     }
-    if vec == 0x0D {
-        crate::dbg_println!(
-            "[SB-DMA] deliver SB vec0D to guest ISR (imr={:#04X} isr={:#04X})",
-            pc.vpic.imr, pc.vpic.isr);
-    }
+    // [SB-DMA] deliver-vec0D trace disabled per request.
     let irq_num = vec.wrapping_sub(8);
     if irq_num < 8 {
         pc.vpic.isr |= 1 << irq_num;

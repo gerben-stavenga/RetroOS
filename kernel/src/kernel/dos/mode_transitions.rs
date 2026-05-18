@@ -562,6 +562,10 @@ fn if_bit(regs: &Regs) -> bool {
 
 /// Dump the IF trace ring oldest→newest (called from the F12 state dump).
 pub(super) fn dump_if_ring() {
+    // IF trace-ring output disabled (commented out per request). The
+    // zero-perturbation ring (`if_record`) still records inline; only the
+    // dump output is off so the IF masked→unmasked logging stays silent.
+    /*
     let (pos, ring) = unsafe { (IF_RING_POS, IF_RING) };
     if pos == 0 {
         crate::dbg_println!("[IFR] (empty)");
@@ -587,6 +591,7 @@ pub(super) fn dump_if_ring() {
             e.if_in as u8, e.if_out as u8,
             e.other.0, e.other.1);
     }
+    */
 }
 
 pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) {
@@ -873,10 +878,9 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // preserved by the read-modify-write.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    // SB IRQ5 (vec 0x0D): confirm the guest's ISR is actually entered
-    // and where, so we can tell "no 0x22E ack" = ISR not run vs ISR run
-    // but doesn't ack. Unconditional (not behind DOS_TRACE).
-    if vector == 0x0D {
+    // SB IRQ5 (vec 0x0D) ISR-entry log + [SBISR] one-shot raw dump
+    // diagnostics disabled (commented out per request).
+    /* if vector == 0x0D {
         // The driver's ISR services the SB only if the software flag
         // [cs:0x166] != 0 at IRQ time (it's armed by "start speech",
         // consumed by the ISR). [cs:0x14C] is the completion flag the
@@ -921,7 +925,7 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
             dump("DATA", 0x0100, 0x80);  // incl cs:0x166 SB-armed flag
             dump("LOOP", 0x1228, 48);
         }
-    }
+    } */
     let if_was = if_bit(regs);
     let new_flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
                   | machine::IOPL_VM86;

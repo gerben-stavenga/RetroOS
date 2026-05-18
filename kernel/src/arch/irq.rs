@@ -32,8 +32,8 @@ pub enum Irq {
     /// position and clamping to a screen range.
     Mouse { dx: i16, dy: i16, buttons: u8 },
     /// Any other unmasked hardware IRQ line, forwarded raw. Arch stays
-    /// policy-free — the kernel decides if it's the Sound Blaster line
-    /// (per the running thread's BLASTER) and relays it to the vPIC.
+    /// policy-free — the kernel decides if it's a device it owns and when
+    /// the line can be rearmed after the guest-visible device ack.
     Hw(u8),
 }
 
@@ -235,7 +235,9 @@ pub fn handle_irq(regs: &mut Regs) {
     outb(data_port, mask | irq_bit);
     outb(pic_port, EOI);
 
-    // Read hardware data and push typed event
+    // Read hardware data and push typed event. Device-specific IRQs that are
+    // not acknowledged here remain masked until the guest-visible device ack
+    // path re-arms the line.
     let event = match irq {
         0 => {
             unsafe {
@@ -255,14 +257,9 @@ pub fn handle_irq(regs: &mut Regs) {
         unsafe { (*(&raw mut QUEUE)).push(e); }
     }
 
-    // Re-unmask only lines we acked *inline* above (kbd/mouse read 0x60,
-    // timer is edge-pulsed) — their device has already deasserted, so the
-    // line won't re-fire. `Irq::Hw` lines (e.g. SB IRQ5) are level-held
-    // by the device until the *guest* ISR acks it, which happens later
-    // and asynchronously; re-unmasking here would re-fire in a tight
-    // host-side storm until then. Leave them masked; the kernel re-arms
-    // the line via `unmask_irq` once the guest's device-ack passes
-    // through (mirrors the "deassert before re-arm" rule, ack deferred).
+    // Re-unmask only lines whose device was acked inline above. Generic
+    // `Hw` lines are still asserted by their device, so leaving them masked
+    // prevents a host-side storm until the guest-visible ack path re-arms.
     let inline_acked = matches!(irq, 0 | 1 | 12);
     if inline_acked {
         outb(data_port, mask);

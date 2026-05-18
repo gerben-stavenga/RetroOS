@@ -326,6 +326,9 @@ fn advance_ip(regs: &mut Regs, cs_32: bool, n: u32) {
 /// guest sequence (e.g. Hexen's `pushf; cli; …; popf`). One line per
 /// restore — rare (once per bracket), so it won't flood.
 fn log_if_restore(tag: &str, regs: &Regs, cs_base: u32, instr_ip: u32) {
+    // [IFLOG] IF 0->1 restore logging disabled (commented out per request).
+    let _ = (tag, regs, cs_base, instr_ip);
+    /*
     // VM86 POPF/IRET always #GP at IOPL=1 and trap through here
     // correctly — logging them just floods (DN does it constantly).
     // Only PM is interesting: that's the path that was broken and
@@ -351,6 +354,7 @@ fn log_if_restore(tag: &str, regs: &Regs, cs_base: u32, instr_ip: u32) {
         tag, regs.code_seg(), instr_ip, lin, mode,
         regs.stack_seg(), regs.sp32(), win,
     );
+    */
 }
 
 // =============================================================================

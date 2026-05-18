@@ -22,8 +22,8 @@
 #define SB_WSTAT  (SB_BASE + 0xC)
 #define SB_RSTAT  (SB_BASE + 0xE)
 
-#define SB_IRQ    5
-#define SB_VEC    0x0D
+#define SB_IRQ    7
+#define SB_VEC    0x0F
 #define PIC_CMD   0x20
 #define PIC_MASK  0x21
 
@@ -42,6 +42,9 @@ static void interrupt (*old_vec)(void);
 static volatile unsigned cur_seg = 0;
 static volatile unsigned irqs    = 0;
 static volatile int      done    = 0;
+/* 8237 ch1 current count, sampled at ISR entry exactly the way Dune2's
+ * speech ISR does to identify its completion IRQ (expects 0xFFFF). */
+static volatile unsigned isr_count = 0;
 
 /* ---- continuous music stream (independent of DMA chunking) -------- */
 
@@ -95,6 +98,15 @@ static void fill(unsigned base, unsigned n)
 
 static void interrupt sb_isr(void)
 {
+    unsigned lo, hi;
+    /* Dune2's speech ISR identifies its IRQ by reading the 8237 ch1
+     * current count and testing == 0xFFFF (terminal count). Sample it
+     * here, at IRQ entry, the exact same way, BEFORE acking. */
+    outportb(0x0C, 0x00);                    /* clear ch0-3 flip-flop */
+    lo = inportb(0x03);
+    hi = inportb(0x03);
+    isr_count = (hi << 8) | lo;
+
     inportb(SB_RSTAT);                       /* ack SB 8-bit DMA IRQ */
     if (mode == M_AUTO) {
         fill(cur_seg * SEGSZ, SEGSZ);        /* refill consumed segment */
@@ -202,6 +214,8 @@ int main(int argc, char *argv[])
             blocks++;
             printf("sbtest: block %u armed, waiting SB IRQ...\n", blocks);
             while (!done) ;                  /* SB IRQ (sbsing-proven OK) */
+            printf("sbtest: block %u IRQ; 8237 count at ISR = %04X "
+                   "(Dune2 expects FFFF)\n", blocks, isr_count);
 
             if (mode == M_CLI) {
                 /* Dune2 post-speech shape: cli to read the BIOS tick

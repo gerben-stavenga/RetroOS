@@ -16,16 +16,35 @@ use super::*;
 // registers live in the 0x80-0x8F block. Address/count are 16-bit,
 // loaded low-then-high through a per-controller byte-pointer flip-flop.
 
-/// One DMA channel's programmed state (what we need to locate and size
-/// the transfer in Slice 3): `addr`/`count` are in bytes for 8-bit
-/// channels, in *words* for 16-bit channels (8237 quirk).
+/// A channel's captured guest programming (what we need to locate and
+/// size the transfer): `addr`/`count` are in bytes for 8-bit channels,
+/// in *words* for 16-bit channels (8237 quirk).
+#[derive(Clone, Copy, Default)]
+pub struct DmaProg {
+    pub addr: u16,  // base address register (offset within its page)
+    pub count: u16, // base count register (transfer length − 1)
+    pub page: u8,   // page register (high address bits)
+    pub mode: u8,   // mode register byte (transfer type, auto-init…)
+}
+
+/// One DMA channel. `prog` is **always present** — it mirrors the
+/// 8237's base address/count/page/mode registers, which physically
+/// persist across re-arms (single-cycle drivers rewrite only addr+count
+/// each block, reusing mode/page). Two orthogonal control bits sit
+/// beside it, exactly as on the real chip — neither discriminates
+/// `prog`'s validity, both just gate behaviour, so every combination is
+/// physically meaningful (no illegal states):
+///  - `masked` — channel masked (DRQ ignored); starts masked.
+///  - `armed`  — the current programming has been handed to the real
+///    QEMU-8257, which is then authoritative for *current-count* reads
+///    (live decrement, natural 0xFFFF at terminal). A fresh count
+///    (re)write clears it; `maybe_remap` sets it. `prog` is untouched
+///    by either, so a partial re-arm keeps the prior mode/page.
 #[derive(Clone, Copy, Default)]
 pub struct DmaChannel {
-    pub addr: u16,    // base address register (offset within its page)
-    pub count: u16,   // base count register (transfer length − 1)
-    pub page: u8,     // page register (high address bits)
-    pub mode: u8,     // mode register byte (transfer type, auto-init…)
-    pub masked: bool, // channel masked (DRQ ignored) — starts masked
+    pub prog: DmaProg,
+    pub masked: bool,
+    pub armed: bool,
 }
 
 /// Generic virtual 8237 pair. Indexed by absolute channel 0..7.
@@ -41,12 +60,10 @@ pub struct Dma8237 {
     /// writes it once. The SB-DMA layer reprograms the real 8237 when
     /// this changes, independent of mask/unmask.
     pub count_gen: [u32; 8],
-    /// Per-channel terminal-count latch. A real 8237 underflows its
-    /// current-count to 0xFFFF when a transfer completes; drivers read
-    /// the count register back to detect completion / identify a shared
-    /// IRQ (Dune2's SB ISR does exactly this). Set when the channel's
-    /// completion IRQ is relayed, cleared on the next count (re)write.
-    pub tc: [bool; 8],
+    /// Transient holder for the real QEMU-8257 16-bit current-count,
+    /// snapshotted at the guest's low-byte read so the lo/hi pair is
+    /// consistent. Not part of the programming shadow.
+    read_latch: u16,
 }
 
 /// Standard PC/AT page-register port → absolute channel. 0x8F is the
@@ -58,10 +75,10 @@ const DMA_PAGE_PORT: [(u16, usize); 7] = [
 
 impl Dma8237 {
     pub fn new() -> Self {
-        // Channels power up masked until the guest clears the mask.
-        let mut ch = [DmaChannel::default(); 8];
-        for c in &mut ch { c.masked = true; }
-        Self { ch, ff_lo: false, ff_hi: false, count_gen: [0; 8], tc: [false; 8] }
+        // Channels power up masked & un-armed, registers zeroed (count
+        // 0 ⇒ `maybe_remap` won't act) until the guest programs them.
+        let ch = [DmaChannel { prog: DmaProg::default(), masked: true, armed: false }; 8];
+        Self { ch, ff_lo: false, ff_hi: false, count_gen: [0; 8], read_latch: 0 }
     }
 
     /// True if `port` (already 10-bit-folded) belongs to the 8237.
@@ -77,7 +94,7 @@ impl Dma8237 {
     pub fn io_write(&mut self, port: u16, val: u8) {
         // Page registers.
         if let Some(&(_, chan)) = DMA_PAGE_PORT.iter().find(|&&(p, _)| p == port) {
-            self.ch[chan].page = val;
+            self.ch[chan].prog.page = val;
             return;
         }
         let hi = port >= 0xC0;
@@ -91,24 +108,25 @@ impl Dma8237 {
                 let ff = self.ff(hi);
                 let flip = *ff;
                 *ff = !*ff;
-                let r = if is_count { &mut self.ch[chan].count }
-                        else { &mut self.ch[chan].addr };
+                let p = &mut self.ch[chan].prog;
+                let r = if is_count { &mut p.count } else { &mut p.addr };
                 if !flip { *r = (*r & 0xFF00) | val as u16; }
                 else     { *r = (*r & 0x00FF) | ((val as u16) << 8); }
-                // High byte of a count write completes the 16-bit count:
-                // that's the (re)arm signal for this channel.
                 if is_count {
-                    // (Re)writing the count re-arms the channel: the
-                    // transfer is no longer complete, drop terminal count.
-                    self.tc[chan] = false;
+                    // (Re)writing the count un-arms: count reads return
+                    // the freshly-programmed base until `maybe_remap`
+                    // re-arms onto the real chip. addr/page/mode persist.
+                    self.ch[chan].armed = false;
                     if flip {
+                        // High byte completes the 16-bit count: the
+                        // (re)arm signal the SB-DMA layer keys off.
                         self.count_gen[chan] = self.count_gen[chan].wrapping_add(1);
                     }
                 }
             }
             0x0B => { // mode: bits0-1 = channel
                 let chan = chan_base + (val & 0x03) as usize;
-                self.ch[chan].mode = val;
+                self.ch[chan].prog.mode = val;
             }
             0x0A => { // single mask: bits0-1 channel, bit2 = mask/unmask
                 let chan = chan_base + (val & 0x03) as usize;
@@ -130,7 +148,7 @@ impl Dma8237 {
     pub fn io_read(&mut self, port: u16) -> u8 {
         // Page registers read back the latched value.
         if let Some(&(_, chan)) = DMA_PAGE_PORT.iter().find(|&&(p, _)| p == port) {
-            return self.ch[chan].page;
+            return self.ch[chan].prog.page;
         }
         let hi = port >= 0xC0;
         let reg = if hi { ((port - 0xC0) >> 1) as u16 } else { port };
@@ -139,12 +157,11 @@ impl Dma8237 {
             0x00..=0x07 => {
                 let chan = chan_base + (reg >> 1) as usize;
                 let is_count = reg & 1 == 1;
-                // A completed transfer reads back terminal count (0xFFFF):
-                // real 8237 underflows current-count past 0. Drivers
-                // (Dune2's SB ISR) poll this to detect completion.
-                let v = if is_count {
-                    if self.tc[chan] { 0xFFFF } else { self.ch[chan].count }
-                } else { self.ch[chan].addr };
+                // Captured guest programming (base registers). The armed
+                // SB channel never reaches here for count — `dma_read`
+                // intercepts and serves the live real QEMU-8257 instead.
+                let p = self.ch[chan].prog;
+                let v = if is_count { p.count } else { p.addr };
                 let ff = self.ff(hi);
                 let byte = if !*ff { v as u8 } else { (v >> 8) as u8 };
                 *ff = !*ff;
@@ -187,15 +204,48 @@ pub struct SbDmaState {
 }
 
 impl SbDmaState {
-    /// Defaults match a stock SB16/AWE64: A220 I5 D1 H5.
+    /// Defaults: A220 I7 D1 H5 (guest sees SB IRQ 7; the host chip stays
+    /// on its real line and the IRQ relay maps host→guest, so the two are
+    /// intentionally decoupled). Overridden by the guest's `BLASTER=` env.
     pub fn new() -> Self {
         Self {
-            io_base: 0x220, irq: 5, dma8: 1, dma16: 5,
+            io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
             dma: Dma8237::new(),
             remap_start_page: 0, remap_pages: 0,
             last_gpa: 0, last_len: 0, last_gen: [0; 8],
         }
+    }
+
+    /// DIAG: QEMU i8257 current count for the SB 8-bit host channel,
+    /// sampled at IRQ-relay time — the moment the guest ISR is about to
+    /// read it expecting terminal `0xFFFF`.
+    pub fn diag_host_count8(&self) -> u16 {
+        real_8237_count(self.host_dma8)
+    }
+
+    /// DIAG: is virtual channel `ch` currently armed (handed to the real
+    /// chip and not yet completed/reprogrammed from our side)?
+    pub fn dma_ch_armed(&self, ch: usize) -> bool {
+        ch < 8 && self.dma.ch[ch].armed
+    }
+
+    /// Release the contiguous ISA-DMA pool binding this thread holds, if
+    /// any. The pool is a single global slot ("foreground thread owns
+    /// the card"); a thread that armed SB DMA and then exits or `exec`s
+    /// must hand it back, or every later program's `maybe_remap` fails
+    /// with "no contiguous DMA region". Idempotent. Also resets the
+    /// per-channel re-arm cursor so a reused `SbDmaState` can't dangle.
+    pub fn release_dma_pool(&mut self) {
+        if self.remap_pages != 0 {
+            crate::kernel::startup::arch_free_phys_contig(
+                self.remap_start_page, self.remap_pages);
+            self.remap_start_page = 0;
+            self.remap_pages = 0;
+        }
+        self.last_gpa = 0;
+        self.last_len = 0;
+        self.last_gen = [0; 8];
     }
 
     /// SB ports that pass straight through to the real card (QEMU
@@ -205,13 +255,19 @@ impl SbDmaState {
         (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388 | 0x389)
     }
 
-    /// DMA-port read. For the SB channel's count register we serve the
-    /// **real** QEMU 8237's live current-count (it's the actual transfer
-    /// QEMU-sb16 is pacing) — ground truth for both completion *and*
-    /// progress (Dune2 syncs the next speech segment + intro animation
-    /// to it). The flip-flop low/high split stays in `Dma8237::io_read`,
-    /// so snapshot the real 16-bit value only at the start of a fresh
-    /// read (flip-flop low) to avoid a torn lo/hi pair.
+    /// DMA-port read. Two distinct sources of truth, never conflated:
+    ///
+    ///  - **armed SB channel, count register** → the *real* QEMU-8257's
+    ///    live current-count (it's the actual transfer QEMU-sb16 paces):
+    ///    decrements during playback, underflows to 0xFFFF at terminal
+    ///    count — exactly real-hw semantics Dune2's `0x4D8` ISR expects.
+    ///    Served here directly (own flip-flop split, latched at the
+    ///    low-byte read so the lo/hi pair is consistent); the shadow
+    ///    `ch[].count` is left untouched so `maybe_remap`'s programming
+    ///    snapshot stays intact.
+    ///  - **everything else** (not-yet-armed = programming snapshot,
+    ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
+    ///    the captured guest programming.
     pub fn dma_read(&mut self, port: u16) -> u8 {
         let (is_cnt, chan, hi_ctrl) = if port <= 0x0F {
             (port & 1 == 1, (port >> 1) as usize, false)
@@ -220,15 +276,24 @@ impl SbDmaState {
             (r & 1 == 1, 4 + (r >> 1) as usize, true)
         } else { (false, 0, false) };
 
-        if is_cnt && !self.dma.tc[chan] {
-            let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
-                       else if chan == self.dma16 as usize { Some(self.host_dma16) }
-                       else { None };
-            // Only refresh at the low-byte phase (flip-flop == false),
-            // so the guest's lo+hi reads come from one consistent snap.
-            let ff_low = !if hi_ctrl { self.dma.ff_hi } else { self.dma.ff_lo };
-            if let (Some(h), true) = (host, ff_low) {
-                self.dma.ch[chan].count = real_8237_count(h);
+        let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
+                   else if chan == self.dma16 as usize { Some(self.host_dma16) }
+                   else { None };
+        if is_cnt && self.dma.ch[chan].armed {
+            if let Some(h) = host {
+                // Real QEMU-8257 current-count, lo/hi via the controller
+                // byte-pointer flip-flop. Snapshot the full u16 at the
+                // low-byte read; the hi byte comes from the same snap.
+                let ff = if hi_ctrl { &mut self.dma.ff_hi }
+                         else { &mut self.dma.ff_lo };
+                let low = !*ff;
+                *ff = !*ff;
+                if low {
+                    self.dma.read_latch = real_8237_count(h);
+                    // [SB-DMA] guest count-read trace disabled per request.
+                }
+                let v = self.dma.read_latch;
+                return if low { v as u8 } else { (v >> 8) as u8 };
             }
         }
         self.dma.io_read(port)
@@ -243,9 +308,12 @@ impl SbDmaState {
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
         let c8 = self.dma8 as usize;
         let c16 = self.dma16 as usize;
-        let armed8 = c8 < 4 && !self.dma.ch[c8].masked && self.dma.ch[c8].count != 0;
-        let armed16 = (5..8).contains(&c16)
-            && !self.dma.ch[c16].masked && self.dma.ch[c16].count != 0;
+        let armed8 = c8 < 4 && !self.dma.ch[c8].masked
+            && self.dma.ch[c8].prog.count != 0;
+        let armed16 = (5..8).contains(&c16) && !self.dma.ch[c16].masked
+            && self.dma.ch[c16].prog.count != 0;
+
+        // [SB-DMA] per-gate-evaluation trace disabled per request.
 
         let (chan, is16, host_chan) = if armed16 {
                 (c16, true, self.host_dma16 as usize)
@@ -265,13 +333,14 @@ impl SbDmaState {
         if self.last_gen[chan] == cur_gen { return; }
         self.last_gen[chan] = cur_gen;
 
-        let ch = self.dma.ch[chan];
+        // The captured base programming — what we hand to the real chip.
+        let p = self.dma.ch[chan].prog;
         let (gpa, len, blog2) = if is16 {
-            (((ch.page as u32) << 16) | ((ch.addr as u32) << 1),
-             ((ch.count as u32) + 1) * 2, 17u32)
+            (((p.page as u32) << 16) | ((p.addr as u32) << 1),
+             ((p.count as u32) + 1) * 2, 17u32)
         } else {
-            (((ch.page as u32) << 16) | ch.addr as u32,
-             (ch.count as u32) + 1, 16u32)
+            (((p.page as u32) << 16) | p.addr as u32,
+             (p.count as u32) + 1, 16u32)
         };
 
         // SB DMA-channel probe: the driver arms several tiny (≤ a few
@@ -289,12 +358,10 @@ impl SbDmaState {
             let scratch = crate::kernel::startup::arch_alloc_phys_contig(1, blog2);
             if scratch != 0 {
                 program_real_8237(host_chan as u8, (scratch as u32) * 0x1000,
-                                   len, ch.mode, is16);
+                                   len, p.mode, is16);
                 crate::kernel::startup::arch_free_phys_contig(scratch, 1);
             }
-            crate::dbg_println!(
-                "[SB-DMA] DMA probe gpa={:#X} len={:#X} -> scratch (no remap)",
-                gpa, len);
+            // [SB-DMA] DMA-probe trace disabled per request.
             return;
         }
 
@@ -316,8 +383,7 @@ impl SbDmaState {
             let contig =
                 crate::kernel::startup::arch_alloc_phys_contig(num_pages, blog2);
             if contig == 0 {
-                crate::dbg_println!(
-                    "[SB-DMA] no contiguous DMA region for {} pages", num_pages);
+                // [SB-DMA] "no contiguous DMA region" trace disabled per request.
                 self.last_gen[chan] = cur_gen.wrapping_sub(1); // retry next arm
                 return;
             }
@@ -348,19 +414,12 @@ impl SbDmaState {
         // cycle drivers re-arm per block, so the real controller must be
         // re-pointed each time even though the binding is unchanged.
         let phys = (self.remap_start_page as u32) * 0x1000 + page_off as u32;
-        program_real_8237(host_chan as u8, phys, len, ch.mode, is16);
-        // Diagnostic: Dune2's driver arms [cs:0x166] (cs=0x45EC for this
-        // build) before a speech IRQ; its ISR services only if it's set.
-        // Sample it at DMA-arm to bracket vs. its value at IRQ time.
-        let armed = unsafe {
-            core::ptr::read_volatile(((0x45ECu32 << 4) + 0x166) as *const u8)
-        };
-        let donew = unsafe {
-            core::ptr::read_volatile(((0x45ECu32 << 4) + 0x14C) as *const u16)
-        };
-        crate::dbg_println!(
-            "[SB-DMA] vch{} -> hch{} gpa={:#07X} len={:#X} -> phys={:#X} ({} pg, mode={:#04X}) armed[166]={:02X} done[14C]={:04X}",
-            chan, host_chan, gpa, len, phys, self.remap_pages, ch.mode, armed, donew);
+        program_real_8237(host_chan as u8, phys, len, p.mode, is16);
+        // Armed: the real QEMU-8257 is now authoritative for this
+        // channel's current-count reads (live decrement + terminal
+        // 0xFFFF). `prog` (base regs) persists for partial re-arms.
+        self.dma.ch[chan].armed = true;
+        // [SB-DMA] vch→hch arm trace + [cs:0x166]/[0x14C] sampling disabled per request.
     }
 
     /// Apply this thread's `BLASTER=Axxx Iy Dz Hw …` env string. Unknown
@@ -425,6 +484,12 @@ fn real_8237_count(host: u8) -> u16 {
 /// mode, addr lo/hi, page, count lo/hi, unmask.
 fn program_real_8237(chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
     use crate::arch::outb;
+    // DIAG: snapshot QEMU's i8257 current count for this channel *before*
+    // we overwrite it. Writing the count reloads now[COUNT]=0, so this
+    // tells us whether a completed transfer (count ~0xFFFF) is being
+    // clobbered back to base by a (re)arm that happened before the guest
+    // read it to validate completion.
+    // [SB-DMA] program_real_8237 entry trace + pre-count sampling disabled per request.
     // Standard PC/AT page-register ports indexed by absolute channel.
     const PAGE: [u8; 8] = [0x87, 0x83, 0x81, 0x82, 0x8F, 0x8B, 0x89, 0x8A];
     if is16 {
