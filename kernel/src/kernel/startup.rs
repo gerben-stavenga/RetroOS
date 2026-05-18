@@ -848,6 +848,8 @@ fn dump_virtual_hw(dos: &thread::DosState) {
     let delta = (next as i64).wrapping_sub(now as i64);
     crate::dbg_println!("[DBG] vpit ch0 en={} mode={} reload={} now={} next={} (next-now={})",
         en, mode, reload, now, next, delta);
+
+    crate::kernel::dos::dump_if_ring();
 }
 
 /// Resume user code via arch `EXECUTE` (INT 0x80) and return the next
@@ -1017,6 +1019,47 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
             in("ecx") num_pages as u32,
             in("ebx") ppage_start as u32,
             in("edi") flags as u32,
+        );
+    }
+}
+
+/// Allocate `num_pages` physically contiguous, ISA-DMA-safe pages
+/// (< 16 MB, not crossing a `1 << boundary_log2` boundary). Returns the
+/// starting physical page number, or 0 on failure.
+pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
+    let r: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("eax") crate::arch::arch_call::ALLOC_PHYS_CONTIG as u32 => r,
+            in("edx") num_pages as u32,
+            in("ecx") boundary_log2,
+        );
+    }
+    r as u64
+}
+
+/// Free a contiguous run previously returned by `arch_alloc_phys_contig`.
+pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::arch_call::FREE_PHYS_CONTIG as u32,
+            in("edx") start_page as u32,
+            in("ecx") num_pages as u32,
+        );
+    }
+}
+
+/// Re-arm (re-unmask) an IRQ line that `handle_irq` left masked because
+/// its ack is deferred to the guest. Call once the guest's device-ack
+/// has passed through, so the next interrupt on that line can fire.
+pub fn arch_rearm_irq(line: u8) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::arch_call::REARM_IRQ as u32,
+            in("edx") line as u32,
         );
     }
 }

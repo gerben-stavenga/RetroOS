@@ -93,6 +93,9 @@ pub mod arch_call {
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
     pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=count, EDX/ECX=watched linear addrs
+    pub const ALLOC_PHYS_CONTIG: u64 = 0x11A; // EDX=num_pages, ECX=boundary_log2 -> EAX=start_page (0=fail)
+    pub const FREE_PHYS_CONTIG: u64 = 0x11B;  // EDX=start_page, ECX=num_pages
+    pub const REARM_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -233,6 +236,16 @@ fn arch_dispatch(regs: &mut Regs) {
             for i in 0..num_pages {
                 paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64, flags);
             }
+        }
+        arch_call::ALLOC_PHYS_CONTIG => {
+            regs.rax = crate::arch::phys_mm::alloc_phys_contig(
+                regs.rdx as usize, regs.rcx as u32).unwrap_or(0);
+        }
+        arch_call::FREE_PHYS_CONTIG => {
+            crate::arch::phys_mm::free_phys_contig(regs.rdx as u64, regs.rcx as usize);
+        }
+        arch_call::REARM_IRQ => {
+            crate::arch::irq::rearm_irq(regs.rdx as u8);
         }
         arch_call::SET_TLS_ENTRY => {
             let index = regs.rdx as i32;

@@ -73,8 +73,36 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
 
         // Start searching after kernel
         NEXT_FREE = kernel_high as usize;
+
+        // Reserve a low-memory ISA-DMA pool. ISA DMA needs a physically
+        // contiguous, < 16 MB, boundary-non-crossing buffer; the general
+        // allocator walks upward and fragments the whole < 16 MB region
+        // before a game ever plays sound. Carve a fixed 64 KB-aligned,
+        // 64 KB pool now and mark it RESERVED so `alloc_phys_page` skips
+        // it. 64 KB-aligned + ≤ 64 KB ⇒ no 8-bit (64 KB) or 16-bit
+        // (128 KB) DMA-boundary crossing by construction. One SB DMA
+        // buffer is live at a time (foreground thread owns the card).
+        let mut p = 256usize;
+        while p + DMA_POOL_PAGES <= DMA_MAX_PAGE.min(MAX_PAGES) {
+            if p % DMA_POOL_PAGES != 0 { p += 1; continue; } // 64 KB align
+            if (p..p + DMA_POOL_PAGES).all(|i| PAGE_REFS[i] == 0) {
+                for i in p..p + DMA_POOL_PAGES { PAGE_REFS[i] = RESERVED; }
+                DMA_POOL_START = p;
+                break;
+            }
+            p += DMA_POOL_PAGES;
+        }
     }
 }
+
+/// Largest physical page usable for ISA DMA (addresses are 24-bit, < 16 MB).
+const DMA_MAX_PAGE: usize = 0x100_0000 / PAGE_SIZE;
+/// Reserved ISA-DMA pool size: 64 KB = 16 pages, 64 KB-aligned.
+const DMA_POOL_PAGES: usize = 0x1_0000 / PAGE_SIZE;
+/// First page of the reserved DMA pool (0 = not reserved / unavailable).
+static mut DMA_POOL_START: usize = 0;
+/// True while the pool is handed out (single live SB DMA buffer).
+static mut DMA_POOL_BUSY: bool = false;
 
 /// Mark a range of pages as reserved
 #[allow(dead_code)]
@@ -180,6 +208,35 @@ pub fn is_shared(page: u64) -> bool {
     unsafe {
         let count = PAGE_REFS[page as usize];
         count > 1 && count != RESERVED
+    }
+}
+
+/// Hand out the reserved ISA-DMA pool for a buffer of `num_pages`
+/// (≤ `DMA_POOL_PAGES`). Returns the pool's start page, or None if the
+/// pool is unavailable, busy, or the buffer is too large. `boundary_log2`
+/// is satisfied by construction: the pool is 64 KB-aligned and ≤ 64 KB,
+/// so no 8-bit (64 KB) or 16-bit (128 KB) boundary is ever crossed.
+///
+/// Release with `free_phys_contig`. Pages are NOT zeroed — the DMA-remap
+/// path copies the guest buffer in.
+pub fn alloc_phys_contig(num_pages: usize, _boundary_log2: u32) -> Option<u64> {
+    unsafe {
+        if DMA_POOL_START == 0 || DMA_POOL_BUSY
+            || num_pages == 0 || num_pages > DMA_POOL_PAGES {
+            return None;
+        }
+        DMA_POOL_BUSY = true;
+        Some(DMA_POOL_START as u64)
+    }
+}
+
+/// Release the DMA pool (back to available, not to the general allocator —
+/// the pool pages stay RESERVED for the next SB buffer).
+pub fn free_phys_contig(start_page: u64, _num_pages: usize) {
+    unsafe {
+        if start_page as usize == DMA_POOL_START {
+            DMA_POOL_BUSY = false;
+        }
     }
 }
 

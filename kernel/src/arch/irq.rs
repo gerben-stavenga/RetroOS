@@ -31,6 +31,10 @@ pub enum Irq {
     /// bit 1 right, bit 2 middle. Consumer is responsible for accumulating
     /// position and clamping to a screen range.
     Mouse { dx: i16, dy: i16, buttons: u8 },
+    /// Any other unmasked hardware IRQ line, forwarded raw. Arch stays
+    /// policy-free — the kernel decides if it's a device it owns and when
+    /// the line can be rearmed after the guest-visible device ack.
+    Hw(u8),
 }
 
 impl Irq {
@@ -40,6 +44,7 @@ impl Irq {
             Irq::Tick => 0,
             Irq::Key(_) => 1,
             Irq::Mouse { .. } => 12,
+            Irq::Hw(n) => *n,
         }
     }
 }
@@ -193,6 +198,12 @@ fn init_mouse() {
     let _ack = inb(0x60); // 0xFA expected; not actionable
 
     unmask_irq(12);
+
+    // Standard ISA Sound Blaster IRQ lines (5 and 7). Harmless to unmask
+    // with nothing driving them; lets QEMU `sb16`'s completion IRQ reach
+    // handle_irq so the kernel can relay it to the guest vPIC.
+    unmask_irq(5);
+    unmask_irq(7);
 }
 
 // ============================================================================
@@ -224,7 +235,9 @@ pub fn handle_irq(regs: &mut Regs) {
     outb(data_port, mask | irq_bit);
     outb(pic_port, EOI);
 
-    // Read hardware data and push typed event
+    // Read hardware data and push typed event. Device-specific IRQs that are
+    // not acknowledged here remain masked until the guest-visible device ack
+    // path re-arms the line.
     let event = match irq {
         0 => {
             unsafe {
@@ -237,14 +250,27 @@ pub fn handle_irq(regs: &mut Regs) {
         }
         1 => Some(Irq::Key(inb(0x60))),
         12 => mouse_packet_byte(inb(0x60)),
-        _ => None,
+        _ => Some(Irq::Hw(irq)),
     };
 
     if let Some(e) = event {
         unsafe { (*(&raw mut QUEUE)).push(e); }
     }
 
-    outb(data_port, mask);
+    // Re-unmask only lines whose device was acked inline above. Generic
+    // `Hw` lines are still asserted by their device, so leaving them masked
+    // prevents a host-side storm until the guest-visible ack path re-arms.
+    let inline_acked = matches!(irq, 0 | 1 | 12);
+    if inline_acked {
+        outb(data_port, mask);
+    }
+}
+
+/// Re-arm an IRQ line previously left masked by `handle_irq` (a deferred-
+/// ack `Irq::Hw` line). Called from the kernel once the guest has acked
+/// the device so the next interrupt can be delivered.
+pub fn rearm_irq(irq: u8) {
+    unmask_irq(irq);
 }
 
 /// Get timer ticks

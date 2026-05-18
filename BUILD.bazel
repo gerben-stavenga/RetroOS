@@ -92,6 +92,11 @@ _EXTRA_FILES = {
     "//apps/tests/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
     "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
+    # SB DMA test (compile in-OS via SBTEST.BAT). One binary, mode by
+    # arg: SBTEST [auto|sing|cli] -- auto-init / single-cycle / single
+    # + Dune2-style CLI tick-wait (virtual-IF freeze repro).
+    "apps/sbtest/sbtest.c":                 "TESTS/SBTEST.C",
+    "apps/sbtest/SBTEST.BAT":               "SBTEST.BAT",
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).
     # Standalone-shell mode dispatches applets via basename(argv[0]); the
     # binary's compiled-in re-exec path is /bin/busybox, hence the location.

@@ -31,10 +31,47 @@ case "$ARCH" in
     *)    echo "Usage: $0 [386|686|x64] [-i image] [-r binary] [-h hostfs_dir] [extra qemu args...]"; exit 1 ;;
 esac
 
-# AdLib (YM3812 / OPL2) on ports 0x388-0x389. Override audio backend with
-# AUDIO_BACKEND=alsa|sdl|... if pulseaudio isn't available.
-AUDIO_BACKEND="${AUDIO_BACKEND:-pa}"
-AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0" -device adlib,audiodev=snd0)
+# AdLib (YM3812 / OPL2) on ports 0x388-0x389 and SB16 at
+# A220/I5/D1/H5. QEMU DOS guests are sensitive to bare `-device sb16`;
+# always bind every sound-producing device to an explicit backend. Override
+# with AUDIO_BACKEND=pa|pipewire|alsa|sdl|none if auto-selection is wrong.
+# Use SOUND=0 to omit SB16/AdLib/PC speaker devices entirely.
+choose_audio_backend() {
+    if [ -n "${AUDIO_BACKEND:-}" ]; then
+        printf '%s\n' "$AUDIO_BACKEND"
+        return
+    fi
+    local help
+    help="$($QEMU -audiodev help 2>/dev/null || true)"
+    # Prefer QEMU's PulseAudio backend. On PipeWire desktops this usually
+    # reaches pipewire-pulse and is less brittle than QEMU's native PipeWire
+    # backend, which can fail with "Failed to initialize PW context" even when
+    # compiled in.
+    for backend in pa pipewire alsa sdl; do
+        if printf '%s\n' "$help" | grep -q "^$backend"; then
+            printf '%s\n' "$backend"
+            return
+        fi
+    done
+    printf '%s\n' "pa"
+}
+
+AUDIO_BACKEND="$(choose_audio_backend)"
+if [ "${SOUND:-1}" = "0" ]; then
+    AUDIO_ARGS=()
+else
+    AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0"
+                -device adlib,audiodev=snd0
+                -device sb16,audiodev=snd0,iobase=0x220,irq=5,dma=1,dma16=5
+                -machine pcspk-audiodev=snd0)
+fi
+
+# Display backend. Default to SDL, NOT GTK: QEMU's GTK UI only repaints
+# when the main loop goes idle, and SB16 ISA DMA keeps i8257_dma_run()
+# spinning so it never does — the whole screen freezes while sound plays
+# (QEMU LP#1873769 / GitLab #469; unfixed upstream, SDL/Spice/curses are
+# unaffected). Override with QEMU_DISPLAY=gtk|spice|none|... if needed.
+DISPLAY_ARGS=(-display "${QEMU_DISPLAY:-sdl}")
 
 case "$IMG" in
     image)       BAZEL_TARGET="//:image";             IMAGE_FILE="image.bin" ;;
@@ -88,12 +125,14 @@ if [ "$IMG" = "grub" ]; then
         DISPLAY="${DISPLAY:-}" \
         XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
         $QEMU \
         $CPU \
         -cdrom "$ISO" \
         -drive "file=$DISK,format=raw,snapshot=on" \
         -boot order=d \
         -debugcon stdio \
+        "${DISPLAY_ARGS[@]}" \
         "${AUDIO_ARGS[@]}" \
         "${RTC_ARGS[@]}" \
         -no-reboot \
@@ -181,6 +220,7 @@ elif [ "$IMG" = "freedos" ]; then
         DISPLAY="${DISPLAY:-}" \
         XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
         $QEMU \
         $CPU \
         -debugcon stdio \
@@ -190,6 +230,7 @@ elif [ "$IMG" = "freedos" ]; then
         -drive "file=$HDD_IMG,format=raw" \
         $APPS_DRIVE \
         $FDOS_ARGS \
+        "${DISPLAY_ARGS[@]}" \
         "${AUDIO_ARGS[@]}" \
         "${RTC_ARGS[@]}" \
         -no-reboot \
@@ -231,12 +272,14 @@ else
         DISPLAY="${DISPLAY:-}" \
         XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
         $QEMU \
         $CPU \
         -drive "file=$IMAGE,format=raw,snapshot=on" \
         -debugcon stdio \
         "${FWCFG_ARGS[@]}" \
         "${HOSTFS_ARGS[@]}" \
+        "${DISPLAY_ARGS[@]}" \
         "${AUDIO_ARGS[@]}" \
         "${RTC_ARGS[@]}" \
         -no-reboot \

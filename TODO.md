@@ -144,6 +144,24 @@
       MIPS. Would help Wing Commander, Pinball Fantasies' linesync
       loop, and the rest of the Vogons CPU-sensitive list without
       per-game in-engine knobs.
+- [ ] (sb-dma-virt) MOD music has deep comb-echo "reverb" + unstable
+      tempo at "ultra high quality" mixing; "486" mixing sounds normal.
+      Not a buffer/remap-coherency bug (a coherency fault would echo at
+      any rate). It's a throughput ceiling: with host IRQ5 re-armed on
+      the guest vPIC EOI (`0x20`) — the correct, existing trigger — the
+      full per-IRQ round trip (QEMU sb16 → host trap → event-loop drain
+      → relay → vPIC → mode-transition into guest ISR → passthrough port
+      I/O traps → EOI → cross-mode restore) exceeds the ultra-quality
+      segment period, so free-running auto-init drops segments. Prime
+      suspect: `run_qemu.sh` runs QEMU under TCG (no `-enable-kvm` /
+      `-accel`), inflating every trap. Rejected dead-ends: auto-init
+      special-case + kernel-side 2xEh ack (reverted — both hacks); the
+      0x22E-read re-arm idea (wrong; EOI 0x20 is the right trigger).
+- [ ] Restart from launcher after quitting OMF hangs. Likely uncleaned
+      DOS-exit/exec state on the sb-dma-virt path — SB DMA pool binding,
+      host-IRQ5 mask state, or virtual-8237 armed state not reset.
+      Check `release_dma_pool` / IRQ-mask reset on `exec_dos_into` and
+      program exit.
 
 ## Kernel — virtual IF gets stuck at 0
 - [ ] Intermittent across games: a program runs fine for a while then
@@ -175,3 +193,18 @@
 - [ ] Diagnosis: capture more of the surrounding code (extend prof
       F12 dump to a full instruction window) or single-step the outer
       loop after the inner exits to find what condition it's polling.
+
+## Dune II — single-cycle SB DMA (sb-dma-virt)
+- [ ] Speech still broken. Dune2 uses single-cycle (not auto-init) SB
+      DMA; under the virtual-8237 + host-IRQ5-relay path the speech
+      pump doesn't advance. Single-cycle keeps the deferred-ack model
+      (host IRQ5 masked until guest vPIC EOI `0x20` → `arch_rearm_irq(5)`),
+      the card halts at terminal count and the guest owns the re-arm.
+      Investigate terminal-count current-count readback (the ISR tests
+      8237 ch count `== 0xFFFF` to claim the completion IRQ) and the
+      re-arm timing on the single-cycle path.
+
+## Wacky Wheels
+- [ ] Setup program crashes. Triage: capture the fault (CS:EIP,
+      exception vector, VM86/PM mode) and isolate the subsystem
+      (DOS/DPMI/SB/other) before fixing.
