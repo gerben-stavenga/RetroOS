@@ -478,7 +478,7 @@ fn event_loop(first_tid: usize) {
             crate::arch::monitor::KernelEvent::Exception(_) => ev_exc += 1,
             crate::arch::monitor::KernelEvent::Syscall => ev_syscall += 1,
         }
-        if ts_after_user.wrapping_sub(last_profile_dump) >= PROFILE_DUMP_CYCLES {
+        if ts_after_user.wrapping_sub(last_profile_dump) >= PROFILE_DUMP_CYCLES && false {
             let total = user_cycles.wrapping_add(kernel_cycles);
             let user_pct = if total > 0 { user_cycles.wrapping_mul(100) / total } else { 0 };
             let kern_pct = if total > 0 { kernel_cycles.wrapping_mul(100) / total } else { 0 };
