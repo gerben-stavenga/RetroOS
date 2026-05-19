@@ -134,6 +134,30 @@ pkg_tar(
     ],
 )
 
+# dosrt artifacts (modplay SB-DMA test) staged into TESTS/. RLOADER.BIN
+# must sit beside MODPLAY.EXE (the stub loads it from cwd). NOT added to
+# the extras consumed by `image_min` (the stub's boot image) — that would
+# re-introduce the image→modplay_exe→stub_exe→image build cycle.
+pkg_tar(
+    name = "dosrt_tar",
+    files = {
+        "//apps/dosrt:modplay_exe": "TESTS/MODPLAY.EXE",
+        "//apps/dosrt:rloader_bin": "TESTS/RLOADER.BIN",
+    },
+)
+
+# Full extras = dosrt-free extras + the dosrt test, merged. Used by the
+# real `image`; `image_min` (stub boot image) uses plain `extras_tar`.
+pkg_tar(
+    name = "extras_tar_full",
+    deps = [":extras_tar", ":dosrt_tar"],
+)
+
+pkg_tar(
+    name = "extras_tar_proprietary_full",
+    deps = [":extras_tar_proprietary", ":dosrt_tar"],
+)
+
 # Same extras plus the proprietary game/tooling drop.
 pkg_tar(
     name = "extras_tar_proprietary",
@@ -220,20 +244,33 @@ with open('$@', 'r+b') as f:
     "
 """
 
+# Minimal boot image: apps-boot bundle (kernel+DN+TC) + dosrt-free
+# extras. This is the image //apps/dosrt:stub_exe boots to run in-OS
+# TCC. It must NOT contain the dosrt artifacts, else
+# image→modplay_exe→stub_exe→image_min would still be a cycle (it isn't,
+# because image_min depends only on extras_tar, never on dosrt).
 genrule(
-    name = "image",
+    name = "image_min",
     srcs = [":boot_bundle_tar", ":extras_tar"],
-    outs = ["image.bin"],
+    outs = ["image_min.bin"],
     cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_tar)"),
     # Consumed by //apps/dosrt:stub_exe (QEMU-genrule TC compile host).
     visibility = ["//visibility:public"],
 )
 
 genrule(
+    name = "image",
+    srcs = [":boot_bundle_tar", ":extras_tar_full"],
+    outs = ["image.bin"],
+    cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_tar_full)"),
+    visibility = ["//visibility:public"],
+)
+
+genrule(
     name = "image_proprietary",
-    srcs = [":boot_bundle_tar", ":extras_tar_proprietary"],
+    srcs = [":boot_bundle_tar", ":extras_tar_proprietary_full"],
     outs = ["image_proprietary.bin"],
-    cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_tar_proprietary)"),
+    cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_tar_proprietary_full)"),
 )
 
 # FAT16 data disk for FreeDOS (all apps from the proprietary TAR)

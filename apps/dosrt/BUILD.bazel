@@ -105,12 +105,14 @@ genrule(
     name = "stub_exe",
     srcs = [
         "stub/stub.c",
-        "//:image",
+        # Minimal dosrt-free boot image: booting //:image (which now
+        # bundles modplay_exe) here would be a build cycle.
+        "//:image_min",
         "//:hostfs.py",
     ],
     outs = ["STUB.EXE"],
     tools = ["qemu_tcc.sh"],
-    cmd = "$(location qemu_tcc.sh) $(location //:image) $(location //:hostfs.py) $(location stub/stub.c) $@",
+    cmd = "$(location qemu_tcc.sh) $(location //:image_min) $(location //:hostfs.py) $(location stub/stub.c) $@",
 )
 
 # ---- pack: app.exe = stub ++ payload.elf --------------------------------
