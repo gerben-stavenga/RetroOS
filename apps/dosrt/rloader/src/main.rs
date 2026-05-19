@@ -23,10 +23,10 @@ use lib::elf::Elf;
 // is valid. Distinct from a payload crt0: only RLOADER is handed a
 // file handle.
 core::arch::global_asm!(
-    ".section .text._start,\"ax\"",
+    ".section .text.rloader_entry,\"ax\"",
     ".code32",
-    ".globl _start",
-    "_start:",
+    ".globl rloader_entry",
+    "rloader_entry:",
     "mov bx, cs",                       // CS selector
     "mov ax, 0x0006",                   // DPMI get-segment-base -> CX:DX
     "int 0x31",
@@ -63,16 +63,19 @@ core::arch::global_asm!(
     "cld",
     "rep stosb",
     // Capture the stub's far-call args off its (still-current) 16-bit PM
-    // stack: go(unsigned exh, unsigned long poff) — cdecl, far CALL ⇒
-    // [SP+0]=retIP(2) [SP+2]=retCS(2) [SP+4]=exh(2) [SP+6]=poff(4).
-    // EBP-based ⇒ SS-relative; SS is still the stub stack here. Zero-
-    // extend SP (32-bit code, 16-bit stub stack ⇒ ESP-hi undefined).
+    // stack: go(unsigned exh, unsigned long poff, unsigned long arg_lin)
+    // — cdecl, far CALL ⇒ [SP+0]=retIP(2) [SP+2]=retCS(2) [SP+4]=exh(2)
+    // [SP+6]=poff(4) [SP+10]=arg_lin(4, already a linear addr). EBP-based
+    // ⇒ SS-relative; SS is still the stub stack here. Zero-extend SP
+    // (32-bit code, 16-bit stub stack ⇒ ESP-hi undefined).
     "xor ebp, ebp",
     "mov bp, sp",
     "movzx ecx, word ptr [ebp+4]",      // exh
     "mov [HOFF_H], cx",
     "mov esi, [ebp+6]",                 // poff
     "mov [HOFF_OFF], esi",
+    "mov eax, [ebp+10]",                // argblk LINEAR addr (u32; stub
+    "mov [HOFF_ARG], eax",              //   passes it directly, no seg<<4)
     // Switch to RLOADER's own stack and enter the loader.
     "mov ss, bx",
     "mov esp, offset RLOADER_STACK + 0x4000",
@@ -88,6 +91,11 @@ core::arch::global_asm!(
 static mut HOFF_H: u16 = 0;
 #[unsafe(no_mangle)]
 static mut HOFF_OFF: u32 = 0;
+/// Linear address of the stub's command-tail (Borland `argv[1]`) string,
+/// passed to the payload (ESI) so dosrt's `_start` builds `app_main`'s
+/// args without the PSP/AH=62h path (empty for a PM client here).
+#[unsafe(no_mangle)]
+static mut HOFF_ARG: u32 = 0;
 
 /// RLOADER crt's stack (BSS). 16 KB; ESP starts at the top.
 #[unsafe(no_mangle)]
@@ -297,7 +305,8 @@ fn load_and_run(segs: &[Seg], entry: u32) -> ! {
     // optimizer spreads over the whole fn, corrupting the pure size math
     // above. It lives in a dedicated global_asm symbol (like crt0), fed
     // the already-computed values.
-    unsafe { enter_payload(code as u32, data as u32, sp_top, entry) }
+    let arg = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HOFF_ARG)) };
+    unsafe { enter_payload(code as u32, data as u32, sp_top, entry, arg) }
 }
 
 // Final far-transfer into the payload. A real asm symbol (cdecl args on
@@ -312,17 +321,18 @@ core::arch::global_asm!(
     "mov edx, [esp+8]",                  // arg1: data selector
     "mov eax, [esp+12]",                 // arg2: sp_top
     "mov ebx, [esp+16]",                 // arg3: entry
+    "mov esi, [esp+20]",                 // arg4: arg_lin (→ dosrt _start)
     "mov ss, dx",
     "mov esp, eax",                      // (mov-ss shadow covers next insn)
     "mov ds, dx",
     "mov es, dx",
     "push ecx",                          // CS
     "push ebx",                          // EIP
-    "retf",                              // -> code:entry
+    "retf",                              // -> code:entry, ESI = arg_lin
 );
 
 unsafe extern "C" {
-    fn enter_payload(code: u32, data: u32, sp_top: u32, entry: u32) -> !;
+    fn enter_payload(code: u32, data: u32, sp_top: u32, entry: u32, arg_lin: u32) -> !;
 }
 
 fn hang() -> ! {

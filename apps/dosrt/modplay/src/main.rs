@@ -284,13 +284,34 @@ impl<'a> Player<'a> {
     }
 }
 
+/// Entry: dosrt's crt0 set up the environment and reconstructed
+/// `argc`/`argv` from the stub's Borland argv. `argv[1]` = module path.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub fn app_main(argc: usize, argv: &[&[u8]]) {
     puts("\r\nmodplay: ");
-    let h = match dos::open(b"MOD2.MOD\0") {
+    // `MODPLAY <path>`; default to MOD2.MOD when no argument given.
+    static mut PATHBUF: [u8; 128] = [0; 128];
+    let pb = unsafe { &mut *core::ptr::addr_of_mut!(PATHBUF) };
+    let plen = if argc > 1 {
+        let a = argv[1];
+        let n = a.len().min(pb.len() - 1);
+        pb[..n].copy_from_slice(&a[..n]);
+        pb[n] = 0;
+        n + 1
+    } else {
+        pb[..9].copy_from_slice(b"MOD2.MOD\0");
+        9
+    };
+    let path: &[u8] = &pb[..plen];
+    puts("file='");
+    for &c in &path[..path.len() - 1] {
+        putc(c);
+    }
+    puts("' ");
+    let h = match dos::open(path) {
         Some(h) => h,
         None => {
-            puts("open MOD2.MOD FAIL\r\n");
+            puts("open FAIL\r\n");
             dos::exit(1);
         }
     };
@@ -389,8 +410,11 @@ pub extern "C" fn _start() -> ! {
     const NSEG: usize = NSAMP / SEGSZ as usize;
     let mut next_fill = 0usize;             // next consumed seg to refill
     let mut refills: u32 = 0;
-    let cap = 8 * SRATE / SEGSZ as u32;     // ~8 s of segments (headless)
-    while refills < cap && !pl.ended {
+    // Play one full pass of the module. `pl.ended` is set when the order
+    // list wraps (do_row). A tiny post-end drain lets the last in-ring
+    // segments finish instead of cutting the tail.
+    let mut drain = NSEG as u32 + 2;
+    while !pl.ended || drain > 0 {
         outb(0x0C, 0x00);
         let lo = inb(0x03) as u16;
         let hi = inb(0x03) as u16;
@@ -402,14 +426,16 @@ pub extern "C" fn _start() -> ! {
             pl.render(&mut ring[b..b + SEGSZ as usize]);
             next_fill = (next_fill + 1) % NSEG;
             refills += 1;
+            if pl.ended && drain > 0 {
+                drain -= 1;
+            }
         }
     }
     sb::write(0xD3);                        // speaker off
     sb::write(0xDA);                        // exit auto-init
     puts(" refills=");
     puthex32(refills);
-    puts(if pl.ended { " (song end)\r\n" } else { " (cap)\r\n" });
-
-    dos::exit(0);
+    puts(" (song end)\r\n");
+    // Return → dosrt's _start calls dos::exit(0).
 }
-// Panic handler is provided by the `dosrt` crate (linked).
+// crt0 (_start) + panic handler are provided by the `dosrt` crate.

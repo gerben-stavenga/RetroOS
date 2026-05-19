@@ -153,9 +153,23 @@ pkg_tar(
     deps = [":extras_tar", ":dosrt_tar"],
 )
 
+# Proprietary variant: also drop a FANTASY module as TESTS/MOD2.MOD so
+# `cd TESTS & MODPLAY.EXE` plays it (modplay opens "MOD2.MOD" from cwd;
+# real argv is the proper general fix, tracked separately). This MOD is
+# proprietary — it must only ever be in extras_tar_proprietary_full,
+# never the public extras_tar_full.
+pkg_tar(
+    name = "dosrt_tar_proprietary",
+    files = {
+        "//apps/dosrt:modplay_exe": "TESTS/MODPLAY.EXE",
+        "//apps/dosrt:rloader_bin": "TESTS/RLOADER.BIN",
+        "//apps-proprietary:games/FANTASY/MOD2.MOD": "TESTS/MOD2.MOD",
+    },
+)
+
 pkg_tar(
     name = "extras_tar_proprietary_full",
-    deps = [":extras_tar_proprietary", ":dosrt_tar"],
+    deps = [":extras_tar_proprietary", ":dosrt_tar_proprietary"],
 )
 
 # Same extras plus the proprietary game/tooling drop.

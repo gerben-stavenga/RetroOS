@@ -300,11 +300,89 @@ pub mod dos {
         dpmi::sim_int(0x21, &mut r);
     }
 
+    /// The DOS command tail (argv) of *this* process. The whole
+    /// stub→RLOADER→payload chain runs in one DOS process, so its PSP
+    /// carries the original command line. INT 21h AH=62h → PSP segment;
+    /// `PSP:0x80` = length byte, `PSP:0x81..` = the tail (CR-terminated).
+    /// Conventional memory, reached via our flat selector. Empty slice
+    /// if no args.
+    pub fn cmdline() -> &'static [u8] {
+        let mut r = Rmcs::default();
+        r.eax = 0x6200;                       // get PSP segment -> BX
+        dpmi::sim_int(0x21, &mut r);
+        let psp = r.ebx as u16;
+        if psp == 0 {
+            return &[];
+        }
+        let base = crate::conv_flat_ptr(psp); // flat ptr to PSP:0
+        unsafe {
+            let len = (*base.add(0x80) as usize).min(126);
+            core::slice::from_raw_parts(base.add(0x81) as *const u8, len)
+        }
+    }
+
     /// INT 21h AH=4Ch exit (register-only; reflects directly).
     pub fn exit(code: u8) -> ! {
         unsafe { core::arch::asm!("int 0x21", in("ax") 0x4C00u16 | code as u16) }
         loop { unsafe { core::arch::asm!("hlt") } }
     }
+}
+
+/// Universal app crt0. RLOADER's `enter_payload` already set the
+/// payload's CS/DS/SS/ESP and zeroed its BSS, and left **ESI = the
+/// linear address of the command-tail string** (Borland `argv[1]`,
+/// piped stub→RLOADER→here — the PSP/AH=62h path is empty for a PM
+/// client). `_start` forwards ESI to `rt_entry`, which resolves it to a
+/// flat pointer and hands the app its args. The app provides `app_main`.
+/// RLOADER is not an app (own entry `rloader_entry`); this `_start` is
+/// unreferenced there and gc-sectioned away.
+core::arch::global_asm!(
+    ".section .text._start,\"ax\"",
+    ".code32",
+    ".globl _start",
+    "_start:",
+    "push esi",                 // arg_lin → rt_entry(arg_lin)
+    "call rt_entry",
+    "1: hlt",
+    "jmp 1b",
+);
+
+unsafe extern "Rust" {
+    fn app_main(argc: usize, argv: &[&[u8]]);
+}
+
+/// Max argv the runtime reconstructs.
+const ARGV_MAX: usize = 16;
+
+/// Rebuild `argc`/`argv` from the stub's conventional block
+/// (`[u8 argc][argv0 \0][argv1 \0]...`), reached via our flat DS at
+/// `arg_lin - DS_base`, then enter the app.
+#[unsafe(no_mangle)]
+extern "C" fn rt_entry(arg_lin: u32) -> ! {
+    let mut argv: [&[u8]; ARGV_MAX] = [&[]; ARGV_MAX];
+    let dsb = dpmi::seg_base(dpmi::ds_sel());
+    let argc = if arg_lin == 0 {
+        0
+    } else {
+        let p = arg_lin.wrapping_sub(dsb) as *const u8;
+        unsafe {
+            let n = (*p as usize).min(ARGV_MAX);
+            let mut q = p.add(1);
+            for slot in argv.iter_mut().take(n) {
+                let start = q;
+                let mut l = 0usize;
+                while *q != 0 && l < 255 {
+                    q = q.add(1);
+                    l += 1;
+                }
+                *slot = core::slice::from_raw_parts(start, l);
+                q = q.add(1); // skip the NUL
+            }
+            n
+        }
+    };
+    unsafe { app_main(argc, &argv[..argc]) }
+    dos::exit(0)
 }
 
 #[panic_handler]

@@ -2,9 +2,10 @@
    Non-PIC, linked at a fixed nonzero base; the stub builds a selector
    whose base = (buffer_linear - LINK_BASE) so all link addresses
    resolve (DJGPP-style selector-base trick). Single contiguous region
-   so the flat .BIN == [0, file_end). _start must be at file offset 0,
-   i.e. link address LINK_BASE. */
-ENTRY(_start)
+   so the flat .BIN == [0, file_end). rloader_entry must be at file
+   offset 0, i.e. link address LINK_BASE. (Entry is NOT named _start:
+   dosrt owns _start as the universal app crt0; RLOADER is not an app.) */
+ENTRY(rloader_entry)
 
 /* Nonzero so no symbol/static lands at vaddr 0 (LLVM/Rust would treat
    address 0 as a null pointer → miscompile/UB). Must fit a 16-bit far
@@ -16,7 +17,7 @@ SECTIONS
 {
     . = __link_base;
 
-    .text   : { *(.text._start) *(.text .text.*) }
+    .text   : { *(.text.rloader_entry) *(.text .text.*) }
     .rodata : { *(.rodata .rodata.*) }
     .data   : { *(.data .data.*) }
 

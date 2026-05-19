@@ -55,10 +55,10 @@ genrule(
     name = "rloader_elf",
     srcs = [":rloader_retro", "rloader/rloader.ld"],
     outs = ["rloader.elf"],
-    # `-u _start`: rust_static_library is an archive; ld only pulls members
-    # that resolve an undefined symbol. ENTRY() sets the entry field but is
-    # not such a reference, so without this ld links nothing (33-byte bin).
-    cmd = "ld -m elf_i386 --gc-sections -T $(location rloader/rloader.ld) -u _start --entry _start $(location :rloader_retro) -o $@",
+    # `-u rloader_entry`: force-link RLOADER's own crt entry (its name is
+    # NOT _start — dosrt owns _start as the app crt0). gc-sections then
+    # drops dosrt's unused _start (and its app_main ref) from RLOADER.
+    cmd = "ld -m elf_i386 --gc-sections -T $(location rloader/rloader.ld) -u rloader_entry --entry rloader_entry $(location :rloader_retro) -o $@",
 )
 
 genrule(

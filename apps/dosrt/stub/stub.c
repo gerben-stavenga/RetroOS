@@ -22,7 +22,14 @@
  * pushes the return CS:IP; RLOADER's crt0 reads them off that stack
  * (SS-relative, before it repoints SS:ESP). No fixed buffer slot, no
  * register-survival assumptions. */
-typedef void (far *rloader_fn)(unsigned, unsigned long);
+typedef void (far *rloader_fn)(unsigned, unsigned long, unsigned long);
+
+/* Borland-parsed argv, repacked into one self-describing conventional
+ * block: [u8 argc][argv0 \0][argv1 \0]...  RLOADER captures its far
+ * pointer and pipes it to the payload, whose dosrt crt0 rebuilds
+ * argc/argv (the PSP/AH=62h path is empty for a PM client, so the
+ * stub's Borland argv is the source). */
+static char argblk[512];
 
 static unsigned ent_off, ent_seg;      /* DPMI mode-switch entry (ES:DI) */
 
@@ -76,6 +83,19 @@ int main(int argc, char **argv)
      * reads the appended payload ELF through this handle. The payload
      * begins right after the MZ load module; derive that size from the MZ
      * header: pages*512, minus the unused tail of the last page. */
+    /* Repack argv → [u8 argc][argv0 \0][argv1 \0]... in conventional mem. */
+    {
+        unsigned p = 0, a, j;
+        unsigned char na = (unsigned char)(argc > 255 ? 255 : argc);
+        argblk[p++] = (char) na;
+        for (a = 0; a < na; a++) {
+            j = 0;
+            while (argv[a][j] != '\0' && p < sizeof(argblk) - 1)
+                argblk[p++] = argv[a][j++];
+            argblk[p++] = '\0';
+        }
+    }
+
     exh = open(argv[0], O_RDONLY | O_BINARY);
     if (exh < 0) { printf("dosrt: cannot open self '%s'\n", argv[0]); return 1; }
     if (read(exh, mz, 6) != 6 || mz[0] != 'M' || mz[1] != 'Z') {
@@ -140,7 +160,12 @@ int main(int argc, char **argv)
     geninterrupt(0x31);
 
     go = (rloader_fn) MK_FP(sel, 0x1000);        /* RLOADER _start @ __link_base */
-    (*go)((unsigned) exh, poff);                 /* -> RLOADER (args on stack) */
+    /* By now the stub is a 16-bit DPMI PM client: _DS is a SELECTOR, not
+     * a paragraph, so a far seg:off is wrong (RLOADER would do seg<<4).
+     * Pass argblk's LINEAR address, computed from the DS base we already
+     * fetched via AX=0006 (bhi:blo). */
+    (*go)((unsigned) exh, poff,
+          (((unsigned long) bhi << 16) | blo) + (unsigned long)(unsigned) argblk);
 
     return 0;                                                 /* not reached */
 }
