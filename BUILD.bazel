@@ -141,7 +141,7 @@ pkg_tar(
 pkg_tar(
     name = "dosrt_tar",
     files = {
-        "//apps/dosrt:modplay_exe": "TESTS/MODPLAY.EXE",
+        "//apps/tests/modplay:modplay_exe": "TESTS/MODPLAY.EXE",
         "//apps/dosrt:rloader_bin": "TESTS/RLOADER.BIN",
     },
 )
@@ -161,7 +161,7 @@ pkg_tar(
 pkg_tar(
     name = "dosrt_tar_proprietary",
     files = {
-        "//apps/dosrt:modplay_exe": "TESTS/MODPLAY.EXE",
+        "//apps/tests/modplay:modplay_exe": "TESTS/MODPLAY.EXE",
         "//apps/dosrt:rloader_bin": "TESTS/RLOADER.BIN",
         "//apps-proprietary:games/FANTASY/MOD2.MOD": "TESTS/MOD2.MOD",
     },
