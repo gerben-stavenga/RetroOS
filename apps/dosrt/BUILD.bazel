@@ -1,0 +1,105 @@
+# dosrt — Rust-on-DOS via a shared ELF loader. See README.md for the
+# architecture and the stub→RLOADER→payload handoff contract.
+#
+# Status: SCAFFOLD. Rules mirror in-tree patterns (kernel: rust_static_library
+# → `ld -T` genrule; hello_com: `nasm -f bin`; boot: `objcopy -O binary`).
+# The freestanding-binary path is new ground here — expect to iterate the
+# retro transition / link until it produces a valid ELF.
+
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load(":retro.bzl", "retro_lib")
+
+# ---- RLOADER: pure-PM flat loader (single, shared) ----------------------
+
+rust_static_library(
+    name = "rloader_lib",
+    srcs = ["rloader/src/main.rs"],
+    crate_name = "rloader",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+    deps = ["//lib"],
+)
+
+retro_lib(
+    name = "rloader_retro",
+    lib = ":rloader_lib",
+)
+
+genrule(
+    name = "rloader_elf",
+    srcs = [":rloader_retro", "rloader/rloader.ld"],
+    outs = ["rloader.elf"],
+    # `-u _start`: rust_static_library is an archive; ld only pulls members
+    # that resolve an undefined symbol. ENTRY() sets the entry field but is
+    # not such a reference, so without this ld links nothing (33-byte bin).
+    cmd = "ld -m elf_i386 -T $(location rloader/rloader.ld) -u _start $(location :rloader_retro) -o $@",
+)
+
+genrule(
+    name = "rloader_bin",
+    srcs = [":rloader_elf"],
+    outs = ["RLOADER.BIN"],
+    cmd = "objcopy -O binary $< $@",
+    visibility = ["//visibility:public"],
+)
+
+# ---- payload: ordinary no_std ELF (hello smoke test) --------------------
+
+rust_static_library(
+    name = "hello_lib",
+    srcs = ["hello/src/main.rs"],
+    crate_name = "hello",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+)
+
+retro_lib(
+    name = "hello_retro",
+    lib = ":hello_lib",
+)
+
+genrule(
+    name = "hello_elf",
+    srcs = [":hello_retro", "hello/hello.ld"],
+    outs = ["hello.elf"],
+    # See rloader_elf: force the archive member with `_start` to be linked.
+    cmd = "ld -m elf_i386 -T $(location hello/hello.ld) -u _start $(location :hello_retro) -o $@",
+)
+
+# ---- stub: Turbo C MZ EXE, compiled by booting RetroOS in QEMU --------
+# QEMU is invoked as a build tool (host tool, like ld/nasm used above);
+# there's no Linux-hosted Turbo C, so TC runs inside RetroOS. qemu_tcc.sh
+# is the genrule action, not a hand-run script.
+
+genrule(
+    name = "stub_exe",
+    srcs = [
+        "stub/stub.c",
+        "//:image",
+        "//:hostfs.py",
+    ],
+    outs = ["STUB.EXE"],
+    tools = ["qemu_tcc.sh"],
+    cmd = "$(location qemu_tcc.sh) $(location //:image) $(location //:hostfs.py) $(location stub/stub.c) $@",
+)
+
+# ---- pack: app.exe = stub ++ payload.elf --------------------------------
+# Convention: RLOADER reads the payload ELF from offset = size of the MZ
+# load module (= len(STUB.EXE)). The stub passes that offset to RLOADER
+# (ECX) per the handoff contract.
+
+genrule(
+    name = "dosrt_exe",
+    srcs = [":stub_exe", ":hello_elf"],
+    outs = ["DOSRT.EXE"],
+    cmd = "cat $(location :stub_exe) $(location :hello_elf) > $@",
+    visibility = ["//visibility:public"],
+)

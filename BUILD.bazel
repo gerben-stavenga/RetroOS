@@ -1,7 +1,7 @@
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
-exports_files(["i686-retro-none.json"])
+exports_files(["i686-retro-none.json", "hostfs.py"])
 
 # Convenient applet shims for busybox: each is a tar symlink "bin/<name>"
 # pointing at "busybox" (relative within /bin), so PATH=/bin lookup of
@@ -97,6 +97,10 @@ _EXTRA_FILES = {
     # + Dune2-style CLI tick-wait (virtual-IF freeze repro).
     "apps/sbtest/sbtest.c":                 "TESTS/SBTEST.C",
     "apps/sbtest/SBTEST.BAT":               "SBTEST.BAT",
+    # NOTE: dosrt artifacts are deliberately NOT bundled here — the QEMU
+    # genrule that compiles the stub boots //:image, so embedding the
+    # dosrt outputs in the image would create a build cycle. Run the
+    # standalone DOSRT.EXE via run_qemu.sh -r / hostfs instead.
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).
     # Standalone-shell mode dispatches applets via basename(argv[0]); the
     # binary's compiled-in re-exec path is /bin/busybox, hence the location.
@@ -221,6 +225,8 @@ genrule(
     srcs = [":boot_bundle_tar", ":extras_tar"],
     outs = ["image.bin"],
     cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_tar)"),
+    # Consumed by //apps/dosrt:stub_exe (QEMU-genrule TC compile host).
+    visibility = ["//visibility:public"],
 )
 
 genrule(
