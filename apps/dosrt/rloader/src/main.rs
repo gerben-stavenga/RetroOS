@@ -39,21 +39,20 @@ struct Handoff {
 #[unsafe(no_mangle)]
 static mut HANDOFF: [u32; 5] = [0; 5]; // [EBX, ECX, EDX, ESI, EDI]
 
-// BRING-UP _start: isolate "did the stub's 32-bit far-jmp land and run
-// 32-bit code here?" — pure register-only `INT 21h` AH=02 print 'R'
-// (DPMI-reflected, PM-safe, same principle as the stub's geninterrupt),
-// then halt-loop. NO memory refs (so it's independent of DS/relocation
-// correctness — that's the next layer). Restore the real handoff shim
-// (stash regs -> rloader_main) once this proves the transfer works.
+// BRING-UP _start (32-bit). The stub enters PM (32-bit client),
+// builds a 32-bit CODE selector whose base is this buffer, and far-jmps
+// here. Prove the transition: print 'R' via DPMI-reflected INT 21h
+// (PM-safe), then halt-loop. Real ELF-loader body is the next step.
 core::arch::global_asm!(
     ".section .text._start,\"ax\"",
+    ".code32",
     ".globl _start",
     "_start:",
     "mov ah, 0x02",
     "mov dl, 0x52",          // 'R'
     "int 0x21",
-    "2: hlt",
-    "jmp 2b",
+    "1: hlt",
+    "jmp 1b",
 );
 
 #[unsafe(no_mangle)]
