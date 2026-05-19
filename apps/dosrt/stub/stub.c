@@ -13,6 +13,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <dos.h>
+#include <fcntl.h>
+#include <io.h>
+
+/* Handoff to RLOADER is via the natural C far-call ABI: the stub calls
+ * the 32-bit entry as go(unsigned exh, unsigned long poff). TC pushes the
+ * args (right-to-left, cdecl) onto the stub's PM stack and the far CALL
+ * pushes the return CS:IP; RLOADER's crt0 reads them off that stack
+ * (SS-relative, before it repoints SS:ESP). No fixed buffer slot, no
+ * register-survival assumptions. */
+typedef void (far *rloader_fn)(unsigned, unsigned long);
 
 static unsigned ent_off, ent_seg;      /* DPMI mode-switch entry (ES:DI) */
 
@@ -36,19 +46,47 @@ int main(int argc, char **argv)
     struct SREGS s;
     unsigned host_si, host_seg, seg, ds_sel, sel, bhi, blo, off;
     unsigned long lin;
-    void (far *go)();
+    rloader_fn go;
+    int exh;
+    unsigned char mz[6];
+    unsigned long poff;
 
-    (void) argc; (void) argv;
+    (void) argc;
 
-    /* Load the shared loader with the C library. */
+    /* Load the shared loader. The buffer must hold RLOADER's whole image
+     * incl. BSS+stack (crt0 zeroes/uses BSS past the file bytes), not
+     * just the file. Allocate a fixed block big enough; read the file
+     * into the front. (Small-model heap cap ~64 KB — fine while RLOADER
+     * + payload-scratch stay modest.) */
+    #define DOSRT_BUFSZ 0xE000U      /* ~56 KB: file + BSS + stack       */
     f = fopen("RLOADER.BIN", "rb");
     if (!f) { printf("dosrt: cannot open RLOADER.BIN\n"); return 1; }
     fseek(f, 0L, SEEK_END); sz = ftell(f); fseek(f, 0L, SEEK_SET);
-    buf = (char *) malloc((size_t) sz);
-    if (!buf) { printf("dosrt: malloc(%ld) failed\n", sz); fclose(f); return 1; }
+    if (sz <= 0 || (unsigned long) sz > DOSRT_BUFSZ) {
+        printf("dosrt: RLOADER.BIN size %ld > buf\n", sz); fclose(f); return 1;
+    }
+    buf = (char *) malloc(DOSRT_BUFSZ);
+    if (!buf) { printf("dosrt: malloc failed\n"); fclose(f); return 1; }
     n = fread(buf, 1, (size_t) sz, f);
     fclose(f);
     if (n != (size_t) sz) { printf("dosrt: short read %u/%ld\n", n, sz); return 1; }
+
+    /* Open our own .EXE (argv[0] = full path; RetroOS fills the DOS-3 env
+     * program-path, so TC's startup populates it). Keep it open — RLOADER
+     * reads the appended payload ELF through this handle. The payload
+     * begins right after the MZ load module; derive that size from the MZ
+     * header: pages*512, minus the unused tail of the last page. */
+    exh = open(argv[0], O_RDONLY | O_BINARY);
+    if (exh < 0) { printf("dosrt: cannot open self '%s'\n", argv[0]); return 1; }
+    if (read(exh, mz, 6) != 6 || mz[0] != 'M' || mz[1] != 'Z') {
+        printf("dosrt: self is not MZ\n"); return 1;
+    }
+    {
+        unsigned e_cblp = mz[2] | ((unsigned) mz[3] << 8);   /* bytes/last pg */
+        unsigned e_cp   = mz[4] | ((unsigned) mz[5] << 8);   /* 512-byte pgs  */
+        poff = (unsigned long) e_cp * 512UL;
+        if (e_cblp) poff = poff - 512UL + e_cblp;
+    }
 
     /* DPMI present?  INT 2Fh AX=1687h (no libc for this). */
     r.x.ax = 0x1687;
@@ -84,7 +122,9 @@ int main(int argc, char **argv)
 
     _AX = 0x0006; _BX = ds_sel; geninterrupt(0x31);          /* DS base */
     bhi = _CX; blo = _DX;
-    lin = (((unsigned long)bhi << 16) | blo) + off;
+    /* selector base = buffer_linear - __link_base (rloader.ld 0x1000),
+     * so RLOADER's link addresses (0x1000+) resolve via this selector. */
+    lin = (((unsigned long)bhi << 16) | blo) + off - 0x1000UL;
 
     _AX = 0x0000; _CX = 1; geninterrupt(0x31);                /* alloc desc */
     sel = _AX;
@@ -93,14 +133,14 @@ int main(int argc, char **argv)
     _CX = (unsigned)(lin >> 16); _DX = (unsigned)(lin & 0xFFFF);
     geninterrupt(0x31);
 
-    _AX = 0x0008; _BX = sel; _CX = 0; _DX = 0xFFFF;           /* limit 64K */
+    _AX = 0x0008; _BX = sel; _CX = 0x000F; _DX = 0xFFFF;      /* limit 1MB */
     geninterrupt(0x31);
 
     _AX = 0x0009; _BX = sel; _CX = 0x40FA;                    /* 32-bit code */
     geninterrupt(0x31);
 
-    go = (void (far *)()) MK_FP(sel, 0);
-    (*go)();                                                  /* -> RLOADER */
+    go = (rloader_fn) MK_FP(sel, 0x1000);        /* RLOADER _start @ __link_base */
+    (*go)((unsigned) exh, poff);                 /* -> RLOADER (args on stack) */
 
     return 0;                                                 /* not reached */
 }

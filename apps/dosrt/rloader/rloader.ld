@@ -1,18 +1,20 @@
-/* RLOADER — pure-PM flat loader. Linked as one contiguous image, then
-   `objcopy -O binary` → RLOADER.BIN. Self-relocating is preferred long
-   term (run at any base); for the first bring-up we link at a fixed base
-   the stub honours when it copies the .BIN in. Keep a single load region
-   so the flat .BIN == [0, _end - _base). */
+/* RLOADER — flat 32-bit image, `objcopy -O binary` → RLOADER.BIN.
+   Non-PIC, linked at a fixed nonzero base; the stub builds a selector
+   whose base = (buffer_linear - LINK_BASE) so all link addresses
+   resolve (DJGPP-style selector-base trick). Single contiguous region
+   so the flat .BIN == [0, file_end). _start must be at file offset 0,
+   i.e. link address LINK_BASE. */
 ENTRY(_start)
+
+/* Nonzero so no symbol/static lands at vaddr 0 (LLVM/Rust would treat
+   address 0 as a null pointer → miscompile/UB). Must fit a 16-bit far
+   offset (the stub's TC MK_FP far-jmp target). Stub does
+   selector_base = DS_base + buf_off - 0x1000 and far-jmps sel:0x1000. */
+__link_base = 0x1000;
 
 SECTIONS
 {
-    /* Base 0: the stub creates a 32-bit code/data selector whose BASE is
-       the linear address of the buffer RLOADER was read into, so all of
-       RLOADER's addresses are selector-relative offsets from 0 (DJGPP-
-       style selector-base trick). _start must be at offset 0. */
-    . = 0;
-    __rloader_base = .;
+    . = __link_base;
 
     .text   : { *(.text._start) *(.text .text.*) }
     .rodata : { *(.rodata .rodata.*) }
@@ -21,7 +23,6 @@ SECTIONS
     __bss_start = .;
     .bss    : { *(.bss .bss.*) *(COMMON) }
     __bss_end = .;
-    __rloader_end = .;
 
     /DISCARD/ : { *(.eh_frame) *(.comment) *(.note*) }
 }

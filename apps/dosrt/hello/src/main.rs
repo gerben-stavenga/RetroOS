@@ -29,8 +29,12 @@ unsafe fn dos_putc(c: u8) {
 
 #[inline]
 fn dos_exit(code: u8) -> ! {
+    // INT 21h AH=4Ch. AX must be set as ONE 16-bit operand: separate
+    // in("ah")/in("al") let LLVM emit `mov ah,0x4c; xor eax,eax` (AL=0
+    // via a full-EAX clear), wiping AH → AX=0x0000 → wrong INT 21h
+    // function. (Matches dosrt::dos::exit.)
     unsafe {
-        core::arch::asm!("int 0x21", in("ah") 0x4Cu8, in("al") code, options(noreturn));
+        core::arch::asm!("int 0x21", in("ax") 0x4C00u16 | code as u16, options(noreturn));
     }
 }
 

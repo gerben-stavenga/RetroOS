@@ -3,9 +3,10 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Link base. RLOADER honours p_vaddr/p_paddr from the program headers,
-       so this only needs to be a sane, page-aligned address that does not
-       collide with RLOADER's own load region or DOS low memory. */
+    /* Link base. RLOADER honours p_vaddr/p_paddr from the program headers
+       and gives the payload its OWN DPMI-allocated memory + selector
+       (INT 31h AX=0501), so this only needs to be a sane, page-aligned
+       address that doesn't collide with DOS low memory. */
     . = 0x00400000;
 
     .text   : { *(.text .text.*) }

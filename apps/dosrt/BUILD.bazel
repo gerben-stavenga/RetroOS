@@ -6,8 +6,26 @@
 # The freestanding-binary path is new ground here — expect to iterate the
 # retro transition / link until it produces a valid ELF.
 
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 load(":retro.bzl", "retro_lib")
+
+# ---- dosrt: the universal Rust-on-DOS runtime (crt0 + DPMI + libc) -----
+# Every dosrt program links this; the program supplies only
+# `#[no_mangle] extern "C" fn dosrt_main()`. An rlib (inter-crate Rust
+# dep); rloader's staticlib bundles it for the `ld -T` step.
+
+rust_library(
+    name = "dosrt_lib",
+    srcs = ["src/lib.rs"],
+    crate_name = "dosrt",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+    deps = ["//lib"],
+)
 
 # ---- RLOADER: pure-PM flat loader (single, shared) ----------------------
 
@@ -21,7 +39,11 @@ rust_static_library(
         "-Copt-level=z",
         "-Crelocation-model=static",
     ],
-    deps = ["//lib"],
+    # dosrt = the runtime (crt0/_start, console, DPMI, libc); //lib for
+    # lib::elf. staticlib bundles both rlibs into one archive for the
+    # `ld -T` step; --gc-sections there strips the unused bulk so
+    # RLOADER.BIN stays small enough for the small-model stub loader.
+    deps = [":dosrt_lib", "//lib"],
 )
 
 retro_lib(
@@ -36,7 +58,7 @@ genrule(
     # `-u _start`: rust_static_library is an archive; ld only pulls members
     # that resolve an undefined symbol. ENTRY() sets the entry field but is
     # not such a reference, so without this ld links nothing (33-byte bin).
-    cmd = "ld -m elf_i386 -T $(location rloader/rloader.ld) -u _start $(location :rloader_retro) -o $@",
+    cmd = "ld -m elf_i386 --gc-sections -T $(location rloader/rloader.ld) -u _start --entry _start $(location :rloader_retro) -o $@",
 )
 
 genrule(
