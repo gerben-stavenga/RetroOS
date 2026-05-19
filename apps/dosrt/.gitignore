@@ -1,0 +1,7 @@
+# In-place TCC compile artifacts (interactive debugging) — the real
+# build is hermetic via Bazel (//apps/dosrt:dosrt_exe).
+STUB.EXE
+STUB.COM
+*.OBJ
+*.MAP
+TURBOC.$LN
