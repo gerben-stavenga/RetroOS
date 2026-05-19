@@ -11,7 +11,39 @@
 #![no_std]
 #![no_main]
 
-use dosrt::{dos, puthex32, puthex8, puts};
+use dosrt::{dos, putc, puthex32, puthex8, puts};
+use dosrt::io::{inb, outb};
+
+/// Sound Blaster DSP (ports proven by the C `sbtest`; here from PM Rust).
+mod sb {
+    use super::{inb, outb};
+    const RESET: u16 = 0x226;
+    const READ: u16 = 0x22A;
+    const WSTAT: u16 = 0x22C;
+    const RSTAT: u16 = 0x22E;
+
+    pub fn reset() -> bool {
+        outb(RESET, 1);
+        for _ in 0..1000 { inb(RESET); }
+        outb(RESET, 0);
+        for _ in 0..10000 {
+            if inb(RSTAT) & 0x80 != 0 && inb(READ) == 0xAA {
+                return true;
+            }
+        }
+        false
+    }
+    pub fn write(v: u8) {
+        while inb(WSTAT) & 0x80 != 0 {}
+        outb(WSTAT, v);
+    }
+    pub fn set_rate(srate: u32) {
+        write(0xD1);                              // speaker on
+        let tc = (256u32 - 1_000_000 / srate) as u8;
+        write(0x40);
+        write(tc);
+    }
+}
 
 const FILEBUF_LEN: usize = 96 * 1024;
 static mut FILEBUF: [u8; FILEBUF_LEN] = [0; FILEBUF_LEN];
@@ -307,7 +339,76 @@ pub extern "C" fn _start() -> ! {
     puthex8(mx);
     puts(" sum=");
     puthex32(sum);
-    puts("\r\n");
+
+    // #23a: can the PM payload reach the SB hardware ports?
+    puts(" sb=");
+    if !sb::reset() {
+        puts("FAIL\r\n");
+        dos::exit(1);
+    }
+    puts("OK");
+    sb::set_rate(SRATE);
+
+    // #23b: conventional auto-init DMA ring (8237 needs <1 MB physical).
+    // Render the mixer straight into it (zero-copy), arm the virtualized
+    // 8237, start 8-bit auto-init, and confirm the channel count moves.
+    const NSAMP: usize = 4096;
+    const SEGSZ: u16 = 256;
+    let seg = match dosrt::dpmi::alloc_dos_mem((NSAMP / 16) as u16) {
+        Some((s, _)) => s,
+        None => {
+            puts(" ring FAIL\r\n");
+            dos::exit(1);
+        }
+    };
+    let ring = unsafe {
+        core::slice::from_raw_parts_mut(dosrt::conv_flat_ptr(seg), NSAMP)
+    };
+    pl.render(ring);
+
+    let phys = (seg as u32) << 4;
+    let off = (phys & 0xFFFF) as u16;
+    let page = (phys >> 16) as u8;
+    outb(0x0A, 0x05);                       // mask ch1
+    outb(0x0C, 0x00);                       // clear flip-flop
+    outb(0x0B, 0x59);                       // ch1 read, auto-init
+    outb(0x02, (off & 0xFF) as u8);
+    outb(0x02, (off >> 8) as u8);
+    outb(0x83, page);                       // ch1 page
+    outb(0x03, ((NSAMP - 1) & 0xFF) as u8);
+    outb(0x03, (((NSAMP - 1) >> 8) & 0xFF) as u8);
+    outb(0x0A, 0x01);                       // unmask ch1
+    sb::write(0x48);                        // set block size = SEGSZ
+    sb::write(((SEGSZ - 1) & 0xFF) as u8);
+    sb::write(((SEGSZ - 1) >> 8) as u8);
+    sb::write(0x1C);                        // 8-bit auto-init DMA start
+
+    // #23c: poll-driven streaming. The 8237 count runs (NSAMP-1)→0 and
+    // auto-init reloads it each ring pass; play index = (NSAMP-1)-count.
+    // Re-render every segment the play head has passed. No IRQ handler.
+    const NSEG: usize = NSAMP / SEGSZ as usize;
+    let mut next_fill = 0usize;             // next consumed seg to refill
+    let mut refills: u32 = 0;
+    let cap = 8 * SRATE / SEGSZ as u32;     // ~8 s of segments (headless)
+    while refills < cap && !pl.ended {
+        outb(0x0C, 0x00);
+        let lo = inb(0x03) as u16;
+        let hi = inb(0x03) as u16;
+        let count = ((hi << 8) | lo) as usize;
+        let play_idx = (NSAMP - 1).wrapping_sub(count) % NSAMP;
+        let playing_seg = play_idx / SEGSZ as usize;
+        while next_fill != playing_seg {
+            let b = next_fill * SEGSZ as usize;
+            pl.render(&mut ring[b..b + SEGSZ as usize]);
+            next_fill = (next_fill + 1) % NSEG;
+            refills += 1;
+        }
+    }
+    sb::write(0xD3);                        // speaker off
+    sb::write(0xDA);                        // exit auto-init
+    puts(" refills=");
+    puthex32(refills);
+    puts(if pl.ended { " (song end)\r\n" } else { " (cap)\r\n" });
 
     dos::exit(0);
 }

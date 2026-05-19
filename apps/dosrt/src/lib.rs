@@ -183,6 +183,30 @@ pub mod dpmi {
     }
 }
 
+/// Port I/O. At CPL3 `in`/`out` #GP and RetroOS's machine layer emulates
+/// them for the DOS process (same path the VM86 DOS games use), so a PM
+/// dosrt payload can drive the SB/8237/PIC ports directly.
+pub mod io {
+    #[inline]
+    pub fn inb(port: u16) -> u8 {
+        let v: u8;
+        unsafe { core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline]
+    pub fn outb(port: u16, v: u8) {
+        unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+/// Flat pointer, in our own DS, aliasing a conventional block at real-
+/// mode segment `seg`. Our selectors are flat, so linear `seg<<4` is
+/// reachable at DS offset `seg<<4 - DS_base`. Used for the SB DMA ring
+/// (the 8237 needs a conventional <1 MB physical buffer).
+pub fn conv_flat_ptr(seg: u16) -> *mut u8 {
+    ((seg as u32) << 4).wrapping_sub(dpmi::seg_base(dpmi::ds_sel())) as *mut u8
+}
+
 /// dosrt libc: DOS file I/O via INT 21h through `dpmi::sim_int`. The
 /// pointer-passing transfer buffer is a *real conventional* DOS block
 /// (DPMI AX=0100), lazily allocated on first use — a payload's own image
