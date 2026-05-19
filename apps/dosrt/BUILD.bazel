@@ -125,3 +125,39 @@ genrule(
     cmd = "cat $(location :stub_exe) $(location :hello_elf) > $@",
     visibility = ["//visibility:public"],
 )
+
+# ---- modplay: ProTracker .MOD player payload (links the dosrt lib) ------
+
+rust_static_library(
+    name = "modplay_lib",
+    srcs = ["modplay/src/main.rs"],
+    crate_name = "modplay",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+    deps = [":dosrt_lib"],
+)
+
+retro_lib(
+    name = "modplay_retro",
+    lib = ":modplay_lib",
+)
+
+genrule(
+    name = "modplay_elf",
+    srcs = [":modplay_retro", "modplay/modplay.ld"],
+    outs = ["modplay.elf"],
+    # --gc-sections: strip the unused dosrt/core bulk (same as rloader).
+    cmd = "ld -m elf_i386 --gc-sections -T $(location modplay/modplay.ld) -u _start $(location :modplay_retro) -o $@",
+)
+
+genrule(
+    name = "modplay_exe",
+    srcs = [":stub_exe", ":modplay_elf"],
+    outs = ["MODPLAY.EXE"],
+    cmd = "cat $(location :stub_exe) $(location :modplay_elf) > $@",
+    visibility = ["//visibility:public"],
+)

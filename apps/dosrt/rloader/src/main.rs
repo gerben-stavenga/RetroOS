@@ -14,14 +14,14 @@
 use dosrt::{dos, dpmi, putc, puthex32, puthex8, puts};
 use lib::elf::Elf;
 
-/// RLOADER's own crt. The stub built a 32-bit CODE selector over the
-/// RLOADER buffer (base = buf-0x1000) and far-called `_start` as
-/// `go(unsigned exh, unsigned long poff)`. Build a matching 32-bit DATA
-/// selector (alias of CS), load DS/ES, zero BSS, capture the far-call
-/// args off the stub's (still-current) 16-bit PM stack, switch to our
-/// own stack, then enter `rloader_main`. Register-only INT 31h until DS
-/// is valid. Distinct from a payload crt0: only RLOADER is handed a
-/// file handle.
+// RLOADER's own crt. The stub built a 32-bit CODE selector over the
+// RLOADER buffer (base = buf-0x1000) and far-called `_start` as
+// `go(unsigned exh, unsigned long poff)`. Build a matching 32-bit DATA
+// selector (alias of CS), load DS/ES, zero BSS, capture the far-call
+// args off the stub's (still-current) 16-bit PM stack, switch to our
+// own stack, then enter `rloader_main`. Register-only INT 31h until DS
+// is valid. Distinct from a payload crt0: only RLOADER is handed a
+// file handle.
 core::arch::global_asm!(
     ".section .text._start,\"ax\"",
     ".code32",
@@ -133,7 +133,12 @@ extern "C" fn rloader_main() -> ! {
     {
         let handle = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HOFF_H)) };
         let poff = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HOFF_OFF)) };
-        static mut ELFBUF: [u8; 0x2000] = [0; 0x2000];
+        // Holds the whole payload ELF *file* (headers + filesz, not the
+        // BSS memsz). modplay.elf ≈ 13 KB; 16 KB fits with margin. Must
+        // stay small: RLOADER's image+BSS+stack must fit the stub's
+        // ~56 KB small-model buffer (a too-big ELFBUF overran it and
+        // corrupted the stub stack / handoff args).
+        static mut ELFBUF: [u8; 0x4000] = [0; 0x4000];
         dos::lseek(handle, poff);
         let nread = {
             let eb = unsafe { &mut *core::ptr::addr_of_mut!(ELFBUF) };
@@ -295,9 +300,9 @@ fn load_and_run(segs: &[Seg], entry: u32) -> ! {
     unsafe { enter_payload(code as u32, data as u32, sp_top, entry) }
 }
 
-/// Final far-transfer into the payload. A real asm symbol (cdecl args on
-/// RLOADER's stack), NOT inline asm in a Rust fn — so the SS:ESP switch
-/// and `retf` can't poison optimizer codegen for the loader.
+// Final far-transfer into the payload. A real asm symbol (cdecl args on
+// RLOADER's stack), NOT inline asm in a Rust fn — so the SS:ESP switch
+// and `retf` can't poison optimizer codegen for the loader.
 core::arch::global_asm!(
     ".section .text._enter_payload,\"ax\"",
     ".code32",

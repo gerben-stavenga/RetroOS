@@ -137,16 +137,39 @@ pub mod dpmi {
         if cf & 1 != 0 { None } else { Some(((bx as u32) << 16) | cx as u32) }
     }
 
-    /// INT 31h AX=0300: simulate a real-mode interrupt. `r` is filled
-    /// by the caller (RM register frame) and updated with results.
-    /// ES:EDI points the host at the RMCS (PM memory — ES already = DS
-    /// from crt0; EDI = the struct's address in our flat data).
+    /// INT 31h AX=0100: allocate a DOS (conventional, <1 MB) memory
+    /// block. `paras` = 16-byte paragraphs. Returns `(rm_segment,
+    /// pm_selector)` — the segment for real-mode INT 21h pointers, the
+    /// selector to access the block from protected mode. The 8237/INT 21h
+    /// transfer buffer MUST come from here: a payload's own image is
+    /// AX=0501 (extended) memory, not real-mode addressable.
+    pub fn alloc_dos_mem(paras: u16) -> Option<(u16, u16)> {
+        let (ax, dx): (u16, u16);
+        let cf: u16;
+        unsafe {
+            core::arch::asm!(
+                "int 0x31",
+                "setc cl",                 // CF -> CL (CX captured as u16)
+                in("ax") 0x0100u16, in("bx") paras,
+                lateout("ax") ax, lateout("dx") dx, out("cx") cf,
+                clobber_abi("C"),
+            );
+        }
+        if cf & 1 != 0 { None } else { Some((ax, dx)) }
+    }
+
+    /// INT 31h AX=0300: simulate a real-mode interrupt. `r` is the RMCS,
+    /// pointed at by `ES:EDI`. Do NOT assume a global `ES == DS` invariant
+    /// — any code that touched ES (e.g. the conv-buffer copy) would break
+    /// this. Set `ES = DS` here, at the single point that needs it.
     pub fn sim_int(int_no: u8, r: &mut Rmcs) {
         let p = r as *mut Rmcs as u32;
         unsafe {
             // edi can't be an asm operand (LLVM-reserved) — load it
-            // inside. ES already = DS (crt0), so ES:EDI -> RMCS.
+            // inside. Force ES = DS so ES:EDI -> the RMCS in our data.
             core::arch::asm!(
+                "push ds",                // ES = DS without a GP reg — a
+                "pop es",                 //   scratch could clobber {p}
                 "mov edi, {p:e}",
                 "int 0x31",
                 p = in(reg) p,
@@ -160,42 +183,60 @@ pub mod dpmi {
     }
 }
 
-/// dosrt libc: DOS file I/O via INT 21h through `dpmi::sim_int` + one
-/// conventional transfer buffer (a static; its real-mode seg:off is
-/// derived from DS's linear base). Reusable by RLOADER and payloads.
+/// dosrt libc: DOS file I/O via INT 21h through `dpmi::sim_int`. The
+/// pointer-passing transfer buffer is a *real conventional* DOS block
+/// (DPMI AX=0100), lazily allocated on first use — a payload's own image
+/// is AX=0501 extended memory and is NOT real-mode addressable, so the
+/// old "derive seg:off from DS base" trick only worked for conventional
+/// clients (RLOADER) and produced a garbage pointer for real payloads.
 pub mod dos {
     use super::dpmi::{self, Rmcs};
 
-    const XFER_LEN: usize = 4096;
-    static mut XFER: [u8; XFER_LEN] = [0; XFER_LEN];
+    const XFER_PARAS: u16 = 256;                 // 256 * 16 = 4096 bytes
+    const XFER_LEN: usize = XFER_PARAS as usize * 16;
+    static mut XFER_SEG: u16 = 0;                 // RM segment (0 = unalloc)
 
-    /// (real-mode segment, offset) of XFER. off < 16.
-    fn xfer_segoff() -> (u16, u16) {
-        let xb = core::ptr::addr_of_mut!(XFER) as u32;
-        let lin = dpmi::seg_base(dpmi::ds_sel()) + xb;
-        ((lin >> 4) as u16, (lin & 0x0F) as u16)
+    /// Lazily allocate the conventional transfer block (AX=0100). We only
+    /// need its real-mode segment for the INT 21h `DS:DX` pointer — our
+    /// own selectors are flat (RLOADER 1 MB, payload 4 GB), so the
+    /// block's linear address is directly reachable from our DS.
+    fn xfer_seg() -> u16 {
+        unsafe {
+            if XFER_SEG == 0 {
+                let (seg, _sel) = dpmi::alloc_dos_mem(XFER_PARAS)
+                    .expect("dosrt: AX=0100 conv buffer");
+                XFER_SEG = seg;
+            }
+            XFER_SEG
+        }
     }
-    fn xfer_ptr() -> *mut u8 { core::ptr::addr_of_mut!(XFER) as *mut u8 }
+
+    /// A plain pointer, *in our own DS*, that aliases the conventional
+    /// block. Our selector is flat, so `linear == DS_base + offset` ⇒
+    /// `offset = conv_linear - DS_base` (mod 2^32); a normal
+    /// `copy_nonoverlapping` then reaches it — no second selector / asm.
+    fn conv_ptr(seg: u16) -> *mut u8 {
+        let conv_lin = (seg as u32) << 4;
+        let ds_base = dpmi::seg_base(dpmi::ds_sel());
+        conv_lin.wrapping_sub(ds_base) as *mut u8
+    }
 
     /// INT 21h AH=3Dh open, AL=0 read-only. `path` must be NUL-terminated.
     pub fn open(path: &[u8]) -> Option<u16> {
-        let (seg, off) = xfer_segoff();
-        unsafe {
-            let xb = xfer_ptr();
-            let mut i = 0;
-            while i < path.len() && i < XFER_LEN { *xb.add(i) = path[i]; i += 1; }
-        }
+        let seg = xfer_seg();
+        let n = core::cmp::min(path.len(), XFER_LEN);
+        unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), conv_ptr(seg), n); }
         let mut r = Rmcs::default();
         r.eax = 0x3D00;
-        r.ds = seg; r.edx = off as u32;
+        r.ds = seg; r.edx = 0;                     // DS:DX -> conv block
         dpmi::sim_int(0x21, &mut r);
-        let cf = r.flags & 1;
-        if cf != 0 { None } else { Some(r.eax as u16) }
+        if r.flags & 1 != 0 { None } else { Some(r.eax as u16) }
     }
 
-    /// INT 21h AH=3Fh read, chunked through XFER. Returns bytes read.
+    /// INT 21h AH=3Fh read, chunked through the conv block. Bytes read.
     pub fn read(handle: u16, buf: &mut [u8]) -> usize {
-        let (seg, off) = xfer_segoff();
+        let seg = xfer_seg();
+        let cp = conv_ptr(seg);
         let mut done = 0usize;
         while done < buf.len() {
             let want = core::cmp::min(buf.len() - done, XFER_LEN) as u16;
@@ -203,15 +244,13 @@ pub mod dos {
             r.eax = 0x3F00;
             r.ebx = handle as u32;
             r.ecx = want as u32;
-            r.ds = seg; r.edx = off as u32;
+            r.ds = seg; r.edx = 0;
             dpmi::sim_int(0x21, &mut r);
             if r.flags & 1 != 0 { break; }            // CF -> error
             let got = r.eax as u16 as usize;
             if got == 0 { break; }                    // EOF
             unsafe {
-                let xb = xfer_ptr();
-                let mut i = 0;
-                while i < got { buf[done + i] = *xb.add(i); i += 1; }
+                core::ptr::copy_nonoverlapping(cp, buf.as_mut_ptr().add(done), got);
             }
             done += got;
             if got < want as usize { break; }         // short read = EOF
