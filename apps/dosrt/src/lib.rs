@@ -158,6 +158,29 @@ pub mod dpmi {
         if cf & 1 != 0 { None } else { Some((ax, dx)) }
     }
 
+    /// INT 31h AX=0205: install a PM hardware-interrupt handler at
+    /// vector `vec`. `sel:offset` is our handler. Returns Ok on success
+    /// (CF=0); Err(ax) on failure.
+    pub fn set_pm_int(vec: u8, sel: u16, offset: u32) -> Result<(), u16> {
+        let ax: u16;
+        let cf: u16;
+        unsafe {
+            core::arch::asm!(
+                "mov edx, {off:e}",   // EDX = handler offset
+                "int 0x31",
+                "setc dl",            // DL = CF (DX captured as u16)
+                off = in(reg) offset,
+                in("ax") 0x0205u16,
+                in("bx") vec as u16,  // BL = interrupt #, BH = 0
+                in("cx") sel,
+                lateout("ax") ax,
+                lateout("dx") cf,
+                clobber_abi("C"),
+            );
+        }
+        if cf & 1 != 0 { Err(ax) } else { Ok(()) }
+    }
+
     /// INT 31h AX=0300: simulate a real-mode interrupt. `r` is the RMCS,
     /// pointed at by `ES:EDI`. Do NOT assume a global `ES == DS` invariant
     /// — any code that touched ES (e.g. the conv-buffer copy) would break
@@ -341,11 +364,21 @@ core::arch::global_asm!(
     ".code32",
     ".globl _start",
     "_start:",
+    "mov ax, ds",               // stash our data sel so PM ISRs can
+    "mov [OUR_DS], ax",         //   reach it via cs:[OUR_DS] (CS&DS
+                                //   share base in our flat setup)
     "push esi",                 // arg_lin → rt_entry(arg_lin)
     "call rt_entry",
     "1: hlt",
     "jmp 1b",
 );
+
+/// Our data selector, captured by `_start`. PM ISRs (which enter with
+/// DS/ES undefined per DPMI HW-IRQ delivery) load DS/ES from
+/// `cs:[OUR_DS]` — our CS and DS share base, so a CS-relative read of
+/// this symbol resolves to the same linear address as a DS-relative one.
+#[unsafe(no_mangle)]
+pub static mut OUR_DS: u16 = 0;
 
 unsafe extern "Rust" {
     fn app_main(argc: usize, argv: &[&[u8]]);
