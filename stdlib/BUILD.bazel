@@ -35,6 +35,15 @@ rust_library(
         "-Cpanic=abort",
         "-Copt-level=z",
         "-Cforce-frame-pointers=yes",
+        # Match rustc bootstrap's std build:
+        "-Zforce-unstable-if-unmarked",
+        # Don't export this crate's generic monomorphizations for downstream
+        # share-generics. Cross-crate shared monos pulled into alloc-rooted
+        # calls confused rustc's alias analysis enough that downstream code
+        # (e.g. modplay's `mix.pcm_buffer.copy_within(...)`) read a stale
+        # spilled `pcm_buffer_pos` instead of the live static — the
+        # "extern-crate-alloc breaks copy_within" symptom.
+        "-Zshare-generics=no",
     ],
     deps = [":core_internal", ":compiler_builtins_internal"],
     tags = ["manual"],
