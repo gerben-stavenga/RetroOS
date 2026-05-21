@@ -221,58 +221,55 @@ mod sb {
 }
 
 // ============================================================================
-// `Sample` trait + concrete `Mono` / `Stereo` types.
+// `Sample` trait + concrete on-wire DMA frame types.
 //
-// The mixer always produces L/R stereo (i16, i16) for every frame. The
-// `Sample` trait describes how to fold that into the actual on-wire DMA
-// frame format for one of {Mono, Stereo} × {8-bit, 16-bit}.
+// Each Sample IS the literal byte layout the DSP/DMA consumes — the DMA
+// ring is `[S]`, and `pcm[i] = S::from(left, right)` writes the correct
+// bytes directly. `#[repr(C)]` / `#[repr(transparent)]` pins the layout.
+//
+//   Mono8    : 1 byte  unsigned          (DSP cmd 0x1C / 0xC6 mode 0x00)
+//   Stereo8  : 2 bytes unsigned L,R      (DSP cmd 0xC6 mode 0x20)
+//   Mono16   : 1 i16   signed LE         (DSP cmd 0xB6 mode 0x10)
+//   Stereo16 : 2 i16   signed LE L,R     (DSP cmd 0xB6 mode 0x30)
+//
+// The mod renderer always produces stereo L/R i16; `from(left, right)`
+// folds that into the right wire format (mono = L+R; stereo = identity).
 // ============================================================================
 
 trait Sample: Copy + Default {
-    const CHANNELS: usize;
-    /// Combine an L/R stereo pair into the final per-frame sample.
-    fn from_stereo(left: i16, right: i16) -> Self;
-    /// Write self into the on-wire byte stream. `dst.len()` must equal
-    /// `CHANNELS * (if bit16 { 2 } else { 1 })`.
-    fn write(self, dst: &mut [u8], bit16: bool);
+    fn from(left: i16, right: i16) -> Self;
 }
 
 #[derive(Clone, Copy, Default)]
-struct Mono(i16);
-
-impl Sample for Mono {
-    const CHANNELS: usize = 1;
-    /// Mono down-mix: L + R sum (no divide). Saturating so the i16 wraps
-    /// behave cleanly when one side maxes out from a four-channel stack.
-    fn from_stereo(l: i16, r: i16) -> Self { Mono(l.saturating_add(r)) }
-    fn write(self, dst: &mut [u8], bit16: bool) {
-        if bit16 {
-            let u = self.0 as u16;
-            dst[0] = u as u8;
-            dst[1] = (u >> 8) as u8;
-        } else {
-            dst[0] = (((self.0 >> 8) as i32) + 0x80) as u8;
-        }
-    }
-}
+#[repr(transparent)]
+struct Mono8(u8);
 
 #[derive(Clone, Copy, Default)]
-struct Stereo { l: i16, r: i16 }
+#[repr(C)]
+struct Stereo8 { l: u8, r: u8 }
 
-impl Sample for Stereo {
-    const CHANNELS: usize = 2;
-    fn from_stereo(l: i16, r: i16) -> Self { Stereo { l, r } }
-    fn write(self, dst: &mut [u8], bit16: bool) {
-        if bit16 {
-            let ul = self.l as u16;
-            let ur = self.r as u16;
-            dst[0] = ul as u8; dst[1] = (ul >> 8) as u8;
-            dst[2] = ur as u8; dst[3] = (ur >> 8) as u8;
-        } else {
-            dst[0] = (((self.l >> 8) as i32) + 0x80) as u8;
-            dst[1] = (((self.r >> 8) as i32) + 0x80) as u8;
-        }
-    }
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct Mono16(i16);
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Stereo16 { l: i16, r: i16 }
+
+/// 16-bit signed i16 → 8-bit unsigned: drop the low byte, bias to 0x80.
+#[inline(always)] fn to_u8(v: i16) -> u8 { (((v >> 8) as i32) + 0x80) as u8 }
+
+impl Sample for Mono8 {
+    fn from(l: i16, r: i16) -> Self { Mono8(to_u8(l.saturating_add(r))) }
+}
+impl Sample for Stereo8 {
+    fn from(l: i16, r: i16) -> Self { Stereo8 { l: to_u8(l), r: to_u8(r) } }
+}
+impl Sample for Mono16 {
+    fn from(l: i16, r: i16) -> Self { Mono16(l.saturating_add(r)) }
+}
+impl Sample for Stereo16 {
+    fn from(l: i16, r: i16) -> Self { Stereo16 { l, r } }
 }
 
 // ============================================================================
@@ -462,13 +459,19 @@ const NSEG: usize = NSAMP / SEGSZ as usize;
 /// Global SB instance (populated by `app_main`). The ISR reads it.
 static mut SB: sb::SoundBlaster = sb::SoundBlaster::EMPTY;
 /// Shared ISR↔main state. Audio functions take borrows; the statics are
-/// the rendezvous.
+/// the rendezvous. The ring base pointer is type-erased; the ISR re-casts
+/// to `*mut S` for the active Sample type via the 2×2 dispatch grid.
 static mut MODULE: Module = Module::EMPTY;
 static mut MIXER: Mixer = Mixer::new();
 static mut ISR_RING: *mut u8 = core::ptr::null_mut();
-static mut ISR_RING_BYTES: usize = 0;
 static mut ISR_NEXT_FILL: usize = 0;
 static mut ISR_IRQS: u32 = 0;
+
+/// Reinterpret the type-erased ring as a typed sample slice.
+#[inline] unsafe fn ring_as<S: Sample>() -> &'static mut [S] {
+    let p = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_RING)) };
+    unsafe { core::slice::from_raw_parts_mut(p as *mut S, NSAMP) }
+}
 
 /// Convert the 8237's current down-count to a segment index.
 fn current_play_seg(sb: &sb::SoundBlaster) -> usize {
@@ -478,14 +481,13 @@ fn current_play_seg(sb: &sb::SoundBlaster) -> usize {
     (played / sb.channels()) / SEGSZ as usize
 }
 
-/// Top up the L/R mixer until it has at least `n_frames` of pending audio,
-/// then drain that many frames into the on-wire byte stream `seg`, then
+/// Top up the L/R mixer until it has at least `seg.len()` frames of
+/// pending audio, then write `seg[i] = S::from(left[i], right[i])`, then
 /// shift the rest forward.
 fn fill_segment<S: Sample>(
-    module: &Module, mix: &mut Mixer, seg: &mut [u8], bit16: bool,
+    module: &Module, mix: &mut Mixer, seg: &mut [S],
 ) {
-    let bpf = S::CHANNELS * if bit16 { 2 } else { 1 };
-    let n_frames = seg.len() / bpf;
+    let n_frames = seg.len();
     while mix.pcm_buffer_pos < n_frames {
         let lo = mix.pcm_buffer_pos;
         let hi = lo + ROW_SAMPLES;
@@ -495,8 +497,7 @@ fn fill_segment<S: Sample>(
         mix.pcm_buffer_pos += ROW_SAMPLES;
     }
     for i in 0..n_frames {
-        let s = S::from_stereo(mix.left[i], mix.right[i]);
-        s.write(&mut seg[i * bpf..(i + 1) * bpf], bit16);
+        seg[i] = S::from(mix.left[i], mix.right[i]);
     }
     mix.left.copy_within(n_frames..mix.pcm_buffer_pos, 0);
     mix.right.copy_within(n_frames..mix.pcm_buffer_pos, 0);
@@ -504,13 +505,12 @@ fn fill_segment<S: Sample>(
 }
 
 fn fill_ring_to<S: Sample>(
-    module: &Module, mix: &mut Mixer, ring: &mut [u8],
-    next_fill: &mut usize, target: usize, bit16: bool,
+    module: &Module, mix: &mut Mixer, ring: &mut [S],
+    next_fill: &mut usize, target: usize,
 ) {
-    let seg_bytes = SEGSZ as usize * S::CHANNELS * if bit16 { 2 } else { 1 };
     while *next_fill != target {
-        let b = *next_fill * seg_bytes;
-        fill_segment::<S>(module, mix, &mut ring[b..b + seg_bytes], bit16);
+        let b = *next_fill * SEGSZ as usize;
+        fill_segment::<S>(module, mix, &mut ring[b..b + SEGSZ as usize]);
         *next_fill = (*next_fill + 1) % NSEG;
     }
 }
@@ -527,17 +527,13 @@ unsafe extern "C" fn sb_isr_body() {
 
     let module: &Module = unsafe { &*core::ptr::addr_of!(MODULE) };
     let mix: &mut Mixer = unsafe { &mut *core::ptr::addr_of_mut!(MIXER) };
-    let ring_ptr =
-        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_RING)) };
-    let ring_bytes =
-        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_RING_BYTES)) };
-    let ring = unsafe { core::slice::from_raw_parts_mut(ring_ptr, ring_bytes) };
     let mut nf = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_NEXT_FILL)) };
     let target = current_play_seg(sb);
-    if sb.stereo {
-        fill_ring_to::<Stereo>(module, mix, ring, &mut nf, target, sb.bit16);
-    } else {
-        fill_ring_to::<Mono>(module, mix, ring, &mut nf, target, sb.bit16);
+    match (sb.bit16, sb.stereo) {
+        (false, false) => fill_ring_to::<Mono8>(module, mix, unsafe { ring_as::<Mono8>() }, &mut nf, target),
+        (false, true)  => fill_ring_to::<Stereo8>(module, mix, unsafe { ring_as::<Stereo8>() }, &mut nf, target),
+        (true,  false) => fill_ring_to::<Mono16>(module, mix, unsafe { ring_as::<Mono16>() }, &mut nf, target),
+        (true,  true)  => fill_ring_to::<Stereo16>(module, mix, unsafe { ring_as::<Stereo16>() }, &mut nf, target),
     }
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), nf) };
 }
@@ -649,29 +645,30 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
         Some((s, _)) => s,
         None => { puts(" ring FAIL\r\n"); dos::exit(1); }
     };
-    let ring = unsafe {
-        core::slice::from_raw_parts_mut(dosrt::conv_flat_ptr(seg), ring_bytes)
-    };
-    // Pre-fill the whole ring as 16 back-to-back DMA segments.
+    // Type-erased ring base; we re-cast to `[S]` for the active sample type.
+    let ring_ptr = dosrt::conv_flat_ptr(seg);
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_RING), ring_ptr);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_IRQS), 0);
+    }
+    // Pre-fill the whole ring as `NSEG` back-to-back segments. One match
+    // picks the right Sample type for the entire bring-up.
     {
         let module: &Module = unsafe { &*core::ptr::addr_of!(MODULE) };
         let mix: &mut Mixer = unsafe { &mut *core::ptr::addr_of_mut!(MIXER) };
-        let seg_bytes = SEGSZ as usize * sb.frame_bytes();
-        for s in 0..NSEG {
-            let b = s * seg_bytes;
-            if sb.stereo {
-                fill_segment::<Stereo>(module, mix, &mut ring[b..b + seg_bytes], sb.bit16);
-            } else {
-                fill_segment::<Mono>(module, mix, &mut ring[b..b + seg_bytes], sb.bit16);
+        fn prime<S: Sample>(module: &Module, mix: &mut Mixer, ring: &mut [S]) {
+            for s in 0..NSEG {
+                let b = s * SEGSZ as usize;
+                fill_segment::<S>(module, mix, &mut ring[b..b + SEGSZ as usize]);
             }
         }
-    }
-
-    unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_RING), ring.as_mut_ptr());
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_RING_BYTES), ring_bytes);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_IRQS), 0);
+        match (sb.bit16, sb.stereo) {
+            (false, false) => prime::<Mono8>(module, mix, unsafe { ring_as::<Mono8>() }),
+            (false, true)  => prime::<Stereo8>(module, mix, unsafe { ring_as::<Stereo8>() }),
+            (true,  false) => prime::<Mono16>(module, mix, unsafe { ring_as::<Mono16>() }),
+            (true,  true)  => prime::<Stereo16>(module, mix, unsafe { ring_as::<Stereo16>() }),
+        }
     }
 
     // Install the PM HW-IRQ handler (only in IRQ mode).
@@ -702,10 +699,11 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
         let mut next_fill: usize = 0;
         loop {
             let target = current_play_seg(sb);
-            if sb.stereo {
-                fill_ring_to::<Stereo>(module, mix, ring, &mut next_fill, target, sb.bit16);
-            } else {
-                fill_ring_to::<Mono>(module, mix, ring, &mut next_fill, target, sb.bit16);
+            match (sb.bit16, sb.stereo) {
+                (false, false) => fill_ring_to::<Mono8>(module, mix, unsafe { ring_as::<Mono8>() }, &mut next_fill, target),
+                (false, true)  => fill_ring_to::<Stereo8>(module, mix, unsafe { ring_as::<Stereo8>() }, &mut next_fill, target),
+                (true,  false) => fill_ring_to::<Mono16>(module, mix, unsafe { ring_as::<Mono16>() }, &mut next_fill, target),
+                (true,  true)  => fill_ring_to::<Stereo16>(module, mix, unsafe { ring_as::<Stereo16>() }, &mut next_fill, target),
             }
         }
     } else {
