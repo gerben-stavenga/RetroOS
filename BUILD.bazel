@@ -98,6 +98,7 @@ _EXTRA_FILES = {
     # No build cycle: `image_min` (used to build the stub) uses
     # _MIN_EXTRA_FILES below, not these.
     "//apps/tests/modplay:modplay_exe":     "TESTS/MODPLAY.EXE",
+    "//apps/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
     "//apps/dosrt:rloader_bin":             "TESTS/RLOADER.BIN",
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).
     # Standalone-shell mode dispatches applets via basename(argv[0]); the

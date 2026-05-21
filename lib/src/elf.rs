@@ -305,6 +305,12 @@ pub struct Segment<'a> {
     pub memsz: usize,
     pub flags: u32,
     pub data: Option<&'a [u8]>,
+    /// Raw `p_offset` / `p_filesz` from the program header. Loaders that
+    /// stream the payload from disk (e.g. RLOADER's headers-only buffer)
+    /// need these even when `data` is `None` because the file content
+    /// lives outside the buffer they parsed.
+    pub file_offset: usize,
+    pub filesz: usize,
 }
 
 impl Segment<'_> {
@@ -351,7 +357,10 @@ impl<'a> Iterator for SegmentIter<'a> {
                     None
                 };
 
-                return Some(Segment { vaddr, paddr, memsz, flags, data: file_data });
+                return Some(Segment {
+                    vaddr, paddr, memsz, flags, data: file_data,
+                    file_offset: off, filesz,
+                });
             }
         }
         None

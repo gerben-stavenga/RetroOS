@@ -48,9 +48,9 @@ core::arch::global_asm!(
     "mov cx, 0x000f",
     "mov dx, 0xffff",
     "int 0x31",
-    "mov ax, 0x0009",                   // access: 32-bit data, P, DPL3, RW
-    "mov bx, bp",
-    "mov cx, 0x40f2",
+    "mov ax, 0x0009",                   // access: 32-bit data, P, DPL3, RW,
+    "mov bx, bp",                       //   G=1 so limit 0xFFFFF means 4 GB
+    "mov cx, 0xC0f2",                   //   (CWSDPMI: high byte clobbers G).
     "int 0x31",
     "mov ax, bp",                       // DS/ES = data sel; keep sel in EBX
     "mov ds, ax",
@@ -136,17 +136,17 @@ extern "C" fn rloader_main() -> ! {
 
     // Pull the appended payload ELF out of our own .EXE. The stub
     // open()ed the .EXE and far-called us as go(exh, poff); crt0 captured
-    // those args into HOFF_H / HOFF_OFF. lseek+read it, parse via
-    // lib::elf.
+    // those args into HOFF_H / HOFF_OFF. Read only the ELF + program
+    // headers into a tiny buffer; the PT_LOAD bytes are streamed directly
+    // into the payload's allocation in `load_and_run`.
     {
         let handle = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HOFF_H)) };
         let poff = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HOFF_OFF)) };
-        // Holds the whole payload ELF *file* (headers + filesz, not the
-        // BSS memsz). modplay.elf ≈ 13 KB; 16 KB fits with margin. Must
-        // stay small: RLOADER's image+BSS+stack must fit the stub's
-        // ~56 KB small-model buffer (a too-big ELFBUF overran it and
-        // corrupted the stub stack / handoff args).
-        static mut ELFBUF: [u8; 0x4000] = [0; 0x4000];
+        // Just headers — ELF header + program headers fit comfortably in
+        // 1 KB. Payload section bytes are read straight into their final
+        // home by `load_and_run`, so this buffer's size doesn't scale
+        // with payload size.
+        static mut ELFBUF: [u8; 0x400] = [0; 0x400];
         dos::lseek(handle, poff);
         let nread = {
             let eb = unsafe { &mut *core::ptr::addr_of_mut!(ELFBUF) };
@@ -159,13 +159,9 @@ extern "C" fn rloader_main() -> ! {
         puts(" n=");
         puthex32(nread as u32);
 
-        // Snapshot the program headers into plain Copy locals *before*
-        // any DPMI/selector/asm work. Holding the `Elf` borrow (which
-        // raw-casts into the `static mut ELFBUF`) live across the inline
-        // asm that touches memory the compiler can't model is aliasing
-        // UB — under -Oz it let the optimizer reorder the pure size math
-        // (the `sz=0x50` instability). `src` is a linear addr into the
-        // (still-live) static; the copy reads it via raw asm, no borrow.
+        // Snapshot program headers into plain Copy locals; the parsed
+        // `Elf` borrows `ELFBUF`, which we let drop before re-using the
+        // disk for the streaming PT_LOAD reads.
         let mut segs = [Seg::default(); MAX_SEG];
         let mut nseg = 0usize;
         let entry;
@@ -181,8 +177,8 @@ extern "C" fn rloader_main() -> ! {
                 segs[nseg] = Seg {
                     vaddr: s.vaddr as u32,
                     memsz: s.memsz as u32,
-                    src: s.data.map(|d| d.as_ptr() as u32).unwrap_or(0),
-                    fsz: s.data.map(|d| d.len() as u32).unwrap_or(0),
+                    foff: poff + s.file_offset as u32,
+                    fsz: s.filesz as u32,
                 };
                 nseg += 1;
             }
@@ -197,27 +193,27 @@ extern "C" fn rloader_main() -> ! {
         puthex32(segs[0].memsz);
         puts(" f=");
         puthex32(segs[0].fsz);
-        puts(" s=");
-        puthex32(segs[0].src);
         puts("\r\n");
-        load_and_run(&segs[..nseg], entry);
+        load_and_run(handle, &segs[..nseg], entry);
     }
 }
 
 /// One PT_LOAD, snapshotted to plain Copy locals (no `Elf`/`static mut`
-/// borrow held across the loader's inline asm). `src` is the linear
-/// address of the file bytes inside our still-live ELF buffer.
+/// borrow held across the loader's later disk reads / inline asm).
+/// `foff` is the absolute file offset of the segment's filesz bytes;
+/// `fsz` is the filesz; `memsz - fsz` is the BSS tail to zero.
 #[derive(Clone, Copy, Default)]
-struct Seg { vaddr: u32, memsz: u32, src: u32, fsz: u32 }
+struct Seg { vaddr: u32, memsz: u32, foff: u32, fsz: u32 }
 
 const MAX_SEG: usize = 8;
 
-/// Give the payload its own DPMI memory + selectors, copy PT_LOADs, zero
-/// BSS, then far-jump its entry. The selector base = alloc_lin -
-/// min_vaddr (selector-base trick) so the payload's link addresses
-/// resolve verbatim; limit is flat 4 GB. Never returns.
+/// Give the payload its own DPMI memory + selectors, stream each PT_LOAD
+/// from disk straight into its destination, zero BSS, then far-jump the
+/// entry. The selector base = alloc_lin - min_vaddr (selector-base trick)
+/// so the payload's link addresses resolve verbatim; limit is flat 4 GB.
+/// Never returns.
 #[inline(never)]
-fn load_and_run(segs: &[Seg], entry: u32) -> ! {
+fn load_and_run(handle: u16, segs: &[Seg], entry: u32) -> ! {
     // Span [min_vaddr, max_end) over all PT_LOADs.
     let mut min_v = u32::MAX;
     let mut max_e = 0u32;
@@ -246,8 +242,10 @@ fn load_and_run(segs: &[Seg], entry: u32) -> ! {
         dpmi::set_base(s, base);
         dpmi::set_limit(s, 0xFFFF_FFFF);
     }
-    dpmi::set_ar(code, 0x40FA);          // 32-bit code, P, DPL3, exec/read
-    dpmi::set_ar(data, 0x40F2);          // 32-bit data, P, DPL3, RW
+    // G=1 so the limit-field 0xFFFFF set above means 4 GB - 1, not 1 MB - 1.
+    // (Our DPMI host's AX=0009 clobbers the G bit set by AX=0008.)
+    dpmi::set_ar(code, 0xC0FA);          // 32-bit code, P, DPL3, exec/read, G=1
+    dpmi::set_ar(data, 0xC0F2);          // 32-bit data, P, DPL3, RW, G=1
 
     puts("dosrt: load lin=");
     puthex32(lin);
@@ -257,44 +255,24 @@ fn load_and_run(segs: &[Seg], entry: u32) -> ! {
     puthex32(base);
     puts("\r\n");
 
-    // Copy each PT_LOAD into the payload image (dest = data:p_vaddr,
-    // src = our ELF buffer, addressed via DS), then zero the BSS tail.
-    // ES = payload data selector for the duration; DS stays ours.
+    // Stream each PT_LOAD straight from disk into payload memory.
+    // RLOADER's own DS is 4 GB-flat (crt0 bumped it), so we can dereference
+    // a linear address as a plain `*mut u8` after subtracting our DS base.
+    let ds_base = dpmi::seg_base(dpmi::ds_sel());
     for s in segs {
-        let dst = s.vaddr;                    // selector-relative offset
+        let dst_lin = lin + (s.vaddr - min_v);
+        let dst = dst_lin.wrapping_sub(ds_base) as *mut u8;
         if s.fsz != 0 {
-            unsafe {
-                core::arch::asm!(
-                    "push esi",              // esi can't even be a clobber
-                    "mov es, {sel:x}",       //   (LLVM-reserved) — save it
-                    "mov esi, {src:e}",
-                    "mov edi, {dst:e}",
-                    "cld",
-                    "rep movsb",             // ES:EDI <- DS:ESI (DS = ours)
-                    "pop esi",
-                    sel = in(reg) data,
-                    src = in(reg) s.src,
-                    dst = in(reg) dst,
-                    in("ecx") s.fsz,
-                    out("edi") _, lateout("ecx") _,
-                );
-            }
+            dos::lseek(handle, s.foff);
+            let dst_slice = unsafe {
+                core::slice::from_raw_parts_mut(dst, s.fsz as usize)
+            };
+            let n = dos::read(handle, dst_slice);
+            if n != s.fsz as usize { puts("dosrt: short read\r\n"); hang(); }
         }
         let zbytes = s.memsz - s.fsz;
         if zbytes != 0 {
-            unsafe {
-                core::arch::asm!(
-                    "mov es, {sel:x}",       // ES = payload data sel
-                    "mov edi, {dst:e}",      // edi LLVM-reserved as operand
-                    "cld",
-                    "xor al, al",
-                    "rep stosb",             // zero ES:EDI (BSS tail)
-                    sel = in(reg) data,
-                    dst = in(reg) dst + s.fsz,
-                    in("ecx") zbytes,
-                    out("edi") _, lateout("ecx") _, out("al") _,
-                );
-            }
+            unsafe { core::ptr::write_bytes(dst.add(s.fsz as usize), 0, zbytes as usize); }
         }
     }
 
