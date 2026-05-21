@@ -170,11 +170,46 @@ pub type SectionHeader = SectionHeader32;
 
 /// Program header types
 pub const PT_LOAD: u32 = 1;
+pub const PT_DYNAMIC: u32 = 2;
 
 /// Program header flags
 pub const PF_EXEC: u32 = 1;
 pub const PF_WRITE: u32 = 2;
 pub const PF_READ: u32 = 4;
+
+// =============================================================================
+// Dynamic section (PIE relocations)
+// =============================================================================
+
+/// `.dynamic` tags we care about for static PIE — REL on i386 is non-addend.
+pub const DT_NULL: i32 = 0;
+pub const DT_REL: i32 = 17;
+pub const DT_RELSZ: i32 = 18;
+pub const DT_RELENT: i32 = 19;
+
+/// `Elf32_Dyn` (8 bytes): one entry of the .dynamic table.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Elf32Dyn {
+    pub tag: i32,
+    pub val: u32,
+}
+
+/// `Elf32_Rel` (8 bytes): one i386 REL relocation. `r_info` packs symbol
+/// index and type: `sym = r_info >> 8`, `type = r_info & 0xFF`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Elf32Rel {
+    pub r_offset: u32,
+    pub r_info: u32,
+}
+
+impl Elf32Rel {
+    pub fn r_type(&self) -> u8 { self.r_info as u8 }
+}
+
+/// i386 relocation types — we only handle the one PIE static-link emits.
+pub const R_386_RELATIVE: u8 = 8;
 
 /// ELF parse error
 #[derive(Debug)]
@@ -272,9 +307,45 @@ impl<'a> Elf<'a> {
         }
     }
 
-    /// Iterate over loadable program segments
-    pub fn segments(&self) -> SegmentIter<'a> {
-        let (offset, size, count) = match self.class {
+    /// Locate the `PT_DYNAMIC` program header, if any. Returns the
+    /// `.dynamic` table's `(vaddr, memsz)` — both relative to the ELF's
+    /// link base. A non-PIE executable has no `PT_DYNAMIC` and returns
+    /// `None`. Streaming loaders read the table back out of the loaded
+    /// image (it always lands inside a `PT_LOAD`).
+    pub fn dynamic(&self) -> Option<(usize, usize)> {
+        let (offset, size, count) = self.ph_table();
+        for i in 0..count {
+            let ph_start = offset + i * size;
+            let (typ, vaddr, memsz) = match self.class {
+                ElfClass::Elf32 => {
+                    if ph_start + core::mem::size_of::<ProgramHeader32>() > self.data.len() {
+                        continue;
+                    }
+                    let ph = unsafe {
+                        &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader32)
+                    };
+                    (ph.typ, ph.vaddr as usize, ph.memsz as usize)
+                }
+                ElfClass::Elf64 => {
+                    if ph_start + core::mem::size_of::<ProgramHeader64>() > self.data.len() {
+                        continue;
+                    }
+                    let ph = unsafe {
+                        &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader64)
+                    };
+                    (ph.typ, ph.vaddr as usize, ph.memsz as usize)
+                }
+            };
+            if typ == PT_DYNAMIC {
+                return Some((vaddr, memsz));
+            }
+        }
+        None
+    }
+
+    /// `(file offset, entry size, entry count)` of the program header table.
+    fn ph_table(&self) -> (usize, usize, usize) {
+        match self.class {
             ElfClass::Elf32 => {
                 let h = unsafe { &*(self.data.as_ptr() as *const ElfHeader32) };
                 (h.phoff as usize, h.phentsize as usize, h.phnum as usize)
@@ -283,7 +354,12 @@ impl<'a> Elf<'a> {
                 let h = unsafe { &*(self.data.as_ptr() as *const ElfHeader64) };
                 (h.phoff as usize, h.phentsize as usize, h.phnum as usize)
             }
-        };
+        }
+    }
+
+    /// Iterate over loadable program segments
+    pub fn segments(&self) -> SegmentIter<'a> {
+        let (offset, size, count) = self.ph_table();
         SegmentIter { data: self.data, class: self.class, offset, size, count, index: 0 }
     }
 }
