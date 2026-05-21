@@ -46,7 +46,7 @@ FXVolume         196
 ;
 ; Number of Voices
 ; 1 - 8
-NumVoices          4
+NumVoices          8
 
 ;
 ; Stereo or Mono
