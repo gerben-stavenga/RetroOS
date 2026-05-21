@@ -37,11 +37,30 @@ mod sb {
         while inb(WSTAT) & 0x80 != 0 {}
         outb(WSTAT, v);
     }
-    pub fn set_rate(srate: u32) {
+    pub fn read() -> u8 {
+        while inb(RSTAT) & 0x80 == 0 {}
+        inb(READ)
+    }
+    /// DSP cmd 0xE1: DSP version. Major .0, minor .1. SB16 ≥ 4.0.
+    pub fn version() -> (u8, u8) {
+        write(0xE1);
+        let major = read();
+        let minor = read();
+        (major, minor)
+    }
+    /// Legacy time-constant rate (SB1/SB2/SBPro, 8-bit DMA).
+    pub fn set_rate_8(srate: u32) {
         write(0xD1);                              // speaker on
         let tc = (256u32 - 1_000_000 / srate) as u8;
         write(0x40);
         write(tc);
+    }
+    /// SB16 16-bit output sample rate (cmd 0x41, hi/lo).
+    pub fn set_rate_16(srate: u32) {
+        write(0xD1);                              // speaker on (harmless on SB16)
+        write(0x41);
+        write((srate >> 8) as u8);
+        write(srate as u8);
     }
 }
 
@@ -281,10 +300,18 @@ impl Mixer {
 // ---- SB auto-init DMA, IRQ-driven --------------------------------------
 
 const NSAMP: usize = 4096;
-const SEGSZ: u16 = 256;
+const SEGSZ: u16 = 256;          // samples per DMA segment (8-bit AND 16-bit)
 const NSEG: usize = NSAMP / SEGSZ as usize;
 const SB_IRQ: u8 = 7;
 const SB_VEC: u8 = 0x0F; // master PIC IRQ7 default-mapped to INT 0x0F
+
+/// True when the DSP/DMA path is SB16 16-bit signed mono (ch5, DSP cmd
+/// 0xB6, ack via 0x22F). False = legacy 8-bit unsigned mono (ch1, DSP
+/// cmd 0x1C, ack via 0x22E). Set once in `app_main` from the `-16` arg
+/// and never written again; ISR reads it concurrently.
+static mut BIT16: bool = false;
+#[inline] fn bit16() -> bool { unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BIT16)) } }
+#[inline] fn bytes_per_sample() -> usize { if bit16() { 2 } else { 1 } }
 
 /// All ISR↔mainloop sharing happens through these statics; the audio
 /// functions themselves operate only on borrowed parameters.
@@ -294,36 +321,59 @@ static mut ISR_RING: *mut u8 = core::ptr::null_mut();
 static mut ISR_NEXT_FILL: usize = 0;
 static mut ISR_IRQS: u32 = 0;
 
-/// Sample 8237 ch1 current count → which segment the DSP is replaying.
+/// Sample the active 8237 channel's current count → which segment the
+/// DSP is replaying. ch1 (8-bit) lives on the master 8237 (ports 0x03,
+/// 0x0C); ch5 (16-bit) lives on the slave 8237 (ports 0xC6, 0xD8). The
+/// counter unit matches the transfer size, so count → sample idx is the
+/// same arithmetic for both.
 fn current_play_seg() -> usize {
-    outb(0x0C, 0x00);
-    let lo = inb(0x03) as u16;
-    let hi = inb(0x03) as u16;
-    let count = ((hi << 8) | lo) as usize;
-    let play_idx = (NSAMP - 1).wrapping_sub(count) % NSAMP;
-    play_idx / SEGSZ as usize
+    if bit16() {
+        outb(0xD8, 0x00);                 // clear slave flip-flop
+        let lo = inb(0xC6) as u16;
+        let hi = inb(0xC6) as u16;
+        let count = ((hi << 8) | lo) as usize;
+        let play_idx = (NSAMP - 1).wrapping_sub(count) % NSAMP;
+        play_idx / SEGSZ as usize
+    } else {
+        outb(0x0C, 0x00);
+        let lo = inb(0x03) as u16;
+        let hi = inb(0x03) as u16;
+        let count = ((hi << 8) | lo) as usize;
+        let play_idx = (NSAMP - 1).wrapping_sub(count) % NSAMP;
+        play_idx / SEGSZ as usize
+    }
 }
 
-/// Fill `seg` (one DMA segment, u8 offset-binary).
-///
-/// First, top up `pcm_buffer` by appending `play_row` output until it
-/// has at least `seg.len()` samples. Then copy those `seg.len()`
-/// samples out (converting i16 → u8 offset binary) and slide the
-/// remainder back to the front of `pcm_buffer`.
+/// Fill one DMA segment from the i16 mix buffer. `seg.len()` is in
+/// BYTES: SEGSZ for 8-bit unsigned mono, SEGSZ*2 for 16-bit signed mono.
+/// Top up `pcm_buffer` until it has enough samples, then convert each
+/// sample to the on-wire DMA format and slide the remainder.
 fn fill_segment(module: &Module, mix: &mut Mixer, seg: &mut [u8]) {
-    while mix.pcm_buffer_pos < seg.len() {
+    let bps = bytes_per_sample();
+    let n_samples = seg.len() / bps;
+    while mix.pcm_buffer_pos < n_samples {
         let dst = &mut mix.pcm_buffer
             [mix.pcm_buffer_pos..mix.pcm_buffer_pos + ROW_SAMPLES];
         module.play_row(mix.row, &mut mix.chans, dst);
         mix.row += 1;
         mix.pcm_buffer_pos += ROW_SAMPLES;
     }
-    for i in 0..seg.len() {
-        let v = mix.pcm_buffer[i];
-        seg[i] = (((v >> 8) as i32) + 0x80) as u8;
+    if bit16() {
+        // signed i16 little-endian, mono
+        for i in 0..n_samples {
+            let v = mix.pcm_buffer[i] as u16;
+            seg[i*2]     = (v & 0xFF) as u8;
+            seg[i*2 + 1] = (v >> 8) as u8;
+        }
+    } else {
+        // unsigned 8-bit, mono — drop low byte, bias to 0x80
+        for i in 0..n_samples {
+            let v = mix.pcm_buffer[i];
+            seg[i] = (((v >> 8) as i32) + 0x80) as u8;
+        }
     }
-    mix.pcm_buffer.copy_within(seg.len()..mix.pcm_buffer_pos, 0);
-    mix.pcm_buffer_pos -= seg.len();
+    mix.pcm_buffer.copy_within(n_samples..mix.pcm_buffer_pos, 0);
+    mix.pcm_buffer_pos -= n_samples;
 }
 
 /// Advance the DMA fill cursor `next_fill` until it reaches the current
@@ -332,9 +382,10 @@ fn fill_ring_to(
     module: &Module, mix: &mut Mixer,
     ring: &mut [u8], next_fill: &mut usize, target: usize,
 ) {
+    let seg_bytes = SEGSZ as usize * bytes_per_sample();
     while *next_fill != target {
-        let b = *next_fill * SEGSZ as usize;
-        fill_segment(module, mix, &mut ring[b..b + SEGSZ as usize]);
+        let b = *next_fill * seg_bytes;
+        fill_segment(module, mix, &mut ring[b..b + seg_bytes]);
         *next_fill = (*next_fill + 1) % NSEG;
     }
 }
@@ -347,7 +398,7 @@ fn fill_ring_to(
 /// the whole IRQ pipeline (including timer ticks) goes dark.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn sb_isr_body() {
-    inb(0x22E); // SB ack: read DSP status = ack 8-bit DMA IRQ
+    if bit16() { inb(0x22F); } else { inb(0x22E); }   // SB ack (8-bit vs 16-bit DMA IRQ)
     outb(0x20, 0x20); // PIC master EOI
     unsafe {
         let n = core::ptr::read_volatile(core::ptr::addr_of!(ISR_IRQS));
@@ -358,7 +409,7 @@ unsafe extern "C" fn sb_isr_body() {
     let mix: &mut Mixer = unsafe { &mut *core::ptr::addr_of_mut!(MIXER) };
     let ring_ptr =
         unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_RING)) };
-    let ring = unsafe { core::slice::from_raw_parts_mut(ring_ptr, NSAMP) };
+    let ring = unsafe { core::slice::from_raw_parts_mut(ring_ptr, NSAMP * bytes_per_sample()) };
     let mut nf = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_NEXT_FILL)) };
     fill_ring_to(module, mix, ring, &mut nf, current_play_seg());
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), nf) };
@@ -399,15 +450,19 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
     puts("\r\nmodplay: ");
     // Walk argv: first non-flag arg is the path; `-p`/`poll` selects poll.
     let mut poll_mode = false;
+    let mut bit16_mode = false;
     let mut path_arg: &[u8] = b"";
     for i in 1..argc {
         let a = argv[i];
         if a == b"-p" || a == b"poll" {
             poll_mode = true;
+        } else if a == b"-16" {
+            bit16_mode = true;
         } else if path_arg.is_empty() {
             path_arg = a;
         }
     }
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(BIT16), bit16_mode) };
     static mut PATHBUF: [u8; 128] = [0; 128];
     let pb = unsafe { &mut *core::ptr::addr_of_mut!(PATHBUF) };
     let plen = if !path_arg.is_empty() {
@@ -422,6 +477,7 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
     };
     let path: &[u8] = &pb[..plen];
     puts(if poll_mode { "[poll] " } else { "[irq] " });
+    puts(if bit16_mode { "[16-bit] " } else { "[8-bit] " });
     puts("file='");
     for &c in &path[..path.len() - 1] {
         putc(c);
@@ -463,10 +519,21 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
         dos::exit(1);
     }
     puts("OK");
-    sb::set_rate(SRATE);
+    let (vmaj, vmin) = sb::version();
+    puts(" sbv=");
+    puthex8(vmaj);
+    putc(b'.');
+    puthex8(vmin);
+    if bit16_mode && vmaj < 4 {
+        puts(" need SB16 for -16\r\n");
+        dos::exit(1);
+    }
+    if bit16_mode { sb::set_rate_16(SRATE); } else { sb::set_rate_8(SRATE); }
 
     // Conventional auto-init DMA ring (8237 needs <1 MB physical).
-    let seg = match dosrt::dpmi::alloc_dos_mem((NSAMP / 16) as u16) {
+    // Ring size in bytes = NSAMP * bytes_per_sample. Paragraphs = bytes/16.
+    let ring_bytes = NSAMP * bytes_per_sample();
+    let seg = match dosrt::dpmi::alloc_dos_mem((ring_bytes / 16) as u16) {
         Some((s, _)) => s,
         None => {
             puts(" ring FAIL\r\n");
@@ -474,7 +541,7 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
         }
     };
     let ring = unsafe {
-        core::slice::from_raw_parts_mut(dosrt::conv_flat_ptr(seg), NSAMP)
+        core::slice::from_raw_parts_mut(dosrt::conv_flat_ptr(seg), ring_bytes)
     };
     // Pre-fill the whole ring by treating it as 16 back-to-back DMA
     // segments. Same code path as the IRQ refill — Module/Mixer are
@@ -483,9 +550,10 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
     {
         let module: &Module = unsafe { &*core::ptr::addr_of!(MODULE) };
         let mix: &mut Mixer = unsafe { &mut *core::ptr::addr_of_mut!(MIXER) };
+        let seg_bytes = SEGSZ as usize * bytes_per_sample();
         for s in 0..NSEG {
-            let b = s * SEGSZ as usize;
-            fill_segment(module, mix, &mut ring[b..b + SEGSZ as usize]);
+            let b = s * seg_bytes;
+            fill_segment(module, mix, &mut ring[b..b + seg_bytes]);
         }
     }
 
@@ -512,23 +580,45 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
         outb(0x21, old_imr & !(1u8 << SB_IRQ));   // unmask SB IRQ
     }
 
-    // Program 8237 ch1 auto-init over the whole ring, then kick the DSP.
+    // Program 8237 auto-init over the whole ring, then kick the DSP.
+    // 8-bit  → ch1 on master 8237 (ports 0x02/0x03/0x0A/0x0B/0x0C, page 0x83).
+    // 16-bit → ch5 on slave  8237 (ports 0xC4/0xC6/0xD4/0xD6/0xD8, page 0x8B).
+    // Counter unit matches transfer size, so count = NSAMP - 1 either way.
     let phys = (seg as u32) << 4;
-    let off = (phys & 0xFFFF) as u16;
-    let page = (phys >> 16) as u8;
-    outb(0x0A, 0x05);                         // mask ch1
-    outb(0x0C, 0x00);                         // clear flip-flop
-    outb(0x0B, 0x59);                         // ch1 read, auto-init
-    outb(0x02, (off & 0xFF) as u8);
-    outb(0x02, (off >> 8) as u8);
-    outb(0x83, page);
-    outb(0x03, ((NSAMP - 1) & 0xFF) as u8);
-    outb(0x03, (((NSAMP - 1) >> 8) & 0xFF) as u8);
-    outb(0x0A, 0x01);                         // unmask ch1
-    sb::write(0x48);                          // set block size = SEGSZ
-    sb::write(((SEGSZ - 1) & 0xFF) as u8);
-    sb::write(((SEGSZ - 1) >> 8) as u8);
-    sb::write(0x1C);                          // 8-bit auto-init DMA start
+    if bit16_mode {
+        let waddr = phys >> 1;
+        let off = (waddr & 0xFFFF) as u16;
+        let page = (phys >> 16) as u8;
+        outb(0xD4, 0x05);                     // mask ch5 (4 | (5-4))
+        outb(0xD8, 0x00);                     // clear slave flip-flop
+        outb(0xD6, 0x59);                     // ch5 mode: read, auto-init, single
+        outb(0xC4, (off & 0xFF) as u8);
+        outb(0xC4, (off >> 8) as u8);
+        outb(0x8B, page);                     // ch5 page
+        outb(0xC6, ((NSAMP - 1) & 0xFF) as u8);
+        outb(0xC6, (((NSAMP - 1) >> 8) & 0xFF) as u8);
+        outb(0xD4, 0x01);                     // unmask ch5
+        sb::write(0xB6);                      // 16-bit auto-init DMA out
+        sb::write(0x10);                      // mode: signed mono
+        sb::write(((SEGSZ - 1) & 0xFF) as u8);
+        sb::write(((SEGSZ - 1) >> 8) as u8);
+    } else {
+        let off = (phys & 0xFFFF) as u16;
+        let page = (phys >> 16) as u8;
+        outb(0x0A, 0x05);                     // mask ch1
+        outb(0x0C, 0x00);                     // clear flip-flop
+        outb(0x0B, 0x59);                     // ch1 read, auto-init
+        outb(0x02, (off & 0xFF) as u8);
+        outb(0x02, (off >> 8) as u8);
+        outb(0x83, page);
+        outb(0x03, ((NSAMP - 1) & 0xFF) as u8);
+        outb(0x03, (((NSAMP - 1) >> 8) & 0xFF) as u8);
+        outb(0x0A, 0x01);                     // unmask ch1
+        sb::write(0x48);                      // set block size = SEGSZ
+        sb::write(((SEGSZ - 1) & 0xFF) as u8);
+        sb::write(((SEGSZ - 1) >> 8) as u8);
+        sb::write(0x1C);                      // 8-bit auto-init DMA out
+    }
 
     if poll_mode {
         // Poll the 8237 current count; whenever the DSP has moved into a
