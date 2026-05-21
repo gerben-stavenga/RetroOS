@@ -171,8 +171,8 @@ TARGET_JSON_32 = """{
   "data-layout": "e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-i128:128-f64:32:64-f80:32-n8:16:32-S128",
   "arch": "x86",
   "target-endian": "little",
-  "target-pointer-width": "32",
-  "target-c-int-width": "32",
+  "target-pointer-width": 32,
+  "target-c-int-width": 32,
   "os": "none",
   "executables": true,
   "linker-flavor": "ld.lld",
@@ -189,8 +189,8 @@ TARGET_JSON_64 = """{
   "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
   "arch": "x86_64",
   "target-endian": "little",
-  "target-pointer-width": "64",
-  "target-c-int-width": "32",
+  "target-pointer-width": 64,
+  "target-c-int-width": 32,
   "os": "none",
   "executables": true,
   "linker-flavor": "ld.lld",
@@ -249,6 +249,8 @@ rust_toolchain(
     rustc = "@rust_toolchain_x86_64_linux//:rustc_bin",
     staticlib_ext = ".a",
     stdlib_linkflags = [],
+    # Custom target JSON requires -Zunstable-options on recent nightlies.
+    extra_rustc_flags = ["-Zunstable-options"],
 )
 
 toolchain(
@@ -274,6 +276,7 @@ rust_toolchain(
     rustc = "@rust_toolchain_x86_64_linux//:rustc_bin",
     staticlib_ext = ".a",
     stdlib_linkflags = [],
+    extra_rustc_flags = ["-Zunstable-options"],
 )
 
 toolchain(

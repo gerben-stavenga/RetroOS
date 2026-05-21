@@ -1,6 +1,6 @@
 module(name = "retro_os", version = "0.1.0")
 
-bazel_dep(name = "rules_rust", version = "0.56.0")
+bazel_dep(name = "rules_rust", version = "0.70.0")
 bazel_dep(name = "rules_cc", version = "0.1.1")
 bazel_dep(name = "rules_nasm", version = "0.4.0")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
@@ -10,7 +10,7 @@ bazel_dep(name = "platforms", version = "0.0.10")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
-    versions = ["nightly/2025-01-15"],
+    versions = ["nightly/2026-05-19"],
     extra_target_triples = ["i686-unknown-linux-musl", "x86_64-unknown-linux-musl"],
 )
 use_repo(
@@ -32,23 +32,23 @@ http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "ht
 
 http_archive(
     name = "rust_toolchain_x86_64_linux",
-    url = "https://static.rust-lang.org/dist/2025-01-15/rust-nightly-x86_64-unknown-linux-gnu.tar.xz",
+    url = "https://static.rust-lang.org/dist/2026-05-19/rust-nightly-x86_64-unknown-linux-gnu.tar.xz",
     strip_prefix = "rust-nightly-x86_64-unknown-linux-gnu",
     build_file = "//toolchain:rust_toolchain.BUILD",
 )
 
 http_archive(
     name = "rust_src",
-    url = "https://static.rust-lang.org/dist/2025-01-15/rust-src-nightly.tar.xz",
+    url = "https://static.rust-lang.org/dist/2026-05-19/rust-src-nightly.tar.xz",
     strip_prefix = "rust-src-nightly/rust-src/lib/rustlib/src/rust",
     build_file = "//stdlib:rust_src.BUILD",
 )
 
 http_archive(
     name = "compiler_builtins",
-    url = "https://crates.io/api/v1/crates/compiler_builtins/0.1.140/download",
+    url = "https://crates.io/api/v1/crates/compiler_builtins/0.1.160/download",
     type = "tar.gz",
-    strip_prefix = "compiler_builtins-0.1.140",
+    strip_prefix = "compiler_builtins-0.1.160",
     build_file = "//stdlib:compiler_builtins.BUILD",
 )
 

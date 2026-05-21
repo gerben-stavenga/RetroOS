@@ -370,7 +370,7 @@ fn populate_dir_cache(dir: &[u8]) {
         let cache_dir = &raw mut DIR_CACHE_DIR;
         let entries = &mut *(&raw mut DIR_CACHE_ENTRIES);
         let dlen = dir.len().min((*cache_dir).len());
-        (*cache_dir)[..dlen].copy_from_slice(&dir[..dlen]);
+        (&mut *cache_dir)[..dlen].copy_from_slice(&dir[..dlen]);
         DIR_CACHE_DIR_LEN = dlen;
 
         entries.clear();
@@ -420,7 +420,7 @@ pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
         let entries = &*(&raw const DIR_CACHE_ENTRIES);
         // Check if cache is valid for this directory
         if !DIR_CACHE_VALID || DIR_CACHE_DIR_LEN != dir.len()
-            || (*cache_dir)[..DIR_CACHE_DIR_LEN] != *dir
+            || (&*cache_dir)[..DIR_CACHE_DIR_LEN] != *dir
         {
             populate_dir_cache(dir);
         }

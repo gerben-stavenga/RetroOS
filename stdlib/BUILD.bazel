@@ -10,12 +10,15 @@ rust_library(
     srcs = ["@rust_src//:core_src"],
     crate_name = "core",
     crate_root = "@rust_src//:library/core/src/lib.rs",
-    edition = "2021",
+    edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
         "-Cpanic=abort",
         "-Copt-level=z",
         "-Cforce-frame-pointers=yes",
+        # Mark stable items as unstable inside core so compiler_builtins
+        # cannot re-monomorphize core generics ("upstream monomorphizations").
+        "-Zforce-unstable-if-unmarked",
     ],
     tags = ["manual"],
     visibility = ["//visibility:private"],
@@ -26,7 +29,7 @@ rust_library(
     srcs = ["@rust_src//:alloc_src"],
     crate_name = "alloc",
     crate_root = "@rust_src//:library/alloc/src/lib.rs",
-    edition = "2021",
+    edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
         "-Cpanic=abort",
@@ -40,16 +43,27 @@ rust_library(
 
 rust_library(
     name = "compiler_builtins_internal",
-    srcs = ["@compiler_builtins//:src"],
+    srcs = ["@rust_src//:compiler_builtins_intree_src"],
     crate_name = "compiler_builtins",
-    crate_root = "@compiler_builtins//:src/lib.rs",
-    crate_features = ["mem", "compiler-builtins"],
-    edition = "2021",
+    crate_root = "@rust_src//:library/compiler-builtins/compiler-builtins/src/lib.rs",
+    # Match the in-tree std build of compiler_builtins. `arch` is the default
+    # (SIMD/asm routines), `mem` exposes unmangled memcpy/etc., and
+    # `compiler-builtins` flips the `#[compiler_builtins]` lang attribute.
+    crate_features = ["arch", "mem", "compiler-builtins", "unmangled-names"],
+    edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
         "-Cpanic=abort",
         "-Copt-level=z",
         "-Cforce-frame-pointers=yes",
+        # Same flag rustc's bootstrap passes — marks unmarked items unstable
+        # so the upstream-monomorphizations check is satisfied.
+        "-Zforce-unstable-if-unmarked",
+        # build.rs sets these cfgs from configure_f16_f128 by target. We don't
+        # run build.rs in the Bazel build, so set them manually so
+        # __extendhfsf2 / __truncsfhf2 etc. are compiled in.
+        "--cfg=f16_enabled",
+        "--cfg=f128_enabled",
     ],
     deps = [":core_internal"],
     tags = ["manual"],
@@ -61,7 +75,7 @@ rust_library(
     srcs = ["@rustc_demangle//:src"],
     crate_name = "rustc_demangle",
     crate_root = "@rustc_demangle//:src/lib.rs",
-    edition = "2021",
+    edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
         "-Cpanic=abort",
