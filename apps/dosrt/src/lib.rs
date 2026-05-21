@@ -10,6 +10,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 
 /// Minimal dosrt console: register-only INT 21h, DPMI-reflected (PM-safe;
@@ -349,6 +351,53 @@ pub mod dos {
         unsafe { core::arch::asm!("int 0x21", in("ax") 0x4C00u16 | code as u16) }
         loop { unsafe { core::arch::asm!("hlt") } }
     }
+}
+
+/// Process-wide global allocator: a single bump arena carved out of one
+/// 4 MB DPMI extended-memory block (AX=0501). Lazy-init on first
+/// `alloc`; `dealloc` is a no-op (we never free — process exit reclaims
+/// everything). Sufficient for payloads that want `Vec`/`Box` without
+/// pulling in a real free-list allocator.
+mod heap {
+    use super::dpmi;
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::UnsafeCell;
+    const HEAP_SIZE: u32 = 4 * 1024 * 1024;
+    struct State { next: u32, end: u32 }
+    pub struct DpmiBump { state: UnsafeCell<State> }
+    // Single-threaded DOS payload — no actual concurrency.
+    unsafe impl Sync for DpmiBump {}
+    impl DpmiBump {
+        pub const fn new() -> Self {
+            Self { state: UnsafeCell::new(State { next: 0, end: 0 }) }
+        }
+        unsafe fn ensure(s: &mut State) -> bool {
+            if s.end != 0 { return true; }
+            let lin = match dpmi::alloc_mem(HEAP_SIZE) {
+                Some(l) => l,
+                None => return false,
+            };
+            let off = lin.wrapping_sub(dpmi::seg_base(dpmi::ds_sel()));
+            s.next = off;
+            s.end = off.wrapping_add(HEAP_SIZE);
+            true
+        }
+    }
+    unsafe impl GlobalAlloc for DpmiBump {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let s = unsafe { &mut *self.state.get() };
+            unsafe { if !Self::ensure(s) { return core::ptr::null_mut(); } }
+            let m = (l.align() - 1) as u32;
+            let a = s.next.wrapping_add(m) & !m;
+            let n = a.wrapping_add(l.size() as u32);
+            if n > s.end || n < a { return core::ptr::null_mut(); }
+            s.next = n;
+            a as *mut u8
+        }
+        unsafe fn dealloc(&self, _p: *mut u8, _l: Layout) {}
+    }
+    #[global_allocator]
+    pub static ALLOCATOR: DpmiBump = DpmiBump::new();
 }
 
 /// Universal app crt0. RLOADER's `enter_payload` already set the
