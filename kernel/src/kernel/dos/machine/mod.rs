@@ -380,6 +380,10 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         0x20 => pc.vpic.isr,
         // Master PIC data (read IMR)
         0x21 => pc.vpic.imr,
+        // Slave PIC command (read ISR)
+        0xA0 => pc.vpic.slave_isr,
+        // Slave PIC data (read IMR)
+        0xA1 => pc.vpic.slave_imr,
         // Keyboard data port — returns current scancode from the virtual 8042.
         0x60 => pc.vkbd.read_port60(),
         // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
@@ -467,8 +471,14 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         0x200..=0x20F => {}
         // Master PIC data (write IMR)
         0x21 => pc.vpic.imr = val,
-        // Slave PIC command / data
-        0xA0 | 0xA1 => {}
+        // Slave PIC command
+        0xA0 => {
+            if val == 0x20 {
+                pc.vpic.slave_eoi();
+            }
+        }
+        // Slave PIC data (write IMR)
+        0xA1 => pc.vpic.slave_imr = val,
         // Keyboard data port — host-to-device command / parameter byte.
         // The keyboard's response (ACK, BAT, ID, …) becomes visible at port
         // 0x60 and asserts IRQ1, exactly as on real hardware.
@@ -663,9 +673,15 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
         }
     }
     // [SB-DMA] deliver-vec0D trace disabled per request.
-    let irq_num = vec.wrapping_sub(8);
-    if irq_num < 8 {
-        pc.vpic.isr |= 1 << irq_num;
+    let master_irq = vec.wrapping_sub(0x08);
+    if master_irq < 8 {
+        pc.vpic.isr |= 1 << master_irq;
+    } else {
+        let slave_irq = vec.wrapping_sub(0x70);
+        if slave_irq < 8 {
+            pc.vpic.isr |= 1 << 2; // master cascade IRQ
+            pc.vpic.slave_isr |= 1 << slave_irq;
+        }
     }
     // Clear VIP — interrupt is being serviced
     regs.frame.rflags &= !(1u64 << 20);
