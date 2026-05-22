@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// A private 64KB virtual slot for the guest mappings displaced while the
+/// single ISA DMA pool backs an SB buffer. XMS starts after this range.
+const SB_DMA_SHADOW_PAGE: usize = 0x120;
+
 // Virtual 8237 DMA controller (generic — not SB-specific)
 // ============================================================================
 //
@@ -237,6 +241,7 @@ impl SbDmaState {
     /// with "no contiguous DMA region". Idempotent. Also resets the
     /// per-channel re-arm cursor so a reused `SbDmaState` can't dangle.
     pub fn release_dma_pool(&mut self) {
+        self.restore_guest_mapping();
         if self.remap_pages != 0 {
             crate::kernel::startup::arch_free_phys_contig(
                 self.remap_start_page, self.remap_pages);
@@ -246,6 +251,29 @@ impl SbDmaState {
         self.last_gpa = 0;
         self.last_len = 0;
         self.last_gen = [0; 8];
+    }
+
+    /// Put the original guest PTEs back before the ISA DMA pool can be
+    /// handed to another buffer. The live guest range currently names the
+    /// pool; the private shadow range holds the PTEs it displaced.
+    fn restore_guest_mapping(&mut self) {
+        if self.remap_pages == 0 {
+            return;
+        }
+        let vpage = (self.last_gpa as usize) >> 12;
+        let span = self.remap_pages * 0x1000;
+        unsafe {
+            core::ptr::copy(
+                (vpage << 12) as *const u8,
+                (SB_DMA_SHADOW_PAGE << 12) as *mut u8,
+                span);
+        }
+        crate::kernel::startup::arch_swap_page_entries(
+            vpage, SB_DMA_SHADOW_PAGE, self.remap_pages);
+        // The swap leaves the pool mapping in the private shadow. Clear it
+        // before the pool is reused so no stale alias survives this binding.
+        crate::kernel::startup::arch_unmap_range(
+            SB_DMA_SHADOW_PAGE, self.remap_pages);
     }
 
     /// SB ports that pass straight through to the real card (QEMU
@@ -279,18 +307,34 @@ impl SbDmaState {
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
                    else if chan == self.dma16 as usize { Some(self.host_dma16) }
                    else { None };
-        if is_cnt && self.dma.ch[chan].armed {
+        if self.dma.ch[chan].armed {
             if let Some(h) = host {
-                // Real QEMU-8257 current-count, lo/hi via the controller
-                // byte-pointer flip-flop. Snapshot the full u16 at the
-                // low-byte read; the hi byte comes from the same snap.
+                // Serve the *live* transfer state for the armed SB channel,
+                // lo/hi via the controller byte-pointer flip-flop; snapshot
+                // the full u16 at the low-byte read so the pair is coherent.
                 let ff = if hi_ctrl { &mut self.dma.ff_hi }
                          else { &mut self.dma.ff_lo };
                 let low = !*ff;
                 *ff = !*ff;
                 if low {
-                    self.dma.read_latch = real_8237_count(h);
-                    // [SB-DMA] guest count-read trace disabled per request.
+                    let live_count = real_8237_count(h);
+                    let p = self.dma.ch[chan].prog;
+                    self.dma.read_latch = if is_cnt {
+                        // Count register: QEMU-8257's live current-count —
+                        // decrements during playback, 0xFFFF at terminal
+                        // (Dune2's 0x4D8 ISR relies on this).
+                        live_count
+                    } else {
+                        // Address register: the 8237 advances the address as
+                        // it decrements the count. Derive the current address
+                        // from the count delta so it stays in the *guest*
+                        // buffer space — the real chip holds the remapped
+                        // contiguous address. ROTT / the Apogee Sound System
+                        // track 16-bit playback progress by reading *this*,
+                        // not the count; a frozen address looks like a dead
+                        // DMA channel and fails their playback self-test.
+                        p.addr.wrapping_add(p.count.wrapping_sub(live_count))
+                    };
                 }
                 let v = self.dma.read_latch;
                 return if low { v as u8 } else { (v >> 8) as u8 };
@@ -375,6 +419,7 @@ impl SbDmaState {
         // (true zero-copy) — no re-alloc/re-copy needed.
         if self.remap_pages == 0 || gpa != self.last_gpa || len != self.last_len {
             if self.remap_pages != 0 {
+                self.restore_guest_mapping();
                 crate::kernel::startup::arch_free_phys_contig(
                     self.remap_start_page, self.remap_pages);
                 self.remap_start_page = 0;
@@ -398,6 +443,8 @@ impl SbDmaState {
                 core::ptr::copy_nonoverlapping(
                     vbase as *const u8, snap.as_mut_ptr(), span);
             }
+            crate::kernel::startup::arch_swap_page_entries(
+                vbase >> 12, SB_DMA_SHADOW_PAGE, num_pages);
             crate::kernel::startup::arch_map_phys_range(
                 vbase >> 12, num_pages, contig, 0);
             unsafe {
