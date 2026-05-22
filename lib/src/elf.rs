@@ -274,7 +274,9 @@ impl<'a> Elf<'a> {
             }
         };
 
-        if typ != 2 {
+        // ET_EXEC (2) or ET_DYN (3, PIE). Both are loadable; PIE just
+        // carries R_386_RELATIVE fixups the loader applies after placement.
+        if typ != 2 && typ != 3 {
             return Err(ElfError::InvalidType);
         }
         let expected_machine = match class {

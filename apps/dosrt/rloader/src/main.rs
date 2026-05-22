@@ -243,12 +243,15 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32,
         Some(l) => l,
         None => { puts("dosrt: AX=0501 FAIL\r\n"); hang(); }
     };
-    // selector-base trick: base + p_vaddr == lin + (p_vaddr - min_v)
-    let base = lin.wrapping_sub(min_v);
+    // Payloads are PIE: their selectors are base=0 flat, and the
+    // `R_386_RELATIVE` fixups (applied below) bias every absolute slot by
+    // the load address. `load_bias = lin - min_v` is what the fixups add;
+    // for a PIE linked at 0 that is just `lin`.
+    let load_bias = lin.wrapping_sub(min_v);
     let code = dpmi::alloc_ldt();
     let data = dpmi::alloc_ldt();
     for s in [code, data] {
-        dpmi::set_base(s, base);
+        dpmi::set_base(s, 0);
         dpmi::set_limit(s, 0xFFFF_FFFF);
     }
     // G=1 so the limit-field 0xFFFFF set above means 4 GB - 1, not 1 MB - 1.
@@ -260,8 +263,8 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32,
     puthex32(lin);
     puts(" sz=");
     puthex32(size);
-    puts(" base=");
-    puthex32(base);
+    puts(" bias=");
+    puthex32(load_bias);
     puts("\r\n");
 
     // Stream each PT_LOAD straight from disk into payload memory.
@@ -285,18 +288,21 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32,
         }
     }
 
-    // Apply PIE relocations. A PIE payload links at vaddr base 0 and
-    // carries `R_386_RELATIVE` fixups in `.rel.dyn`; we patch each slot by
-    // the load bias (`base = lin - min_v`). A plain ET_EXEC has no
-    // PT_DYNAMIC, `dyn_size == 0`, and this is skipped.
+    // Apply PIE relocations: patch each `R_386_RELATIVE` slot by
+    // `load_bias`. A plain ET_EXEC has no PT_DYNAMIC, `dyn_size == 0`,
+    // and this is skipped.
     if dyn_size != 0 {
-        let nreloc = apply_relocations(base, ds_base, dyn_vaddr, dyn_size);
+        let nreloc = apply_relocations(load_bias, ds_base, dyn_vaddr, dyn_size);
         puts("dosrt: relocs=");
         puthex32(nreloc);
         puts("\r\n");
     }
 
-    let sp_top = min_v + size;               // selector-relative; grows down
+    // Payload selectors are base=0 flat, so SS:ESP and CS:EIP are plain
+    // linear addresses. Stack grows down from the top of the allocation;
+    // the entry vaddr is biased onto the load address.
+    let sp_top = lin + size;
+    let entry_lin = load_bias.wrapping_add(entry);
     puts("dosrt: jmp payload\r\n");
     // The SS/ESP/segment-reg/retf transfer MUST NOT be inline asm inside
     // this function: rewriting SS:ESP and never-returning is UB the -Oz
@@ -304,7 +310,7 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32,
     // above. It lives in a dedicated global_asm symbol (like crt0), fed
     // the already-computed values.
     let arg = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HOFF_ARG)) };
-    unsafe { enter_payload(code as u32, data as u32, sp_top, entry, arg) }
+    unsafe { enter_payload(code as u32, data as u32, sp_top, entry_lin, arg) }
 }
 
 /// Walk the payload's `.dynamic` table (already streamed into memory at
