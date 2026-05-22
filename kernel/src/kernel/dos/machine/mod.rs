@@ -338,27 +338,44 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
     // separate path (arch::inl/outl), not this emulator.
     let port = port & 0x3FF;
     match port {
-        // VGA Input Status 1: synthesize retrace signal tied to host wall
-        // time so vsync busy-waits actually wait. Mode 13h refresh ~70 Hz
-        // (14.286 ms/frame), mapped to a 32-step phase:
-        //   phase  0..16 — display active (0x00)            bit0=0 bit3=0
-        //   phase 16..24 — horizontal blank (0x01)          bit0=1 bit3=0
-        //   phase 24..32 — vertical blank   (0x09)          bit0=1 bit3=1
-        // - VL_WaitVBL needs bit3=1 (VBL phase)
-        // - VL_SetScreen needs 6+ consecutive bit0=1/bit3=0 (HBL phase)
-        // - VL_SetCRTC needs bit0=0 (display active phase)
-        // Phase formula: (ticks_ms * 70 cycles/s * 32 phases) / 1000 ms/s,
-        // taken mod 32. With ms-resolution ticks the phase advances ~2.24
-        // steps per host ms, so a tight busy-wait sees the same phase for
-        // many successive reads (gives VL_SetScreen its "consecutive 6+"
-        // criterion for free) but bit transitions happen on real wallclock.
+        // Synthetic VGA Input Status Register 1 — QEMU's 0x3DA isn't usable
+        // here (its bit 3 doesn't toggle in our setup, so a passthrough hangs
+        // Wolf3D's VL_WaitVBL), so bit 3 and bit 0 are fabricated:
+        //
+        //  - bit 3 (vertical retrace) — 70 Hz frame phase (mode 13h refresh,
+        //    14.286 ms / frame), asserted for 8/32 phase-steps ≈ 3.6 ms/frame.
+        //    Drives frame-level pacing (Wolf3D VL_WaitVBL, Build vsync).
+        //
+        //  - bit 0 (display-disabled / blanking) — per-read counter toggling
+        //    every 8 reads. Models *horizontal* blanking, which on real VGA
+        //    pulses at ~31.5 kHz (every scanline); a once-per-frame block
+        //    (the obvious encoding) made Build engine's per-DAC-entry
+        //    snow-avoidance wait take ~60 s for a Duke3D fade. Runs of 8
+        //    ones/zeros also satisfy "6+ consecutive bit0=X" idioms
+        //    (Wolf3D's VL_SetScreen pre-CRTC-write wait, etc.) Vsync ⊂
+        //    blanking, so bit 0 is forced 1 whenever bit 3 is set.
+        //
+        // The real `inb(0x3DA)` is retained for its hardware side-effect:
+        // resetting the VGA attribute-controller flip-flop.
         0x3DA => {
-            // Read real hardware to reset the AC flip-flop, and track it globally.
-            let _real = crate::arch::inb(0x3DA);
+            // Real port read: hardware retrace bits AND resets the VGA
+            // attribute-controller flip-flop. On real iron the bits are
+            // authoritative (the CRTC drives them from the scan position);
+            // under QEMU they're stuck, so we synthesize below. Flip this
+            // when deploying on real hardware.
+            let real = crate::arch::inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
+            let use_real_vga_retrace = false;
+            if use_real_vga_retrace {
+                return real;
+            }
             let ticks = crate::arch::get_ticks();
             let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
-            if phase < 16 { 0x00 } else if phase < 24 { 0x01 } else { 0x09 }
+            let vr = phase >= 24;
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static DA_READ_COUNT: AtomicU32 = AtomicU32::new(0);
+            let hbl = (DA_READ_COUNT.fetch_add(1, Ordering::Relaxed) >> 3) & 1 != 0;
+            (if vr { 0x08 } else { 0 }) | (if vr || hbl { 0x01 } else { 0 })
         }
         // VGA ports — pass through to hardware
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => crate::arch::inb(port),
