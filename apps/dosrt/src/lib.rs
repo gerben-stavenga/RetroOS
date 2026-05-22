@@ -206,6 +206,132 @@ pub mod dpmi {
             );
         }
     }
+
+    // --- PM interrupt-handler installation --------------------------------
+    //
+    // A DPMI host enters a PM interrupt handler on a *locked* stack of
+    // its own (DPMI 0.9 §1.8.2); that stack's SS need not be flat —
+    // CWSDPMI runs handlers on its own `g_pdata` segment (base = the
+    // host's data, not 0). Rust/LLVM flat-model codegen assumes
+    // `SS.base == DS.base`, so a handler that takes the address of a
+    // stack local forms an SS-relative offset and dereferences it
+    // through our flat DS, missing. Every handler therefore runs on
+    // dosrt's own flat interrupt stack; the per-vector→flat-stack switch
+    // is the DOS-extender's job, what DJGPP's go32 does over CWSDPMI, so
+    // a dosrt app's handlers work under any DPMI host.
+
+    /// Per-vector handler table, indexed directly by interrupt vector.
+    static mut HANDLERS: [Option<unsafe extern "C" fn()>; 256] = [None; 256];
+
+    /// Flat stack every handler runs on (see the section comment above).
+    const INT_STACK_SIZE: usize = 0x4000;
+    static mut INT_STACK: [u8; INT_STACK_SIZE] = [0; INT_STACK_SIZE];
+
+    /// Linear top-of-`INT_STACK`, filled by `install_handler` — PIE: the
+    /// buffer address is only known after load-time relocation, so the
+    /// asm reads it here instead of taking an `offset`.
+    #[unsafe(no_mangle)]
+    static mut INT_STACK_TOP: u32 = 0;
+
+    /// Stride between entries in `dosrt_int_stubs`. Each stub is a
+    /// 2-byte `push imm8` + a `jmp` (≤5 bytes), ≤7 total; `.p2align 3`
+    /// rounds each to 8, so stub `v` is `dosrt_int_stubs + 8*v`.
+    const STUB_STRIDE: usize = 8;
+
+    unsafe extern "C" {
+        // An asm label, declared as a byte so its address can be taken
+        // without a function-pointer cast.
+        static dosrt_int_stubs: u8;
+    }
+
+    // One stub per IDT vector (256), then the shared trampoline. Stub
+    // `v` pushes `v` and jumps to `dosrt_int_common`. The push is kept
+    // to the 2-byte `imm8` form by sign-extending `v` into [-128, 127]
+    // (`(v ^ 128) - 128`) — the dispatcher reads only the low byte, so
+    // pushing the negative imm8 for v ≥ 128 is equivalent and keeps
+    // every stub ≤7 bytes, giving a uniform 8-byte `.p2align 3` stride.
+    // `dosrt_int_common` preserves everything, loads our flat DS/ES,
+    // parks the host SS:ESP in callee-saved EBX/ESI, switches SS:ESP
+    // onto the flat interrupt stack, calls the dispatcher with the
+    // vector, restores SS:ESP from EBX/ESI (the C ABI guarantees the
+    // call preserves them), and `iretd`s. The `cs:[...]` reads reach our
+    // statics through CS (CS & DS share base); the `mov ss` / `mov esp`
+    // pairs sit in the mov-ss interrupt shadow.
+    core::arch::global_asm!(
+        ".section .text.dosrt_int,\"ax\"",
+        ".code32",
+        ".globl dosrt_int_stubs",
+        ".p2align 3",
+        "dosrt_int_stubs:",
+        ".set vec, 0",
+        ".rept 256",
+        "  push ((vec ^ 128) - 128)",
+        "  jmp dosrt_int_common",
+        "  .p2align 3",
+        "  .set vec, vec + 1",
+        ".endr",
+        "dosrt_int_common:",
+        "pushad",
+        // vector the stub pushed, just above the architecturally-fixed
+        // 32-byte pushad frame. Read it before push ds/es so the offset
+        // doesn't depend on their assembler-chosen operand size (LLVM
+        // encodes a 32-bit-mode segment push as 16-bit + a 66 prefix).
+        "mov ebp, [esp + 32]",
+        "push ds",
+        "push es",
+        "mov ax, cs:[OUR_DS]",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov ebx, esp",               // host ESP -> EBX (callee-saved)
+        "mov si, ss",                 // host SS  -> ESI (callee-saved)
+        "mov ss, ax",
+        "mov esp, cs:[INT_STACK_TOP]",
+        "push ebp",                   // dosrt_int_dispatch(vector)
+        "call dosrt_int_dispatch",
+        "mov ss, si",                 // EBX/ESI survived the call
+        "mov esp, ebx",
+        "pop es",
+        "pop ds",
+        "popad",
+        "add esp, 4",                 // discard the stub's pushed vector
+        "iretd",
+    );
+
+    /// Called by `dosrt_int_common` on the flat interrupt stack with the
+    /// vector of the stub that fired.
+    #[unsafe(no_mangle)]
+    extern "C" fn dosrt_int_dispatch(vector: u8) {
+        let h = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HANDLERS[vector as usize])) };
+        if let Some(h) = h {
+            unsafe { h() }
+        }
+    }
+
+    /// Install `handler` as the protected-mode handler for interrupt
+    /// `vector` (DPMI 0.9 AX=0205). The handler runs on dosrt's flat
+    /// interrupt stack with DS/ES = our flat data selector, so it may
+    /// freely take the address of stack locals; the trampoline preserves
+    /// all registers, so the handler need not. A hardware-IRQ handler
+    /// must ack the device + EOI the PIC and must not enable interrupts.
+    pub fn install_handler(vector: u8, handler: unsafe extern "C" fn()) -> Result<(), u16> {
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(HANDLERS[vector as usize]),
+                Some(handler),
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(INT_STACK_TOP),
+                core::ptr::addr_of!(INT_STACK) as u32 + INT_STACK_SIZE as u32,
+            );
+        }
+        let cs: u16;
+        unsafe {
+            core::arch::asm!("mov {0:x}, cs", out(reg) cs,
+                options(nomem, nostack, preserves_flags));
+        }
+        let stub = core::ptr::addr_of!(dosrt_int_stubs) as usize + vector as usize * STUB_STRIDE;
+        set_pm_int(vector, cs, stub as u32)
+    }
 }
 
 /// Port I/O. At CPL3 `in`/`out` #GP and RetroOS's machine layer emulates

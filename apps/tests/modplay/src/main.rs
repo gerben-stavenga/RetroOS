@@ -464,8 +464,14 @@ static mut SB: sb::SoundBlaster = sb::SoundBlaster::EMPTY;
 static mut MODULE: Module = Module::EMPTY;
 static mut MIXER: Mixer = Mixer::new();
 static mut ISR_RING: *mut u8 = core::ptr::null_mut();
-static mut ISR_NEXT_FILL: usize = 0;
 static mut ISR_IRQS: u32 = 0;
+/// Bottom-half flag: the ISR sets it, the main loop watches+clears it and
+/// then does the refill in task context (poll-bool mode).
+static mut IRQ_PENDING: bool = false;
+/// When true, the ISR does the full refill itself (irq-mix mode); the
+/// `next_fill` cursor then has to be ISR-owned static state.
+static mut ISR_DOES_MIX: bool = false;
+static mut ISR_NEXT_FILL: usize = 0;
 
 /// Reinterpret the type-erased ring as a typed sample slice.
 #[inline] unsafe fn ring_as<S: Sample>() -> &'static mut [S] {
@@ -499,11 +505,18 @@ fn fill_segment<S: Sample>(
     for i in 0..n_frames {
         seg[i] = S::from(mix.left[i], mix.right[i]);
     }
-    mix.left.copy_within(n_frames..mix.pcm_buffer_pos, 0);
-    mix.right.copy_within(n_frames..mix.pcm_buffer_pos, 0);
-    mix.pcm_buffer_pos -= n_frames;
+    // Shift the unconsumed tail of left/right to the front. A
+    // bounds-checked indexed loop — `copy_within` empirically miscompiles
+    // here (stale `pcm_buffer_pos` spill); see feedback_copy_within_alloc_bug.
+    let keep = mix.pcm_buffer_pos - n_frames;
+    for i in 0..keep {
+        mix.left[i] = mix.left[i + n_frames];
+        mix.right[i] = mix.right[i + n_frames];
+    }
+    mix.pcm_buffer_pos = keep;
 }
 
+/// Render segments `*next_fill..target` (wrapping), advancing `next_fill`.
 fn fill_ring_to<S: Sample>(
     module: &Module, mix: &mut Mixer, ring: &mut [S],
     next_fill: &mut usize, target: usize,
@@ -515,7 +528,12 @@ fn fill_ring_to<S: Sample>(
     }
 }
 
-#[unsafe(no_mangle)]
+/// SB IRQ handler. Always: ack the SB, EOI the PIC, bump the counter.
+/// Then either (irq-mix mode) do the whole refill here in interrupt
+/// context, or (poll-bool mode) just raise `IRQ_PENDING` for the main
+/// loop to pick up. The 3-way comparison — poll-dma / poll-bool / irq-mix
+/// — exists to pin down whether the refill misbehaves *because* it runs
+/// in interrupt context.
 unsafe extern "C" fn sb_isr_body() {
     let sb = unsafe { &*core::ptr::addr_of!(SB) };
     sb.ack_irq();
@@ -524,7 +542,12 @@ unsafe extern "C" fn sb_isr_body() {
         let n = core::ptr::read_volatile(core::ptr::addr_of!(ISR_IRQS));
         core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_IRQS), n + 1);
     }
-
+    if !unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_DOES_MIX)) } {
+        // poll-bool: defer the refill to the main loop.
+        unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_PENDING), true) };
+        return;
+    }
+    // irq-mix: full refill in interrupt context.
     let module: &Module = unsafe { &*core::ptr::addr_of!(MODULE) };
     let mix: &mut Mixer = unsafe { &mut *core::ptr::addr_of_mut!(MIXER) };
     let mut nf = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ISR_NEXT_FILL)) };
@@ -538,28 +561,6 @@ unsafe extern "C" fn sb_isr_body() {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), nf) };
 }
 
-core::arch::global_asm!(
-    ".section .text.sb_isr,\"ax\"",
-    ".code32",
-    ".globl sb_isr",
-    "sb_isr:",
-    "pushad",
-    "push ds",
-    "push es",
-    "mov ax, cs:[OUR_DS]",
-    "mov ds, ax",
-    "mov es, ax",
-    "call sb_isr_body",
-    "pop es",
-    "pop ds",
-    "popad",
-    "iretd",
-);
-
-unsafe extern "C" {
-    fn sb_isr();
-}
-
 /// Hardcoded for now; once `dosrt::env_get(b"BLASTER")` lands we read the
 /// real value from PSP[0x2C]:0.
 const BLASTER_STR: &[u8] = b"A220 I7 D1 H5 T6";
@@ -567,13 +568,17 @@ const BLASTER_STR: &[u8] = b"A220 I7 D1 H5 T6";
 #[unsafe(no_mangle)]
 pub fn app_main(argc: usize, argv: &[&[u8]]) {
     puts("\r\nmodplay: ");
+    // Refill mode: `-p` poll the DMA count; `-i` refill inside the ISR;
+    // default = poll-bool (ISR raises a flag, main loop refills).
     let mut poll_mode = false;
+    let mut irq_mix = false;
     let mut bit16_mode = false;
     let mut stereo_mode = false;
     let mut path_arg: &[u8] = b"";
     for i in 1..argc {
         let a = argv[i];
         if a == b"-p" || a == b"poll" { poll_mode = true; }
+        else if a == b"-i" || a == b"irq" { irq_mix = true; }
         else if a == b"-16" { bit16_mode = true; }
         else if a == b"-s" || a == b"stereo" { stereo_mode = true; }
         else if path_arg.is_empty() { path_arg = a; }
@@ -591,7 +596,9 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
         DEFAULT.len()
     };
     let path: &[u8] = &pb[..plen];
-    puts(if poll_mode { "[poll] " } else { "[irq] " });
+    puts(if poll_mode { "[poll-dma] " }
+         else if irq_mix { "[irq-mix] " }
+         else { "[poll-bool] " });
     puts(if bit16_mode { "[16-bit] " } else { "[8-bit] " });
     puts(if stereo_mode { "[stereo] " } else { "[mono] " });
     puts("file='");
@@ -649,8 +656,10 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
     let ring_ptr = dosrt::conv_flat_ptr(seg);
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_RING), ring_ptr);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_IRQS), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_PENDING), false);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_DOES_MIX), irq_mix);
     }
     // Pre-fill the whole ring as `NSEG` back-to-back segments. One match
     // picks the right Sample type for the entire bring-up.
@@ -671,13 +680,11 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
         }
     }
 
-    // Install the PM HW-IRQ handler (only in IRQ mode).
+    // Install the PM HW-IRQ handler — needed by poll-bool and irq-mix,
+    // not by poll-dma (which never looks at the IRQ).
     let old_imr = inb(0x21);
     if !poll_mode {
-        let cs: u16;
-        unsafe { core::arch::asm!("mov {0:x}, cs", out(reg) cs) };
-        let isr_off = sb_isr as usize as u32;
-        if let Err(e) = dosrt::dpmi::set_pm_int(sb.irq_vector(), cs, isr_off) {
+        if let Err(e) = dosrt::dpmi::install_handler(sb.irq_vector(), sb_isr_body) {
             puts(" set_pm_int FAIL=");
             puthex32(e as u32);
             dos::exit(1);
@@ -693,21 +700,29 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
     sb.program_dma(phys, dma_transfers);
     sb.start_playback(seg_transfers);
 
-    if poll_mode {
-        let module: &Module = unsafe { &*core::ptr::addr_of!(MODULE) };
-        let mix: &mut Mixer = unsafe { &mut *core::ptr::addr_of_mut!(MIXER) };
-        let mut next_fill: usize = 0;
-        loop {
-            let target = current_play_seg(sb);
-            match (sb.bit16, sb.stereo) {
-                (false, false) => fill_ring_to::<Mono8>(module, mix, unsafe { ring_as::<Mono8>() }, &mut next_fill, target),
-                (false, true)  => fill_ring_to::<Stereo8>(module, mix, unsafe { ring_as::<Stereo8>() }, &mut next_fill, target),
-                (true,  false) => fill_ring_to::<Mono16>(module, mix, unsafe { ring_as::<Mono16>() }, &mut next_fill, target),
-                (true,  true)  => fill_ring_to::<Stereo16>(module, mix, unsafe { ring_as::<Stereo16>() }, &mut next_fill, target),
-            }
-        }
-    } else {
+    // irq-mix: the ISR owns the refill — the main task just idles.
+    if irq_mix {
         loop { unsafe { core::arch::asm!("pause") }; }
+    }
+
+    // poll-dma / poll-bool: the refill runs here in task context.
+    // poll-dma refills continuously; poll-bool waits for the ISR's
+    // `IRQ_PENDING` flag before each refill.
+    let module: &Module = unsafe { &*core::ptr::addr_of!(MODULE) };
+    let mix: &mut Mixer = unsafe { &mut *core::ptr::addr_of_mut!(MIXER) };
+    let mut next_fill: usize = 0;
+    loop {
+        if !poll_mode {
+            while !unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IRQ_PENDING)) } {}
+            unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(IRQ_PENDING), false) };
+        }
+        let target = current_play_seg(sb);
+        match (sb.bit16, sb.stereo) {
+            (false, false) => fill_ring_to::<Mono8>(module, mix, unsafe { ring_as::<Mono8>() }, &mut next_fill, target),
+            (false, true)  => fill_ring_to::<Stereo8>(module, mix, unsafe { ring_as::<Stereo8>() }, &mut next_fill, target),
+            (true,  false) => fill_ring_to::<Mono16>(module, mix, unsafe { ring_as::<Mono16>() }, &mut next_fill, target),
+            (true,  true)  => fill_ring_to::<Stereo16>(module, mix, unsafe { ring_as::<Stereo16>() }, &mut next_fill, target),
+        }
     }
 
     #[allow(unreachable_code)]
