@@ -1573,16 +1573,20 @@ pub fn unmap_range(base_page: usize, num_pages: usize) {
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
-                if e[base_page + i].present() {
-                    phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                let ent = e[base_page + i];
+                // MMIO / externally-owned (cache-disabled) frames are not
+                // ours to free — same rule as the address-space teardown.
+                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                    phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry32::default();
             }
         }
         Entries::E64(e) => {
             for i in 0..num_pages {
-                if e[base_page + i].present() {
-                    phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                let ent = e[base_page + i];
+                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                    phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry64::default();
             }
@@ -1596,18 +1600,50 @@ pub fn free_range(base_page: usize, num_pages: usize) {
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
-                if e[base_page + i].present() {
-                    crate::arch::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                let ent = e[base_page + i];
+                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                    crate::arch::phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry32::new((base_page + i) as u64, false, true);
             }
         }
         Entries::E64(e) => {
             for i in 0..num_pages {
-                if e[base_page + i].present() {
-                    crate::arch::phys_mm::free_phys_page(e[base_page + i].addr() >> 12);
+                let ent = e[base_page + i];
+                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                    crate::arch::phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry64::new((base_page + i) as u64, false, true);
+            }
+        }
+    }
+    flush_tlb();
+}
+
+/// Replace a range with fresh anonymous user-RW frames. Owned (non-MMIO)
+/// frames currently mapped are freed first; cache-disabled / externally-
+/// owned pages (an aliased DMA buffer) are left intact.
+pub fn map_fresh_range(base_page: usize, num_pages: usize) {
+    use crate::arch::phys_mm;
+    match entries() {
+        Entries::E32(e) => {
+            for i in 0..num_pages {
+                let ent = e[base_page + i];
+                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                    phys_mm::free_phys_page(ent.addr() >> 12);
+                }
+                let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
+                e[base_page + i] = Entry32::new(fresh, true, true);
+            }
+        }
+        Entries::E64(e) => {
+            for i in 0..num_pages {
+                let ent = e[base_page + i];
+                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                    phys_mm::free_phys_page(ent.addr() >> 12);
+                }
+                let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
+                e[base_page + i] = Entry64::new(fresh, true, true);
             }
         }
     }
