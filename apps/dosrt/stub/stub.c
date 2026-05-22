@@ -43,6 +43,23 @@ static int dpmi_switch(unsigned host_seg)
     return (int)(_FLAGS & 1);
 }
 
+/* INT 21h AH=48h. Keep this direct: this block is passed to the DPMI
+ * mode-switch entry, and Borland's dos.h does not declare _dos_allocmem. */
+static int dos_alloc_paras(unsigned paras, unsigned *segp, unsigned *maxp)
+{
+    union REGS r;
+
+    r.h.ah = 0x48;
+    r.x.bx = paras;
+    int86(0x21, &r, &r);
+    if (r.x.cflag) {
+        *maxp = r.x.bx;
+        return r.x.ax;
+    }
+    *segp = r.x.ax;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     FILE *f;
@@ -51,7 +68,7 @@ int main(int argc, char **argv)
     size_t n;
     union REGS r;
     struct SREGS s;
-    unsigned host_si, host_seg, seg, ds_sel, sel, bhi, blo, off;
+    unsigned host_si, host_seg, host_max, seg, ds_sel, sel, bhi, blo, off;
     unsigned long lin;
     rloader_fn go;
     int exh;
@@ -116,12 +133,12 @@ int main(int argc, char **argv)
     ent_off = r.x.di;
     ent_seg = s.es;
 
-    /* Host data block (SI paras), if any. _dos_allocmem is the libc
-     * wrapper for the DOS segment alloc. ES ignored when SI==0. */
+    /* Host data block (SI paras), if any. ES ignored when SI==0. */
     host_seg = 0;
     if (host_si != 0) {
-        if (_dos_allocmem(host_si, &seg) != 0) {
-            printf("dosrt: host-block alloc failed\n");
+        if (dos_alloc_paras(host_si, &seg, &host_max) != 0) {
+            printf("dosrt: host-block alloc failed need=%u max=%u\n",
+                   host_si, host_max);
             return 1;
         }
         host_seg = seg;
