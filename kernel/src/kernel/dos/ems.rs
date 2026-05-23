@@ -390,7 +390,6 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Regs, ah: u8) -> thread:
                 regs.rcx = (regs.rcx & !0xFFFF) | 4; // 4 mappable pages
                 regs.rax = regs.rax & !0xFF00;
             } else {
-                // Sub 1: just return count
                 regs.rcx = (regs.rcx & !0xFFFF) | 4;
                 regs.rax = regs.rax & !0xFF00;
             }

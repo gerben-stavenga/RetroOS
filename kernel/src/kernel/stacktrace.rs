@@ -153,7 +153,7 @@ fn print_frame(depth: usize, ip: u64) {
 /// up front and decides whether to chain into ring-1 from there.
 fn walk(mut bp: u64, mut depth: usize, user_64: bool) {
     unsafe extern "C" { fn isr_return(); }
-    let isr_dispatch = isr_return as u64;
+    let isr_dispatch = isr_return as *const () as u64;
     const MAX_DEPTH: usize = 20;
 
     while depth < MAX_DEPTH && bp >= 0x1000 {

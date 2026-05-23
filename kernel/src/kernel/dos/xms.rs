@@ -3,7 +3,6 @@
 //! Pure bookkeeping over the VM86 linear address space above the HMA + A20
 //! shadow region. Physical backing comes from the kernel's demand paging.
 
-use crate::kernel::dos::dos_trace;
 use crate::kernel::dos::linear;
 use crate::dbg_println;
 use crate::kernel::thread;
@@ -24,7 +23,7 @@ struct XmsHandle {
 }
 
 /// Per-thread XMS driver state.
-pub(super) struct XmsState {
+pub struct XmsState {
     handles: [Option<XmsHandle>; MAX_XMS_HANDLES],
     a20_local: u16,
     a20_global: u16,
@@ -287,7 +286,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> threa
             }
         }
         // AH=0Fh — Reallocate extended memory block (DX=handle, BX=new size KB)
-        // Simple: free old, alloc new (no data preservation — rare in practice)
+        // This implementation allocates a fresh block and does not preserve contents.
         0x0F => {
             let handle = regs.rdx as u16;
             let new_kb = regs.rbx as u16;
@@ -306,7 +305,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> threa
                             regs.rax = (regs.rax & !0xFFFF) | 1;
                         }
                         None => {
-                            // Restore old handle
+                            // Preserve the original handle when the new allocation fails.
                             xms.handles[handle as usize - 1] = Some(old);
                             regs.rax = regs.rax & !0xFFFF;
                             regs.rbx = (regs.rbx & !0xFF) | 0xA0;

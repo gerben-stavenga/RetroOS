@@ -162,9 +162,8 @@ impl VgaState {
         //     mov al, [esi]   ; loads latches with src plane bytes
         //     <-- preempt here -->
         //     mov [edi], al   ; write mode 1: writes (wrong) latches to dst
-        // The window is 1–2 instructions wide so the hit rate is very low,
-        // and the visible artifact (one bad 4-byte stripe in one frame) is
-        // typically invisible. Left unfixed; revisit if we ever observe it.
+        // The affected window is 1–2 instructions wide, so a lost latch
+        // normally appears as one bad 4-byte stripe in one frame.
         // Read planes through the kernel-side low-memory mapping
         // (LOW_MEM_BASE + 0xA0000) so this works regardless of which
         // personality's user pages are currently mapped — Linux threads

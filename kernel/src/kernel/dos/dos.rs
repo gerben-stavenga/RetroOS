@@ -23,7 +23,6 @@ use super::{
 use super::{dpmi, dfs, machine, mode_transitions, xms};
 use super::ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};
 use super::xms::xms_dispatch;
-use super::dos_trace;
 use super::machine::{
     read_u16, write_u16,
     vm86_cs, vm86_ip, vm86_ss, vm86_sp, vm86_flags,
@@ -188,10 +187,8 @@ pub(crate) fn dispatch_kernel_syscall(
             thread::KernelAction::Done
         }
         0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
-        // INT 29h — DOS FAST_CON_OUT: AL = char to display. Routes through
-        // dos_putchar so the char hits the same VGA + debugcon path as
-        // INT 21h text output. Programs that bypass INT 21h (calling
-        // INT 29h directly for speed) now show up in out.log too.
+        // INT 29h — DOS FAST_CON_OUT: AL = char to display. Route through
+        // the normal console path so VGA and debugcon stay in sync.
         0x29 => {
             dos_putchar(regs.rax as u8);
             thread::KernelAction::Done
@@ -577,7 +574,7 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
     // For floppy drives (DL < 0x80), return "drive not ready" error.
     // Hard drives (DL >= 0x80) are also unsupported — return error.
     match ah {
-        // AH=00h Reset Disk — just succeed
+        // AH=00h Reset Disk
         0x00 => {
             regs.rax = regs.rax & !0xFF00; // AH=0 success
             regs.clear_flag32(1);
@@ -691,8 +688,7 @@ fn read_key_resume(echo: bool) -> super::ResumeCallback {
 /// cursor see the correct position.
 fn dos_putchar(c: u8) {
     use crate::arch::outb;
-    // Mirror DOS console output (TCC banner, TLINK errors, etc.) to QEMU
-    // debugcon so it shows up in out.log alongside trace events.
+    // Mirror DOS console output to QEMU debugcon alongside VGA.
     outb(0xE9, c);
     unsafe {
         let col = core::ptr::read_volatile(0x450 as *const u8) as usize;
@@ -922,7 +918,6 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x0C => {
             clear_bios_keyboard_buffer();
             dos.dos_pending_char = None;
-            // Just execute the sub-function in AL
             let sub_ah = regs.rax as u8;
             if sub_ah == 0x06 {
                 if let Some(ch) = poll_dos_console_char(dos) {
@@ -932,7 +927,6 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     regs.set_flag32(0x40); // ZF=1
                 }
             }
-            // Other sub-functions: just return
             thread::KernelAction::Done
         }
         // AH=0x0D: Disk Reset (flush buffers) — no-op on RAM-backed FS
@@ -1097,15 +1091,14 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let count = regs.rcx as u16 as usize;
             let buf_addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             if handle == 0 {
-                // stdin — read from virtual keyboard
-                // Return 0 for now (no line-buffered stdin in VM86)
+                // Line-buffered stdin is not implemented.
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else if handle == 1 || handle == 2 {
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else if handle == NULL_FILE_HANDLE as i32 {
-                // /dev/null — return 0 bytes (EOF)
+                // Null device EOF.
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else if count == 0 || buf_addr == 0 {
@@ -2454,7 +2447,6 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
 
     let prog_name: &[u8] = &filename[..flen];
 
-    // TRACE: log cmdtail and filename BC passes to EXEC
     {
         let mut tail_vis = [0u8; 80];
         let vis_len = copy_len.min(80);
@@ -2468,7 +2460,6 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
             core::str::from_utf8(&tail_vis[..vis_len]).unwrap_or("?"));
     }
 
-    // --- DOS program: in-process exec (shared address space) ---
     let fd = dos_open_program(kt, dos, prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
@@ -2565,7 +2556,6 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
     let psp_seg = loaded.psp_seg;
 
-    // Copy command tail to child's PSP at psp_seg:0080
     Psp::at(loaded.psp_seg).set_cmdline(&tail[..copy_len]);
     dos.dta = (psp_seg as u32) * 16 + 0x80;
     // DPMI host obligation: parent's PM state must not be observable to the
@@ -2598,8 +2588,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     }
     super::dpmi::install_kernel_ldt_slots(dos);
     super::dpmi::reset_pm_vectors(dos);
-    // LDTR still points at parent's LDT box (which now lives in ExecParent).
-    // Reload so the CPU sees the fresh child LDT if child enters DPMI.
+    // Reload LDTR after swapping in the child LDT.
     dos.on_resume();
     dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
@@ -2638,11 +2627,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     regs.ds = psp_seg as u64;
     regs.es = psp_seg as u64;
     regs.clear_flag32(1);
-    // The child is a fresh DOS program — runs in VM86 regardless of who
-    // EXEC'd it. If the EXEC originated from a PM client (bcc via
-    // dpmiload's PMDOS path), regs was PM on entry; flip VM_FLAG so the
-    // dispatch tail (rm_stub_dispatch's vm86_pop or pmdos_int21_handler's
-    // mode-discriminator branch) treats it as a VM86 entry.
+    // Children always start in VM86; PM parents resume through the dispatch tail.
     regs.frame.rflags |= machine::VM_FLAG as u64;
     dos_trace!("  exec_program loaded: cs:ip={:04X}:{:04X} ss:sp={:04X}:{:04X} heap_seg={:04X}",
         cs, ip, ss, sp, dos.heap_seg);
@@ -3013,6 +2998,7 @@ impl Psp {
     pub fn at(psp_seg: u16) -> &'static mut Self {
         unsafe { &mut *(((psp_seg as u32) << 4) as *mut Self) }
     }
+    #[allow(dead_code)]
     pub fn psp_seg(&self) -> u16 { (self as *const _ as u32 >> 4) as u16 }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
     pub fn set_cmdline(&mut self, tail: &[u8]) {
@@ -3167,6 +3153,7 @@ pub(super) fn heap_start() -> u16 {
 
 /// The system Program (master env + stand-in PSP) used as bootstrap parent
 /// for the initial DOS thread and as chain-terminator for PSP[0x16].
+#[allow(dead_code)]
 pub(super) fn boot_psp() -> &'static mut Psp {
     &mut low_mem().boot_psp
 }
@@ -3285,6 +3272,7 @@ pub(super) struct ParentRef<'a> {
 /// Output of a successful binary load — segment layout plus initial CPU
 /// register values for the VM86 thread.
 pub(super) struct Loaded {
+    #[allow(dead_code)]
     pub env_seg: u16,
     pub psp_seg: u16,
     pub cs: u16,
@@ -3292,6 +3280,7 @@ pub(super) struct Loaded {
     pub ss: u16,
     pub sp: u16,
     /// First paragraph past the loaded image (= `psp_seg + program_paras`).
+    #[allow(dead_code)]
     pub end_seg: u16,
 }
 
@@ -3547,7 +3536,6 @@ fn init_psp(psp_seg: u16, env_seg: u16, parent_psp: u16) {
         ..Default::default()
     };
 
-    // TRACE: dump env block (first 80 bytes) for debugging.
     let env = env_bytes(env_seg, 80);
     let mut dump = [0u8; 80];
     for (i, &b) in env.iter().enumerate() {
@@ -3681,11 +3669,7 @@ pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
         core::ptr::copy_nonoverlapping(load_data.as_ptr(), load_base as *mut u8, load_size);
     }
 
-    // Zero BSS from end of load module up to end_seg. DOS itself doesn't —
-    // the MZ loader just copies the image and allocates extra paragraphs
-    // uninitialized; real CRTs (Borland c0, Watcom cstart, ...) zero BSS
-    // from linker symbols. We zero defensively on re-exec, where the backing
-    // pages may retain prior-run data.
+    // Zero the allocation tail so re-exec cannot expose stale data past the image.
     let bss_start = load_base + load_size as u32;
     let bss_end = (end_seg as u32) << 4;
     if bss_end > bss_start {

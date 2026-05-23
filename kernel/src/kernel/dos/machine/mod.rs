@@ -27,9 +27,6 @@ pub const IOPL_MASK: u32 = 3 << 12;
 pub const IOPL_VM86: u32 = 1 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
 
-pub const NT_FLAG: u32 = 1 << 14;
-/// Flags that user code cannot change (IOPL, VM, NT)
-pub const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG | NT_FLAG;
 
 /// HMA spans 16 pages (64KB) starting at page 0x100.
 const HMA_PAGE: usize = 0x100;
@@ -348,9 +345,8 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         //
         //  - bit 0 (display-disabled / blanking) — per-read counter toggling
         //    every 8 reads. Models *horizontal* blanking, which on real VGA
-        //    pulses at ~31.5 kHz (every scanline); a once-per-frame block
-        //    (the obvious encoding) made Build engine's per-DAC-entry
-        //    snow-avoidance wait take ~60 s for a Duke3D fade. Runs of 8
+        //    pulses at ~31.5 kHz (every scanline); frame-scale blanking
+        //    makes Build engine's per-DAC-entry snow-avoidance wait too slow. Runs of 8
         //    ones/zeros also satisfy "6+ consecutive bit0=X" idioms
         //    (Wolf3D's VL_SetScreen pre-CRTC-write wait, etc.) Vsync ⊂
         //    blanking, so bit 0 is forced 1 whenever bit 3 is set.
@@ -358,11 +354,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // The real `inb(0x3DA)` is retained for its hardware side-effect:
         // resetting the VGA attribute-controller flip-flop.
         0x3DA => {
-            // Real port read: hardware retrace bits AND resets the VGA
-            // attribute-controller flip-flop. On real iron the bits are
-            // authoritative (the CRTC drives them from the scan position);
-            // under QEMU they're stuck, so we synthesize below. Flip this
-            // when deploying on real hardware.
+            // Preserve the 0x3DA side effect: reset the attribute-controller flip-flop.
             let real = crate::arch::inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
             let use_real_vga_retrace = false;
@@ -423,7 +415,6 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
             let v = pc.sb.sb_read(p);
-            // [SB-IO] in trace disabled per request.
             v
         }
         // Virtual 8237 DMA controller. SB channel count register is
@@ -431,9 +422,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // poll it for DMA progress, not just completion).
         p if Dma8237::owns(p) =>
             pc.sb.dma_read(p),
-        // Unknown ports: return 0xFF (unpopulated bus). Diagnostic — log to
-        // surface ports the BIOS or guest expects responses on but we don't
-        // virtualize.
+        // Unknown ports read as an unpopulated ISA bus and are logged for missing-device coverage.
         _ => {
             crate::dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
             0xFF
@@ -481,10 +470,7 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 }
             }
         }
-        // Gameport one-shot trigger: no card on this ISA bus window (see
-        // emulate_inb above; full 0x200-0x20F to match the read side and
-        // the 10-bit alias fold). Writes to absent devices are dropped on
-        // real hardware too — silently swallow rather than flood the log.
+        // Gameport one-shot trigger: no card is present on this ISA window.
         0x200..=0x20F => {}
         // Master PIC data (write IMR)
         0x21 => pc.vpic.imr = val,
@@ -519,7 +505,6 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            // [SB-IO] out trace disabled per request.
             pc.sb.sb_write(p, val);
         }
         // Virtual 8237 DMA controller (generic). After capturing the
@@ -529,9 +514,7 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
             pc.sb.dma.io_write(p, val);
             pc.sb.maybe_remap();
         }
-        // Unknown ports: silently ignore (BIOS probes various ports during mode switches).
-        // Diagnostic — log so we can spot ports SeaBIOS / guest writes to
-        // that we need to virtualize but currently drop.
+        // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {
             crate::dbg_println!("[port] out {:04X} <- {:02X} (unhandled)", port, val);
         }
@@ -628,11 +611,6 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             }
         }
         Irq::Tick => {
-            // DIAG: while an SB block is armed, sample QEMU's i8257 ch1
-            // count every tick to see the now[COUNT] trajectory across
-            // the block (climbs to 0xFFFF => ordering; flat at base =>
-            // sb16 not driving this channel's counter).
-            // [SB-DMA] per-tick host-count sampling disabled per request.
             let due = pc.vpit.take_pending_irqs();
             for _ in 0..due {
                 pc.vpic.push(0x08);
@@ -660,7 +638,6 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             let vec = if line < 8 { 0x08 + line } else { 0x70 + (line - 8) };
             if !pc.vpic.has_pending_vec(vec) {
                 pc.vpic.push(vec);
-                // [SB-DMA] relay log + diag host-count sampling disabled per request.
             }
         }
     }
@@ -689,7 +666,6 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
             return None;
         }
     }
-    // [SB-DMA] deliver-vec0D trace disabled per request.
     let master_irq = vec.wrapping_sub(0x08);
     if master_irq < 8 {
         pc.vpic.isr |= 1 << master_irq;

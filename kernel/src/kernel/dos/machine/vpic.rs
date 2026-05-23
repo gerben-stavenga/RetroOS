@@ -1,7 +1,5 @@
 //! Virtual cascaded 8259 PIC state (per thread).
 
-use super::*;
-
 pub const VPIC_QUEUE_SIZE: usize = 64;
 
 /// Virtual cascaded 8259 PIC pair (one per thread).

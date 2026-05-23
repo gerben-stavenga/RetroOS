@@ -14,9 +14,9 @@ const PTE_CACHE_DISABLE: u64 = 1 << 4;
 //
 // A DOS program programs the 8237 with a *DOS-physical* buffer address,
 // but runs paged in VM86, so the real DMA engine would fetch the wrong
-// memory. We capture every channel's programming here; the SB-DMA layer
-// (see [`SbDmaState`]) later translates the BLASTER-declared channel onto
-// the real card's channel by remapping the guest buffer contiguous.
+// memory. We capture every channel's programming here; `SbDmaState` maps
+// the BLASTER-declared channel onto the real card's channel by remapping
+// the guest buffer contiguous.
 //
 // Two cascaded controllers: #1 = 8-bit channels 0-3 (ports 0x00-0x0F),
 // #2 = 16-bit channels 4-7 (ports 0xC0-0xDF, register stride ×2). Page
@@ -39,7 +39,7 @@ pub struct DmaProg {
 /// persist across re-arms (single-cycle drivers rewrite only addr+count
 /// each block, reusing mode/page). Two orthogonal control bits sit
 /// beside it, exactly as on the real chip — neither discriminates
-/// `prog`'s validity, both just gate behaviour, so every combination is
+/// `prog`'s validity, and every combination is
 /// physically meaningful (no illegal states):
 ///  - `masked` — channel masked (DRQ ignored); starts masked.
 ///  - `armed`  — the current programming has been handed to the real
@@ -234,15 +234,12 @@ impl SbDmaState {
         }
     }
 
-    /// DIAG: QEMU i8257 current count for the SB 8-bit host channel,
-    /// sampled at IRQ-relay time — the moment the guest ISR is about to
-    /// read it expecting terminal `0xFFFF`.
+    /// Current QEMU i8257 count for the SB 8-bit host channel.
     pub fn diag_host_count8(&self) -> u16 {
         real_8237_count(self.host_dma8)
     }
 
-    /// DIAG: is virtual channel `ch` currently armed (handed to the real
-    /// chip and not yet completed/reprogrammed from our side)?
+    /// Whether virtual DMA channel `ch` is armed on the real chip.
     pub fn dma_ch_armed(&self, ch: usize) -> bool {
         ch < 8 && self.dma.ch[ch].armed
     }
@@ -430,7 +427,7 @@ impl SbDmaState {
         // SB DMA-channel probe: the driver fires tiny (≤ a few bytes)
         // single-cycle transfers at assorted low addresses purely to
         // confirm DMA+IRQ wiring — it ignores the data. Never alias those
-        // (page 0 = IVT); just point the real chip at the channel buffer
+        // (page 0 = IVT); point the real chip at the channel buffer
         // so the transfer completes and raises the IRQ.
         if len < 0x100 || (gpa & !0xFFF) < 0x1000 {
             program_real_8237(host as u8, phys, len, mode, is16);
@@ -624,12 +621,6 @@ fn real_8237_count(host: u8) -> u16 {
 /// mode, addr lo/hi, page, count lo/hi, unmask.
 fn program_real_8237(chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
     use crate::arch::outb;
-    // DIAG: snapshot QEMU's i8257 current count for this channel *before*
-    // we overwrite it. Writing the count reloads now[COUNT]=0, so this
-    // tells us whether a completed transfer (count ~0xFFFF) is being
-    // clobbered back to base by a (re)arm that happened before the guest
-    // read it to validate completion.
-    // [SB-DMA] program_real_8237 entry trace + pre-count sampling disabled per request.
     // Standard PC/AT page-register ports indexed by absolute channel.
     const PAGE: [u8; 8] = [0x87, 0x83, 0x81, 0x82, 0x8F, 0x8B, 0x89, 0x8A];
     if is16 {

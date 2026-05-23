@@ -330,19 +330,6 @@ fn event_loop(first_tid: usize) {
     let mut ev_pf: u32 = 0;
     let mut ev_exc: u32 = 0;
     let mut ev_syscall: u32 = 0;
-    // Cycle time spent in each phase, accumulated over a profile period:
-    //   - phase1_cycles: arch::drain + queue_irq + raise_pending in Phase 1.
-    //   - dispatch_cycles: handle_event after the user trap.
-    //   - max_dispatch: largest single handle_event call this period.
-    let mut phase1_cycles: u64 = 0;
-    let mut dispatch_cycles: u64 = 0;
-    let mut max_dispatch: u64 = 0;
-    // Per-INT-vector counts so when softint=N is high we can see whether
-    // it's INT 21 (DOS), INT 67 (EMS), INT 31 (DPMI), etc.
-    let mut ev_softint_hist: [u32; 256] = [0; 256];
-    let mut ev_in_hist: [u32; 16] = [0; 16];   // bucketed by port high-nibble
-    let mut ev_out_hist: [u32; 16] = [0; 16];
-
     // REGS already set up by startup, page tables correct from boot
     loop {
         event_counter = event_counter.wrapping_add(1);
@@ -775,7 +762,7 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
         // is the first thing to check when buffer paints but screen is
         // black — most often SEQ[1] bit 5 = screen-off, GC[6] framebuffer
         // mapping, or AC mode register text-vs-graphics).
-        unsafe {
+        {
             use crate::arch::{inb, outb};
             let _ = inb(0x3DA);
             let misc = inb(0x3CC);
@@ -1026,6 +1013,7 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
 /// Allocate `num_pages` physically contiguous, ISA-DMA-safe pages
 /// (< 16 MB, not crossing a `1 << boundary_log2` boundary). Returns the
 /// starting physical page number, or 0 on failure.
+#[allow(dead_code)]
 pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
     let r: u32;
     unsafe {
@@ -1040,6 +1028,7 @@ pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
 }
 
 /// Free a contiguous run previously returned by `arch_alloc_phys_contig`.
+#[allow(dead_code)]
 pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
     unsafe {
         core::arch::asm!(

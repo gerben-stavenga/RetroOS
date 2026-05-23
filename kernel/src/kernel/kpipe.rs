@@ -77,6 +77,7 @@ pub fn write(idx: u8, data: &[u8]) -> i32 {
 }
 
 /// Remove the last written byte (for backspace line editing). Returns true if removed.
+#[allow(dead_code)]
 pub fn pop_back(idx: u8) -> bool {
     unsafe { PIPES[idx as usize].buffer.pop_back() }
 }

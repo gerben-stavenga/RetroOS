@@ -19,7 +19,7 @@ mod x86;
 // --- Re-exports for the kernel layer (ring 1) ---
 
 // Types
-pub use paging2::{KernelPages, RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE, unmap_kernel_page};
+pub use paging2::{KernelPages, RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE};
 pub use irq::Irq;
 pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 
@@ -30,7 +30,7 @@ pub(crate) use traps::REGS;
 // Power/halt entry points. The kernel layer must not toggle IF directly —
 // `cli`/`sti` stay arch-private; use `halt_forever` (panic) and
 // `without_irqs` (critical sections) instead.
-pub use x86::{hlt, shutdown};
+pub use x86::shutdown;
 
 /// Disable interrupts and halt forever. For panic / shutdown failure.
 pub fn halt_forever() -> ! {

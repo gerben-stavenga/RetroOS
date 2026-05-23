@@ -407,6 +407,7 @@ pub struct PaePages {
 }
 
 /// Kernel page tables (3 pages for PAE, 2 for legacy)
+#[allow(dead_code)]
 pub struct KernelPages([RawPage; 3]);
 
 impl KernelPages {

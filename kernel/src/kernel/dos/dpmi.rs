@@ -20,7 +20,6 @@ use super::mode_transitions::{seg_base, seg_is_32};
 use crate::kernel::startup;
 use crate::Regs;
 
-use super::dos_trace;
 
 /// Number of LDT entries
 pub(super) const LDT_ENTRIES: usize = 8192;
@@ -128,7 +127,7 @@ pub struct DpmiState {
 
 /// A DPMI linear memory block
 #[derive(Clone, Copy)]
-struct MemBlock {
+pub struct MemBlock {
     base: u32,
     size: u32,
 }
@@ -141,7 +140,7 @@ struct MemBlock {
 /// the non-current mode here so raw mode switches can be nested safely.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct RawModeState {
+pub struct RawModeState {
     flags: u32,
     cs: u16,
     ip: u32,
@@ -246,11 +245,6 @@ impl DpmiState {
         *desc |= (((base >> 24) & 0xFF) as u64) << 56;
     }
 
-    /// Check if a descriptor has the D/B (default operation size) bit set (32-bit)
-    fn desc_is_32(desc: u64) -> bool {
-        desc & (1u64 << 54) != 0
-    }
-
     /// Match CWSDPMI's "segment to descriptor" reuse heuristic:
     /// 64 KiB byte-granularity descriptor with base == seg << 4.
     fn desc_is_seg_alias(desc: u64, base: u32) -> bool {
@@ -330,7 +324,7 @@ pub(super) fn install_kernel_ldt_slots(dos: &mut thread::DosState) {
     let host_limit = dos::host_stack_size() - 1;
     mark(dos, super::mode_transitions::HOST_STACK_PM16_LDT_IDX, DpmiState::make_data_desc_ex(host_base, host_limit, false));
     mark(dos, super::mode_transitions::HOST_STACK_PM32_LDT_IDX, DpmiState::make_data_desc_ex(host_base, host_limit, true));
-    // PSP_LDT_IDX is written per RM→PM by `enter_pm_psp_view`; just reserve.
+    // `enter_pm_psp_view` fills PSP_LDT_IDX on each RM→PM transition.
     dos.ldt_alloc[PSP_LDT_IDX / 32] |= 1 << (PSP_LDT_IDX % 32);
 
     reset_pm_vectors(dos);
@@ -428,9 +422,7 @@ pub(super) fn ldt_is_allocated(ldt_alloc: &[u32], idx: usize) -> bool {
 /// Called from rm_int31_dispatch when the DPMI entry stub executes.
 pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
-    // Save VM86 register state for the FAR CALL return address
-    // The FAR CALL pushed CS:IP on the real-mode stack.
-    // Pop the return address so we know where to resume in PM.
+    // DPMI entry is a FAR CALL; the real-mode stack holds the PM return CS:IP.
     let ret_ip = machine::vm86_pop(regs);
     let ret_cs = machine::vm86_pop(regs);
     let real_ss = regs.stack_seg();
@@ -440,7 +432,6 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
         ret_cs, ret_ip, dos.current_psp, real_ss, real_sp, regs.ds as u16, regs.es as u16);
     let entry_rm_state = capture_real_mode_state(regs, ret_cs, ret_ip, real_ss, real_sp);
 
-    // Allocate DPMI state
     let mut dpmi = DpmiState::new();
     dpmi.mem_next = dos.dpmi_mem_next;
     dpmi.client_use32 = client_type != 0;
@@ -486,12 +477,6 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let ds_sel = DpmiState::idx_to_sel(CLIENT_DS_LDT_IDX);
     let ss_sel = DpmiState::idx_to_sel(CLIENT_SS_LDT_IDX);
 
-    // The DPMI 0.9 §3.1.3 real-mode stack lives in `LowMem.rm_stack`
-    // (kernel-managed, paragraph-aligned, 0x200 bytes — the spec
-    // minimum). Shared by all kernel-orchestrated RM excursions; nested
-    // use is reentrant via the snapshot-on-locked-stack discipline. No
-    // DOS-heap allocation needed.
-
     // Round client allocation pool up to a 1 MB boundary. DOS/4GW appears to
     // treat the first 0501 base as a slab origin and takes a private code path
     // when it is not MB-aligned (matches CWSDPMI's VADDR_START=0x400000).
@@ -523,9 +508,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // LDTR at it. Mutations to `dos.ldt[CLIENT_CS/DS/SS]` are visible to the
     // CPU without reloading.
 
-    // One-time LDT dump for DPMI client init (debugging RM-segment alias logic
-    // in protected-mode loaders like DOS/4GW that compute paragraph segments
-    // from PM descriptor bases).
+    // Trace non-empty low LDT slots for clients that derive paragraphs from descriptor bases.
     for i in 1..8 {
         let d = dos.ldt[i];
         if d != 0 {
@@ -534,8 +517,6 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
         }
     }
 
-    // Switch regs from VM86 to protected mode:
-    // Clear VM flag, set PM selectors, set EIP to return offset
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
     regs.frame.rflags |= machine::IF_FLAG as u64;
     regs.frame.cs = cs_sel as u64;
@@ -555,15 +536,6 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
 // CLI/STI/PUSHF/POPF/IRET directly (fast-path iret to user) and bubbles
 // INT/HLT/IN/OUT/INS/OUTS up as `KernelEvent`s. PM software-INT dispatch
 // for installed client vectors is `mode_transitions::deliver_pm_int`.
-
-
-
-
-
-
-// ============================================================================
-// PM stub dispatch — INT 31h from the unified CD 31 array
-// ============================================================================
 
 
 // ============================================================================
@@ -589,7 +561,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16,
         regs.code_seg(), regs.ip32() as u16);
 
-    // PM TF single-step arming (disabled — flip the `if false` to re-enable).
+    // Optional PM TF single-step arming.
     #[allow(dead_code)]
     if false {
         use core::sync::atomic::Ordering;
@@ -1189,7 +1161,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             let new_size = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
             let aligned = (new_size + 0xFFF) & !0xFFF;
-            // Grow in place — all memory is demand-paged so we just update the size.
+            // Grow in place; pages are committed lazily.
             // This preserves existing data (pages already faulted in stay mapped).
             let mut base = handle;
             let mut found = false;
@@ -1440,7 +1412,7 @@ fn host_stack_read_call_args(ldt: &[u64], cursor: (u16, u32)) -> CallStubFrame {
 /// is critical: writeback uses *current* (post-RM) regs, so it must run
 /// before `restore_gp` overwrites them.
 pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
-    // User just RM-IRETed onto rm side; pm cursor lives in other_stack.
+    // After RM-side IRET, `other_stack` holds the PM cursor.
     // CallStubFrame is the topmost record, ModeSave below it.
     let cursor0 = super::mode_transitions::pm_get_stack(dos, regs);
     let stub = host_stack_read_call_args(&dos.ldt[..], cursor0);
@@ -1486,7 +1458,7 @@ pub(super) fn rm_iret_call(dos: &mut thread::DosState, regs: &mut Regs) {
     save.restore(regs);
     dos.pc.locked_stack.other_stack = save.other_stack();
 
-    // callback_entry path: ModeSave captured RM, so we just restored to
+    // callback_entry path: ModeSave captured RM, so this restored to
     // VM86 with cs:ip = STUB_SEG:slot+2 (the trap-incremented IP, which
     // points at the *next* slot's CD 31). The RM caller reached us via
     // CALL FAR, so pop the 4-byte return frame from the RM stack to land
@@ -1892,10 +1864,8 @@ struct ExcFrame32 {
 /// DPMI 1.0 expanded exception frame body (56 bytes). Sits at
 /// SS:(E)SP+20H regardless of client/handler bitness — per spec, the
 /// expanded frame always uses 32-bit fields and lives above the 0.9
-/// frame. We unconditionally write this on every dispatch so a future
-/// 0212H/0213H install path has the data already in place; a 0.9
-/// handler (Function 0203H install) reads only the +0..+1FH portion
-/// and is oblivious to the bytes above.
+/// frame. It is written on every dispatch; 0.9 handlers read only the
+/// +0..+1FH portion and ignore the expanded bytes above it.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ExcFrameV10 {
@@ -1924,8 +1894,7 @@ struct ExcFrameV10 {
 /// The trailing `_pad` bytes bring `RetF16 + ExcFrame16` to exactly 32
 /// bytes (0x20). A 16-bit 0.9 handler reads at +00H..+0FH and is
 /// oblivious to the padding above; but the constant 0x20 footprint
-/// leaves a stable +20H offset to drop the DPMI 1.0 expanded frame
-/// into when/if a 0212H/0213H handler is installed.
+/// leaves a stable +20H offset for the DPMI 1.0 expanded frame.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ExcFrame16 {
@@ -1944,8 +1913,8 @@ struct ExcFrame16 {
 /// We unconditionally write the full DPMI 1.0 layout on every dispatch:
 /// the 0.9 portion (sized for client_use32) at +00..+1FH, followed by
 /// the 1.0 expanded frame at +20H..+57H. A 0.9 (0203H) handler reads
-/// only the +0..+1FH portion; a 1.0 (0212H/0213H, not yet implemented)
-/// handler additionally reads the expanded portion. Total = 88 bytes.
+/// only the +0..+1FH portion; a 1.0 (0212H/0213H) handler additionally
+/// reads the expanded portion. Total = 88 bytes.
 ///
 /// 32-bit client 0.9 portion:
 ///   [ESP+0]   Return EIP (points to SLOT_EXCEPTION_RET stub)
@@ -2077,10 +2046,8 @@ pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_
     // 1.0 expanded frame (faulting-state portion is always 32-bit
     // fields; same layout for both client bitnesses). Sits at
     // SS:(E)SP+20H regardless of who installed the handler — a 0.9
-    // (0203H) handler simply doesn't read past +1FH. The expanded
-    // RETF target at +20H points at our SAME exception-return stub so
-    // a future 1.0 handler that does `ADD (E)SP, 0x20; RETF` lands in
-    // exception_return as well. Width of that RETF target depends on
+    // (0203H) handler does not read past +1FH. The expanded RETF target
+    // at +20H points at the 1.0 exception-return stub. Width depends on
     // handler bitness: a 32-bit handler pops EIP at +20H + CS at +24H;
     // a 16-bit handler pops IP at +20H + CS at +22H.
     let (v10_ret_eip, v10_ret_cs) = if use32 {
@@ -2257,7 +2224,7 @@ pub(super) fn exception_return(
     let mode_save_sp = dos::host_stack_empty_sp() - super::mode_transitions::MODE_SAVE_SIZE;
 
     // Read whichever view the handler modified. Both views share the
-    // same host_stack region; we just index into the right portion.
+    // Both views share the same host_stack region; index into the selected portion.
     // The handler's own SS:SP after RETF is irrelevant to us — it may
     // have moved arbitrarily (locals, pushes that weren't fully popped)
     // and the host stack is the authoritative scratchpad either way.
@@ -2407,9 +2374,8 @@ pub(super) fn sync_psp_view_for_regs(dos: &mut thread::DosState, regs: &Regs) {
     }
 }
 
-/// PM-to-real raw mode switch.
 /// Raw mode switch PM→real. Called via unified stub slot SLOT_PM_TO_REAL.
-/// AX has new DS directly (stub is just CD 31, no register clobbering).
+/// AX has the new DS directly because the stub is `CD 31`.
 ///
 /// Register convention (set by caller before CALL FAR):
 ///   AX = new real-mode DS
@@ -2431,7 +2397,6 @@ pub(super) fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs)
     }
     restore_rm_psp_view(dos);
 
-    // Set VM86 mode
     regs.frame.rflags |= (machine::VM_FLAG | machine::IF_FLAG) as u64;
     regs.frame.cs = new_cs as u64;
     regs.frame.rip = new_ip as u64;
@@ -2560,7 +2525,6 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     }
     enter_pm_psp_view(dos);
 
-    // Clear VM flag, enter protected mode
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
     regs.frame.rflags |= machine::IF_FLAG as u64;
     regs.frame.cs = new_cs as u64;
@@ -2574,8 +2538,7 @@ pub fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
     dos_trace!("[DPMI] raw RM->PM CS:EIP={:04X}:{:08X} SS:ESP={:04X}:{:08X} DS={:04X} ES={:04X}",
         new_cs, new_eip, new_ss, new_esp, new_ds, new_es);
 
-    // No LDT reload: `dos.ldt` is the same per-thread buffer context switch
-    // already loaded LDTR for; raw mode switch doesn't swap it.
+    // Raw mode switches mutate descriptors in place; LDTR still points at this thread's LDT.
 }
 
 // ============================================================================

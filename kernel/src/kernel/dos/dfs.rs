@@ -4,7 +4,7 @@
 //! form, case-insensitive lookup) over the case-sensitive VFS. Mirrors
 //! DOSBox: the underlying filesystem is Linux-style; DFS walks it
 //! component-by-component to map each DOS component to the real on-disk
-//! case name. Single-drive-C for now; `H:` maps to the `host/` mount.
+//! case name. Drive `C:` is the default DOS root; `H:` maps to the `host/` mount.
 //!
 //! All DOS INT 21h path-bearing handlers must route through DFS — never
 //! touch the raw VFS directly from the DOS layer.
@@ -164,7 +164,6 @@ fn compute_alias_8_3(name: &[u8], existing: &[(Vec<u8>, ci::Entry)]) -> Vec<u8> 
 
     for n in 1u32..=999_999 {
         let mut digits = [0u8; 8];
-        let mut dlen = 0;
         let mut nn = n;
         let mut tmp = [0u8; 8];
         let mut tlen = 0;
