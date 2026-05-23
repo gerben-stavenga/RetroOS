@@ -139,6 +139,21 @@ fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
     Some(ascii)
 }
 
+/// Park the guest at SLOT_RESUME for a blocking I/O wait. Sets CS:IP to
+/// the resume stub AND forces IF in the saved EFLAGS so the IRQ that's
+/// meant to unblock the wait (kbd, timer) can actually deliver while
+/// parked — real DOS BIOS does STI around its wait loops for the same
+/// reason. Without this, AH=01/07/08/0A and the SLOT_RESUME re-park loop
+/// spin forever after any path that entered the dispatcher with IF
+/// cleared (the trap gate at entry, an exception handler, …): pending
+/// kbd/timer IRQs queue in the vPIC but `pick_pending_vec` gates them on
+/// VIF, and VIF is bit 9 of the saved EFLAGS.
+fn park_at_slot_resume(regs: &mut Regs) {
+    machine::set_vm86_cs(regs, STUB_SEG);
+    machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
+    regs.frame.rflags |= machine::IF_FLAG as u64;
+}
+
 // ============================================================================
 // RM INT 31h dispatch — routes from the unified CD 31 array by slot number
 // ============================================================================
@@ -296,7 +311,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             match (cb.0)(kt, dos, regs) {
                 Some(next) => {
                     dos.pending_resume = Some(next);
-                    machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
+                    park_at_slot_resume(regs);
                 }
                 None => {
                     let ret_ip = vm86_pop(regs);
@@ -391,7 +406,7 @@ fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Regs) {
             super::mode_transitions::pop_iret_frame(&dos.ldt[..], regs, client_use32);
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);
-        regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status | machine::IF_FLAG);
+        regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status);
     }
 }
 
@@ -766,8 +781,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 if ah == 0x01 { dos_putchar(ch); }
             } else {
                 dos.pending_resume = Some(read_key_resume(ah == 0x01));
-                machine::set_vm86_cs(regs, STUB_SEG);
-                machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
+                park_at_slot_resume(regs);
             }
             thread::KernelAction::Done
         }
@@ -801,8 +815,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 return thread::KernelAction::Done;
             }
             dos.pending_resume = Some(buffered_input_resume(buf_lin, max_chars, 0));
-            machine::set_vm86_cs(regs, STUB_SEG);
-            machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
+            park_at_slot_resume(regs);
             return thread::KernelAction::Done;
         }
         // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready.
@@ -2610,10 +2623,15 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     });
 
     // Set child entry. Push child's CS:IP + FLAGS onto the child's stack
-    // so that rm_int31_dispatch's pop restores them correctly.
+    // so that rm_int31_dispatch's pop restores them correctly. Force IF
+    // on in the pushed flags — DOS hands every program "interrupts on";
+    // the parent's current EFLAGS (inherited here) has IF cleared because
+    // the INT 21h trap gate cleared it on entry, and without this the
+    // child boots with IRQ delivery blocked and any wait/scheduling-tick
+    // dependency hangs forever (e.g. OMF after re-launch from a launcher).
     regs.set_ss32(ss as u32);
     regs.set_sp32(sp as u32);
-    let flags = vm86_flags(regs) as u16;
+    let flags = (vm86_flags(regs) as u16) | (machine::IF_FLAG as u16);
     vm86_push(regs, flags);
     vm86_push(regs, cs);
     vm86_push(regs, ip);

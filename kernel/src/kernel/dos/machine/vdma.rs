@@ -250,9 +250,24 @@ impl SbDmaState {
     /// Release any SB-DMA binding this thread holds — exec/exit cleanup.
     /// The per-channel buffers are permanent; this just detaches the guest
     /// alias and clears the re-arm cursor so a reused `SbDmaState` can't
-    /// dangle. Idempotent.
+    /// dangle. Also resets the SB DSP and masks the host SB channels so
+    /// the next program sees a clean card — without this, OMF re-launch
+    /// from a launcher inherits OMF1's mid-playback DSP / armed-8237
+    /// state and OMF2's sound-init probe falls into a "wait for the card
+    /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
+    /// trace). Idempotent.
     pub fn release_dma_pool(&mut self) {
         self.unbind();
+        // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
+        // this atomically; the hardware ~3 µs hold is irrelevant under
+        // emulation. Puts the DSP back in its post-power-on state so the
+        // next program's reset+probe behaves like the first one's.
+        crate::arch::outb(self.io_base + 0x06, 1);
+        crate::arch::outb(self.io_base + 0x06, 0);
+        // Stop any in-flight host DMA cold; the next bind reprograms and
+        // unmasks. host_dma8/host_dma16 are the SB16's 8-bit/16-bit lines.
+        mask_real_8237(self.host_dma8);
+        mask_real_8237(self.host_dma16);
         self.suspended = false;
         self.last_gen = [0; 8];
     }

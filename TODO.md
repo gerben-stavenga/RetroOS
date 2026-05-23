@@ -29,33 +29,12 @@
       (broke nested IRQ delivery on a non-host-stack handler stack).
 
 ## Hexen
-- [ ] Doesn't boot. Launches via DOS32A; loads `HEXEN.CFG` and `HEXEN.WAD`,
-      then hangs in a tight PM poll at `00c7:0x00541b2c`:
-      `cmp eax, [0x005d6dc8]; jz $-6` with EAX=0. EFLAGS=0x00101046 →
-      **IF=0, VIP=1**, vpic `pending=[09,08]` (timer + keyboard queued
-      but undeliverable). The polled variable would be bumped by Hexen's
-      timer ISR, but IRQs are masked.
-- [ ] Most likely root: our virtual-IF tracking drops IF=0 across some
-      boundary and never restores. Suspect paths: PM `INT 21h` reflect/IRET
-      (lots in the trace before the hang), or a TF=1 single-step artifact
-      around CLI/STI virtualization.
-- [ ] Fix: instrument virtual-IF state at every CLI/STI/POPF/IRET site,
-      re-run, find where IF=1→0 isn't paired with a 0→1.
+- [x] Works.
 
 ## Monkey Island 1 / Indiana Jones IV (Atlantis) — SCUMM
-- [ ] Both hang at startup before the LucasArts logo paints. Same trap
-      point: stuck inside SeaBIOS `wait_irq` (`STI; HLT; CLI; CLD; RETD`
-      at F000:B7C0) reached via `INT 15h` from the game (atlantis's
-      caller is at `1222:0x1c89`).
-- [ ] BIOS time-of-day at `0040:006C` IS advancing (~18 Hz, confirmed by
-      vector_stub_reflect trace), and the BIOS keyboard ring tail
-      advances when keys are pressed — but the game never reads from
-      head, so it isn't waiting on INT 16. Likely AH=86 (Wait us) with
-      a long count, AH=83 (Event Wait), or a per-tick callback that
-      isn't firing the way SCUMM expects.
-- [ ] Diagnosis: hook IVT[0x15] at boot via a CD-31 + JMP FAR stub so
-      we see the entry AX/CX/DX of every INT 15h call (we don't trap
-      these otherwise — IVT goes through real-mode dispatch).
+- [ ] Both hang at startup before the LucasArts logo paints. Stuck inside
+      SeaBIOS `wait_irq` (`STI; HLT; CLI; CLD; RETD` at F000:B7C0). INT
+      15h is not the trigger — needs fresh diagnosis.
 
 ## Duke Nukem 3D — via DOS/4GW (no LOADFIX wrap)
 - [ ] With DOS32A wrap (LOADFIX) it works; without, DOS/4GW triggers an
@@ -70,20 +49,13 @@
       itself is a DOS/4GW-internal issue.
 
 ## Duke Nukem 3D — palette fades super-slow
-- [ ] After commit `efe5911` (wallclock-paced 0x3DA), Build engine's
-      `palto()` palette fades take ~20 s each instead of <1 s. Trace
-      shows the inner spin pinned at PM EIP `00c7:0x005455CE-D8` doing
-      ~140 k `inb 0x3DA` per second with `irq=` count in [prof] dropped
-      ~5× vs. boot-time (timer IRQ starvation under heavy #GP traffic),
-      so `get_ticks()` advances slower than wall-time → wallclock vsync
-      cycle stretches well past 14.3 ms.
-- [ ] Suspect: `let _real = crate::arch::inb(0x3DA);` in `emulate_inb`
-      runs a real-hardware PIO per trapped read to keep the AC
-      flip-flop synchronized — that's a host-exit on every iteration
-      of the guest's spin and likely the dominant cost / IRQ-blocking
-      culprit. Move it behind a "VGA state changed since last save"
-      guard or drop it for the synthesized 0x3DA path.
-- [ ] Don't revert `efe5911` — Epic Pinball's pacing fix lives there.
+- [x] Fixed (commit `b9a7f41`): synthetic `0x3DA` bit 0 now toggles via
+      a per-read counter (runs of 8) instead of a once-per-frame block,
+      so Build's per-DAC-entry snow-avoidance wait finds a blanking
+      window in ≤16 reads instead of stalling a full ~14 ms frame
+      between writes. ~4096 DAC writes × ~14 ms ≈ 60 s collapsed back
+      to <1 s. Bit 3 (vsync) still on the 70 Hz wallclock phase so
+      Wolf3D's `VL_WaitVBL` and Epic Pinball's pacing are unaffected.
 
 ## Zone 66 (PMODE/W extender)
 - [x] Original "PMODE doesn't work" hang fixed by two virtual-PC
@@ -157,11 +129,19 @@
       `-accel`), inflating every trap. Rejected dead-ends: auto-init
       special-case + kernel-side 2xEh ack (reverted — both hacks); the
       0x22E-read re-arm idea (wrong; EOI 0x20 is the right trigger).
-- [ ] Restart from launcher after quitting OMF hangs. Likely uncleaned
-      DOS-exit/exec state on the sb-dma-virt path — SB DMA pool binding,
-      host-IRQ5 mask state, or virtual-8237 armed state not reset.
-      Check `release_dma_pool` / IRQ-mask reset on `exec_dos_into` and
-      program exit.
+- [ ] Restart from launcher after quitting OMF hangs. **Diagnosis
+      confirmed** via fresh trace: OMF2 enters a tight `INT 21 AH=2C`
+      (GetTime) timeout loop that OMF1 never executes (526 calls vs 0)
+      — different sound-init branch. EFLAGS in the loop: IF=0, VIP=1,
+      vpic `pending=[08,0F,09]` (timer + SB IRQ + kbd queued, all
+      blocked by IF=0). BIOS tick at `0:046C` therefore can't advance,
+      AH=2C returns the same time forever, the timeout never fires.
+      Root is *not* IF=0 itself (umbrella IF-stuck bug downstream) —
+      it's persistent HW state (most likely SB DSP / real 8237 / host-
+      IRQ5 mask) carried over from OMF1 sending OMF2 down a "wait for
+      the card to settle" branch. Speculative fix: issue an SB DSP
+      reset and mask the host SB channels in `release_dma_pool` so the
+      next program sees a clean card.
 
 ## Kernel — virtual IF gets stuck at 0
 - [ ] Intermittent across games: a program runs fine for a while then
