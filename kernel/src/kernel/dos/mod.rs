@@ -5,7 +5,7 @@
 //! and VGA register set, and `arch::monitor` which decodes #GP-faulting
 //! sensitive instructions. This module provides the public surface; the
 //! INT-handler implementation lives in `dos.rs`, the DPMI extender in
-//! `dpmi.rs`, the VFS bridge in `dfs.rs`, the virtual PC machine in
+//! `dpmi`, the VFS bridge in `dfs.rs`, the virtual PC machine in
 //! `machine.rs`, and XMS/EMS/UMA in their own files.
 //!
 //! The BIOS ROM at 0xF0000-0xFFFFF and the BIOS IVT at 0x0000-0x03FF are
@@ -390,7 +390,7 @@ fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
 /// | PM   | client selector   | `dpmi::dpmi_api`              | DPMI services (by AX)               |
 ///
 /// Lives at the personality root because INT 31h spans both submodules
-/// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi.rs`).
+/// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi`).
 pub fn syscall(
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,

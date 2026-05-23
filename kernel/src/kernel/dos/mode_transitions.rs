@@ -886,7 +886,7 @@ pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
 // LDT descriptor decode helpers
 // =============================================================================
 //
-// Used by the iret-frame primitives, the stub dispatchers, and dpmi.rs's own
+// Used by the iret-frame primitives, the stub dispatchers, and the `dpmi` module's own
 // LDT management. Bare descriptor decode — no DPMI session knowledge.
 
 /// Get the base address for any selector. GDT selectors (TI=0) are flat.
