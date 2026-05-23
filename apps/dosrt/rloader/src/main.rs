@@ -12,7 +12,7 @@
 #![no_main]
 
 use dosrt::{dos, dpmi, putc, puthex32, puthex8, puts};
-use lib::elf::Elf;
+use lib::elf::{Elf, Elf32Dyn, Elf32Rel, DT_NULL, DT_REL, DT_RELSZ, R_386_RELATIVE};
 
 // RLOADER's own crt. The stub built a 32-bit CODE selector over the
 // RLOADER buffer (base = buf-0x1000) and far-called `_start` as
@@ -165,6 +165,10 @@ extern "C" fn rloader_main() -> ! {
         let mut segs = [Seg::default(); MAX_SEG];
         let mut nseg = 0usize;
         let entry;
+        // PT_DYNAMIC's `(vaddr, memsz)` for a PIE payload; `(0, 0)` for a
+        // plain ET_EXEC — the relocation pass then no-ops.
+        let mut dyn_vaddr = 0u32;
+        let mut dyn_size = 0u32;
         {
             let buf: &[u8] = unsafe { &*core::ptr::addr_of!(ELFBUF) };
             let e = match Elf::parse(&buf[..nread]) {
@@ -182,6 +186,10 @@ extern "C" fn rloader_main() -> ! {
                 };
                 nseg += 1;
             }
+            if let Some((dv, ds)) = e.dynamic() {
+                dyn_vaddr = dv as u32;
+                dyn_size = ds as u32;
+            }
         }
         puts(" entry=");
         puthex32(entry);
@@ -194,7 +202,7 @@ extern "C" fn rloader_main() -> ! {
         puts(" f=");
         puthex32(segs[0].fsz);
         puts("\r\n");
-        load_and_run(handle, &segs[..nseg], entry);
+        load_and_run(handle, &segs[..nseg], entry, dyn_vaddr, dyn_size);
     }
 }
 
@@ -213,7 +221,8 @@ const MAX_SEG: usize = 8;
 /// so the payload's link addresses resolve verbatim; limit is flat 4 GB.
 /// Never returns.
 #[inline(never)]
-fn load_and_run(handle: u16, segs: &[Seg], entry: u32) -> ! {
+fn load_and_run(handle: u16, segs: &[Seg], entry: u32,
+                dyn_vaddr: u32, dyn_size: u32) -> ! {
     // Span [min_vaddr, max_end) over all PT_LOADs.
     let mut min_v = u32::MAX;
     let mut max_e = 0u32;
@@ -234,12 +243,15 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32) -> ! {
         Some(l) => l,
         None => { puts("dosrt: AX=0501 FAIL\r\n"); hang(); }
     };
-    // selector-base trick: base + p_vaddr == lin + (p_vaddr - min_v)
-    let base = lin.wrapping_sub(min_v);
+    // Payloads are PIE: their selectors are base=0 flat, and the
+    // `R_386_RELATIVE` fixups (applied below) bias every absolute slot by
+    // the load address. `load_bias = lin - min_v` is what the fixups add;
+    // for a PIE linked at 0 that is just `lin`.
+    let load_bias = lin.wrapping_sub(min_v);
     let code = dpmi::alloc_ldt();
     let data = dpmi::alloc_ldt();
     for s in [code, data] {
-        dpmi::set_base(s, base);
+        dpmi::set_base(s, 0);
         dpmi::set_limit(s, 0xFFFF_FFFF);
     }
     // G=1 so the limit-field 0xFFFFF set above means 4 GB - 1, not 1 MB - 1.
@@ -251,8 +263,8 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32) -> ! {
     puthex32(lin);
     puts(" sz=");
     puthex32(size);
-    puts(" base=");
-    puthex32(base);
+    puts(" bias=");
+    puthex32(load_bias);
     puts("\r\n");
 
     // Stream each PT_LOAD straight from disk into payload memory.
@@ -276,7 +288,21 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32) -> ! {
         }
     }
 
-    let sp_top = min_v + size;               // selector-relative; grows down
+    // Apply PIE relocations: patch each `R_386_RELATIVE` slot by
+    // `load_bias`. A plain ET_EXEC has no PT_DYNAMIC, `dyn_size == 0`,
+    // and this is skipped.
+    if dyn_size != 0 {
+        let nreloc = apply_relocations(load_bias, ds_base, dyn_vaddr, dyn_size);
+        puts("dosrt: relocs=");
+        puthex32(nreloc);
+        puts("\r\n");
+    }
+
+    // Payload selectors are base=0 flat, so SS:ESP and CS:EIP are plain
+    // linear addresses. Stack grows down from the top of the allocation;
+    // the entry vaddr is biased onto the load address.
+    let sp_top = lin + size;
+    let entry_lin = load_bias.wrapping_add(entry);
     puts("dosrt: jmp payload\r\n");
     // The SS/ESP/segment-reg/retf transfer MUST NOT be inline asm inside
     // this function: rewriting SS:ESP and never-returning is UB the -Oz
@@ -284,7 +310,40 @@ fn load_and_run(handle: u16, segs: &[Seg], entry: u32) -> ! {
     // above. It lives in a dedicated global_asm symbol (like crt0), fed
     // the already-computed values.
     let arg = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(HOFF_ARG)) };
-    unsafe { enter_payload(code as u32, data as u32, sp_top, entry, arg) }
+    unsafe { enter_payload(code as u32, data as u32, sp_top, entry_lin, arg) }
+}
+
+/// Walk the payload's `.dynamic` table (already streamed into memory at
+/// `base + dyn_vaddr`), find the `.rel.dyn` REL table via DT_REL/DT_RELSZ,
+/// and add the load bias `base` to every `R_386_RELATIVE` slot. All
+/// addresses are linear; RLOADER's DS is 4 GB-flat with base `ds_base`,
+/// so a linear `X` is dereferenced as the pointer `X - ds_base`. Returns
+/// the number of relocations applied.
+fn apply_relocations(base: u32, ds_base: u32, dyn_vaddr: u32, dyn_size: u32) -> u32 {
+    let dyn_ptr = (base.wrapping_add(dyn_vaddr).wrapping_sub(ds_base)) as *const Elf32Dyn;
+    let mut rel_off = 0u32;
+    let mut rel_sz = 0u32;
+    for i in 0..(dyn_size as usize / core::mem::size_of::<Elf32Dyn>()) {
+        let d = unsafe { *dyn_ptr.add(i) };
+        match d.tag {
+            DT_NULL => break,
+            DT_REL => rel_off = d.val,
+            DT_RELSZ => rel_sz = d.val,
+            _ => {}
+        }
+    }
+    if rel_sz == 0 { return 0; }
+    let rel_ptr = (base.wrapping_add(rel_off).wrapping_sub(ds_base)) as *const Elf32Rel;
+    let mut applied = 0u32;
+    for i in 0..(rel_sz as usize / core::mem::size_of::<Elf32Rel>()) {
+        let r = unsafe { *rel_ptr.add(i) };
+        if r.r_type() == R_386_RELATIVE {
+            let slot = (base.wrapping_add(r.r_offset).wrapping_sub(ds_base)) as *mut u32;
+            unsafe { *slot = (*slot).wrapping_add(base); }
+            applied += 1;
+        }
+    }
+    applied
 }
 
 // Final far-transfer into the payload. A real asm symbol (cdecl args on

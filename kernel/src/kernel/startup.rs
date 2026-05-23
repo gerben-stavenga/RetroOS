@@ -478,7 +478,7 @@ fn event_loop(first_tid: usize) {
             crate::arch::monitor::KernelEvent::Exception(_) => ev_exc += 1,
             crate::arch::monitor::KernelEvent::Syscall => ev_syscall += 1,
         }
-        if ts_after_user.wrapping_sub(last_profile_dump) >= PROFILE_DUMP_CYCLES && false {
+        if ts_after_user.wrapping_sub(last_profile_dump) >= PROFILE_DUMP_CYCLES {
             let total = user_cycles.wrapping_add(kernel_cycles);
             let user_pct = if total > 0 { user_cycles.wrapping_mul(100) / total } else { 0 };
             let kern_pct = if total > 0 { kernel_cycles.wrapping_mul(100) / total } else { 0 };
@@ -1060,6 +1060,31 @@ pub fn arch_rearm_irq(line: u8) {
             "int 0x80",
             in("eax") crate::arch::arch_call::REARM_IRQ as u32,
             in("edx") line as u32,
+        );
+    }
+}
+
+/// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).
+pub fn arch_dma_channel_buf(ch: usize) -> u64 {
+    let r: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("eax") crate::arch::arch_call::DMA_CHANNEL_BUF as u32 => r,
+            in("edx") ch as u32,
+        );
+    }
+    r as u64
+}
+
+/// Replace `count` user pages at `vpage` with fresh anonymous RW frames.
+pub fn arch_map_fresh_range(vpage: usize, count: usize) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch::arch_call::MAP_FRESH_RANGE as u32,
+            in("edx") vpage as u32,
+            in("ecx") count as u32,
         );
     }
 }

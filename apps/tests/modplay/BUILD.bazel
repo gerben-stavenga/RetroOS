@@ -14,7 +14,9 @@ rust_static_library(
     rustc_flags = [
         "-Cpanic=abort",
         "-Copt-level=z",
-        "-Crelocation-model=static",
+        # PIE: emit position-independent code; RLOADER applies the
+        # R_386_RELATIVE fixups at load time (DOS4GW-style).
+        "-Crelocation-model=pie",
     ],
     deps = ["//apps/dosrt:dosrt_lib"],
 )
@@ -28,8 +30,12 @@ genrule(
     name = "modplay_elf",
     srcs = [":modplay_retro", "modplay.ld"],
     outs = ["modplay.elf"],
-    # --gc-sections: strip the unused dosrt/core bulk (same as rloader).
-    cmd = "ld -m elf_i386 --gc-sections -T $(location modplay.ld) -u _start $(location :modplay_retro) -o $@",
+    # -pie: position-independent ET_DYN; --no-dynamic-linker drops the
+    # PT_INTERP (no ld.so — RLOADER is the loader). --gc-sections strips
+    # the unused dosrt/core bulk.
+    cmd = "ld -m elf_i386 -pie --no-dynamic-linker --hash-style=sysv " +
+          "--gc-sections -T $(location modplay.ld) -u _start " +
+          "$(location :modplay_retro) -o $@",
 )
 
 genrule(

@@ -92,6 +92,19 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
             }
             p += DMA_POOL_PAGES;
         }
+
+        // Per-channel permanent ISA-DMA buffers (see `dma_channel_buf`):
+        // one 128 KB-aligned, contiguous, < 16 MB block, marked RESERVED.
+        let mut p = 256usize;
+        while p + DMA_BUFS_PAGES <= DMA_MAX_PAGE.min(MAX_PAGES) {
+            if p % DMA_BUF_16BIT_PAGES != 0 { p += 1; continue; }
+            if (p..p + DMA_BUFS_PAGES).all(|i| PAGE_REFS[i] == 0) {
+                for i in p..p + DMA_BUFS_PAGES { PAGE_REFS[i] = RESERVED; }
+                DMA_BUFS_BASE = p;
+                break;
+            }
+            p += DMA_BUF_16BIT_PAGES;
+        }
     }
 }
 
@@ -103,6 +116,19 @@ const DMA_POOL_PAGES: usize = 0x1_0000 / PAGE_SIZE;
 static mut DMA_POOL_START: usize = 0;
 /// True while the pool is handed out (single live SB DMA buffer).
 static mut DMA_POOL_BUSY: bool = false;
+
+/// Per-channel permanent ISA-DMA buffers. Each DMA channel gets a fixed,
+/// physically contiguous, boundary-aligned buffer sized to the largest
+/// transfer it can carry: 8-bit channels (0-3) → 64 KB / 64 KB-aligned,
+/// 16-bit channels (4-7) → 128 KB / 128 KB-aligned. A guest SB buffer is
+/// aliased onto its channel's buffer; the buffer is reserved once and
+/// never re-allocated. Layout: the four 128 KB buffers first (so the whole
+/// block needs only 128 KB alignment), then the four 64 KB ones.
+const DMA_BUF_8BIT_PAGES: usize = 0x1_0000 / PAGE_SIZE;   // 64 KB
+const DMA_BUF_16BIT_PAGES: usize = 0x2_0000 / PAGE_SIZE;  // 128 KB
+const DMA_BUFS_PAGES: usize = 4 * DMA_BUF_16BIT_PAGES + 4 * DMA_BUF_8BIT_PAGES;
+/// First physical page of the per-channel buffer block (0 = unavailable).
+static mut DMA_BUFS_BASE: usize = 0;
 
 /// Mark a range of pages as reserved
 #[allow(dead_code)]
@@ -209,6 +235,19 @@ pub fn is_shared(page: u64) -> bool {
         let count = PAGE_REFS[page as usize];
         count > 1 && count != RESERVED
     }
+}
+
+/// Physical page number of DMA channel `ch`'s permanent buffer (0 = none).
+/// 16-bit channels (4-7) occupy the front of the block, 8-bit (0-3) after.
+pub fn dma_channel_buf(ch: usize) -> u64 {
+    let base = unsafe { DMA_BUFS_BASE };
+    if base == 0 || ch >= 8 { return 0; }
+    let off = if ch >= 4 {
+        (ch - 4) * DMA_BUF_16BIT_PAGES
+    } else {
+        4 * DMA_BUF_16BIT_PAGES + ch * DMA_BUF_8BIT_PAGES
+    };
+    (base + off) as u64
 }
 
 /// Hand out the reserved ISA-DMA pool for a buffer of `num_pages`

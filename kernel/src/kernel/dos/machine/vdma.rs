@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
+/// "externally owned" mark — COW-fork and address-space teardown both
+/// skip such frames — exactly what an aliased permanent DMA buffer needs.
+/// Arch's `paging2::flags` is private, so the bit is duplicated here per
+/// the arch-boundary rule (small primitives are copied, not cross-called).
+const PTE_CACHE_DISABLE: u64 = 1 << 4;
+
 // Virtual 8237 DMA controller (generic — not SB-specific)
 // ============================================================================
 //
@@ -188,14 +195,22 @@ pub struct SbDmaState {
     pub host_dma8: u8,
     pub host_dma16: u8,
     pub dma: Dma8237, // generic virtual controller shadow
-    // Remap binding: the contiguous phys run the guest buffer was moved
-    // to, kept alive across blocks (auto-init reuses it; single-cycle
-    // re-arms reuse it). Freed only when the buffer addr/len changes.
-    pub remap_start_page: u64,
-    pub remap_pages: usize,
-    /// Buffer (DOS-phys addr, byte length) the current binding covers.
-    last_gpa: u32,
-    last_len: u32,
+    dsp_test_reg: u8,
+    dsp_read_data: Option<u8>,
+    dsp_expect_test_write: bool,
+    /// Current alias binding. `bound_chan == 0xFF` ⇒ none. While bound,
+    /// the guest's `bound_vpage..+bound_pages` linear pages alias DMA
+    /// channel `bound_host`'s permanent buffer; `bound_gpa`/`bound_len`
+    /// are the 8237 programming the binding was built for (rebind probe).
+    bound_chan: u8,
+    bound_host: u8,
+    bound_gpa: u32,
+    bound_len: u32,
+    bound_vpage: usize,
+    bound_pages: usize,
+    /// Set while the binding is detached for a background task switch
+    /// (`sb_suspend`); `sb_resume` re-materializes it.
+    suspended: bool,
     /// Per-channel `count_gen` last acted on. The real 8237 is
     /// (re)programmed exactly when the guest bumps a channel's count
     /// generation (its per-block re-arm), not on mask/unmask — handles
@@ -212,8 +227,10 @@ impl SbDmaState {
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
             dma: Dma8237::new(),
-            remap_start_page: 0, remap_pages: 0,
-            last_gpa: 0, last_len: 0, last_gen: [0; 8],
+            dsp_test_reg: 0, dsp_read_data: None, dsp_expect_test_write: false,
+            bound_chan: 0xFF, bound_host: 0xFF,
+            bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
+            suspended: false, last_gen: [0; 8],
         }
     }
 
@@ -230,21 +247,13 @@ impl SbDmaState {
         ch < 8 && self.dma.ch[ch].armed
     }
 
-    /// Release the contiguous ISA-DMA pool binding this thread holds, if
-    /// any. The pool is a single global slot ("foreground thread owns
-    /// the card"); a thread that armed SB DMA and then exits or `exec`s
-    /// must hand it back, or every later program's `maybe_remap` fails
-    /// with "no contiguous DMA region". Idempotent. Also resets the
-    /// per-channel re-arm cursor so a reused `SbDmaState` can't dangle.
+    /// Release any SB-DMA binding this thread holds — exec/exit cleanup.
+    /// The per-channel buffers are permanent; this just detaches the guest
+    /// alias and clears the re-arm cursor so a reused `SbDmaState` can't
+    /// dangle. Idempotent.
     pub fn release_dma_pool(&mut self) {
-        if self.remap_pages != 0 {
-            crate::kernel::startup::arch_free_phys_contig(
-                self.remap_start_page, self.remap_pages);
-            self.remap_start_page = 0;
-            self.remap_pages = 0;
-        }
-        self.last_gpa = 0;
-        self.last_len = 0;
+        self.unbind();
+        self.suspended = false;
         self.last_gen = [0; 8];
     }
 
@@ -253,6 +262,45 @@ impl SbDmaState {
     /// the OPL2/3 FM ports 0x388/0x389. Only the 8237 is virtual.
     pub fn is_passthrough(&self, p: u16) -> bool {
         (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388 | 0x389)
+    }
+
+    /// Read an SB DSP/mixer/OPL passthrough port, with a tiny compatibility
+    /// shim for DSP command E4h/E8h (test register write/read). Some older
+    /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
+    /// sb16 does not appear to surface that response through passthrough.
+    pub fn sb_read(&mut self, p: u16) -> u8 {
+        if p == self.io_base + 0x0A {
+            if let Some(v) = self.dsp_read_data.take() {
+                return v;
+            }
+        } else if p == self.io_base + 0x0E && self.dsp_read_data.is_some() {
+            return 0x80;
+        }
+        crate::arch::inb(p)
+    }
+
+    /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
+    /// locally; all other traffic continues to the real QEMU sb16/adlib.
+    pub fn sb_write(&mut self, p: u16, val: u8) {
+        if p == self.io_base + 0x0C {
+            if self.dsp_expect_test_write {
+                self.dsp_test_reg = val;
+                self.dsp_expect_test_write = false;
+                return;
+            }
+            match val {
+                0xE4 => {
+                    self.dsp_expect_test_write = true;
+                    return;
+                }
+                0xE8 => {
+                    self.dsp_read_data = Some(self.dsp_test_reg);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        crate::arch::outb(p, val);
     }
 
     /// DMA-port read. Two distinct sources of truth, never conflated:
@@ -279,18 +327,34 @@ impl SbDmaState {
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
                    else if chan == self.dma16 as usize { Some(self.host_dma16) }
                    else { None };
-        if is_cnt && self.dma.ch[chan].armed {
+        if self.dma.ch[chan].armed {
             if let Some(h) = host {
-                // Real QEMU-8257 current-count, lo/hi via the controller
-                // byte-pointer flip-flop. Snapshot the full u16 at the
-                // low-byte read; the hi byte comes from the same snap.
+                // Serve the *live* transfer state for the armed SB channel,
+                // lo/hi via the controller byte-pointer flip-flop; snapshot
+                // the full u16 at the low-byte read so the pair is coherent.
                 let ff = if hi_ctrl { &mut self.dma.ff_hi }
                          else { &mut self.dma.ff_lo };
                 let low = !*ff;
                 *ff = !*ff;
                 if low {
-                    self.dma.read_latch = real_8237_count(h);
-                    // [SB-DMA] guest count-read trace disabled per request.
+                    let live_count = real_8237_count(h);
+                    let p = self.dma.ch[chan].prog;
+                    self.dma.read_latch = if is_cnt {
+                        // Count register: QEMU-8257's live current-count —
+                        // decrements during playback, 0xFFFF at terminal
+                        // (Dune2's 0x4D8 ISR relies on this).
+                        live_count
+                    } else {
+                        // Address register: the 8237 advances the address as
+                        // it decrements the count. Derive the current address
+                        // from the count delta so it stays in the *guest*
+                        // buffer space — the real chip holds the remapped
+                        // contiguous address. ROTT / the Apogee Sound System
+                        // track 16-bit playback progress by reading *this*,
+                        // not the count; a frozen address looks like a dead
+                        // DMA channel and fails their playback self-test.
+                        p.addr.wrapping_add(p.count.wrapping_sub(live_count))
+                    };
                 }
                 let v = self.dma.read_latch;
                 return if low { v as u8 } else { (v >> 8) as u8 };
@@ -299,11 +363,10 @@ impl SbDmaState {
         self.dma.io_read(port)
     }
 
-    /// Called after every virtual-8237 write. If the BLASTER-declared
-    /// channel just became armed (unmasked, nonzero count), relocate the
-    /// guest DMA buffer to a contiguous DMA-safe physical run and program
-    /// the *real* 8237 with the translated address — the card then DMAs
-    /// correct bytes. If the channel was masked, release the binding.
+    /// Called after every virtual-8237 write. When the BLASTER channel is
+    /// (re)armed, alias the guest's DMA buffer onto that channel's
+    /// permanent host buffer and program the real 8237. A no-op until the
+    /// guest finishes a count write (the per-block re-arm signal).
     pub fn maybe_remap(&mut self) {
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
         let c8 = self.dma8 as usize;
@@ -312,10 +375,7 @@ impl SbDmaState {
             && self.dma.ch[c8].prog.count != 0;
         let armed16 = (5..8).contains(&c16) && !self.dma.ch[c16].masked
             && self.dma.ch[c16].prog.count != 0;
-
-        // [SB-DMA] per-gate-evaluation trace disabled per request.
-
-        let (chan, is16, host_chan) = if armed16 {
+        let (chan, is16, host) = if armed16 {
                 (c16, true, self.host_dma16 as usize)
             } else if armed8 {
                 (c8, false, self.host_dma8 as usize)
@@ -325,101 +385,147 @@ impl SbDmaState {
             };
 
         // Act only when the guest (re)armed this channel: it bumped
-        // count_gen since we last acted. This is the per-block re-arm
-        // signal regardless of whether the driver masks (single-cycle
-        // rewrites count every block; auto-init writes it once). Skips
-        // per-write spam without the old coarse mask/unmask latch.
+        // count_gen since we last acted. The per-block re-arm signal
+        // regardless of whether the driver masks (single-cycle rewrites
+        // count every block; auto-init writes it once).
         let cur_gen = self.dma.count_gen[chan];
         if self.last_gen[chan] == cur_gen { return; }
         self.last_gen[chan] = cur_gen;
 
-        // The captured base programming — what we hand to the real chip.
         let p = self.dma.ch[chan].prog;
-        let (gpa, len, blog2) = if is16 {
-            (((p.page as u32) << 16) | ((p.addr as u32) << 1),
-             ((p.count as u32) + 1) * 2, 17u32)
-        } else {
-            (((p.page as u32) << 16) | p.addr as u32,
-             (p.count as u32) + 1, 16u32)
-        };
+        let (gpa, len) = chan_gpa_len(&p, is16);
+        self.arm(chan, host, is16, gpa, len, p.mode);
+    }
 
-        // SB DMA-channel probe: the driver arms several tiny (≤ a few
-        // bytes) single-cycle transfers at assorted low addresses
-        // (observed: gpa 0x0, 0x73, 0x6573, all len=4) purely to confirm
-        // DMA+IRQ wiring — it ignores the data. The reliable signal is
-        // the *size* (real audio blocks are KB; e.g. 0x3B81), not the
-        // address. We must NOT repoint such pages (a stale page→pool
-        // alias + pool reuse corrupts memory — kernel stub #UD at
-        // gpa=0). But the transfer must still complete so the card
-        // raises the IRQ, else the driver decides "no SB" and falls back
-        // to subtitles. Point the real 8237 at a throwaway scratch
-        // frame, no page remap. (Also covers any low-system address.)
+    /// Alias the guest buffer at `gpa` onto host DMA channel `host`'s
+    /// permanent buffer and program the real 8237. Driven from
+    /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
+    /// virtual-8237 state after a task switch).
+    fn arm(&mut self, chan: usize, host: usize, is16: bool,
+           gpa: u32, len: u32, mode: u8) {
+        let bufpage = crate::kernel::startup::arch_dma_channel_buf(host);
+        if bufpage == 0 { return; }              // no reserved buffer
+        // The buffer sits at `off` inside its channel's 64 KB / 128 KB
+        // window; the channel buffer is window-aligned, so the same `off`
+        // lands it correctly. An ISA transfer never crosses the boundary.
+        let win = if is16 { 0x1_FFFFu32 } else { 0xFFFFu32 };
+        let off = gpa & win;
+        let phys = (bufpage as u32) * 0x1000 + off;
+
+        // SB DMA-channel probe: the driver fires tiny (≤ a few bytes)
+        // single-cycle transfers at assorted low addresses purely to
+        // confirm DMA+IRQ wiring — it ignores the data. Never alias those
+        // (page 0 = IVT); just point the real chip at the channel buffer
+        // so the transfer completes and raises the IRQ.
         if len < 0x100 || (gpa & !0xFFF) < 0x1000 {
-            let scratch = crate::kernel::startup::arch_alloc_phys_contig(1, blog2);
-            if scratch != 0 {
-                program_real_8237(host_chan as u8, (scratch as u32) * 0x1000,
-                                   len, p.mode, is16);
-                crate::kernel::startup::arch_free_phys_contig(scratch, 1);
-            }
-            // [SB-DMA] DMA-probe trace disabled per request.
+            program_real_8237(host as u8, phys, len, mode, is16);
+            self.dma.ch[chan].armed = true;
             return;
         }
 
-        let page_off = (gpa & 0xFFF) as usize;
-        let num_pages = (page_off + len as usize + 0xFFF) / 0x1000;
-
-        // (Re)locate the guest buffer onto a contiguous run only when the
-        // buffer (addr/len) differs from the live binding. Auto-init
-        // reuses the same buffer every block; since we repointed the
-        // guest PTEs, its refills land straight in the contiguous pages
-        // (true zero-copy) — no re-alloc/re-copy needed.
-        if self.remap_pages == 0 || gpa != self.last_gpa || len != self.last_len {
-            if self.remap_pages != 0 {
-                crate::kernel::startup::arch_free_phys_contig(
-                    self.remap_start_page, self.remap_pages);
-                self.remap_start_page = 0;
-                self.remap_pages = 0;
-            }
-            let contig =
-                crate::kernel::startup::arch_alloc_phys_contig(num_pages, blog2);
-            if contig == 0 {
-                // [SB-DMA] "no contiguous DMA region" trace disabled per request.
-                self.last_gen[chan] = cur_gen.wrapping_sub(1); // retry next arm
-                return;
-            }
-            // The ring-1 kernel shares the VM86 address space, so the
-            // guest buffer is directly at its DOS-physical = linear
-            // address `gpa`. Snapshot it, repoint those pages onto the
-            // contiguous run, write the bytes back (now contig-backed).
-            let vbase = (gpa & !0xFFF) as usize;
+        // (Re)bind only when the guest buffer (channel/addr/len) changed.
+        // Auto-init and single-cycle re-arms of the same buffer skip
+        // straight to re-programming the real chip — true zero-copy: the
+        // guest's refills already land in the channel buffer via the alias.
+        let bound = self.bound_chan == chan as u8 && self.bound_host == host as u8
+            && self.bound_gpa == gpa && self.bound_len == len;
+        if !bound {
+            if self.bound_gpa != 0 { self.unbind(); }
+            let vbase     = (gpa & !0xFFF) as usize;
+            let page_off  = (gpa & 0xFFF) as usize;
+            let num_pages = (page_off + len as usize + 0xFFF) / 0x1000;
+            let win_pgoff = ((off & !0xFFF) >> 12) as u64;
+            // A well-formed ISA transfer never crosses its 64 KB / 128 KB
+            // window; refuse one that would overrun the channel buffer.
+            let buf_pages = if is16 { 32usize } else { 16usize };
+            if win_pgoff as usize + num_pages > buf_pages { return; }
             let span = num_pages * 0x1000;
+            // Snapshot the guest's pre-filled content — whole pages, so the
+            // unrelated neighbour bytes on partial end pages survive.
             let mut snap = alloc::vec![0u8; span];
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     vbase as *const u8, snap.as_mut_ptr(), span);
             }
+            // Free the guest's original frames, then alias the range onto
+            // the channel buffer with CACHE_DISABLE — externally owned, so
+            // COW-fork and address-space teardown both leave it intact.
+            crate::kernel::startup::arch_free_range(vbase >> 12, num_pages);
             crate::kernel::startup::arch_map_phys_range(
-                vbase >> 12, num_pages, contig, 0);
+                vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     snap.as_ptr(), vbase as *mut u8, span);
             }
-            self.remap_start_page = contig;
-            self.remap_pages = num_pages;
-            self.last_gpa = gpa;
-            self.last_len = len;
+            self.bound_chan  = chan as u8;
+            self.bound_host  = host as u8;
+            self.bound_gpa   = gpa;
+            self.bound_len   = len;
+            self.bound_vpage = vbase >> 12;
+            self.bound_pages = num_pages;
         }
 
-        // Always (re)program the real 8237 on every (re)arm — single-
-        // cycle drivers re-arm per block, so the real controller must be
-        // re-pointed each time even though the binding is unchanged.
-        let phys = (self.remap_start_page as u32) * 0x1000 + page_off as u32;
-        program_real_8237(host_chan as u8, phys, len, p.mode, is16);
-        // Armed: the real QEMU-8257 is now authoritative for this
-        // channel's current-count reads (live decrement + terminal
-        // 0xFFFF). `prog` (base regs) persists for partial re-arms.
+        program_real_8237(host as u8, phys, len, mode, is16);
+        // Armed: the real QEMU-8257 is now authoritative for this channel's
+        // live addr/count reads (`dma_read` serves them).
         self.dma.ch[chan].armed = true;
-        // [SB-DMA] vch→hch arm trace + [cs:0x166]/[0x14C] sampling disabled per request.
+    }
+
+    /// Detach the current alias: hand the guest's buffer range fresh
+    /// anonymous frames and copy the channel buffer's content back into
+    /// them, so the partial-end-page neighbour data survives and the guest
+    /// can reuse the linear range. The channel buffer is permanent. No-op
+    /// when nothing is bound.
+    fn unbind(&mut self) {
+        if self.bound_gpa == 0 { return; }
+        let vbase = self.bound_vpage << 12;
+        let span  = self.bound_pages * 0x1000;
+        let mut snap = alloc::vec![0u8; span];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                vbase as *const u8, snap.as_mut_ptr(), span);
+        }
+        crate::kernel::startup::arch_map_fresh_range(
+            self.bound_vpage, self.bound_pages);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                snap.as_ptr(), vbase as *mut u8, span);
+        }
+        self.bound_chan  = 0xFF;
+        self.bound_host  = 0xFF;
+        self.bound_gpa   = 0;
+        self.bound_len   = 0;
+        self.bound_vpage = 0;
+        self.bound_pages = 0;
+    }
+
+    /// Task switched to the background: detach the alias (the channel
+    /// buffer's content is saved back into the task's own memory) and mask
+    /// the real 8237 channel so the card stops pulling a buffer that's no
+    /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
+    /// replays it. Must run with this task's address space active.
+    pub fn sb_suspend(&mut self) {
+        if self.bound_gpa == 0 { return; }
+        mask_real_8237(self.bound_host);
+        self.unbind();
+        self.suspended = true;
+    }
+
+    /// Task switched back to the foreground: re-materialize the binding —
+    /// re-alias every channel the virtual 8237 still shows armed and
+    /// reprogram the real 8237. Must run with this task's address space
+    /// active.
+    pub fn sb_resume(&mut self) {
+        if !self.suspended { return; }
+        self.suspended = false;
+        for chan in 0..8 {
+            if !self.dma.ch[chan].armed { continue; }
+            let is16 = chan >= 4;
+            let host = if is16 { self.host_dma16 } else { self.host_dma8 } as usize;
+            let p = self.dma.ch[chan].prog;
+            let (gpa, len) = chan_gpa_len(&p, is16);
+            self.arm(chan, host, is16, gpa, len, p.mode);
+        }
     }
 
     /// Apply this thread's `BLASTER=Axxx Iy Dz Hw …` env string. Unknown
@@ -440,6 +546,25 @@ impl SbDmaState {
             }
         }
     }
+}
+
+/// Decode a channel's captured 8237 programming into the (DOS-physical
+/// buffer address, byte length) the SB-DMA layer works in. 16-bit
+/// channels count words: addr is a word offset, count a word count − 1.
+fn chan_gpa_len(p: &DmaProg, is16: bool) -> (u32, u32) {
+    if is16 {
+        (((p.page as u32) << 16) | ((p.addr as u32) << 1), ((p.count as u32) + 1) * 2)
+    } else {
+        (((p.page as u32) << 16) | p.addr as u32, (p.count as u32) + 1)
+    }
+}
+
+/// Mask host DMA channel `chan` on the real 8237 — stops the card pulling
+/// the channel buffer while the owning task is backgrounded.
+fn mask_real_8237(chan: u8) {
+    use crate::arch::outb;
+    if (4..8).contains(&chan) { outb(0xD4, 0x04 | (chan - 4)); }
+    else if chan < 4 { outb(0x0A, 0x04 | chan); }
 }
 
 /// Look up `KEY` in a DOS environment block, returning its value bytes.

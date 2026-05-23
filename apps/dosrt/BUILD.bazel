@@ -80,7 +80,8 @@ rust_static_library(
     rustc_flags = [
         "-Cpanic=abort",
         "-Copt-level=z",
-        "-Crelocation-model=static",
+        # PIE — RLOADER applies R_386_RELATIVE fixups at load.
+        "-Crelocation-model=pie",
     ],
 )
 
@@ -93,8 +94,11 @@ genrule(
     name = "hello_elf",
     srcs = [":hello_retro", "hello/hello.ld"],
     outs = ["hello.elf"],
-    # See rloader_elf: force the archive member with `_start` to be linked.
-    cmd = "ld -m elf_i386 -T $(location hello/hello.ld) -u _start $(location :hello_retro) -o $@",
+    # -pie: position-independent ET_DYN; --no-dynamic-linker drops
+    # PT_INTERP (RLOADER is the loader). `-u _start` forces the archive
+    # member carrying `_start` to be linked.
+    cmd = "ld -m elf_i386 -pie --no-dynamic-linker --hash-style=sysv " +
+          "-T $(location hello/hello.ld) -u _start $(location :hello_retro) -o $@",
 )
 
 # ---- stub: Turbo C MZ EXE, compiled by booting RetroOS in QEMU --------

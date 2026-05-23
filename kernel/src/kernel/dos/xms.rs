@@ -10,9 +10,9 @@ use crate::kernel::thread;
 use crate::Regs;
 
 const MAX_XMS_HANDLES: usize = 16;
-/// XMS address space: linear 0x120000 (after HMA + shadow region) to ~0x500000.
-/// Pages 0x100-0x10F = HMA, 0x110-0x11F = A20 shadow. XMS starts after both.
-const XMS_BASE: u32 = 0x120000; // after HMA + shadow (1MB + 128KB)
+/// XMS address space: linear 0x120000 (after HMA and the A20 shadow) to
+/// about 0x500000. Pages 0x100-0x10F = HMA, 0x110-0x11F = A20 shadow.
+const XMS_BASE: u32 = 0x120000;
 const XMS_END: u32 = 0x500000;  // 5MB — plenty for DOS games
 const XMS_TOTAL_KB: u16 = ((XMS_END - XMS_BASE) / 1024) as u16;
 

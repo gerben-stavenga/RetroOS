@@ -32,10 +32,11 @@ case "$ARCH" in
 esac
 
 # AdLib (YM3812 / OPL2) on ports 0x388-0x389 and SB16 at
-# A220/I5/D1/H5. QEMU DOS guests are sensitive to bare `-device sb16`;
-# always bind every sound-producing device to an explicit backend. Override
-# with AUDIO_BACKEND=pa|pipewire|alsa|sdl|none if auto-selection is wrong.
-# Use SOUND=0 to omit SB16/AdLib/PC speaker devices entirely.
+# A220/I5/D1/H5, except FreeDOS uses I7. QEMU DOS guests are sensitive to bare
+# `-device sb16`; always bind every sound-producing device to an explicit
+# backend. Override with AUDIO_BACKEND=pa|pipewire|alsa|sdl|none if
+# auto-selection is wrong. Use SOUND=0 to omit SB16/AdLib/PC speaker devices
+# entirely.
 choose_audio_backend() {
     if [ -n "${AUDIO_BACKEND:-}" ]; then
         printf '%s\n' "$AUDIO_BACKEND"
@@ -57,12 +58,16 @@ choose_audio_backend() {
 }
 
 AUDIO_BACKEND="$(choose_audio_backend)"
+SB16_IRQ=5
+if [ "$IMG" = "freedos" ]; then
+    SB16_IRQ=7
+fi
 if [ "${SOUND:-1}" = "0" ]; then
     AUDIO_ARGS=()
 else
     AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0"
                 -device adlib,audiodev=snd0
-                -device sb16,audiodev=snd0,iobase=0x220,irq=5,dma=1,dma16=5
+                -device sb16,audiodev=snd0,iobase=0x220,irq="$SB16_IRQ",dma=1,dma16=5
                 -machine pcspk-audiodev=snd0)
 fi
 

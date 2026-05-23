@@ -1,13 +1,15 @@
-//! Virtual 8259 PIC (per-thread, master only).
+//! Virtual cascaded 8259 PIC state (per thread).
 
 use super::*;
 
 pub const VPIC_QUEUE_SIZE: usize = 64;
 
-/// Virtual 8259 PIC (one per thread, master only)
+/// Virtual cascaded 8259 PIC pair (one per thread).
 pub struct VirtualPic {
-    pub isr: u8,  // In-Service Register
-    pub imr: u8,  // Interrupt Mask Register
+    pub isr: u8,       // Master In-Service Register
+    pub imr: u8,       // Master Interrupt Mask Register
+    pub slave_isr: u8, // Slave In-Service Register
+    pub slave_imr: u8, // Slave Interrupt Mask Register
     queue: [u8; VPIC_QUEUE_SIZE],  // pending interrupt vectors
     head: usize,
     tail: usize,
@@ -15,7 +17,15 @@ pub struct VirtualPic {
 
 impl VirtualPic {
     pub const fn new() -> Self {
-        Self { isr: 0, imr: 0, queue: [0; VPIC_QUEUE_SIZE], head: 0, tail: 0 }
+        Self {
+            isr: 0,
+            imr: 0,
+            slave_isr: 0,
+            slave_imr: 0,
+            queue: [0; VPIC_QUEUE_SIZE],
+            head: 0,
+            tail: 0,
+        }
     }
 
     /// Check if there are pending interrupt vectors in the queue.
@@ -39,6 +49,13 @@ impl VirtualPic {
     pub fn eoi(&mut self) {
         if self.isr != 0 {
             self.isr &= self.isr - 1; // clear lowest set bit
+        }
+    }
+
+    /// Non-specific EOI for the slave PIC.
+    pub fn slave_eoi(&mut self) {
+        if self.slave_isr != 0 {
+            self.slave_isr &= self.slave_isr - 1;
         }
     }
 

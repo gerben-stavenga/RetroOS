@@ -96,6 +96,8 @@ pub mod arch_call {
     pub const ALLOC_PHYS_CONTIG: u64 = 0x11A; // EDX=num_pages, ECX=boundary_log2 -> EAX=start_page (0=fail)
     pub const FREE_PHYS_CONTIG: u64 = 0x11B;  // EDX=start_page, ECX=num_pages
     pub const REARM_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
+    pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
+    pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -246,6 +248,12 @@ fn arch_dispatch(regs: &mut Regs) {
         }
         arch_call::REARM_IRQ => {
             crate::arch::irq::rearm_irq(regs.rdx as u8);
+        }
+        arch_call::DMA_CHANNEL_BUF => {
+            regs.rax = crate::arch::phys_mm::dma_channel_buf(regs.rdx as usize);
+        }
+        arch_call::MAP_FRESH_RANGE => {
+            paging2::map_fresh_range(regs.rdx as usize, regs.rcx as usize);
         }
         arch_call::SET_TLS_ENTRY => {
             let index = regs.rdx as i32;
