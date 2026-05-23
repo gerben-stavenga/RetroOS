@@ -21,17 +21,22 @@ use crate::kernel::startup;
 use crate::Regs;
 
 mod state;
-pub use self::state::*;
+pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PSP_SEL};
+use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX, RawModeState};
 mod descriptors;
-pub(super) use self::descriptors::*;
+pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors};
+use self::descriptors::{alloc_ldt, alloc_ldt_range, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc};
 mod rm_calls;
-pub(super) use self::rm_calls::*;
+pub(in crate::kernel::dos) use self::rm_calls::{callback_entry, rm_iret_call};
+use self::rm_calls::{call_real_mode_proc, call_real_mode_proc_iret, simulate_real_mode_int};
 mod exceptions;
-pub(super) use self::exceptions::*;
+pub(in crate::kernel::dos) use self::exceptions::dispatch_dpmi_exception;
+use self::exceptions::{exception_return, ExcReturnVia};
 mod psp;
-pub(super) use self::psp::*;
+pub(in crate::kernel::dos) use self::psp::{enter_pm_psp_view, restore_rm_psp_view, sync_psp_view_for_regs};
 mod raw_switch;
-pub(super) use self::raw_switch::*;
+pub(in crate::kernel::dos) use self::raw_switch::{pm_stub_dispatch, raw_switch_real_to_pm, save_restore_protected_mode_state};
+use self::raw_switch::{capture_real_mode_state, clear_carry, flat_addr, set_carry, trace_client_selector_leak};
 
 // ============================================================================
 // DPMI entry — mode switch from Dos/VM86 to Dos/DPMI (protected mode)
@@ -39,7 +44,7 @@ pub(super) use self::raw_switch::*;
 
 /// Switch from VM86 to 32-bit protected mode.
 /// Called from rm_int31_dispatch when the DPMI entry stub executes.
-pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
     // DPMI entry is a FAR CALL; the real-mode stack holds the PM return CS:IP.
     let ret_ip = machine::vm86_pop(regs);
@@ -75,13 +80,13 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // CS — code, base = ret_cs * 16 (caller's CS, not stub segment).
     // Placed at LDT[16] (CWSDPMI's l_acode) — see CLIENT_CS_LDT_IDX docs.
     let cs_base = (ret_cs as u32) * 16;
-    dos.ldt[CLIENT_CS_LDT_IDX] = DpmiState::make_code_desc_ex(cs_base, 0xFFFF, false);
+    dos.ldt[CLIENT_CS_LDT_IDX] = make_code_desc_ex(cs_base, 0xFFFF, false);
     dos.ldt_alloc[CLIENT_CS_LDT_IDX / 32] |= 1 << (CLIENT_CS_LDT_IDX % 32);
 
     // DS — data, base = real-mode DS * 16, limit = 64K.
     // Placed at LDT[17] (CWSDPMI's l_adata).
     let ds_base = (regs.ds as u32) * 16;
-    dos.ldt[CLIENT_DS_LDT_IDX] = DpmiState::make_data_desc_ex(ds_base, 0xFFFF, false);
+    dos.ldt[CLIENT_DS_LDT_IDX] = make_data_desc_ex(ds_base, 0xFFFF, false);
     dos.ldt_alloc[CLIENT_DS_LDT_IDX / 32] |= 1 << (CLIENT_DS_LDT_IDX % 32);
 
     // SS — stack, base = real_ss * 16, limit = 64K.
@@ -89,12 +94,12 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
     // Placed at LDT[19] (CWSDPMI's l_aenv slot, repurposed — RetroOS doesn't
     // separately allocate an env selector).
     let ss_base = (real_ss as u32) * 16;
-    dos.ldt[CLIENT_SS_LDT_IDX] = DpmiState::make_data_desc_ex(ss_base, 0xFFFF, use32);
+    dos.ldt[CLIENT_SS_LDT_IDX] = make_data_desc_ex(ss_base, 0xFFFF, use32);
     dos.ldt_alloc[CLIENT_SS_LDT_IDX / 32] |= 1 << (CLIENT_SS_LDT_IDX % 32);
 
-    let cs_sel = DpmiState::idx_to_sel(CLIENT_CS_LDT_IDX);
-    let ds_sel = DpmiState::idx_to_sel(CLIENT_DS_LDT_IDX);
-    let ss_sel = DpmiState::idx_to_sel(CLIENT_SS_LDT_IDX);
+    let cs_sel = idx_to_sel(CLIENT_CS_LDT_IDX);
+    let ds_sel = idx_to_sel(CLIENT_DS_LDT_IDX);
+    let ss_sel = idx_to_sel(CLIENT_SS_LDT_IDX);
 
     // Round client allocation pool up to a 1 MB boundary. DOS/4GW appears to
     // treat the first 0501 base as a slab origin and takes a private code path
@@ -132,7 +137,7 @@ pub fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Regs) {
         let d = dos.ldt[i];
         if d != 0 {
             dos_trace!("[DPMI] INIT_LDT idx={} sel={:04X} base={:08X} raw={:016X}",
-                i, DpmiState::idx_to_sel(i), DpmiState::desc_base(d), d);
+                i, idx_to_sel(i), desc_base(d), d);
         }
     }
 
@@ -212,10 +217,10 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             match alloc_ldt_range(&mut dos.ldt_alloc, count) {
                 Some(idx) => {
                     for extra in idx..(idx + count) {
-                        dos.ldt[extra] = DpmiState::make_data_desc_ex(0, 0, use32);
-                        trace_dpmi_desc("0000 alloc", DpmiState::idx_to_sel(extra), dos.ldt[extra]);
+                        dos.ldt[extra] = make_data_desc_ex(0, 0, use32);
+                        trace_dpmi_desc("0000 alloc", idx_to_sel(extra), dos.ldt[extra]);
                     }
-                    let sel = DpmiState::idx_to_sel(idx);
+                    let sel = idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
                     clear_carry(regs);
                 }
@@ -226,7 +231,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector
         0x0001 => {
             let sel = regs.rbx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             dos_trace!("[DPMI] 0001 free sel={:04X} idx={}", sel, idx);
             if sel & 0x0004 == 0 || idx < 16 || !ldt_is_allocated(&dos.ldt_alloc, idx) {
                 dos_trace!(
@@ -251,8 +256,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             let seg = regs.rbx as u16;
             let base = (seg as u32) << 4;
             for idx in 1..LDT_ENTRIES {
-                if ldt_is_allocated(&dos.ldt_alloc, idx) && DpmiState::desc_is_seg_alias(dos.ldt[idx], base) {
-                    let sel = DpmiState::idx_to_sel(idx);
+                if ldt_is_allocated(&dos.ldt_alloc, idx) && desc_is_seg_alias(dos.ldt[idx], base) {
+                    let sel = idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
                     dos_trace!("[DPMI] 0002 seg={:04X} -> reuse sel={:04X} base={:08X}", seg, sel, base);
                     clear_carry(regs);
@@ -260,8 +265,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 }
             }
             if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
-                dos.ldt[idx] = DpmiState::make_data_desc_ex(base, 0xFFFF, false);
-                let sel = DpmiState::idx_to_sel(idx);
+                dos.ldt[idx] = make_data_desc_ex(base, 0xFFFF, false);
+                let sel = idx_to_sel(idx);
                 regs.rax = (regs.rax & !0xFFFF) | sel as u64;
                 dos_trace!("[DPMI] 0002 seg={:04X} -> sel={:04X} base={:08X}", seg, sel, base);
                 clear_carry(regs);
@@ -279,9 +284,9 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector. Returns: CX:DX = base
         0x0006 => {
             let sel = regs.rbx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if idx < LDT_ENTRIES {
-                let base = DpmiState::desc_base(dos.ldt[idx]);
+                let base = desc_base(dos.ldt[idx]);
                 dos_trace!("[DPMI] 0006 sel={:04X} -> base={:08X}", sel, base);
                 regs.rcx = (regs.rcx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | (base & 0xFFFF) as u64;
@@ -294,10 +299,10 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, CX:DX = base
         0x0007 => {
             let sel = regs.rbx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
-                DpmiState::set_desc_base(&mut dos.ldt[idx], base);
+                set_desc_base(&mut dos.ldt[idx], base);
                 trace_dpmi_desc("0007 base", sel, dos.ldt[idx]);
                 dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
                 clear_carry(regs);
@@ -309,10 +314,10 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, CX:DX = limit
         0x0008 => {
             let sel = regs.rbx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let limit = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
-                DpmiState::set_desc_limit(&mut dos.ldt[idx], limit);
+                set_desc_limit(&mut dos.ldt[idx], limit);
                 trace_dpmi_desc("0008 limit", sel, dos.ldt[idx]);
                 clear_carry(regs);
             } else {
@@ -323,7 +328,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, CL = access rights byte, CH = extended type
         0x0009 => {
             let sel = regs.rbx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let cl = regs.rcx as u8;
                 let ch = (regs.rcx >> 8) as u8;
@@ -342,7 +347,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector. Returns: AX = new data selector
         0x000A => {
             let sel = regs.rbx as u16;
-            let src_idx = DpmiState::sel_to_idx(sel);
+            let src_idx = sel_to_idx(sel);
             if src_idx < LDT_ENTRIES {
                 if let Some(new_idx) = alloc_ldt(&mut dos.ldt_alloc) {
                     let mut desc = dos.ldt[src_idx];
@@ -351,11 +356,11 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                     desc &= !(1u64 << 43); // clear execute
                     desc |= 1u64 << 41;    // set writable
                     dos.ldt[new_idx] = desc;
-                    let new_sel = DpmiState::idx_to_sel(new_idx);
+                    let new_sel = idx_to_sel(new_idx);
                     trace_dpmi_desc("000A alias", new_sel, desc);
                     regs.rax = (regs.rax & !0xFFFF) | new_sel as u64;
                     dos_trace!("[DPMI] 000A alias src_sel={:04X} -> new_sel={:04X} base={:08X}",
-                        sel, new_sel, DpmiState::desc_base(desc));
+                        sel, new_sel, desc_base(desc));
                     clear_carry(regs);
                 } else {
                     set_carry(regs);
@@ -368,13 +373,13 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, ES:EDI = buffer (8 bytes)
         0x000B => {
             let sel = regs.rbx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let desc = dos.ldt[idx];
                 unsafe { core::ptr::write_unaligned(dest as *mut u64, desc); }
                 dos_trace!("[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
-                    DpmiState::desc_base(desc), desc);
+                    desc_base(desc), desc);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -384,7 +389,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, ES:EDI = descriptor (8 bytes)
         0x000C => {
             let sel = regs.rbx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if idx < LDT_ENTRIES {
                 let src = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let mut new_desc = unsafe { core::ptr::read_unaligned(src as *const u64) };
@@ -393,7 +398,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                 dos.ldt[idx] = new_desc;
                 trace_dpmi_desc("000C set", sel, new_desc);
                 dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
-                    DpmiState::desc_base(new_desc), new_desc);
+                    desc_base(new_desc), new_desc);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -408,8 +413,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
                     if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
                         let base = (seg as u32) * 16;
                         let limit = (paragraphs as u32).saturating_mul(16).saturating_sub(1);
-                        dos.ldt[idx] = DpmiState::make_data_desc(base, limit);
-                        let sel = DpmiState::idx_to_sel(idx);
+                        dos.ldt[idx] = make_data_desc(base, limit);
+                        let sel = idx_to_sel(idx);
                         regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                         regs.rdx = (regs.rdx & !0xFFFF) | sel as u64;
                         dos_trace!("[DPMI] 0100 alloc paragraphs={:04X} -> seg={:04X} sel={:04X} base={:08X}",
@@ -432,12 +437,12 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // DX = selector
         0x0101 => {
             let sel = regs.rdx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if !ldt_is_allocated(&dos.ldt_alloc, idx) {
                 regs.rax = (regs.rax & !0xFFFF) | 9;
                 set_carry(regs);
             } else {
-                let base = DpmiState::desc_base(dos.ldt[idx]);
+                let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
                 match dos::dos_free_block(dos, seg) {
                     Ok(()) => {
@@ -456,17 +461,17 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         0x0102 => {
             let paragraphs = regs.rbx as u16;
             let sel = regs.rdx as u16;
-            let idx = DpmiState::sel_to_idx(sel);
+            let idx = sel_to_idx(sel);
             if !ldt_is_allocated(&dos.ldt_alloc, idx) {
                 regs.rax = (regs.rax & !0xFFFF) | 9;
                 set_carry(regs);
             } else {
-                let base = DpmiState::desc_base(dos.ldt[idx]);
+                let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
                 match dos::dos_resize_block(dos, seg, paragraphs) {
                     Ok(()) => {
                         let limit = (paragraphs as u32).saturating_mul(16).saturating_sub(1);
-                        dos.ldt[idx] = DpmiState::make_data_desc(base, limit);
+                        dos.ldt[idx] = make_data_desc(base, limit);
                         clear_carry(regs);
                     }
                     Err((err, max)) => {

@@ -2,15 +2,15 @@ use super::*;
 use super::super::mode_transitions;
 
 fn dump_selector(label: &str, dos: &thread::DosState, sel: u16) {
-    let idx = DpmiState::sel_to_idx(sel);
+    let idx = sel_to_idx(sel);
     if idx < LDT_ENTRIES {
         let desc = dos.ldt[idx];
         crate::println!(
             "  {} {:04X}: base={:08X} limit={:08X} raw={:016X}",
             label,
             sel,
-            DpmiState::desc_base(desc),
-            DpmiState::desc_limit(desc),
+            desc_base(desc),
+            desc_limit(desc),
             desc,
         );
     } else {
@@ -190,7 +190,7 @@ struct ExcFrame16 {
 ///   [ESP+0x4C] GS + Reserved
 ///   [ESP+0x50] CR2 (valid for #PF)
 ///   [ESP+0x54] PTE (valid for #PF)
-pub fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
     dos_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x} DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS:ESP={:04x}:{:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
         regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16,

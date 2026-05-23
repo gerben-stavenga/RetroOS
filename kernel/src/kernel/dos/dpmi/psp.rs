@@ -31,15 +31,15 @@ pub(in crate::kernel::dos) fn enter_pm_psp_view(dos: &mut thread::DosState) {
     // PSP_SEL descriptor: base = active RM PSP, limit = 64K. Spec says
     // limit=100h but real extenders (DOS/4GW) reuse ES as scratch and need
     // the full 64K window.
-    dos.ldt[PSP_LDT_IDX] = DpmiState::make_data_desc_ex(psp_base, 0xFFFF, false);
+    dos.ldt[PSP_LDT_IDX] = make_data_desc_ex(psp_base, 0xFFFF, false);
     dos.ldt_alloc[0] |= 1 << PSP_LDT_IDX;
 
     dpmi.env_ldt_idx = 0;
     if dpmi.client_use32 && env_seg != 0 {
         if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
             let env_base = (env_seg as u32) * 16;
-            dos.ldt[idx] = DpmiState::make_data_desc_ex(env_base, 0xFFFF, false);
-            let env_sel = DpmiState::idx_to_sel(idx);
+            dos.ldt[idx] = make_data_desc_ex(env_base, 0xFFFF, false);
+            let env_sel = idx_to_sel(idx);
             unsafe { core::ptr::write_volatile((psp_base + 0x2C) as *mut u16, env_sel); }
             dpmi.env_ldt_idx = idx;
         }

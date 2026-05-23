@@ -11,7 +11,7 @@ use super::super::mode_transitions;
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-pub(in crate::kernel::dos) fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -194,7 +194,7 @@ pub(super) fn capture_real_mode_state(regs: &Regs, cs: u16, ip: u16, ss: u16, sp
     }
 }
 
-pub(super) fn capture_protected_mode_state(regs: &Regs) -> RawModeState {
+fn capture_protected_mode_state(regs: &Regs) -> RawModeState {
     RawModeState {
         flags: regs.flags32(),
         cs: regs.code_seg(),
@@ -212,7 +212,7 @@ fn real_mode_state_buffer_addr(regs: &Regs) -> u32 {
     ((regs.es as u32) << 4).wrapping_add((regs.rdi as u32) & 0xFFFF)
 }
 
-pub(super) fn save_restore_real_mode_state(dos: &mut thread::DosState, regs: &Regs) {
+fn save_restore_real_mode_state(dos: &mut thread::DosState, regs: &Regs) {
     let dpmi = match dos.dpmi.as_mut() {
         Some(dpmi) => dpmi,
         None => return,

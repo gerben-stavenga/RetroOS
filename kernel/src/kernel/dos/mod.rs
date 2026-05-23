@@ -733,8 +733,8 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
         let idx = (sel >> 3) as usize;
         if idx >= dos.ldt.len() { continue; }
         let raw = dos.ldt[idx];
-        let base = dpmi::DpmiState::desc_base(raw);
-        let limit = dpmi::DpmiState::desc_limit(raw);
+        let base = dpmi::desc_base(raw);
+        let limit = dpmi::desc_limit(raw);
         crate::dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
             name, sel, idx, base, limit, raw);
     }

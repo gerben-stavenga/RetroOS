@@ -354,7 +354,7 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Re
 
 /// Real-mode callback entry — real-mode code called one of our callback stubs.
 /// Save real-mode state, fill register structure, switch to PM callback handler.
-pub fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize) {
+pub(in crate::kernel::dos) fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize) {
     let cb = match dos.dpmi.as_ref() {
         Some(d) => d.callbacks[cb_idx],
         None => {
