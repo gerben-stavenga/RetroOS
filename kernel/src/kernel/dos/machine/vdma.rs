@@ -195,6 +195,9 @@ pub struct SbDmaState {
     pub host_dma8: u8,
     pub host_dma16: u8,
     pub dma: Dma8237, // generic virtual controller shadow
+    dsp_test_reg: u8,
+    dsp_read_data: Option<u8>,
+    dsp_expect_test_write: bool,
     /// Current alias binding. `bound_chan == 0xFF` ⇒ none. While bound,
     /// the guest's `bound_vpage..+bound_pages` linear pages alias DMA
     /// channel `bound_host`'s permanent buffer; `bound_gpa`/`bound_len`
@@ -224,6 +227,7 @@ impl SbDmaState {
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
             dma: Dma8237::new(),
+            dsp_test_reg: 0, dsp_read_data: None, dsp_expect_test_write: false,
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
             suspended: false, last_gen: [0; 8],
@@ -258,6 +262,45 @@ impl SbDmaState {
     /// the OPL2/3 FM ports 0x388/0x389. Only the 8237 is virtual.
     pub fn is_passthrough(&self, p: u16) -> bool {
         (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388 | 0x389)
+    }
+
+    /// Read an SB DSP/mixer/OPL passthrough port, with a tiny compatibility
+    /// shim for DSP command E4h/E8h (test register write/read). Some older
+    /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
+    /// sb16 does not appear to surface that response through passthrough.
+    pub fn sb_read(&mut self, p: u16) -> u8 {
+        if p == self.io_base + 0x0A {
+            if let Some(v) = self.dsp_read_data.take() {
+                return v;
+            }
+        } else if p == self.io_base + 0x0E && self.dsp_read_data.is_some() {
+            return 0x80;
+        }
+        crate::arch::inb(p)
+    }
+
+    /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
+    /// locally; all other traffic continues to the real QEMU sb16/adlib.
+    pub fn sb_write(&mut self, p: u16, val: u8) {
+        if p == self.io_base + 0x0C {
+            if self.dsp_expect_test_write {
+                self.dsp_test_reg = val;
+                self.dsp_expect_test_write = false;
+                return;
+            }
+            match val {
+                0xE4 => {
+                    self.dsp_expect_test_write = true;
+                    return;
+                }
+                0xE8 => {
+                    self.dsp_read_data = Some(self.dsp_test_reg);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        crate::arch::outb(p, val);
     }
 
     /// DMA-port read. Two distinct sources of truth, never conflated:

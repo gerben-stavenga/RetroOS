@@ -422,7 +422,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            let v = crate::arch::inb(p);
+            let v = pc.sb.sb_read(p);
             // [SB-IO] in trace disabled per request.
             v
         }
@@ -520,7 +520,7 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
             // [SB-IO] out trace disabled per request.
-            crate::arch::outb(p, val);
+            pc.sb.sb_write(p, val);
         }
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
