@@ -1,18 +1,19 @@
-//! PM/RM transition mechanics for our DOS personality.
+//! DPMI protected-mode DOS crossing mechanics.
 //!
 //! Owns the per-thread **locked PM stack** (DPMI 0.9 §3.1.2 "locked
-//! protected mode stack") and tracks user execution state across mode
-//! switches. The locked stack is a buffer in low memory, aliased by
-//! two LDT selectors (PM16 with B=0, PM32 with B=1, both base=0) so
-//! user PM handlers see SS_base matching client flat DS_base.
+//! protected mode stack") and the dedicated real-mode stack used when
+//! protected-mode DOS clients reflect interrupts, invoke real-mode
+//! procedures, receive callbacks, or run protected-mode IRQ/exception
+//! handlers. This is not a generic mode-switch layer: it is the stack
+//! bridge for DPMI/PMDOS execution.
 //!
 //! ### User execution states
 //!
-//! Four logical states distinguished by (mode, stack):
+//! Four logical states matter to the bridge:
 //!
 //! - `ClientPm`     — PM running on the client's own PM stack.
 //! - `ClientRm`     — RM/VM86 running on the client's own RM stack.
-//! - `PmInLocked`   — PM running on the locked PM stack. PM IRQ
+//! - `PmInLocked`   — PM running on the DPMI locked PM stack. PM IRQ
 //!                    handlers, exception handlers, RM callbacks, and
 //!                    post-soft-INT-reflect PM continuations all run
 //!                    here. The handler may switch SS to its own
@@ -32,22 +33,22 @@
 //! the *other* dedicated stack we'd ping-pong to.
 //! `regs.SS:SP` is authoritative for whichever stack the user is
 //! currently on; `other_stack` tracks the cursor of the not-current
-//! one. ModeSave captures and restores `other_stack` symmetrically.
+//! one. HostContinuation captures and restores `other_stack` symmetrically.
 //!
 //! ### Frame layout
 //!
-//! Cross-mode entries push a `ModeSave` on the PM-side stack. Some
-//! recipes place additional typed records above it, such as an IRET
-//! frame for PM IRQ delivery or a call-stub frame for DPMI 0300/0301/
-//! 0302 and callbacks. The return stubs pop the matching layout and
-//! restore `other_stack` from the captured `ModeSave`.
+//! Cross-mode entries push a `HostContinuation` on the PM-side stack. Some
+//! recipes place an IRET frame above it for PM IRQ delivery or callback
+//! return. Explicit DPMI RM calls store their register-structure address
+//! in the continuation so one return path can write results back, restore
+//! GP regs, and restore `other_stack`.
 
 use super::dos;
 use super::machine;
 use super::thread;
 use crate::Regs;
 
-/// Per-thread tracking for kernel-mediated PM/RM crossings.
+/// Per-thread tracking for kernel-mediated DPMI/PMDOS crossings.
 ///
 /// `other_stack` is the central state: `None` when the user is in
 /// client mode (not on either dedicated stack), `Some((ss, sp))` when
@@ -57,9 +58,9 @@ use crate::Regs;
 /// currently on; `other_stack` tracks the cursor of the not-current
 /// one.
 ///
-/// Maintained automatically via `ModeSave`'s capture/restore: every
-/// `push_save` records the current value, every matching `pop_save`'s
-/// caller restores it. Bracket boundaries (`deliver_pm_irq`
+/// Maintained automatically via `HostContinuation`'s capture/restore: every
+/// `push_continuation` records the current value, and
+/// `resume_continuation` restores it. Bracket boundaries (`deliver_pm_irq`
 /// first-entry, etc.) update it explicitly when transitioning state.
 pub struct LockedStackState {
     pub other_stack: Option<(u16, u32)>,
@@ -74,10 +75,9 @@ impl LockedStackState {
 /// Snapshot of CPU state captured across a kernel-orchestrated mode
 /// switch. Pushed onto the locked stack by recipes that need to
 /// remember "where to go back to". GP regs are deliberately not part
-/// of this struct — DPMI 0.9 §2.4 round-trips them through the
-/// handler / RM code, and recipes that need to preserve them across
-/// an explicit call (DPMI 0300-02) lay their own typed frame above
-/// the ModeSave.
+/// of this struct; explicit DPMI RM-call recipes save them in the
+/// caller-visible RmCallStruct while the RM side runs, then exchange that
+/// structure with the live result regs during `resume_continuation`.
 ///
 /// ### Hardware-stack-compat layout
 ///
@@ -85,20 +85,20 @@ impl LockedStackState {
 /// to mirror what a 32-bit CPU pushes on a fault/interrupt with stack
 /// switch (`ESP` → low: EIP, CS, EFLAGS, ESP, SS). This lets recipes
 /// expose a spec-mandated frame to the client by writing only a small
-/// prefix above the ModeSave instead of duplicating the faulting
+/// prefix above the HostContinuation instead of duplicating the faulting
 /// state:
 ///
 ///   - **DPMI 0.9 §6 PM exception frame** (32-bit): a 3-dword prefix
-///     `[ret_eip, ret_cs, err_code]` above ModeSave gives the handler
+///     `[ret_eip, ret_cs, err_code]` above HostContinuation gives the handler
 ///     the exact 8-field spec layout — faulting `EIP/CS/EFLAGS/ESP/SS`
 ///     at offsets `+12/+16/+20/+24/+28` from the handler's ESP coincide
-///     with ModeSave's first five u32 fields. Handler modifications
-///     to those fields land in ModeSave directly, and `save.restore`
+///     with HostContinuation's first five u32 fields. Handler modifications
+///     to those fields land in HostContinuation directly, and `save.restore`
 ///     picks them up on unwind without a copy step.
 ///   - **HW IRQ entry**: the iret-frame `[eip, cs, eflags]` pushed
-///     above ModeSave (with control values, not faulting state)
+///     above HostContinuation (with control values, not faulting state)
 ///     follows the same field order, so a hardware IRET pops it and
-///     leaves `regs.SS:SP` aligned at the start of ModeSave for the
+///     leaves `regs.SS:SP` aligned at the start of HostContinuation for the
 ///     trap-back stub to find.
 ///
 /// 16-bit clients don't get the overlap (their spec frame uses u16
@@ -106,10 +106,10 @@ impl LockedStackState {
 /// and pay the small redundancy.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-pub(super) struct ModeSave {
+pub(super) struct HostContinuation {
     // Hardware-stack-compat layout: matches CPU iret-frame field order
     // (eip, cs, eflags) so the spec exception frame's faulting portion
-    // can overlap with ModeSave's first 5 u32 fields for 32-bit clients.
+    // can overlap with HostContinuation's first 5 u32 fields for 32-bit clients.
     pub eip:    u32,
     pub cs:     u32,
     pub eflags: u32,
@@ -121,16 +121,17 @@ pub(super) struct ModeSave {
     pub gs:     u16,
     /// `dos.pc.locked_stack.other_stack` value at push time. Sentinel
     /// `(0, 0)` means `None` (selector 0 is never a valid stack
-    /// selector, so the encoding is unambiguous). pop_save's caller
+    /// selector, so the encoding is unambiguous). `resume_continuation`
     /// restores `dos.pc.locked_stack.other_stack` from these fields.
     pub other_ss: u16,
     pub other_sp: u32,
+    pub rm_call_struct_addr: u32,
 }
 
-pub(super) const MODE_SAVE_SIZE: u32 = core::mem::size_of::<ModeSave>() as u32;
+pub(super) const HOST_CONTINUATION_SIZE: u32 = core::mem::size_of::<HostContinuation>() as u32;
 
-impl ModeSave {
-    pub fn capture(regs: &Regs, other_stack: Option<(u16, u32)>) -> Self {
+impl HostContinuation {
+    pub fn capture(regs: &Regs, other_stack: Option<(u16, u32)>, rm_call_struct_addr: Option<u32>) -> Self {
         let (other_ss, other_sp) = other_stack.unwrap_or((0, 0));
         Self {
             eip:    regs.ip32(),
@@ -144,6 +145,7 @@ impl ModeSave {
             gs:     regs.gs as u16,
             other_ss,
             other_sp,
+            rm_call_struct_addr: rm_call_struct_addr.unwrap_or(0),
         }
     }
 
@@ -159,11 +161,48 @@ impl ModeSave {
         regs.gs        = self.gs as u64;
     }
 
+    /// Decode the optional DPMI register-block pointer.
+    pub fn rm_call_struct_addr(&self) -> Option<u32> {
+        if self.rm_call_struct_addr == 0 { None } else { Some(self.rm_call_struct_addr) }
+    }
+
     /// Decode the captured `other_stack` value. `(0, 0)` ⇒ None.
     pub fn other_stack(&self) -> Option<(u16, u32)> {
         let ss = self.other_ss;
         let sp = self.other_sp;
         if ss == 0 { None } else { Some((ss, sp)) }
+    }
+}
+
+/// DPMI real-mode call structure used by INT 31h/0300-0302 and callbacks.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub(super) struct RmCallStruct {
+    pub edi: u32, pub esi: u32, pub ebp: u32, pub _reserved: u32,
+    pub ebx: u32, pub edx: u32, pub ecx: u32, pub eax: u32,
+    pub flags: u16, pub es: u16, pub ds: u16, pub fs: u16, pub gs: u16,
+    pub ip: u16, pub cs: u16, pub sp: u16, pub ss: u16,
+}
+
+impl RmCallStruct {
+    pub fn capture(regs: &Regs) -> Self {
+        Self {
+            edi: regs.rdi as u32, esi: regs.rsi as u32, ebp: regs.rbp as u32, _reserved: 0,
+            ebx: regs.rbx as u32, edx: regs.rdx as u32, ecx: regs.rcx as u32, eax: regs.rax as u32,
+            flags: regs.flags32() as u16, es: regs.es as u16, ds: regs.ds as u16,
+            fs: regs.fs as u16, gs: regs.gs as u16, ip: regs.ip32() as u16,
+            cs: regs.code_seg(), sp: regs.sp32() as u16, ss: regs.stack_seg(),
+        }
+    }
+
+    pub fn restore_gp(&self, regs: &mut Regs) {
+        regs.rax = (regs.rax & !0xFFFFFFFF) | self.eax as u64;
+        regs.rbx = (regs.rbx & !0xFFFFFFFF) | self.ebx as u64;
+        regs.rcx = (regs.rcx & !0xFFFFFFFF) | self.ecx as u64;
+        regs.rdx = (regs.rdx & !0xFFFFFFFF) | self.edx as u64;
+        regs.rsi = (regs.rsi & !0xFFFFFFFF) | self.esi as u64;
+        regs.rdi = (regs.rdi & !0xFFFFFFFF) | self.edi as u64;
+        regs.rbp = (regs.rbp & !0xFFFFFFFF) | self.ebp as u64;
     }
 }
 
@@ -210,102 +249,116 @@ pub(super) fn pm_get_stack(dos: &thread::DosState, regs: &Regs) -> (u16, u32) {
 }
 
 /// Resolve a (SS, SP) pair to a linear address, using the LDT for SS
-/// base. Used by push_save / pop_save to read/write a save at an
-/// arbitrary pm-side cursor.
+/// base. Used by continuation and IRET-frame helpers for explicit
+/// pm-side cursors.
 fn pm_addr(ldt: &[u64], cursor: (u16, u32)) -> u32 {
     seg_base(ldt, cursor.0).wrapping_add(cursor.1)
 }
 
-/// rm-side stack provider: live rm cursor if tracked in other_stack
-/// (chain in flight), else rm_dedicated:rm_TOS (first-entry default).
-/// Used by `switch_to_rm_side` callers when the recipe doesn't have a
-/// user-supplied rm SS:SP.
-pub(super) fn rm_get_stack(dos: &thread::DosState) -> (u16, u32) {
-    dos.pc.locked_stack.other_stack
-        .unwrap_or_else(|| (dos::rm_stack_seg(), rm_stack_top() as u32))
+fn fresh_rm_stack() -> (u16, u32) {
+    (dos::rm_stack_seg(), rm_stack_top() as u32)
 }
 
-/// Capture current regs as a ModeSave and write it at
-/// `(pm_get_stack.SS, pm_get_stack.SP − MODE_SAVE_SIZE)`. Returns the
-/// post-push (SS, SP). Private — recipes go through `switch_to_pm_side`
-/// or `switch_to_rm_side`, the only entry points to the locked-stack
+/// rm-side stack provider: live rm cursor if tracked in other_stack
+/// (chain in flight), else rm_dedicated:rm_TOS (first-entry default).
+/// Used by `push_continuation_and_switch_to_rm_side` callers when the recipe does not have a
+/// user-supplied rm SS:SP.
+pub(super) fn rm_get_stack(dos: &thread::DosState) -> (u16, u32) {
+    dos.pc.locked_stack.other_stack.unwrap_or_else(fresh_rm_stack)
+}
+
+fn rm_cursor_for_pm_entry(dos: &thread::DosState, regs: &Regs) -> (u16, u32) {
+    match dos.pc.locked_stack.other_stack {
+        None => fresh_rm_stack(),
+        Some(cursor) if regs.mode() != crate::UserMode::VM86 => cursor,
+        Some(_) => (regs.stack_seg(), regs.sp32()),
+    }
+}
+
+/// Capture current regs as a HostContinuation and write it at
+/// `(pm_get_stack.SS, pm_get_stack.SP − HOST_CONTINUATION_SIZE)`. Returns the
+/// post-push (SS, SP). Private — recipes go through `push_continuation_and_switch_to_pm_side`
+/// or `push_continuation_and_switch_to_rm_side`, the only entry points to the locked-stack
 /// chain.
-fn push_save(dos: &mut thread::DosState, regs: &Regs) -> (u16, u32) {
-    let save = ModeSave::capture(regs, dos.pc.locked_stack.other_stack);
+fn push_continuation(dos: &mut thread::DosState, regs: &Regs, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+    let save = HostContinuation::capture(regs, dos.pc.locked_stack.other_stack, rm_call_struct_addr);
     let (ss, sp) = pm_get_stack(dos, regs);
-    let new_sp = sp - MODE_SAVE_SIZE;
+    let new_sp = sp - HOST_CONTINUATION_SIZE;
     let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
-    unsafe { core::ptr::write_unaligned(addr as *mut ModeSave, save); }
+    unsafe { core::ptr::write_unaligned(addr as *mut HostContinuation, save); }
     (ss, new_sp)
 }
 
-/// Read the topmost ModeSave on the pm side. Doesn't write back — the
-/// caller follows with `save.restore(regs)` which clobbers SS:SP and
-/// other_stack, so the post-pop cursor doesn't need to live anywhere.
-pub(super) fn pop_save(dos: &thread::DosState, regs: &Regs) -> ModeSave {
-    pop_save_at(&dos.ldt[..], pm_get_stack(dos, regs))
+/// Read the topmost HostContinuation on the pm side. The caller follows
+/// with `resume_continuation`, which restores SS:SP and `other_stack`, so
+/// the post-pop cursor does not need to live anywhere.
+pub(super) fn pop_continuation(dos: &thread::DosState, regs: &Regs) -> HostContinuation {
+    pop_continuation_at(&dos.ldt[..], pm_get_stack(dos, regs))
 }
 
-/// Read a ModeSave at an explicit (SS, SP). Used by `rm_iret_call`
-/// which has to skip past a CallStubFrame first.
-pub(super) fn pop_save_at(ldt: &[u64], cursor: (u16, u32)) -> ModeSave {
+/// Read a HostContinuation at an explicit (SS, SP). Used by recipes that
+/// know the pm-side cursor directly.
+pub(super) fn pop_continuation_at(ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
     let addr = pm_addr(ldt, cursor);
-    unsafe { core::ptr::read_unaligned(addr as *const ModeSave) }
+    unsafe { core::ptr::read_unaligned(addr as *const HostContinuation) }
 }
 
-// ─── Cross-mode toggle primitives ────────────────────────────────────
-//
-// These are the *only* way to push a ModeSave onto the pm side and
-// open/extend the chain bracket. Every recipe that switches the user
-// across the pm/rm boundary calls one of them. Direction is implicit
-// from `regs.mode()` at entry; the toggles capture pre-transition rm
-// (or pm) state into other_stack so unwind round-trips cleanly even
-// when nested inside an outer rm excursion.
+pub(super) fn resume_continuation(dos: &mut thread::DosState, regs: &mut Regs, save: HostContinuation) {
+    let saved_regs = save.rm_call_struct_addr().map(|addr| {
+        let current = RmCallStruct::capture(regs);
+        let saved = unsafe { core::ptr::read_unaligned(addr as *const RmCallStruct) };
+        unsafe { core::ptr::write_unaligned(addr as *mut RmCallStruct, current); }
+        saved
+    });
 
-/// Switch the user to the pm side. Pushes a ModeSave on pm side,
-/// lands `regs.SS:SP` on top of the save, clears VM_FLAG. Captures
-/// pre-transition rm SS:SP into `other_stack` so a subsequent
-/// PM→RM toggle resumes below it (LIFO sharing of rm_dedicated).
+    save.restore(regs);
+    dos.pc.locked_stack.other_stack = save.other_stack();
+
+    if let Some(saved) = saved_regs {
+        saved.restore_gp(regs);
+        if regs.mode() == crate::UserMode::VM86 {
+            let ret_ip = machine::vm86_pop(regs);
+            let ret_cs = machine::vm86_pop(regs);
+            machine::set_vm86_ip(regs, ret_ip);
+            machine::set_vm86_cs(regs, ret_cs);
+        }
+    }
+}
+
+// ─── DPMI side-switch primitives ─────────────────────────────────────
+//
+// These are the only entry points that both push a HostContinuation and move
+// execution between the DPMI PM side and the RM side. Their contract is
+// deliberately narrow:
+//
+//   1. Push exactly one HostContinuation on the PM side before changing mode bits.
+//   2. Set regs.SS:SP to the destination side's cursor.
+//   3. Set other_stack to the cursor for the side that is no longer current.
+//   4. Do not choose the destination CS:EIP or add recipe-specific frames.
+//
+// Callers own target CS:EIP, interrupt/call frames, register marshalling,
+// and any later adjustment of other_stack after adding records above the
+// HostContinuation.
+
+/// Push a HostContinuation and make the PM side current.
 ///
-/// Returns the post-push pm `(SS, SP)`. Caller may write additional
-/// pm-side bookkeeping above the save (iret-frame, CallStubFrame),
-/// then adjust `regs.SP` to land the user on top of the full layout.
-/// Caller also sets `regs.CS:EIP` and any flags beyond VM_FLAG.
+/// Postconditions:
+///   - `regs.mode()` is protected mode (`VM_FLAG` clear).
+///   - `regs.SS:SP` points at the newly-pushed HostContinuation on the PM side.
+///   - `other_stack` holds the RM resume cursor. For first entry this is
+///     the dedicated RM stack top, not the caller's VM86 stack.
 ///
-/// Used by: `deliver_pm_irq` (toggle/first-entry branch), `callback_entry`.
-pub(super) fn switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs) -> (u16, u32) {
+/// The caller must then choose PM `CS:EIP` and may add recipe-specific
+/// frames above the HostContinuation before finalizing `regs.SP`.
+pub(super) fn push_continuation_and_switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
     if_record(IF_SWITCH_PM, regs, if_bit(regs), if_bit(regs),
         dos.pc.locked_stack.other_stack);
-    // Compute the rm cursor to track in `other_stack` for the duration
-    // of this excursion. The cursor's role is to tell a subsequent
-    // PM→RM toggle (`switch_to_rm_side` via `rm_get_stack`) where to
-    // land the BIOS handler / RM target.
-    //
-    // - chain in flight (other_stack==Some): we're nesting on top of
-    //   an outer rm excursion — capture the live rm cursor (regs.SS:SP
-    //   for VM86 entry, the outer cursor for PM entry) so the inner
-    //   toggle resumes below it (LIFO sharing of rm_dedicated).
-    //
-    // - first entry (other_stack==None): regs.SS:SP for VM86 entry is
-    //   the *user's own stack*, NOT a usable rm landing site — DN's
-    //   decompression code runs with a tiny ~few-hundred-byte stack
-    //   right above its execution loop. Routing a BIOS-handler reflect
-    //   onto that stack overflows it, corrupts adjacent code, and
-    //   crashes DN at random sites after AH=4Bh return. Default to
-    //   rm_dedicated:rm_TOS instead.
-    //
-    // ModeSave's own ss/esp fields capture the user's actual SS:SP for
-    // cross_mode_restore, independent of `other_stack`.
-    let next_rm_cursor = if dos.pc.locked_stack.other_stack.is_some() {
-        if regs.mode() == crate::UserMode::VM86 {
-            (regs.stack_seg(), regs.sp32())
-        } else {
-            rm_get_stack(dos)
-        }
-    } else {
-        (dos::rm_stack_seg(), rm_stack_top() as u32)
-    };
-    let pm_save_at = push_save(dos, regs);
+    // Track where the RM side should resume if this PM entry reflects
+    // back to real mode. First entry must use the dedicated RM stack;
+    // a VM86 caller's own stack may be too small for BIOS/DOS handlers.
+    // HostContinuation still captures the interrupted SS:SP for final restore.
+    let next_rm_cursor = rm_cursor_for_pm_entry(dos, regs);
+    let pm_save_at = push_continuation(dos, regs, rm_call_struct_addr);
     regs.frame.ss  = pm_save_at.0 as u64;
     regs.frame.rsp = pm_save_at.1 as u64;
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
@@ -313,22 +366,19 @@ pub(super) fn switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Regs) -> 
     pm_save_at
 }
 
-/// Switch the user to the rm side. Pushes a ModeSave on pm side, sets
-/// `regs.SS:SP` to `rm_dest`, sets VM_FLAG. Records the post-push pm
-/// cursor in `other_stack` so an unwind via SLOT_RM_IRET / SLOT_RM_IRET_CALL
-/// can locate the save. Caller may overwrite `other_stack` with a later
-/// pm cursor if it writes additional pm-side bookkeeping (CallStubFrame
-/// for 0300/01/02).
+/// Push a HostContinuation and make the RM side current.
 ///
-/// Returns the post-push pm `(SS, SP)` — where the save lives, and
-/// where any caller-written pm-side bookkeeping (CallStubFrame) goes
-/// above. Caller also sets `regs.CS:EIP` and any flags beyond VM_FLAG.
+/// Postconditions:
+///   - `regs.mode()` is VM86 (`VM_FLAG` set).
+///   - `regs.SS:SP` is `rm_dest`.
+///   - `other_stack` holds the PM cursor where the HostContinuation was pushed.
 ///
-/// Used by: `reflect_int_to_real_mode`, `simulate_real_mode_int`,
-/// `call_real_mode_proc`, `call_real_mode_proc_iret`.
-pub(super) fn switch_to_rm_side(dos: &mut thread::DosState, regs: &mut Regs,
-                                rm_dest: (u16, u32)) -> (u16, u32) {
-    let pm_save_at = push_save(dos, regs);
+/// The caller must then choose RM `CS:EIP` and may add recipe-specific
+/// PM-side frames above the HostContinuation. If it does, it must update
+/// `other_stack` to the new topmost PM cursor before returning to user code.
+pub(super) fn push_continuation_and_switch_to_rm_side(dos: &mut thread::DosState, regs: &mut Regs,
+                                rm_dest: (u16, u32), rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+    let pm_save_at = push_continuation(dos, regs, rm_call_struct_addr);
     regs.frame.ss  = rm_dest.0 as u64;
     regs.frame.rsp = rm_dest.1 as u64;
     regs.frame.rflags |= machine::VM_FLAG as u64;
@@ -403,12 +453,17 @@ pub const HOST_STACK_PM32_LDT_IDX: usize = 9;
 pub const HOST_STACK_PM16_SEL: u16 = ((HOST_STACK_PM16_LDT_IDX as u16) << 3) | 4 | 3;
 pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4 | 3;
 
+fn host_iret_stub(use32: bool) -> (u16, u32) {
+    let slot = if use32 { dos::SLOT_HOST_IRET32 } else { dos::SLOT_HOST_IRET16 };
+    (SPECIAL_STUB_SEL, dos::STUB_BASE + dos::slot_offset(slot) as u32)
+}
+
 // ─── PM interrupt delivery ─────────────────────────────────────────────
 //
 // PM IRQ delivery uses the same cross-mode chain as RM reflection:
 // `regs.SS:SP` is the live stack cursor, and `other_stack` holds the
 // cursor for the side not currently executing. First-entry/toggle cases
-// push a `ModeSave` plus an IRET frame targeting `SLOT_PM_IRET`; nested
+// push a `HostContinuation` plus an IRET frame targeting `SLOT_PM_IRET`; nested
 // PM-side IRQs only need a normal IRET frame on the current PM stack.
 
 /// Deliver a PM soft INT to the installed handler.
@@ -419,9 +474,8 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 ///
 ///   - Push an IRET frame on `regs.ss:regs.sp` (the client's stack) with
 ///     return CS:EIP:EFLAGS pointing back at the interrupted client.
-///     Frame width follows `dpmi.client_use32` per §10.6 (32-bit client →
-///     12-byte IRETD frame; 16-bit → 6-byte IRET frame). The handler
-///     owns matching its IRET width to the client's.
+///     Frame width follows the DPMI client type. Some 32-bit clients install
+///     handlers in 16-bit-looking segments but return with IRETD.
 ///   - Set CS:EIP to the installed handler. Clear TF so we don't
 ///     single-step into the handler. IF/IOPL/etc. follow the caller's
 ///     EFLAGS unchanged (spec leaves soft-INT handler IF state alone).
@@ -430,13 +484,18 @@ pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4
 ///     switch.
 pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     let (sel, off) = dos.pm_vectors[vector as usize];
-    let dpmi = match dos.dpmi.as_ref() {
-        Some(d) => d,
+    let frame_use32 = match dos.dpmi.as_ref() {
+        Some(dpmi) => dpmi.client_use32,
         None => return thread::KernelAction::Done,
     };
-    let client_use32 = dpmi.client_use32;
-    push_iret_frame(&dos.ldt[..], regs, client_use32,
+    push_iret_frame(&dos.ldt[..], regs, frame_use32,
         regs.ip32(), regs.code_seg(), regs.flags32());
+    if sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2 {
+        let (stub_sel, stub_off) = host_iret_stub(frame_use32);
+        regs.set_cs32(stub_sel as u32);
+        regs.set_ip32(stub_off);
+        return reflect_int_to_real_mode(dos, regs, vector);
+    }
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
     regs.clear_flag32(1 << 8);
@@ -456,7 +515,7 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
 /// handler context (the client's PM stack or VM86); nested entries
 /// already inside a handler context reuse the existing stack chain.
 ///
-///   - **First entry or RM-side toggle**: push a `ModeSave`, switch to
+///   - **First entry or RM-side toggle**: push a `HostContinuation`, switch to
 ///     the PM locked-stack alias, and push an IRET frame targeting
 ///     `SLOT_PM_IRET`. The handler IRETs to that stub, and
 ///     `cross_mode_restore` pops the save and restores the interrupted
@@ -464,7 +523,7 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Regs, vector
 ///
 ///   - **Nested while already on the PM side of a chain**: push only an
 ///     IRET frame at `regs.ESP - frame_size` targeting the outer CS:EIP.
-///     No `ModeSave` is needed because the current PM stack already is
+///     No `HostContinuation` is needed because the current PM stack already is
 ///     the live cursor and same-privilege IRET can unwind it directly.
 ///
 /// Works for non-DPMI threads too: `install_kernel_ldt_slots` makes the
@@ -494,10 +553,10 @@ pub(super) struct IfEvt {
     pub if_out: bool,   // virtual IF after this event
     pub other: (u16, u32), // locked_stack.other_stack at this point
 }
-pub(super) const IF_SWITCH_PM: u8 = 1; // switch_to_pm_side (first/toggle entry)
+pub(super) const IF_SWITCH_PM: u8 = 1; // push_continuation_and_switch_to_pm_side (first/toggle entry)
 pub(super) const IF_REFLECT_RM: u8 = 2; // reflect_int_to_real_mode (clears IF)
-pub(super) const IF_RM_IRET: u8 = 3;    // rm_iret (forces IF=1)
-pub(super) const IF_XRESTORE: u8 = 4;   // cross_mode_restore (pops ModeSave)
+pub(super) const IF_RESUME_CONTINUATION: u8 = 3;    // resume_continuation_from_stub (reflected INT forces IF=1)
+pub(super) const IF_XRESTORE: u8 = 4;   // cross_mode_restore (pops HostContinuation)
 
 const IF_RING_LEN: usize = 128;
 pub(super) static mut IF_RING: [IfEvt; IF_RING_LEN] = [IfEvt {
@@ -537,12 +596,8 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         LAST_IRQ = (vector, sel, off, regs.code_seg(), regs.ip32(),
                     regs.stack_seg(), regs.sp32());
     }
-    // DPMI 0.9 §10.6: frame width follows the *client*'s bitness, not the
-    // handler segment's D bit. A 32-bit client routinely installs a
-    // 16-bit-segment handler that issues `66 CF` (32-bit IRETD) — clients
-    // own that contract end-to-end. Non-DPMI threads default to 16-bit
-    // (the host default-stub path is 16-bit).
-    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    let default_vector = sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2;
+    let handler_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
 
     // Discriminate via (regs.mode, other_stack):
     //   (PM,   Some) → nested on pm side; plant iret-frame at
@@ -565,18 +620,18 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         // uses regs.frame.ss to look up the segment base, so this writes
         // to whatever stack the handler is currently on (DPMI 0.9 §3.1.2
         // permits handler SS != HOST_STACK_PM*).
-        push_iret_frame(&dos.ldt[..], regs, client_use32,
+        push_iret_frame(&dos.ldt[..], regs, handler_use32,
             regs.ip32(), regs.code_seg(), regs.flags32());
     } else {
-        // First-entry from client OR toggle from rm: switch_to_pm_side
-        // pushes ModeSave, lands user on top of the save, captures pre-
+        // First-entry from client OR toggle from rm: push_continuation_and_switch_to_pm_side
+        // pushes HostContinuation, lands user on top of the save, captures pre-
         // toggle rm SS:SP into other_stack (rm_TOS for first-entry from
         // PM client). Recipe layers an iret-to-SLOT_PM_IRET frame above
         // the save so the eventual handler IRET round-trips through
         // the kernel for unwind.
-        switch_to_pm_side(dos, regs);
+        push_continuation_and_switch_to_pm_side(dos, regs, None);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_IRET) as u32;
-        push_iret_frame(&dos.ldt[..], regs, client_use32,
+        push_iret_frame(&dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, regs.flags32());
 
         regs.ds = 0;
@@ -585,29 +640,34 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         regs.gs = 0;
     }
 
+    if default_vector {
+        let (stub_sel, stub_off) = host_iret_stub(handler_use32);
+        regs.frame.cs = stub_sel as u64;
+        regs.frame.rip = stub_off as u64;
+        let _ = reflect_int_to_real_mode(dos, regs, vector);
+        return;
+    }
+
     regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
     regs.frame.cs  = sel as u64;
     regs.frame.rip = off as u64;
 }
 
-/// Pop the ModeSave pushed by the outermost-relative PM-handler entry
+/// Pop the HostContinuation pushed by the outermost-relative PM-handler entry
 /// (`deliver_pm_irq` taking the cross-mode branch). Called from
 /// `pm_stub_dispatch` when SLOT_PM_IRET fires (client handler IRETed
 /// through our stub) and from `vector_stub_reflect` when the default
 /// stub catches an IRQ that has no PM handler installed.
 ///
 /// At entry: hardware IRET advanced regs.ESP past the iret_frame, so
-/// regs.SS:SP now points at the ModeSave on whichever pm stack the
+/// regs.SS:SP now points at the HostContinuation on whichever pm stack the
 /// handler used (host_stack or its own locked stack). pm_get_stack reads
 /// it directly off (regs.SS, regs.SP); save.restore then clobbers SS:SP
 /// with the pre-toggle values.
 pub(super) fn cross_mode_restore(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let xr_if_in = if_bit(regs);
-    let save = pop_save(dos, regs);
-    save.restore(regs);
-    // Restore the other_stack that was current at push time (None at
-    // outermost-from-client entry, Some at nested entries).
-    dos.pc.locked_stack.other_stack = save.other_stack();
+    let save = pop_continuation(dos, regs);
+    resume_continuation(dos, regs, save);
     if_record(IF_XRESTORE, regs, xr_if_in, if_bit(regs),
         dos.pc.locked_stack.other_stack);
 
@@ -703,16 +763,15 @@ pub(super) fn pop_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool) 
 /// Per-vector default stub trap. Mimics, in kernel space, the canonical
 /// PM stub a DOS extender would install:
 ///
-///   push_regs              ← `push_save`           (in `reflect_int_to_real_mode`)
+///   push_regs              ← `push_continuation`   (in `reflect_int_to_real_mode`)
 ///   call simulate_rm_int   ← RM-INT round-trip       (in `reflect_int_to_real_mode`)
-///   pop_regs               ← `pop_save`            (in `rm_iret`)
-///   sti                                             (in `rm_iret`)
-///   iret                   ← synthetic iret-pop    (in `rm_iret`)
+///   pop_regs               ← `resume_continuation` (in `resume_continuation_from_stub`)
+///   sti                                             (in `resume_continuation_from_stub`)
+///   iret                   ← host IRET stub
 ///
 /// Uniform — no discrimination by iret-target. The planted iret-frame
-/// (deliver_pm_irq or deliver_pm_int wrote it) is consumed at the
-/// synthetic-iret tail in `rm_iret`, landing regs at whatever
-/// target the planter chose:
+/// (deliver_pm_irq or deliver_pm_int wrote it) is consumed by the
+/// host IRET stub after `resume_continuation_from_stub` restores the continuation:
 ///   - `SLOT_PM_IRET` for cross-mode HW-IRQ first-entry → next CD 31
 ///     traps `cross_mode_restore` to pop the outer save.
 ///   - The outer caller's CS:EIP for soft-INT and nested-HW-IRQ.
@@ -724,6 +783,10 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
             vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
             regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
     }
+    let use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    let (stub_sel, stub_off) = host_iret_stub(use32);
+    regs.set_cs32(stub_sel as u32);
+    regs.set_ip32(stub_off);
     reflect_int_to_real_mode(dos, regs, vector)
 }
 
@@ -734,16 +797,16 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
 /// per-vector default stub (`vector_stub_reflect`) and by the unhandled-
 /// exception fallback (`dispatch_dpmi_exception`).
 ///
-/// On the way out: push `ModeSave`, switch to the RM-side cursor, and
+/// On the way out: push `HostContinuation`, switch to the RM-side cursor, and
 /// set up regs to enter the IVT handler in VM86 with the trampoline
-/// IRET frame pointing back at SLOT_RM_IRET. Per DPMI 0.9 §2.4 / §3.2:
+/// IRET frame pointing back at SLOT_RESUME_CONTINUATION. Per DPMI 0.9 §2.4 / §3.2:
 /// EAX/EBX/ECX/EDX/ESI/EDI/EBP and flags are passed unaltered; segment
 /// registers are undefined in real mode.
 ///
 /// On the way back: RM IRET pops the trampoline frame and lands at
-/// SLOT_RM_IRET. `rm_iret` pops the saved PM state, applies the
-/// default-stub STI rule, then synthetic-IRETs through the frame the
-/// caller planted on the user stack (the CS:EIP it wants resumed at).
+/// SLOT_RESUME_CONTINUATION. `resume_continuation_from_stub` pops the saved PM state, applies the
+/// default-stub STI rule, then resumes at a host IRET stub that pops the
+/// frame the caller planted on the user stack.
 pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     // Run the RM handler on the dedicated RM stack — never the
     // client's own VM86 stack — so a HW IRQ landing during a sensitive
@@ -751,7 +814,7 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // saved registers / return address. Works for VM86 and PM clients
     // alike, no DPMI session required.
     //
-    // Capture the client's flags before switch_to_rm_side mutates them
+    // Capture the client's flags before push_continuation_and_switch_to_rm_side mutates them
     // (it sets VM_FLAG) — these go on the rm iret-frame so RM IRET
     // restores them unmodified per CPU's own INT-n semantics. Pushing
     // 0 or current handler flags would corrupt status bits across the
@@ -771,20 +834,20 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // through `linear()` which is PM-aware, or via the dedicated
     // pmdos_int21_handler short-circuit for 16-bit clients (`pm_dos`).
     let rm_dest = rm_get_stack(dos);
-    let _save_at = switch_to_rm_side(dos, regs, rm_dest);
+    let _save_at = push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, None);
 
     // Some real-mode IRQ handlers assume DS/ES still name the interrupted
     // program's data segment. Restore those selectors when reflecting an
     // IRQ that was first delivered through the PM locked-stack path.
     if _save_at.0 == host_stack_pm_seg(dos) {
         // host_stack_pm layout (SS=host_stack_pm, SP grows down):
-        //   ModeSave1     ← deliver_pm_irq's switch_to_pm_side
+        //   HostContinuation1     ← deliver_pm_irq's push_continuation_and_switch_to_pm_side
         //   iret-frame    ← deliver_pm_irq's push_iret_frame (frame_size)
-        //   ModeSave2     ← our switch_to_rm_side push_save; `_save_at.1` here
+        //   HostContinuation2     ← our push_continuation_and_switch_to_rm_side; `_save_at.1` here
         let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
         let frame_size: u32 = if client_use32 { 12 } else { 6 };
-        let save = pop_save_at(&dos.ldt[..],
-            (_save_at.0, _save_at.1 + MODE_SAVE_SIZE + frame_size));
+        let save = pop_continuation_at(&dos.ldt[..],
+            (_save_at.0, _save_at.1 + HOST_CONTINUATION_SIZE + frame_size));
         regs.ds = save.ds as u64;
         regs.es = save.es as u64;
         regs.fs = save.fs as u64;
@@ -796,7 +859,7 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
 
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
     // own INT n in real mode would push: FLAGS / CS / IP.
-    let ret_off: u16 = dos::slot_offset(dos::SLOT_RM_IRET);
+    let ret_off: u16 = dos::slot_offset(dos::SLOT_RESUME_CONTINUATION);
     let ret_seg: u16 = dos::STUB_SEG;
     machine::vm86_push(regs, ret_flags);
     machine::vm86_push(regs, ret_seg);
@@ -804,7 +867,7 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
 
     // Enter the RM handler with IF cleared (matches CPU's INT-n: clears
     // IF, preserves status flags) and IOPL=1 (cli/sti virtualized via
-    // VME's VIF). VM_FLAG already set by switch_to_rm_side and
+    // VME's VIF). VM_FLAG already set by push_continuation_and_switch_to_rm_side and
     // preserved by the read-modify-write.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
@@ -826,58 +889,29 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     thread::KernelAction::Done
 }
 
-/// SLOT_RM_IRET dispatch — RM-INT-return unwind.
-/// Mirrors the canonical PM default-stub's tail in kernel space:
+/// SLOT_RESUME_CONTINUATION dispatch - the single RM-side continuation return.
 ///
-///   - Pop the `ModeSave` that `reflect_int_to_real_mode` pushed on
-///     entry.
-///   - OR IF=1 into EFLAGS (default-stub STI rule per DPMI 0.9).
-///   - Synthetic IRET: pop the iret-frame the caller planted on the
-///     user stack (whatever CS:EIP it wants resumed at), install
-///     CS:EIP/EFLAGS from it, and advance regs.SP.
-pub(super) fn rm_iret(dos: &mut thread::DosState, regs: &mut Regs) {
-    // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
-    // is a control flag — handler-set CLD/STD must not leak into caller.
+/// Explicit DPMI RM calls and callbacks carry an `RmCallStruct` address in
+/// the continuation; `resume_continuation` exchanges that register block and
+/// restores the suspended side. Plain reflected interrupts have no register
+/// block, so this also applies the default-stub STI/status-flag rule before
+/// resuming at the host IRET stub selected by the caller.
+pub(super) fn resume_continuation_from_stub(dos: &mut thread::DosState, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x08D5;
-    let rm_iret_if_in = if_bit(regs);
-    let rm_iret_other = dos.pc.locked_stack.other_stack;
+    let resume_if_in = if_bit(regs);
+    let resume_other = dos.pc.locked_stack.other_stack;
     let rm_arith = regs.flags32() & STATUS_MASK;
 
-    // pm_get_stack reads from other_stack here (we're in VM86 with
-    // other_stack=Some); pop_save fetches the save from wherever pm
-    // last was.
-    let save = pop_save(dos, regs);
-    save.restore(regs);
-    dos.pc.locked_stack.other_stack = save.other_stack();
-    regs.set_flags32((regs.flags32() & !STATUS_MASK) | rm_arith);
-    regs.frame.rflags |= machine::IF_FLAG as u64;
+    let mut save = pop_continuation(dos, regs);
+    let has_rm_call_struct = save.rm_call_struct_addr().is_some();
+    if !has_rm_call_struct {
+        save.eflags = (save.eflags & !STATUS_MASK) | rm_arith | machine::IF_FLAG;
+    }
+    resume_continuation(dos, regs, save);
+    if_record(IF_RESUME_CONTINUATION, regs, resume_if_in, if_bit(regs), resume_other);
 
-    // Planted iret-frame width follows client bitness (DPMI 0.9 §10.6),
-    // matching what host_stack_write_iret used on the entry side.
-    // pop_iret_frame advances regs.SP — which IS the pm cursor while
-    // user is on pm side, so the frame's bytes are released
-    // automatically.
-    //
-    // Preserve handler-set status flags across the synth-iret. The
-    // planted iret-frame holds the *caller's* pre-INT flags (planted
-    // by deliver_pm_int with handler_flags = caller's flags & ~TF). A
-    // plain `regs.flags = ret_flags` wipes the handler's CF/PF/AF/ZF/
-    // SF/OF — DOS calls return success/failure via CF, so the caller
-    // would see its own pre-INT CF instead of our handler's result.
-    // Borland's `dpmiload` PM loader specifically does
-    // `int 0x21 AH=3F; jnc 0x3B1; jmp 0x414` immediately after the
-    // read; without this merge it sees CF=1 (caller's stale flag) and
-    // bails with the "Application load & execute error FFFB".
-    let post_handler_status = regs.flags32() & STATUS_MASK;
-    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
-    let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, client_use32);
-    regs.set_ip32(ret_eip);
-    regs.set_cs32(ret_cs as u32);
-    regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status | machine::IF_FLAG);
-    if_record(IF_RM_IRET, regs, rm_iret_if_in, if_bit(regs), rm_iret_other);
-
-    dos_trace!("[DPMI] RM_IRET_STUB -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
-        ret_cs, ret_eip, regs.stack_seg(), regs.sp32());
+    dos_trace!("[DPMI] RESUME_CONTINUATION_STUB -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
+        regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
 }
 
 

@@ -78,7 +78,6 @@ macro_rules! dos_trace {
         }
     };
 }
-pub(crate) use dos_trace;
 
 mod dpmi;
 mod dfs;
@@ -102,12 +101,12 @@ pub use dos::parse_config_env;
 #[allow(unused_imports)]
 use dos::{
     STUB_BASE, STUB_SEG,
-    SLOT_RM_IRET, SLOT_RM_IRET_CALL,
+    SLOT_RESUME_CONTINUATION,
     SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_EXCEPTION_RET_V10, SLOT_PM_TO_REAL,
     SLOT_PMDOS_INT21,
-    SLOT_PM_IRET,
+    SLOT_PM_IRET, SLOT_HOST_IRET16, SLOT_HOST_IRET32,
     slot_offset,
     host_stack_base, host_stack_size, host_stack_empty_sp,
     rm_stack_base, rm_stack_size, rm_stack_seg, rm_stack_align_offset,
@@ -482,7 +481,7 @@ pub fn handle_event(
         }
         KE::Exception(n) => {
             // DPMI session active: route to client's exception handler
-            // regardless of current mode. switch_to_pm_side handles the
+            // regardless of current mode. push_continuation_and_switch_to_pm_side handles the
             // VM86→PM toggle if needed; save.restore puts us back in
             // VM86 on the unwind.
             if dos.dpmi.is_some() {

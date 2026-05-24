@@ -125,9 +125,9 @@ struct ExcFrameV10 {
 
 /// 16-bit DPMI 0.9 exception spec frame. Sits above `RetF16` on the
 /// host stack as its own region (u16 fields don't share offsets with
-/// ModeSave's u32 fields). dispatch writes the whole struct;
+/// HostContinuation's u32 fields). dispatch writes the whole struct;
 /// exception_return reads it back, copies handler-modified faulting
-/// fields into the low halves of ModeSave's u32 fields.
+/// fields into the low halves of HostContinuation's u32 fields.
 ///
 /// The trailing `_pad` bytes bring `RetF16 + ExcFrame16` to exactly 32
 /// bytes (0x20). A 16-bit 0.9 handler reads at +00H..+0FH and is
@@ -239,9 +239,9 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
             dos_trace!("[DPMI] reflect exception {} to IVT {:04X}:{:04X} from {:04X}:{:08X} flags={:04X}",
                 exc_num, ivt_seg, ivt_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
             // Plant an iret-frame on the user's stack pointing at the
-            // faulting CS:EIP so that `rm_iret`'s synth-iret tail (after
-            // BIOS returns) lands the user back at the faulting
-            // instruction. Frame width follows client bitness.
+            // faulting CS:EIP. After BIOS returns, `resume_continuation_from_stub` resumes at a
+            // host IRET stub that lands back at the faulting instruction.
+            // Frame width follows client bitness.
             let client_use32 = dpmi.client_use32;
             let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8));
             mode_transitions::push_iret_frame(&dos.ldt[..], regs, client_use32,
@@ -263,7 +263,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
     let stub_off_v10 = dos::STUB_BASE + dos::slot_offset(dos::SLOT_EXCEPTION_RET_V10) as u32;
     let err_code = regs.err_code as u32;
 
-    // Capture faulting state *before* switch_to_pm_side mutates regs.
+    // Capture faulting state *before* push_continuation_and_switch_to_pm_side mutates regs.
     // `from_vm86` was already captured above for the handler-table lookup.
     let f_eip    = regs.ip32();
     let f_cs     = regs.code_seg();
@@ -275,7 +275,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
     let f_fs     = regs.fs as u16;
     let f_gs     = regs.gs as u16;
 
-    let pm_save_at = mode_transitions::switch_to_pm_side(dos, regs);
+    let pm_save_at = mode_transitions::push_continuation_and_switch_to_pm_side(dos, regs, None);
     let pm_seg_base = mode_transitions::seg_base(&dos.ldt[..], pm_save_at.0);
     let new_sp;
 
@@ -456,10 +456,10 @@ pub(super) fn exception_return(
     //   new_sp:               RetF{16,32}
     //   new_sp + 4 or 8:      ExcFrame{16,32}   (0.9 spec frame body)
     //   new_sp + 0x20:        ExcFrameV10       (1.0 expanded frame)
-    //   pm_save_at.1:         ModeSave
+    //   pm_save_at.1:         HostContinuation
     let host_seg = mode_transitions::host_stack_pm_seg(dos);
     let host_base = mode_transitions::seg_base(&dos.ldt[..], host_seg);
-    let mode_save_sp = dos::host_stack_empty_sp() - mode_transitions::MODE_SAVE_SIZE;
+    let mode_save_sp = dos::host_stack_empty_sp() - mode_transitions::HOST_CONTINUATION_SIZE;
 
     // Read whichever view the handler modified. Both views share the
     // Both views share the same host_stack region; index into the selected portion.
@@ -485,14 +485,14 @@ pub(super) fn exception_return(
                 };
                 // 16-bit fields fold into the low halves of the saved
                 // 32-bit registers; upper halves come from the pre-fault
-                // capture in ModeSave below.
+                // capture in HostContinuation below.
                 (f.ip as u32, f.cs as u32, f.flags as u32, f.sp as u32, f.ss as u32)
             }
         }
         ExcReturnVia::V10 => {
             // 1.0 expanded frame is always 32-bit fields regardless of
             // client bitness (DPMI 1.0 §4.3). Sits at +20H..+57H from
-            // the frame base, i.e. just below ModeSave on host_stack.
+            // the frame base, i.e. just below HostContinuation on host_stack.
             let frame_sp = mode_save_sp - core::mem::size_of::<ExcFrameV10>() as u32;
             let f = unsafe {
                 core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrameV10)
@@ -502,7 +502,7 @@ pub(super) fn exception_return(
         }
     };
 
-    let mut save = mode_transitions::pop_save_at(&dos.ldt[..], (host_seg, mode_save_sp));
+    let mut save = mode_transitions::pop_continuation_at(&dos.ldt[..], (host_seg, mode_save_sp));
     if use32 || via == ExcReturnVia::V10 {
         save.eip    = new_eip;
         save.cs     = new_cs;
@@ -511,15 +511,14 @@ pub(super) fn exception_return(
         save.ss     = new_ss;
     } else {
         // 0.9 16-bit view: fold word-width modifications into the low
-        // 16 bits of ModeSave's 32-bit slots.
+        // 16 bits of HostContinuation's 32-bit slots.
         save.eip    = (save.eip    & 0xFFFF_0000) | new_eip;
         save.cs     = new_cs;
         save.eflags = (save.eflags & 0xFFFF_0000) | new_eflags;
         save.esp    = (save.esp    & 0xFFFF_0000) | new_esp;
         save.ss     = new_ss;
     }
-    save.restore(regs);
-    dos.pc.locked_stack.other_stack = save.other_stack();
+    mode_transitions::resume_continuation(dos, regs, save);
 
     trace_client_selector_leak("exception_return.out", regs);
     thread::KernelAction::Done

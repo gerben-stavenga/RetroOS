@@ -222,6 +222,18 @@ pub(super) fn ldt_is_allocated(ldt_alloc: &[u32], idx: usize) -> bool {
     ldt_alloc[word] & (1 << bit) != 0
 }
 
+pub(super) fn valid_ldt_selector_idx(ldt_alloc: &[u32], sel: u16) -> Option<usize> {
+    if sel & 0x0004 == 0 {
+        return None;
+    }
+    let idx = sel_to_idx(sel);
+    if ldt_is_allocated(ldt_alloc, idx) {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
 /// Build an x86 segment descriptor from components.
 /// flags: high nibble of byte 6: bit 7 = G, bit 6 = D/B, bit 5 = L, bit 4 = AVL.
 fn build_descriptor(base: u32, limit: u32, access: u64, flags: u64) -> u64 {

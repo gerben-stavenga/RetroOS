@@ -225,7 +225,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 
     let slot = ((ip.wrapping_sub(2)) / 2) as u8;
     let is_far_call = matches!(slot,
-        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RM_IRET | SLOT_RM_IRET_CALL
+        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RESUME_CONTINUATION
         | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
         | SLOT_INT74_MOUSE_CB | SLOT_INT74_MOUSE_CB_RET
         | SLOT_RESUME)
@@ -237,16 +237,10 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             dpmi::dpmi_enter(dos, regs);
             thread::KernelAction::Done
         }
-        SLOT_RM_IRET => {
-            // RM-INT-return: pop save, sti, synth-iret the iret-frame the
-            // caller planted on the user's stack.
-            mode_transitions::rm_iret(dos, regs);
-            thread::KernelAction::Done
-        }
-        SLOT_RM_IRET_CALL => {
-            // Explicit PM→RM call unwind: pop rm_struct_addr stub-arg,
-            // write current RM regs back to RmCallStruct, pop ModeSave.
-            dpmi::rm_iret_call(dos, regs);
+        SLOT_RESUME_CONTINUATION => {
+            // Single RM-side continuation return. The continuation decides
+            // whether this is a reflected INT or explicit RM call/callback.
+            mode_transitions::resume_continuation_from_stub(dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RAW_REAL_TO_PM => {
@@ -363,7 +357,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 /// `dos.pm_vectors[0x21] = (SPECIAL_STUB_SEL, STUB_BASE + SLOT_PMDOS_INT21*2)`,
 /// which `dpmi_enter` installs when `client_use32 == false`.
 ///
-/// We service the call directly with PM regs — no `switch_to_rm_side`,
+/// We service the call directly with PM regs — no `push_continuation_and_switch_to_rm_side`,
 /// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
@@ -385,8 +379,8 @@ pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut threa
 ///     (which is either the child's stack with the entry frame from
 ///     `exec_program`, or a VM86 parent's stack with the original INT
 ///     21 frame).
-///   - PM: synth-iret the frame `deliver_pm_int` planted on the PM
-///     stack. Status-flag merge mirrors `rm_iret` so DOS-call CF/AX
+///   - PM: pop the IRET frame `deliver_pm_int` planted on the PM
+///     stack. Status-flag merge mirrors `resume_continuation_from_stub` so DOS-call CF/AX
 ///     results survive.
 fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Regs) {
     // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
@@ -831,25 +825,11 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x25: Set interrupt vector (AL=int, DS:DX=handler)
         0x25 => {
             let int_num = regs.rax as u8;
-            let (seg, off) = if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
-                let sel = regs.ds as u16;
-                let off = regs.rdx as u16;
-                let shadow = dos.pm_rm_vector_shadow[int_num as usize];
-                if sel == dpmi::LOW_MEM_SEL && shadow.2 == off {
-                    (shadow.0, shadow.1)
-                } else {
-                    let base = mode_transitions::seg_base(&dos.ldt[..], sel);
-                    let addr = base.wrapping_add(off as u32);
-                    if base <= 0xFFFF0 && (base & 0x0F) == 0 && addr <= 0xFFFFF {
-                        ((base >> 4) as u16, off)
-                    } else {
-                        let linear = addr & 0xFFFFF;
-                        ((linear >> 4) as u16, (linear & 0x0F) as u16)
-                    }
-                }
-            } else {
-                (regs.ds as u16, regs.rdx as u16)
-            };
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                dos.pm_vectors[int_num as usize] = (regs.ds as u16, regs.rdx as u32);
+                return thread::KernelAction::Done;
+            }
+            let (seg, off) = (regs.ds as u16, regs.rdx as u16);
             write_u16(0, (int_num as u32) * 4, off);
             write_u16(0, (int_num as u32) * 4 + 2, seg);
             thread::KernelAction::Done
@@ -966,14 +946,18 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x35: Get interrupt vector (AL=int, returns ES:BX=handler)
         0x35 => {
             let int_num = regs.rax as u8;
-            let off = read_u16(0, (int_num as u32) * 4);
-            let seg = read_u16(0, (int_num as u32) * 4 + 2);
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
-                let linear = ((seg as u32) << 4).wrapping_add(off as u32);
-                dos.pm_rm_vector_shadow[int_num as usize] = (seg, off, (linear & 0xFFFF) as u16);
-                regs.es = dpmi::LOW_MEM_SEL as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | (linear & 0xFFFF) as u64;
+                let (sel, off) = dos.pm_vectors[int_num as usize];
+                regs.es = sel as u64;
+                let client_use32 = dos.dpmi.as_ref().map(|d| d.client_use32).unwrap_or(false);
+                if client_use32 {
+                    regs.rbx = (regs.rbx & !0xFFFF_FFFF) | off as u64;
+                } else {
+                    regs.rbx = (regs.rbx & !0xFFFF) | (off & 0xFFFF) as u64;
+                }
             } else {
+                let off = read_u16(0, (int_num as u32) * 4);
+                let seg = read_u16(0, (int_num as u32) * 4 + 2);
                 regs.es = seg as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | off as u64;
             }
@@ -1947,12 +1931,14 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=51h/62h. No return value other than the side effect.
         0x50 => {
             dos.current_psp = regs.rbx as u16;
+            regs.clear_flag32(1);
             thread::KernelAction::Done
         }
         // AH=0x51: Get Current Process ID (returns BX = current PSP segment)
         // Undocumented sibling of AH=62h.
         0x51 => {
             regs.rbx = (regs.rbx & !0xFFFF) | dos.current_psp as u64;
+            regs.clear_flag32(1);
             let cs = regs.frame.cs as u16;
             let ip = regs.frame.rip as u32;
             dos_trace!("D21 51 -> BX={:04X} cs:ip={:04X}:{:08X}",
@@ -2272,13 +2258,13 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 /// at our stub. Set up the AX=0Ch handler far-call and jump the user there.
 ///
 /// Bracket-saves the user GP regs we're about to clobber (AX/BX/CX/DX/SI/DI)
-/// since `ModeSave` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
+/// since `HostContinuation` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
 /// returns via SLOT_INT74_MOUSE_CB_RET which restores them and then unwinds
-/// the IRQ via the standard `rm_iret`.
+/// the IRQ via the standard `resume_continuation_from_stub`.
 ///
 /// Stack at entry (RM slab pushed by `reflect_int_to_real_mode`):
 ///   top: trap-IP, trap-CS, trap-FLAGS (the CD 31 IRET frame).
-///   below: outer IRET frame targeting SLOT_RM_IRET.
+///   below: outer IRET frame targeting SLOT_RESUME_CONTINUATION.
 fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
     use super::machine::{vm86_pop, vm86_push};
     // Discard the CD 31 trap iret-frame (slot is is_far_call, dispatcher
@@ -2327,7 +2313,7 @@ fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
 
 /// SLOT_INT74_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
 /// Restore the GP regs `mouse_callback_invoke` clobbered, then unwind the
-/// IRQ via the same `rm_iret` that SLOT_RM_IRET uses.
+/// IRQ via the same `resume_continuation_from_stub` that SLOT_RESUME_CONTINUATION uses.
 fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     use super::machine::vm86_pop;
     // Discard the CD 31 trap iret-frame.
@@ -2343,7 +2329,7 @@ fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     regs.rsi = m.saved_rsi;
     regs.rdi = m.saved_rdi;
 
-    super::mode_transitions::rm_iret(dos, regs);
+    super::mode_transitions::resume_continuation_from_stub(dos, regs);
 }
 
 /// Open a DOS program file by literal name. No extension probing, no
@@ -3293,15 +3279,6 @@ pub(super) struct Loaded {
 const STUB_INT: u8 = 0x31;
 const SLOT_XMS: u8 = 0x00;
 const SLOT_DPMI_ENTRY: u8 = 0x01;
-/// RM-side return stub for explicit PM→RM excursions: `INT 31h/0300h`
-/// (`simulate_real_mode_int`), `0301h` (`call_real_mode_proc`), `0302h`
-/// (`call_real_mode_proc_iret`), and `callback_entry` (RM→PM). Each entry
-/// pushes a `ModeSave` followed by a `rm_struct_addr` stub-arg on
-/// host_stack. On RM IRET the kernel pops the stub-arg, writes the
-/// current RM regs back into the RmCallStruct at that address (spec
-/// requires results in the structure), then pops the ModeSave and
-/// restores PM.
-pub(crate) const SLOT_RM_IRET_CALL: u8 = 0xF9;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
 pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 // Exclusive end. Stops at 0x13 because slot 0x13 collides with INT 13h
@@ -3318,8 +3295,8 @@ pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x13;
 /// and jumps the user to the handler.
 pub(crate) const SLOT_INT74_MOUSE_CB: u8 = 0x74;
 /// Handler RETFs to this slot. `mouse_callback_return` restores the
-/// bracket-saved GP regs (ModeSave doesn't cover them) and then unwinds the
-/// IRQ via the standard `rm_iret` path.
+/// bracket-saved GP regs (HostContinuation doesn't cover them) and then unwinds the
+/// IRQ via the standard `resume_continuation_from_stub` path.
 pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
 /// Generic block-and-retry resume slot. A syscall that can't complete
 /// synchronously (e.g. AH=08 with no key in the buffer) stashes a closure
@@ -3347,30 +3324,28 @@ pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// clients by default), `pm_vectors[0x21]` points here instead of the
 /// generic vector stub. The CD 31 traps to `pmdos_int21_handler` which
 /// runs the DOS INT 21 dispatcher with PM regs intact (no mode switch),
-/// then synth-irets the frame `deliver_pm_int` planted on the client's
-/// PM stack. `linear()` sees `regs.mode() == PM` and resolves DS:DX via
+/// then pops the frame `deliver_pm_int` planted on the client's PM stack. `linear()` sees `regs.mode() == PM` and resolves DS:DX via
 /// LDT base lookup — so high-memory PM-block buffers (the case Borland's
 /// `dpmiload` hits) are addressed correctly without bounce buffering.
 pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
 /// Outermost-relative PM-handler IRET target. Pushed as the IRET-frame
 /// `CS:EIP` by `deliver_pm_irq`'s cross-mode branch so the handler's IRET
 /// lands here; the `CD 31` then traps to the kernel, which pops the
-/// `ModeSave` from host_stack and restores the interrupted state via
+/// `HostContinuation` from host_stack and restores the interrupted state via
 /// `cross_mode_restore`. One slot serves both 16-bit and 32-bit handlers:
 /// bitness is encoded in the frame width on the push side; either IRET
 /// width lands at the same `CD 31` byte pair.
+pub(crate) const SLOT_HOST_IRET16: u8 = 0xF6;
+pub(crate) const SLOT_HOST_IRET32: u8 = 0xF7;
 pub(crate) const SLOT_PM_IRET: u8 = 0xF8;
 
-/// Kernel-owned PM return target for `reflect_int_to_real_mode` —
-/// the CS:EIP the caller asks reflect to come back at after the RM INT
-/// returns. Has to be a kernel-trapped address because the RM→PM mode
-/// flip on the way back needs kernel mediation. The handler at this
-/// slot (`mode_transitions::rm_iret`) runs the standard tail: pop the
-/// captured ModeSave, OR IF=1 (default-stub-STI rule), and synth-iret
-/// the iret-frame the caller planted on the user's stack — landing
-/// regs at whatever target the caller chose (SLOT_PM_IRET for
-/// cross-mode HW-IRQ, the outer caller's CS:EIP otherwise).
-pub(crate) const SLOT_RM_IRET: u8 = 0x02;
+/// Single RM-side continuation return target. Reflected INTs, explicit
+/// DPMI RM calls, and PM callback returns all land here after their RM or
+/// callback-side return. `mode_transitions::resume_continuation_from_stub` pops the captured
+/// HostContinuation; an attached RmCallStruct address selects register-block
+/// exchange, otherwise it applies the default-stub STI/status rule and
+/// resumes at the caller-selected host IRET stub.
+pub(crate) const SLOT_RESUME_CONTINUATION: u8 = 0x02;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 

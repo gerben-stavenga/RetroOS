@@ -156,7 +156,7 @@ pub struct MouseState {
     pub pending_cond: u16,
     pub last_dx: i16,
     pub last_dy: i16,
-    /// User GP regs saved across the AX=0Ch handler far-call. ModeSave only
+    /// User GP regs saved across the AX=0Ch handler far-call. HostContinuation
     /// covers CS/EIP/SS/ESP/EFLAGS/segs; we clobber AX/BX/CX/DX/SI/DI to set
     /// up the call, so they have to be bracket-saved here and restored by
     /// the SLOT_INT74_MOUSE_CB_RET slot when the handler RETFs.

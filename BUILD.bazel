@@ -273,6 +273,7 @@ genrule(
         "freedos/quake/CWSDPMI.EXE",
         "freedos/ctmouse/CTMOUSE.EXE",
         "freedos/hx/HDPMI16.EXE",
+        "freedos/hx/HDPMI16D.EXE",
         "freedos/hx/HDPMI32.EXE",
         "freedos/hx/SETUPBC.BAT",
     ],
@@ -322,12 +323,14 @@ genrule(
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/ctmouse/CTMOUSE.EXE" "::CTMOUSE.EXE"
 
         # Japheth HX HDPMI16/HDPMI32 — open-source 16/32-bit DPMI hosts at
-        # D:\\HDPMI16.EXE / D:\\HDPMI32.EXE. Load `HDPMI16` (TSR) before
+        # D:\\HDPMI16.EXE / D:\\HDPMI32.EXE. HDPMI16D.EXE is a local
+        # debug build with port E9 trace output. Load `HDPMI16` (TSR) before
         # BCC.EXE so BCC's runtime sees an existing DPMI host via INT 2F
         # AX=1687h instead of installing its own DPMI16BI.OVL — useful
         # for diagnosing whether a BCC behavior is host-side (DPMI16BI
         # quirk) or BCC-side (would reproduce under HDPMI16 too).
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI16.EXE" "::HDPMI16.EXE"
+        mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI16D.EXE" "::HDPMI16D.EXE"
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI32.EXE" "::HDPMI32.EXE"
         # SETUPBC.BAT — sets PATH/INCLUDE/LIB for BCC on D: (FreeDOS).
         # Run `D:\\SETUPBC` once after booting to make BCC find its headers.

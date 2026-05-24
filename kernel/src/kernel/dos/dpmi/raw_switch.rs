@@ -64,11 +64,16 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
         dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
         }
-        dos::SLOT_RM_IRET_CALL => {
-            // PM callback IRETed back to us: writeback + restore the RM
-            // caller (callback_entry path). 0300/01/02 path lands here via
-            // RM `CD 31` in slot from the RM-side stub instead.
-            rm_iret_call(dos, regs);
+        dos::SLOT_RESUME_CONTINUATION => {
+            mode_transitions::resume_continuation_from_stub(dos, regs);
+            return thread::KernelAction::Done;
+        }
+        dos::SLOT_HOST_IRET16 | dos::SLOT_HOST_IRET32 => {
+            let use32 = slot == dos::SLOT_HOST_IRET32;
+            let (ret_eip, ret_cs, ret_flags) = mode_transitions::pop_iret_frame(&dos.ldt[..], regs, use32);
+            regs.set_ip32(ret_eip);
+            regs.set_cs32(ret_cs as u32);
+            regs.set_flags32(ret_flags);
             return thread::KernelAction::Done;
         }
         dos::SLOT_PM_IRET => {
