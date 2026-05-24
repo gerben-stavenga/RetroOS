@@ -238,8 +238,8 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             thread::KernelAction::Done
         }
         SLOT_RESUME_CONTINUATION => {
-            // Single RM-side continuation return. The continuation decides
-            // whether this is a reflected INT or explicit RM call/callback.
+            // Single continuation return. An attached RmCallStruct selects
+            // register-block exchange; otherwise this restores the saved state.
             mode_transitions::resume_continuation_from_stub(dos, regs);
             thread::KernelAction::Done
         }
@@ -380,8 +380,7 @@ pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut threa
 ///     `exec_program`, or a VM86 parent's stack with the original INT
 ///     21 frame).
 ///   - PM: pop the IRET frame `deliver_pm_int` planted on the PM
-///     stack. Status-flag merge mirrors `resume_continuation_from_stub` so DOS-call CF/AX
-///     results survive.
+///     stack and merge DOS status flags so CF/AX results survive.
 fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Regs) {
     // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
     // is a control flag — handler-set CLD/STD must not leak into caller.
@@ -3328,23 +3327,11 @@ pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// LDT base lookup — so high-memory PM-block buffers (the case Borland's
 /// `dpmiload` hits) are addressed correctly without bounce buffering.
 pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
-/// Outermost-relative PM-handler IRET target. Pushed as the IRET-frame
-/// `CS:EIP` by `deliver_pm_irq`'s cross-mode branch so the handler's IRET
-/// lands here; the `CD 31` then traps to the kernel, which pops the
-/// `HostContinuation` from host_stack and restores the interrupted state via
-/// `cross_mode_restore`. One slot serves both 16-bit and 32-bit handlers:
-/// bitness is encoded in the frame width on the push side; either IRET
-/// width lands at the same `CD 31` byte pair.
-pub(crate) const SLOT_HOST_IRET16: u8 = 0xF6;
-pub(crate) const SLOT_HOST_IRET32: u8 = 0xF7;
-pub(crate) const SLOT_PM_IRET: u8 = 0xF8;
-
-/// Single RM-side continuation return target. Reflected INTs, explicit
-/// DPMI RM calls, and PM callback returns all land here after their RM or
-/// callback-side return. `mode_transitions::resume_continuation_from_stub` pops the captured
+/// Single continuation return target. Reflected INTs, explicit DPMI RM calls,
+/// PM callback returns, and PM IRQ unwind all land here after their far return
+/// or IRET. `mode_transitions::resume_continuation_from_stub` pops the captured
 /// HostContinuation; an attached RmCallStruct address selects register-block
-/// exchange, otherwise it applies the default-stub STI/status rule and
-/// resumes at the caller-selected host IRET stub.
+/// exchange.
 pub(crate) const SLOT_RESUME_CONTINUATION: u8 = 0x02;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }

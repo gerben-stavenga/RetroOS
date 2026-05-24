@@ -239,8 +239,9 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
             dos_trace!("[DPMI] reflect exception {} to IVT {:04X}:{:04X} from {:04X}:{:08X} flags={:04X}",
                 exc_num, ivt_seg, ivt_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
             // Plant an iret-frame on the user's stack pointing at the
-            // faulting CS:EIP. After BIOS returns, `resume_continuation_from_stub` resumes at a
-            // host IRET stub that lands back at the faulting instruction.
+            // faulting CS:EIP. After BIOS returns, `resume_continuation_from_stub`
+            // consumes the synthetic host IRET marker and lands back at the
+            // faulting instruction.
             // Frame width follows client bitness.
             let client_use32 = dpmi.client_use32;
             let handler_flags = regs.flags32() & !(machine::IF_FLAG | (1u32 << 8));

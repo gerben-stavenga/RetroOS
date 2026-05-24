@@ -66,23 +66,10 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
         }
         dos::SLOT_RESUME_CONTINUATION => {
             mode_transitions::resume_continuation_from_stub(dos, regs);
+            if regs.code_seg() != mode_transitions::SPECIAL_STUB_SEL {
+                super::super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
+            }
             return thread::KernelAction::Done;
-        }
-        dos::SLOT_HOST_IRET16 | dos::SLOT_HOST_IRET32 => {
-            let use32 = slot == dos::SLOT_HOST_IRET32;
-            let (ret_eip, ret_cs, ret_flags) = mode_transitions::pop_iret_frame(&dos.ldt[..], regs, use32);
-            regs.set_ip32(ret_eip);
-            regs.set_cs32(ret_cs as u32);
-            regs.set_flags32(ret_flags);
-            return thread::KernelAction::Done;
-        }
-        dos::SLOT_PM_IRET => {
-            let r = mode_transitions::cross_mode_restore(dos, regs);
-            // PM-handler path for HW IRQ: client handler ran, IRETed
-            // through our stub, cross_mode_restore put us back at the
-            // interrupted client state. IRQ context is over.
-            super::super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
-            return r;
         }
         dos::SLOT_SAVE_RESTORE => {
             // No state to save: AX=0305 announces buffer size = 0, so the

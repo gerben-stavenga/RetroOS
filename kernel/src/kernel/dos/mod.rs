@@ -106,7 +106,6 @@ use dos::{
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_EXCEPTION_RET_V10, SLOT_PM_TO_REAL,
     SLOT_PMDOS_INT21,
-    SLOT_PM_IRET, SLOT_HOST_IRET16, SLOT_HOST_IRET32,
     slot_offset,
     host_stack_base, host_stack_size, host_stack_empty_sp,
     rm_stack_base, rm_stack_size, rm_stack_seg, rm_stack_align_offset,
@@ -764,12 +763,12 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 /// is uniform regardless of the client's current mode: `deliver_pm_irq`
 /// snapshots the client state on a kernel IRQ stack and switches to the
 /// handler at `pm_vectors[vec].sel:off`. When the handler IRETs it lands at
-/// `SLOT_PM_RET_{16,32}` → `cross_mode_restore` → back to the client's
-/// original state (VM86 or PM). If `pm_vectors[vec]` is the default stub
-/// (no PM handler installed), `vector_stub_reflect` runs `cross_mode_restore`
-/// and then reflects the IRQ to BIOS via `reflect_int_to_real_mode` —
-/// uniformly for VM86 and PM clients. BIOS executes on a kernel-owned RM
-/// frame allocated from host_stack, never on the client's own stack.
+/// `SLOT_RESUME_CONTINUATION`, which restores the client's original state
+/// (VM86 or PM). If `pm_vectors[vec]` is the default stub (no PM handler
+/// installed), `vector_stub_reflect` reflects the IRQ to BIOS via
+/// `reflect_int_to_real_mode` first, then returns through the same continuation
+/// resume path. BIOS executes on a kernel-owned RM frame allocated from
+/// host_stack, never on the client's own stack.
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
     IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
