@@ -286,7 +286,10 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             action
         }
         SLOT_SAVE_RESTORE => {
-            dpmi::save_restore_protected_mode_state(dos, regs);
+            // AX=0305 announces buffer size = 0 to the client, so the
+            // save/restore procedures are NOPs (matches CWSDPMI's
+            // STUB_NOP). The far-call return frame is popped below by
+            // the `matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE)` arm.
             thread::KernelAction::Done
         }
         SLOT_INT74_MOUSE_CB => {

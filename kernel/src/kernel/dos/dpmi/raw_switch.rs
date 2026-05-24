@@ -19,9 +19,6 @@ fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs) -> thread:
     let new_cs = regs.rsi as u16;
     let new_ip = regs.rdi as u16;
 
-    if let Some(dpmi) = dos.dpmi.as_mut() {
-        dpmi.raw_pm_state = capture_protected_mode_state(regs);
-    }
     restore_rm_psp_view(dos);
 
     regs.frame.rflags |= (machine::VM_FLAG | machine::IF_FLAG) as u64;
@@ -83,11 +80,13 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
             return r;
         }
         dos::SLOT_SAVE_RESTORE => {
-            save_restore_real_mode_state(dos, regs);
-
-            // Pop the far-call return address and resume caller. Frame size
-            // depends on the client's operand size: 16-bit CALL FAR pushed
-            // IP+CS as 4 bytes; 32-bit CALL FAR pushed EIP+CS as 8 bytes.
+            // No state to save: AX=0305 announces buffer size = 0, so the
+            // procedure is a NOP per the spec (matches CWSDPMI's STUB_NOP).
+            // We only need to pop the far-call return frame and resume.
+            //
+            // Frame size depends on the client's operand size: 16-bit CALL
+            // FAR pushed IP+CS as 4 bytes; 32-bit CALL FAR pushed EIP+CS
+            // as 8 bytes.
             let dpmi = dos.dpmi.as_ref().unwrap();
             let use32 = dpmi.client_use32;
             let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
@@ -129,13 +128,6 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm(dos: &mut thread::DosState, 
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
     let new_cs = regs.rsi as u16;
-    let saved_rm_state = capture_real_mode_state(
-        regs,
-        regs.code_seg(),
-        regs.ip32() as u16,
-        regs.stack_seg(),
-        regs.sp32() as u16,
-    );
 
     // Determine destination operand size from the target CS/SS descriptors,
     // so 16-bit clients don't pick up garbage in EBX/EDI upper bits.
@@ -147,9 +139,6 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm(dos: &mut thread::DosState, 
         (esp, eip)
     };
 
-    if let Some(dpmi) = dos.dpmi.as_mut() {
-        dpmi.raw_rm_state = saved_rm_state;
-    }
     enter_pm_psp_view(dos);
 
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
@@ -178,66 +167,6 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm(dos: &mut thread::DosState, 
 pub(super) fn flat_addr(ldt: &[u64], seg: u16, offset: u32, cs_32: bool) -> u32 {
     let offset = if cs_32 { offset } else { offset & 0xFFFF };
     seg_base(ldt, seg).wrapping_add(offset)
-}
-
-pub(super) fn capture_real_mode_state(regs: &Regs, cs: u16, ip: u16, ss: u16, sp: u16) -> RawModeState {
-    RawModeState {
-        flags: regs.flags32() as u32,
-        cs,
-        ip: ip as u32,
-        ss,
-        sp: sp as u32,
-        ds: regs.ds as u16,
-        es: regs.es as u16,
-        fs: regs.fs as u16,
-        gs: regs.gs as u16,
-    }
-}
-
-fn capture_protected_mode_state(regs: &Regs) -> RawModeState {
-    RawModeState {
-        flags: regs.flags32(),
-        cs: regs.code_seg(),
-        ip: regs.ip32(),
-        ss: regs.stack_seg(),
-        sp: regs.sp32(),
-        ds: regs.ds as u16,
-        es: regs.es as u16,
-        fs: regs.fs as u16,
-        gs: regs.gs as u16,
-    }
-}
-
-fn real_mode_state_buffer_addr(regs: &Regs) -> u32 {
-    ((regs.es as u32) << 4).wrapping_add((regs.rdi as u32) & 0xFFFF)
-}
-
-fn save_restore_real_mode_state(dos: &mut thread::DosState, regs: &Regs) {
-    let dpmi = match dos.dpmi.as_mut() {
-        Some(dpmi) => dpmi,
-        None => return,
-    };
-    let buf_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-    match regs.rax as u8 {
-        0 => unsafe { core::ptr::write_unaligned(buf_addr as *mut RawModeState, dpmi.raw_rm_state) },
-        1 => unsafe { dpmi.raw_rm_state = core::ptr::read_unaligned(buf_addr as *const RawModeState) },
-        al => crate::kernel::dos::dos_trace!(
-            "DPMI save_restore_raw_mode unsupported AL={:02X}", al),
-    }
-}
-
-pub(in crate::kernel::dos) fn save_restore_protected_mode_state(dos: &mut thread::DosState, regs: &Regs) {
-    let dpmi = match dos.dpmi.as_mut() {
-        Some(dpmi) => dpmi,
-        None => return,
-    };
-    let buf_addr = real_mode_state_buffer_addr(regs);
-    match regs.rax as u8 {
-        0 => unsafe { core::ptr::write_unaligned(buf_addr as *mut RawModeState, dpmi.raw_pm_state) },
-        1 => unsafe { dpmi.raw_pm_state = core::ptr::read_unaligned(buf_addr as *const RawModeState) },
-        al => crate::kernel::dos::dos_trace!(
-            "DPMI save_restore_pm_state unsupported AL={:02X}", al),
-    }
 }
 
 pub(super) fn trace_client_selector_leak(_label: &str, _regs: &Regs) {}

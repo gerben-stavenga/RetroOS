@@ -22,7 +22,7 @@ use crate::Regs;
 
 mod state;
 pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PSP_SEL};
-use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX, RawModeState};
+use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors};
 use self::descriptors::{alloc_ldt, alloc_ldt_range, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc};
@@ -35,8 +35,8 @@ use self::exceptions::{exception_return, ExcReturnVia};
 mod psp;
 pub(in crate::kernel::dos) use self::psp::{enter_pm_psp_view, restore_rm_psp_view, sync_psp_view_for_regs};
 mod raw_switch;
-pub(in crate::kernel::dos) use self::raw_switch::{pm_stub_dispatch, raw_switch_real_to_pm, save_restore_protected_mode_state};
-use self::raw_switch::{capture_real_mode_state, clear_carry, flat_addr, set_carry, trace_client_selector_leak};
+pub(in crate::kernel::dos) use self::raw_switch::{pm_stub_dispatch, raw_switch_real_to_pm};
+use self::raw_switch::{clear_carry, flat_addr, set_carry, trace_client_selector_leak};
 
 // ============================================================================
 // DPMI entry — mode switch from Dos/VM86 to Dos/DPMI (protected mode)
@@ -54,12 +54,10 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
     dos_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X} rm_ss:sp={:04X}:{:04X} ds={:04X} es={:04X}",
         client_type, if client_type != 0 { 32 } else { 16 },
         ret_cs, ret_ip, dos.current_psp, real_ss, real_sp, regs.ds as u16, regs.es as u16);
-    let entry_rm_state = capture_real_mode_state(regs, ret_cs, ret_ip, real_ss, real_sp);
 
     let mut dpmi = DpmiState::new();
     dpmi.mem_next = dos.dpmi_mem_next;
     dpmi.client_use32 = client_type != 0;
-    dpmi.raw_rm_state = entry_rm_state;
     // 16-bit DPMI clients (Borland) issue INT 21 directly from PM with
     // high-base PM selector buffers and rely on the host to handle them.
     // PMDOS short-circuits INT 21 to a kernel handler that services the

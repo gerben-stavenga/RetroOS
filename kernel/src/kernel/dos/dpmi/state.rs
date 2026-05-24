@@ -52,10 +52,6 @@ pub struct DpmiState {
     pub(super) mem_blocks: [Option<MemBlock>; MAX_MEM_BLOCKS],
     /// Bump allocator for linear memory (next free address)
     pub(super) mem_next: u32,
-    /// Hidden real-mode state for raw mode switches (INT 31h/0305h/0306h).
-    pub(super) raw_rm_state: RawModeState,
-    /// Hidden protected-mode state for raw mode switches (INT 31h/0305h/0306h).
-    pub(super) raw_pm_state: RawModeState,
     /// DPMI 0.9 exception handler vectors (set via INT 31h/0203H).
     /// A 0.9 handler covers BOTH PM-origin and VM86-origin faults for
     /// the vector; it serves as the fallback whenever the matching
@@ -109,33 +105,11 @@ pub(super) struct MemBlock {
     pub(super) size: u32,
 }
 
-/// Host-private alternate-mode state saved/restored by INT 31h/0305h.
-///
-/// The DPMI spec leaves the buffer format host-defined; clients only know the
-/// size returned by AX=0305h and pass the buffer back to the save/restore
-/// routine. We keep the hidden CS:IP, SS:SP, flags, and segment registers for
-/// the non-current mode here so raw mode switches can be nested safely.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(super) struct RawModeState {
-    pub(super) flags: u32,
-    pub(super) cs: u16,
-    pub(super) ip: u32,
-    pub(super) ss: u16,
-    pub(super) sp: u32,
-    pub(super) ds: u16,
-    pub(super) es: u16,
-    pub(super) fs: u16,
-    pub(super) gs: u16,
-}
-
 impl DpmiState {
     pub(super) fn new() -> Self {
         Self {
             mem_blocks: [None; MAX_MEM_BLOCKS],
             mem_next: MEM_BASE,
-            raw_rm_state: RawModeState::default(),
-            raw_pm_state: RawModeState::default(),
             exc_vectors: [(0, 0); 32],
             pm_exc_vectors: [(0, 0); 32],
             rm_exc_vectors: [(0, 0); 32],
