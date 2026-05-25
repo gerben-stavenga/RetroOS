@@ -453,6 +453,10 @@ pub const HOST_STACK_PM32_LDT_IDX: usize = 9;
 pub const HOST_STACK_PM16_SEL: u16 = ((HOST_STACK_PM16_LDT_IDX as u16) << 3) | 4 | 3;
 pub const HOST_STACK_PM32_SEL: u16 = ((HOST_STACK_PM32_LDT_IDX as u16) << 3) | 4 | 3;
 
+/// Sentinel for "synthetic IRET" continuations. Reserves `SPECIAL_STUB_SEL:0`
+/// (which would dispatch via slot 0 = SLOT_XMS — RM-only, never used by
+/// pm_stub_dispatch). Don't add a PM slot 0 handler without picking a
+/// different sentinel.
 const SYNTHETIC_HOST_IRET_EIP: u32 = 0;
 
 fn synthetic_host_iret_target() -> (u16, u32) {
@@ -879,6 +883,7 @@ pub(super) fn resume_continuation_from_stub(dos: &mut thread::DosState, regs: &m
     let save = pop_continuation(dos, regs);
     let resumes_to_host_iret = save.cs as u16 == SPECIAL_STUB_SEL
         && save.eip == SYNTHETIC_HOST_IRET_EIP;
+    let was_outermost = save.other_stack().is_none();
     resume_continuation(dos, regs, save);
     if resumes_to_host_iret {
         let use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
@@ -886,9 +891,12 @@ pub(super) fn resume_continuation_from_stub(dos: &mut thread::DosState, regs: &m
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);
         regs.set_flags32((ret_flags & !STATUS_MASK) | current_status | machine::IF_FLAG);
-        if regs.code_seg() != SPECIAL_STUB_SEL {
-            super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
-        }
+    }
+    // IRQ chain complete when we just popped an outermost HC (HC.other_stack=None
+    // ⇒ first-entry from client). Nested HCs (Some) keep the flag so trace
+    // gating stays correct inside a soft-INT-from-IRQ-handler reflect.
+    if was_outermost {
+        super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
     }
     if_record(IF_RESUME_CONTINUATION, regs, resume_if_in, if_bit(regs), resume_other);
 

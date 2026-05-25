@@ -66,9 +66,6 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
         }
         dos::SLOT_RESUME_CONTINUATION => {
             mode_transitions::resume_continuation_from_stub(dos, regs);
-            if regs.code_seg() != mode_transitions::SPECIAL_STUB_SEL {
-                super::super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
-            }
             return thread::KernelAction::Done;
         }
         dos::SLOT_SAVE_RESTORE => {
