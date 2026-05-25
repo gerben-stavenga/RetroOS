@@ -8,9 +8,10 @@
 //! - 0x28: User Data (ring 3)
 //! - 0x30: User Code 64-bit (ring 3)
 //! - 0x38: TSS32 (8 bytes - 32-bit descriptor)
-//! - 0x40: TSS64 (16 bytes - 0x40 + 0x48)
+//! - 0x40: BIOS Data Area alias (ring 3 data, base=0x400) — DPMI compat
 //! - 0x50: Ring-1 Code 32-bit (OS kernel)
 //! - 0x58: Ring-1 Data (OS kernel)
+//! - 0x80: TSS64 (16 bytes - 0x80 + 0x88), moved off 0x40 for DPMI compat
 
 #![allow(static_mut_refs)]
 
@@ -24,7 +25,7 @@ pub const USER_CS: u16 = 0x20 | 3;   // Ring 3
 pub const USER_DS: u16 = 0x28 | 3;   // Ring 3
 pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
 pub const TSS32_SEL: u16 = 0x38;
-pub const TSS64_SEL: u16 = 0x40;
+pub const TSS64_SEL: u16 = 0x80;
 
 /// Segment selectors - ring 1 (OS kernel)
 pub const RING1_CS: u16 = 0x50 | 1; // Ring 1
@@ -287,15 +288,31 @@ pub fn int_intercepted(int_num: u8) -> bool {
 #[allow(dead_code)] const GDT_USER_DS: usize = 5;     // 0x28 — SYSRET SS
 #[allow(dead_code)] const GDT_USER_CS64: usize = 6;   // 0x30 — SYSRET CS (64-bit)
 const GDT_TSS32: usize = 7;       // 0x38
-const GDT_TSS64_LO: usize = 8;    // 0x40
-#[allow(dead_code)] const GDT_TSS64_HI: usize = 9;    // 0x48 (null - upper 32 bits of base are 0)
+// HACK: GDT[8] (= selector 0x40) is a ring-3 data alias for the BIOS Data
+// Area (base = 0x400). This matches a de-facto convention established by
+// CWSDPMI (gdt.h: g_BIOSdata=8, control.c: fill_desc(...,0x400,...)) and
+// followed by DOS/32A (kernel.asm: SELBIOSDATA=40h) and presumably HDPMI16.
+// 16-bit DPMI clients like Borland's DPMI16BI runtime and 32-bit extenders
+// like DOS/4GW emit hardcoded `mov ax, 0x40; mov ds, ax` to access BDA in
+// both real- and protected-mode-compatible code paths; the value `0x40`
+// works as a real-mode paragraph (linear 0x400) AND as a PM selector when
+// the host has populated GDT[8] with base 0x400. Without this entry, BC
+// IDE's INT 21 hook, DOS/4GW's PM dispatcher, and many other 16-bit DOS
+// extenders #GP on the seg-load. The DPMI spec allows hosts to either
+// pre-define selector 40h *or* handle the GP — pre-defining is simpler.
+#[allow(dead_code)] const GDT_BIOS_DATA: usize = 8;   // 0x40 — BIOS Data Area alias
 #[allow(dead_code)] const GDT_RING1_CS: usize = 10;   // 0x50
 #[allow(dead_code)] const GDT_RING1_DS: usize = 11;   // 0x58
 const GDT_LDT: usize = 12;        // 0x60
 const GDT_TLS_START: usize = 13;  // 0x68 — first of 3 per-thread TLS slots
 // 14 = 0x70, 15 = 0x78
+// TSS64 was at slots 8/9 (sel 0x40/0x48) — moved past TLS so 0x40 can
+// serve as the BDA alias above. SYSCALL/SYSRET don't care; LTR uses the
+// selector value (0x80) which we set in TSS64_SEL below.
+const GDT_TSS64_LO: usize = 16;   // 0x80 — TSS64 low (16-byte descriptor)
+#[allow(dead_code)] const GDT_TSS64_HI: usize = 17;   // 0x88 (always null — base[63:32] = 0 for <4GB)
 
-const GDT_ENTRIES: usize = 16;
+const GDT_ENTRIES: usize = 18;
 
 /// LDT selector (GDT index 12 * 8 = 0x60)
 pub const LDT_SEL: u16 = 0x60;
@@ -338,14 +355,16 @@ static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::segment32(false, 3),  // 0x28: User Data (SYSRET SS)
     GdtEntry::segment64(3),         // 0x30: User Code 64-bit (SYSRET CS)
     GdtEntry::null(),               // 0x38: TSS32 (filled at runtime)
-    GdtEntry::null(),               // 0x40: TSS64 low (filled at runtime)
-    GdtEntry::null(),               // 0x48: TSS64 high (always null for <4GB)
+    GdtEntry::segment32(false, 3).with_base(0x400), // 0x40: BIOS Data Area alias (DPMI compat — see GDT_BIOS_DATA)
+    GdtEntry::null(),               // 0x48: reserved (was TSS64 high)
     GdtEntry::segment32(true, 1),   // 0x50: Ring-1 Code 32-bit (flat, no wrapping yet)
     GdtEntry::segment32(false, 1),  // 0x58: Ring-1 Data (flat, no wrapping yet)
     GdtEntry::null(),               // 0x60: LDT (filled at runtime by load_ldt)
     GdtEntry::null(),               // 0x68: TLS slot 0 (set_thread_area)
     GdtEntry::null(),               // 0x70: TLS slot 1
     GdtEntry::null(),               // 0x78: TLS slot 2
+    GdtEntry::null(),               // 0x80: TSS64 low (filled at runtime)
+    GdtEntry::null(),               // 0x88: TSS64 high (always null for <4GB)
 ];
 
 static mut IDT32: Idt32 = Idt32 {
