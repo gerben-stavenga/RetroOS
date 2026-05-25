@@ -35,12 +35,19 @@
       root cause with Settlers below.
 
 ## Dos Navigator
-- [ ] **Using mouse makes keyboard stop responding.** After mouse use,
-      keyboard events no longer reach the application. Likely an IRQ-1
-      (keyboard) delivery issue while mouse IRQ-12 is active — possibly
-      the vPIC mask state, IF flag, or a callback-stack leftover that
-      blocks subsequent keyboard delivery. Different bug shape from the
-      BC/Settlers PM-callback issue.
+- [x] Mouse-then-keyboard-dead fixed by bypassing the vpic for mouse
+      entirely (commit `e4e3639`): no PS/2 hardware is modelled, every
+      DOS program uses INT 33 + AX=0Ch callback, so routing IRQ 12
+      through master/slave ISR was half-modelling that left master ISR
+      bit 2 stuck (no EOI source) and blocked every subsequent IRQ.
+      `raise_pending` now dispatches the AX=0Ch callback directly when
+      `pending_cond & cb_mask != 0` under user IF=1, with a new
+      `cb_in_flight` re-entry guard. See [[feedback_no_half_modelled_devices]].
+- [ ] **Residual IF=0 hangs.** DN still freezes intermittently with
+      virtual IF stuck at 0 — same umbrella bug as the "Kernel — virtual
+      IF gets stuck at 0" section below. Not mouse-specific (mouse path
+      is clean now). Needs a fresh F12 dump (IF, ISR, IMR, pending) to
+      narrow down which non-mouse path leaks the IF=0 state.
 
 ## Settlers
 - [ ] **Mouse crashes.** Probably same root cause as Borland C IDE above
