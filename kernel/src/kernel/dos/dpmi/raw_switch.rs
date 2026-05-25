@@ -64,20 +64,12 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
         dos::SLOT_PM_TO_REAL => {
             return raw_switch_pm_to_real(dos, regs);
         }
-        dos::SLOT_RM_IRET_CALL => {
-            // PM callback IRETed back to us: writeback + restore the RM
-            // caller (callback_entry path). 0300/01/02 path lands here via
-            // RM `CD 31` in slot from the RM-side stub instead.
-            rm_iret_call(dos, regs);
+        dos::SLOT_RESUME_CONTINUATION => {
+            mode_transitions::resume_continuation_from_stub(dos, regs);
+            if regs.code_seg() != mode_transitions::SPECIAL_STUB_SEL {
+                super::super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
+            }
             return thread::KernelAction::Done;
-        }
-        dos::SLOT_PM_IRET => {
-            let r = mode_transitions::cross_mode_restore(dos, regs);
-            // PM-handler path for HW IRQ: client handler ran, IRETed
-            // through our stub, cross_mode_restore put us back at the
-            // interrupted client state. IRQ context is over.
-            super::super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
-            return r;
         }
         dos::SLOT_SAVE_RESTORE => {
             // No state to save: AX=0305 announces buffer size = 0, so the

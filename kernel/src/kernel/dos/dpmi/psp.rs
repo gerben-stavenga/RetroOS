@@ -4,13 +4,10 @@ use super::*;
 ///
 /// Captures the current RM PSP segment and PSP[0x2C] (so PM→RM can restore
 /// them), rebuilds the fixed `PSP_SEL` LDT[4] descriptor with base = current
-/// RM PSP * 16, and (for 32-bit clients per DPMI 0.9 §4.1) allocates a fresh
-/// env selector and patches PSP[0x2C] to point at it. Finally sets
+/// RM PSP * 16, allocates a fresh env selector, and patches PSP[0x2C]
+/// to point at it. Finally sets
 /// `dos.current_psp = PSP_SEL` so PM-side AH=51/62 reflections return a value
 /// the client can load into ES.
-///
-/// 16-bit clients (DOS/16M) read PSP[0x2C] as an RM segment, so leave it
-/// unpatched — the env_ldt_idx stays 0 and PM→RM has nothing to undo.
 pub(in crate::kernel::dos) fn enter_pm_psp_view(dos: &mut thread::DosState) {
     if dos.current_psp == PSP_SEL {
         return;
@@ -35,7 +32,7 @@ pub(in crate::kernel::dos) fn enter_pm_psp_view(dos: &mut thread::DosState) {
     dos.ldt_alloc[0] |= 1 << PSP_LDT_IDX;
 
     dpmi.env_ldt_idx = 0;
-    if dpmi.client_use32 && env_seg != 0 {
+    if env_seg != 0 {
         if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
             let env_base = (env_seg as u32) * 16;
             dos.ldt[idx] = make_data_desc_ex(env_base, 0xFFFF, false);
@@ -50,9 +47,9 @@ pub(in crate::kernel::dos) fn enter_pm_psp_view(dos: &mut thread::DosState) {
 
 /// PM→RM transition: undo the PM-side PSP view set up by `enter_pm_psp_view`.
 ///
-/// Restores the original PSP[0x2C] (32-bit clients), frees the env selector
-/// LDT slot, and sets `dos.current_psp` back to the RM PSP segment captured
-/// on entry so reflected AH=51/62 returns an RM-loadable value.
+/// Restores the original PSP[0x2C], frees the env selector
+/// LDT slot, and sets `dos.current_psp` back to the RM PSP segment captured on
+/// entry so reflected AH=51/62 returns an RM-loadable value.
 pub(in crate::kernel::dos) fn restore_rm_psp_view(dos: &mut thread::DosState) {
     if dos.current_psp != PSP_SEL {
         return;

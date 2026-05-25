@@ -25,9 +25,9 @@ pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL
 use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors};
-use self::descriptors::{alloc_ldt, alloc_ldt_range, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc};
+use self::descriptors::{alloc_ldt, alloc_ldt_range, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc, valid_ldt_selector_idx};
 mod rm_calls;
-pub(in crate::kernel::dos) use self::rm_calls::{callback_entry, rm_iret_call};
+pub(in crate::kernel::dos) use self::rm_calls::callback_entry;
 use self::rm_calls::{call_real_mode_proc, call_real_mode_proc_iret, simulate_real_mode_int};
 mod exceptions;
 pub(in crate::kernel::dos) use self::exceptions::dispatch_dpmi_exception;
@@ -282,8 +282,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector. Returns: CX:DX = base
         0x0006 => {
             let sel = regs.rbx as u16;
-            let idx = sel_to_idx(sel);
-            if idx < LDT_ENTRIES {
+            if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let base = desc_base(dos.ldt[idx]);
                 dos_trace!("[DPMI] 0006 sel={:04X} -> base={:08X}", sel, base);
                 regs.rcx = (regs.rcx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
@@ -297,9 +296,24 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, CX:DX = base
         0x0007 => {
             let sel = regs.rbx as u16;
-            let idx = sel_to_idx(sel);
-            if idx < LDT_ENTRIES {
-                let base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
+            if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
+                let mut base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
+                if let Some(dpmi) = dos.dpmi.as_ref() {
+                    if !dpmi.client_use32 && dos.current_psp == PSP_SEL && (base & 0xF) == 0 {
+                        let psp_base = desc_base(dos.ldt[PSP_LDT_IDX]);
+                        let env_sel = unsafe { core::ptr::read_volatile((psp_base + 0x2C) as *const u16) };
+                        if env_sel != 0 && ((env_sel as u32) << 4) == base {
+                            let env_idx = sel_to_idx(env_sel);
+                            if env_idx < LDT_ENTRIES && ldt_is_allocated(&dos.ldt_alloc, env_idx) {
+                                let env_base = desc_base(dos.ldt[env_idx]);
+                                if env_base != base {
+                                    dos_trace!("[DPMI] 0007 env selector-as-segment sel={:04X} base={:08X}->{:08X}", env_sel, base, env_base);
+                                    base = env_base;
+                                }
+                            }
+                        }
+                    }
+                }
                 set_desc_base(&mut dos.ldt[idx], base);
                 trace_dpmi_desc("0007 base", sel, dos.ldt[idx]);
                 dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
@@ -312,8 +326,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, CX:DX = limit
         0x0008 => {
             let sel = regs.rbx as u16;
-            let idx = sel_to_idx(sel);
-            if idx < LDT_ENTRIES {
+            if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let limit = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 set_desc_limit(&mut dos.ldt[idx], limit);
                 trace_dpmi_desc("0008 limit", sel, dos.ldt[idx]);
@@ -326,8 +339,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, CL = access rights byte, CH = extended type
         0x0009 => {
             let sel = regs.rbx as u16;
-            let idx = sel_to_idx(sel);
-            if idx < LDT_ENTRIES {
+            if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let cl = regs.rcx as u8;
                 let ch = (regs.rcx >> 8) as u8;
                 // Match CWSDPMI: force the descriptor to stay code/data (S=1)
@@ -345,8 +357,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector. Returns: AX = new data selector
         0x000A => {
             let sel = regs.rbx as u16;
-            let src_idx = sel_to_idx(sel);
-            if src_idx < LDT_ENTRIES {
+            if let Some(src_idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 if let Some(new_idx) = alloc_ldt(&mut dos.ldt_alloc) {
                     let mut desc = dos.ldt[src_idx];
                     // Change type from code to data (clear bit 3 of type nibble = execute bit)
@@ -371,8 +382,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, ES:EDI = buffer (8 bytes)
         0x000B => {
             let sel = regs.rbx as u16;
-            let idx = sel_to_idx(sel);
-            if idx < LDT_ENTRIES {
+            if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let desc = dos.ldt[idx];
                 unsafe { core::ptr::write_unaligned(dest as *mut u64, desc); }
@@ -387,8 +397,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         // BX = selector, ES:EDI = descriptor (8 bytes)
         0x000C => {
             let sel = regs.rbx as u16;
-            let idx = sel_to_idx(sel);
-            if idx < LDT_ENTRIES {
+            if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let src = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let mut new_desc = unsafe { core::ptr::read_unaligned(src as *const u64) };
                 // Match CWSDPMI: force the descriptor to stay non-system.
