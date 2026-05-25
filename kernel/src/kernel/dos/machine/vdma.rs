@@ -329,12 +329,21 @@ impl SbDmaState {
     ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
     ///    the captured guest programming.
     pub fn dma_read(&mut self, port: u16) -> u8 {
-        let (is_cnt, chan, hi_ctrl) = if port <= 0x0F {
+        // Channel-data ports only: DMA1 0x00..=0x07 (addr/count pairs for
+        // chan 0..3), DMA2 0xC0..=0xCF (addr/count pairs for chan 4..7,
+        // 4-byte stride per channel due to 16-bit alignment). Control
+        // registers (0x08..=0x0F status/mask/etc., 0xD0..=0xDF for DMA2)
+        // and page-register ports don't index into ch[] — route them to
+        // io_read for the captured/synthetic control state. Without the
+        // upper bound, port 0xD0 produced chan=8 and panicked on ch[8].
+        let (is_cnt, chan, hi_ctrl) = if port <= 0x07 {
             (port & 1 == 1, (port >> 1) as usize, false)
-        } else if (0xC0..=0xDF).contains(&port) {
+        } else if (0xC0..=0xCF).contains(&port) {
             let r = (port - 0xC0) >> 1;
             (r & 1 == 1, 4 + (r >> 1) as usize, true)
-        } else { (false, 0, false) };
+        } else {
+            return self.dma.io_read(port);
+        };
 
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
                    else if chan == self.dma16 as usize { Some(self.host_dma16) }
