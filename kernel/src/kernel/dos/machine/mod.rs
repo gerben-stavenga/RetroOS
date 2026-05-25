@@ -150,12 +150,17 @@ pub struct MouseState {
     pub cb_mask: u16,
     pub cb_seg: u16,
     pub cb_off: u16,
-    /// Pending event-condition bits since last delivery, plus the deltas
-    /// from the last packet that triggered. Read & cleared by the SLOT_INT74
-    /// dispatcher when it sets up the user-handler call.
+    /// Pending event-condition bits since last delivery. `raise_pending`
+    /// dispatches when `cb_mask & pending_cond != 0`, and
+    /// `mouse_callback_invoke` clears the field as it sets up the AX=0Ch
+    /// far-call (so the callback sees the merged conditions exactly once).
     pub pending_cond: u16,
     pub last_dx: i16,
     pub last_dy: i16,
+    /// Re-entry guard: true between `mouse_callback_invoke` setting up the
+    /// far-call and `mouse_callback_return` unwinding it. Suppresses fresh
+    /// dispatches while the user handler is on the stack.
+    pub cb_in_flight: bool,
     /// User GP regs saved across the AX=0Ch handler far-call. HostContinuation
     /// covers CS/EIP/SS/ESP/EFLAGS/segs; we clobber AX/BX/CX/DX/SI/DI to set
     /// up the call, so they have to be bracket-saved here and restored by
@@ -178,13 +183,14 @@ impl MouseState {
                show_count: 1, drawn_at: None, saved_attr: 0,
                cb_mask: 0, cb_seg: 0, cb_off: 0,
                pending_cond: 0, last_dx: 0, last_dy: 0,
+               cb_in_flight: false,
                saved_rax: 0, saved_rbx: 0, saved_rcx: 0,
                saved_rdx: 0, saved_rsi: 0, saved_rdi: 0 }
     }
     /// Apply one PS/2 packet: accumulate raw delta, advance clipped position,
     /// redraw the cursor at the new cell if it's visible. Returns the
-    /// AX=0Ch condition bits that fired this packet (so the caller can OR
-    /// against the registered event mask and decide to deliver IRQ 12).
+    /// AX=0Ch condition bits that fired this packet (also OR'd into
+    /// `pending_cond` for the next `raise_pending` dispatch).
     ///
     /// AX=0Ch condition bits (from the spec):
     ///   0x01 = mouse moved
@@ -217,7 +223,7 @@ impl MouseState {
 
         // Coalesce condition bits across multiple packets into one delivery;
         // last_dx/dy reflect only the latest packet (real drivers fire once
-        // per packet, but our delivery is gated on the IRQ-loop tick).
+        // per packet, but our delivery is gated on the raise_pending tick).
         self.pending_cond |= cond;
         self.last_dx = dx;
         self.last_dy = dy;
@@ -617,15 +623,13 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             }
         }
         Irq::Mouse { dx, dy, buttons } => {
-            let cond = pc.mouse.apply_packet(dx, dy, buttons);
-            // Raise IRQ 12 (vec 0x74) into the virtual PIC iff the user
-            // registered a handler whose mask intersects this packet's
-            // condition bits. The IVT[0x74] stub at slot SLOT_INT74_MOUSE_CB
-            // will trap to kernel, set up callback args, and far-call the
-            // user handler.
-            if pc.mouse.cb_mask & cond != 0 && !pc.vpic.has_pending_vec(0x74) {
-                pc.vpic.push(0x74);
-            }
+            // No physical mouse hardware is modelled (no PS/2 ports, no
+            // IRQ 12 line) and every DOS program reaches the mouse through
+            // INT 33 + AX=000Ch callback. So we don't route through the
+            // vpic at all — `apply_packet` updates `pending_cond` and
+            // `raise_pending` dispatches the AX=0Ch callback directly when
+            // the mask matches and the user's IF=1.
+            let _ = pc.mouse.apply_packet(dx, dy, buttons);
         }
         Irq::Hw(line) => {
             if line != 5 {

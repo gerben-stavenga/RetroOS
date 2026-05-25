@@ -770,6 +770,20 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
+    // Mouse-callback dispatch (no PS/2 hardware, no IRQ 12 line — the only
+    // mouse interface is INT 33 + AX=0Ch). Gated on the same conditions
+    // pick_pending_vec applies to vpic-backed IRQs: user IF=1, no in-flight
+    // delivery. `mouse_callback_invoke` will clear `pending_cond` and set
+    // `cb_in_flight`.
+    let mouse = &dos.pc.mouse;
+    if regs.frame.rflags & (1u64 << 9) != 0
+        && !mouse.cb_in_flight
+        && mouse.cb_mask & mouse.pending_cond != 0
+    {
+        IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
+        mode_transitions::deliver_pm_irq(dos, regs, 0x74);
+        return;
+    }
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
     IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
     mode_transitions::deliver_pm_irq(dos, regs, vec);

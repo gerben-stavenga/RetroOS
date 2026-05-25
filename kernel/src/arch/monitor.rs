@@ -320,42 +320,6 @@ fn advance_ip(regs: &mut Regs, cs_32: bool, n: u32) {
     if cs_32 { regs.set_ip32(new_ip); } else { regs.set_ip32(new_ip & 0xFFFF); }
 }
 
-/// Diagnostic: a trapped `POPF`/`IRET` in the monitor just flipped
-/// virtual IF 0→1 (closed a CLI critical-section bracket). Dump the
-/// instruction's location and ±16 code bytes so we can see the exact
-/// guest sequence (e.g. Hexen's `pushf; cli; …; popf`). One line per
-/// restore — rare (once per bracket), so it won't flood.
-fn log_if_restore(tag: &str, regs: &Regs, cs_base: u32, instr_ip: u32) {
-    // [IFLOG] IF 0->1 restore logging disabled (commented out per request).
-    let _ = (tag, regs, cs_base, instr_ip);
-    /*
-    // VM86 POPF/IRET always #GP at IOPL=1 and trap through here
-    // correctly — logging them just floods (DN does it constantly).
-    // Only PM is interesting: that's the path that was broken and
-    // where Hexen/DOS32A's untracked CLI…POPF bracket lives.
-    if regs.mode() == UserMode::VM86 {
-        return;
-    }
-    let lin = cs_base.wrapping_add(instr_ip);
-    // Wide window: -160 .. +32 around the instruction. Captures the
-    // whole compiler-emitted routine (prologue + body + this epilogue)
-    // from the live, relocated, unpacked image — the only reliable
-    // source, since DOS/4GW relocates the LE objects at runtime to a
-    // base not recoverable statically from the .EXE.
-    const BACK: u32 = 160;
-    let mut win = [0u8; 192];
-    for (i, b) in win.iter_mut().enumerate() {
-        *b = peek_byte(cs_base, instr_ip.wrapping_sub(BACK).wrapping_add(i as u32));
-    }
-    let mode = if regs.mode() == UserMode::VM86 { "VM86" } else { "PM" };
-    crate::println!(
-        "[IFLOG] {} IF 0->1 at {:04X}:{:08X} lin={:#x} mode={} ss:sp={:04X}:{:08X} \
-         code-160..+32: {:02X?}",
-        tag, regs.code_seg(), instr_ip, lin, mode,
-        regs.stack_seg(), regs.sp32(), win,
-    );
-    */
-}
 
 // =============================================================================
 // Monitor entry
@@ -417,7 +381,6 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
         }
         // POPF / POPFD — IOPL and VM are preserved
         0x9D => {
-            let old_if = regs.flags32() & IF_FLAG != 0;
             advance_ip(regs, cs_32, advance);
             let flags = unsafe {
                 if op32 { pop32(regs, ss_base, ss_32) }
@@ -425,14 +388,10 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
             };
             let preserved = regs.flags32() & PRESERVED_FLAGS;
             regs.set_flags32((flags & !PRESERVED_FLAGS) | preserved);
-            if !old_if && regs.flags32() & IF_FLAG != 0 {
-                log_if_restore("POPF", regs, cs_base, start_ip);
-            }
             MonitorResult::Resume
         }
         // IRET / IRETD — pop IP, CS, FLAGS (same-ring only)
         0xCF => {
-            let old_if = regs.flags32() & IF_FLAG != 0;
             // Don't pre-advance IP — we're loading it from the stack.
             unsafe {
                 if op32 {
@@ -458,9 +417,6 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
                     let preserved = regs.flags32() & PRESERVED_FLAGS;
                     regs.set_flags32((new_fl & !PRESERVED_FLAGS) | preserved);
                 }
-            }
-            if !old_if && regs.flags32() & IF_FLAG != 0 {
-                log_if_restore("IRET", regs, cs_base, start_ip);
             }
             MonitorResult::Resume
         }

@@ -2306,6 +2306,9 @@ fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
 
     super::machine::set_vm86_cs(regs, cb_seg);
     super::machine::set_vm86_ip(regs, cb_off);
+
+    dos.pc.mouse.cb_in_flight = true;
+
     dos_trace!("[MOUSE] CB enter cond={:04X} buttons={:02X} x={} y={} dx={} dy={} -> {:04X}:{:04X}",
         cond, buttons, x as i16, y as i16, dx as i16, dy as i16, cb_seg, cb_off);
 }
@@ -2320,13 +2323,14 @@ fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     let _ = vm86_pop(regs);
     let _ = vm86_pop(regs);
 
-    let m = &dos.pc.mouse;
+    let m = &mut dos.pc.mouse;
     regs.rax = m.saved_rax;
     regs.rbx = m.saved_rbx;
     regs.rcx = m.saved_rcx;
     regs.rdx = m.saved_rdx;
     regs.rsi = m.saved_rsi;
     regs.rdi = m.saved_rdi;
+    m.cb_in_flight = false;
 
     super::mode_transitions::resume_continuation_from_stub(dos, regs);
 }
