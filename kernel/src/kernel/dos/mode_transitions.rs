@@ -635,6 +635,15 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         push_iret_frame(&dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, regs.flags32());
 
+        // Zero DS/ES/FS/GS:
+        //   - PM-handler entry: spec wants undefined segs; null is the safe
+        //     choice and matches what real DPMI hosts do.
+        //   - The unwind via SLOT_RESUME_CONTINUATION's synthetic-IRET branch
+        //     restores DS/ES from HC2, then exits to PM at SPECIAL_STUB_SEL
+        //     for the next CD 31 trap. The exit asm's `pop ds` loads DS as a
+        //     PM selector before the final IRET — a paragraph-sized VM86 seg
+        //     here would #GP. Capturing zeros into HC2 keeps that pop safe.
+        // HC1 still holds the original client segs for the outer unwind.
         regs.ds = 0;
         regs.es = 0;
         regs.fs = 0;
@@ -642,10 +651,23 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     }
 
     if default_vector {
+        // PoP timer ISR at 0F11:B110 — `inc word [DS:0x2C]` against its own
+        // DGROUP — assumes DS=interrupted-program's data segment, matching
+        // real-mode CPU semantics. Reflect to RM with client's pre-IRQ segs
+        // restored from HC1 so the ISR finds the expected paragraph instead
+        // of phys 0x2C in the BIOS IVT.
         let (stub_sel, stub_off) = synthetic_host_iret_target();
         regs.frame.cs = stub_sel as u64;
         regs.frame.rip = stub_off as u64;
-        let _ = reflect_int_to_real_mode(dos, regs, vector);
+        let r = reflect_int_to_real_mode(dos, regs, vector);
+        let pm_save_at = (host_stack_pm_seg(dos),
+                          dos::host_stack_empty_sp() - HOST_CONTINUATION_SIZE);
+        let hc1 = pop_continuation_at(&dos.ldt[..], pm_save_at);
+        regs.ds = hc1.ds as u64;
+        regs.es = hc1.es as u64;
+        regs.fs = hc1.fs as u64;
+        regs.gs = hc1.gs as u64;
+        let _ = r;
         return;
     }
 
@@ -806,24 +828,6 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Re
     // pmdos_int21_handler short-circuit for 16-bit clients (`pm_dos`).
     let rm_dest = rm_get_stack(dos);
     let _save_at = push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, None);
-
-    // Some real-mode IRQ handlers assume DS/ES still name the interrupted
-    // program's data segment. Restore those selectors when reflecting an
-    // IRQ that was first delivered through the PM locked-stack path.
-    if _save_at.0 == host_stack_pm_seg(dos) {
-        // host_stack_pm layout (SS=host_stack_pm, SP grows down):
-        //   HostContinuation1     ← deliver_pm_irq's push_continuation_and_switch_to_pm_side
-        //   iret-frame    ← deliver_pm_irq's push_iret_frame (frame_size)
-        //   HostContinuation2     ← our push_continuation_and_switch_to_rm_side; `_save_at.1` here
-        let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
-        let frame_size: u32 = if client_use32 { 12 } else { 6 };
-        let save = pop_continuation_at(&dos.ldt[..],
-            (_save_at.0, _save_at.1 + HOST_CONTINUATION_SIZE + frame_size));
-        regs.ds = save.ds as u64;
-        regs.es = save.es as u64;
-        regs.fs = save.fs as u64;
-        regs.gs = save.gs as u64;
-    }
 
     let ivt_off = machine::read_u16(0, (vector as u32) * 4);
     let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
