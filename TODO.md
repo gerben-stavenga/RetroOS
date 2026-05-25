@@ -15,7 +15,39 @@
 - [x] Works.
 
 ## Borland C IDE
-- [ ] Still throws an exception — identify vector and trigger
+- [x] BC IDE boots into the editor and BCC compiles + invokes TLINK
+      end-to-end. Unblocked by (a) DPMI AH=25/35 PM-vector routing (PR #11),
+      (b) DMA control-register port bounds fix in `vdma::dma_read` (was
+      indexing `ch[8]` for port 0xD0), and (c) `GDT[8] = BIOS Data Area
+      alias` (selector 0x40, base 0x400, ring-3 data) — DPMI16BI hardcodes
+      `mov ds, 0x40` to access BDA; TSS64 moved to slot 16. See
+      [[feedback_gdt_bda_alias]].
+- [ ] **Mouse click crashes**. BC installs INT 33 AX=000C with a PM
+      handler address (ES:DX = PM selector:offset, e.g. `030F:00F3`).
+      Our `mouse_callback_invoke` does a VM86 `CALL FAR cb_seg:cb_off`,
+      treating the PM selector value as a real-mode paragraph → wild
+      jump → crash. **Fix sketch:** in `int_33h` AX=000C from PM,
+      allocate an internal DPMI callback wrapping the client's PM
+      handler. Reuse the existing `dpmi.callbacks[]` pool + a new
+      `MouseEvent` kind tag in `callback_entry` so MS-Mouse register
+      convention (`AX=cond, BX=buttons, CX=x, DX=y, SI=dx, DI=dy`) is
+      used instead of DPMI 0303's `DS:SI/ES:DI` setup. Likely shared
+      root cause with Settlers below.
+
+## Dos Navigator
+- [ ] **Using mouse makes keyboard stop responding.** After mouse use,
+      keyboard events no longer reach the application. Likely an IRQ-1
+      (keyboard) delivery issue while mouse IRQ-12 is active — possibly
+      the vPIC mask state, IF flag, or a callback-stack leftover that
+      blocks subsequent keyboard delivery. Different bug shape from the
+      BC/Settlers PM-callback issue.
+
+## Settlers
+- [ ] **Mouse crashes.** Probably same root cause as Borland C IDE above
+      (PM handler installed via INT 33 AX=000C, our mouse_callback_invoke
+      treats PM selector as RM paragraph). Re-test after the BC mouse
+      fix lands; if it still crashes, it's a different mouse-driver
+      convention requiring separate handling.
 
 ## Dark Forces
 - [x] AH=08 IP-rewind HACK on PM-via-VECSTUB path — fixed by `SLOT_RESUME`
