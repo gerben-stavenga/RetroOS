@@ -38,8 +38,8 @@ const NULL_FILE_HANDLE: u16 = 99;
 const COM_OFFSET: u16 = 0x0100;
 /// Initial stack pointer for .COM (top of PSP's 64KB segment)
 const COM_SP: u16 = 0xFFFE;
-const EXEC_SAVED_IVT_VECTORS: [u8; 12] =
-    [0x13, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67, 0x74];
+const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
+    [0x13, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67];
 
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
@@ -227,7 +227,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
     let is_far_call = matches!(slot,
         SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RESUME_CONTINUATION
         | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
-        | SLOT_INT74_MOUSE_CB | SLOT_INT74_MOUSE_CB_RET
+        | SLOT_MOUSE_CB_RET
         | SLOT_RESUME)
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
@@ -286,11 +286,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             // the `matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE)` arm.
             thread::KernelAction::Done
         }
-        SLOT_INT74_MOUSE_CB => {
-            mouse_callback_invoke(dos, regs);
-            thread::KernelAction::Done
-        }
-        SLOT_INT74_MOUSE_CB_RET => {
+        SLOT_MOUSE_CB_RET => {
             mouse_callback_return(dos, regs);
             thread::KernelAction::Done
         }
@@ -2253,24 +2249,17 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
     thread::KernelAction::Done
 }
 
-/// SLOT_INT74_MOUSE_CB dispatch: HW IRQ 12 was reflected to IVT[0x74], landed
-/// at our stub. Set up the AX=0Ch handler far-call and jump the user there.
+/// Deliver the INT 33h AX=000Ch software mouse callback.
 ///
 /// Bracket-saves the user GP regs we're about to clobber (AX/BX/CX/DX/SI/DI)
 /// since `HostContinuation` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
-/// returns via SLOT_INT74_MOUSE_CB_RET which restores them and then unwinds
-/// the IRQ via the standard `resume_continuation_from_stub`.
-///
-/// Stack at entry (RM slab pushed by `reflect_int_to_real_mode`):
-///   top: trap-IP, trap-CS, trap-FLAGS (the CD 31 IRET frame).
-///   below: outer IRET frame targeting SLOT_RESUME_CONTINUATION.
-fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
-    use super::machine::{vm86_pop, vm86_push};
-    // Discard the CD 31 trap iret-frame (slot is is_far_call, dispatcher
-    // doesn't auto-pop it).
-    let _ = vm86_pop(regs); // trap ip
-    let _ = vm86_pop(regs); // trap cs
-    let _ = vm86_pop(regs); // trap flags
+/// returns via SLOT_MOUSE_CB_RET which restores them and then unwinds through
+/// the standard `resume_continuation_from_stub`.
+pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Regs) {
+    use super::machine::vm86_push;
+
+    let rm_dest = super::mode_transitions::rm_get_stack(dos);
+    super::mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, None);
 
     let m = &mut dos.pc.mouse;
     // Bracket-save the user GP regs we're about to clobber.
@@ -2291,10 +2280,10 @@ fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
     let cb_off = m.cb_off;
     m.pending_cond = 0;
 
-    // Push retf frame: handler RETFs to SLOT_INT74_MOUSE_CB_RET which
-    // restores the saved GP regs and then unwinds the IRQ.
+    // Push retf frame: handler RETFs to SLOT_MOUSE_CB_RET which
+    // restores the saved GP regs and then unwinds the callback.
     vm86_push(regs, STUB_SEG);
-    vm86_push(regs, slot_offset(SLOT_INT74_MOUSE_CB_RET));
+    vm86_push(regs, slot_offset(SLOT_MOUSE_CB_RET));
 
     // Load AX=0Ch convention.
     regs.rax = (regs.rax & !0xFFFF) | cond as u64;
@@ -2313,9 +2302,9 @@ fn mouse_callback_invoke(dos: &mut thread::DosState, regs: &mut Regs) {
         cond, buttons, x as i16, y as i16, dx as i16, dy as i16, cb_seg, cb_off);
 }
 
-/// SLOT_INT74_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
-/// Restore the GP regs `mouse_callback_invoke` clobbered, then unwind the
-/// IRQ via the same `resume_continuation_from_stub` that SLOT_RESUME_CONTINUATION uses.
+/// SLOT_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
+/// Restore the GP regs `deliver_mouse_callback` clobbered, then unwind via
+/// the same `resume_continuation_from_stub` that SLOT_RESUME_CONTINUATION uses.
 fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     use super::machine::vm86_pop;
     // Discard the CD 31 trap iret-frame.
@@ -3289,18 +3278,10 @@ pub(crate) const SLOT_CB_ENTRY_BASE: u8 = 0x04;
 // INT vector (INT 0x13 / 0x20 / 0x21 / 0x25 / 0x26 / 0x28 / 0x2E / 0x2F /
 // 0x67). 15 callbacks at slots 0x04..0x12.
 pub(crate) const SLOT_CB_ENTRY_END: u8 = 0x13;
-/// IVT[0x74] target. When IRQ 12 (= INT 0x74) is reflected into the user via
-/// the standard `reflect_int_to_real_mode` path, control lands here. The
-/// CD 31 traps to kernel; `mouse_callback_invoke` sets up the AX=0Ch
-/// event-handler call: pops the trap frame, bracket-saves the user GP regs
-/// we're about to clobber, loads condition / button / x / y / dx / dy into
-/// AX/BX/CX/DX/SI/DI, pushes a retf frame pointing at SLOT_INT74_MOUSE_CB_RET,
-/// and jumps the user to the handler.
-pub(crate) const SLOT_INT74_MOUSE_CB: u8 = 0x74;
 /// Handler RETFs to this slot. `mouse_callback_return` restores the
-/// bracket-saved GP regs (HostContinuation doesn't cover them) and then unwinds the
-/// IRQ via the standard `resume_continuation_from_stub` path.
-pub(crate) const SLOT_INT74_MOUSE_CB_RET: u8 = 0x75;
+/// bracket-saved GP regs (HostContinuation doesn't cover them) and then
+/// unwinds the INT 33h callback via the standard continuation path.
+pub(crate) const SLOT_MOUSE_CB_RET: u8 = 0x14;
 /// Generic block-and-retry resume slot. A syscall that can't complete
 /// synchronously (e.g. AH=08 with no key in the buffer) stashes a closure
 /// in `dos.pending_resume` and parks user CS:IP at this stub. Each
@@ -3358,11 +3339,6 @@ pub(super) fn setup_ivt() {
         write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
-    // IVT[0x74] = STUB_SEG:slot_offset(SLOT_INT74_MOUSE_CB). HW IRQ 12
-    // reflection lands here so the kernel can dispatch the AX=0Ch handler.
-    write_u16(0, (0x74u32) * 4,     slot_offset(SLOT_INT74_MOUSE_CB));
-    write_u16(0, (0x74u32) * 4 + 2, STUB_SEG);
-
     setup_lol_sft();
     xms::scan_uma();
 }

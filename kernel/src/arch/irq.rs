@@ -37,18 +37,6 @@ pub enum Irq {
     Hw(u8),
 }
 
-impl Irq {
-    /// Hardware IRQ number for VM86 signal delivery
-    pub fn irq_num(&self) -> u8 {
-        match self {
-            Irq::Tick => 0,
-            Irq::Key(_) => 1,
-            Irq::Mouse { .. } => 12,
-            Irq::Hw(n) => *n,
-        }
-    }
-}
-
 /// Global IRQ event queue for discrete events (keyboard).
 /// Timer ticks use a separate counter to avoid flooding and evicting keys.
 static mut QUEUE: Pipe<Irq, 256> = Pipe::new(Irq::Tick);

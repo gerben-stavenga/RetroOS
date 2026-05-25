@@ -770,18 +770,21 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
-    // Mouse-callback dispatch (no PS/2 hardware, no IRQ 12 line — the only
-    // mouse interface is INT 33 + AX=0Ch). Gated on the same conditions
-    // pick_pending_vec applies to vpic-backed IRQs: user IF=1, no in-flight
-    // delivery. `mouse_callback_invoke` will clear `pending_cond` and set
-    // `cb_in_flight`.
+    // Mouse-callback dispatch (INT 33h AX=000Ch / Function 12), not a
+    // hardware IRQ12/INT 74h delivery. Microsoft documents Function 12 as a
+    // FAR subroutine callback and says the mouse driver protects it from
+    // reentry: the subroutine is not called again until it terminates.
+    //
+    // We therefore deliver only from an interruptible guest point (IF=1),
+    // but keep IF as-is for the callback itself; `cb_in_flight` provides the
+    // specified mouse-driver reentrancy guard. `deliver_mouse_callback` clears
+    // `pending_cond` for this invocation and sets `cb_in_flight`.
     let mouse = &dos.pc.mouse;
     if regs.frame.rflags & (1u64 << 9) != 0
         && !mouse.cb_in_flight
         && mouse.cb_mask & mouse.pending_cond != 0
     {
-        IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
-        mode_transitions::deliver_pm_irq(dos, regs, 0x74);
+        self::dos::deliver_mouse_callback(dos, regs);
         return;
     }
     let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };

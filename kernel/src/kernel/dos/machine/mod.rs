@@ -152,19 +152,19 @@ pub struct MouseState {
     pub cb_off: u16,
     /// Pending event-condition bits since last delivery. `raise_pending`
     /// dispatches when `cb_mask & pending_cond != 0`, and
-    /// `mouse_callback_invoke` clears the field as it sets up the AX=0Ch
+    /// `deliver_mouse_callback` clears the field as it sets up the AX=0Ch
     /// far-call (so the callback sees the merged conditions exactly once).
     pub pending_cond: u16,
     pub last_dx: i16,
     pub last_dy: i16,
-    /// Re-entry guard: true between `mouse_callback_invoke` setting up the
+    /// Re-entry guard: true between `deliver_mouse_callback` setting up the
     /// far-call and `mouse_callback_return` unwinding it. Suppresses fresh
     /// dispatches while the user handler is on the stack.
     pub cb_in_flight: bool,
     /// User GP regs saved across the AX=0Ch handler far-call. HostContinuation
     /// covers CS/EIP/SS/ESP/EFLAGS/segs; we clobber AX/BX/CX/DX/SI/DI to set
     /// up the call, so they have to be bracket-saved here and restored by
-    /// the SLOT_INT74_MOUSE_CB_RET slot when the handler RETFs.
+    /// the SLOT_MOUSE_CB_RET slot when the handler RETFs.
     pub saved_rax: u64,
     pub saved_rbx: u64,
     pub saved_rcx: u64,
