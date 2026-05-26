@@ -33,7 +33,7 @@ mod exceptions;
 pub(in crate::kernel::dos) use self::exceptions::dispatch_dpmi_exception;
 use self::exceptions::{exception_return, ExcReturnVia};
 mod psp;
-pub(in crate::kernel::dos) use self::psp::{enter_pm_psp_view, restore_rm_psp_view, sync_psp_view_for_regs};
+pub(in crate::kernel::dos) use self::psp::{install_dpmi_psp_view, get_or_alloc_psp_sel, psp_sel_to_segment};
 mod raw_switch;
 pub(in crate::kernel::dos) use self::raw_switch::{pm_stub_dispatch, raw_switch_real_to_pm};
 use self::raw_switch::{clear_carry, flat_addr, set_carry, trace_client_selector_leak};
@@ -110,12 +110,14 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
     // synthesizes the stub address on demand for clients that chain to the
     // default handler.
 
-    // Attach DPMI state to thread, then build the per-RM→PM PSP view: this
-    // builds LDT[4] (PSP_SEL) for the active RM PSP, captures saved_rm_psp /
-    // saved_rm_env, and (for 32-bit clients) allocates an env selector and
-    // patches PSP[0x2C] per DPMI 0.9 §4.1. Sets `dos.current_psp = PSP_SEL`.
+    // Attach DPMI state to thread, then install the one-shot DPMI PSP
+    // view: LDT[18] (PSP_SEL) descriptor for the entering client's PSP,
+    // seed the PSP cache with (initial_psp, PSP_SEL), capture
+    // saved_rm_psp/saved_rm_env, and convert PSP[0x2C] from segment to
+    // selector per §4.1. `dos.current_psp` stays as the segment value
+    // (pure DOS state).
     dos.dpmi = Some(Box::new(dpmi));
-    enter_pm_psp_view(dos);
+    install_dpmi_psp_view(dos);
 
     // PMDOS: route PM INT 21 to the kernel's direct-service handler.
     if dos.pm_dos {
@@ -299,7 +301,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let mut base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 if let Some(dpmi) = dos.dpmi.as_ref() {
-                    if !dpmi.client_use32 && dos.current_psp == PSP_SEL && (base & 0xF) == 0 {
+                    if !dpmi.client_use32 && dpmi.env_ldt_idx != 0 && (base & 0xF) == 0 {
                         let psp_base = desc_base(dos.ldt[PSP_LDT_IDX]);
                         let env_sel = unsafe { core::ptr::read_volatile((psp_base + 0x2C) as *const u16) };
                         if env_sel != 0 && ((env_sel as u32) << 4) == base {

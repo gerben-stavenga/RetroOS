@@ -699,10 +699,7 @@ fn dos_putchar(c: u8) {
 }
 
 fn psp_struct_seg(dos: &thread::DosState) -> u16 {
-    match dos.dpmi.as_ref() {
-        Some(dpmi) if dos.current_psp == dpmi::PSP_SEL => dpmi.saved_rm_psp,
-        _ => dos.current_psp,
-    }
+    dos.current_psp
 }
 
 fn dos_error_from_errno(err: i32) -> u16 {
@@ -1921,33 +1918,40 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             regs.rax = (regs.rax & !0xFFFF) | status as u64;
             thread::KernelAction::Done
         }
-        // AH=0x50: Set Current Process ID (BX = new PSP segment)
-        // Undocumented in DOS 1-3, documented in 5+. Same backing field as
-        // AH=51h/62h. No return value other than the side effect.
+        // AH=0x50: Set Current Process ID (BX = new PSP). In PM, client
+        // passes a selector cached in `psp_cache` (HDPMI behavior); reverse
+        // it to a segment before storing. If BX isn't a known selector
+        // treat it as a segment value directly (matches HDPMI's
+        // `bx_sel2segm` fallthrough).
         0x50 => {
-            dos.current_psp = regs.rbx as u16;
+            let bx = regs.rbx as u16;
+            let in_pm = regs.mode() != crate::UserMode::VM86;
+            let seg = if in_pm {
+                super::dpmi::psp_sel_to_segment(dos, bx).unwrap_or(bx)
+            } else {
+                bx
+            };
+            dos.current_psp = seg;
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
-        // AH=0x51: Get Current Process ID (returns BX = current PSP segment)
-        // Undocumented sibling of AH=62h.
-        0x51 => {
-            regs.rbx = (regs.rbx & !0xFFFF) | dos.current_psp as u64;
+        // AH=0x51 / AH=0x62: Get PSP. In PM, return the per-segment
+        // selector from `psp_cache` (HDPMI's getpspsel); the client can
+        // load it into ES and address its PSP. In RM, return the raw
+        // segment.
+        0x51 | 0x62 => {
+            let in_pm = regs.mode() != crate::UserMode::VM86;
+            let bx = if in_pm {
+                super::dpmi::get_or_alloc_psp_sel(dos, dos.current_psp)
+            } else {
+                dos.current_psp
+            };
+            regs.rbx = (regs.rbx & !0xFFFF) | bx as u64;
             regs.clear_flag32(1);
             let cs = regs.frame.cs as u16;
             let ip = regs.frame.rip as u32;
-            dos_trace!("D21 51 -> BX={:04X} cs:ip={:04X}:{:08X}",
-                dos.current_psp, cs, ip);
-            thread::KernelAction::Done
-        }
-        // AH=0x62: Get PSP segment (returns BX=PSP segment)
-        0x62 => {
-            regs.rbx = (regs.rbx & !0xFFFF) | dos.current_psp as u64;
-            regs.clear_flag32(1);
-            let cs = regs.frame.cs as u16;
-            let ip = regs.frame.rip as u32;
-            dos_trace!("D21 62 -> BX={:04X} cs:ip={:04X}:{:08X}",
-                dos.current_psp, cs, ip);
+            dos_trace!("D21 5x -> BX={:04X} cs:ip={:04X}:{:08X}",
+                bx, cs, ip);
             thread::KernelAction::Done
         }
         // AH=0x6C: Extended Open/Create (DOS 4.0+)
@@ -2481,15 +2485,16 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let mut abs_dos = [0u8; dfs::DFS_PATH_MAX];
     let abs_len = dos.dfs.resolve(prog_name, &mut abs_dos).unwrap_or(0);
 
-    // Build parent reference. In PM, dos.current_psp is PSP_SEL and the
-    // real PSP[0x2C] may be patched to an env selector, but the child PSP's
-    // parent link and copied env must use real-mode paragraphs.
-    let parent_psp = dos.current_psp;
-    let (parent_rm_psp, parent_env_seg, parent_dpmi_pm) = match dos.dpmi.as_ref() {
-        Some(dpmi) if parent_psp == dpmi::PSP_SEL => {
-            (dpmi.saved_rm_psp, dpmi.saved_rm_env, true)
+    // Parent's PSP segment is now always a real-mode paragraph in
+    // `dos.current_psp`. The PSP[0x2C] in memory may have been converted
+    // to a selector at `dpmi_enter` — use `saved_rm_env` in that case so
+    // the child's parent link / copied env stay in segment form.
+    let parent_rm_psp = dos.current_psp;
+    let parent_env_seg = match dos.dpmi.as_ref() {
+        Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == parent_rm_psp => {
+            dpmi.saved_rm_env
         }
-        _ => (parent_psp, Psp::at(parent_psp).env_seg, false),
+        _ => Psp::at(parent_rm_psp).env_seg,
     };
     let parent_env_vec = snapshot_env(parent_env_seg);
     let parent = ParentRef { psp_seg: parent_rm_psp, env: &parent_env_vec };
@@ -2502,10 +2507,6 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let parent_heap_base = dos.heap_base_seg;
     let parent_blocks = dos.dos_blocks.clone();
     let parent_dta = dos.dta;
-
-    if parent_dpmi_pm {
-        super::dpmi::restore_rm_psp_view(dos);
-    }
 
     // Reset the chain to start at parent.heap_seg (= first paragraph past
     // parent's owned blocks). load_exe / load_com will dos_alloc_block the
@@ -2520,9 +2521,6 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
                 dos.heap_seg = parent_heap;
                 dos.heap_base_seg = parent_heap_base;
                 dos.current_psp = parent_rm_psp;
-                if parent_dpmi_pm {
-                    super::dpmi::enter_pm_psp_view(dos);
-                }
                 dos.dta = parent_dta;
                 dos.dos_blocks = parent_blocks;
                 super::sync_mcb_chain(dos);
@@ -2791,7 +2789,6 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
     dos.on_resume();
-    super::dpmi::sync_psp_view_for_regs(dos, regs);
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }

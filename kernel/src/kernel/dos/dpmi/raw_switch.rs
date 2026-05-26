@@ -11,15 +11,13 @@ use super::super::mode_transitions;
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
     let new_sp = regs.rbx as u16;
     let new_cs = regs.rsi as u16;
     let new_ip = regs.rdi as u16;
-
-    restore_rm_psp_view(dos);
 
     regs.frame.rflags |= (machine::VM_FLAG | machine::IF_FLAG) as u64;
     regs.frame.cs = new_cs as u64;
@@ -127,8 +125,6 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm(dos: &mut thread::DosState, 
         let eip = if cs_32 { regs.rdi as u32 } else { regs.rdi as u32 & 0xFFFF };
         (esp, eip)
     };
-
-    enter_pm_psp_view(dos);
 
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
     regs.frame.rflags |= machine::IF_FLAG as u64;

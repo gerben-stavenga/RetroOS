@@ -700,13 +700,15 @@ fn snapshot_env(env_seg: u16) -> alloc::vec::Vec<u8> {
 }
 
 /// Snapshot the parent's DOS environment block for fork+exec inheritance.
-/// In PM, `current_psp == PSP_SEL` and the env paragraph lives in `dpmi.saved_rm_env`
-/// (PSP[0x2C] may have been patched with an env selector). In RM, PSP[0x2C] is
-/// authoritative.
+/// `dos.current_psp` is always a segment; PSP[0x2C] may have been
+/// converted to a selector at DPMI entry, so use `saved_rm_env` when the
+/// active PSP matches the one whose env we patched.
 pub fn snapshot_parent_env(dos: &thread::DosState) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
-        Some(dpmi) if psp_seg == dpmi::PSP_SEL => dpmi.saved_rm_env,
+        Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
+            dpmi.saved_rm_env
+        }
         _ => dos::Psp::at(psp_seg).env_seg,
     };
     snapshot_env(env_seg)
@@ -929,10 +931,7 @@ fn dos_reset_blocks(dos: &mut DosState, base_seg: u16) {
 }
 
 fn current_mcb_owner(dos: &DosState) -> u16 {
-    match dos.dpmi.as_ref() {
-        Some(dpmi) if dos.current_psp == dpmi::PSP_SEL => dpmi.saved_rm_psp,
-        _ => dos.current_psp,
-    }
+    dos.current_psp
 }
 
 fn dos_alloc_block(dos: &mut DosState, need: u16) -> Result<u16, u16> {

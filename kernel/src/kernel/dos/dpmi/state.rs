@@ -95,7 +95,31 @@ pub struct DpmiState {
     /// or 0 if none is currently allocated (16-bit client, null env, or
     /// PM→RM has run since the last RM→PM). Non-zero implies PSP[0x2C] of
     /// `saved_rm_psp` is currently patched with `idx_to_sel(env_ldt_idx)`.
-    pub(super) env_ldt_idx: usize,
+    pub(in crate::kernel::dos) env_ldt_idx: usize,
+    /// PSP segment → PM selector cache. HDPMI-style append-only mapping:
+    /// each unique RM PSP segment queried from PM gets one stable LDT slot
+    /// (descriptor base = segment*16, limit = 0xFF). AH=51/62 from PM
+    /// returns the cached selector; AH=50 from PM reverses it to a segment
+    /// before reflecting to RM DOS. `entry.selector == 0` marks an unused
+    /// slot. Slot 0 is pre-populated at `dpmi_enter` with
+    /// `(initial_psp, PSP_SEL)` so the well-known selector keeps its
+    /// CWSDPMI-shape value for clients that probe.
+    pub(super) psp_cache: [PspCacheEntry; MAX_PSP_CACHE],
+}
+
+/// Maximum simultaneous tracked PSPs in the per-client PSP selector cache.
+/// HDPMI uses an unbounded linked list; 16 is plenty for the depths we see
+/// (Borland's loader chain stays at 2–3, COMMAND.COM cmd.exe etc. add a few
+/// more but never approach this).
+pub(super) const MAX_PSP_CACHE: usize = 16;
+
+/// One entry in the PSP selector cache. `selector == 0` means the slot is
+/// free. The descriptor at LDT[selector>>3] has base = `segment * 16` and
+/// limit 0xFF.
+#[derive(Clone, Copy, Default)]
+pub(super) struct PspCacheEntry {
+    pub(super) segment: u16,
+    pub(super) selector: u16,
 }
 
 /// A DPMI linear memory block
@@ -118,6 +142,7 @@ impl DpmiState {
             saved_rm_psp: 0,
             saved_rm_env: 0,
             env_ldt_idx: 0,
+            psp_cache: [PspCacheEntry::default(); MAX_PSP_CACHE],
         }
     }
 }

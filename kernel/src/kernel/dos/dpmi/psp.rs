@@ -1,18 +1,14 @@
 use super::*;
+use super::state::PspCacheEntry;
 
-/// RM→PM transition: build the PM-side PSP view from the active RM PSP.
+/// One-shot at DPMI entry: install the initial PSP selector and (per
+/// spec 4.1) convert PSP[0x2C] env segment to a selector. Pre-seeds the
+/// PSP cache with `(initial_psp, PSP_SEL)` so the well-known LDT[18]
+/// keeps its CWSDPMI-shape value for clients that probe.
 ///
-/// Captures the current RM PSP segment and PSP[0x2C] (so PM→RM can restore
-/// them), rebuilds the fixed `PSP_SEL` LDT[4] descriptor with base = current
-/// RM PSP * 16, allocates a fresh env selector, and patches PSP[0x2C]
-/// to point at it. Finally sets
-/// `dos.current_psp = PSP_SEL` so PM-side AH=51/62 reflections return a value
-/// the client can load into ES.
-pub(in crate::kernel::dos) fn enter_pm_psp_view(dos: &mut thread::DosState) {
-    if dos.current_psp == PSP_SEL {
-        return;
-    }
-
+/// Does NOT touch `dos.current_psp` — that's pure DOS state and stays as
+/// the segment value the entering program had.
+pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState) {
     let rm_psp = dos.current_psp;
     let psp_base = (rm_psp as u32) * 16;
     let env_seg = unsafe { core::ptr::read_volatile((psp_base + 0x2C) as *const u16) };
@@ -25,57 +21,83 @@ pub(in crate::kernel::dos) fn enter_pm_psp_view(dos: &mut thread::DosState) {
     dpmi.saved_rm_psp = rm_psp;
     dpmi.saved_rm_env = env_seg;
 
-    // PSP_SEL descriptor: base = active RM PSP, limit = 64K. Spec says
-    // limit=100h but real extenders (DOS/4GW) reuse ES as scratch and need
-    // the full 64K window.
+    // PSP_SEL (= LDT[18]) descriptor: base = initial PSP, limit = 64K. Spec
+    // says 100h but DOS/4GW reuses ES as scratch and needs 64K.
     dos.ldt[PSP_LDT_IDX] = make_data_desc_ex(psp_base, 0xFFFF, false);
     dos.ldt_alloc[0] |= 1 << PSP_LDT_IDX;
 
-    dpmi.env_ldt_idx = 0;
+    // Seed the PSP cache with the initial PSP → PSP_SEL mapping so AH=51
+    // returns PSP_SEL for this PSP and AH=50 maps PSP_SEL back to the
+    // segment.
+    if let Some(dpmi) = dos.dpmi.as_mut() {
+        dpmi.psp_cache[0] = PspCacheEntry { segment: rm_psp, selector: PSP_SEL };
+    }
+
+    // Env conversion: PSP[0x2C] segment → selector. One-shot per spec
+    // 4.1; never re-toggled. 16-bit Borland-family clients (DPMI16BI /
+    // RTM) and 32-bit extenders (DOS/4GW) both observe selector form here.
+    if let Some(dpmi) = dos.dpmi.as_mut() {
+        dpmi.env_ldt_idx = 0;
+    }
     if env_seg != 0 {
         if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
             let env_base = (env_seg as u32) * 16;
             dos.ldt[idx] = make_data_desc_ex(env_base, 0xFFFF, false);
             let env_sel = idx_to_sel(idx);
             unsafe { core::ptr::write_volatile((psp_base + 0x2C) as *mut u16, env_sel); }
-            dpmi.env_ldt_idx = idx;
+            if let Some(dpmi) = dos.dpmi.as_mut() {
+                dpmi.env_ldt_idx = idx;
+            }
         }
     }
-
-    dos.current_psp = PSP_SEL;
 }
 
-/// PM→RM transition: undo the PM-side PSP view set up by `enter_pm_psp_view`.
-///
-/// Restores the original PSP[0x2C], frees the env selector
-/// LDT slot, and sets `dos.current_psp` back to the RM PSP segment captured on
-/// entry so reflected AH=51/62 returns an RM-loadable value.
-pub(in crate::kernel::dos) fn restore_rm_psp_view(dos: &mut thread::DosState) {
-    if dos.current_psp != PSP_SEL {
-        return;
+/// Look up an existing PSP selector for `segment`, or allocate a new one.
+/// Mirrors HDPMI's `allocxsel(seg, limit=0xFF)`: per-segment stable
+/// mapping, fresh LDT slot on first sight. Returns 0 on alloc failure.
+pub(in crate::kernel::dos) fn get_or_alloc_psp_sel(
+    dos: &mut thread::DosState,
+    segment: u16,
+) -> u16 {
+    if let Some(dpmi) = dos.dpmi.as_ref() {
+        for entry in &dpmi.psp_cache {
+            if entry.selector != 0 && entry.segment == segment {
+                return entry.selector;
+            }
+        }
     }
-
-    let dpmi = match dos.dpmi.as_mut() {
-        Some(d) => d,
-        None => return,
+    let idx = match alloc_ldt(&mut dos.ldt_alloc) {
+        Some(i) => i,
+        None => return 0,
     };
-    let rm_psp = dpmi.saved_rm_psp;
-    let psp_base = (rm_psp as u32) * 16;
-
-    if dpmi.env_ldt_idx != 0 {
-        unsafe { core::ptr::write_volatile((psp_base + 0x2C) as *mut u16, dpmi.saved_rm_env); }
-        let idx = dpmi.env_ldt_idx;
-        free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
-        dpmi.env_ldt_idx = 0;
+    let psp_base = (segment as u32) * 16;
+    dos.ldt[idx] = make_data_desc_ex(psp_base, 0xFF, false);
+    let sel = idx_to_sel(idx);
+    if let Some(dpmi) = dos.dpmi.as_mut() {
+        for entry in dpmi.psp_cache.iter_mut() {
+            if entry.selector == 0 {
+                *entry = PspCacheEntry { segment, selector: sel };
+                break;
+            }
+        }
     }
-
-    dos.current_psp = rm_psp;
+    sel
 }
 
-pub(in crate::kernel::dos) fn sync_psp_view_for_regs(dos: &mut thread::DosState, regs: &Regs) {
-    if regs.mode() == crate::UserMode::VM86 {
-        restore_rm_psp_view(dos);
-    } else {
-        enter_pm_psp_view(dos);
+/// Reverse lookup: PSP selector → RM segment. Used by AH=50 in PM to
+/// translate a client-passed selector back to the segment value RM DOS
+/// needs. Returns `None` if `selector` isn't a known PSP selector — the
+/// caller should treat the value as already being a segment (matches
+/// HDPMI's `bx_sel2segm` fallthrough).
+pub(in crate::kernel::dos) fn psp_sel_to_segment(
+    dos: &thread::DosState,
+    selector: u16,
+) -> Option<u16> {
+    let dpmi = dos.dpmi.as_ref()?;
+    for entry in &dpmi.psp_cache {
+        if entry.selector != 0 && entry.selector == selector {
+            return Some(entry.segment);
+        }
     }
+    None
 }
