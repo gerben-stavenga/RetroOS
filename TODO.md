@@ -1,5 +1,21 @@
 # DOS Game Compatibility — Bug Sprint
 
+## Kernel — virtual IF gets stuck at 0
+- Freezes seen for
+      * Dos Navigator
+      * Sokoban
+      * Zone66
+      * TIM
+- [ ] Intermittent across games: a program runs fine for a while then
+      freezes. F12 dump shows EFLAGS.IF=0 — some interrupt sequence
+      (INT reflect / IRET / exception dispatch / mode transition) is
+      leaving the user's virtual IF cleared and never restoring it.
+      vPIC IRQs queue up but never get delivered, so anything waiting
+      on a timer/keyboard IRQ wedges. Related to the Hexen hang above
+      (same symptom, also IF=0 + VIP=1), but here it's not game-specific
+      so the IF=1→0-without-pairing path is somewhere on a common code
+      path, not Hexen-specific.
+
 ## INT 10h teletype rendering
 - [x] Fixed: word-sized passthrough for Bochs VBE ports 0x01CE/0x01CF/0x01D0
       in `handle_in_event`/`handle_out_event`. SeaBIOS's graphics-mode
@@ -8,20 +24,14 @@
       framebuffer offset and nothing rendered. Alley Cat, Digger and
       similar now show text in graphics modes.
 
+## Prince of Persia
+- [ ] Key events missed, resulting in stuck running (always running in one 
+      direction) until you press arraw again and key release is seen.
+
 ## Offroad
 - [ ] Doesn't work — failure mode TBD (capture trace)
 
-## Test Drive 1
-- [x] Works.
-
 ## Borland C IDE
-- [x] BC IDE boots into the editor and BCC compiles + invokes TLINK
-      end-to-end. Unblocked by (a) DPMI AH=25/35 PM-vector routing (PR #11),
-      (b) DMA control-register port bounds fix in `vdma::dma_read` (was
-      indexing `ch[8]` for port 0xD0), and (c) `GDT[8] = BIOS Data Area
-      alias` (selector 0x40, base 0x400, ring-3 data) — DPMI16BI hardcodes
-      `mov ds, 0x40` to access BDA; TSS64 moved to slot 16. See
-      [[feedback_gdt_bda_alias]].
 - [ ] **Mouse click crashes**. BC installs INT 33 AX=000C with a PM
       handler address (ES:DX = PM selector:offset, e.g. `030F:00F3`).
       Our `mouse_callback_invoke` does a VM86 `CALL FAR cb_seg:cb_off`,
@@ -33,21 +43,7 @@
       convention (`AX=cond, BX=buttons, CX=x, DX=y, SI=dx, DI=dy`) is
       used instead of DPMI 0303's `DS:SI/ES:DI` setup. Likely shared
       root cause with Settlers below.
-
-## Dos Navigator
-- [x] Mouse-then-keyboard-dead fixed by bypassing the vpic for mouse
-      entirely (commit `e4e3639`): no PS/2 hardware is modelled, every
-      DOS program uses INT 33 + AX=0Ch callback, so routing IRQ 12
-      through master/slave ISR was half-modelling that left master ISR
-      bit 2 stuck (no EOI source) and blocked every subsequent IRQ.
-      `raise_pending` now dispatches the AX=0Ch callback directly when
-      `pending_cond & cb_mask != 0` under user IF=1, with a new
-      `cb_in_flight` re-entry guard. See [[feedback_no_half_modelled_devices]].
-- [ ] **Residual IF=0 hangs.** DN still freezes intermittently with
-      virtual IF stuck at 0 — same umbrella bug as the "Kernel — virtual
-      IF gets stuck at 0" section below. Not mouse-specific (mouse path
-      is clean now). Needs a fresh F12 dump (IF, ISR, IMR, pending) to
-      narrow down which non-mouse path leaks the IF=0 state.
+- [ ] **Wolf3d project compile crashes**.
 
 ## Settlers
 - [ ] **Mouse crashes.** Probably same root cause as Borland C IDE above
@@ -56,105 +52,22 @@
       fix lands; if it still crashes, it's a different mouse-driver
       convention requiring separate handling.
 
-## Dark Forces
-- [x] AH=08 IP-rewind HACK on PM-via-VECSTUB path — fixed by `SLOT_RESUME`
-      block-and-retry closure mechanism. Game now boots through intro and
-      menu.
-- [x] Mouse-click crash on "Begin Mission" — DPMI 0303 callback dispatch
-      was missing the IRET return frame, planting `STUB_BASE` in the EIP,
-      and DPMI 0.9 §6.1.1 DS:(E)SI semantics. Also fixed an unrelated
-      `deliver_pm_irq` bug where `host_stack_write_iret` hardcoded
-      `host_stack_base()` instead of resolving through `regs.frame.ss`
-      (broke nested IRQ delivery on a non-host-stack handler stack).
-
-## Hexen
-- [x] Works.
-
-## Monkey Island 1 / Indiana Jones IV (Atlantis) — SCUMM
+## Monkey Island 1, 2 / Indiana Jones IV (Atlantis) — SCUMM
 - [ ] Both hang at startup before the LucasArts logo paints. Stuck inside
       SeaBIOS `wait_irq` (`STI; HLT; CLI; CLD; RETD` at F000:B7C0). INT
       15h is not the trigger — needs fresh diagnosis.
 
-## Duke Nukem 3D — via DOS/4GW (no LOADFIX wrap)
-- [ ] With DOS32A wrap (LOADFIX) it works; without, DOS/4GW triggers an
-      infinite exception loop. PM #13 fires → DOS/4GW handler RETFs with
-      ExcFrame32 modified to resume in VM86 at `0000:0x10B` (an IVT-area
-      address) → #UD → DOS/4GW's #UD handler is a decode/skip emulator
-      that advances EIP into more IVT garbage → loop, leaking ~60 stack
-      bytes per iteration. DOS/4GW evidently expects its RM panic stub
-      to be present at some low-memory address that we don't set up.
-      Kernel panic on the *first* loop iteration was fixed by zeroing
-      DS/ES/FS/GS in VM86-source dispatch (DPMI 0.9 §6.1.4); the loop
-      itself is a DOS/4GW-internal issue.
-
-## Duke Nukem 3D — palette fades super-slow
-- [x] Fixed (commit `b9a7f41`): synthetic `0x3DA` bit 0 now toggles via
-      a per-read counter (runs of 8) instead of a once-per-frame block,
-      so Build's per-DAC-entry snow-avoidance wait finds a blanking
-      window in ≤16 reads instead of stalling a full ~14 ms frame
-      between writes. ~4096 DAC writes × ~14 ms ≈ 60 s collapsed back
-      to <1 s. Bit 3 (vsync) still on the 70 Hz wallclock phase so
-      Wolf3D's `VL_WaitVBL` and Epic Pinball's pacing are unaffected.
-
-## Zone 66 (PMODE/W extender)
-- [x] Original "PMODE doesn't work" hang fixed by two virtual-PC
-      pieces. Root cause was NOT the extender — PMODE/W is a normal
-      DPMI 0.9 client and INT 2F AX=1687 ENTER worked fine. The actual
-      blocker was INTRO.EXE busy-polling port 0x61 for a DRAM
-      refresh-bit edge (the classic ~15 µs sub-tick timer) which our
-      `read_port61` never produced. Fix: XOR bit 4 on each read in
-      `kernel/src/kernel/dos/machine.rs`. Also added a minimal PS/2
-      keyboard command/ACK handler for `OUT 0x60` (was previously
-      dropped silently) so the prior `OUT 0xED` set-LEDs path queues
-      0xFA correctly — needed for full PS/2 detection paths (probably
-      shared with Operation Wolf and others).
-- [ ] Downstream crash: INTRO.EXE later issues `INT 31 AX=BA02`
-      (DPMI 1.0 vendor / phys-mapping group, unhandled by us → returns
-      AX=8001 CF=1) and shortly after SEGVs at RM `0269:003E`. Need to
-      identify what BA02 should do for PMODE/W and either implement
-      it or stub it more sympathetically.
+## Indiana Jones and the last crusade
+- [ ] Division by 0 error on startup
 
 ## Jazz Jackrabbit
 - [ ] Get it working — its bundled DPMI host rejects us. Jazz ships with
-      its own extender (not CWSDPMI / DOS32A / DOS/4GW), and that host
-      bails out before reaching the game. Capture the failing INT 2Fh
-      AX=1687 / DPMI entry sequence and the host's first few PM
-      requests to identify which service or expectation we miss
-      (likely a 0.9 detail it probes for before installing).
-
-## Operation Wolf
-- [x] Mouse worked all along — runtime input choice was pinned in
-      `OWconfig.dat`. Trace showed exactly one `INT 33h AX=0000`
-      install check at startup (we correctly returned AX=FFFF) and
-      no further mouse calls; the game just used whatever device the
-      config named. Deleting `OWconfig.dat` forces the startup menu
-      to re-prompt; selecting "Mouse" routes input through our INT
-      33h driver normally. No code change needed; lesson: when a DOS
-      game ignores an obviously-detected device, check for a saved-
-      config file before chasing emulation bugs.
+      its own extender (Borland RTM), and that host.
 
 ## Epic Pinball
-- [x] "Runs unplayably fast" was the 0x3DA retrace-emulation bug
-      (fixed in commit `efe5911`): we advanced the retrace phase
-      per-read instead of per-host-millisecond, so `VL_WaitVBL`
-      completed in microseconds instead of ~14 ms. With wallclock-
-      derived phase the engine paces correctly at 70 Hz.
+- [ ] Menu is way too fast, arrow keypresses often result in 2/3 steps
 
 ## One Must Fall 2097
-- [x] Playable with the in-game "Game Speed" slider set to 1
-      (minimum). OMF has no wallclock timer — diagnosed via trace
-      + Vogons: doesn't reprogram the PIT, doesn't read `40:6C`,
-      doesn't poll INT 1A, doesn't even use 0x3DA. Game loop just
-      runs as fast as the CPU executes it; on a 486DX2/66 (target
-      hw) this landed near 30–60 fps because file streaming + 8bpp
-      blitting saturated the CPU. The shipped speed slider bounds
-      work per frame and is enough on RetroOS.
-- [ ] (Optional) Generic guest-CPU-throttle knob (à la DOSBox
-      `cpu cycles fixed`) — gate event-loop iterations against
-      `get_ticks()` so any DOS guest runs at a chosen effective
-      MIPS. Would help Wing Commander, Pinball Fantasies' linesync
-      loop, and the rest of the Vogons CPU-sensitive list without
-      per-game in-engine knobs.
 - [ ] (sb-dma-virt) MOD music has deep comb-echo "reverb" + unstable
       tempo at "ultra high quality" mixing; "486" mixing sounds normal.
       Not a buffer/remap-coherency bug (a coherency fault would echo at
@@ -182,20 +95,6 @@
       reset and mask the host SB channels in `release_dma_pool` so the
       next program sees a clean card.
 
-## Kernel — virtual IF gets stuck at 0
-- [ ] Intermittent across games: a program runs fine for a while then
-      freezes. F12 dump shows EFLAGS.IF=0 — some interrupt sequence
-      (INT reflect / IRET / exception dispatch / mode transition) is
-      leaving the user's virtual IF cleared and never restoring it.
-      vPIC IRQs queue up but never get delivered, so anything waiting
-      on a timer/keyboard IRQ wedges. Related to the Hexen hang above
-      (same symptom, also IF=0 + VIP=1), but here it's not game-specific
-      so the IF=1→0-without-pairing path is somewhere on a common code
-      path, not Hexen-specific.
-- [ ] Diagnosis: instrument every CLI/STI/POPF/IRET/PM-INT-deliver site
-      with a "virtual IF state changed" trace, run a session, watch for
-      a 1→0 transition with no matching 0→1 before the freeze.
-
 ## Pinball Fantasies
 - [ ] Doesn't boot. INTRO.PRG loads, sets mode 13h, never paints the
       LucasArts/intro logo. Spends ~80 % of runtime in a tight VSYNC-
@@ -213,17 +112,39 @@
       F12 dump to a full instruction window) or single-step the outer
       loop after the inner exits to find what condition it's polling.
 
-## Dune II — single-cycle SB DMA (sb-dma-virt)
-- [ ] Speech still broken. Dune2 uses single-cycle (not auto-init) SB
-      DMA; under the virtual-8237 + host-IRQ5-relay path the speech
-      pump doesn't advance. Single-cycle keeps the deferred-ack model
-      (host IRQ5 masked until guest vPIC EOI `0x20` → `arch_rearm_irq(5)`),
-      the card halts at terminal count and the guest owns the re-arm.
-      Investigate terminal-count current-count readback (the ISR tests
-      8237 ch count `== 0xFFFF` to claim the completion IRQ) and the
-      re-arm timing on the single-cycle path.
+## Aladdin
+- [ ] Sound is bad and game after a bit starts producing garbage on screen
 
-## Wacky Wheels
-- [ ] Setup program crashes. Triage: capture the fault (CS:EIP,
-      exception vector, VM86/PM mode) and isolate the subsystem
-      (DOS/DPMI/SB/other) before fixing.
+## GoldenAxe
+- [ ] Keyboard is missing keys preventing from actually selecting
+      a player and starting the game. You need awkward keyboard bindings
+      in its keyboard config menu
+
+## Pinball illusions
+- [ ] pMAX protected mode is incompatible
+
+## Extreme pinball
+- [ ] Kernel panic on keypress
+
+## Strunts
+- [ ] Does not start
+
+# QEMU related problems
+
+There are some known problems that also occur in regular QEMU+freedos 
+emulation, which should match original hardware closest. These are
+thus not related to RetroOS but due to inaccurate QEMU emulation.
+
+## List
+
+- Odd/even vga address mode problem
+  * Keen4e signon screen is slightly garbled. QEMU EGA emulation is doing
+    something wrong with odd/even addressing, causing the checkmarks to
+    by located at wrong position and attribute bytes to garble part of
+    screen.
+- No hsync/vsync emulation in vga port 3da.
+  * Wolf3d hangs
+  * Epic pinball, supaplex and other games unplayable fast 
+  RetroOS solves this explicitly by producing synthetic vtrace/htrace
+- SB16 emulation problem
+  * Dune2 stops digitized speech after first sample
