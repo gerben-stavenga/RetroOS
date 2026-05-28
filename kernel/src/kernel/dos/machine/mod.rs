@@ -403,8 +403,29 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         0x60 => pc.vkbd.read_port60(),
         // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
         0x61 => pc.vkbd.read_port61(),
-        // Keyboard status port (bit 0 = output buffer full)
-        0x64 => if pc.vkbd.has_data() { 1 } else { 0 },
+        // Keyboard status port (bit 0 = output buffer full).
+        //
+        // Model the 8042's refill delay: the controller presents exactly one
+        // scancode per IRQ1 and only loads the next FIFO byte once the current
+        // interrupt has been serviced. So while a keyboard IRQ is in service,
+        // report only the latched byte (no FIFO refill). This makes a guest's
+        // INT 9 drain loop see a single scancode and exit — make and release
+        // arrive as separate interrupts, as on real hardware.
+        //
+        // Reproducer: Prince of Persia's INT 9 handler applies the *first*
+        // scancode of an interrupt to its movement key-table and discards the
+        // rest. With batched delivery a coalesced make+release landed in one
+        // INT 9, so it saw "left down" and threw the release away → stuck key.
+        // Poll-driven guests keep IRQ1 masked (never in service), so they
+        // still advance through the FIFO here.
+        0x64 => {
+            let ready = if pc.vpic.isr & 0x02 != 0 {
+                pc.vkbd.has_data()
+            } else {
+                pc.vkbd.poll_data()
+            };
+            if ready { 1 } else { 0 }
+        }
         0x40 => pc.vpit.read_counter0(),
         0x41 | 0x42 => 0,
         // PIT command register not readable
@@ -466,10 +487,12 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 if sb_in_service {
                     crate::kernel::startup::arch_rearm_irq(5);
                 }
-                // Real hardware effectively re-asserts IRQ1 if more scancodes are
-                // already visible in the controller when the handler finishes.
+                // Real hardware re-asserts IRQ1 if more scancodes remain in the
+                // controller when the handler finishes. Since reads no longer
+                // prefetch, check buffered bytes too — `latch` surfaces the
+                // next one at the following INT 9 delivery.
                 if keyboard_in_service
-                    && pc.vkbd.has_data()
+                    && (pc.vkbd.has_data() || pc.vkbd.has_buffered())
                     && !pc.vpic.has_pending_vec(0x09)
                 {
                     pc.vpic.push(0x09);
@@ -610,6 +633,10 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
     use crate::arch::Irq;
     match event {
         Irq::Key(sc) => {
+            if vkbd::KBD_TRACE {
+                crate::dbg_println!("[kbd] raw {:02X}{} e0p={}", sc,
+                    if sc & 0x80 != 0 { " REL" } else { "" }, pc.e0_pending as u8);
+            }
             let Some(sc) = normalize_scancode(pc, sc) else { return };
             pc.vkbd.push(sc);
             if pc.vpic.isr & 0x02 == 0 && !pc.vpic.has_pending_vec(0x09) {
@@ -668,6 +695,11 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
         if !pc.vkbd.latch() {
             pc.vpic.push(0x09);
             return None;
+        }
+        if vkbd::KBD_TRACE {
+            crate::dbg_println!("[kbd] deliver INT9 sc={:02X}{}",
+                pc.vkbd.port60,
+                if pc.vkbd.port60 & 0x80 != 0 { " REL" } else { "" });
         }
     }
     let master_irq = vec.wrapping_sub(0x08);

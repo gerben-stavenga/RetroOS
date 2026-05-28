@@ -4,6 +4,12 @@ use super::*;
 
 const KBD_BUF_SIZE: usize = 32;
 
+/// Flip to `true` to trace every scancode in/out of the virtual 8042
+/// (push from the host IRQ, INT 9 latch/delivery, guest port-0x60 read).
+/// Unconditional dbg_println — bypasses the DOS_TRACE_RT gate, which is
+/// suppressed in HW-IRQ context exactly where keyboard pushes happen.
+pub(super) const KBD_TRACE: bool = false;
+
 /// Virtual keyboard controller (scancode buffer)
 ///
 /// Models the 8042 output buffer. Incoming scancodes become visible in the
@@ -54,9 +60,17 @@ impl VirtualKeyboard {
         true
     }
 
-    /// Buffer a scancode from the real keyboard IRQ handler
+    /// Buffer a scancode from the real keyboard IRQ handler. Only present it
+    /// directly when the output buffer is free AND nothing is queued behind it
+    /// — otherwise FIFO order would break (a read clears OBF without pulling
+    /// the next byte forward, so OBF-clear no longer implies an empty ring).
     pub fn push(&mut self, scancode: u8) {
-        if !self.obf {
+        if KBD_TRACE {
+            crate::dbg_println!("[kbd] push {:02X}{} obf={} buf={}",
+                scancode, if scancode & 0x80 != 0 { " REL" } else { "" },
+                self.obf as u8, self.depth());
+        }
+        if !self.obf && self.head == self.tail {
             self.port60 = scancode;
             self.obf = true;
         } else {
@@ -64,21 +78,45 @@ impl VirtualKeyboard {
         }
     }
 
+    fn depth(&self) -> usize {
+        (self.tail + KBD_BUF_SIZE - self.head) % KBD_BUF_SIZE
+    }
+
     /// Ensure a scancode is visible in port60 for INT 9 delivery.
     pub fn latch(&mut self) -> bool {
         self.fill_output()
     }
 
-    /// Read port 0x60 — returns current scancode and then exposes the next
-    /// queued byte if one is already waiting in the controller.
+    /// Read port 0x60. Clears OBF and returns the current scancode WITHOUT
+    /// pulling the next queued byte forward.
+    ///
+    /// Reproducer: Prince of Persia hooks INT 9, reads 0x60 once to update its
+    /// own key-state table, then chains to the BIOS INT 9 handler — which reads
+    /// 0x60 again. On real hardware that second read returns the *same* byte
+    /// (the 8042 needs ~µs to surface the next scancode + raise a fresh IRQ1),
+    /// and the release arrives as its own later interrupt the game processes.
+    /// If we prefetched here, the BIOS chain would swallow a coalesced release
+    /// byte the game never saw, leaving its key-state stuck (the prince keeps
+    /// walking). Refill happens only at IRQ-delivery (`latch`) and 0x64 polls.
     pub fn read_port60(&mut self) -> u8 {
         let sc = self.port60;
+        if KBD_TRACE {
+            crate::dbg_println!("[kbd] read60 -> {:02X}{} (was_obf={} buf={})",
+                sc, if sc & 0x80 != 0 { " REL" } else { "" }, self.obf as u8, self.depth());
+        }
         self.obf = false;
-        self.fill_output();
         sc
     }
 
-    /// Check if data is available (port 0x64 bit 0)
+    /// Port 0x64 bit 0 (output-buffer-full). A poll-driven guest (no INT 9,
+    /// IRQ1 masked) advances through queued scancodes by sampling this between
+    /// 0x60 reads, so surface the next byte here — but never inside a single
+    /// 0x60 read, where back-to-back reads must see the same byte.
+    pub fn poll_data(&mut self) -> bool {
+        self.fill_output()
+    }
+
+    /// Check if a byte is latched in the output buffer (no refill).
     pub fn has_data(&self) -> bool {
         self.obf
     }
