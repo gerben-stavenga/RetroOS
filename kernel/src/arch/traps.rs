@@ -593,27 +593,43 @@ fn isr_handler_ring3(regs: &mut Regs) {
             }
             return;
         }
-        13 => match monitor(regs) {
-            MonitorResult::Resume => {
-                // If the monitor just cleared virtual IF in PM (e.g. a CLI),
-                // kick off the single-step interpreter so POPF/IRET get
-                // intercepted before hardware runs them. Skipped when TF
-                // stepping is disabled — DPMI 0.9 §2.13 says POPF/IRET
-                // aren't required to affect virtual IF, so spec-conforming
-                // clients use CLI/STI/AX=0900-0902 only.
-                if TF_VIRTUAL_IF_STEPPING
-                    && regs.mode() != UserMode::VM86
-                    && regs.flags32() & (1 << 9) == 0
-                {
-                    let _ = step_virtual_if(regs);
+        13 => {
+            // VME raises #GP with VIF=1 && VIP=1 to ask the host to inject the
+            // pending virtual interrupt. It normally lands on STI/POPF/IRET
+            // (monitor Resume), but the STI interrupt-shadow can defer it onto
+            // the *following* instruction (monitor Fault on a plain opcode —
+            // e.g. the `push ds` right after `sti` in the Bochs BIOS INT 9
+            // handler). Either way it's a delivery request, not an instruction
+            // fault: bubble it as an IRQ and let `pick_pending_vec` choose the
+            // highest-priority deliverable line. The Fault path leaves IP on
+            // the (innocent) instruction, so it re-runs after the handler IRETs.
+            const VIF_VIP: u32 = (1 << 9) | (1 << 20);
+            let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
+            match monitor(regs) {
+                MonitorResult::Resume => {
+                    // If the monitor just cleared virtual IF in PM (e.g. a CLI),
+                    // kick off the single-step interpreter so POPF/IRET get
+                    // intercepted before hardware runs them. Skipped when TF
+                    // stepping is disabled — DPMI 0.9 §2.13 says POPF/IRET
+                    // aren't required to affect virtual IF, so spec-conforming
+                    // clients use CLI/STI/AX=0900-0902 only.
+                    if TF_VIRTUAL_IF_STEPPING
+                        && regs.mode() != UserMode::VM86
+                        && regs.flags32() & (1 << 9) == 0
+                    {
+                        let _ = step_virtual_if(regs);
+                    }
+                    if regs.flags32() & VIF_VIP != VIF_VIP {
+                        return;
+                    }
+                    KE::Irq
                 }
-                if regs.flags32() & ((1 << 9) | (1 << 20)) != (1 << 9) | (1 << 20) {
-                    return;
-                }
-                KE::Irq
+                // A real fault is reclassified as IRQ delivery only when the
+                // VME pending-interrupt condition held at fault time.
+                MonitorResult::Event(KE::Fault) if pending_virtual_irq => KE::Irq,
+                MonitorResult::Event(e) => e,
             }
-            MonitorResult::Event(e) => e,
-        },
+        }
         14 => {
             if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
             KE::PageFault { addr: x86::read_cr2() as u32 }

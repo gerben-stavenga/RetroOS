@@ -392,13 +392,13 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // suppresses the unhandled-port log during joystick probes.
         0x200..=0x20F => 0xFF,
         // Master PIC command (read ISR)
-        0x20 => pc.vpic.isr,
+        0x20 => pc.vpic.master_isr(),
         // Master PIC data (read IMR)
-        0x21 => pc.vpic.imr,
+        0x21 => pc.vpic.master_imr(),
         // Slave PIC command (read ISR)
-        0xA0 => pc.vpic.slave_isr,
+        0xA0 => pc.vpic.slave_isr(),
         // Slave PIC data (read IMR)
-        0xA1 => pc.vpic.slave_imr,
+        0xA1 => pc.vpic.slave_imr(),
         // Keyboard data port — returns current scancode from the virtual 8042.
         0x60 => pc.vkbd.read_port60(),
         // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
@@ -419,7 +419,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // Poll-driven guests keep IRQ1 masked (never in service), so they
         // still advance through the FIFO here.
         0x64 => {
-            let ready = if pc.vpic.isr & 0x02 != 0 {
+            let ready = if pc.vpic.in_service(1) {
                 pc.vkbd.has_data()
             } else {
                 pc.vkbd.poll_data()
@@ -481,9 +481,9 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 // Non-specific EOI
                 // If keyboard IRQ (bit 1) was in service, and the virtual 8042
                 // still has data ready, IRQ1 should assert again after EOI.
-                let keyboard_in_service = pc.vpic.isr & 0x02 != 0;
-                let sb_in_service = pc.sb.irq < 8 && pc.vpic.isr & (1 << pc.sb.irq) != 0;
-                pc.vpic.eoi();
+                let keyboard_in_service = pc.vpic.in_service(1);
+                let sb_in_service = pc.sb.irq < 8 && pc.vpic.in_service(pc.sb.irq);
+                pc.vpic.master_eoi();
                 if sb_in_service {
                     crate::kernel::startup::arch_rearm_irq(5);
                 }
@@ -493,16 +493,16 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 // next one at the following INT 9 delivery.
                 if keyboard_in_service
                     && (pc.vkbd.has_data() || pc.vkbd.has_buffered())
-                    && !pc.vpic.has_pending_vec(0x09)
+                    && !pc.vpic.is_requested(1)
                 {
-                    pc.vpic.push(0x09);
+                    pc.vpic.raise(1);
                 }
             }
         }
         // Gameport one-shot trigger: no card is present on this ISA window.
         0x200..=0x20F => {}
         // Master PIC data (write IMR)
-        0x21 => pc.vpic.imr = val,
+        0x21 => pc.vpic.set_master_imr(val),
         // Slave PIC command
         0xA0 => {
             if val == 0x20 {
@@ -510,13 +510,13 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
             }
         }
         // Slave PIC data (write IMR)
-        0xA1 => pc.vpic.slave_imr = val,
+        0xA1 => pc.vpic.set_slave_imr(val),
         // Keyboard data port — host-to-device command / parameter byte.
         // The keyboard's response (ACK, BAT, ID, …) becomes visible at port
         // 0x60 and asserts IRQ1, exactly as on real hardware.
         0x60 => {
-            if pc.vkbd.write_port60(val) && !pc.vpic.has_pending_vec(0x09) {
-                pc.vpic.push(0x09);
+            if pc.vkbd.write_port60(val) && !pc.vpic.is_requested(1) {
+                pc.vpic.raise(1);
             }
         }
         // Keyboard controller / speaker port
@@ -639,14 +639,20 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             }
             let Some(sc) = normalize_scancode(pc, sc) else { return };
             pc.vkbd.push(sc);
-            if pc.vpic.isr & 0x02 == 0 && !pc.vpic.has_pending_vec(0x09) {
-                pc.vpic.push(0x09);
+            // Assert IRQ1 only when one isn't already in service or pending —
+            // the scancode otherwise waits in the 8042 buffer and the EOI
+            // re-assert surfaces it (one scancode per INT 9; see vkbd).
+            if !pc.vpic.in_service(1) && !pc.vpic.is_requested(1) {
+                pc.vpic.raise(1);
             }
         }
         Irq::Tick => {
-            let due = pc.vpit.take_pending_irqs();
-            for _ in 0..due {
-                pc.vpic.push(0x08);
+            // Edge-triggered: the IRR coalesces repeated ticks into one pending
+            // IRQ0, so a slow guest loses ticks rather than flooding — exactly
+            // real-hardware behaviour. `take_pending_irqs` keeps the PIT model
+            // honest about how many fired.
+            if pc.vpit.take_pending_irqs() > 0 {
+                pc.vpic.raise(0);
             }
         }
         Irq::Mouse { dx, dy, buttons } => {
@@ -665,35 +671,54 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             // Real QEMU sb16 is wired to host IRQ5. Relay it to the guest's
             // BLASTER-declared IRQ line, but leave the host IRQ masked until
             // the guest completes the virtual interrupt with a PIC EOI.
-            let line = pc.sb.irq;
-            let vec = if line < 8 { 0x08 + line } else { 0x70 + (line - 8) };
-            if !pc.vpic.has_pending_vec(vec) {
-                pc.vpic.push(vec);
+            if !pc.vpic.is_requested(pc.sb.irq) {
+                pc.vpic.raise(pc.sb.irq);
             }
         }
     }
 }
 
 /// Poll the virtual PIC for a deliverable IRQ, respecting the virtual
-/// interrupt flag and in-service register. Returns the vector to deliver
-/// (and marks it in-service on the master PIC), or `None` if nothing is
-/// ready. The caller is responsible for pushing the interrupt frame
-/// (see `dpmi::reflect_int_to_real_mode` / `dpmi::deliver_pm_irq`).
+/// interrupt flag and full cascade priority. Returns the vector to deliver
+/// (and marks it in-service), or `None` if nothing is ready. The caller is
+/// responsible for pushing the interrupt frame (see
+/// `dpmi::reflect_int_to_real_mode` / `dpmi::deliver_pm_irq`).
+///
+/// VIP is kept coherent with deliverability: latched while the guest has IF=0
+/// and a deliverable IRQ exists, cleared otherwise. Because `vpic.peek()` is
+/// priority-aware (a pending line must out-rank whatever is in service), a
+/// higher-priority IRQ preempts an in-service lower one once the guest does
+/// `sti` mid-handler — and the VME pending-interrupt `#GP` that fires there
+/// always has something real to deliver, so it can't spin.
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
+    const VIP: u64 = 1 << 20;
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
+    let candidate = pc.vpic.peek();
+
     if !vif {
-        if pc.vpic.has_pending() {
-            regs.frame.rflags |= 1u64 << 20; // VIP
+        // Can't deliver now — latch/clear VIP to mirror whether anything would
+        // be deliverable the moment the guest re-enables interrupts.
+        if candidate.is_some() {
+            regs.frame.rflags |= VIP;
+        } else {
+            regs.frame.rflags &= !VIP;
         }
         return None;
     }
-    if pc.vpic.isr != 0 {
+
+    // IF=1: deliver the highest-priority deliverable line, else make sure VIP
+    // is clear so a VME delivery-#GP doesn't re-fire with nothing to hand over.
+    let Some(irq) = candidate else {
+        regs.frame.rflags &= !VIP;
         return None;
-    }
-    let vec = pc.vpic.pop()?;
-    if vec == 0x09 {
+    };
+
+    if irq == 1 {
+        // Keyboard: only commit if a scancode is actually latched; otherwise
+        // drop the (spurious) request so we don't keep re-selecting it.
         if !pc.vkbd.latch() {
-            pc.vpic.push(0x09);
+            pc.vpic.clear_request(1);
+            regs.frame.rflags &= !VIP;
             return None;
         }
         if vkbd::KBD_TRACE {
@@ -702,18 +727,10 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
                 if pc.vkbd.port60 & 0x80 != 0 { " REL" } else { "" });
         }
     }
-    let master_irq = vec.wrapping_sub(0x08);
-    if master_irq < 8 {
-        pc.vpic.isr |= 1 << master_irq;
-    } else {
-        let slave_irq = vec.wrapping_sub(0x70);
-        if slave_irq < 8 {
-            pc.vpic.isr |= 1 << 2; // master cascade IRQ
-            pc.vpic.slave_isr |= 1 << slave_irq;
-        }
-    }
-    // Clear VIP — interrupt is being serviced
-    regs.frame.rflags &= !(1u64 << 20);
+
+    pc.vpic.ack(irq);
+    regs.frame.rflags &= !VIP; // interrupt is being serviced
+    let vec = if irq < 8 { 0x08 + irq } else { 0x70 + (irq - 8) };
     Some(vec)
 }
 

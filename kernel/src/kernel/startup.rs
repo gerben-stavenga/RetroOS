@@ -739,7 +739,7 @@ const F12_PRESS: u8 = 0x58;
 ///   the 80x25 VGA text buffer (for diagnosing hung DOS programs).
 /// - PM: Rust stack trace via frame-pointer walking through user symbols.
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
-/// stuck IRQ delivery (e.g. vpic.isr never cleared by a missed EOI).
+/// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
 pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::Regs) {
     dump_interrupted_thread(regs, Some(dos));
 }
@@ -813,23 +813,13 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
 }
 
 /// Print virtual PIC/PIT state — the actual IRQ-delivery gating lives here,
-/// so hangs that look like "timer stopped" almost always show up as a stuck
-/// vpic.isr bit (any bit blocks all deliveries in raise_pending).
+/// so hangs that look like "timer stopped" usually show up as a stuck in-
+/// service bit (a higher-priority pending line is blocked by it) or a
+/// requested-but-masked line.
 fn dump_virtual_hw(dos: &thread::DosState) {
-    let vpic = &dos.pc.vpic;
-    let (q, n) = vpic.debug_queue();
-    let mut pending = [0u8; 32];
-    let mut plen = 0;
-    for i in 0..n.min(8) {
-        let hi = q[i] >> 4;
-        let lo = q[i] & 0xF;
-        pending[plen] = if hi < 10 { b'0' + hi } else { b'A' + hi - 10 }; plen += 1;
-        pending[plen] = if lo < 10 { b'0' + lo } else { b'A' + lo - 10 }; plen += 1;
-        if i + 1 < n { pending[plen] = b','; plen += 1; }
-    }
-    let pending_str = core::str::from_utf8(&pending[..plen]).unwrap_or("?");
-    crate::dbg_println!("[DBG] vpic isr={:#04x} imr={:#04x} pending=[{}] ({}),",
-        vpic.isr, vpic.imr, pending_str, n);
+    let (mirr, misr, mimr, sirr, sisr, simr) = dos.pc.vpic.debug_state();
+    crate::dbg_println!("[DBG] vpic master irr={:#04x} isr={:#04x} imr={:#04x}  slave irr={:#04x} isr={:#04x} imr={:#04x}",
+        mirr, misr, mimr, sirr, sisr, simr);
 
     let (en, mode, reload, now, next) = dos.pc.vpit.debug_state();
     let delta = (next as i64).wrapping_sub(now as i64);
