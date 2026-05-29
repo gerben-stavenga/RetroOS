@@ -32,6 +32,11 @@ esac
 # a current PAE setup bug at CR0.PG enable with PAE-capable models.
 BOCHS_CPU_MODEL="${BOCHS_CPU_MODEL:-pentium}"
 BOCHS_IPS="${BOCHS_IPS:-50000000}"
+# Clock pacing. Default `none` runs the interpreter flat-out (fastest) with
+# guest time derived from `ips` instead of throttling to wall-clock — handy
+# since Bochs is slow. Set BOCHS_SYNC=realtime for faithful timing (game
+# speed / music tempo), or `slowdown` to only brake when ahead.
+BOCHS_SYNC="${BOCHS_SYNC:-none}"
 
 case "$IMG" in
     image)       BAZEL_TARGET="//:image";             IMAGE_FILE="image.bin" ;;
@@ -176,7 +181,7 @@ port_e9_hack: enabled=1
 romimage: file="$BOCHS_BIOS"
 vgaromimage: file="$BOCHS_VGA_ROM"
 boot: disk
-clock: sync=realtime, time0=local
+clock: sync=$BOCHS_SYNC, time0=local
 mouse: enabled=1, type=ps2
 speaker: enabled=1, mode=sound
 sb16: wavemode=1, midimode=0, dmatimer=750000, log="$VM_DIR/sb16.log", loglevel=2
