@@ -530,6 +530,15 @@ pub fn handle_event(
             if is_vm86 {
                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                 let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                // Dump the surrounding state before panicking: a plain
+                // `push ds` etc. can't #GP in genuine VM86, so SS:SP/flags
+                // and the last IRQ we reflected (vector + the CS:IP/SS:SP it
+                // was delivered against) tell us how the guest got here.
+                let liq = unsafe { mode_transitions::LAST_IRQ };
+                crate::println!("VM86 #GP state: ss:sp={:04x}:{:08x} flags={:#x} vm={} last_irq=vec{:02x} handler={:04x}:{:04x} delivered_at cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
+                    regs.stack_seg(), regs.sp32(), regs.flags32(),
+                    regs.mode() == crate::UserMode::VM86,
+                    liq.0, liq.1, liq.2 as u16, liq.3, liq.4, liq.5, liq.6);
                 panic!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
                     regs.code_seg(), regs.ip32() as u16, lin,
                     bytes[0], bytes[1], bytes[2], bytes[3],
