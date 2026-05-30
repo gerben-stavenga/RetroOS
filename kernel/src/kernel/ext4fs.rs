@@ -1,20 +1,21 @@
 //! Ext4 filesystem — implements the Filesystem trait via ext4-view crate.
 //!
 //! ext4-view is path-oriented, while our VFS trait is handle-oriented.
-//! Bridge: on open(), read the file into a kernel buffer keyed by handle.
-//! On read(), serve from that buffer. This works well for the expected
-//! use case (loading DOS games and small files from a Linux partition).
+//! Bridge: on open() keep a seekable `File` cursor keyed by handle; on read()
+//! seek to the requested offset and pull only that range off disk. Memory is
+//! bounded regardless of file size — unlike slurping whole files into a
+//! per-handle buffer, which exhausted the kernel heap on large CD assets
+//! (Indy IV's multi-MB MONSTER.SOU OOM'd `demand_page_kernel`).
 
 extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec;
-use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::error::Error;
 
-use ext4_view::{Ext4, Ext4Read};
+use ext4_view::{Ext4, Ext4Read, File};
 use crate::kernel::{hdd, vfs::{Filesystem, Vnode, DirEntry}};
 
 
@@ -43,8 +44,13 @@ impl Ext4Read for DiskReader {
 /// Ext4 filesystem wrapper implementing the VFS Filesystem trait.
 pub struct Ext4Fs {
     fs: Ext4,
-    /// Cached file contents, keyed by handle (monotonic counter).
-    cache: RefCell<BTreeMap<u64, Vec<u8>>>,
+    /// Per-handle seekable file cursors (handle = monotonic counter). A `File`
+    /// is just an inode + extent iterator + offset (a few hundred bytes), NOT
+    /// the file's contents — so this stays small no matter how large the files
+    /// are. Lifetime matches the VFS path-cache: handles are not dropped on
+    /// close (the path-cache shares a handle across opens and is never
+    /// evicted), exactly as the old cached byte buffers lived.
+    open_files: RefCell<BTreeMap<u64, File>>,
     /// Next handle to assign.
     next_handle: RefCell<u64>,
 }
@@ -56,7 +62,7 @@ impl Ext4Fs {
         let fs = Ext4::load(Box::new(reader)).map_err(|_| "failed to load ext4")?;
         Ok(Self {
             fs,
-            cache: RefCell::new(BTreeMap::new()),
+            open_files: RefCell::new(BTreeMap::new()),
             next_handle: RefCell::new(1),
         })
     }
@@ -81,37 +87,47 @@ impl Filesystem for Ext4Fs {
         // POSIX: case-sensitive only. DOS callers go through DFS's CI cache.
         let mut buf = [0u8; 256];
         let abs = make_absolute(path, &mut buf)?;
-        let data = self.fs.read(abs).ok()?;
-        let size = data.len() as u32;
+        let file = self.fs.open(abs).ok()?;
+        let size = file.metadata().len() as u32;
 
         let mut handle_ref = self.next_handle.borrow_mut();
         let handle = *handle_ref;
         *handle_ref = handle.wrapping_add(1);
 
-        self.cache.borrow_mut().insert(handle, data);
+        self.open_files.borrow_mut().insert(handle, file);
 
-        // ext4-view's read API doesn't surface mode bits — default to a
-        // generic file mode. Worth replacing with a stat-based lookup if
-        // we need accurate POSIX bits from the ext4 partition.
+        // ext4-view doesn't surface POSIX mode bits — default to a generic
+        // file mode (matches the prior behaviour). Worth a stat-based lookup
+        // if we ever need accurate bits from the ext4 partition.
         Some(Vnode { handle, size, mode: 0o644 })
     }
 
-    fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32 {
-        let cache = self.cache.borrow();
-        let data = match cache.get(&handle) {
-            Some(d) => d,
+    fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
+        let mut files = self.open_files.borrow_mut();
+        let file = match files.get_mut(&handle) {
+            Some(f) => f,
             None => return 0,
         };
-
-        let off = offset as usize;
-        let file_size = (size as usize).min(data.len());
-        if off >= file_size {
-            return 0;
+        // Only seek when not already positioned there. Sequential reads (the
+        // common case) leave `position` at `offset` after the previous read;
+        // `seek_to` re-walks the extent iterator from the start, so seeking
+        // every chunk would turn a sequential read into O(n²).
+        if file.position() != offset as u64 {
+            if file.seek_to(offset as u64).is_err() {
+                return 0;
+            }
         }
-        let avail = file_size - off;
-        let n = buf.len().min(avail);
-        buf[..n].copy_from_slice(&data[off..off + n]);
-        n as i32
+        // `read_bytes` yields block-sized partials and Ok(0) at EOF; loop to
+        // fill the caller's buffer (naturally bounded by end-of-file).
+        let mut total = 0usize;
+        while total < buf.len() {
+            match file.read_bytes(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(_) => break,
+            }
+        }
+        total as i32
     }
 
     fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
