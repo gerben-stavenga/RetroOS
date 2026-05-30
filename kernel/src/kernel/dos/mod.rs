@@ -371,6 +371,13 @@ fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
     } else {
+        // PM client: resolve the buffer selector through its LDT base. This is
+        // why PMDOS services 16-bit DPMI INT 21 in PM rather than reflecting to
+        // RM: Borland issues buffered calls bare from PM with selector pointers
+        // (confirmed: INT 21 AH=3Dh open, DS:DX=008F:149B = the filename). A
+        // reflect would hand RM-DOS the selector *value* as a segment (DPMI
+        // §host must not translate selectors — feedback_dpmi_host_no_seg_xlate),
+        // dereferencing garbage. Servicing in PM lets `seg_base` find the buffer.
         mode_transitions::seg_base(&dos.ldt[..], seg).wrapping_add(off)
     }
 }
