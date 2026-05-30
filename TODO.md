@@ -16,17 +16,13 @@
       so the IF=1→0-without-pairing path is somewhere on a common code
       path, not Hexen-specific.
 
-## INT 10h teletype rendering
-- [x] Fixed: word-sized passthrough for Bochs VBE ports 0x01CE/0x01CF/0x01D0
-      in `handle_in_event`/`handle_out_event`. SeaBIOS's graphics-mode
-      teletype reads/writes those to program the display; our byte-wise
-      emulator returned zeros, so glyph-blit math computed a junk
-      framebuffer offset and nothing rendered. Alley Cat, Digger and
-      similar now show text in graphics modes.
-
 ## Prince of Persia
-- [ ] Key events missed, resulting in stuck running (always running in one 
-      direction) until you press arraw again and key release is seen.
+- [x] Fixed (45b9bc5): the virtual 8042 surfaced a coalesced make+release in
+      a single INT 9 (the event loop drains host IRQs in batches). PoP's INT 9
+      handler applies only the first scancode and discards the rest, so it
+      recorded "key down", threw the release away, and the prince kept running.
+      Fix models the 8042 refill delay so each scancode arrives in its own
+      IRQ1, the way real hardware delivers make and release.
 
 ## Offroad
 - [ ] Doesn't work — failure mode TBD (capture trace)
@@ -52,10 +48,12 @@
       fix lands; if it still crashes, it's a different mouse-driver
       convention requiring separate handling.
 
-## Monkey Island 1, 2 / Indiana Jones IV (Atlantis) — SCUMM
-- [ ] Both hang at startup before the LucasArts logo paints. Stuck inside
-      SeaBIOS `wait_irq` (`STI; HLT; CLI; CLD; RETD` at F000:B7C0). INT
-      15h is not the trigger — needs fresh diagnosis.
+## Monkey Island 1, 2 — SCUMM
+- [ ] Hits `run-time error R6003 - integer divide by 0` (#DE) just after
+      entering mode 13h — the classic SCUMM fast-CPU timing calibration
+      divide-by-zero (a measurement loop sees 0 timer-tick delta because the
+      guest runs at full native host speed with no throttle). Same root
+      cause as Indy 3's startup divide-by-0 below; fixing one should fix both.
 
 ## Indiana Jones and the last crusade
 - [ ] Division by 0 error on startup
@@ -94,23 +92,6 @@
       the card to settle" branch. Speculative fix: issue an SB DSP
       reset and mask the host SB channels in `release_dma_pool` so the
       next program sees a clean card.
-
-## Pinball Fantasies
-- [ ] Doesn't boot. INTRO.PRG loads, sets mode 13h, never paints the
-      LucasArts/intro logo. Spends ~80 % of runtime in a tight VSYNC-
-      counter loop at `3E93:1BC8` (`linesync` macro from INTRO.ASM line
-      3342, followed by `INC BX; JNZ outer; CLI`). The outer loop wraps
-      a full 0x10000 INC BX iterations.
-- [ ] Loop progresses (BX values change between F12 dumps: 2871, 815E,
-      E05C, 2FF8…) so the inner spin DOES exit, but the game stays in
-      this routine — likely an outer animation/wait loop calling it
-      many times waiting on something else.
-- [ ] Source from historicalsource/pinballfantasies confirms the
-      pattern; file containing the outer-loop call site isn't in the
-      open-source drop (probably a sound/mod-player .OBJ linked in).
-- [ ] Diagnosis: capture more of the surrounding code (extend prof
-      F12 dump to a full instruction window) or single-step the outer
-      loop after the inner exits to find what condition it's polling.
 
 ## Aladdin
 - [ ] Sound is bad and game after a bit starts producing garbage on screen

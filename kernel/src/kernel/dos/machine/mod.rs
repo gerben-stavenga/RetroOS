@@ -104,6 +104,7 @@ pub struct PcMachine {
     pub a20_enabled: bool,
     pub vpit: VirtualPit,
     pub vpic: VirtualPic,
+    pub vrtc: VirtualRtc,
     pub vkbd: VirtualKeyboard,
     pub mouse: MouseState,
     pub skip_irq: bool,
@@ -295,6 +296,7 @@ impl PcMachine {
             a20_enabled: false,
             vpit: VirtualPit::new(),
             vpic: VirtualPic::new(),
+            vrtc: VirtualRtc::new(),
             vkbd: VirtualKeyboard::new(),
             mouse: MouseState::new(),
             skip_irq: false,
@@ -324,6 +326,8 @@ pub(super) use vpit::*;
 
 pub(super) mod vpic;
 pub(super) use vpic::*;
+pub(super) mod vrtc;
+pub(super) use vrtc::*;
 pub(super) mod vkbd;
 pub(super) use vkbd::*;
 // ============================================================================
@@ -432,9 +436,11 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         0x43 => 0xFF,
         // CMOS index port: read returns the last index byte (rare).
         0x70 => pc.cmos_index,
-        // CMOS data port: pass through to host RTC at the saved index.
-        // Host CMOS isn't used by the kernel itself, so this is safe; the
-        // guest sees real time-of-day plus a UIP/VRT-correct status block.
+        // CMOS data port. Status registers A/B/C are served from the virtual
+        // RTC (periodic-interrupt model — see vrtc.rs); every other index
+        // passes through to the host RTC so the guest sees real time-of-day.
+        // Host CMOS isn't used by the kernel itself, so the passthrough is safe.
+        0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.read(pc.cmos_index),
         0x71 => {
             crate::arch::outb(0x70, pc.cmos_index);
             crate::arch::inb(0x71)
@@ -529,8 +535,10 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         // CMOS index: latch for the next data-port read. Mask off the NMI
         // disable bit (0x80) — we never want guest writes to toggle host NMI.
         0x70 => pc.cmos_index = val & 0x7F,
-        // CMOS data writes are dropped — never let the guest mutate host CMOS
-        // (BIOS settings, time-of-day, alarm, etc.).
+        // CMOS data writes to the virtual RTC status registers (A/B/C) drive
+        // the periodic-interrupt model; writes to any other index are dropped
+        // so the guest can never mutate host CMOS (time-of-day, alarm, etc.).
+        0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.write(pc.cmos_index, val),
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
@@ -653,6 +661,13 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             // honest about how many fired.
             if pc.vpit.take_pending_irqs() > 0 {
                 pc.vpic.raise(0);
+            }
+            // RTC periodic interrupt (IRQ8) shares the host timer. When the
+            // guest has enabled PIE (CMOS reg B), drive IRQ8 at the programmed
+            // rate so the BIOS INT 70h ISR can complete INT 15h AH=86h waits.
+            // Edge-triggered like the PIT: coalesce into one pending line.
+            if pc.vrtc.take_pending_irqs() > 0 {
+                pc.vpic.raise(8);
             }
         }
         Irq::Mouse { dx, dy, buttons } => {
