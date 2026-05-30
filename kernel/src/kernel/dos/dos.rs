@@ -661,18 +661,42 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
 /// optionally echoes) then returns `None` to signal completion.
 /// `echo`: whether to also `dos_putchar` the read character (AH=01h does
 /// this; AH=07h/AH=08h don't).
-fn read_key_resume(echo: bool) -> super::ResumeCallback {
+/// Set up a guest INT 16h AH=00 (wait-for-key) call that returns to the
+/// `SLOT_RESUME` stub. Mirrors what a real `INT 16h` does: push FLAGS/CS/IP
+/// (the return frame, pointing back at SLOT_RESUME) and enter `IVT[0x16]`.
+/// IF is forced so the guest's wait loop can receive the keypress IRQ.
+fn launch_int16_read(regs: &mut Regs) {
+    let ivt_off = read_u16(0, 0x16 * 4);
+    let ivt_seg = read_u16(0, 0x16 * 4 + 2);
+    let ret_flags = (machine::vm86_flags(regs) | machine::IF_FLAG) as u16;
+    machine::vm86_push(regs, ret_flags);
+    machine::vm86_push(regs, STUB_SEG);
+    machine::vm86_push(regs, slot_offset(SLOT_RESUME));
+    machine::set_vm86_cs(regs, ivt_seg);
+    machine::set_vm86_ip(regs, ivt_off);
+    regs.rax &= !0xFF00;                      // AH = 0 (INT 16h AH=00)
+    regs.frame.rflags |= machine::IF_FLAG as u64; // IF=1 while INT 16 runs
+}
+
+/// Completion closure for an INT-16-routed DOS char read. Fires once the
+/// guest's INT 16h handler IRETs back to SLOT_RESUME, with AX = the key
+/// (AL=ASCII, AH=scancode). Applies DOS char-read semantics and returns
+/// `None` so SLOT_RESUME pops the original INT 21 return frame.
+fn int16_finish_resume(echo: bool) -> super::ResumeCallback {
     super::ResumeCallback(alloc::boxed::Box::new(
         move |_kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
               regs: &mut Regs| -> Option<super::ResumeCallback> {
-            if let Some(ch) = poll_dos_console_char(dos) {
-                regs.rax = (regs.rax & !0xFF) | ch as u64;
-                if echo { dos_putchar(ch); }
-                None
-            } else {
-                Some(read_key_resume(echo))
+            let ax = regs.rax as u16;
+            let ascii = ax as u8;
+            let scan = (ax >> 8) as u8;
+            // Extended key: DOS returns AL=0 now, the scancode on the next read.
+            if ascii == 0 && scan != 0 {
+                dos.dos_pending_char = Some(scan);
             }
+            regs.rax = (regs.rax & !0xFF) | ascii as u64;
+            if echo && ascii != 0 { dos_putchar(ascii); }
+            None
         }))
 }
 
@@ -761,12 +785,29 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // the same path with no risk of corrupting the trampoline IRET
         // frame on rm_dedicated.
         0x01 | 0x07 | 0x08 => {
-            if let Some(ch) = poll_dos_console_char(dos) {
+            let echo = ah == 0x01;
+            // Console reads only reach here from VM86: PM/DPMI clients run under
+            // an extender that installs its own INT 21h chain, so the pmdos
+            // short-circuit never services char input. The INT 16 round-trip
+            // below relies on real-mode INT framing (vm86_push, real-mode IVT).
+            debug_assert!(regs.mode() == crate::UserMode::VM86,
+                "INT 21 console read in PM mode — PM extenders own their INT 21");
+            // Second byte of a prior extended key takes precedence (DOS returns
+            // AL=0 then the scancode on the next read).
+            if let Some(ch) = dos.dos_pending_char.take() {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
-                if ah == 0x01 { dos_putchar(ch); }
+                if echo && ch != 0 { dos_putchar(ch); }
             } else {
-                dos.pending_resume = Some(read_key_resume(ah == 0x01));
-                park_at_slot_resume(regs);
+                // Real DOS services console input through INT 16h — so do we.
+                // Enter the guest's IVT[0x16] (AH=00, wait-for-key) with an
+                // iret frame that returns to SLOT_RESUME, where
+                // `int16_finish_resume` applies DOS char-read semantics to the
+                // returned AX (and pops the original INT 21 frame). A guest that
+                // hooks INT 16/INT 9 (and keeps 40:1A empty) is honoured; an
+                // unhooked guest just runs the BIOS INT 16h, reading the same
+                // 40:1A the old fast path did.
+                launch_int16_read(regs);
+                dos.pending_resume = Some(int16_finish_resume(echo));
             }
             thread::KernelAction::Done
         }
