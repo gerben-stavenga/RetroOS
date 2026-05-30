@@ -55,6 +55,16 @@
       guest runs at full native host speed with no throttle). Same root
       cause as Indy 3's startup divide-by-0 below; fixing one should fix both.
 
+## Indiana Jones IV: Fate of Atlantis (CD)
+- [ ] **Mouse doesn't work** — no mouse clicks register; you have to drive
+      menus/dialogue with Enter instead. The game now boots and runs (RTC
+      wait + ext4 on-demand reads fixed the earlier hang/OOM). SCUMM runs in
+      real mode (VM86), so unlike the BC IDE / Settlers cases this is *not*
+      the PM-handler-as-RM-paragraph bug — likely the INT 33 button/callback
+      path: either AX=0003 button state isn't reflecting presses, or the
+      AX=000C event callback / AX=0005 press-count isn't delivered. Needs a
+      trace of which INT 33 subfunctions SCUMM polls.
+
 ## Indiana Jones and the last crusade
 - [ ] Division by 0 error on startup
 
