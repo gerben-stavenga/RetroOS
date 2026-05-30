@@ -32,11 +32,19 @@ esac
 # a current PAE setup bug at CR0.PG enable with PAE-capable models.
 BOCHS_CPU_MODEL="${BOCHS_CPU_MODEL:-pentium}"
 BOCHS_IPS="${BOCHS_IPS:-50000000}"
-# Clock pacing. Default `none` runs the interpreter flat-out (fastest) with
-# guest time derived from `ips` instead of throttling to wall-clock — handy
-# since Bochs is slow. Set BOCHS_SYNC=realtime for faithful timing (game
-# speed / music tempo), or `slowdown` to only brake when ahead.
-BOCHS_SYNC="${BOCHS_SYNC:-none}"
+# Clock pacing. Default `realtime` ties guest time to the wall clock so games
+# run at the right speed (animation pace, music tempo) instead of sprinting —
+# guest timers (PIT/RTC) then fire at real-world rates. With `realtime` Bochs
+# brakes whenever it runs ahead; if the host can't sustain BOCHS_IPS in real
+# time the guest simply runs below full speed. Set BOCHS_SYNC=none to run the
+# interpreter flat-out (fastest, but guest time races ahead of real time —
+# games run too fast), or `slowdown` to cap at realtime without aligning.
+BOCHS_SYNC="${BOCHS_SYNC:-realtime}"
+# Host-window repaint rate (Hz). Bochs repaints the framebuffer on the
+# *emulated* clock; the historic default is only a few Hz, which looks choppy.
+# 60 Hz gives smooth video (paired with sync=realtime so the CPU doesn't
+# outrun the redraw). Cheap for 320x200/640x480 modes.
+BOCHS_VGA_UPDATE_FREQ="${BOCHS_VGA_UPDATE_FREQ:-60}"
 
 case "$IMG" in
     image)       BAZEL_TARGET="//:image";             IMAGE_FILE="image.bin" ;;
@@ -180,6 +188,10 @@ cpu: model="$BOCHS_CPU_MODEL", count=1, ips="$BOCHS_IPS", reset_on_triple_fault=
 port_e9_hack: enabled=1
 romimage: file="$BOCHS_BIOS"
 vgaromimage: file="$BOCHS_VGA_ROM"
+# update_freq = host-window repaints/sec on the emulated clock. Default is a
+# few Hz (choppy); 60 Hz gives smooth video. extension=vbe matches the Bochs
+# VBE display interface (ports 0x1CE/0x1CF) the kernel programs.
+vga: extension=vbe, update_freq=$BOCHS_VGA_UPDATE_FREQ
 boot: disk
 clock: sync=$BOCHS_SYNC, time0=local
 mouse: enabled=1, type=ps2
