@@ -126,9 +126,15 @@
         `VgaState` saves during the whole gameplay run — RetroOS is never in the
         pixel path while Jazz runs. Jazz uses unchained **Mode X** (planar +
         latch blits + CRTC page-flips), which QEMU's std VGA renders imperfectly
-        — same bucket as the "QEMU related problems" below. **Next:** confirm
-        via DOSBox/real-HW (likely same garble), and separately chase the
-        Bochs hang (Bochs VGA + VME timing). Then the DMA/GUS work for audio.
+        — same bucket as the "QEMU related problems" below. Root-confirmed via
+        the OpenJazz HN thread (id=42831927): Jazz uses an undocumented
+        **odd/even mode applied to 256-color** (tweaked Mode X — 128K, fast
+        blit + double-buffer), and QEMU's maintainer (bonzini) notes **QEMU
+        needed fixes for odd/even mode + VRAM wraparound**. Our QEMU is 8.2.2
+        (early 2024), which predates those (HN thread Jan 2025) → garble.
+        **Next:** test on **QEMU 9.2+/git** (expected to render correctly, no
+        RetroOS change); the Bochs 2.7 hang is its own VGA/VME-timing issue.
+        Then the DMA/GUS work for audio.
       (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
        program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
        capturing load-time DPMI traces without driving DN.)
