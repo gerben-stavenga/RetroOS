@@ -358,7 +358,41 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
 pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    // 16-bit DPMI clients issue INT 21h with 16-bit register parameters; the
+    // high 16 bits of EAX..EBP are undefined and real (16-bit) DOS never
+    // touches them. Zero them for the duration of servicing so every handler's
+    // full-width reads (filename/buffer offsets via DS:DX, ES:DI, set-vector
+    // offsets, …) see a clean value without per-call masking, then OR the
+    // client's original high halves back so they're preserved exactly as DOS
+    // would. Skip process-control calls (terminate/TSR/exec/exit): they swap
+    // `regs` out to the parent/child, so restoring this client's halves
+    // afterward would write into the wrong context.
+    let ah = (regs.rax >> 8) as u8;
+    let proc_ctrl = matches!(ah, 0x00 | 0x31 | 0x4B | 0x4C);
+    let mask16 = !proc_ctrl && dos.dpmi.as_ref().map_or(false, |d| !d.client_use32);
+    const HI: u64 = 0xFFFF_0000;
+    let saved_hi = if mask16 {
+        let s = [
+            (regs.rax & HI), (regs.rbx & HI), (regs.rcx & HI), (regs.rdx & HI),
+            (regs.rsi & HI), (regs.rdi & HI), (regs.rbp & HI),
+        ];
+        regs.rax &= !HI; regs.rbx &= !HI; regs.rcx &= !HI; regs.rdx &= !HI;
+        regs.rsi &= !HI; regs.rdi &= !HI; regs.rbp &= !HI;
+        s
+    } else { [0u64; 7] };
+
     let action = int_21h(kt, dos, regs);
+
+    if mask16 {
+        regs.rax = (regs.rax & !HI) | saved_hi[0];
+        regs.rbx = (regs.rbx & !HI) | saved_hi[1];
+        regs.rcx = (regs.rcx & !HI) | saved_hi[2];
+        regs.rdx = (regs.rdx & !HI) | saved_hi[3];
+        regs.rsi = (regs.rsi & !HI) | saved_hi[4];
+        regs.rdi = (regs.rdi & !HI) | saved_hi[5];
+        regs.rbp = (regs.rbp & !HI) | saved_hi[6];
+    }
+
     if !matches!(action, thread::KernelAction::Done) { return action; }
     if dos.pending_resume.is_none() {
         finish_dos_call(dos, regs);
