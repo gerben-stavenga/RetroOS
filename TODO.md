@@ -23,6 +23,10 @@
       recorded "key down", threw the release away, and the prince kept running.
       Fix models the 8042 refill delay so each scancode arrives in its own
       IRQ1, the way real hardware delivers make and release.
+- [ ] **End-of-level door hangs, repeating.** When the prince reaches the exit
+      door, the game wedges with the door animation/sound looping. Failure mode
+      TBD — capture a trace at the level-exit transition (likely a wait loop on
+      a timer/IRQ or sound-DMA completion that never fires).
 
 ## Offroad
 - [ ] Doesn't work — failure mode TBD (capture trace)
@@ -121,7 +125,8 @@
         clients (`f020295`). Jazz now loads CONFIG/MENU/fonts/SOUNDCRD/music
         and runs its main loop. Under QEMU it **runs but the screen is garbled
         — old sprite/scroll positions aren't erased (Mode X trails)**; under
-        Bochs it **hangs**. Confirmed this is the **emulator's VGA, not us**:
+        Bochs the screen stays **black** (it's still loading — see below).
+        Confirmed the garble is the **emulator's VGA, not us**:
         VGA ports (0x3C0-0x3DF) + 0xA0000 are passthrough, and there were ZERO
         `VgaState` saves during the whole gameplay run — RetroOS is never in the
         pixel path while Jazz runs. Jazz uses unchained **Mode X** (planar +
@@ -136,7 +141,12 @@
         our 8.2.2 likely lacks it — but the exact release that carries the
         commit is UNVERIFIED. **Next:** confirm which QEMU tag has the fix (or
         just test QEMU ≥9.0) — expected to render correctly with no RetroOS
-        change; the Bochs 2.7 hang is its own VGA/VME-timing issue. Then DMA/GUS.
+        change. **Bochs is NOT hung** — Jazz keeps loading (LDT selector idx
+        climbs 22→194 over the run, 100+ #NP demand-loads), but Bochs's
+        realtime-paced interpreter crawls through the heavy segment
+        decompression, so the screen stays black for a long time and looks
+        hung. Run `BOCHS_SYNC=none ./run_bochs.sh …` (flat-out, no realtime
+        clock pacing) to let it finish loading. Then DMA/GUS for audio.
       (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
        program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
        capturing load-time DPMI traces without driving DN.)
