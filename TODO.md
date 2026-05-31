@@ -106,15 +106,21 @@
       loads** (DPMILOAD path — no regression). The earlier "Jazz fails earlier"
       note was wrong: BP and Jazz failed identically (same `EXCEPTION 11` #NP
       on sel ~0x16F, same `Loader error (0010)`); one fix unblocked both.
-  - [ ] Follow-ups now reachable: **BP** IDE is interactive-ready (confirmed at
-        the IDE). **Jazz** now loads the game (`FILE0001.EXE`) and runs through
-        video init, then dies on a **divide-by-zero (#DE) at `021f:37f2`** right
-        after `INT 10` mode/font setup — its own #DE handler catches it and
-        exits cleanly (code 0). This is the **fast-CPU timing-calibration
-        divide-by-zero**, same family as Monkey Island/SCUMM + Indy 3/4 below —
-        NOT an RTM/DPMI issue anymore. Fixing the calibration-#DE class (CPU
-        throttle / survive a 0 tick-delta) should get Jazz in-game; it'll then
-        also need the DMA/GUS work (`jazz-psp-env-gate` worktree) for audio.
+  - [x] **BP** IDE is interactive-ready (confirmed at the IDE).
+  - [x] **Jazz** now reaches its **title/menu** (branch `fix-vme-pm-vector`).
+        Getting there took three more fixes past the RTM loader:
+        (1) the fast-CPU **RTE 200** (Borland Pascal `CRT.Delay` divide
+        overflow) — patched out by running **TPPATCH** on `FILE0001.EXE`
+        (TPPATCH now shipped at `C:\TPPATCH`); (2) a **VME ring-0 `#GP`**
+        when a HW IRQ was delivered to the default PM stub — `pm_vectors`
+        offset carried stale high bits (`63b576c`); (3) the **menu.000
+        "not found"** — its INT 21h AH=3Dh open read an *empty* filename
+        because PM `linear()` used the full 32-bit `EDX` and 16-bit clients
+        leave the high half garbage, so the read went out of bounds. Fixed by
+        zeroing the high 16 bits of GP regs across PMDOS INT 21h for 16-bit
+        clients (`f020295`). Jazz now loads CONFIG/MENU/fonts/SOUNDCRD/music
+        and runs its main loop. **Next:** confirm the menu renders + is
+        playable under a display, then the DMA/GUS work for audio.
       (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
        program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
        capturing load-time DPMI traces without driving DN.)
