@@ -129,12 +129,14 @@
         — same bucket as the "QEMU related problems" below. Root-confirmed via
         the OpenJazz HN thread (id=42831927): Jazz uses an undocumented
         **odd/even mode applied to 256-color** (tweaked Mode X — 128K, fast
-        blit + double-buffer), and QEMU's maintainer (bonzini) notes **QEMU
-        needed fixes for odd/even mode + VRAM wraparound**. Our QEMU is 8.2.2
-        (early 2024), which predates those (HN thread Jan 2025) → garble.
-        **Next:** test on **QEMU 9.2+/git** (expected to render correctly, no
-        RetroOS change); the Bochs 2.7 hang is its own VGA/VME-timing issue.
-        Then the DMA/GUS work for audio.
+        blit + double-buffer). QEMU's maintainer (bonzini) states in that thread
+        he **fixed VRAM-wraparound + odd/even handling in QEMU** ("I had to fix
+        in QEMU"), patch `lore.kernel.org/all/20231231093918.239549-4-pbonzini`
+        dated 2023-12-31. That postdates the QEMU 8.2.0 branch (2023-12-20), so
+        our 8.2.2 likely lacks it — but the exact release that carries the
+        commit is UNVERIFIED. **Next:** confirm which QEMU tag has the fix (or
+        just test QEMU ≥9.0) — expected to render correctly with no RetroOS
+        change; the Bochs 2.7 hang is its own VGA/VME-timing issue. Then DMA/GUS.
       (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
        program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
        capturing load-time DPMI traces without driving DN.)
