@@ -1869,6 +1869,30 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             thread::KernelAction::Done
         }
+        // AH=0x37: Get/set switch character. DOS 5+ fixes it at '/' (set is a
+        // no-op). Returning DL='/' is load-bearing: the Borland/Microsoft C
+        // runtime uses '/' as the *path separator* whenever the switch char is
+        // not '/'. A missing/error answer (our old catch-all returned AX=1,CF=1)
+        // made bc.exe emit forward-slash paths everywhere — e.g. the TASM object
+        // spec "OBJ/H_LDIV.OBJ", where TASM parses the "/H" as the help switch
+        // and prints its syntax screen instead of assembling (Wolf3D .PRJ build).
+        0x37 => {
+            match regs.rax as u8 {
+                0x00 => {
+                    regs.rax &= !0xFF;                       // AL=00: success
+                    regs.rdx = (regs.rdx & !0xFF) | b'/' as u64;
+                    regs.clear_flag32(1);
+                }
+                0x01 => {
+                    regs.rax &= !0xFF;                       // accept set, no-op
+                    regs.clear_flag32(1);
+                }
+                _ => {
+                    regs.rax = (regs.rax & !0xFF) | 0xFF;    // invalid subfunction
+                }
+            }
+            thread::KernelAction::Done
+        }
         // AH=0x67: Set Handle Count
         0x67 => {
             let requested = regs.rbx as u16;

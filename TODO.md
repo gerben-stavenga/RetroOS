@@ -39,7 +39,26 @@
       convention (`AX=cond, BX=buttons, CX=x, DX=y, SI=dx, DI=dy`) is
       used instead of DPMI 0303's `DS:SI/ES:DI` setup. Likely shared
       root cause with Settlers below.
-- [ ] **Wolf3d project compile crashes**.
+- [ ] **Goal: successful WOLFSRC compile from the BC IDE** (`bc`, project
+      `WOLF3D.PRJ`, sources served over hostfs at `C:\PROJECT\WOLFSRC`).
+  - [x] Fixed: TASM printed its syntax screen instead of assembling. Root
+        cause was unhandled INT 21h AH=37h (get switch char) — the Borland/MS
+        C runtime then used `/` as the path separator, so the IDE handed TASM
+        `OBJ/H_LDIV.OBJ`, whose `/H` parses as the `/h` help switch. Added an
+        AH=37h handler returning `DL='/'` (DOS 5+ semantics). H_LDIV.ASM now
+        assembles cleanly (`Error messages: None`). See
+        `[[project_dos_switchar_pathsep]]`.
+  - [ ] **Blocked: TASM hangs at exit.** After assembling H_LDIV.ASM and
+        writing OBJ\H_LDIV.OBJ, TASM wedges while printing "Remaining memory"
+        and never reaches `AH=4C`. Resume IP is pinned at `1B79:0DF9` (its
+        decimal-print routine, confirmed by disasm) across hundreds of
+        `RESUME_CONTINUATION_STUB` events with no intervening DOS calls/excs,
+        yet SS:ESP wanders the whole 64K segment — the kernel keeps replaying
+        the same saved frame. Suspect the continuation / `other_stack` LIFO
+        bookkeeping after TASM's long run of reflected INT 21h calls through
+        the bc.exe DPMI host, not a TASM bug. Next: arm `PM_STEP_BUDGET` /
+        `pm_step_log` when the client first hits `1B79:0DF9` to confirm
+        whether TASM advances at all, then inspect `resume_continuation_from_stub`.
 
 ## Settlers
 - [ ] **Mouse crashes.** Probably same root cause as Borland C IDE above
