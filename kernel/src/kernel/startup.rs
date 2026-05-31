@@ -133,17 +133,35 @@ pub fn startup() -> ! {
         crate::arch::shutdown();
     }
 
-    // Self-build: if Turbo C is on the image, compile BOOT\SRC\COMMAND.C
-    // -> root COMMAND.COM via TC at boot. cwd="" so TCC writes the linker
-    // output to the drive root (C:\COMMAND.COM, on the ext4 partition);
+    // Self-build: recompile BOOT\SRC\COMMAND.C -> root COMMAND.COM at boot.
+    // cwd="" so the linker writes the output to the drive root (C:\COMMAND.COM);
     // DN's EXEC of "COMMAND.COM /C ..." then picks up the freshly-built one.
     //
-    // TC 2.01 is freeware (Borland Antique Software), so this entire
-    // self-build chain is publicly redistributable.
-    if crate::kernel::exec::load_file_resolved(b"boot/TC/TCC.EXE").is_ok() {
+    // Prefer Borland C++ when present (the proprietary image, \BORLANDC): BCC
+    // compiling + EXEC'ing TLINK — a 16-bit DPMI parent that execs a child,
+    // which exits and returns — exercises the INT 21h AH=4Bh EXEC / MCB path
+    // end-to-end every boot, so breakage there surfaces immediately. BC++ 3.1
+    // is abandonware (not officially free like TC 2.01), so it ships only in
+    // the proprietary image. The open image has no \BORLANDC and falls back to
+    // freeware Turbo C 2.01 in the boot bundle; with neither present, the tar's
+    // pre-built COMMAND.COM runs as-is.
+    if crate::kernel::exec::load_file_resolved(b"BORLANDC/BIN/BCC.EXE").is_ok() {
+        println!("Building COMMAND.COM from BOOT\\SRC\\COMMAND.C via BCC + Borland TLINK...");
+        // Hermetic env: PATH has ONLY C:\BORLANDC\BIN so BCC EXECs Borland's
+        // own TLINK 5.1 — not TC's TLINK 2.0 (which a PATH listing C:\BOOT\TC
+        // first would shadow it with). Include/lib paths come from
+        // BORLANDC\BIN\TURBOC.CFG / TLINK.CFG (-I/-L), which BCC and TLINK read
+        // from their own EXE directory, so no INCLUDE/LIB env is needed.
+        run_dos_program(
+            b"BORLANDC/BIN/BCC.EXE",
+            b"-mt -lt BOOT\\SRC\\COMMAND.C",
+            b"",
+            b"PATH=C:\\BORLANDC\\BIN\0\0",
+        );
+        println!("Build done.");
+    } else if crate::kernel::exec::load_file_resolved(b"boot/TC/TCC.EXE").is_ok() {
         println!("Building COMMAND.COM from BOOT\\SRC\\COMMAND.C via TC...");
-        // Self-contained env: only PATH so TCC can find TLINK. Bypasses
-        // CONFIG.SYS so the build is hermetic w.r.t. user config.
+        // Hermetic env: only PATH so TCC can find TLINK; bypasses CONFIG.SYS.
         run_dos_program(
             b"boot/TC/TCC.EXE",
             b"-mt -lt BOOT\\SRC\\COMMAND.C",
