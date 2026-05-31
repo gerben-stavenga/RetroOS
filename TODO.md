@@ -52,17 +52,25 @@
         AH=37h handler returning `DL='/'` (DOS 5+ semantics). H_LDIV.ASM now
         assembles cleanly (`Error messages: None`). See
         `[[project_dos_switchar_pathsep]]`.
-  - [ ] **Blocked: TASM hangs at exit.** After assembling H_LDIV.ASM and
-        writing OBJ\H_LDIV.OBJ, TASM wedges while printing "Remaining memory"
-        and never reaches `AH=4C`. Resume IP is pinned at `1B79:0DF9` (its
-        decimal-print routine, confirmed by disasm) across hundreds of
-        `RESUME_CONTINUATION_STUB` events with no intervening DOS calls/excs,
-        yet SS:ESP wanders the whole 64K segment — the kernel keeps replaying
-        the same saved frame. Suspect the continuation / `other_stack` LIFO
-        bookkeeping after TASM's long run of reflected INT 21h calls through
-        the bc.exe DPMI host, not a TASM bug. Next: arm `PM_STEP_BUDGET` /
-        `pm_step_log` when the client first hits `1B79:0DF9` to confirm
-        whether TASM advances at all, then inspect `resume_continuation_from_stub`.
+  - [x] **TASM exit-hang FIXED** (by the 16-bit DPMI fixes on master —
+        `f020295`/`63b576c`). TASM previously wedged at `1B79:0DF9` after
+        assembling; now it assembles, finishes, and exits cleanly.
+  - [ ] **Blocked: bc.exe's PM-exec of TASM drops the `/D__MEDIUM__` model
+        define.** Assembling C0.ASM, TASM reports "no model symbol"
+        (RULES.ASI .ERR) → 15 errors, IDE aborts. The cmdtail bc passes is
+        correct (` /MX /ZI /O /D__MEDIUM__ C0.ASM,obj\C0.OBJ`, trace confirms
+        42 bytes read + `set_cmdline`'d). PROVEN it's the PM-exec path, not the
+        files/define: the **identical** TASM command assembles C0.ASM with
+        `Error messages: None` when launched directly via `-r`
+        (`qemu … -fw_cfg opt/cmdline='BORLANDC/BIN/TASM.EXE /MX /ZI /O
+        /D__MEDIUM__ C0.ASM' opt/cwd=PROJECT/WOLFSRC`). So `exec_program` for a
+        **16-bit DPMI parent (bc.exe)** delivers the cmdtail such that TASM
+        parses the source/object filenames but not the leading `/D` switch.
+        `exec_program` looks correct statically (sets child entry DS=ES=PSP,
+        `current_psp`=child, `set_cmdline` writes the full tail) — so it's
+        subtle. Next: instrument `exec_program` to dump the child PSP:0080 +
+        FCBs at child entry on the real bc run, or single-step TASM's cmdline
+        parser; compare PM-parent vs kernel-exec child setup.
 
 ## Settlers
 - [ ] **Mouse crashes.** Probably same root cause as Borland C IDE above
