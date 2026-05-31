@@ -88,37 +88,30 @@
 - [ ] Division by 0 error on startup
 
 ## Borland RTM extender (Jazz Jackrabbit + Borland Pascal 7)
-Shared root cause: both ship Borland's **RTM.EXE** ("Run-Time Manager", RTM
-loader v1.1, 1990-93) as their DPMI loader, and RTM fails on us. This is
-distinct from the Borland C++ path, which uses **DPMILOAD.EXE** (the thin
-DPMI16BI bootstrap) — DPMILOAD detects our host via INT 2F AX=1687 and makes
-the app a direct DPMI client, so BC reaches its IDE. RTM instead layers its
-own protected-mode image loader + exception management on top of our host,
-and that extra layer breaks. Fixing RTM should unblock both titles.
-- [ ] **Borland Pascal (`bp.exe`)** — RTM enters DPMI fine (allocates ~45 LDT
-      selectors, a 64MB `0501` block, sets exception handlers 6/B/C/D, hooks
-      INT 21/2F/31, TSRs resident OK). Then `bp.exe` drives RTM to load the PM
-      IDE image and RTM's loader bails: `Loader error (0010): internal error`
-      right after a raw PM→RM switch into RTM at `030F:0527` (a set-PSP AH=50
-      with BX=selector precedes it). RTM cleanly unwinds and exits code 0.
-      Error 0x10 is internal to RTM: there are NO DOS/DPMI calls between the
-      raw PM→RM into the loader and the error print — RTM validates some state
-      we set up earlier (selector base/limit, PSP selector, or the loaded PM
-      image) and rejects it. RTM assembles the message from pieces ("Internal
-      error" + "(%04X): ") in its PM runtime; no numeric→cause table, so
-      decoding 0x10 statically needs disassembling a mixed 16/32-bit extender.
-      Prime suspects from the trace: the AH=51 get-PSP returning a freshly
-      alloc'd selector (per-segment PSP selector cache) + the set-base/limit
-      INT 31 calls on that PSP selector (0177) right before the loader entry —
-      cf. the `jazz-psp-env-gate` branch name. Next: single-step the RTM
-      loader (arm PM_STEP on the raw PM→RM into it) to catch the failing check.
-- [ ] **Jazz Jackrabbit** — IDENTICAL failure to BP (earlier "fails earlier"
-      note was WRONG): same `EXCEPTION 11` (#NP, dec 11 = 0x0B) on selector
-      ~0x16F dispatched to RTM's handler, then the same `Loader error (0010)`
-      after the raw PM→RM into RTM's loader (seg `0571:0527` here vs `030F` for
-      BP — differs only by load address). Fixing one fixes both. Jazz also
-      needs the DMA/GUS work (see `jazz-psp-env-gate` worktree) for audio, but
-      that's post-load; the loader error blocks it first.
+- [x] **FIXED** (branch `fix-rtm-loader`): both ship Borland's **RTM.EXE**
+      ("Run-Time Manager" loader v1.1) as their DPMI loader. RTM hooks INT 31h
+      and, for functions it doesn't handle itself, **tail-chains to the
+      previously-installed (host) vector** — which we report via `AX=0204` as
+      our per-vector default stub (`VECTOR_STUB_SEL:STUB_BASE+0x62`). The bug:
+      `vector_stub_reflect` reflected that chained INT 31h to **real mode**
+      (`F000:FF53`), silently dropping the DPMI call. RTM's loader chains
+      `set-descriptor-base/limit` (AX=0007/0008) on its PSP-alias selector
+      (`0177`) that way, so the selector stayed unset → RTM's loader rejected
+      it with `Loader error (0010): internal error` after the raw PM→RM into
+      its loader. Fix: `mode_transitions::vector_stub_reflect` now services
+      vector 0x31 via `dpmi::dpmi_api` (popping the stub's own IRET frame so
+      results return to the chain's original caller) instead of reflecting to
+      RM. Verified headless: **BP loads to its IDE** (idles on INT 16 keyboard
+      poll), **Jazz clears the loader and runs SETUP**, and the **BC IDE still
+      loads** (DPMILOAD path — no regression). The earlier "Jazz fails earlier"
+      note was wrong: BP and Jazz failed identically (same `EXCEPTION 11` #NP
+      on sel ~0x16F, same `Loader error (0010)`); one fix unblocked both.
+  - [ ] Follow-ups now reachable: Jazz still needs the DMA/GUS work (see
+        `jazz-psp-env-gate` worktree) for audio + mouse to actually play; BP
+        IDE is interactive-ready. Re-test both end-to-end with a display.
+      (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
+       program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
+       capturing load-time DPMI traces without driving DN.)
 
 ## Epic Pinball
 - [ ] Menu is way too fast, arrow keypresses often result in 2/3 steps

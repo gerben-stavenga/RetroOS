@@ -781,6 +781,25 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Regs) -
             vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
             regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
     }
+    // INT 31h's host default handler is the DPMI services API — NOT a real-
+    // mode IVT reflection. A client that hooks INT 31h and tail-chains to the
+    // previously-installed (host) vector — which we report as this default
+    // stub (`AX=0204` returns VECTOR_STUB_SEL:STUB_BASE+0x62) — reaches here.
+    // Reflecting it to RM silently drops the DPMI call (Borland RTM's loader
+    // chains set-descriptor-base/limit on its PSP-alias selector this way; the
+    // lost calls leave the selector unset → `Loader error (0010)`, blocking
+    // Borland Pascal and Jazz Jackrabbit). Service it as DPMI instead. The
+    // CD 31 in the stub pushed its own IRET frame on top of the original
+    // caller's; pop it so dpmi_api's results return to that caller.
+    if vector == 0x31 {
+        let use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+        let (eip, cs, flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
+        regs.set_ip32(eip);
+        regs.set_cs32(cs as u32);
+        regs.set_flags32(flags);
+        return super::dpmi::dpmi_api(dos, regs);
+    }
+
     let (stub_sel, stub_off) = synthetic_host_iret_target();
     regs.set_cs32(stub_sel as u32);
     regs.set_ip32(stub_off);
