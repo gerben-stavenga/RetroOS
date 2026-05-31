@@ -55,22 +55,32 @@
   - [x] **TASM exit-hang FIXED** (by the 16-bit DPMI fixes on master —
         `f020295`/`63b576c`). TASM previously wedged at `1B79:0DF9` after
         assembling; now it assembles, finishes, and exits cleanly.
-  - [ ] **Blocked: bc.exe's PM-exec of TASM drops the `/D__MEDIUM__` model
-        define.** Assembling C0.ASM, TASM reports "no model symbol"
-        (RULES.ASI .ERR) → 15 errors, IDE aborts. The cmdtail bc passes is
-        correct (` /MX /ZI /O /D__MEDIUM__ C0.ASM,obj\C0.OBJ`, trace confirms
-        42 bytes read + `set_cmdline`'d). PROVEN it's the PM-exec path, not the
-        files/define: the **identical** TASM command assembles C0.ASM with
-        `Error messages: None` when launched directly via `-r`
-        (`qemu … -fw_cfg opt/cmdline='BORLANDC/BIN/TASM.EXE /MX /ZI /O
-        /D__MEDIUM__ C0.ASM' opt/cwd=PROJECT/WOLFSRC`). So `exec_program` for a
-        **16-bit DPMI parent (bc.exe)** delivers the cmdtail such that TASM
-        parses the source/object filenames but not the leading `/D` switch.
-        `exec_program` looks correct statically (sets child entry DS=ES=PSP,
-        `current_psp`=child, `set_cmdline` writes the full tail) — so it's
-        subtle. Next: instrument `exec_program` to dump the child PSP:0080 +
-        FCBs at child entry on the real bc run, or single-step TASM's cmdline
-        parser; compare PM-parent vs kernel-exec child setup.
+  - [x] **"No model symbol" RESOLVED** — was NOT a bc PM-exec define-drop bug
+        (earlier misdiagnosis). Root: WOLF3D.DSK's project path was wrong, so
+        the IDE never loaded the project and RULES.ASI's model cascade fired.
+        Fixed by re-saving WOLF3D.DSK in DOSBox with the correct C:\PROJECT\
+        WOLFSRC path. C0.ASM now assembles `Error messages: None`.
+  - [x] **"Error writing object file" RESOLVED** — the IDE assembles to
+        `.\OBJ\*.OBJ` but our source-only import dropped the empty `OBJ\` dir
+        the id project ships. DFS `to_vfs_create` requires intermediate dirs to
+        exist, so AH=3Ch create of `obj\C0.OBJ` failed CF=1. Fixed by shipping
+        `apps-proprietary/project/wolfsrc/OBJ/` (KEEP.TXT placeholder). Verified
+        TASM assembles C0.ASM → obj\C0.OBJ clean.
+  - [ ] **Blocked: 2nd TASM exec under bc crashes #UD.** Build order now: C0.ASM
+        (TASM #1) assembles ✓, TASM2MSG ✓, then H_LDIV.ASM (TASM #2) → CPU
+        exception 6 at `f4a4:0x206c` (vm86) — a wild far transfer into the
+        F-segment BIOS region; the crash stack holds ASCII string data, not a
+        return addr (misplaced/corrupted stack). NOT file-specific: H_LDIV.ASM
+        assembles `Error messages: None` standalone via `-r`. Both TASM execs
+        load **identically** (child_seg=02DF, cs:ip=1B79:1AEE, psp=0BD9), so the
+        corruption is resident state carried across the bc DPMI-host's
+        EXEC/reap cycles — same family as `[[project_bcc_regression_is_flaky_layout]]`
+        (the 14e7301 MCB-keep fix), evidently not fully closed. Clean execs
+        restore bc to its PM stack (`ss:sp=0597:F572 pm_env=restored`); the
+        crashing one degrades to a real-mode frame (`0239:013A`). Next:
+        run the full bc compile with PM single-step / DOS_TRACE_RT armed at the
+        2nd TASM EXEC; dump the locked-stack/mode-save chain + MCB list at
+        child entry and diff vs the 1st (working) TASM exec.
 
 ## Settlers
 - [ ] **Mouse crashes.** Probably same root cause as Borland C IDE above
