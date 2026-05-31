@@ -106,9 +106,15 @@
       loads** (DPMILOAD path — no regression). The earlier "Jazz fails earlier"
       note was wrong: BP and Jazz failed identically (same `EXCEPTION 11` #NP
       on sel ~0x16F, same `Loader error (0010)`); one fix unblocked both.
-  - [ ] Follow-ups now reachable: Jazz still needs the DMA/GUS work (see
-        `jazz-psp-env-gate` worktree) for audio + mouse to actually play; BP
-        IDE is interactive-ready. Re-test both end-to-end with a display.
+  - [ ] Follow-ups now reachable: **BP** IDE is interactive-ready (confirmed at
+        the IDE). **Jazz** now loads the game (`FILE0001.EXE`) and runs through
+        video init, then dies on a **divide-by-zero (#DE) at `021f:37f2`** right
+        after `INT 10` mode/font setup — its own #DE handler catches it and
+        exits cleanly (code 0). This is the **fast-CPU timing-calibration
+        divide-by-zero**, same family as Monkey Island/SCUMM + Indy 3/4 below —
+        NOT an RTM/DPMI issue anymore. Fixing the calibration-#DE class (CPU
+        throttle / survive a 0 tick-delta) should get Jazz in-game; it'll then
+        also need the DMA/GUS work (`jazz-psp-env-gate` worktree) for audio.
       (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
        program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
        capturing load-time DPMI traces without driving DN.)
