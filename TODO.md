@@ -119,8 +119,16 @@
         leave the high half garbage, so the read went out of bounds. Fixed by
         zeroing the high 16 bits of GP regs across PMDOS INT 21h for 16-bit
         clients (`f020295`). Jazz now loads CONFIG/MENU/fonts/SOUNDCRD/music
-        and runs its main loop. **Next:** confirm the menu renders + is
-        playable under a display, then the DMA/GUS work for audio.
+        and runs its main loop. Under QEMU it **runs but the screen is garbled
+        — old sprite/scroll positions aren't erased (Mode X trails)**; under
+        Bochs it **hangs**. Confirmed this is the **emulator's VGA, not us**:
+        VGA ports (0x3C0-0x3DF) + 0xA0000 are passthrough, and there were ZERO
+        `VgaState` saves during the whole gameplay run — RetroOS is never in the
+        pixel path while Jazz runs. Jazz uses unchained **Mode X** (planar +
+        latch blits + CRTC page-flips), which QEMU's std VGA renders imperfectly
+        — same bucket as the "QEMU related problems" below. **Next:** confirm
+        via DOSBox/real-HW (likely same garble), and separately chase the
+        Bochs hang (Bochs VGA + VME timing). Then the DMA/GUS work for audio.
       (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
        program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
        capturing load-time DPMI traces without driving DN.)
