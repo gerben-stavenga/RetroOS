@@ -617,7 +617,10 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Regs) -> thread::K
         0x0205 => {
             let int_num = regs.rbx as u8;
             let sel = regs.rcx as u16;
-            let off = regs.rdx as u32;
+            // 16-bit clients pass a 16-bit offset in DX (high EDX undefined);
+            // masking avoids storing stale high bits that break deliver_pm_irq's
+            // default-stub check. See AH=25 in dos.rs for the full failure mode.
+            let off = if dpmi.client_use32 { regs.rdx as u32 } else { regs.rdx as u16 as u32 };
             dos_trace!("[DPMI] 0205 set vec {:02X} = {:04X}:{:#X}", int_num, sel, off);
             dos.pm_vectors[int_num as usize] = (sel, off);
             clear_carry(regs);

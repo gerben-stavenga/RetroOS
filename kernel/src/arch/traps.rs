@@ -384,13 +384,13 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // Same-priv (ring 0 → ring 0) traps don't push SS/ESP and never reach VM86
     // segs, so canonicalizing would read residue. Cross-priv traps (ring 1
     // kernel or ring 3 user → arch ring 0) get full canonicalization.
-    let (vm86, raw_cs, raw_int_num, raw_err_code) = if from_64 {
+    let (vm86, raw_cs, raw_int_num, raw_err_code, raw_eip) = if from_64 {
         // EFLAGS.VM is reserved in long mode -- 64-bit entry is never VM86.
         let r = unsafe { &(*stack).regs };
-        (false, r.frame.cs, r.int_num, r.err_code)
+        (false, r.frame.cs, r.int_num, r.err_code, r.frame.rip)
     } else {
         let r = unsafe { &(*stack).raw32.0 };
-        (r.eflags as u64 & VM_FLAG != 0, r.cs as u64, r.int_num as u64, r.err_code as u64)
+        (r.eflags as u64 & VM_FLAG != 0, r.cs as u64, r.int_num as u64, r.err_code as u64, r.eip as u64)
     };
     // Mask int_num to 8 bits to undo sign-extension from `push imm8` for
     // vectors >= 0x80. `syscall_entry_64` pushes 256 (out of IDT range) as a
@@ -398,7 +398,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     let raw_int_num = if raw_int_num == 256 { 256 } else { raw_int_num & 0xFF };
 
     if !vm86 && (raw_cs & 3) == 0 {  // from ring 0?
-        handle_ring0(raw_int_num, raw_err_code);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss
+        handle_ring0(raw_int_num, raw_err_code, raw_cs, raw_eip);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss
         return from_64;
     }
 
@@ -858,7 +858,7 @@ fn demand_page_kernel(fault_addr: usize) {
 /// Ring-0 interrupt handler. No frame conversion, no canonicalization.
 /// Called before from_32/to_32 since 32-bit same-privilege interrupts
 /// don't push ESP/SS.
-fn handle_ring0(int_num: u64, error: u64) {
+fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
     match int_num {
         14 => {
             if try_handle_page_fault(error, false).is_none() {
@@ -870,7 +870,7 @@ fn handle_ring0(int_num: u64, error: u64) {
             regs.int_num = int_num;
             handle_irq(&mut regs);
         }
-        _ => panic!("Unhandled exception in arch: int={:#x} err={:#x}", int_num, error),
+        _ => panic!("Unhandled exception in arch: int={:#x} err={:#x} at {:#06x}:{:#010x}", int_num, error, cs, eip),
     }
 }
 

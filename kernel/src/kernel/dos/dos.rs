@@ -859,7 +859,15 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x25 => {
             let int_num = regs.rax as u8;
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
-                dos.pm_vectors[int_num as usize] = (regs.ds as u16, regs.rdx as u32);
+                // 16-bit DPMI clients pass a 16-bit handler offset in DX; the
+                // high EDX bits are undefined. Storing the full EDX captures
+                // stale garbage that later makes the default-stub check in
+                // deliver_pm_irq fail, delivering a HW IRQ to VECTOR_STUB:garbage
+                // → #GP on the VME 32-bit iret (Jazz Jackrabbit / Borland RTM,
+                // which chain the default vector back via AH=35→AH=25).
+                let use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+                let off = if use32 { regs.rdx as u32 } else { regs.rdx as u16 as u32 };
+                dos.pm_vectors[int_num as usize] = (regs.ds as u16, off);
                 return thread::KernelAction::Done;
             }
             let (seg, off) = (regs.ds as u16, regs.rdx as u16);
