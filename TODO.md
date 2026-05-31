@@ -87,9 +87,38 @@
 ## Indiana Jones and the last crusade
 - [ ] Division by 0 error on startup
 
-## Jazz Jackrabbit
-- [ ] Get it working — its bundled DPMI host rejects us. Jazz ships with
-      its own extender (Borland RTM), and that host.
+## Borland RTM extender (Jazz Jackrabbit + Borland Pascal 7)
+Shared root cause: both ship Borland's **RTM.EXE** ("Run-Time Manager", RTM
+loader v1.1, 1990-93) as their DPMI loader, and RTM fails on us. This is
+distinct from the Borland C++ path, which uses **DPMILOAD.EXE** (the thin
+DPMI16BI bootstrap) — DPMILOAD detects our host via INT 2F AX=1687 and makes
+the app a direct DPMI client, so BC reaches its IDE. RTM instead layers its
+own protected-mode image loader + exception management on top of our host,
+and that extra layer breaks. Fixing RTM should unblock both titles.
+- [ ] **Borland Pascal (`bp.exe`)** — RTM enters DPMI fine (allocates ~45 LDT
+      selectors, a 64MB `0501` block, sets exception handlers 6/B/C/D, hooks
+      INT 21/2F/31, TSRs resident OK). Then `bp.exe` drives RTM to load the PM
+      IDE image and RTM's loader bails: `Loader error (0010): internal error`
+      right after a raw PM→RM switch into RTM at `030F:0527` (a set-PSP AH=50
+      with BX=selector precedes it). RTM cleanly unwinds and exits code 0.
+      Error 0x10 is internal to RTM: there are NO DOS/DPMI calls between the
+      raw PM→RM into the loader and the error print — RTM validates some state
+      we set up earlier (selector base/limit, PSP selector, or the loaded PM
+      image) and rejects it. RTM assembles the message from pieces ("Internal
+      error" + "(%04X): ") in its PM runtime; no numeric→cause table, so
+      decoding 0x10 statically needs disassembling a mixed 16/32-bit extender.
+      Prime suspects from the trace: the AH=51 get-PSP returning a freshly
+      alloc'd selector (per-segment PSP selector cache) + the set-base/limit
+      INT 31 calls on that PSP selector (0177) right before the loader entry —
+      cf. the `jazz-psp-env-gate` branch name. Next: single-step the RTM
+      loader (arm PM_STEP on the raw PM→RM into it) to catch the failing check.
+- [ ] **Jazz Jackrabbit** — IDENTICAL failure to BP (earlier "fails earlier"
+      note was WRONG): same `EXCEPTION 11` (#NP, dec 11 = 0x0B) on selector
+      ~0x16F dispatched to RTM's handler, then the same `Loader error (0010)`
+      after the raw PM→RM into RTM's loader (seg `0571:0527` here vs `030F` for
+      BP — differs only by load address). Fixing one fixes both. Jazz also
+      needs the DMA/GUS work (see `jazz-psp-env-gate` worktree) for audio, but
+      that's post-load; the loader error blocks it first.
 
 ## Epic Pinball
 - [ ] Menu is way too fast, arrow keypresses often result in 2/3 steps
