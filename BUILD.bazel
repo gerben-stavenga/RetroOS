@@ -29,11 +29,6 @@ _BUSYBOX_APPLETS = [
 # C:\TP70\... in the image on the next build — no per-file wiring.
 _TC_SRCS = glob(["apps-boot/tc/**/*"], allow_empty = True)
 _TP70_SRCS = glob(["apps/TP70/**/*"], allow_empty = True)
-# Wolfenstein 3D source (id Software, GPL). Ships at C:\PROJECT\WOLFSRC — the
-# path WOLF3D.DSK (Borland desktop) and the .PRJ reference, so the BC IDE opens
-# it and `GO.BAT`/BCC build it on the proprietary image. Source-only (no
-# OBJ/EXE/SYM/MAP).
-_WOLFSRC_SRCS = glob(["project/wolfsrc/**/*"], allow_empty = True)
 
 pkg_tar(
     name = "tc_tar",
@@ -43,11 +38,6 @@ pkg_tar(
 pkg_tar(
     name = "tp70_tar",
     files = {":" + s: "TP70/" + s[len("apps/TP70/"):].upper() for s in _TP70_SRCS},
-)
-
-pkg_tar(
-    name = "wolfsrc_tar",
-    files = {":" + s: "PROJECT/WOLFSRC/" + s[len("project/wolfsrc/"):].upper() for s in _WOLFSRC_SRCS},
 )
 
 # Compute MD5 of kernel ELF
@@ -174,7 +164,6 @@ pkg_tar(
     deps = [
         "//apps/games:tar",
         ":tp70_tar",
-        ":wolfsrc_tar",
         "//apps-proprietary:tar",
     ],
 )
