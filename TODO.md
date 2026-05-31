@@ -212,6 +212,13 @@ thus not related to RetroOS but due to inaccurate QEMU emulation.
     something wrong with odd/even addressing, causing the checkmarks to
     by located at wrong position and attribute bytes to garble part of
     screen.
+  * Jazz Jackrabbit gameplay is garbled (old sprite/scroll positions not
+    erased) on QEMU 8.2.2. Jazz uses an undocumented odd/even mode applied to
+    256-color graphics (tweaked Mode X w/ double-buffer + VRAM wraparound).
+    QEMU's maintainer fixed odd/even + VRAM-wraparound handling (patch
+    2023-12-31, postdates the 8.2 branch) → expected fixed on QEMU ≥9.0.
+    RetroOS is not in the pixel path (VGA passthrough); see the Jazz entry
+    above. Bochs renders it but is too slow at realtime sync to finish loading.
 - No hsync/vsync emulation in vga port 3da.
   * Wolf3d hangs
   * Epic pinball, supaplex and other games unplayable fast 
