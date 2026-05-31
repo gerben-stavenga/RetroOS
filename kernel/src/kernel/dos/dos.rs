@@ -2549,11 +2549,16 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let parent_blocks = dos.dos_blocks.clone();
     let parent_dta = dos.dta;
 
-    // Reset the chain to start at parent.heap_seg (= first paragraph past
-    // parent's owned blocks). load_exe / load_com will dos_alloc_block the
-    // child's env + program block from there, exactly like a fresh
-    // fork+exec.
-    super::dos_reset_blocks(dos, parent_heap);
+    // Do NOT reset the MCB chain. Real DOS keeps a single chain across EXEC:
+    // the parent's blocks stay allocated while the child runs, and the child's
+    // env+program are first-fit `dos_alloc_block`'d into genuinely-free regions
+    // (load_exe sizes a max-alloc child from `largest_dos_block`, not
+    // 0xA000-heap_base). This is load-bearing: a 16-bit DPMI parent (Borland
+    // C) keeps a live PM CS aliased onto a conventional block that can sit
+    // ABOVE a free gap (so `heap_seg`'s contiguous-run value is below it).
+    // Resetting + flooring the child at `heap_seg` let the child overwrite that
+    // block — corrupting BC's code (the 0x20cc #GP cascade after TLINK exits).
+    // exec_return restores `parent_blocks`, dropping whatever the child added.
 
     let loaded = if is_exe {
         match load_exe(dos, &parent, &buf, &abs_dos[..abs_len]) {
@@ -3629,18 +3634,23 @@ pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
     }
 
     let load_paras = ((load_size as u32 + 15) / 16) as u16;
-    // Real DOS gives the program min(e_maxalloc, available_conv_mem) extra
-    // paragraphs above the load module. Programs with e_maxalloc=0xFFFF
-    // (Watcom, BC, most Turbo) expect to receive ALL conventional memory
-    // and then `AH=4A` it back down — DOS/4G stubs in particular base
-    // their PSP-grow target on this initial size. Reserve 1 paragraph for
-    // the env-block MCB and `ENV_PARAS` for env data + 1 for program-block
-    // MCB + 0x10 for PSP, then the rest is load module + extra.
-    let overhead = 1u32 + (ENV_PARAS as u32) + 1 + 0x10 + load_paras as u32;
-    let max_avail_paras = 0xA000u32.saturating_sub(dos.heap_base_seg as u32 + overhead);
-    let extra = (max_avail_paras.min(max_extra).max(min_extra)) as u16;
-    let prog_paras = 0x10u16.saturating_add(load_paras).saturating_add(extra);
-    let (env_seg, psp_seg, end_seg) = alloc_program_blocks(dos, prog_paras).ok()?;
+    // Real DOS gives the program min(e_maxalloc, available) extra paragraphs
+    // above the load module. Programs with e_maxalloc=0xFFFF (Watcom, BC, most
+    // Turbo) expect ALL available conventional memory and then `AH=4A` it back
+    // down. "Available" is the largest FREE region in the live MCB chain — NOT
+    // 0xA000-heap_base — because EXEC no longer resets the chain, so the parent
+    // (and prior siblings) keep their blocks. Allocate the env block first,
+    // then size the program to the largest remaining free region so it lands
+    // in one contiguous block that never overlaps a still-live parent (e.g.
+    // BC's PM CS alias). exec_return drops these blocks when the child exits.
+    let env_seg = dos_alloc_block(dos, ENV_PARAS).ok()?;
+    let avail = super::largest_dos_block(dos);
+    let base_paras = 0x10u16.saturating_add(load_paras);
+    let floor = base_paras.saturating_add(min_extra as u16);
+    if avail < floor { return None; }
+    let prog_paras = base_paras.saturating_add(max_extra as u16).min(avail).max(floor);
+    let psp_seg = dos_alloc_block(dos, prog_paras).ok()?;
+    let end_seg = psp_seg.wrapping_add(prog_paras);
     populate_program(dos, env_seg, psp_seg, parent, prog_name);
 
     // Load module starts 0x10 paragraphs after the PSP.

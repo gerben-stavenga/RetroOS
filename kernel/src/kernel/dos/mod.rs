@@ -914,8 +914,8 @@ fn sync_heap_seg(dos: &mut DosState) {
 }
 
 /// Largest free *data* paragraphs across all gaps + trailing region.
-/// Each gap loses 1 paragraph to MCB overhead.
-#[allow(dead_code)]
+/// Each gap loses 1 paragraph to MCB overhead. Used by `load_exe` to size a
+/// max-alloc child against the live (non-reset) MCB chain.
 fn largest_dos_block(dos: &DosState) -> u16 {
     let mut largest_data = 0u16;
     let mut cur = dos.heap_base_seg;
