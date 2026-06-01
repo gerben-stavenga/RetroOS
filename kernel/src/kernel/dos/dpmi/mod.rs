@@ -127,6 +127,16 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
         );
     }
 
+    // Route PM INT 33h (mouse) to the kernel's direct-service handler for
+    // every DPMI client (16- and 32-bit). Servicing it in PM is what lets the
+    // kernel-modeled mouse driver record a PM-installed AX=0Ch handler as a
+    // selector (`cb_is_pm`) and call it back in PM — the symmetric twin of the
+    // INT 21 PMDOS routing above. A client may still override pm_vectors[0x33].
+    dos.pm_vectors[0x33] = (
+        super::mode_transitions::SPECIAL_STUB_SEL,
+        dos::STUB_BASE + dos::slot_offset(dos::SLOT_PMDOS_INT33) as u32,
+    );
+
     // No arch_load_ldt here: `dos.ldt` is a fixed per-thread buffer allocated
     // at thread init, and the context switch into this thread already pointed
     // LDTR at it. Mutations to `dos.ldt[CLIENT_CS/DS/SS]` are visible to the

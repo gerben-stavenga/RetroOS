@@ -105,7 +105,7 @@ use dos::{
     SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_EXCEPTION_RET_V10, SLOT_PM_TO_REAL,
-    SLOT_PMDOS_INT21,
+    SLOT_PMDOS_INT21, SLOT_PMDOS_INT33, SLOT_MOUSE_CB_RET,
     slot_offset,
     host_stack_base, host_stack_size, host_stack_empty_sp,
     rm_stack_base, rm_stack_size, rm_stack_seg, rm_stack_align_offset,

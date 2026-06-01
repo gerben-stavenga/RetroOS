@@ -146,11 +146,17 @@ pub struct MouseState {
     /// cell. `None` means no cursor is currently drawn.
     pub drawn_at: Option<u16>,
     pub saved_attr: u8,
-    /// AX=0Ch event handler. CX=mask, ES:DX=handler far address. `mask=0`
-    /// means no handler installed.
+    /// AX=0Ch event handler. CX=mask, ES:(E)DX=handler far address. `mask=0`
+    /// means no handler installed. `cb_off` is 32-bit: a 16-bit client's DX
+    /// occupies the low half; a 32-bit PM client passes the full EDX.
     pub cb_mask: u16,
     pub cb_seg: u16,
-    pub cb_off: u16,
+    pub cb_off: u32,
+    /// True when the AX=0Ch handler was installed by a protected-mode (DPMI)
+    /// client: `ES:DX` is a selector:offset, so the callback must be delivered
+    /// in PM, not via a VM86 far-call. The symmetric twin of `pmdos_int21`'s
+    /// selector handling for INT 21h. See `deliver_mouse_callback`.
+    pub cb_is_pm: bool,
     /// Pending event-condition bits since last delivery. `raise_pending`
     /// dispatches when `cb_mask & pending_cond != 0`, and
     /// `deliver_mouse_callback` clears the field as it sets up the AX=0Ch
@@ -182,7 +188,7 @@ impl MouseState {
                min_x: 0, max_x: 639, min_y: 0, max_y: 199,
                accum_dx: 0, accum_dy: 0,
                show_count: 1, drawn_at: None, saved_attr: 0,
-               cb_mask: 0, cb_seg: 0, cb_off: 0,
+               cb_mask: 0, cb_seg: 0, cb_off: 0, cb_is_pm: false,
                pending_cond: 0, last_dx: 0, last_dy: 0,
                cb_in_flight: false,
                saved_rax: 0, saved_rbx: 0, saved_rcx: 0,

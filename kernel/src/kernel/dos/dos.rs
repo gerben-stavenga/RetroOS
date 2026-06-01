@@ -400,6 +400,22 @@ pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut threa
     thread::KernelAction::Done
 }
 
+/// PMDOS INT 33h short-circuit. A PM client issued `int 33h`; `pm_vectors[0x33]`
+/// routed it here (`SPECIAL_STUB_SEL:STUB_BASE + SLOT_PMDOS_INT33*2`) so the
+/// mouse driver runs in PM with the client's PM regs — no RM reflection. This
+/// is what makes `regs.mode() == PM` true inside `int_33h` (AX=0Ch records the
+/// handler as a PM selector) and `ES:DX` a genuine selector:offset. The mouse
+/// subfunctions only touch 16-bit register halves and absolute VGA memory, so
+/// no DS:DX buffer translation is needed. On exit `finish_dos_call` does the
+/// mode-aware iret-frame pop.
+pub(super) fn pmdos_int33_handler(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+    let _ = int_33h(dos, regs);
+    if dos.pending_resume.is_none() {
+        finish_dos_call(dos, regs);
+    }
+    thread::KernelAction::Done
+}
+
 /// Resume the user after a kernel-serviced DOS call. Mode-aware: the call
 /// might have flipped mode (AH=4B EXEC sets up a VM86 child, AH=4C/31
 /// restores parent which may be VM86 or PM), so check `regs.mode()`
@@ -2287,6 +2303,10 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
     let ax = regs.rax as u16;
     dos_trace!("D33 AX={:04X} BX={:04X} CX={:04X} DX={:04X} ES={:04X}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16, regs.es as u16);
+    // Computed before borrowing `m`: a PM install (AX=0Ch) records the handler
+    // as a selector and, for a 32-bit client, keeps the full EDX offset.
+    let cb_is_pm = regs.mode() != crate::UserMode::VM86;
+    let client_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
     let m = &mut dos.pc.mouse;
     match ax {
         // AX=0000h — reset / installation check.
@@ -2350,7 +2370,11 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
         0x000C => {
             m.cb_mask = regs.rcx as u16;
             m.cb_seg  = regs.es as u16;
-            m.cb_off  = regs.rdx as u16;
+            // 32-bit PM client → full EDX offset; otherwise the 16-bit DX.
+            m.cb_off  = if cb_is_pm && client_use32 { regs.rdx as u32 } else { regs.rdx as u16 as u32 };
+            // A DPMI client installs ES:(E)DX as a selector:offset and expects
+            // the callback in PM; a real-mode client installs a paragraph.
+            m.cb_is_pm = cb_is_pm;
             m.pending_cond = 0;
         }
         _ => {
@@ -2368,9 +2392,21 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 /// the standard `resume_continuation_from_stub`.
 pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Regs) {
     use super::machine::vm86_push;
+    use super::mode_transitions;
 
-    let rm_dest = super::mode_transitions::rm_get_stack(dos);
-    super::mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, None);
+    let cb_is_pm = dos.pc.mouse.cb_is_pm;
+
+    if cb_is_pm {
+        // PM client (DPMI): the handler is `selector:offset` and must run in
+        // protected mode. Mirror the IRQ PM-entry path (switch to the PM side
+        // via a HostContinuation), but return via FAR RET — MS-Mouse handlers
+        // end with RETF, not IRET — to the SLOT_MOUSE_CB_RET trampoline.
+        mode_transitions::push_continuation_and_switch_to_pm_side(dos, regs, None);
+    } else {
+        // Real-mode client: ES:DX is a paragraph; far-call it on the RM stack.
+        let rm_dest = mode_transitions::rm_get_stack(dos);
+        mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, None);
+    }
 
     let m = &mut dos.pc.mouse;
     // Bracket-save the user GP regs we're about to clobber.
@@ -2391,10 +2427,19 @@ pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Regs
     let cb_off = m.cb_off;
     m.pending_cond = 0;
 
-    // Push retf frame: handler RETFs to SLOT_MOUSE_CB_RET which
-    // restores the saved GP regs and then unwinds the callback.
-    vm86_push(regs, STUB_SEG);
-    vm86_push(regs, slot_offset(SLOT_MOUSE_CB_RET));
+    // Push a FAR-return frame: the handler RETFs to SLOT_MOUSE_CB_RET, which
+    // restores the saved GP regs and then unwinds the callback. PM and RM
+    // differ only in the stub segment width and the frame writer.
+    if cb_is_pm {
+        let handler_use32 = mode_transitions::seg_is_32(&dos.ldt[..], cb_seg);
+        // SPECIAL_STUB_SEL has base=0, so the offset is the full linear
+        // address of the `CD 31` byte (cf. deliver_pm_irq's SLOT_RESUME_CONTINUATION).
+        mode_transitions::push_farret_frame(&dos.ldt[..], regs, handler_use32,
+            STUB_BASE + slot_offset(SLOT_MOUSE_CB_RET) as u32, mode_transitions::SPECIAL_STUB_SEL);
+    } else {
+        vm86_push(regs, STUB_SEG);
+        vm86_push(regs, slot_offset(SLOT_MOUSE_CB_RET));
+    }
 
     // Load AX=0Ch convention.
     regs.rax = (regs.rax & !0xFFFF) | cond as u64;
@@ -2404,24 +2449,44 @@ pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Regs
     regs.rsi = (regs.rsi & !0xFFFF) | dx as u64;
     regs.rdi = (regs.rdi & !0xFFFF) | dy as u64;
 
-    super::machine::set_vm86_cs(regs, cb_seg);
-    super::machine::set_vm86_ip(regs, cb_off);
+    if cb_is_pm {
+        regs.frame.cs = cb_seg as u64;
+        regs.set_ip32(cb_off);
+        // Spec doesn't promise the data segments to the handler (a real
+        // mouse handler reloads DS itself); null them so a stale RM segment
+        // value can't #GP at the handler's IRET/seg use. Matches the PM-entry
+        // convention in `deliver_pm_irq` / `callback_entry`.
+        regs.ds = 0;
+        regs.es = 0;
+        regs.fs = 0;
+        regs.gs = 0;
+    } else {
+        super::machine::set_vm86_cs(regs, cb_seg);
+        super::machine::set_vm86_ip(regs, cb_off as u16);
+    }
 
     dos.pc.mouse.cb_in_flight = true;
 
-    dos_trace!("[MOUSE] CB enter cond={:04X} buttons={:02X} x={} y={} dx={} dy={} -> {:04X}:{:04X}",
-        cond, buttons, x as i16, y as i16, dx as i16, dy as i16, cb_seg, cb_off);
+    dos_trace!("[MOUSE] CB enter cond={:04X} buttons={:02X} x={} y={} dx={} dy={} -> {:04X}:{:08X}{}",
+        cond, buttons, x as i16, y as i16, dx as i16, dy as i16, cb_seg, cb_off,
+        if cb_is_pm { " (PM)" } else { "" });
 }
 
 /// SLOT_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
 /// Restore the GP regs `deliver_mouse_callback` clobbered, then unwind via
 /// the same `resume_continuation_from_stub` that SLOT_RESUME_CONTINUATION uses.
-fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
+pub(super) fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
     use super::machine::vm86_pop;
-    // Discard the CD 31 trap iret-frame.
-    let _ = vm86_pop(regs);
-    let _ = vm86_pop(regs);
-    let _ = vm86_pop(regs);
+    if !dos.pc.mouse.cb_is_pm {
+        // VM86: the stub's `CD 31` (INT 31h, IOPL=3) pushed FLAGS/CS/IP onto
+        // the RM stack the handler ran on. Discard that trap iret-frame.
+        let _ = vm86_pop(regs);
+        let _ = vm86_pop(regs);
+        let _ = vm86_pop(regs);
+    }
+    // PM: the stub's `CD 31` trapped via a CPL3→ring1 transition, so the CPU
+    // pushed the iret-frame on the kernel stack, not the client PM stack. The
+    // client SS:SP is already at the HostContinuation level — nothing to pop.
 
     let m = &mut dos.pc.mouse;
     regs.rax = m.saved_rax;
@@ -3421,6 +3486,13 @@ pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// LDT base lookup — so high-memory PM-block buffers (the case Borland's
 /// `dpmiload` hits) are addressed correctly without bounce buffering.
 pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
+/// PM INT 33h (mouse) direct-service slot. `dpmi_enter` points
+/// `pm_vectors[0x33]` here for every DPMI client so a PM `int 33h` is
+/// serviced in protected mode with PM regs intact, rather than reflected to
+/// real mode. This is what lets `int_33h` see `regs.mode() == PM` (so AX=0Ch
+/// records `cb_is_pm`) and read `ES:DX` as a real selector:offset. The RM-side
+/// INT 33h still routes through STUB_SEG slot 0x33 (the IVT redirect).
+pub(crate) const SLOT_PMDOS_INT33: u8 = 0xFA;
 /// Single continuation return target. Reflected INTs, explicit DPMI RM calls,
 /// PM callback returns, and PM IRQ unwind all land here after their far return
 /// or IRET. `mode_transitions::resume_continuation_from_stub` pops the captured

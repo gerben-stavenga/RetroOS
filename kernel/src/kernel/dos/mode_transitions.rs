@@ -722,6 +722,43 @@ pub(super) fn push_iret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
     regs.set_sp32(sp);
 }
 
+/// Push a FAR-return frame (`CS:(E)IP`, no flags) on the stack addressed by
+/// `regs.ss:regs.sp`, updating regs.sp. Width follows the *handler's* bitness
+/// — 8 bytes for a 32-bit handler, 4 bytes for 16-bit — because the handler's
+/// `RETF` is what pops it. Used for MS-Mouse INT 33h AX=0Ch PM callbacks,
+/// which the driver enters with a FAR CALL and the handler ends with FAR RET
+/// (unlike HW IRQ / DPMI callbacks, which IRET — see `push_iret_frame`).
+pub(super) fn push_farret_frame(ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
+                   eip: u32, cs: u16) {
+    let ss = regs.frame.ss as u16;
+    let base = seg_base(ldt, ss);
+    let stack_is_32 = seg_is_32(ldt, ss);
+    let frame_size: u32 = if handler_is_32 { 8 } else { 4 };
+    let sp_in = regs.sp32();
+    let sp = if stack_is_32 {
+        sp_in.wrapping_sub(frame_size)
+    } else {
+        let new_sp16 = (sp_in as u16).wrapping_sub(frame_size as u16);
+        (sp_in & !0xFFFF) | new_sp16 as u32
+    };
+    let eff_sp = if stack_is_32 { sp } else { sp & 0xFFFF };
+    let addr = base.wrapping_add(eff_sp);
+    if handler_is_32 {
+        unsafe {
+            let p = addr as *mut u32;
+            core::ptr::write_unaligned(p, eip);
+            core::ptr::write_unaligned(p.add(1), cs as u32);
+        }
+    } else {
+        unsafe {
+            let p = addr as *mut u16;
+            core::ptr::write_unaligned(p, eip as u16);
+            core::ptr::write_unaligned(p.add(1), cs);
+        }
+    }
+    regs.set_sp32(sp);
+}
+
 /// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp.
 /// `handler_is_32` must match the width used at push time. Frame width
 /// follows handler.D; SP semantics follow SS.B (see `push_iret_frame`).

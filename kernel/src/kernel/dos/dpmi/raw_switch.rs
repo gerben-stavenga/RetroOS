@@ -53,6 +53,9 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
         dos::SLOT_PMDOS_INT21 => {
             return super::super::dos::pmdos_int21_handler(kt, dos, regs);
         }
+        dos::SLOT_PMDOS_INT33 => {
+            return super::super::dos::pmdos_int33_handler(dos, regs);
+        }
         dos::SLOT_EXCEPTION_RET => {
             return exception_return(dos, regs, ExcReturnVia::V09);
         }
@@ -64,6 +67,12 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
         }
         dos::SLOT_RESUME_CONTINUATION => {
             mode_transitions::resume_continuation_from_stub(dos, regs);
+            return thread::KernelAction::Done;
+        }
+        dos::SLOT_MOUSE_CB_RET => {
+            // PM INT 33h AX=0Ch handler FAR-RETurned into this trampoline.
+            // Restore the bracket-saved GP regs and unwind the callback.
+            super::super::dos::mouse_callback_return(dos, regs);
             return thread::KernelAction::Done;
         }
         dos::SLOT_SAVE_RESTORE => {
