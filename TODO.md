@@ -17,55 +17,68 @@
       path, not Hexen-specific.
 
 ## Prince of Persia
-- [x] Fixed (45b9bc5): the virtual 8042 surfaced a coalesced make+release in
-      a single INT 9 (the event loop drains host IRQs in batches). PoP's INT 9
-      handler applies only the first scancode and discards the rest, so it
-      recorded "key down", threw the release away, and the prince kept running.
-      Fix models the 8042 refill delay so each scancode arrives in its own
-      IRQ1, the way real hardware delivers make and release.
 - [ ] **End-of-level door hangs, repeating.** When the prince reaches the exit
       door, the game wedges with the door animation/sound looping. Failure mode
       TBD — capture a trace at the level-exit transition (likely a wait loop on
       a timer/IRQ or sound-DMA completion that never fires).
 
-## Offroad
-- [ ] Doesn't work — failure mode TBD (capture trace)
+## Ironman Off-Road Racing (Offroad)
+- [ ] **Freezes / grinds to a halt — timer ISR's 0x3DA vblank loop never
+      completes.** Root-caused (not yet fixed). The game installs an INT 8
+      (timer) ISR at `067D:0A44` that re-tunes the PIT *phase-locked to vblank*
+      by splitting the divisor write across a vblank edge, then JMP-FARs to the
+      old handler:
+      ```
+        OUT 43h,36h
+        MOV AX,[06BA]          ; new PIT divisor
+        OUT 40h,AL             ; low byte only
+        wait 0x3DA bit0 == 0   ; (out of blank)
+        MOV CX,[06B8]          ; <-- the "reads-per-vblank" calibration count
+      .lp:
+        IN  AL,0x3DA           ; individual reads
+        TEST AL,1
+        LOOPNE .lp             ; count CX *sustained* bit0=1 reads
+        JZ  restart            ; CX exhausted w/o vblank → retry
+        OUT 40h,AL             ; high byte, now phase-locked to vblank
+        ADD [06C1],1
+        JMP FAR [06BD]
+      ```
+- [ ] **Why it hangs (solid):** the loop needs `CX = [06B8]` *consecutive*
+      `bit0=1` reads to accept a vblank. Our synthetic 0x3DA (`synth_status1`,
+      raster off `hr_cycles`) sustains bit0=1 for only ~565 consecutive
+      *individual* `IN` reads, but `[06B8]` is **48963**. 48963 ≫ 565 → `LOOPNE`
+      never falls through → ISR never returns → `[06C1]` (the game's frame
+      counter) freezes → grind to a halt.
+- [ ] **`[06B8]` is runtime-derived, not a shipped constant.** A gdb watchpoint
+      on `[06B8]` (lin `0x8288`) caught its first write `0 → 48963` from
+      F-segment block-I/O (`REP INSD`). 48963 reads/vblank implies a ~200+ MHz
+      `IN`/`TEST`/`LOOPNE` throughput — impossible for the game's 1990 target, so
+      the game *calibrated this count against our (fast) emulated read rate* and
+      stored it. (Exact calibration instruction not pinned down — gdb's
+      real-mode watchpoint disassembly kept erroring; the magnitude alone proves
+      runtime derivation.)
+- [ ] **The fundamental tension.** The whole 0x3DA scheme assumes
+      reads-per-second is a fixed constant (one CPU speed): the game calibrates
+      the count in one path and consumes it in the ISR via individual `IN`.
+      Under a *trapping* emulator the per-read cost isn't constant — in
+      particular a block `REP INS` (a strong candidate for the calibration path)
+      and individual `IN` (the ISR) don't cost the same — so the calibrated
+      count is structurally unreachable by the ISR. A *time-based* 0x3DA can
+      never satisfy a read-count detector unless reads occur at the calibrated
+      rate.
+- [ ] **Fix options (undecided):**
+      1. *Cheap, uniform 0x3DA reads* (fast in-trap path, or don't trap 0x3DA
+         for the common read pattern) so reads track a near-constant rate and
+         calibration ≈ ISR. Principled but the biggest change.
+      2. *Read-count-based raster* (bit0 set for K reads, clear for M): fixes the
+         hang but makes game speed depend on emulated read throughput and drifts
+         against the time-based PIT. Earlier hblank/read-counter experiments were
+         this, and failed only because K didn't match the calibrated count.
+      3. Document as a known trap-based-VGA limitation and move on.
 
 ## Borland C IDE
-- [ ] **Mouse click crashes**. BC installs INT 33 AX=000C with a PM
-      handler address (ES:DX = PM selector:offset, e.g. `030F:00F3`).
-      Our `mouse_callback_invoke` does a VM86 `CALL FAR cb_seg:cb_off`,
-      treating the PM selector value as a real-mode paragraph → wild
-      jump → crash. **Fix sketch:** in `int_33h` AX=000C from PM,
-      allocate an internal DPMI callback wrapping the client's PM
-      handler. Reuse the existing `dpmi.callbacks[]` pool + a new
-      `MouseEvent` kind tag in `callback_entry` so MS-Mouse register
-      convention (`AX=cond, BX=buttons, CX=x, DX=y, SI=dx, DI=dy`) is
-      used instead of DPMI 0303's `DS:SI/ES:DI` setup. Likely shared
-      root cause with Settlers below.
 - [ ] **Goal: successful WOLFSRC compile from the BC IDE** (`bc`, project
       `WOLF3D.PRJ`, sources served over hostfs at `C:\PROJECT\WOLFSRC`).
-  - [x] Fixed: TASM printed its syntax screen instead of assembling. Root
-        cause was unhandled INT 21h AH=37h (get switch char) — the Borland/MS
-        C runtime then used `/` as the path separator, so the IDE handed TASM
-        `OBJ/H_LDIV.OBJ`, whose `/H` parses as the `/h` help switch. Added an
-        AH=37h handler returning `DL='/'` (DOS 5+ semantics). H_LDIV.ASM now
-        assembles cleanly (`Error messages: None`). See
-        `[[project_dos_switchar_pathsep]]`.
-  - [x] **TASM exit-hang FIXED** (by the 16-bit DPMI fixes on master —
-        `f020295`/`63b576c`). TASM previously wedged at `1B79:0DF9` after
-        assembling; now it assembles, finishes, and exits cleanly.
-  - [x] **"No model symbol" RESOLVED** — was NOT a bc PM-exec define-drop bug
-        (earlier misdiagnosis). Root: WOLF3D.DSK's project path was wrong, so
-        the IDE never loaded the project and RULES.ASI's model cascade fired.
-        Fixed by re-saving WOLF3D.DSK in DOSBox with the correct C:\PROJECT\
-        WOLFSRC path. C0.ASM now assembles `Error messages: None`.
-  - [x] **"Error writing object file" RESOLVED** — the IDE assembles to
-        `.\OBJ\*.OBJ` but our source-only import dropped the empty `OBJ\` dir
-        the id project ships. DFS `to_vfs_create` requires intermediate dirs to
-        exist, so AH=3Ch create of `obj\C0.OBJ` failed CF=1. Fixed by shipping
-        `apps-proprietary/project/wolfsrc/OBJ/` (KEEP.TXT placeholder). Verified
-        TASM assembles C0.ASM → obj\C0.OBJ clean.
   - [ ] **Blocked: 2nd TASM exec under bc crashes #UD.** Build order now: C0.ASM
         (TASM #1) assembles ✓, TASM2MSG ✓, then H_LDIV.ASM (TASM #2) → CPU
         exception 6 at `f4a4:0x206c` (vm86) — a wild far transfer into the
@@ -82,12 +95,39 @@
         2nd TASM EXEC; dump the locked-stack/mode-save chain + MCB list at
         child entry and diff vs the 1st (working) TASM exec.
 
-## Settlers
-- [ ] **Mouse crashes.** Probably same root cause as Borland C IDE above
-      (PM handler installed via INT 33 AX=000C, our mouse_callback_invoke
-      treats PM selector as RM paragraph). Re-test after the BC mouse
-      fix lands; if it still crashes, it's a different mouse-driver
-      convention requiring separate handling.
+## Settlers (DOS/4GW 32-bit)
+- [ ] **Mouse click → kernel #GP panic.** NOT the BC selector-as-paragraph bug
+      (that fix is correctly bypassed here). Settlers runs under **DOS/4GW 1.92**
+      as a 32-bit DPMI client and does its **own** PM↔RM mouse bridging:
+      - DOS/4GW hooks PM INT 33h (`015f:0xcc`) and, via `AX=0204`, captures the
+        prior PM vector = our `SLOT_PMDOS_INT33` host stub (`003f:06f4` =
+        `SPECIAL_STUB_SEL : STUB_BASE+0xFA*2`). For ordinary functions
+        (AX=000E/0002/…) it **chains to our handler** → serviced in PM, works.
+        (Confirms the `pm_vectors[0x33]` routing is load-bearing — keep it.)
+      - For **AX=000C** it intercepts and reflects to real mode via **DPMI
+        AX=0302** (call RM proc), passing its own **tiled** trampoline
+        `ES:DX = 0229:0000` (DOS/4GW uses 1:1 selector tiling: base = sel<<4,
+        so `0229` ↔ linear `0x2290`). So `int_33h` correctly sees VM86 →
+        `cb_is_pm=false`; DOS/4GW *wants* a real-mode callback.
+      - Failure: our RM far-call reaches `0229:0000` (trampoline runs), which
+        switches RM→PM and raises **`INT 60h`** (DOS/4GW's internal gateway) to
+        call the app's 32-bit handler. The panic is a kernel `#GP err=0x200` while
+        **delivering that PM `INT 60h`** — the IRET-to-user (`common_call+0x39`)
+        loads an invalid selector `0x200` on client `SS:ESP=002f:0x2094`. Trace:
+        `[MOUSE] CB enter -> 0229:0 → [DPMI] PM_INT vec=60 -> 015f:0x180 → PANIC`.
+      - **Root is a nested cross-mode transition during a mouse callback**
+        (PM client → our RM-callback excursion → DOS/4GW RM trampoline →
+        RM→PM → `INT 60h`), likely corrupting the locked-stack/`other_stack`
+        chain or leaking a garbage segment that the PM-INT-60 IRET then loads.
+      - Underlying hardening gap: a `#GP` from a bad client segment on the
+        IRET-to-user path should be re-attributed to the client (vector 0x0D →
+        DOS/4GW's installed exception handler), not panic the kernel as
+        "Unhandled exception in arch" (`traps.rs:873`).
+      - **Next:** arm PM single-step at `[MOUSE] CB enter`, trace the `0229:0000`
+        trampoline through its RM→PM→`INT 60h` sequence, find where `0x200`
+        enters and dump the locked-stack/mode-save chain at the `INT 60h`
+        delivery vs. a clean PM-INT delivery. Headless `-r` repro won't reach
+        a click; needs interactive + `DOS_TRACE_RT` (AH=02) on.
 
 ## Monkey Island 1, 2 — SCUMM
 - [ ] Hits `run-time error R6003 - integer divide by 0` (#DE) just after
@@ -108,66 +148,6 @@
 
 ## Indiana Jones and the last crusade
 - [ ] Division by 0 error on startup
-
-## Borland RTM extender (Jazz Jackrabbit + Borland Pascal 7)
-- [x] **FIXED** (branch `fix-rtm-loader`): both ship Borland's **RTM.EXE**
-      ("Run-Time Manager" loader v1.1) as their DPMI loader. RTM hooks INT 31h
-      and, for functions it doesn't handle itself, **tail-chains to the
-      previously-installed (host) vector** — which we report via `AX=0204` as
-      our per-vector default stub (`VECTOR_STUB_SEL:STUB_BASE+0x62`). The bug:
-      `vector_stub_reflect` reflected that chained INT 31h to **real mode**
-      (`F000:FF53`), silently dropping the DPMI call. RTM's loader chains
-      `set-descriptor-base/limit` (AX=0007/0008) on its PSP-alias selector
-      (`0177`) that way, so the selector stayed unset → RTM's loader rejected
-      it with `Loader error (0010): internal error` after the raw PM→RM into
-      its loader. Fix: `mode_transitions::vector_stub_reflect` now services
-      vector 0x31 via `dpmi::dpmi_api` (popping the stub's own IRET frame so
-      results return to the chain's original caller) instead of reflecting to
-      RM. Verified headless: **BP loads to its IDE** (idles on INT 16 keyboard
-      poll), **Jazz clears the loader and runs SETUP**, and the **BC IDE still
-      loads** (DPMILOAD path — no regression). The earlier "Jazz fails earlier"
-      note was wrong: BP and Jazz failed identically (same `EXCEPTION 11` #NP
-      on sel ~0x16F, same `Loader error (0010)`); one fix unblocked both.
-  - [x] **BP** IDE is interactive-ready (confirmed at the IDE).
-  - [x] **Jazz** now reaches its **title/menu** (branch `fix-vme-pm-vector`).
-        Getting there took three more fixes past the RTM loader:
-        (1) the fast-CPU **RTE 200** (Borland Pascal `CRT.Delay` divide
-        overflow) — patched out by running **TPPATCH** on `FILE0001.EXE`
-        (TPPATCH now shipped at `C:\TPPATCH`); (2) a **VME ring-0 `#GP`**
-        when a HW IRQ was delivered to the default PM stub — `pm_vectors`
-        offset carried stale high bits (`63b576c`); (3) the **menu.000
-        "not found"** — its INT 21h AH=3Dh open read an *empty* filename
-        because PM `linear()` used the full 32-bit `EDX` and 16-bit clients
-        leave the high half garbage, so the read went out of bounds. Fixed by
-        zeroing the high 16 bits of GP regs across PMDOS INT 21h for 16-bit
-        clients (`f020295`). Jazz now loads CONFIG/MENU/fonts/SOUNDCRD/music
-        and runs its main loop. Under QEMU it **runs but the screen is garbled
-        — old sprite/scroll positions aren't erased (Mode X trails)**; under
-        Bochs the screen stays **black** (it's still loading — see below).
-        Confirmed the garble is the **emulator's VGA, not us**:
-        VGA ports (0x3C0-0x3DF) + 0xA0000 are passthrough, and there were ZERO
-        `VgaState` saves during the whole gameplay run — RetroOS is never in the
-        pixel path while Jazz runs. Jazz uses unchained **Mode X** (planar +
-        latch blits + CRTC page-flips), which QEMU's std VGA renders imperfectly
-        — same bucket as the "QEMU related problems" below. Root-confirmed via
-        the OpenJazz HN thread (id=42831927): Jazz uses an undocumented
-        **odd/even mode applied to 256-color** (tweaked Mode X — 128K, fast
-        blit + double-buffer). QEMU's maintainer (bonzini) states in that thread
-        he **fixed VRAM-wraparound + odd/even handling in QEMU** ("I had to fix
-        in QEMU"), patch `lore.kernel.org/all/20231231093918.239549-4-pbonzini`
-        dated 2023-12-31. That postdates the QEMU 8.2.0 branch (2023-12-20), so
-        our 8.2.2 likely lacks it — but the exact release that carries the
-        commit is UNVERIFIED. **Next:** confirm which QEMU tag has the fix (or
-        just test QEMU ≥9.0) — expected to render correctly with no RetroOS
-        change. **Bochs is NOT hung** — Jazz keeps loading (LDT selector idx
-        climbs 22→194 over the run, 100+ #NP demand-loads), but Bochs's
-        realtime-paced interpreter crawls through the heavy segment
-        decompression, so the screen stays black for a long time and looks
-        hung. Run `BOCHS_SYNC=none ./run_bochs.sh …` (flat-out, no realtime
-        clock pacing) to let it finish loading. Then DMA/GUS for audio.
-      (Dev aid discovered: `run_qemu.sh -r 'PATH/PROG.EXE'` auto-runs a DOS
-       program headlessly via fw_cfg `opt/cmdline` then shuts down — ideal for
-       capturing load-time DPMI traces without driving DN.)
 
 ## Epic Pinball
 - [ ] Menu is way too fast, arrow keypresses often result in 2/3 steps
