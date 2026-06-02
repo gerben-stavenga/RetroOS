@@ -620,13 +620,22 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
     //                   Same path as toggle, plus the empty default.
     let in_pm = regs.mode() != crate::UserMode::VM86;
     let nested_on_pm = in_pm && dos.pc.locked_stack.other_stack.is_some();
-    if nested_on_pm {
+    // Track where push_continuation actually placed the HostContinuation, so
+    // the default-vector reflect below pops the SAME (possibly nested) slot
+    // instead of the fixed top-of-stack. A HW IRQ taken *inside* an active
+    // cross-mode excursion (e.g. the timer firing during a DPMI sim-INT 10h
+    // VESA call) pushes its HC one slot deeper; reading the fixed top slot
+    // grabbed the outer excursion's HC and leaked a VM86-context segment into
+    // the PM frame → #GP on the exit's `pop gs` (Quake/Doom under Bochs, where
+    // timing lands the tick mid-excursion).
+    let pushed_hc_at = if nested_on_pm {
         // Plant iret-frame at regs.SS:[SP-frame_size]; push_iret_frame
         // uses regs.frame.ss to look up the segment base, so this writes
         // to whatever stack the handler is currently on (DPMI 0.9 §3.1.2
         // permits handler SS != HOST_STACK_PM*).
         push_iret_frame(&dos.ldt[..], regs, handler_use32,
             regs.ip32(), regs.code_seg(), regs.flags32());
+        None
     } else {
         // First-entry from client OR toggle from rm: push_continuation_and_switch_to_pm_side
         // pushes HostContinuation, lands user on top of the save, captures pre-
@@ -634,7 +643,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         // PM client). Recipe layers an iret-to-SLOT_RESUME_CONTINUATION frame above
         // the save so the eventual handler IRET round-trips through
         // the kernel for unwind.
-        push_continuation_and_switch_to_pm_side(dos, regs, None);
+        let at = push_continuation_and_switch_to_pm_side(dos, regs, None);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
         push_iret_frame(&dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, regs.flags32());
@@ -652,7 +661,8 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         regs.es = 0;
         regs.fs = 0;
         regs.gs = 0;
-    }
+        Some(at)
+    };
 
     if default_vector {
         // PoP timer ISR at 0F11:B110 — `inc word [DS:0x2C]` against its own
@@ -664,8 +674,10 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         regs.frame.cs = stub_sel as u64;
         regs.frame.rip = stub_off as u64;
         let r = reflect_int_to_real_mode(dos, regs, vector);
-        let pm_save_at = (host_stack_pm_seg(dos),
-                          dos::host_stack_empty_sp() - HOST_CONTINUATION_SIZE);
+        // Use the actual pushed HC slot (nested-aware); fall back to the fixed
+        // top slot only on the nested_on_pm path, which pushes no continuation.
+        let pm_save_at = pushed_hc_at.unwrap_or((host_stack_pm_seg(dos),
+                          dos::host_stack_empty_sp() - HOST_CONTINUATION_SIZE));
         let hc1 = pop_continuation_at(&dos.ldt[..], pm_save_at);
         regs.ds = hc1.ds as u64;
         regs.es = hc1.es as u64;
@@ -675,6 +687,9 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Regs, vector
         return;
     }
 
+    // PM HW-IRQ handler entry: clear VM, IF (handlers enter with interrupts
+    // disabled — textbook INT semantics), and TF. IOPL is pinned to 1 for every
+    // ring-3 guest at the arch exit, so it needs no touch here.
     regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
     regs.frame.cs  = sel as u64;
     regs.frame.rip = off as u64;

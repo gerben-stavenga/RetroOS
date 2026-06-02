@@ -503,8 +503,35 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         if to_vm86 && x86::read_cr4() & x86::cr4::VME != 0 {
             if unsafe { VIF } { regs.frame.rflags |= 1 << 19; }
             else              { regs.frame.rflags &= !(1 << 19); }
+        } else {
+            // PM client (CR4.PVI is off) or software-VM86 (no VME): virtual
+            // IF/VIP live only in the statics saved just above; the hardware
+            // VIF/VIP bits (19/20) must be 0, or the CPU applies VME virtual-
+            // interrupt semantics to the client. Bochs does exactly that — a
+            // stale VIF=1 left riding through here made Doom/Jazz/Duke3D's
+            // freshly-installed timer ISR flip VIF on CLI/STI, desyncing from
+            // our bit-9 tracking so the dispatcher's EOI never landed and IRQ0
+            // wedged in-service. QEMU leaves these bits 0, so this is a no-op
+            // there. The next PM entry restores them to the frame from the
+            // statics, so no tracking is lost.
+            regs.frame.rflags &= !((1 << 19) | (1 << 20));
         }
         regs.frame.rflags |= 0x200;
+        // Pin IOPL=1 for every ring-3 guest. The whole system runs at IOPL=1:
+        // the ring-1 kernel does port I/O directly, while ring-3 guests (VM86
+        // and PM/DPMI) sit at CPL(3) > IOPL(1) so every IN/OUT is filtered
+        // through the TSS I/O bitmap — open ports (VGA regs, AdLib) pass
+        // straight through at full speed, closed ports (0x3DA, PIC, keyboard)
+        // trap into the raster emu / vPIC / vkbd. There is no reason for a
+        // client to run at IOPL=3: it gains nothing (the bitmap already grants
+        // the VGA ports) and loses everything (IOPL=3 bypasses the bitmap, so
+        // 0x3DA/0x20/0x60 go direct to the host — the Bochs keyboard/IRQ
+        // breakage). IOPL is a preserved flag the guest can't change, so the
+        // various cross-mode transitions that copy flags around can leak an
+        // IOPL=3 into a client's eflags; normalize it here — the one ring-3
+        // exit — rather than in each setter. (Where the 3 originates is still
+        // open; see TODO "DPMI client IOPL=3 leak".)
+        regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | (1 << 12);
     }
 
     // Denormalize back to the 32-bit push form if exiting to 32-bit/VM86.

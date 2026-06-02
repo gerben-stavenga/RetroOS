@@ -16,6 +16,29 @@
       so the IF=1→0-without-pairing path is somewhere on a common code
       path, not Hexen-specific.
 
+## Kernel — DPMI client IOPL=3 leak (backstopped, not root-fixed)
+- [ ] **Find where the PM client's IOPL gets set to 3 and stop it at the
+      source.** The system invariant is that *every* ring-3 guest runs at
+      IOPL=1 (ring-1 kernel does port I/O directly; ring-3 traps closed ports
+      through the TSS I/O bitmap into the raster emu / vPIC / vkbd). A PM/DPMI
+      client that runs at IOPL=3 bypasses the bitmap entirely — 0x3DA, `out
+      0x20`, `in 0x60` all go straight to the host — which broke the keyboard
+      and wedged IRQs under Bochs (QEMU happened to tolerate it). This is now
+      **backstopped** in the arch ring-3 exit (`traps.rs`, next to the IF/VIF
+      normalization): IOPL is pinned to 1 on every exit, since it's a preserved
+      flag the guest can't change anyway. That fixes the symptom, but the leak
+      source is still unidentified — IOPL=3 was observed first appearing at the
+      SPECIAL_STUB DPMI-entry stub (`003f:0x504`) on the VM86→PM return path.
+      Leading suspect: with VME, a VM86 `PUSHF`/`INT` reports IOPL=3 in the
+      pushed image regardless of the actual IOPL=1, and one of the cross-mode
+      transitions that copy flags around (`raw_switch_real_to_pm`,
+      `resume_continuation_from_stub`, `reflect_int_to_real_mode`) propagates
+      that virtualized IOPL=3 into the PM client's real eflags. Track down which
+      flag-copy is the culprit and mask IOPL there (or confirm the exit pin is
+      the right single canonical point and document it as such). Reproduce by
+      temporarily re-adding a `cs&3==3 && iopl!=1` panic in the event loop
+      before `do_arch_execute` and running any DPMI game under Bochs.
+
 ## Prince of Persia
 - [ ] **End-of-level door hangs, repeating.** When the prince reaches the exit
       door, the game wedges with the door animation/sound looping. Failure mode

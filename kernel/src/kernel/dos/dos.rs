@@ -3263,19 +3263,24 @@ struct LowMem {
     /// client bitness.
     host_stack: [u8; 4096],
 
-    /// Dedicated RM stack — 512 B host-provided buffer used by all
-    /// kernel-orchestrated RM execution (BIOS reflection from PM, DPMI
-    /// 0300/0301/0302 PM->RM calls, RM-side of callbacks). Sized to
-    /// DPMI 0.9 §3.1.3's "at least 200H bytes" minimum, which is what
-    /// real DPMI extenders allocate per session. Single per-thread
-    /// buffer reused across excursions; reentrance for nested
-    /// kernel-orchestrated RM use is achieved by snapshotting this
-    /// buffer onto the locked stack on the way in and copying back on
-    /// the way out — a 4 KB snapshot would dominate host_stack, so
-    /// keeping rm_stack small keeps the snapshot small. Paragraph-
-    /// aligned naturally because `host_stack` precedes it and is a
-    /// multiple of 16 in size.
-    rm_stack: [u8; 0x200],
+    /// Dedicated RM stack — host-provided buffer used by all kernel-
+    /// orchestrated RM execution (BIOS reflection from PM, DPMI
+    /// 0300/0301/0302 PM->RM calls, RM-side of callbacks). Reused per-thread
+    /// across excursions and shared LIFO via `other_stack` (no snapshot copy).
+    ///
+    /// MUST be large enough for a real-mode interrupt handler's full stack
+    /// frame. DPMI 0.9 §3.1.3's 200H is only the *client*-supplied minimum;
+    /// the *host*-provided stack for ss=0 sim-INT / BIOS calls must hold the
+    /// handler itself. At 200H it overflowed: the Bochs VGA BIOS's VESA
+    /// `INT 10h/4F00` handler ran a few bytes past the buffer, and because
+    /// `host_stack` (holding the live HostContinuation) sits immediately below
+    /// this buffer, the overflow clobbered the HC's segment slots → a garbage
+    /// paragraph got popped as a selector on the PM exit → kernel #GP, hanging
+    /// every DPMI app under Bochs (whose VGA BIOS is stack-hungrier than
+    /// QEMU's SeaBIOS). 4 KB matches what real DPMI extenders provide and
+    /// leaves ample headroom, incl. LIFO-nested excursions. Paragraph-aligned
+    /// because `host_stack` precedes it and is a multiple of 16 in size.
+    rm_stack: [u8; 0x1000],
 }
 
 /// Borrow the kernel-owned low-mem area as a typed `&'static mut`.
