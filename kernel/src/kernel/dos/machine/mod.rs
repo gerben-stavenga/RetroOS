@@ -351,9 +351,10 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
     // separate path (arch::inl/outl), not this emulator.
     let port = port & 0x3FF;
     match port {
-        // Synthetic VGA Input Status Register 1 — QEMU's 0x3DA isn't usable
-        // here (its bit 3 doesn't toggle in our setup, so a passthrough hangs
-        // Wolf3D's VL_WaitVBL), so bit 3 and bit 0 are fabricated:
+        // VGA Input Status Register 1. Under QEMU its 0x3DA bit 3 doesn't sweep
+        // a raster in our setup (passthrough hangs Wolf3D's VL_WaitVBL), so
+        // under QEMU *only* we fabricate bit 3 and bit 0; Bochs / real hardware
+        // pass through (see the is_qemu gate below). The fabricated values:
         //
         //  - bit 3 (vertical retrace) — 70 Hz frame phase (mode 13h refresh,
         //    14.286 ms / frame), asserted for 8/32 phase-steps ≈ 3.6 ms/frame.
@@ -370,11 +371,15 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // The real `inb(0x3DA)` is retained for its hardware side-effect:
         // resetting the VGA attribute-controller flip-flop.
         0x3DA => {
-            // Preserve the 0x3DA side effect: reset the attribute-controller flip-flop.
+            // Reading 0x3DA returns Input Status #1 AND resets the attribute-
+            // controller write flip-flop — mirror that side effect either way.
             let real = crate::arch::inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
-            let use_real_vga_retrace = false;
-            if use_real_vga_retrace {
+            // QEMU's 0x3DA bit 3 (vsync) doesn't sweep a raster in our setup, so
+            // a passthrough hangs Wolf3D's VL_WaitVBL — under QEMU we fabricate.
+            // Bochs and real hardware drive 0x3DA from a real raster, so use the
+            // genuine bits there (flip-flop already handled above).
+            if !crate::kernel::startup::is_qemu() {
                 return real;
             }
             let ticks = crate::arch::get_ticks();

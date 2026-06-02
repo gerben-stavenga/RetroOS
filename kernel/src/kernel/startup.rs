@@ -1129,11 +1129,34 @@ fn fw_cfg_read_bytes(buf: &mut [u8]) {
     for b in buf.iter_mut() { *b = crate::arch::inb(FW_CFG_DATA); }
 }
 
+// Cached host identity. QEMU exposes the fw_cfg "QEMU" signature; Bochs and
+// real hardware have no fw_cfg interface. 0 = not yet probed, 1 = not QEMU,
+// 2 = QEMU. Primed at boot by the `opt/cmdline` read below (it calls
+// fw_cfg_present), so the hot-path `is_qemu()` is a plain cached load.
+static HOST_QEMU: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 fn fw_cfg_present() -> bool {
     fw_cfg_select(FW_CFG_SIG);
     let mut sig = [0u8; 4];
     fw_cfg_read_bytes(&mut sig);
-    &sig == b"QEMU"
+    let qemu = &sig == b"QEMU";
+    HOST_QEMU.store(if qemu { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    qemu
+}
+
+/// True iff running under QEMU (vs Bochs / real hardware), detected once via
+/// the fw_cfg signature and cached. Cheap to call on hot paths.
+///
+/// Used to gate QEMU-specific emulation-bug workarounds — e.g. the synthetic
+/// 0x3DA vtrace in the DOS machine layer, which exists only because QEMU's
+/// 0x3DA doesn't sweep a raster; Bochs/real hardware drive it correctly and
+/// are passed through.
+pub fn is_qemu() -> bool {
+    match HOST_QEMU.load(core::sync::atomic::Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => fw_cfg_present(), // not yet probed (no cmdline read ran): probe + cache now
+    }
 }
 
 fn fw_cfg_read<'a>(name: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
