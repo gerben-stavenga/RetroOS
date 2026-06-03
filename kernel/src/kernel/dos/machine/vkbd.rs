@@ -214,8 +214,22 @@ impl VirtualKeyboard {
     }
 }
 
-/// Strip PS/2 E0 prefix — DOS games expect XT-style scancodes.
-/// E0 is consumed; the following scancode passes through as its legacy equivalent.
+/// Normalize an MF2/AT scancode before it reaches the guest BIOS and any
+/// INT-9-hooking game. Two transforms, both required:
+///
+///  - **Strip the E0 prefix.** Old DOS games hook INT 9 and read port 0x60
+///    raw, expecting XT-style scancodes (no E0); the grey navigation keys
+///    then collapse onto their numpad twins (Up → 0x48 == numpad-8, etc.).
+///  - **Drop the MF2 "fake shift" codes** — E0 2A/AA (LShift), E0 36/B6
+///    (RShift) — that a real keyboard brackets the grey keys with. With the
+///    E0 stripped they would otherwise land as a *real* Shift and corrupt the
+///    shift state (the original cause of arrows doing nothing on 86box).
+///
+/// Navigation then relies on NumLock being OFF, so the stripped numpad codes
+/// render as arrows rather than digits — `setup_ivt` forces it off. (QEMU and
+/// Bochs boot NumLock off and emit neither E0-less numpads nor fake shifts,
+/// so this only began to matter under 86box, whose accurate MF2 keyboard
+/// emits the fake shifts and whose BIOS boots NumLock on.)
 pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<u8> {
     if scancode == 0xE0 {
         pc.e0_pending = true;
@@ -223,6 +237,9 @@ pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<u8>
     }
     if pc.e0_pending {
         pc.e0_pending = false;
+        if matches!(scancode, 0x2A | 0xAA | 0x36 | 0xB6) {
+            return None;
+        }
     }
     Some(scancode)
 }

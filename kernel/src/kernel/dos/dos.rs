@@ -3527,6 +3527,15 @@ pub(super) fn setup_ivt() {
     }
     setup_lol_sft();
     xms::scan_uma();
+
+    // Force NumLock OFF in the BIOS keyboard-flags byte (40:17 bit 5). The
+    // grey arrow keys are E0-stripped down to their numpad twins (Up == 0x48
+    // == numpad-8) before the BIOS sees them, so with NumLock on the BIOS
+    // renders them as digits ('8'/'2') instead of navigation — and a laptop
+    // keyboard may have no NumLock key to clear it. 86box boots NumLock on;
+    // QEMU/Bochs boot it off, which is why arrows worked there.
+    let kbd_flags = read_u16(0x40, 0x17) & !0x0020;
+    write_u16(0x40, 0x17, kbd_flags);
 }
 
 fn setup_lol_sft() {

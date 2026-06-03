@@ -184,9 +184,22 @@ fn enable_a20() {
     if check_a20() {
         return;
     }
+    // Method 1: BIOS INT 15h AX=2401 (works on SeaBIOS/Bochs BIOS).
     unsafe {
         regs.ax = 0x2401;
         generate_real_interrupt(0x15);
+    }
+    if check_a20() {
+        return;
+    }
+    // Method 2: Fast A20 via System Control Port A (0x92). Standard on
+    // PS/2 and every Pentium-era chipset (incl. the 430TX in 86box's
+    // tx97), which does not implement INT 15h AX=2401. Set bit1 (A20
+    // enable); keep bit0 (fast CPU reset) clear.
+    unsafe {
+        let v: u8;
+        core::arch::asm!("in al, 0x92", out("al") v);
+        core::arch::asm!("out 0x92, al", in("al") (v | 0x02) & !0x01);
     }
     if !check_a20() {
         panic!("A20 not enabled");
