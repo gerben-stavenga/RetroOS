@@ -10,6 +10,7 @@ use crate::arch::paging2::{self, Entry};
 use crate::println;
 use crate::arch::x86;
 use crate::{Frame64, Regs};
+use crate::arch::Vcpu;
 
 // =============================================================================
 // Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
@@ -72,8 +73,14 @@ pub union StackFrame {
 
 const _: () = assert!(core::mem::size_of::<Regs>() == core::mem::size_of::<Raw32>());
 
-/// Register swap buffer. Holds user regs when kernel runs.
-pub(crate) static mut REGS: Regs = Regs::empty();
+/// The live execution context while the kernel runs: `REGS.regs` is the user
+/// register swap buffer (holds user regs when the kernel runs); the Vcpu
+/// wrapper also exposes the user-memory API (`REGS.read/write/slice/...`)
+/// against the active mapping, so any code holding `&mut REGS` can touch guest
+/// memory. `REGS.space` tracks the current thread's address space (set at
+/// thread switch); it is not consulted by the memory API, which always hits
+/// the active page tables.
+pub(crate) static mut REGS: Vcpu = Vcpu::empty();
 
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
@@ -308,7 +315,7 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
 }
 
 fn swap_regs(regs: &mut Regs) {
-    unsafe { core::mem::swap(regs, &mut *(&raw mut REGS)); }
+    unsafe { core::mem::swap(regs, &mut (*(&raw mut REGS)).regs); }
 }
 
 /// Switch threads: swap live state with pointed-to state.
@@ -341,7 +348,7 @@ fn arch_switch_to(regs: &mut Regs) {
     }
 
     // Swap regs
-    unsafe { core::mem::swap(&mut *regs_ptr, &mut REGS); }
+    unsafe { core::mem::swap(&mut *regs_ptr, &mut (*(&raw mut REGS)).regs); }
 
     // Log incoming struct PDE[0] before swap
     let _pre_pde0 = unsafe { (*root_ptr).e32[0].0 };

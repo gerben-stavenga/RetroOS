@@ -27,6 +27,19 @@ pub struct Vcpu {
     pub space: RootPageTable,
 }
 
+/// A Vcpu *is* its registers plus a way to reach the memory they run against.
+/// Deref to `Regs` so every `regs.rax` / `regs.mode()` keeps working when a
+/// `&mut Vcpu` is passed where a `&mut Regs` used to be, and so an unconverted
+/// `fn f(regs: &mut Regs)` still accepts a `&mut Vcpu` by coercion. The extra
+/// surface a Vcpu adds over Regs is the user-memory API below.
+impl core::ops::Deref for Vcpu {
+    type Target = Regs;
+    fn deref(&self) -> &Regs { &self.regs }
+}
+impl core::ops::DerefMut for Vcpu {
+    fn deref_mut(&mut self) -> &mut Regs { &mut self.regs }
+}
+
 impl Vcpu {
     pub const fn empty() -> Self {
         Vcpu { regs: Regs::empty(), space: RootPageTable::empty() }

@@ -4,6 +4,7 @@
 //! shadow region. Physical backing comes from the kernel's demand paging.
 
 use crate::kernel::dos::linear;
+use crate::arch::Vcpu;
 use crate::dbg_println;
 use crate::kernel::thread;
 use crate::Regs;
@@ -112,7 +113,7 @@ fn xms_state(dos: &mut thread::DosState) -> &mut XmsState {
     dos.xms.as_deref_mut().unwrap()
 }
 
-pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — Get XMS version
@@ -372,7 +373,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Regs) -> threa
 ///   +06: u32 source offset (or seg:off if handle=0)
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
-fn xms_move(dos: &mut thread::DosState, regs: &mut Regs) {
+fn xms_move(dos: &mut thread::DosState, regs: &mut Vcpu) {
     let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
 
     let length = unsafe { (addr as *const u32).read_unaligned() } as usize;

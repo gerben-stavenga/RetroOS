@@ -1,4 +1,5 @@
 use super::*;
+use crate::arch::Vcpu;
 use super::super::mode_transitions;
 
 /// Raw mode switch PM→real. Called via unified stub slot SLOT_PM_TO_REAL.
@@ -11,7 +12,7 @@ use super::super::mode_transitions;
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -37,7 +38,7 @@ fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Regs) -> thread
 /// initiated return trampolines, entry points, and the PMDOS INT 21
 /// short-circuit live here.
 /// Slot = (EIP - STUB_BASE - 2) / 2.
-pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
@@ -99,7 +100,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
             };
             let new_sp = sp.wrapping_add(frame_size);
             if ss_32 { regs.set_sp32(new_sp); }
-            else { regs.set_sp32((regs.sp32() & !0xFFFF) | (new_sp & 0xFFFF)); }
+            else { let cur = regs.sp32(); regs.set_sp32((cur & !0xFFFF) | (new_sp & 0xFFFF)); }
             regs.set_ip32(ret_eip);
             regs.set_cs32(ret_cs);
             thread::KernelAction::Done
@@ -119,7 +120,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
 ///   (E)BX = new PM (E)SP
 ///   SI = new PM CS selector
 ///   (E)DI = new PM (E)IP
-pub(in crate::kernel::dos) fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn raw_switch_real_to_pm(dos: &mut thread::DosState, regs: &mut Vcpu) {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -163,12 +164,12 @@ pub(super) fn flat_addr(ldt: &[u64], seg: u16, offset: u32, cs_32: bool) -> u32 
     seg_base(ldt, seg).wrapping_add(offset)
 }
 
-pub(super) fn trace_client_selector_leak(_label: &str, _regs: &Regs) {}
+pub(super) fn trace_client_selector_leak(_label: &str, _regs: &Vcpu) {}
 
-pub(super) fn set_carry(regs: &mut Regs) {
+pub(super) fn set_carry(regs: &mut Vcpu) {
     regs.set_flag32(1); // CF
 }
 
-pub(super) fn clear_carry(regs: &mut Regs) {
+pub(super) fn clear_carry(regs: &mut Vcpu) {
     regs.clear_flag32(1); // CF
 }

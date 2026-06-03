@@ -15,6 +15,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
+use crate::arch::Vcpu;
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
 /// Lets COMMAND.COM bracket a single exec so the log only captures that
@@ -205,7 +206,7 @@ pub struct DosState {
 /// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
 /// so the FnOnce can return another `ResumeCallback` (recursive type).
 pub struct ResumeCallback(pub alloc::boxed::Box<
-    dyn FnOnce(&mut thread::KernelThread, &mut DosState, &mut crate::Regs) -> Option<ResumeCallback>>);
+    dyn FnOnce(&mut thread::KernelThread, &mut DosState, &mut Vcpu) -> Option<ResumeCallback>>);
 
 #[derive(Clone, Copy)]
 pub struct DosMemBlock {
@@ -366,10 +367,17 @@ pub struct ExecParent {
 /// the DOS handler runs with PM regs and high-base PM selectors as buffer
 /// pointers; the regular reflect-to-RM path always reaches the handler in
 /// VM86 with RM-paragraph regs.
+/// THE one place a guest (segment-or-selector : offset) pair becomes a flat
+/// linear address. VM86 uses `seg<<4` with the A20 fold; PM walks the LDT for
+/// base+limit. Downstream the linear is used with the flat `regs.read/write/
+/// slice` memory API.
 #[inline]
-fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
+fn linear(dos: &thread::DosState, regs: &Vcpu, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
-        ((seg as u32) << 4).wrapping_add(off & 0xFFFF)
+        let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
+        // A20 gate: with the gate disabled, address line 20 is forced low, so
+        // the HMA (FFFF:0010..FFFF:FFFF) folds back over the first 64 KiB.
+        if dos.pc.a20_enabled { lin } else { lin & !(1 << 20) }
     } else {
         // PM client: resolve the buffer selector through its LDT base. This is
         // why PMDOS services 16-bit DPMI INT 21 in PM rather than reflecting to
@@ -378,6 +386,13 @@ fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
         // reflect would hand RM-DOS the selector *value* as a segment (DPMI
         // §host must not translate selectors — feedback_dpmi_host_no_seg_xlate),
         // dereferencing garbage. Servicing in PM lets `seg_base` find the buffer.
+        let limit = mode_transitions::seg_limit(&dos.ldt[..], seg);
+        if off > limit {
+            // Offset past the segment limit — a #GP on real silicon. Surface it
+            // (hard #GP delivery is a follow-up; today the access proceeds and
+            // an unmapped linear still faults via #PF).
+            dos_trace!("[DOS] sel {:04X}:{:X} past limit {:X}", seg, off, limit);
+        }
         mode_transitions::seg_base(&dos.ldt[..], seg).wrapping_add(off)
     }
 }
@@ -399,7 +414,7 @@ fn linear(dos: &thread::DosState, regs: &Regs, seg: u16, off: u32) -> u32 {
 pub fn syscall(
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,
-    regs: &mut Regs,
+    regs: &mut Vcpu,
 ) -> thread::KernelAction {
     use crate::UserMode;
     let mode = regs.mode();
@@ -423,7 +438,7 @@ pub fn syscall(
 pub fn handle_event(
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,
-    regs: &mut Regs,
+    regs: &mut Vcpu,
     kevent: crate::arch::monitor::KernelEvent,
 ) -> thread::KernelAction {
     use crate::arch::monitor::KernelEvent as KE;
@@ -688,7 +703,7 @@ pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>,
         core::ptr::write_volatile(0x450 as *mut u8, col as u8);
         core::ptr::write_volatile(0x451 as *mut u8, row as u8);
     }
-    unsafe { *(&raw mut crate::arch::REGS) = t.kernel.vcpu.regs; }
+    unsafe { *(&raw mut crate::arch::REGS) = t.kernel.vcpu; }
     // Initial thread never goes through a context switch, so load LDTR
     // directly here. Subsequent threads pick this up via `on_resume` in the
     // event-loop switch path.
@@ -787,7 +802,7 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 /// `reflect_int_to_real_mode` first, then returns through the same continuation
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
-pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Regs) {
+pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Vcpu) {
     // Mouse-callback dispatch (INT 33h AX=000Ch / Function 12), not a
     // hardware IRQ12/INT 74h delivery. Microsoft documents Function 12 as a
     // FAR subroutine callback and says the mouse driver protects it from

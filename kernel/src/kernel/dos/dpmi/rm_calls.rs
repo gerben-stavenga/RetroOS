@@ -1,4 +1,5 @@
 use super::*;
+use crate::arch::Vcpu;
 use super::super::mode_transitions;
 use super::super::mode_transitions::RmCallStruct;
 
@@ -32,7 +33,7 @@ fn printable(b: u8) -> char {
 // DPMI 0300/0301/0302 — explicit PM→RM call mechanics
 // ============================================================================
 
-pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let int_num = regs.rbx as u8;
 
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
@@ -99,7 +100,7 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Regs
 
 
 /// INT 31h/0301h — Call Real Mode Far Procedure
-pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
 
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
@@ -141,7 +142,7 @@ pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Regs) -
 }
 
 /// INT 31h/0302h — Call Real Mode Procedure with IRET Frame
-pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
 
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
@@ -195,7 +196,7 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Re
 
 /// Real-mode callback entry — real-mode code called one of our callback stubs.
 /// Save real-mode state, fill register structure, switch to PM callback handler.
-pub(in crate::kernel::dos) fn callback_entry(dos: &mut thread::DosState, regs: &mut Regs, cb_idx: usize) {
+pub(in crate::kernel::dos) fn callback_entry(dos: &mut thread::DosState, regs: &mut Vcpu, cb_idx: usize) {
     let cb = match dos.dpmi.as_ref() {
         Some(d) => d.callbacks[cb_idx],
         None => {

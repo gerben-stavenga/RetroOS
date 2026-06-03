@@ -16,6 +16,7 @@
 extern crate alloc;
 
 use crate::Regs;
+use crate::arch::Vcpu;
 
 pub const IF_FLAG: u32 = 1 << 9;
 pub const IOPL_MASK: u32 = 3 << 12;
@@ -39,48 +40,48 @@ const HMA_SHADOW_PAGE: usize = HMA_PAGE + HMA_PAGE_COUNT;
 // ============================================================================
 
 #[inline]
-pub fn vm86_cs(regs: &Regs) -> u16 {
+pub fn vm86_cs(regs: &Vcpu) -> u16 {
     regs.code_seg()
 }
 
 #[inline]
-pub fn vm86_ip(regs: &Regs) -> u16 {
+pub fn vm86_ip(regs: &Vcpu) -> u16 {
     regs.ip32() as u16
 }
 
 #[inline]
-pub fn vm86_ss(regs: &Regs) -> u16 {
+pub fn vm86_ss(regs: &Vcpu) -> u16 {
     regs.stack_seg()
 }
 
 #[inline]
-pub fn vm86_sp(regs: &Regs) -> u16 {
+pub fn vm86_sp(regs: &Vcpu) -> u16 {
     regs.sp32() as u16
 }
 
 #[inline]
-pub fn vm86_flags(regs: &Regs) -> u32 {
+pub fn vm86_flags(regs: &Vcpu) -> u32 {
     regs.flags32()
 }
 
 #[inline]
-pub fn set_vm86_cs(regs: &mut Regs, cs: u16) {
+pub fn set_vm86_cs(regs: &mut Vcpu, cs: u16) {
     regs.set_cs32(cs as u32);
 }
 
 #[inline]
-pub fn set_vm86_ip(regs: &mut Regs, ip: u16) {
+pub fn set_vm86_ip(regs: &mut Vcpu, ip: u16) {
     regs.set_ip32(ip as u32);
 }
 
 #[inline]
-pub fn set_vm86_sp(regs: &mut Regs, sp: u16) {
+pub fn set_vm86_sp(regs: &mut Vcpu, sp: u16) {
     let full = (regs.sp32() & 0xFFFF_0000) | sp as u32;
     regs.set_sp32(full);
 }
 
 #[inline]
-pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
+pub fn set_vm86_flags(regs: &mut Vcpu, flags: u32) {
     // Merge low 16 bits (user-visible flags), preserve upper EFLAGS (VM, IOPL, VIF, VIP).
     regs.frame.rflags = (regs.frame.rflags & !0xFFFF) | (flags as u64 & 0xFFFF);
 }
@@ -575,7 +576,7 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
 
 /// Resolve the linear base of segment `sel`. VM86 uses `sel*16`; PM walks
 /// GDT/LDT via the arch descriptor helpers.
-fn seg_base_for(regs: &Regs, sel: u16) -> u32 {
+fn seg_base_for(regs: &Vcpu, sel: u16) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         (sel as u32) << 4
     } else {
@@ -585,7 +586,7 @@ fn seg_base_for(regs: &Regs, sel: u16) -> u32 {
 
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
 /// bytes through `emulate_inb` and writes the result into `regs.rax`.
-pub fn handle_in_event(pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+pub fn handle_in_event(pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
     if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
         let val = crate::arch::inw(port) as u64;
         regs.rax = (regs.rax & !0xFFFF) | val;
@@ -601,7 +602,7 @@ pub fn handle_in_event(pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32
 }
 
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
-pub fn handle_out_event(pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+pub fn handle_out_event(pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
     let val = regs.rax;
     if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
         crate::arch::outw(port, val as u16);
@@ -615,7 +616,7 @@ pub fn handle_out_event(pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u3
 
 /// Complete an `INSB/INSW/INSD` (ES:DI ← port, advance DI). Single element —
 /// no REP handling; the CPU traps per iteration when REP is in effect.
-pub fn handle_ins_event(pc: &mut PcMachine, regs: &mut Regs, size: u32) {
+pub fn handle_ins_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
     let port = regs.rdx as u16;
     let es_base = seg_base_for(regs, regs.es as u16);
     let di = regs.rdi as u32;
@@ -629,7 +630,7 @@ pub fn handle_ins_event(pc: &mut PcMachine, regs: &mut Regs, size: u32) {
 }
 
 /// Complete an `OUTSB/OUTSW/OUTSD` (port ← DS:SI, advance SI). Single element.
-pub fn handle_outs_event(pc: &mut PcMachine, regs: &mut Regs, size: u32) {
+pub fn handle_outs_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
     let port = regs.rdx as u16;
     let ds_base = seg_base_for(regs, regs.ds as u16);
     let si = regs.rsi as u32;
@@ -716,7 +717,7 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
 /// higher-priority IRQ preempts an in-service lower one once the guest does
 /// `sti` mid-handler — and the VME pending-interrupt `#GP` that fires there
 /// always has something real to deliver, so it can't spin.
-pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
+pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Vcpu) -> Option<u8> {
     const VIP: u64 = 1 << 20;
     let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
     let candidate = pc.vpic.peek();
@@ -789,14 +790,14 @@ pub fn write_u16(seg: u32, off: u32, val: u16) {
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
-pub fn vm86_push(regs: &mut Regs, val: u16) {
+pub fn vm86_push(regs: &mut Vcpu, val: u16) {
     let sp = vm86_sp(regs).wrapping_sub(2);
     set_vm86_sp(regs, sp);
     write_u16(regs.ss32(), sp as u32, val);
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
-pub fn vm86_pop(regs: &mut Regs) -> u16 {
+pub fn vm86_pop(regs: &mut Vcpu) -> u16 {
     let sp = vm86_sp(regs);
     let val = read_u16(regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));

@@ -10,6 +10,7 @@
 extern crate alloc;
 
 use crate::kernel::thread;
+use crate::arch::Vcpu;
 use crate::vga;
 use crate::Regs;
 
@@ -147,7 +148,7 @@ fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
 /// cleared (the trap gate at entry, an exception handler, …): pending
 /// kbd/timer IRQs queue in the vPIC but `pick_pending_vec` gates them on
 /// VIF, and VIF is bit 9 of the saved EFLAGS.
-fn park_at_slot_resume(regs: &mut Regs) {
+fn park_at_slot_resume(regs: &mut Vcpu) {
     machine::set_vm86_cs(regs, STUB_SEG);
     machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
     regs.frame.rflags |= machine::IF_FLAG as u64;
@@ -165,7 +166,7 @@ fn park_at_slot_resume(regs: &mut Regs) {
 pub(crate) fn dispatch_kernel_syscall(
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,
-    regs: &mut Regs,
+    regs: &mut Vcpu,
     vector: u8,
 ) -> thread::KernelAction {
     match vector {
@@ -218,7 +219,7 @@ pub(crate) fn dispatch_kernel_syscall(
 /// VM86 stack from the original INT; far-call stubs have a CS/IP frame from
 /// CALL FAR. The kernel pops these frames directly — no RETF/RETF 2 in the
 /// stub. Caller (`syscall`) has already checked CS == STUB_SEG.
-pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     let cs = vm86_cs(regs);
     debug_assert_eq!(cs, STUB_SEG, "rm_stub_dispatch: CS must be STUB_SEG");
@@ -357,7 +358,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 /// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
-pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     // 16-bit DPMI clients issue INT 21h with 16-bit register parameters; the
     // high 16 bits of EAX..EBP are undefined and real (16-bit) DOS never
     // touches them. Zero them for the duration of servicing so every handler's
@@ -408,7 +409,7 @@ pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut threa
 /// subfunctions only touch 16-bit register halves and absolute VGA memory, so
 /// no DS:DX buffer translation is needed. On exit `finish_dos_call` does the
 /// mode-aware iret-frame pop.
-pub(super) fn pmdos_int33_handler(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn pmdos_int33_handler(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let _ = int_33h(dos, regs);
     if dos.pending_resume.is_none() {
         finish_dos_call(dos, regs);
@@ -427,7 +428,7 @@ pub(super) fn pmdos_int33_handler(dos: &mut thread::DosState, regs: &mut Regs) -
 ///     21 frame).
 ///   - PM: pop the IRET frame `deliver_pm_int` planted on the PM
 ///     stack and merge DOS status flags so CF/AX results survive.
-fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Regs) {
+fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Vcpu) {
     // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
     // is a control flag — handler-set CLD/STD must not leak into caller.
     const STATUS_MASK: u32 = 0x08D5;
@@ -451,7 +452,7 @@ fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Regs) {
 
 /// INT 31h from real mode user code. AH selects subfunction.
 /// On success: AX=0, CF=0. On error: AX=errno (unsigned), CF=1.
-pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — SYNTH_VGA_TAKE: adopt a (still-zombie) child's farewell
@@ -493,7 +494,7 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
                 let base = linear(dos, regs, seg, off);
                 let mut n = 0;
                 while n < 127 {
-                    let c = unsafe { *((base + n as u32) as *const u8) };
+                    let c = regs.read::<u8>(((base + n as u32)) as usize);
                     if c == 0 { break; }
                     dst[n] = c;
                     n += 1;
@@ -610,7 +611,7 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
 // BIOS INT 13h — Disk services
 // ============================================================================
 
-fn int_13h(regs: &mut Regs) -> thread::KernelAction {
+fn int_13h(regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     let dl = regs.rdx as u8; // drive number
     // For floppy drives (DL < 0x80), return "drive not ready" error.
@@ -667,16 +668,14 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
     super::ResumeCallback(alloc::boxed::Box::new(
         move |_kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
-              _regs: &mut Regs| -> Option<super::ResumeCallback> {
+              regs: &mut Vcpu| -> Option<super::ResumeCallback> {
             let Some(ch) = poll_dos_console_char(dos) else {
                 return Some(buffered_input_resume(buf_lin, max_chars, count));
             };
             match ch {
                 0x0D => {
-                    unsafe {
-                        *((buf_lin + 1) as *mut u8) = count;
-                        *((buf_lin + 2 + count as u32) as *mut u8) = 0x0D;
-                    }
+                    regs.write::<u8>((buf_lin + 1) as usize, count);
+                    regs.write::<u8>((buf_lin + 2 + count as u32) as usize, 0x0D);
                     dos_putchar(0x0D);
                     dos_putchar(0x0A);
                     None
@@ -693,7 +692,7 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
                 }
                 _ => {
                     if (count as u32) + 1 < max_chars as u32 {
-                        unsafe { *((buf_lin + 2 + count as u32) as *mut u8) = ch; }
+                        regs.write::<u8>(((buf_lin + 2 + count as u32)) as usize, ch);
                         dos_putchar(ch);
                         Some(buffered_input_resume(buf_lin, max_chars, count + 1))
                     } else {
@@ -715,7 +714,7 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
 /// `SLOT_RESUME` stub. Mirrors what a real `INT 16h` does: push FLAGS/CS/IP
 /// (the return frame, pointing back at SLOT_RESUME) and enter `IVT[0x16]`.
 /// IF is forced so the guest's wait loop can receive the keypress IRQ.
-fn launch_int16_read(regs: &mut Regs) {
+fn launch_int16_read(regs: &mut Vcpu) {
     let ivt_off = read_u16(0, 0x16 * 4);
     let ivt_seg = read_u16(0, 0x16 * 4 + 2);
     let ret_flags = (machine::vm86_flags(regs) | machine::IF_FLAG) as u16;
@@ -736,7 +735,7 @@ fn int16_finish_resume(echo: bool) -> super::ResumeCallback {
     super::ResumeCallback(alloc::boxed::Box::new(
         move |_kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
-              regs: &mut Regs| -> Option<super::ResumeCallback> {
+              regs: &mut Vcpu| -> Option<super::ResumeCallback> {
             let ax = regs.rax as u16;
             let ascii = ax as u8;
             let scan = (ax >> 8) as u8;
@@ -790,7 +789,7 @@ fn dos_error_from_errno(err: i32) -> u16 {
 // DOS INT 21h — DOS services
 // ============================================================================
 
-fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
     // running clients), 02/06/09 (character/string output — exception
@@ -866,7 +865,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let start = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut addr = start;
             loop {
-                let ch = unsafe { *(addr as *const u8) };
+                let ch = regs.read::<u8>((addr) as usize);
                 if ch == b'$' { break; }
                 dos_putchar(ch);
                 addr = addr.wrapping_add(1);
@@ -885,9 +884,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // game spins forever asking for input.
         0x0A => {
             let buf_lin = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-            let max_chars = unsafe { *(buf_lin as *const u8) };
+            let max_chars = regs.read::<u8>((buf_lin) as usize);
             if max_chars == 0 {
-                unsafe { *((buf_lin + 1) as *mut u8) = 0; }
+                regs.write::<u8>(((buf_lin + 1)) as usize, 0);
                 return thread::KernelAction::Done;
             }
             dos.pending_resume = Some(buffered_input_resume(buf_lin, max_chars, 0));
@@ -1086,7 +1085,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut path = [0u8; 64];
             let mut i = 0;
             while i < 63 {
-                let ch = unsafe { *((addr + i as u32) as *const u8) };
+                let ch = regs.read::<u8>(((addr + i as u32)) as usize);
                 if ch == 0 { break; }
                 path[i] = ch;
                 i += 1;
@@ -1108,7 +1107,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
-                let ch = unsafe { *(addr as *const u8) };
+                let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
                 addr += 1;
@@ -1183,7 +1182,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else {
-                let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, count) };
+                let buf = regs.slice_mut((buf_addr) as usize, count);
                 let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
                 if n >= 0 {
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
@@ -1210,7 +1209,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut raw = [0u8; 80];
             let mut raw_len = 0;
             while raw_len < 79 {
-                let ch = unsafe { *(addr as *const u8) };
+                let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 raw[raw_len] = ch;
                 addr += 1;
@@ -1414,7 +1413,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
-                let ch = unsafe { *(addr as *const u8) };
+                let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
                 addr += 1;
@@ -1449,7 +1448,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if handle == 1 || handle == 2 {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
-                    let ch = unsafe { *((addr + i) as *const u8) };
+                    let ch = regs.read::<u8>(((addr + i)) as usize);
                     dos_putchar(ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
@@ -1459,7 +1458,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.clear_flag32(1);
             } else {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-                let data = unsafe { core::slice::from_raw_parts(addr as *const u8, count as usize) };
+                let data = regs.slice((addr) as usize, count as usize);
                 let n = crate::kernel::vfs::write(handle as i32, data, &kt.fds);
                 if n >= 0 {
                     let size = crate::kernel::vfs::file_size(handle as i32, &kt.fds);
@@ -1509,7 +1508,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
-                let ch = unsafe { *(addr as *const u8) };
+                let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
                 addr += 1;
@@ -1577,9 +1576,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     if *(addr as *const u8) == 0xFF { (true, 7) } else { (false, 0) }
                 };
                 let fcb_base = addr.wrapping_add(fcb_off);
-                let drive_byte = unsafe { *(fcb_base as *const u8) };
-                let name = unsafe { core::slice::from_raw_parts((fcb_base + 1) as *const u8, 8) };
-                let ext = unsafe { core::slice::from_raw_parts((fcb_base + 9) as *const u8, 3) };
+                let drive_byte = regs.read::<u8>((fcb_base) as usize);
+                let name = regs.slice(((fcb_base + 1)) as usize, 8);
+                let ext = regs.slice(((fcb_base + 9)) as usize, 3);
                 // Build "[X:][cwd\]NAME[.EXT]" — wildcards stay as-is
                 // ('?' for single, real chars for literal). resolve()
                 // uppercases and applies cwd.
@@ -1723,7 +1722,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let flags = regs.rax as u8;
             if flags & 1 != 0 {
                 loop {
-                    let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
+                    let ch = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
                     if ch == b' ' || ch == b'\t' || ch == b';' || ch == b',' {
                         si += 1;
                     } else {
@@ -1736,47 +1735,47 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             unsafe { core::ptr::write_bytes((fcb + 1) as *mut u8, b' ', 11); }
 
             // Check for drive letter (e.g., "C:")
-            let ch0 = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
-            let ch1 = unsafe { *(ds_base.wrapping_add(si as u32 + 1) as *const u8) };
+            let ch0 = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
+            let ch1 = regs.read::<u8>((ds_base.wrapping_add(si as u32 + 1)) as usize);
             if ch1 == b':' && ch0.is_ascii_alphabetic() {
-                unsafe { *(fcb as *mut u8) = ch0.to_ascii_uppercase() - b'A' + 1; }
+                regs.write::<u8>((fcb) as usize, ch0.to_ascii_uppercase() - b'A' + 1);
                 si += 2;
             } else {
-                unsafe { *(fcb as *mut u8) = 0; } // default drive
+                regs.write::<u8>((fcb) as usize, 0); // default drive
             }
 
             // Parse filename (up to 8 chars) into FCB+1
             let mut pos = 0u32;
             loop {
-                let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
+                let ch = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
                 if ch == b'.' || ch == 0 || ch == b' ' || ch == b'/' || ch == b'\\' || ch == b'\r' { break; }
                 if ch == b'*' {
-                    while pos < 8 { unsafe { *((fcb + 1 + pos) as *mut u8) = b'?'; } pos += 1; }
+                    while pos < 8 { regs.write::<u8>(((fcb + 1 + pos)) as usize, b'?'); pos += 1; }
                     si += 1;
                     break;
                 }
                 if pos < 8 {
-                    unsafe { *((fcb + 1 + pos) as *mut u8) = ch.to_ascii_uppercase(); }
+                    regs.write::<u8>(((fcb + 1 + pos)) as usize, ch.to_ascii_uppercase());
                     pos += 1;
                 }
                 si += 1;
             }
 
             // Parse extension (up to 3 chars) into FCB+9
-            let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
+            let ch = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
             if ch == b'.' {
                 si += 1;
                 pos = 0;
                 loop {
-                    let ch = unsafe { *(ds_base.wrapping_add(si as u32) as *const u8) };
+                    let ch = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
                     if ch == 0 || ch == b' ' || ch == b'/' || ch == b'\\' || ch == b'\r' { break; }
                     if ch == b'*' {
-                        while pos < 3 { unsafe { *((fcb + 9 + pos) as *mut u8) = b'?'; } pos += 1; }
+                        while pos < 3 { regs.write::<u8>(((fcb + 9 + pos)) as usize, b'?'); pos += 1; }
                         si += 1;
                         break;
                     }
                     if pos < 3 {
-                        unsafe { *((fcb + 9 + pos) as *mut u8) = ch.to_ascii_uppercase(); }
+                        regs.write::<u8>(((fcb + 9 + pos)) as usize, ch.to_ascii_uppercase());
                         pos += 1;
                     }
                     si += 1;
@@ -1840,7 +1839,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut name = [0u8; 128];
             let mut len = 0;
             while len < 127 {
-                let ch = unsafe { *((src + len as u32) as *const u8) };
+                let ch = regs.read::<u8>(((src + len as u32)) as usize);
                 if ch == 0 { break; }
                 name[len] = ch;
                 len += 1;
@@ -1969,7 +1968,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
-                let ch = unsafe { *(addr as *const u8) };
+                let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
                 addr += 1;
@@ -2086,7 +2085,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             let mut name = [0u8; 64];
             let mut i = 0;
             while i < 63 {
-                let ch = unsafe { *(addr as *const u8) };
+                let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
                 addr += 1;
@@ -2210,11 +2209,11 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
 // INT 2Eh — COMMAND.COM internal execute
 // ============================================================================
 
-fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
     // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
     let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
-    let len = unsafe { *(addr as *const u8) } as usize;
+    let len = regs.read::<u8>((addr) as usize) as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
     unsafe {
@@ -2238,7 +2237,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
 
 /// Fill regs with DPMI 0.90 installation-check reply (shared by INT 2F/1687h
 /// and DOS/32A's INT 21h AX=FF87h probe).
-fn dpmi_install_check(regs: &mut Regs) {
+fn dpmi_install_check(regs: &mut Vcpu) {
     regs.rax = regs.rax & !0xFFFF; // AX=0: DPMI available
     regs.rbx = (regs.rbx & !0xFFFF) | 0x0001; // BX bit0 = 32-bit supported
     regs.rcx = (regs.rcx & !0xFF) | 0x03; // CL = 386
@@ -2248,7 +2247,7 @@ fn dpmi_install_check(regs: &mut Regs) {
     regs.rdi = (regs.rdi & !0xFFFF) | slot_offset(SLOT_DPMI_ENTRY) as u64;
 }
 
-fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn int_2fh(_dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ax = regs.rax as u16;
     dos_trace!("D2F {:04X} BX={:04X} CX={:04X} DX={:04X} cs:ip={:04X}:{:04X}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -2299,7 +2298,7 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction
 ///
 /// Mouse hardware state lives on `dos.pc.mouse` and is updated by the IRQ 12
 /// packet stream queued through `machine::queue_irq`.
-fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn int_33h(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ax = regs.rax as u16;
     dos_trace!("D33 AX={:04X} BX={:04X} CX={:04X} DX={:04X} ES={:04X}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16, regs.es as u16);
@@ -2390,7 +2389,7 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction 
 /// since `HostContinuation` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
 /// returns via SLOT_MOUSE_CB_RET which restores them and then unwinds through
 /// the standard `resume_continuation_from_stub`.
-pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Regs) {
+pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Vcpu) {
     use super::machine::vm86_push;
     use super::mode_transitions;
 
@@ -2475,7 +2474,7 @@ pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Regs
 /// SLOT_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
 /// Restore the GP regs `deliver_mouse_callback` clobbered, then unwind via
 /// the same `resume_continuation_from_stub` that SLOT_RESUME_CONTINUATION uses.
-pub(super) fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Regs) {
+pub(super) fn mouse_callback_return(dos: &mut thread::DosState, regs: &mut Vcpu) {
     use super::machine::vm86_pop;
     if !dos.pc.mouse.cb_is_pm {
         // VM86: the stub's `CD 31` (INT 31h, IOPL=3) pushed FLAGS/CS/IP onto
@@ -2512,7 +2511,7 @@ fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, n
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs: &mut Regs, _kt: &mut thread::KernelThread) -> thread::KernelAction {
+fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs: &mut Vcpu, _kt: &mut thread::KernelThread) -> thread::KernelAction {
     // Resolve raw DOS name → VFS path via DFS. No extension probing or
     // PATH search here -- those live in COMMAND.COM, matching real DOS.
     let mut path = [0u8; 164];
@@ -2560,7 +2559,7 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs:
 /// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C
 /// which interprets BAT itself and uses synth INT 31h AH=01h to
 /// fork+exec+wait each external command in a separate thread.
-fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let al = regs.rax as u8;
     match al {
         0x00 => {}                                  // load & execute — fall through
@@ -2580,7 +2579,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let mut filename = [0u8; 128];
     let mut flen = 0;
     while flen < 127 {
-        let ch = unsafe { *(addr as *const u8) };
+        let ch = regs.read::<u8>((addr) as usize);
         if ch == 0 { break; }
         filename[flen] = ch;
         flen += 1;
@@ -2595,7 +2594,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // when the caller is in PM, an RM paragraph:offset in VM86 — same
     // discriminator linear() uses for buffer addresses elsewhere.
     let cmdtail_addr = linear(dos, regs, cmdtail_seg, cmdtail_off);
-    let tail_len = unsafe { *(cmdtail_addr as *const u8) } as usize;
+    let tail_len = regs.read::<u8>((cmdtail_addr) as usize) as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
     unsafe {
@@ -2799,13 +2798,13 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
 /// For MZ .EXE the load module is copied at load_seg:0 and each relocation
 /// entry gets `reloc_factor` added (NOT load_seg — the spec leaves it to
 /// the caller, e.g. Borland C passes the segment of the overlay frame).
-fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     // ASCIIZ filename at DS:DX
     let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
     let mut filename = [0u8; 128];
     let mut flen = 0;
     while flen < 127 {
-        let ch = unsafe { *(addr as *const u8) };
+        let ch = regs.read::<u8>((addr) as usize);
         if ch == 0 { break; }
         filename[flen] = ch;
         flen += 1;
@@ -2899,16 +2898,16 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return(dos: &mut thread::DosState, regs: &mut Regs, parent: ExecParent,
+fn exec_return(dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
     crate::dbg_println!("exec_return: parent ss:sp={:04X}:{:04X} ds={:04X} es={:04X} heap={:04X} psp={:04X}",
         parent.ss, parent.sp, parent.ds, parent.es, parent.heap_seg, parent.psp);
     if !parent.pm_mode {
         // Peek the IRET frame waiting on the real-mode parent's stack.
         let lin = ((parent.ss as u32) << 4) + (parent.sp as u32);
-        let ret_ip = unsafe { *(lin as *const u16) };
-        let ret_cs = unsafe { *((lin + 2) as *const u16) };
-        let ret_flags = unsafe { *((lin + 4) as *const u16) };
+        let ret_ip = regs.read::<u16>((lin) as usize);
+        let ret_cs = regs.read::<u16>(((lin + 2)) as usize);
+        let ret_flags = regs.read::<u16>(((lin + 4)) as usize);
         crate::dbg_println!("exec_return: parent IRET frame at {:04X}:{:04X} -> ip={:04X} cs={:04X} flags={:04X}",
             parent.ss, parent.sp, ret_ip, ret_cs, ret_flags);
     }
@@ -3045,7 +3044,7 @@ pub(crate) fn dfs_create_path(dos: &thread::DosState, dos_in: &[u8])
 
 /// FindFirst/FindNext helper: resume search from dos.find_idx,
 /// updating it in place. Directory and pattern come from find_path.
-fn find_matching_file(dos: &mut thread::DosState, regs: &mut Regs) -> thread::KernelAction {
+fn find_matching_file(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     // Split find_path into directory and pattern components.
     // find_path is an absolute VFS path like "DN/DN*.SWP" or "*.*".
     // The directory part includes any trailing slash; the pattern is
