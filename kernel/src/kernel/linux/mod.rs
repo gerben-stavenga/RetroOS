@@ -97,6 +97,12 @@ pub struct LinuxState {
     /// no cwd of its own — see CLAUDE notes on personality-owned state.
     pub cwd: [u8; 64],
     pub cwd_len: usize,
+    /// Path this process's image was loaded from — what `/proc/self/exe`
+    /// resolves to. Set on each successful exec; preserved across the
+    /// in-place ELF execve. Lets self-re-exec'ing binaries (busybox standalone
+    /// shell) find themselves without a real /proc or any hardcoded path.
+    pub exec_path: [u8; 128],
+    pub exec_path_len: usize,
 }
 
 impl LinuxState {
@@ -115,10 +121,22 @@ impl LinuxState {
             wait_exit_code: 0,
             cwd: [0; 64],
             cwd_len: 0,
+            exec_path: [0; 128],
+            exec_path_len: 0,
         }
     }
 
     pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
+
+    /// Path the running image was loaded from (`/proc/self/exe` target).
+    pub fn exec_path_str(&self) -> &[u8] { &self.exec_path[..self.exec_path_len] }
+
+    /// Record the load path on exec (truncated to the buffer if absurdly long).
+    pub fn set_exec_path(&mut self, path: &[u8]) {
+        let n = path.len().min(self.exec_path.len());
+        self.exec_path[..n].copy_from_slice(&path[..n]);
+        self.exec_path_len = n;
+    }
 
     /// Called when a Linux thread loses focus. Snapshots the shared Linux
     /// console framebuffer (TTY-style — all Linux threads share it).
@@ -610,7 +628,7 @@ pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool) -> u
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub fn exec_elf_into(tid: usize, data: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
+pub fn exec_elf_into(tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
     let loaded = elf::load_elf(data).map_err(|_| 8)?; // ENOEXEC
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
@@ -629,6 +647,7 @@ pub fn exec_elf_into(tid: usize, data: &[u8], args: &[alloc::vec::Vec<u8>]) -> R
         l.heap_base = loaded.max_vaddr;
         l.heap_end = loaded.max_vaddr;
         l.mmap_cursor = elf::USER_STACK_TOP - 0x0100_0000;
+        l.set_exec_path(path);
     }
 
     Ok(())
@@ -831,32 +850,33 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
     let _envp_ptr = a.a2 as usize;
 
     let raw_path = unsafe { read_c_str(path_ptr, 256) };
-    // Static busybox's standalone-shell mode re-execs itself via
-    // /proc/self/exe. We don't have a /proc filesystem; redirect the path
-    // to the binary's actual location. Generalizes if more apps need
-    // /proc/self/exe — could later become a real /proc by tracking the
-    // exec path per thread.
-    let path: &[u8] = if raw_path == b"/proc/self/exe" {
-        b"/bin/busybox"
+    // Resolve /proc/self/exe to this process's own load path (tracked in
+    // LinuxState.exec_path, set on every exec) — busybox's standalone-shell
+    // mode re-execs itself that way, and we have no real /proc. Copy to the
+    // kernel heap: `raw_path` borrows user memory that arch_user_clean() below
+    // unmaps, and we use `path` after that (format detection + init_thread).
+    let path: alloc::vec::Vec<u8> = if raw_path == b"/proc/self/exe" {
+        linux.exec_path_str().to_vec()
     } else {
-        raw_path
+        raw_path.to_vec()
     };
 
-    // Read argv from caller's address space before we free it. argv[0] is
-    // forced to `path` so init_thread (which uses args[0] for both load
-    // reference and argv[0]) sees a consistent value. POSIX permits an
-    // argv[0] that differs from the loaded path -- we don't honor that.
+    // Read argv from caller's address space before we free it. Preserve the
+    // caller's argv[0] — POSIX lets it differ from the load path, and busybox
+    // launches as /bin/busybox with argv[0] = the applet name (sh/ls/…) to
+    // select the applet. Format detection uses `path` (handed to init_thread)
+    // rather than argv[0]; only synthesize argv[0] from the path if the caller
+    // passed an empty argv.
     let wide = regs.mode() == crate::UserMode::Mode64;
     let mut args = read_c_argv(argv_ptr, wide);
-    if args.is_empty() { args.push(alloc::vec::Vec::new()); }
-    args[0] = path.to_vec();
+    if args.is_empty() { args.push(path.clone()); }
 
     // Snapshot cwd up front — execve preserves it across the address-space
     // teardown, but `linux` borrows from the thread we're about to clobber.
     let cwd_snapshot: alloc::vec::Vec<u8> = linux.cwd_str().into();
 
     // Load file (resolves path against cwd)
-    let buffer = match exec::load_file(path, &cwd_snapshot) {
+    let buffer = match exec::load_file(&path, &cwd_snapshot) {
         Ok(b) => b,
         Err(_) => return SyscallResult::val(-ENOENT),
     };
@@ -865,14 +885,14 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
     kt.symbols = None;
     kt.close_cloexec();
 
-    let format = exec::detect_format(&buffer, path);
+    let format = exec::detect_format(&buffer, &path);
 
     // ELF address space prep (DOS handles its own inside exec_dos_into)
     if matches!(format, exec::BinaryFormat::Elf) {
         startup::arch_user_clean();
     }
 
-    if let Err(_) = exec::init_thread(tid, buffer, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
+    if let Err(_) = exec::init_thread(tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
         return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, -ENOEXEC)) };
     }
 

@@ -75,17 +75,21 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 ///
 /// - **ELF**: caller must have already cleaned the address space.
 /// - **DOS**: address space setup (clean + low mem + IVT) is handled internally.
-/// - `args[0]` is the program path (load source + argv[0]). Subsequent
-///   entries are extra argv for ELF; ignored for DOS.
+/// - `path` is the load path, used only for format detection (the .EXE
+///   extension fallback). It is kept separate from `args` because POSIX lets
+///   `argv[0]` differ from the executable path — busybox/toybox are launched
+///   as `/bin/busybox` with `argv[0]` = the applet name (`sh`, `ls`, …) and
+///   dispatch on it. Forcing `args[0] = path` here used to break that.
+/// - `args` is the full argv; `args[0]` is argv[0]. Subsequent entries are
+///   extra argv for ELF; ignored for DOS.
 /// - `parent_env_data` is the parent DOS env snapshot (DOS-only path);
 ///   pass `Vec::new()` for non-DOS execs or initial loads with no parent.
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
-pub fn init_thread(tid: usize, data: Vec<u8>, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) -> Result<(), i32> {
-    let path = args.first().expect("init_thread: args must contain program path as args[0]");
+pub fn init_thread(tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) -> Result<(), i32> {
     match detect_format(&data, path) {
         BinaryFormat::Elf => {
-            crate::kernel::linux::exec_elf_into(tid, &data, &args)
+            crate::kernel::linux::exec_elf_into(tid, &data, path, &args)
         }
         fmt => {
             let is_exe = matches!(fmt, BinaryFormat::MzExe);

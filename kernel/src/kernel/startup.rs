@@ -680,7 +680,7 @@ fn handle_fork_exec(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if let Err(_) = exec::init_thread(child_tid, buf, args, cmdtail, env, cwd) {
+    if let Err(_) = exec::init_thread(child_tid, buf, path, args, cmdtail, env, cwd) {
         let child = thread::get_thread(child_tid).unwrap();
         arch_switch_to(&mut child.kernel.cpu_state, &mut child.kernel.root, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(child_tid, 1);

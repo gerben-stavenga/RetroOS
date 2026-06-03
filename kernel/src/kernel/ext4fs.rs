@@ -88,7 +88,15 @@ impl Filesystem for Ext4Fs {
         let mut buf = [0u8; 256];
         let abs = make_absolute(path, &mut buf)?;
         let file = self.fs.open(abs).ok()?;
-        let size = file.metadata().len() as u32;
+        // Pull size + real permission bits before File is moved into the handle
+        // map. The execute bits matter: the old hardcoded 0o644 made every ext4
+        // binary look non-executable, so busybox refused to run anything
+        // ("ls: Permission denied"). open() follows symlinks, so this is the
+        // resolved target's mode.
+        let (size, mode) = {
+            let md = file.metadata();
+            (md.len() as u32, md.mode())
+        };
 
         let mut handle_ref = self.next_handle.borrow_mut();
         let handle = *handle_ref;
@@ -96,10 +104,7 @@ impl Filesystem for Ext4Fs {
 
         self.open_files.borrow_mut().insert(handle, file);
 
-        // ext4-view doesn't surface POSIX mode bits — default to a generic
-        // file mode (matches the prior behaviour). Worth a stat-based lookup
-        // if we ever need accurate bits from the ext4 partition.
-        Some(Vnode { handle, size, mode: 0o644 })
+        Some(Vnode { handle, size, mode })
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
@@ -171,7 +176,7 @@ impl Filesystem for Ext4Fs {
                     name_len,
                     size,
                     is_dir,
-                    mode: if is_dir { 0o755 } else { 0o644 },
+                    mode: entry.metadata().map(|m| m.mode()).unwrap_or(if is_dir { 0o755 } else { 0o644 }),
                 };
                 de.name[..name_len].copy_from_slice(&basename[..name_len]);
                 return Some(de);
@@ -190,6 +195,10 @@ impl Filesystem for Ext4Fs {
             Some(s) => s,
             None => return false,
         };
-        self.fs.exists(abs).unwrap_or(false)
+        // A directory exists iff read_dir succeeds — it fails for files and
+        // symlinks. The previous `exists()` returned true for ANY path, so
+        // stat() reported regular files (e.g. /bin/ls) as directories and
+        // busybox rejected them as non-executable.
+        self.fs.read_dir(abs).is_ok()
     }
 }
