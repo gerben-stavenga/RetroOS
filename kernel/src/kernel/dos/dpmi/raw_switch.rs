@@ -90,12 +90,12 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
             let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
             let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
             let (ret_eip, ret_cs, frame_size) = if use32 {
-                let eip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u32) };
-                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 4)) as *const u32) };
+                let eip = regs.read::<u32>(((ss_base.wrapping_add(sp))) as usize);
+                let cs = regs.read::<u32>(((ss_base.wrapping_add(sp + 4))) as usize);
                 (eip, cs, 8u32)
             } else {
-                let ip = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp)) as *const u16) } as u32;
-                let cs = unsafe { core::ptr::read_unaligned((ss_base.wrapping_add(sp + 2)) as *const u16) } as u32;
+                let ip = regs.read::<u16>(((ss_base.wrapping_add(sp))) as usize) as u32;
+                let cs = regs.read::<u16>(((ss_base.wrapping_add(sp + 2))) as usize) as u32;
                 (ip, cs, 4u32)
             };
             let new_sp = sp.wrapping_add(frame_size);

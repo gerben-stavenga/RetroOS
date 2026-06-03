@@ -376,11 +376,11 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> threa
 fn xms_move(dos: &mut thread::DosState, regs: &mut Vcpu) {
     let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
 
-    let length = unsafe { (addr as *const u32).read_unaligned() } as usize;
-    let src_handle = unsafe { ((addr + 4) as *const u16).read_unaligned() };
-    let src_offset = unsafe { ((addr + 6) as *const u32).read_unaligned() };
-    let dst_handle = unsafe { ((addr + 10) as *const u16).read_unaligned() };
-    let dst_offset = unsafe { ((addr + 12) as *const u32).read_unaligned() };
+    let length = regs.read::<u32>((addr) as usize) as usize;
+    let src_handle = regs.read::<u16>(((addr + 4)) as usize);
+    let src_offset = regs.read::<u32>(((addr + 6)) as usize);
+    let dst_handle = regs.read::<u16>(((addr + 10)) as usize);
+    let dst_offset = regs.read::<u32>(((addr + 12)) as usize);
 
     if length == 0 {
         regs.rax = (regs.rax & !0xFFFF) | 1;

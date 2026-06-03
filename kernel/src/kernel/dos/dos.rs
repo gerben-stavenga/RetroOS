@@ -2588,8 +2588,8 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
 
     // Read parameter block at ES:BX
     let pb = linear(dos, regs, regs.es as u16, regs.rbx as u32);
-    let cmdtail_off = unsafe { ((pb + 2) as *const u16).read_unaligned() } as u32;
-    let cmdtail_seg = unsafe { ((pb + 4) as *const u16).read_unaligned() };
+    let cmdtail_off = regs.read::<u16>(((pb + 2)) as usize) as u32;
+    let cmdtail_seg = regs.read::<u16>(((pb + 4)) as usize);
     // The embedded (segment, offset) far pointer is a PM selector:offset
     // when the caller is in PM, an RM paragraph:offset in VM86 — same
     // discriminator linear() uses for buffer addresses elsewhere.
@@ -2814,8 +2814,8 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 
     // Parameter block at ES:BX — two WORDs.
     let pb = linear(dos, regs, regs.es as u16, regs.rbx as u32);
-    let load_seg = unsafe { (pb as *const u16).read_unaligned() };
-    let reloc_factor = unsafe { ((pb + 2) as *const u16).read_unaligned() };
+    let load_seg = regs.read::<u16>((pb) as usize);
+    let reloc_factor = regs.read::<u16>(((pb + 2)) as usize);
     dos_trace!("D21 4B03 LOAD_OVERLAY prog={:?} load_seg={:04X} reloc_factor={:04X}",
         core::str::from_utf8(prog_name).unwrap_or("?"), load_seg, reloc_factor);
 

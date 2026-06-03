@@ -301,13 +301,15 @@ pub(super) fn pop_continuation(dos: &thread::DosState, regs: &Vcpu) -> HostConti
 /// know the pm-side cursor directly.
 pub(super) fn pop_continuation_at(ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
     let addr = pm_addr(ldt, cursor);
+    // Leaf helper taking a raw (SS,SP) cursor with no Vcpu in scope; the
+    // address is already linear, so read it directly.
     unsafe { core::ptr::read_unaligned(addr as *const HostContinuation) }
 }
 
 pub(super) fn resume_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, save: HostContinuation) {
     let saved_regs = save.rm_call_struct_addr().map(|addr| {
         let current = RmCallStruct::capture(regs);
-        let saved = unsafe { core::ptr::read_unaligned(addr as *const RmCallStruct) };
+        let saved = regs.read::<RmCallStruct>((addr) as usize);
         unsafe { core::ptr::write_unaligned(addr as *mut RmCallStruct, current); }
         saved
     });

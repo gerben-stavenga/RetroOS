@@ -412,7 +412,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             let sel = regs.rbx as u16;
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let src = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-                let mut new_desc = unsafe { core::ptr::read_unaligned(src as *const u64) };
+                let mut new_desc = regs.read::<u64>((src) as usize);
                 // Match CWSDPMI: force the descriptor to stay non-system.
                 new_desc |= 1u64 << 44;
                 dos.ldt[idx] = new_desc;

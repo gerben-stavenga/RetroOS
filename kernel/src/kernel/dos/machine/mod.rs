@@ -622,7 +622,7 @@ pub fn handle_ins_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
     let di = regs.rdi as u32;
     for i in 0..size {
         let b = emulate_inb(pc, port + i as u16);
-        unsafe { *((es_base.wrapping_add(di.wrapping_add(i))) as *mut u8) = b; }
+        regs.write::<u8>(((es_base.wrapping_add(di.wrapping_add(i)))) as usize, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
@@ -635,7 +635,7 @@ pub fn handle_outs_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
     let ds_base = seg_base_for(regs, regs.ds as u16);
     let si = regs.rsi as u32;
     for i in 0..size {
-        let b = unsafe { *((ds_base.wrapping_add(si.wrapping_add(i))) as *const u8) };
+        let b = regs.read::<u8>(((ds_base.wrapping_add(si.wrapping_add(i)))) as usize);
         emulate_outb(pc, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;

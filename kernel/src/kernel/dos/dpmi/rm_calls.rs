@@ -40,7 +40,7 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu
 
     // Read the real-mode call structure from ES:EDI (use client_use32, not cs_32)
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
-    let rm = unsafe { *(struct_addr as *const RmCallStruct) };
+    let rm = regs.read::<RmCallStruct>((struct_addr) as usize);
 
     { let (ax, bx, cx, dx, ds, es, edi) =
         (rm.eax as u16, rm.ebx as u16, rm.ecx as u16, rm.edx as u16, rm.ds, rm.es, rm.edi);
@@ -104,7 +104,7 @@ pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Vcpu) -
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
 
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
-    let rm = unsafe { *(struct_addr as *const RmCallStruct) };
+    let rm = regs.read::<RmCallStruct>((struct_addr) as usize);
 
     // Same LIFO-share rule as simulate_real_mode_int.
     let rm_dest = if rm.ss != 0 {
@@ -146,7 +146,7 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vc
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
 
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
-    let rm = unsafe { *(struct_addr as *const RmCallStruct) };
+    let rm = regs.read::<RmCallStruct>((struct_addr) as usize);
 
     { let (ax, bx, cx, dx, ds, es, edi, cs, ip) =
         (rm.eax as u16, rm.ebx as u16, rm.ecx as u16, rm.edx as u16, rm.ds, rm.es, rm.edi, rm.cs, rm.ip);
@@ -218,7 +218,7 @@ pub(in crate::kernel::dos) fn callback_entry(dos: &mut thread::DosState, regs: &
     let struct_addr = seg_base(&dos.ldt[..], rm_struct_sel).wrapping_add(rm_struct_off);
 
     let rm_call = RmCallStruct::capture(regs);
-    unsafe { *(struct_addr as *mut RmCallStruct) = rm_call; }
+    regs.write::<RmCallStruct>((struct_addr) as usize, rm_call);
 
     // RM→PM toggle: pushes HostContinuation on the pm side and records
     // the RM call-structure address in it. `resume_continuation` later

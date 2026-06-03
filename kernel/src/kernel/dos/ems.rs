@@ -299,8 +299,8 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
             }
 
             for i in 0..count as u32 {
-                let log_page = unsafe { ((base_addr + i * 4) as *const u16).read_unaligned() };
-                let phys_raw = unsafe { ((base_addr + i * 4 + 2) as *const u16).read_unaligned() };
+                let log_page = regs.read::<u16>(((base_addr + i * 4)) as usize);
+                let phys_raw = regs.read::<u16>(((base_addr + i * 4 + 2)) as usize);
 
                 let phys_page = if al == 0 {
                     phys_raw as u8
