@@ -45,9 +45,10 @@ for i in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 # NOT a hang when slow: TCC does hundreds of single-chunk hostfs serial
 # round-trips (every include/OBJ/EXE byte), so the compile legitimately
 # takes ~tens of seconds and DOES complete (hostfs log shows CREATE
-# STUB.EXE + WRITE). 120s cap = enough to finish, still bounded so a
-# genuine hang fails in ~2min rather than being masked.
-timeout 120 qemu-system-i386 -cpu 486 \
+# STUB.EXE + WRITE). No wall-clock cap here: under host load the compile
+# can run well past a fixed timeout and fail spuriously (signal 15). Let it
+# run to completion; bazel's own action timeout still bounds a real hang.
+qemu-system-i386 -cpu 486 \
     -drive "file=$IMAGE,format=raw,snapshot=on" \
     -m 64M -display none -no-reboot \
     -debugcon "file:$LOG" \
