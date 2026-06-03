@@ -28,6 +28,7 @@ use crate::kernel::thread::{FdKind, PendingRead, PendingPoll, MAX_FDS};
 use crate::kernel::vfs;
 use crate::vga;
 use crate::Regs;
+use crate::arch::Vcpu;
 use crate::println;
 
 // =============================================================================
@@ -279,8 +280,8 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
         5   => sys_open(kt, linux, a),
         6   => sys_close(kt, a),
         11  => sys_execve(kt, linux, a, regs),
-        12  => sys_chdir(linux, a),
-        13  => sys_time(a),
+        12  => sys_chdir(&mut kt.vcpu, linux, a),
+        13  => sys_time(&mut kt.vcpu, a),
         19  => sys_lseek(kt, a),
         20  => SyscallResult::val(kt.tid),
         // getuid/geteuid/getgid/getegid (16-bit uid variants) — pretend root.
@@ -295,23 +296,23 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
         // setpgid(57)/getpgid(132)/setsid(66)/getpgrp(65)/getsid(147) —
         // single-process job model, return our tid as session/group.
         57 | 66 | 65 | 132 | 147 => SyscallResult::val(kt.tid),
-        33  => sys_access(linux, a),
+        33  => sys_access(&mut kt.vcpu, linux, a),
         42  => sys_pipe(kt, a, false),
         45  => sys_brk(linux, a),
         54  => sys_ioctl(kt, a),
         55  => sys_fcntl(kt, a),
         63  => sys_dup2(kt, a),
-        85  => sys_readlink(a),
+        85  => sys_readlink(&mut kt.vcpu, a),
         // Old i386 struct stat — 64-byte layout. busybox/uclibc still uses
         // these and falls back from stat64; without them mode comes back
         // zero and access(X_OK) reports "Permission denied".
-        106 => sys_stat_old(linux, a),
-        107 => sys_stat_old(linux, a), // lstat — no symlinks, treat as stat
+        106 => sys_stat_old(&mut kt.vcpu, linux, a),
+        107 => sys_stat_old(&mut kt.vcpu, linux, a), // lstat — no symlinks, treat as stat
         108 => sys_fstat_old(kt, a),
         91  => sys_munmap(linux, a),
         114 => sys_wait4(kt, a, regs),
         120 => sys_clone(kt, linux, a, regs),
-        122 => sys_uname(a),
+        122 => sys_uname(&mut kt.vcpu, a),
         125 => SyscallResult::val(0),
         140 => sys_llseek(kt, a),
         146 => sys_writev(kt, a),
@@ -320,11 +321,11 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
         168 => sys_poll(kt, linux, a, regs),
         174 => SyscallResult::val(0),
         175 => SyscallResult::val(0),
-        183 => sys_getcwd(linux, a),
+        183 => sys_getcwd(&mut kt.vcpu, linux, a),
         186 => SyscallResult::val(0),
         192 => sys_mmap2(linux, a),
-        195 => sys_stat64(linux, a),
-        196 => sys_stat64(linux, a),
+        195 => sys_stat64(&mut kt.vcpu, linux, a),
+        196 => sys_stat64(&mut kt.vcpu, linux, a),
         197 => sys_fstat64(kt, a),
         220 => sys_getdents64(kt, linux, a),
         221 => sys_fcntl(kt, a),
@@ -333,14 +334,14 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
         243 => sys_set_thread_area(kt, linux, a),
         252 => sys_exit(tid, a),
         258 => SyscallResult::val(kt.tid),
-        265 => sys_clock_gettime(a),
+        265 => sys_clock_gettime(&mut kt.vcpu, a),
         270 => sys_exit(tid, a),
         295 => sys_openat(kt, linux, a),
-        300 => sys_fstatat64(linux, a),
+        300 => sys_fstatat64(&mut kt.vcpu, linux, a),
         305 => SyscallResult::val(-ENOENT),
         331 => sys_pipe(kt, a, true),
         340 => SyscallResult::val(0),
-        355 => sys_getrandom(a),
+        355 => sys_getrandom(&mut kt.vcpu, a),
         _ => {
             println!("unimplemented syscall {}", nr);
             SyscallResult::val(-ENOSYS)
@@ -356,9 +357,9 @@ fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32
         1   => sys_write(kt, a),
         2   => sys_open(kt, linux, a),
         3   => sys_close(kt, a),
-        4   => sys_stat64(linux, a),
+        4   => sys_stat64(&mut kt.vcpu, linux, a),
         5   => sys_fstat64(kt, a),
-        6   => sys_stat64(linux, a),
+        6   => sys_stat64(&mut kt.vcpu, linux, a),
         7   => sys_poll(kt, linux, a, regs),
         8   => sys_lseek(kt, a),
         9   => sys_mmap2(linux, a),
@@ -369,7 +370,7 @@ fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32
         14  => SyscallResult::val(0),
         16  => sys_ioctl(kt, a),
         20  => sys_writev(kt, a),
-        21  => sys_access(linux, a),
+        21  => sys_access(&mut kt.vcpu, linux, a),
         22  => sys_pipe(kt, a, false),
         24  => sys_sched_yield(kt, regs),
         33  => sys_dup2(kt, a),
@@ -381,10 +382,10 @@ fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32
         60  => sys_exit(tid, a),
         61  => sys_wait4(kt, a, regs),
         72  => sys_fcntl(kt, a),
-        79  => sys_getcwd(linux, a),
-        80  => sys_chdir(linux, a),
+        79  => sys_getcwd(&mut kt.vcpu, linux, a),
+        80  => sys_chdir(&mut kt.vcpu, linux, a),
         89  => SyscallResult::val(-ENOENT),
-        96  => sys_clock_gettime(a),
+        96  => sys_clock_gettime(&mut kt.vcpu, a),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
         110 => SyscallResult::val(kt.tid),
         131 => SyscallResult::val(0),
@@ -393,15 +394,15 @@ fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32
         202 => SyscallResult::val(0),
         217 => sys_getdents64(kt, linux, a),
         218 => SyscallResult::val(kt.tid),
-        228 => sys_clock_gettime(a),
+        228 => sys_clock_gettime(&mut kt.vcpu, a),
         231 => sys_exit(tid, a),
         234 => sys_exit(tid, a),
         257 => sys_openat(kt, linux, a),
-        262 => sys_fstatat64(linux, a),
+        262 => sys_fstatat64(&mut kt.vcpu, linux, a),
         267 => SyscallResult::val(-ENOENT),
         293 => sys_pipe(kt, a, true),
         302 => SyscallResult::val(0),
-        318 => sys_getrandom(a),
+        318 => sys_getrandom(&mut kt.vcpu, a),
         _ => {
             println!("unimplemented x86_64 syscall {}", nr);
             SyscallResult::val(-ENOSYS)
@@ -412,16 +413,6 @@ fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32
 // =============================================================================
 // Helpers: C string / path handling
 // =============================================================================
-
-/// Read a NUL-terminated C string from user memory. Returns slice excluding NUL.
-unsafe fn read_c_str(ptr: usize, max: usize) -> &'static [u8] {
-    unsafe {
-        let p = ptr as *const u8;
-        let mut len = 0;
-        while len < max && *p.add(len) != 0 { len += 1; }
-        core::slice::from_raw_parts(p, len)
-    }
-}
 
 /// Resolve a path (NUL-terminated user pointer) against cwd.
 /// Leading `/` = absolute (strip it). Otherwise prepend cwd.
@@ -473,22 +464,19 @@ pub fn do_chdir(path: &[u8], cwd: &mut [u8; 64], cwd_len: &mut usize) -> i32 {
 
 /// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
 /// Read a C `char**` (NULL-terminated) from 32-bit user memory into Vec<Vec<u8>>.
-fn read_c_argv(ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+fn read_c_argv(vcpu: &Vcpu, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
     let mut args = alloc::vec::Vec::new();
     if ptr == 0 { return args; }
-    unsafe {
-        let mut offset = 0usize;
-        loop {
-            let arg_ptr = if wide {
-                *((ptr + offset) as *const u64) as usize
-            } else {
-                *((ptr + offset) as *const u32) as usize
-            };
-            if arg_ptr == 0 { break; }
-            let s = read_c_str(arg_ptr, 4096);
-            args.push(s.to_vec());
-            offset += if wide { 8 } else { 4 };
-        }
+    let mut offset = 0usize;
+    loop {
+        let arg_ptr = if wide {
+            vcpu.read::<u64>(ptr + offset) as usize
+        } else {
+            vcpu.read::<u32>(ptr + offset) as usize
+        };
+        if arg_ptr == 0 { break; }
+        args.push(vcpu.c_str(arg_ptr, 4096).to_vec());
+        offset += if wide { 8 } else { 4 };
     }
     args
 }
@@ -502,7 +490,13 @@ fn read_c_argv(ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
 ///   [16 random bytes] [string pool]
 ///
 /// For 64-bit: same layout with 8-byte slots.
-pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool) -> usize {
+pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], want_64: bool) -> usize {
+    // Write one machine word (4 or 8 bytes, per client bitness) to the stack.
+    fn write_word(vcpu: &mut Vcpu, addr: usize, val: usize, want_64: bool) {
+        if want_64 { vcpu.write::<u64>(addr, val as u64); }
+        else { vcpu.write::<u32>(addr, val as u32); }
+    }
+
     let stack_top = elf::USER_STACK_TOP;
     let word = if want_64 { 8usize } else { 4 };
     let mut sp = stack_top;
@@ -513,10 +507,8 @@ pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool) -> u
     let mut env_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(env_strings.len());
     for &env in env_strings.iter().rev() {
         sp -= env.len() + 1;
-        unsafe {
-            core::ptr::copy_nonoverlapping(env.as_ptr(), sp as *mut u8, env.len());
-            *((sp + env.len()) as *mut u8) = 0;
-        }
+        vcpu.write_bytes(sp, env);
+        vcpu.write::<u8>(sp + env.len(), 0);
         env_addrs.push(sp);
     }
     env_addrs.reverse();
@@ -525,10 +517,8 @@ pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool) -> u
     let mut string_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(args.len());
     for arg in args.iter().rev() {
         sp -= arg.len() + 1; // +1 for NUL
-        unsafe {
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
-            *((sp + arg.len()) as *mut u8) = 0; // NUL terminator
-        }
+        vcpu.write_bytes(sp, arg);
+        vcpu.write::<u8>(sp + arg.len(), 0); // NUL terminator
         string_addrs.push(sp);
     }
     string_addrs.reverse();
@@ -537,12 +527,8 @@ pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool) -> u
     sp &= !(word - 1); // align
     sp -= 16;
     let random_addr = sp;
-    // Fill with PRNG output
-    unsafe {
-        let rnd = sp as *mut u32;
-        for i in 0..4 {
-            *rnd.add(i) = thread::prng() as u32;
-        }
+    for i in 0..4 {
+        vcpu.write::<u32>(sp + i * 4, thread::prng() as u32);
     }
 
     // 3. Compute total header size and align
@@ -558,66 +544,31 @@ pub(crate) fn setup_user_stack(args: &[alloc::vec::Vec<u8>], want_64: bool) -> u
     let mut pos = base;
 
     // 4. Write argc
-    if want_64 {
-        unsafe { *(pos as *mut u64) = args.len() as u64; }
-    } else {
-        unsafe { *(pos as *mut u32) = args.len() as u32; }
-    }
+    write_word(vcpu, pos, args.len(), want_64);
     pos += word;
 
-    // 5. Write argv[0..N-1]
+    // 5. Write argv[0..N-1] then the argv[N] = NULL terminator
     for &addr in &string_addrs {
-        if want_64 {
-            unsafe { *(pos as *mut u64) = addr as u64; }
-        } else {
-            unsafe { *(pos as *mut u32) = addr as u32; }
-        }
+        write_word(vcpu, pos, addr, want_64);
         pos += word;
     }
-    // argv[N] = NULL
-    if want_64 {
-        unsafe { *(pos as *mut u64) = 0; }
-    } else {
-        unsafe { *(pos as *mut u32) = 0; }
-    }
+    write_word(vcpu, pos, 0, want_64);
     pos += word;
 
-    // 6. envp[0..M-1]
+    // 6. envp[0..M-1] then the envp[M] = NULL terminator
     for &addr in &env_addrs {
-        if want_64 {
-            unsafe { *(pos as *mut u64) = addr as u64; }
-        } else {
-            unsafe { *(pos as *mut u32) = addr as u32; }
-        }
+        write_word(vcpu, pos, addr, want_64);
         pos += word;
     }
-    // envp[M] = NULL
-    if want_64 {
-        unsafe { *(pos as *mut u64) = 0; }
-    } else {
-        unsafe { *(pos as *mut u32) = 0; }
-    }
+    write_word(vcpu, pos, 0, want_64);
     pos += word;
 
-    // 7. Auxiliary vector
-    let write_auxv = |p: &mut usize, tag: usize, val: usize| {
-        if want_64 {
-            unsafe {
-                *(*p as *mut u64) = tag as u64;
-                *((*p + 8) as *mut u64) = val as u64;
-            }
-        } else {
-            unsafe {
-                *(*p as *mut u32) = tag as u32;
-                *((*p + 4) as *mut u32) = val as u32;
-            }
-        }
-        *p += word * 2;
-    };
-
-    write_auxv(&mut pos, 6, 4096);         // AT_PAGESZ = 4096
-    write_auxv(&mut pos, 25, random_addr);  // AT_RANDOM = pointer to 16 random bytes
-    write_auxv(&mut pos, 0, 0);             // AT_NULL
+    // 7. Auxiliary vector: (AT_PAGESZ, 4096), (AT_RANDOM, ptr), (AT_NULL, 0)
+    for (tag, val) in [(6usize, 4096usize), (25, random_addr), (0, 0)] {
+        write_word(vcpu, pos, tag, want_64);
+        write_word(vcpu, pos + word, val, want_64);
+        pos += word * 2;
+    }
 
     base // return sp
 }
@@ -633,9 +584,9 @@ pub fn exec_elf_into(tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::V
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
     let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
-    let sp = setup_user_stack(args, want_64);
 
     let current = thread::get_thread(tid).unwrap();
+    let sp = setup_user_stack(&mut current.kernel.vcpu, args, want_64);
     if want_64 {
         thread::init_process_thread_64(current, loaded.entry, sp as u64);
     } else {
@@ -674,7 +625,7 @@ fn sys_fork(kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, re
         None => return SyscallResult::val(-ENOMEM),
     };
 
-    child.kernel.cpu_state = *regs;
+    child.kernel.vcpu.regs = *regs;
 
     kt.dup_all_fds(&mut child.kernel);
     if let thread::Personality::Linux(cl) = &mut child.personality {
@@ -704,7 +655,7 @@ fn sys_clone(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, re
     if child_stack != 0 {
         if let Some(child_tid) = result.switch_to {
             if let Some(child) = thread::get_thread(child_tid) {
-                child.kernel.cpu_state.frame.rsp = child_stack as u64;
+                child.kernel.vcpu.regs.frame.rsp = child_stack as u64;
             }
         }
     }
@@ -723,7 +674,7 @@ fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
 
     match fd_kind {
         thread::FdKind::PipeRead(idx) => {
-            let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+            let user_buf = kt.vcpu.slice_mut(buf, len);
             let n = crate::kernel::kpipe::read(idx, user_buf);
             if n > 0 {
                 return SyscallResult::val(n as i32);
@@ -739,7 +690,7 @@ fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
             // unblock. Keep the thread as the running tid; the Blocked
             // drain at the top of event_loop satisfies the read as soon as
             // bytes show up.
-            kt.cpu_state = *regs;
+            kt.vcpu.regs = *regs;
             kt.state = thread::ThreadState::Blocked;
             linux.pending_read = Some(thread::PendingRead {
                 fd_kind,
@@ -749,7 +700,7 @@ fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
             SyscallResult { retval: 0, switch_to: None }
         }
         thread::FdKind::Vfs(handle) => {
-            let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+            let user_buf = kt.vcpu.slice_mut(buf, len);
             SyscallResult::val(vfs::read_by_handle(handle, user_buf))
         }
         thread::FdKind::ConsoleOut | thread::FdKind::PipeWrite(_) | thread::FdKind::Dir(_) => {
@@ -762,7 +713,7 @@ fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
 /// write(4)
 fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
-    let buf = a.a1 as usize as *const u8;
+    let buf = a.a1 as usize;
     let len = a.a2 as usize;
 
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
@@ -770,16 +721,13 @@ fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 
     match fd_kind {
         thread::FdKind::ConsoleOut => {
-            unsafe {
-                for i in 0..len {
-                    vga::vga().putchar(*buf.add(i));
-                }
+            for &b in kt.vcpu.slice(buf, len) {
+                vga::vga().putchar(b);
             }
             SyscallResult::val(len as i32)
         }
         thread::FdKind::PipeWrite(idx) => {
-            let data = unsafe { core::slice::from_raw_parts(buf, len) };
-            let r = crate::kernel::kpipe::write(idx, data);
+            let r = crate::kernel::kpipe::write(idx, kt.vcpu.slice(buf, len));
             if r < 0 {
                 SyscallResult::val(-EPIPE)
             } else {
@@ -787,8 +735,7 @@ fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
             }
         }
         thread::FdKind::Vfs(handle) => {
-            let data = unsafe { core::slice::from_raw_parts(buf, len) };
-            SyscallResult::val(vfs::write_by_handle(handle, data))
+            SyscallResult::val(vfs::write_by_handle(handle, kt.vcpu.slice(buf, len)))
         }
         thread::FdKind::PipeRead(_) | thread::FdKind::None | thread::FdKind::Dir(_) => {
             SyscallResult::val(-EBADF)
@@ -799,7 +746,7 @@ fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 /// open(5)
 fn sys_open(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -> SyscallResult {
     let path_ptr = a.a0 as usize;
-    let path = unsafe { read_c_str(path_ptr, 256) };
+    let path = kt.vcpu.c_str(path_ptr, 256);
 
     let mut buf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut buf);
@@ -849,7 +796,7 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
     let argv_ptr = a.a1 as usize;
     let _envp_ptr = a.a2 as usize;
 
-    let raw_path = unsafe { read_c_str(path_ptr, 256) };
+    let raw_path = kt.vcpu.c_str(path_ptr, 256);
     // Resolve /proc/self/exe to this process's own load path (tracked in
     // LinuxState.exec_path, set on every exec) — busybox's standalone-shell
     // mode re-execs itself that way, and we have no real /proc. Copy to the
@@ -868,7 +815,7 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
     // rather than argv[0]; only synthesize argv[0] from the path if the caller
     // passed an empty argv.
     let wide = regs.mode() == crate::UserMode::Mode64;
-    let mut args = read_c_argv(argv_ptr, wide);
+    let mut args = read_c_argv(&kt.vcpu, argv_ptr, wide);
     if args.is_empty() { args.push(path.clone()); }
 
     // Snapshot cwd up front — execve preserves it across the address-space
@@ -897,22 +844,22 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
     }
 
     // Reload regs from thread (init_thread sets them via get_thread)
-    *regs = thread::get_thread(tid).unwrap().kernel.cpu_state;
+    *regs = thread::get_thread(tid).unwrap().kernel.vcpu.regs;
     SyscallResult { retval: 0, switch_to: Some(tid) }
 }
 
 
 /// chdir(12)
-fn sys_chdir(linux: &mut LinuxState, a: &Args) -> SyscallResult {
-    let path = unsafe { read_c_str(a.a0 as usize, 256) };
+fn sys_chdir(vcpu: &mut Vcpu, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+    let path = vcpu.c_str(a.a0 as usize, 256);
     SyscallResult::val(do_chdir(path, &mut linux.cwd, &mut linux.cwd_len))
 }
 
 /// time(13) — stub
-fn sys_time(a: &Args) -> SyscallResult {
+fn sys_time(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
     let ptr = a.a0 as usize;
     if ptr != 0 {
-        unsafe { *(ptr as *mut u32) = 0; }
+        vcpu.write::<u32>(ptr, 0);
     }
     SyscallResult::val(0)
 }
@@ -962,7 +909,7 @@ fn sys_ioctl(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
             // struct termios is ~36 bytes on i386. Zero is fine — what
             // matters for isatty() is just that the call succeeds.
             if arg != 0 {
-                unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 36); }
+                kt.vcpu.zero(arg, 36);
             }
             SyscallResult::val(0)
         }
@@ -970,18 +917,17 @@ fn sys_ioctl(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
         TIOCGWINSZ => {
             // struct winsize: ws_row, ws_col, ws_xpixel, ws_ypixel — 4×u16.
             if arg != 0 {
-                unsafe {
-                    *(arg as *mut u16) = 25;          // ws_row
-                    *((arg + 2) as *mut u16) = 80;    // ws_col
-                    *((arg + 4) as *mut u16) = 0;
-                    *((arg + 6) as *mut u16) = 0;
-                }
+                kt.vcpu.write::<u16>(arg, 25);       // ws_row
+                kt.vcpu.write::<u16>(arg + 2, 80);   // ws_col
+                kt.vcpu.write::<u16>(arg + 4, 0);
+                kt.vcpu.write::<u16>(arg + 6, 0);
             }
             SyscallResult::val(0)
         }
         TIOCGPGRP => {
             if arg != 0 {
-                unsafe { *(arg as *mut i32) = kt.tid; }
+                let tid = kt.tid;
+                kt.vcpu.write::<i32>(arg, tid);
             }
             SyscallResult::val(0)
         }
@@ -992,22 +938,22 @@ fn sys_ioctl(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 /// readlink(85) — minimal stub: only resolves /proc/self/exe (used by
 /// static-busybox to find its own re-exec path). Everything else returns
 /// EINVAL since we have no symlinks.
-fn sys_readlink(a: &Args) -> SyscallResult {
-    let path = unsafe { read_c_str(a.a0 as usize, 256) };
-    let buf = a.a1 as usize as *mut u8;
+fn sys_readlink(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
+    let buf = a.a1 as usize;
     let bufsz = a.a2 as usize;
-    if path == b"/proc/self/exe" {
+    let is_self_exe = vcpu.c_str(a.a0 as usize, 256) == b"/proc/self/exe";
+    if is_self_exe {
         let target: &[u8] = b"/bin/busybox";
         let n = target.len().min(bufsz);
-        unsafe { core::ptr::copy_nonoverlapping(target.as_ptr(), buf, n); }
+        vcpu.write_bytes(buf, &target[..n]);
         return SyscallResult::val(n as i32);
     }
     SyscallResult::val(-EINVAL)
 }
 
 /// access(33) — check file existence via VFS stat
-fn sys_access(linux: &LinuxState, a: &Args) -> SyscallResult {
-    let path = unsafe { read_c_str(a.a0 as usize, 256) };
+fn sys_access(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
+    let path = vcpu.c_str(a.a0 as usize, 256);
     let mut buf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut buf);
     let handle = vfs::open_to_handle(resolved);
@@ -1094,7 +1040,7 @@ fn sys_wait4(kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> Syscal
 
     if child_tid >= 0 {
         if status_ptr != 0 {
-            unsafe { *(status_ptr as *mut i32) = (exit_code & 0xFF) << 8; }
+            kt.vcpu.write::<i32>(status_ptr, (exit_code & 0xFF) << 8);
         }
         return SyscallResult::val(child_tid);
     }
@@ -1108,31 +1054,23 @@ fn sys_wait4(kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> Syscal
     if let thread::Personality::Linux(linux) = &mut thread::get_thread(tid).unwrap().personality {
         linux.wait_status_ptr = status_ptr;
     }
-    kt.cpu_state = *regs;
+    kt.vcpu.regs = *regs;
     kt.state = thread::ThreadState::Blocked;
     let next = thread::schedule(tid).unwrap_or(0);
     SyscallResult { retval: 0, switch_to: Some(next) }
 }
 
 /// uname(122)
-fn sys_uname(a: &Args) -> SyscallResult {
-    let buf = a.a0 as usize as *mut u8;
-    if buf.is_null() { return SyscallResult::val(-EFAULT); }
+fn sys_uname(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
+    let buf = a.a0 as usize;
+    if buf == 0 { return SyscallResult::val(-EFAULT); }
 
-    // Linux struct old_utsname: 5 fields, 65 bytes each
-    unsafe {
-        let p = buf;
-        core::ptr::write_bytes(p, 0, 65 * 6);
-        let write_field = |offset: usize, s: &[u8]| {
-            let dst = p.add(offset);
-            core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len().min(64));
-        };
-        write_field(0, b"Linux");
-        write_field(65, b"retroos");
-        write_field(130, b"5.0.0");
-        write_field(195, b"#1");
-        write_field(260, b"i686");
-        write_field(325, b"(none)");
+    // Linux struct old_utsname: 6 fields, 65 bytes each
+    vcpu.zero(buf, 65 * 6);
+    let fields: [&[u8]; 6] = [b"Linux", b"retroos", b"5.0.0", b"#1", b"i686", b"(none)"];
+    for (i, s) in fields.iter().enumerate() {
+        let n = s.len().min(64);
+        vcpu.write_bytes(buf + i * 65, &s[..n]);
     }
     SyscallResult::val(0)
 }
@@ -1157,7 +1095,7 @@ fn sys_llseek(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     if r < 0 { return SyscallResult::val(r); }
 
     if result_ptr != 0 {
-        unsafe { *(result_ptr as *mut i64) = r as i64; }
+        kt.vcpu.write::<i64>(result_ptr, r as i64);
     }
     SyscallResult::val(0)
 }
@@ -1177,29 +1115,25 @@ fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     for i in 0..iovcnt {
         // struct iovec { void *iov_base; size_t iov_len; } — 8 bytes on i386
         let base_addr = iov_ptr + i * 8;
-        let iov_base = unsafe { *(base_addr as *const u32) } as usize;
-        let iov_len = unsafe { *((base_addr + 4) as *const u32) } as usize;
+        let iov_base = kt.vcpu.read::<u32>(base_addr) as usize;
+        let iov_len = kt.vcpu.read::<u32>(base_addr + 4) as usize;
 
         if iov_len == 0 { continue; }
 
         match fd_kind {
             thread::FdKind::ConsoleOut => {
-                unsafe {
-                    for j in 0..iov_len {
-                        vga::vga().putchar(*(iov_base as *const u8).add(j));
-                    }
+                for &b in kt.vcpu.slice(iov_base, iov_len) {
+                    vga::vga().putchar(b);
                 }
                 total += iov_len as i32;
             }
             thread::FdKind::PipeWrite(idx) => {
-                let data = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
-                let r = crate::kernel::kpipe::write(idx, data);
+                let r = crate::kernel::kpipe::write(idx, kt.vcpu.slice(iov_base, iov_len));
                 if r < 0 { return SyscallResult::val(-EPIPE); }
                 total += r;
             }
             thread::FdKind::Vfs(handle) => {
-                let data = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
-                let r = vfs::write_by_handle(handle, data);
+                let r = vfs::write_by_handle(handle, kt.vcpu.slice(iov_base, iov_len));
                 if r < 0 { return SyscallResult::val(r); }
                 total += r;
             }
@@ -1213,8 +1147,8 @@ fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 /// sched_yield(158)
 fn sys_sched_yield(kt: &mut thread::KernelThread, regs: &mut Regs) -> SyscallResult {
     let tid = kt.tid as usize;
-    kt.cpu_state = *regs;
-    kt.cpu_state.rax = 0;
+    kt.vcpu.regs = *regs;
+    kt.vcpu.regs.rax = 0;
     kt.state = thread::ThreadState::Ready;
     SyscallResult { retval: 0, switch_to: thread::schedule(tid) }
 }
@@ -1227,14 +1161,14 @@ fn sys_nanosleep() -> SyscallResult {
 /// Evaluate a pollfd[] array once, writing revents and returning the
 /// number of fds with non-zero revents. Used by both sys_poll's first try
 /// and the event-loop's pending-poll retry.
-pub(crate) fn run_poll(kt: &thread::KernelThread, fds_ptr: usize, nfds: usize) -> i32 {
+pub(crate) fn run_poll(kt: &mut thread::KernelThread, fds_ptr: usize, nfds: usize) -> i32 {
     const POLLIN: i16 = 1;
     const POLLOUT: i16 = 4;
     let mut ready = 0i32;
     for i in 0..nfds {
         let base = fds_ptr + i * 8;
-        let fd = unsafe { *(base as *const i32) } as usize;
-        let events = unsafe { *((base + 4) as *const i16) };
+        let fd = kt.vcpu.read::<i32>(base) as usize;
+        let events = kt.vcpu.read::<i16>(base + 4);
         let mut revents: i16 = 0;
         if fd < thread::MAX_FDS {
             match kt.fds[fd] {
@@ -1256,7 +1190,7 @@ pub(crate) fn run_poll(kt: &thread::KernelThread, fds_ptr: usize, nfds: usize) -
                 thread::FdKind::None => {}
             }
         }
-        unsafe { *((base + 6) as *mut i16) = revents; }
+        kt.vcpu.write::<i16>(base + 6, revents);
         if revents != 0 { ready += 1; }
     }
     ready
@@ -1277,24 +1211,22 @@ fn sys_poll(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
     // bytes show up on the watched pipe(s). Same focus rules as sys_read:
     // don't yield, since console keystrokes only land in the focused
     // thread's pipe.
-    kt.cpu_state = *regs;
+    kt.vcpu.regs = *regs;
     kt.state = thread::ThreadState::Blocked;
     linux.pending_poll = Some(thread::PendingPoll { fds_ptr, nfds, timeout_ms: timeout });
     SyscallResult { retval: 0, switch_to: None }
 }
 
 /// getcwd(183)
-fn sys_getcwd(linux: &LinuxState, a: &Args) -> SyscallResult {
-    let ptr = a.a0 as usize as *mut u8;
+fn sys_getcwd(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
+    let ptr = a.a0 as usize;
     let size = a.a1 as usize;
     let cwd = linux.cwd_str();
     // Linux getcwd returns absolute path with leading /
     if size < cwd.len() + 2 { return SyscallResult::val(-EINVAL); }
-    unsafe {
-        *(ptr) = b'/';
-        core::ptr::copy_nonoverlapping(cwd.as_ptr(), ptr.add(1), cwd.len());
-        *(ptr.add(1 + cwd.len())) = 0; // NUL
-    }
+    vcpu.write::<u8>(ptr, b'/');
+    vcpu.write_bytes(ptr + 1, cwd);
+    vcpu.write::<u8>(ptr + 1 + cwd.len(), 0); // NUL
     SyscallResult::val((cwd.len() + 2) as i32)
 }
 
@@ -1341,17 +1273,17 @@ fn sys_mmap2(linux: &mut LinuxState, a: &Args) -> SyscallResult {
 }
 
 /// stat64(195) / lstat64(196)
-fn sys_stat64(linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let stat_buf = a.a1 as usize;
-    let path = unsafe { read_c_str(path_ptr, 256) };
+    let path = vcpu.c_str(path_ptr, 256);
 
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
 
     // Check if it's a directory
     if vfs::dir_exists(resolved) {
-        write_stat64(stat_buf, 0o40755, 0);
+        write_stat64(vcpu, stat_buf, 0o40755, 0);
         return SyscallResult::val(0);
     }
 
@@ -1360,7 +1292,7 @@ fn sys_stat64(linux: &LinuxState, a: &Args) -> SyscallResult {
     let size = vfs::file_size_by_handle(handle);
     let posix_mode = vfs::file_mode_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat64(stat_buf, 0o100000 | posix_mode as u32, size);
+    write_stat64(vcpu, stat_buf, 0o100000 | posix_mode as u32, size);
     SyscallResult::val(0)
 }
 
@@ -1373,17 +1305,17 @@ fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     match kt.fds[fd] {
         thread::FdKind::ConsoleOut | thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => {
             // stdin/stdout/stderr / pipes — character device / pipe
-            write_stat64(stat_buf, 0o20666, 0); // S_IFCHR
+            write_stat64(&mut kt.vcpu, stat_buf, 0o20666, 0); // S_IFCHR
             SyscallResult::val(0)
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
             let mode = vfs::file_mode_by_handle(handle);
-            write_stat64(stat_buf, 0o100000 | mode as u32, size);
+            write_stat64(&mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {
-            write_stat64(stat_buf, 0o40755, 0); // S_IFDIR
+            write_stat64(&mut kt.vcpu, stat_buf, 0o40755, 0); // S_IFDIR
             SyscallResult::val(0)
         }
         thread::FdKind::None => SyscallResult::val(-EBADF),
@@ -1391,52 +1323,44 @@ fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// fstatat64(300)
-fn sys_fstatat64(linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_fstatat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
     let _dirfd = a.a0 as i32;
     // Treat as stat64 on the path (a.a1 = path, a.a2 = stat buf)
     let shifted = Args { a0: a.a1, a1: a.a2, a2: a.a3, a3: a.a4, a4: a.a5, a5: 0 };
-    sys_stat64(linux, &shifted)
+    sys_stat64(vcpu, linux, &shifted)
 }
 
 /// Write a minimal Linux stat64 struct to user memory.
 /// struct stat64 on i386 is 96 bytes. We fill mode, size, blksize.
-fn write_stat64(buf: usize, mode: u32, size: u32) {
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 96);
-        // st_mode at offset 16 (u32)
-        *((buf + 16) as *mut u32) = mode;
-        // st_size at offset 44 (u64 on stat64)
-        *((buf + 44) as *mut u64) = size as u64;
-        // st_blksize at offset 56 (u32)
-        *((buf + 56) as *mut u32) = 4096;
-        // st_blocks at offset 64 (u64) — size / 512
-        *((buf + 64) as *mut u64) = ((size as u64) + 511) / 512;
-    }
+fn write_stat64(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32) {
+    vcpu.zero(buf, 96);
+    vcpu.write::<u32>(buf + 16, mode);                          // st_mode
+    vcpu.write::<u64>(buf + 44, size as u64);                   // st_size (u64 on stat64)
+    vcpu.write::<u32>(buf + 56, 4096);                          // st_blksize
+    vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
 }
 
 /// Write the old (pre-LFS) Linux i386 `struct stat` (newstat layout, 64 bytes).
 /// Used by syscalls 106/107/108. uclibc's busybox falls back to these for
 /// access/exec checks; without correct mode bits we get spurious EACCES.
-fn write_stat_old(buf: usize, mode: u32, size: u32) {
-    unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 64);
-        *((buf + 0x08) as *mut u16) = mode as u16;       // st_mode
-        *((buf + 0x0a) as *mut u16) = 1;                  // st_nlink
-        *((buf + 0x14) as *mut u32) = size;               // st_size
-        *((buf + 0x18) as *mut u32) = 4096;               // st_blksize
-        *((buf + 0x1c) as *mut u32) = (size + 511) / 512; // st_blocks
-    }
+fn write_stat_old(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32) {
+    vcpu.zero(buf, 64);
+    vcpu.write::<u16>(buf + 0x08, mode as u16);          // st_mode
+    vcpu.write::<u16>(buf + 0x0a, 1);                    // st_nlink
+    vcpu.write::<u32>(buf + 0x14, size);                 // st_size
+    vcpu.write::<u32>(buf + 0x18, 4096);                 // st_blksize
+    vcpu.write::<u32>(buf + 0x1c, (size + 511) / 512);   // st_blocks
 }
 
 /// stat(106) / lstat(107) — old struct stat layout. We have no symlinks so
 /// lstat falls through to stat.
-fn sys_stat_old(linux: &LinuxState, a: &Args) -> SyscallResult {
-    let path = unsafe { read_c_str(a.a0 as usize, 256) };
+fn sys_stat_old(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
+    let path = vcpu.c_str(a.a0 as usize, 256);
     let stat_buf = a.a1 as usize;
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
     if vfs::dir_exists(resolved) {
-        write_stat_old(stat_buf, 0o40755, 0);
+        write_stat_old(vcpu, stat_buf, 0o40755, 0);
         return SyscallResult::val(0);
     }
     let handle = vfs::open_to_handle(resolved);
@@ -1444,7 +1368,7 @@ fn sys_stat_old(linux: &LinuxState, a: &Args) -> SyscallResult {
     let size = vfs::file_size_by_handle(handle);
     let mode = vfs::file_mode_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat_old(stat_buf, 0o100000 | mode as u32, size);
+    write_stat_old(vcpu, stat_buf, 0o100000 | mode as u32, size);
     SyscallResult::val(0)
 }
 
@@ -1455,17 +1379,17 @@ fn sys_fstat_old(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
     match kt.fds[fd] {
         thread::FdKind::ConsoleOut | thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => {
-            write_stat_old(stat_buf, 0o20666, 0); // S_IFCHR
+            write_stat_old(&mut kt.vcpu, stat_buf, 0o20666, 0); // S_IFCHR
             SyscallResult::val(0)
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
             let mode = vfs::file_mode_by_handle(handle);
-            write_stat_old(stat_buf, 0o100000 | mode as u32, size);
+            write_stat_old(&mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {
-            write_stat_old(stat_buf, 0o40755, 0);
+            write_stat_old(&mut kt.vcpu, stat_buf, 0o40755, 0);
             SyscallResult::val(0)
         }
         _ => SyscallResult::val(-EBADF),
@@ -1508,14 +1432,12 @@ fn sys_getdents64(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -
         }
 
         let base = dirp + offset;
-        unsafe {
-            core::ptr::write_bytes(base as *mut u8, 0, reclen);
-            *(base as *mut u64) = index as u64;         // d_ino
-            *((base + 8) as *mut u64) = index as u64;   // d_off
-            *((base + 16) as *mut u16) = reclen as u16;  // d_reclen
-            *((base + 18) as *mut u8) = if entry.is_dir { 4 } else { 8 }; // d_type: DT_DIR/DT_REG
-            core::ptr::copy_nonoverlapping(name.as_ptr(), (base + 19) as *mut u8, name.len());
-        }
+        kt.vcpu.zero(base, reclen);
+        kt.vcpu.write::<u64>(base, index as u64);         // d_ino
+        kt.vcpu.write::<u64>(base + 8, index as u64);     // d_off
+        kt.vcpu.write::<u16>(base + 16, reclen as u16);   // d_reclen
+        kt.vcpu.write::<u8>(base + 18, if entry.is_dir { 4 } else { 8 }); // d_type: DT_DIR/DT_REG
+        kt.vcpu.write_bytes(base + 19, name);
         offset += reclen;
     }
 
@@ -1526,22 +1448,22 @@ fn sys_getdents64(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -
 }
 
 /// set_thread_area(243) — parse user_desc struct, set GDT TLS entry, save to LinuxState
-fn sys_set_thread_area(_kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_set_thread_area(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let u_info = a.a0 as usize;
     if u_info == 0 { return SyscallResult::val(-EFAULT); }
 
     // struct user_desc { entry_number: i32, base_addr: u32, limit: u32, flags: u32 }
-    let entry_number = unsafe { *(u_info as *const i32) };
-    let base_addr = unsafe { *((u_info + 4) as *const u32) };
-    let limit = unsafe { *((u_info + 8) as *const u32) };
-    let flags = unsafe { *((u_info + 12) as *const u32) };
+    let entry_number = kt.vcpu.read::<i32>(u_info);
+    let base_addr = kt.vcpu.read::<u32>(u_info + 4);
+    let limit = kt.vcpu.read::<u32>(u_info + 8);
+    let flags = kt.vcpu.read::<u32>(u_info + 12);
     let limit_in_pages = flags & (1 << 4) != 0;
 
     let idx = startup::arch_set_tls_entry(entry_number, base_addr, limit, limit_in_pages);
     if idx < 0 { return SyscallResult::val(-ESRCH); }
 
     // Write back the allocated entry number
-    unsafe { *(u_info as *mut i32) = idx; }
+    kt.vcpu.write::<i32>(u_info, idx);
 
     // Save TLS state for context-switch restore
     linux.tls_entry = idx;
@@ -1554,7 +1476,7 @@ fn sys_set_thread_area(_kt: &mut thread::KernelThread, linux: &mut LinuxState, a
 
 /// arch_prctl(158) — x86_64 TLS via FS/GS base.
 /// Stores the base in regs.fs/gs — arch layer writes MSR on return to user.
-fn sys_arch_prctl(_kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_arch_prctl(kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     const ARCH_SET_GS: u64 = 0x1001;
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
@@ -1564,13 +1486,13 @@ fn sys_arch_prctl(_kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &A
         ARCH_SET_FS => { regs.fs = a.a1; SyscallResult::val(0) }
         ARCH_SET_GS => { regs.gs = a.a1; SyscallResult::val(0) }
         ARCH_GET_FS => {
-            let ptr = a.a1 as usize as *mut u64;
-            if !ptr.is_null() { unsafe { *ptr = regs.fs; } }
+            let ptr = a.a1 as usize;
+            if ptr != 0 { kt.vcpu.write::<u64>(ptr, regs.fs); }
             SyscallResult::val(0)
         }
         ARCH_GET_GS => {
-            let ptr = a.a1 as usize as *mut u64;
-            if !ptr.is_null() { unsafe { *ptr = regs.gs; } }
+            let ptr = a.a1 as usize;
+            if ptr != 0 { kt.vcpu.write::<u64>(ptr, regs.gs); }
             SyscallResult::val(0)
         }
         _ => SyscallResult::val(-EINVAL),
@@ -1578,7 +1500,7 @@ fn sys_arch_prctl(_kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &A
 }
 
 /// clock_gettime(265) — monotonic from tick counter
-fn sys_clock_gettime(a: &Args) -> SyscallResult {
+fn sys_clock_gettime(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
     let _clock_id = a.a0 as u32;
     let tp = a.a1 as usize;
     if tp != 0 {
@@ -1586,10 +1508,8 @@ fn sys_clock_gettime(a: &Args) -> SyscallResult {
         // PIT ticks at ~1193182 Hz, timer IRQ at ~100 Hz (div=11932)
         let secs = ticks / 100;
         let nsecs = (ticks % 100) * 10_000_000;
-        unsafe {
-            *(tp as *mut u32) = secs as u32;       // tv_sec
-            *((tp + 4) as *mut u32) = nsecs as u32; // tv_nsec
-        }
+        vcpu.write::<u32>(tp, secs as u32);        // tv_sec
+        vcpu.write::<u32>(tp + 4, nsecs as u32);   // tv_nsec
     }
     SyscallResult::val(0)
 }
@@ -1606,14 +1526,11 @@ fn sys_openat(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -> Sy
 }
 
 /// getrandom(355) — stub: fill with PRNG output
-fn sys_getrandom(a: &Args) -> SyscallResult {
+fn sys_getrandom(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
     let buf = a.a0 as usize;
     let buflen = a.a1 as usize;
-    unsafe {
-        let p = buf as *mut u8;
-        for i in 0..buflen {
-            *p.add(i) = thread::prng() as u8;
-        }
+    for b in vcpu.slice_mut(buf, buflen) {
+        *b = thread::prng() as u8;
     }
     SyscallResult::val(buflen as i32)
 }
@@ -1653,10 +1570,8 @@ fn sys_pipe(kt: &mut thread::KernelThread, a: &Args, is_pipe2: bool) -> SyscallR
         kt.cloexec |= (1 << read_fd) | (1 << write_fd);
     }
 
-    unsafe {
-        *(pipefd_ptr as *mut i32) = read_fd as i32;
-        *((pipefd_ptr + 4) as *mut i32) = write_fd as i32;
-    }
+    kt.vcpu.write::<i32>(pipefd_ptr, read_fd as i32);
+    kt.vcpu.write::<i32>(pipefd_ptr + 4, write_fd as i32);
     SyscallResult::val(0)
 }
 

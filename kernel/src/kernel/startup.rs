@@ -281,13 +281,13 @@ const ASSERT_ADDR_HASH: bool = false;
 fn verify_cpu_hash(t: &thread::Thread, tag: &str) {
     let k = &t.kernel;
     if k.cpu_hash == 0 { return; }
-    let actual = thread::hash_regs(&k.cpu_state);
+    let actual = thread::hash_regs(&k.vcpu.regs);
     if actual == k.cpu_hash { return; }
     crate::println!(
         "\x1b[91mCPU STATE CORRUPTION [{}] tid={} expected={:#018x} actual={:#018x}\x1b[0m",
         tag, k.tid, k.cpu_hash, actual,
     );
-    let r = &k.cpu_state;
+    let r = &k.vcpu.regs;
     crate::println!(
         "  cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x} flags={:08x}",
         r.code_seg(), r.ip32(), r.stack_seg(), r.sp32(), r.flags32(),
@@ -576,20 +576,18 @@ fn switch_thread(tid: usize, new_tid: usize) -> usize {
         old.personality.suspend();
     }
     verify_cpu_hash(new, "switch-in");
-    let mut swap_regs = new.kernel.cpu_state;
-    let mut swap_root = new.kernel.root;
+    let mut swap_vcpu = new.kernel.vcpu;
     let mut swap_fx = new.kernel.fx_state;
     if ASSERT_ADDR_HASH {
         let mut hash = new.kernel.addr_hash;
-        arch_switch_to(&mut swap_regs, &mut swap_root, &mut hash, &mut swap_fx);
+        arch_switch_to(&mut swap_vcpu, &mut hash, &mut swap_fx);
         old.kernel.addr_hash = hash;
     } else {
-        arch_switch_to(&mut swap_regs, &mut swap_root, core::ptr::null_mut(), &mut swap_fx);
+        arch_switch_to(&mut swap_vcpu, core::ptr::null_mut(), &mut swap_fx);
     }
-    old.kernel.cpu_state = swap_regs;
-    old.kernel.root = swap_root;
+    old.kernel.vcpu = swap_vcpu;
     old.kernel.fx_state = swap_fx;
-    old.kernel.cpu_hash = thread::hash_regs(&old.kernel.cpu_state);
+    old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
     new.personality.materialize();
     new.personality.on_resume();
     new_tid
@@ -665,10 +663,10 @@ fn handle_fork_exec(
 
     // Save parent's user regs (in REGS) before the swap — exec_dos_into
     // bundles address-space setup + init_process_thread_vm86, which would
-    // overwrite the parent state that the first swap parks in child.cpu_state.
+    // overwrite the parent state that the first swap parks in child.vcpu.regs.
     let parent_regs = *regs;
 
-    arch_switch_to(&mut child.kernel.cpu_state, &mut child.kernel.root, core::ptr::null_mut(), core::ptr::null_mut());
+    arch_switch_to(&mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
 
     // ELF needs user pages freed before loading; DOS handles its own address space
     if matches!(format, exec::BinaryFormat::Elf) {
@@ -682,7 +680,7 @@ fn handle_fork_exec(
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
     if let Err(_) = exec::init_thread(child_tid, buf, path, args, cmdtail, env, cwd) {
         let child = thread::get_thread(child_tid).unwrap();
-        arch_switch_to(&mut child.kernel.cpu_state, &mut child.kernel.root, core::ptr::null_mut(), core::ptr::null_mut());
+        arch_switch_to(&mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(child_tid, 1);
         on_error(regs, 11);
         return None;
@@ -691,9 +689,9 @@ fn handle_fork_exec(
     let child = thread::get_thread(child_tid).unwrap();
     // Swap back to parent's address space. Save child's cpu_state (set by
     // init_thread) and restore after — the swap would overwrite it.
-    let saved_cpu = child.kernel.cpu_state;
-    arch_switch_to(&mut child.kernel.cpu_state, &mut child.kernel.root, core::ptr::null_mut(), core::ptr::null_mut());
-    child.kernel.cpu_state = saved_cpu;
+    let saved_cpu = child.kernel.vcpu.regs;
+    arch_switch_to(&mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
+    child.kernel.vcpu.regs = saved_cpu;
     // Restore parent's user regs into REGS (the swap left stale data there).
     *regs = parent_regs;
 
@@ -873,10 +871,13 @@ fn do_arch_execute() -> crate::arch::monitor::KernelEvent {
 /// hash_ptr: null = no hashing. Non-null: on entry = expected hash (0=don't check),
 /// on exit = old address space hash.
 pub fn arch_switch_to(
-    regs: &mut crate::Regs, root: &mut crate::RootPageTable,
+    vcpu: &mut crate::arch::Vcpu,
     hash_ptr: *mut u64,
     fx_ptr: *mut crate::arch::FxState,
 ) {
+    // The arch call still takes two separate pointers (regs in EDX, page-table
+    // root in ECX); the Vcpu bundle is purely kernel-side, so we hand the
+    // handler `&mut vcpu.regs` and `&mut vcpu.space` exactly as before.
     // LLVM reserves ESI/EDI for its own use in inline asm on x86, so we
     // can't name them directly. Stash fx_ptr in ESI around the int 0x80.
     unsafe {
@@ -886,8 +887,8 @@ pub fn arch_switch_to(
             "xchg esi, {fx}",
             fx = inout(reg) fx_ptr as u32 => _,
             in("eax") crate::arch::arch_call::SWITCH_TO as u32,
-            in("edx") regs as *mut _ as u32,
-            in("ecx") root as *mut _ as u32,
+            in("edx") &mut vcpu.regs as *mut _ as u32,
+            in("ecx") &mut vcpu.space as *mut _ as u32,
             in("ebx") hash_ptr as u32,
         );
     }

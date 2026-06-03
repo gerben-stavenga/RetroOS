@@ -625,7 +625,7 @@ pub fn exec_dos_into(tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>
 /// already populated `current.personality` and run the loader.
 fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
     use machine::{VM_FLAG, IF_FLAG, IOPL_VM86};
-    let state = &mut thread.kernel.cpu_state;
+    let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
     state.ds = psp_seg as u64;
     state.es = psp_seg as u64;
@@ -688,7 +688,7 @@ pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>,
         core::ptr::write_volatile(0x450 as *mut u8, col as u8);
         core::ptr::write_volatile(0x451 as *mut u8, row as u8);
     }
-    unsafe { *(&raw mut crate::arch::REGS) = t.kernel.cpu_state; }
+    unsafe { *(&raw mut crate::arch::REGS) = t.kernel.vcpu.regs; }
     // Initial thread never goes through a context switch, so load LDTR
     // directly here. Subsequent threads pick this up via `on_resume` in the
     // event-loop switch path.

@@ -197,8 +197,11 @@ pub struct KernelThread {
     pub parent_tid: i32,
     pub state: ThreadState,
     pub time: u32,
-    pub root: crate::RootPageTable,
-    pub cpu_state: Regs,
+    /// Register state + address-space handle for this thread's execution
+    /// context. `vcpu.regs` is the saved CPU state, `vcpu.space` the page-table
+    /// root. Bundled so the kernel manipulates one "thing to run" rather than
+    /// two loosely-coupled fields (see arch::Vcpu).
+    pub vcpu: crate::arch::Vcpu,
     pub fx_state: crate::arch::FxState,
     pub exit_code: i32,
     pub addr_hash: u64,
@@ -231,7 +234,7 @@ pub fn hash_regs(r: &Regs) -> u64 {
 
 /// Recompute a thread's cpu_hash after an out-of-band modification to cpu_state.
 pub fn refresh_cpu_hash(t: &mut Thread) {
-    t.kernel.cpu_hash = hash_regs(&t.kernel.cpu_state);
+    t.kernel.cpu_hash = hash_regs(&t.kernel.vcpu.regs);
 }
 
 impl KernelThread {
@@ -243,8 +246,7 @@ impl KernelThread {
             parent_tid: -1,
             state: ThreadState::Unused,
             time: 0,
-            root: crate::RootPageTable::empty(),
-            cpu_state: Regs::empty(),
+            vcpu: crate::arch::Vcpu::empty(),
             fx_state: crate::arch::FxState::zeroed(),
             exit_code: 0,
             addr_hash: 0,
@@ -415,8 +417,7 @@ pub fn create_thread(parent_tid: Option<usize>, root: crate::RootPageTable, is_p
                 k.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
                 k.state = ThreadState::Ready;
                 k.time = crate::arch::get_ticks() as u32;
-                k.root = root;
-                k.cpu_state = Regs::empty();
+                k.vcpu = crate::arch::Vcpu { regs: Regs::empty(), space: root };
                 k.fx_state = crate::arch::clean_fx_template();
                 k.exit_code = 0;
                 k.addr_hash = 0;
@@ -431,17 +432,17 @@ pub fn create_thread(parent_tid: Option<usize>, root: crate::RootPageTable, is_p
 
 /// Initialize a thread as a 32-bit user process
 pub fn init_process_thread(thread: &mut Thread, entry: u32, stack: u32) {
-    thread.kernel.cpu_state.init_user_process(entry, stack);
+    thread.kernel.vcpu.regs.init_user_process(entry, stack);
 }
 
 /// Initialize a thread as a 64-bit user process
 pub fn init_process_thread_64(thread: &mut Thread, entry: u64, stack: u64) {
-    thread.kernel.cpu_state.init_user_process_64(entry, stack);
+    thread.kernel.vcpu.regs.init_user_process_64(entry, stack);
 }
 
 /// Save CPU state to thread.
 pub fn save_state(thread: &mut Thread, regs: &Regs) {
-    thread.kernel.cpu_state = *regs;
+    thread.kernel.vcpu.regs = *regs;
 }
 
 /// Block a thread (waiting for child exit).
@@ -461,7 +462,7 @@ pub fn unblock_thread(tid: usize) {
 pub fn yield_thread(tid: usize, regs: &crate::Regs) -> Option<usize> {
     unsafe {
         let k = &mut THREADS[tid].kernel;
-        k.cpu_state = *regs;
+        k.vcpu.regs = *regs;
         k.state = ThreadState::Ready;
     }
     schedule(tid)
@@ -469,7 +470,7 @@ pub fn yield_thread(tid: usize, regs: &crate::Regs) -> Option<usize> {
 
 /// Set return value in thread's saved state
 pub fn set_return(thread: &mut Thread, ret: i32) {
-    thread.kernel.cpu_state.rax = ret as i64 as u64;
+    thread.kernel.vcpu.regs.rax = ret as i64 as u64;
 }
 
 /// Schedule next thread (randomly selected from ready threads).
@@ -577,10 +578,10 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
                 parent.kernel.state = ThreadState::Ready;
                 match &mut parent.personality {
                     Personality::Dos(_) => {
-                        parent.kernel.cpu_state.rax = parent.kernel.cpu_state.rax & !0xFFFF;
+                        parent.kernel.vcpu.regs.rax = parent.kernel.vcpu.regs.rax & !0xFFFF;
                     }
                     Personality::Linux(linux) => {
-                        parent.kernel.cpu_state.rax = thread.kernel.tid as u64;
+                        parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
                         // status_ptr was saved in sys_wait4 when parent blocked.
                         // Just set the exit code; the deferred write happens
                         // during thread switch when parent's address space is loaded.
@@ -679,10 +680,10 @@ pub fn signal_thread(thread: &Thread, fault_address: usize) {
     }
     println!("SEGV in thread {} at {:#x} rip={:#x} cs={:#x} rsp={:#x} ss={:#x} fl={:#x} rax={:#x} rbx={:#x} rcx={:#x}",
         thread.kernel.tid, fault_address,
-        thread.kernel.cpu_state.frame.rip, thread.kernel.cpu_state.frame.cs,
-        thread.kernel.cpu_state.frame.rsp, thread.kernel.cpu_state.frame.ss,
-        thread.kernel.cpu_state.frame.rflags,
-        thread.kernel.cpu_state.rax, thread.kernel.cpu_state.rbx, thread.kernel.cpu_state.rcx);
+        thread.kernel.vcpu.regs.frame.rip, thread.kernel.vcpu.regs.frame.cs,
+        thread.kernel.vcpu.regs.frame.rsp, thread.kernel.vcpu.regs.frame.ss,
+        thread.kernel.vcpu.regs.frame.rflags,
+        thread.kernel.vcpu.regs.rax, thread.kernel.vcpu.regs.rbx, thread.kernel.vcpu.regs.rcx);
 }
 
 /// Initialize threading system with init thread

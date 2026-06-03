@@ -14,12 +14,14 @@ pub mod monitor;
 mod paging2;
 mod phys_mm;
 mod traps;
+mod vcpu;
 mod x86;
 
 // --- Re-exports for the kernel layer (ring 1) ---
 
 // Types
 pub use paging2::{KernelPages, RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE};
+pub use vcpu::Vcpu;
 pub use irq::Irq;
 pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 
