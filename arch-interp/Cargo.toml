@@ -3,5 +3,18 @@ name = "retroos-arch-interp"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "retroos_arch_interp"
+path = "src/lib.rs"
+
 [dependencies]
+arch-abi = { path = "../arch-abi" }
+# Unicorn (the software x86 core) drives the Vcpu run path. The hosted build
+# targets a native 64-bit host, so its C core builds natively.
 unicorn-engine = "2.1.5"
+
+# The self-contained Unicorn proof-of-concept that seeded this backend:
+#   cargo run -p retroos-arch-interp --example poc
+[[example]]
+name = "poc"
+path = "examples/poc.rs"

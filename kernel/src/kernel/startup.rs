@@ -218,6 +218,9 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8]) {
     event_loop(tid);
 }
 
+// Hardware write-watchpoints via debug registers — a metal-only arch call. The
+// interpreter has no debug-register feature, so hosted makes this a no-op.
+#[cfg(not(feature = "hosted"))]
 fn set_debug_watch(addrs: Option<(u32, u32)>) {
     let (count, addr0, addr1) = match addrs {
         Some((addr0, addr1)) if addr1 != 0 => (2u32, addr0, addr1),
@@ -234,6 +237,9 @@ fn set_debug_watch(addrs: Option<(u32, u32)>) {
         );
     }
 }
+
+#[cfg(feature = "hosted")]
+fn set_debug_watch(_addrs: Option<(u32, u32)>) {}
 
 fn debug_watch_config() -> Option<(u32, u32)> {
     let mut buf = [0u8; 64];

@@ -21,9 +21,10 @@ use crate::arch::x86::{self, GdtPtr, IdtPtr};
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_CS64: u16 = 0x10;   // SYSCALL CS = STAR[47:32]
 pub const KERNEL_DS: u16 = 0x18;     // SYSCALL SS = STAR[47:32]+8
-pub const USER_CS: u16 = 0x20 | 3;   // Ring 3
-pub const USER_DS: u16 = 0x28 | 3;   // Ring 3
-pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
+// User selectors are guest-visible ABI values shared with the interpreter
+// backend; they live in `arch-abi` and are re-exported here (the metal GDT is
+// laid out to match). Ring 3.
+pub use arch_abi::{USER_CS, USER_CS64, USER_DS};
 pub const TSS32_SEL: u16 = 0x38;
 pub const TSS64_SEL: u16 = 0x80;
 

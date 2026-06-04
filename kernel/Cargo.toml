@@ -1,0 +1,32 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2024"
+
+# HOSTED build only. The bare-metal build stays on Bazel (//kernel:kernel_elf);
+# this manifest exists so the kernel can be compiled as a std binary linking the
+# software `arch-interp` backend, on the native (64-bit) host:
+#   cargo run -p kernel
+
+[lib]
+name = "kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "retroos-host"
+path = "src/host_main.rs"
+required-features = ["hosted"]
+
+[features]
+# `hosted` is the only cargo configuration that builds — it selects the
+# interpreter arch backend and routes console output to stdout. Default so the
+# documented `cargo build -p kernel` works without extra flags.
+default = ["hosted"]
+hosted = ["dep:retroos-arch-interp", "lib/std"]
+
+[dependencies]
+arch-abi = { path = "../arch-abi" }
+lib = { path = "../lib" }
+retroos-arch-interp = { path = "../arch-interp", optional = true }
+ext4-view = "0.9.3"
+rustc-demangle = "0.1.24"

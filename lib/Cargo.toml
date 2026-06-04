@@ -1,0 +1,16 @@
+[package]
+name = "lib"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "lib"
+path = "src/lib.rs"
+
+[features]
+# Hosted builds route console output to stdout instead of VGA MMIO / port 0xE9
+# (wired in Milestone 2). Defined here so `kernel`'s `hosted` feature can
+# enable `lib/std`.
+std = []
+
+[dependencies]

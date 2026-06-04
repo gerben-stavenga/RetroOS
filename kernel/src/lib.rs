@@ -5,15 +5,23 @@
 //! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
 #![no_std]
-#![no_main]
-
-use core::panic::PanicInfo;
+// The bare-metal (metal) build has no runtime entry point; the hosted build is
+// an ordinary `std` binary with `fn main()`, so it keeps the default main shim.
+#![cfg_attr(not(feature = "hosted"), no_main)]
 
 extern crate alloc;
 extern crate ext4_view;
 extern crate rustc_demangle;
 
+// The arch layer is a swappable backend. Metal: the in-tree `kernel/src/arch/`
+// (real x86, INT 0x80). Hosted: the `arch-interp` crate (software x86 core),
+// pulled in as `crate::arch` so every `crate::arch::*` path resolves the same.
+#[cfg(not(feature = "hosted"))]
+#[path = "arch/mod.rs"]
 mod arch;
+#[cfg(feature = "hosted")]
+extern crate retroos_arch_interp as arch;
+
 mod kernel;
 pub mod pipe;  // Shared utility: ring buffer used by both arch and kernel
 
@@ -53,13 +61,19 @@ pub struct MultibootInfo {
     pub mmap_addr: u32,
 }
 
+// Metal-only: scratch/zero page frames and linker-symbol statics are consumed
+// only by the bare-metal arch boot/paging code. The hosted backend has neither
+// a custom paging bring-up nor a linker script.
+#[cfg(not(feature = "hosted"))]
 static ZERO_PAGE: RawPage = unsafe { core::mem::zeroed() };
+#[cfg(not(feature = "hosted"))]
 static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
 
 // Linker symbols. Stacks and their guard pages live at the tail of .bss
 // (see kernel.ld); only their addresses matter to Rust, so they're declared
 // as opaque externs. Guard pages get unmapped at boot so kernel-stack
 // overflow takes a clean #PF instead of corrupting adjacent memory.
+#[cfg(not(feature = "hosted"))]
 unsafe extern "C" {
     static _kernel_start: u8;
     static _data: u8;
@@ -73,187 +87,94 @@ unsafe extern "C" {
     pub static ARCH_STACK_TOP: u8;
 }
 
-/// CPU-pushed interrupt frame for 64-bit mode
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Frame64 {
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-}
+// Frame64, UserMode, and Regs now live in the shared `arch-abi` crate (the
+// backend-agnostic arch↔kernel contract) and are re-exported here so existing
+// `crate::Frame64` / `crate::UserMode` / `crate::Regs` paths keep resolving
+// unchanged. Both the metal and interpreter backends share this one register
+// ABI rather than each defining its own.
+pub use arch_abi::{Frame64, Regs, UserMode};
 
-impl core::fmt::Debug for Frame64 {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Frame64")
-            .field("rip", &format_args!("{:#018x}", self.rip))
-            .field("cs", &format_args!("{:#06x}", self.cs))
-            .field("rflags", &format_args!("{:#018x}", self.rflags))
-            .field("rsp", &format_args!("{:#018x}", self.rsp))
-            .field("ss", &format_args!("{:#06x}", self.ss))
-            .finish()
-    }
-}
+/// Hosted entry point. Where the metal build comes up through `boot_kernel`
+/// (paging, GDT/IDT, ring-1 drop) before calling `startup()`, the hosted build
+/// is an ordinary process. Called from the `retroos-host` binary.
+///
+/// Milestone 2 bring-up: the full `startup()` path needs a disk + the software
+/// MMU + threads (M3/M4), so this drives a hand-assembled guest directly
+/// through the *real* arch boundary (`arch::do_arch_execute` over Unicorn,
+/// `arch::mem()` over shared guest RAM, the canonical `KernelEvent`s) to prove
+/// the event loop turns over end-to-end on the interpreter backend.
+#[cfg(feature = "hosted")]
+pub fn host_start() -> ! {
+    use arch::monitor::KernelEvent;
 
-/// User execution mode, derived from register state.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum UserMode { VM86, Mode32, Mode64 }
+    // Flat guest-RAM region the software CPU and `arch::mem()` share.
+    arch::init_guest_ram(64 << 20);
+    println!("[host] RetroOS hosted kernel — interpreter (Unicorn) arch backend");
 
-/// CPU register state saved by interrupt handler.
-/// Also used as the saved CPU state in Thread (identical layout).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Regs {
-    // Segment registers (zero-extended)
-    pub gs: u64,
-    pub fs: u64,
-    pub es: u64,
-    pub ds: u64,
-    // x86-64 extended registers (zero in 32-bit mode)
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    // General purpose registers
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rbp: u64,
-    pub rsp_dummy: u64,
-    pub rbx: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rax: u64,
-    // Interrupt info (software-pushed, zero-extended to 64-bit)
-    pub int_num: u64,
-    pub err_code: u64,
-    // CPU-pushed interrupt frame normalized to Frame64 before the kernel sees it.
-    pub frame: Frame64,
-}
+    // Hand-assembled 32-bit guest: syscall, port OUT, a ~2k-insn delay loop
+    // (exercises timer slicing), then exit.
+    const CODE: u32 = 0x1000;
+    const STACK: u32 = 0x8000;
+    #[rustfmt::skip]
+    let code: &[u8] = &[
+        0xB8, 0x04,0x00,0x00,0x00,   // mov eax,4
+        0xBB, 0x39,0x05,0x00,0x00,   // mov ebx,0x539
+        0xCD, 0x80,                  // int 0x80      -> SoftInt(0x80), eax=4
+        0xB8, 0x42,0x00,0x00,0x00,   // mov eax,0x42
+        0xBA, 0xE9,0x00,0x00,0x00,   // mov edx,0xE9
+        0xEE,                        // out dx,al     -> Out{port=0xE9}
+        0xB9, 0x00,0x08,0x00,0x00,   // mov ecx,0x800
+        0x49,                        // dec ecx   <- loop
+        0x75, 0xFD,                  // jnz -3
+        0xB8, 0x01,0x00,0x00,0x00,   // mov eax,1
+        0xCD, 0x80,                  // int 0x80      -> SoftInt(0x80), eax=1 (exit)
+        0xF4,                        // hlt
+    ];
+    arch::mem().write_bytes(CODE as usize, code);
 
-impl Regs {
-    pub const fn empty() -> Self {
-        Regs {
-            gs: 0, fs: 0, es: 0, ds: 0,
-            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-            rdi: 0, rsi: 0, rbp: 0, rsp_dummy: 0, rbx: 0, rdx: 0, rcx: 0, rax: 0,
-            int_num: 0, err_code: 0,
-            frame: Frame64 { rip: 0, cs: 0, rflags: 0, rsp: 0, ss: 0 },
+    let mut vcpu = arch::Vcpu::empty();
+    vcpu.regs.init_user_process(CODE, STACK);
+    arch::set_current_vcpu(vcpu);
+
+    // Read the live guest registers (updated by each `do_arch_execute`).
+    let eax = || unsafe { (*(&raw const arch::REGS)).regs.rax as u32 };
+
+    println!("[host] running guest vcpu...");
+    let mut irqs = 0u32;
+    loop {
+        match arch::do_arch_execute() {
+            KernelEvent::SoftInt(0x80) if eax() == 1 => {
+                println!("[host] guest exit syscall -> done ({irqs} timer ticks)");
+                arch::shutdown();
+            }
+            KernelEvent::SoftInt(n) => {
+                println!("[host] INT {:#x} (eax={:#x}) -> serviced", n, eax());
+            }
+            KernelEvent::Out { port, size } => {
+                println!("[host] OUT port={:#06x} size={:?} val={:#x}", port, size, eax());
+            }
+            KernelEvent::In { port, size } => {
+                println!("[host] IN  port={:#06x} size={:?}", port, size);
+            }
+            KernelEvent::Irq => {
+                irqs += 1;
+            }
+            KernelEvent::PageFault { addr } => {
+                println!("[host] page fault @ {:#x} -> stopping", addr);
+                arch::shutdown();
+            }
+            ev => {
+                println!("[host] unhandled event {:?} -> stopping", ev);
+                arch::shutdown();
+            }
         }
     }
-
-    pub fn ip32(&self) -> u32 {
-        self.frame.rip as u32
-    }
-
-    pub fn set_ip32(&mut self, ip: u32) {
-        self.frame.rip = ip as u64;
-    }
-
-    pub fn cs32(&self) -> u32 {
-        self.frame.cs as u32
-    }
-
-    pub fn set_cs32(&mut self, cs: u32) {
-        self.frame.cs = cs as u64;
-    }
-
-    pub fn flags32(&self) -> u32 {
-        self.frame.rflags as u32
-    }
-
-    pub fn set_flags32(&mut self, flags: u32) {
-        self.frame.rflags = flags as u64;
-    }
-
-    pub fn set_flag32(&mut self, mask: u32) {
-        self.set_flags32(self.flags32() | mask);
-    }
-
-    pub fn clear_flag32(&mut self, mask: u32) {
-        self.set_flags32(self.flags32() & !mask);
-    }
-
-    pub fn sp32(&self) -> u32 {
-        self.frame.rsp as u32
-    }
-
-    pub fn set_sp32(&mut self, sp: u32) {
-        self.frame.rsp = sp as u64;
-    }
-
-    pub fn ss32(&self) -> u32 {
-        self.frame.ss as u32
-    }
-
-    pub fn set_ss32(&mut self, ss: u32) {
-        self.frame.ss = ss as u64;
-    }
-
-    /// Get instruction pointer.
-    pub fn ip(&self) -> u64 {
-        self.frame.rip
-    }
-
-    /// Get code segment
-    pub fn code_seg(&self) -> u16 {
-        self.frame.cs as u16
-    }
-
-    /// Get flags
-    pub fn flags(&self) -> u64 {
-        self.frame.rflags
-    }
-
-    /// Derive execution mode from canonical register state.
-    /// Checks CS first (64-bit wins over stale VM flag), then EFLAGS.VM.
-    /// Returns Mode32 for kernel regs (ring 1 CS) too.
-    pub fn mode(&self) -> UserMode {
-        if self.frame.cs == arch::USER_CS64 as u64 {
-            UserMode::Mode64
-        } else if self.frame.rflags & (1 << 17) != 0 {
-            UserMode::VM86
-        } else {
-            UserMode::Mode32
-        }
-    }
-
-    /// Get stack pointer
-    pub fn sp(&self) -> u64 {
-        self.frame.rsp
-    }
-
-    /// Get stack segment
-    pub fn stack_seg(&self) -> u16 {
-        self.frame.ss as u16
-    }
 }
 
-impl core::fmt::Debug for Regs {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "INT: {:#04x}  ERR: {:#010x}", self.int_num, self.err_code)?;
-        writeln!(f, "IP:  {:#010x}  CS: {:#06x}  FL: {:#010x}", self.ip(), self.code_seg(), self.flags())?;
-        writeln!(f, "SP:  {:#010x}  SS: {:#06x}", self.sp(), self.stack_seg())?;
-        writeln!(f, "RAX: {:#018x}  RBX: {:#018x}", self.rax, self.rbx)?;
-        writeln!(f, "RCX: {:#018x}  RDX: {:#018x}", self.rcx, self.rdx)?;
-        writeln!(f, "RSI: {:#018x}  RDI: {:#018x}", self.rsi, self.rdi)?;
-        writeln!(f, "RBP: {:#018x}  R8:  {:#018x}", self.rbp, self.r8)?;
-        writeln!(f, "R9:  {:#018x}  R10: {:#018x}", self.r9, self.r10)?;
-        writeln!(f, "R11: {:#018x}  R12: {:#018x}", self.r11, self.r12)?;
-        writeln!(f, "R13: {:#018x}  R14: {:#018x}", self.r13, self.r14)?;
-        writeln!(f, "R15: {:#018x}", self.r15)?;
-        write!(f, "DS: {:#06x}  ES: {:#06x}  FS: {:#06x}  GS: {:#06x}",
-               self.ds as u16, self.es as u16, self.fs as u16, self.gs as u16)
-    }
-}
-
-/// Panic handler
+/// Panic handler (metal only — std supplies its own for the hosted build).
+#[cfg(not(feature = "hosted"))]
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
     // Mirror to both VGA (println) and debugcon (dbg_println) so panic
     // shows up in out.log too, not just on the QEMU display.
     println!();

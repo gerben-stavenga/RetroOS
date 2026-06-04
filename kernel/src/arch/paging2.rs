@@ -87,12 +87,10 @@
 
 use core::ops::{Index, IndexMut};
 
-/// Page size in bytes
-pub const PAGE_SIZE: usize = 4096;
-
-#[derive(Clone)]
-#[repr(C, align(4096))]
-pub struct RawPage([u8; PAGE_SIZE]);
+// PAGE_SIZE, LOW_MEM_BASE, and the RawPage blob are part of the
+// backend-agnostic contract (`arch-abi`); re-exported so `crate::arch::{
+// PAGE_SIZE, LOW_MEM_BASE, RawPage}` keep resolving.
+pub use arch_abi::{PAGE_SIZE, RawPage};
 
 /// Recursive mapping base - page tables accessible here (PDPT[0-3], 8MB)
 pub const PAGE_TABLE_BASE: usize = 0xC000_0000;
@@ -101,7 +99,7 @@ pub const PAGE_TABLE_BASE: usize = 0xC000_0000;
 pub const PAGE_TABLE_BASE_IDX: usize = PAGE_TABLE_BASE / PAGE_SIZE;
 
 /// Low memory (first 1MB) mapped here for VGA, BIOS, etc. (PDPT[5] first half)
-pub const LOW_MEM_BASE: usize = 0xC0A0_0000;
+pub use arch_abi::LOW_MEM_BASE;
 
 /// Kernel space starts here (PDPT[5+], after low memory)
 pub const KERNEL_BASE: usize = 0xC0B0_0000;

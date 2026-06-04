@@ -1,0 +1,130 @@
+//! Vcpu and guest-memory access for the interpreter backend.
+//!
+//! Mirrors `kernel/src/arch/vcpu.rs` exactly in shape so the kernel is blind to
+//! the backend. The one difference is where the bytes live: on metal a
+//! guest-linear address *is* a host pointer (shared page tables); here it
+//! indexes a flat host-side guest-RAM buffer. The raw access stays confined to
+//! `GuestMem`, so kernel/dos code holds no `unsafe` of its own.
+
+use crate::space::RootPageTable;
+use arch_abi::Regs;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+/// Register state + address-space handle for one execution context.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Vcpu {
+    pub regs: Regs,
+    pub space: RootPageTable,
+}
+
+impl core::ops::Deref for Vcpu {
+    type Target = Regs;
+    fn deref(&self) -> &Regs { &self.regs }
+}
+impl core::ops::DerefMut for Vcpu {
+    fn deref_mut(&mut self) -> &mut Regs { &mut self.regs }
+}
+
+impl Vcpu {
+    pub const fn empty() -> Self {
+        Vcpu { regs: Regs::empty(), space: RootPageTable::empty() }
+    }
+
+    // Thin forwarders over the active address space's memory (see `GuestMem`).
+    pub fn slice(&self, addr: usize, len: usize) -> &[u8] { mem().slice(addr, len) }
+    pub fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { mem().slice_mut(addr, len) }
+    pub fn c_str(&self, addr: usize, max: usize) -> &[u8] { mem().c_str(addr, max) }
+    pub fn read<T: Copy>(&self, addr: usize) -> T { mem().read(addr) }
+    pub fn write<T: Copy>(&mut self, addr: usize, val: T) { mem().write(addr, val) }
+    pub fn zero(&mut self, addr: usize, len: usize) { mem().zero(addr, len) }
+    pub fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
+}
+
+/// The live execution context while the kernel runs (the interpreter's analogue
+/// of metal's `traps::REGS`). Single-core: one global Vcpu that `do_arch_execute`
+/// syncs to/from the software CPU before/after each run slice.
+pub static mut REGS: Vcpu = Vcpu::empty();
+
+/// Seed the live execution context. The `static mut` access is confined here.
+pub fn set_current_vcpu(v: Vcpu) {
+    unsafe { *(&raw mut REGS) = v; }
+}
+
+// ── Guest RAM ────────────────────────────────────────────────────────────
+//
+// A single flat host buffer; a guest-linear address indexes it directly. The
+// buffer is leaked at init so the slices `GuestMem` hands out are soundly
+// `'static` (it never moves or frees), matching the metal signatures. The
+// software MMU (M3) will replace this flat model with per-space mappings.
+
+static GUEST_RAM: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static GUEST_RAM_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Allocate the flat guest-RAM region. Call once during host bring-up before
+/// any guest memory access. Idempotent-ish: a second call leaks the first.
+pub fn init_guest_ram(len: usize) {
+    let buf = vec![0u8; len].into_boxed_slice();
+    let ptr = Box::leak(buf).as_mut_ptr();
+    GUEST_RAM.store(ptr, Ordering::SeqCst);
+    GUEST_RAM_LEN.store(len, Ordering::SeqCst);
+}
+
+#[inline]
+fn host_ptr(addr: usize) -> *mut u8 {
+    let base = GUEST_RAM.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null(), "guest RAM not initialized (call init_guest_ram)");
+    debug_assert!(addr < GUEST_RAM_LEN.load(Ordering::Relaxed), "guest addr {addr:#x} out of range");
+    unsafe { base.add(addr) }
+}
+
+/// The flat guest-RAM region `(base, len)`. The software CPU (`cpu.rs`) maps
+/// this exact buffer into Unicorn so guest execution and `GuestMem` share one
+/// set of bytes. Returns a null base until `init_guest_ram`.
+pub(crate) fn guest_ram() -> (*mut u8, usize) {
+    (GUEST_RAM.load(Ordering::Relaxed), GUEST_RAM_LEN.load(Ordering::Relaxed))
+}
+
+/// The active address space's memory interface — `arch::mem()`. THE place the
+/// kernel touches guest memory; the backend detail (host buffer vs page tables)
+/// stays behind this identical API.
+#[derive(Clone, Copy)]
+pub struct GuestMem(());
+
+#[inline]
+pub fn mem() -> GuestMem { GuestMem(()) }
+
+impl GuestMem {
+    pub fn slice(self, addr: usize, len: usize) -> &'static [u8] {
+        unsafe { core::slice::from_raw_parts(host_ptr(addr), len) }
+    }
+    pub fn slice_mut(self, addr: usize, len: usize) -> &'static mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(host_ptr(addr), len) }
+    }
+    pub fn c_str(self, addr: usize, max: usize) -> &'static [u8] {
+        unsafe {
+            let p = host_ptr(addr);
+            let mut len = 0;
+            while len < max && *p.add(len) != 0 { len += 1; }
+            core::slice::from_raw_parts(p, len)
+        }
+    }
+    pub fn read<T: Copy>(self, addr: usize) -> T {
+        unsafe { core::ptr::read_unaligned(host_ptr(addr) as *const T) }
+    }
+    pub fn write<T: Copy>(self, addr: usize, val: T) {
+        unsafe { core::ptr::write_unaligned(host_ptr(addr) as *mut T, val); }
+    }
+    pub fn at<T>(self, addr: usize) -> &'static mut T {
+        unsafe { &mut *(host_ptr(addr) as *mut T) }
+    }
+    pub fn zero(self, addr: usize, len: usize) {
+        unsafe { core::ptr::write_bytes(host_ptr(addr), 0, len); }
+    }
+    pub fn write_bytes(self, addr: usize, src: &[u8]) {
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), host_ptr(addr), src.len()); }
+    }
+    pub fn copy_within(self, src: usize, dst: usize, len: usize) {
+        unsafe { core::ptr::copy(host_ptr(src), host_ptr(dst), len); }
+    }
+}

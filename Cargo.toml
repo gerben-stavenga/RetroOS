@@ -1,0 +1,13 @@
+# Cargo workspace for the HOSTED build only (the bare-metal build stays on
+# Bazel — rules_rust ignores these Cargo.toml files). It exists so the kernel
+# can be compiled as a std binary linking the `arch-interp` (software) backend:
+#
+#   cargo run -p kernel            # builds the retroos-host binary
+#
+# Built for the native (64-bit) host. The kernel is deliberately NOT bound to a
+# 32-bit pointer width — guest addresses are explicit fixed-width types, so it
+# compiles host-width-agnostic and the software CPU runs as a real 64-bit
+# process (where Unicorn's C core also builds natively).
+[workspace]
+resolver = "2"
+members = ["arch-abi", "arch-interp", "kernel", "lib"]

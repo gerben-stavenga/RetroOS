@@ -152,8 +152,15 @@ fn print_frame(depth: usize, ip: u64) {
 /// context itself is shown via `stack_trace_regs`, which prints regs.rip
 /// up front and decides whether to chain into ring-1 from there.
 fn walk(mut bp: u64, mut depth: usize, user_64: bool) {
-    unsafe extern "C" { fn isr_return(); }
-    let isr_dispatch = isr_return as *const () as u64;
+    // The trap-entry boundary is an `entry.asm` label (metal only). The hosted
+    // process has no such boundary, so the chain just walks to its natural end.
+    #[cfg(not(feature = "hosted"))]
+    let isr_dispatch = {
+        unsafe extern "C" { fn isr_return(); }
+        isr_return as *const () as u64
+    };
+    #[cfg(feature = "hosted")]
+    let isr_dispatch = 0u64;
     const MAX_DEPTH: usize = 20;
 
     while depth < MAX_DEPTH && bp >= 0x1000 {

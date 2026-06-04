@@ -20,22 +20,10 @@ pub const IRQ_OFFSET: u8 = 32;
 // IRQ event queue
 // ============================================================================
 
-/// Typed IRQ event. Each hardware IRQ captures its data and pushes one of these.
-#[derive(Clone, Copy)]
-pub enum Irq {
-    Tick,
-    Key(u8), // raw PS/2 scancode (press and release)
-    /// One PS/2 mouse motion/button packet decoded into deltas + button mask.
-    /// `dx` / `dy` are signed motion since the previous packet (PS/2 reports
-    /// +Y as up; we flip so `+dy` means screen-down). `buttons`: bit 0 left,
-    /// bit 1 right, bit 2 middle. Consumer is responsible for accumulating
-    /// position and clamping to a screen range.
-    Mouse { dx: i16, dy: i16, buttons: u8 },
-    /// Any other unmasked hardware IRQ line, forwarded raw. Arch stays
-    /// policy-free — the kernel decides if it's a device it owns and when
-    /// the line can be rearmed after the guest-visible device ack.
-    Hw(u8),
-}
+/// Typed IRQ event — the backend-agnostic contract, defined in `arch-abi` and
+/// re-exported so `crate::arch::Irq` keeps resolving. The PIC plumbing below
+/// constructs and queues these.
+pub use arch_abi::Irq;
 
 /// Global IRQ event queue for discrete events (keyboard).
 /// Timer ticks use a separate counter to avoid flooding and evicting keys.

@@ -166,6 +166,17 @@ impl Vga {
 }
 
 impl Write for Vga {
+    #[cfg(feature = "std")]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // Hosted: the kernel runs as a process — console goes to stdout.
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(s.as_bytes());
+        let _ = out.flush();
+        Ok(())
+    }
+
+    #[cfg(not(feature = "std"))]
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let to_screen = KERNEL_OWNS_SCREEN.load(core::sync::atomic::Ordering::Relaxed);
         for byte in s.bytes() {
@@ -218,6 +229,14 @@ macro_rules! println {
 pub struct DebugCon;
 
 impl Write for DebugCon {
+    #[cfg(feature = "std")]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(s.as_bytes());
+        Ok(())
+    }
+
+    #[cfg(not(feature = "std"))]
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for b in s.bytes() {
             unsafe { core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") b); }

@@ -3,10 +3,9 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
-use crate::arch::{USER_CS, USER_CS64, USER_DS};
 use crate::kernel::stacktrace::SymbolData;
 use crate::println;
-use crate::{Frame64, Regs};
+use crate::Regs;
 
 // Re-export personality state types so `thread::DosState` / `thread::LinuxState` still works
 pub use crate::kernel::dos::DosState;
@@ -146,46 +145,10 @@ impl Personality {
 /// Backward compat alias
 pub type ThreadMode = Personality;
 
-/// Initialize Regs for user processes (extends Regs with descriptor-aware methods)
-impl Regs {
-    /// Initialize for a 32-bit user process (stored as Frame64; arch converts on exit if needed)
-    pub fn init_user_process(&mut self, entry: u32, stack: u32) {
-        let ds = USER_DS as u64;
-        const IF_FLAG: u64 = 1 << 9;
-
-        *self = Self::empty();
-        self.gs = ds;
-        self.fs = ds;
-        self.es = ds;
-        self.ds = ds;
-        self.frame = Frame64 {
-            rip: entry as u64,
-            cs: USER_CS as u64,
-            rflags: IF_FLAG,
-            rsp: stack as u64,
-            ss: USER_DS as u64,
-        };
-    }
-
-    /// Initialize for a 64-bit user process
-    pub fn init_user_process_64(&mut self, entry: u64, stack: u64) {
-        let ds = USER_DS as u64;
-        const IF_FLAG: u64 = 1 << 9;
-
-        *self = Self::empty();
-        self.gs = 0;   // FS/GS are MSR bases in 64-bit mode, 0 = no TLS yet
-        self.fs = 0;
-        self.es = ds;
-        self.ds = ds;
-        self.frame = Frame64 {
-            rip: entry,
-            cs: USER_CS64 as u64,
-            rflags: IF_FLAG,
-            rsp: stack,
-            ss: USER_DS as u64,
-        };
-    }
-}
+// `Regs::init_user_process[_64]` (canonical user-entry register state) moved
+// into the shared `arch-abi` crate alongside `Regs` — the kernel can no longer
+// add inherent impls to `Regs` (orphan rule), and that state is part of the
+// backend-agnostic contract anyway.
 
 /// Kernel-side thread state shared across all personalities.
 /// Personality code receives `&mut KernelThread` alongside its own `&mut DosState`

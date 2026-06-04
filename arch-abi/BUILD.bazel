@@ -1,0 +1,16 @@
+# Build arch-abi crate (backend-agnostic arch↔kernel contract) using rules_rust
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "arch-abi",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "arch_abi",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+)

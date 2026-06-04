@@ -22,22 +22,11 @@
 
 use crate::{Regs, UserMode};
 
-/// Operand width for port I/O events.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum IoSize {
-    Byte  = 0,
-    Word  = 1,
-    Dword = 2,
-}
-
-impl IoSize {
-    pub const fn bytes(self) -> u32 {
-        match self { IoSize::Byte => 1, IoSize::Word => 2, IoSize::Dword => 4 }
-    }
-    pub const fn from_u32(v: u32) -> Self {
-        match v & 3 { 0 => IoSize::Byte, 1 => IoSize::Word, _ => IoSize::Dword }
-    }
-}
+// IoSize and KernelEvent are the backend-agnostic arch↔kernel contract; they
+// live in `arch-abi` and are re-exported here so `crate::arch::monitor::{
+// KernelEvent, IoSize}` keeps resolving. The metal monitor below decodes a #GP
+// into these; the interpreter backend produces them directly.
+pub use arch_abi::{IoSize, KernelEvent};
 
 /// Result of one monitor decode step, returned by `monitor()` to its caller
 /// (the arch #GP handler). `Resume` is the fast path — the handler iret's
@@ -49,110 +38,6 @@ pub enum MonitorResult {
     Resume,
     /// Instruction decoded into a kernel event; caller encodes + bubbles it up.
     Event(KernelEvent),
-}
-
-/// Canonical kernel-visible event. `do_arch_execute` returns one of these
-/// for every ring-3 trap — the event loop matches on shape, not raw numbers.
-///
-/// Variants split by origin:
-/// - **Monitor-produced** (`SoftInt`, `Hlt`, `In`/`Out`/`Ins`/`Outs`, `Fault`)
-///   come from `monitor()` decoding a sensitive-instruction #GP. These are
-///   the only variants that flow through `encode`.
-/// - **Direct-IDT** (`Irq`, `PageFault`, `Exception`) come from raw `int_num`
-///   / `err_code` / CR2 and are written into the arch boundary without
-///   going through `encode`.
-///
-/// `decode` is the single inverse and handles both origins.
-#[derive(Copy, Clone, Debug)]
-pub enum KernelEvent {
-    /// Hardware IRQ was ACK'd + queued inline by arch; the event loop just
-    /// needs to know a scheduling point happened.
-    Irq,
-    /// Page fault at `addr` (CR2).
-    PageFault { addr: u32 },
-    /// CPU-raised fault from ring 3 — e.g. #DE (0), #UD (6), #NP (11), #SS (12),
-    /// #AC (17). Never includes #BP/#OF (vectors 3/4) since those are only
-    /// raised by the user `INT3`/`INTO` instructions, nor #PF (handled above).
-    Exception(u8),
-    /// User-executed `INT n` — either monitor-decoded from a #GP'd `INT n` or
-    /// delivered directly through a DPL=3 IDT gate (vectors 3, 4, 0x30..=0xFF,
-    /// plus VM86 `INT3`/`0xCC` which bypasses VME). Note that `INT 0x80` lands
-    /// here too — it's not the same thing as the `SYSCALL` instruction, which
-    /// has its own `Syscall` event.
-    SoftInt(u8),
-    /// User executed the `SYSCALL` instruction (64-bit only). Distinct from
-    /// `SoftInt(0x80)`: the IDT gate path and the SYSCALL fast-path land at
-    /// different arch entries (`int_vector` vs `syscall_entry_64`); arch tags
-    /// the SYSCALL one with int_num=256 so this stays unambiguous.
-    Syscall,
-    /// HLT from user code — scheduler yields.
-    Hlt,
-    /// Port `IN` (AL/AX/EAX ← port). Kernel emulates, writes back into rax.
-    In { port: u16, size: IoSize },
-    /// Port `OUT` (port ← AL/AX/EAX).
-    Out { port: u16, size: IoSize },
-    /// String `INS` (ES:DI ← port, advance DI by size). Single element — no REP.
-    Ins { size: IoSize },
-    /// String `OUTS` (port ← DS:SI, advance SI by size). Single element.
-    Outs { size: IoSize },
-    /// Non-sensitive #GP or unknown opcode — reflect as fault.
-    Fault,
-}
-
-impl KernelEvent {
-    // Private wire format for `encode`/`decode`. Tags are an arbitrary
-    // internal numbering — they have no relationship to any CPU vector,
-    // IRQ number, or opcode. The arch boundary sees them only as opaque
-    // `(event, extra)` u32 pairs.
-    const IRQ:        u32 = 1;
-    const PAGE_FAULT: u32 = 2;
-    const EXCEPTION:  u32 = 3;
-    const SOFT_INT:   u32 = 4;
-    const HLT:        u32 = 5;
-    const IN:         u32 = 6;
-    const OUT:        u32 = 7;
-    const INS:        u32 = 8;
-    const OUTS:       u32 = 9;
-    const FAULT:      u32 = 10;
-    const SYSCALL:    u32 = 11;
-
-    /// Encode into the `(event, extra)` u32 pair that flows across the
-    /// arch→kernel boundary as `(eax, edx)`. Total over all variants.
-    /// Exact inverse of `decode`.
-    #[inline]
-    pub fn encode(self) -> (u32, u32) {
-        match self {
-            KernelEvent::Irq                  => (Self::IRQ, 0),
-            KernelEvent::PageFault { addr }   => (Self::PAGE_FAULT, addr),
-            KernelEvent::Exception(n)         => (Self::EXCEPTION, n as u32),
-            KernelEvent::SoftInt(n)           => (Self::SOFT_INT, n as u32),
-            KernelEvent::Syscall              => (Self::SYSCALL, 0),
-            KernelEvent::Hlt                  => (Self::HLT, 0),
-            KernelEvent::In  { port, size }   => (Self::IN,  (port as u32) | ((size as u32) << 16)),
-            KernelEvent::Out { port, size }   => (Self::OUT, (port as u32) | ((size as u32) << 16)),
-            KernelEvent::Ins  { size }        => (Self::INS,  size as u32),
-            KernelEvent::Outs { size }        => (Self::OUTS, size as u32),
-            KernelEvent::Fault                => (Self::FAULT, 0),
-        }
-    }
-
-    /// Decode the `(event, extra)` pair produced by `encode`.
-    pub fn decode(event: u32, extra: u32) -> Self {
-        match event {
-            Self::IRQ        => KernelEvent::Irq,
-            Self::PAGE_FAULT => KernelEvent::PageFault { addr: extra },
-            Self::EXCEPTION  => KernelEvent::Exception(extra as u8),
-            Self::SOFT_INT   => KernelEvent::SoftInt(extra as u8),
-            Self::SYSCALL    => KernelEvent::Syscall,
-            Self::HLT        => KernelEvent::Hlt,
-            Self::IN         => KernelEvent::In  { port: extra as u16, size: IoSize::from_u32(extra >> 16) },
-            Self::OUT        => KernelEvent::Out { port: extra as u16, size: IoSize::from_u32(extra >> 16) },
-            Self::INS        => KernelEvent::Ins  { size: IoSize::from_u32(extra) },
-            Self::OUTS       => KernelEvent::Outs { size: IoSize::from_u32(extra) },
-            Self::FAULT      => KernelEvent::Fault,
-            _ => panic!("KernelEvent::decode: unknown tag {:#x}", event),
-        }
-    }
 }
 
 // =============================================================================
