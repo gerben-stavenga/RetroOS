@@ -722,20 +722,15 @@ pub(super) fn push_iret_frame(ldt: &[u64], regs: &mut Vcpu, handler_is_32: bool,
     };
     let eff_sp = if stack_is_32 { sp } else { sp & 0xFFFF };
     let addr = base.wrapping_add(eff_sp);
+    let a = addr as usize;
     if handler_is_32 {
-        unsafe {
-            let p = addr as *mut u32;
-            core::ptr::write_unaligned(p, eip);
-            core::ptr::write_unaligned(p.add(1), cs as u32);
-            core::ptr::write_unaligned(p.add(2), flags);
-        }
+        regs.write::<u32>(a, eip);
+        regs.write::<u32>(a + 4, cs as u32);
+        regs.write::<u32>(a + 8, flags);
     } else {
-        unsafe {
-            let p = addr as *mut u16;
-            core::ptr::write_unaligned(p, eip as u16);
-            core::ptr::write_unaligned(p.add(1), cs);
-            core::ptr::write_unaligned(p.add(2), flags as u16);
-        }
+        regs.write::<u16>(a, eip as u16);
+        regs.write::<u16>(a + 2, cs);
+        regs.write::<u16>(a + 4, flags as u16);
     }
     regs.set_sp32(sp);
 }
@@ -761,18 +756,13 @@ pub(super) fn push_farret_frame(ldt: &[u64], regs: &mut Vcpu, handler_is_32: boo
     };
     let eff_sp = if stack_is_32 { sp } else { sp & 0xFFFF };
     let addr = base.wrapping_add(eff_sp);
+    let a = addr as usize;
     if handler_is_32 {
-        unsafe {
-            let p = addr as *mut u32;
-            core::ptr::write_unaligned(p, eip);
-            core::ptr::write_unaligned(p.add(1), cs as u32);
-        }
+        regs.write::<u32>(a, eip);
+        regs.write::<u32>(a + 4, cs as u32);
     } else {
-        unsafe {
-            let p = addr as *mut u16;
-            core::ptr::write_unaligned(p, eip as u16);
-            core::ptr::write_unaligned(p.add(1), cs);
-        }
+        regs.write::<u16>(a, eip as u16);
+        regs.write::<u16>(a + 2, cs);
     }
     regs.set_sp32(sp);
 }
@@ -788,22 +778,11 @@ pub(super) fn pop_iret_frame(ldt: &[u64], regs: &mut Vcpu, handler_is_32: bool) 
     let sp_in = regs.sp32();
     let eff_sp = if stack_is_32 { sp_in } else { sp_in & 0xFFFF };
     let addr = base.wrapping_add(eff_sp);
+    let a = addr as usize;
     let frame = if handler_is_32 {
-        unsafe {
-            let p = addr as *const u32;
-            let eip = core::ptr::read_unaligned(p);
-            let cs = core::ptr::read_unaligned(p.add(1)) as u16;
-            let flags = core::ptr::read_unaligned(p.add(2));
-            (eip, cs, flags)
-        }
+        (regs.read::<u32>(a), regs.read::<u32>(a + 4) as u16, regs.read::<u32>(a + 8))
     } else {
-        unsafe {
-            let p = addr as *const u16;
-            let ip = core::ptr::read_unaligned(p) as u32;
-            let cs = core::ptr::read_unaligned(p.add(1));
-            let flags = core::ptr::read_unaligned(p.add(2)) as u32;
-            (ip, cs, flags)
-        }
+        (regs.read::<u16>(a) as u32, regs.read::<u16>(a + 2), regs.read::<u16>(a + 4) as u32)
     };
     let new_sp = if stack_is_32 {
         sp_in.wrapping_add(frame_size)
