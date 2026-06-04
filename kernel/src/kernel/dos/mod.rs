@@ -880,14 +880,12 @@ fn sync_mcb_chain(dos: &DosState) {
     for (i, &(mcb_seg, ow, paras)) in entries.iter().enumerate() {
         let sig = if i + 1 == last_idx { b'Z' } else { b'M' };
         let addr = (mcb_seg as u32) << 4;
-        unsafe {
-            let p = addr as *mut u8;
-            *p = sig;
-            ((addr + 1) as *mut u16).write_unaligned(ow);
-            ((addr + 3) as *mut u16).write_unaligned(paras);
-            for off in 5..16 {
-                *((addr + off) as *mut u8) = 0;
-            }
+        let m = crate::arch::mem();
+        m.write::<u8>(addr as usize, sig);
+        m.write::<u16>(addr as usize + 1, ow);
+        m.write::<u16>(addr as usize + 3, paras);
+        for off in 5..16 {
+            m.write::<u8>(addr as usize + off, 0);
         }
     }
 }

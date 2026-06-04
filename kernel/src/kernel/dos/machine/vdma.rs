@@ -464,20 +464,14 @@ impl SbDmaState {
             // Snapshot the guest's pre-filled content — whole pages, so the
             // unrelated neighbour bytes on partial end pages survive.
             let mut snap = alloc::vec![0u8; span];
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    vbase as *const u8, snap.as_mut_ptr(), span);
-            }
+            snap.copy_from_slice(crate::arch::mem().slice(vbase as usize, span));
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
             crate::kernel::startup::arch_free_range(vbase >> 12, num_pages);
             crate::kernel::startup::arch_map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    snap.as_ptr(), vbase as *mut u8, span);
-            }
+            crate::arch::mem().write_bytes(vbase as usize, &snap);
             self.bound_chan  = chan as u8;
             self.bound_host  = host as u8;
             self.bound_gpa   = gpa;
@@ -502,16 +496,10 @@ impl SbDmaState {
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                vbase as *const u8, snap.as_mut_ptr(), span);
-        }
+        snap.copy_from_slice(crate::arch::mem().slice(vbase as usize, span));
         crate::kernel::startup::arch_map_fresh_range(
             self.bound_vpage, self.bound_pages);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                snap.as_ptr(), vbase as *mut u8, span);
-        }
+        crate::arch::mem().write_bytes(vbase as usize, &snap);
         self.bound_chan  = 0xFF;
         self.bound_host  = 0xFF;
         self.bound_gpa   = 0;

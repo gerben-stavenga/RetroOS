@@ -381,10 +381,8 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
                 let base = (es << 4) + di;
                 for i in 0..4u32 {
                     let seg = ems_frame_seg() + (i as u16) * 0x0400;
-                    unsafe {
-                        ((base + i * 4) as *mut u16).write_unaligned(seg);
-                        ((base + i * 4 + 2) as *mut u16).write_unaligned(i as u16);
-                    }
+                    regs.write::<u16>((base + i * 4) as usize, seg);
+                    regs.write::<u16>((base + i * 4 + 2) as usize, i as u16);
                 }
                 regs.rcx = (regs.rcx & !0xFFFF) | 4; // 4 mappable pages
                 regs.rax = regs.rax & !0xFF00;
