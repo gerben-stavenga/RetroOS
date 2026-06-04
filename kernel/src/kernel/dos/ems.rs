@@ -27,11 +27,11 @@ pub(crate) const EMS_DEVICE_HANDLE: u16 = 0xFE;
 
 /// EMS page frame segment — set dynamically by `scan_uma()`.
 pub fn ems_frame_seg() -> u16 {
-    (unsafe { EMS_BASE_PAGE } as u16) * 0x100
+    (EMS_BASE_PAGE.load(core::sync::atomic::Ordering::Relaxed) as u16) * 0x100
 }
 
 fn ems_base_page() -> usize {
-    unsafe { EMS_BASE_PAGE }
+    EMS_BASE_PAGE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Swap an EMS window with a backing region.

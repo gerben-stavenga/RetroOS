@@ -5,6 +5,7 @@
 
 use crate::kernel::dos::linear;
 use crate::arch::Vcpu;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use crate::dbg_println;
 use crate::kernel::thread;
 use crate::Regs;
@@ -428,9 +429,7 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Vcpu) {
         }
     };
 
-    unsafe {
-        core::ptr::copy(src as *const u8, dst as *mut u8, length);
-    }
+    crate::arch::mem().copy_within(src as usize, dst as usize, length);
     regs.rax = (regs.rax & !0xFFFF) | 1;
     regs.rbx = regs.rbx & !0xFFFF;
 }
@@ -447,40 +446,58 @@ const UMA_PAGES: usize = UMA_END - UMA_BASE; // 48
 
 /// Bitmap of free pages in UMA (bit i = page UMA_BASE+i). 1=free, 0=ROM/reserved.
 /// Set by `scan_uma()`, then EMS claims 16 pages, rest available for UMB.
-static mut UMA_FREE: u64 = 0;
+// 48-bit page bitmaps. The bare-metal i686 target has no AtomicU64, so each
+// is split across two AtomicU32 halves; the kernel is single-core, so the two
+// halves are always updated together (see the load64/store64/and64/or64 pair
+// helpers). 1=free (UMA_FREE) / 1=allocated (UMB_ALLOC).
+static UMA_FREE_LO: AtomicU32 = AtomicU32::new(0);
+static UMA_FREE_HI: AtomicU32 = AtomicU32::new(0);
+static UMB_ALLOC_LO: AtomicU32 = AtomicU32::new(0);
+static UMB_ALLOC_HI: AtomicU32 = AtomicU32::new(0);
 
-/// Bitmap of UMB-allocated pages (subset of UMA_FREE). 1=allocated by UMB, 0=free.
-static mut UMB_ALLOC: u64 = 0;
+fn load64(lo: &AtomicU32, hi: &AtomicU32) -> u64 {
+    (hi.load(Relaxed) as u64) << 32 | lo.load(Relaxed) as u64
+}
+fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
+    lo.store(v as u32, Relaxed); hi.store((v >> 32) as u32, Relaxed);
+}
+fn and64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
+    lo.fetch_and(m as u32, Relaxed); hi.fetch_and((m >> 32) as u32, Relaxed);
+}
+fn or64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
+    lo.fetch_or(m as u32, Relaxed); hi.fetch_or((m >> 32) as u32, Relaxed);
+}
 
 /// EMS page frame base page (set by `scan_uma`); read by `ems` submodule.
-pub(super) static mut EMS_BASE_PAGE: usize = 0xD0;
+pub(super) static EMS_BASE_PAGE: AtomicUsize = AtomicUsize::new(0xD0);
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
 pub(super) fn scan_uma() {
     let mut free: u64 = 0;
+    let m = crate::arch::mem();
     for i in 0..UMA_PAGES {
-        let base = ((UMA_BASE + i) * 0x1000) as *const u8;
-        let first = unsafe { *base };
+        let base = (UMA_BASE + i) * 0x1000;
+        let first = m.read::<u8>(base);
         let mut uniform = true;
         for j in 1..0x1000 {
-            if unsafe { *base.add(j) } != first { uniform = false; break; }
+            if m.read::<u8>(base + j) != first { uniform = false; break; }
         }
         if uniform && (first == 0x00 || first == 0xFF) {
             free |= 1 << i;
         }
     }
-    unsafe { UMA_FREE = free; }
+    store64(&UMA_FREE_LO, &UMA_FREE_HI, free);
 
     // Find 16 contiguous free pages for the EMS page frame (64KB).
     // Prefer 0xD000 (standard EMS frame address).
     if let Some(off) = find_contiguous_run(free, 16, 0xD0 - UMA_BASE) {
-        unsafe { EMS_BASE_PAGE = UMA_BASE + off; }
+        EMS_BASE_PAGE.store(UMA_BASE + off, Relaxed);
         let mask = ((1u64 << 16) - 1) << off;
-        unsafe { UMA_FREE &= !mask; }
+        and64(&UMA_FREE_LO, &UMA_FREE_HI, !mask);
     }
 
-    let umb_free = unsafe { UMA_FREE };
-    let ems_base = unsafe { EMS_BASE_PAGE };
+    let umb_free = load64(&UMA_FREE_LO, &UMA_FREE_HI);
+    let ems_base = EMS_BASE_PAGE.load(Relaxed);
     let mut umb_count = 0u32;
     let mut t = umb_free;
     while t != 0 { umb_count += 1; t &= t - 1; }
@@ -508,7 +525,7 @@ fn find_contiguous_run(bitmap: u64, count: usize, hint: usize) -> Option<usize> 
 }
 
 fn umb_avail() -> u64 {
-    unsafe { UMA_FREE & !UMB_ALLOC }
+    load64(&UMA_FREE_LO, &UMA_FREE_HI) & !load64(&UMB_ALLOC_LO, &UMB_ALLOC_HI)
 }
 
 /// Allocate a UMB of at least `paragraphs` size (1 paragraph = 16 bytes).
@@ -529,7 +546,7 @@ fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
                 for j in run_start..run_start + pages_needed {
                     alloc_mask |= 1 << j;
                 }
-                unsafe { UMB_ALLOC |= alloc_mask; }
+                or64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, alloc_mask);
                 let base_page = UMA_BASE + run_start;
                 crate::kernel::startup::arch_unmap_range(base_page, pages_needed);
                 let seg = (base_page as u16) * 0x100;
@@ -549,7 +566,7 @@ fn umb_free(segment: u16) -> bool {
     if page < UMA_BASE || page >= UMA_END { return false; }
     let offset = page - UMA_BASE;
 
-    let alloc = unsafe { UMB_ALLOC };
+    let alloc = load64(&UMB_ALLOC_LO, &UMB_ALLOC_HI);
     if alloc & (1 << offset) == 0 { return false; }
 
     let mut mask = 0u64;
@@ -559,7 +576,7 @@ fn umb_free(segment: u16) -> bool {
         i += 1;
     }
     let count = (i - offset) as usize;
-    unsafe { UMB_ALLOC &= !mask; }
+    and64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, !mask);
     crate::kernel::startup::arch_free_range(page, count);
     true
 }
