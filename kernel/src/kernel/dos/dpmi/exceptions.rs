@@ -342,20 +342,11 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
             - core::mem::size_of::<RetF32>() as u32
             - core::mem::size_of::<ExcFrame32>() as u32
             - core::mem::size_of::<ExcFrameV10>() as u32;
-        let addr = pm_seg_base.wrapping_add(new_sp);
-        unsafe {
-            core::ptr::write_unaligned(addr as *mut RetF32, retf);
-            core::ptr::write_unaligned(
-                addr.wrapping_add(core::mem::size_of::<RetF32>() as u32) as *mut ExcFrame32,
-                frame,
-            );
-            core::ptr::write_unaligned(
-                addr.wrapping_add(
-                    (core::mem::size_of::<RetF32>() + core::mem::size_of::<ExcFrame32>()) as u32
-                ) as *mut ExcFrameV10,
-                v10,
-            );
-        }
+        let addr = pm_seg_base.wrapping_add(new_sp) as usize;
+        regs.write::<RetF32>(addr, retf);
+        regs.write::<ExcFrame32>(addr + core::mem::size_of::<RetF32>(), frame);
+        regs.write::<ExcFrameV10>(
+            addr + core::mem::size_of::<RetF32>() + core::mem::size_of::<ExcFrame32>(), v10);
     } else {
         // 16-bit: RetF16 (4) + ExcFrame16 (28, padded) + ExcFrameV10 (56) = 88 bytes.
         // 0.9 handler reads +00..+0FH; padding fills +10H..+1FH so the
@@ -371,20 +362,11 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
             - core::mem::size_of::<RetF16>() as u32
             - core::mem::size_of::<ExcFrame16>() as u32
             - core::mem::size_of::<ExcFrameV10>() as u32;
-        let addr = pm_seg_base.wrapping_add(new_sp);
-        unsafe {
-            core::ptr::write_unaligned(addr as *mut RetF16, retf);
-            core::ptr::write_unaligned(
-                addr.wrapping_add(core::mem::size_of::<RetF16>() as u32) as *mut ExcFrame16,
-                frame,
-            );
-            core::ptr::write_unaligned(
-                addr.wrapping_add(
-                    (core::mem::size_of::<RetF16>() + core::mem::size_of::<ExcFrame16>()) as u32
-                ) as *mut ExcFrameV10,
-                v10,
-            );
-        }
+        let addr = pm_seg_base.wrapping_add(new_sp) as usize;
+        regs.write::<RetF16>(addr, retf);
+        regs.write::<ExcFrame16>(addr + core::mem::size_of::<RetF16>(), frame);
+        regs.write::<ExcFrameV10>(
+            addr + core::mem::size_of::<RetF16>() + core::mem::size_of::<ExcFrame16>(), v10);
     }
 
     regs.frame.rsp = new_sp as u64;
@@ -471,17 +453,13 @@ pub(super) fn exception_return(
                 let frame_sp = mode_save_sp
                     - core::mem::size_of::<ExcFrameV10>() as u32
                     - core::mem::size_of::<ExcFrame32>() as u32;
-                let f = unsafe {
-                    core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrame32)
-                };
+                let f: ExcFrame32 = regs.read(host_base.wrapping_add(frame_sp) as usize);
                 (f.eip, f.cs, f.eflags, f.esp, f.ss)
             } else {
                 let frame_sp = mode_save_sp
                     - core::mem::size_of::<ExcFrameV10>() as u32
                     - core::mem::size_of::<ExcFrame16>() as u32;
-                let f = unsafe {
-                    core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrame16)
-                };
+                let f: ExcFrame16 = regs.read(host_base.wrapping_add(frame_sp) as usize);
                 // 16-bit fields fold into the low halves of the saved
                 // 32-bit registers; upper halves come from the pre-fault
                 // capture in HostContinuation below.
@@ -493,9 +471,7 @@ pub(super) fn exception_return(
             // client bitness (DPMI 1.0 §4.3). Sits at +20H..+57H from
             // the frame base, i.e. just below HostContinuation on host_stack.
             let frame_sp = mode_save_sp - core::mem::size_of::<ExcFrameV10>() as u32;
-            let f = unsafe {
-                core::ptr::read_unaligned(host_base.wrapping_add(frame_sp) as *const ExcFrameV10)
-            };
+            let f: ExcFrameV10 = regs.read(host_base.wrapping_add(frame_sp) as usize);
             // CS lives in low 16 of cs_xinfo; high 16 is ExceptionInfoBits.
             (f.eip, f.cs_xinfo & 0xFFFF, f.eflags, f.esp, f.ss)
         }

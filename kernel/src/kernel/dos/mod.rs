@@ -699,11 +699,10 @@ pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>,
     dos::Psp::at(loaded.psp_seg).set_cmdline(&cmdline_tail);
 
     let (col, row) = vga::vga().cursor_pos();
-    unsafe {
-        core::ptr::write_volatile(0x450 as *mut u8, col as u8);
-        core::ptr::write_volatile(0x451 as *mut u8, row as u8);
-    }
-    unsafe { *(&raw mut crate::arch::REGS) = t.kernel.vcpu; }
+    let m = crate::arch::mem();
+    m.write::<u8>(0x450, col as u8);
+    m.write::<u8>(0x451, row as u8);
+    crate::arch::set_current_vcpu(t.kernel.vcpu);
     // Initial thread never goes through a context switch, so load LDTR
     // directly here. Subsequent threads pick this up via `on_resume` in the
     // event-loop switch path.
@@ -716,12 +715,12 @@ pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>,
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
 fn snapshot_env(env_seg: u16) -> alloc::vec::Vec<u8> {
-    let src = ((env_seg as usize) << 4) as *const u8;
+    let base = (env_seg as usize) << 4;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;
     let mut i = 0usize;
     while i < 32768 {
-        let b = unsafe { *src.add(i) };
+        let b = crate::arch::mem().read::<u8>(base + i);
         out.push(b);
         i += 1;
         if b == 0 && prev_was_nul { break; }
@@ -782,7 +781,7 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
         cp[8], cp[9], cp[10], cp[11], cp[12], cp[13], cp[14], cp[15],
         cp[16], cp[17], cp[18], cp[19], cp[20], cp[21], cp[22], cp[23],
         cp[24], cp[25], cp[26], cp[27], cp[28], cp[29], cp[30], cp[31]);
-    let sw = unsafe { core::slice::from_raw_parts(sp_lin as *const u32, 8) };
+    let sw: [u32; 8] = core::array::from_fn(|i| crate::arch::mem().read::<u32>(sp_lin as usize + i * 4));
     crate::dbg_println!("[DBG] stack @{:08x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
         sp_lin, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
 }

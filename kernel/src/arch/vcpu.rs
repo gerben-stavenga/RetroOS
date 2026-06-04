@@ -87,6 +87,13 @@ pub struct GuestMem(());
 #[inline]
 pub fn mem() -> GuestMem { GuestMem(()) }
 
+/// Seed the live execution context with `v`. Used for the very first thread,
+/// which is entered directly rather than through a context switch (the swap
+/// path otherwise owns `REGS`). The `static mut` access is confined here.
+pub fn set_current_vcpu(v: Vcpu) {
+    unsafe { *(&raw mut crate::arch::REGS) = v; }
+}
+
 impl GuestMem {
     /// Read `len` bytes at `addr` as a slice.
     pub fn slice(self, addr: usize, len: usize) -> &'static [u8] {
