@@ -3152,7 +3152,7 @@ impl Psp {
     /// (psp_seg+0x10)<<4)`. Single-threaded kernel; the borrow checker
     /// treats successive calls as independent borrows.
     pub fn at(psp_seg: u16) -> &'static mut Self {
-        unsafe { &mut *(((psp_seg as u32) << 4) as *mut Self) }
+        crate::arch::mem().at::<Self>(((psp_seg as u32) << 4) as usize)
     }
     #[allow(dead_code)]
     pub fn psp_seg(&self) -> u16 { (self as *const _ as u32 >> 4) as u16 }
@@ -3289,7 +3289,7 @@ struct LowMem {
 /// independent borrows, so callers must avoid actually aliasing the data.
 #[inline]
 fn low_mem() -> &'static mut LowMem {
-    unsafe { &mut *(LOW_MEM_BASE as *mut LowMem) }
+    crate::arch::mem().at::<LowMem>(LOW_MEM_BASE as usize)
 }
 
 /// Update the chain-head pointer that lives at `[LOL - 2]`. Called from

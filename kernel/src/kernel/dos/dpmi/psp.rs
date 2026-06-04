@@ -11,7 +11,7 @@ use super::state::PspCacheEntry;
 pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState) {
     let rm_psp = dos.current_psp;
     let psp_base = (rm_psp as u32) * 16;
-    let env_seg = unsafe { core::ptr::read_volatile((psp_base + 0x2C) as *const u16) };
+    let env_seg = crate::arch::mem().read::<u16>(((psp_base + 0x2C)) as usize);
 
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,

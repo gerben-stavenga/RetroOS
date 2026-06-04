@@ -286,7 +286,7 @@ fn push_continuation(dos: &mut thread::DosState, regs: &Vcpu, rm_call_struct_add
     let (ss, sp) = pm_get_stack(dos, regs);
     let new_sp = sp - HOST_CONTINUATION_SIZE;
     let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
-    unsafe { core::ptr::write_unaligned(addr as *mut HostContinuation, save); }
+    crate::arch::mem().write::<HostContinuation>((addr) as usize, save);
     (ss, new_sp)
 }
 
@@ -303,14 +303,14 @@ pub(super) fn pop_continuation_at(ldt: &[u64], cursor: (u16, u32)) -> HostContin
     let addr = pm_addr(ldt, cursor);
     // Leaf helper taking a raw (SS,SP) cursor with no Vcpu in scope; the
     // address is already linear, so read it directly.
-    unsafe { core::ptr::read_unaligned(addr as *const HostContinuation) }
+    crate::arch::mem().read::<HostContinuation>((addr) as usize)
 }
 
 pub(super) fn resume_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, save: HostContinuation) {
     let saved_regs = save.rm_call_struct_addr().map(|addr| {
         let current = RmCallStruct::capture(regs);
         let saved = regs.read::<RmCallStruct>((addr) as usize);
-        unsafe { core::ptr::write_unaligned(addr as *mut RmCallStruct, current); }
+        crate::arch::mem().write::<RmCallStruct>((addr) as usize, current);
         saved
     });
 

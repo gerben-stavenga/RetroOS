@@ -11,7 +11,7 @@ fn dump_ds_dx(ds: u16, edx: u32) {
     if linear >= 0x110000 { return; } // guard against non-low memory
     let mut bytes = [0u8; 16];
     for i in 0..16 {
-        bytes[i] = unsafe { core::ptr::read_volatile((linear + i as u32) as *const u8) };
+        bytes[i] = crate::arch::mem().read::<u8>(((linear + i as u32)) as usize);
     }
     dos_trace!(
         "[DPMI]   DS:DX@{:05X}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}  '{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}'",
@@ -57,7 +57,7 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu
         mode_transitions::rm_get_stack(dos)
     };
 
-    unsafe { core::ptr::write_unaligned(struct_addr as *mut RmCallStruct, RmCallStruct::capture(regs)); }
+    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     // Get IVT entry for the interrupt
@@ -113,7 +113,7 @@ pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Vcpu) -
         mode_transitions::rm_get_stack(dos)
     };
 
-    unsafe { core::ptr::write_unaligned(struct_addr as *mut RmCallStruct, RmCallStruct::capture(regs)); }
+    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     regs.rax = rm.eax as u64;
@@ -165,7 +165,7 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vc
         mode_transitions::rm_get_stack(dos)
     };
 
-    unsafe { core::ptr::write_unaligned(struct_addr as *mut RmCallStruct, RmCallStruct::capture(regs)); }
+    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     regs.rax = rm.eax as u64;

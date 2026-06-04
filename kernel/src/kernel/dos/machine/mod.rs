@@ -761,32 +761,15 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Vcpu) -> Option<u8> {
     Some(vec)
 }
 
-/// Read a u16 from a real-mode seg:off address (unaligned-safe, null-safe)
+/// Read a u16 from a real-mode seg:off address, through the active address
+/// space's memory interface (`arch::mem()`) — works under any arch backend.
 pub fn read_u16(seg: u32, off: u32) -> u16 {
-    let linear = (seg << 4) + off;
-    let val: u16;
-    unsafe {
-        core::arch::asm!(
-            "movzx {val:e}, word ptr [{addr}]",
-            addr = in(reg) linear,
-            val = out(reg) val,
-            options(readonly, nostack),
-        );
-    }
-    val
+    crate::arch::mem().read::<u16>(((seg << 4) + off) as usize)
 }
 
-/// Write a u16 to a real-mode seg:off address (unaligned-safe, null-safe)
+/// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
 pub fn write_u16(seg: u32, off: u32, val: u16) {
-    let linear = (seg << 4) + off;
-    unsafe {
-        core::arch::asm!(
-            "mov word ptr [{addr}], {val:x}",
-            addr = in(reg) linear,
-            val = in(reg) val,
-            options(nostack),
-        );
-    }
+    crate::arch::mem().write::<u16>(((seg << 4) + off) as usize, val);
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)

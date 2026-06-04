@@ -314,7 +314,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
                 if let Some(dpmi) = dos.dpmi.as_ref() {
                     if !dpmi.client_use32 && dpmi.env_ldt_idx != 0 && (base & 0xF) == 0 {
                         let psp_base = desc_base(dos.ldt[PSP_LDT_IDX]);
-                        let env_sel = unsafe { core::ptr::read_volatile((psp_base + 0x2C) as *const u16) };
+                        let env_sel = crate::arch::mem().read::<u16>(((psp_base + 0x2C)) as usize);
                         if env_sel != 0 && ((env_sel as u32) << 4) == base {
                             let env_idx = sel_to_idx(env_sel);
                             if env_idx < LDT_ENTRIES && ldt_is_allocated(&dos.ldt_alloc, env_idx) {
@@ -398,7 +398,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let desc = dos.ldt[idx];
-                unsafe { core::ptr::write_unaligned(dest as *mut u64, desc); }
+                crate::arch::mem().write::<u64>((dest) as usize, desc);
                 dos_trace!("[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
                     desc_base(desc), desc);
                 clear_carry(regs);

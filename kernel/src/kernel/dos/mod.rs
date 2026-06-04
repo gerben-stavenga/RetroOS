@@ -48,7 +48,7 @@ pub(crate) fn pm_step_log(regs: &crate::Regs) {
     let lin = cs_base.wrapping_add(ip);
     let mut b = [0u8; 8];
     for i in 0..8 {
-        b[i] = unsafe { core::ptr::read_volatile((lin + i as u32) as *const u8) };
+        b[i] = crate::arch::mem().read::<u8>(((lin + i as u32)) as usize);
     }
     crate::dbg_println!(
         "[STEP {}] {:04X}:{:08X} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} SS:SP={:04X}:{:08X} DS={:04X} ES={:04X}",
@@ -522,18 +522,18 @@ pub fn handle_event(
                 } else {
                     crate::arch::monitor::seg_base(regs.code_seg()).wrapping_add(regs.ip32())
                 };
-                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                let bytes = crate::arch::mem().slice((lin) as usize, 8);
                 let ss_lin = if is_vm86 {
                     ((regs.stack_seg() as u32) << 4).wrapping_add(regs.sp32() & 0xFFFF)
                 } else {
                     crate::arch::monitor::seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
                 };
-                let s0 = unsafe { core::ptr::read_unaligned(ss_lin as *const u16) };
-                let s1 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(2) as *const u16) };
-                let s2 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(4) as *const u16) };
-                let s3 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(6) as *const u16) };
-                let s4 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(8) as *const u16) };
-                let s5 = unsafe { core::ptr::read_unaligned(ss_lin.wrapping_add(10) as *const u16) };
+                let s0 = crate::arch::mem().read::<u16>((ss_lin) as usize);
+                let s1 = crate::arch::mem().read::<u16>((ss_lin.wrapping_add(2)) as usize);
+                let s2 = crate::arch::mem().read::<u16>((ss_lin.wrapping_add(4)) as usize);
+                let s3 = crate::arch::mem().read::<u16>((ss_lin.wrapping_add(6)) as usize);
+                let s4 = crate::arch::mem().read::<u16>((ss_lin.wrapping_add(8)) as usize);
+                let s5 = crate::arch::mem().read::<u16>((ss_lin.wrapping_add(10)) as usize);
                 let liq = unsafe { mode_transitions::LAST_IRQ };
                 crate::println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} psp={:04x} (vm86={}) bytes={:02x?} stack={:04x} {:04x} {:04x} {:04x} {:04x} {:04x} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     n, regs.code_seg(), regs.ip32(),
@@ -551,7 +551,7 @@ pub fn handle_event(
         KE::Fault => {
             if is_vm86 {
                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
-                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                let bytes = crate::arch::mem().slice((lin) as usize, 8);
                 // Dump the surrounding state before panicking: a plain
                 // `push ds` etc. can't #GP in genuine VM86, so SS:SP/flags
                 // and the last IRQ we reflected (vector + the CS:IP/SS:SP it
@@ -775,7 +775,7 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
     let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
     let sp_lin = ss_base.wrapping_add(regs.sp32());
     let pre = ip_lin.wrapping_sub(16);
-    let cp = unsafe { core::slice::from_raw_parts(pre as *const u8, 32) };
+    let cp = crate::arch::mem().slice((pre) as usize, 32);
     crate::dbg_println!("[DBG] code @{:08x} (-16..+16):", pre);
     crate::dbg_println!("[DBG]   {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} | {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
         cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
