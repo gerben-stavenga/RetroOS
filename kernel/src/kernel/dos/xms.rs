@@ -548,7 +548,7 @@ fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
                 }
                 or64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, alloc_mask);
                 let base_page = UMA_BASE + run_start;
-                crate::kernel::startup::arch_unmap_range(base_page, pages_needed);
+                crate::arch::arch_unmap_range(base_page, pages_needed);
                 let seg = (base_page as u16) * 0x100;
                 let paras = (pages_needed as u16) * 0x100;
                 return Some((seg, paras));
@@ -577,7 +577,7 @@ fn umb_free(segment: u16) -> bool {
     }
     let count = (i - offset) as usize;
     and64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, !mask);
-    crate::kernel::startup::arch_free_range(page, count);
+    crate::arch::arch_free_range(page, count);
     true
 }
 

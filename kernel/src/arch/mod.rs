@@ -8,6 +8,7 @@
 //! uses only the re-exports below and arch calls (INT 0x80).
 
 mod boot;
+mod calls;
 mod descriptors;
 mod irq;
 pub mod monitor;
@@ -25,8 +26,10 @@ pub use vcpu::{Vcpu, GuestMem, mem, set_current_vcpu};
 pub use irq::Irq;
 pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 
-// Arch call constants (used by INT 0x80 wrappers in startup.rs)
+// Arch call constants + the ring-1 wrappers that issue them (the kernel-facing
+// arch API; the HW backend implements them as INT 0x80 stubs in `calls.rs`).
 pub use traps::arch_call;
+pub use calls::*;
 pub(crate) use traps::REGS;
 
 // Power/halt entry points. The kernel layer must not toggle IF directly —

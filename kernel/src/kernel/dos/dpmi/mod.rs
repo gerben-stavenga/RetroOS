@@ -921,7 +921,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             let vpage_start = base as usize / 4096;
             let ppage_start = phys as u64 / 4096;
             // PWT (bit 3) + PCD (bit 4): write-through, cache-disable for MMIO
-            crate::kernel::startup::arch_map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
+            crate::arch::arch_map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
             // Return linear address
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
             regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);

@@ -599,7 +599,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
             }
         }
 
-        crate::kernel::startup::arch_user_clean();
+        crate::arch::arch_user_clean();
         thread.kernel.state = ThreadState::Zombie;
         crate::dbg_println!("[mem] exit tid={} code={} free_pages={}",
             tid, exit_code, crate::arch::free_page_count());

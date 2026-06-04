@@ -291,7 +291,7 @@ impl DosState {
     pub fn on_resume(&self) {
         let ldt_ptr = self.ldt.as_ptr() as u32;
         let ldt_limit = (dpmi::LDT_ENTRIES * 8 - 1) as u32;
-        crate::kernel::startup::arch_load_ldt(ldt_ptr, ldt_limit);
+        crate::arch::arch_load_ldt(ldt_ptr, ldt_limit);
     }
 
     /// Called when the thread loses focus. Snapshots the VGA framebuffer
@@ -586,8 +586,8 @@ pub fn handle_event(
 pub fn exec_dos_into(tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) {
     use crate::kernel::startup;
 
-    startup::arch_user_clean();
-    startup::arch_map_low_mem();
+    crate::arch::arch_user_clean();
+    crate::arch::arch_map_low_mem();
     dos::setup_ivt();
 
     // args[0] is VFS-form (from exec fan-out); convert to drive-qualified
@@ -665,7 +665,7 @@ pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>,
         .expect("Failed to create DOS thread");
     let tid = t.kernel.tid as usize;
 
-    startup::arch_map_low_mem();
+    crate::arch::arch_map_low_mem();
     dos::setup_ivt();
 
     let mut dos_name = [0u8; dfs::DFS_PATH_MAX];

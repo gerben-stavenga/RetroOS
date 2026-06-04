@@ -424,7 +424,7 @@ impl SbDmaState {
     /// virtual-8237 state after a task switch).
     fn arm(&mut self, chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
-        let bufpage = crate::kernel::startup::arch_dma_channel_buf(host);
+        let bufpage = crate::arch::arch_dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
         // The buffer sits at `off` inside its channel's 64 KB / 128 KB
         // window; the channel buffer is window-aligned, so the same `off`
@@ -468,8 +468,8 @@ impl SbDmaState {
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
-            crate::kernel::startup::arch_free_range(vbase >> 12, num_pages);
-            crate::kernel::startup::arch_map_phys_range(
+            crate::arch::arch_free_range(vbase >> 12, num_pages);
+            crate::arch::arch_map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
             crate::arch::mem().write_bytes(vbase as usize, &snap);
             self.bound_chan  = chan as u8;
@@ -497,7 +497,7 @@ impl SbDmaState {
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
         snap.copy_from_slice(crate::arch::mem().slice(vbase as usize, span));
-        crate::kernel::startup::arch_map_fresh_range(
+        crate::arch::arch_map_fresh_range(
             self.bound_vpage, self.bound_pages);
         crate::arch::mem().write_bytes(vbase as usize, &snap);
         self.bound_chan  = 0xFF;

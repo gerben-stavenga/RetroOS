@@ -4,7 +4,7 @@
 //! Page tables are allocated on-demand via the page fault handler.
 
 const PAGE_SIZE: usize = 4096;
-use crate::kernel::startup::arch_set_page_flags;
+use crate::arch::arch_set_page_flags;
 pub use lib::elf::{ElfError, ElfClass};
 
 /// User stack top address (just below kernel space)

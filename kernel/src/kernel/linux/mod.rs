@@ -157,7 +157,7 @@ impl LinuxState {
     /// per-thread CPU state and finalize a deferred wait4 status write.
     pub fn on_resume(&mut self) {
         if self.tls_entry >= 0 {
-            crate::kernel::startup::arch_set_tls_entry(
+            crate::arch::arch_set_tls_entry(
                 self.tls_entry, self.tls_base,
                 self.tls_limit, self.tls_limit_in_pages,
             );
@@ -618,7 +618,7 @@ fn sys_exit(tid: usize, a: &Args) -> SyscallResult {
 fn sys_fork(kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, regs: &mut Regs) -> SyscallResult {
     let tid = kt.tid as usize;
     let mut child_root = crate::RootPageTable::empty();
-    startup::arch_user_fork(&mut child_root);
+    crate::arch::arch_user_fork(&mut child_root);
 
     let child = match thread::create_thread(Some(tid), child_root, true) {
         Some(t) => t,
@@ -836,7 +836,7 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
 
     // ELF address space prep (DOS handles its own inside exec_dos_into)
     if matches!(format, exec::BinaryFormat::Elf) {
-        startup::arch_user_clean();
+        crate::arch::arch_user_clean();
     }
 
     if let Err(_) = exec::init_thread(tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
@@ -1459,7 +1459,7 @@ fn sys_set_thread_area(kt: &mut thread::KernelThread, linux: &mut LinuxState, a:
     let flags = kt.vcpu.read::<u32>(u_info + 12);
     let limit_in_pages = flags & (1 << 4) != 0;
 
-    let idx = startup::arch_set_tls_entry(entry_number, base_addr, limit, limit_in_pages);
+    let idx = crate::arch::arch_set_tls_entry(entry_number, base_addr, limit, limit_in_pages);
     if idx < 0 { return SyscallResult::val(-ESRCH); }
 
     // Write back the allocated entry number

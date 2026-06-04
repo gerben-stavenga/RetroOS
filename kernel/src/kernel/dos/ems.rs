@@ -37,7 +37,7 @@ fn ems_base_page() -> usize {
 /// Swap an EMS window with a backing region.
 fn swap_ems_window(window: usize, backing_vpage: usize) {
     let frame = ems_base_page() + window * 4;
-    startup::arch_swap_page_entries(backing_vpage, frame, 4);
+    crate::arch::arch_swap_page_entries(backing_vpage, frame, 4);
 }
 
 /// Per-thread EMS driver state

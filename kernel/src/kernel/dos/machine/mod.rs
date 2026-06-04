@@ -294,7 +294,7 @@ impl PcMachine {
         // which is the correct A20-on state when no extended memory is
         // allocated — set_a20(true) will swap not-present into HMA_PAGE
         // so HMA accesses fault until XMS maps real extended memory.
-        crate::kernel::startup::arch_copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
+        crate::arch::arch_copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
         Self {
             a20_enabled: false,
             vpit: VirtualPit::new(),
@@ -316,7 +316,7 @@ impl PcMachine {
         if enabled == self.a20_enabled { return; }
         // Shadow always holds the opposite of what's in HMA.
         // Swap them to toggle.
-        crate::kernel::startup::arch_swap_page_entries(HMA_SHADOW_PAGE, HMA_PAGE, HMA_PAGE_COUNT);
+        crate::arch::arch_swap_page_entries(HMA_SHADOW_PAGE, HMA_PAGE, HMA_PAGE_COUNT);
         self.a20_enabled = enabled;
     }
 }
@@ -499,7 +499,7 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 let sb_in_service = pc.sb.irq < 8 && pc.vpic.in_service(pc.sb.irq);
                 pc.vpic.master_eoi();
                 if sb_in_service {
-                    crate::kernel::startup::arch_rearm_irq(5);
+                    crate::arch::arch_rearm_irq(5);
                 }
                 // Real hardware re-asserts IRQ1 if more scancodes remain in the
                 // controller when the handler finishes. Since reads no longer
