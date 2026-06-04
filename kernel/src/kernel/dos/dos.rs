@@ -45,11 +45,11 @@ const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
 
-fn bios_time_of_day() -> (u8, u8, u8, u8) {
+fn bios_time_of_day(regs: &Vcpu) -> (u8, u8, u8, u8) {
     // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
     // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
-    // of approximating the tick rate as 18 Hz.
-    let ticks = unsafe { core::ptr::read_volatile(0x46C as *const u32) } as u64;
+    // of approximating the tick rate as 18 Hz. (BDA = guest address space.)
+    let ticks = regs.read::<u32>(0x46C) as u64;
     let total_centis = ticks
         .saturating_mul(BIOS_TICK_DIVISOR)
         .saturating_mul(100)
@@ -117,8 +117,8 @@ fn cmos_date() -> (u16, u8, u8, u8) {
     (year, month, day, day_of_week(year, month, day))
 }
 
-fn current_dos_timestamp() -> (u16, u16) {
-    let (hour, min, sec, _) = bios_time_of_day();
+fn current_dos_timestamp(regs: &Vcpu) -> (u16, u16) {
+    let (hour, min, sec, _) = bios_time_of_day(regs);
     let (year, month, day, _) = cmos_date();
     let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
     let dos_date = ((year.saturating_sub(1980)) << 9) | ((month as u16) << 5) | day as u16;
@@ -191,7 +191,7 @@ pub(crate) fn dispatch_kernel_syscall(
         // INT 29h — DOS FAST_CON_OUT: AL = char to display. Route through
         // the normal console path so VGA and debugcon stay in sync.
         0x29 => {
-            dos_putchar(regs.rax as u8);
+            let ch = regs.rax as u8; dos_putchar(regs, ch);
             thread::KernelAction::Done
         }
         0x2E => int_2eh(kt, dos, regs),
@@ -676,15 +676,15 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
                 0x0D => {
                     regs.write::<u8>((buf_lin + 1) as usize, count);
                     regs.write::<u8>((buf_lin + 2 + count as u32) as usize, 0x0D);
-                    dos_putchar(0x0D);
-                    dos_putchar(0x0A);
+                    dos_putchar(regs, 0x0D);
+                    dos_putchar(regs, 0x0A);
                     None
                 }
                 0x08 => {
                     if count > 0 {
-                        dos_putchar(0x08);
-                        dos_putchar(b' ');
-                        dos_putchar(0x08);
+                        dos_putchar(regs, 0x08);
+                        dos_putchar(regs, b' ');
+                        dos_putchar(regs, 0x08);
                         Some(buffered_input_resume(buf_lin, max_chars, count - 1))
                     } else {
                         Some(buffered_input_resume(buf_lin, max_chars, count))
@@ -693,10 +693,10 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
                 _ => {
                     if (count as u32) + 1 < max_chars as u32 {
                         regs.write::<u8>(((buf_lin + 2 + count as u32)) as usize, ch);
-                        dos_putchar(ch);
+                        dos_putchar(regs, ch);
                         Some(buffered_input_resume(buf_lin, max_chars, count + 1))
                     } else {
-                        dos_putchar(0x07); // bell — no room
+                        dos_putchar(regs, 0x07); // bell — no room
                         Some(buffered_input_resume(buf_lin, max_chars, count))
                     }
                 }
@@ -744,31 +744,33 @@ fn int16_finish_resume(echo: bool) -> super::ResumeCallback {
                 dos.dos_pending_char = Some(scan);
             }
             regs.rax = (regs.rax & !0xFF) | ascii as u64;
-            if echo && ascii != 0 { dos_putchar(ascii); }
+            if echo && ascii != 0 { dos_putchar(regs, ascii); }
             None
         }))
 }
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
-fn dos_putchar(c: u8) {
+fn dos_putchar(regs: &mut Vcpu, c: u8) {
     use crate::arch::outb;
     // Mirror DOS console output to QEMU debugcon alongside VGA.
     outb(0xE9, c);
-    unsafe {
-        let col = core::ptr::read_volatile(0x450 as *const u8) as usize;
-        let row = core::ptr::read_volatile(0x451 as *const u8) as usize;
+    // The BDA cursor (0040:0050/0051) is guest address space — go through the
+    // vcpu so the access works under any arch backend, not just a host pointer.
+    let col = regs.read::<u8>(0x450) as usize;
+    let row = regs.read::<u8>(0x451) as usize;
+    let (col, row) = unsafe {
         let v = vga::vga();
         v.set_cursor_pos(col, row);
         v.putchar(c);
-        let (col, row) = v.cursor_pos();
-        core::ptr::write_volatile(0x450 as *mut u8, col as u8);
-        core::ptr::write_volatile(0x451 as *mut u8, row as u8);
-        // Update CRTC hardware cursor so save_from_hardware captures it
-        let offset = (row * 80 + col) as u16;
-        outb(0x3D4, 0x0E); outb(0x3D5, (offset >> 8) as u8);
-        outb(0x3D4, 0x0F); outb(0x3D5, offset as u8);
-    }
+        v.cursor_pos()
+    };
+    regs.write::<u8>(0x450, col as u8);
+    regs.write::<u8>(0x451, row as u8);
+    // Update CRTC hardware cursor so save_from_hardware captures it
+    let offset = (row * 80 + col) as u16;
+    outb(0x3D4, 0x0E); outb(0x3D5, (offset >> 8) as u8);
+    outb(0x3D4, 0x0F); outb(0x3D5, offset as u8);
 }
 
 fn psp_struct_seg(dos: &thread::DosState) -> u16 {
@@ -804,7 +806,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
-            dos_putchar(regs.rdx as u8);
+            let ch = regs.rdx as u8; dos_putchar(regs, ch);
             thread::KernelAction::Done
         }
         // AH=0x06: Direct console I/O (DL=0xFF=input, else output DL)
@@ -818,7 +820,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     regs.set_flag32(0x40); // set ZF = no char available
                 }
             } else {
-                dos_putchar(dl);
+                dos_putchar(regs, dl);
             }
             thread::KernelAction::Done
         }
@@ -845,7 +847,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             // AL=0 then the scancode on the next read).
             if let Some(ch) = dos.dos_pending_char.take() {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
-                if echo && ch != 0 { dos_putchar(ch); }
+                if echo && ch != 0 { dos_putchar(regs, ch); }
             } else {
                 // Real DOS services console input through INT 16h — so do we.
                 // Enter the guest's IVT[0x16] (AH=00, wait-for-key) with an
@@ -867,7 +869,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             loop {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == b'$' { break; }
-                dos_putchar(ch);
+                dos_putchar(regs, ch);
                 addr = addr.wrapping_add(1);
                 // Safety limit: cap at 64 KiB from start
                 if addr.wrapping_sub(start) > 0xFFFF { break; }
@@ -1449,7 +1451,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = regs.read::<u8>(((addr + i)) as usize);
-                    dos_putchar(ch);
+                    dos_putchar(regs, ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
                 regs.clear_flag32(1);
@@ -1807,7 +1809,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=2Ch — Get System Time
         0x2C => {
-            let (hours, mins, secs, centisecs) = bios_time_of_day();
+            let (hours, mins, secs, centisecs) = bios_time_of_day(regs);
             regs.rcx = (regs.rcx & !0xFFFF) | ((hours as u64) << 8) | mins as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | ((secs as u64) << 8) | centisecs as u64;
             thread::KernelAction::Done
@@ -1818,7 +1820,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if al == 0 {
                 // DOS time: bits 15-11=hours, 10-5=minutes, 4-0=seconds/2
                 // DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
-                let (time, date) = current_dos_timestamp();
+                let (time, date) = current_dos_timestamp(regs);
                 regs.rcx = (regs.rcx & !0xFFFF) | time as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | date as u64;
                 regs.clear_flag32(1);
