@@ -111,10 +111,13 @@ pub fn host_start() -> ! {
     arch::init_guest_ram(64 << 20);
     println!("[host] RetroOS hosted kernel — interpreter (Unicorn) arch backend");
 
-    // Hand-assembled 32-bit guest: syscall, port OUT, a ~2k-insn delay loop
-    // (exercises timer slicing), then exit.
-    const CODE: u32 = 0x1000;
-    const STACK: u32 = 0x8000;
+    // Hand-assembled 32-bit guest: syscall, port OUT, a write to a fresh
+    // (demand-paged) page, a ~2k-insn delay loop (timer slicing), then exit.
+    // Above the 64 KiB null-pointer guard (the MMU faults guard-range accesses,
+    // matching metal).
+    const CODE: u32 = 0x0010_0000; // 1 MiB
+    const STACK: u32 = 0x0020_0000; // 2 MiB
+    const SCRATCH: u32 = 0x0040_0000; // 4 MiB — a fresh page, demand-paged on write
     #[rustfmt::skip]
     let code: &[u8] = &[
         0xB8, 0x04,0x00,0x00,0x00,   // mov eax,4
@@ -123,6 +126,7 @@ pub fn host_start() -> ! {
         0xB8, 0x42,0x00,0x00,0x00,   // mov eax,0x42
         0xBA, 0xE9,0x00,0x00,0x00,   // mov edx,0xE9
         0xEE,                        // out dx,al     -> Out{port=0xE9}
+        0xA3, 0x00,0x00,0x40,0x00,   // mov [0x00400000],eax  -> demand-page write
         0xB9, 0x00,0x08,0x00,0x00,   // mov ecx,0x800
         0x49,                        // dec ecx   <- loop
         0x75, 0xFD,                  // jnz -3
@@ -144,6 +148,10 @@ pub fn host_start() -> ! {
     loop {
         match arch::do_arch_execute() {
             KernelEvent::SoftInt(0x80) if eax() == 1 => {
+                // The guest's `mov [0x400000],eax` (eax was 0x42) went through a
+                // demand-paged page that arch::mem() and Unicorn share.
+                let scratch: u32 = arch::mem().read(SCRATCH as usize);
+                println!("[host] guest scratch[{:#x}] = {:#x} (demand-paged)", SCRATCH, scratch);
                 println!("[host] guest exit syscall -> done ({irqs} timer ticks)");
                 arch::shutdown();
             }

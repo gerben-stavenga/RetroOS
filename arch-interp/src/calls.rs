@@ -46,64 +46,85 @@ pub fn do_arch_execute() -> KernelEvent {
     crate::cpu::execute()
 }
 
-/// Switch threads: swap live state with the pointed-to state. (M2/M3)
-pub fn arch_switch_to(vcpu: &mut Vcpu, hash_ptr: *mut u64, fx_ptr: *mut FxState) {
-    unimplemented!("M3: address-space + register swap")
+/// Switch threads: swap live state (`REGS`) with the pointed-to state, and make
+/// the incoming address space active. On entry `vcpu` holds the incoming state;
+/// on exit it holds the saved outgoing state (matching the metal contract).
+pub fn arch_switch_to(vcpu: &mut Vcpu, _hash_ptr: *mut u64, _fx_ptr: *mut FxState) {
+    let live = unsafe { &mut *(&raw mut crate::vcpu::REGS) };
+    core::mem::swap(&mut live.regs, &mut vcpu.regs);
+    core::mem::swap(&mut live.space, &mut vcpu.space);
+    // `live` now holds the incoming context — activate its address space and
+    // drop the outgoing space's lazy Unicorn mappings.
+    crate::cpu::flush_uc();
+    crate::mmu::switch_to(live.space.0);
+    // FPU state is the software core's; cross-switch FPU preservation is M4.
 }
 
-/// COW-fork the current address space, filling `child_root`. (M4)
+/// Fork the current address space into `child_root`. M4 will make this COW;
+/// for now it is a full copy (correct, just not lazy).
 pub fn arch_user_fork(child_root: &mut RootPageTable) {
-    unimplemented!("M4: COW fork over the software MMU")
+    let parent = crate::mmu::active_id();
+    *child_root = RootPageTable(crate::mmu::fork_copy(parent));
 }
 
-/// Free all user pages in the current address space. (M3)
+/// Free all user pages in the current address space.
 pub fn arch_user_clean() {
-    unimplemented!("M3: free user pages")
+    crate::mmu::clean();
+    crate::cpu::flush_uc();
 }
 
-/// Free user pages in the current address space (arch CLEAN). (M3)
+/// Free user pages in the current address space (arch CLEAN).
 pub fn arch_free_user_pages() {
-    unimplemented!("M3: free user pages")
+    arch_user_clean();
 }
 
-/// Set page permissions (bit0=W, bit1=X) over a range. (M3)
-pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, executable: bool) {
-    unimplemented!("M3: software MMU page flags")
+/// Set page permissions (bit0=W, bit1=X) over a range.
+pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, _executable: bool) {
+    crate::mmu::set_flags(start_vpage, count, writable);
+    crate::cpu::invalidate_uc(start_vpage, count);
 }
 
-/// Map the first 1MB user-accessible for VM86. (M3)
+/// Map the first 1MB user-accessible.
 pub fn arch_map_low_mem() {
-    unimplemented!("M3: low-memory mapping")
+    crate::mmu::map_low_mem();
+    crate::cpu::invalidate_uc(0, 0x100);
 }
 
-/// Copy page-table entries src→dst. (M3)
+/// Copy page-table entries src→dst.
 pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
-    unimplemented!("M3: software MMU copy entries")
+    crate::mmu::copy_entries(src_vpage, dst_vpage, count);
+    crate::cpu::invalidate_uc(dst_vpage, count);
 }
 
-/// Swap page-table entries a↔b. (M3)
+/// Swap page-table entries a↔b.
 pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
-    unimplemented!("M3: software MMU swap entries")
+    crate::mmu::swap_entries(a_vpage, b_vpage, count);
+    crate::cpu::invalidate_uc(a_vpage, count);
+    crate::cpu::invalidate_uc(b_vpage, count);
 }
 
-/// Clear entries to absent (enables demand paging on next access). (M3)
+/// Clear entries to absent (enables demand paging on next access).
 pub fn arch_unmap_range(base_page: usize, count: usize) {
-    unimplemented!("M3: software MMU unmap range")
+    crate::mmu::unmap(base_page, count);
+    crate::cpu::invalidate_uc(base_page, count);
 }
 
-/// Free physical pages and restore identity-mapped read-only entries. (M3)
+/// Free physical pages over a range.
 pub fn arch_free_range(base_page: usize, count: usize) {
-    unimplemented!("M3: software MMU free range")
+    crate::mmu::free(base_page, count);
+    crate::cpu::invalidate_uc(base_page, count);
 }
 
-/// Replace `count` user pages with fresh anonymous RW frames. (M3)
+/// Replace `count` user pages with fresh anonymous RW frames.
 pub fn arch_map_fresh_range(vpage: usize, count: usize) {
-    unimplemented!("M3: software MMU fresh range")
+    crate::mmu::map_fresh(vpage, count);
+    crate::cpu::invalidate_uc(vpage, count);
 }
 
-/// Map a range of physical pages into user virtual space. (M3)
-pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
-    unimplemented!("M3: software MMU phys mapping")
+/// Map a range of physical pages into user virtual space.
+pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, _ppage_start: u64, _flags: u64) {
+    crate::mmu::map_phys(vpage_start, num_pages);
+    crate::cpu::invalidate_uc(vpage_start, num_pages);
 }
 
 /// Load LDT base+limit. (M4)

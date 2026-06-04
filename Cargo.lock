@@ -271,6 +271,7 @@ name = "retroos-arch-interp"
 version = "0.1.0"
 dependencies = [
  "arch-abi",
+ "libc",
  "unicorn-engine",
 ]
 

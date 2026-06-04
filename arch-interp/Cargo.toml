@@ -12,6 +12,10 @@ arch-abi = { path = "../arch-abi" }
 # Unicorn (the software x86 core) drives the Vcpu run path. The hosted build
 # targets a native 64-bit host, so its C core builds natively.
 unicorn-engine = "2.1.5"
+# Software MMU: each guest address space is an mmap-reserved, demand-committed
+# host VA region, so a guest-linear address is a contiguous host pointer (the
+# same model the metal backend gets from real page tables).
+libc = "0.2"
 
 # The self-contained Unicorn proof-of-concept that seeded this backend:
 #   cargo run -p retroos-arch-interp --example poc

@@ -6,9 +6,9 @@
 //! indexes a flat host-side guest-RAM buffer. The raw access stays confined to
 //! `GuestMem`, so kernel/dos code holds no `unsafe` of its own.
 
+use crate::mmu;
 use crate::space::RootPageTable;
 use arch_abi::Regs;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Register state + address-space handle for one execution context.
 #[repr(C)]
@@ -51,43 +51,25 @@ pub fn set_current_vcpu(v: Vcpu) {
     unsafe { *(&raw mut REGS) = v; }
 }
 
-// ── Guest RAM ────────────────────────────────────────────────────────────
-//
-// A single flat host buffer; a guest-linear address indexes it directly. The
-// buffer is leaked at init so the slices `GuestMem` hands out are soundly
-// `'static` (it never moves or frees), matching the metal signatures. The
-// software MMU (M3) will replace this flat model with per-space mappings.
-
-static GUEST_RAM: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static GUEST_RAM_LEN: AtomicUsize = AtomicUsize::new(0);
-
-/// Allocate the flat guest-RAM region. Call once during host bring-up before
-/// any guest memory access. Idempotent-ish: a second call leaks the first.
-pub fn init_guest_ram(len: usize) {
-    let buf = vec![0u8; len].into_boxed_slice();
-    let ptr = Box::leak(buf).as_mut_ptr();
-    GUEST_RAM.store(ptr, Ordering::SeqCst);
-    GUEST_RAM_LEN.store(len, Ordering::SeqCst);
+/// Initialize guest memory: create the initial address space. The `len`
+/// argument is vestigial (the MMU reserves the full user VA range per space);
+/// kept for surface compatibility with the bring-up call site.
+pub fn init_guest_ram(_len: usize) {
+    mmu::init();
 }
 
+/// Host pointer for a guest address in the active space, demand-committing the
+/// spanned pages. A reserved-contiguous VA window means this is a plain
+/// `base + addr` once committed — so multi-page slices are sound.
 #[inline]
-fn host_ptr(addr: usize) -> *mut u8 {
-    let base = GUEST_RAM.load(Ordering::Relaxed);
-    debug_assert!(!base.is_null(), "guest RAM not initialized (call init_guest_ram)");
-    debug_assert!(addr < GUEST_RAM_LEN.load(Ordering::Relaxed), "guest addr {addr:#x} out of range");
-    unsafe { base.add(addr) }
-}
-
-/// The flat guest-RAM region `(base, len)`. The software CPU (`cpu.rs`) maps
-/// this exact buffer into Unicorn so guest execution and `GuestMem` share one
-/// set of bytes. Returns a null base until `init_guest_ram`.
-pub(crate) fn guest_ram() -> (*mut u8, usize) {
-    (GUEST_RAM.load(Ordering::Relaxed), GUEST_RAM_LEN.load(Ordering::Relaxed))
+fn host_ptr(addr: usize, len: usize) -> *mut u8 {
+    mmu::ensure_committed(addr, len);
+    unsafe { mmu::active_base().add(addr) }
 }
 
 /// The active address space's memory interface — `arch::mem()`. THE place the
-/// kernel touches guest memory; the backend detail (host buffer vs page tables)
-/// stays behind this identical API.
+/// kernel touches guest memory; the backend detail (software MMU vs page
+/// tables) stays behind this identical API.
 #[derive(Clone, Copy)]
 pub struct GuestMem(());
 
@@ -96,35 +78,38 @@ pub fn mem() -> GuestMem { GuestMem(()) }
 
 impl GuestMem {
     pub fn slice(self, addr: usize, len: usize) -> &'static [u8] {
-        unsafe { core::slice::from_raw_parts(host_ptr(addr), len) }
+        unsafe { core::slice::from_raw_parts(host_ptr(addr, len), len) }
     }
     pub fn slice_mut(self, addr: usize, len: usize) -> &'static mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(host_ptr(addr), len) }
+        unsafe { core::slice::from_raw_parts_mut(host_ptr(addr, len), len) }
     }
     pub fn c_str(self, addr: usize, max: usize) -> &'static [u8] {
         unsafe {
-            let p = host_ptr(addr);
+            let p = host_ptr(addr, max);
             let mut len = 0;
             while len < max && *p.add(len) != 0 { len += 1; }
             core::slice::from_raw_parts(p, len)
         }
     }
     pub fn read<T: Copy>(self, addr: usize) -> T {
-        unsafe { core::ptr::read_unaligned(host_ptr(addr) as *const T) }
+        unsafe { core::ptr::read_unaligned(host_ptr(addr, core::mem::size_of::<T>()) as *const T) }
     }
     pub fn write<T: Copy>(self, addr: usize, val: T) {
-        unsafe { core::ptr::write_unaligned(host_ptr(addr) as *mut T, val); }
+        unsafe { core::ptr::write_unaligned(host_ptr(addr, core::mem::size_of::<T>()) as *mut T, val); }
     }
     pub fn at<T>(self, addr: usize) -> &'static mut T {
-        unsafe { &mut *(host_ptr(addr) as *mut T) }
+        unsafe { &mut *(host_ptr(addr, core::mem::size_of::<T>()) as *mut T) }
     }
     pub fn zero(self, addr: usize, len: usize) {
-        unsafe { core::ptr::write_bytes(host_ptr(addr), 0, len); }
+        unsafe { core::ptr::write_bytes(host_ptr(addr, len), 0, len); }
     }
     pub fn write_bytes(self, addr: usize, src: &[u8]) {
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), host_ptr(addr), src.len()); }
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), host_ptr(addr, src.len()), src.len()); }
     }
     pub fn copy_within(self, src: usize, dst: usize, len: usize) {
-        unsafe { core::ptr::copy(host_ptr(src), host_ptr(dst), len); }
+        // Commit both ranges, then an overlap-safe copy through the contiguous
+        // active base (host_ptr returns base+addr, so the two pointers alias the
+        // same region and `copy` handles overlap).
+        unsafe { core::ptr::copy(host_ptr(src, len), host_ptr(dst, len), len); }
     }
 }

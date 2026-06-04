@@ -5,73 +5,67 @@
 //! * The kernel's global `REGS` (a `Vcpu`) is the source of truth for register
 //!   state. Each `execute()` loads `REGS` into Unicorn, runs a slice, then
 //!   stores Unicorn's registers back into `REGS`.
-//! * Guest RAM is the interpreter's `GUEST_RAM` buffer, mapped *by pointer*
-//!   into Unicorn (`mem_map_ptr`). So guest execution and the kernel's
-//!   `arch::mem()` touch the very same bytes — one source of truth, no copying.
-//! * A run ends at the first sensitive event (software `INT`, port `IN`/`OUT`)
-//!   or after `SLICE` instructions retire (a deterministic timer tick → `Irq`).
-//!   The hooks stash the event; `execute` returns it as the canonical
-//!   `KernelEvent` the kernel event loop already understands.
-//!
-//! Milestone 2 runs a flat 32-bit guest over a single mapped region; the
-//! demand-paged software MMU and segmentation come in M3/M4.
+//! * Guest memory is the software MMU (`mmu.rs`): a reserved, demand-committed
+//!   host VA window per address space. Unicorn maps pages of the *active* space
+//!   lazily — the first access to a page faults into the mem hook, which asks
+//!   the MMU to demand-commit it and maps that host page into Unicorn by
+//!   pointer, so guest execution and `arch::mem()` share the same bytes. On a
+//!   context switch the active space's lazily-mapped pages are dropped, so the
+//!   incoming space re-faults its own pages in.
+//! * A run ends at the first sensitive event (software `INT`, port `IN`/`OUT`,
+//!   an illegal access → `PageFault`) or after `SLICE` instructions retire
+//!   (a deterministic timer tick → `Irq`).
 
-use crate::vcpu;
+use crate::{mmu, vcpu};
 use arch_abi::{IoSize, KernelEvent, Regs};
 use core::cell::RefCell;
 use core::ffi::c_void;
+use std::collections::BTreeSet;
 use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
+
+const PAGE: u64 = 4096;
 
 /// Instructions per run-slice — also the timer-IRQ granularity (deterministic).
 const SLICE: usize = 500;
 
-/// Per-run hook scratch: the event a hook stopped the slice with (if any).
+/// Per-run hook scratch.
 #[derive(Default)]
 struct Ctx {
+    /// Event a hook stopped the slice with (if any).
     pending: Option<KernelEvent>,
+    /// Guest pages currently mapped into Unicorn for the active space. Cleared
+    /// (and the pages unmapped) on a context switch.
+    mapped: BTreeSet<u64>,
 }
 
 thread_local! {
-    /// The single software CPU. Built lazily on first `execute()` once guest
-    /// RAM exists; persists (with its memory mapping + hooks) across slices.
+    /// The single software CPU. Built lazily on first `execute()`; persists
+    /// (with its hooks) across slices and address spaces.
     static MACHINE: RefCell<Option<Unicorn<'static, Ctx>>> = const { RefCell::new(None) };
 }
 
-/// Build the Unicorn instance: map the shared guest RAM and install the event
-/// hooks. Called once.
+/// Build the Unicorn instance and install the event hooks. No memory is mapped
+/// up front — pages are mapped lazily as the guest faults them in.
 fn build() -> Unicorn<'static, Ctx> {
-    let (ram, len) = vcpu::guest_ram();
-    assert!(!ram.is_null(), "guest RAM not initialized before execute()");
-
     let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, Ctx::default())
         .expect("unicorn init");
 
-    // Share the kernel's guest-RAM buffer with the software CPU (no copy).
-    unsafe {
-        uc.mem_map_ptr(0, len as u64, Prot::ALL, ram as *mut c_void)
-            .expect("map guest RAM");
-    }
-
-    // Software INT n → SoftInt(n). (Flat 32-bit guest: every INT surfaces;
-    // VM86 redirection / exception splitting is M4.)
+    // Software INT n → SoftInt(n).
     uc.add_intr_hook(|uc, intno| {
         uc.get_data_mut().pending = Some(KernelEvent::SoftInt(intno as u8));
         let _ = uc.emu_stop();
     })
     .expect("intr hook");
 
-    // Port OUT → Out event; the value is already in EAX (synced back to REGS),
-    // matching how the metal monitor surfaces it.
+    // Port OUT → Out event; the value is in EAX (synced back to REGS).
     uc.add_insn_out_hook(|uc, port, size, _val| {
         uc.get_data_mut().pending = Some(KernelEvent::Out { port: port as u16, size: io_size(size) });
         let _ = uc.emu_stop();
     })
     .expect("out hook");
 
-    // Port IN → In event. The hook must return a value for the in-flight
-    // instruction; the kernel overwrites EAX with the real value before resume,
-    // so the dummy 0 here is immediately discarded.
+    // Port IN → In event. The dummy 0 is overwritten by the kernel's EAX.
     uc.add_insn_in_hook(|uc, port, size| {
         uc.get_data_mut().pending = Some(KernelEvent::In { port: port as u16, size: io_size(size) });
         let _ = uc.emu_stop();
@@ -79,15 +73,37 @@ fn build() -> Unicorn<'static, Ctx> {
     })
     .expect("in hook");
 
-    // Access outside the mapped region → page fault (CR2 = faulting address).
-    // With the flat M2 mapping this only fires for genuinely-bad accesses; the
-    // demand-paging retry path arrives with the software MMU (M3).
+    // Access to an unmapped page → ask the MMU to demand-commit it, map that
+    // host page into Unicorn, and retry. An illegal address bubbles a fault.
     uc.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX, |uc, _t: MemType, addr, _sz, _v| {
+        let page = addr & !(PAGE - 1);
+        match mmu::demand(addr as usize) {
+            Some(writable) => {
+                let prot = if writable { Prot::ALL } else { Prot::READ | Prot::EXEC };
+                let host = unsafe { mmu::active_base().add(page as usize) };
+                let ok = unsafe { uc.mem_map_ptr(page, PAGE, prot, host as *mut c_void).is_ok() };
+                if ok {
+                    uc.get_data_mut().mapped.insert(page);
+                }
+                ok // retry if we mapped it
+            }
+            None => {
+                uc.get_data_mut().pending = Some(KernelEvent::PageFault { addr: addr as u32 });
+                let _ = uc.emu_stop();
+                false
+            }
+        }
+    })
+    .expect("unmapped hook");
+
+    // Write/exec against a present-but-protected page (e.g. a read-only .text
+    // page). COW lands in M4; for now this is a genuine fault.
+    uc.add_mem_hook(HookType::MEM_PROT, 0, u64::MAX, |uc, _t: MemType, addr, _sz, _v| {
         uc.get_data_mut().pending = Some(KernelEvent::PageFault { addr: addr as u32 });
         let _ = uc.emu_stop();
-        false // do not retry — surface the fault
+        false
     })
-    .expect("mem hook");
+    .expect("prot hook");
 
     uc
 }
@@ -100,13 +116,16 @@ fn io_size(bytes: usize) -> IoSize {
     }
 }
 
-/// Run the current Vcpu (`REGS`) for one slice and return the next event.
-pub fn execute() -> KernelEvent {
+fn io_with<R>(f: impl FnOnce(&mut Unicorn<'static, Ctx>) -> R) -> R {
     MACHINE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let uc = slot.get_or_insert_with(build);
+        f(slot.get_or_insert_with(build))
+    })
+}
 
-        // Kernel REGS → software CPU.
+/// Run the current Vcpu (`REGS`) for one slice and return the next event.
+pub fn execute() -> KernelEvent {
+    io_with(|uc| {
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
         load_regs(uc, regs);
         uc.get_data_mut().pending = None;
@@ -114,23 +133,46 @@ pub fn execute() -> KernelEvent {
         let pc = regs.frame.rip;
         let run = uc.emu_start(pc, 0xFFFF_FFFF, 0, SLICE);
 
-        // Software CPU → kernel REGS.
         store_regs(uc, regs);
 
         if let Some(ev) = uc.get_data_mut().pending.take() {
             return ev;
         }
         match run {
-            // Whole slice retired with no event → deterministic timer tick.
-            Ok(()) => KernelEvent::Irq,
+            Ok(()) => KernelEvent::Irq, // whole slice retired → timer tick
             Err(_) => KernelEvent::Fault,
         }
     })
 }
 
-// Register sync. M2 syncs the general-purpose file, instruction pointer, and
-// flags; the guest runs flat (segment bases 0), so selector/GDT sync is left
-// for M4. EAX..EFLAGS are 32-bit here; the upper halves of `Regs` stay 0.
+/// Drop `count` pages at `vpage` from Unicorn's active mapping so a later access
+/// re-faults them with the MMU's new state. Called after any arch call that
+/// mutates the active space's mappings.
+pub fn invalidate_uc(vpage: usize, count: usize) {
+    io_with(|uc| {
+        for p in vpage..vpage + count {
+            let base = (p as u64) * PAGE;
+            if uc.get_data_mut().mapped.remove(&base) {
+                let _ = uc.mem_unmap(base, PAGE);
+            }
+        }
+    });
+}
+
+/// Drop the entire active-space mapping from Unicorn (on a context switch); the
+/// incoming space re-faults its pages in lazily.
+pub fn flush_uc() {
+    io_with(|uc| {
+        let pages: Vec<u64> = uc.get_data().mapped.iter().copied().collect();
+        for base in pages {
+            let _ = uc.mem_unmap(base, PAGE);
+        }
+        uc.get_data_mut().mapped.clear();
+    });
+}
+
+// Register sync. M2/M3 sync the general-purpose file, instruction pointer, and
+// flags; the guest runs flat (segment bases 0), so selector/GDT sync is M4.
 
 fn load_regs(uc: &mut Unicorn<'static, Ctx>, r: &Regs) {
     let _ = uc.reg_write(RegisterX86::EAX, r.rax);

@@ -37,6 +37,7 @@ pub use arch_abi::{
 mod calls;
 mod cpu;
 mod machine;
+mod mmu;
 pub mod monitor;
 mod space;
 mod vcpu;
@@ -49,6 +50,8 @@ pub use machine::{
 pub use space::{KernelPages, RootPageTable};
 pub use vcpu::{mem, set_current_vcpu, GuestMem, Vcpu, REGS};
 
-// Interpreter-specific host bring-up (not part of the metal surface): allocate
-// the flat guest-RAM region before the kernel touches guest memory.
+// Interpreter-specific host bring-up (not part of the metal surface):
+// `init_guest_ram` creates the initial address space; `new_space` allocates a
+// fresh one (until the kernel's thread/fork path drives this in M4).
 pub use vcpu::init_guest_ram;
+pub use mmu::new_space;
