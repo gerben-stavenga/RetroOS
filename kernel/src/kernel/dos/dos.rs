@@ -970,14 +970,10 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.rax = (regs.rax & !0xFFFF) | 0x0F;
                 regs.set_flag32(1);
             } else {
-                let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
+                let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
                 let cwd = dos.dfs.get_cwd();
-                unsafe {
-                    for (i, &b) in cwd.iter().enumerate() {
-                        *((addr + i as u32) as *mut u8) = b;
-                    }
-                    *((addr + cwd.len() as u32) as *mut u8) = 0;
-                }
+                regs.write_bytes(addr, cwd);
+                regs.write::<u8>(addr + cwd.len(), 0);
                 dos_trace!("D21 47 DL={:02X} out=\"{}\"",
                     dl, core::str::from_utf8(cwd).unwrap_or("?"));
                 regs.clear_flag32(1);
@@ -1061,22 +1057,14 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // Many programs (including NC 2.0) allocate only 32 bytes, so write
         // field-by-field rather than blindly zeroing 34 bytes.
         0x38 => {
-            let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-            unsafe {
-                let p = addr as *mut u8;
-                core::ptr::write_bytes(p, 0, 24); // zero first 24 bytes (through case-map)
-                // +00: date format (0 = USA: mm/dd/yy)
-                // +02: currency symbol '$\0\0\0\0'
-                *p.add(2) = b'$';
-                // +07: thousands separator ',\0'
-                *p.add(7) = b',';
-                // +09: decimal separator '.\0'
-                *p.add(9) = b'.';
-                // +0B: date separator '/\0'
-                *p.add(0x0B) = b'/';
-                // +0D: time separator ':\0'
-                *p.add(0x0D) = b':';
-            }
+            let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
+            regs.zero(addr, 24); // zero first 24 bytes (through case-map)
+            // +00: date format (0 = USA: mm/dd/yy)
+            regs.write::<u8>(addr + 2, b'$');     // +02: currency symbol '$\0\0\0\0'
+            regs.write::<u8>(addr + 7, b',');     // +07: thousands separator ',\0'
+            regs.write::<u8>(addr + 9, b'.');     // +09: decimal separator '.\0'
+            regs.write::<u8>(addr + 0x0B, b'/');  // +0B: date separator '/\0'
+            regs.write::<u8>(addr + 0x0D, b':');  // +0D: time separator ':\0'
             regs.rbx = (regs.rbx & !0xFFFF) | 1; // country code = 1 (USA)
             regs.clear_flag32(1);
             thread::KernelAction::Done
@@ -1504,8 +1492,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x43 => {
             let al = regs.rax as u8;
             let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-            { let p = addr as *const u8; let mut hex = [0u8; 32];
-              for j in 0..16usize { let b = unsafe { *p.add(j) }; hex[j*2] = b"0123456789ABCDEF"[(b>>4) as usize]; hex[j*2+1] = b"0123456789ABCDEF"[(b&0xF) as usize]; }
+            { let mut hex = [0u8; 32];
+              for j in 0..16usize { let b = regs.read::<u8>(addr as usize + j); hex[j*2] = b"0123456789ABCDEF"[(b>>4) as usize]; hex[j*2+1] = b"0123456789ABCDEF"[(b&0xF) as usize]; }
               dos_trace!("D21 43 addr={:08X} hex={}", addr, core::str::from_utf8(&hex).unwrap()); }
             let mut name = [0u8; 64];
             let mut i = 0;
@@ -1574,9 +1562,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 // dos.find_path / dos.find_idx, then drop into the
                 // shared scan loop below.
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-                let (is_ext, fcb_off) = unsafe {
-                    if *(addr as *const u8) == 0xFF { (true, 7) } else { (false, 0) }
-                };
+                let (is_ext, fcb_off) = if regs.read::<u8>(addr as usize) == 0xFF { (true, 7) } else { (false, 0) };
                 let fcb_base = addr.wrapping_add(fcb_off);
                 let drive_byte = regs.read::<u8>((fcb_base) as usize);
                 let name = regs.slice(((fcb_base + 1)) as usize, 8);
@@ -1663,45 +1649,42 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                         if !dos_wildcard_match(pat, alias) { continue; }
                         dos.find_idx = idx as u16;
                         // Write search FCB into DTA. Layout above.
-                        let dta = dos.dta;
-                        unsafe {
-                            let p = dta as *mut u8;
-                            // Zero the (extended-prefix + 32-byte) area first.
-                            let total = if is_ext { 7 + 32 } else { 32 };
-                            core::ptr::write_bytes(p, 0, total);
-                            let fcb_base = if is_ext {
-                                *p = 0xFF;
-                                *p.add(6) = if is_dir { 0x10 } else { 0x20 };
-                                p.add(7)
-                            } else {
-                                p
-                            };
-                            *fcb_base = drive;
-                            // Split alias (e.g. "CIV.EXE" or "AUTOEXEC.BAT")
-                            // into 8-char name + 3-char ext, space-padded.
-                            let mut name_buf = [b' '; 8];
-                            let mut ext_buf = [b' '; 3];
-                            let dot = alias.iter().position(|&c| c == b'.');
-                            let (n, e) = match dot {
-                                Some(d) => (&alias[..d], &alias[d + 1..]),
-                                None => (alias, &[][..]),
-                            };
-                            for (i, &c) in n.iter().take(8).enumerate() {
-                                name_buf[i] = c.to_ascii_uppercase();
-                            }
-                            for (i, &c) in e.iter().take(3).enumerate() {
-                                ext_buf[i] = c.to_ascii_uppercase();
-                            }
-                            core::ptr::copy_nonoverlapping(name_buf.as_ptr(), fcb_base.add(1), 8);
-                            core::ptr::copy_nonoverlapping(ext_buf.as_ptr(), fcb_base.add(9), 3);
-                            // current block = 0 (offsets 0x0C-0x0D), record
-                            // size = 128 (0x0E-0x0F), file size at 0x10-0x13.
-                            (fcb_base.add(0x0E) as *mut u16).write_unaligned(128);
-                            (fcb_base.add(0x10) as *mut u32).write_unaligned(size);
-                            // Date = 1980-01-01 (0x0021), time = 00:00:00.
-                            (fcb_base.add(0x14) as *mut u16).write_unaligned(0x0021);
-                            (fcb_base.add(0x16) as *mut u16).write_unaligned(0);
+                        let dta = dos.dta as usize;
+                        // Zero the (extended-prefix + 32-byte) area first.
+                        let total = if is_ext { 7 + 32 } else { 32 };
+                        regs.zero(dta, total);
+                        let fcb_base = if is_ext {
+                            regs.write::<u8>(dta, 0xFF);
+                            regs.write::<u8>(dta + 6, if is_dir { 0x10 } else { 0x20 });
+                            dta + 7
+                        } else {
+                            dta
+                        };
+                        regs.write::<u8>(fcb_base, drive);
+                        // Split alias (e.g. "CIV.EXE" or "AUTOEXEC.BAT")
+                        // into 8-char name + 3-char ext, space-padded.
+                        let mut name_buf = [b' '; 8];
+                        let mut ext_buf = [b' '; 3];
+                        let dot = alias.iter().position(|&c| c == b'.');
+                        let (n, e) = match dot {
+                            Some(d) => (&alias[..d], &alias[d + 1..]),
+                            None => (alias, &[][..]),
+                        };
+                        for (i, &c) in n.iter().take(8).enumerate() {
+                            name_buf[i] = c.to_ascii_uppercase();
                         }
+                        for (i, &c) in e.iter().take(3).enumerate() {
+                            ext_buf[i] = c.to_ascii_uppercase();
+                        }
+                        regs.write_bytes(fcb_base + 1, &name_buf);
+                        regs.write_bytes(fcb_base + 9, &ext_buf);
+                        // current block = 0 (offsets 0x0C-0x0D), record
+                        // size = 128 (0x0E-0x0F), file size at 0x10-0x13.
+                        regs.write::<u16>(fcb_base + 0x0E, 128);
+                        regs.write::<u32>(fcb_base + 0x10, size);
+                        // Date = 1980-01-01 (0x0021), time = 00:00:00.
+                        regs.write::<u16>(fcb_base + 0x14, 0x0021);
+                        regs.write::<u16>(fcb_base + 0x16, 0);
                         regs.rax = regs.rax & !0xFF;
                         return thread::KernelAction::Done;
                     }
@@ -1734,7 +1717,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
 
             // Zero-fill the 11-byte name field in FCB (drive byte at +0, name at +1..+12)
-            unsafe { core::ptr::write_bytes((fcb + 1) as *mut u8, b' ', 11); }
+            regs.write_bytes((fcb + 1) as usize, &[b' '; 11]);
 
             // Check for drive letter (e.g., "C:")
             let ch0 = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
@@ -1787,10 +1770,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             // Update SI to point past parsed name
             regs.rsi = (regs.rsi & !0xFFFF) | si as u64;
             // AL=0: no wildcards, AL=1: wildcards present, AL=0xFF: drive invalid
-            let has_wildcards = unsafe {
-                let name_area = core::slice::from_raw_parts((fcb + 1) as *const u8, 11);
-                name_area.iter().any(|&b| b == b'?')
-            };
+            let has_wildcards = regs.slice((fcb + 1) as usize, 11).iter().any(|&b| b == b'?');
             regs.rax = (regs.rax & !0xFF) | if has_wildcards { 1 } else { 0 };
             thread::KernelAction::Done
         }
@@ -1886,9 +1866,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             out[pos] = 0;
             // Write to ES:DI
-            unsafe {
-                core::ptr::copy_nonoverlapping(out.as_ptr(), dst as *mut u8, pos + 1);
-            }
+            crate::arch::mem().write_bytes(dst as usize, &out[..pos + 1]);
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -2218,9 +2196,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     let len = regs.read::<u8>((addr) as usize) as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
-    unsafe {
-        core::ptr::copy_nonoverlapping((addr + 1) as *const u8, cmd.as_mut_ptr(), copy);
-    }
+    cmd[..copy].copy_from_slice(crate::arch::mem().slice((addr + 1) as usize, copy));
     let mut start = 0;
     while start < copy && cmd[start] == b' ' { start += 1; }
     let mut end = start;
@@ -2599,9 +2575,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let tail_len = regs.read::<u8>((cmdtail_addr) as usize) as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
-    unsafe {
-        core::ptr::copy_nonoverlapping((cmdtail_addr + 1) as *const u8, tail.as_mut_ptr(), copy_len);
-    }
+    tail[..copy_len].copy_from_slice(crate::arch::mem().slice((cmdtail_addr + 1) as usize, copy_len));
 
     let prog_name: &[u8] = &filename[..flen];
 
@@ -2870,27 +2844,21 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
         }
 
         let img = &data[header_size as usize..header_size as usize + load_size];
-        unsafe {
-            core::ptr::copy_nonoverlapping(img.as_ptr(), load_base as *mut u8, load_size);
-        }
+        crate::arch::mem().write_bytes(load_base as usize, img);
         // Apply relocations using caller's reloc_factor (not load_seg).
         for i in 0..reloc_count {
             let entry = reloc_offset + i * 4;
             let off = w(entry) as u32;
             let seg = w(entry + 2) as u32;
-            let a = load_base + (seg << 4) + off;
-            unsafe {
-                let p = a as *mut u16;
-                let v = p.read_unaligned();
-                p.write_unaligned(v.wrapping_add(reloc_factor));
-            }
+            let a = (load_base + (seg << 4) + off) as usize;
+            let m = crate::arch::mem();
+            let v: u16 = m.read(a);
+            m.write::<u16>(a, v.wrapping_add(reloc_factor));
         }
         dos_trace!("D21 4B03 MZ loaded: load_size={} relocs={}", load_size, reloc_count);
     } else {
         // Raw / .COM: copy file verbatim at load_seg:0.
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), load_base as *mut u8, buf.len());
-        }
+        crate::arch::mem().write_bytes(load_base as usize, &buf);
         dos_trace!("D21 4B03 raw loaded: size={}", buf.len());
     }
 
@@ -3081,16 +3049,13 @@ fn find_matching_file(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::Ke
                 idx += 1;
                 if dos_wildcard_match(pat, alias) {
                     dos.find_idx = idx as u16;
-                    let dta = dos.dta;
-                    unsafe {
-                        let p = dta as *mut u8;
-                        core::ptr::write_bytes(p, 0, 43);
-                        *p.add(0x15) = if is_dir { 0x10 } else { 0x20 };
-                        (p.add(0x1A) as *mut u32).write_unaligned(size);
-                        let name_len = alias.len().min(12);
-                        core::ptr::copy_nonoverlapping(alias.as_ptr(), p.add(0x1E), name_len);
-                        *p.add(0x1E + name_len) = 0;
-                    }
+                    let dta = dos.dta as usize;
+                    regs.zero(dta, 43);
+                    regs.write::<u8>(dta + 0x15, if is_dir { 0x10 } else { 0x20 });
+                    regs.write::<u32>(dta + 0x1A, size);
+                    let name_len = alias.len().min(12);
+                    regs.write_bytes(dta + 0x1E, &alias[..name_len]);
+                    regs.write::<u8>(dta + 0x1E + name_len, 0);
                     regs.clear_flag32(1);
                     return thread::KernelAction::Done;
                 }
@@ -3406,18 +3371,14 @@ fn trim_ws(s: &[u8]) -> &[u8] {
 /// Borrow `len` bytes of an env block at `env_seg` as a writable slice.
 /// Used by `fill_env` to populate a freshly-allocated env block.
 pub(super) fn env_bytes_mut(env_seg: u16, len: usize) -> &'static mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(((env_seg as u32) << 4) as *mut u8, len)
-    }
+    crate::arch::mem().slice_mut(((env_seg as u32) << 4) as usize, len)
 }
 
 /// Borrow the env block at `env_seg` as a read-only slice up to the
 /// `00 00` terminator (or `len` bytes max). Used to inherit a parent's
 /// env into a child via `fill_env`.
 pub(super) fn env_bytes(env_seg: u16, len: usize) -> &'static [u8] {
-    unsafe {
-        core::slice::from_raw_parts(((env_seg as u32) << 4) as *const u8, len)
-    }
+    crate::arch::mem().slice(((env_seg as u32) << 4) as usize, len)
 }
 
 /// What a child inherits from its parent: PSP segment (for child's PSP[0x16])
@@ -3732,9 +3693,7 @@ pub(super) fn load_com(dos: &mut thread::DosState, parent: &ParentRef,
 
     // Load .COM code at psp_seg:0x100 (= (psp_seg+0x10):0).
     let load_addr = ((psp_seg as u32) << 4) + COM_OFFSET as u32;
-    unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), load_addr as *mut u8, data.len());
-    }
+    crate::arch::mem().write_bytes(load_addr as usize, data);
 
     Loaded {
         env_seg, psp_seg,
@@ -3811,15 +3770,13 @@ pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
 
     let load_base = (load_segment as u32) << 4;
     let load_data = &data[header_size as usize..header_size as usize + load_size];
-    unsafe {
-        core::ptr::copy_nonoverlapping(load_data.as_ptr(), load_base as *mut u8, load_size);
-    }
+    crate::arch::mem().write_bytes(load_base as usize, load_data);
 
     // Zero the allocation tail so re-exec cannot expose stale data past the image.
     let bss_start = load_base + load_size as u32;
     let bss_end = (end_seg as u32) << 4;
     if bss_end > bss_start {
-        unsafe { core::ptr::write_bytes(bss_start as *mut u8, 0, (bss_end - bss_start) as usize); }
+        crate::arch::mem().zero(bss_start as usize, (bss_end - bss_start) as usize);
     }
 
     // Apply relocations: each entry is (offset, segment) within the load
@@ -3830,12 +3787,10 @@ pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
         let entry = reloc_offset + i * 4;
         let off = w(entry) as u32;
         let seg = w(entry + 2) as u32;
-        let addr = load_base + (seg << 4) + off;
-        unsafe {
-            let p = addr as *mut u16;
-            let val = p.read_unaligned();
-            p.write_unaligned(val.wrapping_add(load_segment));
-        }
+        let addr = (load_base + (seg << 4) + off) as usize;
+        let m = crate::arch::mem();
+        let val: u16 = m.read(addr);
+        m.write::<u16>(addr, val.wrapping_add(load_segment));
     }
 
     Some(Loaded {
