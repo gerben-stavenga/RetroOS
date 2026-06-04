@@ -22,7 +22,7 @@ fn dump_selector(label: &str, dos: &thread::DosState, sel: u16) {
 fn dump_words(label: &str, addr: u32) {
     // Debug-only dump helper: no execution context here, raw reads of the
     // already-linear addr (the centralized memory API needs a Vcpu).
-    let rd = |off: u32| unsafe { *((addr.wrapping_add(off)) as *const u16) };
+    let rd = |off: u32| crate::arch::mem().read::<u16>((addr.wrapping_add(off)) as usize);
     let (w0, w1, w2, w3) = (rd(0), rd(2), rd(4), rd(6));
     let (w4, w5, w6, w7) = (rd(8), rd(10), rd(12), rd(14));
     crate::println!(

@@ -271,10 +271,8 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
             let mut count = 0u16;
             for i in 0..MAX_EMS_HANDLES {
                 if let Some(ref h) = ems.handles[i] {
-                    unsafe {
-                        (addr as *mut u16).write_unaligned(i as u16);
-                        ((addr + 2) as *mut u16).write_unaligned(h.pages.len() as u16);
-                    }
+                    regs.write::<u16>(addr as usize, i as u16);
+                    regs.write::<u16>(addr as usize + 2, h.pages.len() as u16);
                     addr += 4;
                     count += 1;
                 }

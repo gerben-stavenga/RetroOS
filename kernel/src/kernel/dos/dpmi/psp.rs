@@ -44,7 +44,7 @@ pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState) 
             let env_base = (env_seg as u32) * 16;
             dos.ldt[idx] = make_data_desc_ex(env_base, 0xFFFF, false);
             let env_sel = idx_to_sel(idx);
-            unsafe { core::ptr::write_volatile((psp_base + 0x2C) as *mut u16, env_sel); }
+            crate::arch::mem().write::<u16>((psp_base + 0x2C) as usize, env_sel);
             if let Some(dpmi) = dos.dpmi.as_mut() {
                 dpmi.env_ldt_idx = idx;
             }

@@ -259,21 +259,17 @@ impl MouseState {
         let offset = (row * 80 + col) as u16;
         if Some(offset) == self.drawn_at { return; }
         self.erase_cursor();
-        unsafe {
-            let attr = (VGA_TEXT_BASE + offset as u32 * 2 + 1) as *mut u8;
-            self.saved_attr = core::ptr::read_volatile(attr);
-            core::ptr::write_volatile(attr, self.saved_attr ^ 0x77);
-        }
+        let attr = (VGA_TEXT_BASE + offset as u32 * 2 + 1) as usize;
+        let m = crate::arch::mem();
+        self.saved_attr = m.read::<u8>(attr);
+        m.write::<u8>(attr, self.saved_attr ^ 0x77);
         self.drawn_at = Some(offset);
     }
 
     /// Restore the original attribute under the current cursor cell.
     pub fn erase_cursor(&mut self) {
         if let Some(old) = self.drawn_at.take() {
-            unsafe {
-                let attr = (VGA_TEXT_BASE + old as u32 * 2 + 1) as *mut u8;
-                core::ptr::write_volatile(attr, self.saved_attr);
-            }
+            crate::arch::mem().write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
         }
     }
 

@@ -722,14 +722,9 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             // Buffer layout (DPMI 1.0 §3.4): [0]=major (decimal), [1]=minor,
             // [2..]=ASCIIZ vendor identifier (≤126 bytes).
             const VENDOR: &[u8] = b"RetroOS DPMI Host\0";
-            unsafe {
-                let buf = dest as *mut u8;
-                core::ptr::write(buf, 1);             // host major = 1
-                core::ptr::write(buf.add(1), 0);      // host minor = 0
-                for (i, &b) in VENDOR.iter().enumerate() {
-                    core::ptr::write(buf.add(2 + i), b);
-                }
-            }
+            regs.write::<u8>(dest as usize, 1);        // host major = 1
+            regs.write::<u8>(dest as usize + 1, 0);    // host minor = 0
+            regs.write_bytes(dest as usize + 2, VENDOR);
             clear_carry(regs);
         }
         // AX=0500h — Get Free Memory Information
@@ -749,10 +744,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             info[8] = swap_pages;                // paging file pages
             info[1] = swap_pages + physical_pages; // max unlocked alloc (pages)
             info[0] = info[1] << 12;             // largest block (bytes)
-            unsafe {
-                for (i, value) in info.into_iter().enumerate() {
-                    core::ptr::write_unaligned((dest as *mut u32).add(i), value);
-                }
+            for (i, value) in info.into_iter().enumerate() {
+                regs.write::<u32>(dest as usize + i * 4, value);
             }
             clear_carry(regs);
         }
