@@ -76,7 +76,7 @@ impl core::fmt::Debug for Frame64 {
 }
 
 /// User execution mode, derived from register state.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UserMode { VM86, Mode32, Mode64 }
 
 /// CPU register state saved by the interrupt handler.

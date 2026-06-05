@@ -61,6 +61,33 @@ pub fn int_intercepted(n: u8) -> bool {
     DESC.with(|d| d.borrow().int_redir[(n / 8) as usize] & (1 << (n % 8)) != 0)
 }
 
+/// The loaded LDT descriptors, copied out for programming the software CPU's
+/// LDT (cpu.rs writes these into a scratch table Unicorn reads as `env->ldt`).
+pub fn ldt_raw() -> std::vec::Vec<u64> {
+    DESC.with(|d| {
+        let d = d.borrow();
+        if d.ldt.is_null() {
+            return std::vec::Vec::new();
+        }
+        (0..d.ldt_len)
+            .map(|i| unsafe { core::ptr::read_unaligned(d.ldt.add(i)) })
+            .collect()
+    })
+}
+
+/// Visit each present TLS slot as `(gdt_index, base, limit)` so cpu.rs can place
+/// the matching flat data descriptor in the software CPU's GDT.
+pub fn for_each_tls(mut f: impl FnMut(usize, u32, u32)) {
+    DESC.with(|d| {
+        let d = d.borrow();
+        for (i, t) in d.tls.iter().enumerate() {
+            if t.present {
+                f(TLS_MIN + i, t.base, t.limit);
+            }
+        }
+    });
+}
+
 pub fn load_ldt(ldt: &[u64]) {
     DESC.with(|d| {
         let mut d = d.borrow_mut();

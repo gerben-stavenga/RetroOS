@@ -39,6 +39,9 @@ struct Ctx {
     /// Guest pages currently mapped into Unicorn for the active space. Cleared
     /// (and the pages unmapped) on a context switch.
     mapped: BTreeSet<u64>,
+    /// Whether the high scratch window (GDT/LDT/trampoline, [`SYS_BASE`]) is
+    /// mapped into Unicorn yet — done once, lazily, on first PM-descriptor run.
+    sys_mapped: bool,
 }
 
 thread_local! {
@@ -111,6 +114,15 @@ fn build() -> Unicorn<'static, Ctx> {
     uc
 }
 
+/// Per-slice transition trace, gated by `RETRO_TRACE` (checked once). Logs each
+/// run's entry/exit mode, CS:IP, SS:SP and the event that ended it — the lens
+/// used to bring up VM86/PM execution on this backend.
+fn trace_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RETRO_TRACE").is_some())
+}
+
 fn io_size(bytes: usize) -> IoSize {
     match bytes {
         1 => IoSize::Byte,
@@ -145,16 +157,44 @@ pub fn execute() -> KernelEvent {
             d.pending_intr = None;
         }
 
+        if trace_on() {
+            eprintln!("[run] mode={:?} cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} ds={:#06x} flags={:#x}",
+                mode, regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
+                regs.ds as u16, regs.frame.rflags);
+        }
         let run = uc.emu_start(begin, 0xFFFF_FFFF, 0, SLICE);
         store_regs(uc, regs, mode);
+        if trace_on() {
+            let intr = uc.get_data().pending_intr;
+            let ev = uc.get_data().pending.is_some();
+            eprintln!("   -> cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} intr={:?} ev={} run={:?}",
+                regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
+                intr, ev, run.is_ok());
+        }
 
         if let Some(intno) = uc.get_data_mut().pending_intr.take() {
             let n = intno as u8;
-            if mode == UserMode::VM86 && n != 3 && n != 4 && !crate::desc::int_intercepted(n) {
-                // Not a trap vector: reflect to the guest's real-mode IVT and
-                // keep running (an IVT stub will `int 0x31` if it needs us).
-                unsafe { crate::monitor::sw_reflect_vm86_int(regs, n) };
-                continue;
+            if mode == UserMode::VM86 {
+                // Real mode: `int n` and real-mode CPU faults alike carry their
+                // vector here. Reflect anything the redirection bitmap doesn't
+                // trap to the guest's IVT (an IVT stub will `int 0x31` if it
+                // needs us); trapped vectors (0x31) bubble to the kernel.
+                if n != 3 && n != 4 && !crate::desc::int_intercepted(n) {
+                    unsafe { crate::monitor::sw_reflect_vm86_int(regs, n) };
+                    continue;
+                }
+                return KernelEvent::SoftInt(n);
+            }
+            // Protected mode: classify by vector, the same convention the metal
+            // trap entry (`arch/traps.rs`) uses. Vectors 0..=31 are CPU
+            // exceptions (e.g. #NP=11 for a not-present segment — the basis of
+            // DPMI demand-loaded overlays), except #BP/#OF (3/4), reachable only
+            // via `int3`/`into`. Everything else is a software interrupt (DOS /
+            // DPMI service ints 0x21/0x2F/0x31, …). x86 itself can't distinguish
+            // `int 0x0d` from #GP, so low vectors are reserved for faults by
+            // convention — Unicorn's intr hook likewise only hands us the vector.
+            if n < 32 && n != 3 && n != 4 {
+                return KernelEvent::Exception(n);
             }
             return KernelEvent::SoftInt(n);
         }
@@ -197,6 +237,107 @@ pub fn flush_uc() {
 const VM_FLAG: u64 = 1 << 17;
 const IOPL_MASK: u64 = 3 << 12;
 
+// ── High scratch window: descriptor tables + the ring-3 entry trampoline ─────
+//
+// To run a protected-mode client (Linux flat-32 *or* a 16/32-bit DPMI client)
+// the software CPU must resolve segment selectors through real descriptor
+// tables — a write to a segment register in PM makes Unicorn load base/limit/D
+// from the GDT/LDT in *guest* memory (QEMU `helper_load_seg`). We reserve a
+// window above the user VA range (the MMU never maps there) and place there:
+//   * a small GDT mirroring the kernel's flat ring-0/ring-3 + BDA + TLS slots,
+//   * the active LDT (copied from the kernel's table — DPMI descriptors live
+//     there), pointed at by LDTR, and
+//   * a one-byte `iretd` trampoline plus a ring-0 stack.
+// CPL only becomes 3 by *returning* to a DPL-3 stack, so we can't just write
+// SS=ring3 (a same-privilege load demands CPL==DPL already). Instead each PM
+// entry resets to CPL 0 (a brief real-mode SS load), programs the tables, then
+// `iretd`s through a CPL-0→3 frame — exactly how real kernels enter ring 3.
+const SYS_BASE: u64 = 0xFFFE_0000;
+const GDT_ADDR: u64 = SYS_BASE; // 256-byte GDT (32 entries)
+const LDT_ADDR: u64 = SYS_BASE + 0x1000; // up to LDT_MAX_BYTES
+const TRAMP_ADDR: u64 = SYS_BASE + 0x5000; // the `iretd` byte
+const RING0_SP_TOP: u64 = SYS_BASE + 0x7000; // ring-0 stack top (frame just below)
+const SYS_SIZE: usize = 0x8000;
+const GDT_BYTES: usize = 32 * 8;
+const LDT_MAX_BYTES: usize = 0x4000; // 2048 descriptors
+
+// Flat ring-0 selectors the trampoline runs under (GDT indices 1 and 3, to
+// match the kernel's `descriptors.rs` KERNEL_CS=0x08 / KERNEL_DS=0x18 layout).
+const KERNEL_CS: u16 = 0x08;
+const KERNEL_DS: u16 = 0x18;
+/// LDT selector value (GDT slot 12 on metal). We program LDTR's base directly,
+/// so the selector is cosmetic, but keep the kernel's value for fidelity.
+const LDT_SEL: u16 = 0x60;
+
+/// Pack a legacy 8-byte segment descriptor. `flags4` is the high nibble
+/// (G, D/B, L, AVL); `access` is the type/DPL/P byte.
+fn gdt_desc(base: u32, limit: u32, access: u8, flags4: u8) -> u64 {
+    (limit as u64 & 0xFFFF)
+        | ((base as u64 & 0xFFFF) << 16)
+        | (((base as u64 >> 16) & 0xFF) << 32)
+        | ((access as u64) << 40)
+        | (((limit as u64 >> 16) & 0xF) << 48)
+        | ((flags4 as u64 & 0xF) << 52)
+        | (((base as u64 >> 24) & 0xFF) << 56)
+}
+
+/// Write a memory-management register (GDTR/LDTR) via the `uc_x86_mmr` layout
+/// `{ selector:u16, _pad, base:u64@8, limit:u32@16, flags:u32@20 }` (24 bytes).
+fn set_mmr(uc: &Unicorn<'static, Ctx>, reg: RegisterX86, selector: u16, base: u64, limit: u32, flags: u32) {
+    let mut buf = [0u8; 24];
+    buf[0..2].copy_from_slice(&selector.to_le_bytes());
+    buf[8..16].copy_from_slice(&base.to_le_bytes());
+    buf[16..20].copy_from_slice(&limit.to_le_bytes());
+    buf[20..24].copy_from_slice(&flags.to_le_bytes());
+    let _ = uc.reg_write_long(reg, &buf);
+}
+
+/// Map the scratch window (once) and seed the `iretd` trampoline byte.
+fn ensure_sys_mapped(uc: &mut Unicorn<'static, Ctx>) {
+    if uc.get_data().sys_mapped {
+        return;
+    }
+    let _ = uc.mem_map(SYS_BASE, SYS_SIZE as u64, Prot::ALL);
+    let _ = uc.mem_write(TRAMP_ADDR, &[0xCF]); // IRETD (32-bit ring-0 CS)
+    uc.get_data_mut().sys_mapped = true;
+}
+
+/// Refresh the GDT (flat ring-0/ring-3 + BDA alias + present TLS slots) and the
+/// LDT (the kernel's active table) in the scratch window, and point GDTR/LDTR
+/// at them.
+fn write_tables(uc: &mut Unicorn<'static, Ctx>) {
+    use arch_abi::{USER_CS, USER_DS};
+    let mut gdt = [0u64; 32];
+    gdt[(KERNEL_CS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0x9A, 0xC); // ring-0 code32
+    gdt[(KERNEL_DS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0x92, 0xC); // ring-0 data32
+    gdt[(USER_CS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0xFA, 0xC); // ring-3 code32 (Linux)
+    gdt[(USER_DS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0xF2, 0xC); // ring-3 data32 (Linux)
+    gdt[8] = gdt_desc(0x400, 0xFFFF, 0xF2, 0x4); // 0x40: BIOS Data Area alias (DPMI compat)
+    crate::desc::for_each_tls(|idx, base, _limit| {
+        if idx < 32 {
+            gdt[idx] = gdt_desc(base, 0xF_FFFF, 0xF2, 0xC);
+        }
+    });
+    let mut gbytes = [0u8; GDT_BYTES];
+    for (i, d) in gdt.iter().enumerate() {
+        gbytes[i * 8..i * 8 + 8].copy_from_slice(&d.to_le_bytes());
+    }
+    let _ = uc.mem_write(GDT_ADDR, &gbytes);
+    set_mmr(uc, RegisterX86::GDTR, 0, GDT_ADDR, (GDT_BYTES - 1) as u32, 0);
+
+    let ldt = crate::desc::ldt_raw();
+    let n = ldt.len().min(LDT_MAX_BYTES / 8);
+    let mut lbytes = std::vec![0u8; n * 8];
+    for (i, d) in ldt.iter().take(n).enumerate() {
+        lbytes[i * 8..i * 8 + 8].copy_from_slice(&d.to_le_bytes());
+    }
+    if !lbytes.is_empty() {
+        let _ = uc.mem_write(LDT_ADDR, &lbytes);
+    }
+    let ldt_limit = if lbytes.is_empty() { 0 } else { (lbytes.len() - 1) as u32 };
+    set_mmr(uc, RegisterX86::LDTR, LDT_SEL, LDT_ADDR, ldt_limit, 0x8200);
+}
+
 /// Configure Unicorn for `mode`, load `REGS`, and return the linear start PC.
 fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
     let cr0 = uc.reg_read(RegisterX86::CR0).unwrap_or(1);
@@ -210,31 +351,78 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
     w(uc, RegisterX86::EDI, r.rdi);
     w(uc, RegisterX86::EBP, r.rbp);
 
-    if mode == UserMode::VM86 {
-        // Real mode: PE=0, segment*16 addressing, 16-bit operands. (We model
-        // VM86 as real mode — same seg<<4 semantics — rather than PM+VME.)
-        w(uc, RegisterX86::CR0, cr0 & !1);
-        w(uc, RegisterX86::CS, r.code_seg() as u64);
-        w(uc, RegisterX86::DS, r.ds & 0xFFFF);
-        w(uc, RegisterX86::ES, r.es & 0xFFFF);
-        w(uc, RegisterX86::SS, r.stack_seg() as u64);
-        w(uc, RegisterX86::FS, r.fs & 0xFFFF);
-        w(uc, RegisterX86::GS, r.gs & 0xFFFF);
-        w(uc, RegisterX86::ESP, r.sp32() as u64 & 0xFFFF);
-        w(uc, RegisterX86::EIP, r.ip32() as u64 & 0xFFFF);
-        // Drop VM (real mode has no VM bit); keep the rest, force reserved bit 1.
-        w(uc, RegisterX86::EFLAGS, (r.flags() & !VM_FLAG) | 2);
-        // `begin` is the EIP offset — Unicorn adds the CS base (CS<<4) itself.
-        r.ip32() as u64 & 0xFFFF
-    } else {
-        // Protected-mode flat 32-bit (Linux): PE=1, flat segments (Unicorn's
-        // base-0 default — we don't sync selectors), 32-bit.
-        w(uc, RegisterX86::CR0, cr0 | 1);
-        w(uc, RegisterX86::ESP, r.frame.rsp);
-        w(uc, RegisterX86::EIP, r.frame.rip);
-        w(uc, RegisterX86::EFLAGS, r.frame.rflags);
-        r.frame.rip
+    match mode {
+        UserMode::VM86 => {
+            // Real mode: PE=0, segment*16 addressing, 16-bit operands. (We model
+            // VM86 as real mode — same seg<<4 semantics — rather than PM+VME.)
+            w(uc, RegisterX86::CR0, cr0 & !1);
+            w(uc, RegisterX86::CS, r.code_seg() as u64);
+            w(uc, RegisterX86::DS, r.ds & 0xFFFF);
+            w(uc, RegisterX86::ES, r.es & 0xFFFF);
+            w(uc, RegisterX86::SS, r.stack_seg() as u64);
+            w(uc, RegisterX86::FS, r.fs & 0xFFFF);
+            w(uc, RegisterX86::GS, r.gs & 0xFFFF);
+            w(uc, RegisterX86::ESP, r.sp32() as u64 & 0xFFFF);
+            w(uc, RegisterX86::EIP, r.ip32() as u64 & 0xFFFF);
+            // Drop VM (real mode has no VM bit); keep the rest, force reserved bit 1.
+            w(uc, RegisterX86::EFLAGS, (r.flags() & !VM_FLAG) | 2);
+            // `begin` is the EIP offset — Unicorn adds the CS base (CS<<4) itself.
+            r.ip32() as u64 & 0xFFFF
+        }
+        UserMode::Mode32 => configure_pm(uc, r),
+        UserMode::Mode64 => {
+            // 64-bit guests aren't interpreted yet (the core runs in 32-bit
+            // mode); fall back to the old flat-32 setup so the existing 64-bit
+            // ELF smoke paths don't regress.
+            w(uc, RegisterX86::CR0, cr0 | 1);
+            w(uc, RegisterX86::ESP, r.frame.rsp);
+            w(uc, RegisterX86::EIP, r.frame.rip);
+            w(uc, RegisterX86::EFLAGS, r.frame.rflags);
+            r.frame.rip
+        }
     }
+}
+
+/// Protected-mode (32-bit) entry through real descriptor tables. Handles both
+/// Linux flat-32 (CS=USER_CS) and 16/32-bit DPMI clients (LDT selectors) the
+/// same way: program GDT/LDT, then `iretd` into the CPL-3 client.
+fn configure_pm(uc: &mut Unicorn<'static, Ctx>, r: &Regs) -> u64 {
+    ensure_sys_mapped(uc);
+    let w = |uc: &mut Unicorn<'static, Ctx>, reg, v: u64| { let _ = uc.reg_write(reg, v); };
+
+    // 1. Force CPL 0: a real-mode SS load (PE=0) sets the cached DPL to 0, then
+    //    re-enable PE. From CPL 0 we can load the ring-0 trampoline segments and
+    //    the DPL-3 client data segments alike.
+    let cr0 = uc.reg_read(RegisterX86::CR0).unwrap_or(1);
+    w(uc, RegisterX86::CR0, cr0 & !1);
+    w(uc, RegisterX86::SS, 0);
+    w(uc, RegisterX86::CR0, cr0 | 1);
+
+    // 2. Program the descriptor tables, then load the client's data segments
+    //    (DPL 3 loads fine at CPL 0; they survive the iret since DPL == new CPL).
+    write_tables(uc);
+    w(uc, RegisterX86::DS, r.ds & 0xFFFF);
+    w(uc, RegisterX86::ES, r.es & 0xFFFF);
+    w(uc, RegisterX86::FS, r.fs & 0xFFFF);
+    w(uc, RegisterX86::GS, r.gs & 0xFFFF);
+
+    // 3. Build the inter-privilege iret frame (EIP, CS, EFLAGS, ESP, SS) and run
+    //    the trampoline under the flat ring-0 selectors.
+    let flags = (r.flags32() & !(VM_FLAG as u32)) | 2;
+    let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
+    let mut bytes = [0u8; 20];
+    for (i, v) in frame.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let frame_addr = RING0_SP_TOP - bytes.len() as u64;
+    let _ = uc.mem_write(frame_addr, &bytes);
+
+    w(uc, RegisterX86::SS, KERNEL_DS as u64);
+    w(uc, RegisterX86::ESP, frame_addr);
+    w(uc, RegisterX86::CS, KERNEL_CS as u64);
+    w(uc, RegisterX86::EFLAGS, 2);
+    w(uc, RegisterX86::EIP, TRAMP_ADDR);
+    TRAMP_ADDR
 }
 
 fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
@@ -249,18 +437,45 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
     r.frame.rsp = rd(uc, RegisterX86::ESP);
     r.frame.rip = rd(uc, RegisterX86::EIP);
 
-    if mode == UserMode::VM86 {
-        // Segments may have changed (mov/pop); read them back.
-        r.set_cs32(rd(uc, RegisterX86::CS) as u32);
-        r.set_ss32(rd(uc, RegisterX86::SS) as u32);
-        r.ds = rd(uc, RegisterX86::DS);
-        r.es = rd(uc, RegisterX86::ES);
-        r.fs = rd(uc, RegisterX86::FS);
-        r.gs = rd(uc, RegisterX86::GS);
-        // Re-assert VM86 in the saved flags so `regs.mode()` stays VM86 for the
-        // kernel (we ran in real mode, which carries no VM bit).
-        r.frame.rflags = rd(uc, RegisterX86::EFLAGS) | VM_FLAG | IOPL_MASK;
-    } else {
-        r.frame.rflags = rd(uc, RegisterX86::EFLAGS);
+    match mode {
+        UserMode::VM86 => {
+            // Segments may have changed (mov/pop); read them back.
+            r.set_cs32(rd(uc, RegisterX86::CS) as u32);
+            r.set_ss32(rd(uc, RegisterX86::SS) as u32);
+            r.ds = rd(uc, RegisterX86::DS);
+            r.es = rd(uc, RegisterX86::ES);
+            r.fs = rd(uc, RegisterX86::FS);
+            r.gs = rd(uc, RegisterX86::GS);
+            // Re-assert VM86 in the saved flags so `regs.mode()` stays VM86 for the
+            // kernel (we ran in real mode, which carries no VM bit).
+            r.frame.rflags = rd(uc, RegisterX86::EFLAGS) | VM_FLAG | IOPL_MASK;
+        }
+        UserMode::Mode32 => {
+            // PM client: a far jump / mov may have reloaded any selector — read
+            // them all back so the kernel sees the live segment state.
+            let cs = rd(uc, RegisterX86::CS) as u16;
+            let ss = rd(uc, RegisterX86::SS) as u16;
+            r.set_cs32(cs as u32);
+            r.set_ss32(ss as u32);
+            r.ds = rd(uc, RegisterX86::DS);
+            r.es = rd(uc, RegisterX86::ES);
+            r.fs = rd(uc, RegisterX86::FS);
+            r.gs = rd(uc, RegisterX86::GS);
+            r.frame.rflags = rd(uc, RegisterX86::EFLAGS);
+            // On a 16-bit stack/code segment only SP / IP are meaningful. The
+            // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
+            // (and possibly EIP) holding stale bits from the trampoline's own
+            // 32-bit stack, since x86 keeps the upper bits when SS/CS are 16-bit.
+            // The kernel treats these as flat offsets, so normalize them here.
+            if !crate::desc::seg_is_32(ss) {
+                r.frame.rsp &= 0xFFFF;
+            }
+            if !crate::desc::seg_is_32(cs) {
+                r.frame.rip &= 0xFFFF;
+            }
+        }
+        UserMode::Mode64 => {
+            r.frame.rflags = rd(uc, RegisterX86::EFLAGS);
+        }
     }
 }

@@ -231,3 +231,87 @@ impl PortIo for Uart {
 pub fn attach_hostfs(dir: &str) {
     register(COM1, COM1 + 7, Box::new(Uart::new(HostFs::new(dir))));
 }
+
+// ── QEMU fw_cfg (headless program selection) ────────────────────────────────
+//
+// `kernel::startup` reads `opt/cmdline` (which DOS program to run, then shut
+// down) through the QEMU fw_cfg port protocol — the exact path metal takes from
+// `-fw_cfg name=opt/cmdline,string=...`. A 16-bit selector write to 0x510 picks
+// an item; byte reads from 0x511 stream it out. Selector 0x0000 is the "QEMU"
+// signature; 0x0019 is the file directory: a u32 count (big-endian) followed by
+// 64-byte entries `{ size:u32 BE, select:u16 BE, reserved:u16, name:[u8;56] }`.
+// File items get selectors from 0x0020 up. Serving a small in-memory file set
+// lets `cargo run -- --cmd "PROG ARGS"` boot straight into one program headless,
+// with no keyboard — the device behind the ports differs, `startup()` does not.
+
+const FW_CFG_SEL: u16 = 0x510;
+const FW_CFG_DATA: u16 = 0x511;
+const FW_CFG_SIG: u16 = 0x0000;
+const FW_CFG_FILE_DIR: u16 = 0x0019;
+const FW_CFG_FILE_FIRST: u16 = 0x0020;
+
+struct FwCfg {
+    files: Vec<(String, Vec<u8>)>,
+    sel: u16,
+    pos: usize,
+}
+
+impl FwCfg {
+    /// The byte stream the current selector names (signature / directory / file).
+    fn current(&self) -> Vec<u8> {
+        match self.sel {
+            FW_CFG_SIG => b"QEMU".to_vec(),
+            FW_CFG_FILE_DIR => {
+                let mut out = (self.files.len() as u32).to_be_bytes().to_vec();
+                for (i, (name, data)) in self.files.iter().enumerate() {
+                    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&(FW_CFG_FILE_FIRST + i as u16).to_be_bytes());
+                    out.extend_from_slice(&[0, 0]); // reserved
+                    let mut field = [0u8; 56];
+                    let nb = name.as_bytes();
+                    let n = nb.len().min(55);
+                    field[..n].copy_from_slice(&nb[..n]);
+                    out.extend_from_slice(&field);
+                }
+                out
+            }
+            s if s >= FW_CFG_FILE_FIRST => self
+                .files
+                .get((s - FW_CFG_FILE_FIRST) as usize)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl PortIo for FwCfg {
+    fn read(&mut self, port: u16, _width: u8) -> u32 {
+        if port == FW_CFG_DATA {
+            let cur = self.current();
+            let b = cur.get(self.pos).copied().unwrap_or(0);
+            self.pos = (self.pos + 1).min(cur.len());
+            b as u32
+        } else {
+            0
+        }
+    }
+    fn write(&mut self, port: u16, _width: u8, val: u32) {
+        if port == FW_CFG_SEL {
+            // The IO-port selector is native byte order (only fw_cfg *data* is
+            // big-endian); the kernel writes the host-order selector via `outw`.
+            self.sel = val as u16;
+            self.pos = 0;
+        }
+    }
+}
+
+/// Serve a QEMU-style fw_cfg with `opt/cmdline` (and optionally `opt/cwd`) so
+/// the kernel boots one program headless and shuts down when it exits.
+pub fn attach_fw_cfg(cmdline: &str, cwd: Option<&str>) {
+    let mut files = vec![("opt/cmdline".to_string(), cmdline.as_bytes().to_vec())];
+    if let Some(c) = cwd {
+        files.push(("opt/cwd".to_string(), c.as_bytes().to_vec()));
+    }
+    register(FW_CFG_SEL, FW_CFG_DATA, Box::new(FwCfg { files, sel: 0, pos: 0 }));
+}

@@ -61,4 +61,4 @@ pub use vcpu::init_guest_ram;
 pub use mmu::new_space;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
-pub use devices::{attach_disk, attach_hostfs, register, register_debugcon, PortIo};
+pub use devices::{attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon, PortIo};

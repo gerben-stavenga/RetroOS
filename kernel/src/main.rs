@@ -6,6 +6,7 @@
 //!
 //!   cargo run -p kernel -- disk.img                 # boot the real kernel
 //!   cargo run -p kernel -- --host DIR disk.img      # ...with /host = DIR
+//!   cargo run -p kernel -- --cmd "PROG ARGS" disk.img  # boot straight into PROG, then halt
 //!   cargo run -p kernel -- program.elf              # run one 32-bit Linux ELF directly
 //!   cargo run -p kernel                             # arch-boundary demo
 
@@ -14,11 +15,18 @@ use std::io::Read;
 
 fn main() {
     let mut host_dir: Option<String> = None;
+    let mut cmd: Option<String> = None;
+    let mut cwd: Option<String> = None;
     let mut input: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" | "-h" => host_dir = args.next(),
+            // Headless single-program launch via fw_cfg `opt/cmdline` — the same
+            // mechanism QEMU's `-fw_cfg name=opt/cmdline,string=...` drives on
+            // metal. `startup()` runs the program(s), then shuts down (no DN loop).
+            "--cmd" | "-c" => cmd = args.next(),
+            "--cwd" => cwd = args.next(),
             _ => input = Some(a),
         }
     }
@@ -29,6 +37,9 @@ fn main() {
     kernel::host_console_init();
     if let Some(dir) = host_dir {
         arch::attach_hostfs(&dir); // COM1 → /host
+    }
+    if let Some(ref c) = cmd {
+        arch::attach_fw_cfg(c, cwd.as_deref()); // fw_cfg opt/cmdline → headless launch
     }
 
     let Some(path) = input else {
