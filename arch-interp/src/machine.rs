@@ -25,15 +25,17 @@ pub fn clean_fx_template() -> FxState { FxState::zeroed() }
 
 // ── Port I/O ───────────────────────────────────────────────────────────────
 //
-// On metal these reach real hardware. The interpreter has no real devices, so
-// the kernel's own port I/O (PIT/PIC bring-up etc.) reads back the ISA-bus
-// "no device" value 0xFF and drops writes. (Guest-side IN/OUT is a different
-// path — it surfaces as a `KernelEvent::In/Out` from `do_arch_execute`.)
+// On metal these reach real hardware. The interpreter routes them to its device
+// layer (`devices.rs`) — e.g. the ATA disk — so the kernel's own port I/O (the
+// `hdd.rs` PIO disk driver) works and `kernel::startup()` runs unchanged. Ports
+// with no device behind them read the ISA "no device" value 0xFF and drop
+// writes. (Guest-side IN/OUT is a different path — it surfaces as a
+// `KernelEvent::In/Out` from `do_arch_execute`.)
 
-pub fn inb(_port: u16) -> u8 { 0xFF }
-pub fn inw(_port: u16) -> u16 { 0xFFFF }
-pub fn outb(_port: u16, _value: u8) {}
-pub fn outw(_port: u16, _value: u16) {}
+pub fn inb(port: u16) -> u8 { crate::devices::port_in(port, 1) as u8 }
+pub fn inw(port: u16) -> u16 { crate::devices::port_in(port, 2) as u16 }
+pub fn outb(port: u16, value: u8) { crate::devices::port_out(port, 1, value as u32); }
+pub fn outw(port: u16, value: u16) { crate::devices::port_out(port, 2, value as u32); }
 
 /// Monotonic cycle counter. Deterministic stand-in for the TSC.
 pub fn rdtsc() -> u64 {

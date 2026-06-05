@@ -36,6 +36,7 @@ pub use arch_abi::{
 
 mod calls;
 mod cpu;
+mod devices;
 mod machine;
 mod mmu;
 pub mod monitor;
@@ -52,6 +53,8 @@ pub use vcpu::{mem, set_current_vcpu, GuestMem, Vcpu, REGS};
 
 // Interpreter-specific host bring-up (not part of the metal surface):
 // `init_guest_ram` creates the initial address space; `new_space` allocates a
-// fresh one (until the kernel's thread/fork path drives this in M4).
+// fresh one (until the kernel's thread/fork path drives this in M4);
+// `attach_disk` backs the interpreted ATA ports with a host image file.
 pub use vcpu::init_guest_ram;
 pub use mmu::new_space;
+pub use devices::attach_disk;

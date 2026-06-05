@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "retroos-host"
-path = "src/host_main.rs"
+path = "src/main.rs"
 required-features = ["hosted"]
 
 [features]

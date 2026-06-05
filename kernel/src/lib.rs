@@ -94,6 +94,13 @@ unsafe extern "C" {
 // ABI rather than each defining its own.
 pub use arch_abi::{Frame64, Regs, UserMode};
 
+// The hosted binary calls the same `kernel::startup` symbol the metal crt0
+// (`arch/boot.rs`) calls — the backend difference lives below the arch boundary
+// (the interpreter serves the disk via its port handlers), so `startup` itself
+// is identical on both. Re-exported here so `main` can reach it.
+#[cfg(feature = "hosted")]
+pub use kernel::startup::startup;
+
 /// Hosted: run a 32-bit Linux ELF (already read into `data` by the binary)
 /// through the *real* kernel path — thread creation, the ELF loader, the Linux
 /// personality syscalls, and the real `event_loop` — all over the interpreter
