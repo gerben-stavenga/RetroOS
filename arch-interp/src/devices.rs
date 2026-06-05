@@ -1,22 +1,88 @@
-//! Port-I/O device layer for the interpreter backend.
+//! Port-I/O device bus for the interpreter backend.
 //!
-//! The kernel drives real hardware through `arch::inb/inw/outb` — e.g. the ATA
-//! disk in `kernel/src/kernel/hdd.rs` is pure PIO on ports 0x1F0–0x1F7 / 0x3F6.
-//! On the interpreter those port calls land here instead of on silicon, so the
-//! *same* `kernel::startup()` (mount the disk, read the MBR, …) runs unchanged:
-//! the backend difference lives entirely below the arch boundary.
-//!
-//! The dispatch is generic (a registry of devices keyed by port range) so more
-//! devices — fw_cfg, serial — can be added later. Today there is one: a
-//! host-file-backed ATA controller installed via `attach_disk`.
+//! The kernel drives hardware through `arch::inb/inw/outb`; on the interpreter
+//! those land here. Devices implement the [`PortIo`] trait and are `register`ed
+//! for an inclusive port range, so the hosted `main` composes the platform by
+//! hooking ports — a disk image on the ATA ports, a host directory on COM1, the
+//! debug console on 0xE9. Ports with no registered device read the ISA "no
+//! device" value 0xFF and drop writes.
 
+use crate::hostfs::HostFs;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 const SECTOR: usize = 512;
 
-// Primary ATA controller ports (LBA28 PIO — the subset hdd.rs uses).
+/// A device that responds to port I/O. `width` is the access size in bytes.
+pub trait PortIo {
+    fn read(&mut self, port: u16, width: u8) -> u32 {
+        let _ = (port, width);
+        0xFFFF_FFFF
+    }
+    fn write(&mut self, port: u16, width: u8, val: u32) {
+        let _ = (port, width, val);
+    }
+}
+
+struct Entry {
+    lo: u16,
+    hi: u16,
+    dev: Box<dyn PortIo>,
+}
+
+thread_local! {
+    static BUS: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Register `dev` for the inclusive port range `[lo, hi]`. Later registrations
+/// shadow earlier ones on overlap.
+pub fn register(lo: u16, hi: u16, dev: Box<dyn PortIo>) {
+    BUS.with(|b| b.borrow_mut().push(Entry { lo, hi, dev }));
+}
+
+pub fn port_in(port: u16, width: u8) -> u32 {
+    BUS.with(|b| {
+        for e in b.borrow_mut().iter_mut().rev() {
+            if e.lo <= port && port <= e.hi {
+                return e.dev.read(port, width);
+            }
+        }
+        0xFFFF_FFFF
+    })
+}
+
+pub fn port_out(port: u16, width: u8, val: u32) {
+    BUS.with(|b| {
+        for e in b.borrow_mut().iter_mut().rev() {
+            if e.lo <= port && port <= e.hi {
+                e.dev.write(port, width, val);
+                return;
+            }
+        }
+    });
+}
+
+// ── Debug console (port 0xE9 → stdout) ──────────────────────────────────────
+
+struct Debugcon;
+impl PortIo for Debugcon {
+    fn write(&mut self, _port: u16, _width: u8, val: u32) {
+        // The debug console is the *log* channel → stderr. (The screen/program
+        // output goes to stdout via the VGA path; sending 0xE9 there too would
+        // duplicate every character.)
+        let _ = std::io::stderr().write_all(&[val as u8]);
+    }
+}
+
+/// Hook the Bochs/QEMU debug console at port 0xE9 to stderr (the log channel).
+pub fn register_debugcon() {
+    register(0xE9, 0xE9, Box::new(Debugcon));
+}
+
+// ── ATA disk (primary controller, LBA28 PIO) ────────────────────────────────
+
 const ATA_BASE: u16 = 0x1F0;
 const ATA_DATA: u16 = 0x1F0;
 const ATA_SECCOUNT: u16 = 0x1F2;
@@ -25,18 +91,15 @@ const ATA_LBA_8_15: u16 = 0x1F4;
 const ATA_LBA_16_23: u16 = 0x1F5;
 const ATA_LBA_24_27: u16 = 0x1F6;
 const ATA_STATUS_CMD: u16 = 0x1F7;
-const ATA_CTRL: u16 = 0x3F6;
 
 const ST_DRDY: u32 = 0x40;
 const ST_DRQ: u32 = 0x08;
 const CMD_READ_SECTORS: u32 = 0x20;
 
-/// A host-file-backed ATA disk presenting the LBA28 PIO read protocol.
 struct Ata {
     file: File,
     seccount: u8,
     lba: u32,
-    /// Bytes loaded by the current READ_SECTORS command, drained by DATA reads.
     buf: Vec<u8>,
     pos: usize,
 }
@@ -47,32 +110,16 @@ impl Ata {
     }
 
     fn status(&self) -> u32 {
-        // Reads are synchronous, so BSY is never set and the kernel's busy-poll
-        // loops exit immediately. DRQ is set while a sector buffer has data.
+        // Reads are synchronous → never BSY; DRQ while a sector buffer has data.
         ST_DRDY | if self.pos < self.buf.len() { ST_DRQ } else { 0 }
-    }
-
-    fn out(&mut self, port: u16, val: u32) {
-        match port {
-            ATA_SECCOUNT => self.seccount = val as u8,
-            ATA_LBA_0_7 => self.lba = (self.lba & 0xFFFF_FF00) | (val & 0xFF),
-            ATA_LBA_8_15 => self.lba = (self.lba & 0xFFFF_00FF) | ((val & 0xFF) << 8),
-            ATA_LBA_16_23 => self.lba = (self.lba & 0xFF00_FFFF) | ((val & 0xFF) << 16),
-            ATA_LBA_24_27 => self.lba = (self.lba & 0x00FF_FFFF) | ((val & 0x0F) << 24),
-            ATA_STATUS_CMD if val == CMD_READ_SECTORS => self.read_sectors(),
-            _ => {} // FEATURES, control (SRST/select), other commands: no-op
-        }
     }
 
     fn read_sectors(&mut self) {
         let count = if self.seccount == 0 { 256 } else { self.seccount as usize };
-        let len = count * SECTOR;
-        let mut buf = vec![0u8; len];
-        // Short reads past end-of-file leave zeros — matches a disk that's
-        // larger than the image would, harmless for the in-range reads the FS does.
+        let mut buf = vec![0u8; count * SECTOR];
         if self.file.seek(SeekFrom::Start(self.lba as u64 * SECTOR as u64)).is_ok() {
             let mut filled = 0;
-            while filled < len {
+            while filled < buf.len() {
                 match self.file.read(&mut buf[filled..]) {
                     Ok(0) => break,
                     Ok(n) => filled += n,
@@ -84,7 +131,6 @@ impl Ata {
         self.pos = 0;
     }
 
-    /// DATA-port read: next little-endian 16-bit word from the sector buffer.
     fn data_word(&mut self) -> u32 {
         let lo = self.buf.get(self.pos).copied().unwrap_or(0) as u32;
         let hi = self.buf.get(self.pos + 1).copied().unwrap_or(0) as u32;
@@ -93,46 +139,96 @@ impl Ata {
     }
 }
 
-struct Devices {
-    ata: Option<Ata>,
+impl PortIo for Ata {
+    fn read(&mut self, port: u16, _width: u8) -> u32 {
+        if port == ATA_DATA {
+            self.data_word()
+        } else {
+            self.status() // status/alt-status and other registers report ready
+        }
+    }
+
+    fn write(&mut self, port: u16, _width: u8, val: u32) {
+        match port {
+            ATA_SECCOUNT => self.seccount = val as u8,
+            ATA_LBA_0_7 => self.lba = (self.lba & 0xFFFF_FF00) | (val & 0xFF),
+            ATA_LBA_8_15 => self.lba = (self.lba & 0xFFFF_00FF) | ((val & 0xFF) << 8),
+            ATA_LBA_16_23 => self.lba = (self.lba & 0xFF00_FFFF) | ((val & 0xFF) << 16),
+            ATA_LBA_24_27 => self.lba = (self.lba & 0x00FF_FFFF) | ((val & 0x0F) << 24),
+            ATA_STATUS_CMD if val == CMD_READ_SECTORS => self.read_sectors(),
+            _ => {} // features / other commands: no-op
+        }
+    }
 }
 
-thread_local! {
-    static DEVICES: RefCell<Devices> = const { RefCell::new(Devices { ata: None }) };
-}
-
-/// Attach a host image file as the primary ATA disk. The interpreted `inb/inw/
-/// outb` then serve `hdd::read_sectors` from it.
+/// Hook a host image file onto the primary ATA ports — `hdd::read_sectors`
+/// reads it through the interpreted PIO.
 pub fn attach_disk(path: &str) -> std::io::Result<()> {
     let file = File::open(path)?;
-    DEVICES.with(|d| d.borrow_mut().ata = Some(Ata::new(file)));
+    register(ATA_BASE, ATA_STATUS_CMD, Box::new(Ata::new(file)));
     Ok(())
 }
 
-/// Port input (`width` in bytes). Unhandled ports read the ISA "no device" value.
-pub fn port_in(port: u16, _width: u8) -> u32 {
-    DEVICES.with(|d| {
-        let mut d = d.borrow_mut();
-        if let Some(ata) = d.ata.as_mut() {
-            match port {
-                ATA_DATA => return ata.data_word(),
-                ATA_STATUS_CMD | ATA_CTRL => return ata.status(),
-                p if (ATA_BASE..=ATA_STATUS_CMD).contains(&p) => return ata.status(),
-                _ => {}
-            }
-        }
-        0xFFFF_FFFF // absent device: all ones (callers truncate to width)
-    })
+// ── COM1 16550 UART → native host filesystem ────────────────────────────────
+
+const COM1: u16 = 0x3F8;
+
+struct Uart {
+    fs: HostFs,
+    tx: Vec<u8>,
+    rx: VecDeque<u8>,
+    scratch: u8,
+    dlab: bool,
 }
 
-/// Port output (`width` in bytes). Unhandled ports drop the write.
-pub fn port_out(port: u16, _width: u8, val: u32) {
-    DEVICES.with(|d| {
-        let mut d = d.borrow_mut();
-        if let Some(ata) = d.ata.as_mut() {
-            if (ATA_BASE..=ATA_STATUS_CMD).contains(&port) || port == ATA_CTRL {
-                ata.out(port, val);
-            }
+impl Uart {
+    fn new(fs: HostFs) -> Uart {
+        Uart { fs, tx: Vec::new(), rx: VecDeque::new(), scratch: 0, dlab: false }
+    }
+
+    fn read_reg(&mut self, off: u16) -> u8 {
+        match off {
+            0 => self.rx.pop_front().unwrap_or(0),                 // RBR (data)
+            5 => 0x60 | if self.rx.is_empty() { 0 } else { 0x01 }, // LSR: THRE+TEMT (+DR)
+            6 => 0x30,                                             // MSR: CTS+DSR (peer present)
+            7 => self.scratch,                                     // scratch (presence probe)
+            _ => 0,
         }
-    });
+    }
+
+    fn write_reg(&mut self, off: u16, val: u8) {
+        match off {
+            0 if !self.dlab => {
+                // The client sends a whole command, then reads the reply, so the
+                // command's last byte completes it here and the reply is queued
+                // synchronously — no blocking, no external process.
+                self.tx.push(val);
+                let Uart { fs, tx, rx, .. } = self;
+                while let Some((consumed, reply)) = fs.try_command(tx) {
+                    tx.drain(..consumed);
+                    rx.extend(reply);
+                    if tx.is_empty() {
+                        break;
+                    }
+                }
+            }
+            3 => self.dlab = val & 0x80 != 0, // LCR (DLAB)
+            7 => self.scratch = val,
+            _ => {} // IER / FCR / MCR / divisor latches: accept & ignore
+        }
+    }
+}
+
+impl PortIo for Uart {
+    fn read(&mut self, port: u16, _width: u8) -> u32 {
+        self.read_reg(port - COM1) as u32
+    }
+    fn write(&mut self, port: u16, _width: u8, val: u32) {
+        self.write_reg(port - COM1, val as u8);
+    }
+}
+
+/// Hook a host directory onto COM1 as the kernel's `/host` filesystem.
+pub fn attach_hostfs(dir: &str) {
+    register(COM1, COM1 + 7, Box::new(Uart::new(HostFs::new(dir))));
 }

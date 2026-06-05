@@ -38,6 +38,7 @@ mod calls;
 mod cpu;
 mod desc;
 mod devices;
+mod hostfs;
 mod machine;
 mod mmu;
 pub mod monitor;
@@ -58,4 +59,6 @@ pub use vcpu::{mem, set_current_vcpu, GuestMem, Vcpu, REGS};
 // `attach_disk` backs the interpreted ATA ports with a host image file.
 pub use vcpu::init_guest_ram;
 pub use mmu::new_space;
-pub use devices::attach_disk;
+// Platform device composition (the hosted `main` hooks ports): the PortIo trait
+// + `register` for custom devices, and convenience hooks for the built-ins.
+pub use devices::{attach_disk, attach_hostfs, register, register_debugcon, PortIo};
