@@ -69,14 +69,13 @@ pub fn port_out(port: u16, width: u8, val: u32) {
 struct Debugcon;
 impl PortIo for Debugcon {
     fn write(&mut self, _port: u16, _width: u8, val: u32) {
-        // The debug console is the *log* channel → stderr. (The screen/program
-        // output goes to stdout via the VGA path; sending 0xE9 there too would
-        // duplicate every character.)
-        let _ = std::io::stderr().write_all(&[val as u8]);
+        // The kernel's text console mirrors every byte to 0xE9, so this *is* the
+        // console output stream → stdout.
+        let _ = std::io::stdout().write_all(&[val as u8]);
     }
 }
 
-/// Hook the Bochs/QEMU debug console at port 0xE9 to stderr (the log channel).
+/// Hook the debug console at port 0xE9 to stdout (the console stream).
 pub fn register_debugcon() {
     register(0xE9, 0xE9, Box::new(Debugcon));
 }

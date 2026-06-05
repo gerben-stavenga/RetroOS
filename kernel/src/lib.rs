@@ -29,9 +29,10 @@ pub mod pipe;  // Shared utility: ring buffer used by both arch and kernel
 pub use kernel::dos;
 pub use kernel::thread;
 
-// Re-export lib's vga module and macros
-pub use lib::vga;
-pub use lib::{print, println, dbg_print, dbg_println};
+// The text console lives in the kernel (it crosses the arch boundary for the
+// 0xE9 debug port); `print!`/`println!`/`dbg_*!` are defined there (macro_export
+// puts them at the crate root, so `crate::println!` keeps working).
+pub mod vga;
 
 // Re-export arch types used as opaque blobs by kernel code
 pub use arch::{RootPageTable, PAGE_SIZE, KernelPages, RawPage, LOW_MEM_BASE};
@@ -100,6 +101,16 @@ pub use arch_abi::{Frame64, Regs, UserMode};
 // is identical on both. Re-exported here so `main` can reach it.
 #[cfg(feature = "hosted")]
 pub use kernel::startup::startup;
+
+/// Hosted: point the VGA console framebuffer at a scratch buffer so its writes
+/// (clear/scroll/putchar) don't dereference the unmapped `0xB8000` host address.
+/// Console output reaches stdout via the `0xE9` debug device, so the framebuffer
+/// content itself is unused.
+#[cfg(feature = "hosted")]
+pub fn host_console_init() {
+    let fb = alloc::boxed::Box::leak(alloc::vec![0u16; 80 * 25].into_boxed_slice());
+    vga::vga().base = fb.as_mut_ptr() as usize;
+}
 
 /// Hosted: run a 32-bit Linux ELF (already read into `data` by the binary)
 /// through the *real* kernel path — thread creation, the ELF loader, the Linux

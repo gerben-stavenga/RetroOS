@@ -22,7 +22,7 @@ required-features = ["hosted"]
 # interpreter arch backend and routes console output to stdout. Default so the
 # documented `cargo build -p kernel` works without extra flags.
 default = ["hosted"]
-hosted = ["dep:retroos-arch-interp", "lib/std"]
+hosted = ["dep:retroos-arch-interp"]
 
 [dependencies]
 arch-abi = { path = "../arch-abi" }

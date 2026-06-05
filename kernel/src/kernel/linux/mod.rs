@@ -726,7 +726,7 @@ fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     match fd_kind {
         thread::FdKind::ConsoleOut => {
             for &b in kt.vcpu.slice(buf, len) {
-                vga::vga().putchar(b);
+                vga::putchar(b);
             }
             SyscallResult::val(len as i32)
         }
@@ -1127,7 +1127,7 @@ fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
         match fd_kind {
             thread::FdKind::ConsoleOut => {
                 for &b in kt.vcpu.slice(iov_base, iov_len) {
-                    vga::vga().putchar(b);
+                    vga::putchar(b);
                 }
                 total += iov_len as i32;
             }

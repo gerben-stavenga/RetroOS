@@ -23,8 +23,10 @@ fn main() {
         }
     }
 
-    // Compose the platform: hook the device ports.
-    arch::register_debugcon(); // 0xE9 → stdout
+    // Compose the platform: hook the device ports, and give the VGA console a
+    // valid (scratch) framebuffer — its output reaches stdout via 0xE9.
+    arch::register_debugcon(); // 0xE9 → stdout (the console stream)
+    kernel::host_console_init();
     if let Some(dir) = host_dir {
         arch::attach_hostfs(&dir); // COM1 → /host
     }

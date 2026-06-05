@@ -393,7 +393,7 @@ pub(crate) fn event_loop(first_tid: usize) {
                                 if crate::kernel::keyboard::update_key_state(sc) {
                                     let c = crate::kernel::keyboard::scancode_to_ascii(sc);
                                     if c != 0 {
-                                        crate::vga::vga().putchar(c);
+                                        crate::vga::putchar(c);
                                         let cpipe = thread::console_pipe();
                                         crate::kernel::kpipe::write(cpipe, &[c]);
                                     }

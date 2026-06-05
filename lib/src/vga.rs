@@ -62,18 +62,8 @@ impl Vga {
         }
     }
 
-    #[cfg(not(feature = "std"))]
     fn buffer(&mut self) -> &mut [u16] {
         unsafe { core::slice::from_raw_parts_mut(self.base as *mut u16, VGA_SIZE) }
-    }
-
-    /// Hosted: there is no VGA MMIO — back the screen buffer with a scratch
-    /// array so `clear`/`scroll` stay safe. Visible output goes via `putchar`
-    /// → stdout instead.
-    #[cfg(feature = "std")]
-    fn buffer(&mut self) -> &mut [u16] {
-        static mut SCRATCH: [u16; VGA_SIZE] = [0; VGA_SIZE];
-        unsafe { &mut *(&raw mut SCRATCH) }
     }
 
     /// Returns (column, row) cursor position.
@@ -103,19 +93,6 @@ impl Vga {
         buffer[VGA_SIZE - VGA_WIDTH..].fill(blank);
     }
 
-    /// Hosted: write straight to stdout (the host terminal interprets ANSI
-    /// itself, so no VGA buffer or escape-state machine is needed).
-    #[cfg(feature = "std")]
-    pub fn putchar(&mut self, c: u8) {
-        use std::io::Write as _;
-        let mut out = std::io::stdout();
-        let _ = out.write_all(&[c]);
-        if c == b'\n' {
-            let _ = out.flush();
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
     pub fn putchar(&mut self, c: u8) {
         if !self.screen_enabled {
             return;
@@ -189,24 +166,14 @@ impl Vga {
 }
 
 impl Write for Vga {
-    #[cfg(feature = "std")]
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        // Hosted: the kernel runs as a process — console goes to stdout.
-        use std::io::Write as _;
-        let mut out = std::io::stdout();
-        let _ = out.write_all(s.as_bytes());
-        let _ = out.flush();
-        Ok(())
-    }
-
-    #[cfg(not(feature = "std"))]
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let to_screen = KERNEL_OWNS_SCREEN.load(core::sync::atomic::Ordering::Relaxed);
-        for byte in s.bytes() {
-            if to_screen {
+        // Pure renderer: write cells into the framebuffer only. The debug
+        // console / output stream (port 0xE9) is the embedder's concern — it
+        // crosses the arch boundary, which `lib` sits below.
+        if KERNEL_OWNS_SCREEN.load(core::sync::atomic::Ordering::Relaxed) {
+            for byte in s.bytes() {
                 self.putchar(byte);
             }
-            unsafe { core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") byte); }
         }
         Ok(())
     }
@@ -248,41 +215,6 @@ macro_rules! println {
     }};
 }
 
-/// Debug console writer (port 0xE9 only, no VGA)
-pub struct DebugCon;
-
-impl Write for DebugCon {
-    #[cfg(feature = "std")]
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        use std::io::Write as _;
-        let _ = std::io::stderr().write_all(s.as_bytes());
-        Ok(())
-    }
-
-    #[cfg(not(feature = "std"))]
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            unsafe { core::arch::asm!("out dx, al", in("dx") 0xE9u16, in("al") b); }
-        }
-        Ok(())
-    }
-}
-
-/// Print to debug console only (port 0xE9), not VGA
-#[macro_export]
-macro_rules! dbg_print {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        let _ = $crate::vga::DebugCon.write_fmt(format_args!($($arg)*));
-    }};
-}
-
-/// Print to debug console only with newline
-#[macro_export]
-macro_rules! dbg_println {
-    () => { $crate::dbg_print!("\n") };
-    ($($arg:tt)*) => {{
-        $crate::dbg_print!($($arg)*);
-        $crate::dbg_print!("\n");
-    }};
-}
+// The debug console (port 0xE9) and `dbg_print!`/`dbg_println!` live in the
+// embedder (kernel/bootloader), since they cross the arch boundary `lib` is
+// below. `lib::vga` is purely a framebuffer renderer.
