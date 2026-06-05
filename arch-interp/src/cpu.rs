@@ -34,8 +34,14 @@ const SLICE: usize = 100_000;
 struct Ctx {
     /// Event a hook stopped the slice with (if any).
     pending: Option<KernelEvent>,
-    /// Raw `INT n` / exception vector a hook stopped on (decided in `execute`).
-    pending_intr: Option<u32>,
+    /// `INT n` / exception vector a hook stopped on (decided in `execute`).
+    pending_intr: Option<u8>,
+    /// Whether `pending_intr` was a software `int n` (true) or a CPU fault
+    /// (false) — decoded from bit 8 of the patched intr-hook vector.
+    pending_is_int: bool,
+    /// CPU fault error code (e.g. the faulting selector for #GP/#NP) — decoded
+    /// from bits 16..31 of the patched intr-hook vector.
+    pending_err: u16,
     /// Guest pages currently mapped into Unicorn for the active space. Cleared
     /// (and the pages unmapped) on a context switch.
     mapped: BTreeSet<u64>,
@@ -56,10 +62,15 @@ fn build() -> Unicorn<'static, Ctx> {
     let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, Ctx::default())
         .expect("unicorn init");
 
-    // Software INT n (CPU exceptions surface here too) — record the raw vector;
-    // `execute` decides VM86 reflect-to-IVT vs. bubble to the kernel.
+    // Software INT n and CPU exceptions both surface here. Our local Unicorn
+    // patch encodes `exception_is_int` in bit 8 of `intno` (vectors are <= 0xFF),
+    // so we record the vector and that bit; `execute` turns it into a clean
+    // SoftInt (software int) vs Exception (CPU fault) event.
     uc.add_intr_hook(|uc, intno| {
-        uc.get_data_mut().pending_intr = Some(intno);
+        let d = uc.get_data_mut();
+        d.pending_intr = Some((intno & 0xFF) as u8);
+        d.pending_is_int = intno & 0x100 != 0;
+        d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
         let _ = uc.emu_stop();
     })
     .expect("intr hook");
@@ -155,6 +166,8 @@ pub fn execute() -> KernelEvent {
             let d = uc.get_data_mut();
             d.pending = None;
             d.pending_intr = None;
+            d.pending_is_int = false;
+            d.pending_err = 0;
         }
 
         if trace_on() {
@@ -172,8 +185,8 @@ pub fn execute() -> KernelEvent {
                 intr, ev, run.is_ok());
         }
 
-        if let Some(intno) = uc.get_data_mut().pending_intr.take() {
-            let n = intno as u8;
+        if let Some(n) = uc.get_data_mut().pending_intr.take() {
+            let is_int = uc.get_data().pending_is_int;
             if mode == UserMode::VM86 {
                 // Real mode: `int n` and real-mode CPU faults alike carry their
                 // vector here. Reflect anything the redirection bitmap doesn't
@@ -185,18 +198,18 @@ pub fn execute() -> KernelEvent {
                 }
                 return KernelEvent::SoftInt(n);
             }
-            // Protected mode: classify by vector, the same convention the metal
-            // trap entry (`arch/traps.rs`) uses. Vectors 0..=31 are CPU
-            // exceptions (e.g. #NP=11 for a not-present segment — the basis of
-            // DPMI demand-loaded overlays), except #BP/#OF (3/4), reachable only
-            // via `int3`/`into`. Everything else is a software interrupt (DOS /
-            // DPMI service ints 0x21/0x2F/0x31, …). x86 itself can't distinguish
-            // `int 0x0d` from #GP, so low vectors are reserved for faults by
-            // convention — Unicorn's intr hook likewise only hands us the vector.
-            if n < 32 && n != 3 && n != 4 {
-                return KernelEvent::Exception(n);
+            // Protected mode: the engine tells us directly whether this was a
+            // software `int n` or a CPU fault (`exception_is_int`, surfaced by
+            // our Unicorn patch). A fault becomes a typed Exception carrying the
+            // CPU error code (the faulting selector for #NP/#GP — what a DPMI
+            // host needs to demand-load the right overlay segment); a software
+            // int (`int 0x21`/`0x11`/…) becomes a SoftInt. No vector heuristics,
+            // no guest-opcode inspection.
+            if is_int {
+                return KernelEvent::SoftInt(n);
             }
-            return KernelEvent::SoftInt(n);
+            regs.err_code = uc.get_data().pending_err as u64;
+            return KernelEvent::Exception(n);
         }
         if let Some(ev) = uc.get_data_mut().pending.take() {
             return ev;

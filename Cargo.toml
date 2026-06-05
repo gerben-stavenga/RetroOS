@@ -21,3 +21,12 @@ members = ["arch-abi", "arch-interp", "kernel", "lib"]
 overflow-checks = false
 [profile.dev.package.lib]
 overflow-checks = false
+
+# Patched Unicorn C bindings: surface exception_is_int (bit 8) + error_code
+# (bits 16..31) through the intr-hook argument and reset old_exception, so
+# arch-interp can return clean SoftInt/Exception events with the faulting
+# selector (DPMI overlay demand-loading) and avoid spurious double faults.
+# Fork = published 2.1.5 + a 3-hunk cpu-exec.c patch (see the repo's
+# RETROOS_PATCH.md). Pinned by rev for reproducibility.
+[patch.crates-io]
+unicorn-engine-sys = { git = "https://github.com/gerben-stavenga/unicorn-retroos-patch", rev = "269253342e0cf2d415db12b3579abb865b43b13b" }

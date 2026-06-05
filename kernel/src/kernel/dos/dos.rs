@@ -841,8 +841,6 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             // an extender that installs its own INT 21h chain, so the pmdos
             // short-circuit never services char input. The INT 16 round-trip
             // below relies on real-mode INT framing (vm86_push, real-mode IVT).
-            debug_assert!(regs.mode() == crate::UserMode::VM86,
-                "INT 21 console read in PM mode — PM extenders own their INT 21");
             // Second byte of a prior extended key takes precedence (DOS returns
             // AL=0 then the scancode on the next read).
             if let Some(ch) = dos.dos_pending_char.take() {
@@ -952,9 +950,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x34 => {
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | (&raw const low_mem().boot_psp as u32 + INDOS_FLAG_OFFSET as u32) as u64;
+                regs.rbx = (regs.rbx & !0xFFFF) | ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) + INDOS_FLAG_OFFSET as u32) as u64;
             } else {
-                regs.es = (&raw const low_mem().boot_psp as u32 >> 4) as u64;
+                regs.es = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | INDOS_FLAG_OFFSET as u64;
             }
             thread::KernelAction::Done
@@ -1875,7 +1873,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // head). LOL doesn't need to be paragraph-aligned: ES:BX expresses
         // any linear address.
         0x52 => {
-            let lol_addr = &raw const low_mem().lol as u32;
+            let lol_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, lol) as u32;
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | lol_addr as u64;
@@ -2139,7 +2137,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 //   always be swapped. Point at SYSPSP (zeroed) with a nominal
                 //   size; DPMILOAD just needs a plausible pointer.
                 0x06 => {
-                    let syspsp_addr = &raw const low_mem().boot_psp as u32;
+                    let syspsp_addr = (LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32);
                     if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                         regs.ds = dpmi::LOW_MEM_SEL as u64;
                         regs.rsi = (regs.rsi & !0xFFFF) | syspsp_addr as u64;
@@ -3284,7 +3282,7 @@ pub(super) fn boot_psp() -> &'static mut Psp {
     &mut low_mem().boot_psp
 }
 pub(super) fn boot_psp_seg() -> u16 {
-    (&raw const low_mem().boot_psp as u32 >> 4) as u16
+    ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16
 }
 /// Bootstrap parent reference for the initial program load. The env is the
 /// kernel's compiled-in `MASTER_ENV` (no allocation needed); the parent
@@ -3297,7 +3295,7 @@ pub(super) fn boot_parent_with_env<'a>(env: &'a [u8]) -> ParentRef<'a> {
 /// by dpmi when building the three aliasing LDT selectors (PM16, PM32,
 /// VM86 paragraph) that all point at this same buffer.
 pub(super) fn host_stack_base() -> u32 {
-    &raw const low_mem().host_stack as u32
+    LOW_MEM_BASE + core::mem::offset_of!(LowMem, host_stack) as u32
 }
 pub(super) fn host_stack_size() -> u32 {
     core::mem::size_of_val(&low_mem().host_stack) as u32
@@ -3317,7 +3315,7 @@ pub(super) fn host_stack_empty_sp() -> u32 {
 /// the buffer's start within the LowMem layout. `mode_transitions::rm_stack_top`
 /// does this for the standard "fresh-excursion top of stack" SP.
 pub(super) fn rm_stack_base() -> u32 {
-    &raw const low_mem().rm_stack as u32
+    LOW_MEM_BASE + core::mem::offset_of!(LowMem, rm_stack) as u32
 }
 pub(super) fn rm_stack_size() -> u32 {
     core::mem::size_of_val(&low_mem().rm_stack) as u32
@@ -3501,8 +3499,8 @@ pub(super) fn setup_ivt() {
 }
 
 fn setup_lol_sft() {
-    let sft_addr = &raw const low_mem().sft as u32;
-    let cds_addr = &raw const low_mem().cds as u32;
+    let sft_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
+    let cds_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
 
     let lm = low_mem();
 

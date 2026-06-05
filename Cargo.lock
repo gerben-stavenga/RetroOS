@@ -332,8 +332,7 @@ dependencies = [
 [[package]]
 name = "unicorn-engine-sys"
 version = "2.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "685282714d35a6fbfed0ae14d81bb11c91838bc7a165cac778321679a7bb91d8"
+source = "git+https://github.com/gerben-stavenga/unicorn-retroos-patch?rev=269253342e0cf2d415db12b3579abb865b43b13b#269253342e0cf2d415db12b3579abb865b43b13b"
 dependencies = [
  "bindgen",
  "cc",
