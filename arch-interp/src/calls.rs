@@ -127,14 +127,17 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, _ppage_start: u
     crate::cpu::invalidate_uc(vpage_start, num_pages);
 }
 
-/// Load LDT base+limit. (M4)
-pub fn arch_load_ldt(base: u32, limit: u32) {
-    unimplemented!("M4: software LDT")
+/// Load the LDT base+limit (the active descriptor table for PM selector
+/// resolution). Stored for `monitor::seg_base`; only consulted once a guest
+/// enters protected mode (DPMI). Real-mode DOS never reads it.
+pub fn arch_load_ldt(ldt: &[u64]) {
+    crate::desc::load_ldt(ldt);
 }
 
-/// Set a per-thread TLS GDT entry; returns the GDT index or -1. (M4)
-pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32 {
-    unimplemented!("M4: software TLS entry")
+/// Set a per-thread TLS GDT entry; returns the GDT index. Stored for PM segment
+/// resolution; `index < 0` auto-allocates the first free TLS slot.
+pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, _limit_in_pages: bool) -> i32 {
+    crate::desc::set_tls_entry(index, base, limit)
 }
 
 /// Allocate ISA-DMA-safe physically-contiguous pages; returns start page or 0.

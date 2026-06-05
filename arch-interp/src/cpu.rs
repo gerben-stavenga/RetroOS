@@ -17,7 +17,7 @@
 //!   (a deterministic timer tick → `Irq`).
 
 use crate::{mmu, vcpu};
-use arch_abi::{IoSize, KernelEvent, Regs};
+use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
 use core::cell::RefCell;
 use core::ffi::c_void;
 use std::collections::BTreeSet;
@@ -27,13 +27,15 @@ use unicorn_engine::{RegisterX86, Unicorn};
 const PAGE: u64 = 4096;
 
 /// Instructions per run-slice — also the timer-IRQ granularity (deterministic).
-const SLICE: usize = 500;
+const SLICE: usize = 100_000;
 
 /// Per-run hook scratch.
 #[derive(Default)]
 struct Ctx {
     /// Event a hook stopped the slice with (if any).
     pending: Option<KernelEvent>,
+    /// Raw `INT n` / exception vector a hook stopped on (decided in `execute`).
+    pending_intr: Option<u32>,
     /// Guest pages currently mapped into Unicorn for the active space. Cleared
     /// (and the pages unmapped) on a context switch.
     mapped: BTreeSet<u64>,
@@ -51,9 +53,10 @@ fn build() -> Unicorn<'static, Ctx> {
     let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, Ctx::default())
         .expect("unicorn init");
 
-    // Software INT n → SoftInt(n).
+    // Software INT n (CPU exceptions surface here too) — record the raw vector;
+    // `execute` decides VM86 reflect-to-IVT vs. bubble to the kernel.
     uc.add_intr_hook(|uc, intno| {
-        uc.get_data_mut().pending = Some(KernelEvent::SoftInt(intno as u8));
+        uc.get_data_mut().pending_intr = Some(intno);
         let _ = uc.emu_stop();
     })
     .expect("intr hook");
@@ -124,24 +127,44 @@ fn io_with<R>(f: impl FnOnce(&mut Unicorn<'static, Ctx>) -> R) -> R {
 }
 
 /// Run the current Vcpu (`REGS`) for one slice and return the next event.
+///
+/// Two execution modes share one Unicorn instance: 32-bit flat protected mode
+/// (Linux) and 16-bit real mode (VM86/DOS). The mode is read from `REGS` each
+/// slice; segment registers and `CR0.PE` are configured to match. VM86 `INT n`
+/// that the redirection bitmap does NOT intercept is reflected to the guest's
+/// real-mode IVT here and execution continues — only trapped vectors (and the
+/// DPL=3 gates 3/4) bubble to the kernel.
 pub fn execute() -> KernelEvent {
-    io_with(|uc| {
+    io_with(|uc| loop {
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
-        load_regs(uc, regs);
-        uc.get_data_mut().pending = None;
+        let mode = regs.mode();
+        let begin = configure(uc, regs, mode);
+        {
+            let d = uc.get_data_mut();
+            d.pending = None;
+            d.pending_intr = None;
+        }
 
-        let pc = regs.frame.rip;
-        let run = uc.emu_start(pc, 0xFFFF_FFFF, 0, SLICE);
+        let run = uc.emu_start(begin, 0xFFFF_FFFF, 0, SLICE);
+        store_regs(uc, regs, mode);
 
-        store_regs(uc, regs);
-
+        if let Some(intno) = uc.get_data_mut().pending_intr.take() {
+            let n = intno as u8;
+            if mode == UserMode::VM86 && n != 3 && n != 4 && !crate::desc::int_intercepted(n) {
+                // Not a trap vector: reflect to the guest's real-mode IVT and
+                // keep running (an IVT stub will `int 0x31` if it needs us).
+                unsafe { crate::monitor::sw_reflect_vm86_int(regs, n) };
+                continue;
+            }
+            return KernelEvent::SoftInt(n);
+        }
         if let Some(ev) = uc.get_data_mut().pending.take() {
             return ev;
         }
-        match run {
+        return match run {
             Ok(()) => KernelEvent::Irq, // whole slice retired → timer tick
             Err(_) => KernelEvent::Fault,
-        }
+        };
     })
 }
 
@@ -171,31 +194,73 @@ pub fn flush_uc() {
     });
 }
 
-// Register sync. M2/M3 sync the general-purpose file, instruction pointer, and
-// flags; the guest runs flat (segment bases 0), so selector/GDT sync is M4.
+const VM_FLAG: u64 = 1 << 17;
+const IOPL_MASK: u64 = 3 << 12;
 
-fn load_regs(uc: &mut Unicorn<'static, Ctx>, r: &Regs) {
-    let _ = uc.reg_write(RegisterX86::EAX, r.rax);
-    let _ = uc.reg_write(RegisterX86::EBX, r.rbx);
-    let _ = uc.reg_write(RegisterX86::ECX, r.rcx);
-    let _ = uc.reg_write(RegisterX86::EDX, r.rdx);
-    let _ = uc.reg_write(RegisterX86::ESI, r.rsi);
-    let _ = uc.reg_write(RegisterX86::EDI, r.rdi);
-    let _ = uc.reg_write(RegisterX86::EBP, r.rbp);
-    let _ = uc.reg_write(RegisterX86::ESP, r.frame.rsp);
-    let _ = uc.reg_write(RegisterX86::EIP, r.frame.rip);
-    let _ = uc.reg_write(RegisterX86::EFLAGS, r.frame.rflags);
+/// Configure Unicorn for `mode`, load `REGS`, and return the linear start PC.
+fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
+    let cr0 = uc.reg_read(RegisterX86::CR0).unwrap_or(1);
+    let w = |uc: &mut Unicorn<'static, Ctx>, reg, v: u64| { let _ = uc.reg_write(reg, v); };
+
+    w(uc, RegisterX86::EAX, r.rax);
+    w(uc, RegisterX86::EBX, r.rbx);
+    w(uc, RegisterX86::ECX, r.rcx);
+    w(uc, RegisterX86::EDX, r.rdx);
+    w(uc, RegisterX86::ESI, r.rsi);
+    w(uc, RegisterX86::EDI, r.rdi);
+    w(uc, RegisterX86::EBP, r.rbp);
+
+    if mode == UserMode::VM86 {
+        // Real mode: PE=0, segment*16 addressing, 16-bit operands. (We model
+        // VM86 as real mode — same seg<<4 semantics — rather than PM+VME.)
+        w(uc, RegisterX86::CR0, cr0 & !1);
+        w(uc, RegisterX86::CS, r.code_seg() as u64);
+        w(uc, RegisterX86::DS, r.ds & 0xFFFF);
+        w(uc, RegisterX86::ES, r.es & 0xFFFF);
+        w(uc, RegisterX86::SS, r.stack_seg() as u64);
+        w(uc, RegisterX86::FS, r.fs & 0xFFFF);
+        w(uc, RegisterX86::GS, r.gs & 0xFFFF);
+        w(uc, RegisterX86::ESP, r.sp32() as u64 & 0xFFFF);
+        w(uc, RegisterX86::EIP, r.ip32() as u64 & 0xFFFF);
+        // Drop VM (real mode has no VM bit); keep the rest, force reserved bit 1.
+        w(uc, RegisterX86::EFLAGS, (r.flags() & !VM_FLAG) | 2);
+        // `begin` is the EIP offset — Unicorn adds the CS base (CS<<4) itself.
+        r.ip32() as u64 & 0xFFFF
+    } else {
+        // Protected-mode flat 32-bit (Linux): PE=1, flat segments (Unicorn's
+        // base-0 default — we don't sync selectors), 32-bit.
+        w(uc, RegisterX86::CR0, cr0 | 1);
+        w(uc, RegisterX86::ESP, r.frame.rsp);
+        w(uc, RegisterX86::EIP, r.frame.rip);
+        w(uc, RegisterX86::EFLAGS, r.frame.rflags);
+        r.frame.rip
+    }
 }
 
-fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs) {
-    r.rax = uc.reg_read(RegisterX86::EAX).unwrap_or(0);
-    r.rbx = uc.reg_read(RegisterX86::EBX).unwrap_or(0);
-    r.rcx = uc.reg_read(RegisterX86::ECX).unwrap_or(0);
-    r.rdx = uc.reg_read(RegisterX86::EDX).unwrap_or(0);
-    r.rsi = uc.reg_read(RegisterX86::ESI).unwrap_or(0);
-    r.rdi = uc.reg_read(RegisterX86::EDI).unwrap_or(0);
-    r.rbp = uc.reg_read(RegisterX86::EBP).unwrap_or(0);
-    r.frame.rsp = uc.reg_read(RegisterX86::ESP).unwrap_or(0);
-    r.frame.rip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
-    r.frame.rflags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
+fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
+    let rd = |uc: &mut Unicorn<'static, Ctx>, reg| uc.reg_read(reg).unwrap_or(0);
+    r.rax = rd(uc, RegisterX86::EAX);
+    r.rbx = rd(uc, RegisterX86::EBX);
+    r.rcx = rd(uc, RegisterX86::ECX);
+    r.rdx = rd(uc, RegisterX86::EDX);
+    r.rsi = rd(uc, RegisterX86::ESI);
+    r.rdi = rd(uc, RegisterX86::EDI);
+    r.rbp = rd(uc, RegisterX86::EBP);
+    r.frame.rsp = rd(uc, RegisterX86::ESP);
+    r.frame.rip = rd(uc, RegisterX86::EIP);
+
+    if mode == UserMode::VM86 {
+        // Segments may have changed (mov/pop); read them back.
+        r.set_cs32(rd(uc, RegisterX86::CS) as u32);
+        r.set_ss32(rd(uc, RegisterX86::SS) as u32);
+        r.ds = rd(uc, RegisterX86::DS);
+        r.es = rd(uc, RegisterX86::ES);
+        r.fs = rd(uc, RegisterX86::FS);
+        r.gs = rd(uc, RegisterX86::GS);
+        // Re-assert VM86 in the saved flags so `regs.mode()` stays VM86 for the
+        // kernel (we ran in real mode, which carries no VM bit).
+        r.frame.rflags = rd(uc, RegisterX86::EFLAGS) | VM_FLAG | IOPL_MASK;
+    } else {
+        r.frame.rflags = rd(uc, RegisterX86::EFLAGS);
+    }
 }

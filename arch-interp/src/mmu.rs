@@ -180,13 +180,20 @@ pub fn ensure_committed(addr: usize, len: usize) {
 /// was demand-committed and execution should retry; `None` means a genuinely
 /// illegal access that must bubble to the kernel as `PageFault`.
 pub fn demand(addr: usize) -> Option<bool> {
-    if addr < NULL_GUARD || addr >= GUEST_VA_SIZE {
+    if addr >= GUEST_VA_SIZE {
         return None;
     }
     let vpage = addr / PAGE;
     with_active(|sp| {
+        // An already-committed page is always serviceable — including low memory
+        // that `arch_map_low_mem` mapped for VM86/DOS (the IVT, BIOS data area,
+        // PSPs live below 64 KiB). The null-pointer guard only blocks
+        // demand-zeroing of *unmapped* low pages (a real null deref).
         if sp.perm[vpage].present {
             return Some(sp.perm[vpage].writable);
+        }
+        if addr < NULL_GUARD {
+            return None;
         }
         sp.commit(vpage, true);
         Some(true)

@@ -152,13 +152,18 @@ pub fn arch_free_range(base_page: usize, count: usize) {
 
 
 
-/// Load LDT: write base+limit into GDT[12] and execute LLDT.
-pub fn arch_load_ldt(base: u32, limit: u32) {
+/// Load the LDT: write base+limit into GDT[12] and execute LLDT. Takes the LDT
+/// as a slice so base and limit travel together; the metal backend splits it
+/// into the `edx`/`ecx` register pair for the trap (the kernel address fits
+/// `edx` losslessly), while a hosted backend keeps the full fat pointer.
+pub fn arch_load_ldt(ldt: &[u64]) {
+    let base = ldt.as_ptr();
+    let limit = (core::mem::size_of_val(ldt) - 1) as u32;
     unsafe {
         core::arch::asm!(
             "int 0x80",
             in("eax") crate::arch::arch_call::LOAD_LDT as u32,
-            in("edx") base,
+            in("edx") base as usize as u32,
             in("ecx") limit,
         );
     }

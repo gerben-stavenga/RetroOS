@@ -81,7 +81,13 @@ impl VgaState {
         }
     }
 
-    /// Read current VGA hardware state into this struct.
+    /// Read current VGA hardware state into this struct. No-op on the
+    /// interpreter backend, which has no VGA hardware (ports read 0xFF and the
+    /// planar framebuffer at the low-mem alias isn't host-mapped).
+    #[cfg(feature = "hosted")]
+    pub fn save_from_hardware(&mut self) {}
+
+    #[cfg(not(feature = "hosted"))]
     pub fn save_from_hardware(&mut self) {
         use crate::arch::{inb, outb};
         if self.planes.is_empty() {
@@ -193,7 +199,12 @@ impl VgaState {
         outb(0x3CE, self.gc_index);
     }
 
-    /// Write this struct's state to VGA hardware.
+    /// Write this struct's state to VGA hardware. No-op on the interpreter
+    /// backend (no VGA hardware).
+    #[cfg(feature = "hosted")]
+    pub fn restore_to_hardware(&self) {}
+
+    #[cfg(not(feature = "hosted"))]
     pub fn restore_to_hardware(&self) {
         if self.planes.is_empty() { return; }
         use crate::arch::{inb, outb};

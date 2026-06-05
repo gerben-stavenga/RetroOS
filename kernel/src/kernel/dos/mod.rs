@@ -289,9 +289,7 @@ impl DosState {
     /// LDTR at this thread's LDT). Keeps the LDT layout private to the dos
     /// module — external code never touches `self.ldt`.
     pub fn on_resume(&self) {
-        let ldt_ptr = self.ldt.as_ptr() as u32;
-        let ldt_limit = (dpmi::LDT_ENTRIES * 8 - 1) as u32;
-        crate::arch::arch_load_ldt(ldt_ptr, ldt_limit);
+        crate::arch::arch_load_ldt(&self.ldt[..]);
     }
 
     /// Called when the thread loses focus. Snapshots the VGA framebuffer

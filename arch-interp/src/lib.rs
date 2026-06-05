@@ -36,6 +36,7 @@ pub use arch_abi::{
 
 mod calls;
 mod cpu;
+mod desc;
 mod devices;
 mod machine;
 mod mmu;
