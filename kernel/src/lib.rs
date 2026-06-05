@@ -94,44 +94,78 @@ unsafe extern "C" {
 // ABI rather than each defining its own.
 pub use arch_abi::{Frame64, Regs, UserMode};
 
-/// Hosted entry point. Where the metal build comes up through `boot_kernel`
-/// (paging, GDT/IDT, ring-1 drop) before calling `startup()`, the hosted build
-/// is an ordinary process. Called from the `retroos-host` binary.
-///
-/// Milestone 2 bring-up: the full `startup()` path needs a disk + the software
-/// MMU + threads (M3/M4), so this drives a hand-assembled guest directly
-/// through the *real* arch boundary (`arch::do_arch_execute` over Unicorn,
-/// `arch::mem()` over shared guest RAM, the canonical `KernelEvent`s) to prove
-/// the event loop turns over end-to-end on the interpreter backend.
+/// Hosted: run a 32-bit Linux ELF (already read into `data` by the binary)
+/// through the *real* kernel path — thread creation, the ELF loader, the Linux
+/// personality syscalls, and the real `event_loop` — all over the interpreter
+/// arch backend, with no disk/filesystem boot. Mirrors what `run_init_program`
+/// does for DOS. `path` is used for argv[0] / diagnostics.
 #[cfg(feature = "hosted")]
-pub fn host_start() -> ! {
-    use arch::monitor::KernelEvent;
+pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>) -> ! {
+    use kernel::thread;
 
-    // Flat guest-RAM region the software CPU and `arch::mem()` share.
-    arch::init_guest_ram(64 << 20);
+    arch::init_guest_ram(0);
+    kernel::heap::init();
+    thread::init_threading();
+
+    // Console stdin pipe (kernel is the phantom writer, as in startup()).
+    let cpipe = kernel::kpipe::alloc().expect("console pipe");
+    kernel::kpipe::add_writer(cpipe);
+    thread::set_console_pipe(cpipe);
+
+    // Fresh process thread in the initial (active) address space.
+    let tid = {
+        let t = thread::create_thread(None, RootPageTable::empty(), true).expect("create thread");
+        t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
+        t.kernel.fds[1] = thread::FdKind::ConsoleOut;
+        t.kernel.fds[2] = thread::FdKind::ConsoleOut;
+        t.kernel.tid as usize
+    };
+    kernel::kpipe::add_reader(cpipe);
+
+    // Load the ELF (segments + argv/envp/auxv stack) into the active space and
+    // set the thread's entry registers.
+    let argv = alloc::vec![path.to_vec()];
+    if let Err(e) = kernel::linux::exec_elf_into(tid, &data, path, &argv) {
+        dbg_println!("[host] exec failed: errno {}", e);
+        arch::shutdown();
+    }
+
+    // Seed the live execution context and run the real kernel event loop.
+    let t = thread::get_thread(tid).expect("thread");
+    arch::set_current_vcpu(t.kernel.vcpu);
+    dbg_println!("[host] running 32-bit Linux ELF, interpreted");
+    kernel::startup::event_loop(tid);
+    dbg_println!("[host] guest exited");
+    arch::shutdown();
+}
+
+/// Hosted no-argument fallback: a hand-assembled guest driven directly through
+/// the arch boundary (syscall, port OUT, demand-paged write, timer slicing,
+/// exit). Proves the interpreter mechanism without the full kernel.
+#[cfg(feature = "hosted")]
+pub fn host_run_demo() -> ! {
+    use arch::monitor::KernelEvent;
+    arch::init_guest_ram(0);
     println!("[host] RetroOS hosted kernel — interpreter (Unicorn) arch backend");
 
-    // Hand-assembled 32-bit guest: syscall, port OUT, a write to a fresh
-    // (demand-paged) page, a ~2k-insn delay loop (timer slicing), then exit.
-    // Above the 64 KiB null-pointer guard (the MMU faults guard-range accesses,
-    // matching metal).
-    const CODE: u32 = 0x0010_0000; // 1 MiB
-    const STACK: u32 = 0x0020_0000; // 2 MiB
-    const SCRATCH: u32 = 0x0040_0000; // 4 MiB — a fresh page, demand-paged on write
+    // Above the 64 KiB null-pointer guard (the MMU faults guard-range accesses).
+    const CODE: u32 = 0x0010_0000;
+    const STACK: u32 = 0x0020_0000;
+    const SCRATCH: u32 = 0x0040_0000;
     #[rustfmt::skip]
     let code: &[u8] = &[
         0xB8, 0x04,0x00,0x00,0x00,   // mov eax,4
         0xBB, 0x39,0x05,0x00,0x00,   // mov ebx,0x539
-        0xCD, 0x80,                  // int 0x80      -> SoftInt(0x80), eax=4
+        0xCD, 0x80,                  // int 0x80
         0xB8, 0x42,0x00,0x00,0x00,   // mov eax,0x42
         0xBA, 0xE9,0x00,0x00,0x00,   // mov edx,0xE9
-        0xEE,                        // out dx,al     -> Out{port=0xE9}
-        0xA3, 0x00,0x00,0x40,0x00,   // mov [0x00400000],eax  -> demand-page write
+        0xEE,                        // out dx,al
+        0xA3, 0x00,0x00,0x40,0x00,   // mov [0x00400000],eax
         0xB9, 0x00,0x08,0x00,0x00,   // mov ecx,0x800
-        0x49,                        // dec ecx   <- loop
+        0x49,                        // dec ecx
         0x75, 0xFD,                  // jnz -3
         0xB8, 0x01,0x00,0x00,0x00,   // mov eax,1
-        0xCD, 0x80,                  // int 0x80      -> SoftInt(0x80), eax=1 (exit)
+        0xCD, 0x80,                  // int 0x80 (exit)
         0xF4,                        // hlt
     ];
     arch::mem().write_bytes(CODE as usize, code);
@@ -140,41 +174,23 @@ pub fn host_start() -> ! {
     vcpu.regs.init_user_process(CODE, STACK);
     arch::set_current_vcpu(vcpu);
 
-    // Read the live guest registers (updated by each `do_arch_execute`).
     let eax = || unsafe { (*(&raw const arch::REGS)).regs.rax as u32 };
-
     println!("[host] running guest vcpu...");
     let mut irqs = 0u32;
     loop {
         match arch::do_arch_execute() {
             KernelEvent::SoftInt(0x80) if eax() == 1 => {
-                // The guest's `mov [0x400000],eax` (eax was 0x42) went through a
-                // demand-paged page that arch::mem() and Unicorn share.
                 let scratch: u32 = arch::mem().read(SCRATCH as usize);
                 println!("[host] guest scratch[{:#x}] = {:#x} (demand-paged)", SCRATCH, scratch);
                 println!("[host] guest exit syscall -> done ({irqs} timer ticks)");
                 arch::shutdown();
             }
-            KernelEvent::SoftInt(n) => {
-                println!("[host] INT {:#x} (eax={:#x}) -> serviced", n, eax());
-            }
-            KernelEvent::Out { port, size } => {
-                println!("[host] OUT port={:#06x} size={:?} val={:#x}", port, size, eax());
-            }
-            KernelEvent::In { port, size } => {
-                println!("[host] IN  port={:#06x} size={:?}", port, size);
-            }
-            KernelEvent::Irq => {
-                irqs += 1;
-            }
-            KernelEvent::PageFault { addr } => {
-                println!("[host] page fault @ {:#x} -> stopping", addr);
-                arch::shutdown();
-            }
-            ev => {
-                println!("[host] unhandled event {:?} -> stopping", ev);
-                arch::shutdown();
-            }
+            KernelEvent::SoftInt(n) => println!("[host] INT {:#x} (eax={:#x}) -> serviced", n, eax()),
+            KernelEvent::Out { port, size } =>
+                println!("[host] OUT port={:#06x} size={:?} val={:#x}", port, size, eax()),
+            KernelEvent::In { port, size } => println!("[host] IN  port={:#06x} size={:?}", port, size),
+            KernelEvent::Irq => irqs += 1,
+            ev => { println!("[host] unhandled event {:?} -> stopping", ev); arch::shutdown(); }
         }
     }
 }

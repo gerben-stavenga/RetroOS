@@ -316,7 +316,7 @@ fn verify_cpu_hash(t: &thread::Thread, tag: &str) {
 
 /// Ring-1 kernel event loop. Returns when no threads remain.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
-fn event_loop(first_tid: usize) {
+pub(crate) fn event_loop(first_tid: usize) {
     use crate::arch::REGS;
 
     crate::dbg_println!("event_loop entered, tid={}", first_tid);

@@ -62,8 +62,18 @@ impl Vga {
         }
     }
 
+    #[cfg(not(feature = "std"))]
     fn buffer(&mut self) -> &mut [u16] {
         unsafe { core::slice::from_raw_parts_mut(self.base as *mut u16, VGA_SIZE) }
+    }
+
+    /// Hosted: there is no VGA MMIO — back the screen buffer with a scratch
+    /// array so `clear`/`scroll` stay safe. Visible output goes via `putchar`
+    /// → stdout instead.
+    #[cfg(feature = "std")]
+    fn buffer(&mut self) -> &mut [u16] {
+        static mut SCRATCH: [u16; VGA_SIZE] = [0; VGA_SIZE];
+        unsafe { &mut *(&raw mut SCRATCH) }
     }
 
     /// Returns (column, row) cursor position.
@@ -93,6 +103,19 @@ impl Vga {
         buffer[VGA_SIZE - VGA_WIDTH..].fill(blank);
     }
 
+    /// Hosted: write straight to stdout (the host terminal interprets ANSI
+    /// itself, so no VGA buffer or escape-state machine is needed).
+    #[cfg(feature = "std")]
+    pub fn putchar(&mut self, c: u8) {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&[c]);
+        if c == b'\n' {
+            let _ = out.flush();
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
     pub fn putchar(&mut self, c: u8) {
         if !self.screen_enabled {
             return;

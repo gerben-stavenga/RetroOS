@@ -11,3 +11,13 @@
 [workspace]
 resolver = "2"
 members = ["arch-abi", "arch-interp", "kernel", "lib"]
+
+# The kernel and its freestanding lib are written for the bare-metal deployment
+# semantics (Bazel builds them at opt-level=s, where integer-overflow checks are
+# off and wrapping is relied upon — e.g. shift-by-width masking). Match that for
+# the hosted debug build so benign metal wraps don't panic. The interpreter
+# backend (arch-interp) keeps overflow checks on.
+[profile.dev.package.kernel]
+overflow-checks = false
+[profile.dev.package.lib]
+overflow-checks = false

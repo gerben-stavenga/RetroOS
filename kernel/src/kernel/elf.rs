@@ -25,19 +25,19 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
 
     let mut max_vaddr = 0usize;
 
-    // First pass: copy data (pages demand-allocated on access)
+    // First pass: copy data into the active address space through arch::mem()
+    // (pages demand-allocated on access). Going through GuestMem — rather than
+    // dereferencing `seg.vaddr` as a host pointer — is what keeps this loader
+    // backend-agnostic: on metal the guest VA is a valid kernel pointer, while
+    // on the interpreter it indexes the software MMU's address space.
+    let mem = crate::arch::mem();
     for seg in elf.segments() {
         let end = seg.vaddr + seg.memsz;
         if end > max_vaddr { max_vaddr = end; }
         if let Some(data) = seg.data {
-            unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), seg.vaddr as *mut u8, data.len());
-            }
+            mem.write_bytes(seg.vaddr, data);
             if seg.memsz > data.len() {
-                unsafe {
-                    let bss = (seg.vaddr + data.len()) as *mut u8;
-                    core::ptr::write_bytes(bss, 0, seg.memsz - data.len());
-                }
+                mem.zero(seg.vaddr + data.len(), seg.memsz - data.len());
             }
         }
     }

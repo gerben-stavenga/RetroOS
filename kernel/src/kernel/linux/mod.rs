@@ -55,7 +55,10 @@ const ENOSYS: i32 = 38;
 static mut LINUX_CONSOLE_VGA: Option<crate::kernel::dos::VgaState> = None;
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
+/// No-op on the interpreter backend, which has no VGA hardware (console output
+/// goes to stdout, not a saved/restored framebuffer).
 pub fn save_console_vga() {
+    #[cfg(not(feature = "hosted"))]
     unsafe {
         let vga = (&raw mut LINUX_CONSOLE_VGA)
             .as_mut()
@@ -70,6 +73,7 @@ pub fn save_console_vga() {
 /// the previous personality's framebuffer — keeps F11 into Linux
 /// deterministic regardless of what was last drawn.
 pub fn restore_console_vga() {
+    #[cfg(not(feature = "hosted"))]
     unsafe {
         if let Some(vga) = (&raw const LINUX_CONSOLE_VGA).as_ref().unwrap() {
             vga.restore_to_hardware();
