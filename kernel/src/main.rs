@@ -18,6 +18,7 @@ fn main() {
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut input: Option<String> = None;
+    let mut shot: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -27,8 +28,21 @@ fn main() {
             // metal. `startup()` runs the program(s), then shuts down (no DN loop).
             "--cmd" | "-c" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
+            // Periodically snapshot the guest's VGA text screen (0xB8000) to a
+            // file — lets a headless run of an interactive TUI (DN) be inspected.
+            "--screenshot" => shot = args.next(),
             _ => input = Some(a),
         }
+    }
+
+    // Arm VGA-screen snapshotting: a watcher thread flips the request flag every
+    // second; the CPU thread renders at its next slice boundary.
+    if let Some(path) = shot {
+        arch::set_dump_path(&path);
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            arch::request_vga_dump();
+        });
     }
 
     // Compose the platform: hook the device ports, and give the VGA console a

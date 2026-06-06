@@ -42,6 +42,7 @@ mod hostfs;
 mod machine;
 mod mmu;
 pub mod monitor;
+mod screendump;
 mod space;
 mod vcpu;
 
@@ -62,3 +63,7 @@ pub use mmu::new_space;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
 pub use devices::{attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon, PortIo};
+// Host-side VGA text-screen snapshotting (headless inspection of the guest's
+// 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the
+// flag from a watcher thread, the CPU thread renders at the next slice boundary.
+pub use screendump::{request as request_vga_dump, set_dump_path};

@@ -159,6 +159,9 @@ fn io_with<R>(f: impl FnOnce(&mut Unicorn<'static, Ctx>) -> R) -> R {
 /// DPL=3 gates 3/4) bubble to the kernel.
 pub fn execute() -> KernelEvent {
     io_with(|uc| loop {
+        // Service an off-thread VGA-screen snapshot request (host-thread reads
+        // the active guest space here, where it's valid).
+        crate::screendump::maybe_dump();
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
         let mode = regs.mode();
         let begin = configure(uc, regs, mode);
@@ -215,7 +218,18 @@ pub fn execute() -> KernelEvent {
             return ev;
         }
         return match run {
-            Ok(()) => KernelEvent::Irq, // whole slice retired → timer tick
+            Ok(()) => {
+                // Reaching here means NO hook fired (the intr/event blocks above
+                // returned early otherwise): the SLICE budget was fully retired.
+                // This is the ONLY true full-retire — `run.is_ok()` is also true
+                // for hook-stopped (early) slices, so the virtual clock must be
+                // charged here, not on every `Ok`. Anchoring time to retired
+                // compute (not wall time, not interrupt count) paces the guest's
+                // timer at a fixed virtual MIPS; charging early stops would race
+                // the clock and flood IRQ0 (a timer-interrupt storm).
+                crate::machine::advance_virtual_time(SLICE as u64);
+                KernelEvent::Irq // whole slice retired → timer tick
+            }
             Err(_) => KernelEvent::Fault,
         };
     })

@@ -55,12 +55,53 @@ pub fn halt_forever() -> ! {
 
 // ── Timer / IRQ queue ────────────────────────────────────────────────────
 //
-// M2 will drive these from the instruction-counted run slices (deterministic
-// timer ticks) and surface keyboard/mouse via the virtual device layer. For
-// now there are no queued events.
+// On metal `get_ticks` reads `TIMER_TICKS`, a 1 kHz counter the real PIT ISR
+// bumps; `take_pending_ticks` reports how many of those host ticks the event
+// loop hasn't consumed. The virtual PIT (`vpit.rs`) and RTC (`vrtc.rs`) read
+// `get_ticks` to compute elapsed input cycles, so the guest sees IRQ0 at its
+// programmed rate (18.2 Hz by default) and the BIOS INT 8 stub (`calls.rs`)
+// advances `0040:006C`.
+//
+// The interpreter has no PIT ISR. We must NOT derive this clock from wall time:
+// the interpreter runs the guest at full host speed (hundreds of MIPS) with no
+// pacing, so a wall-clock 55 ms tick would span tens of millions of guest
+// instructions — the guest perceives a multi-hundred-MHz CPU and period
+// software overflows its timing loops (Turbo Pascal's CRT delay calibration
+// counts loop iterations between ticks into a 16-bit word, then `DIV`s by it —
+// too many iterations #DEs with "Runtime error 200"). Instead we anchor the
+// clock to *retired guest instructions* (`advance_virtual_time`, called per run
+// slice), modelling a fixed ~VIRT_INSTR_PER_MS MIPS CPU. This both fixes the
+// calibration overflow and makes timing reproducible run-to-run.
 
-pub fn get_ticks() -> u64 { 0 }
-pub fn take_pending_ticks() -> u32 { 0 }
+/// Virtual CPU speed: guest instructions per millisecond of guest-perceived
+/// time. ~2 MIPS models a 386/486-class machine — slow enough that period
+/// delay-calibration loops keep their per-tick counts well inside 16 bits.
+const VIRT_INSTR_PER_MS: u64 = 2_000;
+
+/// Retired guest instructions, the source of virtual time.
+static VIRT_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// Advance virtual time by `instructions` retired in a run slice. Called by the
+/// CPU core (`cpu::execute`) after each `emu_start`.
+pub fn advance_virtual_time(instructions: u64) {
+    VIRT_CYCLES.fetch_add(instructions, Ordering::Relaxed);
+}
+
+/// Guest-perceived milliseconds — the interpreter's 1 kHz host tick clock,
+/// derived from retired instructions.
+pub fn get_ticks() -> u64 {
+    VIRT_CYCLES.load(Ordering::Relaxed) / VIRT_INSTR_PER_MS
+}
+
+/// Host ticks (ms) elapsed since the previous call. Drives the event loop's
+/// `Irq::Tick` pump; the vpit coalesces a burst into one pending IRQ0.
+pub fn take_pending_ticks() -> u32 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = get_ticks();
+    let last = LAST.swap(now, Ordering::Relaxed);
+    now.saturating_sub(last).min(64) as u32
+}
+
 pub fn drain(_f: impl FnMut(Irq)) {}
 
 /// Physical free-page count, for diagnostic logging only. The interpreter has
