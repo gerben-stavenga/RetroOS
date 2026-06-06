@@ -101,11 +101,28 @@ genrule(
           "-T $(location hello/hello.ld) -u _start $(location :hello_retro) -o $@",
 )
 
-# ---- stub: Turbo C MZ EXE, compiled by booting RetroOS in QEMU --------
-# QEMU is invoked as a build tool (host tool, like ld/nasm used above);
-# there's no Linux-hosted Turbo C, so TC runs inside RetroOS. qemu_tcc.sh
-# is the genrule action, not a hand-run script.
+# ---- retroos-host: the hosted interpreter backend, cargo-built ---------
+# There's no Linux-hosted Turbo C, so TC runs inside RetroOS. Rather than boot
+# the OS in QEMU, we run it on the arch-interp (interpreter) backend as an
+# ordinary host process — deterministic and headless, no VM. `build_host.sh`
+# cargo-builds the binary; the genrule is `local` because it uses the host
+# cargo + CARGO_HOME (the patched Unicorn fork). The binary is statically
+# linked, so `stub_exe` can consume it sandboxed.
+genrule(
+    name = "interp_host",
+    outs = ["retroos-host"],
+    tools = ["build_host.sh"],
+    cmd = "$(location build_host.sh) $@",
+    local = 1,
+    tags = ["no-sandbox", "requires-network"],
+    visibility = ["//visibility:public"],
+)
 
+# ---- stub: Turbo C MZ EXE, compiled by running RetroOS on the interpreter ---
+# `interp_tcc.sh` runs in-OS TCC over the interpreter's native hostfs (no
+# qemu_tcc.sh socket bridge / background reaping). Output is byte-identical to
+# the old QEMU genrule — same in-OS TCC, same input — just deterministic and
+# not flaky.
 genrule(
     name = "stub_exe",
     srcs = [
@@ -113,11 +130,10 @@ genrule(
         # Minimal dosrt-free boot image: booting //:image (which now
         # bundles modplay_exe) here would be a build cycle.
         "//:image_min",
-        "//:hostfs.py",
     ],
     outs = ["STUB.EXE"],
-    tools = ["qemu_tcc.sh"],
-    cmd = "$(location qemu_tcc.sh) $(location //:image_min) $(location //:hostfs.py) $(location stub/stub.c) $@",
+    tools = ["interp_tcc.sh", ":interp_host"],
+    cmd = "$(location interp_tcc.sh) $(location :interp_host) $(location //:image_min) $(location stub/stub.c) $@",
     # Packed onto by dosrt payloads (hello, //apps/tests/modplay, …).
     visibility = ["//visibility:public"],
 )

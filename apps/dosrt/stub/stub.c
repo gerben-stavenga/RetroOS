@@ -8,7 +8,7 @@
  * the malloc'd RLOADER buffer (selector-base trick; RLOADER linked at 0)
  * and far-jmps it. RLOADER then runs as 32-bit code.
  *
- * Stage CRLF + ASCII (TCC 2.01 aborts on LF) -- qemu_tcc.sh does that.
+ * Stage CRLF + ASCII (TCC 2.01 aborts on LF) -- interp_tcc.sh does that.
  */
 #include <stdio.h>
 #include <stdlib.h>
