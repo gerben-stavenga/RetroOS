@@ -205,12 +205,12 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
     // not gated by this flag and continue to work for text-mode programs.
     crate::vga::KERNEL_OWNS_SCREEN.store(false, core::sync::atomic::Ordering::Relaxed);
 
-    set_debug_watch(None);
+    machine.set_debug_watch(None);
 
     let tid = dos::run_init_program(machine, buf, args, cmdline_tail, cwd, env);
 
     if let Some((addr0, addr1)) = debug_watch {
-        set_debug_watch(Some((addr0, addr1)));
+        machine.set_debug_watch(Some((addr0, addr1)));
         if addr1 != 0 {
             crate::dbg_println!("[WATCH] armed write watchpoints at {:08X} and {:08X}", addr0, addr1);
         } else {
@@ -219,29 +219,6 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
     }
     event_loop(machine, tid);
 }
-
-// Hardware write-watchpoints via debug registers — a metal-only arch call. The
-// interpreter has no debug-register feature, so hosted makes this a no-op.
-#[cfg(not(feature = "hosted"))]
-fn set_debug_watch(addrs: Option<(u32, u32)>) {
-    let (count, addr0, addr1) = match addrs {
-        Some((addr0, addr1)) if addr1 != 0 => (2u32, addr0, addr1),
-        Some((addr0, _)) => (1u32, addr0, 0),
-        None => (0u32, 0, 0),
-    };
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch::arch_call::SET_DEBUG_WATCH as u32,
-            in("ebx") count,
-            in("edx") addr0,
-            in("ecx") addr1,
-        );
-    }
-}
-
-#[cfg(feature = "hosted")]
-fn set_debug_watch(_addrs: Option<(u32, u32)>) {}
 
 const ASSERT_ADDR_HASH: bool = false;
 

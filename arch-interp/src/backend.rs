@@ -71,6 +71,7 @@ impl Arch for Interp {
     // ── IRQ lines ──
     fn set_irq_line(&mut self, asserted: bool) { crate::machine::set_irq_line(asserted) }
     fn rearm_irq(&mut self, line: u8) { crate::calls::arch_rearm_irq(line) }
+    fn set_debug_watch(&mut self, _addrs: Option<(u32, u32)>) {} // no debug-register feature
 
     // ── Arch calls: paging / fork / LDT / DMA ──
     fn user_fork(&mut self, child: &mut RootPageTable) { crate::calls::arch_user_fork(child) }

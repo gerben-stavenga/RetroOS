@@ -218,6 +218,12 @@ pub trait Arch: GuestBytes + GuestOverlay {
     /// deferred guest-visible device ack.
     fn rearm_irq(&mut self, line: u8);
 
+    /// Arm hardware write-watchpoints at up to two guest-linear addresses
+    /// (`None`/missing entry disables): a `#DB` fires when the guest writes one,
+    /// for catching memory corruption. Real on metal (programs the debug
+    /// registers); a no-op on backends with no debug-register feature.
+    fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>);
+
     // ── Arch calls: paging / fork / LDT / DMA ──────────────────────────────
 
     /// COW-fork the current address space into `child` (fills the child root).
