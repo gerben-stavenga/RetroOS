@@ -8,8 +8,7 @@ extern crate ext4_view;
 use crate::kernel::{hdd, vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
-// Arch interface wrappers now live in arch::calls; these are called bare here.
-use crate::arch::{do_arch_execute, arch_switch_to, arch_user_fork, arch_free_user_pages};
+use arch_abi::Arch; // the `machine: &mut TheArch` trait methods (execute/switch_to/…)
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
 static mut ROOT_TARFS: TarFs = TarFs::new(0);
@@ -317,11 +316,19 @@ fn verify_cpu_hash(t: &thread::Thread, tag: &str) {
 /// Ring-1 kernel event loop. Returns when no threads remain.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
 pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
-    use crate::arch::REGS;
-    use arch_abi::Arch;
 
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut tid = first_tid;
+
+    // The live CPU context, owned by the loop (no global `REGS`). Seeded from
+    // the first thread's saved state; `machine.execute(&mut vcpu)` runs it and
+    // writes the post-run state back, and `switch_thread` swaps it on a context
+    // switch. Handlers receive `&mut vcpu` (disjoint from `&mut machine`), so the
+    // borrow checker — not a `static mut` — keeps register and machine state
+    // from aliasing.
+    let mut vcpu = thread::get_thread(first_tid)
+        .expect("event_loop: invalid first thread")
+        .kernel.vcpu;
 
     // Page-allocator instrumentation: every MEM_DUMP_PERIOD iterations,
     // log free physical pages and the running low-water mark. Watch the
@@ -357,7 +364,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
     let mut ev_pf: u32 = 0;
     let mut ev_exc: u32 = 0;
     let mut ev_syscall: u32 = 0;
-    // REGS already set up by startup, page tables correct from boot
+    // `vcpu` seeded from the first thread above; page tables correct from boot.
     loop {
         event_counter = event_counter.wrapping_add(1);
         if event_counter % MEM_DUMP_PERIOD == 0 {
@@ -369,7 +376,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
             last_free = free;
         }
         crate::kernel::stacktrace::set_debug_tid(tid);
-        let regs = unsafe { &mut *(&raw mut REGS) };
+        let regs = &mut vcpu;
 
         // Phase 1: drain hardware events into the running thread's personality,
         // then try to satisfy any pending pipe read.
@@ -463,7 +470,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         {
             if thread::take_switch_request() {
                 if let Some(next) = thread::cycle_next(tid) {
-                    tid = switch_thread(tid, next);
+                    tid = switch_thread(machine, &mut vcpu, tid, next);
                     continue;
                 }
             }
@@ -475,10 +482,14 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
         let ts_before_user = machine.rdtsc();
         kernel_cycles = kernel_cycles.wrapping_add(ts_before_user.wrapping_sub(last_kernel_entry));
-        let kevent = crate::arch::do_arch_execute();
+        let kevent = machine.execute(&mut vcpu);
         let ts_after_user = machine.rdtsc();
         user_cycles = user_cycles.wrapping_add(ts_after_user.wrapping_sub(ts_before_user));
         last_kernel_entry = ts_after_user;
+        // The live register frame for this iteration (post-run). Borrows the
+        // loop-owned `vcpu`; `machine.execute` above already returned, so there
+        // is no aliasing with the run.
+        let regs = &mut vcpu;
         match &kevent {
             crate::arch::monitor::KernelEvent::Irq => ev_irq += 1,
             crate::arch::monitor::KernelEvent::SoftInt(_) => ev_softint += 1,
@@ -509,8 +520,6 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
             last_profile_dump = ts_after_user;
         }
 
-        let regs = unsafe { &mut *(&raw mut REGS) };
-
         // PageFault is handled at the loop level because `signal_thread`
         // needs the full `&Thread`. Everything else dispatches through
         // the personality's `handle_event`. The `Exit(-11)` below runs
@@ -537,7 +546,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
             thread::KernelAction::Exit(code) => Some(thread::exit_thread(tid, code)),
             thread::KernelAction::Switch(next) => Some(next),
             thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, on_error, on_success } => {
-                handle_fork_exec(tid, regs, &path[..path_len], &cmdtail[..cmdtail_len], on_error, on_success)
+                handle_fork_exec(machine, regs, tid, &path[..path_len], &cmdtail[..cmdtail_len], on_error, on_success)
             }
             thread::KernelAction::Fork(_) => {
                 // TODO: implement Fork in event loop
@@ -560,7 +569,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
 
         if let Some(new_tid) = new_tid {
             if new_tid == 0 { return; } // no threads left — respawn DN
-            tid = switch_thread(tid, new_tid);
+            tid = switch_thread(machine, &mut vcpu, tid, new_tid);
         }
     }
 }
@@ -578,7 +587,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
 /// before `arch_user_clean` unmapped 0xA0000 (re-reading would fault). If
 /// a parent wants the dying child's farewell screen to persist, it calls
 /// `SYNTH_VGA_TAKE` explicitly — the kernel makes no inheritance policy.
-fn switch_thread(tid: usize, new_tid: usize) -> usize {
+fn switch_thread(machine: &mut crate::TheArch, live: &mut crate::arch::Vcpu, tid: usize, new_tid: usize) -> usize {
     if new_tid == tid { return tid; }
     let (old, new) = thread::get_two_threads(tid, new_tid);
     if old.kernel.state != thread::ThreadState::Zombie {
@@ -589,10 +598,10 @@ fn switch_thread(tid: usize, new_tid: usize) -> usize {
     let mut swap_fx = new.kernel.fx_state;
     if ASSERT_ADDR_HASH {
         let mut hash = new.kernel.addr_hash;
-        arch_switch_to(&mut swap_vcpu, &mut hash, &mut swap_fx);
+        machine.switch_to(live, &mut swap_vcpu, &mut hash, &mut swap_fx);
         old.kernel.addr_hash = hash;
     } else {
-        arch_switch_to(&mut swap_vcpu, core::ptr::null_mut(), &mut swap_fx);
+        machine.switch_to(live, &mut swap_vcpu, core::ptr::null_mut(), &mut swap_fx);
     }
     old.kernel.vcpu = swap_vcpu;
     old.kernel.fx_state = swap_fx;
@@ -605,8 +614,9 @@ fn switch_thread(tid: usize, new_tid: usize) -> usize {
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
 /// Blocks parent, returns child tid on success, None on error (caller stays on parent).
 fn handle_fork_exec(
+    machine: &mut crate::TheArch,
+    vcpu: &mut crate::arch::Vcpu,
     parent_tid: usize,
-    regs: &mut crate::Regs,
     path: &[u8],
     cmdtail: &[u8],
     on_error: fn(&mut crate::Regs, i32),
@@ -651,36 +661,36 @@ fn handle_fork_exec(
 
     let buf = match exec::load_file_resolved(path) {
         Ok(b) => b,
-        Err(_) => { on_error(regs, 2); return None; }
+        Err(_) => { on_error(&mut vcpu.regs, 2); return None; }
     };
 
     let format = exec::detect_format(&buf, path);
     crate::dbg_println!("handle_fork_exec: {:?} size={} format={} free_pages={}",
         core::str::from_utf8(path), buf.len(),
         match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" },
-        crate::arch::free_page_count());
+        machine.free_page_count());
 
     // COW-fork parent address space for child
     let mut child_root = crate::RootPageTable::empty();
-    arch_user_fork(&mut child_root);
+    machine.user_fork(&mut child_root);
 
     let child = match thread::create_thread(Some(parent_tid), child_root, true) {
         Some(t) => t,
-        None => { on_error(regs, 8); return None; }
+        None => { on_error(&mut vcpu.regs, 8); return None; }
     };
     let child_tid = child.kernel.tid as usize;
 
-    // Save parent's user regs (in REGS) before the swap — exec_dos_into
+    // Save parent's user regs (the live frame) before the swap — exec_dos_into
     // bundles address-space setup + init_process_thread_vm86, which would
     // overwrite the parent state that the first swap parks in child.vcpu.regs.
-    let parent_regs = *regs;
+    let parent_regs = vcpu.regs;
 
-    arch_switch_to(&mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
+    machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
 
     // ELF needs user pages freed before loading; DOS handles its own address space
     if matches!(format, exec::BinaryFormat::Elf) {
         crate::dbg_println!("  fork done, loading ELF...");
-        arch_free_user_pages();
+        machine.free_user_pages();
     }
 
     let args = alloc::vec![path.to_vec()];
@@ -689,9 +699,9 @@ fn handle_fork_exec(
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
     if let Err(_) = exec::init_thread(child_tid, buf, path, args, cmdtail, env, cwd) {
         let child = thread::get_thread(child_tid).unwrap();
-        arch_switch_to(&mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
+        machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(child_tid, 1);
-        on_error(regs, 11);
+        on_error(&mut vcpu.regs, 11);
         return None;
     }
 
@@ -699,10 +709,10 @@ fn handle_fork_exec(
     // Swap back to parent's address space. Save child's cpu_state (set by
     // init_thread) and restore after — the swap would overwrite it.
     let saved_cpu = child.kernel.vcpu.regs;
-    arch_switch_to(&mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
+    machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
     child.kernel.vcpu.regs = saved_cpu;
-    // Restore parent's user regs into REGS (the swap left stale data there).
-    *regs = parent_regs;
+    // Restore parent's user regs into the live frame (the swap left stale data).
+    vcpu.regs = parent_regs;
 
     match &mut child.personality {
         thread::Personality::Linux(lin) => {
@@ -728,11 +738,10 @@ fn handle_fork_exec(
                 let dos_state = child.dos_mut();
                 dos_state.pc.vga.save_from_hardware();
             }
-            use crate::arch::{inb, outb};
-            outb(0x3D4, 0x0E);
-            let cursor_hi = inb(0x3D5) as u16;
-            outb(0x3D4, 0x0F);
-            let cursor_lo = inb(0x3D5) as u16;
+            machine.outb(0x3D4, 0x0E);
+            let cursor_hi = machine.inb(0x3D5) as u16;
+            machine.outb(0x3D4, 0x0F);
+            let cursor_lo = machine.inb(0x3D5) as u16;
             let cursor_off = (cursor_hi << 8) | cursor_lo;
             let col = (cursor_off % 80) as u8;
             let row = (cursor_off / 80) as u8;
@@ -747,7 +756,7 @@ fn handle_fork_exec(
     // when focus returns to it. No kernel-side blocking — the focused thread
     // runs continuously, so polling is just a status query.
     crate::dbg_println!("  child tid={}, parent tid={} continues without blocking", child_tid, parent_tid);
-    on_success(regs, child_tid as i32);
+    on_success(&mut vcpu.regs, child_tid as i32);
     Some(child_tid)
 }
 
