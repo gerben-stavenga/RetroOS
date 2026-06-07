@@ -8,30 +8,11 @@
 
 use crate::space::RootPageTable;
 use crate::vcpu::{self, Vcpu};
-use arch_abi::{Arch, GuestBytes, GuestOverlay, Irq, KernelEvent, Regs};
+use arch_abi::{Arch, Irq, KernelEvent, Regs};
 
 /// The interpreter backend handle. Zero-sized today (state lives in module
 /// statics); it gains fields as the globals migrate into it.
 pub struct Interp;
-
-impl GuestBytes for Interp {
-    fn read<T: Copy>(&self, addr: usize) -> T { vcpu::mem().read(addr) }
-    fn write<T: Copy>(&mut self, addr: usize, val: T) { vcpu::mem().write(addr, val) }
-    fn slice(&self, addr: usize, len: usize) -> &[u8] { vcpu::mem().slice(addr, len) }
-    fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { vcpu::mem().slice_mut(addr, len) }
-    fn c_str(&self, addr: usize, max: usize) -> &[u8] { vcpu::mem().c_str(addr, max) }
-    fn zero(&mut self, addr: usize, len: usize) { vcpu::mem().zero(addr, len) }
-    fn write_bytes(&mut self, addr: usize, src: &[u8]) { vcpu::mem().write_bytes(addr, src) }
-}
-
-impl GuestOverlay for Interp {
-    fn at<T>(&mut self, addr: usize) -> &mut T {
-        // Tie the placed ref's lifetime to `&mut self` (not `'static`).
-        let p = vcpu::mem().slice_mut(addr, core::mem::size_of::<T>()).as_mut_ptr() as *mut T;
-        unsafe { &mut *p }
-    }
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize) { vcpu::mem().copy_within(src, dst, len) }
-}
 
 impl Arch for Interp {
     type PageTable = RootPageTable;

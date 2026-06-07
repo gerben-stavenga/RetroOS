@@ -32,6 +32,15 @@ impl GuestBytes for RootPageTable {
     fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
 }
 
+impl arch_abi::GuestOverlay for RootPageTable {
+    fn at<T>(&mut self, addr: usize) -> &mut T {
+        // Tie the placed ref's lifetime to `&mut self` (not `'static`).
+        let p = mem().slice_mut(addr, core::mem::size_of::<T>()).as_mut_ptr() as *mut T;
+        unsafe { &mut *p }
+    }
+    fn copy_within(&mut self, src: usize, dst: usize, len: usize) { mem().copy_within(src, dst, len) }
+}
+
 /// The live execution context while the kernel runs (the interpreter's analogue
 /// of metal's `traps::REGS`). Single-core: one global Vcpu that `do_arch_execute`
 /// syncs to/from the software CPU before/after each run slice.

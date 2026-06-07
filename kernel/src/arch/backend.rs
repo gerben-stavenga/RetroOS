@@ -8,33 +8,13 @@
 //! backends symmetric against the shared `trait Arch`.
 
 use super::paging2::RootPageTable;
-use super::vcpu::mem;
 use super::x86::FxState;
-use arch_abi::{Arch, GuestBytes, GuestOverlay, Irq, KernelEvent, Regs, Vcpu};
+use arch_abi::{Arch, Irq, KernelEvent, Regs, Vcpu};
 
 /// The bare-metal backend handle. Zero-sized today (state lives in module
 /// statics — `traps::REGS`, the timer/IRQ queue); it gains fields as those
 /// globals migrate into it.
 pub struct Metal;
-
-impl GuestBytes for Metal {
-    fn read<T: Copy>(&self, addr: usize) -> T { mem().read(addr) }
-    fn write<T: Copy>(&mut self, addr: usize, val: T) { mem().write(addr, val) }
-    fn slice(&self, addr: usize, len: usize) -> &[u8] { mem().slice(addr, len) }
-    fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { mem().slice_mut(addr, len) }
-    fn c_str(&self, addr: usize, max: usize) -> &[u8] { mem().c_str(addr, max) }
-    fn zero(&mut self, addr: usize, len: usize) { mem().zero(addr, len) }
-    fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
-}
-
-impl GuestOverlay for Metal {
-    fn at<T>(&mut self, addr: usize) -> &mut T {
-        // Tie the placed ref's lifetime to `&mut self` (not `'static`).
-        let p = mem().slice_mut(addr, core::mem::size_of::<T>()).as_mut_ptr() as *mut T;
-        unsafe { &mut *p }
-    }
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize) { mem().copy_within(src, dst, len) }
-}
 
 impl Arch for Metal {
     type PageTable = RootPageTable;

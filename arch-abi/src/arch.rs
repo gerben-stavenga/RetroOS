@@ -127,9 +127,11 @@ impl<P: Default> Vcpu<P> {
 }
 
 /// A `Vcpu` reaches guest memory through the address space it names — forward
-/// every `GuestBytes` op to `self.space` (the backend supplies the real impl on
-/// its page-table type). This is what keeps `regs.read(addr)` working across the
-/// DOS/Linux personalities without the kernel knowing the backend.
+/// every memory op to `self.space` (the backend supplies the real impl on its
+/// page-table type). The `Vcpu` is *the* guest-memory handle: registers + the
+/// address space they run against, in one object, which the kernel already holds
+/// as `regs`/`vcpu` in every handler. So `regs.read(addr)` is the single way the
+/// kernel touches guest memory — there is no separate machine-side accessor.
 impl<P: GuestBytes> GuestBytes for Vcpu<P> {
     fn read<T: Copy>(&self, addr: usize) -> T { self.space.read(addr) }
     fn write<T: Copy>(&mut self, addr: usize, val: T) { self.space.write(addr, val) }
@@ -140,6 +142,11 @@ impl<P: GuestBytes> GuestBytes for Vcpu<P> {
     fn write_bytes(&mut self, addr: usize, src: &[u8]) { self.space.write_bytes(addr, src) }
 }
 
+impl<P: GuestOverlay> GuestOverlay for Vcpu<P> {
+    fn at<T>(&mut self, addr: usize) -> &mut T { self.space.at(addr) }
+    fn copy_within(&mut self, src: usize, dst: usize, len: usize) { self.space.copy_within(src, dst, len) }
+}
+
 // =============================================================================
 // The backend contract
 // =============================================================================
@@ -147,19 +154,17 @@ impl<P: GuestBytes> GuestBytes for Vcpu<P> {
 /// The full kernel→arch boundary. One value implements this per CPU; the kernel
 /// threads `&mut impl Arch` through `startup` and the event loop.
 ///
-/// `Arch: GuestBytes + GuestOverlay` so `arch.read(addr)` reaches the active
-/// address space. Because `PageTable: GuestBytes`, a thread's `Vcpu` is
-/// `GuestBytes` too (via the blanket impl), so the kernel can reach a thread's
-/// memory through the `Vcpu` it already holds.
-///
-/// Method grouping mirrors the old free-function surface (`kernel/src/arch/`):
-/// port I/O, execution/scheduling, the timer, IRQ lines, the page-table/fork/
-/// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers the DOS
-/// personality needs.
-pub trait Arch: GuestBytes + GuestOverlay {
-    /// Backend page-table root type stored in `Vcpu::space`. It is the canonical
-    /// `GuestBytes` implementor — the active address space's memory primitive.
-    type PageTable: GuestBytes + Copy + Default;
+/// `Arch` is deliberately **not** a memory accessor. Guest memory belongs to the
+/// address space, which the running thread's `Vcpu` carries (`Vcpu::space`); the
+/// kernel reads/writes it through the `Vcpu` it already holds (`regs.read(addr)`).
+/// So there is exactly one guest-memory path — the vcpu — and `Arch` is just the
+/// rest of the machine: CPU exec, ports, timer, IRQ lines, the page-table/fork/
+/// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
+pub trait Arch {
+    /// Backend page-table root type stored in `Vcpu::space`. It is the guest-
+    /// memory primitive — `GuestBytes`/`GuestOverlay` route through it, which is
+    /// what makes `vcpu.read(addr)` work.
+    type PageTable: GuestBytes + GuestOverlay + Copy + Default;
     /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
     type Fx: Copy;
 
