@@ -109,7 +109,8 @@ fn main() {
     // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
     arch::enter_raw_mode();
     spawn_keyboard();
-    kernel::startup();
+    let mut machine = kernel::new_arch();
+    kernel::startup(&mut machine);
 }
 
 /// Spawn the stdin → keyboard pump: read host terminal bytes, translate each to

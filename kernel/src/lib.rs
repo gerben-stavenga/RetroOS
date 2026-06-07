@@ -171,7 +171,8 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     let t = thread::get_thread(tid).expect("thread");
     arch::set_current_vcpu(t.kernel.vcpu);
     dbg_println!("[host] running 32-bit Linux ELF, interpreted");
-    kernel::startup::event_loop(tid);
+    let mut machine = new_arch();
+    kernel::startup::event_loop(&mut machine, tid);
     dbg_println!("[host] guest exited");
     arch::shutdown();
 }

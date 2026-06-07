@@ -126,5 +126,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
 
     descriptors::enter_ring1();
 
-    crate::kernel::startup::startup();
+    // The arch backend handle, threaded as `&mut` through the kernel from here
+    // on so its mutable state is borrow-checked rather than global. Lives for
+    // the rest of the kernel's life (startup never returns).
+    let mut machine = crate::new_arch();
+    crate::kernel::startup::startup(&mut machine);
 }

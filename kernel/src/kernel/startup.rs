@@ -19,7 +19,7 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 
 /// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
-pub fn startup() -> ! {
+pub fn startup(machine: &mut crate::TheArch) -> ! {
     // Heap must be live before any kernel code allocates. Arch only depends
     // on phys_mm during boot; everything heap-using lives at or below this
     // entry point.
@@ -129,7 +129,7 @@ pub fn startup() -> ! {
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            run_dos_program(path, tail, cwd, &master_env);
+            run_dos_program(machine, path, tail, cwd, &master_env);
         }
         println!("All commands done — shutting down.");
         crate::arch::shutdown();
@@ -154,7 +154,7 @@ pub fn startup() -> ! {
         // first would shadow it with). Include/lib paths come from
         // BORLANDC\BIN\TURBOC.CFG / TLINK.CFG (-I/-L), which BCC and TLINK read
         // from their own EXE directory, so no INCLUDE/LIB env is needed.
-        run_dos_program(
+        run_dos_program(machine, 
             b"BORLANDC/BIN/BCC.EXE",
             b"-mt -lt BOOT\\SRC\\COMMAND.C",
             b"",
@@ -164,7 +164,7 @@ pub fn startup() -> ! {
     } else if crate::kernel::exec::load_file_resolved(b"boot/TC/TCC.EXE").is_ok() {
         println!("Building COMMAND.COM from BOOT\\SRC\\COMMAND.C via TC...");
         // Hermetic env: only PATH so TCC can find TLINK; bypasses CONFIG.SYS.
-        run_dos_program(
+        run_dos_program(machine, 
             b"boot/TC/TCC.EXE",
             b"-mt -lt BOOT\\SRC\\COMMAND.C",
             b"",
@@ -177,7 +177,7 @@ pub fn startup() -> ! {
 
     println!("Starting DN...");
     loop {
-        run_dos_program(b"boot/DN/DN.COM", b"", b"", &master_env);
+        run_dos_program(machine, b"boot/DN/DN.COM", b"", b"", &master_env);
         println!("DN exited, restarting...");
     }
 }
@@ -185,7 +185,7 @@ pub fn startup() -> ! {
 /// Load a DOS program (.COM or MZ .EXE) into a fresh VM86 thread and run the
 /// event loop until it exits. `cmdline_tail` is written to PSP:0080h (without
 /// the length byte or terminator; those are added automatically).
-fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8]) {
+fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8]) {
     use crate::kernel::{dos, exec};
 
     let buf = exec::load_file_resolved(path)
@@ -215,7 +215,7 @@ fn run_dos_program(path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8]) {
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(tid);
+    event_loop(machine, tid);
 }
 
 // Hardware write-watchpoints via debug registers — a metal-only arch call. The
@@ -316,8 +316,9 @@ fn verify_cpu_hash(t: &thread::Thread, tag: &str) {
 
 /// Ring-1 kernel event loop. Returns when no threads remain.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
-pub(crate) fn event_loop(first_tid: usize) {
+pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
     use crate::arch::REGS;
+    use arch_abi::Arch;
 
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut tid = first_tid;
@@ -328,7 +329,7 @@ pub(crate) fn event_loop(first_tid: usize) {
     // only — does not clobber user VGA.
     const MEM_DUMP_PERIOD: u64 = 1000;
     let mut event_counter: u64 = 0;
-    let mut min_free: usize = crate::arch::free_page_count();
+    let mut min_free: usize = machine.free_page_count();
     let mut last_free: usize = min_free;
     // crate::dbg_println!("[mem] start free={}", min_free);
 
@@ -338,7 +339,7 @@ pub(crate) fn event_loop(first_tid: usize) {
     // bottleneck or our trap/event handling is.
     let mut user_cycles: u64 = 0;
     let mut kernel_cycles: u64 = 0;
-    let mut last_kernel_entry = crate::arch::rdtsc();
+    let mut last_kernel_entry = machine.rdtsc();
     let mut last_profile_dump = last_kernel_entry;
     // Roughly assume 2 GHz host; only used to format the dump as ms. Off
     // by a constant factor across runs but the user/kernel ratio is exact.
@@ -360,7 +361,7 @@ pub(crate) fn event_loop(first_tid: usize) {
     loop {
         event_counter = event_counter.wrapping_add(1);
         if event_counter % MEM_DUMP_PERIOD == 0 {
-            let free = crate::arch::free_page_count();
+            let free = machine.free_page_count();
             if free < min_free { min_free = free; }
             let _delta = (free as i64) - (last_free as i64);
             // crate::dbg_println!("[mem] iter={} free={} delta={} min={}",
@@ -378,12 +379,12 @@ pub(crate) fn event_loop(first_tid: usize) {
             match &mut thread.personality {
                 thread::Personality::Dos(dos) => {
                     let is_blocked = kt.state == thread::ThreadState::Blocked;
-                    let ticks = crate::arch::take_pending_ticks();
+                    let ticks = machine.take_pending_ticks();
                     for _ in 0..ticks {
                         crate::kernel::dos::queue_irq(dos, crate::arch::Irq::Tick);
                     }
                     let dp = dos as *mut thread::DosState;
-                    crate::arch::drain(|evt| {
+                    machine.drain(&mut |evt| {
                         if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
                             thread::request_switch();
                         } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
@@ -414,7 +415,7 @@ pub(crate) fn event_loop(first_tid: usize) {
                 thread::Personality::Linux(linux) => {
                     let ktp = kt as *mut thread::KernelThread;
                     let lp = linux as *mut thread::LinuxState;
-                    crate::arch::drain(|evt| {
+                    machine.drain(&mut |evt| {
                         if let crate::arch::Irq::Key(sc) = evt {
                             if sc == F11_PRESS {
                                 thread::request_switch();
@@ -472,10 +473,10 @@ pub(crate) fn event_loop(first_tid: usize) {
 
         // Phase 3: run user code and dispatch the resulting event.
         let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
-        let ts_before_user = crate::arch::rdtsc();
+        let ts_before_user = machine.rdtsc();
         kernel_cycles = kernel_cycles.wrapping_add(ts_before_user.wrapping_sub(last_kernel_entry));
         let kevent = crate::arch::do_arch_execute();
-        let ts_after_user = crate::arch::rdtsc();
+        let ts_after_user = machine.rdtsc();
         user_cycles = user_cycles.wrapping_add(ts_after_user.wrapping_sub(ts_before_user));
         last_kernel_entry = ts_after_user;
         match &kevent {
