@@ -166,7 +166,7 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     // Load the ELF (segments + argv/envp/auxv stack) into the active space and
     // set the thread's entry registers. Default argv = [path] when none given.
     let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
-    if let Err(e) = kernel::linux::exec_elf_into(tid, &data, path, &argv) {
+    if let Err(e) = kernel::linux::exec_elf_into(&mut machine, tid, &data, path, &argv) {
         dbg_println!("[host] exec failed: errno {}", e);
         arch::shutdown();
     }

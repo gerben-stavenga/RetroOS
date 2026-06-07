@@ -4,7 +4,7 @@
 //! Page tables are allocated on-demand via the page fault handler.
 
 const PAGE_SIZE: usize = 4096;
-use crate::arch::arch_set_page_flags;
+use arch_abi::Arch;
 pub use lib::elf::{ElfError, ElfClass};
 
 /// User stack top address (just below kernel space)
@@ -20,7 +20,7 @@ pub struct LoadedElf {
 }
 
 /// Load an ELF executable into user address space
-pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
+pub fn load_elf(machine: &mut crate::TheArch, elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
     let mut max_vaddr = 0usize;
@@ -51,7 +51,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
             let end_page = (seg.vaddr + seg.memsz + PAGE_SIZE - 1) / PAGE_SIZE;
             let count = end_page - start_page;
             if count > 0 {
-                arch_set_page_flags(start_page, count, seg.is_writable(), executable_pass);
+                machine.set_page_flags(start_page, count, seg.is_writable(), executable_pass);
             }
         }
     }

@@ -15,6 +15,7 @@
 //! completes and the guest hangs on a black screen — this is the Monkey Island
 //! / SCUMM startup-splash hang.
 
+use arch_abi::Arch;
 const HOST_TIMER_HZ: u64 = 1000;
 
 pub struct VirtualRtc {
@@ -38,14 +39,14 @@ pub struct VirtualRtc {
 }
 
 impl VirtualRtc {
-    pub fn new() -> Self {
+    pub fn new(machine: &mut crate::TheArch) -> Self {
         Self {
             // Power-on defaults of a typical PC RTC: reg A = 0x26 (32 kHz time
             // base, 1024 Hz periodic rate), reg B = 0x02 (24-hour, BCD).
             reg_a: 0x26,
             reg_b: 0x02,
             reg_c: 0,
-            last_host_tick: crate::arch::get_ticks(),
+            last_host_tick: machine.get_ticks(),
             frac_accum: 0,
         }
     }
@@ -73,7 +74,7 @@ impl VirtualRtc {
         }
     }
 
-    pub fn write(&mut self, idx: u8, val: u8) {
+    pub fn write(&mut self, machine: &mut crate::TheArch, idx: u8, val: u8) {
         match idx {
             0x0A => self.reg_a = val & 0x7F, // UIP is read-only
             0x0B => {
@@ -84,7 +85,7 @@ impl VirtualRtc {
                 // tick lands a full period later rather than immediately —
                 // otherwise stale elapsed host time would fire a burst at once.
                 if now_pie && !was_pie {
-                    self.last_host_tick = crate::arch::get_ticks();
+                    self.last_host_tick = machine.get_ticks();
                     self.frac_accum = 0;
                 }
             }
@@ -111,7 +112,7 @@ impl VirtualRtc {
     /// enabled. When non-zero it latches PF/IRQF for the next reg C read. Like
     /// the PIT, repeated intervals coalesce into a single edge at the vPIC — a
     /// slow guest loses intervals rather than flooding, matching real hardware.
-    pub fn take_pending_irqs(&mut self) -> u32 {
+    pub fn take_pending_irqs(&mut self, machine: &mut crate::TheArch) -> u32 {
         if self.reg_b & 0x40 == 0 {
             return 0; // PIE disabled
         }
@@ -119,7 +120,7 @@ impl VirtualRtc {
         if hz == 0 {
             return 0;
         }
-        let now = crate::arch::get_ticks();
+        let now = machine.get_ticks();
         let delta = now.saturating_sub(self.last_host_tick);
         if delta == 0 {
             return 0;

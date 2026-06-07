@@ -86,14 +86,14 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 ///   pass `Vec::new()` for non-DOS execs or initial loads with no parent.
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
-pub fn init_thread(tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) -> Result<(), i32> {
+pub fn init_thread(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) -> Result<(), i32> {
     match detect_format(&data, path) {
         BinaryFormat::Elf => {
-            crate::kernel::linux::exec_elf_into(tid, &data, path, &args)
+            crate::kernel::linux::exec_elf_into(machine, tid, &data, path, &args)
         }
         fmt => {
             let is_exe = matches!(fmt, BinaryFormat::MzExe);
-            crate::kernel::dos::exec_dos_into(tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd);
+            crate::kernel::dos::exec_dos_into(machine, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd);
             Ok(())
         }
     }

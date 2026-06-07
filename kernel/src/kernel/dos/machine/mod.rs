@@ -296,19 +296,19 @@ impl PcMachine {
         self.vpic.has_deliverable() || (self.mouse.cb_mask & self.mouse.pending_cond != 0)
     }
 
-    pub fn new() -> Self {
+    pub fn new(machine: &mut crate::TheArch) -> Self {
         // A20 starts disabled. HMA_PAGE wraps to user's private low memory
         // by copying entries[0..16]. HMA_SHADOW_PAGE is left not-present
         // (arch_user_clean cleared it; map_low_mem_user doesn't touch it),
         // which is the correct A20-on state when no extended memory is
         // allocated — set_a20(true) will swap not-present into HMA_PAGE
         // so HMA accesses fault until XMS maps real extended memory.
-        crate::arch::arch_copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
+        machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
         Self {
             a20_enabled: false,
-            vpit: VirtualPit::new(),
+            vpit: VirtualPit::new(machine),
             vpic: VirtualPic::new(),
-            vrtc: VirtualRtc::new(),
+            vrtc: VirtualRtc::new(machine),
             vkbd: VirtualKeyboard::new(),
             mouse: MouseState::new(),
             skip_irq: false,
@@ -447,7 +447,7 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
             };
             if ready { 1 } else { 0 }
         }
-        0x40 => pc.vpit.read_counter0(),
+        0x40 => pc.vpit.read_counter0(machine),
         0x41 | 0x42 => 0,
         // PIT command register not readable
         0x43 => 0xFF,
@@ -546,8 +546,8 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16,
         0x61 => pc.vkbd.write_port61(val),
         // Keyboard controller command
         0x64 => {}
-        0x43 => pc.vpit.write_command(val),
-        0x40 => pc.vpit.write_counter0(val),
+        0x43 => pc.vpit.write_command(machine, val),
+        0x40 => pc.vpit.write_counter0(machine, val),
         0x41 | 0x42 => {}
         // CMOS index: latch for the next data-port read. Mask off the NMI
         // disable bit (0x80) — we never want guest writes to toggle host NMI.
@@ -555,7 +555,7 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16,
         // CMOS data writes to the virtual RTC status registers (A/B/C) drive
         // the periodic-interrupt model; writes to any other index are dropped
         // so the guest can never mutate host CMOS (time-of-day, alarm, etc.).
-        0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.write(pc.cmos_index, val),
+        0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.write(machine, pc.cmos_index, val),
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
@@ -654,6 +654,20 @@ pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs:
 
 /// Buffer a hardware event into the virtual PIC / keyboard.
 /// Mode-independent: both VM86 and DPMI share the same virtual devices.
+/// Advance the host-timer-driven PIT/RTC and raise IRQ0/IRQ8 if a period
+/// elapsed. The tick has no host payload — it queries `machine`'s timer — so it
+/// is separate from `queue_irq` (which runs inside the input-queue drain, where
+/// `machine` is borrowed). Edge-triggered: the IRR coalesces repeated ticks into
+/// one pending line, so a slow guest loses ticks rather than flooding.
+pub fn queue_tick(machine: &mut crate::TheArch, pc: &mut PcMachine) {
+    if pc.vpit.take_pending_irqs(machine) > 0 {
+        pc.vpic.raise(0);
+    }
+    if pc.vrtc.take_pending_irqs(machine) > 0 {
+        pc.vpic.raise(8);
+    }
+}
+
 pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
     use crate::arch::Irq;
     match event {
@@ -671,22 +685,10 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
                 pc.vpic.raise(1);
             }
         }
-        Irq::Tick => {
-            // Edge-triggered: the IRR coalesces repeated ticks into one pending
-            // IRQ0, so a slow guest loses ticks rather than flooding — exactly
-            // real-hardware behaviour. `take_pending_irqs` keeps the PIT model
-            // honest about how many fired.
-            if pc.vpit.take_pending_irqs() > 0 {
-                pc.vpic.raise(0);
-            }
-            // RTC periodic interrupt (IRQ8) shares the host timer. When the
-            // guest has enabled PIE (CMOS reg B), drive IRQ8 at the programmed
-            // rate so the BIOS INT 70h ISR can complete INT 15h AH=86h waits.
-            // Edge-triggered like the PIT: coalesce into one pending line.
-            if pc.vrtc.take_pending_irqs() > 0 {
-                pc.vpic.raise(8);
-            }
-        }
+        // Ticks carry no host payload and need the machine timer, so they come
+        // through `queue_tick` (which has `&mut machine`), never here — the
+        // input-queue drain only ever delivers Key/Mouse events.
+        Irq::Tick => {}
         Irq::Mouse { dx, dy, buttons } => {
             // No physical mouse hardware is modelled (no PS/2 ports, no
             // IRQ 12 line) and every DOS program reaches the mouse through

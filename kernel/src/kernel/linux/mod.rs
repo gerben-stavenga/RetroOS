@@ -586,8 +586,8 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub fn exec_elf_into(tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
-    let loaded = elf::load_elf(data).map_err(|_| 8)?; // ENOEXEC
+pub fn exec_elf_into(machine: &mut crate::TheArch, tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
+    let loaded = elf::load_elf(machine, data).map_err(|_| 8)?; // ENOEXEC
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
     let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
@@ -846,7 +846,7 @@ fn sys_execve(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux
         machine.free_user_pages();
     }
 
-    if let Err(_) = exec::init_thread(tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
+    if let Err(_) = exec::init_thread(machine, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
         return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(machine, tid, -ENOEXEC)) };
     }
 

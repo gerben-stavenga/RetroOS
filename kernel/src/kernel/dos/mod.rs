@@ -229,10 +229,10 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
 }
 
 impl DosState {
-    pub fn new() -> Self {
+    pub fn new(machine: &mut crate::TheArch) -> Self {
         let ldt = fresh_ldt();
         let mut dos = DosState {
-            pc: machine::PcMachine::new(),
+            pc: machine::PcMachine::new(machine),
             dta: 0,
             heap_seg: 0xA000,
             heap_base_seg: 0xA000,
@@ -584,11 +584,11 @@ pub fn handle_event(
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
-pub fn exec_dos_into(tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) {
+pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) {
     use crate::kernel::startup;
 
-    crate::arch::arch_user_clean();
-    crate::arch::arch_map_low_mem();
+    machine.free_user_pages();
+    machine.map_low_mem();
     dos::setup_ivt();
 
     // args[0] is VFS-form (from exec fan-out); convert to drive-qualified
@@ -604,7 +604,7 @@ pub fn exec_dos_into(tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>
     // Initialize a fresh DosState and seed the heap chain at heap_start so
     // the upcoming dos_alloc_block calls (env, then program block) carve
     // env_seg = heap_start + 1, psp_seg = env_seg + 0x10 = heap_start + 17.
-    let mut new_state = DosState::new();
+    let mut new_state = DosState::new(machine);
     new_state.dfs.init_from_vfs(&parent_cwd);
     // In-place exec replaces (drops) the old DosState — release its SB
     // DMA pool binding first, else the global pool stays held forever.
@@ -674,7 +674,7 @@ pub fn run_init_program(machine: &mut crate::TheArch, buf: Vec<u8>, args: Vec<Ve
     let dos_len = dfs::vfs_to_dos(path, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
 
-    let mut new_state = DosState::new();
+    let mut new_state = DosState::new(machine);
     new_state.dfs.init_from_vfs(&cwd);
     if let thread::Personality::Dos(old) = &mut t.personality {
         old.pc.sb.release_dma_pool();
@@ -791,6 +791,14 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Regs) {
 /// Queue an arch IRQ into this thread's virtual PIC.
 pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
     machine::queue_irq(&mut dos.pc, irq);
+}
+
+/// Advance the virtual PIT/RTC against the machine timer and raise IRQ0/IRQ8 on
+/// a period boundary. Separate from `queue_irq` because the tick queries
+/// `machine` (it has no host payload), and `queue_irq` runs inside the input
+/// drain where `machine` is already borrowed.
+pub fn queue_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState) {
+    machine::queue_tick(machine, &mut dos.pc);
 }
 
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery

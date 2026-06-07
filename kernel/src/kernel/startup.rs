@@ -388,7 +388,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
                     let is_blocked = kt.state == thread::ThreadState::Blocked;
                     let ticks = machine.take_pending_ticks();
                     for _ in 0..ticks {
-                        crate::kernel::dos::queue_irq(dos, crate::arch::Irq::Tick);
+                        crate::kernel::dos::queue_tick(machine, dos);
                     }
                     let dp = dos as *mut thread::DosState;
                     machine.drain(&mut |evt| {
@@ -697,7 +697,7 @@ fn handle_fork_exec(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if let Err(_) = exec::init_thread(child_tid, buf, path, args, cmdtail, env, cwd) {
+    if let Err(_) = exec::init_thread(machine, child_tid, buf, path, args, cmdtail, env, cwd) {
         let child = thread::get_thread(child_tid).unwrap();
         machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(machine, child_tid, 1);
