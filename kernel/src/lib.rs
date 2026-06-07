@@ -144,6 +144,10 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     kernel::heap::init();
     thread::init_threading();
 
+    // The arch backend handle, threaded as `&mut` through thread creation and
+    // the event loop (same as the metal/disk path).
+    let mut machine = new_arch();
+
     // Console stdin pipe (kernel is the phantom writer, as in startup()).
     let cpipe = kernel::kpipe::alloc().expect("console pipe");
     kernel::kpipe::add_writer(cpipe);
@@ -151,7 +155,7 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
 
     // Fresh process thread in the initial (active) address space.
     let tid = {
-        let t = thread::create_thread(None, RootPageTable::empty(), true).expect("create thread");
+        let t = thread::create_thread(&mut machine, None, RootPageTable::empty(), true).expect("create thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
         t.kernel.fds[2] = thread::FdKind::ConsoleOut;
@@ -167,11 +171,8 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
         arch::shutdown();
     }
 
-    // Seed the live execution context and run the real kernel event loop.
-    let t = thread::get_thread(tid).expect("thread");
-    arch::set_current_vcpu(t.kernel.vcpu);
+    // Run the real kernel event loop (it seeds its live vcpu from the thread).
     dbg_println!("[host] running 32-bit Linux ELF, interpreted");
-    let mut machine = new_arch();
     kernel::startup::event_loop(&mut machine, tid);
     dbg_println!("[host] guest exited");
     arch::shutdown();

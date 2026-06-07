@@ -273,13 +273,13 @@ impl DosState {
     /// state, restore A20. The screen snapshot is handled by `suspend`,
     /// which `exit_thread` calls separately before `arch_user_clean`
     /// unmaps the 0xA0000 framebuffer. Called from `thread::exit_thread`.
-    pub fn on_exit(&mut self) {
+    pub fn on_exit(&mut self, machine: &mut crate::TheArch) {
         if let Some(ref mut ems) = self.ems {
             ems.free_all_pages();
         }
         self.ems = None;
         self.xms = None;
-        self.pc.set_a20(true);
+        self.pc.set_a20(machine, true);
         // Hand the single global ISA-DMA pool back; a dying thread that
         // armed SB DMA must not poison it for the next program.
         self.pc.sb.release_dma_pool();
@@ -486,19 +486,19 @@ pub fn handle_event(
             }
         }
         KE::In { port, size } => {
-            machine::handle_in_event(&mut dos.pc, regs, port, size.bytes());
+            machine::handle_in_event(machine, &mut dos.pc, regs, port, size.bytes());
             thread::KernelAction::Done
         }
         KE::Out { port, size } => {
-            machine::handle_out_event(&mut dos.pc, regs, port, size.bytes());
+            machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
             thread::KernelAction::Done
         }
         KE::Ins { size } => {
-            machine::handle_ins_event(&mut dos.pc, regs, size.bytes());
+            machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes());
             thread::KernelAction::Done
         }
         KE::Outs { size } => {
-            machine::handle_outs_event(&mut dos.pc, regs, size.bytes());
+            machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes());
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
@@ -662,7 +662,7 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
 pub fn run_init_program(machine: &mut crate::TheArch, buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
     use crate::kernel::startup;
 
-    let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
+    let t = thread::create_thread(machine, None, crate::RootPageTable::empty(), true)
         .expect("Failed to create DOS thread");
     let tid = t.kernel.tid as usize;
 

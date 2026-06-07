@@ -3,6 +3,7 @@
 //! Pure bookkeeping over the VM86 linear address space above the HMA + A20
 //! shadow region. Physical backing comes from the kernel's demand paging.
 
+use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::kernel::dos::linear;
 use crate::arch::Vcpu;
@@ -115,7 +116,7 @@ fn xms_state(dos: &mut thread::DosState) -> &mut XmsState {
     dos.xms.as_deref_mut().unwrap()
 }
 
-pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(crate) fn xms_dispatch(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — Get XMS version
@@ -128,7 +129,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> threa
         0x03 => {
             let xms = xms_state(dos);
             xms.a20_global += 1;
-            dos.pc.set_a20(true);
+            dos.pc.set_a20(machine, true);
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
             regs.rbx = regs.rbx & !0xFFFF; // BL=0 no error
         }
@@ -137,7 +138,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> threa
             let xms = xms_state(dos);
             xms.a20_global = xms.a20_global.saturating_sub(1);
             if xms.a20_global == 0 && xms.a20_local == 0 {
-                dos.pc.set_a20(false);
+                dos.pc.set_a20(machine, false);
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = regs.rbx & !0xFFFF;
@@ -146,7 +147,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> threa
         0x05 => {
             let xms = xms_state(dos);
             xms.a20_local += 1;
-            dos.pc.set_a20(true);
+            dos.pc.set_a20(machine, true);
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = regs.rbx & !0xFFFF;
         }
@@ -155,7 +156,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> threa
             let xms = xms_state(dos);
             xms.a20_local = xms.a20_local.saturating_sub(1);
             if xms.a20_local == 0 && xms.a20_global == 0 {
-                dos.pc.set_a20(false);
+                dos.pc.set_a20(machine, false);
             }
             regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = regs.rbx & !0xFFFF;
@@ -335,7 +336,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> threa
         // AH=10h — Request Upper Memory Block (DX=size in paragraphs)
         0x10 => {
             let size = regs.rdx as u16;
-            match umb_alloc(size) {
+            match umb_alloc(machine, size) {
                 Some((seg, paras)) => {
                     regs.rax = (regs.rax & !0xFFFF) | 1; // success
                     regs.rbx = (regs.rbx & !0xFFFF) | seg as u64;
@@ -352,7 +353,7 @@ pub(crate) fn xms_dispatch(dos: &mut thread::DosState, regs: &mut Vcpu) -> threa
         // AH=11h — Release Upper Memory Block (DX=segment)
         0x11 => {
             let seg = regs.rdx as u16;
-            if umb_free(seg) {
+            if umb_free(machine, seg) {
                 regs.rax = (regs.rax & !0xFFFF) | 1; // success
             } else {
                 regs.rax = regs.rax & !0xFFFF; // failure
@@ -531,7 +532,7 @@ fn umb_avail() -> u64 {
 
 /// Allocate a UMB of at least `paragraphs` size (1 paragraph = 16 bytes).
 /// Returns (segment, paragraphs_allocated) or None.
-fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
+fn umb_alloc(machine: &mut crate::TheArch, paragraphs: u16) -> Option<(u16, u16)> {
     let pages_needed = ((paragraphs as usize) * 16 + 0xFFF) / 0x1000;
     if pages_needed == 0 { return None; }
 
@@ -549,7 +550,7 @@ fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
                 }
                 or64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, alloc_mask);
                 let base_page = UMA_BASE + run_start;
-                crate::arch::arch_unmap_range(base_page, pages_needed);
+                machine.unmap_range(base_page, pages_needed);
                 let seg = (base_page as u16) * 0x100;
                 let paras = (pages_needed as u16) * 0x100;
                 return Some((seg, paras));
@@ -562,7 +563,7 @@ fn umb_alloc(paragraphs: u16) -> Option<(u16, u16)> {
 }
 
 /// Free a UMB by segment address.
-fn umb_free(segment: u16) -> bool {
+fn umb_free(machine: &mut crate::TheArch, segment: u16) -> bool {
     let page = (segment / 0x100) as usize;
     if page < UMA_BASE || page >= UMA_END { return false; }
     let offset = page - UMA_BASE;
@@ -578,7 +579,7 @@ fn umb_free(segment: u16) -> bool {
     }
     let count = (i - offset) as usize;
     and64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, !mask);
-    crate::arch::arch_free_range(page, count);
+    machine.free_range(page, count);
     true
 }
 

@@ -235,7 +235,7 @@ pub(super) fn rm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::Ke
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
     let action = match slot {
-        SLOT_XMS => xms_dispatch(dos, regs),
+        SLOT_XMS => xms_dispatch(machine, dos, regs),
         SLOT_DPMI_ENTRY => {
             dpmi::dpmi_enter(dos, regs);
             thread::KernelAction::Done

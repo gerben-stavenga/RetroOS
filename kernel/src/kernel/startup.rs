@@ -535,7 +535,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
             let kt = &mut thread.kernel;
             match &mut thread.personality {
                 thread::Personality::Dos(dos) => crate::kernel::dos::handle_event(machine, kt, dos, regs, kevent),
-                thread::Personality::Linux(linux) => crate::kernel::linux::handle_event(kt, linux, regs, kevent),
+                thread::Personality::Linux(linux) => crate::kernel::linux::handle_event(machine, kt, linux, regs, kevent),
             }
         };
 
@@ -543,7 +543,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         let new_tid: Option<usize> = match action {
             thread::KernelAction::Done => None,
             thread::KernelAction::Yield => thread::yield_thread(tid, regs),
-            thread::KernelAction::Exit(code) => Some(thread::exit_thread(tid, code)),
+            thread::KernelAction::Exit(code) => Some(thread::exit_thread(machine, tid, code)),
             thread::KernelAction::Switch(next) => Some(next),
             thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, on_error, on_success } => {
                 handle_fork_exec(machine, regs, tid, &path[..path_len], &cmdtail[..cmdtail_len], on_error, on_success)
@@ -674,7 +674,7 @@ fn handle_fork_exec(
     let mut child_root = crate::RootPageTable::empty();
     machine.user_fork(&mut child_root);
 
-    let child = match thread::create_thread(Some(parent_tid), child_root, true) {
+    let child = match thread::create_thread(machine, Some(parent_tid), child_root, true) {
         Some(t) => t,
         None => { on_error(&mut vcpu.regs, 8); return None; }
     };
@@ -700,7 +700,7 @@ fn handle_fork_exec(
     if let Err(_) = exec::init_thread(child_tid, buf, path, args, cmdtail, env, cwd) {
         let child = thread::get_thread(child_tid).unwrap();
         machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
-        thread::exit_thread(child_tid, 1);
+        thread::exit_thread(machine, child_tid, 1);
         on_error(&mut vcpu.regs, 11);
         return None;
     }
