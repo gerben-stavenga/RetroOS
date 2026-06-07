@@ -11,6 +11,13 @@ use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
 pub const KERNEL_PHYS: usize = 0x0010_0000;
 
+/// Metal debug-log sink: emit one byte to the 0xE9 debug port. Installed into
+/// the kernel console via `set_debug_sink` so the kernel logs without ever
+/// issuing a port op itself.
+fn log_byte_0xe9(b: u8) {
+    x86::outb(0xE9, b);
+}
+
 /// Magic value the Multiboot bootloader places in EAX before jumping to us.
 const MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2BAD_B002;
 
@@ -44,6 +51,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
     );
     // Update VGA base for paged addressing before any println
     vga::vga().base = LOW_MEM_BASE + 0xB8000;
+
+    // Install the kernel's debug-log sink: on metal, a byte to the 0xE9 debug
+    // port. Logging is a platform concern, not an arch call — the kernel never
+    // touches a port itself; it just hands bytes to this sink.
+    crate::vga::set_debug_sink(log_byte_0xe9);
 
     // Switch to flat GDT (base=0) + IDT + TSS immediately after paging.
     // Offset segments are no longer needed — paging maps KERNEL_BASE to KERNEL_PHYS.

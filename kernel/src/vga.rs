@@ -2,24 +2,41 @@
 //!
 //! The framebuffer *renderer* is `lib::vga` — a pure function from bytes to a
 //! cell slice, with no I/O (so it stays a freestanding `lib` util, shared with
-//! the bootloader). This module adds the parts that cross the arch boundary:
-//! the debug-console / output stream on port `0xE9`, driven through
-//! `arch::outb` — a real `out` instruction on metal, the `PortIo` device bus on
-//! the interpreter — plus the `print!`/`println!`/`dbg_*!` macros.
+//! the bootloader). This module adds the kernel text console: the `print!` /
+//! `println!` / `dbg_*!` macros plus the byte sink they mirror to.
+//!
+//! Logging is a *platform* concern, not an arch one — it must work ambiently
+//! (no `&mut machine` to thread into a `println!`) and even mid-panic. So the
+//! sink is a function pointer the platform installs once at startup, instead of
+//! going through the `arch` boundary: metal installs an `out 0xE9, al` emitter;
+//! the hosted binary installs a plain stderr (or log-file) writer. The kernel
+//! itself never touches a port to log.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 // Re-export the renderer so `crate::vga::{vga, KERNEL_OWNS_SCREEN}` keep working
 // (cursor/clear/base live on the lib `Vga`).
 pub use lib::vga::{vga, Vga, KERNEL_OWNS_SCREEN};
 
-/// Debug console / output-stream port. `arch::outb` issues a real `out` on
-/// metal and routes to the `PortIo` debug-console device on the interpreter.
-const DEBUGCON: u16 = 0xE9;
+/// The platform-installed debug-output sink (`fn(u8)` stored as its address; 0 =
+/// none yet, in which case bytes are dropped). Write-only and panic-safe: a
+/// plain atomic load + indirect call, no locks, no `&mut` state.
+static DEBUG_SINK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the platform debug-output sink. Called once, early, by the platform
+/// entry point (metal `boot_kernel`, hosted `main`) before anything logs.
+pub fn set_debug_sink(f: fn(u8)) {
+    DEBUG_SINK.store(f as usize, Ordering::Relaxed);
+}
 
 #[inline]
 fn stream(b: u8) {
-    crate::arch::outb(DEBUGCON, b);
+    let p = DEBUG_SINK.load(Ordering::Relaxed);
+    if p != 0 {
+        let f: fn(u8) = unsafe { core::mem::transmute(p) };
+        f(b);
+    }
 }
 
 /// Write one byte to the console: render it to the framebuffer and mirror it to
