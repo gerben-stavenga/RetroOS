@@ -39,7 +39,7 @@ fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Vcpu) -> thread
 /// initiated return trampolines, entry points, and the PMDOS INT 21
 /// short-circuit live here.
 /// Slot = (EIP - STUB_BASE - 2) / 2.
-pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn pm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
@@ -53,7 +53,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(kt: &mut thread::KernelThread, do
 
     match slot {
         dos::SLOT_PMDOS_INT21 => {
-            return super::super::dos::pmdos_int21_handler(kt, dos, regs);
+            return super::super::dos::pmdos_int21_handler(machine, kt, dos, regs);
         }
         dos::SLOT_PMDOS_INT33 => {
             return super::super::dos::pmdos_int33_handler(dos, regs);

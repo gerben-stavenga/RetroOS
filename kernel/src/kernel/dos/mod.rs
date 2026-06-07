@@ -289,8 +289,8 @@ impl DosState {
     /// DOS thread. Encapsulates any per-resume side effects (right now: point
     /// LDTR at this thread's LDT). Keeps the LDT layout private to the dos
     /// module — external code never touches `self.ldt`.
-    pub fn on_resume(&self) {
-        crate::arch::arch_load_ldt(&self.ldt[..]);
+    pub fn on_resume(&self, machine: &mut crate::TheArch) {
+        machine.load_ldt(&self.ldt[..]);
     }
 
     /// Called when the thread loses focus. Snapshots the VGA framebuffer
@@ -411,6 +411,7 @@ fn linear(dos: &thread::DosState, regs: &Vcpu, seg: u16, off: u32) -> u32 {
 /// Lives at the personality root because INT 31h spans both submodules
 /// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi`).
 pub fn syscall(
+    machine: &mut crate::TheArch,
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,
     regs: &mut Vcpu,
@@ -419,10 +420,10 @@ pub fn syscall(
     let mode = regs.mode();
     let cs = if mode == UserMode::VM86 { machine::vm86_cs(regs) } else { regs.code_seg() };
     match (mode, cs) {
-        (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(kt, dos, regs),
+        (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(machine, kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(dos, regs),
-        (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(kt, dos, regs),
+        (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, kt, dos, regs),
         _                                       => dpmi::dpmi_api(dos, regs),
     }
 }
@@ -457,7 +458,7 @@ pub fn handle_event(
                 // Kernel syscall — `syscall` branches on mode + CS to reach
                 // the right RM/PM dispatcher. Runs even on non-DPMI threads
                 // (HW-IRQ default reflection lands here too).
-                syscall(kt, dos, regs)
+                syscall(machine, kt, dos, regs)
             } else {
                 // Invariants: VM86 only ever traps INT 31h (only entry in
                 // the TSS bitmap), and the only path into PM is DPMI. So a
@@ -658,14 +659,14 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
 /// Set up the initial DOS thread for a fresh program load (no parent).
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
-pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
+pub fn run_init_program(machine: &mut crate::TheArch, buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
     use crate::kernel::startup;
 
     let t = thread::create_thread(None, crate::RootPageTable::empty(), true)
         .expect("Failed to create DOS thread");
     let tid = t.kernel.tid as usize;
 
-    crate::arch::arch_map_low_mem();
+    machine.map_low_mem();
     dos::setup_ivt();
 
     let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
@@ -702,11 +703,12 @@ pub fn run_init_program(buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>,
     let m = crate::arch::mem();
     m.write::<u8>(0x450, col as u8);
     m.write::<u8>(0x451, row as u8);
-    crate::arch::set_current_vcpu(t.kernel.vcpu);
+    // (The event loop seeds its live vcpu from this thread's saved state, so no
+    // separate "set current vcpu" is needed here.)
     // Initial thread never goes through a context switch, so load LDTR
     // directly here. Subsequent threads pick this up via `on_resume` in the
     // event-loop switch path.
-    t.dos_mut().on_resume();
+    t.dos_mut().on_resume(machine);
     tid
 }
 

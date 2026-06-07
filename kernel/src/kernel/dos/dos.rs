@@ -165,6 +165,7 @@ fn park_at_slot_resume(regs: &mut Vcpu) {
 /// The caller is responsible for any mode-specific frame housekeeping after
 /// the call (V86 stack pop, PM return-frame restore, etc.).
 pub(crate) fn dispatch_kernel_syscall(
+    machine: &mut crate::TheArch,
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,
     regs: &mut Vcpu,
@@ -176,11 +177,11 @@ pub(crate) fn dispatch_kernel_syscall(
         0x20 => {
             if let Some(parent) = dos.exec_parent.take() {
                 dos.last_child_exit_status = 0x0000;
-                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
+                return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
             }
             thread::KernelAction::Exit(0)
         }
-        0x21 => int_21h(kt, dos, regs),
+        0x21 => int_21h(machine, kt, dos, regs),
         0x33 => int_33h(dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error
         0x25 | 0x26 => {
@@ -220,7 +221,7 @@ pub(crate) fn dispatch_kernel_syscall(
 /// VM86 stack from the original INT; far-call stubs have a CS/IP frame from
 /// CALL FAR. The kernel pops these frames directly — no RETF/RETF 2 in the
 /// stub. Caller (`syscall`) has already checked CS == STUB_SEG.
-pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn rm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     let cs = vm86_cs(regs);
     debug_assert_eq!(cs, STUB_SEG, "rm_stub_dispatch: CS must be STUB_SEG");
@@ -260,7 +261,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             // restores the handler's result to the caller.
             let caller_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
             machine::set_vm86_flags(regs, caller_flags as u32);
-            let action = dispatch_kernel_syscall(kt, dos, regs, slot);
+            let action = dispatch_kernel_syscall(machine, kt, dos, regs, slot);
             // Exit replaces thread state outright — skip the iret-frame
             // pop entirely. Anything else (Done, ForkExec, Yield, Switch)
             // leaves the issuing thread alive and needs regs.CS:EIP
@@ -359,7 +360,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 /// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
-pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn pmdos_int21_handler(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     // 16-bit DPMI clients issue INT 21h with 16-bit register parameters; the
     // high 16 bits of EAX..EBP are undefined and real (16-bit) DOS never
     // touches them. Zero them for the duration of servicing so every handler's
@@ -383,7 +384,7 @@ pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut threa
         s
     } else { [0u64; 7] };
 
-    let action = int_21h(kt, dos, regs);
+    let action = int_21h(machine, kt, dos, regs);
 
     if mask16 {
         regs.rax = (regs.rax & !HI) | saved_hi[0];
@@ -792,7 +793,7 @@ fn dos_error_from_errno(err: i32) -> u16 {
 // DOS INT 21h — DOS services
 // ============================================================================
 
-fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
     // running clients), 02/06/09 (character/string output — exception
@@ -1255,7 +1256,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if let Some(parent) = dos.exec_parent.take() {
                 // Termination type 00h (normal) | return code in AL.
                 dos.last_child_exit_status = (regs.rax as u8) as u16;
-                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
+                return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
             }
             let code = regs.rax as u8;
             thread::KernelAction::Exit(code as i32)
@@ -1286,7 +1287,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 // to RM via 0306, then TSRs — leaves the PM session usable
                 // by subsequent programs that enter via the raw-switch
                 // trampoline.
-                let action = exec_return(dos, regs, parent, /*preserve_pm_env=*/true);
+                let action = exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/true);
                 dos_keep_resident_block(dos, child_psp_seg, keep, child_psp_seg);
                 dos_trace!("D21 31 TSR kept resident block {:04X}+{:04X} top={:04X}",
                     child_psp_seg, keep, resident_top);
@@ -1776,7 +1777,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x4B: EXEC — Load and Execute Program
         // AL=00: load+execute, DS:DX=ASCIIZ filename, ES:BX=param block
         0x4B => {
-            exec_program(kt, dos, regs)
+            exec_program(machine, kt, dos, regs)
         }
         // AH=2Ah — Get System Date
         0x2A => {
@@ -2536,7 +2537,7 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs:
 /// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C
 /// which interprets BAT itself and uses synth INT 31h AH=01h to
 /// fork+exec+wait each external command in a separate thread.
-fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let al = regs.rax as u8;
     match al {
         0x00 => {}                                  // load & execute — fall through
@@ -2719,7 +2720,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     super::dpmi::install_kernel_ldt_slots(dos);
     super::dpmi::reset_pm_vectors(dos);
     // Reload LDTR after swapping in the child LDT.
-    dos.on_resume();
+    dos.on_resume(machine);
     dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
@@ -2867,7 +2868,7 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return(dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
+fn exec_return(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
     crate::dbg_println!("exec_return: parent ss:sp={:04X}:{:04X} ds={:04X} es={:04X} heap={:04X} psp={:04X}",
         parent.ss, parent.sp, parent.ds, parent.es, parent.heap_seg, parent.psp);
@@ -2933,7 +2934,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
     }
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
-    dos.on_resume();
+    dos.on_resume(machine);
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }

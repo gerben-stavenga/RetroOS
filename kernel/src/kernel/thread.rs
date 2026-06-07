@@ -134,10 +134,10 @@ impl Personality {
     /// Swap-in hook: rebind per-thread CPU state. Called every time a thread
     /// becomes the running thread, regardless of whether it's also taking
     /// focus visually.
-    pub fn on_resume(&mut self) {
+    pub fn on_resume(&mut self, machine: &mut crate::TheArch) {
         match self {
-            Self::Dos(d) => d.on_resume(),
-            Self::Linux(l) => l.on_resume(),
+            Self::Dos(d) => d.on_resume(machine),
+            Self::Linux(l) => l.on_resume(machine),
         }
     }
 }

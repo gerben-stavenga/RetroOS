@@ -204,7 +204,7 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
 
     set_debug_watch(None);
 
-    let tid = dos::run_init_program(buf, args, cmdline_tail, cwd, env);
+    let tid = dos::run_init_program(machine, buf, args, cmdline_tail, cwd, env);
 
     if let Some((addr0, addr1)) = debug_watch_config() {
         set_debug_watch(Some((addr0, addr1)));
@@ -607,7 +607,7 @@ fn switch_thread(machine: &mut crate::TheArch, live: &mut crate::arch::Vcpu, tid
     old.kernel.fx_state = swap_fx;
     old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
     new.personality.materialize();
-    new.personality.on_resume();
+    new.personality.on_resume(machine);
     new_tid
 }
 

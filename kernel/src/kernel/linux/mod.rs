@@ -21,6 +21,7 @@ macro_rules! linux_trace {
 }
 
 use arch_abi::GuestBytes;
+use arch_abi::Arch; // `machine: &mut TheArch` trait methods (set_tls_entry, user_fork, …)
 use crate::kernel::elf;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::startup;
@@ -160,9 +161,9 @@ impl LinuxState {
 
     /// Called on every swap-in (whether or not we're refocusing): rebind
     /// per-thread CPU state and finalize a deferred wait4 status write.
-    pub fn on_resume(&mut self) {
+    pub fn on_resume(&mut self, machine: &mut crate::TheArch) {
         if self.tls_entry >= 0 {
-            crate::arch::arch_set_tls_entry(
+            machine.set_tls_entry(
                 self.tls_entry, self.tls_base,
                 self.tls_limit, self.tls_limit_in_pages,
             );
