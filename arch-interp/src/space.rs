@@ -14,6 +14,10 @@ impl RootPageTable {
     }
 }
 
+impl Default for RootPageTable {
+    fn default() -> Self { RootPageTable::empty() }
+}
+
 /// Interpreter analogue of the metal kernel's statically-allocated page-table
 /// frames. The hosted kernel has no boot-time paging bring-up, so nothing
 /// constructs this; it exists only for surface parity with the metal backend.

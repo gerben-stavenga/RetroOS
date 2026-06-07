@@ -80,7 +80,7 @@ const _: () = assert!(core::mem::size_of::<Regs>() == core::mem::size_of::<Raw32
 /// memory. `REGS.space` tracks the current thread's address space (set at
 /// thread switch); it is not consulted by the memory API, which always hits
 /// the active page tables.
-pub(crate) static mut REGS: Vcpu = Vcpu::empty();
+pub(crate) static mut REGS: Vcpu = Vcpu::new(Regs::empty(), paging2::RootPageTable::empty());
 
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)

@@ -43,6 +43,7 @@
 //! in the continuation so one return path can write results back, restore
 //! GP regs, and restore `other_stack`.
 
+use arch_abi::GuestBytes;
 use super::dos;
 use crate::arch::Vcpu;
 use super::machine;

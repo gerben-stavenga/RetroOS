@@ -34,6 +34,7 @@ pub use arch_abi::{
     USER_CS, USER_CS64, USER_DS,
 };
 
+mod backend;
 mod bios;
 mod calls;
 mod cpu;
@@ -48,6 +49,7 @@ mod space;
 mod tty;
 mod vcpu;
 
+pub use backend::Interp;
 pub use calls::*;
 pub use machine::{
     clean_fx_template, drain, free_page_count, get_ticks, halt_forever, inb, inw, outb, outw,

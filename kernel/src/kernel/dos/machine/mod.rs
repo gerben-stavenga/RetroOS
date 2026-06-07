@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+use arch_abi::GuestBytes;
 use crate::Regs;
 use crate::arch::Vcpu;
 

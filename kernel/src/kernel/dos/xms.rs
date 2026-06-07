@@ -3,6 +3,7 @@
 //! Pure bookkeeping over the VM86 linear address space above the HMA + A20
 //! shadow region. Physical backing comes from the kernel's demand paging.
 
+use arch_abi::GuestBytes;
 use crate::kernel::dos::linear;
 use crate::arch::Vcpu;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};

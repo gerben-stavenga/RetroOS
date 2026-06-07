@@ -1,3 +1,4 @@
+use arch_abi::GuestBytes;
 use super::*;
 use crate::arch::Vcpu;
 use super::super::mode_transitions;

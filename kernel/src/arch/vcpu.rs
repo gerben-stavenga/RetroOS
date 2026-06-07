@@ -12,55 +12,30 @@
 //! kernel-facing shape of this type does not change.
 
 use crate::Regs;
+use arch_abi::GuestBytes;
 use super::paging2::RootPageTable;
 
-/// Register state + address-space handle for one execution context.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Vcpu {
-    /// Architectural register state, including the program counter
-    /// (`regs.frame.rip`) and the mode (32/64/VM86, derived from CS/EFLAGS).
-    pub regs: Regs,
-    /// Handle to the address space these registers execute in. For single-core
-    /// this is the full per-thread page-table root; the arch context switch
-    /// swaps it into the constant root page on entry.
-    pub space: RootPageTable,
-}
+/// Register state + address-space handle for one execution context. The shape is
+/// shared across backends, so it is `arch_abi::Vcpu<P>` over this backend's
+/// page-table type. Derefs to `Regs` so every `regs.rax` / `regs.mode()` keeps
+/// working and a `&mut Vcpu` coerces where a `&mut Regs` is expected. Guest
+/// memory comes from the blanket `GuestBytes for Vcpu<P>` impl in `arch-abi`,
+/// forwarding to the `GuestBytes for RootPageTable` impl below.
+pub type Vcpu = arch_abi::Vcpu<RootPageTable>;
 
-/// A Vcpu *is* its registers plus a way to reach the memory they run against.
-/// Deref to `Regs` so every `regs.rax` / `regs.mode()` keeps working when a
-/// `&mut Vcpu` is passed where a `&mut Regs` used to be, and so an unconverted
-/// `fn f(regs: &mut Regs)` still accepts a `&mut Vcpu` by coercion. The extra
-/// surface a Vcpu adds over Regs is the user-memory API below.
-impl core::ops::Deref for Vcpu {
-    type Target = Regs;
-    fn deref(&self) -> &Regs { &self.regs }
-}
-impl core::ops::DerefMut for Vcpu {
-    fn deref_mut(&mut self) -> &mut Regs { &mut self.regs }
-}
-
-impl Vcpu {
-    pub const fn empty() -> Self {
-        Vcpu { regs: Regs::empty(), space: RootPageTable::empty() }
-    }
-
-    // ── Address-space memory access ─────────────────────────────────────
-    //
-    // A Vcpu exposes the memory of the address space it runs in. The actual
-    // access lives in `GuestMem` (obtained via `mem()` / `arch::mem()`); these
-    // are thin forwarders for code that already holds the running Vcpu. The
-    // `&self`/`&mut self` here is a borrow contract — a returned slice can't
-    // outlive a teardown of the space (which needs `&mut` access) — but the
-    // bytes are reached through the active mapping, not stored in the Vcpu.
-
-    pub fn slice(&self, addr: usize, len: usize) -> &[u8] { mem().slice(addr, len) }
-    pub fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { mem().slice_mut(addr, len) }
-    pub fn c_str(&self, addr: usize, max: usize) -> &[u8] { mem().c_str(addr, max) }
-    pub fn read<T: Copy>(&self, addr: usize) -> T { mem().read(addr) }
-    pub fn write<T: Copy>(&mut self, addr: usize, val: T) { mem().write(addr, val) }
-    pub fn zero(&mut self, addr: usize, len: usize) { mem().zero(addr, len) }
-    pub fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
+/// The metal guest-memory primitive: on the ring-1 kernel a guest-linear address
+/// *is* a host pointer (shared page tables), so these dereference it directly via
+/// `mem()`. The raw access stays confined here; kernel/dos code holds no
+/// `unsafe`. `self` (the page-table root) is not consulted — `mem()` reaches the
+/// active mapping, matching the prior `Vcpu` forwarder behaviour.
+impl GuestBytes for RootPageTable {
+    fn slice(&self, addr: usize, len: usize) -> &[u8] { mem().slice(addr, len) }
+    fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { mem().slice_mut(addr, len) }
+    fn c_str(&self, addr: usize, max: usize) -> &[u8] { mem().c_str(addr, max) }
+    fn read<T: Copy>(&self, addr: usize) -> T { mem().read(addr) }
+    fn write<T: Copy>(&mut self, addr: usize, val: T) { mem().write(addr, val) }
+    fn zero(&mut self, addr: usize, len: usize) { mem().zero(addr, len) }
+    fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
 }
 
 /// The active address space's memory interface — `arch::mem()`.

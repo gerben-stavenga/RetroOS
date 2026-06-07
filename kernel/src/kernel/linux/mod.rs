@@ -20,6 +20,7 @@ macro_rules! linux_trace {
     };
 }
 
+use arch_abi::GuestBytes;
 use crate::kernel::elf;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::startup;

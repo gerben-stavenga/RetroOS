@@ -8,43 +8,34 @@
 
 use crate::mmu;
 use crate::space::RootPageTable;
-use arch_abi::Regs;
+use arch_abi::{GuestBytes, Regs};
 
-/// Register state + address-space handle for one execution context.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Vcpu {
-    pub regs: Regs,
-    pub space: RootPageTable,
-}
+/// Register state + address-space handle for one execution context. The shape
+/// is shared across backends, so it is `arch_abi::Vcpu<P>` parameterized over
+/// this backend's page-table type. Guest-memory access comes from the blanket
+/// `GuestBytes for Vcpu<P>` impl in `arch-abi`, which forwards to the
+/// `GuestBytes for RootPageTable` impl below.
+pub type Vcpu = arch_abi::Vcpu<RootPageTable>;
 
-impl core::ops::Deref for Vcpu {
-    type Target = Regs;
-    fn deref(&self) -> &Regs { &self.regs }
-}
-impl core::ops::DerefMut for Vcpu {
-    fn deref_mut(&mut self) -> &mut Regs { &mut self.regs }
-}
-
-impl Vcpu {
-    pub const fn empty() -> Self {
-        Vcpu { regs: Regs::empty(), space: RootPageTable::empty() }
-    }
-
-    // Thin forwarders over the active address space's memory (see `GuestMem`).
-    pub fn slice(&self, addr: usize, len: usize) -> &[u8] { mem().slice(addr, len) }
-    pub fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { mem().slice_mut(addr, len) }
-    pub fn c_str(&self, addr: usize, max: usize) -> &[u8] { mem().c_str(addr, max) }
-    pub fn read<T: Copy>(&self, addr: usize) -> T { mem().read(addr) }
-    pub fn write<T: Copy>(&mut self, addr: usize, val: T) { mem().write(addr, val) }
-    pub fn zero(&mut self, addr: usize, len: usize) { mem().zero(addr, len) }
-    pub fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
+/// The one real guest-memory primitive on this backend: index the active
+/// guest-RAM buffer (`mem()`). The forwarders that used to be inherent methods
+/// on `Vcpu` now hang off the page-table handle, which is where `arch-abi`'s
+/// blanket `Vcpu`/`Arch` `GuestBytes` impls route. `self` (the space id) is not
+/// consulted — `mem()` is the *active* space, matching the prior behaviour.
+impl GuestBytes for RootPageTable {
+    fn slice(&self, addr: usize, len: usize) -> &[u8] { mem().slice(addr, len) }
+    fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { mem().slice_mut(addr, len) }
+    fn c_str(&self, addr: usize, max: usize) -> &[u8] { mem().c_str(addr, max) }
+    fn read<T: Copy>(&self, addr: usize) -> T { mem().read(addr) }
+    fn write<T: Copy>(&mut self, addr: usize, val: T) { mem().write(addr, val) }
+    fn zero(&mut self, addr: usize, len: usize) { mem().zero(addr, len) }
+    fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
 }
 
 /// The live execution context while the kernel runs (the interpreter's analogue
 /// of metal's `traps::REGS`). Single-core: one global Vcpu that `do_arch_execute`
 /// syncs to/from the software CPU before/after each run slice.
-pub static mut REGS: Vcpu = Vcpu::empty();
+pub static mut REGS: Vcpu = Vcpu::new(Regs::empty(), RootPageTable::empty());
 
 /// Seed the live execution context. The `static mut` access is confined here.
 pub fn set_current_vcpu(v: Vcpu) {

@@ -17,6 +17,9 @@
 
 #![no_std]
 
+mod arch;
+pub use arch::{Arch, GuestBytes, GuestOverlay, Vcpu};
+
 // =============================================================================
 // Guest-visible selector values (ABI-fixed across backends)
 // =============================================================================

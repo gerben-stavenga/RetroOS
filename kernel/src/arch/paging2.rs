@@ -125,6 +125,10 @@ pub union RootPageTable {
 struct HwPdpt([u64; 4]);
 static mut HW_PDPT: HwPdpt = HwPdpt([0; 4]);
 
+impl Default for RootPageTable {
+    fn default() -> Self { RootPageTable::empty() }
+}
+
 impl RootPageTable {
     pub const fn empty() -> Self {
         RootPageTable { e32: [Entry32(0); 768] }

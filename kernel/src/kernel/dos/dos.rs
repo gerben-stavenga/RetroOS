@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+use arch_abi::GuestBytes;
 use crate::kernel::thread;
 use crate::arch::Vcpu;
 use crate::vga;
