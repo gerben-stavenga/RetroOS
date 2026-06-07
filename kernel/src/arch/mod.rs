@@ -49,6 +49,13 @@ pub use x86::rdtsc;
 pub use x86::{FxState, clean_fx_template};
 pub use irq::{get_ticks, take_pending_ticks, drain};
 
+/// Assert/deassert the CPU INTR line from the virtual PIC. On metal the real
+/// 8259 drives INTR in hardware, so this is a no-op; the interpreter backend
+/// uses it to make its software CPU re-check for a pending IRQ at a basic-block
+/// boundary (see `retroos_arch_interp::set_irq_line`).
+#[inline]
+pub fn set_irq_line(_asserted: bool) {}
+
 /// Physical free-page count, for diagnostic logging. Walks PAGE_REFS;
 /// O(MAX_PAGES) but small (~64 KB scan) and only called from instrumentation.
 pub fn free_page_count() -> usize {

@@ -56,6 +56,34 @@ thread_local! {
     static MACHINE: RefCell<Option<Unicorn<'static, Ctx>>> = const { RefCell::new(None) };
 }
 
+/// Real-mode `INT`/fault reflection done *in place* on the live Unicorn state:
+/// push FLAGS/CS/IP, vector CS:IP through the IVT, clear IF/TF. Called from the
+/// intr hook so `emu_start` runs straight through the handler (like TCG's
+/// `do_interrupt`) instead of bouncing to the kernel per int — letting the batch
+/// retire a full slice. Mirrors `monitor::sw_reflect_vm86_int`, but on `uc`.
+fn reflect_vm86_inline<'a>(uc: &mut Unicorn<'a, Ctx>, vector: u8) {
+    use RegisterX86 as R;
+    let cs = uc.reg_read(R::CS).unwrap_or(0) as u16;
+    let ip = uc.reg_read(R::EIP).unwrap_or(0) as u16;
+    let flags = uc.reg_read(R::EFLAGS).unwrap_or(0) as u32;
+    let ss = uc.reg_read(R::SS).unwrap_or(0) as u32;
+    let mut sp = uc.reg_read(R::ESP).unwrap_or(0) as u16;
+    // Guest memory (IVT, stack) goes through the software MMU, not `uc` — the IVT
+    // page isn't mapped into Unicorn (the guest never touches it; we do).
+    let m = crate::vcpu::mem();
+    let base = ss << 4;
+    for word in [flags as u16, cs, ip] {
+        sp = sp.wrapping_sub(2);
+        m.write::<u16>((base + sp as u32) as usize, word);
+    }
+    let new_ip = m.read::<u16>(vector as usize * 4);
+    let new_cs = m.read::<u16>(vector as usize * 4 + 2);
+    let _ = uc.reg_write(R::ESP, sp as u64);
+    let _ = uc.reg_write(R::CS, new_cs as u64);
+    let _ = uc.reg_write(R::EIP, new_ip as u64);
+    let _ = uc.reg_write(R::EFLAGS, (flags & !0x300) as u64); // clear IF (0x200) + TF (0x100)
+}
+
 /// Build the Unicorn instance and install the event hooks. No memory is mapped
 /// up front — pages are mapped lazily as the guest faults them in.
 fn build() -> Unicorn<'static, Ctx> {
@@ -67,13 +95,48 @@ fn build() -> Unicorn<'static, Ctx> {
     // so we record the vector and that bit; `execute` turns it into a clean
     // SoftInt (software int) vs Exception (CPU fault) event.
     uc.add_intr_hook(|uc, intno| {
+        let vector = (intno & 0xFF) as u8;
+        // Real-mode (VM86, PE=0) `INT n`/fault that the redirection bitmap does
+        // not trap: reflect to the IVT *in place* and keep running, so the slice
+        // runs through the handler like TCG does — only trapped vectors (0x31)
+        // and the DPL=3 gates (3/4) bubble to the kernel. PM ints/faults always
+        // bubble (decided by `execute`).
+        if vector != 3 && vector != 4
+            && uc.reg_read(RegisterX86::CR0).unwrap_or(1) & 1 == 0
+            && !crate::desc::int_intercepted(vector)
+        {
+            reflect_vm86_inline(uc, vector);
+            return; // no emu_stop → emu_start continues at the handler
+        }
         let d = uc.get_data_mut();
-        d.pending_intr = Some((intno & 0xFF) as u8);
+        d.pending_intr = Some(vector);
         d.pending_is_int = intno & 0x100 != 0;
         d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
         let _ = uc.emu_stop();
     })
     .expect("intr hook");
+
+    // The CPU's interrupt check, run before every basic block — the analog of
+    // QEMU's `cpu_handle_interrupt` before each TB. If the INTR line is asserted
+    // (a pending vpic IRQ / host input) AND the guest can take it now (IF=1),
+    // stop at this clean block boundary so the kernel's `deliver_pm_irq` injects
+    // here. While the line is clear (the common case) this is just an atomic
+    // load. The IF=0→1 case falls out for free: we skip while IF=0 and stop at
+    // the first block after the guest re-enables interrupts.
+    uc.add_block_hook(1, 0, |uc, _addr, size| {
+        // Charge virtual time by the block's retired work here, not on full-slice
+        // retirement — so it advances even in port-IN / int-heavy loops that
+        // never complete a slice (e.g. DN's `in 0x3DA` retrace poll, whose VGA
+        // phase is derived from this clock). ~3 bytes/instruction.
+        crate::machine::advance_virtual_time((size as u64 / 3).max(1));
+        if crate::machine::irq_line() {
+            let flags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
+            if flags & 0x200 != 0 {
+                let _ = uc.emu_stop();
+            }
+        }
+    })
+    .expect("block hook");
 
     // Port OUT → Out event; the value is in EAX (synced back to REGS).
     uc.add_insn_out_hook(|uc, port, size, _val| {
@@ -159,9 +222,11 @@ fn io_with<R>(f: impl FnOnce(&mut Unicorn<'static, Ctx>) -> R) -> R {
 /// DPL=3 gates 3/4) bubble to the kernel.
 pub fn execute() -> KernelEvent {
     io_with(|uc| loop {
-        // Service an off-thread VGA-screen snapshot request (host-thread reads
-        // the active guest space here, where it's valid).
+        // Service an off-thread VGA-screen snapshot request, and paint the live
+        // terminal view if enabled (both read the active guest space here, where
+        // it's valid — the CPU thread).
         crate::screendump::maybe_dump();
+        crate::screendump::maybe_render_live();
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
         let mode = regs.mode();
         let begin = configure(uc, regs, mode);
@@ -191,14 +256,9 @@ pub fn execute() -> KernelEvent {
         if let Some(n) = uc.get_data_mut().pending_intr.take() {
             let is_int = uc.get_data().pending_is_int;
             if mode == UserMode::VM86 {
-                // Real mode: `int n` and real-mode CPU faults alike carry their
-                // vector here. Reflect anything the redirection bitmap doesn't
-                // trap to the guest's IVT (an IVT stub will `int 0x31` if it
-                // needs us); trapped vectors (0x31) bubble to the kernel.
-                if n != 3 && n != 4 && !crate::desc::int_intercepted(n) {
-                    unsafe { crate::monitor::sw_reflect_vm86_int(regs, n) };
-                    continue;
-                }
+                // Non-trapped VM86 ints are reflected to the IVT in the intr hook
+                // (run-through), so only trapped vectors (0x31) and the DPL=3
+                // gates (3/4) reach here.
                 return KernelEvent::SoftInt(n);
             }
             // Protected mode: the engine tells us directly whether this was a
@@ -218,18 +278,10 @@ pub fn execute() -> KernelEvent {
             return ev;
         }
         return match run {
-            Ok(()) => {
-                // Reaching here means NO hook fired (the intr/event blocks above
-                // returned early otherwise): the SLICE budget was fully retired.
-                // This is the ONLY true full-retire — `run.is_ok()` is also true
-                // for hook-stopped (early) slices, so the virtual clock must be
-                // charged here, not on every `Ok`. Anchoring time to retired
-                // compute (not wall time, not interrupt count) paces the guest's
-                // timer at a fixed virtual MIPS; charging early stops would race
-                // the clock and flood IRQ0 (a timer-interrupt storm).
-                crate::machine::advance_virtual_time(SLICE as u64);
-                KernelEvent::Irq // whole slice retired → timer tick
-            }
+            // Virtual time is charged per basic block in the block hook (above),
+            // so nothing to add here. A bare `Ok` is either a full-slice retire
+            // or a block-hook IRQ stop — both just hand control to the kernel.
+            Ok(()) => KernelEvent::Irq,
             Err(_) => KernelEvent::Fault,
         };
     })

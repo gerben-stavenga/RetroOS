@@ -66,18 +66,32 @@ pub fn port_out(port: u16, width: u8, val: u32) {
 
 // ── Debug console (port 0xE9 → stdout) ──────────────────────────────────────
 
-struct Debugcon;
+struct Debugcon {
+    /// Optional file sink. When live-rendering the VGA screen owns the terminal,
+    /// the 0xE9 stream is routed to a log file instead so the two don't collide.
+    sink: Option<std::fs::File>,
+}
 impl PortIo for Debugcon {
     fn write(&mut self, _port: u16, _width: u8, val: u32) {
         // The kernel's text console mirrors every byte to 0xE9, so this *is* the
-        // console output stream → stdout.
-        let _ = std::io::stdout().write_all(&[val as u8]);
+        // console output stream.
+        match &mut self.sink {
+            Some(f) => { let _ = f.write_all(&[val as u8]); }
+            None => { let _ = std::io::stdout().write_all(&[val as u8]); }
+        }
     }
 }
 
 /// Hook the debug console at port 0xE9 to stdout (the console stream).
 pub fn register_debugcon() {
-    register(0xE9, 0xE9, Box::new(Debugcon));
+    register(0xE9, 0xE9, Box::new(Debugcon { sink: None }));
+}
+
+/// Hook the debug console to a file instead of stdout — used with the live VGA
+/// console, where the terminal is owned by the screen renderer.
+pub fn register_debugcon_file(path: &str) {
+    let sink = std::fs::File::create(path).ok();
+    register(0xE9, 0xE9, Box::new(Debugcon { sink }));
 }
 
 // ── ATA disk (primary controller, LBA28 PIO) ────────────────────────────────
@@ -308,8 +322,16 @@ impl PortIo for FwCfg {
 
 /// Serve a QEMU-style fw_cfg with `opt/cmdline` (and optionally `opt/cwd`) so
 /// the kernel boots one program headless and shuts down when it exits.
-pub fn attach_fw_cfg(cmdline: &str, cwd: Option<&str>) {
-    let mut files = vec![("opt/cmdline".to_string(), cmdline.as_bytes().to_vec())];
+/// Register the fw_cfg device. Always presents the "QEMU" signature (so the
+/// kernel's `is_qemu()` is true — the interpreter has no real VGA raster, so it
+/// must fabricate 0x3DA retrace bits etc. the way it does under QEMU). With a
+/// `cmdline`, also exposes `opt/cmdline` (+ optional `opt/cwd`) for headless
+/// single-program launch; without one it's just the signature + an empty dir.
+pub fn attach_fw_cfg(cmdline: Option<&str>, cwd: Option<&str>) {
+    let mut files = Vec::new();
+    if let Some(c) = cmdline {
+        files.push(("opt/cmdline".to_string(), c.as_bytes().to_vec()));
+    }
     if let Some(c) = cwd {
         files.push(("opt/cwd".to_string(), c.as_bytes().to_vec()));
     }

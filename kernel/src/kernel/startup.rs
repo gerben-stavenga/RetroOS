@@ -773,8 +773,10 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
     if vm86 {
         let vif = regs.flags32() & (1 << 9) != 0;
         let lin = (regs.cs32() << 4) + regs.ip32();
-        let b = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-        let ticks = unsafe { *(0x46Cu32 as *const u32) };
+        // Guest reads via arch::mem() (identity on metal, mmap offset on the
+        // interpreter) — raw `lin as *const u8` would fault on the interp.
+        let b = crate::arch::mem().slice(lin as usize, 8);
+        let ticks = crate::arch::mem().read::<u32>(0x46C);
         crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} IF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             regs.code_seg(), regs.ip32(),
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -808,8 +810,11 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
             crate::dbg_println!("[VGA HW] ac[10..14]={:02X} {:02X} {:02X} {:02X}  crtc[0C..0F]={:02X} {:02X} {:02X} {:02X}",
                 ac[0x10], ac[0x11], ac[0x12], ac[0x13], crtc[0x0C], crtc[0x0D], crtc[0x0E], crtc[0x0F]);
         }
-        // Dump VGA text buffer (80x25, char+attr interleaved at 0xB8000)
-        let vga = unsafe { core::slice::from_raw_parts(0xB8000 as *const u8, 4000) };
+        // Dump VGA text buffer (80x25, char+attr interleaved at 0xB8000).
+        // Through arch::mem() so it works on both backends — `0xB8000` is a
+        // guest address, identity-mapped on metal but an mmap offset on the
+        // interpreter (a raw `0xB8000 as *const u8` would fault there).
+        let vga = crate::arch::mem().slice(0xB8000, 4000);
         for row in 0..25 {
             let mut line = [b'.'; 80];
             for col in 0..80 {

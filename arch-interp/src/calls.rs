@@ -91,82 +91,26 @@ pub fn arch_map_low_mem() {
     crate::cpu::invalidate_uc(0, 0x100);
 }
 
-/// Minimal BIOS firmware the interpreter must supply. On real hardware (and
-/// metal) the PC BIOS ROM owns these IVT vectors; the interpreter has no ROM, so
-/// without a handler a guest `int 11h` (or a reflected IRQ0 `int 8`) lands on a
-/// null IVT entry and the guest then executes the zeroed IVT as code, scrambling
-/// itself. We supply the handful DOS/BIOS CRTs depend on: equipment (11h),
-/// keyboard (16h, "no key"), the IRQ0 timer ISR (08h, owns 0040:006C), and a
-/// generic `iret` for the rest.
+/// BIOS firmware the interpreter must supply. On real hardware (and metal) the
+/// PC BIOS ROM owns these IVT vectors; the interpreter has no ROM, so without a
+/// handler a guest `int 11h` (or a reflected IRQ0 `int 8`) lands on a null IVT
+/// entry and the guest then executes the zeroed IVT as code, scrambling itself.
+///
+/// The substantive handlers (INT 08/10/11/16/1A + the BDA) are written in 16-bit
+/// C (`bios/bios.c`, built by our own Turbo C) and loaded by `crate::bios`. Here
+/// we add only a generic `iret` for the handful of BIOS vectors we don't model.
 fn install_bios_stubs() {
     let m = crate::vcpu::mem();
     const SEG: u16 = 0xF000;
-    // Generic `iret` at F000:0010 — for BIOS vectors we don't model yet, so a
-    // guest call returns harmlessly instead of executing the null IVT.
+    // Generic `iret` at F000:0010 — for BIOS vectors we don't model, so a guest
+    // call returns harmlessly instead of executing the null IVT.
     m.write::<u8>(0xF0010, 0xCF);
-    // INT 11h at F000:0011 = `mov ax, equip; iret` — equipment word.
-    let equip: u16 = 0x0021; // bit0=floppy present, bits4-5=10 (80x25 color)
-    m.write_bytes(0xF0011, &[0xB8, equip as u8, (equip >> 8) as u8, 0xCF]);
-    // INT 16h at F000:0020 — keyboard. We have no real keyboard, so report "no
-    // key": status (AH=01/11) returns ZF=1, read (AH=00/10) returns AX=0. The
-    // status flag must be set in the *pushed* FLAGS (iret restores them), so:
-    //   push bp; mov bp,sp; or word[bp+6],40h (ZF); xor ax,ax; pop bp; iret
-    m.write_bytes(0xF0020, &[0x55, 0x89, 0xE5, 0x81, 0x4E, 0x06, 0x40, 0x00, 0x31, 0xC0, 0x5D, 0xCF]);
-    // INT 10h (video) at F000:0050 — handle AH=0Fh (get video mode), the query
-    // Turbo Vision (DN's UI toolkit) uses to pick its video segment: it must
-    // report mode 3 (80x25 colour) so TVision writes to B800, not the mono B000
-    // or a zero-width screen. All other subfunctions `iret` (TVision draws the
-    // screen body by writing video memory directly).
-    //   cmp ah,0Fh; jne other; mov al,03h (mode); mov ah,50h (cols=80);
-    //   xor bh,bh (page 0); iret;  other: iret
-    m.write_bytes(0xF0050, &[
-        0x80, 0xFC, 0x0F, 0x75, 0x07, 0xB0, 0x03, 0xB4, 0x50, 0x30, 0xFF, 0xCF, 0xCF,
-    ]);
-    // INT 08h (IRQ0 timer) at F000:0030. On metal the ROM BIOS owns this vector
-    // and its ISR advances the 0040:006C tick count; the interpreter has no ROM,
-    // so without it the kernel's IRQ0 (clocked by the virtual PIT) reflects to a
-    // null IVT[8] and the guest scrambles itself. Turbo Pascal's CRT delay
-    // calibration reads 0040:006C directly and divides by the elapsed ticks, so
-    // a stalled tick is a divide-by-zero (RTE 200). Faithful BIOS sequence:
-    //   push ds; push ax; xor ax,ax; mov ds,ax
-    //   inc word[0x046C]; jnz +4; inc word[0x046E]   ; 32-bit tick at 0040:006C
-    //   int 1Ch                                       ; user timer chain
-    //   mov al,20h; out 20h,al                        ; PIC EOI
-    //   pop ax; pop ds; iret
-    m.write_bytes(0xF0030, &[
-        0x1E, 0x50, 0x31, 0xC0, 0x8E, 0xD8,
-        0xFF, 0x06, 0x6C, 0x04, 0x75, 0x04, 0xFF, 0x06, 0x6E, 0x04,
-        0xCD, 0x1C,
-        0xB0, 0x20, 0xE6, 0x20,
-        0x58, 0x1F, 0xCF,
-    ]);
-    // IVT: unmodeled BIOS vectors → generic iret; 0x11 → equipment; 0x16 → kbd.
-    for v in [0x10u8, 0x12, 0x14, 0x15, 0x17, 0x1A, 0x1B, 0x1C] {
+    for v in [0x12u8, 0x14, 0x15, 0x17, 0x1B, 0x1C] {
         m.write::<u16>(v as usize * 4, 0x0010);
         m.write::<u16>(v as usize * 4 + 2, SEG);
     }
-    m.write::<u16>(0x11 * 4, 0x0011);
-    m.write::<u16>(0x11 * 4 + 2, SEG);
-    m.write::<u16>(0x16 * 4, 0x0020);
-    m.write::<u16>(0x16 * 4 + 2, SEG);
-    m.write::<u16>(0x08 * 4, 0x0030);
-    m.write::<u16>(0x08 * 4 + 2, SEG);
-    m.write::<u16>(0x10 * 4, 0x0050);
-    m.write::<u16>(0x10 * 4 + 2, SEG);
-
-    // BIOS Data Area (segment 0x40) video fields. On metal the ROM BIOS POST
-    // fills these from the active video mode; the interpreter has no POST, so a
-    // guest that reads them (Turbo Vision queries 0040:0049 mode + 0040:004A
-    // columns to size its screen) sees zeroes → mode 0 / 0 columns → it never
-    // draws. Seed an 80x25 colour text mode (mode 3).
-    m.write::<u8>(0x449, 0x03); // current video mode = 3
-    m.write::<u16>(0x44A, 80); // columns on screen
-    m.write::<u16>(0x44C, 0x1000); // video page size (bytes)
-    m.write::<u16>(0x44E, 0x0000); // current page start offset
-    m.write::<u8>(0x462, 0x00); // active display page
-    m.write::<u16>(0x463, 0x03D4); // CRTC base I/O port (colour)
-    m.write::<u8>(0x484, 24); // rows on screen − 1 (EGA+)
-    m.write::<u16>(0x485, 16); // character cell height (scanlines)
+    // The real handlers (in C) + the BDA seed.
+    crate::bios::install();
 }
 
 /// Copy page-table entries src→dst.

@@ -118,7 +118,7 @@ pub fn host_console_init() {
 /// arch backend, with no disk/filesystem boot. Mirrors what `run_init_program`
 /// does for DOS. `path` is used for argv[0] / diagnostics.
 #[cfg(feature = "hosted")]
-pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>) -> ! {
+pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Vec<alloc::vec::Vec<u8>>) -> ! {
     use kernel::thread;
 
     arch::init_guest_ram(0);
@@ -141,8 +141,8 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>) -> ! {
     kernel::kpipe::add_reader(cpipe);
 
     // Load the ELF (segments + argv/envp/auxv stack) into the active space and
-    // set the thread's entry registers.
-    let argv = alloc::vec![path.to_vec()];
+    // set the thread's entry registers. Default argv = [path] when none given.
+    let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
     if let Err(e) = kernel::linux::exec_elf_into(tid, &data, path, &argv) {
         dbg_println!("[host] exec failed: errno {}", e);
         arch::shutdown();

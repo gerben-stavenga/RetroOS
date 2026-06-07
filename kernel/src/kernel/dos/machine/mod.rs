@@ -287,6 +287,13 @@ impl MouseState {
 }
 
 impl PcMachine {
+    /// Whether a hardware IRQ or mouse callback is pending delivery — drives the
+    /// interpreter's CPU INTR line via `arch::set_irq_line`, so its per-block
+    /// interrupt check keeps firing until everything has been delivered.
+    pub fn intr_pending(&self) -> bool {
+        self.vpic.has_deliverable() || (self.mouse.cb_mask & self.mouse.pending_cond != 0)
+    }
+
     pub fn new() -> Self {
         // A20 starts disabled. HMA_PAGE wraps to user's private low memory
         // by copying entries[0..16]. HMA_SHADOW_PAGE is left not-present

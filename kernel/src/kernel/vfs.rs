@@ -157,10 +157,27 @@ fn resolve_mount(path: &[u8]) -> (u8, &'static dyn Filesystem, &[u8]) {
             }
         }
     }
-    if !found { panic!("VFS: no filesystem mounted"); }
+    if !found {
+        // Nothing mounted (e.g. the hosted bare-ELF Linux path, before a root
+        // fs exists). Resolve to the empty filesystem so opens miss with
+        // -ENOENT instead of panicking — an interactive shell opening /dev/tty
+        // then falls back to fds 0/1, exactly as it would on a real mount that
+        // lacks the node.
+        return (0, &EMPTY_FS, path);
+    }
     let m = unsafe { MOUNTS[best_idx as usize].as_ref().unwrap() };
     (best_idx, m.fs, &path[best_len..])
 }
+
+/// Fallback filesystem for "nothing mounted": every lookup misses.
+struct EmptyFs;
+impl Filesystem for EmptyFs {
+    fn open(&self, _path: &[u8]) -> Option<Vnode> { None }
+    fn read(&self, _h: u64, _o: u32, _b: &mut [u8], _s: u32) -> i32 { -2 }
+    fn readdir(&self, _dir: &[u8], _index: usize) -> Option<DirEntry> { None }
+    fn dir_exists(&self, _path: &[u8]) -> bool { false }
+}
+static EMPTY_FS: EmptyFs = EmptyFs;
 
 /// Get a filesystem by mount index.
 fn mount_fs(idx: u8) -> &'static dyn Filesystem {

@@ -810,16 +810,19 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Vcpu) {
     // specified mouse-driver reentrancy guard. `deliver_mouse_callback` clears
     // `pending_cond` for this invocation and sets `cb_in_flight`.
     let mouse = &dos.pc.mouse;
-    if regs.frame.rflags & (1u64 << 9) != 0
+    let mouse_ready = regs.frame.rflags & (1u64 << 9) != 0
         && !mouse.cb_in_flight
-        && mouse.cb_mask & mouse.pending_cond != 0
-    {
+        && mouse.cb_mask & mouse.pending_cond != 0;
+    if mouse_ready {
         self::dos::deliver_mouse_callback(dos, regs);
-        return;
+    } else if let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) {
+        IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
+        mode_transitions::deliver_pm_irq(dos, regs, vec);
     }
-    let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) else { return };
-    IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
-    mode_transitions::deliver_pm_irq(dos, regs, vec);
+    // Keep the interpreter's CPU INTR line coherent with what's still pending so
+    // its per-block interrupt check keeps firing until everything is delivered
+    // (no-op on metal, where the real 8259 drives INTR).
+    crate::arch::set_irq_line(dos.pc.intr_pending());
 }
 
 // ── Block-allocator helpers used by INT 21h handlers in `dos.rs` ────────

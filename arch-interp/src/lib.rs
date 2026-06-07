@@ -34,6 +34,7 @@ pub use arch_abi::{
     USER_CS, USER_CS64, USER_DS,
 };
 
+mod bios;
 mod calls;
 mod cpu;
 mod desc;
@@ -44,13 +45,17 @@ mod mmu;
 pub mod monitor;
 mod screendump;
 mod space;
+mod tty;
 mod vcpu;
 
 pub use calls::*;
 pub use machine::{
     clean_fx_template, drain, free_page_count, get_ticks, halt_forever, inb, inw, outb, outw,
-    rdtsc, shutdown, take_pending_ticks, FxState,
+    post_irq, rdtsc, set_irq_line, shutdown, take_pending_ticks, FxState,
 };
+// Interactive console (hosted `main` drives input): raw terminal mode; key
+// events are posted via `post_irq` and surface to the kernel through `drain`.
+pub use tty::enter_raw_mode;
 pub use space::{KernelPages, RootPageTable};
 pub use vcpu::{mem, set_current_vcpu, GuestMem, Vcpu, REGS};
 
@@ -62,8 +67,11 @@ pub use vcpu::init_guest_ram;
 pub use mmu::new_space;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
-pub use devices::{attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon, PortIo};
+pub use devices::{
+    attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon, register_debugcon_file,
+    PortIo,
+};
 // Host-side VGA text-screen snapshotting (headless inspection of the guest's
 // 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the
 // flag from a watcher thread, the CPU thread renders at the next slice boundary.
-pub use screendump::{request as request_vga_dump, set_dump_path};
+pub use screendump::{enable_live as enable_live_console, request as request_vga_dump, set_dump_path};

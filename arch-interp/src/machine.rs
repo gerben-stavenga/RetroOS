@@ -2,7 +2,7 @@
 //! analogue of `kernel/src/arch/x86.rs` + the timer/IRQ bits of `irq.rs`.
 
 use arch_abi::Irq;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// FPU/SSE save area. Same 512-byte FXSAVE-shaped blob the kernel saves and
 /// restores opaquely. On the interpreter the live FPU state lives inside the
@@ -102,7 +102,66 @@ pub fn take_pending_ticks() -> u32 {
     now.saturating_sub(last).min(64) as u32
 }
 
-pub fn drain(_f: impl FnMut(Irq)) {}
+// Host-posted input events (keyboard, …) awaiting delivery to the kernel event
+// loop — the interpreter's analogue of metal's `irq.rs` QUEUE that a real
+// keyboard IRQ pushes into. The hosted `main` owns the *source* (a stdin reader
+// that translates terminal bytes to PC scancodes); arch just provides the queue
+// + `drain`, so the kernel sees identical `Irq::Key` events on both backends.
+static INPUT_QUEUE: std::sync::Mutex<std::collections::VecDeque<Irq>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+// The CPU's INTR line — our `cpu->interrupt_request`. The CPU core's block hook
+// (`cpu::execute`) checks `irq_line()` before each basic block, exactly like
+// QEMU's `cpu_handle_interrupt` before each TB, and bails to the kernel (which
+// injects via `deliver_pm_irq`) when it's asserted and the guest has IF=1.
+//
+// Two independent contributors, each cleared by its owner so neither can wedge
+// the line: host input awaiting `drain` (set by `post_irq`, cleared by `drain` —
+// the only contributor for the Linux/tty path), and the kernel's virtual PIC
+// (set/cleared by `set_irq_line` from DOS `raise_pending`).
+static INPUT_PENDING: AtomicBool = AtomicBool::new(false);
+static VPIC_LINE: AtomicBool = AtomicBool::new(false);
+
+/// Assert/deassert the CPU INTR line from the kernel's virtual PIC.
+pub fn set_irq_line(asserted: bool) {
+    VPIC_LINE.store(asserted, Ordering::Relaxed);
+}
+
+/// Read the INTR line (CPU core, per basic block — two cheap atomic loads).
+#[inline]
+pub(crate) fn irq_line() -> bool {
+    INPUT_PENDING.load(Ordering::Relaxed) || VPIC_LINE.load(Ordering::Relaxed)
+}
+
+/// Post a hardware-input event from the host side (called off the CPU thread,
+/// e.g. by main's stdin reader). Mirrors a device asserting an IRQ on metal:
+/// queue the event and raise the input line so the CPU bails out to service it.
+/// The flag is set under the queue lock so it stays consistent with `drain`.
+pub fn post_irq(irq: Irq) {
+    if let Ok(mut q) = INPUT_QUEUE.lock() {
+        q.push_back(irq);
+        INPUT_PENDING.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Drain queued input events into the kernel event loop. Collect under the lock
+/// then dispatch unlocked, so `f` (kernel keyboard handling) can't deadlock the
+/// poster.
+pub fn drain(mut f: impl FnMut(Irq)) {
+    let events: std::vec::Vec<Irq> = match INPUT_QUEUE.lock() {
+        Ok(mut q) => {
+            let v = q.drain(..).collect();
+            // Clear under the lock, atomically with emptying the queue, so a
+            // concurrent `post_irq` can't be lost (it re-asserts under the lock).
+            INPUT_PENDING.store(false, Ordering::Relaxed);
+            v
+        }
+        Err(_) => return,
+    };
+    for e in events {
+        f(e);
+    }
+}
 
 /// Physical free-page count, for diagnostic logging only. The interpreter has
 /// no physical frame allocator yet (M3); report 0.

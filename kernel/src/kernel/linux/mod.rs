@@ -10,7 +10,7 @@
 //! x86_64: RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4, R9=a5
 //! Return: EAX/RAX (negative = -errno)
 
-const LINUX_TRACE: bool = true;
+const LINUX_TRACE: bool = false;
 
 macro_rules! linux_trace {
     ($($arg:tt)*) => {
