@@ -136,11 +136,66 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
     println!();
     println!("\x1b[92mHello from Rust kernel!\x1b[0m");
 
+    // Read the boot config (QEMU fw_cfg) at the platform boundary, before
+    // handing it to the kernel — the kernel no longer pokes firmware ports.
+    let config = read_boot_config();
+
     descriptors::enter_ring1();
 
     // The arch backend handle, threaded as `&mut` through the kernel from here
     // on so its mutable state is borrow-checked rather than global. Lives for
     // the rest of the kernel's life (startup never returns).
     let mut machine = crate::new_arch();
-    crate::kernel::startup::startup(&mut machine);
+    crate::kernel::startup::startup(&mut machine, &config);
+}
+
+/// Read QEMU's fw_cfg interface into a `BootConfig` (headless cmdline/cwd,
+/// debug-watch, is-QEMU signature). Absent fw_cfg (Bochs / real hardware) reads
+/// 0xFF → no QEMU signature → an empty interactive config. Port I/O is a real
+/// `out`/`in` here in the metal boot glue, so the kernel never touches it.
+fn read_boot_config() -> crate::BootConfig {
+    const SEL: u16 = 0x510;
+    const DATA: u16 = 0x511;
+    fn select(sel: u16) { x86::outw(SEL, sel); }
+    fn read_bytes(buf: &mut [u8]) { for b in buf.iter_mut() { *b = x86::inb(DATA); } }
+    // Find a named fw_cfg file via the file directory (selector 0x0019), select
+    // it, and read up to `buf.len()` bytes. Returns the byte count read.
+    fn read_named(name: &[u8], buf: &mut [u8]) -> Option<usize> {
+        select(0x0019);
+        let mut count_be = [0u8; 4];
+        read_bytes(&mut count_be);
+        let count = u32::from_be_bytes(count_be);
+        for _ in 0..count {
+            let mut entry = [0u8; 64];
+            read_bytes(&mut entry);
+            let size = u32::from_be_bytes(entry[0..4].try_into().unwrap()) as usize;
+            let sel = u16::from_be_bytes(entry[4..6].try_into().unwrap());
+            let name_end = entry[8..].iter().position(|&c| c == 0).unwrap_or(56);
+            if &entry[8..8 + name_end] == name {
+                let n = size.min(buf.len());
+                select(sel);
+                read_bytes(&mut buf[..n]);
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    let mut cfg = crate::BootConfig::empty();
+    select(0x0000); // FW_CFG_SIGNATURE
+    let mut sig = [0u8; 4];
+    read_bytes(&mut sig);
+    cfg.is_qemu = &sig == b"QEMU";
+    if !cfg.is_qemu {
+        return cfg; // no fw_cfg interface — interactive boot
+    }
+    let mut buf = [0u8; 4096];
+    if let Some(n) = read_named(b"opt/cmdline", &mut buf) { cfg.set_cmdline(&buf[..n]); }
+    let mut cwd = [0u8; 256];
+    if let Some(n) = read_named(b"opt/cwd", &mut cwd) { cfg.set_cwd(&cwd[..n]); }
+    let mut dw = [0u8; 64];
+    if let Some(n) = read_named(b"opt/debug-watch", &mut dw) {
+        cfg.debug_watch = crate::parse_debug_watch(&dw[..n]);
+    }
+    cfg
 }

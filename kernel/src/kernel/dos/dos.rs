@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::kernel::thread;
 use crate::arch::Vcpu;
@@ -65,9 +66,9 @@ fn bios_time_of_day(regs: &Vcpu) -> (u8, u8, u8, u8) {
     )
 }
 
-fn cmos_read(index: u8) -> u8 {
-    crate::arch::outb(0x70, index);
-    crate::arch::inb(0x71)
+fn cmos_read(machine: &mut crate::TheArch, index: u8) -> u8 {
+    machine.outb(0x70, index);
+    machine.inb(0x71)
 }
 
 fn cmos_decode(value: u8, binary: bool) -> u8 {
@@ -89,19 +90,19 @@ fn day_of_week(mut year: u16, mut month: u8, day: u8) -> u8 {
     ((y + y / 4 - y / 100 + y / 400 + OFFSETS[month as usize - 1] as u32 + day as u32) % 7) as u8
 }
 
-fn cmos_date() -> (u16, u8, u8, u8) {
+fn cmos_date(machine: &mut crate::TheArch) -> (u16, u8, u8, u8) {
     for _ in 0..10_000 {
-        if cmos_read(0x0A) & 0x80 == 0 {
+        if cmos_read(machine, 0x0A) & 0x80 == 0 {
             break;
         }
     }
 
-    let status_b = cmos_read(0x0B);
+    let status_b = cmos_read(machine, 0x0B);
     let binary = status_b & 0x04 != 0;
-    let day = cmos_decode(cmos_read(0x07), binary);
-    let month = cmos_decode(cmos_read(0x08), binary);
-    let year_lo = cmos_decode(cmos_read(0x09), binary);
-    let century = cmos_decode(cmos_read(0x32), binary);
+    let day = cmos_decode(cmos_read(machine, 0x07), binary);
+    let month = cmos_decode(cmos_read(machine, 0x08), binary);
+    let year_lo = cmos_decode(cmos_read(machine, 0x09), binary);
+    let century = cmos_decode(cmos_read(machine, 0x32), binary);
 
     let year = if (19..=99).contains(&century) {
         century as u16 * 100 + year_lo as u16
@@ -118,9 +119,9 @@ fn cmos_date() -> (u16, u8, u8, u8) {
     (year, month, day, day_of_week(year, month, day))
 }
 
-fn current_dos_timestamp(regs: &Vcpu) -> (u16, u16) {
+fn current_dos_timestamp(machine: &mut crate::TheArch, regs: &Vcpu) -> (u16, u16) {
     let (hour, min, sec, _) = bios_time_of_day(regs);
-    let (year, month, day, _) = cmos_date();
+    let (year, month, day, _) = cmos_date(machine);
     let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
     let dos_date = ((year.saturating_sub(1980)) << 9) | ((month as u16) << 5) | day as u16;
     (dos_time, dos_date)
@@ -193,7 +194,7 @@ pub(crate) fn dispatch_kernel_syscall(
         // INT 29h — DOS FAST_CON_OUT: AL = char to display. Route through
         // the normal console path so VGA and debugcon stay in sync.
         0x29 => {
-            let ch = regs.rax as u8; dos_putchar(regs, ch);
+            let ch = regs.rax as u8; dos_putchar(machine, regs, ch);
             thread::KernelAction::Done
         }
         0x2E => int_2eh(kt, dos, regs),
@@ -207,7 +208,7 @@ pub(crate) fn dispatch_kernel_syscall(
                 regs.rax = (regs.rax & !0xFF00) | 0x80_00;
                 return thread::KernelAction::Done;
             }
-            int_67h(dos, regs)
+            int_67h(machine, dos, regs)
         }
         _ => {
             dos_trace!("dispatch_kernel_syscall: unhandled vector {:#04x}", vector);
@@ -301,7 +302,7 @@ pub(super) fn rm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::Ke
             // slot would have done, unwinding the chain naturally).
             let cb = dos.pending_resume.take()
                 .expect("SLOT_RESUME fired without pending_resume");
-            match (cb.0)(kt, dos, regs) {
+            match (cb.0)(machine, kt, dos, regs) {
                 Some(next) => {
                     dos.pending_resume = Some(next);
                     park_at_slot_resume(regs);
@@ -668,7 +669,8 @@ fn int_13h(regs: &mut Vcpu) -> thread::KernelAction {
 /// gathering input; `None` once Enter is pressed.
 fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::ResumeCallback {
     super::ResumeCallback(alloc::boxed::Box::new(
-        move |_kt: &mut thread::KernelThread,
+        move |machine: &mut crate::TheArch,
+              _kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
               regs: &mut Vcpu| -> Option<super::ResumeCallback> {
             let Some(ch) = poll_dos_console_char(dos) else {
@@ -678,15 +680,15 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
                 0x0D => {
                     regs.write::<u8>((buf_lin + 1) as usize, count);
                     regs.write::<u8>((buf_lin + 2 + count as u32) as usize, 0x0D);
-                    dos_putchar(regs, 0x0D);
-                    dos_putchar(regs, 0x0A);
+                    dos_putchar(machine, regs, 0x0D);
+                    dos_putchar(machine, regs, 0x0A);
                     None
                 }
                 0x08 => {
                     if count > 0 {
-                        dos_putchar(regs, 0x08);
-                        dos_putchar(regs, b' ');
-                        dos_putchar(regs, 0x08);
+                        dos_putchar(machine, regs, 0x08);
+                        dos_putchar(machine, regs, b' ');
+                        dos_putchar(machine, regs, 0x08);
                         Some(buffered_input_resume(buf_lin, max_chars, count - 1))
                     } else {
                         Some(buffered_input_resume(buf_lin, max_chars, count))
@@ -695,10 +697,10 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
                 _ => {
                     if (count as u32) + 1 < max_chars as u32 {
                         regs.write::<u8>(((buf_lin + 2 + count as u32)) as usize, ch);
-                        dos_putchar(regs, ch);
+                        dos_putchar(machine, regs, ch);
                         Some(buffered_input_resume(buf_lin, max_chars, count + 1))
                     } else {
-                        dos_putchar(regs, 0x07); // bell — no room
+                        dos_putchar(machine, regs, 0x07); // bell — no room
                         Some(buffered_input_resume(buf_lin, max_chars, count))
                     }
                 }
@@ -735,7 +737,8 @@ fn launch_int16_read(regs: &mut Vcpu) {
 /// `None` so SLOT_RESUME pops the original INT 21 return frame.
 fn int16_finish_resume(echo: bool) -> super::ResumeCallback {
     super::ResumeCallback(alloc::boxed::Box::new(
-        move |_kt: &mut thread::KernelThread,
+        move |machine: &mut crate::TheArch,
+              _kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
               regs: &mut Vcpu| -> Option<super::ResumeCallback> {
             let ax = regs.rax as u16;
@@ -746,17 +749,16 @@ fn int16_finish_resume(echo: bool) -> super::ResumeCallback {
                 dos.dos_pending_char = Some(scan);
             }
             regs.rax = (regs.rax & !0xFF) | ascii as u64;
-            if echo && ascii != 0 { dos_putchar(regs, ascii); }
+            if echo && ascii != 0 { dos_putchar(machine, regs, ascii); }
             None
         }))
 }
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
-fn dos_putchar(regs: &mut Vcpu, c: u8) {
-    use crate::arch::outb;
-    // Mirror DOS console output to QEMU debugcon alongside VGA.
-    outb(0xE9, c);
+fn dos_putchar(machine: &mut crate::TheArch, regs: &mut Vcpu, c: u8) {
+    // Mirror DOS console output to the debug log stream alongside VGA.
+    crate::vga::debug_byte(c);
     // The BDA cursor (0040:0050/0051) is guest address space — go through the
     // vcpu so the access works under any arch backend, not just a host pointer.
     let col = regs.read::<u8>(0x450) as usize;
@@ -771,8 +773,8 @@ fn dos_putchar(regs: &mut Vcpu, c: u8) {
     regs.write::<u8>(0x451, row as u8);
     // Update CRTC hardware cursor so save_from_hardware captures it
     let offset = (row * 80 + col) as u16;
-    outb(0x3D4, 0x0E); outb(0x3D5, (offset >> 8) as u8);
-    outb(0x3D4, 0x0F); outb(0x3D5, offset as u8);
+    machine.outb(0x3D4, 0x0E); machine.outb(0x3D5, (offset >> 8) as u8);
+    machine.outb(0x3D4, 0x0F); machine.outb(0x3D5, offset as u8);
 }
 
 fn psp_struct_seg(dos: &thread::DosState) -> u16 {
@@ -808,7 +810,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
-            let ch = regs.rdx as u8; dos_putchar(regs, ch);
+            let ch = regs.rdx as u8; dos_putchar(machine, regs, ch);
             thread::KernelAction::Done
         }
         // AH=0x06: Direct console I/O (DL=0xFF=input, else output DL)
@@ -822,7 +824,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                     regs.set_flag32(0x40); // set ZF = no char available
                 }
             } else {
-                dos_putchar(regs, dl);
+                dos_putchar(machine, regs, dl);
             }
             thread::KernelAction::Done
         }
@@ -847,7 +849,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             // AL=0 then the scancode on the next read).
             if let Some(ch) = dos.dos_pending_char.take() {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
-                if echo && ch != 0 { dos_putchar(regs, ch); }
+                if echo && ch != 0 { dos_putchar(machine, regs, ch); }
             } else {
                 // Real DOS services console input through INT 16h — so do we.
                 // Enter the guest's IVT[0x16] (AH=00, wait-for-key) with an
@@ -869,7 +871,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             loop {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == b'$' { break; }
-                dos_putchar(regs, ch);
+                dos_putchar(machine, regs, ch);
                 addr = addr.wrapping_add(1);
                 // Safety limit: cap at 64 KiB from start
                 if addr.wrapping_sub(start) > 0xFFFF { break; }
@@ -1439,7 +1441,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = regs.read::<u8>(((addr + i)) as usize);
-                    dos_putchar(regs, ch);
+                    dos_putchar(machine, regs, ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
                 regs.clear_flag32(1);
@@ -1781,7 +1783,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         }
         // AH=2Ah — Get System Date
         0x2A => {
-            let (year, month, day, dow) = cmos_date();
+            let (year, month, day, dow) = cmos_date(machine);
             regs.rcx = (regs.rcx & !0xFFFF) | year as u64; // CX = year
             regs.rdx = (regs.rdx & !0xFFFF) | ((month as u64) << 8) | day as u64; // DH = month, DL = day
             regs.rax = (regs.rax & !0xFF) | dow as u64; // AL = day of week (0=Sun, 6=Sat)
@@ -1800,7 +1802,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             if al == 0 {
                 // DOS time: bits 15-11=hours, 10-5=minutes, 4-0=seconds/2
                 // DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
-                let (time, date) = current_dos_timestamp(regs);
+                let (time, date) = current_dos_timestamp(machine, regs);
                 regs.rcx = (regs.rcx & !0xFFFF) | time as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | date as u64;
                 regs.clear_flag32(1);

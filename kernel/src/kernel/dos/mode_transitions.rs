@@ -808,7 +808,7 @@ pub(super) fn pop_iret_frame(ldt: &[u64], regs: &mut Vcpu, handler_is_32: bool) 
 /// synthetic host IRET after `resume_continuation_from_stub` restores the continuation:
 ///   - `SLOT_RESUME_CONTINUATION` for cross-mode HW-IRQ first-entry.
 ///   - The outer caller's CS:EIP for soft-INT and nested-HW-IRQ.
-pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn vector_stub_reflect(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let eip = regs.ip32();
     let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
     if vector >= 0x10 {
@@ -832,7 +832,7 @@ pub(super) fn vector_stub_reflect(dos: &mut thread::DosState, regs: &mut Vcpu) -
         regs.set_ip32(eip);
         regs.set_cs32(cs as u32);
         regs.set_flags32(flags);
-        return super::dpmi::dpmi_api(dos, regs);
+        return super::dpmi::dpmi_api(machine, dos, regs);
     }
 
     let (stub_sel, stub_off) = synthetic_host_iret_target();

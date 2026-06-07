@@ -30,6 +30,12 @@ pub fn set_debug_sink(f: fn(u8)) {
     DEBUG_SINK.store(f as usize, Ordering::Relaxed);
 }
 
+/// Emit one byte to the debug-output sink (the DOS console mirror uses this to
+/// echo program output to the log stream alongside the VGA framebuffer).
+pub fn debug_byte(b: u8) {
+    stream(b);
+}
+
 #[inline]
 fn stream(b: u8) {
     let p = DEBUG_SINK.load(Ordering::Relaxed);

@@ -3,6 +3,7 @@
 //! 64KB page-frame in upper memory (set up by `scan_uma`), 256 logical pages
 //! of 16KB each (4MB total) backed by the kernel's demand paging.
 
+use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::dbg_println;
 use crate::arch::Vcpu;
@@ -36,9 +37,9 @@ fn ems_base_page() -> usize {
 }
 
 /// Swap an EMS window with a backing region.
-fn swap_ems_window(window: usize, backing_vpage: usize) {
+fn swap_ems_window(machine: &mut crate::TheArch, window: usize, backing_vpage: usize) {
     let frame = ems_base_page() + window * 4;
-    crate::arch::arch_swap_page_entries(backing_vpage, frame, 4);
+    machine.swap_page_entries(backing_vpage, frame, 4);
 }
 
 /// Per-thread EMS driver state
@@ -87,7 +88,7 @@ fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
     dos.ems.as_deref_mut().unwrap()
 }
 
-pub(crate) fn int_67h(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(crate) fn int_67h(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
@@ -101,13 +102,13 @@ pub(crate) fn int_67h(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::Ke
             regs.rax as u16);
         return thread::KernelAction::Done;
     }
-    let result = int_67h_inner(dos, regs, ah);
+    let result = int_67h_inner(machine, dos, regs, ah);
     dbg_println!("EMS: -> AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
     result
 }
 
-fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread::KernelAction {
+fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread::KernelAction {
     match ah {
         // AH=40h — Get status
         0x40 => {
@@ -178,7 +179,7 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
                 // Save current frame content back to its backing
                 if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
                     if let Some(ref h) = ems.handles[old_h as usize] {
-                        swap_ems_window(phys_page as usize, h.pages[old_lp as usize]);
+                        swap_ems_window(machine, phys_page as usize, h.pages[old_lp as usize]);
                     }
                 }
                 ems.frame[phys_page as usize] = None;
@@ -197,11 +198,11 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
                     // Save current frame content back to old backing
                     if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
                         if let Some(ref oh) = ems.handles[old_h as usize] {
-                            swap_ems_window(phys_page as usize, oh.pages[old_lp as usize]);
+                            swap_ems_window(machine, phys_page as usize, oh.pages[old_lp as usize]);
                         }
                     }
                     // Load new backing into frame
-                    swap_ems_window(phys_page as usize, backing_vpage);
+                    swap_ems_window(machine, phys_page as usize, backing_vpage);
                     ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                     regs.rax = regs.rax & !0xFF00; // AH=0
                 }
@@ -223,7 +224,7 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
                     if let Some((h, lp)) = ems.frame[w] {
                         if h == handle as u8 {
                             if let Some(ref hnd) = ems.handles[h as usize] {
-                                swap_ems_window(w, hnd.pages[lp as usize]);
+                                swap_ems_window(machine, w, hnd.pages[lp as usize]);
                             }
                             ems.frame[w] = None;
                         }
@@ -317,7 +318,7 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
                 // Save current frame content back to old backing
                 if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
                     if let Some(ref oh) = ems.handles[old_h as usize] {
-                        swap_ems_window(phys_page as usize, oh.pages[old_lp as usize]);
+                        swap_ems_window(machine, phys_page as usize, oh.pages[old_lp as usize]);
                     }
                 }
 
@@ -327,7 +328,7 @@ fn int_67h_inner(dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread:
                     match &ems.handles[handle as usize] {
                         Some(h) if (log_page as usize) < h.pages.len() => {
                             let backing_vpage = h.pages[log_page as usize];
-                            swap_ems_window(phys_page as usize, backing_vpage);
+                            swap_ems_window(machine, phys_page as usize, backing_vpage);
                             ems.frame[phys_page as usize] = Some((handle as u8, log_page));
                         }
                         _ => {

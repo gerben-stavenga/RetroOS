@@ -207,7 +207,7 @@ pub struct DosState {
 /// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
 /// so the FnOnce can return another `ResumeCallback` (recursive type).
 pub struct ResumeCallback(pub alloc::boxed::Box<
-    dyn FnOnce(&mut thread::KernelThread, &mut DosState, &mut Vcpu) -> Option<ResumeCallback>>);
+    dyn FnOnce(&mut crate::TheArch, &mut thread::KernelThread, &mut DosState, &mut Vcpu) -> Option<ResumeCallback>>);
 
 #[derive(Clone, Copy)]
 pub struct DosMemBlock {
@@ -422,9 +422,9 @@ pub fn syscall(
     match (mode, cs) {
         (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(machine, kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
-        (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(dos, regs),
+        (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(machine, dos, regs),
         (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, kt, dos, regs),
-        _                                       => dpmi::dpmi_api(dos, regs),
+        _                                       => dpmi::dpmi_api(machine, dos, regs),
     }
 }
 

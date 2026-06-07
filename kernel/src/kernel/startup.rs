@@ -18,7 +18,10 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 
 /// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
-pub fn startup(machine: &mut crate::TheArch) -> ! {
+pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
+    // Platform identity comes from the boot config, not a firmware probe.
+    HOST_QEMU.store(if boot.is_qemu { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+
     // Heap must be live before any kernel code allocates. Arch only depends
     // on phys_mm during boot; everything heap-using lives at or below this
     // entry point.
@@ -99,12 +102,10 @@ pub fn startup(machine: &mut crate::TheArch) -> ! {
     // Multiple commands separated by `;` are run in sequence; the machine
     // shuts down when the last one exits. If absent, run DN.COM in a loop
     // (default interactive shell).
-    let mut cmdline_buf = [0u8; 4096];
-    if let Some(raw) = fw_cfg_read(b"opt/cmdline", &mut cmdline_buf) {
-        // CWD: explicit `opt/cwd` fw_cfg key wins; else fall back to each
-        // program's own directory.
-        let mut cwd_buf = [0u8; 256];
-        let explicit_cwd = fw_cfg_read(b"opt/cwd", &mut cwd_buf).map(trim_ascii);
+    if let Some(raw) = boot.cmdline() {
+        // CWD: explicit `opt/cwd` key wins; else fall back to each program's
+        // own directory.
+        let explicit_cwd = boot.cwd().map(trim_ascii);
 
         for one in raw.split(|&b| b == b';') {
             let cmdline = trim_ascii(one);
@@ -128,10 +129,10 @@ pub fn startup(machine: &mut crate::TheArch) -> ! {
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            run_dos_program(machine, path, tail, cwd, &master_env);
+            run_dos_program(machine, path, tail, cwd, &master_env, boot.debug_watch);
         }
         println!("All commands done — shutting down.");
-        crate::arch::shutdown();
+        machine.shutdown();
     }
 
     // Self-build: recompile BOOT\SRC\COMMAND.C -> root COMMAND.COM at boot.
@@ -158,6 +159,7 @@ pub fn startup(machine: &mut crate::TheArch) -> ! {
             b"-mt -lt BOOT\\SRC\\COMMAND.C",
             b"",
             b"PATH=C:\\BORLANDC\\BIN\0\0",
+            boot.debug_watch,
         );
         println!("Build done.");
     } else if crate::kernel::exec::load_file_resolved(b"boot/TC/TCC.EXE").is_ok() {
@@ -168,6 +170,7 @@ pub fn startup(machine: &mut crate::TheArch) -> ! {
             b"-mt -lt BOOT\\SRC\\COMMAND.C",
             b"",
             b"PATH=C:\\BOOT\\TC\0\0",
+            boot.debug_watch,
         );
         println!("Build done.");
     }
@@ -176,7 +179,7 @@ pub fn startup(machine: &mut crate::TheArch) -> ! {
 
     println!("Starting DN...");
     loop {
-        run_dos_program(machine, b"boot/DN/DN.COM", b"", b"", &master_env);
+        run_dos_program(machine, b"boot/DN/DN.COM", b"", b"", &master_env, boot.debug_watch);
         println!("DN exited, restarting...");
     }
 }
@@ -184,7 +187,7 @@ pub fn startup(machine: &mut crate::TheArch) -> ! {
 /// Load a DOS program (.COM or MZ .EXE) into a fresh VM86 thread and run the
 /// event loop until it exits. `cmdline_tail` is written to PSP:0080h (without
 /// the length byte or terminator; those are added automatically).
-fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8]) {
+fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
     use crate::kernel::{dos, exec};
 
     let buf = exec::load_file_resolved(path)
@@ -206,7 +209,7 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
 
     let tid = dos::run_init_program(machine, buf, args, cmdline_tail, cwd, env);
 
-    if let Some((addr0, addr1)) = debug_watch_config() {
+    if let Some((addr0, addr1)) = debug_watch {
         set_debug_watch(Some((addr0, addr1)));
         if addr1 != 0 {
             crate::dbg_println!("[WATCH] armed write watchpoints at {:08X} and {:08X}", addr0, addr1);
@@ -239,46 +242,6 @@ fn set_debug_watch(addrs: Option<(u32, u32)>) {
 
 #[cfg(feature = "hosted")]
 fn set_debug_watch(_addrs: Option<(u32, u32)>) {}
-
-fn debug_watch_config() -> Option<(u32, u32)> {
-    let mut buf = [0u8; 64];
-    let raw = fw_cfg_read(b"opt/debug-watch", &mut buf)?;
-    let raw = trim_ascii(raw);
-    if raw.is_empty() {
-        return None;
-    }
-
-    let split = raw.iter().position(|&b| b == b',' || b == b' ' || b == b';');
-    let addr0 = parse_u32(raw.get(..split.unwrap_or(raw.len()))?)?;
-    let addr1 = match split {
-        Some(idx) => parse_u32(trim_ascii(&raw[idx + 1..])).unwrap_or(0),
-        None => 0,
-    };
-    Some((addr0, addr1))
-}
-
-fn parse_u32(mut s: &[u8]) -> Option<u32> {
-    s = trim_ascii(s);
-    if s.starts_with(b"0x") || s.starts_with(b"0X") {
-        s = &s[2..];
-    }
-    if s.is_empty() {
-        return None;
-    }
-
-    let mut value = 0u32;
-    for &b in s {
-        let digit = match b {
-            b'0'..=b'9' => (b - b'0') as u32,
-            b'a'..=b'f' => (b - b'a' + 10) as u32,
-            b'A'..=b'F' => (b - b'A' + 10) as u32,
-            b'_' => continue,
-            _ => return None,
-        };
-        value = value.checked_mul(16)?.checked_add(digit)?;
-    }
-    Some(value)
-}
 
 const ASSERT_ADDR_HASH: bool = false;
 
@@ -869,73 +832,16 @@ fn dump_virtual_hw(dos: &thread::DosState) {
 }
 
 
-// --- QEMU fw_cfg reader --------------------------------------------------
-// Lets the host select which program to run via:
-//   -fw_cfg name=opt/cmdline,string=PATH
-// Selector register is big-endian over the wire; data port is byte-stream.
-const FW_CFG_SEL: u16 = 0x510;
-const FW_CFG_DATA: u16 = 0x511;
-const FW_CFG_SIG: u16 = 0x0000;
-const FW_CFG_FILE_DIR: u16 = 0x0019;
-
-fn fw_cfg_select(sel: u16) {
-    crate::arch::outw(FW_CFG_SEL, sel);
-}
-
-fn fw_cfg_read_bytes(buf: &mut [u8]) {
-    for b in buf.iter_mut() { *b = crate::arch::inb(FW_CFG_DATA); }
-}
-
-// Cached host identity. QEMU exposes the fw_cfg "QEMU" signature; Bochs and
-// real hardware have no fw_cfg interface. 0 = not yet probed, 1 = not QEMU,
-// 2 = QEMU. Primed at boot by the `opt/cmdline` read below (it calls
-// fw_cfg_present), so the hot-path `is_qemu()` is a plain cached load.
+// Host identity, set once from `BootConfig` at startup (not a firmware probe):
+// 0 = unprimed, 1 = not QEMU, 2 = QEMU.
 static HOST_QEMU: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-fn fw_cfg_present() -> bool {
-    fw_cfg_select(FW_CFG_SIG);
-    let mut sig = [0u8; 4];
-    fw_cfg_read_bytes(&mut sig);
-    let qemu = &sig == b"QEMU";
-    HOST_QEMU.store(if qemu { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-    qemu
-}
-
-/// True iff running under QEMU (vs Bochs / real hardware), detected once via
-/// the fw_cfg signature and cached. Cheap to call on hot paths.
-///
-/// Used to gate QEMU-specific emulation-bug workarounds — e.g. the synthetic
-/// 0x3DA vtrace in the DOS machine layer, which exists only because QEMU's
-/// 0x3DA doesn't sweep a raster; Bochs/real hardware drive it correctly and
-/// are passed through.
+/// True iff the host is QEMU-like (vs Bochs / real hardware). Gates QEMU-
+/// specific emulation-bug workarounds — e.g. the synthetic 0x3DA vtrace in the
+/// DOS machine layer (QEMU's 0x3DA doesn't sweep a raster; Bochs / real hardware
+/// drive it correctly and are passed through). Cheap cached load on hot paths.
 pub fn is_qemu() -> bool {
-    match HOST_QEMU.load(core::sync::atomic::Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => fw_cfg_present(), // not yet probed (no cmdline read ran): probe + cache now
-    }
-}
-
-fn fw_cfg_read<'a>(name: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
-    if !fw_cfg_present() { return None; }
-    fw_cfg_select(FW_CFG_FILE_DIR);
-    let mut count_be = [0u8; 4];
-    fw_cfg_read_bytes(&mut count_be);
-    let count = u32::from_be_bytes(count_be);
-    for _ in 0..count {
-        let mut entry = [0u8; 64];
-        fw_cfg_read_bytes(&mut entry);
-        let size = u32::from_be_bytes(entry[0..4].try_into().unwrap()) as usize;
-        let sel = u16::from_be_bytes(entry[4..6].try_into().unwrap());
-        let name_end = entry[8..].iter().position(|&c| c == 0).unwrap_or(56);
-        if &entry[8..8 + name_end] == name {
-            let n = size.min(buf.len());
-            fw_cfg_select(sel);
-            fw_cfg_read_bytes(&mut buf[..n]);
-            return Some(&buf[..n]);
-        }
-    }
-    None
+    HOST_QEMU.load(core::sync::atomic::Ordering::Relaxed) == 2
 }
 
 fn trim_ascii(s: &[u8]) -> &[u8] {

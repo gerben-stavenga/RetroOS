@@ -89,10 +89,6 @@ fn main() {
     if let Some(dir) = host_dir {
         arch::attach_hostfs(&dir); // COM1 → /host
     }
-    // Always present fw_cfg so the kernel's is_qemu() is true (the interpreter
-    // emulates a QEMU-like, no-real-VGA machine — it must fabricate 0x3DA etc.).
-    // --cmd adds opt/cmdline for a headless single-program launch.
-    arch::attach_fw_cfg(cmd.as_deref(), cwd.as_deref());
 
     let Some(path) = input else {
         kernel::host_run_demo()
@@ -130,8 +126,17 @@ fn main() {
     // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
     arch::enter_raw_mode();
     spawn_keyboard();
+
+    // Build the boot config from our CLI args directly — the interpreter is
+    // QEMU-like (it must fabricate 0x3DA etc.), and we already know the headless
+    // cmdline/cwd, so there's no fw_cfg port round-trip.
+    let mut config = kernel::BootConfig::empty();
+    config.is_qemu = true;
+    if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
+    if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
+
     let mut machine = kernel::new_arch();
-    kernel::startup(&mut machine);
+    kernel::startup(&mut machine, &config);
 }
 
 /// Spawn the stdin → keyboard pump: read host terminal bytes, translate each to

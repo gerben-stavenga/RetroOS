@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use alloc::boxed::Box;
 use crate::arch::Vcpu;
@@ -181,7 +182,7 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
 /// PM client-initiated INT 31h — the DPMI service API, dispatched by AX.
 /// Caller (`dos::syscall`) has already classified the trap as client-side
 /// (CS not in the kernel's stub LDT slots).
-pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
@@ -922,7 +923,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             let vpage_start = base as usize / 4096;
             let ppage_start = phys as u64 / 4096;
             // PWT (bit 3) + PCD (bit 4): write-through, cache-disable for MMIO
-            crate::arch::arch_map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
+            machine.map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
             // Return linear address
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
             regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);
