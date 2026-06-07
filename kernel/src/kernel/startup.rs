@@ -416,7 +416,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
                         }
                     });
                     if !is_blocked {
-                        crate::kernel::dos::raise_pending(unsafe { &mut *dp }, regs);
+                        crate::kernel::dos::raise_pending(machine, unsafe { &mut *dp }, regs);
                     }
                 }
                 thread::Personality::Linux(linux) => {
@@ -534,7 +534,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         } else {
             let kt = &mut thread.kernel;
             match &mut thread.personality {
-                thread::Personality::Dos(dos) => crate::kernel::dos::handle_event(kt, dos, regs, kevent),
+                thread::Personality::Dos(dos) => crate::kernel::dos::handle_event(machine, kt, dos, regs, kevent),
                 thread::Personality::Linux(linux) => crate::kernel::linux::handle_event(kt, linux, regs, kevent),
             }
         };

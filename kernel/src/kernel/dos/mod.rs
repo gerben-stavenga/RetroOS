@@ -16,6 +16,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::arch::Vcpu;
+use arch_abi::Arch; // `machine: &mut TheArch` trait methods (set_irq_line, …)
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
 /// Lets COMMAND.COM bracket a single exec so the log only captures that
@@ -434,6 +435,7 @@ pub fn syscall(
 /// `PageFault` is excluded — the loop handles it inline because it needs
 /// access to the full `Thread` (for `signal_thread`).
 pub fn handle_event(
+    machine: &mut crate::TheArch,
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,
     regs: &mut Vcpu,
@@ -512,19 +514,19 @@ pub fn handle_event(
                 // handler that fixes up DX:AX and advances EIP past the
                 // DIV. Reflect instead of killing — this matches what
                 // FreeDOS does.
-                unsafe { crate::arch::monitor::sw_reflect_vm86_int(regs, n as u8); }
+                machine.sw_reflect_vm86_int(regs, n as u8);
                 thread::KernelAction::Done
             } else {
                 let lin = if is_vm86 {
                     ((regs.code_seg() as u32) << 4).wrapping_add(regs.ip32())
                 } else {
-                    crate::arch::monitor::seg_base(regs.code_seg()).wrapping_add(regs.ip32())
+                    machine.seg_base(regs.code_seg()).wrapping_add(regs.ip32())
                 };
                 let bytes = crate::arch::mem().slice((lin) as usize, 8);
                 let ss_lin = if is_vm86 {
                     ((regs.stack_seg() as u32) << 4).wrapping_add(regs.sp32() & 0xFFFF)
                 } else {
-                    crate::arch::monitor::seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
+                    machine.seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
                 };
                 let s0 = crate::arch::mem().read::<u16>((ss_lin) as usize);
                 let s1 = crate::arch::mem().read::<u16>((ss_lin.wrapping_add(2)) as usize);
@@ -799,7 +801,7 @@ pub fn queue_irq(dos: &mut thread::DosState, irq: crate::arch::Irq) {
 /// `reflect_int_to_real_mode` first, then returns through the same continuation
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
-pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Vcpu) {
+pub fn raise_pending(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) {
     // Mouse-callback dispatch (INT 33h AX=000Ch / Function 12), not a
     // hardware IRQ12/INT 74h delivery. Microsoft documents Function 12 as a
     // FAR subroutine callback and says the mouse driver protects it from
@@ -822,7 +824,7 @@ pub fn raise_pending(dos: &mut thread::DosState, regs: &mut Vcpu) {
     // Keep the interpreter's CPU INTR line coherent with what's still pending so
     // its per-block interrupt check keeps firing until everything is delivered
     // (no-op on metal, where the real 8259 drives INTR).
-    crate::arch::set_irq_line(dos.pc.intr_pending());
+    machine.set_irq_line(dos.pc.intr_pending());
 }
 
 // ── Block-allocator helpers used by INT 21h handlers in `dos.rs` ────────
