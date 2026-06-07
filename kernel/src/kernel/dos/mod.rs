@@ -282,7 +282,7 @@ impl DosState {
         self.pc.set_a20(machine, true);
         // Hand the single global ISA-DMA pool back; a dying thread that
         // armed SB DMA must not poison it for the next program.
-        self.pc.sb.release_dma_pool();
+        self.pc.sb.release_dma_pool(machine);
     }
 
     /// Called by the context-switch code when this thread becomes the running
@@ -609,7 +609,7 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is
     // In-place exec replaces (drops) the old DosState — release its SB
     // DMA pool binding first, else the global pool stays held forever.
     if let thread::Personality::Dos(old) = &mut current.personality {
-        old.pc.sb.release_dma_pool();
+        old.pc.sb.release_dma_pool(machine);
     }
     current.personality = thread::Personality::Dos(new_state);
     let dos_state = current.dos_mut();
@@ -677,7 +677,7 @@ pub fn run_init_program(machine: &mut crate::TheArch, buf: Vec<u8>, args: Vec<Ve
     let mut new_state = DosState::new(machine);
     new_state.dfs.init_from_vfs(&cwd);
     if let thread::Personality::Dos(old) = &mut t.personality {
-        old.pc.sb.release_dma_pool();
+        old.pc.sb.release_dma_pool(machine);
     }
     t.personality = thread::Personality::Dos(new_state);
     let dos_state = t.dos_mut();

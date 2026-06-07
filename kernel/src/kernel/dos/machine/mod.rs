@@ -464,14 +464,14 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            let v = pc.sb.sb_read(p);
+            let v = pc.sb.sb_read(machine, p);
             v
         }
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
         // poll it for DMA progress, not just completion).
         p if Dma8237::owns(p) =>
-            pc.sb.dma_read(p),
+            pc.sb.dma_read(machine, p),
         // Unknown ports read as an unpopulated ISA bus and are logged for missing-device coverage.
         _ => {
             crate::dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
@@ -559,14 +559,14 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16,
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            pc.sb.sb_write(p, val);
+            pc.sb.sb_write(machine, p, val);
         }
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.
         p if Dma8237::owns(p) => {
-            pc.sb.dma.io_write(p, val);
-            pc.sb.maybe_remap();
+            pc.sb.dma.io_write(machine, p, val);
+            pc.sb.maybe_remap(machine);
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {

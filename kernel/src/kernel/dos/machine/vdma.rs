@@ -1,5 +1,6 @@
 //! Virtual 8237 DMA controller + Sound Blaster DMA virtualization.
 
+use arch_abi::Arch;
 use super::*;
 
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
@@ -98,7 +99,7 @@ impl Dma8237 {
         if hi { &mut self.ff_hi } else { &mut self.ff_lo }
     }
 
-    pub fn io_write(&mut self, port: u16, val: u8) {
+    pub fn io_write(&mut self, machine: &mut crate::TheArch, port: u16, val: u8) {
         // Page registers.
         if let Some(&(_, chan)) = DMA_PAGE_PORT.iter().find(|&&(p, _)| p == port) {
             self.ch[chan].prog.page = val;
@@ -152,7 +153,7 @@ impl Dma8237 {
         }
     }
 
-    pub fn io_read(&mut self, port: u16) -> u8 {
+    pub fn io_read(&mut self, machine: &mut crate::TheArch, port: u16) -> u8 {
         // Page registers read back the latched value.
         if let Some(&(_, chan)) = DMA_PAGE_PORT.iter().find(|&&(p, _)| p == port) {
             return self.ch[chan].prog.page;
@@ -235,8 +236,8 @@ impl SbDmaState {
     }
 
     /// Current QEMU i8257 count for the SB 8-bit host channel.
-    pub fn diag_host_count8(&self) -> u16 {
-        real_8237_count(self.host_dma8)
+    pub fn diag_host_count8(&self, machine: &mut crate::TheArch) -> u16 {
+        real_8237_count(machine, self.host_dma8)
     }
 
     /// Whether virtual DMA channel `ch` is armed on the real chip.
@@ -253,18 +254,18 @@ impl SbDmaState {
     /// state and OMF2's sound-init probe falls into a "wait for the card
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
-    pub fn release_dma_pool(&mut self) {
-        self.unbind();
+    pub fn release_dma_pool(&mut self, machine: &mut crate::TheArch) {
+        self.unbind(machine);
         // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
         // this atomically; the hardware ~3 µs hold is irrelevant under
         // emulation. Puts the DSP back in its post-power-on state so the
         // next program's reset+probe behaves like the first one's.
-        crate::arch::outb(self.io_base + 0x06, 1);
-        crate::arch::outb(self.io_base + 0x06, 0);
+        machine.outb(self.io_base + 0x06, 1);
+        machine.outb(self.io_base + 0x06, 0);
         // Stop any in-flight host DMA cold; the next bind reprograms and
         // unmasks. host_dma8/host_dma16 are the SB16's 8-bit/16-bit lines.
-        mask_real_8237(self.host_dma8);
-        mask_real_8237(self.host_dma16);
+        mask_real_8237(machine, self.host_dma8);
+        mask_real_8237(machine, self.host_dma16);
         self.suspended = false;
         self.last_gen = [0; 8];
     }
@@ -280,7 +281,7 @@ impl SbDmaState {
     /// shim for DSP command E4h/E8h (test register write/read). Some older
     /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
     /// sb16 does not appear to surface that response through passthrough.
-    pub fn sb_read(&mut self, p: u16) -> u8 {
+    pub fn sb_read(&mut self, machine: &mut crate::TheArch, p: u16) -> u8 {
         if p == self.io_base + 0x0A {
             if let Some(v) = self.dsp_read_data.take() {
                 return v;
@@ -288,12 +289,12 @@ impl SbDmaState {
         } else if p == self.io_base + 0x0E && self.dsp_read_data.is_some() {
             return 0x80;
         }
-        crate::arch::inb(p)
+        machine.inb(p)
     }
 
     /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
     /// locally; all other traffic continues to the real QEMU sb16/adlib.
-    pub fn sb_write(&mut self, p: u16, val: u8) {
+    pub fn sb_write(&mut self, machine: &mut crate::TheArch, p: u16, val: u8) {
         if p == self.io_base + 0x0C {
             if self.dsp_expect_test_write {
                 self.dsp_test_reg = val;
@@ -312,7 +313,7 @@ impl SbDmaState {
                 _ => {}
             }
         }
-        crate::arch::outb(p, val);
+        machine.outb(p, val);
     }
 
     /// DMA-port read. Two distinct sources of truth, never conflated:
@@ -328,7 +329,7 @@ impl SbDmaState {
     ///  - **everything else** (not-yet-armed = programming snapshot,
     ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
     ///    the captured guest programming.
-    pub fn dma_read(&mut self, port: u16) -> u8 {
+    pub fn dma_read(&mut self, machine: &mut crate::TheArch, port: u16) -> u8 {
         // Channel-data ports only: DMA1 0x00..=0x07 (addr/count pairs for
         // chan 0..3), DMA2 0xC0..=0xCF (addr/count pairs for chan 4..7,
         // 4-byte stride per channel due to 16-bit alignment). Control
@@ -342,7 +343,7 @@ impl SbDmaState {
             let r = (port - 0xC0) >> 1;
             (r & 1 == 1, 4 + (r >> 1) as usize, true)
         } else {
-            return self.dma.io_read(port);
+            return self.dma.io_read(machine, port);
         };
 
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
@@ -358,7 +359,7 @@ impl SbDmaState {
                 let low = !*ff;
                 *ff = !*ff;
                 if low {
-                    let live_count = real_8237_count(h);
+                    let live_count = real_8237_count(machine, h);
                     let p = self.dma.ch[chan].prog;
                     self.dma.read_latch = if is_cnt {
                         // Count register: QEMU-8257's live current-count —
@@ -381,14 +382,14 @@ impl SbDmaState {
                 return if low { v as u8 } else { (v >> 8) as u8 };
             }
         }
-        self.dma.io_read(port)
+        self.dma.io_read(machine, port)
     }
 
     /// Called after every virtual-8237 write. When the BLASTER channel is
     /// (re)armed, alias the guest's DMA buffer onto that channel's
     /// permanent host buffer and program the real 8237. A no-op until the
     /// guest finishes a count write (the per-block re-arm signal).
-    pub fn maybe_remap(&mut self) {
+    pub fn maybe_remap(&mut self, machine: &mut crate::TheArch) {
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
         let c8 = self.dma8 as usize;
         let c16 = self.dma16 as usize;
@@ -415,16 +416,16 @@ impl SbDmaState {
 
         let p = self.dma.ch[chan].prog;
         let (gpa, len) = chan_gpa_len(&p, is16);
-        self.arm(chan, host, is16, gpa, len, p.mode);
+        self.arm(machine, chan, host, is16, gpa, len, p.mode);
     }
 
     /// Alias the guest buffer at `gpa` onto host DMA channel `host`'s
     /// permanent buffer and program the real 8237. Driven from
     /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
     /// virtual-8237 state after a task switch).
-    fn arm(&mut self, chan: usize, host: usize, is16: bool,
+    fn arm(&mut self, machine: &mut crate::TheArch, chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
-        let bufpage = crate::arch::arch_dma_channel_buf(host);
+        let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
         // The buffer sits at `off` inside its channel's 64 KB / 128 KB
         // window; the channel buffer is window-aligned, so the same `off`
@@ -439,7 +440,7 @@ impl SbDmaState {
         // (page 0 = IVT); point the real chip at the channel buffer
         // so the transfer completes and raises the IRQ.
         if len < 0x100 || (gpa & !0xFFF) < 0x1000 {
-            program_real_8237(host as u8, phys, len, mode, is16);
+            program_real_8237(machine, host as u8, phys, len, mode, is16);
             self.dma.ch[chan].armed = true;
             return;
         }
@@ -451,7 +452,7 @@ impl SbDmaState {
         let bound = self.bound_chan == chan as u8 && self.bound_host == host as u8
             && self.bound_gpa == gpa && self.bound_len == len;
         if !bound {
-            if self.bound_gpa != 0 { self.unbind(); }
+            if self.bound_gpa != 0 { self.unbind(machine); }
             let vbase     = (gpa & !0xFFF) as usize;
             let page_off  = (gpa & 0xFFF) as usize;
             let num_pages = (page_off + len as usize + 0xFFF) / 0x1000;
@@ -468,8 +469,8 @@ impl SbDmaState {
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
-            crate::arch::arch_free_range(vbase >> 12, num_pages);
-            crate::arch::arch_map_phys_range(
+            machine.free_range(vbase >> 12, num_pages);
+            machine.map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
             crate::arch::mem().write_bytes(vbase as usize, &snap);
             self.bound_chan  = chan as u8;
@@ -480,7 +481,7 @@ impl SbDmaState {
             self.bound_pages = num_pages;
         }
 
-        program_real_8237(host as u8, phys, len, mode, is16);
+        program_real_8237(machine, host as u8, phys, len, mode, is16);
         // Armed: the real QEMU-8257 is now authoritative for this channel's
         // live addr/count reads (`dma_read` serves them).
         self.dma.ch[chan].armed = true;
@@ -491,13 +492,13 @@ impl SbDmaState {
     /// them, so the partial-end-page neighbour data survives and the guest
     /// can reuse the linear range. The channel buffer is permanent. No-op
     /// when nothing is bound.
-    fn unbind(&mut self) {
+    fn unbind(&mut self, machine: &mut crate::TheArch) {
         if self.bound_gpa == 0 { return; }
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
         snap.copy_from_slice(crate::arch::mem().slice(vbase as usize, span));
-        crate::arch::arch_map_fresh_range(
+        machine.map_fresh_range(
             self.bound_vpage, self.bound_pages);
         crate::arch::mem().write_bytes(vbase as usize, &snap);
         self.bound_chan  = 0xFF;
@@ -513,10 +514,10 @@ impl SbDmaState {
     /// the real 8237 channel so the card stops pulling a buffer that's no
     /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
     /// replays it. Must run with this task's address space active.
-    pub fn sb_suspend(&mut self) {
+    pub fn sb_suspend(&mut self, machine: &mut crate::TheArch) {
         if self.bound_gpa == 0 { return; }
-        mask_real_8237(self.bound_host);
-        self.unbind();
+        mask_real_8237(machine, self.bound_host);
+        self.unbind(machine);
         self.suspended = true;
     }
 
@@ -524,7 +525,7 @@ impl SbDmaState {
     /// re-alias every channel the virtual 8237 still shows armed and
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
-    pub fn sb_resume(&mut self) {
+    pub fn sb_resume(&mut self, machine: &mut crate::TheArch) {
         if !self.suspended { return; }
         self.suspended = false;
         for chan in 0..8 {
@@ -533,7 +534,7 @@ impl SbDmaState {
             let host = if is16 { self.host_dma16 } else { self.host_dma8 } as usize;
             let p = self.dma.ch[chan].prog;
             let (gpa, len) = chan_gpa_len(&p, is16);
-            self.arm(chan, host, is16, gpa, len, p.mode);
+            self.arm(machine, chan, host, is16, gpa, len, p.mode);
         }
     }
 
@@ -570,10 +571,9 @@ fn chan_gpa_len(p: &DmaProg, is16: bool) -> (u32, u32) {
 
 /// Mask host DMA channel `chan` on the real 8237 — stops the card pulling
 /// the channel buffer while the owning task is backgrounded.
-fn mask_real_8237(chan: u8) {
-    use crate::arch::outb;
-    if (4..8).contains(&chan) { outb(0xD4, 0x04 | (chan - 4)); }
-    else if chan < 4 { outb(0x0A, 0x04 | chan); }
+fn mask_real_8237(machine: &mut crate::TheArch, chan: u8) {
+    if (4..8).contains(&chan) { machine.outb(0xD4, 0x04 | (chan - 4)); }
+    else if chan < 4 { machine.outb(0x0A, 0x04 | chan); }
 }
 
 /// Look up `KEY` in a DOS environment block, returning its value bytes.
@@ -598,16 +598,15 @@ fn env_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 /// consumes the buffer, so it's exact for both progress and (terminal-
 /// count) completion. Channel-native units (bytes for 0-3, words 5-7),
 /// matching what the guest programmed.
-fn real_8237_count(host: u8) -> u16 {
-    use crate::arch::{inb, outb};
+fn real_8237_count(machine: &mut crate::TheArch, host: u8) -> u16 {
     let (clr_ff, cnt) = if host < 4 {
         (0x0Cu16, (host as u16) * 2 + 1)
     } else {
         (0xD8u16, 0xC0 + ((host - 4) as u16) * 4 + 2)
     };
-    outb(clr_ff, 0);
-    let lo = inb(cnt) as u16;
-    let hi = inb(cnt) as u16;
+    machine.outb(clr_ff, 0);
+    let lo = machine.inb(cnt) as u16;
+    let hi = machine.inb(cnt) as u16;
     (hi << 8) | lo
 }
 
@@ -616,34 +615,33 @@ fn real_8237_count(host: u8) -> u16 {
 /// addressed; 16-bit channels (5-7) are word-addressed (addr/count in
 /// words, page bit16 implied). Standard sequence: mask, clear flip-flop,
 /// mode, addr lo/hi, page, count lo/hi, unmask.
-fn program_real_8237(chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
-    use crate::arch::outb;
+fn program_real_8237(machine: &mut crate::TheArch, chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
     // Standard PC/AT page-register ports indexed by absolute channel.
     const PAGE: [u8; 8] = [0x87, 0x83, 0x81, 0x82, 0x8F, 0x8B, 0x89, 0x8A];
     if is16 {
         let m = (chan - 4) as u16;            // local 0..3 on controller #2
         let addr = (phys >> 1) & 0xFFFF;       // word address
         let cnt = (len / 2) - 1;               // word count − 1
-        outb(0xD4, 0x04 | (chan - 4));         // mask channel
-        outb(0xD8, 0);                         // clear byte-pointer flip-flop
-        outb(0xD6, mode);
-        outb(0xC0 + (m * 4) as u16, addr as u8);
-        outb(0xC0 + (m * 4) as u16, (addr >> 8) as u8);
-        outb(PAGE[chan as usize] as u16, (phys >> 16) as u8);
-        outb(0xC0 + (m * 4 + 2) as u16, cnt as u8);
-        outb(0xC0 + (m * 4 + 2) as u16, (cnt >> 8) as u8);
-        outb(0xD4, chan - 4);                  // unmask channel
+        machine.outb(0xD4, 0x04 | (chan - 4));         // mask channel
+        machine.outb(0xD8, 0);                         // clear byte-pointer flip-flop
+        machine.outb(0xD6, mode);
+        machine.outb(0xC0 + (m * 4) as u16, addr as u8);
+        machine.outb(0xC0 + (m * 4) as u16, (addr >> 8) as u8);
+        machine.outb(PAGE[chan as usize] as u16, (phys >> 16) as u8);
+        machine.outb(0xC0 + (m * 4 + 2) as u16, cnt as u8);
+        machine.outb(0xC0 + (m * 4 + 2) as u16, (cnt >> 8) as u8);
+        machine.outb(0xD4, chan - 4);                  // unmask channel
     } else {
         let cnt = len - 1;                     // byte count − 1
-        outb(0x0A, 0x04 | chan);               // mask channel
-        outb(0x0C, 0);                         // clear byte-pointer flip-flop
-        outb(0x0B, mode);
-        outb((chan as u16) * 2, phys as u8);
-        outb((chan as u16) * 2, (phys >> 8) as u8);
-        outb(PAGE[chan as usize] as u16, (phys >> 16) as u8);
-        outb((chan as u16) * 2 + 1, cnt as u8);
-        outb((chan as u16) * 2 + 1, (cnt >> 8) as u8);
-        outb(0x0A, chan);                      // unmask channel
+        machine.outb(0x0A, 0x04 | chan);               // mask channel
+        machine.outb(0x0C, 0);                         // clear byte-pointer flip-flop
+        machine.outb(0x0B, mode);
+        machine.outb((chan as u16) * 2, phys as u8);
+        machine.outb((chan as u16) * 2, (phys >> 8) as u8);
+        machine.outb(PAGE[chan as usize] as u16, (phys >> 16) as u8);
+        machine.outb((chan as u16) * 2 + 1, cnt as u8);
+        machine.outb((chan as u16) * 2 + 1, (cnt >> 8) as u8);
+        machine.outb(0x0A, chan);                      // unmask channel
     }
 }
 
