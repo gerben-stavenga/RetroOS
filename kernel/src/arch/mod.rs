@@ -7,6 +7,7 @@
 //! and calls submodules directly. After enter_ring1(), the kernel layer
 //! uses only the re-exports below and arch calls (INT 0x80).
 
+mod backend;
 mod boot;
 mod calls;
 mod descriptors;
@@ -21,6 +22,7 @@ mod x86;
 // --- Re-exports for the kernel layer (ring 1) ---
 
 // Types
+pub use backend::Metal;
 pub use paging2::{KernelPages, RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE};
 pub use vcpu::{Vcpu, GuestMem, mem, set_current_vcpu};
 pub use irq::Irq;

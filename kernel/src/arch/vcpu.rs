@@ -11,7 +11,6 @@
 //! becomes a shared handle and the per-core register state stays here; the
 //! kernel-facing shape of this type does not change.
 
-use crate::Regs;
 use arch_abi::GuestBytes;
 use super::paging2::RootPageTable;
 
