@@ -37,6 +37,25 @@ pub mod vga;
 // Re-export arch types used as opaque blobs by kernel code
 pub use arch::{RootPageTable, PAGE_SIZE, KernelPages, RawPage, LOW_MEM_BASE};
 
+// The single concrete arch backend this build links against, threaded as
+// `&mut TheArch` through `startup`/`event_loop` so the kernel's mutable arch
+// state is borrow-checked instead of living in global `static mut`s. Because
+// `TheArch` is concrete, `TheArch::PageTable` is `RootPageTable`, so the thread
+// table's `Vcpu` stays a plain type and nothing in the kernel needs to be
+// generic yet. (Making the kernel generic over `A: Arch` for pure dependency
+// injection — and lifting the metal backend into its own crate — is a later
+// stage; this keeps that end state in reach while threading the borrow first.)
+#[cfg(feature = "hosted")]
+pub type TheArch = arch::Interp;
+#[cfg(not(feature = "hosted"))]
+pub type TheArch = arch::Metal;
+
+/// Construct this build's arch backend (a zero-sized handle today).
+pub fn new_arch() -> TheArch {
+    #[cfg(feature = "hosted")] { arch::Interp }
+    #[cfg(not(feature = "hosted"))] { arch::Metal }
+}
+
 /// Multiboot memory map entry
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
