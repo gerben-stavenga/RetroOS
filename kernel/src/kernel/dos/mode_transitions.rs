@@ -311,7 +311,7 @@ pub(super) fn resume_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, s
     let saved_regs = save.rm_call_struct_addr().map(|addr| {
         let current = RmCallStruct::capture(regs);
         let saved = regs.read::<RmCallStruct>((addr) as usize);
-        crate::arch::mem().write::<RmCallStruct>((addr) as usize, current);
+        regs.write::<RmCallStruct>((addr) as usize, current);
         saved
     });
 

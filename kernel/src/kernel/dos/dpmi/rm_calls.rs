@@ -58,7 +58,7 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu
         mode_transitions::rm_get_stack(dos)
     };
 
-    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
+    regs.write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     // Get IVT entry for the interrupt
@@ -114,7 +114,7 @@ pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Vcpu) -
         mode_transitions::rm_get_stack(dos)
     };
 
-    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
+    regs.write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     regs.rax = rm.eax as u64;
@@ -166,7 +166,7 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vc
         mode_transitions::rm_get_stack(dos)
     };
 
-    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
+    regs.write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     regs.rax = rm.eax as u64;

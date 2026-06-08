@@ -1868,7 +1868,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             }
             out[pos] = 0;
             // Write to ES:DI
-            crate::arch::mem().write_bytes(dst as usize, &out[..pos + 1]);
+            regs.write_bytes(dst as usize, &out[..pos + 1]);
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -2198,7 +2198,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     let len = regs.read::<u8>((addr) as usize) as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
-    cmd[..copy].copy_from_slice(crate::arch::mem().slice((addr + 1) as usize, copy));
+    cmd[..copy].copy_from_slice(regs.slice((addr + 1) as usize, copy));
     let mut start = 0;
     while start < copy && cmd[start] == b' ' { start += 1; }
     let mut end = start;
@@ -2577,7 +2577,7 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
     let tail_len = regs.read::<u8>((cmdtail_addr) as usize) as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
-    tail[..copy_len].copy_from_slice(crate::arch::mem().slice((cmdtail_addr + 1) as usize, copy_len));
+    tail[..copy_len].copy_from_slice(regs.slice((cmdtail_addr + 1) as usize, copy_len));
 
     let prog_name: &[u8] = &filename[..flen];
 
@@ -2846,7 +2846,7 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
         }
 
         let img = &data[header_size as usize..header_size as usize + load_size];
-        crate::arch::mem().write_bytes(load_base as usize, img);
+        regs.write_bytes(load_base as usize, img);
         // Apply relocations using caller's reloc_factor (not load_seg).
         for i in 0..reloc_count {
             let entry = reloc_offset + i * 4;
@@ -2860,7 +2860,7 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
         dos_trace!("D21 4B03 MZ loaded: load_size={} relocs={}", load_size, reloc_count);
     } else {
         // Raw / .COM: copy file verbatim at load_seg:0.
-        crate::arch::mem().write_bytes(load_base as usize, &buf);
+        regs.write_bytes(load_base as usize, &buf);
         dos_trace!("D21 4B03 raw loaded: size={}", buf.len());
     }
 
