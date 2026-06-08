@@ -55,7 +55,7 @@ pub fn arch_switch_to(
 
 /// COW fork the current address space. Fills child root.
 /// Caller must save parent root after (fork modifies entries for COW).
-pub fn arch_user_fork(child_root: &mut crate::RootPageTable) {
+pub fn arch_user_fork(child_root: &mut super::RootPageTable) {
     unsafe {
         core::arch::asm!(
             "int 0x80",

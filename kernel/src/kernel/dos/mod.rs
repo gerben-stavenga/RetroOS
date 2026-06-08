@@ -30,11 +30,10 @@ static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
 pub(crate) static IN_HW_IRQ_CONTEXT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Single-step tracing budget. Armed by specific DPMI handlers to watch the
-/// client's code path right after a suspicious return. Decremented on each
-/// PM `#DB`; at zero, tracing stops and TF is cleared.
-pub(crate) static PM_STEP_BUDGET: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+/// Single-step tracing budget — lives in `arch-abi` (the backend's `#DB` handler
+/// consumes it; this layer only arms it). Re-exported so DPMI sites keep writing
+/// `dos::PM_STEP_BUDGET`.
+pub(crate) use arch_abi::PM_STEP_BUDGET;
 
 /// Log one PM step: CS:EIP + key regs, plus the first few opcode bytes.
 pub(crate) fn pm_step_log(regs: &Vcpu) {

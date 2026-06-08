@@ -9,7 +9,7 @@ use crate::arch::irq::handle_irq;
 use crate::arch::paging2::{self, Entry};
 use crate::println;
 use crate::arch::x86;
-use crate::{Frame64, Regs};
+use arch_abi::{Frame64, Regs};
 use crate::arch::Vcpu;
 
 // =============================================================================
@@ -156,7 +156,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
                 regs.rdi as u32,
             );
         } else {
-            let cs_base = if regs.mode() == crate::UserMode::VM86 {
+            let cs_base = if regs.mode() == arch_abi::UserMode::VM86 {
                 (regs.code_seg() as u32) << 4
             } else {
                 crate::arch::monitor::seg_base(regs.code_seg())
@@ -164,7 +164,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
             let ip = regs.ip32();
             let lin = cs_base.wrapping_add(ip);
             let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-            let ss_base = if regs.mode() == crate::UserMode::VM86 {
+            let ss_base = if regs.mode() == arch_abi::UserMode::VM86 {
                 (regs.stack_seg() as u32) << 4
             } else {
                 crate::arch::monitor::seg_base(regs.stack_seg())
@@ -299,7 +299,7 @@ fn arch_dispatch(regs: &mut Regs) {
 }
 
 fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
-    use crate::UserMode;
+    use arch_abi::UserMode;
     let want_64 = regs.mode() == UserMode::Mode64;
     let is_vm86 = regs.mode() == UserMode::VM86;
     let need_toggle = (!is_long && want_64) || (is_long && is_vm86);
@@ -596,7 +596,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 /// are handled inline by arch before bubbling.
 fn isr_handler_ring3(regs: &mut Regs) {
     use crate::arch::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult, TF_VIRTUAL_IF_STEPPING};
-    use crate::UserMode;
+    use arch_abi::UserMode;
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
     let kevent: KE = match int_num {
@@ -611,7 +611,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
             if debug_watch_trap(regs, dr6, false) {
                 return;
             }
-            let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
+            let budget = arch_abi::PM_STEP_BUDGET.load(Ordering::Relaxed);
             if budget > 0 {
                 // Log step in PM and VM86 — VM86 logging needed to trace
                 // RM execution after a raw PM->RM switch. The DOS-layer tracer
@@ -619,7 +619,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 // (its `space` is unused — `mem()` reads the active mapping).
                 let v = Vcpu::new(*regs, paging2::RootPageTable::empty());
                 crate::kernel::dos::pm_step_log(&v);
-                crate::kernel::dos::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
+                arch_abi::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
                 regs.set_flag32(1 << 8); // keep TF on
                 return;
             }
@@ -773,8 +773,8 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
     }
 
     // Kernel fault in heap region: demand-page a real writable page
-    if !user && fault_addr >= KERNEL_BASE && fault_addr < crate::kernel::heap::HEAP_END {
-        let heap_start = crate::kernel::heap::heap_base();
+    if !user && fault_addr >= KERNEL_BASE && fault_addr < paging2::HEAP_END {
+        let heap_start = paging2::heap_base();
         if fault_addr >= heap_start && !present {
             return Some(demand_page_kernel(fault_addr));
         }
@@ -914,7 +914,7 @@ fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
 const VM_FLAG: u64 = 1 << 17;
 
 fn is_vm86(regs: &Regs) -> bool {
-    regs.mode() == crate::UserMode::VM86
+    regs.mode() == arch_abi::UserMode::VM86
 }
 
 // =============================================================================

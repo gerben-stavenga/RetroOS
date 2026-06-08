@@ -2,7 +2,7 @@
 
 use crate::pipe::Pipe;
 use crate::arch::x86::{inb, outb};
-use crate::Regs;
+use arch_abi::Regs;
 
 /// PIC ports
 const MASTER_CMD: u16 = 0x20;

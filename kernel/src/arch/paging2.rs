@@ -104,6 +104,22 @@ pub use arch_abi::LOW_MEM_BASE;
 /// Kernel space starts here (PDPT[5+], after low memory)
 pub const KERNEL_BASE: usize = 0xC0B0_0000;
 
+/// The kernel heap occupies `[heap_base() .. HEAP_END)` in kernel space. The
+/// demand-paging `#PF` handler grows it on access and the heap allocator carves
+/// within it — but the window itself is a memory-layout fact (the ceiling, and
+/// the base = first page past the kernel image's linker `_end`), owned here, not
+/// allocator policy.
+pub const HEAP_END: usize = 0xFFF0_0000;
+
+/// First page after the kernel image (`_end`), aligned up — the heap base.
+pub fn heap_base() -> usize {
+    unsafe extern "C" {
+        static _end: u8;
+    }
+    let end = (&raw const _end) as usize;
+    (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
 /// Per-thread saved root page table entries.
 ///
 /// The root page (PD or PDPT) is a constant static page. This struct

@@ -20,6 +20,16 @@
 mod arch;
 pub use arch::{Arch, GuestBytes, Vcpu};
 
+/// Single-step trace budget — a cross-boundary diagnostic, not an arch operation.
+/// Armed by the DOS/DPMI layer (kernel) to watch a client's code path after a
+/// suspicious return; consumed by the backend's single-step `#DB` handler, which
+/// decrements it and logs each step until it reaches zero. It lives here because
+/// it is the one piece of state the *arming* side (kernel) and the *consuming*
+/// side (backend) both touch, and both depend on this crate. Backends without a
+/// single-step trap (the interpreter) simply never read it.
+pub static PM_STEP_BUDGET: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 // =============================================================================
 // Guest-visible selector values (ABI-fixed across backends)
 // =============================================================================
