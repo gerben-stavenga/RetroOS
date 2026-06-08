@@ -73,11 +73,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
     // Multiboot info is in low memory — access through LOW_MEM_BASE mapping
     let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const crate::MultibootInfo) };
 
-    println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
+    lib::println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
     paging2::finish_setup_paging();
 
-    println!("kernel_phys: {:#x}", KERNEL_PHYS);
+    lib::println!("kernel_phys: {:#x}", KERNEL_PHYS);
 
     let kernel_low_page = (KERNEL_PHYS / PAGE_SIZE) as u64;
     let kernel_high_page = ((KERNEL_PHYS + kernel_size + PAGE_SIZE - 1) / PAGE_SIZE) as u64;
@@ -97,19 +97,19 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
         kernel_high_page,
     );
 
-    println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
+    lib::println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
-    println!("Memory regions: {}", mmap_count);
+    lib::println!("Memory regions: {}", mmap_count);
     for entry in mmap_entries {
         if entry.typ == 1 {
             let base = entry.base;
             let length = entry.length;
-            println!("  Available: {:#x} - {:#x}", base, base + length);
+            lib::println!("  Available: {:#x} - {:#x}", base, base + length);
         }
     }
 
     irq::init_interrupts();
-    println!("Interrupts initialized");
+    lib::println!("Interrupts initialized");
 
     if paging2::cpu_supports_long_mode() {
         paging2::sync_hw_pdpt();
@@ -117,11 +117,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
         let saved = paging2::ensure_trampoline_mapped();
         descriptors::toggle_mode(paging2::toggle_cr3(true));
         paging2::clear_trampoline(saved);
-        println!("Switched to Compat mode");
+        lib::println!("Switched to Compat mode");
     }
 
     x86::sti();
-    println!("Interrupts enabled");
+    lib::println!("Interrupts enabled");
 
     // Install stack guard pages: unmap the page directly below each stack
     // so any overflow takes a clean #PF (caught and labeled in
@@ -131,10 +131,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
     let astack_guard = (&raw const crate::ARCH_STACK_GUARD) as usize;
     paging2::unmap_kernel_page(kstack_guard);
     paging2::unmap_kernel_page(astack_guard);
-    println!("Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
+    lib::println!("Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
 
-    println!();
-    println!("\x1b[92mHello from Rust kernel!\x1b[0m");
+    lib::println!();
+    lib::println!("\x1b[92mHello from Rust kernel!\x1b[0m");
 
     // Read the boot config (QEMU fw_cfg) at the platform boundary, before
     // handing it to the kernel — the kernel no longer pokes firmware ports.

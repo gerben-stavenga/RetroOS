@@ -444,9 +444,9 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
     let (_, _, _, edx) = x86::cpuid(1);
     if edx & (1 << 1) != 0 {
         unsafe { x86::write_cr4(x86::read_cr4() | x86::cr4::VME); }
-        crate::println!("VME enabled");
+        lib::println!("VME enabled");
     } else {
-        crate::println!("VME not supported, using software VM86 monitor");
+        lib::println!("VME not supported, using software VM86 monitor");
     }
 
     // Enable SSE if supported; always init x87.
@@ -676,7 +676,7 @@ pub fn setup_syscall() {
         SYSCALL_KERNEL_RSP = TSS64.sp0;
     }
 
-    crate::println!("SYSCALL enabled");
+    lib::println!("SYSCALL enabled");
 }
 
 /// Drop from ring 0 to ring 1 in place.

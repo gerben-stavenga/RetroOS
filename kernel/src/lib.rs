@@ -33,6 +33,10 @@ pub use kernel::thread;
 // 0xE9 debug port); `print!`/`println!`/`dbg_*!` are defined there (macro_export
 // puts them at the crate root, so `crate::println!` keeps working).
 pub mod vga;
+// The console macros live in `lib`; re-exporting them at the crate root makes
+// both bare `println!` (crate-wide, via this 2018 path import) and the explicit
+// `crate::println!` / `crate::dbg_println!` paths the kernel uses resolve.
+pub use lib::{print, println, dbg_print, dbg_println};
 
 // Re-export arch types used as opaque blobs by kernel code
 pub use arch::{RootPageTable, PAGE_SIZE, KernelPages, RawPage, LOW_MEM_BASE};

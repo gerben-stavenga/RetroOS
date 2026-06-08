@@ -35,33 +35,6 @@ pub(crate) static IN_HW_IRQ_CONTEXT: core::sync::atomic::AtomicBool =
 /// `dos::PM_STEP_BUDGET`.
 pub(crate) use arch_abi::PM_STEP_BUDGET;
 
-/// Log one PM step: CS:EIP + key regs, plus the first few opcode bytes.
-pub(crate) fn pm_step_log(regs: &Vcpu) {
-    let is_vm86 = regs.frame.rflags & (1u64 << 17) != 0;
-    let (cs_base, mode) = if is_vm86 {
-        ((regs.code_seg() as u32) << 4, "RM")
-    } else {
-        let cs = regs.code_seg();
-        let m = if crate::arch::monitor::seg_is_32(cs) { "PM32" } else { "PM16" };
-        (crate::arch::monitor::seg_base(cs), m)
-    };
-    let ip = if mode == "PM32" { regs.ip32() } else { regs.ip32() & 0xFFFF };
-    let lin = cs_base.wrapping_add(ip);
-    let mut b = [0u8; 8];
-    for i in 0..8 {
-        b[i] = regs.read::<u8>(((lin + i as u32)) as usize);
-    }
-    crate::dbg_println!(
-        "[STEP {}] {:04X}:{:08X} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} SS:SP={:04X}:{:08X} DS={:04X} ES={:04X}",
-        mode, regs.code_seg(), ip,
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
-        regs.rsi as u32, regs.rdi as u32, regs.rbp as u32,
-        regs.frame.ss as u16, regs.sp32(),
-        regs.ds as u16, regs.es as u16,
-    );
-}
-
 /// Returns true if a trace line should fire. Folds away to `false` when the
 /// compile-time `DOS_TRACE` master switch is off, so disabled traces cost
 /// nothing in the binary.

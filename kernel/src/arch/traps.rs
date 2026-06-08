@@ -7,7 +7,6 @@
 
 use crate::arch::irq::handle_irq;
 use crate::arch::paging2::{self, Entry};
-use crate::println;
 use crate::arch::x86;
 use arch_abi::{Frame64, Regs};
 use crate::arch::Vcpu;
@@ -138,7 +137,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 
     if hits <= 32 {
         if kernel {
-            crate::dbg_println!(
+            lib::dbg_println!(
                 "[WATCH-K] hit={} dr6={:08X} at {:04X}:{:08X} watch0={:08X}:{:04X} watch1={:08X}:{:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X}",
                 hits,
                 dr6,
@@ -176,7 +175,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
             let st3 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(6) as *const u16) };
             let st4 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(8) as *const u16) };
             let st5 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(10) as *const u16) };
-            crate::dbg_println!(
+            lib::dbg_println!(
                 "[WATCH] hit={} dr6={:08X} after {:04X}:{:08X} next={:02X?} watch0={:08X}:{:04X} watch1={:08X}:{:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X} DS={:04X} ES={:04X} SS:SP={:04X}:{:08X} stack={:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
                 hits, dr6, regs.code_seg(), ip, bytes, addr0, value0, addr1, value1,
                 regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
@@ -359,7 +358,7 @@ fn arch_switch_to(regs: &mut Regs) {
     if !hash_ptr.is_null() {
         let new_hash = paging2::hash_and_record();
         if expected != 0 && expected != new_hash {
-            crate::println!("\x1b[91mHASH MISMATCH expected {:#018x} got {:#018x}\x1b[0m", expected, new_hash);
+            lib::println!("\x1b[91mHASH MISMATCH expected {:#018x} got {:#018x}\x1b[0m", expected, new_hash);
             paging2::print_recorded_diff(expected, new_hash);
         }
     }
@@ -618,7 +617,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 // takes a `&Vcpu`; wrap the trap frame in a throwaway vcpu view
                 // (its `space` is unused — `mem()` reads the active mapping).
                 let v = Vcpu::new(*regs, paging2::RootPageTable::empty());
-                crate::kernel::dos::pm_step_log(&v);
+                crate::arch::monitor::pm_step_log(&v);
                 arch_abi::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
                 regs.set_flag32(1 << 8); // keep TF on
                 return;
@@ -690,7 +689,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
             };
             let sp = regs.sp32();
             let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
-            crate::dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
+            lib::dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
                 regs.code_seg(), regs.ip32(), regs.err_code, bytes,
                 regs.stack_seg(), sp, stack);
             KE::Exception(int_num as u8)
@@ -924,6 +923,6 @@ fn is_vm86(regs: &Regs) -> bool {
 #[track_caller]
 fn panic_with_regs(msg: &str, regs: &Regs) -> ! {
     x86::cli();
-    println!("{:?}", regs);
+    lib::println!("{:?}", regs);
     panic!("{}", msg);
 }

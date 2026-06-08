@@ -196,25 +196,113 @@ pub fn vga() -> &'static mut Vga {
     unsafe { &mut *(&raw mut VGA) }
 }
 
-/// Print formatted text
+// =============================================================================
+// Debug-output sink + the console macros
+// =============================================================================
+//
+// Logging is a *platform* concern that must work ambiently (no `&mut machine` to
+// thread into a `println!`) and even mid-panic, so it goes through a function-
+// pointer sink the platform installs once at startup rather than the `arch`
+// boundary: metal installs an `out 0xE9, al` emitter, the hosted binary a
+// stderr/log-file writer, the bootloader installs nothing (sink stays null).
+// Living in `lib` lets every embedder — bootloader, kernel, and each backend
+// crate — share one sink and one set of macros. `lib::vga` itself only renders
+// the framebuffer; the byte sink is the function pointer below.
+
+/// The platform-installed debug-output sink (`fn(u8)` as its address; 0 = none,
+/// bytes dropped). Write-only and panic-safe: an atomic load + indirect call.
+static DEBUG_SINK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the platform debug-output sink. Called once, early, by the platform
+/// entry point (metal `boot_kernel`, hosted `main`) before anything logs.
+pub fn set_debug_sink(f: fn(u8)) {
+    DEBUG_SINK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Emit one byte to the debug-output sink (the DOS console mirror uses this to
+/// echo program output to the log stream alongside the VGA framebuffer).
+pub fn debug_byte(b: u8) {
+    stream(b);
+}
+
+#[inline]
+fn stream(b: u8) {
+    let p = DEBUG_SINK.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        let f: fn(u8) = unsafe { core::mem::transmute(p) };
+        f(b);
+    }
+}
+
+/// Write one byte to the console: render it to the framebuffer and mirror it to
+/// the sink stream. Direct console writers (DOS/Linux `write`) use this.
+pub fn putchar(c: u8) {
+    vga().putchar(c);
+    stream(c);
+}
+
+/// Console writer behind `print!`/`println!`: renders to the framebuffer when
+/// the kernel owns the screen, and always mirrors to the sink stream.
+pub struct Console;
+impl Write for Console {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let to_screen = KERNEL_OWNS_SCREEN.load(core::sync::atomic::Ordering::Relaxed);
+        for b in s.bytes() {
+            if to_screen {
+                vga().putchar(b);
+            }
+            stream(b);
+        }
+        Ok(())
+    }
+}
+
+/// Debug-console-only writer (the sink stream, never the framebuffer).
+pub struct DebugCon;
+impl Write for DebugCon {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            stream(b);
+        }
+        Ok(())
+    }
+}
+
+/// Print formatted text (framebuffer when kernel-owned + sink mirror).
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        let _ = $crate::vga::vga().write_fmt(format_args!($($arg)*));
+        let _ = $crate::vga::Console.write_fmt(format_args!($($arg)*));
     }};
 }
 
-/// Print formatted text with newline
+/// Print formatted text with newline.
 #[macro_export]
 macro_rules! println {
-    () => { $crate::vga::vga().putchar(b'\n') };
+    () => { $crate::vga::putchar(b'\n') };
     ($($arg:tt)*) => {{
         $crate::print!($($arg)*);
         $crate::print!("\n");
     }};
 }
 
-// The debug console (port 0xE9) and `dbg_print!`/`dbg_println!` live in the
-// embedder (kernel/bootloader), since they cross the arch boundary `lib` is
-// below. `lib::vga` is purely a framebuffer renderer.
+/// Print to the debug console (sink) only, never the framebuffer.
+#[macro_export]
+macro_rules! dbg_print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = $crate::vga::DebugCon.write_fmt(format_args!($($arg)*));
+    }};
+}
+
+/// `dbg_print!` with a newline.
+#[macro_export]
+macro_rules! dbg_println {
+    () => { $crate::dbg_print!("\n") };
+    ($($arg:tt)*) => {{
+        $crate::dbg_print!($($arg)*);
+        $crate::dbg_print!("\n");
+    }};
+}

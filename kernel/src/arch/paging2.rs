@@ -720,15 +720,15 @@ fn diff_children(a: &[(u16, Node)], b: &[(u16, Node)], depth: usize) {
                 ai += 1; bi += 1;
             }
             (Some((aidx, an)), Some((bidx, _))) if aidx < bidx => {
-                crate::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                lib::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
                 ai += 1;
             }
             (_, Some((bidx, bn))) => {
-                crate::println!("{:w$}+ [{}] bits={:#x}", "", bidx, node_bits(bn), w = depth * 2);
+                lib::println!("{:w$}+ [{}] bits={:#x}", "", bidx, node_bits(bn), w = depth * 2);
                 bi += 1;
             }
             (Some((aidx, an)), None) => {
-                crate::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                lib::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
                 ai += 1;
             }
             (None, None) => break,
@@ -740,18 +740,18 @@ fn diff_node(idx: u16, a: &Node, b: &Node, depth: usize) {
     match (a, b) {
         (Node::Internal { bits: ab, children: ac }, Node::Internal { bits: bb, children: bc }) => {
             if ab != bb {
-                crate::println!("{:w$}~ [{}] bits={:#x} -> {:#x}", "", idx, ab, bb, w = depth * 2);
+                lib::println!("{:w$}~ [{}] bits={:#x} -> {:#x}", "", idx, ab, bb, w = depth * 2);
             } else {
-                crate::println!("{:w$}~ [{}] bits={:#x} (children changed)", "", idx, ab, w = depth * 2);
+                lib::println!("{:w$}~ [{}] bits={:#x} (children changed)", "", idx, ab, w = depth * 2);
             }
             diff_children(ac, bc, depth + 1);
         }
         (Node::Leaf { bits: ab, data_hash: ah }, Node::Leaf { bits: bb, data_hash: bh }) => {
-            crate::println!("{:w$}~ [{}] bits={:#x}dh={:#x} -> bits={:#x}dh={:#x}",
+            lib::println!("{:w$}~ [{}] bits={:#x}dh={:#x} -> bits={:#x}dh={:#x}",
                 "", idx, ab, ah, bb, bh, w = depth * 2);
         }
         _ => {
-            crate::println!("{:w$}~ [{}] node type changed!", "", idx, w = depth * 2);
+            lib::println!("{:w$}~ [{}] node type changed!", "", idx, w = depth * 2);
         }
     }
 }
@@ -813,7 +813,7 @@ pub fn print_recorded_diff(expected: u64, actual: u64) {
     let act = map.get(&actual);
     match (exp, act) {
         (Some(e), Some(a)) => e.diff(a),
-        _ => crate::println!("  (trees not available for diff)"),
+        _ => lib::println!("  (trees not available for diff)"),
     }
 }
 
@@ -895,27 +895,27 @@ fn remove_identity_mapping<E: Entry>(entries: &mut [E]) {
 pub fn finish_setup_paging() {
     match entries() {
         Entries::E32(e) => {
-            crate::println!("Paging: Legacy (32-bit)");
+            lib::println!("Paging: Legacy (32-bit)");
             remove_identity_mapping(e);
             harden_kernel(e);
         }
         Entries::E64(e) => {
-            crate::println!("Paging: PAE (64-bit entries)");
+            lib::println!("Paging: PAE (64-bit entries)");
             let lm = cpu_supports_long_mode();
             if lm {
-                crate::println!("CPU supports Long Mode (64-bit)");
+                lib::println!("CPU supports Long Mode (64-bit)");
 
                 // Set up long mode page tables
                 setup_long_mode_tables();
-                crate::println!("Long mode tables set up");
+                lib::println!("Long mode tables set up");
             }
 
             remove_identity_mapping(e);
-            crate::println!("Identity mapping removed");
+            lib::println!("Identity mapping removed");
 
             enable_nx();
             if nx_enabled() {
-                crate::println!("NX (No-Execute) protection enabled");
+                lib::println!("NX (No-Execute) protection enabled");
             }
 
             harden_kernel(e);
@@ -1695,12 +1695,12 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     let data_start_page = page_idx(data_start);
     let data_end_page = page_idx(data_end + PAGE_SIZE - 1);
 
-    crate::println!("Hardening kernel:");
-    crate::println!("  .text:   {:#x}-{:#x} (pages {}-{}): R-X",
+    lib::println!("Hardening kernel:");
+    lib::println!("  .text:   {:#x}-{:#x} (pages {}-{}): R-X",
         text_start, text_end, text_start_page, text_end_page);
-    crate::println!("  .rodata: {:#x}-{:#x} (pages {}-{}): R-- NX",
+    lib::println!("  .rodata: {:#x}-{:#x} (pages {}-{}): R-- NX",
         text_end, rodata_end, text_end_page, rodata_end_page);
-    crate::println!("  .data:   {:#x}-{:#x} (pages {}-{}): RW- NX",
+    lib::println!("  .data:   {:#x}-{:#x} (pages {}-{}): RW- NX",
         data_start, data_end, data_start_page, data_end_page);
 
     // .text: read-only, executable (no NX)
@@ -1722,5 +1722,5 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     }
 
     invalidate_tlb();
-    crate::println!("Kernel hardening complete");
+    lib::println!("Kernel hardening complete");
 }
