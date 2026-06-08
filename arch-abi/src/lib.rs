@@ -30,6 +30,88 @@ pub use arch::{Arch, GuestBytes, Vcpu};
 pub static PM_STEP_BUDGET: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Boot-time platform configuration, read once by the platform entry point and
+/// handed to `startup` — instead of the kernel poking firmware ports itself.
+///
+/// It carries the host-selected headless command line, working directory,
+/// debug-watch addresses, and the is-QEMU flag. On metal, the backend's entry
+/// reads these from QEMU's fw_cfg interface; the hosted `main` fills them
+/// straight from its CLI args. It lives here — the boot boundary contract — so
+/// the entry (which constructs it) and the kernel (which consumes it) share one
+/// type across the crate split.
+pub struct BootConfig {
+    cmdline: [u8; 4096],
+    cmdline_len: Option<usize>, // None = no headless cmdline (interactive DN loop)
+    cwd: [u8; 256],
+    cwd_len: Option<usize>,
+    /// Debug write-watch addresses (metal QEMU `opt/debug-watch`), if any.
+    pub debug_watch: Option<(u32, u32)>,
+    /// Host is QEMU-like: fabricate the synthetic 0x3DA vtrace etc. (vs Bochs /
+    /// real hardware, whose 0x3DA is passed through).
+    pub is_qemu: bool,
+}
+
+impl BootConfig {
+    pub const fn empty() -> Self {
+        BootConfig {
+            cmdline: [0; 4096], cmdline_len: None,
+            cwd: [0; 256], cwd_len: None,
+            debug_watch: None, is_qemu: false,
+        }
+    }
+    /// Record the headless command line (semicolon-separated program list).
+    pub fn set_cmdline(&mut self, s: &[u8]) {
+        let n = s.len().min(self.cmdline.len());
+        self.cmdline[..n].copy_from_slice(&s[..n]);
+        self.cmdline_len = Some(n);
+    }
+    /// Record the explicit working directory for the headless launch.
+    pub fn set_cwd(&mut self, s: &[u8]) {
+        let n = s.len().min(self.cwd.len());
+        self.cwd[..n].copy_from_slice(&s[..n]);
+        self.cwd_len = Some(n);
+    }
+    pub fn cmdline(&self) -> Option<&[u8]> { self.cmdline_len.map(|n| &self.cmdline[..n]) }
+    pub fn cwd(&self) -> Option<&[u8]> { self.cwd_len.map(|n| &self.cwd[..n]) }
+}
+
+/// Parse an `opt/debug-watch` value (`"addr0[,addr1]"`, hex with optional `0x`)
+/// into write-watch addresses, for the metal entry to fill
+/// `BootConfig::debug_watch`. Returns `None` if empty/unparseable.
+pub fn parse_debug_watch(raw: &[u8]) -> Option<(u32, u32)> {
+    fn trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|&c| c > b' ').unwrap_or(s.len());
+        let end = s.iter().rposition(|&c| c > b' ').map_or(start, |i| i + 1);
+        &s[start..end]
+    }
+    fn parse_u32(mut s: &[u8]) -> Option<u32> {
+        s = trim(s);
+        if s.starts_with(b"0x") || s.starts_with(b"0X") { s = &s[2..]; }
+        if s.is_empty() { return None; }
+        let mut value = 0u32;
+        for &b in s {
+            let digit = match b {
+                b'0'..=b'9' => (b - b'0') as u32,
+                b'a'..=b'f' => (b - b'a' + 10) as u32,
+                b'A'..=b'F' => (b - b'A' + 10) as u32,
+                b'_' => continue,
+                _ => return None,
+            };
+            value = value.checked_mul(16)?.checked_add(digit)?;
+        }
+        Some(value)
+    }
+    let raw = trim(raw);
+    if raw.is_empty() { return None; }
+    let split = raw.iter().position(|&b| b == b',' || b == b' ' || b == b';');
+    let addr0 = parse_u32(raw.get(..split.unwrap_or(raw.len()))?)?;
+    let addr1 = match split {
+        Some(idx) => parse_u32(trim(&raw[idx + 1..])).unwrap_or(0),
+        None => 0,
+    };
+    Some((addr0, addr1))
+}
+
 // =============================================================================
 // Guest-visible selector values (ABI-fixed across backends)
 // =============================================================================
