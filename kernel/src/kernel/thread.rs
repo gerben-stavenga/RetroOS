@@ -523,7 +523,7 @@ pub fn exit_thread(machine: &mut crate::TheArch, tid: usize, exit_code: i32) -> 
         // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
         thread.personality.suspend();
         match &mut thread.personality {
-            Personality::Dos(dos) => dos.on_exit(machine),
+            Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),
             Personality::Linux(_) => {}
         }
 

@@ -4,7 +4,7 @@
 //! shadow region. Physical backing comes from the kernel's demand paging.
 
 use arch_abi::Arch;
-use arch_abi::GuestBytes;
+use arch_abi::{GuestBytes, GuestOverlay};
 use crate::kernel::dos::linear;
 use crate::arch::Vcpu;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
@@ -431,7 +431,7 @@ fn xms_move(dos: &mut thread::DosState, regs: &mut Vcpu) {
         }
     };
 
-    crate::arch::mem().copy_within(src as usize, dst as usize, length);
+    regs.copy_within(src as usize, dst as usize, length);
     regs.rax = (regs.rax & !0xFFFF) | 1;
     regs.rbx = regs.rbx & !0xFFFF;
 }
@@ -474,15 +474,14 @@ fn or64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
 pub(super) static EMS_BASE_PAGE: AtomicUsize = AtomicUsize::new(0xD0);
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
-pub(super) fn scan_uma() {
+pub(super) fn scan_uma(regs: &Vcpu) {
     let mut free: u64 = 0;
-    let m = crate::arch::mem();
     for i in 0..UMA_PAGES {
         let base = (UMA_BASE + i) * 0x1000;
-        let first = m.read::<u8>(base);
+        let first = regs.read::<u8>(base);
         let mut uniform = true;
         for j in 1..0x1000 {
-            if m.read::<u8>(base + j) != first { uniform = false; break; }
+            if regs.read::<u8>(base + j) != first { uniform = false; break; }
         }
         if uniform && (first == 0x00 || first == 0xFF) {
             free |= 1 << i;

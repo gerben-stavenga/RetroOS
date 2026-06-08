@@ -210,7 +210,7 @@ impl MouseState {
     ///   0x10 = right button released
     ///   0x20 = middle button pressed
     ///   0x40 = middle button released
-    pub fn apply_packet(&mut self, dx: i16, dy: i16, buttons: u8) -> u16 {
+    pub fn apply_packet(&mut self, regs: &mut Vcpu, dx: i16, dy: i16, buttons: u8) -> u16 {
         self.accum_dx = self.accum_dx.saturating_add(dx as i32);
         self.accum_dy = self.accum_dy.saturating_add(dy as i32);
         self.x = (self.x as i32 + dx as i32).clamp(self.min_x as i32, self.max_x as i32) as i16;
@@ -218,7 +218,7 @@ impl MouseState {
         let prev = self.buttons;
         let cur = buttons;
         self.buttons = cur;
-        self.render_if_visible();
+        self.render_if_visible(regs);
 
         let mut cond: u16 = 0;
         if dx != 0 || dy != 0 { cond |= 0x01; }
@@ -253,37 +253,36 @@ impl MouseState {
     /// already drawn at this cell. Real Microsoft Mouse drivers also do this
     /// in graphics modes via a sprite — we don't (yet); games that go to
     /// mode 13h hide the driver cursor and draw their own anyway.
-    pub fn render_if_visible(&mut self) {
+    pub fn render_if_visible(&mut self, regs: &mut Vcpu) {
         if self.show_count > 0 { return; }
         let col = (self.x >> 3) as u32;
         let row = (self.y >> 3) as u32;
         if col >= 80 || row >= 25 { return; }
         let offset = (row * 80 + col) as u16;
         if Some(offset) == self.drawn_at { return; }
-        self.erase_cursor();
+        self.erase_cursor(regs);
         let attr = (VGA_TEXT_BASE + offset as u32 * 2 + 1) as usize;
-        let m = crate::arch::mem();
-        self.saved_attr = m.read::<u8>(attr);
-        m.write::<u8>(attr, self.saved_attr ^ 0x77);
+        self.saved_attr = regs.read::<u8>(attr);
+        regs.write::<u8>(attr, self.saved_attr ^ 0x77);
         self.drawn_at = Some(offset);
     }
 
     /// Restore the original attribute under the current cursor cell.
-    pub fn erase_cursor(&mut self) {
+    pub fn erase_cursor(&mut self, regs: &mut Vcpu) {
         if let Some(old) = self.drawn_at.take() {
-            crate::arch::mem().write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
+            regs.write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
         }
     }
 
     /// AX=01h — show cursor: decrement counter; if it just reached 0, draw.
-    pub fn show(&mut self) {
+    pub fn show(&mut self, regs: &mut Vcpu) {
         self.show_count -= 1;
-        self.render_if_visible();
+        self.render_if_visible(regs);
     }
 
     /// AX=02h — hide cursor: increment counter; if it was 0, erase.
-    pub fn hide(&mut self) {
-        if self.show_count <= 0 { self.erase_cursor(); }
+    pub fn hide(&mut self, regs: &mut Vcpu) {
+        if self.show_count <= 0 { self.erase_cursor(regs); }
         self.show_count += 1;
     }
 }
@@ -481,7 +480,7 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
 }
 
 /// Emulate OUT to a port.
-pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16, val: u8) {
+pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, val: u8) {
     // ISA 10-bit I/O decode — fold the alias mod 0x400. See `emulate_inb`.
     let port = port & 0x3FF;
     match port {
@@ -566,7 +565,7 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16,
         // so, remap the guest buffer contiguous + program the real 8237.
         p if Dma8237::owns(p) => {
             pc.sb.dma.io_write(machine, p, val);
-            pc.sb.maybe_remap(machine);
+            pc.sb.maybe_remap(machine, regs);
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {
@@ -615,7 +614,7 @@ pub fn handle_out_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: 
     }
 
     for i in 0..size {
-        emulate_outb(machine, pc, port + i as u16, (val >> (i * 8)) as u8);
+        emulate_outb(machine, pc, regs, port + i as u16, (val >> (i * 8)) as u8);
     }
 }
 
@@ -641,7 +640,7 @@ pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs:
     let si = regs.rsi as u32;
     for i in 0..size {
         let b = regs.read::<u8>(((ds_base.wrapping_add(si.wrapping_add(i)))) as usize);
-        emulate_outb(machine, pc, port + i as u16, b);
+        emulate_outb(machine, pc, regs, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
@@ -668,7 +667,7 @@ pub fn queue_tick(machine: &mut crate::TheArch, pc: &mut PcMachine) {
     }
 }
 
-pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
+pub fn queue_irq(pc: &mut PcMachine, regs: &mut Vcpu, event: crate::arch::Irq) {
     use crate::arch::Irq;
     match event {
         Irq::Key(sc) => {
@@ -696,7 +695,7 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             // vpic at all — `apply_packet` updates `pending_cond` and
             // `raise_pending` dispatches the AX=0Ch callback directly when
             // the mask matches and the user's IF=1.
-            let _ = pc.mouse.apply_packet(dx, dy, buttons);
+            let _ = pc.mouse.apply_packet(regs, dx, dy, buttons);
         }
         Irq::Hw(line) => {
             if line != 5 {
@@ -770,26 +769,27 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Vcpu) -> Option<u8> {
 
 /// Read a u16 from a real-mode seg:off address, through the active address
 /// space's memory interface (`arch::mem()`) — works under any arch backend.
-pub fn read_u16(seg: u32, off: u32) -> u16 {
-    crate::arch::mem().read::<u16>(((seg << 4) + off) as usize)
+pub fn read_u16(regs: &Vcpu, seg: u32, off: u32) -> u16 {
+    regs.read::<u16>(((seg << 4) + off) as usize)
 }
 
 /// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
-pub fn write_u16(seg: u32, off: u32, val: u16) {
-    crate::arch::mem().write::<u16>(((seg << 4) + off) as usize, val);
+pub fn write_u16(regs: &mut Vcpu, seg: u32, off: u32, val: u16) {
+    regs.write::<u16>(((seg << 4) + off) as usize, val);
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
 pub fn vm86_push(regs: &mut Vcpu, val: u16) {
     let sp = vm86_sp(regs).wrapping_sub(2);
     set_vm86_sp(regs, sp);
-    write_u16(regs.ss32(), sp as u32, val);
+    let ss = regs.ss32();
+    write_u16(regs, ss, sp as u32, val);
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
 pub fn vm86_pop(regs: &mut Vcpu) -> u16 {
     let sp = vm86_sp(regs);
-    let val = read_u16(regs.ss32(), sp as u32);
+    let val = read_u16(regs, regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
     val
 }

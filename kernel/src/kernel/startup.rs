@@ -9,6 +9,7 @@ use crate::kernel::{hdd, vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
 use arch_abi::Arch; // the `machine: &mut TheArch` trait methods (execute/switch_to/…)
+use arch_abi::GuestBytes;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
 static mut ROOT_TARFS: TarFs = TarFs::new(0);
@@ -349,9 +350,9 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
                             }
                         } else {
                             if let crate::arch::Irq::Key(sc) = evt {
-                                unsafe { (*dp).process_key(sc); }
+                                unsafe { (*dp).process_key(regs, sc); }
                             } else {
-                                crate::kernel::dos::queue_irq(unsafe { &mut *dp }, evt);
+                                crate::kernel::dos::queue_irq(unsafe { &mut *dp }, regs, evt);
                             }
                         }
                     });
@@ -588,7 +589,7 @@ fn handle_fork_exec(
             }
             parent_cwd_len = n;
 
-            parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(dos));
+            parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(vcpu, dos));
         }
         thread::Personality::Linux(lin) => {
             parent_is_dos = false;
@@ -714,19 +715,19 @@ const F12_PRESS: u8 = 0x58;
 /// - PM: Rust stack trace via frame-pointer walking through user symbols.
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
-pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::Regs) {
+pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::arch::Vcpu) {
     dump_interrupted_thread(regs, Some(dos));
 }
 
-fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
+fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thread::DosState>) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
         let vif = regs.flags32() & (1 << 9) != 0;
         let lin = (regs.cs32() << 4) + regs.ip32();
         // Guest reads via arch::mem() (identity on metal, mmap offset on the
         // interpreter) — raw `lin as *const u8` would fault on the interp.
-        let b = crate::arch::mem().slice(lin as usize, 8);
-        let ticks = crate::arch::mem().read::<u32>(0x46C);
+        let b = regs.slice(lin as usize, 8);
+        let ticks = regs.read::<u32>(0x46C);
         crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} IF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             regs.code_seg(), regs.ip32(),
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -764,7 +765,7 @@ fn dump_interrupted_thread(regs: &crate::Regs, dos: Option<&thread::DosState>) {
         // Through arch::mem() so it works on both backends — `0xB8000` is a
         // guest address, identity-mapped on metal but an mmap offset on the
         // interpreter (a raw `0xB8000 as *const u8` would fault there).
-        let vga = crate::arch::mem().slice(0xB8000, 4000);
+        let vga = regs.slice(0xB8000, 4000);
         for row in 0..25 {
             let mut line = [b'.'; 80];
             for col in 0..80 {

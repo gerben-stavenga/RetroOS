@@ -587,12 +587,12 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
 pub fn exec_elf_into(machine: &mut crate::TheArch, tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
-    let loaded = elf::load_elf(machine, data).map_err(|_| 8)?; // ENOEXEC
+    let current = thread::get_thread(tid).unwrap();
+    let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data).map_err(|_| 8)?; // ENOEXEC
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
     let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
 
-    let current = thread::get_thread(tid).unwrap();
     let sp = setup_user_stack(&mut current.kernel.vcpu, args, want_64);
     if want_64 {
         thread::init_process_thread_64(current, loaded.entry, sp as u64);

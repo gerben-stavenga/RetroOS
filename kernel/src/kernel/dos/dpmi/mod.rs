@@ -120,7 +120,7 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
     // selector per §4.1. `dos.current_psp` stays as the segment value
     // (pure DOS state).
     dos.dpmi = Some(Box::new(dpmi));
-    install_dpmi_psp_view(dos);
+    install_dpmi_psp_view(dos, regs);
 
     // PMDOS: route PM INT 21 to the kernel's direct-service handler.
     if dos.pm_dos {
@@ -430,7 +430,7 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         // BX = paragraphs. Returns: AX = real-mode segment, DX = selector
         0x0100 => {
             let paragraphs = regs.rbx as u16;
-            match dos::dos_alloc_block(dos, paragraphs) {
+            match dos::dos_alloc_block(dos, regs, paragraphs) {
                 Ok(seg) => {
                     if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
                         let base = (seg as u32) * 16;
@@ -443,7 +443,7 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
                             paragraphs, seg, sel, base);
                         clear_carry(regs);
                     } else {
-                        let _ = dos::dos_free_block(dos, seg);
+                        let _ = dos::dos_free_block(dos, regs, seg);
                         regs.rax = (regs.rax & !0xFFFF) | 8;
                         set_carry(regs);
                     }
@@ -466,7 +466,7 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
-                match dos::dos_free_block(dos, seg) {
+                match dos::dos_free_block(dos, regs, seg) {
                     Ok(()) => {
                         free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
                         clear_carry(regs);
@@ -490,7 +490,7 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
-                match dos::dos_resize_block(dos, seg, paragraphs) {
+                match dos::dos_resize_block(dos, regs, seg, paragraphs) {
                     Ok(()) => {
                         let limit = (paragraphs as u32).saturating_mul(16).saturating_sub(1);
                         dos.ldt[idx] = make_data_desc(base, limit);
@@ -508,8 +508,8 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         // BL = interrupt number. Returns: CX:DX = seg:off
         0x0200 => {
             let int_num = regs.rbx as u8;
-            let off = machine::read_u16(0, (int_num as u32) * 4);
-            let seg = machine::read_u16(0, (int_num as u32) * 4 + 2);
+            let off = machine::read_u16(regs, 0, (int_num as u32) * 4);
+            let seg = machine::read_u16(regs, 0, (int_num as u32) * 4 + 2);
             regs.rcx = (regs.rcx & !0xFFFF) | seg as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | off as u64;
             clear_carry(regs);
@@ -521,8 +521,8 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
             let seg = regs.rcx as u16;
             let off = regs.rdx as u16;
             dos_trace!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
-            machine::write_u16(0, (int_num as u32) * 4, off);
-            machine::write_u16(0, (int_num as u32) * 4 + 2, seg);
+            machine::write_u16(regs, 0, (int_num as u32) * 4, off);
+            machine::write_u16(regs, 0, (int_num as u32) * 4 + 2, seg);
             clear_carry(regs);
         }
         // AX=0202h — Get Processor Exception Handler Vector

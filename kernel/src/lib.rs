@@ -288,9 +288,9 @@ pub fn host_run_demo() -> ! {
         0xCD, 0x80,                  // int 0x80 (exit)
         0xF4,                        // hlt
     ];
-    arch::mem().write_bytes(CODE as usize, code);
-
+    use arch_abi::GuestBytes;
     let mut vcpu = arch::Vcpu::empty();
+    vcpu.write_bytes(CODE as usize, code);
     vcpu.regs.init_user_process(CODE, STACK);
     arch::set_current_vcpu(vcpu);
 
@@ -300,7 +300,7 @@ pub fn host_run_demo() -> ! {
     loop {
         match arch::do_arch_execute() {
             KernelEvent::SoftInt(0x80) if eax() == 1 => {
-                let scratch: u32 = arch::mem().read(SCRATCH as usize);
+                let scratch: u32 = unsafe { (*(&raw const arch::REGS)).read(SCRATCH as usize) };
                 println!("[host] guest scratch[{:#x}] = {:#x} (demand-paged)", SCRATCH, scratch);
                 println!("[host] guest exit syscall -> done ({irqs} timer ticks)");
                 arch::shutdown();

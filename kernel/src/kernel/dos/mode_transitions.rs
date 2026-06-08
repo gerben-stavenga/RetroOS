@@ -282,12 +282,12 @@ fn rm_cursor_for_pm_entry(dos: &thread::DosState, regs: &Vcpu) -> (u16, u32) {
 /// post-push (SS, SP). Private — recipes go through `push_continuation_and_switch_to_pm_side`
 /// or `push_continuation_and_switch_to_rm_side`, the only entry points to the locked-stack
 /// chain.
-fn push_continuation(dos: &mut thread::DosState, regs: &Vcpu, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+fn push_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
     let save = HostContinuation::capture(regs, dos.pc.locked_stack.other_stack, rm_call_struct_addr);
     let (ss, sp) = pm_get_stack(dos, regs);
     let new_sp = sp - HOST_CONTINUATION_SIZE;
     let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
-    crate::arch::mem().write::<HostContinuation>((addr) as usize, save);
+    regs.write::<HostContinuation>((addr) as usize, save);
     (ss, new_sp)
 }
 
@@ -295,16 +295,14 @@ fn push_continuation(dos: &mut thread::DosState, regs: &Vcpu, rm_call_struct_add
 /// with `resume_continuation`, which restores SS:SP and `other_stack`, so
 /// the post-pop cursor does not need to live anywhere.
 pub(super) fn pop_continuation(dos: &thread::DosState, regs: &Vcpu) -> HostContinuation {
-    pop_continuation_at(&dos.ldt[..], pm_get_stack(dos, regs))
+    pop_continuation_at(regs, &dos.ldt[..], pm_get_stack(dos, regs))
 }
 
 /// Read a HostContinuation at an explicit (SS, SP). Used by recipes that
 /// know the pm-side cursor directly.
-pub(super) fn pop_continuation_at(ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
+pub(super) fn pop_continuation_at(regs: &Vcpu, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
     let addr = pm_addr(ldt, cursor);
-    // Leaf helper taking a raw (SS,SP) cursor with no Vcpu in scope; the
-    // address is already linear, so read it directly.
-    crate::arch::mem().read::<HostContinuation>((addr) as usize)
+    regs.read::<HostContinuation>((addr) as usize)
 }
 
 pub(super) fn resume_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, save: HostContinuation) {
@@ -682,7 +680,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
         // top slot only on the nested_on_pm path, which pushes no continuation.
         let pm_save_at = pushed_hc_at.unwrap_or((host_stack_pm_seg(dos),
                           dos::host_stack_empty_sp() - HOST_CONTINUATION_SIZE));
-        let hc1 = pop_continuation_at(&dos.ldt[..], pm_save_at);
+        let hc1 = pop_continuation_at(regs, &dos.ldt[..], pm_save_at);
         regs.ds = hc1.ds as u64;
         regs.es = hc1.es as u64;
         regs.fs = hc1.fs as u64;
@@ -887,8 +885,8 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Vc
     let rm_dest = rm_get_stack(dos);
     let _save_at = push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, None);
 
-    let ivt_off = machine::read_u16(0, (vector as u32) * 4);
-    let ivt_seg = machine::read_u16(0, (vector as u32) * 4 + 2);
+    let ivt_off = machine::read_u16(regs, 0, (vector as u32) * 4);
+    let ivt_seg = machine::read_u16(regs, 0, (vector as u32) * 4 + 2);
 
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
     // own INT n in real mode would push: FLAGS / CS / IP.

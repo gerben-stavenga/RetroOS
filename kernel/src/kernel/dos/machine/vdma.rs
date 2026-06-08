@@ -254,8 +254,8 @@ impl SbDmaState {
     /// state and OMF2's sound-init probe falls into a "wait for the card
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
-    pub fn release_dma_pool(&mut self, machine: &mut crate::TheArch) {
-        self.unbind(machine);
+    pub fn release_dma_pool(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+        self.unbind(machine, regs);
         // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
         // this atomically; the hardware ~3 µs hold is irrelevant under
         // emulation. Puts the DSP back in its post-power-on state so the
@@ -389,7 +389,7 @@ impl SbDmaState {
     /// (re)armed, alias the guest's DMA buffer onto that channel's
     /// permanent host buffer and program the real 8237. A no-op until the
     /// guest finishes a count write (the per-block re-arm signal).
-    pub fn maybe_remap(&mut self, machine: &mut crate::TheArch) {
+    pub fn maybe_remap(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
         let c8 = self.dma8 as usize;
         let c16 = self.dma16 as usize;
@@ -416,14 +416,14 @@ impl SbDmaState {
 
         let p = self.dma.ch[chan].prog;
         let (gpa, len) = chan_gpa_len(&p, is16);
-        self.arm(machine, chan, host, is16, gpa, len, p.mode);
+        self.arm(machine, regs, chan, host, is16, gpa, len, p.mode);
     }
 
     /// Alias the guest buffer at `gpa` onto host DMA channel `host`'s
     /// permanent buffer and program the real 8237. Driven from
     /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
     /// virtual-8237 state after a task switch).
-    fn arm(&mut self, machine: &mut crate::TheArch, chan: usize, host: usize, is16: bool,
+    fn arm(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu, chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
@@ -452,7 +452,7 @@ impl SbDmaState {
         let bound = self.bound_chan == chan as u8 && self.bound_host == host as u8
             && self.bound_gpa == gpa && self.bound_len == len;
         if !bound {
-            if self.bound_gpa != 0 { self.unbind(machine); }
+            if self.bound_gpa != 0 { self.unbind(machine, regs); }
             let vbase     = (gpa & !0xFFF) as usize;
             let page_off  = (gpa & 0xFFF) as usize;
             let num_pages = (page_off + len as usize + 0xFFF) / 0x1000;
@@ -465,14 +465,14 @@ impl SbDmaState {
             // Snapshot the guest's pre-filled content — whole pages, so the
             // unrelated neighbour bytes on partial end pages survive.
             let mut snap = alloc::vec![0u8; span];
-            snap.copy_from_slice(crate::arch::mem().slice(vbase as usize, span));
+            snap.copy_from_slice(regs.slice(vbase as usize, span));
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
             machine.free_range(vbase >> 12, num_pages);
             machine.map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
-            crate::arch::mem().write_bytes(vbase as usize, &snap);
+            regs.write_bytes(vbase as usize, &snap);
             self.bound_chan  = chan as u8;
             self.bound_host  = host as u8;
             self.bound_gpa   = gpa;
@@ -492,15 +492,15 @@ impl SbDmaState {
     /// them, so the partial-end-page neighbour data survives and the guest
     /// can reuse the linear range. The channel buffer is permanent. No-op
     /// when nothing is bound.
-    fn unbind(&mut self, machine: &mut crate::TheArch) {
+    fn unbind(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
         if self.bound_gpa == 0 { return; }
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
-        snap.copy_from_slice(crate::arch::mem().slice(vbase as usize, span));
+        snap.copy_from_slice(regs.slice(vbase as usize, span));
         machine.map_fresh_range(
             self.bound_vpage, self.bound_pages);
-        crate::arch::mem().write_bytes(vbase as usize, &snap);
+        regs.write_bytes(vbase as usize, &snap);
         self.bound_chan  = 0xFF;
         self.bound_host  = 0xFF;
         self.bound_gpa   = 0;
@@ -514,10 +514,10 @@ impl SbDmaState {
     /// the real 8237 channel so the card stops pulling a buffer that's no
     /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
     /// replays it. Must run with this task's address space active.
-    pub fn sb_suspend(&mut self, machine: &mut crate::TheArch) {
+    pub fn sb_suspend(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
-        self.unbind(machine);
+        self.unbind(machine, regs);
         self.suspended = true;
     }
 
@@ -525,7 +525,7 @@ impl SbDmaState {
     /// re-alias every channel the virtual 8237 still shows armed and
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
-    pub fn sb_resume(&mut self, machine: &mut crate::TheArch) {
+    pub fn sb_resume(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
         if !self.suspended { return; }
         self.suspended = false;
         for chan in 0..8 {
@@ -534,7 +534,7 @@ impl SbDmaState {
             let host = if is16 { self.host_dma16 } else { self.host_dma8 } as usize;
             let p = self.dma.ch[chan].prog;
             let (gpa, len) = chan_gpa_len(&p, is16);
-            self.arm(machine, chan, host, is16, gpa, len, p.mode);
+            self.arm(machine, regs, chan, host, is16, gpa, len, p.mode);
         }
     }
 

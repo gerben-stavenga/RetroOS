@@ -614,8 +614,11 @@ fn isr_handler_ring3(regs: &mut Regs) {
             let budget = crate::kernel::dos::PM_STEP_BUDGET.load(Ordering::Relaxed);
             if budget > 0 {
                 // Log step in PM and VM86 — VM86 logging needed to trace
-                // RM execution after a raw PM->RM switch.
-                crate::kernel::dos::pm_step_log(regs);
+                // RM execution after a raw PM->RM switch. The DOS-layer tracer
+                // takes a `&Vcpu`; wrap the trap frame in a throwaway vcpu view
+                // (its `space` is unused — `mem()` reads the active mapping).
+                let v = Vcpu::new(*regs, paging2::RootPageTable::empty());
+                crate::kernel::dos::pm_step_log(&v);
                 crate::kernel::dos::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
                 regs.set_flag32(1 << 8); // keep TF on
                 return;

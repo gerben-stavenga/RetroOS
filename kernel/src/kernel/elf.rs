@@ -5,6 +5,8 @@
 
 const PAGE_SIZE: usize = 4096;
 use arch_abi::Arch;
+use arch_abi::GuestBytes;
+use crate::arch::Vcpu;
 pub use lib::elf::{ElfError, ElfClass};
 
 /// User stack top address (just below kernel space)
@@ -20,24 +22,24 @@ pub struct LoadedElf {
 }
 
 /// Load an ELF executable into user address space
-pub fn load_elf(machine: &mut crate::TheArch, elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
+pub fn load_elf(machine: &mut crate::TheArch, regs: &mut Vcpu, elf_data: &[u8]) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
     let mut max_vaddr = 0usize;
 
-    // First pass: copy data into the active address space through arch::mem()
-    // (pages demand-allocated on access). Going through GuestMem — rather than
-    // dereferencing `seg.vaddr` as a host pointer — is what keeps this loader
-    // backend-agnostic: on metal the guest VA is a valid kernel pointer, while
-    // on the interpreter it indexes the software MMU's address space.
-    let mem = crate::arch::mem();
+    // First pass: copy data into the active address space through the vcpu
+    // (pages demand-allocated on access). Going through the vcpu's guest-memory
+    // API — rather than dereferencing `seg.vaddr` as a host pointer — is what
+    // keeps this loader backend-agnostic: on metal the guest VA is a valid
+    // kernel pointer, while on the interpreter it indexes the software MMU's
+    // address space.
     for seg in elf.segments() {
         let end = seg.vaddr + seg.memsz;
         if end > max_vaddr { max_vaddr = end; }
         if let Some(data) = seg.data {
-            mem.write_bytes(seg.vaddr, data);
+            regs.write_bytes(seg.vaddr, data);
             if seg.memsz > data.len() {
-                mem.zero(seg.vaddr + data.len(), seg.memsz - data.len());
+                regs.zero(seg.vaddr + data.len(), seg.memsz - data.len());
             }
         }
     }
