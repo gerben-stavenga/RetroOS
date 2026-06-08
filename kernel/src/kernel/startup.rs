@@ -726,7 +726,8 @@ fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thread::DosSta
         let lin = (regs.cs32() << 4) + regs.ip32();
         // Guest reads via arch::mem() (identity on metal, mmap offset on the
         // interpreter) — raw `lin as *const u8` would fault on the interp.
-        let b = regs.slice(lin as usize, 8);
+        let mut b = [0u8; 8];
+        regs.copy_from(lin as usize, &mut b);
         let ticks = regs.read::<u32>(0x46C);
         crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} IF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             regs.code_seg(), regs.ip32(),
@@ -765,7 +766,8 @@ fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thread::DosSta
         // Through arch::mem() so it works on both backends — `0xB8000` is a
         // guest address, identity-mapped on metal but an mmap offset on the
         // interpreter (a raw `0xB8000 as *const u8` would fault there).
-        let vga = regs.slice(0xB8000, 4000);
+        let mut vga = [0u8; 4000];
+        regs.copy_from(0xB8000, &mut vga);
         for row in 0..25 {
             let mut line = [b'.'; 80];
             for col in 0..80 {

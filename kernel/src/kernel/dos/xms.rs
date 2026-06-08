@@ -4,7 +4,7 @@
 //! shadow region. Physical backing comes from the kernel's demand paging.
 
 use arch_abi::Arch;
-use arch_abi::{GuestBytes, GuestOverlay};
+use arch_abi::GuestBytes;
 use crate::kernel::dos::linear;
 use crate::arch::Vcpu;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};

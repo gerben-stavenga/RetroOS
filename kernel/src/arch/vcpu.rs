@@ -22,103 +22,78 @@ use super::paging2::RootPageTable;
 /// forwarding to the `GuestBytes for RootPageTable` impl below.
 pub type Vcpu = arch_abi::Vcpu<RootPageTable>;
 
-/// The metal guest-memory primitive: on the ring-1 kernel a guest-linear address
-/// *is* a host pointer (shared page tables), so these dereference it directly via
-/// `mem()`. The raw access stays confined here; kernel/dos code holds no
-/// `unsafe`. `self` (the page-table root) is not consulted — `mem()` reaches the
-/// active mapping, matching the prior `Vcpu` forwarder behaviour.
+/// The metal guest-memory primitive. On the ring-1 kernel a guest-linear address
+/// *is* a host pointer (shared page tables), so these dereference it directly.
+/// Every access is **volatile** (guest/BIOS/devices may observe and mutate the
+/// bytes) and **bytewise** (so any address/alignment is fine — a DOS guest puts
+/// live structures at address 0 and at unaligned paragraph addresses). No method
+/// hands out a reference into guest memory: bytes are copied to/from a
+/// caller-owned buffer, so kernel/dos code never asserts Rust's non-null /
+/// alignment / aliasing invariants against guest RAM, and holds no `unsafe`.
+/// `self` (the page-table root) is not consulted — the access reaches the active
+/// mapping (single-core; one space is live at a time).
 impl GuestBytes for RootPageTable {
-    fn slice(&self, addr: usize, len: usize) -> &[u8] { mem().slice(addr, len) }
-    fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { mem().slice_mut(addr, len) }
-    fn c_str(&self, addr: usize, max: usize) -> &[u8] { mem().c_str(addr, max) }
-    fn read<T: Copy>(&self, addr: usize) -> T { mem().read(addr) }
-    fn write<T: Copy>(&mut self, addr: usize, val: T) { mem().write(addr, val) }
-    fn zero(&mut self, addr: usize, len: usize) { mem().zero(addr, len) }
-    fn write_bytes(&mut self, addr: usize, src: &[u8]) { mem().write_bytes(addr, src) }
-}
-
-impl arch_abi::GuestOverlay for RootPageTable {
-    fn at<T>(&mut self, addr: usize) -> &mut T {
-        // Tie the placed ref's lifetime to `&mut self` (not `'static`).
-        let p = mem().slice_mut(addr, core::mem::size_of::<T>()).as_mut_ptr() as *mut T;
-        unsafe { &mut *p }
+    fn read<T: Copy>(&self, addr: usize) -> T {
+        let mut v = core::mem::MaybeUninit::<T>::uninit();
+        let dst = v.as_mut_ptr() as *mut u8;
+        let src = addr as *const u8;
+        for i in 0..core::mem::size_of::<T>() {
+            unsafe { dst.add(i).write(src.add(i).read_volatile()); }
+        }
+        unsafe { v.assume_init() }
     }
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize) { mem().copy_within(src, dst, len) }
+    fn write<T: Copy>(&mut self, addr: usize, val: T) {
+        let src = &val as *const T as *const u8;
+        let dst = addr as *mut u8;
+        for i in 0..core::mem::size_of::<T>() {
+            unsafe { dst.add(i).write_volatile(src.add(i).read()); }
+        }
+    }
+    fn copy_from(&self, addr: usize, dst: &mut [u8]) {
+        let src = addr as *const u8;
+        for (i, b) in dst.iter_mut().enumerate() {
+            unsafe { *b = src.add(i).read_volatile(); }
+        }
+    }
+    fn copy_to(&mut self, addr: usize, src: &[u8]) {
+        let dst = addr as *mut u8;
+        for (i, &b) in src.iter().enumerate() {
+            unsafe { dst.add(i).write_volatile(b); }
+        }
+    }
+    fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize {
+        let src = addr as *const u8;
+        let mut n = 0;
+        while n < dst.len() {
+            let b = unsafe { src.add(n).read_volatile() };
+            if b == 0 { break; }
+            dst[n] = b;
+            n += 1;
+        }
+        n
+    }
+    fn zero(&mut self, addr: usize, len: usize) {
+        let dst = addr as *mut u8;
+        for i in 0..len {
+            unsafe { dst.add(i).write_volatile(0); }
+        }
+    }
+    fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
+        // Overlap-safe: copy back-to-front when the destination is above the
+        // source, front-to-back otherwise.
+        let s = src as *const u8;
+        let d = dst as *mut u8;
+        if dst > src {
+            for i in (0..len).rev() { unsafe { d.add(i).write_volatile(s.add(i).read_volatile()); } }
+        } else {
+            for i in 0..len { unsafe { d.add(i).write_volatile(s.add(i).read_volatile()); } }
+        }
+    }
 }
-
-/// The active address space's memory interface — `arch::mem()`.
-///
-/// This is THE place the kernel touches guest memory. On the hardware backend
-/// the ring-1 kernel shares the guest's page tables, so a guest-linear address
-/// is already a valid host pointer and these methods dereference it; the raw
-/// access is confined here. A software-interpreter backend would index its
-/// guest-RAM buffer instead, behind the identical API — so `kernel`/`dos` code
-/// calls `arch::mem()` and never learns which backend is underneath, and holds
-/// no `unsafe` of its own.
-///
-/// Memory belongs to the *address space*, not the per-core registers: many
-/// vcpus (cores) can share one address space, so this is keyed off the active
-/// space, not a specific Vcpu. `mem()` returns the current space; a
-/// space-parameterized form is the natural extension for cross-space access.
-///
-/// `addr` is a guest-linear address as `usize` (the 32-bit kernel addresses all
-/// guest memory within 4 GiB).
-#[derive(Clone, Copy)]
-pub struct GuestMem(());
-
-/// Memory interface for the currently-active address space (see `GuestMem`).
-#[inline]
-pub fn mem() -> GuestMem { GuestMem(()) }
 
 /// Seed the live execution context with `v`. Used for the very first thread,
 /// which is entered directly rather than through a context switch (the swap
 /// path otherwise owns `REGS`). The `static mut` access is confined here.
 pub fn set_current_vcpu(v: Vcpu) {
     unsafe { *(&raw mut crate::arch::REGS) = v; }
-}
-
-impl GuestMem {
-    /// Read `len` bytes at `addr` as a slice.
-    pub fn slice(self, addr: usize, len: usize) -> &'static [u8] {
-        unsafe { core::slice::from_raw_parts(addr as *const u8, len) }
-    }
-    /// Mutably borrow `len` bytes at `addr`.
-    pub fn slice_mut(self, addr: usize, len: usize) -> &'static mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, len) }
-    }
-    /// Borrow a NUL-terminated C string (excluding the NUL), scanning ≤ `max`.
-    pub fn c_str(self, addr: usize, max: usize) -> &'static [u8] {
-        unsafe {
-            let p = addr as *const u8;
-            let mut len = 0;
-            while len < max && *p.add(len) != 0 { len += 1; }
-            core::slice::from_raw_parts(p, len)
-        }
-    }
-    /// Read a `T` (unaligned-safe).
-    pub fn read<T: Copy>(self, addr: usize) -> T {
-        unsafe { core::ptr::read_unaligned(addr as *const T) }
-    }
-    /// Write a `T` (unaligned-safe).
-    pub fn write<T: Copy>(self, addr: usize, val: T) {
-        unsafe { core::ptr::write_unaligned(addr as *mut T, val); }
-    }
-    /// Borrow the `T` living at `addr` in guest memory in place. Used for the
-    /// DOS struct overlays (PSP, low-memory BIOS area) that mutate fields
-    /// directly; an interpreter backend reinterprets its buffer here.
-    pub fn at<T>(self, addr: usize) -> &'static mut T {
-        unsafe { &mut *(addr as *mut T) }
-    }
-    /// Zero `len` bytes at `addr`.
-    pub fn zero(self, addr: usize, len: usize) {
-        unsafe { core::ptr::write_bytes(addr as *mut u8, 0, len); }
-    }
-    /// Copy `src` into guest memory at `addr`.
-    pub fn write_bytes(self, addr: usize, src: &[u8]) {
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, src.len()); }
-    }
-    /// Copy `len` bytes within guest memory (`src` → `dst`), overlap-safe.
-    pub fn copy_within(self, src: usize, dst: usize, len: usize) {
-        unsafe { core::ptr::copy(src as *const u8, dst as *mut u8, len); }
-    }
 }

@@ -524,7 +524,8 @@ pub fn handle_event(
                 } else {
                     machine.seg_base(regs.code_seg()).wrapping_add(regs.ip32())
                 };
-                let bytes = regs.slice((lin) as usize, 8);
+                let mut bytes = [0u8; 8];
+                regs.copy_from(lin as usize, &mut bytes);
                 let ss_lin = if is_vm86 {
                     ((regs.stack_seg() as u32) << 4).wrapping_add(regs.sp32() & 0xFFFF)
                 } else {
@@ -553,7 +554,8 @@ pub fn handle_event(
         KE::Fault => {
             if is_vm86 {
                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
-                let bytes = regs.slice((lin) as usize, 8);
+                let mut bytes = [0u8; 8];
+                regs.copy_from(lin as usize, &mut bytes);
                 // Dump the surrounding state before panicking: a plain
                 // `push ds` etc. can't #GP in genuine VM86, so SS:SP/flags
                 // and the last IRQ we reflected (vector + the CS:IP/SS:SP it
@@ -633,7 +635,7 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is
     crate::dbg_println!("exec_dos_into tid={} psp_seg={:04X} cmdtail.len={} cmdtail={:?}",
         tid, loaded.psp_seg, cmdtail.len(),
         core::str::from_utf8(&cmdtail).unwrap_or("<non-utf8>"));
-    dos::Psp::at(regs, loaded.psp_seg).set_cmdline(&cmdtail);
+    dos::Psp::set_cmdline(regs, loaded.psp_seg, &cmdtail);
 
     let psp_seg = loaded.psp_seg;
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
@@ -713,7 +715,7 @@ pub fn run_init_program(machine: &mut crate::TheArch, buf: Vec<u8>, args: Vec<Ve
     let (col, row) = vga::vga().cursor_pos();
     {
         let regs = &mut t.kernel.vcpu;
-        dos::Psp::at(regs, loaded.psp_seg).set_cmdline(&cmdline_tail);
+        dos::Psp::set_cmdline(regs, loaded.psp_seg, &cmdline_tail);
         regs.write::<u8>(0x450, col as u8);
         regs.write::<u8>(0x451, row as u8);
     }
@@ -755,7 +757,7 @@ pub fn snapshot_parent_env(regs: &mut Vcpu, dos: &thread::DosState) -> alloc::ve
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
             dpmi.saved_rm_env
         }
-        _ => dos::Psp::at(regs, psp_seg).env_seg,
+        _ => dos::Psp::env_seg(regs, psp_seg),
     };
     snapshot_env(regs, env_seg)
 }
@@ -790,7 +792,8 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Vcpu) {
     let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
     let sp_lin = ss_base.wrapping_add(regs.sp32());
     let pre = ip_lin.wrapping_sub(16);
-    let cp = regs.slice((pre) as usize, 32);
+    let mut cp = [0u8; 32];
+    regs.copy_from(pre as usize, &mut cp);
     crate::dbg_println!("[DBG] code @{:08x} (-16..+16):", pre);
     crate::dbg_println!("[DBG]   {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} | {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
         cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],

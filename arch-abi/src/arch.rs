@@ -35,46 +35,50 @@ use crate::{Irq, KernelEvent, Regs};
 // GuestBytes — access to guest memory
 // =============================================================================
 
-/// Read/write access to guest memory, implemented for three receivers:
+/// Access to guest memory, implemented for two receivers:
 ///
 /// * the backend's page-table handle (`A::PageTable`) — the primitive; the
 ///   backend supplies the one real impl (host-pointer deref on metal, guest-RAM
 ///   index on the interp), confining the `unsafe` there;
 /// * the running [`Vcpu`] — the kernel already holds `&mut Vcpu` in the DOS /
 ///   Linux paths and reaches its address space through it (`regs.read(addr)`);
-///   the blanket impl below forwards to `self.space`;
-/// * the [`Arch`] backend itself — the active address space, for code that
-///   touches guest memory without a `Vcpu` in hand (`arch.read(addr)`).
+///   the blanket impl below forwards to `self.space`.
 ///
-/// Slice-returning methods borrow `self`, so a view can't outlive a mutation of
-/// the space — the lifetime the old `&'static` handle could not express.
+/// **No method returns a reference into guest memory.** Guest RAM is external,
+/// volatile memory: a DOS guest places live structures at address 0 (the IVT)
+/// and at arbitrary, unaligned paragraph addresses, and the guest/BIOS/devices
+/// may mutate them under us. A Rust `&T`/`&[u8]` would assert non-null,
+/// alignment, and "no mutation for the borrow's lifetime" against memory that
+/// promises none of those — instant UB the moment the reference is *formed*,
+/// before any read. So every accessor copies bytes between guest memory and a
+/// caller-owned buffer; the only references that ever exist point at locals.
+///
+/// All accesses are **volatile** (never elided, reordered, or coalesced — the
+/// guest/devices can observe and change the bytes) and **unaligned-safe** (done
+/// byte-at-a-time, so any `addr`/alignment is fine).
 ///
 /// `addr` is a guest-linear address as `usize` (the 32-bit kernel addresses all
 /// guest memory within 4 GiB).
+///
+/// Soundness note: `read::<T>` reconstructs a `T` from copied bytes, so `T` must
+/// be valid for *all* bit patterns (an integer or a `#[repr(C, packed)]` POD
+/// struct of integers). Reading a `bool`/`char`/fieldless-enum out of guest
+/// memory would be UB; the kernel never does.
 pub trait GuestBytes {
-    /// Read a `T` at `addr` (unaligned-safe).
+    /// Read a `T` at `addr` (volatile, unaligned, bytewise into a local).
     fn read<T: Copy>(&self, addr: usize) -> T;
-    /// Write a `T` at `addr` (unaligned-safe).
+    /// Write a `T` at `addr` (volatile, unaligned, bytewise from a local).
     fn write<T: Copy>(&mut self, addr: usize, val: T);
-    /// Borrow `len` bytes at `addr`.
-    fn slice(&self, addr: usize, len: usize) -> &[u8];
-    /// Mutably borrow `len` bytes at `addr`.
-    fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8];
-    /// Borrow a NUL-terminated C string (excluding the NUL), scanning ≤ `max`.
-    fn c_str(&self, addr: usize, max: usize) -> &[u8];
+    /// Copy `dst.len()` bytes from guest memory at `addr` into `dst`.
+    fn copy_from(&self, addr: usize, dst: &mut [u8]);
+    /// Copy `src` into guest memory at `addr`.
+    fn copy_to(&mut self, addr: usize, src: &[u8]);
+    /// Copy bytes from guest memory at `addr` into `dst`, stopping before the
+    /// first NUL or at `dst.len()`. Returns the number of bytes copied (the
+    /// C-string length, capped at `dst.len()`); the NUL is not copied.
+    fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize;
     /// Zero `len` bytes at `addr`.
     fn zero(&mut self, addr: usize, len: usize);
-    /// Copy `src` into guest memory at `addr`.
-    fn write_bytes(&mut self, addr: usize, src: &[u8]);
-}
-
-/// In-place borrow of a `T` living in guest memory, for the DOS struct overlays
-/// (PSP, low-memory BIOS area) that mutate fields directly. Separate from
-/// [`GuestBytes`] because it is generic over the placed type rather than `Self`,
-/// and only the active-space (`Arch`) receiver needs it.
-pub trait GuestOverlay {
-    /// Borrow the `T` at `addr` in guest memory in place.
-    fn at<T>(&mut self, addr: usize) -> &mut T;
     /// Copy `len` bytes within guest memory (`src` → `dst`), overlap-safe.
     fn copy_within(&mut self, src: usize, dst: usize, len: usize);
 }
@@ -135,15 +139,10 @@ impl<P: Default> Vcpu<P> {
 impl<P: GuestBytes> GuestBytes for Vcpu<P> {
     fn read<T: Copy>(&self, addr: usize) -> T { self.space.read(addr) }
     fn write<T: Copy>(&mut self, addr: usize, val: T) { self.space.write(addr, val) }
-    fn slice(&self, addr: usize, len: usize) -> &[u8] { self.space.slice(addr, len) }
-    fn slice_mut(&mut self, addr: usize, len: usize) -> &mut [u8] { self.space.slice_mut(addr, len) }
-    fn c_str(&self, addr: usize, max: usize) -> &[u8] { self.space.c_str(addr, max) }
+    fn copy_from(&self, addr: usize, dst: &mut [u8]) { self.space.copy_from(addr, dst) }
+    fn copy_to(&mut self, addr: usize, src: &[u8]) { self.space.copy_to(addr, src) }
+    fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize { self.space.copy_cstr(addr, dst) }
     fn zero(&mut self, addr: usize, len: usize) { self.space.zero(addr, len) }
-    fn write_bytes(&mut self, addr: usize, src: &[u8]) { self.space.write_bytes(addr, src) }
-}
-
-impl<P: GuestOverlay> GuestOverlay for Vcpu<P> {
-    fn at<T>(&mut self, addr: usize) -> &mut T { self.space.at(addr) }
     fn copy_within(&mut self, src: usize, dst: usize, len: usize) { self.space.copy_within(src, dst, len) }
 }
 
@@ -162,9 +161,9 @@ impl<P: GuestOverlay> GuestOverlay for Vcpu<P> {
 /// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
 pub trait Arch {
     /// Backend page-table root type stored in `Vcpu::space`. It is the guest-
-    /// memory primitive — `GuestBytes`/`GuestOverlay` route through it, which is
-    /// what makes `vcpu.read(addr)` work.
-    type PageTable: GuestBytes + GuestOverlay + Copy + Default;
+    /// memory primitive — `GuestBytes` routes through it, which is what makes
+    /// `vcpu.read(addr)` work.
+    type PageTable: GuestBytes + Copy + Default;
     /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
     type Fx: Copy;
 

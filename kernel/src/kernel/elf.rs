@@ -37,7 +37,7 @@ pub fn load_elf(machine: &mut crate::TheArch, regs: &mut Vcpu, elf_data: &[u8]) 
         let end = seg.vaddr + seg.memsz;
         if end > max_vaddr { max_vaddr = end; }
         if let Some(data) = seg.data {
-            regs.write_bytes(seg.vaddr, data);
+            regs.copy_to(seg.vaddr, data);
             if seg.memsz > data.len() {
                 regs.zero(seg.vaddr + data.len(), seg.memsz - data.len());
             }

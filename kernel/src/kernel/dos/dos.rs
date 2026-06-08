@@ -10,7 +10,7 @@
 extern crate alloc;
 
 use arch_abi::Arch;
-use arch_abi::{GuestBytes, GuestOverlay};
+use arch_abi::GuestBytes;
 use crate::kernel::thread;
 use crate::arch::Vcpu;
 use crate::vga;
@@ -976,7 +976,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             } else {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
                 let cwd = dos.dfs.get_cwd();
-                regs.write_bytes(addr, cwd);
+                regs.copy_to(addr, cwd);
                 regs.write::<u8>(addr + cwd.len(), 0);
                 dos_trace!("D21 47 DL={:02X} out=\"{}\"",
                     dl, core::str::from_utf8(cwd).unwrap_or("?"));
@@ -1127,7 +1127,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(regs, fd as u16, size);
-                    if (fd as usize) < 20 { Psp::at(regs, psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
+                    if (fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
@@ -1141,13 +1141,13 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         0x3E => {
             let handle = regs.rbx as u16;
             if handle <= 2 || handle == NULL_FILE_HANDLE || (EMS_ENABLED && handle == EMS_DEVICE_HANDLE) {
-                if (handle as usize) < 20 { Psp::at(regs, psp_struct_seg(dos)).jft[handle as usize] = 0xFF; }
+                if (handle as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), handle as usize, 0xFF); }
                 regs.clear_flag32(1);
             } else {
                 let rv = crate::kernel::vfs::close(handle as i32, &mut kt.fds);
                 if rv >= 0 {
                     sft_clear(regs, handle);
-                    if (handle as usize) < 20 { Psp::at(regs, psp_struct_seg(dos)).jft[handle as usize] = 0xFF; }
+                    if (handle as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), handle as usize, 0xFF); }
                     regs.clear_flag32(1);
                 } else {
                     regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rv) as u64;
@@ -1176,9 +1176,10 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else {
-                let buf = regs.slice_mut((buf_addr) as usize, count);
-                let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
+                let mut buf = alloc::vec![0u8; count];
+                let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
                 if n >= 0 {
+                    regs.copy_to(buf_addr as usize, &buf[..(n as usize).min(count)]);
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
                     let dump_n = (n as usize).min(16);
                     let mut hex = [0u8; 16];
@@ -1428,7 +1429,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             };
             if fd >= 0 {
                 sft_set_file(regs, fd as u16, 0);
-                if (fd as usize) < 20 { Psp::at(regs, psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
+                if (fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), fd as usize, fd as u8); }
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
@@ -1455,8 +1456,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                 regs.clear_flag32(1);
             } else {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-                let data = regs.slice((addr) as usize, count as usize);
-                let n = crate::kernel::vfs::write(handle as i32, data, &kt.fds);
+                let mut data = alloc::vec![0u8; count as usize];
+                regs.copy_from(addr as usize, &mut data);
+                let n = crate::kernel::vfs::write(handle as i32, &data, &kt.fds);
                 if n >= 0 {
                     let size = crate::kernel::vfs::file_size(handle as i32, &kt.fds);
                     sft_set_file(regs, handle, size);
@@ -1572,8 +1574,10 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                 let (is_ext, fcb_off) = if regs.read::<u8>(addr as usize) == 0xFF { (true, 7) } else { (false, 0) };
                 let fcb_base = addr.wrapping_add(fcb_off);
                 let drive_byte = regs.read::<u8>((fcb_base) as usize);
-                let name = regs.slice(((fcb_base + 1)) as usize, 8);
-                let ext = regs.slice(((fcb_base + 9)) as usize, 3);
+                let mut name = [0u8; 8];
+                regs.copy_from((fcb_base + 1) as usize, &mut name);
+                let mut ext = [0u8; 3];
+                regs.copy_from((fcb_base + 9) as usize, &mut ext);
                 // Build "[X:][cwd\]NAME[.EXT]" — wildcards stay as-is
                 // ('?' for single, real chars for literal). resolve()
                 // uppercases and applies cwd.
@@ -1586,13 +1590,13 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                     dpos = 3;
                 }
                 let mut k = 0;
-                for &c in name { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; k += 1; }
+                for &c in &name { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; k += 1; }
                 let _ = k;
                 let mut has_ext = false;
-                for &c in ext { if c != b' ' { has_ext = true; break; } }
+                for &c in &ext { if c != b' ' { has_ext = true; break; } }
                 if has_ext {
                     dos_path[dpos] = b'.'; dpos += 1;
-                    for &c in ext { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; }
+                    for &c in &ext { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; }
                 }
                 let mut abs = [0u8; dfs::DFS_PATH_MAX];
                 let alen = match dos.dfs.resolve(&dos_path[..dpos], &mut abs) {
@@ -1683,8 +1687,8 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                         for (i, &c) in e.iter().take(3).enumerate() {
                             ext_buf[i] = c.to_ascii_uppercase();
                         }
-                        regs.write_bytes(fcb_base + 1, &name_buf);
-                        regs.write_bytes(fcb_base + 9, &ext_buf);
+                        regs.copy_to(fcb_base + 1, &name_buf);
+                        regs.copy_to(fcb_base + 9, &ext_buf);
                         // current block = 0 (offsets 0x0C-0x0D), record
                         // size = 128 (0x0E-0x0F), file size at 0x10-0x13.
                         regs.write::<u16>(fcb_base + 0x0E, 128);
@@ -1724,7 +1728,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             }
 
             // Zero-fill the 11-byte name field in FCB (drive byte at +0, name at +1..+12)
-            regs.write_bytes((fcb + 1) as usize, &[b' '; 11]);
+            regs.copy_to((fcb + 1) as usize, &[b' '; 11]);
 
             // Check for drive letter (e.g., "C:")
             let ch0 = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
@@ -1777,7 +1781,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             // Update SI to point past parsed name
             regs.rsi = (regs.rsi & !0xFFFF) | si as u64;
             // AL=0: no wildcards, AL=1: wildcards present, AL=0xFF: drive invalid
-            let has_wildcards = regs.slice((fcb + 1) as usize, 11).iter().any(|&b| b == b'?');
+            let mut fcb_name = [0u8; 11];
+            regs.copy_from((fcb + 1) as usize, &mut fcb_name);
+            let has_wildcards = fcb_name.iter().any(|&b| b == b'?');
             regs.rax = (regs.rax & !0xFF) | if has_wildcards { 1 } else { 0 };
             thread::KernelAction::Done
         }
@@ -1873,7 +1879,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             }
             out[pos] = 0;
             // Write to ES:DI
-            regs.write_bytes(dst as usize, &out[..pos + 1]);
+            regs.copy_to(dst as usize, &out[..pos + 1]);
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -1941,7 +1947,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         0x67 => {
             let requested = regs.rbx as u16;
             if requested <= 20 {
-                Psp::at(regs, psp_struct_seg(dos)).max_files = requested;
+                Psp::set_max_files(regs, psp_struct_seg(dos), requested);
                 regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory for an external JFT
@@ -2091,7 +2097,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                 if open_exists {
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(regs, fd as u16, size);
-                    if (fd as usize) < 20 { Psp::at(regs, psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
+                    if (fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
                     regs.clear_flag32(1);
@@ -2103,7 +2109,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                     };
                     if new_fd >= 0 {
                         sft_set_file(regs, new_fd as u16, 0);
-                        if (new_fd as usize) < 20 { Psp::at(regs, psp_struct_seg(dos)).jft[new_fd as usize] = new_fd as u8; }
+                        if (new_fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                         regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                         regs.rcx = (regs.rcx & !0xFFFF) | 3; // CX=3: file replaced
                         regs.clear_flag32(1);
@@ -2123,7 +2129,7 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
                 };
                 if new_fd >= 0 {
                     sft_set_file(regs, new_fd as u16, 0);
-                    if (new_fd as usize) < 20 { Psp::at(regs, psp_struct_seg(dos)).jft[new_fd as usize] = new_fd as u8; }
+                    if (new_fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
                     regs.clear_flag32(1);
@@ -2203,7 +2209,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     let len = regs.read::<u8>((addr) as usize) as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
-    cmd[..copy].copy_from_slice(regs.slice((addr + 1) as usize, copy));
+    regs.copy_from((addr + 1) as usize, &mut cmd[..copy]);
     let mut start = 0;
     while start < copy && cmd[start] == b' ' { start += 1; }
     let mut end = start;
@@ -2582,7 +2588,7 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
     let tail_len = regs.read::<u8>((cmdtail_addr) as usize) as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
-    tail[..copy_len].copy_from_slice(regs.slice((cmdtail_addr + 1) as usize, copy_len));
+    regs.copy_from((cmdtail_addr + 1) as usize, &mut tail[..copy_len]);
 
     let prog_name: &[u8] = &filename[..flen];
 
@@ -2648,7 +2654,7 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == parent_rm_psp => {
             dpmi.saved_rm_env
         }
-        _ => Psp::at(regs, parent_rm_psp).env_seg,
+        _ => Psp::env_seg(regs, parent_rm_psp),
     };
     let parent_env_vec = snapshot_env(regs, parent_env_seg);
     let parent = ParentRef { psp_seg: parent_rm_psp, env: &parent_env_vec };
@@ -2694,7 +2700,7 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
     let psp_seg = loaded.psp_seg;
 
-    Psp::at(regs, loaded.psp_seg).set_cmdline(&tail[..copy_len]);
+    Psp::set_cmdline(regs, loaded.psp_seg, &tail[..copy_len]);
     dos.dta = (psp_seg as u32) * 16 + 0x80;
     // DPMI host obligation: parent's PM state must not be observable to the
     // child (no PM handlers fire; child's DPMI entry, if any, allocates a
@@ -2851,7 +2857,7 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
         }
 
         let img = &data[header_size as usize..header_size as usize + load_size];
-        regs.write_bytes(load_base as usize, img);
+        regs.copy_to(load_base as usize, img);
         // Apply relocations using caller's reloc_factor (not load_seg).
         for i in 0..reloc_count {
             let entry = reloc_offset + i * 4;
@@ -2864,7 +2870,7 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
         dos_trace!("D21 4B03 MZ loaded: load_size={} relocs={}", load_size, reloc_count);
     } else {
         // Raw / .COM: copy file verbatim at load_seg:0.
-        regs.write_bytes(load_base as usize, &buf);
+        regs.copy_to(load_base as usize, &buf);
         dos_trace!("D21 4B03 raw loaded: size={}", buf.len());
     }
 
@@ -3060,7 +3066,7 @@ fn find_matching_file(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::Ke
                     regs.write::<u8>(dta + 0x15, if is_dir { 0x10 } else { 0x20 });
                     regs.write::<u32>(dta + 0x1A, size);
                     let name_len = alias.len().min(12);
-                    regs.write_bytes(dta + 0x1E, &alias[..name_len]);
+                    regs.copy_to(dta + 0x1E, &alias[..name_len]);
                     regs.write::<u8>(dta + 0x1E + name_len, 0);
                     regs.clear_flag32(1);
                     return thread::KernelAction::Done;
@@ -3098,6 +3104,7 @@ const SFT_ENTRIES: usize = 20;
 /// for any guest code that walks the structure directly.
 ///
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub(super) struct Psp {
     pub int_20:           [u8; 2],   // 0x00 — CD 20 (terminate)
     pub top_of_mem:       u16,        // 0x02 — segment past program (paragraphs)
@@ -3119,20 +3126,31 @@ pub(super) struct Psp {
 }
 const _: () = assert!(core::mem::size_of::<Psp>() == 256);
 impl Psp {
-    /// Borrow the PSP at `psp_seg`. The 256-byte PSP is `[psp_seg<<4 ..
-    /// (psp_seg+0x10)<<4)`. Single-threaded kernel; the borrow checker
-    /// treats successive calls as independent borrows.
-    pub fn at(regs: &mut Vcpu, psp_seg: u16) -> &mut Self {
-        regs.at::<Self>(((psp_seg as u32) << 4) as usize)
+    /// Linear base of the 256-byte PSP at `psp_seg` (`[psp_seg<<4 ..]`).
+    #[inline]
+    fn base(psp_seg: u16) -> usize { ((psp_seg as u32) << 4) as usize }
+    /// Write the whole PSP at `psp_seg`.
+    pub fn store(regs: &mut Vcpu, psp_seg: u16, psp: Self) { regs.write::<Self>(Self::base(psp_seg), psp); }
+    /// Read PSP[0x2C] (environment segment or selector).
+    pub fn env_seg(regs: &Vcpu, psp_seg: u16) -> u16 {
+        regs.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
     }
-    #[allow(dead_code)]
-    pub fn psp_seg(&self) -> u16 { (self as *const _ as u32 >> 4) as u16 }
+    /// Set one Job File Table entry (PSP[0x18 + idx]).
+    pub fn set_jft(regs: &mut Vcpu, psp_seg: u16, idx: usize, val: u8) {
+        regs.write::<u8>(Self::base(psp_seg) + core::mem::offset_of!(Self, jft) + idx, val);
+    }
+    /// Set the JFT size field (PSP[0x32]).
+    pub fn set_max_files(regs: &mut Vcpu, psp_seg: u16, n: u16) {
+        regs.write::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files), n);
+    }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
-    pub fn set_cmdline(&mut self, tail: &[u8]) {
-        let n = tail.len().min(self.cmdline.len() - 1);
-        self.cmdline_len = n as u8;
-        self.cmdline[..n].copy_from_slice(&tail[..n]);
-        self.cmdline[n] = 0x0D;
+    pub fn set_cmdline(regs: &mut Vcpu, psp_seg: u16, tail: &[u8]) {
+        let n = tail.len().min(126);
+        let base = Self::base(psp_seg);
+        regs.write::<u8>(base + core::mem::offset_of!(Self, cmdline_len), n as u8);
+        let cmd = base + core::mem::offset_of!(Self, cmdline);
+        regs.copy_to(cmd, &tail[..n]);
+        regs.write::<u8>(cmd + n, 0x0D);
     }
 }
 impl Default for Psp {
@@ -3141,6 +3159,7 @@ impl Default for Psp {
 
 /// One System File Table entry (DOS 3+ format, 59 bytes).
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct SftEntry {
     refcount: u16,        // 0x00
     open_mode: u16,       // 0x02
@@ -3160,6 +3179,7 @@ impl Default for SftEntry {
 
 /// SFT header followed by the entry array. Total 1186 bytes.
 #[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
 struct Sft {
     next: u32,                       // 0x00 — far ptr to next SFT block (FFFF:FFFF = end)
     count: u16,                      // 0x04
@@ -3169,6 +3189,7 @@ struct Sft {
 /// List-of-Lists (DOS internal). Only the fields we actually fill are named;
 /// the rest is reserved padding.
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct Lol {
     _reserved_00: [u8; 4],
     sft_off: u16,                    // 0x04 — far ptr to SFT (off, seg)
@@ -3188,6 +3209,7 @@ impl Default for Lol {
 
 /// Current Directory Structure (one per drive letter, DOS 3.3 format).
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct CdsEntry {
     path: [u8; 67],                  // 0x00 — ASCIIZ (e.g. "C:\")
     flags: u16,                      // 0x43 — 0x4000 = valid physical drive
@@ -3260,19 +3282,18 @@ const HOST_STACK_SIZE: usize = 4096;
 /// Dedicated RM stack size (see `LowMem::rm_stack`).
 const RM_STACK_SIZE: usize = 0x1000;
 
-/// Borrow the kernel-owned low-mem area as a typed `&'static mut`.
-/// Single-threaded kernel; the borrow checker treats successive calls as
-/// independent borrows, so callers must avoid actually aliasing the data.
+/// Linear address of a `LowMem` field, e.g. `lm_field(offset_of!(LowMem, lol))`.
+/// The kernel-owned low-mem area is a *projection* written into guest memory
+/// field-by-field through the vcpu — never borrowed as a Rust struct (it sits at
+/// a fixed low address the guest can also reach).
 #[inline]
-fn low_mem(regs: &mut Vcpu) -> &mut LowMem {
-    regs.at::<LowMem>(LOW_MEM_BASE as usize)
-}
+fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 
 /// Update the chain-head pointer that lives at `[LOL - 2]`. Called from
 /// `sync_mcb_chain` so AH=52h-style chain walkers see the current
 /// `heap_base_seg`.
 pub(super) fn set_first_mcb_seg(regs: &mut Vcpu, seg: u16) {
-    low_mem(regs).first_mcb_seg = seg;
+    regs.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
 }
 
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
@@ -3288,12 +3309,6 @@ pub(super) fn heap_start() -> u16 {
     ((end + 15) >> 4) as u16
 }
 
-/// The system Program (master env + stand-in PSP) used as bootstrap parent
-/// for the initial DOS thread and as chain-terminator for PSP[0x16].
-#[allow(dead_code)]
-pub(super) fn boot_psp(regs: &mut Vcpu) -> &mut Psp {
-    &mut low_mem(regs).boot_psp
-}
 pub(super) fn boot_psp_seg() -> u16 {
     ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16
 }
@@ -3377,19 +3392,6 @@ fn trim_ws(s: &[u8]) -> &[u8] {
     while start < end && matches!(s[start], b' ' | b'\t' | b'\r') { start += 1; }
     while end > start && matches!(s[end-1], b' ' | b'\t' | b'\r') { end -= 1; }
     &s[start..end]
-}
-
-/// Borrow `len` bytes of an env block at `env_seg` as a writable slice.
-/// Used by `fill_env` to populate a freshly-allocated env block.
-pub(super) fn env_bytes_mut(regs: &mut Vcpu, env_seg: u16, len: usize) -> &mut [u8] {
-    regs.slice_mut(((env_seg as u32) << 4) as usize, len)
-}
-
-/// Borrow the env block at `env_seg` as a read-only slice up to the
-/// `00 00` terminator (or `len` bytes max). Used to inherit a parent's
-/// env into a child via `fill_env`.
-pub(super) fn env_bytes(regs: &Vcpu, env_seg: u16, len: usize) -> &[u8] {
-    regs.slice(((env_seg as u32) << 4) as usize, len)
 }
 
 /// What a child inherits from its parent: PSP segment (for child's PSP[0x16])
@@ -3483,8 +3485,9 @@ pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 pub(super) fn setup_ivt(regs: &mut Vcpu) {
     // Fill the stub array with `CD 31` so any slot reached by an IVT entry
     // (or PM CALL FAR) traps to STUB_INT and the slot dispatcher.
-    for entry in low_mem(regs).stubs.iter_mut() {
-        *entry = [0xCD, STUB_INT];
+    let stubs = lm_field(core::mem::offset_of!(LowMem, stubs));
+    for i in 0..256 {
+        regs.write::<[u8; 2]>(stubs + i * 2, [0xCD, STUB_INT]);
     }
 
     // HW IRQ vectors (0x08-0x0F + 0x70-0x77) are left pointing at the
@@ -3514,23 +3517,21 @@ pub(super) fn setup_ivt(regs: &mut Vcpu) {
 fn setup_lol_sft(regs: &mut Vcpu) {
     let sft_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
     let cds_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
-
-    let lm = low_mem(regs);
+    let boot_seg = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16;
 
     // Bootstrap sentinel PSP: self-referencing parent_psp terminates any
     // PSP[0x16] walk, env_seg = 0 (env defaults live in MASTER_ENV
     // const, not on the chain). The cmdline area at 0x80+ is otherwise
     // unused and gives us a permanent zero byte at the INDOS-flag offset.
-    let boot_seg = (&raw const lm.boot_psp as u32 >> 4) as u16;
-    lm.boot_psp = Psp {
+    Psp::store(regs, boot_seg, Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
         parent_psp: boot_seg,         // self-ref terminates the parent chain
         env_seg: 0,
         ..Default::default()
-    };
+    });
 
-    lm.lol = Lol {
+    let lol = Lol {
         sft_off: (sft_addr & 0xF) as u16,
         sft_seg: (sft_addr >> 4) as u16,
         cds_off: (cds_addr & 0xF) as u16,
@@ -3539,19 +3540,21 @@ fn setup_lol_sft(regs: &mut Vcpu) {
         last_drive: NUM_DRIVES,
         ..Default::default()
     };
+    regs.write::<Lol>(lm_field(core::mem::offset_of!(LowMem, lol)), lol);
 
     // SFT header: end-of-chain link, entry count + zeroed entries; then
     // pre-populate stdin/stdout/stderr as character devices.
-    lm.sft = unsafe { core::mem::zeroed() };
-    lm.sft.next = 0xFFFF_FFFF;
-    lm.sft.count = SFT_ENTRIES as u16;
+    let mut sft = Sft::default();
+    sft.next = 0xFFFF_FFFF;
+    sft.count = SFT_ENTRIES as u16;
     for fd in 0..3 {
-        lm.sft.entries[fd] = SftEntry {
+        sft.entries[fd] = SftEntry {
             refcount: 1,
             device_info: if fd == 0 { 0x81 } else { 0x82 },
             ..Default::default()
         };
     }
+    regs.write::<Sft>(lm_field(core::mem::offset_of!(LowMem, sft)), sft);
 
     // CDS: drive 2 = C:\, drive 7 = H:\ (hostfs). Others stay invalid.
     let mk = |drive_letter: u8| -> CdsEntry {
@@ -3563,29 +3566,37 @@ fn setup_lol_sft(regs: &mut Vcpu) {
         e.backslash_off = 2;
         e
     };
-    lm.cds = [(); NUM_DRIVES as usize].map(|_| CdsEntry::default());
-    lm.cds[2] = mk(b'C');
-    lm.cds[7] = mk(b'H');
+    let mut cds = [(); NUM_DRIVES as usize].map(|_| CdsEntry::default());
+    cds[2] = mk(b'C');
+    cds[7] = mk(b'H');
+    regs.write::<[CdsEntry; NUM_DRIVES as usize]>(lm_field(core::mem::offset_of!(LowMem, cds)), cds);
 }
 
+
+/// Linear address of `LowMem.sft.entries[handle]`.
+#[inline]
+fn sft_entry_addr(handle: usize) -> usize {
+    lm_field(core::mem::offset_of!(LowMem, sft) + core::mem::offset_of!(Sft, entries)
+        + handle * core::mem::size_of::<SftEntry>())
+}
 
 /// Populate SFT entry for a newly opened file handle.
 fn sft_set_file(regs: &mut Vcpu, handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
-    low_mem(regs).sft.entries[handle as usize] = SftEntry {
+    regs.write::<SftEntry>(sft_entry_addr(handle as usize), SftEntry {
         refcount: 1,
         attribute: 0x20,    // archive
         time: 0x6000,       // 12:00:00
         date: 0x5C76,       // 2026-03-22
         size,
         ..Default::default()
-    };
+    });
 }
 
 /// Clear SFT entry when a file handle is closed.
 fn sft_clear(regs: &mut Vcpu, handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
-    low_mem(regs).sft.entries[handle as usize].refcount = 0;
+    regs.write::<u16>(sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount), 0);
 }
 
 // ============================================================================
@@ -3635,7 +3646,7 @@ fn init_psp(regs: &mut Vcpu, psp_seg: u16, env_seg: u16, parent_psp: u16) {
     let mut cmdline = [0u8; 127];
     cmdline[0] = 0x0D;                      // empty tail terminated by CR
 
-    *Psp::at(regs, psp_seg) = Psp {
+    Psp::store(regs, psp_seg, Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
         parent_psp,
@@ -3647,9 +3658,10 @@ fn init_psp(regs: &mut Vcpu, psp_seg: u16, env_seg: u16, parent_psp: u16) {
         cmdline_len: 0,
         cmdline,
         ..Default::default()
-    };
+    });
 
-    let env = env_bytes(regs, env_seg, 80);
+    let mut env = [0u8; 80];
+    regs.copy_from((env_seg as usize) << 4, &mut env);
     let mut dump = [0u8; 80];
     for (i, &b) in env.iter().enumerate() {
         dump[i] = if b == 0 { b'.' } else if b < 32 || b >= 127 { b'?' } else { b };
@@ -3682,12 +3694,15 @@ fn alloc_program_blocks(dos: &mut thread::DosState, regs: &mut Vcpu, prog_paras:
 /// and re-syncs the MCB chain so block ownership reflects the new PSP.
 fn populate_program(regs: &mut Vcpu, dos: &mut thread::DosState, env_seg: u16, psp_seg: u16,
                     parent: &ParentRef, prog_name: &[u8]) {
-    fill_env(env_bytes_mut(regs, env_seg, (ENV_PARAS as usize) * 16),
-             parent.env, prog_name);
+    // Build the env arena in a local buffer, write it to guest memory, and
+    // read the BLASTER config from the same buffer (no second guest read).
+    let mut env = alloc::vec![0u8; (ENV_PARAS as usize) * 16];
+    fill_env(&mut env, parent.env, prog_name);
+    regs.copy_to(((env_seg as u32) << 4) as usize, &env);
     // Latch this program's BLASTER A/I/D/H into the SB-DMA layer so the
     // virtual 8237 traps the right channel and the IRQ relay uses the
     // right vector. Missing BLASTER leaves the SB16 defaults.
-    dos.pc.sb.configure_from_env(env_bytes(regs, env_seg, (ENV_PARAS as usize) * 16));
+    dos.pc.sb.configure_from_env(&env);
     init_psp(regs, psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
     dos_set_program_block_owner(dos, regs, env_seg, psp_seg, psp_seg);
@@ -3704,7 +3719,7 @@ pub(super) fn load_com(regs: &mut Vcpu, dos: &mut thread::DosState, parent: &Par
 
     // Load .COM code at psp_seg:0x100 (= (psp_seg+0x10):0).
     let load_addr = ((psp_seg as u32) << 4) + COM_OFFSET as u32;
-    regs.write_bytes(load_addr as usize, data);
+    regs.copy_to(load_addr as usize, data);
 
     Loaded {
         env_seg, psp_seg,
@@ -3781,7 +3796,7 @@ pub(super) fn load_exe(regs: &mut Vcpu, dos: &mut thread::DosState, parent: &Par
 
     let load_base = (load_segment as u32) << 4;
     let load_data = &data[header_size as usize..header_size as usize + load_size];
-    regs.write_bytes(load_base as usize, load_data);
+    regs.copy_to(load_base as usize, load_data);
 
     // Zero the allocation tail so re-exec cannot expose stale data past the image.
     let bss_start = load_base + load_size as u32;

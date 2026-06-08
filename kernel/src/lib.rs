@@ -290,7 +290,7 @@ pub fn host_run_demo() -> ! {
     ];
     use arch_abi::GuestBytes;
     let mut vcpu = arch::Vcpu::empty();
-    vcpu.write_bytes(CODE as usize, code);
+    vcpu.copy_to(CODE as usize, code);
     vcpu.regs.init_user_process(CODE, STACK);
     arch::set_current_vcpu(vcpu);
 

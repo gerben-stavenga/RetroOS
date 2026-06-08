@@ -465,14 +465,14 @@ impl SbDmaState {
             // Snapshot the guest's pre-filled content — whole pages, so the
             // unrelated neighbour bytes on partial end pages survive.
             let mut snap = alloc::vec![0u8; span];
-            snap.copy_from_slice(regs.slice(vbase as usize, span));
+            regs.copy_from(vbase as usize, &mut snap);
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
             machine.free_range(vbase >> 12, num_pages);
             machine.map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
-            regs.write_bytes(vbase as usize, &snap);
+            regs.copy_to(vbase as usize, &snap);
             self.bound_chan  = chan as u8;
             self.bound_host  = host as u8;
             self.bound_gpa   = gpa;
@@ -497,10 +497,10 @@ impl SbDmaState {
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
-        snap.copy_from_slice(regs.slice(vbase as usize, span));
+        regs.copy_from(vbase as usize, &mut snap);
         machine.map_fresh_range(
             self.bound_vpage, self.bound_pages);
-        regs.write_bytes(vbase as usize, &snap);
+        regs.copy_to(vbase as usize, &snap);
         self.bound_chan  = 0xFF;
         self.bound_host  = 0xFF;
         self.bound_gpa   = 0;

@@ -726,7 +726,7 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
             const VENDOR: &[u8] = b"RetroOS DPMI Host\0";
             regs.write::<u8>(dest as usize, 1);        // host major = 1
             regs.write::<u8>(dest as usize + 1, 0);    // host minor = 0
-            regs.write_bytes(dest as usize + 2, VENDOR);
+            regs.copy_to(dest as usize + 2, VENDOR);
             clear_carry(regs);
         }
         // AX=0500h — Get Free Memory Information

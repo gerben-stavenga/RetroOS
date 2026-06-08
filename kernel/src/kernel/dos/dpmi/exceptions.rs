@@ -36,7 +36,8 @@ fn dump_dpmi_fault_context(dos: &thread::DosState, regs: &Vcpu, exc_num: u32) {
     let ip_addr = cs_base.wrapping_add(regs.ip32());
     let sp_addr = ss_base.wrapping_add(regs.sp32());
     let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
-    let bytes = regs.slice((ip_addr) as usize, 16);
+    let mut bytes = [0u8; 16];
+    regs.copy_from(ip_addr as usize, &mut bytes);
 
     crate::println!(
         "[DPMI-FAULT] exc={} at {:04X}:{:08X} err={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X}",
