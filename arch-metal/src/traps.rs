@@ -5,11 +5,11 @@
 
 #![allow(static_mut_refs)]
 
-use crate::arch::irq::handle_irq;
-use crate::arch::paging2::{self, Entry};
-use crate::arch::x86;
+use crate::irq::handle_irq;
+use crate::paging2::{self, Entry};
+use crate::x86;
 use arch_abi::{Frame64, Regs};
-use crate::arch::Vcpu;
+use crate::Vcpu;
 
 // =============================================================================
 // Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
@@ -158,7 +158,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
             let cs_base = if regs.mode() == arch_abi::UserMode::VM86 {
                 (regs.code_seg() as u32) << 4
             } else {
-                crate::arch::monitor::seg_base(regs.code_seg())
+                crate::monitor::seg_base(regs.code_seg())
             };
             let ip = regs.ip32();
             let lin = cs_base.wrapping_add(ip);
@@ -166,7 +166,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
             let ss_base = if regs.mode() == arch_abi::UserMode::VM86 {
                 (regs.stack_seg() as u32) << 4
             } else {
-                crate::arch::monitor::seg_base(regs.stack_seg())
+                crate::monitor::seg_base(regs.stack_seg())
             };
             let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
             let st0 = unsafe { core::ptr::read_unaligned(bp_addr as *const u16) };
@@ -235,7 +235,7 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::UNMAP_RANGE => paging2::unmap_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::FREE_RANGE => paging2::free_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::LOAD_LDT => {
-            crate::arch::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
+            crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }
         arch_call::MAP_PHYS_RANGE => {
             let vpage_start = regs.rdx as usize;
@@ -247,17 +247,17 @@ fn arch_dispatch(regs: &mut Regs) {
             }
         }
         arch_call::ALLOC_PHYS_CONTIG => {
-            regs.rax = crate::arch::phys_mm::alloc_phys_contig(
+            regs.rax = crate::phys_mm::alloc_phys_contig(
                 regs.rdx as usize, regs.rcx as u32).unwrap_or(0);
         }
         arch_call::FREE_PHYS_CONTIG => {
-            crate::arch::phys_mm::free_phys_contig(regs.rdx as u64, regs.rcx as usize);
+            crate::phys_mm::free_phys_contig(regs.rdx as u64, regs.rcx as usize);
         }
         arch_call::REARM_IRQ => {
-            crate::arch::irq::rearm_irq(regs.rdx as u8);
+            crate::irq::rearm_irq(regs.rdx as u8);
         }
         arch_call::DMA_CHANNEL_BUF => {
-            regs.rax = crate::arch::phys_mm::dma_channel_buf(regs.rdx as usize);
+            regs.rax = crate::phys_mm::dma_channel_buf(regs.rdx as usize);
         }
         arch_call::MAP_FRESH_RANGE => {
             paging2::map_fresh_range(regs.rdx as usize, regs.rcx as usize);
@@ -267,10 +267,10 @@ fn arch_dispatch(regs: &mut Regs) {
             let base = regs.rcx as u32;
             let limit = regs.rbx as u32;
             let limit_in_pages = regs.rdi != 0;
-            regs.rax = crate::arch::descriptors::set_tls_entry(index, base, limit, limit_in_pages) as u64;
+            regs.rax = crate::descriptors::set_tls_entry(index, base, limit, limit_in_pages) as u64;
             // Also write FS_BASE MSR so 32-bit compat mode picks up the
             // correct hidden base (the 32-bit iret path doesn't touch the MSR).
-            unsafe { crate::arch::x86::wrmsr(0xC000_0100, base as u64); }
+            unsafe { crate::x86::wrmsr(0xC000_0100, base as u64); }
         }
         arch_call::SET_DEBUG_WATCH => {
             unsafe {
@@ -308,7 +308,7 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
     paging2::sync_hw_pdpt();
     x86::flush_tlb();
     let saved = paging2::ensure_trampoline_mapped();
-    crate::arch::descriptors::toggle_mode(paging2::toggle_cr3(want_64));
+    crate::descriptors::toggle_mode(paging2::toggle_cr3(want_64));
     paging2::clear_trampoline(saved);
     !is_long
 }
@@ -324,7 +324,7 @@ fn arch_switch_to(regs: &mut Regs) {
     let regs_ptr = regs.rdx as u32 as *mut Regs;
     let root_ptr = regs.rcx as u32 as *mut paging2::RootPageTable;
     let hash_ptr = regs.rbx as u32 as *mut u64;
-    let fx_ptr   = regs.rsi as u32 as *mut crate::arch::x86::FxState;
+    let fx_ptr   = regs.rsi as u32 as *mut crate::x86::FxState;
 
     let expected = if !hash_ptr.is_null() {
         unsafe {
@@ -340,7 +340,7 @@ fn arch_switch_to(regs: &mut Regs) {
     // Null fx_ptr = skip (used by kernel-only transient swaps that never
     // touch the FPU between entry and exit).
     if !fx_ptr.is_null() {
-        let mut tmp = crate::arch::x86::FxState::zeroed();
+        let mut tmp = crate::x86::FxState::zeroed();
         tmp.save();
         unsafe { (*fx_ptr).restore(); }
         unsafe { *fx_ptr = tmp; }
@@ -594,7 +594,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 /// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
 /// are handled inline by arch before bubbling.
 fn isr_handler_ring3(regs: &mut Regs) {
-    use crate::arch::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult, TF_VIRTUAL_IF_STEPPING};
+    use crate::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult, TF_VIRTUAL_IF_STEPPING};
     use arch_abi::UserMode;
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
@@ -617,7 +617,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 // takes a `&Vcpu`; wrap the trap frame in a throwaway vcpu view
                 // (its `space` is unused — `mem()` reads the active mapping).
                 let v = Vcpu::new(*regs, paging2::RootPageTable::empty());
-                crate::arch::monitor::pm_step_log(&v);
+                crate::monitor::pm_step_log(&v);
                 arch_abi::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
                 regs.set_flag32(1 << 8); // keep TF on
                 return;
@@ -678,14 +678,14 @@ fn isr_handler_ring3(regs: &mut Regs) {
             let cs_base = if regs.mode() == UserMode::VM86 {
                 (regs.code_seg() as u32) << 4
             } else {
-                crate::arch::monitor::seg_base(regs.code_seg())
+                crate::monitor::seg_base(regs.code_seg())
             };
             let lin = cs_base.wrapping_add(regs.ip32());
             let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
             let ss_base = if regs.mode() == UserMode::VM86 {
                 (regs.stack_seg() as u32) << 4
             } else {
-                crate::arch::monitor::seg_base(regs.stack_seg())
+                crate::monitor::seg_base(regs.stack_seg())
             };
             let sp = regs.sp32();
             let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
@@ -737,7 +737,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
 
 /// Try to handle a page fault. Returns Some(()) if resolved, None if not.
 fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
-    use crate::arch::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
+    use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
 
     let fault_addr = x86::read_cr2() as usize;
     let present = (error & 1) != 0;
@@ -859,7 +859,7 @@ fn demand_page<E: paging2::Entry>(
     page_index: usize,
     use_nx: bool,
 ) {
-    use crate::arch::paging2::PAGE_TABLE_BASE_IDX;
+    use crate::paging2::PAGE_TABLE_BASE_IDX;
 
     let zero_page = paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
     let is_user = page_index < paging2::recursive_idx();
@@ -877,7 +877,7 @@ fn demand_page<E: paging2::Entry>(
 
 /// Demand-page a kernel heap page: allocate a real writable physical page.
 fn demand_page_kernel(fault_addr: usize) {
-    let phys = crate::arch::phys_mm::alloc_phys_page()
+    let phys = crate::phys_mm::alloc_phys_page()
         .expect("Arch: OOM during kernel heap demand paging");
     let page_index = paging2::page_idx(fault_addr);
     match paging2::entries() {

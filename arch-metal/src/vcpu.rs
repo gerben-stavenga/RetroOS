@@ -95,5 +95,5 @@ impl GuestBytes for RootPageTable {
 /// which is entered directly rather than through a context switch (the swap
 /// path otherwise owns `REGS`). The `static mut` access is confined here.
 pub fn set_current_vcpu(v: Vcpu) {
-    unsafe { *(&raw mut crate::arch::REGS) = v; }
+    unsafe { *(&raw mut crate::REGS) = v; }
 }

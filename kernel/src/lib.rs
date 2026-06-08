@@ -13,14 +13,20 @@ extern crate alloc;
 extern crate ext4_view;
 extern crate rustc_demangle;
 
-// The arch layer is a swappable backend. Metal: the in-tree `kernel/src/arch/`
-// (real x86, INT 0x80). Hosted: the `arch-interp` crate (software x86 core),
-// pulled in as `crate::arch` so every `crate::arch::*` path resolves the same.
+// The arch layer is a swappable backend crate, pulled in as `crate::arch` so
+// every `crate::arch::*` path resolves the same. Metal: `arch-metal` (real x86,
+// INT 0x80). Hosted: `arch-interp` (software x86 core).
 #[cfg(not(feature = "hosted"))]
-#[path = "arch/mod.rs"]
-mod arch;
+extern crate arch_metal as arch;
 #[cfg(feature = "hosted")]
 extern crate retroos_arch_interp as arch;
+
+// The metal entry/crt0 (`boot_kernel`, called by `entry.asm`). It is the binary
+// side of the boundary: it drives `arch`'s bring-up then calls `startup`, so it
+// stays kernel-side rather than in the backend crate.
+#[cfg(not(feature = "hosted"))]
+#[path = "arch/boot.rs"]
+mod boot;
 
 mod kernel;
 
@@ -65,38 +71,9 @@ pub fn new_arch() -> TheArch {
 // `crate::parse_debug_watch` keep resolving.
 pub use arch_abi::{BootConfig, parse_debug_watch};
 
-/// Multiboot memory map entry
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct MultibootMmapEntry {
-    pub size: u32,
-    pub base: u64,
-    pub length: u64,
-    pub typ: u32,
-}
-
-/// Multiboot info structure (from GRUB or our bootloader)
-#[repr(C)]
-pub struct MultibootInfo {
-    pub flags: u32,
-    pub mem_lower: u32,
-    pub mem_upper: u32,
-    pub boot_device: u32,
-    pub cmdline: u32,
-    pub mods_count: u32,
-    pub mods_addr: u32,
-    pub syms: [u32; 4],
-    pub mmap_length: u32,
-    pub mmap_addr: u32,
-}
-
-// Metal-only: scratch/zero page frames and linker-symbol statics are consumed
-// only by the bare-metal arch boot/paging code. The hosted backend has neither
-// a custom paging bring-up nor a linker script.
-#[cfg(not(feature = "hosted"))]
-static ZERO_PAGE: RawPage = unsafe { core::mem::zeroed() };
-#[cfg(not(feature = "hosted"))]
-static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
+// The multiboot info structs + the metal scratch/zero page frames moved into
+// `arch-metal` (consumed by its paging bring-up); the metal entry `boot.rs`
+// reaches them as `arch::…`.
 
 // Linker symbols. Stacks and their guard pages live at the tail of .bss
 // (see kernel.ld); only their addresses matter to Rust, so they're declared

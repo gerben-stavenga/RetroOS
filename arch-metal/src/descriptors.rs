@@ -15,7 +15,7 @@
 
 #![allow(static_mut_refs)]
 
-use crate::arch::x86::{self, GdtPtr, IdtPtr};
+use crate::x86::{self, GdtPtr, IdtPtr};
 
 /// Segment selectors
 pub const KERNEL_CS: u16 = 0x08;
@@ -334,7 +334,7 @@ struct Idt64 {
 /// (0xC0Bxxxxx) resolve to physical memory (0x001xxxxx) via 32-bit segment
 /// wraparound, before paging is enabled.
 const BOOT_SEG_OFFSET: u32 =
-    (super::boot::KERNEL_PHYS as u32).wrapping_sub(super::paging2::KERNEL_BASE as u32);
+    (super::paging2::KERNEL_PHYS as u32).wrapping_sub(super::paging2::KERNEL_BASE as u32);
 
 /// Boot GDT used by the asm `_start` stub until paging is enabled.
 /// Layout: null / code32 @ 0x08 / data32 @ 0x10. Referenced by name from
@@ -651,7 +651,7 @@ const FMASK_MSR: u32 = 0xC0000084;
 /// Set up SYSCALL MSRs for 64-bit user processes.
 /// Call once during init, after GDT/TSS are configured.
 pub fn setup_syscall() {
-    if !crate::arch::paging2::cpu_supports_long_mode() {
+    if !crate::paging2::cpu_supports_long_mode() {
         return;
     }
     unsafe {
@@ -696,7 +696,11 @@ pub fn enter_ring1() {
             "push {ss:e}",            // SS = RING1_DS
             "push {tmp:e}",           // ESP = pre-push value (restored by IRET)
             "pushfd",                 // EFLAGS
-            "or dword ptr [esp], 0x1000", // set IOPL=1 so ring-1 can do I/O
+            // IOPL=1 (0x1000) so ring-1 can do I/O, and IF (0x200) so HW IRQs
+            // (timer/keyboard) are delivered once we drop to the kernel. This is
+            // the sole place interrupts are enabled — `sti`/`cli` stay
+            // arch-private; the kernel never toggles IF.
+            "or dword ptr [esp], 0x1200",
             "push {cs:e}",            // CS = RING1_CS
             "lea {tmp:e}, [2f]",
             "push {tmp:e}",           // EIP = label after IRET

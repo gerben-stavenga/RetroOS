@@ -1,0 +1,18 @@
+# Build arch-metal crate (the bare-metal x86 `arch_abi::Arch` backend).
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "arch-metal",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "arch_metal",
+    edition = "2024",
+    rustc_flags = [
+        "-Copt-level=s",
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+        "-Cforce-frame-pointers=yes",
+    ],
+    deps = ["//arch-abi", "//lib"],
+)

@@ -23,7 +23,7 @@
 use arch_abi::{Regs, UserMode};
 
 // IoSize and KernelEvent are the backend-agnostic arch↔kernel contract; they
-// live in `arch-abi` and are re-exported here so `crate::arch::monitor::{
+// live in `arch-abi` and are re-exported here so `crate::monitor::{
 // KernelEvent, IoSize}` keeps resolving. The metal monitor below decodes a #GP
 // into these; the interpreter backend produces them directly.
 pub use arch_abi::{IoSize, KernelEvent};
@@ -44,13 +44,13 @@ pub enum MonitorResult {
 // Segment resolution (re-exported from descriptors)
 // =============================================================================
 
-pub use crate::arch::descriptors::{seg_base, seg_is_32};
+pub use crate::descriptors::{seg_base, seg_is_32};
 
 /// Log one PM/VM86 single-step: CS:EIP + key regs + the first opcode bytes.
 /// Armed via `arch_abi::PM_STEP_BUDGET`; the single-step `#DB` handler calls
 /// this each step until the budget drains. Pure arch-level instruction tracing
 /// (decodes CS:EIP through the segment helpers and reads the opcode bytes).
-pub fn pm_step_log(regs: &crate::arch::Vcpu) {
+pub fn pm_step_log(regs: &crate::Vcpu) {
     use arch_abi::GuestBytes;
     let is_vm86 = regs.frame.rflags & (1u64 << 17) != 0;
     let (cs_base, mode) = if is_vm86 {
@@ -353,7 +353,7 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
             advance += 1;
             advance_ip(regs, cs_32, advance);
             if regs.mode() == UserMode::VM86
-                && !crate::arch::descriptors::int_intercepted(vector)
+                && !crate::descriptors::int_intercepted(vector)
             {
                 unsafe { sw_reflect_vm86_int(regs, vector); }
                 MonitorResult::Resume

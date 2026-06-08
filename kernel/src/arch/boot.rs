@@ -4,8 +4,9 @@
 //! 1. _start (asm stub: offset GDT, kernel stack, calls boot_kernel)
 //! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
-use super::{paging2, phys_mm, descriptors, irq, x86};
-use crate::{vga, println, MultibootMmapEntry};
+use arch::{paging2, phys_mm, descriptors, irq, x86};
+use crate::vga;
+use arch::MultibootMmapEntry;
 use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
@@ -36,7 +37,7 @@ unsafe extern "C" {
 /// `magic` is the Multiboot bootloader magic (EAX on entry).
 /// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootInfo) -> ! {
+pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInfo) -> ! {
     let kernel_size =
         core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
     ;
@@ -45,7 +46,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
     // Enable paging (auto-detects Legacy vs PAE)
     // With offset segments, linked pointers work directly — no delta adjustment needed
     paging2::enable_paging(
-        &raw mut crate::SCRATCH,
+        &raw mut arch::SCRATCH,
         KERNEL_PHYS,
         kernel_pages,
     );
@@ -71,7 +72,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
     );
 
     // Multiboot info is in low memory — access through LOW_MEM_BASE mapping
-    let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const crate::MultibootInfo) };
+    let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const arch::MultibootInfo) };
 
     lib::println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
@@ -120,8 +121,8 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const crate::MultibootIn
         lib::println!("Switched to Compat mode");
     }
 
-    x86::sti();
-    lib::println!("Interrupts enabled");
+    // Interrupts are enabled by `enter_ring1` (it sets IF in the IRET frame it
+    // builds) — the kernel side never touches `sti`/`cli`.
 
     // Install stack guard pages: unmap the page directly below each stack
     // so any overflow takes a clean #PF (caught and labeled in

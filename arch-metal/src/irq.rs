@@ -1,7 +1,7 @@
 //! Programmable Interrupt Controller (8259 PIC) and IRQ handling
 
 use lib::pipe::Pipe;
-use crate::arch::x86::{inb, outb};
+use crate::x86::{inb, outb};
 use arch_abi::Regs;
 
 /// PIC ports
@@ -21,7 +21,7 @@ pub const IRQ_OFFSET: u8 = 32;
 // ============================================================================
 
 /// Typed IRQ event — the backend-agnostic contract, defined in `arch-abi` and
-/// re-exported so `crate::arch::Irq` keeps resolving. The PIC plumbing below
+/// re-exported so `crate::Irq` keeps resolving. The PIC plumbing below
 /// constructs and queues these.
 pub use arch_abi::Irq;
 
