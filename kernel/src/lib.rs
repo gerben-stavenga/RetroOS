@@ -23,7 +23,6 @@ mod arch;
 extern crate retroos_arch_interp as arch;
 
 mod kernel;
-pub mod pipe;  // Shared utility: ring buffer used by both arch and kernel
 
 // Re-export kernel submodules so arch/ code can use crate::thread, crate::dos, etc.
 pub use kernel::dos;

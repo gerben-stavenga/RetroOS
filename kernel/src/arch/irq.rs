@@ -1,6 +1,6 @@
 //! Programmable Interrupt Controller (8259 PIC) and IRQ handling
 
-use crate::pipe::Pipe;
+use lib::pipe::Pipe;
 use crate::arch::x86::{inb, outb};
 use arch_abi::Regs;
 
