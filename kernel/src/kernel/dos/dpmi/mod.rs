@@ -12,6 +12,8 @@
 
 extern crate alloc;
 
+use arch_abi::Arch;
+use arch_abi::GuestBytes;
 use alloc::boxed::Box;
 use crate::arch::Vcpu;
 use crate::kernel::thread;
@@ -118,7 +120,7 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
     // selector per §4.1. `dos.current_psp` stays as the segment value
     // (pure DOS state).
     dos.dpmi = Some(Box::new(dpmi));
-    install_dpmi_psp_view(dos);
+    install_dpmi_psp_view(dos, regs);
 
     // PMDOS: route PM INT 21 to the kernel's direct-service handler.
     if dos.pm_dos {
@@ -180,7 +182,7 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
 /// PM client-initiated INT 31h — the DPMI service API, dispatched by AX.
 /// Caller (`dos::syscall`) has already classified the trap as client-side
 /// (CS not in the kernel's stub LDT slots).
-pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
@@ -314,7 +316,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
                 if let Some(dpmi) = dos.dpmi.as_ref() {
                     if !dpmi.client_use32 && dpmi.env_ldt_idx != 0 && (base & 0xF) == 0 {
                         let psp_base = desc_base(dos.ldt[PSP_LDT_IDX]);
-                        let env_sel = crate::arch::mem().read::<u16>(((psp_base + 0x2C)) as usize);
+                        let env_sel = regs.read::<u16>(((psp_base + 0x2C)) as usize);
                         if env_sel != 0 && ((env_sel as u32) << 4) == base {
                             let env_idx = sel_to_idx(env_sel);
                             if env_idx < LDT_ENTRIES && ldt_is_allocated(&dos.ldt_alloc, env_idx) {
@@ -398,7 +400,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let desc = dos.ldt[idx];
-                crate::arch::mem().write::<u64>((dest) as usize, desc);
+                regs.write::<u64>((dest) as usize, desc);
                 dos_trace!("[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
                     desc_base(desc), desc);
                 clear_carry(regs);
@@ -428,7 +430,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
         // BX = paragraphs. Returns: AX = real-mode segment, DX = selector
         0x0100 => {
             let paragraphs = regs.rbx as u16;
-            match dos::dos_alloc_block(dos, paragraphs) {
+            match dos::dos_alloc_block(dos, regs, paragraphs) {
                 Ok(seg) => {
                     if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
                         let base = (seg as u32) * 16;
@@ -441,7 +443,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
                             paragraphs, seg, sel, base);
                         clear_carry(regs);
                     } else {
-                        let _ = dos::dos_free_block(dos, seg);
+                        let _ = dos::dos_free_block(dos, regs, seg);
                         regs.rax = (regs.rax & !0xFFFF) | 8;
                         set_carry(regs);
                     }
@@ -464,7 +466,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
-                match dos::dos_free_block(dos, seg) {
+                match dos::dos_free_block(dos, regs, seg) {
                     Ok(()) => {
                         free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
                         clear_carry(regs);
@@ -488,7 +490,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
-                match dos::dos_resize_block(dos, seg, paragraphs) {
+                match dos::dos_resize_block(dos, regs, seg, paragraphs) {
                     Ok(()) => {
                         let limit = (paragraphs as u32).saturating_mul(16).saturating_sub(1);
                         dos.ldt[idx] = make_data_desc(base, limit);
@@ -506,8 +508,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
         // BL = interrupt number. Returns: CX:DX = seg:off
         0x0200 => {
             let int_num = regs.rbx as u8;
-            let off = machine::read_u16(0, (int_num as u32) * 4);
-            let seg = machine::read_u16(0, (int_num as u32) * 4 + 2);
+            let off = machine::read_u16(regs, 0, (int_num as u32) * 4);
+            let seg = machine::read_u16(regs, 0, (int_num as u32) * 4 + 2);
             regs.rcx = (regs.rcx & !0xFFFF) | seg as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | off as u64;
             clear_carry(regs);
@@ -519,8 +521,8 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             let seg = regs.rcx as u16;
             let off = regs.rdx as u16;
             dos_trace!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
-            machine::write_u16(0, (int_num as u32) * 4, off);
-            machine::write_u16(0, (int_num as u32) * 4 + 2, seg);
+            machine::write_u16(regs, 0, (int_num as u32) * 4, off);
+            machine::write_u16(regs, 0, (int_num as u32) * 4 + 2, seg);
             clear_carry(regs);
         }
         // AX=0202h — Get Processor Exception Handler Vector
@@ -724,7 +726,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             const VENDOR: &[u8] = b"RetroOS DPMI Host\0";
             regs.write::<u8>(dest as usize, 1);        // host major = 1
             regs.write::<u8>(dest as usize + 1, 0);    // host minor = 0
-            regs.write_bytes(dest as usize + 2, VENDOR);
+            regs.copy_to(dest as usize + 2, VENDOR);
             clear_carry(regs);
         }
         // AX=0500h — Get Free Memory Information
@@ -921,7 +923,7 @@ pub(super) fn dpmi_api(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::K
             let vpage_start = base as usize / 4096;
             let ppage_start = phys as u64 / 4096;
             // PWT (bit 3) + PCD (bit 4): write-through, cache-disable for MMIO
-            crate::arch::arch_map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
+            machine.map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
             // Return linear address
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
             regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);

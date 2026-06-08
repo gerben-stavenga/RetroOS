@@ -11,6 +11,11 @@
 [workspace]
 resolver = "2"
 members = ["arch-abi", "arch-interp", "kernel", "lib"]
+# `arch-metal` is the bare-metal i686 backend — it only compiles for the metal
+# target via Bazel (//arch-metal), never on the host triple. Excluded so a
+# host-side `cargo build` never tries to compile it. (The hosted kernel selects
+# `arch-interp`; the metal cfg that names `arch_metal` is off under cargo.)
+exclude = ["arch-metal"]
 
 # The kernel and its freestanding lib are written for the bare-metal deployment
 # semantics (Bazel builds them at opt-level=s, where integer-overflow checks are

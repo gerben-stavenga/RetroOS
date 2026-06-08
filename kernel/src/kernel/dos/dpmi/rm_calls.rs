@@ -1,3 +1,4 @@
+use arch_abi::GuestBytes;
 use super::*;
 use crate::arch::Vcpu;
 use super::super::mode_transitions;
@@ -6,12 +7,12 @@ use super::super::mode_transitions::RmCallStruct;
 /// INT 31h/0300h — Simulate Real Mode Interrupt
 /// Trace helper: peek 16 bytes at RM linear (ds<<4)+edx and print ASCII.
 /// Used to see what filename/buffer DOS/4GW hands to real mode.
-fn dump_ds_dx(ds: u16, edx: u32) {
+fn dump_ds_dx(regs: &Vcpu, ds: u16, edx: u32) {
     let linear = ((ds as u32) << 4).wrapping_add(edx & 0xFFFF);
     if linear >= 0x110000 { return; } // guard against non-low memory
     let mut bytes = [0u8; 16];
     for i in 0..16 {
-        bytes[i] = crate::arch::mem().read::<u8>(((linear + i as u32)) as usize);
+        bytes[i] = regs.read::<u8>(((linear + i as u32)) as usize);
     }
     dos_trace!(
         "[DPMI]   DS:DX@{:05X}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}  '{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}'",
@@ -46,7 +47,7 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu
         (rm.eax as u16, rm.ebx as u16, rm.ecx as u16, rm.edx as u16, rm.ds, rm.es, rm.edi);
       dos_trace!("[DPMI] 0300 int={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} ES={:04X} EDI={:08X}",
         int_num, ax, bx, cx, dx, ds, es, edi);
-      dump_ds_dx(ds, rm.edx); }
+      dump_ds_dx(regs, ds, rm.edx); }
 
     // rm dest: user-supplied SS:SP from the struct, or the live rm
     // cursor if a chain is in flight (LIFO share with outer excursion),
@@ -57,12 +58,12 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu
         mode_transitions::rm_get_stack(dos)
     };
 
-    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
+    regs.write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     // Get IVT entry for the interrupt
-    let ivt_off = machine::read_u16(0, (int_num as u32) * 4);
-    let ivt_seg = machine::read_u16(0, (int_num as u32) * 4 + 2);
+    let ivt_off = machine::read_u16(regs, 0, (int_num as u32) * 4);
+    let ivt_seg = machine::read_u16(regs, 0, (int_num as u32) * 4 + 2);
 
     // Set up VM86 state
     regs.rax = rm.eax as u64;
@@ -113,7 +114,7 @@ pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Vcpu) -
         mode_transitions::rm_get_stack(dos)
     };
 
-    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
+    regs.write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     regs.rax = rm.eax as u64;
@@ -156,7 +157,7 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vc
           (rm.edi, rm.esi, rm.ebp, rm.ebx, rm.edx, rm.ecx, rm.eax, rm.flags);
       dos_trace!("[DPMI] 0302 RMCS full: EDI={:08X} ESI={:08X} EBP={:08X} EBX={:08X} EDX={:08X} ECX={:08X} EAX={:08X} flags={:04X}",
         edi_f, esi_f, ebp_f, ebx_f, edx_f, ecx_f, eax_f, flags_f);
-      dump_ds_dx(ds, rm.edx); }
+      dump_ds_dx(regs, ds, rm.edx); }
 
     // Same LIFO-share rule as simulate_real_mode_int.
     let rm_dest = if rm.ss != 0 {
@@ -165,7 +166,7 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vc
         mode_transitions::rm_get_stack(dos)
     };
 
-    crate::arch::mem().write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
+    regs.write::<RmCallStruct>((struct_addr) as usize, RmCallStruct::capture(regs));
     mode_transitions::push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, Some(struct_addr));
 
     regs.rax = rm.eax as u64;

@@ -20,6 +20,8 @@ macro_rules! linux_trace {
     };
 }
 
+use arch_abi::GuestBytes;
+use arch_abi::Arch; // `machine: &mut TheArch` trait methods (set_tls_entry, user_fork, …)
 use crate::kernel::elf;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::startup;
@@ -159,9 +161,9 @@ impl LinuxState {
 
     /// Called on every swap-in (whether or not we're refocusing): rebind
     /// per-thread CPU state and finalize a deferred wait4 status write.
-    pub fn on_resume(&mut self) {
+    pub fn on_resume(&mut self, machine: &mut crate::TheArch) {
         if self.tls_entry >= 0 {
-            crate::arch::arch_set_tls_entry(
+            machine.set_tls_entry(
                 self.tls_entry, self.tls_base,
                 self.tls_limit, self.tls_limit_in_pages,
             );
@@ -232,6 +234,7 @@ impl SyscallResult {
 /// Handles syscalls (INT 0x80) and treats other CPU events as fatal.
 /// `PageFault` is excluded — the loop handles it inline.
 pub fn handle_event(
+    machine: &mut crate::TheArch,
     kt: &mut thread::KernelThread,
     linux: &mut LinuxState,
     regs: &mut Regs,
@@ -242,7 +245,7 @@ pub fn handle_event(
         KE::Irq => thread::KernelAction::Done,
         // 32-bit user uses INT 0x80 (lands as SoftInt); 64-bit user uses the
         // SYSCALL instruction (lands as Syscall). Both reach the same dispatch.
-        KE::SoftInt(0x80) | KE::Syscall => dispatch_action(kt, linux, regs),
+        KE::SoftInt(0x80) | KE::Syscall => dispatch_action(machine, kt, linux, regs),
         KE::PageFault { .. } => unreachable!("PageFault handled in event loop"),
         _ => {
             crate::dbg_println!("[LINUX] fatal {:?} at EIP={:#x} tid={}", kevent, regs.ip32(), kt.tid);
@@ -252,7 +255,7 @@ pub fn handle_event(
 }
 
 /// Dispatch returning KernelAction.
-pub fn dispatch_action(kt: &mut thread::KernelThread, linux: &mut LinuxState, regs: &mut Regs) -> thread::KernelAction {
+pub fn dispatch_action(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, regs: &mut Regs) -> thread::KernelAction {
     let args = extract_args(regs);
     let nr = regs.rax as u32;
 
@@ -260,9 +263,9 @@ pub fn dispatch_action(kt: &mut thread::KernelThread, linux: &mut LinuxState, re
         nr, args.a0, args.a1, args.a2, kt.tid);
 
     let result = if regs.mode() == crate::UserMode::Mode64 {
-        dispatch_nr_64(kt, linux, nr, &args, regs)
+        dispatch_nr_64(machine, kt, linux, nr, &args, regs)
     } else {
-        dispatch_nr(kt, linux, nr, &args, regs)
+        dispatch_nr(machine, kt, linux, nr, &args, regs)
     };
 
     linux_trace!("[LINUX] syscall {} => {}", nr, result.retval);
@@ -273,17 +276,17 @@ pub fn dispatch_action(kt: &mut thread::KernelThread, linux: &mut LinuxState, re
     }
 }
 
-fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
     let tid = kt.tid as usize;
     match nr {
-        1   => sys_exit(tid, a),
-        2   => sys_fork(kt, linux, a, regs),
+        1   => sys_exit(machine, tid, a),
+        2   => sys_fork(machine, kt, linux, a, regs),
         3   => sys_read(kt, linux, a, regs),
         7   => sys_wait4(kt, a, regs),
         4   => sys_write(kt, a),
         5   => sys_open(kt, linux, a),
         6   => sys_close(kt, a),
-        11  => sys_execve(kt, linux, a, regs),
+        11  => sys_execve(machine, kt, linux, a, regs),
         12  => sys_chdir(&mut kt.vcpu, linux, a),
         13  => sys_time(&mut kt.vcpu, a),
         19  => sys_lseek(kt, a),
@@ -315,7 +318,7 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
         108 => sys_fstat_old(kt, a),
         91  => sys_munmap(linux, a),
         114 => sys_wait4(kt, a, regs),
-        120 => sys_clone(kt, linux, a, regs),
+        120 => sys_clone(machine, kt, linux, a, regs),
         122 => sys_uname(&mut kt.vcpu, a),
         125 => SyscallResult::val(0),
         140 => sys_llseek(kt, a),
@@ -333,13 +336,13 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
         197 => sys_fstat64(kt, a),
         220 => sys_getdents64(kt, linux, a),
         221 => sys_fcntl(kt, a),
-        238 => sys_exit(tid, a),
+        238 => sys_exit(machine, tid, a),
         240 => SyscallResult::val(0),
-        243 => sys_set_thread_area(kt, linux, a),
-        252 => sys_exit(tid, a),
+        243 => sys_set_thread_area(machine, kt, linux, a),
+        252 => sys_exit(machine, tid, a),
         258 => SyscallResult::val(kt.tid),
-        265 => sys_clock_gettime(&mut kt.vcpu, a),
-        270 => sys_exit(tid, a),
+        265 => sys_clock_gettime(machine, &mut kt.vcpu, a),
+        270 => sys_exit(machine, tid, a),
         295 => sys_openat(kt, linux, a),
         300 => sys_fstatat64(&mut kt.vcpu, linux, a),
         305 => SyscallResult::val(-ENOENT),
@@ -354,7 +357,7 @@ fn dispatch_nr(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a
 }
 
 /// x86_64 syscall number table (different numbers, same implementations)
-fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32, a: &Args, regs: &mut Regs) -> SyscallResult {
     let tid = kt.tid as usize;
     match nr {
         0   => sys_read(kt, linux, a, regs),
@@ -380,27 +383,27 @@ fn dispatch_nr_64(kt: &mut thread::KernelThread, linux: &mut LinuxState, nr: u32
         33  => sys_dup2(kt, a),
         35  => sys_nanosleep(),
         39  => SyscallResult::val(kt.tid),
-        56  => sys_clone(kt, linux, a, regs),
-        57  => sys_fork(kt, linux, a, regs),
-        59  => sys_execve(kt, linux, a, regs),
-        60  => sys_exit(tid, a),
+        56  => sys_clone(machine, kt, linux, a, regs),
+        57  => sys_fork(machine, kt, linux, a, regs),
+        59  => sys_execve(machine, kt, linux, a, regs),
+        60  => sys_exit(machine, tid, a),
         61  => sys_wait4(kt, a, regs),
         72  => sys_fcntl(kt, a),
         79  => sys_getcwd(&mut kt.vcpu, linux, a),
         80  => sys_chdir(&mut kt.vcpu, linux, a),
         89  => SyscallResult::val(-ENOENT),
-        96  => sys_clock_gettime(&mut kt.vcpu, a),
+        96  => sys_clock_gettime(machine, &mut kt.vcpu, a),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
         110 => SyscallResult::val(kt.tid),
         131 => SyscallResult::val(0),
         158 => sys_arch_prctl(kt, linux, a, regs),
-        200 => sys_exit(tid, a),
+        200 => sys_exit(machine, tid, a),
         202 => SyscallResult::val(0),
         217 => sys_getdents64(kt, linux, a),
         218 => SyscallResult::val(kt.tid),
-        228 => sys_clock_gettime(&mut kt.vcpu, a),
-        231 => sys_exit(tid, a),
-        234 => sys_exit(tid, a),
+        228 => sys_clock_gettime(machine, &mut kt.vcpu, a),
+        231 => sys_exit(machine, tid, a),
+        234 => sys_exit(machine, tid, a),
         257 => sys_openat(kt, linux, a),
         262 => sys_fstatat64(&mut kt.vcpu, linux, a),
         267 => SyscallResult::val(-ENOENT),
@@ -479,7 +482,9 @@ fn read_c_argv(vcpu: &Vcpu, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::ve
             vcpu.read::<u32>(ptr + offset) as usize
         };
         if arg_ptr == 0 { break; }
-        args.push(vcpu.c_str(arg_ptr, 4096).to_vec());
+        let mut arg_buf = alloc::vec![0u8; 4096];
+        let arg_len = vcpu.copy_cstr(arg_ptr, &mut arg_buf);
+        args.push(arg_buf[..arg_len].to_vec());
         offset += if wide { 8 } else { 4 };
     }
     args
@@ -511,7 +516,7 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
     let mut env_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(env_strings.len());
     for &env in env_strings.iter().rev() {
         sp -= env.len() + 1;
-        vcpu.write_bytes(sp, env);
+        vcpu.copy_to(sp, env);
         vcpu.write::<u8>(sp + env.len(), 0);
         env_addrs.push(sp);
     }
@@ -521,7 +526,7 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
     let mut string_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(args.len());
     for arg in args.iter().rev() {
         sp -= arg.len() + 1; // +1 for NUL
-        vcpu.write_bytes(sp, arg);
+        vcpu.copy_to(sp, arg);
         vcpu.write::<u8>(sp + arg.len(), 0); // NUL terminator
         string_addrs.push(sp);
     }
@@ -583,13 +588,13 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub fn exec_elf_into(tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
-    let loaded = elf::load_elf(data).map_err(|_| 8)?; // ENOEXEC
+pub fn exec_elf_into(machine: &mut crate::TheArch, tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
+    let current = thread::get_thread(tid).unwrap();
+    let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data).map_err(|_| 8)?; // ENOEXEC
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
     let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
 
-    let current = thread::get_thread(tid).unwrap();
     let sp = setup_user_stack(&mut current.kernel.vcpu, args, want_64);
     if want_64 {
         thread::init_process_thread_64(current, loaded.entry, sp as u64);
@@ -613,18 +618,18 @@ pub fn exec_elf_into(tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::V
 // =============================================================================
 
 /// exit(1) / exit_group(252)
-fn sys_exit(tid: usize, a: &Args) -> SyscallResult {
+fn sys_exit(machine: &mut crate::TheArch, tid: usize, a: &Args) -> SyscallResult {
     let code = a.a0 as i32;
-    SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, code)) }
+    SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(machine, tid, code)) }
 }
 
 /// fork(2)
-fn sys_fork(kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_fork(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, regs: &mut Regs) -> SyscallResult {
     let tid = kt.tid as usize;
     let mut child_root = crate::RootPageTable::empty();
-    crate::arch::arch_user_fork(&mut child_root);
+    machine.user_fork(&mut child_root);
 
-    let child = match thread::create_thread(Some(tid), child_root, true) {
+    let child = match thread::create_thread(machine, Some(tid), child_root, true) {
         Some(t) => t,
         None => return SyscallResult::val(-ENOMEM),
     };
@@ -651,10 +656,10 @@ fn sys_fork(kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, re
 }
 
 /// clone(120) — always COW fork, with optional child_stack override.
-fn sys_clone(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_clone(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     let child_stack = a.a1 as usize;
 
-    let result = sys_fork(kt, linux, a, regs);
+    let result = sys_fork(machine, kt, linux, a, regs);
 
     if child_stack != 0 {
         if let Some(child_tid) = result.switch_to {
@@ -678,9 +683,10 @@ fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
 
     match fd_kind {
         thread::FdKind::PipeRead(idx) => {
-            let user_buf = kt.vcpu.slice_mut(buf, len);
-            let n = crate::kernel::kpipe::read(idx, user_buf);
+            let mut tmp = alloc::vec![0u8; len];
+            let n = crate::kernel::kpipe::read(idx, &mut tmp);
             if n > 0 {
+                kt.vcpu.copy_to(buf, &tmp[..n as usize]);
                 return SyscallResult::val(n as i32);
             }
             // No data — check if writers exist
@@ -704,8 +710,10 @@ fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
             SyscallResult { retval: 0, switch_to: None }
         }
         thread::FdKind::Vfs(handle) => {
-            let user_buf = kt.vcpu.slice_mut(buf, len);
-            SyscallResult::val(vfs::read_by_handle(handle, user_buf))
+            let mut tmp = alloc::vec![0u8; len];
+            let n = vfs::read_by_handle(handle, &mut tmp);
+            if n > 0 { kt.vcpu.copy_to(buf, &tmp[..n as usize]); }
+            SyscallResult::val(n)
         }
         thread::FdKind::ConsoleOut | thread::FdKind::PipeWrite(_) | thread::FdKind::Dir(_) => {
             SyscallResult::val(-EBADF)
@@ -725,13 +733,17 @@ fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 
     match fd_kind {
         thread::FdKind::ConsoleOut => {
-            for &b in kt.vcpu.slice(buf, len) {
+            let mut tmp = alloc::vec![0u8; len];
+            kt.vcpu.copy_from(buf, &mut tmp);
+            for &b in &tmp {
                 vga::putchar(b);
             }
             SyscallResult::val(len as i32)
         }
         thread::FdKind::PipeWrite(idx) => {
-            let r = crate::kernel::kpipe::write(idx, kt.vcpu.slice(buf, len));
+            let mut tmp = alloc::vec![0u8; len];
+            kt.vcpu.copy_from(buf, &mut tmp);
+            let r = crate::kernel::kpipe::write(idx, &tmp);
             if r < 0 {
                 SyscallResult::val(-EPIPE)
             } else {
@@ -739,7 +751,9 @@ fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
             }
         }
         thread::FdKind::Vfs(handle) => {
-            SyscallResult::val(vfs::write_by_handle(handle, kt.vcpu.slice(buf, len)))
+            let mut tmp = alloc::vec![0u8; len];
+            kt.vcpu.copy_from(buf, &mut tmp);
+            SyscallResult::val(vfs::write_by_handle(handle, &tmp))
         }
         thread::FdKind::PipeRead(_) | thread::FdKind::None | thread::FdKind::Dir(_) => {
             SyscallResult::val(-EBADF)
@@ -750,7 +764,9 @@ fn sys_write(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 /// open(5)
 fn sys_open(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -> SyscallResult {
     let path_ptr = a.a0 as usize;
-    let path = kt.vcpu.c_str(path_ptr, 256);
+    let mut path_buf = [0u8; 256];
+    let path_len = kt.vcpu.copy_cstr(path_ptr, &mut path_buf);
+    let path = &path_buf[..path_len];
 
     let mut buf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut buf);
@@ -792,7 +808,7 @@ fn sys_close(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// execve(11)
-fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_execve(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     use crate::kernel::exec;
 
     let tid = kt.tid as usize;
@@ -800,7 +816,9 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
     let argv_ptr = a.a1 as usize;
     let _envp_ptr = a.a2 as usize;
 
-    let raw_path = kt.vcpu.c_str(path_ptr, 256);
+    let mut raw_path_buf = [0u8; 256];
+    let raw_path_len = kt.vcpu.copy_cstr(path_ptr, &mut raw_path_buf);
+    let raw_path = &raw_path_buf[..raw_path_len];
     // Resolve /proc/self/exe to this process's own load path (tracked in
     // LinuxState.exec_path, set on every exec) — busybox's standalone-shell
     // mode re-execs itself that way, and we have no real /proc. Copy to the
@@ -840,11 +858,11 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
 
     // ELF address space prep (DOS handles its own inside exec_dos_into)
     if matches!(format, exec::BinaryFormat::Elf) {
-        crate::arch::arch_user_clean();
+        machine.free_user_pages();
     }
 
-    if let Err(_) = exec::init_thread(tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
-        return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(tid, -ENOEXEC)) };
+    if let Err(_) = exec::init_thread(machine, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
+        return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(machine, tid, -ENOEXEC)) };
     }
 
     // Reload regs from thread (init_thread sets them via get_thread)
@@ -855,7 +873,9 @@ fn sys_execve(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, r
 
 /// chdir(12)
 fn sys_chdir(vcpu: &mut Vcpu, linux: &mut LinuxState, a: &Args) -> SyscallResult {
-    let path = vcpu.c_str(a.a0 as usize, 256);
+    let mut path_buf = [0u8; 256];
+    let path_len = vcpu.copy_cstr(a.a0 as usize, &mut path_buf);
+    let path = &path_buf[..path_len];
     SyscallResult::val(do_chdir(path, &mut linux.cwd, &mut linux.cwd_len))
 }
 
@@ -945,11 +965,13 @@ fn sys_ioctl(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 fn sys_readlink(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
     let buf = a.a1 as usize;
     let bufsz = a.a2 as usize;
-    let is_self_exe = vcpu.c_str(a.a0 as usize, 256) == b"/proc/self/exe";
+    let mut self_exe_buf = [0u8; 256];
+    let self_exe_len = vcpu.copy_cstr(a.a0 as usize, &mut self_exe_buf);
+    let is_self_exe = &self_exe_buf[..self_exe_len] == b"/proc/self/exe";
     if is_self_exe {
         let target: &[u8] = b"/bin/busybox";
         let n = target.len().min(bufsz);
-        vcpu.write_bytes(buf, &target[..n]);
+        vcpu.copy_to(buf, &target[..n]);
         return SyscallResult::val(n as i32);
     }
     SyscallResult::val(-EINVAL)
@@ -957,7 +979,9 @@ fn sys_readlink(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
 
 /// access(33) — check file existence via VFS stat
 fn sys_access(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
-    let path = vcpu.c_str(a.a0 as usize, 256);
+    let mut path_buf = [0u8; 256];
+    let path_len = vcpu.copy_cstr(a.a0 as usize, &mut path_buf);
+    let path = &path_buf[..path_len];
     let mut buf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut buf);
     let handle = vfs::open_to_handle(resolved);
@@ -1074,7 +1098,7 @@ fn sys_uname(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
     let fields: [&[u8]; 6] = [b"Linux", b"retroos", b"5.0.0", b"#1", b"i686", b"(none)"];
     for (i, s) in fields.iter().enumerate() {
         let n = s.len().min(64);
-        vcpu.write_bytes(buf + i * 65, &s[..n]);
+        vcpu.copy_to(buf + i * 65, &s[..n]);
     }
     SyscallResult::val(0)
 }
@@ -1124,20 +1148,22 @@ fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 
         if iov_len == 0 { continue; }
 
+        let mut iov = alloc::vec![0u8; iov_len];
+        kt.vcpu.copy_from(iov_base, &mut iov);
         match fd_kind {
             thread::FdKind::ConsoleOut => {
-                for &b in kt.vcpu.slice(iov_base, iov_len) {
+                for &b in &iov {
                     vga::putchar(b);
                 }
                 total += iov_len as i32;
             }
             thread::FdKind::PipeWrite(idx) => {
-                let r = crate::kernel::kpipe::write(idx, kt.vcpu.slice(iov_base, iov_len));
+                let r = crate::kernel::kpipe::write(idx, &iov);
                 if r < 0 { return SyscallResult::val(-EPIPE); }
                 total += r;
             }
             thread::FdKind::Vfs(handle) => {
-                let r = vfs::write_by_handle(handle, kt.vcpu.slice(iov_base, iov_len));
+                let r = vfs::write_by_handle(handle, &iov);
                 if r < 0 { return SyscallResult::val(r); }
                 total += r;
             }
@@ -1229,7 +1255,7 @@ fn sys_getcwd(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
     // Linux getcwd returns absolute path with leading /
     if size < cwd.len() + 2 { return SyscallResult::val(-EINVAL); }
     vcpu.write::<u8>(ptr, b'/');
-    vcpu.write_bytes(ptr + 1, cwd);
+    vcpu.copy_to(ptr + 1, cwd);
     vcpu.write::<u8>(ptr + 1 + cwd.len(), 0); // NUL
     SyscallResult::val((cwd.len() + 2) as i32)
 }
@@ -1280,7 +1306,9 @@ fn sys_mmap2(linux: &mut LinuxState, a: &Args) -> SyscallResult {
 fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let stat_buf = a.a1 as usize;
-    let path = vcpu.c_str(path_ptr, 256);
+    let mut path_buf = [0u8; 256];
+    let path_len = vcpu.copy_cstr(path_ptr, &mut path_buf);
+    let path = &path_buf[..path_len];
 
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
@@ -1359,7 +1387,9 @@ fn write_stat_old(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32) {
 /// stat(106) / lstat(107) — old struct stat layout. We have no symlinks so
 /// lstat falls through to stat.
 fn sys_stat_old(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
-    let path = vcpu.c_str(a.a0 as usize, 256);
+    let mut path_buf = [0u8; 256];
+    let path_len = vcpu.copy_cstr(a.a0 as usize, &mut path_buf);
+    let path = &path_buf[..path_len];
     let stat_buf = a.a1 as usize;
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
@@ -1441,7 +1471,7 @@ fn sys_getdents64(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -
         kt.vcpu.write::<u64>(base + 8, index as u64);     // d_off
         kt.vcpu.write::<u16>(base + 16, reclen as u16);   // d_reclen
         kt.vcpu.write::<u8>(base + 18, if entry.is_dir { 4 } else { 8 }); // d_type: DT_DIR/DT_REG
-        kt.vcpu.write_bytes(base + 19, name);
+        kt.vcpu.copy_to(base + 19, name);
         offset += reclen;
     }
 
@@ -1452,7 +1482,7 @@ fn sys_getdents64(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -
 }
 
 /// set_thread_area(243) — parse user_desc struct, set GDT TLS entry, save to LinuxState
-fn sys_set_thread_area(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_set_thread_area(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let u_info = a.a0 as usize;
     if u_info == 0 { return SyscallResult::val(-EFAULT); }
 
@@ -1463,7 +1493,7 @@ fn sys_set_thread_area(kt: &mut thread::KernelThread, linux: &mut LinuxState, a:
     let flags = kt.vcpu.read::<u32>(u_info + 12);
     let limit_in_pages = flags & (1 << 4) != 0;
 
-    let idx = crate::arch::arch_set_tls_entry(entry_number, base_addr, limit, limit_in_pages);
+    let idx = machine.set_tls_entry(entry_number, base_addr, limit, limit_in_pages);
     if idx < 0 { return SyscallResult::val(-ESRCH); }
 
     // Write back the allocated entry number
@@ -1504,11 +1534,11 @@ fn sys_arch_prctl(kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &Ar
 }
 
 /// clock_gettime(265) — monotonic from tick counter
-fn sys_clock_gettime(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
+fn sys_clock_gettime(machine: &mut crate::TheArch, vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
     let _clock_id = a.a0 as u32;
     let tp = a.a1 as usize;
     if tp != 0 {
-        let ticks = crate::arch::get_ticks() as u64;
+        let ticks = machine.get_ticks() as u64;
         // PIT ticks at ~1193182 Hz, timer IRQ at ~100 Hz (div=11932)
         let secs = ticks / 100;
         let nsecs = (ticks % 100) * 10_000_000;
@@ -1533,9 +1563,11 @@ fn sys_openat(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -> Sy
 fn sys_getrandom(vcpu: &mut Vcpu, a: &Args) -> SyscallResult {
     let buf = a.a0 as usize;
     let buflen = a.a1 as usize;
-    for b in vcpu.slice_mut(buf, buflen) {
+    let mut tmp = alloc::vec![0u8; buflen];
+    for b in tmp.iter_mut() {
         *b = thread::prng() as u8;
     }
+    vcpu.copy_to(buf, &tmp);
     SyscallResult::val(buflen as i32)
 }
 

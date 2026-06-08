@@ -14,6 +14,25 @@
 use retroos_arch_interp as arch;
 use std::io::Read;
 
+/// Optional log file for the kernel debug sink (`--console` mode routes logs
+/// here to keep them off the terminal showing the live VGA render). When unset,
+/// logs go to stderr.
+static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// The kernel's installed debug-log sink: one byte to `LOG_FILE` if set, else to
+/// stderr. Logging is a host concern here — straight to a stream, never through
+/// the interpreter's port/device machinery.
+fn host_log_byte(b: u8) {
+    use std::io::Write;
+    if let Ok(mut g) = LOG_FILE.lock() {
+        if let Some(f) = g.as_mut() {
+            let _ = f.write_all(&[b]);
+            return;
+        }
+    }
+    let _ = std::io::stderr().write_all(&[b]);
+}
+
 fn main() {
     let mut host_dir: Option<String> = None;
     let mut cmd: Option<String> = None;
@@ -56,22 +75,20 @@ fn main() {
         });
     }
 
-    // Compose the platform: hook the device ports, and give the VGA console a
-    // valid (scratch) framebuffer — its output reaches stdout via 0xE9.
+    // Install the kernel debug-log sink (a host stream, not the arch port bus):
+    // stderr normally; a log file under --console so logs stay off the terminal
+    // that's showing the live VGA render.
     if live_console {
-        arch::register_debugcon_file("retroos.log"); // keep 0xE9 off the screen
+        if let Ok(f) = std::fs::File::create("retroos.log") {
+            *LOG_FILE.lock().unwrap() = Some(f);
+        }
         arch::enable_live_console(); // paint guest 0xB8000 to this terminal
-    } else {
-        arch::register_debugcon(); // 0xE9 → stdout (the console stream)
     }
+    kernel::vga::set_debug_sink(host_log_byte);
     kernel::host_console_init();
     if let Some(dir) = host_dir {
         arch::attach_hostfs(&dir); // COM1 → /host
     }
-    // Always present fw_cfg so the kernel's is_qemu() is true (the interpreter
-    // emulates a QEMU-like, no-real-VGA machine — it must fabricate 0x3DA etc.).
-    // --cmd adds opt/cmdline for a headless single-program launch.
-    arch::attach_fw_cfg(cmd.as_deref(), cwd.as_deref());
 
     let Some(path) = input else {
         kernel::host_run_demo()
@@ -109,7 +126,17 @@ fn main() {
     // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
     arch::enter_raw_mode();
     spawn_keyboard();
-    kernel::startup();
+
+    // Build the boot config from our CLI args directly — the interpreter is
+    // QEMU-like (it must fabricate 0x3DA etc.), and we already know the headless
+    // cmdline/cwd, so there's no fw_cfg port round-trip.
+    let mut config = kernel::BootConfig::empty();
+    config.is_qemu = true;
+    if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
+    if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
+
+    let mut machine = kernel::new_arch();
+    kernel::startup(&mut machine, &config);
 }
 
 /// Spawn the stdin → keyboard pump: read host terminal bytes, translate each to

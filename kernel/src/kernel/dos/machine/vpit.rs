@@ -4,6 +4,7 @@
 // Virtual 8253 PIT
 // ============================================================================
 
+use arch_abi::Arch;
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const HOST_TIMER_HZ: u64 = 1000;
 
@@ -171,8 +172,8 @@ pub struct VirtualPit {
 }
 
 impl VirtualPit {
-    pub(crate) fn new() -> Self {
-        let now = crate::arch::get_ticks();
+    pub(crate) fn new(machine: &mut crate::TheArch) -> Self {
+        let now = machine.get_ticks();
         Self {
             last_host_tick: now,
             frac_accum: 0,
@@ -181,8 +182,8 @@ impl VirtualPit {
         }
     }
 
-    fn sync(&mut self) {
-        let now = crate::arch::get_ticks();
+    fn sync(&mut self, machine: &mut crate::TheArch) {
+        let now = machine.get_ticks();
         let delta_ticks = now.saturating_sub(self.last_host_tick);
         if delta_ticks == 0 {
             return;
@@ -193,18 +194,18 @@ impl VirtualPit {
         self.frac_accum = total % HOST_TIMER_HZ;
     }
 
-    pub(crate) fn read_counter0(&mut self) -> u8 {
-        self.sync();
+    pub(crate) fn read_counter0(&mut self, machine: &mut crate::TheArch) -> u8 {
+        self.sync(machine);
         self.ch0.read_byte(self.input_cycles)
     }
 
-    pub(crate) fn write_counter0(&mut self, val: u8) {
-        self.sync();
+    pub(crate) fn write_counter0(&mut self, machine: &mut crate::TheArch, val: u8) {
+        self.sync(machine);
         self.ch0.write_byte(val, self.input_cycles);
     }
 
-    pub(crate) fn write_command(&mut self, val: u8) {
-        self.sync();
+    pub(crate) fn write_command(&mut self, machine: &mut crate::TheArch, val: u8) {
+        self.sync(machine);
         let channel = (val >> 6) & 0x03;
         if channel != 0 {
             return;
@@ -217,8 +218,8 @@ impl VirtualPit {
         self.ch0.set_command(rw_mode, (val >> 1) & 0x07);
     }
 
-    pub fn take_pending_irqs(&mut self) -> u32 {
-        self.sync();
+    pub fn take_pending_irqs(&mut self, machine: &mut crate::TheArch) -> u32 {
+        self.sync(machine);
         self.ch0.take_irqs(self.input_cycles)
     }
 

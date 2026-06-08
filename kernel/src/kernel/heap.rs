@@ -9,23 +9,14 @@ use core::ptr::NonNull;
 
 const PAGE_SIZE: usize = 4096;
 
-/// Heap ends before the top of address space
-pub const HEAP_END: usize = 0xFFF0_0000;
+// The heap's VA window is a memory-layout fact owned by the arch backend (the
+// demand-paging `#PF` handler grows it); the allocator just carves within it.
+use crate::arch::{HEAP_END, heap_base};
 
 /// Track large allocs/deallocs for debugging
 static mut LARGE_ALLOCS: u32 = 0;
 static mut LARGE_FREES: u32 = 0;
 static mut LARGE_REUSE: u32 = 0;  // alloc satisfied from free list (no extend)
-
-/// Get heap base (first page after kernel _end)
-pub fn heap_base() -> usize {
-    unsafe extern "C" {
-        static _end: u8;
-    }
-    let end = (&raw const _end) as usize;
-    // Align up to next page
-    (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-}
 
 /// Free block header stored at the start of each free region
 struct FreeBlock {

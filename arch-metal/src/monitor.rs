@@ -20,10 +20,10 @@
 //! The wire format between `encode`/`decode` is a private implementation
 //! detail of `KernelEvent` — callers never see raw tag numbers.
 
-use crate::{Regs, UserMode};
+use arch_abi::{Regs, UserMode};
 
 // IoSize and KernelEvent are the backend-agnostic arch↔kernel contract; they
-// live in `arch-abi` and are re-exported here so `crate::arch::monitor::{
+// live in `arch-abi` and are re-exported here so `crate::monitor::{
 // KernelEvent, IoSize}` keeps resolving. The metal monitor below decodes a #GP
 // into these; the interpreter backend produces them directly.
 pub use arch_abi::{IoSize, KernelEvent};
@@ -44,7 +44,38 @@ pub enum MonitorResult {
 // Segment resolution (re-exported from descriptors)
 // =============================================================================
 
-pub use crate::arch::descriptors::{seg_base, seg_is_32};
+pub use crate::descriptors::{seg_base, seg_is_32};
+
+/// Log one PM/VM86 single-step: CS:EIP + key regs + the first opcode bytes.
+/// Armed via `arch_abi::PM_STEP_BUDGET`; the single-step `#DB` handler calls
+/// this each step until the budget drains. Pure arch-level instruction tracing
+/// (decodes CS:EIP through the segment helpers and reads the opcode bytes).
+pub fn pm_step_log(regs: &crate::Vcpu) {
+    use arch_abi::GuestBytes;
+    let is_vm86 = regs.frame.rflags & (1u64 << 17) != 0;
+    let (cs_base, mode) = if is_vm86 {
+        ((regs.code_seg() as u32) << 4, "RM")
+    } else {
+        let cs = regs.code_seg();
+        let m = if seg_is_32(cs) { "PM32" } else { "PM16" };
+        (seg_base(cs), m)
+    };
+    let ip = if mode == "PM32" { regs.ip32() } else { regs.ip32() & 0xFFFF };
+    let lin = cs_base.wrapping_add(ip);
+    let mut b = [0u8; 8];
+    for i in 0..8 {
+        b[i] = regs.read::<u8>((lin + i as u32) as usize);
+    }
+    lib::dbg_println!(
+        "[STEP {}] {:04X}:{:08X} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} SS:SP={:04X}:{:08X} DS={:04X} ES={:04X}",
+        mode, regs.code_seg(), ip,
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
+        regs.rsi as u32, regs.rdi as u32, regs.rbp as u32,
+        regs.frame.ss as u16, regs.sp32(),
+        regs.ds as u16, regs.es as u16,
+    );
+}
 
 // =============================================================================
 // EFLAGS bits the monitor cares about
@@ -322,7 +353,7 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
             advance += 1;
             advance_ip(regs, cs_32, advance);
             if regs.mode() == UserMode::VM86
-                && !crate::arch::descriptors::int_intercepted(vector)
+                && !crate::descriptors::int_intercepted(vector)
             {
                 unsafe { sw_reflect_vm86_int(regs, vector); }
                 MonitorResult::Resume

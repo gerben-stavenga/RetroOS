@@ -8,10 +8,10 @@ use super::state::PspCacheEntry;
 ///
 /// Does NOT touch `dos.current_psp` — that's pure DOS state and stays as
 /// the segment value the entering program had.
-pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState) {
+pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState, regs: &mut Vcpu) {
     let rm_psp = dos.current_psp;
     let psp_base = (rm_psp as u32) * 16;
-    let env_seg = crate::arch::mem().read::<u16>(((psp_base + 0x2C)) as usize);
+    let env_seg = regs.read::<u16>(((psp_base + 0x2C)) as usize);
 
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
@@ -44,7 +44,7 @@ pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState) 
             let env_base = (env_seg as u32) * 16;
             dos.ldt[idx] = make_data_desc_ex(env_base, 0xFFFF, false);
             let env_sel = idx_to_sel(idx);
-            crate::arch::mem().write::<u16>((psp_base + 0x2C) as usize, env_sel);
+            regs.write::<u16>((psp_base + 0x2C) as usize, env_sel);
             if let Some(dpmi) = dos.dpmi.as_mut() {
                 dpmi.env_ldt_idx = idx;
             }

@@ -1,3 +1,4 @@
+use arch_abi::GuestBytes;
 use super::*;
 use crate::arch::Vcpu;
 use super::super::mode_transitions;
@@ -19,10 +20,8 @@ fn dump_selector(label: &str, dos: &thread::DosState, sel: u16) {
     }
 }
 
-fn dump_words(label: &str, addr: u32) {
-    // Debug-only dump helper: no execution context here, raw reads of the
-    // already-linear addr (the centralized memory API needs a Vcpu).
-    let rd = |off: u32| crate::arch::mem().read::<u16>((addr.wrapping_add(off)) as usize);
+fn dump_words(regs: &Vcpu, label: &str, addr: u32) {
+    let rd = |off: u32| regs.read::<u16>((addr.wrapping_add(off)) as usize);
     let (w0, w1, w2, w3) = (rd(0), rd(2), rd(4), rd(6));
     let (w4, w5, w6, w7) = (rd(8), rd(10), rd(12), rd(14));
     crate::println!(
@@ -37,7 +36,8 @@ fn dump_dpmi_fault_context(dos: &thread::DosState, regs: &Vcpu, exc_num: u32) {
     let ip_addr = cs_base.wrapping_add(regs.ip32());
     let sp_addr = ss_base.wrapping_add(regs.sp32());
     let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
-    let bytes = regs.slice((ip_addr) as usize, 16);
+    let mut bytes = [0u8; 16];
+    regs.copy_from(ip_addr as usize, &mut bytes);
 
     crate::println!(
         "[DPMI-FAULT] exc={} at {:04X}:{:08X} err={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X}",
@@ -67,8 +67,8 @@ fn dump_dpmi_fault_context(dos: &thread::DosState, regs: &Vcpu, exc_num: u32) {
     dump_selector("DS", dos, regs.ds as u16);
     dump_selector("ES", dos, regs.es as u16);
     dump_selector("SS", dos, regs.stack_seg());
-    dump_words("stack SP", sp_addr);
-    dump_words("stack BP", bp_addr);
+    dump_words(regs, "stack SP", sp_addr);
+    dump_words(regs, "stack BP", bp_addr);
 }
 
 /// FAR-CALL return frame the host pushes below the spec exception
@@ -232,8 +232,8 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
         // faulting instruction would just re-execute and refault, producing
         // an infinite loop. Terminate the client instead.
         if matches!(exc_num, 0 | 3 | 4) {
-            let ivt_off = machine::read_u16(0, exc_num * 4);
-            let ivt_seg = machine::read_u16(0, exc_num * 4 + 2);
+            let ivt_off = machine::read_u16(regs, 0, exc_num * 4);
+            let ivt_seg = machine::read_u16(regs, 0, exc_num * 4 + 2);
             dos_trace!("[DPMI] reflect exception {} to IVT {:04X}:{:04X} from {:04X}:{:08X} flags={:04X}",
                 exc_num, ivt_seg, ivt_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
             // Plant an iret-frame on the user's stack pointing at the
@@ -477,7 +477,7 @@ pub(super) fn exception_return(
         }
     };
 
-    let mut save = mode_transitions::pop_continuation_at(&dos.ldt[..], (host_seg, mode_save_sp));
+    let mut save = mode_transitions::pop_continuation_at(regs, &dos.ldt[..], (host_seg, mode_save_sp));
     if use32 || via == ExcReturnVia::V10 {
         save.eip    = new_eip;
         save.cs     = new_cs;

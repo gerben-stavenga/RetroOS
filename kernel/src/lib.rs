@@ -13,17 +13,22 @@ extern crate alloc;
 extern crate ext4_view;
 extern crate rustc_demangle;
 
-// The arch layer is a swappable backend. Metal: the in-tree `kernel/src/arch/`
-// (real x86, INT 0x80). Hosted: the `arch-interp` crate (software x86 core),
-// pulled in as `crate::arch` so every `crate::arch::*` path resolves the same.
+// The arch layer is a swappable backend crate, pulled in as `crate::arch` so
+// every `crate::arch::*` path resolves the same. Metal: `arch-metal` (real x86,
+// INT 0x80). Hosted: `arch-interp` (software x86 core).
 #[cfg(not(feature = "hosted"))]
-#[path = "arch/mod.rs"]
-mod arch;
+extern crate arch_metal as arch;
 #[cfg(feature = "hosted")]
 extern crate retroos_arch_interp as arch;
 
+// The metal entry/crt0 (`boot_kernel`, called by `entry.asm`). It is the binary
+// side of the boundary: it drives `arch`'s bring-up then calls `startup`, so it
+// stays kernel-side rather than in the backend crate.
+#[cfg(not(feature = "hosted"))]
+#[path = "arch/boot.rs"]
+mod boot;
+
 mod kernel;
-pub mod pipe;  // Shared utility: ring buffer used by both arch and kernel
 
 // Re-export kernel submodules so arch/ code can use crate::thread, crate::dos, etc.
 pub use kernel::dos;
@@ -33,42 +38,42 @@ pub use kernel::thread;
 // 0xE9 debug port); `print!`/`println!`/`dbg_*!` are defined there (macro_export
 // puts them at the crate root, so `crate::println!` keeps working).
 pub mod vga;
+// The console macros live in `lib`; re-exporting them at the crate root makes
+// both bare `println!` (crate-wide, via this 2018 path import) and the explicit
+// `crate::println!` / `crate::dbg_println!` paths the kernel uses resolve.
+pub use lib::{print, println, dbg_print, dbg_println};
 
 // Re-export arch types used as opaque blobs by kernel code
 pub use arch::{RootPageTable, PAGE_SIZE, KernelPages, RawPage, LOW_MEM_BASE};
 
-/// Multiboot memory map entry
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct MultibootMmapEntry {
-    pub size: u32,
-    pub base: u64,
-    pub length: u64,
-    pub typ: u32,
+// The single concrete arch backend this build links against, threaded as
+// `&mut TheArch` through `startup`/`event_loop` so the kernel's mutable arch
+// state is borrow-checked instead of living in global `static mut`s. Because
+// `TheArch` is concrete, `TheArch::PageTable` is `RootPageTable`, so the thread
+// table's `Vcpu` stays a plain type and nothing in the kernel needs to be
+// generic yet. (Making the kernel generic over `A: Arch` for pure dependency
+// injection — and lifting the metal backend into its own crate — is a later
+// stage; this keeps that end state in reach while threading the borrow first.)
+#[cfg(feature = "hosted")]
+pub type TheArch = arch::Interp;
+#[cfg(not(feature = "hosted"))]
+pub type TheArch = arch::Metal;
+
+/// Construct this build's arch backend (a zero-sized handle today).
+pub fn new_arch() -> TheArch {
+    #[cfg(feature = "hosted")] { arch::Interp }
+    #[cfg(not(feature = "hosted"))] { arch::Metal }
 }
 
-/// Multiboot info structure (from GRUB or our bootloader)
-#[repr(C)]
-pub struct MultibootInfo {
-    pub flags: u32,
-    pub mem_lower: u32,
-    pub mem_upper: u32,
-    pub boot_device: u32,
-    pub cmdline: u32,
-    pub mods_count: u32,
-    pub mods_addr: u32,
-    pub syms: [u32; 4],
-    pub mmap_length: u32,
-    pub mmap_addr: u32,
-}
+// Boot-time platform configuration + the fw_cfg debug-watch parser live in
+// `arch-abi` (the boot boundary contract, shared by the entry that builds them
+// and `startup` that consumes them). Re-exported so `crate::BootConfig` /
+// `crate::parse_debug_watch` keep resolving.
+pub use arch_abi::{BootConfig, parse_debug_watch};
 
-// Metal-only: scratch/zero page frames and linker-symbol statics are consumed
-// only by the bare-metal arch boot/paging code. The hosted backend has neither
-// a custom paging bring-up nor a linker script.
-#[cfg(not(feature = "hosted"))]
-static ZERO_PAGE: RawPage = unsafe { core::mem::zeroed() };
-#[cfg(not(feature = "hosted"))]
-static mut SCRATCH: RawPage = unsafe { core::mem::zeroed() };
+// The multiboot info structs + the metal scratch/zero page frames moved into
+// `arch-metal` (consumed by its paging bring-up); the metal entry `boot.rs`
+// reaches them as `arch::…`.
 
 // Linker symbols. Stacks and their guard pages live at the tail of .bss
 // (see kernel.ld); only their addresses matter to Rust, so they're declared
@@ -125,6 +130,10 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     kernel::heap::init();
     thread::init_threading();
 
+    // The arch backend handle, threaded as `&mut` through thread creation and
+    // the event loop (same as the metal/disk path).
+    let mut machine = new_arch();
+
     // Console stdin pipe (kernel is the phantom writer, as in startup()).
     let cpipe = kernel::kpipe::alloc().expect("console pipe");
     kernel::kpipe::add_writer(cpipe);
@@ -132,7 +141,7 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
 
     // Fresh process thread in the initial (active) address space.
     let tid = {
-        let t = thread::create_thread(None, RootPageTable::empty(), true).expect("create thread");
+        let t = thread::create_thread(&mut machine, None, RootPageTable::empty(), true).expect("create thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
         t.kernel.fds[2] = thread::FdKind::ConsoleOut;
@@ -143,16 +152,14 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     // Load the ELF (segments + argv/envp/auxv stack) into the active space and
     // set the thread's entry registers. Default argv = [path] when none given.
     let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
-    if let Err(e) = kernel::linux::exec_elf_into(tid, &data, path, &argv) {
+    if let Err(e) = kernel::linux::exec_elf_into(&mut machine, tid, &data, path, &argv) {
         dbg_println!("[host] exec failed: errno {}", e);
         arch::shutdown();
     }
 
-    // Seed the live execution context and run the real kernel event loop.
-    let t = thread::get_thread(tid).expect("thread");
-    arch::set_current_vcpu(t.kernel.vcpu);
+    // Run the real kernel event loop (it seeds its live vcpu from the thread).
     dbg_println!("[host] running 32-bit Linux ELF, interpreted");
-    kernel::startup::event_loop(tid);
+    kernel::startup::event_loop(&mut machine, tid);
     dbg_println!("[host] guest exited");
     arch::shutdown();
 }
@@ -186,9 +193,9 @@ pub fn host_run_demo() -> ! {
         0xCD, 0x80,                  // int 0x80 (exit)
         0xF4,                        // hlt
     ];
-    arch::mem().write_bytes(CODE as usize, code);
-
+    use arch_abi::GuestBytes;
     let mut vcpu = arch::Vcpu::empty();
+    vcpu.copy_to(CODE as usize, code);
     vcpu.regs.init_user_process(CODE, STACK);
     arch::set_current_vcpu(vcpu);
 
@@ -198,7 +205,7 @@ pub fn host_run_demo() -> ! {
     loop {
         match arch::do_arch_execute() {
             KernelEvent::SoftInt(0x80) if eax() == 1 => {
-                let scratch: u32 = arch::mem().read(SCRATCH as usize);
+                let scratch: u32 = unsafe { (*(&raw const arch::REGS)).read(SCRATCH as usize) };
                 println!("[host] guest scratch[{:#x}] = {:#x} (demand-paged)", SCRATCH, scratch);
                 println!("[host] guest exit syscall -> done ({irqs} timer ticks)");
                 arch::shutdown();

@@ -9,20 +9,20 @@
 /// `(event, extra)`; this function decodes it into `KernelEvent` right away
 /// so the event loop never sees raw tag numbers.
 #[inline(never)]
-pub fn do_arch_execute() -> crate::arch::monitor::KernelEvent {
+pub fn do_arch_execute() -> crate::monitor::KernelEvent {
     let event: u32;
     let extra: u32;
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inout("eax") crate::arch::arch_call::EXECUTE as u32 => event,
+            inout("eax") crate::arch_call::EXECUTE as u32 => event,
             out("edx") extra,
             out("ecx") _,
             out("ebx") _,
             out("edi") _,
         );
     }
-    crate::arch::monitor::KernelEvent::decode(event, extra)
+    crate::monitor::KernelEvent::decode(event, extra)
 }
 
 /// Switch threads: swap live state with pointed-to state.
@@ -30,9 +30,9 @@ pub fn do_arch_execute() -> crate::arch::monitor::KernelEvent {
 /// hash_ptr: null = no hashing. Non-null: on entry = expected hash (0=don't check),
 /// on exit = old address space hash.
 pub fn arch_switch_to(
-    vcpu: &mut crate::arch::Vcpu,
+    vcpu: &mut crate::Vcpu,
     hash_ptr: *mut u64,
-    fx_ptr: *mut crate::arch::FxState,
+    fx_ptr: *mut crate::FxState,
 ) {
     // The arch call still takes two separate pointers (regs in EDX, page-table
     // root in ECX); the Vcpu bundle is purely kernel-side, so we hand the
@@ -45,7 +45,7 @@ pub fn arch_switch_to(
             "int 0x80",
             "xchg esi, {fx}",
             fx = inout(reg) fx_ptr as u32 => _,
-            in("eax") crate::arch::arch_call::SWITCH_TO as u32,
+            in("eax") crate::arch_call::SWITCH_TO as u32,
             in("edx") &mut vcpu.regs as *mut _ as u32,
             in("ecx") &mut vcpu.space as *mut _ as u32,
             in("ebx") hash_ptr as u32,
@@ -55,11 +55,11 @@ pub fn arch_switch_to(
 
 /// COW fork the current address space. Fills child root.
 /// Caller must save parent root after (fork modifies entries for COW).
-pub fn arch_user_fork(child_root: &mut crate::RootPageTable) {
+pub fn arch_user_fork(child_root: &mut super::RootPageTable) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::FORK as u32,
+            in("eax") crate::arch_call::FORK as u32,
             in("edx") child_root as *mut _ as u32,
         );
     }
@@ -69,7 +69,7 @@ pub fn arch_user_clean() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::CLEAN as u32,
+            in("eax") crate::arch_call::CLEAN as u32,
         );
     }
 }
@@ -82,7 +82,7 @@ pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, exe
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::SET_PAGE_FLAGS as u32,
+            in("eax") crate::arch_call::SET_PAGE_FLAGS as u32,
             in("edx") start_vpage as u32,
             in("ecx") count as u32,
             in("ebx") flags,
@@ -95,7 +95,7 @@ pub fn arch_map_low_mem() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::MAP_LOW_MEM as u32,
+            in("eax") crate::arch_call::MAP_LOW_MEM as u32,
         );
     }
 }
@@ -105,7 +105,7 @@ pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) 
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::COPY_PAGE_ENTRIES as u32,
+            in("eax") crate::arch_call::COPY_PAGE_ENTRIES as u32,
             in("edx") src_vpage as u32,
             in("ecx") dst_vpage as u32,
             in("ebx") count as u32,
@@ -117,7 +117,7 @@ pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::SWAP_PAGE_ENTRIES as u32,
+            in("eax") crate::arch_call::SWAP_PAGE_ENTRIES as u32,
             in("edx") a_vpage as u32,
             in("ecx") b_vpage as u32,
             in("ebx") count as u32,
@@ -130,7 +130,7 @@ pub fn arch_unmap_range(base_page: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::UNMAP_RANGE as u32,
+            in("eax") crate::arch_call::UNMAP_RANGE as u32,
             in("edx") base_page as u32,
             in("ecx") count as u32,
         );
@@ -142,7 +142,7 @@ pub fn arch_free_range(base_page: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::FREE_RANGE as u32,
+            in("eax") crate::arch_call::FREE_RANGE as u32,
             in("edx") base_page as u32,
             in("ecx") count as u32,
         );
@@ -162,7 +162,7 @@ pub fn arch_load_ldt(ldt: &[u64]) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::LOAD_LDT as u32,
+            in("eax") crate::arch_call::LOAD_LDT as u32,
             in("edx") base as usize as u32,
             in("ecx") limit,
         );
@@ -174,7 +174,7 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::MAP_PHYS_RANGE as u32,
+            in("eax") crate::arch_call::MAP_PHYS_RANGE as u32,
             in("edx") vpage_start as u32,
             in("ecx") num_pages as u32,
             in("ebx") ppage_start as u32,
@@ -192,7 +192,7 @@ pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inlateout("eax") crate::arch::arch_call::ALLOC_PHYS_CONTIG as u32 => r,
+            inlateout("eax") crate::arch_call::ALLOC_PHYS_CONTIG as u32 => r,
             in("edx") num_pages as u32,
             in("ecx") boundary_log2,
         );
@@ -206,7 +206,7 @@ pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::FREE_PHYS_CONTIG as u32,
+            in("eax") crate::arch_call::FREE_PHYS_CONTIG as u32,
             in("edx") start_page as u32,
             in("ecx") num_pages as u32,
         );
@@ -220,7 +220,7 @@ pub fn arch_rearm_irq(line: u8) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::REARM_IRQ as u32,
+            in("eax") crate::arch_call::REARM_IRQ as u32,
             in("edx") line as u32,
         );
     }
@@ -232,7 +232,7 @@ pub fn arch_dma_channel_buf(ch: usize) -> u64 {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inlateout("eax") crate::arch::arch_call::DMA_CHANNEL_BUF as u32 => r,
+            inlateout("eax") crate::arch_call::DMA_CHANNEL_BUF as u32 => r,
             in("edx") ch as u32,
         );
     }
@@ -244,7 +244,7 @@ pub fn arch_map_fresh_range(vpage: usize, count: usize) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::MAP_FRESH_RANGE as u32,
+            in("eax") crate::arch_call::MAP_FRESH_RANGE as u32,
             in("edx") vpage as u32,
             in("ecx") count as u32,
         );
@@ -257,7 +257,7 @@ pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: boo
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inout("eax") crate::arch::arch_call::SET_TLS_ENTRY as u32 => result,
+            inout("eax") crate::arch_call::SET_TLS_ENTRY as u32 => result,
             in("edx") index as u32,
             in("ecx") base,
             in("ebx") limit,
@@ -272,7 +272,27 @@ pub fn arch_free_user_pages() {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch::arch_call::CLEAN as u32,
+            in("eax") crate::arch_call::CLEAN as u32,
+        );
+    }
+}
+
+/// Arm hardware write-watchpoints at up to two addresses (`addr1==0`/`None`
+/// disables the second/both). The ring-0 handler programs the debug registers
+/// so a guest write to a watched address raises `#DB`.
+pub fn arch_set_debug_watch(addrs: Option<(u32, u32)>) {
+    let (count, addr0, addr1) = match addrs {
+        Some((a0, a1)) if a1 != 0 => (2u32, a0, a1),
+        Some((a0, _)) => (1u32, a0, 0),
+        None => (0u32, 0, 0),
+    };
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch_call::SET_DEBUG_WATCH as u32,
+            in("ebx") count,
+            in("edx") addr0,
+            in("ecx") addr1,
         );
     }
 }

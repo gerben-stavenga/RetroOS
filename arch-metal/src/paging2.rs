@@ -88,7 +88,7 @@
 use core::ops::{Index, IndexMut};
 
 // PAGE_SIZE, LOW_MEM_BASE, and the RawPage blob are part of the
-// backend-agnostic contract (`arch-abi`); re-exported so `crate::arch::{
+// backend-agnostic contract (`arch-abi`); re-exported so `crate::{
 // PAGE_SIZE, LOW_MEM_BASE, RawPage}` keep resolving.
 pub use arch_abi::{PAGE_SIZE, RawPage};
 
@@ -103,6 +103,25 @@ pub use arch_abi::LOW_MEM_BASE;
 
 /// Kernel space starts here (PDPT[5+], after low memory)
 pub const KERNEL_BASE: usize = 0xC0B0_0000;
+
+/// Kernel physical load address (must match KERNEL_PHYS in `kernel.ld`).
+pub const KERNEL_PHYS: usize = 0x0010_0000;
+
+/// The kernel heap occupies `[heap_base() .. HEAP_END)` in kernel space. The
+/// demand-paging `#PF` handler grows it on access and the heap allocator carves
+/// within it — but the window itself is a memory-layout fact (the ceiling, and
+/// the base = first page past the kernel image's linker `_end`), owned here, not
+/// allocator policy.
+pub const HEAP_END: usize = 0xFFF0_0000;
+
+/// First page after the kernel image (`_end`), aligned up — the heap base.
+pub fn heap_base() -> usize {
+    unsafe extern "C" {
+        static _end: u8;
+    }
+    let end = (&raw const _end) as usize;
+    (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
 
 /// Per-thread saved root page table entries.
 ///
@@ -124,6 +143,10 @@ pub union RootPageTable {
 #[repr(C, align(32))]
 struct HwPdpt([u64; 4]);
 static mut HW_PDPT: HwPdpt = HwPdpt([0; 4]);
+
+impl Default for RootPageTable {
+    fn default() -> Self { RootPageTable::empty() }
+}
 
 impl RootPageTable {
     pub const fn empty() -> Self {
@@ -217,7 +240,7 @@ impl RootPageTable {
         if cpu_mode() == CpuMode::Pae {
             sync_hw_pdpt();
         }
-        unsafe { crate::arch::x86::write_cr3(self.cr3() as u32); }
+        unsafe { crate::x86::write_cr3(self.cr3() as u32); }
     }
 
     /// Load user entries into constant root and reload CR3.
@@ -227,7 +250,7 @@ impl RootPageTable {
         if cpu_mode() == CpuMode::Pae {
             sync_hw_pdpt();
         }
-        unsafe { crate::arch::x86::write_cr3(self.cr3() as u32); }
+        unsafe { crate::x86::write_cr3(self.cr3() as u32); }
     }
 
     /// CR3 value for this address space.
@@ -432,7 +455,7 @@ static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 /// double as a page table, otherwise demand paging writes PTEs into it
 /// and corrupts PML4 entries.
 pub fn setup_long_mode_tables() {
-    let pdpt_phys = crate::arch::x86::read_cr3() as u64;
+    let pdpt_phys = crate::x86::read_cr3() as u64;
     let pml4_phys = physical_page((&raw const PML4) as usize);
 
     // PML4[0] = PDPT (so long mode uses same mappings)
@@ -514,9 +537,9 @@ pub enum CpuMode {
 /// Read current paging mode from CPU registers (CR4.PAE, EFER.LME)
 #[inline]
 pub fn cpu_mode() -> CpuMode {
-    if crate::arch::x86::read_cr4() & crate::arch::x86::cr4::PAE == 0 {
+    if crate::x86::read_cr4() & crate::x86::cr4::PAE == 0 {
         CpuMode::Legacy
-    } else if !cpu_supports_long_mode() || crate::arch::x86::rdmsr(crate::arch::x86::EFER_MSR) & crate::arch::x86::efer::LME == 0 {
+    } else if !cpu_supports_long_mode() || crate::x86::rdmsr(crate::x86::EFER_MSR) & crate::x86::efer::LME == 0 {
         CpuMode::Pae
     } else {
         CpuMode::Compat
@@ -700,15 +723,15 @@ fn diff_children(a: &[(u16, Node)], b: &[(u16, Node)], depth: usize) {
                 ai += 1; bi += 1;
             }
             (Some((aidx, an)), Some((bidx, _))) if aidx < bidx => {
-                crate::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                lib::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
                 ai += 1;
             }
             (_, Some((bidx, bn))) => {
-                crate::println!("{:w$}+ [{}] bits={:#x}", "", bidx, node_bits(bn), w = depth * 2);
+                lib::println!("{:w$}+ [{}] bits={:#x}", "", bidx, node_bits(bn), w = depth * 2);
                 bi += 1;
             }
             (Some((aidx, an)), None) => {
-                crate::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                lib::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
                 ai += 1;
             }
             (None, None) => break,
@@ -720,18 +743,18 @@ fn diff_node(idx: u16, a: &Node, b: &Node, depth: usize) {
     match (a, b) {
         (Node::Internal { bits: ab, children: ac }, Node::Internal { bits: bb, children: bc }) => {
             if ab != bb {
-                crate::println!("{:w$}~ [{}] bits={:#x} -> {:#x}", "", idx, ab, bb, w = depth * 2);
+                lib::println!("{:w$}~ [{}] bits={:#x} -> {:#x}", "", idx, ab, bb, w = depth * 2);
             } else {
-                crate::println!("{:w$}~ [{}] bits={:#x} (children changed)", "", idx, ab, w = depth * 2);
+                lib::println!("{:w$}~ [{}] bits={:#x} (children changed)", "", idx, ab, w = depth * 2);
             }
             diff_children(ac, bc, depth + 1);
         }
         (Node::Leaf { bits: ab, data_hash: ah }, Node::Leaf { bits: bb, data_hash: bh }) => {
-            crate::println!("{:w$}~ [{}] bits={:#x}dh={:#x} -> bits={:#x}dh={:#x}",
+            lib::println!("{:w$}~ [{}] bits={:#x}dh={:#x} -> bits={:#x}dh={:#x}",
                 "", idx, ab, ah, bb, bh, w = depth * 2);
         }
         _ => {
-            crate::println!("{:w$}~ [{}] node type changed!", "", idx, w = depth * 2);
+            lib::println!("{:w$}~ [{}] node type changed!", "", idx, w = depth * 2);
         }
     }
 }
@@ -793,7 +816,7 @@ pub fn print_recorded_diff(expected: u64, actual: u64) {
     let act = map.get(&actual);
     match (exp, act) {
         (Some(e), Some(a)) => e.diff(a),
-        _ => crate::println!("  (trees not available for diff)"),
+        _ => lib::println!("  (trees not available for diff)"),
     }
 }
 
@@ -812,7 +835,7 @@ pub fn unmap_kernel_page(vaddr: usize) {
         Entries::E32(e) => { e[idx] = Entry32(0); }
         Entries::E64(e) => { e[idx] = Entry64(0); }
     }
-    crate::arch::x86::invlpg(vaddr);
+    crate::x86::invlpg(vaddr);
 }
 
 /// Get physical page number for a virtual address
@@ -828,7 +851,7 @@ pub fn physical_page(vaddr: usize) -> u64 {
 /// Get current CR3 value (page directory physical address)
 #[allow(dead_code)]
 pub fn current_cr3() -> u64 {
-    (crate::arch::x86::read_cr3() & !(PAGE_SIZE as u32 - 1)) as u64
+    (crate::x86::read_cr3() & !(PAGE_SIZE as u32 - 1)) as u64
 }
 
 /// Get current process's virtual root physical address.
@@ -836,7 +859,7 @@ pub fn current_cr3() -> u64 {
 /// For PAE: read from recursive entry (CR3 points to thread's pdpt, not virtual root).
 pub fn current_root_phys() -> u64 {
     if cpu_mode() != CpuMode::Pae {
-        return crate::arch::x86::read_cr3() as u64;
+        return crate::x86::read_cr3() as u64;
     }
     // The virtual root's recursive entry points to itself
     let recursive_slot = recursive_idx() - root_base();
@@ -849,14 +872,14 @@ pub fn current_root_phys() -> u64 {
 /// Raw TLB invalidation (CR3 reload). Used internally by paging operations
 /// that don't need the PAE PDPT sync.
 fn invalidate_tlb() {
-    crate::arch::x86::flush_tlb();
+    crate::x86::flush_tlb();
 }
 
 /// Flush TLB. In PAE mode, also syncs the hardware PDPT
 /// before reloading CR3.
 pub fn flush_tlb() {
     sync_hw_pdpt();
-    crate::arch::x86::flush_tlb();
+    crate::x86::flush_tlb();
 }
 
 /// Remove identity mapping (call after switching to virtual addresses)
@@ -875,27 +898,27 @@ fn remove_identity_mapping<E: Entry>(entries: &mut [E]) {
 pub fn finish_setup_paging() {
     match entries() {
         Entries::E32(e) => {
-            crate::println!("Paging: Legacy (32-bit)");
+            lib::println!("Paging: Legacy (32-bit)");
             remove_identity_mapping(e);
             harden_kernel(e);
         }
         Entries::E64(e) => {
-            crate::println!("Paging: PAE (64-bit entries)");
+            lib::println!("Paging: PAE (64-bit entries)");
             let lm = cpu_supports_long_mode();
             if lm {
-                crate::println!("CPU supports Long Mode (64-bit)");
+                lib::println!("CPU supports Long Mode (64-bit)");
 
                 // Set up long mode page tables
                 setup_long_mode_tables();
-                crate::println!("Long mode tables set up");
+                lib::println!("Long mode tables set up");
             }
 
             remove_identity_mapping(e);
-            crate::println!("Identity mapping removed");
+            lib::println!("Identity mapping removed");
 
             enable_nx();
             if nx_enabled() {
-                crate::println!("NX (No-Execute) protection enabled");
+                lib::println!("NX (No-Execute) protection enabled");
             }
 
             harden_kernel(e);
@@ -906,23 +929,23 @@ pub fn finish_setup_paging() {
 
 /// Check if CPU supports PAE (CPUID.1:EDX bit 6)
 pub fn cpu_supports_pae() -> bool {
-    let (_, _, _, edx) = crate::arch::x86::cpuid(1);
+    let (_, _, _, edx) = crate::x86::cpuid(1);
     edx & (1 << 6) != 0
 }
 
 /// Check if CPU supports long mode (CPUID.80000001:EDX bit 29)
 pub fn cpu_supports_long_mode() -> bool {
-    let (max_ext, _, _, _) = crate::arch::x86::cpuid(0x80000000);
+    let (max_ext, _, _, _) = crate::x86::cpuid(0x80000000);
     if max_ext < 0x80000001 { return false; }
-    let (_, _, _, edx) = crate::arch::x86::cpuid(0x80000001);
+    let (_, _, _, edx) = crate::x86::cpuid(0x80000001);
     edx & (1 << 29) != 0
 }
 
 /// Check if CPU supports NX/XD bit (CPUID.80000001:EDX bit 20)
 pub fn cpu_supports_nx() -> bool {
-    let (max_ext, _, _, _) = crate::arch::x86::cpuid(0x80000000);
+    let (max_ext, _, _, _) = crate::x86::cpuid(0x80000000);
     if max_ext < 0x80000001 { return false; }
-    let (_, _, _, edx) = crate::arch::x86::cpuid(0x80000001);
+    let (_, _, _, edx) = crate::x86::cpuid(0x80000001);
     edx & (1 << 20) != 0
 }
 
@@ -940,15 +963,15 @@ pub fn enable_nx() {
         return;  // NX requires PAE or long mode
     }
     unsafe {
-        let efer = crate::arch::x86::rdmsr(crate::arch::x86::EFER_MSR);
-        crate::arch::x86::wrmsr(crate::arch::x86::EFER_MSR, efer | crate::arch::x86::efer::NXE);
+        let efer = crate::x86::rdmsr(crate::x86::EFER_MSR);
+        crate::x86::wrmsr(crate::x86::EFER_MSR, efer | crate::x86::efer::NXE);
         NX_ENABLED = true;
     }
 }
 
 fn boot_phys_page(page: &RawPage) -> u64 {
     let va = page as *const _ as usize;
-    ((va - KERNEL_BASE + super::boot::KERNEL_PHYS) >> 12) as u64
+    ((va - KERNEL_BASE + KERNEL_PHYS) >> 12) as u64
 }
 
 fn boot_phys_addr(page: &RawPage) -> u64 {
@@ -999,9 +1022,9 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
     kpages.pd[770] = Entry32::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
 
     unsafe {
-        crate::arch::x86::write_cr3(boot_phys_addr(&kpages.pd.0) as u32);
-        let cr0 = crate::arch::x86::read_cr0();
-        crate::arch::x86::write_cr0(cr0 | crate::arch::x86::cr0::PG | crate::arch::x86::cr0::WP);
+        crate::x86::write_cr3(boot_phys_addr(&kpages.pd.0) as u32);
+        let cr0 = crate::x86::read_cr0();
+        crate::x86::write_cr0(cr0 | crate::x86::cr0::PG | crate::x86::cr0::WP);
     }
 }
 
@@ -1057,12 +1080,12 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     // Boot with virtual root in CR3 directly (R/W bits in PDPT[0..3] are
     // technically reserved, but OK for boot — we switch to the thread's
     // thread's RootPageTable once threading is initialized)
-    let cr4 = crate::arch::x86::read_cr4();
+    let cr4 = crate::x86::read_cr4();
     unsafe {
-        crate::arch::x86::write_cr4(cr4 | crate::arch::x86::cr4::PAE);
-        crate::arch::x86::write_cr3(boot_phys_addr(&kpages.pdpt.0) as u32);
-        let cr0 = crate::arch::x86::read_cr0();
-        crate::arch::x86::write_cr0(cr0 | crate::arch::x86::cr0::PG | crate::arch::x86::cr0::WP);
+        crate::x86::write_cr4(cr4 | crate::x86::cr4::PAE);
+        crate::x86::write_cr3(boot_phys_addr(&kpages.pdpt.0) as u32);
+        let cr0 = crate::x86::read_cr0();
+        crate::x86::write_cr0(cr0 | crate::x86::cr0::PG | crate::x86::cr0::WP);
     }
     IS_PAE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
@@ -1124,7 +1147,7 @@ pub fn temp_swap(page: u64) -> u64 {
 /// Returns the saved page (pass to temp_swap to restore and get the new page back).
 #[must_use]
 fn fresh_temp_page() -> u64 {
-    temp_swap(crate::arch::phys_mm::alloc_phys_page().expect("out of memory"))
+    temp_swap(crate::phys_mm::alloc_phys_page().expect("out of memory"))
 }
 
 /// Get entries per page for an Entry type
@@ -1220,7 +1243,7 @@ fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
 /// COW-share a page table page: mark each present non-MMIO entry R/O
 /// in `src`, increment its ref count, and write the R/O copy to `dst`.
 fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
-    use crate::arch::phys_mm;
+    use crate::phys_mm;
 
     debug_assert_eq!(src.len(), dst.len());
 
@@ -1243,7 +1266,7 @@ fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
 /// copies the old contents, and updates the entry. For page table entries,
 /// also marks children R/O and increments their ref counts.
 pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
-    use crate::arch::phys_mm;
+    use crate::phys_mm;
 
     debug_assert!(idx < recursive_idx(),
         "cow_entry: idx {} is at or above recursive entry, must be a user entry", idx);
@@ -1340,7 +1363,7 @@ pub fn free_user_pages() {
 /// If sole-owned, walk children: recurse for intermediate levels,
 /// free directly for leaf pages.
 fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
-    use crate::arch::phys_mm;
+    use crate::phys_mm;
 
     if !entries[parent_idx].present() {
         return;
@@ -1384,11 +1407,11 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 /// address while paging is briefly disabled during a mode toggle.
 /// Returns the previous PTE value to pass back to `clear_trampoline()`.
 pub fn ensure_trampoline_mapped() -> u64 {
-    let page = super::boot::KERNEL_PHYS / PAGE_SIZE;
+    let page = KERNEL_PHYS / PAGE_SIZE;
     if let Entries::E64(e) = entries() {
         let saved = e[page].0;
         e[page] = Entry64::new(page as u64, true, false);
-        crate::arch::x86::invlpg(super::boot::KERNEL_PHYS);
+        crate::x86::invlpg(KERNEL_PHYS);
         saved
     } else {
         0
@@ -1397,11 +1420,11 @@ pub fn ensure_trampoline_mapped() -> u64 {
 
 /// Restore the trampoline page's PTE after a mode toggle.
 pub fn clear_trampoline(saved: u64) {
-    let page = super::boot::KERNEL_PHYS / PAGE_SIZE;
+    let page = KERNEL_PHYS / PAGE_SIZE;
     if let Entries::E64(e) = entries() {
         e[page] = Entry64(saved);
     }
-    crate::arch::x86::invlpg(super::boot::KERNEL_PHYS);
+    crate::x86::invlpg(KERNEL_PHYS);
 }
 
 /// Map the first 1MB of physical memory as user-accessible (for VM86 mode).
@@ -1531,7 +1554,7 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
 /// When enabled: virtual 0x100000-0x10FFFF → the thread's saved HMA mappings.
 /// Copy page table entries from src range to dst range.
 pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
-    use crate::arch::phys_mm;
+    use crate::phys_mm;
     match entries() {
         Entries::E32(e) => { for i in 0..count {
             e[dst_vpage + i] = e[src_vpage + i];
@@ -1568,7 +1591,7 @@ pub fn swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
 
 /// Clear page entries to absent (enables demand paging on next access).
 pub fn unmap_range(base_page: usize, num_pages: usize) {
-    use crate::arch::phys_mm;
+    use crate::phys_mm;
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
@@ -1601,7 +1624,7 @@ pub fn free_range(base_page: usize, num_pages: usize) {
             for i in 0..num_pages {
                 let ent = e[base_page + i];
                 if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
-                    crate::arch::phys_mm::free_phys_page(ent.addr() >> 12);
+                    crate::phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry32::new((base_page + i) as u64, false, true);
             }
@@ -1610,7 +1633,7 @@ pub fn free_range(base_page: usize, num_pages: usize) {
             for i in 0..num_pages {
                 let ent = e[base_page + i];
                 if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
-                    crate::arch::phys_mm::free_phys_page(ent.addr() >> 12);
+                    crate::phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry64::new((base_page + i) as u64, false, true);
             }
@@ -1623,7 +1646,7 @@ pub fn free_range(base_page: usize, num_pages: usize) {
 /// frames currently mapped are freed first; cache-disabled / externally-
 /// owned pages (an aliased DMA buffer) are left intact.
 pub fn map_fresh_range(base_page: usize, num_pages: usize) {
-    use crate::arch::phys_mm;
+    use crate::phys_mm;
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
@@ -1675,12 +1698,12 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     let data_start_page = page_idx(data_start);
     let data_end_page = page_idx(data_end + PAGE_SIZE - 1);
 
-    crate::println!("Hardening kernel:");
-    crate::println!("  .text:   {:#x}-{:#x} (pages {}-{}): R-X",
+    lib::println!("Hardening kernel:");
+    lib::println!("  .text:   {:#x}-{:#x} (pages {}-{}): R-X",
         text_start, text_end, text_start_page, text_end_page);
-    crate::println!("  .rodata: {:#x}-{:#x} (pages {}-{}): R-- NX",
+    lib::println!("  .rodata: {:#x}-{:#x} (pages {}-{}): R-- NX",
         text_end, rodata_end, text_end_page, rodata_end_page);
-    crate::println!("  .data:   {:#x}-{:#x} (pages {}-{}): RW- NX",
+    lib::println!("  .data:   {:#x}-{:#x} (pages {}-{}): RW- NX",
         data_start, data_end, data_start_page, data_end_page);
 
     // .text: read-only, executable (no NX)
@@ -1702,5 +1725,5 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     }
 
     invalidate_tlb();
-    crate::println!("Kernel hardening complete");
+    lib::println!("Kernel hardening complete");
 }

@@ -4,7 +4,7 @@
 //! Each pipe has independent reader and writer refcounts. When all writers
 //! close, readers get EOF. When all readers close, writers get EPIPE.
 
-use crate::pipe::Pipe;
+use lib::pipe::Pipe;
 
 const MAX_PIPES: usize = 64;
 const PIPE_BUF_SIZE: usize = 1024;

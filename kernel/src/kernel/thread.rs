@@ -3,6 +3,7 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
+use arch_abi::Arch;
 use crate::kernel::stacktrace::SymbolData;
 use crate::println;
 use crate::Regs;
@@ -134,10 +135,10 @@ impl Personality {
     /// Swap-in hook: rebind per-thread CPU state. Called every time a thread
     /// becomes the running thread, regardless of whether it's also taking
     /// focus visually.
-    pub fn on_resume(&mut self) {
+    pub fn on_resume(&mut self, machine: &mut crate::TheArch) {
         match self {
-            Self::Dos(d) => d.on_resume(),
-            Self::Linux(l) => l.on_resume(),
+            Self::Dos(d) => d.on_resume(machine),
+            Self::Linux(l) => l.on_resume(machine),
         }
     }
 }
@@ -367,7 +368,7 @@ pub fn get_two_threads(a: usize, b: usize) -> (&'static mut Thread, &'static mut
 }
 
 /// Create a new thread with the given root page table.
-pub fn create_thread(parent_tid: Option<usize>, root: crate::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
+pub fn create_thread(machine: &mut crate::TheArch, parent_tid: Option<usize>, root: crate::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
     unsafe {
         let parent = parent_tid.map(|tid| &THREADS[tid].kernel);
         for i in 0..MAX_THREADS {
@@ -379,9 +380,9 @@ pub fn create_thread(parent_tid: Option<usize>, root: crate::RootPageTable, is_p
                 k.priority = parent.map(|p| p.priority).unwrap_or(0);
                 k.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
                 k.state = ThreadState::Ready;
-                k.time = crate::arch::get_ticks() as u32;
+                k.time = machine.get_ticks() as u32;
                 k.vcpu = crate::arch::Vcpu { regs: Regs::empty(), space: root };
-                k.fx_state = crate::arch::clean_fx_template();
+                k.fx_state = machine.clean_fx_template();
                 k.exit_code = 0;
                 k.addr_hash = 0;
                 k.cpu_hash = 0;
@@ -512,7 +513,7 @@ pub fn cycle_next(current_tid: usize) -> Option<usize> {
 
 /// Exit thread and schedule next.
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
-pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
+pub fn exit_thread(machine: &mut crate::TheArch, tid: usize, exit_code: i32) -> usize {
     unsafe {
         let thread = &mut THREADS[tid];
         let parent_tid = thread.kernel.parent_tid;
@@ -522,7 +523,7 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
         // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
         thread.personality.suspend();
         match &mut thread.personality {
-            Personality::Dos(dos) => dos.on_exit(),
+            Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),
             Personality::Linux(_) => {}
         }
 
@@ -562,10 +563,10 @@ pub fn exit_thread(tid: usize, exit_code: i32) -> usize {
             }
         }
 
-        crate::arch::arch_user_clean();
+        machine.free_user_pages();
         thread.kernel.state = ThreadState::Zombie;
         crate::dbg_println!("[mem] exit tid={} code={} free_pages={}",
-            tid, exit_code, crate::arch::free_page_count());
+            tid, exit_code, machine.free_page_count());
 
         // Hand focus back to the parent that spawned us — it's the
         // natural caller of wait4. Covers both "parent was Blocked on

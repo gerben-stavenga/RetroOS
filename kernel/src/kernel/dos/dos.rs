@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+use arch_abi::Arch;
+use arch_abi::GuestBytes;
 use crate::kernel::thread;
 use crate::arch::Vcpu;
 use crate::vga;
@@ -64,9 +66,9 @@ fn bios_time_of_day(regs: &Vcpu) -> (u8, u8, u8, u8) {
     )
 }
 
-fn cmos_read(index: u8) -> u8 {
-    crate::arch::outb(0x70, index);
-    crate::arch::inb(0x71)
+fn cmos_read(machine: &mut crate::TheArch, index: u8) -> u8 {
+    machine.outb(0x70, index);
+    machine.inb(0x71)
 }
 
 fn cmos_decode(value: u8, binary: bool) -> u8 {
@@ -88,19 +90,19 @@ fn day_of_week(mut year: u16, mut month: u8, day: u8) -> u8 {
     ((y + y / 4 - y / 100 + y / 400 + OFFSETS[month as usize - 1] as u32 + day as u32) % 7) as u8
 }
 
-fn cmos_date() -> (u16, u8, u8, u8) {
+fn cmos_date(machine: &mut crate::TheArch) -> (u16, u8, u8, u8) {
     for _ in 0..10_000 {
-        if cmos_read(0x0A) & 0x80 == 0 {
+        if cmos_read(machine, 0x0A) & 0x80 == 0 {
             break;
         }
     }
 
-    let status_b = cmos_read(0x0B);
+    let status_b = cmos_read(machine, 0x0B);
     let binary = status_b & 0x04 != 0;
-    let day = cmos_decode(cmos_read(0x07), binary);
-    let month = cmos_decode(cmos_read(0x08), binary);
-    let year_lo = cmos_decode(cmos_read(0x09), binary);
-    let century = cmos_decode(cmos_read(0x32), binary);
+    let day = cmos_decode(cmos_read(machine, 0x07), binary);
+    let month = cmos_decode(cmos_read(machine, 0x08), binary);
+    let year_lo = cmos_decode(cmos_read(machine, 0x09), binary);
+    let century = cmos_decode(cmos_read(machine, 0x32), binary);
 
     let year = if (19..=99).contains(&century) {
         century as u16 * 100 + year_lo as u16
@@ -117,20 +119,20 @@ fn cmos_date() -> (u16, u8, u8, u8) {
     (year, month, day, day_of_week(year, month, day))
 }
 
-fn current_dos_timestamp(regs: &Vcpu) -> (u16, u16) {
+fn current_dos_timestamp(machine: &mut crate::TheArch, regs: &Vcpu) -> (u16, u16) {
     let (hour, min, sec, _) = bios_time_of_day(regs);
-    let (year, month, day, _) = cmos_date();
+    let (year, month, day, _) = cmos_date(machine);
     let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
     let dos_date = ((year.saturating_sub(1980)) << 9) | ((month as u16) << 5) | day as u16;
     (dos_time, dos_date)
 }
 
-fn poll_dos_console_char(dos: &mut thread::DosState) -> Option<u8> {
+fn poll_dos_console_char(dos: &mut thread::DosState, regs: &mut Vcpu) -> Option<u8> {
     if let Some(ch) = dos.dos_pending_char.take() {
         return Some(ch);
     }
 
-    let word = pop_bios_keyboard_word()?;
+    let word = pop_bios_keyboard_word(regs)?;
     let ascii = word as u8;
     let scan = (word >> 8) as u8;
     if ascii == 0 && scan != 0 {
@@ -164,6 +166,7 @@ fn park_at_slot_resume(regs: &mut Vcpu) {
 /// The caller is responsible for any mode-specific frame housekeeping after
 /// the call (V86 stack pop, PM return-frame restore, etc.).
 pub(crate) fn dispatch_kernel_syscall(
+    machine: &mut crate::TheArch,
     kt: &mut thread::KernelThread,
     dos: &mut thread::DosState,
     regs: &mut Vcpu,
@@ -175,11 +178,11 @@ pub(crate) fn dispatch_kernel_syscall(
         0x20 => {
             if let Some(parent) = dos.exec_parent.take() {
                 dos.last_child_exit_status = 0x0000;
-                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
+                return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
             }
             thread::KernelAction::Exit(0)
         }
-        0x21 => int_21h(kt, dos, regs),
+        0x21 => int_21h(machine, kt, dos, regs),
         0x33 => int_33h(dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error
         0x25 | 0x26 => {
@@ -191,7 +194,7 @@ pub(crate) fn dispatch_kernel_syscall(
         // INT 29h — DOS FAST_CON_OUT: AL = char to display. Route through
         // the normal console path so VGA and debugcon stay in sync.
         0x29 => {
-            let ch = regs.rax as u8; dos_putchar(regs, ch);
+            let ch = regs.rax as u8; dos_putchar(machine, regs, ch);
             thread::KernelAction::Done
         }
         0x2E => int_2eh(kt, dos, regs),
@@ -205,7 +208,7 @@ pub(crate) fn dispatch_kernel_syscall(
                 regs.rax = (regs.rax & !0xFF00) | 0x80_00;
                 return thread::KernelAction::Done;
             }
-            int_67h(dos, regs)
+            int_67h(machine, dos, regs)
         }
         _ => {
             dos_trace!("dispatch_kernel_syscall: unhandled vector {:#04x}", vector);
@@ -219,7 +222,7 @@ pub(crate) fn dispatch_kernel_syscall(
 /// VM86 stack from the original INT; far-call stubs have a CS/IP frame from
 /// CALL FAR. The kernel pops these frames directly — no RETF/RETF 2 in the
 /// stub. Caller (`syscall`) has already checked CS == STUB_SEG.
-pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn rm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     let cs = vm86_cs(regs);
     debug_assert_eq!(cs, STUB_SEG, "rm_stub_dispatch: CS must be STUB_SEG");
@@ -233,7 +236,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
         || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
 
     let action = match slot {
-        SLOT_XMS => xms_dispatch(dos, regs),
+        SLOT_XMS => xms_dispatch(machine, dos, regs),
         SLOT_DPMI_ENTRY => {
             dpmi::dpmi_enter(dos, regs);
             thread::KernelAction::Done
@@ -257,9 +260,9 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             // Restore caller FLAGS into regs so handlers may mutate them
             // (CF/ZF returns); then write back so normal IRET-style pop
             // restores the handler's result to the caller.
-            let caller_flags = read_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
+            let caller_flags = read_u16(regs, vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
             machine::set_vm86_flags(regs, caller_flags as u32);
-            let action = dispatch_kernel_syscall(kt, dos, regs, slot);
+            let action = dispatch_kernel_syscall(machine, kt, dos, regs, slot);
             // Exit replaces thread state outright — skip the iret-frame
             // pop entirely. Anything else (Done, ForkExec, Yield, Switch)
             // leaves the issuing thread alive and needs regs.CS:EIP
@@ -275,8 +278,10 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             // writeback would scribble garbage. finish_dos_call below
             // takes the PM branch and merges flags through pop_iret_frame.
             if regs.mode() == crate::UserMode::VM86 {
-                write_u16(vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4),
-                          machine::vm86_flags(regs) as u16);
+                let ss = vm86_ss(regs) as u32;
+                let off = (vm86_sp(regs) as u32).wrapping_add(4);
+                let flags = machine::vm86_flags(regs) as u16;
+                write_u16(regs, ss, off, flags);
             }
             action
         }
@@ -299,7 +304,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
             // slot would have done, unwinding the chain naturally).
             let cb = dos.pending_resume.take()
                 .expect("SLOT_RESUME fired without pending_resume");
-            match (cb.0)(kt, dos, regs) {
+            match (cb.0)(machine, kt, dos, regs) {
                 Some(next) => {
                     dos.pending_resume = Some(next);
                     park_at_slot_resume(regs);
@@ -358,7 +363,7 @@ pub(super) fn rm_stub_dispatch(kt: &mut thread::KernelThread, dos: &mut thread::
 /// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
-pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn pmdos_int21_handler(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     // 16-bit DPMI clients issue INT 21h with 16-bit register parameters; the
     // high 16 bits of EAX..EBP are undefined and real (16-bit) DOS never
     // touches them. Zero them for the duration of servicing so every handler's
@@ -382,7 +387,7 @@ pub(super) fn pmdos_int21_handler(kt: &mut thread::KernelThread, dos: &mut threa
         s
     } else { [0u64; 7] };
 
-    let action = int_21h(kt, dos, regs);
+    let action = int_21h(machine, kt, dos, regs);
 
     if mask16 {
         regs.rax = (regs.rax & !HI) | saved_hi[0];
@@ -666,25 +671,26 @@ fn int_13h(regs: &mut Vcpu) -> thread::KernelAction {
 /// gathering input; `None` once Enter is pressed.
 fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::ResumeCallback {
     super::ResumeCallback(alloc::boxed::Box::new(
-        move |_kt: &mut thread::KernelThread,
+        move |machine: &mut crate::TheArch,
+              _kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
               regs: &mut Vcpu| -> Option<super::ResumeCallback> {
-            let Some(ch) = poll_dos_console_char(dos) else {
+            let Some(ch) = poll_dos_console_char(dos, regs) else {
                 return Some(buffered_input_resume(buf_lin, max_chars, count));
             };
             match ch {
                 0x0D => {
                     regs.write::<u8>((buf_lin + 1) as usize, count);
                     regs.write::<u8>((buf_lin + 2 + count as u32) as usize, 0x0D);
-                    dos_putchar(regs, 0x0D);
-                    dos_putchar(regs, 0x0A);
+                    dos_putchar(machine, regs, 0x0D);
+                    dos_putchar(machine, regs, 0x0A);
                     None
                 }
                 0x08 => {
                     if count > 0 {
-                        dos_putchar(regs, 0x08);
-                        dos_putchar(regs, b' ');
-                        dos_putchar(regs, 0x08);
+                        dos_putchar(machine, regs, 0x08);
+                        dos_putchar(machine, regs, b' ');
+                        dos_putchar(machine, regs, 0x08);
                         Some(buffered_input_resume(buf_lin, max_chars, count - 1))
                     } else {
                         Some(buffered_input_resume(buf_lin, max_chars, count))
@@ -693,10 +699,10 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
                 _ => {
                     if (count as u32) + 1 < max_chars as u32 {
                         regs.write::<u8>(((buf_lin + 2 + count as u32)) as usize, ch);
-                        dos_putchar(regs, ch);
+                        dos_putchar(machine, regs, ch);
                         Some(buffered_input_resume(buf_lin, max_chars, count + 1))
                     } else {
-                        dos_putchar(regs, 0x07); // bell — no room
+                        dos_putchar(machine, regs, 0x07); // bell — no room
                         Some(buffered_input_resume(buf_lin, max_chars, count))
                     }
                 }
@@ -715,8 +721,8 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
 /// (the return frame, pointing back at SLOT_RESUME) and enter `IVT[0x16]`.
 /// IF is forced so the guest's wait loop can receive the keypress IRQ.
 fn launch_int16_read(regs: &mut Vcpu) {
-    let ivt_off = read_u16(0, 0x16 * 4);
-    let ivt_seg = read_u16(0, 0x16 * 4 + 2);
+    let ivt_off = read_u16(regs, 0, 0x16 * 4);
+    let ivt_seg = read_u16(regs, 0, 0x16 * 4 + 2);
     let ret_flags = (machine::vm86_flags(regs) | machine::IF_FLAG) as u16;
     machine::vm86_push(regs, ret_flags);
     machine::vm86_push(regs, STUB_SEG);
@@ -733,7 +739,8 @@ fn launch_int16_read(regs: &mut Vcpu) {
 /// `None` so SLOT_RESUME pops the original INT 21 return frame.
 fn int16_finish_resume(echo: bool) -> super::ResumeCallback {
     super::ResumeCallback(alloc::boxed::Box::new(
-        move |_kt: &mut thread::KernelThread,
+        move |machine: &mut crate::TheArch,
+              _kt: &mut thread::KernelThread,
               dos: &mut thread::DosState,
               regs: &mut Vcpu| -> Option<super::ResumeCallback> {
             let ax = regs.rax as u16;
@@ -744,17 +751,16 @@ fn int16_finish_resume(echo: bool) -> super::ResumeCallback {
                 dos.dos_pending_char = Some(scan);
             }
             regs.rax = (regs.rax & !0xFF) | ascii as u64;
-            if echo && ascii != 0 { dos_putchar(regs, ascii); }
+            if echo && ascii != 0 { dos_putchar(machine, regs, ascii); }
             None
         }))
 }
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
-fn dos_putchar(regs: &mut Vcpu, c: u8) {
-    use crate::arch::outb;
-    // Mirror DOS console output to QEMU debugcon alongside VGA.
-    outb(0xE9, c);
+fn dos_putchar(machine: &mut crate::TheArch, regs: &mut Vcpu, c: u8) {
+    // Mirror DOS console output to the debug log stream alongside VGA.
+    crate::vga::debug_byte(c);
     // The BDA cursor (0040:0050/0051) is guest address space — go through the
     // vcpu so the access works under any arch backend, not just a host pointer.
     let col = regs.read::<u8>(0x450) as usize;
@@ -769,8 +775,8 @@ fn dos_putchar(regs: &mut Vcpu, c: u8) {
     regs.write::<u8>(0x451, row as u8);
     // Update CRTC hardware cursor so save_from_hardware captures it
     let offset = (row * 80 + col) as u16;
-    outb(0x3D4, 0x0E); outb(0x3D5, (offset >> 8) as u8);
-    outb(0x3D4, 0x0F); outb(0x3D5, offset as u8);
+    machine.outb(0x3D4, 0x0E); machine.outb(0x3D5, (offset >> 8) as u8);
+    machine.outb(0x3D4, 0x0F); machine.outb(0x3D5, offset as u8);
 }
 
 fn psp_struct_seg(dos: &thread::DosState) -> u16 {
@@ -791,7 +797,7 @@ fn dos_error_from_errno(err: i32) -> u16 {
 // DOS INT 21h — DOS services
 // ============================================================================
 
-fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
     // running clients), 02/06/09 (character/string output — exception
@@ -806,21 +812,21 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
-            let ch = regs.rdx as u8; dos_putchar(regs, ch);
+            let ch = regs.rdx as u8; dos_putchar(machine, regs, ch);
             thread::KernelAction::Done
         }
         // AH=0x06: Direct console I/O (DL=0xFF=input, else output DL)
         0x06 => {
             let dl = regs.rdx as u8;
             if dl == 0xFF {
-                if let Some(ch) = poll_dos_console_char(dos) {
+                if let Some(ch) = poll_dos_console_char(dos, regs) {
                     regs.rax = (regs.rax & !0xFF) | ch as u64;
                     regs.clear_flag32(0x40); // clear ZF = char available
                 } else {
                     regs.set_flag32(0x40); // set ZF = no char available
                 }
             } else {
-                dos_putchar(regs, dl);
+                dos_putchar(machine, regs, dl);
             }
             thread::KernelAction::Done
         }
@@ -845,7 +851,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             // AL=0 then the scancode on the next read).
             if let Some(ch) = dos.dos_pending_char.take() {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
-                if echo && ch != 0 { dos_putchar(regs, ch); }
+                if echo && ch != 0 { dos_putchar(machine, regs, ch); }
             } else {
                 // Real DOS services console input through INT 16h — so do we.
                 // Enter the guest's IVT[0x16] (AH=00, wait-for-key) with an
@@ -867,7 +873,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             loop {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == b'$' { break; }
-                dos_putchar(regs, ch);
+                dos_putchar(machine, regs, ch);
                 addr = addr.wrapping_add(1);
                 // Safety limit: cap at 64 KiB from start
                 if addr.wrapping_sub(start) > 0xFFFF { break; }
@@ -898,8 +904,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // Some Borland C builds back kbhit() with this rather than INT 16h
         // AH=01h, so a hardcoded "no char" silently breaks polling.
         0x0B => {
-            let head = read_u16(0x40, 0x1A);
-            let tail = read_u16(0x40, 0x1C);
+            let head = read_u16(regs, 0x40, 0x1A);
+            let tail = read_u16(regs, 0x40, 0x1C);
             let al = if head != tail { 0xFFu8 } else { 0u8 };
             regs.rax = (regs.rax & !0xFF) | al as u64;
             thread::KernelAction::Done
@@ -920,8 +926,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 return thread::KernelAction::Done;
             }
             let (seg, off) = (regs.ds as u16, regs.rdx as u16);
-            write_u16(0, (int_num as u32) * 4, off);
-            write_u16(0, (int_num as u32) * 4 + 2, seg);
+            write_u16(regs, 0, (int_num as u32) * 4, off);
+            write_u16(regs, 0, (int_num as u32) * 4 + 2, seg);
             thread::KernelAction::Done
         }
         // AH=0x33: Get/Set Ctrl-Break check state
@@ -970,7 +976,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             } else {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
                 let cwd = dos.dfs.get_cwd();
-                regs.write_bytes(addr, cwd);
+                regs.copy_to(addr, cwd);
                 regs.write::<u8>(addr + cwd.len(), 0);
                 dos_trace!("D21 47 DL={:02X} out=\"{}\"",
                     dl, core::str::from_utf8(cwd).unwrap_or("?"));
@@ -985,11 +991,11 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=0x0C: Flush input buffer then execute function in AL
         0x0C => {
-            clear_bios_keyboard_buffer();
+            clear_bios_keyboard_buffer(regs);
             dos.dos_pending_char = None;
             let sub_ah = regs.rax as u8;
             if sub_ah == 0x06 {
-                if let Some(ch) = poll_dos_console_char(dos) {
+                if let Some(ch) = poll_dos_console_char(dos, regs) {
                     regs.rax = (regs.rax & !0xFF) | ch as u64;
                     regs.clear_flag32(0x40);
                 } else {
@@ -1042,8 +1048,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     regs.rbx = (regs.rbx & !0xFFFF) | (off & 0xFFFF) as u64;
                 }
             } else {
-                let off = read_u16(0, (int_num as u32) * 4);
-                let seg = read_u16(0, (int_num as u32) * 4 + 2);
+                let off = read_u16(regs, 0, (int_num as u32) * 4);
+                let seg = read_u16(regs, 0, (int_num as u32) * 4 + 2);
                 regs.es = seg as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | off as u64;
             }
@@ -1120,8 +1126,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
-                    sft_set_file(fd as u16, size);
-                    if (fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
+                    sft_set_file(regs, fd as u16, size);
+                    if (fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
@@ -1135,13 +1141,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x3E => {
             let handle = regs.rbx as u16;
             if handle <= 2 || handle == NULL_FILE_HANDLE || (EMS_ENABLED && handle == EMS_DEVICE_HANDLE) {
-                if (handle as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[handle as usize] = 0xFF; }
+                if (handle as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), handle as usize, 0xFF); }
                 regs.clear_flag32(1);
             } else {
                 let rv = crate::kernel::vfs::close(handle as i32, &mut kt.fds);
                 if rv >= 0 {
-                    sft_clear(handle);
-                    if (handle as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[handle as usize] = 0xFF; }
+                    sft_clear(regs, handle);
+                    if (handle as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), handle as usize, 0xFF); }
                     regs.clear_flag32(1);
                 } else {
                     regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rv) as u64;
@@ -1170,9 +1176,10 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.rax = regs.rax & !0xFFFF;
                 regs.clear_flag32(1);
             } else {
-                let buf = regs.slice_mut((buf_addr) as usize, count);
-                let n = crate::kernel::vfs::read(handle, buf, &kt.fds);
+                let mut buf = alloc::vec![0u8; count];
+                let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
                 if n >= 0 {
+                    regs.copy_to(buf_addr as usize, &buf[..(n as usize).min(count)]);
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
                     let dump_n = (n as usize).min(16);
                     let mut hex = [0u8; 16];
@@ -1254,7 +1261,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if let Some(parent) = dos.exec_parent.take() {
                 // Termination type 00h (normal) | return code in AL.
                 dos.last_child_exit_status = (regs.rax as u8) as u16;
-                return exec_return(dos, regs, parent, /*preserve_pm_env=*/false);
+                return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
             }
             let code = regs.rax as u8;
             thread::KernelAction::Exit(code as i32)
@@ -1285,8 +1292,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 // to RM via 0306, then TSRs — leaves the PM session usable
                 // by subsequent programs that enter via the raw-switch
                 // trampoline.
-                let action = exec_return(dos, regs, parent, /*preserve_pm_env=*/true);
-                dos_keep_resident_block(dos, child_psp_seg, keep, child_psp_seg);
+                let action = exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/true);
+                dos_keep_resident_block(dos, regs, child_psp_seg, keep, child_psp_seg);
                 dos_trace!("D21 31 TSR kept resident block {:04X}+{:04X} top={:04X}",
                     child_psp_seg, keep, resident_top);
                 return action;
@@ -1300,7 +1307,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
             let need = regs.rbx as u16;
-            match dos_alloc_block(dos, need) {
+            match dos_alloc_block(dos, regs, need) {
                 Ok(seg) => {
                     regs.rax = (regs.rax & !0xFFFF) | seg as u64;
                     regs.clear_flag32(1);
@@ -1317,7 +1324,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=0x49: Free memory (ES=segment)
         0x49 => {
-            match dos_free_block(dos, regs.es as u16) {
+            let es = regs.es as u16;
+            match dos_free_block(dos, regs, es) {
                 Ok(()) => regs.clear_flag32(1),
                 Err(err) => {
                     regs.rax = (regs.rax & !0xFFFF) | err as u64;
@@ -1328,7 +1336,9 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         }
         // AH=0x4A: Resize memory block (ES=segment, BX=new size in paragraphs)
         0x4A => {
-            match dos_resize_block(dos, regs.es as u16, regs.rbx as u16) {
+            let es = regs.es as u16;
+            let new_paras = regs.rbx as u16;
+            match dos_resize_block(dos, regs, es, new_paras) {
                 Ok(()) => regs.clear_flag32(1),
                 Err((err, max)) => {
                     regs.rax = (regs.rax & !0xFFFF) | err as u64;
@@ -1418,8 +1428,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 Err(e) => -e,
             };
             if fd >= 0 {
-                sft_set_file(fd as u16, 0);
-                if (fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
+                sft_set_file(regs, fd as u16, 0);
+                if (fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), fd as usize, fd as u8); }
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
@@ -1437,7 +1447,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = regs.read::<u8>(((addr + i)) as usize);
-                    dos_putchar(regs, ch);
+                    dos_putchar(machine, regs, ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
                 regs.clear_flag32(1);
@@ -1446,11 +1456,12 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 regs.clear_flag32(1);
             } else {
                 let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-                let data = regs.slice((addr) as usize, count as usize);
-                let n = crate::kernel::vfs::write(handle as i32, data, &kt.fds);
+                let mut data = alloc::vec![0u8; count as usize];
+                regs.copy_from(addr as usize, &mut data);
+                let n = crate::kernel::vfs::write(handle as i32, &data, &kt.fds);
                 if n >= 0 {
                     let size = crate::kernel::vfs::file_size(handle as i32, &kt.fds);
-                    sft_set_file(handle, size);
+                    sft_set_file(regs, handle, size);
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     regs.clear_flag32(1);
                 } else {
@@ -1563,8 +1574,10 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                 let (is_ext, fcb_off) = if regs.read::<u8>(addr as usize) == 0xFF { (true, 7) } else { (false, 0) };
                 let fcb_base = addr.wrapping_add(fcb_off);
                 let drive_byte = regs.read::<u8>((fcb_base) as usize);
-                let name = regs.slice(((fcb_base + 1)) as usize, 8);
-                let ext = regs.slice(((fcb_base + 9)) as usize, 3);
+                let mut name = [0u8; 8];
+                regs.copy_from((fcb_base + 1) as usize, &mut name);
+                let mut ext = [0u8; 3];
+                regs.copy_from((fcb_base + 9) as usize, &mut ext);
                 // Build "[X:][cwd\]NAME[.EXT]" — wildcards stay as-is
                 // ('?' for single, real chars for literal). resolve()
                 // uppercases and applies cwd.
@@ -1577,13 +1590,13 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     dpos = 3;
                 }
                 let mut k = 0;
-                for &c in name { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; k += 1; }
+                for &c in &name { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; k += 1; }
                 let _ = k;
                 let mut has_ext = false;
-                for &c in ext { if c != b' ' { has_ext = true; break; } }
+                for &c in &ext { if c != b' ' { has_ext = true; break; } }
                 if has_ext {
                     dos_path[dpos] = b'.'; dpos += 1;
-                    for &c in ext { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; }
+                    for &c in &ext { if c == b' ' { break; } dos_path[dpos] = c; dpos += 1; }
                 }
                 let mut abs = [0u8; dfs::DFS_PATH_MAX];
                 let alen = match dos.dfs.resolve(&dos_path[..dpos], &mut abs) {
@@ -1674,8 +1687,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                         for (i, &c) in e.iter().take(3).enumerate() {
                             ext_buf[i] = c.to_ascii_uppercase();
                         }
-                        regs.write_bytes(fcb_base + 1, &name_buf);
-                        regs.write_bytes(fcb_base + 9, &ext_buf);
+                        regs.copy_to(fcb_base + 1, &name_buf);
+                        regs.copy_to(fcb_base + 9, &ext_buf);
                         // current block = 0 (offsets 0x0C-0x0D), record
                         // size = 128 (0x0E-0x0F), file size at 0x10-0x13.
                         regs.write::<u16>(fcb_base + 0x0E, 128);
@@ -1715,7 +1728,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
 
             // Zero-fill the 11-byte name field in FCB (drive byte at +0, name at +1..+12)
-            regs.write_bytes((fcb + 1) as usize, &[b' '; 11]);
+            regs.copy_to((fcb + 1) as usize, &[b' '; 11]);
 
             // Check for drive letter (e.g., "C:")
             let ch0 = regs.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
@@ -1768,18 +1781,20 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             // Update SI to point past parsed name
             regs.rsi = (regs.rsi & !0xFFFF) | si as u64;
             // AL=0: no wildcards, AL=1: wildcards present, AL=0xFF: drive invalid
-            let has_wildcards = regs.slice((fcb + 1) as usize, 11).iter().any(|&b| b == b'?');
+            let mut fcb_name = [0u8; 11];
+            regs.copy_from((fcb + 1) as usize, &mut fcb_name);
+            let has_wildcards = fcb_name.iter().any(|&b| b == b'?');
             regs.rax = (regs.rax & !0xFF) | if has_wildcards { 1 } else { 0 };
             thread::KernelAction::Done
         }
         // AH=0x4B: EXEC — Load and Execute Program
         // AL=00: load+execute, DS:DX=ASCIIZ filename, ES:BX=param block
         0x4B => {
-            exec_program(kt, dos, regs)
+            exec_program(machine, kt, dos, regs)
         }
         // AH=2Ah — Get System Date
         0x2A => {
-            let (year, month, day, dow) = cmos_date();
+            let (year, month, day, dow) = cmos_date(machine);
             regs.rcx = (regs.rcx & !0xFFFF) | year as u64; // CX = year
             regs.rdx = (regs.rdx & !0xFFFF) | ((month as u64) << 8) | day as u64; // DH = month, DL = day
             regs.rax = (regs.rax & !0xFF) | dow as u64; // AL = day of week (0=Sun, 6=Sat)
@@ -1798,7 +1813,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if al == 0 {
                 // DOS time: bits 15-11=hours, 10-5=minutes, 4-0=seconds/2
                 // DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
-                let (time, date) = current_dos_timestamp(regs);
+                let (time, date) = current_dos_timestamp(machine, regs);
                 regs.rcx = (regs.rcx & !0xFFFF) | time as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | date as u64;
                 regs.clear_flag32(1);
@@ -1864,7 +1879,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             }
             out[pos] = 0;
             // Write to ES:DI
-            crate::arch::mem().write_bytes(dst as usize, &out[..pos + 1]);
+            regs.copy_to(dst as usize, &out[..pos + 1]);
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -1932,7 +1947,7 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
         0x67 => {
             let requested = regs.rbx as u16;
             if requested <= 20 {
-                Psp::at(psp_struct_seg(dos)).max_files = requested;
+                Psp::set_max_files(regs, psp_struct_seg(dos), requested);
                 regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory for an external JFT
@@ -2081,8 +2096,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
             if fd >= 0 {
                 if open_exists {
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
-                    sft_set_file(fd as u16, size);
-                    if (fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[fd as usize] = fd as u8; }
+                    sft_set_file(regs, fd as u16, size);
+                    if (fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
                     regs.clear_flag32(1);
@@ -2093,8 +2108,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                         Err(e) => -e,
                     };
                     if new_fd >= 0 {
-                        sft_set_file(new_fd as u16, 0);
-                        if (new_fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[new_fd as usize] = new_fd as u8; }
+                        sft_set_file(regs, new_fd as u16, 0);
+                        if (new_fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                         regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                         regs.rcx = (regs.rcx & !0xFFFF) | 3; // CX=3: file replaced
                         regs.clear_flag32(1);
@@ -2113,8 +2128,8 @@ fn int_21h(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
                     Err(e) => -e,
                 };
                 if new_fd >= 0 {
-                    sft_set_file(new_fd as u16, 0);
-                    if (new_fd as usize) < 20 { Psp::at(psp_struct_seg(dos)).jft[new_fd as usize] = new_fd as u8; }
+                    sft_set_file(regs, new_fd as u16, 0);
+                    if (new_fd as usize) < 20 { Psp::set_jft(regs, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
                     regs.clear_flag32(1);
@@ -2194,7 +2209,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     let len = regs.read::<u8>((addr) as usize) as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
-    cmd[..copy].copy_from_slice(crate::arch::mem().slice((addr + 1) as usize, copy));
+    regs.copy_from((addr + 1) as usize, &mut cmd[..copy]);
     let mut start = 0;
     while start < copy && cmd[start] == b' ' { start += 1; }
     let mut end = start;
@@ -2287,14 +2302,14 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction 
         // AX=0000h — reset / installation check.
         // Returns: AX=0xFFFF (driver installed), BX=number of buttons (2).
         0x0000 => {
-            m.erase_cursor();
+            m.erase_cursor(regs);
             *m = super::machine::MouseState::new();
             regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
             regs.rbx = (regs.rbx & !0xFFFF) | 2;
         }
         // AX=0001h — show cursor. AX=0002h — hide cursor.
-        0x0001 => m.show(),
-        0x0002 => m.hide(),
+        0x0001 => m.show(regs),
+        0x0002 => m.hide(regs),
         // AX=0003h — get position and button status.
         // BX=button mask, CX=x, DX=y.
         0x0003 => {
@@ -2306,7 +2321,7 @@ fn int_33h(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction 
         0x0004 => {
             m.x = (regs.rcx as i16).clamp(m.min_x, m.max_x);
             m.y = (regs.rdx as i16).clamp(m.min_y, m.max_y);
-            m.render_if_visible();
+            m.render_if_visible(regs);
         }
         // AX=0005h — get button press info. BX=button (0=left, 1=right, 2=mid).
         // Returns AX=button mask, BX=press count since last call (degenerate
@@ -2535,7 +2550,7 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs:
 /// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C
 /// which interprets BAT itself and uses synth INT 31h AH=01h to
 /// fork+exec+wait each external command in a separate thread.
-fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let al = regs.rax as u8;
     match al {
         0x00 => {}                                  // load & execute — fall through
@@ -2573,7 +2588,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let tail_len = regs.read::<u8>((cmdtail_addr) as usize) as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
-    tail[..copy_len].copy_from_slice(crate::arch::mem().slice((cmdtail_addr + 1) as usize, copy_len));
+    regs.copy_from((cmdtail_addr + 1) as usize, &mut tail[..copy_len]);
 
     let prog_name: &[u8] = &filename[..flen];
 
@@ -2639,9 +2654,9 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == parent_rm_psp => {
             dpmi.saved_rm_env
         }
-        _ => Psp::at(parent_rm_psp).env_seg,
+        _ => Psp::env_seg(regs, parent_rm_psp),
     };
-    let parent_env_vec = snapshot_env(parent_env_seg);
+    let parent_env_vec = snapshot_env(regs, parent_env_seg);
     let parent = ParentRef { psp_seg: parent_rm_psp, env: &parent_env_vec };
 
     // Save parent state before reseating the heap chain for the child.
@@ -2665,7 +2680,7 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     // exec_return restores `parent_blocks`, dropping whatever the child added.
 
     let loaded = if is_exe {
-        match load_exe(dos, &parent, &buf, &abs_dos[..abs_len]) {
+        match load_exe(regs, dos, &parent, &buf, &abs_dos[..abs_len]) {
             Some(l) => l,
             None => {
                 dos.heap_seg = parent_heap;
@@ -2673,19 +2688,19 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
                 dos.current_psp = parent_rm_psp;
                 dos.dta = parent_dta;
                 dos.dos_blocks = parent_blocks;
-                super::sync_mcb_chain(dos);
+                super::sync_mcb_chain(dos, regs);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
                 regs.set_flag32(1);
                 return thread::KernelAction::Done;
             }
         }
     } else {
-        load_com(dos, &parent, &buf, &abs_dos[..abs_len])
+        load_com(regs, dos, &parent, &buf, &abs_dos[..abs_len])
     };
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
     let psp_seg = loaded.psp_seg;
 
-    Psp::at(loaded.psp_seg).set_cmdline(&tail[..copy_len]);
+    Psp::set_cmdline(regs, loaded.psp_seg, &tail[..copy_len]);
     dos.dta = (psp_seg as u32) * 16 + 0x80;
     // DPMI host obligation: parent's PM state must not be observable to the
     // child (no PM handlers fire; child's DPMI entry, if any, allocates a
@@ -2707,18 +2722,18 @@ fn exec_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs:
     let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
     let mut parent_ivt = [(0u8, 0u16, 0u16); 12];
     for (slot, &int_num) in parent_ivt.iter_mut().zip(EXEC_SAVED_IVT_VECTORS.iter()) {
-        let off = read_u16(0, (int_num as u32) * 4);
-        let seg = read_u16(0, (int_num as u32) * 4 + 2);
+        let off = read_u16(regs, 0, (int_num as u32) * 4);
+        let seg = read_u16(regs, 0, (int_num as u32) * 4 + 2);
         *slot = (int_num, off, seg);
         if parent_pm_mode {
-            write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
-            write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
+            write_u16(regs, 0, (int_num as u32) * 4, slot_offset(int_num));
+            write_u16(regs, 0, (int_num as u32) * 4 + 2, STUB_SEG);
         }
     }
     super::dpmi::install_kernel_ldt_slots(dos);
     super::dpmi::reset_pm_vectors(dos);
     // Reload LDTR after swapping in the child LDT.
-    dos.on_resume();
+    dos.on_resume(machine);
     dos.exec_parent = Some(ExecParent {
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
@@ -2842,21 +2857,20 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
         }
 
         let img = &data[header_size as usize..header_size as usize + load_size];
-        crate::arch::mem().write_bytes(load_base as usize, img);
+        regs.copy_to(load_base as usize, img);
         // Apply relocations using caller's reloc_factor (not load_seg).
         for i in 0..reloc_count {
             let entry = reloc_offset + i * 4;
             let off = w(entry) as u32;
             let seg = w(entry + 2) as u32;
             let a = (load_base + (seg << 4) + off) as usize;
-            let m = crate::arch::mem();
-            let v: u16 = m.read(a);
-            m.write::<u16>(a, v.wrapping_add(reloc_factor));
+            let v: u16 = regs.read(a);
+            regs.write::<u16>(a, v.wrapping_add(reloc_factor));
         }
         dos_trace!("D21 4B03 MZ loaded: load_size={} relocs={}", load_size, reloc_count);
     } else {
         // Raw / .COM: copy file verbatim at load_seg:0.
-        crate::arch::mem().write_bytes(load_base as usize, &buf);
+        regs.copy_to(load_base as usize, &buf);
         dos_trace!("D21 4B03 raw loaded: size={}", buf.len());
     }
 
@@ -2866,7 +2880,7 @@ fn exec_load_overlay(kt: &mut thread::KernelThread, dos: &mut thread::DosState, 
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return(dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
+fn exec_return(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
     crate::dbg_println!("exec_return: parent ss:sp={:04X}:{:04X} ds={:04X} es={:04X} heap={:04X} psp={:04X}",
         parent.ss, parent.sp, parent.ds, parent.es, parent.heap_seg, parent.psp);
@@ -2902,11 +2916,11 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
     dos.current_psp = parent.psp;
     dos.dta = parent.dta;
     dos.dos_blocks = parent.dos_blocks;
-    super::sync_mcb_chain(dos);
+    super::sync_mcb_chain(dos, regs);
     if parent.pm_mode && !preserve_pm_env {
         for &(int_num, off, seg) in parent.ivt_vectors.iter() {
-            write_u16(0, (int_num as u32) * 4, off);
-            write_u16(0, (int_num as u32) * 4 + 2, seg);
+            write_u16(regs, 0, (int_num as u32) * 4, off);
+            write_u16(regs, 0, (int_num as u32) * 4 + 2, seg);
         }
     }
     // PM-environment handling on exec_return:
@@ -2932,7 +2946,7 @@ fn exec_return(dos: &mut thread::DosState, regs: &mut Vcpu, parent: ExecParent,
     }
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
-    dos.on_resume();
+    dos.on_resume(machine);
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }
@@ -3052,7 +3066,7 @@ fn find_matching_file(dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::Ke
                     regs.write::<u8>(dta + 0x15, if is_dir { 0x10 } else { 0x20 });
                     regs.write::<u32>(dta + 0x1A, size);
                     let name_len = alias.len().min(12);
-                    regs.write_bytes(dta + 0x1E, &alias[..name_len]);
+                    regs.copy_to(dta + 0x1E, &alias[..name_len]);
                     regs.write::<u8>(dta + 0x1E + name_len, 0);
                     regs.clear_flag32(1);
                     return thread::KernelAction::Done;
@@ -3090,6 +3104,7 @@ const SFT_ENTRIES: usize = 20;
 /// for any guest code that walks the structure directly.
 ///
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub(super) struct Psp {
     pub int_20:           [u8; 2],   // 0x00 — CD 20 (terminate)
     pub top_of_mem:       u16,        // 0x02 — segment past program (paragraphs)
@@ -3111,20 +3126,31 @@ pub(super) struct Psp {
 }
 const _: () = assert!(core::mem::size_of::<Psp>() == 256);
 impl Psp {
-    /// Borrow the PSP at `psp_seg`. The 256-byte PSP is `[psp_seg<<4 ..
-    /// (psp_seg+0x10)<<4)`. Single-threaded kernel; the borrow checker
-    /// treats successive calls as independent borrows.
-    pub fn at(psp_seg: u16) -> &'static mut Self {
-        crate::arch::mem().at::<Self>(((psp_seg as u32) << 4) as usize)
+    /// Linear base of the 256-byte PSP at `psp_seg` (`[psp_seg<<4 ..]`).
+    #[inline]
+    fn base(psp_seg: u16) -> usize { ((psp_seg as u32) << 4) as usize }
+    /// Write the whole PSP at `psp_seg`.
+    pub fn store(regs: &mut Vcpu, psp_seg: u16, psp: Self) { regs.write::<Self>(Self::base(psp_seg), psp); }
+    /// Read PSP[0x2C] (environment segment or selector).
+    pub fn env_seg(regs: &Vcpu, psp_seg: u16) -> u16 {
+        regs.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
     }
-    #[allow(dead_code)]
-    pub fn psp_seg(&self) -> u16 { (self as *const _ as u32 >> 4) as u16 }
+    /// Set one Job File Table entry (PSP[0x18 + idx]).
+    pub fn set_jft(regs: &mut Vcpu, psp_seg: u16, idx: usize, val: u8) {
+        regs.write::<u8>(Self::base(psp_seg) + core::mem::offset_of!(Self, jft) + idx, val);
+    }
+    /// Set the JFT size field (PSP[0x32]).
+    pub fn set_max_files(regs: &mut Vcpu, psp_seg: u16, n: u16) {
+        regs.write::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files), n);
+    }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
-    pub fn set_cmdline(&mut self, tail: &[u8]) {
-        let n = tail.len().min(self.cmdline.len() - 1);
-        self.cmdline_len = n as u8;
-        self.cmdline[..n].copy_from_slice(&tail[..n]);
-        self.cmdline[n] = 0x0D;
+    pub fn set_cmdline(regs: &mut Vcpu, psp_seg: u16, tail: &[u8]) {
+        let n = tail.len().min(126);
+        let base = Self::base(psp_seg);
+        regs.write::<u8>(base + core::mem::offset_of!(Self, cmdline_len), n as u8);
+        let cmd = base + core::mem::offset_of!(Self, cmdline);
+        regs.copy_to(cmd, &tail[..n]);
+        regs.write::<u8>(cmd + n, 0x0D);
     }
 }
 impl Default for Psp {
@@ -3133,6 +3159,7 @@ impl Default for Psp {
 
 /// One System File Table entry (DOS 3+ format, 59 bytes).
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct SftEntry {
     refcount: u16,        // 0x00
     open_mode: u16,       // 0x02
@@ -3152,6 +3179,7 @@ impl Default for SftEntry {
 
 /// SFT header followed by the entry array. Total 1186 bytes.
 #[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
 struct Sft {
     next: u32,                       // 0x00 — far ptr to next SFT block (FFFF:FFFF = end)
     count: u16,                      // 0x04
@@ -3161,6 +3189,7 @@ struct Sft {
 /// List-of-Lists (DOS internal). Only the fields we actually fill are named;
 /// the rest is reserved padding.
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct Lol {
     _reserved_00: [u8; 4],
     sft_off: u16,                    // 0x04 — far ptr to SFT (off, seg)
@@ -3180,6 +3209,7 @@ impl Default for Lol {
 
 /// Current Directory Structure (one per drive letter, DOS 3.3 format).
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct CdsEntry {
     path: [u8; 67],                  // 0x00 — ASCIIZ (e.g. "C:\")
     flags: u16,                      // 0x43 — 0x4000 = valid physical drive
@@ -3225,7 +3255,7 @@ struct LowMem {
     /// return. Two aliasing LDT selectors (PM16 with B=0, PM32 with
     /// B=1) point at this same buffer so SP values are portable across
     /// client bitness.
-    host_stack: [u8; 4096],
+    host_stack: [u8; HOST_STACK_SIZE],
 
     /// Dedicated RM stack — host-provided buffer used by all kernel-
     /// orchestrated RM execution (BIOS reflection from PM, DPMI
@@ -3244,22 +3274,26 @@ struct LowMem {
     /// QEMU's SeaBIOS). 4 KB matches what real DPMI extenders provide and
     /// leaves ample headroom, incl. LIFO-nested excursions. Paragraph-aligned
     /// because `host_stack` precedes it and is a multiple of 16 in size.
-    rm_stack: [u8; 0x1000],
+    rm_stack: [u8; RM_STACK_SIZE],
 }
 
-/// Borrow the kernel-owned low-mem area as a typed `&'static mut`.
-/// Single-threaded kernel; the borrow checker treats successive calls as
-/// independent borrows, so callers must avoid actually aliasing the data.
+/// Locked PM stack size (see `LowMem::host_stack`).
+const HOST_STACK_SIZE: usize = 4096;
+/// Dedicated RM stack size (see `LowMem::rm_stack`).
+const RM_STACK_SIZE: usize = 0x1000;
+
+/// Linear address of a `LowMem` field, e.g. `lm_field(offset_of!(LowMem, lol))`.
+/// The kernel-owned low-mem area is a *projection* written into guest memory
+/// field-by-field through the vcpu — never borrowed as a Rust struct (it sits at
+/// a fixed low address the guest can also reach).
 #[inline]
-fn low_mem() -> &'static mut LowMem {
-    crate::arch::mem().at::<LowMem>(LOW_MEM_BASE as usize)
-}
+fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 
 /// Update the chain-head pointer that lives at `[LOL - 2]`. Called from
 /// `sync_mcb_chain` so AH=52h-style chain walkers see the current
 /// `heap_base_seg`.
-pub(super) fn set_first_mcb_seg(seg: u16) {
-    low_mem().first_mcb_seg = seg;
+pub(super) fn set_first_mcb_seg(regs: &mut Vcpu, seg: u16) {
+    regs.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
 }
 
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
@@ -3275,12 +3309,6 @@ pub(super) fn heap_start() -> u16 {
     ((end + 15) >> 4) as u16
 }
 
-/// The system Program (master env + stand-in PSP) used as bootstrap parent
-/// for the initial DOS thread and as chain-terminator for PSP[0x16].
-#[allow(dead_code)]
-pub(super) fn boot_psp() -> &'static mut Psp {
-    &mut low_mem().boot_psp
-}
 pub(super) fn boot_psp_seg() -> u16 {
     ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16
 }
@@ -3298,7 +3326,7 @@ pub(super) fn host_stack_base() -> u32 {
     LOW_MEM_BASE + core::mem::offset_of!(LowMem, host_stack) as u32
 }
 pub(super) fn host_stack_size() -> u32 {
-    core::mem::size_of_val(&low_mem().host_stack) as u32
+    HOST_STACK_SIZE as u32
 }
 /// SP value within `HOST_STACK_PM*_SEL` for an empty locked stack. The
 /// selectors have base = host_stack_base() and limit = size−1, so the
@@ -3318,7 +3346,7 @@ pub(super) fn rm_stack_base() -> u32 {
     LOW_MEM_BASE + core::mem::offset_of!(LowMem, rm_stack) as u32
 }
 pub(super) fn rm_stack_size() -> u32 {
-    core::mem::size_of_val(&low_mem().rm_stack) as u32
+    RM_STACK_SIZE as u32
 }
 pub(super) fn rm_stack_seg() -> u16 {
     (rm_stack_base() >> 4) as u16
@@ -3364,19 +3392,6 @@ fn trim_ws(s: &[u8]) -> &[u8] {
     while start < end && matches!(s[start], b' ' | b'\t' | b'\r') { start += 1; }
     while end > start && matches!(s[end-1], b' ' | b'\t' | b'\r') { end -= 1; }
     &s[start..end]
-}
-
-/// Borrow `len` bytes of an env block at `env_seg` as a writable slice.
-/// Used by `fill_env` to populate a freshly-allocated env block.
-pub(super) fn env_bytes_mut(env_seg: u16, len: usize) -> &'static mut [u8] {
-    crate::arch::mem().slice_mut(((env_seg as u32) << 4) as usize, len)
-}
-
-/// Borrow the env block at `env_seg` as a read-only slice up to the
-/// `00 00` terminator (or `len` bytes max). Used to inherit a parent's
-/// env into a child via `fill_env`.
-pub(super) fn env_bytes(env_seg: u16, len: usize) -> &'static [u8] {
-    crate::arch::mem().slice(((env_seg as u32) << 4) as usize, len)
 }
 
 /// What a child inherits from its parent: PSP segment (for child's PSP[0x16])
@@ -3467,11 +3482,12 @@ pub(crate) const SLOT_RESUME_CONTINUATION: u8 = 0x02;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
-pub(super) fn setup_ivt() {
+pub(super) fn setup_ivt(regs: &mut Vcpu) {
     // Fill the stub array with `CD 31` so any slot reached by an IVT entry
     // (or PM CALL FAR) traps to STUB_INT and the slot dispatcher.
-    for entry in low_mem().stubs.iter_mut() {
-        *entry = [0xCD, STUB_INT];
+    let stubs = lm_field(core::mem::offset_of!(LowMem, stubs));
+    for i in 0..256 {
+        regs.write::<[u8; 2]>(stubs + i * 2, [0xCD, STUB_INT]);
     }
 
     // HW IRQ vectors (0x08-0x0F + 0x70-0x77) are left pointing at the
@@ -3482,11 +3498,11 @@ pub(super) fn setup_ivt() {
     // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
     // dispatcher (slot index = INT vector).
     for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67] {
-        write_u16(0, (int_num as u32) * 4, slot_offset(int_num));
-        write_u16(0, (int_num as u32) * 4 + 2, STUB_SEG);
+        write_u16(regs, 0, (int_num as u32) * 4, slot_offset(int_num));
+        write_u16(regs, 0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
-    setup_lol_sft();
-    xms::scan_uma();
+    setup_lol_sft(regs);
+    xms::scan_uma(regs);
 
     // Force NumLock OFF in the BIOS keyboard-flags byte (40:17 bit 5). The
     // grey arrow keys are E0-stripped down to their numpad twins (Up == 0x48
@@ -3494,30 +3510,28 @@ pub(super) fn setup_ivt() {
     // renders them as digits ('8'/'2') instead of navigation — and a laptop
     // keyboard may have no NumLock key to clear it. 86box boots NumLock on;
     // QEMU/Bochs boot it off, which is why arrows worked there.
-    let kbd_flags = read_u16(0x40, 0x17) & !0x0020;
-    write_u16(0x40, 0x17, kbd_flags);
+    let kbd_flags = read_u16(regs, 0x40, 0x17) & !0x0020;
+    write_u16(regs, 0x40, 0x17, kbd_flags);
 }
 
-fn setup_lol_sft() {
+fn setup_lol_sft(regs: &mut Vcpu) {
     let sft_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
     let cds_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
-
-    let lm = low_mem();
+    let boot_seg = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16;
 
     // Bootstrap sentinel PSP: self-referencing parent_psp terminates any
     // PSP[0x16] walk, env_seg = 0 (env defaults live in MASTER_ENV
     // const, not on the chain). The cmdline area at 0x80+ is otherwise
     // unused and gives us a permanent zero byte at the INDOS-flag offset.
-    let boot_seg = (&raw const lm.boot_psp as u32 >> 4) as u16;
-    lm.boot_psp = Psp {
+    Psp::store(regs, boot_seg, Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
         parent_psp: boot_seg,         // self-ref terminates the parent chain
         env_seg: 0,
         ..Default::default()
-    };
+    });
 
-    lm.lol = Lol {
+    let lol = Lol {
         sft_off: (sft_addr & 0xF) as u16,
         sft_seg: (sft_addr >> 4) as u16,
         cds_off: (cds_addr & 0xF) as u16,
@@ -3526,19 +3540,21 @@ fn setup_lol_sft() {
         last_drive: NUM_DRIVES,
         ..Default::default()
     };
+    regs.write::<Lol>(lm_field(core::mem::offset_of!(LowMem, lol)), lol);
 
     // SFT header: end-of-chain link, entry count + zeroed entries; then
     // pre-populate stdin/stdout/stderr as character devices.
-    lm.sft = unsafe { core::mem::zeroed() };
-    lm.sft.next = 0xFFFF_FFFF;
-    lm.sft.count = SFT_ENTRIES as u16;
+    let mut sft = Sft::default();
+    sft.next = 0xFFFF_FFFF;
+    sft.count = SFT_ENTRIES as u16;
     for fd in 0..3 {
-        lm.sft.entries[fd] = SftEntry {
+        sft.entries[fd] = SftEntry {
             refcount: 1,
             device_info: if fd == 0 { 0x81 } else { 0x82 },
             ..Default::default()
         };
     }
+    regs.write::<Sft>(lm_field(core::mem::offset_of!(LowMem, sft)), sft);
 
     // CDS: drive 2 = C:\, drive 7 = H:\ (hostfs). Others stay invalid.
     let mk = |drive_letter: u8| -> CdsEntry {
@@ -3550,29 +3566,37 @@ fn setup_lol_sft() {
         e.backslash_off = 2;
         e
     };
-    lm.cds = [(); NUM_DRIVES as usize].map(|_| CdsEntry::default());
-    lm.cds[2] = mk(b'C');
-    lm.cds[7] = mk(b'H');
+    let mut cds = [(); NUM_DRIVES as usize].map(|_| CdsEntry::default());
+    cds[2] = mk(b'C');
+    cds[7] = mk(b'H');
+    regs.write::<[CdsEntry; NUM_DRIVES as usize]>(lm_field(core::mem::offset_of!(LowMem, cds)), cds);
 }
 
 
+/// Linear address of `LowMem.sft.entries[handle]`.
+#[inline]
+fn sft_entry_addr(handle: usize) -> usize {
+    lm_field(core::mem::offset_of!(LowMem, sft) + core::mem::offset_of!(Sft, entries)
+        + handle * core::mem::size_of::<SftEntry>())
+}
+
 /// Populate SFT entry for a newly opened file handle.
-fn sft_set_file(handle: u16, size: u32) {
+fn sft_set_file(regs: &mut Vcpu, handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
-    low_mem().sft.entries[handle as usize] = SftEntry {
+    regs.write::<SftEntry>(sft_entry_addr(handle as usize), SftEntry {
         refcount: 1,
         attribute: 0x20,    // archive
         time: 0x6000,       // 12:00:00
         date: 0x5C76,       // 2026-03-22
         size,
         ..Default::default()
-    };
+    });
 }
 
 /// Clear SFT entry when a file handle is closed.
-fn sft_clear(handle: u16) {
+fn sft_clear(regs: &mut Vcpu, handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
-    low_mem().sft.entries[handle as usize].refcount = 0;
+    regs.write::<u16>(sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount), 0);
 }
 
 // ============================================================================
@@ -3616,13 +3640,13 @@ fn fill_env(env: &mut [u8], parent_env: &[u8], prog_name: &[u8]) {
 
 /// Initialize a freshly-allocated PSP at `psp_seg` to point at its env
 /// block at `env_seg`, with parent_psp / JFT / cmdline default fields set.
-fn init_psp(psp_seg: u16, env_seg: u16, parent_psp: u16) {
+fn init_psp(regs: &mut Vcpu, psp_seg: u16, env_seg: u16, parent_psp: u16) {
     let mut jft = [0xFFu8; 20];
     jft[0] = 0; jft[1] = 1; jft[2] = 2;   // stdin/stdout/stderr → SFT 0/1/2
     let mut cmdline = [0u8; 127];
     cmdline[0] = 0x0D;                      // empty tail terminated by CR
 
-    *Psp::at(psp_seg) = Psp {
+    Psp::store(regs, psp_seg, Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
         parent_psp,
@@ -3634,9 +3658,10 @@ fn init_psp(psp_seg: u16, env_seg: u16, parent_psp: u16) {
         cmdline_len: 0,
         cmdline,
         ..Default::default()
-    };
+    });
 
-    let env = env_bytes(env_seg, 80);
+    let mut env = [0u8; 80];
+    regs.copy_from((env_seg as usize) << 4, &mut env);
     let mut dump = [0u8; 80];
     for (i, &b) in env.iter().enumerate() {
         dump[i] = if b == 0 { b'.' } else if b < 32 || b >= 127 { b'?' } else { b };
@@ -3655,11 +3680,11 @@ pub(super) fn is_mz_exe(data: &[u8]) -> bool {
 /// separate AH=48-style allocations on `dos`'s MCB chain, exactly like
 /// real DOS does on `INT 21h AH=4B EXEC`. Returns `(env_seg, psp_seg,
 /// end_seg)`.
-fn alloc_program_blocks(dos: &mut thread::DosState, prog_paras: u16)
+fn alloc_program_blocks(dos: &mut thread::DosState, regs: &mut Vcpu, prog_paras: u16)
     -> Result<(u16, u16, u16), ()>
 {
-    let env_seg = dos_alloc_block(dos, ENV_PARAS).map_err(|_| ())?;
-    let psp_seg = dos_alloc_block(dos, prog_paras).map_err(|_| ())?;
+    let env_seg = dos_alloc_block(dos, regs, ENV_PARAS).map_err(|_| ())?;
+    let psp_seg = dos_alloc_block(dos, regs, prog_paras).map_err(|_| ())?;
     let end_seg = psp_seg.wrapping_add(prog_paras);
     Ok((env_seg, psp_seg, end_seg))
 }
@@ -3667,31 +3692,34 @@ fn alloc_program_blocks(dos: &mut thread::DosState, prog_paras: u16)
 /// Populate the env block + PSP + load module for a freshly-allocated
 /// program. Common to `load_exe` and `load_com`. Sets `dos.current_psp`
 /// and re-syncs the MCB chain so block ownership reflects the new PSP.
-fn populate_program(dos: &mut thread::DosState, env_seg: u16, psp_seg: u16,
+fn populate_program(regs: &mut Vcpu, dos: &mut thread::DosState, env_seg: u16, psp_seg: u16,
                     parent: &ParentRef, prog_name: &[u8]) {
-    fill_env(env_bytes_mut(env_seg, (ENV_PARAS as usize) * 16),
-             parent.env, prog_name);
+    // Build the env arena in a local buffer, write it to guest memory, and
+    // read the BLASTER config from the same buffer (no second guest read).
+    let mut env = alloc::vec![0u8; (ENV_PARAS as usize) * 16];
+    fill_env(&mut env, parent.env, prog_name);
+    regs.copy_to(((env_seg as u32) << 4) as usize, &env);
     // Latch this program's BLASTER A/I/D/H into the SB-DMA layer so the
     // virtual 8237 traps the right channel and the IRQ relay uses the
     // right vector. Missing BLASTER leaves the SB16 defaults.
-    dos.pc.sb.configure_from_env(env_bytes(env_seg, (ENV_PARAS as usize) * 16));
-    init_psp(psp_seg, env_seg, parent.psp_seg);
+    dos.pc.sb.configure_from_env(&env);
+    init_psp(regs, psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
-    dos_set_program_block_owner(dos, env_seg, psp_seg, psp_seg);
+    dos_set_program_block_owner(dos, regs, env_seg, psp_seg, psp_seg);
 }
 
 /// Load a .COM binary. Allocates env + program block (1000h paragraphs =
 /// 64 KB, the standard .COM arena), populates env/PSP/code. Stack at
 /// PSP:COM_SP (top of 64 KB segment), code at (psp+0x10):0000.
-pub(super) fn load_com(dos: &mut thread::DosState, parent: &ParentRef,
+pub(super) fn load_com(regs: &mut Vcpu, dos: &mut thread::DosState, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Loaded {
-    let (env_seg, psp_seg, end_seg) = alloc_program_blocks(dos, 0x1000)
+    let (env_seg, psp_seg, end_seg) = alloc_program_blocks(dos, regs, 0x1000)
         .expect("load_com: allocation failed");
-    populate_program(dos, env_seg, psp_seg, parent, prog_name);
+    populate_program(regs, dos, env_seg, psp_seg, parent, prog_name);
 
     // Load .COM code at psp_seg:0x100 (= (psp_seg+0x10):0).
     let load_addr = ((psp_seg as u32) << 4) + COM_OFFSET as u32;
-    crate::arch::mem().write_bytes(load_addr as usize, data);
+    regs.copy_to(load_addr as usize, data);
 
     Loaded {
         env_seg, psp_seg,
@@ -3713,7 +3741,7 @@ pub(super) fn load_com(dos: &mut thread::DosState, parent: &ParentRef,
 ///   0x14: initial IP
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
-pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
+pub(super) fn load_exe(regs: &mut Vcpu, dos: &mut thread::DosState, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Option<Loaded> {
     if data.len() < 28 { return None; }
 
@@ -3753,28 +3781,28 @@ pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
     // then size the program to the largest remaining free region so it lands
     // in one contiguous block that never overlaps a still-live parent (e.g.
     // BC's PM CS alias). exec_return drops these blocks when the child exits.
-    let env_seg = dos_alloc_block(dos, ENV_PARAS).ok()?;
+    let env_seg = dos_alloc_block(dos, regs, ENV_PARAS).ok()?;
     let avail = super::largest_dos_block(dos);
     let base_paras = 0x10u16.saturating_add(load_paras);
     let floor = base_paras.saturating_add(min_extra as u16);
     if avail < floor { return None; }
     let prog_paras = base_paras.saturating_add(max_extra as u16).min(avail).max(floor);
-    let psp_seg = dos_alloc_block(dos, prog_paras).ok()?;
+    let psp_seg = dos_alloc_block(dos, regs, prog_paras).ok()?;
     let end_seg = psp_seg.wrapping_add(prog_paras);
-    populate_program(dos, env_seg, psp_seg, parent, prog_name);
+    populate_program(regs, dos, env_seg, psp_seg, parent, prog_name);
 
     // Load module starts 0x10 paragraphs after the PSP.
     let load_segment = psp_seg + 0x10;
 
     let load_base = (load_segment as u32) << 4;
     let load_data = &data[header_size as usize..header_size as usize + load_size];
-    crate::arch::mem().write_bytes(load_base as usize, load_data);
+    regs.copy_to(load_base as usize, load_data);
 
     // Zero the allocation tail so re-exec cannot expose stale data past the image.
     let bss_start = load_base + load_size as u32;
     let bss_end = (end_seg as u32) << 4;
     if bss_end > bss_start {
-        crate::arch::mem().zero(bss_start as usize, (bss_end - bss_start) as usize);
+        regs.zero(bss_start as usize, (bss_end - bss_start) as usize);
     }
 
     // Apply relocations: each entry is (offset, segment) within the load
@@ -3786,9 +3814,8 @@ pub(super) fn load_exe(dos: &mut thread::DosState, parent: &ParentRef,
         let off = w(entry) as u32;
         let seg = w(entry + 2) as u32;
         let addr = (load_base + (seg << 4) + off) as usize;
-        let m = crate::arch::mem();
-        let val: u16 = m.read(addr);
-        m.write::<u16>(addr, val.wrapping_add(load_segment));
+        let val: u16 = regs.read(addr);
+        regs.write::<u16>(addr, val.wrapping_add(load_segment));
     }
 
     Some(Loaded {

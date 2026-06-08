@@ -15,6 +15,8 @@
 
 extern crate alloc;
 
+use arch_abi::Arch;
+use arch_abi::GuestBytes;
 use crate::Regs;
 use crate::arch::Vcpu;
 
@@ -208,7 +210,7 @@ impl MouseState {
     ///   0x10 = right button released
     ///   0x20 = middle button pressed
     ///   0x40 = middle button released
-    pub fn apply_packet(&mut self, dx: i16, dy: i16, buttons: u8) -> u16 {
+    pub fn apply_packet(&mut self, regs: &mut Vcpu, dx: i16, dy: i16, buttons: u8) -> u16 {
         self.accum_dx = self.accum_dx.saturating_add(dx as i32);
         self.accum_dy = self.accum_dy.saturating_add(dy as i32);
         self.x = (self.x as i32 + dx as i32).clamp(self.min_x as i32, self.max_x as i32) as i16;
@@ -216,7 +218,7 @@ impl MouseState {
         let prev = self.buttons;
         let cur = buttons;
         self.buttons = cur;
-        self.render_if_visible();
+        self.render_if_visible(regs);
 
         let mut cond: u16 = 0;
         if dx != 0 || dy != 0 { cond |= 0x01; }
@@ -251,37 +253,36 @@ impl MouseState {
     /// already drawn at this cell. Real Microsoft Mouse drivers also do this
     /// in graphics modes via a sprite — we don't (yet); games that go to
     /// mode 13h hide the driver cursor and draw their own anyway.
-    pub fn render_if_visible(&mut self) {
+    pub fn render_if_visible(&mut self, regs: &mut Vcpu) {
         if self.show_count > 0 { return; }
         let col = (self.x >> 3) as u32;
         let row = (self.y >> 3) as u32;
         if col >= 80 || row >= 25 { return; }
         let offset = (row * 80 + col) as u16;
         if Some(offset) == self.drawn_at { return; }
-        self.erase_cursor();
+        self.erase_cursor(regs);
         let attr = (VGA_TEXT_BASE + offset as u32 * 2 + 1) as usize;
-        let m = crate::arch::mem();
-        self.saved_attr = m.read::<u8>(attr);
-        m.write::<u8>(attr, self.saved_attr ^ 0x77);
+        self.saved_attr = regs.read::<u8>(attr);
+        regs.write::<u8>(attr, self.saved_attr ^ 0x77);
         self.drawn_at = Some(offset);
     }
 
     /// Restore the original attribute under the current cursor cell.
-    pub fn erase_cursor(&mut self) {
+    pub fn erase_cursor(&mut self, regs: &mut Vcpu) {
         if let Some(old) = self.drawn_at.take() {
-            crate::arch::mem().write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
+            regs.write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
         }
     }
 
     /// AX=01h — show cursor: decrement counter; if it just reached 0, draw.
-    pub fn show(&mut self) {
+    pub fn show(&mut self, regs: &mut Vcpu) {
         self.show_count -= 1;
-        self.render_if_visible();
+        self.render_if_visible(regs);
     }
 
     /// AX=02h — hide cursor: increment counter; if it was 0, erase.
-    pub fn hide(&mut self) {
-        if self.show_count <= 0 { self.erase_cursor(); }
+    pub fn hide(&mut self, regs: &mut Vcpu) {
+        if self.show_count <= 0 { self.erase_cursor(regs); }
         self.show_count += 1;
     }
 }
@@ -294,19 +295,19 @@ impl PcMachine {
         self.vpic.has_deliverable() || (self.mouse.cb_mask & self.mouse.pending_cond != 0)
     }
 
-    pub fn new() -> Self {
+    pub fn new(machine: &mut crate::TheArch) -> Self {
         // A20 starts disabled. HMA_PAGE wraps to user's private low memory
         // by copying entries[0..16]. HMA_SHADOW_PAGE is left not-present
         // (arch_user_clean cleared it; map_low_mem_user doesn't touch it),
         // which is the correct A20-on state when no extended memory is
         // allocated — set_a20(true) will swap not-present into HMA_PAGE
         // so HMA accesses fault until XMS maps real extended memory.
-        crate::arch::arch_copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
+        machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
         Self {
             a20_enabled: false,
-            vpit: VirtualPit::new(),
+            vpit: VirtualPit::new(machine),
             vpic: VirtualPic::new(),
-            vrtc: VirtualRtc::new(),
+            vrtc: VirtualRtc::new(machine),
             vkbd: VirtualKeyboard::new(),
             mouse: MouseState::new(),
             skip_irq: false,
@@ -319,11 +320,11 @@ impl PcMachine {
     }
 
     /// Toggle A20 gate: HMA either sees shadow (real content) or wraps to page 0.
-    pub fn set_a20(&mut self, enabled: bool) {
+    pub fn set_a20(&mut self, machine: &mut crate::TheArch, enabled: bool) {
         if enabled == self.a20_enabled { return; }
         // Shadow always holds the opposite of what's in HMA.
         // Swap them to toggle.
-        crate::arch::arch_swap_page_entries(HMA_SHADOW_PAGE, HMA_PAGE, HMA_PAGE_COUNT);
+        machine.swap_page_entries(HMA_SHADOW_PAGE, HMA_PAGE, HMA_PAGE_COUNT);
         self.a20_enabled = enabled;
     }
 }
@@ -345,7 +346,7 @@ pub(super) use vkbd::*;
 // ============================================================================
 
 /// Emulate IN from a port using the virtual peripherals.
-pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
+pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) -> u8 {
     // ISA decodes only A0-A9, so I/O ports alias mod 0x400 (e.g. a
     // gameport at 0x208 also answers 0x608). DOS-era code relies on
     // this; the whole DOS I/O surface is <= 0x3FF. Fold the alias
@@ -377,7 +378,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
-            let real = crate::arch::inb(0x3DA);
+            let real = machine.inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
             // QEMU's 0x3DA bit 3 (vsync) doesn't sweep a raster in our setup, so
             // a passthrough hangs Wolf3D's VL_WaitVBL — under QEMU we fabricate.
@@ -386,7 +387,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
             if !crate::kernel::startup::is_qemu() {
                 return real;
             }
-            let ticks = crate::arch::get_ticks();
+            let ticks = machine.get_ticks();
             let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
             let vr = phase >= 24;
             use core::sync::atomic::{AtomicU32, Ordering};
@@ -395,11 +396,11 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
             (if vr { 0x08 } else { 0 }) | (if vr || hbl { 0x01 } else { 0 })
         }
         // VGA ports — pass through to hardware
-        0x3C0..=0x3D9 | 0x3DB..=0x3DF => crate::arch::inb(port),
+        0x3C0..=0x3D9 | 0x3DB..=0x3DF => machine.inb(port),
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
         // to configure QEMU's emulated VGA, even for legacy modes.
         // Pass through so SeaBIOS sees real VBE state.
-        0x01CE | 0x01CF | 0x01D0 => crate::arch::inb(port),
+        0x01CE | 0x01CF | 0x01D0 => machine.inb(port),
         // Gameport (joystick): we don't model a Sound Blaster or dedicated
         // gameport card, so on the ISA bus the gameport is unpopulated —
         // reads return 0xFF (floating data lines, weakly pulled high by
@@ -445,7 +446,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
             };
             if ready { 1 } else { 0 }
         }
-        0x40 => pc.vpit.read_counter0(),
+        0x40 => pc.vpit.read_counter0(machine),
         0x41 | 0x42 => 0,
         // PIT command register not readable
         0x43 => 0xFF,
@@ -457,19 +458,19 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
         // Host CMOS isn't used by the kernel itself, so the passthrough is safe.
         0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.read(pc.cmos_index),
         0x71 => {
-            crate::arch::outb(0x70, pc.cmos_index);
-            crate::arch::inb(0x71)
+            machine.outb(0x70, pc.cmos_index);
+            machine.inb(0x71)
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            let v = pc.sb.sb_read(p);
+            let v = pc.sb.sb_read(machine, p);
             v
         }
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
         // poll it for DMA progress, not just completion).
         p if Dma8237::owns(p) =>
-            pc.sb.dma_read(p),
+            pc.sb.dma_read(machine, p),
         // Unknown ports read as an unpopulated ISA bus and are logged for missing-device coverage.
         _ => {
             crate::dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
@@ -479,7 +480,7 @@ pub fn emulate_inb(pc: &mut PcMachine, port: u16) -> u8 {
 }
 
 /// Emulate OUT to a port.
-pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
+pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, val: u8) {
     // ISA 10-bit I/O decode — fold the alias mod 0x400. See `emulate_inb`.
     let port = port & 0x3FF;
     match port {
@@ -491,11 +492,11 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 }
                 VGA_AC_STATE.pending_data = !VGA_AC_STATE.pending_data;
             }
-            crate::arch::outb(port, val);
+            machine.outb(port, val);
         }
-        0x3C1..=0x3DF => crate::arch::outb(port, val),
+        0x3C1..=0x3DF => machine.outb(port, val),
         // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.
-        0x01CE | 0x01CF | 0x01D0 => crate::arch::outb(port, val),
+        0x01CE | 0x01CF | 0x01D0 => machine.outb(port, val),
         // Master PIC command
         0x20 => {
             if val == 0x20 {
@@ -506,7 +507,7 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
                 let sb_in_service = pc.sb.irq < 8 && pc.vpic.in_service(pc.sb.irq);
                 pc.vpic.master_eoi();
                 if sb_in_service {
-                    crate::arch::arch_rearm_irq(5);
+                    machine.rearm_irq(5);
                 }
                 // Real hardware re-asserts IRQ1 if more scancodes remain in the
                 // controller when the handler finishes. Since reads no longer
@@ -544,8 +545,8 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         0x61 => pc.vkbd.write_port61(val),
         // Keyboard controller command
         0x64 => {}
-        0x43 => pc.vpit.write_command(val),
-        0x40 => pc.vpit.write_counter0(val),
+        0x43 => pc.vpit.write_command(machine, val),
+        0x40 => pc.vpit.write_counter0(machine, val),
         0x41 | 0x42 => {}
         // CMOS index: latch for the next data-port read. Mask off the NMI
         // disable bit (0x80) — we never want guest writes to toggle host NMI.
@@ -553,18 +554,18 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
         // CMOS data writes to the virtual RTC status registers (A/B/C) drive
         // the periodic-interrupt model; writes to any other index are dropped
         // so the guest can never mutate host CMOS (time-of-day, alarm, etc.).
-        0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.write(pc.cmos_index, val),
+        0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.write(machine, pc.cmos_index, val),
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            pc.sb.sb_write(p, val);
+            pc.sb.sb_write(machine, p, val);
         }
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.
         p if Dma8237::owns(p) => {
-            pc.sb.dma.io_write(p, val);
-            pc.sb.maybe_remap();
+            pc.sb.dma.io_write(machine, p, val);
+            pc.sb.maybe_remap(machine, regs);
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {
@@ -579,52 +580,52 @@ pub fn emulate_outb(pc: &mut PcMachine, port: u16, val: u8) {
 
 /// Resolve the linear base of segment `sel`. VM86 uses `sel*16`; PM walks
 /// GDT/LDT via the arch descriptor helpers.
-fn seg_base_for(regs: &Vcpu, sel: u16) -> u32 {
+fn seg_base_for(machine: &mut crate::TheArch, regs: &Vcpu, sel: u16) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         (sel as u32) << 4
     } else {
-        crate::arch::monitor::seg_base(sel)
+        machine.seg_base(sel)
     }
 }
 
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
 /// bytes through `emulate_inb` and writes the result into `regs.rax`.
-pub fn handle_in_event(pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
+pub fn handle_in_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
     if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
-        let val = crate::arch::inw(port) as u64;
+        let val = machine.inw(port) as u64;
         regs.rax = (regs.rax & !0xFFFF) | val;
         return;
     }
 
     let mut val: u64 = 0;
     for i in 0..size {
-        val |= (emulate_inb(pc, port + i as u16) as u64) << (i * 8);
+        val |= (emulate_inb(machine, pc, port + i as u16) as u64) << (i * 8);
     }
     let mask: u64 = if size >= 4 { 0xFFFF_FFFF } else { (1u64 << (size * 8)) - 1 };
     regs.rax = (regs.rax & !mask) | (val & mask);
 }
 
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
-pub fn handle_out_event(pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
+pub fn handle_out_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
     let val = regs.rax;
     if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
-        crate::arch::outw(port, val as u16);
+        machine.outw(port, val as u16);
         return;
     }
 
     for i in 0..size {
-        emulate_outb(pc, port + i as u16, (val >> (i * 8)) as u8);
+        emulate_outb(machine, pc, regs, port + i as u16, (val >> (i * 8)) as u8);
     }
 }
 
 /// Complete an `INSB/INSW/INSD` (ES:DI ← port, advance DI). Single element —
 /// no REP handling; the CPU traps per iteration when REP is in effect.
-pub fn handle_ins_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
+pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
     let port = regs.rdx as u16;
-    let es_base = seg_base_for(regs, regs.es as u16);
+    let es_base = seg_base_for(machine, regs, regs.es as u16);
     let di = regs.rdi as u32;
     for i in 0..size {
-        let b = emulate_inb(pc, port + i as u16);
+        let b = emulate_inb(machine, pc, port + i as u16);
         regs.write::<u8>(((es_base.wrapping_add(di.wrapping_add(i)))) as usize, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
@@ -633,13 +634,13 @@ pub fn handle_ins_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
 }
 
 /// Complete an `OUTSB/OUTSW/OUTSD` (port ← DS:SI, advance SI). Single element.
-pub fn handle_outs_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
+pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
     let port = regs.rdx as u16;
-    let ds_base = seg_base_for(regs, regs.ds as u16);
+    let ds_base = seg_base_for(machine, regs, regs.ds as u16);
     let si = regs.rsi as u32;
     for i in 0..size {
         let b = regs.read::<u8>(((ds_base.wrapping_add(si.wrapping_add(i)))) as usize);
-        emulate_outb(pc, port + i as u16, b);
+        emulate_outb(machine, pc, regs, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
@@ -652,7 +653,21 @@ pub fn handle_outs_event(pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
 
 /// Buffer a hardware event into the virtual PIC / keyboard.
 /// Mode-independent: both VM86 and DPMI share the same virtual devices.
-pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
+/// Advance the host-timer-driven PIT/RTC and raise IRQ0/IRQ8 if a period
+/// elapsed. The tick has no host payload — it queries `machine`'s timer — so it
+/// is separate from `queue_irq` (which runs inside the input-queue drain, where
+/// `machine` is borrowed). Edge-triggered: the IRR coalesces repeated ticks into
+/// one pending line, so a slow guest loses ticks rather than flooding.
+pub fn queue_tick(machine: &mut crate::TheArch, pc: &mut PcMachine) {
+    if pc.vpit.take_pending_irqs(machine) > 0 {
+        pc.vpic.raise(0);
+    }
+    if pc.vrtc.take_pending_irqs(machine) > 0 {
+        pc.vpic.raise(8);
+    }
+}
+
+pub fn queue_irq(pc: &mut PcMachine, regs: &mut Vcpu, event: crate::arch::Irq) {
     use crate::arch::Irq;
     match event {
         Irq::Key(sc) => {
@@ -669,22 +684,10 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
                 pc.vpic.raise(1);
             }
         }
-        Irq::Tick => {
-            // Edge-triggered: the IRR coalesces repeated ticks into one pending
-            // IRQ0, so a slow guest loses ticks rather than flooding — exactly
-            // real-hardware behaviour. `take_pending_irqs` keeps the PIT model
-            // honest about how many fired.
-            if pc.vpit.take_pending_irqs() > 0 {
-                pc.vpic.raise(0);
-            }
-            // RTC periodic interrupt (IRQ8) shares the host timer. When the
-            // guest has enabled PIE (CMOS reg B), drive IRQ8 at the programmed
-            // rate so the BIOS INT 70h ISR can complete INT 15h AH=86h waits.
-            // Edge-triggered like the PIT: coalesce into one pending line.
-            if pc.vrtc.take_pending_irqs() > 0 {
-                pc.vpic.raise(8);
-            }
-        }
+        // Ticks carry no host payload and need the machine timer, so they come
+        // through `queue_tick` (which has `&mut machine`), never here — the
+        // input-queue drain only ever delivers Key/Mouse events.
+        Irq::Tick => {}
         Irq::Mouse { dx, dy, buttons } => {
             // No physical mouse hardware is modelled (no PS/2 ports, no
             // IRQ 12 line) and every DOS program reaches the mouse through
@@ -692,7 +695,7 @@ pub fn queue_irq(pc: &mut PcMachine, event: crate::arch::Irq) {
             // vpic at all — `apply_packet` updates `pending_cond` and
             // `raise_pending` dispatches the AX=0Ch callback directly when
             // the mask matches and the user's IF=1.
-            let _ = pc.mouse.apply_packet(dx, dy, buttons);
+            let _ = pc.mouse.apply_packet(regs, dx, dy, buttons);
         }
         Irq::Hw(line) => {
             if line != 5 {
@@ -766,26 +769,27 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Vcpu) -> Option<u8> {
 
 /// Read a u16 from a real-mode seg:off address, through the active address
 /// space's memory interface (`arch::mem()`) — works under any arch backend.
-pub fn read_u16(seg: u32, off: u32) -> u16 {
-    crate::arch::mem().read::<u16>(((seg << 4) + off) as usize)
+pub fn read_u16(regs: &Vcpu, seg: u32, off: u32) -> u16 {
+    regs.read::<u16>(((seg << 4) + off) as usize)
 }
 
 /// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
-pub fn write_u16(seg: u32, off: u32, val: u16) {
-    crate::arch::mem().write::<u16>(((seg << 4) + off) as usize, val);
+pub fn write_u16(regs: &mut Vcpu, seg: u32, off: u32, val: u16) {
+    regs.write::<u16>(((seg << 4) + off) as usize, val);
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
 pub fn vm86_push(regs: &mut Vcpu, val: u16) {
     let sp = vm86_sp(regs).wrapping_sub(2);
     set_vm86_sp(regs, sp);
-    write_u16(regs.ss32(), sp as u32, val);
+    let ss = regs.ss32();
+    write_u16(regs, ss, sp as u32, val);
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
 pub fn vm86_pop(regs: &mut Vcpu) -> u16 {
     let sp = vm86_sp(regs);
-    let val = read_u16(regs.ss32(), sp as u32);
+    let val = read_u16(regs, regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
     val
 }
