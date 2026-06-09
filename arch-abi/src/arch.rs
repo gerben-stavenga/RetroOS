@@ -176,6 +176,12 @@ pub trait Arch {
     fn outw(&mut self, port: u16, val: u16);
     fn outl(&mut self, port: u16, val: u32);
 
+    /// Let the guest access ports `[port, port+count)` directly — clear them in
+    /// the I/O-permission bitmap so they no longer trap to the kernel. The DOS
+    /// layer uses this to drop the per-write trap on the OPL ports once it finds
+    /// a real card (passthrough). No-op on backends that interpret all I/O.
+    fn allow_io_ports(&mut self, port: u16, count: usize);
+
     // ── Execution & scheduling ─────────────────────────────────────────────
     //
     // The event loop *owns* the live `Vcpu` (there is no `REGS` global). It hands

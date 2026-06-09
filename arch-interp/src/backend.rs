@@ -25,6 +25,7 @@ impl Arch for Interp {
     fn outb(&mut self, port: u16, val: u8) { crate::machine::outb(port, val) }
     fn outw(&mut self, port: u16, val: u16) { crate::machine::outw(port, val) }
     fn outl(&mut self, port: u16, val: u32) { crate::machine::outl(port, val) }
+    fn allow_io_ports(&mut self, _port: u16, _count: usize) {} // all I/O is interpreted
 
     // ── Execution & scheduling ──
     //

@@ -69,7 +69,6 @@ const NAM_PCM_DAC_RATE: u16 = 0x2C; // sample rate when VRA enabled
 const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
 const PO_CIV: u16 = 0x14; // 8-bit: current index value (RO)
 const PO_LVI: u16 = 0x15; // 8-bit: last valid index
-const PO_PICB: u16 = 0x18; // 16-bit: position in current buffer (samples left)
 const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset)
 const GLOB_CNT: u16 = 0x2C; // 32-bit: bit1 = AC-link out of cold reset
 const GLOB_STA: u16 = 0x30; // 32-bit: bit8 = primary codec ready
@@ -111,8 +110,6 @@ struct Ac97 {
     cur_off: usize, // byte offset within `cur_buf`
     running: bool,  // bus master started
     rate: u32,      // last programmed sample rate (Hz)
-    last_civ: u8,   // CIV at the last consumed_frames() read (wrap tracking)
-    played: u64,    // frames the codec has completed (monotonic)
 }
 
 static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
@@ -209,8 +206,6 @@ fn bring_up(arch: &mut crate::TheArch, dev: u8) -> bool {
         cur_off: 0,
         running: false,
         rate: 0,
-        last_civ: 0,
-        played: 0,
     };
     d.build_bdl();
     arch.outl(nabm + PO_BDBAR, dma_phys); // BDL base
@@ -302,24 +297,3 @@ pub fn play(arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
     }
 }
 
-/// Frames the codec has actually played so far (monotonic), or `None` if no
-/// codec is present. The SB emulation paces itself to this so the whole audio
-/// chain runs on the codec's real crystal instead of the PIT — no drift, and
-/// the codec's progress (not virtual time) is what drives the guest's SB IRQs.
-pub fn consumed_frames(arch: &mut crate::TheArch) -> Option<u64> {
-    let mut g = AC97.lock();
-    let d = g.as_mut()?;
-    if !d.running {
-        return Some(0); // primed-but-not-started: nothing played yet
-    }
-    // Completed buffers since the last read (CIV wraps mod NUM_BUF).
-    let civ = arch.inb(d.nabm + PO_CIV) as usize;
-    let delta = (civ + NUM_BUF - d.last_civ as usize) % NUM_BUF;
-    d.played += (delta * (BUF_BYTES / 4)) as u64; // 4 bytes/frame
-    d.last_civ = civ as u8;
-    // Plus progress within the current buffer (PICB = 16-bit samples remaining),
-    // for smoother sub-buffer pacing.
-    let picb = arch.inw(d.nabm + PO_PICB) as usize;
-    let in_buf = (BUF_BYTES / 2).saturating_sub(picb) / 2; // frames consumed in cur buf
-    Some(d.played + in_buf as u64)
-}

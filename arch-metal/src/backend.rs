@@ -27,6 +27,9 @@ impl Arch for Metal {
     fn outb(&mut self, port: u16, val: u8) { super::x86::outb(port, val) }
     fn outw(&mut self, port: u16, val: u16) { super::x86::outw(port, val) }
     fn outl(&mut self, port: u16, val: u32) { super::x86::outl(port, val) }
+    fn allow_io_ports(&mut self, port: u16, count: usize) {
+        super::descriptors::allow_io_ports(port, count)
+    }
 
     // ── Execution & scheduling ──
     //

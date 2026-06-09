@@ -252,8 +252,8 @@ impl Tss {
 }
 
 /// Set up TSS bitmaps for VM86:
-/// - IOPB: allow VGA ports (0x3C0-0x3DF) + AdLib OPL2 (0x388-0x389),
-///   deny everything else
+/// - IOPB: allow VGA ports (0x3C0-0x3DF); deny everything else (the SB DSP/
+///   mixer/8237 and the AdLib OPL ports are all trapped → kernel-emulated)
 /// - Interrupt redirection: trap handled INTs to monitor, rest through IVT
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
@@ -265,13 +265,34 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
         (*tss).iopb[121] = 0x00;
         (*tss).iopb[122] = 0x00;
         (*tss).iopb[123] = 0x04; // trap bit 2 = port 0x3DA
-        // AdLib OPL2 status/index (0x388) + data (0x389): bits 0-1 of byte
-        // 113. Pass through to QEMU's emulated YM3812; no IRQ, no DMA.
-        (*tss).iopb[113] &= !0x03;
+        // AdLib OPL2 ports 0x388/0x389 (byte 113, bits 0-1) are left TRAPPED
+        // (default-deny) so they route through the kernel SB/OPL emulation. The
+        // OPL is the same chip as the SB's io_base+8/9 mirror (already trapped),
+        // and on an AC'97-only host with no real YM3812 the kernel must answer
+        // FM detection itself — a pass-through here hits dead hardware and the
+        // guest reports "could not detect FM chip". (Was passed through for
+        // music-write perf when a real OPL existed; the per-write trap cost is
+        // fine and emulation requires the trap.)
         // Interrupt redirection: only INT 31h traps to monitor.
         // All other intercepted INTs (20h, 21h, 28h, 2Eh, 2Fh) go through IVT
         // to stubs that call INT 31h, which then traps here.
         (*tss).int_redir[(0x31 / 8) as usize] |= 1 << (0x31 % 8);
+    }
+}
+
+/// Clear the IOPB bits for ports `[port, port+count)` so the guest accesses
+/// them directly (pass-through) instead of trapping to the monitor. Used once
+/// passthrough is detected to drop the per-write trap on the OPL ports (frequent
+/// during music) when a real card is present. Ports must lie within the IOPB
+/// (< 0x3E8); anything beyond is already denied and left as-is.
+pub fn allow_io_ports(port: u16, count: usize) {
+    unsafe {
+        for p in port..port.saturating_add(count as u16) {
+            let byte = (p / 8) as usize;
+            if byte < IOPB_SIZE {
+                TSS32.iopb[byte] &= !(1u8 << (p % 8));
+            }
+        }
     }
 }
 

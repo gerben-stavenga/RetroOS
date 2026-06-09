@@ -16,12 +16,6 @@
 use arch_abi::Arch;
 use super::*;
 
-/// Frames the play cursor leads the real codec's playback by, when output goes
-/// to a clocked sink (metal AC'97). This *is* the audio latency; it must exceed
-/// the codec's own prime/jitter buffer so its ring never starves. ~2048 frames
-/// ≈ 93 ms @ 22 kHz.
-const AC97_CUSHION_FRAMES: u64 = 2048;
-
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
 /// "externally owned" mark — COW-fork and address-space teardown both
 /// skip such frames — exactly what an aliased permanent DMA buffer needs.
@@ -59,6 +53,23 @@ struct EmuDsp {
     /// Last value written to `base+0x06` (DSP reset register); the 1→0 edge
     /// triggers the reset handshake.
     reset_prev: u8,
+    /// DSP test register (write 0xE4 → store, read 0xE8 → return). Some card
+    /// detection routines round-trip a byte through it to confirm a real DSP.
+    test_reg: u8,
+    /// Minimal OPL2 (AdLib FM) state — *just enough to pass FM detection*, no
+    /// synthesis. `opl_index` = the selected register (port 0x388 write);
+    /// `opl_status` = the timer status the detect routine reads from 0x388.
+    /// Without this, FM detection fails and Apogee games exit ("could not
+    /// detect FM chip") before they ever reach digital sound.
+    opl_index: u8,
+    opl_status: u8,
+    /// SB16 mixer register index (port base+4 write); its data port is base+5.
+    mixer_index: u8,
+    /// Mixer reg 0x82 IRQ status: bit0 = 8-bit DMA IRQ pending, bit1 = 16-bit.
+    /// Set when the SB IRQ is raised (by playback width); cleared when the guest
+    /// acks (reads base+0xE for 8-bit / base+0xF for 16-bit). A 16-bit driver
+    /// reads this to confirm "that was a *16-bit* DMA interrupt".
+    irq_status: u8,
 
     /// True between a `start playback` command and a stop/reset.
     playing: bool,
@@ -82,13 +93,6 @@ struct EmuDsp {
     next_irq: u64,    // cursor value of the next block boundary (IRQ point)
     frac: u64,        // sub-frame pacing accumulator, units of frames×1000
     last_ms: u64,     // get_ticks() at the last `audio_tick`
-    /// Codec-clock origin for this playback (clocked sink only): the sink's
-    /// `consumed` count at playback start, so the cursor measures frames
-    /// produced *since* this sound began — not since the codec powered on.
-    /// `u64::MAX` = "rebase on the next tick". Without this, restarting playback
-    /// (a new sound) while the codec has played a lot makes the first advance
-    /// enormous (IRQ flood → guest crawl; cursor races the ring → reverb).
-    clock_base: u64,
     /// Set when a block boundary is reached and its IRQ raised; cleared when the
     /// guest reads the DMA count (services the block — poll-bool/poll-dma/irq-mix
     /// all do). While set, consumption freezes at the boundary so we never
@@ -102,12 +106,12 @@ impl EmuDsp {
         EmuDsp {
             out: [0; 4], out_len: 0,
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
-            reset_prev: 0,
+            reset_prev: 0, test_reg: 0, opl_index: 0, opl_status: 0,
+            mixer_index: 0, irq_status: 0,
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0, frac: 0, last_ms: 0,
-            clock_base: 0,
             awaiting_ack: false,
         }
     }
@@ -565,22 +569,72 @@ impl SoundBlaster {
         let absent = machine.inb(self.io_base + 0x0C) == 0xFF
             && machine.inb(self.io_base + 0x0E) == 0xFF;
         self.mode = if absent { SbMode::Emulated } else { SbMode::Passthrough };
+        if self.mode == SbMode::Passthrough {
+            // A real card is present, so a real OPL is too: stop trapping the
+            // AdLib ports and let the guest's (frequent) FM music writes hit the
+            // hardware directly. In emulation they stay trapped → `emu_*` answers
+            // FM detection. (No-op on the interpreter, which interprets all I/O.)
+            machine.allow_io_ports(0x388, 2);
+        }
     }
 
     /// Emulated DSP/mixer port read.
     fn emu_read(&mut self, p: u16) -> u8 {
+        // OPL2 status register (0x388 or io_base+8): timer-expiry bits the FM
+        // detection routine checks.
+        if p == 0x388 || p == self.io_base + 8 {
+            return self.emu.opl_status;
+        }
         match p.wrapping_sub(self.io_base) {
-            0x0A => self.emu.pop_out(),                                  // DSP read data
-            0x0C => 0x00,                                               // write-status: always ready
-            0x0E => if self.emu.out_len > 0 { 0x80 } else { 0x00 },     // read-status / 8-bit IRQ ack
-            0x0F => 0x00,                                               // 16-bit IRQ ack
-            _ => 0xFF,                                                  // mixer / OPL: unmodelled
+            0x05 => match self.emu.mixer_index {       // mixer data
+                0x82 => self.emu.irq_status,           // IRQ status (8/16-bit)
+                0x80 => match self.irq {               // IRQ select
+                    2 | 9 => 0x01, 5 => 0x02, 7 => 0x04, 10 => 0x08, _ => 0x04,
+                },
+                0x81 => (1u8 << (self.dma8 & 7)) | (1u8 << (self.dma16 & 7)), // DMA select
+                _ => 0x00,
+            },
+            0x0A => self.emu.pop_out(),                // DSP read data
+            0x0C => 0x00,                              // write-status: always ready
+            0x0E => {                                  // read-status / 8-bit IRQ ack
+                self.emu.irq_status &= !0x01;          // reading acks the 8-bit IRQ
+                self.emu.awaiting_ack = false;         // ...and releases the produce gate
+                if self.emu.out_len > 0 { 0x80 } else { 0x00 }
+            }
+            0x0F => {                                  // 16-bit IRQ ack
+                self.emu.irq_status &= !0x02;
+                self.emu.awaiting_ack = false;
+                0x00
+            }
+            _ => 0xFF,
         }
     }
 
     /// Emulated DSP/mixer port write.
     fn emu_write(&mut self, p: u16, val: u8) {
+        // OPL2 FM (AdLib 0x388/0x389, or the SB's OPL at io_base+8/+9): index
+        // register select + the timer-control register, enough for detection.
+        if p == 0x388 || p == self.io_base + 8 {
+            self.emu.opl_index = val;
+            return;
+        }
+        if p == 0x389 || p == self.io_base + 9 {
+            if self.emu.opl_index == 0x04 {
+                // Timer control: bit7 = reset status/IRQ; bit0/1 = start T1/T2.
+                // Detection starts a timer then reads status expecting it
+                // "expired", so set the expiry bits on start (no real timing).
+                if val & 0x80 != 0 {
+                    self.emu.opl_status = 0;
+                } else {
+                    if val & 0x01 != 0 { self.emu.opl_status |= 0xC0; } // T1 → IRQ|T1
+                    if val & 0x02 != 0 { self.emu.opl_status |= 0xA0; } // T2 → IRQ|T2
+                }
+            }
+            return; // other FM registers: no synthesis (music stays silent)
+        }
         match p.wrapping_sub(self.io_base) {
+            0x04 => self.emu.mixer_index = val, // mixer register select
+            0x05 => {}                          // mixer data: no mixing modeled
             0x06 => {
                 // DSP reset: a 1→0 edge triggers the reset handshake.
                 if self.emu.reset_prev == 1 && val == 0 {
@@ -612,10 +666,10 @@ impl SoundBlaster {
         }
         // Parameter count by command (only the subset DSP clients use here).
         let need = match val {
-            0x40 => 1,                            // set time constant
+            0x40 | 0xE0 | 0xE4 => 1,              // time constant; ident byte; test-reg write
             0x14 | 0x41 | 0x42 | 0x48 | 0x80 => 2, // single-cycle len, out/in rate, block, silence
             0xB0..=0xBF | 0xC0..=0xCF => 3,       // SB16 16/8-bit DMA: mode + length lo/hi
-            _ => 0,                               // 0x1C/0x90/0x91 etc. take no params
+            _ => 0,                               // 0x1C/0x90/0x91/0xE8 etc. take no params
         };
         if need > 0 {
             self.emu.cmd = Some(val);
@@ -634,6 +688,10 @@ impl SoundBlaster {
                 self.emu.push_out(4); // DSP version 4.5 (SB16)
                 self.emu.push_out(5);
             }
+            // Detection helpers some drivers use to confirm a real DSP:
+            0xE0 => self.emu.push_out(!p[0]), // identification: return ~byte
+            0xE4 => self.emu.test_reg = p[0], // write test register
+            0xE8 => self.emu.push_out(self.emu.test_reg), // read test register back
             0xD1 | 0xD4 => {}                          // speaker on / continue DMA
             0xD0 | 0xD3 | 0xD9 | 0xDA => self.emu.playing = false, // pause / speaker off / exit auto-init
             0x40 => {
@@ -692,7 +750,6 @@ impl SoundBlaster {
         self.emu.cursor = 0;
         self.emu.next_irq = self.emu.block_frames as u64;
         self.emu.frac = 0;
-        self.emu.clock_base = u64::MAX; // rebase the codec clock on the next tick
         self.emu.awaiting_ack = false;
         self.emu.playing = self.emu.buf_frames > 0;
     }
@@ -723,33 +780,22 @@ impl SoundBlaster {
             self.emu.last_ms = machine.get_ticks();
             return;
         }
-        // Virtual-time advance — always computed. This is the FLOOR that keeps
-        // the guest progressing no matter what the codec does: if a clocked sink
-        // stalls (underrun/halt), the cursor still advances at real rate, so the
-        // guest (which polls the DMA count) never deadlocks into a crawl.
+        // Pace the play cursor by virtual time at the sample rate. The cursor is
+        // the GUEST-VISIBLE playback position — the DMA count and the SB IRQ both
+        // derive from it — so it must advance at the real rate: drivers verify
+        // 16-bit DMA by watching the count move at the programmed rate (Duke3D
+        // bails otherwise). On metal virtual time ≈ the AC'97 crystal, so this
+        // stays rate-matched to the codec without a cushion/clock-follow (which
+        // led the count and broke that verification).
         let now = machine.get_ticks();
         let dt = now.saturating_sub(self.emu.last_ms);
         self.emu.last_ms = now;
+        if dt == 0 {
+            return;
+        }
         self.emu.frac += self.emu.rate as u64 * dt; // units: frames × 1000
-        let virt = self.emu.frac / 1000;
+        let mut advance = self.emu.frac / 1000;
         self.emu.frac %= 1000;
-
-        // With a clocked sink (metal AC'97), *follow* the codec when it is the
-        // limiting clock — produce enough to keep a fixed cushion ahead of real
-        // playback — but never below the virtual-time floor. Without a clocked
-        // sink (interp WAV) the floor is the pacing.
-        let mut advance = match crate::kernel::sound::sink_clock(machine) {
-            Some(consumed) => {
-                // Rebase the codec clock to this playback's start.
-                if self.emu.clock_base == u64::MAX {
-                    self.emu.clock_base = consumed;
-                }
-                let played = consumed.saturating_sub(self.emu.clock_base);
-                let clk = (played + AC97_CUSHION_FRAMES).saturating_sub(self.emu.cursor);
-                virt.max(clk)
-            }
-            None => virt,
-        };
         if advance == 0 {
             return;
         }
@@ -761,6 +807,8 @@ impl SoundBlaster {
             self.emit_frames(machine, regs, advance);
             self.emu.cursor += advance;
             self.emu.awaiting_ack = true;
+            // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
+            self.emu.irq_status |= if self.emu.bits == 16 { 0x02 } else { 0x01 };
             if !vpic.is_requested(self.irq) {
                 vpic.raise(self.irq);
             }

@@ -96,14 +96,6 @@ fn device_present(arch: &mut crate::TheArch) -> bool {
     }
 }
 
-/// The monotonic played-frame count of a *clocked* output (the metal AC'97
-/// codec), or `None` when the sink has no real clock (the interpreter's WAV /
-/// port-window sink). A producer paces itself to this so it follows the real
-/// DAC; a `None` sink leaves the producer on virtual-time pacing.
-pub fn sink_clock(arch: &mut crate::TheArch) -> Option<u64> {
-    crate::kernel::ac97::consumed_frames(arch)
-}
-
 /// Stream a block of source PCM `bytes` (`fmt`, `rate` Hz) to the canonical
 /// audio device, canonicalizing to i16 stereo on the way. A no-op when no
 /// device answers the signature probe (so the existing SB passthrough still
