@@ -95,6 +95,8 @@ pub use vga::*;
 // ============================================================================
 pub(super) mod vdma;
 pub(super) use vdma::*;
+pub(super) mod vsb;
+pub(super) use vsb::*;
 /// Policy-free PC machine virtualization — per-thread peripheral state.
 ///
 /// Holds the virtual 8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set,
@@ -115,7 +117,7 @@ pub struct PcMachine {
     pub vga: VgaState,
     /// Sound Blaster DMA virtualization (generic virtual 8237 + the
     /// thread's BLASTER channel/IRQ map). SB itself is passthrough.
-    pub sb: SbDmaState,
+    pub sb: SoundBlaster,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -313,7 +315,7 @@ impl PcMachine {
             skip_irq: false,
             e0_pending: false,
             vga: VgaState::new(),
-            sb: SbDmaState::new(),
+            sb: SoundBlaster::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
         }
