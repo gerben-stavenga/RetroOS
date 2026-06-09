@@ -320,6 +320,108 @@ impl PortIo for FwCfg {
     }
 }
 
+// ── RetroOS canonical audio device → WAV file ───────────────────────────────
+//
+// The kernel's sound layer (`kernel/src/kernel/sound.rs`) canonicalizes every
+// PCM source to signed-16 interleaved stereo and streams it here via `arch.outw`
+// on a private port window — the audio analogue of the ATA disk: a device below
+// the arch boundary, driven through ordinary port I/O, not a bespoke arch call.
+// The host side (where `std` lives) writes a RIFF/WAVE file so the produced
+// audio can be verified offline (e.g. the `modplay` MOD player).
+
+const AUDIO_SIG: u16 = 0x530; // R: signature; W: sample rate (Hz)
+const AUDIO_LEFT: u16 = 0x532; // W: latch left i16
+const AUDIO_RIGHT: u16 = 0x534; // W: right i16 + commit the (L,R) frame
+const AUDIO_SIGNATURE: u16 = 0x5241; // 'R','A' — matches kernel `sound::SIGNATURE`
+
+/// How often (in frames) to re-patch the WAV header's length fields. Headless
+/// runs end via `std::process::exit` (no `Drop`), so we keep the on-disk header
+/// valid by rewriting it periodically — at most this many frames of tail are
+/// lost if the process is killed between patches (~46 ms at 22 kHz).
+const HEADER_PATCH_EVERY: u32 = 1024;
+
+struct WavSink {
+    file: File,
+    rate: u32,
+    frames: u32,
+    left: i16,
+}
+
+impl WavSink {
+    fn new(mut file: File) -> WavSink {
+        let _ = file.write_all(&Self::header(0, 22050));
+        WavSink { file, rate: 22050, frames: 0, left: 0 }
+    }
+
+    /// 44-byte canonical PCM WAVE header (2ch / 16-bit / `rate` Hz, `frames`).
+    fn header(frames: u32, rate: u32) -> [u8; 44] {
+        let channels: u16 = 2;
+        let bits: u16 = 16;
+        let block_align: u16 = channels * bits / 8; // 4 bytes/frame
+        let byte_rate = rate * block_align as u32;
+        let data_bytes = frames * block_align as u32;
+        let mut h = [0u8; 44];
+        h[0..4].copy_from_slice(b"RIFF");
+        h[4..8].copy_from_slice(&(36 + data_bytes).to_le_bytes());
+        h[8..12].copy_from_slice(b"WAVE");
+        h[12..16].copy_from_slice(b"fmt ");
+        h[16..20].copy_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        h[20..22].copy_from_slice(&1u16.to_le_bytes()); // format = PCM
+        h[22..24].copy_from_slice(&channels.to_le_bytes());
+        h[24..28].copy_from_slice(&rate.to_le_bytes());
+        h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+        h[32..34].copy_from_slice(&block_align.to_le_bytes());
+        h[34..36].copy_from_slice(&bits.to_le_bytes());
+        h[36..40].copy_from_slice(b"data");
+        h[40..44].copy_from_slice(&data_bytes.to_le_bytes());
+        h
+    }
+
+    fn commit_frame(&mut self, right: i16) {
+        let mut frame = [0u8; 4];
+        frame[0..2].copy_from_slice(&self.left.to_le_bytes());
+        frame[2..4].copy_from_slice(&right.to_le_bytes());
+        let _ = self.file.write_all(&frame);
+        self.frames += 1;
+        if self.frames % HEADER_PATCH_EVERY == 0 {
+            self.patch_header();
+        }
+    }
+
+    fn patch_header(&mut self) {
+        if self.file.seek(SeekFrom::Start(0)).is_ok() {
+            let _ = self.file.write_all(&Self::header(self.frames, self.rate));
+            let _ = self.file.seek(SeekFrom::End(0));
+        }
+    }
+}
+
+impl PortIo for WavSink {
+    fn read(&mut self, port: u16, _width: u8) -> u32 {
+        if port == AUDIO_SIG { AUDIO_SIGNATURE as u32 } else { 0xFFFF }
+    }
+    fn write(&mut self, port: u16, _width: u8, val: u32) {
+        match port {
+            // Rate change: flush the header at the old rate first, then adopt.
+            AUDIO_SIG => {
+                self.patch_header();
+                self.rate = val & 0xFFFF;
+            }
+            AUDIO_LEFT => self.left = val as u16 as i16,
+            AUDIO_RIGHT => self.commit_frame(val as u16 as i16),
+            _ => {}
+        }
+    }
+}
+
+/// Hook a WAV-to-disk sink onto the canonical audio port window — the kernel's
+/// `sound::play` streams canonical i16-stereo PCM here for offline verification.
+pub fn attach_audio(path: &str) {
+    if let Ok(file) = File::create(path) {
+        register(AUDIO_SIG, AUDIO_RIGHT, Box::new(WavSink::new(file)));
+    }
+}
+
 /// Serve a QEMU-style fw_cfg with `opt/cmdline` (and optionally `opt/cwd`) so
 /// the kernel boots one program headless and shuts down when it exits.
 /// Register the fw_cfg device. Always presents the "QEMU" signature (so the

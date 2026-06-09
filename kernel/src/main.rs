@@ -38,6 +38,7 @@ fn main() {
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut shot: Option<String> = None;
+    let mut wav: Option<String> = None;
     let mut live_console = false;
     // Positional args: [0] = program/disk, [1..] = the program's own argv tail.
     let mut positional: Vec<String> = Vec::new();
@@ -56,6 +57,11 @@ fn main() {
             // Periodically snapshot the guest's VGA text screen (0xB8000) to a
             // file — lets a headless run of an interactive TUI (DN) be inspected.
             "--screenshot" => shot = args.next(),
+            // Back the canonical audio device with a WAV file: the kernel's
+            // emulated Sound Blaster streams PCM here so it can be verified
+            // offline (no real card on the host). Without this flag the audio
+            // ports are unpopulated and the kernel sound path is inert.
+            "--wav" => wav = args.next(),
             // First positional ends flag parsing; the rest are the program's argv.
             _ => {
                 positional.push(a);
@@ -88,6 +94,9 @@ fn main() {
     kernel::host_console_init();
     if let Some(dir) = host_dir {
         arch::attach_hostfs(&dir); // COM1 → /host
+    }
+    if let Some(path) = wav {
+        arch::attach_audio(&path); // canonical audio device → WAV file
     }
 
     let Some(path) = input else {

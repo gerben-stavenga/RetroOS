@@ -790,6 +790,11 @@ pub fn queue_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState) {
     machine::queue_tick(machine, &mut dos.pc);
 }
 
+/// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).
+pub fn audio_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) {
+    machine::audio_tick(machine, &mut dos.pc, regs);
+}
+
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery
 /// is uniform regardless of the client's current mode: `deliver_pm_irq`
 /// snapshots the client state on a kernel IRQ stack and switches to the

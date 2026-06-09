@@ -181,11 +181,98 @@ impl Dma8237 {
     }
 }
 
+/// How the SB DSP/mixer/OPL block is serviced, decided once by probing for a
+/// real card (`ensure_mode`):
+///  - `Passthrough` — a real card answers (QEMU `sb16`/`adlib` on metal); DSP
+///    traffic forwards to it and the virtual 8237 remaps onto the real chip.
+///  - `Emulated` — no card answers (the hosted interpreter, or metal hardware
+///    with no SB16); a software DSP+DMA engine synthesizes playback from the
+///    guest's DMA buffer into the kernel `sound` API. **No** real-card pokes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SbMode { Unknown, Passthrough, Emulated }
+
+/// Software DSP/DMA playback engine — populated and driven only in
+/// `SbMode::Emulated`. Turns the guest's DSP command stream + virtual-8237
+/// buffer programming into canonical PCM (`sound::play`), paced by virtual time,
+/// raising the SB IRQ once per completed DMA block exactly like the real card's
+/// terminal count. See [`SbDmaState::audio_tick`].
+#[derive(Clone, Copy)]
+struct EmuDsp {
+    /// DSP read-buffer FIFO (reset 0xAA, version bytes …) the guest pops from
+    /// `base+0x0A`; `out_len` valid bytes starting at `out[0]`.
+    out: [u8; 4],
+    out_len: u8,
+    /// Command awaiting parameter bytes (`None` = idle), and the parameters
+    /// collected so far. SB DSP commands take 0–3 parameter bytes.
+    cmd: Option<u8>,
+    params: [u8; 3],
+    param_got: u8,
+    param_need: u8,
+    /// Last value written to `base+0x06` (DSP reset register); the 1→0 edge
+    /// triggers the reset handshake.
+    reset_prev: u8,
+
+    /// True between a `start playback` command and a stop/reset.
+    playing: bool,
+    rate: u32,        // output sample rate (Hz)
+    bits: u8,         // 8 or 16
+    stereo: bool,     // false = mono, true = interleaved L/R
+    block_param: u16, // DSP block size set by 0x48 (transfers − 1)
+
+    /// Ring geometry, snapshotted from the virtual 8237 at `start playback`.
+    buf_gpa: u32,      // DOS-physical base of the auto-init ring
+    buf_frames: u32,   // ring length in frames
+    block_frames: u32, // frames between SB IRQs (one DMA block)
+    /// Frames consumed since playback start (monotonic). `dma_read` derives the
+    /// guest-visible down-count from this.
+    cursor: u64,
+    next_irq: u64,    // cursor value of the next block boundary (IRQ point)
+    frac: u64,        // sub-frame pacing accumulator, units of frames×1000
+    last_ms: u64,     // get_ticks() at the last `audio_tick`
+    /// Set when a block boundary is reached and its IRQ raised; cleared when the
+    /// guest reads the DMA count (services the block — poll-bool/poll-dma/irq-mix
+    /// all do). While set, consumption freezes at the boundary so we never
+    /// outrun the guest's refill (which would re-read stale ring data and repeat
+    /// the previous lap's audio). Locks consume-rate to refill-rate.
+    awaiting_ack: bool,
+}
+
+impl EmuDsp {
+    const fn new() -> Self {
+        EmuDsp {
+            out: [0; 4], out_len: 0,
+            cmd: None, params: [0; 3], param_got: 0, param_need: 0,
+            reset_prev: 0,
+            playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
+            buf_gpa: 0, buf_frames: 0, block_frames: 0,
+            cursor: 0, next_irq: 0, frac: 0, last_ms: 0,
+            awaiting_ack: false,
+        }
+    }
+    fn push_out(&mut self, b: u8) {
+        if (self.out_len as usize) < self.out.len() {
+            self.out[self.out_len as usize] = b;
+            self.out_len += 1;
+        }
+    }
+    fn pop_out(&mut self) -> u8 {
+        if self.out_len == 0 { return 0; }
+        let b = self.out[0];
+        self.out.copy_within(1..self.out_len as usize, 0);
+        self.out_len -= 1;
+        b
+    }
+}
+
 /// Per-thread Sound Blaster DMA state: the BLASTER-declared channel/IRQ
 /// map plus the generic virtual 8237. The card itself (DSP/mixer/OPL3/
 /// EMU8000) is pure passthrough; only this DMA indirection is virtual.
 /// Slice 3 fills the remap binding; Slice 4 the IRQ relay.
 pub struct SbDmaState {
+    /// Passthrough vs software emulation, decided once by `ensure_mode`.
+    mode: SbMode,
+    /// The software DSP/DMA engine (used only in `SbMode::Emulated`).
+    emu: EmuDsp,
     pub io_base: u16, // BLASTER A — DSP/mixer port base (passthrough target)
     pub irq: u8,      // BLASTER I — guest vPIC IRQ to inject on SB completion
     pub dma8: u8,     // BLASTER D — guest's 8-bit vDMA channel (0..3)
@@ -225,6 +312,8 @@ impl SbDmaState {
     /// intentionally decoupled). Overridden by the guest's `BLASTER=` env.
     pub fn new() -> Self {
         Self {
+            mode: SbMode::Unknown,
+            emu: EmuDsp::new(),
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
             dma: Dma8237::new(),
@@ -238,6 +327,11 @@ impl SbDmaState {
     /// Current QEMU i8257 count for the SB 8-bit host channel.
     pub fn diag_host_count8(&self, machine: &mut crate::TheArch) -> u16 {
         real_8237_count(machine, self.host_dma8)
+    }
+
+    /// Whether the SB is serviced by the software emulation (no real card).
+    pub fn is_emulated(&self) -> bool {
+        self.mode == SbMode::Emulated
     }
 
     /// Whether virtual DMA channel `ch` is armed on the real chip.
@@ -255,6 +349,14 @@ impl SbDmaState {
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
     pub fn release_dma_pool(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+        if self.mode == SbMode::Emulated {
+            // No real card / no buffer alias in emulation: just stop the
+            // software DSP so the next program sees a clean, idle card.
+            self.emu.playing = false;
+            self.emu.out_len = 0;
+            self.emu.cmd = None;
+            return;
+        }
         self.unbind(machine, regs);
         // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
         // this atomically; the hardware ~3 µs hold is irrelevant under
@@ -282,6 +384,10 @@ impl SbDmaState {
     /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
     /// sb16 does not appear to surface that response through passthrough.
     pub fn sb_read(&mut self, machine: &mut crate::TheArch, p: u16) -> u8 {
+        self.ensure_mode(machine);
+        if self.mode == SbMode::Emulated {
+            return self.emu_read(p);
+        }
         if p == self.io_base + 0x0A {
             if let Some(v) = self.dsp_read_data.take() {
                 return v;
@@ -295,6 +401,11 @@ impl SbDmaState {
     /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
     /// locally; all other traffic continues to the real QEMU sb16/adlib.
     pub fn sb_write(&mut self, machine: &mut crate::TheArch, p: u16, val: u8) {
+        self.ensure_mode(machine);
+        if self.mode == SbMode::Emulated {
+            self.emu_write(p, val);
+            return;
+        }
         if p == self.io_base + 0x0C {
             if self.dsp_expect_test_write {
                 self.dsp_test_reg = val;
@@ -346,6 +457,12 @@ impl SbDmaState {
             return self.dma.io_read(machine, port);
         };
 
+        // Emulated card: the live current-count comes from the software DSP's
+        // play cursor (there is no real 8257 to interrogate).
+        if self.mode == SbMode::Emulated {
+            return self.emu_dma_read(is_cnt, chan, hi_ctrl);
+        }
+
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
                    else if chan == self.dma16 as usize { Some(self.host_dma16) }
                    else { None };
@@ -390,6 +507,13 @@ impl SbDmaState {
     /// permanent host buffer and program the real 8237. A no-op until the
     /// guest finishes a count write (the per-block re-arm signal).
     pub fn maybe_remap(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+        self.ensure_mode(machine);
+        if self.mode == SbMode::Emulated {
+            // No real chip to program / no buffer to alias: the virtual-8237
+            // `prog` is already captured (io_write), and the software DSP reads
+            // the guest buffer directly at playback. Nothing to remap.
+            return;
+        }
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
         let c8 = self.dma8 as usize;
         let c16 = self.dma16 as usize;
@@ -515,6 +639,7 @@ impl SbDmaState {
     /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
     /// replays it. Must run with this task's address space active.
     pub fn sb_suspend(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+        if self.mode == SbMode::Emulated { return; } // no real chip / alias to detach
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
         self.unbind(machine, regs);
@@ -526,6 +651,7 @@ impl SbDmaState {
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
     pub fn sb_resume(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+        if self.mode == SbMode::Emulated { return; }
         if !self.suspended { return; }
         self.suspended = false;
         for chan in 0..8 {
@@ -555,6 +681,262 @@ impl SbDmaState {
                 _ => {}
             }
         }
+    }
+
+    // ── Software DSP/DMA emulation (SbMode::Emulated) ───────────────────────
+    //
+    // Active only when no real card answers. The guest drives the standard SB16
+    // DSP register file (reset, version, set-rate, auto-init playback); we run
+    // the command FSM, then `audio_tick` consumes the guest's DMA ring into
+    // canonical PCM (`sound::play`) paced by virtual time, raising the SB IRQ
+    // per block. The virtual 8237 (`self.dma`) already captured the buffer
+    // programming, so playback needs no real-chip interaction at all.
+
+    /// Decide passthrough vs emulation by probing for a real card, once. An
+    /// *absent* ISA device floats both the DSP write- and read-status ports to
+    /// 0xFF (the no-device convention, `feedback_no_fake_hardware`); a real SB16
+    /// never reads 0xFF on both. On metal+QEMU the card answers → passthrough;
+    /// on the hosted interpreter (no `sb16`) → emulation.
+    fn ensure_mode(&mut self, machine: &mut crate::TheArch) {
+        if self.mode != SbMode::Unknown {
+            return;
+        }
+        let absent = machine.inb(self.io_base + 0x0C) == 0xFF
+            && machine.inb(self.io_base + 0x0E) == 0xFF;
+        self.mode = if absent { SbMode::Emulated } else { SbMode::Passthrough };
+    }
+
+    /// Emulated DSP/mixer port read.
+    fn emu_read(&mut self, p: u16) -> u8 {
+        match p.wrapping_sub(self.io_base) {
+            0x0A => self.emu.pop_out(),                                  // DSP read data
+            0x0C => 0x00,                                               // write-status: always ready
+            0x0E => if self.emu.out_len > 0 { 0x80 } else { 0x00 },     // read-status / 8-bit IRQ ack
+            0x0F => 0x00,                                               // 16-bit IRQ ack
+            _ => 0xFF,                                                  // mixer / OPL: unmodelled
+        }
+    }
+
+    /// Emulated DSP/mixer port write.
+    fn emu_write(&mut self, p: u16, val: u8) {
+        match p.wrapping_sub(self.io_base) {
+            0x06 => {
+                // DSP reset: a 1→0 edge triggers the reset handshake.
+                if self.emu.reset_prev == 1 && val == 0 {
+                    self.emu.playing = false;
+                    self.emu.cmd = None;
+                    self.emu.param_got = 0;
+                    self.emu.out_len = 0;
+                    self.emu.push_out(0xAA); // reset acknowledge
+                }
+                self.emu.reset_prev = val;
+            }
+            0x0C => self.emu_dsp_byte(val), // DSP command / parameter port
+            _ => {}                         // mixer index/data, OPL: ignored
+        }
+    }
+
+    /// Feed one byte to the DSP command FSM: a parameter for the in-flight
+    /// command, or the start of a new one.
+    fn emu_dsp_byte(&mut self, val: u8) {
+        if let Some(cmd) = self.emu.cmd {
+            self.emu.params[self.emu.param_got as usize] = val;
+            self.emu.param_got += 1;
+            if self.emu.param_got >= self.emu.param_need {
+                self.emu_exec(cmd);
+                self.emu.cmd = None;
+                self.emu.param_got = 0;
+            }
+            return;
+        }
+        // Parameter count by command (only the subset DSP clients use here).
+        let need = match val {
+            0x40 => 1,                         // set time constant
+            0x41 | 0x42 | 0x48 | 0x80 => 2,    // out/in rate, block size, silence
+            0xB0..=0xBF | 0xC0..=0xCF => 3,    // 16/8-bit DMA: mode + length lo/hi
+            _ => 0,
+        };
+        if need > 0 {
+            self.emu.cmd = Some(val);
+            self.emu.param_need = need;
+            self.emu.param_got = 0;
+        } else {
+            self.emu_exec(val);
+        }
+    }
+
+    /// Execute a fully-parameterized DSP command.
+    fn emu_exec(&mut self, cmd: u8) {
+        let p = self.emu.params;
+        match cmd {
+            0xE1 => {
+                self.emu.push_out(4); // DSP version 4.5 (SB16)
+                self.emu.push_out(5);
+            }
+            0xD1 | 0xD4 => {}                          // speaker on / continue DMA
+            0xD0 | 0xD3 | 0xD9 | 0xDA => self.emu.playing = false, // pause / speaker off / exit auto-init
+            0x40 => {
+                let tc = p[0] as u32;
+                self.emu.rate = if tc < 256 { 1_000_000 / (256 - tc) } else { 22050 };
+            }
+            0x41 => self.emu.rate = ((p[0] as u32) << 8) | p[1] as u32, // output rate (hi, lo)
+            0x42 => {}                                                  // input rate: ignore
+            0x48 => self.emu.block_param = (p[0] as u16) | ((p[1] as u16) << 8),
+            0x1C | 0x2C => self.emu_start(8, false, None),              // 8-bit mono auto-init (block from 0x48)
+            0xC4 | 0xC6 => {
+                let stereo = p[0] & 0x20 != 0;
+                self.emu_start(8, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)));
+            }
+            0xB4 | 0xB6 => {
+                let stereo = p[0] & 0x20 != 0;
+                self.emu_start(16, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)));
+            }
+            _ => {}
+        }
+    }
+
+    /// Begin auto-init playback: snapshot the ring geometry from the active
+    /// BLASTER channel's virtual-8237 programming and arm the play cursor.
+    fn emu_start(&mut self, bits: u8, stereo: bool, block_override: Option<u16>) {
+        self.emu.bits = bits;
+        self.emu.stereo = stereo;
+        if let Some(b) = block_override {
+            self.emu.block_param = b;
+        }
+        let channels = if stereo { 2u32 } else { 1 };
+        // Block size is "transfers − 1"; a transfer is one sample (per channel).
+        let block_transfers = self.emu.block_param as u32 + 1;
+        self.emu.block_frames = (block_transfers / channels).max(1);
+
+        let is16 = bits == 16;
+        let chan = if is16 { self.dma16 as usize } else { self.dma8 as usize };
+        let prog = self.dma.ch[chan].prog;
+        let (gpa, len_bytes) = chan_gpa_len(&prog, is16);
+        let frame_bytes = (bits as u32 / 8) * channels;
+        self.emu.buf_gpa = gpa;
+        self.emu.buf_frames = if frame_bytes > 0 { len_bytes / frame_bytes } else { 0 };
+        self.emu.cursor = 0;
+        self.emu.next_irq = self.emu.block_frames as u64;
+        self.emu.frac = 0;
+        self.emu.awaiting_ack = false;
+        self.emu.playing = self.emu.buf_frames > 0;
+    }
+
+    /// Advance emulated playback by the virtual time elapsed since the last
+    /// call: consume `rate × Δt` ring frames into the kernel sound API and
+    /// raise the SB IRQ for each completed block. Self-pacing — the guest's
+    /// per-block refill keeps up because we consume at exactly its sample rate,
+    /// and the auto-init ring's prime gives the refill latency headroom.
+    pub fn audio_tick(
+        &mut self,
+        machine: &mut crate::TheArch,
+        regs: &mut Vcpu,
+        vpic: &mut super::vpic::VirtualPic,
+    ) {
+        if self.mode != SbMode::Emulated {
+            return;
+        }
+        let now = machine.get_ticks();
+        if !self.emu.playing {
+            self.emu.last_ms = now; // keep Δt small for the first playing tick
+            return;
+        }
+        // Frozen at a block boundary until the guest services the IRQ (clears
+        // `awaiting_ack` by reading the DMA count). Absorb the elapsed time so we
+        // don't burst on release — the gate, not the clock, paces us. This is
+        // what stops the consume cursor outrunning the guest's refill (which
+        // would re-read stale ring frames and repeat the previous lap's audio).
+        if self.emu.awaiting_ack {
+            self.emu.last_ms = now;
+            return;
+        }
+        let dt = now.saturating_sub(self.emu.last_ms);
+        self.emu.last_ms = now;
+        if dt == 0 {
+            return;
+        }
+        self.emu.frac += self.emu.rate as u64 * dt; // units: frames × 1000
+        let mut advance = self.emu.frac / 1000;
+        self.emu.frac %= 1000;
+        if advance == 0 {
+            return;
+        }
+        // Advance at most to the next block boundary, then gate on the guest.
+        let to_boundary = self.emu.next_irq - self.emu.cursor; // ≥ 1
+        if advance >= to_boundary {
+            advance = to_boundary;
+            self.emu.frac = 0; // discard the excess; we resume on the guest's ack
+            self.emit_frames(machine, regs, advance);
+            self.emu.cursor += advance;
+            self.emu.next_irq += self.emu.block_frames as u64;
+            self.emu.awaiting_ack = true;
+            if !vpic.is_requested(self.irq) {
+                vpic.raise(self.irq);
+            }
+        } else {
+            self.emit_frames(machine, regs, advance);
+            self.emu.cursor += advance;
+        }
+    }
+
+    /// Copy `count` ring frames (from `cursor`, wrapping) out of guest memory
+    /// and hand them to the kernel sound layer.
+    fn emit_frames(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu, count: u64) {
+        let channels = if self.emu.stereo { 2u32 } else { 1 };
+        let frame_bytes = (self.emu.bits as u32 / 8) * channels;
+        if frame_bytes == 0 || self.emu.buf_frames == 0 {
+            return;
+        }
+        let fmt = crate::kernel::sound::Format {
+            bits: self.emu.bits,
+            signed: self.emu.bits == 16,
+            channels: channels as u8,
+        };
+        let mut remaining = count;
+        let mut pos = (self.emu.cursor % self.emu.buf_frames as u64) as u32;
+        while remaining > 0 {
+            let run = remaining.min((self.emu.buf_frames - pos) as u64) as u32;
+            let mut scratch = alloc::vec![0u8; (run * frame_bytes) as usize];
+            let addr = self.emu.buf_gpa as usize + (pos * frame_bytes) as usize;
+            regs.copy_from(addr, &mut scratch);
+            crate::kernel::sound::play(machine, self.emu.rate, fmt, &scratch);
+            remaining -= run as u64;
+            pos += run;
+            if pos >= self.emu.buf_frames {
+                pos = 0;
+            }
+        }
+    }
+
+    /// Emulated DMA current-address/count read: serve the active SB channel's
+    /// live state from the play cursor (auto-init down-count), other channels
+    /// from the captured base programming. Mirrors `dma_read`'s flip-flop split.
+    fn emu_dma_read(&mut self, is_cnt: bool, chan: usize, hi_ctrl: bool) -> u8 {
+        let is_active = chan == self.dma8 as usize || chan == self.dma16 as usize;
+        // The guest reading the active channel's count = it serviced the block
+        // (computed `current_play_seg` to refill). Release the consume gate so
+        // playback advances in lock-step with the refill, never ahead of it.
+        if is_cnt && is_active && self.emu.playing {
+            self.emu.awaiting_ack = false;
+        }
+        let ff = if hi_ctrl { &mut self.dma.ff_hi } else { &mut self.dma.ff_lo };
+        let low = !*ff;
+        *ff = !*ff;
+        if self.emu.playing && is_active {
+            if low {
+                let channels = if self.emu.stereo { 2u64 } else { 1 };
+                let total = (self.emu.buf_frames as u64 * channels).max(1); // transfers
+                let consumed = (self.emu.cursor * channels) % total;
+                let count = total.wrapping_sub(1).wrapping_sub(consumed) as u16;
+                let addr = self.dma.ch[chan].prog.addr.wrapping_add(consumed as u16);
+                self.dma.read_latch = if is_cnt { count } else { addr };
+            }
+            let v = self.dma.read_latch;
+            return if low { v as u8 } else { (v >> 8) as u8 };
+        }
+        let p = self.dma.ch[chan].prog;
+        let v = if is_cnt { p.count } else { p.addr };
+        if low { v as u8 } else { (v >> 8) as u8 }
     }
 }
 

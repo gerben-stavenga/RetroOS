@@ -70,8 +70,8 @@ pub use mmu::new_space;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
 pub use devices::{
-    attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon, register_debugcon_file,
-    PortIo,
+    attach_audio, attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon,
+    register_debugcon_file, PortIo,
 };
 // Host-side VGA text-screen snapshotting (headless inspection of the guest's
 // 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the

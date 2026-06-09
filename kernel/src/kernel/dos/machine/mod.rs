@@ -504,9 +504,13 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
                 // If keyboard IRQ (bit 1) was in service, and the virtual 8042
                 // still has data ready, IRQ1 should assert again after EOI.
                 let keyboard_in_service = pc.vpic.in_service(1);
+                // Re-arm only the passthrough host IRQ5 (the real QEMU sb16
+                // line, masked until the guest EOIs). The emulated SB has no
+                // host line — its IRQ is purely virtual — so there is nothing
+                // to rearm there (`feedback_no_half_modelled_devices`).
                 let sb_in_service = pc.sb.irq < 8 && pc.vpic.in_service(pc.sb.irq);
                 pc.vpic.master_eoi();
-                if sb_in_service {
+                if sb_in_service && !pc.sb.is_emulated() {
                     machine.rearm_irq(5);
                 }
                 // Real hardware re-asserts IRQ1 if more scancodes remain in the
@@ -665,6 +669,16 @@ pub fn queue_tick(machine: &mut crate::TheArch, pc: &mut PcMachine) {
     if pc.vrtc.take_pending_irqs(machine) > 0 {
         pc.vpic.raise(8);
     }
+}
+
+/// Advance the emulated Sound Blaster's software DSP playback by the virtual
+/// time elapsed since the last call (no-op unless the SB is in emulation mode).
+/// Runs in the event loop right after the PIT tick pump, where `machine`,
+/// `regs`, and the machine are all in scope; consumes the guest DMA ring into
+/// the kernel sound API and raises the SB IRQ per block.
+pub fn audio_tick(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu) {
+    let PcMachine { sb, vpic, .. } = pc;
+    sb.audio_tick(machine, regs, vpic);
 }
 
 pub fn queue_irq(pc: &mut PcMachine, regs: &mut Vcpu, event: crate::arch::Irq) {

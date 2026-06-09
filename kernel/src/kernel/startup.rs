@@ -331,6 +331,8 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
                     for _ in 0..ticks {
                         crate::kernel::dos::queue_tick(machine, dos);
                     }
+                    // Pump emulated-SB playback against the same virtual clock.
+                    crate::kernel::dos::audio_tick(machine, dos, regs);
                     let dp = dos as *mut thread::DosState;
                     machine.drain(&mut |evt| {
                         if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
