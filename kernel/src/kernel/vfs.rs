@@ -7,9 +7,22 @@
 //! Writable overlay: a BTreeMap<Vec<u8>, Vec<u8>> holds RAM-backed files
 //! created by DOS programs. create() inserts, open() checks overlay
 //! before the backing filesystem, read()/write()/seek() dispatch on the backing type.
+//!
+//! All VFS state — the mount table, the open-file table, the RAM overlay, and
+//! the path/dir caches — is a single kernel-wide singleton (`Vfs`) behind a
+//! `spin::Mutex`, so access is borrow-checked and correct under multiple cores.
+//! The lock is taken only from kernel/event-loop context (ISRs merely queue), so
+//! a plain spinlock suffices. To stay deadlock-free, the *state* lives in `&mut
+//! self` methods on `Vfs` (which call each other via `self`, never re-locking);
+//! the public free functions are thin wrappers that lock once, and the
+//! orchestrators (`open`/`read`/…, which only juggle the caller's fd array and
+//! call other public wrappers) never hold the lock across a call. The backing
+//! filesystems never call back into `vfs`, so holding the lock across `fs.read`/
+//! `fs.open` is safe.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use spin::Mutex;
 use crate::kernel::thread::FdKind;
 
 /// Maximum simultaneous open files system-wide
@@ -78,9 +91,9 @@ pub struct FileEntry {
     pub vnode: Vnode,
     pub offset: u32,
     pub refcount: u16,
-    /// Index into MOUNTS table (which filesystem owns this file)
+    /// Index into the mount table (which filesystem owns this file)
     pub mount_idx: u8,
-    /// For RAM-backed files: normalized path key into RAM_FILES
+    /// For RAM-backed files: normalized path key into the RAM overlay
     pub ram_key: [u8; PATH_KEY_MAX],
     pub ram_key_len: u8,
 }
@@ -91,58 +104,83 @@ struct Mount {
     fs: &'static dyn Filesystem,
 }
 
-/// Mount table — up to 4 mounts, checked longest-prefix-first
 const MAX_MOUNTS: usize = 4;
-static mut MOUNTS: [Option<Mount>; MAX_MOUNTS] = [None, None, None, None];
-static mut MOUNT_COUNT: usize = 0;
 
-/// Directory listing cache — avoids O(n²) re-scanning for sequential
-/// readdir. One directory cached at a time, growable so a flat dir with
-/// hundreds of entries (e.g. TP70 with ~230 files) doesn't get truncated.
-static mut DIR_CACHE_DIR: [u8; 96] = [0; 96];
-static mut DIR_CACHE_DIR_LEN: usize = 0;
-static mut DIR_CACHE_ENTRIES: Vec<DirEntry> = Vec::new();
-static mut DIR_CACHE_VALID: bool = false;
-
-/// Invalidate the directory cache (call after file create/delete).
-pub fn invalidate_dir_cache() {
-    unsafe { DIR_CACHE_VALID = false; }
+/// Single-directory readdir cache (avoids O(n²) re-scanning for sequential
+/// readdir). One directory cached at a time, growable so a flat dir with
+/// hundreds of entries doesn't get truncated.
+struct DirCache {
+    dir: [u8; 96],
+    dir_len: usize,
+    entries: Vec<DirEntry>,
+    valid: bool,
 }
 
-/// Writable file overlay — persists across open/close cycles
-static mut RAM_FILES: Option<BTreeMap<Vec<u8>, Vec<u8>>> = None;
-
-#[allow(static_mut_refs)]
-fn ram_files() -> &'static mut BTreeMap<Vec<u8>, Vec<u8>> {
-    unsafe { RAM_FILES.get_or_insert_with(BTreeMap::new) }
+impl DirCache {
+    const fn new() -> Self {
+        DirCache { dir: [0; 96], dir_len: 0, entries: Vec::new(), valid: false }
+    }
 }
 
-/// Path-keyed vnode cache. Sits in front of `fs.open()` so repeated opens
-/// of the same path skip the underlying filesystem walk entirely (matters
-/// most for ext4 where each open re-reads the inode chain + file content).
-///
-/// Caches the (mount_idx, Vnode) returned by `fs.open`. Multiple FILE_TABLE
-/// entries can share the same vnode handle -- the FS sees parallel reads at
-/// different offsets, which is fine for read-only mounts. RAM overlay
-/// shadows the cache (overlay is checked first in `open_to_handle`), so
-/// writes/creates don't need to invalidate this layer.
-static mut PATH_CACHE: Option<BTreeMap<Vec<u8>, (u8, Vnode)>> = None;
+/// Fallback filesystem for "nothing mounted": every lookup misses.
+struct EmptyFs;
+impl Filesystem for EmptyFs {
+    fn open(&self, _path: &[u8]) -> Option<Vnode> { None }
+    fn read(&self, _h: u64, _o: u32, _b: &mut [u8], _s: u32) -> i32 { -2 }
+    fn readdir(&self, _dir: &[u8], _index: usize) -> Option<DirEntry> { None }
+    fn dir_exists(&self, _path: &[u8]) -> bool { false }
+}
+static EMPTY_FS: EmptyFs = EmptyFs;
 
-#[allow(static_mut_refs)]
-fn path_cache() -> &'static mut BTreeMap<Vec<u8>, (u8, Vnode)> {
-    unsafe { PATH_CACHE.get_or_insert_with(BTreeMap::new) }
+// ============================================================================
+// The VFS singleton
+// ============================================================================
+
+/// All VFS state, behind one lock. See the module docs for the locking model.
+struct Vfs {
+    mounts: [Option<Mount>; MAX_MOUNTS],
+    mount_count: usize,
+    /// Writable file overlay — persists across open/close cycles.
+    ram_files: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Path-keyed vnode cache in front of `fs.open()` (skips the FS walk on
+    /// repeated opens — matters most for ext4). RAM overlay shadows it.
+    path_cache: BTreeMap<Vec<u8>, (u8, Vnode)>,
+    /// Global file table — slot is free when refcount == 0.
+    file_table: [FileEntry; MAX_OPEN_FILES],
+    dir_cache: DirCache,
 }
 
-/// Find the mount whose prefix matches `path`, returning (mount_index, fs, path-after-prefix).
-/// Longest prefix wins. A path equal to a mount prefix sans trailing `/`
-/// (e.g. `"host"` for mount `"host/"`) resolves to that mount's root.
-fn resolve_mount(path: &[u8]) -> (u8, &'static dyn Filesystem, &[u8]) {
-    let mut best_idx = 0u8;
-    let mut best_len = 0usize;
-    let mut found = false;
-    unsafe {
-        for i in 0..MOUNT_COUNT {
-            if let Some(ref m) = MOUNTS[i] {
+impl Vfs {
+    const fn new() -> Self {
+        const EMPTY: FileEntry = FileEntry {
+            vnode: Vnode { handle: 0, size: 0, mode: 0 },
+            offset: 0,
+            refcount: 0,
+            mount_idx: 0,
+            ram_key: [0; PATH_KEY_MAX],
+            ram_key_len: 0,
+        };
+        Vfs {
+            mounts: [None, None, None, None],
+            mount_count: 0,
+            ram_files: BTreeMap::new(),
+            path_cache: BTreeMap::new(),
+            file_table: [EMPTY; MAX_OPEN_FILES],
+            dir_cache: DirCache::new(),
+        }
+    }
+
+    // ── mount table ──────────────────────────────────────────────────────
+
+    /// Find the mount whose prefix matches `path`: (mount_index, fs, path-after-
+    /// prefix). Longest prefix wins; a path equal to a prefix sans trailing `/`
+    /// resolves to that mount's root.
+    fn resolve_mount<'a>(&self, path: &'a [u8]) -> (u8, &'static dyn Filesystem, &'a [u8]) {
+        let mut best_idx = 0u8;
+        let mut best_len = 0usize;
+        let mut found = false;
+        for i in 0..self.mount_count {
+            if let Some(ref m) = self.mounts[i] {
                 let plen = m.prefix.len();
                 let matches = m.prefix.is_empty()
                     || (path.len() >= plen && eq_ignore_case(&path[..plen], m.prefix))
@@ -156,83 +194,351 @@ fn resolve_mount(path: &[u8]) -> (u8, &'static dyn Filesystem, &[u8]) {
                 }
             }
         }
+        if !found {
+            // Nothing mounted (e.g. the hosted bare-ELF Linux path, before a root
+            // fs exists). Resolve to the empty filesystem so opens miss with
+            // -ENOENT instead of panicking.
+            return (0, &EMPTY_FS, path);
+        }
+        let m = self.mounts[best_idx as usize].as_ref().unwrap();
+        (best_idx, m.fs, &path[best_len..])
     }
-    if !found {
-        // Nothing mounted (e.g. the hosted bare-ELF Linux path, before a root
-        // fs exists). Resolve to the empty filesystem so opens miss with
-        // -ENOENT instead of panicking — an interactive shell opening /dev/tty
-        // then falls back to fds 0/1, exactly as it would on a real mount that
-        // lacks the node.
-        return (0, &EMPTY_FS, path);
+
+    fn mount_fs(&self, idx: u8) -> &'static dyn Filesystem {
+        self.mounts[idx as usize].as_ref().expect("VFS: invalid mount index").fs
     }
-    let m = unsafe { MOUNTS[best_idx as usize].as_ref().unwrap() };
-    (best_idx, m.fs, &path[best_len..])
-}
 
-/// Fallback filesystem for "nothing mounted": every lookup misses.
-struct EmptyFs;
-impl Filesystem for EmptyFs {
-    fn open(&self, _path: &[u8]) -> Option<Vnode> { None }
-    fn read(&self, _h: u64, _o: u32, _b: &mut [u8], _s: u32) -> i32 { -2 }
-    fn readdir(&self, _dir: &[u8], _index: usize) -> Option<DirEntry> { None }
-    fn dir_exists(&self, _path: &[u8]) -> bool { false }
-}
-static EMPTY_FS: EmptyFs = EmptyFs;
+    fn mount(&mut self, prefix: &'static [u8], fs: &'static dyn Filesystem) {
+        assert!(self.mount_count < MAX_MOUNTS, "VFS: mount table full");
+        self.mounts[self.mount_count] = Some(Mount { prefix, fs });
+        self.mount_count += 1;
+    }
 
-/// Get a filesystem by mount index.
-fn mount_fs(idx: u8) -> &'static dyn Filesystem {
-    unsafe { MOUNTS[idx as usize].as_ref().expect("VFS: invalid mount index").fs }
-}
+    // ── file table ───────────────────────────────────────────────────────
 
-/// Mount a filesystem at a prefix. Empty prefix = root.
-pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
-    unsafe {
-        assert!(MOUNT_COUNT < MAX_MOUNTS, "VFS: mount table full");
-        MOUNTS[MOUNT_COUNT] = Some(Mount { prefix, fs });
-        MOUNT_COUNT += 1;
+    fn alloc_file_entry(&self) -> Option<usize> {
+        (0..MAX_OPEN_FILES).find(|&i| self.file_table[i].refcount == 0)
+    }
+
+    fn close_handle(&mut self, idx: i32) {
+        if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
+            let entry = &mut self.file_table[idx as usize];
+            if entry.refcount > 0 {
+                entry.refcount -= 1;
+            }
+        }
+    }
+
+    fn add_ref(&mut self, idx: i32) {
+        if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
+            self.file_table[idx as usize].refcount += 1;
+        }
+    }
+
+    // ── dir cache ────────────────────────────────────────────────────────
+
+    fn invalidate_dir_cache(&mut self) {
+        self.dir_cache.valid = false;
+    }
+
+    /// Populate the directory cache for `dir` (single pass).
+    fn populate_dir_cache(&mut self, dir: &[u8]) {
+        let dlen = dir.len().min(self.dir_cache.dir.len());
+        self.dir_cache.dir[..dlen].copy_from_slice(&dir[..dlen]);
+        self.dir_cache.dir_len = dlen;
+        self.dir_cache.entries.clear();
+
+        let (_midx, fs, subpath) = self.resolve_mount(dir);
+        let mut idx = 0usize;
+        while let Some(e) = fs.readdir(subpath, idx) {
+            self.dir_cache.entries.push(e);
+            idx += 1;
+        }
+
+        // Synthesize mount-point directories.
+        for i in 0..self.mount_count {
+            if let Some(ref m) = self.mounts[i] {
+                if let Some(name) = mount_child_in_dir(m.prefix, dir) {
+                    let name_len = name.len().min(100);
+                    let mut de = DirEntry {
+                        name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
+                    };
+                    de.name[..name_len].copy_from_slice(&name[..name_len]);
+                    self.dir_cache.entries.push(de);
+                }
+            }
+        }
+
+        // RAM overlay files.
+        for (key, data) in self.ram_files.iter() {
+            if let Some(basename) = entry_in_ram_dir(key, dir) {
+                let len = basename.len().min(100);
+                let mut de = DirEntry {
+                    name: [0; 100], name_len: len, size: data.len() as u32,
+                    is_dir: false, mode: 0o644,
+                };
+                de.name[..len].copy_from_slice(&basename[..len]);
+                self.dir_cache.entries.push(de);
+            }
+        }
+
+        self.dir_cache.valid = true;
+    }
+
+    fn readdir(&mut self, dir: &[u8], index: usize) -> Option<DirEntry> {
+        let stale = !self.dir_cache.valid
+            || self.dir_cache.dir_len != dir.len()
+            || self.dir_cache.dir[..self.dir_cache.dir_len] != *dir;
+        if stale {
+            self.populate_dir_cache(dir);
+        }
+        self.dir_cache.entries.get(index).map(clone_dir_entry)
+    }
+
+    fn dir_exists(&self, path: &[u8]) -> bool {
+        let (_midx, fs, subpath) = self.resolve_mount(path);
+        fs.dir_exists(subpath)
+    }
+
+    // ── open / create / read / write / seek ──────────────────────────────
+
+    fn open_to_handle(&mut self, path: &[u8]) -> i32 {
+        // Check RAM overlay first.
+        if let Some(data) = self.ram_files.get(path) {
+            let size = data.len() as u32;
+            let table_idx = match self.alloc_file_entry() {
+                Some(i) => i,
+                None => return -24,
+            };
+            let key_len = path.len().min(PATH_KEY_MAX) as u8;
+            let mut ram_key = [0u8; PATH_KEY_MAX];
+            ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
+            self.file_table[table_idx] = FileEntry {
+                vnode: Vnode { handle: RAM_SENTINEL, size, mode: 0o644 },
+                offset: 0,
+                refcount: 1,
+                mount_idx: 0,
+                ram_key,
+                ram_key_len: key_len,
+            };
+            return table_idx as i32;
+        }
+
+        // Path cache: skip fs.open if we've already resolved this path. The
+        // cached vnode's FS-internal handle is shared across file-table entries;
+        // each entry still has its own offset.
+        if let Some(&(midx, vnode)) = self.path_cache.get(path) {
+            let table_idx = match self.alloc_file_entry() {
+                Some(i) => i,
+                None => return -24,
+            };
+            self.file_table[table_idx] = FileEntry {
+                vnode, offset: 0, refcount: 1, mount_idx: midx,
+                ram_key: [0; PATH_KEY_MAX], ram_key_len: 0,
+            };
+            return table_idx as i32;
+        }
+
+        let (midx, fs, subpath) = self.resolve_mount(path);
+        let vnode = match fs.open(subpath) {
+            Some(v) => v,
+            None => return -2,
+        };
+
+        self.path_cache.insert(path.to_vec(), (midx, vnode));
+
+        let table_idx = match self.alloc_file_entry() {
+            Some(i) => i,
+            None => return -24,
+        };
+        self.file_table[table_idx] = FileEntry {
+            vnode,
+            offset: 0,
+            refcount: 1,
+            mount_idx: midx,
+            ram_key: [0; PATH_KEY_MAX],
+            ram_key_len: 0,
+        };
+        table_idx as i32
+    }
+
+    fn create_to_handle(&mut self, path: &[u8]) -> i32 {
+        let (midx, fs, subpath) = self.resolve_mount(path);
+        if let Some(vnode) = fs.create(subpath) {
+            let table_idx = match self.alloc_file_entry() {
+                Some(i) => i,
+                None => return -24,
+            };
+            self.file_table[table_idx] = FileEntry {
+                vnode,
+                offset: 0,
+                refcount: 1,
+                mount_idx: midx,
+                ram_key: [0; PATH_KEY_MAX],
+                ram_key_len: 0,
+            };
+            self.invalidate_dir_cache();
+            return table_idx as i32;
+        }
+
+        let key_len = path.len().min(PATH_KEY_MAX) as u8;
+        self.ram_files.insert(path.to_vec(), Vec::new());
+        self.invalidate_dir_cache();
+
+        let table_idx = match self.alloc_file_entry() {
+            Some(i) => i,
+            None => return -24,
+        };
+        let mut ram_key = [0u8; PATH_KEY_MAX];
+        ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
+        self.file_table[table_idx] = FileEntry {
+            vnode: Vnode { handle: RAM_SENTINEL, size: 0, mode: 0o644 },
+            offset: 0,
+            refcount: 1,
+            mount_idx: 0,
+            ram_key,
+            ram_key_len: key_len,
+        };
+        table_idx as i32
+    }
+
+    fn delete(&mut self, path: &[u8]) -> i32 {
+        if self.ram_files.remove(path).is_some() {
+            self.invalidate_dir_cache();
+            0
+        } else { -2 }
+    }
+
+    fn read_by_handle(&mut self, handle: i32, buf: &mut [u8]) -> i32 {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
+        let h = handle as usize;
+        if self.file_table[h].refcount == 0 { return -9; }
+
+        if self.file_table[h].vnode.handle == RAM_SENTINEL {
+            let off = self.file_table[h].offset as usize;
+            let klen = self.file_table[h].ram_key_len as usize;
+            let key = self.file_table[h].ram_key[..klen].to_vec();
+            if let Some(data) = self.ram_files.get(&key) {
+                if off >= data.len() { return 0; }
+                let avail = data.len() - off;
+                let n = buf.len().min(avail);
+                buf[..n].copy_from_slice(&data[off..off + n]);
+                self.file_table[h].offset += n as u32;
+                return n as i32;
+            }
+            return 0;
+        }
+
+        let (mount_idx, fs_handle, offset, size) = {
+            let e = &self.file_table[h];
+            (e.mount_idx, e.vnode.handle, e.offset, e.vnode.size)
+        };
+        let n = self.mount_fs(mount_idx).read(fs_handle, offset, buf, size);
+        if n > 0 { self.file_table[h].offset += n as u32; }
+        n
+    }
+
+    fn write_by_handle(&mut self, handle: i32, data: &[u8]) -> i32 {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
+        let h = handle as usize;
+        if self.file_table[h].refcount == 0 { return -9; }
+
+        if self.file_table[h].vnode.handle == RAM_SENTINEL {
+            let off = self.file_table[h].offset as usize;
+            let klen = self.file_table[h].ram_key_len as usize;
+            let key = self.file_table[h].ram_key[..klen].to_vec();
+            if let Some(file_data) = self.ram_files.get_mut(&key) {
+                let end = off + data.len();
+                if end > file_data.len() { file_data.resize(end, 0); }
+                file_data[off..end].copy_from_slice(data);
+                let new_size = file_data.len() as u32;
+                self.file_table[h].offset = end as u32;
+                self.file_table[h].vnode.size = new_size;
+                return data.len() as i32;
+            }
+            return -9;
+        }
+
+        let (mount_idx, fs_handle, offset) = {
+            let e = &self.file_table[h];
+            (e.mount_idx, e.vnode.handle, e.offset)
+        };
+        let n = self.mount_fs(mount_idx).write(fs_handle, offset, data);
+        if n > 0 {
+            let e = &mut self.file_table[h];
+            e.offset += n as u32;
+            if e.offset > e.vnode.size { e.vnode.size = e.offset; }
+        }
+        n
+    }
+
+    fn seek_by_handle(&mut self, handle: i32, offset: i32, whence: i32) -> i32 {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
+        let h = handle as usize;
+        if self.file_table[h].refcount == 0 { return -9; }
+
+        let size = if self.file_table[h].vnode.handle == RAM_SENTINEL {
+            let klen = self.file_table[h].ram_key_len as usize;
+            let key = self.file_table[h].ram_key[..klen].to_vec();
+            self.ram_files.get(&key).map(|d| d.len() as u32).unwrap_or(0)
+        } else {
+            self.file_table[h].vnode.size
+        };
+
+        let cur = self.file_table[h].offset;
+        let new_offset = match whence {
+            0 => offset as i64,
+            1 => cur as i64 + offset as i64,
+            2 => size as i64 + offset as i64,
+            _ => return -22,
+        };
+        if new_offset < 0 { return -22; }
+        self.file_table[h].offset = new_offset as u32;
+        self.file_table[h].offset as i32
+    }
+
+    fn file_size_by_handle(&self, handle: i32) -> u32 {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+        let e = &self.file_table[handle as usize];
+        if e.refcount == 0 { return 0; }
+        if e.vnode.handle == RAM_SENTINEL {
+            let key = &e.ram_key[..e.ram_key_len as usize];
+            return self.ram_files.get(key).map(|d| d.len() as u32).unwrap_or(0);
+        }
+        e.vnode.size
+    }
+
+    fn file_mode_by_handle(&self, handle: i32) -> u16 {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+        let e = &self.file_table[handle as usize];
+        if e.refcount == 0 { return 0; }
+        e.vnode.mode
     }
 }
 
-/// Global file table — slot is free when refcount == 0
-static mut FILE_TABLE: [FileEntry; MAX_OPEN_FILES] = {
-    const EMPTY: FileEntry = FileEntry {
-        vnode: Vnode { handle: 0, size: 0, mode: 0 },
-        offset: 0,
-        refcount: 0,
-        mount_idx: 0,
-        ram_key: [0; PATH_KEY_MAX],
-        ram_key_len: 0,
-    };
-    [EMPTY; MAX_OPEN_FILES]
-};
+// `Vfs` holds `&'static dyn Filesystem`, and some backends are not thread-safe
+// in isolation (the ext4 wrapper uses `Rc`/`RefCell` because `ext4_view` is
+// single-threaded). This `Send` is nonetheless sound — and SMP-correct, not a
+// single-core assumption — because *every* filesystem access goes through
+// `&mut self` while the VFS `spin::Mutex` is held, so no filesystem (and no
+// `Rc` refcount) is ever touched by two cores at once. The lock serializes all
+// FS use; this is the one `unsafe` the locking model earns, in place of the 22
+// scattered `static mut` accesses it replaced.
+unsafe impl Send for Vfs {}
+
+static VFS: Mutex<Vfs> = Mutex::new(Vfs::new());
+
+// ============================================================================
+// Pure helpers (no VFS state)
+// ============================================================================
 
 /// Case-insensitive comparison of two byte slices
 pub fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
 }
 
-// ============================================================================
-// Global file table helpers
-// ============================================================================
-
-fn alloc_file_entry() -> Option<usize> {
-    unsafe {
-        for i in 0..MAX_OPEN_FILES {
-            if FILE_TABLE[i].refcount == 0 {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
 fn alloc_fd(fds: &[FdKind; MAX_FDS]) -> Option<usize> {
-    for fd in FIRST_FD..MAX_FDS {
-        if fds[fd].is_none() {
-            return Some(fd);
-        }
-    }
-    None
+    (FIRST_FD..MAX_FDS).find(|&fd| fds[fd].is_none())
 }
 
 /// Extract VFS handle from an FdKind, or return -9 (EBADF).
@@ -244,13 +550,53 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
     }
 }
 
+fn clone_dir_entry(e: &DirEntry) -> DirEntry {
+    DirEntry {
+        name: e.name,
+        name_len: e.name_len,
+        size: e.size,
+        is_dir: e.is_dir,
+        mode: e.mode,
+    }
+}
+
+/// If a mount prefix is a direct child of `dir`, return the child name.
+/// e.g. mount "boot/" in dir "" → Some("boot"), mount "a/b/" in dir "a/" → Some("b").
+fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
+    if prefix.len() <= dir.len() { return None; }
+    if !dir.is_empty() && !eq_ignore_case(&prefix[..dir.len()], dir) { return None; }
+    let rest = &prefix[dir.len()..];
+    let name = rest.strip_suffix(b"/")?;
+    if name.is_empty() || name.contains(&b'/') { return None; }
+    Some(name)
+}
+
+fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
+    if entry_name.len() <= dir.len() { return None; }
+    if !dir.is_empty() && !eq_ignore_case(&entry_name[..dir.len()], dir) { return None; }
+    let rest = &entry_name[dir.len()..];
+    if rest.iter().any(|&b| b == b'/') { return None; }
+    Some(rest)
+}
+
 // ============================================================================
-// Public API — called by syscalls.rs and vm86.rs
+// Public API — thin locking wrappers + lock-free orchestrators.
+// Called by syscalls.rs and vm86.rs.
 // ============================================================================
 
+/// Mount a filesystem at a prefix. Empty prefix = root.
+pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
+    VFS.lock().mount(prefix, fs);
+}
+
+/// Invalidate the directory cache (call after file create/delete).
+pub fn invalidate_dir_cache() {
+    VFS.lock().invalidate_dir_cache();
+}
+
 /// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
-/// POSIX-strict case-sensitive lookup. DOS callers must resolve through DFS
-/// (which case-folds via its CI cache) before reaching here.
+/// POSIX-strict case-sensitive lookup. (Orchestrator: no lock held across the
+/// `open_to_handle` / `close_vfs_handle` wrapper calls.)
 pub fn open(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
     let handle = open_to_handle(path);
     if handle < 0 { return handle; }
@@ -303,50 +649,9 @@ pub fn create(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
 }
 
 /// Create (or truncate) a file. If the path's mount FS supports `create`,
-/// it owns the file; otherwise we fall back to the RAM overlay (so writes
-/// to read-only mounts like the root TAR are still observable in-session).
+/// it owns the file; otherwise we fall back to the RAM overlay.
 pub fn create_to_handle(path: &[u8]) -> i32 {
-    let (midx, fs, subpath) = resolve_mount(path);
-    if let Some(vnode) = fs.create(subpath) {
-        let table_idx = match alloc_file_entry() {
-            Some(i) => i,
-            None => return -24,
-        };
-        unsafe {
-            FILE_TABLE[table_idx] = FileEntry {
-                vnode,
-                offset: 0,
-                refcount: 1,
-                mount_idx: midx,
-                ram_key: [0; PATH_KEY_MAX],
-                ram_key_len: 0,
-            };
-        }
-        invalidate_dir_cache();
-        return table_idx as i32;
-    }
-
-    let key_len = path.len().min(PATH_KEY_MAX) as u8;
-    ram_files().insert(path.to_vec(), Vec::new());
-    invalidate_dir_cache();
-
-    let table_idx = match alloc_file_entry() {
-        Some(i) => i,
-        None => return -24,
-    };
-    let mut ram_key = [0u8; PATH_KEY_MAX];
-    ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-    unsafe {
-        FILE_TABLE[table_idx] = FileEntry {
-            vnode: Vnode { handle: RAM_SENTINEL, size: 0, mode: 0o644 },
-            offset: 0,
-            refcount: 1,
-            mount_idx: 0,
-            ram_key,
-            ram_key_len: key_len,
-        };
-    }
-    table_idx as i32
+    VFS.lock().create_to_handle(path)
 }
 
 /// Write to an open file descriptor.
@@ -359,10 +664,7 @@ pub fn write(fd: i32, data: &[u8], fds: &[FdKind; MAX_FDS]) -> i32 {
 
 /// Delete a RAM-backed file by absolute VFS path.
 pub fn delete(path: &[u8]) -> i32 {
-    if ram_files().remove(path).is_some() {
-        invalidate_dir_cache();
-        0
-    } else { -2 }
+    VFS.lock().delete(path)
 }
 
 /// Get the size of an open file descriptor.
@@ -381,294 +683,53 @@ pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
     }
 }
 
-/// Populate directory cache for the given directory (single pass).
-fn populate_dir_cache(dir: &[u8]) {
-    unsafe {
-        let cache_dir = &raw mut DIR_CACHE_DIR;
-        let entries = &mut *(&raw mut DIR_CACHE_ENTRIES);
-        let dlen = dir.len().min((*cache_dir).len());
-        (&mut *cache_dir)[..dlen].copy_from_slice(&dir[..dlen]);
-        DIR_CACHE_DIR_LEN = dlen;
-
-        entries.clear();
-
-        let (_midx, fs, subpath) = resolve_mount(dir);
-        let mut idx = 0usize;
-        while let Some(e) = fs.readdir(subpath, idx) {
-            entries.push(e);
-            idx += 1;
-        }
-
-        // Synthesize mount point directories
-        for i in 0..MOUNT_COUNT {
-            if let Some(ref m) = MOUNTS[i] {
-                if let Some(name) = mount_child_in_dir(m.prefix, dir) {
-                    let name_len = name.len().min(100);
-                    let mut de = DirEntry {
-                        name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
-                    };
-                    de.name[..name_len].copy_from_slice(&name[..name_len]);
-                    entries.push(de);
-                }
-            }
-        }
-
-        // RAM overlay files
-        for (key, data) in ram_files().iter() {
-            if let Some(basename) = entry_in_ram_dir(key, dir) {
-                let len = basename.len().min(100);
-                let mut de = DirEntry {
-                    name: [0; 100], name_len: len, size: data.len() as u32,
-                    is_dir: false, mode: 0o644,
-                };
-                de.name[..len].copy_from_slice(&basename[..len]);
-                entries.push(de);
-            }
-        }
-
-        DIR_CACHE_VALID = true;
-    }
-}
-
 /// Enumerate directory entries at index. Uses a single-pass cache.
 pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
-    unsafe {
-        let cache_dir = &raw const DIR_CACHE_DIR;
-        let entries = &*(&raw const DIR_CACHE_ENTRIES);
-        // Check if cache is valid for this directory
-        if !DIR_CACHE_VALID || DIR_CACHE_DIR_LEN != dir.len()
-            || (&*cache_dir)[..DIR_CACHE_DIR_LEN] != *dir
-        {
-            populate_dir_cache(dir);
-        }
-        entries.get(index).map(clone_dir_entry)
-    }
-}
-
-fn clone_dir_entry(e: &DirEntry) -> DirEntry {
-    DirEntry {
-        name: e.name,
-        name_len: e.name_len,
-        size: e.size,
-        is_dir: e.is_dir,
-        mode: e.mode,
-    }
-}
-
-/// If a mount prefix is a direct child of `dir`, return the child name.
-/// e.g. mount "boot/" in dir "" → Some("boot"), mount "a/b/" in dir "a/" → Some("b").
-fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    // Mount prefix must start with dir
-    if prefix.len() <= dir.len() { return None; }
-    if !dir.is_empty() && !eq_ignore_case(&prefix[..dir.len()], dir) { return None; }
-    let rest = &prefix[dir.len()..];
-    // rest should be "name/" — one component with trailing slash
-    let name = rest.strip_suffix(b"/")?;
-    if name.is_empty() || name.contains(&b'/') { return None; }
-    Some(name)
-}
-
-fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    if entry_name.len() <= dir.len() { return None; }
-    if !dir.is_empty() && !eq_ignore_case(&entry_name[..dir.len()], dir) { return None; }
-    let rest = &entry_name[dir.len()..];
-    if rest.iter().any(|&b| b == b'/') { return None; }
-    Some(rest)
+    VFS.lock().readdir(dir, index)
 }
 
 /// Check if a directory exists on a mounted filesystem.
 pub fn dir_exists(path: &[u8]) -> bool {
-    let (_midx, fs, subpath) = resolve_mount(path);
-    fs.dir_exists(subpath)
+    VFS.lock().dir_exists(path)
 }
 
-/// Decrement refcount for a VFS file table entry (used by Linux FdKind::Vfs close).
+/// Decrement refcount for a VFS file table entry (Linux FdKind::Vfs close).
 pub fn close_vfs_handle(idx: i32) {
-    if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
-        unsafe {
-            let entry = &mut FILE_TABLE[idx as usize];
-            if entry.refcount > 0 {
-                entry.refcount -= 1;
-            }
-        }
-    }
+    VFS.lock().close_handle(idx);
 }
 
-/// Increment refcount for a VFS file table entry (used by Linux fork/dup).
+/// Increment refcount for a VFS file table entry (Linux fork/dup).
 pub fn add_vfs_ref(idx: i32) {
-    if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
-        unsafe {
-            FILE_TABLE[idx as usize].refcount += 1;
-        }
-    }
+    VFS.lock().add_ref(idx);
 }
 
 /// Open a file and return the VFS file table index (not an fd slot).
 /// Used by Linux syscalls that manage their own FdKind table.
 pub fn open_to_handle(path: &[u8]) -> i32 {
-    // Check RAM overlay first
-    let ram = ram_files();
-    if let Some(data) = ram.get(path) {
-        let size = data.len() as u32;
-        let table_idx = match alloc_file_entry() {
-            Some(i) => i,
-            None => return -24,
-        };
-        let key_len = path.len().min(PATH_KEY_MAX) as u8;
-        let mut ram_key = [0u8; PATH_KEY_MAX];
-        ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-        unsafe {
-            FILE_TABLE[table_idx] = FileEntry {
-                vnode: Vnode { handle: RAM_SENTINEL, size, mode: 0o644 },
-                offset: 0,
-                refcount: 1,
-                mount_idx: 0,
-                ram_key,
-                ram_key_len: key_len,
-            };
-        }
-        return table_idx as i32;
-    }
-
-    // Path cache: skip fs.open if we've already resolved this path. The
-    // cached vnode's FS-internal handle is shared across FILE_TABLE entries;
-    // each FILE_TABLE entry still has its own offset.
-    if let Some(&(midx, vnode)) = path_cache().get(path) {
-        let table_idx = match alloc_file_entry() {
-            Some(i) => i,
-            None => return -24,
-        };
-        unsafe {
-            FILE_TABLE[table_idx] = FileEntry {
-                vnode, offset: 0, refcount: 1, mount_idx: midx,
-                ram_key: [0; PATH_KEY_MAX], ram_key_len: 0,
-            };
-        }
-        return table_idx as i32;
-    }
-
-    let (midx, fs, subpath) = resolve_mount(path);
-    let vnode = match fs.open(subpath) {
-        Some(v) => v,
-        None => return -2,
-    };
-
-    path_cache().insert(path.to_vec(), (midx, vnode));
-
-    let table_idx = match alloc_file_entry() {
-        Some(i) => i,
-        None => return -24,
-    };
-
-    unsafe {
-        FILE_TABLE[table_idx] = FileEntry {
-            vnode,
-            offset: 0,
-            refcount: 1,
-            mount_idx: midx,
-            ram_key: [0; PATH_KEY_MAX],
-            ram_key_len: 0,
-        };
-    }
-
-    table_idx as i32
+    VFS.lock().open_to_handle(path)
 }
 
 /// Read from a VFS file table entry by handle index.
 pub fn read_by_handle(handle: i32, buf: &mut [u8]) -> i32 {
-    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
-    let entry = unsafe { &mut FILE_TABLE[handle as usize] };
-    if entry.refcount == 0 { return -9; }
-
-    if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        let ram = ram_files();
-        if let Some(data) = ram.get(key) {
-            let off = entry.offset as usize;
-            if off >= data.len() { return 0; }
-            let avail = data.len() - off;
-            let n = buf.len().min(avail);
-            buf[..n].copy_from_slice(&data[off..off + n]);
-            entry.offset += n as u32;
-            return n as i32;
-        }
-        return 0;
-    }
-
-    let n = mount_fs(entry.mount_idx).read(entry.vnode.handle, entry.offset, buf, entry.vnode.size);
-    if n > 0 { entry.offset += n as u32; }
-    n
+    VFS.lock().read_by_handle(handle, buf)
 }
 
 /// Write to a VFS file table entry by handle index.
 pub fn write_by_handle(handle: i32, data: &[u8]) -> i32 {
-    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
-    let entry = unsafe { &mut FILE_TABLE[handle as usize] };
-    if entry.refcount == 0 { return -9; }
-
-    if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        let ram = ram_files();
-        if let Some(file_data) = ram.get_mut(key) {
-            let off = entry.offset as usize;
-            let end = off + data.len();
-            if end > file_data.len() { file_data.resize(end, 0); }
-            file_data[off..end].copy_from_slice(data);
-            entry.offset = end as u32;
-            entry.vnode.size = file_data.len() as u32;
-            return data.len() as i32;
-        }
-        return -9;
-    }
-
-    let n = mount_fs(entry.mount_idx).write(entry.vnode.handle, entry.offset, data);
-    if n > 0 {
-        entry.offset += n as u32;
-        if entry.offset > entry.vnode.size { entry.vnode.size = entry.offset; }
-    }
-    n
+    VFS.lock().write_by_handle(handle, data)
 }
 
 /// Seek on a VFS handle directly.
 pub fn seek_by_handle(handle: i32, offset: i32, whence: i32) -> i32 {
-    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
-    let entry = unsafe { &mut FILE_TABLE[handle as usize] };
-    if entry.refcount == 0 { return -9; }
-
-    let size = if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0)
-    } else {
-        entry.vnode.size
-    };
-
-    let new_offset = match whence {
-        0 => offset as i64,
-        1 => entry.offset as i64 + offset as i64,
-        2 => size as i64 + offset as i64,
-        _ => return -22,
-    };
-    if new_offset < 0 { return -22; }
-    entry.offset = new_offset as u32;
-    entry.offset as i32
+    VFS.lock().seek_by_handle(handle, offset, whence)
 }
 
 /// Get file size by VFS handle.
 pub fn file_size_by_handle(handle: i32) -> u32 {
-    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
-    let entry = unsafe { &FILE_TABLE[handle as usize] };
-    if entry.refcount == 0 { return 0; }
-    if entry.vnode.handle == RAM_SENTINEL {
-        let key = &entry.ram_key[..entry.ram_key_len as usize];
-        return ram_files().get(key).map(|d| d.len() as u32).unwrap_or(0);
-    }
-    entry.vnode.size
+    VFS.lock().file_size_by_handle(handle)
 }
 
 /// Get POSIX mode bits by VFS handle. Returns 0 for an invalid handle.
 pub fn file_mode_by_handle(handle: i32) -> u16 {
-    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
-    let entry = unsafe { &FILE_TABLE[handle as usize] };
-    if entry.refcount == 0 { return 0; }
-    entry.vnode.mode
+    VFS.lock().file_mode_by_handle(handle)
 }
