@@ -21,8 +21,10 @@ impl Arch for Interp {
     // ── Port I/O ──
     fn inb(&mut self, port: u16) -> u8 { crate::machine::inb(port) }
     fn inw(&mut self, port: u16) -> u16 { crate::machine::inw(port) }
+    fn inl(&mut self, port: u16) -> u32 { crate::machine::inl(port) }
     fn outb(&mut self, port: u16, val: u8) { crate::machine::outb(port, val) }
     fn outw(&mut self, port: u16, val: u16) { crate::machine::outw(port, val) }
+    fn outl(&mut self, port: u16, val: u32) { crate::machine::outl(port, val) }
 
     // ── Execution & scheduling ──
     //

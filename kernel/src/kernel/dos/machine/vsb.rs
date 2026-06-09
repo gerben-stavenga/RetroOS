@@ -16,6 +16,12 @@
 use arch_abi::Arch;
 use super::*;
 
+/// Frames the play cursor leads the real codec's playback by, when output goes
+/// to a clocked sink (metal AC'97). This *is* the audio latency; it must exceed
+/// the codec's own prime/jitter buffer so its ring never starves. ~2048 frames
+/// ≈ 93 ms @ 22 kHz.
+const AC97_CUSHION_FRAMES: u64 = 2048;
+
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
 /// "externally owned" mark — COW-fork and address-space teardown both
 /// skip such frames — exactly what an aliased permanent DMA buffer needs.
@@ -71,6 +77,13 @@ struct EmuDsp {
     next_irq: u64,    // cursor value of the next block boundary (IRQ point)
     frac: u64,        // sub-frame pacing accumulator, units of frames×1000
     last_ms: u64,     // get_ticks() at the last `audio_tick`
+    /// Codec-clock origin for this playback (clocked sink only): the sink's
+    /// `consumed` count at playback start, so the cursor measures frames
+    /// produced *since* this sound began — not since the codec powered on.
+    /// `u64::MAX` = "rebase on the next tick". Without this, restarting playback
+    /// (a new sound) while the codec has played a lot makes the first advance
+    /// enormous (IRQ flood → guest crawl; cursor races the ring → reverb).
+    clock_base: u64,
     /// Set when a block boundary is reached and its IRQ raised; cleared when the
     /// guest reads the DMA count (services the block — poll-bool/poll-dma/irq-mix
     /// all do). While set, consumption freezes at the boundary so we never
@@ -88,6 +101,7 @@ impl EmuDsp {
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0, frac: 0, last_ms: 0,
+            clock_base: 0,
             awaiting_ack: false,
         }
     }
@@ -659,6 +673,7 @@ impl SoundBlaster {
         self.emu.cursor = 0;
         self.emu.next_irq = self.emu.block_frames as u64;
         self.emu.frac = 0;
+        self.emu.clock_base = u64::MAX; // rebase the codec clock on the next tick
         self.emu.awaiting_ack = false;
         self.emu.playing = self.emu.buf_frames > 0;
     }
@@ -677,28 +692,45 @@ impl SoundBlaster {
         if self.mode != SbMode::Emulated {
             return;
         }
-        let now = machine.get_ticks();
         if !self.emu.playing {
-            self.emu.last_ms = now; // keep Δt small for the first playing tick
+            self.emu.last_ms = machine.get_ticks(); // keep Δt small for first tick
             return;
         }
         // Frozen at a block boundary until the guest services the IRQ (clears
-        // `awaiting_ack` by reading the DMA count). Absorb the elapsed time so we
-        // don't burst on release — the gate, not the clock, paces us. This is
-        // what stops the consume cursor outrunning the guest's refill (which
-        // would re-read stale ring frames and repeat the previous lap's audio).
+        // `awaiting_ack` by reading the DMA count). This is what stops the
+        // consume cursor outrunning the guest's refill (which would re-read
+        // stale ring frames and repeat the previous lap's audio).
         if self.emu.awaiting_ack {
-            self.emu.last_ms = now;
+            self.emu.last_ms = machine.get_ticks();
             return;
         }
+        // Virtual-time advance — always computed. This is the FLOOR that keeps
+        // the guest progressing no matter what the codec does: if a clocked sink
+        // stalls (underrun/halt), the cursor still advances at real rate, so the
+        // guest (which polls the DMA count) never deadlocks into a crawl.
+        let now = machine.get_ticks();
         let dt = now.saturating_sub(self.emu.last_ms);
         self.emu.last_ms = now;
-        if dt == 0 {
-            return;
-        }
         self.emu.frac += self.emu.rate as u64 * dt; // units: frames × 1000
-        let mut advance = self.emu.frac / 1000;
+        let virt = self.emu.frac / 1000;
         self.emu.frac %= 1000;
+
+        // With a clocked sink (metal AC'97), *follow* the codec when it is the
+        // limiting clock — produce enough to keep a fixed cushion ahead of real
+        // playback — but never below the virtual-time floor. Without a clocked
+        // sink (interp WAV) the floor is the pacing.
+        let mut advance = match crate::kernel::sound::sink_clock(machine) {
+            Some(consumed) => {
+                // Rebase the codec clock to this playback's start.
+                if self.emu.clock_base == u64::MAX {
+                    self.emu.clock_base = consumed;
+                }
+                let played = consumed.saturating_sub(self.emu.clock_base);
+                let clk = (played + AC97_CUSHION_FRAMES).saturating_sub(self.emu.cursor);
+                virt.max(clk)
+            }
+            None => virt,
+        };
         if advance == 0 {
             return;
         }

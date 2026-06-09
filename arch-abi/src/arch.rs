@@ -171,8 +171,10 @@ pub trait Arch {
 
     fn inb(&mut self, port: u16) -> u8;
     fn inw(&mut self, port: u16) -> u16;
+    fn inl(&mut self, port: u16) -> u32;
     fn outb(&mut self, port: u16, val: u8);
     fn outw(&mut self, port: u16, val: u16);
+    fn outl(&mut self, port: u16, val: u32);
 
     // ── Execution & scheduling ─────────────────────────────────────────────
     //

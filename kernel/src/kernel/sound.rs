@@ -65,7 +65,7 @@ impl Format {
     }
 
     /// Decode frame `i` into (left, right) canonical i16. Mono duplicates.
-    fn frame(self, bytes: &[u8], i: usize) -> (i16, i16) {
+    pub(crate) fn frame(self, bytes: &[u8], i: usize) -> (i16, i16) {
         let sb = (self.bits as usize) / 8;
         let base = i * self.frame_bytes();
         if self.channels == 2 {
@@ -96,11 +96,26 @@ fn device_present(arch: &mut crate::TheArch) -> bool {
     }
 }
 
+/// The monotonic played-frame count of a *clocked* output (the metal AC'97
+/// codec), or `None` when the sink has no real clock (the interpreter's WAV /
+/// port-window sink). A producer paces itself to this so it follows the real
+/// DAC; a `None` sink leaves the producer on virtual-time pacing.
+pub fn sink_clock(arch: &mut crate::TheArch) -> Option<u64> {
+    crate::kernel::ac97::consumed_frames(arch)
+}
+
 /// Stream a block of source PCM `bytes` (`fmt`, `rate` Hz) to the canonical
 /// audio device, canonicalizing to i16 stereo on the way. A no-op when no
 /// device answers the signature probe (so the existing SB passthrough still
 /// owns sound on metal).
 pub fn play(arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
+    // A discovered hardware codec (metal AC'97) is the real output and takes
+    // precedence; otherwise fall back to the canonical audio device behind the
+    // port window (the interpreter's WAV sink, or nothing).
+    if crate::kernel::ac97::present() {
+        crate::kernel::ac97::play(arch, rate, fmt, bytes);
+        return;
+    }
     if !device_present(arch) {
         return;
     }

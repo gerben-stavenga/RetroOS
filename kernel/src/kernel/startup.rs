@@ -84,6 +84,11 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
 
     crate::kernel::stacktrace::init_from_tar();
 
+    // Probe for an AC'97 codec (metal). If present it becomes the kernel audio
+    // output for the emulated Sound Blaster; absent (no PCI, e.g. the
+    // interpreter) leaves the sound path on its port-window fallback.
+    crate::kernel::ac97::init(machine);
+
     // /CONFIG.SYS provides the master env handed to DN and any user-driven
     // launches. KEY=VALUE lines, `#` comments. Missing is fine -- yields an
     // empty env; the boot self-build below uses its own self-contained env.

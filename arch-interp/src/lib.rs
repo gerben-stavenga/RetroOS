@@ -52,8 +52,8 @@ mod vcpu;
 pub use backend::Interp;
 pub use calls::*;
 pub use machine::{
-    clean_fx_template, drain, free_page_count, get_ticks, halt_forever, inb, inw, outb, outw,
-    post_irq, rdtsc, set_irq_line, shutdown, take_pending_ticks, FxState,
+    clean_fx_template, drain, free_page_count, get_ticks, halt_forever, inb, inl, inw, outb, outl,
+    outw, post_irq, rdtsc, set_irq_line, shutdown, take_pending_ticks, FxState,
 };
 // Interactive console (hosted `main` drives input): raw terminal mode; key
 // events are posted via `post_irq` and surface to the kernel through `drain`.

@@ -23,8 +23,10 @@ impl Arch for Metal {
     // ── Port I/O ──
     fn inb(&mut self, port: u16) -> u8 { super::x86::inb(port) }
     fn inw(&mut self, port: u16) -> u16 { super::x86::inw(port) }
+    fn inl(&mut self, port: u16) -> u32 { super::x86::inl(port) }
     fn outb(&mut self, port: u16, val: u8) { super::x86::outb(port, val) }
     fn outw(&mut self, port: u16, val: u16) { super::x86::outw(port, val) }
+    fn outl(&mut self, port: u16, val: u32) { super::x86::outl(port, val) }
 
     // ── Execution & scheduling ──
     //

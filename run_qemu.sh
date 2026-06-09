@@ -37,6 +37,11 @@ esac
 # backend. Override with AUDIO_BACKEND=pa|pipewire|alsa|sdl|none if
 # auto-selection is wrong. Use SOUND=0 to omit SB16/AdLib/PC speaker devices
 # entirely.
+#
+# AC97=1 tests the kernel's Intel AC'97 driver instead of SB passthrough: it
+# presents an AC'97 codec and *omits* sb16, so the in-kernel SB emulation
+# activates (no real card answers its DSP probe) and routes its PCM through the
+# kernel sound API to the AC'97 codec.
 choose_audio_backend() {
     if [ -n "${AUDIO_BACKEND:-}" ]; then
         printf '%s\n' "$AUDIO_BACKEND"
@@ -64,6 +69,12 @@ if [ "$IMG" = "freedos" ]; then
 fi
 if [ "${SOUND:-1}" = "0" ]; then
     AUDIO_ARGS=()
+elif [ "${AC97:-0}" = "1" ]; then
+    # No sb16 (so the kernel SB emulation kicks in); an Intel AC'97 codec is the
+    # PCM output the kernel ac97 driver discovers and drives.
+    AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0"
+                -device AC97,audiodev=snd0
+                -machine pcspk-audiodev=snd0)
 else
     AUDIO_ARGS=(-audiodev "${AUDIO_BACKEND},id=snd0"
                 -device adlib,audiodev=snd0
