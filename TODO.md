@@ -1,3 +1,78 @@
+# Projects
+
+Larger architectural work / refactors (distinct from the per-game bug sprint
+below). These are sizable, multi-step efforts.
+
+## 1. Hosted backend: audio + video (DOSBox-equivalent)
+Turn the hosted/interp backend into a graphical emulator so RetroOS-hosted runs
+DOS games like DOSBox (its own kernel underneath, not a bespoke DOS layer).
+- [ ] **Real-time audio.** The canonical audio port window (0x530/0x532/0x534)
+      already receives i16-stereo frames (today → WAV). Add a real-time host
+      sink (ring buffer → audio callback) to play to speakers.
+- [ ] **Graphical window.** Render the guest VGA framebuffer (text 0xB8000 +
+      graphics 0xA0000 / mode-13h) + DAC palette + current mode to a real
+      window, replacing the terminal text paint (`screendump`). `lib::vga` has
+      the text renderer; graphics modes are new.
+- [ ] **Input.** Window keyboard events + **mouse** (→ the existing INT 33h
+      packet path). Keyboard already flows `stdin → post_irq`.
+- [ ] **Threading.** Window/event loop on the main thread, interp CPU on a
+      worker thread, sharing guest RAM (framebuffer), `post_irq` (input), an
+      audio ring. Small restructure of `kernel/src/main.rs` (CPU runs on main
+      today).
+- [ ] **Decision: host library** — SDL2 (mature, C dep, what DOSBox uses) vs
+      pure-Rust (minifb + cpal) vs winit + pixels + cpal. Hosted-only, so it
+      doesn't touch the metal/Bazel side.
+
+## 2. Per-thread / per-personality TSS I/O bitmap
+The TSS32 IOPB is a single **shared** bitmap (all threads); `allow_io_ports`
+(OPL un-trap on SB passthrough) is therefore global. It works today only because
+card presence is machine-wide.
+- [ ] Make I/O trapping **per-thread / per-personality**: e.g. a DOS thread with
+      passthrough OPL vs one emulating it; Linux/native personalities that
+      shouldn't get direct port access at all. Needs a per-thread IOPB swapped on
+      context switch (or a per-personality TSS). See
+      `arch-metal/src/descriptors.rs` (`setup_vm86_bitmaps`, `allow_io_ports`).
+
+## 3. Better kernel init structure
+`startup.rs` does too much inline — TAR/ext4 mounts, CONFIG.SYS, AC'97 probe,
+hostfs, the cmdline/DN dispatch, the boot self-build — in one long function.
+- [ ] Restructure into clear ordered init phases (device registration,
+      filesystem mount, personality setup, run/loop), so the metal and hosted
+      entry points share one clean, legible spine.
+
+## 4. Sound Blaster: passthrough vs emulation
+Passthrough-vs-emulation is decided ad-hoc by `ensure_mode` probing, and the
+OPL / DSP / mixer / 8237 handling is split across the two paths.
+- [ ] A cleaner "real card vs emulated card" device abstraction spanning the
+      AC'97 sink, OPL (detection now; **synth** for actual music later), the
+      passthrough remap, and the DSP/mixer. See memories
+      `project_dma_zero_copy_design`, `project_ac97_lowmem_dma_window_todo`.
+
+## 5. Hosted: HDD image vs host filesystem
+The hosted backend can boot a disk image (interpreted ATA) or mount a host dir
+(hostfs over COM1); choosing/combining them is ad-hoc.
+- [ ] A clean model: boot from a disk image **or** run a program straight from a
+      host directory mounted as a drive (DOSBox-style `mount c .`), so you can
+      drop DOS games in a host folder and run them with no image build.
+
+## 6. UEFI boot + DOS personality owns its BIOS
+UEFI machines have no legacy real-mode BIOS (no INT 10h/16h/08h/… services, no
+F-segment ROM). To run DOS guests there, RetroOS must supply its own BIOS — the
+same situation the interpreter already has (no ROM).
+- [ ] **Move the C BIOS (`arch-interp/bios/bios.c`, installed via
+      `arch-interp/src/bios.rs`) out of the interp backend and into the DOS
+      personality.** It should be installed by the DOS layer whenever no native
+      BIOS is present (interpreter today; UEFI metal later) — so the personality
+      is self-contained and backend-independent, instead of the BIOS being an
+      interp-only concern. (Legacy-BIOS metal can keep using the real ROM, or
+      switch to ours for consistency.) See memory
+      `feedback_interp_needs_bios_firmware`.
+- [ ] **UEFI boot path** — a UEFI entry (vs the MBR/stage2 bootloader) that sets
+      up the kernel without firmware BIOS calls, then hands off to the same
+      `startup()`. Pairs with Project 3 (init structure).
+
+---
+
 # DOS Game Compatibility — Bug Sprint
 
 ## Kernel — virtual IF gets stuck at 0
