@@ -92,6 +92,14 @@ http_archive(
     build_file = "//stdlib:ext4_view.BUILD",
 )
 
+http_archive(
+    name = "spin",
+    url = "https://static.crates.io/crates/spin/spin-0.9.8.crate",
+    type = "tar.gz",
+    strip_prefix = "spin-0.9.8",
+    build_file = "//stdlib:spin.BUILD",
+)
+
 # Register toolchains
 register_toolchains(
     "@rules_nasm//nasm/toolchain",

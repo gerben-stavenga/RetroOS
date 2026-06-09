@@ -30,3 +30,6 @@ lib = { path = "../lib" }
 retroos-arch-interp = { path = "../arch-interp", optional = true }
 ext4-view = "0.9.3"
 rustc-demangle = "0.1.24"
+# no_std spinlock for shared kernel singletons (the kpipe pool, …). Minimal
+# features keep it dependency-free (no `lock_api`).
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "mutex"] }

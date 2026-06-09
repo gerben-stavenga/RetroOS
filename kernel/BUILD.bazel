@@ -20,7 +20,7 @@ rust_static_library(
         "-Crelocation-model=static",
         "-Cforce-frame-pointers=yes",
     ],
-    deps = ["//arch-abi", "//arch-metal", "//lib", "@ext4_view//:ext4_view"],
+    deps = ["//arch-abi", "//arch-metal", "//lib", "@ext4_view//:ext4_view", "@spin//:spin"],
 )
 
 genrule(
