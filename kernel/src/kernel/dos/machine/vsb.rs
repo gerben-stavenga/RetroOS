@@ -66,6 +66,11 @@ struct EmuDsp {
     bits: u8,         // 8 or 16
     stereo: bool,     // false = mono, true = interleaved L/R
     block_param: u16, // DSP block size set by 0x48 (transfers − 1)
+    /// Single-cycle DMA (DSP 0x14/0x91/0xC0/0xB0 without the auto-init bit):
+    /// play the buffer ONCE, raise the IRQ at the end, then stop — vs auto-init
+    /// (0x1C/0xC6/0xB6) which loops the ring and IRQs per block. Dune 2 speech
+    /// uses single-cycle.
+    single: bool,
 
     /// Ring geometry, snapshotted from the virtual 8237 at `start playback`.
     buf_gpa: u32,      // DOS-physical base of the auto-init ring
@@ -99,6 +104,7 @@ impl EmuDsp {
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
             reset_prev: 0,
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
+            single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0, frac: 0, last_ms: 0,
             clock_base: 0,
@@ -606,10 +612,10 @@ impl SoundBlaster {
         }
         // Parameter count by command (only the subset DSP clients use here).
         let need = match val {
-            0x40 => 1,                         // set time constant
-            0x41 | 0x42 | 0x48 | 0x80 => 2,    // out/in rate, block size, silence
-            0xB0..=0xBF | 0xC0..=0xCF => 3,    // 16/8-bit DMA: mode + length lo/hi
-            _ => 0,
+            0x40 => 1,                            // set time constant
+            0x14 | 0x41 | 0x42 | 0x48 | 0x80 => 2, // single-cycle len, out/in rate, block, silence
+            0xB0..=0xBF | 0xC0..=0xCF => 3,       // SB16 16/8-bit DMA: mode + length lo/hi
+            _ => 0,                               // 0x1C/0x90/0x91 etc. take no params
         };
         if need > 0 {
             self.emu.cmd = Some(val);
@@ -637,14 +643,21 @@ impl SoundBlaster {
             0x41 => self.emu.rate = ((p[0] as u32) << 8) | p[1] as u32, // output rate (hi, lo)
             0x42 => {}                                                  // input rate: ignore
             0x48 => self.emu.block_param = (p[0] as u16) | ((p[1] as u16) << 8),
-            0x1C | 0x2C => self.emu_start(8, false, None),              // 8-bit mono auto-init (block from 0x48)
-            0xC4 | 0xC6 => {
+            // Legacy 8-bit mono output. 0x1C/0x90 = auto-init (block from 0x48);
+            // 0x14/0x91 = single-cycle (play once; length from the 8237).
+            0x1C | 0x90 => self.emu_start(8, false, None, false),
+            0x14 | 0x91 => self.emu_start(8, false, None, true),
+            // SB16 8-/16-bit output: mode byte + 16-bit length; bit1 = auto-init,
+            // its absence = single-cycle. (0xC8.., 0xB8.. are input/ADC — ignored.)
+            0xC0..=0xC7 => {
                 let stereo = p[0] & 0x20 != 0;
-                self.emu_start(8, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)));
+                let single = cmd & 0x02 == 0;
+                self.emu_start(8, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
             }
-            0xB4 | 0xB6 => {
+            0xB0..=0xB7 => {
                 let stereo = p[0] & 0x20 != 0;
-                self.emu_start(16, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)));
+                let single = cmd & 0x02 == 0;
+                self.emu_start(16, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
             }
             _ => {}
         }
@@ -652,16 +665,14 @@ impl SoundBlaster {
 
     /// Begin auto-init playback: snapshot the ring geometry from the active
     /// BLASTER channel's virtual-8237 programming and arm the play cursor.
-    fn emu_start(&mut self, bits: u8, stereo: bool, block_override: Option<u16>) {
+    fn emu_start(&mut self, bits: u8, stereo: bool, block_override: Option<u16>, single: bool) {
         self.emu.bits = bits;
         self.emu.stereo = stereo;
+        self.emu.single = single;
         if let Some(b) = block_override {
             self.emu.block_param = b;
         }
         let channels = if stereo { 2u32 } else { 1 };
-        // Block size is "transfers − 1"; a transfer is one sample (per channel).
-        let block_transfers = self.emu.block_param as u32 + 1;
-        self.emu.block_frames = (block_transfers / channels).max(1);
 
         let is16 = bits == 16;
         let chan = if is16 { self.dma16 as usize } else { self.dma8 as usize };
@@ -670,6 +681,14 @@ impl SoundBlaster {
         let frame_bytes = (bits as u32 / 8) * channels;
         self.emu.buf_gpa = gpa;
         self.emu.buf_frames = if frame_bytes > 0 { len_bytes / frame_bytes } else { 0 };
+        // Single-cycle: the whole buffer is one block — IRQ fires at the end and
+        // playback stops. Auto-init: IRQ per DSP block and the ring loops.
+        self.emu.block_frames = if single {
+            self.emu.buf_frames.max(1)
+        } else {
+            // Block size is "transfers − 1"; a transfer is one sample/channel.
+            ((self.emu.block_param as u32 + 1) / channels).max(1)
+        };
         self.emu.cursor = 0;
         self.emu.next_irq = self.emu.block_frames as u64;
         self.emu.frac = 0;
@@ -741,10 +760,14 @@ impl SoundBlaster {
             self.emu.frac = 0; // discard the excess; we resume on the guest's ack
             self.emit_frames(machine, regs, advance);
             self.emu.cursor += advance;
-            self.emu.next_irq += self.emu.block_frames as u64;
             self.emu.awaiting_ack = true;
             if !vpic.is_requested(self.irq) {
                 vpic.raise(self.irq);
+            }
+            if self.emu.single {
+                self.emu.playing = false; // single-cycle: one pass done, stop (no loop)
+            } else {
+                self.emu.next_irq += self.emu.block_frames as u64;
             }
         } else {
             self.emit_frames(machine, regs, advance);
