@@ -90,10 +90,12 @@ exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,file="$WORK/vars.fd" \
     -nodefaults \
     -device bochs-display \
-    -drive file="$ESP",if=none,id=esp,format=raw \
-    -device nvme,drive=esp,serial=esp0 \
     -drive file="$IMAGE",if=none,id=hd,format=raw,snapshot=on \
     -device nvme,drive=hd,serial=retro1 \
+    `# image controller FIRST: the kernel's nvme probe takes the first` \
+    `# controller it finds; OVMF locates the ESP by filesystem, not order` \
+    -drive file="$ESP",if=none,id=esp,format=raw \
+    -device nvme,drive=esp,serial=esp0 \
     -device qemu-xhci -device usb-kbd \
     -debugcon stdio \
     -no-reboot \

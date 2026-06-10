@@ -34,6 +34,28 @@ mod cmd {
 const PRIMARY_BASE: u16 = 0x1F0;
 const PRIMARY_CTRL: u16 = 0x3F6;
 
+/// Bounded presence probe: is there a primary ATA controller with a ready
+/// master drive? Unlike `reset`/`read_sectors` (which busy-wait forever and
+/// hang on machines with no ATA at all — UEFI/NVMe-only boxes read 0xFF from
+/// the whole port range), this gives up quickly so `block::init` can fall
+/// through to NVMe.
+pub fn probe() -> bool {
+    outb(PRIMARY_CTRL, 0x04);
+    for _ in 0..4 { inb(PRIMARY_CTRL); }
+    outb(PRIMARY_CTRL, 0x00);
+    outb(PRIMARY_BASE + reg::LBA_24_27_FLAGS, 0xE0);
+    for _ in 0..100_000 {
+        let s = inb(PRIMARY_BASE + reg::STATUS);
+        if s == 0xFF {
+            return false; // floating bus — no controller decodes these ports
+        }
+        if (s & (status::BSY | status::DRDY)) == status::DRDY {
+            return true;
+        }
+    }
+    false
+}
+
 /// Reset the ATA controller and wait for the drive to become ready.
 /// Needed after GRUB boot, which may leave the controller idle.
 pub fn reset() {

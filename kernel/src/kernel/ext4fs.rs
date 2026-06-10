@@ -16,7 +16,7 @@ use core::cell::RefCell;
 use core::error::Error;
 
 use ext4_view::{Ext4, Ext4Read, File};
-use crate::kernel::{hdd, vfs::{Filesystem, Vnode, DirEntry}};
+use crate::kernel::vfs::{Filesystem, Vnode, DirEntry};
 
 
 /// Reader that implements Ext4Read by reading from an ATA partition.
@@ -35,7 +35,7 @@ impl Ext4Read for DiskReader {
         let sector_count = total_bytes.div_ceil(512);
 
         let mut buf = vec![0u8; sector_count * 512];
-        hdd::read_sectors(self.partition_start + first_sector, &mut buf);
+        crate::kernel::block::read_sectors(self.partition_start + first_sector, &mut buf);
         dst.copy_from_slice(&buf[byte_offset..byte_offset + dst.len()]);
         Ok(())
     }

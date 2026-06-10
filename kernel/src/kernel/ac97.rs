@@ -33,28 +33,6 @@ use spin::Mutex;
 use crate::kernel::sound::Format;
 
 // ── PCI config space (0xCF8 address / 0xCFC data) ───────────────────────────
-const PCI_CFG_ADDR: u16 = 0xCF8;
-const PCI_CFG_DATA: u16 = 0xCFC;
-
-fn pci_read32(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
-    let addr = 0x8000_0000
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((off as u32) & 0xFC);
-    arch.outl(PCI_CFG_ADDR, addr);
-    arch.inl(PCI_CFG_DATA)
-}
-
-fn pci_write32(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
-    let addr = 0x8000_0000
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((off as u32) & 0xFC);
-    arch.outl(PCI_CFG_ADDR, addr);
-    arch.outl(PCI_CFG_DATA, val);
-}
 
 // ── AC'97 register offsets ──────────────────────────────────────────────────
 // NAM (Native Audio Mixer, BAR0): the codec's mixer/rate registers (16-bit).
@@ -127,11 +105,11 @@ pub fn present() -> bool {
 pub fn init(arch: &mut crate::TheArch) {
     // Scan bus 0 (QEMU/ICH put the AC'97 there), function 0.
     for dev in 0..32u8 {
-        let id = pci_read32(arch, 0, dev, 0, 0x00);
+        let id = crate::kernel::pci::read32(arch, 0, dev, 0, 0x00);
         if id & 0xFFFF == 0xFFFF {
             continue; // no device in this slot
         }
-        let classes = pci_read32(arch, 0, dev, 0, 0x08);
+        let classes = crate::kernel::pci::read32(arch, 0, dev, 0, 0x08);
         let class = (classes >> 24) & 0xFF;
         let subclass = (classes >> 16) & 0xFF;
         if class == 0x04 && subclass == 0x01 {
@@ -147,11 +125,11 @@ pub fn init(arch: &mut crate::TheArch) {
 fn bring_up(arch: &mut crate::TheArch, dev: u8) -> bool {
     // Enable I/O space + bus-master in the PCI command register (low 16 bits of
     // dword 0x04). Writing 0 to the status word (high 16) is harmless (RW1C).
-    let cmd = pci_read32(arch, 0, dev, 0, 0x04);
-    pci_write32(arch, 0, dev, 0, 0x04, (cmd & 0xFFFF) | 0x05);
+    let cmd = crate::kernel::pci::read32(arch, 0, dev, 0, 0x04);
+    crate::kernel::pci::write32(arch, 0, dev, 0, 0x04, (cmd & 0xFFFF) | 0x05);
 
-    let nam = (pci_read32(arch, 0, dev, 0, 0x10) & 0xFFFC) as u16; // BAR0
-    let nabm = (pci_read32(arch, 0, dev, 0, 0x14) & 0xFFFC) as u16; // BAR1
+    let nam = (crate::kernel::pci::read32(arch, 0, dev, 0, 0x10) & 0xFFFC) as u16; // BAR0
+    let nabm = (crate::kernel::pci::read32(arch, 0, dev, 0, 0x14) & 0xFFFC) as u16; // BAR1
     if nam == 0 || nabm == 0 {
         return false;
     }

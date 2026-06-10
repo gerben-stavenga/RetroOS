@@ -5,7 +5,7 @@ extern crate alloc;
 extern crate ext4_view;
 
 
-use crate::kernel::{hdd, vfs, tarfs::TarFs, ext4fs::Ext4Fs};
+use crate::kernel::{vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
 use arch_abi::Arch; // the `machine: &mut TheArch` trait methods (execute/switch_to/…)
@@ -31,12 +31,12 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
 
     crate::kernel::thread::init_threading();
 
-    // Reset ATA controller (needed when booted via GRUB)
-    hdd::reset();
+    // Pick the boot disk: ATA where present, NVMe on UEFI-class machines.
+    crate::kernel::block::init(machine);
 
     // Read MBR sector 0 to get partition table
     let mut mbr = [0u8; 512];
-    hdd::read_sectors(0, &mut mbr);
+    crate::kernel::block::read_sectors(0, &mut mbr);
 
     // Scan MBR partition table: 4 entries at 0x1BE, each 16 bytes
     // Entry: [status, CHS_start(3), type, CHS_end(3), LBA_start(4), LBA_size(4)]

@@ -4,12 +4,15 @@
 //! that gives the system meaning but doesn't require hardware privilege.
 
 pub mod ac97;
+pub mod block;
 pub mod dos;
 pub mod elf;
 pub mod exec;
 pub mod ext4fs;
 pub mod hdd;
 pub mod hostfs;
+pub mod nvme;
+pub mod pci;
 // The bare-metal demand-paging heap allocator is metal-only; the hosted build
 // uses std's global allocator, so it needs just a no-op `init()`.
 #[cfg(not(feature = "hosted"))]

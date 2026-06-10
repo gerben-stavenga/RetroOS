@@ -1,6 +1,6 @@
 //! TAR filesystem — implements the Filesystem trait for TAR archives on disk.
 
-use crate::kernel::{hdd, vfs::{Filesystem, Vnode, DirEntry}};
+use crate::kernel::vfs::{Filesystem, Vnode, DirEntry};
 use lib::tar::TarHeader;
 use alloc::vec::Vec;
 
@@ -73,7 +73,7 @@ impl TarFs {
 
     fn read_header(&self, block: u32) -> Option<TarEntry> {
         let mut buf = [0u8; BLOCK_SIZE];
-        hdd::read_sectors(self.start_sector + block, &mut buf);
+        crate::kernel::block::read_sectors(self.start_sector + block, &mut buf);
         let header = unsafe { &*(buf.as_ptr() as *const TarHeader) };
         if header.is_end() { return None; }
         let size = header.filesize() as u32;
@@ -183,7 +183,7 @@ impl Filesystem for TarFs {
             let block_offset = file_off % 512;
             let chunk = (512 - block_offset).min(to_read - done);
 
-            hdd::read_sectors(self.start_sector + data_block + block_index as u32, &mut sector_buf);
+            crate::kernel::block::read_sectors(self.start_sector + data_block + block_index as u32, &mut sector_buf);
             buf[done..done + chunk].copy_from_slice(&sector_buf[block_offset..block_offset + chunk]);
 
             done += chunk;
