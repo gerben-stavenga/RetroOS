@@ -693,10 +693,13 @@ fn handle_fork_exec(
             let cursor_off = (cursor_hi << 8) | cursor_lo;
             let col = (cursor_off % 80) as u8;
             let row = (cursor_off / 80) as u8;
-            unsafe {
-                core::ptr::write_volatile(0x450 as *mut u8, col);
-                core::ptr::write_volatile(0x451 as *mut u8, row);
-            }
+            // BDA 0040:0050 — the page-0 cursor position the child's BIOS
+            // sees. Must go through the Vcpu guest accessor: a guest address
+            // is a host address only on metal's low-mem identity window — on
+            // the interp backend a raw 0x450 deref is the host null page
+            // (SEGV'd on DN→PRINCE.EXE, the first task-spawn EXEC on interp).
+            vcpu.write::<u8>(0x450, col);
+            vcpu.write::<u8>(0x451, row);
         }
     }
 
