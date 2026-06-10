@@ -81,14 +81,23 @@ same situation the interpreter already has (no ROM).
 
 # DOS Game Compatibility — Bug Sprint
 
-## Hosted/interp — DN panel-Enter launch crashes (DPMI PM-IRQ delivery)
-- [ ] **Repro (deterministic, headless):** boot image on retroos-host, type
-      `cd \GAMES\PRINCE`, Down, Enter → VM86 panic `unhandled opcode at
-      ffbf:0433 (lin=0x100023)`, `last_irq=vec08 handler=0027:0510`. The
-      typed-command launch (`PRINCE` at the DN prompt → synth task spawn)
-      WORKS; panel-Enter takes DN's in-process route instead: DN.PRG (a
-      BP7/RTM **DPMI client**) exits to free memory, the dn.com stub
-      re-EXECs DN.PRG, and the crash hits shortly after the re-EXEC.
+## Hosted/interp — DN launch crashes in the swap cycle (DPMI PM-IRQ delivery)
+- [ ] **Repro (deterministic per keystroke-timing pattern, headless):** boot
+      image on retroos-host, type `cd \GAMES\PRINCE` (0.15s/char), Down,
+      Enter → VM86 panic `unhandled opcode at ffbf:0433 (lin=0x100023)`,
+      `last_irq=vec08 handler=0027:0510`. NOT a panel-vs-typed mechanism
+      split: BOTH routes go through COMSPEC → our COMMAND.COM →
+      SYNTH_FORK_EXEC (confirmed by F11 task switching working after panel
+      launches on metal). DN wraps EVERY exec in its swap cycle — DN.PRG (a
+      BP7/RTM **DPMI client**) exits, the dn.com stub runs the target, then
+      re-EXECs DN.PRG — and the crash is a timer IRQ landing in a vulnerable
+      window of that DPMI exit/re-entry sequence (faulting delivery at
+      cs=0502 = DN.PRG resident code during swap-out; same script minus the
+      Enter survives 45s+). Instruction-anchored virtual time makes hit/miss
+      deterministic for a given input-timing pattern — which is why some
+      scripted runs survive the identical key sequence with different
+      sleeps. Metal presumably wins by IRQ-phase luck OR handles the lane
+      correctly; get a metal trace to tell which.
 - [ ] **Established:** `0027:0510` is `pm_vectors[8]`'s DEFAULT entry —
       `VECTOR_STUB_SEL` (LDT idx 4) : stub slot 8 — NOT a client hook. So the
       crash is in the kernel's own default reflect lane: vec08 →
