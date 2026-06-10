@@ -1,10 +1,20 @@
-//! TAR filesystem — implements the Filesystem trait for TAR archives on disk.
+//! TAR filesystem — implements the Filesystem trait for TAR archives, either
+//! on disk (the boot partition) or in RAM (the kernel's embedded bootfs).
 
 use crate::kernel::vfs::{Filesystem, Vnode, DirEntry};
 use lib::tar::TarHeader;
 use alloc::vec::Vec;
 
 const BLOCK_SIZE: usize = 512;
+
+/// Where the TAR bytes live. Everything above `read_block` is identical for
+/// both: a TAR is a TAR.
+enum Source {
+    /// TAR partition on the boot disk, starting at this sector.
+    Disk(u32),
+    /// TAR bytes in RAM (`kernel::bootfs()`, linked into the kernel image).
+    Ram(&'static [u8]),
+}
 
 /// In-memory index entry. The TAR is a singly-linked list on disk, so
 /// `open()` would otherwise have to PIO-read the chain block-by-block on
@@ -24,7 +34,7 @@ struct IndexEntry {
 }
 
 pub struct TarFs {
-    start_sector: u32,
+    source: Source,
     /// Entries sorted by name (POSIX-strict). DOS callers go through DFS,
     /// which keeps a separate per-dir 8.3-alias cache and translates DOS
     /// names to canonical VFS names before reaching here.
@@ -33,7 +43,29 @@ pub struct TarFs {
 
 impl TarFs {
     pub const fn new(start_sector: u32) -> Self {
-        Self { start_sector, index: Vec::new() }
+        Self { source: Source::Disk(start_sector), index: Vec::new() }
+    }
+
+    /// A TAR held in RAM (the embedded bootfs).
+    pub fn new_ram(bytes: &'static [u8]) -> Self {
+        Self { source: Source::Ram(bytes), index: Vec::new() }
+    }
+
+    /// The one source-specific primitive: fetch TAR block `block` into `buf`.
+    /// RAM reads past the end yield zeros — TAR end-of-archive, so a
+    /// truncated blob still terminates the index walk.
+    fn read_block(&self, block: u32, buf: &mut [u8; BLOCK_SIZE]) {
+        match self.source {
+            Source::Disk(start) => { crate::kernel::block::read_sectors(start + block, buf); }
+            Source::Ram(bytes) => {
+                let off = block as usize * BLOCK_SIZE;
+                buf.fill(0);
+                if off < bytes.len() {
+                    let n = (bytes.len() - off).min(BLOCK_SIZE);
+                    buf[..n].copy_from_slice(&bytes[off..off + n]);
+                }
+            }
+        }
     }
 
     /// Walk the on-disk TAR header chain once and cache entries in RAM.
@@ -60,8 +92,13 @@ impl TarFs {
         self.index.sort_by(|a, b| {
             a.name[..a.name_len as usize].cmp(&b.name[..b.name_len as usize])
         });
-        crate::println!("TAR: indexed {} entries from sector {:#x}",
-            self.index.len(), self.start_sector);
+        match self.source {
+            Source::Disk(start) => crate::println!(
+                "TAR: indexed {} entries from sector {:#x}", self.index.len(), start),
+            Source::Ram(bytes) => crate::println!(
+                "TAR: indexed {} entries from embedded bootfs ({} KB)",
+                self.index.len(), bytes.len() / 1024),
+        }
     }
 
     /// O(log N) case-sensitive lookup.
@@ -73,7 +110,7 @@ impl TarFs {
 
     fn read_header(&self, block: u32) -> Option<TarEntry> {
         let mut buf = [0u8; BLOCK_SIZE];
-        crate::kernel::block::read_sectors(self.start_sector + block, &mut buf);
+        self.read_block(block, &mut buf);
         let header = unsafe { &*(buf.as_ptr() as *const TarHeader) };
         if header.is_end() { return None; }
         let size = header.filesize() as u32;
@@ -183,7 +220,7 @@ impl Filesystem for TarFs {
             let block_offset = file_off % 512;
             let chunk = (512 - block_offset).min(to_read - done);
 
-            crate::kernel::block::read_sectors(self.start_sector + data_block + block_index as u32, &mut sector_buf);
+            self.read_block(data_block + block_index as u32, &mut sector_buf);
             buf[done..done + chunk].copy_from_slice(&sector_buf[block_offset..block_offset + chunk]);
 
             done += chunk;

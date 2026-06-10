@@ -414,29 +414,37 @@ pub struct LegacyPages {
     /// Page table for kernel region (0xC0800000-0xC0BFFFFF)
     /// PT[0-511]: PML4 region, PT[512-767]: low mem, PT[768-1023]: kernel
     pub pt_kernel: PageTable32,
+    /// Kernel overflow page table (PD[771], 0xC0C00000-0xC0FFFFFF): the
+    /// kernel image past its first 1 MB (the embedded bootfs makes it ~2 MB).
+    pub pt_kernel2: PageTable32,
 }
 
-/// PAE mode kernel page tables (3 pages = 12KB)
+/// PAE mode kernel page tables (5 pages = 20KB)
 ///
 /// With PDPT[3] = PDPT (recursive), the PDPT acts as a 512-entry "virtual PD"
 /// for addresses 0xC0000000-0xFFFFFFFF. PDPT[4-511] become kernel PD entries.
 /// Identity mapping uses SCRATCH page as both PD and PT (temporary, removed after boot)
-/// Assumes kernel < 1MB (same as legacy mode)
+/// Assumes kernel < 5MB (same as legacy mode)
 #[derive(Clone)]
 #[repr(C)]
 pub struct PaePages {
     /// PDPT - also acts as "virtual PD" via PDPT[3] recursion
-    /// PDPT[0] = scratch (identity), PDPT[3] = PDPT, PDPT[4] = pt_pml4, PDPT[5] = pt_kernel
+    /// PDPT[0] = scratch (identity), PDPT[3] = PDPT, PDPT[4] = pt_pml4,
+    /// PDPT[5] = pt_kernel, PDPT[6] = pt_kernel2, PDPT[7] = pt_kernel3
     pub pdpt: PageTable64,
     /// Page table for PML4 region (PDPT[4], covers 0xC0800000-0xC09FFFFF)
     pub pt_pml4: PageTable64,
     /// Page table for low mem + kernel (PDPT[5], 0xC0A00000-0xC0BFFFFF)
     pub pt_kernel: PageTable64,
+    /// Kernel overflow page tables (PDPT[6]/[7], 0xC0C00000-0xC0FFFFFF): the
+    /// kernel image past its first 1 MB (the embedded bootfs makes it ~2 MB).
+    pub pt_kernel2: PageTable64,
+    pub pt_kernel3: PageTable64,
 }
 
-/// Kernel page tables (3 pages for PAE, 2 for legacy)
+/// Kernel page tables (5 pages for PAE, 3 for legacy)
 #[allow(dead_code)]
-pub struct KernelPages([RawPage; 3]);
+pub struct KernelPages([RawPage; 5]);
 
 impl KernelPages {
     pub fn legacy(&mut self) -> &mut LegacyPages {
@@ -451,7 +459,7 @@ impl KernelPages {
 }
 
 /// Kernel pages - statically allocated page tables
-static mut KERNEL_PAGES: KernelPages = KernelPages([const { RawPage([0; PAGE_SIZE]) }; 3]);
+static mut KERNEL_PAGES: KernelPages = KernelPages([const { RawPage([0; PAGE_SIZE]) }; 5]);
 
 /// PML4 for long mode - shared with PAE via PML4[0] = PDPT
 static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
@@ -1014,8 +1022,15 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
 
     // Map kernel at KERNEL_BASE (0xC0B00000)
     // PT index for 0xC0B00000: (0xC0B00000 >> 12) & 0x3FF = 768
-    for i in 0..kernel_pages.min(256) {
-        kpages.pt_kernel[768 + i] = Entry32::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
+    // Pages past the first 1 MB (PT end) continue in pt_kernel2 (PD[771],
+    // 0xC0C00000+) — the embedded bootfs pushes the kernel past 1 MB.
+    for i in 0..kernel_pages.min(256 + 1024) {
+        let e = Entry32::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
+        if i < 256 {
+            kpages.pt_kernel[768 + i] = e;
+        } else {
+            kpages.pt_kernel2[i - 256] = e;
+        }
     }
 
     // Setup page directory
@@ -1027,6 +1042,9 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
 
     // PD[770] = kernel region (0xC0800000 >> 22 = 770)
     kpages.pd[770] = Entry32::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
+
+    // PD[771] = kernel overflow (0xC0C00000-0xC0FFFFFF)
+    kpages.pd[771] = Entry32::new(boot_phys_page(&kpages.pt_kernel2.0), true, false);
 
     unsafe {
         crate::x86::write_cr3(boot_phys_addr(&kpages.pd.0) as u32);
@@ -1073,9 +1091,18 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     }
 
     // Map kernel at KERNEL_BASE (0xC0B00000)
-    // PT index 256-511 maps kernel (up to 1MB)
-    for i in 0..kernel_pages.min(256) {
-        kpages.pt_kernel[256 + i] = Entry64::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
+    // PT index 256-511 maps kernel (up to 1MB); pages past that continue in
+    // pt_kernel2/pt_kernel3 (PDPT[6]/[7], 0xC0C00000+, 2MB per table) — the
+    // embedded bootfs pushes the kernel past 1 MB.
+    for i in 0..kernel_pages.min(256 + 1024) {
+        let e = Entry64::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
+        if i < 256 {
+            kpages.pt_kernel[256 + i] = e;
+        } else if i < 256 + 512 {
+            kpages.pt_kernel2[i - 256] = e;
+        } else {
+            kpages.pt_kernel3[i - 256 - 512] = e;
+        }
     }
 
     // Setup PDPT (virtual root — has R/W bits for COW tracking)
@@ -1083,6 +1110,8 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     kpages.pdpt[3] = Entry64::new(boot_phys_page(&kpages.pdpt.0), true, false);
     kpages.pdpt[4] = Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false);
     kpages.pdpt[5] = Entry64::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
+    kpages.pdpt[6] = Entry64::new(boot_phys_page(&kpages.pt_kernel2.0), true, false);
+    kpages.pdpt[7] = Entry64::new(boot_phys_page(&kpages.pt_kernel3.0), true, false);
 
     // Boot with virtual root in CR3 directly (R/W bits in PDPT[0..3] are
     // technically reserved, but OK for boot — we switch to the thread's
@@ -1100,16 +1129,15 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
 /// Enable paging with auto-detected mode
 /// scratch is used for identity mapping (temporary, can be reused after remove_identity_mapping)
 pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: usize) {
-    // The kernel mapping is hard-wired to PDE[770]'s last 1 MB
-    // (0xC0B00000-0xC0BFFFFF = 256 pages). Anything beyond gets silently
-    // truncated by `kernel_pages.min(256)` in enable_legacy/enable_pae and
-    // page-faults at runtime — see kernel/src/lib.rs:78. Trip a clear assert
-    // before that happens.
-    assert!(kernel_pages <= 256,
-        "kernel too large: {} pages (>{} pages = 1 MB). Either shrink the \
-         kernel or extend the mapping in enable_legacy/enable_pae to also \
-         populate PDE[771]+.",
-        kernel_pages, 256);
+    // The kernel mapping covers 0xC0B00000-0xC0FFFFFF (PDE[770]'s last 1 MB
+    // + the pt_kernel2/3 overflow tables = 5 MB, 1280 pages). Anything beyond
+    // gets silently truncated by the `.min()` in enable_legacy/enable_pae and
+    // page-faults at runtime. Trip a clear assert before that happens.
+    assert!(kernel_pages <= 256 + 1024,
+        "kernel too large: {} pages (>{} pages = 5 MB). Either shrink the \
+         kernel or extend the mapping in enable_legacy/enable_pae with more \
+         overflow page tables (PDE[772]+).",
+        kernel_pages, 256 + 1024);
     // Note: physical_page() not available until page tables are set up
     if !cpu_supports_pae() {
         let scratch32 = unsafe { &mut *(scratch as *mut PageTable32) };

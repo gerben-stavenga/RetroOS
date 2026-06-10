@@ -48,6 +48,39 @@ genrule(
     cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
 )
 
+genrule(
+    name = "kernel_md5_bare",
+    srcs = ["//kernel:kernel_elf_bare"],
+    outs = ["kernel_bare.elf.md5"],
+    cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
+)
+
+# DN file manager — shipped both in the boot bundle (disk boots) and in the
+# kernel's embedded bootfs (diskless boots).
+_DN_FILES = {
+    "apps-boot/dn/DN." + ext: "DN/DN." + ext
+    for ext in ["COM", "PRG", "OVR", "DLG", "LNG", "HLP", "EDT", "EXT",
+                "HGL", "MNU", "VWR", "XRN", "FLG", "HIS"]
+}
+
+# The kernel's embedded boot filesystem: DN + COMMAND.COM + a fallback
+# CONFIG.SYS — the environment that is always there. Linked into kernel.elf
+# as raw bytes (//kernel:bootfs_obj) and mounted at /boot/ when no TAR boot
+# partition exists, so a bare kernel.elf booted from any multiboot loader
+# (someone's existing GRUB) comes up with a usable system, no RetroOS disk
+# required.
+_BOOTFS_FILES = {
+    "//apps-boot/command:command_com": "COMMAND.COM",
+    "etc/CONFIG.BOOTFS": "CONFIG.SYS",
+}
+_BOOTFS_FILES.update(_DN_FILES)
+
+pkg_tar(
+    name = "bootfs_tar",
+    files = _BOOTFS_FILES,
+    visibility = ["//kernel:__pkg__"],
+)
+
 # Boot bundle (small TAR, mounted at /boot/ when ext4 is root). Holds
 # everything the kernel touches before userland is up: bootloader, kernel,
 # self-build sources for COMMAND.COM, DN file manager, DOS32A extender.
@@ -57,27 +90,27 @@ _BOOT_FILES = {
     ":kernel_md5": "kernel.elf.md5",
     "//kernel:kernel_elf": "kernel.elf",
     "//apps-boot/command:command.c":     "SRC/COMMAND.C",
-    "apps-boot/dn/DN.COM": "DN/DN.COM",
-    "apps-boot/dn/DN.PRG": "DN/DN.PRG",
-    "apps-boot/dn/DN.OVR": "DN/DN.OVR",
-    "apps-boot/dn/DN.DLG": "DN/DN.DLG",
-    "apps-boot/dn/DN.LNG": "DN/DN.LNG",
-    "apps-boot/dn/DN.HLP": "DN/DN.HLP",
-    "apps-boot/dn/DN.EDT": "DN/DN.EDT",
-    "apps-boot/dn/DN.EXT": "DN/DN.EXT",
-    "apps-boot/dn/DN.HGL": "DN/DN.HGL",
-    "apps-boot/dn/DN.MNU": "DN/DN.MNU",
-    "apps-boot/dn/DN.VWR": "DN/DN.VWR",
-    "apps-boot/dn/DN.XRN": "DN/DN.XRN",
-    "apps-boot/dn/DN.FLG": "DN/DN.FLG",
-    "apps-boot/dn/DN.HIS": "DN/DN.HIS",
 }
+_BOOT_FILES.update(_DN_FILES)
+
+# image_min's boot bundle: the bare kernel (no embedded bootfs). The in-OS
+# toolchain genrules (//apps-boot/command:command_com, //apps/dosrt:stub_exe)
+# boot image_min, and the full kernel embeds COMMAND.COM — swapping in the
+# bare kernel here is what keeps that acyclic.
+_BOOT_FILES_MIN = dict(_BOOT_FILES)
+_BOOT_FILES_MIN.pop("//kernel:kernel_elf")
+_BOOT_FILES_MIN.pop(":kernel_md5")
+_BOOT_FILES_MIN["//kernel:kernel_elf_bare"] = "kernel.elf"
+_BOOT_FILES_MIN[":kernel_md5_bare"] = "kernel.elf.md5"
 
 # Extras (live on ext4 in the boot+ext4 image, or alongside boot files in the
 # monolithic open-source image). Linux-personality binaries, test programs,
 # and busybox.
 _EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
+    # Prebuilt by in-OS TCC at image-build time (it used to be self-built at
+    # every boot); DN's "COMMAND.COM /C ..." EXECs this from C:\.
+    "//apps-boot/command:command_com": "COMMAND.COM",
     "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
     "//apps-boot/command:LOADFIX.CFG": "LOADFIX.CFG",
     "//apps/shell:shell_elf": "shell.elf",
@@ -128,6 +161,12 @@ _BASE_FILES.update(_EXTRA_FILES)
 pkg_tar(
     name = "boot_bundle_tar",
     files = _BOOT_FILES,
+    deps = [":tc_tar"],
+)
+
+pkg_tar(
+    name = "boot_bundle_min_tar",
+    files = _BOOT_FILES_MIN,
     deps = [":tc_tar"],
 )
 
@@ -200,7 +239,7 @@ _DISK_CMD = """
     # is the bootloader (which embeds the MBR + partition table at the
     # tail of its first 512 bytes).
     BOOT_RAW=$$(mktemp)
-    tail -c +513 $(location :boot_bundle_tar) > "$$BOOT_RAW"
+    tail -c +513 $(BOOT_TAR) > "$$BOOT_RAW"
 
     BOOT_SIZE=$$(stat -c%s "$$BOOT_RAW")
     BOOT_BUDGET=$$(( EXT4_START * 512 ))
@@ -242,15 +281,19 @@ with open('$@', 'r+b') as f:
     "
 """
 
-# Stub-build image: apps-boot bundle (kernel+DN+TC) + just CONFIG.SYS.
-# Pulls NO dosrt artifacts, so image→modplay→stub_exe→image_min is not a
-# cycle (image_min's only ext4 content is CONFIG.SYS).
+# Stub-build image: apps-boot bundle (bare kernel+DN+TC) + just CONFIG.SYS.
+# Pulls NO dosrt artifacts and carries the bootfs-free kernel, so
+# image→bootfs→COMMAND.COM→image_min (and image→modplay→stub_exe→image_min)
+# is not a cycle (image_min's only ext4 content is CONFIG.SYS).
 genrule(
     name = "image_min",
-    srcs = [":boot_bundle_tar", ":extras_min_tar"],
+    srcs = [":boot_bundle_min_tar", ":extras_min_tar"],
     outs = ["image_min.bin"],
-    cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_min_tar)"),
-    # Consumed by //apps/dosrt:stub_exe (QEMU-genrule TC compile host).
+    cmd = _DISK_CMD
+        .replace("$(BOOT_TAR)", "$(location :boot_bundle_min_tar)")
+        .replace("$(EXTRAS_TAR)", "$(location :extras_min_tar)"),
+    # Consumed by //apps/dosrt:stub_exe and //apps-boot/command:command_com
+    # (the in-OS TC compile host).
     visibility = ["//visibility:public"],
 )
 
@@ -258,7 +301,9 @@ genrule(
     name = "image",
     srcs = [":boot_bundle_tar", ":extras_tar"],
     outs = ["image.bin"],
-    cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_tar)"),
+    cmd = _DISK_CMD
+        .replace("$(BOOT_TAR)", "$(location :boot_bundle_tar)")
+        .replace("$(EXTRAS_TAR)", "$(location :extras_tar)"),
     visibility = ["//visibility:public"],
 )
 
@@ -266,7 +311,9 @@ genrule(
     name = "image_proprietary",
     srcs = [":boot_bundle_tar", ":extras_tar_proprietary"],
     outs = ["image_proprietary.bin"],
-    cmd = _DISK_CMD.replace("$(EXTRAS_TAR)", "$(location :extras_tar_proprietary)"),
+    cmd = _DISK_CMD
+        .replace("$(BOOT_TAR)", "$(location :boot_bundle_tar)")
+        .replace("$(EXTRAS_TAR)", "$(location :extras_tar_proprietary)"),
 )
 
 # FAT16 data disk for FreeDOS (all apps from the proprietary TAR)

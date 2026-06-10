@@ -1,6 +1,26 @@
-# COMMAND.COM is built at boot inside RetroOS by TC compiling SRC/COMMAND.C.
-# Just export the source so the root tar can ship it at SRC/COMMAND.C.
+# COMMAND.COM is built by in-OS TCC on the interpreter backend (the same
+# recipe as //apps/dosrt:stub_exe), so it's an ordinary Bazel artifact: it
+# ships prebuilt on the ext4 root and inside the kernel's embedded bootfs.
+# (It used to be self-built at every boot from SRC/COMMAND.C; the source is
+# still exported for in-OS tinkering.)
 exports_files(
     ["command.c", "LOADFIX.CFG"],
+    visibility = ["//visibility:public"],
+)
+
+# `-mt -lt`: tiny model + TLINK /t → a .COM image (the same flags the boot
+# self-build used). Builds on //:image_min, which carries the bare kernel
+# (no embedded bootfs) — that is what keeps image → bootfs → COMMAND.COM →
+# image_min acyclic.
+genrule(
+    name = "command_com",
+    srcs = [
+        "command.c",
+        "//:image_min",
+    ],
+    outs = ["COMMAND.COM"],
+    tools = ["//apps/dosrt:interp_tcc.sh", "//apps/dosrt:interp_host"],
+    cmd = "$(location //apps/dosrt:interp_tcc.sh) $(location //apps/dosrt:interp_host) " +
+          "$(location //:image_min) $(location command.c) $@ -mt -lt",
     visibility = ["//visibility:public"],
 )

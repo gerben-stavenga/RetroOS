@@ -81,9 +81,30 @@ same situation the interpreter already has (no ROM).
       interp-only concern. (Legacy-BIOS metal can keep using the real ROM, or
       switch to ours for consistency.) See memory
       `feedback_interp_needs_bios_firmware`.
-- [ ] **UEFI boot path** — a UEFI entry (vs the MBR/stage2 bootloader) that sets
-      up the kernel without firmware BIOS calls, then hands off to the same
-      `startup()`. Pairs with Project 3 (init structure).
+- [x] **Embedded bootfs — kernel.elf is a complete system.** DN + COMMAND.COM
+      + a fallback CONFIG.SYS ride inside the kernel image (`//:bootfs_tar` →
+      objcopy → linked into .rodata; `kernel::bootfs()`); startup mounts it at
+      /boot when no TAR partition exists. COMMAND.COM is a Bazel artifact now
+      (in-OS TCC on the interpreter, `//apps-boot/command:command_com`) — the
+      per-boot self-build is gone; it also ships at C:\COMMAND.COM on ext4.
+      The boot kernel mapping grew 1MB→5MB (pt_kernel2/3) to fit. Verified:
+      `qemu-system-i386 -kernel kernel.elf` with NO disk boots to DN.
+- [ ] **Re-evaluate bootfs size vs the kernel ≤ 1MB design line.** Numbers:
+      kernel proper = 954KB loaded (only ~70KB headroom under 1MB); bootfs =
+      1060KB, dominated by DN.OVR (746KB, the TP overlay body — not
+      trimmable); gzip -9 → ~512KB. Options when revisiting: (a) embed
+      COMMAND.COM only (~975KB total, revert pt_kernel2/3), DN from disk;
+      (b) gzipped DN+COMMAND (~1.4MB, needs a no_std inflate in the kernel);
+      (c) keep as-is (2.05MB loaded). Also note ~100KB of cheap kernel diet
+      if headroom is ever needed: core::fmt float machinery (exp_u128 /
+      POWER_OF_FIVE_128 / f128 soft-float, ~30KB) and the fixed 65KB kpipe
+      pool.
+- [ ] **UEFI/modern-metal boot = the user's existing GRUB** (direction change:
+      no own `boot-uefi` entry — GRUB is on people's machines already and
+      multiboot is our production boot contract there). Remaining: a
+      documented menuentry snippet (copy kernel.elf to /boot, multiboot line),
+      and a story for reaching the user's storage from RetroOS (GPT scan, or
+      stay RAM-only diskless).
 
 ---
 

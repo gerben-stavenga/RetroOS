@@ -1,0 +1,7 @@
+# Fallback boot config, baked into the kernel's embedded bootfs as
+# BOOT\CONFIG.SYS. Read only when no root filesystem provides \CONFIG.SYS —
+# i.e. a bare kernel.elf booted from a multiboot loader with no RetroOS disk.
+# Everything lives under C:\BOOT then (the embedded DN + COMMAND.COM).
+
+COMSPEC=C:\BOOT\COMMAND.COM
+PATH=C:\;C:\BOOT

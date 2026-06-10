@@ -77,6 +77,34 @@ pub fn new_arch() -> TheArch {
 // `crate::parse_debug_watch` keep resolving.
 pub use arch_abi::{BootConfig, parse_debug_watch};
 
+/// The embedded boot filesystem: a TAR (DN + COMMAND.COM + fallback
+/// CONFIG.SYS) linked into the metal kernel as raw bytes (`//:bootfs_tar` →
+/// `//kernel:bootfs_obj`), so a bare kernel.elf booted from any multiboot
+/// loader — someone's existing GRUB, no RetroOS disk — still has its
+/// environment. `startup` mounts it at /boot/ when no TAR boot partition is
+/// found. None in the bare kernel (`kernel_elf_bare`, used by image_min) and
+/// in the hosted build (which always boots a disk image).
+#[cfg(not(feature = "hosted"))]
+pub fn bootfs() -> Option<&'static [u8]> {
+    unsafe extern "C" {
+        static _binary_bootfs_tar_start: u8;
+        static _binary_bootfs_tar_end: u8;
+    }
+    let start = (&raw const _binary_bootfs_tar_start) as usize;
+    let end = (&raw const _binary_bootfs_tar_end) as usize;
+    // A zero first byte is TAR end-of-archive: the bare kernel links an empty
+    // TAR (objcopy can't embed 0 bytes), which counts as "no bootfs".
+    if end - start < 512 || unsafe { *(start as *const u8) } == 0 {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(start as *const u8, end - start) })
+}
+
+#[cfg(feature = "hosted")]
+pub fn bootfs() -> Option<&'static [u8]> {
+    None
+}
+
 // The multiboot info structs + the metal scratch/zero page frames moved into
 // `arch-metal` (consumed by its paging bring-up); the metal entry `boot.rs`
 // reaches them as `arch::…`.

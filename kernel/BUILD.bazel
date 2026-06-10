@@ -23,10 +23,48 @@ rust_static_library(
     deps = ["//arch-abi", "//arch-metal", "//lib", "@ext4_view//:ext4_view", "@spin//:spin"],
 )
 
+# The embedded boot filesystem (DN + COMMAND.COM, see //:bootfs_tar) as a
+# linkable object: raw bytes in .rodata between _binary_bootfs_tar_{start,end}
+# (read by `kernel::bootfs()`). objcopy derives the symbol names from the
+# input path, hence the cd-to-a-fixed-name dance.
+genrule(
+    name = "bootfs_obj",
+    srcs = ["//:bootfs_tar"],
+    outs = ["bootfs.o"],
+    cmd = "T=$$(mktemp -d) && cp $< $$T/bootfs.tar && O=$$(pwd)/$@ && " +
+          "(cd $$T && objcopy -I binary -O elf32-i386 -B i386 " +
+          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
+          "bootfs.tar $$O) && rm -r $$T",
+)
+
+# Empty variant: same symbols around an empty TAR (two zero end-of-archive
+# blocks — objcopy refuses a 0-byte input; bootfs() reads a zero first block
+# as "no bootfs"). Links into kernel_elf_bare below.
+genrule(
+    name = "bootfs_empty_obj",
+    outs = ["bootfs_empty.o"],
+    cmd = "T=$$(mktemp -d) && truncate -s 1024 $$T/bootfs.tar && O=$$(pwd)/$@ && " +
+          "(cd $$T && objcopy -I binary -O elf32-i386 -B i386 " +
+          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
+          "bootfs.tar $$O) && rm -r $$T",
+)
+
 genrule(
     name = "kernel_elf",
-    srcs = [":entry", ":kernel", "kernel.ld"],
+    srcs = [":entry", ":kernel", ":bootfs_obj", "kernel.ld"],
     outs = ["kernel.elf"],
-    cmd = "ld -m elf_i386 -T $(location kernel.ld) $(location :entry) $(location :kernel) -o $@",
+    cmd = "ld -m elf_i386 -T $(location kernel.ld) $(location :entry) $(location :bootfs_obj) $(location :kernel) -o $@",
+    visibility = ["//visibility:public"],
+)
+
+# Bare kernel: the identical link with an empty bootfs. //:image_min carries
+# this one — the in-OS toolchain genrules (COMMAND.COM, the dosrt stub) boot
+# image_min to do their work, and the full kernel embeds COMMAND.COM, so the
+# full kernel cannot be an input to building COMMAND.COM.
+genrule(
+    name = "kernel_elf_bare",
+    srcs = [":entry", ":kernel", ":bootfs_empty_obj", "kernel.ld"],
+    outs = ["kernel_bare.elf"],
+    cmd = "ld -m elf_i386 -T $(location kernel.ld) $(location :entry) $(location :bootfs_empty_obj) $(location :kernel) -o $@",
     visibility = ["//visibility:public"],
 )

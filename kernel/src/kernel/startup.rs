@@ -41,6 +41,7 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     // Scan MBR partition table: 4 entries at 0x1BE, each 16 bytes
     // Entry: [status, CHS_start(3), type, CHS_end(3), LBA_start(4), LBA_size(4)]
     // Layout: 0xDA boot bundle TAR (mounts at /boot/) + 0x83 ext4 (root).
+    let mut disk_tar = false;
     for i in 0..4 {
         let base = 0x1BE + i * 16;
         let ptype = mbr[base + 4];
@@ -50,6 +51,7 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
         match ptype {
             0xDA => {
                 println!("Partition {}: TAR at sector {:#x}", i, lba);
+                disk_tar = true;
                 unsafe {
                     ROOT_TARFS = TarFs::new(lba);
                     (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
@@ -68,6 +70,18 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
                 }
             }
             _ => {}
+        }
+    }
+
+    // No TAR boot partition (a bare kernel.elf booted from someone's GRUB, no
+    // RetroOS disk): /boot/ comes from the embedded bootfs instead — the
+    // DN + COMMAND.COM environment linked into the kernel image.
+    if !disk_tar {
+        if let Some(bytes) = crate::bootfs() {
+            unsafe {
+                ROOT_TARFS = TarFs::new_ram(bytes);
+                (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
+            }
         }
     }
 
@@ -90,9 +104,12 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     crate::kernel::ac97::init(machine);
 
     // /CONFIG.SYS provides the master env handed to DN and any user-driven
-    // launches. KEY=VALUE lines, `#` comments. Missing is fine -- yields an
-    // empty env; the boot self-build below uses its own self-contained env.
-    let config = crate::kernel::exec::load_file_resolved(b"CONFIG.SYS").unwrap_or_default();
+    // launches. KEY=VALUE lines, `#` comments. No root CONFIG.SYS (diskless
+    // boot) falls back to the embedded bootfs copy, whose PATH points into
+    // C:\BOOT; with neither, the env is empty.
+    let config = crate::kernel::exec::load_file_resolved(b"CONFIG.SYS")
+        .or_else(|_| crate::kernel::exec::load_file_resolved(b"boot/CONFIG.SYS"))
+        .unwrap_or_default();
     let master_env = crate::kernel::dos::parse_config_env(&config);
 
     // Allocate console stdin pipe (keyboard → Linux stdin). The kernel
@@ -141,45 +158,11 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
         machine.shutdown();
     }
 
-    // Self-build: recompile BOOT\SRC\COMMAND.C -> root COMMAND.COM at boot.
-    // cwd="" so the linker writes the output to the drive root (C:\COMMAND.COM);
-    // DN's EXEC of "COMMAND.COM /C ..." then picks up the freshly-built one.
-    //
-    // Prefer Borland C++ when present (the proprietary image, \BORLANDC): BCC
-    // compiling + EXEC'ing TLINK — a 16-bit DPMI parent that execs a child,
-    // which exits and returns — exercises the INT 21h AH=4Bh EXEC / MCB path
-    // end-to-end every boot, so breakage there surfaces immediately. BC++ 3.1
-    // is abandonware (not officially free like TC 2.01), so it ships only in
-    // the proprietary image. The open image has no \BORLANDC and falls back to
-    // freeware Turbo C 2.01 in the boot bundle; with neither present, the tar's
-    // pre-built COMMAND.COM runs as-is.
-    if crate::kernel::exec::load_file_resolved(b"BORLANDC/BIN/BCC.EXE").is_ok() {
-        println!("Building COMMAND.COM from BOOT\\SRC\\COMMAND.C via BCC + Borland TLINK...");
-        // Hermetic env: PATH has ONLY C:\BORLANDC\BIN so BCC EXECs Borland's
-        // own TLINK 5.1 — not TC's TLINK 2.0 (which a PATH listing C:\BOOT\TC
-        // first would shadow it with). Include/lib paths come from
-        // BORLANDC\BIN\TURBOC.CFG / TLINK.CFG (-I/-L), which BCC and TLINK read
-        // from their own EXE directory, so no INCLUDE/LIB env is needed.
-        run_dos_program(machine, 
-            b"BORLANDC/BIN/BCC.EXE",
-            b"-mt -lt BOOT\\SRC\\COMMAND.C",
-            b"",
-            b"PATH=C:\\BORLANDC\\BIN\0\0",
-            boot.debug_watch,
-        );
-        println!("Build done.");
-    } else if crate::kernel::exec::load_file_resolved(b"boot/TC/TCC.EXE").is_ok() {
-        println!("Building COMMAND.COM from BOOT\\SRC\\COMMAND.C via TC...");
-        // Hermetic env: only PATH so TCC can find TLINK; bypasses CONFIG.SYS.
-        run_dos_program(machine, 
-            b"boot/TC/TCC.EXE",
-            b"-mt -lt BOOT\\SRC\\COMMAND.C",
-            b"",
-            b"PATH=C:\\BOOT\\TC\0\0",
-            boot.debug_watch,
-        );
-        println!("Build done.");
-    }
+    // COMMAND.COM is prebuilt (in-OS TCC at image-build time —
+    // //apps-boot/command:command_com) and ships at C:\COMMAND.COM plus inside
+    // the embedded bootfs at C:\BOOT\COMMAND.COM. The per-boot self-build from
+    // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
+    // doubled as lives on in test/dpmi_smoke.sh.
 
     println!("Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
 
