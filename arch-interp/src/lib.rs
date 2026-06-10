@@ -40,8 +40,6 @@ mod calls;
 mod cpu;
 mod desc;
 mod devices;
-#[cfg(feature = "display")]
-mod display;
 mod hostfs;
 mod machine;
 mod mmu;
@@ -84,7 +82,8 @@ pub use screendump::{enable_live as enable_live_console, request as request_vga_
 // (mode 13h) through the shared `lib::vga_render`. `attach_vga` installs the
 // capture device; the screenshot path renders a PPM for graphics modes.
 pub use vga::attach as attach_vga;
-// Live SDL2 window sink (the `display` feature). `init_display` creates the
-// window from the hosted `main`; the CPU slice loop pumps it via `display::tick`.
-#[cfg(feature = "display")]
-pub use display::init as init_display;
+// Shared frame sink for an out-of-process-tree display (retroos-play): the
+// window thread `request_frame`s, the CPU thread renders at its next slice
+// boundary (the screendump pattern), the window thread `take_frame`s and blits.
+// Presentation (SDL et al.) lives entirely in the consuming binary.
+pub use vga::{request_frame, take_frame};

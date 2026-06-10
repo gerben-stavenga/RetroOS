@@ -10,7 +10,11 @@
 # process (where Unicorn's C core also builds natively).
 [workspace]
 resolver = "2"
-members = ["arch-abi", "arch-interp", "kernel", "lib"]
+members = ["arch-abi", "arch-interp", "kernel", "lib", "play"]
+# A bare `cargo build` stays SDL-free: `play` (the windowed retroos-play
+# binary) compiles SDL2 from source, so it builds only when asked for
+# explicitly (`cargo build -p retroos-play`).
+default-members = ["arch-abi", "arch-interp", "kernel", "lib"]
 # `arch-metal` is the bare-metal i686 backend — it only compiles for the metal
 # target via Bazel (//arch-metal), never on the host triple. Excluded so a
 # host-side `cargo build` never tries to compile it. (The hosted kernel selects

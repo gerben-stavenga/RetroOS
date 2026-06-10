@@ -286,8 +286,16 @@ dependencies = [
  "arch-abi",
  "lib",
  "libc",
- "sdl2",
  "unicorn-engine",
+]
+
+[[package]]
+name = "retroos-play"
+version = "0.1.0"
+dependencies = [
+ "kernel",
+ "retroos-arch-interp",
+ "sdl2",
 ]
 
 [[package]]

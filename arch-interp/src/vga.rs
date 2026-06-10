@@ -136,6 +136,42 @@ pub fn render_current() -> Option<(usize, usize, Vec<u32>)> {
     })
 }
 
+// ── Shared frame sink (the retroos-play window) ─────────────────────────────
+//
+// Same shape as the screendump request: a consumer on another thread flips the
+// request flag; the CPU thread — the only place guest RAM and the palette are
+// valid — renders at its next slice boundary and parks the frame in a shared
+// slot. Headless runs never set the flag, so the slice loop pays one relaxed
+// atomic load, exactly like the screendump check it sits next to.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+static FRAME_REQ: AtomicBool = AtomicBool::new(false);
+static FRAME: Mutex<Option<(usize, usize, Vec<u32>)>> = Mutex::new(None);
+
+/// Ask the CPU thread for a frame at its next slice boundary (any thread).
+pub fn request_frame() {
+    FRAME_REQ.store(true, Ordering::Relaxed);
+}
+
+/// Take the most recently published frame, if any (any thread).
+pub fn take_frame() -> Option<(usize, usize, Vec<u32>)> {
+    FRAME.lock().ok()?.take()
+}
+
+/// Service a pending frame request (CPU thread, slice boundary). `None` from
+/// the renderer (unhandled mode) leaves the consumer's last frame on screen.
+pub(crate) fn maybe_publish() {
+    if FRAME_REQ.swap(false, Ordering::Relaxed) {
+        if let Some(frame) = render_current() {
+            if let Ok(mut slot) = FRAME.lock() {
+                *slot = Some(frame);
+            }
+        }
+    }
+}
+
 /// If the guest is in **graphics** mode 13h, render the screen to a binary PPM
 /// (P6) at `path` and return `true`. Text modes return `false` so `--screenshot`
 /// keeps producing the inspectable CP437 character dump (the live window renders

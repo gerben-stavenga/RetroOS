@@ -1,0 +1,22 @@
+# retroos-play — the "actually playing" hosted target: boots a RetroOS disk
+# image on the interpreter backend with a live SDL window (video, keyboard,
+# mouse). The SDL dependency lives HERE and only here; `retroos-host` (the
+# kernel crate's binary) stays headless for tests, genrules, and repro runs.
+#
+#   cargo run -p retroos-play -- bazel-bin/image_proprietary.bin \
+#       --cmd "GAMES/SKYROADS/SKYROADS.EXE" --cwd "GAMES/SKYROADS/"
+[package]
+name = "retroos-play"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "retroos-play"
+path = "src/main.rs"
+
+[dependencies]
+kernel = { path = "../kernel" } # default features = hosted (interp backend)
+retroos-arch-interp = { path = "../arch-interp" }
+# `bundled` compiles SDL2 from source (like Unicorn's C core); `static-link`
+# avoids needing a system libSDL2 at runtime.
+sdl2 = { version = "0.37", default-features = false, features = ["bundled", "static-link"] }
