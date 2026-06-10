@@ -54,6 +54,7 @@ macro_rules! dos_trace {
     };
 }
 
+mod bios;
 mod dpmi;
 mod dfs;
 mod machine;
@@ -75,13 +76,13 @@ pub use dos::parse_config_env;
 // physically defines the constant.
 #[allow(unused_imports)]
 use dos::{
-    STUB_BASE, STUB_SEG,
+    STUB_BASE, STUB_SEG, CTRL_STUB_SEG,
     SLOT_RESUME_CONTINUATION,
     SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_EXCEPTION_RET_V10, SLOT_PM_TO_REAL,
     SLOT_PMDOS_INT21, SLOT_PMDOS_INT33, SLOT_MOUSE_CB_RET,
-    slot_offset,
+    slot_offset, ctrl_slot_off,
     host_stack_base, host_stack_size, host_stack_empty_sp,
     rm_stack_base, rm_stack_size, rm_stack_seg, rm_stack_align_offset,
 };
@@ -375,7 +376,8 @@ fn linear(dos: &thread::DosState, regs: &Vcpu, seg: u16, off: u32) -> u32 {
 ///
 /// | Mode | CS                | Routes to                     | Slot space                          |
 /// |------|-------------------|-------------------------------|-------------------------------------|
-/// | VM86 | `STUB_SEG`        | `dos::rm_stub_dispatch`       | RM IVT redirects + far-call entries |
+/// | VM86 | `STUB_SEG`        | `dos::rm_vector_dispatch`     | Vector view: slot == INT vector     |
+/// | VM86 | `CTRL_STUB_SEG`   | `dos::rm_ctrl_dispatch`       | Control view: far-call entries      |
 /// | VM86 | else              | `dos::synth_dispatch`         | Synth INT 31h (AH-dispatched)       |
 /// | PM   | `VECTOR_STUB`     | `mode_transitions::vector_stub_reflect`   | Per-vector default reflection       |
 /// | PM   | `SPECIAL_STUB`    | `dpmi::pm_stub_dispatch`      | PM host-stub return trampolines     |
@@ -393,7 +395,8 @@ pub fn syscall(
     let mode = regs.mode();
     let cs = if mode == UserMode::VM86 { machine::vm86_cs(regs) } else { regs.code_seg() };
     match (mode, cs) {
-        (UserMode::VM86, dos::STUB_SEG)         => dos::rm_stub_dispatch(machine, kt, dos, regs),
+        (UserMode::VM86, dos::STUB_SEG)         => dos::rm_vector_dispatch(machine, kt, dos, regs),
+        (UserMode::VM86, dos::CTRL_STUB_SEG)    => dos::rm_ctrl_dispatch(machine, kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(machine, dos, regs),
         (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, kt, dos, regs),

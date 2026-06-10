@@ -668,9 +668,10 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
                         regs.es as u16,
                         regs.rdi as u32,
                     ));
-                    // Return real-mode address: STUB_SEG:slot_offset(SLOT_CB_ENTRY_BASE + i)
-                    let rm_off = dos::slot_offset(dos::SLOT_CB_ENTRY_BASE + i as u8);
-                    regs.rcx = (regs.rcx & !0xFFFF) | dos::STUB_SEG as u64;
+                    // Return real-mode address: the control view of the stub
+                    // array, CTRL_STUB_SEG:ctrl_slot_off(SLOT_CB_ENTRY_BASE + i).
+                    let rm_off = dos::ctrl_slot_off(dos::SLOT_CB_ENTRY_BASE + i as u8);
+                    regs.rcx = (regs.rcx & !0xFFFF) | dos::CTRL_STUB_SEG as u64;
                     regs.rdx = (regs.rdx & !0xFFFF) | rm_off as u64;
                     clear_carry(regs);
                 }
@@ -682,8 +683,8 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         0x0304 => {
             let dpmi = dos.dpmi.as_mut().unwrap();
             let off = regs.rdx as u16;
-            let cb_base = dos::slot_offset(dos::SLOT_CB_ENTRY_BASE);
-            let cb_end = dos::slot_offset(dos::SLOT_CB_ENTRY_END);
+            let cb_base = dos::ctrl_slot_off(dos::SLOT_CB_ENTRY_BASE);
+            let cb_end = dos::ctrl_slot_off(dos::SLOT_CB_ENTRY_END);
             if off >= cb_base && off < cb_end {
                 let idx = ((off - cb_base) / 2) as usize;
                 dpmi.callbacks[idx] = None;
@@ -871,9 +872,9 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         // call the routine.
         0x0305 => {
             regs.rax = regs.rax & !0xFFFF;
-            // Real-mode save/restore: stub slot SLOT_SAVE_RESTORE
-            regs.rbx = (regs.rbx & !0xFFFF) | dos::STUB_SEG as u64;
-            regs.rcx = (regs.rcx & !0xFFFF) | dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u64;
+            // Real-mode save/restore: the control view of the stub array.
+            regs.rbx = (regs.rbx & !0xFFFF) | dos::CTRL_STUB_SEG as u64;
+            regs.rcx = (regs.rcx & !0xFFFF) | dos::ctrl_slot_off(dos::SLOT_SAVE_RESTORE) as u64;
             // Protected-mode save/restore entry in the special-stub segment.
             regs.rsi = (regs.rsi & !0xFFFF) | super::mode_transitions::SPECIAL_STUB_SEL as u64;
             regs.rdi = (regs.rdi & !0xFFFF) | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u32) as u64;
@@ -882,9 +883,9 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         // AX=0306h — Get Raw Mode Switch Addresses
         // Returns real-to-PM and PM-to-real switch entry points
         0x0306 => {
-            // BX:CX = real-to-PM entry point (real-mode segment:offset)
-            regs.rbx = (regs.rbx & !0xFFFF) | dos::STUB_SEG as u64;
-            regs.rcx = (regs.rcx & !0xFFFF) | dos::slot_offset(dos::SLOT_RAW_REAL_TO_PM) as u64;
+            // BX:CX = real-to-PM entry point (control view of the stub array)
+            regs.rbx = (regs.rbx & !0xFFFF) | dos::CTRL_STUB_SEG as u64;
+            regs.rcx = (regs.rcx & !0xFFFF) | dos::ctrl_slot_off(dos::SLOT_RAW_REAL_TO_PM) as u64;
             // SI:(E)DI = PM-to-real entry in the special-stub segment.
             regs.rsi = (regs.rsi & !0xFFFF) | super::mode_transitions::SPECIAL_STUB_SEL as u64;
             regs.rdi = (regs.rdi & !0xFFFFFFFF) | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_TO_REAL) as u32) as u64;

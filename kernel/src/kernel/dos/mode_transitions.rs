@@ -890,8 +890,8 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Vc
 
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
     // own INT n in real mode would push: FLAGS / CS / IP.
-    let ret_off: u16 = dos::slot_offset(dos::SLOT_RESUME_CONTINUATION);
-    let ret_seg: u16 = dos::STUB_SEG;
+    let ret_off: u16 = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION);
+    let ret_seg: u16 = dos::CTRL_STUB_SEG;
     machine::vm86_push(regs, ret_flags);
     machine::vm86_push(regs, ret_seg);
     machine::vm86_push(regs, ret_off);

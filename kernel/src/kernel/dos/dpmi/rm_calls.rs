@@ -80,8 +80,8 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu
 
     // Push return IRET frame on VM86 stack — push_continuation_and_switch_to_rm_side already
     // set regs.SS:SP = rm_dest.
-    let resume_off: u16 = dos::slot_offset(dos::SLOT_RESUME_CONTINUATION);
-    let callback_seg: u16 = dos::STUB_SEG;
+    let resume_off: u16 = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION);
+    let callback_seg: u16 = dos::CTRL_STUB_SEG;
     machine::vm86_push(regs, rm.flags);
     machine::vm86_push(regs, callback_seg);
     machine::vm86_push(regs, resume_off);
@@ -130,8 +130,8 @@ pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Vcpu) -
     regs.gs = rm.gs as u64;
 
     // For FAR CALL: push return address (callback stub) as FAR return
-    let resume_off: u16 = dos::slot_offset(dos::SLOT_RESUME_CONTINUATION);
-    let callback_seg: u16 = dos::STUB_SEG;
+    let resume_off: u16 = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION);
+    let callback_seg: u16 = dos::CTRL_STUB_SEG;
     machine::vm86_push(regs, callback_seg);
     machine::vm86_push(regs, resume_off);
 
@@ -182,8 +182,8 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vc
     regs.gs = rm.gs as u64;
 
     // For IRET frame: push FLAGS, CS, IP (callback return stub)
-    let resume_off: u16 = dos::slot_offset(dos::SLOT_RESUME_CONTINUATION);
-    let callback_seg: u16 = dos::STUB_SEG;
+    let resume_off: u16 = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION);
+    let callback_seg: u16 = dos::CTRL_STUB_SEG;
     machine::vm86_push(regs, rm.flags);
     machine::vm86_push(regs, callback_seg);
     machine::vm86_push(regs, resume_off);

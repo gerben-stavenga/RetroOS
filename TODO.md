@@ -73,14 +73,25 @@ same situation the interpreter already has (no ROM).
       `run_uefi.sh` mock; legacy boots keep writing real B8000 cells.
       Gotcha for `boot-uefi` later: GRUB places the multiboot color_info at
       offset 112, not the spec's 110 (multiboot.h's union is 4-aligned).
-- [ ] **Move the C BIOS (`arch-interp/bios/bios.c`, installed via
-      `arch-interp/src/bios.rs`) out of the interp backend and into the DOS
-      personality.** It should be installed by the DOS layer whenever no native
-      BIOS is present (interpreter today; UEFI metal later) — so the personality
-      is self-contained and backend-independent, instead of the BIOS being an
-      interp-only concern. (Legacy-BIOS metal can keep using the real ROM, or
-      switch to ours for consistency.) See memory
-      `feedback_interp_needs_bios_firmware`.
+- [x] **The DOS personality owns its BIOS** (`kernel/src/kernel/dos/bios.rs`):
+      the 16-bit C BIOS is gone from arch-interp, replaced by Rust services
+      dispatched from the ONE 256-slot stub array, which now has two RM
+      *views* separated purely by segment aliasing (the RM twin of PM's
+      VECTOR_STUB_SEL vs SPECIAL_STUB_SEL): `STUB_SEG:vec*2` = vector view
+      (slot == INT vector, all 256 IVT entries; kernel-DOS syscall vectors +
+      BIOS services + IRET/EOI defaults), `CTRL_STUB_SEG(0):STUB_BASE+slot*2`
+      = control view (XMS/DPMI entries, RM callbacks, resume parks — same
+      offset arithmetic as the PM selectors). No second array, no slot/vector
+      collision constraints, and "is INT n hooked?" is an IVT-segment
+      compare. The BDA is a typed Rust projection at 0x400 (offset_of!, no
+      magic addresses). Installed by `setup_ivt` whenever no native ROM is
+      present (no far-JMP at F000:FFF0): interp today, UEFI metal for free.
+      Port I/O goes through `machine::emulate_inb/outb` (the vpic/vkbd are
+      kernel-side — a raw Arch outb bypasses the vpic and freezes ticks;
+      SkyRoads black-screen was the reproducer). Verified: SkyRoads render +
+      palette identical to the C BIOS, in-OS TCC byte-identical, DOSRT
+      (DPMI entry/callbacks) and BCC+TLINK (16-bit DPMI client + EXEC) clean,
+      DN TUI, legacy metal untouched, diskless + UEFI boots green.
 - [x] **Embedded bootfs — kernel.elf is a complete system.** DN + COMMAND.COM
       + a fallback CONFIG.SYS ride inside the kernel image (`//:bootfs_tar` →
       objcopy → linked into .rodata; `kernel::bootfs()`); startup mounts it at

@@ -35,7 +35,6 @@ pub use arch_abi::{
 };
 
 mod backend;
-mod bios;
 mod calls;
 mod cpu;
 mod desc;

@@ -151,8 +151,8 @@ fn poll_dos_console_char(dos: &mut thread::DosState, regs: &mut Vcpu) -> Option<
 /// kbd/timer IRQs queue in the vPIC but `pick_pending_vec` gates them on
 /// VIF, and VIF is bit 9 of the saved EFLAGS.
 fn park_at_slot_resume(regs: &mut Vcpu) {
-    machine::set_vm86_cs(regs, STUB_SEG);
-    machine::set_vm86_ip(regs, slot_offset(SLOT_RESUME));
+    machine::set_vm86_cs(regs, CTRL_STUB_SEG);
+    machine::set_vm86_ip(regs, ctrl_slot_off(SLOT_RESUME));
     regs.frame.rflags |= machine::IF_FLAG as u64;
 }
 
@@ -217,23 +217,73 @@ pub(crate) fn dispatch_kernel_syscall(
     }
 }
 
-/// Dispatch INT 31h from the RM stub array (CS == STUB_SEG).
-/// Slot = (IP - 2) / 2. IVT-redirect stubs have a FLAGS/CS/IP frame on the
-/// VM86 stack from the original INT; far-call stubs have a CS/IP frame from
-/// CALL FAR. The kernel pops these frames directly — no RETF/RETF 2 in the
-/// stub. Caller (`syscall`) has already checked CS == STUB_SEG.
-pub(super) fn rm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+/// Dispatch INT 31h from the stub array's VECTOR view (CS == `STUB_SEG`):
+/// slot index == INT vector, for all 256. The caller's INT pushed a
+/// FLAGS/CS/IP frame. Kernel-DOS vectors route to `dispatch_kernel_syscall`
+/// (with the CF/ZF flag dance); every other vector is the personality BIOS —
+/// real services or the IRET/EOI defaults (`bios::dispatch`), which own
+/// their frame pop. Caller (`syscall`) has already checked CS.
+pub(super) fn rm_vector_dispatch(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ip = vm86_ip(regs);
-    let cs = vm86_cs(regs);
-    debug_assert_eq!(cs, STUB_SEG, "rm_stub_dispatch: CS must be STUB_SEG");
+    debug_assert_eq!(vm86_cs(regs), STUB_SEG, "rm_vector_dispatch: CS must be STUB_SEG");
+    let vector = ((ip.wrapping_sub(2)) / 2) as u8;
 
-    let slot = ((ip.wrapping_sub(2)) / 2) as u8;
-    let is_far_call = matches!(slot,
-        SLOT_XMS | SLOT_DPMI_ENTRY | SLOT_RESUME_CONTINUATION
-        | SLOT_RAW_REAL_TO_PM | SLOT_SAVE_RESTORE
-        | SLOT_MOUSE_CB_RET
-        | SLOT_RESUME)
-        || (slot >= SLOT_CB_ENTRY_BASE && slot < SLOT_CB_ENTRY_END);
+    match vector {
+        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2E | 0x2F | 0x33 | 0x67 => {
+            // Restore caller FLAGS into regs so handlers may mutate them
+            // (CF/ZF returns); then write back so normal IRET-style pop
+            // restores the handler's result to the caller.
+            let caller_flags = read_u16(regs, vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
+            machine::set_vm86_flags(regs, caller_flags as u32);
+            let action = dispatch_kernel_syscall(machine, kt, dos, regs, vector);
+            // Exit replaces thread state outright — skip the iret-frame
+            // pop entirely. Anything else (Done, ForkExec, Yield, Switch)
+            // leaves the issuing thread alive and needs regs.CS:EIP
+            // popped to the user's post-INT instruction; otherwise the
+            // saved cpu_state retains the kernel stub address and the
+            // thread re-traps on its next slice.
+            if matches!(action, thread::KernelAction::Exit(_)) {
+                return action;
+            }
+            // Flag-writeback only when we're still in VM86. AH=4C with a
+            // PM parent flips mode to PM mid-dispatch via exec_return; in
+            // that case regs.SS:SP is the parent's PM stack and the flag
+            // writeback would scribble garbage. finish_dos_call below
+            // takes the PM branch and merges flags through pop_iret_frame.
+            if regs.mode() == crate::UserMode::VM86 {
+                let ss = vm86_ss(regs) as u32;
+                let off = (vm86_sp(regs) as u32).wrapping_add(4);
+                let flags = machine::vm86_flags(regs) as u16;
+                write_u16(regs, ss, off, flags);
+            }
+            // The pop is mode-aware: a child of a PM parent (VM86 client of
+            // bcc-via-PMDOS) issuing AH=4C runs `exec_return`, which restores
+            // the PM parent's SS:SP and clears VM_FLAG. We're then logically
+            // resuming a PM caller and must pop the iret-frame
+            // `deliver_pm_int` planted on the parent's PM stack, not a
+            // VM86-style frame. A pending resume means the handler
+            // intentionally parked CS:IP at SLOT_RESUME to block (AH=01/07/
+            // 08/0A waiting on the keyboard) — popping here would clobber
+            // the redirect; SLOT_RESUME owns the unwind once input arrives.
+            if dos.pending_resume.is_none() {
+                finish_dos_call(dos, regs);
+            }
+            action
+        }
+        _ => super::bios::dispatch(machine, dos, regs),
+    }
+}
+
+/// Dispatch INT 31h from the stub array's CONTROL view (CS ==
+/// `CTRL_STUB_SEG`): the far-call entry points and continuation parks the
+/// kernel hands out. Slot = (IP - STUB_BASE - 2) / 2 — the same arithmetic
+/// as PM's `pm_stub_dispatch` over `SPECIAL_STUB_SEL`. Far-call entries
+/// (XMS, save/restore) have a CS/IP frame to pop; everything else either
+/// switches mode outright or owns its unwind.
+pub(super) fn rm_ctrl_dispatch(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+    let ip = vm86_ip(regs);
+    debug_assert_eq!(vm86_cs(regs), CTRL_STUB_SEG, "rm_ctrl_dispatch: CS must be CTRL_STUB_SEG");
+    let slot = ((ip.wrapping_sub(STUB_BASE as u16 + 2)) / 2) as u8;
 
     let action = match slot {
         SLOT_XMS => xms_dispatch(machine, dos, regs),
@@ -255,35 +305,6 @@ pub(super) fn rm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::Ke
             let cb_idx = (slot - SLOT_CB_ENTRY_BASE) as usize;
             dpmi::callback_entry(dos, regs, cb_idx);
             thread::KernelAction::Done
-        }
-        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x2E | 0x2F | 0x33 | 0x67 => {
-            // Restore caller FLAGS into regs so handlers may mutate them
-            // (CF/ZF returns); then write back so normal IRET-style pop
-            // restores the handler's result to the caller.
-            let caller_flags = read_u16(regs, vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
-            machine::set_vm86_flags(regs, caller_flags as u32);
-            let action = dispatch_kernel_syscall(machine, kt, dos, regs, slot);
-            // Exit replaces thread state outright — skip the iret-frame
-            // pop entirely. Anything else (Done, ForkExec, Yield, Switch)
-            // leaves the issuing thread alive and needs regs.CS:EIP
-            // popped to the user's post-INT instruction; otherwise the
-            // saved cpu_state retains the kernel stub address and the
-            // thread re-traps on its next slice.
-            if matches!(action, thread::KernelAction::Exit(_)) {
-                return action;
-            }
-            // Flag-writeback only when we're still in VM86. AH=4C with a
-            // PM parent flips mode to PM mid-dispatch via exec_return; in
-            // that case regs.SS:SP is the parent's PM stack and the flag
-            // writeback would scribble garbage. finish_dos_call below
-            // takes the PM branch and merges flags through pop_iret_frame.
-            if regs.mode() == crate::UserMode::VM86 {
-                let ss = vm86_ss(regs) as u32;
-                let off = (vm86_sp(regs) as u32).wrapping_add(4);
-                let flags = machine::vm86_flags(regs) as u16;
-                write_u16(regs, ss, off, flags);
-            }
-            action
         }
         SLOT_SAVE_RESTORE => {
             // AX=0305 announces buffer size = 0 to the client, so the
@@ -321,35 +342,21 @@ pub(super) fn rm_stub_dispatch(machine: &mut crate::TheArch, kt: &mut thread::Ke
             thread::KernelAction::Done
         }
         _ => {
-            panic!("VM86: INT 31h unknown stub slot {:#04x} CS:IP={:04x}:{:#06x}", slot, cs, ip);
+            panic!("VM86: INT 31h unknown control slot {:#04x} CS:IP={:04x}:{:#06x}",
+                slot, CTRL_STUB_SEG, ip);
         }
     };
 
-    // Pop the stack frame left by the caller before returning.
-    // IVT-redirect: original INT pushed FLAGS/CS/IP (6 bytes) — pop and return to caller.
-    // Far-call (XMS): CALL FAR pushed CS/IP (4 bytes) — pop and return to caller.
-    // Mode-switching stubs (DPMI entry, raw switch, callbacks) replace all regs — skip.
-    //
-    // The pop is mode-aware: a child of a PM parent (VM86 client of bcc-
-    // via-PMDOS) issuing AH=4C runs `exec_return`, which restores the PM
-    // parent's SS:SP and clears VM_FLAG. We're then logically resuming a
-    // PM caller and must pop the iret-frame `deliver_pm_int` planted on
-    // the parent's PM stack, not a VM86-style frame.
-    if !is_far_call && dos.pending_resume.is_none() {
-        // A pending resume means the handler intentionally redirected CS:IP
-        // to SLOT_RESUME to block (AH=01/07/08/0A waiting on the keyboard).
-        // Popping the iret frame here would clobber the redirect and the
-        // user code would race past the supposedly-blocking INT — SLOT_RESUME
-        // owns the unwind once the input arrives.
-        finish_dos_call(dos, regs);
-    } else if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
-        // Returns to caller — pop far-call return address
+    // Far-call entries that return to their caller: pop the CALL FAR's
+    // CS/IP. Mode-switching stubs (DPMI entry, raw switch, callbacks)
+    // replace all regs; SLOT_RESUME/SLOT_RESUME_CONTINUATION own their
+    // unwind — skip.
+    if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
         let ret_ip = vm86_pop(regs);
         let ret_cs = vm86_pop(regs);
         set_vm86_ip(regs, ret_ip);
         set_vm86_cs(regs, ret_cs);
     }
-    // Other far-call stubs (DPMI entry, raw switch, callbacks) switch modes entirely
 
     action
 }
@@ -725,8 +732,8 @@ fn launch_int16_read(regs: &mut Vcpu) {
     let ivt_seg = read_u16(regs, 0, 0x16 * 4 + 2);
     let ret_flags = (machine::vm86_flags(regs) | machine::IF_FLAG) as u16;
     machine::vm86_push(regs, ret_flags);
-    machine::vm86_push(regs, STUB_SEG);
-    machine::vm86_push(regs, slot_offset(SLOT_RESUME));
+    machine::vm86_push(regs, CTRL_STUB_SEG);
+    machine::vm86_push(regs, ctrl_slot_off(SLOT_RESUME));
     machine::set_vm86_cs(regs, ivt_seg);
     machine::set_vm86_ip(regs, ivt_off);
     regs.rax &= !0xFF00;                      // AH = 0 (INT 16h AH=00)
@@ -2234,8 +2241,8 @@ fn dpmi_install_check(regs: &mut Vcpu) {
     regs.rcx = (regs.rcx & !0xFF) | 0x03; // CL = 386
     regs.rdx = (regs.rdx & !0xFFFF) | 0x005A; // DX = DPMI 0.90
     regs.rsi = regs.rsi & !0xFFFF; // SI = 0 paragraphs needed
-    regs.es = STUB_SEG as u64;
-    regs.rdi = (regs.rdi & !0xFFFF) | slot_offset(SLOT_DPMI_ENTRY) as u64;
+    regs.es = CTRL_STUB_SEG as u64;
+    regs.rdi = (regs.rdi & !0xFFFF) | ctrl_slot_off(SLOT_DPMI_ENTRY) as u64;
 }
 
 fn int_2fh(_dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
@@ -2263,8 +2270,8 @@ fn int_2fh(_dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction
         }
         // AX=4310h — Get XMS driver entry point
         0x4310 => {
-            regs.es = STUB_SEG as u64;
-            regs.rbx = (regs.rbx & !0xFFFF) | slot_offset(SLOT_XMS) as u64;
+            regs.es = CTRL_STUB_SEG as u64;
+            regs.rbx = (regs.rbx & !0xFFFF) | ctrl_slot_off(SLOT_XMS) as u64;
             thread::KernelAction::Done
         }
         _ => {
@@ -2427,8 +2434,8 @@ pub(super) fn deliver_mouse_callback(dos: &mut thread::DosState, regs: &mut Vcpu
         mode_transitions::push_farret_frame(&dos.ldt[..], regs, handler_use32,
             STUB_BASE + slot_offset(SLOT_MOUSE_CB_RET) as u32, mode_transitions::SPECIAL_STUB_SEL);
     } else {
-        vm86_push(regs, STUB_SEG);
-        vm86_push(regs, slot_offset(SLOT_MOUSE_CB_RET));
+        vm86_push(regs, CTRL_STUB_SEG);
+        vm86_push(regs, ctrl_slot_off(SLOT_MOUSE_CB_RET));
     }
 
     // Load AX=0Ch convention.
@@ -3245,8 +3252,8 @@ struct LowMem {
     /// head. `sync_mcb_chain` writes the current `dos.heap_base_seg` here
     /// every time the chain is updated.
     first_mcb_seg: u16,
-    lol:       Lol,                    // 0x900 — adjust offset
-    sft:       Sft,                    // 0x940
+    lol:       Lol,                    // 0x902
+    sft:       Sft,
     cds:       [CdsEntry; NUM_DRIVES as usize],
     /// DPMI 0.9 §3.1.2 locked PM stack (referred to as "host_stack" in
     /// the implementation). 4 KB host-provided buffer used for HW IRQ /
@@ -3298,6 +3305,32 @@ pub(super) fn set_first_mcb_seg(regs: &mut Vcpu, seg: u16) {
 
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
 pub(crate) const STUB_SEG: u16 = (LOW_MEM_BASE >> 4) as u16;
+
+/// RM alias segment for the CONTROL view of the stub array. The ONE 256-slot
+/// `CD 31` array serves two namespaces, separated purely by how its bytes are
+/// addressed — the RM twin of PM's `SPECIAL_STUB_SEL` vs `VECTOR_STUB_SEL`
+/// selectors aliasing the same array:
+///
+///   vector view:  `STUB_SEG:vector*2`             — IVT entries; slot == INT
+///                 vector for all 256 (kernel-DOS redirects and the
+///                 personality BIOS alike)
+///   control view: `CTRL_STUB_SEG:STUB_BASE+slot*2` — far-call entry points
+///                 the kernel hands out (XMS, DPMI entry, RM callbacks,
+///                 resume/continuation parks)
+///
+/// Same bytes, same trap; CS alone says which namespace, so control-slot
+/// numbering can never collide with vector numbering. CTRL_STUB_SEG = 0 makes
+/// the control-view offset equal the linear address — the same arithmetic the
+/// PM stub selectors use (their base is 0 too), so PM and RM control
+/// addresses differ only in the segment/selector half. Segment 0 is never a
+/// program's code segment, so the CS discrimination in `syscall` is
+/// unambiguous.
+pub(crate) const CTRL_STUB_SEG: u16 = 0x0000;
+
+/// Control-view IP for a slot (= the linear address of its stub bytes).
+pub(crate) const fn ctrl_slot_off(slot: u8) -> u16 {
+    STUB_BASE as u16 + slot_offset(slot)
+}
 /// Offset within SYSPSP of the INDOS flag byte (permanently zero).
 /// Placed in the "command tail" area since the system PSP never runs.
 const INDOS_FLAG_OFFSET: u16 = 0xFE;
@@ -3422,7 +3455,7 @@ pub(super) struct Loaded {
 // ── Stub vector / slot assignments ─────────────────────────────────────
 // Slot N at offset N*2 from STUB_SEG. After CD 31, IP = N*2+2, slot = (IP-2)/2.
 // VM86 traps via TSS bitmap bit 31h; PM fires INT 31h directly (DPL=3).
-const STUB_INT: u8 = 0x31;
+pub(super) const STUB_INT: u8 = 0x31;
 const SLOT_XMS: u8 = 0x00;
 const SLOT_DPMI_ENTRY: u8 = 0x01;
 pub(crate) const SLOT_RAW_REAL_TO_PM: u8 = 0x03;
@@ -3488,6 +3521,14 @@ pub(super) fn setup_ivt(regs: &mut Vcpu) {
     let stubs = lm_field(core::mem::offset_of!(LowMem, stubs));
     for i in 0..256 {
         regs.write::<[u8; 2]>(stubs + i * 2, [0xCD, STUB_INT]);
+    }
+
+    // No native BIOS ROM (interp's zeroed guest RAM; UEFI metal): the
+    // personality installs its own — all 256 IVT entries into the BIOS stub
+    // array, services in `bios.rs`. The kernel-DOS redirects below then
+    // override their vectors, layered like a real machine (BIOS, DOS on top).
+    if !super::bios::native_bios_present(regs) {
+        super::bios::install(regs);
     }
 
     // HW IRQ vectors (0x08-0x0F + 0x70-0x77) are left pointing at the

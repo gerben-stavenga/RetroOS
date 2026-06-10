@@ -85,32 +85,14 @@ pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, _ex
 }
 
 /// Map the first 1MB user-accessible.
+///
+/// No BIOS is installed here anymore: firmware is the DOS *personality's*
+/// concern, not the backend's. The kernel's `dos::bios` (Rust services behind
+/// a per-vector stub array) detects the absence of a native ROM and installs
+/// itself — on this interpreter exactly as on a UEFI-booted metal machine.
 pub fn arch_map_low_mem() {
     crate::mmu::map_low_mem();
-    install_bios_stubs();
     crate::cpu::invalidate_uc(0, 0x100);
-}
-
-/// BIOS firmware the interpreter must supply. On real hardware (and metal) the
-/// PC BIOS ROM owns these IVT vectors; the interpreter has no ROM, so without a
-/// handler a guest `int 11h` (or a reflected IRQ0 `int 8`) lands on a null IVT
-/// entry and the guest then executes the zeroed IVT as code, scrambling itself.
-///
-/// The substantive handlers (INT 08/10/11/16/1A + the BDA) are written in 16-bit
-/// C (`bios/bios.c`, built by our own Turbo C) and loaded by `crate::bios`. Here
-/// we add only a generic `iret` for the handful of BIOS vectors we don't model.
-fn install_bios_stubs() {
-    let m = crate::vcpu::mem();
-    const SEG: u16 = 0xF000;
-    // Generic `iret` at F000:0010 — for BIOS vectors we don't model, so a guest
-    // call returns harmlessly instead of executing the null IVT.
-    m.write::<u8>(0xF0010, 0xCF);
-    for v in [0x12u8, 0x14, 0x15, 0x17, 0x1B, 0x1C] {
-        m.write::<u16>(v as usize * 4, 0x0010);
-        m.write::<u16>(v as usize * 4 + 2, SEG);
-    }
-    // The real handlers (in C) + the BDA seed.
-    crate::bios::install();
 }
 
 /// Copy page-table entries src→dst.
