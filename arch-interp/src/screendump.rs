@@ -115,6 +115,11 @@ pub fn maybe_dump() {
         return;
     }
     let Some(path) = DUMP_PATH.get() else { return };
+    // Graphics modes (mode 13h) render to a PPM through the shared VGA renderer;
+    // text modes fall through to the CP437 character dump below.
+    if crate::vga::try_dump_ppm(path) {
+        return;
+    }
     let mem = crate::vcpu::mem();
     let mut out = String::with_capacity(ROWS * (COLS + 1));
     for row in 0..ROWS {

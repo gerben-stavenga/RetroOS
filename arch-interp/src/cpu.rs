@@ -227,6 +227,8 @@ pub fn execute() -> KernelEvent {
         // it's valid — the CPU thread).
         crate::screendump::maybe_dump();
         crate::screendump::maybe_render_live();
+        #[cfg(feature = "display")]
+        crate::display::tick();
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
         let mode = regs.mode();
         let begin = configure(uc, regs, mode);

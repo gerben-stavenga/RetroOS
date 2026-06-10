@@ -3,6 +3,12 @@
 Larger architectural work / refactors (distinct from the per-game bug sprint
 below). These are sizable, multi-step efforts.
 
+**Guiding goal:** one kernel that supports all hardware from the 386 to today,
+giving retro devices (VGA, Sound Blaster, …) **direct/passthrough access when
+the real device is available** and **emulating them when absent or when
+emulation is preferred** — the same kernel adapts per-machine rather than
+forking. Several projects below (1, 4) are concrete expressions of this.
+
 ## 1. Hosted backend: audio + video (DOSBox-equivalent)
 Turn the hosted/interp backend into a graphical emulator so RetroOS-hosted runs
 DOS games like DOSBox (its own kernel underneath, not a bespoke DOS layer).

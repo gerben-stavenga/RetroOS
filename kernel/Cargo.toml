@@ -23,6 +23,9 @@ required-features = ["hosted"]
 # documented `cargo build -p kernel` works without extra flags.
 default = ["hosted"]
 hosted = ["dep:retroos-arch-interp"]
+# Live SDL2 A/V window for the hosted backend (off by default — building SDL is
+# heavy). `cargo run -p kernel --features display -- --window <disk>`.
+display = ["hosted", "retroos-arch-interp/display"]
 
 [dependencies]
 arch-abi = { path = "../arch-abi" }

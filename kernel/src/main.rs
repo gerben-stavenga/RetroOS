@@ -40,6 +40,7 @@ fn main() {
     let mut shot: Option<String> = None;
     let mut wav: Option<String> = None;
     let mut live_console = false;
+    let mut window = false;
     // Positional args: [0] = program/disk, [1..] = the program's own argv tail.
     let mut positional: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -62,6 +63,9 @@ fn main() {
             // offline (no real card on the host). Without this flag the audio
             // ports are unpopulated and the kernel sound path is inert.
             "--wav" => wav = args.next(),
+            // Open a live SDL2 window showing the guest's VGA output (graphics
+            // modes for now). Needs `--features display`; a no-op build without.
+            "--window" => window = true,
             // First positional ends flag parsing; the rest are the program's argv.
             _ => {
                 positional.push(a);
@@ -92,6 +96,15 @@ fn main() {
     }
     kernel::vga::set_debug_sink(host_log_byte);
     kernel::host_console_init();
+    // Emulate the VGA below the arch boundary: capture the guest's DAC palette so
+    // graphics-mode screenshots (and the live window) render correctly.
+    arch::attach_vga();
+    if window {
+        #[cfg(feature = "display")]
+        arch::init_display();
+        #[cfg(not(feature = "display"))]
+        eprintln!("retroos-host: --window needs `--features display` (SDL2); ignoring");
+    }
     if let Some(dir) = host_dir {
         arch::attach_hostfs(&dir); // COM1 → /host
     }

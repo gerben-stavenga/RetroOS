@@ -40,6 +40,8 @@ mod calls;
 mod cpu;
 mod desc;
 mod devices;
+#[cfg(feature = "display")]
+mod display;
 mod hostfs;
 mod machine;
 mod mmu;
@@ -48,6 +50,7 @@ mod screendump;
 mod space;
 mod tty;
 mod vcpu;
+mod vga;
 
 pub use backend::Interp;
 pub use calls::*;
@@ -77,3 +80,11 @@ pub use devices::{
 // 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the
 // flag from a watcher thread, the CPU thread renders at the next slice boundary.
 pub use screendump::{enable_live as enable_live_console, request as request_vga_dump, set_dump_path};
+// Hosted VGA emulation: capture the guest DAC palette + render graphics modes
+// (mode 13h) through the shared `lib::vga_render`. `attach_vga` installs the
+// capture device; the screenshot path renders a PPM for graphics modes.
+pub use vga::attach as attach_vga;
+// Live SDL2 window sink (the `display` feature). `init_display` creates the
+// window from the hosted `main`; the CPU slice loop pumps it via `display::tick`.
+#[cfg(feature = "display")]
+pub use display::init as init_display;

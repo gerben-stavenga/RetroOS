@@ -9,6 +9,10 @@ path = "src/lib.rs"
 
 [dependencies]
 arch-abi = { path = "../arch-abi" }
+# The reusable software-VGA renderer (no_std, backend-agnostic). The interpreter
+# emulates the VGA below the arch boundary and renders the guest screen through
+# it — the same renderer a future in-RetroOS windowed-DOS compositor will use.
+lib = { path = "../lib" }
 # Unicorn (the software x86 core) drives the Vcpu run path. The hosted build
 # targets a native 64-bit host, so its C core builds natively.
 unicorn-engine = "2.1.5"
@@ -16,6 +20,16 @@ unicorn-engine = "2.1.5"
 # host VA region, so a guest-linear address is a contiguous host pointer (the
 # same model the metal backend gets from real page tables).
 libc = "0.2"
+# Live A/V/input window (the `display` feature). SDL2 is push/poll — we drive it
+# from our own CPU slice loop, it never owns the loop. `bundled` builds SDL from
+# source (like Unicorn's C core) and `static-link` avoids a system libSDL2 at
+# runtime. Optional so headless/CI builds don't pay the SDL build cost.
+sdl2 = { version = "0.37", default-features = false, features = ["bundled", "static-link"], optional = true }
+
+[features]
+# Off by default: opening a window needs SDL built. The hosted `main` only
+# creates the window when `--window` is passed *and* this feature is on.
+display = ["dep:sdl2"]
 
 # The self-contained Unicorn proof-of-concept that seeded this backend:
 #   cargo run -p retroos-arch-interp --example poc
