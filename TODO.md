@@ -88,10 +88,11 @@ same situation the interpreter already has (no ROM).
       `last_irq=vec08 handler=0027:0510`. NOT a panel-vs-typed mechanism
       split: BOTH routes go through COMSPEC → our COMMAND.COM →
       SYNTH_FORK_EXEC (confirmed by F11 task switching working after panel
-      launches on metal). DN wraps EVERY exec in its swap cycle — DN.PRG (a
-      BP7/RTM **DPMI client**) exits, the dn.com stub runs the target, then
-      re-EXECs DN.PRG — and the crash is a timer IRQ landing in a vulnerable
-      window of that DPMI exit/re-entry sequence (faulting delivery at
+      launches on metal). DN wraps EVERY exec in its swap cycle — DN.PRG (a plain
+      **real-mode** BP7 app: RM overlay runtime, NOT DPMI) exits, the
+      dn.com stub runs the target, then re-EXECs DN.PRG — and the crash is
+      a timer IRQ landing in a vulnerable window of that exec/return
+      sequence (faulting delivery at
       cs=0502 = DN.PRG resident code during swap-out; same script minus the
       Enter survives 45s+). Instruction-anchored virtual time makes hit/miss
       deterministic for a given input-timing pattern — which is why some
@@ -110,10 +111,18 @@ same situation the interpreter already has (no ROM).
       (DN game launches are routine there). Trigger window: immediately
       after DN.PRG's re-EXEC (exec_return restored the parent world, child
       freshly entered — first IRQ through the restored/new lane).
-- [ ] **Suspects (interp-specific):** the PM virtual-IF machinery — metal
-      tracks DPMI PM IF via TF=1 single-step + VME; verify the interp backend
-      implements the TF/#DB lane and VIF gating identically, else an IRQ can
-      inject mid-critical-section during the fresh client's stack switch.
+- [ ] **Suspects (narrowed 2026-06-09):** the IRQ lane is UNIVERSAL — every
+      DOS thread's IRQ goes through deliver_pm_irq (mod.rs:826,
+      unconditional): default vector ⇒ toggle to the PM-side locked stack +
+      push HostContinuation, reflect to the RM IVT handler, pop HC to
+      restore pre-IRQ segs. So plain RM DN rides locked_stack/other_stack/
+      host_stack on every tick. exec_program suspends DPMI/pm_vectors/LDT/
+      IVT (dos.rs:2710-2756) but does NOT touch dos.pc.locked_stack, and
+      host_stack lives in shared low memory — prime suspect: excursion
+      state (other_stack / HostContinuation slots) surviving across DN's
+      swap-cycle EXEC/exec_return when it shouldn't (forward-edge sibling
+      of the known exec_return locked-stack reset rule). Instrument
+      locked_stack at EXEC/exec_return/delivery in the deterministic repro.
       Same failure family as the Settlers nested-callback #GP below.
 - [ ] **Real gaps surfaced (fix regardless):**
       * Port 0x92 (fast A20) is unmodeled: reads return 0xFF = "A20 enabled"
