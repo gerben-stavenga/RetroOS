@@ -81,6 +81,41 @@ same situation the interpreter already has (no ROM).
 
 # DOS Game Compatibility — Bug Sprint
 
+## Hosted/interp — DN panel-Enter launch crashes (DPMI PM-IRQ delivery)
+- [ ] **Repro (deterministic, headless):** boot image on retroos-host, type
+      `cd \GAMES\PRINCE`, Down, Enter → VM86 panic `unhandled opcode at
+      ffbf:0433 (lin=0x100023)`, `last_irq=vec08 handler=0027:0510`. The
+      typed-command launch (`PRINCE` at the DN prompt → synth task spawn)
+      WORKS; panel-Enter takes DN's in-process route instead: DN.PRG (a
+      BP7/RTM **DPMI client**) exits to free memory, the dn.com stub
+      re-EXECs DN.PRG, and the crash hits shortly after the re-EXEC.
+- [ ] **Established:** `0027:0510` is the live client's PM INT 8 hook in
+      `pm_vectors[8]` (LDT selector 0x27, not an RM segment); the timer is
+      delivered via `deliver_pm_irq` while the guest is in a VM86 excursion,
+      and execution ends back in VM86 with garbage CS=FFBF → wanders into the
+      HMA window → `f0 25 ...` (LOCK AND reg) → unhandled-opcode panic. The
+      real-mode IVT[8] stays clean throughout (transition-sampled); the
+      in-process EXEC correctly suspends/restores DPMI state (dos.rs:2710).
+      Same sequence works on metal/QEMU (DN game launches are routine there).
+- [ ] **Suspects (interp-specific):** the PM virtual-IF machinery — metal
+      tracks DPMI PM IF via TF=1 single-step + VME; verify the interp backend
+      implements the TF/#DB lane and VIF gating identically, else an IRQ can
+      inject mid-critical-section during the fresh client's stack switch.
+      Same failure family as the Settlers nested-callback #GP below.
+- [ ] **Real gaps surfaced (fix regardless):**
+      * Port 0x92 (fast A20) is unmodeled: reads return 0xFF = "A20 enabled"
+        lie; writes drop. Model it (kbc/port92 → `set_a20`).
+      * XMS AH=01/02 (Request/Release HMA) unimplemented → generic failure.
+      * Interp `copy_entries`/`swap_entries` are CONTENT copies, not PTE
+        aliases: the A20-off wrap "alias" of low memory is a stale snapshot
+        on interp (wrap-detection through FFFF:xxxx sees frozen bytes), and
+        HMA content does not survive A20 toggles the way metal's PTE swap
+        does. Faithful A20/HMA needs real aliasing in the interp MMU.
+- [ ] **Next:** rerun the deterministic repro with DOS_TRACE_RT armed at the
+      2nd DN.PRG EXEC + PM single-step (`PM_STEP_BUDGET`) at the vec08
+      delivery; dump the locked-stack/ModeSave chain; diff against a metal
+      trace of the same panel-Enter sequence.
+
 ## Kernel — virtual IF gets stuck at 0
 - Freezes seen for
       * Dos Navigator
