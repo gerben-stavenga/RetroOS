@@ -112,6 +112,19 @@ fn unmask_irq(irq: u8) {
 
 /// Initialize interrupts (PIC, PIT, unmask timer + keyboard + mouse)
 pub fn init_interrupts() {
+    // This kernel is PIC-only — make sure the 8259's INTR actually reaches
+    // the CPU. Legacy BIOSes leave virtual-wire mode (LAPIC LINT0 = ExtINT,
+    // unmasked), but UEFI firmware (OVMF) boots in APIC mode and leaves the
+    // LAPIC enabled with LINT0 masked, silently eating every PIC interrupt:
+    // the UEFI mock ran at ~4 timer IRQs/s (stray edges) and DN's tick-paced
+    // startup extrapolated to minutes. Disabling the LAPIC via
+    // IA32_APIC_BASE reverts the pin to plain INTR — one MSR write, no
+    // LAPIC MMIO mapping needed (we never use the LAPIC).
+    const IA32_APIC_BASE: u32 = 0x1B;
+    let apic_base = crate::x86::rdmsr(IA32_APIC_BASE);
+    if apic_base & (1 << 11) != 0 {
+        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !(1 << 11)) };
+    }
     remap_pic();
     init_pit(1000); // 1000 Hz timer
     unmask_irq(0);  // timer

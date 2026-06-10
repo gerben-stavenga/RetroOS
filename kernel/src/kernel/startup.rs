@@ -319,6 +319,9 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
                     for _ in 0..ticks {
                         crate::kernel::dos::queue_tick(machine, dos);
                     }
+                    if ticks > 0 {
+                        crate::kernel::dos::display_tick(dos, regs, ticks);
+                    }
                     // Pump emulated-SB playback against the same virtual clock.
                     crate::kernel::dos::audio_tick(machine, dos, regs);
                     let dp = dos as *mut thread::DosState;
@@ -438,10 +441,10 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
             let total = user_cycles.wrapping_add(kernel_cycles);
             let user_pct = if total > 0 { user_cycles.wrapping_mul(100) / total } else { 0 };
             let kern_pct = if total > 0 { kernel_cycles.wrapping_mul(100) / total } else { 0 };
-            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
+            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
                 user_pct, kern_pct,
                 ev_irq, ev_softint, ev_hlt, ev_in, ev_out, ev_ins, ev_outs,
-                ev_pf, ev_exc, ev_fault, ev_syscall,
+                ev_pf, ev_exc, ev_fault, ev_syscall, machine.get_ticks(),
                 regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
             user_cycles = 0;
             kernel_cycles = 0;
@@ -665,7 +668,7 @@ fn handle_fork_exec(
             // the child's vga empty; switch_thread's restore is a no-op on
             // empty planes, so the hardware shows whatever the previous
             // restore put up — the child draws on top.
-            if parent_is_dos {
+            if parent_is_dos && crate::kernel::dos::vga_present() {
                 let dos_state = child.dos_mut();
                 dos_state.pc.vga.save_from_hardware();
             }

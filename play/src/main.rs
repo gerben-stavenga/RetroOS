@@ -54,7 +54,10 @@ fn main() {
     // composed here, on the thread that will run it.
     std::thread::spawn(move || {
         kernel::host_console_init();
-        arch::attach_vga(); // DAC capture → renderer palette
+        // Display: the kernel emulates the VGA and renders (single-VGA
+        // design); install its present sink to park frames in the backend
+        // mailbox the window thread blits from.
+        lib::vga_render::set_present_sink(|w, h, px| arch::publish_frame(w, h, px));
         if let Some(dir) = &host_dir {
             arch::attach_hostfs(dir); // COM1 → /host
         }

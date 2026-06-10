@@ -115,10 +115,21 @@ pub fn maybe_dump() {
         return;
     }
     let Some(path) = DUMP_PATH.get() else { return };
-    // Graphics modes (mode 13h) render to a PPM through the shared VGA renderer;
-    // text modes fall through to the CP437 character dump below.
-    if crate::vga::try_dump_ppm(path) {
-        return;
+    // Graphics mode (13h): dump the latest kernel-rendered frame as a PPM;
+    // text modes fall through to the CP437 character dump below (more useful
+    // as grep-able text than as pixels).
+    if crate::vcpu::mem().read::<u8>(0x449) == 0x13 {
+        if let Some((w, h, fb)) = crate::vga::peek_frame() {
+            let mut buf = Vec::with_capacity(w * h * 3 + 32);
+            let _ = write!(buf, "P6\n{w} {h}\n255\n");
+            for &px in &fb {
+                buf.push((px >> 16) as u8);
+                buf.push((px >> 8) as u8);
+                buf.push(px as u8);
+            }
+            let _ = std::fs::write(path, buf);
+            return;
+        }
     }
     let mem = crate::vcpu::mem();
     let mut out = String::with_capacity(ROWS * (COLS + 1));

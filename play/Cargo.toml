@@ -15,7 +15,8 @@ name = "retroos-play"
 path = "src/main.rs"
 
 [dependencies]
-kernel = { path = "../kernel" } # default features = hosted (interp backend)
+kernel = { path = "../kernel" }
+lib = { path = "../lib" } # default features = hosted (interp backend)
 retroos-arch-interp = { path = "../arch-interp" }
 # `bundled` compiles SDL2 from source (like Unicorn's C core); `static-link`
 # avoids needing a system libSDL2 at runtime.

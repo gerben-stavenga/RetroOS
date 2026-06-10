@@ -380,6 +380,11 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
+            // No card: the per-thread emulated flip-flop, fabricated status.
+            if !vga::vga_present() {
+                pc.vga.ac_state.pending_data = false;
+                return fabricated_status1(machine);
+            }
             let real = machine.inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
             // QEMU's 0x3DA bit 3 (vsync) doesn't sweep a raster in our setup, so
@@ -389,16 +394,17 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
             if !crate::kernel::startup::is_qemu() {
                 return real;
             }
-            let ticks = machine.get_ticks();
-            let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
-            let vr = phase >= 24;
-            use core::sync::atomic::{AtomicU32, Ordering};
-            static DA_READ_COUNT: AtomicU32 = AtomicU32::new(0);
-            let hbl = (DA_READ_COUNT.fetch_add(1, Ordering::Relaxed) >> 3) & 1 != 0;
-            (if vr { 0x08 } else { 0 }) | (if vr || hbl { 0x01 } else { 0 })
+            fabricated_status1(machine)
         }
-        // VGA ports — pass through to hardware
-        0x3C0..=0x3D9 | 0x3DB..=0x3DF => machine.inb(port),
+        // VGA ports — pass through to hardware, or the emulated register file
+        // when no card is present (see vga::vga_present).
+        0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
+            if vga::vga_present() {
+                machine.inb(port)
+            } else {
+                pc.vga.port_read(port)
+            }
+        }
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
         // to configure QEMU's emulated VGA, even for legacy modes.
         // Pass through so SeaBIOS sees real VBE state.
@@ -486,8 +492,14 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
     // ISA 10-bit I/O decode — fold the alias mod 0x400. See `emulate_inb`.
     let port = port & 0x3FF;
     match port {
-        // VGA ports — pass through to hardware, track AC flip-flop + index
+        // VGA ports — pass through to hardware (tracking the AC flip-flop +
+        // index, which hardware can't read back), or the emulated register
+        // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
+            if !vga::vga_present() {
+                pc.vga.port_write(port, val);
+                return;
+            }
             unsafe {
                 if !VGA_AC_STATE.pending_data {
                     VGA_AC_STATE.index = val; // index write — latch full byte (incl. PAS)
@@ -496,7 +508,13 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
             }
             machine.outb(port, val);
         }
-        0x3C1..=0x3DF => machine.outb(port, val),
+        0x3C1..=0x3DF => {
+            if vga::vga_present() {
+                machine.outb(port, val);
+            } else {
+                pc.vga.port_write(port, val);
+            }
+        }
         // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.
         0x01CE | 0x01CF | 0x01D0 => machine.outb(port, val),
         // Master PIC command
@@ -592,6 +610,19 @@ fn seg_base_for(machine: &mut crate::TheArch, regs: &Vcpu, sel: u16) -> u32 {
     } else {
         machine.seg_base(sel)
     }
+}
+
+/// Fabricated VGA Input Status #1 (see the `emulate_inb` 0x3DA arm for why):
+/// bit 3 = vertical retrace on a 70 Hz frame phase, bit 0 = blanking from a
+/// per-read counter, vsync forcing blanking.
+fn fabricated_status1(machine: &mut crate::TheArch) -> u8 {
+    let ticks = machine.get_ticks();
+    let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
+    let vr = phase >= 24;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static DA_READ_COUNT: AtomicU32 = AtomicU32::new(0);
+    let hbl = (DA_READ_COUNT.fetch_add(1, Ordering::Relaxed) >> 3) & 1 != 0;
+    (if vr { 0x08 } else { 0 }) | (if vr || hbl { 0x01 } else { 0 })
 }
 
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`

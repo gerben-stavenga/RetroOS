@@ -77,12 +77,8 @@ pub use devices::{
 // 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the
 // flag from a watcher thread, the CPU thread renders at the next slice boundary.
 pub use screendump::{enable_live as enable_live_console, request as request_vga_dump, set_dump_path};
-// Hosted VGA emulation: capture the guest DAC palette + render graphics modes
-// (mode 13h) through the shared `lib::vga_render`. `attach_vga` installs the
-// capture device; the screenshot path renders a PPM for graphics modes.
-pub use vga::attach as attach_vga;
-// Shared frame sink for an out-of-process-tree display (retroos-play): the
-// window thread `request_frame`s, the CPU thread renders at its next slice
-// boundary (the screendump pattern), the window thread `take_frame`s and blits.
-// Presentation (SDL et al.) lives entirely in the consuming binary.
-pub use vga::{request_frame, take_frame};
+// Display frame mailbox: the kernel emulates the VGA and renders (single-VGA
+// design); this backend only carries pixels. The hosted `main` publishes
+// frames from the kernel's present sink; retroos-play takes them and blits;
+// screenshots peek. Presentation (SDL et al.) lives in the consuming binary.
+pub use vga::{peek_frame, publish as publish_frame, take_frame};

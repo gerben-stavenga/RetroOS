@@ -153,6 +153,8 @@ pub(super) fn native_bios_present(regs: &Vcpu) -> bool {
 /// identical values — the layering matches a real machine (BIOS first, DOS
 /// on top).
 pub(super) fn install(regs: &mut Vcpu) {
+    crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (VGA {})",
+        if super::machine::vga_present() { "present" } else { "emulated" });
     for n in 0..256u32 {
         write_u16(regs, 0, n * 4, (n * 2) as u16);
         write_u16(regs, 0, n * 4 + 2, STUB_SEG);

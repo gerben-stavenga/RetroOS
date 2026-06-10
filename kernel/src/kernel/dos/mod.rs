@@ -67,6 +67,7 @@ mod mode_transitions;
 // Re-export so the Linux personality can hold its own console snapshot — DOS
 // machine emulation stays private otherwise.
 pub use machine::VgaState;
+pub use machine::vga_present;
 pub use dos::parse_config_env;
 
 // Stub array / slot table / IRQ-stack constants live in `dos.rs` (alongside
@@ -268,16 +269,22 @@ impl DosState {
     }
 
     /// Called when the thread loses focus. Snapshots the VGA framebuffer
-    /// + register set so the screen can be repainted on materialize.
+    /// + register set so the screen can be repainted on materialize. With no
+    /// card there is nothing to do: the per-thread register file already IS
+    /// the live state (the emulated port model), and VRAM lives in guest RAM.
     pub fn suspend(&mut self) {
-        self.pc.vga.save_from_hardware();
+        if machine::vga_present() {
+            self.pc.vga.save_from_hardware();
+        }
     }
 
     /// Called when the thread regains focus. Repaints the VGA framebuffer
     /// from the suspend snapshot. CPU-binding side effects live in
     /// `on_resume` and happen on every swap-in regardless of focus.
     pub fn materialize(&mut self) {
-        self.pc.vga.restore_to_hardware();
+        if machine::vga_present() {
+            self.pc.vga.restore_to_hardware();
+        }
     }
 }
 
@@ -791,6 +798,13 @@ pub fn queue_irq(dos: &mut thread::DosState, regs: &mut Vcpu, irq: crate::arch::
 /// drain where `machine` is already borrowed.
 pub fn queue_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState) {
     machine::queue_tick(machine, &mut dos.pc);
+}
+
+/// Render the emulated VGA to the platform display (no-op with a real card
+/// or no present sink). Called by the event loop with the PIT ticks just
+/// pumped; renders at a divided rate (see `machine::display_tick`).
+pub fn display_tick(dos: &mut thread::DosState, regs: &Vcpu, ticks: u32) {
+    machine::display_tick(&mut dos.pc, regs, ticks);
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).

@@ -294,6 +294,7 @@ name = "retroos-play"
 version = "0.1.0"
 dependencies = [
  "kernel",
+ "lib",
  "retroos-arch-interp",
  "sdl2",
 ]

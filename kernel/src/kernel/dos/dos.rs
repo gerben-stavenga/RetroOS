@@ -483,7 +483,9 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
                 if src.planes.is_empty() { return -61; }
                 unsafe {
                     core::mem::swap(&mut *dst, src);
-                    (*dst).restore_to_hardware();
+                    if machine::vga_present() {
+                        (*dst).restore_to_hardware();
+                    }
                 }
                 0
             });

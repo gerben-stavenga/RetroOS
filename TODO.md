@@ -15,10 +15,13 @@ DOS games like DOSBox (its own kernel underneath, not a bespoke DOS layer).
 - [ ] **Real-time audio.** The canonical audio port window (0x530/0x532/0x534)
       already receives i16-stereo frames (today → WAV). Add a real-time host
       sink (ring buffer → audio callback) to play to speakers.
-- [ ] **Graphical window.** Render the guest VGA framebuffer (text 0xB8000 +
-      graphics 0xA0000 / mode-13h) + DAC palette + current mode to a real
-      window, replacing the terminal text paint (`screendump`). `lib::vga` has
-      the text renderer; graphics modes are new.
+- [x] **Graphical window.** Done via the single-VGA design: the kernel
+      emulates the VGA once (`machine/vga.rs`: VgaState as the live register
+      file when no card, `display_tick` rendering through `lib::vga_render`
+      at divided tick cadence) and presents through a platform sink
+      (`lib::vga_render::set_present_sink`) — hosted parks frames in the
+      backend mailbox for the retroos-play window; metal blits into the
+      fbcon GOP framebuffer. arch-interp's own VGA emulation is deleted.
 - [ ] **Input.** Window keyboard events + **mouse** (→ the existing INT 33h
       packet path). Keyboard already flows `stdin → post_irq`.
 - [ ] **Threading.** Window/event loop on the main thread, interp CPU on a
@@ -65,6 +68,16 @@ The hosted backend can boot a disk image (interpreted ATA) or mount a host dir
 UEFI machines have no legacy real-mode BIOS (no INT 10h/16h/08h/… services, no
 F-segment ROM). To run DOS guests there, RetroOS must supply its own BIOS — the
 same situation the interpreter already has (no ROM).
+- [x] **DN runs with full display on the UEFI mock** (the milestone the items
+      below add up to): GRUB multiboot → embedded bootfs → Rust BIOS →
+      kernel-emulated VGA → GOP framebuffer. Two metal-specific fixes it
+      took: OVMF leaves the LAPIC enabled with LINT0 masked, eating every
+      PIC interrupt (init_interrupts now disables the LAPIC — we're
+      PIC-only); and the display render needed a tick divider + identical-
+      frame skip (uncached GOP blits at full tick rate starved the guest).
+      Remaining for real hardware: keyboard on the mock is wired
+      (i8042 → IRQ1 → Rust BIOS INT 09) but untested interactively; xHCI for
+      laptops with no i8042.
 - [x] **GOP framebuffer console** — the kernel's multiboot header requests a
       linear framebuffer (video fields, bit 2); `kernel/src/arch/fbcon.rs`
       maps it (cache-disabled, `paging2::FB_WINDOW_*`) and renders dirty text

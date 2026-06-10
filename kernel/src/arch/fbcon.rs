@@ -129,13 +129,66 @@ pub fn init(info: &arch::MultibootInfo) {
     });
 
     lib::vga::set_text_flush(flush);
+    // The emulated VGA's display sink: DOS screens (text or mode 13h) render
+    // kernel-side through lib::vga_render and land here for the GOP blit.
+    lib::vga_render::set_present_sink(present_dos_frame);
     flush(); // render the boot backlog accumulated since `early`
+}
+
+/// Set when a DOS frame painted the framebuffer: the console's dirty-cell
+/// shadow no longer matches the pixels, so the next console flush repaints
+/// from scratch (otherwise the kernel console stays invisible after a DOS
+/// program exits — the diff thinks nothing changed).
+static DOS_PAINTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Present sink for the kernel-emulated VGA: integer-scale and center the
+/// rendered DOS frame in the GOP framebuffer.
+///
+/// Unchanged frames are skipped BEFORE touching the framebuffer: the GOP
+/// mapping is uncached, so a full blit costs tens of milliseconds — at tick
+/// cadence that saturated the event loop and starved guest port I/O to ~64
+/// ins/sec (reproducer: DN's CGA snow-avoidance polls 0x3DA around every
+/// word it writes; its UI draw extrapolated to ~500 seconds). The compare
+/// runs in cached RAM and costs microseconds.
+fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
+    let Some(g) = geom() else { return };
+    if w == 0 || h == 0 || px.len() < w * h {
+        return;
+    }
+    static mut PREV: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let prev = unsafe { &mut *(&raw mut PREV) };
+    if prev.len() == w * h && prev[..] == px[..w * h] {
+        return;
+    }
+    prev.clear();
+    prev.extend_from_slice(&px[..w * h]);
+    let fb_w = g.stride; // pixels per row (pitch); visible width <= stride
+    let fb_h = g.len / g.stride;
+    let k = (fb_w / w).min(fb_h / h).max(1);
+    let (out_w, out_h) = ((w * k).min(fb_w), (h * k).min(fb_h));
+    let origin = (fb_h - out_h) / 2 * g.stride + (fb_w - out_w) / 2;
+    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+    for y in 0..out_h {
+        let src_row = &px[(y / k) * w..(y / k) * w + w];
+        let dst = &mut out[origin + y * g.stride..origin + y * g.stride + out_w];
+        for (x, d) in dst.iter_mut().enumerate() {
+            *d = src_row[x / k];
+        }
+    }
+    DOS_PAINTED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Re-render every cell that changed since the last flush. Installed as the
 /// console's post-write hook; also safe to call any time.
 fn flush() {
     let Some(g) = geom() else { return };
+    // A DOS frame painted over us: wipe and repaint the whole console.
+    if DOS_PAINTED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+        out.fill(0);
+        unsafe { (&mut *(&raw mut SHADOW)).fill(0) };
+    }
     let text: &[u16; 80 * 25] = unsafe { &*(&raw const TEXT_BUF) };
     let shadow = unsafe { &mut *(&raw mut SHADOW) };
     let frame = Frame {

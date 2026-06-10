@@ -1,6 +1,45 @@
-//! Virtual VGA register state (Attribute Controller + CRTC/sequencer snapshot).
+//! Virtual VGA register state (Attribute Controller + CRTC/sequencer snapshot)
+//! — and, when no card is present, the *emulated* VGA itself: the same
+//! register file becomes the live model behind `emulate_inb`/`emulate_outb`,
+//! and `display_tick` renders the screen through the shared `lib::vga_render`
+//! to the platform's present sink. One VGA, emulated once, kernel-side; the
+//! backends only supply a framebuffer.
 
 use super::*;
+
+// ============================================================================
+// Machine-wide VGA presence
+// ============================================================================
+
+/// 0 = unprobed, 1 = absent, 2 = present.
+static VGA_PRESENT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Is a real VGA card present? Probed once, lazily: write the SEQ index
+/// register and read it back — an absent ISA-bus port reads 0xFF. Decides
+/// passthrough vs the emulated register file for the whole 3Cx/3Dx window
+/// (and whether context-switch save/restore touches hardware at all).
+/// Machine-wide truth: legacy metal = yes; the interpreter (no VGA device on
+/// its port bus) and UEFI-class metal (no card) = no.
+pub fn vga_present() -> bool {
+    match VGA_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            use crate::arch::{inb, outb};
+            let saved = inb(0x3C4);
+            outb(0x3C4, 0x02);
+            let present = inb(0x3C4) == 0x02;
+            if present {
+                outb(0x3C4, saved);
+            }
+            VGA_PRESENT.store(
+                if present { 2 } else { 1 },
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            present
+        }
+    }
+}
 
 // ============================================================================
 // VGA register state (AcState + VgaState)
@@ -58,19 +97,34 @@ pub struct VgaState {
     pub dac_index: u8,
     /// DAC state byte from inb(0x3C7): 0x00 = write-mode, 0x03 = read-mode
     pub dac_state: u8,
+    // ── Emulated-model DAC latches (absent-card port model only) ──
+    /// Real VGA keeps *separate* read and write indices; palette-cycling
+    /// effects read entries back, rotate, and rewrite them — Prince of
+    /// Persia's torch flames do exactly this, and a read answering 0xFF
+    /// turns every cycled entry permanent white. `dac_index` above stays
+    /// the write index (the save/restore contract); these carry the read
+    /// index and the per-entry R/G/B sub-positions.
+    pub dac_read_index: u8,
+    pub dac_rsub: u8,
+    pub dac_wsub: u8,
 }
 
 impl VgaState {
     pub fn new() -> Self {
         Self {
             planes: alloc::vec::Vec::new(),
+            // EGA/text DAC defaults so the emulated model renders text in
+            // colour even though text-mode programs never program the DAC
+            // (mode 13h loads overwrite these). Harmless for the metal
+            // snapshot use: restore_to_hardware no-ops until a real save
+            // fills `planes`, which also rewrites the whole DAC.
             misc_output: 0,
             feature_ctl: 0,
             seq: [0; 5],
             crtc: [0; 25],
             gc: [0; 9],
             ac: [0; 21],
-            dac: [0; 768],
+            dac: lib::vga_render::fallback_palette(),
             dac_mask: 0xFF,
             seq_index: 0,
             crtc_index: 0,
@@ -78,16 +132,127 @@ impl VgaState {
             ac_state: AcState::new(),
             dac_index: 0,
             dac_state: 0,
+            dac_read_index: 0,
+            dac_rsub: 0,
+            dac_wsub: 0,
         }
     }
 
-    /// Read current VGA hardware state into this struct. No-op on the
-    /// interpreter backend, which has no VGA hardware (ports read 0xFF and the
-    /// planar framebuffer at the low-mem alias isn't host-mapped).
-    #[cfg(feature = "hosted")]
-    pub fn save_from_hardware(&mut self) {}
+    /// Emulated register-file write — the absent-card half of the VGA
+    /// passthrough-vs-emulate split (`PcMachine::vga_present == false`).
+    /// This per-thread struct IS the hardware then: `emulate_outb` routes the
+    /// 3Cx/3Dx window here instead of to real ports, and save/restore on
+    /// context switch becomes a no-op because the state never leaves the
+    /// struct. Index/data pairs land in the same arrays the metal
+    /// save/restore fills, so every consumer (renderer, mode queries) reads
+    /// one representation.
+    pub fn port_write(&mut self, port: u16, v: u8) {
+        match port {
+            0x3C0 => {
+                if !self.ac_state.pending_data {
+                    self.ac_state.index = v;
+                } else {
+                    let i = (self.ac_state.index & 0x1F) as usize;
+                    if i < 21 {
+                        self.ac[i] = v;
+                    }
+                }
+                self.ac_state.pending_data = !self.ac_state.pending_data;
+            }
+            0x3C2 => self.misc_output = v,
+            0x3C4 => self.seq_index = v,
+            0x3C5 => {
+                let i = (self.seq_index & 0x1F) as usize;
+                if i < 5 {
+                    self.seq[i] = v;
+                }
+            }
+            0x3C6 => self.dac_mask = v,
+            0x3C7 => {
+                self.dac_read_index = v;
+                self.dac_rsub = 0;
+                self.dac_state = 0x03;
+            }
+            0x3C8 => {
+                self.dac_index = v;
+                self.dac_wsub = 0;
+                self.dac_state = 0x00;
+            }
+            0x3C9 => {
+                let i = self.dac_index as usize * 3 + self.dac_wsub as usize;
+                self.dac[i] = v & 0x3F;
+                self.dac_wsub += 1;
+                if self.dac_wsub == 3 {
+                    self.dac_wsub = 0;
+                    self.dac_index = self.dac_index.wrapping_add(1);
+                }
+            }
+            0x3CE => self.gc_index = v,
+            0x3CF => {
+                let i = (self.gc_index & 0x0F) as usize;
+                if i < 9 {
+                    self.gc[i] = v;
+                }
+            }
+            0x3D4 => self.crtc_index = v,
+            0x3D5 => {
+                let i = self.crtc_index as usize;
+                if i < 25 {
+                    self.crtc[i] = v;
+                }
+            }
+            0x3DA => self.feature_ctl = v, // FCR write port (colour)
+            _ => {}
+        }
+    }
 
-    #[cfg(not(feature = "hosted"))]
+    /// Emulated register-file read (see `port_write`). 0x3DA (status + AC
+    /// flip-flop reset) stays in `emulate_inb`, which fabricates the retrace
+    /// bits for emulated and QEMU cards alike.
+    pub fn port_read(&mut self, port: u16) -> u8 {
+        match port {
+            0x3C0 => self.ac_state.index,
+            0x3C1 => {
+                let i = (self.ac_state.index & 0x1F) as usize;
+                if i < 21 { self.ac[i] } else { 0 }
+            }
+            0x3C2 => 0, // input status 0: no interrupt pending, monitor present
+            0x3C4 => self.seq_index,
+            0x3C5 => {
+                let i = (self.seq_index & 0x1F) as usize;
+                if i < 5 { self.seq[i] } else { 0 }
+            }
+            0x3C6 => self.dac_mask,
+            0x3C7 => self.dac_state,
+            0x3C8 => self.dac_index,
+            0x3C9 => {
+                let v = self.dac[self.dac_read_index as usize * 3 + self.dac_rsub as usize];
+                self.dac_rsub += 1;
+                if self.dac_rsub == 3 {
+                    self.dac_rsub = 0;
+                    self.dac_read_index = self.dac_read_index.wrapping_add(1);
+                }
+                v
+            }
+            0x3CA => self.feature_ctl,
+            0x3CC => self.misc_output,
+            0x3CE => self.gc_index,
+            0x3CF => {
+                let i = (self.gc_index & 0x0F) as usize;
+                if i < 9 { self.gc[i] } else { 0 }
+            }
+            0x3D4 => self.crtc_index,
+            0x3D5 => {
+                let i = self.crtc_index as usize;
+                if i < 25 { self.crtc[i] } else { 0 }
+            }
+            _ => 0xFF,
+        }
+    }
+
+    /// Read current VGA hardware state into this struct. Callers gate on
+    /// `PcMachine::vga_present` — with no card the per-thread struct already
+    /// *is* the live state (see `port_write`) and there is nothing to save.
     pub fn save_from_hardware(&mut self) {
         use crate::arch::{inb, outb};
         if self.planes.is_empty() {
@@ -199,12 +364,8 @@ impl VgaState {
         outb(0x3CE, self.gc_index);
     }
 
-    /// Write this struct's state to VGA hardware. No-op on the interpreter
-    /// backend (no VGA hardware).
-    #[cfg(feature = "hosted")]
-    pub fn restore_to_hardware(&self) {}
-
-    #[cfg(not(feature = "hosted"))]
+    /// Write this struct's state to VGA hardware. Callers gate on
+    /// `PcMachine::vga_present` (see `save_from_hardware`).
     pub fn restore_to_hardware(&self) {
         if self.planes.is_empty() { return; }
         use crate::arch::{inb, outb};
@@ -301,3 +462,55 @@ impl VgaState {
     }
 }
 
+
+// ============================================================================
+// Emulated display: render to the platform's present sink
+// ============================================================================
+
+/// Render the emulated VGA's screen and hand it to the platform present sink
+/// (`lib::vga_render::set_present_sink` — the GOP framebuffer on UEFI metal,
+/// the window/screenshot frame mailbox on hosted). Called from the event
+/// loop on PIT-tick cadence; free when a real card displays directly or no
+/// sink is installed.
+///
+/// The mode comes from BDA 0x449 (set by the personality BIOS INT 10h AH=00)
+/// — direct-register mode sets aren't derived yet, and planar/mode-X needs
+/// VRAM trapping; both match the limitations of the interp renderer this
+/// replaces.
+pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
+    use lib::vga_render::{self, Frame, VgaMode};
+    if vga_present() || !vga_render::present_sink_installed() {
+        return;
+    }
+    // Frame-rate divider: ticks arrive at the PIT rate (1000 Hz kernel
+    // default), and a render per tick saturates the event loop — the UEFI
+    // mock spent 99% CPU rendering and starved guest execution to ~50
+    // port-ins/sec. 50 ticks ≈ 20 fps.
+    static ACCUM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let due = ACCUM.fetch_add(ticks, core::sync::atomic::Ordering::Relaxed) + ticks >= 50;
+    if !due {
+        return;
+    }
+    ACCUM.store(0, core::sync::atomic::Ordering::Relaxed);
+    let mode = match regs.read::<u8>(0x449) {
+        0x13 => VgaMode::Mode13h,
+        0x02 | 0x03 | 0x07 => VgaMode::Text80x25, // 80×25 colour/mono text
+        _ => return,
+    };
+    let (w, h) = vga_render::dimensions(mode);
+    let (base, len) = match mode {
+        VgaMode::Mode13h => (0xA0000usize, w * h),
+        VgaMode::Text80x25 => (0xB8000usize, 80 * 25 * 2),
+    };
+    let mut vram = alloc::vec![0u8; len];
+    regs.copy_from(base, &mut vram);
+    let frame = Frame {
+        mode,
+        vram: &vram,
+        palette: &pc.vga.dac,
+        font: &lib::vga_font_8x16::FONT_8X16,
+    };
+    let mut fb = alloc::vec![0u32; w * h];
+    vga_render::render(&frame, &mut fb);
+    vga_render::present(w, h, &fb);
+}

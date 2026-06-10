@@ -108,9 +108,8 @@ pub fn run() -> ! {
             }
         }
 
-        // Ask for the next frame; blit the one the CPU thread has published
-        // since the last iteration (one loop-period of latency, by design).
-        arch::request_frame();
+        // Blit the latest frame the kernel's display tick published (PIT-tick
+        // cadence; one loop-period of latency, by design).
         if let Some((w, h, fb)) = arch::take_frame() {
             // A fresh streaming texture each frame keeps this trivial across
             // mode/size changes; at 320×200/720×400 it's negligible. RGB888 is

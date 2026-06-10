@@ -120,6 +120,38 @@ fn pal_rgb(palette: &[u8; 768], idx: u8) -> u32 {
     (c6to8(palette[o]) << 16) | (c6to8(palette[o + 1]) << 8) | c6to8(palette[o + 2])
 }
 
+// ── Present sink ─────────────────────────────────────────────────────────────
+//
+// The display half of the single-VGA design: the kernel emulates the VGA once
+// (register file + DAC in the DOS machine layer) and renders here; the
+// *platform* only supplies a place for pixels. Same shape as `lib::vga`'s
+// debug/flush sinks: a function pointer the platform installs once — the metal
+// boot glue points it at the GOP framebuffer blit (fbcon), the hosted binary
+// at the window/screenshot frame mailbox. No sink (e.g. legacy metal, where
+// the real card displays directly) means `present` is a no-op.
+
+static PRESENT_SINK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the platform's frame sink (`fn(width, height, pixels)`).
+pub fn set_present_sink(f: fn(usize, usize, &[u32])) {
+    PRESENT_SINK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a sink is installed — lets the renderer skip work entirely.
+pub fn present_sink_installed() -> bool {
+    PRESENT_SINK.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Hand a rendered frame (`0x00RRGGBB` pixels, row-major) to the platform.
+pub fn present(w: usize, h: usize, px: &[u32]) {
+    let p = PRESENT_SINK.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        let f: fn(usize, usize, &[u32]) = unsafe { core::mem::transmute(p) };
+        f(w, h, px);
+    }
+}
+
 /// Render `frame` into the caller-provided framebuffer `out`, which must be at
 /// least `dimensions(frame.mode).0 * .1` pixels (`0x00RRGGBB` each). Returns
 /// `(width, height)`. The whole frame area is written (background-cleared first),

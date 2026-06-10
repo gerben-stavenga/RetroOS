@@ -62,6 +62,9 @@ static mut LINUX_CONSOLE_VGA: Option<crate::kernel::dos::VgaState> = None;
 pub fn save_console_vga() {
     #[cfg(not(feature = "hosted"))]
     unsafe {
+        if !crate::kernel::dos::vga_present() {
+            return; // no card (UEFI metal): nothing to snapshot
+        }
         let vga = (&raw mut LINUX_CONSOLE_VGA)
             .as_mut()
             .unwrap()
@@ -77,6 +80,9 @@ pub fn save_console_vga() {
 pub fn restore_console_vga() {
     #[cfg(not(feature = "hosted"))]
     unsafe {
+        if !crate::kernel::dos::vga_present() {
+            return;
+        }
         if let Some(vga) = (&raw const LINUX_CONSOLE_VGA).as_ref().unwrap() {
             vga.restore_to_hardware();
         } else {

@@ -78,6 +78,7 @@ fn main() {
 
     // Arm VGA-screen snapshotting: a watcher thread flips the request flag every
     // second; the CPU thread renders at its next slice boundary.
+    let shot_armed = shot.is_some();
     if let Some(path) = shot {
         arch::set_dump_path(&path);
         std::thread::spawn(|| loop {
@@ -97,9 +98,13 @@ fn main() {
     }
     kernel::vga::set_debug_sink(host_log_byte);
     kernel::host_console_init();
-    // Emulate the VGA below the arch boundary: capture the guest's DAC palette so
-    // graphics-mode screenshots (and the live window) render correctly.
-    arch::attach_vga();
+    // Display: the kernel emulates the VGA (single-VGA design) and renders
+    // frames through its present sink; we just park them in the backend's
+    // frame mailbox for the screenshot path. Only armed when a consumer
+    // exists, so headless --cmd runs skip the render work entirely.
+    if shot_armed {
+        lib::vga_render::set_present_sink(|w, h, px| arch::publish_frame(w, h, px));
+    }
     if let Some(dir) = host_dir {
         arch::attach_hostfs(&dir); // COM1 → /host
     }
