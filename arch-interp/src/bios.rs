@@ -26,18 +26,49 @@ pub fn install() {
 
     // Signature 0xF00D 0xB105 (little-endian), then (vector, offset) u16 pairs
     // terminated by vector 0. Offsets are absolute within the F000 segment.
+    // Pseudo-vectors >= 0x100 carry the default stubs (see bios.c): 0x100 =
+    // IRET for every vector, 0x101/0x102 = master/slave-PIC EOI for the HW IRQ
+    // ranges. Defaults are written first so the explicit entries override —
+    // a real BIOS leaves no IVT entry null (SB IRQ autodetect chains through
+    // "old" vectors; a null one executes the IVT itself).
     const SIG: [u8; 4] = [0x0D, 0xF0, 0x05, 0xB1];
     if let Some(p) = BIOS_COM.windows(4).position(|w| w == SIG) {
+        let mut entries = Vec::new();
+        let (mut iret, mut eoi_m, mut eoi_s) = (None, None, None);
         let mut o = p + 4;
         while o + 4 <= BIOS_COM.len() {
             let vec = u16::from_le_bytes([BIOS_COM[o], BIOS_COM[o + 1]]);
             let off = u16::from_le_bytes([BIOS_COM[o + 2], BIOS_COM[o + 3]]);
             o += 4;
-            if vec == 0 {
-                break;
+            match vec {
+                0 => break,
+                0x100 => iret = Some(off),
+                0x101 => eoi_m = Some(off),
+                0x102 => eoi_s = Some(off),
+                _ => entries.push((vec, off)),
             }
-            m.write::<u16>(vec as usize * 4, off);
-            m.write::<u16>(vec as usize * 4 + 2, BIOS_SEG);
+        }
+        let wire = |vec: usize, off: u16| {
+            m.write::<u16>(vec * 4, off);
+            m.write::<u16>(vec * 4 + 2, BIOS_SEG);
+        };
+        if let Some(off) = iret {
+            for vec in 0..256 {
+                wire(vec, off);
+            }
+        }
+        if let Some(off) = eoi_m {
+            for vec in 0x08..0x10 {
+                wire(vec, off);
+            }
+        }
+        if let Some(off) = eoi_s {
+            for vec in 0x70..0x78 {
+                wire(vec, off);
+            }
+        }
+        for (vec, off) in entries {
+            wire(vec as usize, off);
         }
     }
 
@@ -52,7 +83,9 @@ fn seed_bda(m: crate::vcpu::GuestMem) {
     m.write::<u16>(0x463, 0x03D4); // CRTC base port (colour)
     m.write::<u8>(0x484, 24); // rows - 1
     m.write::<u16>(0x485, 16); // character cell height
-    m.write::<u16>(0x410, 0x0021); // equipment word
+    // Equipment word: bits 4-5 = 00 means "EGA/VGA with its own BIOS" — games'
+    // adapter detection (e.g. SkyRoads) checks this alongside INT 10h AX=1A00.
+    m.write::<u16>(0x410, 0x0001);
     // Keyboard ring buffer: empty (head == tail), buffer 0x1E..0x3D.
     m.write::<u16>(0x41A, 0x1E); // head
     m.write::<u16>(0x41C, 0x1E); // tail

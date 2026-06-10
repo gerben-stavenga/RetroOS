@@ -32,35 +32,60 @@ thread_local! {
     static PALETTE: RefCell<[u8; 768]> = const { RefCell::new([0u8; 768]) };
 }
 
-/// Virtual VGA registers — capture only. The guest's palette loads (write index
-/// at 0x3C8, then data at 0x3C9 auto-incrementing across R,G,B) are recorded;
-/// every other register write is dropped, and reads report the ISA "no device"
-/// value so the kernel's own 0x3DA retrace fabrication is unaffected.
+/// Virtual VGA DAC. The guest's palette loads (write index at 0x3C8, data at
+/// 0x3C9 auto-incrementing across R,G,B) are recorded, and the **read side is
+/// modelled too** (read index at 0x3C7, data back out of 0x3C9): palette-cycling
+/// effects read entries back, rotate, and rewrite them — Prince of Persia's
+/// torch flames do exactly this, and a read that answers 0xFF turns every cycled
+/// entry into 0x3F/0x3F/0x3F = permanent white. Real VGA keeps separate
+/// read/write indices; so do we. Other registers: writes dropped, reads report
+/// the ISA "no device" value (0x3DA itself is fabricated in the kernel).
 struct VgaRegs {
-    dac_index: u8, // DAC entry currently being written (latched by 0x3C8)
-    dac_sub: u8,   // component within the entry: 0=R, 1=G, 2=B
+    windex: u8, // DAC entry currently being written (latched by 0x3C8)
+    wsub: u8,   // write component within the entry: 0=R, 1=G, 2=B
+    rindex: u8, // DAC entry currently being read (latched by 0x3C7)
+    rsub: u8,   // read component within the entry
 }
 
 impl PortIo for VgaRegs {
-    fn read(&mut self, _port: u16, _width: u8) -> u32 {
-        0xFFFF_FFFF // nothing readable here; 0x3DA is handled in the kernel
+    fn read(&mut self, port: u16, _width: u8) -> u32 {
+        match port {
+            0x3C7 => 0x03, // DAC state: last operation was a read (we just serve)
+            0x3C8 => self.windex as u32,
+            0x3C9 => {
+                let v = PALETTE.with(|p| {
+                    p.borrow()[self.rindex as usize * 3 + self.rsub as usize]
+                });
+                self.rsub += 1;
+                if self.rsub == 3 {
+                    self.rsub = 0;
+                    self.rindex = self.rindex.wrapping_add(1);
+                }
+                v as u32
+            }
+            _ => 0xFFFF_FFFF, // nothing else readable; 0x3DA handled in the kernel
+        }
     }
     fn write(&mut self, port: u16, _width: u8, val: u32) {
         let v = val as u8;
         match port {
+            0x3C7 => {
+                self.rindex = v;
+                self.rsub = 0;
+            }
             0x3C8 => {
-                self.dac_index = v;
-                self.dac_sub = 0;
+                self.windex = v;
+                self.wsub = 0;
             }
             0x3C9 => {
                 PALETTE.with(|p| {
-                    let i = self.dac_index as usize * 3 + self.dac_sub as usize;
+                    let i = self.windex as usize * 3 + self.wsub as usize;
                     p.borrow_mut()[i] = v & 0x3F;
                 });
-                self.dac_sub += 1;
-                if self.dac_sub == 3 {
-                    self.dac_sub = 0;
-                    self.dac_index = self.dac_index.wrapping_add(1);
+                self.wsub += 1;
+                if self.wsub == 3 {
+                    self.wsub = 0;
+                    self.windex = self.windex.wrapping_add(1);
                 }
             }
             _ => {} // SEQ/CRTC/GC/AC index+data, DAC mask: not needed to render 13h
@@ -74,7 +99,7 @@ pub fn attach() {
     // Seed the DAC with the standard EGA/text defaults so text mode renders in
     // colour even though it never programs the DAC (mode 13h overwrites these).
     PALETTE.with(|p| *p.borrow_mut() = vga_render::fallback_palette());
-    register(0x3C0, 0x3DF, Box::new(VgaRegs { dac_index: 0, dac_sub: 0 }));
+    register(0x3C0, 0x3DF, Box::new(VgaRegs { windex: 0, wsub: 0, rindex: 0, rsub: 0 }));
 }
 
 /// Map the BIOS video mode to a renderable [`VgaMode`], or `None` for modes this

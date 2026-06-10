@@ -37,6 +37,16 @@ struct Display {
     texture_creator: TextureCreator<WindowContext>,
     event_pump: EventPump,
     last_present: Instant,
+    /// INT 33h button mask (bit 0 left, bit 1 right, bit 2 middle) — the
+    /// kernel's mouse packet wants the *current* mask, not edge events.
+    mouse_buttons: u8,
+    /// Fractional motion carry: window-pixel deltas are scaled to the INT 33h
+    /// coordinate space (640×200), so a slow 1-px vertical move is < 1 unit and
+    /// must accumulate instead of truncating to zero.
+    mouse_acc: (f32, f32),
+    /// Pointer captured (SDL relative mode): grabbed on first click in the
+    /// window, released with Ctrl+F10 (the DOSBox convention).
+    captured: bool,
 }
 
 thread_local! {
@@ -67,6 +77,9 @@ pub fn init() {
             texture_creator,
             event_pump,
             last_present: Instant::now() - FRAME_INTERVAL,
+            mouse_buttons: 0,
+            mouse_acc: (0.0, 0.0),
+            captured: false,
         });
     });
 }
@@ -85,12 +98,24 @@ pub fn tick() {
 /// Poll all pending SDL events: window close quits the host; key press/release
 /// become PS/2 scancodes posted to the kernel IRQ queue (press = scancode,
 /// release = scancode | 0x80 — the convention the stdin pump and kernel use).
+/// Mouse motion/buttons become `Irq::Mouse` packets in INT 33h units; the
+/// pointer is captured (relative mode) on the first click and released with
+/// Ctrl+F10, the DOSBox convention.
 fn pump_input(disp: &mut Display) {
-    for event in disp.event_pump.poll_iter() {
+    use sdl2::keyboard::Mod;
+    // Collect first: handling needs the rest of `disp` (button mask, capture),
+    // which can't be borrowed while `event_pump.poll_iter()` holds it.
+    let events: Vec<Event> = disp.event_pump.poll_iter().collect();
+    for event in events {
         match event {
             Event::Quit { .. } => {
                 // Runs atexit (restores the terminal the kernel may have raw-ed).
                 std::process::exit(0);
+            }
+            Event::KeyDown { scancode: Some(Scancode::F10), keymod, .. }
+                if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) =>
+            {
+                set_captured(disp, false); // Ctrl+F10: release the pointer
             }
             Event::KeyDown { scancode: Some(sc), repeat: false, .. } => {
                 if let Some(pc) = pc_scancode(sc) {
@@ -102,9 +127,59 @@ fn pump_input(disp: &mut Display) {
                     crate::machine::post_irq(Irq::Key(pc | 0x80));
                 }
             }
+            Event::MouseMotion { xrel, yrel, .. } => {
+                // Scale window-pixel deltas to the INT 33h space the kernel's
+                // MouseState lives in (640×200 over the whole window), carrying
+                // sub-unit remainders so slow motion isn't truncated away.
+                let (w, h) = disp.canvas.window().size();
+                disp.mouse_acc.0 += xrel as f32 * 640.0 / w.max(1) as f32;
+                disp.mouse_acc.1 += yrel as f32 * 200.0 / h.max(1) as f32;
+                let (dx, dy) = (disp.mouse_acc.0 as i16, disp.mouse_acc.1 as i16);
+                if dx != 0 || dy != 0 {
+                    disp.mouse_acc.0 -= dx as f32;
+                    disp.mouse_acc.1 -= dy as f32;
+                    crate::machine::post_irq(Irq::Mouse { dx, dy, buttons: disp.mouse_buttons });
+                }
+            }
+            Event::MouseButtonDown { mouse_btn, .. } => {
+                if !disp.captured {
+                    set_captured(disp, true); // first click grabs the pointer
+                }
+                if let Some(bit) = button_bit(mouse_btn) {
+                    disp.mouse_buttons |= bit;
+                    crate::machine::post_irq(Irq::Mouse { dx: 0, dy: 0, buttons: disp.mouse_buttons });
+                }
+            }
+            Event::MouseButtonUp { mouse_btn, .. } => {
+                if let Some(bit) = button_bit(mouse_btn) {
+                    disp.mouse_buttons &= !bit;
+                    crate::machine::post_irq(Irq::Mouse { dx: 0, dy: 0, buttons: disp.mouse_buttons });
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// SDL button → INT 33h mask bit (0 = left, 1 = right, 2 = middle).
+fn button_bit(btn: sdl2::mouse::MouseButton) -> Option<u8> {
+    use sdl2::mouse::MouseButton;
+    Some(match btn {
+        MouseButton::Left => 0x01,
+        MouseButton::Right => 0x02,
+        MouseButton::Middle => 0x04,
+        _ => return None,
+    })
+}
+
+/// Capture/release the pointer: SDL relative mode hides the host cursor and
+/// streams raw deltas regardless of window edges. The title shows how to get
+/// the pointer back.
+fn set_captured(disp: &mut Display, on: bool) {
+    disp.captured = on;
+    disp._sdl.mouse().set_relative_mouse_mode(on);
+    let title = if on { "RetroOS — DOS (Ctrl+F10 releases mouse)" } else { "RetroOS — DOS" };
+    let _ = disp.canvas.window_mut().set_title(title);
 }
 
 /// Render the guest's current screen (if a renderable mode) and blit it,

@@ -88,8 +88,28 @@ void interrupt int10(unsigned bp, unsigned di, unsigned si, unsigned ds,
     unsigned page;
 
     switch (ah) {
-    case 0x00: /* set video mode -- record it; we only model text mode 3 */
-        BDA_B(0x49) = (unsigned char)(ax & 0x7F);
+    case 0x00: /* set video mode -- record it, set BDA geometry, clear VRAM */
+        {
+            unsigned char mode = (unsigned char)(ax & 0x7F);
+            BDA_B(0x49) = mode;
+            BDA_W(0x4A) = (mode <= 1 || mode == 0x13) ? 40 : 80;
+            BDA_B(0x84) = 24;                       /* rows - 1 */
+            BDA_W(0x85) = (mode == 0x13) ? 8 : 16;  /* cell height */
+            BDA_B(0x62) = 0;                        /* active page 0 */
+            BDA_W(0x50) = 0;                        /* cursor home */
+            if (!(ax & 0x80)) {                     /* AL bit 7: no-clear */
+                unsigned i;
+                if (mode == 0x13) {
+                    unsigned far *p = (unsigned far *)MK_FP(0xA000, 0);
+                    for (i = 0; i < 32000; i++)     /* 320x200 bytes */
+                        p[i] = 0;
+                } else {
+                    unsigned far *p = (unsigned far *)MK_FP(VGA_SEG, 0);
+                    for (i = 0; i < 16384; i++)     /* full 32K text window */
+                        p[i] = 0x0720;
+                }
+            }
+        }
         break;
     case 0x01: /* set cursor shape (CX) */
         BDA_W(0x60) = cx;
@@ -134,6 +154,40 @@ void interrupt int10(unsigned bp, unsigned di, unsigned si, unsigned ds,
     case 0x0F: /* get video mode: AL=mode, AH=columns, BH=page */
         ax = (BDA_W(0x4A) << 8) | BDA_B(0x49);
         bx = (BDA_B(0x62) << 8) | (bx & 0xFF);
+        break;
+    case 0x10: /* palette/DAC -- forward to the DAC ports so the platform's
+                * palette capture (and a real card on metal) sees one path */
+        switch (ax & 0xFF) {
+        case 0x10: /* set one DAC register: BX=index, DH=R, CH=G, CL=B */
+            outportb(0x3C8, (unsigned char)(bx & 0xFF));
+            outportb(0x3C9, (unsigned char)(dx >> 8));
+            outportb(0x3C9, (unsigned char)(cx >> 8));
+            outportb(0x3C9, (unsigned char)(cx & 0xFF));
+            break;
+        case 0x12: /* set DAC block: BX=first, CX=count, ES:DX=RGB triples */
+            {
+                unsigned char far *tbl = (unsigned char far *)MK_FP(es, dx);
+                unsigned i, n = cx * 3;
+                outportb(0x3C8, (unsigned char)(bx & 0xFF));
+                for (i = 0; i < n; i++)
+                    outportb(0x3C9, tbl[i]);
+            }
+            break;
+        default:
+            break;
+        }
+        break;
+    case 0x12: /* alternate select */
+        if ((bx & 0xFF) == 0x10) {  /* EGA info: BH=colour, BL=mem, CL=switches */
+            bx = 0x0003;            /* colour mode, 256K on board */
+            cx = 0x0009;            /* switch setting: EGA+, colour display */
+        }
+        break;
+    case 0x1A: /* display combination code -- the canonical "is this VGA?" */
+        if ((ax & 0xFF) == 0x00) {
+            ax = (ax & 0xFF00) | 0x1A;  /* AL=1Ah: function supported */
+            bx = 0x0008;                /* BL=8: VGA with colour analog display */
+        }
         break;
     default:
         break;
@@ -234,13 +288,45 @@ void interrupt int09(void)
     outportb(0x20, 0x20);                               /* EOI */
 }
 
+/* --- Default handlers ------------------------------------------------------
+ * Every vector this BIOS doesn't model gets a stub, exactly like a real BIOS:
+ * plain IRET for software vectors, EOI+IRET for the hardware IRQ lines. A null
+ * IVT entry is lethal to probing guests -- SB IRQ autodetect (SkyRoads) hooks
+ * INT 0A/0B/0F, chains to the "old" vector, and a null vector sends execution
+ * through the IVT bytes at 0000:0000. */
+void interrupt int_default(unsigned bp, unsigned di, unsigned si, unsigned ds,
+                           unsigned es, unsigned dx, unsigned cx, unsigned bx,
+                           unsigned ax, unsigned ip, unsigned cs, unsigned flags)
+{
+}
+
+void interrupt irq_default_master(void)
+{
+    outportb(0x20, 0x20);
+}
+
+void interrupt irq_default_slave(void)
+{
+    outportb(0xA0, 0x20);
+    outportb(0x20, 0x20);
+}
+
 /* --- Self-describing vector table ----------------------------------------
  * The interpreter scans the compiled blob for the 0xF00D 0xB105 signature, then
  * reads (vector, handler-offset) pairs until a zero vector, and wires the IVT.
  * The handler offsets are link-time constants (the functions' offsets within
- * the F000 segment), so no MAP file or running code is needed. */
+ * the F000 segment), so no MAP file or running code is needed.
+ *
+ * Pseudo-vector ids >= 0x100 carry the default stubs (real vectors are < 0x100):
+ *   0x100 = IRET stub for every unlisted vector
+ *   0x101 = master-PIC EOI stub  (IVT 08-0F defaults)
+ *   0x102 = slave-PIC EOI stub   (IVT 70-77 defaults)
+ * The loader applies defaults first, then the explicit entries override. */
 unsigned bios_vectors[] = {
     0xF00D, 0xB105,                 /* signature */
+    0x100, (unsigned)int_default,
+    0x101, (unsigned)irq_default_master,
+    0x102, (unsigned)irq_default_slave,
     0x08, (unsigned)int08,
     0x09, (unsigned)int09,
     0x10, (unsigned)int10,
