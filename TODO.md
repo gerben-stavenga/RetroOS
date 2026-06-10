@@ -89,14 +89,18 @@ same situation the interpreter already has (no ROM).
       WORKS; panel-Enter takes DN's in-process route instead: DN.PRG (a
       BP7/RTM **DPMI client**) exits to free memory, the dn.com stub
       re-EXECs DN.PRG, and the crash hits shortly after the re-EXEC.
-- [ ] **Established:** `0027:0510` is the live client's PM INT 8 hook in
-      `pm_vectors[8]` (LDT selector 0x27, not an RM segment); the timer is
-      delivered via `deliver_pm_irq` while the guest is in a VM86 excursion,
-      and execution ends back in VM86 with garbage CS=FFBF → wanders into the
-      HMA window → `f0 25 ...` (LOCK AND reg) → unhandled-opcode panic. The
-      real-mode IVT[8] stays clean throughout (transition-sampled); the
-      in-process EXEC correctly suspends/restores DPMI state (dos.rs:2710).
-      Same sequence works on metal/QEMU (DN game launches are routine there).
+- [ ] **Established:** `0027:0510` is `pm_vectors[8]`'s DEFAULT entry —
+      `VECTOR_STUB_SEL` (LDT idx 4) : stub slot 8 — NOT a client hook. So the
+      crash is in the kernel's own default reflect lane: vec08 →
+      `deliver_pm_irq` (guest mid-VM86-excursion) → vector stub `CD 31` →
+      reflect toward the BIOS IVT handler, and the round trip comes back to
+      VM86 with garbage CS=FFBF → wanders into the HMA window → `f0 25 ...`
+      (LOCK AND reg) → unhandled-opcode panic. RM IVT[8] stays clean
+      throughout (transition-sampled); in-process EXEC suspends/restores
+      DPMI state correctly (dos.rs:2710). Same sequence works on metal/QEMU
+      (DN game launches are routine there). Trigger window: immediately
+      after DN.PRG's re-EXEC (exec_return restored the parent world, child
+      freshly entered — first IRQ through the restored/new lane).
 - [ ] **Suspects (interp-specific):** the PM virtual-IF machinery — metal
       tracks DPMI PM IF via TF=1 single-step + VME; verify the interp backend
       implements the TF/#DB lane and VIF gating identically, else an IRQ can
