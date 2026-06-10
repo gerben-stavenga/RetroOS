@@ -226,6 +226,28 @@ pub fn debug_byte(b: u8) {
     stream(b);
 }
 
+/// Post-write console-flush hook (`fn()` as its address; 0 = none). On machines
+/// whose text cells are not themselves the display — a GOP linear framebuffer
+/// with no VGA text mode — the platform installs a renderer here that pushes
+/// the dirty cells to pixels after each console write. Same shape as
+/// `DEBUG_SINK`: an atomic load + indirect call, panic-safe.
+static TEXT_FLUSH: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the post-write console-flush hook.
+pub fn set_text_flush(f: fn()) {
+    TEXT_FLUSH.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn text_flush() {
+    let p = TEXT_FLUSH.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        let f: fn() = unsafe { core::mem::transmute(p) };
+        f();
+    }
+}
+
 #[inline]
 fn stream(b: u8) {
     let p = DEBUG_SINK.load(core::sync::atomic::Ordering::Relaxed);
@@ -240,6 +262,7 @@ fn stream(b: u8) {
 pub fn putchar(c: u8) {
     vga().putchar(c);
     stream(c);
+    text_flush();
 }
 
 /// Console writer behind `print!`/`println!`: renders to the framebuffer when
@@ -253,6 +276,9 @@ impl Write for Console {
                 vga().putchar(b);
             }
             stream(b);
+        }
+        if to_screen {
+            text_flush();
         }
         Ok(())
     }

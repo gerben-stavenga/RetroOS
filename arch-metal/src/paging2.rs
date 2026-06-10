@@ -112,7 +112,14 @@ pub const KERNEL_PHYS: usize = 0x0010_0000;
 /// within it — but the window itself is a memory-layout fact (the ceiling, and
 /// the base = first page past the kernel image's linker `_end`), owned here, not
 /// allocator policy.
-pub const HEAP_END: usize = 0xFFF0_0000;
+pub const HEAP_END: usize = FB_WINDOW_BASE;
+
+/// VA window for the boot-handoff linear framebuffer on UEFI-class machines
+/// (GOP — no VGA text mode). The kernel framebuffer console maps the
+/// multiboot-reported framebuffer here, cache-disabled. 63 MB covers any
+/// plausible mode (4K×32bpp ≈ 33 MB). Carved off the top of the heap window.
+pub const FB_WINDOW_BASE: usize = 0xFC00_0000;
+pub const FB_WINDOW_END: usize = 0xFFF0_0000;
 
 /// First page after the kernel image (`_end`), aligned up — the heap base.
 pub fn heap_base() -> usize {

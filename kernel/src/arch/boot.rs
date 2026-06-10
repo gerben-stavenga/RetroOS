@@ -74,6 +74,12 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // Multiboot info is in low memory — access through LOW_MEM_BASE mapping
     let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const arch::MultibootInfo) };
 
+    // UEFI-class machine (loader handed us a linear framebuffer, there is no
+    // VGA text mode): console cells go to a RAM buffer instead of B8000.
+    // Pixels start flowing at `fbcon::init` below; cells written until then
+    // are rendered as backlog.
+    crate::fbcon::early(info);
+
     lib::println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
     paging2::finish_setup_paging();
@@ -136,6 +142,12 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     lib::println!();
     lib::println!("\x1b[92mHello from Rust kernel!\x1b[0m");
+
+    // GOP machines: map the framebuffer and render the boot backlog. Last of
+    // the ring-0 bring-up — the mapping demand-allocates page tables, so the
+    // #PF handler and phys_mm must be up, and it must run after the compat-
+    // mode switch so the entries land in the final page tables.
+    crate::fbcon::init(info);
 
     // Read the boot config (QEMU fw_cfg) at the platform boundary, before
     // handing it to the kernel — the kernel no longer pokes firmware ports.

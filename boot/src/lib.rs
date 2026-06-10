@@ -62,6 +62,12 @@ pub struct MultibootInfo {
     pub syms: [u32; 4],
     pub mmap_length: u32,
     pub mmap_addr: u32,
+    /// The drives/config/loader-name/APM/VBE/framebuffer fields the kernel-side
+    /// struct (arch-metal `MultibootInfo`) defines, kept as zero filler here:
+    /// this bootloader never sets their `flags` bits (it boots in VGA text
+    /// mode), but the kernel dereferences the full-size struct, so the memory
+    /// must exist and read as zero.
+    pub ext: [u32; 17],
 }
 
 /// E820 entry used for BIOS call (has extra acpi field)
@@ -439,6 +445,7 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         syms: [0; 4],
         mmap_length,
         mmap_addr: mmap_entries.as_ptr() as u32,
+        ext: [0; 17],
     };
 
     println!("Starting kernel...");

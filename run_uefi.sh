@@ -16,8 +16,11 @@
 # framebuffer handoff) replaces it. The kernel binary itself is UNCHANGED
 # from the legacy-BIOS boot.
 #
-# Console: the kernel's 0xE9 debug log → stdio (-debugcon). With no VGA text
-# mode, that's the only console until the GOP framebuffer renderer lands.
+# Console: the kernel header requests a linear framebuffer (multiboot video
+# fields); GRUB sets a GOP mode and the kernel's fbcon renders the text
+# console into it (kernel/src/arch/fbcon.rs). The 0xE9 debug log → stdio
+# (-debugcon) carries the same text. DOS guests draw to guest VRAM, which has
+# no display path here yet — that's the DOS-personality-BIOS work (TODO #6).
 #
 # Usage: ./run_uefi.sh [image.bin] [--headless] [-- extra qemu args]
 #   default image: bazel-bin/image_proprietary.bin (falls back to image.bin)
@@ -57,6 +60,9 @@ trap 'rm -rf "$WORK"' EXIT
 
 cat > "$WORK/grub.cfg" <<'EOF'
 set timeout=0
+# The kernel's multiboot header requests a linear framebuffer (GOP); GRUB can
+# only satisfy it with its EFI video driver loaded.
+insmod efi_gop
 menuentry "RetroOS (multiboot)" {
     search --no-floppy --file /kernel.elf --set=root
     multiboot /kernel.elf

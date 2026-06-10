@@ -28,6 +28,12 @@ extern crate retroos_arch_interp as arch;
 #[path = "arch/boot.rs"]
 mod boot;
 
+// The GOP framebuffer text console (UEFI-class machines, no VGA text mode).
+// Metal boot glue like `boot.rs`: legacy-BIOS boots never activate it.
+#[cfg(not(feature = "hosted"))]
+#[path = "arch/fbcon.rs"]
+mod fbcon;
+
 mod kernel;
 
 // Re-export kernel submodules so arch/ code can use crate::thread, crate::dos, etc.

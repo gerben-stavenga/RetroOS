@@ -65,6 +65,14 @@ The hosted backend can boot a disk image (interpreted ATA) or mount a host dir
 UEFI machines have no legacy real-mode BIOS (no INT 10h/16h/08h/… services, no
 F-segment ROM). To run DOS guests there, RetroOS must supply its own BIOS — the
 same situation the interpreter already has (no ROM).
+- [x] **GOP framebuffer console** — the kernel's multiboot header requests a
+      linear framebuffer (video fields, bit 2); `kernel/src/arch/fbcon.rs`
+      maps it (cache-disabled, `paging2::FB_WINDOW_*`) and renders dirty text
+      cells via `lib::vga_render::render_text_cell` after each console write
+      (`lib::vga::set_text_flush`). Kernel console is visible on the
+      `run_uefi.sh` mock; legacy boots keep writing real B8000 cells.
+      Gotcha for `boot-uefi` later: GRUB places the multiboot color_info at
+      offset 112, not the spec's 110 (multiboot.h's union is 4-aligned).
 - [ ] **Move the C BIOS (`arch-interp/bios/bios.c`, installed via
       `arch-interp/src/bios.rs`) out of the interp backend and into the DOS
       personality.** It should be installed by the DOS layer whenever no native

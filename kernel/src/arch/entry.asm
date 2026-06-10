@@ -27,12 +27,22 @@ extern SYSCALL_KERNEL_RSP  ; SYSCALL kernel stack (descriptors.rs)
 section .multiboot
 align 4
 MULTIBOOT_MAGIC  equ 0x1BADB002
-MULTIBOOT_FLAGS  equ 0x00000003  ; align modules + provide memory map
+MULTIBOOT_FLAGS  equ 0x00000007  ; align modules + memory map + video mode
 MULTIBOOT_CHECK  equ -(MULTIBOOT_MAGIC + MULTIBOOT_FLAGS)
 
 dd MULTIBOOT_MAGIC
 dd MULTIBOOT_FLAGS
 dd MULTIBOOT_CHECK
+; Address fields — present because the video fields below follow them
+; positionally, but unused (flags bit 16 is clear; we're a plain ELF).
+dd 0, 0, 0, 0, 0
+; Video request (flags bit 2). On UEFI-class machines (no VGA text mode) the
+; loader hands back a linear framebuffer in the info struct; our own legacy
+; bootloader ignores the header and boots in VGA text mode as before.
+dd 0          ; mode_type: 0 = linear graphics
+dd 1024       ; width  (a request — the loader picks the nearest GOP mode)
+dd 768        ; height
+dd 32         ; depth
 
 ; =============================================================================
 ; 32-bit code: boot stub, mode toggle, protected-mode entry, ISR dispatch

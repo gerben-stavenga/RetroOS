@@ -146,39 +146,54 @@ fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
     }
 }
 
+const TEXT_COLS: usize = 80;
+const TEXT_ROWS: usize = 25;
+const CELL_W: usize = 9; // 8 glyph + 1 (col 8 repeats col 7 for line-draw)
+const CELL_H: usize = 16;
+
 /// 80×25 text: char+attr cells through the 8×16 font. Attribute byte is
 /// `BBBBFFFF`-ish: bits 0-3 = foreground palette index, bits 4-6 = background
 /// (bit 7 = blink, rendered as background bit 3 here — i.e. no blink).
 fn render_text(frame: &Frame, out: &mut [u32], w: usize, _h: usize) {
-    const COLS: usize = 80;
-    const ROWS: usize = 25;
-    const CW: usize = 9; // 8 glyph + 1 (we render 9 wide; col 8 repeats col 7 for line-draw)
-    const CH: usize = 16;
-    if frame.font.len() < 256 * 16 {
+    for row in 0..TEXT_ROWS {
+        for col in 0..TEXT_COLS {
+            render_text_cell(frame, col, row, out, w);
+        }
+    }
+}
+
+/// Render one text cell (9×16 px) of `frame` into a pitched output buffer.
+/// `out` starts at the frame's pixel (0,0); `stride` is the output row pitch
+/// in *pixels* (≥ 720), so a caller with a wider target (a GOP framebuffer)
+/// can pass a sub-rectangle of it directly — no staging copy. A cell that
+/// would overrun `out` is skipped. This is the dirty-cell primitive for
+/// incremental console rendering; the full-frame path above is built on it.
+pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], stride: usize) {
+    if frame.font.len() < 256 * 16 || col >= TEXT_COLS || row >= TEXT_ROWS {
         return;
     }
-    for row in 0..ROWS {
-        for col in 0..COLS {
-            let cell = (row * COLS + col) * 2;
-            if cell + 1 >= frame.vram.len() {
-                continue;
-            }
-            let ch = frame.vram[cell] as usize;
-            let attr = frame.vram[cell + 1];
-            let fg = pal_rgb(frame.palette, attr & 0x0F);
-            let bg = pal_rgb(frame.palette, (attr >> 4) & 0x07);
-            let glyph = &frame.font[ch * 16..ch * 16 + 16];
-            for gy in 0..CH {
-                let bits = glyph[gy];
-                let py = row * CH + gy;
-                for gx in 0..CW {
-                    // Column 8 duplicates column 7 (VGA 9th-dot line-draw rule).
-                    let bit = if gx < 8 { gx } else { 7 };
-                    let on = bits & (0x80 >> bit) != 0;
-                    let px = col * CW + gx;
-                    out[py * w + px] = if on { fg } else { bg };
-                }
-            }
+    let cell = (row * TEXT_COLS + col) * 2;
+    if cell + 1 >= frame.vram.len() {
+        return;
+    }
+    // Whole-cell bounds up front so the pixel loop can't overrun.
+    if (row * CELL_H + CELL_H - 1) * stride + col * CELL_W + CELL_W > out.len() {
+        return;
+    }
+    let ch = frame.vram[cell] as usize;
+    let attr = frame.vram[cell + 1];
+    let fg = pal_rgb(frame.palette, attr & 0x0F);
+    let bg = pal_rgb(frame.palette, (attr >> 4) & 0x07);
+    let glyph = &frame.font[ch * 16..ch * 16 + 16];
+    for gy in 0..CELL_H {
+        let bits = glyph[gy];
+        let py = row * CELL_H + gy;
+        for gx in 0..CELL_W {
+            // Column 8 duplicates column 7 (VGA 9th-dot line-draw rule).
+            let bit = if gx < 8 { gx } else { 7 };
+            let on = bits & (0x80 >> bit) != 0;
+            let px = col * CELL_W + gx;
+            out[py * stride + px] = if on { fg } else { bg };
         }
     }
 }

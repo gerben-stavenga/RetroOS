@@ -46,6 +46,12 @@ pub struct MultibootMmapEntry {
 }
 
 /// Multiboot info structure (from GRUB or our bootloader).
+///
+/// `repr(C)` reproduces the spec offsets exactly: the u16 run keeps
+/// `framebuffer_addr` at offset 88, which is 8-aligned, so no padding is
+/// inserted anywhere. Fields past `mmap_addr` are only valid under their
+/// `flags` bit; our legacy bootloader zero-fills them (bit 12 clear), GRUB
+/// fills the framebuffer block when the header requests video.
 #[repr(C)]
 pub struct MultibootInfo {
     pub flags: u32,
@@ -58,7 +64,36 @@ pub struct MultibootInfo {
     pub syms: [u32; 4],
     pub mmap_length: u32,
     pub mmap_addr: u32,
+    pub drives_length: u32,
+    pub drives_addr: u32,
+    pub config_table: u32,
+    pub boot_loader_name: u32,
+    pub apm_table: u32,
+    pub vbe_control_info: u32,
+    pub vbe_mode_info: u32,
+    pub vbe_mode: u16,
+    pub vbe_interface_seg: u16,
+    pub vbe_interface_off: u16,
+    pub vbe_interface_len: u16,
+    pub framebuffer_addr: u64,
+    pub framebuffer_pitch: u32,
+    pub framebuffer_width: u32,
+    pub framebuffer_height: u32,
+    pub framebuffer_bpp: u8,
+    /// 0 = indexed, 1 = direct RGB, 2 = EGA text (B8000-style cells).
+    pub framebuffer_type: u8,
+    /// The spec text puts color_info at offset 110, but GRUB fills the block
+    /// through multiboot.h's struct, where color_info is a *union containing a
+    /// u32* — 4-aligned, so it really lands at 112. Observed on GRUB 2.12/OVMF:
+    /// reading at 110 yields (0,0,16,8,…). Match GRUB, the only multiboot
+    /// loader we use (our own bootloader zero-fills all of this).
+    pub color_pad: [u8; 2],
+    /// For type 1: (red_pos, red_size, green_pos, green_size, blue_pos, blue_size).
+    pub color_info: [u8; 6],
 }
+
+/// `flags` bit: the framebuffer fields above are valid.
+pub const MULTIBOOT_INFO_FRAMEBUFFER: u32 = 1 << 12;
 
 // --- Re-exports for the kernel layer (ring 1) ---
 
