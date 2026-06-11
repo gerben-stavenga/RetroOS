@@ -198,6 +198,19 @@ multiboot map called free, or something interrupt/time-driven).
 # DOS Game Compatibility — Bug Sprint
 
 ## Hosted/interp — DN launch crashes in the swap cycle (DPMI PM-IRQ delivery)
+- [x] **Resource leak fixed (630c335) — the suspected driver:** reap() never
+      freed anything (slot flipped Unused; zombie kept VgaState planes +
+      screen snapshot + LDT until slot reuse) and interp address spaces were
+      IMMORTAL (mmu registry never removed entries: 3GB reservation + 1.5MB
+      bookkeeping leaked per fork). Now: arch destroy_space(root) at reap,
+      reap(machine,·) drops personality + space, and the event loop reaps
+      ALL zombies before returning (callers never inherit zombies). PRINCE
+      launch/quit cycles: RSS flat. Remaining hosted growth during exec
+      churn = Unicorn TB-cache fill (bounded) — backend concern.
+- [ ] **Re-verify the original timing crash post-fix:** the deterministic
+      keystroke repro (below) did not reproduce in today's runs (it is
+      timing-pattern sensitive). If it still fires with reaping fixed, the
+      locked-stack/IRQ-lane analysis below resumes.
 - [ ] **Repro (deterministic per keystroke-timing pattern, headless):** boot
       image on retroos-host, type `cd \GAMES\PRINCE` (0.15s/char), Down,
       Enter → VM86 panic `unhandled opcode at ffbf:0433 (lin=0x100023)`,
