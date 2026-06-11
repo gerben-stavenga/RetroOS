@@ -36,18 +36,41 @@ DOS games like DOSBox (its own kernel underneath, not a bespoke DOS layer).
 The TSS32 IOPB is a single **shared** bitmap (all threads); `allow_io_ports`
 (OPL un-trap on SB passthrough) is therefore global. It works today only because
 card presence is machine-wide.
-- [ ] Make I/O trapping **per-thread / per-personality**: e.g. a DOS thread with
-      passthrough OPL vs one emulating it; Linux/native personalities that
-      shouldn't get direct port access at all. Needs a per-thread IOPB swapped on
-      context switch (or a per-personality TSS). See
-      `arch-metal/src/descriptors.rs` (`setup_vm86_bitmaps`, `allow_io_ports`).
+- [x] Make I/O trapping **per-thread / per-personality** (f755094):
+      `kernel::io_policy` rebuilds the bitmap on every swap-in from
+      (personality, Platform, focus). DOS-with-focus gets the VGA window on a
+      real card; background DOS gets only granted device windows (OPL stays
+      DOS-global so background music keeps playing); Linux gets nothing — its
+      dispatcher already faults KE::In/Out, and now the trap actually fires.
+      Arch mechanism = `reset_io_bitmap` + `allow_io_ports`; policy in kernel.
+- [x] `kernel::platform` (a4fc2ae): the machine probed ONCE at startup into
+      ADTs — Host { Qemu | Metal | Interp }, Display { VgaCard | Framebuffer
+      | HostWindow | Headless }, Firmware { NativeBios | Substitute },
+      DebugSink. Killed the lazy vga_present atomic, the reset-vector sniff
+      at BIOS install, and HOST_QEMU/is_qemu().
+
+## 2b. Decouple focus from execution
+`kernel::focus` (f755094) names the concept: F11 moves console ownership
+(display + keyboard + mouse), release/acquire hooks do the screen handoff,
+and the I/O bitmap follows the owner. But today the event loop still runs
+only the focused thread — focus and execution move together.
+- [ ] Scheduler change: background threads keep executing while an
+      unfocused DOS app renders into its own VgaState and gets no input.
+      Everything keyed off `focus::focused()` is already in place; the event
+      loop needs to multiplex Ready threads instead of parking on the
+      focused one. Watch the DN swap-cycle DPMI bug (see bug sprint) — it
+      lives in exactly this machinery.
+- [ ] Route keyboard/mouse explicitly through `focus::focused()` instead of
+      "whoever is running" (equivalent today, load-bearing after the
+      scheduler change).
 
 ## 3. Better kernel init structure
 `startup.rs` does too much inline — TAR/ext4 mounts, CONFIG.SYS, AC'97 probe,
 hostfs, the cmdline/DN dispatch, the boot self-build — in one long function.
-- [ ] Restructure into clear ordered init phases (device registration,
-      filesystem mount, personality setup, run/loop), so the metal and hosted
-      entry points share one clean, legible spine.
+- [x] Restructured (ee9ab48): startup() is an ordered spine — heap →
+      platform probe → threading → block → mount_filesystems →
+      init_device_policy → load_master_env → init_console_pipe → run. Both
+      entry points (metal enter_ring1, hosted main) share it.
 
 ## 4. Sound Blaster: passthrough vs emulation
 Passthrough-vs-emulation is decided ad-hoc by `ensure_mode` probing, and the
