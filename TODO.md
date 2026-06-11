@@ -132,6 +132,44 @@ same situation the interpreter already has (no ROM).
       RetroOS (GPT scan, or stay RAM-only diskless), and the real-laptop
       trial itself (open questions: panel GOP pixel format, i8042 presence).
 
+## 7. Real-laptop boot reset after "Heap initialized" (ACTIVE HUNT)
+The laptop resets silently right after the "Heap initialized" print — no
+panic, no double-fault dump, machine just reboots. Same kernel boots fine on
+QEMU UEFI, Bochs+OVMF (`run_uefi_bochs.sh`), and hosted. Eliminated so far:
+port-0x80 side effects (delays removed entirely, still resets), and
+"handler couldn't run" (an IST1 double-fault handler now prints+halts for
+that whole class — yet the reset stays silent, so the machine dies without a
+deliverable CPU fault: smells like a write to firmware/SMM-owned memory the
+multiboot map called free, or something interrupt/time-driven).
+- [ ] **Get the countdown verdict.** The instrumented kernel (local branch
+      `metal-work`) prints a 10×1s spin countdown with zero memory activity,
+      then `demand[k]: va=… → phys …` for the first 16 heap pages, each line
+      lingering ~2s before the page is touched. Where the output stops picks
+      the cause: mid-countdown = interrupt/time-driven (memory innocent);
+      after `probe: start` with no demand line = fault-entry path; after
+      `demand[k]` = that physical address is poison (cross-check against the
+      `Memory regions:` list printed at the top of boot — photograph both).
+- [ ] **Rebase `metal-work` onto master afterwards.** Its build plumbing
+      (build_host.sh inputs fix) is superseded by the crate_universe work on
+      master. Keepers to land regardless of the bug: the IST1 double-fault
+      handler (arch-metal descriptors/traps), the Bochs UEFI rig
+      (`run_uefi_bochs.sh` + `vncstub.py`, 2MB-OVMF auto-fetch,
+      `reset_on_triple_fault=0`), and whichever probe caught the bug. The
+      diagnostics knobs (`HEAP_PROBE_MB`, `DEMAND_TRACE_N`) go back to 0.
+
+## 8. Build/toolchain cleanups
+- [ ] **Upstream the pre-generated unicorn bindings into the fork.** The
+      86KB `toolchain/unicorn-sys-pregen-bindings.patch` vendors bindgen's
+      output and rewires `include!`; committing `bindings_pregen.rs` to
+      `unicorn-retroos-patch` (plus the include! change) lets this repo drop
+      the patch to a one-liner or nothing. Regeneration story stays the
+      crate's own `generate_bindings` when `unicorn.h` changes.
+- [ ] **Watch the rules_python stale-repo trap.** The rules_foreign_cc dep
+      bumped transitive rules_python; an interrupted fetch left a stale
+      hermetic-python external repo and `pkg_tar` failed on a dangling
+      setuptools file. Remedy (documented in 7aab93a): delete the
+      `rules_python~~python~*` external dir + `.marker`, rebuild.
+
 ---
 
 # DOS Game Compatibility — Bug Sprint
