@@ -125,10 +125,11 @@ same situation the interpreter already has (no ROM).
       pool.
 - [ ] **UEFI/modern-metal boot = the user's existing GRUB** (direction change:
       no own `boot-uefi` entry — GRUB is on people's machines already and
-      multiboot is our production boot contract there). Remaining: a
-      documented menuentry snippet (copy kernel.elf to /boot, multiboot line),
-      and a story for reaching the user's storage from RetroOS (GPT scan, or
-      stay RAM-only diskless).
+      multiboot is our production boot contract there). The menuentry snippet
+      is documented in BOOTING.md (copy kernel.elf, insmod efi_gop, Secure
+      Boot off). Remaining: a story for reaching the user's storage from
+      RetroOS (GPT scan, or stay RAM-only diskless), and the real-laptop
+      trial itself (open questions: panel GOP pixel format, i8042 presence).
 
 ---
 
