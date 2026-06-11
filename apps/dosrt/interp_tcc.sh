@@ -37,7 +37,7 @@ sed 's/$/\r/' "$SRC" | LC_ALL=C tr -cd '\11\12\15\40-\176' > "$STAGE/$GUEST_SRC"
 # The interpreter shuts down when TCC exits; no wall-clock cap is needed (it's
 # deterministic, and Bazel's action timeout still bounds a real hang).
 "$HOST" --host "$STAGE" \
-    --cmd "boot/TC/TCC.EXE $TCC_FLAGS $GUEST_SRC" --cwd "host/" \
+    --cmd "TC/TCC.EXE $TCC_FLAGS $GUEST_SRC" --cwd "host/" \
     "$IMAGE" < /dev/null > "$STAGE/run.log" 2>&1 || true
 
 if [ ! -f "$STAGE/$GUEST_OUT" ]; then

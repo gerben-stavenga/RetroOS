@@ -94,12 +94,12 @@ impl Audio {
 /// (`mount_filesystems` derives the mount set from the variant payload).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Media {
-    /// A boot disk answered with a usable partition table: the natural
-    /// root for metal (and hosted runs with an image attached). `tar_lba`
-    /// = 0xDA boot-bundle TAR for /boot (embedded bootfs stands in when
-    /// absent); `ext4_lba` = the 0x83 root. `hostfs` additionally at /host
-    /// when the COM1 transport answered.
-    DiskRoot { tar_lba: Option<u32>, ext4_lba: Option<u32>, hostfs: bool },
+    /// A boot disk answered with an ext4 root (0x83) in its partition
+    /// table: the natural root for metal (and hosted runs with an image
+    /// attached). `hostfs` additionally at /host when the COM1 transport
+    /// answered. (/boot is NOT from disk — the embedded bootfs is an
+    /// invariant; the 0xDA boot-bundle partition is bootloader-only.)
+    DiskRoot { ext4_lba: u32, hostfs: bool },
     /// No usable disk, but the host filesystem answered: it IS the root —
     /// the natural root for hosted runs (DOSBox-style: a host directory is
     /// the drive, no image build). Also aliased at /host so DiskRoot-era
@@ -235,9 +235,10 @@ fn probe_audio(machine: &mut crate::TheArch) -> Audio {
     Audio::EmulatedSilent
 }
 
-/// Scan the MBR (4 entries at 0x1BE) for the boot-bundle TAR (type 0xDA)
-/// and the ext4 root (0x83), and probe the hostfs COM1 transport. With no
-/// block device, `read_sectors` leaves the buffer zeroed and the scan finds
+/// Scan the MBR (4 entries at 0x1BE) for the ext4 root (type 0x83) and
+/// probe the hostfs COM1 transport. The 0xDA boot-bundle partition is the
+/// legacy bootloader's business — the kernel ignores it. With no block
+/// device, `read_sectors` leaves the buffer zeroed and the scan finds
 /// nothing — the same verdict path as an empty disk.
 fn probe_media(machine: &mut crate::TheArch) -> Media {
     let _ = machine;
@@ -245,20 +246,16 @@ fn probe_media(machine: &mut crate::TheArch) -> Media {
 
     let mut mbr = [0u8; 512];
     crate::kernel::block::read_sectors(0, &mut mbr);
-    let mut tar_lba = None;
     let mut ext4_lba = None;
     for i in 0..4 {
         let base = 0x1BE + i * 16;
-        let lba = u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap());
-        match mbr[base + 4] {
-            0xDA => tar_lba = Some(lba),
-            0x83 => ext4_lba = Some(lba),
-            _ => {}
+        if mbr[base + 4] == 0x83 {
+            ext4_lba = Some(u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap()));
         }
     }
 
-    if tar_lba.is_some() || ext4_lba.is_some() {
-        Media::DiskRoot { tar_lba, ext4_lba, hostfs }
+    if let Some(ext4_lba) = ext4_lba {
+        Media::DiskRoot { ext4_lba, hostfs }
     } else if hostfs {
         Media::HostRoot
     } else {

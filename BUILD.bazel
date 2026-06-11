@@ -81,17 +81,15 @@ pkg_tar(
     visibility = ["//kernel:__pkg__"],
 )
 
-# Boot bundle (small TAR, mounted at /boot/ when ext4 is root). Holds
-# everything the kernel touches before userland is up: bootloader, kernel,
-# self-build sources for COMMAND.COM, DN file manager, DOS32A extender.
-# Keep this tight — it caps the size of the boot partition.
+# Boot bundle (small TAR, partition 1): the LEGACY BOOTLOADER's kernel
+# source only — the MBR stage reads kernel.elf (+ md5) from it. The kernel
+# itself never mounts it: /boot is always the embedded bootfs, on top of
+# whatever the root is. Everything else lives on ext4.
 _BOOT_FILES = {
     "//boot:bootloader_bin": "A",
     ":kernel_md5": "kernel.elf.md5",
     "//kernel:kernel_elf": "kernel.elf",
-    "//apps-boot/command:command.c":     "SRC/COMMAND.C",
 }
-_BOOT_FILES.update(_DN_FILES)
 
 # image_min's boot bundle: the bare kernel (no embedded bootfs). The in-OS
 # toolchain genrules (//apps-boot/command:command_com, //apps/dosrt:stub_exe)
@@ -108,6 +106,8 @@ _BOOT_FILES_MIN[":kernel_md5_bare"] = "kernel.elf.md5"
 # and busybox.
 _EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
+    # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
+    "//apps-boot/command:command.c": "SRC/COMMAND.C",
     # Prebuilt by in-OS TCC at image-build time (it used to be self-built at
     # every boot); DN's "COMMAND.COM /C ..." EXECs this from C:\.
     "//apps-boot/command:command_com": "COMMAND.COM",
@@ -140,13 +140,15 @@ _EXTRA_FILES = {
 }
 
 # Minimum extras needed for the stub-build image (//apps/dosrt:stub_exe
-# boots //:image_min and runs in-OS TCC). TCC + DN are in the boot bundle;
-# the only thing it needs from ext4 root is CONFIG.SYS, for its PATH
+# boots //:image_min and runs in-OS TCC from ext4 /TC;
+# CONFIG.SYS supplies the PATH
 # (= C:\;C:\BOOT\TC;C:\BORLANDC\BIN) so TCC can find TLINK.EXE. Keeping
 # this tiny avoids the image→modplay→stub_exe→image cycle that would
 # otherwise force a separate `dosrt_tar` indirection.
 _MIN_EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
+    # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
+    "//apps-boot/command:command.c": "SRC/COMMAND.C",
 }
 
 # Monolithic file map for the open-source image and FreeDOS apps disk —
@@ -161,20 +163,20 @@ _BASE_FILES.update(_EXTRA_FILES)
 pkg_tar(
     name = "boot_bundle_tar",
     files = _BOOT_FILES,
-    deps = [":tc_tar"],
 )
 
 pkg_tar(
     name = "boot_bundle_min_tar",
     files = _BOOT_FILES_MIN,
-    deps = [":tc_tar"],
 )
 
-# Just enough on ext4 for the stub-build image (CONFIG.SYS, for TCC's
-# PATH). Used only by image_min; keeps the build acyclic.
+# Just enough on ext4 for the stub-build image: CONFIG.SYS (for TCC's
+# PATH) and the TC toolchain itself (the boot TAR is bootloader-only now).
+# Used only by image_min; keeps the build acyclic.
 pkg_tar(
     name = "extras_min_tar",
     files = _MIN_EXTRA_FILES,
+    deps = [":tc_tar"],
 )
 
 # Extras populated into the ext4 partition: busybox-userland, Linux test
@@ -186,6 +188,7 @@ pkg_tar(
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
         "//apps/games:tar",
+        ":tc_tar",
         ":tp70_tar",
     ],
 )
@@ -193,7 +196,7 @@ pkg_tar(
 # Same extras plus the proprietary game/tooling drop. (No hard-coded
 # MOD file — modplay takes the module path as argv[1].) CONFIG.SYS is dropped
 # from the file map so apps-proprietary's own CONFIG.SYS (PATH without
-# C:\BOOT\TC, since BC is the compiler) is the ONLY one: pkg_tar lets `files`
+# C:\TC, since BC is the compiler) is the ONLY one: pkg_tar lets `files`
 # win over `deps` on a duplicate path, so the default would otherwise shadow it.
 _EXTRA_FILES_PROPRIETARY = {k: v for k, v in _EXTRA_FILES.items() if k != "etc/CONFIG.SYS"}
 pkg_tar(
@@ -202,6 +205,7 @@ pkg_tar(
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
         "//apps/games:tar",
+        ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
     ],
@@ -223,9 +227,9 @@ pkg_tar(
 
 # Disk image layout (used by both image and image_proprietary):
 #   sector 0           bootloader/MBR (with patched partition table)
-#   sector 1..         boot bundle TAR (kernel + DN + TC + COMMAND.C)
-#   sector EXT4_START  ext4 partition: extras + games (+ proprietary)
-# The kernel scans the MBR, mounts ext4 as root, and the TAR at /boot/.
+#   sector 1..         boot bundle TAR (kernel.elf for the MBR loader only)
+#   sector EXT4_START  ext4 partition: extras + TC + games (+ proprietary)
+# The kernel scans the MBR for the ext4 root; /boot is the embedded bootfs.
 #
 # EXT4_START leaves 32 MiB of headroom for the boot bundle. Anything bigger
 # should live on ext4.

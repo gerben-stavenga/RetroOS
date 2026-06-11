@@ -54,30 +54,22 @@ static HOSTFS: crate::kernel::hostfs::HostFs = crate::kernel::hostfs::HostFs::ne
 
 /// Derive the mount set from the platform's Media verdict (the probe already
 /// scanned the MBR and the hostfs transport); then the symbol index.
+/// /boot is an INVARIANT: the embedded bootfs (DN + COMMAND.COM), mounted on
+/// top of whatever the root is — the disk's 0xDA boot-bundle partition is
+/// bootloader-only and never mounted.
 fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
     use crate::kernel::platform::Media;
 
-    let mut disk_tar = false;
     match platform.media {
-        Media::DiskRoot { tar_lba, ext4_lba, hostfs } => {
-            if let Some(lba) = tar_lba {
-                println!("Boot TAR at sector {:#x}", lba);
-                disk_tar = true;
-                unsafe {
-                    ROOT_TARFS = TarFs::new(lba);
-                    (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
+        Media::DiskRoot { ext4_lba, hostfs } => {
+            println!("ext4 root at sector {:#x}", ext4_lba);
+            match Ext4Fs::new(ext4_lba) {
+                Ok(fs) => {
+                    let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+                    unsafe { EXT4_FS = Some(leaked); }
+                    vfs::mount(b"", leaked);
                 }
-            }
-            if let Some(lba) = ext4_lba {
-                println!("ext4 root at sector {:#x}", lba);
-                match Ext4Fs::new(lba) {
-                    Ok(fs) => {
-                        let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
-                        unsafe { EXT4_FS = Some(leaked); }
-                        vfs::mount(b"", leaked);
-                    }
-                    Err(e) => panic!("ext4 mount failed: {}", e),
-                }
+                Err(e) => panic!("ext4 mount failed: {}", e),
             }
             if hostfs {
                 vfs::mount(b"host/", &HOSTFS);
@@ -94,18 +86,12 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
         Media::Diskless => {}
     }
 
-    // No TAR boot partition: /boot/ comes from the embedded bootfs — the
-    // DN + COMMAND.COM environment linked into the kernel image.
-    if !disk_tar {
-        if let Some(bytes) = crate::bootfs() {
-            unsafe {
-                ROOT_TARFS = TarFs::new_ram(bytes);
-                (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
-            }
+    if let Some(bytes) = crate::bootfs() {
+        unsafe {
+            ROOT_TARFS = TarFs::new_ram(bytes);
+            (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
         }
     }
-
-    // Boot bundle TAR mounts at /boot/; the root holds everything else.
     #[allow(static_mut_refs)]
     unsafe { vfs::mount(b"boot/", &ROOT_TARFS); }
 
