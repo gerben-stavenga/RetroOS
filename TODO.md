@@ -72,20 +72,25 @@ hostfs, the cmdline/DN dispatch, the boot self-build — in one long function.
       init_device_policy → load_master_env → init_console_pipe → run. Both
       entry points (metal enter_ring1, hosted main) share it.
 
-## 4. Sound Blaster: passthrough vs emulation
-Passthrough-vs-emulation is decided ad-hoc by `ensure_mode` probing, and the
-OPL / DSP / mixer / 8237 handling is split across the two paths.
-- [ ] A cleaner "real card vs emulated card" device abstraction spanning the
-      AC'97 sink, OPL (detection now; **synth** for actual music later), the
-      passthrough remap, and the DSP/mixer. See memories
+## 4. Audio into the Platform type (follow-up to 2/3)
+Same doctrine as the platform/io_policy work: probe ONCE at init, freeze into
+an ADT, derive all policy. Passthrough-vs-emulation is still decided ad-hoc by
+`ensure_mode` probing — the audio twin of the old lazy `vga_present()`.
+- [ ] `platform::Audio { Ac97 | SbPassthrough | Emulated | Absent }`, probed
+      eagerly in `platform::probe` (codec + OPL + SB reality). `ensure_mode`'s
+      lazy probing dies; the OPL grant becomes derived `io_policy` template
+      data instead of a runtime `grant_dos_ports` poke; the AC'97 sink, the
+      passthrough remap, and the DSP/mixer hang off the variant. See memories
       `project_dma_zero_copy_design`, `project_ac97_lowmem_dma_window_todo`.
 
-## 5. Hosted: HDD image vs host filesystem
-The hosted backend can boot a disk image (interpreted ATA) or mount a host dir
-(hostfs over COM1); choosing/combining them is ad-hoc.
-- [ ] A clean model: boot from a disk image **or** run a program straight from a
-      host directory mounted as a drive (DOSBox-style `mount c .`), so you can
-      drop DOS games in a host folder and run them with no image build.
+## 5. Boot media into the Platform type (follow-up to 2/3)
+Same doctrine again, for storage: the hosted backend can boot a disk image
+(interpreted ATA) or mount a host dir (hostfs over COM1), and
+`mount_filesystems` decides by poking (hostfs-if-it-answers).
+- [ ] A typed `Media { DiskImage | HostDir | Both }` decided at init (CLI +
+      platform facts), with the mount set derived from it — and the clean
+      end state: run a program straight from a host directory mounted as a
+      drive (DOSBox-style `mount c .`), no image build needed.
 
 ## 6. UEFI boot + DOS personality owns its BIOS
 UEFI machines have no legacy real-mode BIOS (no INT 10h/16h/08h/… services, no
