@@ -78,13 +78,14 @@ pub fn new_arch() -> TheArch {
 pub use arch_abi::{BootConfig, parse_debug_watch};
 
 /// The embedded boot filesystem: a TAR (DN + COMMAND.COM + fallback
-/// CONFIG.SYS) linked into the metal kernel as raw bytes (`//:bootfs_tar` →
-/// `//kernel:bootfs_obj`), so a bare kernel.elf booted from any multiboot
-/// loader — someone's existing GRUB, no RetroOS disk — still has its
-/// environment. `startup` mounts it at /boot/ when no TAR boot partition is
-/// found. None in the bare kernel (`kernel_elf_bare`, used by image_min) and
-/// in the hosted build (which always boots a disk image).
-#[cfg(not(feature = "hosted"))]
+/// CONFIG.SYS) linked in as raw bytes (`//:bootfs_tar` → objcopy → the
+/// `_binary_bootfs_tar_*` symbols), so /boot ALWAYS exists, mounted on top
+/// of whatever the root is — a bare kernel.elf from someone's GRUB, an
+/// imageless hosted run, anything. None only in the bare kernel
+/// (`kernel_elf_bare`, used by image_min) and the cargo build of the hosted
+/// binary (Bazel links the bytes — `bootfs_embedded` cfg; cargo can't).
+#[cfg(any(not(feature = "hosted"), bootfs_embedded))]
+#[allow(unexpected_cfgs)]
 pub fn bootfs() -> Option<&'static [u8]> {
     unsafe extern "C" {
         static _binary_bootfs_tar_start: u8;
@@ -100,7 +101,8 @@ pub fn bootfs() -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(start as *const u8, end - start) })
 }
 
-#[cfg(feature = "hosted")]
+#[cfg(all(feature = "hosted", not(bootfs_embedded)))]
+#[allow(unexpected_cfgs)]
 pub fn bootfs() -> Option<&'static [u8]> {
     None
 }

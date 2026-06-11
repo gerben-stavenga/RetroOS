@@ -1,6 +1,7 @@
 # Build kernel using rules_rust and rules_nasm
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_static_library")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:retro_platform.bzl", "retro_platform_files")
 
 nasm_library(
     name = "entry",
@@ -38,7 +39,10 @@ rust_library(
     edition = "2024",
     # abort matches //lib and //arch-abi (abort rlibs can't link into an
     # unwind binary; unwind rlibs like std/@crates link into abort fine).
+    # bootfs_embedded: Bazel links the bootfs bytes (bootfs_obj_host), so
+    # the symbol-reading bootfs() is selected; cargo keeps the None arm.
     rustc_flags = [
+        "--cfg=bootfs_embedded",
         "-Cpanic=abort",
         # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
         # metal setting); a PIE link rejects them — build non-PIE to match.
@@ -68,6 +72,77 @@ rust_binary(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":bootfs_host",
+        ":kernel_hosted",
+        "//arch-interp",
+        "//lib",
+    ],
+)
+
+# The bootfs tar pinned to the canonical retro platform: its build subtree
+# (in-OS TCC → image_min → the i686 bootloader) must not follow the host
+# config that retroos-host builds in.
+retro_platform_files(
+    name = "bootfs_tar_pinned",
+    dep = "//:bootfs_tar",
+)
+
+# The embedded bootfs for the HOSTED binary: same bytes, same
+# _binary_bootfs_tar_* symbols as the metal kernel's bootfs_obj, in the
+# host object format. /boot always exists, on top of whatever the root is.
+genrule(
+    name = "bootfs_obj_host",
+    srcs = [":bootfs_tar_pinned"],
+    outs = ["bootfs_host.o"],
+    cmd = "T=$$(mktemp -d) && cp $< $$T/bootfs.tar && O=$$(pwd)/$@ && " +
+          "(cd $$T && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 " +
+          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
+          "bootfs.tar $$O) && rm -r $$T",
+)
+
+cc_library(
+    name = "bootfs_host",
+    srcs = [":bootfs_obj_host"],
+    linkstatic = True,
+)
+
+# Empty twin for retroos-host-bare (the in-OS TCC build tool): bootfs_tar
+# contains COMMAND.COM, which is BUILT BY retroos-host — the tool must not
+# depend on its own output. Mirrors kernel_elf_bare's bootfs_empty_obj:
+# a 1024-byte zero TAR reads as end-of-archive → bootfs() returns None.
+genrule(
+    name = "bootfs_empty_obj_host",
+    outs = ["bootfs_empty_host.o"],
+    cmd = "T=$$(mktemp -d) && truncate -s 1024 $$T/bootfs.tar && O=$$(pwd)/$@ && " +
+          "(cd $$T && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 " +
+          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
+          "bootfs.tar $$O) && rm -r $$T",
+)
+
+cc_library(
+    name = "bootfs_host_empty",
+    srcs = [":bootfs_empty_obj_host"],
+    linkstatic = True,
+)
+
+# The TCC-genrule tool: identical to retroos-host but with the empty
+# bootfs (see bootfs_empty_obj_host) — breaks the COMMAND.COM cycle. Tool
+# runs always boot a disk image, so /boot comes from its TAR partition.
+rust_binary(
+    name = "retroos-host-bare",
+    srcs = ["src/main.rs"],
+    crate_name = "retroos_host",
+    crate_features = ["hosted"],
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
+        # metal setting); a PIE link rejects them — build non-PIE to match.
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":bootfs_host_empty",
         ":kernel_hosted",
         "//arch-interp",
         "//lib",
