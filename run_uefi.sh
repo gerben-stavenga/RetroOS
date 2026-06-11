@@ -102,7 +102,12 @@ exec qemu-system-x86_64 \
     `# controller it finds; OVMF locates the ESP by filesystem, not order` \
     -drive file="$ESP",if=none,id=esp,format=raw \
     -device nvme,drive=esp,serial=esp0 \
-    -device qemu-xhci -device usb-kbd \
+    `# xHCI controller present (the honest modern-laptop bus, for the future` \
+    `# xHCI driver to probe) but NO usb-kbd: QEMU routes keyboard input to a` \
+    `# USB keyboard when one exists, and with no xHCI driver those keys` \
+    `# vanish — the i8042 bring-up crutch never sees a byte. Keys reach the` \
+    `# guest via q35's i8042 until the xHCI/HID driver lands.` \
+    -device qemu-xhci \
     -debugcon stdio \
     -no-reboot \
     "${DISPLAY_ARGS[@]}" \
