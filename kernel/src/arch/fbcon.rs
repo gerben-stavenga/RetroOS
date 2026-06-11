@@ -91,6 +91,24 @@ pub fn init(info: &arch::MultibootInfo) {
             "fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — no display",
             info.framebuffer_bpp, rp, rs, gp, gs, bp, bs
         );
+        // Blind-debug signal: a machine with no debug port shows nothing at
+        // all otherwise. Map just the first stripe of the framebuffer and
+        // fill it with 0xFF bytes — white-ish on any channel order or depth
+        // — so "framebuffer handed over but format rejected" is visible.
+        let stripe_bytes = (pitch * 32).min(1 << 20);
+        let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes + PAGE_SIZE - 1)
+            / PAGE_SIZE;
+        for i in 0..pages {
+            paging2::map_user_page_phys(
+                paging2::FB_WINDOW_BASE / PAGE_SIZE + i,
+                addr / PAGE_SIZE as u64 + i as u64,
+                paging2::flags::CACHE_DISABLE,
+            );
+        }
+        let base = paging2::FB_WINDOW_BASE + (addr & (PAGE_SIZE as u64 - 1)) as usize;
+        unsafe {
+            core::slice::from_raw_parts_mut(base as *mut u8, stripe_bytes).fill(0xFF);
+        }
         return;
     }
     if width < TEXT_W || height < TEXT_H {

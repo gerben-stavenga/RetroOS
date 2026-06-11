@@ -189,7 +189,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     if paging2::cpu_supports_long_mode() {
         paging2::sync_hw_pdpt();
         x86::flush_tlb();
+        stage_delay(); // stage 6a: hw PDPT synced
         let saved = paging2::ensure_trampoline_mapped();
+        stage_delay(); // stage 6b: trampoline identity-mapped
         descriptors::toggle_mode(paging2::toggle_cr3(true));
         paging2::clear_trampoline(saved);
         lib::println!("Switched to Compat mode");
