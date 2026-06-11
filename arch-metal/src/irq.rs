@@ -122,8 +122,14 @@ pub fn init_interrupts() {
     // LAPIC MMIO mapping needed (we never use the LAPIC).
     const IA32_APIC_BASE: u32 = 0x1B;
     let apic_base = crate::x86::rdmsr(IA32_APIC_BASE);
+    // x2APIC (bit 10) set — real laptop firmware does this — must be cleared
+    // FIRST: x2APIC→disabled in one write (EN=0 with EXTD=1) is an illegal
+    // transition and #GPs. Step down x2APIC→xAPIC→disabled.
+    if apic_base & (1 << 10) != 0 {
+        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !(1 << 10)) };
+    }
     if apic_base & (1 << 11) != 0 {
-        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !(1 << 11)) };
+        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !((1 << 11) | (1 << 10))) };
     }
     remap_pic();
     init_pit(1000); // 1000 Hz timer

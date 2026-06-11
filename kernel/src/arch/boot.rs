@@ -38,6 +38,15 @@ unsafe extern "C" {
 /// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInfo) -> ! {
+    // FIRST life sign, before paging: paint a strip into the framebuffer the
+    // loader handed us. On real hardware there is no debug port and no
+    // display until fbcon::init — a kernel that dies in early init reboots
+    // with a black screen and zero evidence. The strip separates "GRUB never
+    // entered the kernel" from "kernel died during init". Pre-paging we run
+    // on offset segments (base = KERNEL_PHYS - KERNEL_BASE), so a physical
+    // address P is reached at P + (KERNEL_BASE - KERNEL_PHYS), wrapping.
+    unsafe { splash(info) };
+
     let kernel_size =
         core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
     ;
@@ -115,6 +124,13 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         }
     }
 
+    // GOP machines: map the framebuffer and render the boot backlog NOW —
+    // as early as its dependencies allow (the IDT for the COW page-table
+    // faults, phys_mm for the frames) — so every later init phase can paint
+    // its panics. The mappings land in the dual-use PDPT page that the
+    // compat-mode toggle below reuses, so they survive the switch.
+    crate::fbcon::init(info);
+
     irq::init_interrupts();
     lib::println!("Interrupts initialized");
 
@@ -142,12 +158,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     lib::println!();
     lib::println!("\x1b[92mHello from Rust kernel!\x1b[0m");
-
-    // GOP machines: map the framebuffer and render the boot backlog. Last of
-    // the ring-0 bring-up — the mapping demand-allocates page tables, so the
-    // #PF handler and phys_mm must be up, and it must run after the compat-
-    // mode switch so the entries land in the final page tables.
-    crate::fbcon::init(info);
 
     // Read the boot config (QEMU fw_cfg) at the platform boundary, before
     // handing it to the kernel — the kernel no longer pokes firmware ports.
@@ -211,4 +221,27 @@ fn read_boot_config() -> crate::BootConfig {
         cfg.debug_watch = crate::parse_debug_watch(&dw[..n]);
     }
     cfg
+}
+
+/// Pre-paging boot splash: top-of-screen strip, written through the offset
+/// data segment directly to framebuffer physical memory. Reads the multiboot
+/// info (also a physical pointer) the same way. Safe only before
+/// `enable_paging`.
+unsafe fn splash(info: *const arch::MultibootInfo) {
+    const PHYS_TO_SEG: usize = (crate::arch::paging2::KERNEL_BASE - KERNEL_PHYS) as usize;
+    let info = unsafe { &*((info as usize).wrapping_add(PHYS_TO_SEG) as *const arch::MultibootInfo) };
+    if info.flags & arch::MULTIBOOT_INFO_FRAMEBUFFER == 0
+        || info.framebuffer_type != 1
+        || info.framebuffer_bpp != 32
+    {
+        return;
+    }
+    let fb = (info.framebuffer_addr as usize).wrapping_add(PHYS_TO_SEG) as *mut u32;
+    let stride = info.framebuffer_pitch as usize / 4;
+    let width = info.framebuffer_width as usize;
+    for y in 0..8usize {
+        for x in 0..width {
+            unsafe { fb.add(y * stride + x).write_volatile(0x0040_8040) };
+        }
+    }
 }

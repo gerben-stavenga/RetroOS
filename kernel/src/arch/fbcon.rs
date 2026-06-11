@@ -128,6 +128,10 @@ pub fn init(info: &arch::MultibootInfo) {
         len: stride * height,
     });
 
+    // Wipe the boot splash (the pre-paging life-sign strip boot_kernel
+    // paints) now that the console owns the pixels.
+    unsafe { core::slice::from_raw_parts_mut((paging2::FB_WINDOW_BASE + page_off) as *mut u32, stride * height).fill(0) };
+
     lib::vga::set_text_flush(flush);
     // The emulated VGA's display sink: DOS screens (text or mode 13h) render
     // kernel-side through lib::vga_render and land here for the GOP blit.
