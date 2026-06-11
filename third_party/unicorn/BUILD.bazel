@@ -1,0 +1,27 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "cmake")
+
+# The Unicorn C core (the patched fork pinned in MODULE.bazel), built as a
+# first-class Bazel target with the configured host CC toolchain — this is
+# what unicorn-engine-sys's build.rs used to do via the `cmake` crate. The
+# sys crate's build script is disabled (gen_build_script in MODULE.bazel);
+# its bindings are vendored (toolchain/unicorn-sys-pregen-bindings.patch)
+# and the crate links this target via an annotation dep.
+#
+# x86 only: RetroOS interprets x86 guests; the crate's default features
+# built every arch core (sparc, mips, tricore, …) for nothing.
+cmake(
+    name = "unicorn",
+    cache_entries = {
+        "BUILD_SHARED_LIBS": "OFF",
+        "CMAKE_BUILD_TYPE": "Release",
+        "UNICORN_ARCH": "x86",
+        "UNICORN_BUILD_TESTS": "OFF",
+        "UNICORN_INSTALL": "ON",
+        # The all-in-one libunicorn.a (v1-style archive) — what the sys
+        # crate's `cargo:rustc-link-lib=static=unicorn` expects.
+        "UNICORN_LEGACY_STATIC_ARCHIVE": "ON",
+    },
+    lib_source = "@unicorn_fork//:srcs",
+    out_static_libs = ["libunicorn.a"],
+    visibility = ["//visibility:public"],
+)

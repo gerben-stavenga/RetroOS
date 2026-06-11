@@ -111,11 +111,32 @@ register_toolchains(
     "//toolchain:bare_cc_toolchain_musl64_def",
 )
 
+# ---- the Unicorn C core, as a Bazel cmake target ---------------------------
+# Source = the patched fork (same rev Cargo.lock pins for the Rust crate).
+# Built by //third_party/unicorn with the configured host CC toolchain;
+# rules_foreign_cc supplies a downloaded cmake, so nothing here depends on
+# host tool paths.
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+
+http_archive(
+    name = "unicorn_fork",
+    url = "https://github.com/gerben-stavenga/unicorn-retroos-patch/archive/269253342e0cf2d415db12b3579abb865b43b13b.tar.gz",
+    sha256 = "8c12a55228e395c9d5163161d8192c89913a7e839eafa7b6020fdf0a4502a524",
+    strip_prefix = "unicorn-retroos-patch-269253342e0cf2d415db12b3579abb865b43b13b",
+    build_file_content = """filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+    visibility = ["//visibility:public"],
+)""",
+)
+
 # ---- crate_universe: the hosted (cargo-workspace) dependency graph --------
-# Generates Bazel targets for every crates.io/git dependency in Cargo.lock —
-# including the patched unicorn-engine-sys fork — so retroos-host builds as
-# an ordinary rust_binary instead of cargo-in-a-genrule. The unicorn build
-# scripts run cmake + bindgen; bindgen dlopens libclang, hence the env.
+# Generates Bazel targets for every crates.io/git dependency in Cargo.lock,
+# so retroos-host builds as an ordinary rust_binary instead of
+# cargo-in-a-genrule. unicorn-engine-sys is fully de-build-scripted: the C
+# core comes from //third_party/unicorn and the bindgen output is vendored
+# (see the patch) — no libclang, no host-path pins, and the whole bindgen
+# build-dependency tree is never built.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
@@ -131,21 +152,9 @@ crate.from_cargo(
 )
 crate.annotation(
     crate = "unicorn-engine-sys",
-    build_script_env = {
-        "LIBCLANG_PATH": "/usr/lib/llvm-18/lib",
-        "PATH": "/usr/bin:/bin",
-    },
-    # The fork's build.rs bakes CARGO_MANIFEST_DIR at compile time
-    # (concat!(env!(...))) — a dead sandbox path by the time Bazel runs the
-    # script. The patch makes it a runtime lookup.
+    gen_build_script = "off",
+    deps = ["@@//third_party/unicorn"],
     patch_args = ["-p1"],
-    patches = ["//toolchain:unicorn-sys-runtime-manifest-dir.patch"],
-)
-crate.annotation(
-    crate = "unicorn-engine",
-    build_script_env = {
-        "LIBCLANG_PATH": "/usr/lib/llvm-18/lib",
-        "PATH": "/usr/bin:/bin",
-    },
+    patches = ["//toolchain:unicorn-sys-pregen-bindings.patch"],
 )
 use_repo(crate, "crates")
