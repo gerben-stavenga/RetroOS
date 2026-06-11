@@ -63,6 +63,8 @@ set timeout=0
 # The kernel's multiboot header requests a linear framebuffer (GOP); GRUB can
 # only satisfy it with its EFI video driver loaded.
 insmod efi_gop
+set gfxmode=auto
+set gfxpayload=keep
 menuentry "RetroOS (multiboot)" {
     search --no-floppy --file /kernel.elf --set=root
     multiboot /kernel.elf

@@ -72,9 +72,10 @@ same situation the interpreter already has (no ROM).
       below add up to): GRUB multiboot → embedded bootfs → Rust BIOS →
       kernel-emulated VGA → GOP framebuffer. Two metal-specific fixes it
       took: OVMF leaves the LAPIC enabled with LINT0 masked, eating every
-      PIC interrupt (init_interrupts now disables the LAPIC — we're
-      PIC-only); and the display render needed a tick divider + identical-
-      frame skip (uncached GOP blits at full tick rate starved the guest).
+      PIC interrupt (`init_interrupts` disables xAPIC or programs x2APIC
+      LINT0 for virtual-wire ExtINT routing); and the display render needed a
+      tick divider + identical-frame skip (uncached GOP blits at full tick
+      rate starved the guest).
       Remaining for real hardware: keyboard on the mock is wired
       (i8042 → IRQ1 → Rust BIOS INT 09) but untested interactively; xHCI for
       laptops with no i8042.

@@ -22,6 +22,8 @@ menuentry "RetroOS" {
     insmod ext2
     insmod multiboot
     insmod efi_gop
+    set gfxmode=auto
+    set gfxpayload=keep
     search --no-floppy --file /retroos/kernel.elf --set=root
     multiboot /retroos/kernel.elf
     boot
@@ -36,6 +38,8 @@ then `sudo update-grub` and reboot.
 - `insmod efi_gop` is load-bearing: the kernel's multiboot header requests a
   linear framebuffer, and without the GOP driver GRUB fails with
   "no suitable video mode found".
+- `gfxpayload=keep` makes the framebuffer handoff explicit instead of relying
+  on GRUB's platform-specific payload default.
 - **Secure Boot must be disabled** in firmware setup: GRUB under Secure Boot
   lockdown refuses `multiboot` of unsigned binaries.
 
@@ -52,9 +56,8 @@ the personality BIOS's INT 09. A machine with USB-only input needs the xHCI
 driver (not yet written).
 
 Caveats on real hardware (vs the `run_uefi.sh` mock):
-- fbcon accepts only 32bpp XRGB framebuffers (R/G/B at bits 16/8/0); a panel
-  reporting another GOP format falls back to no display (debug log on 0xE9
-  only). Extend `fbcon::init` if you hit one.
+- fbcon accepts 32bpp direct-RGB framebuffers and converts its pixels using the
+  channel positions and widths reported by GRUB.
 - ACPI shutdown isn't wired on metal: reboot/power off by holding the power
   button. Nothing persists; Secure Boot can be re-enabled afterwards.
 - An old MBR-partitioned disk with a type-0x83 partition WILL be mounted

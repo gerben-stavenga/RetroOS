@@ -40,11 +40,74 @@ struct Geom {
     origin: usize,
     /// Total mapped pixels from `va` (bounds for the cell renderer).
     len: usize,
+    /// Convert the renderer's canonical 0x00RRGGBB pixels to the GOP layout.
+    format: PixelFormat,
 }
 static mut GEOM: Option<Geom> = None;
 
 const TEXT_W: usize = 720;
 const TEXT_H: usize = 400;
+const CELL_W: usize = 9;
+const CELL_H: usize = 16;
+
+#[derive(Clone, Copy)]
+struct PixelFormat {
+    red_pos: u8,
+    red_size: u8,
+    green_pos: u8,
+    green_size: u8,
+    blue_pos: u8,
+    blue_size: u8,
+}
+
+impl PixelFormat {
+    fn from_multiboot(info: &arch::MultibootInfo) -> Option<Self> {
+        if info.framebuffer_bpp != 32 {
+            return None;
+        }
+        let [red_pos, red_size, green_pos, green_size, blue_pos, blue_size] =
+            info.color_info;
+        let fields = [
+            (red_pos, red_size),
+            (green_pos, green_size),
+            (blue_pos, blue_size),
+        ];
+        let mut used = 0u32;
+        for (pos, size) in fields {
+            if size == 0 || size > 16 || pos >= 32 || pos as u16 + size as u16 > 32 {
+                return None;
+            }
+            let mask = (((1u64 << size) - 1) << pos) as u32;
+            if used & mask != 0 {
+                return None;
+            }
+            used |= mask;
+        }
+        Some(Self {
+            red_pos,
+            red_size,
+            green_pos,
+            green_size,
+            blue_pos,
+            blue_size,
+        })
+    }
+
+    fn is_native(self) -> bool {
+        (self.red_pos, self.red_size, self.green_pos, self.green_size,
+            self.blue_pos, self.blue_size) == (16, 8, 8, 8, 0, 8)
+    }
+
+    fn encode(self, rgb: u32) -> u32 {
+        fn channel(value: u32, pos: u8, size: u8) -> u32 {
+            let max = (1u64 << size) - 1;
+            ((((value as u64 * max) + 127) / 255) << pos) as u32
+        }
+        channel((rgb >> 16) & 0xFF, self.red_pos, self.red_size)
+            | channel((rgb >> 8) & 0xFF, self.green_pos, self.green_size)
+            | channel(rgb & 0xFF, self.blue_pos, self.blue_size)
+    }
+}
 
 fn geom() -> &'static mut Option<Geom> {
     unsafe { &mut *(&raw mut GEOM) }
@@ -82,11 +145,11 @@ pub fn init(info: &arch::MultibootInfo) {
     let width = info.framebuffer_width as usize;
     let height = info.framebuffer_height as usize;
 
-    // The renderer emits 0x00RRGGBB; accept exactly that layout (32 bpp,
-    // R/G/B at bits 16/8/0 — what GOP/bochs-display modes are). Anything
-    // else: stay on the 0xE9 debug console rather than render garbage.
+    // The renderer emits 0x00RRGGBB. GOP commonly exposes either BGRX memory
+    // (the native little-endian representation of that value) or RGBX memory;
+    // use Multiboot's channel metadata instead of assuming one firmware layout.
     let [rp, rs, gp, gs, bp, bs] = info.color_info;
-    if info.framebuffer_bpp != 32 || (rp, rs, gp, gs, bp, bs) != (16, 8, 8, 8, 0, 8) {
+    let Some(format) = PixelFormat::from_multiboot(info) else {
         lib::println!(
             "fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — no display",
             info.framebuffer_bpp, rp, rs, gp, gs, bp, bs
@@ -110,7 +173,7 @@ pub fn init(info: &arch::MultibootInfo) {
             core::slice::from_raw_parts_mut(base as *mut u8, stripe_bytes).fill(0xFF);
         }
         return;
-    }
+    };
     if width < TEXT_W || height < TEXT_H {
         lib::println!("fbcon: framebuffer {}x{} too small — no display", width, height);
         return;
@@ -144,6 +207,7 @@ pub fn init(info: &arch::MultibootInfo) {
         stride,
         origin,
         len: stride * height,
+        format,
     });
 
     // Wipe the boot splash (the pre-paging life-sign strip boot_kernel
@@ -195,7 +259,8 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         let src_row = &px[(y / k) * w..(y / k) * w + w];
         let dst = &mut out[origin + y * g.stride..origin + y * g.stride + out_w];
         for (x, d) in dst.iter_mut().enumerate() {
-            *d = src_row[x / k];
+            let rgb = src_row[x / k];
+            *d = if g.format.is_native() { rgb } else { g.format.encode(rgb) };
         }
     }
     DOS_PAINTED.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -221,14 +286,39 @@ fn flush() {
         palette: unsafe { &*(&raw const PALETTE) },
         font: &FONT_8X16,
     };
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(g.va as *mut u32, g.len)
-    };
-    let out = &mut out[g.origin..];
+    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+    let native = g.format.is_native();
+    let mut cell_pixels = [0u32; CELL_W * CELL_H];
     for i in 0..80 * 25 {
         if shadow[i] != text[i] {
             shadow[i] = text[i];
-            vga_render::render_text_cell(&frame, i % 80, i / 80, out, g.stride);
+            if native {
+                vga_render::render_text_cell(
+                    &frame,
+                    i % 80,
+                    i / 80,
+                    &mut out[g.origin..],
+                    g.stride,
+                );
+                continue;
+            }
+
+            let cell = i * 2;
+            let cell_frame = Frame {
+                mode: VgaMode::Text80x25,
+                vram: &frame.vram[cell..cell + 2],
+                palette: frame.palette,
+                font: frame.font,
+            };
+            vga_render::render_text_cell(&cell_frame, 0, 0, &mut cell_pixels, CELL_W);
+            let x = (i % 80) * CELL_W;
+            let y = (i / 80) * CELL_H;
+            for row in 0..CELL_H {
+                let dst = g.origin + (y + row) * g.stride + x;
+                for col in 0..CELL_W {
+                    out[dst + col] = g.format.encode(cell_pixels[row * CELL_W + col]);
+                }
+            }
         }
     }
 }

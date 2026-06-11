@@ -470,7 +470,9 @@ static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 /// double as a page table, otherwise demand paging writes PTEs into it
 /// and corrupts PML4 entries.
 pub fn setup_long_mode_tables() {
-    let pdpt_phys = crate::x86::read_cr3() as u64;
+    // PAE CR3 points at the compact 32-byte hardware PDPT, while long mode
+    // needs the full page-sized virtual root (including recursive entries).
+    let pdpt_phys = current_root_phys();
     let pml4_phys = physical_page((&raw const PML4) as usize);
 
     // PML4[0] = PDPT (so long mode uses same mappings)
@@ -518,18 +520,28 @@ pub fn toggle_cr3(want_64: bool) -> u32 {
 }
 
 /// Copy constant PDPT[0..4] to the hardware PDPT (PAE only).
-/// Sanitizes entries: R/W=0, U/S=0 (hardware ignores these, but
-/// keep them clean).
+/// Sanitizes every bit that is reserved in a 32-bit PAE PDPTE. The virtual
+/// root entries are also traversed as PDEs through the recursive mapping, so
+/// hardware may set Accessed there; copying the raw entry makes a subsequent
+/// MOV CR3 fail its PDPTR check on strict implementations.
+fn hardware_pdpte(entry: Entry64) -> u64 {
+    let mut mask = Entry64::ADDR_MASK
+        | flags::PRESENT
+        | flags::WRITE_THROUGH
+        | flags::CACHE_DISABLE;
+    if nx_enabled() {
+        mask |= flags::NO_EXECUTE;
+    }
+    entry.0 & mask
+}
+
 pub fn sync_hw_pdpt() {
     if cpu_mode() == CpuMode::Legacy { return; }
 
     if let Entries::E64(e) = entries() {
         let root = root_base();
         for i in 0..4 {
-            let mut entry = e[root + i];
-            entry.set_hw_writable(false);
-            entry.set_user(false);
-            unsafe { HW_PDPT.0[i] = entry.0; }
+            unsafe { HW_PDPT.0[i] = hardware_pdpte(e[root + i]); }
         }
     }
 }
@@ -1113,17 +1125,66 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     kpages.pdpt[6] = Entry64::new(boot_phys_page(&kpages.pt_kernel2.0), true, false);
     kpages.pdpt[7] = Entry64::new(boot_phys_page(&kpages.pt_kernel3.0), true, false);
 
-    // Boot with virtual root in CR3 directly (R/W bits in PDPT[0..3] are
-    // technically reserved, but OK for boot — we switch to the thread's
-    // thread's RootPageTable once threading is initialized)
+    // The hardware PAE PDPT has a stricter format than the virtual root:
+    // bits 1 (R/W) and 2 (U/S) are reserved in PDPTEs. Keep the full entries
+    // in the recursively mapped virtual root for software/COW bookkeeping,
+    // but load CR3 with the dedicated 32-byte hardware PDPT from the start.
+    // QEMU accepts those reserved bits in a CR3-loaded PDPT; real CPUs need
+    // them clear and can fault before the first post-paging instruction.
+    for i in 0..4 {
+        unsafe { HW_PDPT.0[i] = hardware_pdpte(kpages.pdpt[i]); }
+    }
+    let hw_pdpt_va = (&raw const HW_PDPT) as usize;
+    let hw_pdpt_phys = hw_pdpt_va - KERNEL_BASE + KERNEL_PHYS;
     let cr4 = crate::x86::read_cr4();
     unsafe {
         crate::x86::write_cr4(cr4 | crate::x86::cr4::PAE);
-        crate::x86::write_cr3(boot_phys_addr(&kpages.pdpt.0) as u32);
+        crate::x86::write_cr3(hw_pdpt_phys as u32);
         let cr0 = crate::x86::read_cr0();
         crate::x86::write_cr0(cr0 | crate::x86::cr0::PG | crate::x86::cr0::WP);
     }
     IS_PAE.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Boot-time early framebuffer window: a static PD of 2MB pages installed at
+/// PDPT[2] (VA 0x80000000), usable the instant `enable_pae` returns — no
+/// allocator, no #PF handler, works for ANY physical address (PAE PDEs carry
+/// 52-bit phys; the Blade 14's GOP framebuffer sits at 0x7C_0000_0000, which
+/// pre-paging 32-bit code cannot address at all). The boot life-sign strip is
+/// painted through this and the window is torn down again immediately.
+static mut EARLY_FB_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+
+/// Map 64MB around `fb_phys` and return its VA. PAE/long boot path only
+/// (legacy returns None — pre-PAE machines have a real VGA anyway).
+pub fn map_early_fb(fb_phys: u64) -> Option<usize> {
+    if !cpu_supports_pae() {
+        return None;
+    }
+    const TWO_MB: u64 = 2 * 1024 * 1024;
+    let base = fb_phys & !(TWO_MB - 1);
+    #[allow(static_mut_refs)]
+    let (pd, kpages) = unsafe { (&mut EARLY_FB_PD, KERNEL_PAGES.pae()) };
+    for i in 0..32u64 {
+        // PS (2MB page) + present + write + cache-disable (MMIO).
+        pd[i as usize] = Entry64(
+            (base + i * TWO_MB) | flags::PRESENT | flags::READ_WRITE
+                | flags::PAGE_SIZE_BIT | flags::CACHE_DISABLE,
+        );
+    }
+    kpages.pdpt[2] = Entry64::new(boot_phys_page(&pd.0), true, false);
+    flush_tlb();
+    Some(0x8000_0000usize + (fb_phys - base) as usize)
+}
+
+/// Tear the early framebuffer window down (PDPT[2] belongs to user space).
+pub fn unmap_early_fb() {
+    if !cpu_supports_pae() {
+        return;
+    }
+    #[allow(static_mut_refs)]
+    let kpages = unsafe { KERNEL_PAGES.pae() };
+    kpages.pdpt[2] = Entry64::default();
+    flush_tlb();
 }
 
 /// Enable paging with auto-detected mode
@@ -1437,29 +1498,46 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 // Mode switching trampoline support
 // =============================================================================
 
+/// Dedicated low identity hierarchy used only while toggling PAE/compat mode.
+/// The boot SCRATCH page cannot be reused here: page-zero COW operations use
+/// it after startup, and a leaf PTE alone is ineffective once PDPT[0] has been
+/// removed by `finish_setup_paging`.
+static mut TRAMPOLINE_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+static mut TRAMPOLINE_PT: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+
 /// Identity-map the page holding `toggle_prot_compat` (first page of kernel
 /// `.text`, physical KERNEL_PHYS) so the function can run at its physical
 /// address while paging is briefly disabled during a mode toggle.
-/// Returns the previous PTE value to pass back to `clear_trampoline()`.
+/// Returns the previous PDPT[0] value to pass back to `clear_trampoline()`.
 pub fn ensure_trampoline_mapped() -> u64 {
     let page = KERNEL_PHYS / PAGE_SIZE;
     if let Entries::E64(e) = entries() {
-        let saved = e[page].0;
-        e[page] = Entry64::new(page as u64, true, false);
-        crate::x86::invlpg(KERNEL_PHYS);
+        let root = root_base();
+        let saved = e[root].0;
+        #[allow(static_mut_refs)]
+        unsafe {
+            TRAMPOLINE_PT[page] = Entry64::new(page as u64, true, false);
+            TRAMPOLINE_PD[0] = Entry64::new(boot_phys_page(&TRAMPOLINE_PT.0), true, false);
+            e[root] = Entry64::new(boot_phys_page(&TRAMPOLINE_PD.0), true, false);
+        }
+        // Needed when the target is PAE; harmless when the target is compat.
+        sync_hw_pdpt();
+        // PAE caches all four PDPTEs on MOV CR3. INVLPG cannot make a newly
+        // installed PDPT[0] visible before the trampoline's physical jump.
+        crate::x86::flush_tlb();
         saved
     } else {
         0
     }
 }
 
-/// Restore the trampoline page's PTE after a mode toggle.
+/// Restore PDPT[0] after a mode toggle.
 pub fn clear_trampoline(saved: u64) {
-    let page = KERNEL_PHYS / PAGE_SIZE;
     if let Entries::E64(e) = entries() {
-        e[page] = Entry64(saved);
+        e[root_base()] = Entry64(saved);
     }
-    crate::x86::invlpg(KERNEL_PHYS);
+    sync_hw_pdpt();
+    crate::x86::flush_tlb();
 }
 
 /// Map the first 1MB of physical memory as user-accessible (for VM86 mode).

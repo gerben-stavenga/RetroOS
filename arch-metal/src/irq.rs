@@ -112,28 +112,51 @@ fn unmask_irq(irq: u8) {
 
 /// Initialize interrupts (PIC, PIT, unmask timer + keyboard + mouse)
 pub fn init_interrupts() {
-    // This kernel is PIC-only — make sure the 8259's INTR actually reaches
-    // the CPU. Legacy BIOSes leave virtual-wire mode (LAPIC LINT0 = ExtINT,
-    // unmasked), but UEFI firmware (OVMF) boots in APIC mode and leaves the
-    // LAPIC enabled with LINT0 masked, silently eating every PIC interrupt:
-    // the UEFI mock ran at ~4 timer IRQs/s (stray edges) and DN's tick-paced
-    // startup extrapolated to minutes. Disabling the LAPIC via
-    // IA32_APIC_BASE reverts the pin to plain INTR — one MSR write, no
-    // LAPIC MMIO mapping needed (we never use the LAPIC).
+    // This kernel is PIC-only, so make sure the 8259's INTR reaches the CPU.
+    // In x2APIC mode keep the firmware-selected mode and use its MSR interface
+    // to establish virtual-wire routing. Tearing x2APIC down here is fragile
+    // on real firmware and unnecessary. The xAPIC path still disables the
+    // LAPIC because its MMIO page is not mapped this early.
     const IA32_APIC_BASE: u32 = 0x1B;
+    const APIC_ENABLE: u64 = 1 << 11;
+    const X2APIC_ENABLE: u64 = 1 << 10;
+    const X2APIC_SVR: u32 = 0x80F;
+    const X2APIC_LVT_LINT0: u32 = 0x835;
+    const APIC_SOFTWARE_ENABLE: u64 = 1 << 8;
+    const APIC_DELIVERY_EXTINT: u64 = 7 << 8;
+
+    lib::println!("IRQ: APIC routing");
     let apic_base = crate::x86::rdmsr(IA32_APIC_BASE);
-    // x2APIC (bit 10) set — real laptop firmware does this — must be cleared
-    // FIRST: x2APIC→disabled in one write (EN=0 with EXTD=1) is an illegal
-    // transition and #GPs. Step down x2APIC→xAPIC→disabled.
-    if apic_base & (1 << 10) != 0 {
-        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !(1 << 10)) };
+    let modern_x2apic =
+        apic_base & (APIC_ENABLE | X2APIC_ENABLE) == (APIC_ENABLE | X2APIC_ENABLE);
+    if modern_x2apic {
+        // x2APIC registers are MSR 0x800 + (xAPIC MMIO offset >> 4).
+        // Enable the local APIC in SVR before unmasking LINT0; with software
+        // enable clear, hardware forces all LVT entries masked.
+        let svr = crate::x86::rdmsr(X2APIC_SVR);
+        unsafe {
+            crate::x86::wrmsr(X2APIC_SVR, (svr & 0x3FF) | APIC_SOFTWARE_ENABLE);
+            crate::x86::wrmsr(X2APIC_LVT_LINT0, APIC_DELIVERY_EXTINT);
+        }
+    } else if apic_base & APIC_ENABLE != 0 {
+        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !APIC_ENABLE) };
     }
-    if apic_base & (1 << 11) != 0 {
-        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !((1 << 11) | (1 << 10))) };
-    }
+
+    lib::println!("IRQ: PIC");
     remap_pic();
+    lib::println!("IRQ: PIT");
     init_pit(1000); // 1000 Hz timer
     unmask_irq(0);  // timer
+
+    // x2APIC firmware identifies the modern UEFI machines targeted here.
+    // Their keyboard/touchpad are USB or I2C devices, and direct accesses to
+    // legacy 8042 ports may enter firmware/SMM emulation or reset the machine.
+    // Leave all legacy input IRQs masked until proper xHCI/I2C drivers exist.
+    if modern_x2apic {
+        lib::println!("IRQ: legacy input skipped");
+        return;
+    }
+
     // Drain any byte left in the 8042 output buffer by BIOS or a key pressed
     // before our handler is in place. Must happen BEFORE init_mouse: that
     // function reads 0x60 expecting the controller config byte, but if a
@@ -144,6 +167,7 @@ pub fn init_interrupts() {
     // stuck OBF locks out subsequent keypresses regardless.
     // Bounded for the same no-i8042 reason as ps2_wait_in: port 0x64 reading
     // 0xFF keeps OBF set forever and this drain would hang the boot.
+    lib::println!("IRQ: keyboard");
     for _ in 0..1_000 {
         if inb(0x64) & 1 == 0 {
             break;
@@ -151,7 +175,18 @@ pub fn init_interrupts() {
         let _ = inb(0x60);
     }
     unmask_irq(1);  // keyboard
-    init_mouse();
+    lib::println!("IRQ: mouse probe");
+    if init_mouse() {
+        lib::println!("IRQ: mouse ready");
+
+        // The emulated legacy machine that supplies a PS/2 mouse may also
+        // supply an ISA Sound Blaster on IRQ 5 or 7. Keep these masked on
+        // modern machines where the legacy-controller probe failed.
+        unmask_irq(5);
+        unmask_irq(7);
+    } else {
+        lib::println!("IRQ: mouse unavailable");
+    }
 }
 
 // ============================================================================
@@ -162,59 +197,81 @@ pub fn init_interrupts() {
 /// BOUNDED: a machine with no i8042 (USB-only laptop keyboards) reads 0xFF
 /// from port 0x64 — busy bits permanently set — and an unbounded spin hangs
 /// the whole boot at a black screen. Give up after ~100k polls.
-fn ps2_wait_in() {
+fn ps2_wait_in() -> bool {
     for _ in 0..100_000 {
         if inb(0x64) & 0x02 == 0 {
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// Wait until the 8042 output buffer has data ready (bounded, see above).
-fn ps2_wait_out() {
+fn ps2_wait_out() -> bool {
     for _ in 0..100_000 {
         if inb(0x64) & 0x01 != 0 {
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// Initialize PS/2 mouse: enable AUX port, turn on AUX IRQ in the controller
 /// config, kick the mouse into streaming mode (one 3-byte packet per motion
 /// or button event), and unmask IRQ 12.
-fn init_mouse() {
+fn init_mouse() -> bool {
+    // A machine without an 8042 commonly returns all ones for the unmapped
+    // status port. Do not turn that into a fabricated controller config and
+    // continue sending commands through firmware/SMM I/O emulation.
+    if inb(0x64) == 0xFF {
+        return false;
+    }
+
     // Enable AUX (mouse) port on the 8042.
-    ps2_wait_in();
+    if !ps2_wait_in() {
+        return false;
+    }
     outb(0x64, 0xA8);
 
     // Read controller config byte (cmd 0x20).
-    ps2_wait_in();
+    if !ps2_wait_in() {
+        return false;
+    }
     outb(0x64, 0x20);
-    ps2_wait_out();
+    if !ps2_wait_out() {
+        return false;
+    }
     let mut cfg = inb(0x60);
+    if cfg == 0xFF {
+        return false;
+    }
     // bit 1 = AUX IRQ enable; bit 5 = AUX clock disable (must be 0 for AUX).
     cfg = (cfg | 0x02) & !0x20;
     // Write modified config back (cmd 0x60).
-    ps2_wait_in();
+    if !ps2_wait_in() {
+        return false;
+    }
     outb(0x64, 0x60);
-    ps2_wait_in();
+    if !ps2_wait_in() {
+        return false;
+    }
     outb(0x60, cfg);
 
     // Tell mouse to stream packets (mouse cmd 0xF4, sent via 0xD4 prefix).
-    ps2_wait_in();
+    if !ps2_wait_in() {
+        return false;
+    }
     outb(0x64, 0xD4);
-    ps2_wait_in();
+    if !ps2_wait_in() {
+        return false;
+    }
     outb(0x60, 0xF4);
-    ps2_wait_out();
-    let _ack = inb(0x60); // 0xFA expected; not actionable
+    if !ps2_wait_out() || inb(0x60) != 0xFA {
+        return false;
+    }
 
     unmask_irq(12);
-
-    // Standard ISA Sound Blaster IRQ lines (5 and 7). Harmless to unmask
-    // with nothing driving them; lets QEMU `sb16`'s completion IRQ reach
-    // handle_irq so the kernel can relay it to the guest vPIC.
-    unmask_irq(5);
-    unmask_irq(7);
+    true
 }
 
 // ============================================================================

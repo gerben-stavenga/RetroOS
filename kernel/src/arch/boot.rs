@@ -60,17 +60,6 @@ unsafe fn capture_boot_info(info: *const arch::MultibootInfo) {
     unsafe { BOOT_INFO = inf };
 }
 
-/// Boot-stage diagnostic delay: with no display and no debug port, the time
-/// until a crash-reset is the only observable on opaque hardware — set this
-/// to ~3_000_000 (≈ seconds per stage via port-0x80 writes) and count seconds
-/// to learn which stage the boot reached. 0 = off (normal boots).
-const STAGE_DELAY_SPINS: u32 = 0;
-fn stage_delay() {
-    for _ in 0..STAGE_DELAY_SPINS {
-        x86::outb(0x80, 0);
-    }
-}
-
 /// boot_kernel - Entry point called by asm boot stub
 ///
 /// Runs with offset segments (base = KERNEL_PHYS - KERNEL_BASE) so linked
@@ -89,8 +78,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // on offset segments (base = KERNEL_PHYS - KERNEL_BASE), so a physical
     // address P is reached at P + (KERNEL_BASE - KERNEL_PHYS), wrapping.
     unsafe { capture_boot_info(info) };
-    unsafe { splash() };
-    stage_delay(); // stage 1: kernel entered, MBI captured
 
     let kernel_size =
         core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
@@ -104,7 +91,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         KERNEL_PHYS,
         kernel_pages,
     );
-    stage_delay(); // stage 2: paging on
 
     // Update VGA base for paged addressing before any println
     vga::vga().base = LOW_MEM_BASE + 0xB8000;
@@ -119,7 +105,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     let arch_stack_top = (&raw const crate::ARCH_STACK_TOP) as u32 - 16;
     descriptors::setup_descriptor_tables(arch_stack_top);
     descriptors::setup_syscall();
-    stage_delay(); // stage 3: GDT/IDT/TSS + syscall up
 
     // Verify the bootloader is Multiboot-compliant before touching info.
     assert!(
@@ -171,8 +156,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         }
     }
 
-    stage_delay(); // stage 4: phys_mm initialized
-
     // GOP machines: map the framebuffer and render the boot backlog NOW —
     // as early as its dependencies allow (the IDT for the COW page-table
     // faults, phys_mm for the frames) — so every later init phase can paint
@@ -180,23 +163,17 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // compat-mode toggle below reuses, so they survive the switch.
     crate::fbcon::init(info);
 
-    stage_delay(); // stage 5: fbcon up (pixels should exist from here)
-
     irq::init_interrupts();
     lib::println!("Interrupts initialized");
-    stage_delay(); // stage 6: PIC/PIT/LAPIC-stepdown done
 
     if paging2::cpu_supports_long_mode() {
         paging2::sync_hw_pdpt();
         x86::flush_tlb();
-        stage_delay(); // stage 6a: hw PDPT synced
         let saved = paging2::ensure_trampoline_mapped();
-        stage_delay(); // stage 6b: trampoline identity-mapped
         descriptors::toggle_mode(paging2::toggle_cr3(true));
         paging2::clear_trampoline(saved);
         lib::println!("Switched to Compat mode");
     }
-    stage_delay(); // stage 7: compat toggle done
 
     // Interrupts are enabled by `enter_ring1` (it sets IF in the IRET frame it
     // builds) — the kernel side never touches `sti`/`cli`.
@@ -219,6 +196,8 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     let config = read_boot_config();
 
     descriptors::enter_ring1();
+
+    lib::println!("Ring1 entered, paging + interrupts + syscall setup complete");
 
     // The arch backend handle, threaded as `&mut` through the kernel from here
     // on so its mutable state is borrow-checked rather than global. Lives for
@@ -276,35 +255,4 @@ fn read_boot_config() -> crate::BootConfig {
         cfg.debug_watch = crate::parse_debug_watch(&dw[..n]);
     }
     cfg
-}
-
-/// Pre-paging boot splash: top-of-screen strip, written through the offset
-/// data segment directly to framebuffer physical memory. Reads the multiboot
-/// info (also a physical pointer) the same way. Safe only before
-/// `enable_paging`.
-unsafe fn splash() {
-    let info = unsafe { &*(&raw const BOOT_INFO) };
-    if info.flags & arch::MULTIBOOT_INFO_FRAMEBUFFER == 0
-        || info.framebuffer_type != 1
-        || info.framebuffer_bpp != 32
-    {
-        return;
-    }
-    // A framebuffer above 4GB (real AMD laptops put the GPU VRAM BAR there —
-    // the Blade 14's sits at 0x7C_0000_0000) is unreachable before paging:
-    // 32-bit addressing would TRUNCATE and spray 80KB over whatever lives at
-    // the low alias (the PCI hole, on the Blade — instant machine reset).
-    // Skip; fbcon::init maps it properly (PAE PTEs carry 52-bit phys) a few
-    // lines later and the console takes over as the life sign.
-    if info.framebuffer_addr >= 1 << 32 {
-        return;
-    }
-    let fb = (info.framebuffer_addr as usize).wrapping_add(PHYS_TO_SEG) as *mut u32;
-    let stride = info.framebuffer_pitch as usize / 4;
-    let width = info.framebuffer_width as usize;
-    for y in 0..8usize {
-        for x in 0..width {
-            unsafe { fb.add(y * stride + x).write_volatile(0x0040_8040) };
-        }
-    }
 }
