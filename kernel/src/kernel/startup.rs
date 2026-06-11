@@ -229,55 +229,17 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
     event_loop(machine, tid);
 }
 
-const ASSERT_ADDR_HASH: bool = false;
-
-/// Verify that a thread's saved cpu_state still matches the hash recorded on
-/// the last switch-out. Print a diff-style dump on mismatch.
-/// `tag` is printed in the header ("switch-in" / "reblock" / ...).
-fn verify_cpu_hash(t: &thread::Thread, tag: &str) {
-    let k = &t.kernel;
-    if k.cpu_hash == 0 { return; }
-    let actual = thread::hash_regs(&k.vcpu.regs);
-    if actual == k.cpu_hash { return; }
-    crate::println!(
-        "\x1b[91mCPU STATE CORRUPTION [{}] tid={} expected={:#018x} actual={:#018x}\x1b[0m",
-        tag, k.tid, k.cpu_hash, actual,
-    );
-    let r = &k.vcpu.regs;
-    crate::println!(
-        "  cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x} flags={:08x}",
-        r.code_seg(), r.ip32(), r.stack_seg(), r.sp32(), r.flags32(),
-    );
-    crate::println!(
-        "  ds={:04x} es={:04x} fs={:04x} gs={:04x}",
-        r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16,
-    );
-    crate::println!(
-        "  eax={:08x} ebx={:08x} ecx={:08x} edx={:08x}",
-        r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32,
-    );
-    crate::println!(
-        "  esi={:08x} edi={:08x} ebp={:08x} int={:02x} err={:08x}",
-        r.rsi as u32, r.rdi as u32, r.rbp as u32, r.int_num as u32, r.err_code as u32,
-    );
-}
-
 /// Ring-1 kernel event loop. Returns when no threads remain.
 /// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
 pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
 
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
-    let mut tid = first_tid;
 
-    // The live CPU context, owned by the loop (no global `REGS`). Seeded from
-    // the first thread's saved state; `machine.execute(&mut vcpu)` runs it and
-    // writes the post-run state back, and `switch_thread` swaps it on a context
-    // switch. Handlers receive `&mut vcpu` (disjoint from `&mut machine`), so the
-    // borrow checker — not a `static mut` — keeps register and machine state
-    // from aliasing.
-    let mut vcpu = thread::get_thread(first_tid)
-        .expect("event_loop: invalid first thread")
-        .kernel.vcpu;
+    // The CPU loan, owned by the loop: the live register frame + which
+    // thread holds it. Handlers receive `&mut ctx.vcpu` (disjoint from
+    // `&mut machine`), so the borrow checker — not a `static mut` — keeps
+    // register and machine state from aliasing.
+    let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(first_tid);
 
     // Page-allocator instrumentation: every MEM_DUMP_PERIOD iterations,
     // log free physical pages and the running low-water mark. Watch the
@@ -324,13 +286,13 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
             //     event_counter, free, delta, min_free);
             last_free = free;
         }
-        crate::kernel::stacktrace::set_debug_tid(tid);
-        let regs = &mut vcpu;
+        crate::kernel::stacktrace::set_debug_tid(ctx.tid);
+        let regs = &mut ctx.vcpu;
 
         // Phase 1: drain hardware events into the running thread's personality,
         // then try to satisfy any pending pipe read.
         {
-            let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+            let thread = thread::get_thread(ctx.tid).expect("Invalid thread in event loop");
             let kt = &mut thread.kernel;
             match &mut thread.personality {
                 thread::Personality::Dos(dos) => {
@@ -383,12 +345,12 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         // Phase 2: if still parked, honour F11 (cycle focus) or spin. The
         // take_switch_request consumer below the do_arch_execute path is
         // unreachable from here, so we re-implement the switch step inline.
-        if thread::get_thread(tid).expect("Invalid thread").kernel.state
+        if thread::get_thread(ctx.tid).expect("Invalid thread").kernel.state
             == thread::ThreadState::Blocked
         {
             if thread::take_switch_request() {
-                if let Some(next) = thread::cycle_next(tid) {
-                    tid = switch_thread(machine, &mut vcpu, tid, next);
+                if let Some(next) = thread::cycle_next(ctx.tid) {
+                    switch_focus_and_run(machine, &mut ctx, next);
                     continue;
                 }
             }
@@ -397,17 +359,17 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         }
 
         // Phase 3: run user code and dispatch the resulting event.
-        let thread = thread::get_thread(tid).expect("Invalid thread in event loop");
+        let thread = thread::get_thread(ctx.tid).expect("Invalid thread in event loop");
         let ts_before_user = machine.rdtsc();
         kernel_cycles = kernel_cycles.wrapping_add(ts_before_user.wrapping_sub(last_kernel_entry));
-        let kevent = machine.execute(&mut vcpu);
+        let kevent = ctx.run(machine);
         let ts_after_user = machine.rdtsc();
         user_cycles = user_cycles.wrapping_add(ts_after_user.wrapping_sub(ts_before_user));
         last_kernel_entry = ts_after_user;
         // The live register frame for this iteration (post-run). Borrows the
         // loop-owned `vcpu`; `machine.execute` above already returned, so there
         // is no aliasing with the run.
-        let regs = &mut vcpu;
+        let regs = &mut ctx.vcpu;
         match &kevent {
             crate::arch::monitor::KernelEvent::Irq => ev_irq += 1,
             crate::arch::monitor::KernelEvent::SoftInt(_) => ev_softint += 1,
@@ -460,11 +422,11 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
 
         let new_tid: Option<usize> = match action {
             thread::KernelAction::Done => None,
-            thread::KernelAction::Yield => thread::yield_thread(tid, regs),
-            thread::KernelAction::Exit(code) => Some(thread::exit_thread(machine, tid, code)),
+            thread::KernelAction::Yield => thread::yield_thread(ctx.tid, regs),
+            thread::KernelAction::Exit(code) => Some(thread::exit_thread(machine, ctx.tid, code)),
             thread::KernelAction::Switch(next) => Some(next),
             thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, on_error, on_success } => {
-                handle_fork_exec(machine, regs, tid, &path[..path_len], &cmdtail[..cmdtail_len], on_error, on_success)
+                handle_fork_exec(machine, regs, ctx.tid, &path[..path_len], &cmdtail[..cmdtail_len], on_error, on_success)
             }
             thread::KernelAction::Fork(_) => {
                 // TODO: implement Fork in event loop
@@ -480,7 +442,7 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         // blocked thread or break any waitpid. The shell (command.com) decides
         // backgrounding semantics by polling SYNTH_WAITPID + reading kbd.
         let new_tid = if new_tid.is_none() && thread::take_switch_request() {
-            thread::cycle_next(tid)
+            thread::cycle_next(ctx.tid)
         } else {
             new_tid
         };
@@ -494,59 +456,46 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
                 thread::reap_all_zombies(machine);
                 return; // respawn DN / next cmdline program
             }
-            tid = switch_thread(machine, &mut vcpu, tid, new_tid);
+            switch_focus_and_run(machine, &mut ctx, new_tid);
         }
     }
 }
 
-/// Swap CPU state, address space, FPU, and the VGA framebuffer to make
-/// `new_tid` the running thread. No-op when `new_tid == tid`. Returns the
-/// new tid.
+/// Switch console focus and execution together — today's coupling, in one
+/// named place. The event loop runs the focused thread, so every execution
+/// switch is also a focus handoff (release: out-focus screen snapshot with
+/// the old context live; acquire: in-focus repaint with the new context
+/// live). When the scheduler decouples them, this helper is what splits.
 ///
-/// Lifecycle hooks live on the personalities:
-///   - `suspend`     — snapshot screen state on out-focus.
-///   - `materialize` — repaint screen state on in-focus.
-///   - `on_resume`   — rebind CPU state (LDT/TLS/...) on every swap-in.
-///
-/// Zombies skip the suspend here because `exit_thread` already called it
+/// Zombies skip the release because `exit_thread` already snapshotted
 /// before `arch_user_clean` unmapped 0xA0000 (re-reading would fault). If
 /// a parent wants the dying child's farewell screen to persist, it calls
 /// `SYNTH_VGA_TAKE` explicitly — the kernel makes no inheritance policy.
-fn switch_thread(machine: &mut crate::TheArch, live: &mut crate::arch::Vcpu, tid: usize, new_tid: usize) -> usize {
-    if new_tid == tid { return tid; }
-    let (old, new) = thread::get_two_threads(tid, new_tid);
-    // Console focus follows the run switch today (the event loop runs the
-    // focused thread); the concepts stay separate so a future scheduler can
-    // run background threads without moving focus.
-    let old_personality = if old.kernel.state != thread::ThreadState::Zombie {
-        Some(&mut old.personality)
-    } else {
-        None
-    };
-    crate::kernel::focus::release(old_personality);
-    verify_cpu_hash(new, "switch-in");
-    let mut swap_vcpu = new.kernel.vcpu;
-    let mut swap_fx = new.kernel.fx_state;
-    if ASSERT_ADDR_HASH {
-        let mut hash = new.kernel.addr_hash;
-        machine.switch_to(live, &mut swap_vcpu, &mut hash, &mut swap_fx);
-        old.kernel.addr_hash = hash;
-    } else {
-        machine.switch_to(live, &mut swap_vcpu, core::ptr::null_mut(), &mut swap_fx);
+fn switch_focus_and_run(
+    machine: &mut crate::TheArch,
+    ctx: &mut crate::kernel::exec_ctx::ExecutionContext,
+    new_tid: usize,
+) {
+    if new_tid == ctx.tid {
+        return;
     }
-    old.kernel.vcpu = swap_vcpu;
-    old.kernel.fx_state = swap_fx;
-    old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
+    {
+        let old = thread::get_thread(ctx.tid).expect("switch: invalid old thread");
+        let old_personality = if old.kernel.state != thread::ThreadState::Zombie {
+            Some(&mut old.personality)
+        } else {
+            None
+        };
+        crate::kernel::focus::release(old_personality);
+    }
+    ctx.switch_to(machine, new_tid);
+    let new = thread::get_thread(new_tid).expect("switch: invalid new thread");
     crate::kernel::focus::acquire(new_tid, &mut new.personality);
-    // The incoming thread's port permissions: rebuilt from (personality,
-    // platform, focus) — never inherited from whoever ran last.
-    crate::kernel::io_policy::apply(
-        machine,
-        &new.personality,
-        new_tid == crate::kernel::focus::focused(),
-    );
-    new.personality.on_resume(machine);
-    new_tid
+    // switch_to derived the I/O bitmap before focus moved (it must — a bare
+    // execution switch is valid without any focus change); now that this
+    // thread holds focus, re-derive so the focused-only windows (VGA on a
+    // real card) open. Cheap: a deny-all reset + a few range enables.
+    crate::kernel::io_policy::apply(machine, &new.personality, true);
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.

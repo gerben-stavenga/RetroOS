@@ -9,6 +9,7 @@ pub mod console;
 pub mod dos;
 pub mod elf;
 pub mod exec;
+pub mod exec_ctx;
 pub mod focus;
 pub mod ext4fs;
 pub mod hdd;
