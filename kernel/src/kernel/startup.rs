@@ -241,51 +241,9 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
     // register and machine state from aliasing.
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(first_tid);
 
-    // Page-allocator instrumentation: every MEM_DUMP_PERIOD iterations,
-    // log free physical pages and the running low-water mark. Watch the
-    // line for monotonic decrease to find leaks. Print to debug serial
-    // only — does not clobber user VGA.
-    const MEM_DUMP_PERIOD: u64 = 1000;
-    let mut event_counter: u64 = 0;
-    let mut min_free: usize = machine.free_page_count();
-    let mut last_free: usize = min_free;
-    // crate::dbg_println!("[mem] start free={}", min_free);
-
-    // User/kernel cycle accounting. We bracket `do_arch_execute()` with
-    // rdtsc; every iteration adds a chunk to USER_CYCLES and a chunk to
-    // KERNEL_CYCLES. The split tells you whether app code is the
-    // bottleneck or our trap/event handling is.
-    let mut user_cycles: u64 = 0;
-    let mut kernel_cycles: u64 = 0;
-    let mut last_kernel_entry = machine.rdtsc();
-    let mut last_profile_dump = last_kernel_entry;
-    // Roughly assume 2 GHz host; only used to format the dump as ms. Off
-    // by a constant factor across runs but the user/kernel ratio is exact.
-    const PROFILE_DUMP_CYCLES: u64 = 2_000_000_000; // ~1 second on 2GHz host
-    // Per-event-type counts for the same window, to identify which trap
-    // kind is dominating when kernel% is high.
-    let mut ev_irq: u32 = 0;
-    let mut ev_softint: u32 = 0;
-    let mut ev_hlt: u32 = 0;
-    let mut ev_in: u32 = 0;
-    let mut ev_out: u32 = 0;
-    let mut ev_ins: u32 = 0;
-    let mut ev_outs: u32 = 0;
-    let mut ev_fault: u32 = 0;
-    let mut ev_pf: u32 = 0;
-    let mut ev_exc: u32 = 0;
-    let mut ev_syscall: u32 = 0;
-    // `vcpu` seeded from the first thread above; page tables correct from boot.
+    let mut stats = EventStats::new(machine);
     loop {
-        event_counter = event_counter.wrapping_add(1);
-        if event_counter % MEM_DUMP_PERIOD == 0 {
-            let free = machine.free_page_count();
-            if free < min_free { min_free = free; }
-            let _delta = (free as i64) - (last_free as i64);
-            // crate::dbg_println!("[mem] iter={} free={} delta={} min={}",
-            //     event_counter, free, delta, min_free);
-            last_free = free;
-        }
+        stats.iteration(machine);
         crate::kernel::stacktrace::set_debug_tid(ctx.tid);
         let regs = &mut ctx.vcpu;
 
@@ -313,11 +271,9 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         if thread::get_thread(ctx.tid).expect("Invalid thread").kernel.state
             == thread::ThreadState::Blocked
         {
-            if thread::take_switch_request() {
-                if let Some(next) = thread::cycle_next(ctx.tid) {
-                    switch_focus_and_run(machine, &mut ctx, next);
-                    continue;
-                }
+            if let Some(next) = crate::kernel::sched::focus_request(ctx.tid) {
+                switch_focus_and_run(machine, &mut ctx, next);
+                continue;
             }
             core::hint::spin_loop();
             continue;
@@ -325,45 +281,13 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
 
         // Phase 3: run user code and dispatch the resulting event.
         let thread = thread::get_thread(ctx.tid).expect("Invalid thread in event loop");
-        let ts_before_user = machine.rdtsc();
-        kernel_cycles = kernel_cycles.wrapping_add(ts_before_user.wrapping_sub(last_kernel_entry));
+        stats.pre_run(machine);
         let kevent = ctx.run(machine);
-        let ts_after_user = machine.rdtsc();
-        user_cycles = user_cycles.wrapping_add(ts_after_user.wrapping_sub(ts_before_user));
-        last_kernel_entry = ts_after_user;
         // The live register frame for this iteration (post-run). Borrows the
-        // loop-owned `vcpu`; `machine.execute` above already returned, so there
-        // is no aliasing with the run.
+        // loop-owned context; `ctx.run` above already returned, so there is
+        // no aliasing with the run.
         let regs = &mut ctx.vcpu;
-        match &kevent {
-            crate::arch::monitor::KernelEvent::Irq => ev_irq += 1,
-            crate::arch::monitor::KernelEvent::SoftInt(_) => ev_softint += 1,
-            crate::arch::monitor::KernelEvent::Hlt => ev_hlt += 1,
-            crate::arch::monitor::KernelEvent::In { .. } => ev_in += 1,
-            crate::arch::monitor::KernelEvent::Out { .. } => ev_out += 1,
-            crate::arch::monitor::KernelEvent::Ins { .. } => ev_ins += 1,
-            crate::arch::monitor::KernelEvent::Outs { .. } => ev_outs += 1,
-            crate::arch::monitor::KernelEvent::Fault => ev_fault += 1,
-            crate::arch::monitor::KernelEvent::PageFault { .. } => ev_pf += 1,
-            crate::arch::monitor::KernelEvent::Exception(_) => ev_exc += 1,
-            crate::arch::monitor::KernelEvent::Syscall => ev_syscall += 1,
-        }
-        if ts_after_user.wrapping_sub(last_profile_dump) >= PROFILE_DUMP_CYCLES {
-            let total = user_cycles.wrapping_add(kernel_cycles);
-            let user_pct = if total > 0 { user_cycles.wrapping_mul(100) / total } else { 0 };
-            let kern_pct = if total > 0 { kernel_cycles.wrapping_mul(100) / total } else { 0 };
-            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
-                user_pct, kern_pct,
-                ev_irq, ev_softint, ev_hlt, ev_in, ev_out, ev_ins, ev_outs,
-                ev_pf, ev_exc, ev_fault, ev_syscall, machine.get_ticks(),
-                regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
-            user_cycles = 0;
-            kernel_cycles = 0;
-            ev_irq = 0; ev_softint = 0; ev_hlt = 0;
-            ev_in = 0; ev_out = 0; ev_ins = 0; ev_outs = 0;
-            ev_fault = 0; ev_pf = 0; ev_exc = 0; ev_syscall = 0;
-            last_profile_dump = ts_after_user;
-        }
+        stats.post_run(machine, &kevent, regs);
 
         // PageFault is handled at the loop level because `signal_thread`
         // needs the full `&Thread`. Everything else dispatches through
@@ -385,32 +309,8 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         };
 
 
-        let new_tid: Option<usize> = match action {
-            thread::KernelAction::Done => None,
-            thread::KernelAction::Yield => thread::yield_thread(ctx.tid, regs),
-            thread::KernelAction::Exit(code) => Some(thread::exit_thread(machine, ctx.tid, code)),
-            thread::KernelAction::Switch(next) => Some(next),
-            thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, on_error, on_success } => {
-                handle_fork_exec(machine, regs, ctx.tid, &path[..path_len], &cmdtail[..cmdtail_len], on_error, on_success)
-            }
-            thread::KernelAction::Fork(_) => {
-                // TODO: implement Fork in event loop
-                None
-            }
-            thread::KernelAction::Exec { path: _, path_len: _, args: _ } => {
-                // TODO: implement Exec in event loop
-                None
-            }
-        };
-
-        // F11: round-robin thread cycle. Pure focus shift — does not wake any
-        // blocked thread or break any waitpid. The shell (command.com) decides
-        // backgrounding semantics by polling SYNTH_WAITPID + reading kbd.
-        let new_tid = if new_tid.is_none() && thread::take_switch_request() {
-            thread::cycle_next(ctx.tid)
-        } else {
-            new_tid
-        };
+        let new_tid = crate::kernel::sched::next_after(machine, regs, ctx.tid, action)
+            .or_else(|| crate::kernel::sched::focus_request(ctx.tid));
 
         if let Some(new_tid) = new_tid {
             if new_tid == 0 {
@@ -465,7 +365,7 @@ fn switch_focus_and_run(
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
 /// Blocks parent, returns child tid on success, None on error (caller stays on parent).
-fn handle_fork_exec(
+pub(crate) fn handle_fork_exec(
     machine: &mut crate::TheArch,
     vcpu: &mut crate::arch::Vcpu,
     parent_tid: usize,
@@ -721,6 +621,105 @@ fn dump_virtual_hw(dos: &thread::DosState) {
     crate::kernel::dos::dump_if_ring();
 }
 
+
+/// Event-loop diagnostics: per-event-type counts, user/kernel cycle split,
+/// the periodic [prof] dump, and the free-page low-water sampling. Keeps
+/// the loop body logic, not bookkeeping.
+struct EventStats {
+    iterations: u64,
+    min_free: usize,
+    last_free: usize,
+    user_cycles: u64,
+    kernel_cycles: u64,
+    last_kernel_entry: u64,
+    last_profile_dump: u64,
+    counts: [u32; 11], // irq, softint, hlt, in, out, ins, outs, fault, pf, exc, syscall
+}
+
+impl EventStats {
+    /// Sampling cadence for the free-page low-water mark.
+    const MEM_DUMP_PERIOD: u64 = 1000;
+    /// Profile dump cadence. Roughly assume 2 GHz host; only used to format
+    /// the dump as seconds. Off by a constant factor but the ratio is exact.
+    const PROFILE_DUMP_CYCLES: u64 = 2_000_000_000;
+
+    fn new(machine: &mut crate::TheArch) -> Self {
+        let free = machine.free_page_count();
+        let now = machine.rdtsc();
+        EventStats {
+            iterations: 0,
+            min_free: free,
+            last_free: free,
+            user_cycles: 0,
+            kernel_cycles: 0,
+            last_kernel_entry: now,
+            last_profile_dump: now,
+            counts: [0; 11],
+        }
+    }
+
+    fn iteration(&mut self, machine: &mut crate::TheArch) {
+        self.iterations = self.iterations.wrapping_add(1);
+        if self.iterations % Self::MEM_DUMP_PERIOD == 0 {
+            let free = machine.free_page_count();
+            if free < self.min_free {
+                self.min_free = free;
+            }
+            self.last_free = free;
+        }
+    }
+
+    fn pre_run(&mut self, machine: &mut crate::TheArch) {
+        let now = machine.rdtsc();
+        self.kernel_cycles = self
+            .kernel_cycles
+            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
+        self.last_kernel_entry = now;
+    }
+
+    fn post_run(
+        &mut self,
+        machine: &mut crate::TheArch,
+        kevent: &crate::arch::monitor::KernelEvent,
+        regs: &crate::arch::Vcpu,
+    ) {
+        use crate::arch::monitor::KernelEvent as KE;
+        let now = machine.rdtsc();
+        self.user_cycles = self
+            .user_cycles
+            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
+        self.last_kernel_entry = now;
+        let idx = match kevent {
+            KE::Irq => 0,
+            KE::SoftInt(_) => 1,
+            KE::Hlt => 2,
+            KE::In { .. } => 3,
+            KE::Out { .. } => 4,
+            KE::Ins { .. } => 5,
+            KE::Outs { .. } => 6,
+            KE::Fault => 7,
+            KE::PageFault { .. } => 8,
+            KE::Exception(_) => 9,
+            KE::Syscall => 10,
+        };
+        self.counts[idx] += 1;
+        if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
+            let total = self.user_cycles.wrapping_add(self.kernel_cycles);
+            let user_pct = if total > 0 { self.user_cycles.wrapping_mul(100) / total } else { 0 };
+            let kern_pct = if total > 0 { self.kernel_cycles.wrapping_mul(100) / total } else { 0 };
+            let c = &self.counts;
+            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
+                user_pct, kern_pct,
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6],
+                c[8], c[9], c[7], c[10], machine.get_ticks(),
+                regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+            self.user_cycles = 0;
+            self.kernel_cycles = 0;
+            self.counts = [0; 11];
+            self.last_profile_dump = now;
+        }
+    }
+}
 
 fn trim_ascii(s: &[u8]) -> &[u8] {
     let start = s.iter().position(|&c| c > b' ').unwrap_or(s.len());
