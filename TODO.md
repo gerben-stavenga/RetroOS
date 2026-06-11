@@ -54,6 +54,17 @@ card presence is machine-wide.
 (display + keyboard + mouse), release/acquire hooks do the screen handoff,
 and the I/O bitmap follows the owner. But today the event loop still runs
 only the focused thread — focus and execution move together.
+- [x] **Factorization groundwork (d8a5f98..6fd8120, behavior-preserving):**
+      kernel::console (input routing to the console owner, F11/F12
+      interception, blocked-stdin path), kernel::exec_ctx::ExecutionContext
+      (the CPU loan: seed/run/switch_to — pure execution swap, io_policy
+      derived inside; focus deliberately outside), Personality::on_slice /
+      after_input (DOS virtual time + IRQ delivery, Linux pending-IO),
+      kernel::sched (the policy stated once: the focused thread runs;
+      next_after + focus_request), EventStats (loop diagnostics). Today's
+      focus-follows-execution coupling lives in ONE place:
+      startup::switch_focus_and_run. Verified: TCC byte-identical, Bochs
+      UEFI DN, hosted DiskRoot/HostRoot, 15-window PRINCE sweep clean.
 - [ ] Scheduler change: background threads keep executing while an
       unfocused DOS app renders into its own VgaState and gets no input.
       Everything keyed off `focus::focused()` is already in place; the event
