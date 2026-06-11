@@ -82,13 +82,20 @@ hostfs, the cmdline/DN dispatch, the boot self-build — in one long function.
       (synthesis for OPL, see `project_dma_zero_copy_design`).
 
 ## 5. Boot media into the Platform type (follow-up to 2/3)
-Same doctrine again, for storage: the hosted backend can boot a disk image
-(interpreted ATA) or mount a host dir (hostfs over COM1), and
-`mount_filesystems` decides by poking (hostfs-if-it-answers).
-- [ ] A typed `Media { DiskImage | HostDir | Both }` decided at init (CLI +
-      platform facts), with the mount set derived from it — and the clean
-      end state: run a program straight from a host directory mounted as a
-      drive (DOSBox-style `mount c .`), no image build needed.
+- [x] Done (04eb600): `platform::Media { DiskRoot{tar_lba, ext4_lba,
+      hostfs} | HostRoot | Diskless }` probed once (the MBR scan + hostfs
+      transport feed the verdict; the payload IS the mount plan).
+      DOSBox-style works: `retroos-host --host DIR --cmd "X.COM …"` boots
+      imageless with the host directory as the root drive.
+- [ ] **Embed the bootfs in retroos-host too.** It's a kernel_elf link
+      artifact, so imageless hosted has no /boot — DN/COMMAND.COM
+      out-of-the-box under HostRoot needs the bootfs tar included in the
+      hosted binary (rustc_env + include_bytes via Bazel, or equivalent).
+- [ ] **Honest hostfs probe.** `hostfs::init` answers "a COM1 UART
+      exists" — true on Bochs/QEMU with nothing behind it (now visible as
+      `hostfs: true` in the typed verdict; /host is dead there, as it
+      always was). A transport handshake (hello/ack with the host agent)
+      would make the verdict mean what it says.
 
 ## 6. UEFI boot + DOS personality owns its BIOS
 UEFI machines have no legacy real-mode BIOS (no INT 10h/16h/08h/… services, no
