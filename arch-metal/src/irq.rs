@@ -142,7 +142,12 @@ pub fn init_interrupts() {
     // clock disable), silently killing the keyboard for the rest of the
     // boot. Also, the 8042 only edges IRQ1 when OBF transitions 0→1, so a
     // stuck OBF locks out subsequent keypresses regardless.
-    while inb(0x64) & 1 != 0 {
+    // Bounded for the same no-i8042 reason as ps2_wait_in: port 0x64 reading
+    // 0xFF keeps OBF set forever and this drain would hang the boot.
+    for _ in 0..1_000 {
+        if inb(0x64) & 1 == 0 {
+            break;
+        }
         let _ = inb(0x60);
     }
     unmask_irq(1);  // keyboard
@@ -154,13 +159,24 @@ pub fn init_interrupts() {
 // ============================================================================
 
 /// Wait until the 8042 input buffer is empty so we can write a command/data.
+/// BOUNDED: a machine with no i8042 (USB-only laptop keyboards) reads 0xFF
+/// from port 0x64 — busy bits permanently set — and an unbounded spin hangs
+/// the whole boot at a black screen. Give up after ~100k polls.
 fn ps2_wait_in() {
-    while inb(0x64) & 0x02 != 0 {}
+    for _ in 0..100_000 {
+        if inb(0x64) & 0x02 == 0 {
+            return;
+        }
+    }
 }
 
-/// Wait until the 8042 output buffer has data ready.
+/// Wait until the 8042 output buffer has data ready (bounded, see above).
 fn ps2_wait_out() {
-    while inb(0x64) & 0x01 == 0 {}
+    for _ in 0..100_000 {
+        if inb(0x64) & 0x01 != 0 {
+            return;
+        }
+    }
 }
 
 /// Initialize PS/2 mouse: enable AUX port, turn on AUX IRQ in the controller

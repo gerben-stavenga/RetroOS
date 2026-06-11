@@ -28,6 +28,49 @@ unsafe extern "C" {
     static _end: u8;
 }
 
+// Pre-paging copies of the multiboot info + memory map. GRUB may place them
+// anywhere below 4GB, but after enable_paging only the first 1MB of physical
+// memory stays reachable (LOW_MEM_BASE window) — assuming the MBI sits there
+// reads garbage on machines where it doesn't. Copy both while the offset
+// segments can still address all 32-bit physical memory.
+static mut BOOT_INFO: arch::MultibootInfo = unsafe { core::mem::zeroed() };
+static mut BOOT_MMAP: [MultibootMmapEntry; 128] =
+    [MultibootMmapEntry { size: 0, base: 0, length: 0, typ: 0 }; 128];
+static mut BOOT_MMAP_LEN: usize = 0;
+
+/// Physical address P is reachable pre-paging at P + (KERNEL_BASE -
+/// KERNEL_PHYS), wrapping (the boot GDT's offset segments).
+const PHYS_TO_SEG: usize = paging2::KERNEL_BASE - KERNEL_PHYS;
+
+/// Copy the multiboot info + memory map into kernel statics. Pre-paging only.
+unsafe fn capture_boot_info(info: *const arch::MultibootInfo) {
+    let src = (info as usize).wrapping_add(PHYS_TO_SEG) as *const arch::MultibootInfo;
+    let inf = unsafe { core::ptr::read_unaligned(src) };
+    if inf.flags & (1 << 6) != 0 {
+        let count = (inf.mmap_length as usize / core::mem::size_of::<MultibootMmapEntry>())
+            .min(128);
+        let m = (inf.mmap_addr as usize).wrapping_add(PHYS_TO_SEG)
+            as *const MultibootMmapEntry;
+        let dst = unsafe { &mut *(&raw mut BOOT_MMAP) };
+        for i in 0..count {
+            dst[i] = unsafe { core::ptr::read_unaligned(m.add(i)) };
+        }
+        unsafe { BOOT_MMAP_LEN = count };
+    }
+    unsafe { BOOT_INFO = inf };
+}
+
+/// Boot-stage diagnostic delay: with no display and no debug port, the time
+/// until a crash-reset is the only observable on opaque hardware — set this
+/// to ~3_000_000 (≈ seconds per stage via port-0x80 writes) and count seconds
+/// to learn which stage the boot reached. 0 = off (normal boots).
+const STAGE_DELAY_SPINS: u32 = 0;
+fn stage_delay() {
+    for _ in 0..STAGE_DELAY_SPINS {
+        x86::outb(0x80, 0);
+    }
+}
+
 /// boot_kernel - Entry point called by asm boot stub
 ///
 /// Runs with offset segments (base = KERNEL_PHYS - KERNEL_BASE) so linked
@@ -45,7 +88,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // entered the kernel" from "kernel died during init". Pre-paging we run
     // on offset segments (base = KERNEL_PHYS - KERNEL_BASE), so a physical
     // address P is reached at P + (KERNEL_BASE - KERNEL_PHYS), wrapping.
-    unsafe { splash(info) };
+    unsafe { capture_boot_info(info) };
+    unsafe { splash() };
+    stage_delay(); // stage 1: kernel entered, MBI captured
 
     let kernel_size =
         core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
@@ -59,6 +104,8 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         KERNEL_PHYS,
         kernel_pages,
     );
+    stage_delay(); // stage 2: paging on
+
     // Update VGA base for paged addressing before any println
     vga::vga().base = LOW_MEM_BASE + 0xB8000;
 
@@ -72,6 +119,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     let arch_stack_top = (&raw const crate::ARCH_STACK_TOP) as u32 - 16;
     descriptors::setup_descriptor_tables(arch_stack_top);
     descriptors::setup_syscall();
+    stage_delay(); // stage 3: GDT/IDT/TSS + syscall up
 
     // Verify the bootloader is Multiboot-compliant before touching info.
     assert!(
@@ -80,8 +128,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         magic, MULTIBOOT_BOOTLOADER_MAGIC
     );
 
-    // Multiboot info is in low memory — access through LOW_MEM_BASE mapping
-    let info = unsafe { &*((info as usize + LOW_MEM_BASE) as *const arch::MultibootInfo) };
+    // The multiboot info was copied into kernel statics pre-paging (GRUB may
+    // place the original anywhere below 4GB; only low 1MB is mapped now).
+    let info = unsafe { &*(&raw const BOOT_INFO) };
 
     // UEFI-class machine (loader handed us a linear framebuffer, there is no
     // VGA text mode): console cells go to a RAM buffer instead of B8000.
@@ -98,13 +147,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     let kernel_low_page = (KERNEL_PHYS / PAGE_SIZE) as u64;
     let kernel_high_page = ((KERNEL_PHYS + kernel_size + PAGE_SIZE - 1) / PAGE_SIZE) as u64;
 
-    // Parse Multiboot memory map
+    // Parse Multiboot memory map (the pre-paging copy)
     assert!(info.flags & (1 << 6) != 0, "No Multiboot memory map");
-    let mmap_addr = (info.mmap_addr as usize + LOW_MEM_BASE) as *const MultibootMmapEntry;
-    let mmap_length = info.mmap_length as usize;
-    let entry_size = core::mem::size_of::<MultibootMmapEntry>();
-    let mmap_count = mmap_length / entry_size;
-    let mmap_entries = unsafe { core::slice::from_raw_parts(mmap_addr, mmap_count) };
+    let mmap_count = unsafe { BOOT_MMAP_LEN };
+    let mmap_entries: &[MultibootMmapEntry] =
+        unsafe { &(&*(&raw const BOOT_MMAP))[..mmap_count] };
 
     phys_mm::init_phys_mm(
         mmap_entries,
@@ -124,6 +171,8 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         }
     }
 
+    stage_delay(); // stage 4: phys_mm initialized
+
     // GOP machines: map the framebuffer and render the boot backlog NOW —
     // as early as its dependencies allow (the IDT for the COW page-table
     // faults, phys_mm for the frames) — so every later init phase can paint
@@ -131,8 +180,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // compat-mode toggle below reuses, so they survive the switch.
     crate::fbcon::init(info);
 
+    stage_delay(); // stage 5: fbcon up (pixels should exist from here)
+
     irq::init_interrupts();
     lib::println!("Interrupts initialized");
+    stage_delay(); // stage 6: PIC/PIT/LAPIC-stepdown done
 
     if paging2::cpu_supports_long_mode() {
         paging2::sync_hw_pdpt();
@@ -142,6 +194,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         paging2::clear_trampoline(saved);
         lib::println!("Switched to Compat mode");
     }
+    stage_delay(); // stage 7: compat toggle done
 
     // Interrupts are enabled by `enter_ring1` (it sets IF in the IRET frame it
     // builds) — the kernel side never touches `sti`/`cli`.
@@ -227,9 +280,8 @@ fn read_boot_config() -> crate::BootConfig {
 /// data segment directly to framebuffer physical memory. Reads the multiboot
 /// info (also a physical pointer) the same way. Safe only before
 /// `enable_paging`.
-unsafe fn splash(info: *const arch::MultibootInfo) {
-    const PHYS_TO_SEG: usize = (crate::arch::paging2::KERNEL_BASE - KERNEL_PHYS) as usize;
-    let info = unsafe { &*((info as usize).wrapping_add(PHYS_TO_SEG) as *const arch::MultibootInfo) };
+unsafe fn splash() {
+    let info = unsafe { &*(&raw const BOOT_INFO) };
     if info.flags & arch::MULTIBOOT_INFO_FRAMEBUFFER == 0
         || info.framebuffer_type != 1
         || info.framebuffer_bpp != 32
