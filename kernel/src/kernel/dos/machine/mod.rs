@@ -391,7 +391,7 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
             // a passthrough hangs Wolf3D's VL_WaitVBL — under QEMU we fabricate.
             // Bochs and real hardware drive 0x3DA from a real raster, so use the
             // genuine bits there (flip-flop already handled above).
-            if !crate::kernel::startup::is_qemu() {
+            if crate::kernel::platform::get().host != crate::kernel::platform::Host::Qemu {
                 return real;
             }
             fabricated_status1(machine)

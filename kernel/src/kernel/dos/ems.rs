@@ -8,7 +8,6 @@ use arch_abi::GuestBytes;
 use crate::dbg_println;
 use crate::arch::Vcpu;
 use super::xms::EMS_BASE_PAGE;
-use crate::kernel::startup;
 use crate::kernel::thread;
 use crate::Regs;
 

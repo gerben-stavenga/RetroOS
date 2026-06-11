@@ -13,6 +13,7 @@ pub mod hdd;
 pub mod hostfs;
 pub mod nvme;
 pub mod pci;
+pub mod platform;
 // The bare-metal demand-paging heap allocator is metal-only; the hosted build
 // uses std's global allocator, so it needs just a no-op `init()`.
 #[cfg(not(feature = "hosted"))]

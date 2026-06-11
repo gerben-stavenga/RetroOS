@@ -11,34 +11,14 @@ use super::*;
 // Machine-wide VGA presence
 // ============================================================================
 
-/// 0 = unprobed, 1 = absent, 2 = present.
-static VGA_PRESENT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// Is a real VGA card present? Probed once, lazily: write the SEQ index
-/// register and read it back — an absent ISA-bus port reads 0xFF. Decides
-/// passthrough vs the emulated register file for the whole 3Cx/3Dx window
-/// (and whether context-switch save/restore touches hardware at all).
-/// Machine-wide truth: legacy metal = yes; the interpreter (no VGA device on
-/// its port bus) and UEFI-class metal (no card) = no.
+/// Does guest VGA programming reach a real card (vs the emulated register
+/// file)? Answered by the eager boot-time probe (`kernel::platform`) —
+/// passthrough decides the whole 3Cx/3Dx window and whether context-switch
+/// save/restore touches hardware at all. Machine-wide today; per-thread
+/// display ownership (foreground DOS owns the card, background threads run
+/// emulated) hangs off the same Platform type later.
 pub fn vga_present() -> bool {
-    match VGA_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => {
-            use crate::arch::{inb, outb};
-            let saved = inb(0x3C4);
-            outb(0x3C4, 0x02);
-            let present = inb(0x3C4) == 0x02;
-            if present {
-                outb(0x3C4, saved);
-            }
-            VGA_PRESENT.store(
-                if present { 2 } else { 1 },
-                core::sync::atomic::Ordering::Relaxed,
-            );
-            present
-        }
-    }
+    crate::kernel::platform::get().display.vga_passthrough()
 }
 
 // ============================================================================

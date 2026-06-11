@@ -18,9 +18,10 @@ use alloc::boxed::Box;
 use crate::arch::Vcpu;
 use crate::kernel::thread;
 use crate::kernel::dos;
+// used by exceptions.rs via its `use super::*`
+use crate::kernel::startup;
 use super::machine;
 use super::mode_transitions::{seg_base, seg_is_32};
-use crate::kernel::startup;
 use crate::Regs;
 
 mod state;

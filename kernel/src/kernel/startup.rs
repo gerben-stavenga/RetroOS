@@ -20,14 +20,15 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 /// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
 pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
-    // Platform identity comes from the boot config, not a firmware probe.
-    HOST_QEMU.store(if boot.is_qemu { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
-
     // Heap must be live before any kernel code allocates. Arch only depends
     // on phys_mm during boot; everything heap-using lives at or below this
     // entry point.
     crate::kernel::heap::init();
     println!("Heap initialized");
+
+    // Probe the machine ONCE and freeze the result; all hardware policy
+    // (VGA passthrough, BIOS choice, console, IOPB) derives from this.
+    let platform = crate::kernel::platform::probe(boot);
 
     crate::kernel::thread::init_threading();
 
@@ -112,7 +113,7 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     // programming runs untrapped (0x3C0 + 0x3DA stay trapped: AC flip-flop
     // tracking + retrace fabrication). Card-less machines leave everything
     // trapped, routing into the kernel-emulated VGA.
-    if crate::kernel::dos::vga_present() {
+    if platform.display.vga_passthrough() {
         machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
         machine.allow_io_ports(0x3DB, 5);  // 0x3DB..=0x3DF
     }
@@ -821,18 +822,6 @@ fn dump_virtual_hw(dos: &thread::DosState) {
     crate::kernel::dos::dump_if_ring();
 }
 
-
-// Host identity, set once from `BootConfig` at startup (not a firmware probe):
-// 0 = unprimed, 1 = not QEMU, 2 = QEMU.
-static HOST_QEMU: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-/// True iff the host is QEMU-like (vs Bochs / real hardware). Gates QEMU-
-/// specific emulation-bug workarounds — e.g. the synthetic 0x3DA vtrace in the
-/// DOS machine layer (QEMU's 0x3DA doesn't sweep a raster; Bochs / real hardware
-/// drive it correctly and are passed through). Cheap cached load on hot paths.
-pub fn is_qemu() -> bool {
-    HOST_QEMU.load(core::sync::atomic::Ordering::Relaxed) == 2
-}
 
 fn trim_ascii(s: &[u8]) -> &[u8] {
     let start = s.iter().position(|&c| c > b' ').unwrap_or(s.len());

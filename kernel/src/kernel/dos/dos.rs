@@ -3529,7 +3529,7 @@ pub(super) fn setup_ivt(regs: &mut Vcpu) {
     // personality installs its own — all 256 IVT entries into the BIOS stub
     // array, services in `bios.rs`. The kernel-DOS redirects below then
     // override their vectors, layered like a real machine (BIOS, DOS on top).
-    if !super::bios::native_bios_present(regs) {
+    if crate::kernel::platform::get().firmware == crate::kernel::platform::Firmware::Substitute {
         super::bios::install(regs);
     }
 

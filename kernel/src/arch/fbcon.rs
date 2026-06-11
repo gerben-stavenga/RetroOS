@@ -113,6 +113,12 @@ fn geom() -> &'static mut Option<Geom> {
     unsafe { &mut *(&raw mut GEOM) }
 }
 
+/// Whether the framebuffer console owns the display (a linear framebuffer
+/// was handed over and mapped). Probed by `kernel::platform`.
+pub fn active() -> bool {
+    geom().is_some()
+}
+
 /// Early hook, called by `boot_kernel` before the first `println!`: if the
 /// bootloader handed us a linear RGB framebuffer (i.e. there is no VGA text
 /// mode to write to), repoint the console's cell buffer at RAM. The pixel

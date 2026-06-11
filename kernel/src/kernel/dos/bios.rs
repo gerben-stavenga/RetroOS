@@ -138,23 +138,16 @@ macro_rules! bda_field {
 // Install
 // ============================================================================
 
-/// True when a native BIOS ROM owns the machine: every legacy BIOS has a
-/// far-JMP (0xEA) at the reset vector F000:FFF0. The interpreter's zeroed
-/// guest RAM and a UEFI-booted machine (no CSM, nothing mapped at the legacy
-/// ROM window) read something else there.
-pub(super) fn native_bios_present(regs: &Vcpu) -> bool {
-    regs.read::<u8>(0xFFFF0) == 0xEA
-}
-
 /// Install the personality BIOS: point all 256 IVT entries at the stub
 /// array's vector view and seed the BDA. The stub bytes themselves are
 /// filled by `setup_ivt` (one array serves vector and control views). The
 /// kernel-DOS IVT redirects written after this overwrite their vectors with
 /// identical values — the layering matches a real machine (BIOS first, DOS
-/// on top).
+/// on top). Native-vs-substitute is decided by the boot-time probe
+/// (`platform::Firmware`), not sniffed here.
 pub(super) fn install(regs: &mut Vcpu) {
-    crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (VGA {})",
-        if super::machine::vga_present() { "present" } else { "emulated" });
+    crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (display {:?})",
+        crate::kernel::platform::get().display);
     for n in 0..256u32 {
         write_u16(regs, 0, n * 4, (n * 2) as u16);
         write_u16(regs, 0, n * 4 + 2, STUB_SEG);
