@@ -236,6 +236,15 @@ unsafe fn splash(info: *const arch::MultibootInfo) {
     {
         return;
     }
+    // A framebuffer above 4GB (real AMD laptops put the GPU VRAM BAR there —
+    // the Blade 14's sits at 0x7C_0000_0000) is unreachable before paging:
+    // 32-bit addressing would TRUNCATE and spray 80KB over whatever lives at
+    // the low alias (the PCI hole, on the Blade — instant machine reset).
+    // Skip; fbcon::init maps it properly (PAE PTEs carry 52-bit phys) a few
+    // lines later and the console takes over as the life sign.
+    if info.framebuffer_addr >= 1 << 32 {
+        return;
+    }
     let fb = (info.framebuffer_addr as usize).wrapping_add(PHYS_TO_SEG) as *mut u32;
     let stride = info.framebuffer_pitch as usize / 4;
     let width = info.framebuffer_width as usize;
