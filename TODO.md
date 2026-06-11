@@ -73,15 +73,13 @@ hostfs, the cmdline/DN dispatch, the boot self-build — in one long function.
       entry points (metal enter_ring1, hosted main) share it.
 
 ## 4. Audio into the Platform type (follow-up to 2/3)
-Same doctrine as the platform/io_policy work: probe ONCE at init, freeze into
-an ADT, derive all policy. Passthrough-vs-emulation is still decided ad-hoc by
-`ensure_mode` probing — the audio twin of the old lazy `vga_present()`.
-- [ ] `platform::Audio { Ac97 | SbPassthrough | Emulated | Absent }`, probed
-      eagerly in `platform::probe` (codec + OPL + SB reality). `ensure_mode`'s
-      lazy probing dies; the OPL grant becomes derived `io_policy` template
-      data instead of a runtime `grant_dos_ports` poke; the AC'97 sink, the
-      passthrough remap, and the DSP/mixer hang off the variant. See memories
-      `project_dma_zero_copy_design`, `project_ac97_lowmem_dma_window_todo`.
+- [x] Done (36a8ad4): `platform::Audio { SbPassthrough | EmulatedAc97 |
+      EmulatedPortWindow | EmulatedSilent }` probed once (uniform across
+      backends). ensure_mode/SbMode, sound's device_present atomic, and the
+      io_policy grant table all died; OPL is derived template data; ac97
+      split into scan (probe) + init (bring-up, gated on the verdict).
+      Remaining audio work lives with the SB DSP/mixer/8237 model itself
+      (synthesis for OPL, see `project_dma_zero_copy_design`).
 
 ## 5. Boot media into the Platform type (follow-up to 2/3)
 Same doctrine again, for storage: the hosted backend can boot a disk image
