@@ -17,8 +17,9 @@ static mut ROOT_TARFS: TarFs = TarFs::new(0);
 /// Ext4 filesystem (heap-allocated at boot, leaked to get &'static)
 static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 
-/// Startup: mount filesystem and run DN.COM in a loop.
-/// Called from enter_ring1 — we are already at ring 1.
+/// Startup: the kernel's ordered init spine — probe, then derive, then run.
+/// Each phase is a named function below; this stays short enough to read as
+/// the boot story. Called from enter_ring1 — we are already at ring 1.
 pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     // Heap must be live before any kernel code allocates. Arch only depends
     // on phys_mm during boot; everything heap-using lives at or below this
@@ -31,14 +32,24 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     let platform = crate::kernel::platform::probe(boot);
 
     crate::kernel::thread::init_threading();
-
     println!("Threading initialized");
 
     // Pick the boot disk: ATA where present, NVMe on UEFI-class machines.
     crate::kernel::block::init(machine);
-
     println!("Block devices initialized");
 
+    mount_filesystems();
+    init_device_policy(machine, platform);
+    let master_env = load_master_env();
+    init_console_pipe();
+
+    run(machine, boot, &master_env)
+}
+
+/// MBR partition scan → boot-bundle TAR at /boot/ + ext4 root; the embedded
+/// bootfs stands in for /boot/ on diskless boots; hostfs over COM1 when the
+/// host answers; then the symbol index for stack traces.
+fn mount_filesystems() {
     // Read MBR sector 0 to get partition table
     let mut mbr = [0u8; 512];
     crate::kernel::block::read_sectors(0, &mut mbr);
@@ -102,7 +113,13 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     }
 
     crate::kernel::stacktrace::init_from_tar();
+}
 
+/// Device policy, derived from the platform probe — not re-probed here.
+fn init_device_policy(
+    machine: &mut crate::TheArch,
+    platform: &'static crate::kernel::platform::Platform,
+) {
     // Probe for an AC'97 codec (metal). If present it becomes the kernel audio
     // output for the emulated Sound Blaster; absent (no PCI, e.g. the
     // interpreter) leaves the sound path on its port-window fallback.
@@ -117,29 +134,33 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
         machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
         machine.allow_io_ports(0x3DB, 5);  // 0x3DB..=0x3DF
     }
+}
 
-    // /CONFIG.SYS provides the master env handed to DN and any user-driven
-    // launches. KEY=VALUE lines, `#` comments. No root CONFIG.SYS (diskless
-    // boot) falls back to the embedded bootfs copy, whose PATH points into
-    // C:\BOOT; with neither, the env is empty.
+/// /CONFIG.SYS provides the master env handed to DN and any user-driven
+/// launches. KEY=VALUE lines, `#` comments. No root CONFIG.SYS (diskless
+/// boot) falls back to the embedded bootfs copy, whose PATH points into
+/// C:\BOOT; with neither, the env is empty.
+fn load_master_env() -> alloc::vec::Vec<u8> {
     let config = crate::kernel::exec::load_file_resolved(b"CONFIG.SYS")
         .or_else(|_| crate::kernel::exec::load_file_resolved(b"boot/CONFIG.SYS"))
         .unwrap_or_default();
-    let master_env = crate::kernel::dos::parse_config_env(&config);
+    crate::kernel::dos::parse_config_env(&config)
+}
 
-    // Allocate console stdin pipe (keyboard → Linux stdin). The kernel
-    // itself is the writer (via process_key during the event loop drain),
-    // so register a phantom writer permanently — without it, has_writers
-    // returns false and the first read on fd 0 reports EOF immediately,
-    // which makes busybox/sh bail out at startup.
+/// Allocate the console stdin pipe (keyboard → Linux stdin). The kernel
+/// itself is the writer (via process_key during the event loop drain), so
+/// register a phantom writer permanently — without it, has_writers returns
+/// false and the first read on fd 0 reports EOF immediately, which makes
+/// busybox/sh bail out at startup.
+fn init_console_pipe() {
     let console_pipe = crate::kernel::kpipe::alloc().expect("Failed to allocate console pipe");
     crate::kernel::kpipe::add_writer(console_pipe);
     crate::kernel::thread::set_console_pipe(console_pipe);
+}
 
-    // Host may select a program via QEMU `-fw_cfg name=opt/cmdline,string=...`.
-    // Multiple commands separated by `;` are run in sequence; the machine
-    // shuts down when the last one exits. If absent, run DN.COM in a loop
-    // (default interactive shell).
+/// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
+/// sequence (shut down after), or the interactive DN loop.
+fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]) -> ! {
     if let Some(raw) = boot.cmdline() {
         // CWD: explicit `opt/cwd` key wins; else fall back to each program's
         // own directory.
@@ -167,7 +188,7 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            run_dos_program(machine, path, tail, cwd, &master_env, boot.debug_watch);
+            run_dos_program(machine, path, tail, cwd, master_env, boot.debug_watch);
         }
         println!("All commands done — shutting down.");
         machine.shutdown();
@@ -183,7 +204,7 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
 
     println!("Starting DN...");
     loop {
-        run_dos_program(machine, b"boot/DN/DN.COM", b"", b"", &master_env, boot.debug_watch);
+        run_dos_program(machine, b"boot/DN/DN.COM", b"", b"", master_env, boot.debug_watch);
         println!("DN exited, restarting...");
     }
 }
