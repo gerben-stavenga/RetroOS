@@ -72,6 +72,10 @@ impl Arch for Metal {
     // ── Arch calls: paging / fork / LDT / DMA ──
     fn user_fork(&mut self, child: &mut RootPageTable) { super::calls::arch_user_fork(child) }
     fn free_user_pages(&mut self) { super::calls::arch_free_user_pages() }
+    // The metal "space" is the saved-entries buffer inside the Thread (the
+    // live tables use the constant root); page frames were already freed by
+    // free_user_pages at exit, so there is no arch-side object to release.
+    fn destroy_space(&mut self, _root: &mut RootPageTable) {}
     fn set_page_flags(&mut self, start_vpage: usize, count: usize, writable: bool, executable: bool) {
         super::calls::arch_set_page_flags(start_vpage, count, writable, executable)
     }

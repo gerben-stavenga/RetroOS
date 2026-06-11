@@ -287,7 +287,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         1   => sys_exit(machine, tid, a),
         2   => sys_fork(machine, kt, linux, a, regs),
         3   => sys_read(kt, linux, a, regs),
-        7   => sys_wait4(kt, a, regs),
+        7   => sys_wait4(machine, kt, a, regs),
         4   => sys_write(kt, a),
         5   => sys_open(kt, linux, a),
         6   => sys_close(kt, a),
@@ -322,7 +322,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         107 => sys_stat_old(&mut kt.vcpu, linux, a), // lstat — no symlinks, treat as stat
         108 => sys_fstat_old(kt, a),
         91  => sys_munmap(linux, a),
-        114 => sys_wait4(kt, a, regs),
+        114 => sys_wait4(machine, kt, a, regs),
         120 => sys_clone(machine, kt, linux, a, regs),
         122 => sys_uname(&mut kt.vcpu, a),
         125 => SyscallResult::val(0),
@@ -392,7 +392,7 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         57  => sys_fork(machine, kt, linux, a, regs),
         59  => sys_execve(machine, kt, linux, a, regs),
         60  => sys_exit(machine, tid, a),
-        61  => sys_wait4(kt, a, regs),
+        61  => sys_wait4(machine, kt, a, regs),
         72  => sys_fcntl(kt, a),
         79  => sys_getcwd(&mut kt.vcpu, linux, a),
         80  => sys_chdir(&mut kt.vcpu, linux, a),
@@ -1063,13 +1063,13 @@ fn sys_munmap(_linux: &mut LinuxState, a: &Args) -> SyscallResult {
 }
 
 /// wait4(114)
-fn sys_wait4(kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_wait4(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> SyscallResult {
     let tid = kt.tid as usize;
     let pid = a.a0 as i32;
     let status_ptr = a.a1 as usize;
     let _options = a.a2 as i32;
 
-    let (child_tid, exit_code) = thread::waitpid(tid, pid);
+    let (child_tid, exit_code) = thread::waitpid(machine, tid, pid);
 
     if child_tid >= 0 {
         if status_ptr != 0 {

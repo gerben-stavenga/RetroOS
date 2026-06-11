@@ -464,7 +464,7 @@ fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Vcpu) {
 
 /// INT 31h from real mode user code. AH selects subfunction.
 /// On success: AX=0, CF=0. On error: AX=errno (unsigned), CF=1.
-pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn rm_native_syscall(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — SYNTH_VGA_TAKE: adopt a (still-zombie) child's farewell
@@ -489,7 +489,7 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
                 }
                 0
             });
-            if rv >= 0 { thread::reap(pid); }
+            if rv >= 0 { thread::reap(machine, pid); }
             regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
             if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
             thread::KernelAction::Done
@@ -582,7 +582,7 @@ pub(super) fn rm_native_syscall(kt: &mut thread::KernelThread, dos: &mut thread:
         // and its VGA state is suspect. BX = child pid.
         0x05 => {
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            thread::reap(pid);
+            thread::reap(machine, pid);
             regs.rax &= !0xFFFF;
             regs.clear_flag32(1);
             thread::KernelAction::Done

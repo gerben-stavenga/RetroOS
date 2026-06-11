@@ -136,6 +136,29 @@ pub fn new_space() -> u32 {
     })
 }
 
+/// Destroy a space entirely: decommitted AND committed pages, the host VA
+/// reservation (Space::drop munmaps), and the per-page bookkeeping. The
+/// space must not be active (the kernel reaps only after switching away) —
+/// destroying id 0 (the boot space) is a bug.
+pub fn destroy_space(id: u32) {
+    // The boot space (id 0) is permanent — the init program of each run
+    // lives in it, and `clean` at exit already returned its page frames.
+    // Reaping the init thread is therefore a no-op here.
+    if id == 0 {
+        return;
+    }
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        // Destroying the active space happens only at event-loop exit (the
+        // last thread died; nothing runs until the next init program, which
+        // switches properly). Fall back to the boot space.
+        if s.active == id {
+            s.active = 0;
+        }
+        s.spaces.remove(&id);
+    });
+}
+
 /// Make `id` the active space.
 pub fn switch_to(id: u32) {
     STATE.with(|s| {

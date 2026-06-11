@@ -612,12 +612,33 @@ pub fn peek_zombie_child(current_tid: usize, pid: i32) -> (i32, i32) {
 }
 
 /// Recycle a Zombie thread slot. No-op if the tid isn't a zombie.
-pub fn reap(tid: i32) {
+pub fn reap(machine: &mut crate::TheArch, tid: i32) {
     if tid < 0 || (tid as usize) >= MAX_THREADS { return; }
     unsafe {
-        let k = &mut THREADS[tid as usize].kernel;
-        if k.state == ThreadState::Zombie {
-            k.state = ThreadState::Unused;
+        let t = &mut THREADS[tid as usize];
+        if t.kernel.state == ThreadState::Zombie {
+            // Release everything the zombie still holds — the address-space
+            // object (interp: host VA reservation + page bookkeeping; metal:
+            // no-op, frames went back at exit) and the personality state
+            // (VGA planes + suspend snapshot, LDT, DOS bookkeeping). A slot
+            // must hold no resources once Unused: anyone learning the tid is
+            // free has, by contract, nothing left to collect from it.
+            machine.destroy_space(&mut t.kernel.vcpu.space);
+            t.personality = Personality::Linux(LinuxState::new());
+            t.kernel.state = ThreadState::Unused;
+        }
+    }
+}
+
+/// Reap every zombie. The event loop calls this before returning: its
+/// contract is "no thread resources survive the loop" — callers (the DN
+/// restart loop, the cmdline sequence) never inherit zombies to clean up.
+pub fn reap_all_zombies(machine: &mut crate::TheArch) {
+    unsafe {
+        for i in 1..MAX_THREADS {
+            if THREADS[i].kernel.state == ThreadState::Zombie {
+                reap(machine, i as i32);
+            }
         }
     }
 }
@@ -626,9 +647,9 @@ pub fn reap(tid: i32) {
 /// Use when there's no per-personality state to grab from the zombie (the
 /// only current caller is Linux sys_wait4, which has nothing to retrieve
 /// once the parent has the exit code).
-pub fn waitpid(current_tid: usize, pid: i32) -> (i32, i32) {
+pub fn waitpid(machine: &mut crate::TheArch, current_tid: usize, pid: i32) -> (i32, i32) {
     let r = peek_zombie_child(current_tid, pid);
-    if r.0 >= 0 { reap(r.0); }
+    if r.0 >= 0 { reap(machine, r.0); }
     r
 }
 

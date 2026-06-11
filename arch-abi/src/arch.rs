@@ -246,6 +246,14 @@ pub trait Arch {
 
     /// COW-fork the current address space into `child` (fills the child root).
     fn user_fork(&mut self, child: &mut Self::PageTable);
+
+    /// Tear down a dead thread's address space entirely. `free_user_pages`
+    /// (called at exit, while the space is still active) returns its page
+    /// FRAMES; this releases the space OBJECT itself — on the interpreter
+    /// the host VA reservation + per-page bookkeeping, on metal a no-op
+    /// (the saved-entries buffer lives in the Thread and drops with it).
+    /// Called at reap, after execution has switched away.
+    fn destroy_space(&mut self, root: &mut Self::PageTable);
     /// Free user pages in the current address space (the CLEAN call).
     fn free_user_pages(&mut self);
     /// Set page permissions for a range (`writable`, `executable`).

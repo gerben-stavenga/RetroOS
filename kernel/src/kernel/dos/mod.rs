@@ -404,7 +404,7 @@ pub fn syscall(
     match (mode, cs) {
         (UserMode::VM86, dos::STUB_SEG)         => dos::rm_vector_dispatch(machine, kt, dos, regs),
         (UserMode::VM86, dos::CTRL_STUB_SEG)    => dos::rm_ctrl_dispatch(machine, kt, dos, regs),
-        (UserMode::VM86, _)                     => dos::rm_native_syscall(kt, dos, regs),
+        (UserMode::VM86, _)                     => dos::rm_native_syscall(machine, kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(machine, dos, regs),
         (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, kt, dos, regs),
         _                                       => dpmi::dpmi_api(machine, dos, regs),

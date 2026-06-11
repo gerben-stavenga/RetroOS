@@ -539,7 +539,14 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         };
 
         if let Some(new_tid) = new_tid {
-            if new_tid == 0 { return; } // no threads left — respawn DN
+            if new_tid == 0 {
+                // No runnable threads left. Reap every zombie NOW — the
+                // loop's contract is that all thread resources (address
+                // spaces, VGA state) are released before it returns;
+                // callers never inherit zombies.
+                thread::reap_all_zombies(machine);
+                return; // respawn DN / next cmdline program
+            }
             tid = switch_thread(machine, &mut vcpu, tid, new_tid);
         }
     }

@@ -61,6 +61,10 @@ impl Arch for Interp {
     // ── Arch calls: paging / fork / LDT / DMA ──
     fn user_fork(&mut self, child: &mut RootPageTable) { crate::calls::arch_user_fork(child) }
     fn free_user_pages(&mut self) { crate::calls::arch_free_user_pages() }
+    fn destroy_space(&mut self, root: &mut Self::PageTable) {
+        crate::mmu::destroy_space(root.0);
+        crate::cpu::flush_uc();
+    }
     fn set_page_flags(&mut self, start_vpage: usize, count: usize, writable: bool, executable: bool) {
         crate::calls::arch_set_page_flags(start_vpage, count, writable, executable)
     }
