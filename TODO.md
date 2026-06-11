@@ -218,10 +218,13 @@ multiboot map called free, or something interrupt/time-driven).
       ALL zombies before returning (callers never inherit zombies). PRINCE
       launch/quit cycles: RSS flat. Remaining hosted growth during exec
       churn = Unicorn TB-cache fill (bounded) — backend concern.
-- [ ] **Re-verify the original timing crash post-fix:** the deterministic
-      keystroke repro (below) did not reproduce in today's runs (it is
-      timing-pattern sensitive). If it still fires with reaping fixed, the
-      locked-stack/IRQ-lane analysis below resumes.
+- [x] **Re-verified post-fix (2026-06-11): the crash is gone.** Sweep of 5
+      keystroke-timing variants (0.10–0.22s/char, including the documented
+      0.15s pattern) x 3 PRINCE launch cycles each — 15 launch windows, all
+      survived. Verdict: the resource leak was the driver. The
+      locked-stack/IRQ-lane analysis below is RETIRED unless the panic
+      (`unhandled opcode at ffbf:...`, `last_irq=vec08`) ever reappears —
+      if it does, start from the analysis notes below.
 - [ ] **Repro (deterministic per keystroke-timing pattern, headless):** boot
       image on retroos-host, type `cd \GAMES\PRINCE` (0.15s/char), Down,
       Enter → VM86 panic `unhandled opcode at ffbf:0433 (lin=0x100023)`,
