@@ -17,6 +17,7 @@ pub struct Platform {
     pub display: Display,
     pub firmware: Firmware,
     pub audio: Audio,
+    pub media: Media,
     pub debug: DebugSink,
 }
 
@@ -89,6 +90,26 @@ impl Audio {
     }
 }
 
+/// Where the filesystems come from — the probe result IS the mount plan
+/// (`mount_filesystems` derives the mount set from the variant payload).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Media {
+    /// A boot disk answered with a usable partition table: the natural
+    /// root for metal (and hosted runs with an image attached). `tar_lba`
+    /// = 0xDA boot-bundle TAR for /boot (embedded bootfs stands in when
+    /// absent); `ext4_lba` = the 0x83 root. `hostfs` additionally at /host
+    /// when the COM1 transport answered.
+    DiskRoot { tar_lba: Option<u32>, ext4_lba: Option<u32>, hostfs: bool },
+    /// No usable disk, but the host filesystem answered: it IS the root —
+    /// the natural root for hosted runs (DOSBox-style: a host directory is
+    /// the drive, no image build). Also aliased at /host so DiskRoot-era
+    /// `host/...` paths keep working; /boot = the embedded bootfs.
+    HostRoot,
+    /// Neither: the embedded bootfs at /boot is the whole world (a bare
+    /// kernel.elf booted from someone's GRUB).
+    Diskless,
+}
+
 /// Where dbg_println bytes go. Installed by the backend long before startup
 /// (boot prints need it); recorded here so policy can reason about it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,6 +136,7 @@ static mut PLATFORM: Option<Platform> = None;
 /// the write-once static needs no lock).
 pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static Platform {
     let audio = probe_audio(machine);
+    let media = probe_media(machine);
 
     // Metal: ask the hardware. Hosted: the answers are properties of the
     // backend itself — the interp port bus has no VGA device and its zeroed
@@ -147,6 +169,7 @@ pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static
             display,
             firmware,
             audio,
+            media,
             debug: DebugSink::Debugcon,
         }
     };
@@ -163,6 +186,7 @@ pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static
             },
             firmware: Firmware::Substitute,
             audio,
+            media,
             debug: DebugSink::HostStdout,
         }
     };
@@ -172,8 +196,8 @@ pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static
     }
     let p = get();
     println!(
-        "Platform: host={:?} display={:?} firmware={:?} audio={:?} debug={:?}",
-        p.host, p.display, p.firmware, p.audio, p.debug
+        "Platform: host={:?} display={:?} firmware={:?} audio={:?} media={:?} debug={:?}",
+        p.host, p.display, p.firmware, p.audio, p.media, p.debug
     );
     p
 }
@@ -209,6 +233,37 @@ fn probe_audio(machine: &mut crate::TheArch) -> Audio {
         return Audio::EmulatedPortWindow;
     }
     Audio::EmulatedSilent
+}
+
+/// Scan the MBR (4 entries at 0x1BE) for the boot-bundle TAR (type 0xDA)
+/// and the ext4 root (0x83), and probe the hostfs COM1 transport. With no
+/// block device, `read_sectors` leaves the buffer zeroed and the scan finds
+/// nothing — the same verdict path as an empty disk.
+fn probe_media(machine: &mut crate::TheArch) -> Media {
+    let _ = machine;
+    let hostfs = crate::kernel::hostfs::init();
+
+    let mut mbr = [0u8; 512];
+    crate::kernel::block::read_sectors(0, &mut mbr);
+    let mut tar_lba = None;
+    let mut ext4_lba = None;
+    for i in 0..4 {
+        let base = 0x1BE + i * 16;
+        let lba = u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap());
+        match mbr[base + 4] {
+            0xDA => tar_lba = Some(lba),
+            0x83 => ext4_lba = Some(lba),
+            _ => {}
+        }
+    }
+
+    if tar_lba.is_some() || ext4_lba.is_some() {
+        Media::DiskRoot { tar_lba, ext4_lba, hostfs }
+    } else if hostfs {
+        Media::HostRoot
+    } else {
+        Media::Diskless
+    }
 }
 
 /// Is a real VGA card on the bus? Write the SEQ index register and read it

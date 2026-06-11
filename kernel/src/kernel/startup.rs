@@ -27,18 +27,20 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     crate::kernel::heap::init();
     println!("Heap initialized");
 
+    // Pick the boot disk: ATA where present, NVMe on UEFI-class machines —
+    // before the platform probe, which reads the MBR for the Media verdict.
+    crate::kernel::block::init(machine);
+    println!("Block devices initialized");
+
     // Probe the machine ONCE and freeze the result; all hardware policy
-    // (VGA passthrough, BIOS choice, console, IOPB) derives from this.
+    // (VGA passthrough, BIOS choice, audio, media/mounts, console, IOPB)
+    // derives from this.
     let platform = crate::kernel::platform::probe(machine, boot);
 
     crate::kernel::thread::init_threading();
     println!("Threading initialized");
 
-    // Pick the boot disk: ATA where present, NVMe on UEFI-class machines.
-    crate::kernel::block::init(machine);
-    println!("Block devices initialized");
-
-    mount_filesystems();
+    mount_filesystems(platform);
     init_device_policy(machine, platform);
     let master_env = load_master_env();
     init_console_pipe();
@@ -46,51 +48,53 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     run(machine, boot, &master_env)
 }
 
-/// MBR partition scan → boot-bundle TAR at /boot/ + ext4 root; the embedded
-/// bootfs stands in for /boot/ on diskless boots; hostfs over COM1 when the
-/// host answers; then the symbol index for stack traces.
-fn mount_filesystems() {
-    // Read MBR sector 0 to get partition table
-    let mut mbr = [0u8; 512];
-    crate::kernel::block::read_sectors(0, &mut mbr);
+/// The host filesystem (COM1 transport). Mounted at /host beside a disk
+/// root, or AS the root under `Media::HostRoot`.
+static HOSTFS: crate::kernel::hostfs::HostFs = crate::kernel::hostfs::HostFs::new();
 
-    // Scan MBR partition table: 4 entries at 0x1BE, each 16 bytes
-    // Entry: [status, CHS_start(3), type, CHS_end(3), LBA_start(4), LBA_size(4)]
-    // Layout: 0xDA boot bundle TAR (mounts at /boot/) + 0x83 ext4 (root).
+/// Derive the mount set from the platform's Media verdict (the probe already
+/// scanned the MBR and the hostfs transport); then the symbol index.
+fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
+    use crate::kernel::platform::Media;
+
     let mut disk_tar = false;
-    for i in 0..4 {
-        let base = 0x1BE + i * 16;
-        let ptype = mbr[base + 4];
-        let lba = u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap());
-        if ptype == 0 { continue; }
-
-        match ptype {
-            0xDA => {
-                println!("Partition {}: TAR at sector {:#x}", i, lba);
+    match platform.media {
+        Media::DiskRoot { tar_lba, ext4_lba, hostfs } => {
+            if let Some(lba) = tar_lba {
+                println!("Boot TAR at sector {:#x}", lba);
                 disk_tar = true;
                 unsafe {
                     ROOT_TARFS = TarFs::new(lba);
                     (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
                 }
             }
-            0x83 => {
-                println!("Partition {}: ext4 at sector {:#x}", i, lba);
+            if let Some(lba) = ext4_lba {
+                println!("ext4 root at sector {:#x}", lba);
                 match Ext4Fs::new(lba) {
                     Ok(fs) => {
                         let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                         unsafe { EXT4_FS = Some(leaked); }
                         vfs::mount(b"", leaked);
-                        println!("  ext4 mounted as root");
                     }
                     Err(e) => panic!("ext4 mount failed: {}", e),
                 }
             }
-            _ => {}
+            if hostfs {
+                vfs::mount(b"host/", &HOSTFS);
+                println!("hostfs mounted at /host");
+            }
         }
+        Media::HostRoot => {
+            // The host directory IS the drive (DOSBox-style). Alias it at
+            // /host too so DiskRoot-era `host/...` paths keep working.
+            vfs::mount(b"", &HOSTFS);
+            vfs::mount(b"host/", &HOSTFS);
+            println!("hostfs mounted as root");
+        }
+        Media::Diskless => {}
     }
 
-    // No TAR boot partition (a bare kernel.elf booted from someone's GRUB, no
-    // RetroOS disk): /boot/ comes from the embedded bootfs instead — the
+    // No TAR boot partition: /boot/ comes from the embedded bootfs — the
     // DN + COMMAND.COM environment linked into the kernel image.
     if !disk_tar {
         if let Some(bytes) = crate::bootfs() {
@@ -101,16 +105,9 @@ fn mount_filesystems() {
         }
     }
 
-    // Boot bundle TAR mounts at /boot/; the ext4 root holds everything else.
+    // Boot bundle TAR mounts at /boot/; the root holds everything else.
     #[allow(static_mut_refs)]
     unsafe { vfs::mount(b"boot/", &ROOT_TARFS); }
-
-    // Mount host filesystem on COM1 serial (hostfs.py must be running)
-    if crate::kernel::hostfs::init() {
-        static HOSTFS: crate::kernel::hostfs::HostFs = crate::kernel::hostfs::HostFs::new();
-        vfs::mount(b"host/", &HOSTFS);
-        println!("hostfs mounted at /host");
-    }
 
     crate::kernel::stacktrace::init_from_tar();
 }

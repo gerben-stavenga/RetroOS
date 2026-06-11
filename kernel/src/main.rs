@@ -105,26 +105,32 @@ fn main() {
     if shot_armed {
         lib::vga_render::set_present_sink(|w, h, px| arch::publish_frame(w, h, px));
     }
-    if let Some(dir) = host_dir {
-        arch::attach_hostfs(&dir); // COM1 → /host
+    if let Some(dir) = &host_dir {
+        arch::attach_hostfs(dir); // COM1 → /host (or the root, per Media)
     }
     if let Some(path) = wav {
         arch::attach_audio(&path); // canonical audio device → WAV file
     }
 
-    let Some(path) = input else {
+    // No image and nothing else to do → the demo. With --host or --cmd the
+    // imageless boot is real: the host dir becomes the VFS root
+    // (platform::Media::HostRoot) over the embedded bootfs.
+    if input.is_none() && host_dir.is_none() && cmd.is_none() {
         kernel::host_run_demo()
-    };
+    }
 
     let mut data = Vec::new();
-    std::fs::File::open(&path)
-        .and_then(|mut f| f.read_to_end(&mut data))
-        .unwrap_or_else(|e| {
-            eprintln!("retroos-host: cannot read {path}: {e}");
-            std::process::exit(1);
-        });
+    if let Some(path) = &input {
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_to_end(&mut data))
+            .unwrap_or_else(|e| {
+                eprintln!("retroos-host: cannot read {path}: {e}");
+                std::process::exit(1);
+            });
+    }
 
     if data.starts_with(b"\x7fELF") {
+        let path = input.as_deref().unwrap();
         // A bare executable: run it directly (no disk). argv = the positional
         // tail (so `… apps/busybox/busybox sh` runs BusyBox's `sh` applet).
         let argv: Vec<Vec<u8>> = positional.iter().map(|s| s.clone().into_bytes()).collect();
@@ -136,13 +142,16 @@ fn main() {
         kernel::host_run_elf(path.as_bytes(), data, argv);
     }
 
-    // Otherwise treat it as a disk image: hook the ATA ports onto it and boot
-    // the same kernel::startup() the metal crt0 calls.
+    // Otherwise boot the same kernel::startup() the metal crt0 calls — with
+    // the image's ATA disk attached when one was given, diskless otherwise
+    // (the platform Media probe roots on hostfs or the embedded bootfs).
     arch::init_guest_ram(0);
-    arch::attach_disk(&path).unwrap_or_else(|e| {
-        eprintln!("retroos-host: cannot attach disk {path}: {e}");
-        std::process::exit(1);
-    });
+    if let Some(path) = &input {
+        arch::attach_disk(path).unwrap_or_else(|e| {
+            eprintln!("retroos-host: cannot attach disk {path}: {e}");
+            std::process::exit(1);
+        });
+    }
     // Drive the booted OS (DOS shell, DN) from the terminal: raw mode + the
     // stdin→keyboard pump. Keys reach the guest via the kernel's IRQ1 path and
     // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
