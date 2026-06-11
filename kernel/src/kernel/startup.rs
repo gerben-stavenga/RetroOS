@@ -344,49 +344,13 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
                     }
                     // Pump emulated-SB playback against the same virtual clock.
                     crate::kernel::dos::audio_tick(machine, dos, regs);
-                    let dp = dos as *mut thread::DosState;
-                    machine.drain(&mut |evt| {
-                        if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
-                            thread::request_switch();
-                        } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
-                            dump_interrupted_thread(regs, Some(unsafe { &*dp }));
-                        } else if is_blocked {
-                            if let crate::arch::Irq::Key(sc) = evt {
-                                if crate::kernel::keyboard::update_key_state(sc) {
-                                    let c = crate::kernel::keyboard::scancode_to_ascii(sc);
-                                    if c != 0 {
-                                        crate::vga::putchar(c);
-                                        let cpipe = thread::console_pipe();
-                                        crate::kernel::kpipe::write(cpipe, &[c]);
-                                    }
-                                }
-                            }
-                        } else {
-                            if let crate::arch::Irq::Key(sc) = evt {
-                                unsafe { (*dp).process_key(regs, sc); }
-                            } else {
-                                crate::kernel::dos::queue_irq(unsafe { &mut *dp }, regs, evt);
-                            }
-                        }
-                    });
+                    crate::kernel::console::drain_dos(machine, regs, is_blocked, dos);
                     if !is_blocked {
-                        crate::kernel::dos::raise_pending(machine, unsafe { &mut *dp }, regs);
+                        crate::kernel::dos::raise_pending(machine, dos, regs);
                     }
                 }
                 thread::Personality::Linux(linux) => {
-                    let ktp = kt as *mut thread::KernelThread;
-                    let lp = linux as *mut thread::LinuxState;
-                    machine.drain(&mut |evt| {
-                        if let crate::arch::Irq::Key(sc) = evt {
-                            if sc == F11_PRESS {
-                                thread::request_switch();
-                            } else if sc == F12_PRESS {
-                                dump_interrupted_thread(regs, None);
-                            } else {
-                                unsafe { (*lp).process_key(&(*ktp).fds, sc); }
-                            }
-                        }
-                    });
+                    crate::kernel::console::drain_linux(machine, regs, kt, linux);
                 }
             }
 
@@ -737,11 +701,7 @@ fn handle_fork_exec(
     Some(child_tid)
 }
 
-/// F11 scancode (press)
-const F11_PRESS: u8 = 0x57;
 
-/// F12 scancode (press) — debug dump hotkey
-const F12_PRESS: u8 = 0x58;
 
 /// F12 handler: dump the user thread state that was interrupted when F12 was
 /// pressed. `regs` is always a user frame — the kernel event loop is never
@@ -755,7 +715,7 @@ pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::arch::Vcpu) {
     dump_interrupted_thread(regs, Some(dos));
 }
 
-fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thread::DosState>) {
+pub(crate) fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thread::DosState>) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
         let vif = regs.flags32() & (1 << 9) != 0;

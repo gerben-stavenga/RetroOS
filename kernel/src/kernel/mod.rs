@@ -5,6 +5,7 @@
 
 pub mod ac97;
 pub mod block;
+pub mod console;
 pub mod dos;
 pub mod elf;
 pub mod exec;

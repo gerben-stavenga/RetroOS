@@ -1,0 +1,80 @@
+//! Console input routing — drained host/hardware events to their owners.
+//!
+//! ONE place decides where an input event goes:
+//! - Console-global chords are intercepted first: F11 requests a focus
+//!   switch, F12 dumps the interrupted thread's state.
+//! - Everything else is addressed to the console owner — `focus::focused()`,
+//!   which today is also the running thread (focus implies execution until
+//!   the scheduler decouples them; this router is written against the
+//!   owner, so that change won't touch the routing).
+//! - Keys to a *blocked* DOS owner feed the console stdin pipe (the Linux
+//!   shell the DOS thread is wait4-blocked on reads them from fd 0).
+//! - Keys to a running DOS owner go through its BIOS keyboard path; other
+//!   IRQs (mouse packets) queue into its per-thread virtual devices.
+//! - Linux owners get keys cooked into their fds; they have no virtual
+//!   device bus for other IRQs.
+
+use crate::kernel::thread;
+use arch_abi::Arch;
+
+/// F11 scancode (press) — focus switch.
+pub const F11_PRESS: u8 = 0x57;
+/// F12 scancode (press) — dump the running thread's state.
+pub const F12_PRESS: u8 = 0x58;
+
+/// Drain pending input into a DOS console owner. `blocked` selects the
+/// stdin-pipe path (owner is wait4-parked behind a foreground Linux child).
+pub fn drain_dos(
+    machine: &mut crate::TheArch,
+    regs: &mut crate::arch::Vcpu,
+    blocked: bool,
+    dos: &mut thread::DosState,
+) {
+    let dp = dos as *mut thread::DosState;
+    machine.drain(&mut |evt| {
+        if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
+            thread::request_switch();
+        } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
+            crate::kernel::startup::dump_interrupted_thread(regs, Some(unsafe { &*dp }));
+        } else if blocked {
+            if let crate::arch::Irq::Key(sc) = evt {
+                if crate::kernel::keyboard::update_key_state(sc) {
+                    let c = crate::kernel::keyboard::scancode_to_ascii(sc);
+                    if c != 0 {
+                        crate::vga::putchar(c);
+                        let cpipe = thread::console_pipe();
+                        crate::kernel::kpipe::write(cpipe, &[c]);
+                    }
+                }
+            }
+        } else {
+            if let crate::arch::Irq::Key(sc) = evt {
+                unsafe { (*dp).process_key(regs, sc) };
+            } else {
+                crate::kernel::dos::queue_irq(unsafe { &mut *dp }, regs, evt);
+            }
+        }
+    });
+}
+
+/// Drain pending input into a Linux console owner (keys → cooked fd input).
+pub fn drain_linux(
+    machine: &mut crate::TheArch,
+    regs: &mut crate::arch::Vcpu,
+    kt: &mut thread::KernelThread,
+    linux: &mut thread::LinuxState,
+) {
+    let ktp = kt as *mut thread::KernelThread;
+    let lp = linux as *mut thread::LinuxState;
+    machine.drain(&mut |evt| {
+        if let crate::arch::Irq::Key(sc) = evt {
+            if sc == F11_PRESS {
+                thread::request_switch();
+            } else if sc == F12_PRESS {
+                crate::kernel::startup::dump_interrupted_thread(regs, None);
+            } else {
+                unsafe { (*lp).process_key(&(*ktp).fds, sc) };
+            }
+        }
+    });
+}
