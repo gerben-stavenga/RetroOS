@@ -103,6 +103,16 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     // interpreter) leaves the sound path on its port-window fallback.
     crate::kernel::ac97::init(machine);
 
+    // VGA passthrough is policy, decided here like the OPL/SB ports: with a
+    // real card, open the register window in the VM86 IOPB so guest VGA
+    // programming runs untrapped (0x3C0 + 0x3DA stay trapped: AC flip-flop
+    // tracking + retrace fabrication). Card-less machines leave everything
+    // trapped, routing into the kernel-emulated VGA.
+    if crate::kernel::dos::vga_present() {
+        machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
+        machine.allow_io_ports(0x3DB, 5);  // 0x3DB..=0x3DF
+    }
+
     // /CONFIG.SYS provides the master env handed to DN and any user-driven
     // launches. KEY=VALUE lines, `#` comments. No root CONFIG.SYS (diskless
     // boot) falls back to the embedded bootfs copy, whose PATH points into

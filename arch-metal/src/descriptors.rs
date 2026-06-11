@@ -252,19 +252,20 @@ impl Tss {
 }
 
 /// Set up TSS bitmaps for VM86:
-/// - IOPB: allow VGA ports (0x3C0-0x3DF); deny everything else (the SB DSP/
-///   mixer/8237 and the AdLib OPL ports are all trapped → kernel-emulated)
+/// - IOPB: deny (trap) ALL ports by default — including VGA. Passthrough is
+///   kernel policy, not an arch default: the kernel re-opens 0x3C1-0x3D9 +
+///   0x3DB-0x3DF via `allow_io_ports` only when a real card answers the
+///   probe (`vga_present`). On a card-less machine (UEFI metal) the traps
+///   route the whole register file into the kernel-emulated VGA — with the
+///   old static allowance, a game's DAC loads went straight to dead
+///   hardware and the screen rendered with the seed palette (reproducer:
+///   SkyRoads on run_uefi.sh, palette completely wrong). 0x3C0 and 0x3DA
+///   stay trapped even with a real card (flip-flop tracking + retrace
+///   fabrication), preserving the exact legacy-metal behaviour.
 /// - Interrupt redirection: trap handled INTs to monitor, rest through IVT
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
-    // IOPB: allow VGA ports 0x3C0-0x3DF (bytes 120-123)
-    // Trap 0x3C0 (AC index/data) to track flip-flop state
-    // Trap 0x3DA (Input Status 1) to synthesize retrace + reset flip-flop
     unsafe {
-        (*tss).iopb[120] = 0x01; // bit 0 = port 0x3C0
-        (*tss).iopb[121] = 0x00;
-        (*tss).iopb[122] = 0x00;
-        (*tss).iopb[123] = 0x04; // trap bit 2 = port 0x3DA
         // AdLib OPL2 ports 0x388/0x389 (byte 113, bits 0-1) are left TRAPPED
         // (default-deny) so they route through the kernel SB/OPL emulation. The
         // OPL is the same chip as the SB's io_base+8/9 mirror (already trapped),
