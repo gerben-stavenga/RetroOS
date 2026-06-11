@@ -17,19 +17,6 @@ static mut ROOT_TARFS: TarFs = TarFs::new(0);
 /// Ext4 filesystem (heap-allocated at boot, leaked to get &'static)
 static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 
-/// Boot-stage diagnostic delay: with no display and no debug port, the time
-/// until a crash-reset is the only observable on opaque hardware — set this
-/// to ~3_000_000 (≈ seconds per stage via port-0x80 writes) and count seconds
-/// to learn which stage the boot reached. 0 = off (normal boots).
-const STAGE_DELAY_SPINS: u32 = 1_000_000;
-fn stage_delay() {
-    for _ in 0..STAGE_DELAY_SPINS {
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") 0x80, in("al") 0u8);
-        }
-    }
-}
-
 /// Startup: mount filesystem and run DN.COM in a loop.
 /// Called from enter_ring1 — we are already at ring 1.
 pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
@@ -41,18 +28,15 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     // entry point.
     crate::kernel::heap::init();
     println!("Heap initialized");
-    stage_delay();
 
     crate::kernel::thread::init_threading();
 
     println!("Threading initialized");
-    stage_delay();
 
     // Pick the boot disk: ATA where present, NVMe on UEFI-class machines.
     crate::kernel::block::init(machine);
 
     println!("Block devices initialized");
-    stage_delay();
 
     // Read MBR sector 0 to get partition table
     let mut mbr = [0u8; 512];

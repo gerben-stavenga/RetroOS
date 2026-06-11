@@ -654,9 +654,7 @@ unsafe extern "fastcall" {
 /// Safety: Requires trampoline copied to 0xF000 and identity-mapped.
 pub fn toggle_mode(new_cr3: u32) {
     x86::cli();
-    diag_delay(); // toggle sub-stage A: about to flip paging/LME
     unsafe { toggle_prot_compat(new_cr3); }
-    diag_delay(); // toggle sub-stage B: mode flipped, descriptors stale
     // Reload IDT/TSS based on current mode (check EFER.LMA)
     let efer = x86::rdmsr(x86::EFER_MSR);
     if efer & x86::efer::LMA != 0 {
@@ -664,18 +662,7 @@ pub fn toggle_mode(new_cr3: u32) {
     } else {
         load_prot_mode_descriptors();
     }
-    diag_delay(); // toggle sub-stage C: descriptors reloaded, pre-sti
     x86::sti();
-    diag_delay(); // toggle sub-stage D: first IRQs through the new IDT
-}
-
-/// Boot diagnostic delay for opaque hardware (see boot.rs STAGE_DELAY_SPINS —
-/// duplicated here because arch doesn't call into the kernel). 0 = off.
-const DIAG_DELAY_SPINS: u32 = 0;
-fn diag_delay() {
-    for _ in 0..DIAG_DELAY_SPINS {
-        x86::outb(0x80, 0);
-    }
 }
 
 /// SYSCALL/SYSRET MSR addresses
