@@ -1,0 +1,3 @@
+# Package exists so crate_universe can reference //play:Cargo.toml as a
+# workspace-member manifest. retroos-play itself stays cargo-built — it owns
+# the SDL dependency and is a developer A/V tool, not a build input.

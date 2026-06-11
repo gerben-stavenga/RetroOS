@@ -1,0 +1,26 @@
+Make the bindgen header path a RUN-time lookup instead of a COMPILE-time
+env! bake. Under cargo both happen in the same directory so it never
+matters; under Bazel the build script is compiled in one sandbox and run
+in another, so the compile-time CARGO_MANIFEST_DIR is a dead path by the
+time the script runs. Applied by the crate.annotation in MODULE.bazel.
+--- a/build.rs
++++ b/build.rs
+@@ -323,7 +323,8 @@
+ }
+
+ fn generate_bindings() {
+-    const HEADER_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/include/unicorn/unicorn.h");
++    let header_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
++        .join("include/unicorn/unicorn.h");
+
+     let bitflag_enums = [
+         "uc_hook_type",
+@@ -335,7 +336,7 @@
+     ];
+
+     let bindings = bindgen::Builder::default()
+-        .header(HEADER_PATH)
++        .header(header_path.to_str().unwrap())
+         .layout_tests(false)
+         .allowlist_type("^uc.*")
+         .allowlist_function("^uc_.*")

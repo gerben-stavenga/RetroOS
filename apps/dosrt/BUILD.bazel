@@ -105,20 +105,15 @@ genrule(
           "-T $(location hello/hello.ld) -u _start $(location :hello_retro) -o $@",
 )
 
-# ---- retroos-host: the hosted interpreter backend, cargo-built ---------
+# ---- retroos-host: the hosted interpreter backend --------------------------
 # There's no Linux-hosted Turbo C, so TC runs inside RetroOS. Rather than boot
 # the OS in QEMU, we run it on the arch-interp (interpreter) backend as an
-# ordinary host process — deterministic and headless, no VM. `build_host.sh`
-# cargo-builds the binary; the genrule is `local` because it uses the host
-# cargo + CARGO_HOME (the patched Unicorn fork). The binary is statically
-# linked, so `stub_exe` can consume it sandboxed.
-genrule(
+# ordinary host process — deterministic and headless, no VM. A plain Bazel
+# rust_binary (unicorn via crate_universe, see MODULE.bazel) — used from
+# `tools`, so it builds in the exec configuration (the host platform).
+alias(
     name = "interp_host",
-    outs = ["retroos-host"],
-    tools = ["build_host.sh"],
-    cmd = "$(location build_host.sh) $@",
-    local = 1,
-    tags = ["no-sandbox", "requires-network"],
+    actual = "//kernel:retroos-host",
     visibility = ["//visibility:public"],
 )
 

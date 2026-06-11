@@ -1,5 +1,5 @@
 # Build kernel using rules_rust and rules_nasm
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_static_library")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 
 nasm_library(
@@ -21,6 +21,57 @@ rust_static_library(
         "-Cforce-frame-pointers=yes",
     ],
     deps = ["//arch-abi", "//arch-metal", "//lib", "@ext4_view//:ext4_view", "@spin//:spin"],
+)
+
+# ---- hosted: the same kernel on the arch-interp backend, as a host binary --
+# What `cargo build -p kernel --features hosted` used to produce; now an
+# ordinary Bazel target so kernel changes rebuild it like everything else
+# (the cargo genrule reused stale binaries — no declared inputs).
+# Genrules consume it via `tools` (exec config = host platform); to build it
+# directly, pass --platforms=@platforms//host (the workspace default target
+# platform is the bare-metal one).
+rust_library(
+    name = "kernel_hosted",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kernel",
+    crate_features = ["hosted"],
+    edition = "2024",
+    # abort matches //lib and //arch-abi (abort rlibs can't link into an
+    # unwind binary; unwind rlibs like std/@crates link into abort fine).
+    rustc_flags = [
+        "-Cpanic=abort",
+        # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
+        # metal setting); a PIE link rejects them — build non-PIE to match.
+        "-Crelocation-model=static",
+    ],
+    deps = [
+        "//arch-abi",
+        "//arch-interp",
+        "//lib",
+        "@crates//:ext4-view",
+        "@crates//:rustc-demangle",
+        "@crates//:spin",
+    ],
+)
+
+rust_binary(
+    name = "retroos-host",
+    srcs = ["src/main.rs"],
+    crate_name = "retroos_host",
+    crate_features = ["hosted"],
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
+        # metal setting); a PIE link rejects them — build non-PIE to match.
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":kernel_hosted",
+        "//arch-interp",
+        "//lib",
+    ],
 )
 
 # The embedded boot filesystem (DN + COMMAND.COM, see //:bootfs_tar) as a
