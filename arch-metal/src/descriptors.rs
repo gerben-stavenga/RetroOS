@@ -297,6 +297,15 @@ pub fn allow_io_ports(port: u16, count: usize) {
     }
 }
 
+/// Deny-all I/O bitmap baseline (every byte 0xFF, terminator included).
+/// The kernel re-opens a thread's allowed ranges via `allow_io_ports` on
+/// swap-in — per-personality port policy lives there, not here.
+pub fn reset_io_bitmap() {
+    unsafe {
+        TSS32.iopb = [0xFF; IOPB_SIZE];
+    }
+}
+
 /// Check whether INT n is intercepted (bit set in redirection bitmap).
 pub fn int_intercepted(int_num: u8) -> bool {
     unsafe { TSS32.int_redir[(int_num / 8) as usize] & (1 << (int_num % 8)) != 0 }

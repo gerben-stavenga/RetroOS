@@ -182,6 +182,12 @@ pub trait Arch {
     /// a real card (passthrough). No-op on backends that interpret all I/O.
     fn allow_io_ports(&mut self, port: u16, count: usize);
 
+    /// Reset the I/O-permission bitmap to deny-all. The kernel's io_policy
+    /// rebuilds a thread's allowed set (reset + allow_io_ports ranges) on
+    /// every swap-in; which ports a personality may touch is kernel policy,
+    /// this is only the mechanism. No-op on backends that interpret all I/O.
+    fn reset_io_bitmap(&mut self);
+
     // ── Execution & scheduling ─────────────────────────────────────────────
     //
     // The event loop *owns* the live `Vcpu` (there is no `REGS` global). It hands

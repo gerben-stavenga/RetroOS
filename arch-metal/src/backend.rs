@@ -30,6 +30,9 @@ impl Arch for Metal {
     fn allow_io_ports(&mut self, port: u16, count: usize) {
         super::descriptors::allow_io_ports(port, count)
     }
+    fn reset_io_bitmap(&mut self) {
+        super::descriptors::reset_io_bitmap()
+    }
 
     // ── Execution & scheduling ──
     //

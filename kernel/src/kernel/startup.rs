@@ -116,24 +116,17 @@ fn mount_filesystems() {
 }
 
 /// Device policy, derived from the platform probe — not re-probed here.
+/// Port permissions are NOT set here: `io_policy::apply` rebuilds the I/O
+/// bitmap per thread on every swap-in (the VGA window follows console
+/// focus; Linux threads get nothing).
 fn init_device_policy(
     machine: &mut crate::TheArch,
-    platform: &'static crate::kernel::platform::Platform,
+    _platform: &'static crate::kernel::platform::Platform,
 ) {
     // Probe for an AC'97 codec (metal). If present it becomes the kernel audio
     // output for the emulated Sound Blaster; absent (no PCI, e.g. the
     // interpreter) leaves the sound path on its port-window fallback.
     crate::kernel::ac97::init(machine);
-
-    // VGA passthrough is policy, decided here like the OPL/SB ports: with a
-    // real card, open the register window in the VM86 IOPB so guest VGA
-    // programming runs untrapped (0x3C0 + 0x3DA stay trapped: AC flip-flop
-    // tracking + retrace fabrication). Card-less machines leave everything
-    // trapped, routing into the kernel-emulated VGA.
-    if platform.display.vga_passthrough() {
-        machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
-        machine.allow_io_ports(0x3DB, 5);  // 0x3DB..=0x3DF
-    }
 }
 
 /// /CONFIG.SYS provides the master env handed to DN and any user-driven
@@ -233,6 +226,14 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
     machine.set_debug_watch(None);
 
     let tid = dos::run_init_program(machine, buf, args, cmdline_tail, cwd, env);
+
+    // The initial program owns the console outright (nothing to repaint) and
+    // gets its port permissions from policy, not from boot-time leftovers.
+    crate::kernel::focus::adopt(tid);
+    {
+        let t = thread::get_thread(tid).expect("init program thread");
+        crate::kernel::io_policy::apply(machine, &t.personality, true);
+    }
 
     if let Some((addr0, addr1)) = debug_watch {
         machine.set_debug_watch(Some((addr0, addr1)));
@@ -560,9 +561,15 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
 fn switch_thread(machine: &mut crate::TheArch, live: &mut crate::arch::Vcpu, tid: usize, new_tid: usize) -> usize {
     if new_tid == tid { return tid; }
     let (old, new) = thread::get_two_threads(tid, new_tid);
-    if old.kernel.state != thread::ThreadState::Zombie {
-        old.personality.suspend();
-    }
+    // Console focus follows the run switch today (the event loop runs the
+    // focused thread); the concepts stay separate so a future scheduler can
+    // run background threads without moving focus.
+    let old_personality = if old.kernel.state != thread::ThreadState::Zombie {
+        Some(&mut old.personality)
+    } else {
+        None
+    };
+    crate::kernel::focus::release(old_personality);
     verify_cpu_hash(new, "switch-in");
     let mut swap_vcpu = new.kernel.vcpu;
     let mut swap_fx = new.kernel.fx_state;
@@ -576,7 +583,14 @@ fn switch_thread(machine: &mut crate::TheArch, live: &mut crate::arch::Vcpu, tid
     old.kernel.vcpu = swap_vcpu;
     old.kernel.fx_state = swap_fx;
     old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
-    new.personality.materialize();
+    crate::kernel::focus::acquire(new_tid, &mut new.personality);
+    // The incoming thread's port permissions: rebuilt from (personality,
+    // platform, focus) — never inherited from whoever ran last.
+    crate::kernel::io_policy::apply(
+        machine,
+        &new.personality,
+        new_tid == crate::kernel::focus::focused(),
+    );
     new.personality.on_resume(machine);
     new_tid
 }

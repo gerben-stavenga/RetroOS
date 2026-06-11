@@ -574,7 +574,7 @@ impl SoundBlaster {
             // AdLib ports and let the guest's (frequent) FM music writes hit the
             // hardware directly. In emulation they stay trapped → `emu_*` answers
             // FM detection. (No-op on the interpreter, which interprets all I/O.)
-            machine.allow_io_ports(0x388, 2);
+            crate::kernel::io_policy::grant_dos_ports(machine, 0x388, 2);
         }
     }
 
