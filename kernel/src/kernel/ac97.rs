@@ -98,12 +98,11 @@ pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
 
-/// Probe PCI for an AC'97 codec and, if found, bring it up. Called once at boot.
-/// On a backend with no PCI (the interpreter) every config read returns
-/// `0xFFFFFFFF`, so nothing is found and the kernel sound path falls back to the
-/// canonical audio port window.
-pub fn init(arch: &mut crate::TheArch) {
-    // Scan bus 0 (QEMU/ICH put the AC'97 there), function 0.
+/// Find an AC'97 codec on PCI bus 0 (QEMU/ICH put it there), function 0.
+/// Pure presence scan — `platform::probe` uses it for the Audio decision; on
+/// a backend with no PCI (the interpreter) every config read is 0xFFFFFFFF
+/// and nothing is found.
+pub fn scan(arch: &mut crate::TheArch) -> Option<u8> {
     for dev in 0..32u8 {
         let id = crate::kernel::pci::read32(arch, 0, dev, 0, 0x00);
         if id & 0xFFFF == 0xFFFF {
@@ -113,11 +112,22 @@ pub fn init(arch: &mut crate::TheArch) {
         let class = (classes >> 24) & 0xFF;
         let subclass = (classes >> 16) & 0xFF;
         if class == 0x04 && subclass == 0x01 {
-            if bring_up(arch, dev) {
-                PRESENT.store(true, Ordering::Relaxed);
-            }
-            return;
+            return Some(dev);
         }
+    }
+    None
+}
+
+/// Bring up the codec the platform probe found. Driver init only — the
+/// routing decision is `platform::Audio` (EmulatedAc97); PRESENT here means
+/// "driver is actually up" and guards `play` against a failed bring-up.
+pub fn init(arch: &mut crate::TheArch) {
+    if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedAc97 {
+        return;
+    }
+    let dev = scan(arch).expect("platform probe saw an AC'97 codec; scan must agree");
+    if bring_up(arch, dev) {
+        PRESENT.store(true, Ordering::Relaxed);
     }
 }
 

@@ -29,7 +29,7 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
 
     // Probe the machine ONCE and freeze the result; all hardware policy
     // (VGA passthrough, BIOS choice, console, IOPB) derives from this.
-    let platform = crate::kernel::platform::probe(boot);
+    let platform = crate::kernel::platform::probe(machine, boot);
 
     crate::kernel::thread::init_threading();
     println!("Threading initialized");

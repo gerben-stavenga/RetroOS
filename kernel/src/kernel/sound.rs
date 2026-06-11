@@ -14,12 +14,12 @@
 //! unpopulated, so the kernel sound path is inert there and the existing SB
 //! passthrough to a real card still produces sound.
 //!
-//! A one-shot *signature probe* gates streaming: the kernel reads the device's
-//! signature port once and caches presence, so writing PCM never pokes real
-//! silicon on a backend that has no canonical audio device.
+//! Routing is decided ONCE at boot (`platform::Audio`): the AC'97 codec
+//! where one was found, the port window where a backend installed a sink,
+//! nowhere otherwise — `play` just matches the type.
 
 use arch_abi::Arch;
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // RetroOS canonical audio device — a kernel-private ISA port window. It is
 // *never* guest-visible: only the kernel addresses it, through `arch.outw`
@@ -77,39 +77,28 @@ impl Format {
     }
 }
 
-// Device-presence probe cache: 0 = unprobed, 1 = present, 2 = absent. Atomic so
-// the gate is correct once the kernel is multi-core (each core probes at most
-// once; a redundant probe is harmless).
-static PRESENT: AtomicU8 = AtomicU8::new(0);
 /// Last rate programmed into the device, so we only re-emit `AUDIO_SIG` on change.
 static LAST_RATE: AtomicU32 = AtomicU32::new(0);
 
-fn device_present(arch: &mut crate::TheArch) -> bool {
-    match PRESENT.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let yes = arch.inw(AUDIO_SIG) == SIGNATURE;
-            PRESENT.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
-            yes
-        }
-    }
+/// Does a backend-installed sink answer behind the canonical port window?
+/// Pure probe — called once by `platform::probe`, never cached here.
+pub fn window_present(arch: &mut crate::TheArch) -> bool {
+    arch.inw(AUDIO_SIG) == SIGNATURE
 }
 
 /// Stream a block of source PCM `bytes` (`fmt`, `rate` Hz) to the canonical
-/// audio device, canonicalizing to i16 stereo on the way. A no-op when no
-/// device answers the signature probe (so the existing SB passthrough still
-/// owns sound on metal).
+/// audio output, canonicalizing to i16 stereo on the way. The sink is the
+/// boot-time platform decision; SbPassthrough never produces canonical PCM
+/// (the real card owns sound) and Silent drops it.
 pub fn play(arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
-    // A discovered hardware codec (metal AC'97) is the real output and takes
-    // precedence; otherwise fall back to the canonical audio device behind the
-    // port window (the interpreter's WAV sink, or nothing).
-    if crate::kernel::ac97::present() {
-        crate::kernel::ac97::play(arch, rate, fmt, bytes);
-        return;
-    }
-    if !device_present(arch) {
-        return;
+    use crate::kernel::platform::Audio;
+    match crate::kernel::platform::get().audio {
+        Audio::EmulatedAc97 => {
+            crate::kernel::ac97::play(arch, rate, fmt, bytes);
+            return;
+        }
+        Audio::EmulatedPortWindow => {}
+        Audio::SbPassthrough | Audio::EmulatedSilent => return,
     }
     if LAST_RATE.swap(rate, Ordering::Relaxed) != rate {
         arch.outw(AUDIO_SIG, rate as u16);

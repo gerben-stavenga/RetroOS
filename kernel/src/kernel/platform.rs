@@ -10,11 +10,13 @@
 //! site at compile time — deliberately.
 
 use crate::println;
+use arch_abi::Arch;
 
 pub struct Platform {
     pub host: Host,
     pub display: Display,
     pub firmware: Firmware,
+    pub audio: Audio,
     pub debug: DebugSink,
 }
 
@@ -59,6 +61,34 @@ pub enum Firmware {
     Substitute,
 }
 
+/// The audio path — exactly one of these is true, decided here. Replaces
+/// three lazy probes: vsb's `ensure_mode` (SB card), ac97's PRESENT atomic,
+/// and sound's port-window signature cache.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Audio {
+    /// A real Sound Blaster answered the DSP-status probe (legacy metal,
+    /// QEMU `sb16`): guest DSP/mixer traffic forwards to the card and only
+    /// the 8237 stays virtual. Implies a real OPL — the 0x388 window is
+    /// part of the DOS io_policy template, not a runtime grant.
+    SbPassthrough,
+    /// No card; the software SB16 renders through the kernel sound API into
+    /// the AC'97 codec found on PCI (UEFI-class metal).
+    EmulatedAc97,
+    /// No card or codec; rendering goes to the canonical audio port window
+    /// (the interpreter's WAV sink answered the signature probe).
+    EmulatedPortWindow,
+    /// Nothing answers. Emulation still satisfies device detection (games
+    /// configure and run); playback is dropped.
+    EmulatedSilent,
+}
+
+impl Audio {
+    /// Guest SB programming reaches a real card (vs the software DSP).
+    pub fn sb_passthrough(self) -> bool {
+        matches!(self, Audio::SbPassthrough)
+    }
+}
+
 /// Where dbg_println bytes go. Installed by the backend long before startup
 /// (boot prints need it); recorded here so policy can reason about it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,7 +113,9 @@ static mut PLATFORM: Option<Platform> = None;
 /// Probe the machine and freeze the result. Called exactly once, early in
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
-pub fn probe(boot: &crate::BootConfig) -> &'static Platform {
+pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static Platform {
+    let audio = probe_audio(machine);
+
     // Metal: ask the hardware. Hosted: the answers are properties of the
     // backend itself — the interp port bus has no VGA device and its zeroed
     // guest RAM never contains a ROM — and its guest address space doesn't
@@ -114,6 +146,7 @@ pub fn probe(boot: &crate::BootConfig) -> &'static Platform {
             host: if boot.is_qemu { Host::Qemu } else { Host::Metal },
             display,
             firmware,
+            audio,
             debug: DebugSink::Debugcon,
         }
     };
@@ -129,6 +162,7 @@ pub fn probe(boot: &crate::BootConfig) -> &'static Platform {
                 Display::Headless
             },
             firmware: Firmware::Substitute,
+            audio,
             debug: DebugSink::HostStdout,
         }
     };
@@ -138,8 +172,8 @@ pub fn probe(boot: &crate::BootConfig) -> &'static Platform {
     }
     let p = get();
     println!(
-        "Platform: host={:?} display={:?} firmware={:?} debug={:?}",
-        p.host, p.display, p.firmware, p.debug
+        "Platform: host={:?} display={:?} firmware={:?} audio={:?} debug={:?}",
+        p.host, p.display, p.firmware, p.audio, p.debug
     );
     p
 }
@@ -154,6 +188,27 @@ pub fn get() -> &'static Platform {
             .as_ref()
             .expect("platform::get before platform::probe")
     }
+}
+
+/// The audio probe is uniform across backends: an absent ISA device reads
+/// 0xFF (so no-SB is the same answer on the interpreter's port bus and on
+/// card-less metal), PCI config reads are 0xFFFFFFFF where there is no PCI,
+/// and the canonical port window answers its signature only where a backend
+/// installed a sink. Card presence is machine-wide, so the probe uses the
+/// canonical SB base 0x220 (a per-thread BLASTER override relocates the
+/// guest-visible base, not the card).
+fn probe_audio(machine: &mut crate::TheArch) -> Audio {
+    let sb_absent = machine.inb(0x22C) == 0xFF && machine.inb(0x22E) == 0xFF;
+    if !sb_absent {
+        return Audio::SbPassthrough;
+    }
+    if crate::kernel::ac97::scan(machine).is_some() {
+        return Audio::EmulatedAc97;
+    }
+    if crate::kernel::sound::window_present(machine) {
+        return Audio::EmulatedPortWindow;
+    }
+    Audio::EmulatedSilent
 }
 
 /// Is a real VGA card on the bus? Write the SEQ index register and read it

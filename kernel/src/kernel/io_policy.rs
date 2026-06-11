@@ -15,32 +15,14 @@
 //!     not an emulation request (the personality dispatcher exits the
 //!     process on `KE::In`/`KE::Out`).
 //!
-//! Grants (e.g. the OPL window once SB passthrough engages) are dynamic but
-//! few; they apply to every DOS thread — background music keeps playing,
-//! the display does not follow.
+//! Everything is derived — there is no runtime grant table. The OPL window
+//! rides with `platform::Audio::SbPassthrough` for every DOS thread:
+//! background FM music keeps playing; the display does not follow focus,
+//! audio does not follow it either.
 
 use crate::kernel::platform;
 use crate::kernel::thread::Personality;
 use arch_abi::Arch;
-
-/// Dynamically granted DOS port windows (device passthrough). Fixed table:
-/// grants are rare (OPL today, maybe SB DSP/mixer later).
-static mut GRANTS: [(u16, u16); 4] = [(0, 0); 4];
-
-/// Grant a port window to the DOS personality (all DOS threads) and open it
-/// in the live bitmap immediately — grants happen while emulating a DOS
-/// port access, so the running thread is necessarily DOS.
-pub fn grant_dos_ports(machine: &mut crate::TheArch, port: u16, count: u16) {
-    unsafe {
-        let g = &mut *(&raw mut GRANTS);
-        if let Some(slot) = g.iter_mut().find(|s| **s == (0, 0) || **s == (port, count)) {
-            *slot = (port, count);
-        } else {
-            panic!("io_policy: grant table full");
-        }
-    }
-    machine.allow_io_ports(port, count as usize);
-}
 
 /// Rebuild the live I/O bitmap for a thread taking the CPU: deny-all
 /// baseline, then exactly what its personality + focus state allow. Called
@@ -53,12 +35,11 @@ pub fn apply(machine: &mut crate::TheArch, personality: &Personality, focused: b
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
             }
-            unsafe {
-                for &(p, c) in (&*(&raw const GRANTS)).iter() {
-                    if c != 0 {
-                        machine.allow_io_ports(p, c as usize);
-                    }
-                }
+            // A real SB implies a real OPL: FM music writes (frequent) go
+            // straight to the card; emulated stays trapped so `emu_*`
+            // answers FM detection.
+            if platform::get().audio.sb_passthrough() {
+                machine.allow_io_ports(0x388, 2);
             }
         }
         // Linux: no ports. The deny-all baseline stands.

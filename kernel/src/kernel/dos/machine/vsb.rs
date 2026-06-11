@@ -3,7 +3,7 @@
 //! The SB is the one DOS sound device RetroOS virtualizes. It *uses* an ISA DMA
 //! channel — the generic [`Dma8237`](super::vdma::Dma8237) shadow in `vdma.rs`,
 //! exactly as a real SB card uses an 8237 channel — and runs in one of two
-//! modes (`SbMode`, chosen once by probing for a real card):
+//! modes (passthrough vs emulated, the boot-time `platform::Audio` verdict):
 //!
 //!  - **Passthrough** — a real card answers (QEMU `sb16`/`adlib` on metal): DSP
 //!    traffic forwards to it, and the guest's DMA buffer is remapped contiguous
@@ -23,18 +23,8 @@ use super::*;
 /// the arch-boundary rule (small primitives are copied, not cross-called).
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
-/// How the SB DSP/mixer/OPL block is serviced, decided once by probing for a
-/// real card (`ensure_mode`):
-///  - `Passthrough` — a real card answers (QEMU `sb16`/`adlib` on metal); DSP
-///    traffic forwards to it and the virtual 8237 remaps onto the real chip.
-///  - `Emulated` — no card answers (the hosted interpreter, or metal hardware
-///    with no SB16); a software DSP+DMA engine synthesizes playback from the
-///    guest's DMA buffer into the kernel `sound` API. **No** real-card pokes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SbMode { Unknown, Passthrough, Emulated }
-
 /// Software DSP/DMA playback engine — populated and driven only in
-/// `SbMode::Emulated`. Turns the guest's DSP command stream + virtual-8237
+/// software-emulated mode. Turns the guest's DSP command stream + virtual-8237
 /// buffer programming into canonical PCM (`sound::play`), paced by virtual time,
 /// raising the SB IRQ once per completed DMA block exactly like the real card's
 /// terminal count. See [`SoundBlaster::audio_tick`].
@@ -134,9 +124,7 @@ impl EmuDsp {
 /// the generic virtual 8237 it drives, and either the passthrough remap binding
 /// or the software DSP/DMA engine depending on `mode`.
 pub struct SoundBlaster {
-    /// Passthrough vs software emulation, decided once by `ensure_mode`.
-    mode: SbMode,
-    /// The software DSP/DMA engine (used only in `SbMode::Emulated`).
+    /// The software DSP/DMA engine (used only when emulating).
     emu: EmuDsp,
     pub io_base: u16, // BLASTER A — DSP/mixer port base (passthrough target)
     pub irq: u8,      // BLASTER I — guest vPIC IRQ to inject on SB completion
@@ -177,7 +165,6 @@ impl SoundBlaster {
     /// intentionally decoupled). Overridden by the guest's `BLASTER=` env.
     pub fn new() -> Self {
         Self {
-            mode: SbMode::Unknown,
             emu: EmuDsp::new(),
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
@@ -196,7 +183,7 @@ impl SoundBlaster {
 
     /// Whether the SB is serviced by the software emulation (no real card).
     pub fn is_emulated(&self) -> bool {
-        self.mode == SbMode::Emulated
+        self.emulated()
     }
 
     /// Whether virtual DMA channel `ch` is armed on the real chip.
@@ -214,7 +201,7 @@ impl SoundBlaster {
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
     pub fn release_dma_pool(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
-        if self.mode == SbMode::Emulated {
+        if self.emulated() {
             // No real card / no buffer alias in emulation: just stop the
             // software DSP so the next program sees a clean, idle card.
             self.emu.playing = false;
@@ -249,8 +236,7 @@ impl SoundBlaster {
     /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
     /// sb16 does not appear to surface that response through passthrough.
     pub fn sb_read(&mut self, machine: &mut crate::TheArch, p: u16) -> u8 {
-        self.ensure_mode(machine);
-        if self.mode == SbMode::Emulated {
+        if self.emulated() {
             return self.emu_read(p);
         }
         if p == self.io_base + 0x0A {
@@ -266,8 +252,7 @@ impl SoundBlaster {
     /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
     /// locally; all other traffic continues to the real QEMU sb16/adlib.
     pub fn sb_write(&mut self, machine: &mut crate::TheArch, p: u16, val: u8) {
-        self.ensure_mode(machine);
-        if self.mode == SbMode::Emulated {
+        if self.emulated() {
             self.emu_write(p, val);
             return;
         }
@@ -324,7 +309,7 @@ impl SoundBlaster {
 
         // Emulated card: the live current-count comes from the software DSP's
         // play cursor (there is no real 8257 to interrogate).
-        if self.mode == SbMode::Emulated {
+        if self.emulated() {
             return self.emu_dma_read(is_cnt, chan, hi_ctrl);
         }
 
@@ -372,8 +357,7 @@ impl SoundBlaster {
     /// permanent host buffer and program the real 8237. A no-op until the
     /// guest finishes a count write (the per-block re-arm signal).
     pub fn maybe_remap(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
-        self.ensure_mode(machine);
-        if self.mode == SbMode::Emulated {
+        if self.emulated() {
             // No real chip to program / no buffer to alias: the virtual-8237
             // `prog` is already captured (io_write), and the software DSP reads
             // the guest buffer directly at playback. Nothing to remap.
@@ -504,7 +488,7 @@ impl SoundBlaster {
     /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
     /// replays it. Must run with this task's address space active.
     pub fn sb_suspend(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
-        if self.mode == SbMode::Emulated { return; } // no real chip / alias to detach
+        if self.emulated() { return; } // no real chip / alias to detach
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
         self.unbind(machine, regs);
@@ -516,7 +500,7 @@ impl SoundBlaster {
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
     pub fn sb_resume(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
-        if self.mode == SbMode::Emulated { return; }
+        if self.emulated() { return; }
         if !self.suspended { return; }
         self.suspended = false;
         for chan in 0..8 {
@@ -548,7 +532,7 @@ impl SoundBlaster {
         }
     }
 
-    // ── Software DSP/DMA emulation (SbMode::Emulated) ───────────────────────
+    // ── Software DSP/DMA emulation (platform::Audio emulated paths) ─────────
     //
     // Active only when no real card answers. The guest drives the standard SB16
     // DSP register file (reset, version, set-rate, auto-init playback); we run
@@ -557,25 +541,12 @@ impl SoundBlaster {
     // per block. The virtual 8237 (`self.dma`) already captured the buffer
     // programming, so playback needs no real-chip interaction at all.
 
-    /// Decide passthrough vs emulation by probing for a real card, once. An
-    /// *absent* ISA device floats both the DSP write- and read-status ports to
-    /// 0xFF (the no-device convention, `feedback_no_fake_hardware`); a real SB16
-    /// never reads 0xFF on both. On metal+QEMU the card answers → passthrough;
-    /// on the hosted interpreter (no `sb16`) → emulation.
-    fn ensure_mode(&mut self, machine: &mut crate::TheArch) {
-        if self.mode != SbMode::Unknown {
-            return;
-        }
-        let absent = machine.inb(self.io_base + 0x0C) == 0xFF
-            && machine.inb(self.io_base + 0x0E) == 0xFF;
-        self.mode = if absent { SbMode::Emulated } else { SbMode::Passthrough };
-        if self.mode == SbMode::Passthrough {
-            // A real card is present, so a real OPL is too: stop trapping the
-            // AdLib ports and let the guest's (frequent) FM music writes hit the
-            // hardware directly. In emulation they stay trapped → `emu_*` answers
-            // FM detection. (No-op on the interpreter, which interprets all I/O.)
-            crate::kernel::io_policy::grant_dos_ports(machine, 0x388, 2);
-        }
+    /// Software emulation vs real-card passthrough — the boot-time platform
+    /// probe's verdict (`platform::Audio`), not probed here. The OPL window
+    /// for passthrough is part of the DOS io_policy template for the same
+    /// reason: derived, not granted at runtime.
+    fn emulated(&self) -> bool {
+        !crate::kernel::platform::get().audio.sb_passthrough()
     }
 
     /// Emulated DSP/mixer port read.
@@ -765,7 +736,7 @@ impl SoundBlaster {
         regs: &mut Vcpu,
         vpic: &mut super::vpic::VirtualPic,
     ) {
-        if self.mode != SbMode::Emulated {
+        if !self.emulated() {
             return;
         }
         if !self.emu.playing {
