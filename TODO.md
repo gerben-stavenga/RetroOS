@@ -87,10 +87,11 @@ hostfs, the cmdline/DN dispatch, the boot self-build — in one long function.
       transport feed the verdict; the payload IS the mount plan).
       DOSBox-style works: `retroos-host --host DIR --cmd "X.COM …"` boots
       imageless with the host directory as the root drive.
-- [ ] **Embed the bootfs in retroos-host too.** It's a kernel_elf link
-      artifact, so imageless hosted has no /boot — DN/COMMAND.COM
-      out-of-the-box under HostRoot needs the bootfs tar included in the
-      hosted binary (rustc_env + include_bytes via Bazel, or equivalent).
+- [x] **Bootfs embedded in retroos-host** (same objcopy-symbols mechanism
+      as the metal kernel; retroos-host-bare twin for the TCC genrules
+      breaks the COMMAND.COM cycle; retro_platform.bzl transition pins the
+      bootfs subtree to the canonical platform). /boot is an invariant —
+      `retroos-host --host DIR` boots DN from a bare folder.
 - [ ] **Honest hostfs probe.** `hostfs::init` answers "a COM1 UART
       exists" — true on Bochs/QEMU with nothing behind it (now visible as
       `hostfs: true` in the typed verdict; /host is dead there, as it
