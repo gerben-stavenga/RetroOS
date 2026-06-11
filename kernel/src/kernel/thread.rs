@@ -141,6 +141,51 @@ impl Personality {
             Self::Linux(l) => l.on_resume(machine),
         }
     }
+
+    /// Per-iteration slice work BEFORE input routing: advance the thread's
+    /// virtual time (DOS: PIT ticks, display render cadence, emulated-SB
+    /// playback). Linux threads have no virtual devices to advance.
+    pub fn on_slice(&mut self, machine: &mut crate::TheArch, regs: &mut crate::arch::Vcpu) {
+        match self {
+            Self::Dos(dos) => {
+                use arch_abi::Arch;
+                let ticks = machine.take_pending_ticks();
+                for _ in 0..ticks {
+                    crate::kernel::dos::queue_tick(machine, dos);
+                }
+                if ticks > 0 {
+                    crate::kernel::dos::display_tick(dos, regs, ticks);
+                }
+                // Pump emulated-SB playback against the same virtual clock.
+                crate::kernel::dos::audio_tick(machine, dos, regs);
+            }
+            Self::Linux(_) => {}
+        }
+    }
+
+    /// Per-iteration slice work AFTER input routing: deliver queued IRQs to
+    /// a runnable DOS guest; complete a blocked Linux thread's pending pipe
+    /// read / poll (which may make it Ready again).
+    pub fn after_input(
+        &mut self,
+        machine: &mut crate::TheArch,
+        kt: &mut KernelThread,
+        regs: &mut crate::arch::Vcpu,
+    ) {
+        let blocked = kt.state == ThreadState::Blocked;
+        match self {
+            Self::Dos(dos) => {
+                if !blocked {
+                    crate::kernel::dos::raise_pending(machine, dos, regs);
+                }
+            }
+            Self::Linux(linux) => {
+                if blocked {
+                    crate::kernel::linux::complete_pending_io(kt, linux, regs);
+                }
+            }
+        }
+    }
 }
 
 /// Backward compat alias

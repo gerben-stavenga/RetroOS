@@ -289,57 +289,22 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         crate::kernel::stacktrace::set_debug_tid(ctx.tid);
         let regs = &mut ctx.vcpu;
 
-        // Phase 1: drain hardware events into the running thread's personality,
-        // then try to satisfy any pending pipe read.
+        // Phase 1: advance the thread's virtual time, route console input,
+        // then deliver/complete what the input made possible.
         {
             let thread = thread::get_thread(ctx.tid).expect("Invalid thread in event loop");
             let kt = &mut thread.kernel;
+            thread.personality.on_slice(machine, regs);
             match &mut thread.personality {
                 thread::Personality::Dos(dos) => {
-                    let is_blocked = kt.state == thread::ThreadState::Blocked;
-                    let ticks = machine.take_pending_ticks();
-                    for _ in 0..ticks {
-                        crate::kernel::dos::queue_tick(machine, dos);
-                    }
-                    if ticks > 0 {
-                        crate::kernel::dos::display_tick(dos, regs, ticks);
-                    }
-                    // Pump emulated-SB playback against the same virtual clock.
-                    crate::kernel::dos::audio_tick(machine, dos, regs);
-                    crate::kernel::console::drain_dos(machine, regs, is_blocked, dos);
-                    if !is_blocked {
-                        crate::kernel::dos::raise_pending(machine, dos, regs);
-                    }
+                    let blocked = kt.state == thread::ThreadState::Blocked;
+                    crate::kernel::console::drain_dos(machine, regs, blocked, dos);
                 }
                 thread::Personality::Linux(linux) => {
                     crate::kernel::console::drain_linux(machine, regs, kt, linux);
                 }
             }
-
-            if kt.state == thread::ThreadState::Blocked {
-                if let thread::Personality::Linux(ref mut linux) = thread.personality {
-                    if let Some(ref pr) = linux.pending_read {
-                        if let thread::FdKind::PipeRead(idx) = pr.fd_kind {
-                            let user_buf = unsafe {
-                                core::slice::from_raw_parts_mut(pr.buf_ptr as *mut u8, pr.buf_len)
-                            };
-                            let n = crate::kernel::kpipe::read(idx, user_buf);
-                            if n > 0 {
-                                regs.rax = n as u64;
-                                linux.pending_read = None;
-                                kt.state = thread::ThreadState::Ready;
-                            }
-                        }
-                    } else if let Some(ref pp) = linux.pending_poll {
-                        let ready = crate::kernel::linux::run_poll(kt, pp.fds_ptr, pp.nfds);
-                        if ready > 0 {
-                            regs.rax = ready as u64;
-                            linux.pending_poll = None;
-                            kt.state = thread::ThreadState::Ready;
-                        }
-                    }
-                }
-            }
+            thread.personality.after_input(machine, kt, regs);
         }
 
         // Phase 2: if still parked, honour F11 (cycle focus) or spin. The

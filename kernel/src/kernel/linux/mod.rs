@@ -259,6 +259,36 @@ pub fn handle_event(
     }
 }
 
+/// Complete a blocked thread's pending pipe read or poll, making it Ready
+/// when data arrived. Called from the event loop slice (the thread is not
+/// running; `regs` is its live frame).
+pub fn complete_pending_io(
+    kt: &mut thread::KernelThread,
+    linux: &mut LinuxState,
+    regs: &mut Regs,
+) {
+    if let Some(ref pr) = linux.pending_read {
+        if let thread::FdKind::PipeRead(idx) = pr.fd_kind {
+            let user_buf = unsafe {
+                core::slice::from_raw_parts_mut(pr.buf_ptr as *mut u8, pr.buf_len)
+            };
+            let n = crate::kernel::kpipe::read(idx, user_buf);
+            if n > 0 {
+                regs.rax = n as u64;
+                linux.pending_read = None;
+                kt.state = thread::ThreadState::Ready;
+            }
+        }
+    } else if let Some(ref pp) = linux.pending_poll {
+        let ready = run_poll(kt, pp.fds_ptr, pp.nfds);
+        if ready > 0 {
+            regs.rax = ready as u64;
+            linux.pending_poll = None;
+            kt.state = thread::ThreadState::Ready;
+        }
+    }
+}
+
 /// Dispatch returning KernelAction.
 pub fn dispatch_action(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, regs: &mut Regs) -> thread::KernelAction {
     let args = extract_args(regs);
