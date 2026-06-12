@@ -285,7 +285,10 @@ screen capture. Harness limits: no mouse, blind pokes, no eyes on frames.
   (behavior changed; needs eyes). Next: rerun with high-cadence screen
   capture to read the exit messages, then fix by error class.
 - **Class C — runs; needs interactive/visual verification:**
-  raptor (WAS the named DPMI crash — now RUNS ✦ big mover), settlers
+  raptor (WAS the named DPMI crash — now EXECUTES without crashing, but
+  publishes ZERO graphics frames across 60s+ of key-driving while
+  monkey2/skyroads render fine through the same pipeline → likely the
+  planar/ModeX VRAM-trapping gap, reinforcing parity item #1), settlers
   (launches; the mouse-click #GP needs mouse injection to retest),
   goldenaxe (key coverage), extr-pinball (keypress-panic NOT reproduced
   under pokes — possibly fixed), indy4-atlantis (alive in graphics;
