@@ -313,9 +313,14 @@ Known gaps, roughly by leverage:
       we dispatched the #GP to the client's exception handler instead.
       DOS/4GW's IRQ epilogue STIs on every timer tick, so the first
       delivery after sound init cascaded (client #GP handler -> INT FC
-      -> crossed HC unwind -> wild fetch at (0xEA00<<16)|0x51D5). Metal
-      dodges via the IOPL=3 leak — root-fix that leak and metal rides
-      this same path. Raptor now RENDERS GRAPHICS on the interp; duke3d
+      -> crossed HC unwind -> wild fetch at (0xEA00<<16)|0x51D5). Pure
+      backend parity gap: metal's #GP runs the sensitive-instruction
+      monitor first (arch-metal monitor.rs emulates CLI/STI below the
+      arch boundary — NOT related to the old IOPL=3 leak), while the
+      interp's PM path had no monitor pass; the kernel arm now covers
+      it. Follow-up worth checking: does the interp have metal's
+      TF-step tracking for PM POPF/IRET silent IF-drops? If not, that
+      may BE the "virtual IF stuck at 0" item below. Raptor now RENDERS GRAPHICS on the interp; duke3d
       1.3d shareware runs through DOS/4GW 1.97 init (silent exit left =
       synthetic DUKE3D.CFG values, run real SETUP.EXE). Bonus fixes en
       route: interp CPL-0 iretd trampoline made atomic (slice ending

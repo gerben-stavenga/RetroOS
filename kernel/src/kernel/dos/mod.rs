@@ -492,8 +492,12 @@ pub fn handle_event(
             // DOS/4GW's IRQ epilogue executes STI on every timer tick
             // (duke3d/raptor at sound init, handler code 0117:06FC);
             // dispatching that #GP to the client cascaded into a wild jump.
-            // Metal currently dodges this via the IOPL=3 leak (see TODO);
-            // this path serves both backends once IOPL is pinned properly.
+            // On metal this arm is unreachable: the arch #GP path runs the
+            // sensitive-instruction monitor first (arch-metal monitor.rs),
+            // which emulates CLI/STI below the arch boundary. The interp
+            // has no monitor pass on its PM path, so the kernel covers it
+            // here — in PM only CLI/STI fault this way (POPF/IRET silently
+            // drop IF instead; that's the TF-step machinery's job).
             if n == 13 && !is_vm86 && dos.dpmi.is_some() {
                 let lin = mode_transitions::seg_base(&dos.ldt[..], regs.code_seg())
                     .wrapping_add(regs.ip32());
