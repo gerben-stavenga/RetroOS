@@ -178,6 +178,35 @@ pub fn classify(bda_mode: u8, r: &Regs) -> Option<VgaMode> {
     Some(VgaMode::Planar16 { w, h, row_bytes })
 }
 
+/// Chain-4 deinterleave: spread a linear 64K "chained view" (mode 13h, where
+/// the CPU sees byte `n` as pixel `n`) into the 4 planes the way real VGA
+/// chain-4 hardware does — byte `n` lives in plane `n & 3` at offset `n >> 2`.
+/// Called on a chain→unchain hop so pixels drawn in mode 13h survive into a
+/// Mode X view (and on a real-card capture, to normalise either representation
+/// into the planes the renderer reads). `chained` is 64K; `planes` is 4×64K
+/// plane-major.
+pub fn chain4_split(chained: &[u8], planes: &mut [u8]) {
+    let n = chained.len().min(0x10000);
+    for i in 0..n {
+        let plane = i & 3;
+        let off = i >> 2;
+        if plane * 0x10000 + off < planes.len() {
+            planes[plane * 0x10000 + off] = chained[i];
+        }
+    }
+}
+
+/// Chain-4 interleave: the inverse of [`chain4_split`] — gather the 4 planes
+/// back into the linear chained view on an unchain→chain hop.
+pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
+    let n = chained.len().min(0x10000);
+    for i in 0..n {
+        let plane = i & 3;
+        let off = i >> 2;
+        chained[i] = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
+    }
+}
+
 /// Map a BIOS mode number (BDA 0x449) to a renderable mode with that mode's
 /// standard geometry. The fallback when the GC isn't programmed (emulated
 /// BIOS); also the source of the standard `row_bytes` for the planar modes.
@@ -541,6 +570,23 @@ mod tests {
         render(&frame, &mut out);
         assert_eq!(out[0], pal_rgb(&pal, 5)); // colour index 5
         assert_eq!(out[1], pal_rgb(&pal, 0)); // background
+    }
+
+    #[test]
+    fn chain4_roundtrips() {
+        let mut chained = vec![0u8; 0x10000];
+        for i in 0..64000 { chained[i] = (i % 251) as u8; }
+        let mut planes = vec![0u8; 4 * 0x10000];
+        chain4_split(&chained, &mut planes);
+        // Byte n must land in plane n&3 at n>>2.
+        assert_eq!(planes[0 * 0x10000 + 0], chained[0]);
+        assert_eq!(planes[1 * 0x10000 + 0], chained[1]);
+        assert_eq!(planes[2 * 0x10000 + 0], chained[2]);
+        assert_eq!(planes[3 * 0x10000 + 0], chained[3]);
+        assert_eq!(planes[0 * 0x10000 + 1], chained[4]);
+        let mut back = vec![0u8; 0x10000];
+        chain4_merge(&planes, &mut back);
+        assert_eq!(&back[..64000], &chained[..64000]);
     }
 
     #[test]
