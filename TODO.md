@@ -355,6 +355,27 @@ Known gaps, roughly by leverage:
 - [ ] COW fork (interp fork is a full copy — "M4"); fine for correctness,
       costs ~6MB/launch of copying.
 
+## Interp MMU — kernel writes must not be bound by guest protections
+- [ ] **Structural parity gap (class behind the fork_copy SEGV, ec48a4d):**
+      on metal the kernel writes user pages through its own ring-1 view,
+      where guest-RO doesn't bind it; on the interp, kernel-side writes
+      (arch::mem()/GuestBytes) go through the SAME host mapping that
+      enforces guest protections — any kernel write to a page already
+      protected RO segfaults the HOST. fork_copy was the first instance
+      (fixed in-place); the ELF loader survives only by write-then-protect
+      ordering convention. Fix the class below the arch boundary: give the
+      interp MMU a permanently-writable kernel alias of guest memory —
+      memfd_create + a second mmap of the same backing (mirrors metal's
+      kernel-view/user-view split exactly, and is the natural substrate
+      for interp CoW/M4 later: shared frames need refcounted backing
+      anyway). Note on unicorn API: uc_mem_write does bypass unicorn-level
+      page perms, but our guest protections live in the HOST mprotect
+      layer (mmu.rs), which unicorn cannot bypass either — so the fix is
+      in mmu.rs, not a unicorn call swap; unicorn keeps reading/executing
+      through the guest-view mapping unchanged. Then revisit fork_copy:
+      with a kernel alias the populate-then-protect ordering cannot be
+      wrong by construction.
+
 ## Linux-on-interp console (surfaced 2026-06-12 via shell.elf workflow)
 - [x] **FIXED (ec48a4d): busybox killed the whole host on its first
       command** — fork_copy committed child pages at final protection
