@@ -252,23 +252,38 @@ Known gaps, roughly by leverage:
       project_hosted_game_workflow): mode 13h works via direct writes +
       renderer; planar modes need the A0000 window trapped through the
       VgaState plane logic on the interp. Unlocks a whole class of games.
-- [ ] **Store-storm slowdown: big guest memory clears crawl ~100-1000x**
-      (diagnosed 2026-06-11 via raptor). Raptor's old "DPMI crash" is gone;
-      it now EXECUTES but its init wedges for minutes inside a single
-      emu_start: gdb shows the CPU thread looping in
-      `helper_le_stw_mmu → find_memory_mapping` — every 16-bit store of a
-      REP-STOSW-class clear takes unicorn's TLB-miss slow path. Prime
-      suspect: the MEM_UNMAPPED hook commits + `uc.mem_map_ptr`s one page
-      at a time (arch-interp cpu.rs), and each mem_map_ptr rebuilds the
-      flatview and flushes the TLB — so a multi-MB clear pays a full TLB
-      flush per fresh 4K page and re-misses every store after it. Because
-      interp rdtsc/get_ticks are VIRTUAL (instruction-anchored,
-      backend.rs), everything downstream starves in lockstep: zero [prof]
-      lines for 280s+, no ticks, no display_tick, blank screenshot — the
-      baseline "RUNS" verdict was a false positive (empty at= list). Not a
-      deadlock, not a VGA gap. Fix directions: map bigger spans per
-      unmapped-fault (e.g. the whole committed region), or pre-map DPMI
-      allocations at alloc time, so mem_map_ptr/TLB-flush is amortized.
+- [ ] **Stores have NO fast path in unicorn — store-heavy phases crawl
+      ~1000x** (root-caused 2026-06-11 via raptor, fork source verified).
+      "QEMU runs it fine, same interpreter" — true for the TCG core, false
+      for the memory subsystem. Unicorn deleted QEMU's dirty-memory
+      bitmap: `cpu_physical_memory_is_clean()` is stubbed to `return
+      true` (qemu/include/exec/ram_addr.h:70), so EVERY TLB fill marks
+      writable RAM `TLB_NOTDIRTY` and EVERY store takes
+      `helper_*_stw_mmu → notdirty_write` (cputlb.c:1189). In there, per
+      store: a flatview lookup (`uc->memory_mapping` =
+      address_space_translate), and — because our unmapped hook maps
+      pages `Prot::ALL` (cpu.rs:162) — `mr->perms & UC_PROT_EXEC` is
+      always true, so ALSO `page_collection_lock` +
+      `tb_invalidate_phys_page_fast` PER STORE. The escape hatch
+      (`tlb_set_dirty` at the end of notdirty_write) is disabled for us:
+      it's gated on `!uc_mem_hook_installed()` and our global 0..MAX
+      MEM_UNMAPPED hook makes that true for every address. QEMU proper:
+      one pre-mapped dirty RAMBlock, stores are inline TLB hits (~ns),
+      notdirty only for genuinely-clean/code pages and the first write
+      re-dirties. Our per-4K-page mem_map_ptr topology adds flatview
+      rebuild + full TLB flush per fresh page and thousands of regions to
+      search. Net: raptor's DOS/4GW init (tens of MB of clears/copies)
+      advanced ~0.3 VIRTUAL seconds in 5 wall minutes (rdtsc/ticks are
+      instruction-anchored) — zero prof lines, no display_tick, blank
+      screen; "RUNS" was a false positive. Store-light real-mode games
+      (skyroads, monkey2) tolerate it. Fix ladder (fork is ours, all in
+      scope): (1) map data pages W^X — drop EXEC from the unmapped-hook
+      mapping, promote to EXEC on fetch fault → kills the per-store
+      tb_invalidate/page-lock immediately; (2) chunk/eager-map regions
+      (e.g. 256KB spans) → cheap flatview lookups, no per-page
+      rebuild+flush; (3) fork patch: restore a real DIRTY_MEMORY_CODE
+      bitmap (or page-has-TBs test) so non-code stores regain the inline
+      fast path — true QEMU-parity fix.
 - [ ] **display_tick classifies mode from the BDA byte (0x449), not from
       VgaState registers** — ModeX games reprogram CRTC/sequencer directly
       and the BDA still says 0x13, so the renderer either rejects the mode
