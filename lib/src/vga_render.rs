@@ -75,6 +75,12 @@ pub struct Frame<'a> {
     /// TUIs (DN, NC) disable blink via INT 10h AX=1003 to get bright
     /// backgrounds; masking bit 7 away rendered DN's dark-grey panels black.
     pub blink: bool,
+    /// CRTC display Start Address as a per-plane byte offset — the planar/Mode-X
+    /// front buffer the program flipped to (registers 0x0C/0x0D). Page-flipping
+    /// games (Doom's Mode Y) draw an off-screen page then set this to display
+    /// it; rendering from 0 instead would show the back buffer mid-draw. 0 for
+    /// non-flipping modes.
+    pub start_offset: usize,
 }
 
 /// Output framebuffer dimensions for a mode. Text is 80×25 cells of 9×16 px
@@ -415,9 +421,10 @@ fn planar_rgb(frame: &Frame, val: u8) -> u32 {
 fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
+    let start = frame.start_offset;
     for y in 0..h {
         for x in 0..w {
-            let off = y * rb + x / 8;
+            let off = start + y * rb + x / 8;
             let bit = 7 - (x & 7);
             let mut val = 0u8;
             for p in 0..4 {
@@ -434,10 +441,11 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
 fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 4 } else { row_bytes };
+    let start = frame.start_offset;
     for y in 0..h {
         for x in 0..w {
             let plane = x & 3;
-            let off = y * rb + x / 4;
+            let off = start + y * rb + x / 4;
             let idx = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
             out[y * w + x] = pal_rgb(frame.palette, idx);
         }
@@ -564,7 +572,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -599,7 +607,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);

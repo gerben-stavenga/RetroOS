@@ -642,6 +642,13 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
         regs.copy_from(VRAM_WINDOW, &mut planes);
     }
+    // Display Start Address (CRTC 0x0C high, 0x0D low) selects the planar
+    // front buffer for page-flipping games; only meaningful in planar modes.
+    let start_offset = match mode {
+        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } =>
+            ((pc.vga.crtc[0x0C] as usize) << 8) | pc.vga.crtc[0x0D] as usize,
+        _ => 0,
+    };
     let frame = Frame {
         mode,
         vram: &vram,
@@ -650,6 +657,7 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         palette: &pc.vga.dac,
         font: &lib::vga_font_8x16::FONT_8X16,
         blink: pc.vga.ac[0x10] & 0x08 != 0,
+        start_offset,
     };
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);
