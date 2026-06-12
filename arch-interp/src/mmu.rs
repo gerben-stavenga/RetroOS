@@ -357,13 +357,21 @@ pub fn fork_copy(src: u32) -> u32 {
         for (vpage, writable) in present {
             let sbase = s.spaces[&src].base;
             let dspace = s.spaces.get_mut(&dst).unwrap();
-            dspace.commit(vpage, writable);
+            // Commit writable for the copy itself — a read-only page (ELF
+            // .text) committed with its final protection SEGVs the host on
+            // the memcpy below (first hit: busybox fork, whose text pages
+            // are the first read-only pages ever forked here). Drop to the
+            // real protection after the bytes are in.
+            dspace.commit(vpage, true);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     sbase.add(vpage * PAGE),
                     dspace.page_ptr(vpage),
                     PAGE,
                 );
+            }
+            if !writable {
+                dspace.commit(vpage, false);
             }
         }
     });
