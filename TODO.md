@@ -355,6 +355,25 @@ Known gaps, roughly by leverage:
 - [ ] COW fork (interp fork is a full copy — "M4"); fine for correctness,
       costs ~6MB/launch of copying.
 
+## Linux-on-interp console (surfaced 2026-06-12 via shell.elf workflow)
+- [x] **FIXED (ec48a4d): busybox killed the whole host on its first
+      command** — fork_copy committed child pages at final protection
+      before the memcpy, so the first read-only page (ELF .text) made the
+      copy write to PROT_READ and SIGSEGV'd retroos-host. First-ever fork
+      of a read-only page on the interp.
+- [ ] **Linux console output bypasses the window.** On the emulated
+      display (play/UEFI), Linux stdout goes to host stdout — running
+      shell.elf from DN in the play window leaves the window frozen on
+      DN's screen while busybox lives in the launching terminal. The
+      single-VGA design wants Linux console writes rendered through
+      vga::vga() text console -> display_tick -> present sink, same as
+      metal-with-card renders them through the real text page. Same work
+      item as de-cfg'ing linux/mod.rs save/restore_console_vga (stale
+      "interp has no VGA" comment; emulated path should snapshot/restore
+      the model instead of ports). Cosmetics in the same area: busybox
+      'can't access tty; job control off', and ash's ESC[6n cursor query
+      is never answered.
+
 # DOS Game Compatibility — Bug Sprint
 
 ## Re-baseline 2026-06-11 (headless harness, current master)
