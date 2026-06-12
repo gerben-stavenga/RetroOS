@@ -101,10 +101,56 @@ pub fn bootfs() -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(start as *const u8, end - start) })
 }
 
+/// Cargo build of the hosted binaries: no linked TAR bytes. The std
+/// front-ends (retroos-play, cargo retroos-host) read the Bazel-built
+/// `//:bootfs_tar` at startup and hand it over here before boot — refusing
+/// to run without it, so /boot is the same invariant as everywhere else.
+#[cfg(all(feature = "hosted", not(bootfs_embedded)))]
+#[allow(unexpected_cfgs)]
+mod external_bootfs {
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    static PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+    static LEN: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn set(bytes: &'static [u8]) {
+        LEN.store(bytes.len(), Ordering::Relaxed);
+        PTR.store(bytes.as_ptr() as *mut u8, Ordering::Release);
+    }
+
+    pub fn get() -> Option<&'static [u8]> {
+        let ptr = PTR.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { core::slice::from_raw_parts(ptr, LEN.load(Ordering::Relaxed)) })
+    }
+}
+
 #[cfg(all(feature = "hosted", not(bootfs_embedded)))]
 #[allow(unexpected_cfgs)]
 pub fn bootfs() -> Option<&'static [u8]> {
-    None
+    external_bootfs::get()
+}
+
+/// Install the runtime-loaded bootfs TAR (cargo hosted builds only; the
+/// embedded-bootfs builds ignore it — the linked bytes are the truth).
+#[cfg(all(feature = "hosted", not(bootfs_embedded)))]
+#[allow(unexpected_cfgs)]
+pub fn set_bootfs(bytes: &'static [u8]) {
+    external_bootfs::set(bytes);
+}
+
+#[cfg(any(not(feature = "hosted"), bootfs_embedded))]
+#[allow(unexpected_cfgs)]
+pub fn set_bootfs(_bytes: &'static [u8]) {}
+
+/// Whether this build links the bootfs bytes (Bazel; the bare build tool's
+/// intentionally-empty TAR counts — it must NOT runtime-load one). The std
+/// front-end mains consult this: only the pure-cargo builds load the TAR
+/// from disk at startup.
+#[allow(unexpected_cfgs)]
+pub fn bootfs_is_embedded() -> bool {
+    cfg!(any(not(feature = "hosted"), bootfs_embedded))
 }
 
 // The multiboot info structs + the metal scratch/zero page frames moved into

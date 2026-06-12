@@ -73,6 +73,9 @@ if [ -n "$TERMINAL" ]; then
 fi
 
 # Window mode: retroos-play stays cargo-built (it owns the SDL dependency).
+# The cargo build has no embedded bootfs; it loads bazel-bin/bootfs_tar.tar
+# at startup (and refuses to run without it), so make sure it's built.
+bazelisk build //:bootfs_tar
 [ -n "$WAV" ] && ARGS+=(--wav "$WAV")
 if [ -n "$CMD" ]; then
     ARGS+=(--cwd "$(dirname "$CMD")/")

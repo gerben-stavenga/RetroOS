@@ -50,6 +50,19 @@ fn main() {
 
     kernel::vga::set_debug_sink(log_byte);
 
+    // Cargo builds carry no embedded bootfs (Bazel links those bytes into
+    // kernel.elf / retroos-host); /boot is an invariant, so load the same
+    // Bazel-built TAR at runtime. Not optional: refuse to boot without it.
+    match std::fs::read("bazel-bin/bootfs_tar.tar") {
+        Ok(b) => kernel::set_bootfs(Box::leak(b.into_boxed_slice())),
+        Err(e) => {
+            eprintln!("retroos-play: bazel-bin/bootfs_tar.tar: {e}");
+            eprintln!("the bootfs (DN + COMMAND.COM) is required; build it with:");
+            eprintln!("    bazelisk build //:bootfs_tar");
+            std::process::exit(1);
+        }
+    }
+
     // CPU/kernel worker: interpreter state is thread-local, so the platform is
     // composed here, on the thread that will run it.
     std::thread::spawn(move || {

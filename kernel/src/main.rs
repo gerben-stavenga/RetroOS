@@ -34,6 +34,23 @@ fn host_log_byte(b: u8) {
 }
 
 fn main() {
+    // Cargo builds carry no embedded bootfs (Bazel links those bytes into
+    // the Bazel retroos-host); /boot is an invariant, so load the same
+    // Bazel-built TAR at runtime. Not optional: refuse to boot without it.
+    // (Bazel builds — including the bare in-OS build tool, whose empty TAR
+    // is intentional — skip this; the linked bytes are the truth.)
+    if !kernel::bootfs_is_embedded() {
+        match std::fs::read("bazel-bin/bootfs_tar.tar") {
+            Ok(b) => kernel::set_bootfs(Box::leak(b.into_boxed_slice())),
+            Err(e) => {
+                eprintln!("retroos-host: bazel-bin/bootfs_tar.tar: {e}");
+                eprintln!("the bootfs (DN + COMMAND.COM) is required; build it with:");
+                eprintln!("    bazelisk build //:bootfs_tar");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut host_dir: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
