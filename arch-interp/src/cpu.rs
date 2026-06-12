@@ -243,7 +243,25 @@ pub fn execute() -> KernelEvent {
                 mode, regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
                 regs.ds as u16, regs.frame.rflags);
         }
-        let run = uc.emu_start(begin, 0xFFFF_FFFF, 0, SLICE);
+        let mut run = uc.emu_start(begin, 0xFFFF_FFFF, 0, SLICE);
+        // The CPL-0 `iretd` trampoline (configure_pm) is kernel-internal: if
+        // the slice budget expired with EIP still inside the scratch window
+        // (the count hook counts the trampoline too — ~1 in SLICE switches),
+        // ring-0 mid-switch state must NOT surface as user regs. The kernel
+        // would deliver IRQs onto it and corrupt the client (duke3d/raptor
+        // DOS/4GW wild-jump SEGVs; the DN exec-window ffbf panics). Retire
+        // the switch before reporting; a faulting iretd (pending event) still
+        // bubbles.
+        for _ in 0..4 {
+            let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
+            if uc.get_data().pending.is_some()
+                || uc.get_data().pending_intr.is_some()
+                || !(SYS_BASE..SYS_BASE + SYS_SIZE as u64).contains(&eip)
+            {
+                break;
+            }
+            run = uc.emu_start(eip, 0xFFFF_FFFF, 0, 1);
+        }
         store_regs(uc, regs, mode);
         if trace_on() {
             let intr = uc.get_data().pending_intr;

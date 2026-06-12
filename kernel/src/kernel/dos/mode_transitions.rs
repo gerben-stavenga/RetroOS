@@ -288,6 +288,11 @@ fn push_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, rm_call_struct
     let new_sp = sp - HOST_CONTINUATION_SIZE;
     let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
     regs.write::<HostContinuation>((addr) as usize, save);
+    {
+        let (c, e, s2, p, r) = (save.cs, save.eip, save.ss, save.esp, save.rm_call_struct_addr);
+        dos_trace!("[HC push] @{:04x}:{:#x} (lin={:#x}) save cs:eip={:04x}:{:#x} ss:esp={:04x}:{:#x} other={:?} rmcs={:#x}",
+            ss, new_sp, addr, c, e, s2, p, save.other_stack(), r);
+    }
     (ss, new_sp)
 }
 
@@ -302,7 +307,13 @@ pub(super) fn pop_continuation(dos: &thread::DosState, regs: &Vcpu) -> HostConti
 /// know the pm-side cursor directly.
 pub(super) fn pop_continuation_at(regs: &Vcpu, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
     let addr = pm_addr(ldt, cursor);
-    regs.read::<HostContinuation>((addr) as usize)
+    let save = regs.read::<HostContinuation>((addr) as usize);
+    {
+        let (c, e, s2, p, r) = (save.cs, save.eip, save.ss, save.esp, save.rm_call_struct_addr);
+        dos_trace!("[HC pop ] @{:04x}:{:#x} (lin={:#x}) save cs:eip={:04x}:{:#x} ss:esp={:04x}:{:#x} other={:?} rmcs={:#x}",
+            cursor.0, cursor.1, addr, c, e, s2, p, save.other_stack(), r);
+    }
+    save
 }
 
 pub(super) fn resume_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, save: HostContinuation) {

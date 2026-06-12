@@ -485,6 +485,30 @@ pub fn handle_event(
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
+            // DPMI virtual IF: a CPL-3 CLI/STI #GPs at IOPL<3 and the HOST
+            // must emulate it against the virtual interrupt flag — never
+            // forward it to the client's exception handler (CWSDPMI and
+            // HDPMI both emulate these in their #GP paths). Reproducer:
+            // DOS/4GW's IRQ epilogue executes STI on every timer tick
+            // (duke3d/raptor at sound init, handler code 0117:06FC);
+            // dispatching that #GP to the client cascaded into a wild jump.
+            // Metal currently dodges this via the IOPL=3 leak (see TODO);
+            // this path serves both backends once IOPL is pinned properly.
+            if n == 13 && !is_vm86 && dos.dpmi.is_some() {
+                let lin = mode_transitions::seg_base(&dos.ldt[..], regs.code_seg())
+                    .wrapping_add(regs.ip32());
+                let op = regs.read::<u8>(lin as usize);
+                if op == 0xFA || op == 0xFB {
+                    if op == 0xFB {
+                        regs.frame.rflags |= 1 << 9;
+                    } else {
+                        regs.frame.rflags &= !(1 << 9);
+                    }
+                    let next_ip = regs.ip32().wrapping_add(1);
+                    regs.set_ip32(next_ip);
+                    return thread::KernelAction::Done;
+                }
+            }
             // DPMI session active: route to client's exception handler
             // regardless of current mode. push_continuation_and_switch_to_pm_side handles the
             // VM86→PM toggle if needed; save.restore puts us back in
