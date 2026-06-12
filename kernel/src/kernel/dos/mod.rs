@@ -485,34 +485,11 @@ pub fn handle_event(
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
-            // DPMI virtual IF: a CPL-3 CLI/STI #GPs at IOPL<3 and the HOST
-            // must emulate it against the virtual interrupt flag — never
-            // forward it to the client's exception handler (CWSDPMI and
-            // HDPMI both emulate these in their #GP paths). Reproducer:
-            // DOS/4GW's IRQ epilogue executes STI on every timer tick
-            // (duke3d/raptor at sound init, handler code 0117:06FC);
-            // dispatching that #GP to the client cascaded into a wild jump.
-            // On metal this arm is unreachable: the arch #GP path runs the
-            // sensitive-instruction monitor first (arch-metal monitor.rs),
-            // which emulates CLI/STI below the arch boundary. The interp
-            // has no monitor pass on its PM path, so the kernel covers it
-            // here — in PM only CLI/STI fault this way (POPF/IRET silently
-            // drop IF instead; that's the TF-step machinery's job).
-            if n == 13 && !is_vm86 && dos.dpmi.is_some() {
-                let lin = mode_transitions::seg_base(&dos.ldt[..], regs.code_seg())
-                    .wrapping_add(regs.ip32());
-                let op = regs.read::<u8>(lin as usize);
-                if op == 0xFA || op == 0xFB {
-                    if op == 0xFB {
-                        regs.frame.rflags |= 1 << 9;
-                    } else {
-                        regs.frame.rflags &= !(1 << 9);
-                    }
-                    let next_ip = regs.ip32().wrapping_add(1);
-                    regs.set_ip32(next_ip);
-                    return thread::KernelAction::Done;
-                }
-            }
+            // CLI/STI never arrive here: a CPL-3 CLI/STI #GP is a sensitive
+            // instruction the ARCH emulates against the virtual IF below the
+            // boundary (metal: the #GP monitor; interp: the exception path in
+            // cpu.rs) — the kernel sees identical events from both backends.
+            //
             // DPMI session active: route to client's exception handler
             // regardless of current mode. push_continuation_and_switch_to_pm_side handles the
             // VM86→PM toggle if needed; save.restore puts us back in

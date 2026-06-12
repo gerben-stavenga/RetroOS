@@ -289,6 +289,29 @@ pub fn execute() -> KernelEvent {
             if is_int {
                 return KernelEvent::SoftInt(n);
             }
+            // #GP on a CPL-3 CLI/STI (IOPL < 3): the DPMI host must emulate
+            // the instruction against the virtual IF. This lives below the
+            // arch boundary — arch-metal's #GP path runs its sensitive-
+            // instruction monitor the same way — so the kernel NEVER sees an
+            // Exception(13) for these on either backend. In PM only CLI/STI
+            // fault like this (POPF/IRET silently drop IF instead).
+            // Reproducer: DOS/4GW's IRQ epilogue STIs on every timer tick
+            // (duke3d/raptor at sound init); forwarding the #GP to the
+            // client's exception handler cascaded into a wild jump.
+            if n == 13 && uc.get_data().pending_err == 0 {
+                let lin = crate::desc::seg_base(regs.code_seg())
+                    .wrapping_add(regs.ip32());
+                let op = crate::vcpu::mem().read::<u8>(lin as usize);
+                if op == 0xFA || op == 0xFB {
+                    if op == 0xFB {
+                        regs.frame.rflags |= 1 << 9; // STI: set virtual IF
+                    } else {
+                        regs.frame.rflags &= !(1 << 9); // CLI: clear it
+                    }
+                    regs.frame.rip = regs.frame.rip.wrapping_add(1);
+                    continue;
+                }
+            }
             regs.err_code = uc.get_data().pending_err as u64;
             return KernelEvent::Exception(n);
         }
