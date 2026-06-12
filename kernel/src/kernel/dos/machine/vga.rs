@@ -449,6 +449,116 @@ impl VgaState {
 
 
 // ============================================================================
+// Emulated VGA planar VRAM (paging-aliased planes)
+// ============================================================================
+//
+// Planar/Mode-X graphics route a single CPU store to A0000 through the VGA's
+// plane logic into 1-4 of the 4 planes — the result is not what lands in
+// linear RAM, so it must be modelled at write time. We do it metal-natively
+// with paging, no per-write trap: the 4 planes are physical frames; A0000 is
+// page-aliased onto the active plane (CPU writes land there directly); the
+// renderer reads all 4 planes through a kernel-private guest-VA window. On the
+// chain↔unchain hop the chained (mode-13h linear) content is synced into/out
+// of the planes (chain4 split/merge). Single-plane access (all Mode X, simple
+// EGA) is pure alias; EGA multi-plane set/reset fan-out is the not-yet-handled
+// fallback. Interp emulates the same paging; metal does it in page tables.
+
+use core::sync::atomic::{AtomicUsize, AtomicU8, Ordering};
+
+/// 4 plane frames × 64K. 0 = not yet allocated (the singleton VGA VRAM, lazily
+/// created the first time a guest unchains into planar graphics).
+static VRAM_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Which plane the guest A0000 window currently aliases (0..3), or 0xFF when
+/// A0000 is plain linear RAM (chained mode 13h / text — not planar).
+static A0000_TARGET: AtomicU8 = AtomicU8::new(0xFF);
+
+const FRAMES_PER_64K: u64 = 16;
+const NUM_PLANE_FRAMES: usize = 4 * 16; // 256K
+/// Kernel-private guest-VA window mapping all 4 planes contiguously; the
+/// renderer reads it via `copy_from`. Below the interp's 3GB reservation and
+/// far above any DOS/DPMI usage, so it never collides with the guest.
+const VRAM_WINDOW: usize = 0x8000_0000;
+const A0000: usize = 0xA0000;
+
+/// True while a guest is in unchained planar graphics (A0000 aliases a plane).
+pub fn planar_active() -> bool {
+    A0000_TARGET.load(Ordering::Relaxed) != 0xFF
+}
+
+fn vram_base(machine: &mut crate::TheArch) -> u64 {
+    let base = VRAM_BASE.load(Ordering::Relaxed);
+    if base != 0 {
+        return base as u64;
+    }
+    let base = machine.alloc_phys_contig(NUM_PLANE_FRAMES, 0);
+    machine.map_phys_range(VRAM_WINDOW >> 12, NUM_PLANE_FRAMES, base, 0);
+    VRAM_BASE.store(base as usize, Ordering::Relaxed);
+    base
+}
+
+/// Point the guest A0000 window at plane `plane` (0..3): the 16 frames of that
+/// plane, so guest stores to A0000 land in it.
+fn alias_a0000_to_plane(machine: &mut crate::TheArch, base: u64, plane: u8) {
+    machine.map_phys_range(A0000 >> 12, 16, base + plane as u64 * FRAMES_PER_64K, 0);
+    A0000_TARGET.store(plane, Ordering::Relaxed);
+}
+
+/// React to a Sequencer register write (port 0x3C5) that may change the
+/// chain-4 mode or the plane-select mask. Drives the A0000 paging alias.
+/// `pc.vga` already holds the post-write register values.
+pub fn on_seq_write(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu) {
+    if vga_present() {
+        return; // a real card does its own plane routing
+    }
+    let idx = pc.vga.seq_index & 0x1F;
+    match idx {
+        4 => {
+            // Memory Mode bit 3 = chain-4. Set ⇒ chained (mode 13h linear);
+            // clear ⇒ unchained (Mode X planes).
+            let unchained = pc.vga.seq[4] & 0x08 == 0;
+            let currently_planar = planar_active();
+            if unchained && !currently_planar {
+                // chain → unchain hop: stand up the planes, deinterleave the
+                // current chained A0000 content into them, alias A0000→plane0.
+                let base = vram_base(machine);
+                let mut chained = alloc::vec![0u8; 0x10000];
+                regs.copy_from(A0000, &mut chained);
+                let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
+                lib::vga_render::chain4_split(&chained, &mut planes);
+                regs.copy_to(VRAM_WINDOW, &planes);
+                alias_a0000_to_plane(machine, base, 0);
+            } else if !unchained && currently_planar {
+                // unchain → chain hop: interleave planes back into a fresh
+                // linear A0000, drop the alias.
+                let base = VRAM_BASE.load(Ordering::Relaxed) as u64;
+                let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
+                regs.copy_from(VRAM_WINDOW, &mut planes);
+                let mut chained = alloc::vec![0u8; 0x10000];
+                lib::vga_render::chain4_merge(&planes, &mut chained);
+                machine.map_fresh_range(A0000 >> 12, 16);
+                regs.copy_to(A0000, &chained);
+                A0000_TARGET.store(0xFF, Ordering::Relaxed);
+                let _ = base;
+            }
+        }
+        2 => {
+            // Map Mask = plane select. Single selected plane ⇒ repoint A0000
+            // to it (the Mode X write pattern). Multi-plane is the EGA fan-out
+            // fallback (not handled by pure aliasing).
+            if planar_active() {
+                let mask = pc.vga.seq[2] & 0x0F;
+                if mask.count_ones() == 1 {
+                    let plane = mask.trailing_zeros() as u8;
+                    let base = VRAM_BASE.load(Ordering::Relaxed) as u64;
+                    alias_a0000_to_plane(machine, base, plane);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
 // Emulated display: render to the platform's present sink
 // ============================================================================
 
@@ -504,10 +614,17 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         vram = alloc::vec![0u8; len];
         regs.copy_from(base, &mut vram);
     }
+    // Planar/Mode-X read all 4 planes from the kernel-private VRAM window (the
+    // guest filled them through the A0000 plane alias); empty otherwise.
+    let mut planes = alloc::vec![0u8; 0];
+    if matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) && VRAM_BASE.load(Ordering::Relaxed) != 0 {
+        planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
+        regs.copy_from(VRAM_WINDOW, &mut planes);
+    }
     let frame = Frame {
         mode,
         vram: &vram,
-        planes: &pc.vga.planes,
+        planes: &planes,
         ac: &pc.vga.ac,
         palette: &pc.vga.dac,
         font: &lib::vga_font_8x16::FONT_8X16,
