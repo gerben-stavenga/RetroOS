@@ -22,9 +22,25 @@ pub const F11_PRESS: u8 = 0x57;
 /// F12 scancode (press) — dump the running thread's state.
 pub const F12_PRESS: u8 = 0x58;
 
-/// Drain pending input into a DOS console owner. `blocked` selects the
-/// stdin-pipe path (owner is wait4-parked behind a foreground Linux child).
-pub fn drain_dos(
+/// Drain pending input into the console owner.
+pub fn drain(
+    machine: &mut crate::TheArch,
+    regs: &mut crate::arch::Vcpu,
+    kt: &mut thread::KernelThread,
+    personality: &mut thread::Personality,
+) {
+    match personality {
+        thread::Personality::Dos(dos) => {
+            let blocked = kt.state == thread::ThreadState::Blocked;
+            drain_dos(machine, regs, blocked, dos);
+        }
+        thread::Personality::Linux(linux) => drain_linux(machine, regs, kt, linux),
+    }
+}
+
+/// DOS owner: `blocked` selects the stdin-pipe path (owner is wait4-parked
+/// behind a foreground Linux child).
+fn drain_dos(
     machine: &mut crate::TheArch,
     regs: &mut crate::arch::Vcpu,
     blocked: bool,
@@ -57,8 +73,8 @@ pub fn drain_dos(
     });
 }
 
-/// Drain pending input into a Linux console owner (keys → cooked fd input).
-pub fn drain_linux(
+/// Linux owner: keys → cooked fd input.
+fn drain_linux(
     machine: &mut crate::TheArch,
     regs: &mut crate::arch::Vcpu,
     kt: &mut thread::KernelThread,

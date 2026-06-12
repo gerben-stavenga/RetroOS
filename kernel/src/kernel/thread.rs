@@ -163,6 +163,20 @@ impl Personality {
         }
     }
 
+    /// Dispatch a kernel event produced by this thread's user code.
+    pub fn handle_event(
+        &mut self,
+        machine: &mut crate::TheArch,
+        kt: &mut KernelThread,
+        regs: &mut crate::arch::Vcpu,
+        kevent: crate::arch::monitor::KernelEvent,
+    ) -> KernelAction {
+        match self {
+            Self::Dos(dos) => crate::kernel::dos::handle_event(machine, kt, dos, regs, kevent),
+            Self::Linux(linux) => crate::kernel::linux::handle_event(machine, kt, linux, regs, kevent),
+        }
+    }
+
     /// Per-iteration slice work AFTER input routing: deliver queued IRQs to
     /// a runnable DOS guest; complete a blocked Linux thread's pending pipe
     /// read / poll (which may make it Ready again).

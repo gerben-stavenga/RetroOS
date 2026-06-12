@@ -31,6 +31,13 @@ impl ExecutionContext {
         ExecutionContext { tid, vcpu }
     }
 
+    /// The thread currently holding the CPU. The thread table is static,
+    /// so the borrow is independent of `self` — callers can hold it across
+    /// `run`/`switch_to` (which never invalidate table slots).
+    pub fn thread(&self) -> &'static mut thread::Thread {
+        thread::get_thread(self.tid).expect("ExecutionContext: current thread vanished")
+    }
+
     /// Run user code until it produces a kernel event.
     pub fn run(&mut self, machine: &mut crate::TheArch) -> crate::arch::monitor::KernelEvent {
         use arch_abi::Arch;

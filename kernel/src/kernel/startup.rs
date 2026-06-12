@@ -230,100 +230,78 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
 }
 
 /// Ring-1 kernel event loop. Returns when no threads remain.
-/// EXECUTE swaps kernel↔user regs. SWITCH_TO changes threads (root + mode toggle).
+///
+/// One iteration is the whole kernel, in order: advance the running
+/// thread's world (virtual time, console input, delivery), lend it the CPU,
+/// canonicalize whatever came back into a `KernelAction`, and ask the
+/// scheduler. Every concept lives behind its seam — `ExecutionContext`
+/// (the CPU loan), `console` (input routing), `Personality` (the slice
+/// hooks + event dispatch), `sched` (policy), `focus` (console ownership,
+/// moved together with execution by `switch_focus_and_run` for now).
 pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
-
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
-
-    // The CPU loan, owned by the loop: the live register frame + which
-    // thread holds it. Handlers receive `&mut ctx.vcpu` (disjoint from
-    // `&mut machine`), so the borrow checker — not a `static mut` — keeps
-    // register and machine state from aliasing.
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(first_tid);
-
     let mut stats = EventStats::new(machine);
+
     loop {
         stats.iteration(machine);
         crate::kernel::stacktrace::set_debug_tid(ctx.tid);
-        let regs = &mut ctx.vcpu;
+        let thread = ctx.thread();
 
-        // Phase 1: advance the thread's virtual time, route console input,
-        // then deliver/complete what the input made possible.
-        {
-            let thread = thread::get_thread(ctx.tid).expect("Invalid thread in event loop");
-            let kt = &mut thread.kernel;
-            thread.personality.on_slice(machine, regs);
-            match &mut thread.personality {
-                thread::Personality::Dos(dos) => {
-                    let blocked = kt.state == thread::ThreadState::Blocked;
-                    crate::kernel::console::drain_dos(machine, regs, blocked, dos);
-                }
-                thread::Personality::Linux(linux) => {
-                    crate::kernel::console::drain_linux(machine, regs, kt, linux);
-                }
-            }
-            thread.personality.after_input(machine, kt, regs);
-        }
+        // Advance this thread's world: virtual time, console input, delivery.
+        thread.personality.on_slice(machine, &mut ctx.vcpu);
+        crate::kernel::console::drain(machine, &mut ctx.vcpu, &mut thread.kernel, &mut thread.personality);
+        thread.personality.after_input(machine, &mut thread.kernel, &mut ctx.vcpu);
 
-        // Phase 2: if still parked, honour F11 (cycle focus) or spin. The
-        // take_switch_request consumer below the do_arch_execute path is
-        // unreachable from here, so we re-implement the switch step inline.
-        if thread::get_thread(ctx.tid).expect("Invalid thread").kernel.state
-            == thread::ThreadState::Blocked
-        {
-            if let Some(next) = crate::kernel::sched::focus_request(ctx.tid) {
-                switch_focus_and_run(machine, &mut ctx, next);
-                continue;
+        // A blocked thread holds the console but not the CPU: wait for input
+        // to unblock it (above) or F11 to move on.
+        if thread.kernel.state == thread::ThreadState::Blocked {
+            match crate::kernel::sched::focus_request(ctx.tid) {
+                Some(next) => switch_focus_and_run(machine, &mut ctx, next),
+                None => core::hint::spin_loop(),
             }
-            core::hint::spin_loop();
             continue;
         }
 
-        // Phase 3: run user code and dispatch the resulting event.
-        let thread = thread::get_thread(ctx.tid).expect("Invalid thread in event loop");
+        // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine);
         let kevent = ctx.run(machine);
-        // The live register frame for this iteration (post-run). Borrows the
-        // loop-owned context; `ctx.run` above already returned, so there is
-        // no aliasing with the run.
-        let regs = &mut ctx.vcpu;
-        stats.post_run(machine, &kevent, regs);
+        stats.post_run(machine, &kevent, &ctx.vcpu);
+        let action = dispatch(machine, thread, &mut ctx.vcpu, kevent);
 
-        // PageFault is handled at the loop level because `signal_thread`
-        // needs the full `&Thread`. Everything else dispatches through
-        // the personality's `handle_event`. The `Exit(-11)` below runs
-        // against the faulting `tid` so `exit_thread` does the standard
-        // cleanup (parent wake, last_child_exit_status, arch_user_clean,
-        // on_exit) — exactly what a normal program exit does.
-        let action = if let crate::arch::monitor::KernelEvent::PageFault { addr } = kevent {
-            let rip = regs.frame.rip;
-            crate::println!("  fault rip={:#x} addr={:#x} err={:#x}", rip, addr, regs.err_code);
-            thread::signal_thread(thread, addr as usize);
-            thread::KernelAction::Exit(-11)
-        } else {
-            let kt = &mut thread.kernel;
-            match &mut thread.personality {
-                thread::Personality::Dos(dos) => crate::kernel::dos::handle_event(machine, kt, dos, regs, kevent),
-                thread::Personality::Linux(linux) => crate::kernel::linux::handle_event(machine, kt, linux, regs, kevent),
+        // Ask the scheduler.
+        match crate::kernel::sched::verdict(machine, &mut ctx.vcpu, ctx.tid, action) {
+            crate::kernel::sched::Verdict::Stay => {}
+            crate::kernel::sched::Verdict::Switch(next) => {
+                switch_focus_and_run(machine, &mut ctx, next);
             }
-        };
-
-
-        let new_tid = crate::kernel::sched::next_after(machine, regs, ctx.tid, action)
-            .or_else(|| crate::kernel::sched::focus_request(ctx.tid));
-
-        if let Some(new_tid) = new_tid {
-            if new_tid == 0 {
-                // No runnable threads left. Reap every zombie NOW — the
-                // loop's contract is that all thread resources (address
-                // spaces, VGA state) are released before it returns;
+            crate::kernel::sched::Verdict::AllDead => {
+                // The loop's contract: no thread resources survive it —
                 // callers never inherit zombies.
                 thread::reap_all_zombies(machine);
-                return; // respawn DN / next cmdline program
+                return;
             }
-            switch_focus_and_run(machine, &mut ctx, new_tid);
         }
     }
+}
+
+/// Canonicalize a kernel event into the action the scheduler decides on.
+/// Page faults are decided here — an unhandled user fault is a SEGV exit,
+/// and `signal_thread` wants the whole `Thread` for its diagnostics;
+/// everything else is the personality's call.
+fn dispatch(
+    machine: &mut crate::TheArch,
+    thread: &mut thread::Thread,
+    regs: &mut crate::arch::Vcpu,
+    kevent: crate::arch::monitor::KernelEvent,
+) -> thread::KernelAction {
+    if let crate::arch::monitor::KernelEvent::PageFault { addr } = kevent {
+        crate::println!("  fault rip={:#x} addr={:#x} err={:#x}",
+            regs.frame.rip, addr, regs.err_code);
+        thread::signal_thread(thread, addr as usize);
+        return thread::KernelAction::Exit(-11);
+    }
+    thread.personality.handle_event(machine, &mut thread.kernel, regs, kevent)
 }
 
 /// Switch console focus and execution together — today's coupling, in one
