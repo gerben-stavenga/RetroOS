@@ -50,6 +50,8 @@ pub fn run() -> ! {
     // Pointer captured (SDL relative mode): grabbed on first click, released
     // with Ctrl+F10 (the DOSBox convention).
     let mut captured = false;
+    // Last presented frame dimensions — window resizes on change.
+    let mut last_dims = (0usize, 0usize);
 
     loop {
         for event in event_pump.poll_iter() {
@@ -111,6 +113,18 @@ pub fn run() -> ! {
         // Blit the latest frame the kernel's display tick published (PIT-tick
         // cadence; one loop-period of latency, by design).
         if let Some((w, h, fb)) = arch::take_frame() {
+            // Integer scaling: size the window to a whole multiple of the
+            // frame so glyph columns stay crisp. The old fixed 640-wide
+            // window forced 720x400 text into a 0.89x downscale — every
+            // 9-dot cell lost a column and text read "thin". Scale to
+            // ~800px tall: text (400) -> 2x, mode 13h (200) -> 4x.
+            if (w, h) != last_dims {
+                last_dims = (w, h);
+                let scale = (800 / h as u32).max(1);
+                let _ = canvas
+                    .window_mut()
+                    .set_size(w as u32 * scale, h as u32 * scale);
+            }
             // A fresh streaming texture each frame keeps this trivial across
             // mode/size changes; at 320×200/720×400 it's negligible. RGB888 is
             // SDL's *alpha-less* 32-bit format (X8R8G8B8) whose channel masks
