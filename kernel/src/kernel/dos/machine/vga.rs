@@ -597,8 +597,29 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         gc: v.gc,
         misc: v.misc_output,
     };
-    let Some(mode) = vga_render::classify(regs.read::<u8>(0x449), &rregs) else {
-        return;
+    // An explicit unchain (a guest writing the SEQ chain-4 bit, tracked by the
+    // A0000 alias) is the authoritative Mode X signal — `classify` can't see it
+    // because our BIOS leaves the GC graphics bit unprogrammed and an
+    // unprogrammed SEQ reads the same as a deliberate unchain. Doom (Mode Y,
+    // 320×200 unchained) lands here. Resolution comes from the CRTC the game
+    // programmed (offset → row bytes; vertical-display-end → height).
+    let mode = if planar_active() {
+        let row_bytes = if v.crtc[0x13] != 0 { v.crtc[0x13] as u16 * 2 } else { 80 };
+        let v_end = v.crtc[0x12] as u16
+            | (((v.crtc[7] >> 1) & 1) as u16) << 8
+            | (((v.crtc[7] >> 6) & 1) as u16) << 9;
+        let mut h = v_end + 1;
+        if v.crtc[9] & 0x80 != 0 { h /= 2; }
+        // The CRTC vertical-end is meaningful only if the game (re)programmed
+        // it; Mode Y games (Doom) keep the BIOS mode-13h CRTC our BIOS never
+        // wrote, leaving it ~0. Fall back to the 320×200 Mode Y default.
+        if h < 64 || h > 480 { h = 200; }
+        VgaMode::ModeX { w: row_bytes * 4, h, row_bytes }
+    } else {
+        match vga_render::classify(regs.read::<u8>(0x449), &rregs) {
+            Some(m) => m,
+            None => return,
+        }
     };
     let (w, h) = vga_render::dimensions(mode);
     // Linear modes read a guest memory window; planar modes read the VGA plane
