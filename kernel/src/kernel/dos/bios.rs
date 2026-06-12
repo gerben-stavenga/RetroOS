@@ -151,11 +151,14 @@ pub(super) fn install(regs: &mut Vcpu) {
     // Vectors with a real service keep their own stub (slot index == vector);
     // everything unserviced shares ONE dummy cell, exactly like a real BIOS
     // points its unassigned vectors at a single dummy handler. The duplicates
-    // are load-bearing: DOS/4GW (raptor's bound extender) scans the IVT for
-    // two adjacent vectors with identical handlers to find a free one, and
-    // with 256 distinct stub addresses that scan never terminates. Dispatch
-    // is unaffected — the dummy decodes as vector 0xFF → plain IRET, and
-    // "has the guest hooked INT n" tests only the segment.
+    // are load-bearing: DOS/4GW (raptor's bound extender, RM code at
+    // 04e6:62d8) discovers the BIOS dummy-handler address by scanning the
+    // IVT for an address that appears in TWO entries (any duplicate must be
+    // the shared dummy; it then knows "unhooked" == that value). With 256
+    // distinct stub addresses the scan never terminates — raptor spun
+    // forever here. Dispatch is unaffected: the dummy decodes as vector
+    // 0xFF → plain IRET, and "has the guest hooked INT n" tests only the
+    // segment.
     const DUMMY_OFF: u16 = 0xFF * 2;
     for n in 0..256u32 {
         let serviced = matches!(n,

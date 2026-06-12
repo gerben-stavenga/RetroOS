@@ -295,10 +295,12 @@ Known gaps, roughly by leverage:
 - [x] **FIXED: personality-BIOS IVT had 256 distinct stub addresses —
       DOS/4GW's free-vector scan never terminated** (raptor layer 2,
       2026-06-11). After the store fix, raptor spun forever in a 20-byte
-      RM loop at 04e6:62e3: DOS/4GW scans the IVT for two vectors with
-      IDENTICAL handlers (the classic find-a-free-vector trick — real
-      BIOSes point all unassigned vectors at one shared dummy, so
-      duplicates abound). Our install gave every vector its own stub
+      RM loop at 04e6:62e3: DOS/4GW discovers the BIOS dummy-handler
+      address by scanning the IVT for an address appearing in TWO entries
+      (any duplicate must be the shared dummy; "unhooked vector" tests
+      then compare against it — real BIOSes point all unassigned vectors
+      at one dummy, so duplicates abound; verified it claims no vector,
+      just records the address). Our install gave every vector its own stub
       (STUB_SEG:n*2) → no duplicates → infinite scan, burning 100% of
       virtual time, so the 18.2Hz tick interrupted the same 7 instructions
       forever. Fix (bios.rs install): unserviced vectors share vector
