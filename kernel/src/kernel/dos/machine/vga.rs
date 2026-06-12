@@ -477,37 +477,38 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         return;
     }
     ACCUM.store(0, core::sync::atomic::Ordering::Relaxed);
-    let mode = match regs.read::<u8>(0x449) {
-        0x13 => VgaMode::Mode13h,
-        0x02 | 0x03 | 0x07 => VgaMode::Text80x25, // 80×25 colour/mono text
-        other => {
-            // Unrenderable mode: log the real VGA register state once so a
-            // blank screen is diagnosable. Classifying from the BDA byte is
-            // itself a known gap — ModeX games (re)program CRTC/sequencer
-            // directly and the BDA still says 0x13; classification should
-            // move to VgaState registers.
-            use core::sync::atomic::{AtomicBool, Ordering};
-            static ONCE: AtomicBool = AtomicBool::new(false);
-            if !ONCE.swap(true, Ordering::Relaxed) {
-                let v = &pc.vga;
-                crate::dbg_println!("display_tick: unrenderable bda_mode={:#04x} misc={:#04x} seq=[{:02x} {:02x} {:02x} {:02x} {:02x}] gc5={:02x} gc6={:02x} crtc14={:02x} crtc17={:02x}",
-                    other, v.misc_output,
-                    v.seq[0], v.seq[1], v.seq[2], v.seq[3], v.seq[4],
-                    v.gc[5], v.gc[6], v.crtc[0x14], v.crtc[0x17]);
-            }
-            return;
-        }
+    // Classify from the live VGA registers (Mode X reprograms them while the
+    // BDA byte still reads 0x13); the BDA byte only disambiguates the linear
+    // 256-colour families. `None` = a mode the renderer doesn't draw.
+    let v = &pc.vga;
+    let rregs = vga_render::Regs {
+        crtc: v.crtc,
+        seq: v.seq,
+        gc: v.gc,
+        misc: v.misc_output,
+    };
+    let Some(mode) = vga_render::classify(regs.read::<u8>(0x449), &rregs) else {
+        return;
     };
     let (w, h) = vga_render::dimensions(mode);
-    let (base, len) = match mode {
-        VgaMode::Mode13h => (0xA0000usize, w * h),
-        VgaMode::Text80x25 => (0xB8000usize, 80 * 25 * 2),
+    // Linear modes read a guest memory window; planar modes read the VGA plane
+    // model (filled by the VRAM-trap write path — empty until a guest draws).
+    let linear = match mode {
+        VgaMode::Mode13h => Some((0xA0000usize, w * h)),
+        VgaMode::Text80x25 => Some((0xB8000usize, 80 * 25 * 2)),
+        VgaMode::Cga4 | VgaMode::Cga2 => Some((0xB8000usize, 0x4000)),
+        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => None,
     };
-    let mut vram = alloc::vec![0u8; len];
-    regs.copy_from(base, &mut vram);
+    let mut vram = alloc::vec![0u8; 0];
+    if let Some((base, len)) = linear {
+        vram = alloc::vec![0u8; len];
+        regs.copy_from(base, &mut vram);
+    }
     let frame = Frame {
         mode,
         vram: &vram,
+        planes: &pc.vga.planes,
+        ac: &pc.vga.ac,
         palette: &pc.vga.dac,
         font: &lib::vga_font_8x16::FONT_8X16,
         blink: pc.vga.ac[0x10] & 0x08 != 0,

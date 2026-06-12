@@ -29,6 +29,15 @@ static mut SHADOW: [u16; 80 * 25] = [0; 80 * 25];
 
 /// DAC palette for attribute colors (filled from `fallback_palette` at init).
 static mut PALETTE: [u8; 768] = [0; 768];
+/// Identity Attribute-Controller palette (AC[i]=i): text rendering doesn't use
+/// the planar colour path, but `Frame` requires the field. Mode-control byte
+/// (index 0x10) left 0 = blink semantics, matching `blink: false` here.
+static FBCON_AC: [u8; 21] = {
+    let mut a = [0u8; 21];
+    let mut i = 0;
+    while i < 16 { a[i] = i as u8; i += 1; }
+    a
+};
 
 /// Framebuffer geometry, set once by `init` (None until then / on legacy VGA).
 struct Geom {
@@ -289,6 +298,8 @@ fn flush() {
         vram: unsafe {
             core::slice::from_raw_parts((&raw const TEXT_BUF) as *const u8, 80 * 25 * 2)
         },
+        planes: &[],
+        ac: &FBCON_AC,
         palette: unsafe { &*(&raw const PALETTE) },
         font: &FONT_8X16,
         blink: false,
@@ -314,6 +325,8 @@ fn flush() {
             let cell_frame = Frame {
                 mode: VgaMode::Text80x25,
                 vram: &frame.vram[cell..cell + 2],
+                planes: &[],
+                ac: &FBCON_AC,
                 palette: frame.palette,
                 font: frame.font,
                 blink: frame.blink,
