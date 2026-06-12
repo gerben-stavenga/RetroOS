@@ -385,6 +385,55 @@ screen capture. Harness limits: no mouse, blind pokes, no eyes on frames.
 - Controls: skyroads + prince healthy (graphics, title/attract).
 
 
+## Hosted/interp — DN panel-Enter wedges (ffbf family, ROOT IN SIGHT 2026-06-12)
+User symptom: in retroos-play, launching a program from the DN PANEL with
+Enter never works (DN's own COMMAND-LINE exec works fine; --cmd works).
+Reproduced on the CARGO terminal host: panel-Enter DOES initiate (DN reads
+C:\BOOT\DN\DN.ARH — likely absent from the bootfs, open shows no success
+line — then does its pre-spawn mouse setup: INT 33 0007/0008/0003/000C
+(install callback mask=FFFF handler=0502:1E44)/0001/000F-unsupported), and
+then DN's function at 0502:21xx (PUSH BP; INT 33 AX=000F; POP BP; LEAVE;
+RETF 4) returns into HMA garbage: cs=ffbf:05da/05ad, SP collapsed — the
+restored BP was trampled. The user's duke3d-from-DN crash (vec09 +
+delivered_at ffbf:...) and the old retired DN-launch crash are the same
+family. Watchpoint evidence (one run): right after the 000F excursion,
+DN's hooked IRQ-handler chain (cs=2eec/50d8/234d) executed ON DN'S OWN
+STACK at SP≈0x403c-0x4042 — ABOVE the live frame — overwriting saved-BP +
+far-return slots (e.g. `write ret-cs val=0x403e from 2eec:0x177`). The
+kernel's reflect_int_to_real_mode is DESIGNED to run RM handlers on the
+dedicated RM slab (rm_get_stack: 01F6:100A — and the healthy [oth] ledger
+cycles confirm to_pm→to_rm→resume→resume balanced to None), so the open
+question is which delivery path ran DN's handlers on the CLIENT stack at a
+STALE depth: stale other_stack Some((3f4a,...)), the inline VM86 software-
+INT reflection (cpu.rs reflect_vm86_inline pushes on CURRENT stack — by
+design, but maybe a chained INT from a handler?), or the parked console-
+read (pending_resume) interleave. NEXT: re-add the temp traces (this entry
+documents them all) with a DYNAMIC watchpoint armed at the AX=000F
+d33-frame moment covering [sp+6 .. sp+12] of the live frame, capture only
+between 000F-return and the RETF, and identify the writer's delivery path.
+Temp instrumentation used (all reverted, recreate as needed): [d33-frame]
+dump in dos.rs int33 tail; [oth] transition traces at the 3 other_stack
+assignments in mode_transitions.rs; uc MEM_WRITE watchpoint in cpu.rs
+build(); KBD_TRACE=true; DOS_TRACE_RT=true. Repro driver: boot cargo
+target/release/retroos-host with a WRITABLE image copy, stdin: 8s wait,
+type "cd \GAMES\PRINCE" 0.15s/char, Enter, 2s, ESC[B, Enter, wait.
+ALSO FOUND (separate bugs, file/fix independently):
+- [ ] BAZEL-native retroos-host wedges DN pre-UI (never draws, never reads
+      input; busy-loops) while the CARGO build of the same sources is
+      healthy — broken since the Bazel-native port (June 11); all --cmd
+      game testing missed it. Suspect build-flag-sensitive (panic=abort /
+      relocation-static / opt) or embedded-vs-file bootfs delta.
+- [ ] DN.ARH (and the rest of DN's data set?) missing from the embedded
+      bootfs — DN's archive-detection config; open fails silently. Decide:
+      add to bootfs or accept.
+- [ ] COMMAND.COM duplication: ext4 root carries a copy (BUILD.bazel
+      _EXTRA_FILES, "DN EXECs COMSPEC=C:\COMMAND.COM from C:\") AND the
+      bootfs carries one. User wants bootfs-only: point the master-env
+      COMSPEC at C:\BOOT\COMMAND.COM and drop the root copy.
+- [ ] retroos-play window: text mode renders 8x16 (640x400) unscaled —
+      smaller than qemu/bochs/86box (9x16 = 720x400, usually 2x-scaled).
+      Add integer scaling (and ideally the 9-dot column) in play/display.rs.
+
 ## Hosted/interp — DN launch crashes in the swap cycle (DPMI PM-IRQ delivery)
 - [x] **Resource leak fixed (630c335) — the suspected driver:** reap() never
       freed anything (slot flipped Unused; zombie kept VgaState planes +
