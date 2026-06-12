@@ -270,6 +270,31 @@ Known gaps, roughly by leverage:
 
 # DOS Game Compatibility — Bug Sprint
 
+## Re-baseline 2026-06-11 (headless harness, current master)
+Direct `--cmd GAMES/...` launches, 40s each, benign key pokes, prof-line
+freeze detection (`at=0050:*` = BIOS-stub input wait = alive), text/PPM
+screen capture. Harness limits: no mouse, blind pokes, no eyes on frames.
+- **Class A — extender init dies executing low-mem garbage (VM86 panic at
+  dos/mod.rs:550):** stunts (ST.COM → 0000:3180), omf-direct
+  (FILE0001.EXE), pinball-illusions (known pMAX incompat). NOT a
+  regression (pre-factoring kernel identical class). omf/stunts may be
+  wrong entry exe — verify the real launcher chain before kernel work.
+- **Class B — quick clean exit, error presumably printed to text screen
+  (uncaptured):** monkey1, indy3-jones, epicpinball, AND offroad — which
+  previously FROZE in the 0x3DA vblank loop and now exits instead
+  (behavior changed; needs eyes). Next: rerun with high-cadence screen
+  capture to read the exit messages, then fix by error class.
+- **Class C — runs; needs interactive/visual verification:**
+  raptor (WAS the named DPMI crash — now RUNS ✦ big mover), settlers
+  (launches; the mouse-click #GP needs mouse injection to retest),
+  goldenaxe (key coverage), extr-pinball (keypress-panic NOT reproduced
+  under pokes — possibly fixed), indy4-atlantis (alive in graphics;
+  mouse known-missing), aladdin (runs; audio/garbage need eyes/ears),
+  monkey2 (reaches graphics then exits — further than the documented
+  text-mode R6003).
+- Controls: skyroads + prince healthy (graphics, title/attract).
+
+
 ## Hosted/interp — DN launch crashes in the swap cycle (DPMI PM-IRQ delivery)
 - [x] **Resource leak fixed (630c335) — the suspected driver:** reap() never
       freed anything (slot flipped Unused; zombie kept VgaState planes +
