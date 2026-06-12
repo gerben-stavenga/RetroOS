@@ -262,11 +262,20 @@ is the trap routing + where it runs:
       only on the rare chain<->unchain hop. EGA multi-plane set/reset
       fan-out stays a #PF-trap fallback (later). Renderer reads chained
       view for 13h, planes for ModeX.
-- [ ] **Metal: READY with existing primitives** — map_phys_range honors
-      ppage (int 0x80 page mapping). Plan: alloc_phys_contig the plane +
-      chained frames, map A0000's 16 vpages onto the active plane's frames,
-      repoint on SEQ chain-4 / mode change, renderer reads planes.
-- [ ] **Interp BLOCKER: no physical-memory model.** Its map_phys_range is a
+- [ ] **Both backends ready with EXISTING primitives — no new arch surface.**
+      (phys_view was added then reverted: unnecessary.) The kernel reads
+      VRAM the SAME way the ac97/nvme drivers read DMA buffers — map the
+      frames into a kernel-readable window via map_phys_range (cf. ac97's
+      DMA_WIN_VA = LOW_MEM_BASE + 0xC_0000) and read there. Plan:
+      alloc_phys_contig the 80 plane+chained frames; map_phys_range them
+      into a kernel VRAM window (read for rendering) AND map A0000's 16
+      vpages onto the active plane's frames (guest writes); repoint A0000
+      on SEQ chain-4 / plane-select; chain4 sync on the hop. Disabled on a
+      backend that can't alias — no per-backend method needed.
+- [x] **Interp phys-memory model: DONE (5ba0490)** — map_phys_range honors
+      ppage via a sparse memfd; alloc_phys_contig works; aliasing unit-
+      tested. The blocker below is cleared.
+- [ ] (cleared) Interp BLOCKER: no physical-memory model. Its map_phys_range is a
       stub (ignores ppage → map_fresh anonymous), and there's no guest-phys
       namespace that both a guest A0000 mapping AND the kernel's plane-read
       share. To "emulate the paging," the interp needs a real guest-phys
