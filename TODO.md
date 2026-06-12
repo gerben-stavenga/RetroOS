@@ -252,8 +252,16 @@ Known gaps, roughly by leverage:
       project_hosted_game_workflow): mode 13h works via direct writes +
       renderer; planar modes need the A0000 window trapped through the
       VgaState plane logic on the interp. Unlocks a whole class of games.
-- [ ] **Stores have NO fast path in unicorn — store-heavy phases crawl
-      ~1000x** (root-caused 2026-06-11 via raptor, fork source verified).
+- [x] **FIXED: stores had NO fast path in unicorn — store-heavy phases
+      crawled ~1000x** (root-caused + patched 2026-06-11 via raptor;
+      toolchain/unicorn-store-fastpath.patch, applied to the unicorn_fork
+      http_archive — upstream into the fork repo and bump the rev when
+      convenient). TLB fill now consults the TB page table
+      (uc_phys_page_has_tb) instead of the stubbed is_clean≡true, and
+      uc_mem_hook_installed no longer counts *_UNMAPPED hooks. Verified:
+      raptor's init storms through in seconds (was: wedged for minutes),
+      DN/skyroads/monkey2/prince/keen4/in-OS-TCC all clean. Original
+      diagnosis below for the record.
       "QEMU runs it fine, same interpreter" — true for the TCG core, false
       for the memory subsystem. Unicorn deleted QEMU's dirty-memory
       bitmap: `cpu_physical_memory_is_clean()` is stubbed to `return
@@ -284,6 +292,25 @@ Known gaps, roughly by leverage:
       rebuild+flush; (3) fork patch: restore a real DIRTY_MEMORY_CODE
       bitmap (or page-has-TBs test) so non-code stores regain the inline
       fast path — true QEMU-parity fix.
+- [x] **FIXED: personality-BIOS IVT had 256 distinct stub addresses —
+      DOS/4GW's free-vector scan never terminated** (raptor layer 2,
+      2026-06-11). After the store fix, raptor spun forever in a 20-byte
+      RM loop at 04e6:62e3: DOS/4GW scans the IVT for two vectors with
+      IDENTICAL handlers (the classic find-a-free-vector trick — real
+      BIOSes point all unassigned vectors at one shared dummy, so
+      duplicates abound). Our install gave every vector its own stub
+      (STUB_SEG:n*2) → no duplicates → infinite scan, burning 100% of
+      virtual time, so the 18.2Hz tick interrupted the same 7 instructions
+      forever. Fix (bios.rs install): unserviced vectors share vector
+      0xFF's stub cell, mirroring real-BIOS topology; dispatch and
+      hooked-detection are offset-independent. DOS/4GW now prints its
+      Rational Systems banner and proceeds.
+- [ ] **Raptor layer 3: SEGV after the DOS/4GW banner** — wild fetch at
+      linear 0xea0051d5 (guest cs:ip 04e6:0x2372, VM flag set, err=0)
+      right after "Copyright (c) Rational Systems" prints. A wild far
+      jump through garbage, next diagnosis target. Note the kernel SEGV
+      report's rip (0x2372) and the fault addr disagree — check whether
+      the reported regs are stale vs the faulting fetch.
 - [ ] **display_tick classifies mode from the BDA byte (0x449), not from
       VgaState registers** — ModeX games reprogram CRTC/sequencer directly
       and the BDA still says 0x13, so the renderer either rejects the mode

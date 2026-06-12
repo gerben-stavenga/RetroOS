@@ -148,8 +148,20 @@ macro_rules! bda_field {
 pub(super) fn install(regs: &mut Vcpu) {
     crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (display {:?})",
         crate::kernel::platform::get().display);
+    // Vectors with a real service keep their own stub (slot index == vector);
+    // everything unserviced shares ONE dummy cell, exactly like a real BIOS
+    // points its unassigned vectors at a single dummy handler. The duplicates
+    // are load-bearing: DOS/4GW (raptor's bound extender) scans the IVT for
+    // two adjacent vectors with identical handlers to find a free one, and
+    // with 256 distinct stub addresses that scan never terminates. Dispatch
+    // is unaffected — the dummy decodes as vector 0xFF → plain IRET, and
+    // "has the guest hooked INT n" tests only the segment.
+    const DUMMY_OFF: u16 = 0xFF * 2;
     for n in 0..256u32 {
-        write_u16(regs, 0, n * 4, (n * 2) as u16);
+        let serviced = matches!(n,
+            0x00..=0x33 | 0x40..=0x46 | 0x4A | 0x67 | 0x70..=0x77);
+        let off = if serviced { (n * 2) as u16 } else { DUMMY_OFF };
+        write_u16(regs, 0, n * 4, off);
         write_u16(regs, 0, n * 4 + 2, STUB_SEG);
     }
     seed_bda(regs);
