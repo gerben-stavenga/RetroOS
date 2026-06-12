@@ -528,7 +528,18 @@ fn configure_pm(uc: &mut Unicorn<'static, Ctx>, r: &Regs) -> u64 {
 
     // 3. Build the inter-privilege iret frame (EIP, CS, EFLAGS, ESP, SS) and run
     //    the trampoline under the flat ring-0 selectors.
-    let flags = (r.flags32() & !(VM_FLAG as u32)) | 2;
+    //
+    //    The client enters with IOPL=3: inside the software CPU, CLI/STI and
+    //    POPF/IRET then manipulate the emulated IF natively, so the virtual
+    //    IF (rflags bit 9, read back per slice) tracks every idiom including
+    //    the POPF/IRET restores that drop silently at IOPL<3 — the class
+    //    metal closes with TF single-stepping (Hexen via DOS32A re-enables
+    //    IF by POPF, monitor.rs TF_VIRTUAL_IF_STEPPING). Safe here, unlike
+    //    metal: port I/O always traps through the IN/OUT hooks regardless of
+    //    IOPL, and the kernel regains control by slice count, not timer IF.
+    //    store_regs normalizes IOPL back to 1 so the kernel-side invariant
+    //    (every ring-3 guest at IOPL=1) holds identically across backends.
+    let flags = (r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (IOPL_MASK as u32) | 2;
     let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
     let mut bytes = [0u8; 20];
     for (i, v) in frame.iter().enumerate() {
@@ -581,7 +592,10 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             r.es = rd(uc, RegisterX86::ES);
             r.fs = rd(uc, RegisterX86::FS);
             r.gs = rd(uc, RegisterX86::GS);
-            r.frame.rflags = rd(uc, RegisterX86::EFLAGS);
+            // Normalize IOPL back to the kernel-side invariant (1): the
+            // guest ran at IOPL=3 inside the software CPU (see configure_pm)
+            // purely so IF-manipulating instructions execute natively.
+            r.frame.rflags = (rd(uc, RegisterX86::EFLAGS) & !IOPL_MASK) | (1 << 12);
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
             // (and possibly EIP) holding stale bits from the trampoline's own
