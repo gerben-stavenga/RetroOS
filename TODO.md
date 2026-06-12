@@ -75,6 +75,32 @@ only the focused thread — focus and execution move together.
       "whoever is running" (equivalent today, load-bearing after the
       scheduler change).
 
+## 2c. Cleanup roadmap (post event-loop factoring, in attack order)
+Same doctrine: one concept per seam, policy stated once. Surveyed 2026-06-11.
+- [ ] **Process lifecycle.** `handle_fork_exec` predates ExecutionContext:
+      raw double machine.switch_to with a hand-saved `saved_cpu` juggle,
+      parent snapshot dance, personality-specific child wiring inline. Wants
+      a scoped `ctx.borrow_space(child_tid, |…|)` primitive (enter/do/restore
+      as a structural guarantee) + child setup on Personality. Also:
+      exit_thread's parent-wake protocol is an inline Dos/Linux match →
+      `Personality::on_child_exit`; sched's Fork/Exec arms are TODO stubs.
+- [ ] **Finish the sched seam (small).** yield_thread / cycle_next /
+      schedule are policy fragments still in thread.rs; move to sched.rs —
+      thread.rs = table + lifecycle, sched.rs = ALL the policy.
+- [ ] **Console output side.** Input has a router; output is scattered:
+      vga.rs console state, the KERNEL_OWNS_SCREEN atomic flipped in
+      run_dos_program, per-backend debug sinks, fbcon flush hooks. The
+      ownership flag is a focus-shaped concept (kernel owns the screen until
+      the first program takes it) — type the handoff like input.
+- [ ] **DOS port dispatch.** machine/mod.rs emulate_inb/outb is a long match
+      with vga_present() interleaved per arm — passthrough-vs-emulated
+      decided per-port instead of per-device. Canonicalize: port range →
+      device, each device knowing its mode from the Platform verdict.
+      Touches game paths — run the sweep per step.
+- [ ] **dos/dos.rs (later, big).** 3800 lines of INT 21 dispatcher + the
+      exec/swap-cycle machinery. Highest value, highest risk — only with a
+      thicker regression suite.
+
 ## 3. Better kernel init structure
 `startup.rs` does too much inline — TAR/ext4 mounts, CONFIG.SYS, AC'97 probe,
 hostfs, the cmdline/DN dispatch, the boot self-build — in one long function.
@@ -216,6 +242,31 @@ multiboot map called free, or something interrupt/time-driven).
       `rules_python~~python~*` external dir + `.marker`, rebuild.
 
 ---
+
+# PRIORITY: Interp parity with metal
+
+The hosted/interp backend must run DOS software at the same level as metal —
+it is the out-of-box emulator (project goal) and the development vehicle.
+Known gaps, roughly by leverage:
+- [ ] **Planar / Mode X needs VRAM trapping** (memory:
+      project_hosted_game_workflow): mode 13h works via direct writes +
+      renderer; planar modes need the A0000 window trapped through the
+      VgaState plane logic on the interp. Unlocks a whole class of games.
+- [ ] **Raptor: DPMI crash on hosted** (works on metal? verify) — first
+      named casualty; likely shares a root with other DPMI-on-interp gaps.
+- [ ] **Virtual IF stuck at 0** (bug sprint below) — intermittent across
+      games on hosted; programs freeze after minutes.
+- [ ] **DPMI client IOPL=3 leak** (bug sprint below) — backstopped, not
+      root-fixed.
+- [ ] **Interp idle efficiency:** DN idle on hosted burns 50/50
+      user/kernel in a softint polling storm (~1M softints/s through the
+      BIOS stubs); metal idles at user≈93%. Not a correctness gap, but the
+      out-of-box experience cooks a host core.
+- [ ] **Per-game bug-sprint list below** — most entries are hosted/interp;
+      retest each against current master (the reap fix + platform work may
+      have moved several), then fix by class, not by game.
+- [ ] COW fork (interp fork is a full copy — "M4"); fine for correctness,
+      costs ~6MB/launch of copying.
 
 # DOS Game Compatibility — Bug Sprint
 
