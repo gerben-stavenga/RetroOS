@@ -475,7 +475,23 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
     let mode = match regs.read::<u8>(0x449) {
         0x13 => VgaMode::Mode13h,
         0x02 | 0x03 | 0x07 => VgaMode::Text80x25, // 80×25 colour/mono text
-        _ => return,
+        other => {
+            // Unrenderable mode: log the real VGA register state once so a
+            // blank screen is diagnosable. Classifying from the BDA byte is
+            // itself a known gap — ModeX games (re)program CRTC/sequencer
+            // directly and the BDA still says 0x13; classification should
+            // move to VgaState registers.
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                let v = &pc.vga;
+                crate::dbg_println!("display_tick: unrenderable bda_mode={:#04x} misc={:#04x} seq=[{:02x} {:02x} {:02x} {:02x} {:02x}] gc5={:02x} gc6={:02x} crtc14={:02x} crtc17={:02x}",
+                    other, v.misc_output,
+                    v.seq[0], v.seq[1], v.seq[2], v.seq[3], v.seq[4],
+                    v.gc[5], v.gc[6], v.crtc[0x14], v.crtc[0x17]);
+            }
+            return;
+        }
     };
     let (w, h) = vga_render::dimensions(mode);
     let (base, len) = match mode {

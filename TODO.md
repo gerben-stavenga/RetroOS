@@ -252,8 +252,28 @@ Known gaps, roughly by leverage:
       project_hosted_game_workflow): mode 13h works via direct writes +
       renderer; planar modes need the A0000 window trapped through the
       VgaState plane logic on the interp. Unlocks a whole class of games.
-- [ ] **Raptor: DPMI crash on hosted** (works on metal? verify) — first
-      named casualty; likely shares a root with other DPMI-on-interp gaps.
+- [ ] **Store-storm slowdown: big guest memory clears crawl ~100-1000x**
+      (diagnosed 2026-06-11 via raptor). Raptor's old "DPMI crash" is gone;
+      it now EXECUTES but its init wedges for minutes inside a single
+      emu_start: gdb shows the CPU thread looping in
+      `helper_le_stw_mmu → find_memory_mapping` — every 16-bit store of a
+      REP-STOSW-class clear takes unicorn's TLB-miss slow path. Prime
+      suspect: the MEM_UNMAPPED hook commits + `uc.mem_map_ptr`s one page
+      at a time (arch-interp cpu.rs), and each mem_map_ptr rebuilds the
+      flatview and flushes the TLB — so a multi-MB clear pays a full TLB
+      flush per fresh 4K page and re-misses every store after it. Because
+      interp rdtsc/get_ticks are VIRTUAL (instruction-anchored,
+      backend.rs), everything downstream starves in lockstep: zero [prof]
+      lines for 280s+, no ticks, no display_tick, blank screenshot — the
+      baseline "RUNS" verdict was a false positive (empty at= list). Not a
+      deadlock, not a VGA gap. Fix directions: map bigger spans per
+      unmapped-fault (e.g. the whole committed region), or pre-map DPMI
+      allocations at alloc time, so mem_map_ptr/TLB-flush is amortized.
+- [ ] **display_tick classifies mode from the BDA byte (0x449), not from
+      VgaState registers** — ModeX games reprogram CRTC/sequencer directly
+      and the BDA still says 0x13, so the renderer either rejects the mode
+      or renders it wrong. Unrenderable modes now log register state once
+      (vga.rs); the real fix is deriving the mode from misc/seq/gc/crtc.
 - [ ] **Virtual IF stuck at 0** (bug sprint below) — intermittent across
       games on hosted; programs freeze after minutes.
 - [ ] **DPMI client IOPL=3 leak** (bug sprint below) — backstopped, not
@@ -285,10 +305,10 @@ screen capture. Harness limits: no mouse, blind pokes, no eyes on frames.
   (behavior changed; needs eyes). Next: rerun with high-cadence screen
   capture to read the exit messages, then fix by error class.
 - **Class C — runs; needs interactive/visual verification:**
-  raptor (WAS the named DPMI crash — now EXECUTES without crashing, but
-  publishes ZERO graphics frames across 60s+ of key-driving while
-  monkey2/skyroads render fine through the same pipeline → likely the
-  planar/ModeX VRAM-trapping gap, reinforcing parity item #1), settlers
+  raptor (WAS the named DPMI crash — now EXECUTES without crashing;
+  blank screen ROOT-CAUSED as the store-storm slowdown, see parity item
+  above: init crawls in unicorn's per-store TLB-miss slow path and the
+  virtual clock starves display_tick — NOT the planar gap), settlers
   (launches; the mouse-click #GP needs mouse injection to retest),
   goldenaxe (key coverage), extr-pinball (keypress-panic NOT reproduced
   under pokes — possibly fixed), indy4-atlantis (alive in graphics;
