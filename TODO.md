@@ -333,8 +333,16 @@ Known gaps, roughly by leverage:
       and the BDA still says 0x13, so the renderer either rejects the mode
       or renders it wrong. Unrenderable modes now log register state once
       (vga.rs); the real fix is deriving the mode from misc/seq/gc/crtc.
-- [ ] **Virtual IF stuck at 0** (bug sprint below) — intermittent across
-      games on hosted; programs freeze after minutes.
+- [x] **LIKELY FIXED: virtual IF stuck at 0 on hosted** (31c367b) — the
+      interp had no counterpart to metal's TF-stepping for POPF/IRET
+      silent IF-drops (Hexen-via-DOS32A class). Fix: PM clients enter
+      the software CPU at IOPL=3, so CLI/STI/POPF/IRET manipulate the
+      emulated IF natively — no faults, no stepping, no holes; safe
+      because IN/OUT hooks fire regardless of IOPL and slices end by
+      count. store_regs re-pins kernel-visible IOPL to 1. Hexen (the
+      documented hang) now runs and renders on the interp. Keep an eye
+      on the intermittent freezers (DN idle, settlers) for a while
+      before closing the sprint entries below.
 - [ ] **DPMI client IOPL=3 leak** (bug sprint below) — backstopped, not
       root-fixed.
 - [ ] **Interp idle efficiency:** DN idle on hosted burns 50/50
