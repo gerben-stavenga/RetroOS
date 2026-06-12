@@ -96,9 +96,6 @@ impl Arch for Metal {
     fn alloc_phys_contig(&mut self, num_pages: usize, boundary_log2: u32) -> u64 {
         super::calls::arch_alloc_phys_contig(num_pages, boundary_log2)
     }
-    fn phys_view(&mut self, ppage: u64, num_pages: usize) -> usize {
-        super::calls::arch_phys_view(ppage, num_pages)
-    }
     fn free_phys_contig(&mut self, start_page: u64, num_pages: usize) {
         super::calls::arch_free_phys_contig(start_page, num_pages)
     }
