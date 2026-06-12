@@ -278,6 +278,13 @@ pub trait Arch {
     /// (< 16 MB, not crossing a `1 << boundary_log2` boundary). Returns the
     /// starting physical page number, or 0 on failure.
     fn alloc_phys_contig(&mut self, num_pages: usize, boundary_log2: u32) -> u64;
+    /// Return a kernel-readable/writable address for `num_pages` contiguous
+    /// physical frames starting at `ppage`. The emulated VGA reads its plane
+    /// frames here while the guest writes them through an A0000 alias of the
+    /// same frames. On the interpreter this is the persistent phys view; on
+    /// metal it maps the frames into a fixed kernel window. Stable for a given
+    /// `ppage` (idempotent), so callers may cache it.
+    fn phys_view(&mut self, ppage: u64, num_pages: usize) -> usize;
     /// Free a run previously returned by `alloc_phys_contig`.
     fn free_phys_contig(&mut self, start_page: u64, num_pages: usize);
     /// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).

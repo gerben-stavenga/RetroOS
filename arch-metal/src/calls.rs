@@ -169,6 +169,21 @@ pub fn arch_load_ldt(ldt: &[u64]) {
     }
 }
 
+/// Map `num_pages` physical frames at `ppage` into the kernel VGA-VRAM window;
+/// returns the kernel VA. See `Arch::phys_view`.
+pub fn arch_phys_view(ppage: u64, num_pages: usize) -> usize {
+    let va: u32;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("eax") crate::arch_call::PHYS_VIEW as u32 => va,
+            in("edx") ppage as u32,
+            in("ecx") num_pages as u32,
+        );
+    }
+    va as usize
+}
+
 /// Map a range of physical pages into user virtual space.
 pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
     unsafe {

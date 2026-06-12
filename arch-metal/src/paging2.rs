@@ -1626,6 +1626,21 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     flush_tlb();
 }
 
+/// Map a physical page into kernel space (supervisor, writable) — used for
+/// kernel windows like the emulated-VGA VRAM view. Kernel-space mappings are
+/// shared across address spaces, so this persists across context switches.
+pub fn map_kernel_page_phys(vpage: usize, ppage: u64) {
+    match entries() {
+        Entries::E32(e) => { e[vpage] = Entry32::new(ppage, true, false); }
+        Entries::E64(e) => {
+            let mut entry = Entry64::new(ppage, true, false);
+            entry.set_raw(entry.raw() | flags::NO_EXECUTE);
+            e[vpage] = entry;
+        }
+    }
+    flush_tlb();
+}
+
 /// Map a physical page into the user address space.
 pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
     match entries() {

@@ -105,6 +105,7 @@ pub mod arch_call {
     pub const REARM_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
+    pub const PHYS_VIEW: u64 = 0x11F;          // EDX=ppage, ECX=num_pages -> EAX=kernel VA of those frames
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -249,6 +250,18 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::ALLOC_PHYS_CONTIG => {
             regs.rax = crate::phys_mm::alloc_phys_contig(
                 regs.rdx as usize, regs.rcx as u32).unwrap_or(0);
+        }
+        arch_call::PHYS_VIEW => {
+            // Map the frames into the kernel VGA-VRAM window and return its VA.
+            // Kernel space (shared across all address spaces), so the mapping
+            // persists across context switches — the emulated VGA caches it.
+            let ppage = regs.rdx as u64;
+            let num_pages = regs.rcx as usize;
+            const VRAM_WINDOW: usize = 0xFFE0_0000; // top of the FB kernel window
+            for i in 0..num_pages {
+                paging2::map_kernel_page_phys(VRAM_WINDOW / paging2::PAGE_SIZE + i, ppage + i as u64);
+            }
+            regs.rax = VRAM_WINDOW as u64;
         }
         arch_call::FREE_PHYS_CONTIG => {
             crate::phys_mm::free_phys_contig(regs.rdx as u64, regs.rcx as usize);

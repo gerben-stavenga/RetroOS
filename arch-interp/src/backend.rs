@@ -85,6 +85,11 @@ impl Arch for Interp {
     fn alloc_phys_contig(&mut self, num_pages: usize, boundary_log2: u32) -> u64 {
         crate::calls::arch_alloc_phys_contig(num_pages, boundary_log2)
     }
+    fn phys_view(&mut self, ppage: u64, _num_pages: usize) -> usize {
+        // The phys memfd is contiguous and the kernel view is persistent, so
+        // num_pages is implicit — the caller knows the span.
+        crate::phys::frame_ptr(ppage) as usize
+    }
     fn free_phys_contig(&mut self, start_page: u64, num_pages: usize) {
         crate::calls::arch_free_phys_contig(start_page, num_pages)
     }
