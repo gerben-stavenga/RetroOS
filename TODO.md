@@ -252,8 +252,30 @@ planes — the result is NOT what lands in linear A0000 RAM, so it must be
 modelled at WRITE time. The plane logic belongs in VgaState
 (vram_write/vram_read, kernel-side, the one VGA model). Open DESIGN question
 is the trap routing + where it runs:
-- [ ] Today A0000-AFFFF is plain demand-committed RAM (map_low_mem maps the
-      first 1MB), so mode 13h works linearly but planar writes are lost.
+- [ ] **Renderer + sync DONE** (be39c43, c1c2fce): model-complete renderer
+      (CGA/EGA-planar/ModeX, register classify) + chain4 split/merge, all
+      unit-tested. Remaining = the paging-alias feeder.
+- [ ] **Design LOCKED (metal-native, user-directed):** planes + a 64K
+      "chained view" are PHYSICAL frames; A0000 always aliases one linear
+      64K — the chained view (mode 13h/text) or the active plane (ModeX) —
+      via paging, so the CPU never traps. Sync (chain4_split/merge) runs
+      only on the rare chain<->unchain hop. EGA multi-plane set/reset
+      fan-out stays a #PF-trap fallback (later). Renderer reads chained
+      view for 13h, planes for ModeX.
+- [ ] **Metal: READY with existing primitives** — map_phys_range honors
+      ppage (int 0x80 page mapping). Plan: alloc_phys_contig the plane +
+      chained frames, map A0000's 16 vpages onto the active plane's frames,
+      repoint on SEQ chain-4 / mode change, renderer reads planes.
+- [ ] **Interp BLOCKER: no physical-memory model.** Its map_phys_range is a
+      stub (ignores ppage → map_fresh anonymous), and there's no guest-phys
+      namespace that both a guest A0000 mapping AND the kernel's plane-read
+      share. To "emulate the paging," the interp needs a real guest-phys
+      backing: a phys buffer that map_phys_range(vpage→ppage) aliases into
+      the guest VA window (mem_map_ptr) and that the kernel reads by phys
+      address. THIS IS THE SAME SUBSTRATE the kernel-write-alias / CoW items
+      want — one foundation, three unlocks. Build it next, then the VGA
+      paging-alias is small kernel wiring on top.
+- [ ] (superseded) Today A0000-AFFFF is plain demand-committed RAM.
 - [ ] **Routing options to decide:**
       (a) Kernel event per VRAM access — simplest, correct, but a kernel
           round-trip per byte; a full 64KB planar redraw at 20fps is ~1.3MB/s
