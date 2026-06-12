@@ -57,10 +57,11 @@ genrule(
 
 # DN file manager — shipped both in the boot bundle (disk boots) and in the
 # kernel's embedded bootfs (diskless boots).
+# The WHOLE directory ships — drop DN.ARH / config files in apps-boot/dn
+# and they're embedded on the next build; no hand-maintained list.
 _DN_FILES = {
-    "apps-boot/dn/DN." + ext: "DN/DN." + ext
-    for ext in ["COM", "PRG", "OVR", "DLG", "LNG", "HLP", "EDT", "EXT",
-                "HGL", "MNU", "VWR", "XRN", "FLG", "HIS"]
+    f: "DN/" + f.rsplit("/", 1)[-1]
+    for f in glob(["apps-boot/dn/*"])
 }
 
 # The kernel's embedded boot filesystem: DN + COMMAND.COM + a fallback
