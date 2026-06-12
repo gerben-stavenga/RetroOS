@@ -42,6 +42,7 @@ mod devices;
 mod hostfs;
 mod machine;
 mod mmu;
+mod phys;
 pub mod monitor;
 mod screendump;
 mod space;

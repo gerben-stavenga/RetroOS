@@ -127,8 +127,8 @@ pub fn arch_map_fresh_range(vpage: usize, count: usize) {
 }
 
 /// Map a range of physical pages into user virtual space.
-pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, _ppage_start: u64, _flags: u64) {
-    crate::mmu::map_phys(vpage_start, num_pages);
+pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, _flags: u64) {
+    crate::mmu::map_phys(vpage_start, num_pages, ppage_start);
     crate::cpu::invalidate_uc(vpage_start, num_pages);
 }
 
@@ -146,13 +146,15 @@ pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, _limit_in_pages: bo
 }
 
 /// Allocate ISA-DMA-safe physically-contiguous pages; returns start page or 0.
-pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
-    unimplemented!("interp DMA-contiguous allocation (not needed for flat-PM ELF)")
+pub fn arch_alloc_phys_contig(num_pages: usize, _boundary_log2: u32) -> u64 {
+    // The phys backing is a sparse memfd with a bump allocator; boundary
+    // alignment is irrelevant (no real DMA engine reads these on the interp).
+    crate::phys::alloc_frames(num_pages)
 }
 
 /// Free a contiguous run from `arch_alloc_phys_contig`.
 pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
-    unimplemented!("interp DMA-contiguous free")
+    crate::phys::free_frames(start_page, num_pages);
 }
 
 /// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).

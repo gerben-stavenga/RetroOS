@@ -317,10 +317,20 @@ pub fn swap_entries(a: usize, b: usize, count: usize) {
     });
 }
 
-/// Map `count` "physical" pages as committed RW (the interp has no separate
-/// physical frame namespace, so this is anonymous RW like `map_fresh`).
-pub fn map_phys(vpage: usize, count: usize) {
-    map_fresh(vpage, count);
+/// Alias `count` guest pages at `vpage` onto physical frames starting at
+/// `ppage` — the guest VA window and `crate::phys::frame_ptr(ppage)` then share
+/// storage (the interpreter's emulation of two PTEs pointing at one frame:
+/// VGA A0000↔plane, COW, an MMIO buffer). The `Space` reservation slot is
+/// `MAP_FIXED`-replaced by a shared view of the phys memfd.
+pub fn map_phys(vpage: usize, count: usize, ppage: u64) {
+    with_active(|sp| {
+        let dst = sp.page_ptr(vpage);
+        let ok = unsafe { crate::phys::alias_into(dst, ppage, count) };
+        assert!(ok, "map_phys alias failed at vpage {vpage:#x} ppage {ppage:#x}");
+        for p in vpage..(vpage + count).min(NUM_PAGES) {
+            sp.perm[p] = Perm { present: true, writable: true };
+        }
+    });
 }
 
 /// Map the first 1 MB user-accessible (committed RW). The metal call splits
