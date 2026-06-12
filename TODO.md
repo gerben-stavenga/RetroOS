@@ -418,11 +418,10 @@ build(); KBD_TRACE=true; DOS_TRACE_RT=true. Repro driver: boot cargo
 target/release/retroos-host with a WRITABLE image copy, stdin: 8s wait,
 type "cd \GAMES\PRINCE" 0.15s/char, Enter, 2s, ESC[B, Enter, wait.
 ALSO FOUND (separate bugs, file/fix independently):
-- [ ] BAZEL-native retroos-host wedges DN pre-UI (never draws, never reads
-      input; busy-loops) while the CARGO build of the same sources is
-      healthy — broken since the Bazel-native port (June 11); all --cmd
-      game testing missed it. Suspect build-flag-sensitive (panic=abort /
-      relocation-static / opt) or embedded-vs-file bootfs delta.
+- [x] BAZEL-native retroos-host wedged DN pre-UI: ROOT-CAUSED — it was
+      the unicorn store-fastpath patch (Bazel-only; see retraction above).
+      Unpatched Bazel host runs DN fully (panels, input). Build flags and
+      bootfs delivery were innocent.
 - [ ] DN.ARH (and the rest of DN's data set?) missing from the embedded
       bootfs — DN's archive-detection config; open fails silently. Decide:
       add to bootfs or accept.

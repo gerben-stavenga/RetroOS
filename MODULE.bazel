@@ -123,10 +123,6 @@ http_archive(
     url = "https://github.com/gerben-stavenga/unicorn-retroos-patch/archive/269253342e0cf2d415db12b3579abb865b43b13b.tar.gz",
     sha256 = "8c12a55228e395c9d5163161d8192c89913a7e839eafa7b6020fdf0a4502a524",
     strip_prefix = "unicorn-retroos-patch-269253342e0cf2d415db12b3579abb865b43b13b",
-    # Restores the QEMU store fast path the upstream fork disabled; should
-    # eventually land as a commit in the fork repo and the rev bumped.
-    patches = ["//toolchain:unicorn-store-fastpath.patch"],
-    patch_args = ["-p1"],
     build_file_content = """filegroup(
     name = "srcs",
     srcs = glob(["**"]),
