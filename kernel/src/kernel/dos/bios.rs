@@ -464,6 +464,18 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
             // Palette/DAC — forward to the DAC ports so the platform's
             // palette capture (and a real card on metal) sees one path.
             match (ax & 0xFF) as u8 {
+                0x03 => {
+                    // Toggle blink/intensity (BL bit 0: 1 = blink, 0 = 16
+                    // background colors). Program AC reg 0x10 bit 3 through
+                    // the ports like a real BIOS — one path for the emulated
+                    // model and a real card alike.
+                    let blink = regs.rbx & 1 != 0;
+                    let cur = dos.pc.vga.ac[0x10];
+                    let val = if blink { cur | 0x08 } else { cur & !0x08 };
+                    let _ = emulate_inb(machine, &mut dos.pc, 0x3DA); // reset AC flip-flop
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x10 | 0x20);
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, val);
+                }
                 0x10 => {
                     // Set one DAC register: BX=index, DH=R, CH=G, CL=B.
                     let (bx, dx, cx) = (regs.rbx as u8, regs.rdx, regs.rcx);

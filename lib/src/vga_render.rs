@@ -44,6 +44,11 @@ pub struct Frame<'a> {
     /// 8×16 glyph bitmap, 256 chars × 16 bytes (one bit per pixel). Required for
     /// text mode; ignored otherwise.
     pub font: &'a [u8],
+    /// Attribute bit 7 semantics (AC mode-control bit 3): `true` = blink
+    /// (bit 7 ignored here — not animated), `false` = 16 background colors.
+    /// TUIs (DN, NC) disable blink via INT 10h AX=1003 to get bright
+    /// backgrounds; masking bit 7 away rendered DN's dark-grey panels black.
+    pub blink: bool,
 }
 
 /// Output framebuffer dimensions for a mode. Text is 80×25 cells of 9×16 px
@@ -183,9 +188,9 @@ const TEXT_ROWS: usize = 25;
 const CELL_W: usize = 9; // 8 glyph + 1 (col 8 repeats col 7 for line-draw)
 const CELL_H: usize = 16;
 
-/// 80×25 text: char+attr cells through the 8×16 font. Attribute byte is
-/// `BBBBFFFF`-ish: bits 0-3 = foreground palette index, bits 4-6 = background
-/// (bit 7 = blink, rendered as background bit 3 here — i.e. no blink).
+/// 80×25 text: char+attr cells through the 8×16 font. Attribute byte:
+/// bits 0-3 = foreground palette index; bits 4-6 = background; bit 7 =
+/// blink when `frame.blink`, else background intensity (16 bg colors).
 fn render_text(frame: &Frame, out: &mut [u32], w: usize, _h: usize) {
     for row in 0..TEXT_ROWS {
         for col in 0..TEXT_COLS {
@@ -215,7 +220,8 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let ch = frame.vram[cell] as usize;
     let attr = frame.vram[cell + 1];
     let fg = pal_rgb(frame.palette, attr & 0x0F);
-    let bg = pal_rgb(frame.palette, (attr >> 4) & 0x07);
+    let bg_mask = if frame.blink { 0x07 } else { 0x0F };
+    let bg = pal_rgb(frame.palette, (attr >> 4) & bg_mask);
     let glyph = &frame.font[ch * 16..ch * 16 + 16];
     for gy in 0..CELL_H {
         let bits = glyph[gy];

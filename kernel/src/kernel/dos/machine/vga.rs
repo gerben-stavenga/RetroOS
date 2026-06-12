@@ -103,7 +103,12 @@ impl VgaState {
             seq: [0; 5],
             crtc: [0; 25],
             gc: [0; 9],
-            ac: [0; 21],
+            // AC mode-control (reg 0x10) bit 3 set: blink semantics for
+            // attribute bit 7, the BIOS mode-3 power-on default. TUIs that
+            // want 16 background colors clear it (INT 10h AX=1003 BL=0 or a
+            // direct AC write — both land here); DN's dark-grey panels
+            // (bg=8) rendered black until this was modeled.
+            ac: { let mut a = [0u8; 21]; a[0x10] = 0x08; a },
             dac: lib::vga_render::fallback_palette(),
             dac_mask: 0xFF,
             seq_index: 0,
@@ -505,6 +510,7 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         vram: &vram,
         palette: &pc.vga.dac,
         font: &lib::vga_font_8x16::FONT_8X16,
+        blink: pc.vga.ac[0x10] & 0x08 != 0,
     };
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);

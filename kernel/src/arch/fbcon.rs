@@ -291,6 +291,7 @@ fn flush() {
         },
         palette: unsafe { &*(&raw const PALETTE) },
         font: &FONT_8X16,
+        blink: false,
     };
     let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
     let native = g.format.is_native();
@@ -315,6 +316,7 @@ fn flush() {
                 vram: &frame.vram[cell..cell + 2],
                 palette: frame.palette,
                 font: frame.font,
+                blink: frame.blink,
             };
             vga_render::render_text_cell(&cell_frame, 0, 0, &mut cell_pixels, CELL_W);
             let x = (i % 80) * CELL_W;
