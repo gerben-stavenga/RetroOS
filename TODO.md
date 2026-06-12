@@ -243,6 +243,40 @@ multiboot map called free, or something interrupt/time-driven).
 
 ---
 
+## VGA: planar/Mode X VRAM trapping (renderer done be39c43; needs the feeder)
+The shared renderer now draws CGA/EGA-planar/Mode X from a 4-plane model +
+registers (lib::vga_render, unit-tested). What's missing is POPULATING the
+planes: planar/unchained writes route a single CPU store to A0000 through the
+GC (write modes 0-3, the 4 latches, SEQ plane mask, bit mask + ALU) into 1-4
+planes — the result is NOT what lands in linear A0000 RAM, so it must be
+modelled at WRITE time. The plane logic belongs in VgaState
+(vram_write/vram_read, kernel-side, the one VGA model). Open DESIGN question
+is the trap routing + where it runs:
+- [ ] Today A0000-AFFFF is plain demand-committed RAM (map_low_mem maps the
+      first 1MB), so mode 13h works linearly but planar writes are lost.
+- [ ] **Routing options to decide:**
+      (a) Kernel event per VRAM access — simplest, correct, but a kernel
+          round-trip per byte; a full 64KB planar redraw at 20fps is ~1.3MB/s
+          of trapped writes → likely too slow.
+      (b) Arch-side shared plane model — give the interp mem hook a pointer to
+          the active thread's VgaState plane buffer + GC/SEQ latch state so the
+          ALU runs in-hook without a kernel round-trip. Fast, but punches a
+          hole in the arch boundary (arch touching kernel VGA state) unless we
+          define a narrow "VRAM accessor" arch primitive the kernel installs.
+      (c) Metal mirror: on metal-with-card the real hardware does this; on
+          UEFI-no-card metal we'd need the same trap via #PF on the A0000
+          mapping. So whatever (b) looks like should be expressible on both
+          backends below the arch boundary.
+- [ ] Also needed for register-authoritative classification: the personality
+      BIOS INT 10h AH=00 should PROGRAM the canonical CRTC/SEQ/GC/AC register
+      set per mode (it currently only writes the BDA byte + DAC). Then
+      classify() trusts registers for everything incl. post-BIOS Mode X, and
+      the BDA fallback becomes belt-and-suspenders. Independent of trapping
+      but pairs with it.
+- [ ] Latch/read modelling: planar READS load the 4 latches (used by
+      write-mode-1 copies and read-mode-1 colour-compare); the model needs
+      both directions, not just writes.
+
 # PRIORITY: Interp parity with metal
 
 The hosted/interp backend must run DOS software at the same level as metal —
