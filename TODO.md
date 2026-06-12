@@ -307,12 +307,21 @@ Known gaps, roughly by leverage:
       0xFF's stub cell, mirroring real-BIOS topology; dispatch and
       hooked-detection are offset-independent. DOS/4GW now prints its
       Rational Systems banner and proceeds.
-- [ ] **Raptor layer 3: SEGV after the DOS/4GW banner** — wild fetch at
-      linear 0xea0051d5 (guest cs:ip 04e6:0x2372, VM flag set, err=0)
-      right after "Copyright (c) Rational Systems" prints. A wild far
-      jump through garbage, next diagnosis target. Note the kernel SEGV
-      report's rip (0x2372) and the fault addr disagree — check whether
-      the reported regs are stale vs the faulting fetch.
+- [x] **FIXED: raptor layer 3 / duke3d crash — PM CLI/STI #GP must be
+      emulated by the host** (1bb17d2). A CPL-3 STI #GPs at IOPL<3 and a
+      DPMI host emulates it against the virtual IF (CWSDPMI/HDPMI do);
+      we dispatched the #GP to the client's exception handler instead.
+      DOS/4GW's IRQ epilogue STIs on every timer tick, so the first
+      delivery after sound init cascaded (client #GP handler -> INT FC
+      -> crossed HC unwind -> wild fetch at (0xEA00<<16)|0x51D5). Metal
+      dodges via the IOPL=3 leak — root-fix that leak and metal rides
+      this same path. Raptor now RENDERS GRAPHICS on the interp; duke3d
+      1.3d shareware runs through DOS/4GW 1.97 init (silent exit left =
+      synthetic DUKE3D.CFG values, run real SETUP.EXE). Bonus fixes en
+      route: interp CPL-0 iretd trampoline made atomic (slice ending
+      mid-switch leaked ring-0 state as user regs), HC push/pop ledger
+      now permanent DOS_TRACE lines. The kernel SEGV report prints stale
+      saved regs — still worth fixing (separate small item).
 - [ ] **display_tick classifies mode from the BDA byte (0x449), not from
       VgaState registers** — ModeX games reprogram CRTC/sequencer directly
       and the BDA still says 0x13, so the renderer either rejects the mode
