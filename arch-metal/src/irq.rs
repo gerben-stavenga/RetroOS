@@ -126,20 +126,32 @@ pub fn init_interrupts() {
     const APIC_DELIVERY_EXTINT: u64 = 7 << 8;
 
     lib::println!("IRQ: APIC routing");
-    let apic_base = crate::x86::rdmsr(IA32_APIC_BASE);
-    let modern_x2apic =
-        apic_base & (APIC_ENABLE | X2APIC_ENABLE) == (APIC_ENABLE | X2APIC_ENABLE);
-    if modern_x2apic {
-        // x2APIC registers are MSR 0x800 + (xAPIC MMIO offset >> 4).
-        // Enable the local APIC in SVR before unmasking LINT0; with software
-        // enable clear, hardware forces all LVT entries masked.
-        let svr = crate::x86::rdmsr(X2APIC_SVR);
-        unsafe {
-            crate::x86::wrmsr(X2APIC_SVR, (svr & 0x3FF) | APIC_SOFTWARE_ENABLE);
-            crate::x86::wrmsr(X2APIC_LVT_LINT0, APIC_DELIVERY_EXTINT);
+    // IA32_APIC_BASE (MSR 0x1B) is architectural only from P6: a P5-class
+    // part #GPs on the RDMSR even when CPUID advertises an on-chip APIC
+    // (its APIC base is fixed, no MSR) — 86Box's pentium_p54c machine died
+    // exactly here. Gate all APIC-base work on family >= 6 + the CPUID
+    // APIC feature bit; anything older is a pure-PIC machine and INTR
+    // already reaches the CPU.
+    let (sig, _, _, edx) = crate::x86::cpuid(1);
+    let family = (sig >> 8) & 0xF;
+    let has_apic_base_msr = family >= 6 && edx & (1 << 9) != 0;
+    let mut modern_x2apic = false;
+    if has_apic_base_msr {
+        let apic_base = crate::x86::rdmsr(IA32_APIC_BASE);
+        modern_x2apic =
+            apic_base & (APIC_ENABLE | X2APIC_ENABLE) == (APIC_ENABLE | X2APIC_ENABLE);
+        if modern_x2apic {
+            // x2APIC registers are MSR 0x800 + (xAPIC MMIO offset >> 4).
+            // Enable the local APIC in SVR before unmasking LINT0; with software
+            // enable clear, hardware forces all LVT entries masked.
+            let svr = crate::x86::rdmsr(X2APIC_SVR);
+            unsafe {
+                crate::x86::wrmsr(X2APIC_SVR, (svr & 0x3FF) | APIC_SOFTWARE_ENABLE);
+                crate::x86::wrmsr(X2APIC_LVT_LINT0, APIC_DELIVERY_EXTINT);
+            }
+        } else if apic_base & APIC_ENABLE != 0 {
+            unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !APIC_ENABLE) };
         }
-    } else if apic_base & APIC_ENABLE != 0 {
-        unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !APIC_ENABLE) };
     }
 
     lib::println!("IRQ: PIC");
