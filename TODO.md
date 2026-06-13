@@ -336,6 +336,27 @@ is the trap routing + where it runs:
       write-mode-1 copies and read-mode-1 colour-compare); the model needs
       both directions, not just writes.
 
+## Interp real paging (branch interp-real-paging — IN PROGRESS)
+Replaces the per-page mem_map_ptr region model (Doom O(n^2) flatview blowup,
+perf-proven) with QEMU's topology: guest RAM = ONE region, kernel page tables
+in guest RAM, CR3/CR0.PG set, unicorn softmmu walks them. Done so far:
+- [x] Proof: unicorn walks page tables we build (non-identity translate).
+- [x] Page-table primitives over the phys memfd: new_page_dir / map_page /
+      unmap_page / translate, unit-tested (arch-interp/src/paging.rs).
+Remaining:
+- [ ] RootPageTable = page-directory ppage (not a Space id); switch = set CR3;
+      fork = COW (clone PD, RW->RO + copy-on-write-fault).
+- [ ] One unicorn region for all guest physical RAM (the memfd), mapped once.
+- [ ] configure(): CR3 from active space + CR0.PG; GDT already built.
+- [ ] kernel mem()/copy_from/copy_to via translate() (software walk).
+- [ ] Reimplement Arch mem methods on real tables (map_low_mem, map_fresh_range,
+      set_page_flags, map_phys_range, unmap/free_range, clean, alloc_phys).
+- [ ] Build the initial kernel page-table layout at boot (user 0-3GB, kernel
+      0xC0B00000+, recursive view, low-mem identity for VM86).
+- [ ] Switch over; run raptor/doom/dn/duke + re-profile Doom (qemu_ram_alloc_
+      from_ptr must vanish); delete the old Space model.
+NOTE: master keeps the working Space model until this branch lands.
+
 # PRIORITY: Interp parity with metal
 
 The hosted/interp backend must run DOS software at the same level as metal —
