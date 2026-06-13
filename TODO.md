@@ -336,7 +336,28 @@ is the trap routing + where it runs:
       write-mode-1 copies and read-mode-1 colour-compare); the model needs
       both directions, not just writes.
 
-## Interp real paging (branch interp-real-paging — IN PROGRESS)
+## Interp real paging (branch interp-real-paging — LANDED, one follow-up)
+STATUS 2026-06-12: the live wiring is done and working. unicorn runs CR0.PG=1
+over ONE guest-physical region (the phys memfd), softmmu walks our page tables.
+Verified: kernel boot, VM86/DOS (DN, SkyRoads render; in-OS TCC builds a
+byte-identical COMMAND.COM), and DOS/4GW PM (Doom runs through init at full
+interpreter speed — the per-page mem_map_ptr O(n^2) blowup is gone). Commits:
+ad2a678 (vm86 paged proof), a31b9da (live wiring), b487e07 (fault ownership).
+Key bring-up fixes: run_trampoline must clear EFLAGS.VM before the CR0 bootstrap
+(entering from a prior VM86 slice otherwise stays in VM86 and the iretd never
+switches); and with PG=1 + no guest IDT a demand #PF escalates to #DF (vec 8) —
+the intr hook snapshots the FIRST fault's vector+CR2 so the interp owns paging
+faults (the guest IDT must never see them).
+REMAINING (not paging-architecture; a DPMI timing detail):
+- [ ] Doom spins in a PM timer-wait loop (at 01DF:0063258F, softint=0, an
+      apparent IRQ0 storm: ~1M timer IRQs per profile interval with no progress).
+      Doom's INT 8 tick ISR isn't advancing its counter. Suspect virtual-time /
+      timer-IRQ delivery to the PM client (cf. feedback_interp_virtual_time_full
+      _retire — block-hook charges time per block; a tight PM spin may overcharge
+      and storm IRQ0). Next: trace whether the kernel invokes Doom's PM IRQ0 ISR
+      at all, or only counts the IRQ; check EOI/IF gating for PM IRQ delivery.
+
+## Interp real paging (superseded plan below — kept for the wiring checklist)
 Replaces the per-page mem_map_ptr region model (Doom O(n^2) flatview blowup,
 perf-proven) with QEMU's topology: guest RAM = ONE region, kernel page tables
 in guest RAM, CR3/CR0.PG set, unicorn softmmu walks them. Done so far:
