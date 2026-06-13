@@ -1,3 +1,36 @@
-# Package exists so crate_universe can reference //play:Cargo.toml as a
-# workspace-member manifest. retroos-play itself stays cargo-built — it owns
-# the SDL dependency and is a developer A/V tool, not a build input.
+# retroos-play — the windowed (SDL) hosted A/V tool. Built under Bazel like
+# everything else so it links the ONE patched unicorn (//third_party/unicorn,
+# no-double-fault). It used to be cargo-only; cargo pulled the fork's unpatched
+# unicorn rev, whose #DF synthesis surfaced as 0xFFFFFFFE SEGVs once VM86 ran at
+# IOPL=1 — the "bazel+cargo must link identical unicorn" landmine. Cargo.toml
+# stays only as a crate_universe manifest (dependency data, not a build path).
+#
+# SDL2 comes from @crates//:sdl2 (the sdl2 crate's `bundled`+`static-link`
+# features compile a static SDL2 in its build script — no system libSDL2 at
+# build or run time). Build for the host: --platforms=@platforms//host.
+#
+# Bootfs is EMBEDDED (//kernel:bootfs_host + kernel_hosted's --cfg=bootfs_embedded),
+# exactly like retroos-host — so the windowed launch is one host-platform build
+# with no separate //:bootfs_tar step (which would flip --platforms and discard
+# Bazel's analysis cache every run).
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "retroos-play",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "retroos_play",
+    edition = "2021",
+    rustc_flags = [
+        "-Cpanic=abort",
+        # //lib + //arch-abi are -Crelocation-model=static (non-PIC); match it.
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//arch-interp",
+        "//kernel:bootfs_host",
+        "//kernel:kernel_hosted",
+        "//lib",
+        "@crates//:sdl2",
+    ],
+)

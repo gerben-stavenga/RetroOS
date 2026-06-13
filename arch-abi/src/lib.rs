@@ -20,6 +20,8 @@
 mod arch;
 pub use arch::{Arch, GuestBytes, Vcpu};
 
+pub mod monitor;
+
 /// Single-step trace budget — a cross-boundary diagnostic, not an arch operation.
 /// Armed by the DOS/DPMI layer (kernel) to watch a client's code path after a
 /// suspicious return; consumed by the backend's single-step `#DB` handler, which

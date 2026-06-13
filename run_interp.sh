@@ -72,14 +72,14 @@ if [ -n "$TERMINAL" ]; then
     exec bazel-bin/kernel/retroos-host "${ARGS[@]}" "$@"
 fi
 
-# Window mode: retroos-play stays cargo-built (it owns the SDL dependency).
-# The cargo build has no embedded bootfs; it loads bazel-bin/bootfs_tar.tar
-# at startup (and refuses to run without it), so make sure it's built.
-bazelisk build //:bootfs_tar
+# Window mode: retroos-play is Bazel-built like everything else, so it links the
+# ONE patched unicorn (//third_party/unicorn). The bootfs is embedded (same as
+# retroos-host), so this is a single host-platform build — no //:bootfs_tar step
+# that would flip --platforms and discard Bazel's analysis cache every run.
+bazelisk build //play:retroos-play --platforms=@platforms//host
 [ -n "$WAV" ] && ARGS+=(--wav "$WAV")
 if [ -n "$CMD" ]; then
     ARGS+=(--cwd "$(dirname "$CMD")/")
 fi
-cargo build --release -p retroos-play
 [ -n "$TRACE" ] && export RETRO_TRACE=1
-exec target/release/retroos-play "${ARGS[@]}" "$@"
+exec bazel-bin/play/retroos-play "${ARGS[@]}" "$@"

@@ -554,7 +554,21 @@ fn map_kernel_windows(pd: u64) {
 /// `mmu::ensure_committed` (the metal kernel's ring-1 access faults the page in
 /// transparently); the interpreter "kernel" is host code, so it does the commit.
 pub fn space_resolve(vaddr: u32) -> *mut u8 {
-    let pd = active_pd();
+    resolve_in(active_pd(), vaddr)
+}
+
+/// Resolve `vaddr` to a host pointer through a SPECIFIC page directory `pd`
+/// (a ppage, i.e. CR3>>12), not the ambient active space. Demand-commits an
+/// absent page exactly like `space_resolve`.
+///
+/// The sensitive-instruction monitor must read/write the *interpreted thread's*
+/// memory regardless of which space is globally active: a windowed run's
+/// render/focus path can move `active` between the slice and the post-slice
+/// monitor decode, so binding to the running CR3 (not `active_pd()`) is what
+/// keeps the IVT/stack/code reads pointing at the right space. Reproducer:
+/// windowed DN #GP'ing on its first INT 21h read a stale space's IVT → wild
+/// `0xFFFFFFFE` jump; headless (single space) never diverged.
+pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
     let pa = match translate(pd, vaddr) {
         Some(pa) => pa,
         None => {
@@ -564,6 +578,22 @@ pub fn space_resolve(vaddr: u32) -> *mut u8 {
         }
     };
     unsafe { phys::frame_ptr((pa >> 12) as u64).add((pa & 0xFFF) as usize) }
+}
+
+/// Page-directory ppage of the space named by `id` (not the active space).
+pub fn pd_of_space(id: u32) -> u64 {
+    SPACES.with(|s| *s.borrow().pd.get(&id).expect("resolve in unknown space"))
+}
+
+/// Resolve `vaddr` through a SPECIFIC address-space `id`'s page directory — the
+/// space-id form of [`resolve_in`]. The sensitive-instruction monitor uses this
+/// to read/write the *interpreted thread's* memory (the thread carries its
+/// space id in its `RootPageTable`), which is the only space guaranteed to be
+/// the right one: the kernel moves the globally-`active` space around to peek
+/// other spaces (exec argv copy, focus VGA snapshot), and unicorn's CR3 follows
+/// `active`, so neither is a safe basis for the monitor's reads.
+pub fn resolve_in_space(id: u32, vaddr: u32) -> *mut u8 {
+    resolve_in(pd_of_space(id), vaddr)
 }
 
 /// Guest-fault resolve from the software CPU (#PF, no EIP progress + CR2). Returns

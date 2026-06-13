@@ -17,11 +17,68 @@
 //!   (a deterministic timer tick → `Irq`).
 
 use crate::vcpu;
+use arch_abi::monitor::{GuestView, MonitorResult};
 use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
 use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
+
+/// Interp guest-memory view for the shared sensitive-instruction monitor.
+///
+/// Bound by `&mut` to the **interpreted thread's** address space — the
+/// `RootPageTable` (a space id) carried in the live `REGS`. This is the only
+/// correct basis for the monitor's reads/writes: the kernel moves the globally
+/// `active` space around to peek other spaces (exec argv copy, focus VGA
+/// snapshot), and unicorn's CR3 follows `active`, so neither names the thread we
+/// are decoding. Resolving through the thread's own space id (never `active`)
+/// is the software-MMU analogue of metal, where the faulting thread's page
+/// tables are simply live during the #GP. The `&mut` is exactly the "mut ref to
+/// the thread" guest writes (PUSHF/INT frames) and demand-paged reads require.
+///
+/// All addresses are linear; access is byte-wise so a 16/32-bit access that
+/// straddles a page boundary still lands correctly.
+struct InterpView<'a> {
+    space: &'a mut crate::space::RootPageTable,
+}
+
+impl InterpView<'_> {
+    #[inline]
+    fn load<const N: usize>(&mut self, lin: u32) -> [u8; N] {
+        let id = self.space.0;
+        let mut b = [0u8; N];
+        for i in 0..N {
+            b[i] = unsafe { *crate::paging::resolve_in_space(id, lin.wrapping_add(i as u32)) };
+        }
+        b
+    }
+    #[inline]
+    fn store(&mut self, lin: u32, src: &[u8]) {
+        let id = self.space.0;
+        for (i, &byte) in src.iter().enumerate() {
+            unsafe { *crate::paging::resolve_in_space(id, lin.wrapping_add(i as u32)) = byte; }
+        }
+    }
+}
+
+impl GuestView for InterpView<'_> {
+    #[inline]
+    fn read8(&mut self, lin: u32) -> u8 { self.load::<1>(lin)[0] }
+    #[inline]
+    fn read16(&mut self, lin: u32) -> u16 { u16::from_le_bytes(self.load::<2>(lin)) }
+    #[inline]
+    fn read32(&mut self, lin: u32) -> u32 { u32::from_le_bytes(self.load::<4>(lin)) }
+    #[inline]
+    fn write16(&mut self, lin: u32, val: u16) { self.store(lin, &val.to_le_bytes()); }
+    #[inline]
+    fn write32(&mut self, lin: u32, val: u32) { self.store(lin, &val.to_le_bytes()); }
+    #[inline]
+    fn seg_base(&mut self, sel: u16) -> u32 { crate::desc::seg_base(sel) }
+    #[inline]
+    fn seg_is_32(&mut self, sel: u16) -> bool { crate::desc::seg_is_32(sel) }
+    #[inline]
+    fn int_intercepted(&mut self, vector: u8) -> bool { crate::desc::int_intercepted(vector) }
+}
 
 const PAGE: u64 = 4096;
 
@@ -156,17 +213,20 @@ fn build() -> Unicorn<'static, Ctx> {
             let _ = uc.emu_stop();
             return;
         }
-        // Real-mode (VM86) `INT n` / exception the redirection bitmap does not
-        // trap: reflect to the IVT *in place* and keep running, so the slice runs
-        // through the handler like TCG does — only trapped vectors (0x31) and the
-        // DPL=3 gates (3/4) bubble to the kernel. (#PF, vector 14, is excluded
-        // above — it is the paging backend's, not the guest's.) PM ints/faults
-        // always bubble. VM86 is now entered paged (PE=1), so detect it by
-        // EFLAGS.VM, not PE=0; both software INTs and CPU exceptions vector
-        // through the IVT in real mode, matching the old PE=0 path.
+        // Genuine VM86 CPU exception the redirection bitmap does not trap (e.g.
+        // #DE, #UD): reflect to the IVT *in place* and keep running, so the slice
+        // runs through the program's own real-mode handler like TCG does.
+        //
+        // At IOPL=1 the IOPL-sensitive instructions — `INT n` included — raise
+        // #GP (vector 13), NOT a direct software interrupt, so they no longer
+        // arrive here as vector n: the shared monitor decodes the #GP and does
+        // the IVT reflect (or bubbles SoftInt for trapped/DPL=3 vectors). Vector
+        // 13 must therefore bubble, never reflect (reflecting it would vector
+        // through IVT[0Dh] — a guest disk/UMB handler — instead of the monitor).
+        // #PF (14/8) is excluded above (the paging backend's). PM faults bubble.
         let _ = is_int;
         let in_vm86 = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0) & VM_FLAG != 0;
-        if vector != 3 && vector != 4
+        if vector != 3 && vector != 4 && vector != 13
             && in_vm86
             && !crate::desc::int_intercepted(vector)
         {
@@ -288,7 +348,14 @@ pub fn execute() -> KernelEvent {
         // IF-touching opcodes in software so we only ever hand unicorn a
         // non-sensitive instruction (which `configure` then TF-single-steps).
         if mode == UserMode::Mode32 && regs.flags32() & IF_FLAG == 0 {
-            step_virtual_if(regs);
+            // A sensitive op decoded during stepping (e.g. IRET popping CS=0)
+            // bubbles as an Event — surface it rather than re-entering. The view
+            // is bound to the interpreted thread's own space (REGS.space), not
+            // the globally-active one.
+            let mut view = InterpView { space: unsafe { &mut (*(&raw mut vcpu::REGS)).space } };
+            if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if(regs, &mut view) {
+                return ev;
+            }
         }
         // Roll to the next IRQ0 grid period once the last was fully spent; a trap
         // carries the remainder over so the grid stays fixed in cumulative
@@ -374,44 +441,37 @@ pub fn execute() -> KernelEvent {
             if n == 1 && !is_int {
                 continue;
             }
+            // Sensitive-instruction #GP (error code 0): decode through the shared
+            // monitor — the same decoder arch-metal runs on its real #GP, so the
+            // kernel NEVER sees an Exception(13) for these on either backend. At
+            // IOPL=1 this covers VM86 CLI/STI/PUSHF/POPF/IRET/INT (all #GP) and
+            // PM CLI/STI (PM POPF/IRET silently drop IF and are caught by TF
+            // stepping instead). `Resume` re-enters the client; `Event` bubbles
+            // (SoftInt for trapped/IVT-redirected INTs and INT3/INTO, In/Out for
+            // port I/O, Hlt for idle); `Fault` is a genuine #GP, handled below.
+            // Reproducer: DOS/4GW's IRQ epilogue STIs on every timer tick
+            // (duke3d/raptor at sound init); forwarding the #GP to the client's
+            // own handler cascaded into a wild jump.
+            if n == 13 && !is_int && uc.get_data().pending_err == 0 {
+                let mut view = InterpView { space: unsafe { &mut (*(&raw mut vcpu::REGS)).space } };
+                match arch_abi::monitor::monitor(regs, &mut view) {
+                    MonitorResult::Resume => continue,
+                    MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
+                    MonitorResult::Event(ev) => return ev,
+                }
+            }
             if mode == UserMode::VM86 {
-                // Non-trapped VM86 ints are reflected to the IVT in the intr hook
-                // (run-through), so only trapped vectors (0x31) and the DPL=3
-                // gates (3/4) reach here.
+                // Residual VM86 traps the monitor didn't consume: genuine
+                // exceptions the intr hook bubbled, and the DPL=3 gates. Match
+                // the pre-IOPL=1 behaviour and surface them as SoftInt(n).
                 return KernelEvent::SoftInt(n);
             }
-            // Protected mode: the engine tells us directly whether this was a
-            // software `int n` or a CPU fault (`exception_is_int`, surfaced by
-            // our Unicorn patch). A fault becomes a typed Exception carrying the
-            // CPU error code (the faulting selector for #NP/#GP — what a DPMI
-            // host needs to demand-load the right overlay segment); a software
-            // int (`int 0x21`/`0x11`/…) becomes a SoftInt. No vector heuristics,
-            // no guest-opcode inspection.
+            // Protected mode: a software `int n` (DPL=3 gate / 0x80) becomes a
+            // SoftInt; any other CPU fault becomes a typed Exception carrying the
+            // error code (the faulting selector for #NP/#GP — what a DPMI host
+            // needs to demand-load the right overlay segment).
             if is_int {
                 return KernelEvent::SoftInt(n);
-            }
-            // #GP on a CPL-3 CLI/STI (IOPL < 3): the DPMI host must emulate
-            // the instruction against the virtual IF. This lives below the
-            // arch boundary — arch-metal's #GP path runs its sensitive-
-            // instruction monitor the same way — so the kernel NEVER sees an
-            // Exception(13) for these on either backend. In PM only CLI/STI
-            // fault like this (POPF/IRET silently drop IF instead).
-            // Reproducer: DOS/4GW's IRQ epilogue STIs on every timer tick
-            // (duke3d/raptor at sound init); forwarding the #GP to the
-            // client's exception handler cascaded into a wild jump.
-            if n == 13 && uc.get_data().pending_err == 0 {
-                let lin = crate::desc::seg_base(regs.code_seg())
-                    .wrapping_add(regs.ip32());
-                let op = crate::vcpu::mem().read::<u8>(lin as usize);
-                if op == 0xFA || op == 0xFB {
-                    if op == 0xFB {
-                        regs.frame.rflags |= 1 << 9; // STI: set virtual IF
-                    } else {
-                        regs.frame.rflags &= !(1 << 9); // CLI: clear it
-                    }
-                    regs.frame.rip = regs.frame.rip.wrapping_add(1);
-                    continue;
-                }
             }
             regs.err_code = uc.get_data().pending_err as u64;
             return KernelEvent::Exception(n);
@@ -441,86 +501,14 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
 const IF_FLAG: u32 = 1 << 9;
 const TF_FLAG: u32 = 1 << 8;
 
-/// Virtual-IF single-step driver — the interp twin of arch-metal's
-/// `step_virtual_if`. A PM client runs at CPL=3, IOPL=1 (exactly like the real
-/// processor on metal): `CLI`/`STI` `#GP` and are emulated, but `POPF`/`IRET`
-/// at CPL>IOPL *silently drop* the IF bit instead of faulting, so the host can't
-/// see them. While the client's virtual IF is 0, we therefore walk the
-/// instruction stream in software, emulating every IF-touching opcode
-/// (`PUSHF`/`POPF`/`IRET`/`CLI`/`STI`) so the IF bit is never lost; non-sensitive
-/// instructions are handed to unicorn one at a time under `TF` (set in
-/// `configure`). When virtual IF comes back on we stop and resume at full speed.
-/// Leaves `regs` either with IF=1 (resume) or at a non-sensitive instruction
-/// with IF=0 (TF-step it). Stack/flags semantics follow SS.B / operand size.
-fn step_virtual_if(regs: &mut Regs) {
-    const BUDGET: usize = 64;
-    let m = crate::vcpu::mem();
-    for _ in 0..BUDGET {
-        if regs.flags32() & IF_FLAG != 0 {
-            return; // IF back on — resume hardware execution
-        }
-        let cs_base = crate::desc::seg_base(regs.code_seg());
-        let cs32 = crate::desc::seg_is_32(regs.code_seg());
-        let ss = regs.stack_seg();
-        let ss_base = crate::desc::seg_base(ss);
-        let ss32 = crate::desc::seg_is_32(ss);
-        // Skip prefixes; 0x66 toggles operand size from the CS default.
-        let mut p = regs.ip32();
-        let mut osz32 = cs32;
-        loop {
-            let b: u8 = m.read(cs_base.wrapping_add(p) as usize);
-            match b {
-                0x66 => { osz32 = !cs32; p = p.wrapping_add(1); }
-                0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => {
-                    p = p.wrapping_add(1);
-                }
-                _ => break,
-            }
-        }
-        let op: u8 = m.read(cs_base.wrapping_add(p) as usize);
-        let after = p.wrapping_add(1);
-        let osz: u32 = if osz32 { 4 } else { 2 };
-        let eff = |sp: u32| if ss32 { sp } else { sp & 0xFFFF };
-        let dec = |sp: u32| if ss32 { sp.wrapping_sub(osz) } else { (sp & !0xFFFF) | ((sp as u16).wrapping_sub(osz as u16) as u32) };
-        let inc = |sp: u32| if ss32 { sp.wrapping_add(osz) } else { (sp & !0xFFFF) | ((sp as u16).wrapping_add(osz as u16) as u32) };
-        let rd = |sp: u32| -> u32 {
-            let a = ss_base.wrapping_add(eff(sp)) as usize;
-            if osz == 4 { m.read::<u32>(a) } else { m.read::<u16>(a) as u32 }
-        };
-        // Apply popped flags: take the standard bits, keep client IOPL/VM, drop
-        // our stepping TF, set reserved bit 1. The IF bit becomes the virtual IF.
-        let apply_flags = |regs: &mut Regs, f: u32| {
-            let keep = regs.flags32() & (IOPL_MASK as u32 | (1 << 17));
-            regs.set_flags32((f & !(IOPL_MASK as u32) & !(1u32 << 17) & !TF_FLAG) | keep | 2);
-        };
-        match op {
-            0xFA => { let f = regs.flags32() & !IF_FLAG; regs.set_flags32(f); regs.set_ip32(after); } // CLI
-            0xFB => { let f = regs.flags32() | IF_FLAG; regs.set_flags32(f); regs.set_ip32(after); }  // STI
-            0x9C => { // PUSHF
-                let sp = dec(regs.sp32());
-                let a = ss_base.wrapping_add(eff(sp)) as usize;
-                if osz == 4 { m.write::<u32>(a, regs.flags32()); } else { m.write::<u16>(a, regs.flags32() as u16); }
-                regs.set_sp32(sp); regs.set_ip32(after);
-            }
-            0x9D => { // POPF
-                let f = rd(regs.sp32());
-                regs.set_sp32(inc(regs.sp32()));
-                apply_flags(regs, f);
-                regs.set_ip32(after);
-            }
-            0xCF => { // IRET (same-privilege CPL3→CPL3)
-                let mut sp = regs.sp32();
-                let nip = rd(sp); sp = inc(sp);
-                let ncs = rd(sp); sp = inc(sp);
-                let f = rd(sp); sp = inc(sp);
-                regs.set_sp32(sp); regs.set_ip32(nip); regs.set_cs32(ncs);
-                apply_flags(regs, f);
-                return; // CS changed — re-resolve next call
-            }
-            _ => return, // non-sensitive: configure arms TF and unicorn steps it
-        }
-    }
-}
+// Virtual-IF single-stepping and sensitive-instruction decoding now live in the
+// shared `arch_abi::monitor`, driven through `InterpView` (see top of file).
+// Both backends emulate `CLI`/`STI`/`PUSHF`/`POPF`/`IRET`/`INT` identically;
+// only the guest-memory backing differs (interp = software MMU, metal = live
+// page tables). PM clients run CPL=3/IOPL=1: `CLI`/`STI` `#GP` (decoded by the
+// monitor), `POPF`/`IRET` silently drop IF at CPL>IOPL (caught by TF stepping).
+// VM86 runs CPL=3/IOPL=1 too: there *every* IF-touching op (and `INT n`) `#GP`s,
+// so the monitor sees them all and no TF stepping is needed.
 
 /// Run up to `count` guest instructions and charge virtual time by what actually
 /// retired. A run that hits its instruction budget (no hook stopped it) retired
@@ -769,9 +757,13 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // addresses translate through the per-thread page tables, giving DOS
             // isolation under the single shared physical region. Entry is by IRET
             // into a frame whose EFLAGS image has VM=1 (the only valid v86 entry),
-            // with IOPL=3 so CLI/STI/PUSHF/POPF don't #GP — port I/O still traps
-            // via the IN/OUT hooks and INT n via the intr hook.
-            let flags = r.flags32() | (VM_FLAG as u32) | (IOPL_MASK as u32) | 2;
+            // pinned at IOPL=1 exactly like arch-metal's ring-3 guests. At IOPL<3
+            // every VM86 IOPL-sensitive op — CLI/STI/PUSHF/POPF/IRET *and* `INT n`
+            // — #GPs into the shared monitor, which tracks the virtual IF and
+            // IVT-reflects the INTs; the host, not unicorn's native IF, owns
+            // interrupt state. NEVER IOPL=3: that lets the guest toggle the real
+            // IF behind the kernel's back and bypasses the per-swap-in IO bitmap.
+            let flags = (r.flags32() & !(IOPL_MASK as u32)) | (VM_FLAG as u32) | (1 << 12) | 2;
             let frame = [
                 r.ip32() & 0xFFFF,
                 r.code_seg() as u32,
@@ -802,8 +794,9 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
         UserMode::Mode64 => {
             // 64-bit guests aren't interpreted yet (the core runs in 32-bit mode);
             // run flat-32 at CPL3 via the same trampoline so memory still goes
-            // through the page tables. (Smoke paths only.)
-            let flags = (r.frame.rflags as u32 & !(IOPL_MASK as u32)) | (IOPL_MASK as u32) | 2;
+            // through the page tables. (Smoke paths only.) IOPL=1 like every
+            // other ring-3 guest — never IOPL=3.
+            let flags = (r.frame.rflags as u32 & !(IOPL_MASK as u32)) | (1 << 12) | 2;
             use arch_abi::{USER_CS, USER_DS};
             let frame = [r.frame.rip as u32, USER_CS as u32, flags, r.frame.rsp as u32, USER_DS as u32];
             run_trampoline(uc, &frame, Some([USER_DS, USER_DS, USER_DS, USER_DS]))
@@ -833,8 +826,9 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             r.fs = rd(uc, RegisterX86::FS);
             r.gs = rd(uc, RegisterX86::GS);
             // Re-assert VM86 in the saved flags so `regs.mode()` stays VM86 for the
-            // kernel (we ran in real mode, which carries no VM bit).
-            r.frame.rflags = rd(uc, RegisterX86::EFLAGS) | VM_FLAG | IOPL_MASK;
+            // kernel; normalize IOPL to the kernel-side invariant (1, never 3).
+            // Bit 9 carries the virtual IF the monitor tracked across the slice.
+            r.frame.rflags = (rd(uc, RegisterX86::EFLAGS) & !IOPL_MASK) | VM_FLAG | (1 << 12);
         }
         UserMode::Mode32 => {
             // PM client: a far jump / mov may have reloaded any selector — read
@@ -847,9 +841,9 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             r.es = rd(uc, RegisterX86::ES);
             r.fs = rd(uc, RegisterX86::FS);
             r.gs = rd(uc, RegisterX86::GS);
-            // Normalize IOPL back to the kernel-side invariant (1): the
-            // guest ran at IOPL=3 inside the software CPU (see configure_pm)
-            // purely so IF-manipulating instructions execute natively.
+            // Normalize IOPL to the kernel-side invariant (1, never 3) and strip
+            // the stepping TF. The guest ran at CPL=3/IOPL=1, so CLI/STI #GP'd
+            // into the monitor; bit 9 holds the virtual IF it tracked.
             r.frame.rflags = (rd(uc, RegisterX86::EFLAGS) & !IOPL_MASK & !(TF_FLAG as u64)) | (1 << 12);
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
