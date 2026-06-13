@@ -127,8 +127,14 @@ pub fn arch_map_fresh_range(vpage: usize, count: usize) {
 }
 
 /// Map a range of physical pages into user virtual space.
-pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, _flags: u64) {
-    crate::mmu::map_phys(vpage_start, num_pages, ppage_start);
+pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
+    // Honour map flags like metal does — ignoring them silently diverges the
+    // moment a flag carries meaning. MAP_MMIO maps a present=0 trap window.
+    if flags & arch_abi::MAP_MMIO != 0 {
+        crate::paging::space_map_mmio(vpage_start, num_pages);
+    } else {
+        crate::mmu::map_phys(vpage_start, num_pages, ppage_start);
+    }
     crate::cpu::invalidate_uc(vpage_start, num_pages);
 }
 

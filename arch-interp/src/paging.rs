@@ -80,6 +80,42 @@ pub fn map_page(pd: u64, vaddr: u32, paddr_ppage: u64, writable: bool) {
     write_entry(pt, pte_index(vaddr), ((paddr_ppage as u32) << 12) | flags);
 }
 
+/// Software PTE marker (bit 10 — ignored by the CPU/softmmu): present=0 + this
+/// bit ⇒ MMIO/device aperture, which `space_demand` faults to the kernel
+/// instead of committing RAM. Same bit as `arch_abi::MAP_MMIO`.
+pub const MMIO_MARK: u32 = 1 << 10;
+
+/// Map `count` pages at `vpage` as an MMIO trap window: present=0 + marker, so
+/// guest accesses fault to the kernel (the page is not backed — `ppage` is
+/// irrelevant). The metal twin maps with `paging2::flags::SOFT_MMIO`.
+pub fn space_map_mmio(vpage: usize, count: usize) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let vaddr = ((vpage + i) * 4096) as u32;
+            let pde_i = pde_index(vaddr);
+            let pde = read_entry(pd, pde_i);
+            let pt = if pde & PRESENT != 0 {
+                (pde >> 12) as u64
+            } else {
+                let pt = alloc_table();
+                write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
+                pt
+            };
+            write_entry(pt, pte_index(vaddr), MMIO_MARK); // present=0
+        }
+    });
+}
+
+/// Raw leaf PTE for `vaddr` (0 if its page table is absent) — lets the fault
+/// path peek software markers on a not-present page.
+fn pte_raw(pd: u64, vaddr: u32) -> u32 {
+    let pde = read_entry(pd, pde_index(vaddr));
+    if pde & PRESENT == 0 {
+        return 0;
+    }
+    read_entry((pde >> 12) as u64, pte_index(vaddr))
+}
+
 /// Clear the mapping for `vaddr` (page granularity). Leaves the page table
 /// frame in place (cheap; reclaimed only when the whole space is freed).
 pub fn unmap_page(pd: u64, vaddr: u32) {
@@ -606,11 +642,12 @@ pub fn space_demand(vaddr: u32) -> bool {
     if translate(pd, vaddr).is_some() {
         return true; // already present — spurious refault, just retry
     }
-    // The A0000 VGA aperture is device memory, never demand-paged RAM: when it
-    // isn't explicitly mapped (linear mode-13h / single-plane alias) it is the
-    // planar trap window, so bubble a PageFault for the kernel to decode —
-    // matching metal, where a not-present A0000 page simply #PFs in hardware.
-    if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 || (0xA_0000..0xB_0000).contains(&vaddr) {
+    // MMIO/device aperture (present=0 + marker, e.g. the planar VGA window
+    // mapped with MAP_MMIO): trap to the kernel, never demand-commit RAM.
+    if pte_raw(pd, vaddr) & MMIO_MARK != 0 {
+        return false;
+    }
+    if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 {
         return false;
     }
     let frame = phys::alloc_frames(1);

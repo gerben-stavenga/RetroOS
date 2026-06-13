@@ -532,7 +532,10 @@ pub fn on_seq_write(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
                 let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
                 lib::vga_render::chain4_split(&chained, &mut planes);
                 regs.copy_to(VRAM_WINDOW, &planes);
-                machine.unmap_range(A0000 >> 12, 16);
+                // Map A0000 as MMIO (present=0 + trap marker) so every guest
+                // access faults into the planar trap. Same flag on both
+                // backends — no interp-only range special-case.
+                machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
                 A0000_TARGET.store(0, Ordering::Relaxed); // 0 != 0xFF ⇒ planar_active()
             } else if !unchained && currently_planar {
                 // unchain → chain hop: interleave planes back into a fresh
