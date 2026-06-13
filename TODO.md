@@ -343,18 +343,36 @@ in guest RAM, CR3/CR0.PG set, unicorn softmmu walks them. Done so far:
 - [x] Proof: unicorn walks page tables we build (non-identity translate).
 - [x] Page-table primitives over the phys memfd: new_page_dir / map_page /
       unmap_page / translate, unit-tested (arch-interp/src/paging.rs).
-Remaining:
-- [ ] RootPageTable = page-directory ppage (not a Space id); switch = set CR3;
-      fork = COW (clone PD, RW->RO + copy-on-write-fault).
-- [ ] One unicorn region for all guest physical RAM (the memfd), mapped once.
-- [ ] configure(): CR3 from active space + CR0.PG; GDT already built.
-- [ ] kernel mem()/copy_from/copy_to via translate() (software walk).
-- [ ] Reimplement Arch mem methods on real tables (map_low_mem, map_fresh_range,
-      set_page_flags, map_phys_range, unmap/free_range, clean, alloc_phys).
-- [ ] Build the initial kernel page-table layout at boot (user 0-3GB, kernel
-      0xC0B00000+, recursive view, low-mem identity for VM86).
-- [ ] Switch over; run raptor/doom/dn/duke + re-profile Doom (qemu_ram_alloc_
-      from_ptr must vanish); delete the old Space model.
+- [x] Page-table primitives (map/unmap/translate), unit-tested.
+- [x] Keystone integration: one region + paging + demand-fault + software walk
+      all compose. Learned: unicorn surfaces a paging #PF as no-EIP-progress +
+      CR2 (no intr hook, no IDT); after writing a PTE, flush TLB by re-writing
+      CR3. (46e85b3)
+- [x] Address-space ops layer: space_new/switch/map_fresh/map_phys/set_writable
+      /unmap/translate/fork (eager copy), unit-tested (4 paging tests green).
+REMAINING — the live wiring (all-or-nothing; the kernel boots under it or not):
+- [ ] cpu.rs build(): map the memfd as ONE region (mem_map_ptr(0, PHYS_SIZE,
+      frame_ptr(0))) instead of the per-page MEM_UNMAPPED hook.
+- [ ] cpu.rs configure(): CR3 = space::active_pd()<<12, CR0.PG=1 (GDT already
+      built by write_tables); drop the flat per-space base addressing.
+- [ ] cpu.rs execute(): replace the MEM_UNMAPPED demand path with the #PF retry
+      loop (no-EIP-progress + CR2 → demand-commit or deliver PageFault → flush
+      CR3 → re-emu_start).
+- [ ] calls.rs: route arch_map_low_mem / map_fresh_range / map_phys_range /
+      set_page_flags / unmap_range / free_range / user_fork / user_clean /
+      switch_to onto the space_* ops. RootPageTable(u32 id) stays.
+- [ ] vcpu.rs mem()/copy_from/copy_to: translate the guest vaddr via
+      space_translate() → phys::frame_ptr(paddr) (page-crossing aware). This is
+      the per-access cost change — measure it.
+- [ ] RISK: copy_entries / swap_entries (COW + A20/HMA shadow) — today they
+      copy/swap host-page CONTENT; on real tables decide whether they stay
+      content ops or become PTE ops. Check kernel callers (A20 gate, HMA).
+- [ ] Demand model: keep the current permissive auto-zero-on-fault (interp
+      commits any non-null page) vs deliver #PF to the kernel — pick the one
+      that matches what the kernel expects; the kernel pre-maps via map_fresh.
+- [ ] Switch over; run raptor/doom/dn/duke/keen + re-profile Doom (qemu_ram_
+      alloc_from_ptr must vanish); then delete mmu.rs Space model + the phys
+      alias path's invalidate churn.
 NOTE: master keeps the working Space model until this branch lands.
 
 # PRIORITY: Interp parity with metal
