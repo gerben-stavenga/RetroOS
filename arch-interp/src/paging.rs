@@ -520,3 +520,111 @@ mod space_ops {
         assert_eq!(space_translate(0x10_000), None);
     }
 }
+
+#[cfg(test)]
+mod vm86 {
+    use super::*;
+    use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
+    use unicorn_engine::{RegisterX86, Unicorn};
+
+    fn flat_desc(access: u8) -> [u8; 8] { [0xFF,0xFF,0,0,0,access,0xCF,0] }
+    fn mmr(base: u64, limit: u32) -> [u8;24] {
+        let mut b=[0u8;24]; b[8..16].copy_from_slice(&base.to_le_bytes());
+        b[16..20].copy_from_slice(&limit.to_le_bytes()); b }
+    fn wphys(paddr: u32, bytes: &[u8]) {
+        let pp=(paddr>>12) as u64; let off=(paddr&0xFFF) as usize;
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys::frame_ptr(pp).add(off), bytes.len()); }
+    }
+
+    /// Can unicorn run a VM86 task (real-mode addressing) THROUGH page tables?
+    /// This is what per-thread DOS isolation needs: the VM86 guest's real-mode
+    /// linear address (seg<<4 + off) must be translated by the page tables to a
+    /// per-thread physical frame — NOT a shared physical address.
+    #[test]
+    fn vm86_runs_paged() {
+        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).expect("uc");
+        let base = phys::frame_ptr(0);
+        unsafe { uc.mem_map_ptr(0, 16<<20, Prot::ALL, base as *mut core::ffi::c_void).unwrap(); }
+
+        let pd = new_page_dir();
+        // GDT identity-mapped low so the CPL0 trampoline can load flat selectors.
+        let gdt = phys::alloc_frames(1);
+        map_page(pd, frame_phys(gdt) & !0xFFF, gdt, true); // identity
+        wphys(frame_phys(gdt), &[0u8;8]);
+        wphys(frame_phys(gdt)+8, &flat_desc(0x9A));   // sel 0x08: ring0 code
+        wphys(frame_phys(gdt)+16, &flat_desc(0x92));  // sel 0x10: ring0 data
+
+        // CPL0 trampoline page (identity): a single `iretd` (0xCF) that pops the
+        // VM86 frame below and enters the v86 task. This mirrors configure_pm:
+        // VM86 is entered by IRET into a frame whose EFLAGS image has VM=1 — the
+        // only architecturally valid entry, and how a real kernel does it.
+        let tramp = phys::alloc_frames(1);
+        let tramp_va = 0x2000u32;
+        map_page(pd, tramp_va, tramp, true);
+        wphys(frame_phys(tramp), &[0xCFu8]); // iretd
+
+        // Trampoline stack page (identity): holds the 32-bit VM86 iret frame.
+        let stk = phys::alloc_frames(1);
+        let stk_va = 0x3000u32;
+        map_page(pd, stk_va, stk, true);
+
+        // VM86 code lives at linear 0x10000 (CS=0x1000, IP=0) but is mapped to a
+        // NON-identity physical frame — proving the translation, not a coincidence.
+        let code_frame = phys::alloc_frames(1);
+        map_page(pd, 0x10000, code_frame, true);
+        // mov ax, 0x1234 (real-mode/16-bit) ; jmp $   →  B8 34 12  EB FE
+        wphys(frame_phys(code_frame), &[0xB8, 0x34, 0x12, 0xEB, 0xFE]);
+        // A VM86 stack so the v86 task has somewhere to point SS:SP (linear 0x1FFF0).
+        let v86stk = phys::alloc_frames(1);
+        map_page(pd, 0x1F000, v86stk, true);
+
+        // VM86 iret frame (32-bit iretd from CPL0 to VM86 pops 9 dwords):
+        //   EIP, CS, EFLAGS, ESP, SS, ES, DS, FS, GS
+        let vm_flags = (1u32 << 17) | 2; // VM | reserved
+        let frame: [u32; 9] = [
+            0x0000,  // EIP
+            0x1000,  // CS  (base 0x10000)
+            vm_flags,// EFLAGS with VM=1
+            0xFFF0,  // ESP
+            0x1000,  // SS  (base 0x10000) — within v86stk page region
+            0x1000,  // ES
+            0x1000,  // DS
+            0x0000,  // FS
+            0x0000,  // GS
+        ];
+        let frame_va = stk_va + 0x800; // some room
+        for (i, v) in frame.iter().enumerate() {
+            wphys(frame_phys(stk) + 0x800 + (i as u32) * 4, &v.to_le_bytes());
+        }
+
+        // Bring CPL0 up the way configure_pm does: real-mode SS load fixes the
+        // cached DPL to 0, then PE, then load flat selectors, then enable PG last.
+        uc.reg_write(RegisterX86::CR0, 0x10).unwrap();            // real mode (ET)
+        uc.reg_write(RegisterX86::SS, 0).unwrap();                // cached DPL 0
+        uc.reg_write_long(RegisterX86::GDTR, &mmr((frame_phys(gdt)&!0xFFF) as u64, 0x17)).unwrap();
+        uc.reg_write(RegisterX86::CR0, 0x11).unwrap();            // PE on, PG off
+        uc.reg_write(RegisterX86::CS, 0x08).unwrap();
+        uc.reg_write(RegisterX86::SS, 0x10).unwrap();
+        uc.reg_write(RegisterX86::EFLAGS, 2).unwrap();
+        uc.reg_write(RegisterX86::ESP, frame_va as u64).unwrap();
+        uc.reg_write(RegisterX86::EAX, 0).unwrap();
+        // Enable paging (CR3 before PG).
+        uc.reg_write(RegisterX86::CR4, 0).unwrap();
+        uc.reg_write(RegisterX86::CR3, frame_phys(pd) as u64).unwrap();
+        uc.reg_write(RegisterX86::CR0, 0x8000_0011).unwrap();     // PE|PG (+ET)
+
+        use std::cell::Cell;
+        thread_local!{ static VEC: Cell<i32> = Cell::new(-1); }
+        uc.add_intr_hook(|_uc, intno| { VEC.with(|c| c.set(intno as i32)); }).unwrap();
+        // iretd + mov + a couple jmp-self spins.
+        let r = uc.emu_start(tramp_va as u64, 0, 0, 4);
+        let cr2 = uc.reg_read(RegisterX86::CR2).unwrap();
+        let eip = uc.reg_read(RegisterX86::EIP).unwrap();
+        let ax = uc.reg_read(RegisterX86::EAX).unwrap() & 0xFFFF;
+        let vm = uc.reg_read(RegisterX86::EFLAGS).unwrap() & (1<<17);
+        eprintln!("vm86_paged: r={r:?} ax={ax:#x} vm_flag={vm:#x} intr={} cr2={cr2:#x} eip={eip:#x}",
+                  VEC.with(|c| c.get()));
+        assert_eq!(ax, 0x1234, "VM86 code ran through the page-table translation");
+        assert!(vm != 0, "still in VM86 mode after entry");
+    }
+}
