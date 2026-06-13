@@ -7,8 +7,27 @@
 //! `GuestMem`, so kernel/dos code holds no `unsafe` of its own.
 
 use crate::mmu;
+use crate::paging;
 use crate::space::RootPageTable;
 use arch_abi::{GuestBytes, Regs};
+
+/// Walk `[addr, addr+len)` one page-bounded chunk at a time, resolving each page
+/// to a host pointer through the active page tables (demand-committing absent
+/// pages). `on_chunk(host_ptr, offset_into_request, chunk_len)`. Replaces the
+/// old "VA is a contiguous host pointer" model: under real paging the frames a
+/// VA range lands on are scattered, so every guest access is page-split here.
+#[inline]
+fn for_chunks(addr: usize, len: usize, mut on_chunk: impl FnMut(*mut u8, usize, usize)) {
+    let mut off = 0;
+    while off < len {
+        let a = addr + off;
+        let page_off = a & 0xFFF;
+        let chunk = core::cmp::min(len - off, 4096 - page_off);
+        let host = paging::space_resolve(a as u32);
+        on_chunk(host, off, chunk);
+        off += chunk;
+    }
+}
 
 /// Register state + address-space handle for one execution context. The shape
 /// is shared across backends, so it is `arch_abi::Vcpu<P>` parameterized over
@@ -30,39 +49,34 @@ pub type Vcpu = arch_abi::Vcpu<RootPageTable>;
 impl GuestBytes for RootPageTable {
     fn read<T: Copy>(&self, addr: usize) -> T {
         let size = core::mem::size_of::<T>();
-        let src = host_ptr(addr, size) as *const u8;
         let mut v = core::mem::MaybeUninit::<T>::uninit();
         let dst = v.as_mut_ptr() as *mut u8;
-        for i in 0..size {
-            unsafe { dst.add(i).write(src.add(i).read_volatile()); }
-        }
+        for_chunks(addr, size, |host, off, n| unsafe {
+            for i in 0..n { dst.add(off + i).write((host as *const u8).add(i).read_volatile()); }
+        });
         unsafe { v.assume_init() }
     }
     fn write<T: Copy>(&mut self, addr: usize, val: T) {
         let size = core::mem::size_of::<T>();
-        let dst = host_ptr(addr, size);
         let src = &val as *const T as *const u8;
-        for i in 0..size {
-            unsafe { dst.add(i).write_volatile(src.add(i).read()); }
-        }
+        for_chunks(addr, size, |host, off, n| unsafe {
+            for i in 0..n { host.add(i).write_volatile(src.add(off + i).read()); }
+        });
     }
     fn copy_from(&self, addr: usize, dst: &mut [u8]) {
-        let src = host_ptr(addr, dst.len()) as *const u8;
-        for (i, b) in dst.iter_mut().enumerate() {
-            unsafe { *b = src.add(i).read_volatile(); }
-        }
+        for_chunks(addr, dst.len(), |host, off, n| unsafe {
+            for i in 0..n { dst[off + i] = (host as *const u8).add(i).read_volatile(); }
+        });
     }
     fn copy_to(&mut self, addr: usize, src: &[u8]) {
-        let dst = host_ptr(addr, src.len());
-        for (i, &b) in src.iter().enumerate() {
-            unsafe { dst.add(i).write_volatile(b); }
-        }
+        for_chunks(addr, src.len(), |host, off, n| unsafe {
+            for i in 0..n { host.add(i).write_volatile(src[off + i]); }
+        });
     }
     fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize {
-        let base = host_ptr(addr, dst.len()) as *const u8;
         let mut n = 0;
         while n < dst.len() {
-            let b = unsafe { base.add(n).read_volatile() };
+            let b = unsafe { (paging::space_resolve((addr + n) as u32) as *const u8).read_volatile() };
             if b == 0 { break; }
             dst[n] = b;
             n += 1;
@@ -70,21 +84,24 @@ impl GuestBytes for RootPageTable {
         n
     }
     fn zero(&mut self, addr: usize, len: usize) {
-        let dst = host_ptr(addr, len);
-        for i in 0..len {
-            unsafe { dst.add(i).write_volatile(0); }
-        }
+        for_chunks(addr, len, |host, _off, n| unsafe {
+            core::ptr::write_bytes(host, 0, n);
+        });
     }
     fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
-        // Commit both ranges, then an overlap-safe directional copy through the
-        // contiguous active base (host_ptr returns base+addr, so the pointers
-        // alias the same region).
-        let s = host_ptr(src, len) as *const u8;
-        let d = host_ptr(dst, len);
+        // Frames are scattered under real paging, so there is no single aliased
+        // region: resolve each byte through the page tables in the overlap-safe
+        // direction. Not on the guest hot path (DOS loaders, relocation).
         if dst > src {
-            for i in (0..len).rev() { unsafe { d.add(i).write_volatile(s.add(i).read_volatile()); } }
+            for i in (0..len).rev() {
+                let b = unsafe { (paging::space_resolve((src + i) as u32) as *const u8).read_volatile() };
+                unsafe { paging::space_resolve((dst + i) as u32).write_volatile(b); }
+            }
         } else {
-            for i in 0..len { unsafe { d.add(i).write_volatile(s.add(i).read_volatile()); } }
+            for i in 0..len {
+                let b = unsafe { (paging::space_resolve((src + i) as u32) as *const u8).read_volatile() };
+                unsafe { paging::space_resolve((dst + i) as u32).write_volatile(b); }
+            }
         }
     }
 }
@@ -107,12 +124,12 @@ pub fn init_guest_ram(_len: usize) {
 }
 
 /// Host pointer for a guest address in the active space, demand-committing the
-/// spanned pages. A reserved-contiguous VA window means this is a plain
-/// `base + addr` once committed — so multi-page slices are sound.
+/// page. Under real paging the backing frames are scattered, so the returned
+/// pointer is valid only within the page containing `addr` — callers that span
+/// more than one page must page-split (`for_chunks` / the `GuestBytes` impl).
 #[inline]
-fn host_ptr(addr: usize, len: usize) -> *mut u8 {
-    mmu::ensure_committed(addr, len);
-    unsafe { mmu::active_base().add(addr) }
+fn host_ptr(addr: usize, _len: usize) -> *mut u8 {
+    paging::space_resolve(addr as u32)
 }
 
 /// The active address space's memory interface — `arch::mem()`. THE place the
@@ -124,40 +141,44 @@ pub struct GuestMem(());
 #[inline]
 pub fn mem() -> GuestMem { GuestMem(()) }
 
+// The slice/at views below hand out a contiguous host reference, which under
+// real paging is only sound within one page. They are arch-internal and (per
+// audit) span at most a single small struct/cell, so the page guard holds; the
+// kernel-facing API is the page-splitting `GuestBytes` impl above.
 impl GuestMem {
     pub fn slice(self, addr: usize, len: usize) -> &'static [u8] {
+        debug_assert!((addr & 0xFFF) + len <= 4096, "GuestMem::slice crosses a page");
         unsafe { core::slice::from_raw_parts(host_ptr(addr, len), len) }
     }
     pub fn slice_mut(self, addr: usize, len: usize) -> &'static mut [u8] {
+        debug_assert!((addr & 0xFFF) + len <= 4096, "GuestMem::slice_mut crosses a page");
         unsafe { core::slice::from_raw_parts_mut(host_ptr(addr, len), len) }
     }
     pub fn c_str(self, addr: usize, max: usize) -> &'static [u8] {
         unsafe {
             let p = host_ptr(addr, max);
             let mut len = 0;
-            while len < max && *p.add(len) != 0 { len += 1; }
+            while len < max && (addr & 0xFFF) + len < 4096 && *p.add(len) != 0 { len += 1; }
             core::slice::from_raw_parts(p, len)
         }
     }
     pub fn read<T: Copy>(self, addr: usize) -> T {
-        unsafe { core::ptr::read_unaligned(host_ptr(addr, core::mem::size_of::<T>()) as *const T) }
+        RootPageTable::empty().read::<T>(addr)
     }
     pub fn write<T: Copy>(self, addr: usize, val: T) {
-        unsafe { core::ptr::write_unaligned(host_ptr(addr, core::mem::size_of::<T>()) as *mut T, val); }
+        RootPageTable::empty().write::<T>(addr, val);
     }
     pub fn at<T>(self, addr: usize) -> &'static mut T {
+        debug_assert!((addr & 0xFFF) + core::mem::size_of::<T>() <= 4096, "GuestMem::at crosses a page");
         unsafe { &mut *(host_ptr(addr, core::mem::size_of::<T>()) as *mut T) }
     }
     pub fn zero(self, addr: usize, len: usize) {
-        unsafe { core::ptr::write_bytes(host_ptr(addr, len), 0, len); }
+        RootPageTable::empty().zero(addr, len);
     }
     pub fn write_bytes(self, addr: usize, src: &[u8]) {
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), host_ptr(addr, src.len()), src.len()); }
+        RootPageTable::empty().copy_to(addr, src);
     }
     pub fn copy_within(self, src: usize, dst: usize, len: usize) {
-        // Commit both ranges, then an overlap-safe copy through the contiguous
-        // active base (host_ptr returns base+addr, so the two pointers alias the
-        // same region and `copy` handles overlap).
-        unsafe { core::ptr::copy(host_ptr(src, len), host_ptr(dst, len), len); }
+        RootPageTable::empty().copy_within(src, dst, len);
     }
 }

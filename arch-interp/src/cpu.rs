@@ -16,11 +16,10 @@
 //!   an illegal access → `PageFault`) or after `SLICE` instructions retire
 //!   (a deterministic timer tick → `Irq`).
 
-use crate::{mmu, vcpu};
+use crate::vcpu;
 use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
 use core::cell::RefCell;
 use core::ffi::c_void;
-use std::collections::BTreeSet;
 use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
 
@@ -42,12 +41,6 @@ struct Ctx {
     /// CPU fault error code (e.g. the faulting selector for #GP/#NP) — decoded
     /// from bits 16..31 of the patched intr-hook vector.
     pending_err: u16,
-    /// Guest pages currently mapped into Unicorn for the active space. Cleared
-    /// (and the pages unmapped) on a context switch.
-    mapped: BTreeSet<u64>,
-    /// Whether the high scratch window (GDT/LDT/trampoline, [`SYS_BASE`]) is
-    /// mapped into Unicorn yet — done once, lazily, on first PM-descriptor run.
-    sys_mapped: bool,
 }
 
 thread_local! {
@@ -84,25 +77,60 @@ fn reflect_vm86_inline<'a>(uc: &mut Unicorn<'a, Ctx>, vector: u8) {
     let _ = uc.reg_write(R::EFLAGS, (flags & !0x300) as u64); // clear IF (0x200) + TF (0x100)
 }
 
-/// Build the Unicorn instance and install the event hooks. No memory is mapped
-/// up front — pages are mapped lazily as the guest faults them in.
+/// Build the Unicorn instance and install the event hooks. Guest physical RAM is
+/// mapped as ONE region (the `phys` memfd); the CPU runs CR0.PG=1 with our page
+/// tables in that RAM, so a TLB miss is a softmmu walk, not a per-page region
+/// creation. Demand paging and faults surface as #PF (vector 14), handled in
+/// `execute`.
 fn build() -> Unicorn<'static, Ctx> {
     let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, Ctx::default())
         .expect("unicorn init");
 
+    // The single guest-physical region: [0, PHYS_SIZE) backed by the memfd view.
+    // With paging on, unicorn walks our tables and indexes here.
+    unsafe {
+        uc.mem_map_ptr(
+            0,
+            crate::phys::PHYS_SIZE as u64,
+            Prot::ALL,
+            crate::phys::region_base() as *mut c_void,
+        )
+        .expect("map guest-physical region");
+    }
+    // Allocate + map the GDT/LDT/iretd-trampoline window into every space.
+    ensure_sys_window();
+
     // Software INT n and CPU exceptions both surface here. Our local Unicorn
     // patch encodes `exception_is_int` in bit 8 of `intno` (vectors are <= 0xFF),
     // so we record the vector and that bit; `execute` turns it into a clean
-    // SoftInt (software int) vs Exception (CPU fault) event.
+    // SoftInt (software int) vs Exception (CPU fault) / demand-#PF event.
     uc.add_intr_hook(|uc, intno| {
         let vector = (intno & 0xFF) as u8;
-        // Real-mode (VM86, PE=0) `INT n`/fault that the redirection bitmap does
-        // not trap: reflect to the IVT *in place* and keep running, so the slice
-        // runs through the handler like TCG does — only trapped vectors (0x31)
-        // and the DPL=3 gates (3/4) bubble to the kernel. PM ints/faults always
-        // bubble (decided by `execute`).
+        let is_int = intno & 0x100 != 0;
+        // A page fault (#PF, vector 14, a CPU fault not a software int) is the
+        // paging backend's own business: demand-commit or genuine SEGV is
+        // decided in `execute` (it needs CR2 + the active page tables). Stop and
+        // let it run there.
+        if vector == 14 && !is_int {
+            let d = uc.get_data_mut();
+            d.pending_intr = Some(vector);
+            d.pending_is_int = false;
+            d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
+            let _ = uc.emu_stop();
+            return;
+        }
+        // Real-mode (VM86) `INT n` / exception the redirection bitmap does not
+        // trap: reflect to the IVT *in place* and keep running, so the slice runs
+        // through the handler like TCG does — only trapped vectors (0x31) and the
+        // DPL=3 gates (3/4) bubble to the kernel. (#PF, vector 14, is excluded
+        // above — it is the paging backend's, not the guest's.) PM ints/faults
+        // always bubble. VM86 is now entered paged (PE=1), so detect it by
+        // EFLAGS.VM, not PE=0; both software INTs and CPU exceptions vector
+        // through the IVT in real mode, matching the old PE=0 path.
+        let _ = is_int;
+        let in_vm86 = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0) & VM_FLAG != 0;
         if vector != 3 && vector != 4
-            && uc.reg_read(RegisterX86::CR0).unwrap_or(1) & 1 == 0
+            && in_vm86
             && !crate::desc::int_intercepted(vector)
         {
             reflect_vm86_inline(uc, vector);
@@ -110,7 +138,7 @@ fn build() -> Unicorn<'static, Ctx> {
         }
         let d = uc.get_data_mut();
         d.pending_intr = Some(vector);
-        d.pending_is_int = intno & 0x100 != 0;
+        d.pending_is_int = is_int;
         d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
         let _ = uc.emu_stop();
     })
@@ -153,37 +181,17 @@ fn build() -> Unicorn<'static, Ctx> {
     })
     .expect("in hook");
 
-    // Access to an unmapped page → ask the MMU to demand-commit it, map that
-    // host page into Unicorn, and retry. An illegal address bubbles a fault.
-    uc.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX, |uc, _t: MemType, addr, _sz, _v| {
-        let page = addr & !(PAGE - 1);
-        match mmu::demand(addr as usize) {
-            Some(writable) => {
-                let prot = if writable { Prot::ALL } else { Prot::READ | Prot::EXEC };
-                let host = unsafe { mmu::active_base().add(page as usize) };
-                let ok = unsafe { uc.mem_map_ptr(page, PAGE, prot, host as *mut c_void).is_ok() };
-                if ok {
-                    uc.get_data_mut().mapped.insert(page);
-                }
-                ok // retry if we mapped it
-            }
-            None => {
-                uc.get_data_mut().pending = Some(KernelEvent::PageFault { addr: addr as u32 });
-                let _ = uc.emu_stop();
-                false
-            }
-        }
-    })
-    .expect("unmapped hook");
-
-    // Write/exec against a present-but-protected page (e.g. a read-only .text
-    // page). COW lands in M4; for now this is a genuine fault.
-    uc.add_mem_hook(HookType::MEM_PROT, 0, u64::MAX, |uc, _t: MemType, addr, _sz, _v| {
-        uc.get_data_mut().pending = Some(KernelEvent::PageFault { addr: addr as u32 });
+    // A guest *physical* address outside [0, PHYS_SIZE) — i.e. a page table that
+    // points at a non-existent frame, or a bad CR3. That is a hard fault (the
+    // demand/permission faults are virtual #PFs handled via the intr hook), so
+    // surface the faulting *virtual* address from CR2 and stop.
+    uc.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX, |uc, _t: MemType, _addr, _sz, _v| {
+        let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
+        uc.get_data_mut().pending = Some(KernelEvent::PageFault { addr: cr2 });
         let _ = uc.emu_stop();
         false
     })
-    .expect("prot hook");
+    .expect("unmapped hook");
 
     uc
 }
@@ -244,15 +252,33 @@ pub fn execute() -> KernelEvent {
                 regs.ds as u16, regs.frame.rflags);
         }
         let mut run = uc.emu_start(begin, 0xFFFF_FFFF, 0, SLICE);
-        // The CPL-0 `iretd` trampoline (configure_pm) is kernel-internal: if
-        // the slice budget expired with EIP still inside the scratch window
-        // (the count hook counts the trampoline too — ~1 in SLICE switches),
-        // ring-0 mid-switch state must NOT surface as user regs. The kernel
-        // would deliver IRQs onto it and corrupt the client (duke3d/raptor
-        // DOS/4GW wild-jump SEGVs; the DN exec-window ffbf panics). Retire
-        // the switch before reporting; a faulting iretd (pending event) still
-        // bubbles.
-        for _ in 0..4 {
+        // Resolve interp-internal stops without bubbling to the kernel:
+        //  * Demand #PF (vector 14): the faulting VA is absent — commit a fresh
+        //    frame, flush the TLB (CR3 rewrite), and re-run at the faulting EIP.
+        //    A present-page fault (RO write) or illegal VA bubbles as PageFault.
+        //  * Trampoline retire: if the slice budget expired with EIP still inside
+        //    the CPL-0 iretd scratch window (the block hook counts it too), ring-0
+        //    mid-switch state must NOT surface as user regs — the kernel would
+        //    deliver IRQs onto it and corrupt the client (duke3d/raptor DOS/4GW
+        //    wild-jump SEGVs; DN exec-window ffbf panics). Step it out first.
+        for _ in 0..256 {
+            let d = uc.get_data();
+            if d.pending_intr == Some(14) && !d.pending_is_int {
+                let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
+                if crate::paging::space_translate(cr2).is_none() && crate::paging::space_demand(cr2) {
+                    flush_tlb(uc);
+                    {
+                        let d = uc.get_data_mut();
+                        d.pending_intr = None;
+                        d.pending_is_int = false;
+                        d.pending_err = 0;
+                    }
+                    let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
+                    run = uc.emu_start(eip, 0xFFFF_FFFF, 0, SLICE);
+                    continue;
+                }
+                break; // genuine fault — handled below as PageFault
+            }
             let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
             if uc.get_data().pending.is_some()
                 || uc.get_data().pending_intr.is_some()
@@ -263,6 +289,14 @@ pub fn execute() -> KernelEvent {
             run = uc.emu_start(eip, 0xFFFF_FFFF, 0, 1);
         }
         store_regs(uc, regs, mode);
+        // A page fault that demand-paging did not resolve is a genuine SEGV: the
+        // kernel signals the thread. Carry CR2 + the #PF error code.
+        if uc.get_data().pending_intr == Some(14) && !uc.get_data().pending_is_int {
+            let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
+            regs.err_code = uc.get_data().pending_err as u64;
+            uc.get_data_mut().pending_intr = None;
+            return KernelEvent::PageFault { addr: cr2 };
+        }
         if trace_on() {
             let intr = uc.get_data().pending_intr;
             let ev = uc.get_data().pending.is_some();
@@ -328,29 +362,33 @@ pub fn execute() -> KernelEvent {
     })
 }
 
-/// Drop `count` pages at `vpage` from Unicorn's active mapping so a later access
-/// re-faults them with the MMU's new state. Called after any arch call that
-/// mutates the active space's mappings.
-pub fn invalidate_uc(vpage: usize, count: usize) {
-    io_with(|uc| {
-        for p in vpage..vpage + count {
-            let base = (p as u64) * PAGE;
-            if uc.get_data_mut().mapped.remove(&base) {
-                let _ = uc.mem_unmap(base, PAGE);
-            }
+/// Flush the softmmu TLB by rewriting CR3 (no global pages, so this drops every
+/// cached translation). The keystone for the paging model: after the kernel
+/// edits page tables, the next walk must see the new entries.
+fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
+    let cr3 = uc.reg_read(RegisterX86::CR3).unwrap_or(0);
+    let _ = uc.reg_write(RegisterX86::CR3, cr3);
+}
+
+/// Invalidate cached translations for a range after an arch call mutated the
+/// active space's page tables. `configure` reloads CR3 at the start of every
+/// slice (a full TLB flush), so the only window this must cover is a mutation
+/// applied while the CPU is already configured — handled by a CR3 rewrite.
+pub fn invalidate_uc(_vpage: usize, _count: usize) {
+    MACHINE.with(|cell| {
+        if let Some(uc) = cell.borrow_mut().as_mut() {
+            flush_tlb(uc);
         }
     });
 }
 
-/// Drop the entire active-space mapping from Unicorn (on a context switch); the
-/// incoming space re-faults its pages in lazily.
+/// Flush all cached translations (on a context switch). The incoming space's
+/// CR3 is loaded by the next `configure`; this drops the outgoing TLB now.
 pub fn flush_uc() {
-    io_with(|uc| {
-        let pages: Vec<u64> = uc.get_data().mapped.iter().copied().collect();
-        for base in pages {
-            let _ = uc.mem_unmap(base, PAGE);
+    MACHINE.with(|cell| {
+        if let Some(uc) = cell.borrow_mut().as_mut() {
+            flush_tlb(uc);
         }
-        uc.get_data_mut().mapped.clear();
     });
 }
 
@@ -412,20 +450,43 @@ fn set_mmr(uc: &Unicorn<'static, Ctx>, reg: RegisterX86, selector: u16, base: u6
     let _ = uc.reg_write_long(reg, &buf);
 }
 
-/// Map the scratch window (once) and seed the `iretd` trampoline byte.
-fn ensure_sys_mapped(uc: &mut Unicorn<'static, Ctx>) {
-    if uc.get_data().sys_mapped {
-        return;
-    }
-    let _ = uc.mem_map(SYS_BASE, SYS_SIZE as u64, Prot::ALL);
-    let _ = uc.mem_write(TRAMP_ADDR, &[0xCF]); // IRETD (32-bit ring-0 CS)
-    uc.get_data_mut().sys_mapped = true;
+/// The 8 contiguous guest-physical frames backing the SYS window (GDT, LDT,
+/// trampoline, ring-0 stack), shared by every address space. Allocated once;
+/// `register_kernel_window` maps `SYS_BASE` onto them in every page directory.
+static SYS_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn sys_base_frame() -> u64 {
+    *SYS_FRAMES.get().expect("SYS window not initialized")
+}
+
+/// Host pointer to a SYS-window linear address (the frames are contiguous, so
+/// the linear offset within the window is the offset within the frame run).
+fn sys_ptr(linear: u64) -> *mut u8 {
+    unsafe { crate::phys::frame_ptr(sys_base_frame()).add((linear - SYS_BASE) as usize) }
+}
+
+/// Physical address of a SYS-window linear address (for GDTR/LDTR base while
+/// paging is momentarily off during the CPL0 bootstrap).
+fn sys_phys(linear: u64) -> u64 {
+    (crate::paging::frame_phys(sys_base_frame()) as u64) + (linear - SYS_BASE)
+}
+
+/// Allocate the SYS frames, seed the `iretd` trampoline byte, and register the
+/// window so every page directory (existing and future) maps it. Idempotent.
+fn ensure_sys_window() {
+    SYS_FRAMES.get_or_init(|| {
+        let frames = crate::phys::alloc_frames(SYS_SIZE / 4096);
+        unsafe { *crate::phys::frame_ptr(frames).add((TRAMP_ADDR - SYS_BASE) as usize) = 0xCF; }
+        crate::paging::register_kernel_window((SYS_BASE / 4096) as usize, frames, SYS_SIZE / 4096);
+        frames
+    });
 }
 
 /// Refresh the GDT (flat ring-0/ring-3 + BDA alias + present TLS slots) and the
-/// LDT (the kernel's active table) in the scratch window, and point GDTR/LDTR
-/// at them.
-fn write_tables(uc: &mut Unicorn<'static, Ctx>) {
+/// LDT (the kernel's active table) in the SYS-window frames. Returns the LDT
+/// byte limit (the GDTR/LDTR bases are set by the trampoline runner, which knows
+/// the paging phase). Writes go to the shared phys frames, not through unicorn.
+fn write_tables() -> u32 {
     use arch_abi::{USER_CS, USER_DS};
     let mut gdt = [0u64; 32];
     gdt[(KERNEL_CS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0x9A, 0xC); // ring-0 code32
@@ -438,29 +499,81 @@ fn write_tables(uc: &mut Unicorn<'static, Ctx>) {
             gdt[idx] = gdt_desc(base, 0xF_FFFF, 0xF2, 0xC);
         }
     });
-    let mut gbytes = [0u8; GDT_BYTES];
+    let gp = sys_ptr(GDT_ADDR);
     for (i, d) in gdt.iter().enumerate() {
-        gbytes[i * 8..i * 8 + 8].copy_from_slice(&d.to_le_bytes());
+        unsafe { core::ptr::copy_nonoverlapping(d.to_le_bytes().as_ptr(), gp.add(i * 8), 8); }
     }
-    let _ = uc.mem_write(GDT_ADDR, &gbytes);
-    set_mmr(uc, RegisterX86::GDTR, 0, GDT_ADDR, (GDT_BYTES - 1) as u32, 0);
 
     let ldt = crate::desc::ldt_raw();
     let n = ldt.len().min(LDT_MAX_BYTES / 8);
-    let mut lbytes = std::vec![0u8; n * 8];
+    let lp = sys_ptr(LDT_ADDR);
     for (i, d) in ldt.iter().take(n).enumerate() {
-        lbytes[i * 8..i * 8 + 8].copy_from_slice(&d.to_le_bytes());
+        unsafe { core::ptr::copy_nonoverlapping(d.to_le_bytes().as_ptr(), lp.add(i * 8), 8); }
     }
-    if !lbytes.is_empty() {
-        let _ = uc.mem_write(LDT_ADDR, &lbytes);
+    if n == 0 { 0 } else { (n * 8 - 1) as u32 }
+}
+
+/// Enter the guest through the CPL0 `iretd` trampoline. `frame` is the iret
+/// stack image (5 dwords for PM, 9 for VM86 with the VM bit set); `pre_segs`,
+/// when present, loads the client's DS/ES/FS/GS at CPL0 before the iret (PM —
+/// VM86 carries them in the frame). Returns the trampoline start PC.
+fn run_trampoline(uc: &mut Unicorn<'static, Ctx>, frame: &[u32], pre_segs: Option<[u16; 4]>) -> u64 {
+    let w = |uc: &mut Unicorn<'static, Ctx>, reg, v: u64| { let _ = uc.reg_write(reg, v); };
+    let cr0 = uc.reg_read(RegisterX86::CR0).unwrap_or(0x11);
+
+    // 0. Exit VM86 first. When the previous slice was a VM86 task (the common
+    //    case — the next entry is another VM86 task or its INT handler), EFLAGS.VM
+    //    is still set; clearing PE/PG and loading flat selectors while VM=1 leaves
+    //    the CPU in VM86, where `CS=KERNEL_CS` is misread as a real-mode segment
+    //    and the trampoline `iretd` never switches. Forcing EFLAGS=2 (VM=0, ring-0
+    //    flags) drops VM86 so the CPL-0 bootstrap below is interpreted as PM.
+    w(uc, RegisterX86::EFLAGS, 2);
+
+    // 1. Drop to real mode (clear PE *and* PG together — legal in one write) and
+    //    do a real-mode SS load so the cached CPL is 0.
+    w(uc, RegisterX86::CR0, cr0 & !0x8000_0001);
+    w(uc, RegisterX86::SS, 0);
+
+    // 2. Tables into the SYS frames; GDTR/LDTR at the PHYSICAL base while PG=0.
+    let ldt_limit = write_tables();
+    set_mmr(uc, RegisterX86::GDTR, 0, sys_phys(GDT_ADDR), (GDT_BYTES - 1) as u32, 0);
+    set_mmr(uc, RegisterX86::LDTR, LDT_SEL, sys_phys(LDT_ADDR), ldt_limit, 0x8200);
+
+    // 3. PE on (PG still off): load flat ring-0 CS, and the client data segments
+    //    for PM (DPL-3 loads fine at CPL 0; they survive the iret).
+    w(uc, RegisterX86::CR0, (cr0 & !0x8000_0000) | 1);
+    w(uc, RegisterX86::CS, KERNEL_CS as u64);
+    if let Some([ds, es, fs, gs]) = pre_segs {
+        w(uc, RegisterX86::DS, ds as u64);
+        w(uc, RegisterX86::ES, es as u64);
+        w(uc, RegisterX86::FS, fs as u64);
+        w(uc, RegisterX86::GS, gs as u64);
     }
-    let ldt_limit = if lbytes.is_empty() { 0 } else { (lbytes.len() - 1) as u32 };
+
+    // 4. Build the iret frame at the top of the ring-0 stack (linear SYS).
+    let frame_addr = RING0_SP_TOP - (frame.len() * 4) as u64;
+    let fp = sys_ptr(frame_addr);
+    for (i, v) in frame.iter().enumerate() {
+        unsafe { core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), fp.add(i * 4), 4); }
+    }
+    w(uc, RegisterX86::SS, KERNEL_DS as u64);
+    w(uc, RegisterX86::ESP, frame_addr);
+    w(uc, RegisterX86::EFLAGS, 2);
+    w(uc, RegisterX86::EIP, TRAMP_ADDR);
+
+    // 5. Enable paging: CR3 = active page directory, then PE|PG. With PG on, the
+    //    iret's CS/SS (PM) reload reads GDT/LDT through the page tables, so point
+    //    GDTR/LDTR at the LINEAR window now.
+    w(uc, RegisterX86::CR4, 0);
+    w(uc, RegisterX86::CR3, crate::paging::frame_phys(crate::paging::active_pd()) as u64);
+    w(uc, RegisterX86::CR0, (cr0 | 0x8000_0001) | 0x10);
+    set_mmr(uc, RegisterX86::GDTR, 0, GDT_ADDR, (GDT_BYTES - 1) as u32, 0);
     set_mmr(uc, RegisterX86::LDTR, LDT_SEL, LDT_ADDR, ldt_limit, 0x8200);
+    TRAMP_ADDR
 }
 
 /// Configure Unicorn for `mode`, load `REGS`, and return the linear start PC.
 fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
-    let cr0 = uc.reg_read(RegisterX86::CR0).unwrap_or(1);
     let w = |uc: &mut Unicorn<'static, Ctx>, reg, v: u64| { let _ = uc.reg_write(reg, v); };
 
     w(uc, RegisterX86::EAX, r.rax);
@@ -473,87 +586,50 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
 
     match mode {
         UserMode::VM86 => {
-            // Real mode: PE=0, segment*16 addressing, 16-bit operands. (We model
-            // VM86 as real mode — same seg<<4 semantics — rather than PM+VME.)
-            w(uc, RegisterX86::CR0, cr0 & !1);
-            w(uc, RegisterX86::CS, r.code_seg() as u64);
-            w(uc, RegisterX86::DS, r.ds & 0xFFFF);
-            w(uc, RegisterX86::ES, r.es & 0xFFFF);
-            w(uc, RegisterX86::SS, r.stack_seg() as u64);
-            w(uc, RegisterX86::FS, r.fs & 0xFFFF);
-            w(uc, RegisterX86::GS, r.gs & 0xFFFF);
-            w(uc, RegisterX86::ESP, r.sp32() as u64 & 0xFFFF);
-            w(uc, RegisterX86::EIP, r.ip32() as u64 & 0xFFFF);
-            // Drop VM (real mode has no VM bit); keep the rest, force reserved bit 1.
-            w(uc, RegisterX86::EFLAGS, (r.flags() & !VM_FLAG) | 2);
-            // `begin` is the EIP offset — Unicorn adds the CS base (CS<<4) itself.
-            r.ip32() as u64 & 0xFFFF
+            // VM86 runs PAGED now (PE=1, VM=1, PG=1) — its real-mode seg<<4 linear
+            // addresses translate through the per-thread page tables, giving DOS
+            // isolation under the single shared physical region. Entry is by IRET
+            // into a frame whose EFLAGS image has VM=1 (the only valid v86 entry),
+            // with IOPL=3 so CLI/STI/PUSHF/POPF don't #GP — port I/O still traps
+            // via the IN/OUT hooks and INT n via the intr hook.
+            let flags = r.flags32() | (VM_FLAG as u32) | (IOPL_MASK as u32) | 2;
+            let frame = [
+                r.ip32() & 0xFFFF,
+                r.code_seg() as u32,
+                flags,
+                r.sp32() & 0xFFFF,
+                r.stack_seg() as u32,
+                (r.es & 0xFFFF) as u32,
+                (r.ds & 0xFFFF) as u32,
+                (r.fs & 0xFFFF) as u32,
+                (r.gs & 0xFFFF) as u32,
+            ];
+            run_trampoline(uc, &frame, None)
         }
-        UserMode::Mode32 => configure_pm(uc, r),
+        UserMode::Mode32 => {
+            // The client enters with IOPL=3: inside the software CPU, CLI/STI and
+            // POPF/IRET manipulate the emulated IF natively, so the virtual IF
+            // (rflags bit 9, read back per slice) tracks every idiom including the
+            // POPF/IRET restores that drop silently at IOPL<3. Safe here unlike
+            // metal: port I/O always traps through the IN/OUT hooks regardless of
+            // IOPL, and the kernel regains control by slice count, not timer IF.
+            // store_regs normalizes IOPL back to 1 so the kernel-side invariant
+            // (every ring-3 guest at IOPL=1) holds identically across backends.
+            let flags = (r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (IOPL_MASK as u32) | 2;
+            let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
+            let segs = [r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16];
+            run_trampoline(uc, &frame, Some(segs))
+        }
         UserMode::Mode64 => {
-            // 64-bit guests aren't interpreted yet (the core runs in 32-bit
-            // mode); fall back to the old flat-32 setup so the existing 64-bit
-            // ELF smoke paths don't regress.
-            w(uc, RegisterX86::CR0, cr0 | 1);
-            w(uc, RegisterX86::ESP, r.frame.rsp);
-            w(uc, RegisterX86::EIP, r.frame.rip);
-            w(uc, RegisterX86::EFLAGS, r.frame.rflags);
-            r.frame.rip
+            // 64-bit guests aren't interpreted yet (the core runs in 32-bit mode);
+            // run flat-32 at CPL3 via the same trampoline so memory still goes
+            // through the page tables. (Smoke paths only.)
+            let flags = (r.frame.rflags as u32 & !(IOPL_MASK as u32)) | (IOPL_MASK as u32) | 2;
+            use arch_abi::{USER_CS, USER_DS};
+            let frame = [r.frame.rip as u32, USER_CS as u32, flags, r.frame.rsp as u32, USER_DS as u32];
+            run_trampoline(uc, &frame, Some([USER_DS, USER_DS, USER_DS, USER_DS]))
         }
     }
-}
-
-/// Protected-mode (32-bit) entry through real descriptor tables. Handles both
-/// Linux flat-32 (CS=USER_CS) and 16/32-bit DPMI clients (LDT selectors) the
-/// same way: program GDT/LDT, then `iretd` into the CPL-3 client.
-fn configure_pm(uc: &mut Unicorn<'static, Ctx>, r: &Regs) -> u64 {
-    ensure_sys_mapped(uc);
-    let w = |uc: &mut Unicorn<'static, Ctx>, reg, v: u64| { let _ = uc.reg_write(reg, v); };
-
-    // 1. Force CPL 0: a real-mode SS load (PE=0) sets the cached DPL to 0, then
-    //    re-enable PE. From CPL 0 we can load the ring-0 trampoline segments and
-    //    the DPL-3 client data segments alike.
-    let cr0 = uc.reg_read(RegisterX86::CR0).unwrap_or(1);
-    w(uc, RegisterX86::CR0, cr0 & !1);
-    w(uc, RegisterX86::SS, 0);
-    w(uc, RegisterX86::CR0, cr0 | 1);
-
-    // 2. Program the descriptor tables, then load the client's data segments
-    //    (DPL 3 loads fine at CPL 0; they survive the iret since DPL == new CPL).
-    write_tables(uc);
-    w(uc, RegisterX86::DS, r.ds & 0xFFFF);
-    w(uc, RegisterX86::ES, r.es & 0xFFFF);
-    w(uc, RegisterX86::FS, r.fs & 0xFFFF);
-    w(uc, RegisterX86::GS, r.gs & 0xFFFF);
-
-    // 3. Build the inter-privilege iret frame (EIP, CS, EFLAGS, ESP, SS) and run
-    //    the trampoline under the flat ring-0 selectors.
-    //
-    //    The client enters with IOPL=3: inside the software CPU, CLI/STI and
-    //    POPF/IRET then manipulate the emulated IF natively, so the virtual
-    //    IF (rflags bit 9, read back per slice) tracks every idiom including
-    //    the POPF/IRET restores that drop silently at IOPL<3 — the class
-    //    metal closes with TF single-stepping (Hexen via DOS32A re-enables
-    //    IF by POPF, monitor.rs TF_VIRTUAL_IF_STEPPING). Safe here, unlike
-    //    metal: port I/O always traps through the IN/OUT hooks regardless of
-    //    IOPL, and the kernel regains control by slice count, not timer IF.
-    //    store_regs normalizes IOPL back to 1 so the kernel-side invariant
-    //    (every ring-3 guest at IOPL=1) holds identically across backends.
-    let flags = (r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (IOPL_MASK as u32) | 2;
-    let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
-    let mut bytes = [0u8; 20];
-    for (i, v) in frame.iter().enumerate() {
-        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    let frame_addr = RING0_SP_TOP - bytes.len() as u64;
-    let _ = uc.mem_write(frame_addr, &bytes);
-
-    w(uc, RegisterX86::SS, KERNEL_DS as u64);
-    w(uc, RegisterX86::ESP, frame_addr);
-    w(uc, RegisterX86::CS, KERNEL_CS as u64);
-    w(uc, RegisterX86::EFLAGS, 2);
-    w(uc, RegisterX86::EIP, TRAMP_ADDR);
-    TRAMP_ADDR
 }
 
 fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {

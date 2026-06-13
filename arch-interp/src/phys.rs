@@ -16,6 +16,7 @@
 //! drives real frames through `map_phys_range`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 const PAGE: usize = 4096;
 
@@ -43,6 +44,20 @@ static PHYS: std::sync::OnceLock<Phys> = std::sync::OnceLock::new();
 /// enough (VGA teardown, reaped DMA buffers) that a simple high-water bump
 /// with no reuse is acceptable for now; `free` is a no-op stub.
 static NEXT_FRAME: AtomicUsize = AtomicUsize::new(1);
+
+/// Reclaimed single frames available for reuse before the bump pointer advances.
+/// `free_frames` punch-holes the backing storage (so the frame re-reads zero)
+/// and returns it here; with real reuse, sequential program runs (DN → game →
+/// exit → next game) no longer march `NEXT_FRAME` to exhaustion.
+static FREE_LIST: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Base of the persistent kernel-side mapping of the whole guest-physical memfd.
+/// This is the single region handed to unicorn (`mem_map_ptr(0, PHYS_SIZE, …)`):
+/// with CR0.PG set, unicorn's softmmu walks our page tables and indexes here, so
+/// guest physical address `pa` lives at `region_base() + pa`.
+pub fn region_base() -> *mut u8 {
+    phys().view
+}
 
 fn phys() -> &'static Phys {
     PHYS.get_or_init(|| {
@@ -75,16 +90,42 @@ pub fn frame_ptr(ppage: u64) -> *mut u8 {
     unsafe { phys().view.add(off) }
 }
 
-/// Allocate `count` contiguous frames; returns the starting page. Bump-only.
+/// Allocate `count` contiguous frames; returns the starting page. A single-frame
+/// request reuses a freed frame when one is available (the common case: page
+/// tables, demand pages, fork copies); multi-frame contiguous requests always
+/// bump (the free list holds only isolated frames).
 pub fn alloc_frames(count: usize) -> u64 {
+    if count == 1 {
+        if let Some(f) = FREE_LIST.lock().unwrap().pop() {
+            return f;
+        }
+    }
     let start = NEXT_FRAME.fetch_add(count, Ordering::Relaxed);
     assert!((start + count) * PAGE <= PHYS_SIZE, "guest phys exhausted");
     start as u64
 }
 
-/// Free is a no-op for the bump allocator (see `NEXT_FRAME`). Kept so callers
-/// mirror the metal allocator's free/alloc symmetry.
-pub fn free_frames(_start: u64, _count: usize) {}
+/// Return `count` frames at `start` to the allocator. Each frame is hole-punched
+/// (host RAM reclaimed; the frame re-reads zero on next touch) and pushed to the
+/// free list for reuse. Frame 0 is never freed (the null sentinel).
+pub fn free_frames(start: u64, count: usize) {
+    let mut free = FREE_LIST.lock().unwrap();
+    for i in 0..count as u64 {
+        let f = start + i;
+        if f == 0 {
+            continue;
+        }
+        unsafe {
+            libc::fallocate(
+                phys().fd,
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                (f as libc::off_t) * PAGE as libc::off_t,
+                PAGE as libc::off_t,
+            );
+        }
+        free.push(f);
+    }
+}
 
 /// Alias `count` pages of physical memory (starting at `ppage`) into the host
 /// VA window starting at `dst` (a guest address-space page). After this the

@@ -366,6 +366,7 @@ pub fn space_init() {
         let mut s = s.borrow_mut();
         if s.pd.is_empty() {
             let pd = new_page_dir();
+            map_kernel_windows(pd);
             s.pd.insert(0, pd);
             s.active = 0;
             s.next = 1;
@@ -392,6 +393,7 @@ pub fn space_new() -> u32 {
         let id = s.next;
         s.next += 1;
         let pd = new_page_dir();
+        map_kernel_windows(pd);
         s.pd.insert(id, pd);
         id
     })
@@ -400,6 +402,25 @@ pub fn space_new() -> u32 {
 /// Switch the active space.
 pub fn space_switch(id: u32) {
     SPACES.with(|s| s.borrow_mut().active = id);
+}
+
+/// Id of the active space.
+pub fn active_id() -> u32 {
+    SPACES.with(|s| s.borrow().active)
+}
+
+/// Free `count` pages at `vpage`: drop the PTEs and return the frames to the
+/// allocator (arch FREE_RANGE — the metal call releases physical frames).
+pub fn space_free(vpage: usize, count: usize) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let v = ((vpage + i) * 4096) as u32;
+            if let Some(pa) = translate(pd, v) {
+                phys::free_frames((pa >> 12) as u64, 1);
+            }
+            unmap_page(pd, v);
+        }
+    });
 }
 
 /// Map `count` pages at `vpage` to fresh zeroed frames (the memfd reads zero
@@ -488,6 +509,177 @@ pub fn space_fork(src: u32) -> u32 {
         }
     }
     dst
+}
+
+// ── Kernel windows: mappings every address space must carry ──────────────────
+//
+// The interpreter's PM/VM86 entry runs a CPL0 `iretd` trampoline through real
+// descriptor tables (GDT/LDT) that live in guest physical RAM. Those tables and
+// the trampoline are reachable only if mapped in the page directory unicorn
+// walks — so every space gets the same high "system" window (and any future
+// kernel-side window) at a fixed linear address backed by globally-shared
+// frames. The client never touches it; it exists for the segment loads + iret.
+
+thread_local! {
+    static KERNEL_WINDOWS: RefCell<Vec<(u32, u64, usize)>> = RefCell::new(Vec::new());
+}
+
+/// Register a linear→physical window (page-granular) that every address space —
+/// existing and future — must map. `vaddr`/`count` in pages, `ppage` the shared
+/// starting frame. Idempotent enough for one-time setup at backend init.
+pub fn register_kernel_window(vpage: usize, ppage: u64, count: usize) {
+    KERNEL_WINDOWS.with(|w| w.borrow_mut().push((vpage as u32, ppage, count)));
+    // Retro-map into every space that already exists (the boot space).
+    SPACES.with(|s| {
+        for &pd in s.borrow().pd.values() {
+            for i in 0..count {
+                map_page(pd, ((vpage + i) * 4096) as u32, ppage + i as u64, true);
+            }
+        }
+    });
+}
+
+fn map_kernel_windows(pd: u64) {
+    KERNEL_WINDOWS.with(|w| {
+        for &(vpage, ppage, count) in w.borrow().iter() {
+            for i in 0..count {
+                map_page(pd, (vpage as usize + i) as u32 * 4096, ppage + i as u64, true);
+            }
+        }
+    });
+}
+
+/// Kernel-side resolve: translate `vaddr` in the active space to a host pointer,
+/// demand-committing a fresh zero frame if the page is absent. Mirrors the old
+/// `mmu::ensure_committed` (the metal kernel's ring-1 access faults the page in
+/// transparently); the interpreter "kernel" is host code, so it does the commit.
+pub fn space_resolve(vaddr: u32) -> *mut u8 {
+    let pd = active_pd();
+    let pa = match translate(pd, vaddr) {
+        Some(pa) => pa,
+        None => {
+            let frame = phys::alloc_frames(1);
+            map_page(pd, vaddr & !0xFFF, frame, true);
+            (frame as u32) << 12 | (vaddr & 0xFFF)
+        }
+    };
+    unsafe { phys::frame_ptr((pa >> 12) as u64).add((pa & 0xFFF) as usize) }
+}
+
+/// Guest-fault resolve from the software CPU (#PF, no EIP progress + CR2). Returns
+/// `true` if the page was demand-committed (retry) and `false` for a genuinely
+/// illegal access (null guard / out of range) that must bubble as `PageFault`.
+const NULL_GUARD: u32 = 0x1_0000;
+pub fn space_demand(vaddr: u32) -> bool {
+    let page = vaddr & !0xFFF;
+    let pd = active_pd();
+    if translate(pd, vaddr).is_some() {
+        return true; // already present — spurious refault, just retry
+    }
+    if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 {
+        return false;
+    }
+    let frame = phys::alloc_frames(1);
+    map_page(pd, page, frame, true);
+    true
+}
+
+/// Copy `count` page mappings src→dst with fresh frames (content copy — the
+/// interp owns a frame per VA, same observable result as a refcount-shared PTE).
+pub fn space_copy_entries(src: usize, dst: usize, count: usize) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let sv = ((src + i) * 4096) as u32;
+            let dv = ((dst + i) * 4096) as u32;
+            match translate(pd, sv) {
+                Some(spa) => {
+                    let df = phys::alloc_frames(1);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            phys::frame_ptr((spa >> 12) as u64),
+                            phys::frame_ptr(df),
+                            4096,
+                        );
+                    }
+                    // Preserve writability of the source page.
+                    let pde = read_entry(pd, pde_index(sv));
+                    let pte = read_entry((pde >> 12) as u64, pte_index(sv));
+                    map_page(pd, dv, df, pte & WRITABLE != 0);
+                }
+                None => unmap_page(pd, dv),
+            }
+        }
+    });
+}
+
+/// Swap `count` page mappings a↔b (PTE swap — no content move needed since each
+/// VA already owns its frame).
+pub fn space_swap_entries(a: usize, b: usize, count: usize) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let av = ((a + i) * 4096) as u32;
+            let bv = ((b + i) * 4096) as u32;
+            let (apde, bpde) = (read_entry(pd, pde_index(av)), read_entry(pd, pde_index(bv)));
+            // Ensure both PDEs have a page table so we can write either slot.
+            let apt = if apde & PRESENT != 0 { (apde >> 12) as u64 } else {
+                let pt = alloc_table(); write_entry(pd, pde_index(av), ((pt as u32) << 12) | ENTRY_FLAGS); pt };
+            let bpt = if bpde & PRESENT != 0 { (bpde >> 12) as u64 } else {
+                let pt = alloc_table(); write_entry(pd, pde_index(bv), ((pt as u32) << 12) | ENTRY_FLAGS); pt };
+            let (ae, be) = (read_entry(apt, pte_index(av)), read_entry(bpt, pte_index(bv)));
+            write_entry(apt, pte_index(av), be);
+            write_entry(bpt, pte_index(bv), ae);
+        }
+    });
+}
+
+/// Map the first 1 MB of the active space as fresh RW (VM86/DOS low memory:
+/// IVT, BDA, BIOS, PSPs). The metal call splits this into BIOS/VGA/ROM regions;
+/// the interp's emulated devices don't need that split here.
+pub fn space_map_low_mem() {
+    space_map_fresh(0, 0x100);
+}
+
+/// Free every user page in the active space (arch CLEAN): drop the PTEs and
+/// return the frames to the allocator. Kernel windows (high) are left intact.
+pub fn space_clean() {
+    with_active_pd(|pd| free_user_frames(pd));
+}
+
+fn free_user_frames(pd: u64) {
+    for pde_i in 0..(0xC000_0000usize >> 22) {
+        let pde = read_entry(pd, pde_i as usize);
+        if pde & PRESENT == 0 {
+            continue;
+        }
+        let pt = (pde >> 12) as u64;
+        for pte_i in 0..1024usize {
+            let pte = read_entry(pt, pte_i);
+            if pte & PRESENT != 0 {
+                phys::free_frames((pte >> 12) as u64, 1);
+                write_entry(pt, pte_i, 0);
+            }
+        }
+    }
+}
+
+/// Destroy a space entirely (reaped thread): free its user frames and forget it.
+/// Page-table frames and the PD are leaked back to the bump allocator's reuse
+/// only for user frames; id 0 (boot space) is permanent.
+pub fn space_destroy(id: u32) {
+    if id == 0 {
+        return;
+    }
+    let pd = SPACES.with(|s| s.borrow().pd.get(&id).copied());
+    if let Some(pd) = pd {
+        free_user_frames(pd);
+    }
+    SPACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.active == id {
+            s.active = 0;
+        }
+        s.pd.remove(&id);
+    });
 }
 
 #[cfg(test)]
