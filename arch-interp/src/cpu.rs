@@ -18,15 +18,27 @@
 
 use crate::vcpu;
 use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
 
 const PAGE: u64 = 4096;
 
-/// Instructions per run-slice — also the timer-IRQ granularity (deterministic).
-const SLICE: usize = 100_000;
+/// Instructions between forced returns to the kernel — the timer-IRQ delivery
+/// grid. A trap returns before this is spent and the *remainder* carries over
+/// ([`BUDGET`]); only a clean run to the boundary resets it. So IRQ0 lands on a
+/// fixed cumulative-instruction grid regardless of how the guest's I/O chopped
+/// the run up — like real hardware where `IN`/`INT` don't restart the PIT. Must
+/// be <= the shortest timer period a guest programs (Doom's 140 Hz ~= 14k instr).
+const IRQ_PERIOD: usize = 2_000;
+
+thread_local! {
+    /// Instructions left until the next forced kernel return (IRQ0 grid point):
+    /// decremented by every run, carried across traps, reset at the loop top once
+    /// a run reaches the boundary with no trap pending.
+    static BUDGET: Cell<usize> = const { Cell::new(IRQ_PERIOD) };
+}
 
 /// Per-run hook scratch.
 #[derive(Default)]
@@ -272,6 +284,12 @@ pub fn execute() -> KernelEvent {
         crate::screendump::maybe_render_live();
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
         let mode = regs.mode();
+        // Roll to the next IRQ0 grid period once the last was fully spent; a trap
+        // carries the remainder over so the grid stays fixed in cumulative
+        // instructions (the kernel pumps the PIT on every return regardless).
+        if budget_spent() {
+            BUDGET.with(|b| b.set(IRQ_PERIOD));
+        }
         let begin = configure(uc, regs, mode);
         {
             let d = uc.get_data_mut();
@@ -287,7 +305,7 @@ pub fn execute() -> KernelEvent {
                 mode, regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
                 regs.ds as u16, regs.frame.rflags);
         }
-        let mut run = run_slice(uc, begin, SLICE);
+        let mut run = run_slice(uc, begin, usize::MAX);
         // Resolve interp-internal stops without bubbling to the kernel:
         //  * Demand #PF (vector 14): the faulting VA is absent — commit a fresh
         //    frame, flush the TLB (CR3 rewrite), and re-run at the faulting EIP.
@@ -311,7 +329,7 @@ pub fn execute() -> KernelEvent {
                         d.pending_cr2 = 0;
                     }
                     let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
-                    run = run_slice(uc, eip, SLICE);
+                    run = run_slice(uc, eip, usize::MAX);
                     continue;
                 }
                 break; // genuine fault — handled below as PageFault
@@ -405,6 +423,7 @@ pub fn execute() -> KernelEvent {
 fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
     let cr3 = uc.reg_read(RegisterX86::CR3).unwrap_or(0);
     let _ = uc.reg_write(RegisterX86::CR3, cr3);
+    let _ = uc.ctl_flush_tlb();
 }
 
 /// Run up to `count` guest instructions and charge virtual time by what actually
@@ -414,7 +433,8 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
 /// (the timer never ticks; DOS/4GW's IRQ-dispatch loop waits forever). An early
 /// stop charges the block-accumulated work, which is accurate for the TB-breaking
 /// poll loops (DN's `in 0x3DA`) that the accumulator exists for.
-fn run_slice(uc: &mut Unicorn<'static, Ctx>, begin: u64, count: usize) -> Result<(), uc_error> {
+fn run_slice(uc: &mut Unicorn<'static, Ctx>, begin: u64, max: usize) -> Result<(), uc_error> {
+    let count = BUDGET.with(|b| b.get()).min(max).max(1);
     {
         let d = uc.get_data_mut();
         d.slice_instr = 0;
@@ -424,7 +444,13 @@ fn run_slice(uc: &mut Unicorn<'static, Ctx>, begin: u64, count: usize) -> Result
     let d = uc.get_data();
     let instr = if d.stopped { d.slice_instr } else { count as u64 };
     crate::machine::advance_virtual_time(instr.max(1));
+    BUDGET.with(|b| b.set(b.get().saturating_sub(instr as usize)));
     r
+}
+
+/// Whether the IRQ0 grid boundary was reached (budget spent).
+fn budget_spent() -> bool {
+    BUDGET.with(|b| b.get()) == 0
 }
 
 /// Invalidate cached translations for a range after an arch call mutated the
