@@ -41,6 +41,11 @@ struct Ctx {
     /// CPU fault error code (e.g. the faulting selector for #GP/#NP) — decoded
     /// from bits 16..31 of the patched intr-hook vector.
     pending_err: u16,
+    /// CR2 captured at the FIRST page fault of the slice. With CR0.PG=1 and no
+    /// usable guest IDT, a #PF QEMU can't vector escalates to #DF whose own
+    /// (faulting) delivery clobbers CR2 — so we snapshot it when the first fault
+    /// fires, before the escalation, rather than reading it back afterwards.
+    pending_cr2: u32,
 }
 
 thread_local! {
@@ -107,15 +112,26 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_intr_hook(|uc, intno| {
         let vector = (intno & 0xFF) as u8;
         let is_int = intno & 0x100 != 0;
-        // A page fault (#PF, vector 14, a CPU fault not a software int) is the
-        // paging backend's own business: demand-commit or genuine SEGV is
-        // decided in `execute` (it needs CR2 + the active page tables). Stop and
-        // let it run there.
-        if vector == 14 && !is_int {
-            let d = uc.get_data_mut();
-            d.pending_intr = Some(vector);
-            d.pending_is_int = false;
-            d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
+        // A page fault is the paging backend's own business: demand-commit or
+        // genuine SEGV is decided in `execute` (it needs CR2 + the active page
+        // tables). It surfaces as #PF (vector 14) when unicorn can report it, or
+        // — because we run the guest with no usable IDT — escalated to #DF
+        // (vector 8, error code 0) when unicorn tried and failed to vector the
+        // #PF through the (empty) guest IDT. Treat both as the underlying fault
+        // so the interp owns paging, exactly as the old PG=0 MEM_UNMAPPED path
+        // did (the guest's own IDT must never see our page-table faults).
+        if (vector == 14 || vector == 8) && !is_int {
+            // Keep the FIRST fault's vector + CR2: a #PF (14) that immediately
+            // escalates to #DF (8) calls this hook twice in one instruction, and
+            // the escalation's CR2 is garbage. The first call wins.
+            if uc.get_data().pending_intr.is_none() {
+                let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
+                let d = uc.get_data_mut();
+                d.pending_intr = Some(vector);
+                d.pending_is_int = false;
+                d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
+                d.pending_cr2 = cr2;
+            }
             let _ = uc.emu_stop();
             return;
         }
@@ -244,6 +260,7 @@ pub fn execute() -> KernelEvent {
             d.pending_intr = None;
             d.pending_is_int = false;
             d.pending_err = 0;
+            d.pending_cr2 = 0;
         }
 
         if trace_on() {
@@ -263,8 +280,8 @@ pub fn execute() -> KernelEvent {
         //    wild-jump SEGVs; DN exec-window ffbf panics). Step it out first.
         for _ in 0..256 {
             let d = uc.get_data();
-            if d.pending_intr == Some(14) && !d.pending_is_int {
-                let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
+            if matches!(d.pending_intr, Some(14) | Some(8)) && !d.pending_is_int {
+                let cr2 = d.pending_cr2;
                 if crate::paging::space_translate(cr2).is_none() && crate::paging::space_demand(cr2) {
                     flush_tlb(uc);
                     {
@@ -272,6 +289,7 @@ pub fn execute() -> KernelEvent {
                         d.pending_intr = None;
                         d.pending_is_int = false;
                         d.pending_err = 0;
+                        d.pending_cr2 = 0;
                     }
                     let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
                     run = uc.emu_start(eip, 0xFFFF_FFFF, 0, SLICE);
@@ -291,8 +309,8 @@ pub fn execute() -> KernelEvent {
         store_regs(uc, regs, mode);
         // A page fault that demand-paging did not resolve is a genuine SEGV: the
         // kernel signals the thread. Carry CR2 + the #PF error code.
-        if uc.get_data().pending_intr == Some(14) && !uc.get_data().pending_is_int {
-            let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
+        if matches!(uc.get_data().pending_intr, Some(14) | Some(8)) && !uc.get_data().pending_is_int {
+            let cr2 = uc.get_data().pending_cr2;
             regs.err_code = uc.get_data().pending_err as u64;
             uc.get_data_mut().pending_intr = None;
             return KernelEvent::PageFault { addr: cr2 };
