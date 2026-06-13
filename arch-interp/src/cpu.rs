@@ -20,7 +20,7 @@ use crate::vcpu;
 use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
 use core::cell::RefCell;
 use core::ffi::c_void;
-use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot};
+use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
 
 const PAGE: u64 = 4096;
@@ -46,6 +46,14 @@ struct Ctx {
     /// (faulting) delivery clobbers CR2 — so we snapshot it when the first fault
     /// fires, before the escalation, rather than reading it back afterwards.
     pending_cr2: u32,
+    /// Virtual-time accounting for the in-flight `emu_start`. The block hook
+    /// accumulates retired work into `slice_instr`; `stopped` records whether a
+    /// hook cut the slice short. A slice that runs to its instruction budget
+    /// retires the whole budget (the block hook undercounts a chained-TB loop —
+    /// it fires per TB entry, not per iteration), so on a full retire we charge
+    /// the budget; on an early stop we charge the accumulated work.
+    slice_instr: u64,
+    stopped: bool,
 }
 
 thread_local! {
@@ -132,6 +140,7 @@ fn build() -> Unicorn<'static, Ctx> {
                 d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
                 d.pending_cr2 = cr2;
             }
+            uc.get_data_mut().stopped = true;
             let _ = uc.emu_stop();
             return;
         }
@@ -156,6 +165,7 @@ fn build() -> Unicorn<'static, Ctx> {
         d.pending_intr = Some(vector);
         d.pending_is_int = is_int;
         d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
+        d.stopped = true;
         let _ = uc.emu_stop();
     })
     .expect("intr hook");
@@ -168,14 +178,17 @@ fn build() -> Unicorn<'static, Ctx> {
     // load. The IF=0→1 case falls out for free: we skip while IF=0 and stop at
     // the first block after the guest re-enables interrupts.
     uc.add_block_hook(1, 0, |uc, _addr, size| {
-        // Charge virtual time by the block's retired work here, not on full-slice
-        // retirement — so it advances even in port-IN / int-heavy loops that
-        // never complete a slice (e.g. DN's `in 0x3DA` retrace poll, whose VGA
-        // phase is derived from this clock). ~3 bytes/instruction.
-        crate::machine::advance_virtual_time((size as u64 / 3).max(1));
+        // Accumulate retired work (~3 bytes/instruction) for this slice. This
+        // undercounts a tight chained-TB loop (the hook fires on TB entry, not
+        // per iteration), so the *full-retire* charge in `run_slice` uses the
+        // instruction budget instead; this accumulator is the time source only
+        // for early stops (port-IN / int-heavy loops like DN's `in 0x3DA`
+        // retrace poll, whose VGA phase is derived from this clock).
+        uc.get_data_mut().slice_instr += (size as u64 / 3).max(1);
         if crate::machine::irq_line() {
             let flags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
             if flags & 0x200 != 0 {
+                uc.get_data_mut().stopped = true;
                 let _ = uc.emu_stop();
             }
         }
@@ -184,14 +197,18 @@ fn build() -> Unicorn<'static, Ctx> {
 
     // Port OUT → Out event; the value is in EAX (synced back to REGS).
     uc.add_insn_out_hook(|uc, port, size, _val| {
-        uc.get_data_mut().pending = Some(KernelEvent::Out { port: port as u16, size: io_size(size) });
+        let d = uc.get_data_mut();
+        d.pending = Some(KernelEvent::Out { port: port as u16, size: io_size(size) });
+        d.stopped = true;
         let _ = uc.emu_stop();
     })
     .expect("out hook");
 
     // Port IN → In event. The dummy 0 is overwritten by the kernel's EAX.
     uc.add_insn_in_hook(|uc, port, size| {
-        uc.get_data_mut().pending = Some(KernelEvent::In { port: port as u16, size: io_size(size) });
+        let d = uc.get_data_mut();
+        d.pending = Some(KernelEvent::In { port: port as u16, size: io_size(size) });
+        d.stopped = true;
         let _ = uc.emu_stop();
         0
     })
@@ -203,7 +220,9 @@ fn build() -> Unicorn<'static, Ctx> {
     // surface the faulting *virtual* address from CR2 and stop.
     uc.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX, |uc, _t: MemType, _addr, _sz, _v| {
         let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
-        uc.get_data_mut().pending = Some(KernelEvent::PageFault { addr: cr2 });
+        let d = uc.get_data_mut();
+        d.pending = Some(KernelEvent::PageFault { addr: cr2 });
+        d.stopped = true;
         let _ = uc.emu_stop();
         false
     })
@@ -268,7 +287,7 @@ pub fn execute() -> KernelEvent {
                 mode, regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
                 regs.ds as u16, regs.frame.rflags);
         }
-        let mut run = uc.emu_start(begin, 0xFFFF_FFFF, 0, SLICE);
+        let mut run = run_slice(uc, begin, SLICE);
         // Resolve interp-internal stops without bubbling to the kernel:
         //  * Demand #PF (vector 14): the faulting VA is absent — commit a fresh
         //    frame, flush the TLB (CR3 rewrite), and re-run at the faulting EIP.
@@ -292,7 +311,7 @@ pub fn execute() -> KernelEvent {
                         d.pending_cr2 = 0;
                     }
                     let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
-                    run = uc.emu_start(eip, 0xFFFF_FFFF, 0, SLICE);
+                    run = run_slice(uc, eip, SLICE);
                     continue;
                 }
                 break; // genuine fault — handled below as PageFault
@@ -304,7 +323,7 @@ pub fn execute() -> KernelEvent {
             {
                 break;
             }
-            run = uc.emu_start(eip, 0xFFFF_FFFF, 0, 1);
+            run = run_slice(uc, eip, 1);
         }
         store_regs(uc, regs, mode);
         // A page fault that demand-paging did not resolve is a genuine SEGV: the
@@ -386,6 +405,26 @@ pub fn execute() -> KernelEvent {
 fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
     let cr3 = uc.reg_read(RegisterX86::CR3).unwrap_or(0);
     let _ = uc.reg_write(RegisterX86::CR3, cr3);
+}
+
+/// Run up to `count` guest instructions and charge virtual time by what actually
+/// retired. A run that hits its instruction budget (no hook stopped it) retired
+/// the whole `count` — the block hook undercounts a chained-TB loop, so we must
+/// not trust its accumulator there or a tight compute loop freezes virtual time
+/// (the timer never ticks; DOS/4GW's IRQ-dispatch loop waits forever). An early
+/// stop charges the block-accumulated work, which is accurate for the TB-breaking
+/// poll loops (DN's `in 0x3DA`) that the accumulator exists for.
+fn run_slice(uc: &mut Unicorn<'static, Ctx>, begin: u64, count: usize) -> Result<(), uc_error> {
+    {
+        let d = uc.get_data_mut();
+        d.slice_instr = 0;
+        d.stopped = false;
+    }
+    let r = uc.emu_start(begin, 0xFFFF_FFFF, 0, count);
+    let d = uc.get_data();
+    let instr = if d.stopped { d.slice_instr } else { count as u64 };
+    crate::machine::advance_virtual_time(instr.max(1));
+    r
 }
 
 /// Invalidate cached translations for a range after an arch call mutated the
