@@ -248,26 +248,28 @@ multiboot map called free, or something interrupt/time-driven).
       Doom renders its 3D view + status bar with page-flipping (CRTC start
       address). A0000 paged onto the active plane, renderer reads the planes,
       detection via explicit-unchain state, no per-write trap.
-- [ ] **Doom slow, raptor fast — the QEMU-vs-our-unicorn store path** (user:
-      "QEMU runs Doom fantastic"; same TCG core, so it's OUR fork mod). Two
-      hypotheses TESTED and ruled out: (1) VGA feeder — no, the repoint
-      fired ONCE in 20s and headless Doom (no rendering) is also slow;
-      (2) the per-block hook breaking TB chaining — TESTED by removing it:
-      time-to-ST_Init unchanged (1.5 vs 1.9s) and the present-rate "71x"
-      was a virtual-time-over-charge ARTIFACT, not real speedup. So NOT the
-      block hook. Remaining confirmed difference = the fork stubs QEMU's
-      dirty-memory bitmap (cpu_physical_memory_is_clean ≡ true), so every
-      store goes via notdirty_write, and because the MEM_UNMAPPED hook maps
-      pages Prot::ALL (EXEC) it ALSO does page_collection_lock +
-      tb_invalidate per store. Doom's full-back-buffer-per-frame store
-      volume drowns in it; raptor's doesn't. THE FIX = W^X: map writable
-      pages READ|WRITE (no EXEC) in MEM_UNMAPPED, promote to EXEC on a
-      FETCH_PROT fault in the MEM_PROT hook (use uc.mem_protect). Data pages
-      (Doom's back buffer) then skip tb_invalidate entirely; code pages stay
-      EXEC (correct SMC — does NOT touch the NOTDIRTY logic that broke DN).
-      CAREFUL CHANGE — needs DN (the SMC/overlay reproducer) + raptor/duke
-      regression. Measure with a real metric (time-to-milestone or page-flip
-      rate), NOT present-fps (it tracks virtual-time charging, not throughput).
+- [ ] **Doom slow, raptor fast — ROOT-CAUSED by perf profile (2026-06-13):
+      per-page mem_map_ptr region blowup, NOT stores, NOT the block hook,
+      NOT the VGA feeder.** User's logic ("raptor is fat too, can't be a
+      per-store dirty thing affecting both") was right and decisive. perf on
+      Doom: 75% self-time in qemu_ram_alloc_from_ptr (+ render_memory_region,
+      memory_map_ptr); raptor: 0% there. The interp maps guest RAM ONE PAGE
+      per mem_map_ptr in the MEM_UNMAPPED hook — each new page allocates a
+      unicorn RAMBlock and rebuilds the flatview, O(regions) per map. Doom
+      streams a large/growing working set (4MB WAD + level/texture data +
+      256K Mode Y planes) → thousands of regions → O(n^2). raptor's small
+      working set maps once and stabilizes → no churn. (Earlier wrong turns,
+      for the record: block-hook/TB-chaining was a virtual-time ARTIFACT
+      not real speedup; the store/dirty-bitmap theory is contradicted by
+      raptor being fast.) THE FIX = stop the per-page region explosion: map
+      guest memory in LARGER spans (commit + mem_map_ptr a chunk, e.g.
+      64KB-1MB, per fault) so the RAMBlock/region count and per-map flatview
+      cost collapse; or restructure to a single large region with host-
+      mprotect + a SIGSEGV demand-paging handler (bigger, the "proper" QEMU-
+      like topology). Verify region count drops and re-profile. CAREFUL: a
+      chunk must handle partially-committed (sparse) and already-unicorn-
+      mapped pages without overlap errors. Measure with perf / a real metric,
+      NOT present-fps (it tracks virtual-time charging, not throughput).
 
 ## VGA: planar/Mode X VRAM trapping (renderer done be39c43; needs the feeder)
 The shared renderer now draws CGA/EGA-planar/Mode X from a 4-plane model +
