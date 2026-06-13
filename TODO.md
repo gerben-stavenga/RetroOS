@@ -243,6 +243,26 @@ multiboot map called free, or something interrupt/time-driven).
 
 ---
 
+## Mode X DONE; Doom slow = store ceiling, not the VGA path (measured 2026-06-12)
+- [x] **Mode X / Mode Y plane aliasing WORKS** (2fab439, 9a58ca9, f57e96a):
+      Doom renders its 3D view + status bar with page-flipping (CRTC start
+      address). A0000 paged onto the active plane, renderer reads the planes,
+      detection via explicit-unchain state, no per-write trap.
+- [ ] **Doom is ~8x slower than raptor — it's the unicorn store ceiling, NOT
+      the VGA feeder** (measured: raptor 323 present-fps, Doom 39; headless
+      Doom also slow; the VGA repoint fired exactly ONCE in 20s). Doom's
+      software 3D renderer rewrites a full back buffer every frame =
+      10-50x raptor's store volume, and every guest store hits unicorn's
+      slow path (notdirty_write + per-store tb_invalidate because the
+      MEM_UNMAPPED hook maps pages Prot::ALL → EXEC → SMC check on every
+      store). THE FIX (low-risk, unlike the reverted global patch): map data
+      pages W^X in the MEM_UNMAPPED hook (RW, no EXEC), promote to EXEC on a
+      fetch fault. Data-page stores (Doom's back buffer = the bulk) then skip
+      the tb_invalidate entirely. This is store-fastpath "direction 1" from
+      the original analysis and does NOT touch the NOTDIRTY/SMC logic that
+      broke DN. Pairs with: a VGA-plane-only fast store path (plane frames are
+      pure data, never code).
+
 ## VGA: planar/Mode X VRAM trapping (renderer done be39c43; needs the feeder)
 The shared renderer now draws CGA/EGA-planar/Mode X from a 4-plane model +
 registers (lib::vga_render, unit-tested). What's missing is POPULATING the
