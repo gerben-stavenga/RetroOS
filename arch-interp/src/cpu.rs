@@ -284,6 +284,12 @@ pub fn execute() -> KernelEvent {
         crate::screendump::maybe_render_live();
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
         let mode = regs.mode();
+        // Virtual-IF stepping: while a PM client has IF off, emulate the leading
+        // IF-touching opcodes in software so we only ever hand unicorn a
+        // non-sensitive instruction (which `configure` then TF-single-steps).
+        if mode == UserMode::Mode32 && regs.flags32() & IF_FLAG == 0 {
+            step_virtual_if(regs);
+        }
         // Roll to the next IRQ0 grid period once the last was fully spent; a trap
         // carries the remainder over so the grid stays fixed in cumulative
         // instructions (the kernel pumps the PIT on every return regardless).
@@ -362,6 +368,12 @@ pub fn execute() -> KernelEvent {
 
         if let Some(n) = uc.get_data_mut().pending_intr.take() {
             let is_int = uc.get_data().pending_is_int;
+            // #DB single-step trap from the virtual-IF stepping (configure armed
+            // TF while the PM client's IF is off): the one non-sensitive
+            // instruction retired; loop back so `step_virtual_if` re-checks.
+            if n == 1 && !is_int {
+                continue;
+            }
             if mode == UserMode::VM86 {
                 // Non-trapped VM86 ints are reflected to the IVT in the intr hook
                 // (run-through), so only trapped vectors (0x31) and the DPL=3
@@ -424,6 +436,90 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
     let cr3 = uc.reg_read(RegisterX86::CR3).unwrap_or(0);
     let _ = uc.reg_write(RegisterX86::CR3, cr3);
     let _ = uc.ctl_flush_tlb();
+}
+
+const IF_FLAG: u32 = 1 << 9;
+const TF_FLAG: u32 = 1 << 8;
+
+/// Virtual-IF single-step driver — the interp twin of arch-metal's
+/// `step_virtual_if`. A PM client runs at CPL=3, IOPL=1 (exactly like the real
+/// processor on metal): `CLI`/`STI` `#GP` and are emulated, but `POPF`/`IRET`
+/// at CPL>IOPL *silently drop* the IF bit instead of faulting, so the host can't
+/// see them. While the client's virtual IF is 0, we therefore walk the
+/// instruction stream in software, emulating every IF-touching opcode
+/// (`PUSHF`/`POPF`/`IRET`/`CLI`/`STI`) so the IF bit is never lost; non-sensitive
+/// instructions are handed to unicorn one at a time under `TF` (set in
+/// `configure`). When virtual IF comes back on we stop and resume at full speed.
+/// Leaves `regs` either with IF=1 (resume) or at a non-sensitive instruction
+/// with IF=0 (TF-step it). Stack/flags semantics follow SS.B / operand size.
+fn step_virtual_if(regs: &mut Regs) {
+    const BUDGET: usize = 64;
+    let m = crate::vcpu::mem();
+    for _ in 0..BUDGET {
+        if regs.flags32() & IF_FLAG != 0 {
+            return; // IF back on — resume hardware execution
+        }
+        let cs_base = crate::desc::seg_base(regs.code_seg());
+        let cs32 = crate::desc::seg_is_32(regs.code_seg());
+        let ss = regs.stack_seg();
+        let ss_base = crate::desc::seg_base(ss);
+        let ss32 = crate::desc::seg_is_32(ss);
+        // Skip prefixes; 0x66 toggles operand size from the CS default.
+        let mut p = regs.ip32();
+        let mut osz32 = cs32;
+        loop {
+            let b: u8 = m.read(cs_base.wrapping_add(p) as usize);
+            match b {
+                0x66 => { osz32 = !cs32; p = p.wrapping_add(1); }
+                0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => {
+                    p = p.wrapping_add(1);
+                }
+                _ => break,
+            }
+        }
+        let op: u8 = m.read(cs_base.wrapping_add(p) as usize);
+        let after = p.wrapping_add(1);
+        let osz: u32 = if osz32 { 4 } else { 2 };
+        let eff = |sp: u32| if ss32 { sp } else { sp & 0xFFFF };
+        let dec = |sp: u32| if ss32 { sp.wrapping_sub(osz) } else { (sp & !0xFFFF) | ((sp as u16).wrapping_sub(osz as u16) as u32) };
+        let inc = |sp: u32| if ss32 { sp.wrapping_add(osz) } else { (sp & !0xFFFF) | ((sp as u16).wrapping_add(osz as u16) as u32) };
+        let rd = |sp: u32| -> u32 {
+            let a = ss_base.wrapping_add(eff(sp)) as usize;
+            if osz == 4 { m.read::<u32>(a) } else { m.read::<u16>(a) as u32 }
+        };
+        // Apply popped flags: take the standard bits, keep client IOPL/VM, drop
+        // our stepping TF, set reserved bit 1. The IF bit becomes the virtual IF.
+        let apply_flags = |regs: &mut Regs, f: u32| {
+            let keep = regs.flags32() & (IOPL_MASK as u32 | (1 << 17));
+            regs.set_flags32((f & !(IOPL_MASK as u32) & !(1u32 << 17) & !TF_FLAG) | keep | 2);
+        };
+        match op {
+            0xFA => { let f = regs.flags32() & !IF_FLAG; regs.set_flags32(f); regs.set_ip32(after); } // CLI
+            0xFB => { let f = regs.flags32() | IF_FLAG; regs.set_flags32(f); regs.set_ip32(after); }  // STI
+            0x9C => { // PUSHF
+                let sp = dec(regs.sp32());
+                let a = ss_base.wrapping_add(eff(sp)) as usize;
+                if osz == 4 { m.write::<u32>(a, regs.flags32()); } else { m.write::<u16>(a, regs.flags32() as u16); }
+                regs.set_sp32(sp); regs.set_ip32(after);
+            }
+            0x9D => { // POPF
+                let f = rd(regs.sp32());
+                regs.set_sp32(inc(regs.sp32()));
+                apply_flags(regs, f);
+                regs.set_ip32(after);
+            }
+            0xCF => { // IRET (same-privilege CPL3→CPL3)
+                let mut sp = regs.sp32();
+                let nip = rd(sp); sp = inc(sp);
+                let ncs = rd(sp); sp = inc(sp);
+                let f = rd(sp); sp = inc(sp);
+                regs.set_sp32(sp); regs.set_ip32(nip); regs.set_cs32(ncs);
+                apply_flags(regs, f);
+                return; // CS changed — re-resolve next call
+            }
+            _ => return, // non-sensitive: configure arms TF and unicorn steps it
+        }
+    }
 }
 
 /// Run up to `count` guest instructions and charge virtual time by what actually
@@ -690,15 +786,15 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             run_trampoline(uc, &frame, None)
         }
         UserMode::Mode32 => {
-            // The client enters with IOPL=3: inside the software CPU, CLI/STI and
-            // POPF/IRET manipulate the emulated IF natively, so the virtual IF
-            // (rflags bit 9, read back per slice) tracks every idiom including the
-            // POPF/IRET restores that drop silently at IOPL<3. Safe here unlike
-            // metal: port I/O always traps through the IN/OUT hooks regardless of
-            // IOPL, and the kernel regains control by slice count, not timer IF.
-            // store_regs normalizes IOPL back to 1 so the kernel-side invariant
-            // (every ring-3 guest at IOPL=1) holds identically across backends.
-            let flags = (r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (IOPL_MASK as u32) | 2;
+            // The client runs CPL=3, IOPL=1 — exactly like the real processor on
+            // metal. CLI/STI #GP and are emulated against the virtual IF (rflags
+            // bit 9); POPF/IRET silently drop IF at CPL>IOPL, so while the virtual
+            // IF is 0 we single-step (TF=1) and `step_virtual_if` emulates the
+            // IF-touching opcodes in software. With IF on we run at full speed.
+            let mut flags = (r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (1 << 12) | 2;
+            if flags & IF_FLAG == 0 {
+                flags |= TF_FLAG; // step the next non-sensitive instruction
+            }
             let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
             let segs = [r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16];
             run_trampoline(uc, &frame, Some(segs))
@@ -754,7 +850,7 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             // Normalize IOPL back to the kernel-side invariant (1): the
             // guest ran at IOPL=3 inside the software CPU (see configure_pm)
             // purely so IF-manipulating instructions execute natively.
-            r.frame.rflags = (rd(uc, RegisterX86::EFLAGS) & !IOPL_MASK) | (1 << 12);
+            r.frame.rflags = (rd(uc, RegisterX86::EFLAGS) & !IOPL_MASK & !(TF_FLAG as u64)) | (1 << 12);
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
             // (and possibly EIP) holding stale bits from the trampoline's own

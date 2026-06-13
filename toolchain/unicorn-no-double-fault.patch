@@ -1,0 +1,32 @@
+RetroOS: never synthesize #DF in check_exception.
+
+This unicorn fork delivers every CPU fault independently through UC_HOOK_INTR
+(see qemu/accel/tcg/cpu-exec.c cpu_handle_exception), with no guest IDT and no
+nested-delivery path — the RetroOS arch-interp backend resolves each fault
+(demand-paging, DPMI exception reflection) itself. QEMU's hardware double-fault
+synthesis is therefore wrong here: it rewrites a demand #PF into #DF (vector 8,
+error 0) *during the raise*, before the hook runs, so the backend loses the true
+vector and CR2 (CR2 reads back as garbage once the escalation faults again).
+
+Deliver the raw vector instead; the backend never wants a host-synthesized #DF.
+
+--- a/qemu/target/i386/excp_helper.c
++++ b/qemu/target/i386/excp_helper.c
+@@ -64,11 +64,14 @@ static int check_exception(CPUX86State *env, int intno, int *error_code,
+         qemu_system_reset_request(env->uc);
+         return EXCP_HLT;
+     }
+
+     if ((first_contributory && second_contributory)
+         || (env->old_exception == EXCP0E_PAGE &&
+             (second_contributory || (intno == EXCP0E_PAGE)))) {
+-        intno = EXCP08_DBLE;
+-        *error_code = 0;
++        /* RetroOS patch: faults are delivered independently through
++         * UC_HOOK_INTR (no guest IDT, no nested delivery), so a demand #PF must
++         * reach the hook as #PF (vector 14) with its real CR2 — never combined
++         * into #DF. Keep the raw vector. */
++        (void)0;
+     }
+
+     if (second_contributory || (intno == EXCP0E_PAGE) ||
