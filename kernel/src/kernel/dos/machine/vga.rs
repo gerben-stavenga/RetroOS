@@ -87,6 +87,11 @@ pub struct VgaState {
     pub dac_read_index: u8,
     pub dac_rsub: u8,
     pub dac_wsub: u8,
+    /// VGA read latches: the 4 plane bytes loaded by the most recent VRAM read
+    /// (one per plane). Write mode 1 (latched copy) writes these straight
+    /// through; write modes 0/2/3 ALU the new value against them. Only used on
+    /// the trapped planar write path (see `vram_write`/`vram_read`).
+    pub latches: [u8; 4],
 }
 
 impl VgaState {
@@ -120,6 +125,7 @@ impl VgaState {
             dac_read_index: 0,
             dac_rsub: 0,
             dac_wsub: 0,
+            latches: [0; 4],
         }
     }
 
@@ -563,6 +569,52 @@ pub fn on_seq_write(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
         }
         _ => {}
     }
+}
+
+/// True when an A0000 access needs the full planar write/read logic rather than
+/// the single-plane page alias: any write mode but 0, a non-default read setup
+/// (latches matter), or a multi-plane map mask. The alias handles only the
+/// common write-mode-0 single-plane store; everything else traps to
+/// [`vram_write`]/[`vram_read`].
+pub fn needs_planar_trap(vga: &VgaState) -> bool {
+    if !planar_active() {
+        return false;
+    }
+    let write_mode = vga.gc[5] & 3;
+    let map_mask = vga.seq[2] & 0x0F;
+    write_mode != 0 || map_mask.count_ones() != 1
+}
+
+/// Trapped planar VRAM write: run the Graphics Controller write-mode logic for a
+/// CPU store of `byte` at A0000 offset `off`, fanning it into the 4 planes
+/// (stored at `VRAM_WINDOW`). Used when the single-plane alias can't model the
+/// access — write mode 1 (Mode X latched copy), write modes 2/3, or a
+/// multi-plane EGA write. Latches must have been loaded by a prior `vram_read`.
+pub fn vram_write(regs: &mut Vcpu, vga: &mut VgaState, off: u32, byte: u8) {
+    let off = (off & 0xFFFF) as usize;
+    let mut cur = [0u8; 4];
+    for p in 0..4 {
+        cur[p] = regs.read::<u8>(VRAM_WINDOW + p * 0x10000 + off);
+    }
+    let out = lib::vga_render::planar_write(cur, vga.latches, &vga.gc, vga.seq[2] & 0x0F, byte);
+    for p in 0..4 {
+        if out[p] != cur[p] {
+            regs.write::<u8>(VRAM_WINDOW + p * 0x10000 + off, out[p]);
+        }
+    }
+}
+
+/// Trapped planar VRAM read: load the 4 latches from the planes at A0000 offset
+/// `off` and return the byte the CPU sees (read map select, or color compare).
+pub fn vram_read(regs: &mut Vcpu, vga: &mut VgaState, off: u32) -> u8 {
+    let off = (off & 0xFFFF) as usize;
+    let mut cur = [0u8; 4];
+    for p in 0..4 {
+        cur[p] = regs.read::<u8>(VRAM_WINDOW + p * 0x10000 + off);
+    }
+    let (data, latches) = lib::vga_render::planar_read(cur, &vga.gc);
+    vga.latches = latches;
+    data
 }
 
 // ============================================================================

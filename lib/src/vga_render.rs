@@ -213,6 +213,109 @@ pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
     }
 }
 
+// ============================================================================
+// VGA planar write/read logic (EGA/VGA Graphics Controller + Sequencer)
+// ============================================================================
+//
+// One CPU byte written to the A0000 window fans out into 1–4 of the 4 planes
+// through the Graphics Controller. These pure functions model that fan-out so a
+// VRAM trap can apply it; `cur`/`latches` are the 4 plane bytes at one offset.
+//
+// Register layout (caller passes the GC file `gc[0..9]` + the Sequencer Map
+// Mask `seq[2]`):
+//   gc[0] Set/Reset       gc[1] Enable Set/Reset  gc[2] Color Compare
+//   gc[3] Data Rotate: bits0-2 rotate, bits3-4 ALU func (0=copy 1=AND 2=OR 3=XOR)
+//   gc[4] Read Map Select  gc[5] Mode: bits0-1 write mode, bit3 read mode
+//   gc[7] Color Don't Care gc[8] Bit Mask
+//   map_mask = seq[2] & 0x0F (per-plane write enable)
+
+#[inline]
+fn vga_alu(func: u8, val: u8, latch: u8) -> u8 {
+    match func & 3 {
+        0 => val,
+        1 => val & latch,
+        2 => val | latch,
+        _ => val ^ latch,
+    }
+}
+
+/// Apply one CPU store of `cpu` at a plane offset whose current plane bytes are
+/// `cur` and whose VGA latches (loaded by the most recent read) are `latches`.
+/// Returns the new 4 plane bytes. Planes not selected by the map mask are
+/// returned unchanged. Implements write modes 0/1/2/3 incl. set/reset, ALU
+/// function, and the bit mask. Write mode 1 is the latched copy (the `cpu`
+/// value is ignored — the latches are written straight through), which is how
+/// Mode X plane-parallel blits move 4 pixels per store.
+pub fn planar_write(cur: [u8; 4], latches: [u8; 4], gc: &[u8; 9], map_mask: u8, cpu: u8) -> [u8; 4] {
+    let write_mode = gc[5] & 3;
+    let rotate = (gc[3] & 7) as u32;
+    let func = (gc[3] >> 3) & 3;
+    let bit_mask = gc[8];
+    let esr = gc[1] & 0x0F;
+    let sr = gc[0] & 0x0F;
+    let rotated = cpu.rotate_right(rotate);
+
+    let mut out = cur;
+    for p in 0..4 {
+        if map_mask & (1 << p) == 0 {
+            continue;
+        }
+        let latch = latches[p];
+        out[p] = match write_mode {
+            // Write mode 0: per-plane set/reset or rotated CPU data, through the
+            // ALU against the latch, then merged with the latch by the bit mask.
+            0 => {
+                let val = if esr & (1 << p) != 0 {
+                    if sr & (1 << p) != 0 { 0xFF } else { 0x00 }
+                } else {
+                    rotated
+                };
+                let v = vga_alu(func, val, latch);
+                (v & bit_mask) | (latch & !bit_mask)
+            }
+            // Write mode 1: latched copy — write the latch directly (CPU ignored).
+            1 => latch,
+            // Write mode 2: each CPU bit selects the whole plane (0x00/0xFF),
+            // through the ALU and bit mask. Used for fast solid-colour fills.
+            2 => {
+                let val = if cpu & (1 << p) != 0 { 0xFF } else { 0x00 };
+                let v = vga_alu(func, val, latch);
+                (v & bit_mask) | (latch & !bit_mask)
+            }
+            // Write mode 3: rotated CPU data AND bit-mask forms the effective
+            // mask; the colour comes from set/reset (always, no enable gate).
+            _ => {
+                let eff_mask = rotated & bit_mask;
+                let val = if sr & (1 << p) != 0 { 0xFF } else { 0x00 };
+                let v = vga_alu(func, val, latch);
+                (v & eff_mask) | (latch & !eff_mask)
+            }
+        };
+    }
+    out
+}
+
+/// Read one offset: always loads all 4 plane bytes into the latches (returned
+/// as the second tuple element) and returns the byte the CPU sees. Read mode 0
+/// returns the plane chosen by Read Map Select; read mode 1 returns the
+/// color-compare result (1 bits where all don't-care planes match Color Compare).
+pub fn planar_read(cur: [u8; 4], gc: &[u8; 9]) -> (u8, [u8; 4]) {
+    let data = if (gc[5] >> 3) & 1 == 0 {
+        cur[(gc[4] & 3) as usize]
+    } else {
+        let cc = gc[2] & 0x0F;
+        let dc = gc[7] & 0x0F;
+        let mut r = 0xFFu8;
+        for p in 0..4 {
+            if dc & (1 << p) != 0 {
+                r &= if cc & (1 << p) != 0 { cur[p] } else { !cur[p] };
+            }
+        }
+        r
+    };
+    (data, cur)
+}
+
 /// Map a BIOS mode number (BDA 0x449) to a renderable mode with that mode's
 /// standard geometry. The fallback when the GC isn't programmed (emulated
 /// BIOS); also the source of the standard `row_bytes` for the planar modes.
@@ -613,5 +716,61 @@ mod tests {
         render(&frame, &mut out);
         assert_eq!(out[2], pal_rgb(&pal, 7));
         assert_eq!(out[0], pal_rgb(&pal, 0));
+    }
+
+    /// GC file with write mode `wm`, full bit mask, no set/reset, copy ALU,
+    /// map mask all planes (set via the seq side, passed separately).
+    fn gc_wm(wm: u8) -> [u8; 9] {
+        let mut gc = [0u8; 9];
+        gc[5] = wm & 3;
+        gc[8] = 0xFF; // bit mask: all bits from the new value
+        gc
+    }
+
+    #[test]
+    fn planar_latched_copy_moves_all_planes() {
+        // Write mode 1: the CPU byte is ignored; the latches go straight to the
+        // map-mask-selected planes — the Mode X 4-pixels-per-store blit.
+        let cur = [0x11, 0x22, 0x33, 0x44];
+        let latches = [0xAA, 0xBB, 0xCC, 0xDD];
+        let out = planar_write(cur, latches, &gc_wm(1), 0x0F, 0x00);
+        assert_eq!(out, latches);
+        // A masked-out plane (say plane 1) keeps its current byte.
+        let out2 = planar_write(cur, latches, &gc_wm(1), 0b1101, 0x00);
+        assert_eq!(out2, [0xAA, 0x22, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn planar_read_loads_latches_and_read_map() {
+        // Read map select (gc[4]) picks the returned plane; latches get all 4.
+        let cur = [0x10, 0x20, 0x30, 0x40];
+        let mut gc = [0u8; 9];
+        gc[4] = 2; // read plane 2
+        let (data, latches) = planar_read(cur, &gc);
+        assert_eq!(data, 0x30);
+        assert_eq!(latches, cur);
+    }
+
+    #[test]
+    fn planar_write_mode2_fill() {
+        // Write mode 2: each CPU bit selects whole-plane 0x00/0xFF. cpu=0b0101
+        // → planes 0 and 2 = 0xFF, planes 1 and 3 = 0x00 (copy ALU, full mask).
+        let cur = [0x55, 0x55, 0x55, 0x55];
+        let latches = [0; 4];
+        let out = planar_write(cur, latches, &gc_wm(2), 0x0F, 0b0101);
+        assert_eq!(out, [0xFF, 0x00, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn planar_write_mode0_bitmask_merges_latch() {
+        // Write mode 0, copy ALU, bit mask 0xF0: high nibble from CPU data, low
+        // nibble preserved from the latch.
+        let cur = [0; 4];
+        let latches = [0x0F, 0x0F, 0x0F, 0x0F];
+        let mut gc = gc_wm(0);
+        gc[8] = 0xF0;
+        let out = planar_write(cur, latches, &gc, 0x0F, 0xAA);
+        // (0xAA & 0xF0) | (0x0F & 0x0F) = 0xA0 | 0x0F = 0xAF
+        assert_eq!(out, [0xAF, 0xAF, 0xAF, 0xAF]);
     }
 }
