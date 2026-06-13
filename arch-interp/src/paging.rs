@@ -16,6 +16,94 @@
 //! walk with tables we build (a non-identity virtual→physical mapping), then
 //! grows into the real memory backend.
 
+use crate::phys;
+
+/// 32-bit non-PAE page-table format. A page directory and each page table are
+/// one physical frame of 1024 × 4-byte entries. We address frames by physical
+/// page number (ppage); the entry stores the target ppage in bits 31:12.
+const PRESENT: u32 = 1 << 0;
+const WRITABLE: u32 = 1 << 1;
+const USER: u32 = 1 << 2;
+const ENTRY_FLAGS: u32 = PRESENT | WRITABLE | USER;
+
+#[inline]
+fn pde_index(vaddr: u32) -> usize {
+    (vaddr >> 22) as usize
+}
+#[inline]
+fn pte_index(vaddr: u32) -> usize {
+    ((vaddr >> 12) & 0x3FF) as usize
+}
+
+/// Read entry `i` of the table in frame `ppage`.
+fn read_entry(ppage: u64, i: usize) -> u32 {
+    unsafe {
+        let p = phys::frame_ptr(ppage).add(i * 4) as *const u32;
+        p.read_unaligned()
+    }
+}
+/// Write entry `i` of the table in frame `ppage`.
+fn write_entry(ppage: u64, i: usize, v: u32) {
+    unsafe {
+        let p = phys::frame_ptr(ppage).add(i * 4) as *mut u32;
+        p.write_unaligned(v);
+    }
+}
+
+/// Allocate and zero a fresh page-table frame; returns its ppage.
+fn alloc_table() -> u64 {
+    let ppage = phys::alloc_frames(1);
+    unsafe { core::ptr::write_bytes(phys::frame_ptr(ppage), 0, 4096) };
+    ppage
+}
+
+/// Create a new (empty) address space: a zeroed page directory frame. Returns
+/// its ppage — this is the value loaded into CR3.
+pub fn new_page_dir() -> u64 {
+    alloc_table()
+}
+
+/// Map virtual page `vaddr` (page-aligned) to physical frame `paddr_ppage` in
+/// the address space rooted at page directory `pd`. Allocates the intermediate
+/// page table on first use. `writable` clears the W bit when false (read-only).
+pub fn map_page(pd: u64, vaddr: u32, paddr_ppage: u64, writable: bool) {
+    let pde_i = pde_index(vaddr);
+    let pde = read_entry(pd, pde_i);
+    let pt = if pde & PRESENT != 0 {
+        (pde >> 12) as u64
+    } else {
+        let pt = alloc_table();
+        write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
+        pt
+    };
+    let flags = if writable { ENTRY_FLAGS } else { PRESENT | USER };
+    write_entry(pt, pte_index(vaddr), ((paddr_ppage as u32) << 12) | flags);
+}
+
+/// Clear the mapping for `vaddr` (page granularity). Leaves the page table
+/// frame in place (cheap; reclaimed only when the whole space is freed).
+pub fn unmap_page(pd: u64, vaddr: u32) {
+    let pde = read_entry(pd, pde_index(vaddr));
+    if pde & PRESENT != 0 {
+        write_entry((pde >> 12) as u64, pte_index(vaddr), 0);
+    }
+}
+
+/// Software walk: translate guest virtual `vaddr` to a guest physical address,
+/// or `None` if unmapped. Used by the kernel's guest-memory accessors (the
+/// kernel is host code; it can't lean on the CPU MMU like the metal kernel).
+pub fn translate(pd: u64, vaddr: u32) -> Option<u32> {
+    let pde = read_entry(pd, pde_index(vaddr));
+    if pde & PRESENT == 0 {
+        return None;
+    }
+    let pte = read_entry((pde >> 12) as u64, pte_index(vaddr));
+    if pte & PRESENT == 0 {
+        return None;
+    }
+    Some((pte & !0xFFF) | (vaddr & 0xFFF))
+}
+
 #[cfg(test)]
 mod proof {
     use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
@@ -94,5 +182,42 @@ mod proof {
             "paging walk failed: ran code at virtual 0x40000000 (→ phys 0x100000) \
              should have set EAX, got {eax:#x}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tables {
+    use super::*;
+
+    #[test]
+    fn map_walk_roundtrip() {
+        let pd = new_page_dir();
+        // Map a few non-identity pages, including two in the same 4 MiB region
+        // (shared page table) and one far away (separate page table).
+        let f1 = phys::alloc_frames(1);
+        let f2 = phys::alloc_frames(1);
+        let f3 = phys::alloc_frames(1);
+        map_page(pd, 0x4000_0000, f1, true);
+        map_page(pd, 0x4000_1000, f2, true); // same PDE as above
+        map_page(pd, 0x8012_3000, f3, false); // different PDE, read-only
+
+        assert_eq!(translate(pd, 0x4000_0000), Some((f1 as u32) << 12));
+        assert_eq!(translate(pd, 0x4000_0abc), Some(((f1 as u32) << 12) | 0xabc));
+        assert_eq!(translate(pd, 0x4000_1000), Some((f2 as u32) << 12));
+        assert_eq!(translate(pd, 0x8012_3000), Some((f3 as u32) << 12));
+        assert_eq!(translate(pd, 0x5000_0000), None); // unmapped
+
+        // The two adjacent virtual pages share one page table (one PDE).
+        let pde0 = read_entry(pd, pde_index(0x4000_0000));
+        assert_eq!(pde0 >> 12, read_entry(pd, pde_index(0x4000_1000)) >> 12);
+
+        // Read-only page clears the W bit in its PTE.
+        let pde = read_entry(pd, pde_index(0x8012_3000));
+        let pte = read_entry((pde >> 12) as u64, pte_index(0x8012_3000));
+        assert_eq!(pte & WRITABLE, 0);
+
+        unmap_page(pd, 0x4000_0000);
+        assert_eq!(translate(pd, 0x4000_0000), None);
+        assert_eq!(translate(pd, 0x4000_1000), Some((f2 as u32) << 12)); // sibling intact
     }
 }
