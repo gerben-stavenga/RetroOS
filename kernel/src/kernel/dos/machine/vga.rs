@@ -499,6 +499,13 @@ fn vram_base(machine: &mut crate::TheArch) -> u64 {
 /// Point the guest A0000 window at plane `plane` (0..3): the 16 frames of that
 /// plane, so guest stores to A0000 land in it.
 fn alias_a0000_to_plane(machine: &mut crate::TheArch, base: u64, plane: u8) {
+    // Skip a no-op remap: a guest setting the plane-select mask to the same
+    // plane repeatedly (common in Mode X blit inner loops) would otherwise
+    // churn unicorn's region map (map_phys_range → unmap + re-fault →
+    // flatview rebuild, O(regions) each) every write.
+    if A0000_TARGET.load(Ordering::Relaxed) == plane {
+        return;
+    }
     machine.map_phys_range(A0000 >> 12, 16, base + plane as u64 * FRAMES_PER_64K, 0);
     A0000_TARGET.store(plane, Ordering::Relaxed);
 }
