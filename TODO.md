@@ -248,20 +248,26 @@ multiboot map called free, or something interrupt/time-driven).
       Doom renders its 3D view + status bar with page-flipping (CRTC start
       address). A0000 paged onto the active plane, renderer reads the planes,
       detection via explicit-unchain state, no per-write trap.
-- [ ] **Doom is ~8x slower than raptor — it's the unicorn store ceiling, NOT
-      the VGA feeder** (measured: raptor 323 present-fps, Doom 39; headless
-      Doom also slow; the VGA repoint fired exactly ONCE in 20s). Doom's
-      software 3D renderer rewrites a full back buffer every frame =
-      10-50x raptor's store volume, and every guest store hits unicorn's
-      slow path (notdirty_write + per-store tb_invalidate because the
-      MEM_UNMAPPED hook maps pages Prot::ALL → EXEC → SMC check on every
-      store). THE FIX (low-risk, unlike the reverted global patch): map data
-      pages W^X in the MEM_UNMAPPED hook (RW, no EXEC), promote to EXEC on a
-      fetch fault. Data-page stores (Doom's back buffer = the bulk) then skip
-      the tb_invalidate entirely. This is store-fastpath "direction 1" from
-      the original analysis and does NOT touch the NOTDIRTY/SMC logic that
-      broke DN. Pairs with: a VGA-plane-only fast store path (plane frames are
-      pure data, never code).
+- [ ] **Doom slow, raptor fast — the QEMU-vs-our-unicorn store path** (user:
+      "QEMU runs Doom fantastic"; same TCG core, so it's OUR fork mod). Two
+      hypotheses TESTED and ruled out: (1) VGA feeder — no, the repoint
+      fired ONCE in 20s and headless Doom (no rendering) is also slow;
+      (2) the per-block hook breaking TB chaining — TESTED by removing it:
+      time-to-ST_Init unchanged (1.5 vs 1.9s) and the present-rate "71x"
+      was a virtual-time-over-charge ARTIFACT, not real speedup. So NOT the
+      block hook. Remaining confirmed difference = the fork stubs QEMU's
+      dirty-memory bitmap (cpu_physical_memory_is_clean ≡ true), so every
+      store goes via notdirty_write, and because the MEM_UNMAPPED hook maps
+      pages Prot::ALL (EXEC) it ALSO does page_collection_lock +
+      tb_invalidate per store. Doom's full-back-buffer-per-frame store
+      volume drowns in it; raptor's doesn't. THE FIX = W^X: map writable
+      pages READ|WRITE (no EXEC) in MEM_UNMAPPED, promote to EXEC on a
+      FETCH_PROT fault in the MEM_PROT hook (use uc.mem_protect). Data pages
+      (Doom's back buffer) then skip tb_invalidate entirely; code pages stay
+      EXEC (correct SMC — does NOT touch the NOTDIRTY logic that broke DN).
+      CAREFUL CHANGE — needs DN (the SMC/overlay reproducer) + raptor/duke
+      regression. Measure with a real metric (time-to-milestone or page-flip
+      rate), NOT present-fps (it tracks virtual-time charging, not throughput).
 
 ## VGA: planar/Mode X VRAM trapping (renderer done be39c43; needs the feeder)
 The shared renderer now draws CGA/EGA-planar/Mode X from a 4-plane model +
