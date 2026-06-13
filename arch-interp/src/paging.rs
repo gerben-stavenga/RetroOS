@@ -104,6 +104,12 @@ pub fn translate(pd: u64, vaddr: u32) -> Option<u32> {
     Some((pte & !0xFFF) | (vaddr & 0xFFF))
 }
 
+/// Physical address (for CR3 / page-table walk) of a table frame.
+#[inline]
+pub fn frame_phys(ppage: u64) -> u32 {
+    (ppage as u32) << 12
+}
+
 #[cfg(test)]
 mod proof {
     use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
@@ -219,5 +225,115 @@ mod tables {
         unmap_page(pd, 0x4000_0000);
         assert_eq!(translate(pd, 0x4000_0000), None);
         assert_eq!(translate(pd, 0x4000_1000), Some((f2 as u32) << 12)); // sibling intact
+    }
+}
+
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot};
+    use unicorn_engine::{RegisterX86, Unicorn};
+
+    fn flat_desc(access: u8) -> [u8; 8] {
+        [0xFF, 0xFF, 0x00, 0x00, 0x00, access, 0xCF, 0x00]
+    }
+    fn mmr(base: u64, limit: u32) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        b[8..16].copy_from_slice(&base.to_le_bytes());
+        b[16..20].copy_from_slice(&limit.to_le_bytes());
+        b
+    }
+    fn write_phys(paddr: u32, bytes: &[u8]) {
+        let ppage = (paddr >> 12) as u64;
+        let off = (paddr & 0xFFF) as usize;
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys::frame_ptr(ppage).add(off), bytes.len());
+        }
+    }
+
+    /// The keystone: guest physical RAM is ONE unicorn region (the memfd), the
+    /// kernel's page tables live in it, paging is on, and an access to an
+    /// UNMAPPED virtual page demand-commits via the #PF handler and retries —
+    /// the model the whole migration rests on.
+    #[test]
+    fn one_region_paging_with_demand_fault() {
+        // Track #PF demand-commits via a thread-local because the intr hook
+        // closure can't borrow test locals across emu_start.
+        thread_local! { static PD: std::cell::Cell<u64> = std::cell::Cell::new(0); }
+        thread_local! { static FAULTS: std::cell::Cell<u32> = std::cell::Cell::new(0); }
+
+        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).expect("uc");
+
+        // ONE region: all guest physical RAM = the memfd, mapped once. (16 MiB
+        // window is plenty for the test; the real backend maps PHYS_SIZE.)
+        let base = phys::frame_ptr(0);
+        unsafe {
+            uc.mem_map_ptr(0, 16 << 20, Prot::ALL, base as *mut core::ffi::c_void)
+                .expect("map the one phys region");
+        }
+
+        let pd = new_page_dir();
+        PD.with(|c| c.set(pd));
+
+        // Lay out and map: GDT at virtual 0x1000, code at virtual 0x40_0000.
+        let gdt_frame = phys::alloc_frames(1);
+        let code_frame = phys::alloc_frames(1);
+        map_page(pd, 0x1000, gdt_frame, true);
+        map_page(pd, 0x40_0000, code_frame, true);
+
+        write_phys(frame_phys(gdt_frame), &[0u8; 8]);
+        write_phys(frame_phys(gdt_frame) + 8, &flat_desc(0x9A));
+        write_phys(frame_phys(gdt_frame) + 16, &flat_desc(0x92));
+
+        // Code: write 0x42 to the UNMAPPED virtual page 0x80_0000 (demand
+        // fault), read it back into EAX, halt. mov [0x800000],0x42; mov eax,[..]; jmp$
+        write_phys(
+            frame_phys(code_frame),
+            &[
+                0xC7, 0x05, 0x00, 0x00, 0x80, 0x00, 0x42, 0x00, 0x00, 0x00, // mov dword [0x800000],0x42
+                0xA1, 0x00, 0x00, 0x80, 0x00, // mov eax,[0x800000]
+                0xEB, 0xFE, // jmp $
+            ],
+        );
+
+        uc.reg_write_long(RegisterX86::GDTR, &mmr(0x1000, 0x17)).unwrap();
+        uc.reg_write(RegisterX86::CR3, frame_phys(pd) as u64).unwrap();
+        uc.reg_write(RegisterX86::CR4, 0).unwrap();
+        uc.reg_write(RegisterX86::CR0, 0x8000_0001).unwrap();
+        uc.reg_write(RegisterX86::CS, 0x08).unwrap();
+        for r in [RegisterX86::DS, RegisterX86::ES, RegisterX86::SS] {
+            uc.reg_write(r, 0x10).unwrap();
+        }
+
+        // Drive: run from the code's virtual address; on a #PF stop, retry from
+        // the current EIP (the page is now mapped).
+        let mut eip = 0x40_0000u64;
+        for _ in 0..8 {
+            let _ = uc.emu_start(eip, 0, 0, 8);
+            let neip = uc.reg_read(RegisterX86::EIP).unwrap();
+            if neip == 0x40_0000 + 15 { break; } // reached the jmp $ self-loop
+            if neip == eip {
+                // No progress = a paging fault. Demand-commit the page at CR2.
+                let cr2 = uc.reg_read(RegisterX86::CR2).unwrap() as u32;
+                if translate(PD.with(|c| c.get()), cr2).is_none() {
+                    let frame = phys::alloc_frames(1);
+                    PD.with(|c| map_page(c.get(), cr2 & !0xFFF, frame, true));
+                    FAULTS.with(|c| c.set(c.get() + 1));
+                    // Flush unicorn's softmmu TLB so it re-walks the updated PTE.
+                    let cr3 = uc.reg_read(RegisterX86::CR3).unwrap();
+                    uc.reg_write(RegisterX86::CR3, cr3).unwrap();
+                }
+            }
+            eip = neip;
+        }
+
+        assert_eq!(FAULTS.with(|c| c.get()), 1, "expected exactly one demand fault");
+        assert_eq!(uc.reg_read(RegisterX86::EAX).unwrap(), 0x42,
+            "guest wrote+read the demand-committed page");
+        // The kernel-side software walk sees the same byte the guest wrote.
+        let phys_of_data = translate(pd, 0x80_0000).expect("0x800000 mapped after fault");
+        let byte = unsafe { *phys::frame_ptr((phys_of_data >> 12) as u64) };
+        assert_eq!(byte, 0x42, "translate() + phys read matches the guest store");
+        let _ = MemType::WRITE; let _ = HookType::MEM_UNMAPPED; // keep imports used
     }
 }
