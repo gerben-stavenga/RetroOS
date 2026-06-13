@@ -411,6 +411,32 @@ pub fn syscall(
     }
 }
 
+/// Page-fault hook for the planar VGA trap: when a guest unchained-graphics
+/// access to the A0000 window faults (the window is left unmapped so the planar
+/// write/read logic runs), decode the faulting store/load and emulate it. Pure
+/// kernel + lib, no arch — both backends deliver the same PageFault. Returns
+/// true if handled (resume), false → real SEGV.
+pub fn try_vga_fault(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu, addr: u32) -> bool {
+    if !(0xA0000..0xB0000).contains(&addr) {
+        return false;
+    }
+    if !machine::vga::planar_active() {
+        // Chained (mode-13h linear) / text: A0000 is plain RAM. The interp
+        // faults the VGA aperture instead of auto-committing it (so the planar
+        // window can trap); here that just means demand-map this page and retry.
+        machine.map_fresh_range((addr as usize) >> 12, 1);
+        return true;
+    }
+    let off = addr - 0xA0000;
+    let (cs_base, def32) = if regs.mode() == crate::UserMode::VM86 {
+        ((regs.code_seg() as u32) << 4, false)
+    } else {
+        let cs = regs.code_seg();
+        (mode_transitions::seg_base(&dos.ldt[..], cs), mode_transitions::seg_is_32(&dos.ldt[..], cs))
+    };
+    machine::vga::handle_planar_fault(regs, &mut dos.pc.vga, cs_base, def32, off)
+}
+
 /// Single entry point the event loop calls for the DOS personality.
 /// All DOS/DPMI-specific knowledge (VM86 INT routing, DPMI INT 31, soft INT
 /// reflection, In/Out/Ins/Outs port virtualization, exception → DPMI exception

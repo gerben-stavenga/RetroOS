@@ -606,7 +606,11 @@ pub fn space_demand(vaddr: u32) -> bool {
     if translate(pd, vaddr).is_some() {
         return true; // already present — spurious refault, just retry
     }
-    if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 {
+    // The A0000 VGA aperture is device memory, never demand-paged RAM: when it
+    // isn't explicitly mapped (linear mode-13h / single-plane alias) it is the
+    // planar trap window, so bubble a PageFault for the kernel to decode —
+    // matching metal, where a not-present A0000 page simply #PFs in hardware.
+    if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 || (0xA_0000..0xB_0000).contains(&vaddr) {
         return false;
     }
     let frame = phys::alloc_frames(1);

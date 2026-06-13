@@ -177,6 +177,22 @@ impl Personality {
         }
     }
 
+    /// A page fault at `addr` may be a VGA planar-trap access (A0000 is left
+    /// unmapped while unchained graphics needs the planar write/read logic).
+    /// Returns true if it was handled (resume the thread), false → real SEGV.
+    /// Unified across backends: both deliver the PageFault, the kernel decodes.
+    pub fn try_vga_fault(
+        &mut self,
+        machine: &mut crate::TheArch,
+        regs: &mut crate::arch::Vcpu,
+        addr: u32,
+    ) -> bool {
+        match self {
+            Self::Dos(dos) => crate::kernel::dos::try_vga_fault(machine, dos, regs, addr),
+            _ => false,
+        }
+    }
+
     /// Per-iteration slice work AFTER input routing: deliver queued IRQs to
     /// a runnable DOS guest; complete a blocked Linux thread's pending pipe
     /// read / poll (which may make it Ready again).

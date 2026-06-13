@@ -296,6 +296,12 @@ fn dispatch(
     kevent: crate::arch::monitor::KernelEvent,
 ) -> thread::KernelAction {
     if let crate::arch::monitor::KernelEvent::PageFault { addr } = kevent {
+        // A VGA planar-trap access (A0000 unmapped while unchained graphics
+        // needs the write/read planar logic) is decoded + emulated here, not a
+        // SEGV. Same path on both backends — both deliver this PageFault.
+        if thread.personality.try_vga_fault(machine, regs, addr) {
+            return thread::KernelAction::Done;
+        }
         crate::println!("  fault rip={:#x} addr={:#x} err={:#x}",
             regs.frame.rip, addr, regs.err_code);
         thread::signal_thread(thread, addr as usize);

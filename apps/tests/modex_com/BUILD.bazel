@@ -1,0 +1,7 @@
+genrule(
+    name = "modex_com",
+    srcs = ["modex.asm"],
+    outs = ["MODEX.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
