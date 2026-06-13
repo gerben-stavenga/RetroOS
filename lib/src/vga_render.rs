@@ -81,6 +81,10 @@ pub struct Frame<'a> {
     /// it; rendering from 0 instead would show the back buffer mid-draw. 0 for
     /// non-flipping modes.
     pub start_offset: usize,
+    /// Horizontal pixel pan (Attribute Controller register 0x13), 0..7: the
+    /// fine sub-byte left shift that, combined with `start_offset`'s coarse
+    /// (4-px in Mode X) steps, gives smooth horizontal scrolling. 0 = none.
+    pub pixel_pan: usize,
 }
 
 /// Output framebuffer dimensions for a mode. Text is 80×25 cells of 9×16 px
@@ -525,10 +529,12 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
     let start = frame.start_offset;
+    let pan = frame.pixel_pan & 7;
     for y in 0..h {
         for x in 0..w {
-            let off = start + y * rb + x / 8;
-            let bit = 7 - (x & 7);
+            let sx = x + pan;
+            let off = start + y * rb + sx / 8;
+            let bit = 7 - (sx & 7);
             let mut val = 0u8;
             for p in 0..4 {
                 let b = planes.get(p * 0x10000 + off).copied().unwrap_or(0);
@@ -545,10 +551,13 @@ fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: u
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 4 } else { row_bytes };
     let start = frame.start_offset;
+    let pan = frame.pixel_pan & 7;
     for y in 0..h {
         for x in 0..w {
-            let plane = x & 3;
-            let off = start + y * rb + x / 4;
+            // Source column = displayed column + pan (display shifts left).
+            let sx = x + pan;
+            let plane = sx & 3;
+            let off = start + y * rb + sx / 4;
             let idx = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
             out[y * w + x] = pal_rgb(frame.palette, idx);
         }
@@ -675,7 +684,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -710,7 +719,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -772,5 +781,42 @@ mod tests {
         let out = planar_write(cur, latches, &gc, 0x0F, 0xAA);
         // (0xAA & 0xF0) | (0x0F & 0x0F) = 0xA0 | 0x0F = 0xAF
         assert_eq!(out, [0xAF, 0xAF, 0xAF, 0xAF]);
+    }
+
+    #[test]
+    fn planar_write_alu_functions() {
+        // Write mode 0, full bit mask, latch 0x0F, CPU 0xF0, through each ALU
+        // function (gc[3] bits 3-4: 0=copy 1=AND 2=OR 3=XOR).
+        let cur = [0x0F; 4];
+        let latches = [0x0F; 4];
+        let alu = |func: u8| {
+            let mut gc = gc_wm(0);
+            gc[3] = func << 3;
+            planar_write(cur, latches, &gc, 0x0F, 0xF0)[0]
+        };
+        assert_eq!(alu(0), 0xF0); // copy: new value
+        assert_eq!(alu(1), 0x00); // AND: 0xF0 & 0x0F
+        assert_eq!(alu(2), 0xFF); // OR:  0xF0 | 0x0F
+        assert_eq!(alu(3), 0xFF); // XOR: 0xF0 ^ 0x0F
+    }
+
+    #[test]
+    fn modex_pixel_pan_shifts_source() {
+        // Plane bytes 0..3 hold pixels 0..3; pan=2 shifts the display left 2, so
+        // displayed pixel 0 reads source pixel 2 (plane 2).
+        let mut planes = vec![0u8; 4 * 0x10000];
+        for p in 0..4 { planes[p * 0x10000] = (p as u8 + 1) * 16; } // plane p = 0x10*(p+1)
+        let ac = [0u8; 21];
+        let pal = fallback_palette();
+        let frame = Frame {
+            mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
+            vram: &[], planes: &planes, ac: &ac, palette: &pal,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 2,
+        };
+        let mut out = [0u32; 4];
+        render(&frame, &mut out);
+        // Displayed px0 = source px2 = plane2 = 0x30.
+        assert_eq!(out[0], pal_rgb(&pal, 0x30));
+        assert_eq!(out[1], pal_rgb(&pal, 0x40)); // source px3 = plane3
     }
 }

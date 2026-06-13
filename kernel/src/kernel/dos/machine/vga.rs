@@ -868,6 +868,12 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
             ((pc.vga.crtc[0x0C] as usize) << 8) | pc.vga.crtc[0x0D] as usize,
         _ => 0,
     };
+    // Horizontal Pixel Panning (AC 0x13, bits 0-3): the fine sub-byte shift for
+    // smooth scrolling, paired with the coarse start address above.
+    let pixel_pan = match mode {
+        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (pc.vga.ac[0x13] & 0x07) as usize,
+        _ => 0,
+    };
     let frame = Frame {
         mode,
         vram: &vram,
@@ -877,6 +883,7 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         font: &lib::vga_font_8x16::FONT_8X16,
         blink: pc.vga.ac[0x10] & 0x08 != 0,
         start_offset,
+        pixel_pan,
     };
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);
