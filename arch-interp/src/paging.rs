@@ -337,3 +337,186 @@ mod integration {
         let _ = MemType::WRITE; let _ = HookType::MEM_UNMAPPED; // keep imports used
     }
 }
+
+// ── Address-space layer ─────────────────────────────────────────────────────
+//
+// The page-table-based replacement for mmu.rs's `Space` model. An address space
+// IS a page directory (a CR3 value); these are the operations the Arch memory
+// methods drive. Built on the primitives above; the live wiring (cpu.rs
+// build/configure/execute, calls.rs) swaps onto these.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+struct Spaces {
+    /// id → page-directory ppage. id 0 is the boot space.
+    pd: BTreeMap<u32, u64>,
+    active: u32,
+    next: u32,
+}
+
+thread_local! {
+    static SPACES: RefCell<Spaces> =
+        RefCell::new(Spaces { pd: BTreeMap::new(), active: 0, next: 0 });
+}
+
+/// Create the boot address space (id 0) and make it active.
+pub fn space_init() {
+    SPACES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.pd.is_empty() {
+            let pd = new_page_dir();
+            s.pd.insert(0, pd);
+            s.active = 0;
+            s.next = 1;
+        }
+    });
+}
+
+/// Page-directory ppage of the active space (the CR3 value to load).
+pub fn active_pd() -> u64 {
+    SPACES.with(|s| {
+        let s = s.borrow();
+        *s.pd.get(&s.active).expect("active space missing")
+    })
+}
+
+fn with_active_pd<R>(f: impl FnOnce(u64) -> R) -> R {
+    f(active_pd())
+}
+
+/// Create a fresh empty address space; returns its id.
+pub fn space_new() -> u32 {
+    SPACES.with(|s| {
+        let mut s = s.borrow_mut();
+        let id = s.next;
+        s.next += 1;
+        let pd = new_page_dir();
+        s.pd.insert(id, pd);
+        id
+    })
+}
+
+/// Switch the active space.
+pub fn space_switch(id: u32) {
+    SPACES.with(|s| s.borrow_mut().active = id);
+}
+
+/// Map `count` pages at `vpage` to fresh zeroed frames (the memfd reads zero
+/// for never-written frames, and the bump allocator never reuses one).
+pub fn space_map_fresh(vpage: usize, count: usize) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let v = ((vpage + i) * 4096) as u32;
+            let frame = phys::alloc_frames(1);
+            map_page(pd, v, frame, true);
+        }
+    });
+}
+
+/// Map `count` guest pages at `vpage` onto physical frames at `ppage`.
+pub fn space_map_phys(vpage: usize, count: usize, ppage: u64, writable: bool) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            map_page(pd, ((vpage + i) * 4096) as u32, ppage + i as u64, writable);
+        }
+    });
+}
+
+/// Set writability across `count` present pages.
+pub fn space_set_writable(vpage: usize, count: usize, writable: bool) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let v = ((vpage + i) * 4096) as u32;
+            let pde = read_entry(pd, pde_index(v));
+            if pde & PRESENT == 0 {
+                continue;
+            }
+            let pt = (pde >> 12) as u64;
+            let pte = read_entry(pt, pte_index(v));
+            if pte & PRESENT == 0 {
+                continue;
+            }
+            let nf = if writable { pte | WRITABLE } else { pte & !WRITABLE };
+            write_entry(pt, pte_index(v), nf);
+        }
+    });
+}
+
+/// Clear `count` pages to absent (next access demand-faults).
+pub fn space_unmap(vpage: usize, count: usize) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            unmap_page(pd, ((vpage + i) * 4096) as u32);
+        }
+    });
+}
+
+/// Translate a guest virtual address in the active space.
+pub fn space_translate(vaddr: u32) -> Option<u32> {
+    translate(active_pd(), vaddr)
+}
+
+/// Eager copy fork: clone every present mapping into a new space with its own
+/// freshly-copied frames (correct, not yet COW — mirrors the current model).
+pub fn space_fork(src: u32) -> u32 {
+    let src_pd = SPACES.with(|s| *s.borrow().pd.get(&src).expect("fork src"));
+    let dst = space_new();
+    let dst_pd = SPACES.with(|s| *s.borrow().pd.get(&dst).unwrap());
+    for pde_i in 0..1024usize {
+        let pde = read_entry(src_pd, pde_i);
+        if pde & PRESENT == 0 {
+            continue;
+        }
+        let src_pt = (pde >> 12) as u64;
+        for pte_i in 0..1024usize {
+            let pte = read_entry(src_pt, pte_i);
+            if pte & PRESENT == 0 {
+                continue;
+            }
+            let v = ((pde_i << 22) | (pte_i << 12)) as u32;
+            let src_frame = (pte >> 12) as u64;
+            let dst_frame = phys::alloc_frames(1);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys::frame_ptr(src_frame),
+                    phys::frame_ptr(dst_frame),
+                    4096,
+                );
+            }
+            map_page(dst_pd, v, dst_frame, pte & WRITABLE != 0);
+        }
+    }
+    dst
+}
+
+#[cfg(test)]
+mod space_ops {
+    use super::*;
+
+    #[test]
+    fn map_fork_translate() {
+        space_init();
+        let s = space_new();
+        space_switch(s);
+        space_map_fresh(0x10, 2); // vpages 0x10,0x11
+        let p = space_translate(0x10_000).expect("mapped");
+        // Write a marker through the frame and confirm fork copies it.
+        unsafe { *phys::frame_ptr((p >> 12) as u64) = 0x7E };
+        let child = space_fork(s);
+        space_switch(child);
+        let cp = space_translate(0x10_000).expect("child mapped");
+        assert_ne!(p >> 12, cp >> 12, "fork gave the child its own frame");
+        assert_eq!(unsafe { *phys::frame_ptr((cp >> 12) as u64) }, 0x7E, "contents copied");
+        // Mutating the child doesn't touch the parent (separate frames).
+        unsafe { *phys::frame_ptr((cp >> 12) as u64) = 0x11 };
+        assert_eq!(unsafe { *phys::frame_ptr((p >> 12) as u64) }, 0x7E, "parent unchanged");
+
+        space_set_writable(0x10, 1, false);
+        let pde = read_entry(active_pd(), pde_index(0x10_000));
+        let pte = read_entry((pde >> 12) as u64, pte_index(0x10_000));
+        assert_eq!(pte & WRITABLE, 0);
+        space_unmap(0x10, 1);
+        assert_eq!(space_translate(0x10_000), None);
+    }
+}
