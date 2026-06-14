@@ -420,10 +420,13 @@ pub fn try_vga_fault(machine: &mut crate::TheArch, dos: &mut thread::DosState, r
     if !(0xA0000..0xB0000).contains(&addr) {
         return false;
     }
-    if !machine::vga::planar_active() {
-        // Chained (mode-13h linear) / text: A0000 is plain RAM. The interp
-        // faults the VGA aperture instead of auto-committing it (so the planar
-        // window can trap); here that just means demand-map this page and retry.
+    // Decide planar vs chained from THIS process's Sequencer Memory Mode
+    // (chain-4 bit), never the GLOBAL planar flag: A0000's mapping is
+    // per-address-space, so after an exec/process switch a still-trap-marked
+    // A0000 in the resumed space met a stale global "not planar" and SEGV'd
+    // (Epic Pinball's launcher exec). chain-4 set ⇒ chained linear RAM (a stale
+    // marking is just remapped + retried); clear ⇒ unchained Mode X ⇒ decode.
+    if dos.pc.vga.seq[4] & 0x08 != 0 {
         machine.map_fresh_range((addr as usize) >> 12, 1);
         return true;
     }

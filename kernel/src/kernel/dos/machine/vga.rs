@@ -761,10 +761,32 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             regs.rdi = if addr32 { di } else { (regs.rdi & !0xFFFF) | (di & 0xFFFF) };
             if rep { regs.rcx = if addr32 { 0 } else { regs.rcx & !0xFFFF }; }
         }
-        // movs (A4/A5) is a mem-to-mem block move where either side may be in
-        // A0000 — modelling it through the latches needs both effective
-        // addresses, not just the faulting one. Left unmodeled for now (surfaces
-        // as a fault) rather than emulated wrong.
+        // movs: DS:SI -> ES:DI, the write to ES:DI (in A0000) faults. The source
+        // (DS:SI) is normal RAM for the common blit-to-VRAM pattern (Epic
+        // Pinball); read it directly and write the destination through the
+        // planar logic. (VM86 only — a PM movs would need the source segment's
+        // LDT base, which isn't plumbed here; it falls through to a real fault.)
+        0xA4 | 0xA5 if !def32 => {
+            let sz = opsize(p66, opcode == 0xA4);
+            let count = if rep { gpr(regs, 1, 2).max(1) } else { 1 };
+            let df = regs.frame.rflags & (1 << 10) != 0;
+            let ds_base = (regs.ds as u32) << 4; // VM86 DS:SI source
+            let mut si = regs.rsi as u32 & 0xFFFF;
+            let mut dst = off;
+            for _ in 0..count {
+                for b in 0..sz {
+                    let byte = regs.read::<u8>(ds_base.wrapping_add(si).wrapping_add(b) as usize);
+                    vram_write(regs, vga, dst.wrapping_add(b), byte);
+                }
+                if df { si = si.wrapping_sub(sz); dst = dst.wrapping_sub(sz); }
+                else  { si = si.wrapping_add(sz); dst = dst.wrapping_add(sz); }
+            }
+            let step = count * sz;
+            let adj = |v: u64| if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) } as u64;
+            regs.rsi = (regs.rsi & !0xFFFF) | (adj(regs.rsi) & 0xFFFF);
+            regs.rdi = (regs.rdi & !0xFFFF) | (adj(regs.rdi) & 0xFFFF);
+            if rep { regs.rcx &= !0xFFFF; }
+        }
         _ => {
             let _ = (rep, addr32);
             return false;
