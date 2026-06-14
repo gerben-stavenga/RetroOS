@@ -295,10 +295,6 @@ pub mod flags {
     /// When set, page can never become writable (e.g., .text, .rodata)
     /// When clear (default), page is semantically writable
     pub const SOFT_RO: u64 = 1 << 9;
-    /// Software MMIO/device marker (matches `arch_abi::MAP_MMIO`): present=0 with
-    /// this bit set ⇒ a #PF here is a device trap (planar VGA aperture, future
-    /// BARs), handled by the kernel rather than demand-paged into RAM.
-    pub const SOFT_MMIO: u64 = 1 << 10;
     pub const NO_EXECUTE: u64 = 1 << 63;  // NX bit (PAE/long mode only)
 }
 
@@ -1632,13 +1628,14 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
 
 /// Map a physical page into the user address space.
 pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
-    // MAP_MMIO: a present=0 trap window (planar VGA aperture, future BARs) — a
-    // #PF here is a device trap the kernel decodes, not demand-paged RAM. The
-    // SOFT_MMIO marker persists so try_handle_page_fault recognises it.
-    if extra_flags & flags::SOFT_MMIO != 0 {
+    // MAP_MMIO: an emulated device aperture — present=0 + Cache-Disable (PCD),
+    // the not-present twin of the present+PCD passthrough device mappings. A #PF
+    // here is a device trap the kernel decodes (planar VGA, future emulated
+    // BARs), not demand-paged RAM; try_handle_page_fault recognises the PCD.
+    if extra_flags & arch_abi::MAP_MMIO != 0 {
         match entries() {
-            Entries::E32(e) => { let mut x = Entry32::default(); x.set_raw(flags::SOFT_MMIO | flags::USER); e[vpage] = x; }
-            Entries::E64(e) => { let mut x = Entry64::default(); x.set_raw(flags::SOFT_MMIO | flags::USER); e[vpage] = x; }
+            Entries::E32(e) => { let mut x = Entry32::default(); x.set_raw(flags::CACHE_DISABLE | flags::USER); e[vpage] = x; }
+            Entries::E64(e) => { let mut x = Entry64::default(); x.set_raw(flags::CACHE_DISABLE | flags::USER); e[vpage] = x; }
         }
         flush_tlb();
         return;

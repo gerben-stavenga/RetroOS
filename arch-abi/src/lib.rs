@@ -127,13 +127,14 @@ pub const USER_CS: u16 = 0x20 | 3; // Ring 3
 pub const USER_DS: u16 = 0x28 | 3; // Ring 3
 pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
 
-/// `Arch::map_phys_range` flag: map the range as **MMIO / device memory** —
-/// present=0 with a software trap marker — so a guest access faults to the
-/// kernel (e.g. the planar VGA aperture, future device BARs) instead of
-/// demand-committing RAM. Both backends honour it identically (it doubles as
-/// the PTE software-marker bit, free on x86: bits 9-11 are available). `flags=0`
-/// is plain writable RAM. The interp must NOT ignore map flags — that would
-/// silently diverge from metal the moment a flag carries meaning.
+/// `Arch::map_phys_range` flag: map the range as an **emulated MMIO aperture** —
+/// present=0 with the regular Cache-Disable (PCD) attribute the kernel already
+/// uses for device memory (NVMe BARs, AC'97/SB DMA map present+PCD). present=0
+/// + PCD is the *trapped* twin: a guest access faults to the kernel (the planar
+/// VGA window, future emulated BARs) instead of demand-committing RAM — present
+/// distinguishes passthrough device memory from an emulated one. No invented
+/// software bit. The interp must NOT ignore map flags — that silently diverges
+/// from metal the moment a flag carries meaning.
 pub const MAP_MMIO: u64 = 1 << 10;
 
 // =============================================================================

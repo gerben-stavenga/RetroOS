@@ -788,8 +788,8 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
         paging2::Entries::E32(e) => {
             if present {
                 handle_protection_fault(e, fault_addr, page_index, write, user, instruction_fetch)?;
-            } else if e[page_index].raw() & paging2::flags::SOFT_MMIO != 0 {
-                return None; // MMIO/device trap — kernel decodes (planar VGA, BARs)
+            } else if e[page_index].raw() & paging2::flags::CACHE_DISABLE != 0 {
+                return None; // present=0 + PCD = emulated MMIO trap — kernel decodes
             } else {
                 demand_page(e, page_index, false);
             }
@@ -797,7 +797,7 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
         paging2::Entries::E64(e) => {
             if present {
                 handle_protection_fault(e, fault_addr, page_index, write, user, instruction_fetch)?;
-            } else if e[page_index].raw() & paging2::flags::SOFT_MMIO != 0 {
+            } else if e[page_index].raw() & paging2::flags::CACHE_DISABLE != 0 {
                 return None;
             } else {
                 demand_page(e, page_index, nx);

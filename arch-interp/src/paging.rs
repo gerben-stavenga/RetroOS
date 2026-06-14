@@ -80,14 +80,15 @@ pub fn map_page(pd: u64, vaddr: u32, paddr_ppage: u64, writable: bool) {
     write_entry(pt, pte_index(vaddr), ((paddr_ppage as u32) << 12) | flags);
 }
 
-/// Software PTE marker (bit 10 — ignored by the CPU/softmmu): present=0 + this
-/// bit ⇒ MMIO/device aperture, which `space_demand` faults to the kernel
-/// instead of committing RAM. Same bit as `arch_abi::MAP_MMIO`.
-pub const MMIO_MARK: u32 = 1 << 10;
+/// Cache-Disable (PCD) PTE bit — the regular x86 device-memory attribute. On a
+/// present=0 PTE it is the MMIO trap marker: `space_demand` faults it to the
+/// kernel instead of committing RAM (present + PCD would be passthrough device
+/// memory, but the interp has no cache so it's inert there).
+pub const CACHE_DISABLE: u32 = 1 << 4;
 
-/// Map `count` pages at `vpage` as an MMIO trap window: present=0 + marker, so
+/// Map `count` pages at `vpage` as an MMIO trap window: present=0 + PCD, so
 /// guest accesses fault to the kernel (the page is not backed — `ppage` is
-/// irrelevant). The metal twin maps with `paging2::flags::SOFT_MMIO`.
+/// irrelevant). The metal twin maps the same present=0 + `CACHE_DISABLE`.
 pub fn space_map_mmio(vpage: usize, count: usize) {
     with_active_pd(|pd| {
         for i in 0..count {
@@ -101,7 +102,7 @@ pub fn space_map_mmio(vpage: usize, count: usize) {
                 write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
                 pt
             };
-            write_entry(pt, pte_index(vaddr), MMIO_MARK); // present=0
+            write_entry(pt, pte_index(vaddr), CACHE_DISABLE); // present=0 + PCD
         }
     });
 }
@@ -642,9 +643,9 @@ pub fn space_demand(vaddr: u32) -> bool {
     if translate(pd, vaddr).is_some() {
         return true; // already present — spurious refault, just retry
     }
-    // MMIO/device aperture (present=0 + marker, e.g. the planar VGA window
-    // mapped with MAP_MMIO): trap to the kernel, never demand-commit RAM.
-    if pte_raw(pd, vaddr) & MMIO_MARK != 0 {
+    // MMIO/device aperture (present=0 + PCD, e.g. the planar VGA window mapped
+    // with MAP_MMIO): trap to the kernel, never demand-commit RAM.
+    if pte_raw(pd, vaddr) & CACHE_DISABLE != 0 {
         return false;
     }
     if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 {
