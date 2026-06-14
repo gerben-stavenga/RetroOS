@@ -515,40 +515,17 @@ pub fn on_seq_write(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
     match idx {
         4 => {
             // Memory Mode bit 3 = chain-4. Set ⇒ chained (mode 13h linear);
-            // clear ⇒ unchained (Mode X planes).
+            // clear ⇒ unchained (Mode X planes). The chain→unchain hop seeds the
+            // planes from the current chained A0000 image (a 13h frame the game
+            // unchains into Mode X mid-stream); the reverse merges them back.
             let unchained = pc.vga.seq[4] & 0x08 == 0;
             let currently_planar = planar_active();
             if unchained && !currently_planar {
-                // chain → unchain hop: stand up the planes, deinterleave the
-                // current chained A0000 content into them, then LEAVE A0000
-                // UNMAPPED so every guest access faults into the planar trap
-                // (`handle_planar_fault`): the only way one CPU store can fan
-                // into 4 planes / honour the latches and write modes. The kernel
-                // owns the planes at VRAM_WINDOW; the renderer reads those.
-                let base = vram_base(machine);
-                let _ = base;
                 let mut chained = alloc::vec![0u8; 0x10000];
                 regs.copy_from(A0000, &mut chained);
-                let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
-                lib::vga_render::chain4_split(&chained, &mut planes);
-                regs.copy_to(VRAM_WINDOW, &planes);
-                // Map A0000 as MMIO (present=0 + trap marker) so every guest
-                // access faults into the planar trap. Same flag on both
-                // backends — no interp-only range special-case.
-                machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
-                A0000_TARGET.store(0, Ordering::Relaxed); // 0 != 0xFF ⇒ planar_active()
+                arm_planar(machine, regs, Some(&chained));
             } else if !unchained && currently_planar {
-                // unchain → chain hop: interleave planes back into a fresh
-                // linear A0000, drop the alias.
-                let base = VRAM_BASE.load(Ordering::Relaxed) as u64;
-                let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
-                regs.copy_from(VRAM_WINDOW, &mut planes);
-                let mut chained = alloc::vec![0u8; 0x10000];
-                lib::vga_render::chain4_merge(&planes, &mut chained);
-                machine.map_fresh_range(A0000 >> 12, 16);
-                regs.copy_to(A0000, &chained);
-                A0000_TARGET.store(0xFF, Ordering::Relaxed);
-                let _ = base;
+                disarm_planar(machine, regs, true);
             }
         }
         2 => {
@@ -560,6 +537,85 @@ pub fn on_seq_write(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
             let _ = ();
         }
         _ => {}
+    }
+}
+
+/// Stand up the 4-plane window and map A0000 as MMIO (present=0 + trap marker)
+/// so every guest store/load into A0000 faults into `handle_planar_fault` — the
+/// only way one CPU store can fan into 4 planes and honour the latches, write
+/// modes, and map mask. The kernel owns the planes at `VRAM_WINDOW`; the
+/// renderer reads those. `seed`: deinterleave an existing chained A0000 image
+/// into the planes (the Mode-X chain→unchain hop), or `None` to zero them (a
+/// fresh BIOS planar mode-set). Idempotent if already armed via the callers.
+fn arm_planar(machine: &mut crate::TheArch, regs: &mut Vcpu, seed: Option<&[u8]>) {
+    let _ = vram_base(machine); // ensure the plane window is allocated + mapped
+    let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
+    if let Some(chained) = seed {
+        lib::vga_render::chain4_split(chained, &mut planes);
+    }
+    regs.copy_to(VRAM_WINDOW, &planes);
+    machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
+    A0000_TARGET.store(0, Ordering::Relaxed); // 0 != 0xFF ⇒ planar_active()
+}
+
+/// Tear down the planar trap: map A0000 back to plain RAM. `merge`: interleave
+/// the planes back into a linear A0000 image first (the Mode-X unchain→chain
+/// hop, which expects the 13h view preserved); skip it when simply leaving
+/// graphics for text (the next mode-set clears the screen anyway).
+fn disarm_planar(machine: &mut crate::TheArch, regs: &mut Vcpu, merge: bool) {
+    let mut chained = alloc::vec![0u8; 0x10000];
+    if merge {
+        let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
+        regs.copy_from(VRAM_WINDOW, &mut planes);
+        lib::vga_render::chain4_merge(&planes, &mut chained);
+    }
+    machine.map_fresh_range(A0000 >> 12, 16);
+    if merge {
+        regs.copy_to(A0000, &chained);
+    }
+    A0000_TARGET.store(0xFF, Ordering::Relaxed);
+}
+
+/// React to a BIOS INT 10h AH=00 video mode set. The EGA/VGA 16-colour planar
+/// family (0x0D–0x12, e.g. Commander Keen) draws through the 4 planes via the
+/// map mask + write modes exactly like Mode X, but a game sets it via the BIOS
+/// and never toggles the Sequencer chain-4 bit — so `on_seq_write` never fires
+/// and the planar trap would stay disarmed, leaving the plane window empty
+/// (a black screen). Arm it here on entry to a planar mode, and disarm on a
+/// return to text/linear. `clear` (AL bit 7 clear) zeroes the planes.
+pub fn on_set_mode(
+    machine: &mut crate::TheArch,
+    pc: &mut PcMachine,
+    regs: &mut Vcpu,
+    mode: u8,
+    clear: bool,
+) {
+    if vga_present() {
+        return; // a real card draws its own planes
+    }
+    let planar = matches!(mode, 0x0D..=0x12);
+    if planar {
+        // Load the standard EGA 16-colour Attribute Controller palette the IBM
+        // BIOS programs on every planar mode set. Without it AC[0..15] are 0, so
+        // every 4-bit pixel maps to DAC index 0 (black) — Keen never touches the
+        // AC, relying on this default. Index i → i for 0..5, brown fixup at 6
+        // (0x14), then the bright bank 0x38..0x3F for 8..15.
+        const EGA_AC: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
+            0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+        ];
+        pc.vga.ac[..16].copy_from_slice(&EGA_AC);
+        pc.vga.ac[0x10] &= !0x80; // mode control: P4/P5 from palette, not colour-select
+    }
+    let currently = planar_active();
+    if planar && !currently {
+        arm_planar(machine, regs, None); // fresh mode-set ⇒ zeroed planes
+    } else if planar && currently && clear {
+        // Re-set the same planar mode: keep the trap, just blank the planes.
+        let zero = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
+        regs.copy_to(VRAM_WINDOW, &zero);
+    } else if !planar && currently {
+        disarm_planar(machine, regs, false); // leaving planar ⇒ A0000 back to RAM
     }
 }
 
@@ -846,8 +902,12 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
     // because our BIOS leaves the GC graphics bit unprogrammed and an
     // unprogrammed SEQ reads the same as a deliberate unchain. Doom (Mode Y,
     // 320×200 unchained) lands here. Resolution comes from the CRTC the game
-    // programmed (offset → row bytes; vertical-display-end → height).
-    let mode = if planar_active() {
+    // programmed (offset → row bytes; vertical-display-end → height). Only when
+    // the BDA still reads 256-colour 0x13: the planar trap is ALSO armed for the
+    // EGA 16-colour family (0x0D/0x0E/0x10, Keen), where the BDA names the mode
+    // and `classify` resolves the (different) pixel format correctly.
+    let bda_mode = regs.read::<u8>(0x449);
+    let mode = if planar_active() && bda_mode == 0x13 {
         let row_bytes = if v.crtc[0x13] != 0 { v.crtc[0x13] as u16 * 2 } else { 80 };
         let v_end = v.crtc[0x12] as u16
             | (((v.crtc[7] >> 1) & 1) as u16) << 8
@@ -860,7 +920,18 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         if h < 64 || h > 480 { h = 200; }
         VgaMode::ModeX { w: row_bytes * 4, h, row_bytes }
     } else {
-        match vga_render::classify(regs.read::<u8>(0x449), &rregs) {
+        match vga_render::classify(bda_mode, &rregs) {
+            // The visible width is the BIOS mode's (classify_bda gives 320/640),
+            // but the in-memory ROW STRIDE is the CRTC Offset register (0x13,
+            // counted in words). A smooth-scroller (Commander Keen) sets a
+            // virtual screen far wider than the 320-px display and pans a window
+            // across it; rendering at the mode's nominal 40-byte stride shears
+            // the image into stripes. Honour the programmed offset when the
+            // guest set one (a plain non-scrolling EGA program leaves it 0).
+            Some(VgaMode::Planar16 { w, h, row_bytes }) => {
+                let stride = if v.crtc[0x13] != 0 { v.crtc[0x13] as u16 * 2 } else { row_bytes };
+                VgaMode::Planar16 { w, h, row_bytes: stride }
+            }
             Some(m) => m,
             None => return,
         }

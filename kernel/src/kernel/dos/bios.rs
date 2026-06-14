@@ -386,19 +386,26 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
         0x00 => {
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
+            let clear = ax & 0x80 == 0;
             bda_field!(regs, video_mode = mode);
             bda_field!(regs, columns = if mode <= 1 || mode == 0x13 { 40u16 } else { 80 });
             bda_field!(regs, rows_minus1 = 24u8);
             bda_field!(regs, cell_height = if mode == 0x13 { 8u16 } else { 16 });
             bda_field!(regs, active_page = 0u8);
             bda_field!(regs, cursor_pos = [0u16; 8]);
-            if ax & 0x80 == 0 {
-                // AL bit 7 clear: clear the framebuffer.
+            // Arm/disarm the planar VRAM trap for the EGA 16-colour family
+            // (0x0D–0x12, Keen): a BIOS-set planar mode never toggles the
+            // Sequencer chain-4 bit, so this is the only place the trap gets
+            // armed. (`clear` also blanks the planes.)
+            super::machine::vga::on_set_mode(machine, &mut dos.pc, regs, mode, clear);
+            if clear {
+                // AL bit 7 clear: clear the framebuffer. Planar modes are
+                // cleared inside on_set_mode (their VRAM is the plane window).
                 if mode == 0x13 {
                     for i in 0..(320 * 200 / 4) {
                         regs.write::<u32>(VRAM_MODE13 + i * 4, 0);
                     }
-                } else {
+                } else if !matches!(mode, 0x0D..=0x12) {
                     for i in 0..16384 {
                         // full 32K text window
                         regs.write::<u16>(VRAM_TEXT + i * 2, 0x0720);

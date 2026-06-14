@@ -115,10 +115,13 @@ pub fn maybe_dump() {
         return;
     }
     let Some(path) = DUMP_PATH.get() else { return };
-    // Graphics mode (13h): dump the latest kernel-rendered frame as a PPM;
-    // text modes fall through to the CP437 character dump below (more useful
-    // as grep-able text than as pixels).
-    if crate::vcpu::mem().read::<u8>(0x449) == 0x13 {
+    // Any graphics mode: dump the latest kernel-rendered frame as a PPM. Text
+    // modes (0x00-0x03, 0x07) fall through to the CP437 character dump below
+    // (more useful as grep-able text than as pixels). This must cover the EGA
+    // 16-colour planar family (0x0D/0x0E/0x10, Commander Keen) and Mode X, not
+    // just linear mode 13h — gating on ==0x13 left Keen's screenshot blank.
+    let is_text = matches!(crate::vcpu::mem().read::<u8>(0x449), 0x00..=0x03 | 0x07);
+    if !is_text {
         if let Some((w, h, fb)) = crate::vga::peek_frame() {
             let mut buf = Vec::with_capacity(w * h * 3 + 32);
             let _ = write!(buf, "P6\n{w} {h}\n255\n");
