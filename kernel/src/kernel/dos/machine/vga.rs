@@ -801,6 +801,16 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             i += l + 1;
             vram_write(regs, vga, off, imm);
         }
+        // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
+        0xC7 => {
+            let modrm = peek(i);
+            let l = modrm_len(modrm, addr32, &peek, i);
+            let sz = opsize(p66, false);
+            let mut imm = 0u32;
+            for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
+            i += l + sz;
+            for b in 0..sz { vram_write(regs, vga, off + b, (imm >> (b * 8)) as u8); }
+        }
         // stos: store (E)AX to ES:DI, count in (E)CX if rep. AL/AX/EAX.
         0xAA | 0xAB => {
             let sz = opsize(p66, opcode == 0xAA);
@@ -817,25 +827,41 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             regs.rdi = if addr32 { di } else { (regs.rdi & !0xFFFF) | (di & 0xFFFF) };
             if rep { regs.rcx = if addr32 { 0 } else { regs.rcx & !0xFFFF }; }
         }
-        // movs: DS:SI -> ES:DI, the write to ES:DI (in A0000) faults. The source
-        // (DS:SI) is normal RAM for the common blit-to-VRAM pattern (Epic
-        // Pinball); read it directly and write the destination through the
-        // planar logic. (VM86 only — a PM movs would need the source segment's
-        // LDT base, which isn't plumbed here; it falls through to a real fault.)
+        // movs: DS:SI -> ES:DI. The source (DS:SI) is normal RAM for the common
+        // blit-to-VRAM pattern (Epic Pinball); read it directly and write the
+        // destination (ES:DI, in A0000) through the planar logic. Recompute both
+        // ends from the registers rather than trusting `off` — either operand
+        // can be the faulting one.
+        //
+        // NOTE: a VRAM→VRAM `rep movs` (EGA latch copy — Keen's Galaxy engine
+        // composes from off-screen VRAM) is NOT routed through the latches here.
+        // Doing so (vram_read on the source) is correct in isolation but lets
+        // Keen run far enough to trip a separate timer-IRQ storm (stack
+        // exhausted, garbage IRET). Until that is fixed it stays a plain read.
+        // The common `mov al,[si]` / `mov [di],al` latch copy already works via
+        // the 0x8A/0x88 handlers. (VM86 only — a PM movs would need the source
+        // segment's LDT base, which isn't plumbed here.)
         0xA4 | 0xA5 if !def32 => {
             let sz = opsize(p66, opcode == 0xA4);
             let count = if rep { gpr(regs, 1, 2).max(1) } else { 1 };
             let df = regs.frame.rflags & (1 << 10) != 0;
-            let ds_base = (regs.ds as u32) << 4; // VM86 DS:SI source
+            let ds_base = (regs.ds as u32) << 4;
+            let es_base = (regs.es as u32) << 4;
             let mut si = regs.rsi as u32 & 0xFFFF;
-            let mut dst = off;
+            let mut di = regs.rdi as u32 & 0xFFFF;
             for _ in 0..count {
                 for b in 0..sz {
-                    let byte = regs.read::<u8>(ds_base.wrapping_add(si).wrapping_add(b) as usize);
-                    vram_write(regs, vga, dst.wrapping_add(b), byte);
+                    let src = ds_base.wrapping_add(si).wrapping_add(b);
+                    let dst = es_base.wrapping_add(di).wrapping_add(b);
+                    let byte = regs.read::<u8>(src as usize);
+                    if (0xA0000..0xB0000).contains(&dst) {
+                        vram_write(regs, vga, dst - 0xA0000, byte);
+                    } else {
+                        regs.write::<u8>(dst as usize, byte);
+                    }
                 }
-                if df { si = si.wrapping_sub(sz); dst = dst.wrapping_sub(sz); }
-                else  { si = si.wrapping_add(sz); dst = dst.wrapping_add(sz); }
+                if df { si = si.wrapping_sub(sz); di = di.wrapping_sub(sz); }
+                else  { si = si.wrapping_add(sz); di = di.wrapping_add(sz); }
             }
             let step = count * sz;
             let adj = |v: u64| if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) } as u64;
