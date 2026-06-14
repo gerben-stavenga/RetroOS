@@ -468,9 +468,45 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
             regs.rbx = (regs.rbx & !0xFF00) | ((page as u64) << 8);
         }
         0x10 => {
-            // Palette/DAC — forward to the DAC ports so the platform's
+            // Palette/DAC — forward to the AC/DAC ports so the platform's
             // palette capture (and a real card on metal) sees one path.
             match (ax & 0xFF) as u8 {
+                0x00 => {
+                    // Set one EGA palette (Attribute Controller) register:
+                    // BL = register 0..15, BH = colour value. Keen recolours its
+                    // title (and fades it in) through these — without it every
+                    // value-1 pixel stays at the default AC[1]=blue.
+                    let idx = (regs.rbx & 0x1F) as u8;
+                    let val = (regs.rbx >> 8) as u8;
+                    let _ = emulate_inb(machine, &mut dos.pc, 0x3DA); // reset AC flip-flop
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, idx); // index (PAS=0)
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, val); // data
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x20); // re-enable display
+                }
+                0x01 => {
+                    // Set overscan/border colour (AC register 0x11) = BH.
+                    let val = (regs.rbx >> 8) as u8;
+                    let _ = emulate_inb(machine, &mut dos.pc, 0x3DA);
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x11);
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, val);
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x20);
+                }
+                0x02 => {
+                    // Set all 16 palette registers + overscan: ES:DX → 17 bytes
+                    // (0..15 = palette, 16 = overscan). Keen loads its title
+                    // palette in one shot here.
+                    let tbl = ((regs.es as u16 as usize) << 4) + regs.rdx as u16 as usize;
+                    let _ = emulate_inb(machine, &mut dos.pc, 0x3DA);
+                    for i in 0..16u8 {
+                        let b: u8 = regs.read(tbl + i as usize);
+                        emulate_outb(machine, &mut dos.pc, regs, 0x3C0, i);
+                        emulate_outb(machine, &mut dos.pc, regs, 0x3C0, b);
+                    }
+                    let ov: u8 = regs.read(tbl + 16);
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x11);
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, ov);
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x20);
+                }
                 0x03 => {
                     // Toggle blink/intensity (BL bit 0: 1 = blink, 0 = 16
                     // background colors). Program AC reg 0x10 bit 3 through
