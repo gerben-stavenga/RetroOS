@@ -665,18 +665,20 @@ pub fn space_copy_entries(src: usize, dst: usize, count: usize) {
             let dv = ((dst + i) * 4096) as u32;
             match translate(pd, sv) {
                 Some(spa) => {
-                    let df = phys::alloc_frames(1);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            phys::frame_ptr((spa >> 12) as u64),
-                            phys::frame_ptr(df),
-                            4096,
-                        );
-                    }
-                    // Preserve writability of the source page.
+                    // ALIAS dst onto src's physical frame — do NOT snapshot it
+                    // into a fresh frame. The sole caller is the A20-wrap setup
+                    // (HMA pages onto low memory), where the two ranges are the
+                    // SAME storage on real hardware (A20 forces address bit 20
+                    // to 0). A content copy froze HMA at boot, so writes through
+                    // low memory never appeared via the wrap and DN/COMMAND read
+                    // stale code (the ffbf garbage-execution crash on panel
+                    // launch). Metal copies the PTE + bumps a shared refcount;
+                    // match that so the two views truly share storage.
+                    let frame = (spa >> 12) as u64;
                     let pde = read_entry(pd, pde_index(sv));
                     let pte = read_entry((pde >> 12) as u64, pte_index(sv));
-                    map_page(pd, dv, df, pte & WRITABLE != 0);
+                    map_page(pd, dv, frame, pte & WRITABLE != 0);
+                    phys::inc_ref(frame);
                 }
                 None => unmap_page(pd, dv),
             }

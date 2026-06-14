@@ -15,8 +15,9 @@
 //! plane-aliasing, and COW fork all build on; on metal the same kernel code
 //! drives real frames through `map_phys_range`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 const PAGE: usize = 4096;
 
@@ -105,14 +106,42 @@ pub fn alloc_frames(count: usize) -> u64 {
     start as u64
 }
 
-/// Return `count` frames at `start` to the allocator. Each frame is hole-punched
-/// (host RAM reclaimed; the frame re-reads zero on next touch) and pushed to the
-/// free list for reuse. Frame 0 is never freed (the null sentinel).
+/// Frames referenced by more than one PTE — the only intra-space aliasing the
+/// interp creates is the A20-wrap (HMA pages aliased onto low memory), but the
+/// model is general. A frame absent here has an implicit refcount of 1; a frame
+/// present here is shared and is reclaimed only when its last extra reference is
+/// released. Mirrors metal's `phys_mm` shared-frame count so `copy_page_entries`
+/// can alias instead of snapshot.
+fn shared() -> &'static Mutex<HashMap<u64, u32>> {
+    static S: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Add a reference to `frame` (a second PTE now maps it). The frame survives the
+/// next `free_frames` and is reclaimed only when references drop back to 1.
+pub fn inc_ref(frame: u64) {
+    *shared().lock().unwrap().entry(frame).or_insert(1) += 1;
+}
+
+/// Return `count` frames at `start` to the allocator. A shared (aliased) frame
+/// just drops a reference. The last reference hole-punches it (host RAM
+/// reclaimed; the frame re-reads zero on next touch) and pushes it to the free
+/// list for reuse. Frame 0 is never freed (the null sentinel).
 pub fn free_frames(start: u64, count: usize) {
     let mut free = FREE_LIST.lock().unwrap();
+    let mut sh = shared().lock().unwrap();
     for i in 0..count as u64 {
         let f = start + i;
         if f == 0 {
+            continue;
+        }
+        if let Some(rc) = sh.get_mut(&f) {
+            // Shared frame: drop one reference; once it falls back to 1 it's no
+            // longer aliased and the next free will reclaim it for real.
+            *rc -= 1;
+            if *rc <= 1 {
+                sh.remove(&f);
+            }
             continue;
         }
         unsafe {
