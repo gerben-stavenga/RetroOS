@@ -970,6 +970,20 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (pc.vga.ac[0x13] & 0x07) as usize,
         _ => 0,
     };
+    // CRTC Line Compare (0x18 + overflow bit 8 in 0x07.4, bit 9 in 0x09.6): the
+    // scanline where the lower split-screen region begins (status panel locked
+    // to display address 0). All-ones ⇒ no split. Halve under double-scan so it
+    // lands in the same row space as `h`. Planar modes only.
+    let line_compare = match mode {
+        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => {
+            let lc = v.crtc[0x18] as usize
+                | (((v.crtc[7] >> 4) & 1) as usize) << 8
+                | (((v.crtc[9] >> 6) & 1) as usize) << 9;
+            let lc = if v.crtc[9] & 0x80 != 0 { lc / 2 } else { lc };
+            if lc < h { lc } else { usize::MAX }
+        }
+        _ => usize::MAX,
+    };
     let frame = Frame {
         mode,
         vram: &vram,
@@ -980,6 +994,7 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
         blink: pc.vga.ac[0x10] & 0x08 != 0,
         start_offset,
         pixel_pan,
+        line_compare,
     };
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);

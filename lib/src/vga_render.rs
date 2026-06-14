@@ -85,6 +85,13 @@ pub struct Frame<'a> {
     /// fine sub-byte left shift that, combined with `start_offset`'s coarse
     /// (4-px in Mode X) steps, gives smooth horizontal scrolling. 0 = none.
     pub pixel_pan: usize,
+    /// CRTC Line Compare split: the first output row of the lower "split screen"
+    /// region, which the hardware always fetches from display address 0 with
+    /// panning disabled (the classic static status bar below a scrolling
+    /// playfield). `usize::MAX` = no split. Above this row the normal
+    /// `start_offset`/`pixel_pan` apply; at and below it, the address latch
+    /// resets to 0.
+    pub line_compare: usize,
 }
 
 /// Output framebuffer dimensions for a mode. Text is 80×25 cells of 9×16 px
@@ -528,12 +535,18 @@ fn planar_rgb(frame: &Frame, val: u8) -> u32 {
 fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
-    let start = frame.start_offset;
-    let pan = frame.pixel_pan & 7;
     for y in 0..h {
+        // Below the Line Compare split the address latch resets to 0 and panning
+        // is suppressed — a fixed status panel under the scrolling playfield.
+        let split = y >= frame.line_compare;
+        let (start, pan, ry) = if split {
+            (0, 0, y - frame.line_compare)
+        } else {
+            (frame.start_offset, frame.pixel_pan & 7, y)
+        };
         for x in 0..w {
             let sx = x + pan;
-            let off = start + y * rb + sx / 8;
+            let off = start + ry * rb + sx / 8;
             let bit = 7 - (sx & 7);
             let mut val = 0u8;
             for p in 0..4 {
@@ -550,14 +563,19 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
 fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 4 } else { row_bytes };
-    let start = frame.start_offset;
-    let pan = frame.pixel_pan & 7;
     for y in 0..h {
+        // Line Compare split: the lower region fetches from address 0, no pan.
+        let split = y >= frame.line_compare;
+        let (start, pan, ry) = if split {
+            (0, 0, y - frame.line_compare)
+        } else {
+            (frame.start_offset, frame.pixel_pan & 7, y)
+        };
         for x in 0..w {
             // Source column = displayed column + pan (display shifts left).
             let sx = x + pan;
             let plane = sx & 3;
-            let off = start + y * rb + sx / 4;
+            let off = start + ry * rb + sx / 4;
             let idx = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
             out[y * w + x] = pal_rgb(frame.palette, idx);
         }
@@ -684,7 +702,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -719,12 +737,37 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
         assert_eq!(out[2], pal_rgb(&pal, 7));
         assert_eq!(out[0], pal_rgb(&pal, 0));
+    }
+
+    #[test]
+    fn modex_line_compare_splits_to_address_zero() {
+        // 4×4 Mode X. Plane 0 byte 0 (top row, addr 0) = 5; the scrolled
+        // front buffer (start_offset) row 2 holds a different value. With a
+        // line compare at output row 2, rows 0-1 read the scrolled page and
+        // rows 2-3 snap back to address 0 (the static panel).
+        let mut planes = vec![0u8; 4 * 0x10000];
+        planes[0] = 5; // address 0, plane 0 → pixel (0,0) of the split region
+        planes[0x100] = 9; // start_offset page (0x100), plane 0, byte 0
+        let ac = [0u8; 21];
+        let pal = fallback_palette();
+        let frame = Frame {
+            mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
+            vram: &[], planes: &planes, ac: &ac, palette: &pal,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+            start_offset: 0x100, pixel_pan: 0, line_compare: 2,
+        };
+        let mut out = [0u32; 16];
+        render(&frame, &mut out);
+        // Row 0 (above split) reads start_offset page → pixel (0,0) = 9.
+        assert_eq!(out[0], pal_rgb(&pal, 9));
+        // Row 2 (split region, ry=0) reads address 0 → pixel (0,0) = 5.
+        assert_eq!(out[2 * 4], pal_rgb(&pal, 5));
     }
 
     /// GC file with write mode `wm`, full bit mask, no set/reset, copy ALU,
@@ -811,7 +854,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 2,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);

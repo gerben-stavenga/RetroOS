@@ -305,6 +305,7 @@ fn flush() {
         blink: false,
         start_offset: 0,
         pixel_pan: 0,
+        line_compare: usize::MAX,
     };
     let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
     let native = g.format.is_native();
@@ -334,6 +335,7 @@ fn flush() {
                 blink: frame.blink,
                 start_offset: 0,
                 pixel_pan: 0,
+                line_compare: usize::MAX,
             };
             vga_render::render_text_cell(&cell_frame, 0, 0, &mut cell_pixels, CELL_W);
             let x = (i % 80) * CELL_W;
