@@ -698,6 +698,22 @@ fn set_gpr(regs: &mut Vcpu, idx: u8, sz: u32, val: u32) {
     }
 }
 
+/// Set the status flags (CF/PF/AF/ZF/SF/OF) for an 8-bit `a - b` subtraction —
+/// the result of a `CMP`/`SUB` — leaving the rest of EFLAGS untouched. The other
+/// arithmetic flags follow the x86 definition; OF is signed overflow.
+fn set_sub_flags8(regs: &mut Vcpu, a: u8, b: u8) {
+    let res = a.wrapping_sub(b);
+    const MASK: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+    let mut f = regs.frame.rflags & !MASK;
+    if (a as u16) < (b as u16) { f |= 1 << 0; }          // CF: borrow
+    if res.count_ones() & 1 == 0 { f |= 1 << 2; }        // PF: even parity of low byte
+    if (a & 0xF) < (b & 0xF) { f |= 1 << 4; }            // AF: borrow from bit 4
+    if res == 0 { f |= 1 << 6; }                         // ZF
+    if res & 0x80 != 0 { f |= 1 << 7; }                  // SF
+    if (a ^ b) & (a ^ res) & 0x80 != 0 { f |= 1 << 11; } // OF: signed overflow
+    regs.frame.rflags = f;
+}
+
 /// Length of the ModR/M + SIB + displacement that follows the opcode, given the
 /// first ModR/M byte and the effective address size (32-bit when `addr32`).
 fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u32 {
@@ -868,6 +884,25 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             regs.rsi = (regs.rsi & !0xFFFF) | (adj(regs.rsi) & 0xFFFF);
             regs.rdi = (regs.rdi & !0xFFFF) | (adj(regs.rdi) & 0xFFFF);
             if rep { regs.rcx &= !0xFFFF; }
+        }
+        // cmp r/m8, r8 — read the VRAM byte (loads the latches) and compare it
+        // with r8, setting flags; no write-back. Doom's Mode-X renderer does
+        // `cmp byte [vram], dl` in its masked-write loop. Read map / read mode
+        // are honoured by `vram_read`; the Map Mask only governs writes.
+        0x38 => {
+            let modrm = peek(i);
+            let reg = gpr(regs, (modrm >> 3) & 7, 1) as u8;
+            i += modrm_len(modrm, addr32, &peek, i);
+            let mem = vram_read(regs, vga, off);
+            set_sub_flags8(regs, mem, reg);
+        }
+        // cmp r8, r/m8 — the symmetric form (reg - [vram]).
+        0x3A => {
+            let modrm = peek(i);
+            let reg = gpr(regs, (modrm >> 3) & 7, 1) as u8;
+            i += modrm_len(modrm, addr32, &peek, i);
+            let mem = vram_read(regs, vga, off);
+            set_sub_flags8(regs, reg, mem);
         }
         _ => {
             let _ = (rep, addr32);
