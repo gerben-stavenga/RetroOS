@@ -439,6 +439,16 @@ pub fn execute() -> KernelEvent {
             // TF while the PM client's IF is off): the one non-sensitive
             // instruction retired; loop back so `step_virtual_if` re-checks.
             if n == 1 && !is_int {
+                // A single-stepped port `in`/`out` raises the I/O hook AND the
+                // #DB on the SAME instruction. The instruction already retired,
+                // so the I/O event must be delivered — not dropped by this
+                // re-step `continue` (the loop top clears `pending`). Losing it
+                // silently swallowed a PM IRQ handler's `out 0x20` EOI, leaving
+                // IRQ0 stuck in-service forever (Doom timer freeze after
+                // I_StartupTimer; the ISR EOIs while IF=0, i.e. single-stepped).
+                if let Some(ev) = uc.get_data_mut().pending.take() {
+                    return ev;
+                }
                 continue;
             }
             // Sensitive-instruction #GP (error code 0): decode through the shared
