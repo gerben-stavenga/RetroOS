@@ -110,6 +110,7 @@ fn init_device_policy(
     // output for the emulated Sound Blaster; absent (no PCI, e.g. the
     // interpreter) leaves the sound path on its port-window fallback.
     crate::kernel::ac97::init(machine);
+    crate::kernel::hda::init(machine);
 }
 
 /// /CONFIG.SYS provides the master env handed to DN and any user-driven

@@ -93,6 +93,10 @@ pub fn window_present(arch: &mut crate::TheArch) -> bool {
 pub fn play(arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
+        Audio::EmulatedHda => {
+            crate::kernel::hda::play(arch, rate, fmt, bytes);
+            return;
+        }
         Audio::EmulatedAc97 => {
             crate::kernel::ac97::play(arch, rate, fmt, bytes);
             return;

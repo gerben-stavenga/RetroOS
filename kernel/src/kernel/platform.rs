@@ -72,6 +72,9 @@ pub enum Audio {
     /// the 8237 stays virtual. Implies a real OPL — the 0x388 window is
     /// part of the DOS io_policy template, not a runtime grant.
     SbPassthrough,
+    /// No card; the software SB16 renders through the kernel sound API into an
+    /// Intel HD Audio controller found on PCI (QEMU `intel-hda`, modern metal).
+    EmulatedHda,
     /// No card; the software SB16 renders through the kernel sound API into
     /// the AC'97 codec found on PCI (UEFI-class metal).
     EmulatedAc97,
@@ -225,6 +228,9 @@ fn probe_audio(machine: &mut crate::TheArch) -> Audio {
     let sb_absent = machine.inb(0x22C) == 0xFF && machine.inb(0x22E) == 0xFF;
     if !sb_absent {
         return Audio::SbPassthrough;
+    }
+    if crate::kernel::hda::scan(machine).is_some() {
+        return Audio::EmulatedHda;
     }
     if crate::kernel::ac97::scan(machine).is_some() {
         return Audio::EmulatedAc97;
