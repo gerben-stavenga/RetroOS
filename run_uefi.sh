@@ -1,116 +1,34 @@
 #!/bin/bash
-# Boot RetroOS on a UEFI-only "modern laptop" mock.
+# Boot RetroOS on a UEFI-only "modern laptop" mock (QEMU + OVMF, GOP, NVMe).
+# COMPAT SHIM: this now forwards to the unified ./run.sh (qemu --firmware uefi).
+# Usage: ./run_uefi.sh [image] [--headless] [-- extra qemu args]
+#   default image: see run.sh (proprietary when present, else image)
 #
-# This deliberately mimics a current machine (e.g. a 2024 Razer Blade):
-#   - OVMF (edk2) firmware: UEFI boot, no CSM, no legacy BIOS services
-#   - GOP-only display:  -device bochs-display — a dumb linear framebuffer
-#     with NO VGA ports and NO text mode (touching 0xB8000/VGA regs does
-#     nothing, exactly like real modern hardware)
-#   - NVMe-only storage: the RetroOS image is attached as an NVMe namespace;
-#     there is no IDE/AHCI disk, so the ATA driver must find nothing
-#   - USB keyboard (xHCI) — though q35 still provides an i8042, which is the
-#     bring-up crutch until a xHCI/HID driver exists
-#
-# The kernel is loaded by a standalone GRUB (multiboot1) from a generated
-# ESP — an interim stand-in until `boot-uefi` (our own UEFI entry with GOP
-# framebuffer handoff) replaces it. The kernel binary itself is UNCHANGED
-# from the legacy-BIOS boot.
-#
-# Console: the kernel header requests a linear framebuffer (multiboot video
-# fields); GRUB sets a GOP mode and the kernel's fbcon renders the text
-# console into it (kernel/src/arch/fbcon.rs). The 0xE9 debug log → stdio
-# (-debugcon) carries the same text. DOS guests draw to guest VRAM, which has
-# no display path here yet — that's the DOS-personality-BIOS work (TODO #6).
-#
-# Usage: ./run_uefi.sh [image.bin] [--headless] [-- extra qemu args]
-#   default image: bazel-bin/image_proprietary.bin (falls back to image.bin)
+# See run.sh's launch_qemu_uefi for the OVMF/ESP/NVMe/xHCI details.
 
-set -euo pipefail
+set -e
+set -o pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
 
-IMAGE=""
-HEADLESS=0
-EXTRA=()
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --headless|-H) HEADLESS=1 ;;
-        --) shift; EXTRA+=("$@"); break ;;
-        *)  if [ -z "$IMAGE" ]; then IMAGE="$1"; else EXTRA+=("$1"); fi ;;
+# Translate the original's optional leading positional [image] into run.sh's
+# uniform `-i <image>` (a leading dash arg is a flag, left as passthrough), and
+# translate the original's -H short form for --headless (run.sh reserves -H for
+# the hosted backend's host-dir, so it isn't accepted as a headless flag here).
+ARGS=()
+first=1
+for a in "$@"; do
+    if [ "$first" = 1 ]; then
+        first=0
+        case "$a" in
+            -*) : ;;                  # flag: fall through to normal handling
+            *)  ARGS+=(-i "$a"); continue ;;
+        esac
+    fi
+    case "$a" in
+        -H) ARGS+=(--headless) ;;
+        *)  ARGS+=("$a") ;;
     esac
-    shift
 done
-if [ -z "$IMAGE" ]; then
-    IMAGE="bazel-bin/image_proprietary.bin"
-    [ -f "$IMAGE" ] || IMAGE="bazel-bin/image.bin"
-fi
-[ -f "$IMAGE" ] || { echo "run_uefi: no image at $IMAGE (bazelisk build //:image)" >&2; exit 1; }
 
-KERNEL="bazel-bin/kernel/kernel.elf"
-[ -f "$KERNEL" ] || { echo "run_uefi: no kernel at $KERNEL (bazelisk build //kernel:kernel_elf)" >&2; exit 1; }
-
-OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
-OVMF_VARS="/usr/share/OVMF/OVMF_VARS_4M.fd"
-[ -f "$OVMF_CODE" ] || { echo "run_uefi: OVMF not found (apt install ovmf)" >&2; exit 1; }
-
-# Build the ESP fresh each run (cheap: ~1s). Standalone GRUB embeds its own
-# grub.cfg in a memdisk; it then locates kernel.elf on the ESP by search.
-WORK="$(mktemp -d -t retroos-uefi.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
-
-cat > "$WORK/grub.cfg" <<'EOF'
-set timeout=0
-# The kernel's multiboot header requests a linear framebuffer (GOP); GRUB can
-# only satisfy it with its EFI video driver loaded.
-insmod efi_gop
-set gfxmode=auto
-set gfxpayload=keep
-menuentry "RetroOS (multiboot)" {
-    search --no-floppy --file /kernel.elf --set=root
-    multiboot /kernel.elf
-    boot
-}
-EOF
-
-grub-mkstandalone -O x86_64-efi -o "$WORK/BOOTX64.EFI" \
-    "boot/grub/grub.cfg=$WORK/grub.cfg" >/dev/null
-
-ESP="$WORK/esp.img"
-truncate -s 64M "$ESP"
-mformat -i "$ESP" -F ::
-mmd    -i "$ESP" ::/EFI ::/EFI/BOOT
-mcopy  -i "$ESP" "$WORK/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
-mcopy  -i "$ESP" "$KERNEL" ::/kernel.elf
-
-# Private writable VARS copy (OVMF persists boot entries into it).
-cp "$OVMF_VARS" "$WORK/vars.fd"
-
-DISPLAY_ARGS=()
-if [ "$HEADLESS" = 1 ]; then
-    DISPLAY_ARGS+=(-display none)
-fi
-
-# -cpu max: the default qemu64 model lacks VME, forcing the kernel's software
-# VM86 monitor; real hardware (and run_qemu.sh) has VME.
-exec qemu-system-x86_64 \
-    -M q35 -m 512 -cpu max \
-    -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-    -drive if=pflash,format=raw,file="$WORK/vars.fd" \
-    -nodefaults \
-    -device bochs-display \
-    -drive file="$IMAGE",if=none,id=hd,format=raw,snapshot=on \
-    -device nvme,drive=hd,serial=retro1 \
-    `# image controller FIRST: the kernel's nvme probe takes the first` \
-    `# controller it finds; OVMF locates the ESP by filesystem, not order` \
-    -drive file="$ESP",if=none,id=esp,format=raw \
-    -device nvme,drive=esp,serial=esp0 \
-    `# xHCI controller present (the honest modern-laptop bus, for the future` \
-    `# xHCI driver to probe) but NO usb-kbd: QEMU routes keyboard input to a` \
-    `# USB keyboard when one exists, and with no xHCI driver those keys` \
-    `# vanish — the i8042 bring-up crutch never sees a byte. Keys reach the` \
-    `# guest via q35's i8042 until the xHCI/HID driver lands.` \
-    -device qemu-xhci \
-    -debugcon stdio \
-    -no-reboot \
-    "${DISPLAY_ARGS[@]}" \
-    "${EXTRA[@]}"
+exec "$SCRIPT_DIR/run.sh" qemu --firmware uefi "${ARGS[@]}"
