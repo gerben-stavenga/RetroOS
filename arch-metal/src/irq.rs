@@ -110,62 +110,291 @@ fn unmask_irq(irq: u8) {
     outb(port, mask & !(1 << bit));
 }
 
-/// Initialize interrupts (PIC, PIT, unmask timer + keyboard + mouse)
-pub fn init_interrupts() {
-    // This kernel is PIC-only, so make sure the 8259's INTR reaches the CPU.
-    // In x2APIC mode keep the firmware-selected mode and use its MSR interface
-    // to establish virtual-wire routing. Tearing x2APIC down here is fragile
-    // on real firmware and unnecessary. The xAPIC path still disables the
-    // LAPIC because its MMIO page is not mapped this early.
-    const IA32_APIC_BASE: u32 = 0x1B;
-    const APIC_ENABLE: u64 = 1 << 11;
-    const X2APIC_ENABLE: u64 = 1 << 10;
+// ============================================================================
+// LAPIC timer — PIT-independent system tick for modern (PIT-less) hardware
+// ============================================================================
+//
+// Modern UEFI laptops frequently have no usable legacy 8254 PIT, so IRQ0 never
+// fires and the event loop's first hlt-on-tick freezes the boot (reproduced as
+// the "hangs at Starting DN" symptom on an AMD Razer laptop; locally with QEMU
+// `-M q35,pit=off`). The local APIC timer is always present; we run it as the
+// system tick, feeding the same TIMER_TICKS/PENDING_TICKS counters the PIC IRQ0
+// path fed. The HPET (fixed, self-describing frequency at the de-facto-standard
+// base 0xFED00000) is the calibration reference — with no PIT there is no other
+// fixed clock to derive the rate from.
+
+// xAPIC MMIO register offsets (the x2APIC MSR is 0x800 + offset/16).
+const LAPIC_SVR: u32 = 0xF0;
+const LAPIC_EOI: u32 = 0xB0;
+const LAPIC_LVT_TIMER: u32 = 0x320;
+const LAPIC_LVT_LINT0: u32 = 0x350;
+const LAPIC_DIV_CONF: u32 = 0x3E0;
+const LAPIC_INIT_COUNT: u32 = 0x380;
+const LAPIC_CUR_COUNT: u32 = 0x390;
+
+const LAPIC_SW_ENABLE: u32 = 1 << 8;       // SVR bit 8: software-enable the LAPIC
+const LVT_TIMER_PERIODIC: u32 = 1 << 17;   // LVT timer: periodic mode
+const LVT_MASKED: u32 = 1 << 16;
+const LVT_DELIVERY_EXTINT: u32 = 7 << 8;   // LVT delivery mode = ExtINT
+const LAPIC_DIV_1: u32 = 0b1011;           // divide-config: bus clock / 1
+// Tick vector reuses the IRQ0 slot (32) so the existing `32..=47 => handle_irq`
+// dispatch and Irq::Tick semantics apply unchanged.
+const LAPIC_TIMER_VECTOR: u32 = IRQ_OFFSET as u32;
+// Spurious-interrupt vector: low nibble must be 0xF on P6/early CPUs, and 0x2F
+// lands in the PIC range where handle_irq's spurious-IRQ15 check returns
+// cleanly without us touching the kernel's vector dispatch.
+const LAPIC_SPURIOUS_VECTOR: u32 = 0x2F;
+
+const IA32_APIC_BASE: u32 = 0x1B;
+const APIC_BASE_ENABLE: u64 = 1 << 11;     // global enable
+const APIC_BASE_X2: u64 = 1 << 10;         // x2APIC mode
+
+// MMIO windows: one page each, just above the framebuffer window (mapped the
+// same way fbcon maps the framebuffer — cache-disabled, persistent).
+const LAPIC_MMIO_VA: usize = 0xFFF0_0000;
+const LAPIC_PHYS: u64 = 0xFEE0_0000;
+const HPET_MMIO_VA: usize = 0xFFF0_1000;
+const HPET_PHYS: u64 = 0xFED0_0000;
+
+// false => x2APIC (MSR access); true after we map MMIO for the xAPIC path.
+static mut LAPIC_X2: bool = false;
+/// Set once the LAPIC timer is the live tick source (so handle_irq routes the
+/// vector-0x20 EOI to the LAPIC instead of running the PIC ack dance).
+static mut LAPIC_TIMER_ACTIVE: bool = false;
+
+pub fn lapic_timer_active() -> bool {
+    unsafe { core::ptr::read_volatile(&raw const LAPIC_TIMER_ACTIVE) }
+}
+
+fn lapic_write(off: u32, val: u32) {
+    unsafe {
+        if LAPIC_X2 {
+            crate::x86::wrmsr(0x800 + (off >> 4), val as u64);
+        } else {
+            core::ptr::write_volatile((LAPIC_MMIO_VA + off as usize) as *mut u32, val);
+        }
+    }
+}
+fn lapic_read(off: u32) -> u32 {
+    unsafe {
+        if LAPIC_X2 {
+            crate::x86::rdmsr(0x800 + (off >> 4)) as u32
+        } else {
+            core::ptr::read_volatile((LAPIC_MMIO_VA + off as usize) as *const u32)
+        }
+    }
+}
+
+fn map_mmio_page(va: usize, phys: u64) {
+    crate::paging2::map_user_page_phys(
+        va / crate::paging2::PAGE_SIZE,
+        phys / crate::paging2::PAGE_SIZE as u64,
+        crate::paging2::flags::CACHE_DISABLE,
+    );
+}
+
+/// Measure the LAPIC timer input frequency against the HPET (a fixed,
+/// self-describing clock) and return the periodic initial-count for ~1000 Hz.
+/// Returns None when no usable HPET is present (then there is no fixed
+/// reference and the caller falls back to the PIT).
+fn calibrate_lapic_via_hpet() -> Option<u32> {
+    map_mmio_page(HPET_MMIO_VA, HPET_PHYS);
+    let hpet_read = |off: usize| -> u64 {
+        unsafe { core::ptr::read_volatile((HPET_MMIO_VA + off) as *const u64) }
+    };
+    // GEN_CAP_ID[63:32] = main-counter period in femtoseconds. A valid HPET
+    // period is non-zero and at most 100 ns (10 MHz minimum per the spec).
+    let period_fs = (hpet_read(0x00) >> 32) as u32;
+    if period_fs == 0 || period_fs > 100_000_000 {
+        return None;
+    }
+    let hpet_hz = 1_000_000_000_000_000u64 / period_fs as u64;
+    // Enable the HPET main counter (GEN_CONF bit 0).
+    let conf = hpet_read(0x10);
+    unsafe { core::ptr::write_volatile((HPET_MMIO_VA + 0x10) as *mut u64, conf | 1); }
+
+    // One-shot, divide-by-1, masked, max count — just a free-running down-counter.
+    lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
+    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
+    lapic_write(LAPIC_INIT_COUNT, 0xFFFF_FFFF);
+
+    // Count LAPIC ticks over a 10 ms HPET window.
+    let window = hpet_hz / 100;
+    let t0 = hpet_read(0xF0);
+    let c0 = lapic_read(LAPIC_CUR_COUNT);
+    while hpet_read(0xF0).wrapping_sub(t0) < window {}
+    let c1 = lapic_read(LAPIC_CUR_COUNT);
+    lapic_write(LAPIC_INIT_COUNT, 0); // stop
+
+    let elapsed = c0.wrapping_sub(c1); // counts down
+    if elapsed == 0 {
+        return None;
+    }
+    let lapic_hz = elapsed as u64 * 100;
+    Some(((lapic_hz / 1000).max(1)) as u32)
+}
+
+/// Bring up the LAPIC timer as the system tick. Returns true on success; false
+/// (no APIC, LAPIC globally disabled, or no HPET to calibrate against) leaves
+/// the caller on the legacy PIT path.
+fn setup_lapic_timer() -> bool {
+    // APIC-base MSR is architectural only from P6; a P5-class part #GPs on the
+    // RDMSR (86Box pentium_p54c). Pre-P6 is a pure-PIC machine anyway.
+    let (sig, _, _, _) = crate::x86::cpuid(1);
+    if (sig >> 8) & 0xF < 6 {
+        return false;
+    }
+    let base = crate::x86::rdmsr(IA32_APIC_BASE);
+    if base & APIC_BASE_ENABLE == 0 {
+        return false; // LAPIC globally disabled by firmware — stay on PIT.
+    }
+    // Keep the firmware-selected mode: x2APIC => MSRs, xAPIC => map the MMIO
+    // page. We deliberately do NOT promote xAPIC->x2APIC (it would perturb the
+    // legacy-input heuristic and is unnecessary).
+    unsafe {
+        LAPIC_X2 = base & APIC_BASE_X2 != 0;
+        if !LAPIC_X2 {
+            map_mmio_page(LAPIC_MMIO_VA, LAPIC_PHYS);
+        }
+    }
+
+    // Software-enable the LAPIC (required for the timer to count and for LVT
+    // entries to unmask), then route LINT0 = ExtINT so 8259-delivered IRQs
+    // (keyboard/mouse) still reach the CPU now that the LAPIC owns the local
+    // interrupt pins.
+    lapic_write(LAPIC_SVR, LAPIC_SW_ENABLE | LAPIC_SPURIOUS_VECTOR);
+    lapic_write(LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
+
+    let init_count = match calibrate_lapic_via_hpet() {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Start the periodic timer on vector 0x20.
+    lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_TIMER_PERIODIC);
+    lapic_write(LAPIC_INIT_COUNT, init_count);
+    unsafe { core::ptr::write_volatile(&raw mut LAPIC_TIMER_ACTIVE, true); }
+    lib::println!("IRQ: LAPIC timer tick (init_count={})", init_count);
+    true
+}
+
+/// Legacy fallback: ensure the 8259 INTR reaches the CPU (the old APIC-routing
+/// logic) and drive the tick from the PIT. Used when the LAPIC timer can't be
+/// brought up (no APIC / no HPET reference).
+fn legacy_intr_and_pit() {
     const X2APIC_SVR: u32 = 0x80F;
     const X2APIC_LVT_LINT0: u32 = 0x835;
     const APIC_SOFTWARE_ENABLE: u64 = 1 << 8;
     const APIC_DELIVERY_EXTINT: u64 = 7 << 8;
 
-    lib::println!("IRQ: APIC routing");
-    // IA32_APIC_BASE (MSR 0x1B) is architectural only from P6: a P5-class
-    // part #GPs on the RDMSR even when CPUID advertises an on-chip APIC
-    // (its APIC base is fixed, no MSR) — 86Box's pentium_p54c machine died
-    // exactly here. Gate all APIC-base work on family >= 6 + the CPUID
-    // APIC feature bit; anything older is a pure-PIC machine and INTR
-    // already reaches the CPU.
     let (sig, _, _, edx) = crate::x86::cpuid(1);
     let family = (sig >> 8) & 0xF;
-    let has_apic_base_msr = family >= 6 && edx & (1 << 9) != 0;
-    let mut modern_x2apic = false;
-    if has_apic_base_msr {
-        let apic_base = crate::x86::rdmsr(IA32_APIC_BASE);
-        modern_x2apic =
-            apic_base & (APIC_ENABLE | X2APIC_ENABLE) == (APIC_ENABLE | X2APIC_ENABLE);
-        if modern_x2apic {
-            // x2APIC registers are MSR 0x800 + (xAPIC MMIO offset >> 4).
-            // Enable the local APIC in SVR before unmasking LINT0; with software
-            // enable clear, hardware forces all LVT entries masked.
+    if family >= 6 && edx & (1 << 9) != 0 {
+        let base = crate::x86::rdmsr(IA32_APIC_BASE);
+        if base & (APIC_BASE_ENABLE | APIC_BASE_X2) == (APIC_BASE_ENABLE | APIC_BASE_X2) {
             let svr = crate::x86::rdmsr(X2APIC_SVR);
             unsafe {
                 crate::x86::wrmsr(X2APIC_SVR, (svr & 0x3FF) | APIC_SOFTWARE_ENABLE);
                 crate::x86::wrmsr(X2APIC_LVT_LINT0, APIC_DELIVERY_EXTINT);
             }
-        } else if apic_base & APIC_ENABLE != 0 {
-            unsafe { crate::x86::wrmsr(IA32_APIC_BASE, apic_base & !APIC_ENABLE) };
+        } else if base & APIC_BASE_ENABLE != 0 {
+            // Disable a firmware-enabled xAPIC so LINT0 reverts to the legacy
+            // INTR wire (its MMIO page isn't mapped on this path).
+            unsafe { crate::x86::wrmsr(IA32_APIC_BASE, base & !APIC_BASE_ENABLE) };
         }
     }
-
-    lib::println!("IRQ: PIC");
-    remap_pic();
     lib::println!("IRQ: PIT");
     init_pit(1000); // 1000 Hz timer
     unmask_irq(0);  // timer
+}
 
-    // x2APIC firmware identifies the modern UEFI machines targeted here.
-    // Their keyboard/touchpad are USB or I2C devices, and direct accesses to
-    // legacy 8042 ports may enter firmware/SMM emulation or reset the machine.
-    // Leave all legacy input IRQs masked until proper xHCI/I2C drivers exist.
-    if modern_x2apic {
-        lib::println!("IRQ: legacy input skipped");
+// ============================================================================
+// I/O APIC — external IRQ routing in APIC mode (modern UEFI machines)
+// ============================================================================
+//
+// In LAPIC mode the 8259 is bypassed: external device IRQs (keyboard GSI1,
+// mouse GSI12) are delivered through the I/O APIC to the BSP local APIC at a
+// fixed vector and acked with a LAPIC EOI. Legacy machines never touch this —
+// the PIC path stands. The I/O APIC sits at the architectural default
+// 0xFEC00000 (ACPI MADT could relocate it, but QEMU q35 and PC-class firmware
+// use the default; revisit if a board moves it).
+const IOAPIC_PHYS: u64 = 0xFEC0_0000;
+const IOAPIC_MMIO_VA: usize = 0xFFF0_2000; // next page after LAPIC (F0000)/HPET (F1000)
+static mut IOAPIC_READY: bool = false;
+
+/// Indirect register access: select the register via IOREGSEL (+0x00), then
+/// read/write its value through IOWIN (+0x10).
+fn ioapic_write(reg: u32, val: u32) {
+    unsafe {
+        core::ptr::write_volatile(IOAPIC_MMIO_VA as *mut u32, reg);
+        core::ptr::write_volatile((IOAPIC_MMIO_VA + 0x10) as *mut u32, val);
+    }
+}
+
+/// The BSP local-APIC ID — the I/O APIC redirection destination (physical mode,
+/// uniprocessor). x2APIC holds the full ID in MSR 0x802; xAPIC in bits 24-31 of
+/// the memory-mapped ID register (0x20).
+fn bsp_apic_id() -> u32 {
+    unsafe {
+        if LAPIC_X2 {
+            crate::x86::rdmsr(0x802) as u32
+        } else {
+            lapic_read(0x20) >> 24
+        }
+    }
+}
+
+/// Route ISA IRQ line `gsi` to `vector` on the BSP: fixed delivery, physical
+/// destination, edge-triggered, active-high, unmasked. ISA IRQs map 1:1 to GSIs
+/// for the keyboard (1) and mouse (12); the timer (often overridden to GSI2) is
+/// not routed here — the LAPIC timer owns the tick.
+fn ioapic_route(gsi: u8, vector: u8) {
+    unsafe {
+        if !IOAPIC_READY {
+            map_mmio_page(IOAPIC_MMIO_VA, IOAPIC_PHYS);
+            IOAPIC_READY = true;
+        }
+    }
+    let idx = 0x10 + 2 * gsi as u32;
+    // High dword: destination APIC ID in bits 56-63 (bits 24-31 of this word).
+    ioapic_write(idx + 1, bsp_apic_id() << 24);
+    // Low dword: vector in bits 0-7; all other fields 0 (fixed / physical /
+    // edge / active-high) and bit 16 (mask) clear = unmasked.
+    ioapic_write(idx, vector as u32);
+}
+
+/// Probe whether an 8042 keyboard controller is present. A board with no i8042
+/// (USB-only modern laptop, legacy-free firmware) floats the status port high —
+/// 0xFF. Read-only: we issue no command, since writing to a phantom 8042 traps
+/// to SMM on some firmware. This replaces guessing "no keyboard" from x2APIC.
+fn i8042_present() -> bool {
+    inb(0x64) != 0xFF
+}
+
+/// Initialize interrupts (PIC + tick source + keyboard/mouse)
+pub fn init_interrupts() {
+    lib::println!("IRQ: PIC");
+    remap_pic();
+
+    // Pick the interrupt mode ONCE: LAPIC timer succeeds ⇒ APIC mode (IOAPIC
+    // routes device IRQs, LAPIC EOI); else the legacy 8259 path (PIT tick, PIC
+    // delivery). The keyboard and mouse below follow that same decision — the
+    // half-state (LAPIC timer but PIC keyboard) is what left modern boxes with
+    // a dead keyboard: the tick survived on the LAPIC while IRQ1 rode the PIC
+    // whose INTR the firmware had cut.
+    let apic = setup_lapic_timer();
+    if !apic {
+        legacy_intr_and_pit();
+    }
+
+    // Keyboard/mouse SOURCE is a separate axis from delivery: PROBE the i8042
+    // rather than guessing "no keyboard" from x2APIC. A real controller (many
+    // laptops expose the internal keyboard as PS/2 via the EC) is used either
+    // way — routed through the IOAPIC in APIC mode, the PIC otherwise. A truly
+    // legacy-free box (no i8042) needs the xHCI USB-HID driver (not yet here).
+    if !i8042_present() {
+        lib::println!("IRQ: no i8042 (USB-HID keyboard not yet supported)");
         return;
     }
 
@@ -177,8 +406,6 @@ pub fn init_interrupts() {
     // clock disable), silently killing the keyboard for the rest of the
     // boot. Also, the 8042 only edges IRQ1 when OBF transitions 0→1, so a
     // stuck OBF locks out subsequent keypresses regardless.
-    // Bounded for the same no-i8042 reason as ps2_wait_in: port 0x64 reading
-    // 0xFF keeps OBF set forever and this drain would hang the boot.
     lib::println!("IRQ: keyboard");
     for _ in 0..1_000 {
         if inb(0x64) & 1 == 0 {
@@ -186,16 +413,24 @@ pub fn init_interrupts() {
         }
         let _ = inb(0x60);
     }
-    unmask_irq(1);  // keyboard
+    if apic {
+        ioapic_route(1, IRQ_OFFSET + 1); // keyboard GSI1
+    } else {
+        unmask_irq(1);
+    }
+
     lib::println!("IRQ: mouse probe");
     if init_mouse() {
         lib::println!("IRQ: mouse ready");
-
-        // The emulated legacy machine that supplies a PS/2 mouse may also
-        // supply an ISA Sound Blaster on IRQ 5 or 7. Keep these masked on
-        // modern machines where the legacy-controller probe failed.
-        unmask_irq(5);
-        unmask_irq(7);
+        if apic {
+            ioapic_route(12, IRQ_OFFSET + 12); // mouse GSI12
+        } else {
+            unmask_irq(12);
+            // The emulated legacy machine that supplies a PS/2 mouse may also
+            // supply an ISA Sound Blaster on IRQ 5 or 7 (legacy delivery only).
+            unmask_irq(5);
+            unmask_irq(7);
+        }
     } else {
         lib::println!("IRQ: mouse unavailable");
     }
@@ -282,8 +517,99 @@ fn init_mouse() -> bool {
         return false;
     }
 
-    unmask_irq(12);
+    // IRQ12 line enable is left to the caller: IOAPIC route in APIC mode, or
+    // unmask_irq(12) on the PIC in legacy mode.
     true
+}
+
+/// Boot diagnostic: with IF still 0 (interrupts not yet enabled), interrogate
+/// the timer chain directly so a freeze-at-first-IRQ on real hardware becomes
+/// readable on the VGA console instead of a black hang. Isolates the break:
+///   1. Is the 8254 PIT counting?      (latch + sample channel 0 repeatedly)
+///   2. Does the 8259 master see IRQ0?  (read IRR bit 0 — IRQ0 is unmasked but
+///      IF=0, so the request latches and stays pending, never acked)
+/// If both pass but the kernel still freezes, the break is CPU delivery —
+/// LINT0 / virtual-wire routing through the (x2)APIC, the known UEFI failure.
+pub fn timer_selftest() {
+    // --- 1. PIT channel 0 counting? Sample the latched counter several times.
+    let mut samples = [0u16; 8];
+    for s in samples.iter_mut() {
+        outb(0x43, 0x00); // latch channel 0
+        let lo = inb(0x40) as u16;
+        let hi = inb(0x40) as u16;
+        *s = lo | (hi << 8);
+        // crude I/O delay so successive samples land in different counts
+        for _ in 0..2000 { let _ = inb(0x80); }
+    }
+    let counting = samples.iter().any(|&v| v != samples[0]);
+    lib::println!(
+        "SELFTEST PIT counting={} samples={:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
+        counting as u8,
+        samples[0], samples[1], samples[2], samples[3],
+        samples[4], samples[5], samples[6], samples[7],
+    );
+
+    // --- 2. 8259 master IRR — does the PIT pulse reach the PIC? IRQ0 was
+    // unmasked in init_interrupts; with IF=0 the request latches in IRR.
+    // OCW3 0x0A selects IRR for the next read; restore ISR mode (0x0B) after,
+    // since handle_irq's spurious check relies on the default ISR read.
+    let mut irr_seen = 0u8;
+    for _ in 0..8 {
+        outb(MASTER_CMD, 0x0A);
+        irr_seen |= inb(MASTER_CMD);
+        for _ in 0..2000 { let _ = inb(0x80); }
+    }
+    outb(MASTER_CMD, 0x0B);
+    let mask = inb(MASTER_DATA);
+    lib::println!(
+        "SELFTEST PIC master IRR(seen)={:08b} IMR={:08b} IRQ0_pending={} IRQ0_masked={}",
+        irr_seen, mask, irr_seen & 1, mask & 1,
+    );
+
+    // --- 3. APIC routing recap (which delivery path init_interrupts took).
+    let (sig, _, ecx1, edx1) = crate::x86::cpuid(1);
+    let family = (sig >> 8) & 0xF;
+    let has_apic = family >= 6 && edx1 & (1 << 9) != 0;
+    if has_apic {
+        let base = crate::x86::rdmsr(0x1B);
+        let mode = if base & (1 << 11) == 0 { "disabled" }
+            else if base & (1 << 10) != 0 { "x2apic" }
+            else { "xapic" };
+        lib::println!(
+            "SELFTEST APIC base={:#x} mode={} (LINT0 ExtINT route is what carries IRQ0)",
+            base, mode,
+        );
+    } else {
+        lib::println!("SELFTEST APIC none (pure-PIC machine, INTR direct)");
+    }
+
+    // --- 4. CPU timer capabilities — picks the LAPIC-timer calibration path
+    // (no PIT means TSC/CPUID is the only fixed reference we have).
+    let (maxleaf, vb, vc, vd) = crate::x86::cpuid(0);
+    let vendor = [
+        vb as u8, (vb >> 8) as u8, (vb >> 16) as u8, (vb >> 24) as u8,
+        vd as u8, (vd >> 8) as u8, (vd >> 16) as u8, (vd >> 24) as u8,
+        vc as u8, (vc >> 8) as u8, (vc >> 16) as u8, (vc >> 24) as u8,
+    ];
+    lib::println!(
+        "SELFTEST CPU vendor={} family={} tsc_deadline={} x2apic_cap={} invtsc={}",
+        core::str::from_utf8(&vendor).unwrap_or("????????????"),
+        family,
+        (ecx1 >> 24) & 1, (ecx1 >> 21) & 1,
+        if crate::x86::cpuid(0x8000_0007).3 & (1 << 8) != 0 { 1 } else { 0 },
+    );
+    if maxleaf >= 0x15 {
+        let (den, num, crystal, _) = crate::x86::cpuid(0x15);
+        lib::println!("SELFTEST CPUID.15H den={} num={} crystal_hz={}", den, num, crystal);
+    } else {
+        lib::println!("SELFTEST CPUID.15H unavailable (maxleaf={:#x})", maxleaf);
+    }
+    if maxleaf >= 0x16 {
+        let (base_mhz, max_mhz, bus_mhz, _) = crate::x86::cpuid(0x16);
+        lib::println!("SELFTEST CPUID.16H base={}MHz max={}MHz bus={}MHz", base_mhz, max_mhz, bus_mhz);
+    } else {
+        lib::println!("SELFTEST CPUID.16H unavailable");
+    }
 }
 
 // ============================================================================
@@ -293,6 +619,31 @@ fn init_mouse() -> bool {
 /// Handle an IRQ: PIC ACK, read hardware data, push typed event to queue.
 pub fn handle_irq(regs: &mut Regs) {
     let irq = (regs.int_num - IRQ_OFFSET as u64) as u8;
+
+    // APIC mode: the tick is the LAPIC timer (vector 0x20 from the local APIC)
+    // and keyboard/mouse arrive through the I/O APIC — the 8259 is bypassed
+    // entirely. Read the device inline and ack with a single LAPIC EOI; none of
+    // the PIC mask/ack dance below applies. (`lapic_timer_active()` is the
+    // APIC-mode flag: it is set iff setup_lapic_timer succeeded.)
+    if lapic_timer_active() {
+        match irq {
+            0 => unsafe {
+                let t = core::ptr::read_volatile(&raw const TIMER_TICKS);
+                core::ptr::write_volatile(&raw mut TIMER_TICKS, t + 1);
+                let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
+                core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
+            },
+            1 => unsafe { (*(&raw mut QUEUE)).push(Irq::Key(inb(0x60))); },
+            12 => {
+                if let Some(e) = mouse_packet_byte(inb(0x60)) {
+                    unsafe { (*(&raw mut QUEUE)).push(e); }
+                }
+            }
+            _ => unsafe { (*(&raw mut QUEUE)).push(Irq::Hw(irq)); },
+        }
+        lapic_write(LAPIC_EOI, 0);
+        return;
+    }
 
     let (pic_port, irq_bit) = if irq < 8 {
         (MASTER_CMD, 1u8 << irq)

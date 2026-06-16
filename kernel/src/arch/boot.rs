@@ -200,6 +200,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // handing it to the kernel — the kernel no longer pokes firmware ports.
     let config = read_boot_config();
 
+    // Diagnostic: with IF still 0, dump the timer chain to the VGA console so a
+    // freeze-at-first-IRQ on real hardware is readable instead of a black hang.
+    irq::timer_selftest();
+
     descriptors::enter_ring1();
 
     lib::println!("Ring1 entered, paging + interrupts + syscall setup complete");
