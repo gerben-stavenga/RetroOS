@@ -166,7 +166,12 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     irq::init_interrupts();
     lib::println!("Interrupts initialized");
 
-    if paging2::cpu_supports_long_mode() {
+    // The compat-mode switch was a test harness to force the experimental
+    // x64/long-mode path — the kernel normally runs PAE 32-bit. On a real CPU
+    // (KVM/metal) it switches to long mode and the first IRQ through the 64-bit
+    // IDT triple-faults (TCG was hiding it); flip this on only to exercise x64.
+    const ENTER_COMPAT_MODE: bool = false;
+    if ENTER_COMPAT_MODE && paging2::cpu_supports_long_mode() {
         paging2::sync_hw_pdpt();
         x86::flush_tlb();
         let saved = paging2::ensure_trampoline_mapped();
