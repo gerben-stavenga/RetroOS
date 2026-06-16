@@ -599,6 +599,24 @@ pub fn handle_event(
 
 
 /// Load a DOS binary (.COM or .EXE) and initialize the thread for VM86 mode.
+/// Back the legacy VGA memory window (0xA0000-0xBFFFF) with fresh RAM when the
+/// display is the GOP framebuffer rather than a real VGA card.
+///
+/// `map_low_mem` identity-maps that window to the physical legacy aperture,
+/// which a real card backs (and DOS writes there drive the screen). But on a
+/// UEFI machine with no legacy-VGA-backed RAM, the GPU decodes the window yet
+/// stores nothing — reads return 0xFF — so the emulated VGA's text buffer
+/// (0xB8000) and mode-13h/graphics buffer (0xA0000) never retain what the guest
+/// writes, and `display_tick` renders 0xFF (a white screen). Fresh RAM makes the
+/// emulated VGA's memory actually hold data; the kernel renders it to the GOP
+/// framebuffer itself. The planar trap re-maps 0xA0000 as it arms/disarms.
+fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
+    if !machine::vga_present() {
+        // 0xA0000..0xC0000 = 32 pages: graphics (A0000) + text (B0000-BFFFF).
+        machine.map_fresh_range(0xA0000 >> 12, 0x20000 >> 12);
+    }
+}
+
 /// Handles full address space setup: clean + low mem + IVT + binary load + thread init.
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
@@ -609,6 +627,7 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is
     let current = thread::get_thread(tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
+    back_vga_window_if_emulated(machine);
     dos::setup_ivt(&mut current.kernel.vcpu);
 
     // args[0] is VFS-form (from exec fan-out); convert to drive-qualified
@@ -692,6 +711,7 @@ pub fn run_init_program(machine: &mut crate::TheArch, buf: Vec<u8>, args: Vec<Ve
     let tid = t.kernel.tid as usize;
 
     machine.map_low_mem();
+    back_vga_window_if_emulated(machine);
     dos::setup_ivt(&mut t.kernel.vcpu);
 
     let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
