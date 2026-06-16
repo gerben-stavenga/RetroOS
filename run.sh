@@ -19,6 +19,8 @@
 #   qemu extras:   -r BIN            headless fw_cfg cmdline
 #                  -h HOSTFS_DIR     host directory served over hostfs.py
 #                  --headless        (uefi firmware) -display none
+#                  --kvm             run on the host CPU (-accel kvm -cpu host):
+#                                    near-metal semantics, no reboot
 #   hosted extras: -c DOS_CMD / --cmd, -H hostdir / --host, -w WAV / --wav,
 #                  -T (terminal/headless), -s SHOT / --screenshot, -t (trace)
 #
@@ -47,7 +49,7 @@ set -e
 set -o pipefail
 
 usage() {
-    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -67,6 +69,7 @@ START_BIN=""
 HOSTFS_DIR="$HOME"
 HOSTFS_DIR_SET=0
 QEMU_HEADLESS=0
+KVM=0             # --kvm: run on the host CPU via -accel kvm -cpu host (qemu only)
 
 # hosted-specific
 HOSTED_CMD=""
@@ -96,6 +99,7 @@ while [ $# -gt 0 ]; do
         # qemu passthrough flags
         -r)           START_BIN="$2"; shift 2 ;;
         --headless)   QEMU_HEADLESS=1; shift ;;
+        --kvm)        KVM=1; shift ;;
 
         # hosted flags (long + short forms)
         -c|--cmd)        HOSTED_CMD="$2"; shift 2 ;;
@@ -171,6 +175,12 @@ if [ "$BACKEND" = "qemu" ] || [ "$BACKEND" = "bochs" ]; then
         386|686|x64) ;;
         *) echo "run.sh: unknown arch '$ARCH' (386|686|x64)" >&2; exit 1 ;;
     esac
+fi
+
+# --kvm is a QEMU accelerator (run on the host CPU via VT-x/AMD-V).
+if [ "$KVM" = 1 ] && [ "$BACKEND" != "qemu" ]; then
+    echo "run.sh: --kvm only applies to the qemu backend (got '$BACKEND')." >&2
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -406,6 +416,13 @@ launch_qemu() {
         686)  QEMU=qemu-system-i386;   CPU="" ;;
         x64)  QEMU=qemu-system-x86_64; CPU="" ;;
     esac
+
+    # --kvm: run on the real host CPU (VT-x/AMD-V) — near-metal semantics for
+    # reproducing bugs that TCG's lenient emulation hides. -cpu host wins over
+    # the per-arch model above.
+    if [ "$KVM" = 1 ]; then
+        CPU="-accel kvm -cpu host"
+    fi
 
     if [ "$FIRMWARE" = "uefi" ]; then
         launch_qemu_uefi
@@ -645,9 +662,12 @@ launch_qemu_uefi() {
     fi
 
     # -cpu max: the default qemu64 model lacks VME, forcing the kernel's software
-    # VM86 monitor; real hardware (and the BIOS path) has VME.
+    # VM86 monitor; real hardware (and the BIOS path) has VME. --kvm runs on the
+    # host CPU instead (VT-x/AMD-V) for near-metal semantics.
+    local ACCEL_CPU="-cpu max"
+    [ "$KVM" = 1 ] && ACCEL_CPU="-accel kvm -cpu host"
     exec qemu-system-x86_64 \
-        -M q35 -m 512 -cpu max \
+        -M q35 -m 512 $ACCEL_CPU \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -nodefaults \
