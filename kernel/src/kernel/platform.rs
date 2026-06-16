@@ -147,10 +147,21 @@ pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static
     // even exist yet this early, so there is nothing to probe.
     #[cfg(not(feature = "hosted"))]
     let p = {
-        let display = if vga_card_answers() {
-            Display::VgaCard
-        } else if crate::fbcon::active() {
+        // A GOP linear framebuffer (fbcon active) IS the scanout the firmware
+        // handed us, so it wins unconditionally — even when a legacy VGA card
+        // also answers its I/O ports. On a UEFI machine the GPU still latches
+        // the VGA sequencer/CRTC registers (so `vga_card_answers` is true), but
+        // that register file no longer drives the panel; the GOP framebuffer
+        // does. Probing VGA first mislabels the display as `VgaCard`, routes the
+        // DOS guest's VGA programming through to those dead legacy registers,
+        // and `display_tick` then skips the GOP present — DOS Navigator launched
+        // on a UEFI laptop showed a blank/white panel while the kernel console
+        // (rendered straight to GOP) was fine. Only when no framebuffer was
+        // handed over (legacy-BIOS boot) does the real VGA card own the screen.
+        let display = if crate::fbcon::active() {
             Display::Framebuffer
+        } else if vga_card_answers() {
+            Display::VgaCard
         } else {
             Display::Headless
         };

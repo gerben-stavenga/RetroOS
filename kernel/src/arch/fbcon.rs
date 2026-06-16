@@ -164,6 +164,10 @@ pub fn init(info: &arch::MultibootInfo) {
     // (the native little-endian representation of that value) or RGBX memory;
     // use Multiboot's channel metadata instead of assuming one firmware layout.
     let [rp, rs, gp, gs, bp, bs] = info.color_info;
+    lib::println!(
+        "fbcon: GOP {}x{} pitch={} bpp={} R{}/{} G{}/{} B{}/{} addr={:#x}",
+        width, height, pitch, info.framebuffer_bpp, rp, rs, gp, gs, bp, bs, addr
+    );
     let Some(format) = PixelFormat::from_multiboot(info) else {
         lib::println!(
             "fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — no display",
@@ -214,6 +218,7 @@ pub fn init(info: &arch::MultibootInfo) {
         );
     }
 
+    lib::println!("fbcon: format accepted, native_blit={}", format.is_native());
     let stride = pitch / 4;
     let origin = (height - TEXT_H) / 2 * stride + (width - TEXT_W) / 2;
     unsafe { PALETTE = vga_render::fallback_palette(); }
