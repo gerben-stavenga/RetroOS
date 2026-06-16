@@ -72,6 +72,8 @@ const RINTCNT: usize = 0x5A; // w16: response interrupt count
 const RIRBCTL: usize = 0x5C; // b8: bit1 RIRBDMAEN
 const RIRBSTS: usize = 0x5D; // b8: bit0 RINTFL (response interrupt), bit2 overrun
 const RIRBSIZE: usize = 0x5E; // b8: bits1:0 size (0b10 = 256 entries)
+const DPLBASE: usize = 0x70; // d32: DMA position buffer base; bit0 = enable
+const DPUBASE: usize = 0x74; // d32: DMA position buffer base high
 
 // Output stream descriptor register offsets (added to the descriptor base, which
 // is 0x80 + ISS*0x20 — the first output stream sits past the input streams).
@@ -91,6 +93,7 @@ const RIRB_ENTRIES: usize = 256; // 8 bytes each → 2 KB
 const CORB_OFF: usize = 0x0000;
 const RIRB_OFF: usize = 0x0400;
 const BDL_OFF: usize = 0x0C00; // 128-byte aligned; NUM_BUF*16 = 512 bytes
+const POS_OFF: usize = 0x0E00; // 128-byte aligned; DMA position buffer (8 strm*8)
 const BUF_OFF: usize = 0x1000; // PCM ring starts on the next page
 const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES + 0xFFF) / 0x1000;
 
@@ -104,8 +107,8 @@ const STREAM_TAG: u32 = 1;
 /// Fallback codec node IDs if enumeration fails (QEMU's usual layout).
 const FALLBACK_DAC: u32 = 2;
 const FALLBACK_PIN: u32 = 3;
-/// Boot-time bring-up diagnostics to debugcon (flip off once it's solid).
-const DEBUG: bool = true;
+/// Boot-time bring-up diagnostics to debugcon (flip on to debug the codec).
+const DEBUG: bool = false;
 
 static HDA: Mutex<Option<Hda>> = Mutex::new(None);
 
@@ -263,11 +266,14 @@ fn bring_up(arch: &mut crate::TheArch, dev: u8) -> bool {
             r8(CORBCTL), r8(RIRBCTL), r8(CORBSIZE), r8(RIRBSIZE),
             r16(CORBWP), r16(CORBRP), r16(RIRBWP)
         );
-        let vid = d.verb(0, (0xF00 << 8) | 0x00); // Get Parameter: Vendor/Device ID
-        crate::println!(
-            "hda: test-verb vid={:#x} corbwp={} corbrp={} rirbwp={} rirbsts={:#x}",
-            vid, r16(CORBWP), r16(CORBRP), r16(RIRBWP), r8(RIRBSTS)
-        );
+        // Probe consecutive verbs: does the ring keep processing past the first?
+        for p in [0x00u32, 0x02, 0x04, 0x09] {
+            let r = d.verb(0, (0xF00 << 8) | p);
+            crate::println!(
+                "hda: probe param={:#04x} -> {:#x} corbwp={} corbrp={} rirbwp={} rirbsts={:#x}",
+                p, r, r16(CORBWP), r16(CORBRP), r16(RIRBWP), r8(RIRBSTS)
+            );
+        }
     }
     d.enumerate();
     if d.dac == 0 {
@@ -278,6 +284,28 @@ fn bring_up(arch: &mut crate::TheArch, dev: u8) -> bool {
     }
 
     d.build_bdl();
+
+    // Reset the output stream into a known state before programming it: assert
+    // SDCTL.SRST, wait for it to read back, deassert, wait for it to clear. A
+    // stream that was never reset may refuse to advance when RUN is set.
+    w8(sd + SDCTL, 0x01);
+    for _ in 0..100_000 {
+        if r8(sd + SDCTL) & 0x01 != 0 {
+            break;
+        }
+    }
+    w8(sd + SDCTL, 0x00);
+    for _ in 0..100_000 {
+        if r8(sd + SDCTL) & 0x01 == 0 {
+            break;
+        }
+    }
+
+    // DMA position buffer (some QEMU builds advance this, not SDLPIB). Enable it
+    // so we have a second, authoritative play-position source.
+    w32(DPLBASE, (dma_phys + POS_OFF as u32) | 1);
+    w32(DPUBASE, 0);
+
     // Point the stream descriptor at the BDL and cap its cyclic length.
     let bdl_phys = d.dma_phys + BDL_OFF as u32;
     w32(sd + SDBDPL, bdl_phys);
@@ -348,7 +376,7 @@ impl Hda {
         w32(RIRBUBASE, 0);
         w8(RIRBSIZE, 0x02); // 256 entries
         w16(RIRBWP, 0x8000); // reset the write pointer
-        w16(RINTCNT, 1);
+        w16(RINTCNT, 0xFF); // high count; we also clear RIRBSTS per verb (see verb())
         self.rirb_rp = 0;
 
         w8(CORBCTL, 0x02); // CORBRUN
@@ -376,7 +404,14 @@ impl Hda {
         }
         self.rirb_rp = want;
         // RIRB entry = { response: u32, response_ex: u32 }.
-        unsafe { read_volatile((self.dma_va + RIRB_OFF + want * 8) as *const u32) }
+        let resp = unsafe { read_volatile((self.dma_va + RIRB_OFF + want * 8) as *const u32) };
+        // Clear RIRBSTS (RINTFL bit0 / OIS bit2, both RW1C). QEMU's CORB engine
+        // stops processing once it has written RINTCNT responses since the count
+        // was last reset; clearing RIRBSTS resets that counter, so the NEXT verb
+        // actually runs. Without this, only the first verb after setup executes
+        // (corbrp/rirbwp freeze at 1) and the whole codec is left unconfigured.
+        w8(RIRBSTS, 0x05);
+        resp
     }
 
     /// Walk the codec graph and record the first output DAC + output-capable pin
@@ -393,6 +428,9 @@ impl Hda {
                 afg = n; // Audio Function Group
                 break;
             }
+        }
+        if DEBUG {
+            crate::println!("hda: enum root={:#x} fg_start={} fg_count={} afg={}", root, fg_start, fg_count, afg);
         }
         if afg == 0 {
             return;
@@ -423,9 +461,10 @@ impl Hda {
     /// and bind the stream tag. Format is set later (per rate) by `set_format`.
     fn configure_path(&mut self) {
         let (pin, dac) = (self.pin, self.dac);
-        // Pin: power D0, enable output, unmute its output amp.
+        // Pin: power D0, enable output, select the DAC connection, unmute amp.
         self.verb(pin, (0x705 << 8) | 0x00); // Set Power State D0
         self.verb(pin, (0x707 << 8) | 0x40); // Set Pin Widget Control: OUT enable
+        self.verb(pin, (0x701 << 8) | 0x00); // Set Connection Select: first input
         self.verb(pin, (0x3 << 16) | 0xB07F); // Set Amp: out, L+R, unmute, max gain
         // DAC: power D0, bind the stream tag / channel 0, unmute at full gain.
         self.verb(dac, (0x705 << 8) | 0x00); // Set Power State D0
@@ -446,7 +485,12 @@ impl Hda {
             16000 => (0, 2),
             12000 => (0, 3),
             8000 => (0, 5),
-            _ => (1, 0),
+            // Odd SB rates (e.g. 22222 from DSP time constant 211) → nearest
+            // 44.1 kHz submultiple. divisor = round(44100/rate), field = div-1.
+            _ => {
+                let divisor = ((44100 + rate / 2) / rate).clamp(1, 8);
+                (1, (divisor - 1) as u16)
+            }
         };
         // bit14 base | bits10:8 div | bits6:4 bits(001=16) | bits3:0 chan-1(1=stereo)
         (base << 14) | (div << 8) | (0b001 << 4) | 0x0001
@@ -468,6 +512,13 @@ impl Hda {
     /// Current play position as a buffer index, from the hardware byte position.
     fn play_buf(&self) -> usize {
         (r32(self.sd + SDLPIB) as usize / BUF_BYTES) % NUM_BUF
+    }
+
+    /// Play position (bytes) from the DMA position buffer — QEMU's authoritative
+    /// source on builds that don't update the SDLPIB register.
+    fn dma_pos(&self) -> u32 {
+        let idx = (self.sd - SD_BASE) / SD_STRIDE;
+        unsafe { read_volatile((self.dma_va + POS_OFF + idx * 8) as *const u32) }
     }
 
     fn stop(&mut self) {
@@ -502,7 +553,16 @@ impl Hda {
             if self.cur_off == 0 && self.running {
                 let civ = self.play_buf();
                 let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
-                if ahead >= MAX_AHEAD {
+                // Only throttle when genuinely AHEAD of the codec. A wrapped
+                // value (>= half the ring) means the play position lapped us
+                // (underrun) — feed hard to catch up, never stall.
+                if ahead >= MAX_AHEAD && ahead < NUM_BUF / 2 {
+                    if DEBUG {
+                        crate::println!(
+                            "hda: stall cur_buf={} civ={} lpib={} pos={} sdsts={:#x}",
+                            self.cur_buf, civ, r32(self.sd + SDLPIB), self.dma_pos(), r8(self.sd + 0x03)
+                        );
+                    }
                     break;
                 }
             }
@@ -516,17 +576,25 @@ impl Hda {
             if self.cur_off >= BUF_BYTES {
                 self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
                 self.cur_off = 0;
-                // Start the stream once a small cushion is primed.
+                // Start the stream once a small cushion is primed. Write RUN +
+                // stream number as ONE dword so QEMU re-evaluates the codec<->
+                // stream binding with the stream number visible (a byte-0-only
+                // RUN write may not retrigger it → codec never drains the FIFO).
                 if !self.running && self.cur_buf >= PRIME_BUFS {
-                    let ctl = r8(self.sd + SDCTL);
-                    w8(self.sd + SDCTL, ctl | 0x02); // set RUN
+                    w32(self.sd + SDCTL, 0x02 | (STREAM_TAG << 20));
                     self.running = true;
                     if DEBUG {
                         crate::println!(
-                            "hda: stream RUN sdctl={:#x} lpib={} sdsts={:#x}",
-                            r8(self.sd + SDCTL), r32(self.sd + SDLPIB), r8(self.sd + 0x03)
+                            "hda: stream RUN sdctl={:#010x} sdsts={:#x} cbl={} lvi={} fmt={:#06x}",
+                            r32(self.sd + SDCTL), r8(self.sd + 0x03),
+                            r32(self.sd + SDCBL), r16(self.sd + SDLVI), r16(self.sd + SDFMT)
                         );
                     }
+                }
+                // Heartbeat once per ring lap (~0.7 s): does the HW play position
+                // actually advance? lpib stuck at 0 = DMA not progressing.
+                if DEBUG && self.running && self.cur_buf == 0 {
+                    crate::println!("hda: lpib={} sdsts={:#x}", r32(self.sd + SDLPIB), r8(self.sd + 0x03));
                 }
             }
         }
