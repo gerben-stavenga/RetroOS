@@ -172,8 +172,16 @@ pub fn arch_load_ldt(ldt: &[u64]) {
 /// Map a range of physical pages into user virtual space.
 pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
     unsafe {
+        // EBX holds only the low 32 bits of the physical page; pages above 4 GB
+        // (an NVMe BAR placed >4 GB by firmware on a wide-MAXPHYADDR CPU) need
+        // the high half in ESI (arg3, otherwise unused here). ESI is LLVM-
+        // reserved, so save/load/restore it around the trap.
         core::arch::asm!(
+            "push esi",
+            "mov esi, {hi:e}",
             "int 0x80",
+            "pop esi",
+            hi = in(reg) (ppage_start >> 32) as u32,
             in("eax") crate::arch_call::MAP_PHYS_RANGE as u32,
             in("edx") vpage_start as u32,
             in("ecx") num_pages as u32,

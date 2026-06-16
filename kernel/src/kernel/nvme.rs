@@ -175,7 +175,7 @@ pub fn init(arch: &mut crate::TheArch) -> bool {
     // IOCQES=4 (16B), IOSQES=6 (64B), MPS=0 (4K), CSS=0 (NVM), EN=1.
     w32(R_CC, (4 << 20) | (6 << 16) | 1);
     if !wait_csts(1) {
-        println!("NVMe: controller did not become ready");
+        println!("NVMe: controller did not become ready (csts={:#x})", r32(R_CSTS));
         return false;
     }
 
