@@ -46,6 +46,13 @@ pub fn drain(f: impl FnMut(Irq)) {
     unsafe { (*(&raw mut QUEUE)).drain(f); }
 }
 
+/// Push a keyboard scancode into the queue from a non-IRQ source — the xHCI
+/// USB-HID keyboard `poll()`. Same sink the i8042 IRQ1 handler feeds, so the
+/// kernel sees one uniform key-event stream regardless of the source.
+pub fn push_key(sc: u8) {
+    unsafe { (*(&raw mut QUEUE)).push(Irq::Key(sc)); }
+}
+
 /// Take pending tick count (returns count and resets to 0).
 pub fn take_pending_ticks() -> u32 {
     unsafe {
@@ -632,12 +639,16 @@ pub fn handle_irq(regs: &mut Regs) {
     // APIC-mode flag: it is set iff setup_lapic_timer succeeded.)
     if lapic_timer_active() {
         match irq {
-            0 => unsafe {
-                let t = core::ptr::read_volatile(&raw const TIMER_TICKS);
-                core::ptr::write_volatile(&raw mut TIMER_TICKS, t + 1);
-                let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
-                core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
-            },
+            0 => {
+                unsafe {
+                    let t = core::ptr::read_volatile(&raw const TIMER_TICKS);
+                    core::ptr::write_volatile(&raw mut TIMER_TICKS, t + 1);
+                    let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
+                    core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
+                }
+                // Poll the USB-HID keyboard (if any) into the same key queue.
+                crate::xhci::poll();
+            }
             1 => unsafe { (*(&raw mut QUEUE)).push(Irq::Key(inb(0x60))); },
             12 => {
                 if let Some(e) = mouse_packet_byte(inb(0x60)) {

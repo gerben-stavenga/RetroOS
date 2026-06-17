@@ -99,7 +99,9 @@ const INCTX_OFF: usize = 0x4000; // input context (Address Device / Configure EP
 const DEVCTX_OFF: usize = 0x5000; // device (output) context, in DCBAA[slot]
 const EP0_OFF: usize = 0x6000; // default control endpoint transfer ring
 const XFER_OFF: usize = 0x7000; // control-transfer data buffer (descriptors)
-const DMA_PAGES: usize = 8;
+const INT_OFF: usize = 0x8000; // interrupt-IN endpoint transfer ring
+const REPORT_OFF: usize = 0x9000; // HID boot report buffer (8 bytes)
+const DMA_PAGES: usize = 10;
 const RING_TRBS: usize = 256;
 
 // Operational/runtime register offsets, relative to their region base.
@@ -153,26 +155,34 @@ fn ring_cmd(param: u64, status: u32, control: u32) {
     }
 }
 
-/// Dequeue one event TRB (bounded wait). Returns (trb_type, completion_code,
-/// slot_id) and advances ERDP. None on timeout.
+/// Non-blocking: if an event TRB is ready, dequeue it (advancing ERDP) and
+/// return (trb_type, completion_code, slot_id); else None.
+fn try_event() -> Option<(u32, u32, u32)> {
+    unsafe {
+        let trb = (DMA_VA + EVT_OFF + EVT_DEQ * 16) as *const u32;
+        let ctrl = core::ptr::read_volatile(trb.add(3));
+        if ctrl & 1 != EVT_CYCLE {
+            return None;
+        }
+        let ttype = (ctrl >> 10) & 0x3F;
+        let cc = core::ptr::read_volatile(trb.add(2)) >> 24;
+        let slot = ctrl >> 24;
+        EVT_DEQ += 1;
+        if EVT_DEQ == RING_TRBS {
+            EVT_DEQ = 0;
+            EVT_CYCLE ^= 1;
+        }
+        // Advance ERDP (bits 4:63) and clear the Event-Handler-Busy bit.
+        w64(RT + IR0_ERDP, (DMA_PHYS + (EVT_OFF + EVT_DEQ * 16) as u64) | (1 << 3));
+        Some((ttype, cc, slot))
+    }
+}
+
+/// Dequeue one event TRB (bounded wait). None on timeout.
 fn poll_event() -> Option<(u32, u32, u32)> {
     for _ in 0..50_000_000u64 {
-        unsafe {
-            let trb = (DMA_VA + EVT_OFF + EVT_DEQ * 16) as *const u32;
-            let ctrl = core::ptr::read_volatile(trb.add(3));
-            if ctrl & 1 == EVT_CYCLE {
-                let ttype = (ctrl >> 10) & 0x3F;
-                let cc = core::ptr::read_volatile(trb.add(2)) >> 24;
-                let slot = ctrl >> 24;
-                EVT_DEQ += 1;
-                if EVT_DEQ == RING_TRBS {
-                    EVT_DEQ = 0;
-                    EVT_CYCLE ^= 1;
-                }
-                // Advance ERDP (bits 4:63) and clear the Event-Handler-Busy bit.
-                w64(RT + IR0_ERDP, (DMA_PHYS + (EVT_OFF + EVT_DEQ * 16) as u64) | (1 << 3));
-                return Some((ttype, cc, slot));
-            }
+        if let Some(e) = try_event() {
+            return Some(e);
         }
         core::hint::spin_loop();
     }
@@ -394,9 +404,149 @@ fn address_device(slot: u32, port: u32, speed: u32, stride: usize) -> bool {
     matches!(wait_event(33), Some((1, _)))
 }
 
-/// Probe for an xHCI controller, bring it up, find the keyboard's port, and put
-/// the device into the Addressed state. WIP: control transfers (descriptors,
-/// SET_PROTOCOL) and the HID report read come next.
+/// Initialise the interrupt-IN endpoint transfer ring (Link TRB at end).
+fn init_int_ring() {
+    unsafe {
+        core::ptr::write_bytes((DMA_VA + INT_OFF) as *mut u8, 0, 0x1000);
+        let link = (DMA_VA + INT_OFF + (RING_TRBS - 1) * 16) as *mut u32;
+        core::ptr::write_volatile(link as *mut u64, DMA_PHYS + INT_OFF as u64);
+        core::ptr::write_volatile(link.add(3), (6 << 10) | (1 << 1));
+    }
+}
+
+/// Configure Endpoint (TRB type 12): add the interrupt-IN endpoint (DCI =
+/// ep*2+1) to the device so the controller polls it into our transfer ring.
+fn configure_endpoint(
+    slot: u32,
+    port: u32,
+    speed: u32,
+    ep_num: u32,
+    mps: u32,
+    interval: u32,
+    stride: usize,
+) -> bool {
+    init_int_ring();
+    let dci = ep_num * 2 + 1; // IN
+    unsafe {
+        let inctx = DMA_VA + INCTX_OFF;
+        core::ptr::write_bytes(inctx as *mut u8, 0, 0x1000);
+        // Input Control Context: add Slot (bit 0) + this endpoint (bit dci).
+        core::ptr::write_volatile((inctx + 4) as *mut u32, 1 | (1 << dci));
+        // Slot Context: Context Entries = dci (highest), Speed, Root-Hub Port.
+        let slotc = inctx + stride;
+        core::ptr::write_volatile(slotc as *mut u32, (dci << 27) | (speed << 20));
+        core::ptr::write_volatile((slotc + 4) as *mut u32, port << 16);
+        // Endpoint Context at (1 + dci) * stride: Interval (16:23); EP Type =
+        // Interrupt IN (7) at 3:5, Max Packet Size (16:31), CErr = 3 (1:2); TR
+        // Dequeue Pointer with DCS = 1.
+        let epc = inctx + (1 + dci as usize) * stride;
+        core::ptr::write_volatile(epc as *mut u32, interval << 16);
+        core::ptr::write_volatile((epc + 4) as *mut u32, (mps << 16) | (7 << 3) | (3 << 1));
+        core::ptr::write_volatile((epc + 8) as *mut u64, (DMA_PHYS + INT_OFF as u64) | 1);
+    }
+    let inctx_phys = unsafe { DMA_PHYS } + INCTX_OFF as u64;
+    ring_cmd(inctx_phys, 0, (12 << 10) | (slot << 24));
+    matches!(wait_event(33), Some((1, _)))
+}
+
+// HID usage id → AT scancode set 1 (make code; break = make | 0x80). 0 = key
+// we don't translate (extended/navigation keys need an E0 prefix — later).
+#[rustfmt::skip]
+const HID_SC: [u8; 0x68] = [
+    0,0,0,0,                                              // 00-03
+    0x1E,0x30,0x2E,0x20,0x12,0x21,0x22,0x23,0x17,0x24,    // 04-0D a-j
+    0x25,0x26,0x32,0x31,0x18,0x19,0x10,0x13,0x1F,0x14,    // 0E-17 k-t
+    0x16,0x2F,0x11,0x2D,0x15,0x2C,                        // 18-1D u-z
+    0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,    // 1E-27 1-0
+    0x1C,0x01,0x0E,0x0F,0x39,0x0C,0x0D,0x1A,0x1B,0x2B,    // 28-31 Enter Esc BS Tab Sp - = [ ] \
+    0x2B,0x27,0x28,0x29,0x33,0x34,0x35,0x3A,              // 32-39 #  ; ' ` , . / Caps
+    0x3B,0x3C,0x3D,0x3E,0x3F,0x40,0x41,0x42,0x43,0x44,    // 3A-43 F1-F10
+    0x57,0x58,                                            // 44-45 F11 F12
+    0,0x46,0,0,0,0,0,0,0,0,                               // 46-4F PrtSc ScrLk Pause Ins Home PgUp Del End PgDn Right
+    0,0,0,0x45,0,0x37,0x4A,0x4E,0,0x4F,                   // 50-59 Left Down Up NumLk KP/ KP* KP- KP+ KPEnt KP1
+    0x50,0x51,0x4B,0x4C,0x4D,0x47,0x48,0x49,0x52,0x53,    // 5A-63 KP2-9 KP0 KP.
+    0,0,0,0,                                              // 64-67
+];
+
+// Modifier byte bits → scancode (LCtrl/LShift/LAlt/LGui, RCtrl/RShift/RAlt/RGui).
+// Right-side Ctrl/Alt collapse to the base code (E0 prefix omitted); GUI keys
+// dropped for now.
+const MOD_SC: [u8; 8] = [0x1D, 0x2A, 0x38, 0, 0x1D, 0x36, 0x38, 0];
+
+// Interrupt-IN endpoint state + last report (for make/break diffing).
+static mut INT_ENQ: usize = 0;
+static mut INT_CYCLE: u32 = 1;
+static mut READY: bool = false;
+static mut KBD_SLOT: u32 = 0;
+static mut KBD_DCI: u32 = 0;
+static mut PREV: [u8; 8] = [0; 8];
+
+/// Queue one Normal TRB on the interrupt-IN ring (8-byte report buffer, IOC) and
+/// ring the endpoint's doorbell so the controller polls the keyboard once.
+fn arm_report() {
+    unsafe {
+        let trb = (DMA_VA + INT_OFF + INT_ENQ * 16) as *mut u32;
+        core::ptr::write_volatile(trb as *mut u64, DMA_PHYS + REPORT_OFF as u64);
+        core::ptr::write_volatile(trb.add(2), 8);
+        core::ptr::write_volatile(trb.add(3), (1 << 5) | (1 << 10) | INT_CYCLE); // IOC, Normal
+        INT_ENQ += 1;
+        if INT_ENQ == RING_TRBS - 1 {
+            let link = (DMA_VA + INT_OFF + (RING_TRBS - 1) * 16) as *mut u32;
+            let c = core::ptr::read_volatile(link.add(3)) & !1;
+            core::ptr::write_volatile(link.add(3), c | INT_CYCLE);
+            INT_ENQ = 0;
+            INT_CYCLE ^= 1;
+        }
+        w32(DB + KBD_SLOT as usize * 4, KBD_DCI);
+    }
+}
+
+/// Diff an 8-byte HID boot report against the previous one and push make/break
+/// scancodes into the shared IRQ queue, just like the i8042 IRQ1 handler.
+fn process_report(r: &[u8; 8]) {
+    let prev = unsafe { PREV };
+    // Modifier keys (byte 0): one make/break per changed bit.
+    for b in 0..8 {
+        let (now, was) = (r[0] & (1 << b), prev[0] & (1 << b));
+        if now != was && MOD_SC[b] != 0 {
+            crate::irq::push_key(if now != 0 { MOD_SC[b] } else { MOD_SC[b] | 0x80 });
+        }
+    }
+    // Regular keys (bytes 2-7): newly present → make; newly absent → break.
+    for &k in &r[2..8] {
+        if k >= 4 && (k as usize) < HID_SC.len() && !prev[2..8].contains(&k) && HID_SC[k as usize] != 0 {
+            crate::irq::push_key(HID_SC[k as usize]);
+        }
+    }
+    for &k in &prev[2..8] {
+        if k >= 4 && (k as usize) < HID_SC.len() && !r[2..8].contains(&k) && HID_SC[k as usize] != 0 {
+            crate::irq::push_key(HID_SC[k as usize] | 0x80);
+        }
+    }
+    unsafe { PREV = *r };
+}
+
+/// Called from the timer IRQ: if the keyboard has reported, translate it to
+/// scancodes and re-arm. Cheap when idle (one event-ring cycle-bit check).
+pub fn poll() {
+    if !unsafe { READY } {
+        return;
+    }
+    while let Some((ttype, _, _)) = try_event() {
+        if ttype == 32 {
+            let mut r = [0u8; 8];
+            for (i, b) in r.iter_mut().enumerate() {
+                *b = unsafe { core::ptr::read_volatile((DMA_VA + REPORT_OFF + i) as *const u8) };
+            }
+            process_report(&r);
+            arm_report();
+        }
+    }
+}
+
+/// Probe for an xHCI controller, bring it up, enumerate the keyboard, configure
+/// it for boot protocol, and arm the first report. `poll()` (driven by the
+/// timer IRQ) then streams keystrokes into the IRQ queue.
 pub fn init() {
     let Some((bus, dev, func)) = find_xhci() else {
         lib::println!("xHCI: none found");
@@ -464,16 +614,60 @@ pub fn init() {
     }
     lib::println!("xHCI: device addressed (slot {} port {} speed {})", slot, port, speed);
 
-    // Control transfer proof: GET_DESCRIPTOR(device, 18 bytes) → VID/PID.
-    if control(slot, 0x80, 0x06, 0x0100, 0, 18) {
-        unsafe {
-            let d = DMA_VA + XFER_OFF;
-            let rd = |o: usize| core::ptr::read_volatile((d + o) as *const u8) as u16;
-            let vid = rd(8) | (rd(9) << 8);
-            let pid = rd(10) | (rd(11) << 8);
-            lib::println!("xHCI: device descriptor VID={:04x} PID={:04x} class={}", vid, pid, rd(4));
+    // Read the configuration descriptor and find the interrupt-IN endpoint +
+    // its HID interface (the boot keyboard has exactly one).
+    if !control(slot, 0x80, 0x06, 0x0200, 0, 64) {
+        lib::println!("xHCI: GET config descriptor failed");
+        return;
+    }
+    let rd = |o: usize| unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + o) as *const u8) as u32 };
+    let cfg_value = rd(5); // bConfigurationValue
+    let total = (rd(2) | (rd(3) << 8)) as usize;
+    let total = total.min(64);
+    let (mut iface, mut ep_num, mut ep_mps, mut ep_int) = (0u32, 0u32, 8u32, 8u32);
+    let mut i = rd(0) as usize; // skip the config descriptor header
+    while i + 2 <= total {
+        let (blen, btype) = (rd(i) as usize, rd(i + 1));
+        if blen == 0 {
+            break;
         }
+        if btype == 4 {
+            iface = rd(i + 2); // interface descriptor → bInterfaceNumber
+        } else if btype == 5 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
+            // endpoint descriptor: IN + interrupt
+            ep_num = rd(i + 2) & 0x0F;
+            ep_mps = rd(i + 4) | (rd(i + 5) << 8);
+            ep_int = rd(i + 6);
+            break;
+        }
+        i += blen;
+    }
+    if ep_num == 0 {
+        lib::println!("xHCI: no interrupt-IN endpoint found");
+        return;
+    }
+
+    // Set configuration, switch the HID interface to boot protocol, idle off.
+    control(slot, 0x00, 0x09, cfg_value, 0, 0); // SET_CONFIGURATION
+    control(slot, 0x21, 0x0B, 0, iface, 0); // SET_PROTOCOL = boot
+    control(slot, 0x21, 0x0A, 0, iface, 0); // SET_IDLE = 0 (report only on change)
+
+    // xHCI Interval encoding: high/super speed already gives the exponent
+    // (microframes = 2^(bInterval-1)); full/low speed we approximate.
+    let interval = if speed >= 3 {
+        ep_int.saturating_sub(1).clamp(3, 15)
     } else {
-        lib::println!("xHCI: GET_DESCRIPTOR failed");
+        6
+    };
+    if configure_endpoint(slot, port, speed, ep_num, ep_mps, interval, stride) {
+        unsafe {
+            KBD_SLOT = slot;
+            KBD_DCI = ep_num * 2 + 1;
+            READY = true;
+        }
+        arm_report(); // queue the first interrupt-IN report
+        lib::println!("xHCI: keyboard ready (ep {} mps {}) — polling for keys", ep_num, ep_mps);
+    } else {
+        lib::println!("xHCI: Configure Endpoint failed");
     }
 }
