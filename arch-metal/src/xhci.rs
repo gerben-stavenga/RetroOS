@@ -501,6 +501,41 @@ fn arm_report() {
     }
 }
 
+/// Translate a HID usage to its AT set-1 scancode and whether it's an extended
+/// (E0-prefixed) key. Arrows / navigation / keypad-Enter|slash are extended;
+/// everything else comes from `HID_SC`.
+fn hid_to_scancode(usage: u8) -> Option<(u8, bool)> {
+    let u = usage as usize;
+    if u < HID_SC.len() && HID_SC[u] != 0 {
+        return Some((HID_SC[u], false));
+    }
+    let ext = match usage {
+        0x49 => 0x52, // Insert
+        0x4A => 0x47, // Home
+        0x4B => 0x49, // PageUp
+        0x4C => 0x53, // Delete
+        0x4D => 0x4F, // End
+        0x4E => 0x51, // PageDown
+        0x4F => 0x4D, // Right
+        0x50 => 0x4B, // Left
+        0x51 => 0x50, // Down
+        0x52 => 0x48, // Up
+        0x54 => 0x35, // Keypad /
+        0x58 => 0x1C, // Keypad Enter
+        _ => return None,
+    };
+    Some((ext, true))
+}
+
+/// Push one key event: an extended key gets the 0xE0 prefix byte first, then
+/// the make (or `| 0x80` break) code — exactly what a PS/2 keyboard sends.
+fn emit_key(sc: u8, extended: bool, release: bool) {
+    if extended {
+        crate::irq::push_key(0xE0);
+    }
+    crate::irq::push_key(if release { sc | 0x80 } else { sc });
+}
+
 /// Diff an 8-byte HID boot report against the previous one and push make/break
 /// scancodes into the shared IRQ queue, just like the i8042 IRQ1 handler.
 fn process_report(r: &[u8; 8]) {
@@ -514,13 +549,17 @@ fn process_report(r: &[u8; 8]) {
     }
     // Regular keys (bytes 2-7): newly present → make; newly absent → break.
     for &k in &r[2..8] {
-        if k >= 4 && (k as usize) < HID_SC.len() && !prev[2..8].contains(&k) && HID_SC[k as usize] != 0 {
-            crate::irq::push_key(HID_SC[k as usize]);
+        if k >= 4 && !prev[2..8].contains(&k) {
+            if let Some((sc, ext)) = hid_to_scancode(k) {
+                emit_key(sc, ext, false);
+            }
         }
     }
     for &k in &prev[2..8] {
-        if k >= 4 && (k as usize) < HID_SC.len() && !r[2..8].contains(&k) && HID_SC[k as usize] != 0 {
-            crate::irq::push_key(HID_SC[k as usize] | 0x80);
+        if k >= 4 && !r[2..8].contains(&k) {
+            if let Some((sc, ext)) = hid_to_scancode(k) {
+                emit_key(sc, ext, true);
+            }
         }
     }
     unsafe { PREV = *r };
