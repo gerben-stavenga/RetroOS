@@ -295,10 +295,11 @@ fn bringup(op: usize, rt: usize, max_slots: u32) -> bool {
         return false;
     }
 
-    // One contiguous DMA block for all the structures.
-    let Some(page) = crate::phys_mm::alloc_phys_contig(DMA_PAGES, 0) else {
-        return false;
-    };
+    // One contiguous DMA block for all the structures — from the GENERAL pool,
+    // NOT the single ISA-DMA pool (which NVMe / the Sound Blaster need). Assert:
+    // if we found and reset the controller, we must be able to back it.
+    let page = crate::phys_mm::alloc_contig(DMA_PAGES)
+        .expect("xhci: out of contiguous DMA pages");
     let phys = page * 0x1000;
     map_dma(phys, DMA_PAGES);
     unsafe {

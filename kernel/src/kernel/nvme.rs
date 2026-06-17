@@ -131,7 +131,7 @@ fn set_prp1(c: &mut [u32; 16], phys: u64) {
 /// absent device: false, no side effects.
 pub fn init(arch: &mut crate::TheArch) -> bool {
     let Some((bus, dev)) = pci::find_class(arch, 0x01, 0x08) else {
-        return false;
+        return false; // no NVMe controller (legacy machine) — not an error
     };
 
     // Enable memory space + bus mastering.
@@ -152,10 +152,11 @@ pub fn init(arch: &mut crate::TheArch) -> bool {
 
     arch.map_phys_range(REGS_VA >> 12, REGS_PAGES, bar_phys >> 12, PTE_CACHE_DISABLE);
 
+    // The controller is present (find_class matched) — being unable to back it
+    // with DMA is a hard error, not a "no disk". Fail loud so a regression like
+    // another driver stealing the pool is obvious, not a silent "Diskless".
     let dma_page = arch.alloc_phys_contig(DMA_PAGES, 0);
-    if dma_page == 0 {
-        return false;
-    }
+    assert!(dma_page != 0, "nvme: controller found but no DMA pool available");
     arch.map_phys_range(DMA_VA >> 12, DMA_PAGES, dma_page, PTE_CACHE_DISABLE);
     let dma_phys = dma_page * 0x1000;
     unsafe { core::ptr::write_bytes(DMA_VA as *mut u8, 0, DMA_PAGES * 0x1000) };

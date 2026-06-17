@@ -279,6 +279,33 @@ pub fn free_phys_contig(start_page: u64, _num_pages: usize) {
     }
 }
 
+/// Allocate `num_pages` physically-contiguous pages from the GENERAL pool,
+/// marked RESERVED (a permanent driver-owned region — never freed). Returns the
+/// start page, or None if no contiguous run is free.
+///
+/// Distinct from `alloc_phys_contig`, which hands out the single ISA-DMA pool
+/// (low, 64 KB-aligned — for the Sound Blaster). 64-bit PCI bus-master devices
+/// (NVMe, xHCI) have no such constraint and each get an independent block here,
+/// so they don't fight over one pool.
+pub fn alloc_contig(num_pages: usize) -> Option<u64> {
+    if num_pages == 0 {
+        return None;
+    }
+    unsafe {
+        let mut start = 256; // skip the first 1 MiB (BIOS/IVT/VGA)
+        while start + num_pages <= MAX_PAGES {
+            if (start..start + num_pages).all(|i| PAGE_REFS[i] == 0) {
+                for i in start..start + num_pages {
+                    PAGE_REFS[i] = RESERVED;
+                }
+                return Some(start as u64);
+            }
+            start += 1;
+        }
+        None
+    }
+}
+
 /// Get free page count (for debugging)
 pub fn free_page_count() -> usize {
     let mut count = 0;
