@@ -130,24 +130,24 @@ fn set_prp1(c: &mut [u32; 16], phys: u64) {
 /// up. Returns true when ready to serve reads. Absent bus (interpreter) or
 /// absent device: false, no side effects.
 pub fn init(arch: &mut crate::TheArch) -> bool {
-    let Some((bus, dev)) = pci::find_class(arch, 0x01, 0x08) else {
+    let Some((bus, dev, func)) = pci::find_class(arch, 0x01, 0x08) else {
         return false; // no NVMe controller (legacy machine) — not an error
     };
 
     // Enable memory space + bus mastering.
-    let pcmd = pci::read32(arch, bus, dev, 0, 0x04);
-    pci::write32(arch, bus, dev, 0, 0x04, (pcmd & 0xFFFF) | 0x06);
+    let pcmd = pci::read32(arch, bus, dev, func, 0x04);
+    pci::write32(arch, bus, dev, func, 0x04, (pcmd & 0xFFFF) | 0x06);
 
     // BAR0: a (usually 64-bit) memory BAR. OVMF places it above 4 GB — fine:
     // the kernel VA space is 32-bit but PAE/compat PTEs carry 52-bit physical
     // addresses, so `map_phys_range` reaches it. (A legacy-paging 386 would
     // truncate, but no NVMe machine is a 386.)
-    let bar0 = pci::read32(arch, bus, dev, 0, 0x10);
+    let bar0 = pci::read32(arch, bus, dev, func, 0x10);
     if bar0 & 1 != 0 {
         return false; // I/O BAR — not an NVMe register set
     }
     let is_64 = (bar0 >> 1) & 3 == 2;
-    let bar_hi = if is_64 { pci::read32(arch, bus, dev, 0, 0x14) } else { 0 };
+    let bar_hi = if is_64 { pci::read32(arch, bus, dev, func, 0x14) } else { 0 };
     let bar_phys = ((bar_hi as u64) << 32) | (bar0 & 0xFFFF_FFF0) as u64;
 
     arch.map_phys_range(REGS_VA >> 12, REGS_PAGES, bar_phys >> 12, PTE_CACHE_DISABLE);

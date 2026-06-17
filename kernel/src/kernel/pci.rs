@@ -28,18 +28,33 @@ pub fn write32(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8, off: u8, v
     arch.outl(PCI_CFG_DATA, val);
 }
 
-/// Find the first device matching `(class, subclass)` on buses 0-3.
-/// Returns `(bus, dev)`.
-pub fn find_class(arch: &mut crate::TheArch, class: u8, subclass: u8) -> Option<(u8, u8)> {
-    for bus in 0..4u8 {
+/// Find the first device matching `(class, subclass)`, returning
+/// `(bus, dev, func)`. Spec-conformant brute-force enumeration: all 256 buses,
+/// all 32 devices, and functions 1-7 on multi-function devices.
+///
+/// Both matter on real hardware: a controller commonly sits behind a PCIe root
+/// port on a high bus (the dev laptop's xHCI is at 65:00.3 — bus 0x65,
+/// function 3), so a buses-0-3 / function-0-only scan misses it and the device
+/// probes as absent. Empty slots read all-ones (0xFFFF vendor id).
+pub fn find_class(arch: &mut crate::TheArch, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
+    for bus in 0..=255u8 {
         for dev in 0..32u8 {
-            let id = read32(arch, bus, dev, 0, 0x00);
-            if id & 0xFFFF == 0xFFFF {
-                continue; // empty slot
-            }
-            let classes = read32(arch, bus, dev, 0, 0x08);
-            if (classes >> 24) as u8 == class && (classes >> 16) as u8 == subclass {
-                return Some((bus, dev));
+            for func in 0..8u8 {
+                if read32(arch, bus, dev, func, 0x00) & 0xFFFF == 0xFFFF {
+                    if func == 0 {
+                        break; // function 0 absent ⇒ no device in this slot
+                    }
+                    continue;
+                }
+                let classes = read32(arch, bus, dev, func, 0x08);
+                if (classes >> 24) as u8 == class && (classes >> 16) as u8 == subclass {
+                    return Some((bus, dev, func));
+                }
+                // Probe functions 1-7 only on a multi-function device (header
+                // type bit 7, at config offset 0x0C bit 23).
+                if func == 0 && read32(arch, bus, dev, 0, 0x0C) & 0x0080_0000 == 0 {
+                    break;
+                }
             }
         }
     }
