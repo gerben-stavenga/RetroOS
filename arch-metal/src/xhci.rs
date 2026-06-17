@@ -179,13 +179,13 @@ fn poll_event() -> Option<(u32, u32, u32)> {
     None
 }
 
-/// Wait for the next Command Completion Event (type 33), skipping unrelated
-/// events that may be queued ahead of it (e.g. a Port Status Change from a port
-/// reset). Returns (completion_code, slot_id).
-fn wait_cmd() -> Option<(u32, u32)> {
+/// Wait for the next event of TRB type `want` (33=Command Completion,
+/// 32=Transfer), skipping unrelated events queued ahead of it (e.g. a Port
+/// Status Change from a reset). Returns (completion_code, slot_id).
+fn wait_event(want: u32) -> Option<(u32, u32)> {
     for _ in 0..64 {
         let (ttype, cc, slot) = poll_event()?;
-        if ttype == 33 {
+        if ttype == want {
             return Some((cc, slot));
         }
     }
@@ -199,10 +199,61 @@ fn enable_slot() -> Option<u32> {
     // ring once the interrupter is enabled, even for a polling driver.
     unsafe { w32(RT + 0x20, r32(RT + 0x20) | 0x2) };
     ring_cmd(0, 0, 9 << 10); // TRB type 9 = Enable Slot
-    match wait_cmd()? {
+    match wait_event(33)? {
         (1, slot) => Some(slot),
         _ => None,
     }
+}
+
+// EP0 (default control endpoint) transfer-ring cursor.
+static mut EP0_ENQ: usize = 0;
+static mut EP0_CYCLE: u32 = 1;
+
+/// Enqueue a TRB on the EP0 transfer ring (no doorbell — the caller rings it
+/// once per transfer descriptor). Handles the Link TRB wrap like the cmd ring.
+fn ep0_trb(param: u64, status: u32, control: u32) {
+    unsafe {
+        let trb = (DMA_VA + EP0_OFF + EP0_ENQ * 16) as *mut u32;
+        core::ptr::write_volatile(trb as *mut u64, param);
+        core::ptr::write_volatile(trb.add(2), status);
+        core::ptr::write_volatile(trb.add(3), control | EP0_CYCLE);
+        EP0_ENQ += 1;
+        if EP0_ENQ == RING_TRBS - 1 {
+            let link = (DMA_VA + EP0_OFF + (RING_TRBS - 1) * 16) as *mut u32;
+            let c = core::ptr::read_volatile(link.add(3)) & !1;
+            core::ptr::write_volatile(link.add(3), c | EP0_CYCLE);
+            EP0_ENQ = 0;
+            EP0_CYCLE ^= 1;
+        }
+    }
+}
+
+/// Issue a control transfer on EP0: Setup → (Data) → Status stages, ring the
+/// slot's doorbell (DCI 1 = control EP), wait for the Transfer Event. IN data
+/// (if any) lands in the XFER buffer. Returns true on Success/Short-Packet.
+fn control(slot: u32, bm_req: u32, b_req: u32, w_value: u32, w_index: u32, w_len: u32) -> bool {
+    let dir_in = bm_req & 0x80 != 0;
+    // Setup Stage (immediate data, IDT=1): the 8-byte SETUP packet in `param`.
+    let setup = (bm_req | (b_req << 8) | (w_value << 16)) as u64
+        | ((w_index | (w_len << 16)) as u64) << 32;
+    let trt = if w_len == 0 {
+        0
+    } else if dir_in {
+        3
+    } else {
+        2
+    };
+    ep0_trb(setup, 8, (1 << 6) | (2 << 10) | (trt << 16)); // IDT, type 2, TRT
+    if w_len > 0 {
+        let buf = unsafe { DMA_PHYS } + XFER_OFF as u64;
+        ep0_trb(buf, w_len, (3 << 10) | ((dir_in as u32) << 16)); // type 3, DIR
+    }
+    // Status Stage: opposite direction, Interrupt-On-Completion so we get an event.
+    let status_dir = if dir_in && w_len > 0 { 0 } else { 1 };
+    ep0_trb(0, 0, (1 << 5) | (4 << 10) | (status_dir << 16)); // IOC, type 4, DIR
+    let db = unsafe { DB };
+    w32(db + slot as usize * 4, 1); // ring slot doorbell, DCI 1 (EP0)
+    matches!(wait_event(32), Some((1, _)) | Some((13, _))) // Success or Short Packet
 }
 
 /// Spin until `cond` (bounded — a wedged controller must not hang the boot).
@@ -340,7 +391,7 @@ fn address_device(slot: u32, port: u32, speed: u32, stride: usize) -> bool {
     // Address Device (TRB type 11): input-context pointer, slot id in 31:24.
     let inctx_phys = unsafe { DMA_PHYS } + INCTX_OFF as u64;
     ring_cmd(inctx_phys, 0, (11 << 10) | (slot << 24));
-    matches!(wait_cmd(), Some((1, _)))
+    matches!(wait_event(33), Some((1, _)))
 }
 
 /// Probe for an xHCI controller, bring it up, find the keyboard's port, and put
@@ -407,9 +458,22 @@ pub fn init() {
         lib::println!("xHCI: Enable Slot failed (usbsts={:#x})", r32(op + OP_USBSTS));
         return;
     };
-    if address_device(slot, port, speed, stride) {
-        lib::println!("xHCI: device addressed (slot {} port {} speed {})", slot, port, speed);
-    } else {
+    if !address_device(slot, port, speed, stride) {
         lib::println!("xHCI: Address Device failed (usbsts={:#x})", r32(op + OP_USBSTS));
+        return;
+    }
+    lib::println!("xHCI: device addressed (slot {} port {} speed {})", slot, port, speed);
+
+    // Control transfer proof: GET_DESCRIPTOR(device, 18 bytes) → VID/PID.
+    if control(slot, 0x80, 0x06, 0x0100, 0, 18) {
+        unsafe {
+            let d = DMA_VA + XFER_OFF;
+            let rd = |o: usize| core::ptr::read_volatile((d + o) as *const u8) as u16;
+            let vid = rd(8) | (rd(9) << 8);
+            let pid = rd(10) | (rd(11) << 8);
+            lib::println!("xHCI: device descriptor VID={:04x} PID={:04x} class={}", vid, pid, rd(4));
+        }
+    } else {
+        lib::println!("xHCI: GET_DESCRIPTOR failed");
     }
 }
