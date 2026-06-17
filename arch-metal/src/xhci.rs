@@ -619,7 +619,7 @@ pub fn init() {
 
     let bar0 = cfg_read(bus, dev, func, 0x10);
     if bar0 & 1 != 0 {
-        lib::println!("xHCI: BAR0 is I/O space (unexpected) — skipping");
+        lib::println!("xHCI: BAR0 is I/O space (unexpected) - skipping");
         return;
     }
     let bar_hi = if (bar0 >> 1) & 3 == 2 {
@@ -691,17 +691,25 @@ pub fn init() {
         evaluate_ep0_mps(slot, mps0, stride);
     }
 
-    // Read the configuration descriptor and find the interrupt-IN endpoint +
-    // its HID interface (the boot keyboard has exactly one).
-    if !control(slot, 0x80, 0x06, 0x0200, 0, 64) {
+    // Read the configuration descriptor and find the boot keyboard's
+    // interrupt-IN endpoint. A composite device (e.g. a gaming keyboard with
+    // separate keyboard / NKRO / consumer-control / macro HID interfaces)
+    // chains several interfaces, and the boot keyboard is rarely the first
+    // interrupt endpoint — so we read the WHOLE descriptor (wTotalLength can
+    // exceed 64 bytes) and prefer the interface that declares HID class(3) /
+    // boot subclass(1) / keyboard protocol(1). The first interrupt-IN endpoint
+    // is kept as a fallback for a plain keyboard that omits the boot subclass.
+    if !control(slot, 0x80, 0x06, 0x0200, 0, 255) {
         lib::println!("xHCI: GET config descriptor failed");
         return;
     }
     let rd = |o: usize| unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + o) as *const u8) as u32 };
     let cfg_value = rd(5); // bConfigurationValue
-    let total = (rd(2) | (rd(3) << 8)) as usize;
-    let total = total.min(64);
-    let (mut iface, mut ep_num, mut ep_mps, mut ep_int) = (0u32, 0u32, 8u32, 8u32);
+    let total = ((rd(2) | (rd(3) << 8)) as usize).min(255);
+    // (iface, ep_num, ep_mps, ep_int) for the boot keyboard, and for any interrupt-IN.
+    let (mut kb, mut any) = ((0u32, 0u32, 8u32, 8u32), (0u32, 0u32, 8u32, 8u32));
+    let mut cur_iface = 0u32;
+    let mut cur_is_kbd = false;
     let mut i = rd(0) as usize; // skip the config descriptor header
     while i + 2 <= total {
         let (blen, btype) = (rd(i) as usize, rd(i + 1));
@@ -709,16 +717,22 @@ pub fn init() {
             break;
         }
         if btype == 4 {
-            iface = rd(i + 2); // interface descriptor → bInterfaceNumber
+            // interface descriptor → bInterfaceNumber + class/subclass/protocol
+            cur_iface = rd(i + 2);
+            cur_is_kbd = rd(i + 5) == 3 && rd(i + 6) == 1 && rd(i + 7) == 1;
         } else if btype == 5 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
             // endpoint descriptor: IN + interrupt
-            ep_num = rd(i + 2) & 0x0F;
-            ep_mps = rd(i + 4) | (rd(i + 5) << 8);
-            ep_int = rd(i + 6);
-            break;
+            let ep = (cur_iface, rd(i + 2) & 0x0F, rd(i + 4) | (rd(i + 5) << 8), rd(i + 6));
+            if any.1 == 0 {
+                any = ep;
+            }
+            if cur_is_kbd && kb.1 == 0 {
+                kb = ep;
+            }
         }
         i += blen;
     }
+    let (iface, ep_num, ep_mps, ep_int) = if kb.1 != 0 { kb } else { any };
     if ep_num == 0 {
         lib::println!("xHCI: no interrupt-IN endpoint found");
         return;
@@ -743,7 +757,7 @@ pub fn init() {
             READY = true;
         }
         arm_report(); // queue the first interrupt-IN report
-        lib::println!("xHCI: keyboard ready (ep {} mps {}) — polling for keys", ep_num, ep_mps);
+        lib::println!("xHCI: keyboard ready (ep {} iface {} mps {}) - polling for keys", ep_num, iface, ep_mps);
     } else {
         lib::println!("xHCI: Configure Endpoint failed");
     }
