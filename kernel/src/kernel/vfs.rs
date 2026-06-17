@@ -99,12 +99,13 @@ pub struct FileEntry {
 }
 
 /// Mount table entry
+#[derive(Clone, Copy)]
 struct Mount {
     prefix: &'static [u8],  // e.g. b"" for root, b"boot/" for sub-mount
     fs: &'static dyn Filesystem,
 }
 
-const MAX_MOUNTS: usize = 4;
+const MAX_MOUNTS: usize = 6;
 
 /// Single-directory readdir cache (avoids O(n²) re-scanning for sequential
 /// readdir). One directory cached at a time, growable so a flat dir with
@@ -161,7 +162,7 @@ impl Vfs {
             ram_key_len: 0,
         };
         Vfs {
-            mounts: [None, None, None, None],
+            mounts: [None; MAX_MOUNTS],
             mount_count: 0,
             ram_files: BTreeMap::new(),
             path_cache: BTreeMap::new(),

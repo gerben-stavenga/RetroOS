@@ -102,7 +102,10 @@ pub enum Media {
     /// attached). `hostfs` additionally at /host when the COM1 transport
     /// answered. (/boot is NOT from disk — the embedded bootfs is an
     /// invariant; the 0xDA boot-bundle partition is bootloader-only.)
-    DiskRoot { ext4_lba: u32, hostfs: bool },
+    /// `extra_ext` holds additional ext partitions (a multi-distro disk has
+    /// several); they mount as subdirectories C:\DISK1, C:\DISK2, … of the
+    /// root. Unused slots are 0.
+    DiskRoot { ext4_lba: u32, extra_ext: [u32; 3], hostfs: bool },
     /// No usable disk, but the host filesystem answered: it IS the root —
     /// the natural root for hosted runs (DOSBox-style: a host directory is
     /// the drive, no image build). Also aliased at /host so DiskRoot-era
@@ -278,11 +281,11 @@ fn is_ext_partition(lba: u32) -> bool {
 /// (the only size `block::read_sectors` handles — a 4K-formatted NVMe is
 /// rejected earlier in the driver); partition starts past 4 GiB-sectors don't
 /// fit our u32 LBA and are skipped, which never happens on a real laptop root.
-fn gpt_find_ext() -> Option<u32> {
+fn gpt_collect_ext(out: &mut [u32]) -> usize {
     let mut hdr = [0u8; 512];
     crate::kernel::block::read_sectors(1, &mut hdr);
     if &hdr[0..8] != b"EFI PART" {
-        return None;
+        return 0;
     }
     let entry_lba = u64::from_le_bytes(hdr[0x48..0x50].try_into().unwrap());
     let num_entries = u32::from_le_bytes(hdr[0x50..0x54].try_into().unwrap()).min(256) as usize;
@@ -290,11 +293,12 @@ fn gpt_find_ext() -> Option<u32> {
     // Standard entries are 128 bytes (4 per 512-byte sector) and never straddle
     // a sector. Bail on anything that doesn't divide a sector cleanly.
     if entry_size == 0 || entry_lba == 0 || entry_lba > u32::MAX as u64 || 512 % entry_size != 0 {
-        return None;
+        return 0;
     }
     let per_sector = 512 / entry_size;
     let sectors = num_entries.div_ceil(per_sector);
     let mut buf = [0u8; 512];
+    let mut n = 0;
     for s in 0..sectors {
         crate::kernel::block::read_sectors(entry_lba as u32 + s as u32, &mut buf);
         for e in 0..per_sector {
@@ -307,12 +311,17 @@ fn gpt_find_ext() -> Option<u32> {
             if first_lba == 0 || first_lba > u32::MAX as u64 {
                 continue;
             }
+            // Collect every ext* partition (a multi-distro disk has several);
+            // the first becomes the root, the rest mount as subdirectories.
             if is_ext_partition(first_lba as u32) {
-                return Some(first_lba as u32);
+                if n < out.len() {
+                    out[n] = first_lba as u32;
+                    n += 1;
+                }
             }
         }
     }
-    None
+    n
 }
 
 /// Find the ext4 root and probe the hostfs COM1 transport. First the MBR (4
@@ -328,20 +337,27 @@ fn probe_media(machine: &mut crate::TheArch) -> Media {
 
     let mut mbr = [0u8; 512];
     crate::kernel::block::read_sectors(0, &mut mbr);
-    let mut ext4_lba = None;
+    // Collect every ext partition on the disk (a dual-boot laptop has more than
+    // one): MBR type 0x83 entries, or — on a real UEFI disk (protective MBR) —
+    // the GPT's ext* partitions found by superblock magic.
+    let mut parts = [0u32; 4];
+    let mut n = 0;
     for i in 0..4 {
         let base = 0x1BE + i * 16;
-        if mbr[base + 4] == 0x83 {
-            ext4_lba = Some(u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap()));
+        if mbr[base + 4] == 0x83 && n < parts.len() {
+            parts[n] = u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap());
+            n += 1;
         }
     }
-    // Real UEFI disk: protective MBR, no 0x83 — walk the GPT for the ext root.
-    if ext4_lba.is_none() && is_protective_mbr(&mbr) {
-        ext4_lba = gpt_find_ext();
+    if n == 0 && is_protective_mbr(&mbr) {
+        n = gpt_collect_ext(&mut parts);
     }
 
-    if let Some(ext4_lba) = ext4_lba {
-        Media::DiskRoot { ext4_lba, hostfs }
+    if n > 0 {
+        // First partition = root (C:); the rest mount as C:\DISK1, C:\DISK2, …
+        let mut extra_ext = [0u32; 3];
+        extra_ext[..(n - 1).min(3)].copy_from_slice(&parts[1..1 + (n - 1).min(3)]);
+        Media::DiskRoot { ext4_lba: parts[0], extra_ext, hostfs }
     } else if hostfs {
         Media::HostRoot
     } else {

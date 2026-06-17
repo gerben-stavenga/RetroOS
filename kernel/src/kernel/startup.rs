@@ -61,7 +61,7 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
     use crate::kernel::platform::Media;
 
     match platform.media {
-        Media::DiskRoot { ext4_lba, hostfs } => {
+        Media::DiskRoot { ext4_lba, extra_ext, hostfs } => {
             println!("ext4 root at sector {:#x}", ext4_lba);
             match Ext4Fs::new(ext4_lba) {
                 Ok(fs) => {
@@ -70,6 +70,23 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
                     vfs::mount(b"", leaked);
                 }
                 Err(e) => panic!("ext4 mount failed: {}", e),
+            }
+            // Additional ext partitions (a dual-boot laptop's other distro)
+            // mount as subdirectories C:\DISK1, C:\DISK2, … — an unreadable one
+            // is logged and skipped, never fatal (it's not the boot root).
+            const SUBDIRS: [&[u8]; 3] = [b"disk1/", b"disk2/", b"disk3/"];
+            for (i, &lba) in extra_ext.iter().enumerate() {
+                if lba == 0 {
+                    continue;
+                }
+                match Ext4Fs::new(lba) {
+                    Ok(fs) => {
+                        let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+                        vfs::mount(SUBDIRS[i], leaked);
+                        println!("ext4 partition at sector {:#x} → C:\\DISK{}", lba, i + 1);
+                    }
+                    Err(e) => println!("ext4 partition at {:#x} skipped: {}", lba, e),
+                }
             }
             if hostfs {
                 vfs::mount(b"host/", &HOSTFS);
