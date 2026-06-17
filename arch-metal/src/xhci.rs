@@ -450,6 +450,28 @@ fn configure_endpoint(
     matches!(wait_event(33), Some((1, _)))
 }
 
+/// Evaluate Context (TRB type 13): update EP0's Max Packet Size in the device
+/// context. Full-speed devices vary (8/16/32/64); we address with the safe
+/// minimum 8, then correct it once the device descriptor reveals the real value
+/// — otherwise larger control transfers babble. (High-speed is always 64, so
+/// this is a no-op there.)
+fn evaluate_ep0_mps(slot: u32, mps: u32, stride: usize) -> bool {
+    unsafe {
+        let inctx = DMA_VA + INCTX_OFF;
+        core::ptr::write_bytes(inctx as *mut u8, 0, 0x1000);
+        // Input Control Context: add EP0 (bit 1) only.
+        core::ptr::write_volatile((inctx + 4) as *mut u32, 0x2);
+        // EP0 Context (DCI 1, at 2*stride): Control(4), new MPS, CErr=3; keep
+        // the same TR Dequeue Pointer (DCS=1).
+        let ep0 = inctx + 2 * stride;
+        core::ptr::write_volatile((ep0 + 4) as *mut u32, (mps << 16) | (4 << 3) | (3 << 1));
+        core::ptr::write_volatile((ep0 + 8) as *mut u64, (DMA_PHYS + EP0_OFF as u64) | 1);
+    }
+    let inctx_phys = unsafe { DMA_PHYS } + INCTX_OFF as u64;
+    ring_cmd(inctx_phys, 0, (13 << 10) | (slot << 24));
+    matches!(wait_event(33), Some((1, _)))
+}
+
 // HID usage id → AT scancode set 1 (make code; break = make | 0x80). 0 = key
 // we don't translate (extended/navigation keys need an E0 prefix — later).
 #[rustfmt::skip]
@@ -653,6 +675,21 @@ pub fn init() {
         return;
     }
     lib::println!("xHCI: device addressed (slot {} port {} speed {})", slot, port, speed);
+
+    // Full-speed EP0 max-packet-size correction. We addressed with the safe
+    // minimum (8). Read the first 8 bytes of the device descriptor — fits in one
+    // 8-byte packet regardless of the real MPS — then, if bMaxPacketSize0 (byte
+    // 7) differs, update EP0 before any larger transfer. High-speed reports 64
+    // and skips this; full-speed (this laptop's keyboard) needs it or the config
+    // read babbles.
+    if !control(slot, 0x80, 0x06, 0x0100, 0, 8) {
+        lib::println!("xHCI: GET device descriptor(8) failed");
+        return;
+    }
+    let mps0 = unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + 7) as *const u8) } as u32;
+    if mps0 > 8 {
+        evaluate_ep0_mps(slot, mps0, stride);
+    }
 
     // Read the configuration descriptor and find the interrupt-IN endpoint +
     // its HID interface (the boot keyboard has exactly one).
