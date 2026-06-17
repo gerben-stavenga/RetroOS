@@ -156,44 +156,33 @@ struct Hda {
     rate: u32,
 }
 
-/// Scan PCI bus 0 for an HDA controller (class 0x04, subclass 0x03). Returns the
-/// device number. Like `ac97::scan`, tolerant of a no-PCI backend (all 0xFFFF…).
-pub fn scan(arch: &mut crate::TheArch) -> Option<u8> {
-    for dev in 0..32u8 {
-        let id = crate::kernel::pci::read32(arch, 0, dev, 0, 0x00);
-        if id & 0xFFFF == 0xFFFF {
-            continue;
-        }
-        let classes = crate::kernel::pci::read32(arch, 0, dev, 0, 0x08);
-        let class = (classes >> 24) & 0xFF;
-        let subclass = (classes >> 16) & 0xFF;
-        if class == 0x04 && subclass == 0x03 {
-            return Some(dev);
-        }
-    }
-    None
+/// Find an HDA controller (class 0x04, subclass 0x03) anywhere on PCI, via the
+/// shared `pci::find_class` scan. Like `ac97::scan`, tolerant of a no-PCI
+/// backend (all 0xFFFF…).
+pub fn scan(arch: &mut crate::TheArch) -> Option<(u8, u8, u8)> {
+    crate::kernel::pci::find_class(arch, 0x04, 0x03)
 }
 
 pub fn init(arch: &mut crate::TheArch) {
     if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedHda {
         return;
     }
-    let dev = scan(arch).expect("platform probe saw an HDA controller; scan must agree");
-    let _ = bring_up(arch, dev);
+    let (bus, dev, func) = scan(arch).expect("platform probe saw an HDA controller; scan must agree");
+    let _ = bring_up(arch, bus, dev, func);
 }
 
-/// Bring up the controller + codec output path at bus 0 / `dev`. Returns true on
-/// success.
-fn bring_up(arch: &mut crate::TheArch, dev: u8) -> bool {
+/// Bring up the controller + codec output path at `bus:dev.func`. Returns true
+/// on success.
+fn bring_up(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8) -> bool {
     // Enable memory space + bus master in the PCI command register (bits 1, 2).
-    let cmd = crate::kernel::pci::read32(arch, 0, dev, 0, 0x04);
-    crate::kernel::pci::write32(arch, 0, dev, 0, 0x04, (cmd & 0xFFFF) | 0x06);
+    let cmd = crate::kernel::pci::read32(arch, bus, dev, func, 0x04);
+    crate::kernel::pci::write32(arch, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
 
     // BAR0 is a memory BAR. Read the high dword only if it is actually 64-bit
     // (type bits [2:1] == 0b10); a 32-bit BAR would make 0x14 a different reg.
-    let bar0 = crate::kernel::pci::read32(arch, 0, dev, 0, 0x10);
+    let bar0 = crate::kernel::pci::read32(arch, bus, dev, func, 0x10);
     let hi = if bar0 & 0x6 == 0x4 {
-        crate::kernel::pci::read32(arch, 0, dev, 0, 0x14) as u64
+        crate::kernel::pci::read32(arch, bus, dev, func, 0x14) as u64
     } else {
         0
     };

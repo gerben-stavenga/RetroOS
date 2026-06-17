@@ -98,24 +98,12 @@ pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
 
-/// Find an AC'97 codec on PCI bus 0 (QEMU/ICH put it there), function 0.
-/// Pure presence scan — `platform::probe` uses it for the Audio decision; on
-/// a backend with no PCI (the interpreter) every config read is 0xFFFFFFFF
-/// and nothing is found.
-pub fn scan(arch: &mut crate::TheArch) -> Option<u8> {
-    for dev in 0..32u8 {
-        let id = crate::kernel::pci::read32(arch, 0, dev, 0, 0x00);
-        if id & 0xFFFF == 0xFFFF {
-            continue; // no device in this slot
-        }
-        let classes = crate::kernel::pci::read32(arch, 0, dev, 0, 0x08);
-        let class = (classes >> 24) & 0xFF;
-        let subclass = (classes >> 16) & 0xFF;
-        if class == 0x04 && subclass == 0x01 {
-            return Some(dev);
-        }
-    }
-    None
+/// Find an AC'97 codec (class 0x04, subclass 0x01) anywhere on PCI, via the
+/// shared `pci::find_class` scan. Pure presence probe — `platform::probe` uses
+/// it for the Audio decision; on a no-PCI backend (the interpreter) every read
+/// is 0xFFFFFFFF and nothing is found.
+pub fn scan(arch: &mut crate::TheArch) -> Option<(u8, u8, u8)> {
+    crate::kernel::pci::find_class(arch, 0x04, 0x01)
 }
 
 /// Bring up the codec the platform probe found. Driver init only — the
@@ -125,21 +113,21 @@ pub fn init(arch: &mut crate::TheArch) {
     if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedAc97 {
         return;
     }
-    let dev = scan(arch).expect("platform probe saw an AC'97 codec; scan must agree");
-    if bring_up(arch, dev) {
+    let (bus, dev, func) = scan(arch).expect("platform probe saw an AC'97 codec; scan must agree");
+    if bring_up(arch, bus, dev, func) {
         PRESENT.store(true, Ordering::Relaxed);
     }
 }
 
-/// Bring up the codec at bus 0 / `dev`. Returns true on success.
-fn bring_up(arch: &mut crate::TheArch, dev: u8) -> bool {
+/// Bring up the codec at `bus:dev.func`. Returns true on success.
+fn bring_up(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8) -> bool {
     // Enable I/O space + bus-master in the PCI command register (low 16 bits of
     // dword 0x04). Writing 0 to the status word (high 16) is harmless (RW1C).
-    let cmd = crate::kernel::pci::read32(arch, 0, dev, 0, 0x04);
-    crate::kernel::pci::write32(arch, 0, dev, 0, 0x04, (cmd & 0xFFFF) | 0x05);
+    let cmd = crate::kernel::pci::read32(arch, bus, dev, func, 0x04);
+    crate::kernel::pci::write32(arch, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x05);
 
-    let nam = (crate::kernel::pci::read32(arch, 0, dev, 0, 0x10) & 0xFFFC) as u16; // BAR0
-    let nabm = (crate::kernel::pci::read32(arch, 0, dev, 0, 0x14) & 0xFFFC) as u16; // BAR1
+    let nam = (crate::kernel::pci::read32(arch, bus, dev, func, 0x10) & 0xFFFC) as u16; // BAR0
+    let nabm = (crate::kernel::pci::read32(arch, bus, dev, func, 0x14) & 0xFFFC) as u16; // BAR1
     if nam == 0 || nabm == 0 {
         return false;
     }
