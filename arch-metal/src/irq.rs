@@ -388,6 +388,11 @@ pub fn init_interrupts() {
         legacy_intr_and_pit();
     }
 
+    // Probe the xHCI controller (the USB-HID keyboard source on legacy-free
+    // machines). WIP: reports the controller for now; once the HID read path
+    // lands it becomes the keyboard when no i8042 answers below.
+    crate::xhci::init();
+
     // Keyboard/mouse SOURCE is a separate axis from delivery: PROBE the i8042
     // rather than guessing "no keyboard" from x2APIC. A real controller (many
     // laptops expose the internal keyboard as PS/2 via the EC) is used either

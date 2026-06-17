@@ -21,6 +21,7 @@ pub mod phys_mm;
 mod traps;
 mod vcpu;
 pub mod x86;
+pub mod xhci;
 
 // === Metal-only boot data (consumed by the bring-up here and by the kernel's
 // `boot.rs` entry). On the interp backend none of this exists. ===
