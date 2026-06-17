@@ -70,6 +70,7 @@ HOSTFS_DIR="$HOME"
 HOSTFS_DIR_SET=0
 QEMU_HEADLESS=0
 KVM=0             # --kvm: run on the host CPU via -accel kvm -cpu host (qemu only)
+GPT=0             # --gpt: single GPT disk (ESP+ext4) like a real UEFI machine (qemu/uefi)
 
 # hosted-specific
 HOSTED_CMD=""
@@ -100,6 +101,7 @@ while [ $# -gt 0 ]; do
         -r)           START_BIN="$2"; shift 2 ;;
         --headless)   QEMU_HEADLESS=1; shift ;;
         --kvm)        KVM=1; shift ;;
+        --gpt)        GPT=1; shift ;;
 
         # hosted flags (long + short forms)
         -c|--cmd)        HOSTED_CMD="$2"; shift 2 ;;
@@ -180,6 +182,12 @@ fi
 # --kvm is a QEMU accelerator (run on the host CPU via VT-x/AMD-V).
 if [ "$KVM" = 1 ] && [ "$BACKEND" != "qemu" ]; then
     echo "run.sh: --kvm only applies to the qemu backend (got '$BACKEND')." >&2
+    exit 1
+fi
+
+# --gpt builds a single GPT disk booted via OVMF/GRUB — qemu + uefi only.
+if [ "$GPT" = 1 ] && { [ "$BACKEND" != "qemu" ] || [ "$FIRMWARE" != "uefi" ]; }; then
+    echo "run.sh: --gpt requires the qemu backend with --firmware uefi." >&2
     exit 1
 fi
 
@@ -386,6 +394,51 @@ EOF
     mmd    -i "$esp" ::/EFI ::/EFI/BOOT
     mcopy  -i "$esp" "$work/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
     mcopy  -i "$esp" "$kernel" ::/kernel.elf
+}
+
+# Read a little-endian u32 at byte offset $2 of file $1 (x86 host = LE, so
+# `od -tu4` yields the value directly).
+le32() { od -An -tu4 -j "$2" -N4 "$1" | tr -d ' '; }
+
+# Assemble a single GPT disk that mirrors a real UEFI machine: partition 1 is
+# the ESP (GRUB + kernel.elf), partition 2 is the ext4 root extracted from the
+# MBR data image. Boots OVMF -> GRUB -> kernel, which then walks the GPT to find
+# the ext4 root — the protective-MBR / GPT discovery path that the default
+# two-disk MBR setup never exercises. Privilege-free: od + sgdisk + dd, no loop
+# mounts. $1 = output disk, $2 = ESP image, $3 = MBR data image, $4 = work dir.
+build_gpt_disk() {
+    local out="$1" esp="$2" mbr_img="$3" work="$4"
+    local ext4="$work/ext4part.img"
+
+    # Pull the ext4 (type 0x83) partition out of the MBR data image.
+    local e_lba="" e_cnt="" i base typ
+    for i in 0 1 2 3; do
+        base=$((0x1BE + i * 16))
+        typ=$(od -An -tx1 -j $((base + 4)) -N1 "$mbr_img" | tr -d ' ')
+        if [ "$typ" = "83" ]; then
+            e_lba=$(le32 "$mbr_img" $((base + 8)))
+            e_cnt=$(le32 "$mbr_img" $((base + 12)))
+            break
+        fi
+    done
+    [ -n "$e_lba" ] && [ "$e_cnt" -gt 0 ] 2>/dev/null \
+        || { echo "run.sh (--gpt): no ext4 (0x83) partition in $mbr_img" >&2; exit 1; }
+    dd if="$mbr_img" of="$ext4" bs=512 skip="$e_lba" count="$e_cnt" status=none
+
+    # Layout: ESP at 1 MiB, ext4 aligned to the next MiB after it, + backup-GPT slack.
+    local esp_sectors=$(( ( $(stat -c%s "$esp") + 511) / 512 ))
+    local ext4_sectors=$(( ( $(stat -c%s "$ext4") + 511) / 512 ))
+    local esp_start=2048
+    local ext4_start=$(( (esp_start + esp_sectors + 2047) / 2048 * 2048 ))
+    local total=$(( ext4_start + ext4_sectors + 2048 ))
+
+    truncate -s $(( total * 512 )) "$out"
+    sgdisk -a 2048 \
+        -n 1:${esp_start}:+${esp_sectors}   -t 1:EF00 -c 1:ESP \
+        -n 2:${ext4_start}:+${ext4_sectors} -t 2:8300 -c 2:RetroOS \
+        "$out" >/dev/null
+    dd if="$esp"  of="$out" bs=512 seek="$esp_start"  conv=notrunc status=none
+    dd if="$ext4" of="$out" bs=512 seek="$ext4_start" conv=notrunc status=none
 }
 
 # ---------------------------------------------------------------------------
@@ -656,6 +709,27 @@ launch_qemu_uefi() {
     # Private writable VARS copy (OVMF persists boot entries into it).
     cp "$OVMF_VARS" "$WORK/vars.fd"
 
+    # Disk attach: --gpt assembles ONE GPT disk (ESP + ext4, like a real UEFI
+    # machine — exercises the kernel's GPT/protective-MBR discovery); otherwise
+    # the default two NVMe drives (MBR data disk + a separate FAT ESP).
+    # The data disk the kernel probes is GPT (--gpt) or MBR (default); either way
+    # GRUB boots from the separate bare-FAT ESP. (OVMF auto-boots a bare ESP
+    # reliably but NOT a GPT ESP in -nodefaults, so we don't put GRUB on the GPT
+    # disk — the kernel walks that disk's GPT for the ext root regardless of how
+    # OVMF booted.) Data controller FIRST: the kernel's nvme probe takes it.
+    if [ "$GPT" = 1 ]; then
+        DATA_DISK="$WORK/gpt.img"
+        build_gpt_disk "$DATA_DISK" "$ESP" "$IMAGE" "$WORK"
+    else
+        DATA_DISK="$IMAGE"
+    fi
+    DISK_ARGS=(
+        -drive "file=$DATA_DISK,if=none,id=hd,format=raw,snapshot=on"
+        -device nvme,drive=hd,serial=retro1
+        -drive "file=$ESP,if=none,id=esp,format=raw"
+        -device nvme,drive=esp,serial=esp0
+    )
+
     DISPLAY_ARGS=()
     if [ "$QEMU_HEADLESS" = 1 ]; then
         DISPLAY_ARGS+=(-display none)
@@ -672,12 +746,10 @@ launch_qemu_uefi() {
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -nodefaults \
         -device bochs-display \
-        -drive file="$IMAGE",if=none,id=hd,format=raw,snapshot=on \
-        -device nvme,drive=hd,serial=retro1 \
-        `# image controller FIRST: the kernel's nvme probe takes the first` \
-        `# controller it finds; OVMF locates the ESP by filesystem, not order` \
-        -drive file="$ESP",if=none,id=esp,format=raw \
-        -device nvme,drive=esp,serial=esp0 \
+        "${DISK_ARGS[@]}" \
+        `# (default) image controller FIRST: the kernel's nvme probe takes the` \
+        `# first controller it finds; OVMF locates the ESP by filesystem, not` \
+        `# order. With --gpt a single disk carries both ESP and ext4.` \
         `# xHCI controller present (the honest modern-laptop bus, for the future` \
         `# xHCI driver to probe) but NO usb-kbd: QEMU routes keyboard input to a` \
         `# USB keyboard when one exists, and with no xHCI driver those keys` \

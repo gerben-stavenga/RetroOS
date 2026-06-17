@@ -252,11 +252,76 @@ fn probe_audio(machine: &mut crate::TheArch) -> Audio {
     Audio::EmulatedSilent
 }
 
-/// Scan the MBR (4 entries at 0x1BE) for the ext4 root (type 0x83) and
-/// probe the hostfs COM1 transport. The 0xDA boot-bundle partition is the
-/// legacy bootloader's business — the kernel ignores it. With no block
-/// device, `read_sectors` leaves the buffer zeroed and the scan finds
-/// nothing — the same verdict path as an empty disk.
+/// True if sector 0 is a GPT *protective* MBR — a single entry of type 0xEE
+/// covering the disk. GPT disks (every UEFI machine) put this at LBA 0 so
+/// legacy tooling leaves the real layout alone; it also means the 0x83 scan
+/// finds nothing, which is why a real laptop probes as Diskless.
+fn is_protective_mbr(mbr: &[u8; 512]) -> bool {
+    (0..4).any(|i| mbr[0x1BE + i * 16 + 4] == 0xEE)
+}
+
+/// Confirm the partition starting at `lba` is ext2/3/4 by its superblock magic:
+/// 0xEF53 lives at byte 1080 of the partition (superblock at 1024, s_magic at
+/// +0x38) → sector lba+2, offset 56. GUID-agnostic, so it catches any ext root
+/// regardless of how the partition was typed.
+fn is_ext_partition(lba: u32) -> bool {
+    let mut sb = [0u8; 512];
+    crate::kernel::block::read_sectors(lba + 2, &mut sb);
+    u16::from_le_bytes([sb[56], sb[57]]) == 0xEF53
+}
+
+/// Walk the GPT and return the first-LBA of an ext* partition, or None.
+///
+/// LBA 1 holds the header (signature "EFI PART", then the partition-array LBA,
+/// entry count and entry stride); the array follows. We read it a sector at a
+/// time and probe each non-empty entry's superblock. Assumes 512-byte sectors
+/// (the only size `block::read_sectors` handles — a 4K-formatted NVMe is
+/// rejected earlier in the driver); partition starts past 4 GiB-sectors don't
+/// fit our u32 LBA and are skipped, which never happens on a real laptop root.
+fn gpt_find_ext() -> Option<u32> {
+    let mut hdr = [0u8; 512];
+    crate::kernel::block::read_sectors(1, &mut hdr);
+    if &hdr[0..8] != b"EFI PART" {
+        return None;
+    }
+    let entry_lba = u64::from_le_bytes(hdr[0x48..0x50].try_into().unwrap());
+    let num_entries = u32::from_le_bytes(hdr[0x50..0x54].try_into().unwrap()).min(256) as usize;
+    let entry_size = u32::from_le_bytes(hdr[0x54..0x58].try_into().unwrap()) as usize;
+    // Standard entries are 128 bytes (4 per 512-byte sector) and never straddle
+    // a sector. Bail on anything that doesn't divide a sector cleanly.
+    if entry_size == 0 || entry_lba == 0 || entry_lba > u32::MAX as u64 || 512 % entry_size != 0 {
+        return None;
+    }
+    let per_sector = 512 / entry_size;
+    let sectors = num_entries.div_ceil(per_sector);
+    let mut buf = [0u8; 512];
+    for s in 0..sectors {
+        crate::kernel::block::read_sectors(entry_lba as u32 + s as u32, &mut buf);
+        for e in 0..per_sector {
+            let off = e * entry_size;
+            // Type GUID all-zero ⇒ unused slot.
+            if buf[off..off + 16].iter().all(|&b| b == 0) {
+                continue;
+            }
+            let first_lba = u64::from_le_bytes(buf[off + 32..off + 40].try_into().unwrap());
+            if first_lba == 0 || first_lba > u32::MAX as u64 {
+                continue;
+            }
+            if is_ext_partition(first_lba as u32) {
+                return Some(first_lba as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Find the ext4 root and probe the hostfs COM1 transport. First the MBR (4
+/// entries at 0x1BE, type 0x83 — the RetroOS image / legacy disks); if that's
+/// empty and sector 0 is a GPT protective MBR (a real UEFI disk), walk the GPT
+/// for an ext* partition instead. The 0xDA boot-bundle partition is the legacy
+/// bootloader's business — the kernel ignores it. With no block device,
+/// `read_sectors` leaves the buffer zeroed and every scan finds nothing — the
+/// same verdict path as an empty disk.
 fn probe_media(machine: &mut crate::TheArch) -> Media {
     let _ = machine;
     let hostfs = crate::kernel::hostfs::init();
@@ -269,6 +334,10 @@ fn probe_media(machine: &mut crate::TheArch) -> Media {
         if mbr[base + 4] == 0x83 {
             ext4_lba = Some(u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap()));
         }
+    }
+    // Real UEFI disk: protective MBR, no 0x83 — walk the GPT for the ext root.
+    if ext4_lba.is_none() && is_protective_mbr(&mbr) {
+        ext4_lba = gpt_find_ext();
     }
 
     if let Some(ext4_lba) = ext4_lba {
