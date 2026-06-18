@@ -1085,9 +1085,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         // AH=0x3B: Change directory (DS:DX=ASCIIZ path)
         0x3B => {
             let addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-            let mut path = [0u8; 64];
+            let mut path = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
-            while i < 63 {
+            while i < dfs::DFS_PATH_MAX - 1 {
                 let ch = regs.read::<u8>(((addr + i as u32)) as usize);
                 if ch == 0 { break; }
                 path[i] = ch;
@@ -1107,9 +1107,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         // AH=0x3D: Open file (DS:DX=ASCIIZ filename, AL=access mode)
         0x3D => {
             let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-            let mut name = [0u8; 64];
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
-            while i < 63 {
+            while i < dfs::DFS_PATH_MAX - 1 {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
@@ -1417,9 +1417,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         // AH=0x3C: Create file (CX=attr, DS:DX=filename) — RAM-backed via VFS overlay
         0x3C => {
             let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-            let mut name = [0u8; 64];
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
-            while i < 63 {
+            while i < dfs::DFS_PATH_MAX - 1 {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
@@ -1513,9 +1513,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
             { let mut hex = [0u8; 32];
               for j in 0..16usize { let b = regs.read::<u8>(addr as usize + j); hex[j*2] = b"0123456789ABCDEF"[(b>>4) as usize]; hex[j*2+1] = b"0123456789ABCDEF"[(b&0xF) as usize]; }
               dos_trace!("D21 43 addr={:08X} hex={}", addr, core::str::from_utf8(&hex).unwrap()); }
-            let mut name = [0u8; 64];
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
-            while i < 63 {
+            while i < dfs::DFS_PATH_MAX - 1 {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
@@ -1967,9 +1967,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         // AH=0x41: Delete file (DS:DX=filename)
         0x41 => {
             let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
-            let mut name = [0u8; 64];
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
-            while i < 63 {
+            while i < dfs::DFS_PATH_MAX - 1 {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
@@ -2084,9 +2084,9 @@ fn int_21h(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos: &mu
         0x6C => {
             let action = regs.rdx as u16;
             let mut addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
-            let mut name = [0u8; 64];
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
-            while i < 63 {
+            while i < dfs::DFS_PATH_MAX - 1 {
                 let ch = regs.read::<u8>((addr) as usize);
                 if ch == 0 { break; }
                 name[i] = ch;
