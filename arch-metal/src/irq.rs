@@ -406,7 +406,10 @@ pub fn init_interrupts() {
     // way — routed through the IOAPIC in APIC mode, the PIC otherwise. A truly
     // legacy-free box (no i8042) needs the xHCI USB-HID driver (not yet here).
     if !i8042_present() {
-        lib::println!("IRQ: no i8042 (USB-HID keyboard not yet supported)");
+        // Legacy-free laptop: no PS/2 controller. The keyboard comes from the
+        // xHCI USB-HID driver (initialised above), polled from the timer IRQ —
+        // nothing more to route here.
+        lib::println!("IRQ: no i8042 - keyboard via USB-HID (xHCI)");
         return;
     }
 

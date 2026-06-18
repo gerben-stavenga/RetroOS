@@ -101,7 +101,10 @@ const EP0_OFF: usize = 0x6000; // default control endpoint transfer ring
 const XFER_OFF: usize = 0x7000; // control-transfer data buffer (descriptors)
 const INT_OFF: usize = 0x8000; // interrupt-IN endpoint transfer ring
 const REPORT_OFF: usize = 0x9000; // HID boot report buffer (8 bytes)
-const DMA_PAGES: usize = 10;
+const SCRATCH_OFF: usize = 0xA000; // scratchpad buffer array (DCBAA[0])
+const SCRATCH_BUF_OFF: usize = 0xB000; // scratchpad buffers (zeroed, in-region)
+const SCRATCH_BUFS_MAX: usize = 8; // reserve this many; assert the HC needs <=
+const DMA_PAGES: usize = 11 + SCRATCH_BUFS_MAX;
 const RING_TRBS: usize = 256;
 
 // Operational/runtime register offsets, relative to their region base.
@@ -312,6 +315,31 @@ fn bringup(op: usize, rt: usize, max_slots: u32) -> bool {
     w32(op + OP_CONFIG, max_slots);
     w64(op + OP_DCBAAP, phys + DCBAA_OFF as u64);
 
+    // Scratchpad buffers. HCSPARAMS2 (cap reg 0x08) Max Scratchpad Buffers =
+    // Hi(25:21)<<5 | Lo(31:27). A real controller REQUIRES the driver to hand it
+    // that many page-sized buffers, with their pointer array in DCBAA[0]; given
+    // none, it enumerates and runs control transfers but never services the
+    // periodic schedule — interrupt endpoints stay Running yet transfer nothing.
+    // QEMU asks for zero, which is why this was invisible until real silicon.
+    let hcsp2 = r32(0x08);
+    let scratch = ((((hcsp2 >> 21) & 0x1F) << 5) | ((hcsp2 >> 27) & 0x1F)) as usize;
+    lib::println!("xHCI: scratchpad buffers required: {}", scratch);
+    if scratch > 0 {
+        assert!(scratch <= SCRATCH_BUFS_MAX, "xhci: HC wants {} scratchpad bufs", scratch);
+        unsafe {
+            // Buffers live inside the DMA block — already zeroed (write_bytes
+            // above) and cache-disabled, matching Linux's dma_alloc_coherent.
+            // A controller can read garbage from an uninitialised scratchpad and
+            // misbehave (e.g. never service the periodic schedule).
+            let arr = (DMA_VA + SCRATCH_OFF) as *mut u64;
+            for i in 0..scratch {
+                core::ptr::write_volatile(arr.add(i), phys + (SCRATCH_BUF_OFF + i * 0x1000) as u64);
+            }
+            // DCBAA[0] is reserved for the Scratchpad Buffer Array pointer.
+            core::ptr::write_volatile((DMA_VA + DCBAA_OFF) as *mut u64, phys + SCRATCH_OFF as u64);
+        }
+    }
+
     // Command ring: a Link TRB at the end loops back to the start (TRB type 6,
     // Toggle-Cycle set). CRCR points at it with Ring-Cycle-State = 1.
     let link = (DMA_VA + CMD_OFF + (RING_TRBS - 1) * 16) as *mut u32;
@@ -440,10 +468,21 @@ fn configure_endpoint(
         core::ptr::write_bytes(inctx as *mut u8, 0, 0x1000);
         // Input Control Context: add Slot (bit 0) + this endpoint (bit dci).
         core::ptr::write_volatile((inctx + 4) as *mut u32, 1 | (1 << dci));
-        // Slot Context: Context Entries = dci (highest), Speed, Root-Hub Port.
+        // Slot Context: COPY the controller's live output slot context, then only
+        // bump Context Entries to the new highest DCI. Address Device fills in
+        // derived fields (TT hub/port, routing, speed) needed to run split
+        // transactions to a full-speed device on the high-speed root hub; a fresh
+        // slot context (speed/port only) zeroes those, and the re-evaluation then
+        // leaves the endpoint "Running" but never polled — no transfers at all.
+        let _ = (speed, port);
         let slotc = inctx + stride;
-        core::ptr::write_volatile(slotc as *mut u32, (dci << 27) | (speed << 20));
-        core::ptr::write_volatile((slotc + 4) as *mut u32, port << 16);
+        core::ptr::copy_nonoverlapping(
+            (DMA_VA + DEVCTX_OFF) as *const u8,
+            slotc as *mut u8,
+            stride,
+        );
+        let dw0 = core::ptr::read_volatile(slotc as *const u32) & !(0x1F << 27);
+        core::ptr::write_volatile(slotc as *mut u32, dw0 | (dci << 27));
         // Endpoint Context at (1 + dci) * stride: Interval (16:23); EP Type =
         // Interrupt IN (7) at 3:5, Max Packet Size (16:31), CErr = 3 (1:2); TR
         // Dequeue Pointer with DCS = 1.
@@ -528,7 +567,8 @@ static mut INT_CYCLE: u32 = 1;
 static mut READY: bool = false;
 static mut KBD_SLOT: u32 = 0;
 static mut KBD_DCI: u32 = 0;
-static mut PREV: [u8; 8] = [0; 8];
+static mut KBD_REPORT_LEN: usize = 8; // 8 = boot kbd; >8 = report-ID kbd (e.g. 16)
+static mut PREV: [u8; 16] = [0; 16];
 
 /// Queue one Normal TRB on the interrupt-IN ring (8-byte report buffer, IOC) and
 /// ring the endpoint's doorbell so the controller polls the keyboard once.
@@ -536,7 +576,7 @@ fn arm_report() {
     unsafe {
         let trb = (DMA_VA + INT_OFF + INT_ENQ * 16) as *mut u32;
         core::ptr::write_volatile(trb as *mut u64, DMA_PHYS + REPORT_OFF as u64);
-        core::ptr::write_volatile(trb.add(2), 8);
+        core::ptr::write_volatile(trb.add(2), KBD_REPORT_LEN as u32);
         core::ptr::write_volatile(trb.add(3), (1 << 5) | (1 << 10) | INT_CYCLE); // IOC, Normal
         INT_ENQ += 1;
         if INT_ENQ == RING_TRBS - 1 {
@@ -585,27 +625,41 @@ fn emit_key(sc: u8, extended: bool, release: bool) {
     crate::irq::push_key(if release { sc | 0x80 } else { sc });
 }
 
-/// Diff an 8-byte HID boot report against the previous one and push make/break
+/// Diff a HID keyboard report against the previous one and push make/break
 /// scancodes into the shared IRQ queue, just like the i8042 IRQ1 handler.
-fn process_report(r: &[u8; 8]) {
+///
+/// Two layouts, distinguished by `len`:
+///   - 8 (boot keyboard): `[mods, reserved, k1..k6]` — modifiers at byte 0.
+///   - >8 (report-ID keyboard, e.g. the Razer's interface 1, 16 bytes):
+///     `[report-id, mods, k1..k14]` — report id at byte 0 (only id 1 is the
+///     keyboard; consumer/system reports share the endpoint), modifiers at
+///     byte 1. In both, the keycode array starts at byte 2.
+fn process_report(r: &[u8; 16], len: usize) {
+    let id_prefixed = len > 8;
+    if id_prefixed && r[0] != 1 {
+        return; // not the keyboard report (consumer control, etc.)
+    }
+    let mod_off = if id_prefixed { 1 } else { 0 };
     let prev = unsafe { PREV };
-    // Modifier keys (byte 0): one make/break per changed bit.
+    let keys = &r[2..len];
+    let prev_keys = &prev[2..len];
+    // Modifier keys: one make/break per changed bit.
     for b in 0..8 {
-        let (now, was) = (r[0] & (1 << b), prev[0] & (1 << b));
+        let (now, was) = (r[mod_off] & (1 << b), prev[mod_off] & (1 << b));
         if now != was && MOD_SC[b] != 0 {
             crate::irq::push_key(if now != 0 { MOD_SC[b] } else { MOD_SC[b] | 0x80 });
         }
     }
-    // Regular keys (bytes 2-7): newly present → make; newly absent → break.
-    for &k in &r[2..8] {
-        if k >= 4 && !prev[2..8].contains(&k) {
+    // Regular keys: newly present → make; newly absent → break.
+    for &k in keys {
+        if k >= 4 && !prev_keys.contains(&k) {
             if let Some((sc, ext)) = hid_to_scancode(k) {
                 emit_key(sc, ext, false);
             }
         }
     }
-    for &k in &prev[2..8] {
-        if k >= 4 && !r[2..8].contains(&k) {
+    for &k in prev_keys {
+        if k >= 4 && !keys.contains(&k) {
             if let Some((sc, ext)) = hid_to_scancode(k) {
                 emit_key(sc, ext, true);
             }
@@ -620,13 +674,14 @@ pub fn poll() {
     if !unsafe { READY } {
         return;
     }
+    let len = unsafe { KBD_REPORT_LEN };
     while let Some((ttype, _, _)) = try_event() {
         if ttype == 32 {
-            let mut r = [0u8; 8];
-            for (i, b) in r.iter_mut().enumerate() {
+            let mut r = [0u8; 16];
+            for (i, b) in r.iter_mut().take(len).enumerate() {
                 *b = unsafe { core::ptr::read_volatile((DMA_VA + REPORT_OFF + i) as *const u8) };
             }
-            process_report(&r);
+            process_report(&r, len);
             arm_report();
         }
     }
@@ -685,12 +740,12 @@ fn address_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<u32> 
     Some(slot)
 }
 
-/// Address the device on `port`, read its configuration descriptor, and record
-/// which HID roles (boot keyboard / mouse) it exposes and on which endpoints.
-/// The slot is released before returning — selection re-addresses the chosen
-/// device. None if the device can't even be addressed.
-fn classify_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<PortDevice> {
-    let slot = address_port(op, port, speed, stride)?;
+/// Read the configuration descriptor of an ALREADY-ADDRESSED device (its slot
+/// still live, the 8-byte device descriptor still in XFER) and record which HID
+/// roles (boot keyboard / mouse) it exposes and on which endpoints. The slot is
+/// left addressed so the caller can arm it in place — no re-address, which on a
+/// full-speed device can leave it configured-but-silent.
+fn classify_addressed(slot: u32, port: u32, speed: u32) -> PortDevice {
     let rd = |o: usize| unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + o) as *const u8) as u32 };
     let dev_class = rd(4); // bDeviceClass from the 8-byte device descriptor
     let mut dev = PortDevice { port, speed, dev_class, cfg_value: 0, keyboard: None, mouse: None };
@@ -699,7 +754,7 @@ fn classify_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<Port
     if control(slot, 0x80, 0x06, 0x0200, 0, 255) {
         dev.cfg_value = rd(5);
         let total = ((rd(2) | (rd(3) << 8)) as usize).min(255);
-        let (mut cur_iface, mut is_bootkbd, mut is_mouse) = (0u32, false, false);
+        let (mut cur_iface, mut is_kbd, mut is_mouse) = (0u32, false, false);
         let mut i = rd(0) as usize;
         while i + 2 <= total {
             let (blen, btype) = (rd(i) as usize, rd(i + 1));
@@ -707,10 +762,16 @@ fn classify_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<Port
                 break;
             }
             if btype == 4 {
-                // interface: HID(3)/boot(1)/keyboard(1) vs HID(3)/*/mouse(2)
+                // interface: HID(3)/keyboard(proto 1) vs HID(3)/mouse(proto 2).
+                // A composite keyboard has both a boot interface (subclass 1,
+                // small report) and the real keyboard (subclass 0, larger
+                // report). We accept any keyboard-protocol interface and below
+                // keep the one with the LARGEST report — the real keyboard,
+                // which is the one the device actually reports keys on. (The
+                // boot interface sits idle outside boot protocol.)
                 cur_iface = rd(i + 2);
-                let (cls, sub, proto) = (rd(i + 5), rd(i + 6), rd(i + 7));
-                is_bootkbd = cls == 3 && sub == 1 && proto == 1;
+                let (cls, proto) = (rd(i + 5), rd(i + 7));
+                is_kbd = cls == 3 && proto == 1;
                 is_mouse = cls == 3 && proto == 2;
             } else if btype == 5 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
                 // interrupt-IN endpoint — attribute it to the current role
@@ -720,7 +781,7 @@ fn classify_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<Port
                     mps: rd(i + 4) | (rd(i + 5) << 8),
                     interval: rd(i + 6),
                 };
-                if is_bootkbd && dev.keyboard.is_none() {
+                if is_kbd && dev.keyboard.map_or(true, |k: EpInfo| ep.mps > k.mps) {
                     dev.keyboard = Some(ep);
                 }
                 if is_mouse && dev.mouse.is_none() {
@@ -730,29 +791,28 @@ fn classify_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<Port
             i += blen;
         }
     }
-    disable_slot(slot); // free the slot; selection re-addresses the chosen device
-    Some(dev)
+    dev
 }
 
-/// Re-address the keyboard device, switch its HID interface to boot protocol,
-/// configure the interrupt endpoint, and arm the first report. False on failure
-/// (slot released).
-fn arm_keyboard(op: usize, dev: &PortDevice, stride: usize) -> bool {
-    let Some(kb) = dev.keyboard else {
-        return false;
-    };
-    let Some(slot) = address_port(op, dev.port, dev.speed, stride) else {
-        return false;
-    };
+/// Switch the keyboard's HID interface to boot protocol, configure its interrupt
+/// endpoint, and arm the first report — on the slot it was ALREADY addressed on
+/// (no re-address). False on failure.
+fn arm_on_slot(slot: u32, dev: &PortDevice, kb: EpInfo, stride: usize) -> bool {
     control(slot, 0x00, 0x09, dev.cfg_value, 0, 0); // SET_CONFIGURATION
-    control(slot, 0x21, 0x0B, 0, kb.iface, 0); // SET_PROTOCOL = boot
+    // NOTE: deliberately NOT forcing boot protocol. Linux's usbhid leaves the
+    // device in its default report protocol; some gaming keyboards go silent on
+    // their interrupt endpoint in boot mode. Interface 0 (the boot keyboard) has
+    // the standard 8-byte report layout either way, so process_report still works.
     control(slot, 0x21, 0x0A, 0, kb.iface, 0); // SET_IDLE = 0 (report on change)
-    // xHCI interval: high/super speed gives the exponent directly; full/low we
-    // approximate (~8ms — fine for a keyboard).
+    // xHCI Interval (period = 2^Interval × 125µs). High/super speed: the
+    // descriptor's bInterval is already the exponent+1. Full/low speed: bInterval
+    // is in 1ms frames, so the exponent = 3 + floor(log2(bInterval)) (bInterval 1
+    // → 3 = 1ms). A wrong full-speed interval keeps the controller from
+    // scheduling the endpoint at all (QEMU ignored it; real silicon doesn't).
     let interval = if dev.speed >= 3 {
         kb.interval.saturating_sub(1).clamp(3, 15)
     } else {
-        6
+        (3 + (31 - kb.interval.max(1).leading_zeros())).clamp(3, 10)
     };
     if !configure_endpoint(slot, dev.port, dev.speed, kb.ep, kb.mps, interval, stride) {
         return false;
@@ -760,6 +820,9 @@ fn arm_keyboard(op: usize, dev: &PortDevice, stride: usize) -> bool {
     unsafe {
         KBD_SLOT = slot;
         KBD_DCI = kb.ep * 2 + 1;
+        // The interrupt report is the endpoint's max packet size (8 for a boot
+        // keyboard, 16 for the Razer's report-ID keyboard), capped to our buffer.
+        KBD_REPORT_LEN = (kb.mps as usize).clamp(8, 16);
         READY = true;
     }
     arm_report();
@@ -814,37 +877,36 @@ pub fn init() {
     }
     lib::println!("xHCI: running (slots={} ports={})", max_slots, max_ports);
 
-    // Classification pass: enumerate EVERY connected port once and record what
-    // each device is. A laptop's xHCI carries several devices (here: the
-    // keyboard on port 4, a Bluetooth radio on port 5). The old scan kept the
-    // LAST connected port and so addressed the Bluetooth radio — which has its
-    // own interrupt endpoints and enumerates fine, hence "ready" but no keys.
-    // Build the full inventory first; selection then picks the keyboard.
-    let mut ports: [Option<PortDevice>; 16] = [None; 16];
-    let mut n = 0;
+    // Enumerate each connected port ONCE: address it, classify what it is, and —
+    // if it's a boot keyboard — arm it in place on that same slot (no
+    // re-address). Non-keyboards (e.g. the Bluetooth radio) are released so the
+    // shared device context is free for the next port. We stop at the first
+    // keyboard. (Full multi-device inventory needs per-slot device contexts;
+    // that's a later change — for now this avoids the re-address entirely.)
+    let mut armed = false;
     for p in 1..=max_ports {
         let portsc = r32(op + OP_PORTSC + (p as usize - 1) * 0x10);
         if portsc & 1 == 0 {
             continue; // CCS = 0: nothing connected
         }
         let speed = (portsc >> 10) & 0xF; // 1=full 2=low 3=high 4=super
-        if let Some(dev) = classify_port(op, p, speed, stride) {
-            lib::println!(
-                "xHCI: port {} speed {} class {} keyboard={} mouse={}",
-                p, speed, dev.dev_class, dev.keyboard.is_some(), dev.mouse.is_some()
-            );
-            if n < ports.len() {
-                ports[n] = Some(dev);
-                n += 1;
+        let Some(slot) = address_port(op, p, speed, stride) else {
+            continue;
+        };
+        let dev = classify_addressed(slot, p, speed);
+        lib::println!(
+            "xHCI: port {} speed {} class {} keyboard={} mouse={}",
+            p, speed, dev.dev_class, dev.keyboard.is_some(), dev.mouse.is_some()
+        );
+        if let Some(kb) = dev.keyboard {
+            if arm_on_slot(slot, &dev, kb, stride) {
+                armed = true;
+                break;
             }
         }
+        disable_slot(slot); // not a keyboard (or arm failed) — free the slot
     }
-
-    // Selection: arm the first device that presents a boot keyboard. (The mouse
-    // is a future selection from the same inventory.)
-    match ports[..n].iter().flatten().find(|d| d.keyboard.is_some()) {
-        Some(dev) if arm_keyboard(op, dev, stride) => {}
-        Some(_) => lib::println!("xHCI: keyboard found but setup failed"),
-        None => lib::println!("xHCI: no keyboard among {} device(s)", n),
+    if !armed {
+        lib::println!("xHCI: no keyboard found");
     }
 }
