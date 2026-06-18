@@ -336,8 +336,10 @@ entry_wrapper_64:
     mov ebx, 1
 
     ; Far jump to 32-bit common_call (indirect via memory; direct far jmp
-    ; is invalid in long mode).
-    jmp far [rel far_ptr_32]
+    ; is invalid in long mode). MUST be the m16:32 form (`dword`): a REX.W
+    ; m16:64 far jmp to a compat (L=0) segment triple-faults on AMD (verified
+    ; on a Blade 14 under KVM); TCG/Bochs accept it, which hid this for years.
+    jmp far dword [rel far_ptr_32]
 
 exit_interrupt_64:
     ; Restore FS/GS in the inverse format chosen on entry. CS sits at
@@ -429,6 +431,35 @@ syscall_entry_64:
 ; -----------------------------------------------------------------------------
 align 8
 far_ptr_32:
-    dq common_call          ; 64-bit offset (used from 64-bit mode, m16:64)
+    dd common_call          ; 32-bit offset (m16:32 — see jmp far dword above)
     dw 0x08                 ; 32-bit code segment
+
+; -----------------------------------------------------------------------------
+; zero_rsp_high — clear the high 32 bits of RSP after entering compat mode.
+; In compat mode the kernel runs on ESP and RSP[63:32] is never cleared (compat
+; 32-bit ops don't zero-extend), so it retains whatever was there — on the UEFI
+; path that's garbage from 64-bit OVMF. A long-mode interrupt pushes its frame
+; using the FULL 64-bit RSP → non-canonical address → triple fault on the first
+; IRQ. Briefly enter 64-bit mode and run `mov esp, esp` (64-bit mode DOES zero-
+; extend) to clear RSP[63:32], then return to compat; subsequent compat stack
+; ops preserve the now-zero high half.
+; Callable from compat Rust: `extern "C" fn zero_rsp_high()`.
+; -----------------------------------------------------------------------------
+[bits 32]
+global zero_rsp_high
+zero_rsp_high:
+    jmp 0x10:zrh_64
+.back:
+    ret
+
+[bits 64]
+zrh_64:
+    mov esp, esp            ; zero-extends ESP → clears RSP[63:32]
+    jmp far dword [rel zrh_ret_ptr]   ; m16:32 (REX.W m16:64 triple-faults on AMD)
+
+[bits 32]
+align 8
+zrh_ret_ptr:
+    dd zero_rsp_high.back   ; 32-bit offset (m16:32)
+    dw 0x08                 ; compat code segment
 

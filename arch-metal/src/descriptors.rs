@@ -414,6 +414,9 @@ pub static mut TSS64: Tss = Tss::new();
 // Mode-agnostic encoding: the same table serves both IDT32 and IDT64.
 unsafe extern "C" {
     static int_vector: [u64; 256];
+    // Briefly enters 64-bit mode to zero RSP[63:32], then returns to compat.
+    // Called from toggle_mode after the switch — see the comment there.
+    fn zero_rsp_high();
 }
 
 /// Scratch slot for SYSCALL entry to stash user RSP before switching stacks.
@@ -664,10 +667,20 @@ unsafe extern "fastcall" {
 pub fn toggle_mode(new_cr3: u32) {
     x86::cli();
     unsafe { toggle_prot_compat(new_cr3); }
-    // Reload IDT/TSS based on current mode (check EFER.LMA)
+    // Reload IDT/TSS for the new mode. The long-mode reload runs HERE, in compat
+    // mode (LMA=1), so a 32-bit lidt zero-extends the base into the now-64-bit
+    // IDTR.
     let efer = x86::rdmsr(x86::EFER_MSR);
     if efer & x86::efer::LMA != 0 {
         load_long_mode_descriptors();
+        // Clear RSP[63:32] before enabling interrupts. UEFI/OVMF runs in 64-bit
+        // mode before GRUB drops to 32-bit, leaving garbage in the high half of
+        // RSP that 32-bit/compat code never clears. The kernel runs on ESP in
+        // compat mode, but a long-mode interrupt pushes its frame on the FULL
+        // 64-bit RSP — garbage high bits make that push non-canonical and the
+        // CPU triple-faults on the first IRQ. A brief 64-bit `mov esp, esp`
+        // zero-extends it; compat stack ops then preserve the zero high half.
+        unsafe { zero_rsp_high(); }
     } else {
         load_prot_mode_descriptors();
     }
