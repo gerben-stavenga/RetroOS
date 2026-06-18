@@ -365,6 +365,13 @@ fn init_ep0_ring() {
         let link = (DMA_VA + EP0_OFF + (RING_TRBS - 1) * 16) as *mut u32;
         core::ptr::write_volatile(link as *mut u64, DMA_PHYS + EP0_OFF as u64);
         core::ptr::write_volatile(link.add(3), (6 << 10) | (1 << 1));
+        // Reset the producer cursor to match the fresh ring: Address Device sets
+        // the new slot's EP0 TR-dequeue pointer to offset 0 with DCS=1, so
+        // control() must enqueue from offset 0 with cycle 1. Without this, a
+        // SECOND device (cursor left advanced by the first) enqueues where the
+        // controller isn't reading, and every control transfer times out.
+        EP0_ENQ = 0;
+        EP0_CYCLE = 1;
     }
 }
 
@@ -444,6 +451,15 @@ fn configure_endpoint(
         core::ptr::write_volatile(epc as *mut u32, interval << 16);
         core::ptr::write_volatile((epc + 4) as *mut u32, (mps << 16) | (7 << 3) | (3 << 1));
         core::ptr::write_volatile((epc + 8) as *mut u64, (DMA_PHYS + INT_OFF as u64) | 1);
+        // DW4: Average TRB Length (0:15) + Max ESIT Payload (16:31). A real
+        // xHCI uses Max ESIT Payload to reserve periodic-schedule bandwidth for
+        // an interrupt endpoint; left 0, an Intel/AMD controller *accepts*
+        // Configure Endpoint (so we print "keyboard ready") but allocates zero
+        // bandwidth and never services the endpoint — reports never arrive.
+        // QEMU doesn't model periodic scheduling, which is why high-speed worked
+        // with this field missing. For a boot keyboard both equal the report
+        // size (Max ESIT Payload = MPS × (MaxBurst+1) = mps × 1).
+        core::ptr::write_volatile((epc + 16) as *mut u32, (mps << 16) | mps);
     }
     let inctx_phys = unsafe { DMA_PHYS } + INCTX_OFF as u64;
     ring_cmd(inctx_phys, 0, (12 << 10) | (slot << 24));
@@ -459,13 +475,23 @@ fn evaluate_ep0_mps(slot: u32, mps: u32, stride: usize) -> bool {
     unsafe {
         let inctx = DMA_VA + INCTX_OFF;
         core::ptr::write_bytes(inctx as *mut u8, 0, 0x1000);
+        // Copy the controller's live Slot + EP0 output contexts into the input
+        // context before patching MPS. A real xHCI requires a valid input Slot
+        // Context for Evaluate Context (matches Linux xhci_check_maxpacket) —
+        // zeroing it made the command a silent no-op on the laptop, so the
+        // config descriptor read still ran at the addressed MPS 8 and babbled.
+        core::ptr::copy_nonoverlapping(
+            (DMA_VA + DEVCTX_OFF) as *const u8,
+            (inctx + stride) as *mut u8,
+            2 * stride,
+        );
         // Input Control Context: add EP0 (bit 1) only.
         core::ptr::write_volatile((inctx + 4) as *mut u32, 0x2);
-        // EP0 Context (DCI 1, at 2*stride): Control(4), new MPS, CErr=3; keep
-        // the same TR Dequeue Pointer (DCS=1).
+        // EP0 Context (DCI 1, at 2*stride): patch only Max Packet Size (16:31),
+        // preserving the copied EP type / CErr / TR Dequeue Pointer.
         let ep0 = inctx + 2 * stride;
-        core::ptr::write_volatile((ep0 + 4) as *mut u32, (mps << 16) | (4 << 3) | (3 << 1));
-        core::ptr::write_volatile((ep0 + 8) as *mut u64, (DMA_PHYS + EP0_OFF as u64) | 1);
+        let dw1 = core::ptr::read_volatile((ep0 + 4) as *const u32) & 0x0000_FFFF;
+        core::ptr::write_volatile((ep0 + 4) as *mut u32, (mps << 16) | dw1);
     }
     let inctx_phys = unsafe { DMA_PHYS } + INCTX_OFF as u64;
     ring_cmd(inctx_phys, 0, (13 << 10) | (slot << 24));
@@ -606,6 +632,144 @@ pub fn poll() {
     }
 }
 
+/// One enumerated interrupt-IN endpoint (a HID role's report pipe).
+#[derive(Clone, Copy)]
+struct EpInfo {
+    iface: u32,
+    ep: u32,
+    mps: u32,
+    interval: u32,
+}
+
+/// Classification of one connected root-hub port, built once during init. The
+/// inventory separates enumeration (what's on each port) from role selection
+/// (which device drives the keyboard / mouse), so a multi-device xHCI is probed
+/// once and the keyboard — or later the mouse — is chosen from the table.
+#[derive(Clone, Copy)]
+struct PortDevice {
+    port: u32,
+    speed: u32,
+    dev_class: u32,           // bDeviceClass (0xE0 = Bluetooth, 0 = composite, …)
+    cfg_value: u32,           // bConfigurationValue for SET_CONFIGURATION
+    keyboard: Option<EpInfo>, // HID boot-keyboard interrupt-IN endpoint, if any
+    mouse: Option<EpInfo>,    // HID mouse interrupt-IN endpoint, if any
+}
+
+/// Disable Slot (TRB type 10): release a slot so the device on its port is no
+/// longer bound to it. Classification frees each slot after reading descriptors,
+/// so selection can re-address the chosen device cleanly. (The single shared
+/// device context means only one device can be live at a time anyway.)
+fn disable_slot(slot: u32) {
+    ring_cmd(0, 0, (10 << 10) | (slot << 24));
+    wait_event(33);
+}
+
+/// Reset the port, enable a slot, address the device, and correct EP0's max
+/// packet size for full-speed devices. Returns the slot id, or None on failure.
+fn address_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<u32> {
+    reset_port(op, port);
+    let slot = enable_slot()?;
+    if !address_device(slot, port, speed, stride) {
+        return None;
+    }
+    // We address with the safe minimum MPS 8; read bMaxPacketSize0 (fits one
+    // 8-byte packet) and, if larger, update EP0 before any bigger transfer or a
+    // full-speed config read babbles. High-speed is always 64.
+    if !control(slot, 0x80, 0x06, 0x0100, 0, 8) {
+        return None;
+    }
+    let mps0 = unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + 7) as *const u8) } as u32;
+    if mps0 > 8 && !evaluate_ep0_mps(slot, mps0, stride) {
+        return None;
+    }
+    Some(slot)
+}
+
+/// Address the device on `port`, read its configuration descriptor, and record
+/// which HID roles (boot keyboard / mouse) it exposes and on which endpoints.
+/// The slot is released before returning — selection re-addresses the chosen
+/// device. None if the device can't even be addressed.
+fn classify_port(op: usize, port: u32, speed: u32, stride: usize) -> Option<PortDevice> {
+    let slot = address_port(op, port, speed, stride)?;
+    let rd = |o: usize| unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + o) as *const u8) as u32 };
+    let dev_class = rd(4); // bDeviceClass from the 8-byte device descriptor
+    let mut dev = PortDevice { port, speed, dev_class, cfg_value: 0, keyboard: None, mouse: None };
+    // Read the WHOLE config descriptor (wTotalLength can exceed 64 on a
+    // composite device) and walk its interface / endpoint descriptors.
+    if control(slot, 0x80, 0x06, 0x0200, 0, 255) {
+        dev.cfg_value = rd(5);
+        let total = ((rd(2) | (rd(3) << 8)) as usize).min(255);
+        let (mut cur_iface, mut is_bootkbd, mut is_mouse) = (0u32, false, false);
+        let mut i = rd(0) as usize;
+        while i + 2 <= total {
+            let (blen, btype) = (rd(i) as usize, rd(i + 1));
+            if blen == 0 {
+                break;
+            }
+            if btype == 4 {
+                // interface: HID(3)/boot(1)/keyboard(1) vs HID(3)/*/mouse(2)
+                cur_iface = rd(i + 2);
+                let (cls, sub, proto) = (rd(i + 5), rd(i + 6), rd(i + 7));
+                is_bootkbd = cls == 3 && sub == 1 && proto == 1;
+                is_mouse = cls == 3 && proto == 2;
+            } else if btype == 5 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
+                // interrupt-IN endpoint — attribute it to the current role
+                let ep = EpInfo {
+                    iface: cur_iface,
+                    ep: rd(i + 2) & 0x0F,
+                    mps: rd(i + 4) | (rd(i + 5) << 8),
+                    interval: rd(i + 6),
+                };
+                if is_bootkbd && dev.keyboard.is_none() {
+                    dev.keyboard = Some(ep);
+                }
+                if is_mouse && dev.mouse.is_none() {
+                    dev.mouse = Some(ep);
+                }
+            }
+            i += blen;
+        }
+    }
+    disable_slot(slot); // free the slot; selection re-addresses the chosen device
+    Some(dev)
+}
+
+/// Re-address the keyboard device, switch its HID interface to boot protocol,
+/// configure the interrupt endpoint, and arm the first report. False on failure
+/// (slot released).
+fn arm_keyboard(op: usize, dev: &PortDevice, stride: usize) -> bool {
+    let Some(kb) = dev.keyboard else {
+        return false;
+    };
+    let Some(slot) = address_port(op, dev.port, dev.speed, stride) else {
+        return false;
+    };
+    control(slot, 0x00, 0x09, dev.cfg_value, 0, 0); // SET_CONFIGURATION
+    control(slot, 0x21, 0x0B, 0, kb.iface, 0); // SET_PROTOCOL = boot
+    control(slot, 0x21, 0x0A, 0, kb.iface, 0); // SET_IDLE = 0 (report on change)
+    // xHCI interval: high/super speed gives the exponent directly; full/low we
+    // approximate (~8ms — fine for a keyboard).
+    let interval = if dev.speed >= 3 {
+        kb.interval.saturating_sub(1).clamp(3, 15)
+    } else {
+        6
+    };
+    if !configure_endpoint(slot, dev.port, dev.speed, kb.ep, kb.mps, interval, stride) {
+        return false;
+    }
+    unsafe {
+        KBD_SLOT = slot;
+        KBD_DCI = kb.ep * 2 + 1;
+        READY = true;
+    }
+    arm_report();
+    lib::println!(
+        "xHCI: keyboard ready (slot {} port {} ep {} mps {})",
+        slot, dev.port, kb.ep, kb.mps
+    );
+    true
+}
+
 /// Probe for an xHCI controller, bring it up, enumerate the keyboard, configure
 /// it for boot protocol, and arm the first report. `poll()` (driven by the
 /// timer IRQ) then streams keystrokes into the IRQ queue.
@@ -650,115 +814,37 @@ pub fn init() {
     }
     lib::println!("xHCI: running (slots={} ports={})", max_slots, max_ports);
 
-    // Find the connected root-hub port (the keyboard).
-    let (mut port, mut speed) = (0u32, 0u32);
+    // Classification pass: enumerate EVERY connected port once and record what
+    // each device is. A laptop's xHCI carries several devices (here: the
+    // keyboard on port 4, a Bluetooth radio on port 5). The old scan kept the
+    // LAST connected port and so addressed the Bluetooth radio — which has its
+    // own interrupt endpoints and enumerates fine, hence "ready" but no keys.
+    // Build the full inventory first; selection then picks the keyboard.
+    let mut ports: [Option<PortDevice>; 16] = [None; 16];
+    let mut n = 0;
     for p in 1..=max_ports {
         let portsc = r32(op + OP_PORTSC + (p as usize - 1) * 0x10);
-        if portsc & 1 != 0 {
-            port = p;
-            speed = (portsc >> 10) & 0xF; // 1=full 2=low 3=high 4=super
+        if portsc & 1 == 0 {
+            continue; // CCS = 0: nothing connected
         }
-    }
-    if port == 0 {
-        lib::println!("xHCI: no device connected");
-        return;
-    }
-
-    // Reset the port, allocate a slot, and address the device.
-    reset_port(op, port);
-    let Some(slot) = enable_slot() else {
-        lib::println!("xHCI: Enable Slot failed (usbsts={:#x})", r32(op + OP_USBSTS));
-        return;
-    };
-    if !address_device(slot, port, speed, stride) {
-        lib::println!("xHCI: Address Device failed (usbsts={:#x})", r32(op + OP_USBSTS));
-        return;
-    }
-    lib::println!("xHCI: device addressed (slot {} port {} speed {})", slot, port, speed);
-
-    // Full-speed EP0 max-packet-size correction. We addressed with the safe
-    // minimum (8). Read the first 8 bytes of the device descriptor — fits in one
-    // 8-byte packet regardless of the real MPS — then, if bMaxPacketSize0 (byte
-    // 7) differs, update EP0 before any larger transfer. High-speed reports 64
-    // and skips this; full-speed (this laptop's keyboard) needs it or the config
-    // read babbles.
-    if !control(slot, 0x80, 0x06, 0x0100, 0, 8) {
-        lib::println!("xHCI: GET device descriptor(8) failed");
-        return;
-    }
-    let mps0 = unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + 7) as *const u8) } as u32;
-    if mps0 > 8 {
-        evaluate_ep0_mps(slot, mps0, stride);
-    }
-
-    // Read the configuration descriptor and find the boot keyboard's
-    // interrupt-IN endpoint. A composite device (e.g. a gaming keyboard with
-    // separate keyboard / NKRO / consumer-control / macro HID interfaces)
-    // chains several interfaces, and the boot keyboard is rarely the first
-    // interrupt endpoint — so we read the WHOLE descriptor (wTotalLength can
-    // exceed 64 bytes) and prefer the interface that declares HID class(3) /
-    // boot subclass(1) / keyboard protocol(1). The first interrupt-IN endpoint
-    // is kept as a fallback for a plain keyboard that omits the boot subclass.
-    if !control(slot, 0x80, 0x06, 0x0200, 0, 255) {
-        lib::println!("xHCI: GET config descriptor failed");
-        return;
-    }
-    let rd = |o: usize| unsafe { core::ptr::read_volatile((DMA_VA + XFER_OFF + o) as *const u8) as u32 };
-    let cfg_value = rd(5); // bConfigurationValue
-    let total = ((rd(2) | (rd(3) << 8)) as usize).min(255);
-    // (iface, ep_num, ep_mps, ep_int) for the boot keyboard, and for any interrupt-IN.
-    let (mut kb, mut any) = ((0u32, 0u32, 8u32, 8u32), (0u32, 0u32, 8u32, 8u32));
-    let mut cur_iface = 0u32;
-    let mut cur_is_kbd = false;
-    let mut i = rd(0) as usize; // skip the config descriptor header
-    while i + 2 <= total {
-        let (blen, btype) = (rd(i) as usize, rd(i + 1));
-        if blen == 0 {
-            break;
-        }
-        if btype == 4 {
-            // interface descriptor → bInterfaceNumber + class/subclass/protocol
-            cur_iface = rd(i + 2);
-            cur_is_kbd = rd(i + 5) == 3 && rd(i + 6) == 1 && rd(i + 7) == 1;
-        } else if btype == 5 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
-            // endpoint descriptor: IN + interrupt
-            let ep = (cur_iface, rd(i + 2) & 0x0F, rd(i + 4) | (rd(i + 5) << 8), rd(i + 6));
-            if any.1 == 0 {
-                any = ep;
-            }
-            if cur_is_kbd && kb.1 == 0 {
-                kb = ep;
+        let speed = (portsc >> 10) & 0xF; // 1=full 2=low 3=high 4=super
+        if let Some(dev) = classify_port(op, p, speed, stride) {
+            lib::println!(
+                "xHCI: port {} speed {} class {} keyboard={} mouse={}",
+                p, speed, dev.dev_class, dev.keyboard.is_some(), dev.mouse.is_some()
+            );
+            if n < ports.len() {
+                ports[n] = Some(dev);
+                n += 1;
             }
         }
-        i += blen;
-    }
-    let (iface, ep_num, ep_mps, ep_int) = if kb.1 != 0 { kb } else { any };
-    if ep_num == 0 {
-        lib::println!("xHCI: no interrupt-IN endpoint found");
-        return;
     }
 
-    // Set configuration, switch the HID interface to boot protocol, idle off.
-    control(slot, 0x00, 0x09, cfg_value, 0, 0); // SET_CONFIGURATION
-    control(slot, 0x21, 0x0B, 0, iface, 0); // SET_PROTOCOL = boot
-    control(slot, 0x21, 0x0A, 0, iface, 0); // SET_IDLE = 0 (report only on change)
-
-    // xHCI Interval encoding: high/super speed already gives the exponent
-    // (microframes = 2^(bInterval-1)); full/low speed we approximate.
-    let interval = if speed >= 3 {
-        ep_int.saturating_sub(1).clamp(3, 15)
-    } else {
-        6
-    };
-    if configure_endpoint(slot, port, speed, ep_num, ep_mps, interval, stride) {
-        unsafe {
-            KBD_SLOT = slot;
-            KBD_DCI = ep_num * 2 + 1;
-            READY = true;
-        }
-        arm_report(); // queue the first interrupt-IN report
-        lib::println!("xHCI: keyboard ready (ep {} iface {} mps {}) - polling for keys", ep_num, iface, ep_mps);
-    } else {
-        lib::println!("xHCI: Configure Endpoint failed");
+    // Selection: arm the first device that presents a boot keyboard. (The mouse
+    // is a future selection from the same inventory.)
+    match ports[..n].iter().flatten().find(|d| d.keyboard.is_some()) {
+        Some(dev) if arm_keyboard(op, dev, stride) => {}
+        Some(_) => lib::println!("xHCI: keyboard found but setup failed"),
+        None => lib::println!("xHCI: no keyboard among {} device(s)", n),
     }
 }
