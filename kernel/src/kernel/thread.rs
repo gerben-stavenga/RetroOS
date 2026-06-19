@@ -417,8 +417,10 @@ impl Thread {
     }
 }
 
-/// Thread array (heap-allocated to keep large RootPageTable out of .data)
-static mut THREADS: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
+/// The thread table is no longer a global: `startup()` owns a `Vec<Thread>`
+/// (built by `init_threading`) and threads `&mut [Thread]` through the event
+/// loop and the executors. The table API below takes that slice; the live
+/// register frame lives in `ExecutionContext`, never here.
 
 /// Console stdin kpipe index (shared by all Linux processes)
 static mut CONSOLE_PIPE: u8 = 0;
@@ -427,8 +429,8 @@ pub fn set_console_pipe(idx: u8) { unsafe { CONSOLE_PIPE = idx; } }
 pub fn console_pipe() -> u8 { unsafe { CONSOLE_PIPE } }
 
 /// Check if threading system is initialized
-pub fn is_initialized() -> bool {
-    unsafe { (*(&raw const THREADS)).len() > 0 }
+pub fn is_initialized(threads: &[Thread]) -> bool {
+    !threads.is_empty()
 }
 
 pub fn prng() -> u64 {
@@ -444,56 +446,61 @@ pub fn prng() -> u64 {
 }
 
 
-/// Get thread by TID
-pub fn get_thread(tid: usize) -> Option<&'static mut Thread> {
+/// Get thread by TID. Borrow is tied to the passed slice.
+pub fn get_thread(threads: &mut [Thread], tid: usize) -> Option<&mut Thread> {
     if tid >= MAX_THREADS {
         return None;
     }
-    unsafe {
-        let thread = &mut THREADS[tid];
-        if thread.kernel.state != ThreadState::Unused {
-            Some(thread)
-        } else {
-            None
-        }
+    let thread = &mut threads[tid];
+    if thread.kernel.state != ThreadState::Unused {
+        Some(thread)
+    } else {
+        None
     }
 }
 
-/// Get mutable references to two different threads (for switch_to).
-pub fn get_two_threads(a: usize, b: usize) -> (&'static mut Thread, &'static mut Thread) {
+/// Get mutable references to two different threads (for switch_to). Safe
+/// `split_at_mut` — no aliasing, no `unsafe`.
+pub fn get_two_threads(threads: &mut [Thread], a: usize, b: usize) -> (&mut Thread, &mut Thread) {
     assert!(a != b && a < MAX_THREADS && b < MAX_THREADS);
-    unsafe {
-        let pa = &mut THREADS[a] as *mut Thread;
-        let pb = &mut THREADS[b] as *mut Thread;
-        (&mut *pa, &mut *pb)
+    if a < b {
+        let (lo, hi) = threads.split_at_mut(b);
+        (&mut lo[a], &mut hi[0])
+    } else {
+        let (lo, hi) = threads.split_at_mut(a);
+        (&mut hi[0], &mut lo[b])
     }
 }
 
 /// Create a new thread with the given root page table.
-pub fn create_thread(machine: &mut crate::TheArch, parent_tid: Option<usize>, root: crate::RootPageTable, is_process: bool) -> Option<&'static mut Thread> {
-    unsafe {
-        let parent = parent_tid.map(|tid| &THREADS[tid].kernel);
-        for i in 0..MAX_THREADS {
-            if THREADS[i].kernel.state == ThreadState::Unused {
-                let t = &mut THREADS[i];
-                let k = &mut t.kernel;
-                k.tid = i as i32;
-                k.pid = if is_process { i as i32 } else { parent.map(|p| p.pid).unwrap_or(0) };
-                k.priority = parent.map(|p| p.priority).unwrap_or(0);
-                k.parent_tid = parent.map(|p| p.tid).unwrap_or(-1);
-                k.state = ThreadState::Ready;
-                k.time = machine.get_ticks() as u32;
-                k.vcpu = crate::arch::Vcpu { regs: Regs::empty(), space: root };
-                k.fx_state = machine.clean_fx_template();
-                k.exit_code = 0;
-                k.addr_hash = 0;
-                k.cpu_hash = 0;
-                t.personality = Personality::Linux(LinuxState::new());
-                return Some(t);
-            }
+pub fn create_thread(threads: &mut [Thread], machine: &mut crate::TheArch, parent_tid: Option<usize>, root: crate::RootPageTable, is_process: bool) -> Option<&mut Thread> {
+    let (parent_pid, parent_prio, parent_tidv) = match parent_tid {
+        Some(tid) => {
+            let p = &threads[tid].kernel;
+            (p.pid, p.priority, p.tid)
         }
-        None
+        None => (0, 0, -1),
+    };
+    for i in 0..MAX_THREADS {
+        if threads[i].kernel.state == ThreadState::Unused {
+            let t = &mut threads[i];
+            let k = &mut t.kernel;
+            k.tid = i as i32;
+            k.pid = if is_process { i as i32 } else { parent_pid };
+            k.priority = parent_prio;
+            k.parent_tid = parent_tidv;
+            k.state = ThreadState::Ready;
+            k.time = machine.get_ticks() as u32;
+            k.vcpu = crate::arch::Vcpu { regs: Regs::empty(), space: root };
+            k.fx_state = machine.clean_fx_template();
+            k.exit_code = 0;
+            k.addr_hash = 0;
+            k.cpu_hash = 0;
+            t.personality = Personality::Linux(LinuxState::new());
+            return Some(t);
+        }
     }
+    None
 }
 
 /// Initialize a thread as a 32-bit user process
@@ -512,26 +519,24 @@ pub fn save_state(thread: &mut Thread, regs: &Regs) {
 }
 
 /// Block a thread (waiting for child exit).
-pub fn block_thread(tid: usize) {
-    unsafe { THREADS[tid].kernel.state = ThreadState::Blocked; }
+pub fn block_thread(threads: &mut [Thread], tid: usize) {
+    threads[tid].kernel.state = ThreadState::Blocked;
 }
 
-pub fn unblock_thread(tid: usize) {
-    unsafe {
-        if tid < MAX_THREADS && THREADS[tid].kernel.state == ThreadState::Blocked {
-            THREADS[tid].kernel.state = ThreadState::Ready;
-        }
+pub fn unblock_thread(threads: &mut [Thread], tid: usize) {
+    if tid < MAX_THREADS && threads[tid].kernel.state == ThreadState::Blocked {
+        threads[tid].kernel.state = ThreadState::Ready;
     }
 }
 
 /// Yield a thread: save regs, mark Ready, schedule next.
-pub fn yield_thread(tid: usize, regs: &crate::Regs) -> Option<usize> {
-    unsafe {
-        let k = &mut THREADS[tid].kernel;
+pub fn yield_thread(threads: &mut [Thread], tid: usize, regs: &crate::Regs) -> Option<usize> {
+    {
+        let k = &mut threads[tid].kernel;
         k.vcpu.regs = *regs;
         k.state = ThreadState::Ready;
     }
-    schedule(tid)
+    schedule(threads, tid)
 }
 
 /// Set return value in thread's saved state
@@ -541,42 +546,38 @@ pub fn set_return(thread: &mut Thread, ret: i32) {
 
 /// Schedule next thread (randomly selected from ready threads).
 /// Returns Some(idx) if a switch is needed, None to stay with current.
-pub fn schedule(current_tid: usize) -> Option<usize> {
-    unsafe {
-        let mut next_idx: usize = usize::MAX;
-        let mut count = 0u64;
+pub fn schedule(threads: &[Thread], current_tid: usize) -> Option<usize> {
+    let mut next_idx: usize = usize::MAX;
+    let mut count = 0u64;
 
-        for i in 1..MAX_THREADS {
-            if i == current_tid {
-                continue;
-            }
-            if THREADS[i].kernel.state == ThreadState::Ready {
-                count += 1;
-                if prng() % count == 0 {
-                    next_idx = i;
-                }
+    for i in 1..MAX_THREADS {
+        if i == current_tid {
+            continue;
+        }
+        if threads[i].kernel.state == ThreadState::Ready {
+            count += 1;
+            if prng() % count == 0 {
+                next_idx = i;
             }
         }
+    }
 
-        if next_idx == usize::MAX {
-            None
-        } else {
-            Some(next_idx)
-        }
+    if next_idx == usize::MAX {
+        None
+    } else {
+        Some(next_idx)
     }
 }
 
 /// Borrow another thread's `DosState` for a swap-style operation.
 /// Returns the target's DosState if the target is a DOS thread, else an errno.
-pub fn with_target_dos<F: FnOnce(&mut DosState) -> i32>(target_tid: i32, f: F) -> i32 {
+pub fn with_target_dos<F: FnOnce(&mut DosState) -> i32>(threads: &mut [Thread], target_tid: i32, f: F) -> i32 {
     if target_tid < 0 || (target_tid as usize) >= MAX_THREADS { return -22; } // EINVAL
-    unsafe {
-        let target = &mut *(&raw mut THREADS[target_tid as usize]);
-        if target.kernel.state == ThreadState::Unused { return -3; } // ESRCH
-        match &mut target.personality {
-            Personality::Dos(d) => f(d),
-            _ => -22, // target not DOS
-        }
+    let target = &mut threads[target_tid as usize];
+    if target.kernel.state == ThreadState::Unused { return -3; } // ESRCH
+    match &mut target.personality {
+        Personality::Dos(d) => f(d),
+        _ => -22, // target not DOS
     }
 }
 
@@ -598,27 +599,27 @@ pub fn take_switch_request() -> bool {
 /// Round-robin: next active thread after current (skips thread 0).
 /// Includes Blocked threads — F11 refocuses a blocked parent (VGA restore)
 /// without unblocking it. Only Unused/Zombie are skipped.
-pub fn cycle_next(current_tid: usize) -> Option<usize> {
-    unsafe {
-        let cur = current_tid;
-        for offset in 1..MAX_THREADS {
-            let i = (cur + offset) % MAX_THREADS;
-            if i == 0 { continue; }
-            match THREADS[i].kernel.state {
-                ThreadState::Ready | ThreadState::Running | ThreadState::Blocked => return Some(i),
-                _ => {}
-            }
+pub fn cycle_next(threads: &[Thread], current_tid: usize) -> Option<usize> {
+    let cur = current_tid;
+    for offset in 1..MAX_THREADS {
+        let i = (cur + offset) % MAX_THREADS;
+        if i == 0 { continue; }
+        match threads[i].kernel.state {
+            ThreadState::Ready | ThreadState::Running | ThreadState::Blocked => return Some(i),
+            _ => {}
         }
-        None
     }
+    None
 }
 
 /// Exit thread and schedule next.
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
-pub fn exit_thread(machine: &mut crate::TheArch, tid: usize, exit_code: i32) -> usize {
-    unsafe {
-        let thread = &mut THREADS[tid];
-        let parent_tid = thread.kernel.parent_tid;
+pub fn exit_thread(threads: &mut [Thread], machine: &mut crate::TheArch, tid: usize, exit_code: i32) -> usize {
+    let parent_tid = threads[tid].kernel.parent_tid;
+
+    // Tear down the dying thread (only touches threads[tid]).
+    {
+        let thread = &mut threads[tid];
         // Snapshot the dying thread's screen NOW — `arch_user_clean` below
         // unmaps 0xA0000, after which save_from_hardware would fault. The
         // snapshot stays in the zombie's slot until the parent either
@@ -628,65 +629,61 @@ pub fn exit_thread(machine: &mut crate::TheArch, tid: usize, exit_code: i32) -> 
             Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),
             Personality::Linux(_) => {}
         }
-
         thread.kernel.close_all_fds();
         thread.kernel.symbols = None;
-
         thread.kernel.exit_code = exit_code;
-
-        // Wake blocked parent and write status BEFORE arch_user_clean —
-        // the parent's stack is still accessible through COW-shared pages.
-        let mut woke_parent = false;
-        if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
-            let parent = &mut THREADS[parent_tid as usize];
-            let was_waiting = parent.kernel.state == ThreadState::Blocked;
-            if was_waiting {
-                parent.kernel.state = ThreadState::Ready;
-                match &mut parent.personality {
-                    Personality::Dos(_) => {
-                        parent.kernel.vcpu.regs.rax = parent.kernel.vcpu.regs.rax & !0xFFFF;
-                    }
-                    Personality::Linux(linux) => {
-                        parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
-                        // status_ptr was saved in sys_wait4 when parent blocked.
-                        // Just set the exit code; the deferred write happens
-                        // during thread switch when parent's address space is loaded.
-                        linux.wait_exit_code = exit_code;
-                    }
-                }
-                refresh_cpu_hash(parent);
-                woke_parent = true;
-            }
-            if let Personality::Dos(dos) = &mut parent.personality {
-                // exit_code from the DOS personality already encodes
-                // termination type in bits 8..15 (00=normal, 02=fault,
-                // 03=TSR) and AL/vector in bits 0..7 — copy verbatim.
-                dos.last_child_exit_status = exit_code as u16;
-            }
-        }
-
-        machine.free_user_pages();
-        thread.kernel.state = ThreadState::Zombie;
-        crate::dbg_println!("[mem] exit tid={} code={} free_pages={}",
-            tid, exit_code, machine.free_page_count());
-
-        // Hand focus back to the parent that spawned us — it's the
-        // natural caller of wait4. Covers both "parent was Blocked on
-        // wait4 and we just woke it" and "parent never got CPU to call
-        // wait4 yet but is Ready" (typical Rust Command::status flow:
-        // fork stays on child, parent only reaches wait4 after we exit).
-        // If the parent is gone or stuck (Blocked on something else,
-        // Zombie/Unused), fall through to the regular scheduler.
-        if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
-            let parent_state = THREADS[parent_tid as usize].kernel.state;
-            if woke_parent
-                || matches!(parent_state, ThreadState::Ready | ThreadState::Running)
-            {
-                return parent_tid as usize;
-            }
-        }
-        schedule(tid).unwrap_or(0)
     }
+
+    // Wake blocked parent and write status BEFORE arch_user_clean — the
+    // parent's stack is still accessible through COW-shared pages. Needs the
+    // dying thread and the parent borrowed at once (disjoint via split).
+    let mut woke_parent = false;
+    if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS && parent_tid as usize != tid {
+        let (thread, parent) = get_two_threads(threads, tid, parent_tid as usize);
+        let was_waiting = parent.kernel.state == ThreadState::Blocked;
+        if was_waiting {
+            parent.kernel.state = ThreadState::Ready;
+            match &mut parent.personality {
+                Personality::Dos(_) => {
+                    parent.kernel.vcpu.regs.rax = parent.kernel.vcpu.regs.rax & !0xFFFF;
+                }
+                Personality::Linux(linux) => {
+                    parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
+                    // status_ptr was saved in sys_wait4 when parent blocked.
+                    // Just set the exit code; the deferred write happens
+                    // during thread switch when parent's address space is loaded.
+                    linux.wait_exit_code = exit_code;
+                }
+            }
+            refresh_cpu_hash(parent);
+            woke_parent = true;
+        }
+        if let Personality::Dos(dos) = &mut parent.personality {
+            // exit_code from the DOS personality already encodes termination
+            // type in bits 8..15 and AL/vector in bits 0..7 — copy verbatim.
+            dos.last_child_exit_status = exit_code as u16;
+        }
+    }
+
+    machine.free_user_pages();
+    threads[tid].kernel.state = ThreadState::Zombie;
+    crate::dbg_println!("[mem] exit tid={} code={} free_pages={}",
+        tid, exit_code, machine.free_page_count());
+
+    // Hand focus back to the parent that spawned us — it's the natural caller
+    // of wait4. Covers "parent was Blocked on wait4 and we just woke it" and
+    // "parent is Ready but hasn't reached wait4 yet" (Rust Command::status:
+    // fork stays on child, parent only reaches wait4 after we exit). If the
+    // parent is gone/stuck, fall through to the regular scheduler.
+    if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
+        let parent_state = threads[parent_tid as usize].kernel.state;
+        if woke_parent
+            || matches!(parent_state, ThreadState::Ready | ThreadState::Running)
+        {
+            return parent_tid as usize;
+        }
+    }
+    schedule(threads, tid).unwrap_or(0)
 }
 
 /// Look for an exited child without reaping it. Returns (child_tid, exit_code)
@@ -694,30 +691,28 @@ pub fn exit_thread(machine: &mut crate::TheArch, tid: usize, exit_code: i32) -> 
 /// -ECHILD if no children at all. The slot stays in `Zombie` state so the
 /// caller can still inspect the child's per-personality state (e.g. DOS pulls
 /// the final VGA snapshot via `with_target_dos`) before calling `reap`.
-pub fn peek_zombie_child(current_tid: usize, pid: i32) -> (i32, i32) {
-    unsafe {
-        let current_tid = THREADS[current_tid].kernel.tid;
-        let mut has_children = false;
+pub fn peek_zombie_child(threads: &[Thread], current_tid: usize, pid: i32) -> (i32, i32) {
+    let current_tid = threads[current_tid].kernel.tid;
+    let mut has_children = false;
 
-        for i in 1..MAX_THREADS {
-            let k = &THREADS[i].kernel;
-            if k.parent_tid == current_tid && k.state != ThreadState::Unused {
-                has_children = true;
-                if k.state == ThreadState::Zombie && (pid == -1 || k.tid == pid) {
-                    return (k.tid, k.exit_code);
-                }
+    for i in 1..MAX_THREADS {
+        let k = &threads[i].kernel;
+        if k.parent_tid == current_tid && k.state != ThreadState::Unused {
+            has_children = true;
+            if k.state == ThreadState::Zombie && (pid == -1 || k.tid == pid) {
+                return (k.tid, k.exit_code);
             }
         }
-
-        if has_children { (-11, 0) } else { (-10, 0) }
     }
+
+    if has_children { (-11, 0) } else { (-10, 0) }
 }
 
 /// Recycle a Zombie thread slot. No-op if the tid isn't a zombie.
-pub fn reap(machine: &mut crate::TheArch, tid: i32) {
+pub fn reap(threads: &mut [Thread], machine: &mut crate::TheArch, tid: i32) {
     if tid < 0 || (tid as usize) >= MAX_THREADS { return; }
-    unsafe {
-        let t = &mut THREADS[tid as usize];
+    {
+        let t = &mut threads[tid as usize];
         if t.kernel.state == ThreadState::Zombie {
             // Release everything the zombie still holds — the address-space
             // object (interp: host VA reservation + page bookkeeping; metal:
@@ -735,12 +730,10 @@ pub fn reap(machine: &mut crate::TheArch, tid: i32) {
 /// Reap every zombie. The event loop calls this before returning: its
 /// contract is "no thread resources survive the loop" — callers (the DN
 /// restart loop, the cmdline sequence) never inherit zombies to clean up.
-pub fn reap_all_zombies(machine: &mut crate::TheArch) {
-    unsafe {
-        for i in 1..MAX_THREADS {
-            if THREADS[i].kernel.state == ThreadState::Zombie {
-                reap(machine, i as i32);
-            }
+pub fn reap_all_zombies(threads: &mut [Thread], machine: &mut crate::TheArch) {
+    for i in 1..MAX_THREADS {
+        if threads[i].kernel.state == ThreadState::Zombie {
+            reap(threads, machine, i as i32);
         }
     }
 }
@@ -749,9 +742,9 @@ pub fn reap_all_zombies(machine: &mut crate::TheArch) {
 /// Use when there's no per-personality state to grab from the zombie (the
 /// only current caller is Linux sys_wait4, which has nothing to retrieve
 /// once the parent has the exit code).
-pub fn waitpid(machine: &mut crate::TheArch, current_tid: usize, pid: i32) -> (i32, i32) {
-    let r = peek_zombie_child(current_tid, pid);
-    if r.0 >= 0 { reap(machine, r.0); }
+pub fn waitpid(threads: &mut [Thread], machine: &mut crate::TheArch, current_tid: usize, pid: i32) -> (i32, i32) {
+    let r = peek_zombie_child(threads, current_tid, pid);
+    if r.0 >= 0 { reap(threads, machine, r.0); }
     r
 }
 
@@ -773,22 +766,20 @@ pub fn signal_thread(thread: &Thread, fault_address: usize) {
         thread.kernel.vcpu.regs.rax, thread.kernel.vcpu.regs.rbx, thread.kernel.vcpu.regs.rcx);
 }
 
-/// Initialize threading system with init thread
-#[allow(static_mut_refs)]
-pub fn init_threading() {
-    unsafe {
-        // Allocate thread table on the heap
-        THREADS.reserve(MAX_THREADS);
-        for _ in 0..MAX_THREADS {
-            THREADS.push(Thread::empty());
-        }
-
-        // Thread 0 is the init/idle thread (uses boot page directory)
-        THREADS[0].kernel.tid = 0;
-        THREADS[0].kernel.pid = 0;
-        THREADS[0].kernel.priority = 0;
-        THREADS[0].kernel.parent_tid = -1;
-        THREADS[0].kernel.state = ThreadState::Running;
-        // root stays empty — idle thread doesn't use user pages
+/// Build the thread table (heap-allocated `Vec<Thread>`, MAX_THREADS slots).
+/// `startup()` owns the returned table and threads `&mut [Thread]` through the
+/// event loop and executors — it is no longer a global.
+pub fn init_threading() -> alloc::vec::Vec<Thread> {
+    let mut threads = alloc::vec::Vec::with_capacity(MAX_THREADS);
+    for _ in 0..MAX_THREADS {
+        threads.push(Thread::empty());
     }
+    // Thread 0 is the init/idle thread (uses boot page directory).
+    threads[0].kernel.tid = 0;
+    threads[0].kernel.pid = 0;
+    threads[0].kernel.priority = 0;
+    threads[0].kernel.parent_tid = -1;
+    threads[0].kernel.state = ThreadState::Running;
+    // root stays empty — idle thread doesn't use user pages
+    threads
 }
