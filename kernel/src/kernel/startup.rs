@@ -179,7 +179,7 @@ fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            run_dos_program(machine, path, tail, cwd, master_env, boot.debug_watch);
+            run_program(machine, path, tail, cwd, master_env, boot.debug_watch);
         }
         println!("All commands done — shutting down.");
         machine.shutdown();
@@ -195,15 +195,16 @@ fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]
 
     println!("Starting DN...");
     loop {
-        run_dos_program(machine, b"boot/DN/DN.COM", b"", b"", master_env, boot.debug_watch);
+        run_program(machine, b"boot/DN/DN.COM", b"", b"", master_env, boot.debug_watch);
         println!("DN exited, restarting...");
     }
 }
 
-/// Load a DOS program (.COM or MZ .EXE) into a fresh VM86 thread and run the
-/// event loop until it exits. `cmdline_tail` is written to PSP:0080h (without
-/// the length byte or terminator; those are added automatically).
-fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
+/// Load and run a single cmdline program until it exits. ELF binaries run
+/// through the Linux loader (a fresh process thread); `.COM` / MZ `.EXE`
+/// through the DOS VM86 loader. `cmdline_tail`/`env` apply only to the DOS
+/// path (PSP:0080h cmdline + environment).
+fn run_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
     use crate::kernel::{dos, exec};
 
     let buf = exec::load_file_resolved(path)
@@ -223,7 +224,13 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
 
     machine.set_debug_watch(None);
 
-    let tid = dos::run_init_program(machine, buf, args, cmdline_tail, cwd, env);
+    // Format-detect: an ELF is a Linux process; everything else is DOS. (The
+    // cmdline launcher used to force every program through the DOS loader,
+    // which silently load_com'd an ELF and ran its header as VM86 garbage.)
+    let tid = match exec::detect_format(&buf, path) {
+        exec::BinaryFormat::Elf => launch_elf(machine, buf, path, args),
+        _ => dos::run_init_program(machine, buf, args, cmdline_tail, cwd, env),
+    };
 
     // The initial program owns the console outright (nothing to repaint) and
     // gets its port permissions from policy, not from boot-time leftovers.
@@ -242,6 +249,27 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
         }
     }
     event_loop(machine, tid);
+}
+
+/// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
+/// the shared console pipe, stdout/stderr go to the console — mirroring the
+/// hosted bare-ELF path (`host_run_elf`). The fresh empty address space is
+/// already clean, so the ELF loader can write straight into it.
+fn launch_elf(machine: &mut crate::TheArch, buf: alloc::vec::Vec<u8>, path: &[u8], args: alloc::vec::Vec<alloc::vec::Vec<u8>>) -> usize {
+    let cpipe = thread::console_pipe();
+    let tid = {
+        let t = thread::create_thread(machine, None, crate::RootPageTable::empty(), true)
+            .expect("create ELF thread");
+        t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
+        t.kernel.fds[1] = thread::FdKind::ConsoleOut;
+        t.kernel.fds[2] = thread::FdKind::ConsoleOut;
+        t.kernel.tid as usize
+    };
+    crate::kernel::kpipe::add_reader(cpipe);
+    crate::kernel::linux::exec_elf_into(machine, tid, &buf, path, &args)
+        .unwrap_or_else(|e| panic!("ELF exec failed ({}): errno {}",
+            core::str::from_utf8(path).unwrap_or("?"), e));
+    tid
 }
 
 /// Ring-1 kernel event loop. Returns when no threads remain.
