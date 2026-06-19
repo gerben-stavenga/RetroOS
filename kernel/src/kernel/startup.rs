@@ -260,7 +260,6 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
 
     loop {
         stats.iteration(machine);
-        crate::kernel::stacktrace::set_debug_tid(ctx.tid);
         let thread = ctx.thread();
 
         // Advance this thread's world: virtual time, console input, delivery.

@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec;
 use crate::{print, println};
-use crate::kernel::{vfs, thread};
+use crate::kernel::vfs;
 use core::arch::asm;
 use lib::elf::SymbolTable;
 
@@ -55,14 +55,6 @@ impl SymbolData {
 }
 
 static mut KERNEL_SYMBOLS: Option<SymbolData> = None;
-
-/// Debug-only: current thread index for panic stacktraces.
-/// Written by the event loop, read only by lookup_symbol during crash diagnostics.
-static mut DEBUG_TID: usize = 0;
-
-pub fn set_debug_tid(tid: usize) {
-    unsafe { DEBUG_TID = tid; }
-}
 
 fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
     core::ptr::addr_of_mut!(KERNEL_SYMBOLS)
@@ -186,27 +178,20 @@ fn walk(mut bp: u64, mut depth: usize, user_64: bool) {
 /// Kernel space starts at this address
 const KERNEL_BASE: u32 = 0xC000_0000;
 
-/// Look up a symbol name for an address
+/// Look up a symbol name for an address. Only kernel addresses are resolved
+/// (against the 'static kernel symbol table). User-space frames print their raw
+/// address: symbolizing them would mean reaching the running thread's symbol
+/// table — state the event loop owns — from the panic path, which can't thread
+/// it in. Best-effort user names aren't worth a global; kernel frames are what
+/// a panic backtrace needs.
 fn lookup_symbol(addr: u64) -> (&'static str, u64) {
     if addr >= KERNEL_BASE as u64 {
-        // Kernel address - use kernel symbols
         let sym_data = unsafe { (*kernel_symbols_ptr()).as_ref() };
         if let Some(data) = sym_data {
             let (name, offset) = data.lookup(addr);
             if !name.is_empty() {
                 // SAFETY: kernel symbols are 'static
                 return (unsafe { core::mem::transmute(name) }, offset);
-            }
-        }
-    } else {
-        // User address - use current thread's symbols (best-effort via debug tid)
-        let tid = unsafe { DEBUG_TID };
-        if let Some(thread) = thread::get_thread(tid) {
-            if let Some(symbols) = &thread.kernel.symbols {
-                let (name, offset) = symbols.lookup(addr);
-                if !name.is_empty() {
-                    return (unsafe { core::mem::transmute(name) }, offset);
-                }
             }
         }
     }
