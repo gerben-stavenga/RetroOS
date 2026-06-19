@@ -56,13 +56,12 @@ const ENOSYS: i32 = 38;
 static mut LINUX_CONSOLE_VGA: Option<crate::kernel::dos::VgaState> = None;
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
-/// No-op on the interpreter backend, which has no VGA hardware (console output
-/// goes to stdout, not a saved/restored framebuffer).
+/// Gated on `vga_present()`: a no-op when there is no passthrough VGA card —
+/// the interpreter backend (console goes to stdout) and UEFI-class metal alike.
 pub fn save_console_vga() {
-    #[cfg(not(feature = "hosted"))]
     unsafe {
         if !crate::kernel::dos::vga_present() {
-            return; // no card (UEFI metal): nothing to snapshot
+            return; // no card (interp / UEFI metal): nothing to snapshot
         }
         let vga = (&raw mut LINUX_CONSOLE_VGA)
             .as_mut()
@@ -77,7 +76,6 @@ pub fn save_console_vga() {
 /// the previous personality's framebuffer — keeps F11 into Linux
 /// deterministic regardless of what was last drawn.
 pub fn restore_console_vga() {
-    #[cfg(not(feature = "hosted"))]
     unsafe {
         if !crate::kernel::dos::vga_present() {
             return;
@@ -224,15 +222,27 @@ fn extract_args(regs: &Regs) -> Args {
 // Dispatch
 // =============================================================================
 
-/// Syscall result: return value + optional switch target
+/// Syscall result: return value + optional switch target.
+///
+/// `action`, when set, is a lifecycle action (fork/exec/wait/yield/exit) the
+/// loop's executor runs *after* this handler's `kt` borrow is released — so a
+/// handler never mutates the thread table under its own borrow. It takes
+/// precedence over `switch_to`. This brings the Linux dispatch up to the same
+/// expressiveness the DOS handlers already have (they return `KernelAction`
+/// directly).
 pub struct SyscallResult {
     pub retval: i64,
     pub switch_to: Option<usize>,
+    pub action: Option<thread::KernelAction>,
 }
 
 impl SyscallResult {
-    fn val(v: i32) -> Self { Self { retval: v as i64, switch_to: None } }
-    fn val64(v: i64) -> Self { Self { retval: v, switch_to: None } }
+    fn val(v: i32) -> Self { Self { retval: v as i64, switch_to: None, action: None } }
+    fn val64(v: i64) -> Self { Self { retval: v, switch_to: None, action: None } }
+    /// Return `retval` and hand the loop a lifecycle action to execute.
+    fn act(retval: i64, action: thread::KernelAction) -> Self {
+        Self { retval, switch_to: None, action: Some(action) }
+    }
 }
 
 /// Single entry point the event loop calls for the Linux personality.
@@ -305,6 +315,11 @@ pub fn dispatch_action(machine: &mut crate::TheArch, kt: &mut thread::KernelThre
 
     linux_trace!("[LINUX] syscall {} => {}", nr, result.retval);
     regs.rax = result.retval as u64;
+    // A lifecycle action (if the handler asked for one) is executed by the loop
+    // after this borrow releases; it wins over a plain switch.
+    if let Some(action) = result.action {
+        return action;
+    }
     match result.switch_to {
         Some(next) => thread::KernelAction::Switch(next),
         None => thread::KernelAction::Done,
@@ -623,8 +638,8 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub fn exec_elf_into(machine: &mut crate::TheArch, tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
-    let current = thread::get_thread(tid).unwrap();
+pub fn exec_elf_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
+    let current = thread::get_thread(threads, tid).unwrap();
     let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data).map_err(|_| 8)?; // ENOEXEC
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
@@ -653,58 +668,78 @@ pub fn exec_elf_into(machine: &mut crate::TheArch, tid: usize, data: &[u8], path
 // =============================================================================
 
 /// exit(1) / exit_group(252)
-fn sys_exit(machine: &mut crate::TheArch, tid: usize, a: &Args) -> SyscallResult {
+fn sys_exit(_machine: &mut crate::TheArch, _tid: usize, a: &Args) -> SyscallResult {
     let code = a.a0 as i32;
-    SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(machine, tid, code)) }
+    // exit_thread (zombie slot + parent wake + cleanup) runs in the executor's
+    // Exit arm, after the kt borrow releases — not inline under it.
+    SyscallResult::act(0, thread::KernelAction::Exit(code))
 }
 
-/// fork(2)
-fn sys_fork(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, regs: &mut Regs) -> SyscallResult {
-    let tid = kt.tid as usize;
+/// fork(2) — return a Fork action; `handle_fork` does the COW clone in the
+/// executor after the kt borrow releases.
+fn sys_fork(_machine: &mut crate::TheArch, _kt: &mut thread::KernelThread, _linux: &mut LinuxState, _a: &Args, _regs: &mut Regs) -> SyscallResult {
+    SyscallResult::act(0, thread::KernelAction::Fork { on_done: fork_set_retval, child_stack: 0 })
+}
+
+/// clone(120) — always COW fork, with optional child_stack override (a.a1).
+fn sys_clone(_machine: &mut crate::TheArch, _kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &Args, _regs: &mut Regs) -> SyscallResult {
+    SyscallResult::act(0, thread::KernelAction::Fork { on_done: fork_set_retval, child_stack: a.a1 as usize })
+}
+
+/// Write a fork/clone return value (child tid, or -errno) into the parent's
+/// live frame — the `Fork` action's `on_done` callback.
+fn fork_set_retval(regs: &mut Regs, ret: i32) {
+    regs.rax = ret as i64 as u64;
+}
+
+/// Executor for `KernelAction::Fork`: COW-clone the current process. Runs in
+/// the event loop after the handler's `kt`/`linux` borrow released, so it can
+/// hold both the parent and the new child slot at once. `vcpu` is the live
+/// (parent) frame. Returns the child tid to switch to (child runs first), or
+/// None on failure (stay on the parent).
+pub(crate) fn handle_fork(
+    machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
+    vcpu: &mut crate::arch::Vcpu,
+    parent_tid: usize,
+    child_stack: usize,
+    on_done: fn(&mut Regs, i32),
+) -> Option<usize> {
     let mut child_root = crate::RootPageTable::empty();
     machine.user_fork(&mut child_root);
 
-    let child = match thread::create_thread(machine, Some(tid), child_root, true) {
-        Some(t) => t,
-        None => return SyscallResult::val(-ENOMEM),
+    let child_tid = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
+        Some(t) => t.kernel.tid as usize,
+        None => { on_done(&mut vcpu.regs, -ENOMEM); return None; }
     };
 
-    child.kernel.vcpu.regs = *regs;
+    let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
 
-    kt.dup_all_fds(&mut child.kernel);
-    if let thread::Personality::Linux(cl) = &mut child.personality {
-        cl.heap_base = linux.heap_base;
-        cl.heap_end = linux.heap_end;
-        cl.mmap_cursor = linux.mmap_cursor;
-        cl.tls_entry = linux.tls_entry;
-        cl.tls_base = linux.tls_base;
-        cl.tls_limit = linux.tls_limit;
-        cl.tls_limit_in_pages = linux.tls_limit_in_pages;
-        cl.cwd = linux.cwd;
-        cl.cwd_len = linux.cwd_len;
-    }
-
-    thread::set_return(child, 0);
-    kt.state = thread::ThreadState::Ready;
-    let child_tid = child.kernel.tid;
-    SyscallResult { retval: child_tid as i64, switch_to: Some(child_tid as usize) }
-}
-
-/// clone(120) — always COW fork, with optional child_stack override.
-fn sys_clone(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
-    let child_stack = a.a1 as usize;
-
-    let result = sys_fork(machine, kt, linux, a, regs);
-
+    // Child resumes at the parent's fork() call site, returning 0.
+    child.kernel.vcpu.regs = vcpu.regs;
+    child.kernel.vcpu.regs.rax = 0;
     if child_stack != 0 {
-        if let Some(child_tid) = result.switch_to {
-            if let Some(child) = thread::get_thread(child_tid) {
-                child.kernel.vcpu.regs.frame.rsp = child_stack as u64;
-            }
-        }
+        child.kernel.vcpu.regs.frame.rsp = child_stack as u64;
     }
 
-    result
+    parent.kernel.dup_all_fds(&mut child.kernel);
+    if let (thread::Personality::Linux(pl), thread::Personality::Linux(cl)) =
+        (&parent.personality, &mut child.personality)
+    {
+        cl.heap_base = pl.heap_base;
+        cl.heap_end = pl.heap_end;
+        cl.mmap_cursor = pl.mmap_cursor;
+        cl.tls_entry = pl.tls_entry;
+        cl.tls_base = pl.tls_base;
+        cl.tls_limit = pl.tls_limit;
+        cl.tls_limit_in_pages = pl.tls_limit_in_pages;
+        cl.cwd = pl.cwd;
+        cl.cwd_len = pl.cwd_len;
+    }
+
+    parent.kernel.state = thread::ThreadState::Ready;
+    on_done(&mut vcpu.regs, child_tid as i32);
+    Some(child_tid)
 }
 
 /// read(3)
@@ -742,7 +777,7 @@ fn sys_read(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
                 buf_ptr: buf,
                 buf_len: len,
             });
-            SyscallResult { retval: 0, switch_to: None }
+            SyscallResult { retval: 0, switch_to: None, action: None }
         }
         thread::FdKind::Vfs(handle) => {
             let mut tmp = alloc::vec![0u8; len];
@@ -843,10 +878,9 @@ fn sys_close(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// execve(11)
-fn sys_execve(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_execve(_machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     use crate::kernel::exec;
 
-    let tid = kt.tid as usize;
     let path_ptr = a.a0 as usize;
     let argv_ptr = a.a1 as usize;
     let _envp_ptr = a.a2 as usize;
@@ -885,24 +919,52 @@ fn sys_execve(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux
         Err(_) => return SyscallResult::val(-ENOENT),
     };
 
-    // Point of no return — close CLOEXEC fds and drop symbols
-    kt.symbols = None;
-    kt.close_cloexec();
+    // File loaded — hand teardown + rebuild to the executor (`handle_exec`),
+    // which runs off this handler's borrow so its in-place
+    // init_thread/exit_thread/reg-reload don't alias `kt`. The point of no
+    // return (drop symbols, close CLOEXEC, free pages, re-image) is the
+    // executor's; until then execve still fails cleanly (the -ENOENT above).
+    SyscallResult::act(0, thread::KernelAction::Exec {
+        buffer, path, args, cwd: cwd_snapshot,
+    })
+}
 
+/// Executor for `KernelAction::Exec`: re-image the current process in place.
+/// Runs after the syscall handler's borrow releases, so its `get_thread`/
+/// `init_thread`/`exit_thread` on `tid` are clean. Returns `None` (stay on the
+/// re-imaged thread) or the next tid if the load fails and the thread exits.
+pub(crate) fn handle_exec(
+    machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
+    vcpu: &mut crate::arch::Vcpu,
+    tid: usize,
+    buffer: alloc::vec::Vec<u8>,
+    path: alloc::vec::Vec<u8>,
+    args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    cwd: alloc::vec::Vec<u8>,
+) -> Option<usize> {
+    use crate::kernel::exec;
     let format = exec::detect_format(&buffer, &path);
 
-    // ELF address space prep (DOS handles its own inside exec_dos_into)
+    // Point of no return — drop symbols + close CLOEXEC fds.
+    {
+        let cur = thread::get_thread(threads, tid).unwrap();
+        cur.kernel.symbols = None;
+        cur.kernel.close_cloexec();
+    }
+
+    // ELF address-space prep (DOS handles its own inside exec_dos_into).
     if matches!(format, exec::BinaryFormat::Elf) {
         machine.free_user_pages();
     }
 
-    if let Err(_) = exec::init_thread(machine, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
-        return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(machine, tid, -ENOEXEC)) };
+    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd).is_err() {
+        return Some(thread::exit_thread(threads, machine, tid, -ENOEXEC));
     }
 
-    // Reload regs from thread (init_thread sets them via get_thread)
-    *regs = thread::get_thread(tid).unwrap().kernel.vcpu.regs;
-    SyscallResult { retval: 0, switch_to: Some(tid) }
+    // Reload the live frame from the rebuilt stored frame; stay on this thread.
+    vcpu.regs = thread::get_thread(threads, tid).unwrap().kernel.vcpu.regs;
+    None
 }
 
 
@@ -1092,35 +1154,52 @@ fn sys_munmap(_linux: &mut LinuxState, a: &Args) -> SyscallResult {
     SyscallResult::val(0)
 }
 
-/// wait4(114)
-fn sys_wait4(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> SyscallResult {
-    let tid = kt.tid as usize;
+/// wait4(114) — return a Wait action; `handle_wait` does the child scan/reap
+/// (or block) in the executor, off the parent's borrow.
+fn sys_wait4(_machine: &mut crate::TheArch, _kt: &mut thread::KernelThread, a: &Args, _regs: &mut Regs) -> SyscallResult {
     let pid = a.a0 as i32;
     let status_ptr = a.a1 as usize;
     let _options = a.a2 as i32;
+    SyscallResult::act(0, thread::KernelAction::Wait { pid, status_ptr })
+}
 
-    let (child_tid, exit_code) = thread::waitpid(machine, tid, pid);
+/// Executor for `KernelAction::Wait`. Runs after the handler's borrow released,
+/// so it can scan/reap other threads. `vcpu` is the live (parent) frame.
+///   - zombie ready: reap, write status to user mem, rax = child tid, stay.
+///   - no children (-ECHILD): rax = -ECHILD, stay.
+///   - children but none exited (EAGAIN): record the deferred status pointer,
+///     block the parent, reschedule (woken when a child exits; `on_resume`
+///     finalizes the status write + return value, as before).
+pub(crate) fn handle_wait(
+    machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
+    vcpu: &mut crate::arch::Vcpu,
+    tid: usize,
+    pid: i32,
+    status_ptr: usize,
+) -> Option<usize> {
+    let (child_tid, exit_code) = thread::waitpid(threads, machine, tid, pid);
 
     if child_tid >= 0 {
         if status_ptr != 0 {
-            kt.vcpu.write::<i32>(status_ptr, (exit_code & 0xFF) << 8);
+            vcpu.write::<i32>(status_ptr, (exit_code & 0xFF) << 8);
         }
-        return SyscallResult::val(child_tid);
+        vcpu.regs.rax = child_tid as i64 as u64;
+        return None;
     }
 
     if child_tid == -10 {
-        return SyscallResult::val(-ECHILD);
+        vcpu.regs.rax = (-ECHILD) as i64 as u64;
+        return None;
     }
 
-    // EAGAIN — children exist but none exited. Block and yield.
-    // Save status_ptr now (we know the ABI); exit_thread will set exit_code.
-    if let thread::Personality::Linux(linux) = &mut thread::get_thread(tid).unwrap().personality {
+    // EAGAIN — children exist but none exited. Record the deferred status
+    // pointer, block, and reschedule.
+    if let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality {
         linux.wait_status_ptr = status_ptr;
     }
-    kt.vcpu.regs = *regs;
-    kt.state = thread::ThreadState::Blocked;
-    let next = thread::schedule(tid).unwrap_or(0);
-    SyscallResult { retval: 0, switch_to: Some(next) }
+    thread::block_thread(threads, tid);
+    Some(thread::schedule(threads, tid).unwrap_or(0))
 }
 
 /// uname(122)
@@ -1210,12 +1289,13 @@ fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// sched_yield(158)
-fn sys_sched_yield(kt: &mut thread::KernelThread, regs: &mut Regs) -> SyscallResult {
-    let tid = kt.tid as usize;
-    kt.vcpu.regs = *regs;
-    kt.vcpu.regs.rax = 0;
-    kt.state = thread::ThreadState::Ready;
-    SyscallResult { retval: 0, switch_to: thread::schedule(tid) }
+fn sys_sched_yield(_kt: &mut thread::KernelThread, _regs: &mut Regs) -> SyscallResult {
+    // Pure: just ask the loop to reschedule. The executor's `Yield` arm marks
+    // this thread Ready, materializes the live frame, and picks the next thread
+    // (`thread::yield_thread`) — none of which can run under the `kt` borrow.
+    // The manual `kt.vcpu.regs = *regs` save the old body did was dead: the live
+    // `ctx.vcpu` is authoritative and `switch_to` materializes it on the way out.
+    SyscallResult::act(0, thread::KernelAction::Yield)
 }
 
 /// nanosleep(162) — stub: yield once
@@ -1279,7 +1359,7 @@ fn sys_poll(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, reg
     kt.vcpu.regs = *regs;
     kt.state = thread::ThreadState::Blocked;
     linux.pending_poll = Some(thread::PendingPoll { fds_ptr, nfds, timeout_ms: timeout });
-    SyscallResult { retval: 0, switch_to: None }
+    SyscallResult { retval: 0, switch_to: None, action: None }
 }
 
 /// getcwd(183)

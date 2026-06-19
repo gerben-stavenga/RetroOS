@@ -741,9 +741,13 @@ fn run_trampoline(uc: &mut Unicorn<'static, Ctx>, frame: &[u32], pre_segs: Optio
     // 5. Enable paging: CR3 = active page directory, then PE|PG. With PG on, the
     //    iret's CS/SS (PM) reload reads GDT/LDT through the page tables, so point
     //    GDTR/LDTR at the LINEAR window now.
-    w(uc, RegisterX86::CR4, 0);
+    // Enable SSE so SSE2 instructions don't #UD: CR4.OSFXSR|OSXMMEXCPT, and CR0
+    // with EM cleared + MP set. rust-musl emits MOVQ/MOVD to XMM in startup;
+    // without this the guest faults at its first SSE2 op. Mirrors metal
+    // (descriptors.rs sets the same when the CPU reports FXSR).
+    w(uc, RegisterX86::CR4, 0x600);
     w(uc, RegisterX86::CR3, crate::paging::frame_phys(crate::paging::active_pd()) as u64);
-    w(uc, RegisterX86::CR0, (cr0 | 0x8000_0001) | 0x10);
+    w(uc, RegisterX86::CR0, (((cr0 | 0x8000_0001) | 0x10) | 0x2) & !0x4);
     set_mmr(uc, RegisterX86::GDTR, 0, GDT_ADDR, (GDT_BYTES - 1) as u32, 0);
     set_mmr(uc, RegisterX86::LDTR, LDT_SEL, LDT_ADDR, ldt_limit, 0x8200);
     TRAMP_ADDR

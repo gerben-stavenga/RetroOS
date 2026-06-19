@@ -23,19 +23,18 @@ pub struct ExecutionContext {
 
 impl ExecutionContext {
     /// Seed the loan from a thread's saved state (the loop's first thread).
-    pub fn seed(tid: usize) -> Self {
-        let vcpu = thread::get_thread(tid)
+    pub fn seed(threads: &mut [thread::Thread], tid: usize) -> Self {
+        let vcpu = thread::get_thread(threads, tid)
             .expect("ExecutionContext::seed: invalid thread")
             .kernel
             .vcpu;
         ExecutionContext { tid, vcpu }
     }
 
-    /// The thread currently holding the CPU. The thread table is static,
-    /// so the borrow is independent of `self` — callers can hold it across
-    /// `run`/`switch_to` (which never invalidate table slots).
-    pub fn thread(&self) -> &'static mut thread::Thread {
-        thread::get_thread(self.tid).expect("ExecutionContext: current thread vanished")
+    /// The thread currently holding the CPU. The borrow is tied to the passed
+    /// `threads` slice (the loop owns it), not to `self`.
+    pub fn thread<'a>(&self, threads: &'a mut [thread::Thread]) -> &'a mut thread::Thread {
+        thread::get_thread(threads, self.tid).expect("ExecutionContext: current thread vanished")
     }
 
     /// Run user code until it produces a kernel event.
@@ -49,12 +48,12 @@ impl ExecutionContext {
     /// hash), restores the incoming thread's, switches the address space,
     /// rebuilds the I/O bitmap from policy, and runs the personality's
     /// `on_resume` (LDT/TLS rebinding). Does NOT touch console focus.
-    pub fn switch_to(&mut self, machine: &mut crate::TheArch, new_tid: usize) {
+    pub fn switch_to(&mut self, threads: &mut [thread::Thread], machine: &mut crate::TheArch, new_tid: usize) {
         use arch_abi::Arch;
         if new_tid == self.tid {
             return;
         }
-        let (old, new) = thread::get_two_threads(self.tid, new_tid);
+        let (old, new) = thread::get_two_threads(threads, self.tid, new_tid);
         verify_cpu_hash(new, "switch-in");
         let mut swap_vcpu = new.kernel.vcpu;
         let mut swap_fx = new.kernel.fx_state;

@@ -25,11 +25,18 @@ pub enum Verdict {
 /// pick a successor.
 pub fn verdict(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     regs: &mut crate::arch::Vcpu,
     tid: usize,
     action: thread::KernelAction,
 ) -> Verdict {
-    match next_after(machine, regs, tid, action).or_else(|| focus_request(tid)) {
+    // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
+    // borrow of `threads` ends cleanly before `focus_request` reborrows it.
+    let next = match next_after(machine, threads, regs, tid, action) {
+        Some(n) => Some(n),
+        None => focus_request(threads, tid),
+    };
+    match next {
         None => Verdict::Stay,
         Some(0) => Verdict::AllDead, // thread 0 = idle: nothing real to run
         Some(next) => Verdict::Switch(next),
@@ -40,29 +47,34 @@ pub fn verdict(
 /// the current thread.
 fn next_after(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     regs: &mut crate::arch::Vcpu,
     tid: usize,
     action: thread::KernelAction,
 ) -> Option<usize> {
     match action {
         thread::KernelAction::Done => None,
-        thread::KernelAction::Yield => thread::yield_thread(tid, regs),
-        thread::KernelAction::Exit(code) => Some(thread::exit_thread(machine, tid, code)),
+        thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
+        thread::KernelAction::Exit(code) => Some(thread::exit_thread(threads, machine, tid, code)),
         thread::KernelAction::Switch(next) => Some(next),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(
-                machine, regs, tid,
+                machine, threads, regs, tid,
                 &path[..path_len], &cmdtail[..cmdtail_len],
                 on_error, on_success,
             )
         }
-        thread::KernelAction::Fork(_) => {
-            // TODO: implement Fork in event loop
-            None
+        thread::KernelAction::Fork { on_done, child_stack } => {
+            crate::kernel::linux::handle_fork(machine, threads, regs, tid, child_stack, on_done)
         }
-        thread::KernelAction::Exec { path: _, path_len: _, args: _ } => {
-            // TODO: implement Exec in event loop
-            None
+        thread::KernelAction::Exec { buffer, path, args, cwd } => {
+            crate::kernel::linux::handle_exec(machine, threads, regs, tid, buffer, path, args, cwd)
+        }
+        thread::KernelAction::Wait { pid, status_ptr } => {
+            crate::kernel::linux::handle_wait(machine, threads, regs, tid, pid, status_ptr)
+        }
+        thread::KernelAction::DosSynthChild { pid, op } => {
+            crate::kernel::dos::handle_synth_child(machine, threads, regs, tid, pid, op)
         }
     }
 }
@@ -71,9 +83,9 @@ fn next_after(
 /// it, execution. Pure focus shift — does not wake any blocked thread or
 /// break any waitpid; the shell decides backgrounding semantics by polling
 /// SYNTH_WAITPID + reading kbd.
-pub(crate) fn focus_request(tid: usize) -> Option<usize> {
+pub(crate) fn focus_request(threads: &[thread::Thread], tid: usize) -> Option<usize> {
     if thread::take_switch_request() {
-        thread::cycle_next(tid)
+        thread::cycle_next(threads, tid)
     } else {
         None
     }

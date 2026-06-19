@@ -21,11 +21,8 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
 pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
-    // Heap must be live before any kernel code allocates. Arch only depends
-    // on phys_mm during boot; everything heap-using lives at or below this
-    // entry point.
-    crate::kernel::heap::init();
-    println!("Heap initialized");
+    // The global allocator is installed by the binary glue before startup runs
+    // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
     // Pick the boot disk: ATA where present, NVMe on UEFI-class machines —
     // before the platform probe, which reads the MBR for the Media verdict.
@@ -37,7 +34,10 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     // derives from this.
     let platform = crate::kernel::platform::probe(machine, boot);
 
-    crate::kernel::thread::init_threading();
+    // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
+    // reused) — startup owns it and threads `&mut threads` down through run →
+    // run_program → event_loop. No global; no `&'static mut`.
+    let mut threads = crate::kernel::thread::init_threading();
     println!("Threading initialized");
 
     mount_filesystems(platform);
@@ -45,7 +45,7 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     let master_env = load_master_env();
     init_console_pipe();
 
-    run(machine, boot, &master_env)
+    run(machine, boot, &master_env, &mut threads)
 }
 
 /// The host filesystem (COM1 transport). Mounted at /host beside a disk
@@ -154,7 +154,7 @@ fn init_console_pipe() {
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the interactive DN loop.
-fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]) -> ! {
+fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8], threads: &mut [thread::Thread]) -> ! {
     if let Some(raw) = boot.cmdline() {
         // CWD: explicit `opt/cwd` key wins; else fall back to each program's
         // own directory.
@@ -182,7 +182,7 @@ fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            run_dos_program(machine, path, tail, cwd, master_env, boot.debug_watch);
+            run_program(machine, threads, path, tail, cwd, master_env, boot.debug_watch);
         }
         println!("All commands done — shutting down.");
         machine.shutdown();
@@ -198,15 +198,16 @@ fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]
 
     println!("Starting DN...");
     loop {
-        run_dos_program(machine, b"boot/DN/DN.COM", b"", b"", master_env, boot.debug_watch);
+        run_program(machine, threads, b"boot/DN/DN.COM", b"", b"", master_env, boot.debug_watch);
         println!("DN exited, restarting...");
     }
 }
 
-/// Load a DOS program (.COM or MZ .EXE) into a fresh VM86 thread and run the
-/// event loop until it exits. `cmdline_tail` is written to PSP:0080h (without
-/// the length byte or terminator; those are added automatically).
-fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
+/// Load and run a single cmdline program until it exits. ELF binaries run
+/// through the Linux loader (a fresh process thread); `.COM` / MZ `.EXE`
+/// through the DOS VM86 loader. `cmdline_tail`/`env` apply only to the DOS
+/// path (PSP:0080h cmdline + environment).
+fn run_program(machine: &mut crate::TheArch, threads: &mut [thread::Thread], path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
     use crate::kernel::{dos, exec};
 
     let buf = exec::load_file_resolved(path)
@@ -226,13 +227,19 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
 
     machine.set_debug_watch(None);
 
-    let tid = dos::run_init_program(machine, buf, args, cmdline_tail, cwd, env);
+    // Format-detect: an ELF is a Linux process; everything else is DOS. (The
+    // cmdline launcher used to force every program through the DOS loader,
+    // which silently load_com'd an ELF and ran its header as VM86 garbage.)
+    let tid = match exec::detect_format(&buf, path) {
+        exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, path, args),
+        _ => dos::run_init_program(machine, threads, buf, args, cmdline_tail, cwd, env),
+    };
 
     // The initial program owns the console outright (nothing to repaint) and
     // gets its port permissions from policy, not from boot-time leftovers.
     crate::kernel::focus::adopt(tid);
     {
-        let t = thread::get_thread(tid).expect("init program thread");
+        let t = thread::get_thread(threads, tid).expect("init program thread");
         crate::kernel::io_policy::apply(machine, &t.personality, true);
     }
 
@@ -244,7 +251,28 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, tid);
+    event_loop(machine, threads, tid);
+}
+
+/// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
+/// the shared console pipe, stdout/stderr go to the console — mirroring the
+/// hosted bare-ELF path (`host_run_elf`). The fresh empty address space is
+/// already clean, so the ELF loader can write straight into it.
+fn launch_elf(machine: &mut crate::TheArch, threads: &mut [thread::Thread], buf: alloc::vec::Vec<u8>, path: &[u8], args: alloc::vec::Vec<alloc::vec::Vec<u8>>) -> usize {
+    let cpipe = thread::console_pipe();
+    let tid = {
+        let t = thread::create_thread(threads, machine, None, crate::RootPageTable::empty(), true)
+            .expect("create ELF thread");
+        t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
+        t.kernel.fds[1] = thread::FdKind::ConsoleOut;
+        t.kernel.fds[2] = thread::FdKind::ConsoleOut;
+        t.kernel.tid as usize
+    };
+    crate::kernel::kpipe::add_reader(cpipe);
+    crate::kernel::linux::exec_elf_into(machine, threads, tid, &buf, path, &args)
+        .unwrap_or_else(|e| panic!("ELF exec failed ({}): errno {}",
+            core::str::from_utf8(path).unwrap_or("?"), e));
+    tid
 }
 
 /// Ring-1 kernel event loop. Returns when no threads remain.
@@ -256,15 +284,14 @@ fn run_dos_program(machine: &mut crate::TheArch, path: &[u8], cmdline_tail: &[u8
 /// (the CPU loan), `console` (input routing), `Personality` (the slice
 /// hooks + event dispatch), `sched` (policy), `focus` (console ownership,
 /// moved together with execution by `switch_focus_and_run` for now).
-pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
+pub(crate) fn event_loop(machine: &mut crate::TheArch, threads: &mut [thread::Thread], first_tid: usize) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
-    let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(first_tid);
+    let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
 
     loop {
         stats.iteration(machine);
-        crate::kernel::stacktrace::set_debug_tid(ctx.tid);
-        let thread = ctx.thread();
+        let thread = ctx.thread(threads);
 
         // Advance this thread's world: virtual time, console input, delivery.
         thread.personality.on_slice(machine, &mut ctx.vcpu);
@@ -274,8 +301,8 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or F11 to move on.
         if thread.kernel.state == thread::ThreadState::Blocked {
-            match crate::kernel::sched::focus_request(ctx.tid) {
-                Some(next) => switch_focus_and_run(machine, &mut ctx, next),
+            match crate::kernel::sched::focus_request(threads, ctx.tid) {
+                Some(next) => switch_focus_and_run(machine, threads, &mut ctx, next),
                 None => core::hint::spin_loop(),
             }
             continue;
@@ -288,15 +315,15 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, first_tid: usize) {
         let action = dispatch(machine, thread, &mut ctx.vcpu, kevent);
 
         // Ask the scheduler.
-        match crate::kernel::sched::verdict(machine, &mut ctx.vcpu, ctx.tid, action) {
+        match crate::kernel::sched::verdict(machine, threads, &mut ctx.vcpu, ctx.tid, action) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
-                switch_focus_and_run(machine, &mut ctx, next);
+                switch_focus_and_run(machine, threads, &mut ctx, next);
             }
             crate::kernel::sched::Verdict::AllDead => {
                 // The loop's contract: no thread resources survive it —
                 // callers never inherit zombies.
-                thread::reap_all_zombies(machine);
+                thread::reap_all_zombies(threads, machine);
                 return;
             }
         }
@@ -340,6 +367,7 @@ fn dispatch(
 /// `SYNTH_VGA_TAKE` explicitly — the kernel makes no inheritance policy.
 fn switch_focus_and_run(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext,
     new_tid: usize,
 ) {
@@ -347,7 +375,7 @@ fn switch_focus_and_run(
         return;
     }
     {
-        let old = thread::get_thread(ctx.tid).expect("switch: invalid old thread");
+        let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
         let old_personality = if old.kernel.state != thread::ThreadState::Zombie {
             Some(&mut old.personality)
         } else {
@@ -355,8 +383,8 @@ fn switch_focus_and_run(
         };
         crate::kernel::focus::release(old_personality);
     }
-    ctx.switch_to(machine, new_tid);
-    let new = thread::get_thread(new_tid).expect("switch: invalid new thread");
+    ctx.switch_to(threads, machine, new_tid);
+    let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
     crate::kernel::focus::acquire(new_tid, &mut new.personality);
     // switch_to derived the I/O bitmap before focus moved (it must — a bare
     // execution switch is valid without any focus change); now that this
@@ -369,6 +397,7 @@ fn switch_focus_and_run(
 /// Blocks parent, returns child tid on success, None on error (caller stays on parent).
 pub(crate) fn handle_fork_exec(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     vcpu: &mut crate::arch::Vcpu,
     parent_tid: usize,
     path: &[u8],
@@ -378,7 +407,7 @@ pub(crate) fn handle_fork_exec(
 ) -> Option<usize> {
     use crate::kernel::exec;
 
-    let parent = thread::get_thread(parent_tid).expect("fork_exec: invalid parent");
+    let parent = thread::get_thread(threads, parent_tid).expect("fork_exec: invalid parent");
 
     // Snapshot the parent's cwd and (DOS-only) env block while we're still in
     // the parent's address space. The COW fork + arch_user_clean inside
@@ -428,7 +457,7 @@ pub(crate) fn handle_fork_exec(
     let mut child_root = crate::RootPageTable::empty();
     machine.user_fork(&mut child_root);
 
-    let child = match thread::create_thread(machine, Some(parent_tid), child_root, true) {
+    let child = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
         Some(t) => t,
         None => { on_error(&mut vcpu.regs, 8); return None; }
     };
@@ -451,15 +480,15 @@ pub(crate) fn handle_fork_exec(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if let Err(_) = exec::init_thread(machine, child_tid, buf, path, args, cmdtail, env, cwd) {
-        let child = thread::get_thread(child_tid).unwrap();
+    if let Err(_) = exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd) {
+        let child = thread::get_thread(threads, child_tid).unwrap();
         machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
-        thread::exit_thread(machine, child_tid, 1);
+        thread::exit_thread(threads, machine, child_tid, 1);
         on_error(&mut vcpu.regs, 11);
         return None;
     }
 
-    let child = thread::get_thread(child_tid).unwrap();
+    let child = thread::get_thread(threads, child_tid).unwrap();
     // Swap back to parent's address space. Save child's cpu_state (set by
     // init_thread) and restore after — the swap would overwrite it.
     let saved_cpu = child.kernel.vcpu.regs;

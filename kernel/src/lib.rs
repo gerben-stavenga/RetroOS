@@ -209,8 +209,8 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     use kernel::thread;
 
     arch::init_guest_ram(0);
-    kernel::heap::init();
-    thread::init_threading();
+    // Own the thread table locally (no global), same as startup() on metal.
+    let mut threads = thread::init_threading();
 
     // The arch backend handle, threaded as `&mut` through thread creation and
     // the event loop (same as the metal/disk path).
@@ -223,7 +223,7 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
 
     // Fresh process thread in the initial (active) address space.
     let tid = {
-        let t = thread::create_thread(&mut machine, None, RootPageTable::empty(), true).expect("create thread");
+        let t = thread::create_thread(&mut threads, &mut machine, None, RootPageTable::empty(), true).expect("create thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
         t.kernel.fds[2] = thread::FdKind::ConsoleOut;
@@ -234,14 +234,14 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     // Load the ELF (segments + argv/envp/auxv stack) into the active space and
     // set the thread's entry registers. Default argv = [path] when none given.
     let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
-    if let Err(e) = kernel::linux::exec_elf_into(&mut machine, tid, &data, path, &argv) {
+    if let Err(e) = kernel::linux::exec_elf_into(&mut machine, &mut threads, tid, &data, path, &argv) {
         dbg_println!("[host] exec failed: errno {}", e);
         arch::shutdown();
     }
 
     // Run the real kernel event loop (it seeds its live vcpu from the thread).
     dbg_println!("[host] running 32-bit Linux ELF, interpreted");
-    kernel::startup::event_loop(&mut machine, tid);
+    kernel::startup::event_loop(&mut machine, &mut threads, tid);
     dbg_println!("[host] guest exited");
     arch::shutdown();
 }
@@ -302,31 +302,3 @@ pub fn host_run_demo() -> ! {
     }
 }
 
-/// Panic handler (metal only — std supplies its own for the hosted build).
-#[cfg(not(feature = "hosted"))]
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Mirror to both VGA (println) and debugcon (dbg_println) so panic
-    // shows up in out.log too, not just on the QEMU display.
-    println!();
-    println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
-    dbg_println!();
-    dbg_println!("!!! KERNEL PANIC !!!");
-
-    if let Some(location) = info.location() {
-        println!("at {}:{}", location.file(), location.line());
-        dbg_println!("at {}:{}", location.file(), location.line());
-    } else {
-        println!("at <unknown location>");
-        dbg_println!("at <unknown location>");
-    }
-
-    println!("  {}", info.message());
-    dbg_println!("  {}", info.message());
-    println!();
-    dbg_println!();
-
-    kernel::stacktrace::stack_trace();
-
-    arch::halt_forever();
-}
