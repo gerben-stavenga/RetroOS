@@ -11,14 +11,19 @@ RetroOS is an educational x86 operating system written mostly in Rust with minim
 ## Build Commands
 
 ```bash
-bazelisk build //:image    # Build complete 16MB disk image
-bazelisk build //kernel:kernel_elf  # Build kernel only
-./run_qemu.sh [386|686|x64]        # Run local proprietary image in QEMU
+bazelisk build //:image            # Build complete bootable disk image
+bazelisk build //kernel:kernel_elf  # Build kernel only (multiboot-loadable ELF)
+./run.sh qemu [--arch 386|686|x64] # Run in QEMU (unified launcher; see ./run.sh header)
+./run.sh hosted --cmd GAMES/X      # Run the interp backend as a host process
 ```
+
+`run.sh` is the single launcher for every backend/firmware (`qemu`, `bochs`,
+`86box`, `hosted`); the old `run_qemu.sh` / `run_uefi.sh` / `run_interp.sh` are
+thin shims that forward to it.
 
 Build outputs (via Bazel):
 - `bazel-bin/boot/bootloader.bin` - MBR bootloader
-- `bazel-bin/kernel/kernel.elf` - Kernel ELF
+- `bazel-bin/kernel/kernel.elf` - Kernel ELF (self-contained: embeds DN + COMMAND.COM)
 - `bazel-bin/image.bin` - Final bootable disk image
 - `bazel-bin/image_proprietary.bin` - Local image with proprietary assets when present
 
@@ -26,25 +31,41 @@ Build outputs (via Bazel):
 
 ### Directory Structure
 
+The `arch` boundary is a shared interface (`arch-abi`) with two swappable
+backends — `arch-metal` (real CPU, `no_std`/Bazel) and `arch-interp` (Unicorn,
+`std`). The `kernel` links one of them and is otherwise backend-agnostic.
+
 - `boot/` - Bootloader (MBR assembly + Rust stage2)
-- `kernel/` - Kernel (entry.asm + Rust)
-  - `kernel/src/arch/paging2.rs` - Virtual memory with recursive paging
-  - `kernel/src/kernel/thread.rs` - Process/thread management, scheduler
-  - `kernel/src/arch/traps.rs` - Interrupt/exception handling and arch call boundary
-  - `kernel/src/kernel/syscalls.rs` - System call implementations
-  - `kernel/src/kernel/vm86.rs` - VM86 runtime and DOS compatibility layer
+- `arch-abi/` - Kernel-facing arch interface both backends implement (`src/arch.rs`, `src/monitor.rs`)
+- `arch-metal/` - Bare-metal arch backend + metal drivers
+  - `arch-metal/src/paging2.rs` - Virtual memory with recursive paging
+  - `arch-metal/src/traps.rs` - Interrupt/exception handling and arch call boundary
+  - `arch-metal/src/phys_mm.rs` - Physical page allocator
+  - `arch-metal/src/xhci.rs` - USB-HID boot keyboard; APIC/LAPIC bringup in `irq.rs`
+- `arch-interp/` - Hosted (Unicorn) arch backend: software CPU/MMU/paging/devices
+- `kernel/` - Ring-1 kernel (Rust); `kernel/src/arch/entry.asm` is the asm entry
+  - `kernel/src/kernel/thread.rs` - Process/thread, personalities, event dispatch
+  - `kernel/src/kernel/sched.rs` - Scheduler
   - `kernel/src/kernel/heap.rs` - Kernel heap allocator
-  - `kernel/src/arch/phys_mm.rs` - Physical page allocator
-- `lib/` - Freestanding library (VGA, ELF, TAR, MD5)
-- `apps/` - User applications, stress tests, and DOS binaries
+  - `kernel/src/kernel/dos/` - DOS personality (machine.rs = PC hardware, dos.rs, dpmi/)
+  - `kernel/src/kernel/linux/` - Linux ABI personality (32/64-bit ELF syscalls)
+  - `kernel/src/kernel/{platform,focus,io_policy}.rs` - machine probe, console owner, IOPB
+  - `kernel/src/kernel/{ac97,hda,sound,nvme,pci,ext4fs}.rs` - device + fs drivers
+  - `kernel/src/vga.rs` - the single emulated VGA model
+- `lib/` - Freestanding library (VGA render, ELF, TAR, MD5)
+- `play/` - `retroos-play` windowed host emulator (on `arch-interp`)
+- `apps/` - User applications, stress tests, and DOS binaries; `apps-boot/` = embedded bootfs
 - `toolchain/` - Bazel toolchain configuration for bare-metal Rust
 
 ### Boot Process
 
+RetroOS boots two ways on metal: its own MBR bootloader, or the machine's
+existing GRUB (`kernel.elf` is multiboot-loadable — see BOOTING.md).
+
 1. **MBR** (`boot/mbr.asm`) - Loads rest of bootloader from sector 1
 2. **Bootloader** (`boot/src/lib.rs`) - Switches to protected mode, sets up GDT, enables A20, reads kernel from TAR filesystem, verifies MD5
-3. **Kernel Entry** (`kernel/entry.asm` + `kernel/src/lib.rs`) - Sets up paging, IDT, remaps PIC
-4. **Init Process** - Userland init/shell that can fork/exec ELF and DOS programs
+3. **Kernel Entry** (`kernel/src/arch/entry.asm` + `kernel/src/lib.rs`) - Sets up paging, IDT, remaps PIC (or APIC bringup); fbcon console on a GOP framebuffer
+4. **Init Process** - Userland init/shell (DN + COMMAND.COM, embedded as a fallback bootfs) that can fork/exec ELF and DOS programs
 
 ### Memory Layout (Virtual)
 
@@ -59,14 +80,21 @@ Build outputs (via Bazel):
 ### Key Design Patterns
 
 - **Canonicalization**: normalize mode/ABI differences into shared kernel abstractions
+- **Swappable arch backend**: `arch-metal` (real CPU) and `arch-interp` (Unicorn) implement one `arch-abi`; differences live *below* the boundary, never as kernel `cfg`/hooks
 - **Recursive Paging**: one flat `entries[]` model across legacy, PAE, and compat mode
 - **Copy-on-Write Forking**: Fork shares parent pages read-only, allocates on write fault
 - **Event Loop Kernel**: ring-3 execution always comes back as a kernel-facing event
-- **TAR Filesystem**: Entire filesystem is a TAR archive
-- **VM86 Mode**: DOS `.COM` and MZ `.EXE` execution is handled as another execution mode
+- **Personalities**: ELF → Linux ABI personality; DOS `.COM`/MZ `.EXE` → DOS personality (VM86 + DPMI), both layered on the same execution modes
+- **TAR Filesystem**: the boot image is a TAR archive; VFS also mounts ext (read-only) and hostfs
+- **One emulated VGA**: a single VGA model presented through a sink (metal GOP fbcon / hosted window); backends supply only a framebuffer
+- **Probe once**: `platform` reads the machine into typed ADTs at startup; `focus` owns singleton console hardware; `io_policy` rebuilds the TSS IOPB per swap-in
 
 ### Syscall Interface
 
-INT 0x80 with: EAX=syscall#, EDX=arg0, ECX=arg1, EBX=arg2, ESI=arg3, EDI=arg4
+Userspace uses the **Linux ABI** (the kernel's Linux personality handles ELF):
 
-Key syscalls: Exit(0), Yield(1), Fork(4), Exec(5), Open(6), Read(8), Write(9)
+- 32-bit: `INT 0x80`, EAX=syscall#, args in EBX, ECX, EDX, ESI, EDI, EBP (Linux i386 numbering)
+- 64-bit: `SYSCALL` instruction, args in RDI, RSI, RDX, R10, R8, R9 (Linux x86-64 numbering)
+
+Both land at the same dispatch in `kernel/src/kernel/linux/mod.rs`. DOS programs
+instead use the INT 21h/DPMI surface in `kernel/src/kernel/dos/`.

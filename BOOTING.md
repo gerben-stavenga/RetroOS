@@ -52,8 +52,9 @@ embedded bootfs and DN starts from it. The machine's own disk is never
 mounted, and the NVMe driver is read-only regardless.
 
 Keyboard: the i8042 path (most laptops expose one via EC emulation) feeds
-the personality BIOS's INT 09. A machine with USB-only input needs the xHCI
-driver (not yet written).
+the personality BIOS's INT 09. Machines with USB-only input are handled by the
+xHCI USB-HID boot-keyboard driver, which works on real full-speed hardware
+(verified on a Razer Blade — SkyRoads played from USB keyboard input).
 
 Caveats on real hardware (vs the `run_uefi.sh` mock):
 - fbcon accepts 32bpp direct-RGB framebuffers and converts its pixels using the

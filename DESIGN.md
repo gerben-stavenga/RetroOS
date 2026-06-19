@@ -31,10 +31,15 @@ argv/environment marshaling, and ABI canonicalization.
 
 ## Arch and ring-1 kernel
 
-RetroOS is split into two layers with hardware-enforced isolation:
+RetroOS is split into two layers running at different privilege levels:
 
 - **arch**: ring-0 supervisor (~2MB code/data)
 - **kernel**: ring-1 OS kernel with event loop
+
+The boundary between them is enforced by the language, not the CPU: the kernel
+is `#![forbid(unsafe_code)]` and can only touch the machine through the safe
+`arch` API (see *Privilege model*). Ring 1 vs ring 0 buys arch the privileged
+instructions and a distinct trap origin, not memory isolation from the kernel.
 
 `arch` is intentionally small. It does not implement OS policy. Its job is
 to abstract the real machine into a simpler idealized computer for the
@@ -57,54 +62,100 @@ The guiding rule is:
 - if it is a hardware-specific oddity, normalize it before it spreads upward
 - if it is a compatibility-specific quirk, keep it out of `arch`
 
+## Two arch backends behind one interface
+
+`arch` is a swappable boundary. The kernel is written against a single
+kernel-facing interface (`arch-abi`) and links one of two implementations,
+selected by build environment rather than a runtime flag:
+
+- **metal** (`arch-metal`): runs the guest on the real CPU. `no_std`, built
+  with the Bazel freestanding toolchain, boots on hardware and QEMU. Events
+  arrive as real traps; `arch::mem()` dereferences the active page tables.
+- **interp** (`arch-interp`): runs the guest in a software x86 core (Unicorn,
+  QEMU's TCG extracted). `std`, runs as an ordinary host process — the kernel
+  executes natively, guest apps are interpreted (the gVisor / User-Mode-Linux
+  shape). Events arrive at instruction-counted slice boundaries; `arch::mem()`
+  is `uc.mem_read`/`mem_write` over a host-owned guest RAM buffer.
+
+The two map the same small contract onto very different machinery:
+
+| arch interface (kernel-facing) | metal backend | interp backend |
+|---|---|---|
+| `execute() -> KernelEvent` | IRET to ring 3, trap back | `emu_start` in instruction-counted slices |
+| `arch::mem()` read/write/slice | deref active page tables | `uc.mem_read`/`mem_write` over guest RAM |
+| software `INT n` → Syscall/SoftInt | IDT vector → ring-1 handler | intr hook |
+| `IN`/`OUT` → Port event | I/O-bitmap trap | in/out insn hook |
+| page fault → demand-page / COW | `#PF` handler | unmapped-mem hook → map + retry |
+| timer / HW IRQ | real PIC/PIT/APIC | slice boundary (deterministic, instruction-counted) |
+| `arch::calls::*` (switch_to, fork, map…) | `int 0x80` stubs | direct fns over software page tables |
+
+The design goal is **parity**: the kernel above the boundary is byte-for-byte
+identical across backends. Differences in how a device behaves (a real card vs.
+an emulated one, a real PIT vs. a deadline-budget virtual timer) are pushed
+*below* the arch boundary, not branched on in the kernel. The interp backend is
+a full backend — it runs DOS games, DPMI clients, and Borland C++ self-builds —
+not a demonstrator.
+
+`retroos-play` (the `play/` crate) wraps the interp backend in a windowed host
+emulator: a real-time audio sink, a presentation window fed by the kernel's
+emulated VGA, and host keyboard/mouse input routed into the guest. This is the
+DOSBox-shaped path — RetroOS *is* the emulator, with its own kernel underneath
+rather than a bespoke DOS layer.
+
 ## Privilege model
 
 RetroOS uses three of the four x86 privilege rings:
 
-| Ring | Role | Paging | Privileged insns | Segment limits |
-|------|------|--------|-----------------|----------------|
-| 0 | arch | supervisor (U/S=0) | yes | flat (full access) |
-| 1 | kernel | supervisor (U/S=0) | no | flat (wrapped planned) |
+| Ring | Role | Paging | Privileged insns | Segments |
+|------|------|--------|-----------------|----------|
+| 0 | arch | supervisor (U/S=0) | yes | flat |
+| 1 | kernel | supervisor (U/S=0) | no | flat |
 | 3 | user | user (U/S=1) | no | flat |
 
-Ring 1 is supervisor for paging purposes — it can access U/S=0 pages. The
-long-term plan is to use x86 segment limits with 32-bit wrapping to
-exclude the arch/page-table region from ring-1 access, providing full
-hardware isolation between arch and kernel.
+Paging U/S gives the only *hardware* privilege boundary that matters here:
+ring 3 (U/S=1) cannot touch the supervisor pages that hold the kernel, arch,
+and page tables. Ring 1 is supervisor for paging purposes, so the CPU does
+**not** hardware-isolate the kernel from arch — and that is deliberate. The
+arch ↔ kernel boundary is enforced by the *language*, not by segments or rings.
 
-### Segment-based arch isolation (planned)
+### Language-enforced arch isolation
 
-*Note: For now, Ring 1 uses flat segments. The wrapped model described
-below is a long-term roadmap goal.*
+The kernel crate is compiled `#![forbid(unsafe_code)]`. Safe Rust cannot
+fabricate a pointer, index out of bounds, or write the page tables — so the
+kernel is, by construction, incapable of corrupting arch or violating memory
+safety, regardless of any logic bug. It can only affect the machine through the
+safe `arch` API (`arch::mem()`, `arch::calls::*`, the `KernelEvent` stream).
 
-The ring-1 code and data segments use base/limit wrapping to punch a hole
-in the address space:
+This replaces an earlier plan to wrap the ring-1 code/data segments
+(base `0xC0C0_0000`, limit excluding `0xC000_0000..0xC0BF_FFFF`) so a stray
+kernel write to the arch/page-table region would `#GP`. That scheme was
+dropped: a segment limit only nets stray writes to *one* region, while
+`forbid(unsafe_code)` makes the entire kernel unable to violate memory safety
+against *any* region — a strictly stronger and compile-time-checkable property
+— and it removes the per-pointer `user_ptr` base-translation tax that the
+non-zero segment base would have imposed on every guest pointer.
 
-```
-Ring-1 CS/DS: base = 0xC0C0_0000, limit = 0xFF3F_FFFF
+The guarantee is **conditional on arch's `unsafe` being sound**. Safe code is
+only as safe as the `unsafe` beneath it, so the trusted computing base is
+exactly arch's `unsafe` surface:
 
-Accessible (wraps around 4GB):
-  0xC0C0_0000 → 0xFFFF_FFFF  (kernel high region)
-  0x0000_0000 → 0xBFFF_FFFF  (user space)
+- the page-table writes and CR3 loads (`arch::calls::map`, `fork`, …)
+- the user/guest-memory accessors (`arch::mem()` — on metal a page-table
+  deref, on interp a bounds-checked index into host-owned guest RAM)
+- the trap entry that enqueues IRQs and packages `KernelEvent`s
+- on interp, the FFI to the Unicorn C core
 
-Excluded (#GP on access):
-  0xC000_0000 → 0xC0BF_FFFF  (page tables + arch)
-```
+That set is small and enumerable, and it is where the engineering discipline
+now lives: **keep arch's `unsafe` tiny and audited.** Both backends present the
+*same* safe API to the *same* kernel source, so the kernel never needs `unsafe`
+no matter which one it links — arch-interp already demonstrates this end to end.
 
-Ring-0 arch uses flat segments (base=0, limit=4GB) for full access.
-The segment swap happens automatically on ring transitions — interrupt
-from ring 1 loads ring-0 SS from TSS (flat), IRET back restores
-ring-1 SS (wrapped).
-
-User pointer translation: since the ring-1 data segment has a non-zero
-base, user pointers from `Regs` (which are raw `u64` values, not Rust
-pointers) must be translated via a single function:
-
-```rust
-fn user_ptr<T>(addr: u32) -> *const T {
-    addr.wrapping_sub(SEGMENT_BASE) as *const T
-}
-```
+*Open work to make the attribute compile:* a few pieces that legitimately need
+`unsafe` still sit inside the kernel crate and must move below the arch line (or
+behind a safe capability) first — the metal device drivers that do raw MMIO /
+port I/O (`nvme`, `ac97`, `hda`, `pci`, `xhci`) and the runtime plumbing
+(`heap`, `stacktrace`). The placement rule that falls out: **code that needs
+`unsafe` hardware access belongs below arch; the kernel stays safe.**
 
 ## Interrupt dispatch
 
@@ -152,8 +203,8 @@ point of view, there are only:
 ```
 0x0000_0000 - 0x0000_FFFF  Null guard (unmapped)
 0x0001_0000 - 0xBFFF_FFFF  User space (~3 GB)
-0xC000_0000 - 0xC0BF_FFFF  Supervisor-only (12 MB, ring-1 excluded by segments)
-0xC0C0_0000 - 0xFFFF_FFFF  Kernel (~1012 MB, ring-1 accessible)
+0xC000_0000 - 0xC0BF_FFFF  Supervisor-only (12 MB, page tables + arch)
+0xC0C0_0000 - 0xFFFF_FFFF  Kernel (~1012 MB)
 ```
 
 ### Root page as PD (through recursive mapping)
@@ -183,10 +234,12 @@ Each entry acts as a PD entry covering 4MB (legacy) or 2MB (PAE/compat):
 | [770] | `0xC080_0000` | 0   | arch code/data             |
 | [771+]| `0xC0C0_0000` | 1   | kernel                     |
 
-The kernel starts at `0xC0C0_0000` in all modes. U/S=0 entries are
-supervisor-only; U/S=1 entries are the ring-1 kernel. The segment limits
-provide the actual isolation between ring-1 kernel and the arch/page-table
-region — paging U/S is defense in depth against ring-3 user processes.
+The kernel starts at `0xC0C0_0000` in all modes. The U/S split here is what
+isolates ring-3 user processes from the supervisor region (kernel + arch +
+page tables); it does **not** separate the ring-1 kernel from ring-0 arch, since
+ring 1 is itself supervisor. That arch ↔ kernel boundary is enforced by the
+language instead (`#![forbid(unsafe_code)]` on the kernel — see *Privilege
+model*), not by paging or segments.
 
 ## Minimal arch interface
 
@@ -414,6 +467,73 @@ DOS .COM programs run in VM86 mode with:
 - VGA BIOS ROM mapped read-only (INT 10h goes through real BIOS code)
 - INT 16h/20h/21h intercepted via interrupt redirection bitmap
 - PSP stub restores text mode on exit
+
+Protected-mode DOS extends the same model. DPMI (0.9 with 1.0 extensions) is a
+kernel personality layered over the VM86/PM execution modes — INT 31h services,
+an LDT, PM interrupt reflection, exception handlers, and RM⇔PM transitions —
+sufficient to run DJGPP/Watcom/Borland clients (Quake, Hexen, Borland C++).
+
+## One emulated VGA, presented through a sink
+
+There is exactly one VGA model in the kernel (`kernel/src/vga.rs` and
+`lib/vga_render`). When no real card is present (interp, or a UEFI machine with
+only a framebuffer), `VgaState` is the live register file the guest reads and
+writes; the kernel renders it through `lib::vga_render` at a divided tick
+cadence and hands finished frames to a **present sink**:
+
+- on metal it blits into the GOP framebuffer (`fbcon`);
+- hosted parks the frame in a mailbox for the `retroos-play` window.
+
+Backends supply only a framebuffer; they never emulate VGA themselves. Planar
+EGA and Mode X are handled uniformly by trapping the unmapped `A0000` window as
+a page fault and decoding the faulting instruction against the VGA's planar
+logic — the same code on both backends, with no arch-specific path.
+
+## Devices: passthrough when present, emulate when absent
+
+The guiding rule for retro hardware (VGA, Sound Blaster, …) is to give
+**direct/passthrough access when the real device is available** and **emulate it
+when absent**, with the same kernel adapting per-machine rather than forking.
+
+- **Platform is probed once** at startup into typed values
+  (`kernel::platform`): `Host { Qemu | Metal | Interp }`,
+  `Display { VgaCard | Framebuffer | HostWindow | Headless }`,
+  `Firmware { NativeBios | Substitute }`, audio, media. No lazy re-probes.
+- **Focus** (`kernel::focus`) owns the singleton console hardware — display,
+  keyboard, mouse — and moves on F11. Singleton-hardware globals are correct
+  because focus owns them; per-thread state is the *model*, transferred in and
+  out on focus change.
+- **I/O policy** (`kernel::io_policy`) rebuilds the TSS I/O bitmap on every
+  swap-in from (personality, platform, focus). DOS-with-focus gets the VGA
+  window on a real card; background DOS gets only its granted device windows;
+  Linux gets no ports (its dispatcher faults `IN`/`OUT`). The arch mechanism is
+  `reset_io_bitmap` + `allow_io_ports`; the policy lives in the kernel.
+- **Sound**: a canonical kernel sound API behind which sit a metal AC'97 driver,
+  an Intel HDA driver, and a cardless software Sound Blaster 16. Only the 8237
+  DMA controller is virtualized for passthrough cards (remap the guest buffer
+  contiguous, program the real 8237, relay the card IRQ); the SB/AWE64 register
+  path itself is passthrough.
+
+## Running on a real modern machine
+
+The kernel boots unchanged on a UEFI x86-64 laptop, with no RetroOS-specific
+firmware:
+
+- **Boot**: `kernel.elf` is multiboot-loadable by the machine's existing GRUB
+  (see [BOOTING.md](BOOTING.md)); it is self-contained — DN, COMMAND.COM and a
+  fallback CONFIG.SYS are embedded, so a diskless boot mounts `/boot` from the
+  embedded bootfs. RetroOS's own MBR bootloader remains the path on legacy/BIOS.
+- **Console**: when GRUB hands over a GOP linear framebuffer, `arch/fbcon.rs`
+  renders the emulated VGA into it.
+- **No-ROM firmware**: machines without a real BIOS get a personality Rust BIOS
+  (`dos/bios.rs`) providing the IVT, BDA projection, and INT 10h/16h/etc.
+- **Storage**: an NVMe driver (read-only) discovers ext partitions on GPT/MBR
+  disks; the root and extra disks mount read-only into the DOS namespace.
+- **Interrupts**: APIC bringup — LAPIC timer (HPET-calibrated, xAPIC MMIO or
+  x2APIC MSR) with a PIT fallback, IOAPIC-routed keyboard/mouse. This is what
+  keeps the event loop's `hlt` waking on machines with no usable PIT.
+- **Input**: i8042 where the EC emulates one, plus an xHCI USB-HID boot-keyboard
+  driver (works on real full-speed hardware).
 
 ## Goal
 
