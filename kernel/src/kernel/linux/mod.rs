@@ -56,13 +56,12 @@ const ENOSYS: i32 = 38;
 static mut LINUX_CONSOLE_VGA: Option<crate::kernel::dos::VgaState> = None;
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
-/// No-op on the interpreter backend, which has no VGA hardware (console output
-/// goes to stdout, not a saved/restored framebuffer).
+/// Gated on `vga_present()`: a no-op when there is no passthrough VGA card —
+/// the interpreter backend (console goes to stdout) and UEFI-class metal alike.
 pub fn save_console_vga() {
-    #[cfg(not(feature = "hosted"))]
     unsafe {
         if !crate::kernel::dos::vga_present() {
-            return; // no card (UEFI metal): nothing to snapshot
+            return; // no card (interp / UEFI metal): nothing to snapshot
         }
         let vga = (&raw mut LINUX_CONSOLE_VGA)
             .as_mut()
@@ -77,7 +76,6 @@ pub fn save_console_vga() {
 /// the previous personality's framebuffer — keeps F11 into Linux
 /// deterministic regardless of what was last drawn.
 pub fn restore_console_vga() {
-    #[cfg(not(feature = "hosted"))]
     unsafe {
         if !crate::kernel::dos::vga_present() {
             return;

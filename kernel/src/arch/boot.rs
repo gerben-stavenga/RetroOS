@@ -283,3 +283,34 @@ fn read_boot_config() -> crate::BootConfig {
     }
     cfg
 }
+
+/// Metal `#[panic_handler]`. Like the global allocator above, this is a
+/// binary-level lang item the metal glue owns — the hosted build is a `std`
+/// binary that supplies its own, so it lives here rather than as a
+/// `#[cfg]`'d item in the backend-agnostic kernel crate.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Mirror to both VGA (println) and debugcon (dbg_println) so panic
+    // shows up in out.log too, not just on the QEMU display.
+    crate::println!();
+    crate::println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
+    crate::dbg_println!();
+    crate::dbg_println!("!!! KERNEL PANIC !!!");
+
+    if let Some(location) = info.location() {
+        crate::println!("at {}:{}", location.file(), location.line());
+        crate::dbg_println!("at {}:{}", location.file(), location.line());
+    } else {
+        crate::println!("at <unknown location>");
+        crate::dbg_println!("at <unknown location>");
+    }
+
+    crate::println!("  {}", info.message());
+    crate::dbg_println!("  {}", info.message());
+    crate::println!();
+    crate::dbg_println!();
+
+    crate::kernel::stacktrace::stack_trace();
+
+    arch::halt_forever();
+}
