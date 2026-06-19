@@ -20,15 +20,6 @@ pub mod nvme;
 pub mod pci;
 pub mod platform;
 pub mod sched;
-// The bare-metal demand-paging heap allocator is metal-only; the hosted build
-// uses std's global allocator, so it needs just a no-op `init()`.
-#[cfg(not(feature = "hosted"))]
-pub mod heap;
-#[cfg(feature = "hosted")]
-pub mod heap {
-    /// No-op on hosted: std installs the global allocator.
-    pub fn init() {}
-}
 pub mod keyboard;
 pub mod kpipe;
 pub mod linux;

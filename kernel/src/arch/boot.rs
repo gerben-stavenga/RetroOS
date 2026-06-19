@@ -12,6 +12,16 @@ use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
 pub const KERNEL_PHYS: usize = 0x0010_0000;
 
+/// The kernel's global allocator on metal: the freestanding demand-paged heap
+/// algorithm (`lib::heap::DemandHeap`), bound here in the binary-side boot glue.
+/// Hosted builds don't compile `boot.rs` at all and use std's allocator, so the
+/// kernel crate itself stays allocator-agnostic (no `#[global_allocator]`, no
+/// `cfg`). The heap VA window and its first-touch `#PF` page-backing are
+/// arch-owned (`arch::{heap_base, HEAP_END}` + the metal `#PF` handler); this is
+/// only the binding and its one-time `init()` call site (below, before startup).
+#[global_allocator]
+static ALLOCATOR: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
+
 /// Metal debug-log sink: emit one byte to the 0xE9 debug port. Installed into
 /// the kernel console via `set_debug_sink` so the kernel logs without ever
 /// issuing a port op itself.
@@ -212,6 +222,14 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // on so its mutable state is borrow-checked rather than global. Lives for
     // the rest of the kernel's life (startup never returns).
     let mut machine = crate::new_arch();
+
+    // Install the kernel heap now that paging, phys_mm, and the #PF page-backing
+    // are all up — just before startup begins allocating (today `new_arch()`
+    // above does not allocate, matching the previous order where startup() did
+    // this as its first step). Hosted installs std's allocator instead.
+    ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
+    lib::println!("Heap base: {:#x}", arch::heap_base());
+
     crate::kernel::startup::startup(&mut machine, &config);
 }
 

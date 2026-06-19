@@ -21,11 +21,8 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
 pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
-    // Heap must be live before any kernel code allocates. Arch only depends
-    // on phys_mm during boot; everything heap-using lives at or below this
-    // entry point.
-    crate::kernel::heap::init();
-    println!("Heap initialized");
+    // The global allocator is installed by the binary glue before startup runs
+    // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
     // Pick the boot disk: ATA where present, NVMe on UEFI-class machines —
     // before the platform probe, which reads the MBR for the Media verdict.

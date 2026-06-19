@@ -209,7 +209,6 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     use kernel::thread;
 
     arch::init_guest_ram(0);
-    kernel::heap::init();
     thread::init_threading();
 
     // The arch backend handle, threaded as `&mut` through thread creation and
