@@ -476,23 +476,10 @@ pub(super) fn rm_native_syscall(machine: &mut crate::TheArch, kt: &mut thread::K
         // the thread slot. Pair with AH=04 SYNTH_WAITPID (peek), then call
         // this once the peek reports "exited".
         0x00 => {
+            // Touches a *child* thread (swap its farewell VGA into ours, reap)
+            // → defer to the executor, off this thread's `dos`/`kt` borrow.
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            let dst = &mut dos.pc.vga as *mut machine::VgaState;
-            let rv = thread::with_target_dos(pid, |target| {
-                let src = &mut target.pc.vga;
-                if src.planes.is_empty() { return -61; }
-                unsafe {
-                    core::mem::swap(&mut *dst, src);
-                    if machine::vga_present() {
-                        (*dst).restore_to_hardware();
-                    }
-                }
-                0
-            });
-            if rv >= 0 { thread::reap(machine, pid); }
-            regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
-            if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
-            thread::KernelAction::Done
+            thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::VgaTake }
         }
         // AH=01h — SYNTH_FORK_EXEC: fork+exec program. Non-blocking.
         // Input:  DS:DX -> ASCIIZ program filename (no shell parsing here)
@@ -544,27 +531,9 @@ pub(super) fn rm_native_syscall(machine: &mut crate::TheArch, kt: &mut thread::K
         // plumbing. command.com loops AH=04 + INT 21h AH=06 (kbd poll) and
         // owns the policy for what to do on user input.
         0x04 => {
+            // Scans the caller's children → executor (peek + AX/BX/CF writeback).
             let pid = regs.rbx as i16 as i32;
-            // Peek only — the slot stays Zombie so AH=00 can grab the VGA.
-            // Reap happens in AH=00 (or via thread::reap if the caller
-            // doesn't care about the screen).
-            let (tid, _code) = thread::peek_zombie_child(kt.tid as usize, pid);
-            if tid >= 0 {
-                // Child exited. last_child_exit_status was already set by
-                // exit_thread with the proper termination-type encoding
-                // (e.g., 0x0300|AL for TSR, AL for normal exit).
-                regs.rax = regs.rax & !0xFFFF;                         // AX=0 exited
-                regs.rbx = (regs.rbx & !0xFFFF) | (tid as u16) as u64; // BX=child_pid
-                regs.clear_flag32(1);
-            } else if tid == -11 {
-                // EAGAIN: children alive, none exited.
-                regs.rax = (regs.rax & !0xFFFF) | 1; // AX=1 still running
-                regs.clear_flag32(1);
-            } else {
-                regs.rax = (regs.rax & !0xFFFF) | (-tid) as u64;
-                regs.set_flag32(1);
-            }
-            thread::KernelAction::Done
+            thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::Waitpid }
         }
         // AH=02h — TRACE_ON: enable runtime DOS/DPMI trace gate.
         // AH=03h — TRACE_OFF: disable it.
@@ -582,10 +551,7 @@ pub(super) fn rm_native_syscall(machine: &mut crate::TheArch, kt: &mut thread::K
         // and its VGA state is suspect. BX = child pid.
         0x05 => {
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            thread::reap(machine, pid);
-            regs.rax &= !0xFFFF;
-            regs.clear_flag32(1);
-            thread::KernelAction::Done
+            thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::Reap }
         }
         // AH=06h — SYNTH_VGA_PEEK_MODE: query the saved VGA state of a
         // zombie child without taking it. BX = child pid.
@@ -598,18 +564,7 @@ pub(super) fn rm_native_syscall(machine: &mut crate::TheArch, kt: &mut thread::K
         // text-mode redraw.
         0x06 => {
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            let rv = thread::with_target_dos(pid, |target| {
-                if target.pc.vga.planes.is_empty() { return -61; }
-                (target.pc.vga.gc[6] & 1) as i32
-            });
-            if rv < 0 {
-                regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
-                regs.set_flag32(1);
-            } else {
-                regs.rax = (regs.rax & !0xFF) | (rv as u64);
-                regs.clear_flag32(1);
-            }
-            thread::KernelAction::Done
+            thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::VgaPeekMode }
         }
         // Unknown AH: RetroOS synth space is kernel-owned; anything outside
         // the documented subfunctions is a guest bug. Return AX=errno/CF=1.

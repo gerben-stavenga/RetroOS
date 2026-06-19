@@ -110,6 +110,24 @@ pub enum KernelAction {
     /// wait4: reap a zombie child (or block until one exists). Run in the
     /// executor so the child-table scan/reap happens off the parent's borrow.
     Wait { pid: i32, status_ptr: usize },
+    /// DOS INT-31 synth op on a *child* thread (reap / waitpid-probe / adopt or
+    /// peek its farewell VGA). Run in the executor so the cross-thread table
+    /// access happens off the caller's `dos`/`kt` borrow. The executor writes
+    /// the AX/BX/CF result into the live frame.
+    DosSynthChild { pid: i32, op: DosChildOp },
+}
+
+/// Which child-thread operation a `KernelAction::DosSynthChild` performs.
+#[derive(Clone, Copy)]
+pub enum DosChildOp {
+    /// AH=05 SYNTH_REAP: recycle the zombie slot.
+    Reap,
+    /// AH=04 SYNTH_WAITPID: non-blocking exit probe.
+    Waitpid,
+    /// AH=00 SYNTH_VGA_TAKE: swap the child's farewell screen into ours, reap.
+    VgaTake,
+    /// AH=06 SYNTH_VGA_PEEK_MODE: report the child's saved VGA text/graphics bit.
+    VgaPeekMode,
 }
 
 /// OS personality — determines event loop dispatch and carries OS-specific state

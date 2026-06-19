@@ -65,6 +65,9 @@ fn next_after(
         thread::KernelAction::Wait { pid, status_ptr } => {
             crate::kernel::linux::handle_wait(machine, regs, tid, pid, status_ptr)
         }
+        thread::KernelAction::DosSynthChild { pid, op } => {
+            crate::kernel::dos::handle_synth_child(machine, regs, tid, pid, op)
+        }
     }
 }
 

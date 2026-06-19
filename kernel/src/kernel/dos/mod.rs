@@ -689,6 +689,73 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is
     current.dos_mut().on_resume(machine);
 }
 
+/// Executor for `KernelAction::DosSynthChild`: the cross-thread half of the
+/// INT-31 synth ops (reap / waitpid-probe / VGA take or peek), run after the
+/// caller's `dos`/`kt` borrow releases. Writes the AX/BX/CF result into the
+/// live frame and stays on the caller (`None`).
+pub(crate) fn handle_synth_child(
+    machine: &mut crate::TheArch,
+    regs: &mut crate::arch::Vcpu,
+    tid: usize,
+    pid: i32,
+    op: thread::DosChildOp,
+) -> Option<usize> {
+    use thread::DosChildOp as Op;
+    match op {
+        Op::Reap => {
+            thread::reap(machine, pid);
+            regs.rax &= !0xFFFF;
+            regs.clear_flag32(1);
+        }
+        Op::Waitpid => {
+            let (ctid, _code) = thread::peek_zombie_child(tid, pid);
+            if ctid >= 0 {
+                regs.rax &= !0xFFFF;                                    // AX=0 exited
+                regs.rbx = (regs.rbx & !0xFFFF) | (ctid as u16) as u64; // BX=child_pid
+                regs.clear_flag32(1);
+            } else if ctid == -11 {
+                regs.rax = (regs.rax & !0xFFFF) | 1;                    // AX=1 still running
+                regs.clear_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | (-ctid) as u64;
+                regs.set_flag32(1);
+            }
+        }
+        Op::VgaTake => {
+            let dst = &mut thread::get_thread(tid).unwrap().dos_mut().pc.vga
+                as *mut machine::VgaState;
+            let rv = thread::with_target_dos(pid, |target| {
+                let src = &mut target.pc.vga;
+                if src.planes.is_empty() { return -61; }
+                unsafe {
+                    core::mem::swap(&mut *dst, src);
+                    if machine::vga_present() {
+                        (*dst).restore_to_hardware();
+                    }
+                }
+                0
+            });
+            if rv >= 0 { thread::reap(machine, pid); }
+            regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
+            if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
+        }
+        Op::VgaPeekMode => {
+            let rv = thread::with_target_dos(pid, |target| {
+                if target.pc.vga.planes.is_empty() { return -61; }
+                (target.pc.vga.gc[6] & 1) as i32
+            });
+            if rv < 0 {
+                regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
+                regs.set_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFF) | (rv as u64);
+                regs.clear_flag32(1);
+            }
+        }
+    }
+    None
+}
+
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
 fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
