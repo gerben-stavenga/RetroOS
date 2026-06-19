@@ -675,53 +675,70 @@ fn sys_exit(_machine: &mut crate::TheArch, _tid: usize, a: &Args) -> SyscallResu
     SyscallResult::act(0, thread::KernelAction::Exit(code))
 }
 
-/// fork(2)
-fn sys_fork(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, _a: &Args, regs: &mut Regs) -> SyscallResult {
-    let tid = kt.tid as usize;
+/// fork(2) — return a Fork action; `handle_fork` does the COW clone in the
+/// executor after the kt borrow releases.
+fn sys_fork(_machine: &mut crate::TheArch, _kt: &mut thread::KernelThread, _linux: &mut LinuxState, _a: &Args, _regs: &mut Regs) -> SyscallResult {
+    SyscallResult::act(0, thread::KernelAction::Fork { on_done: fork_set_retval, child_stack: 0 })
+}
+
+/// clone(120) — always COW fork, with optional child_stack override (a.a1).
+fn sys_clone(_machine: &mut crate::TheArch, _kt: &mut thread::KernelThread, _linux: &mut LinuxState, a: &Args, _regs: &mut Regs) -> SyscallResult {
+    SyscallResult::act(0, thread::KernelAction::Fork { on_done: fork_set_retval, child_stack: a.a1 as usize })
+}
+
+/// Write a fork/clone return value (child tid, or -errno) into the parent's
+/// live frame — the `Fork` action's `on_done` callback.
+fn fork_set_retval(regs: &mut Regs, ret: i32) {
+    regs.rax = ret as i64 as u64;
+}
+
+/// Executor for `KernelAction::Fork`: COW-clone the current process. Runs in
+/// the event loop after the handler's `kt`/`linux` borrow released, so it can
+/// hold both the parent and the new child slot at once. `vcpu` is the live
+/// (parent) frame. Returns the child tid to switch to (child runs first), or
+/// None on failure (stay on the parent).
+pub(crate) fn handle_fork(
+    machine: &mut crate::TheArch,
+    vcpu: &mut crate::arch::Vcpu,
+    parent_tid: usize,
+    child_stack: usize,
+    on_done: fn(&mut Regs, i32),
+) -> Option<usize> {
     let mut child_root = crate::RootPageTable::empty();
     machine.user_fork(&mut child_root);
 
-    let child = match thread::create_thread(machine, Some(tid), child_root, true) {
-        Some(t) => t,
-        None => return SyscallResult::val(-ENOMEM),
+    let child_tid = match thread::create_thread(machine, Some(parent_tid), child_root, true) {
+        Some(t) => t.kernel.tid as usize,
+        None => { on_done(&mut vcpu.regs, -ENOMEM); return None; }
     };
 
-    child.kernel.vcpu.regs = *regs;
+    let (parent, child) = thread::get_two_threads(parent_tid, child_tid);
 
-    kt.dup_all_fds(&mut child.kernel);
-    if let thread::Personality::Linux(cl) = &mut child.personality {
-        cl.heap_base = linux.heap_base;
-        cl.heap_end = linux.heap_end;
-        cl.mmap_cursor = linux.mmap_cursor;
-        cl.tls_entry = linux.tls_entry;
-        cl.tls_base = linux.tls_base;
-        cl.tls_limit = linux.tls_limit;
-        cl.tls_limit_in_pages = linux.tls_limit_in_pages;
-        cl.cwd = linux.cwd;
-        cl.cwd_len = linux.cwd_len;
-    }
-
-    thread::set_return(child, 0);
-    kt.state = thread::ThreadState::Ready;
-    let child_tid = child.kernel.tid;
-    SyscallResult { retval: child_tid as i64, switch_to: Some(child_tid as usize), action: None }
-}
-
-/// clone(120) — always COW fork, with optional child_stack override.
-fn sys_clone(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
-    let child_stack = a.a1 as usize;
-
-    let result = sys_fork(machine, kt, linux, a, regs);
-
+    // Child resumes at the parent's fork() call site, returning 0.
+    child.kernel.vcpu.regs = vcpu.regs;
+    child.kernel.vcpu.regs.rax = 0;
     if child_stack != 0 {
-        if let Some(child_tid) = result.switch_to {
-            if let Some(child) = thread::get_thread(child_tid) {
-                child.kernel.vcpu.regs.frame.rsp = child_stack as u64;
-            }
-        }
+        child.kernel.vcpu.regs.frame.rsp = child_stack as u64;
     }
 
-    result
+    parent.kernel.dup_all_fds(&mut child.kernel);
+    if let (thread::Personality::Linux(pl), thread::Personality::Linux(cl)) =
+        (&parent.personality, &mut child.personality)
+    {
+        cl.heap_base = pl.heap_base;
+        cl.heap_end = pl.heap_end;
+        cl.mmap_cursor = pl.mmap_cursor;
+        cl.tls_entry = pl.tls_entry;
+        cl.tls_base = pl.tls_base;
+        cl.tls_limit = pl.tls_limit;
+        cl.tls_limit_in_pages = pl.tls_limit_in_pages;
+        cl.cwd = pl.cwd;
+        cl.cwd_len = pl.cwd_len;
+    }
+
+    parent.kernel.state = thread::ThreadState::Ready;
+    on_done(&mut vcpu.regs, child_tid as i32);
+    Some(child_tid)
 }
 
 /// read(3)

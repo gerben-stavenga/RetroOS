@@ -78,8 +78,11 @@ pub enum KernelAction {
     Yield,
     /// Exit current thread with given code.
     Exit(i32),
-    /// Fork: COW-clone current process. Callback receives child_tid (or -errno).
-    Fork(fn(&mut crate::Regs, i32)),
+    /// Fork/clone: COW-clone the current process in the executor (after the kt
+    /// borrow releases). `child_stack` overrides the child's SP when nonzero
+    /// (clone); 0 = plain fork. `on_done` writes the parent's return value
+    /// (child tid, or -errno).
+    Fork { on_done: fn(&mut crate::Regs, i32), child_stack: usize },
     /// Switch to a specific thread (already resolved by caller).
     Switch(usize),
     /// ForkExec: fork a child, exec the given path.

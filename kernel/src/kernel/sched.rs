@@ -56,9 +56,8 @@ fn next_after(
                 on_error, on_success,
             )
         }
-        thread::KernelAction::Fork(_) => {
-            // TODO: implement Fork in event loop
-            None
+        thread::KernelAction::Fork { on_done, child_stack } => {
+            crate::kernel::linux::handle_fork(machine, regs, tid, child_stack, on_done)
         }
         thread::KernelAction::Exec { path: _, path_len: _, args: _ } => {
             // TODO: implement Exec in event loop
