@@ -209,7 +209,8 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     use kernel::thread;
 
     arch::init_guest_ram(0);
-    thread::init_threading();
+    // Own the thread table locally (no global), same as startup() on metal.
+    let mut threads = thread::init_threading();
 
     // The arch backend handle, threaded as `&mut` through thread creation and
     // the event loop (same as the metal/disk path).
@@ -222,7 +223,7 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
 
     // Fresh process thread in the initial (active) address space.
     let tid = {
-        let t = thread::create_thread(&mut machine, None, RootPageTable::empty(), true).expect("create thread");
+        let t = thread::create_thread(&mut threads, &mut machine, None, RootPageTable::empty(), true).expect("create thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
         t.kernel.fds[2] = thread::FdKind::ConsoleOut;
@@ -233,14 +234,14 @@ pub fn host_run_elf(path: &[u8], data: alloc::vec::Vec<u8>, argv: alloc::vec::Ve
     // Load the ELF (segments + argv/envp/auxv stack) into the active space and
     // set the thread's entry registers. Default argv = [path] when none given.
     let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
-    if let Err(e) = kernel::linux::exec_elf_into(&mut machine, tid, &data, path, &argv) {
+    if let Err(e) = kernel::linux::exec_elf_into(&mut machine, &mut threads, tid, &data, path, &argv) {
         dbg_println!("[host] exec failed: errno {}", e);
         arch::shutdown();
     }
 
     // Run the real kernel event loop (it seeds its live vcpu from the thread).
     dbg_println!("[host] running 32-bit Linux ELF, interpreted");
-    kernel::startup::event_loop(&mut machine, tid);
+    kernel::startup::event_loop(&mut machine, &mut threads, tid);
     dbg_println!("[host] guest exited");
     arch::shutdown();
 }

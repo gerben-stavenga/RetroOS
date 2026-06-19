@@ -473,7 +473,7 @@ pub fn get_two_threads(threads: &mut [Thread], a: usize, b: usize) -> (&mut Thre
 }
 
 /// Create a new thread with the given root page table.
-pub fn create_thread(threads: &mut [Thread], machine: &mut crate::TheArch, parent_tid: Option<usize>, root: crate::RootPageTable, is_process: bool) -> Option<&mut Thread> {
+pub fn create_thread<'a>(threads: &'a mut [Thread], machine: &mut crate::TheArch, parent_tid: Option<usize>, root: crate::RootPageTable, is_process: bool) -> Option<&'a mut Thread> {
     let (parent_pid, parent_prio, parent_tidv) = match parent_tid {
         Some(tid) => {
             let p = &threads[tid].kernel;

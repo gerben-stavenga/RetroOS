@@ -621,10 +621,10 @@ fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
-pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) {
+pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) {
     use crate::kernel::startup;
 
-    let current = thread::get_thread(tid).unwrap();
+    let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
     back_vga_window_if_emulated(machine);
@@ -695,6 +695,7 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is
 /// live frame and stays on the caller (`None`).
 pub(crate) fn handle_synth_child(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     regs: &mut crate::arch::Vcpu,
     tid: usize,
     pid: i32,
@@ -703,12 +704,12 @@ pub(crate) fn handle_synth_child(
     use thread::DosChildOp as Op;
     match op {
         Op::Reap => {
-            thread::reap(machine, pid);
+            thread::reap(threads, machine, pid);
             regs.rax &= !0xFFFF;
             regs.clear_flag32(1);
         }
         Op::Waitpid => {
-            let (ctid, _code) = thread::peek_zombie_child(tid, pid);
+            let (ctid, _code) = thread::peek_zombie_child(threads, tid, pid);
             if ctid >= 0 {
                 regs.rax &= !0xFFFF;                                    // AX=0 exited
                 regs.rbx = (regs.rbx & !0xFFFF) | (ctid as u16) as u64; // BX=child_pid
@@ -722,25 +723,29 @@ pub(crate) fn handle_synth_child(
             }
         }
         Op::VgaTake => {
-            let dst = &mut thread::get_thread(tid).unwrap().dos_mut().pc.vga
-                as *mut machine::VgaState;
-            let rv = thread::with_target_dos(pid, |target| {
-                let src = &mut target.pc.vga;
-                if src.planes.is_empty() { return -61; }
-                unsafe {
-                    core::mem::swap(&mut *dst, src);
-                    if machine::vga_present() {
-                        (*dst).restore_to_hardware();
-                    }
-                }
+            // Pull the child's farewell screen out (with_target_dos validates
+            // range/live/DOS), then install it into ours + reap. Two
+            // single-borrow steps replace the old `*mut VgaState` cross-slot
+            // swap — no unsafe, no aliasing.
+            let mut taken = machine::VgaState::new();
+            let rv = thread::with_target_dos(threads, pid, |target| {
+                if target.pc.vga.planes.is_empty() { return -61; }
+                core::mem::swap(&mut taken, &mut target.pc.vga);
                 0
             });
-            if rv >= 0 { thread::reap(machine, pid); }
+            if rv >= 0 {
+                let cur = thread::get_thread(threads, tid).unwrap();
+                core::mem::swap(&mut cur.dos_mut().pc.vga, &mut taken);
+                if machine::vga_present() {
+                    cur.dos_mut().pc.vga.restore_to_hardware();
+                }
+                thread::reap(threads, machine, pid);
+            }
             regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
             if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
         }
         Op::VgaPeekMode => {
-            let rv = thread::with_target_dos(pid, |target| {
+            let rv = thread::with_target_dos(threads, pid, |target| {
                 if target.pc.vga.planes.is_empty() { return -61; }
                 (target.pc.vga.gc[6] & 1) as i32
             });
@@ -778,10 +783,10 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
 /// Set up the initial DOS thread for a fresh program load (no parent).
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
-pub fn run_init_program(machine: &mut crate::TheArch, buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
+pub fn run_init_program(machine: &mut crate::TheArch, threads: &mut [thread::Thread], buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
     use crate::kernel::startup;
 
-    let t = thread::create_thread(machine, None, crate::RootPageTable::empty(), true)
+    let t = thread::create_thread(threads, machine, None, crate::RootPageTable::empty(), true)
         .expect("Failed to create DOS thread");
     let tid = t.kernel.tid as usize;
 

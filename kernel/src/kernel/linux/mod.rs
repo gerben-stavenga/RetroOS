@@ -638,8 +638,8 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub fn exec_elf_into(machine: &mut crate::TheArch, tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
-    let current = thread::get_thread(tid).unwrap();
+pub fn exec_elf_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
+    let current = thread::get_thread(threads, tid).unwrap();
     let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data).map_err(|_| 8)?; // ENOEXEC
 
     let want_64 = loaded.class == elf::ElfClass::Elf64;
@@ -699,6 +699,7 @@ fn fork_set_retval(regs: &mut Regs, ret: i32) {
 /// None on failure (stay on the parent).
 pub(crate) fn handle_fork(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     vcpu: &mut crate::arch::Vcpu,
     parent_tid: usize,
     child_stack: usize,
@@ -707,12 +708,12 @@ pub(crate) fn handle_fork(
     let mut child_root = crate::RootPageTable::empty();
     machine.user_fork(&mut child_root);
 
-    let child_tid = match thread::create_thread(machine, Some(parent_tid), child_root, true) {
+    let child_tid = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
         Some(t) => t.kernel.tid as usize,
         None => { on_done(&mut vcpu.regs, -ENOMEM); return None; }
     };
 
-    let (parent, child) = thread::get_two_threads(parent_tid, child_tid);
+    let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
 
     // Child resumes at the parent's fork() call site, returning 0.
     child.kernel.vcpu.regs = vcpu.regs;
@@ -934,6 +935,7 @@ fn sys_execve(_machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
 /// re-imaged thread) or the next tid if the load fails and the thread exits.
 pub(crate) fn handle_exec(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     vcpu: &mut crate::arch::Vcpu,
     tid: usize,
     buffer: alloc::vec::Vec<u8>,
@@ -946,7 +948,7 @@ pub(crate) fn handle_exec(
 
     // Point of no return — drop symbols + close CLOEXEC fds.
     {
-        let cur = thread::get_thread(tid).unwrap();
+        let cur = thread::get_thread(threads, tid).unwrap();
         cur.kernel.symbols = None;
         cur.kernel.close_cloexec();
     }
@@ -956,12 +958,12 @@ pub(crate) fn handle_exec(
         machine.free_user_pages();
     }
 
-    if exec::init_thread(machine, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd).is_err() {
-        return Some(thread::exit_thread(machine, tid, -ENOEXEC));
+    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd).is_err() {
+        return Some(thread::exit_thread(threads, machine, tid, -ENOEXEC));
     }
 
     // Reload the live frame from the rebuilt stored frame; stay on this thread.
-    vcpu.regs = thread::get_thread(tid).unwrap().kernel.vcpu.regs;
+    vcpu.regs = thread::get_thread(threads, tid).unwrap().kernel.vcpu.regs;
     None
 }
 
@@ -1170,12 +1172,13 @@ fn sys_wait4(_machine: &mut crate::TheArch, _kt: &mut thread::KernelThread, a: &
 ///     finalizes the status write + return value, as before).
 pub(crate) fn handle_wait(
     machine: &mut crate::TheArch,
+    threads: &mut [thread::Thread],
     vcpu: &mut crate::arch::Vcpu,
     tid: usize,
     pid: i32,
     status_ptr: usize,
 ) -> Option<usize> {
-    let (child_tid, exit_code) = thread::waitpid(machine, tid, pid);
+    let (child_tid, exit_code) = thread::waitpid(threads, machine, tid, pid);
 
     if child_tid >= 0 {
         if status_ptr != 0 {
@@ -1192,11 +1195,11 @@ pub(crate) fn handle_wait(
 
     // EAGAIN — children exist but none exited. Record the deferred status
     // pointer, block, and reschedule.
-    if let thread::Personality::Linux(linux) = &mut thread::get_thread(tid).unwrap().personality {
+    if let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality {
         linux.wait_status_ptr = status_ptr;
     }
-    thread::block_thread(tid);
-    Some(thread::schedule(tid).unwrap_or(0))
+    thread::block_thread(threads, tid);
+    Some(thread::schedule(threads, tid).unwrap_or(0))
 }
 
 /// uname(122)
