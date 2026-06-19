@@ -668,9 +668,11 @@ pub fn exec_elf_into(machine: &mut crate::TheArch, tid: usize, data: &[u8], path
 // =============================================================================
 
 /// exit(1) / exit_group(252)
-fn sys_exit(machine: &mut crate::TheArch, tid: usize, a: &Args) -> SyscallResult {
+fn sys_exit(_machine: &mut crate::TheArch, _tid: usize, a: &Args) -> SyscallResult {
     let code = a.a0 as i32;
-    SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(machine, tid, code)), action: None }
+    // exit_thread (zombie slot + parent wake + cleanup) runs in the executor's
+    // Exit arm, after the kt borrow releases — not inline under it.
+    SyscallResult::act(0, thread::KernelAction::Exit(code))
 }
 
 /// fork(2)
