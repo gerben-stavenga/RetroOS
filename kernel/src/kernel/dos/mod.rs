@@ -679,6 +679,14 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, tid: usize, data: Vec<u8>, is
     let dos_state = current.dos_mut();
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
     current.kernel.symbols = None;
+    // Bind this thread's DOS CPU state (LDT/TLS/IOPB) into the hardware now.
+    // An in-place execve has no context switch, so `on_resume` — which the boot
+    // path's `run_init_program` calls — wouldn't otherwise fire, leaving the
+    // CPU's LDTR on the *parent's* LDT. When the parent was a Linux process its
+    // LDT[7] is a TLS data segment, not the DOS PM-stub code selector, so the
+    // first DOS protected-mode transition (cs=0x3f) #GPs. (Repro: stress.elf —
+    // a Linux process forks then execve's a DOS .COM.)
+    current.dos_mut().on_resume(machine);
 }
 
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
