@@ -59,9 +59,8 @@ fn next_after(
         thread::KernelAction::Fork { on_done, child_stack } => {
             crate::kernel::linux::handle_fork(machine, regs, tid, child_stack, on_done)
         }
-        thread::KernelAction::Exec { path: _, path_len: _, args: _ } => {
-            // TODO: implement Exec in event loop
-            None
+        thread::KernelAction::Exec { buffer, path, args, cwd } => {
+            crate::kernel::linux::handle_exec(machine, regs, tid, buffer, path, args, cwd)
         }
         thread::KernelAction::Wait { pid, status_ptr } => {
             crate::kernel::linux::handle_wait(machine, regs, tid, pid, status_ptr)

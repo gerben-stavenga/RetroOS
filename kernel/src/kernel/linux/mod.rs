@@ -877,10 +877,9 @@ fn sys_close(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// execve(11)
-fn sys_execve(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_execve(_machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     use crate::kernel::exec;
 
-    let tid = kt.tid as usize;
     let path_ptr = a.a0 as usize;
     let argv_ptr = a.a1 as usize;
     let _envp_ptr = a.a2 as usize;
@@ -919,24 +918,51 @@ fn sys_execve(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linux
         Err(_) => return SyscallResult::val(-ENOENT),
     };
 
-    // Point of no return — close CLOEXEC fds and drop symbols
-    kt.symbols = None;
-    kt.close_cloexec();
+    // File loaded — hand teardown + rebuild to the executor (`handle_exec`),
+    // which runs off this handler's borrow so its in-place
+    // init_thread/exit_thread/reg-reload don't alias `kt`. The point of no
+    // return (drop symbols, close CLOEXEC, free pages, re-image) is the
+    // executor's; until then execve still fails cleanly (the -ENOENT above).
+    SyscallResult::act(0, thread::KernelAction::Exec {
+        buffer, path, args, cwd: cwd_snapshot,
+    })
+}
 
+/// Executor for `KernelAction::Exec`: re-image the current process in place.
+/// Runs after the syscall handler's borrow releases, so its `get_thread`/
+/// `init_thread`/`exit_thread` on `tid` are clean. Returns `None` (stay on the
+/// re-imaged thread) or the next tid if the load fails and the thread exits.
+pub(crate) fn handle_exec(
+    machine: &mut crate::TheArch,
+    vcpu: &mut crate::arch::Vcpu,
+    tid: usize,
+    buffer: alloc::vec::Vec<u8>,
+    path: alloc::vec::Vec<u8>,
+    args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    cwd: alloc::vec::Vec<u8>,
+) -> Option<usize> {
+    use crate::kernel::exec;
     let format = exec::detect_format(&buffer, &path);
 
-    // ELF address space prep (DOS handles its own inside exec_dos_into)
+    // Point of no return — drop symbols + close CLOEXEC fds.
+    {
+        let cur = thread::get_thread(tid).unwrap();
+        cur.kernel.symbols = None;
+        cur.kernel.close_cloexec();
+    }
+
+    // ELF address-space prep (DOS handles its own inside exec_dos_into).
     if matches!(format, exec::BinaryFormat::Elf) {
         machine.free_user_pages();
     }
 
-    if let Err(_) = exec::init_thread(machine, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd_snapshot) {
-        return SyscallResult { retval: 0, switch_to: Some(thread::exit_thread(machine, tid, -ENOEXEC)), action: None };
+    if exec::init_thread(machine, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd).is_err() {
+        return Some(thread::exit_thread(machine, tid, -ENOEXEC));
     }
 
-    // Reload regs from thread (init_thread sets them via get_thread)
-    *regs = thread::get_thread(tid).unwrap().kernel.vcpu.regs;
-    SyscallResult { retval: 0, switch_to: Some(tid), action: None }
+    // Reload the live frame from the rebuilt stored frame; stay on this thread.
+    vcpu.regs = thread::get_thread(tid).unwrap().kernel.vcpu.regs;
+    None
 }
 
 

@@ -98,11 +98,14 @@ pub enum KernelAction {
         on_error: fn(&mut crate::Regs, i32),
         on_success: fn(&mut crate::Regs, child_tid: i32),
     },
-    /// Exec: replace current process with program at path.
+    /// Exec: replace the current process in place with a loaded binary. The
+    /// handler reads path/argv from the (still-live) old address space and loads
+    /// the file; the executor tears down + rebuilds, off the handler's borrow.
     Exec {
-        path: [u8; 164],
-        path_len: usize,
+        buffer: alloc::vec::Vec<u8>,
+        path: alloc::vec::Vec<u8>,
         args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+        cwd: alloc::vec::Vec<u8>,
     },
     /// wait4: reap a zombie child (or block until one exists). Run in the
     /// executor so the child-table scan/reap happens off the parent's borrow.
