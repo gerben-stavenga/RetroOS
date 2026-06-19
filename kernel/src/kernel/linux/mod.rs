@@ -1126,35 +1126,51 @@ fn sys_munmap(_linux: &mut LinuxState, a: &Args) -> SyscallResult {
     SyscallResult::val(0)
 }
 
-/// wait4(114)
-fn sys_wait4(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, a: &Args, regs: &mut Regs) -> SyscallResult {
-    let tid = kt.tid as usize;
+/// wait4(114) — return a Wait action; `handle_wait` does the child scan/reap
+/// (or block) in the executor, off the parent's borrow.
+fn sys_wait4(_machine: &mut crate::TheArch, _kt: &mut thread::KernelThread, a: &Args, _regs: &mut Regs) -> SyscallResult {
     let pid = a.a0 as i32;
     let status_ptr = a.a1 as usize;
     let _options = a.a2 as i32;
+    SyscallResult::act(0, thread::KernelAction::Wait { pid, status_ptr })
+}
 
+/// Executor for `KernelAction::Wait`. Runs after the handler's borrow released,
+/// so it can scan/reap other threads. `vcpu` is the live (parent) frame.
+///   - zombie ready: reap, write status to user mem, rax = child tid, stay.
+///   - no children (-ECHILD): rax = -ECHILD, stay.
+///   - children but none exited (EAGAIN): record the deferred status pointer,
+///     block the parent, reschedule (woken when a child exits; `on_resume`
+///     finalizes the status write + return value, as before).
+pub(crate) fn handle_wait(
+    machine: &mut crate::TheArch,
+    vcpu: &mut crate::arch::Vcpu,
+    tid: usize,
+    pid: i32,
+    status_ptr: usize,
+) -> Option<usize> {
     let (child_tid, exit_code) = thread::waitpid(machine, tid, pid);
 
     if child_tid >= 0 {
         if status_ptr != 0 {
-            kt.vcpu.write::<i32>(status_ptr, (exit_code & 0xFF) << 8);
+            vcpu.write::<i32>(status_ptr, (exit_code & 0xFF) << 8);
         }
-        return SyscallResult::val(child_tid);
+        vcpu.regs.rax = child_tid as i64 as u64;
+        return None;
     }
 
     if child_tid == -10 {
-        return SyscallResult::val(-ECHILD);
+        vcpu.regs.rax = (-ECHILD) as i64 as u64;
+        return None;
     }
 
-    // EAGAIN — children exist but none exited. Block and yield.
-    // Save status_ptr now (we know the ABI); exit_thread will set exit_code.
+    // EAGAIN — children exist but none exited. Record the deferred status
+    // pointer, block, and reschedule.
     if let thread::Personality::Linux(linux) = &mut thread::get_thread(tid).unwrap().personality {
         linux.wait_status_ptr = status_ptr;
     }
-    kt.vcpu.regs = *regs;
-    kt.state = thread::ThreadState::Blocked;
-    let next = thread::schedule(tid).unwrap_or(0);
-    SyscallResult { retval: 0, switch_to: Some(next), action: None }
+    thread::block_thread(tid);
+    Some(thread::schedule(tid).unwrap_or(0))
 }
 
 /// uname(122)

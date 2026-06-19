@@ -104,6 +104,9 @@ pub enum KernelAction {
         path_len: usize,
         args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     },
+    /// wait4: reap a zombie child (or block until one exists). Run in the
+    /// executor so the child-table scan/reap happens off the parent's borrow.
+    Wait { pid: i32, status_ptr: usize },
 }
 
 /// OS personality — determines event loop dispatch and carries OS-specific state

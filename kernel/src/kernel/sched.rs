@@ -63,6 +63,9 @@ fn next_after(
             // TODO: implement Exec in event loop
             None
         }
+        thread::KernelAction::Wait { pid, status_ptr } => {
+            crate::kernel::linux::handle_wait(machine, regs, tid, pid, status_ptr)
+        }
     }
 }
 
