@@ -589,16 +589,16 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 /// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
 /// are handled inline by arch before bubbling.
 fn isr_handler_ring3(regs: &mut Regs) {
-    use crate::monitor::{monitor, KernelEvent as KE, MonitorResult};
+    use crate::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult, TF_VIRTUAL_IF_STEPPING};
     use arch_abi::UserMode;
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
     let kevent: KE = match int_num {
-        // #DB: virtual-IF single-stepping is gone (spec-strict PM — POPF/IRET
-        // don't affect virtual-IF, IRQ-handler return restores it via the
-        // resume stub). The only remaining TF users are debug watchpoints and
-        // the PM_STEP_BUDGET tracer below; anything else is a stray bit we
-        // defensively clear so it can't loop.
+        // #DB: only armed by `step_virtual_if` to single-step PM regions
+        // where virtual IF is 0. The hardware just executed one insn under
+        // TF; decide what to do about the NEXT one. When TF stepping is
+        // disabled, defensively clear TF and resume — nothing in the
+        // kernel arms it, but a stale bit in client flags would loop.
         1 => {
             use core::sync::atomic::Ordering;
             let dr6 = unsafe { x86::read_dr6() };
@@ -617,7 +617,11 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 regs.set_flag32(1 << 8); // keep TF on
                 return;
             }
-            regs.clear_flag32(1 << 8);
+            if TF_VIRTUAL_IF_STEPPING {
+                let _ = step_virtual_if(regs);
+            } else {
+                regs.clear_flag32(1 << 8);
+            }
             return;
         }
         13 => {
@@ -634,10 +638,18 @@ fn isr_handler_ring3(regs: &mut Regs) {
             let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
             match monitor(regs) {
                 MonitorResult::Resume => {
-                    // Spec-strict PM (DPMI 0.9 §2.13): mainline POPF/IRET don't
-                    // affect virtual-IF, so there's nothing to single-step. CLI
-                    // updated VIF inline in the monitor; IRQ-handler return
-                    // restores it via the resume stub.
+                    // If the monitor just cleared virtual IF in PM (e.g. a CLI),
+                    // kick off the single-step interpreter so POPF/IRET get
+                    // intercepted before hardware runs them. Skipped when TF
+                    // stepping is disabled — DPMI 0.9 §2.13 says POPF/IRET
+                    // aren't required to affect virtual IF, so spec-conforming
+                    // clients use CLI/STI/AX=0900-0902 only.
+                    if TF_VIRTUAL_IF_STEPPING
+                        && regs.mode() != UserMode::VM86
+                        && regs.flags32() & (1 << 19) == 0
+                    {
+                        let _ = step_virtual_if(regs);
+                    }
                     if regs.flags32() & VIF_VIP != VIF_VIP {
                         return;
                     }
