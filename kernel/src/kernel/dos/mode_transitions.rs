@@ -642,35 +642,14 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
     // grabbed the outer excursion's HC and leaked a VM86-context segment into
     // the PM frame → #GP on the exit's `pop gs` (Quake/Doom under Bochs, where
     // timing lands the tick mid-excursion).
-    let pushed_hc_at = if nested_on_pm && default_vector {
-        // Nested IRQ on an UNHOOKED vector → default stub reflects to RM below;
-        // the RM/VM86 handler's IRET restores VIF in hardware (VME), so no stub
-        // round-trip is needed. Plant the iret-frame inline at regs.SS:[SP-frame]
-        // (push_iret_frame uses regs.frame.ss for the segment base, so this
-        // writes whatever stack the handler is currently on — DPMI 0.9 §3.1.2
+    let pushed_hc_at = if nested_on_pm {
+        // Plant iret-frame at regs.SS:[SP-frame_size]; push_iret_frame
+        // uses regs.frame.ss to look up the segment base, so this writes
+        // to whatever stack the handler is currently on (DPMI 0.9 §3.1.2
         // permits handler SS != HOST_STACK_PM*).
         push_iret_frame(&dos.ldt[..], regs, handler_use32,
             regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
         None
-    } else if nested_on_pm {
-        // Nested IRQ into the client's OWN PM handler. We're already on the PM
-        // side so we don't switch, but we MUST still push a HostContinuation
-        // (on the handler's current stack — pm_get_stack returns regs.SS:SP for
-        // the nested case) and return the handler through SLOT_RESUME_CONTINUATION.
-        // This is load-bearing for the virtual-IF: deliver clears VIF below
-        // (handlers run with interrupts off), and the CPU CANNOT re-enable it on
-        // the handler's IRET — POPF/IRET preserve EFLAGS bits 19/20. Only
-        // resume_continuation, replaying the captured pre-IRQ eflags, puts VIF
-        // back. Without this the nested path left VIF=0 forever: Doom's timer
-        // firing inside a DPMI excursion → mainline spins on a tick now
-        // permanently held (VIP=1), which is exactly the hang in the wild.
-        let at = push_continuation(dos, regs, None);
-        regs.frame.ss = at.0 as u64;
-        regs.frame.rsp = at.1 as u64;
-        let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
-        push_iret_frame(&dos.ldt[..], regs, handler_use32,
-            stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
-        Some(at)
     } else {
         // First-entry from client OR toggle from rm: push_continuation_and_switch_to_pm_side
         // pushes HostContinuation, lands user on top of the save, captures pre-
