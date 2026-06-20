@@ -60,13 +60,41 @@ pub enum MonitorResult {
 // EFLAGS bits the monitor cares about
 // =============================================================================
 
-const IF_FLAG:   u32 = 1 << 9;
+const IF_FLAG:   u32 = 1 << 9;   // real IF (host-only); never guest state
 const TF_FLAG:   u32 = 1 << 8;
 const IOPL_MASK: u32 = 3 << 12;
 const VM_FLAG:   u32 = 1 << 17;
 const OF_FLAG:   u32 = 1 << 11;
-/// Flags VM86/PM user code cannot modify via POPF/IRET (IOPL, VM).
-const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG;
+/// VIF — the guest's virtual interrupt flag. EFLAGS bit 19. This is the single
+/// canonical store the kernel reads/writes; bit 9 (IF) is the real interrupt
+/// flag only. The guest *observes* its virtual-IF in the bit-9 position (PUSHF
+/// result / a popped IRET frame), so we translate at those points only.
+const VIF_FLAG:  u32 = 1 << 19;
+/// Flags VM86/PM user code cannot modify via POPF/IRET: IOPL, VM, and the real
+/// IF (the guest's IF intent lands in VIF instead — see `apply_guest_flags`).
+const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG | IF_FLAG;
+
+/// The flags word the *guest* observes (PUSHF / pushed IRET frame): its virtual
+/// interrupt flag (VIF/bit 19) appears in the bit-9 (IF) slot; the internal VIF
+/// bit is masked out.
+#[inline]
+fn guest_flags(regs: &Regs) -> u32 {
+    let f = regs.flags32();
+    let vif = f & VIF_FLAG != 0;
+    (f & !(IF_FLAG | VIF_FLAG)) | if vif { IF_FLAG } else { 0 }
+}
+
+/// Apply a flags word the guest supplied (POPF / IRET): status flags take
+/// effect, IOPL/VM/real-IF are preserved, and the guest's bit-9 (its desired
+/// IF) lands in VIF (bit 19).
+#[inline]
+fn apply_guest_flags(regs: &mut Regs, popped: u32) {
+    let want_vif = popped & IF_FLAG != 0;
+    let preserved = regs.flags32() & PRESERVED_FLAGS;
+    let mut nf = (popped & !(PRESERVED_FLAGS | VIF_FLAG)) | preserved;
+    if want_vif { nf |= VIF_FLAG; } else { nf &= !VIF_FLAG; }
+    regs.set_flags32(nf);
+}
 
 /// When true, after a PM client clears virtual IF (via `CLI`), arm TF=1 and walk
 /// the instruction stream so POPF/IRET that would *silently* drop the IF bit at
@@ -169,13 +197,15 @@ pub fn sw_reflect_vm86_int<V: GuestView>(regs: &mut Regs, v: &mut V, vector: u8)
     let new_cs = v.read16(ivt_addr + 2);
 
     let ss_base = (regs.stack_seg() as u32) << 4;
-    let flags = regs.flags32() as u16;
+    // The guest observes its virtual-IF (VIF) in the bit-9 slot of the saved
+    // FLAGS; INT-n clears the guest's IF → clear VIF, not the real IF.
+    let flags = guest_flags(regs) as u16;
     let old_cs = regs.code_seg();
     let old_ip = regs.ip32() as u16;
     push16(regs, v, ss_base, false, flags);
     push16(regs, v, ss_base, false, old_cs);
     push16(regs, v, ss_base, false, old_ip);
-    regs.clear_flag32(IF_FLAG);
+    regs.clear_flag32(VIF_FLAG);
     regs.clear_flag32(TF_FLAG);
     regs.set_cs32(new_cs as u32);
     regs.set_ip32(new_ip as u32);
@@ -226,34 +256,34 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
     match opcode {
         // ----- Flag / stack instructions (fast path) -----
 
-        // CLI — clear virtual IF. The caller (#GP path or step_virtual_if) arms
-        // TF=1 so PM POPF/IRET that would silently drop IF get intercepted.
+        // CLI — clear the guest's virtual IF (VIF). The caller (#GP path or
+        // step_virtual_if) arms TF=1 so PM POPF/IRET that would silently drop
+        // IF get intercepted.
         0xFA => {
             advance_ip(regs, cs_32, advance);
-            regs.clear_flag32(IF_FLAG);
+            regs.clear_flag32(VIF_FLAG);
             MonitorResult::Resume
         }
-        // STI — re-enable virtual IF.
+        // STI — re-enable the guest's virtual IF (VIF).
         0xFB => {
             advance_ip(regs, cs_32, advance);
-            regs.set_flag32(IF_FLAG);
+            regs.set_flag32(VIF_FLAG);
             MonitorResult::Resume
         }
-        // PUSHF / PUSHFD
+        // PUSHF / PUSHFD — the guest sees its VIF in the bit-9 (IF) slot.
         0x9C => {
             advance_ip(regs, cs_32, advance);
-            let flags = regs.flags32();
+            let flags = guest_flags(regs);
             if op32 { push32(regs, v, ss_base, ss_32, flags); }
             else    { push16(regs, v, ss_base, ss_32, flags as u16); }
             MonitorResult::Resume
         }
-        // POPF / POPFD — IOPL and VM are preserved
+        // POPF / POPFD — IOPL/VM/real-IF preserved; the guest's bit-9 → VIF.
         0x9D => {
             advance_ip(regs, cs_32, advance);
             let flags = if op32 { pop32(regs, v, ss_base, ss_32) }
                         else    { pop16(regs, v, ss_base, ss_32) as u32 };
-            let preserved = regs.flags32() & PRESERVED_FLAGS;
-            regs.set_flags32((flags & !PRESERVED_FLAGS) | preserved);
+            apply_guest_flags(regs, flags);
             MonitorResult::Resume
         }
         // IRET / IRETD — pop IP, CS, FLAGS (same-ring only)
@@ -268,8 +298,7 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
                 }
                 regs.set_ip32(new_eip);
                 regs.set_cs32(new_cs as u32);
-                let preserved = regs.flags32() & PRESERVED_FLAGS;
-                regs.set_flags32((new_fl & !PRESERVED_FLAGS) | preserved);
+                apply_guest_flags(regs, new_fl);
             } else {
                 let new_ip = pop16(regs, v, ss_base, ss_32);
                 let new_cs = pop16(regs, v, ss_base, ss_32);
@@ -279,8 +308,7 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
                 }
                 regs.set_ip32(new_ip as u32);
                 regs.set_cs32(new_cs as u32);
-                let preserved = regs.flags32() & PRESERVED_FLAGS;
-                regs.set_flags32((new_fl & !PRESERVED_FLAGS) | preserved);
+                apply_guest_flags(regs, new_fl);
             }
             MonitorResult::Resume
         }
@@ -437,8 +465,8 @@ pub fn step_virtual_if<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResul
     const BUDGET: usize = 64;
 
     for _ in 0..BUDGET {
-        // Fast path: virtual IF came back on — stop stepping.
-        if regs.flags32() & IF_FLAG != 0 {
+        // Fast path: virtual IF (VIF) came back on — stop stepping.
+        if regs.flags32() & VIF_FLAG != 0 {
             regs.clear_flag32(TF_FLAG);
             return MonitorResult::Resume;
         }

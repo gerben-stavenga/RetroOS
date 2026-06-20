@@ -26,7 +26,8 @@ pub fn seg_is_32(sel: u16) -> bool {
 /// # Safety
 /// Reads/writes guest VM86 memory (the IVT at linear 0 and the SS:SP stack).
 pub unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
-    const IF_FLAG: u32 = 1 << 9;
+    const VIF_FLAG: u32 = 1 << 19; // guest virtual IF (canonical store)
+    const IF_FLAG: u32 = 1 << 9;   // real IF (host-only); guest's view in bit 9
     const TF_FLAG: u32 = 1 << 8;
     let m = crate::vcpu::mem();
 
@@ -40,12 +41,16 @@ pub unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
         sp = sp.wrapping_sub(2) & 0xFFFF;
         m.write::<u16>((ss_base + sp) as usize, val);
     };
-    push(regs.flags32() as u16);
+    // The guest observes its virtual IF (VIF) in the bit-9 (IF) slot of the
+    // pushed FLAGS; INT-n then clears the guest's IF → clear VIF, not real IF.
+    let f = regs.flags32();
+    let guest_flags = (f & !(IF_FLAG | VIF_FLAG)) | if f & VIF_FLAG != 0 { IF_FLAG } else { 0 };
+    push(guest_flags as u16);
     push(regs.code_seg());
     push(regs.ip32() as u16);
 
     regs.set_sp32((regs.sp32() & !0xFFFF) | sp);
-    regs.clear_flag32(IF_FLAG);
+    regs.clear_flag32(VIF_FLAG);
     regs.clear_flag32(TF_FLAG);
     regs.set_cs32(new_cs as u32);
     regs.set_ip32(new_ip as u32);

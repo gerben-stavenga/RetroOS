@@ -191,7 +191,7 @@ impl RmCallStruct {
         Self {
             edi: regs.rdi as u32, esi: regs.rsi as u32, ebp: regs.rbp as u32, _reserved: 0,
             ebx: regs.rbx as u32, edx: regs.rdx as u32, ecx: regs.rcx as u32, eax: regs.rax as u32,
-            flags: regs.flags32() as u16, es: regs.es as u16, ds: regs.ds as u16,
+            flags: machine::guest_flags(regs) as u16, es: regs.es as u16, ds: regs.ds as u16,
             fs: regs.fs as u16, gs: regs.gs as u16, ip: regs.ip32() as u16,
             cs: regs.code_seg(), sp: regs.sp32() as u16, ss: regs.stack_seg(),
         }
@@ -508,7 +508,7 @@ pub(super) fn deliver_pm_int(dos: &mut thread::DosState, regs: &mut Vcpu, vector
         None => return thread::KernelAction::Done,
     };
     push_iret_frame(&dos.ldt[..], regs, frame_use32,
-        regs.ip32(), regs.code_seg(), regs.flags32());
+        regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
     if sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2 {
         let (stub_sel, stub_off) = synthetic_host_iret_target();
         regs.set_cs32(stub_sel as u32);
@@ -600,9 +600,10 @@ pub(super) fn if_record(tag: u8, regs: &Vcpu, if_in: bool, if_out: bool,
     }
 }
 
+/// The guest's virtual interrupt flag (VIF/bit 19) — the kernel's single store.
 #[inline]
 fn if_bit(regs: &Vcpu) -> bool {
-    regs.frame.rflags & (machine::IF_FLAG as u64) != 0
+    regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
 }
 
 /// F12 hook for virtual-IF diagnostics. The ring records inline; output is muted.
@@ -647,7 +648,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
         // to whatever stack the handler is currently on (DPMI 0.9 §3.1.2
         // permits handler SS != HOST_STACK_PM*).
         push_iret_frame(&dos.ldt[..], regs, handler_use32,
-            regs.ip32(), regs.code_seg(), regs.flags32());
+            regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
         None
     } else {
         // First-entry from client OR toggle from rm: push_continuation_and_switch_to_pm_side
@@ -659,7 +660,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
         let at = push_continuation_and_switch_to_pm_side(dos, regs, None);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
         push_iret_frame(&dos.ldt[..], regs, handler_use32,
-            stub_eip, SPECIAL_STUB_SEL, regs.flags32());
+            stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
 
         // Zero DS/ES/FS/GS:
         //   - PM-handler entry: spec wants undefined segs; null is the safe
@@ -700,10 +701,11 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
         return;
     }
 
-    // PM HW-IRQ handler entry: clear VM, IF (handlers enter with interrupts
-    // disabled — textbook INT semantics), and TF. IOPL is pinned to 1 for every
-    // ring-3 guest at the arch exit, so it needs no touch here.
-    regs.frame.rflags &= !((machine::VM_FLAG | machine::IF_FLAG | (1u32 << 8)) as u64);
+    // PM HW-IRQ handler entry: clear VM, the guest's virtual IF (VIF — handlers
+    // enter with interrupts disabled, textbook INT semantics), and TF. The real
+    // IF (bit 9) is the host's, forced =1 at the arch exit. IOPL is pinned to 1
+    // there too, so it needs no touch here.
+    regs.frame.rflags &= !((machine::VM_FLAG | machine::VIF_FLAG | (1u32 << 8)) as u64);
     regs.frame.cs  = sel as u64;
     regs.frame.rip = off as u64;
 }
@@ -879,7 +881,7 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Vc
     // restores them unmodified per CPU's own INT-n semantics. Pushing
     // 0 or current handler flags would corrupt status bits across the
     // round-trip.
-    let ret_flags = regs.flags32() as u16;
+    let ret_flags = machine::guest_flags(regs) as u16;
 
     // rm_get_stack: live rm cursor if a chain is in flight (e.g., we're
     // a nested reflect inside an outer 0300 BIOS call), else rm_TOS.
@@ -907,14 +909,15 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Vc
     machine::vm86_push(regs, ret_seg);
     machine::vm86_push(regs, ret_off);
 
-    // Enter the RM handler with IF cleared (matches CPU's INT-n: clears
-    // IF, preserves status flags) and IOPL=1 (cli/sti virtualized via
-    // VME's VIF). VM_FLAG already set by push_continuation_and_switch_to_rm_side and
+    // Enter the RM handler with the guest's virtual IF (VIF) cleared (matches
+    // CPU's INT-n: clears IF, preserves status flags) and IOPL=1. The real IF
+    // (bit 9) is the host's, untouched here and forced =1 at the arch exit.
+    // VM_FLAG already set by push_continuation_and_switch_to_rm_side and
     // preserved by the read-modify-write.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
     let if_was = if_bit(regs);
-    let new_flags = (regs.flags32() & !(machine::IF_FLAG | machine::IOPL_MASK))
+    let new_flags = (regs.flags32() & !(machine::VIF_FLAG | machine::IOPL_MASK))
                   | machine::IOPL_VM86;
     regs.frame.rflags = new_flags as u64;
     if_record(IF_REFLECT_RM, regs, if_was, if_bit(regs),
@@ -953,7 +956,14 @@ pub(super) fn resume_continuation_from_stub(dos: &mut thread::DosState, regs: &m
         let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);
-        regs.set_flags32((ret_flags & !STATUS_MASK) | current_status | machine::IF_FLAG);
+        // Resume with the guest's virtual IF (VIF) on; keep the host's real IF
+        // (bit 9) untouched — ret_flags is guest-observable, so its bit-9 is the
+        // guest's IF and must not land on the real IF.
+        let keep_real_if = regs.flags32() & machine::IF_FLAG;
+        regs.set_flags32(
+            (ret_flags & !STATUS_MASK & !machine::IF_FLAG)
+                | current_status | machine::VIF_FLAG | keep_real_if,
+        );
     }
     // IRQ chain complete when we just popped an outermost HC (HC.other_stack=None
     // ⇒ first-entry from client). Nested HCs (Some) keep the flag so trace

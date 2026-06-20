@@ -474,22 +474,20 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // Only ring 3 / VM86 needs the full user-emulation cleanup (VIF/VIP swap,
     // VM86 seg promotion). Ring 1 kernel just needs the layout normalized.
 
-    // VIF↔IF entry swap (ring 3 / VM86 only). With VME the hardware maintains
-    // VIF/VIP in EFLAGS bits 19/20; otherwise we keep them in statics across
-    // the kernel run.
+    // The guest's virtual-IF lives in EFLAGS bit 19 (VIF) of the saved frame —
+    // the kernel's single virtual-IF home. Bit 9 (IF) is the *real* interrupt
+    // flag only, never guest state. VME+VM86 keeps VIF/VIP in bits 19/20 in
+    // hardware; no-VME / PM can't carry them across the iret (the CPU would
+    // misapply VME semantics), so on exit they were stashed in the statics —
+    // restore them into the frame here.
     let from_ring3 = vm86 || (raw_cs & 3) == 3;
     if from_ring3 {
-        if vm86 && x86::read_cr4() & x86::cr4::VME != 0 {
+        let vme_vm86 = vm86 && x86::read_cr4() & x86::cr4::VME != 0;
+        if !vme_vm86 {
             unsafe {
-                VIF = regs.frame.rflags & (1 << 19) != 0;
-                VIP = regs.frame.rflags & (1 << 20) != 0;
+                if VIF { regs.frame.rflags |= 1 << 19; } else { regs.frame.rflags &= !(1 << 19); }
+                if VIP { regs.frame.rflags |= 1 << 20; } else { regs.frame.rflags &= !(1 << 20); }
             }
-        }
-        unsafe {
-            if VIF { regs.frame.rflags |= 1 << 9; }
-            else   { regs.frame.rflags &= !(1 << 9); }
-            if VIP { regs.frame.rflags |= 1 << 20; }
-            else   { regs.frame.rflags &= !(1 << 20); }
         }
         isr_handler_ring3(regs);
     } else {
@@ -499,29 +497,24 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // Mode-toggle the CPU if the kernel's output mode differs from entry.
     let to_64 = toggle_mode_if_needed(regs, from_64);
 
-    // VIF↔IF exit swap (ring 3 / VM86 only); force real IF=1 so HW IRQs can be
-    // delivered to user.
+    // Exit to a ring-3/VM86 guest: force real IF=1 (bit 9) so HW IRQs always
+    // preempt. VIF/VIP stay in bits 19/20 (the kernel's virtual-IF home).
     let to_vm86 = is_vm86(regs);
     let to_ring3 = to_vm86 || (regs.frame.cs & 3) == 3;
     if to_ring3 {
-        unsafe {
-            VIF = regs.frame.rflags & (1 << 9) != 0;
-            VIP = regs.frame.rflags & (1 << 20) != 0;
-        }
-        if to_vm86 && x86::read_cr4() & x86::cr4::VME != 0 {
-            if unsafe { VIF } { regs.frame.rflags |= 1 << 19; }
-            else              { regs.frame.rflags &= !(1 << 19); }
-        } else {
-            // PM client (CR4.PVI is off) or software-VM86 (no VME): virtual
-            // IF/VIP live only in the statics saved just above; the hardware
-            // VIF/VIP bits (19/20) must be 0, or the CPU applies VME virtual-
-            // interrupt semantics to the client. Bochs does exactly that — a
-            // stale VIF=1 left riding through here made Doom/Jazz/Duke3D's
-            // freshly-installed timer ISR flip VIF on CLI/STI, desyncing from
-            // our bit-9 tracking so the dispatcher's EOI never landed and IRQ0
-            // wedged in-service. QEMU leaves these bits 0, so this is a no-op
-            // there. The next PM entry restores them to the frame from the
-            // statics, so no tracking is lost.
+        let vme_vm86 = to_vm86 && x86::read_cr4() & x86::cr4::VME != 0;
+        if !vme_vm86 {
+            // no-VME / PM: the hardware can't carry VIF/VIP across the iret —
+            // bits 19/20 must be 0 or the CPU applies VME virtual-interrupt
+            // semantics to the client (the Bochs Doom/Jazz/Duke3D timer-ISR
+            // wedge: a stale VIF flips on CLI/STI, the dispatcher's EOI never
+            // lands, IRQ0 wedges in-service). So stash them in the statics and
+            // clear the bits; the next entry restores them into the frame.
+            // VME+VM86 leaves bits 19/20 in the frame for the hardware.
+            unsafe {
+                VIF = regs.frame.rflags & (1 << 19) != 0;
+                VIP = regs.frame.rflags & (1 << 20) != 0;
+            }
             regs.frame.rflags &= !((1 << 19) | (1 << 20));
         }
         regs.frame.rflags |= 0x200;
@@ -641,7 +634,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
             // fault: bubble it as an IRQ and let `pick_pending_vec` choose the
             // highest-priority deliverable line. The Fault path leaves IP on
             // the (innocent) instruction, so it re-runs after the handler IRETs.
-            const VIF_VIP: u32 = (1 << 9) | (1 << 20);
+            const VIF_VIP: u32 = (1 << 19) | (1 << 20);
             let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
             match monitor(regs) {
                 MonitorResult::Resume => {
@@ -653,7 +646,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                     // clients use CLI/STI/AX=0900-0902 only.
                     if TF_VIRTUAL_IF_STEPPING
                         && regs.mode() != UserMode::VM86
-                        && regs.flags32() & (1 << 9) == 0
+                        && regs.flags32() & (1 << 19) == 0
                     {
                         let _ = step_virtual_if(regs);
                     }

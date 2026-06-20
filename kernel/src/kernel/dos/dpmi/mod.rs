@@ -156,7 +156,7 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
     }
 
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
-    regs.frame.rflags |= machine::IF_FLAG as u64;
+    regs.frame.rflags |= machine::VIF_FLAG as u64;
     regs.frame.cs = cs_sel as u64;
     regs.frame.rip = ret_ip as u64;
     regs.frame.ss = ss_sel as u64;
@@ -845,21 +845,21 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         // AX=0900h — Get and Disable Virtual Interrupt State
         // Returns: AL = previous state (1=enabled, 0=disabled)
         0x0900 => {
-            let prev = if regs.frame.rflags & (1 << 9) != 0 { 1u64 } else { 0u64 };
-            regs.frame.rflags &= !(1 << 9);
+            let prev = if regs.frame.rflags & (machine::VIF_FLAG as u64) != 0 { 1u64 } else { 0u64 };
+            regs.frame.rflags &= !(machine::VIF_FLAG as u64);
             regs.rax = (regs.rax & !0xFF) | prev;
             clear_carry(regs);
         }
         // AX=0901h — Get and Enable Virtual Interrupt State
         0x0901 => {
-            let prev = if regs.frame.rflags & (1 << 9) != 0 { 1u64 } else { 0u64 };
-            regs.frame.rflags |= 1 << 9;
+            let prev = if regs.frame.rflags & (machine::VIF_FLAG as u64) != 0 { 1u64 } else { 0u64 };
+            regs.frame.rflags |= machine::VIF_FLAG as u64;
             regs.rax = (regs.rax & !0xFF) | prev;
             clear_carry(regs);
         }
         // AX=0902h — Get Virtual Interrupt State
         0x0902 => {
-            regs.rax = (regs.rax & !0xFF) | if regs.frame.rflags & (1 << 9) != 0 { 1 } else { 0 };
+            regs.rax = (regs.rax & !0xFF) | if regs.frame.rflags & (machine::VIF_FLAG as u64) != 0 { 1 } else { 0 };
             clear_carry(regs);
         }
         // AX=0A00h — Get Vendor-Specific API Entry Point (not supported)

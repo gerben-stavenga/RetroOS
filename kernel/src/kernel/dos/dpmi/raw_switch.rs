@@ -21,7 +21,7 @@ fn raw_switch_pm_to_real(_dos: &mut thread::DosState, regs: &mut Vcpu) -> thread
     let new_cs = regs.rsi as u16;
     let new_ip = regs.rdi as u16;
 
-    regs.frame.rflags |= (machine::VM_FLAG | machine::IF_FLAG) as u64;
+    regs.frame.rflags |= (machine::VM_FLAG | machine::VIF_FLAG) as u64;
     regs.frame.cs = new_cs as u64;
     regs.frame.rip = new_ip as u64;
     regs.frame.ss = new_ss as u64;
@@ -138,7 +138,7 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm(dos: &mut thread::DosState, 
     };
 
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
-    regs.frame.rflags |= machine::IF_FLAG as u64;
+    regs.frame.rflags |= machine::VIF_FLAG as u64;
     regs.frame.cs = new_cs as u64;
     regs.frame.rip = new_eip as u64;
     regs.frame.ss = new_ss as u64;

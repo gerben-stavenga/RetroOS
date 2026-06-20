@@ -764,7 +764,7 @@ pub(crate) fn handle_synth_child(
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
 fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
-    use machine::{VM_FLAG, IF_FLAG, IOPL_VM86};
+    use machine::{VM_FLAG, VIF_FLAG, IOPL_VM86};
     let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
     state.ds = psp_seg as u64;
@@ -774,7 +774,7 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
     state.frame = crate::Frame64 {
         rip: ip as u64,
         cs: cs as u64,
-        rflags: (VM_FLAG | IF_FLAG | IOPL_VM86) as u64,
+        rflags: (VM_FLAG | VIF_FLAG | IOPL_VM86) as u64,
         rsp: sp as u64,
         ss: ss as u64,
     };
@@ -967,7 +967,7 @@ pub fn raise_pending(machine: &mut crate::TheArch, dos: &mut thread::DosState, r
     // specified mouse-driver reentrancy guard. `deliver_mouse_callback` clears
     // `pending_cond` for this invocation and sets `cb_in_flight`.
     let mouse = &dos.pc.mouse;
-    let mouse_ready = regs.frame.rflags & (1u64 << 9) != 0
+    let mouse_ready = regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
         && !mouse.cb_in_flight
         && mouse.cb_mask & mouse.pending_cond != 0;
     if mouse_ready {

@@ -21,6 +21,12 @@ use crate::Regs;
 use crate::arch::Vcpu;
 
 pub const IF_FLAG: u32 = 1 << 9;
+/// VIF — the guest's virtual interrupt flag (EFLAGS bit 19). The DOS layer's
+/// single virtual-IF store; bit 9 (IF) is the real interrupt flag only. The
+/// kernel reads/writes the guest's IF here; a flags word the guest *observes*
+/// (a FLAGS pushed into a guest IRET frame) carries VIF in the bit-9 slot via
+/// `guest_flags`.
+pub const VIF_FLAG: u32 = 1 << 19;
 pub const IOPL_MASK: u32 = 3 << 12;
 /// IOPL=1 — kernel-set value for VM86 threads. With IOPL<3 and VME,
 /// CLI/STI/PUSHF/POPF/INT/IRET virtualize through VIF instead of touching
@@ -62,8 +68,18 @@ pub fn vm86_sp(regs: &Vcpu) -> u16 {
 }
 
 #[inline]
+/// The flags word the guest observes: its virtual-IF (VIF/bit 19) shows in the
+/// bit-9 (IF) slot, and the internal VIF bit is masked out. Bit 9 of the *live*
+/// frame is the real IF — never what the guest should see.
+#[inline]
+pub fn guest_flags(regs: &Vcpu) -> u32 {
+    let f = regs.flags32();
+    let vif = f & VIF_FLAG != 0;
+    (f & !(IF_FLAG | VIF_FLAG)) | if vif { IF_FLAG } else { 0 }
+}
+
 pub fn vm86_flags(regs: &Vcpu) -> u32 {
-    regs.flags32()
+    guest_flags(regs)
 }
 
 #[inline]
@@ -84,8 +100,16 @@ pub fn set_vm86_sp(regs: &mut Vcpu, sp: u16) {
 
 #[inline]
 pub fn set_vm86_flags(regs: &mut Vcpu, flags: u32) {
-    // Merge low 16 bits (user-visible flags), preserve upper EFLAGS (VM, IOPL, VIF, VIP).
-    regs.frame.rflags = (regs.frame.rflags & !0xFFFF) | (flags as u64 & 0xFFFF);
+    // `flags` is the guest's view: its IF intent is in bit 9. Map it to VIF
+    // (bit 19), set the low-16 status flags, and PRESERVE the real IF (bit 9)
+    // and the upper EFLAGS (VM/VIP). The next ring-3 exit forces real IF=1.
+    let want_vif = flags & IF_FLAG != 0;
+    let real_if = regs.frame.rflags & (IF_FLAG as u64);
+    regs.frame.rflags = (regs.frame.rflags & !0xFFFF)
+        | ((flags as u64 & 0xFFFF) & !(IF_FLAG as u64))
+        | real_if;
+    if want_vif { regs.frame.rflags |= VIF_FLAG as u64; }
+    else        { regs.frame.rflags &= !(VIF_FLAG as u64); }
 }
 
 pub(super) mod vga;
@@ -777,7 +801,7 @@ pub fn queue_irq(pc: &mut PcMachine, regs: &mut Vcpu, event: crate::arch::Irq) {
 /// always has something real to deliver, so it can't spin.
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Vcpu) -> Option<u8> {
     const VIP: u64 = 1 << 20;
-    let vif = regs.frame.rflags & (1u64 << 9) != 0; // IF = virtual interrupt flag
+    let vif = regs.frame.rflags & (VIF_FLAG as u64) != 0; // guest virtual interrupt flag
     let candidate = pc.vpic.peek();
 
     if !vif {

@@ -153,7 +153,7 @@ fn poll_dos_console_char(dos: &mut thread::DosState, regs: &mut Vcpu) -> Option<
 fn park_at_slot_resume(regs: &mut Vcpu) {
     machine::set_vm86_cs(regs, CTRL_STUB_SEG);
     machine::set_vm86_ip(regs, ctrl_slot_off(SLOT_RESUME));
-    regs.frame.rflags |= machine::IF_FLAG as u64;
+    regs.frame.rflags |= machine::VIF_FLAG as u64;
 }
 
 // ============================================================================
@@ -694,7 +694,7 @@ fn launch_int16_read(regs: &mut Vcpu) {
     machine::set_vm86_cs(regs, ivt_seg);
     machine::set_vm86_ip(regs, ivt_off);
     regs.rax &= !0xFF00;                      // AH = 0 (INT 16h AH=00)
-    regs.frame.rflags |= machine::IF_FLAG as u64; // IF=1 while INT 16 runs
+    regs.frame.rflags |= machine::VIF_FLAG as u64; // guest VIF=1 while INT 16 runs
 }
 
 /// Completion closure for an INT-16-routed DOS char read. Fires once the

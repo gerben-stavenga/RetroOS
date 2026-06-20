@@ -344,10 +344,11 @@ pub fn execute() -> KernelEvent {
         crate::screendump::maybe_render_live();
         let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
         let mode = regs.mode();
-        // Virtual-IF stepping: while a PM client has IF off, emulate the leading
-        // IF-touching opcodes in software so we only ever hand unicorn a
-        // non-sensitive instruction (which `configure` then TF-single-steps).
-        if mode == UserMode::Mode32 && regs.flags32() & IF_FLAG == 0 {
+        // Virtual-IF stepping: while a PM client has its virtual IF (VIF) off,
+        // emulate the leading IF-touching opcodes in software so we only ever
+        // hand unicorn a non-sensitive instruction (which `configure` then
+        // TF-single-steps).
+        if mode == UserMode::Mode32 && regs.flags32() & VIF_FLAG == 0 {
             // A sensitive op decoded during stepping (e.g. IRET popping CS=0)
             // bubbles as an Event — surface it rather than re-entering. The view
             // is bound to the interpreted thread's own space (REGS.space), not
@@ -510,6 +511,28 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
 
 const IF_FLAG: u32 = 1 << 9;
 const TF_FLAG: u32 = 1 << 8;
+/// VIF (EFLAGS bit 19) — the kernel's canonical store for the guest's virtual
+/// interrupt flag, shared with arch-metal. The interpreter runs the guest with
+/// its IF in the native bit-9 slot, so the entry/exit boundary mirrors between
+/// the two: bit 9 ← VIF on the way into Unicorn, VIF ← bit 9 on the way out.
+const VIF_FLAG: u32 = 1 << 19;
+
+/// Entry: project the guest's virtual IF (VIF/bit 19) into the bit-9 (IF) slot
+/// the emulated CPU runs with.
+#[inline]
+fn vif_to_if(flags: u32) -> u32 {
+    let vif = flags & VIF_FLAG != 0;
+    (flags & !IF_FLAG) | if vif { IF_FLAG } else { 0 }
+}
+
+/// Exit: mirror the emulated IF (bit 9) back into VIF (bit 19), and set the real
+/// IF (bit 9) = 1 — the host-side invariant (the interpreter owns preemption via
+/// its instruction budget, so the real IF never gates guest state).
+#[inline]
+fn if_to_vif(flags: u32) -> u32 {
+    let vif = flags & IF_FLAG != 0;
+    (flags & !VIF_FLAG) | IF_FLAG | if vif { VIF_FLAG } else { 0 }
+}
 
 // Virtual-IF single-stepping and sensitive-instruction decoding now live in the
 // shared `arch_abi::monitor`, driven through `InterpView` (see top of file).
@@ -777,7 +800,8 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // IVT-reflects the INTs; the host, not unicorn's native IF, owns
             // interrupt state. NEVER IOPL=3: that lets the guest toggle the real
             // IF behind the kernel's back and bypasses the per-swap-in IO bitmap.
-            let flags = (r.flags32() & !(IOPL_MASK as u32)) | (VM_FLAG as u32) | (1 << 12) | 2;
+            // Project VIF (bit 19) into the bit-9 IF slot the guest runs with.
+            let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32)) | (VM_FLAG as u32) | (1 << 12) | 2);
             let frame = [
                 r.ip32() & 0xFFFF,
                 r.code_seg() as u32,
@@ -797,7 +821,9 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // bit 9); POPF/IRET silently drop IF at CPL>IOPL, so while the virtual
             // IF is 0 we single-step (TF=1) and `step_virtual_if` emulates the
             // IF-touching opcodes in software. With IF on we run at full speed.
-            let mut flags = (r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (1 << 12) | 2;
+            // Project VIF (bit 19) into the bit-9 IF slot; then if the guest's IF
+            // is off, single-step so POPF/IRET get caught (CPL>IOPL drops them).
+            let mut flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (1 << 12) | 2);
             if flags & IF_FLAG == 0 {
                 flags |= TF_FLAG; // step the next non-sensitive instruction
             }
@@ -839,10 +865,11 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             r.es = rd(uc, RegisterX86::ES);
             r.fs = rd(uc, RegisterX86::FS);
             r.gs = rd(uc, RegisterX86::GS);
-            // Re-assert VM86 in the saved flags so `regs.mode()` stays VM86 for the
-            // kernel; normalize IOPL to the kernel-side invariant (1, never 3).
-            // Bit 9 carries the virtual IF the monitor tracked across the slice.
-            r.frame.rflags = (rd(uc, RegisterX86::EFLAGS) & !IOPL_MASK) | VM_FLAG | (1 << 12);
+            // Re-assert VM86 so `regs.mode()` stays VM86 for the kernel; normalize
+            // IOPL to the kernel invariant (1, never 3). Mirror the emulated IF
+            // (bit 9) into the canonical VIF (bit 19) and set the real IF =1.
+            let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
+            r.frame.rflags = (uc_fl & !IOPL_MASK) | VM_FLAG | (1 << 12);
         }
         UserMode::Mode32 => {
             // PM client: a far jump / mov may have reloaded any selector — read
@@ -855,10 +882,12 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             r.es = rd(uc, RegisterX86::ES);
             r.fs = rd(uc, RegisterX86::FS);
             r.gs = rd(uc, RegisterX86::GS);
-            // Normalize IOPL to the kernel-side invariant (1, never 3) and strip
-            // the stepping TF. The guest ran at CPL=3/IOPL=1, so CLI/STI #GP'd
-            // into the monitor; bit 9 holds the virtual IF it tracked.
-            r.frame.rflags = (rd(uc, RegisterX86::EFLAGS) & !IOPL_MASK & !(TF_FLAG as u64)) | (1 << 12);
+            // Normalize IOPL to the kernel invariant (1, never 3) and strip the
+            // stepping TF. The guest ran at CPL=3/IOPL=1, so CLI/STI #GP'd into
+            // the monitor; mirror the emulated IF (bit 9) into the canonical VIF
+            // (bit 19) and set the real IF =1.
+            let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
+            r.frame.rflags = (uc_fl & !IOPL_MASK & !(TF_FLAG as u64)) | (1 << 12);
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
             // (and possibly EIP) holding stale bits from the trampoline's own
