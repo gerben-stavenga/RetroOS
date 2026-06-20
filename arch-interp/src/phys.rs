@@ -123,6 +123,12 @@ pub fn inc_ref(frame: u64) {
     *shared().lock().unwrap().entry(frame).or_insert(1) += 1;
 }
 
+/// Is `frame` referenced by more than one PTE (refcount > 1)? COW uses this to
+/// decide copy-vs-reuse: a sole owner can take the page writable without a copy.
+pub fn is_shared(frame: u64) -> bool {
+    shared().lock().unwrap().contains_key(&frame)
+}
+
 /// Return `count` frames at `start` to the allocator. A shared (aliased) frame
 /// just drops a reference. The last reference hole-punches it (host RAM
 /// reclaimed; the frame re-reads zero on next touch) and pushes it to the free

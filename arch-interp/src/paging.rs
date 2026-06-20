@@ -25,6 +25,10 @@ const PRESENT: u32 = 1 << 0;
 const WRITABLE: u32 = 1 << 1;
 const USER: u32 = 1 << 2;
 const ENTRY_FLAGS: u32 = PRESENT | WRITABLE | USER;
+/// Software PTE bit (bits 9-11 are ignored by the CPU/unicorn page walk): marks
+/// a copy-on-write page. Such a page is mapped PRESENT|USER read-only (W=0), so
+/// a write #PFs; `space_cow_fault` then privatises the frame and clears COW.
+const COW: u32 = 1 << 9;
 
 #[inline]
 fn pde_index(vaddr: u32) -> usize {
@@ -515,8 +519,14 @@ pub fn space_translate(vaddr: u32) -> Option<u32> {
     translate(active_pd(), vaddr)
 }
 
-/// Eager copy fork: clone every present mapping into a new space with its own
-/// freshly-copied frames (correct, not yet COW — mirrors the current model).
+/// Copy-on-write fork: clone the page-table *structure* into a new space, but
+/// share every leaf data frame read-only + COW-marked (bumping its refcount)
+/// instead of copying it. A later write in either space #PFs into
+/// `space_cow_fault`, which privatises just that one frame. The parent's own
+/// PTEs are downgraded to RO+COW too, so its writes fault as well — every slice
+/// reloads CR3, so the parent re-walks the new flags on resume. Kernel windows
+/// (already mapped shared-writable into the fresh space by `space_new`) are left
+/// untouched: the CPL0 trampoline writes its iret frame there.
 pub fn space_fork(src: u32) -> u32 {
     let src_pd = SPACES.with(|s| *s.borrow().pd.get(&src).expect("fork src"));
     let dst = space_new();
@@ -533,19 +543,75 @@ pub fn space_fork(src: u32) -> u32 {
                 continue;
             }
             let v = ((pde_i << 22) | (pte_i << 12)) as u32;
-            let src_frame = (pte >> 12) as u64;
-            let dst_frame = phys::alloc_frames(1);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    phys::frame_ptr(src_frame),
-                    phys::frame_ptr(dst_frame),
-                    4096,
-                );
+            // Kernel windows are pre-mapped (shared, writable) into the fresh
+            // space — never share-COW them (the trampoline writes there).
+            if translate(dst_pd, v).is_some() {
+                continue;
             }
-            map_page(dst_pd, v, dst_frame, pte & WRITABLE != 0);
+            let frame = (pte >> 12) as u64;
+            if pte & WRITABLE != 0 || pte & COW != 0 {
+                // Writable, OR already a COW page from an earlier fork (RO but
+                // privately writable): both sides go RO+COW over the one shared
+                // frame. Marking src is idempotent when it's already COW — the
+                // point is to never demote a COW page to plain-RO, or a
+                // grandchild's legitimate write would fault unresolved.
+                write_entry(src_pt, pte_i, ((frame as u32) << 12) | PRESENT | USER | COW);
+                map_page_cow(dst_pd, v, frame);
+            } else {
+                // Genuinely read-only (code/rodata): share as-is, no COW needed.
+                map_page(dst_pd, v, frame, false);
+            }
+            phys::inc_ref(frame);
         }
     }
     dst
+}
+
+/// Map `vaddr` to `frame` as a copy-on-write page: PRESENT|USER, W=0, COW=1.
+fn map_page_cow(pd: u64, vaddr: u32, frame: u64) {
+    let pde_i = pde_index(vaddr);
+    let pde = read_entry(pd, pde_i);
+    let pt = if pde & PRESENT != 0 {
+        (pde >> 12) as u64
+    } else {
+        let pt = alloc_table();
+        write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
+        pt
+    };
+    write_entry(pt, pte_index(vaddr), ((frame as u32) << 12) | PRESENT | USER | COW);
+}
+
+/// Resolve a write #PF on a present COW page in the active space: privatise the
+/// frame (copy if still shared with another space, else just re-enable write)
+/// and clear the COW mark. Returns false if `vaddr` isn't a COW page — a
+/// genuine read-only/illegal write the kernel must surface as a fault.
+pub fn space_cow_fault(vaddr: u32) -> bool {
+    with_active_pd(|pd| {
+        let pde = read_entry(pd, pde_index(vaddr));
+        if pde & PRESENT == 0 {
+            return false;
+        }
+        let pt = (pde >> 12) as u64;
+        let pte_i = pte_index(vaddr);
+        let pte = read_entry(pt, pte_i);
+        if pte & PRESENT == 0 || pte & COW == 0 {
+            return false;
+        }
+        let frame = (pte >> 12) as u64;
+        if phys::is_shared(frame) {
+            // Still aliased by another space — copy into a private frame.
+            let new = phys::alloc_frames(1);
+            unsafe {
+                core::ptr::copy_nonoverlapping(phys::frame_ptr(frame), phys::frame_ptr(new), 4096);
+            }
+            write_entry(pt, pte_i, ((new as u32) << 12) | ENTRY_FLAGS);
+            phys::free_frames(frame, 1); // drop this space's reference
+        } else {
+            // Sole owner — no copy; just re-enable write and clear COW.
+            write_entry(pt, pte_i, ((frame as u32) << 12) | ENTRY_FLAGS);
+        }
+        true
+    })
 }
 
 // ── Kernel windows: mappings every address space must carry ──────────────────

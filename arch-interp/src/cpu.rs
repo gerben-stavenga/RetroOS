@@ -393,7 +393,14 @@ pub fn execute() -> KernelEvent {
             let d = uc.get_data();
             if matches!(d.pending_intr, Some(14) | Some(8)) && !d.pending_is_int {
                 let cr2 = d.pending_cr2;
-                if crate::paging::space_translate(cr2).is_none() && crate::paging::space_demand(cr2) {
+                // Absent VA → demand-commit a fresh frame; present VA → a write to
+                // a read-only page, which is a COW page to privatise (else genuine).
+                let resolved = if crate::paging::space_translate(cr2).is_none() {
+                    crate::paging::space_demand(cr2)
+                } else {
+                    crate::paging::space_cow_fault(cr2)
+                };
+                if resolved {
                     flush_tlb(uc);
                     {
                         let d = uc.get_data_mut();
