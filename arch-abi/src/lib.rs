@@ -323,6 +323,10 @@ impl Regs {
     pub fn init_user_process(&mut self, entry: u32, stack: u32) {
         let ds = USER_DS as u64;
         const IF_FLAG: u64 = 1 << 9;
+        // VIF (bit 19) is the canonical guest interrupt-enable; a fresh Linux
+        // process runs with interrupts on. Metal forces real IF=1 regardless,
+        // but the interp projects VIF->IF, so without this it would run IF=0.
+        const VIF_FLAG: u64 = 1 << 19;
 
         *self = Self::empty();
         self.gs = ds;
@@ -332,7 +336,7 @@ impl Regs {
         self.frame = Frame64 {
             rip: entry as u64,
             cs: USER_CS as u64,
-            rflags: IF_FLAG,
+            rflags: IF_FLAG | VIF_FLAG,
             rsp: stack as u64,
             ss: USER_DS as u64,
         };
@@ -342,6 +346,10 @@ impl Regs {
     pub fn init_user_process_64(&mut self, entry: u64, stack: u64) {
         let ds = USER_DS as u64;
         const IF_FLAG: u64 = 1 << 9;
+        // VIF (bit 19) is the canonical guest interrupt-enable; a fresh Linux
+        // process runs with interrupts on. Metal forces real IF=1 regardless,
+        // but the interp projects VIF->IF, so without this it would run IF=0.
+        const VIF_FLAG: u64 = 1 << 19;
 
         *self = Self::empty();
         self.gs = 0;   // FS/GS are MSR bases in 64-bit mode, 0 = no TLS yet
@@ -351,7 +359,7 @@ impl Regs {
         self.frame = Frame64 {
             rip: entry,
             cs: USER_CS64 as u64,
-            rflags: IF_FLAG,
+            rflags: IF_FLAG | VIF_FLAG,
             rsp: stack,
             ss: USER_DS as u64,
         };
