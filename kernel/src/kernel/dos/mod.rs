@@ -621,7 +621,7 @@ fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
-pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>) {
+pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, viopl: u8) {
     use crate::kernel::startup;
 
     let current = thread::get_thread(threads, tid).unwrap();
@@ -676,6 +676,13 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
 
     init_process_thread_vm86_state(current, psp_seg, cs, ip, ss, sp);
+    // Virtual IOPL passed in by the exec caller: COMMAND.COM reads the `iopl3`
+    // flag from LOADFIX.CFG and passes 3 via SYNTH_FORK_EXEC; every other caller
+    // passes 1 (spec-conforming). The kernel never reads LOADFIX.CFG itself.
+    // The real run IOPL is pinned to 1 at the arch exit; this is the virtual
+    // level the PM gate reads. (Literal mask: `machine` is the arch param here.)
+    let f = &mut current.kernel.vcpu.regs.frame.rflags;
+    *f = (*f & !(3u64 << 12)) | ((viopl as u64) << 12);
     let dos_state = current.dos_mut();
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
     current.kernel.symbols = None;
@@ -764,7 +771,7 @@ pub(crate) fn handle_synth_child(
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
 fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
-    use machine::{VM_FLAG, VIF_FLAG, IOPL_VM86};
+    use machine::{VM_FLAG, VIF_FLAG, IOPL_DEFAULT};
     let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
     state.ds = psp_seg as u64;
@@ -774,7 +781,9 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
     state.frame = crate::Frame64 {
         rip: ip as u64,
         cs: cs as u64,
-        rflags: (VM_FLAG | VIF_FLAG | IOPL_VM86) as u64,
+        // Seed the virtual IOPL=3 (compat/step) here at process start; the real
+        // run IOPL is pinned to 1 at the arch exit. <3 would be spec-strict.
+        rflags: (VM_FLAG | VIF_FLAG | IOPL_DEFAULT) as u64,
         rsp: sp as u64,
         ss: ss as u64,
     };

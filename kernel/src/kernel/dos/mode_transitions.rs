@@ -917,8 +917,9 @@ pub(super) fn reflect_int_to_real_mode(dos: &mut thread::DosState, regs: &mut Vc
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
     let if_was = if_bit(regs);
-    let new_flags = (regs.flags32() & !(machine::VIF_FLAG | machine::IOPL_MASK))
-                  | machine::IOPL_VM86;
+    // vIOPL rides the flags unchanged (no IOPL force): the real IOPL is pinned
+    // to 1 at the arch exit, so the RM-handler entry only needs VIF cleared.
+    let new_flags = regs.flags32() & !machine::VIF_FLAG;
     regs.frame.rflags = new_flags as u64;
     if_record(IF_REFLECT_RM, regs, if_was, if_bit(regs),
         dos.pc.locked_stack.other_stack);

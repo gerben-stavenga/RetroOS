@@ -107,7 +107,22 @@ fn apply_guest_flags(regs: &mut Regs, popped: u32) {
 /// VM86 never needs this: at IOPL<3 every IF-touching op (including POPF/IRET)
 /// #GPs, so the monitor sees them all. Only PM (CPL>IOPL) has the silent-drop
 /// hole this closes.
-pub const TF_VIRTUAL_IF_STEPPING: bool = true;
+/// True when the current guest's *virtual* IOPL is 3, meaning the client is
+/// treated as owning the interrupt flag and POPF/IRET must be honored by
+/// single-stepping (compat for the non-conforming clients above: Hexen via
+/// DOS32A, sporadic IF=0 hangs). A virtual IOPL < 3 is spec-strict per DPMI 0.9
+/// §2.13 — CLI/STI stay virtualized, POPF/IRET are left ignored, no step.
+///
+/// vIOPL is per-thread interrupt-control state, so it lives in the saved flags
+/// exactly like VIF/VIP — NOT a global. The *real* IOPL is pinned to 1 in traps
+/// (so CLI/STI/IN/OUT trap); the IOPL field (bits 12-13) carries the *virtual*
+/// level, stashed/restored around the iret in the isr like VIF/VIP. Default 3
+/// (the old unconditional `TF_VIRTUAL_IF_STEPPING == true`); a per-program
+/// policy (LOADFIX.CFG) can launch a client at vIOPL < 3.
+#[inline]
+pub fn virtual_if_stepping(regs: &Regs) -> bool {
+    (regs.flags32() >> 12) & 3 == 3
+}
 
 // =============================================================================
 // Segment views

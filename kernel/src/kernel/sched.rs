@@ -57,10 +57,10 @@ fn next_after(
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
         thread::KernelAction::Exit(code) => Some(thread::exit_thread(threads, machine, tid, code)),
         thread::KernelAction::Switch(next) => Some(next),
-        thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, on_error, on_success } => {
+        thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, viopl, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(
                 machine, threads, regs, tid,
-                &path[..path_len], &cmdtail[..cmdtail_len],
+                &path[..path_len], &cmdtail[..cmdtail_len], viopl,
                 on_error, on_success,
             )
         }

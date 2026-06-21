@@ -89,7 +89,8 @@ pub(super) fn simulate_real_mode_int(dos: &mut thread::DosState, regs: &mut Vcpu
     // Set CS:IP to the IVT handler. VM_FLAG already set by toggle.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    regs.frame.rflags = (machine::VM_FLAG | machine::VIF_FLAG | machine::IOPL_VM86) as u64;
+    // vIOPL rides the flags unchanged (no IOPL force); real IOPL pinned at exit.
+    regs.frame.rflags = ((machine::VM_FLAG | machine::VIF_FLAG) | (regs.flags32() & machine::IOPL_MASK)) as u64;
 
     dos_trace!("[DPMI] simulate INT {:02X} -> {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         int_num, ivt_seg, ivt_off, rm_dest.0, rm_dest.1.wrapping_sub(6));
@@ -138,7 +139,8 @@ pub(super) fn call_real_mode_proc(dos: &mut thread::DosState, regs: &mut Vcpu) -
     // Jump to the far procedure. VM_FLAG already set by toggle.
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
-    regs.frame.rflags = (machine::VM_FLAG | machine::VIF_FLAG | machine::IOPL_VM86) as u64;
+    // vIOPL rides the flags unchanged (no IOPL force); real IOPL pinned at exit.
+    regs.frame.rflags = ((machine::VM_FLAG | machine::VIF_FLAG) | (regs.flags32() & machine::IOPL_MASK)) as u64;
     thread::KernelAction::Done
 }
 
@@ -191,7 +193,8 @@ pub(super) fn call_real_mode_proc_iret(dos: &mut thread::DosState, regs: &mut Vc
     // VM_FLAG already set by toggle.
     regs.frame.cs = rm.cs as u64;
     regs.frame.rip = rm.ip as u64;
-    regs.frame.rflags = (machine::VM_FLAG | machine::VIF_FLAG | machine::IOPL_VM86) as u64;
+    // vIOPL rides the flags unchanged (no IOPL force); real IOPL pinned at exit.
+    regs.frame.rflags = ((machine::VM_FLAG | machine::VIF_FLAG) | (regs.flags32() & machine::IOPL_MASK)) as u64;
     thread::KernelAction::Done
 }
 

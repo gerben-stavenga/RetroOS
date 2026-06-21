@@ -95,6 +95,9 @@ pub enum KernelAction {
         path_len: usize,
         cmdtail: [u8; 128],
         cmdtail_len: usize,
+        /// Virtual IOPL the child execs at: 1 = spec-conforming (default),
+        /// 3 = non-conforming (COMMAND.COM passed `iopl3` from LOADFIX.CFG).
+        viopl: u8,
         on_error: fn(&mut crate::Regs, i32),
         on_success: fn(&mut crate::Regs, child_tid: i32),
     },

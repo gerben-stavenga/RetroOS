@@ -74,6 +74,7 @@ static void trace(int on) {
 #define LF_NAME_LEN  16
 #define LF_F_LOADFIX 0x01
 #define LF_F_DOS32A  0x02
+#define LF_F_IOPL3   0x04
 
 static char          loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
 static unsigned char loadfix_flags[LF_MAX_NAMES];
@@ -96,6 +97,7 @@ static int has_ext(const char *name, const char *ext) {
 static unsigned char parse_flag(const char *tok) {
     if (stricmp(tok, "loadfix") == 0) return LF_F_LOADFIX;
     if (stricmp(tok, "dos32a")  == 0) return LF_F_DOS32A;
+    if (stricmp(tok, "iopl3")   == 0) return LF_F_IOPL3;
     return 0;
 }
 
@@ -242,7 +244,7 @@ static void join_args(char *dst, int max, char **argv, int start, int argc) {
 
 static unsigned int get_child_exit_status(void);
 
-static int synth_fork_exec(const char *name, const char *args) {
+static int synth_fork_exec(const char *name, const char *args, unsigned char viopl) {
     /* Take far pointers so the segments come from the pointers
      * themselves rather than whatever ES happens to be at the
      * call site (HW-IRQ delivery clears ES). The tiny-model
@@ -253,6 +255,11 @@ static int synth_fork_exec(const char *name, const char *args) {
     r.h.ah = 0x01;
     r.x.dx = FP_OFF(fname);
     r.x.bx = FP_OFF(fargs);
+    /* CL = child's virtual IOPL: 3 = `iopl3` (DOOM/DOOM2/Hexen), else the
+     * spec-conforming default of 1. Set explicitly -- the global `r` union
+     * is reused, so a stale CL could otherwise leak IOPL=3 into a plain
+     * launch. The kernel reads CL in INT 31h AH=01 (dos.rs SYNTH_FORK_EXEC). */
+    r.x.cx = viopl;
     s.ds   = FP_SEG(fname);
     s.es   = FP_SEG(fargs);
     int86x(0x31, &r, &r, &s);
@@ -347,11 +354,11 @@ static unsigned int get_child_exit_status(void) {
  * right here at the synth call boundary so callers stay tokenised.
  * `poll_kbd` enables the Ctrl-Z = background gesture used by the
  * interactive launcher path; batch lines pass 0. */
-static int run_external_raw(char **argv, int argc, int poll_kbd) {
+static int run_external_raw(char **argv, int argc, int poll_kbd, unsigned char viopl) {
     char tail[128];
     int pid, rc;
     join_args(tail, sizeof(tail), argv, 1, argc);
-    pid = synth_fork_exec(argv[0], tail);
+    pid = synth_fork_exec(argv[0], tail, viopl);
     if (pid < 0) {
         printf("Bad command or file name: '%s'\r\n", argv[0]);
         return 255;
@@ -413,6 +420,7 @@ static int run_external_raw(char **argv, int argc, int poll_kbd) {
 static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) {
     char resolved[80];
     unsigned char flags;
+    unsigned char viopl;
     if (prog_idx >= argc) return 0;
     assert(prog_idx >= 2);
     if (!resolve_program(argv[prog_idx], resolved)) {
@@ -422,6 +430,10 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
     if (has_ext(resolved, ".BAT")) return run_bat_file(resolved);
     argv[prog_idx] = resolved;
     flags = lookup_flags(resolved);
+    /* iopl3: no trampoline, just run the program directly at virtual IOPL=3
+     * so the monitor single-steps its sloppy POPF/IRET interrupt-enable
+     * (DOOM/DOOM2/Hexen). Conforming clients get the default IOPL=1. */
+    viopl = (flags & LF_F_IOPL3) ? 3 : 1;
     if (flags & LF_F_DOS32A) {
         /* Spawn DOS/32A.EXE with prog + args as its tail. DOS/32A loads
          * the target itself and provides a stricter DPMI 0.9 environment
@@ -454,7 +466,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
         argv[prog_idx] = "C:\\COMMAND.COM";
         argv[prog_idx + 1] = "/L";
     }
-    return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd);
+    return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd, viopl);
 }
 
 /* ----- built-ins -----

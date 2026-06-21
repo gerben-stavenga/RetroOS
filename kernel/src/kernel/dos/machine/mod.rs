@@ -28,12 +28,17 @@ pub const IF_FLAG: u32 = 1 << 9;
 /// `guest_flags`.
 pub const VIF_FLAG: u32 = 1 << 19;
 pub const IOPL_MASK: u32 = 3 << 12;
-/// IOPL=1 — kernel-set value for VM86 threads. With IOPL<3 and VME,
-/// CLI/STI/PUSHF/POPF/INT/IRET virtualize through VIF instead of touching
-/// real IF, which is exactly what the cooperative IRQ-injection model
-/// needs. IOPL=0 would also virtualize but trap on a few extras; IOPL=3
-/// would let the guest manipulate real IF and bypass the gate.
-pub const IOPL_VM86: u32 = 1 << 12;
+/// IOPL=1 — the default *virtual* IOPL a process is born with at execv:
+/// spec-CONFORMING (DPMI 0.9 §2.13), so CLI/STI are virtualized but POPF/IRET
+/// are left ignored and no single-stepping is armed (full speed). It is NOT the
+/// real run IOPL — every ring-3 exit pins the real IOPL to 1; this only rides
+/// the saved flags as "the level the client is treated as having", read by the
+/// PM gate (`virtual_if_stepping`). Non-conforming clients that re-enable IF via
+/// POPF/IRET (DOOM/DOOM2/HEXEN, marked in LOADFIX.CFG) are launched at IOPL=3 so
+/// the monitor steps those re-enables. VM86 is unaffected (the gate is PM-only).
+pub const IOPL_DEFAULT: u32 = 1 << 12;
+/// Virtual IOPL=3 — non-conforming DPMI clients (honor POPF/IRET via stepping).
+pub const IOPL_NONCONF: u32 = 3 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
 
 

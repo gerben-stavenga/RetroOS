@@ -958,7 +958,7 @@ pub(crate) fn handle_exec(
         machine.free_user_pages();
     }
 
-    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd).is_err() {
+    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, 1).is_err() {
         return Some(thread::exit_thread(threads, machine, tid, -ENOEXEC));
     }
 

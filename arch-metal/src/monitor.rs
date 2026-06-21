@@ -7,7 +7,7 @@
 //! address directly, and selectors resolve through `descriptors::seg_base`.
 //!
 //! The public surface (`monitor`, `step_virtual_if`, `sw_reflect_vm86_int`,
-//! `seg_base`, `seg_is_32`, `MonitorResult`, `TF_VIRTUAL_IF_STEPPING`, plus the
+//! `seg_base`, `seg_is_32`, `MonitorResult`, `virtual_if_stepping`, plus the
 //! re-exported `KernelEvent`/`IoSize`) is unchanged — callers in `traps.rs` /
 //! `backend.rs` keep resolving `crate::monitor::*` as before.
 
@@ -17,7 +17,7 @@ use arch_abi::Regs;
 // Backend-agnostic arch↔kernel contract types, re-exported so
 // `crate::monitor::{KernelEvent, IoSize}` keeps resolving.
 pub use arch_abi::{IoSize, KernelEvent};
-pub use arch_abi::monitor::{MonitorResult, TF_VIRTUAL_IF_STEPPING};
+pub use arch_abi::monitor::{virtual_if_stepping, MonitorResult};
 
 // Segment resolution (re-exported from descriptors).
 pub use crate::descriptors::{seg_base, seg_is_32};
@@ -101,13 +101,13 @@ pub fn pm_step_log(regs: &crate::Vcpu) {
     for i in 0..8 {
         b[i] = regs.read::<u8>((lin + i as u32) as usize);
     }
+    let f = regs.flags32();
     lib::dbg_println!(
-        "[STEP {}] {:04X}:{:08X} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} SS:SP={:04X}:{:08X} DS={:04X} ES={:04X}",
+        "[STEP {}] {:04X}:{:08X} VIF={} IF={} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} SS:SP={:04X}:{:08X}",
         mode, regs.code_seg(), ip,
+        (f >> 19) & 1, (f >> 9) & 1,
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
-        regs.rsi as u32, regs.rdi as u32, regs.rbp as u32,
         regs.frame.ss as u16, regs.sp32(),
-        regs.ds as u16, regs.es as u16,
     );
 }

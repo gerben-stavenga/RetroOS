@@ -388,6 +388,12 @@ fn arch_switch_to(regs: &mut Regs) {
 pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     static mut VIF: bool = false;
     static mut VIP: bool = false;
+    // Per-thread virtual IOPL (EFLAGS bits 12-13), carried across the iret like
+    // VIF/VIP. The run pins the *real* IOPL=1 (so CLI/STI/IN/OUT trap); this
+    // stash holds the level the client is *treated* as having, so the dispatch
+    // can read it back via `virtual_if_stepping`. 3 = compat (honor POPF/IRET by
+    // stepping); <3 = spec-strict. The kernel is its single writer.
+    static mut VIOPL: u8 = 1;
     // Read just enough raw fields to classify the trap before canonicalizing.
     // Same-priv (ring 0 → ring 0) traps don't push SS/ESP and never reach VM86
     // segs, so canonicalizing would read residue. Cross-priv traps (ring 1
@@ -489,6 +495,10 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
                 if VIP { regs.frame.rflags |= 1 << 20; } else { regs.frame.rflags &= !(1 << 20); }
             }
         }
+        // Restore the per-thread virtual IOPL: the run pinned real IOPL=1 on
+        // exit, so the just-pushed frame reads 1; put the virtual level back in
+        // bits 12-13 before the dispatch so `virtual_if_stepping` sees it.
+        unsafe { regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | ((VIOPL as u64) << 12); }
         isr_handler_ring3(regs);
     } else {
         isr_handler_ring1(regs);
@@ -532,6 +542,12 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         // IOPL=3 into a client's eflags; normalize it here — the one ring-3
         // exit — rather than in each setter. (Where the 3 originates is still
         // open; see TODO "DPMI client IOPL=3 leak".)
+        //
+        // vIOPL: stash the virtual IOPL (bits 12-13) for the next entry, THEN
+        // pin the real run IOPL=1. This replaces the old unconditional squash —
+        // the kernel now owns the virtual IOPL and we carry it across the iret
+        // like VIF/VIP, while the client always actually runs at IOPL=1.
+        unsafe { VIOPL = ((regs.frame.rflags >> 12) & 3) as u8; }
         regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | (1 << 12);
     }
 
@@ -589,7 +605,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 /// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
 /// are handled inline by arch before bubbling.
 fn isr_handler_ring3(regs: &mut Regs) {
-    use crate::monitor::{monitor, step_virtual_if, KernelEvent as KE, MonitorResult, TF_VIRTUAL_IF_STEPPING};
+    use crate::monitor::{monitor, step_virtual_if, virtual_if_stepping, KernelEvent as KE, MonitorResult};
     use arch_abi::UserMode;
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
@@ -617,7 +633,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 regs.set_flag32(1 << 8); // keep TF on
                 return;
             }
-            if TF_VIRTUAL_IF_STEPPING {
+            if virtual_if_stepping(regs) {
                 let _ = step_virtual_if(regs);
             } else {
                 regs.clear_flag32(1 << 8);
@@ -644,7 +660,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                     // stepping is disabled — DPMI 0.9 §2.13 says POPF/IRET
                     // aren't required to affect virtual IF, so spec-conforming
                     // clients use CLI/STI/AX=0900-0902 only.
-                    if TF_VIRTUAL_IF_STEPPING
+                    if virtual_if_stepping(regs)
                         && regs.mode() != UserMode::VM86
                         && regs.flags32() & (1 << 19) == 0
                     {

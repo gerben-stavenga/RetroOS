@@ -516,7 +516,10 @@ pub(super) fn rm_native_syscall(machine: &mut crate::TheArch, kt: &mut thread::K
             crate::dbg_println!("synth_fork_exec: filename={:?} tail.len={} tail_first8={:02x?}",
                 core::str::from_utf8(&filename[..flen]).unwrap_or("<non-utf8>"),
                 tlen, &tail[..tlen.min(8)]);
-            fork_exec(dos, &filename[..flen], &tail[..tlen], regs, kt)
+            // CL carries the child's virtual IOPL: 3 = `iopl3` from LOADFIX.CFG
+            // (COMMAND.COM looked it up); anything else = conforming default (1).
+            let viopl: u8 = if (regs.rcx & 0xFF) == 3 { 3 } else { 1 };
+            fork_exec(dos, &filename[..flen], &tail[..tlen], viopl, regs, kt)
         }
         // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
         // BX = child pid (from a prior AH=01).
@@ -2183,7 +2186,7 @@ fn int_2eh(kt: &mut thread::KernelThread, dos: &mut thread::DosState, regs: &mut
     // Shift the program name to the start of the buffer.
     let plen = end - start;
     cmd.copy_within(start..end, 0);
-    fork_exec(dos, &cmd[..plen], b"", regs, kt)
+    fork_exec(dos, &cmd[..plen], b"", 1, regs, kt)
 }
 
 // ============================================================================
@@ -2466,7 +2469,7 @@ fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, n
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs: &mut Vcpu, _kt: &mut thread::KernelThread) -> thread::KernelAction {
+fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], viopl: u8, regs: &mut Vcpu, _kt: &mut thread::KernelThread) -> thread::KernelAction {
     // Resolve raw DOS name → VFS path via DFS. No extension probing or
     // PATH search here -- those live in COMMAND.COM, matching real DOS.
     let mut path = [0u8; 164];
@@ -2502,6 +2505,7 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], regs:
         path_len,
         cmdtail: cmdtail_buf,
         cmdtail_len,
+        viopl,
         on_error,
         on_success,
     }
@@ -2591,7 +2595,7 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
     dos_trace!("  exec_program: {:?} size={} elf={}", core::str::from_utf8(prog_name), size, is_elf);
     if is_elf {
-        return fork_exec(dos, prog_name, b"", regs, kt);
+        return fork_exec(dos, prog_name, b"", 1, regs, kt);
     }
 
     let is_exe = is_mz_exe(&buf);

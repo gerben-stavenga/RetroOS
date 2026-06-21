@@ -402,6 +402,7 @@ pub(crate) fn handle_fork_exec(
     parent_tid: usize,
     path: &[u8],
     cmdtail: &[u8],
+    viopl: u8,
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
 ) -> Option<usize> {
@@ -480,7 +481,7 @@ pub(crate) fn handle_fork_exec(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if let Err(_) = exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd) {
+    if let Err(_) = exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, viopl) {
         let child = thread::get_thread(threads, child_tid).unwrap();
         machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(threads, machine, child_tid, 1);
