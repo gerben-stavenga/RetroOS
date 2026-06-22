@@ -119,6 +119,9 @@ static word16 sel_to_ldt_index(word16 reg);
 static char trace_on = 0;
 static word16 trace_budget = 0;
 #define TRACE_BUDGET_MAX 65000
+/* Master switch for the RetroOS-style single-step tracer. 0 = off (no TF arming,
+   no [STEP]/[PMINT21]/[CWS31] spam, runs at full speed). Flip to 1 to debug. */
+#define CWS_TRACE 0
 char trace_arm_pending = 0;
 word32 hook21_lin_lo = 0, hook21_lin_hi = 0;
 word16 hook21_sel = 0;
@@ -352,6 +355,31 @@ static int page_in_user(void)
   return 0;
 }
 
+/* MIMIC-RETROOS: with the client at IOPL=1, CLI/STI #GP (vector 13).  Decode the
+   faulting opcode and emulate them on the client's saved IF (tss_eflags bit 9) —
+   exactly like the RetroOS metal #GP monitor.  POPF/IRET silently preserve IF at
+   CPL>IOPL and are deliberately NOT trapped here, so a client critical section
+   that re-enables interrupts via POPF stays disabled — reproducing the RetroOS
+   Doom hang.  Everything that isn't CLI/STI falls through to user_exception. */
+static int gpf_decode(void)
+{
+  unsigned char op[2];
+  if((tss_ptr->tss_cs & 3) && tss_ptr->tss_error == 0) {
+    memget((word16)tss_ptr->tss_cs, tss_ptr->tss_eip, op, 1);
+    if(op[0] == 0xfa) {			/* CLI */
+      tss_ptr->tss_eflags &= ~0x200L;
+      tss_ptr->tss_eip++;
+      return 0;
+    }
+    if(op[0] == 0xfb) {			/* STI */
+      tss_ptr->tss_eflags |= 0x200L;
+      tss_ptr->tss_eip++;
+      return 0;
+    }
+  }
+  return user_exception();
+}
+
 /* The DPMI spec says we should pass all interrupts through "generic_handler".
    In some cases we choose not to do this for interrupts that most likely would
    cause a wedge, like jumping to data.  All of the unsupported_int calls below
@@ -363,7 +391,7 @@ typedef int (*FUNC)(void);
 static FUNC exception_handler_list[] = {
   UE, i_01, generic_handler, UE, UE, UE, UE, UE,	/* NMI passed - laptops/green */
   /* 08 */ U,			/* Double fault */
-  UE, UE, UE, UE, UE,
+  UE, UE, UE, UE, gpf_decode,	/* 0d = #GP: MIMIC-RETROOS CLI/STI decode */
   /* 0e */ page_in_user,
   UE,
   /* 10 */ generic_handler,	/* Video Interrupt */
@@ -412,6 +440,12 @@ int exception_handler(void)
    for the next step, stop after TRACE_BUDGET_MAX steps. */
 static int i_01(void)
 {
+#if !CWS_TRACE
+  /* Tracer off: disarm TF + the DR6 step bits and resume — never single-step. */
+  (word16)tss_ptr->tss_eflags &= ~0x100;
+  dr[6] &= ~0x400FL;
+  return 0;
+#else
   word32 lin;
   word16 idx;
 
@@ -450,6 +484,7 @@ static int i_01(void)
   (word16)tss_ptr->tss_eflags |= 0x100;
   dr[6] &= ~0x400FL;
   return 0;
+#endif
 }
 
 static int i_21(void)
@@ -632,7 +667,7 @@ static int i_31(void)
 {
   extern word32 dr0_at_intr, dr7_at_intr;
   static char first_int31 = 1;
-  if (first_int31) {
+  if (CWS_TRACE && first_int31) {
     first_int31 = 0;
     trace_on = 1;
     trace_budget = 0;
@@ -1605,7 +1640,7 @@ i31_exit:
     (word16)(tss_ptr->tss_ebx), (word16)(tss_ptr->tss_ecx), (word16)(tss_ptr->tss_edx),
     (word16)(tss_ptr->tss_esi), (word16)(tss_ptr->tss_edi),
     (word16)(tss_ptr->tss_ds), (word16)(tss_ptr->tss_es));
-  if (trace_arm_pending && !trace_on) {
+  if (CWS_TRACE && trace_arm_pending && !trace_on) {
     trace_on = 1;
     trace_budget = 0;
     errmsg("[TRACE] TF tracing engaged (range %08lx..%08lx)\n",

@@ -55,12 +55,20 @@ typedef struct TSS {
 	unsigned short tss_ldt;
 	unsigned short res10;
 	unsigned short tss_trap;
-	unsigned char  tss_iomap;	/* Not used, ring 0 or IOPL = 3 */
-	unsigned char  tss_irqn;
+	unsigned short tss_iomap;	/* MIMIC-RETROOS: real 16-bit I/O-map base
+					   (was iomap-byte + irqn-byte). Set to
+					   offsetof(io_bitmap) for a_tss so the IOPL=1
+					   client's IN/OUT pass through to hardware. */
 	unsigned long  tss_cr2;
 	unsigned long  tss_error;
 	unsigned short stack0[64];	/* 15 max used, 30 worst case */
 	unsigned short tss_stack[1];
+	/* MIMIC-RETROOS: tss_irqn relocated off the iomap-base high byte (0x67),
+	   so 0x66-0x67 is a clean bitmap base; refs are symbolic so they follow. */
+	unsigned char  tss_irqn;
+	unsigned char  tss_irqn_pad;
+	unsigned char  io_bitmap[512];	/* all zeros = ports 0..0xFFF allowed */
+	unsigned char  io_term;		/* 0xFF terminator */
 } TSS;
 
 extern TSS c_tss, a_tss, o_tss, i_tss, f_tss;

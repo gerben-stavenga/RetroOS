@@ -48,10 +48,13 @@ tss_gs		dw	?
 tss_ldt		dw	?
 		dw	?
 tss_trap	dw	?
-tss_iomap	db	?
-tss_irqn	db	?
+tss_iomap	dw	?	;MIMIC-RETROOS: real 16-bit I/O-map base
 tss_cr2		dd	?
 tss_error	dd	?
 		dw	64 dup (?)
 tss_stack	dw	?
+tss_irqn	db	?	;MIMIC-RETROOS: moved off the iomap-base high byte
+		db	?
+io_bitmap	db	512 dup (?)
+io_term		db	?
 		ends

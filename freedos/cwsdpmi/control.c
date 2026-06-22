@@ -476,7 +476,14 @@ void DPMIstartup(void)
   fill_desc(&ldt[acode], 0xffff, (word32)a_tss.tss_cs*16L, SEL_PRV | 0x9a, 0);
   a_tss.tss_cs = LDT_SEL(acode);
   fill_desc(&ldt[adata], 0xffff, (word32)a_tss.tss_ds*16L, SEL_PRV | 0x92, use32);
-  a_tss.tss_eflags = 0x3202;
+  a_tss.tss_eflags = 0x1202;	/* MIMIC-RETROOS: IOPL=1 (was 0x3202/IOPL=3), so
+				   CLI/STI #GP and POPF/IRET silently drop IF —
+				   exactly the RetroOS metal-kernel regime. */
+  /* MIMIC-RETROOS: real I/O-permission bitmap so the IOPL=1 client's IN/OUT
+     still reach hardware. io_bitmap is all-zeros (BSS) = ports 0..0xFFF
+     allowed; io_term is the 0xFF terminator; tss_iomap = its TSS offset. */
+  a_tss.tss_iomap = FP_OFF(&a_tss.io_bitmap) - FP_OFF(&a_tss);
+  a_tss.io_term = 0xff;
 
   _AH = 0x62;				/* Get PSP */
   geninterrupt(0x21);

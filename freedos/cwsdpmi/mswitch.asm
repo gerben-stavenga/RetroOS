@@ -595,11 +595,9 @@ cpuflipflag:		; Try to flip flag #Al in Eflags, Return C=1 if possible
 	public	_trampoline21
 	public	_trampoline21_imm
 _trampoline21	proc	near
-	cmp	ax,4300h
-	jne	short t21_jmp
-	pushfd				; save EFLAGS, set TF, restore so the
-	or	byte ptr [esp+1],1	; far-jmp (next instr) executes with TF=1,
-	popfd				; making dos4g's hook single-step.
+	; MIMIC-RETROOS: TF single-step of DOS/4GW's INT 21 hook DISABLED — it
+	; armed the i_01 [STEP] tracer and ran at a crawl. (Was: cmp ax,4300h /
+	; jne / pushfd / or byte ptr [esp+1],1 / popfd.) Re-enable with CWS_TRACE.
 t21_jmp:
 	db	66h, 0EAh
 _trampoline21_imm:
