@@ -380,7 +380,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         175 => SyscallResult::val(0),
         183 => sys_getcwd(&mut kt.vcpu, linux, a),
         186 => SyscallResult::val(0),
-        192 => sys_mmap2(linux, a),
+        192 => sys_mmap2(kt, linux, a, (a.a5 as usize) << 12), // mmap2: offset in 4K pages
         195 => sys_stat64(&mut kt.vcpu, linux, a),
         196 => sys_stat64(&mut kt.vcpu, linux, a),
         197 => sys_fstat64(kt, a),
@@ -419,7 +419,7 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         6   => sys_stat64(&mut kt.vcpu, linux, a),
         7   => sys_poll(kt, linux, a, regs),
         8   => sys_lseek(kt, a),
-        9   => sys_mmap2(linux, a),
+        9   => sys_mmap2(kt, linux, a, a.a5 as usize), // mmap: offset in bytes
         10  => SyscallResult::val(0),
         11  => sys_munmap(linux, a),
         12  => sys_brk(linux, a),
@@ -549,7 +549,7 @@ fn read_c_argv(vcpu: &Vcpu, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::ve
 ///   [16 random bytes] [string pool]
 ///
 /// For 64-bit: same layout with 8-byte slots.
-pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], want_64: bool) -> usize {
+pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)]) -> usize {
     // Write one machine word (4 or 8 bytes, per client bitness) to the stack.
     fn write_word(vcpu: &mut Vcpu, addr: usize, val: usize, want_64: bool) {
         if want_64 { vcpu.write::<u64>(addr, val as u64); }
@@ -590,40 +590,50 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
         vcpu.write::<u32>(sp + i * 4, thread::prng() as u32);
     }
 
-    // 3. Compute total header size and align
-    // Layout from sp downward: argc, argv[0..N], NULL, envp[0..M], NULL, auxv entries
-    let auxv_count = 2; // AT_PAGESZ, AT_RANDOM (each is 2 words: type + value)
+    // 3. Build the auxiliary vector. The caller supplies the dynamic-linker
+    // entries (AT_PHDR/PHENT/PHNUM/BASE/ENTRY + the id/cap tags) in
+    // `extra_auxv`; we append the ones needing stack-internal addresses
+    // (AT_PAGESZ, AT_RANDOM, AT_EXECFN) and the AT_NULL terminator. A static
+    // exec passes `&[]`, preserving the minimal PAGESZ/RANDOM vector.
+    let mut auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    auxv.extend_from_slice(extra_auxv);
+    auxv.push((6, 4096));         // AT_PAGESZ
+    auxv.push((25, random_addr)); // AT_RANDOM
+    if let Some(&a0) = string_addrs.first() {
+        auxv.push((31, a0));      // AT_EXECFN — argv[0] string
+    }
+    auxv.push((0, 0));            // AT_NULL terminator
+
+    // 4. Compute total header size and align.
+    // Layout from sp downward: argc, argv[0..N], NULL, envp[0..M], NULL, auxv.
     let header_words = 1 /*argc*/ + args.len() + 1 /*NULL*/
         + env_addrs.len() + 1 /*envp NULL*/
-        + auxv_count * 2 + 2 /*AT_NULL*/;
+        + auxv.len() * 2;
     sp -= header_words * word;
     sp &= !0xF; // 16-byte align
 
     let base = sp;
     let mut pos = base;
 
-    // 4. Write argc
+    // argc
     write_word(vcpu, pos, args.len(), want_64);
     pos += word;
-
-    // 5. Write argv[0..N-1] then the argv[N] = NULL terminator
+    // argv[0..N-1], NULL
     for &addr in &string_addrs {
         write_word(vcpu, pos, addr, want_64);
         pos += word;
     }
     write_word(vcpu, pos, 0, want_64);
     pos += word;
-
-    // 6. envp[0..M-1] then the envp[M] = NULL terminator
+    // envp[0..M-1], NULL
     for &addr in &env_addrs {
         write_word(vcpu, pos, addr, want_64);
         pos += word;
     }
     write_word(vcpu, pos, 0, want_64);
     pos += word;
-
-    // 7. Auxiliary vector: (AT_PAGESZ, 4096), (AT_RANDOM, ptr), (AT_NULL, 0)
-    for (tag, val) in [(6usize, 4096usize), (25, random_addr), (0, 0)] {
+    // auxv (terminated by the AT_NULL already pushed)
+    for (tag, val) in auxv {
         write_word(vcpu, pos, tag, want_64);
         write_word(vcpu, pos + word, val, want_64);
         pos += word * 2;
@@ -639,17 +649,57 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
 pub fn exec_elf_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
-    let current = thread::get_thread(threads, tid).unwrap();
-    let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data).map_err(|_| 8)?; // ENOEXEC
+    // PIE main + dynamic linker load bases. Kept in the low user region
+    // (< USER_STACK_TOP) so they don't need the high 64-bit VA range; ld.so
+    // mmaps the shared libraries between these and the stack.
+    const PIE_BASE: usize = 0x0800_0000;     // 128 MiB — main PIE load bias
+    const INTERP_BASE: usize = 0x4000_0000;  // 1 GiB — dynamic-linker load bias
 
+    // Peek dynamic info before loading so we know whether to apply a bias and
+    // whether to bring in the interpreter.
+    let (is_pie, interp_path) = elf::dyn_info(data).map_err(|_| 8)?;
+
+    let current = thread::get_thread(threads, tid).unwrap();
+
+    // Dynamically-linked PIE → load at PIE_BASE; fixed ET_EXEC (and static
+    // ET_DYN, which we keep at bias 0 as before) → no bias.
+    let main_bias = if is_pie && interp_path.is_some() { PIE_BASE } else { 0 };
+    let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data, main_bias).map_err(|_| 8)?;
     let want_64 = loaded.class == elf::ElfClass::Elf64;
+
+    // Dynamic: load the interpreter (ld.so) at INTERP_BASE and build the full
+    // auxv so it can self-relocate, relocate the program, and load its libs.
+    // ld.so runs first, so the CPU entry is the interpreter's. Static: jump
+    // straight to the program entry with a minimal auxv.
+    let (cpu_entry, extra_auxv): (u64, alloc::vec::Vec<(usize, usize)>) = if let Some(ip) = &interp_path {
+        // Resolve the interpreter path against the VFS root (strip leading '/').
+        let mut ipath: &[u8] = ip;
+        while ipath.first() == Some(&b'/') { ipath = &ipath[1..]; }
+        let interp_data = crate::kernel::exec::load_file_resolved(ipath).map_err(|_| 8)?;
+        let interp_loaded = elf::load_elf(machine, &mut current.kernel.vcpu, &interp_data, INTERP_BASE).map_err(|_| 8)?;
+        let aux = alloc::vec![
+            (3usize, loaded.phdr_vaddr),  // AT_PHDR
+            (4, loaded.phentsize),        // AT_PHENT
+            (5, loaded.phnum),            // AT_PHNUM
+            (7, INTERP_BASE),             // AT_BASE — dynamic-linker load base
+            (9, loaded.entry as usize),   // AT_ENTRY — program entry (biased)
+            (16, 0),                      // AT_HWCAP
+            (17, 100),                    // AT_CLKTCK
+            (23, 0),                      // AT_SECURE
+            (11, 0), (12, 0), (13, 0), (14, 0), // AT_UID/EUID/GID/EGID
+        ];
+        (interp_loaded.entry, aux)
+    } else {
+        (loaded.entry, alloc::vec::Vec::new())
+    };
+
     let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
 
-    let sp = setup_user_stack(&mut current.kernel.vcpu, args, want_64);
+    let sp = setup_user_stack(&mut current.kernel.vcpu, args, want_64, &extra_auxv);
     if want_64 {
-        thread::init_process_thread_64(current, loaded.entry, sp as u64);
+        thread::init_process_thread_64(current, cpu_entry, sp as u64);
     } else {
-        thread::init_process_thread(current, loaded.entry as u32, sp as u32);
+        thread::init_process_thread(current, cpu_entry as u32, sp as u32);
     }
     current.kernel.symbols = symbols;
 
@@ -1376,43 +1426,50 @@ fn sys_getcwd(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
 }
 
 /// mmap2(192) — anonymous private only
-fn sys_mmap2(linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_mmap2(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, offset_bytes: usize) -> SyscallResult {
     let addr_hint = a.a0 as usize;
     let length = a.a1 as usize;
     let _prot = a.a2 as u32;
     let flags = a.a3 as u32;
     let fd = a.a4 as i32;
-    let _offset_pages = a.a5 as u32;
 
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_FIXED: u32 = 0x10;
 
-    // Only support MAP_ANONYMOUS | MAP_PRIVATE
-    if flags & MAP_ANONYMOUS == 0 {
-        return SyscallResult::val64(-ENOSYS as i64);
-    }
-    if fd != -1i32 as i32 && flags & MAP_ANONYMOUS != 0 {
-        // Some callers pass fd=-1 with MAP_ANONYMOUS — that's fine
-    }
-
     let num_pages = (length + 0xFFF) / 0x1000;
     if num_pages == 0 { return SyscallResult::val(-EINVAL); }
-
-    // Pick address: grow mmap_cursor downward
     let alloc_size = num_pages * 0x1000;
-    if linux.mmap_cursor < linux.heap_end + alloc_size {
-        return SyscallResult::val64(-ENOMEM as i64);
-    }
+
+    // Pick the base address: MAP_FIXED honors the hint; otherwise grow the
+    // mmap region downward.
     let base = if flags & MAP_FIXED != 0 && addr_hint != 0 {
         addr_hint & !0xFFF
     } else {
+        if linux.mmap_cursor < linux.heap_end + alloc_size {
+            return SyscallResult::val64(-ENOMEM as i64);
+        }
         linux.mmap_cursor -= alloc_size;
         linux.mmap_cursor
     };
 
-    // Pages are demand-paged: existing page fault handler allocates on access.
-    // No need to pre-allocate. The zero page fill on first touch gives
-    // MAP_ANONYMOUS semantics (contents initialized to zero).
+    // File-backed mapping: read the file region into the (demand-allocated)
+    // pages so the dynamic linker can map libc et al. Anonymous mappings stay
+    // demand-zero (page-fault handler zero-fills on first touch). MAP_PRIVATE
+    // file maps are treated as eager copies — fine since we never write back.
+    if flags & MAP_ANONYMOUS == 0 {
+        if fd < 0 || fd as usize >= thread::MAX_FDS {
+            return SyscallResult::val64(-EBADF as i64);
+        }
+        match kt.fds[fd as usize] {
+            thread::FdKind::Vfs(handle) => {
+                vfs::seek_by_handle(handle, offset_bytes as i32, 0 /*SEEK_SET*/);
+                let mut tmp = alloc::vec![0u8; length];
+                let n = vfs::read_by_handle(handle, &mut tmp);
+                if n > 0 { kt.vcpu.copy_to(base, &tmp[..n as usize]); }
+            }
+            _ => return SyscallResult::val64(-EBADF as i64),
+        }
+    }
 
     SyscallResult::val64(base as i64)
 }
