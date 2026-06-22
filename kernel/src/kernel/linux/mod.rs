@@ -357,6 +357,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         42  => sys_pipe(kt, a, false),
         45  => sys_brk(linux, a),
         54  => sys_ioctl(kt, a),
+        180 => sys_pread64(kt, a),
         55  => sys_fcntl(kt, a),
         63  => sys_dup2(kt, a),
         85  => sys_readlink(&mut kt.vcpu, a),
@@ -372,7 +373,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         122 => sys_uname(&mut kt.vcpu, a),
         125 => SyscallResult::val(0),
         140 => sys_llseek(kt, a),
-        146 => sys_writev(kt, a),
+        146 => sys_writev(kt, a, false),
         158 => sys_sched_yield(kt, regs),
         162 => sys_nanosleep(),
         168 => sys_poll(kt, linux, a, regs),
@@ -426,7 +427,8 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         13  => SyscallResult::val(0),
         14  => SyscallResult::val(0),
         16  => sys_ioctl(kt, a),
-        20  => sys_writev(kt, a),
+        17  => sys_pread64(kt, a),
+        20  => sys_writev(kt, a, true),
         21  => sys_access(&mut kt.vcpu, linux, a),
         22  => sys_pipe(kt, a, false),
         24  => sys_sched_yield(kt, regs),
@@ -672,10 +674,16 @@ pub fn exec_elf_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread
     // ld.so runs first, so the CPU entry is the interpreter's. Static: jump
     // straight to the program entry with a minimal auxv.
     let (cpu_entry, extra_auxv): (u64, alloc::vec::Vec<(usize, usize)>) = if let Some(ip) = &interp_path {
-        // Resolve the interpreter path against the VFS root (strip leading '/').
-        let mut ipath: &[u8] = ip;
-        while ipath.first() == Some(&b'/') { ipath = &ipath[1..]; }
-        let interp_data = crate::kernel::exec::load_file_resolved(ipath).map_err(|_| 8)?;
+        // PT_INTERP is absolute in the program's *own* filesystem. Resolve it
+        // against the same mount the executable came from: under `-h /` the
+        // host tree mounts at "host/", so "/lib64/.." lives at "host/lib64/..".
+        // On a real install (the distro's ext4 at root) there's no prefix.
+        let mut s: &[u8] = ip;
+        while s.first() == Some(&b'/') { s = &s[1..]; }
+        let mut ipath: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if path.starts_with(b"host/") { ipath.extend_from_slice(b"host/"); }
+        ipath.extend_from_slice(s);
+        let interp_data = crate::kernel::exec::load_file_resolved(&ipath).map_err(|_| 8)?;
         let interp_loaded = elf::load_elf(machine, &mut current.kernel.vcpu, &interp_data, INTERP_BASE).map_err(|_| 8)?;
         let aux = alloc::vec![
             (3usize, loaded.phdr_vaddr),  // AT_PHDR
@@ -1293,7 +1301,7 @@ fn sys_llseek(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// writev(146)
-fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+fn sys_writev(kt: &mut thread::KernelThread, a: &Args, want_64: bool) -> SyscallResult {
     let fd = a.a0 as usize;
     let iov_ptr = a.a1 as usize;
     let iovcnt = a.a2 as usize;
@@ -1304,11 +1312,17 @@ fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 
     let mut total = 0i32;
 
+    // struct iovec { void *iov_base; size_t iov_len; } — 8 bytes on i386,
+    // 16 bytes (two u64) on x86-64. Reading it at the wrong width drops the
+    // length (reads it from the high half of the pointer) → writes nothing.
+    let stride = if want_64 { 16 } else { 8 };
     for i in 0..iovcnt {
-        // struct iovec { void *iov_base; size_t iov_len; } — 8 bytes on i386
-        let base_addr = iov_ptr + i * 8;
-        let iov_base = kt.vcpu.read::<u32>(base_addr) as usize;
-        let iov_len = kt.vcpu.read::<u32>(base_addr + 4) as usize;
+        let base_addr = iov_ptr + i * stride;
+        let (iov_base, iov_len) = if want_64 {
+            (kt.vcpu.read::<u64>(base_addr) as usize, kt.vcpu.read::<u64>(base_addr + 8) as usize)
+        } else {
+            (kt.vcpu.read::<u32>(base_addr) as usize, kt.vcpu.read::<u32>(base_addr + 4) as usize)
+        };
 
         if iov_len == 0 { continue; }
 
@@ -1426,6 +1440,27 @@ fn sys_getcwd(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
 }
 
 /// mmap2(192) — anonymous private only
+/// pread64(17 / i386 180) — positioned read; does not advance the fd offset
+/// as far as the caller is concerned (each call re-seeks). ld.so reads ELF
+/// headers/sections of shared libraries this way.
+fn sys_pread64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+    let fd = a.a0 as usize;
+    let buf = a.a1 as usize;
+    let len = a.a2 as usize;
+    let offset = a.a3 as i64;
+    if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
+    match kt.fds[fd] {
+        thread::FdKind::Vfs(handle) => {
+            vfs::seek_by_handle(handle, offset as i32, 0 /*SEEK_SET*/);
+            let mut tmp = alloc::vec![0u8; len];
+            let n = vfs::read_by_handle(handle, &mut tmp);
+            if n > 0 { kt.vcpu.copy_to(buf, &tmp[..n as usize]); }
+            SyscallResult::val(n)
+        }
+        _ => SyscallResult::val(-EBADF),
+    }
+}
+
 fn sys_mmap2(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, offset_bytes: usize) -> SyscallResult {
     let addr_hint = a.a0 as usize;
     let length = a.a1 as usize;
