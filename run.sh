@@ -454,7 +454,7 @@ resolve_image() {
         image)       BAZEL_TARGET="//:image";             IMAGE_FILE="image.bin" ;;
         proprietary) BAZEL_TARGET="//:image_proprietary";  IMAGE_FILE="image_proprietary.bin" ;;
         ext4)        BAZEL_TARGET="//:image_ext4";          IMAGE_FILE="image_ext4.bin" ;;
-        grub)        BAZEL_TARGET="//:grub_iso //:image_ext4"; IMAGE_FILE="" ;;
+        grub)        BAZEL_TARGET="//:grub_iso //:image_proprietary"; IMAGE_FILE="" ;;
         freedos)     BAZEL_TARGET="//:freedos_apps";        IMAGE_FILE="freedos_apps.img" ;;
         *)           echo "Unknown image type: $IMG (choose: image, proprietary, ext4, grub, freedos)" >&2; exit 1 ;;
     esac
@@ -506,7 +506,7 @@ launch_qemu() {
 
     if [ "$IMG" = "grub" ]; then
         ISO="$SCRIPT_DIR/bazel-bin/retroos_grub.iso"
-        DISK="$SCRIPT_DIR/bazel-bin/image_ext4.bin"
+        DISK="$SCRIPT_DIR/bazel-bin/image_proprietary.bin"
         exec env -i \
             PATH="/usr/bin:/bin:/usr/local/bin" \
             HOME="$HOME" \
@@ -627,6 +627,9 @@ launch_qemu() {
         IMAGE="$SCRIPT_DIR/bazel-bin/$IMAGE_FILE"
         FWCFG_ARGS=()
         FWCFG_TMPDIR=""
+        # --cmd is the simple alias for the qemu cmdline (mirrors hosted --cmd),
+        # so `run.sh qemu --cmd GAMES/DOOMS/DOOM.EXE` just runs it from the disk.
+        [ -z "$START_BIN" ] && [ -n "${HOSTED_CMD:-}" ] && START_BIN="$HOSTED_CMD"
         if [ -n "$START_BIN" ]; then
             # Write the cmdline to a tempfile and use fw_cfg's file= form. The
             # string= form word-splits on commas, which collide with TLINK's
@@ -634,14 +637,19 @@ launch_qemu() {
             FWCFG_TMPDIR=$(mktemp -d -t retroos-fwcfg.XXXXXX)
             printf '%s' "$START_BIN" > "$FWCFG_TMPDIR/cmdline"
             FWCFG_ARGS+=(-fw_cfg "name=opt/cmdline,file=$FWCFG_TMPDIR/cmdline")
-            # When -h is also given, default cwd to host/ so relative paths in
-            # the program's args resolve against the host workspace.
-            if [ -n "$HOSTFS_DIR" ]; then
+            # cwd: with explicit -h, host/ (resolve against the host workspace);
+            # otherwise the program's OWN directory on the disk, so e.g.
+            # GAMES/DOOMS/DOOM.EXE runs with cwd=GAMES/DOOMS and finds its WAD.
+            if [ "$HOSTFS_DIR_SET" = 1 ]; then
                 FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=host/")
+            else
+                START_CWD="$(dirname "${START_BIN%% *}")"
+                [ "$START_CWD" = "." ] && START_CWD=""
+                FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=$START_CWD")
             fi
         fi
         HOSTFS_ARGS=()
-        if [ -n "$HOSTFS_DIR" ]; then
+        if [ "$HOSTFS_DIR_SET" = 1 ]; then
             HOSTFS_SOCK="/tmp/retroos-hostfs.sock"
             HOSTFS_ARGS=(
                 -serial chardev:hostfs

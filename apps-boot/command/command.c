@@ -104,7 +104,9 @@ static unsigned char parse_flag(const char *tok) {
 static void load_loadfix_cfg(void) {
     FILE *f;
     char line[80];
-    f = fopen("C:\\LOADFIX.CFG", "r");
+    /* Embedded bootfs (always present, always mounted at C:\BOOT) -- robust
+     * vs the ext4 root mounting at C:\DISK1 instead of C:\ on real installs. */
+    f = fopen("C:\\BOOT\\LOADFIX.CFG", "r");
     if (!f) return;
     while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
         char *p = line + strspn(line, " \t");
@@ -529,6 +531,26 @@ static int run_command(char **argv, int prog_idx, int argc, int poll_kbd) {
             fwrite(buf, 1, (size_t)n, stdout);
         }
         fclose(f);
+        return 0;
+    }
+    if (stricmp(name, "LOG") == 0) {
+        /* Dump the in-memory kernel log (INT 31h AH=07h, line by line). On real
+         * metal this is the only way to read kernel/dbg_println output back --
+         * the 0xE9 debug port is unconnected on actual hardware. BX = line
+         * index; CF=1 ends the loop. */
+        static char buf[520];
+        unsigned i;
+        for (i = 0; ; i++) {
+            const char far *fbuf = buf;
+            r.h.ah = 0x07;
+            r.x.bx = i;
+            r.x.di = FP_OFF(fbuf);
+            s.es   = FP_SEG(fbuf);
+            int86x(0x31, &r, &r, &s);
+            if (r.x.cflag) break;
+            buf[r.x.cx] = 0;
+            puts(buf);
+        }
         return 0;
     }
     if (stricmp(name, "PAUSE") == 0) {
