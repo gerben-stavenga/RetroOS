@@ -612,8 +612,16 @@ pub fn handle_event(
 /// framebuffer itself. The planar trap re-maps 0xA0000 as it arms/disarms.
 fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
     if !machine::vga_present() {
-        // 0xA0000..0xC0000 = 32 pages: graphics (A0000) + text (B0000-BFFFF).
-        machine.map_fresh_range(0xA0000 >> 12, 0x20000 >> 12);
+        // Graphics + mono-text aperture (0xA0000-0xB7FFF, 24 pages): per-process
+        // fresh RAM — planar/Mode-X trapping (disarm_planar) manages A0000 per
+        // address space, and these are zeroed so a fresh graphics buffer starts
+        // blank.
+        machine.map_fresh_range(0xA0000 >> 12, 0x18000 >> 12);
+        // Color-text aperture (0xB8000-0xBFFFF): the SHARED text screen. Every
+        // DOS process and the kernel console map the same pages, so the boot log
+        // persists into DN and a child program's output shows under its parent —
+        // exactly like VGA-text hardware, where this aperture is shared video RAM.
+        machine.map_vga_text_aperture();
     }
 }
 
@@ -621,7 +629,7 @@ fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
-pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, viopl: u8) {
+pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8) {
     use crate::kernel::startup;
 
     let current = thread::get_thread(threads, tid).unwrap();
@@ -630,13 +638,22 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread
     back_vga_window_if_emulated(machine);
     dos::setup_ivt(&mut current.kernel.vcpu);
 
-    // args[0] is VFS-form (from exec fan-out); convert to drive-qualified
-    // DOS form for the PSP environment suffix. DOS extenders parse that
-    // field back, so it must look like "C:\BIN\PROG.EXE".
+    // The PSP environment program-name suffix — drive-qualified DOS form
+    // ("C:\BIN\PROG.EXE"), which DOS extenders parse back to reopen their own EXE.
     let prog_name = args.first().expect("exec_dos_into: args[0] must be the program path");
     let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
-    let dos_len = dfs::vfs_to_dos(prog_name, &mut dos_name);
-    let dos_name = &dos_name[..dos_len];
+    let dos_name: &[u8] = if args0_is_dos {
+        // Launcher was DOS: args[0] is already the canonical DOS path it used
+        // (the real 8.3 names) — use it verbatim so it round-trips when reopened.
+        // No VFS→DOS reconstruction (which mangled long non-8.3 names).
+        let n = prog_name.len().min(dos_name.len());
+        dos_name[..n].copy_from_slice(&prog_name[..n]);
+        &dos_name[..n]
+    } else {
+        // Cross-personality / boot: args[0] is VFS — dosify it.
+        let dos_len = dfs::vfs_to_dos(prog_name, &mut dos_name);
+        &dos_name[..dos_len]
+    };
 
     // Initialize a fresh DosState and seed the heap chain at heap_start so
     // the upcoming dos_alloc_block calls (env, then program block) carve
@@ -851,6 +868,17 @@ pub fn run_init_program(machine: &mut crate::TheArch, threads: &mut [thread::Thr
     // event-loop switch path.
     t.dos_mut().on_resume(machine);
     tid
+}
+
+/// Map an absolute DOS path (output of `DfsState::resolve`, e.g. the program
+/// name carried in a `Some(Dos)` ForkExec) to its VFS form for reading. The
+/// DOS-layer's single VFS translator; the generic exec layer calls this rather
+/// than reaching into `dfs`. `None` if the path doesn't resolve.
+pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    dfs::DfsState::to_vfs_open(dos_abs, &mut out)
+        .ok()
+        .map(|n| out[..n].to_vec())
 }
 
 /// Snapshot a DOS env block (variable strings up to and including the

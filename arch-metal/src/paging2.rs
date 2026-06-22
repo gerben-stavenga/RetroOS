@@ -1655,6 +1655,40 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
     flush_tlb();
 }
 
+/// Physical page base of the shared VGA text aperture (0xB8000-0xBFFFF: 8 pages
+/// of real RAM), allocated once on first call. On a UEFI/GOP machine the legacy
+/// physical 0xB8000 region is unbacked (reads 0xFF), so it cannot serve as the
+/// text screen; this is the dedicated RAM that does. The kernel low-mem window
+/// and every DOS process's guest 0xB8000 are both mapped to these pages, giving
+/// one shared text screen — the emulated equivalent of VGA hardware's video RAM.
+pub fn vga_text_aperture_ppage() -> u64 {
+    // Single-threaded kernel state, allocated once at boot — a plain static like
+    // the other paging/phys_mm globals (no atomic needed).
+    static mut APERTURE: u64 = 0;
+    unsafe {
+        let cur = *core::ptr::addr_of!(APERTURE);
+        if cur != 0 {
+            return cur;
+        }
+        let base = crate::phys_mm::alloc_contig(8).expect("VGA text aperture alloc");
+        *core::ptr::addr_of_mut!(APERTURE) = base;
+        base
+    }
+}
+
+/// Map the current process's VGA color-text aperture (guest 0xB8000-0xBFFFF, 8
+/// pages) onto the shared text aperture, so it writes the one screen the kernel
+/// console + every DOS process share. Unlike the graphics/mono region (which is
+/// per-process via `map_fresh_range`), this is shared and NOT zeroed — on-screen
+/// text (the boot log, a prior program's output) persists, exactly as VGA-text
+/// hardware leaves the shared video RAM intact across programs.
+pub fn map_vga_text_aperture_user() {
+    let ap = vga_text_aperture_ppage();
+    for i in 0..8usize {
+        map_user_page_phys(0xB8000 / PAGE_SIZE + i, ap + i as u64, flags::CACHE_DISABLE);
+    }
+}
+
 /// Allocate a physical page, fill it with `data` (zero-padded to PAGE_SIZE),
 /// and map it at user virtual page `page_idx` (writable, user-accessible).
 #[allow(dead_code)]
@@ -1795,6 +1829,16 @@ pub fn map_fresh_range(base_page: usize, num_pages: usize) {
         }
     }
     flush_tlb();
+    // Zero the freshly-mapped pages. `alloc_phys_page` hands back uninitialised
+    // frames; on real hardware that RAM reads as 0xFF, so a fresh VGA aperture
+    // showed as a white screen wherever the guest hadn't drawn (qemu happens to
+    // zero-fill, hiding it). The pages are now mapped + TLB-flushed, so write
+    // through the mapped VA. (DOS callers also rely on a clean B8000/A0000.)
+    for i in 0..num_pages {
+        unsafe {
+            core::ptr::write_bytes(((base_page + i) * PAGE_SIZE) as *mut u8, 0, PAGE_SIZE);
+        }
+    }
 }
 
 /// Harden kernel memory permissions

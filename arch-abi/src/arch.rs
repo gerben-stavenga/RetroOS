@@ -270,6 +270,13 @@ pub trait Arch {
     fn free_range(&mut self, base_page: usize, count: usize);
     /// Replace `count` user pages at `vpage` with fresh anonymous RW frames.
     fn map_fresh_range(&mut self, vpage: usize, count: usize);
+    /// Map this process's VGA color-text aperture (guest 0xB8000-0xBFFFF) onto
+    /// the single SHARED text screen — the emulated equivalent of VGA hardware's
+    /// shared video RAM, so every DOS process and the kernel console write one
+    /// screen (the boot log persists; a child's output shows under its parent).
+    /// On VGA-text hardware this is implicit (the aperture already is shared
+    /// RAM); this is the GOP/emulated stand-in.
+    fn map_vga_text_aperture(&mut self);
     /// Load the LDT (write base+limit into the GDT slot and `LLDT`).
     fn load_ldt(&mut self, ldt: &[u64]);
     /// Map a range of physical pages into user virtual space.

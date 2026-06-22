@@ -86,14 +86,18 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 ///   pass `Vec::new()` for non-DOS execs or initial loads with no parent.
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
-pub fn init_thread(machine: &mut crate::TheArch, threads: &mut [crate::kernel::thread::Thread], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, viopl: u8) -> Result<(), i32> {
+pub fn init_thread(machine: &mut crate::TheArch, threads: &mut [crate::kernel::thread::Thread], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, viopl: u8) -> Result<(), i32> {
     match detect_format(&data, path) {
         BinaryFormat::Elf => {
             crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)
         }
         fmt => {
             let is_exe = matches!(fmt, BinaryFormat::MzExe);
-            crate::kernel::dos::exec_dos_into(machine, threads, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd, viopl);
+            // `args[0]` is already a DOS path when the launcher was DOS
+            // (personality_name == Some(Dos)); otherwise it's VFS and exec_dos_into
+            // dosifies it (the cross-personality / boot fallback).
+            let args0_is_dos = personality_name == Some(crate::kernel::thread::PersonalityName::Dos);
+            crate::kernel::dos::exec_dos_into(machine, threads, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd, args0_is_dos, viopl);
             Ok(())
         }
     }

@@ -569,6 +569,28 @@ pub(super) fn rm_native_syscall(machine: &mut crate::TheArch, kt: &mut thread::K
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
             thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::VgaPeekMode }
         }
+        // AH=07h — SYNTH_LOG_LINE: read back the in-memory kernel log so a
+        // booted system with no serial/debug port (real metal) can surface
+        // kernel + dbg_println output. BX = line index (0 = oldest retained),
+        // ES:DI = >=512-byte buffer. Output: CX = byte length, CF=0; CF=1 once
+        // BX is past the last line (the caller's end-of-log signal). Drives
+        // COMMAND.COM's `LOG` builtin (loops BX until CF=1).
+        0x07 => {
+            let idx = (regs.rbx & 0xFFFF) as usize;
+            let mut buf = [0u8; 512];
+            match crate::kernel::klog::line(idx, &mut buf) {
+                Some(n) => {
+                    let dest = linear(dos, regs, regs.es as u16, regs.rdi as u32);
+                    for (i, &b) in buf[..n].iter().enumerate() {
+                        regs.write::<u8>((dest + i as u32) as usize, b);
+                    }
+                    regs.rcx = (regs.rcx & !0xFFFF) | (n as u64 & 0xFFFF);
+                    regs.clear_flag32(1);
+                }
+                None => regs.set_flag32(1),
+            }
+            thread::KernelAction::Done
+        }
         // Unknown AH: RetroOS synth space is kernel-owned; anything outside
         // the documented subfunctions is a guest bug. Return AX=errno/CF=1.
         _ => {
@@ -2470,14 +2492,22 @@ fn dos_open_program(kt: &mut thread::KernelThread, dos: &mut thread::DosState, n
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
 fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], viopl: u8, regs: &mut Vcpu, _kt: &mut thread::KernelThread) -> thread::KernelAction {
-    // Resolve raw DOS name → VFS path via DFS. No extension probing or
-    // PATH search here -- those live in COMMAND.COM, matching real DOS.
+    // Verify the file exists (DFS resolve → VFS → would-be open); ENOENT else.
+    if dfs_open_existing(dos, prog_name).is_err() {
+        regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
+        regs.set_flag32(1);
+        return thread::KernelAction::Done;
+    }
+    // Carry the absolute DOS path (the launcher's namespace), NOT the VFS path.
+    // This is the program name a DOS extender reopens its own EXE by, so it must
+    // be a real DOS path (the 8.3 names DN/the program used) — `resolve` keeps
+    // them verbatim. It's mapped back to VFS only for the read (handle_fork_exec).
+    // No VFS form ever reaches the DOS env, and ForkExec stays generic (a
+    // personality tag, not a VFS/DOS path field).
     let mut path = [0u8; 164];
-    let path_len = match dfs_open_existing(dos, prog_name) {
-        Ok((p, len)) => {
-            path[..len].copy_from_slice(&p[..len]);
-            len
-        }
+    let mut dos_abs = [0u8; dfs::DFS_PATH_MAX];
+    let path_len = match dos.dfs.resolve(prog_name, &mut dos_abs) {
+        Ok(n) => { path[..n].copy_from_slice(&dos_abs[..n]); n }
         Err(_) => {
             regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
             regs.set_flag32(1);
@@ -2505,6 +2535,7 @@ fn fork_exec(dos: &mut thread::DosState, prog_name: &[u8], cmdtail: &[u8], viopl
         path_len,
         cmdtail: cmdtail_buf,
         cmdtail_len,
+        personality_name: Some(thread::PersonalityName::Dos),
         viopl,
         on_error,
         on_success,

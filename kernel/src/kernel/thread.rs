@@ -95,6 +95,12 @@ pub enum KernelAction {
         path_len: usize,
         cmdtail: [u8; 128],
         cmdtail_len: usize,
+        /// Which personality's namespace `path` is in (the launcher's). `Some(Dos)`
+        /// ⇒ `path` is a DOS path (resolved to VFS only for the read; used verbatim
+        /// as the program name a DOS extender reopens). `None` ⇒ `path` is VFS-form
+        /// (the generic default). Keeps this generic action free of DOS specifics —
+        /// it's a tag, not a DOS path field.
+        personality_name: Option<PersonalityName>,
         /// Virtual IOPL the child execs at: 1 = spec-conforming (default),
         /// 3 = non-conforming (COMMAND.COM passed `iopl3` from LOADFIX.CFG).
         viopl: u8,
@@ -134,6 +140,15 @@ pub enum DosChildOp {
 }
 
 /// OS personality — determines event loop dispatch and carries OS-specific state
+/// The personality identity without its state — a lightweight tag for code that
+/// needs to name "DOS" or "Linux" generically (e.g. which namespace a path is
+/// in) without carrying a whole `DosState`/`LinuxState`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PersonalityName {
+    Dos,
+    Linux,
+}
+
 pub enum Personality {
     /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode)
     Dos(DosState),

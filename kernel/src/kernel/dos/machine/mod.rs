@@ -376,6 +376,12 @@ pub(super) use vkbd::*;
 // I/O port emulation
 // ============================================================================
 
+/// Log accesses to unmodeled ISA ports (`[port] … (unhandled)`) for
+/// missing-device coverage. Off by default — DN and games hammer unmodeled
+/// ports (CRTC mirrors, etc.), which floods the kernel log / `LOG` ring; flip
+/// to true when hunting a genuinely missing device.
+const PORT_TRACE: bool = false;
+
 /// Emulate IN from a port using the virtual peripherals.
 pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) -> u8 {
     // ISA decodes only A0-A9, so I/O ports alias mod 0x400 (e.g. a
@@ -510,7 +516,9 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
             pc.sb.dma_read(machine, p),
         // Unknown ports read as an unpopulated ISA bus and are logged for missing-device coverage.
         _ => {
-            crate::dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
+            if PORT_TRACE {
+                crate::dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
+            }
             0xFF
         }
     }
@@ -627,7 +635,9 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {
-            crate::dbg_println!("[port] out {:04X} <- {:02X} (unhandled)", port, val);
+            if PORT_TRACE {
+                crate::dbg_println!("[port] out {:04X} <- {:02X} (unhandled)", port, val);
+            }
         }
     }
 }

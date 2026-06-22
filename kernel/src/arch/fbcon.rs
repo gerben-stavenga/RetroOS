@@ -3,24 +3,23 @@
 //! mode: the display is a dumb linear framebuffer and writes to 0xB8000 show
 //! nothing.
 //!
-//! The console keeps its 80×25 char+attr cell model unchanged — `lib::vga`
-//! writes cells into a RAM shadow buffer instead of 0xB8000 (same move the
-//! hosted build makes, `host_console_init`) — and this module renders dirty
-//! cells through `lib::vga_render` into the multiboot-reported framebuffer
-//! after every console write (the `set_text_flush` hook). Text renders at
-//! 720×400, centered.
+//! There is ONE VGA model: the shared text aperture at phys 0xB8000 (the
+//! kernel console keeps `lib::vga`'s cell base there — LOW_MEM_BASE + 0xB8000 —
+//! the same memory DOS programs and DN write, since `map_low_mem_user` identity-
+//! maps 0xA0-0xBF into every process). This module renders that one aperture
+//! through `lib::vga_render` and blits it via `present_dos_frame` — the same
+//! present path `display_tick` uses for DOS frames. The `set_text_flush` hook
+//! presents it immediately on kernel console writes (boot-message visibility
+//! before the event loop runs `display_tick`); at runtime `display_tick` is the
+//! presenter. Text renders at 720×400, centered/integer-scaled.
 //!
 //! Like `boot.rs`, this is metal boot glue: legacy-BIOS machines never call
-//! `init` and keep writing real B8000 text cells; the kernel above notices
-//! nothing either way.
+//! `init` and keep writing real B8000 text cells the hardware scans; the kernel
+//! above notices nothing either way.
 
 use arch::paging2::{self, PAGE_SIZE};
 use lib::vga_render::{self, Frame, VgaMode};
 use lib::vga_font_8x16::FONT_8X16;
-
-/// The RAM text buffer the console writes cells into (replaces 0xB8000).
-/// 0x0720 = blank: space on light-gray-on-black.
-static mut TEXT_BUF: [u16; 80 * 25] = [0x0720; 80 * 25];
 
 /// Cells as last rendered to pixels; `flush` re-renders only what differs.
 /// All-zero ≠ any real cell (attr 0x00 is never written), so the first flush
@@ -144,7 +143,10 @@ pub fn early(info: &arch::MultibootInfo) -> bool {
     if info.framebuffer_type != 1 {
         return false;
     }
-    crate::vga::vga().base = (&raw mut TEXT_BUF) as usize;
+    // Leave the console's cell base where `boot_kernel` set it: the shared VGA
+    // text aperture (LOW_MEM_BASE + 0xB8000 = real phys 0xB8000) — the SAME
+    // memory DOS programs and DN write and `display_tick` presents. One screen,
+    // like VGA-text hardware; no separate RAM shadow buffer.
     true
 }
 
@@ -234,19 +236,34 @@ pub fn init(info: &arch::MultibootInfo) {
     // paints) now that the console owns the pixels.
     unsafe { core::slice::from_raw_parts_mut((paging2::FB_WINDOW_BASE + page_off) as *mut u32, stride * height).fill(0) };
 
+    // Back the VGA text aperture with real RAM. `boot_kernel` left the console's
+    // cell base at LOW_MEM_BASE + 0xB8000, but on a UEFI machine that maps to the
+    // unbacked legacy physical 0xB8000 (reads 0xFF → a white screen). Point the
+    // kernel low-mem window's 0xB8000-0xBFFFF at a dedicated allocated aperture
+    // instead — RAM the console can read/write. This is the singleton VGA text
+    // memory; DOS processes map the SAME pages at their guest 0xB8000, so the
+    // kernel console and every DOS program share one screen, like VGA hardware.
+    let aperture = paging2::vga_text_aperture_ppage();
+    for i in 0..8 {
+        paging2::map_user_page_phys(
+            (paging2::LOW_MEM_BASE + 0xB8000) / PAGE_SIZE + i,
+            aperture + i as u64,
+            paging2::flags::CACHE_DISABLE,
+        );
+    }
+    // alloc_contig doesn't zero — blank the text aperture (space, light-gray on
+    // black) so the first flush renders a clean screen, not leftover RAM.
+    unsafe {
+        core::slice::from_raw_parts_mut((paging2::LOW_MEM_BASE + 0xB8000) as *mut u16, 80 * 25)
+            .fill(0x0720);
+    }
+
     lib::vga::set_text_flush(flush);
     // The emulated VGA's display sink: DOS screens (text or mode 13h) render
     // kernel-side through lib::vga_render and land here for the GOP blit.
     lib::vga_render::set_present_sink(present_dos_frame);
     flush(); // render the boot backlog accumulated since `early`
 }
-
-/// Set when a DOS frame painted the framebuffer: the console's dirty-cell
-/// shadow no longer matches the pixels, so the next console flush repaints
-/// from scratch (otherwise the kernel console stays invisible after a DOS
-/// program exits — the diff thinks nothing changed).
-static DOS_PAINTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 /// Present sink for the kernel-emulated VGA: integer-scale and center the
 /// rendered DOS frame in the GOP framebuffer.
@@ -257,6 +274,13 @@ static DOS_PAINTED: core::sync::atomic::AtomicBool =
 /// ins/sec (reproducer: DN's CGA snow-avoidance polls 0x3DA around every
 /// word it writes; its UI draw extrapolated to ~500 seconds). The compare
 /// runs in cached RAM and costs microseconds.
+/// Set when a DOS frame painted the framebuffer via `present_dos_frame`: the
+/// console's dirty-cell shadow no longer matches the pixels, so the next `flush`
+/// repaints the whole screen (else the kernel console stays invisible after a
+/// DOS graphics frame — the diff would think nothing changed).
+static DOS_PAINTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     let Some(g) = geom() else { return };
     if w == 0 || h == 0 || px.len() < w * h {
@@ -286,8 +310,13 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     DOS_PAINTED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Re-render every cell that changed since the last flush. Installed as the
-/// console's post-write hook; also safe to call any time.
+/// Re-render the cells of the shared VGA text aperture that changed since the
+/// last flush, straight to the framebuffer. The kernel console and every DOS
+/// process share one screen at phys 0xB8000 (read through the LOW_MEM_BASE
+/// window) — `flush` reads that aperture (not a private buffer), so there is one
+/// screen. Installed as the console post-write hook for immediate boot-message
+/// visibility; cheap (a per-cell diff, no allocation), unlike the full-frame
+/// `display_tick` path which presents the same aperture during runtime.
 fn flush() {
     let Some(g) = geom() else { return };
     // A DOS frame painted over us: wipe and repaint the whole console.
@@ -296,13 +325,17 @@ fn flush() {
         out.fill(0);
         unsafe { (&mut *(&raw mut SHADOW)).fill(0) };
     }
-    let text: &[u16; 80 * 25] = unsafe { &*(&raw const TEXT_BUF) };
+    // The shared text aperture (real phys 0xB8000 via the low-mem window).
+    let text: &[u16] = unsafe {
+        core::slice::from_raw_parts((paging2::LOW_MEM_BASE + 0xB8000) as *const u16, 80 * 25)
+    };
+    let vram: &[u8] = unsafe {
+        core::slice::from_raw_parts((paging2::LOW_MEM_BASE + 0xB8000) as *const u8, 80 * 25 * 2)
+    };
     let shadow = unsafe { &mut *(&raw mut SHADOW) };
     let frame = Frame {
         mode: VgaMode::Text80x25,
-        vram: unsafe {
-            core::slice::from_raw_parts((&raw const TEXT_BUF) as *const u8, 80 * 25 * 2)
-        },
+        vram,
         planes: &[],
         ac: &FBCON_AC,
         palette: unsafe { &*(&raw const PALETTE) },
@@ -319,20 +352,13 @@ fn flush() {
         if shadow[i] != text[i] {
             shadow[i] = text[i];
             if native {
-                vga_render::render_text_cell(
-                    &frame,
-                    i % 80,
-                    i / 80,
-                    &mut out[g.origin..],
-                    g.stride,
-                );
+                vga_render::render_text_cell(&frame, i % 80, i / 80, &mut out[g.origin..], g.stride);
                 continue;
             }
-
             let cell = i * 2;
             let cell_frame = Frame {
                 mode: VgaMode::Text80x25,
-                vram: &frame.vram[cell..cell + 2],
+                vram: &vram[cell..cell + 2],
                 planes: &[],
                 ac: &FBCON_AC,
                 palette: frame.palette,

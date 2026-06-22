@@ -80,6 +80,7 @@ impl Arch for Metal {
         super::calls::arch_set_page_flags(start_vpage, count, writable, executable)
     }
     fn map_low_mem(&mut self) { super::calls::arch_map_low_mem() }
+    fn map_vga_text_aperture(&mut self) { super::calls::arch_map_vga_text_aperture() }
     fn copy_page_entries(&mut self, src_vpage: usize, dst_vpage: usize, count: usize) {
         super::calls::arch_copy_page_entries(src_vpage, dst_vpage, count)
     }

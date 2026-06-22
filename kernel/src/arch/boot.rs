@@ -27,6 +27,9 @@ static ALLOCATOR: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
 /// issuing a port op itself.
 fn log_byte_0xe9(b: u8) {
     x86::outb(0xE9, b);
+    // Also retain it in RAM: 0xE9 is unconnected on real hardware, so this is
+    // the only way to read kernel/dbg output back on metal (via COMMAND.COM LOG).
+    crate::kernel::klog::push_byte(b);
 }
 
 /// Magic value the Multiboot bootloader places in EAX before jumping to us.

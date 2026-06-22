@@ -24,6 +24,11 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
+    // Allocate the in-memory kernel log now the heap is up; the debug sink tees
+    // into it so `LOG` (COMMAND.COM, INT 31h AH=07h) can surface kernel output
+    // on machines with no serial/debug port (real metal — 0xE9 goes nowhere).
+    crate::kernel::klog::init();
+
     // Pick the boot disk: ATA where present, NVMe on UEFI-class machines —
     // before the platform probe, which reads the MBR for the Media verdict.
     crate::kernel::block::init(machine);
@@ -402,6 +407,7 @@ pub(crate) fn handle_fork_exec(
     parent_tid: usize,
     path: &[u8],
     cmdtail: &[u8],
+    personality_name: Option<thread::PersonalityName>,
     viopl: u8,
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
@@ -443,7 +449,17 @@ pub(crate) fn handle_fork_exec(
         }
     }
 
-    let buf = match exec::load_file_resolved(path) {
+    // `path` is in the launcher's namespace. For a DOS launcher it's a DOS path
+    // — map it to VFS (DOS layer's translator) only for the read; the DOS form
+    // is kept as-is for the program name. Otherwise it's already VFS.
+    let read_path: alloc::vec::Vec<u8> = match personality_name {
+        Some(thread::PersonalityName::Dos) => match crate::kernel::dos::dos_abs_to_vfs(path) {
+            Some(v) => v,
+            None => { on_error(&mut vcpu.regs, 2); return None; }
+        },
+        _ => path.to_vec(),
+    };
+    let buf = match exec::load_file_resolved(&read_path) {
         Ok(b) => b,
         Err(_) => { on_error(&mut vcpu.regs, 2); return None; }
     };
@@ -481,7 +497,7 @@ pub(crate) fn handle_fork_exec(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if let Err(_) = exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, viopl) {
+    if let Err(_) = exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl) {
         let child = thread::get_thread(threads, child_tid).unwrap();
         machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(threads, machine, child_tid, 1);
@@ -674,6 +690,9 @@ impl EventStats {
     /// Profile dump cadence. Roughly assume 2 GHz host; only used to format
     /// the dump as seconds. Off by a constant factor but the ratio is exact.
     const PROFILE_DUMP_CYCLES: u64 = 2_000_000_000;
+    /// Emit the periodic `[prof]` line. Off by default — it floods the kernel
+    /// log (and the `LOG` ring buffer); flip to true to profile the event loop.
+    const PROFILE_DUMP: bool = false;
 
     fn new(machine: &mut crate::TheArch) -> Self {
         let free = machine.free_page_count();
@@ -736,15 +755,17 @@ impl EventStats {
         };
         self.counts[idx] += 1;
         if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
-            let total = self.user_cycles.wrapping_add(self.kernel_cycles);
-            let user_pct = if total > 0 { self.user_cycles.wrapping_mul(100) / total } else { 0 };
-            let kern_pct = if total > 0 { self.kernel_cycles.wrapping_mul(100) / total } else { 0 };
-            let c = &self.counts;
-            crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
-                user_pct, kern_pct,
-                c[0], c[1], c[2], c[3], c[4], c[5], c[6],
-                c[8], c[9], c[7], c[10], machine.get_ticks(),
-                regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+            if Self::PROFILE_DUMP {
+                let total = self.user_cycles.wrapping_add(self.kernel_cycles);
+                let user_pct = if total > 0 { self.user_cycles.wrapping_mul(100) / total } else { 0 };
+                let kern_pct = if total > 0 { self.kernel_cycles.wrapping_mul(100) / total } else { 0 };
+                let c = &self.counts;
+                crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
+                    user_pct, kern_pct,
+                    c[0], c[1], c[2], c[3], c[4], c[5], c[6],
+                    c[8], c[9], c[7], c[10], machine.get_ticks(),
+                    regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+            }
             self.user_cycles = 0;
             self.kernel_cycles = 0;
             self.counts = [0; 11];

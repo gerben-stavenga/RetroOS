@@ -126,6 +126,15 @@ pub fn arch_map_fresh_range(vpage: usize, count: usize) {
     crate::cpu::invalidate_uc(vpage, count);
 }
 
+/// VGA color-text aperture (guest 0xB8000-0xBFFFF, 8 pages). The hosted backend
+/// has no shared singleton yet, so this maps fresh pages — same as before this
+/// split (per-process). Metal shares it across processes; interp parity is a
+/// follow-up.
+pub fn arch_map_vga_text_aperture() {
+    crate::mmu::map_fresh(0xB8000 >> 12, 8);
+    crate::cpu::invalidate_uc(0xB8000 >> 12, 8);
+}
+
 /// Map a range of physical pages into user virtual space.
 pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
     // Honour map flags like metal does — ignoring them silently diverges the

@@ -100,6 +100,16 @@ pub fn arch_map_low_mem() {
     }
 }
 
+/// Map this process's VGA color-text aperture onto the shared text screen.
+pub fn arch_map_vga_text_aperture() {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch_call::MAP_VGA_TEXT_APERTURE as u32,
+        );
+    }
+}
+
 /// Copy page table entries from src to dst.
 pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
     unsafe {

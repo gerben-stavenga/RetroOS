@@ -97,6 +97,7 @@ pub mod arch_call {
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start ECX=num_pages EBX=ppage_lo ESI=ppage_hi EDI=flags
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
+    pub const MAP_VGA_TEXT_APERTURE: u64 = 0x118; // map guest 0xB8000-0xBFFFF onto the shared text screen
     #[allow(dead_code)]
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
     pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=count, EDX/ECX=watched linear addrs
@@ -226,6 +227,7 @@ fn arch_dispatch(regs: &mut Regs) {
             paging2::flush_tlb();
         }
         arch_call::MAP_LOW_MEM => paging2::map_low_mem_user(),
+        arch_call::MAP_VGA_TEXT_APERTURE => paging2::map_vga_text_aperture_user(),
         arch_call::COPY_PAGE_ENTRIES => {
             paging2::copy_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
         }
