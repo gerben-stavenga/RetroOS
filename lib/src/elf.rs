@@ -171,6 +171,8 @@ pub type SectionHeader = SectionHeader32;
 /// Program header types
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
+pub const PT_INTERP: u32 = 3;
+pub const PT_PHDR: u32 = 6;
 
 /// Program header flags
 pub const PF_EXEC: u32 = 1;
@@ -340,6 +342,49 @@ impl<'a> Elf<'a> {
             };
             if typ == PT_DYNAMIC {
                 return Some((vaddr, memsz));
+            }
+        }
+        None
+    }
+
+    /// ELF object type: ET_EXEC (2) or ET_DYN (3, PIE / shared object).
+    pub fn elf_type(&self) -> u16 {
+        match self.class {
+            ElfClass::Elf32 => unsafe { (*(self.data.as_ptr() as *const ElfHeader32)).typ },
+            ElfClass::Elf64 => unsafe { (*(self.data.as_ptr() as *const ElfHeader64)).typ },
+        }
+    }
+
+    /// Program-header table location for auxv building: `(file offset, entry
+    /// size, count)`. The dynamic loader's `AT_PHDR` is `load_bias + offset`
+    /// (the first `PT_LOAD` maps file offset 0 at the image base).
+    pub fn ph_table_info(&self) -> (usize, usize, usize) {
+        self.ph_table()
+    }
+
+    /// The `PT_INTERP` path — the dynamic linker (e.g.
+    /// `/lib64/ld-linux-x86-64.so.2`), without the trailing NUL. `None` for
+    /// static / non-dynamic objects.
+    pub fn interp(&self) -> Option<&'a [u8]> {
+        let (offset, size, count) = self.ph_table();
+        for i in 0..count {
+            let ph_start = offset + i * size;
+            let (typ, off, filesz) = match self.class {
+                ElfClass::Elf32 => {
+                    if ph_start + core::mem::size_of::<ProgramHeader32>() > self.data.len() { continue; }
+                    let ph = unsafe { &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader32) };
+                    (ph.typ, ph.off as usize, ph.filesz as usize)
+                }
+                ElfClass::Elf64 => {
+                    if ph_start + core::mem::size_of::<ProgramHeader64>() > self.data.len() { continue; }
+                    let ph = unsafe { &*(self.data.as_ptr().add(ph_start) as *const ProgramHeader64) };
+                    (ph.typ, ph.off as usize, ph.filesz as usize)
+                }
+            };
+            if typ == PT_INTERP && filesz > 0 && off + filesz <= self.data.len() {
+                let mut s = &self.data[off..off + filesz];
+                while s.last() == Some(&0) { s = &s[..s.len() - 1]; }
+                return Some(s);
             }
         }
         None
