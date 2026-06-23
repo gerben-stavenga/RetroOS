@@ -448,6 +448,12 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         96  => sys_clock_gettime(machine, &mut kt.vcpu, a),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
         110 => SyscallResult::val(kt.tid),
+        // setpgid(109)/getpgrp(111)/setsid(112)/getpgid(121)/getsid(124):
+        // single-process job model — return our tid as group/session (mirrors
+        // the i386 path) so dash's job-control setup converges (getpgrp ==
+        // tcgetpgrp) instead of spinning on getpgrp/kill.
+        109 | 111 | 112 | 121 | 124 => SyscallResult::val(kt.tid),
+        62  => SyscallResult::val(0), // kill — no-op (no real job control)
         131 => SyscallResult::val(0),
         158 => sys_arch_prctl(kt, linux, a, regs),
         200 => sys_exit(machine, tid, a),
