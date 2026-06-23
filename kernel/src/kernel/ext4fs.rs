@@ -162,21 +162,32 @@ impl Filesystem for Ext4Fs {
             }
 
             if i == index {
-                let is_dir = entry.file_type().ok().map_or(false, |ft| ft.is_dir());
-                let size = if is_dir {
-                    0
+                let ft = entry.file_type().ok();
+                // Resolve symlinks so a symlinked directory lists AS a directory
+                // (DN descends into it, the DFS walk traverses it) and a
+                // symlinked file reports its target's size/mode. Real entries
+                // keep the cheap inode-local metadata(); only symlinks pay the
+                // extra path resolution (Ext4::metadata follows FollowSymlinks::All).
+                // This is what lets `ln -s …/apps/games /home/retroos/GAMES`
+                // surface under C:\GAMES instead of looking like a file.
+                let md = if ft.map_or(false, |t| t.is_symlink()) {
+                    core::str::from_utf8(name_bytes).ok().and_then(|p| self.fs.metadata(p).ok())
                 } else {
-                    entry.metadata()
-                        .map(|m| m.len() as u32)
-                        .unwrap_or(0)
+                    entry.metadata().ok()
                 };
+                let is_dir = match &md {
+                    Some(m) => m.is_dir(),
+                    None => ft.map_or(false, |t| t.is_dir()),
+                };
+                let size = if is_dir { 0 } else { md.as_ref().map(|m| m.len() as u32).unwrap_or(0) };
+                let mode = md.as_ref().map(|m| m.mode()).unwrap_or(if is_dir { 0o755 } else { 0o644 });
                 let name_len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100],
                     name_len,
                     size,
                     is_dir,
-                    mode: entry.metadata().map(|m| m.mode()).unwrap_or(if is_dir { 0o755 } else { 0o644 }),
+                    mode,
                 };
                 de.name[..name_len].copy_from_slice(&basename[..name_len]);
                 return Some(de);
@@ -195,10 +206,10 @@ impl Filesystem for Ext4Fs {
             Some(s) => s,
             None => return false,
         };
-        // A directory exists iff read_dir succeeds — it fails for files and
-        // symlinks. The previous `exists()` returned true for ANY path, so
-        // stat() reported regular files (e.g. /bin/ls) as directories and
-        // busybox rejected them as non-executable.
+        // A directory exists iff read_dir succeeds — it fails for regular files
+        // (so stat() no longer reports e.g. /bin/ls as a directory, which made
+        // busybox reject it). read_dir follows symlinks (FollowSymlinks::All),
+        // so a symlink TO a directory correctly counts as one.
         self.fs.read_dir(abs).is_ok()
     }
 }
