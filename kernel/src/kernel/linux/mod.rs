@@ -675,16 +675,11 @@ pub fn exec_elf_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread
     // ld.so runs first, so the CPU entry is the interpreter's. Static: jump
     // straight to the program entry with a minimal auxv.
     let (cpu_entry, extra_auxv): (u64, alloc::vec::Vec<(usize, usize)>) = if let Some(ip) = &interp_path {
-        // PT_INTERP is absolute in the program's *own* filesystem. Resolve it
-        // against the same mount the executable came from: under `-h /` the
-        // host tree mounts at "host/", so "/lib64/.." lives at "host/lib64/..".
-        // On a real install (the distro's ext4 at root) there's no prefix.
+        // PT_INTERP is an absolute path in the (unified) root filesystem, e.g.
+        // "/lib64/ld-linux-x86-64.so.2" → VFS "lib64/ld-linux-x86-64.so.2".
         let mut s: &[u8] = ip;
         while s.first() == Some(&b'/') { s = &s[1..]; }
-        let mut ipath: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        if path.starts_with(b"host/") { ipath.extend_from_slice(b"host/"); }
-        ipath.extend_from_slice(s);
-        let interp_data = crate::kernel::exec::load_file_resolved(&ipath).map_err(|_| 8)?;
+        let interp_data = crate::kernel::exec::load_file_resolved(s).map_err(|_| 8)?;
         let interp_loaded = elf::load_elf(machine, &mut current.kernel.vcpu, &interp_data, INTERP_BASE).map_err(|_| 8)?;
         let aux = alloc::vec![
             (3usize, loaded.phdr_vaddr),  // AT_PHDR

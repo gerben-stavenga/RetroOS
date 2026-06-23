@@ -69,6 +69,9 @@ mod mode_transitions;
 pub use machine::VgaState;
 pub use machine::vga_present;
 pub use dos::parse_config_env;
+/// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
+/// BootConfig.c_root; read by the bootfs mount and the DN/CONFIG launch paths.
+pub use dfs::{set_c_root, c_root};
 
 // Stub array / slot table / IRQ-stack constants live in `dos.rs` (alongside
 // the INT handlers that own them); the `dpmi` sibling module also reads them

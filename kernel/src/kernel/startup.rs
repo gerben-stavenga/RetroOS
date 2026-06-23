@@ -45,6 +45,9 @@ pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
     let mut threads = crate::kernel::thread::init_threading();
     println!("Threading initialized");
 
+    // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
+    crate::kernel::dos::set_c_root(boot.c_root());
+
     mount_filesystems(platform);
     init_device_policy(machine, platform);
     let master_env = load_master_env();
@@ -99,10 +102,9 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
             }
         }
         Media::HostRoot => {
-            // The host directory IS the drive (DOSBox-style). Alias it at
-            // /host too so DiskRoot-era `host/...` paths keep working.
+            // The host filesystem IS the VFS root: Linux binaries see /usr,
+            // /lib, /etc natively; DOS C: is the /home/retroos subtree.
             vfs::mount(b"", &HOSTFS);
-            vfs::mount(b"host/", &HOSTFS);
             println!("hostfs mounted as root");
         }
         Media::Diskless => {}
@@ -114,8 +116,13 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
             (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
         }
     }
+    // The embedded DOS system mounts under C:\BOOT (= c_root + "boot/"). C:
+    // itself is the disk/host fs; C:\BOOT is this overlay. Prefix is leaked
+    // (one-time, boot-lifetime) to satisfy vfs::mount's &'static requirement.
+    let bootfs_prefix: &'static [u8] = alloc::boxed::Box::leak(
+        [crate::kernel::dos::c_root(), b"boot/"].concat().into_boxed_slice());
     #[allow(static_mut_refs)]
-    unsafe { vfs::mount(b"boot/", &ROOT_TARFS); }
+    unsafe { vfs::mount(bootfs_prefix, &ROOT_TARFS); }
 
     crate::kernel::stacktrace::init_from_tar();
 }
@@ -140,8 +147,12 @@ fn init_device_policy(
 /// boot) falls back to the embedded bootfs copy, whose PATH points into
 /// C:\BOOT; with neither, the env is empty.
 fn load_master_env() -> alloc::vec::Vec<u8> {
-    let config = crate::kernel::exec::load_file_resolved(b"CONFIG.SYS")
-        .or_else(|_| crate::kernel::exec::load_file_resolved(b"boot/CONFIG.SYS"))
+    // C:\CONFIG.SYS (user override) wins; else the embedded C:\BOOT\CONFIG.SYS.
+    let cr = crate::kernel::dos::c_root();
+    let user_cfg = [cr, b"CONFIG.SYS"].concat();
+    let boot_cfg = [cr, b"boot/CONFIG.SYS"].concat();
+    let config = crate::kernel::exec::load_file_resolved(&user_cfg)
+        .or_else(|_| crate::kernel::exec::load_file_resolved(&boot_cfg))
         .unwrap_or_default();
     crate::kernel::dos::parse_config_env(&config)
 }
@@ -202,8 +213,9 @@ fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]
     println!("Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
 
     println!("Starting DN...");
+    let dn_path = [crate::kernel::dos::c_root(), b"boot/DN/DN.COM"].concat();
     loop {
-        run_program(machine, threads, b"boot/DN/DN.COM", b"", b"", master_env, boot.debug_watch);
+        run_program(machine, threads, &dn_path, b"", b"", master_env, boot.debug_watch);
         println!("DN exited, restarting...");
     }
 }

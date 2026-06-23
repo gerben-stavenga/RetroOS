@@ -219,6 +219,34 @@ impl Vfs {
         (best_idx, m.fs, &path[best_len..])
     }
 
+    /// If `parent/<name>` (case-insensitive) is itself a mount point, return the
+    /// mount's directory component (e.g. parent=`home/retroos`, name=`BOOT` →
+    /// `b"boot"`). DFS uses this so a VFS mount point is a traversable directory
+    /// even though the parent's *backing* fs has no such readdir entry.
+    fn mount_child(&self, parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
+        let mut par = parent;
+        while par.first() == Some(&b'/') { par = &par[1..]; }
+        while par.last() == Some(&b'/') { par = &par[..par.len() - 1]; }
+        for i in 0..self.mount_count {
+            if let Some(ref m) = self.mounts[i] {
+                let prefix: &'static [u8] = m.prefix;
+                // Drop the trailing slash mount prefixes carry.
+                let p: &'static [u8] = if prefix.last() == Some(&b'/') {
+                    &prefix[..prefix.len() - 1]
+                } else { prefix };
+                if p.is_empty() { continue; } // root mount: no child name
+                let (dir, last): (&[u8], &'static [u8]) = match p.iter().rposition(|&b| b == b'/') {
+                    Some(idx) => (&p[..idx], &p[idx + 1..]),
+                    None => (&b""[..], p),
+                };
+                if eq_ignore_case(dir, par) && eq_ignore_case(last, name) {
+                    return Some(last);
+                }
+            }
+        }
+        None
+    }
+
     fn mount_fs(&self, idx: u8) -> &'static dyn Filesystem {
         self.mounts[idx as usize].as_ref().expect("VFS: invalid mount index").fs
     }
@@ -717,6 +745,12 @@ pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
 /// Check if a directory exists on a mounted filesystem.
 pub fn dir_exists(path: &[u8]) -> bool {
     VFS.lock().dir_exists(path)
+}
+
+/// If `parent/<name>` (case-insensitive) is a mount point, return its directory
+/// component (so a VFS mount is traversable by DFS's component walk).
+pub fn mount_child(parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
+    VFS.lock().mount_child(parent, name)
 }
 
 /// Decrement refcount for a VFS file table entry (Linux FdKind::Vfs close).

@@ -280,6 +280,8 @@ fn read_boot_config() -> crate::BootConfig {
     if let Some(n) = read_named(b"opt/cmdline", &mut buf) { cfg.set_cmdline(&buf[..n]); }
     let mut cwd = [0u8; 256];
     if let Some(n) = read_named(b"opt/cwd", &mut cwd) { cfg.set_cwd(&cwd[..n]); }
+    let mut c_root = [0u8; 128];
+    if let Some(n) = read_named(b"opt/c_root", &mut c_root) { cfg.set_c_root(&c_root[..n]); }
     let mut dw = [0u8; 64];
     if let Some(n) = read_named(b"opt/debug-watch", &mut dw) {
         cfg.debug_watch = crate::parse_debug_watch(&dw[..n]);

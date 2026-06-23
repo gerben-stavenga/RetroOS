@@ -46,6 +46,12 @@ pub struct BootConfig {
     cmdline_len: Option<usize>, // None = no headless cmdline (interactive DN loop)
     cwd: [u8; 256],
     cwd_len: Option<usize>,
+    /// VFS subtree that DOS drive `C:` maps to (normalized: no leading `/`, one
+    /// trailing `/`; empty = root). Default `home/retroos/` so DOS gets a tidy
+    /// C: while Linux keeps the real `/`. The in-OS build toolchain sets it to
+    /// `""` (root) so TC's hardcoded `C:\TC` paths still resolve.
+    c_root: [u8; 128],
+    c_root_len: usize,
     /// Debug write-watch addresses (metal QEMU `opt/debug-watch`), if any.
     pub debug_watch: Option<(u32, u32)>,
     /// Host is QEMU-like: fabricate the synthetic 0x3DA vtrace etc. (vs Bochs /
@@ -55,11 +61,18 @@ pub struct BootConfig {
 
 impl BootConfig {
     pub const fn empty() -> Self {
-        BootConfig {
+        let mut cfg = BootConfig {
             cmdline: [0; 4096], cmdline_len: None,
             cwd: [0; 256], cwd_len: None,
+            c_root: [0; 128], c_root_len: 0,
             debug_watch: None, is_qemu: false,
-        }
+        };
+        // Default C: root = "home/retroos/".
+        let d = *b"home/retroos/";
+        let mut i = 0;
+        while i < d.len() { cfg.c_root[i] = d[i]; i += 1; }
+        cfg.c_root_len = d.len();
+        cfg
     }
     /// Record the headless command line (semicolon-separated program list).
     pub fn set_cmdline(&mut self, s: &[u8]) {
@@ -75,6 +88,21 @@ impl BootConfig {
     }
     pub fn cmdline(&self) -> Option<&[u8]> { self.cmdline_len.map(|n| &self.cmdline[..n]) }
     pub fn cwd(&self) -> Option<&[u8]> { self.cwd_len.map(|n| &self.cwd[..n]) }
+    /// Set the DOS C: root (VFS prefix). Normalized: leading `/` stripped, one
+    /// trailing `/` added when non-empty; `"/"` or `""` → root.
+    pub fn set_c_root(&mut self, s: &[u8]) {
+        let mut t = s;
+        while t.first() == Some(&b'/') { t = &t[1..]; }
+        while t.last() == Some(&b'/') { t = &t[..t.len() - 1]; }
+        let mut n = 0;
+        for &b in t {
+            if n < self.c_root.len() - 1 { self.c_root[n] = b; n += 1; }
+        }
+        if n > 0 { self.c_root[n] = b'/'; n += 1; }
+        self.c_root_len = n;
+    }
+    /// The DOS C: root as a VFS prefix (e.g. `home/retroos/`, or `` for root).
+    pub fn c_root(&self) -> &[u8] { &self.c_root[..self.c_root_len] }
 }
 
 /// Parse an `opt/debug-watch` value (`"addr0[,addr1]"`, hex with optional `0x`)
