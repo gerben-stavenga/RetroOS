@@ -86,11 +86,24 @@ pub struct DirEntry {
     pub mode: u16,
 }
 
+/// Stable inode from a path (FNV-1a, forced nonzero). Same path → same ino,
+/// distinct paths → distinct ino (modulo hash collisions) — enough for the
+/// dynamic linker's object dedup.
+fn path_ino(path: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in path { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h | 1
+}
+
 /// An open file in the global file table
 pub struct FileEntry {
     pub vnode: Vnode,
     pub offset: u32,
     pub refcount: u16,
+    /// Stable per-file inode (FNV hash of the path). fstat reports it so the
+    /// dynamic linker's (st_dev, st_ino) dedup distinguishes libraries — without
+    /// it every file shares ino 0 and ld.so thinks libc == the main binary.
+    pub ino: u64,
     /// Index into the mount table (which filesystem owns this file)
     pub mount_idx: u8,
     /// For RAM-backed files: normalized path key into the RAM overlay
@@ -155,6 +168,7 @@ impl Vfs {
     const fn new() -> Self {
         const EMPTY: FileEntry = FileEntry {
             vnode: Vnode { handle: 0, size: 0, mode: 0 },
+            ino: 0,
             offset: 0,
             refcount: 0,
             mount_idx: 0,
@@ -316,6 +330,7 @@ impl Vfs {
             ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
             self.file_table[table_idx] = FileEntry {
                 vnode: Vnode { handle: RAM_SENTINEL, size, mode: 0o644 },
+                ino: path_ino(path),
                 offset: 0,
                 refcount: 1,
                 mount_idx: 0,
@@ -334,7 +349,7 @@ impl Vfs {
                 None => return -24,
             };
             self.file_table[table_idx] = FileEntry {
-                vnode, offset: 0, refcount: 1, mount_idx: midx,
+                vnode, ino: path_ino(path), offset: 0, refcount: 1, mount_idx: midx,
                 ram_key: [0; PATH_KEY_MAX], ram_key_len: 0,
             };
             return table_idx as i32;
@@ -354,6 +369,7 @@ impl Vfs {
         };
         self.file_table[table_idx] = FileEntry {
             vnode,
+            ino: path_ino(path),
             offset: 0,
             refcount: 1,
             mount_idx: midx,
@@ -372,6 +388,7 @@ impl Vfs {
             };
             self.file_table[table_idx] = FileEntry {
                 vnode,
+                ino: path_ino(path),
                 offset: 0,
                 refcount: 1,
                 mount_idx: midx,
@@ -394,6 +411,7 @@ impl Vfs {
         ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
         self.file_table[table_idx] = FileEntry {
             vnode: Vnode { handle: RAM_SENTINEL, size: 0, mode: 0o644 },
+            ino: path_ino(path),
             offset: 0,
             refcount: 1,
             mount_idx: 0,
@@ -507,6 +525,13 @@ impl Vfs {
             return self.ram_files.get(key).map(|d| d.len() as u32).unwrap_or(0);
         }
         e.vnode.size
+    }
+
+    fn file_ino_by_handle(&self, handle: i32) -> u64 {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+        let e = &self.file_table[handle as usize];
+        if e.refcount == 0 { return 0; }
+        e.ino
     }
 
     fn file_mode_by_handle(&self, handle: i32) -> u16 {
@@ -728,6 +753,11 @@ pub fn seek_by_handle(handle: i32, offset: i32, whence: i32) -> i32 {
 /// Get file size by VFS handle.
 pub fn file_size_by_handle(handle: i32) -> u32 {
     VFS.lock().file_size_by_handle(handle)
+}
+
+/// Stable inode for an open handle — fstat's st_ino (dynamic-linker dedup).
+pub fn file_ino_by_handle(handle: i32) -> u64 {
+    VFS.lock().file_ino_by_handle(handle)
 }
 
 /// Get POSIX mode bits by VFS handle. Returns 0 for an invalid handle.

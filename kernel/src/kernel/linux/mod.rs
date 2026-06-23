@@ -382,9 +382,9 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         183 => sys_getcwd(&mut kt.vcpu, linux, a),
         186 => SyscallResult::val(0),
         192 => sys_mmap2(kt, linux, a, (a.a5 as usize) << 12), // mmap2: offset in 4K pages
-        195 => sys_stat64(&mut kt.vcpu, linux, a),
-        196 => sys_stat64(&mut kt.vcpu, linux, a),
-        197 => sys_fstat64(kt, a),
+        195 => sys_stat64(&mut kt.vcpu, linux, a, false),
+        196 => sys_stat64(&mut kt.vcpu, linux, a, false),
+        197 => sys_fstat64(kt, a, false),
         220 => sys_getdents64(kt, linux, a),
         221 => sys_fcntl(kt, a),
         238 => sys_exit(machine, tid, a),
@@ -395,7 +395,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         265 => sys_clock_gettime(machine, &mut kt.vcpu, a),
         270 => sys_exit(machine, tid, a),
         295 => sys_openat(kt, linux, a),
-        300 => sys_fstatat64(&mut kt.vcpu, linux, a),
+        300 => sys_fstatat64(&mut kt.vcpu, linux, a, false),
         305 => SyscallResult::val(-ENOENT),
         331 => sys_pipe(kt, a, true),
         340 => SyscallResult::val(0),
@@ -415,9 +415,9 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         1   => sys_write(kt, a),
         2   => sys_open(kt, linux, a),
         3   => sys_close(kt, a),
-        4   => sys_stat64(&mut kt.vcpu, linux, a),
-        5   => sys_fstat64(kt, a),
-        6   => sys_stat64(&mut kt.vcpu, linux, a),
+        4   => sys_stat64(&mut kt.vcpu, linux, a, true),
+        5   => sys_fstat64(kt, a, true),
+        6   => sys_stat64(&mut kt.vcpu, linux, a, true),
         7   => sys_poll(kt, linux, a, regs),
         8   => sys_lseek(kt, a),
         9   => sys_mmap2(kt, linux, a, a.a5 as usize), // mmap: offset in bytes
@@ -457,7 +457,7 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         231 => sys_exit(machine, tid, a),
         234 => sys_exit(machine, tid, a),
         257 => sys_openat(kt, linux, a),
-        262 => sys_fstatat64(&mut kt.vcpu, linux, a),
+        262 => sys_fstatat64(&mut kt.vcpu, linux, a, true),
         267 => SyscallResult::val(-ENOENT),
         293 => sys_pipe(kt, a, true),
         302 => SyscallResult::val(0),
@@ -1510,7 +1510,7 @@ fn sys_mmap2(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, of
 }
 
 /// stat64(195) / lstat64(196)
-fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let stat_buf = a.a1 as usize;
     let mut path_buf = [0u8; 256];
@@ -1522,7 +1522,7 @@ fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
 
     // Check if it's a directory
     if vfs::dir_exists(resolved) {
-        write_stat64(vcpu, stat_buf, 0o40755, 0);
+        write_stat64(vcpu, stat_buf, 0o40755, 0, 0, want_64);
         return SyscallResult::val(0);
     }
 
@@ -1530,13 +1530,14 @@ fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
     if handle < 0 { return SyscallResult::val(-ENOENT); }
     let size = vfs::file_size_by_handle(handle);
     let posix_mode = vfs::file_mode_by_handle(handle);
+    let ino = vfs::file_ino_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat64(vcpu, stat_buf, 0o100000 | posix_mode as u32, size);
+    write_stat64(vcpu, stat_buf, 0o100000 | posix_mode as u32, size, ino, want_64);
     SyscallResult::val(0)
 }
 
 /// fstat64(197)
-fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args, want_64: bool) -> SyscallResult {
     let fd = a.a0 as usize;
     let stat_buf = a.a1 as usize;
 
@@ -1544,39 +1545,57 @@ fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     match kt.fds[fd] {
         thread::FdKind::ConsoleOut | thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => {
             // stdin/stdout/stderr / pipes — character device / pipe
-            write_stat64(&mut kt.vcpu, stat_buf, 0o20666, 0); // S_IFCHR
+            write_stat64(&mut kt.vcpu, stat_buf, 0o20666, 0, 0, want_64); // S_IFCHR
             SyscallResult::val(0)
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
             let mode = vfs::file_mode_by_handle(handle);
-            write_stat64(&mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size);
+            let ino = vfs::file_ino_by_handle(handle);
+            write_stat64(&mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size, ino, want_64);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {
-            write_stat64(&mut kt.vcpu, stat_buf, 0o40755, 0); // S_IFDIR
+            write_stat64(&mut kt.vcpu, stat_buf, 0o40755, 0, 0, want_64); // S_IFDIR
             SyscallResult::val(0)
         }
         thread::FdKind::None => SyscallResult::val(-EBADF),
     }
 }
 
-/// fstatat64(300)
-fn sys_fstatat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
+/// fstatat64(300 / x86-64 262)
+fn sys_fstatat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
     let _dirfd = a.a0 as i32;
     // Treat as stat64 on the path (a.a1 = path, a.a2 = stat buf)
     let shifted = Args { a0: a.a1, a1: a.a2, a2: a.a3, a3: a.a4, a4: a.a5, a5: 0 };
-    sys_stat64(vcpu, linux, &shifted)
+    sys_stat64(vcpu, linux, &shifted, want_64)
 }
 
-/// Write a minimal Linux stat64 struct to user memory.
-/// struct stat64 on i386 is 96 bytes. We fill mode, size, blksize.
-fn write_stat64(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32) {
-    vcpu.zero(buf, 96);
-    vcpu.write::<u32>(buf + 16, mode);                          // st_mode
-    vcpu.write::<u64>(buf + 44, size as u64);                   // st_size (u64 on stat64)
-    vcpu.write::<u32>(buf + 56, 4096);                          // st_blksize
-    vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+/// Write a minimal Linux stat struct to user memory. The layout differs by
+/// client bitness: i386 `struct stat64` (96 bytes, st_mode@16, st_size@44) vs
+/// x86-64 `struct stat` (144 bytes, st_mode@24, st_size@48). Getting this wrong
+/// for a 64-bit client makes ld.so read st_mode/st_size from the wrong offsets
+/// and reject a shared library as non-regular — so libc never maps.
+fn write_stat64(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32, ino: u64, want_64: bool) {
+    if want_64 {
+        vcpu.zero(buf, 144);
+        vcpu.write::<u64>(buf + 0, 1);                              // st_dev
+        vcpu.write::<u64>(buf + 8, ino);                            // st_ino
+        vcpu.write::<u64>(buf + 16, 1);                             // st_nlink
+        vcpu.write::<u32>(buf + 24, mode);                          // st_mode
+        vcpu.write::<u64>(buf + 48, size as u64);                   // st_size
+        vcpu.write::<u64>(buf + 56, 4096);                          // st_blksize
+        vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+    } else {
+        vcpu.zero(buf, 96);
+        vcpu.write::<u64>(buf + 0, 1);                              // st_dev
+        vcpu.write::<u32>(buf + 12, ino as u32);                    // __st_ino (32-bit)
+        vcpu.write::<u32>(buf + 16, mode);                          // st_mode
+        vcpu.write::<u64>(buf + 44, size as u64);                   // st_size (u64 on stat64)
+        vcpu.write::<u32>(buf + 56, 4096);                          // st_blksize
+        vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+        vcpu.write::<u64>(buf + 88, ino);                           // st_ino (64-bit)
+    }
 }
 
 /// Write the old (pre-LFS) Linux i386 `struct stat` (newstat layout, 64 bytes).
