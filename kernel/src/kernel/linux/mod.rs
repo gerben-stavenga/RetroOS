@@ -371,6 +371,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         91  => sys_munmap(linux, a),
         114 => sys_wait4(machine, kt, a, regs),
         120 => sys_clone(machine, kt, linux, a, regs),
+        190 => sys_fork(machine, kt, linux, a, regs), // vfork → COW fork
         122 => sys_uname(&mut kt.vcpu, a),
         125 => SyscallResult::val(0),
         140 => sys_llseek(kt, a),
@@ -438,6 +439,10 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         39  => SyscallResult::val(kt.tid),
         56  => sys_clone(machine, kt, linux, a, regs),
         57  => sys_fork(machine, kt, linux, a, regs),
+        // vfork: alias to a COW fork. Real vfork suspends the parent and shares
+        // memory until the child execs/exits, but the child execs immediately
+        // (dash's vfork+execve+waitpid), so a plain fork is observably the same.
+        58  => sys_fork(machine, kt, linux, a, regs),
         59  => sys_execve(machine, kt, linux, a, regs),
         60  => sys_exit(machine, tid, a),
         61  => sys_wait4(machine, kt, a, regs),
