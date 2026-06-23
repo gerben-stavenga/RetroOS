@@ -331,6 +331,18 @@ fn gpt_collect_ext(out: &mut [u32]) -> usize {
 /// bootloader's business — the kernel ignores it. With no block device,
 /// `read_sectors` leaves the buffer zeroed and every scan finds nothing — the
 /// same verdict path as an empty disk.
+/// Heuristic: does the ext partition at `lba` look like an actual Linux root
+/// (has `/etc` and `/usr`) rather than a data partition? A multi-ext disk (a
+/// laptop with a data partition AND the real root) gives no order guarantee, so
+/// we sniff the layout to mount the right one at VFS /.
+fn is_linux_root(lba: u32) -> bool {
+    use crate::kernel::vfs::Filesystem;
+    match crate::kernel::ext4fs::Ext4Fs::new(lba) {
+        Ok(fs) => fs.dir_exists(b"etc") && fs.dir_exists(b"usr"),
+        Err(_) => false,
+    }
+}
+
 fn probe_media(machine: &mut crate::TheArch) -> Media {
     let _ = machine;
     let hostfs = crate::kernel::hostfs::init();
@@ -354,10 +366,24 @@ fn probe_media(machine: &mut crate::TheArch) -> Media {
     }
 
     if n > 0 {
-        // First partition = root (C:); the rest mount as C:\DISK1, C:\DISK2, …
+        // A disk can carry several ext partitions (a data partition AND the
+        // real Linux root); GPT/MBR order doesn't say which is the root. Mount
+        // the one that looks like a Linux root (/etc + /usr) at VFS /; fall back
+        // to the first if none matches (e.g. the RetroOS image's own ext4).
+        let mut root_idx = 0;
+        for i in 0..n {
+            if is_linux_root(parts[i]) { root_idx = i; break; }
+        }
+        // The remaining ext partitions mount as C:\DISK1, C:\DISK2, …
         let mut extra_ext = [0u32; 3];
-        extra_ext[..(n - 1).min(3)].copy_from_slice(&parts[1..1 + (n - 1).min(3)]);
-        Media::DiskRoot { ext4_lba: parts[0], extra_ext, hostfs }
+        let mut e = 0;
+        for i in 0..n {
+            if i != root_idx && e < extra_ext.len() {
+                extra_ext[e] = parts[i];
+                e += 1;
+            }
+        }
+        Media::DiskRoot { ext4_lba: parts[root_idx], extra_ext, hostfs }
     } else if hostfs {
         Media::HostRoot
     } else {

@@ -86,11 +86,24 @@ pub struct DirEntry {
     pub mode: u16,
 }
 
+/// Stable inode from a path (FNV-1a, forced nonzero). Same path → same ino,
+/// distinct paths → distinct ino (modulo hash collisions) — enough for the
+/// dynamic linker's object dedup.
+fn path_ino(path: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in path { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h | 1
+}
+
 /// An open file in the global file table
 pub struct FileEntry {
     pub vnode: Vnode,
     pub offset: u32,
     pub refcount: u16,
+    /// Stable per-file inode (FNV hash of the path). fstat reports it so the
+    /// dynamic linker's (st_dev, st_ino) dedup distinguishes libraries — without
+    /// it every file shares ino 0 and ld.so thinks libc == the main binary.
+    pub ino: u64,
     /// Index into the mount table (which filesystem owns this file)
     pub mount_idx: u8,
     /// For RAM-backed files: normalized path key into the RAM overlay
@@ -155,6 +168,7 @@ impl Vfs {
     const fn new() -> Self {
         const EMPTY: FileEntry = FileEntry {
             vnode: Vnode { handle: 0, size: 0, mode: 0 },
+            ino: 0,
             offset: 0,
             refcount: 0,
             mount_idx: 0,
@@ -203,6 +217,34 @@ impl Vfs {
         }
         let m = self.mounts[best_idx as usize].as_ref().unwrap();
         (best_idx, m.fs, &path[best_len..])
+    }
+
+    /// If `parent/<name>` (case-insensitive) is itself a mount point, return the
+    /// mount's directory component (e.g. parent=`home/retroos`, name=`BOOT` →
+    /// `b"boot"`). DFS uses this so a VFS mount point is a traversable directory
+    /// even though the parent's *backing* fs has no such readdir entry.
+    fn mount_child(&self, parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
+        let mut par = parent;
+        while par.first() == Some(&b'/') { par = &par[1..]; }
+        while par.last() == Some(&b'/') { par = &par[..par.len() - 1]; }
+        for i in 0..self.mount_count {
+            if let Some(ref m) = self.mounts[i] {
+                let prefix: &'static [u8] = m.prefix;
+                // Drop the trailing slash mount prefixes carry.
+                let p: &'static [u8] = if prefix.last() == Some(&b'/') {
+                    &prefix[..prefix.len() - 1]
+                } else { prefix };
+                if p.is_empty() { continue; } // root mount: no child name
+                let (dir, last): (&[u8], &'static [u8]) = match p.iter().rposition(|&b| b == b'/') {
+                    Some(idx) => (&p[..idx], &p[idx + 1..]),
+                    None => (&b""[..], p),
+                };
+                if eq_ignore_case(dir, par) && eq_ignore_case(last, name) {
+                    return Some(last);
+                }
+            }
+        }
+        None
     }
 
     fn mount_fs(&self, idx: u8) -> &'static dyn Filesystem {
@@ -298,6 +340,11 @@ impl Vfs {
 
     fn dir_exists(&self, path: &[u8]) -> bool {
         let (_midx, fs, subpath) = self.resolve_mount(path);
+        // A mount root (and the VFS root) is structurally a directory — answer
+        // without querying the backing fs. This avoids blocking on a mount
+        // whose transport is unresponsive: e.g. `ls /` stats the /host hostfs
+        // mount, and a hostfs read with no server attached hangs forever.
+        if subpath.is_empty() { return true; }
         fs.dir_exists(subpath)
     }
 
@@ -316,6 +363,7 @@ impl Vfs {
             ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
             self.file_table[table_idx] = FileEntry {
                 vnode: Vnode { handle: RAM_SENTINEL, size, mode: 0o644 },
+                ino: path_ino(path),
                 offset: 0,
                 refcount: 1,
                 mount_idx: 0,
@@ -334,7 +382,7 @@ impl Vfs {
                 None => return -24,
             };
             self.file_table[table_idx] = FileEntry {
-                vnode, offset: 0, refcount: 1, mount_idx: midx,
+                vnode, ino: path_ino(path), offset: 0, refcount: 1, mount_idx: midx,
                 ram_key: [0; PATH_KEY_MAX], ram_key_len: 0,
             };
             return table_idx as i32;
@@ -354,6 +402,7 @@ impl Vfs {
         };
         self.file_table[table_idx] = FileEntry {
             vnode,
+            ino: path_ino(path),
             offset: 0,
             refcount: 1,
             mount_idx: midx,
@@ -372,6 +421,7 @@ impl Vfs {
             };
             self.file_table[table_idx] = FileEntry {
                 vnode,
+                ino: path_ino(path),
                 offset: 0,
                 refcount: 1,
                 mount_idx: midx,
@@ -394,6 +444,7 @@ impl Vfs {
         ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
         self.file_table[table_idx] = FileEntry {
             vnode: Vnode { handle: RAM_SENTINEL, size: 0, mode: 0o644 },
+            ino: path_ino(path),
             offset: 0,
             refcount: 1,
             mount_idx: 0,
@@ -507,6 +558,13 @@ impl Vfs {
             return self.ram_files.get(key).map(|d| d.len() as u32).unwrap_or(0);
         }
         e.vnode.size
+    }
+
+    fn file_ino_by_handle(&self, handle: i32) -> u64 {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+        let e = &self.file_table[handle as usize];
+        if e.refcount == 0 { return 0; }
+        e.ino
     }
 
     fn file_mode_by_handle(&self, handle: i32) -> u16 {
@@ -694,6 +752,12 @@ pub fn dir_exists(path: &[u8]) -> bool {
     VFS.lock().dir_exists(path)
 }
 
+/// If `parent/<name>` (case-insensitive) is a mount point, return its directory
+/// component (so a VFS mount is traversable by DFS's component walk).
+pub fn mount_child(parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
+    VFS.lock().mount_child(parent, name)
+}
+
 /// Decrement refcount for a VFS file table entry (Linux FdKind::Vfs close).
 pub fn close_vfs_handle(idx: i32) {
     VFS.lock().close_handle(idx);
@@ -728,6 +792,11 @@ pub fn seek_by_handle(handle: i32, offset: i32, whence: i32) -> i32 {
 /// Get file size by VFS handle.
 pub fn file_size_by_handle(handle: i32) -> u32 {
     VFS.lock().file_size_by_handle(handle)
+}
+
+/// Stable inode for an open handle — fstat's st_ino (dynamic-linker dedup).
+pub fn file_ino_by_handle(handle: i32) -> u64 {
+    VFS.lock().file_ino_by_handle(handle)
 }
 
 /// Get POSIX mode bits by VFS handle. Returns 0 for an invalid handle.

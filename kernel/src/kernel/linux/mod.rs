@@ -346,7 +346,8 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         // getppid: real parent if we have one, else 1 (init).
         64  => SyscallResult::val(kt.parent_tid.max(1)),
         // getuid32/getgid32/geteuid32/getegid32 — pretend root.
-        199 | 200 | 201 | 202 => SyscallResult::val(0),
+        199 | 200 | 201 => SyscallResult::val(0),
+        202 => sys_futex(kt, a),
         // setuid32/setgid32/setreuid32/setregid32/setresuid32/setresgid32 —
         // single-user system, accept any change as a no-op.
         203 | 204 | 208 | 210 | 213 | 214 => SyscallResult::val(0),
@@ -357,6 +358,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         42  => sys_pipe(kt, a, false),
         45  => sys_brk(linux, a),
         54  => sys_ioctl(kt, a),
+        180 => sys_pread64(kt, a),
         55  => sys_fcntl(kt, a),
         63  => sys_dup2(kt, a),
         85  => sys_readlink(&mut kt.vcpu, a),
@@ -369,10 +371,11 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         91  => sys_munmap(linux, a),
         114 => sys_wait4(machine, kt, a, regs),
         120 => sys_clone(machine, kt, linux, a, regs),
+        190 => sys_fork(machine, kt, linux, a, regs), // vfork → COW fork
         122 => sys_uname(&mut kt.vcpu, a),
         125 => SyscallResult::val(0),
         140 => sys_llseek(kt, a),
-        146 => sys_writev(kt, a),
+        146 => sys_writev(kt, a, false),
         158 => sys_sched_yield(kt, regs),
         162 => sys_nanosleep(),
         168 => sys_poll(kt, linux, a, regs),
@@ -380,10 +383,10 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         175 => SyscallResult::val(0),
         183 => sys_getcwd(&mut kt.vcpu, linux, a),
         186 => SyscallResult::val(0),
-        192 => sys_mmap2(linux, a),
-        195 => sys_stat64(&mut kt.vcpu, linux, a),
-        196 => sys_stat64(&mut kt.vcpu, linux, a),
-        197 => sys_fstat64(kt, a),
+        192 => sys_mmap2(kt, linux, a, (a.a5 as usize) << 12), // mmap2: offset in 4K pages
+        195 => sys_stat64(&mut kt.vcpu, linux, a, false),
+        196 => sys_stat64(&mut kt.vcpu, linux, a, false),
+        197 => sys_fstat64(kt, a, false),
         220 => sys_getdents64(kt, linux, a),
         221 => sys_fcntl(kt, a),
         238 => sys_exit(machine, tid, a),
@@ -394,7 +397,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         265 => sys_clock_gettime(machine, &mut kt.vcpu, a),
         270 => sys_exit(machine, tid, a),
         295 => sys_openat(kt, linux, a),
-        300 => sys_fstatat64(&mut kt.vcpu, linux, a),
+        300 => sys_fstatat64(&mut kt.vcpu, linux, a, false),
         305 => SyscallResult::val(-ENOENT),
         331 => sys_pipe(kt, a, true),
         340 => SyscallResult::val(0),
@@ -414,19 +417,20 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         1   => sys_write(kt, a),
         2   => sys_open(kt, linux, a),
         3   => sys_close(kt, a),
-        4   => sys_stat64(&mut kt.vcpu, linux, a),
-        5   => sys_fstat64(kt, a),
-        6   => sys_stat64(&mut kt.vcpu, linux, a),
+        4   => sys_stat64(&mut kt.vcpu, linux, a, true),
+        5   => sys_fstat64(kt, a, true),
+        6   => sys_stat64(&mut kt.vcpu, linux, a, true),
         7   => sys_poll(kt, linux, a, regs),
         8   => sys_lseek(kt, a),
-        9   => sys_mmap2(linux, a),
+        9   => sys_mmap2(kt, linux, a, a.a5 as usize), // mmap: offset in bytes
         10  => SyscallResult::val(0),
         11  => sys_munmap(linux, a),
         12  => sys_brk(linux, a),
         13  => SyscallResult::val(0),
         14  => SyscallResult::val(0),
         16  => sys_ioctl(kt, a),
-        20  => sys_writev(kt, a),
+        17  => sys_pread64(kt, a),
+        20  => sys_writev(kt, a, true),
         21  => sys_access(&mut kt.vcpu, linux, a),
         22  => sys_pipe(kt, a, false),
         24  => sys_sched_yield(kt, regs),
@@ -435,6 +439,10 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         39  => SyscallResult::val(kt.tid),
         56  => sys_clone(machine, kt, linux, a, regs),
         57  => sys_fork(machine, kt, linux, a, regs),
+        // vfork: alias to a COW fork. Real vfork suspends the parent and shares
+        // memory until the child execs/exits, but the child execs immediately
+        // (dash's vfork+execve+waitpid), so a plain fork is observably the same.
+        58  => sys_fork(machine, kt, linux, a, regs),
         59  => sys_execve(machine, kt, linux, a, regs),
         60  => sys_exit(machine, tid, a),
         61  => sys_wait4(machine, kt, a, regs),
@@ -445,17 +453,23 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         96  => sys_clock_gettime(machine, &mut kt.vcpu, a),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
         110 => SyscallResult::val(kt.tid),
+        // setpgid(109)/getpgrp(111)/setsid(112)/getpgid(121)/getsid(124):
+        // single-process job model — return our tid as group/session (mirrors
+        // the i386 path) so dash's job-control setup converges (getpgrp ==
+        // tcgetpgrp) instead of spinning on getpgrp/kill.
+        109 | 111 | 112 | 121 | 124 => SyscallResult::val(kt.tid),
+        62  => SyscallResult::val(0), // kill — no-op (no real job control)
         131 => SyscallResult::val(0),
         158 => sys_arch_prctl(kt, linux, a, regs),
         200 => sys_exit(machine, tid, a),
-        202 => SyscallResult::val(0),
+        202 => sys_futex(kt, a),
         217 => sys_getdents64(kt, linux, a),
         218 => SyscallResult::val(kt.tid),
         228 => sys_clock_gettime(machine, &mut kt.vcpu, a),
         231 => sys_exit(machine, tid, a),
         234 => sys_exit(machine, tid, a),
         257 => sys_openat(kt, linux, a),
-        262 => sys_fstatat64(&mut kt.vcpu, linux, a),
+        262 => sys_fstatat64(&mut kt.vcpu, linux, a, true),
         267 => SyscallResult::val(-ENOENT),
         293 => sys_pipe(kt, a, true),
         302 => SyscallResult::val(0),
@@ -549,7 +563,7 @@ fn read_c_argv(vcpu: &Vcpu, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::ve
 ///   [16 random bytes] [string pool]
 ///
 /// For 64-bit: same layout with 8-byte slots.
-pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], want_64: bool) -> usize {
+pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)]) -> usize {
     // Write one machine word (4 or 8 bytes, per client bitness) to the stack.
     fn write_word(vcpu: &mut Vcpu, addr: usize, val: usize, want_64: bool) {
         if want_64 { vcpu.write::<u64>(addr, val as u64); }
@@ -590,40 +604,50 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
         vcpu.write::<u32>(sp + i * 4, thread::prng() as u32);
     }
 
-    // 3. Compute total header size and align
-    // Layout from sp downward: argc, argv[0..N], NULL, envp[0..M], NULL, auxv entries
-    let auxv_count = 2; // AT_PAGESZ, AT_RANDOM (each is 2 words: type + value)
+    // 3. Build the auxiliary vector. The caller supplies the dynamic-linker
+    // entries (AT_PHDR/PHENT/PHNUM/BASE/ENTRY + the id/cap tags) in
+    // `extra_auxv`; we append the ones needing stack-internal addresses
+    // (AT_PAGESZ, AT_RANDOM, AT_EXECFN) and the AT_NULL terminator. A static
+    // exec passes `&[]`, preserving the minimal PAGESZ/RANDOM vector.
+    let mut auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    auxv.extend_from_slice(extra_auxv);
+    auxv.push((6, 4096));         // AT_PAGESZ
+    auxv.push((25, random_addr)); // AT_RANDOM
+    if let Some(&a0) = string_addrs.first() {
+        auxv.push((31, a0));      // AT_EXECFN — argv[0] string
+    }
+    auxv.push((0, 0));            // AT_NULL terminator
+
+    // 4. Compute total header size and align.
+    // Layout from sp downward: argc, argv[0..N], NULL, envp[0..M], NULL, auxv.
     let header_words = 1 /*argc*/ + args.len() + 1 /*NULL*/
         + env_addrs.len() + 1 /*envp NULL*/
-        + auxv_count * 2 + 2 /*AT_NULL*/;
+        + auxv.len() * 2;
     sp -= header_words * word;
     sp &= !0xF; // 16-byte align
 
     let base = sp;
     let mut pos = base;
 
-    // 4. Write argc
+    // argc
     write_word(vcpu, pos, args.len(), want_64);
     pos += word;
-
-    // 5. Write argv[0..N-1] then the argv[N] = NULL terminator
+    // argv[0..N-1], NULL
     for &addr in &string_addrs {
         write_word(vcpu, pos, addr, want_64);
         pos += word;
     }
     write_word(vcpu, pos, 0, want_64);
     pos += word;
-
-    // 6. envp[0..M-1] then the envp[M] = NULL terminator
+    // envp[0..M-1], NULL
     for &addr in &env_addrs {
         write_word(vcpu, pos, addr, want_64);
         pos += word;
     }
     write_word(vcpu, pos, 0, want_64);
     pos += word;
-
-    // 7. Auxiliary vector: (AT_PAGESZ, 4096), (AT_RANDOM, ptr), (AT_NULL, 0)
-    for (tag, val) in [(6usize, 4096usize), (25, random_addr), (0, 0)] {
+    // auxv (terminated by the AT_NULL already pushed)
+    for (tag, val) in auxv {
         write_word(vcpu, pos, tag, want_64);
         write_word(vcpu, pos + word, val, want_64);
         pos += word * 2;
@@ -639,17 +663,58 @@ pub(crate) fn setup_user_stack(vcpu: &mut Vcpu, args: &[alloc::vec::Vec<u8>], wa
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
 pub fn exec_elf_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
-    let current = thread::get_thread(threads, tid).unwrap();
-    let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data).map_err(|_| 8)?; // ENOEXEC
+    // PIE main + dynamic linker load bases. Kept in the low user region
+    // (< USER_STACK_TOP) so they don't need the high 64-bit VA range; ld.so
+    // mmaps the shared libraries between these and the stack.
+    const PIE_BASE: usize = 0x0800_0000;     // 128 MiB — main PIE load bias
+    const INTERP_BASE: usize = 0x4000_0000;  // 1 GiB — dynamic-linker load bias
 
+    // Peek dynamic info before loading so we know whether to apply a bias and
+    // whether to bring in the interpreter.
+    let (is_pie, interp_path) = elf::dyn_info(data).map_err(|_| 8)?;
+
+    let current = thread::get_thread(threads, tid).unwrap();
+
+    // Dynamically-linked PIE → load at PIE_BASE; fixed ET_EXEC (and static
+    // ET_DYN, which we keep at bias 0 as before) → no bias.
+    let main_bias = if is_pie && interp_path.is_some() { PIE_BASE } else { 0 };
+    let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data, main_bias).map_err(|_| 8)?;
     let want_64 = loaded.class == elf::ElfClass::Elf64;
+
+    // Dynamic: load the interpreter (ld.so) at INTERP_BASE and build the full
+    // auxv so it can self-relocate, relocate the program, and load its libs.
+    // ld.so runs first, so the CPU entry is the interpreter's. Static: jump
+    // straight to the program entry with a minimal auxv.
+    let (cpu_entry, extra_auxv): (u64, alloc::vec::Vec<(usize, usize)>) = if let Some(ip) = &interp_path {
+        // PT_INTERP is an absolute path in the (unified) root filesystem, e.g.
+        // "/lib64/ld-linux-x86-64.so.2" → VFS "lib64/ld-linux-x86-64.so.2".
+        let mut s: &[u8] = ip;
+        while s.first() == Some(&b'/') { s = &s[1..]; }
+        let interp_data = crate::kernel::exec::load_file_resolved(s).map_err(|_| 8)?;
+        let interp_loaded = elf::load_elf(machine, &mut current.kernel.vcpu, &interp_data, INTERP_BASE).map_err(|_| 8)?;
+        let aux = alloc::vec![
+            (3usize, loaded.phdr_vaddr),  // AT_PHDR
+            (4, loaded.phentsize),        // AT_PHENT
+            (5, loaded.phnum),            // AT_PHNUM
+            (7, INTERP_BASE),             // AT_BASE — dynamic-linker load base
+            (9, loaded.entry as usize),   // AT_ENTRY — program entry (biased)
+            (16, 0),                      // AT_HWCAP
+            (17, 100),                    // AT_CLKTCK
+            (23, 0),                      // AT_SECURE
+            (11, 0), (12, 0), (13, 0), (14, 0), // AT_UID/EUID/GID/EGID
+        ];
+        (interp_loaded.entry, aux)
+    } else {
+        (loaded.entry, alloc::vec::Vec::new())
+    };
+
     let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
 
-    let sp = setup_user_stack(&mut current.kernel.vcpu, args, want_64);
+    let sp = setup_user_stack(&mut current.kernel.vcpu, args, want_64, &extra_auxv);
     if want_64 {
-        thread::init_process_thread_64(current, loaded.entry, sp as u64);
+        thread::init_process_thread_64(current, cpu_entry, sp as u64);
     } else {
-        thread::init_process_thread(current, loaded.entry as u32, sp as u32);
+        thread::init_process_thread(current, cpu_entry as u32, sp as u32);
     }
     current.kernel.symbols = symbols;
 
@@ -1110,13 +1175,38 @@ fn sys_fcntl(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
     if kt.fds[fd].is_none() { return SyscallResult::val(-EBADF); }
 
+    const F_DUPFD: i32 = 0;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
+    const F_DUPFD_CLOEXEC: i32 = 1030;
     const FD_CLOEXEC: i32 = 1;
 
     match cmd {
+        // Duplicate `fd` to the lowest free fd >= arg. dash saves its std fds
+        // to 10+ this way at startup; without it dash bailed ("sh: 0: …").
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let minfd = a.a2 as usize;
+            let newfd = match kt.alloc_fd(minfd.min(thread::MAX_FDS)) {
+                Some(n) => n,
+                None => return SyscallResult::val(-24), // EMFILE
+            };
+            let kind = kt.fds[fd];
+            match kind {
+                thread::FdKind::Vfs(handle) => vfs::add_vfs_ref(handle),
+                thread::FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
+                thread::FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
+                thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir(_) => {}
+            }
+            kt.fds[newfd] = kind;
+            if cmd == F_DUPFD_CLOEXEC {
+                kt.cloexec |= 1 << newfd;
+            } else {
+                kt.cloexec &= !(1 << newfd);
+            }
+            SyscallResult::val(newfd as i32)
+        }
         F_GETFD => {
             let cloexec = if kt.cloexec & (1 << fd) != 0 { FD_CLOEXEC } else { 0 };
             SyscallResult::val(cloexec)
@@ -1243,7 +1333,7 @@ fn sys_llseek(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 }
 
 /// writev(146)
-fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+fn sys_writev(kt: &mut thread::KernelThread, a: &Args, want_64: bool) -> SyscallResult {
     let fd = a.a0 as usize;
     let iov_ptr = a.a1 as usize;
     let iovcnt = a.a2 as usize;
@@ -1254,11 +1344,17 @@ fn sys_writev(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
 
     let mut total = 0i32;
 
+    // struct iovec { void *iov_base; size_t iov_len; } — 8 bytes on i386,
+    // 16 bytes (two u64) on x86-64. Reading it at the wrong width drops the
+    // length (reads it from the high half of the pointer) → writes nothing.
+    let stride = if want_64 { 16 } else { 8 };
     for i in 0..iovcnt {
-        // struct iovec { void *iov_base; size_t iov_len; } — 8 bytes on i386
-        let base_addr = iov_ptr + i * 8;
-        let iov_base = kt.vcpu.read::<u32>(base_addr) as usize;
-        let iov_len = kt.vcpu.read::<u32>(base_addr + 4) as usize;
+        let base_addr = iov_ptr + i * stride;
+        let (iov_base, iov_len) = if want_64 {
+            (kt.vcpu.read::<u64>(base_addr) as usize, kt.vcpu.read::<u64>(base_addr + 8) as usize)
+        } else {
+            (kt.vcpu.read::<u32>(base_addr) as usize, kt.vcpu.read::<u32>(base_addr + 4) as usize)
+        };
 
         if iov_len == 0 { continue; }
 
@@ -1376,49 +1472,98 @@ fn sys_getcwd(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
 }
 
 /// mmap2(192) — anonymous private only
-fn sys_mmap2(linux: &mut LinuxState, a: &Args) -> SyscallResult {
+/// pread64(17 / i386 180) — positioned read; does not advance the fd offset
+/// as far as the caller is concerned (each call re-seeks). ld.so reads ELF
+/// headers/sections of shared libraries this way.
+fn sys_pread64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+    let fd = a.a0 as usize;
+    let buf = a.a1 as usize;
+    let len = a.a2 as usize;
+    let offset = a.a3 as i64;
+    if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
+    match kt.fds[fd] {
+        thread::FdKind::Vfs(handle) => {
+            vfs::seek_by_handle(handle, offset as i32, 0 /*SEEK_SET*/);
+            let mut tmp = alloc::vec![0u8; len];
+            let n = vfs::read_by_handle(handle, &mut tmp);
+            if n > 0 { kt.vcpu.copy_to(buf, &tmp[..n as usize]); }
+            SyscallResult::val(n)
+        }
+        _ => SyscallResult::val(-EBADF),
+    }
+}
+
+/// futex(202) — minimal. Single-threaded clients only reach WAIT when a lock is
+/// already held; correct behavior is EAGAIN when the word no longer matches.
+fn sys_futex(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+    let uaddr = a.a0 as usize;
+    let op = a.a1 as u32 & 0x7f; // strip FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
+    let val = a.a2 as u32;
+    const FUTEX_WAIT: u32 = 0;
+    const FUTEX_WAKE: u32 = 1;
+    let cur = kt.vcpu.read::<u32>(uaddr);
+    match op {
+        FUTEX_WAIT => if cur != val { SyscallResult::val(-11) } else { SyscallResult::val(0) }, // EAGAIN
+        FUTEX_WAKE => SyscallResult::val(0),
+        _ => SyscallResult::val(0),
+    }
+}
+
+fn sys_mmap2(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, offset_bytes: usize) -> SyscallResult {
     let addr_hint = a.a0 as usize;
     let length = a.a1 as usize;
     let _prot = a.a2 as u32;
     let flags = a.a3 as u32;
     let fd = a.a4 as i32;
-    let _offset_pages = a.a5 as u32;
 
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_FIXED: u32 = 0x10;
 
-    // Only support MAP_ANONYMOUS | MAP_PRIVATE
-    if flags & MAP_ANONYMOUS == 0 {
-        return SyscallResult::val64(-ENOSYS as i64);
-    }
-    if fd != -1i32 as i32 && flags & MAP_ANONYMOUS != 0 {
-        // Some callers pass fd=-1 with MAP_ANONYMOUS — that's fine
-    }
-
     let num_pages = (length + 0xFFF) / 0x1000;
     if num_pages == 0 { return SyscallResult::val(-EINVAL); }
-
-    // Pick address: grow mmap_cursor downward
     let alloc_size = num_pages * 0x1000;
-    if linux.mmap_cursor < linux.heap_end + alloc_size {
-        return SyscallResult::val64(-ENOMEM as i64);
-    }
+
+    // Pick the base address: MAP_FIXED honors the hint; otherwise grow the
+    // mmap region downward.
     let base = if flags & MAP_FIXED != 0 && addr_hint != 0 {
         addr_hint & !0xFFF
     } else {
+        if linux.mmap_cursor < linux.heap_end + alloc_size {
+            return SyscallResult::val64(-ENOMEM as i64);
+        }
         linux.mmap_cursor -= alloc_size;
         linux.mmap_cursor
     };
 
-    // Pages are demand-paged: existing page fault handler allocates on access.
-    // No need to pre-allocate. The zero page fill on first touch gives
-    // MAP_ANONYMOUS semantics (contents initialized to zero).
+    // File-backed mapping: read the file region into the (demand-allocated)
+    // pages so the dynamic linker can map libc et al. Anonymous mappings stay
+    // demand-zero (page-fault handler zero-fills on first touch). MAP_PRIVATE
+    // file maps are treated as eager copies — fine since we never write back.
+    if flags & MAP_ANONYMOUS == 0 {
+        if fd < 0 || fd as usize >= thread::MAX_FDS {
+            return SyscallResult::val64(-EBADF as i64);
+        }
+        match kt.fds[fd as usize] {
+            thread::FdKind::Vfs(handle) => {
+                vfs::seek_by_handle(handle, offset_bytes as i32, 0 /*SEEK_SET*/);
+                let mut tmp = alloc::vec![0u8; length];
+                let n = vfs::read_by_handle(handle, &mut tmp);
+                if n > 0 { kt.vcpu.copy_to(base, &tmp[..n as usize]); }
+            }
+            _ => return SyscallResult::val64(-EBADF as i64),
+        }
+    } else {
+        // MAP_ANONYMOUS must read as zero. Eager-zero the range — demand-zero
+        // alone left libc's BSS (its lock words) holding garbage, which sent
+        // glibc into a futex spin on a "held" lock.
+        kt.vcpu.zero(base, alloc_size);
+    }
 
     SyscallResult::val64(base as i64)
 }
 
 /// stat64(195) / lstat64(196)
-fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let stat_buf = a.a1 as usize;
     let mut path_buf = [0u8; 256];
@@ -1430,7 +1575,7 @@ fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
 
     // Check if it's a directory
     if vfs::dir_exists(resolved) {
-        write_stat64(vcpu, stat_buf, 0o40755, 0);
+        write_stat64(vcpu, stat_buf, 0o40755, 0, 0, want_64);
         return SyscallResult::val(0);
     }
 
@@ -1438,13 +1583,14 @@ fn sys_stat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
     if handle < 0 { return SyscallResult::val(-ENOENT); }
     let size = vfs::file_size_by_handle(handle);
     let posix_mode = vfs::file_mode_by_handle(handle);
+    let ino = vfs::file_ino_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat64(vcpu, stat_buf, 0o100000 | posix_mode as u32, size);
+    write_stat64(vcpu, stat_buf, 0o100000 | posix_mode as u32, size, ino, want_64);
     SyscallResult::val(0)
 }
 
 /// fstat64(197)
-fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args, want_64: bool) -> SyscallResult {
     let fd = a.a0 as usize;
     let stat_buf = a.a1 as usize;
 
@@ -1452,39 +1598,57 @@ fn sys_fstat64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     match kt.fds[fd] {
         thread::FdKind::ConsoleOut | thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => {
             // stdin/stdout/stderr / pipes — character device / pipe
-            write_stat64(&mut kt.vcpu, stat_buf, 0o20666, 0); // S_IFCHR
+            write_stat64(&mut kt.vcpu, stat_buf, 0o20666, 0, 0, want_64); // S_IFCHR
             SyscallResult::val(0)
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
             let mode = vfs::file_mode_by_handle(handle);
-            write_stat64(&mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size);
+            let ino = vfs::file_ino_by_handle(handle);
+            write_stat64(&mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size, ino, want_64);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {
-            write_stat64(&mut kt.vcpu, stat_buf, 0o40755, 0); // S_IFDIR
+            write_stat64(&mut kt.vcpu, stat_buf, 0o40755, 0, 0, want_64); // S_IFDIR
             SyscallResult::val(0)
         }
         thread::FdKind::None => SyscallResult::val(-EBADF),
     }
 }
 
-/// fstatat64(300)
-fn sys_fstatat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args) -> SyscallResult {
+/// fstatat64(300 / x86-64 262)
+fn sys_fstatat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
     let _dirfd = a.a0 as i32;
     // Treat as stat64 on the path (a.a1 = path, a.a2 = stat buf)
     let shifted = Args { a0: a.a1, a1: a.a2, a2: a.a3, a3: a.a4, a4: a.a5, a5: 0 };
-    sys_stat64(vcpu, linux, &shifted)
+    sys_stat64(vcpu, linux, &shifted, want_64)
 }
 
-/// Write a minimal Linux stat64 struct to user memory.
-/// struct stat64 on i386 is 96 bytes. We fill mode, size, blksize.
-fn write_stat64(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32) {
-    vcpu.zero(buf, 96);
-    vcpu.write::<u32>(buf + 16, mode);                          // st_mode
-    vcpu.write::<u64>(buf + 44, size as u64);                   // st_size (u64 on stat64)
-    vcpu.write::<u32>(buf + 56, 4096);                          // st_blksize
-    vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+/// Write a minimal Linux stat struct to user memory. The layout differs by
+/// client bitness: i386 `struct stat64` (96 bytes, st_mode@16, st_size@44) vs
+/// x86-64 `struct stat` (144 bytes, st_mode@24, st_size@48). Getting this wrong
+/// for a 64-bit client makes ld.so read st_mode/st_size from the wrong offsets
+/// and reject a shared library as non-regular — so libc never maps.
+fn write_stat64(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32, ino: u64, want_64: bool) {
+    if want_64 {
+        vcpu.zero(buf, 144);
+        vcpu.write::<u64>(buf + 0, 1);                              // st_dev
+        vcpu.write::<u64>(buf + 8, ino);                            // st_ino
+        vcpu.write::<u64>(buf + 16, 1);                             // st_nlink
+        vcpu.write::<u32>(buf + 24, mode);                          // st_mode
+        vcpu.write::<u64>(buf + 48, size as u64);                   // st_size
+        vcpu.write::<u64>(buf + 56, 4096);                          // st_blksize
+        vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+    } else {
+        vcpu.zero(buf, 96);
+        vcpu.write::<u64>(buf + 0, 1);                              // st_dev
+        vcpu.write::<u32>(buf + 12, ino as u32);                    // __st_ino (32-bit)
+        vcpu.write::<u32>(buf + 16, mode);                          // st_mode
+        vcpu.write::<u64>(buf + 44, size as u64);                   // st_size (u64 on stat64)
+        vcpu.write::<u32>(buf + 56, 4096);                          // st_blksize
+        vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+        vcpu.write::<u64>(buf + 88, ino);                           // st_ino (64-bit)
+    }
 }
 
 /// Write the old (pre-LFS) Linux i386 `struct stat` (newstat layout, 64 bytes).

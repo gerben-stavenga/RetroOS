@@ -36,7 +36,11 @@ sed 's/$/\r/' "$SRC" | LC_ALL=C tr -cd '\11\12\15\40-\176' > "$STAGE/$GUEST_SRC"
 # (/host); cwd `host/` is where TCC reads the source and writes the output.
 # The interpreter shuts down when TCC exits; no wall-clock cap is needed (it's
 # deterministic, and Bazel's action timeout still bounds a real hang).
+# --c-root / : the in-OS toolchain needs DOS C: = root, because TURBOC.CFG
+# pins -IC:\TC\INCLUDE / -LC:\TC\LIB (the image's TC/ lives at the root). The
+# normal-boot default (C: = /home/retroos) would hide C:\TC.
 "$HOST" --host "$STAGE" \
+    --c-root / \
     --cmd "TC/TCC.EXE $TCC_FLAGS $GUEST_SRC" --cwd "host/" \
     "$IMAGE" < /dev/null > "$STAGE/run.log" 2>&1 || true
 

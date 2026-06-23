@@ -5,7 +5,21 @@ rust_binary(
     name = "shell_bin",
     srcs = ["src/main.rs"],
     edition = "2024",
-    rustc_flags = ["-Copt-level=s", "-Cstrip=symbols", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld", "-Ctarget-feature=-sse,-sse2"],
+    # no_std launcher (see src/main.rs): the Rust crate is std-free (no SSE2/cmov
+    # codegen), but we keep the musl C runtime — crt0 → __libc_start_main → main,
+    # which is i386/SSE2-free — for the process/stack setup. no_std doesn't pull
+    # libc on its own, so -lc resolves __libc_start_main. -Ctarget-cpu=i486: no
+    # SSE2/cmov so it runs on --arch 386 (like busybox). -Cpanic=abort: no
+    # unwinder/eh_personality in no_std.
+    rustc_flags = [
+        "-Copt-level=s",
+        "-Cstrip=symbols",
+        "-Clinker-flavor=ld.lld",
+        "-Clinker=rust-lld",
+        "-Ctarget-cpu=i486",
+        "-Cpanic=abort",
+        "-Clink-arg=-lc",
+    ],
 )
 
 musl_binary(

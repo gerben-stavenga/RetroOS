@@ -33,6 +33,7 @@ fn main() {
     let mut host_dir: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
+    let mut c_root: Option<String> = None;
     let mut wav: Option<String> = None;
     let mut image: Option<String> = None;
     let mut args = std::env::args().skip(1);
@@ -41,6 +42,7 @@ fn main() {
             "--host" => host_dir = args.next(),
             "--cmd" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
+            "--c-root" => c_root = args.next(),
             "--wav" => wav = args.next(),
             _ if image.is_none() && !a.starts_with('-') => image = Some(a),
             _ => usage(),
@@ -84,6 +86,9 @@ fn main() {
         }
         if let Some(c) = &cwd {
             config.set_cwd(c.as_bytes());
+        }
+        if let Some(c) = &c_root {
+            config.set_c_root(c.as_bytes());
         }
         let mut machine = kernel::new_arch();
         kernel::startup(&mut machine, &config);

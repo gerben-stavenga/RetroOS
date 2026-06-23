@@ -3,7 +3,7 @@
 # kernel's built-in master env (PATH only). Edit freely -- this file
 # lives on the ext4 root (read/write).
 
-COMSPEC=C:\COMMAND.COM
-PATH=C:\;C:\TC;C:\BORLANDC\BIN
+COMSPEC=C:\BOOT\COMMAND.COM
+PATH=C:\;C:\BOOT;C:\TC;C:\BORLANDC\BIN
 ADLIB=A388
 BLASTER=A220 I7 D1 H5 P330 T6

@@ -54,6 +54,7 @@ fn main() {
     let mut host_dir: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
+    let mut c_root: Option<String> = None;
     let mut shot: Option<String> = None;
     let mut wav: Option<String> = None;
     let mut live_console = false;
@@ -71,6 +72,7 @@ fn main() {
             // metal. `startup()` runs the program(s), then shuts down (no DN loop).
             "--cmd" | "-c" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
+            "--c-root" => c_root = args.next(),
             // Periodically snapshot the guest's VGA text screen (0xB8000) to a
             // file — lets a headless run of an interactive TUI (DN) be inspected.
             "--screenshot" => shot = args.next(),
@@ -182,6 +184,7 @@ fn main() {
     config.is_qemu = true;
     if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
     if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
+    if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }
 
     let mut machine = kernel::new_arch();
     kernel::startup(&mut machine, &config);

@@ -91,8 +91,12 @@ pub mod ci {
     /// name on hit. Populates the cache on miss.
     pub fn lookup(vfs_dir: &[u8], alias: &[u8]) -> Option<&'static [u8]> {
         let dir = ensure_cached(vfs_dir);
-        dir.binary_search_by(|(k, _)| k.as_slice().cmp(alias)).ok()
-            .map(|i| dir[i].1.original.as_slice())
+        if let Ok(i) = dir.binary_search_by(|(k, _)| k.as_slice().cmp(alias)) {
+            return Some(dir[i].1.original.as_slice());
+        }
+        // Not a backing-fs entry — but it may be a VFS mount point under this
+        // dir (e.g. C:\BOOT = the bootfs overlay, invisible to readdir).
+        crate::kernel::vfs::mount_child(vfs_dir, alias)
     }
 
     /// Get the entry at `idx` in the cache's alias order. Returns `(alias,
@@ -222,6 +226,16 @@ impl DfsState {
     pub fn init_from_vfs(&mut self, vfs_cwd: &[u8]) {
         let mut s = vfs_cwd;
         while s.first() == Some(&b'/') { s = &s[1..]; }
+        // Strip the C: root prefix (c_root) so the cwd is stored relative to C:\
+        // (e.g. "home/retroos/boot" → "boot" → "BOOT"), not the raw VFS path —
+        // otherwise the DOS cwd is a driveless "HOME\RETROOS\BOOT" and every
+        // cwd-relative open fails. Paths already C:-relative (a DOS→DOS fork
+        // passes "BOOT") don't match c_root and pass through unchanged.
+        let cr = c_root();
+        if s.len() >= cr.len() && &s[..cr.len()] == cr {
+            s = &s[cr.len()..];
+        }
+        while s.first() == Some(&b'/') { s = &s[1..]; }
         while s.last() == Some(&b'/') { s = &s[..s.len()-1]; }
         let n = s.len().min(DFS_CWD_MAX);
         for i in 0..n {
@@ -334,13 +348,41 @@ impl DfsState {
     }
 }
 
+/// The VFS subtree that DOS drive `C:` maps to — set once at boot from
+/// `BootConfig.c_root` (default `home/retroos/`; the in-OS build toolchain sets
+/// it to `""` = root). DOS programs see a tidy `C:\...`; the Linux personality
+/// keeps the real root (`/usr`, `/lib`, ...). The embedded DOS system mounts at
+/// `c_root() + "boot/"` (= `C:\BOOT`).
+static mut C_ROOT_BUF: [u8; 128] = [0; 128];
+static mut C_ROOT_LEN: usize = 0;
+
+/// Set the C: → VFS prefix (call once at boot, before any mount/resolve).
+pub fn set_c_root(prefix: &[u8]) {
+    let n = prefix.len().min(128);
+    unsafe {
+        C_ROOT_BUF[..n].copy_from_slice(&prefix[..n]);
+        C_ROOT_LEN = n;
+    }
+}
+
+/// The C: → VFS prefix (e.g. `home/retroos/`, or empty for root).
+#[allow(static_mut_refs)]
+pub fn c_root() -> &'static [u8] {
+    unsafe { &C_ROOT_BUF[..C_ROOT_LEN] }
+}
+
 /// Convert a VFS-form path back to drive-qualified DOS form. Used only on
 /// the initial exec path, where we have an already-resolved VFS path and
 /// need a DOS form for the env program-path suffix: `C:\REST` (uppercased,
-/// `/` → `\`). One drive (C:); `host/` is just a subdirectory.
+/// `/` → `\`). The `C_ROOT` prefix is stripped (it's implied by `C:`).
 pub fn vfs_to_dos(vfs: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> usize {
     let mut s = vfs;
     while s.first() == Some(&b'/') { s = &s[1..]; }
+    // Strip the C: root prefix if present (e.g. "home/retroos/games/x" → "games/x").
+    let cr = c_root();
+    if s.len() >= cr.len() && &s[..cr.len()] == cr {
+        s = &s[cr.len()..];
+    }
     let mut pos = 0;
     if pos + 3 > out.len() { return pos; }
     out[pos] = b'C'; out[pos+1] = b':'; out[pos+2] = b'\\';
@@ -364,9 +406,12 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
         return Err(3);
     }
     let prefix: &[u8] = match abs_dos[0] {
-        b'C' => b"",
+        b'C' => c_root(),
         _ => return Err(15),
     };
+    // c_root carries a trailing slash (for path concat); the component walk
+    // re-adds slashes, so write it WITHOUT the trailing one (and "" → root).
+    let prefix = if prefix.last() == Some(&b'/') { &prefix[..prefix.len() - 1] } else { prefix };
     let mut pos = 0;
     for &b in prefix {
         out[pos] = b; pos += 1;
