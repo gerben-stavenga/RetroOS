@@ -226,6 +226,16 @@ impl DfsState {
     pub fn init_from_vfs(&mut self, vfs_cwd: &[u8]) {
         let mut s = vfs_cwd;
         while s.first() == Some(&b'/') { s = &s[1..]; }
+        // Strip the C: root prefix (c_root) so the cwd is stored relative to C:\
+        // (e.g. "home/retroos/boot" → "boot" → "BOOT"), not the raw VFS path —
+        // otherwise the DOS cwd is a driveless "HOME\RETROOS\BOOT" and every
+        // cwd-relative open fails. Paths already C:-relative (a DOS→DOS fork
+        // passes "BOOT") don't match c_root and pass through unchanged.
+        let cr = c_root();
+        if s.len() >= cr.len() && &s[..cr.len()] == cr {
+            s = &s[cr.len()..];
+        }
+        while s.first() == Some(&b'/') { s = &s[1..]; }
         while s.last() == Some(&b'/') { s = &s[..s.len()-1]; }
         let n = s.len().min(DFS_CWD_MAX);
         for i in 0..n {
