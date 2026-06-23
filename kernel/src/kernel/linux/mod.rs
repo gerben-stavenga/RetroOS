@@ -1164,13 +1164,38 @@ fn sys_fcntl(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
     if kt.fds[fd].is_none() { return SyscallResult::val(-EBADF); }
 
+    const F_DUPFD: i32 = 0;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
+    const F_DUPFD_CLOEXEC: i32 = 1030;
     const FD_CLOEXEC: i32 = 1;
 
     match cmd {
+        // Duplicate `fd` to the lowest free fd >= arg. dash saves its std fds
+        // to 10+ this way at startup; without it dash bailed ("sh: 0: …").
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let minfd = a.a2 as usize;
+            let newfd = match kt.alloc_fd(minfd.min(thread::MAX_FDS)) {
+                Some(n) => n,
+                None => return SyscallResult::val(-24), // EMFILE
+            };
+            let kind = kt.fds[fd];
+            match kind {
+                thread::FdKind::Vfs(handle) => vfs::add_vfs_ref(handle),
+                thread::FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
+                thread::FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
+                thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir(_) => {}
+            }
+            kt.fds[newfd] = kind;
+            if cmd == F_DUPFD_CLOEXEC {
+                kt.cloexec |= 1 << newfd;
+            } else {
+                kt.cloexec &= !(1 << newfd);
+            }
+            SyscallResult::val(newfd as i32)
+        }
         F_GETFD => {
             let cloexec = if kt.cloexec & (1 << fd) != 0 { FD_CLOEXEC } else { 0 };
             SyscallResult::val(cloexec)
