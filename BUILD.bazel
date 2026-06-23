@@ -76,6 +76,10 @@ _BOOTFS_FILES = {
     # COMMAND.COM finds them regardless of how the ext4 root mounts (it may
     # land at C:\DISK1 rather than C:\ — see startup.rs mount_filesystems).
     "//apps-boot/command:LOADFIX.CFG": "LOADFIX.CFG",
+    # Bridge into the Linux personality: a DN-launchable ELF that execs
+    # /bin/busybox as `sh`. In the bootfs (C:\BOOT\SHELL.ELF) so it's ALWAYS
+    # present — independent of whatever's on the disk root / /home/retroos.
+    "//apps/shell:shell_elf": "SHELL.ELF",
     "etc/CONFIG.BOOTFS": "CONFIG.SYS",
 }
 _BOOTFS_FILES.update(_DN_FILES)
@@ -116,8 +120,8 @@ _EXTRA_FILES = {
     # COMMAND.COM itself is NOT duplicated here: it lives in the embedded bootfs
     # at C:\BOOT\COMMAND.COM (see _BOOTFS_FILES), which is where COMSPEC points.
     "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
-    # LOADFIX.CFG now lives in the embedded bootfs (C:\BOOT) — see _BOOTFS_FILES.
-    "//apps/shell:shell_elf": "shell.elf",
+    # LOADFIX.CFG and shell.elf now live in the embedded bootfs (C:\BOOT) —
+    # see _BOOTFS_FILES.
     "//apps/tests/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
     "//apps/tests/stress:stress_elf":       "TESTS/stress.elf",
     "//apps/tests/stress64:stress64_elf":   "TESTS/stress64.elf",
