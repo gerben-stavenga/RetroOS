@@ -346,7 +346,8 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         // getppid: real parent if we have one, else 1 (init).
         64  => SyscallResult::val(kt.parent_tid.max(1)),
         // getuid32/getgid32/geteuid32/getegid32 — pretend root.
-        199 | 200 | 201 | 202 => SyscallResult::val(0),
+        199 | 200 | 201 => SyscallResult::val(0),
+        202 => sys_futex(kt, a),
         // setuid32/setgid32/setreuid32/setregid32/setresuid32/setresgid32 —
         // single-user system, accept any change as a no-op.
         203 | 204 | 208 | 210 | 213 | 214 => SyscallResult::val(0),
@@ -450,7 +451,7 @@ fn dispatch_nr_64(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, l
         131 => SyscallResult::val(0),
         158 => sys_arch_prctl(kt, linux, a, regs),
         200 => sys_exit(machine, tid, a),
-        202 => SyscallResult::val(0),
+        202 => sys_futex(kt, a),
         217 => sys_getdents64(kt, linux, a),
         218 => SyscallResult::val(kt.tid),
         228 => sys_clock_gettime(machine, &mut kt.vcpu, a),
@@ -1461,6 +1462,22 @@ fn sys_pread64(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
     }
 }
 
+/// futex(202) — minimal. Single-threaded clients only reach WAIT when a lock is
+/// already held; correct behavior is EAGAIN when the word no longer matches.
+fn sys_futex(kt: &mut thread::KernelThread, a: &Args) -> SyscallResult {
+    let uaddr = a.a0 as usize;
+    let op = a.a1 as u32 & 0x7f; // strip FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
+    let val = a.a2 as u32;
+    const FUTEX_WAIT: u32 = 0;
+    const FUTEX_WAKE: u32 = 1;
+    let cur = kt.vcpu.read::<u32>(uaddr);
+    match op {
+        FUTEX_WAIT => if cur != val { SyscallResult::val(-11) } else { SyscallResult::val(0) }, // EAGAIN
+        FUTEX_WAKE => SyscallResult::val(0),
+        _ => SyscallResult::val(0),
+    }
+}
+
 fn sys_mmap2(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, offset_bytes: usize) -> SyscallResult {
     let addr_hint = a.a0 as usize;
     let length = a.a1 as usize;
@@ -1504,6 +1521,11 @@ fn sys_mmap2(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, of
             }
             _ => return SyscallResult::val64(-EBADF as i64),
         }
+    } else {
+        // MAP_ANONYMOUS must read as zero. Eager-zero the range — demand-zero
+        // alone left libc's BSS (its lock words) holding garbage, which sent
+        // glibc into a futex spin on a "held" lock.
+        kt.vcpu.zero(base, alloc_size);
     }
 
     SyscallResult::val64(base as i64)
