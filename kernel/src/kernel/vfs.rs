@@ -340,6 +340,11 @@ impl Vfs {
 
     fn dir_exists(&self, path: &[u8]) -> bool {
         let (_midx, fs, subpath) = self.resolve_mount(path);
+        // A mount root (and the VFS root) is structurally a directory — answer
+        // without querying the backing fs. This avoids blocking on a mount
+        // whose transport is unresponsive: e.g. `ls /` stats the /host hostfs
+        // mount, and a hostfs read with no server attached hangs forever.
+        if subpath.is_empty() { return true; }
         fs.dir_exists(subpath)
     }
 
