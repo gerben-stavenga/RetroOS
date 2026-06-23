@@ -79,9 +79,10 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
                 }
                 Err(e) => panic!("ext4 mount failed: {}", e),
             }
-            // Additional ext partitions (a dual-boot laptop's other distro)
-            // mount as subdirectories C:\DISK1, C:\DISK2, … — an unreadable one
-            // is logged and skipped, never fatal (it's not the boot root).
+            // Additional ext partitions (a laptop's data partition / other
+            // distro) mount at VFS /disk1, /disk2, … (Linux-visible; not under
+            // C:). An unreadable one is logged and skipped, never fatal — the
+            // boot root was already chosen by the /etc+/usr sniff in probe_media.
             const SUBDIRS: [&[u8]; 3] = [b"disk1/", b"disk2/", b"disk3/"];
             for (i, &lba) in extra_ext.iter().enumerate() {
                 if lba == 0 {
@@ -91,7 +92,7 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
                     Ok(fs) => {
                         let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                         vfs::mount(SUBDIRS[i], leaked);
-                        println!("ext4 partition at sector {:#x} → C:\\DISK{}", lba, i + 1);
+                        println!("ext4 partition at sector {:#x} → /disk{}", lba, i + 1);
                     }
                     Err(e) => println!("ext4 partition at {:#x} skipped: {}", lba, e),
                 }
