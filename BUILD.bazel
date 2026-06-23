@@ -113,9 +113,8 @@ _EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
     "//apps-boot/command:command.c": "SRC/COMMAND.C",
-    # Prebuilt by in-OS TCC at image-build time (it used to be self-built at
-    # every boot); DN's "COMMAND.COM /C ..." EXECs this from C:\.
-    "//apps-boot/command:command_com": "COMMAND.COM",
+    # COMMAND.COM itself is NOT duplicated here: it lives in the embedded bootfs
+    # at C:\BOOT\COMMAND.COM (see _BOOTFS_FILES), which is where COMSPEC points.
     "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
     # LOADFIX.CFG now lives in the embedded bootfs (C:\BOOT) — see _BOOTFS_FILES.
     "//apps/shell:shell_elf": "shell.elf",
@@ -184,36 +183,55 @@ pkg_tar(
     deps = [":tc_tar"],
 )
 
-# Extras populated into the ext4 partition: busybox-userland, Linux test
-# ELFs, DOS games (shareware), Turbo Pascal, and the modplay/RLOADER
-# binaries listed in _EXTRA_FILES.
+# FS-layout convention (see BootConfig.c_root): the Linux root holds only the
+# busybox userland at /bin; everything DOS lives under C: = /home/retroos. The
+# shared _EXTRA_FILES / dep tars stay root-relative (the FreeDOS flat disk wants
+# that); the home/retroos/ prefix is applied here via package_dir.
+# busybox + applet shims at /bin (the Linux side, NOT under home/retroos).
 pkg_tar(
-    name = "extras_tar",
-    files = _EXTRA_FILES,
+    name = "bin_tar",
+    files = {"//apps/busybox:busybox": "bin/busybox"},
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
+)
+
+# DOS content (everything in _EXTRA_FILES except busybox) + games/TC/TP70,
+# all under C: = /home/retroos.
+_DOS_EXTRA = {k: v for k, v in _EXTRA_FILES.items() if v != "bin/busybox"}
+pkg_tar(
+    name = "dos_extras_tar",
+    files = _DOS_EXTRA,
     deps = [
         "//apps/games:tar",
         ":tc_tar",
         ":tp70_tar",
     ],
+    package_dir = "home/retroos",
 )
 
-# Same extras plus the proprietary game/tooling drop. (No hard-coded
-# MOD file — modplay takes the module path as argv[1].) CONFIG.SYS is dropped
-# from the file map so apps-proprietary's own CONFIG.SYS (PATH without
-# C:\TC, since BC is the compiler) is the ONLY one: pkg_tar lets `files`
-# win over `deps` on a duplicate path, so the default would otherwise shadow it.
-_EXTRA_FILES_PROPRIETARY = {k: v for k, v in _EXTRA_FILES.items() if k != "etc/CONFIG.SYS"}
+# Extras populated into the ext4 partition: the /bin busybox userland plus the
+# /home/retroos DOS world.
 pkg_tar(
-    name = "extras_tar_proprietary",
-    files = _EXTRA_FILES_PROPRIETARY,
-    srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
+    name = "extras_tar",
+    deps = [":bin_tar", ":dos_extras_tar"],
+)
+
+# Same, plus the proprietary game/tooling drop. CONFIG.SYS is dropped from the
+# DOS file map so apps-proprietary's own CONFIG.SYS is the only one.
+_DOS_EXTRA_PROPRIETARY = {k: v for k, v in _DOS_EXTRA.items() if k != "etc/CONFIG.SYS"}
+pkg_tar(
+    name = "dos_extras_tar_proprietary",
+    files = _DOS_EXTRA_PROPRIETARY,
     deps = [
         "//apps/games:tar",
         ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
     ],
+    package_dir = "home/retroos",
+)
+pkg_tar(
+    name = "extras_tar_proprietary",
+    deps = [":bin_tar", ":dos_extras_tar_proprietary"],
 )
 
 # Flat tar used by the FreeDOS data disk (mformat / mcopy). Keeps the
