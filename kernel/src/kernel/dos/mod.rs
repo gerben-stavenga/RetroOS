@@ -434,13 +434,23 @@ pub fn try_vga_fault(machine: &mut crate::TheArch, dos: &mut thread::DosState, r
         return true;
     }
     let off = addr - 0xA0000;
-    let (cs_base, def32) = if regs.mode() == crate::UserMode::VM86 {
-        ((regs.code_seg() as u32) << 4, false)
+    // Resolve CS (instruction fetch) plus the DS/ES bases a `movs` needs: source
+    // is DS:(E)SI, destination ES:(E)DI. VM86 segs are shift-by-4; PM segs index
+    // the LDT. Plumbing both is what lets the 32-bit-PM `rep movsd` blit (Doom's
+    // Mode-Y plane copy under CWSDPMI) decode instead of SEGV.
+    let (cs_base, def32, ds_base, es_base) = if regs.mode() == crate::UserMode::VM86 {
+        ((regs.code_seg() as u32) << 4, false, (regs.ds as u32) << 4, (regs.es as u32) << 4)
     } else {
         let cs = regs.code_seg();
-        (mode_transitions::seg_base(&dos.ldt[..], cs), mode_transitions::seg_is_32(&dos.ldt[..], cs))
+        let ldt = &dos.ldt[..];
+        (
+            mode_transitions::seg_base(ldt, cs),
+            mode_transitions::seg_is_32(ldt, cs),
+            mode_transitions::seg_base(ldt, regs.ds as u16),
+            mode_transitions::seg_base(ldt, regs.es as u16),
+        )
     };
-    machine::vga::handle_planar_fault(regs, &mut dos.pc.vga, cs_base, def32, off)
+    machine::vga::handle_planar_fault(regs, &mut dos.pc.vga, cs_base, def32, ds_base, es_base, off)
 }
 
 /// Single entry point the event loop calls for the DOS personality.
@@ -975,10 +985,11 @@ pub fn queue_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState) {
 }
 
 /// Render the emulated VGA to the platform display (no-op with a real card
-/// or no present sink). Called by the event loop with the PIT ticks just
-/// pumped; renders at a divided rate (see `machine::display_tick`).
-pub fn display_tick(dos: &mut thread::DosState, regs: &Vcpu, ticks: u32) {
-    machine::display_tick(&mut dos.pc, regs, ticks);
+/// or no present sink). Called by the event loop with the absolute tick clock;
+/// presents once per emulated VGA frame on the retrace edge (see
+/// `machine::display_tick`).
+pub fn display_tick(dos: &mut thread::DosState, regs: &Vcpu, now_ticks: u64) {
+    machine::display_tick(&mut dos.pc, regs, now_ticks);
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).

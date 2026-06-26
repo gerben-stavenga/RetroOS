@@ -199,7 +199,10 @@ impl Personality {
                     crate::kernel::dos::queue_tick(machine, dos);
                 }
                 if ticks > 0 {
-                    crate::kernel::dos::display_tick(dos, regs, ticks);
+                    // Present is driven off the absolute tick clock (the same one
+                    // the 0x3DA vertical-retrace fabrication reads), so it fires on
+                    // the emulated VGA frame boundary rather than a private rate.
+                    crate::kernel::dos::display_tick(dos, regs, machine.get_ticks());
                 }
                 // Pump emulated-SB playback against the same virtual clock.
                 crate::kernel::dos::audio_tick(machine, dos, regs);
