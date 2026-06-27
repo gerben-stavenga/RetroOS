@@ -646,8 +646,8 @@ pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
 // ============================================================================
 
 /// Width of the data a string/mov op moves (bytes).
-fn opsize(prefix66: bool, byte_op: bool) -> u32 {
-    if byte_op { 1 } else if prefix66 { 2 } else { 4 }
+fn opsize(op32: bool, byte_op: bool) -> u32 {
+    if byte_op { 1 } else if op32 { 4 } else { 2 }
 }
 
 /// Read/write an integer GP register by encoding `idx` and size `sz` (bytes).
@@ -747,6 +747,15 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
 
     // Prefixes.
     let mut i = 0u32;
+    // Interruptible `rep`: a real CPU services pending interrupts between string
+    // iterations. We emulate the whole `rep` in one kernel call, so cap it at
+    // REP_CHUNK iterations per fault; if CX isn't drained, `not_done` leaves EIP
+    // on the instruction so the guest re-faults to continue — and the event loop
+    // delivers any pending timer IRQ between chunks. Without this a big keen-4
+    // composite `rep movs` runs uninterruptibly, the owed ticks all fire at once
+    // when it returns, and the guest's stack overflows.
+    const REP_CHUNK: u32 = 2048;
+    let mut not_done = false;
     let mut p66 = false;
     let mut p67 = false;
     let mut rep = false;
@@ -775,7 +784,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         // mov r/m16/32, r
         0x89 => {
             let modrm = peek(i);
-            let sz = opsize(p66, false);
+            let sz = opsize(op32, false);
             let val = gpr(regs, (modrm >> 3) & 7, sz);
             i += modrm_len(modrm, addr32, &peek, i);
             for b in 0..sz { vram_write(vga, off + b, (val >> (b * 8)) as u8); }
@@ -790,7 +799,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         // mov r16/32, r/m
         0x8B => {
             let modrm = peek(i);
-            let sz = opsize(p66, false);
+            let sz = opsize(op32, false);
             let mut v = 0u32;
             for b in 0..sz { v |= (vram_read(vga, off + b) as u32) << (b * 8); }
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
@@ -808,7 +817,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         0xC7 => {
             let modrm = peek(i);
             let l = modrm_len(modrm, addr32, &peek, i);
-            let sz = opsize(p66, false);
+            let sz = opsize(op32, false);
             let mut imm = 0u32;
             for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
             i += l + sz;
@@ -816,48 +825,64 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         }
         // stos: store (E)AX to ES:DI, count in (E)CX if rep. AL/AX/EAX.
         0xAA | 0xAB => {
-            let sz = opsize(p66, opcode == 0xAA);
-            let count = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }).max(1) } else { 1 };
+            let sz = opsize(op32, opcode == 0xAA);
+            let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
+            let chunk = total.min(REP_CHUNK);
             let al = regs.rax as u32;
             let df = regs.frame.rflags & (1 << 10) != 0;
-            for n in 0..count {
+            for n in 0..chunk {
                 let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
                 for b in 0..sz { vram_write(vga, o + b, (al >> (b * 8)) as u8); }
             }
-            // Advance DI/CX like the CPU would.
-            let step = count * sz;
+            // Advance DI by the chunk; on `rep`, drop CX by the chunk and, if it
+            // isn't drained, leave EIP on the instruction (`not_done`) to resume.
+            let step = chunk * sz;
             let di = if df { regs.rdi.wrapping_sub(step as u64) } else { regs.rdi.wrapping_add(step as u64) };
             regs.rdi = if addr32 { di } else { (regs.rdi & !0xFFFF) | (di & 0xFFFF) };
-            if rep { regs.rcx = if addr32 { 0 } else { regs.rcx & !0xFFFF }; }
+            if rep {
+                let rem = total - chunk;
+                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
+                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                not_done = rem > 0;
+            }
         }
-        // movs: DS:SI -> ES:DI. The source (DS:SI) is normal RAM for the common
-        // blit-to-VRAM pattern (Epic Pinball); read it directly and write the
-        // destination (ES:DI, in A0000) through the planar logic. Recompute both
-        // ends from the registers rather than trusting `off` — either operand
-        // can be the faulting one.
+        // movs: DS:SI -> ES:DI. Each operand may be normal RAM or the A0000
+        // planar window, resolved per byte below. Recompute both ends from the
+        // registers rather than trusting `off` — either operand can fault.
         //
-        // NOTE: a VRAM→VRAM `rep movs` (EGA latch copy — Keen's Galaxy engine
-        // composes from off-screen VRAM) is NOT routed through the latches here.
-        // Doing so (vram_read on the source) is correct in isolation but lets
-        // Keen run far enough to trip a separate timer-IRQ storm (stack
-        // exhausted, garbage IRET). Until that is fixed it stays a plain read.
-        // The common `mov al,[si]` / `mov [di],al` latch copy already works via
-        // the 0x8A/0x88 handlers. Source (DS:(E)SI) and dest (ES:(E)DI) bases are
-        // resolved by the caller (shift-by-4 in VM86, LDT in PM) so the same path
-        // serves both: 32-bit-PM `rep movsd` is Doom's Mode-Y plane blit under
-        // CWSDPMI/DOS4GW (broke "no graphics under UEFI" — passthrough hides it).
+        // A VRAM *source* (DS:SI in A0000) MUST go through `vram_read`, not a raw
+        // `regs.read`: A0000 is mapped present=0 (the planar trap), so a direct
+        // read page-faults in the kernel (Keen 4's Galaxy engine composites from
+        // off-screen VRAM with `rep movs` and crashed here). `vram_read` also
+        // loads the GC latches, making a VRAM→VRAM `movs` the correct EGA latch
+        // copy. The common `mov al,[si]`/`mov [di],al` latch copy already works
+        // via the 0x8A/0x88 handlers. Source (DS:(E)SI) and dest (ES:(E)DI) bases
+        // are resolved by the caller (shift-by-4 in VM86, LDT in PM) so the same
+        // path serves both: 32-bit-PM `rep movsd` is Doom's Mode-Y plane blit
+        // under CWSDPMI/DOS4GW (broke "no graphics under UEFI" — passthrough hides
+        // it).
         0xA4 | 0xA5 => {
-            let sz = opsize(p66, opcode == 0xA4);
+            let sz = opsize(op32, opcode == 0xA4);
             let amask: u32 = if addr32 { 0xFFFF_FFFF } else { 0xFFFF };
-            let count = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }).max(1) } else { 1 };
+            let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
+            let chunk = total.min(REP_CHUNK);
             let df = regs.frame.rflags & (1 << 10) != 0;
             let mut si = regs.rsi as u32 & amask;
             let mut di = regs.rdi as u32 & amask;
-            for _ in 0..count {
+            for _ in 0..chunk {
                 for b in 0..sz {
                     let src = ds_base.wrapping_add(si).wrapping_add(b);
                     let dst = es_base.wrapping_add(di).wrapping_add(b);
-                    let byte = regs.read::<u8>(src as usize);
+                    // A VRAM source is the planar trap window (present=0): reading
+                    // it with a raw `regs.read` page-faults in the kernel. Route it
+                    // through `vram_read` — which also loads the GC latches, so a
+                    // VRAM→VRAM `rep movs` (Keen's Galaxy engine composites screens
+                    // from off-screen VRAM) is the correct EGA latch copy.
+                    let byte = if (0xA0000..0xB0000).contains(&src) {
+                        vram_read(vga, src - 0xA0000)
+                    } else {
+                        regs.read::<u8>(src as usize)
+                    };
                     if (0xA0000..0xB0000).contains(&dst) {
                         vram_write(vga, dst - 0xA0000, byte);
                     } else {
@@ -867,14 +892,19 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
                 if df { si = si.wrapping_sub(sz); di = di.wrapping_sub(sz); }
                 else  { si = si.wrapping_add(sz); di = di.wrapping_add(sz); }
             }
-            let step = count * sz;
+            let step = chunk * sz;
             let adj = |v: u64| {
                 let nv = if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) };
                 if addr32 { nv as u64 } else { (v & !0xFFFF) | (nv as u64 & 0xFFFF) }
             };
             regs.rsi = adj(regs.rsi);
             regs.rdi = adj(regs.rdi);
-            if rep { regs.rcx = if addr32 { 0 } else { regs.rcx & !0xFFFF }; }
+            if rep {
+                let rem = total - chunk;
+                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
+                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                not_done = rem > 0;
+            }
         }
         // cmp r/m8, r8 — read the VRAM byte (loads the latches) and compare it
         // with r8, setting flags; no write-back. Doom's Mode-X renderer does
@@ -901,12 +931,14 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         }
     }
 
-    // Advance EIP past the emulated instruction.
-    let new_ip = ip0.wrapping_add(i);
+    // Advance EIP past the emulated instruction — unless a `rep` was capped
+    // mid-string (`not_done`), in which case leave EIP on the instruction so the
+    // guest re-executes it (and re-faults) to finish the remaining CX, after the
+    // event loop gets a chance to deliver any pending interrupt.
+    let new_ip = if not_done { ip0 } else { ip0.wrapping_add(i) };
     let cur_ip = regs.ip32();
     if vm86 { regs.set_ip32((cur_ip & !0xFFFF) | (new_ip & 0xFFFF)); }
     else { regs.set_ip32(new_ip); }
-    let _ = op32;
     true
 }
 
@@ -1025,7 +1057,41 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, now_ticks: u64) {
     let mut scratch = alloc::vec::Vec::new();
     let Some(frame) = pc.vga.scanout(regs, &mut scratch) else { return };
     let (w, h) = vga_render::dimensions(frame.mode);
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static LAST: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+        let bda = regs.read::<u8>(0x449);
+        let pa = planar_active();
+        // seq[4] bit3 = chain-4 (clear ⇒ unchained planar); gc[6] bit0 = graphics
+        // (vs text), bits 2-3 = memory map; gc[5] = write/read mode.
+        let key = ((pa as u32) << 16) | ((bda as u32) << 8)
+            | ((pc.vga.gc[6] as u32 & 0xF) << 4) | (pc.vga.seq[4] as u32 & 0xF);
+        if LAST.swap(key, Ordering::Relaxed) != key {
+            crate::dbg_println!("[present] planar_active={} bda={:#x} seq[4]={:#04x} gc[5]={:#04x} gc[6]={:#04x} -> mode={:?}",
+                pa, bda, pc.vga.seq[4], pc.vga.gc[5], pc.vga.gc[6], frame.mode);
+        }
+    }
+    let planar16 = matches!(frame.mode, lib::vga_render::VgaMode::Planar16 { .. });
+    let rd = || -> u64 { let lo: u32; let hi: u32;
+        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+        ((hi as u64) << 32) | lo as u64 };
+    let t0 = rd();
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);
+    let t1 = rd();
     vga_render::present(w, h, &fb);
+    let t2 = rd();
+    if planar16 {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static RSUM: AtomicU32 = AtomicU32::new(0); // kilocycles
+        static PSUM: AtomicU32 = AtomicU32::new(0);
+        static N: AtomicU32 = AtomicU32::new(0);
+        let rk = ((t1 - t0) / 1000) as u32;
+        let pk = ((t2 - t1) / 1000) as u32;
+        let r = RSUM.fetch_add(rk, Ordering::Relaxed) + rk;
+        let p = PSUM.fetch_add(pk, Ordering::Relaxed) + pk;
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::dbg_println!("[ptime] planar16 frame#{} render={}kc present={}kc (avg r={} p={})",
+            n, rk, pk, r / n, p / n);
+    }
 }

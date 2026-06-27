@@ -291,6 +291,12 @@ pub mod flags {
     #[allow(dead_code)] pub const ACCESSED: u64 = 1 << 5;
     #[allow(dead_code)] pub const DIRTY: u64 = 1 << 6;
     #[allow(dead_code)] pub const PAGE_SIZE_BIT: u64 = 1 << 7;
+    /// Leaf-PTE PAT bit (bit 7 in a 4 KB PTE — same bit as PAGE_SIZE_BIT, which
+    /// only means "large page" in a PDE/PDPTE). With PWT/PCD clear it selects
+    /// PAT entry 4, which `enable_wc_pat` programs to Write-Combining. Set on the
+    /// framebuffer so linear blits burst instead of going out as per-pixel UC
+    /// transactions. Only valid on a 4 KB leaf entry.
+    pub const WRITE_COMBINE: u64 = 1 << 7;
     /// Software read-only flag - page is semantically read-only
     /// When set, page can never become writable (e.g., .text, .rodata)
     /// When clear (default), page is semantically writable
@@ -948,6 +954,11 @@ pub fn finish_setup_paging() {
                 lib::println!("NX (No-Execute) protection enabled");
             }
 
+            enable_wc_pat();
+            if wc_pat_enabled() {
+                lib::println!("PAT: Write-Combining slot enabled (framebuffer)");
+            }
+
             harden_kernel(e);
             invalidate_tlb();
         }
@@ -974,6 +985,48 @@ pub fn cpu_supports_nx() -> bool {
     if max_ext < 0x80000001 { return false; }
     let (_, _, _, edx) = crate::x86::cpuid(0x80000001);
     edx & (1 << 20) != 0
+}
+
+/// Check if CPU supports the Page Attribute Table (CPUID.1:EDX bit 16).
+pub fn cpu_supports_pat() -> bool {
+    let (_, _, _, edx) = crate::x86::cpuid(1);
+    edx & (1 << 16) != 0
+}
+
+/// Set when `enable_wc_pat` programmed the WC PAT slot. `fbcon` checks this to
+/// decide whether the framebuffer can be mapped Write-Combining (else UC).
+static mut WC_PAT_ENABLED: bool = false;
+
+/// Whether a Write-Combining PAT slot is available (see `flags::WRITE_COMBINE`).
+pub fn wc_pat_enabled() -> bool {
+    unsafe { WC_PAT_ENABLED }
+}
+
+/// Reprogram PAT entry 4 (PAT=1, PCD=0, PWT=0) from its default WB to
+/// Write-Combining, so a 4 KB leaf PTE carrying `flags::WRITE_COMBINE` maps WC.
+///
+/// Entries 0–3 — the PCD/PWT combinations the rest of the kernel relies on for
+/// WB / WT / UC- / UC — are left at their reset values, so nothing already
+/// mapped changes type. Only pages that explicitly set the PAT bit (the
+/// framebuffer) pick up WC. Must run after paging is up and before the
+/// framebuffer is mapped (`fbcon::init`).
+pub fn enable_wc_pat() {
+    if !cpu_supports_pat() {
+        return;
+    }
+    // Reset IA32_PAT = 0x0007_0406_0007_0406 (PA0=WB PA1=WT PA2=UC- PA3=UC,
+    // PA4=WB PA5=WT PA6=UC- PA7=UC). Rewrite PA4 (byte 4 = bits 32..39) WB→WC(0x01).
+    const PAT_RESET: u64 = 0x0007_0406_0007_0406;
+    const PAT_WC: u64 = (PAT_RESET & !(0xFFu64 << 32)) | (0x01u64 << 32);
+    unsafe {
+        // SDM 11.12.4 cautions to flush around a memory-type change; the FB isn't
+        // mapped yet and we only touch an otherwise-unused slot, but flush anyway.
+        crate::x86::wbinvd();
+        crate::x86::wrmsr(crate::x86::IA32_PAT_MSR, PAT_WC);
+        crate::x86::wbinvd();
+        crate::x86::flush_tlb();
+        WC_PAT_ENABLED = true;
+    }
 }
 
 /// NX enabled flag (set when EFER.NXE is enabled)

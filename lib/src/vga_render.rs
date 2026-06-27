@@ -530,6 +530,29 @@ fn planar_rgb(frame: &Frame, val: u8) -> u32 {
     pal_rgb(frame.palette, idx)
 }
 
+/// Bit-spread LUT for planar→chunky: `SPREAD[b]` scatters the 8 bits of a plane
+/// byte (MSB = leftmost pixel) into bit 0 of 8 consecutive 4-bit nibbles of a
+/// u32. Then `SPREAD[p0] | SPREAD[p1]<<1 | SPREAD[p2]<<2 | SPREAD[p3]<<3` packs
+/// all 8 pixels' 4-bit attribute values into one u32 (8 nibbles) — one table
+/// lookup per plane per 8 pixels, no per-pixel bit shuffling.
+static SPREAD: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut v = 0u32;
+        let mut i = 0;
+        while i < 8 {
+            if (b >> (7 - i)) & 1 != 0 {
+                v |= 1u32 << (4 * i);
+            }
+            i += 1;
+        }
+        t[b] = v;
+        b += 1;
+    }
+    t
+};
+
 /// Planar 16-colour: assemble one bit from each of the 4 planes into a 4-bit
 /// pixel value. Pixel (x,y) → byte `y*row_bytes + x/8`, bit `7-(x&7)`.
 fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
@@ -544,16 +567,32 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
         } else {
             (frame.start_offset, frame.pixel_pan & 7, y)
         };
-        for x in 0..w {
-            let sx = x + pan;
-            let off = start + ry * rb + sx / 8;
-            let bit = 7 - (sx & 7);
-            let mut val = 0u8;
-            for p in 0..4 {
-                let b = planes.get(p * 0x10000 + off).copied().unwrap_or(0);
-                val |= ((b >> bit) & 1) << p;
+        // Per *source byte*: fetch its 4 plane bytes once (64K apart — 4 cache
+        // lines — they serve all 8 pixels), spread them through the LUT into one
+        // u32 of 8 chunky nibbles, and emit the 8 pixels. The old per-pixel
+        // 4-plane fetch + bit-shuffle was essentially the whole present cost for
+        // EGA/16-colour modes — slow enough that the guest's timer-IRQ queue
+        // backed up until its stack overflowed (Keen 4 abort). The first byte may
+        // start mid-byte (horizontal pixel-pan smooth-scroll); the rest emit 8.
+        let base = start + ry * rb;
+        let row = &mut out[y * w..y * w + w];
+        let mut x = 0usize;
+        let mut bit = pan & 7; // first byte's starting nibble (pan), then 0
+        let mut sbyte = pan / 8;
+        while x < w {
+            let off = base + sbyte;
+            let p0 = planes.get(off).copied().unwrap_or(0) as usize;
+            let p1 = planes.get(0x10000 + off).copied().unwrap_or(0) as usize;
+            let p2 = planes.get(0x20000 + off).copied().unwrap_or(0) as usize;
+            let p3 = planes.get(0x30000 + off).copied().unwrap_or(0) as usize;
+            let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
+            while bit < 8 && x < w {
+                row[x] = planar_rgb(frame, ((pix >> (4 * bit)) & 0xF) as u8);
+                bit += 1;
+                x += 1;
             }
-            out[y * w + x] = planar_rgb(frame, val);
+            bit = 0;
+            sbyte += 1;
         }
     }
 }

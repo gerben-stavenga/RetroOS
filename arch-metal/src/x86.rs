@@ -107,6 +107,19 @@ pub fn flush_tlb() {
     }
 }
 
+/// Write back and invalidate all cache lines (`WBINVD`). Used when changing a
+/// memory-type setting (e.g. reprogramming the PAT) so no stale cached line
+/// survives the type change.
+#[inline]
+pub fn wbinvd() {
+    unsafe {
+        asm!("wbinvd", options(nostack));
+    }
+}
+
+/// IA32_PAT MSR (Page Attribute Table).
+pub const IA32_PAT_MSR: u32 = 0x277;
+
 /// Invalidate TLB entry for specific address
 #[inline]
 pub fn invlpg(addr: usize) {

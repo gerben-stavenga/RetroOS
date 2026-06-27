@@ -615,6 +615,17 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
         LAST_IRQ = (vector, sel, off, regs.code_seg(), regs.ip32(),
                     regs.stack_seg(), regs.sp32());
     }
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        if n < 12 || (n > 70 && n < 82) {
+            let lin = ((regs.code_seg() as u32) << 4).wrapping_add(regs.ip32() & 0xFFFF) as usize;
+            let b: [u8; 10] = core::array::from_fn(|k| regs.read::<u8>(lin + k));
+            crate::dbg_println!("[irq] #{} vec={} {:04x}:{:04x} ss:sp={:04x}:{:04x} bytes@ip={:02x?}",
+                n, vector, regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), b);
+        }
+    }
     let default_vector = sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2;
     let handler_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
 
