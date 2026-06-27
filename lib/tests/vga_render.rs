@@ -15,6 +15,14 @@ fn pal_rgb(pal: &[u8; 768], idx: u8) -> u32 {
     (c6to8(pal[o]) << 16) | (c6to8(pal[o + 1]) << 8) | c6to8(pal[o + 2])
 }
 
+fn identity_ac() -> [u8; 21] {
+    let mut ac = [0u8; 21];
+    for i in 0..16 {
+        ac[i] = i as u8;
+    }
+    ac
+}
+
 #[test]
 fn dimensions_match_modes() {
     assert_eq!(vga_render::dimensions(VgaMode::Mode13h), (320, 200));
@@ -36,7 +44,19 @@ fn mode13h_maps_each_index_through_the_palette() {
     for x in 0..320usize {
         vram[x] = (x & 0xFF) as u8;
     }
-    let frame = Frame { mode: VgaMode::Mode13h, vram: &vram, palette: &pal, font: &[] };
+    let ac = identity_ac();
+    let frame = Frame {
+        mode: VgaMode::Mode13h,
+        vram: &vram,
+        planes: &[],
+        ac: &ac,
+        palette: &pal,
+        font: &[],
+        blink: false,
+        start_offset: 0,
+        pixel_pan: 0,
+        line_compare: usize::MAX,
+    };
     let mut out = vec![0u32; 320 * 200];
     let (w, h) = vga_render::render(&frame, &mut out);
     assert_eq!((w, h), (320, 200));
@@ -52,7 +72,19 @@ fn mode13h_tolerates_short_vram() {
     // Fewer bytes than the frame must not panic; the tail stays the cleared 0.
     let vram = vec![7u8; 100];
     let pal = vga_render::fallback_palette();
-    let frame = Frame { mode: VgaMode::Mode13h, vram: &vram, palette: &pal, font: &[] };
+    let ac = identity_ac();
+    let frame = Frame {
+        mode: VgaMode::Mode13h,
+        vram: &vram,
+        planes: &[],
+        ac: &ac,
+        palette: &pal,
+        font: &[],
+        blink: false,
+        start_offset: 0,
+        pixel_pan: 0,
+        line_compare: usize::MAX,
+    };
     let mut out = vec![0u32; 320 * 200];
     let (w, h) = vga_render::render(&frame, &mut out);
     assert_eq!((w, h), (320, 200));
@@ -73,7 +105,19 @@ fn text_renders_glyph_pixels_with_fg_bg() {
     vram[0] = 1;
     vram[1] = 0x1F;
     let pal = vga_render::fallback_palette();
-    let frame = Frame { mode: VgaMode::Text80x25, vram: &vram, palette: &pal, font: &font };
+    let ac = identity_ac();
+    let frame = Frame {
+        mode: VgaMode::Text80x25,
+        vram: &vram,
+        planes: &[],
+        ac: &ac,
+        palette: &pal,
+        font: &font,
+        blink: false,
+        start_offset: 0,
+        pixel_pan: 0,
+        line_compare: usize::MAX,
+    };
     let mut out = vec![0u32; 720 * 400];
     let (w, h) = vga_render::render(&frame, &mut out);
     assert_eq!((w, h), (720, 400));

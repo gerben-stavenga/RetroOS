@@ -585,19 +585,47 @@ pub fn on_set_mode(
     pc.vga.crtc[0x18] = 0xFF; // line-compare bits 0..7
     pc.vga.crtc[7] |= 0x10;   // line-compare bit 8 (CRTC overflow)
     pc.vga.crtc[9] |= 0x40;   // line-compare bit 9 (CRTC max-scan-line)
+    // A real VGA BIOS reloads the DAC on every clearing mode set. Which default
+    // depends on the render path: text/CGA/mode 13h index DAC entries directly
+    // and need the 16 CGA colours at entries 0..15; planar 16-colour modes map
+    // pixels through the Attribute Controller first.
+    if matches!(mode, 0x0D..=0x12) {
+        // Install the planar EGA DAC even on no-clear mode sets: many EGA games
+        // never program the DAC, and our fresh process default is the generic
+        // mode-13h fallback. VGA uses an RGBI-compatibility DAC for the 200-line
+        // EGA modes (0Dh/0Eh) and the full 64-colour EGA DAC for 350/480-line
+        // planar modes.
+        pc.vga.dac = if matches!(mode, 0x0D | 0x0E) {
+            lib::vga_render::ega_200line_dac()
+        } else {
+            lib::vga_render::ega_dac()
+        };
+    } else if clear {
+        pc.vga.dac = lib::vga_render::fallback_palette();
+    }
     let planar = matches!(mode, 0x0D..=0x12);
     if planar {
-        // Load the standard EGA 16-colour Attribute Controller palette the IBM
-        // BIOS programs on every planar mode set. Without it AC[0..15] are 0, so
-        // every 4-bit pixel maps to DAC index 0 (black) — Keen never touches the
-        // AC, relying on this default. Index i → i for 0..5, brown fixup at 6
-        // (0x14), then the bright bank 0x38..0x3F for 8..15.
-        const EGA_AC: [u8; 16] = [
+        // Standard EGA AC palettes. In 200-line compatibility modes, brown uses
+        // value 0x06 because green's secondary bit is the RGBI intensity bit; in
+        // normal 350/480-line modes it uses the full-EGA brown value 0x14.
+        const EGA_AC_NORMAL: [u8; 16] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
             0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
         ];
-        pc.vga.ac[..16].copy_from_slice(&EGA_AC);
-        pc.vga.ac[0x10] &= !0x80; // mode control: P4/P5 from palette, not colour-select
+        const EGA_AC_200LINE: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+        ];
+        let ac = if matches!(mode, 0x0D | 0x0E) {
+            &EGA_AC_200LINE
+        } else {
+            &EGA_AC_NORMAL
+        };
+        pc.vga.ac[..16].copy_from_slice(ac);
+        pc.vga.ac[0x10] &= !0x80; // P4/P5 from palette, not colour-select
+        pc.vga.ac[0x12] = 0x0F; // colour plane enable: all planes visible
+        pc.vga.ac[0x13] = 0x00; // pixel pan
+        pc.vga.ac[0x14] = 0x00; // colour select high bits
     }
     let currently = planar_active();
     if planar && !currently {
@@ -685,20 +713,85 @@ fn set_gpr(regs: &mut Vcpu, idx: u8, sz: u32, val: u32) {
     }
 }
 
-/// Set the status flags (CF/PF/AF/ZF/SF/OF) for an 8-bit `a - b` subtraction —
-/// the result of a `CMP`/`SUB` — leaving the rest of EFLAGS untouched. The other
-/// arithmetic flags follow the x86 definition; OF is signed overflow.
-fn set_sub_flags8(regs: &mut Vcpu, a: u8, b: u8) {
-    let res = a.wrapping_sub(b);
+/// Write the six status flags (CF/PF/AF/ZF/SF/OF) for an ALU result of width
+/// `sz` bytes, leaving the rest of EFLAGS untouched. CF/AF/OF are supplied by
+/// the caller (they depend on the operation); PF (always the low byte), ZF, and
+/// SF (the operand-width sign bit) derive from the result.
+fn write_flags(regs: &mut Vcpu, res: u32, sz: u32, cf: bool, af: bool, of: bool) {
     const MASK: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+    let msb = 1u32 << (sz * 8 - 1);
     let mut f = regs.frame.rflags & !MASK;
-    if (a as u16) < (b as u16) { f |= 1 << 0; }          // CF: borrow
-    if res.count_ones() & 1 == 0 { f |= 1 << 2; }        // PF: even parity of low byte
-    if (a & 0xF) < (b & 0xF) { f |= 1 << 4; }            // AF: borrow from bit 4
-    if res == 0 { f |= 1 << 6; }                         // ZF
-    if res & 0x80 != 0 { f |= 1 << 7; }                  // SF
-    if (a ^ b) & (a ^ res) & 0x80 != 0 { f |= 1 << 11; } // OF: signed overflow
+    if cf {
+        f |= 1 << 0;
+    } // CF
+    if (res as u8).count_ones() & 1 == 0 {
+        f |= 1 << 2;
+    } // PF: parity of low byte
+    if af {
+        f |= 1 << 4;
+    } // AF
+    if res == 0 {
+        f |= 1 << 6;
+    } // ZF (res already masked)
+    if res & msb != 0 {
+        f |= 1 << 7;
+    } // SF
+    if of {
+        f |= 1 << 11;
+    } // OF
     regs.frame.rflags = f;
+}
+
+/// Compute an ALU op `a OP b` of width `sz` bytes (1/2/4), update EFLAGS, and
+/// return the masked result. `alu` is the 3-bit selector from the primary opcode
+/// group (0=ADD 1=OR 2=ADC 3=SBB 4=AND 5=SUB 6=XOR 7=CMP). Logical ops clear
+/// CF/OF/AF per the x86 spec; the arithmetic ops follow the standard
+/// borrow/overflow definitions. CMP computes a subtraction for flags but the
+/// caller discards the returned value. Inputs/outputs are masked to `sz`.
+fn alu(regs: &mut Vcpu, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
+    let bits = sz * 8;
+    let mask = if sz == 4 {
+        0xFFFF_FFFFu32
+    } else {
+        (1u32 << bits) - 1
+    };
+    let msb = 1u32 << (bits - 1);
+    let (a, b) = (a & mask, b & mask);
+    let cf_in = (regs.frame.rflags & 1) as u32;
+    match alu {
+        0 | 2 => {
+            // ADD / ADC
+            let c = if alu == 2 { cf_in } else { 0 };
+            let sum = a as u64 + b as u64 + c as u64;
+            let res = sum as u32 & mask;
+            let cf = (sum >> bits) & 1 != 0;
+            let af = (a & 0xF) + (b & 0xF) + c > 0xF;
+            let of = (a ^ res) & (b ^ res) & msb != 0;
+            write_flags(regs, res, sz, cf, af, of);
+            res
+        }
+        3 | 5 | 7 => {
+            // SBB / SUB / CMP
+            let c = if alu == 3 { cf_in } else { 0 };
+            let diff = a as i64 - b as i64 - c as i64;
+            let res = diff as u32 & mask;
+            let cf = (a as u64) < b as u64 + c as u64;
+            let af = ((a & 0xF) as i32 - (b & 0xF) as i32 - c as i32) < 0;
+            let of = (a ^ b) & (a ^ res) & msb != 0;
+            write_flags(regs, res, sz, cf, af, of);
+            res
+        }
+        _ => {
+            // OR / AND / XOR — CF=OF=AF=0
+            let res = (match alu {
+                1 => a | b,
+                4 => a & b,
+                _ => a ^ b,
+            }) & mask;
+            write_flags(regs, res, sz, false, false, false);
+            res
+        }
+    }
 }
 
 /// Length of the ModR/M + SIB + displacement that follows the opcode, given the
@@ -823,6 +916,36 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             i += l + sz;
             for b in 0..sz { vram_write(vga, off + b, (imm >> (b * 8)) as u8); }
         }
+        // xchg r/m8, r8 — Keen 4's Galaxy engine does `xchg es:[di], al` to
+        // touch planar VRAM: the read half loads the GC latches, the write half
+        // stores AL through the EGA write path, in one instruction. x86 swap
+        // semantics: reg gets the (GC-processed) read byte, VRAM gets reg's old
+        // value written via `vram_write` (so map mask / write mode / latches all
+        // apply). `vram_read` must run first — it loads the latches the write uses.
+        0x86 => {
+            let modrm = peek(i);
+            let ridx = (modrm >> 3) & 7;
+            let regval = gpr(regs, ridx, 1) as u8;
+            i += modrm_len(modrm, addr32, &peek, i);
+            let memval = vram_read(vga, off);
+            vram_write(vga, off, regval);
+            set_gpr(regs, ridx, 1, memval as u32);
+        }
+        // xchg r/m16/32, r — the word/dword form, byte-by-byte so each byte
+        // loads its latch before the matching write (same as the `mov` group).
+        0x87 => {
+            let modrm = peek(i);
+            let ridx = (modrm >> 3) & 7;
+            let sz = opsize(op32, false);
+            let regval = gpr(regs, ridx, sz);
+            i += modrm_len(modrm, addr32, &peek, i);
+            let mut memval = 0u32;
+            for b in 0..sz {
+                memval |= (vram_read(vga, off + b) as u32) << (b * 8);
+                vram_write(vga, off + b, (regval >> (b * 8)) as u8);
+            }
+            set_gpr(regs, ridx, sz, memval);
+        }
         // stos: store (E)AX to ES:DI, count in (E)CX if rep. AL/AX/EAX.
         0xAA | 0xAB => {
             let sz = opsize(op32, opcode == 0xAA);
@@ -906,27 +1029,54 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
                 not_done = rem > 0;
             }
         }
-        // cmp r/m8, r8 — read the VRAM byte (loads the latches) and compare it
-        // with r8, setting flags; no write-back. Doom's Mode-X renderer does
-        // `cmp byte [vram], dl` in its masked-write loop. Read map / read mode
-        // are honoured by `vram_read`; the Map Mask only governs writes.
-        0x38 => {
+        // ALU with a VRAM operand: the primary-group r/m forms, all eight groups
+        // ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, in both directions and widths. Opcode
+        // low 3 bits select form: 0 = `OP r/m8,r8`, 1 = `OP r/m,r`,
+        // 2 = `OP r8,r/m8`, 3 = `OP r,r/m`. Even ⇒ byte; the width of the
+        // word/dword forms is `opsize(op32, …)`, so it follows the segment's
+        // default operand size (16-bit VM86 / 32-bit PM) toggled by a 0x66
+        // prefix — exactly like the `mov` arms. The VRAM read goes through
+        // `vram_read` (loads the GC latches; read map / read mode honoured); a
+        // write-back (every group but CMP, when r/m is the dest) goes through
+        // `vram_write` (map mask / write mode / latches). Keen 4's masked-sprite
+        // blit reads the screen with `and ax, es:[di]` (0x23) then merges;
+        // Doom's Mode-X loop does `cmp byte [vram], dl`.
+        op if op < 0x40 && (op & 0x07) < 4 => {
+            let group = (op >> 3) & 7;
+            let reg_is_dst = op & 0x02 != 0; // forms 2/3: reg <- reg OP [vram]
+            let sz = opsize(op32, op & 1 == 0);
             let modrm = peek(i);
-            let reg = gpr(regs, (modrm >> 3) & 7, 1) as u8;
+            let ridx = (modrm >> 3) & 7;
             i += modrm_len(modrm, addr32, &peek, i);
-            let mem = vram_read(vga, off);
-            set_sub_flags8(regs, mem, reg);
-        }
-        // cmp r8, r/m8 — the symmetric form (reg - [vram]).
-        0x3A => {
-            let modrm = peek(i);
-            let reg = gpr(regs, (modrm >> 3) & 7, 1) as u8;
-            i += modrm_len(modrm, addr32, &peek, i);
-            let mem = vram_read(vga, off);
-            set_sub_flags8(regs, reg, mem);
+            let reg = gpr(regs, ridx, sz);
+            let mut mem = 0u32;
+            for b in 0..sz {
+                mem |= (vram_read(vga, off + b) as u32) << (b * 8);
+            }
+            if reg_is_dst {
+                let res = alu(regs, group, reg, mem, sz);
+                if group != 7 {
+                    set_gpr(regs, ridx, sz, res);
+                } // CMP: flags only
+            } else {
+                let res = alu(regs, group, mem, reg, sz);
+                if group != 7 {
+                    // CMP: no write-back
+                    for b in 0..sz {
+                        vram_write(vga, off + b, (res >> (b * 8)) as u8);
+                    }
+                }
+            }
         }
         _ => {
             let _ = (rep, addr32);
+            crate::println!(
+                "  [planar #PF] unhandled opcode {:#04x} off={:#x} ip0={:#x} bytes={:02x?}",
+                opcode,
+                off,
+                ip0,
+                &buf[..]
+            );
             return false;
         }
     }
@@ -1057,41 +1207,7 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, now_ticks: u64) {
     let mut scratch = alloc::vec::Vec::new();
     let Some(frame) = pc.vga.scanout(regs, &mut scratch) else { return };
     let (w, h) = vga_render::dimensions(frame.mode);
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static LAST: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
-        let bda = regs.read::<u8>(0x449);
-        let pa = planar_active();
-        // seq[4] bit3 = chain-4 (clear ⇒ unchained planar); gc[6] bit0 = graphics
-        // (vs text), bits 2-3 = memory map; gc[5] = write/read mode.
-        let key = ((pa as u32) << 16) | ((bda as u32) << 8)
-            | ((pc.vga.gc[6] as u32 & 0xF) << 4) | (pc.vga.seq[4] as u32 & 0xF);
-        if LAST.swap(key, Ordering::Relaxed) != key {
-            crate::dbg_println!("[present] planar_active={} bda={:#x} seq[4]={:#04x} gc[5]={:#04x} gc[6]={:#04x} -> mode={:?}",
-                pa, bda, pc.vga.seq[4], pc.vga.gc[5], pc.vga.gc[6], frame.mode);
-        }
-    }
-    let planar16 = matches!(frame.mode, lib::vga_render::VgaMode::Planar16 { .. });
-    let rd = || -> u64 { let lo: u32; let hi: u32;
-        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
-        ((hi as u64) << 32) | lo as u64 };
-    let t0 = rd();
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);
-    let t1 = rd();
     vga_render::present(w, h, &fb);
-    let t2 = rd();
-    if planar16 {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static RSUM: AtomicU32 = AtomicU32::new(0); // kilocycles
-        static PSUM: AtomicU32 = AtomicU32::new(0);
-        static N: AtomicU32 = AtomicU32::new(0);
-        let rk = ((t1 - t0) / 1000) as u32;
-        let pk = ((t2 - t1) / 1000) as u32;
-        let r = RSUM.fetch_add(rk, Ordering::Relaxed) + rk;
-        let p = PSUM.fetch_add(pk, Ordering::Relaxed) + pk;
-        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::dbg_println!("[ptime] planar16 frame#{} render={}kc present={}kc (avg r={} p={})",
-            n, rk, pk, r / n, p / n);
-    }
 }
