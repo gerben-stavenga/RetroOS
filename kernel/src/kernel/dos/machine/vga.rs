@@ -580,8 +580,10 @@ fn disarm_planar(machine: &mut crate::TheArch, vga: &VgaState, regs: &mut Vcpu, 
 // through the 64 KB window at 0xA0000, switching banks via VBE 4F05h. We keep
 // the whole framebuffer kernel-side (`vga.svga_fb`) and use 0xA0000 as plain
 // RAM staging: a bank switch flushes the live window to its bank and loads the
-// requested one. This avoids the page-alias refcount churn `copy_page_entries`
-// would cause on every (frequent) bank switch.
+// requested one. (Aliasing the window onto the framebuffer via
+// `copy_page_entries` is also viable now that it releases the clobbered entry,
+// but the kernel-side buffer keeps the lifecycle simple and avoids a
+// guest-mapped LFB region.)
 // ============================================================================
 
 /// Bytes in one 64 KB VBE window granule.

@@ -1769,10 +1769,24 @@ pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
     use crate::phys_mm;
     match entries() {
         Entries::E32(e) => { for i in 0..count {
+            // A copy into a live mapping must drop the reference it held, or the
+            // clobbered frame's refcount never reaches zero and it leaks (mirror
+            // unmap_range). Skip MMIO / externally-owned frames.
+            let old = e[dst_vpage + i];
+            if old.present() && old.raw() & flags::CACHE_DISABLE == 0 {
+                phys_mm::free_phys_page(old.addr() >> 12);
+            }
             e[dst_vpage + i] = e[src_vpage + i];
             if e[src_vpage + i].present() { phys_mm::inc_shared_count(e[src_vpage + i].page()); }
         }}
         Entries::E64(e) => { for i in 0..count {
+            // A copy into a live mapping must drop the reference it held, or the
+            // clobbered frame's refcount never reaches zero and it leaks (mirror
+            // unmap_range). Skip MMIO / externally-owned frames.
+            let old = e[dst_vpage + i];
+            if old.present() && old.raw() & flags::CACHE_DISABLE == 0 {
+                phys_mm::free_phys_page(old.addr() >> 12);
+            }
             e[dst_vpage + i] = e[src_vpage + i];
             if e[src_vpage + i].present() { phys_mm::inc_shared_count(e[src_vpage + i].page()); }
         }}

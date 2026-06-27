@@ -729,6 +729,11 @@ pub fn space_copy_entries(src: usize, dst: usize, count: usize) {
         for i in 0..count {
             let sv = ((src + i) * 4096) as u32;
             let dv = ((dst + i) * 4096) as u32;
+            // Drop the reference dst currently holds before clobbering it, or the
+            // old frame leaks (mirror metal's copy_page_entries / unmap).
+            if let Some(old_pa) = translate(pd, dv) {
+                phys::free_frames((old_pa >> 12) as u64, 1);
+            }
             match translate(pd, sv) {
                 Some(spa) => {
                     // ALIAS dst onto src's physical frame — do NOT snapshot it
