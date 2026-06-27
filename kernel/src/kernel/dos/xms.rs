@@ -1,7 +1,7 @@
 //! XMS 3.0 (Extended Memory Specification) emulation.
 //!
-//! Pure bookkeeping over the VM86 linear address space above the HMA + A20
-//! shadow region. Physical backing comes from the kernel's demand paging.
+//! Pure bookkeeping over the VM86 linear address space above the HMA.
+//! Physical backing comes from the kernel's demand paging.
 
 use arch_abi::Arch;
 use arch_abi::GuestBytes;
@@ -13,8 +13,9 @@ use crate::kernel::thread;
 use crate::Regs;
 
 const MAX_XMS_HANDLES: usize = 16;
-/// XMS address space: linear 0x120000 (after HMA and the A20 shadow) to
-/// about 0x500000. Pages 0x100-0x10F = HMA, 0x110-0x11F = A20 shadow.
+/// XMS address space: linear 0x120000 to about 0x500000. Pages 0x100-0x10F are
+/// the HMA (permanently wrapped over page 0); 0x110-0x11F is a reserved gap left
+/// from the former A20 shadow region.
 const XMS_BASE: u32 = 0x120000;
 const XMS_END: u32 = 0x500000;  // 5MB — plenty for DOS games
 const XMS_TOTAL_KB: u16 = ((XMS_END - XMS_BASE) / 1024) as u16;
@@ -29,14 +30,12 @@ struct XmsHandle {
 /// Per-thread XMS driver state.
 pub struct XmsState {
     handles: [Option<XmsHandle>; MAX_XMS_HANDLES],
-    a20_local: u16,
-    a20_global: u16,
 }
 
 impl XmsState {
     fn new() -> Self {
         const NONE: Option<XmsHandle> = None;
-        Self { handles: [NONE; MAX_XMS_HANDLES], a20_local: 0, a20_global: 0 }
+        Self { handles: [NONE; MAX_XMS_HANDLES] }
     }
 
     /// Find a contiguous free region of `size` bytes. Returns linear address or None.
@@ -123,48 +122,20 @@ pub(crate) fn xms_dispatch(machine: &mut crate::TheArch, dos: &mut thread::DosSt
         0x00 => {
             regs.rax = (regs.rax & !0xFFFF) | 0x0300; // XMS 3.00
             regs.rbx = (regs.rbx & !0xFFFF) | 0x0001; // driver internal revision
-            regs.rdx = (regs.rdx & !0xFFFF) | 0x0001; // HMA exists
+            regs.rdx = regs.rdx & !0xFFFF;            // no HMA (A20 always wrapped)
         }
-        // AH=03h — Global enable A20
-        0x03 => {
-            let xms = xms_state(dos);
-            xms.a20_global += 1;
-            dos.pc.set_a20(machine, true);
+        // AH=03h–06h — A20 enable/disable (global + local). The gate is
+        // permanently wrapped (see machine::new): a VM86 guest has no usable HMA
+        // and can't reach >1 MB directly, so these are no-op successes — callers
+        // that bracket XMS access with enable/disable just proceed.
+        0x03 | 0x04 | 0x05 | 0x06 => {
             regs.rax = (regs.rax & !0xFFFF) | 1; // success
-            regs.rbx = regs.rbx & !0xFFFF; // BL=0 no error
+            regs.rbx = regs.rbx & !0xFFFF;       // BL=0 no error
         }
-        // AH=04h — Global disable A20
-        0x04 => {
-            let xms = xms_state(dos);
-            xms.a20_global = xms.a20_global.saturating_sub(1);
-            if xms.a20_global == 0 && xms.a20_local == 0 {
-                dos.pc.set_a20(machine, false);
-            }
-            regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=05h — Local enable A20
-        0x05 => {
-            let xms = xms_state(dos);
-            xms.a20_local += 1;
-            dos.pc.set_a20(machine, true);
-            regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=06h — Local disable A20
-        0x06 => {
-            let xms = xms_state(dos);
-            xms.a20_local = xms.a20_local.saturating_sub(1);
-            if xms.a20_local == 0 && xms.a20_global == 0 {
-                dos.pc.set_a20(machine, false);
-            }
-            regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx = regs.rbx & !0xFFFF;
-        }
-        // AH=07h — Query A20 state
+        // AH=07h — Query A20 state. Report "enabled" so an enable-then-verify
+        // caller is satisfied; the physical wrap is invisible to XMS-API users.
         0x07 => {
-            let enabled = dos.pc.a20_enabled;
-            regs.rax = (regs.rax & !0xFFFF) | if enabled { 1 } else { 0 };
+            regs.rax = (regs.rax & !0xFFFF) | 1;
             regs.rbx = regs.rbx & !0xFFFF;
         }
         // AH=08h — Query free extended memory

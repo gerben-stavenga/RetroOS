@@ -248,16 +248,15 @@ impl DosState {
     }
 
     /// Per-thread cleanup at exit: free EMS-backed pages, drop XMS/EMS
-    /// state, restore A20. The screen snapshot is handled by `suspend`,
-    /// which `exit_thread` calls separately before `arch_user_clean`
-    /// unmaps the 0xA0000 framebuffer. Called from `thread::exit_thread`.
+    /// state. The screen snapshot is handled by `suspend`, which `exit_thread`
+    /// calls separately before `arch_user_clean` unmaps the 0xA0000
+    /// framebuffer. Called from `thread::exit_thread`.
     pub fn on_exit(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
         if let Some(ref mut ems) = self.ems {
             ems.free_all_pages();
         }
         self.ems = None;
         self.xms = None;
-        self.pc.set_a20(machine, true);
         // Hand the single global ISA-DMA pool back; a dying thread that
         // armed SB DMA must not poison it for the next program.
         self.pc.sb.release_dma_pool(machine, regs);
@@ -358,9 +357,11 @@ pub struct ExecParent {
 fn linear(dos: &thread::DosState, regs: &Vcpu, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
-        // A20 gate: with the gate disabled, address line 20 is forced low, so
-        // the HMA (FFFF:0010..FFFF:FFFF) folds back over the first 64 KiB.
-        if dos.pc.a20_enabled { lin } else { lin & !(1 << 20) }
+        // A20 is permanently wrapped (force line 20 low): the HMA
+        // (FFFF:0010..FFFF:FFFF) folds back over the first 64 KiB, the faithful
+        // A20-off default. A VM86 guest can't use a real HMA (we report none)
+        // nor unreal mode, so there is nothing to gate on — see machine::new.
+        lin & !(1 << 20)
     } else {
         // PM client: resolve the buffer selector through its LDT base. This is
         // why PMDOS services 16-bit DPMI INT 21 in PM rather than reflecting to

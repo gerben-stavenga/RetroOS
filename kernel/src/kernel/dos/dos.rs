@@ -3534,6 +3534,22 @@ pub(super) fn setup_ivt(regs: &mut Vcpu) {
         write_u16(regs, 0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(regs, 0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
+
+    // INT 15h: the SeaBIOS ROM services AH=87h (block move) / AH=89h (switch to
+    // PM) with protected-mode code (LGDT) that #GPs under VM86. Steal the vector
+    // so our dispatcher emulates those and chains the rest back to the ROM.
+    // Native path only: the Substitute BIOS already owns 0x15, and reading it
+    // back (or a COW-inherited, already-redirected page 0) would capture our own
+    // stub and self-loop the chain — so skip if it's already STUB_SEG.
+    if crate::kernel::platform::get().firmware != crate::kernel::platform::Firmware::Substitute {
+        let seg = read_u16(regs, 0, 0x15 * 4 + 2);
+        if seg != STUB_SEG {
+            super::bios::set_native_int15(seg, read_u16(regs, 0, 0x15 * 4));
+        }
+        write_u16(regs, 0, 0x15 * 4, slot_offset(0x15));
+        write_u16(regs, 0, 0x15 * 4 + 2, STUB_SEG);
+    }
+
     setup_lol_sft(regs);
     xms::scan_uma(regs);
 

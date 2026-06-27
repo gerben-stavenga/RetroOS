@@ -2,8 +2,8 @@
 //! the DOS and DPMI personalities run on top of.
 //!
 //! This module is policy-free: it owns the per-thread virtual peripherals
-//! (8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set), A20 gate state,
-//! HMA page tracking, and the primitive helpers that decode/execute the
+//! (8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set) and the primitive
+//! helpers that decode/execute the
 //! handful of sensitive instructions that trap through the GP fault monitor
 //! (I/O, CLI/STI, IRET, PUSHF/POPF, stack push/pop).
 //!
@@ -42,11 +42,10 @@ pub const IOPL_NONCONF: u32 = 3 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
 
 
-/// HMA spans 16 pages (64KB) starting at page 0x100.
+/// HMA spans 16 pages (64KB) starting at page 0x100. Permanently aliased over
+/// page 0 (A20 always wrapped) — see `Machine::new`.
 const HMA_PAGE: usize = 0x100;
 const HMA_PAGE_COUNT: usize = 16;
-/// Shadow region for A20 gate: swap HMA entries here when A20 is off.
-const HMA_SHADOW_PAGE: usize = HMA_PAGE + HMA_PAGE_COUNT;
 
 // ============================================================================
 // VM86 register helpers — 16-bit views of the 32-bit user frame
@@ -128,14 +127,12 @@ pub(super) mod vsb;
 pub(super) use vsb::*;
 /// Policy-free PC machine virtualization — per-thread peripheral state.
 ///
-/// Holds the virtual 8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set,
-/// A20 gate state, HMA page tracking, and small latches used by the monitor
-/// decoders (skip_irq, e0_pending).
+/// Holds the virtual 8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set, and
+/// small latches used by the monitor decoders (skip_irq, e0_pending).
 ///
 /// DOS-specific state (PSP, DTA, heap/free segment, XMS/EMS, FindFirst state,
 /// exec-parent chain) lives directly on `thread::DosState`, not here.
 pub struct PcMachine {
-    pub a20_enabled: bool,
     pub vpit: VirtualPit,
     pub vpic: VirtualPic,
     pub vrtc: VirtualRtc,
@@ -327,15 +324,14 @@ impl PcMachine {
     }
 
     pub fn new(machine: &mut crate::TheArch) -> Self {
-        // A20 starts disabled. HMA_PAGE wraps to user's private low memory
-        // by copying entries[0..16]. HMA_SHADOW_PAGE is left not-present
-        // (arch_user_clean cleared it; map_low_mem_user doesn't touch it),
-        // which is the correct A20-on state when no extended memory is
-        // allocated — set_a20(true) will swap not-present into HMA_PAGE
-        // so HMA accesses fault until XMS maps real extended memory.
+        // A20 is permanently wrapped: HMA_PAGE aliases the user's private low
+        // memory by copying entries[0..16], the faithful A20-off default every
+        // real machine boots with. We never un-wrap it — a VM86 guest can use
+        // neither a real HMA (XMS reports none) nor unreal mode, so the gate has
+        // nothing to toggle. Dropping it removes the shadow region, the page
+        // swap, and the local/global ref-counting that used to track it.
         machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
         Self {
-            a20_enabled: false,
             vpit: VirtualPit::new(machine),
             vpic: VirtualPic::new(),
             vrtc: VirtualRtc::new(machine),
@@ -348,15 +344,6 @@ impl PcMachine {
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
         }
-    }
-
-    /// Toggle A20 gate: HMA either sees shadow (real content) or wraps to page 0.
-    pub fn set_a20(&mut self, machine: &mut crate::TheArch, enabled: bool) {
-        if enabled == self.a20_enabled { return; }
-        // Shadow always holds the opposite of what's in HMA.
-        // Swap them to toggle.
-        machine.swap_page_entries(HMA_SHADOW_PAGE, HMA_PAGE, HMA_PAGE_COUNT);
-        self.a20_enabled = enabled;
     }
 }
 

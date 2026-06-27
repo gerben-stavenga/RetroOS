@@ -37,6 +37,25 @@ use super::machine::{
     self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_sp, vm86_ss, read_u16, write_u16,
 };
 use super::dos::STUB_SEG;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// The native BIOS ROM's INT 15h vector (`seg<<16 | off`), captured before we
+/// steal the vector in `setup_ivt`, so subfunctions we don't emulate can chain
+/// back to it. `NO_NATIVE` on the Substitute path — there's no ROM to chain to,
+/// and unhandled subfunctions just IRET.
+const NO_NATIVE: u32 = 0xFFFF_FFFF;
+static NATIVE_INT15: AtomicU32 = AtomicU32::new(NO_NATIVE);
+
+/// Record the ROM INT 15h vector before `setup_ivt` redirects it to our stub.
+pub(super) fn set_native_int15(seg: u16, off: u16) {
+    NATIVE_INT15.store(((seg as u32) << 16) | off as u32, Ordering::Relaxed);
+}
+fn native_int15() -> Option<(u16, u16)> {
+    match NATIVE_INT15.load(Ordering::Relaxed) {
+        NO_NATIVE => None,
+        v => Some(((v >> 16) as u16, v as u16)),
+    }
+}
 
 // ============================================================================
 // BIOS Data Area — a typed Rust projection at linear 0x400 (segment 0x40)
@@ -234,6 +253,26 @@ pub(super) fn dispatch(
             let equip: u16 = bda_field!(regs, equipment);
             regs.rax = (regs.rax & !0xFFFF) | equip as u64;
         }
+        0x15 => match (regs.rax >> 8) as u8 {
+            // AH=87h block move: the ROM does this via a protected-mode LGDT
+            // excursion (illegal under VM86). Do the copy directly instead.
+            0x87 => int15_block_move(regs),
+            // AH=89h switch-to-PM: a VM86 guest cannot take over real PM — the
+            // monitor owns it. Refuse, exactly as EMM386 does (DPMI is the
+            // sanctioned path). AH=86h = "unsupported", CF set.
+            0x89 => {
+                regs.rax = (regs.rax & !0xFF00) | 0x8600;
+                set_iret_cf(regs, true);
+            }
+            // Everything else: on a real BIOS, hand back to the ROM (WAIT,
+            // ext-mem size, …) reusing the caller's INT frame. On Substitute
+            // there's no ROM, so fall through to a plain IRET as before.
+            _ => if let Some((seg, off)) = native_int15() {
+                machine::set_vm86_cs(regs, seg);
+                machine::set_vm86_ip(regs, off);
+                return thread::KernelAction::Done;
+            },
+        },
         0x16 => {
             if int16(regs, ip) == Parked::Yes {
                 return thread::KernelAction::Done;
@@ -255,6 +294,38 @@ fn pop_iret_frame(regs: &mut Vcpu) {
     machine::set_vm86_ip(regs, ret_ip);
     machine::set_vm86_cs(regs, ret_cs);
     machine::set_vm86_flags(regs, ret_flags as u32);
+}
+
+/// Set/clear CF in the caller's *stacked* FLAGS (at `SS:SP+4`), which
+/// `pop_iret_frame` restores on return — clearing the live flag would just be
+/// overwritten by that pop. This is how a real BIOS reports carry through IRET.
+fn set_iret_cf(regs: &mut Vcpu, cf: bool) {
+    let flin = (((vm86_ss(regs) as u32) << 4) + vm86_sp(regs) as u32 + 4) as usize;
+    let mut f = regs.read::<u16>(flin);
+    if cf { f |= 1 } else { f &= !1 }
+    regs.write::<u16>(flin, f);
+}
+
+/// INT 15h AH=87h — copy a block to/from extended memory. `ES:SI` → the
+/// caller's GDT; descriptor `[0x10]` is the source, `[0x18]` the destination,
+/// each carrying a 24/32-bit linear base (bytes 2–4 = base 0–23, byte 7 =
+/// 24–31). `CX` = words to copy. We perform the copy directly — the same
+/// operation as XMS AH=0Bh (`copy_within`) — instead of letting the ROM `LGDT`
+/// into protected mode, which is illegal under VM86.
+fn int15_block_move(regs: &mut Vcpu) {
+    let gdt = ((regs.es as u32) << 4) + (regs.rsi as u32 & 0xFFFF);
+    let base = |regs: &Vcpu, desc: u32| -> u32 {
+        let d = (gdt + desc) as usize;
+        (regs.read::<u16>(d + 2) as u32)                      // base bits 0–15
+            | (((regs.read::<u16>(d + 4) as u32) & 0xFF) << 16) // byte 4: bits 16–23
+            | (((regs.read::<u16>(d + 6) as u32) >> 8) << 24)   // byte 7: bits 24–31
+    };
+    let src = base(regs, 0x10);
+    let dst = base(regs, 0x18);
+    let len = (regs.rcx as usize & 0xFFFF) * 2;
+    regs.copy_within(src as usize, dst as usize, len);
+    regs.rax &= !0xFF00;       // AH = 0 (success)
+    set_iret_cf(regs, false);  // CF = 0
 }
 
 // ============================================================================
