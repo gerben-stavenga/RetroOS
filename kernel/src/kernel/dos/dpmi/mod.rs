@@ -909,26 +909,17 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         0x0E01 => {
             clear_carry(regs);
         }
-        // AX=0800h — Physical Address Mapping
-        // BX:CX = physical address, SI:DI = size
-        // Returns BX:CX = linear address
+        // AX=0800h — Physical Address Mapping. BX:CX = physical address,
+        // SI:DI = size; returns BX:CX = linear address.
+        //
+        // We present a FLAT DPMI: the client's linear space IS the address
+        // space, and linear→physical paging lives in the RetroOS arch layer
+        // below us — not ours to remap. So there is no separate physical space
+        // to map *from*; a physical address maps to itself. Return it identity.
+        // Memory that needs real backing (the VESA LFB) is set up where it
+        // lives by whoever owns it (svga_set_mode); 0800h adds no mapping.
         0x0800 => {
-            let phys = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
-            let size = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
-            let aligned = (size + 0xFFF) & !0xFFF;
-            // Allocate virtual range from DPMI linear memory pool
-            let base = dpmi.mem_next;
-            dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
-            dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
-            // Map physical pages at the allocated virtual address via ring-0 arch call
-            let num_pages = aligned as usize / 4096;
-            let vpage_start = base as usize / 4096;
-            let ppage_start = phys as u64 / 4096;
-            // PWT (bit 3) + PCD (bit 4): write-through, cache-disable for MMIO
-            machine.map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
-            // Return linear address
-            regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
-            regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);
+            // BX:CX already hold the address; echo it back as the linear result.
             clear_carry(regs);
         }
         // AX=0801h — Free Physical Address Mapping (no-op, we don't track)
