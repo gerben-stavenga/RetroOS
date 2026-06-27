@@ -148,8 +148,8 @@ static unsigned char lookup_flags(const char *name) {
  *
  * Real DOS keeps INT 21h AH=4B raw: it takes a fully-qualified filename
  * and that's it. PATH search and extension probing live in COMMAND.COM,
- * and we do the same -- the kernel never sees a bare "command", only
- * "C:\\COMMAND.COM" once we've resolved it. */
+ * and we do the same -- the kernel sees the resolved path we selected,
+ * not the user's bare command token. */
 
 static int file_exists(const char *p) {
     FILE *f = fopen(p, "rb");
@@ -202,6 +202,72 @@ static int resolve_program(const char *name, char *out) {
         if (*p == ';') p++;
     }
     return 0;
+}
+
+/* Path to this command interpreter for recursive COMMAND.COM launches
+ * (LOADFIX trampoline). Prefer COMSPEC, but cache an absolute-ish copy at
+ * startup so changing directories does not break a later /L re-fork. */
+static char command_com_path[MAXPATH] = "COMMAND.COM";
+
+static void copy_path(char *dst, const char *src) {
+    strncpy(dst, src, MAXPATH - 1);
+    dst[MAXPATH - 1] = 0;
+}
+
+static int is_abs_dos_path(const char *p) {
+    return p && p[0] && p[1] == ':' && (p[2] == '\\' || p[2] == '/');
+}
+
+static int make_abs_path(const char *path, char *out) {
+    char cwd[MAXPATH];
+    size_t clen, plen;
+    if (!path || !*path) return 0;
+    if (is_abs_dos_path(path)) {
+        copy_path(out, path);
+        return 1;
+    }
+    if (getcwd(cwd, sizeof(cwd)) == 0) {
+        copy_path(out, path);
+        return 1;
+    }
+    if (path[0] == '\\' || path[0] == '/') {
+        if (!(cwd[0] && cwd[1] == ':')) {
+            copy_path(out, path);
+            return 1;
+        }
+        plen = strlen(path);
+        if (2 + plen >= MAXPATH) return 0;
+        out[0] = cwd[0];
+        out[1] = ':';
+        strcpy(out + 2, path);
+        return 1;
+    }
+    clen = strlen(cwd);
+    plen = strlen(path);
+    if (clen + (clen > 0 && cwd[clen - 1] != '\\' ? 1 : 0) + plen >= MAXPATH) return 0;
+    strcpy(out, cwd);
+    if (clen > 0 && out[clen - 1] != '\\') strcat(out, "\\");
+    strcat(out, path);
+    return 1;
+}
+
+static int set_command_path_if_exists(const char *path) {
+    char abs[MAXPATH];
+    if (!path || !*path || !file_exists(path)) return 0;
+    if (!make_abs_path(path, abs)) return 0;
+    copy_path(command_com_path, abs);
+    return 1;
+}
+
+static void init_command_path(const char *argv0) {
+    char resolved[MAXPATH];
+    char *comspec = getenv("COMSPEC");
+    if (set_command_path_if_exists(comspec)) return;
+    if (set_command_path_if_exists(argv0)) return;
+    if (argv0 && *argv0 && resolve_program(argv0, resolved) &&
+        set_command_path_if_exists(resolved)) return;
+    if (resolve_program("COMMAND.COM", resolved) &&
+        set_command_path_if_exists(resolved)) return;
 }
 
 static char *skipws(char *p) {
@@ -465,7 +531,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
          * in-process -- its PSP lands above seg 0x1000, dodging EXEPACK's
          * load-low bug. */
          prog_idx -= 2;   /* shift back to overwrite caller's argv[prog_idx-2] with COMMAND.COM */
-        argv[prog_idx] = "C:\\COMMAND.COM";
+        argv[prog_idx] = command_com_path;
         argv[prog_idx + 1] = "/L";
     }
     return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd, viopl);
@@ -633,6 +699,7 @@ static int is_flag(const char *arg, char letter) {
 }
 
 int main(int argc, char *argv[]) {
+    init_command_path(argc > 0 ? argv[0] : 0);
     load_loadfix_cfg();
 
     /* Invocation contract: COMMAND.COM is always called as

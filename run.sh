@@ -748,12 +748,24 @@ launch_qemu_uefi() {
     # host CPU instead (VT-x/AMD-V) for near-metal semantics.
     local ACCEL_CPU="-cpu max"
     [ "$KVM" = 1 ] && ACCEL_CPU="-accel kvm -cpu host"
+    # --cmd / -r autostart (same as the BIOS path): pass the program path via
+    # fw_cfg opt/cmdline; the kernel (boot.rs read_named) execs it instead of DN.
+    local FWCFG_ARGS=()
+    [ -z "$START_BIN" ] && [ -n "${HOSTED_CMD:-}" ] && START_BIN="$HOSTED_CMD"
+    if [ -n "$START_BIN" ]; then
+        printf '%s' "$START_BIN" > "$WORK/cmdline"
+        FWCFG_ARGS+=(-fw_cfg "name=opt/cmdline,file=$WORK/cmdline")
+        local START_CWD; START_CWD="$(dirname "${START_BIN%% *}")"
+        [ "$START_CWD" = "." ] && START_CWD=""
+        FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=$START_CWD")
+    fi
     exec qemu-system-x86_64 \
         -M q35 -m 512 $ACCEL_CPU \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \
         -nodefaults \
         -device bochs-display \
+        "${FWCFG_ARGS[@]}" \
         "${DISK_ARGS[@]}" \
         `# (default) image controller FIRST: the kernel's nvme probe takes the` \
         `# first controller it finds; OVMF locates the ESP by filesystem, not` \

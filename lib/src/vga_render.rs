@@ -395,6 +395,48 @@ pub fn fallback_palette() -> [u8; 768] {
     p
 }
 
+/// The VGA BIOS default DAC for normal EGA/VGA 16-colour modes: entries
+/// 0..=63 hold the full EGA 64-colour palette, so the standard Attribute
+/// Controller values (0x00,0x01,…,0x14 = brown,…,0x38..0x3F = the bright bank)
+/// index the correct colours. The 64..255 tail is the generic fallback cube
+/// (unused by 16-colour/text).
+///
+/// EGA encodes each colour in 6 bits `r' g' b' R G B` (bit 5..0): the primary
+/// R/G/B bits contribute 42, the secondary r'/g'/b' bits add 21 — matching the
+/// [`EGA16`] triples at their scattered AC slots. VGA uses this normal palette
+/// for 350-line, 480-line, and text modes.
+pub fn ega_dac() -> [u8; 768] {
+    let mut p = fallback_palette();
+    for v in 0..64usize {
+        p[v * 3] = (42 * ((v >> 2) & 1) + 21 * ((v >> 5) & 1)) as u8; // red
+        p[v * 3 + 1] = (42 * ((v >> 1) & 1) + 21 * ((v >> 4) & 1)) as u8; // green
+        p[v * 3 + 2] = (42 * (v & 1) + 21 * ((v >> 3) & 1)) as u8; // blue
+    }
+    p
+}
+
+/// VGA's DAC for EGA 200-line graphics modes (0Dh/0Eh), which VGA scans as
+/// 400-line double-scanned modes. An EGA monitor interprets 200-line timings as
+/// CGA/RGBI compatibility: primary R/G/B come from EGA bits 2/1/0, while the
+/// global intensity bit comes from green's secondary bit (bit 4). The VGA BIOS
+/// emulates that monitor behaviour in DAC entries 0..63, so arbitrary EGA
+/// palette values alias to the 16 RGBI colours instead of producing all 64
+/// normal EGA colours.
+pub fn ega_200line_dac() -> [u8; 768] {
+    let mut p = fallback_palette();
+    for v in 0..64usize {
+        let rgbi = (((v >> 4) & 1) << 3) // I = green secondary bit
+            | (((v >> 2) & 1) << 2)      // R = red primary bit
+            | (((v >> 1) & 1) << 1)      // G = green primary bit
+            | (v & 1); // B = blue primary bit
+        let (r, g, b) = EGA16[rgbi];
+        p[v * 3] = r;
+        p[v * 3 + 1] = g;
+        p[v * 3 + 2] = b;
+    }
+    p
+}
+
 /// Expand a 6-bit VGA DAC component (0..63) to 8-bit (0..255).
 #[inline]
 fn c6to8(v: u8) -> u32 {
@@ -530,6 +572,29 @@ fn planar_rgb(frame: &Frame, val: u8) -> u32 {
     pal_rgb(frame.palette, idx)
 }
 
+/// Bit-spread LUT for planar→chunky: `SPREAD[b]` scatters the 8 bits of a plane
+/// byte (MSB = leftmost pixel) into bit 0 of 8 consecutive 4-bit nibbles of a
+/// u32. Then `SPREAD[p0] | SPREAD[p1]<<1 | SPREAD[p2]<<2 | SPREAD[p3]<<3` packs
+/// all 8 pixels' 4-bit attribute values into one u32 (8 nibbles) — one table
+/// lookup per plane per 8 pixels, no per-pixel bit shuffling.
+static SPREAD: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut v = 0u32;
+        let mut i = 0;
+        while i < 8 {
+            if (b >> (7 - i)) & 1 != 0 {
+                v |= 1u32 << (4 * i);
+            }
+            i += 1;
+        }
+        t[b] = v;
+        b += 1;
+    }
+    t
+};
+
 /// Planar 16-colour: assemble one bit from each of the 4 planes into a 4-bit
 /// pixel value. Pixel (x,y) → byte `y*row_bytes + x/8`, bit `7-(x&7)`.
 fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
@@ -544,16 +609,32 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
         } else {
             (frame.start_offset, frame.pixel_pan & 7, y)
         };
-        for x in 0..w {
-            let sx = x + pan;
-            let off = start + ry * rb + sx / 8;
-            let bit = 7 - (sx & 7);
-            let mut val = 0u8;
-            for p in 0..4 {
-                let b = planes.get(p * 0x10000 + off).copied().unwrap_or(0);
-                val |= ((b >> bit) & 1) << p;
+        // Per *source byte*: fetch its 4 plane bytes once (64K apart — 4 cache
+        // lines — they serve all 8 pixels), spread them through the LUT into one
+        // u32 of 8 chunky nibbles, and emit the 8 pixels. The old per-pixel
+        // 4-plane fetch + bit-shuffle was essentially the whole present cost for
+        // EGA/16-colour modes — slow enough that the guest's timer-IRQ queue
+        // backed up until its stack overflowed (Keen 4 abort). The first byte may
+        // start mid-byte (horizontal pixel-pan smooth-scroll); the rest emit 8.
+        let base = start + ry * rb;
+        let row = &mut out[y * w..y * w + w];
+        let mut x = 0usize;
+        let mut bit = pan & 7; // first byte's starting nibble (pan), then 0
+        let mut sbyte = pan / 8;
+        while x < w {
+            let off = base + sbyte;
+            let p0 = planes.get(off).copied().unwrap_or(0) as usize;
+            let p1 = planes.get(0x10000 + off).copied().unwrap_or(0) as usize;
+            let p2 = planes.get(0x20000 + off).copied().unwrap_or(0) as usize;
+            let p3 = planes.get(0x30000 + off).copied().unwrap_or(0) as usize;
+            let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
+            while bit < 8 && x < w {
+                row[x] = planar_rgb(frame, ((pix >> (4 * bit)) & 0xF) as u8);
+                bit += 1;
+                x += 1;
             }
-            out[y * w + x] = planar_rgb(frame, val);
+            bit = 0;
+            sbyte += 1;
         }
     }
 }
@@ -708,6 +789,28 @@ mod tests {
         render(&frame, &mut out);
         assert_eq!(out[0], pal_rgb(&pal, 5)); // colour index 5
         assert_eq!(out[1], pal_rgb(&pal, 0)); // background
+    }
+
+    fn dac_entry(pal: &[u8; 768], idx: usize) -> (u8, u8, u8) {
+        (pal[idx * 3], pal[idx * 3 + 1], pal[idx * 3 + 2])
+    }
+
+    #[test]
+    fn ega_dac_maps_full_64_colour_values() {
+        let pal = ega_dac();
+        assert_eq!(dac_entry(&pal, 0x14), EGA16[6]); // full-EGA brown
+        assert_eq!(dac_entry(&pal, 0x06), (42, 42, 0)); // full-EGA dark yellow
+        assert_eq!(dac_entry(&pal, 0x38), EGA16[8]); // bright-bank dark grey
+        assert_eq!(dac_entry(&pal, 0x3F), EGA16[15]); // white
+    }
+
+    #[test]
+    fn ega_200line_dac_aliases_values_to_rgbi() {
+        let pal = ega_200line_dac();
+        assert_eq!(dac_entry(&pal, 0x06), EGA16[6]); // RGBI brown
+        assert_eq!(dac_entry(&pal, 0x14), EGA16[12]); // green-LSB intensity => bright red
+        assert_eq!(dac_entry(&pal, 0x38), EGA16[8]); // aliases still hit bright bank
+        assert_eq!(dac_entry(&pal, 0x3F), EGA16[15]);
     }
 
     #[test]

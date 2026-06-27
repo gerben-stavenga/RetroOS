@@ -1,3 +1,7 @@
 build --platforms=//toolchain:i686_retro_none
 build --@rules_rust//rust/toolchain/channel=nightly
 build -c opt
+build --action_env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+build --host_action_env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+build --action_env=LD_LIBRARY_PATH=
+build --host_action_env=LD_LIBRARY_PATH=

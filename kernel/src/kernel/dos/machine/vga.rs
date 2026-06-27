@@ -472,36 +472,23 @@ impl VgaState {
 // EGA) is pure alias; EGA multi-plane set/reset fan-out is the not-yet-handled
 // fallback. Interp emulates the same paging; metal does it in page tables.
 
-use core::sync::atomic::{AtomicUsize, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
-/// 4 plane frames × 64K. 0 = not yet allocated (the singleton VGA VRAM, lazily
-/// created the first time a guest unchains into planar graphics).
-static VRAM_BASE: AtomicUsize = AtomicUsize::new(0);
 /// Which plane the guest A0000 window currently aliases (0..3), or 0xFF when
 /// A0000 is plain linear RAM (chained mode 13h / text — not planar).
 static A0000_TARGET: AtomicU8 = AtomicU8::new(0xFF);
 
-const NUM_PLANE_FRAMES: usize = 4 * 16; // 256K
-/// Kernel-private guest-VA window mapping all 4 planes contiguously; the
-/// renderer reads it via `copy_from`. Below the interp's 3GB reservation and
-/// far above any DOS/DPMI usage, so it never collides with the guest.
-const VRAM_WINDOW: usize = 0x8000_0000;
+/// The emulated VGA's plane memory: 4 planes × 64 KB, byte (plane `p`, offset
+/// `off`) at `[p*0x10000 + off]`. Lives per-thread on `VgaState::planes` (the
+/// focus-owned model) — the same buffer `save_from_hardware` fills for a real
+/// card — so the planar trap and the renderer touch it directly, no global and
+/// no per-frame copy.
+const PLANES_LEN: usize = 4 * 0x10000;
 const A0000: usize = 0xA0000;
 
 /// True while a guest is in unchained planar graphics (A0000 aliases a plane).
 pub fn planar_active() -> bool {
     A0000_TARGET.load(Ordering::Relaxed) != 0xFF
-}
-
-fn vram_base(machine: &mut crate::TheArch) -> u64 {
-    let base = VRAM_BASE.load(Ordering::Relaxed);
-    if base != 0 {
-        return base as u64;
-    }
-    let base = machine.alloc_phys_contig(NUM_PLANE_FRAMES, 0);
-    machine.map_phys_range(VRAM_WINDOW >> 12, NUM_PLANE_FRAMES, base, 0);
-    VRAM_BASE.store(base as usize, Ordering::Relaxed);
-    base
 }
 
 /// React to a Sequencer register write (port 0x3C5) that may change the
@@ -523,9 +510,9 @@ pub fn on_seq_write(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
             if unchained && !currently_planar {
                 let mut chained = alloc::vec![0u8; 0x10000];
                 regs.copy_from(A0000, &mut chained);
-                arm_planar(machine, regs, Some(&chained));
+                arm_planar(machine, &mut pc.vga, Some(&chained));
             } else if !unchained && currently_planar {
-                disarm_planar(machine, regs, true);
+                disarm_planar(machine, &pc.vga, regs, true);
             }
         }
         2 => {
@@ -540,20 +527,20 @@ pub fn on_seq_write(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
     }
 }
 
-/// Stand up the 4-plane window and map A0000 as MMIO (present=0 + trap marker)
-/// so every guest store/load into A0000 faults into `handle_planar_fault` — the
-/// only way one CPU store can fan into 4 planes and honour the latches, write
-/// modes, and map mask. The kernel owns the planes at `VRAM_WINDOW`; the
-/// renderer reads those. `seed`: deinterleave an existing chained A0000 image
-/// into the planes (the Mode-X chain→unchain hop), or `None` to zero them (a
-/// fresh BIOS planar mode-set). Idempotent if already armed via the callers.
-fn arm_planar(machine: &mut crate::TheArch, regs: &mut Vcpu, seed: Option<&[u8]>) {
-    let _ = vram_base(machine); // ensure the plane window is allocated + mapped
-    let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
-    if let Some(chained) = seed {
-        lib::vga_render::chain4_split(chained, &mut planes);
+/// Map A0000 as MMIO (present=0 + trap marker) so every guest store/load into
+/// A0000 faults into `handle_planar_fault` — the only way one CPU store can fan
+/// into 4 planes and honour the latches, write modes, and map mask. The planes
+/// live on `vga.planes` (the per-thread VRAM). `seed`: deinterleave an existing
+/// chained A0000 image into the planes (the Mode-X chain→unchain hop), or `None`
+/// to zero them (a fresh BIOS planar mode-set).
+fn arm_planar(machine: &mut crate::TheArch, vga: &mut VgaState, seed: Option<&[u8]>) {
+    if vga.planes.len() != PLANES_LEN {
+        vga.planes = alloc::vec![0u8; PLANES_LEN];
     }
-    regs.copy_to(VRAM_WINDOW, &planes);
+    match seed {
+        Some(chained) => lib::vga_render::chain4_split(chained, &mut vga.planes),
+        None => vga.planes.fill(0),
+    }
     machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
     A0000_TARGET.store(0, Ordering::Relaxed); // 0 != 0xFF ⇒ planar_active()
 }
@@ -562,15 +549,11 @@ fn arm_planar(machine: &mut crate::TheArch, regs: &mut Vcpu, seed: Option<&[u8]>
 /// the planes back into a linear A0000 image first (the Mode-X unchain→chain
 /// hop, which expects the 13h view preserved); skip it when simply leaving
 /// graphics for text (the next mode-set clears the screen anyway).
-fn disarm_planar(machine: &mut crate::TheArch, regs: &mut Vcpu, merge: bool) {
-    let mut chained = alloc::vec![0u8; 0x10000];
-    if merge {
-        let mut planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
-        regs.copy_from(VRAM_WINDOW, &mut planes);
-        lib::vga_render::chain4_merge(&planes, &mut chained);
-    }
+fn disarm_planar(machine: &mut crate::TheArch, vga: &VgaState, regs: &mut Vcpu, merge: bool) {
     machine.map_fresh_range(A0000 >> 12, 16);
     if merge {
+        let mut chained = alloc::vec![0u8; 0x10000];
+        lib::vga_render::chain4_merge(&vga.planes, &mut chained);
         regs.copy_to(A0000, &chained);
     }
     A0000_TARGET.store(0xFF, Ordering::Relaxed);
@@ -593,59 +576,91 @@ pub fn on_set_mode(
     if vga_present() {
         return; // a real card draws its own planes
     }
+    // The IBM BIOS programs CRTC line-compare to its no-split default (0x3FF) on
+    // every mode set; our BIOS leaves the CRTC untouched. Without this a program
+    // that page-flips but never writes 0x18 (Doom relies on the BIOS default)
+    // inherits a stale 0, and the renderer splits the whole screen to address 0
+    // (page 0) — the screen renders page 0 for every row. A split-status-panel
+    // program overwrites these afterward (it must, the default being 0x3FF).
+    pc.vga.crtc[0x18] = 0xFF; // line-compare bits 0..7
+    pc.vga.crtc[7] |= 0x10;   // line-compare bit 8 (CRTC overflow)
+    pc.vga.crtc[9] |= 0x40;   // line-compare bit 9 (CRTC max-scan-line)
+    // A real VGA BIOS reloads the DAC on every clearing mode set. Which default
+    // depends on the render path: text/CGA/mode 13h index DAC entries directly
+    // and need the 16 CGA colours at entries 0..15; planar 16-colour modes map
+    // pixels through the Attribute Controller first.
+    if matches!(mode, 0x0D..=0x12) {
+        // Install the planar EGA DAC even on no-clear mode sets: many EGA games
+        // never program the DAC, and our fresh process default is the generic
+        // mode-13h fallback. VGA uses an RGBI-compatibility DAC for the 200-line
+        // EGA modes (0Dh/0Eh) and the full 64-colour EGA DAC for 350/480-line
+        // planar modes.
+        pc.vga.dac = if matches!(mode, 0x0D | 0x0E) {
+            lib::vga_render::ega_200line_dac()
+        } else {
+            lib::vga_render::ega_dac()
+        };
+    } else if clear {
+        pc.vga.dac = lib::vga_render::fallback_palette();
+    }
     let planar = matches!(mode, 0x0D..=0x12);
     if planar {
-        // Load the standard EGA 16-colour Attribute Controller palette the IBM
-        // BIOS programs on every planar mode set. Without it AC[0..15] are 0, so
-        // every 4-bit pixel maps to DAC index 0 (black) — Keen never touches the
-        // AC, relying on this default. Index i → i for 0..5, brown fixup at 6
-        // (0x14), then the bright bank 0x38..0x3F for 8..15.
-        const EGA_AC: [u8; 16] = [
+        // Standard EGA AC palettes. In 200-line compatibility modes, brown uses
+        // value 0x06 because green's secondary bit is the RGBI intensity bit; in
+        // normal 350/480-line modes it uses the full-EGA brown value 0x14.
+        const EGA_AC_NORMAL: [u8; 16] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
             0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
         ];
-        pc.vga.ac[..16].copy_from_slice(&EGA_AC);
-        pc.vga.ac[0x10] &= !0x80; // mode control: P4/P5 from palette, not colour-select
+        const EGA_AC_200LINE: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+        ];
+        let ac = if matches!(mode, 0x0D | 0x0E) {
+            &EGA_AC_200LINE
+        } else {
+            &EGA_AC_NORMAL
+        };
+        pc.vga.ac[..16].copy_from_slice(ac);
+        pc.vga.ac[0x10] &= !0x80; // P4/P5 from palette, not colour-select
+        pc.vga.ac[0x12] = 0x0F; // colour plane enable: all planes visible
+        pc.vga.ac[0x13] = 0x00; // pixel pan
+        pc.vga.ac[0x14] = 0x00; // colour select high bits
     }
     let currently = planar_active();
     if planar && !currently {
-        arm_planar(machine, regs, None); // fresh mode-set ⇒ zeroed planes
+        arm_planar(machine, &mut pc.vga, None); // fresh mode-set ⇒ zeroed planes
     } else if planar && currently && clear {
         // Re-set the same planar mode: keep the trap, just blank the planes.
-        let zero = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
-        regs.copy_to(VRAM_WINDOW, &zero);
+        pc.vga.planes.fill(0);
     } else if !planar && currently {
-        disarm_planar(machine, regs, false); // leaving planar ⇒ A0000 back to RAM
+        disarm_planar(machine, &pc.vga, regs, false); // leaving planar ⇒ A0000 back to RAM
     }
 }
 
 /// Trapped planar VRAM write: run the Graphics Controller write-mode logic for a
 /// CPU store of `byte` at A0000 offset `off`, fanning it into the 4 planes
-/// (stored at `VRAM_WINDOW`). Used when the single-plane alias can't model the
-/// access — write mode 1 (Mode X latched copy), write modes 2/3, or a
-/// multi-plane EGA write. Latches must have been loaded by a prior `vram_read`.
-pub fn vram_write(regs: &mut Vcpu, vga: &mut VgaState, off: u32, byte: u8) {
+/// (`vga.planes`). Used when the single-plane alias can't model the access —
+/// write mode 1 (Mode X latched copy), write modes 2/3, or a multi-plane EGA
+/// write. Latches must have been loaded by a prior `vram_read`.
+pub fn vram_write(vga: &mut VgaState, off: u32, byte: u8) {
     let off = (off & 0xFFFF) as usize;
-    let mut cur = [0u8; 4];
-    for p in 0..4 {
-        cur[p] = regs.read::<u8>(VRAM_WINDOW + p * 0x10000 + off);
-    }
+    let pl = &vga.planes;
+    let cur = [pl[off], pl[0x10000 + off], pl[0x20000 + off], pl[0x30000 + off]];
     let out = lib::vga_render::planar_write(cur, vga.latches, &vga.gc, vga.seq[2] & 0x0F, byte);
     for p in 0..4 {
         if out[p] != cur[p] {
-            regs.write::<u8>(VRAM_WINDOW + p * 0x10000 + off, out[p]);
+            vga.planes[p * 0x10000 + off] = out[p];
         }
     }
 }
 
 /// Trapped planar VRAM read: load the 4 latches from the planes at A0000 offset
 /// `off` and return the byte the CPU sees (read map select, or color compare).
-pub fn vram_read(regs: &mut Vcpu, vga: &mut VgaState, off: u32) -> u8 {
+pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
     let off = (off & 0xFFFF) as usize;
-    let mut cur = [0u8; 4];
-    for p in 0..4 {
-        cur[p] = regs.read::<u8>(VRAM_WINDOW + p * 0x10000 + off);
-    }
+    let pl = &vga.planes;
+    let cur = [pl[off], pl[0x10000 + off], pl[0x20000 + off], pl[0x30000 + off]];
     let (data, latches) = lib::vga_render::planar_read(cur, &vga.gc);
     vga.latches = latches;
     data
@@ -659,8 +674,8 @@ pub fn vram_read(regs: &mut Vcpu, vga: &mut VgaState, off: u32) -> u8 {
 // ============================================================================
 
 /// Width of the data a string/mov op moves (bytes).
-fn opsize(prefix66: bool, byte_op: bool) -> u32 {
-    if byte_op { 1 } else if prefix66 { 2 } else { 4 }
+fn opsize(op32: bool, byte_op: bool) -> u32 {
+    if byte_op { 1 } else if op32 { 4 } else { 2 }
 }
 
 /// Read/write an integer GP register by encoding `idx` and size `sz` (bytes).
@@ -698,20 +713,85 @@ fn set_gpr(regs: &mut Vcpu, idx: u8, sz: u32, val: u32) {
     }
 }
 
-/// Set the status flags (CF/PF/AF/ZF/SF/OF) for an 8-bit `a - b` subtraction —
-/// the result of a `CMP`/`SUB` — leaving the rest of EFLAGS untouched. The other
-/// arithmetic flags follow the x86 definition; OF is signed overflow.
-fn set_sub_flags8(regs: &mut Vcpu, a: u8, b: u8) {
-    let res = a.wrapping_sub(b);
+/// Write the six status flags (CF/PF/AF/ZF/SF/OF) for an ALU result of width
+/// `sz` bytes, leaving the rest of EFLAGS untouched. CF/AF/OF are supplied by
+/// the caller (they depend on the operation); PF (always the low byte), ZF, and
+/// SF (the operand-width sign bit) derive from the result.
+fn write_flags(regs: &mut Vcpu, res: u32, sz: u32, cf: bool, af: bool, of: bool) {
     const MASK: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+    let msb = 1u32 << (sz * 8 - 1);
     let mut f = regs.frame.rflags & !MASK;
-    if (a as u16) < (b as u16) { f |= 1 << 0; }          // CF: borrow
-    if res.count_ones() & 1 == 0 { f |= 1 << 2; }        // PF: even parity of low byte
-    if (a & 0xF) < (b & 0xF) { f |= 1 << 4; }            // AF: borrow from bit 4
-    if res == 0 { f |= 1 << 6; }                         // ZF
-    if res & 0x80 != 0 { f |= 1 << 7; }                  // SF
-    if (a ^ b) & (a ^ res) & 0x80 != 0 { f |= 1 << 11; } // OF: signed overflow
+    if cf {
+        f |= 1 << 0;
+    } // CF
+    if (res as u8).count_ones() & 1 == 0 {
+        f |= 1 << 2;
+    } // PF: parity of low byte
+    if af {
+        f |= 1 << 4;
+    } // AF
+    if res == 0 {
+        f |= 1 << 6;
+    } // ZF (res already masked)
+    if res & msb != 0 {
+        f |= 1 << 7;
+    } // SF
+    if of {
+        f |= 1 << 11;
+    } // OF
     regs.frame.rflags = f;
+}
+
+/// Compute an ALU op `a OP b` of width `sz` bytes (1/2/4), update EFLAGS, and
+/// return the masked result. `alu` is the 3-bit selector from the primary opcode
+/// group (0=ADD 1=OR 2=ADC 3=SBB 4=AND 5=SUB 6=XOR 7=CMP). Logical ops clear
+/// CF/OF/AF per the x86 spec; the arithmetic ops follow the standard
+/// borrow/overflow definitions. CMP computes a subtraction for flags but the
+/// caller discards the returned value. Inputs/outputs are masked to `sz`.
+fn alu(regs: &mut Vcpu, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
+    let bits = sz * 8;
+    let mask = if sz == 4 {
+        0xFFFF_FFFFu32
+    } else {
+        (1u32 << bits) - 1
+    };
+    let msb = 1u32 << (bits - 1);
+    let (a, b) = (a & mask, b & mask);
+    let cf_in = (regs.frame.rflags & 1) as u32;
+    match alu {
+        0 | 2 => {
+            // ADD / ADC
+            let c = if alu == 2 { cf_in } else { 0 };
+            let sum = a as u64 + b as u64 + c as u64;
+            let res = sum as u32 & mask;
+            let cf = (sum >> bits) & 1 != 0;
+            let af = (a & 0xF) + (b & 0xF) + c > 0xF;
+            let of = (a ^ res) & (b ^ res) & msb != 0;
+            write_flags(regs, res, sz, cf, af, of);
+            res
+        }
+        3 | 5 | 7 => {
+            // SBB / SUB / CMP
+            let c = if alu == 3 { cf_in } else { 0 };
+            let diff = a as i64 - b as i64 - c as i64;
+            let res = diff as u32 & mask;
+            let cf = (a as u64) < b as u64 + c as u64;
+            let af = ((a & 0xF) as i32 - (b & 0xF) as i32 - c as i32) < 0;
+            let of = (a ^ b) & (a ^ res) & msb != 0;
+            write_flags(regs, res, sz, cf, af, of);
+            res
+        }
+        _ => {
+            // OR / AND / XOR — CF=OF=AF=0
+            let res = (match alu {
+                1 => a | b,
+                4 => a & b,
+                _ => a ^ b,
+            }) & mask;
+            write_flags(regs, res, sz, false, false, false);
+            res
+        }
+    }
 }
 
 /// Length of the ModR/M + SIB + displacement that follows the opcode, given the
@@ -747,7 +827,7 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 /// `def32` (default operand & address size) are resolved by the caller, which
 /// has the LDT. Returns false (→ real SEGV) for an instruction we don't model,
 /// so a gap is loud rather than silent corruption.
-pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, def32: bool, off: u32) -> bool {
+pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
     let vm86 = regs.mode() == crate::UserMode::VM86;
     let ip0 = if def32 { regs.ip32() } else { regs.ip32() & 0xFFFF };
     // Pre-read the instruction (max 15 bytes) into a buffer so decoding doesn't
@@ -760,6 +840,15 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
 
     // Prefixes.
     let mut i = 0u32;
+    // Interruptible `rep`: a real CPU services pending interrupts between string
+    // iterations. We emulate the whole `rep` in one kernel call, so cap it at
+    // REP_CHUNK iterations per fault; if CX isn't drained, `not_done` leaves EIP
+    // on the instruction so the guest re-faults to continue — and the event loop
+    // delivers any pending timer IRQ between chunks. Without this a big keen-4
+    // composite `rep movs` runs uninterruptibly, the owed ticks all fire at once
+    // when it returns, and the guest's stack overflows.
+    const REP_CHUNK: u32 = 2048;
+    let mut not_done = false;
     let mut p66 = false;
     let mut p67 = false;
     let mut rep = false;
@@ -783,29 +872,29 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let modrm = peek(i);
             let val = gpr(regs, (modrm >> 3) & 7, 1) as u8;
             i += modrm_len(modrm, addr32, &peek, i);
-            vram_write(regs, vga, off, val);
+            vram_write(vga, off, val);
         }
         // mov r/m16/32, r
         0x89 => {
             let modrm = peek(i);
-            let sz = opsize(p66, false);
+            let sz = opsize(op32, false);
             let val = gpr(regs, (modrm >> 3) & 7, sz);
             i += modrm_len(modrm, addr32, &peek, i);
-            for b in 0..sz { vram_write(regs, vga, off + b, (val >> (b * 8)) as u8); }
+            for b in 0..sz { vram_write(vga, off + b, (val >> (b * 8)) as u8); }
         }
         // mov r8, r/m8 — load
         0x8A => {
             let modrm = peek(i);
-            let v = vram_read(regs, vga, off);
+            let v = vram_read(vga, off);
             set_gpr(regs, (modrm >> 3) & 7, 1, v as u32);
             i += modrm_len(modrm, addr32, &peek, i);
         }
         // mov r16/32, r/m
         0x8B => {
             let modrm = peek(i);
-            let sz = opsize(p66, false);
+            let sz = opsize(op32, false);
             let mut v = 0u32;
-            for b in 0..sz { v |= (vram_read(regs, vga, off + b) as u32) << (b * 8); }
+            for b in 0..sz { v |= (vram_read(vga, off + b) as u32) << (b * 8); }
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
             i += modrm_len(modrm, addr32, &peek, i);
         }
@@ -815,63 +904,110 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let l = modrm_len(modrm, addr32, &peek, i);
             let imm = peek(i + l);
             i += l + 1;
-            vram_write(regs, vga, off, imm);
+            vram_write(vga, off, imm);
         }
         // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
         0xC7 => {
             let modrm = peek(i);
             let l = modrm_len(modrm, addr32, &peek, i);
-            let sz = opsize(p66, false);
+            let sz = opsize(op32, false);
             let mut imm = 0u32;
             for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
             i += l + sz;
-            for b in 0..sz { vram_write(regs, vga, off + b, (imm >> (b * 8)) as u8); }
+            for b in 0..sz { vram_write(vga, off + b, (imm >> (b * 8)) as u8); }
+        }
+        // xchg r/m8, r8 — Keen 4's Galaxy engine does `xchg es:[di], al` to
+        // touch planar VRAM: the read half loads the GC latches, the write half
+        // stores AL through the EGA write path, in one instruction. x86 swap
+        // semantics: reg gets the (GC-processed) read byte, VRAM gets reg's old
+        // value written via `vram_write` (so map mask / write mode / latches all
+        // apply). `vram_read` must run first — it loads the latches the write uses.
+        0x86 => {
+            let modrm = peek(i);
+            let ridx = (modrm >> 3) & 7;
+            let regval = gpr(regs, ridx, 1) as u8;
+            i += modrm_len(modrm, addr32, &peek, i);
+            let memval = vram_read(vga, off);
+            vram_write(vga, off, regval);
+            set_gpr(regs, ridx, 1, memval as u32);
+        }
+        // xchg r/m16/32, r — the word/dword form, byte-by-byte so each byte
+        // loads its latch before the matching write (same as the `mov` group).
+        0x87 => {
+            let modrm = peek(i);
+            let ridx = (modrm >> 3) & 7;
+            let sz = opsize(op32, false);
+            let regval = gpr(regs, ridx, sz);
+            i += modrm_len(modrm, addr32, &peek, i);
+            let mut memval = 0u32;
+            for b in 0..sz {
+                memval |= (vram_read(vga, off + b) as u32) << (b * 8);
+                vram_write(vga, off + b, (regval >> (b * 8)) as u8);
+            }
+            set_gpr(regs, ridx, sz, memval);
         }
         // stos: store (E)AX to ES:DI, count in (E)CX if rep. AL/AX/EAX.
         0xAA | 0xAB => {
-            let sz = opsize(p66, opcode == 0xAA);
-            let count = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }).max(1) } else { 1 };
+            let sz = opsize(op32, opcode == 0xAA);
+            let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
+            let chunk = total.min(REP_CHUNK);
             let al = regs.rax as u32;
             let df = regs.frame.rflags & (1 << 10) != 0;
-            for n in 0..count {
+            for n in 0..chunk {
                 let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
-                for b in 0..sz { vram_write(regs, vga, o + b, (al >> (b * 8)) as u8); }
+                for b in 0..sz { vram_write(vga, o + b, (al >> (b * 8)) as u8); }
             }
-            // Advance DI/CX like the CPU would.
-            let step = count * sz;
+            // Advance DI by the chunk; on `rep`, drop CX by the chunk and, if it
+            // isn't drained, leave EIP on the instruction (`not_done`) to resume.
+            let step = chunk * sz;
             let di = if df { regs.rdi.wrapping_sub(step as u64) } else { regs.rdi.wrapping_add(step as u64) };
             regs.rdi = if addr32 { di } else { (regs.rdi & !0xFFFF) | (di & 0xFFFF) };
-            if rep { regs.rcx = if addr32 { 0 } else { regs.rcx & !0xFFFF }; }
+            if rep {
+                let rem = total - chunk;
+                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
+                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                not_done = rem > 0;
+            }
         }
-        // movs: DS:SI -> ES:DI. The source (DS:SI) is normal RAM for the common
-        // blit-to-VRAM pattern (Epic Pinball); read it directly and write the
-        // destination (ES:DI, in A0000) through the planar logic. Recompute both
-        // ends from the registers rather than trusting `off` — either operand
-        // can be the faulting one.
+        // movs: DS:SI -> ES:DI. Each operand may be normal RAM or the A0000
+        // planar window, resolved per byte below. Recompute both ends from the
+        // registers rather than trusting `off` — either operand can fault.
         //
-        // NOTE: a VRAM→VRAM `rep movs` (EGA latch copy — Keen's Galaxy engine
-        // composes from off-screen VRAM) is NOT routed through the latches here.
-        // Doing so (vram_read on the source) is correct in isolation but lets
-        // Keen run far enough to trip a separate timer-IRQ storm (stack
-        // exhausted, garbage IRET). Until that is fixed it stays a plain read.
-        // The common `mov al,[si]` / `mov [di],al` latch copy already works via
-        // the 0x8A/0x88 handlers. (VM86 only — a PM movs would need the source
-        // segment's LDT base, which isn't plumbed here.)
-        0xA4 | 0xA5 if !def32 => {
-            let sz = opsize(p66, opcode == 0xA4);
-            let count = if rep { gpr(regs, 1, 2).max(1) } else { 1 };
+        // A VRAM *source* (DS:SI in A0000) MUST go through `vram_read`, not a raw
+        // `regs.read`: A0000 is mapped present=0 (the planar trap), so a direct
+        // read page-faults in the kernel (Keen 4's Galaxy engine composites from
+        // off-screen VRAM with `rep movs` and crashed here). `vram_read` also
+        // loads the GC latches, making a VRAM→VRAM `movs` the correct EGA latch
+        // copy. The common `mov al,[si]`/`mov [di],al` latch copy already works
+        // via the 0x8A/0x88 handlers. Source (DS:(E)SI) and dest (ES:(E)DI) bases
+        // are resolved by the caller (shift-by-4 in VM86, LDT in PM) so the same
+        // path serves both: 32-bit-PM `rep movsd` is Doom's Mode-Y plane blit
+        // under CWSDPMI/DOS4GW (broke "no graphics under UEFI" — passthrough hides
+        // it).
+        0xA4 | 0xA5 => {
+            let sz = opsize(op32, opcode == 0xA4);
+            let amask: u32 = if addr32 { 0xFFFF_FFFF } else { 0xFFFF };
+            let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
+            let chunk = total.min(REP_CHUNK);
             let df = regs.frame.rflags & (1 << 10) != 0;
-            let ds_base = (regs.ds as u32) << 4;
-            let es_base = (regs.es as u32) << 4;
-            let mut si = regs.rsi as u32 & 0xFFFF;
-            let mut di = regs.rdi as u32 & 0xFFFF;
-            for _ in 0..count {
+            let mut si = regs.rsi as u32 & amask;
+            let mut di = regs.rdi as u32 & amask;
+            for _ in 0..chunk {
                 for b in 0..sz {
                     let src = ds_base.wrapping_add(si).wrapping_add(b);
                     let dst = es_base.wrapping_add(di).wrapping_add(b);
-                    let byte = regs.read::<u8>(src as usize);
+                    // A VRAM source is the planar trap window (present=0): reading
+                    // it with a raw `regs.read` page-faults in the kernel. Route it
+                    // through `vram_read` — which also loads the GC latches, so a
+                    // VRAM→VRAM `rep movs` (Keen's Galaxy engine composites screens
+                    // from off-screen VRAM) is the correct EGA latch copy.
+                    let byte = if (0xA0000..0xB0000).contains(&src) {
+                        vram_read(vga, src - 0xA0000)
+                    } else {
+                        regs.read::<u8>(src as usize)
+                    };
                     if (0xA0000..0xB0000).contains(&dst) {
-                        vram_write(regs, vga, dst - 0xA0000, byte);
+                        vram_write(vga, dst - 0xA0000, byte);
                     } else {
                         regs.write::<u8>(dst as usize, byte);
                     }
@@ -879,43 +1015,80 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
                 if df { si = si.wrapping_sub(sz); di = di.wrapping_sub(sz); }
                 else  { si = si.wrapping_add(sz); di = di.wrapping_add(sz); }
             }
-            let step = count * sz;
-            let adj = |v: u64| if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) } as u64;
-            regs.rsi = (regs.rsi & !0xFFFF) | (adj(regs.rsi) & 0xFFFF);
-            regs.rdi = (regs.rdi & !0xFFFF) | (adj(regs.rdi) & 0xFFFF);
-            if rep { regs.rcx &= !0xFFFF; }
+            let step = chunk * sz;
+            let adj = |v: u64| {
+                let nv = if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) };
+                if addr32 { nv as u64 } else { (v & !0xFFFF) | (nv as u64 & 0xFFFF) }
+            };
+            regs.rsi = adj(regs.rsi);
+            regs.rdi = adj(regs.rdi);
+            if rep {
+                let rem = total - chunk;
+                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
+                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                not_done = rem > 0;
+            }
         }
-        // cmp r/m8, r8 — read the VRAM byte (loads the latches) and compare it
-        // with r8, setting flags; no write-back. Doom's Mode-X renderer does
-        // `cmp byte [vram], dl` in its masked-write loop. Read map / read mode
-        // are honoured by `vram_read`; the Map Mask only governs writes.
-        0x38 => {
+        // ALU with a VRAM operand: the primary-group r/m forms, all eight groups
+        // ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, in both directions and widths. Opcode
+        // low 3 bits select form: 0 = `OP r/m8,r8`, 1 = `OP r/m,r`,
+        // 2 = `OP r8,r/m8`, 3 = `OP r,r/m`. Even ⇒ byte; the width of the
+        // word/dword forms is `opsize(op32, …)`, so it follows the segment's
+        // default operand size (16-bit VM86 / 32-bit PM) toggled by a 0x66
+        // prefix — exactly like the `mov` arms. The VRAM read goes through
+        // `vram_read` (loads the GC latches; read map / read mode honoured); a
+        // write-back (every group but CMP, when r/m is the dest) goes through
+        // `vram_write` (map mask / write mode / latches). Keen 4's masked-sprite
+        // blit reads the screen with `and ax, es:[di]` (0x23) then merges;
+        // Doom's Mode-X loop does `cmp byte [vram], dl`.
+        op if op < 0x40 && (op & 0x07) < 4 => {
+            let group = (op >> 3) & 7;
+            let reg_is_dst = op & 0x02 != 0; // forms 2/3: reg <- reg OP [vram]
+            let sz = opsize(op32, op & 1 == 0);
             let modrm = peek(i);
-            let reg = gpr(regs, (modrm >> 3) & 7, 1) as u8;
+            let ridx = (modrm >> 3) & 7;
             i += modrm_len(modrm, addr32, &peek, i);
-            let mem = vram_read(regs, vga, off);
-            set_sub_flags8(regs, mem, reg);
-        }
-        // cmp r8, r/m8 — the symmetric form (reg - [vram]).
-        0x3A => {
-            let modrm = peek(i);
-            let reg = gpr(regs, (modrm >> 3) & 7, 1) as u8;
-            i += modrm_len(modrm, addr32, &peek, i);
-            let mem = vram_read(regs, vga, off);
-            set_sub_flags8(regs, reg, mem);
+            let reg = gpr(regs, ridx, sz);
+            let mut mem = 0u32;
+            for b in 0..sz {
+                mem |= (vram_read(vga, off + b) as u32) << (b * 8);
+            }
+            if reg_is_dst {
+                let res = alu(regs, group, reg, mem, sz);
+                if group != 7 {
+                    set_gpr(regs, ridx, sz, res);
+                } // CMP: flags only
+            } else {
+                let res = alu(regs, group, mem, reg, sz);
+                if group != 7 {
+                    // CMP: no write-back
+                    for b in 0..sz {
+                        vram_write(vga, off + b, (res >> (b * 8)) as u8);
+                    }
+                }
+            }
         }
         _ => {
             let _ = (rep, addr32);
+            crate::println!(
+                "  [planar #PF] unhandled opcode {:#04x} off={:#x} ip0={:#x} bytes={:02x?}",
+                opcode,
+                off,
+                ip0,
+                &buf[..]
+            );
             return false;
         }
     }
 
-    // Advance EIP past the emulated instruction.
-    let new_ip = ip0.wrapping_add(i);
+    // Advance EIP past the emulated instruction — unless a `rep` was capped
+    // mid-string (`not_done`), in which case leave EIP on the instruction so the
+    // guest re-executes it (and re-faults) to finish the remaining CX, after the
+    // event loop gets a chance to deliver any pending interrupt.
+    let new_ip = if not_done { ip0 } else { ip0.wrapping_add(i) };
     let cur_ip = regs.ip32();
     if vm86 { regs.set_ip32((cur_ip & !0xFFFF) | (new_ip & 0xFFFF)); }
     else { regs.set_ip32(new_ip); }
-    let _ = op32;
     true
 }
 
@@ -923,140 +1096,117 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
 // Emulated display: render to the platform's present sink
 // ============================================================================
 
-/// Render the emulated VGA's screen and hand it to the platform present sink
-/// (`lib::vga_render::set_present_sink` — the GOP framebuffer on UEFI metal,
-/// the window/screenshot frame mailbox on hosted). Called from the event
-/// loop on PIT-tick cadence; free when a real card displays directly or no
-/// sink is installed.
-///
-/// The mode comes from BDA 0x449 (set by the personality BIOS INT 10h AH=00)
-/// — direct-register mode sets aren't derived yet, and planar/mode-X needs
-/// VRAM trapping; both match the limitations of the interp renderer this
-/// replaces.
-pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, ticks: u32) {
-    use lib::vga_render::{self, Frame, VgaMode};
+/// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
+/// a slice — the one copy linear modes (mode 13h / text) can't avoid, since that
+/// VRAM is guest memory the kernel can't address as a flat region.
+fn read_aperture<'a>(regs: &Vcpu, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
+    buf.clear();
+    buf.resize(len, 0);
+    regs.copy_from(addr, buf);
+    buf
+}
+
+impl VgaState {
+    /// Build the displayed frame from the live registers + VRAM: resolve the
+    /// mode, point at the video memory, and read the display-start / pixel pan /
+    /// line-compare that select the visible window. Planar modes render our own
+    /// `planes` in place (no copy); linear modes copy their guest aperture into
+    /// `scratch`. `None` for a mode the renderer doesn't draw.
+    fn scanout<'a>(&'a self, regs: &Vcpu, scratch: &'a mut alloc::vec::Vec<u8>)
+        -> Option<lib::vga_render::Frame<'a>>
+    {
+        use lib::vga_render::{Frame, VgaMode};
+        let mode = self.classify_mode(regs)?;
+        let (w, h) = lib::vga_render::dimensions(mode);
+        let (vram, planes): (&[u8], &[u8]) = match mode {
+            VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
+            VgaMode::Mode13h => (read_aperture(regs, scratch, 0xA0000, w * h), &[]),
+            VgaMode::Text80x25 => (read_aperture(regs, scratch, 0xB8000, 80 * 25 * 2), &[]),
+            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(regs, scratch, 0xB8000, 0x4000), &[]),
+        };
+        // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
+        // line-compare (split-screen) apply only to the planar families.
+        let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
+        Some(Frame {
+            mode,
+            vram,
+            planes,
+            ac: &self.ac,
+            palette: &self.dac,
+            font: &lib::vga_font_8x16::FONT_8X16,
+            blink: self.ac[0x10] & 0x08 != 0,
+            start_offset: if planar { ((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize } else { 0 },
+            pixel_pan: if planar { (self.ac[0x13] & 0x07) as usize } else { 0 },
+            line_compare: if planar { self.line_compare(h) } else { usize::MAX },
+        })
+    }
+
+    /// Resolve the renderable mode from the live registers. An explicit unchain
+    /// (SEQ chain-4 cleared, tracked by `planar_active`) is the authoritative
+    /// Mode-Y signal `classify` can't see — our BIOS leaves the GC graphics bit
+    /// unprogrammed, so an unchained SEQ reads like the BIOS default; Doom lands
+    /// here and its resolution comes from the CRTC it programmed. Otherwise
+    /// defer to `classify`, honouring the CRTC Offset as the in-memory row
+    /// stride for smooth-scrollers (Keen's wide virtual screen).
+    fn classify_mode(&self, regs: &Vcpu) -> Option<lib::vga_render::VgaMode> {
+        use lib::vga_render::{self, VgaMode};
+        let bda_mode = regs.read::<u8>(0x449);
+        if planar_active() && bda_mode == 0x13 {
+            let row_bytes = if self.crtc[0x13] != 0 { self.crtc[0x13] as u16 * 2 } else { 80 };
+            let v_end = self.crtc[0x12] as u16
+                | (((self.crtc[7] >> 1) & 1) as u16) << 8
+                | (((self.crtc[7] >> 6) & 1) as u16) << 9;
+            let mut h = v_end + 1;
+            if self.crtc[9] & 0x80 != 0 { h /= 2; }
+            // Mode-Y games keep the BIOS mode-13h CRTC our BIOS never wrote
+            // (v-end ~0); fall back to the 320×200 default.
+            if h < 64 || h > 480 { h = 200; }
+            return Some(VgaMode::ModeX { w: row_bytes * 4, h, row_bytes });
+        }
+        let rregs = vga_render::Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };
+        match vga_render::classify(bda_mode, &rregs)? {
+            VgaMode::Planar16 { w, h, row_bytes } => {
+                let stride = if self.crtc[0x13] != 0 { self.crtc[0x13] as u16 * 2 } else { row_bytes };
+                Some(VgaMode::Planar16 { w, h, row_bytes: stride })
+            }
+            m => Some(m),
+        }
+    }
+
+    /// CRTC Line Compare (0x18 + overflow bits 8/9): the scanline where the
+    /// lower split-screen region restarts from address 0 (the locked status
+    /// panel). All-ones ⇒ no split; halved under double-scan to match `h`.
+    fn line_compare(&self, h: usize) -> usize {
+        let lc = self.crtc[0x18] as usize
+            | (((self.crtc[7] >> 4) & 1) as usize) << 8
+            | (((self.crtc[9] >> 6) & 1) as usize) << 9;
+        let lc = if self.crtc[9] & 0x80 != 0 { lc / 2 } else { lc };
+        if lc < h { lc } else { usize::MAX }
+    }
+}
+
+/// VGA refresh throttle: true at most once per ~70 Hz emulated frame, off the
+/// same tick clock the 0x3DA vertical-retrace fabrication reads.
+fn frame_due(now_ticks: u64) -> bool {
+    let frame = (now_ticks.wrapping_mul(70) / 1000) as u32;
+    static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+    LAST.swap(frame, Ordering::Relaxed) != frame
+}
+
+/// Render the emulated VGA's displayed frame to the platform present sink (the
+/// GOP framebuffer on UEFI metal, the window/screenshot mailbox on hosted).
+/// Free when a real card scans out directly or no sink is installed.
+pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, now_ticks: u64) {
+    use lib::vga_render;
     if vga_present() || !vga_render::present_sink_installed() {
         return;
     }
-    // Frame-rate divider: ticks arrive at the PIT rate (1000 Hz kernel
-    // default), and a render per tick saturates the event loop — the UEFI
-    // mock spent 99% CPU rendering and starved guest execution to ~50
-    // port-ins/sec. 50 ticks ≈ 20 fps.
-    static ACCUM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let due = ACCUM.fetch_add(ticks, core::sync::atomic::Ordering::Relaxed) + ticks >= 50;
-    if !due {
+    if !frame_due(now_ticks) {
         return;
     }
-    ACCUM.store(0, core::sync::atomic::Ordering::Relaxed);
-    // Classify from the live VGA registers (Mode X reprograms them while the
-    // BDA byte still reads 0x13); the BDA byte only disambiguates the linear
-    // 256-colour families. `None` = a mode the renderer doesn't draw.
-    let v = &pc.vga;
-    let rregs = vga_render::Regs {
-        crtc: v.crtc,
-        seq: v.seq,
-        gc: v.gc,
-        misc: v.misc_output,
-    };
-    // An explicit unchain (a guest writing the SEQ chain-4 bit, tracked by the
-    // A0000 alias) is the authoritative Mode X signal — `classify` can't see it
-    // because our BIOS leaves the GC graphics bit unprogrammed and an
-    // unprogrammed SEQ reads the same as a deliberate unchain. Doom (Mode Y,
-    // 320×200 unchained) lands here. Resolution comes from the CRTC the game
-    // programmed (offset → row bytes; vertical-display-end → height). Only when
-    // the BDA still reads 256-colour 0x13: the planar trap is ALSO armed for the
-    // EGA 16-colour family (0x0D/0x0E/0x10, Keen), where the BDA names the mode
-    // and `classify` resolves the (different) pixel format correctly.
-    let bda_mode = regs.read::<u8>(0x449);
-    let mode = if planar_active() && bda_mode == 0x13 {
-        let row_bytes = if v.crtc[0x13] != 0 { v.crtc[0x13] as u16 * 2 } else { 80 };
-        let v_end = v.crtc[0x12] as u16
-            | (((v.crtc[7] >> 1) & 1) as u16) << 8
-            | (((v.crtc[7] >> 6) & 1) as u16) << 9;
-        let mut h = v_end + 1;
-        if v.crtc[9] & 0x80 != 0 { h /= 2; }
-        // The CRTC vertical-end is meaningful only if the game (re)programmed
-        // it; Mode Y games (Doom) keep the BIOS mode-13h CRTC our BIOS never
-        // wrote, leaving it ~0. Fall back to the 320×200 Mode Y default.
-        if h < 64 || h > 480 { h = 200; }
-        VgaMode::ModeX { w: row_bytes * 4, h, row_bytes }
-    } else {
-        match vga_render::classify(bda_mode, &rregs) {
-            // The visible width is the BIOS mode's (classify_bda gives 320/640),
-            // but the in-memory ROW STRIDE is the CRTC Offset register (0x13,
-            // counted in words). A smooth-scroller (Commander Keen) sets a
-            // virtual screen far wider than the 320-px display and pans a window
-            // across it; rendering at the mode's nominal 40-byte stride shears
-            // the image into stripes. Honour the programmed offset when the
-            // guest set one (a plain non-scrolling EGA program leaves it 0).
-            Some(VgaMode::Planar16 { w, h, row_bytes }) => {
-                let stride = if v.crtc[0x13] != 0 { v.crtc[0x13] as u16 * 2 } else { row_bytes };
-                VgaMode::Planar16 { w, h, row_bytes: stride }
-            }
-            Some(m) => m,
-            None => return,
-        }
-    };
-    let (w, h) = vga_render::dimensions(mode);
-    // Linear modes read a guest memory window; planar modes read the VGA plane
-    // model (filled by the VRAM-trap write path — empty until a guest draws).
-    let linear = match mode {
-        VgaMode::Mode13h => Some((0xA0000usize, w * h)),
-        VgaMode::Text80x25 => Some((0xB8000usize, 80 * 25 * 2)),
-        VgaMode::Cga4 | VgaMode::Cga2 => Some((0xB8000usize, 0x4000)),
-        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => None,
-    };
-    let mut vram = alloc::vec![0u8; 0];
-    if let Some((base, len)) = linear {
-        vram = alloc::vec![0u8; len];
-        regs.copy_from(base, &mut vram);
-    }
-    // Planar/Mode-X read all 4 planes from the kernel-private VRAM window (the
-    // guest filled them through the A0000 plane alias); empty otherwise.
-    let mut planes = alloc::vec![0u8; 0];
-    if matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) && VRAM_BASE.load(Ordering::Relaxed) != 0 {
-        planes = alloc::vec![0u8; NUM_PLANE_FRAMES * 4096];
-        regs.copy_from(VRAM_WINDOW, &mut planes);
-    }
-    // Display Start Address (CRTC 0x0C high, 0x0D low) selects the planar
-    // front buffer for page-flipping games; only meaningful in planar modes.
-    let start_offset = match mode {
-        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } =>
-            ((pc.vga.crtc[0x0C] as usize) << 8) | pc.vga.crtc[0x0D] as usize,
-        _ => 0,
-    };
-    // Horizontal Pixel Panning (AC 0x13, bits 0-3): the fine sub-byte shift for
-    // smooth scrolling, paired with the coarse start address above.
-    let pixel_pan = match mode {
-        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (pc.vga.ac[0x13] & 0x07) as usize,
-        _ => 0,
-    };
-    // CRTC Line Compare (0x18 + overflow bit 8 in 0x07.4, bit 9 in 0x09.6): the
-    // scanline where the lower split-screen region begins (status panel locked
-    // to display address 0). All-ones ⇒ no split. Halve under double-scan so it
-    // lands in the same row space as `h`. Planar modes only.
-    let line_compare = match mode {
-        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => {
-            let lc = v.crtc[0x18] as usize
-                | (((v.crtc[7] >> 4) & 1) as usize) << 8
-                | (((v.crtc[9] >> 6) & 1) as usize) << 9;
-            let lc = if v.crtc[9] & 0x80 != 0 { lc / 2 } else { lc };
-            if lc < h { lc } else { usize::MAX }
-        }
-        _ => usize::MAX,
-    };
-    let frame = Frame {
-        mode,
-        vram: &vram,
-        planes: &planes,
-        ac: &pc.vga.ac,
-        palette: &pc.vga.dac,
-        font: &lib::vga_font_8x16::FONT_8X16,
-        blink: pc.vga.ac[0x10] & 0x08 != 0,
-        start_offset,
-        pixel_pan,
-        line_compare,
-    };
+    let mut scratch = alloc::vec::Vec::new();
+    let Some(frame) = pc.vga.scanout(regs, &mut scratch) else { return };
+    let (w, h) = vga_render::dimensions(frame.mode);
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);
     vga_render::present(w, h, &fb);

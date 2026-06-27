@@ -200,10 +200,20 @@ pub fn init(info: &arch::MultibootInfo) {
         return;
     }
 
-    // Map the framebuffer (cache-disabled MMIO) into the FB window. The
-    // physical address may sit above 4GB (OVMF does this with the NVMe BAR) —
+    // Map the framebuffer into the FB window. A linear framebuffer wants
+    // Write-Combining: blits are sequential streaming writes, and WC bursts them
+    // into a few bus transactions instead of one-per-pixel. Strong-UC (PCD) makes
+    // a full-frame blit cost tens of milliseconds (~70 ns/pixel), which starves
+    // the DOS event loop; WC drops that to well under a millisecond. Fall back to
+    // CACHE_DISABLE if the CPU has no PAT (no WC slot to point the PAT bit at).
+    // The physical address may sit above 4GB (OVMF does this with the NVMe BAR) —
     // PAE/compat PTEs carry 64-bit phys, so keep it u64 end to end. (Legacy
     // 32-bit paging couldn't, but a pre-PAE CPU has no UEFI/GOP to boot from.)
+    let fb_cache_flag = if paging2::wc_pat_enabled() {
+        paging2::flags::WRITE_COMBINE
+    } else {
+        paging2::flags::CACHE_DISABLE
+    };
     let fb_bytes = pitch * height;
     let page_off = (addr & (PAGE_SIZE as u64 - 1)) as usize;
     let pages = (page_off + fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -216,7 +226,7 @@ pub fn init(info: &arch::MultibootInfo) {
         paging2::map_user_page_phys(
             paging2::FB_WINDOW_BASE / PAGE_SIZE + i,
             ppage + i as u64,
-            paging2::flags::CACHE_DISABLE,
+            fb_cache_flag,
         );
     }
 
@@ -281,24 +291,30 @@ pub fn init(info: &arch::MultibootInfo) {
 static DOS_PAINTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+
 fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     let Some(g) = geom() else { return };
     if w == 0 || h == 0 || px.len() < w * h {
         return;
     }
-    static mut PREV: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
-    let prev = unsafe { &mut *(&raw mut PREV) };
-    if prev.len() == w * h && prev[..] == px[..w * h] {
-        return;
-    }
-    prev.clear();
-    prev.extend_from_slice(&px[..w * h]);
     let fb_w = g.stride; // pixels per row (pitch); visible width <= stride
     let fb_h = g.len / g.stride;
     let k = (fb_w / w).min(fb_h / h).max(1);
     let (out_w, out_h) = ((w * k).min(fb_w), (h * k).min(fb_h));
     let origin = (fb_h - out_h) / 2 * g.stride + (fb_w - out_w) / 2;
     let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+    // On a resolution change (a mode switch — e.g. text 720×400 → Mode-Y
+    // 320×200), the centered image and its letterbox border move, so clear the
+    // whole framebuffer once to drop stale pixels from the previous mode. This
+    // is render bookkeeping, not a frame cache: every frame is blitted (no
+    // content-compare skip — that silently froze the screen when the cached
+    // frame went stale against another writer).
+    static mut LAST_DIMS: (usize, usize) = (0, 0);
+    let last = unsafe { &mut *(&raw mut LAST_DIMS) };
+    if *last != (w, h) {
+        *last = (w, h);
+        out.fill(0);
+    }
     for y in 0..out_h {
         let src_row = &px[(y / k) * w..(y / k) * w + w];
         let dst = &mut out[origin + y * g.stride..origin + y * g.stride + out_w];
@@ -307,6 +323,14 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
             *d = if g.format.is_native() { rgb } else { g.format.encode(rgb) };
         }
     }
+    // The framebuffer is Write-Combining: its stores sit in the CPU's WC buffers
+    // until something drains them. A display controller scanning out (real metal)
+    // — or QEMU's display refresh / KVM dirty tracking — reads framebuffer memory,
+    // so an undrained WC buffer leaves the just-blitted frame invisible until the
+    // next frame happens to evict it (the live window looks frozen even though the
+    // guest is running). SFENCE drains the WC buffers so each present is globally
+    // visible immediately.
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)); }
     DOS_PAINTED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
