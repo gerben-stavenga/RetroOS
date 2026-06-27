@@ -665,7 +665,7 @@ fn vbe(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu)
             regs.rbx = (regs.rbx & !0xFFFF) | cur as u64;
             done(regs, true);
         }
-        0x05 => { vbe_window(dos, regs); done(regs, true); }
+        0x05 => { vbe_window(machine, dos, regs); done(regs, true); }
         _ => done(regs, false),
     }
 }
@@ -754,9 +754,9 @@ fn vbe_set_mode(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &
 }
 
 /// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
-fn vbe_window(dos: &mut super::DosState, regs: &mut Vcpu) {
+fn vbe_window(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) {
     if (regs.rbx >> 8) as u8 == 0 {
-        super::machine::vga::svga_set_bank(&mut dos.pc, regs, regs.rdx as u16);
+        super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
         regs.rdx = (regs.rdx & !0xFFFF) | dos.pc.vga.svga_bank as u64;
     }

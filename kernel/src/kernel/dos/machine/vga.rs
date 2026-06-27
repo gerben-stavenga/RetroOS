@@ -94,15 +94,14 @@ pub struct VgaState {
     pub latches: [u8; 4],
     // ── VESA SVGA (banked) ──
     /// Active VBE mode geometry; `svga_w == 0` ⇒ not in an SVGA mode. The
-    /// framebuffer lives in `svga_fb` (kernel-side, not guest VRAM); the guest
-    /// reaches it through the banked 0xA0000 window, flushed in/out per `4F05`.
+    /// framebuffer is a guest-mapped region at `SVGA_LFB_BASE`; the 0xA0000
+    /// window is *aliased* onto its current bank (shared frames), so guest
+    /// writes land directly in it — no copy, always coherent.
     pub svga_w: u16,
     pub svga_h: u16,
     pub svga_bpp: u8,
-    /// Current window-A bank (64 KB granule) the 0xA0000 window maps.
+    /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
     pub svga_bank: u16,
-    /// The full linear SVGA framebuffer (`pitch*h` bytes), presented directly.
-    pub svga_fb: alloc::vec::Vec<u8>,
 }
 
 impl VgaState {
@@ -144,7 +143,6 @@ impl VgaState {
             svga_h: 0,
             svga_bpp: 0,
             svga_bank: 0,
-            svga_fb: alloc::vec::Vec::new(),
         }
     }
 
@@ -576,69 +574,66 @@ fn disarm_planar(machine: &mut crate::TheArch, vga: &VgaState, regs: &mut Vcpu, 
 }
 
 // ============================================================================
-// VESA SVGA (banked). A real-mode guest reaches the multi-MB framebuffer only
-// through the 64 KB window at 0xA0000, switching banks via VBE 4F05h. We keep
-// the whole framebuffer kernel-side (`vga.svga_fb`) and use 0xA0000 as plain
-// RAM staging: a bank switch flushes the live window to its bank and loads the
-// requested one. (Aliasing the window onto the framebuffer via
-// `copy_page_entries` is also viable now that it releases the clobbered entry,
-// but the kernel-side buffer keeps the lifecycle simple and avoids a
-// guest-mapped LFB region.)
+// VESA SVGA. The framebuffer is a guest user-RAM region at SVGA_LFB_BASE. A
+// real-mode guest reaches one 64 KB bank at a time through the 0xA0000 window,
+// which we *alias* onto the bank (shared frames via copy_page_entries) — guest
+// writes land directly in the framebuffer, always coherent, no copy. A
+// protected-mode (DPMI) client can map the same region as a linear framebuffer
+// and write it directly. `display_tick` presents by reading the region.
 // ============================================================================
 
-/// Bytes in one 64 KB VBE window granule.
-const SVGA_WINDOW: usize = 0x10000;
+/// Guest-linear base of the SVGA framebuffer (well above the XMS region at
+/// 0x120000..0x500000). Sized per mode, rounded up to whole 64 KB banks.
+const SVGA_LFB_BASE: usize = 0x1000000; // 16 MB
+const SVGA_WINDOW: usize = 0x10000; // 64 KB VBE bank granule
+const WINDOW_PAGES: usize = SVGA_WINDOW >> 12;
 
-/// Enter a banked SVGA mode: allocate the framebuffer and give 0xA0000 a clean
-/// 64 KB RAM staging window. Called from INT 10h AX=4F02h.
+/// Whole 64 KB banks a `w`×`h`×`bpp` framebuffer needs.
+fn svga_banks(w: u16, h: u16, bpp: u8) -> usize {
+    let bytes = w as usize * h as usize * ((bpp as usize + 7) / 8);
+    bytes.div_ceil(SVGA_WINDOW)
+}
+
+/// Enter a banked SVGA mode (INT 10h AX=4F02h): back the framebuffer with fresh
+/// user RAM and alias the 0xA0000 window onto bank 0.
 pub fn svga_set_mode(machine: &mut crate::TheArch, pc: &mut PcMachine, w: u16, h: u16, bpp: u8) {
-    let bpp8 = (bpp as usize + 7) / 8;
-    pc.vga.svga_fb = alloc::vec![0u8; w as usize * h as usize * bpp8];
+    let pages = svga_banks(w, h, bpp) * WINDOW_PAGES;
+    machine.map_fresh_range(SVGA_LFB_BASE >> 12, pages);
+    machine.copy_page_entries(SVGA_LFB_BASE >> 12, A0000 >> 12, WINDOW_PAGES);
     pc.vga.svga_w = w;
     pc.vga.svga_h = h;
     pc.vga.svga_bpp = bpp;
     pc.vga.svga_bank = 0;
-    // Plain RAM staging window; also clears any stale planar trap marker (a VBE
-    // set-mode bypasses on_set_mode, so Mode-X state could otherwise linger).
-    machine.map_fresh_range(A0000 >> 12, SVGA_WINDOW >> 12);
+    // A VBE set-mode bypasses on_set_mode, so clear any stale planar marker.
     A0000_TARGET.store(0xFF, Ordering::Relaxed);
 }
 
-/// Copy the live 0xA0000 window into the current bank of `svga_fb`.
-pub fn svga_flush_window(pc: &mut PcMachine, regs: &Vcpu) {
+/// VBE 4F05h window control: alias the 0xA0000 window onto `bank` of the
+/// framebuffer. No copy — the window simply shares the bank's frames.
+pub fn svga_set_bank(machine: &mut crate::TheArch, pc: &mut PcMachine, bank: u16) {
     if pc.vga.svga_w == 0 {
         return;
     }
-    let start = pc.vga.svga_bank as usize * SVGA_WINDOW;
-    let n = SVGA_WINDOW.min(pc.vga.svga_fb.len().saturating_sub(start));
-    if n > 0 {
-        regs.copy_from(A0000, &mut pc.vga.svga_fb[start..start + n]);
-    }
-}
-
-/// VBE 4F05h window control: flush the current window to its bank, then page the
-/// requested bank's bytes into the window (so guest read-backs see them).
-pub fn svga_set_bank(pc: &mut PcMachine, regs: &mut Vcpu, bank: u16) {
-    if pc.vga.svga_w == 0 {
-        return;
-    }
-    svga_flush_window(pc, regs);
+    let src = (SVGA_LFB_BASE >> 12) + bank as usize * WINDOW_PAGES;
+    machine.copy_page_entries(src, A0000 >> 12, WINDOW_PAGES);
     pc.vga.svga_bank = bank;
-    let start = bank as usize * SVGA_WINDOW;
-    let n = SVGA_WINDOW.min(pc.vga.svga_fb.len().saturating_sub(start));
-    if n > 0 {
-        regs.copy_to(A0000, &pc.vga.svga_fb[start..start + n]);
-    }
 }
 
-/// Leave SVGA back to a standard VGA mode: drop the framebuffer. The caller's
-/// mode-set re-backs 0xA0000 (text/graphics) as usual.
-pub fn svga_leave(pc: &mut PcMachine) {
+/// Leave SVGA for a standard VGA mode: detach the window alias and free the
+/// framebuffer region.
+pub fn svga_leave(machine: &mut crate::TheArch, pc: &mut PcMachine) {
+    if pc.vga.svga_w == 0 {
+        return;
+    }
+    let pages = svga_banks(pc.vga.svga_w, pc.vga.svga_h, pc.vga.svga_bpp) * WINDOW_PAGES;
+    // Detach the window alias (drops its shared ref on the current bank), then
+    // free the framebuffer region.
+    machine.map_fresh_range(A0000 >> 12, WINDOW_PAGES);
+    machine.free_range(SVGA_LFB_BASE >> 12, pages);
     pc.vga.svga_w = 0;
     pc.vga.svga_h = 0;
     pc.vga.svga_bpp = 0;
     pc.vga.svga_bank = 0;
-    pc.vga.svga_fb = alloc::vec::Vec::new();
 }
 
 /// React to a BIOS INT 10h AH=00 video mode set. The EGA/VGA 16-colour planar
@@ -659,7 +654,7 @@ pub fn on_set_mode(
         return; // a real card draws its own planes
     }
     // A standard mode-set leaves any active VESA SVGA mode.
-    svga_leave(pc);
+    svga_leave(machine, pc);
     // The IBM BIOS programs CRTC line-compare to its no-split default (0x3FF) on
     // every mode set; our BIOS leaves the CRTC untouched. Without this a program
     // that page-flips but never writes 0x18 (Doom relies on the BIOS default)
@@ -1206,11 +1201,12 @@ impl VgaState {
         if self.svga_w != 0 {
             let bpp8 = (self.svga_bpp as usize + 7) / 8;
             let pitch = self.svga_w as usize * bpp8;
+            let size = pitch * self.svga_h as usize;
             return Some(Frame {
                 mode: VgaMode::LinearSvga {
                     w: self.svga_w, h: self.svga_h, bpp: self.svga_bpp, pitch: pitch as u16,
                 },
-                vram: &self.svga_fb,
+                vram: read_aperture(regs, scratch, SVGA_LFB_BASE, size),
                 planes: &[],
                 ac: &self.ac,
                 palette: &self.dac,
@@ -1317,10 +1313,6 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, now_ticks: u64) {
     }
     if !frame_due(now_ticks) {
         return;
-    }
-    // SVGA: capture the live 0xA0000 window into the framebuffer before present.
-    if pc.vga.svga_w != 0 {
-        svga_flush_window(pc, regs);
     }
     let mut scratch = alloc::vec::Vec::new();
     let Some(frame) = pc.vga.scanout(regs, &mut scratch) else { return };
