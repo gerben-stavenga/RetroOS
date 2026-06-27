@@ -299,8 +299,20 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     }
     let fb_w = g.stride; // pixels per row (pitch); visible width <= stride
     let fb_h = g.len / g.stride;
-    let k = (fb_w / w).min(fb_h / h).max(1);
-    let (out_w, out_h) = ((w * k).min(fb_w), (h * k).min(fb_h));
+    // DOS modes are all authored for a 4:3 display with non-square pixels, so
+    // present into the largest 4:3 rectangle that fits the panel and scale the
+    // source into it with independent X/Y factors. Integer square-pixel scaling
+    // would show each mode at its raw pixel-grid aspect — 320×200 too wide,
+    // 360×400 too tall; this gives 320×200 elongated (tall) pixels and 360×400
+    // wide pixels, matching a real VGA monitor.
+    let (out_w, out_h) = if fb_w * 3 >= fb_h * 4 {
+        ((fb_h * 4 / 3).min(fb_w), fb_h) // panel wider than 4:3 → pillarbox
+    } else {
+        (fb_w, (fb_w * 3 / 4).min(fb_h)) // taller than 4:3 → letterbox
+    };
+    if out_w == 0 || out_h == 0 {
+        return;
+    }
     let origin = (fb_h - out_h) / 2 * g.stride + (fb_w - out_w) / 2;
     let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
     // On a resolution change (a mode switch — e.g. text 720×400 → Mode-Y
@@ -315,13 +327,23 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         *last = (w, h);
         out.fill(0);
     }
-    for y in 0..out_h {
-        let src_row = &px[(y / k) * w..(y / k) * w + w];
-        let dst = &mut out[origin + y * g.stride..origin + y * g.stride + out_w];
-        for (x, d) in dst.iter_mut().enumerate() {
-            let rgb = src_row[x / k];
-            *d = if g.format.is_native() { rgb } else { g.format.encode(rgb) };
+    // Fixed-point (16.16) nearest-neighbour: step the source position by
+    // `src/out` per output pixel — no per-pixel divide, and handles the
+    // fractional (non-integer) scale the 4:3 fit requires.
+    let x_step = ((w as u64) << 16) / out_w as u64;
+    let y_step = ((h as u64) << 16) / out_h as u64;
+    let native = g.format.is_native();
+    let mut sy = 0u64;
+    for oy in 0..out_h {
+        let src_row = &px[((sy >> 16) as usize).min(h - 1) * w..][..w];
+        let dst = &mut out[origin + oy * g.stride..origin + oy * g.stride + out_w];
+        let mut sx = 0u64;
+        for d in dst.iter_mut() {
+            let rgb = src_row[((sx >> 16) as usize).min(w - 1)];
+            *d = if native { rgb } else { g.format.encode(rgb) };
+            sx += x_step;
         }
+        sy += y_step;
     }
     // The framebuffer is Write-Combining: its stores sit in the CPU's WC buffers
     // until something drains them. A display controller scanning out (real metal)
