@@ -329,17 +329,22 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     }
     // Fixed-point (16.16) nearest-neighbour: step the source position by
     // `src/out` per output pixel — no per-pixel divide, and handles the
-    // fractional (non-integer) scale the 4:3 fit requires.
+    // fractional (non-integer) scale the 4:3 fit requires. This blit runs at the
+    // present rate on the guest thread (its cost is stolen guest time), so the
+    // inner loop is kept tight: the format check is hoisted, and indices are
+    // provably in range (`sx>>16 < w`, `sy>>16 < h`, dst within `g.len`), so the
+    // bounds checks are elided with unchecked access.
     let x_step = ((w as u64) << 16) / out_w as u64;
     let y_step = ((h as u64) << 16) / out_h as u64;
     let native = g.format.is_native();
     let mut sy = 0u64;
     for oy in 0..out_h {
-        let src_row = &px[((sy >> 16) as usize).min(h - 1) * w..][..w];
-        let dst = &mut out[origin + oy * g.stride..origin + oy * g.stride + out_w];
+        let src_row = unsafe { px.get_unchecked((sy >> 16) as usize * w..(sy >> 16) as usize * w + w) };
+        let drow = origin + oy * g.stride;
+        let dst = unsafe { out.get_unchecked_mut(drow..drow + out_w) };
         let mut sx = 0u64;
         for d in dst.iter_mut() {
-            let rgb = src_row[((sx >> 16) as usize).min(w - 1)];
+            let rgb = unsafe { *src_row.get_unchecked((sx >> 16) as usize) };
             *d = if native { rgb } else { g.format.encode(rgb) };
             sx += x_step;
         }
