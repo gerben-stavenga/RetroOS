@@ -505,11 +505,28 @@ pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
     (w, h)
 }
 
-/// Mode 13h: one palette index per pixel, linear at the start of vram.
+/// Mode 13h: one palette index per pixel, linear in vram. Honours the CRTC
+/// display-start address and AC pixel-pan that slide the visible window —
+/// screen-shake / centring effects (OMF 2097) draw into a fixed buffer and pan
+/// the scanout origin rather than re-blitting. `start_offset`/`pixel_pan` are
+/// pre-scaled to linear pixel units by the caller. Line Compare splits the
+/// lower region back to address 0 with panning suppressed, like the planar
+/// modes. Row stride is the visible width (320); a uniform horizontal shift,
+/// not a per-row shear, is what the offset produces.
 fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
-    let n = (w * h).min(frame.vram.len()).min(out.len());
-    for i in 0..n {
-        out[i] = pal_rgb(frame.palette, frame.vram[i]);
+    let vram = frame.vram;
+    for y in 0..h {
+        let split = y >= frame.line_compare;
+        let (start, pan, ry) = if split {
+            (0, 0, y - frame.line_compare)
+        } else {
+            (frame.start_offset, frame.pixel_pan & 7, y)
+        };
+        let base = start + ry * w + pan;
+        let row = &mut out[y * w..y * w + w];
+        for x in 0..w {
+            row[x] = pal_rgb(frame.palette, vram.get(base + x).copied().unwrap_or(0));
+        }
     }
 }
 
@@ -964,5 +981,29 @@ mod tests {
         // Displayed px0 = source px2 = plane2 = 0x30.
         assert_eq!(out[0], pal_rgb(&pal, 0x30));
         assert_eq!(out[1], pal_rgb(&pal, 0x40)); // source px3 = plane3
+    }
+
+    #[test]
+    fn mode13h_pan_slides_window() {
+        // Linear Mode 13h with a display-start + pixel-pan offset (screen-shake):
+        // displayed pixel x reads vram[start + pan + x], a uniform shift. With a
+        // 320-wide row, start=320 lands on the second scanline's data.
+        let mut vram = vec![0u8; 0x10000];
+        for i in 0..vram.len() { vram[i] = (i & 0xFF) as u8; }
+        let ac = [0u8; 21];
+        let pal = fallback_palette();
+        let frame = Frame {
+            mode: VgaMode::Mode13h,
+            vram: &vram, planes: &[], ac: &ac, palette: &pal,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+            start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
+        };
+        let mut out = vec![0u32; 320 * 200];
+        render(&frame, &mut out);
+        // Row 0, displayed px0 = vram[320 + 3 + 0]; px1 = vram[324]; ...
+        assert_eq!(out[0], pal_rgb(&pal, vram[323]));
+        assert_eq!(out[5], pal_rgb(&pal, vram[328]));
+        // Row 1, displayed px0 = vram[start + 1*320 + pan] = vram[643].
+        assert_eq!(out[320], pal_rgb(&pal, vram[643]));
     }
 }

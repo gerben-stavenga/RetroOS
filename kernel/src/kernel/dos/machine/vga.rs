@@ -1120,13 +1120,21 @@ impl VgaState {
         let (w, h) = lib::vga_render::dimensions(mode);
         let (vram, planes): (&[u8], &[u8]) = match mode {
             VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
-            VgaMode::Mode13h => (read_aperture(regs, scratch, 0xA0000, w * h), &[]),
+            // Read the whole 64 KB window, not just w*h: a panned display-start
+            // (screen-shake) slides the scanout origin forward, so the visible
+            // window can reach past the nominal 320×200 = 64000 bytes.
+            VgaMode::Mode13h => (read_aperture(regs, scratch, 0xA0000, 0x10000), &[]),
             VgaMode::Text80x25 => (read_aperture(regs, scratch, 0xB8000, 80 * 25 * 2), &[]),
             VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(regs, scratch, 0xB8000, 0x4000), &[]),
         };
         // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
-        // line-compare (split-screen) apply only to the planar families.
+        // line-compare (split-screen) apply to the planar families and to linear
+        // Mode 13h. The display-start latch is in word units for the planar
+        // modes (per-plane byte offset) but the address counter runs in
+        // doubleword mode under 13h, so each latch step is 4 linear pixels.
         let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
+        let mode13 = matches!(mode, VgaMode::Mode13h);
+        let start_latch = ((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize;
         Some(Frame {
             mode,
             vram,
@@ -1135,9 +1143,9 @@ impl VgaState {
             palette: &self.dac,
             font: &lib::vga_font_8x16::FONT_8X16,
             blink: self.ac[0x10] & 0x08 != 0,
-            start_offset: if planar { ((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize } else { 0 },
-            pixel_pan: if planar { (self.ac[0x13] & 0x07) as usize } else { 0 },
-            line_compare: if planar { self.line_compare(h) } else { usize::MAX },
+            start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },
+            pixel_pan: if planar || mode13 { (self.ac[0x13] & 0x07) as usize } else { 0 },
+            line_compare: if planar || mode13 { self.line_compare(h) } else { usize::MAX },
         })
     }
 
