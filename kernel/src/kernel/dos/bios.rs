@@ -666,7 +666,54 @@ fn vbe(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu)
             done(regs, true);
         }
         0x05 => { vbe_window(machine, dos, regs); done(regs, true); }
+        0x08 => { vbe_dac_format(regs); done(regs, true); }
+        0x09 => { let ok = vbe_palette(machine, dos, regs); done(regs, ok); }
         _ => done(regs, false),
+    }
+}
+
+/// VBE 4F08h — Set/Get DAC palette format. We model only the 6-bit VGA DAC, so
+/// report BH=6 for both set and get (a client asking for 8-bit falls back).
+fn vbe_dac_format(regs: &mut Vcpu) {
+    regs.rbx = (regs.rbx & !0xFF00) | (6 << 8);
+}
+
+/// VBE 4F09h — Set/Get Palette Data. CX entries from index DX at ES:DI, each 4
+/// bytes (Blue, Green, Red, align), 6-bit components. Routed through the DAC
+/// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
+fn vbe_palette(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) -> bool {
+    let count = regs.rcx as u16 as usize;
+    let start = regs.rdx as u8;
+    let tbl = es_di(regs);
+    match regs.rbx as u8 {
+        0x00 | 0x80 => {
+            // Set (00h) / set-during-retrace (80h): we apply immediately.
+            emulate_outb(machine, &mut dos.pc, regs, 0x3C8, start);
+            for i in 0..count {
+                let e = tbl + i * 4;
+                let (b, g, r): (u8, u8, u8) = (regs.read(e), regs.read(e + 1), regs.read(e + 2));
+                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, r);
+                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, g);
+                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, b);
+            }
+            true
+        }
+        0x01 => {
+            // Get: read the DAC back into the caller's table.
+            emulate_outb(machine, &mut dos.pc, regs, 0x3C7, start);
+            for i in 0..count {
+                let r = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                let g = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                let b = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                let e = tbl + i * 4;
+                regs.write::<u8>(e, b);
+                regs.write::<u8>(e + 1, g);
+                regs.write::<u8>(e + 2, r);
+                regs.write::<u8>(e + 3, 0);
+            }
+            true
+        }
+        _ => false, // 02h secondary palette: unsupported
     }
 }
 
