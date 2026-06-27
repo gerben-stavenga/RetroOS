@@ -626,7 +626,139 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
                 regs.rbx = (regs.rbx & !0xFFFF) | 0x0008; // VGA, colour analog
             }
         }
+        0x4F => vbe(machine, dos, regs),
         _ => {}
+    }
+}
+
+// ============================================================================
+// VESA VBE (INT 10h AH=4Fh)
+// ============================================================================
+
+/// The banked SVGA modes we expose: (VBE mode#, width, height, bpp). Presented
+/// through the emulated framebuffer sink, integer-scaled/centred to the panel.
+/// 8bpp goes through the DAC palette; 15/16/32 are direct colour. Substitute
+/// path only — the native/SeaBIOS path has the card's own VBE.
+const VBE_MODES: &[(u16, u16, u16, u8)] = &[
+    (0x101, 640, 480, 8),
+    (0x103, 800, 600, 8),
+    (0x110, 640, 480, 15),
+    (0x111, 640, 480, 16),
+    (0x112, 640, 480, 32),
+];
+
+fn vbe(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) {
+    // Every VBE call returns AL=4Fh ("supported"); AH=00h success, 01h failed.
+    let al = regs.rax as u8;
+    let done = |regs: &mut Vcpu, ok: bool| {
+        regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
+    };
+    match al {
+        0x00 => { vbe_controller_info(regs); done(regs, true); }
+        0x01 => { let ok = vbe_mode_info(regs); done(regs, ok); }
+        0x02 => { let ok = vbe_set_mode(machine, dos, regs); done(regs, ok); }
+        0x03 => {
+            let cur = VBE_MODES.iter()
+                .find(|&&(_, w, h, b)| w == dos.pc.vga.svga_w && h == dos.pc.vga.svga_h && b == dos.pc.vga.svga_bpp)
+                .map(|&(n, ..)| n)
+                .unwrap_or(0);
+            regs.rbx = (regs.rbx & !0xFFFF) | cur as u64;
+            done(regs, true);
+        }
+        0x05 => { vbe_window(dos, regs); done(regs, true); }
+        _ => done(regs, false),
+    }
+}
+
+/// Linear address of the caller's ES:DI block (real-mode VBE buffers).
+fn es_di(regs: &Vcpu) -> usize {
+    ((regs.es as usize & 0xFFFF) << 4) + (regs.rdi as usize & 0xFFFF)
+}
+
+/// VBE 4F00h — controller info into ES:DI, with the mode list placed in the
+/// block's reserved area and pointed at by VideoModePtr.
+fn vbe_controller_info(regs: &mut Vcpu) {
+    let lin = es_di(regs);
+    for i in (0..256).step_by(4) {
+        regs.write::<u32>(lin + i, 0);
+    }
+    regs.write::<u8>(lin, b'V');
+    regs.write::<u8>(lin + 1, b'E');
+    regs.write::<u8>(lin + 2, b'S');
+    regs.write::<u8>(lin + 3, b'A');
+    regs.write::<u16>(lin + 0x04, 0x0200); // VBE 2.0
+    // VideoModePtr (0x0E) → mode list at ES:(DI+0x20), in the reserved area.
+    let list_off = (regs.rdi as u16).wrapping_add(0x20);
+    regs.write::<u32>(lin + 0x0E, ((regs.es as u32 & 0xFFFF) << 16) | list_off as u32);
+    regs.write::<u16>(lin + 0x12, 0x80); // total memory: 0x80 × 64 KB = 8 MB
+    let mut p = lin + 0x20;
+    for &(num, ..) in VBE_MODES {
+        regs.write::<u16>(p, num);
+        p += 2;
+    }
+    regs.write::<u16>(p, 0xFFFF); // list terminator
+}
+
+/// VBE 4F01h — mode info for CX into ES:DI. Returns false for an unknown mode.
+fn vbe_mode_info(regs: &mut Vcpu) -> bool {
+    let want = regs.rcx as u16 & 0x1FF;
+    let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
+        return false;
+    };
+    let lin = es_di(regs);
+    for i in (0..256).step_by(4) {
+        regs.write::<u32>(lin + i, 0);
+    }
+    let bpp8 = (bpp as u16 + 7) / 8;
+    let direct = bpp >= 15;
+    // ModeAttributes: supported|reserved|colour|graphics, banked (bit6=0,bit7=0).
+    regs.write::<u16>(lin + 0x00, 0x001B);
+    regs.write::<u8>(lin + 0x02, 0x07); // win A: relocatable|readable|writable
+    regs.write::<u8>(lin + 0x03, 0x00); // win B: not present
+    regs.write::<u16>(lin + 0x04, 64); // granularity (KB)
+    regs.write::<u16>(lin + 0x06, 64); // window size (KB)
+    regs.write::<u16>(lin + 0x08, 0xA000); // win A segment
+    regs.write::<u16>(lin + 0x10, w * bpp8); // bytes per scanline
+    regs.write::<u16>(lin + 0x12, w);
+    regs.write::<u16>(lin + 0x14, h);
+    regs.write::<u8>(lin + 0x16, 8); // char width
+    regs.write::<u8>(lin + 0x17, 16); // char height
+    regs.write::<u8>(lin + 0x18, 1); // planes
+    regs.write::<u8>(lin + 0x19, bpp);
+    regs.write::<u8>(lin + 0x1A, 1); // banks
+    regs.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
+    regs.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
+    if direct {
+        // (red, grn, blu, rsv) as (mask_size, field_position) at 0x1F..0x26.
+        let masks: [(u8, u8); 4] = match bpp {
+            15 => [(5, 10), (5, 5), (5, 0), (1, 15)],
+            16 => [(5, 11), (6, 5), (5, 0), (0, 0)],
+            _ => [(8, 16), (8, 8), (8, 0), if bpp == 32 { (8, 24) } else { (0, 0) }],
+        };
+        for (i, &(sz, pos)) in masks.iter().enumerate() {
+            regs.write::<u8>(lin + 0x1F + i * 2, sz);
+            regs.write::<u8>(lin + 0x20 + i * 2, pos);
+        }
+    }
+    true
+}
+
+/// VBE 4F02h — set mode (BX). Ignores the LFB bit (we only do banked).
+fn vbe_set_mode(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) -> bool {
+    let want = regs.rbx as u16 & 0x1FF;
+    let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
+        return false;
+    };
+    super::machine::vga::svga_set_mode(machine, &mut dos.pc, w, h, bpp);
+    true
+}
+
+/// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
+fn vbe_window(dos: &mut super::DosState, regs: &mut Vcpu) {
+    if (regs.rbx >> 8) as u8 == 0 {
+        super::machine::vga::svga_set_bank(&mut dos.pc, regs, regs.rdx as u16);
+    } else {
+        regs.rdx = (regs.rdx & !0xFFFF) | dos.pc.vga.svga_bank as u64;
     }
 }
 

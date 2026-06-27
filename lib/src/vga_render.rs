@@ -43,6 +43,12 @@ pub enum VgaMode {
     /// Unchained 256-colour ("Mode X", 320×240 etc.): 4 planes, pixel x uses
     /// plane `x & 3` at byte `y*row_bytes + x/4`. Read from `planes`.
     ModeX { w: u16, h: u16, row_bytes: u16 },
+    /// Linear SVGA (VESA): a flat framebuffer at arbitrary `w`×`h`. `bpp` 8 =
+    /// palette index/byte; 15 = 5:5:5, 16 = 5:6:5 direct colour; 24/32 =
+    /// 0x00RRGGBB packed little-endian (the channel layout we report via VBE).
+    /// `pitch` is bytes per scanline. Read from linear `vram` (the VESA
+    /// framebuffer aperture).
+    LinearSvga { w: u16, h: u16, bpp: u8, pitch: u16 },
 }
 
 /// One frame's worth of renderable VGA state. Borrowed — the renderer copies
@@ -104,6 +110,7 @@ pub const fn dimensions(mode: VgaMode) -> (usize, usize) {
         VgaMode::Cga2 => (640, 200),
         VgaMode::Planar16 { w, h, .. } => (w as usize, h as usize),
         VgaMode::ModeX { w, h, .. } => (w as usize, h as usize),
+        VgaMode::LinearSvga { w, h, .. } => (w as usize, h as usize),
     }
 }
 
@@ -501,8 +508,52 @@ pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
         VgaMode::Cga2 => render_cga2(frame, out, w, h),
         VgaMode::Planar16 { row_bytes, .. } => render_planar16(frame, out, w, h, row_bytes as usize),
         VgaMode::ModeX { row_bytes, .. } => render_modex(frame, out, w, h, row_bytes as usize),
+        VgaMode::LinearSvga { bpp, pitch, .. } => render_svga(frame, out, w, h, bpp, pitch as usize),
     }
     (w, h)
+}
+
+/// Linear SVGA present: walk the flat VESA framebuffer and expand each pixel to
+/// the canonical 0x00RRGGBB. 8bpp goes through the DAC palette; 15/16bpp are
+/// 5:5:5 / 5:6:5 scaled to 8-bit; 24/32bpp are already B,G,R bytes (the layout
+/// we report to the guest), so they assemble directly — a no-op recolour, i.e.
+/// the zero-copy-shaped path.
+fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitch: usize) {
+    let vram = frame.vram;
+    let bpp8 = (bpp as usize + 7) / 8;
+    let pitch = if pitch == 0 { w * bpp8 } else { pitch };
+    let rd16 = |p: usize| (vram.get(p).copied().unwrap_or(0) as u16)
+        | ((vram.get(p + 1).copied().unwrap_or(0) as u16) << 8);
+    for y in 0..h {
+        let base = y * pitch;
+        let row = &mut out[y * w..y * w + w];
+        for x in 0..w {
+            let p = base + x * bpp8;
+            row[x] = match bpp {
+                8 => pal_rgb(frame.palette, vram.get(p).copied().unwrap_or(0)),
+                15 => {
+                    let v = rd16(p);
+                    let r = ((v >> 10) & 0x1F) as u32;
+                    let g = ((v >> 5) & 0x1F) as u32;
+                    let b = (v & 0x1F) as u32;
+                    ((r * 255 / 31) << 16) | ((g * 255 / 31) << 8) | (b * 255 / 31)
+                }
+                16 => {
+                    let v = rd16(p);
+                    let r = ((v >> 11) & 0x1F) as u32;
+                    let g = ((v >> 5) & 0x3F) as u32;
+                    let b = (v & 0x1F) as u32;
+                    ((r * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (b * 255 / 31)
+                }
+                _ => {
+                    let b = vram.get(p).copied().unwrap_or(0) as u32;
+                    let g = vram.get(p + 1).copied().unwrap_or(0) as u32;
+                    let r = vram.get(p + 2).copied().unwrap_or(0) as u32;
+                    (r << 16) | (g << 8) | b
+                }
+            };
+        }
+    }
 }
 
 /// Mode 13h: one palette index per pixel, linear in vram. Honours the CRTC
@@ -1005,5 +1056,32 @@ mod tests {
         assert_eq!(out[5], pal_rgb(&pal, vram[328]));
         // Row 1, displayed px0 = vram[start + 1*320 + pan] = vram[643].
         assert_eq!(out[320], pal_rgb(&pal, vram[643]));
+    }
+
+    #[test]
+    fn svga_8bpp_and_32bpp() {
+        let pal = fallback_palette();
+        let ac = [0u8; 21];
+        let mk = |mode, vram: &[u8]| {
+            let frame = Frame {
+                mode, vram, planes: &[], ac: &ac, palette: &pal,
+                font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+                start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            };
+            let (w, h) = dimensions(mode);
+            let mut out = vec![0u32; w * h];
+            render(&frame, &mut out);
+            out
+        };
+        // 8bpp 4x2: index = palette lookup. pitch defaults to w.
+        let idx = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let out8 = mk(VgaMode::LinearSvga { w: 4, h: 2, bpp: 8, pitch: 0 }, &idx);
+        assert_eq!(out8[0], pal_rgb(&pal, 1));
+        assert_eq!(out8[5], pal_rgb(&pal, 6)); // row1 px1
+        // 32bpp 2x1: bytes are B,G,R,X per pixel → 0x00RRGGBB.
+        let px = [0x11u8, 0x22, 0x33, 0x00,  0x44, 0x55, 0x66, 0x00];
+        let out32 = mk(VgaMode::LinearSvga { w: 2, h: 1, bpp: 32, pitch: 0 }, &px);
+        assert_eq!(out32[0], 0x00332211);
+        assert_eq!(out32[1], 0x00665544);
     }
 }

@@ -92,6 +92,17 @@ pub struct VgaState {
     /// through; write modes 0/2/3 ALU the new value against them. Only used on
     /// the trapped planar write path (see `vram_write`/`vram_read`).
     pub latches: [u8; 4],
+    // ── VESA SVGA (banked) ──
+    /// Active VBE mode geometry; `svga_w == 0` ⇒ not in an SVGA mode. The
+    /// framebuffer lives in `svga_fb` (kernel-side, not guest VRAM); the guest
+    /// reaches it through the banked 0xA0000 window, flushed in/out per `4F05`.
+    pub svga_w: u16,
+    pub svga_h: u16,
+    pub svga_bpp: u8,
+    /// Current window-A bank (64 KB granule) the 0xA0000 window maps.
+    pub svga_bank: u16,
+    /// The full linear SVGA framebuffer (`pitch*h` bytes), presented directly.
+    pub svga_fb: alloc::vec::Vec<u8>,
 }
 
 impl VgaState {
@@ -129,6 +140,11 @@ impl VgaState {
             dac_rsub: 0,
             dac_wsub: 0,
             latches: [0; 4],
+            svga_w: 0,
+            svga_h: 0,
+            svga_bpp: 0,
+            svga_bank: 0,
+            svga_fb: alloc::vec::Vec::new(),
         }
     }
 
@@ -559,6 +575,70 @@ fn disarm_planar(machine: &mut crate::TheArch, vga: &VgaState, regs: &mut Vcpu, 
     A0000_TARGET.store(0xFF, Ordering::Relaxed);
 }
 
+// ============================================================================
+// VESA SVGA (banked). A real-mode guest reaches the multi-MB framebuffer only
+// through the 64 KB window at 0xA0000, switching banks via VBE 4F05h. We keep
+// the whole framebuffer kernel-side (`vga.svga_fb`) and use 0xA0000 as plain
+// RAM staging: a bank switch flushes the live window to its bank and loads the
+// requested one. This avoids the page-alias refcount churn `copy_page_entries`
+// would cause on every (frequent) bank switch.
+// ============================================================================
+
+/// Bytes in one 64 KB VBE window granule.
+const SVGA_WINDOW: usize = 0x10000;
+
+/// Enter a banked SVGA mode: allocate the framebuffer and give 0xA0000 a clean
+/// 64 KB RAM staging window. Called from INT 10h AX=4F02h.
+pub fn svga_set_mode(machine: &mut crate::TheArch, pc: &mut PcMachine, w: u16, h: u16, bpp: u8) {
+    let bpp8 = (bpp as usize + 7) / 8;
+    pc.vga.svga_fb = alloc::vec![0u8; w as usize * h as usize * bpp8];
+    pc.vga.svga_w = w;
+    pc.vga.svga_h = h;
+    pc.vga.svga_bpp = bpp;
+    pc.vga.svga_bank = 0;
+    // Plain RAM staging window; also clears any stale planar trap marker (a VBE
+    // set-mode bypasses on_set_mode, so Mode-X state could otherwise linger).
+    machine.map_fresh_range(A0000 >> 12, SVGA_WINDOW >> 12);
+    A0000_TARGET.store(0xFF, Ordering::Relaxed);
+}
+
+/// Copy the live 0xA0000 window into the current bank of `svga_fb`.
+pub fn svga_flush_window(pc: &mut PcMachine, regs: &Vcpu) {
+    if pc.vga.svga_w == 0 {
+        return;
+    }
+    let start = pc.vga.svga_bank as usize * SVGA_WINDOW;
+    let n = SVGA_WINDOW.min(pc.vga.svga_fb.len().saturating_sub(start));
+    if n > 0 {
+        regs.copy_from(A0000, &mut pc.vga.svga_fb[start..start + n]);
+    }
+}
+
+/// VBE 4F05h window control: flush the current window to its bank, then page the
+/// requested bank's bytes into the window (so guest read-backs see them).
+pub fn svga_set_bank(pc: &mut PcMachine, regs: &mut Vcpu, bank: u16) {
+    if pc.vga.svga_w == 0 {
+        return;
+    }
+    svga_flush_window(pc, regs);
+    pc.vga.svga_bank = bank;
+    let start = bank as usize * SVGA_WINDOW;
+    let n = SVGA_WINDOW.min(pc.vga.svga_fb.len().saturating_sub(start));
+    if n > 0 {
+        regs.copy_to(A0000, &pc.vga.svga_fb[start..start + n]);
+    }
+}
+
+/// Leave SVGA back to a standard VGA mode: drop the framebuffer. The caller's
+/// mode-set re-backs 0xA0000 (text/graphics) as usual.
+pub fn svga_leave(pc: &mut PcMachine) {
+    pc.vga.svga_w = 0;
+    pc.vga.svga_h = 0;
+    pc.vga.svga_bpp = 0;
+    pc.vga.svga_bank = 0;
+    pc.vga.svga_fb = alloc::vec::Vec::new();
+}
+
 /// React to a BIOS INT 10h AH=00 video mode set. The EGA/VGA 16-colour planar
 /// family (0x0D–0x12, e.g. Commander Keen) draws through the 4 planes via the
 /// map mask + write modes exactly like Mode X, but a game sets it via the BIOS
@@ -576,6 +656,8 @@ pub fn on_set_mode(
     if vga_present() {
         return; // a real card draws its own planes
     }
+    // A standard mode-set leaves any active VESA SVGA mode.
+    svga_leave(pc);
     // The IBM BIOS programs CRTC line-compare to its no-split default (0x3FF) on
     // every mode set; our BIOS leaves the CRTC untouched. Without this a program
     // that page-flips but never writes 0x18 (Doom relies on the BIOS default)
@@ -1116,6 +1198,27 @@ impl VgaState {
         -> Option<lib::vga_render::Frame<'a>>
     {
         use lib::vga_render::{Frame, VgaMode};
+        // VESA SVGA: present the kernel-side linear framebuffer directly. The
+        // guest filled it through the banked 0xA0000 window; `display_tick`
+        // flushes the live window into `svga_fb` just before this call.
+        if self.svga_w != 0 {
+            let bpp8 = (self.svga_bpp as usize + 7) / 8;
+            let pitch = self.svga_w as usize * bpp8;
+            return Some(Frame {
+                mode: VgaMode::LinearSvga {
+                    w: self.svga_w, h: self.svga_h, bpp: self.svga_bpp, pitch: pitch as u16,
+                },
+                vram: &self.svga_fb,
+                planes: &[],
+                ac: &self.ac,
+                palette: &self.dac,
+                font: &lib::vga_font_8x16::FONT_8X16,
+                blink: false,
+                start_offset: 0,
+                pixel_pan: 0,
+                line_compare: usize::MAX,
+            });
+        }
         let mode = self.classify_mode(regs)?;
         let (w, h) = lib::vga_render::dimensions(mode);
         let (vram, planes): (&[u8], &[u8]) = match mode {
@@ -1126,6 +1229,7 @@ impl VgaState {
             VgaMode::Mode13h => (read_aperture(regs, scratch, 0xA0000, 0x10000), &[]),
             VgaMode::Text80x25 => (read_aperture(regs, scratch, 0xB8000, 80 * 25 * 2), &[]),
             VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(regs, scratch, 0xB8000, 0x4000), &[]),
+            VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
         };
         // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
         // line-compare (split-screen) apply to the planar families and to linear
@@ -1211,6 +1315,10 @@ pub fn display_tick(pc: &mut PcMachine, regs: &Vcpu, now_ticks: u64) {
     }
     if !frame_due(now_ticks) {
         return;
+    }
+    // SVGA: capture the live 0xA0000 window into the framebuffer before present.
+    if pc.vga.svga_w != 0 {
+        svga_flush_window(pc, regs);
     }
     let mut scratch = alloc::vec::Vec::new();
     let Some(frame) = pc.vga.scanout(regs, &mut scratch) else { return };
