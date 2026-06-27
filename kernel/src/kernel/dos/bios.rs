@@ -711,8 +711,8 @@ fn vbe_mode_info(regs: &mut Vcpu) -> bool {
     }
     let bpp8 = (bpp as u16 + 7) / 8;
     let direct = bpp >= 15;
-    // ModeAttributes: supported|reserved|colour|graphics, banked (bit6=0,bit7=0).
-    regs.write::<u16>(lin + 0x00, 0x001B);
+    // ModeAttributes: supported|reserved|colour|graphics, banked + LFB (bit7).
+    regs.write::<u16>(lin + 0x00, 0x009B);
     regs.write::<u8>(lin + 0x02, 0x07); // win A: relocatable|readable|writable
     regs.write::<u8>(lin + 0x03, 0x00); // win B: not present
     regs.write::<u16>(lin + 0x04, 64); // granularity (KB)
@@ -740,6 +740,11 @@ fn vbe_mode_info(regs: &mut Vcpu) -> bool {
             regs.write::<u8>(lin + 0x20 + i * 2, pos);
         }
     }
+    // PhysBasePtr (0x28): the framebuffer's linear base — directly usable by a
+    // PM/DPMI client (physical == linear here). LinBytesPerScanLine (0x32)
+    // mirrors the banked pitch since the framebuffer is contiguous.
+    regs.write::<u32>(lin + 0x28, super::machine::vga::svga_lfb_base());
+    regs.write::<u16>(lin + 0x32, w * bpp8);
     true
 }
 

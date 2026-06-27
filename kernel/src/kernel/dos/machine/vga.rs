@@ -582,9 +582,12 @@ fn disarm_planar(machine: &mut crate::TheArch, vga: &VgaState, regs: &mut Vcpu, 
 // and write it directly. `display_tick` presents by reading the region.
 // ============================================================================
 
-/// Guest-linear base of the SVGA framebuffer (well above the XMS region at
-/// 0x120000..0x500000). Sized per mode, rounded up to whole 64 KB banks.
-const SVGA_LFB_BASE: usize = 0x1000000; // 16 MB
+/// Guest-linear base of the SVGA framebuffer. Placed at 1 GB — far above the
+/// DPMI linear pool (grows up from 0x500000) and the XMS region, well below the
+/// 3 GB user-space ceiling — so a DPMI client mapping it as an LFB never
+/// collides with the program's own allocations. Sized per mode, rounded up to
+/// whole 64 KB banks.
+const SVGA_LFB_BASE: usize = 0x4000_0000; // 1 GB
 const SVGA_WINDOW: usize = 0x10000; // 64 KB VBE bank granule
 const WINDOW_PAGES: usize = SVGA_WINDOW >> 12;
 
@@ -592,6 +595,14 @@ const WINDOW_PAGES: usize = SVGA_WINDOW >> 12;
 fn svga_banks(w: u16, h: u16, bpp: u8) -> usize {
     let bytes = w as usize * h as usize * ((bpp as usize + 7) / 8);
     bytes.div_ceil(SVGA_WINDOW)
+}
+
+/// VBE's `PhysBasePtr`. RetroOS's DOS guest has one paged address space shared
+/// by VM86 and PM, so the DPMI "physical" address *is* a guest-linear address:
+/// we report the framebuffer's linear base, and a PM/DPMI client reaches it
+/// directly through its flat selector — no physical→linear mapping needed.
+pub const fn svga_lfb_base() -> u32 {
+    SVGA_LFB_BASE as u32
 }
 
 /// Enter a banked SVGA mode (INT 10h AX=4F02h): back the framebuffer with fresh
