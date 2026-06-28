@@ -86,7 +86,7 @@ pub fn scancode_to_ascii(scancode: u8) -> u8 {
     // Ctrl-A..Ctrl-Z → 0x01..0x1A; case-insensitive.
     if key_down(LCTRL) {
         let lower = c | 0x20;
-        if (b'a'..=b'z').contains(&lower) { return lower - b'a' + 1; }
+        if lower.is_ascii_lowercase() { return lower - b'a' + 1; }
     }
     c
 }

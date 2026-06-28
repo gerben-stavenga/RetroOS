@@ -11,8 +11,8 @@ fn dump_ds_dx(regs: &Vcpu, ds: u16, edx: u32) {
     let linear = ((ds as u32) << 4).wrapping_add(edx & 0xFFFF);
     if linear >= 0x110000 { return; } // guard against non-low memory
     let mut bytes = [0u8; 16];
-    for i in 0..16 {
-        bytes[i] = regs.read::<u8>(((linear + i as u32)) as usize);
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = regs.read::<u8>((linear + i as u32) as usize);
     }
     dos_trace!(
         "[DPMI]   DS:DX@{:05X}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}  '{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}'",

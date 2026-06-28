@@ -124,7 +124,8 @@ impl PixelFormat {
 }
 
 fn geom() -> &'static mut Option<Geom> {
-    unsafe { &mut *(&raw mut GEOM) }
+    let p = &raw mut GEOM;
+    unsafe { &mut *p }
 }
 
 /// Whether the framebuffer console owns the display (a linear framebuffer
@@ -186,8 +187,7 @@ pub fn init(info: &arch::MultibootInfo) {
         // fill it with 0xFF bytes — white-ish on any channel order or depth
         // — so "framebuffer handed over but format rejected" is visible.
         let stripe_bytes = (pitch * 32).min(1 << 20);
-        let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes + PAGE_SIZE - 1)
-            / PAGE_SIZE;
+        let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes).div_ceil(PAGE_SIZE);
         for i in 0..pages {
             paging2::map_user_page_phys(
                 paging2::FB_WINDOW_BASE / PAGE_SIZE + i,
@@ -222,7 +222,7 @@ pub fn init(info: &arch::MultibootInfo) {
     };
     let fb_bytes = pitch * height;
     let page_off = (addr & (PAGE_SIZE as u64 - 1)) as usize;
-    let pages = (page_off + fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages = (page_off + fb_bytes).div_ceil(PAGE_SIZE);
     assert!(
         paging2::FB_WINDOW_BASE + pages * PAGE_SIZE <= paging2::FB_WINDOW_END,
         "fbcon: framebuffer larger than the FB window"
@@ -328,7 +328,8 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     // content-compare skip — that silently froze the screen when the cached
     // frame went stale against another writer).
     static mut LAST_DIMS: (usize, usize) = (0, 0);
-    let last = unsafe { &mut *(&raw mut LAST_DIMS) };
+    let last_p = &raw mut LAST_DIMS;
+    let last = unsafe { &mut *last_p };
     if *last != (w, h) {
         *last = (w, h);
         out.fill(0);
@@ -345,7 +346,8 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     let y_step = ((h as u64) << 16) / out_h as u64;
     let native = g.format.is_native();
     static mut ENC_ROW: [u32; 2048] = [0; 2048];
-    let enc = unsafe { &mut *(&raw mut ENC_ROW) };
+    let enc_p = &raw mut ENC_ROW;
+    let enc = unsafe { &mut *enc_p };
     let mut sy = 0u64;
     let mut prev_sry = usize::MAX;
     for oy in 0..out_h {
@@ -407,7 +409,8 @@ fn flush() {
     if DOS_PAINTED.swap(false, core::sync::atomic::Ordering::Relaxed) {
         let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
         out.fill(0);
-        unsafe { (&mut *(&raw mut SHADOW)).fill(0) };
+        let sp = &raw mut SHADOW;
+        unsafe { (*sp).fill(0) };
     }
     // The shared text aperture (real phys 0xB8000 via the low-mem window).
     let text: &[u16] = unsafe {
@@ -416,13 +419,15 @@ fn flush() {
     let vram: &[u8] = unsafe {
         core::slice::from_raw_parts((paging2::LOW_MEM_BASE + 0xB8000) as *const u8, 80 * 25 * 2)
     };
-    let shadow = unsafe { &mut *(&raw mut SHADOW) };
+    let shadow_p = &raw mut SHADOW;
+    let shadow = unsafe { &mut *shadow_p };
+    let palette_p = &raw const PALETTE;
     let frame = Frame {
         mode: VgaMode::Text80x25,
         vram,
         planes: &[],
         ac: &FBCON_AC,
-        palette: unsafe { &*(&raw const PALETTE) },
+        palette: unsafe { &*palette_p },
         font: &FONT_8X16,
         blink: false,
         start_offset: 0,

@@ -24,12 +24,11 @@ static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new
 /// the interpreter's port/device machinery.
 fn host_log_byte(b: u8) {
     use std::io::Write;
-    if let Ok(mut g) = LOG_FILE.lock() {
-        if let Some(f) = g.as_mut() {
+    if let Ok(mut g) = LOG_FILE.lock()
+        && let Some(f) = g.as_mut() {
             let _ = f.write_all(&[b]);
             return;
         }
-    }
     let _ = std::io::stderr().write_all(&[b]);
 }
 
@@ -122,7 +121,7 @@ fn main() {
     // frame mailbox for the screenshot path. Only armed when a consumer
     // exists, so headless --cmd runs skip the render work entirely.
     if shot_armed {
-        lib::vga_render::set_present_sink(|w, h, px| arch::publish_frame(w, h, px));
+        lib::vga_render::set_present_sink(arch::publish_frame);
     }
     if let Some(dir) = &host_dir {
         arch::attach_hostfs(dir); // COM1 → /host (or the root, per Media)
@@ -210,13 +209,12 @@ fn spawn_keyboard() {
             }
             // ESC may start a CSI/SS3 escape sequence (arrows, F-keys). The tty
             // sends the whole sequence in one burst, so reading ahead is safe.
-            if b == 0x1B {
-                if let Some(sc) = read_escape_seq(&mut stdin) {
+            if b == 0x1B
+                && let Some(sc) = read_escape_seq(&mut stdin) {
                     arch::post_irq(arch::Irq::Key(sc));
                     arch::post_irq(arch::Irq::Key(sc | 0x80));
                     continue;
                 }
-            }
             for sc in byte_to_scancodes(b) {
                 arch::post_irq(arch::Irq::Key(sc));
             }
@@ -326,11 +324,10 @@ fn byte_to_scancodes(b: u8) -> Vec<u8> {
         _ => {}
     }
     // C0 control bytes (Ctrl-A..Z, excluding the specials matched above).
-    if (0x01..=0x1A).contains(&b) {
-        if let Some((sc, _)) = lookup(b + 0x60) {
+    if (0x01..=0x1A).contains(&b)
+        && let Some((sc, _)) = lookup(b + 0x60) {
             return vec![LCTRL, sc, sc | 0x80, LCTRL | 0x80];
         }
-    }
     if let Some((sc, shift)) = lookup(b) {
         return if shift {
             vec![LSHIFT, sc, sc | 0x80, LSHIFT | 0x80]

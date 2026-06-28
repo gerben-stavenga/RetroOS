@@ -72,11 +72,7 @@ impl TarFs {
     /// Entries sorted by name allow O(log N) `open()` lookups.
     pub fn build_index(&mut self) {
         let mut block: u32 = 0;
-        loop {
-            let entry = match self.read_header(block) {
-                Some(e) => e,
-                None => break,
-            };
+        while let Some(entry) = self.read_header(block) {
             self.index.push(IndexEntry {
                 name: entry.name,
                 name_len: entry.name_len as u16,
@@ -158,7 +154,7 @@ fn entry_in_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     }
     if !dir.is_empty() && &entry_name[..dir.len()] != dir { return None; }
     let rest = &entry_name[dir.len()..];
-    if rest.iter().any(|&b| b == b'/') {
+    if rest.contains(&b'/') {
         return None;
     }
     Some(rest)
@@ -243,7 +239,7 @@ impl Filesystem for TarFs {
                     let rest = &name[dir.len()..];
                     if let Some(slash) = rest.iter().position(|&b| b == b'/') {
                         let dir_name = &rest[..slash];
-                        if !dirs.iter().any(|d| *d == dir_name) {
+                        if !dirs.contains(&dir_name) {
                             dirs.push(dir_name);
                         }
                     }

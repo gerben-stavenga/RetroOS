@@ -60,7 +60,7 @@ impl VirtualPitChannel {
                 if remaining == div { div } else { remaining }
             }
             _ => {
-                if elapsed >= div { 0 } else { div - elapsed }
+                div.saturating_sub(elapsed)
             }
         };
         raw as u16

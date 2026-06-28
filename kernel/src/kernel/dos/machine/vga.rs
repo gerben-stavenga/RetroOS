@@ -28,11 +28,11 @@ pub fn vga_present() -> bool {
 /// VGA Attribute Controller port (0x3C0) state. The hardware has two
 /// independent pieces of state, neither readable from any port:
 ///   - `index`:        last byte written in index state. Includes the PAS bit
-///                     (bit 5) which controls screen blanking. Persistent —
-///                     subsequent data writes do not change it.
+///     (bit 5) which controls screen blanking. Persistent —
+///     subsequent data writes do not change it.
 ///   - `pending_data`: flip-flop position. `false` = next 0x3C0 write is an
-///                     index byte; `true` = next 0x3C0 write is its data.
-/// `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
+///     index byte; `true` = next 0x3C0 write is its data.
+///     `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
 #[derive(Clone, Copy)]
 pub struct AcState {
     pub index: u8,
@@ -102,6 +102,12 @@ pub struct VgaState {
     pub svga_bpp: u8,
     /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
     pub svga_bank: u16,
+}
+
+impl Default for VgaState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VgaState {
@@ -593,7 +599,7 @@ const WINDOW_PAGES: usize = SVGA_WINDOW >> 12;
 
 /// Whole 64 KB banks a `w`×`h`×`bpp` framebuffer needs.
 fn svga_banks(w: u16, h: u16, bpp: u8) -> usize {
-    let bytes = w as usize * h as usize * ((bpp as usize + 7) / 8);
+    let bytes = w as usize * h as usize * (bpp as usize).div_ceil(8);
     bytes.div_ceil(SVGA_WINDOW)
 }
 
@@ -962,7 +968,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         0x88 => {
             let modrm = peek(i);
             let val = gpr(regs, (modrm >> 3) & 7, 1) as u8;
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             vram_write(vga, off, val);
         }
         // mov r/m16/32, r
@@ -970,7 +976,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let modrm = peek(i);
             let sz = opsize(op32, false);
             let val = gpr(regs, (modrm >> 3) & 7, sz);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             for b in 0..sz { vram_write(vga, off + b, (val >> (b * 8)) as u8); }
         }
         // mov r8, r/m8 — load
@@ -978,7 +984,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let modrm = peek(i);
             let v = vram_read(vga, off);
             set_gpr(regs, (modrm >> 3) & 7, 1, v as u32);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
         }
         // mov r16/32, r/m
         0x8B => {
@@ -987,12 +993,12 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let mut v = 0u32;
             for b in 0..sz { v |= (vram_read(vga, off + b) as u32) << (b * 8); }
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
         }
         // mov r/m8, imm8
         0xC6 => {
             let modrm = peek(i);
-            let l = modrm_len(modrm, addr32, &peek, i);
+            let l = modrm_len(modrm, addr32, peek, i);
             let imm = peek(i + l);
             i += l + 1;
             vram_write(vga, off, imm);
@@ -1000,7 +1006,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
         0xC7 => {
             let modrm = peek(i);
-            let l = modrm_len(modrm, addr32, &peek, i);
+            let l = modrm_len(modrm, addr32, peek, i);
             let sz = opsize(op32, false);
             let mut imm = 0u32;
             for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
@@ -1017,7 +1023,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let modrm = peek(i);
             let ridx = (modrm >> 3) & 7;
             let regval = gpr(regs, ridx, 1) as u8;
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             let memval = vram_read(vga, off);
             vram_write(vga, off, regval);
             set_gpr(regs, ridx, 1, memval as u32);
@@ -1029,7 +1035,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let ridx = (modrm >> 3) & 7;
             let sz = opsize(op32, false);
             let regval = gpr(regs, ridx, sz);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             let mut memval = 0u32;
             for b in 0..sz {
                 memval |= (vram_read(vga, off + b) as u32) << (b * 8);
@@ -1138,7 +1144,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let sz = opsize(op32, op & 1 == 0);
             let modrm = peek(i);
             let ridx = (modrm >> 3) & 7;
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
@@ -1211,7 +1217,7 @@ impl VgaState {
         // guest filled it through the banked 0xA0000 window; `display_tick`
         // flushes the live window into `svga_fb` just before this call.
         if self.svga_w != 0 {
-            let bpp8 = (self.svga_bpp as usize + 7) / 8;
+            let bpp8 = (self.svga_bpp as usize).div_ceil(8);
             let pitch = self.svga_w as usize * bpp8;
             let size = pitch * self.svga_h as usize;
             return Some(Frame {
@@ -1230,7 +1236,7 @@ impl VgaState {
             });
         }
         let mode = self.classify_mode(regs)?;
-        let (w, h) = lib::vga_render::dimensions(mode);
+        let (_w, h) = lib::vga_render::dimensions(mode);
         let (vram, planes): (&[u8], &[u8]) = match mode {
             VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
             // Read the whole 64 KB window, not just w*h: a panned display-start
@@ -1282,7 +1288,7 @@ impl VgaState {
             if self.crtc[9] & 0x80 != 0 { h /= 2; }
             // Mode-Y games keep the BIOS mode-13h CRTC our BIOS never wrote
             // (v-end ~0); fall back to the 320×200 default.
-            if h < 64 || h > 480 { h = 200; }
+            if !(64..=480).contains(&h) { h = 200; }
             return Some(VgaMode::ModeX { w: row_bytes * 4, h, row_bytes });
         }
         let rregs = vga_render::Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };

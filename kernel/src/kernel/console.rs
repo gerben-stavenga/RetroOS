@@ -53,8 +53,8 @@ fn drain_dos(
         } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
             crate::kernel::startup::dump_interrupted_thread(regs, Some(unsafe { &*dp }));
         } else if blocked {
-            if let crate::arch::Irq::Key(sc) = evt {
-                if crate::kernel::keyboard::update_key_state(sc) {
+            if let crate::arch::Irq::Key(sc) = evt
+                && crate::kernel::keyboard::update_key_state(sc) {
                     let c = crate::kernel::keyboard::scancode_to_ascii(sc);
                     if c != 0 {
                         crate::vga::putchar(c);
@@ -62,7 +62,6 @@ fn drain_dos(
                         crate::kernel::kpipe::write(cpipe, &[c]);
                     }
                 }
-            }
         } else {
             if let crate::arch::Irq::Key(sc) = evt {
                 unsafe { (*dp).process_key(regs, sc) };

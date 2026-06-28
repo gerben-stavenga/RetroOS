@@ -44,7 +44,6 @@ const DEPTH: usize = 16;
 const SECTORS_PER_CMD: u32 = 8;
 
 // Controller register offsets (from BAR0).
-const R_CAP_LO: usize = 0x00;
 const R_CAP_HI: usize = 0x04;
 const R_CC: usize = 0x14;
 const R_CSTS: usize = 0x1C;

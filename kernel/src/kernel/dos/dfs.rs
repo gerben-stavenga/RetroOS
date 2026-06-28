@@ -51,7 +51,8 @@ pub mod ci {
     static mut CI_CACHE: BTreeMap<Vec<u8>, DirCi> = BTreeMap::new();
 
     fn cache() -> &'static mut BTreeMap<Vec<u8>, DirCi> {
-        unsafe { &mut *(&raw mut CI_CACHE) }
+        let p = &raw mut CI_CACHE;
+        unsafe { &mut *p }
     }
 
     /// Trim trailing `/` so cache keys are canonical.
@@ -132,7 +133,7 @@ fn fits_8_3(name: &[u8]) -> bool {
     if dots > 1 { return false; }
     let (base, ext) = match name.iter().position(|&b| b == b'.') {
         Some(p) => (&name[..p], &name[p + 1..]),
-        None => (&name[..], &b""[..]),
+        None => (name, &b""[..]),
     };
     if base.len() > 8 || ext.len() > 3 { return false; }
     if base.is_empty() && ext.is_empty() { return false; }
@@ -238,8 +239,7 @@ impl DfsState {
         while s.first() == Some(&b'/') { s = &s[1..]; }
         while s.last() == Some(&b'/') { s = &s[..s.len()-1]; }
         let n = s.len().min(DFS_CWD_MAX);
-        for i in 0..n {
-            let b = s[i];
+        for (i, &b) in s.iter().enumerate().take(n) {
             self.cwd[i] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
         }
         self.cwd_len = n as u8;
@@ -250,6 +250,7 @@ impl DfsState {
     ///   - "X:..."         → drive X (ignored cwd unless no `\` after colon)
     ///   - "\..." / "/..." → current drive's root
     ///   - other           → current drive's cwd + path
+    ///
     /// All `/` become `\`, all letters uppercased.
     /// Currently only drive C has a tracked cwd; all other drives start at root.
     pub fn resolve(&self, dos_in: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {

@@ -22,7 +22,7 @@ pub fn init() -> bool {
     }
     outb(COM1 + 1, 0x00); // Disable interrupts
     outb(COM1 + 3, 0x80); // Enable DLAB
-    outb(COM1 + 0, 0x01); // Divisor lo = 1 (115200 baud)
+    outb(COM1, 0x01); // Divisor lo = 1 (115200 baud)
     outb(COM1 + 1, 0x00); // Divisor hi
     outb(COM1 + 3, 0x03); // 8N1, DLAB off
     outb(COM1 + 2, 0xC7); // Enable FIFO, clear, 14-byte threshold

@@ -13,10 +13,14 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 
 const MAX_LINES: usize = 2000;
+// Only the metal debug sink appends to the ring (`push_byte`); the hosted
+// backend logs straight to stdout, so the appender and its state are metal-only.
+#[cfg(not(feature = "hosted"))]
 const MAX_LINE_LEN: usize = 512;
 
 struct KLog {
     lines: VecDeque<String>,
+    #[cfg(not(feature = "hosted"))]
     cur: String,
 }
 
@@ -33,6 +37,7 @@ pub fn init() {
     unsafe {
         LOG = Some(KLog {
             lines: VecDeque::with_capacity(MAX_LINES + 1),
+            #[cfg(not(feature = "hosted"))]
             cur: String::with_capacity(128),
         });
     }
@@ -42,6 +47,7 @@ pub fn init() {
 /// logged byte; a no-op until `init()` has run, and paused during a `LOG` dump
 /// (see `DUMPING`). A completed line (`\n`) is pushed and the oldest dropped
 /// past `MAX_LINES`; `\r` is ignored.
+#[cfg(not(feature = "hosted"))]
 pub fn push_byte(b: u8) {
     unsafe {
         if DUMPING {

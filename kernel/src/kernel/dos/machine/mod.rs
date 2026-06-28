@@ -17,7 +17,6 @@ extern crate alloc;
 
 use arch_abi::Arch;
 use arch_abi::GuestBytes;
-use crate::Regs;
 use crate::arch::Vcpu;
 
 pub const IF_FLAG: u32 = 1 << 9;
@@ -37,8 +36,6 @@ pub const IOPL_MASK: u32 = 3 << 12;
 /// POPF/IRET (DOOM/DOOM2/HEXEN, marked in LOADFIX.CFG) are launched at IOPL=3 so
 /// the monitor steps those re-enables. VM86 is unaffected (the gate is PM-only).
 pub const IOPL_DEFAULT: u32 = 1 << 12;
-/// Virtual IOPL=3 — non-conforming DPMI clients (honor POPF/IRET via stepping).
-pub const IOPL_NONCONF: u32 = 3 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
 
 
@@ -71,7 +68,6 @@ pub fn vm86_sp(regs: &Vcpu) -> u16 {
     regs.sp32() as u16
 }
 
-#[inline]
 /// The flags word the guest observes: its virtual-IF (VIF/bit 19) shows in the
 /// bit-9 (IF) slot, and the internal VIF bit is masked out. Bit 9 of the *live*
 /// frame is the real IF — never what the guest should see.
@@ -430,7 +426,7 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
         // to configure QEMU's emulated VGA, even for legacy modes.
         // Pass through so SeaBIOS sees real VBE state.
-        0x01CE | 0x01CF | 0x01D0 => machine.inb(port),
+        0x01CE..=0x01D0 => machine.inb(port),
         // Gameport (joystick): we don't model a Sound Blaster or dedicated
         // gameport card, so on the ISA bus the gameport is unpopulated —
         // reads return 0xFF (floating data lines, weakly pulled high by
@@ -493,8 +489,7 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            let v = pc.sb.sb_read(machine, p);
-            v
+            pc.sb.sb_read(machine, p)
         }
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
@@ -545,7 +540,7 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.
-        0x01CE | 0x01CF | 0x01D0 => machine.outb(port, val),
+        0x01CE..=0x01D0 => machine.outb(port, val),
         // Master PIC command
         0x20 => {
             if val == 0x20 {
@@ -659,7 +654,7 @@ fn fabricated_status1(machine: &mut crate::TheArch) -> u8 {
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
 /// bytes through `emulate_inb` and writes the result into `regs.rax`.
 pub fn handle_in_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
-    if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
+    if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         let val = machine.inw(port) as u64;
         regs.rax = (regs.rax & !0xFFFF) | val;
         return;
@@ -676,7 +671,7 @@ pub fn handle_in_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
 pub fn handle_out_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
     let val = regs.rax;
-    if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
+    if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         machine.outw(port, val as u16);
         return;
     }
@@ -694,7 +689,7 @@ pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: 
     let di = regs.rdi as u32;
     for i in 0..size {
         let b = emulate_inb(machine, pc, port + i as u16);
-        regs.write::<u8>(((es_base.wrapping_add(di.wrapping_add(i)))) as usize, b);
+        regs.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
@@ -707,7 +702,7 @@ pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs:
     let ds_base = seg_base_for(machine, regs, regs.ds as u16);
     let si = regs.rsi as u32;
     for i in 0..size {
-        let b = regs.read::<u8>(((ds_base.wrapping_add(si.wrapping_add(i)))) as usize);
+        let b = regs.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
         emulate_outb(machine, pc, regs, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;

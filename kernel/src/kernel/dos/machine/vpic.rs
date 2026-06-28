@@ -130,11 +130,10 @@ impl VirtualPic {
         let candidates = (self.master.irr | cascade) & !self.master.imr;
         let win = lowest_set(candidates)?;
         // Strictly-higher-priority preemption against the master's in service.
-        if let Some(svc) = lowest_set(self.master.isr) {
-            if win >= svc {
+        if let Some(svc) = lowest_set(self.master.isr)
+            && win >= svc {
                 return None;
             }
-        }
         if win == CASCADE_LINE {
             // Descend into the slave for the actual line it selected.
             self.slave.peek().map(|s| 8 + s)

@@ -60,7 +60,12 @@ mod dfs;
 mod machine;
 mod xms;
 mod ems;
-mod dos;
+// The DOS ABI core (INT 21h/33h services). Named `dosabi` rather than `dos` so
+// it does not shadow its parent module; `dos` stays a local alias for the many
+// in-file references.
+#[path = "dos.rs"]
+mod dosabi;
+use self::dosabi as dos;
 mod mode_transitions;
 
 // VgaState is hardware-shaped (4 planes + register snapshot), not DOS policy.
@@ -182,10 +187,13 @@ pub struct DosState {
     pub pending_resume: Option<ResumeCallback>,
 }
 
+/// The boxed retry closure inside a [`ResumeCallback`].
+type ResumeFn =
+    dyn FnOnce(&mut crate::TheArch, &mut thread::KernelThread, &mut DosState, &mut Vcpu) -> Option<ResumeCallback>;
+
 /// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
 /// so the FnOnce can return another `ResumeCallback` (recursive type).
-pub struct ResumeCallback(pub alloc::boxed::Box<
-    dyn FnOnce(&mut crate::TheArch, &mut thread::KernelThread, &mut DosState, &mut Vcpu) -> Option<ResumeCallback>>);
+pub struct ResumeCallback(pub alloc::boxed::Box<ResumeFn>);
 
 #[derive(Clone, Copy)]
 pub struct DosMemBlock {
@@ -202,7 +210,6 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
     alloc::vec![0u64; dpmi::LDT_ENTRIES]
         .into_boxed_slice()
         .try_into()
-        .ok()
         .expect("LDT size mismatch")
 }
 
@@ -270,8 +277,8 @@ impl DosState {
         machine.load_ldt(&self.ldt[..]);
     }
 
-    /// Called when the thread loses focus. Snapshots the VGA framebuffer
-    /// + register set so the screen can be repainted on materialize. With no
+    /// Called when the thread loses focus. Snapshots the VGA framebuffer +
+    /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
     pub fn suspend(&mut self) {
@@ -546,7 +553,7 @@ pub fn handle_event(
                 // handler that fixes up DX:AX and advances EIP past the
                 // DIV. Reflect instead of killing — this matches what
                 // FreeDOS does.
-                machine.sw_reflect_vm86_int(regs, n as u8);
+                machine.sw_reflect_vm86_int(regs, n);
                 thread::KernelAction::Done
             } else {
                 let lin = if is_vm86 {
@@ -643,9 +650,8 @@ fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
 /// Called from kernel exec fan-out. `parent_env_data` is the parent's env block
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
+#[allow(clippy::too_many_arguments)]
 pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8) {
-    use crate::kernel::startup;
-
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
@@ -824,7 +830,6 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
 pub fn run_init_program(machine: &mut crate::TheArch, threads: &mut [thread::Thread], buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
-    use crate::kernel::startup;
 
     let t = thread::create_thread(threads, machine, None, crate::RootPageTable::empty(), true)
         .expect("Failed to create DOS thread");
@@ -1023,7 +1028,7 @@ pub fn raise_pending(machine: &mut crate::TheArch, dos: &mut thread::DosState, r
         && !mouse.cb_in_flight
         && mouse.cb_mask & mouse.pending_cond != 0;
     if mouse_ready {
-        self::dos::deliver_mouse_callback(dos, regs);
+        dos::deliver_mouse_callback(dos, regs);
     } else if let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) {
         IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
         mode_transitions::deliver_pm_irq(dos, regs, vec);

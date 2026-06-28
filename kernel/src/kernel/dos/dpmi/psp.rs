@@ -11,7 +11,7 @@ use super::state::PspCacheEntry;
 pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState, regs: &mut Vcpu) {
     let rm_psp = dos.current_psp;
     let psp_base = (rm_psp as u32) * 16;
-    let env_seg = regs.read::<u16>(((psp_base + 0x2C)) as usize);
+    let env_seg = regs.read::<u16>((psp_base + 0x2C) as usize);
 
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
@@ -39,8 +39,8 @@ pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState, 
     if let Some(dpmi) = dos.dpmi.as_mut() {
         dpmi.env_ldt_idx = 0;
     }
-    if env_seg != 0 {
-        if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
+    if env_seg != 0
+        && let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
             let env_base = (env_seg as u32) * 16;
             dos.ldt[idx] = make_data_desc_ex(env_base, 0xFFFF, false);
             let env_sel = idx_to_sel(idx);
@@ -49,7 +49,6 @@ pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState, 
                 dpmi.env_ldt_idx = idx;
             }
         }
-    }
 }
 
 /// Look up an existing PSP selector for `segment`, or allocate a new one.

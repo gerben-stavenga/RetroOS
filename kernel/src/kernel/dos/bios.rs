@@ -36,7 +36,7 @@ use crate::kernel::thread;
 use super::machine::{
     self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_sp, vm86_ss, read_u16, write_u16,
 };
-use super::dos::STUB_SEG;
+use super::dosabi::STUB_SEG;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// The native BIOS ROM's INT 15h vector (`seg<<16 | off`), captured before we
@@ -756,10 +756,10 @@ fn vbe_mode_info(regs: &mut Vcpu) -> bool {
     for i in (0..256).step_by(4) {
         regs.write::<u32>(lin + i, 0);
     }
-    let bpp8 = (bpp as u16 + 7) / 8;
+    let bpp8 = (bpp as u16).div_ceil(8);
     let direct = bpp >= 15;
     // ModeAttributes: supported|reserved|colour|graphics, banked + LFB (bit7).
-    regs.write::<u16>(lin + 0x00, 0x009B);
+    regs.write::<u16>(lin, 0x009B);
     regs.write::<u8>(lin + 0x02, 0x07); // win A: relocatable|readable|writable
     regs.write::<u8>(lin + 0x03, 0x00); // win B: not present
     regs.write::<u16>(lin + 0x04, 64); // granularity (KB)

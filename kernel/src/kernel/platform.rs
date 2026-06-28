@@ -28,8 +28,10 @@ pub enum Host {
     Qemu,
     /// Real hardware — or an emulator without fw_cfg (Bochs), which earns
     /// real-hardware treatment: trust the devices.
+    #[cfg(not(feature = "hosted"))]
     Metal,
     /// The hosted interpreter backend (arch-interp as a host process).
+    #[cfg(feature = "hosted")]
     Interp,
 }
 
@@ -39,12 +41,15 @@ pub enum Host {
 pub enum Display {
     /// A real VGA card answered the SEQ-register probe: guests program the
     /// hardware directly (passthrough port window); console = VGA text.
+    #[cfg(not(feature = "hosted"))]
     VgaCard,
     /// No card, but the loader handed over a linear framebuffer (UEFI/GOP):
     /// the kernel-emulated VGA renders through fbcon.
+    #[cfg(not(feature = "hosted"))]
     Framebuffer,
     /// No card or framebuffer, but a host window installed a present sink
     /// (retroos-play): the emulated VGA renders into the window.
+    #[cfg(feature = "hosted")]
     HostWindow,
     /// Nothing to display on (headless interp run): the emulated VGA still
     /// models state — screendumps and --screenshot remain possible.
@@ -56,6 +61,7 @@ pub enum Display {
 pub enum Firmware {
     /// A legacy BIOS owns F000 (far-JMP at the reset vector): DOS threads
     /// use the real ROM services.
+    #[cfg(not(feature = "hosted"))]
     NativeBios,
     /// No ROM (UEFI metal, interp's zeroed RAM): the DOS personality
     /// installs its substitute Rust BIOS (`dos/bios.rs`).
@@ -122,8 +128,10 @@ pub enum Media {
 pub enum DebugSink {
     /// Port 0xE9 debugcon (QEMU/Bochs `-debugcon`; harmlessly absent on
     /// real metal).
+    #[cfg(not(feature = "hosted"))]
     Debugcon,
     /// The host process's stdout (hosted backend).
+    #[cfg(feature = "hosted")]
     HostStdout,
 }
 
@@ -131,7 +139,17 @@ impl Display {
     /// Guest VGA port programming reaches the real card (vs the VgaState
     /// register model).
     pub fn vga_passthrough(self) -> bool {
-        matches!(self, Display::VgaCard)
+        // `VgaCard` only exists on metal (a hosted run never owns a real card),
+        // so the predicate is constant-false there.
+        #[cfg(feature = "hosted")]
+        {
+            let _ = self;
+            false
+        }
+        #[cfg(not(feature = "hosted"))]
+        {
+            matches!(self, Display::VgaCard)
+        }
     }
 }
 
@@ -313,11 +331,9 @@ fn gpt_collect_ext(out: &mut [u32]) -> usize {
             }
             // Collect every ext* partition (a multi-distro disk has several);
             // the first becomes the root, the rest mount as subdirectories.
-            if is_ext_partition(first_lba as u32) {
-                if n < out.len() {
-                    out[n] = first_lba as u32;
-                    n += 1;
-                }
+            if is_ext_partition(first_lba as u32) && n < out.len() {
+                out[n] = first_lba as u32;
+                n += 1;
             }
         }
     }
@@ -371,15 +387,15 @@ fn probe_media(machine: &mut crate::TheArch) -> Media {
         // the one that looks like a Linux root (/etc + /usr) at VFS /; fall back
         // to the first if none matches (e.g. the RetroOS image's own ext4).
         let mut root_idx = 0;
-        for i in 0..n {
-            if is_linux_root(parts[i]) { root_idx = i; break; }
+        for (i, &p) in parts.iter().enumerate().take(n) {
+            if is_linux_root(p) { root_idx = i; break; }
         }
         // The remaining ext partitions mount as C:\DISK1, C:\DISK2, …
         let mut extra_ext = [0u32; 3];
         let mut e = 0;
-        for i in 0..n {
+        for (i, &p) in parts.iter().enumerate().take(n) {
             if i != root_idx && e < extra_ext.len() {
-                extra_ext[e] = parts[i];
+                extra_ext[e] = p;
                 e += 1;
             }
         }

@@ -98,7 +98,7 @@ impl Dma8237 {
         }
         let hi = port >= 0xC0;
         // Normalize controller #2's ×2 register stride to 0..0x0F.
-        let reg = if hi { ((port - 0xC0) >> 1) as u16 } else { port };
+        let reg = if hi { (port - 0xC0) >> 1 } else { port };
         let chan_base = if hi { 4 } else { 0 };
         match reg {
             0x00..=0x07 => {
@@ -150,7 +150,7 @@ impl Dma8237 {
             return self.ch[chan].prog.page;
         }
         let hi = port >= 0xC0;
-        let reg = if hi { ((port - 0xC0) >> 1) as u16 } else { port };
+        let reg = if hi { (port - 0xC0) >> 1 } else { port };
         let chan_base = if hi { 4 } else { 0 };
         match reg {
             0x00..=0x07 => {
