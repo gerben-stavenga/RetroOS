@@ -108,6 +108,12 @@ impl PixelFormat {
 
     fn encode(self, rgb: u32) -> u32 {
         fn channel(value: u32, pos: u8, size: u8) -> u32 {
+            // 8-bit channels (the usual RGBX/BGRX framebuffers) need no rescale:
+            // (value*255+127)/255 == value. Skip the divide — it dominated the
+            // present blit. The multiply/divide is only needed for 15/16-bit.
+            if size == 8 {
+                return value << pos;
+            }
             let max = (1u64 << size) - 1;
             ((((value as u64 * max) + 127) / 255) << pos) as u32
         }
@@ -327,28 +333,55 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         *last = (w, h);
         out.fill(0);
     }
-    // Fixed-point (16.16) nearest-neighbour: step the source position by
-    // `src/out` per output pixel — no per-pixel divide, and handles the
-    // fractional (non-integer) scale the 4:3 fit requires. This blit runs at the
-    // present rate on the guest thread (its cost is stolen guest time), so the
-    // inner loop is kept tight: the format check is hoisted, and indices are
-    // provably in range (`sx>>16 < w`, `sy>>16 < h`, dst within `g.len`), so the
-    // bounds checks are elided with unchecked access.
+    // This blit runs at the present rate on the guest thread, so its cost is
+    // stolen guest time — and once a present exceeds the ~14ms frame budget the
+    // guest starves. `encode` (a per-channel multiply/divide) run per *output*
+    // pixel dominated it. Hoist it: encode each *source* row once into a staging
+    // row, then scale that row to the panel with a plain native copy — the inner
+    // (per-output-pixel) loop is just a load + store. Fixed-point 16.16
+    // nearest-neighbour stepping; indices are provably in range (`sx>>16 < w`,
+    // `sy>>16 < h`, dst within `g.len`), so bounds checks are elided.
     let x_step = ((w as u64) << 16) / out_w as u64;
     let y_step = ((h as u64) << 16) / out_h as u64;
     let native = g.format.is_native();
+    static mut ENC_ROW: [u32; 2048] = [0; 2048];
+    let enc = unsafe { &mut *(&raw mut ENC_ROW) };
     let mut sy = 0u64;
+    let mut prev_sry = usize::MAX;
     for oy in 0..out_h {
-        let src_row = unsafe { px.get_unchecked((sy >> 16) as usize * w..(sy >> 16) as usize * w + w) };
+        let sry = (sy >> 16) as usize;
+        sy += y_step;
         let drow = origin + oy * g.stride;
         let dst = unsafe { out.get_unchecked_mut(drow..drow + out_w) };
-        let mut sx = 0u64;
-        for d in dst.iter_mut() {
-            let rgb = unsafe { *src_row.get_unchecked((sx >> 16) as usize) };
-            *d = if native { rgb } else { g.format.encode(rgb) };
-            sx += x_step;
+        if w <= enc.len() {
+            // Encode this source row once (a copy when already native), then the
+            // hot loop below scales from the staging row with no per-pixel encode.
+            if sry != prev_sry {
+                prev_sry = sry;
+                let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
+                if native {
+                    enc[..w].copy_from_slice(src_row);
+                } else {
+                    for (e, &p) in enc[..w].iter_mut().zip(src_row) {
+                        *e = g.format.encode(p);
+                    }
+                }
+            }
+            let mut sx = 0u64;
+            for d in dst.iter_mut() {
+                *d = unsafe { *enc.get_unchecked((sx >> 16) as usize) };
+                sx += x_step;
+            }
+        } else {
+            // Source wider than the staging row (never for our modes): direct.
+            let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
+            let mut sx = 0u64;
+            for d in dst.iter_mut() {
+                let rgb = unsafe { *src_row.get_unchecked((sx >> 16) as usize) };
+                *d = if native { rgb } else { g.format.encode(rgb) };
+                sx += x_step;
+            }
         }
-        sy += y_step;
     }
     // The framebuffer is Write-Combining: its stores sit in the CPU's WC buffers
     // until something drains them. A display controller scanning out (real metal)
