@@ -71,6 +71,11 @@ pub enum ThreadState {
 /// Returned by the KernelEvent dispatch in `startup::event_loop`, by syscall
 /// dispatch, and by DPMI INT/exception paths. The event loop acts on it —
 /// personality code never touches scheduling.
+// ForkExec carries the exec payload inline; it is constructed and consumed in
+// the same event-loop turn (never stored), so the size gap to the unit variants
+// doesn't cost per-thread memory — boxing it would only add an alloc on the hot
+// fork/exec path.
+#[allow(clippy::large_enum_variant)]
 pub enum KernelAction {
     /// Nothing to do, continue current thread.
     Done,
@@ -149,6 +154,12 @@ pub enum PersonalityName {
     Linux,
 }
 
+// DosState is the large central DOS personality state; Linux processes carry
+// the small LinuxState. There are only a handful of live threads, and boxing
+// DosState would force a heap allocation + indirection on the hot DOS execution
+// path (and a 17-site deref-coercion refactor), so the inline variant is the
+// deliberate choice.
+#[allow(clippy::large_enum_variant)]
 pub enum Personality {
     /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode)
     Dos(DosState),
