@@ -247,6 +247,8 @@ rust_toolchain(
     rust_doc = "@rust_toolchain_x86_64_linux//:rustdoc_bin",
     rust_std = ":retro_stdlib",
     rustc = "@rust_toolchain_x86_64_linux//:rustc_bin",
+    rustc_lib = "@rust_toolchain_x86_64_linux//:rustc_lib",
+    clippy_driver = "//toolchain:clippy_driver_wrapper.sh",
     staticlib_ext = ".a",
     stdlib_linkflags = [],
     # Custom target JSON requires -Zunstable-options on recent nightlies.
@@ -274,6 +276,8 @@ rust_toolchain(
     rust_doc = "@rust_toolchain_x86_64_linux//:rustdoc_bin",
     rust_std = ":retro_stdlib",
     rustc = "@rust_toolchain_x86_64_linux//:rustc_bin",
+    rustc_lib = "@rust_toolchain_x86_64_linux//:rustc_lib",
+    clippy_driver = "//toolchain:clippy_driver_wrapper.sh",
     staticlib_ext = ".a",
     stdlib_linkflags = [],
     extra_rustc_flags = ["-Zunstable-options"],

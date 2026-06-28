@@ -8,7 +8,9 @@ filegroup(
 
 filegroup(
     name = "rustc_lib",
-    srcs = glob(["rustc/lib/**/*"]),
+    # rustc/lib (librustc_driver + LLVM) plus the real clippy-driver, so both land
+    # under the toolchain's single sysroot root and the clippy wrapper can reach them.
+    srcs = glob(["rustc/lib/**/*"]) + ["clippy-preview/bin/clippy-driver"],
 )
 
 filegroup(
@@ -19,6 +21,14 @@ filegroup(
 filegroup(
     name = "rustdoc_bin",
     srcs = ["rustc/bin/rustdoc"],
+)
+
+# The real clippy-driver binary, bundled into the toolchain's rustc_lib sysroot
+# tree (see :rustc_lib below) so the //toolchain wrapper can exec it. clippy_driver
+# itself points at that wrapper, which fixes up LD_LIBRARY_PATH for librustc_driver.
+filegroup(
+    name = "clippy_driver_real",
+    srcs = ["clippy-preview/bin/clippy-driver"],
 )
 
 filegroup(

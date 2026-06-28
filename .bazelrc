@@ -5,3 +5,10 @@ build --action_env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 build --host_action_env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 build --action_env=LD_LIBRARY_PATH=
 build --host_action_env=LD_LIBRARY_PATH=
+
+# Clippy: `bazel build --config=clippy <targets>` runs the rules_rust clippy
+# aspect and fails on any diagnostic (clippy runs under -D warnings, so every
+# lint is an error). Metal crates lint on the default platform; host-only crates
+# (arch-interp, retroos-host, retroos-play) need --platforms=@platforms//host.
+build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:clippy --output_groups=clippy_checks
