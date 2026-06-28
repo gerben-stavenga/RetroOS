@@ -49,3 +49,6 @@ kernel/Cargo.lock
 /CWSDPMI.MAP
 /CWSLNK.RSP
 /turboc.$ln
+
+# Python bytecode (test harness)
+__pycache__/
