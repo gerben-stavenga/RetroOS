@@ -193,7 +193,11 @@ static mut VGA: Vga = Vga::new();
 
 /// Access the global VGA state
 pub fn vga() -> &'static mut Vga {
-    unsafe { &mut *(&raw mut VGA) }
+    // Bind the raw pointer first, then deref the local: `&mut *(&raw mut VGA)`
+    // directly trips clippy::deref_addrof, while `&mut VGA` trips static_mut_refs.
+    // Borrowing through a separate raw-pointer local satisfies both.
+    let p = &raw mut VGA;
+    unsafe { &mut *p }
 }
 
 // =============================================================================

@@ -211,11 +211,11 @@ pub fn classify(bda_mode: u8, r: &Regs) -> Option<VgaMode> {
 /// plane-major.
 pub fn chain4_split(chained: &[u8], planes: &mut [u8]) {
     let n = chained.len().min(0x10000);
-    for i in 0..n {
+    for (i, &src) in chained.iter().enumerate().take(n) {
         let plane = i & 3;
         let off = i >> 2;
         if plane * 0x10000 + off < planes.len() {
-            planes[plane * 0x10000 + off] = chained[i];
+            planes[plane * 0x10000 + off] = src;
         }
     }
 }
@@ -224,10 +224,10 @@ pub fn chain4_split(chained: &[u8], planes: &mut [u8]) {
 /// back into the linear chained view on an unchain→chain hop.
 pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
     let n = chained.len().min(0x10000);
-    for i in 0..n {
+    for (i, dst) in chained.iter_mut().enumerate().take(n) {
         let plane = i & 3;
         let off = i >> 2;
-        chained[i] = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
+        *dst = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
     }
 }
 
@@ -324,9 +324,9 @@ pub fn planar_read(cur: [u8; 4], gc: &[u8; 9]) -> (u8, [u8; 4]) {
         let cc = gc[2] & 0x0F;
         let dc = gc[7] & 0x0F;
         let mut r = 0xFFu8;
-        for p in 0..4 {
+        for (p, &plane) in cur.iter().enumerate() {
             if dc & (1 << p) != 0 {
-                r &= if cc & (1 << p) != 0 { cur[p] } else { !cur[p] };
+                r &= if cc & (1 << p) != 0 { plane } else { !plane };
             }
         }
         r
@@ -520,16 +520,16 @@ pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
 /// the zero-copy-shaped path.
 fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitch: usize) {
     let vram = frame.vram;
-    let bpp8 = (bpp as usize + 7) / 8;
+    let bpp8 = (bpp as usize).div_ceil(8);
     let pitch = if pitch == 0 { w * bpp8 } else { pitch };
     let rd16 = |p: usize| (vram.get(p).copied().unwrap_or(0) as u16)
         | ((vram.get(p + 1).copied().unwrap_or(0) as u16) << 8);
     for y in 0..h {
         let base = y * pitch;
         let row = &mut out[y * w..y * w + w];
-        for x in 0..w {
+        for (x, px) in row.iter_mut().enumerate() {
             let p = base + x * bpp8;
-            row[x] = match bpp {
+            *px = match bpp {
                 8 => pal_rgb(frame.palette, vram.get(p).copied().unwrap_or(0)),
                 15 => {
                     let v = rd16(p);
@@ -575,8 +575,8 @@ fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
         };
         let base = start + ry * w + pan;
         let row = &mut out[y * w..y * w + w];
-        for x in 0..w {
-            row[x] = pal_rgb(frame.palette, vram.get(base + x).copied().unwrap_or(0));
+        for (x, px) in row.iter_mut().enumerate() {
+            *px = pal_rgb(frame.palette, vram.get(base + x).copied().unwrap_or(0));
         }
     }
 }
@@ -771,8 +771,7 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
     let bg = pal_rgb(frame.palette, (attr >> 4) & bg_mask);
     let glyph = &frame.font[ch * 16..ch * 16 + 16];
-    for gy in 0..CELL_H {
-        let bits = glyph[gy];
+    for (gy, &bits) in glyph.iter().enumerate() {
         let py = row * CELL_H + gy;
         for gx in 0..CELL_W {
             // Column 8 duplicates column 7 (VGA 9th-dot line-draw rule).
@@ -828,7 +827,7 @@ mod tests {
         r.gc[6] = 0x01;
         r.gc[5] = 0x00; // not 256, not cga-shift → planar 16
         r.crtc[1] = 39; // 40 chars → 320 px
-        r.crtc[0x12] = 199 & 0xFF;
+        r.crtc[0x12] = 199;
         r.crtc[7] = 0x00; // no overflow bits
         r.crtc[0x13] = 20; // 40 bytes/row
         match classify(0x0D, &r) {
@@ -843,8 +842,8 @@ mod tests {
     fn planar16_assembles_planes() {
         // Pixel 0 = colour 5 (planes 0 and 2 set at bit 7).
         let mut planes = vec![0u8; 4 * 0x10000];
-        planes[0 * 0x10000 + 0] = 0x80; // plane 0 bit 7
-        planes[2 * 0x10000 + 0] = 0x80; // plane 2 bit 7
+        planes[0] = 0x80; // plane 0 bit 7
+        planes[2 * 0x10000] = 0x80; // plane 2 bit 7
         let mut ac = [0u8; 21];
         for i in 0..16 { ac[i] = i as u8; }
         let pal = fallback_palette();
@@ -888,11 +887,11 @@ mod tests {
         let mut planes = vec![0u8; 4 * 0x10000];
         chain4_split(&chained, &mut planes);
         // Byte n must land in plane n&3 at n>>2.
-        assert_eq!(planes[0 * 0x10000 + 0], chained[0]);
-        assert_eq!(planes[1 * 0x10000 + 0], chained[1]);
-        assert_eq!(planes[2 * 0x10000 + 0], chained[2]);
-        assert_eq!(planes[3 * 0x10000 + 0], chained[3]);
-        assert_eq!(planes[0 * 0x10000 + 1], chained[4]);
+        assert_eq!(planes[0], chained[0]);
+        assert_eq!(planes[0x10000], chained[1]);
+        assert_eq!(planes[2 * 0x10000], chained[2]);
+        assert_eq!(planes[3 * 0x10000], chained[3]);
+        assert_eq!(planes[1], chained[4]);
         let mut back = vec![0u8; 0x10000];
         chain4_merge(&planes, &mut back);
         assert_eq!(&back[..64000], &chained[..64000]);
@@ -902,7 +901,7 @@ mod tests {
     fn modex_plane_select() {
         // Pixels 0..4 live in planes 0..3 at byte 0; set pixel 2 (plane 2) = 7.
         let mut planes = vec![0u8; 4 * 0x10000];
-        planes[2 * 0x10000 + 0] = 7;
+        planes[2 * 0x10000] = 7;
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {

@@ -77,7 +77,7 @@ impl Default for DemandHeap {
 impl Inner {
     /// Claim virtual address space (physical pages are demand-backed on access).
     fn extend_heap(&mut self, min_size: usize) -> bool {
-        let pages_needed = ((min_size + PAGE_SIZE - 1) / PAGE_SIZE).max(4);
+        let pages_needed = min_size.div_ceil(PAGE_SIZE).max(4);
 
         let region_start = self.mapped_end;
         let mut region_pages = 0;

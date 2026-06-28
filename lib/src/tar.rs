@@ -28,7 +28,7 @@ const _: () = assert!(core::mem::size_of::<TarHeader>() == 512);
 pub fn parse_octal(buf: &[u8]) -> u64 {
     let mut result = 0u64;
     for &c in buf {
-        if c < b'0' || c > b'7' {
+        if !(b'0'..=b'7').contains(&c) {
             break;
         }
         result = result * 8 + (c - b'0') as u64;
@@ -81,6 +81,6 @@ impl TarHeader {
 
     /// Number of 512-byte blocks for file data
     pub fn data_blocks(&self) -> u32 {
-        ((self.filesize() + 511) / 512) as u32
+        self.filesize().div_ceil(512) as u32
     }
 }
