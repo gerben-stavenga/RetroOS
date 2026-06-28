@@ -1,0 +1,39 @@
+#!/bin/bash
+# Hosted (interpreter) end-to-end smoke tests for CI.
+#
+# Each case boots a program on the software CPU (no QEMU/KVM) via
+# test/hosted_test.py, optionally drives keyboard input, and asserts the kernel
+# never panicked (and, for the text-mode DN shell, that its screen painted).
+# This is the "good way of running tests" the hosted backend gives us: it runs
+# on any GitHub-hosted runner. Add a case by appending a `run` line.
+#
+# Exit 0 = all passed.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+IMG=bazel-bin/image.bin          # the open-source image carries the committed games
+[ -f "$IMG" ] || { echo "no $IMG — run: bazelisk build //:image"; exit 1; }
+
+PY="python3 test/hosted_test.py --image $IMG"
+fail=0
+run() { local label="$1"; shift; echo "=== $label ==="; $PY "$@" || { fail=1; echo "  ^ FAILED: $label"; }; }
+
+# DN (Dos Navigator) boots into its text-mode file manager: assert the event
+# loop ran (no boot panic) and the panel painted. Note: launching a program
+# from DN's file panel with Enter is a known DPMI-overlay bug (see the
+# dn-enter-launch-bug memory) — not exercised here.
+run "DN boots + panel paints" \
+    --keys "" --settle 5 --timeout 20 \
+    --expect-log "event_loop entered" --expect-screen "free bytes on drive"
+
+# DIGGER: 16-bit real-mode game, launched headless + a few driven keystrokes.
+run "DIGGER (real-mode) + keyboard" \
+    --cmd "GAMES/DIGGER/DIGGER.EXE" --keys "wait:3,SPACE,wait:1,RIGHT,RIGHT,ENTER" \
+    --settle 2 --timeout 25
+
+# DOOM shareware: 32-bit DOS/4GW protected-mode game — reaching its setup
+# without a kernel panic exercises the DPMI + mode-13h path.
+run "DOOM (shareware, DPMI) boots" \
+    --cmd "GAMES/DOOMS/DOOM.EXE" --settle 2 --timeout 35
+
+exit $fail
