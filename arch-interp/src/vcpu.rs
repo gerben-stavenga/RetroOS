@@ -113,7 +113,7 @@ pub static mut REGS: Vcpu = Vcpu::new(Regs::empty(), RootPageTable::empty());
 
 /// Seed the live execution context. The `static mut` access is confined here.
 pub fn set_current_vcpu(v: Vcpu) {
-    unsafe { *(&raw mut REGS) = v; }
+    unsafe { REGS = v; }
 }
 
 /// Initialize guest memory: create the initial address space. The `len`

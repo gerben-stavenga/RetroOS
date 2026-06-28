@@ -375,13 +375,13 @@ pub struct PageTable32(pub RawPage);
 impl Index<usize> for PageTable32 {
     type Output = Entry32;
     fn index(&self, idx: usize) -> &Entry32 { 
-        unsafe { &core::mem::transmute::<_, &[Entry32; 1024]>(self)[idx] }
+        unsafe { &core::mem::transmute::<&PageTable32, &[Entry32; 1024]>(self)[idx] }
     }
 }
 
 impl IndexMut<usize> for PageTable32 {
     fn index_mut(&mut self, idx: usize) -> &mut Entry32 { 
-        unsafe { &mut core::mem::transmute::<_, &mut [Entry32; 1024]>(self)[idx] }
+        unsafe { &mut core::mem::transmute::<&mut PageTable32, &mut [Entry32; 1024]>(self)[idx] }
     }
 }
 
@@ -393,13 +393,13 @@ pub struct PageTable64(pub RawPage);
 impl Index<usize> for PageTable64 {
     type Output = Entry64;
     fn index(&self, idx: usize) -> &Entry64 { 
-        unsafe { &core::mem::transmute::<_, &[Entry64; 512]>(self)[idx] }
+        unsafe { &core::mem::transmute::<&PageTable64, &[Entry64; 512]>(self)[idx] }
     }
 }
 
 impl IndexMut<usize> for PageTable64 {
     fn index_mut(&mut self, idx: usize) -> &mut Entry64 { 
-        unsafe { &mut core::mem::transmute::<_, &mut [Entry64; 512]>(self)[idx] } 
+        unsafe { &mut core::mem::transmute::<&mut PageTable64, &mut [Entry64; 512]>(self)[idx] }
     }
 }
 
@@ -1079,7 +1079,7 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
     for i in 0..256 {
         let mut e = Entry32::new(i as u64, true, false);
         // VGA framebuffer (0xA0-0xBF) must be uncacheable
-        if i >= 0xA0 && i < 0xC0 {
+        if (0xA0..0xC0).contains(&i) {
             e.set_raw(e.raw() | flags::CACHE_DISABLE);
         }
         kpages.pt_kernel[512 + i] = e;
@@ -1149,7 +1149,7 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     // PT index 0-255 maps physical 0x00000000-0x000FFFFF
     for i in 0..256 {
         let mut e = Entry64::new(i as u64, true, false);
-        if i >= 0xA0 && i < 0xC0 {
+        if (0xA0..0xC0).contains(&i) {
             e.set_raw(e.raw() | flags::CACHE_DISABLE);
         }
         kpages.pt_kernel[i] = e;
@@ -1340,15 +1340,15 @@ pub fn fork_current(child_root: &mut RootPageTable) {
         Entries::E32(e) => {
             let mut buf = [Entry32::default(); PAGE_SIZE / core::mem::size_of::<Entry32>()];
             fork_generic(e, &mut buf);
-            for i in 0..user_count {
-                unsafe { child_root.e32[i] = buf[i]; }
+            for (i, item) in buf.iter().enumerate().take(user_count) {
+                unsafe { child_root.e32[i] = *item; }
             }
         }
         Entries::E64(e) => {
             let mut buf = [Entry64::default(); PAGE_SIZE / core::mem::size_of::<Entry64>()];
             fork_generic(e, &mut buf);
-            for i in 0..user_count {
-                unsafe { child_root.e64[i] = buf[i]; }
+            for (i, item) in buf.iter().enumerate().take(user_count) {
+                unsafe { child_root.e64[i] = *item; }
             }
         }
     }
@@ -1443,7 +1443,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         entries[idx] = E::new(p, true, user);
         invalidate_tlb();
         let saved = temp_swap(old_phys);
-        let src = unsafe { core::slice::from_raw_parts_mut((*&raw mut TEMP_PAGE).0.as_mut_ptr() as *mut E, epp) };
+        let src = unsafe { let tp = &raw mut TEMP_PAGE; core::slice::from_raw_parts_mut((*tp).0.as_mut_ptr() as *mut E, epp) };
         share_and_copy(src, &mut entries[child_base..child_base + epp]);
         phys_mm::free_phys_page(temp_swap(saved));
         return;
@@ -1453,18 +1453,19 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
             // Page 0: can't read from VA 0 (null ptr). Copy via temp_map.
             let scratch = &raw mut crate::SCRATCH;
             let saved = temp_swap(old_phys);
-            unsafe { core::ptr::copy_nonoverlapping(
-                (*&raw const TEMP_PAGE).0.as_ptr(), (*scratch).0.as_mut_ptr(), PAGE_SIZE); }
+            unsafe { let tp = &raw const TEMP_PAGE; core::ptr::copy_nonoverlapping(
+                (*tp).0.as_ptr(), (*scratch).0.as_mut_ptr(), PAGE_SIZE); }
             let _ = fresh_temp_page();
-            unsafe { core::ptr::copy_nonoverlapping(
-                (*scratch).0.as_ptr(), (*&raw mut TEMP_PAGE).0.as_mut_ptr(), PAGE_SIZE); }
+            unsafe { let tp = &raw mut TEMP_PAGE; core::ptr::copy_nonoverlapping(
+                (*scratch).0.as_ptr(), (*tp).0.as_mut_ptr(), PAGE_SIZE); }
             temp_swap(saved)
         } else {
             // Other pages: read directly from user VA
             let saved = fresh_temp_page();
             unsafe {
                 let src = (idx * PAGE_SIZE) as *const u8;
-                core::ptr::copy_nonoverlapping(src, (*&raw mut TEMP_PAGE).0.as_mut_ptr(), PAGE_SIZE);
+                let tp = &raw mut TEMP_PAGE;
+                core::ptr::copy_nonoverlapping(src, (*tp).0.as_mut_ptr(), PAGE_SIZE);
             }
             temp_swap(saved)
         }
@@ -1609,17 +1610,19 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     let saved = temp_swap(0); // map physical page 0 at temp VA
     let mut buf = [0u8; PAGE_SIZE];
     unsafe {
+        let tp = &raw const TEMP_PAGE;
         core::ptr::copy_nonoverlapping(
-            (*&raw const TEMP_PAGE).0.as_ptr(),
+            (*tp).0.as_ptr(),
             buf.as_mut_ptr(),
             PAGE_SIZE,
         );
     }
     let _ = fresh_temp_page();
     unsafe {
+        let tp = &raw mut TEMP_PAGE;
         core::ptr::copy_nonoverlapping(
             buf.as_ptr(),
-            (*&raw mut TEMP_PAGE).0.as_mut_ptr(),
+            (*tp).0.as_mut_ptr(),
             PAGE_SIZE,
         );
     }
@@ -1634,17 +1637,18 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     // 0x101000 would alloc its OWN phys Y, breaking the alias. Pre-
     // allocating ensures both PTEs reference the same phys page from the
     // start.
-    for i in 1..0x10usize {
+    for slot in entries.iter_mut().take(0x10usize).skip(1) {
         let saved2 = fresh_temp_page();
         unsafe {
+            let tp = &raw mut TEMP_PAGE;
             core::ptr::write_bytes(
-                (*&raw mut TEMP_PAGE).0.as_mut_ptr(),
+                (*tp).0.as_mut_ptr(),
                 0,
                 PAGE_SIZE,
             );
         }
         let new_phys = temp_swap(saved2);
-        entries[i] = E::new(new_phys, true, true);
+        *slot = E::new(new_phys, true, true);
     }
 
     // Pages 0x10-0x9F: conventional memory — left unmapped (demand-paged zero)
@@ -1653,16 +1657,16 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     // Pages 0xA0-0xBF: VGA framebuffer — identity mapped RW, cache disabled
     // PCD (bit 4) must be set so the CPU doesn't cache/combine writes.
     // VGA Odd/Even addressing relies on seeing individual byte accesses.
-    for i in 0xA0..0xC0usize {
+    for (i, slot) in entries.iter_mut().enumerate().take(0xC0usize).skip(0xA0) {
         let mut e = E::new(i as u64, true, true);
         e.set_raw(e.raw() | flags::CACHE_DISABLE);
-        entries[i] = e;
+        *slot = e;
     }
 
     // Pages 0xC0-0xFF: ROM/BIOS area — identity mapped RO by default.
     // UMB and EMS pages are cleared to not-present later by scan_uma().
-    for i in 0xC0..0x100usize {
-        entries[i] = E::new(i as u64, false, true);
+    for (i, slot) in entries.iter_mut().enumerate().take(0x100usize).skip(0xC0) {
+        *slot = E::new(i as u64, false, true);
     }
 
     // HMA (virt 0x100000..0x10FFFF) is set up by `PcMachine::new` in the DOS
@@ -1749,7 +1753,8 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
     assert!(data.len() <= PAGE_SIZE);
     let saved = fresh_temp_page();
     unsafe {
-        let dst = (*&raw mut TEMP_PAGE).0.as_mut_ptr();
+        let tp = &raw mut TEMP_PAGE;
+        let dst = (*tp).0.as_mut_ptr();
         core::ptr::write_bytes(dst, 0, PAGE_SIZE);
         core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
@@ -1799,16 +1804,12 @@ pub fn swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
     match entries() {
         Entries::E32(e) => {
             for i in 0..count {
-                let tmp = e[a_vpage + i];
-                e[a_vpage + i] = e[b_vpage + i];
-                e[b_vpage + i] = tmp;
+                e.swap(a_vpage + i, b_vpage + i);
             }
         }
         Entries::E64(e) => {
             for i in 0..count {
-                let tmp = e[a_vpage + i];
-                e[a_vpage + i] = e[b_vpage + i];
-                e[b_vpage + i] = tmp;
+                e.swap(a_vpage + i, b_vpage + i);
             }
         }
     }
@@ -1919,21 +1920,21 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
         data_start, data_end, data_start_page, data_end_page);
 
     // .text: read-only, executable (no NX)
-    for i in text_start_page..text_end_page {
-        entries[i].set_hw_writable(false);
-        entries[i].set_writable(false);
+    for slot in entries.iter_mut().take(text_end_page).skip(text_start_page) {
+        slot.set_hw_writable(false);
+        slot.set_writable(false);
     }
 
     // .rodata: read-only, non-executable
-    for i in text_end_page..rodata_end_page {
-        entries[i].set_hw_writable(false);
-        entries[i].set_writable(false);
-        entries[i].set_no_execute(true);
+    for slot in entries.iter_mut().take(rodata_end_page).skip(text_end_page) {
+        slot.set_hw_writable(false);
+        slot.set_writable(false);
+        slot.set_no_execute(true);
     }
 
     // .data/.bss: read-write, non-executable
-    for i in data_start_page..data_end_page {
-        entries[i].set_no_execute(true);
+    for slot in entries.iter_mut().take(data_end_page).skip(data_start_page) {
+        slot.set_no_execute(true);
     }
 
     invalidate_tlb();

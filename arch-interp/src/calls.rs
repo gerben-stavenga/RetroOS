@@ -49,7 +49,8 @@ pub fn do_arch_execute() -> KernelEvent {
 /// the incoming address space active. On entry `vcpu` holds the incoming state;
 /// on exit it holds the saved outgoing state (matching the metal contract).
 pub fn arch_switch_to(vcpu: &mut Vcpu, _hash_ptr: *mut u64, _fx_ptr: *mut FxState) {
-    let live = unsafe { &mut *(&raw mut crate::vcpu::REGS) };
+    let p = &raw mut crate::vcpu::REGS;
+    let live = unsafe { &mut *p };
     core::mem::swap(&mut live.regs, &mut vcpu.regs);
     core::mem::swap(&mut live.space, &mut vcpu.space);
     // `live` now holds the incoming context — activate its address space and

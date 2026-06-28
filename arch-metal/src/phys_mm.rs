@@ -33,8 +33,9 @@ static mut NEXT_FREE: usize = 0;
 pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kernel_low: u64, kernel_high: u64) {
     unsafe {
         // Mark all pages as reserved initially
-        for i in 0..MAX_PAGES {
-            PAGE_REFS[i] = RESERVED;
+        let pr = &raw mut PAGE_REFS;
+        for slot in (*pr).iter_mut() {
+            *slot = RESERVED;
         }
 
         // Mark available regions from memory map
@@ -49,8 +50,8 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
                 continue;
             }
 
-            let start_page = (entry.base as u64 + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
-            let end_page = ((entry.base + entry.length) as u64) / PAGE_SIZE as u64;
+            let start_page = entry.base.div_ceil(PAGE_SIZE as u64);
+            let end_page = (entry.base + entry.length) / PAGE_SIZE as u64;
 
             for page in start_page..end_page {
                 if (page as usize) < MAX_PAGES {
@@ -60,8 +61,8 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
         }
 
         // Mark first 1MB as reserved (BIOS, video memory, etc)
-        for i in 0..256 {
-            PAGE_REFS[i] = RESERVED;
+        for slot in (*pr).iter_mut().take(256) {
+            *slot = RESERVED;
         }
 
         // Mark kernel pages as used
@@ -84,9 +85,9 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
         // buffer is live at a time (foreground thread owns the card).
         let mut p = 256usize;
         while p + DMA_POOL_PAGES <= DMA_MAX_PAGE.min(MAX_PAGES) {
-            if p % DMA_POOL_PAGES != 0 { p += 1; continue; } // 64 KB align
+            if !p.is_multiple_of(DMA_POOL_PAGES) { p += 1; continue; } // 64 KB align
             if (p..p + DMA_POOL_PAGES).all(|i| PAGE_REFS[i] == 0) {
-                for i in p..p + DMA_POOL_PAGES { PAGE_REFS[i] = RESERVED; }
+                for slot in (*pr).iter_mut().skip(p).take(DMA_POOL_PAGES) { *slot = RESERVED; }
                 DMA_POOL_START = p;
                 break;
             }
@@ -97,9 +98,9 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
         // one 128 KB-aligned, contiguous, < 16 MB block, marked RESERVED.
         let mut p = 256usize;
         while p + DMA_BUFS_PAGES <= DMA_MAX_PAGE.min(MAX_PAGES) {
-            if p % DMA_BUF_16BIT_PAGES != 0 { p += 1; continue; }
+            if !p.is_multiple_of(DMA_BUF_16BIT_PAGES) { p += 1; continue; }
             if (p..p + DMA_BUFS_PAGES).all(|i| PAGE_REFS[i] == 0) {
-                for i in p..p + DMA_BUFS_PAGES { PAGE_REFS[i] = RESERVED; }
+                for slot in (*pr).iter_mut().skip(p).take(DMA_BUFS_PAGES) { *slot = RESERVED; }
                 DMA_BUFS_BASE = p;
                 break;
             }
@@ -207,7 +208,7 @@ pub fn inc_shared_count(page: u64) -> bool {
         if count == 0 || count == RESERVED {
             return false;
         }
-        if count + 1 >= RESERVED {
+        if count + 1 == RESERVED {
             panic!("refcount overflow: page {:#x} count {}", page, count);
         }
 
@@ -295,8 +296,9 @@ pub fn alloc_contig(num_pages: usize) -> Option<u64> {
         let mut start = 256; // skip the first 1 MiB (BIOS/IVT/VGA)
         while start + num_pages <= MAX_PAGES {
             if (start..start + num_pages).all(|i| PAGE_REFS[i] == 0) {
-                for i in start..start + num_pages {
-                    PAGE_REFS[i] = RESERVED;
+                let pr = &raw mut PAGE_REFS;
+                for slot in (*pr).iter_mut().skip(start).take(num_pages) {
+                    *slot = RESERVED;
                 }
                 return Some(start as u64);
             }
@@ -310,8 +312,9 @@ pub fn alloc_contig(num_pages: usize) -> Option<u64> {
 pub fn free_page_count() -> usize {
     let mut count = 0;
     unsafe {
-        for i in 0..MAX_PAGES {
-            if PAGE_REFS[i] == 0 {
+        let pr = &raw const PAGE_REFS;
+        for &c in (*pr).iter() {
+            if c == 0 {
                 count += 1;
             }
         }

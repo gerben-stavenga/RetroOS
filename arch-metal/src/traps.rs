@@ -253,7 +253,7 @@ fn arch_dispatch(regs: &mut Regs) {
                 regs.rdx as usize, regs.rcx as u32).unwrap_or(0);
         }
         arch_call::FREE_PHYS_CONTIG => {
-            crate::phys_mm::free_phys_contig(regs.rdx as u64, regs.rcx as usize);
+            crate::phys_mm::free_phys_contig(regs.rdx, regs.rcx as usize);
         }
         arch_call::REARM_IRQ => {
             crate::irq::rearm_irq(regs.rdx as u8);
@@ -316,7 +316,8 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
 }
 
 fn swap_regs(regs: &mut Regs) {
-    unsafe { core::mem::swap(regs, &mut (*(&raw mut REGS)).regs); }
+    let p = &raw mut REGS;
+    unsafe { core::mem::swap(regs, &mut (*p).regs); }
 }
 
 /// Switch threads: swap live state with pointed-to state.
@@ -349,7 +350,8 @@ fn arch_switch_to(regs: &mut Regs) {
     }
 
     // Swap regs
-    unsafe { core::mem::swap(&mut *regs_ptr, &mut (*(&raw mut REGS)).regs); }
+    let regs_p = &raw mut REGS;
+    unsafe { core::ptr::swap(regs_ptr, &raw mut (*regs_p).regs); }
 
     // Log incoming struct PDE[0] before swap
     let _pre_pde0 = unsafe { (*root_ptr).e32[0].0 };
@@ -679,7 +681,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
         }
         14 => {
             if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
-            KE::PageFault { addr: x86::read_cr2() as u32 }
+            KE::PageFault { addr: x86::read_cr2() }
         }
         32..=47 => { handle_irq(regs); KE::Irq }
         // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
@@ -783,10 +785,11 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
     }
 
     // Kernel fault in heap region: demand-page a real writable page
-    if !user && fault_addr >= KERNEL_BASE && fault_addr < paging2::HEAP_END {
+    if !user && (KERNEL_BASE..paging2::HEAP_END).contains(&fault_addr) {
         let heap_start = paging2::heap_base();
         if fault_addr >= heap_start && !present {
-            return Some(demand_page_kernel(fault_addr));
+            demand_page_kernel(fault_addr);
+            return Some(());
         }
         // Present fault or below heap_base in kernel space is a bug
         return None;

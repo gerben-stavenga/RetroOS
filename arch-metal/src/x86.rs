@@ -48,13 +48,14 @@ static mut CLEAN_FX: FxState = FxState::zeroed();
 /// Capture the current (just-initialized) FPU state as the template for new
 /// threads. Call once, immediately after `fninit`, during host bring-up.
 pub fn capture_clean_fx_template() {
-    unsafe { (*(&raw mut CLEAN_FX)).save(); }
+    let p = &raw mut CLEAN_FX;
+    unsafe { (*p).save(); }
 }
 
 /// Return a copy of the clean FPU template for initializing a new thread's
 /// save area.
 pub fn clean_fx_template() -> FxState {
-    unsafe { *(&raw const CLEAN_FX) }
+    unsafe { CLEAN_FX }
 }
 
 /// Read CR0 register
@@ -68,6 +69,11 @@ pub fn read_cr0() -> u32 {
 }
 
 /// Write CR0 register
+///
+/// # Safety
+///
+/// The caller must ensure `value` is a valid CR0 configuration for the current
+/// CPU mode; an invalid control-register write can fault or corrupt execution.
 #[inline]
 pub unsafe fn write_cr0(value: u32) {
     unsafe { asm!("mov cr0, {}", in(reg) value, options(nostack)); }
@@ -94,6 +100,11 @@ pub fn read_cr3() -> u32 {
 }
 
 /// Write CR3 register (page directory base)
+///
+/// # Safety
+///
+/// The caller must ensure `value` points at a valid, properly built page
+/// directory; loading a bad CR3 makes all subsequent memory accesses fault.
 #[inline]
 pub unsafe fn write_cr3(value: u32) {
     unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack)); }
@@ -139,6 +150,12 @@ pub fn read_cr4() -> u32 {
 }
 
 /// Write CR4 register
+///
+/// # Safety
+///
+/// The caller must ensure `value` is a valid CR4 configuration; toggling
+/// feature bits the rest of the kernel does not expect can fault or corrupt
+/// execution.
 #[inline]
 pub unsafe fn write_cr4(value: u32) {
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nostack)); }
@@ -274,24 +291,44 @@ pub(super) unsafe fn write_dr7(value: u32) {
 }
 
 /// Load Global Descriptor Table
+///
+/// # Safety
+///
+/// The caller must ensure `gdt_ptr` describes a valid GDT that stays alive and
+/// is consistent with the segment selectors currently in use.
 #[inline]
 pub unsafe fn lgdt(gdt_ptr: &GdtPtr) {
     unsafe { asm!("lgdt [{}]", in(reg) gdt_ptr, options(nostack)); }
 }
 
 /// Load Interrupt Descriptor Table
+///
+/// # Safety
+///
+/// The caller must ensure `idt_ptr` describes a valid IDT that stays alive;
+/// loading a malformed IDT makes the next interrupt fault.
 #[inline]
 pub unsafe fn lidt(idt_ptr: &IdtPtr) {
     unsafe { asm!("lidt [{}]", in(reg) idt_ptr, options(nostack)); }
 }
 
 /// Load Task Register
+///
+/// # Safety
+///
+/// The caller must ensure `selector` references a valid TSS descriptor in the
+/// current GDT.
 #[inline]
 pub unsafe fn ltr(selector: u16) {
     unsafe { asm!("ltr {:x}", in(reg) selector, options(nostack)); }
 }
 
 /// Load Local Descriptor Table register
+///
+/// # Safety
+///
+/// The caller must ensure `selector` references a valid LDT descriptor in the
+/// current GDT.
 #[inline]
 pub unsafe fn lldt(selector: u16) {
     unsafe { asm!("lldt {:x}", in(reg) selector, options(nostack)); }
@@ -391,6 +428,11 @@ pub fn rdmsr(msr: u32) -> u64 {
 }
 
 /// Write Model Specific Register
+///
+/// # Safety
+///
+/// The caller must ensure `msr` is a writable MSR and `value` is valid for it;
+/// a bad write can `#GP` or change CPU behaviour globally.
 #[inline]
 pub unsafe fn wrmsr(msr: u32, value: u64) {
     let low = value as u32;
@@ -407,6 +449,11 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
 }
 
 /// Reload all data segment registers
+///
+/// # Safety
+///
+/// The caller must ensure both selectors reference valid descriptors in the
+/// active GDT; the far return reloads CS, so a bad `code_selector` faults.
 #[inline]
 pub unsafe fn reload_segments(data_selector: u16, code_selector: u16) {
     unsafe {

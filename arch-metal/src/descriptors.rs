@@ -263,6 +263,7 @@ impl Tss {
 ///   stay trapped even with a real card (flip-flop tracking + retrace
 ///   fabrication), preserving the exact legacy-metal behaviour.
 /// - Interrupt redirection: trap handled INTs to monitor, rest through IVT
+///
 /// Safety: caller must ensure exclusive access to the TSS.
 unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     unsafe {
@@ -560,7 +561,7 @@ pub fn set_tls_entry(index: i32, base: u32, limit: u32, limit_in_pages: bool) ->
         GDT_TLS_START
     } else {
         let i = index as usize;
-        if i < GDT_TLS_START || i >= GDT_TLS_START + 3 { return -1; }
+        if !(GDT_TLS_START..GDT_TLS_START + 3).contains(&i) { return -1; }
         i
     };
 

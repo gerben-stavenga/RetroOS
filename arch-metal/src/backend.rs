@@ -41,9 +41,9 @@ impl Arch for Metal {
     // register file only (~200 B) — the address space / CR3 is touched only at
     // switch. (The internal frame goes away when the globals migrate into `Metal`.)
     fn execute(&mut self, vcpu: &mut Vcpu<RootPageTable>) -> KernelEvent {
-        unsafe { *(&raw mut super::traps::REGS) = *vcpu; }
+        unsafe { super::traps::REGS = *vcpu; }
         let ev = super::calls::do_arch_execute();
-        *vcpu = unsafe { *(&raw const super::traps::REGS) };
+        *vcpu = unsafe { super::traps::REGS };
         ev
     }
     fn switch_to(
@@ -53,15 +53,15 @@ impl Arch for Metal {
         hash_ptr: *mut u64,
         fx_ptr: *mut FxState,
     ) {
-        unsafe { *(&raw mut super::traps::REGS) = *live; }
+        unsafe { super::traps::REGS = *live; }
         super::calls::arch_switch_to(swap, hash_ptr, fx_ptr);
-        *live = unsafe { *(&raw const super::traps::REGS) };
+        *live = unsafe { super::traps::REGS };
     }
 
     // ── Timer ──
     fn get_ticks(&self) -> u64 { super::irq::get_ticks() }
     fn take_pending_ticks(&mut self) -> u32 { super::irq::take_pending_ticks() }
-    fn drain(&mut self, f: &mut dyn FnMut(Irq)) { super::irq::drain(|e| f(e)) }
+    fn drain(&mut self, f: &mut dyn FnMut(Irq)) { super::irq::drain(f) }
     fn rdtsc(&self) -> u64 { super::x86::rdtsc() }
 
     // ── IRQ lines ──

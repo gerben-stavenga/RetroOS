@@ -47,8 +47,8 @@ impl InterpView<'_> {
     fn load<const N: usize>(&mut self, lin: u32) -> [u8; N] {
         let id = self.space.0;
         let mut b = [0u8; N];
-        for i in 0..N {
-            b[i] = unsafe { *crate::paging::resolve_in_space(id, lin.wrapping_add(i as u32)) };
+        for (i, slot) in b.iter_mut().enumerate() {
+            *slot = unsafe { *crate::paging::resolve_in_space(id, lin.wrapping_add(i as u32)) };
         }
         b
     }
@@ -79,8 +79,6 @@ impl GuestView for InterpView<'_> {
     #[inline]
     fn int_intercepted(&mut self, vector: u8) -> bool { crate::desc::int_intercepted(vector) }
 }
-
-const PAGE: u64 = 4096;
 
 /// Instructions between forced returns to the kernel — the timer-IRQ delivery
 /// grid. A trap returns before this is spent and the *remainder* carries over
@@ -342,7 +340,8 @@ pub fn execute() -> KernelEvent {
         // it's valid — the CPU thread).
         crate::screendump::maybe_dump();
         crate::screendump::maybe_render_live();
-        let regs = unsafe { &mut (*(&raw mut vcpu::REGS)).regs };
+        let p = &raw mut vcpu::REGS;
+        let regs = unsafe { &mut (*p).regs };
         let mode = regs.mode();
         // Virtual-IF stepping: while a PM client has its virtual IF (VIF) off,
         // emulate the leading IF-touching opcodes in software so we only ever
@@ -353,7 +352,7 @@ pub fn execute() -> KernelEvent {
             // bubbles as an Event — surface it rather than re-entering. The view
             // is bound to the interpreted thread's own space (REGS.space), not
             // the globally-active one.
-            let mut view = InterpView { space: unsafe { &mut (*(&raw mut vcpu::REGS)).space } };
+            let mut view = InterpView { space: unsafe { &mut (*p).space } };
             if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if(regs, &mut view) {
                 return ev;
             }
@@ -471,7 +470,7 @@ pub fn execute() -> KernelEvent {
             // (duke3d/raptor at sound init); forwarding the #GP to the client's
             // own handler cascaded into a wild jump.
             if n == 13 && !is_int && uc.get_data().pending_err == 0 {
-                let mut view = InterpView { space: unsafe { &mut (*(&raw mut vcpu::REGS)).space } };
+                let mut view = InterpView { space: unsafe { &mut (*p).space } };
                 match arch_abi::monitor::monitor(regs, &mut view) {
                     MonitorResult::Resume => continue,
                     MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
