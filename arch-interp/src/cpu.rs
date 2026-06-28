@@ -517,6 +517,13 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
 
 const IF_FLAG: u32 = 1 << 9;
 const TF_FLAG: u32 = 1 << 8;
+/// NT (Nested Task, EFLAGS bit 14). A real `INT` clears NT on entry, so DOS/DPMI
+/// guests never legitimately run with it set; the interp's software INT
+/// reflection doesn't clear it, so a once-set NT would persist and turn the
+/// guest's next `IRET` into a task-switch return (wild fault). We strip it on
+/// every guest entry so the interp matches metal (NT=0). Without this, Dos
+/// Navigator's launch path faults with Borland RTE 204.
+const NT_FLAG: u32 = 1 << 14;
 /// VIF (EFLAGS bit 19) — the kernel's canonical store for the guest's virtual
 /// interrupt flag, shared with arch-metal. The interpreter runs the guest with
 /// its IF in the native bit-9 slot, so the entry/exit boundary mirrors between
@@ -807,7 +814,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // interrupt state. NEVER IOPL=3: that lets the guest toggle the real
             // IF behind the kernel's back and bypasses the per-swap-in IO bitmap.
             // Project VIF (bit 19) into the bit-9 IF slot the guest runs with.
-            let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32)) | (VM_FLAG as u32) | (1 << 12) | 2);
+            let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32) & !NT_FLAG) | (VM_FLAG as u32) | (1 << 12) | 2);
             let frame = [
                 r.ip32() & 0xFFFF,
                 r.code_seg() as u32,
@@ -829,7 +836,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // IF-touching opcodes in software. With IF on we run at full speed.
             // Project VIF (bit 19) into the bit-9 IF slot; then if the guest's IF
             // is off, single-step so POPF/IRET get caught (CPL>IOPL drops them).
-            let mut flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32)) | (1 << 12) | 2);
+            let mut flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG) | (1 << 12) | 2);
             if flags & IF_FLAG == 0 {
                 flags |= TF_FLAG; // step the next non-sensitive instruction
             }
