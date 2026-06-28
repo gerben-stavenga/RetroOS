@@ -26,7 +26,6 @@ pub mod arch_call {
     pub const COPY_PAGE_ENTRIES: u64 = 0x10C;
     pub const SWAP_PAGE_ENTRIES: u64 = 0x10E;
     pub const UNMAP_RANGE: u64 = 0x10F;
-    pub const FREE_RANGE: u64 = 0x110;
     pub const LOAD_LDT: u64 = 0x115;
     pub const MAP_PHYS_RANGE: u64 = 0x116;
     pub const SET_TLS_ENTRY: u64 = 0x117;
@@ -111,12 +110,6 @@ pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
 /// Clear entries to absent (enables demand paging on next access).
 pub fn arch_unmap_range(base_page: usize, count: usize) {
     crate::mmu::unmap(base_page, count);
-    crate::cpu::invalidate_uc(base_page, count);
-}
-
-/// Free physical pages over a range.
-pub fn arch_free_range(base_page: usize, count: usize) {
-    crate::mmu::free(base_page, count);
     crate::cpu::invalidate_uc(base_page, count);
 }
 

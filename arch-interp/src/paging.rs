@@ -450,19 +450,6 @@ pub fn active_id() -> u32 {
     SPACES.with(|s| s.borrow().active)
 }
 
-/// Free `count` pages at `vpage`: drop the PTEs and return the frames to the
-/// allocator (arch FREE_RANGE — the metal call releases physical frames).
-pub fn space_free(vpage: usize, count: usize) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let v = ((vpage + i) * 4096) as u32;
-            if let Some(pa) = translate(pd, v) {
-                phys::free_frames((pa >> 12) as u64, 1);
-            }
-            unmap_page(pd, v);
-        }
-    });
-}
 
 /// Map `count` pages at `vpage` to fresh zeroed frames (the memfd reads zero
 /// for never-written frames, and the bump allocator never reuses one).

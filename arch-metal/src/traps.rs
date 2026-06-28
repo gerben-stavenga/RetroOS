@@ -93,7 +93,6 @@ pub mod arch_call {
     pub const COPY_PAGE_ENTRIES: u64 = 0x10C; // EDX=src_vpage, ECX=dst_vpage, EBX=count — copy entries src→dst
     pub const SWAP_PAGE_ENTRIES: u64 = 0x10E; // EDX=a_vpage, ECX=b_vpage, EBX=count — swap entries a↔b
     pub const UNMAP_RANGE: u64 = 0x10F;  // EDX=vpage_start, ECX=count — clear entries to absent
-    pub const FREE_RANGE: u64 = 0x110;   // EDX=vpage_start, ECX=count — free phys + identity-map RO
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start ECX=num_pages EBX=ppage_lo ESI=ppage_hi EDI=flags
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
@@ -235,7 +234,6 @@ fn arch_dispatch(regs: &mut Regs) {
             paging2::swap_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
         }
         arch_call::UNMAP_RANGE => paging2::unmap_range(regs.rdx as usize, regs.rcx as usize),
-        arch_call::FREE_RANGE => paging2::free_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }

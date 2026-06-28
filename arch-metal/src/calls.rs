@@ -147,18 +147,6 @@ pub fn arch_unmap_range(base_page: usize, count: usize) {
     }
 }
 
-/// Free physical pages and restore identity-mapped read-only entries.
-pub fn arch_free_range(base_page: usize, count: usize) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::FREE_RANGE as u32,
-            in("edx") base_page as u32,
-            in("ecx") count as u32,
-        );
-    }
-}
-
 
 
 

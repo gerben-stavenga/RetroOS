@@ -1843,30 +1843,6 @@ pub fn unmap_range(base_page: usize, num_pages: usize) {
     flush_tlb();
 }
 
-/// Free physical pages and restore identity-mapped read-only entries.
-pub fn free_range(base_page: usize, num_pages: usize) {
-    match entries() {
-        Entries::E32(e) => {
-            for i in 0..num_pages {
-                let ent = e[base_page + i];
-                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
-                    crate::phys_mm::free_phys_page(ent.addr() >> 12);
-                }
-                e[base_page + i] = Entry32::new((base_page + i) as u64, false, true);
-            }
-        }
-        Entries::E64(e) => {
-            for i in 0..num_pages {
-                let ent = e[base_page + i];
-                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
-                    crate::phys_mm::free_phys_page(ent.addr() >> 12);
-                }
-                e[base_page + i] = Entry64::new((base_page + i) as u64, false, true);
-            }
-        }
-    }
-    flush_tlb();
-}
 
 /// Replace a range with fresh anonymous user-RW frames. Owned (non-MMIO)
 /// frames currently mapped are freed first; cache-disabled / externally-

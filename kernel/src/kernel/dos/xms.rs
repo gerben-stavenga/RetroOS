@@ -549,7 +549,7 @@ fn umb_free(machine: &mut crate::TheArch, segment: u16) -> bool {
     }
     let count = (i - offset) as usize;
     and64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, !mask);
-    machine.free_range(page, count);
+    machine.unmap_range(page, count);
     true
 }
 

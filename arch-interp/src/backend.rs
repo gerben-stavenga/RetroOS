@@ -77,7 +77,6 @@ impl Arch for Interp {
         crate::calls::arch_swap_page_entries(a_vpage, b_vpage, count)
     }
     fn unmap_range(&mut self, base_page: usize, count: usize) { crate::calls::arch_unmap_range(base_page, count) }
-    fn free_range(&mut self, base_page: usize, count: usize) { crate::calls::arch_free_range(base_page, count) }
     fn map_fresh_range(&mut self, vpage: usize, count: usize) { crate::calls::arch_map_fresh_range(vpage, count) }
     fn load_ldt(&mut self, ldt: &[u64]) { crate::calls::arch_load_ldt(ldt) }
     fn map_phys_range(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {

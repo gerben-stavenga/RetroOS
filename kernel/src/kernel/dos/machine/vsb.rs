@@ -442,7 +442,7 @@ impl SoundBlaster {
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
-            machine.free_range(vbase >> 12, num_pages);
+            machine.unmap_range(vbase >> 12, num_pages);
             machine.map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
             regs.copy_to(vbase as usize, &snap);
