@@ -638,9 +638,13 @@ pub fn svga_leave(machine: &mut crate::TheArch, pc: &mut PcMachine) {
     }
     let pages = svga_banks(pc.vga.svga_w, pc.vga.svga_h, pc.vga.svga_bpp) * WINDOW_PAGES;
     // Detach the window alias (drops its shared ref on the current bank), then
-    // free the framebuffer region.
+    // free the framebuffer region. unmap_range (not free_range): it frees the
+    // frames and leaves the entries *absent*. free_range instead restores an
+    // identity mapping (physical = virtual page), which for this 1 GB region
+    // would point at the non-existent physical frame 0x40000 — address-space
+    // teardown then panics trying to free it.
     machine.map_fresh_range(A0000 >> 12, WINDOW_PAGES);
-    machine.free_range(SVGA_LFB_BASE >> 12, pages);
+    machine.unmap_range(SVGA_LFB_BASE >> 12, pages);
     pc.vga.svga_w = 0;
     pc.vga.svga_h = 0;
     pc.vga.svga_bpp = 0;
