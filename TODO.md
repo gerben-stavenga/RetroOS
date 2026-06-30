@@ -241,6 +241,49 @@ multiboot map called free, or something interrupt/time-driven).
       setuptools file. Remedy (documented in 7aab93a): delete the
       `rules_python~~python~*` external dir + `.marker`, rebuild.
 
+## 9. arch-interp translation-cache coherence (stale-TB class)
+Root cause of the long-standing "DN file-panel Enter can't launch digger" bug
+(Borland RTE 204): the interp loads guest **code** host-side — DOS overlay/EXE
+loads, relocations, BSS go through `vcpu.rs` `GuestBytes` (`host.write_volatile`),
+which bypasses Unicorn's self-modifying-code detection. Unicorn kept executing a
+**stale translation block** of the page's previous content (mis-sized DN's
+`les di,[bp+6]` to 2 bytes → corrupted IP/flow). Works on metal because a real
+CPU guarantees store-vs-fetch coherence (I-cache snoop + serialization on the
+overlay's far call). `flush_tlb` only did `ctl_flush_tlb` (softmmu TLB), never
+`ctl_flush_tb` (translated code). Reconciles every prior failed lead — the
+executed instruction *stream* was stale, so all the register/SP/null-ptr
+"divergences" were downstream noise.
+- [x] **Per-write TB invalidation (the fix).** `cpu::invalidate_code_range`
+      (`ctl_remove_cache` per page — frames are scattered, so the range isn't
+      physically contiguous) called from every `vcpu.rs` host-side write
+      (`write`/`copy_to`/`zero`/`copy_within`). Restores x86 store-vs-fetch
+      coherence at the one choke point, covering all code-load sources by
+      construction. `invalidate_uc` also upgraded to drop TBs for its range
+      (COW/remap frame-reuse: a recycled physical frame can carry a previous
+      owner's TBs). Verified: DN launches digger, RTE-204 idle loop gone.
+      Regression tests `arch-interp/tests/{les_decode,stale_tb}.rs`.
+- [ ] **No-translation-cache CI mode (the "never again" net).** `RETRO_FLUSH_TB=1`
+      already flushes ALL TBs at slice entry (`configure`), forcing re-decode of
+      every instruction from current memory — staleness becomes structurally
+      impossible. Wire a CI job that runs the DOS/game suite twice (cached vs
+      `RETRO_FLUSH_TB`): **any** behavioral divergence is, by definition, a
+      missing invalidation, caught the moment it's introduced. (No true Unicorn
+      interpreter mode exists; per-slice/per-block flush is the equivalent.)
+- [ ] **Batch the invalidation (perf optimization).** Per-write `ctl_remove_cache`
+      runs on every guest write incl. tiny BDA/stack pokes, and each does a
+      `get_page_addr_code` softmmu walk. Instead, accumulate written
+      `(space, page)` ranges in a thread-local dirty set during the kernel turn
+      and drain them once at the next `configure` (slice entry) — where CR3 is
+      freshly loaded for the space about to run, so `ctl_remove_cache` resolves
+      against the correct page tables (also fixes the theoretical cross-space
+      case the per-write version resolves against the *last* slice's CR3).
+      Collapse to a single `ctl_flush_tb` when the dirty set is large.
+- [ ] **Cleanup.** Strip the remaining ad-hoc launch-debug instrumentation in
+      `arch-interp/src/{cpu.rs,vcpu.rs}` (INSN/ITREG/STRINT/WR* hooks, the
+      `0x3db93` probes) and the metal `pm_step_log` SI/DI/BP additions, kept
+      across the hunt. Keep `RETRO_FLUSH_TB` (now the diagnostic mode above) and
+      the two isolation tests.
+
 ---
 
 ## Mode X DONE; Doom slow = store ceiling, not the VGA path (measured 2026-06-12)

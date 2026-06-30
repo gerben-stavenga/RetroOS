@@ -587,10 +587,51 @@ fn budget_spent() -> bool {
 /// active space's page tables. `configure` reloads CR3 at the start of every
 /// slice (a full TLB flush), so the only window this must cover is a mutation
 /// applied while the CPU is already configured — handled by a CR3 rewrite.
-pub fn invalidate_uc(_vpage: usize, _count: usize) {
+pub fn invalidate_uc(vpage: usize, count: usize) {
     MACHINE.with(|cell| {
         if let Some(uc) = cell.borrow_mut().as_mut() {
             flush_tlb(uc);
+            // Also drop cached TRANSLATIONS for the affected linears, not just the
+            // softmmu TLB: a COW/remap can repoint a linear at a freshly recycled
+            // physical frame that still carries a previous owner's TBs (TBs are
+            // keyed by physical addr), and `flush_tlb` alone would leave Unicorn
+            // running that stale code. Per page (frames are scattered, so a range
+            // isn't physically contiguous — see `invalidate_code_range`).
+            for p in 0..count {
+                let lin = ((vpage + p) as u64) << 12;
+                let _ = uc.ctl_remove_cache(lin, lin + 0x1000);
+            }
+        }
+    });
+}
+
+/// Drop Unicorn's cached translations for guest-linear `[addr, addr+len)`. Called
+/// from the host-side guest-memory write path (`vcpu.rs`) so that code loaded into
+/// guest RAM by the kernel — DOS overlay/EXE loads, relocations, BSS — invalidates
+/// any stale TB, restoring the x86 store-vs-fetch coherence the real CPU gives for
+/// free (and that Unicorn only honors for stores routed through its own softmmu,
+/// which a direct host-pointer write bypasses). Invalidates PER PAGE: the interp's
+/// frames are scattered, so `ctl_remove_cache(gva, gva+len)` — which resolves the
+/// START gva to a physical addr and adds `len` in PHYSICAL space — would hit the
+/// wrong frames past the first page boundary.
+///
+/// `try_borrow`: the `vcpu.rs` write path runs only in kernel context (between
+/// slices); in-`emu_start` reflections write via `InterpView` (direct paging), not
+/// this path. The guard keeps a future re-entrant write from panicking — it would
+/// silently skip, which `RETRO_FLUSH_TB` would then surface.
+pub fn invalidate_code_range(addr: u32, len: u32) {
+    if len == 0 {
+        return;
+    }
+    MACHINE.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else { return };
+        let Some(uc) = slot.as_mut() else { return };
+        let end = addr as u64 + len as u64;
+        let mut p = (addr as u64) & !0xFFF;
+        while p < end {
+            let page_end = p + 0x1000;
+            let _ = uc.ctl_remove_cache(p.max(addr as u64), page_end.min(end));
+            p = page_end;
         }
     });
 }
@@ -791,6 +832,16 @@ fn run_trampoline(uc: &mut Unicorn<'static, Ctx>, frame: &[u32], pre_segs: Optio
 
 /// Configure Unicorn for `mode`, load `REGS`, and return the linear start PC.
 fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
+    // DIAGNOSTIC "no-translation-cache" mode (RETRO_FLUSH_TB=1): flush ALL
+    // translation blocks at every slice entry, forcing Unicorn to re-decode every
+    // instruction from current guest memory. With caching disabled this way, no
+    // stale TB can survive a host-side code overwrite — so if a bug REPRODUCES
+    // with caching but VANISHES here, it is a missing TB-invalidation (see
+    // `invalidate_code_range`). Too slow for normal use; a CI run with this on is
+    // the regression net for the stale-TB class (see TODO.md §9).
+    if std::env::var_os("RETRO_FLUSH_TB").is_some() {
+        let _ = uc.ctl_flush_tb();
+    }
     let w = |uc: &mut Unicorn<'static, Ctx>, reg, v: u64| { let _ = uc.reg_write(reg, v); };
 
     w(uc, RegisterX86::EAX, r.rax);
