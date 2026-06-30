@@ -261,14 +261,16 @@ executed instruction *stream* was stale, so all the register/SP/null-ptr
       construction. `invalidate_uc` also upgraded to drop TBs for its range
       (COW/remap frame-reuse: a recycled physical frame can carry a previous
       owner's TBs). Verified: DN launches digger, RTE-204 idle loop gone.
-      Regression tests `arch-interp/tests/{les_decode,stale_tb}.rs`.
 - [ ] **No-translation-cache CI mode (the "never again" net).** `RETRO_FLUSH_TB=1`
       already flushes ALL TBs at slice entry (`configure`), forcing re-decode of
       every instruction from current memory — staleness becomes structurally
       impossible. Wire a CI job that runs the DOS/game suite twice (cached vs
       `RETRO_FLUSH_TB`): **any** behavioral divergence is, by definition, a
       missing invalidation, caught the moment it's introduced. (No true Unicorn
-      interpreter mode exists; per-slice/per-block flush is the equivalent.)
+      interpreter mode exists; per-slice/per-block flush is the equivalent.) This
+      is the RIGHT regression layer — it exercises real RetroOS execution, unlike
+      a standalone unicorn-decoder unit test (those were diagnosis, not RetroOS
+      tests, and live on `debug/dn-launch-instruction-trace`).
 - [ ] **Batch the invalidation (perf optimization).** Per-write `ctl_remove_cache`
       runs on every guest write incl. tiny BDA/stack pokes, and each does a
       `get_page_addr_code` softmmu walk. Instead, accumulate written
@@ -281,8 +283,7 @@ executed instruction *stream* was stale, so all the register/SP/null-ptr
 - [ ] **Cleanup.** Strip the remaining ad-hoc launch-debug instrumentation in
       `arch-interp/src/{cpu.rs,vcpu.rs}` (INSN/ITREG/STRINT/WR* hooks, the
       `0x3db93` probes) and the metal `pm_step_log` SI/DI/BP additions, kept
-      across the hunt. Keep `RETRO_FLUSH_TB` (now the diagnostic mode above) and
-      the two isolation tests.
+      across the hunt. Keep `RETRO_FLUSH_TB` (now the diagnostic mode above).
 
 ---
 

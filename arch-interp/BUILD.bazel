@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
 # The hosted interpreter backend (host-config build only; the metal kernel
 # links //arch-metal instead). Unicorn — the patched fork pinned in
@@ -22,32 +22,4 @@ rust_library(
         "@crates//:libc",
         "@crates//:unicorn-engine",
     ],
-)
-
-# Isolation tests for the Unicorn translation-cache coherence work (the stale-TB
-# fix): standalone `unicorn-engine` tests — they exercise the decoder / SMC
-# behavior directly, so they depend on the crate, not the backend lib. Host-only
-# (Unicorn builds for x86_64): `target_compatible_with` makes a metal-platform
-# `//...` skip them as incompatible rather than fail. CI runs them explicitly
-# under `--platforms=@platforms//host`.
-_TEST_RUSTC_FLAGS = ["-Crelocation-model=static"]
-
-rust_test(
-    name = "les_decode_test",
-    size = "small",
-    srcs = ["tests/les_decode.rs"],
-    edition = "2021",
-    rustc_flags = _TEST_RUSTC_FLAGS,
-    target_compatible_with = ["@platforms//cpu:x86_64"],
-    deps = ["@crates//:unicorn-engine"],
-)
-
-rust_test(
-    name = "stale_tb_test",
-    size = "small",
-    srcs = ["tests/stale_tb.rs"],
-    edition = "2021",
-    rustc_flags = _TEST_RUSTC_FLAGS,
-    target_compatible_with = ["@platforms//cpu:x86_64"],
-    deps = ["@crates//:unicorn-engine"],
 )
