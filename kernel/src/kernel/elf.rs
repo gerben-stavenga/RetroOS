@@ -73,7 +73,7 @@ pub fn load_elf(machine: &mut crate::TheArch, regs: &mut Vcpu, elf_data: &[u8], 
             if seg.is_executable() != executable_pass { continue; }
             let vaddr = seg.vaddr + load_bias;
             let start_page = vaddr / PAGE_SIZE;
-            let end_page = (vaddr + seg.memsz + PAGE_SIZE - 1) / PAGE_SIZE;
+            let end_page = (vaddr + seg.memsz).div_ceil(PAGE_SIZE);
             let count = end_page - start_page;
             if count > 0 {
                 machine.set_page_flags(start_page, count, seg.is_writable(), executable_pass);

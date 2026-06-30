@@ -93,7 +93,6 @@ pub mod arch_call {
     pub const COPY_PAGE_ENTRIES: u64 = 0x10C; // EDX=src_vpage, ECX=dst_vpage, EBX=count — copy entries src→dst
     pub const SWAP_PAGE_ENTRIES: u64 = 0x10E; // EDX=a_vpage, ECX=b_vpage, EBX=count — swap entries a↔b
     pub const UNMAP_RANGE: u64 = 0x10F;  // EDX=vpage_start, ECX=count — clear entries to absent
-    pub const FREE_RANGE: u64 = 0x110;   // EDX=vpage_start, ECX=count — free phys + identity-map RO
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start ECX=num_pages EBX=ppage_lo ESI=ppage_hi EDI=flags
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
@@ -235,7 +234,6 @@ fn arch_dispatch(regs: &mut Regs) {
             paging2::swap_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
         }
         arch_call::UNMAP_RANGE => paging2::unmap_range(regs.rdx as usize, regs.rcx as usize),
-        arch_call::FREE_RANGE => paging2::free_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }
@@ -255,7 +253,7 @@ fn arch_dispatch(regs: &mut Regs) {
                 regs.rdx as usize, regs.rcx as u32).unwrap_or(0);
         }
         arch_call::FREE_PHYS_CONTIG => {
-            crate::phys_mm::free_phys_contig(regs.rdx as u64, regs.rcx as usize);
+            crate::phys_mm::free_phys_contig(regs.rdx, regs.rcx as usize);
         }
         arch_call::REARM_IRQ => {
             crate::irq::rearm_irq(regs.rdx as u8);
@@ -318,7 +316,8 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
 }
 
 fn swap_regs(regs: &mut Regs) {
-    unsafe { core::mem::swap(regs, &mut (*(&raw mut REGS)).regs); }
+    let p = &raw mut REGS;
+    unsafe { core::mem::swap(regs, &mut (*p).regs); }
 }
 
 /// Switch threads: swap live state with pointed-to state.
@@ -351,7 +350,8 @@ fn arch_switch_to(regs: &mut Regs) {
     }
 
     // Swap regs
-    unsafe { core::mem::swap(&mut *regs_ptr, &mut (*(&raw mut REGS)).regs); }
+    let regs_p = &raw mut REGS;
+    unsafe { core::ptr::swap(regs_ptr, &raw mut (*regs_p).regs); }
 
     // Log incoming struct PDE[0] before swap
     let _pre_pde0 = unsafe { (*root_ptr).e32[0].0 };
@@ -681,7 +681,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
         }
         14 => {
             if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
-            KE::PageFault { addr: x86::read_cr2() as u32 }
+            KE::PageFault { addr: x86::read_cr2() }
         }
         32..=47 => { handle_irq(regs); KE::Irq }
         // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
@@ -785,10 +785,11 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
     }
 
     // Kernel fault in heap region: demand-page a real writable page
-    if !user && fault_addr >= KERNEL_BASE && fault_addr < paging2::HEAP_END {
+    if !user && (KERNEL_BASE..paging2::HEAP_END).contains(&fault_addr) {
         let heap_start = paging2::heap_base();
         if fault_addr >= heap_start && !present {
-            return Some(demand_page_kernel(fault_addr));
+            demand_page_kernel(fault_addr);
+            return Some(());
         }
         // Present fault or below heap_base in kernel space is a bug
         return None;

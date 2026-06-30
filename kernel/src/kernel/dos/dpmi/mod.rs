@@ -12,7 +12,6 @@
 
 extern crate alloc;
 
-use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use alloc::boxed::Box;
 use crate::arch::Vcpu;
@@ -22,7 +21,6 @@ use crate::kernel::dos;
 use crate::kernel::startup;
 use super::machine;
 use super::mode_transitions::{seg_base, seg_is_32};
-use crate::Regs;
 
 mod state;
 pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PSP_SEL};
@@ -183,7 +181,7 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
 /// PM client-initiated INT 31h — the DPMI service API, dispatched by AX.
 /// Caller (`dos::syscall`) has already classified the trap as client-side
 /// (CS not in the kernel's stub LDT slots).
-pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn dpmi_api(_machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
@@ -226,7 +224,7 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
             // after alloc; getting D=1 for a 16-bit client trips its
             // sanity check and trips the "Application load & execute
             // error FFFB" bail.
-            let use32 = dos.dpmi.as_ref().map_or(true, |d| d.client_use32);
+            let use32 = dos.dpmi.as_ref().is_none_or(|d| d.client_use32);
             // DPMI requires the returned descriptors to be a contiguous run.
             match alloc_ldt_range(&mut dos.ldt_alloc, count) {
                 Some(idx) => {
@@ -314,10 +312,10 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
             let sel = regs.rbx as u16;
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let mut base = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
-                if let Some(dpmi) = dos.dpmi.as_ref() {
-                    if !dpmi.client_use32 && dpmi.env_ldt_idx != 0 && (base & 0xF) == 0 {
+                if let Some(dpmi) = dos.dpmi.as_ref()
+                    && !dpmi.client_use32 && dpmi.env_ldt_idx != 0 && (base & 0xF) == 0 {
                         let psp_base = desc_base(dos.ldt[PSP_LDT_IDX]);
-                        let env_sel = regs.read::<u16>(((psp_base + 0x2C)) as usize);
+                        let env_sel = regs.read::<u16>((psp_base + 0x2C) as usize);
                         if env_sel != 0 && ((env_sel as u32) << 4) == base {
                             let env_idx = sel_to_idx(env_sel);
                             if env_idx < LDT_ENTRIES && ldt_is_allocated(&dos.ldt_alloc, env_idx) {
@@ -329,7 +327,6 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
                             }
                         }
                     }
-                }
                 set_desc_base(&mut dos.ldt[idx], base);
                 trace_dpmi_desc("0007 base", sel, dos.ldt[idx]);
                 dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
@@ -719,9 +716,9 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         // spec allows AX=0 even under VM, since every cap here is optional
         // when virtual memory is supported.
         0x0401 => {
-            regs.rax = regs.rax & !0xFFFF;            // AX = 0  (no optional caps)
-            regs.rcx = regs.rcx & !0xFFFF;            // CX = 0  (reserved)
-            regs.rdx = regs.rdx & !0xFFFF;            // DX = 0  (reserved)
+            regs.rax &= !0xFFFF;            // AX = 0  (no optional caps)
+            regs.rcx &= !0xFFFF;            // CX = 0  (reserved)
+            regs.rdx &= !0xFFFF;            // DX = 0  (reserved)
             let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
             // Buffer layout (DPMI 1.0 §3.4): [0]=major (decimal), [1]=minor,
             // [2..]=ASCIIZ vendor identifier (≤126 bytes).
@@ -789,12 +786,11 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         0x0502 => {
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
             for slot in dpmi.mem_blocks.iter_mut() {
-                if let Some(blk) = slot {
-                    if blk.base == handle {
+                if let Some(blk) = slot
+                    && blk.base == handle {
                         *slot = None;
                         break;
                     }
-                }
             }
             clear_carry(regs);
         }
@@ -809,20 +805,18 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
             // This preserves existing data (pages already faulted in stay mapped).
             let mut base = handle;
             let mut found = false;
-            for slot in dpmi.mem_blocks.iter_mut() {
-                if let Some(blk) = slot {
-                    if blk.base == handle {
-                        // Ensure mem_next covers the grown region
-                        let end = blk.base.wrapping_add(aligned);
-                        if end > dpmi.mem_next {
-                            dpmi.mem_next = end;
-                        }
-                        dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
-                        blk.size = aligned;
-                        base = blk.base;
-                        found = true;
-                        break;
+            for blk in dpmi.mem_blocks.iter_mut().flatten() {
+                if blk.base == handle {
+                    // Ensure mem_next covers the grown region
+                    let end = blk.base.wrapping_add(aligned);
+                    if end > dpmi.mem_next {
+                        dpmi.mem_next = end;
                     }
+                    dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
+                    blk.size = aligned;
+                    base = blk.base;
+                    found = true;
+                    break;
                 }
             }
             if !found { set_carry(regs); return thread::KernelAction::Done; }
@@ -872,7 +866,7 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         // signal to clients that changes their setup path even if they never
         // call the routine.
         0x0305 => {
-            regs.rax = regs.rax & !0xFFFF;
+            regs.rax &= !0xFFFF;
             // Real-mode save/restore: the control view of the stub array.
             regs.rbx = (regs.rbx & !0xFFFF) | dos::CTRL_STUB_SEG as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | dos::ctrl_slot_off(dos::SLOT_SAVE_RESTORE) as u64;
@@ -909,26 +903,17 @@ pub(super) fn dpmi_api(machine: &mut crate::TheArch, dos: &mut thread::DosState,
         0x0E01 => {
             clear_carry(regs);
         }
-        // AX=0800h — Physical Address Mapping
-        // BX:CX = physical address, SI:DI = size
-        // Returns BX:CX = linear address
+        // AX=0800h — Physical Address Mapping. BX:CX = physical address,
+        // SI:DI = size; returns BX:CX = linear address.
+        //
+        // We present a FLAT DPMI: the client's linear space IS the address
+        // space, and linear→physical paging lives in the RetroOS arch layer
+        // below us — not ours to remap. So there is no separate physical space
+        // to map *from*; a physical address maps to itself. Return it identity.
+        // Memory that needs real backing (the VESA LFB) is set up where it
+        // lives by whoever owns it (svga_set_mode); 0800h adds no mapping.
         0x0800 => {
-            let phys = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
-            let size = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
-            let aligned = (size + 0xFFF) & !0xFFF;
-            // Allocate virtual range from DPMI linear memory pool
-            let base = dpmi.mem_next;
-            dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
-            dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
-            // Map physical pages at the allocated virtual address via ring-0 arch call
-            let num_pages = aligned as usize / 4096;
-            let vpage_start = base as usize / 4096;
-            let ppage_start = phys as u64 / 4096;
-            // PWT (bit 3) + PCD (bit 4): write-through, cache-disable for MMIO
-            machine.map_phys_range(vpage_start, num_pages, ppage_start, (1 << 3) | (1 << 4));
-            // Return linear address
-            regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) as u64);
-            regs.rcx = (regs.rcx & !0xFFFF) | ((base & 0xFFFF) as u64);
+            // BX:CX already hold the address; echo it back as the linear result.
             clear_carry(regs);
         }
         // AX=0801h — Free Physical Address Mapping (no-op, we don't track)

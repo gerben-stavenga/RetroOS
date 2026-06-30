@@ -43,14 +43,16 @@ static mut MOUSE_PACKET_IDX: u8 = 0;
 
 /// Drain all queued IRQ events, calling f for each.
 pub fn drain(f: impl FnMut(Irq)) {
-    unsafe { (*(&raw mut QUEUE)).drain(f); }
+    let q = &raw mut QUEUE;
+    unsafe { (*q).drain(f); }
 }
 
 /// Push a keyboard scancode into the queue from a non-IRQ source — the xHCI
 /// USB-HID keyboard `poll()`. Same sink the i8042 IRQ1 handler feeds, so the
 /// kernel sees one uniform key-event stream regardless of the source.
 pub fn push_key(sc: u8) {
-    unsafe { (*(&raw mut QUEUE)).push(Irq::Key(sc)); }
+    let q = &raw mut QUEUE;
+    unsafe { (*q).push(Irq::Key(sc)); }
 }
 
 /// Take pending tick count (returns count and resets to 0).
@@ -97,11 +99,9 @@ pub fn init_pit(frequency: u32) {
     const PIT_FREQUENCY: u32 = 1193182;
 
     outb(PIT_CMD, 0x36);
-    let divisor = if frequency == 0 {
-        0
-    } else {
-        (PIT_FREQUENCY / frequency).clamp(1, 65535) as u16
-    };
+    let divisor = PIT_FREQUENCY
+        .checked_div(frequency)
+        .map_or(0, |d| d.clamp(1, 65535) as u16);
     outb(PIT_CHANNEL0, (divisor & 0xFF) as u8);
     outb(PIT_CHANNEL0, (divisor >> 8) as u8);
 }
@@ -543,6 +543,7 @@ fn init_mouse() -> bool {
 ///   1. Is the 8254 PIT counting?      (latch + sample channel 0 repeatedly)
 ///   2. Does the 8259 master see IRQ0?  (read IRR bit 0 — IRQ0 is unmasked but
 ///      IF=0, so the request latches and stays pending, never acked)
+///
 /// If both pass but the kernel still freezes, the break is CPU delivery —
 /// LINT0 / virtual-wire routing through the (x2)APIC, the known UEFI failure.
 pub fn timer_selftest() {
@@ -652,13 +653,13 @@ pub fn handle_irq(regs: &mut Regs) {
                 // Poll the USB-HID keyboard (if any) into the same key queue.
                 crate::xhci::poll();
             }
-            1 => unsafe { (*(&raw mut QUEUE)).push(Irq::Key(inb(0x60))); },
+            1 => unsafe { let q = &raw mut QUEUE; (*q).push(Irq::Key(inb(0x60))); },
             12 => {
                 if let Some(e) = mouse_packet_byte(inb(0x60)) {
-                    unsafe { (*(&raw mut QUEUE)).push(e); }
+                    unsafe { let q = &raw mut QUEUE; (*q).push(e); }
                 }
             }
-            _ => unsafe { (*(&raw mut QUEUE)).push(Irq::Hw(irq)); },
+            _ => unsafe { let q = &raw mut QUEUE; (*q).push(Irq::Hw(irq)); },
         }
         lapic_write(LAPIC_EOI, 0);
         return;
@@ -704,7 +705,8 @@ pub fn handle_irq(regs: &mut Regs) {
     };
 
     if let Some(e) = event {
-        unsafe { (*(&raw mut QUEUE)).push(e); }
+        let q = &raw mut QUEUE;
+        unsafe { (*q).push(e); }
     }
 
     // Re-unmask only lines whose device was acked inline above. Generic

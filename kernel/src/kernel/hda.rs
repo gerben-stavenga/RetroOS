@@ -95,7 +95,7 @@ const RIRB_OFF: usize = 0x0400;
 const BDL_OFF: usize = 0x0C00; // 128-byte aligned; NUM_BUF*16 = 512 bytes
 const POS_OFF: usize = 0x0E00; // 128-byte aligned; DMA position buffer (8 strm*8)
 const BUF_OFF: usize = 0x1000; // PCM ring starts on the next page
-const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES + 0xFFF) / 0x1000;
+const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
 // ── PCM ring geometry (mirror ac97) ──────────────────────────────────────────
 const NUM_BUF: usize = 32;
@@ -432,12 +432,11 @@ impl Hda {
             let caps = self.verb(nid, (0xF00 << 8) | 0x09); // Audio Widget Capabilities
             match (caps >> 20) & 0xF {
                 0x0 if self.dac == 0 => self.dac = nid, // Audio Output (DAC)
-                0x4 if self.pin == 0 => {
+                0x4 if self.pin == 0
                     // Pin Complex — take the first output-capable one.
-                    if self.verb(nid, (0xF00 << 8) | 0x0C) & (1 << 4) != 0 {
+                    && self.verb(nid, (0xF00 << 8) | 0x0C) & (1 << 4) != 0 => {
                         self.pin = nid;
                     }
-                }
                 _ => {}
             }
             if DEBUG {
@@ -451,13 +450,13 @@ impl Hda {
     fn configure_path(&mut self) {
         let (pin, dac) = (self.pin, self.dac);
         // Pin: power D0, enable output, select the DAC connection, unmute amp.
-        self.verb(pin, (0x705 << 8) | 0x00); // Set Power State D0
+        self.verb(pin, 0x705 << 8); // Set Power State D0
         self.verb(pin, (0x707 << 8) | 0x40); // Set Pin Widget Control: OUT enable
-        self.verb(pin, (0x701 << 8) | 0x00); // Set Connection Select: first input
+        self.verb(pin, 0x701 << 8); // Set Connection Select: first input
         self.verb(pin, (0x3 << 16) | 0xB07F); // Set Amp: out, L+R, unmute, max gain
         // DAC: power D0, bind the stream tag / channel 0, unmute at full gain.
-        self.verb(dac, (0x705 << 8) | 0x00); // Set Power State D0
-        self.verb(dac, (0x706 << 8) | ((STREAM_TAG << 4) as u32)); // Stream/Channel
+        self.verb(dac, 0x705 << 8); // Set Power State D0
+        self.verb(dac, (0x706 << 8) | (STREAM_TAG << 4)); // Stream/Channel
         self.verb(dac, (0x3 << 16) | 0xB07F); // Set Amp: out, L+R, unmute, gain 0x7F
     }
 
@@ -545,7 +544,7 @@ impl Hda {
                 // Only throttle when genuinely AHEAD of the codec. A wrapped
                 // value (>= half the ring) means the play position lapped us
                 // (underrun) — feed hard to catch up, never stall.
-                if ahead >= MAX_AHEAD && ahead < NUM_BUF / 2 {
+                if (MAX_AHEAD..NUM_BUF / 2).contains(&ahead) {
                     if DEBUG {
                         crate::println!(
                             "hda: stall cur_buf={} civ={} lpib={} pos={} sdsts={:#x}",

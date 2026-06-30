@@ -108,6 +108,12 @@ impl PixelFormat {
 
     fn encode(self, rgb: u32) -> u32 {
         fn channel(value: u32, pos: u8, size: u8) -> u32 {
+            // 8-bit channels (the usual RGBX/BGRX framebuffers) need no rescale:
+            // (value*255+127)/255 == value. Skip the divide — it dominated the
+            // present blit. The multiply/divide is only needed for 15/16-bit.
+            if size == 8 {
+                return value << pos;
+            }
             let max = (1u64 << size) - 1;
             ((((value as u64 * max) + 127) / 255) << pos) as u32
         }
@@ -118,7 +124,8 @@ impl PixelFormat {
 }
 
 fn geom() -> &'static mut Option<Geom> {
-    unsafe { &mut *(&raw mut GEOM) }
+    let p = &raw mut GEOM;
+    unsafe { &mut *p }
 }
 
 /// Whether the framebuffer console owns the display (a linear framebuffer
@@ -180,8 +187,7 @@ pub fn init(info: &arch::MultibootInfo) {
         // fill it with 0xFF bytes — white-ish on any channel order or depth
         // — so "framebuffer handed over but format rejected" is visible.
         let stripe_bytes = (pitch * 32).min(1 << 20);
-        let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes + PAGE_SIZE - 1)
-            / PAGE_SIZE;
+        let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes).div_ceil(PAGE_SIZE);
         for i in 0..pages {
             paging2::map_user_page_phys(
                 paging2::FB_WINDOW_BASE / PAGE_SIZE + i,
@@ -216,7 +222,7 @@ pub fn init(info: &arch::MultibootInfo) {
     };
     let fb_bytes = pitch * height;
     let page_off = (addr & (PAGE_SIZE as u64 - 1)) as usize;
-    let pages = (page_off + fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages = (page_off + fb_bytes).div_ceil(PAGE_SIZE);
     assert!(
         paging2::FB_WINDOW_BASE + pages * PAGE_SIZE <= paging2::FB_WINDOW_END,
         "fbcon: framebuffer larger than the FB window"
@@ -299,8 +305,20 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     }
     let fb_w = g.stride; // pixels per row (pitch); visible width <= stride
     let fb_h = g.len / g.stride;
-    let k = (fb_w / w).min(fb_h / h).max(1);
-    let (out_w, out_h) = ((w * k).min(fb_w), (h * k).min(fb_h));
+    // DOS modes are all authored for a 4:3 display with non-square pixels, so
+    // present into the largest 4:3 rectangle that fits the panel and scale the
+    // source into it with independent X/Y factors. Integer square-pixel scaling
+    // would show each mode at its raw pixel-grid aspect — 320×200 too wide,
+    // 360×400 too tall; this gives 320×200 elongated (tall) pixels and 360×400
+    // wide pixels, matching a real VGA monitor.
+    let (out_w, out_h) = if fb_w * 3 >= fb_h * 4 {
+        ((fb_h * 4 / 3).min(fb_w), fb_h) // panel wider than 4:3 → pillarbox
+    } else {
+        (fb_w, (fb_w * 3 / 4).min(fb_h)) // taller than 4:3 → letterbox
+    };
+    if out_w == 0 || out_h == 0 {
+        return;
+    }
     let origin = (fb_h - out_h) / 2 * g.stride + (fb_w - out_w) / 2;
     let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
     // On a resolution change (a mode switch — e.g. text 720×400 → Mode-Y
@@ -310,17 +328,61 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     // content-compare skip — that silently froze the screen when the cached
     // frame went stale against another writer).
     static mut LAST_DIMS: (usize, usize) = (0, 0);
-    let last = unsafe { &mut *(&raw mut LAST_DIMS) };
+    let last_p = &raw mut LAST_DIMS;
+    let last = unsafe { &mut *last_p };
     if *last != (w, h) {
         *last = (w, h);
         out.fill(0);
     }
-    for y in 0..out_h {
-        let src_row = &px[(y / k) * w..(y / k) * w + w];
-        let dst = &mut out[origin + y * g.stride..origin + y * g.stride + out_w];
-        for (x, d) in dst.iter_mut().enumerate() {
-            let rgb = src_row[x / k];
-            *d = if g.format.is_native() { rgb } else { g.format.encode(rgb) };
+    // This blit runs at the present rate on the guest thread, so its cost is
+    // stolen guest time — and once a present exceeds the ~14ms frame budget the
+    // guest starves. `encode` (a per-channel multiply/divide) run per *output*
+    // pixel dominated it. Hoist it: encode each *source* row once into a staging
+    // row, then scale that row to the panel with a plain native copy — the inner
+    // (per-output-pixel) loop is just a load + store. Fixed-point 16.16
+    // nearest-neighbour stepping; indices are provably in range (`sx>>16 < w`,
+    // `sy>>16 < h`, dst within `g.len`), so bounds checks are elided.
+    let x_step = ((w as u64) << 16) / out_w as u64;
+    let y_step = ((h as u64) << 16) / out_h as u64;
+    let native = g.format.is_native();
+    static mut ENC_ROW: [u32; 2048] = [0; 2048];
+    let enc_p = &raw mut ENC_ROW;
+    let enc = unsafe { &mut *enc_p };
+    let mut sy = 0u64;
+    let mut prev_sry = usize::MAX;
+    for oy in 0..out_h {
+        let sry = (sy >> 16) as usize;
+        sy += y_step;
+        let drow = origin + oy * g.stride;
+        let dst = unsafe { out.get_unchecked_mut(drow..drow + out_w) };
+        if w <= enc.len() {
+            // Encode this source row once (a copy when already native), then the
+            // hot loop below scales from the staging row with no per-pixel encode.
+            if sry != prev_sry {
+                prev_sry = sry;
+                let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
+                if native {
+                    enc[..w].copy_from_slice(src_row);
+                } else {
+                    for (e, &p) in enc[..w].iter_mut().zip(src_row) {
+                        *e = g.format.encode(p);
+                    }
+                }
+            }
+            let mut sx = 0u64;
+            for d in dst.iter_mut() {
+                *d = unsafe { *enc.get_unchecked((sx >> 16) as usize) };
+                sx += x_step;
+            }
+        } else {
+            // Source wider than the staging row (never for our modes): direct.
+            let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
+            let mut sx = 0u64;
+            for d in dst.iter_mut() {
+                let rgb = unsafe { *src_row.get_unchecked((sx >> 16) as usize) };
+                *d = if native { rgb } else { g.format.encode(rgb) };
+                sx += x_step;
+            }
         }
     }
     // The framebuffer is Write-Combining: its stores sit in the CPU's WC buffers
@@ -347,7 +409,8 @@ fn flush() {
     if DOS_PAINTED.swap(false, core::sync::atomic::Ordering::Relaxed) {
         let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
         out.fill(0);
-        unsafe { (&mut *(&raw mut SHADOW)).fill(0) };
+        let sp = &raw mut SHADOW;
+        unsafe { (*sp).fill(0) };
     }
     // The shared text aperture (real phys 0xB8000 via the low-mem window).
     let text: &[u16] = unsafe {
@@ -356,13 +419,15 @@ fn flush() {
     let vram: &[u8] = unsafe {
         core::slice::from_raw_parts((paging2::LOW_MEM_BASE + 0xB8000) as *const u8, 80 * 25 * 2)
     };
-    let shadow = unsafe { &mut *(&raw mut SHADOW) };
+    let shadow_p = &raw mut SHADOW;
+    let shadow = unsafe { &mut *shadow_p };
+    let palette_p = &raw const PALETTE;
     let frame = Frame {
         mode: VgaMode::Text80x25,
         vram,
         planes: &[],
         ac: &FBCON_AC,
-        palette: unsafe { &*(&raw const PALETTE) },
+        palette: unsafe { &*palette_p },
         font: &FONT_8X16,
         blink: false,
         start_offset: 0,

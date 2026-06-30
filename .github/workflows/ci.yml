@@ -1,0 +1,96 @@
+name: CI
+
+# Gate every branch and PR: build, clippy (deny-warnings), and the hosted
+# (interpreter) end-to-end tests — no QEMU/KVM needed, so it runs on any
+# GitHub-hosted runner. Make this a required status check in branch protection
+# to keep main green.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-clippy-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # `nasm` for the apps/tests `.COM` genrules (apps/tests/*/BUILD.bazel shell
+      # out to system nasm; the bootloader uses hermetic rules_nasm instead).
+      # ubuntu-latest doesn't ship nasm, so //:image's analysis fails without it.
+      - name: Install nasm
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Install bazelisk
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/bazelisk \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.20.0/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazelisk
+          sudo ln -sf /usr/local/bin/bazelisk /usr/local/bin/bazel
+
+      # Bazel's downloaded toolchains (nightly rustc, crates) and the analysis/
+      # action cache. Keyed on the dependency-defining files so a lockfile bump
+      # busts it. The disk_cache path is set in the CI bazelrc below.
+      - name: Cache bazel
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel-disk
+            ~/.cache/bazel-repo
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'Cargo.lock', '.bazelrc', 'toolchain/**') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: CI bazelrc (disk + repository cache)
+        run: |
+          cat >> .bazelrc <<'EOF'
+
+          # --- CI overrides (appended by .github/workflows/ci.yml) ---
+          build --disk_cache=~/.cache/bazel-disk
+          build --repository_cache=~/.cache/bazel-repo
+          build --keep_going
+          EOF
+
+      - name: Build kernel + disk image
+        run: bazel build //:image //kernel:kernel_elf
+
+      # clippy runs under -D warnings via the rules_rust aspect (--config=clippy),
+      # so any diagnostic fails the build. Metal crates lint on the default
+      # platform; host-only crates need --platforms=@platforms//host.
+      - name: Clippy (metal crates)
+        run: |
+          bazel build --config=clippy \
+            //kernel:kernel //lib:lib //arch-abi:arch-abi //arch-metal:arch-metal
+
+      - name: Clippy (host crates)
+        run: |
+          bazel build --config=clippy --platforms=@platforms//host \
+            //kernel:kernel_hosted //kernel:retroos-host \
+            //arch-interp:arch-interp //lib:lib //arch-abi:arch-abi
+
+      - name: Build hosted runner
+        run: bazel build //kernel:retroos-host --platforms=@platforms//host
+
+      # End-to-end: a real 32-bit Linux ELF through the kernel's Linux
+      # personality on the software CPU.
+      - name: Hosted ELF smoke
+        run: |
+          gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
+            -o /tmp/hello.elf apps/hosted-test/hello.c
+          # The bare-ELF dev path never runs platform::probe(), so it prints the
+          # message then parks; cap it with timeout and assert on the output.
+          out=$(timeout 20 bazel-bin/kernel/retroos-host /tmp/hello.elf 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
+
+      # End-to-end games: boot each headless, drive keyboard, assert no kernel
+      # panic (and, for text-mode programs, an expected on-screen string).
+      - name: Hosted game smoke tests
+        run: test/hosted_games.sh

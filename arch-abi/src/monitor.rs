@@ -257,11 +257,9 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
     // Parse legacy prefixes we care about. Today: 0x66 (operand-size override).
     let mut advance = 0u32;
     let mut op_size_override = false;
-    loop {
-        match peek!(advance) {
-            0x66 => { op_size_override = true; advance += 1; }
-            _ => break,
-        }
+    while peek!(advance) == 0x66 {
+        op_size_override = true;
+        advance += 1;
     }
 
     let op32 = cs_32 ^ op_size_override;

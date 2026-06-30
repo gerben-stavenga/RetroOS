@@ -75,8 +75,12 @@ pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
 }
 
 /// SW equivalent of the CPU's VM86 INT dispatch — see
-/// [`arch_abi::monitor::sw_reflect_vm86_int`]. Kept `unsafe` for caller
-/// compatibility (it touches the live VM86 stack via the active page tables).
+/// [`arch_abi::monitor::sw_reflect_vm86_int`].
+///
+/// # Safety
+///
+/// Kept `unsafe` for caller compatibility (it touches the live VM86 stack via
+/// the active page tables).
 #[inline]
 pub unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
     arch_abi::monitor::sw_reflect_vm86_int(regs, &mut MetalView, vector)
@@ -98,8 +102,8 @@ pub fn pm_step_log(regs: &crate::Vcpu) {
     let ip = if mode == "PM32" { regs.ip32() } else { regs.ip32() & 0xFFFF };
     let lin = cs_base.wrapping_add(ip);
     let mut b = [0u8; 8];
-    for i in 0..8 {
-        b[i] = regs.read::<u8>((lin + i as u32) as usize);
+    for (i, byte) in b.iter_mut().enumerate() {
+        *byte = regs.read::<u8>((lin + i as u32) as usize);
     }
     let f = regs.flags32();
     lib::dbg_println!(

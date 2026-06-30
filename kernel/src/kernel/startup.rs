@@ -413,6 +413,7 @@ fn switch_focus_and_run(
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
 /// Blocks parent, returns child tid on success, None on error (caller stays on parent).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_fork_exec(
     machine: &mut crate::TheArch,
     threads: &mut [thread::Thread],
@@ -510,7 +511,7 @@ pub(crate) fn handle_fork_exec(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if let Err(_) = exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl) {
+    if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl).is_err() {
         let child = thread::get_thread(threads, child_tid).unwrap();
         machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(threads, machine, child_tid, 1);
@@ -584,6 +585,7 @@ pub(crate) fn handle_fork_exec(
 /// - VM86: print guest CS:IP, common registers, BIOS timer, code bytes, and
 ///   the 80x25 VGA text buffer (for diagnosing hung DOS programs).
 /// - PM: Rust stack trace via frame-pointer walking through user symbols.
+///
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
 pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::arch::Vcpu) {
@@ -643,7 +645,7 @@ pub(crate) fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thr
             let mut line = [b'.'; 80];
             for col in 0..80 {
                 let ch = vga[(row * 80 + col) * 2];
-                line[col] = if ch >= 0x20 && ch < 0x7F { ch } else { b'.' };
+                line[col] = if (0x20..0x7F).contains(&ch) { ch } else { b'.' };
             }
             crate::dbg_println!("[VGA {:02}] {}", row,
                 core::str::from_utf8(&line).unwrap_or("???"));
@@ -724,7 +726,7 @@ impl EventStats {
 
     fn iteration(&mut self, machine: &mut crate::TheArch) {
         self.iterations = self.iterations.wrapping_add(1);
-        if self.iterations % Self::MEM_DUMP_PERIOD == 0 {
+        if self.iterations.is_multiple_of(Self::MEM_DUMP_PERIOD) {
             let free = machine.free_page_count();
             if free < self.min_free {
                 self.min_free = free;
@@ -770,8 +772,8 @@ impl EventStats {
         if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
             if Self::PROFILE_DUMP {
                 let total = self.user_cycles.wrapping_add(self.kernel_cycles);
-                let user_pct = if total > 0 { self.user_cycles.wrapping_mul(100) / total } else { 0 };
-                let kern_pct = if total > 0 { self.kernel_cycles.wrapping_mul(100) / total } else { 0 };
+                let user_pct = self.user_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
+                let kern_pct = self.kernel_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
                 let c = &self.counts;
                 crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
                     user_pct, kern_pct,

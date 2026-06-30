@@ -71,6 +71,11 @@ pub enum ThreadState {
 /// Returned by the KernelEvent dispatch in `startup::event_loop`, by syscall
 /// dispatch, and by DPMI INT/exception paths. The event loop acts on it —
 /// personality code never touches scheduling.
+// ForkExec carries the exec payload inline; it is constructed and consumed in
+// the same event-loop turn (never stored), so the size gap to the unit variants
+// doesn't cost per-thread memory — boxing it would only add an alloc on the hot
+// fork/exec path.
+#[allow(clippy::large_enum_variant)]
 pub enum KernelAction {
     /// Nothing to do, continue current thread.
     Done,
@@ -149,6 +154,12 @@ pub enum PersonalityName {
     Linux,
 }
 
+// DosState is the large central DOS personality state; Linux processes carry
+// the small LinuxState. There are only a handful of live threads, and boxing
+// DosState would force a heap allocation + indirection on the hot DOS execution
+// path (and a 17-site deref-coercion refactor), so the inline variant is the
+// deliberate choice.
+#[allow(clippy::large_enum_variant)]
 pub enum Personality {
     /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode)
     Dos(DosState),
@@ -346,12 +357,7 @@ impl KernelThread {
 
     /// Find a free fd slot (starting from `from`). Returns fd number or None.
     pub fn alloc_fd(&self, from: usize) -> Option<usize> {
-        for i in from..MAX_FDS {
-            if self.fds[i].is_none() {
-                return Some(i);
-            }
-        }
-        None
+        (from..MAX_FDS).find(|&i| self.fds[i].is_none())
     }
 
     /// Close a single fd, decrementing pipe/VFS refcounts as needed.
@@ -438,10 +444,10 @@ impl Thread {
     }
 }
 
-/// The thread table is no longer a global: `startup()` owns a `Vec<Thread>`
-/// (built by `init_threading`) and threads `&mut [Thread]` through the event
-/// loop and the executors. The table API below takes that slice; the live
-/// register frame lives in `ExecutionContext`, never here.
+// The thread table is no longer a global: `startup()` owns a `Vec<Thread>`
+// (built by `init_threading`) and threads `&mut [Thread]` through the event
+// loop and the executors. The table API below takes that slice; the live
+// register frame lives in `ExecutionContext`, never here.
 
 /// Console stdin kpipe index (shared by all Linux processes)
 static mut CONSOLE_PIPE: u8 = 0;
@@ -502,9 +508,8 @@ pub fn create_thread<'a>(threads: &'a mut [Thread], machine: &mut crate::TheArch
         }
         None => (0, 0, -1),
     };
-    for i in 0..MAX_THREADS {
-        if threads[i].kernel.state == ThreadState::Unused {
-            let t = &mut threads[i];
+    for (i, t) in threads.iter_mut().enumerate().take(MAX_THREADS) {
+        if t.kernel.state == ThreadState::Unused {
             let k = &mut t.kernel;
             k.tid = i as i32;
             k.pid = if is_process { i as i32 } else { parent_pid };
@@ -571,13 +576,13 @@ pub fn schedule(threads: &[Thread], current_tid: usize) -> Option<usize> {
     let mut next_idx: usize = usize::MAX;
     let mut count = 0u64;
 
-    for i in 1..MAX_THREADS {
+    for (i, t) in threads.iter().enumerate().take(MAX_THREADS).skip(1) {
         if i == current_tid {
             continue;
         }
-        if threads[i].kernel.state == ThreadState::Ready {
+        if t.kernel.state == ThreadState::Ready {
             count += 1;
-            if prng() % count == 0 {
+            if prng().is_multiple_of(count) {
                 next_idx = i;
             }
         }
@@ -666,7 +671,7 @@ pub fn exit_thread(threads: &mut [Thread], machine: &mut crate::TheArch, tid: us
             parent.kernel.state = ThreadState::Ready;
             match &mut parent.personality {
                 Personality::Dos(_) => {
-                    parent.kernel.vcpu.regs.rax = parent.kernel.vcpu.regs.rax & !0xFFFF;
+                    parent.kernel.vcpu.regs.rax &= !0xFFFF;
                 }
                 Personality::Linux(linux) => {
                     parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
@@ -716,8 +721,8 @@ pub fn peek_zombie_child(threads: &[Thread], current_tid: usize, pid: i32) -> (i
     let current_tid = threads[current_tid].kernel.tid;
     let mut has_children = false;
 
-    for i in 1..MAX_THREADS {
-        let k = &threads[i].kernel;
+    for t in threads.iter().take(MAX_THREADS).skip(1) {
+        let k = &t.kernel;
         if k.parent_tid == current_tid && k.state != ThreadState::Unused {
             has_children = true;
             if k.state == ThreadState::Zombie && (pid == -1 || k.tid == pid) {

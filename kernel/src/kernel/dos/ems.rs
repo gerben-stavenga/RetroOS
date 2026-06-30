@@ -9,7 +9,6 @@ use crate::dbg_println;
 use crate::arch::Vcpu;
 use super::xms::EMS_BASE_PAGE;
 use crate::kernel::thread;
-use crate::Regs;
 
 pub(crate) const EMS_ENABLED: bool = true;
 
@@ -64,10 +63,8 @@ impl EmsState {
 
     fn alloc_pages(&self) -> u16 {
         let mut used: u16 = 0;
-        for h in &self.handles {
-            if let Some(h) = h {
-                used += h.pages.len() as u16;
-            }
+        for h in self.handles.iter().flatten() {
+            used += h.pages.len() as u16;
         }
         EMS_TOTAL_PAGES.saturating_sub(used)
     }
@@ -111,12 +108,12 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
     match ah {
         // AH=40h — Get status
         0x40 => {
-            regs.rax = regs.rax & !0xFF00; // AH=0: OK
+            regs.rax &= !0xFF00; // AH=0: OK
         }
         // AH=41h — Get page frame segment
         0x41 => {
             regs.rbx = (regs.rbx & !0xFFFF) | ems_frame_seg() as u64;
-            regs.rax = regs.rax & !0xFF00; // AH=0
+            regs.rax &= !0xFF00; // AH=0
         }
         // AH=42h — Get unallocated page count
         0x42 => {
@@ -124,7 +121,7 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
             let free = ems.alloc_pages();
             regs.rbx = (regs.rbx & !0xFFFF) | free as u64;     // BX = free pages
             regs.rdx = (regs.rdx & !0xFFFF) | EMS_TOTAL_PAGES as u64; // DX = total pages
-            regs.rax = regs.rax & !0xFF00; // AH=0
+            regs.rax &= !0xFF00; // AH=0
         }
         // AH=43h — Allocate handle (BX=pages needed, returns DX=handle)
         0x43 => {
@@ -152,7 +149,7 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
                         }
                         ems.handles[i] = Some(EmsHandle { pages });
                         regs.rdx = (regs.rdx & !0xFFFF) | i as u64;
-                        regs.rax = regs.rax & !0xFF00; // AH=0
+                        regs.rax &= !0xFF00; // AH=0
                     }
                 }
                 None => {
@@ -176,13 +173,12 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
             // BX=FFFFh means unmap
             if log_page == 0xFFFF {
                 // Save current frame content back to its backing
-                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
-                    if let Some(ref h) = ems.handles[old_h as usize] {
+                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize]
+                    && let Some(ref h) = ems.handles[old_h as usize] {
                         swap_ems_window(machine, phys_page as usize, h.pages[old_lp as usize]);
                     }
-                }
                 ems.frame[phys_page as usize] = None;
-                regs.rax = regs.rax & !0xFF00; // AH=0
+                regs.rax &= !0xFF00; // AH=0
                 return thread::KernelAction::Done;
             }
 
@@ -195,15 +191,14 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
                 Some(h) if (log_page as usize) < h.pages.len() => {
                     let backing_vpage = h.pages[log_page as usize];
                     // Save current frame content back to old backing
-                    if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
-                        if let Some(ref oh) = ems.handles[old_h as usize] {
+                    if let Some((old_h, old_lp)) = ems.frame[phys_page as usize]
+                        && let Some(ref oh) = ems.handles[old_h as usize] {
                             swap_ems_window(machine, phys_page as usize, oh.pages[old_lp as usize]);
                         }
-                    }
                     // Load new backing into frame
                     swap_ems_window(machine, phys_page as usize, backing_vpage);
                     ems.frame[phys_page as usize] = Some((handle as u8, log_page));
-                    regs.rax = regs.rax & !0xFF00; // AH=0
+                    regs.rax &= !0xFF00; // AH=0
                 }
                 Some(_) => {
                     regs.rax = (regs.rax & !0xFF00) | (0x8A << 8); // logical page out of range
@@ -220,25 +215,24 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
             if (handle as usize) < MAX_EMS_HANDLES && ems.handles[handle as usize].is_some() {
                 // Unmap any windows using this handle
                 for w in 0..4 {
-                    if let Some((h, lp)) = ems.frame[w] {
-                        if h == handle as u8 {
+                    if let Some((h, lp)) = ems.frame[w]
+                        && h == handle as u8 {
                             if let Some(ref hnd) = ems.handles[h as usize] {
                                 swap_ems_window(machine, w, hnd.pages[lp as usize]);
                             }
                             ems.frame[w] = None;
                         }
-                    }
                 }
                 // Release handle (backing pages freed with address space)
                 ems.handles[handle as usize] = None;
-                regs.rax = regs.rax & !0xFF00; // AH=0
+                regs.rax &= !0xFF00; // AH=0
             } else {
                 regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
             }
         }
         // AH=46h — Get version
         0x46 => {
-            regs.rax = (regs.rax & !0xFF00) | (0x00 << 8); // AH=0
+            regs.rax &= !0xFF00; // AH=0
             regs.rax = (regs.rax & !0xFF) | 0x40; // AL=40h = version 4.0
         }
         // AH=4Bh — Get number of open handles
@@ -246,7 +240,7 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
             let ems = ems_state(dos);
             let count = ems.handles.iter().filter(|h| h.is_some()).count() as u16;
             regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
-            regs.rax = regs.rax & !0xFF00;
+            regs.rax &= !0xFF00;
         }
         // AH=4Ch — Get pages allocated to handle (DX=handle)
         0x4C => {
@@ -255,7 +249,7 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
             if (handle as usize) < MAX_EMS_HANDLES {
                 if let Some(ref h) = ems.handles[handle as usize] {
                     regs.rbx = (regs.rbx & !0xFFFF) | h.pages.len() as u64;
-                    regs.rax = regs.rax & !0xFF00;
+                    regs.rax &= !0xFF00;
                 } else {
                     regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
                 }
@@ -279,7 +273,7 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
                 }
             }
             regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
-            regs.rax = regs.rax & !0xFF00;
+            regs.rax &= !0xFF00;
         }
         // AH=50h — Map multiple pages (AL=0: phys page mode, AL=1: segment mode)
         // CX=count, DX=handle, DS:SI=mapping array
@@ -298,8 +292,8 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
             }
 
             for i in 0..count as u32 {
-                let log_page = regs.read::<u16>(((base_addr + i * 4)) as usize);
-                let phys_raw = regs.read::<u16>(((base_addr + i * 4 + 2)) as usize);
+                let log_page = regs.read::<u16>((base_addr + i * 4) as usize);
+                let phys_raw = regs.read::<u16>((base_addr + i * 4 + 2) as usize);
 
                 let phys_page = if al == 0 {
                     phys_raw as u8
@@ -315,11 +309,10 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
                 }
 
                 // Save current frame content back to old backing
-                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize] {
-                    if let Some(ref oh) = ems.handles[old_h as usize] {
+                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize]
+                    && let Some(ref oh) = ems.handles[old_h as usize] {
                         swap_ems_window(machine, phys_page as usize, oh.pages[old_lp as usize]);
                     }
-                }
 
                 if log_page == 0xFFFF {
                     ems.frame[phys_page as usize] = None;
@@ -337,7 +330,7 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
                     }
                 }
             }
-            regs.rax = regs.rax & !0xFF00; // AH=0
+            regs.rax &= !0xFF00; // AH=0
         }
         // AH=51h — Reallocate pages for handle (DX=handle, BX=new count)
         0x51 => {
@@ -364,7 +357,7 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
                     } else if (new_count as usize) < old_count {
                         h.pages.truncate(new_count as usize);
                     }
-                    regs.rax = regs.rax & !0xFF00;
+                    regs.rax &= !0xFF00;
                     regs.rbx = (regs.rbx & !0xFFFF) | new_count as u64;
                 }
                 None => {
@@ -386,10 +379,10 @@ fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs:
                     regs.write::<u16>((base + i * 4 + 2) as usize, i as u16);
                 }
                 regs.rcx = (regs.rcx & !0xFFFF) | 4; // 4 mappable pages
-                regs.rax = regs.rax & !0xFF00;
+                regs.rax &= !0xFF00;
             } else {
                 regs.rcx = (regs.rcx & !0xFFFF) | 4;
-                regs.rax = regs.rax & !0xFF00;
+                regs.rax &= !0xFF00;
             }
         }
         _ => {

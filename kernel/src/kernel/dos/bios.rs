@@ -36,7 +36,26 @@ use crate::kernel::thread;
 use super::machine::{
     self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_sp, vm86_ss, read_u16, write_u16,
 };
-use super::dos::STUB_SEG;
+use super::dosabi::STUB_SEG;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// The native BIOS ROM's INT 15h vector (`seg<<16 | off`), captured before we
+/// steal the vector in `setup_ivt`, so subfunctions we don't emulate can chain
+/// back to it. `NO_NATIVE` on the Substitute path — there's no ROM to chain to,
+/// and unhandled subfunctions just IRET.
+const NO_NATIVE: u32 = 0xFFFF_FFFF;
+static NATIVE_INT15: AtomicU32 = AtomicU32::new(NO_NATIVE);
+
+/// Record the ROM INT 15h vector before `setup_ivt` redirects it to our stub.
+pub(super) fn set_native_int15(seg: u16, off: u16) {
+    NATIVE_INT15.store(((seg as u32) << 16) | off as u32, Ordering::Relaxed);
+}
+fn native_int15() -> Option<(u16, u16)> {
+    match NATIVE_INT15.load(Ordering::Relaxed) {
+        NO_NATIVE => None,
+        v => Some(((v >> 16) as u16, v as u16)),
+    }
+}
 
 // ============================================================================
 // BIOS Data Area — a typed Rust projection at linear 0x400 (segment 0x40)
@@ -234,6 +253,26 @@ pub(super) fn dispatch(
             let equip: u16 = bda_field!(regs, equipment);
             regs.rax = (regs.rax & !0xFFFF) | equip as u64;
         }
+        0x15 => match (regs.rax >> 8) as u8 {
+            // AH=87h block move: the ROM does this via a protected-mode LGDT
+            // excursion (illegal under VM86). Do the copy directly instead.
+            0x87 => int15_block_move(regs),
+            // AH=89h switch-to-PM: a VM86 guest cannot take over real PM — the
+            // monitor owns it. Refuse, exactly as EMM386 does (DPMI is the
+            // sanctioned path). AH=86h = "unsupported", CF set.
+            0x89 => {
+                regs.rax = (regs.rax & !0xFF00) | 0x8600;
+                set_iret_cf(regs, true);
+            }
+            // Everything else: on a real BIOS, hand back to the ROM (WAIT,
+            // ext-mem size, …) reusing the caller's INT frame. On Substitute
+            // there's no ROM, so fall through to a plain IRET as before.
+            _ => if let Some((seg, off)) = native_int15() {
+                machine::set_vm86_cs(regs, seg);
+                machine::set_vm86_ip(regs, off);
+                return thread::KernelAction::Done;
+            },
+        },
         0x16 => {
             if int16(regs, ip) == Parked::Yes {
                 return thread::KernelAction::Done;
@@ -255,6 +294,38 @@ fn pop_iret_frame(regs: &mut Vcpu) {
     machine::set_vm86_ip(regs, ret_ip);
     machine::set_vm86_cs(regs, ret_cs);
     machine::set_vm86_flags(regs, ret_flags as u32);
+}
+
+/// Set/clear CF in the caller's *stacked* FLAGS (at `SS:SP+4`), which
+/// `pop_iret_frame` restores on return — clearing the live flag would just be
+/// overwritten by that pop. This is how a real BIOS reports carry through IRET.
+fn set_iret_cf(regs: &mut Vcpu, cf: bool) {
+    let flin = (((vm86_ss(regs) as u32) << 4) + vm86_sp(regs) as u32 + 4) as usize;
+    let mut f = regs.read::<u16>(flin);
+    if cf { f |= 1 } else { f &= !1 }
+    regs.write::<u16>(flin, f);
+}
+
+/// INT 15h AH=87h — copy a block to/from extended memory. `ES:SI` → the
+/// caller's GDT; descriptor `[0x10]` is the source, `[0x18]` the destination,
+/// each carrying a 24/32-bit linear base (bytes 2–4 = base 0–23, byte 7 =
+/// 24–31). `CX` = words to copy. We perform the copy directly — the same
+/// operation as XMS AH=0Bh (`copy_within`) — instead of letting the ROM `LGDT`
+/// into protected mode, which is illegal under VM86.
+fn int15_block_move(regs: &mut Vcpu) {
+    let gdt = ((regs.es as u32) << 4) + (regs.rsi as u32 & 0xFFFF);
+    let base = |regs: &Vcpu, desc: u32| -> u32 {
+        let d = (gdt + desc) as usize;
+        (regs.read::<u16>(d + 2) as u32)                      // base bits 0–15
+            | (((regs.read::<u16>(d + 4) as u32) & 0xFF) << 16) // byte 4: bits 16–23
+            | (((regs.read::<u16>(d + 6) as u32) >> 8) << 24)   // byte 7: bits 24–31
+    };
+    let src = base(regs, 0x10);
+    let dst = base(regs, 0x18);
+    let len = (regs.rcx as usize & 0xFFFF) * 2;
+    regs.copy_within(src as usize, dst as usize, len);
+    regs.rax &= !0xFF00;       // AH = 0 (success)
+    set_iret_cf(regs, false);  // CF = 0
 }
 
 // ============================================================================
@@ -555,7 +626,191 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
                 regs.rbx = (regs.rbx & !0xFFFF) | 0x0008; // VGA, colour analog
             }
         }
+        0x4F => vbe(machine, dos, regs),
         _ => {}
+    }
+}
+
+// ============================================================================
+// VESA VBE (INT 10h AH=4Fh)
+// ============================================================================
+
+/// The banked SVGA modes we expose: (VBE mode#, width, height, bpp). Presented
+/// through the emulated framebuffer sink, integer-scaled/centred to the panel.
+/// 8bpp goes through the DAC palette; 15/16/32 are direct colour. Substitute
+/// path only — the native/SeaBIOS path has the card's own VBE.
+const VBE_MODES: &[(u16, u16, u16, u8)] = &[
+    (0x101, 640, 480, 8),
+    (0x103, 800, 600, 8),
+    (0x110, 640, 480, 15),
+    (0x111, 640, 480, 16),
+    (0x112, 640, 480, 32),
+];
+
+fn vbe(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) {
+    // Every VBE call returns AL=4Fh ("supported"); AH=00h success, 01h failed.
+    let al = regs.rax as u8;
+    let done = |regs: &mut Vcpu, ok: bool| {
+        regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
+    };
+    match al {
+        0x00 => { vbe_controller_info(regs); done(regs, true); }
+        0x01 => { let ok = vbe_mode_info(regs); done(regs, ok); }
+        0x02 => { let ok = vbe_set_mode(machine, dos, regs); done(regs, ok); }
+        0x03 => {
+            let cur = VBE_MODES.iter()
+                .find(|&&(_, w, h, b)| w == dos.pc.vga.svga_w && h == dos.pc.vga.svga_h && b == dos.pc.vga.svga_bpp)
+                .map(|&(n, ..)| n)
+                .unwrap_or(0);
+            regs.rbx = (regs.rbx & !0xFFFF) | cur as u64;
+            done(regs, true);
+        }
+        0x05 => { vbe_window(machine, dos, regs); done(regs, true); }
+        0x08 => { vbe_dac_format(regs); done(regs, true); }
+        0x09 => { let ok = vbe_palette(machine, dos, regs); done(regs, ok); }
+        _ => done(regs, false),
+    }
+}
+
+/// VBE 4F08h — Set/Get DAC palette format. We model only the 6-bit VGA DAC, so
+/// report BH=6 for both set and get (a client asking for 8-bit falls back).
+fn vbe_dac_format(regs: &mut Vcpu) {
+    regs.rbx = (regs.rbx & !0xFF00) | (6 << 8);
+}
+
+/// VBE 4F09h — Set/Get Palette Data. CX entries from index DX at ES:DI, each 4
+/// bytes (Blue, Green, Red, align), 6-bit components. Routed through the DAC
+/// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
+fn vbe_palette(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) -> bool {
+    let count = regs.rcx as u16 as usize;
+    let start = regs.rdx as u8;
+    let tbl = es_di(regs);
+    match regs.rbx as u8 {
+        0x00 | 0x80 => {
+            // Set (00h) / set-during-retrace (80h): we apply immediately.
+            emulate_outb(machine, &mut dos.pc, regs, 0x3C8, start);
+            for i in 0..count {
+                let e = tbl + i * 4;
+                let (b, g, r): (u8, u8, u8) = (regs.read(e), regs.read(e + 1), regs.read(e + 2));
+                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, r);
+                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, g);
+                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, b);
+            }
+            true
+        }
+        0x01 => {
+            // Get: read the DAC back into the caller's table.
+            emulate_outb(machine, &mut dos.pc, regs, 0x3C7, start);
+            for i in 0..count {
+                let r = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                let g = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                let b = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                let e = tbl + i * 4;
+                regs.write::<u8>(e, b);
+                regs.write::<u8>(e + 1, g);
+                regs.write::<u8>(e + 2, r);
+                regs.write::<u8>(e + 3, 0);
+            }
+            true
+        }
+        _ => false, // 02h secondary palette: unsupported
+    }
+}
+
+/// Linear address of the caller's ES:DI block (real-mode VBE buffers).
+fn es_di(regs: &Vcpu) -> usize {
+    ((regs.es as usize & 0xFFFF) << 4) + (regs.rdi as usize & 0xFFFF)
+}
+
+/// VBE 4F00h — controller info into ES:DI, with the mode list placed in the
+/// block's reserved area and pointed at by VideoModePtr.
+fn vbe_controller_info(regs: &mut Vcpu) {
+    let lin = es_di(regs);
+    for i in (0..256).step_by(4) {
+        regs.write::<u32>(lin + i, 0);
+    }
+    regs.write::<u8>(lin, b'V');
+    regs.write::<u8>(lin + 1, b'E');
+    regs.write::<u8>(lin + 2, b'S');
+    regs.write::<u8>(lin + 3, b'A');
+    regs.write::<u16>(lin + 0x04, 0x0200); // VBE 2.0
+    // VideoModePtr (0x0E) → mode list at ES:(DI+0x20), in the reserved area.
+    let list_off = (regs.rdi as u16).wrapping_add(0x20);
+    regs.write::<u32>(lin + 0x0E, ((regs.es as u32 & 0xFFFF) << 16) | list_off as u32);
+    regs.write::<u16>(lin + 0x12, 0x80); // total memory: 0x80 × 64 KB = 8 MB
+    let mut p = lin + 0x20;
+    for &(num, ..) in VBE_MODES {
+        regs.write::<u16>(p, num);
+        p += 2;
+    }
+    regs.write::<u16>(p, 0xFFFF); // list terminator
+}
+
+/// VBE 4F01h — mode info for CX into ES:DI. Returns false for an unknown mode.
+fn vbe_mode_info(regs: &mut Vcpu) -> bool {
+    let want = regs.rcx as u16 & 0x1FF;
+    let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
+        return false;
+    };
+    let lin = es_di(regs);
+    for i in (0..256).step_by(4) {
+        regs.write::<u32>(lin + i, 0);
+    }
+    let bpp8 = (bpp as u16).div_ceil(8);
+    let direct = bpp >= 15;
+    // ModeAttributes: supported|reserved|colour|graphics, banked + LFB (bit7).
+    regs.write::<u16>(lin, 0x009B);
+    regs.write::<u8>(lin + 0x02, 0x07); // win A: relocatable|readable|writable
+    regs.write::<u8>(lin + 0x03, 0x00); // win B: not present
+    regs.write::<u16>(lin + 0x04, 64); // granularity (KB)
+    regs.write::<u16>(lin + 0x06, 64); // window size (KB)
+    regs.write::<u16>(lin + 0x08, 0xA000); // win A segment
+    regs.write::<u16>(lin + 0x10, w * bpp8); // bytes per scanline
+    regs.write::<u16>(lin + 0x12, w);
+    regs.write::<u16>(lin + 0x14, h);
+    regs.write::<u8>(lin + 0x16, 8); // char width
+    regs.write::<u8>(lin + 0x17, 16); // char height
+    regs.write::<u8>(lin + 0x18, 1); // planes
+    regs.write::<u8>(lin + 0x19, bpp);
+    regs.write::<u8>(lin + 0x1A, 1); // banks
+    regs.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
+    regs.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
+    if direct {
+        // (red, grn, blu, rsv) as (mask_size, field_position) at 0x1F..0x26.
+        let masks: [(u8, u8); 4] = match bpp {
+            15 => [(5, 10), (5, 5), (5, 0), (1, 15)],
+            16 => [(5, 11), (6, 5), (5, 0), (0, 0)],
+            _ => [(8, 16), (8, 8), (8, 0), if bpp == 32 { (8, 24) } else { (0, 0) }],
+        };
+        for (i, &(sz, pos)) in masks.iter().enumerate() {
+            regs.write::<u8>(lin + 0x1F + i * 2, sz);
+            regs.write::<u8>(lin + 0x20 + i * 2, pos);
+        }
+    }
+    // PhysBasePtr (0x28): the framebuffer's linear base — directly usable by a
+    // PM/DPMI client (physical == linear here). LinBytesPerScanLine (0x32)
+    // mirrors the banked pitch since the framebuffer is contiguous.
+    regs.write::<u32>(lin + 0x28, super::machine::vga::svga_lfb_base());
+    regs.write::<u16>(lin + 0x32, w * bpp8);
+    true
+}
+
+/// VBE 4F02h — set mode (BX). Ignores the LFB bit (we only do banked).
+fn vbe_set_mode(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) -> bool {
+    let want = regs.rbx as u16 & 0x1FF;
+    let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
+        return false;
+    };
+    super::machine::vga::svga_set_mode(machine, &mut dos.pc, w, h, bpp);
+    true
+}
+
+/// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
+fn vbe_window(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcpu) {
+    if (regs.rbx >> 8) as u8 == 0 {
+        super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
+    } else {
+        regs.rdx = (regs.rdx & !0xFFFF) | dos.pc.vga.svga_bank as u64;
     }
 }
 

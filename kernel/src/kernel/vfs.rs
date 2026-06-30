@@ -300,8 +300,8 @@ impl Vfs {
 
         // Synthesize mount-point directories.
         for i in 0..self.mount_count {
-            if let Some(ref m) = self.mounts[i] {
-                if let Some(name) = mount_child_in_dir(m.prefix, dir) {
+            if let Some(ref m) = self.mounts[i]
+                && let Some(name) = mount_child_in_dir(m.prefix, dir) {
                     let name_len = name.len().min(100);
                     let mut de = DirEntry {
                         name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
@@ -309,7 +309,6 @@ impl Vfs {
                     de.name[..name_len].copy_from_slice(&name[..name_len]);
                     self.dir_cache.entries.push(de);
                 }
-            }
         }
 
         // RAM overlay files.
@@ -593,7 +592,7 @@ static VFS: Mutex<Vfs> = Mutex::new(Vfs::new());
 
 /// Case-insensitive comparison of two byte slices
 pub fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 fn alloc_fd(fds: &[FdKind; MAX_FDS]) -> Option<usize> {
@@ -634,7 +633,7 @@ fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     if entry_name.len() <= dir.len() { return None; }
     if !dir.is_empty() && !eq_ignore_case(&entry_name[..dir.len()], dir) { return None; }
     let rest = &entry_name[dir.len()..];
-    if rest.iter().any(|&b| b == b'/') { return None; }
+    if rest.contains(&b'/') { return None; }
     Some(rest)
 }
 
@@ -646,11 +645,6 @@ fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 /// Mount a filesystem at a prefix. Empty prefix = root.
 pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
     VFS.lock().mount(prefix, fs);
-}
-
-/// Invalidate the directory cache (call after file create/delete).
-pub fn invalidate_dir_cache() {
-    VFS.lock().invalidate_dir_cache();
 }
 
 /// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.

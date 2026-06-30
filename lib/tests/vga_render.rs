@@ -97,7 +97,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
     // One glyph (index 1) that is all-bits-set on every scanline → a solid
     // foreground block; cell attribute fg=15 (white) on bg=1 (blue).
     let mut font = vec![0u8; 256 * 16];
-    for b in &mut font[1 * 16..1 * 16 + 16] {
+    for b in &mut font[16..16 + 16] {
         *b = 0xFF;
     }
     // 80×25 cells; put char 1 / attr 0x1F at cell (0,0), leave the rest blank.
@@ -140,5 +140,5 @@ fn fallback_palette_has_ega_colors_first() {
     let pal = vga_render::fallback_palette();
     // Entry 15 is white (63,63,63); entry 1 is blue (0,0,42).
     assert_eq!((pal[15 * 3], pal[15 * 3 + 1], pal[15 * 3 + 2]), (63, 63, 63));
-    assert_eq!((pal[1 * 3], pal[1 * 3 + 1], pal[1 * 3 + 2]), (0, 0, 42));
+    assert_eq!((pal[3], pal[3 + 1], pal[3 + 2]), (0, 0, 42));
 }

@@ -43,6 +43,12 @@ pub enum VgaMode {
     /// Unchained 256-colour ("Mode X", 320×240 etc.): 4 planes, pixel x uses
     /// plane `x & 3` at byte `y*row_bytes + x/4`. Read from `planes`.
     ModeX { w: u16, h: u16, row_bytes: u16 },
+    /// Linear SVGA (VESA): a flat framebuffer at arbitrary `w`×`h`. `bpp` 8 =
+    /// palette index/byte; 15 = 5:5:5, 16 = 5:6:5 direct colour; 24/32 =
+    /// 0x00RRGGBB packed little-endian (the channel layout we report via VBE).
+    /// `pitch` is bytes per scanline. Read from linear `vram` (the VESA
+    /// framebuffer aperture).
+    LinearSvga { w: u16, h: u16, bpp: u8, pitch: u16 },
 }
 
 /// One frame's worth of renderable VGA state. Borrowed — the renderer copies
@@ -104,6 +110,7 @@ pub const fn dimensions(mode: VgaMode) -> (usize, usize) {
         VgaMode::Cga2 => (640, 200),
         VgaMode::Planar16 { w, h, .. } => (w as usize, h as usize),
         VgaMode::ModeX { w, h, .. } => (w as usize, h as usize),
+        VgaMode::LinearSvga { w, h, .. } => (w as usize, h as usize),
     }
 }
 
@@ -204,11 +211,11 @@ pub fn classify(bda_mode: u8, r: &Regs) -> Option<VgaMode> {
 /// plane-major.
 pub fn chain4_split(chained: &[u8], planes: &mut [u8]) {
     let n = chained.len().min(0x10000);
-    for i in 0..n {
+    for (i, &src) in chained.iter().enumerate().take(n) {
         let plane = i & 3;
         let off = i >> 2;
         if plane * 0x10000 + off < planes.len() {
-            planes[plane * 0x10000 + off] = chained[i];
+            planes[plane * 0x10000 + off] = src;
         }
     }
 }
@@ -217,10 +224,10 @@ pub fn chain4_split(chained: &[u8], planes: &mut [u8]) {
 /// back into the linear chained view on an unchain→chain hop.
 pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
     let n = chained.len().min(0x10000);
-    for i in 0..n {
+    for (i, dst) in chained.iter_mut().enumerate().take(n) {
         let plane = i & 3;
         let off = i >> 2;
-        chained[i] = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
+        *dst = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
     }
 }
 
@@ -317,9 +324,9 @@ pub fn planar_read(cur: [u8; 4], gc: &[u8; 9]) -> (u8, [u8; 4]) {
         let cc = gc[2] & 0x0F;
         let dc = gc[7] & 0x0F;
         let mut r = 0xFFu8;
-        for p in 0..4 {
+        for (p, &plane) in cur.iter().enumerate() {
             if dc & (1 << p) != 0 {
-                r &= if cc & (1 << p) != 0 { cur[p] } else { !cur[p] };
+                r &= if cc & (1 << p) != 0 { plane } else { !plane };
             }
         }
         r
@@ -501,15 +508,76 @@ pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
         VgaMode::Cga2 => render_cga2(frame, out, w, h),
         VgaMode::Planar16 { row_bytes, .. } => render_planar16(frame, out, w, h, row_bytes as usize),
         VgaMode::ModeX { row_bytes, .. } => render_modex(frame, out, w, h, row_bytes as usize),
+        VgaMode::LinearSvga { bpp, pitch, .. } => render_svga(frame, out, w, h, bpp, pitch as usize),
     }
     (w, h)
 }
 
-/// Mode 13h: one palette index per pixel, linear at the start of vram.
+/// Linear SVGA present: walk the flat VESA framebuffer and expand each pixel to
+/// the canonical 0x00RRGGBB. 8bpp goes through the DAC palette; 15/16bpp are
+/// 5:5:5 / 5:6:5 scaled to 8-bit; 24/32bpp are already B,G,R bytes (the layout
+/// we report to the guest), so they assemble directly — a no-op recolour, i.e.
+/// the zero-copy-shaped path.
+fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitch: usize) {
+    let vram = frame.vram;
+    let bpp8 = (bpp as usize).div_ceil(8);
+    let pitch = if pitch == 0 { w * bpp8 } else { pitch };
+    let rd16 = |p: usize| (vram.get(p).copied().unwrap_or(0) as u16)
+        | ((vram.get(p + 1).copied().unwrap_or(0) as u16) << 8);
+    for y in 0..h {
+        let base = y * pitch;
+        let row = &mut out[y * w..y * w + w];
+        for (x, px) in row.iter_mut().enumerate() {
+            let p = base + x * bpp8;
+            *px = match bpp {
+                8 => pal_rgb(frame.palette, vram.get(p).copied().unwrap_or(0)),
+                15 => {
+                    let v = rd16(p);
+                    let r = ((v >> 10) & 0x1F) as u32;
+                    let g = ((v >> 5) & 0x1F) as u32;
+                    let b = (v & 0x1F) as u32;
+                    ((r * 255 / 31) << 16) | ((g * 255 / 31) << 8) | (b * 255 / 31)
+                }
+                16 => {
+                    let v = rd16(p);
+                    let r = ((v >> 11) & 0x1F) as u32;
+                    let g = ((v >> 5) & 0x3F) as u32;
+                    let b = (v & 0x1F) as u32;
+                    ((r * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (b * 255 / 31)
+                }
+                _ => {
+                    let b = vram.get(p).copied().unwrap_or(0) as u32;
+                    let g = vram.get(p + 1).copied().unwrap_or(0) as u32;
+                    let r = vram.get(p + 2).copied().unwrap_or(0) as u32;
+                    (r << 16) | (g << 8) | b
+                }
+            };
+        }
+    }
+}
+
+/// Mode 13h: one palette index per pixel, linear in vram. Honours the CRTC
+/// display-start address and AC pixel-pan that slide the visible window —
+/// screen-shake / centring effects (OMF 2097) draw into a fixed buffer and pan
+/// the scanout origin rather than re-blitting. `start_offset`/`pixel_pan` are
+/// pre-scaled to linear pixel units by the caller. Line Compare splits the
+/// lower region back to address 0 with panning suppressed, like the planar
+/// modes. Row stride is the visible width (320); a uniform horizontal shift,
+/// not a per-row shear, is what the offset produces.
 fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
-    let n = (w * h).min(frame.vram.len()).min(out.len());
-    for i in 0..n {
-        out[i] = pal_rgb(frame.palette, frame.vram[i]);
+    let vram = frame.vram;
+    for y in 0..h {
+        let split = y >= frame.line_compare;
+        let (start, pan, ry) = if split {
+            (0, 0, y - frame.line_compare)
+        } else {
+            (frame.start_offset, frame.pixel_pan & 7, y)
+        };
+        let base = start + ry * w + pan;
+        let row = &mut out[y * w..y * w + w];
+        for (x, px) in row.iter_mut().enumerate() {
+            *px = pal_rgb(frame.palette, vram.get(base + x).copied().unwrap_or(0));
+        }
     }
 }
 
@@ -703,8 +771,7 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
     let bg = pal_rgb(frame.palette, (attr >> 4) & bg_mask);
     let glyph = &frame.font[ch * 16..ch * 16 + 16];
-    for gy in 0..CELL_H {
-        let bits = glyph[gy];
+    for (gy, &bits) in glyph.iter().enumerate() {
         let py = row * CELL_H + gy;
         for gx in 0..CELL_W {
             // Column 8 duplicates column 7 (VGA 9th-dot line-draw rule).
@@ -760,7 +827,7 @@ mod tests {
         r.gc[6] = 0x01;
         r.gc[5] = 0x00; // not 256, not cga-shift → planar 16
         r.crtc[1] = 39; // 40 chars → 320 px
-        r.crtc[0x12] = 199 & 0xFF;
+        r.crtc[0x12] = 199;
         r.crtc[7] = 0x00; // no overflow bits
         r.crtc[0x13] = 20; // 40 bytes/row
         match classify(0x0D, &r) {
@@ -775,8 +842,8 @@ mod tests {
     fn planar16_assembles_planes() {
         // Pixel 0 = colour 5 (planes 0 and 2 set at bit 7).
         let mut planes = vec![0u8; 4 * 0x10000];
-        planes[0 * 0x10000 + 0] = 0x80; // plane 0 bit 7
-        planes[2 * 0x10000 + 0] = 0x80; // plane 2 bit 7
+        planes[0] = 0x80; // plane 0 bit 7
+        planes[2 * 0x10000] = 0x80; // plane 2 bit 7
         let mut ac = [0u8; 21];
         for i in 0..16 { ac[i] = i as u8; }
         let pal = fallback_palette();
@@ -820,11 +887,11 @@ mod tests {
         let mut planes = vec![0u8; 4 * 0x10000];
         chain4_split(&chained, &mut planes);
         // Byte n must land in plane n&3 at n>>2.
-        assert_eq!(planes[0 * 0x10000 + 0], chained[0]);
-        assert_eq!(planes[1 * 0x10000 + 0], chained[1]);
-        assert_eq!(planes[2 * 0x10000 + 0], chained[2]);
-        assert_eq!(planes[3 * 0x10000 + 0], chained[3]);
-        assert_eq!(planes[0 * 0x10000 + 1], chained[4]);
+        assert_eq!(planes[0], chained[0]);
+        assert_eq!(planes[0x10000], chained[1]);
+        assert_eq!(planes[2 * 0x10000], chained[2]);
+        assert_eq!(planes[3 * 0x10000], chained[3]);
+        assert_eq!(planes[1], chained[4]);
         let mut back = vec![0u8; 0x10000];
         chain4_merge(&planes, &mut back);
         assert_eq!(&back[..64000], &chained[..64000]);
@@ -834,7 +901,7 @@ mod tests {
     fn modex_plane_select() {
         // Pixels 0..4 live in planes 0..3 at byte 0; set pixel 2 (plane 2) = 7.
         let mut planes = vec![0u8; 4 * 0x10000];
-        planes[2 * 0x10000 + 0] = 7;
+        planes[2 * 0x10000] = 7;
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
@@ -964,5 +1031,56 @@ mod tests {
         // Displayed px0 = source px2 = plane2 = 0x30.
         assert_eq!(out[0], pal_rgb(&pal, 0x30));
         assert_eq!(out[1], pal_rgb(&pal, 0x40)); // source px3 = plane3
+    }
+
+    #[test]
+    fn mode13h_pan_slides_window() {
+        // Linear Mode 13h with a display-start + pixel-pan offset (screen-shake):
+        // displayed pixel x reads vram[start + pan + x], a uniform shift. With a
+        // 320-wide row, start=320 lands on the second scanline's data.
+        let mut vram = vec![0u8; 0x10000];
+        for i in 0..vram.len() { vram[i] = (i & 0xFF) as u8; }
+        let ac = [0u8; 21];
+        let pal = fallback_palette();
+        let frame = Frame {
+            mode: VgaMode::Mode13h,
+            vram: &vram, planes: &[], ac: &ac, palette: &pal,
+            font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+            start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
+        };
+        let mut out = vec![0u32; 320 * 200];
+        render(&frame, &mut out);
+        // Row 0, displayed px0 = vram[320 + 3 + 0]; px1 = vram[324]; ...
+        assert_eq!(out[0], pal_rgb(&pal, vram[323]));
+        assert_eq!(out[5], pal_rgb(&pal, vram[328]));
+        // Row 1, displayed px0 = vram[start + 1*320 + pan] = vram[643].
+        assert_eq!(out[320], pal_rgb(&pal, vram[643]));
+    }
+
+    #[test]
+    fn svga_8bpp_and_32bpp() {
+        let pal = fallback_palette();
+        let ac = [0u8; 21];
+        let mk = |mode, vram: &[u8]| {
+            let frame = Frame {
+                mode, vram, planes: &[], ac: &ac, palette: &pal,
+                font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+                start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            };
+            let (w, h) = dimensions(mode);
+            let mut out = vec![0u32; w * h];
+            render(&frame, &mut out);
+            out
+        };
+        // 8bpp 4x2: index = palette lookup. pitch defaults to w.
+        let idx = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let out8 = mk(VgaMode::LinearSvga { w: 4, h: 2, bpp: 8, pitch: 0 }, &idx);
+        assert_eq!(out8[0], pal_rgb(&pal, 1));
+        assert_eq!(out8[5], pal_rgb(&pal, 6)); // row1 px1
+        // 32bpp 2x1: bytes are B,G,R,X per pixel → 0x00RRGGBB.
+        let px = [0x11u8, 0x22, 0x33, 0x00,  0x44, 0x55, 0x66, 0x00];
+        let out32 = mk(VgaMode::LinearSvga { w: 2, h: 1, bpp: 32, pitch: 0 }, &px);
+        assert_eq!(out32[0], 0x00332211);
+        assert_eq!(out32[1], 0x00665544);
     }
 }

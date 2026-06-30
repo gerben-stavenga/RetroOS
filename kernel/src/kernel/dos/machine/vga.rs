@@ -28,11 +28,11 @@ pub fn vga_present() -> bool {
 /// VGA Attribute Controller port (0x3C0) state. The hardware has two
 /// independent pieces of state, neither readable from any port:
 ///   - `index`:        last byte written in index state. Includes the PAS bit
-///                     (bit 5) which controls screen blanking. Persistent —
-///                     subsequent data writes do not change it.
+///     (bit 5) which controls screen blanking. Persistent —
+///     subsequent data writes do not change it.
 ///   - `pending_data`: flip-flop position. `false` = next 0x3C0 write is an
-///                     index byte; `true` = next 0x3C0 write is its data.
-/// `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
+///     index byte; `true` = next 0x3C0 write is its data.
+///     `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
 #[derive(Clone, Copy)]
 pub struct AcState {
     pub index: u8,
@@ -92,6 +92,22 @@ pub struct VgaState {
     /// through; write modes 0/2/3 ALU the new value against them. Only used on
     /// the trapped planar write path (see `vram_write`/`vram_read`).
     pub latches: [u8; 4],
+    // ── VESA SVGA (banked) ──
+    /// Active VBE mode geometry; `svga_w == 0` ⇒ not in an SVGA mode. The
+    /// framebuffer is a guest-mapped region at `SVGA_LFB_BASE`; the 0xA0000
+    /// window is *aliased* onto its current bank (shared frames), so guest
+    /// writes land directly in it — no copy, always coherent.
+    pub svga_w: u16,
+    pub svga_h: u16,
+    pub svga_bpp: u8,
+    /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
+    pub svga_bank: u16,
+}
+
+impl Default for VgaState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VgaState {
@@ -129,6 +145,10 @@ impl VgaState {
             dac_rsub: 0,
             dac_wsub: 0,
             latches: [0; 4],
+            svga_w: 0,
+            svga_h: 0,
+            svga_bpp: 0,
+            svga_bank: 0,
         }
     }
 
@@ -559,6 +579,81 @@ fn disarm_planar(machine: &mut crate::TheArch, vga: &VgaState, regs: &mut Vcpu, 
     A0000_TARGET.store(0xFF, Ordering::Relaxed);
 }
 
+// ============================================================================
+// VESA SVGA. The framebuffer is a guest user-RAM region at SVGA_LFB_BASE. A
+// real-mode guest reaches one 64 KB bank at a time through the 0xA0000 window,
+// which we *alias* onto the bank (shared frames via copy_page_entries) — guest
+// writes land directly in the framebuffer, always coherent, no copy. A
+// protected-mode (DPMI) client can map the same region as a linear framebuffer
+// and write it directly. `display_tick` presents by reading the region.
+// ============================================================================
+
+/// Guest-linear base of the SVGA framebuffer. Placed at 1 GB — far above the
+/// DPMI linear pool (grows up from 0x500000) and the XMS region, well below the
+/// 3 GB user-space ceiling — so a DPMI client mapping it as an LFB never
+/// collides with the program's own allocations. Sized per mode, rounded up to
+/// whole 64 KB banks.
+const SVGA_LFB_BASE: usize = 0x4000_0000; // 1 GB
+const SVGA_WINDOW: usize = 0x10000; // 64 KB VBE bank granule
+const WINDOW_PAGES: usize = SVGA_WINDOW >> 12;
+
+/// Whole 64 KB banks a `w`×`h`×`bpp` framebuffer needs.
+fn svga_banks(w: u16, h: u16, bpp: u8) -> usize {
+    let bytes = w as usize * h as usize * (bpp as usize).div_ceil(8);
+    bytes.div_ceil(SVGA_WINDOW)
+}
+
+/// VBE's `PhysBasePtr`. RetroOS's DOS guest has one paged address space shared
+/// by VM86 and PM, so the DPMI "physical" address *is* a guest-linear address:
+/// we report the framebuffer's linear base, and a PM/DPMI client reaches it
+/// directly through its flat selector — no physical→linear mapping needed.
+pub const fn svga_lfb_base() -> u32 {
+    SVGA_LFB_BASE as u32
+}
+
+/// Enter a banked SVGA mode (INT 10h AX=4F02h): back the framebuffer with fresh
+/// user RAM and alias the 0xA0000 window onto bank 0.
+pub fn svga_set_mode(machine: &mut crate::TheArch, pc: &mut PcMachine, w: u16, h: u16, bpp: u8) {
+    let pages = svga_banks(w, h, bpp) * WINDOW_PAGES;
+    machine.map_fresh_range(SVGA_LFB_BASE >> 12, pages);
+    machine.copy_page_entries(SVGA_LFB_BASE >> 12, A0000 >> 12, WINDOW_PAGES);
+    pc.vga.svga_w = w;
+    pc.vga.svga_h = h;
+    pc.vga.svga_bpp = bpp;
+    pc.vga.svga_bank = 0;
+    // A VBE set-mode bypasses on_set_mode, so clear any stale planar marker.
+    A0000_TARGET.store(0xFF, Ordering::Relaxed);
+}
+
+/// VBE 4F05h window control: alias the 0xA0000 window onto `bank` of the
+/// framebuffer. No copy — the window simply shares the bank's frames.
+pub fn svga_set_bank(machine: &mut crate::TheArch, pc: &mut PcMachine, bank: u16) {
+    if pc.vga.svga_w == 0 {
+        return;
+    }
+    let src = (SVGA_LFB_BASE >> 12) + bank as usize * WINDOW_PAGES;
+    machine.copy_page_entries(src, A0000 >> 12, WINDOW_PAGES);
+    pc.vga.svga_bank = bank;
+}
+
+/// Leave SVGA for a standard VGA mode: detach the window alias and free the
+/// framebuffer region.
+pub fn svga_leave(machine: &mut crate::TheArch, pc: &mut PcMachine) {
+    if pc.vga.svga_w == 0 {
+        return;
+    }
+    let pages = svga_banks(pc.vga.svga_w, pc.vga.svga_h, pc.vga.svga_bpp) * WINDOW_PAGES;
+    // Detach the window alias (drops its shared ref on the current bank), then
+    // free the framebuffer region — frees the frames and leaves the entries
+    // absent, the only sane "free" for an allocated RAM region.
+    machine.map_fresh_range(A0000 >> 12, WINDOW_PAGES);
+    machine.unmap_range(SVGA_LFB_BASE >> 12, pages);
+    pc.vga.svga_w = 0;
+    pc.vga.svga_h = 0;
+    pc.vga.svga_bpp = 0;
+    pc.vga.svga_bank = 0;
+}
+
 /// React to a BIOS INT 10h AH=00 video mode set. The EGA/VGA 16-colour planar
 /// family (0x0D–0x12, e.g. Commander Keen) draws through the 4 planes via the
 /// map mask + write modes exactly like Mode X, but a game sets it via the BIOS
@@ -576,6 +671,8 @@ pub fn on_set_mode(
     if vga_present() {
         return; // a real card draws its own planes
     }
+    // A standard mode-set leaves any active VESA SVGA mode.
+    svga_leave(machine, pc);
     // The IBM BIOS programs CRTC line-compare to its no-split default (0x3FF) on
     // every mode set; our BIOS leaves the CRTC untouched. Without this a program
     // that page-flips but never writes 0x18 (Doom relies on the BIOS default)
@@ -871,7 +968,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         0x88 => {
             let modrm = peek(i);
             let val = gpr(regs, (modrm >> 3) & 7, 1) as u8;
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             vram_write(vga, off, val);
         }
         // mov r/m16/32, r
@@ -879,7 +976,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let modrm = peek(i);
             let sz = opsize(op32, false);
             let val = gpr(regs, (modrm >> 3) & 7, sz);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             for b in 0..sz { vram_write(vga, off + b, (val >> (b * 8)) as u8); }
         }
         // mov r8, r/m8 — load
@@ -887,7 +984,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let modrm = peek(i);
             let v = vram_read(vga, off);
             set_gpr(regs, (modrm >> 3) & 7, 1, v as u32);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
         }
         // mov r16/32, r/m
         0x8B => {
@@ -896,12 +993,12 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let mut v = 0u32;
             for b in 0..sz { v |= (vram_read(vga, off + b) as u32) << (b * 8); }
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
         }
         // mov r/m8, imm8
         0xC6 => {
             let modrm = peek(i);
-            let l = modrm_len(modrm, addr32, &peek, i);
+            let l = modrm_len(modrm, addr32, peek, i);
             let imm = peek(i + l);
             i += l + 1;
             vram_write(vga, off, imm);
@@ -909,7 +1006,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
         // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
         0xC7 => {
             let modrm = peek(i);
-            let l = modrm_len(modrm, addr32, &peek, i);
+            let l = modrm_len(modrm, addr32, peek, i);
             let sz = opsize(op32, false);
             let mut imm = 0u32;
             for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
@@ -926,7 +1023,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let modrm = peek(i);
             let ridx = (modrm >> 3) & 7;
             let regval = gpr(regs, ridx, 1) as u8;
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             let memval = vram_read(vga, off);
             vram_write(vga, off, regval);
             set_gpr(regs, ridx, 1, memval as u32);
@@ -938,7 +1035,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let ridx = (modrm >> 3) & 7;
             let sz = opsize(op32, false);
             let regval = gpr(regs, ridx, sz);
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             let mut memval = 0u32;
             for b in 0..sz {
                 memval |= (vram_read(vga, off + b) as u32) << (b * 8);
@@ -1047,7 +1144,7 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             let sz = opsize(op32, op & 1 == 0);
             let modrm = peek(i);
             let ridx = (modrm >> 3) & 7;
-            i += modrm_len(modrm, addr32, &peek, i);
+            i += modrm_len(modrm, addr32, peek, i);
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
@@ -1116,17 +1213,48 @@ impl VgaState {
         -> Option<lib::vga_render::Frame<'a>>
     {
         use lib::vga_render::{Frame, VgaMode};
+        // VESA SVGA: present the kernel-side linear framebuffer directly. The
+        // guest filled it through the banked 0xA0000 window; `display_tick`
+        // flushes the live window into `svga_fb` just before this call.
+        if self.svga_w != 0 {
+            let bpp8 = (self.svga_bpp as usize).div_ceil(8);
+            let pitch = self.svga_w as usize * bpp8;
+            let size = pitch * self.svga_h as usize;
+            return Some(Frame {
+                mode: VgaMode::LinearSvga {
+                    w: self.svga_w, h: self.svga_h, bpp: self.svga_bpp, pitch: pitch as u16,
+                },
+                vram: read_aperture(regs, scratch, SVGA_LFB_BASE, size),
+                planes: &[],
+                ac: &self.ac,
+                palette: &self.dac,
+                font: &lib::vga_font_8x16::FONT_8X16,
+                blink: false,
+                start_offset: 0,
+                pixel_pan: 0,
+                line_compare: usize::MAX,
+            });
+        }
         let mode = self.classify_mode(regs)?;
-        let (w, h) = lib::vga_render::dimensions(mode);
+        let (_w, h) = lib::vga_render::dimensions(mode);
         let (vram, planes): (&[u8], &[u8]) = match mode {
             VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
-            VgaMode::Mode13h => (read_aperture(regs, scratch, 0xA0000, w * h), &[]),
+            // Read the whole 64 KB window, not just w*h: a panned display-start
+            // (screen-shake) slides the scanout origin forward, so the visible
+            // window can reach past the nominal 320×200 = 64000 bytes.
+            VgaMode::Mode13h => (read_aperture(regs, scratch, 0xA0000, 0x10000), &[]),
             VgaMode::Text80x25 => (read_aperture(regs, scratch, 0xB8000, 80 * 25 * 2), &[]),
             VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(regs, scratch, 0xB8000, 0x4000), &[]),
+            VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
         };
         // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
-        // line-compare (split-screen) apply only to the planar families.
+        // line-compare (split-screen) apply to the planar families and to linear
+        // Mode 13h. The display-start latch is in word units for the planar
+        // modes (per-plane byte offset) but the address counter runs in
+        // doubleword mode under 13h, so each latch step is 4 linear pixels.
         let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
+        let mode13 = matches!(mode, VgaMode::Mode13h);
+        let start_latch = ((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize;
         Some(Frame {
             mode,
             vram,
@@ -1135,9 +1263,9 @@ impl VgaState {
             palette: &self.dac,
             font: &lib::vga_font_8x16::FONT_8X16,
             blink: self.ac[0x10] & 0x08 != 0,
-            start_offset: if planar { ((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize } else { 0 },
-            pixel_pan: if planar { (self.ac[0x13] & 0x07) as usize } else { 0 },
-            line_compare: if planar { self.line_compare(h) } else { usize::MAX },
+            start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },
+            pixel_pan: if planar || mode13 { (self.ac[0x13] & 0x07) as usize } else { 0 },
+            line_compare: if planar || mode13 { self.line_compare(h) } else { usize::MAX },
         })
     }
 
@@ -1160,7 +1288,7 @@ impl VgaState {
             if self.crtc[9] & 0x80 != 0 { h /= 2; }
             // Mode-Y games keep the BIOS mode-13h CRTC our BIOS never wrote
             // (v-end ~0); fall back to the 320×200 default.
-            if h < 64 || h > 480 { h = 200; }
+            if !(64..=480).contains(&h) { h = 200; }
             return Some(VgaMode::ModeX { w: row_bytes * 4, h, row_bytes });
         }
         let rregs = vga_render::Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };

@@ -93,11 +93,6 @@ struct Ac97 {
 static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
 static PRESENT: AtomicBool = AtomicBool::new(false);
 
-/// Whether a codec was discovered (fast path for `sound::play`).
-pub fn present() -> bool {
-    PRESENT.load(Ordering::Relaxed)
-}
-
 /// Find an AC'97 codec (class 0x04, subclass 0x01) anywhere on PCI, via the
 /// shared `pci::find_class` scan. Pure presence probe — `platform::probe` uses
 /// it for the Audio decision; on a no-PCI backend (the interpreter) every read
@@ -170,7 +165,7 @@ fn bring_up(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8) -> bool {
     if phys_page == 0 {
         return false;
     }
-    let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES + 0xFFF) / 0x1000;
+    let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
     arch.map_phys_range(DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
 

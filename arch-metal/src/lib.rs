@@ -30,8 +30,8 @@ pub mod xhci;
 pub static ZERO_PAGE: paging2::RawPage = unsafe { core::mem::zeroed() };
 pub static mut SCRATCH: paging2::RawPage = unsafe { core::mem::zeroed() };
 
-/// Kernel-stack guard linker symbol (defined in `kernel.ld`); the `#PF` handler
-/// labels overflow faults against it.
+// Kernel-stack guard linker symbol (defined in `kernel.ld`); the `#PF` handler
+// labels overflow faults against it.
 unsafe extern "C" {
     pub static KERNEL_STACK_GUARD: u8;
 }

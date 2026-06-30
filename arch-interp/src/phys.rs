@@ -169,6 +169,7 @@ pub fn free_frames(start: u64, count: usize) {
 /// # Safety
 /// `dst` must be a writable reservation slot (inside a `Space`'s VA window);
 /// the caller invalidates any Unicorn mapping of these pages afterwards.
+#[cfg(test)]
 pub unsafe fn alias_into(dst: *mut u8, ppage: u64, count: usize) -> bool {
     let off = (ppage as usize) * PAGE;
     assert!(off + count * PAGE <= PHYS_SIZE, "phys alias out of range");

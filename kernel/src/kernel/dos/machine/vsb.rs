@@ -316,8 +316,8 @@ impl SoundBlaster {
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
                    else if chan == self.dma16 as usize { Some(self.host_dma16) }
                    else { None };
-        if self.dma.ch[chan].armed {
-            if let Some(h) = host {
+        if self.dma.ch[chan].armed
+            && let Some(h) = host {
                 // Serve the *live* transfer state for the armed SB channel,
                 // lo/hi via the controller byte-pointer flip-flop; snapshot
                 // the full u16 at the low-byte read so the pair is coherent.
@@ -348,7 +348,6 @@ impl SoundBlaster {
                 let v = self.dma.read_latch;
                 return if low { v as u8 } else { (v >> 8) as u8 };
             }
-        }
         self.dma.io_read(machine, port)
     }
 
@@ -396,6 +395,7 @@ impl SoundBlaster {
     /// permanent buffer and program the real 8237. Driven from
     /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
     /// virtual-8237 state after a task switch).
+    #[allow(clippy::too_many_arguments)]
     fn arm(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu, chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
@@ -428,7 +428,7 @@ impl SoundBlaster {
             if self.bound_gpa != 0 { self.unbind(machine, regs); }
             let vbase     = (gpa & !0xFFF) as usize;
             let page_off  = (gpa & 0xFFF) as usize;
-            let num_pages = (page_off + len as usize + 0xFFF) / 0x1000;
+            let num_pages = (page_off + len as usize).div_ceil(0x1000);
             let win_pgoff = ((off & !0xFFF) >> 12) as u64;
             // A well-formed ISA transfer never crosses its 64 KB / 128 KB
             // window; refuse one that would overrun the channel buffer.
@@ -438,14 +438,14 @@ impl SoundBlaster {
             // Snapshot the guest's pre-filled content — whole pages, so the
             // unrelated neighbour bytes on partial end pages survive.
             let mut snap = alloc::vec![0u8; span];
-            regs.copy_from(vbase as usize, &mut snap);
+            regs.copy_from(vbase, &mut snap);
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
-            machine.free_range(vbase >> 12, num_pages);
+            machine.unmap_range(vbase >> 12, num_pages);
             machine.map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
-            regs.copy_to(vbase as usize, &snap);
+            regs.copy_to(vbase, &snap);
             self.bound_chan  = chan as u8;
             self.bound_host  = host as u8;
             self.bound_gpa   = gpa;
@@ -470,10 +470,10 @@ impl SoundBlaster {
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
-        regs.copy_from(vbase as usize, &mut snap);
+        regs.copy_from(vbase, &mut snap);
         machine.map_fresh_range(
             self.bound_vpage, self.bound_pages);
-        regs.copy_to(vbase as usize, &snap);
+        regs.copy_to(vbase, &snap);
         self.bound_chan  = 0xFF;
         self.bound_host  = 0xFF;
         self.bound_gpa   = 0;
@@ -639,7 +639,7 @@ impl SoundBlaster {
         let need = match val {
             0x40 | 0xE0 | 0xE4 => 1,              // time constant; ident byte; test-reg write
             0x14 | 0x41 | 0x42 | 0x48 | 0x80 => 2, // single-cycle len, out/in rate, block, silence
-            0xB0..=0xBF | 0xC0..=0xCF => 3,       // SB16 16/8-bit DMA: mode + length lo/hi
+            0xB0..=0xCF => 3,                      // SB16 16/8-bit DMA: mode + length lo/hi
             _ => 0,                               // 0x1C/0x90/0x91/0xE8 etc. take no params
         };
         if need > 0 {
@@ -709,7 +709,7 @@ impl SoundBlaster {
         let (gpa, len_bytes) = chan_gpa_len(&prog, is16);
         let frame_bytes = (bits as u32 / 8) * channels;
         self.emu.buf_gpa = gpa;
-        self.emu.buf_frames = if frame_bytes > 0 { len_bytes / frame_bytes } else { 0 };
+        self.emu.buf_frames = len_bytes.checked_div(frame_bytes).unwrap_or(0);
         // Single-cycle: the whole buffer is one block — IRQ fires at the end and
         // playback stops. Auto-init: IRQ per DSP block and the ring loops.
         self.emu.block_frames = if single {
@@ -879,11 +879,10 @@ fn env_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     while i < env.len() && env[i] != 0 {
         let end = env[i..].iter().position(|&b| b == 0).map(|p| i + p)?;
         let entry = &env[i..end];
-        if let Some(eq) = entry.iter().position(|&b| b == b'=') {
-            if entry[..eq].eq_ignore_ascii_case(key) {
+        if let Some(eq) = entry.iter().position(|&b| b == b'=')
+            && entry[..eq].eq_ignore_ascii_case(key) {
                 return Some(&entry[eq + 1..]);
             }
-        }
         i = end + 1;
     }
     None
@@ -922,11 +921,11 @@ fn program_real_8237(machine: &mut crate::TheArch, chan: u8, phys: u32, len: u32
         machine.outb(0xD4, 0x04 | (chan - 4));         // mask channel
         machine.outb(0xD8, 0);                         // clear byte-pointer flip-flop
         machine.outb(0xD6, mode);
-        machine.outb(0xC0 + (m * 4) as u16, addr as u8);
-        machine.outb(0xC0 + (m * 4) as u16, (addr >> 8) as u8);
+        machine.outb(0xC0 + (m * 4), addr as u8);
+        machine.outb(0xC0 + (m * 4), (addr >> 8) as u8);
         machine.outb(PAGE[chan as usize] as u16, (phys >> 16) as u8);
-        machine.outb(0xC0 + (m * 4 + 2) as u16, cnt as u8);
-        machine.outb(0xC0 + (m * 4 + 2) as u16, (cnt >> 8) as u8);
+        machine.outb(0xC0 + (m * 4 + 2), cnt as u8);
+        machine.outb(0xC0 + (m * 4 + 2), (cnt >> 8) as u8);
         machine.outb(0xD4, chan - 4);                  // unmask channel
     } else {
         let cnt = len - 1;                     // byte count − 1

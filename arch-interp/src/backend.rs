@@ -34,23 +34,23 @@ impl Arch for Interp {
     // core syncs against; bridge the loop-owned `Vcpu` to it around each call.
     // (The internal frame goes away when the globals migrate into `Interp`.)
     fn execute(&mut self, vcpu: &mut Vcpu) -> KernelEvent {
-        unsafe { *(&raw mut vcpu::REGS) = *vcpu; }
+        unsafe { vcpu::REGS = *vcpu; }
         let ev = crate::cpu::execute();
-        *vcpu = unsafe { *(&raw const vcpu::REGS) };
+        *vcpu = unsafe { vcpu::REGS };
         ev
     }
     fn switch_to(&mut self, live: &mut Vcpu, swap: &mut Vcpu, hash_ptr: *mut u64, fx_ptr: *mut Self::Fx) {
         // `arch_switch_to` swaps the internal live frame with `swap`; stage the
         // loop's `live` into it first, then read the incoming state back out.
-        unsafe { *(&raw mut vcpu::REGS) = *live; }
+        unsafe { vcpu::REGS = *live; }
         crate::calls::arch_switch_to(swap, hash_ptr, fx_ptr);
-        *live = unsafe { *(&raw const vcpu::REGS) };
+        *live = unsafe { vcpu::REGS };
     }
 
     // ── Timer ──
     fn get_ticks(&self) -> u64 { crate::machine::get_ticks() }
     fn take_pending_ticks(&mut self) -> u32 { crate::machine::take_pending_ticks() }
-    fn drain(&mut self, f: &mut dyn FnMut(Irq)) { crate::machine::drain(|e| f(e)) }
+    fn drain(&mut self, f: &mut dyn FnMut(Irq)) { crate::machine::drain(f) }
     fn rdtsc(&self) -> u64 { crate::machine::rdtsc() }
 
     // ── IRQ lines ──
@@ -77,7 +77,6 @@ impl Arch for Interp {
         crate::calls::arch_swap_page_entries(a_vpage, b_vpage, count)
     }
     fn unmap_range(&mut self, base_page: usize, count: usize) { crate::calls::arch_unmap_range(base_page, count) }
-    fn free_range(&mut self, base_page: usize, count: usize) { crate::calls::arch_free_range(base_page, count) }
     fn map_fresh_range(&mut self, vpage: usize, count: usize) { crate::calls::arch_map_fresh_range(vpage, count) }
     fn load_ldt(&mut self, ldt: &[u64]) { crate::calls::arch_load_ldt(ldt) }
     fn map_phys_range(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {

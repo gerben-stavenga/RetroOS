@@ -2,8 +2,8 @@
 //! the DOS and DPMI personalities run on top of.
 //!
 //! This module is policy-free: it owns the per-thread virtual peripherals
-//! (8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set), A20 gate state,
-//! HMA page tracking, and the primitive helpers that decode/execute the
+//! (8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set) and the primitive
+//! helpers that decode/execute the
 //! handful of sensitive instructions that trap through the GP fault monitor
 //! (I/O, CLI/STI, IRET, PUSHF/POPF, stack push/pop).
 //!
@@ -17,7 +17,6 @@ extern crate alloc;
 
 use arch_abi::Arch;
 use arch_abi::GuestBytes;
-use crate::Regs;
 use crate::arch::Vcpu;
 
 pub const IF_FLAG: u32 = 1 << 9;
@@ -37,16 +36,13 @@ pub const IOPL_MASK: u32 = 3 << 12;
 /// POPF/IRET (DOOM/DOOM2/HEXEN, marked in LOADFIX.CFG) are launched at IOPL=3 so
 /// the monitor steps those re-enables. VM86 is unaffected (the gate is PM-only).
 pub const IOPL_DEFAULT: u32 = 1 << 12;
-/// Virtual IOPL=3 — non-conforming DPMI clients (honor POPF/IRET via stepping).
-pub const IOPL_NONCONF: u32 = 3 << 12;
 pub const VM_FLAG: u32 = 1 << 17;
 
 
-/// HMA spans 16 pages (64KB) starting at page 0x100.
+/// HMA spans 16 pages (64KB) starting at page 0x100. Permanently aliased over
+/// page 0 (A20 always wrapped) — see `Machine::new`.
 const HMA_PAGE: usize = 0x100;
 const HMA_PAGE_COUNT: usize = 16;
-/// Shadow region for A20 gate: swap HMA entries here when A20 is off.
-const HMA_SHADOW_PAGE: usize = HMA_PAGE + HMA_PAGE_COUNT;
 
 // ============================================================================
 // VM86 register helpers — 16-bit views of the 32-bit user frame
@@ -72,7 +68,6 @@ pub fn vm86_sp(regs: &Vcpu) -> u16 {
     regs.sp32() as u16
 }
 
-#[inline]
 /// The flags word the guest observes: its virtual-IF (VIF/bit 19) shows in the
 /// bit-9 (IF) slot, and the internal VIF bit is masked out. Bit 9 of the *live*
 /// frame is the real IF — never what the guest should see.
@@ -128,14 +123,12 @@ pub(super) mod vsb;
 pub(super) use vsb::*;
 /// Policy-free PC machine virtualization — per-thread peripheral state.
 ///
-/// Holds the virtual 8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set,
-/// A20 gate state, HMA page tracking, and small latches used by the monitor
-/// decoders (skip_irq, e0_pending).
+/// Holds the virtual 8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set, and
+/// small latches used by the monitor decoders (skip_irq, e0_pending).
 ///
 /// DOS-specific state (PSP, DTA, heap/free segment, XMS/EMS, FindFirst state,
 /// exec-parent chain) lives directly on `thread::DosState`, not here.
 pub struct PcMachine {
-    pub a20_enabled: bool,
     pub vpit: VirtualPit,
     pub vpic: VirtualPic,
     pub vrtc: VirtualRtc,
@@ -327,15 +320,14 @@ impl PcMachine {
     }
 
     pub fn new(machine: &mut crate::TheArch) -> Self {
-        // A20 starts disabled. HMA_PAGE wraps to user's private low memory
-        // by copying entries[0..16]. HMA_SHADOW_PAGE is left not-present
-        // (arch_user_clean cleared it; map_low_mem_user doesn't touch it),
-        // which is the correct A20-on state when no extended memory is
-        // allocated — set_a20(true) will swap not-present into HMA_PAGE
-        // so HMA accesses fault until XMS maps real extended memory.
+        // A20 is permanently wrapped: HMA_PAGE aliases the user's private low
+        // memory by copying entries[0..16], the faithful A20-off default every
+        // real machine boots with. We never un-wrap it — a VM86 guest can use
+        // neither a real HMA (XMS reports none) nor unreal mode, so the gate has
+        // nothing to toggle. Dropping it removes the shadow region, the page
+        // swap, and the local/global ref-counting that used to track it.
         machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
         Self {
-            a20_enabled: false,
             vpit: VirtualPit::new(machine),
             vpic: VirtualPic::new(),
             vrtc: VirtualRtc::new(machine),
@@ -348,15 +340,6 @@ impl PcMachine {
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
         }
-    }
-
-    /// Toggle A20 gate: HMA either sees shadow (real content) or wraps to page 0.
-    pub fn set_a20(&mut self, machine: &mut crate::TheArch, enabled: bool) {
-        if enabled == self.a20_enabled { return; }
-        // Shadow always holds the opposite of what's in HMA.
-        // Swap them to toggle.
-        machine.swap_page_entries(HMA_SHADOW_PAGE, HMA_PAGE, HMA_PAGE_COUNT);
-        self.a20_enabled = enabled;
     }
 }
 
@@ -443,7 +426,7 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
         // to configure QEMU's emulated VGA, even for legacy modes.
         // Pass through so SeaBIOS sees real VBE state.
-        0x01CE | 0x01CF | 0x01D0 => machine.inb(port),
+        0x01CE..=0x01D0 => machine.inb(port),
         // Gameport (joystick): we don't model a Sound Blaster or dedicated
         // gameport card, so on the ISA bus the gameport is unpopulated —
         // reads return 0xFF (floating data lines, weakly pulled high by
@@ -506,8 +489,7 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            let v = pc.sb.sb_read(machine, p);
-            v
+            pc.sb.sb_read(machine, p)
         }
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
@@ -558,7 +540,7 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.
-        0x01CE | 0x01CF | 0x01D0 => machine.outb(port, val),
+        0x01CE..=0x01D0 => machine.outb(port, val),
         // Master PIC command
         0x20 => {
             if val == 0x20 {
@@ -672,7 +654,7 @@ fn fabricated_status1(machine: &mut crate::TheArch) -> u8 {
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
 /// bytes through `emulate_inb` and writes the result into `regs.rax`.
 pub fn handle_in_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
-    if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
+    if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         let val = machine.inw(port) as u64;
         regs.rax = (regs.rax & !0xFFFF) | val;
         return;
@@ -689,7 +671,7 @@ pub fn handle_in_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
 pub fn handle_out_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, port: u16, size: u32) {
     let val = regs.rax;
-    if size == 2 && matches!(port, 0x01CE | 0x01CF | 0x01D0) {
+    if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         machine.outw(port, val as u16);
         return;
     }
@@ -707,7 +689,7 @@ pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: 
     let di = regs.rdi as u32;
     for i in 0..size {
         let b = emulate_inb(machine, pc, port + i as u16);
-        regs.write::<u8>(((es_base.wrapping_add(di.wrapping_add(i)))) as usize, b);
+        regs.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
@@ -720,7 +702,7 @@ pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs:
     let ds_base = seg_base_for(machine, regs, regs.ds as u16);
     let si = regs.rsi as u32;
     for i in 0..size {
-        let b = regs.read::<u8>(((ds_base.wrapping_add(si.wrapping_add(i)))) as usize);
+        let b = regs.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
         emulate_outb(machine, pc, regs, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;

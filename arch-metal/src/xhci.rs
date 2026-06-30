@@ -630,7 +630,7 @@ fn emit_key(sc: u8, extended: bool, release: bool) {
 ///
 /// Two layouts, distinguished by `len`:
 ///   - 8 (boot keyboard): `[mods, reserved, k1..k6]` — modifiers at byte 0.
-///   - >8 (report-ID keyboard, e.g. the Razer's interface 1, 16 bytes):
+///   - \>8 (report-ID keyboard, e.g. the Razer's interface 1, 16 bytes):
 ///     `[report-id, mods, k1..k14]` — report id at byte 0 (only id 1 is the
 ///     keyboard; consumer/system reports share the endpoint), modifiers at
 ///     byte 1. In both, the keycode array starts at byte 2.
@@ -644,25 +644,23 @@ fn process_report(r: &[u8; 16], len: usize) {
     let keys = &r[2..len];
     let prev_keys = &prev[2..len];
     // Modifier keys: one make/break per changed bit.
-    for b in 0..8 {
+    for (b, &sc) in MOD_SC.iter().enumerate() {
         let (now, was) = (r[mod_off] & (1 << b), prev[mod_off] & (1 << b));
-        if now != was && MOD_SC[b] != 0 {
-            crate::irq::push_key(if now != 0 { MOD_SC[b] } else { MOD_SC[b] | 0x80 });
+        if now != was && sc != 0 {
+            crate::irq::push_key(if now != 0 { sc } else { sc | 0x80 });
         }
     }
     // Regular keys: newly present → make; newly absent → break.
     for &k in keys {
-        if k >= 4 && !prev_keys.contains(&k) {
-            if let Some((sc, ext)) = hid_to_scancode(k) {
-                emit_key(sc, ext, false);
-            }
+        if k >= 4 && !prev_keys.contains(&k)
+            && let Some((sc, ext)) = hid_to_scancode(k) {
+            emit_key(sc, ext, false);
         }
     }
     for &k in prev_keys {
-        if k >= 4 && !keys.contains(&k) {
-            if let Some((sc, ext)) = hid_to_scancode(k) {
-                emit_key(sc, ext, true);
-            }
+        if k >= 4 && !keys.contains(&k)
+            && let Some((sc, ext)) = hid_to_scancode(k) {
+            emit_key(sc, ext, true);
         }
     }
     unsafe { PREV = *r };
@@ -781,7 +779,7 @@ fn classify_addressed(slot: u32, port: u32, speed: u32) -> PortDevice {
                     mps: rd(i + 4) | (rd(i + 5) << 8),
                     interval: rd(i + 6),
                 };
-                if is_kbd && dev.keyboard.map_or(true, |k: EpInfo| ep.mps > k.mps) {
+                if is_kbd && dev.keyboard.is_none_or(|k: EpInfo| ep.mps > k.mps) {
                     dev.keyboard = Some(ep);
                 }
                 if is_mouse && dev.mouse.is_none() {
@@ -898,11 +896,10 @@ pub fn init() {
             "xHCI: port {} speed {} class {} keyboard={} mouse={}",
             p, speed, dev.dev_class, dev.keyboard.is_some(), dev.mouse.is_some()
         );
-        if let Some(kb) = dev.keyboard {
-            if arm_on_slot(slot, &dev, kb, stride) {
-                armed = true;
-                break;
-            }
+        if let Some(kb) = dev.keyboard
+            && arm_on_slot(slot, &dev, kb, stride) {
+            armed = true;
+            break;
         }
         disable_slot(slot); // not a keyboard (or arm failed) — free the slot
     }

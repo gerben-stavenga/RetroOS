@@ -195,7 +195,7 @@ mod proof {
         uc.mem_write(0x510, &flat_desc(0x92)).unwrap(); // 0x10 ring0 data32
 
         // Page directory: PDE[0] → identity PT, PDE[256] → the 0x4000_0000 PT.
-        w32(&mut uc, 0x1000 + 0 * 4, 0x3000 | PRW);
+        w32(&mut uc, 0x1000, 0x3000 | PRW);
         w32(&mut uc, 0x1000 + 256 * 4, 0x2000 | PRW); // 0x4000_0000 >> 22 = 256
 
         // Identity page table for the low 4 MiB.
@@ -203,7 +203,7 @@ mod proof {
             w32(&mut uc, 0x3000 + i * 4, (i as u32 * 0x1000) | PRW);
         }
         // The test virtual address's page table: PTE[0] → physical 0x100000.
-        w32(&mut uc, 0x2000 + 0 * 4, 0x100000 | PRW);
+        w32(&mut uc, 0x2000, 0x100000 | PRW);
 
         // Test code at PHYSICAL 0x100000 — only reachable via virtual
         // 0x4000_0000 if the page-table walk works. `mov eax, 0xDEADBEEF; jmp $`.
@@ -300,8 +300,8 @@ mod integration {
     fn one_region_paging_with_demand_fault() {
         // Track #PF demand-commits via a thread-local because the intr hook
         // closure can't borrow test locals across emu_start.
-        thread_local! { static PD: std::cell::Cell<u64> = std::cell::Cell::new(0); }
-        thread_local! { static FAULTS: std::cell::Cell<u32> = std::cell::Cell::new(0); }
+        thread_local! { static PD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+        thread_local! { static FAULTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
 
         let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).expect("uc");
 
@@ -398,7 +398,7 @@ struct Spaces {
 
 thread_local! {
     static SPACES: RefCell<Spaces> =
-        RefCell::new(Spaces { pd: BTreeMap::new(), active: 0, next: 0 });
+        const { RefCell::new(Spaces { pd: BTreeMap::new(), active: 0, next: 0 }) };
 }
 
 /// Create the boot address space (id 0) and make it active.
@@ -450,19 +450,6 @@ pub fn active_id() -> u32 {
     SPACES.with(|s| s.borrow().active)
 }
 
-/// Free `count` pages at `vpage`: drop the PTEs and return the frames to the
-/// allocator (arch FREE_RANGE — the metal call releases physical frames).
-pub fn space_free(vpage: usize, count: usize) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let v = ((vpage + i) * 4096) as u32;
-            if let Some(pa) = translate(pd, v) {
-                phys::free_frames((pa >> 12) as u64, 1);
-            }
-            unmap_page(pd, v);
-        }
-    });
-}
 
 /// Map `count` pages at `vpage` to fresh zeroed frames (the memfd reads zero
 /// for never-written frames, and the bump allocator never reuses one).
@@ -624,7 +611,7 @@ pub fn space_cow_fault(vaddr: u32) -> bool {
 // frames. The client never touches it; it exists for the segment loads + iret.
 
 thread_local! {
-    static KERNEL_WINDOWS: RefCell<Vec<(u32, u64, usize)>> = RefCell::new(Vec::new());
+    static KERNEL_WINDOWS: RefCell<Vec<(u32, u64, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Register a linear→physical window (page-granular) that every address space —
@@ -729,6 +716,11 @@ pub fn space_copy_entries(src: usize, dst: usize, count: usize) {
         for i in 0..count {
             let sv = ((src + i) * 4096) as u32;
             let dv = ((dst + i) * 4096) as u32;
+            // Drop the reference dst currently holds before clobbering it, or the
+            // old frame leaks (mirror metal's copy_page_entries / unmap).
+            if let Some(old_pa) = translate(pd, dv) {
+                phys::free_frames((old_pa >> 12) as u64, 1);
+            }
             match translate(pd, sv) {
                 Some(spa) => {
                     // ALIAS dst onto src's physical frame — do NOT snapshot it
@@ -782,12 +774,12 @@ pub fn space_map_low_mem() {
 /// Free every user page in the active space (arch CLEAN): drop the PTEs and
 /// return the frames to the allocator. Kernel windows (high) are left intact.
 pub fn space_clean() {
-    with_active_pd(|pd| free_user_frames(pd));
+    with_active_pd(free_user_frames);
 }
 
 fn free_user_frames(pd: u64) {
     for pde_i in 0..(0xC000_0000usize >> 22) {
-        let pde = read_entry(pd, pde_i as usize);
+        let pde = read_entry(pd, pde_i);
         if pde & PRESENT == 0 {
             continue;
         }
@@ -946,7 +938,7 @@ mod vm86 {
         uc.reg_write(RegisterX86::CR0, 0x8000_0011).unwrap();     // PE|PG (+ET)
 
         use std::cell::Cell;
-        thread_local!{ static VEC: Cell<i32> = Cell::new(-1); }
+        thread_local!{ static VEC: Cell<i32> = const { Cell::new(-1) }; }
         uc.add_intr_hook(|_uc, intno| { VEC.with(|c| c.set(intno as i32)); }).unwrap();
         // iretd + mov + a couple jmp-self spins.
         let r = uc.emu_start(tramp_va as u64, 0, 0, 4);

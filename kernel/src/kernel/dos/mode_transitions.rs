@@ -14,15 +14,15 @@
 //! - `ClientPm`     — PM running on the client's own PM stack.
 //! - `ClientRm`     — RM/VM86 running on the client's own RM stack.
 //! - `PmInLocked`   — PM running on the DPMI locked PM stack. PM IRQ
-//!                    handlers, exception handlers, RM callbacks, and
-//!                    post-soft-INT-reflect PM continuations all run
-//!                    here. The handler may switch SS to its own
-//!                    "locked" stack mid-execution (DPMI 0.9 §3.1.2):
-//!                    that switched-to stack also counts as the locked
-//!                    stack until the handler switches back.
+//!   handlers, exception handlers, RM callbacks, and
+//!   post-soft-INT-reflect PM continuations all run
+//!   here. The handler may switch SS to its own
+//!   "locked" stack mid-execution (DPMI 0.9 §3.1.2):
+//!   that switched-to stack also counts as the locked
+//!   stack until the handler switches back.
 //! - `RmInLocked`   — RM running on the dedicated RM stack (a separate
-//!                    per-thread buffer in low memory). RM-INT reflection
-//!                    from PM, DPMI 0300/0301/0302 calls, etc.
+//!   per-thread buffer in low memory). RM-INT reflection
+//!   from PM, DPMI 0300/0301/0302 calls, etc.
 //!
 //! ### State tracking
 //!
@@ -44,11 +44,10 @@
 //! GP regs, and restore `other_stack`.
 
 use arch_abi::GuestBytes;
-use super::dos;
+use super::dosabi as dos;
 use crate::arch::Vcpu;
 use super::machine;
 use super::thread;
-use crate::Regs;
 
 /// Per-thread tracking for kernel-mediated DPMI/PMDOS crossings.
 ///
@@ -222,7 +221,7 @@ impl RmCallStruct {
 /// clients get the PM32 alias (D=1), 16-bit clients PM16. Both alias
 /// the same physical buffer at `host_stack_base()`.
 pub(super) fn host_stack_pm_seg(dos: &thread::DosState) -> u16 {
-    if dos.dpmi.as_ref().map_or(false, |d| d.client_use32) {
+    if dos.dpmi.as_ref().is_some_and(|d| d.client_use32) {
         HOST_STACK_PM32_SEL
     } else {
         HOST_STACK_PM16_SEL
@@ -616,7 +615,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
                     regs.stack_seg(), regs.sp32());
     }
     let default_vector = sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2;
-    let handler_use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+    let handler_use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
 
     // Discriminate via (regs.mode, other_stack):
     //   (PM,   Some) → nested on pm side; plant iret-frame at
@@ -838,7 +837,7 @@ pub(super) fn vector_stub_reflect(machine: &mut crate::TheArch, dos: &mut thread
     // CD 31 in the stub pushed its own IRET frame on top of the original
     // caller's; pop it so dpmi_api's results return to that caller.
     if vector == 0x31 {
-        let use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+        let use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
         let (eip, cs, flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
         regs.set_ip32(eip);
         regs.set_cs32(cs as u32);
@@ -953,7 +952,7 @@ pub(super) fn resume_continuation_from_stub(dos: &mut thread::DosState, regs: &m
     let was_outermost = save.other_stack().is_none();
     resume_continuation(dos, regs, save);
     if resumes_to_host_iret {
-        let use32 = dos.dpmi.as_ref().map_or(false, |d| d.client_use32);
+        let use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
         let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);

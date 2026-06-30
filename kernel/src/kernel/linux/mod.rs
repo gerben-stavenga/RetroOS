@@ -115,6 +115,12 @@ pub struct LinuxState {
     pub exec_path_len: usize,
 }
 
+impl Default for LinuxState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinuxState {
     pub fn new() -> Self {
         LinuxState {
@@ -346,7 +352,7 @@ fn dispatch_nr(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
         // getppid: real parent if we have one, else 1 (init).
         64  => SyscallResult::val(kt.parent_tid.max(1)),
         // getuid32/getgid32/geteuid32/getegid32 — pretend root.
-        199 | 200 | 201 => SyscallResult::val(0),
+        199..=201 => SyscallResult::val(0),
         202 => sys_futex(kt, a),
         // setuid32/setgid32/setreuid32/setregid32/setresuid32/setresgid32 —
         // single-user system, accept any change as a no-op.
@@ -522,9 +528,8 @@ pub fn do_chdir(path: &[u8], cwd: &mut [u8; 64], cwd_len: &mut usize) -> i32 {
             if pos < new_cwd.len() { new_cwd[pos] = b; pos += 1; }
         }
     }
-    if pos > 0 && new_cwd[pos - 1] != b'/' {
-        if pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
-    }
+    if pos > 0 && new_cwd[pos - 1] != b'/'
+        && pos < new_cwd.len() { new_cwd[pos] = b'/'; pos += 1; }
     let prefix = &new_cwd[..pos];
     if !vfs::dir_exists(prefix) { return -ENOENT; }
     let len = pos.min(cwd.len());
@@ -998,6 +1003,7 @@ fn sys_execve(_machine: &mut crate::TheArch, kt: &mut thread::KernelThread, linu
 /// Runs after the syscall handler's borrow releases, so its `get_thread`/
 /// `init_thread`/`exit_thread` on `tid` are clean. Returns `None` (stay on the
 /// re-imaged thread) or the next tid if the load fails and the thread exits.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_exec(
     machine: &mut crate::TheArch,
     threads: &mut [thread::Thread],
@@ -1230,7 +1236,7 @@ fn sys_munmap(_linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let addr = a.a0 as usize;
     let length = a.a1 as usize;
     if addr & 0xFFF != 0 { return SyscallResult::val(-EINVAL); }
-    let num_pages = (length + 0xFFF) / 0x1000;
+    let num_pages = length.div_ceil(0x1000);
     let start_page = addr / 0x1000;
     // Clear page table entries — pages get freed via refcount
     for i in 0..num_pages {
@@ -1519,7 +1525,7 @@ fn sys_mmap2(kt: &mut thread::KernelThread, linux: &mut LinuxState, a: &Args, of
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_FIXED: u32 = 0x10;
 
-    let num_pages = (length + 0xFFF) / 0x1000;
+    let num_pages = length.div_ceil(0x1000);
     if num_pages == 0 { return SyscallResult::val(-EINVAL); }
     let alloc_size = num_pages * 0x1000;
 
@@ -1632,21 +1638,21 @@ fn sys_fstatat64(vcpu: &mut Vcpu, linux: &LinuxState, a: &Args, want_64: bool) -
 fn write_stat64(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32, ino: u64, want_64: bool) {
     if want_64 {
         vcpu.zero(buf, 144);
-        vcpu.write::<u64>(buf + 0, 1);                              // st_dev
+        vcpu.write::<u64>(buf, 1);                              // st_dev
         vcpu.write::<u64>(buf + 8, ino);                            // st_ino
         vcpu.write::<u64>(buf + 16, 1);                             // st_nlink
         vcpu.write::<u32>(buf + 24, mode);                          // st_mode
         vcpu.write::<u64>(buf + 48, size as u64);                   // st_size
         vcpu.write::<u64>(buf + 56, 4096);                          // st_blksize
-        vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+        vcpu.write::<u64>(buf + 64, (size as u64).div_ceil(512));   // st_blocks
     } else {
         vcpu.zero(buf, 96);
-        vcpu.write::<u64>(buf + 0, 1);                              // st_dev
+        vcpu.write::<u64>(buf, 1);                              // st_dev
         vcpu.write::<u32>(buf + 12, ino as u32);                    // __st_ino (32-bit)
         vcpu.write::<u32>(buf + 16, mode);                          // st_mode
         vcpu.write::<u64>(buf + 44, size as u64);                   // st_size (u64 on stat64)
         vcpu.write::<u32>(buf + 56, 4096);                          // st_blksize
-        vcpu.write::<u64>(buf + 64, ((size as u64) + 511) / 512);   // st_blocks
+        vcpu.write::<u64>(buf + 64, (size as u64).div_ceil(512));   // st_blocks
         vcpu.write::<u64>(buf + 88, ino);                           // st_ino (64-bit)
     }
 }
@@ -1660,7 +1666,7 @@ fn write_stat_old(vcpu: &mut Vcpu, buf: usize, mode: u32, size: u32) {
     vcpu.write::<u16>(buf + 0x0a, 1);                    // st_nlink
     vcpu.write::<u32>(buf + 0x14, size);                 // st_size
     vcpu.write::<u32>(buf + 0x18, 4096);                 // st_blksize
-    vcpu.write::<u32>(buf + 0x1c, (size + 511) / 512);   // st_blocks
+    vcpu.write::<u32>(buf + 0x1c, size.div_ceil(512));   // st_blocks
 }
 
 /// stat(106) / lstat(107) — old struct stat layout. We have no symlinks so
@@ -1728,11 +1734,7 @@ fn sys_getdents64(kt: &mut thread::KernelThread, linux: &LinuxState, a: &Args) -
     let cwd = linux.cwd_str();
 
     let mut offset = 0usize;
-    loop {
-        let entry = match vfs::readdir(cwd, index) {
-            Some(e) => e,
-            None => break,
-        };
+    while let Some(entry) = vfs::readdir(cwd, index) {
         index += 1;
 
         let name = &entry.name[..entry.name_len];
@@ -1817,7 +1819,7 @@ fn sys_clock_gettime(machine: &mut crate::TheArch, vcpu: &mut Vcpu, a: &Args) ->
     let _clock_id = a.a0 as u32;
     let tp = a.a1 as usize;
     if tp != 0 {
-        let ticks = machine.get_ticks() as u64;
+        let ticks = machine.get_ticks();
         // PIT ticks at ~1193182 Hz, timer IRQ at ~100 Hz (div=11932)
         let secs = ticks / 100;
         let nsecs = (ticks % 100) * 10_000_000;

@@ -383,7 +383,7 @@ impl WavSink {
         frame[2..4].copy_from_slice(&right.to_le_bytes());
         let _ = self.file.write_all(&frame);
         self.frames += 1;
-        if self.frames % HEADER_PATCH_EVERY == 0 {
+        if self.frames.is_multiple_of(HEADER_PATCH_EVERY) {
             self.patch_header();
         }
     }

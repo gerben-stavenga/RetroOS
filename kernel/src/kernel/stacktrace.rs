@@ -9,6 +9,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use crate::{print, println};
 use crate::kernel::vfs;
+#[cfg(not(feature = "hosted"))]
 use core::arch::asm;
 use lib::elf::SymbolTable;
 
@@ -99,6 +100,9 @@ pub fn init_from_tar() {
 
 /// Print a stack trace starting from the caller of this function. Used by the
 /// panic handler; skips its own frame so the first line is whoever panicked.
+/// Only the metal boot path uses this entry; the hosted backend traces via
+/// `stack_trace_regs`.
+#[cfg(not(feature = "hosted"))]
 pub fn stack_trace() {
     let bp: usize;
     unsafe { asm!("mov {}, ebp", out(reg) bp); }
@@ -194,7 +198,7 @@ fn lookup_symbol(addr: u64) -> (&'static str, u64) {
             let (name, offset) = data.lookup(addr);
             if !name.is_empty() {
                 // SAFETY: kernel symbols are 'static
-                return (unsafe { core::mem::transmute(name) }, offset);
+                return (unsafe { core::mem::transmute::<&str, &str>(name) }, offset);
             }
         }
     }

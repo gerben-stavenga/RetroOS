@@ -281,13 +281,14 @@ pub fn host_run_demo() -> ! {
     vcpu.regs.init_user_process(CODE, STACK);
     arch::set_current_vcpu(vcpu);
 
-    let eax = || unsafe { (*(&raw const arch::REGS)).regs.rax as u32 };
+    let regs_ptr = &raw const arch::REGS;
+    let eax = || unsafe { (*regs_ptr).regs.rax as u32 };
     println!("[host] running guest vcpu...");
     let mut irqs = 0u32;
     loop {
         match arch::do_arch_execute() {
             KernelEvent::SoftInt(0x80) if eax() == 1 => {
-                let scratch: u32 = unsafe { (*(&raw const arch::REGS)).read(SCRATCH as usize) };
+                let scratch: u32 = unsafe { (*regs_ptr).read(SCRATCH as usize) };
                 println!("[host] guest scratch[{:#x}] = {:#x} (demand-paged)", SCRATCH, scratch);
                 println!("[host] guest exit syscall -> done ({irqs} timer ticks)");
                 arch::shutdown();

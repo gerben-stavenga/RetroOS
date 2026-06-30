@@ -266,8 +266,6 @@ pub trait Arch {
     fn swap_page_entries(&mut self, a_vpage: usize, b_vpage: usize, count: usize);
     /// Clear page entries to absent (re-enables demand paging on next access).
     fn unmap_range(&mut self, base_page: usize, count: usize);
-    /// Free physical pages and restore identity-mapped read-only entries.
-    fn free_range(&mut self, base_page: usize, count: usize);
     /// Replace `count` user pages at `vpage` with fresh anonymous RW frames.
     fn map_fresh_range(&mut self, vpage: usize, count: usize);
     /// Map this process's VGA color-text aperture (guest 0xB8000-0xBFFFF) onto

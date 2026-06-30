@@ -86,6 +86,7 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 ///   pass `Vec::new()` for non-DOS execs or initial loads with no parent.
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
+#[allow(clippy::too_many_arguments)]
 pub fn init_thread(machine: &mut crate::TheArch, threads: &mut [crate::kernel::thread::Thread], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, viopl: u8) -> Result<(), i32> {
     match detect_format(&data, path) {
         BinaryFormat::Elf => {

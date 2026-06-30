@@ -54,11 +54,6 @@ pub fn unmap(vpage: usize, count: usize) {
     paging::space_unmap(vpage, count);
 }
 
-/// Free `count` pages (drop PTEs and release the frames).
-pub fn free(vpage: usize, count: usize) {
-    paging::space_free(vpage, count);
-}
-
 /// Copy page-table entries src→dst (fresh-frame content copy).
 pub fn copy_entries(src: usize, dst: usize, count: usize) {
     paging::space_copy_entries(src, dst, count);

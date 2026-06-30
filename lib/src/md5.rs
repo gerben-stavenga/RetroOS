@@ -27,7 +27,7 @@ const K: [u32; 64] = [
 ];
 
 fn left_rotate(x: u32, c: u32) -> u32 {
-    (x << c) | (x >> (32 - c))
+    x.rotate_left(c)
 }
 
 fn process_block(block: &[u8; 64], a0: &mut u32, b0: &mut u32, c0: &mut u32, d0: &mut u32) {

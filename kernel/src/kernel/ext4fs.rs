@@ -117,11 +117,10 @@ impl Filesystem for Ext4Fs {
         // common case) leave `position` at `offset` after the previous read;
         // `seek_to` re-walks the extent iterator from the start, so seeking
         // every chunk would turn a sequential read into O(n²).
-        if file.position() != offset as u64 {
-            if file.seek_to(offset as u64).is_err() {
+        if file.position() != offset as u64
+            && file.seek_to(offset as u64).is_err() {
                 return 0;
             }
-        }
         // `read_bytes` yields block-sized partials and Ok(0) at EOF; loop to
         // fill the caller's buffer (naturally bounded by end-of-file).
         let mut total = 0usize;
@@ -170,14 +169,14 @@ impl Filesystem for Ext4Fs {
                 // extra path resolution (Ext4::metadata follows FollowSymlinks::All).
                 // This is what lets `ln -s …/apps/games /home/retroos/GAMES`
                 // surface under C:\GAMES instead of looking like a file.
-                let md = if ft.map_or(false, |t| t.is_symlink()) {
+                let md = if ft.is_some_and(|t| t.is_symlink()) {
                     core::str::from_utf8(name_bytes).ok().and_then(|p| self.fs.metadata(p).ok())
                 } else {
                     entry.metadata().ok()
                 };
                 let is_dir = match &md {
                     Some(m) => m.is_dir(),
-                    None => ft.map_or(false, |t| t.is_dir()),
+                    None => ft.is_some_and(|t| t.is_dir()),
                 };
                 let size = if is_dir { 0 } else { md.as_ref().map(|m| m.len() as u32).unwrap_or(0) };
                 let mode = md.as_ref().map(|m| m.mode()).unwrap_or(if is_dir { 0o755 } else { 0o644 });

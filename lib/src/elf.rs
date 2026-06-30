@@ -496,6 +496,7 @@ impl<'a> Iterator for SegmentIter<'a> {
 
 /// Find .symtab and .strtab section offsets/sizes from section headers.
 /// Returns (sym_off, sym_size, str_off, str_size).
+#[allow(clippy::too_many_arguments)] // width-generic accessors; bundling them buys nothing
 fn find_symtab_strtab(
     elf_data: &[u8],
     shoff: usize,
@@ -662,7 +663,7 @@ impl<'a> SymbolTable<'a> {
                 if sym.value > addr32 { continue; }
                 let has_size = sym.size > 0;
                 if has_size && addr32 > sym.value + sym.size { continue; }
-                if has_size > best_has_size || (has_size == best_has_size && sym.value > best_addr) {
+                if has_size & !best_has_size || (has_size == best_has_size && sym.value > best_addr) {
                     best_addr = sym.value;
                     best_has_size = has_size;
                     best = Some(sym);
@@ -682,7 +683,7 @@ impl<'a> SymbolTable<'a> {
                 if sym.value > addr { continue; }
                 let has_size = sym.size > 0;
                 if has_size && addr > sym.value + sym.size { continue; }
-                if has_size > best_has_size || (has_size == best_has_size && sym.value > best_addr) {
+                if has_size & !best_has_size || (has_size == best_has_size && sym.value > best_addr) {
                     best_addr = sym.value;
                     best_has_size = has_size;
                     best = Some(sym);

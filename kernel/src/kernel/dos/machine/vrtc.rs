@@ -55,7 +55,7 @@ impl VirtualRtc {
     /// (A/B/C = 0x0A/0x0B/0x0C). Every other index falls through to the host
     /// CMOS (time-of-day, century, configuration bytes).
     pub fn owns(idx: u8) -> bool {
-        matches!(idx, 0x0A | 0x0B | 0x0C)
+        matches!(idx, 0x0A..=0x0C)
     }
 
     pub fn read(&mut self, idx: u8) -> u8 {

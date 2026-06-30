@@ -53,29 +53,29 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(machine: &mut crate::TheArch, kt:
 
     match slot {
         dos::SLOT_PMDOS_INT21 => {
-            return super::super::dos::pmdos_int21_handler(machine, kt, dos, regs);
+            super::super::dosabi::pmdos_int21_handler(machine, kt, dos, regs)
         }
         dos::SLOT_PMDOS_INT33 => {
-            return super::super::dos::pmdos_int33_handler(dos, regs);
+            super::super::dosabi::pmdos_int33_handler(dos, regs)
         }
         dos::SLOT_EXCEPTION_RET => {
-            return exception_return(dos, regs, ExcReturnVia::V09);
+            exception_return(dos, regs, ExcReturnVia::V09)
         }
         dos::SLOT_EXCEPTION_RET_V10 => {
-            return exception_return(dos, regs, ExcReturnVia::V10);
+            exception_return(dos, regs, ExcReturnVia::V10)
         }
         dos::SLOT_PM_TO_REAL => {
-            return raw_switch_pm_to_real(dos, regs);
+            raw_switch_pm_to_real(dos, regs)
         }
         dos::SLOT_RESUME_CONTINUATION => {
             mode_transitions::resume_continuation_from_stub(dos, regs);
-            return thread::KernelAction::Done;
+            thread::KernelAction::Done
         }
         dos::SLOT_MOUSE_CB_RET => {
             // PM INT 33h AX=0Ch handler FAR-RETurned into this trampoline.
             // Restore the bracket-saved GP regs and unwind the callback.
-            super::super::dos::mouse_callback_return(dos, regs);
-            return thread::KernelAction::Done;
+            super::super::dosabi::mouse_callback_return(dos, regs);
+            thread::KernelAction::Done
         }
         dos::SLOT_SAVE_RESTORE => {
             // No state to save: AX=0305 announces buffer size = 0, so the
@@ -91,12 +91,12 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch(machine: &mut crate::TheArch, kt:
             let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
             let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
             let (ret_eip, ret_cs, frame_size) = if use32 {
-                let eip = regs.read::<u32>(((ss_base.wrapping_add(sp))) as usize);
-                let cs = regs.read::<u32>(((ss_base.wrapping_add(sp + 4))) as usize);
+                let eip = regs.read::<u32>((ss_base.wrapping_add(sp)) as usize);
+                let cs = regs.read::<u32>((ss_base.wrapping_add(sp + 4)) as usize);
                 (eip, cs, 8u32)
             } else {
-                let ip = regs.read::<u16>(((ss_base.wrapping_add(sp))) as usize) as u32;
-                let cs = regs.read::<u16>(((ss_base.wrapping_add(sp + 2))) as usize) as u32;
+                let ip = regs.read::<u16>((ss_base.wrapping_add(sp)) as usize) as u32;
+                let cs = regs.read::<u16>((ss_base.wrapping_add(sp + 2)) as usize) as u32;
                 (ip, cs, 4u32)
             };
             let new_sp = sp.wrapping_add(frame_size);
