@@ -72,6 +72,14 @@ jobs:
       - name: Build hosted runner
         run: bazel build //kernel:retroos-host --platforms=@platforms//host
 
+      # Isolation tests for the interp's Unicorn translation-cache coherence
+      # (the stale-TB fix): standalone unicorn-engine decoder/SMC tests. Host
+      # platform (Unicorn is x86_64-only).
+      - name: Hosted isolation tests (Bazel)
+        run: |
+          bazel test --platforms=@platforms//host \
+            //arch-interp:les_decode_test //arch-interp:stale_tb_test
+
       # End-to-end: a real 32-bit Linux ELF through the kernel's Linux
       # personality on the software CPU.
       - name: Hosted ELF smoke
