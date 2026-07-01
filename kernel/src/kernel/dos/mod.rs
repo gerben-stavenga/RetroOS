@@ -526,12 +526,12 @@ pub fn handle_event(
             machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
             thread::KernelAction::Done
         }
-        KE::Ins { size } => {
-            machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes());
+        KE::Ins { size, rep, addr32 } => {
+            machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
             thread::KernelAction::Done
         }
-        KE::Outs { size } => {
-            machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes());
+        KE::Outs { size, rep, addr32 } => {
+            machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
             thread::KernelAction::Done
         }
         KE::Exception(n) => {

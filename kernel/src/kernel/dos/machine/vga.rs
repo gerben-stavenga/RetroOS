@@ -61,6 +61,12 @@ pub struct VgaState {
     // ── Registers ──
     pub misc_output: u8,
     pub feature_ctl: u8,
+    /// CGA Mode-Control (0x3D8) and Colour-Select (0x3D9). The CGA renderer
+    /// resolves its 4-colour palette from these (palette 0/1, foreground
+    /// intensity, background/border colour); real-VGA passthrough honours them
+    /// in hardware, so they matter only on the emulated (UEFI/hosted) path.
+    pub cga_mode_ctl: u8,
+    pub cga_color_select: u8,
     pub seq: [u8; 5],
     pub crtc: [u8; 25],
     pub gc: [u8; 9],
@@ -121,6 +127,8 @@ impl VgaState {
             // fills `planes`, which also rewrites the whole DAC.
             misc_output: 0,
             feature_ctl: 0,
+            cga_mode_ctl: 0,
+            cga_color_select: 0,
             seq: [0; 5],
             crtc: [0; 25],
             // GC Bit Mask (index 8) resets to 0xFF — every CPU-data bit passes
@@ -215,6 +223,8 @@ impl VgaState {
                     self.crtc[i] = v;
                 }
             }
+            0x3D8 => self.cga_mode_ctl = v,     // CGA Mode Control
+            0x3D9 => self.cga_color_select = v, // CGA Colour Select (palette/bg)
             0x3DA => self.feature_ctl = v, // FCR write port (colour)
             _ => {}
         }
@@ -763,6 +773,107 @@ pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
     data
 }
 
+/// Rasterize the 8-wide glyph for `ch` into the current *graphics*-mode
+/// framebuffer at character cell `(col,row)`, foreground pixel colour `fg`.
+/// A BIOS teletype/write-char in a graphics mode must draw font pixels (there
+/// is no text cell to poke) — this covers every graphics mode the model draws:
+/// CGA 4-colour (04h/05h) and 2-colour (06h) at 0xB8000, EGA/VGA 16-colour
+/// planar (0Dh–12h) into `vga.planes`, and linear 256-colour mode 13h at
+/// 0xA0000. Returns `false` for a non-graphics mode (caller takes the text-cell
+/// path). Cell background pixels are cleared, so a cell fully replaces what was
+/// under it, matching a real BIOS's replace (non-XOR) glyph write.
+///
+/// Each mode uses the ROM font matching its character-cell height: the authentic
+/// IBM 8×8 (200-line modes + 13h), 8×14 (EGA 350-line), or 8×16 (VGA 480-line).
+pub fn bios_draw_glyph(regs: &mut Vcpu, vga: &mut VgaState, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
+    let (cell_h, font): (u32, &[u8]) = match mode {
+        0x0F | 0x10 => (14, &lib::vga_fonts::FONT_8X14),
+        0x11 | 0x12 => (16, &lib::vga_fonts::FONT_8X16),
+        0x04 | 0x05 | 0x06 | 0x0D | 0x0E | 0x13 => (8, &lib::vga_fonts::FONT_8X8),
+        _ => return false, // text mode (0..3, 7) — caller writes a char cell
+    };
+    let base = ch as usize * cell_h as usize;
+    let glyph = |gy: u32| -> u8 { font[base + gy as usize] };
+    let (px0, py0) = (col * 8, row * cell_h);
+
+    match mode {
+        // Linear 256-colour: one byte per pixel at 0xA0000, stride 320.
+        0x13 => {
+            for gy in 0..cell_h {
+                let bits = glyph(gy);
+                let py = py0 + gy;
+                for gx in 0..8u32 {
+                    let color = if bits & (0x80 >> gx) != 0 { fg } else { 0 };
+                    regs.write::<u8>(0xA0000 + (py * 320 + px0 + gx) as usize, color);
+                }
+            }
+        }
+        // CGA 4-colour: 2 bpp at 0xB8000, four pixels/byte, even scanlines at
+        // offset 0 and odd at +0x2000, 80-byte rows within a bank.
+        0x04 | 0x05 => {
+            for gy in 0..8u32 {
+                let bits = glyph(gy);
+                let py = py0 + gy;
+                let bank = 0xB8000 + ((py & 1) * 0x2000 + (py >> 1) * 80) as usize;
+                for gx in 0..8u32 {
+                    let px = px0 + gx;
+                    let color = if bits & (0x80 >> gx) != 0 { fg & 0x03 } else { 0 };
+                    let off = bank + (px / 4) as usize;
+                    let shift = 6 - (px & 3) * 2;
+                    let mut b: u8 = regs.read(off);
+                    b = (b & !(0x03 << shift)) | (color << shift);
+                    regs.write::<u8>(off, b);
+                }
+            }
+        }
+        // CGA 2-colour: 1 bpp at 0xB8000, eight pixels/byte, same bank interleave.
+        0x06 => {
+            for gy in 0..8u32 {
+                let bits = glyph(gy);
+                let py = py0 + gy;
+                let bank = 0xB8000 + ((py & 1) * 0x2000 + (py >> 1) * 80) as usize;
+                for gx in 0..8u32 {
+                    let px = px0 + gx;
+                    let off = bank + (px / 8) as usize;
+                    let mask = 0x80u8 >> (px & 7);
+                    let mut b: u8 = regs.read(off);
+                    if bits & (0x80 >> gx) != 0 { b |= mask; } else { b &= !mask; }
+                    regs.write::<u8>(off, b);
+                }
+            }
+        }
+        // EGA/VGA 16-colour planar: set/clear each of the 4 plane bits for the
+        // pixel from the 4-bit colour, in `vga.planes` (what the planar renderer
+        // scans out). Stride follows the CRTC Offset like `classify_mode`.
+        0x0D | 0x0E | 0x0F | 0x10 | 0x11 | 0x12 => {
+            if vga.planes.is_empty() {
+                vga.planes = alloc::vec![0u8; PLANES_LEN];
+            }
+            let width: u32 = if mode == 0x0D { 320 } else { 640 };
+            let rb = if vga.crtc[0x13] != 0 { vga.crtc[0x13] as u32 * 2 } else { width / 8 };
+            for gy in 0..cell_h {
+                let bits = glyph(gy);
+                let py = py0 + gy;
+                for gx in 0..8u32 {
+                    let px = px0 + gx;
+                    let color = if bits & (0x80 >> gx) != 0 { fg & 0x0F } else { 0 };
+                    let byte_off = (py * rb + px / 8) as usize;
+                    let mask = 0x80u8 >> (px & 7);
+                    for p in 0..4usize {
+                        let idx = p * 0x10000 + byte_off;
+                        if idx >= vga.planes.len() {
+                            continue;
+                        }
+                        if (color >> p) & 1 != 0 { vga.planes[idx] |= mask; } else { vga.planes[idx] &= !mask; }
+                    }
+                }
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 // ============================================================================
 // Planar #PF decode — the kernel-side trap (no arch involvement: A0000 is left
 // unmapped while planar logic is needed, so the guest store/load faults, the
@@ -949,11 +1060,15 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
     let mut p66 = false;
     let mut p67 = false;
     let mut rep = false;
+    // `repne` (F2) vs `repe` (F3) only matters for scas/cmps, which terminate on
+    // ZF; for the unconditional string ops (movs/stos/lods) both just mean rep.
+    let mut repne = false;
     loop {
         match peek(i) {
             0x66 => { p66 = true; i += 1; }
             0x67 => { p67 = true; i += 1; }
-            0xF2 | 0xF3 => { rep = true; i += 1; }
+            0xF3 => { rep = true; i += 1; }
+            0xF2 => { rep = true; repne = true; i += 1; }
             0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => { i += 1; } // seg override (base already in CR2)
             _ => break,
         }
@@ -1066,6 +1181,35 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
                 not_done = rem > 0;
             }
         }
+        // lods: load DS:SI into the accumulator (AL/AX/EAX), count in (E)CX if
+        // rep. The source (DS:SI) is the faulting A0000 window, so `off` is its
+        // VRAM offset — mirror `stos`, but read through `vram_read` (which loads
+        // the GC latches / honours read map & read mode) instead of writing. A
+        // Keen 4 loop copies off-screen VRAM with `lodsb; stosb; add esi,stride`.
+        // Only the final byte survives in the accumulator; intervening reads
+        // still run so the latches end up as the real CPU would leave them.
+        0xAC | 0xAD => {
+            let sz = opsize(op32, opcode == 0xAC);
+            let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
+            let chunk = total.min(REP_CHUNK);
+            let df = regs.frame.rflags & (1 << 10) != 0;
+            // `rep lods` with CX=0 is a no-op — leave the accumulator untouched.
+            for n in 0..chunk {
+                let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
+                let mut val = 0u32;
+                for b in 0..sz { val |= (vram_read(vga, o + b) as u32) << (b * 8); }
+                set_gpr(regs, 0, sz, val);
+            }
+            let step = chunk * sz;
+            let si = if df { regs.rsi.wrapping_sub(step as u64) } else { regs.rsi.wrapping_add(step as u64) };
+            regs.rsi = if addr32 { si } else { (regs.rsi & !0xFFFF) | (si & 0xFFFF) };
+            if rep {
+                let rem = total - chunk;
+                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
+                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                not_done = rem > 0;
+            }
+        }
         // movs: DS:SI -> ES:DI. Each operand may be normal RAM or the A0000
         // planar window, resolved per byte below. Recompute both ends from the
         // registers rather than trusting `off` — either operand can fault.
@@ -1124,6 +1268,94 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
                 regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
                            else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
                 not_done = rem > 0;
+            }
+        }
+        // scas: compare the accumulator (AL/AX/EAX) with ES:DI, set flags like
+        // `cmp acc, [es:di]`, advance DI. The memory operand is the faulting
+        // A0000 window (present=0), so `off` is its VRAM offset — read it through
+        // `vram_read` (loads the GC latches), never a raw `regs.read`. A `repe`
+        // (F3) / `repne` (F2) run also terminates on ZF, so it's chunked with an
+        // early break when the ZF condition flips (unlike the unconditional
+        // stos/movs). Used by DOS blitters to find a run boundary in VRAM.
+        0xAE | 0xAF => {
+            let sz = opsize(op32, opcode == 0xAE);
+            let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
+            let chunk = total.min(REP_CHUNK);
+            let df = regs.frame.rflags & (1 << 10) != 0;
+            let acc = regs.rax as u32;
+            let mut done_n = 0u32;
+            let mut stop = false;
+            while done_n < chunk {
+                let o = if df { off.wrapping_sub(done_n * sz) } else { off.wrapping_add(done_n * sz) };
+                let mut mem = 0u32;
+                for b in 0..sz { mem |= (vram_read(vga, o + b) as u32) << (b * 8); }
+                alu(regs, 7, acc, mem, sz); // CMP acc, mem — flags only
+                done_n += 1;
+                if rep {
+                    // repe (F3) continues while ZF=1; repne (F2) while ZF=0.
+                    let zf = regs.frame.rflags & (1 << 6) != 0;
+                    if zf == repne { stop = true; break; }
+                }
+            }
+            let step = done_n * sz;
+            let di = if df { regs.rdi.wrapping_sub(step as u64) } else { regs.rdi.wrapping_add(step as u64) };
+            regs.rdi = if addr32 { di } else { (regs.rdi & !0xFFFF) | (di & 0xFFFF) };
+            if rep {
+                let rem = total - done_n;
+                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
+                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                // Re-fault to resume only if the chunk cap (not the ZF condition)
+                // stopped us with counts left.
+                not_done = !stop && rem > 0;
+            }
+        }
+        // cmps: compare DS:SI with ES:DI, set flags like `cmp [ds:si], [es:di]`,
+        // advance both. Either operand may be in the A0000 window, so recompute
+        // both ends from the registers (like `movs`) and route a VRAM operand
+        // through `vram_read`. x86 sets flags from [DS:SI] - [ES:DI]. Same
+        // `repe`/`repne` ZF termination as scas.
+        0xA6 | 0xA7 => {
+            let sz = opsize(op32, opcode == 0xA6);
+            let amask: u32 = if addr32 { 0xFFFF_FFFF } else { 0xFFFF };
+            let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
+            let chunk = total.min(REP_CHUNK);
+            let df = regs.frame.rflags & (1 << 10) != 0;
+            let mut si = regs.rsi as u32 & amask;
+            let mut di = regs.rdi as u32 & amask;
+            let mut done_n = 0u32;
+            let mut stop = false;
+            while done_n < chunk {
+                let mut src1 = 0u32; // [DS:SI]
+                let mut src2 = 0u32; // [ES:DI]
+                for b in 0..sz {
+                    let s = ds_base.wrapping_add(si).wrapping_add(b);
+                    let d = es_base.wrapping_add(di).wrapping_add(b);
+                    let sb = if (0xA0000..0xB0000).contains(&s) { vram_read(vga, s - 0xA0000) } else { regs.read::<u8>(s as usize) };
+                    let db = if (0xA0000..0xB0000).contains(&d) { vram_read(vga, d - 0xA0000) } else { regs.read::<u8>(d as usize) };
+                    src1 |= (sb as u32) << (b * 8);
+                    src2 |= (db as u32) << (b * 8);
+                }
+                alu(regs, 7, src1, src2, sz); // CMP [si], [di] — flags only
+                if df { si = si.wrapping_sub(sz); di = di.wrapping_sub(sz); }
+                else  { si = si.wrapping_add(sz); di = di.wrapping_add(sz); }
+                done_n += 1;
+                if rep {
+                    let zf = regs.frame.rflags & (1 << 6) != 0;
+                    if zf == repne { stop = true; break; }
+                }
+            }
+            let step = done_n * sz;
+            let adj = |v: u64| {
+                let nv = if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) };
+                if addr32 { nv as u64 } else { (v & !0xFFFF) | (nv as u64 & 0xFFFF) }
+            };
+            regs.rsi = adj(regs.rsi);
+            regs.rdi = adj(regs.rdi);
+            if rep {
+                let rem = total - done_n;
+                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
+                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                not_done = !stop && rem > 0;
             }
         }
         // ALU with a VRAM operand: the primary-group r/m forms, all eight groups
@@ -1228,8 +1460,9 @@ impl VgaState {
                 planes: &[],
                 ac: &self.ac,
                 palette: &self.dac,
-                font: &lib::vga_font_8x16::FONT_8X16,
+                font: &lib::vga_fonts::FONT_8X16,
                 blink: false,
+                cga_palette: [0; 4],
                 start_offset: 0,
                 pixel_pan: 0,
                 line_compare: usize::MAX,
@@ -1255,14 +1488,24 @@ impl VgaState {
         let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
         let mode13 = matches!(mode, VgaMode::Mode13h);
         let start_latch = ((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize;
+        // CGA palettes come from the Mode-Control/Colour-Select registers. The
+        // 640×200 2-colour mode's foreground is the Colour-Select low nibble
+        // (background black); the 320×200 4-colour set is the register-resolved
+        // palette. Other modes ignore this field.
+        let cga_palette = match mode {
+            VgaMode::Cga4 => lib::vga_render::cga4_palette(self.cga_mode_ctl, self.cga_color_select),
+            VgaMode::Cga2 => [0x000000, lib::vga_render::CGA16[(self.cga_color_select & 0x0F) as usize], 0, 0],
+            _ => [0; 4],
+        };
         Some(Frame {
             mode,
             vram,
             planes,
             ac: &self.ac,
             palette: &self.dac,
-            font: &lib::vga_font_8x16::FONT_8X16,
+            font: &lib::vga_fonts::FONT_8X16,
             blink: self.ac[0x10] & 0x08 != 0,
+            cga_palette,
             start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },
             pixel_pan: if planar || mode13 { (self.ac[0x13] & 0x07) as usize } else { 0 },
             line_compare: if planar || mode13 { self.line_compare(h) } else { usize::MAX },

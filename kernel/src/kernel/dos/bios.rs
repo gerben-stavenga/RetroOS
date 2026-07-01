@@ -459,9 +459,12 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
             bda_field!(regs, video_mode = mode);
-            bda_field!(regs, columns = if mode <= 1 || mode == 0x13 { 40u16 } else { 80 });
-            bda_field!(regs, rows_minus1 = 24u8);
-            bda_field!(regs, cell_height = if mode == 0x13 { 8u16 } else { 16 });
+            // Text-grid geometry per mode: 40-column modes (CGA/EGA 320-wide and
+            // mode 13h) vs 80; 30 rows on the 480-line VGA modes; character cell
+            // height 8 (200-line + 13h), 14 (350-line EGA), or 16 (text/480-line).
+            bda_field!(regs, columns = match mode { 0 | 1 | 4 | 5 | 0x0D | 0x13 => 40u16, _ => 80 });
+            bda_field!(regs, rows_minus1 = if matches!(mode, 0x11 | 0x12) { 29u8 } else { 24 });
+            bda_field!(regs, cell_height = match mode { 4 | 5 | 6 | 0x0D | 0x0E | 0x13 => 8u16, 0x0F | 0x10 => 14, _ => 16 });
             bda_field!(regs, active_page = 0u8);
             bda_field!(regs, cursor_pos = [0u16; 8]);
             // Arm/disarm the planar VRAM trap for the EGA 16-colour family
@@ -513,13 +516,20 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
             let pos: u16 = regs.read(bda(pos_off));
             let (mut row, mut col) = ((pos >> 8) as u32, (pos & 0xFF) as u32);
             let cols: u16 = bda_field!(regs, columns);
+            let mode: u8 = bda_field!(regs, video_mode);
             match ch {
                 b'\r' => col = 0,
                 b'\n' => row += 1,
                 0x08 => col = col.saturating_sub(1),
                 _ => {
-                    let off = (row * cols as u32 + col) as usize * 2;
-                    regs.write::<u8>(VRAM_TEXT + off, ch);
+                    // Graphics modes have no text cell: rasterize the glyph into
+                    // the framebuffer (BL = foreground colour). Text modes write
+                    // the char byte at the cursor cell as before.
+                    let fg = regs.rbx as u8;
+                    if !super::machine::vga::bios_draw_glyph(regs, &mut dos.pc.vga, mode, ch, col, row, fg) {
+                        let off = (row * cols as u32 + col) as usize * 2;
+                        regs.write::<u8>(VRAM_TEXT + off, ch);
+                    }
                     col += 1;
                     if col >= cols as u32 {
                         col = 0;
@@ -527,7 +537,8 @@ fn int10(machine: &mut crate::TheArch, dos: &mut super::DosState, regs: &mut Vcp
                     }
                 }
             }
-            row = row.min(24);
+            let max_row: u8 = bda_field!(regs, rows_minus1);
+            row = row.min(max_row as u32);
             regs.write::<u16>(bda(pos_off), ((row << 8) | col) as u16);
         }
         0x0F => {

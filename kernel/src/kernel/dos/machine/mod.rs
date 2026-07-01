@@ -681,9 +681,10 @@ pub fn handle_out_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: 
     }
 }
 
-/// Complete an `INSB/INSW/INSD` (ES:DI ← port, advance DI). Single element —
-/// no REP handling; the CPU traps per iteration when REP is in effect.
-pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
+/// Complete one `INSB/INSW/INSD` element (ES:DI ← port, advance DI). On `rep`
+/// the monitor re-faults per iteration (leaving IP on the instruction), so this
+/// does a single element and decrements the count — `dec_rep_count` — each time.
+pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let es_base = seg_base_for(machine, regs, regs.es as u16);
     let di = regs.rdi as u32;
@@ -694,10 +695,12 @@ pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: 
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
     regs.rdi = regs.rdi.wrapping_add(delta);
+    if rep { dec_rep_count(regs, addr32); }
 }
 
-/// Complete an `OUTSB/OUTSW/OUTSD` (port ← DS:SI, advance SI). Single element.
-pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
+/// Complete one `OUTSB/OUTSW/OUTSD` element (port ← DS:SI, advance SI). Same
+/// per-iteration `rep` contract as `handle_ins_event`.
+pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let ds_base = seg_base_for(machine, regs, regs.ds as u16);
     let si = regs.rsi as u32;
@@ -708,6 +711,20 @@ pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs:
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
     regs.rsi = regs.rsi.wrapping_add(delta);
+    if rep { dec_rep_count(regs, addr32); }
+}
+
+/// Decrement the `rep` counter after one string-I/O element. The monitor only
+/// emits an event when the count was non-zero, so this never underflows: it
+/// steps (E)CX toward the 0 that makes the monitor skip the instruction and
+/// resume. `addr32` picks ECX vs the 16-bit CX (upper bits preserved).
+fn dec_rep_count(regs: &mut Vcpu, addr32: bool) {
+    if addr32 {
+        regs.rcx = regs.rcx.wrapping_sub(1);
+    } else {
+        let cx = (regs.rcx as u16).wrapping_sub(1);
+        regs.rcx = (regs.rcx & !0xFFFF) | cx as u64;
+    }
 }
 
 // ============================================================================

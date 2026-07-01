@@ -19,7 +19,7 @@
 
 use arch::paging2::{self, PAGE_SIZE};
 use lib::vga_render::{self, Frame, VgaMode};
-use lib::vga_font_8x16::FONT_8X16;
+use lib::vga_fonts::FONT_8X16;
 
 /// Cells as last rendered to pixels; `flush` re-renders only what differs.
 /// All-zero ≠ any real cell (attr 0x00 is never written), so the first flush
@@ -430,6 +430,7 @@ fn flush() {
         palette: unsafe { &*palette_p },
         font: &FONT_8X16,
         blink: false,
+        cga_palette: [0; 4],
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
@@ -453,6 +454,7 @@ fn flush() {
                 palette: frame.palette,
                 font: frame.font,
                 blink: frame.blink,
+                cga_palette: [0; 4],
                 start_offset: 0,
                 pixel_pan: 0,
                 line_compare: usize::MAX,

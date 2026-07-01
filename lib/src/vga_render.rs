@@ -73,6 +73,11 @@ pub struct Frame<'a> {
     /// DAC palette: 256 entries × (R,G,B), each component 6-bit (0..63) as the
     /// VGA stores it. Used by all indexed modes.
     pub palette: &'a [u8; 768],
+    /// Resolved CGA 4-colour palette (index 0 = background/border), already
+    /// expanded to 0x00RRGGBB. The CGA modes read this instead of the DAC —
+    /// it comes from the Mode-Control/Colour-Select registers (see
+    /// [`cga4_palette`]). Ignored by every non-CGA mode.
+    pub cga_palette: [u32; 4],
     /// 8×16 glyph bitmap, 256 chars × 16 bytes (one bit per pixel). Required for
     /// text mode; ignored otherwise.
     pub font: &'a [u8],
@@ -581,15 +586,41 @@ fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
     }
 }
 
-/// The fixed 4-colour CGA palette (mode 4 palette 1, high-intensity): the
-/// canonical cyan/magenta/white set most CGA games use. Index 0 is the
-/// background (programmable, but we render the common black).
-const CGA4: [u32; 4] = [0x000000, 0x55FFFF, 0xFF55FF, 0xFFFFFF];
+/// Standard 16-colour CGA/EGA RGB set (entry 6 is brown, `0xAA5500`, the CGA
+/// quirk — not dark yellow). Indexed by the Colour-Select low nibble and by the
+/// per-palette foreground picks in [`cga4_palette`].
+pub const CGA16: [u32; 16] = [
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+];
+
+/// Resolve the CGA 320×200×4 palette from the Mode-Control (0x3D8) and
+/// Colour-Select (0x3D9) registers. Index 0 = background/border (`sel` low
+/// nibble). Indices 1-3 are one of the fixed CGA sets: Mode-Control bit 2
+/// (colour-burst off) forces cyan/red/white; otherwise `sel` bit 5 selects
+/// palette 1 (cyan/magenta/grey) vs palette 0 (green/red/brown), and `sel`
+/// bit 4 adds foreground intensity. This is what real CGA hardware does with
+/// the registers a legacy-VGA passthrough boot honours for free — Digger's
+/// green/red/brown (palette 0) came out cyan/magenta/white without it.
+pub fn cga4_palette(mode_ctl: u8, sel: u8) -> [u32; 4] {
+    let bg = CGA16[(sel & 0x0F) as usize];
+    let bright = if sel & 0x10 != 0 { 8 } else { 0 };
+    let (a, b, c) = if mode_ctl & 0x04 != 0 {
+        (3, 4, 7) // palette 2 (burst off): cyan / red / white
+    } else if sel & 0x20 != 0 {
+        (3, 5, 7) // palette 1: cyan / magenta / grey
+    } else {
+        (2, 4, 6) // palette 0: green / red / brown
+    };
+    [bg, CGA16[a + bright], CGA16[b + bright], CGA16[c + bright]]
+}
 
 /// CGA 320×200×4: 2 bits/pixel at B8000, four pixels per byte (MSB first).
 /// Scanlines interleave by bank — even lines at offset 0, odd lines at +0x2000.
+/// Colours come from the register-resolved `frame.cga_palette`.
 fn render_cga4(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
     let vram = frame.vram;
+    let pal = frame.cga_palette;
     for y in 0..h {
         let bank = (y & 1) * 0x2000 + (y >> 1) * (w / 4);
         for x in 0..w {
@@ -599,15 +630,17 @@ fn render_cga4(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
             };
             let shift = 6 - (x & 3) * 2;
             let idx = (byte >> shift) & 0x03;
-            out[y * w + x] = CGA4[idx as usize];
+            out[y * w + x] = pal[idx as usize];
         }
     }
 }
 
 /// CGA 640×200×2: 1 bit/pixel at B8000, eight pixels per byte, same odd/even
-/// bank interleave. White on black.
+/// bank interleave. Foreground is the Colour-Select colour (`cga_palette[1]`)
+/// on the background (`cga_palette[0]`, normally black).
 fn render_cga2(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
     let vram = frame.vram;
+    let (bg, fg) = (frame.cga_palette[0], frame.cga_palette[1]);
     for y in 0..h {
         let bank = (y & 1) * 0x2000 + (y >> 1) * (w / 8);
         for x in 0..w {
@@ -616,7 +649,7 @@ fn render_cga2(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
                 None => continue,
             };
             let on = byte & (0x80 >> (x & 7)) != 0;
-            out[y * w + x] = if on { 0xFFFFFF } else { 0x000000 };
+            out[y * w + x] = if on { fg } else { bg };
         }
     }
 }
@@ -771,12 +804,20 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
     let bg = pal_rgb(frame.palette, (attr >> 4) & bg_mask);
     let glyph = &frame.font[ch * 16..ch * 16 + 16];
+    // VGA 9th-dot rule: the 9th column repeats the glyph's 8th column ONLY for
+    // the line-draw block 0xC0..=0xDF, so box-drawing joins seamlessly. Every
+    // other glyph gets a blank 9th column for inter-character spacing —
+    // replicating unconditionally welds the right edge of any glyph that lights
+    // its last column (M W X Z m w x * 0 _ …) onto the next cell.
+    let line_gfx = (0xC0..=0xDF).contains(&ch);
     for (gy, &bits) in glyph.iter().enumerate() {
         let py = row * CELL_H + gy;
         for gx in 0..CELL_W {
-            // Column 8 duplicates column 7 (VGA 9th-dot line-draw rule).
-            let bit = if gx < 8 { gx } else { 7 };
-            let on = bits & (0x80 >> bit) != 0;
+            let on = if gx < 8 {
+                bits & (0x80 >> gx) != 0
+            } else {
+                line_gfx && bits & 0x01 != 0
+            };
             let px = col * CELL_W + gx;
             out[py * stride + px] = if on { fg } else { bg };
         }
@@ -850,7 +891,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -907,7 +948,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -929,7 +970,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, line_compare: 2,
         };
         let mut out = [0u32; 16];
@@ -1024,7 +1065,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false, start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
+            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1045,7 +1086,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Mode13h,
             vram: &vram, planes: &[], ac: &ac, palette: &pal,
-            font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
         };
         let mut out = vec![0u32; 320 * 200];
@@ -1064,7 +1105,7 @@ mod tests {
         let mk = |mode, vram: &[u8]| {
             let frame = Frame {
                 mode, vram, planes: &[], ac: &ac, palette: &pal,
-                font: &crate::vga_font_8x16::FONT_8X16, blink: false,
+                font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
             };
             let (w, h) = dimensions(mode);
