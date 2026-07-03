@@ -39,10 +39,18 @@ pub fn outb(port: u16, value: u8) { crate::devices::port_out(port, 1, value as u
 pub fn outw(port: u16, value: u16) { crate::devices::port_out(port, 2, value as u32); }
 pub fn outl(port: u16, value: u32) { crate::devices::port_out(port, 4, value); }
 
-/// Monotonic cycle counter. Deterministic stand-in for the TSC.
+/// Monotonic cycle counter. Deterministic stand-in for the TSC (TCG engine).
+#[cfg(feature = "tcg")]
 pub fn rdtsc() -> u64 {
     static TSC: AtomicU64 = AtomicU64::new(0);
     TSC.fetch_add(1000, Ordering::Relaxed)
+}
+
+/// The real TSC (KVM engine): guest RDTSC executes natively (CR4.TSD=0), so
+/// the kernel-side reading must come from the same clock to stay coherent.
+#[cfg(feature = "kvm")]
+pub fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
 }
 
 /// Power off — exit the host process.
@@ -84,21 +92,37 @@ pub fn halt_forever() -> ! {
 /// At the previous 2 MIPS the Duke3D demo loop structurally overran the
 /// interval: every tick landed mid-chain, the excursion nesting only ever
 /// grew, and DOS/4GW died with error 2002 (transfer stack overflow).
+#[cfg(feature = "tcg")]
 const VIRT_INSTR_PER_MS: u64 = 6_000;
 
 /// Retired guest instructions, the source of virtual time.
+#[cfg(feature = "tcg")]
 static VIRT_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 /// Advance virtual time by `instructions` retired in a run slice. Called by the
 /// CPU core (`cpu::execute`) after each `emu_start`.
+#[cfg(feature = "tcg")]
 pub fn advance_virtual_time(instructions: u64) {
     VIRT_CYCLES.fetch_add(instructions, Ordering::Relaxed);
 }
 
 /// Guest-perceived milliseconds — the interpreter's 1 kHz host tick clock,
 /// derived from retired instructions.
+#[cfg(feature = "tcg")]
 pub fn get_ticks() -> u64 {
     VIRT_CYCLES.load(Ordering::Relaxed) / VIRT_INSTR_PER_MS
+}
+
+/// Guest-perceived milliseconds on the KVM engine: real elapsed time. The
+/// instruction-anchored rationale above is TCG-specific — TCG throughput is
+/// wildly variable, so wall time there desyncs from retired work. Under KVM
+/// the guest runs at genuine native speed, exactly like metal, where the PIT
+/// counts real milliseconds; DOS calibration loops behave as on real (fast)
+/// hardware.
+#[cfg(feature = "kvm")]
+pub fn get_ticks() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
 /// Host ticks (ms) elapsed since the previous call. Drives the event loop's

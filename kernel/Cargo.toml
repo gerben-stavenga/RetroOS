@@ -18,18 +18,23 @@ path = "src/main.rs"
 required-features = ["hosted"]
 
 [features]
-# `hosted` is the only cargo configuration that builds — it selects the
-# interpreter arch backend and routes console output to stdout. Default so the
-# documented `cargo build -p kernel` works without extra flags.
-default = ["hosted"]
+# `hosted` is the only cargo configuration that builds — it selects the hosted
+# arch backend and routes console output to stdout. Default so the documented
+# `cargo build -p kernel` works without extra flags. The backend's execution
+# engine is a separate compile-time choice forwarded to arch-interp: `tcg`
+# (default, Unicorn) or `kvm` (/dev/kvm) — the KVM binary is built with
+#   cargo build -p kernel --no-default-features --features hosted,kvm
+default = ["hosted", "tcg"]
 hosted = ["dep:retroos-arch-interp"]
+tcg = ["retroos-arch-interp?/tcg"]
+kvm = ["retroos-arch-interp?/kvm"]
 # (The live A/V window is NOT a feature of this binary: `retroos-play` is its
 # own workspace member owning the SDL dependency; this binary stays headless.)
 
 [dependencies]
 arch-abi = { path = "../arch-abi" }
 lib = { path = "../lib" }
-retroos-arch-interp = { path = "../arch-interp", optional = true }
+retroos-arch-interp = { path = "../arch-interp", optional = true, default-features = false }
 ext4-view = "0.9.3"
 rustc-demangle = "0.1.24"
 # no_std spinlock for shared kernel singletons (the kpipe pool, …). Minimal

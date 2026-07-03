@@ -42,7 +42,7 @@ pub mod arch_call {
 /// Resume the current Vcpu on the software core and return the next event.
 /// Runs `emu_start` in instruction-counted slices; hooks surface the event.
 pub fn do_arch_execute() -> KernelEvent {
-    crate::cpu::execute()
+    crate::engine::execute()
 }
 
 /// Switch threads: swap live state (`REGS`) with the pointed-to state, and make
@@ -55,7 +55,7 @@ pub fn arch_switch_to(vcpu: &mut Vcpu, _hash_ptr: *mut u64, _fx_ptr: *mut FxStat
     core::mem::swap(&mut live.space, &mut vcpu.space);
     // `live` now holds the incoming context — activate its address space and
     // drop the outgoing space's lazy Unicorn mappings.
-    crate::cpu::flush_uc();
+    crate::engine::flush();
     crate::mmu::switch_to(live.space.0);
     // FPU state is the software core's; cross-switch FPU preservation is M4.
 }
@@ -70,7 +70,7 @@ pub fn arch_user_fork(child_root: &mut RootPageTable) {
 /// Free all user pages in the current address space.
 pub fn arch_user_clean() {
     crate::mmu::clean();
-    crate::cpu::flush_uc();
+    crate::engine::flush();
 }
 
 /// Free user pages in the current address space (arch CLEAN).
@@ -81,7 +81,7 @@ pub fn arch_free_user_pages() {
 /// Set page permissions (bit0=W, bit1=X) over a range.
 pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, _executable: bool) {
     crate::mmu::set_flags(start_vpage, count, writable);
-    crate::cpu::invalidate_uc(start_vpage, count);
+    crate::engine::invalidate_pages(start_vpage, count);
 }
 
 /// Map the first 1MB user-accessible.
@@ -92,32 +92,32 @@ pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, _ex
 /// itself — on this interpreter exactly as on a UEFI-booted metal machine.
 pub fn arch_map_low_mem() {
     crate::mmu::map_low_mem();
-    crate::cpu::invalidate_uc(0, 0x100);
+    crate::engine::invalidate_pages(0, 0x100);
 }
 
 /// Copy page-table entries src→dst.
 pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
     crate::mmu::copy_entries(src_vpage, dst_vpage, count);
-    crate::cpu::invalidate_uc(dst_vpage, count);
+    crate::engine::invalidate_pages(dst_vpage, count);
 }
 
 /// Swap page-table entries a↔b.
 pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
     crate::mmu::swap_entries(a_vpage, b_vpage, count);
-    crate::cpu::invalidate_uc(a_vpage, count);
-    crate::cpu::invalidate_uc(b_vpage, count);
+    crate::engine::invalidate_pages(a_vpage, count);
+    crate::engine::invalidate_pages(b_vpage, count);
 }
 
 /// Clear entries to absent (enables demand paging on next access).
 pub fn arch_unmap_range(base_page: usize, count: usize) {
     crate::mmu::unmap(base_page, count);
-    crate::cpu::invalidate_uc(base_page, count);
+    crate::engine::invalidate_pages(base_page, count);
 }
 
 /// Replace `count` user pages with fresh anonymous RW frames.
 pub fn arch_map_fresh_range(vpage: usize, count: usize) {
     crate::mmu::map_fresh(vpage, count);
-    crate::cpu::invalidate_uc(vpage, count);
+    crate::engine::invalidate_pages(vpage, count);
 }
 
 /// VGA color-text aperture (guest 0xB8000-0xBFFFF, 8 pages). The hosted backend
@@ -126,7 +126,7 @@ pub fn arch_map_fresh_range(vpage: usize, count: usize) {
 /// follow-up.
 pub fn arch_map_vga_text_aperture() {
     crate::mmu::map_fresh(0xB8000 >> 12, 8);
-    crate::cpu::invalidate_uc(0xB8000 >> 12, 8);
+    crate::engine::invalidate_pages(0xB8000 >> 12, 8);
 }
 
 /// Map a range of physical pages into user virtual space.
@@ -138,7 +138,7 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
     } else {
         crate::mmu::map_phys(vpage_start, num_pages, ppage_start);
     }
-    crate::cpu::invalidate_uc(vpage_start, num_pages);
+    crate::engine::invalidate_pages(vpage_start, num_pages);
 }
 
 /// Load the LDT base+limit (the active descriptor table for PM selector

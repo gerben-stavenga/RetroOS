@@ -62,7 +62,7 @@ impl GuestBytes for RootPageTable {
         for_chunks(addr, size, |host, off, n| unsafe {
             for i in 0..n { host.add(i).write_volatile(src.add(off + i).read()); }
         });
-        crate::cpu::invalidate_code_range(addr as u32, size as u32);
+        crate::engine::invalidate_code_range(addr as u32, size as u32);
     }
     fn copy_from(&self, addr: usize, dst: &mut [u8]) {
         for_chunks(addr, dst.len(), |host, off, n| unsafe {
@@ -73,7 +73,7 @@ impl GuestBytes for RootPageTable {
         for_chunks(addr, src.len(), |host, off, n| unsafe {
             for i in 0..n { host.add(i).write_volatile(src[off + i]); }
         });
-        crate::cpu::invalidate_code_range(addr as u32, src.len() as u32);
+        crate::engine::invalidate_code_range(addr as u32, src.len() as u32);
     }
     fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize {
         let mut n = 0;
@@ -89,7 +89,7 @@ impl GuestBytes for RootPageTable {
         for_chunks(addr, len, |host, _off, n| unsafe {
             core::ptr::write_bytes(host, 0, n);
         });
-        crate::cpu::invalidate_code_range(addr as u32, len as u32);
+        crate::engine::invalidate_code_range(addr as u32, len as u32);
     }
     fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
         // Frames are scattered under real paging, so there is no single aliased
@@ -106,7 +106,7 @@ impl GuestBytes for RootPageTable {
                 unsafe { paging::space_resolve((dst + i) as u32).write_volatile(b); }
             }
         }
-        crate::cpu::invalidate_code_range(dst as u32, len as u32);
+        crate::engine::invalidate_code_range(dst as u32, len as u32);
     }
 }
 

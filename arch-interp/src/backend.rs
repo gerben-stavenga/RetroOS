@@ -25,8 +25,8 @@ impl Arch for Interp {
     fn outb(&mut self, port: u16, val: u8) { crate::machine::outb(port, val) }
     fn outw(&mut self, port: u16, val: u16) { crate::machine::outw(port, val) }
     fn outl(&mut self, port: u16, val: u32) { crate::machine::outl(port, val) }
-    fn allow_io_ports(&mut self, _port: u16, _count: usize) {} // all I/O is interpreted
-    fn reset_io_bitmap(&mut self) {} // all I/O is interpreted
+    fn allow_io_ports(&mut self, port: u16, count: usize) { crate::engine::allow_io_ports(port, count) }
+    fn reset_io_bitmap(&mut self) { crate::engine::reset_io_bitmap() }
 
     // ── Execution & scheduling ──
     //
@@ -35,7 +35,7 @@ impl Arch for Interp {
     // (The internal frame goes away when the globals migrate into `Interp`.)
     fn execute(&mut self, vcpu: &mut Vcpu) -> KernelEvent {
         unsafe { vcpu::REGS = *vcpu; }
-        let ev = crate::cpu::execute();
+        let ev = crate::engine::execute();
         *vcpu = unsafe { vcpu::REGS };
         ev
     }
@@ -63,7 +63,7 @@ impl Arch for Interp {
     fn free_user_pages(&mut self) { crate::calls::arch_free_user_pages() }
     fn destroy_space(&mut self, root: &mut Self::PageTable) {
         crate::mmu::destroy_space(root.0);
-        crate::cpu::flush_uc();
+        crate::engine::flush();
     }
     fn set_page_flags(&mut self, start_vpage: usize, count: usize, writable: bool, executable: bool) {
         crate::calls::arch_set_page_flags(start_vpage, count, writable, executable)

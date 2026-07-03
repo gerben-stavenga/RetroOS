@@ -80,6 +80,50 @@ rust_binary(
     ],
 )
 
+# ---- hosted on the KVM engine: same kernel, guest slices on the real CPU ---
+# The twin of kernel_hosted/retroos-host linking //arch-interp:arch-interp-kvm
+# (no Unicorn C core). `./run.sh hosted --kvm` builds and runs this pair.
+rust_library(
+    name = "kernel_hosted_kvm",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kernel",
+    crate_features = ["hosted"],
+    visibility = ["//visibility:public"],
+    edition = "2024",
+    rustc_flags = [
+        "--cfg=bootfs_embedded",
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+    ],
+    deps = [
+        "//arch-abi",
+        "//arch-interp:arch-interp-kvm",
+        "//lib",
+        "@crates//:ext4-view",
+        "@crates//:rustc-demangle",
+        "@crates//:spin",
+    ],
+)
+
+rust_binary(
+    name = "retroos-host-kvm",
+    srcs = ["src/main.rs"],
+    crate_name = "retroos_host",
+    crate_features = ["hosted"],
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":bootfs_host",
+        ":kernel_hosted_kvm",
+        "//arch-interp:arch-interp-kvm",
+        "//lib",
+    ],
+)
+
 # The bootfs tar pinned to the canonical retro platform: its build subtree
 # (in-OS TCC → image_min → the i686 bootloader) must not follow the host
 # config that retroos-host builds in.

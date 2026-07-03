@@ -179,9 +179,11 @@ if [ "$BACKEND" = "qemu" ] || [ "$BACKEND" = "bochs" ]; then
     esac
 fi
 
-# --kvm is a QEMU accelerator (run on the host CPU via VT-x/AMD-V).
-if [ "$KVM" = 1 ] && [ "$BACKEND" != "qemu" ]; then
-    echo "run.sh: --kvm only applies to the qemu backend (got '$BACKEND')." >&2
+# --kvm: on the qemu backend, the accelerator (run on the host CPU via
+# VT-x/AMD-V); on the hosted backend, the KVM execution engine (the *-kvm
+# build targets — guest slices on the real CPU, kernel stays a host process).
+if [ "$KVM" = 1 ] && [ "$BACKEND" != "qemu" ] && [ "$BACKEND" != "hosted" ]; then
+    echo "run.sh: --kvm only applies to the qemu and hosted backends (got '$BACKEND')." >&2
     exit 1
 fi
 
@@ -1329,19 +1331,28 @@ launch_hosted() {
         ARGS+=("bazel-bin/$IMG.bin")
     fi
 
+    # Engine suffix: --kvm selects the *-kvm build targets (the KVM execution
+    # engine); default is the TCG (Unicorn) engine.
+    local ENG=""
+    [ "$KVM" = 1 ] && ENG="-kvm"
+
     if [ -n "$HOSTED_TERMINAL" ]; then
         # Headless kernel binary. Hosted build needs the host platform; the repo
         # default pins i686_retro_none.
-        bazelisk build //kernel:retroos-host --platforms=@platforms//host
+        bazelisk build "//kernel:retroos-host$ENG" --platforms=@platforms//host
         [ -n "$HOSTED_SHOT" ] && ARGS+=(--screenshot "$HOSTED_SHOT")
         [ -n "$HOSTED_TRACE" ] && export RETRO_TRACE=1
-        exec bazel-bin/kernel/retroos-host "${ARGS[@]}" "${PASS[@]}"
+        exec "bazel-bin/kernel/retroos-host$ENG" "${ARGS[@]}" "${PASS[@]}"
     fi
 
     # Window mode: retroos-play is Bazel-built like everything else, so it links the
     # ONE patched unicorn (//third_party/unicorn). The bootfs is embedded (same as
     # retroos-host), so this is a single host-platform build — no //:bootfs_tar step
     # that would flip --platforms and discard Bazel's analysis cache every run.
+    if [ "$KVM" = 1 ]; then
+        echo "run.sh: hosted --kvm window mode (retroos-play-kvm) is not built yet; use --terminal" >&2
+        exit 1
+    fi
     bazelisk build //play:retroos-play --platforms=@platforms//host
     [ -n "$HOSTED_WAV" ] && ARGS+=(--wav "$HOSTED_WAV")
     if [ -n "$HOSTED_CMD" ]; then

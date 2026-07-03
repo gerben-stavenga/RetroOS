@@ -16,69 +16,19 @@
 //!   an illegal access → `PageFault`) or after `SLICE` instructions retire
 //!   (a deterministic timer tick → `Irq`).
 
+use crate::sysdesc::{
+    ensure_sys_window, if_to_vif, sys_phys, sys_ptr, vif_to_if, write_tables, GDT_ADDR, GDT_BYTES,
+    IF_FLAG, IOPL_MASK, KERNEL_CS, KERNEL_DS, LDT_ADDR, LDT_SEL, NT_FLAG, RING0_SP_TOP, SYS_BASE,
+    SYS_SIZE, TF_FLAG, TRAMP_ADDR, VIF_FLAG, VM_FLAG,
+};
 use crate::vcpu;
-use arch_abi::monitor::{GuestView, MonitorResult};
+use crate::view::InterpView;
+use arch_abi::monitor::MonitorResult;
 use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
 use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
-
-/// Interp guest-memory view for the shared sensitive-instruction monitor.
-///
-/// Bound by `&mut` to the **interpreted thread's** address space — the
-/// `RootPageTable` (a space id) carried in the live `REGS`. This is the only
-/// correct basis for the monitor's reads/writes: the kernel moves the globally
-/// `active` space around to peek other spaces (exec argv copy, focus VGA
-/// snapshot), and unicorn's CR3 follows `active`, so neither names the thread we
-/// are decoding. Resolving through the thread's own space id (never `active`)
-/// is the software-MMU analogue of metal, where the faulting thread's page
-/// tables are simply live during the #GP. The `&mut` is exactly the "mut ref to
-/// the thread" guest writes (PUSHF/INT frames) and demand-paged reads require.
-///
-/// All addresses are linear; access is byte-wise so a 16/32-bit access that
-/// straddles a page boundary still lands correctly.
-struct InterpView<'a> {
-    space: &'a mut crate::space::RootPageTable,
-}
-
-impl InterpView<'_> {
-    #[inline]
-    fn load<const N: usize>(&mut self, lin: u32) -> [u8; N] {
-        let id = self.space.0;
-        let mut b = [0u8; N];
-        for (i, slot) in b.iter_mut().enumerate() {
-            *slot = unsafe { *crate::paging::resolve_in_space(id, lin.wrapping_add(i as u32)) };
-        }
-        b
-    }
-    #[inline]
-    fn store(&mut self, lin: u32, src: &[u8]) {
-        let id = self.space.0;
-        for (i, &byte) in src.iter().enumerate() {
-            unsafe { *crate::paging::resolve_in_space(id, lin.wrapping_add(i as u32)) = byte; }
-        }
-    }
-}
-
-impl GuestView for InterpView<'_> {
-    #[inline]
-    fn read8(&mut self, lin: u32) -> u8 { self.load::<1>(lin)[0] }
-    #[inline]
-    fn read16(&mut self, lin: u32) -> u16 { u16::from_le_bytes(self.load::<2>(lin)) }
-    #[inline]
-    fn read32(&mut self, lin: u32) -> u32 { u32::from_le_bytes(self.load::<4>(lin)) }
-    #[inline]
-    fn write16(&mut self, lin: u32, val: u16) { self.store(lin, &val.to_le_bytes()); }
-    #[inline]
-    fn write32(&mut self, lin: u32, val: u32) { self.store(lin, &val.to_le_bytes()); }
-    #[inline]
-    fn seg_base(&mut self, sel: u16) -> u32 { crate::desc::seg_base(sel) }
-    #[inline]
-    fn seg_is_32(&mut self, sel: u16) -> bool { crate::desc::seg_is_32(sel) }
-    #[inline]
-    fn int_intercepted(&mut self, vector: u8) -> bool { crate::desc::int_intercepted(vector) }
-}
 
 /// Instructions between forced returns to the kernel — the timer-IRQ delivery
 /// grid. A trap returns before this is spent and the *remainder* carries over
@@ -566,38 +516,6 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
     let _ = uc.ctl_flush_tlb();
 }
 
-const IF_FLAG: u32 = 1 << 9;
-const TF_FLAG: u32 = 1 << 8;
-/// NT (Nested Task, EFLAGS bit 14). A real `INT` clears NT on entry, so DOS/DPMI
-/// guests never legitimately run with it set; the interp's software INT
-/// reflection doesn't clear it, so a once-set NT would persist and turn the
-/// guest's next `IRET` into a task-switch return (wild fault). We strip it on
-/// every guest entry so the interp matches metal (NT=0). Without this, Dos
-/// Navigator's launch path faults with Borland RTE 204.
-const NT_FLAG: u32 = 1 << 14;
-/// VIF (EFLAGS bit 19) — the kernel's canonical store for the guest's virtual
-/// interrupt flag, shared with arch-metal. The interpreter runs the guest with
-/// its IF in the native bit-9 slot, so the entry/exit boundary mirrors between
-/// the two: bit 9 ← VIF on the way into Unicorn, VIF ← bit 9 on the way out.
-const VIF_FLAG: u32 = 1 << 19;
-
-/// Entry: project the guest's virtual IF (VIF/bit 19) into the bit-9 (IF) slot
-/// the emulated CPU runs with.
-#[inline]
-fn vif_to_if(flags: u32) -> u32 {
-    let vif = flags & VIF_FLAG != 0;
-    (flags & !IF_FLAG) | if vif { IF_FLAG } else { 0 }
-}
-
-/// Exit: mirror the emulated IF (bit 9) back into VIF (bit 19), and set the real
-/// IF (bit 9) = 1 — the host-side invariant (the interpreter owns preemption via
-/// its instruction budget, so the real IF never gates guest state).
-#[inline]
-fn if_to_vif(flags: u32) -> u32 {
-    let vif = flags & IF_FLAG != 0;
-    (flags & !VIF_FLAG) | IF_FLAG | if vif { VIF_FLAG } else { 0 }
-}
-
 // Virtual-IF single-stepping and sensitive-instruction decoding now live in the
 // shared `arch_abi::monitor`, driven through `InterpView` (see top of file).
 // Both backends emulate `CLI`/`STI`/`PUSHF`/`POPF`/`IRET`/`INT` identically;
@@ -697,53 +615,6 @@ pub fn flush_uc() {
     });
 }
 
-const VM_FLAG: u64 = 1 << 17;
-const IOPL_MASK: u64 = 3 << 12;
-
-// ── High scratch window: descriptor tables + the ring-3 entry trampoline ─────
-//
-// To run a protected-mode client (Linux flat-32 *or* a 16/32-bit DPMI client)
-// the software CPU must resolve segment selectors through real descriptor
-// tables — a write to a segment register in PM makes Unicorn load base/limit/D
-// from the GDT/LDT in *guest* memory (QEMU `helper_load_seg`). We reserve a
-// window above the user VA range (the MMU never maps there) and place there:
-//   * a small GDT mirroring the kernel's flat ring-0/ring-3 + BDA + TLS slots,
-//   * the active LDT (copied from the kernel's table — DPMI descriptors live
-//     there), pointed at by LDTR, and
-//   * a one-byte `iretd` trampoline plus a ring-0 stack.
-// CPL only becomes 3 by *returning* to a DPL-3 stack, so we can't just write
-// SS=ring3 (a same-privilege load demands CPL==DPL already). Instead each PM
-// entry resets to CPL 0 (a brief real-mode SS load), programs the tables, then
-// `iretd`s through a CPL-0→3 frame — exactly how real kernels enter ring 3.
-const SYS_BASE: u64 = 0xFFFE_0000;
-const GDT_ADDR: u64 = SYS_BASE; // 256-byte GDT (32 entries)
-const LDT_ADDR: u64 = SYS_BASE + 0x1000; // up to LDT_MAX_BYTES
-const TRAMP_ADDR: u64 = SYS_BASE + 0x5000; // the `iretd` byte
-const RING0_SP_TOP: u64 = SYS_BASE + 0x7000; // ring-0 stack top (frame just below)
-const SYS_SIZE: usize = 0x8000;
-const GDT_BYTES: usize = 32 * 8;
-const LDT_MAX_BYTES: usize = 0x4000; // 2048 descriptors
-
-// Flat ring-0 selectors the trampoline runs under (GDT indices 1 and 3, to
-// match the kernel's `descriptors.rs` KERNEL_CS=0x08 / KERNEL_DS=0x18 layout).
-const KERNEL_CS: u16 = 0x08;
-const KERNEL_DS: u16 = 0x18;
-/// LDT selector value (GDT slot 12 on metal). We program LDTR's base directly,
-/// so the selector is cosmetic, but keep the kernel's value for fidelity.
-const LDT_SEL: u16 = 0x60;
-
-/// Pack a legacy 8-byte segment descriptor. `flags4` is the high nibble
-/// (G, D/B, L, AVL); `access` is the type/DPL/P byte.
-fn gdt_desc(base: u32, limit: u32, access: u8, flags4: u8) -> u64 {
-    (limit as u64 & 0xFFFF)
-        | ((base as u64 & 0xFFFF) << 16)
-        | (((base as u64 >> 16) & 0xFF) << 32)
-        | ((access as u64) << 40)
-        | (((limit as u64 >> 16) & 0xF) << 48)
-        | ((flags4 as u64 & 0xF) << 52)
-        | (((base as u64 >> 24) & 0xFF) << 56)
-}
-
 /// Write a memory-management register (GDTR/LDTR) via the `uc_x86_mmr` layout
 /// `{ selector:u16, _pad, base:u64@8, limit:u32@16, flags:u32@20 }` (24 bytes).
 fn set_mmr(uc: &Unicorn<'static, Ctx>, reg: RegisterX86, selector: u16, base: u64, limit: u32, flags: u32) {
@@ -753,69 +624,6 @@ fn set_mmr(uc: &Unicorn<'static, Ctx>, reg: RegisterX86, selector: u16, base: u6
     buf[16..20].copy_from_slice(&limit.to_le_bytes());
     buf[20..24].copy_from_slice(&flags.to_le_bytes());
     let _ = uc.reg_write_long(reg, &buf);
-}
-
-/// The 8 contiguous guest-physical frames backing the SYS window (GDT, LDT,
-/// trampoline, ring-0 stack), shared by every address space. Allocated once;
-/// `register_kernel_window` maps `SYS_BASE` onto them in every page directory.
-static SYS_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-fn sys_base_frame() -> u64 {
-    *SYS_FRAMES.get().expect("SYS window not initialized")
-}
-
-/// Host pointer to a SYS-window linear address (the frames are contiguous, so
-/// the linear offset within the window is the offset within the frame run).
-fn sys_ptr(linear: u64) -> *mut u8 {
-    unsafe { crate::phys::frame_ptr(sys_base_frame()).add((linear - SYS_BASE) as usize) }
-}
-
-/// Physical address of a SYS-window linear address (for GDTR/LDTR base while
-/// paging is momentarily off during the CPL0 bootstrap).
-fn sys_phys(linear: u64) -> u64 {
-    (crate::paging::frame_phys(sys_base_frame()) as u64) + (linear - SYS_BASE)
-}
-
-/// Allocate the SYS frames, seed the `iretd` trampoline byte, and register the
-/// window so every page directory (existing and future) maps it. Idempotent.
-fn ensure_sys_window() {
-    SYS_FRAMES.get_or_init(|| {
-        let frames = crate::phys::alloc_frames(SYS_SIZE / 4096);
-        unsafe { *crate::phys::frame_ptr(frames).add((TRAMP_ADDR - SYS_BASE) as usize) = 0xCF; }
-        crate::paging::register_kernel_window((SYS_BASE / 4096) as usize, frames, SYS_SIZE / 4096);
-        frames
-    });
-}
-
-/// Refresh the GDT (flat ring-0/ring-3 + BDA alias + present TLS slots) and the
-/// LDT (the kernel's active table) in the SYS-window frames. Returns the LDT
-/// byte limit (the GDTR/LDTR bases are set by the trampoline runner, which knows
-/// the paging phase). Writes go to the shared phys frames, not through unicorn.
-fn write_tables() -> u32 {
-    use arch_abi::{USER_CS, USER_DS};
-    let mut gdt = [0u64; 32];
-    gdt[(KERNEL_CS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0x9A, 0xC); // ring-0 code32
-    gdt[(KERNEL_DS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0x92, 0xC); // ring-0 data32
-    gdt[(USER_CS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0xFA, 0xC); // ring-3 code32 (Linux)
-    gdt[(USER_DS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0xF2, 0xC); // ring-3 data32 (Linux)
-    gdt[8] = gdt_desc(0x400, 0xFFFF, 0xF2, 0x4); // 0x40: BIOS Data Area alias (DPMI compat)
-    crate::desc::for_each_tls(|idx, base, _limit| {
-        if idx < 32 {
-            gdt[idx] = gdt_desc(base, 0xF_FFFF, 0xF2, 0xC);
-        }
-    });
-    let gp = sys_ptr(GDT_ADDR);
-    for (i, d) in gdt.iter().enumerate() {
-        unsafe { core::ptr::copy_nonoverlapping(d.to_le_bytes().as_ptr(), gp.add(i * 8), 8); }
-    }
-
-    let ldt = crate::desc::ldt_raw();
-    let n = ldt.len().min(LDT_MAX_BYTES / 8);
-    let lp = sys_ptr(LDT_ADDR);
-    for (i, d) in ldt.iter().take(n).enumerate() {
-        unsafe { core::ptr::copy_nonoverlapping(d.to_le_bytes().as_ptr(), lp.add(i * 8), 8); }
-    }
-    if n == 0 { 0 } else { (n * 8 - 1) as u32 }
 }
 
 /// Enter the guest through the CPL0 `iretd` trampoline. `frame` is the iret

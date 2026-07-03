@@ -151,7 +151,7 @@ pub fn frame_phys(ppage: u64) -> u32 {
     (ppage as u32) << 12
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tcg"))] // proofs drive Unicorn directly
 mod proof {
     use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
     use unicorn_engine::{RegisterX86, Unicorn};
@@ -269,7 +269,7 @@ mod tables {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tcg"))] // proofs drive Unicorn directly
 mod integration {
     use super::*;
     use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot};
@@ -829,8 +829,13 @@ mod space_ops {
         unsafe { *phys::frame_ptr((p >> 12) as u64) = 0x7E };
         let child = space_fork(s);
         space_switch(child);
-        let cp = space_translate(0x10_000).expect("child mapped");
-        assert_ne!(p >> 12, cp >> 12, "fork gave the child its own frame");
+        // Fork is COW: the child shares the parent's frame read-only until a
+        // write; the first write privatises through the COW fault path.
+        let shared = space_translate(0x10_000).expect("child mapped");
+        assert_eq!(p >> 12, shared >> 12, "fork shares the frame (COW)");
+        assert!(space_cow_fault(0x10_000), "COW fault privatises the page");
+        let cp = space_translate(0x10_000).expect("child mapped after COW");
+        assert_ne!(p >> 12, cp >> 12, "COW gave the child its own frame");
         assert_eq!(unsafe { *phys::frame_ptr((cp >> 12) as u64) }, 0x7E, "contents copied");
         // Mutating the child doesn't touch the parent (separate frames).
         unsafe { *phys::frame_ptr((cp >> 12) as u64) = 0x11 };
@@ -845,7 +850,7 @@ mod space_ops {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tcg"))] // proofs drive Unicorn directly
 mod vm86 {
     use super::*;
     use unicorn_engine::unicorn_const::{Arch, Mode, Prot};

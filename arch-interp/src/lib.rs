@@ -1,11 +1,17 @@
-//! retroos-arch-interp — the **interpreter** arch backend.
+//! retroos-arch-interp — the **hosted** arch backend.
 //!
 //! This crate is the software counterpart of `kernel/src/arch/`. The kernel is
 //! built against exactly one `arch` backend: the bare-metal one (real x86, INT
-//! 0x80, Bazel) or *this* one (a software x86 core — Unicorn = QEMU's TCG —
-//! linked into a hosted `std` process). The kernel selects between them with
-//! `#[cfg(feature = "hosted")] extern crate retroos_arch_interp as arch;`, so
+//! 0x80, Bazel) or *this* one (linked into a hosted `std` process). The kernel
+//! selects between them with
+//! `#[cfg(feature = "hosted")] extern crate retroos_arch_interp as arch;` so
 //! every `crate::arch::*` path resolves here instead.
+//!
+//! The CPU under the hosted guest is itself a compile-time choice between two
+//! **engines** (see `engine.rs`): `tcg` (default — the Unicorn/QEMU-TCG
+//! software core) or `kvm` (real hardware execution via `/dev/kvm`). Both run
+//! the same machine model — the shared phys frames, real x86 page tables,
+//! descriptor tables, and device bus above the engine seam.
 //!
 //! Because of that, this crate must present the **identical public surface**
 //! that `kernel/src/arch/mod.rs` re-exports — same type names, same function
@@ -34,12 +40,25 @@ pub use arch_abi::{
     USER_CS, USER_CS64, USER_DS,
 };
 
+// Exactly one execution engine must be selected (`tcg` is the default feature).
+#[cfg(all(feature = "tcg", feature = "kvm"))]
+compile_error!("features `tcg` and `kvm` are mutually exclusive engine selections \
+                (build the kvm engine with `--no-default-features --features kvm`)");
+#[cfg(not(any(feature = "tcg", feature = "kvm")))]
+compile_error!("select an execution engine: feature `tcg` (default) or `kvm`");
+#[cfg(all(feature = "kvm", not(target_os = "linux")))]
+compile_error!("the `kvm` engine requires Linux (/dev/kvm)");
+
 mod backend;
 mod calls;
+#[cfg(feature = "tcg")]
 mod cpu;
 mod desc;
 mod devices;
+mod engine;
 mod hostfs;
+#[cfg(feature = "kvm")]
+mod kvm;
 mod machine;
 mod mmu;
 mod paging;
@@ -47,9 +66,11 @@ mod phys;
 pub mod monitor;
 mod screendump;
 mod space;
+mod sysdesc;
 mod tty;
 mod vcpu;
 mod vga;
+mod view;
 
 pub use backend::Interp;
 pub use calls::*;

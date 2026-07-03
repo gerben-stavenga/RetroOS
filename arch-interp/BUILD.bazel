@@ -1,12 +1,17 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
 
-# The hosted interpreter backend (host-config build only; the metal kernel
-# links //arch-metal instead). Unicorn — the patched fork pinned in
-# Cargo.lock — and libc come from the crate_universe repo @crates.
+# The hosted backend (host-config build only; the metal kernel links
+# //arch-metal instead). Two targets, one per execution engine — the engine is
+# a compile-time choice (see src/engine.rs):
+#  * :arch-interp     — the TCG engine (Unicorn, the patched fork pinned in
+#                       Cargo.lock, via the crate_universe repo @crates).
+#  * :arch-interp-kvm — the KVM engine (/dev/kvm); no Unicorn C core at all.
 rust_library(
     name = "arch-interp",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "retroos_arch_interp",
+    # Bazel does not read cargo default features: select the engine explicitly.
+    crate_features = ["tcg"],
     edition = "2021",
     # abort matches //lib and //arch-abi (see //kernel:kernel_hosted).
     rustc_flags = [
@@ -21,5 +26,25 @@ rust_library(
         "//lib",
         "@crates//:libc",
         "@crates//:unicorn-engine",
+    ],
+)
+
+rust_library(
+    name = "arch-interp-kvm",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "retroos_arch_interp",
+    crate_features = ["kvm"],
+    edition = "2021",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//arch-abi",
+        "//lib",
+        "@crates//:kvm-bindings",
+        "@crates//:kvm-ioctls",
+        "@crates//:libc",
     ],
 )
