@@ -203,7 +203,7 @@ same situation the interpreter already has (no ROM).
       RetroOS (GPT scan, or stay RAM-only diskless), and the real-laptop
       trial itself (open questions: panel GOP pixel format, i8042 presence).
 
-## 7. Real-laptop boot reset after "Heap initialized" (ACTIVE HUNT)
+## 7. Real-laptop boot reset after "Heap initialized" (RESOLVED 2026-07-03)
 The laptop resets silently right after the "Heap initialized" print — no
 panic, no double-fault dump, machine just reboots. Same kernel boots fine on
 QEMU UEFI, Bochs+OVMF (`run_uefi_bochs.sh`), and hosted. Eliminated so far:
@@ -212,7 +212,7 @@ port-0x80 side effects (delays removed entirely, still resets), and
 that whole class — yet the reset stays silent, so the machine dies without a
 deliverable CPU fault: smells like a write to firmware/SMM-owned memory the
 multiboot map called free, or something interrupt/time-driven).
-- [ ] **Get the countdown verdict.** The instrumented kernel (local branch
+- [x] **Get the countdown verdict.** The instrumented kernel (local branch
       `metal-work`) prints a 10×1s spin countdown with zero memory activity,
       then `demand[k]: va=… → phys …` for the first 16 heap pages, each line
       lingering ~2s before the page is touched. Where the output stops picks
@@ -241,7 +241,7 @@ multiboot map called free, or something interrupt/time-driven).
       setuptools file. Remedy (documented in 7aab93a): delete the
       `rules_python~~python~*` external dir + `.marker`, rebuild.
 
-## 9. arch-interp translation-cache coherence (stale-TB class)
+## 9. arch-interp translation-cache coherence (stale-TB class) (RESOLVED)
 Root cause of the long-standing "DN file-panel Enter can't launch digger" bug
 (Borland RTE 204): the interp loads guest **code** host-side — DOS overlay/EXE
 loads, relocations, BSS go through `vcpu.rs` `GuestBytes` (`host.write_volatile`),
@@ -918,8 +918,8 @@ ALSO FOUND (separate bugs, file/fix independently):
 ## Epic Pinball
 - [ ] Menu is way too fast, arrow keypresses often result in 2/3 steps
 
-## One Must Fall 2097
-- [ ] (sb-dma-virt) MOD music has deep comb-echo "reverb" + unstable
+## One Must Fall 2097 (RESOLVED 2026-07-03)
+- [x] (sb-dma-virt) MOD music has deep comb-echo "reverb" + unstable
       tempo at "ultra high quality" mixing; "486" mixing sounds normal.
       Not a buffer/remap-coherency bug (a coherency fault would echo at
       any rate). It's a throughput ceiling: with host IRQ5 re-armed on
@@ -932,7 +932,7 @@ ALSO FOUND (separate bugs, file/fix independently):
       `-accel`), inflating every trap. Rejected dead-ends: auto-init
       special-case + kernel-side 2xEh ack (reverted — both hacks); the
       0x22E-read re-arm idea (wrong; EOI 0x20 is the right trigger).
-- [ ] Restart from launcher after quitting OMF hangs. **Diagnosis
+- [x] Restart from launcher after quitting OMF hangs. **Diagnosis
       confirmed** via fresh trace: OMF2 enters a tight `INT 21 AH=2C`
       (GetTime) timeout loop that OMF1 never executes (526 calls vs 0)
       — different sound-init branch. EFLAGS in the loop: IF=0, VIP=1,
@@ -957,8 +957,8 @@ ALSO FOUND (separate bugs, file/fix independently):
 ## Pinball illusions
 - [ ] pMAX protected mode is incompatible
 
-## Extreme pinball
-- [ ] Kernel panic on keypress
+## Extreme pinball (RESOLVED)
+- [x] Kernel panic on keypress
 
 ## Strunts
 - [ ] Does not start
