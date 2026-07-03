@@ -845,7 +845,7 @@ pub fn bios_draw_glyph(regs: &mut Vcpu, vga: &mut VgaState, mode: u8, ch: u8, co
         // EGA/VGA 16-colour planar: set/clear each of the 4 plane bits for the
         // pixel from the 4-bit colour, in `vga.planes` (what the planar renderer
         // scans out). Stride follows the CRTC Offset like `classify_mode`.
-        0x0D | 0x0E | 0x0F | 0x10 | 0x11 | 0x12 => {
+        0x0D..=0x12 => {
             if vga.planes.is_empty() {
                 vga.planes = alloc::vec![0u8; PLANES_LEN];
             }

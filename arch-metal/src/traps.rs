@@ -422,7 +422,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         // SS/ESP, so Raw32's esp/ss slots and the bytes beyond line up
         // with it. Dump the words so the panic names the bad frame.
         if !from_64 && !(raw_int_num == 14 || (32..=47).contains(&raw_int_num)) {
-            let p = unsafe { core::ptr::addr_of!((*stack).raw32.0.esp) as *const u32 };
+            let p = unsafe { core::ptr::addr_of!((*stack).raw32.0.esp) };
             lib::println!("ring0 fault: words above the trap frame (iret-target frame):");
             for i in 0..10 {
                 lib::println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
