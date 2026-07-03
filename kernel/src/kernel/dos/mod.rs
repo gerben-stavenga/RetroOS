@@ -336,6 +336,15 @@ pub struct ExecParent {
     /// Parent's PMDOS routing flag, suspended alongside dpmi/pm_vectors so
     /// the child runs with the default reflect-to-RM INT 21 path.
     pub pm_dos: bool,
+    /// Parent's locked-stack chain cursor (`pc.locked_stack.other_stack`),
+    /// suspended so the child starts a fresh continuation chain. The cursor
+    /// is a LIFO position into the parent's host/PM stack tied to the
+    /// parent's LDT selectors; leaving it visible to the child makes the
+    /// child's first PM IRQ plant its resume continuation on the *parent's*
+    /// stack selector — which is null in the child's fresh LDT, so the exit
+    /// IRET to the resume park #GPs in ring 0 (the OMF-launcher relaunch
+    /// crash). Restored on `exec_return` alongside dpmi/ldt.
+    pub locked_stack_other: Option<(u16, u32)>,
     /// Parent was running in PM at EXEC time. The child is always VM86;
     /// `exec_return` uses this to flip `VM_FLAG` back so the dispatch tail
     /// runs the PM iret-frame pop instead of the VM86 one.

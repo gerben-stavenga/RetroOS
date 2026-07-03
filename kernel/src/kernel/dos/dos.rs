@@ -2725,6 +2725,9 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
         &mut dos.pm_rm_vector_shadow,
         [(0, 0, 0); 256],
     );
+    // The child begins a fresh continuation chain: its locked-stack cursor
+    // must not point into the parent's PM stack (see ExecParent docs).
+    let suspended_locked_stack = dos.pc.locked_stack.other_stack.take();
     let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
     let mut parent_ivt = [(0u8, 0u16, 0u16); 12];
     for (slot, &int_num) in parent_ivt.iter_mut().zip(EXEC_SAVED_IVT_VECTORS.iter()) {
@@ -2757,6 +2760,7 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
         ldt_alloc: suspended_ldt_alloc,
         pm_rm_vector_shadow: suspended_pm_rm_vector_shadow,
         pm_dos: suspended_pm_dos,
+        locked_stack_other: suspended_locked_stack,
         pm_mode: parent_pm_mode,
         prev: prev.map(alloc::boxed::Box::new),
     });
@@ -2949,6 +2953,9 @@ fn exec_return(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &
         dos.ldt_alloc = parent.ldt_alloc;
         dos.pm_rm_vector_shadow = parent.pm_rm_vector_shadow;
         dos.pm_dos = parent.pm_dos;
+        // Restore the parent's continuation-chain cursor alongside its LDT:
+        // the two are a matched pair (cursor indexes stack via LDT selectors).
+        dos.pc.locked_stack.other_stack = parent.locked_stack_other;
     }
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
