@@ -93,6 +93,7 @@ use dos::{
     SLOT_PMDOS_INT21, SLOT_PMDOS_INT33, SLOT_MOUSE_CB_RET,
     slot_offset, ctrl_slot_off,
     host_stack_base, host_stack_size, host_stack_empty_sp,
+    EXC_STACK_TOP, EXC_STACK_SLOT,
     rm_stack_base, rm_stack_size, rm_stack_seg, rm_stack_align_offset,
 };
 

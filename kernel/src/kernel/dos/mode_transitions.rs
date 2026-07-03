@@ -282,8 +282,17 @@ fn rm_cursor_for_pm_entry(dos: &thread::DosState, regs: &Vcpu) -> (u16, u32) {
 /// or `push_continuation_and_switch_to_rm_side`, the only entry points to the locked-stack
 /// chain.
 fn push_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+    push_continuation_at_cursor(dos, regs, rm_call_struct_addr, None)
+}
+
+/// `push_continuation` with an optional explicit pm-side (SS, SP) target
+/// instead of `pm_get_stack`'s chain cursor. Used by exception dispatch,
+/// which must place its frames in the host stack's exception region — the
+/// chain cursor may point at the client's own stack, where the client's
+/// exception handler is entitled to scribble (see `dos::EXC_STACK_TOP`).
+fn push_continuation_at_cursor(dos: &mut thread::DosState, regs: &mut Vcpu, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
     let save = HostContinuation::capture(regs, dos.pc.locked_stack.other_stack, rm_call_struct_addr);
-    let (ss, sp) = pm_get_stack(dos, regs);
+    let (ss, sp) = cursor.unwrap_or_else(|| pm_get_stack(dos, regs));
     let new_sp = sp - HOST_CONTINUATION_SIZE;
     let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
     regs.write::<HostContinuation>((addr) as usize, save);
@@ -363,6 +372,12 @@ pub(super) fn resume_continuation(dos: &mut thread::DosState, regs: &mut Vcpu, s
 /// The caller must then choose PM `CS:EIP` and may add recipe-specific
 /// frames above the HostContinuation before finalizing `regs.SP`.
 pub(super) fn push_continuation_and_switch_to_pm_side(dos: &mut thread::DosState, regs: &mut Vcpu, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+    push_continuation_and_switch_to_pm_side_at(dos, regs, rm_call_struct_addr, None)
+}
+
+/// `push_continuation_and_switch_to_pm_side` with an optional explicit
+/// pm-side cursor for the HostContinuation (see `push_continuation_at_cursor`).
+pub(super) fn push_continuation_and_switch_to_pm_side_at(dos: &mut thread::DosState, regs: &mut Vcpu, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
     if_record(IF_SWITCH_PM, regs, if_bit(regs), if_bit(regs),
         dos.pc.locked_stack.other_stack);
     // Track where the RM side should resume if this PM entry reflects
@@ -370,7 +385,7 @@ pub(super) fn push_continuation_and_switch_to_pm_side(dos: &mut thread::DosState
     // a VM86 caller's own stack may be too small for BIOS/DOS handlers.
     // HostContinuation still captures the interrupted SS:SP for final restore.
     let next_rm_cursor = rm_cursor_for_pm_entry(dos, regs);
-    let pm_save_at = push_continuation(dos, regs, rm_call_struct_addr);
+    let pm_save_at = push_continuation_at_cursor(dos, regs, rm_call_struct_addr, cursor);
     regs.frame.ss  = pm_save_at.0 as u64;
     regs.frame.rsp = pm_save_at.1 as u64;
     regs.frame.rflags &= !(machine::VM_FLAG as u64);

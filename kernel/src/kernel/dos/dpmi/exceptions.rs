@@ -276,7 +276,22 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
     let f_fs     = regs.fs as u16;
     let f_gs     = regs.gs as u16;
 
-    let pm_save_at = mode_transitions::push_continuation_and_switch_to_pm_side(dos, regs, None);
+    // Dispatch on the host stack's exception region, never on the client's
+    // stack: the handler is entitled to treat the faulting stack as its own
+    // (a fixup handler builds its resume IRET frame at `fault_esp - 12`).
+    // Each nesting level gets a fixed slot; the depth counter is what
+    // `exception_return` pops.
+    let depth = dos.dpmi.as_ref().map_or(0, |d| d.exc_depth) as u32;
+    if depth >= dos::EXC_STACK_TOP / dos::EXC_STACK_SLOT {
+        crate::println!("DPMI: exception {} at {:04x}:{:#x} — nesting depth {} exceeds the exception-stack region",
+            exc_num, f_cs, f_eip, depth);
+        return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
+    }
+    let exc_cursor = (
+        mode_transitions::host_stack_pm_seg(dos),
+        dos::EXC_STACK_TOP - depth * dos::EXC_STACK_SLOT,
+    );
+    let pm_save_at = mode_transitions::push_continuation_and_switch_to_pm_side_at(dos, regs, None, Some(exc_cursor));
     let pm_seg_base = mode_transitions::seg_base(&dos.ldt[..], pm_save_at.0);
     let new_sp;
 
@@ -371,6 +386,19 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
             addr + core::mem::size_of::<RetF16>() + core::mem::size_of::<ExcFrame16>(), v10);
     }
 
+    // Record where this dispatch put the HostContinuation (frames sit just
+    // below it) so `exception_return` unwinds the frame WE wrote — under
+    // nesting the push lands mid-chain (often on the client's own stack),
+    // not at the host stack's empty top.
+    if let Some(d) = dos.dpmi.as_mut() {
+        if d.exc_depth < d.exc_frames.len() {
+            d.exc_frames[d.exc_depth] = pm_save_at;
+            d.exc_depth += 1;
+        } else {
+            crate::println!("DPMI: exception nesting exceeds {} — unwind tracking lost", d.exc_frames.len());
+        }
+    }
+
     regs.frame.rsp = new_sp as u64;
     regs.frame.cs = handler_sel as u64;
     regs.set_ip32(handler_off);
@@ -429,39 +457,44 @@ pub(super) fn exception_return(
     regs: &mut Vcpu,
     via: ExcReturnVia,
 ) -> thread::KernelAction {
-    let dpmi = match dos.dpmi.as_ref() {
-        Some(d) => d,
+    let (use32, recorded_at) = match dos.dpmi.as_mut() {
+        Some(d) => {
+            let at = if d.exc_depth > 0 {
+                d.exc_depth -= 1;
+                Some(d.exc_frames[d.exc_depth])
+            } else {
+                None
+            };
+            (d.client_use32, at)
+        }
         None => return thread::KernelAction::Done,
     };
-    let use32 = dpmi.client_use32;
 
-    // Host-stack layout on entry (low addr → high addr):
-    //   new_sp:               RetF{16,32}
-    //   new_sp + 4 or 8:      ExcFrame{16,32}   (0.9 spec frame body)
-    //   new_sp + 0x20:        ExcFrameV10       (1.0 expanded frame)
-    //   pm_save_at.1:         HostContinuation
-    let host_seg = mode_transitions::host_stack_pm_seg(dos);
-    let host_base = mode_transitions::seg_base(&dos.ldt[..], host_seg);
-    let mode_save_sp = dos::host_stack_empty_sp() - mode_transitions::HOST_CONTINUATION_SIZE;
-
-    // Read whichever view the handler modified. Both views share the
-    // Both views share the same host_stack region; index into the selected portion.
-    // The handler's own SS:SP after RETF is irrelevant to us — it may
-    // have moved arbitrarily (locals, pushes that weren't fully popped)
-    // and the host stack is the authoritative scratchpad either way.
+    // Two different anchors, on purpose:
+    //
+    //   * The (possibly modified) faulting state is read at the client's
+    //     LIVE SS:(E)SP. Per DPMI 0.9 the handler RETFs with SS:(E)SP
+    //     pointing at the error code of the exception frame — but nothing
+    //     obliges it to be OUR copy: DOS/4GW relocates the frame (builds a
+    //     modified copy plus its own far-return slot lower on the stack,
+    //     e.g. to redirect resume into its fixup code), so the only frame
+    //     the spec lets us trust is the one at the returned SS:(E)SP.
+    //
+    //   * The HostContinuation is OURS — the client never sees it — so it
+    //     is popped at the cursor `dispatch_dpmi_exception` recorded. Under
+    //     nesting that cursor is mid-chain (often on the client's own
+    //     stack), which is why it must be recorded rather than derived
+    //     from the host stack's empty top.
+    let live_ss = regs.stack_seg();
+    let live_sp = regs.sp32();
+    let live_base = mode_transitions::seg_base(&dos.ldt[..], live_ss);
     let (new_eip, new_cs, new_eflags, new_esp, new_ss) = match via {
         ExcReturnVia::V09 => {
             if use32 {
-                let frame_sp = mode_save_sp
-                    - core::mem::size_of::<ExcFrameV10>() as u32
-                    - core::mem::size_of::<ExcFrame32>() as u32;
-                let f: ExcFrame32 = regs.read(host_base.wrapping_add(frame_sp) as usize);
+                let f: ExcFrame32 = regs.read(live_base.wrapping_add(live_sp) as usize);
                 (f.eip, f.cs, f.eflags, f.esp, f.ss)
             } else {
-                let frame_sp = mode_save_sp
-                    - core::mem::size_of::<ExcFrameV10>() as u32
-                    - core::mem::size_of::<ExcFrame16>() as u32;
-                let f: ExcFrame16 = regs.read(host_base.wrapping_add(frame_sp) as usize);
+                let f: ExcFrame16 = regs.read(live_base.wrapping_add(live_sp) as usize);
                 // 16-bit fields fold into the low halves of the saved
                 // 32-bit registers; upper halves come from the pre-fault
                 // capture in HostContinuation below.
@@ -470,15 +503,19 @@ pub(super) fn exception_return(
         }
         ExcReturnVia::V10 => {
             // 1.0 expanded frame is always 32-bit fields regardless of
-            // client bitness (DPMI 1.0 §4.3). Sits at +20H..+57H from
-            // the frame base, i.e. just below HostContinuation on host_stack.
-            let frame_sp = mode_save_sp - core::mem::size_of::<ExcFrameV10>() as u32;
-            let f: ExcFrameV10 = regs.read(host_base.wrapping_add(frame_sp) as usize);
+            // client bitness (DPMI 1.0 §4.3). The handler returned with
+            // `ADD (E)SP, 20h; RETF`, so SS:(E)SP points at the expanded
+            // frame's error code — 8 bytes past the struct's return slot.
+            let f: ExcFrameV10 = regs.read(live_base.wrapping_add(live_sp).wrapping_sub(8) as usize);
             // CS lives in low 16 of cs_xinfo; high 16 is ExceptionInfoBits.
             (f.eip, f.cs_xinfo & 0xFFFF, f.eflags, f.esp, f.ss)
         }
     };
 
+    let (host_seg, mode_save_sp) = recorded_at.unwrap_or((
+        mode_transitions::host_stack_pm_seg(dos),
+        dos::EXC_STACK_TOP - mode_transitions::HOST_CONTINUATION_SIZE,
+    ));
     let mut save = mode_transitions::pop_continuation_at(regs, &dos.ldt[..], (host_seg, mode_save_sp));
     if use32 || via == ExcReturnVia::V10 {
         save.eip    = new_eip;
@@ -496,6 +533,12 @@ pub(super) fn exception_return(
         save.ss     = new_ss;
     }
     mode_transitions::resume_continuation(dos, regs, save);
+    // The restored flags came (possibly handler-modified) from the guest-
+    // observable frame — a guest image, IF intent in the bit-9 slot. Map it
+    // through the single bit-9→VIF home so the canonical invariants (bit 9
+    // pinned, virtual IF only in VIF) hold on the resumed frame.
+    let image = regs.flags32();
+    machine::apply_guest_flags(regs, image);
 
     trace_client_selector_leak("exception_return.out", regs);
     thread::KernelAction::Done

@@ -3285,6 +3285,24 @@ struct LowMem {
 
 /// Locked PM stack size (see `LowMem::host_stack`).
 const HOST_STACK_SIZE: usize = 4096;
+
+/// The locked PM stack is split in two:
+///
+///   [EXC_STACK_TOP .. HOST_STACK_SIZE]  rm-call / IRQ continuation chain,
+///                                       growing down from `host_stack_empty_sp()`
+///   [0 .. EXC_STACK_TOP]                exception-dispatch region
+///
+/// Exception dispatch must NEVER park its frames on the client's own stack:
+/// per DPMI 0.9 the handler runs on a host-provided locked stack, and a
+/// fixup-style handler (DOS/4GW) legitimately builds its resume IRET frame
+/// at `fault_esp - 12` — i.e. right inside anything the host put directly
+/// below the faulting ESP. So each dispatch gets a fixed slot here indexed
+/// by the current exception nesting depth.
+pub(super) const EXC_STACK_TOP: u32 = 2048;
+/// Per-nesting-level slot span in the exception region: 126 bytes of
+/// host frames (HostContinuation + RetF + 0.9 + 1.0 frames) plus handler
+/// scratch. Depth is capped at EXC_STACK_TOP / EXC_STACK_SLOT levels.
+pub(super) const EXC_STACK_SLOT: u32 = 1024;
 /// Dedicated RM stack size (see `LowMem::rm_stack`).
 const RM_STACK_SIZE: usize = 0x1000;
 
