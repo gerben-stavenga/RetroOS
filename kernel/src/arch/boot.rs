@@ -41,37 +41,34 @@ unsafe extern "C" {
     static _end: u8;
 }
 
-// Pre-paging copies of the multiboot info + memory map. GRUB may place them
-// anywhere below 4GB, but after enable_paging only the first 1MB of physical
-// memory stays reachable (LOW_MEM_BASE window) — assuming the MBI sits there
-// reads garbage on machines where it doesn't. Copy both while the offset
-// segments can still address all 32-bit physical memory.
-static mut BOOT_INFO: arch::MultibootInfo = unsafe { core::mem::zeroed() };
-static mut BOOT_MMAP: [MultibootMmapEntry; 128] =
-    [MultibootMmapEntry { size: 0, base: 0, length: 0, typ: 0 }; 128];
-static mut BOOT_MMAP_LEN: usize = 0;
-
 /// Physical address P is reachable pre-paging at P + (KERNEL_BASE -
 /// KERNEL_PHYS), wrapping (the boot GDT's offset segments).
 const PHYS_TO_SEG: usize = paging2::KERNEL_BASE - KERNEL_PHYS;
 
-/// Copy the multiboot info + memory map into kernel statics. Pre-paging only.
-unsafe fn capture_boot_info(info: *const arch::MultibootInfo) {
+/// Copy the multiboot info + memory map out of wherever GRUB left them (anywhere
+/// below 4GB) before paging restricts us to the low-1MB window. Returns the
+/// owned info plus the number of map entries written into `mmap_out`. Both then
+/// live as `boot_kernel` locals — the only reader is the rest of `boot_kernel`,
+/// nothing consults them once boot is over, so there is no need for a global.
+/// Pre-paging only; the caller's stack frame holds the copies across the paging
+/// switch (the stack's linked address is mapped identically before and after).
+unsafe fn capture_boot_info(
+    info: *const arch::MultibootInfo,
+    mmap_out: &mut [MultibootMmapEntry; 128],
+) -> (arch::MultibootInfo, usize) {
     let src = (info as usize).wrapping_add(PHYS_TO_SEG) as *const arch::MultibootInfo;
     let inf = unsafe { core::ptr::read_unaligned(src) };
+    let mut count = 0;
     if inf.flags & (1 << 6) != 0 {
-        let count = (inf.mmap_length as usize / core::mem::size_of::<MultibootMmapEntry>())
+        count = (inf.mmap_length as usize / core::mem::size_of::<MultibootMmapEntry>())
             .min(128);
         let m = (inf.mmap_addr as usize).wrapping_add(PHYS_TO_SEG)
             as *const MultibootMmapEntry;
-        let p = &raw mut BOOT_MMAP;
-        let dst = unsafe { &mut *p };
-        for (i, slot) in dst.iter_mut().enumerate().take(count) {
+        for (i, slot) in mmap_out.iter_mut().enumerate().take(count) {
             *slot = unsafe { core::ptr::read_unaligned(m.add(i)) };
         }
-        unsafe { BOOT_MMAP_LEN = count };
     }
-    unsafe { BOOT_INFO = inf };
+    (inf, count)
 }
 
 /// boot_kernel - Entry point called by asm boot stub
@@ -91,7 +88,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // entered the kernel" from "kernel died during init". Pre-paging we run
     // on offset segments (base = KERNEL_PHYS - KERNEL_BASE), so a physical
     // address P is reached at P + (KERNEL_BASE - KERNEL_PHYS), wrapping.
-    unsafe { capture_boot_info(info) };
+    let mut mmap_buf = [MultibootMmapEntry { size: 0, base: 0, length: 0, typ: 0 }; 128];
+    let (boot_info, mmap_count) = unsafe { capture_boot_info(info, &mut mmap_buf) };
+    let info = &boot_info;
 
     let kernel_size =
         core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
@@ -127,11 +126,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         magic, MULTIBOOT_BOOTLOADER_MAGIC
     );
 
-    // The multiboot info was copied into kernel statics pre-paging (GRUB may
-    // place the original anywhere below 4GB; only low 1MB is mapped now).
-    let bp = &raw const BOOT_INFO;
-    let info = unsafe { &*bp };
-
     // UEFI-class machine (loader handed us a linear framebuffer, there is no
     // VGA text mode): console cells go to a RAM buffer instead of B8000.
     // Pixels start flowing at `fbcon::init` below; cells written until then
@@ -149,10 +143,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     // Parse Multiboot memory map (the pre-paging copy)
     assert!(info.flags & (1 << 6) != 0, "No Multiboot memory map");
-    let mmap_count = unsafe { BOOT_MMAP_LEN };
-    let mp = &raw const BOOT_MMAP;
-    let mmap_all = unsafe { &*mp };
-    let mmap_entries: &[MultibootMmapEntry] = &mmap_all[..mmap_count];
+    let mmap_entries: &[MultibootMmapEntry] = &mmap_buf[..mmap_count];
 
     phys_mm::init_phys_mm(
         mmap_entries,

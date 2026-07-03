@@ -101,15 +101,56 @@ pub fn set_vm86_sp(regs: &mut Vcpu, sp: u16) {
 #[inline]
 pub fn set_vm86_flags(regs: &mut Vcpu, flags: u32) {
     // `flags` is the guest's view: its IF intent is in bit 9. Map it to VIF
-    // (bit 19), set the low-16 status flags, and PRESERVE the real IF (bit 9)
-    // and the upper EFLAGS (VM/VIP). The next ring-3 exit forces real IF=1.
+    // (bit 19) and set the low-16 status flags; the upper EFLAGS (VM/VIP/VIF
+    // handled below) are preserved. Canonical bit 9 is PINNED TO 1 — the host
+    // always runs the guest interruptible, the guest's IF is VIF — so a
+    // canonical flags word is well-formed wherever it lands in a frame,
+    // and bit 9 never carries guest state.
     let want_vif = flags & IF_FLAG != 0;
-    let real_if = regs.frame.rflags & (IF_FLAG as u64);
     regs.frame.rflags = (regs.frame.rflags & !0xFFFF)
         | ((flags as u64 & 0xFFFF) & !(IF_FLAG as u64))
-        | real_if;
+        | IF_FLAG as u64;
     if want_vif { regs.frame.rflags |= VIF_FLAG as u64; }
     else        { regs.frame.rflags &= !(VIF_FLAG as u64); }
+}
+
+/// Inverse of `guest_flags` for full-width (PM) images: apply a guest-view
+/// flags image — the guest's IF intent in the bit-9 slot — to the canonical
+/// state. VIF (bit 19) is set from the image's bit-9 slot; VM stays
+/// kernel-owned (never image-owned). Canonical bit 9 is PINNED TO 1 (see
+/// `set_vm86_flags`) — never read, never guest-controlled.
+#[inline]
+pub fn apply_guest_flags(regs: &mut Vcpu, image: u32) {
+    let want_vif = image & IF_FLAG != 0;
+    let vm = regs.flags32() & VM_FLAG;
+    let mut nf = (image & !(IF_FLAG | VIF_FLAG | VM_FLAG)) | vm | IF_FLAG;
+    if want_vif { nf |= VIF_FLAG; }
+    regs.set_flags32(nf);
+}
+
+/// Canonical EFLAGS for entering a kernel-orchestrated VM86 excursion:
+/// VM set, the guest's virtual IF on, canonical IF pinned to 1, and the
+/// current virtual IOPL riding along. The single construction point for
+/// from-scratch VM86 entry flags (DPMI RM calls / callbacks).
+#[inline]
+pub fn vm86_entry_flags(current: u32) -> u32 {
+    VM_FLAG | VIF_FLAG | IF_FLAG | (current & IOPL_MASK)
+}
+
+/// Guest-view flags image with the IF slot forced ON — for kernel-built
+/// frames whose eventual IRET must leave the guest interruptible (e.g. a
+/// launched RM helper that waits on a keypress IRQ).
+#[inline]
+pub fn guest_flags_if_on(regs: &Vcpu) -> u32 {
+    guest_flags(regs) | IF_FLAG
+}
+
+/// Guest-view flags image for an INT-style handler entry: the IF slot and TF
+/// (bit 8) are cleared in the image — textbook INT-n semantics, what the CPU
+/// itself would push before vectoring.
+#[inline]
+pub fn guest_flags_handler_entry(regs: &Vcpu) -> u32 {
+    guest_flags(regs) & !(IF_FLAG | (1 << 8))
 }
 
 pub(super) mod vga;
@@ -681,9 +722,10 @@ pub fn handle_out_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: 
     }
 }
 
-/// Complete an `INSB/INSW/INSD` (ES:DI ← port, advance DI). Single element —
-/// no REP handling; the CPU traps per iteration when REP is in effect.
-pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
+/// Complete one `INSB/INSW/INSD` element (ES:DI ← port, advance DI). On `rep`
+/// the monitor re-faults per iteration (leaving IP on the instruction), so this
+/// does a single element and decrements the count — `dec_rep_count` — each time.
+pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let es_base = seg_base_for(machine, regs, regs.es as u16);
     let di = regs.rdi as u32;
@@ -694,10 +736,12 @@ pub fn handle_ins_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: 
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
     regs.rdi = regs.rdi.wrapping_add(delta);
+    if rep { dec_rep_count(regs, addr32); }
 }
 
-/// Complete an `OUTSB/OUTSW/OUTSD` (port ← DS:SI, advance SI). Single element.
-pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32) {
+/// Complete one `OUTSB/OUTSW/OUTSD` element (port ← DS:SI, advance SI). Same
+/// per-iteration `rep` contract as `handle_ins_event`.
+pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut Vcpu, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let ds_base = seg_base_for(machine, regs, regs.ds as u16);
     let si = regs.rsi as u32;
@@ -708,6 +752,20 @@ pub fn handle_outs_event(machine: &mut crate::TheArch, pc: &mut PcMachine, regs:
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
     regs.rsi = regs.rsi.wrapping_add(delta);
+    if rep { dec_rep_count(regs, addr32); }
+}
+
+/// Decrement the `rep` counter after one string-I/O element. The monitor only
+/// emits an event when the count was non-zero, so this never underflows: it
+/// steps (E)CX toward the 0 that makes the monitor skip the instruction and
+/// resume. `addr32` picks ECX vs the 16-bit CX (upper bits preserved).
+fn dec_rep_count(regs: &mut Vcpu, addr32: bool) {
+    if addr32 {
+        regs.rcx = regs.rcx.wrapping_sub(1);
+    } else {
+        let cx = (regs.rcx as u16).wrapping_sub(1);
+        regs.rcx = (regs.rcx & !0xFFFF) | cx as u64;
+    }
 }
 
 // ============================================================================

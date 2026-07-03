@@ -595,14 +595,16 @@ pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::arch::Vcpu) {
 pub(crate) fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thread::DosState>) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
-        let vif = regs.flags32() & (1 << 9) != 0;
+        // The guest's interrupt flag is VIF (bit 19); canonical bit 9 is
+        // pinned to 1 and carries nothing.
+        let vif = regs.flags32() & (1 << 19) != 0;
         let lin = (regs.cs32() << 4) + regs.ip32();
         // Guest reads via arch::mem() (identity on metal, mmap offset on the
         // interpreter) — raw `lin as *const u8` would fault on the interp.
         let mut b = [0u8; 8];
         regs.copy_from(lin as usize, &mut b);
         let ticks = regs.read::<u32>(0x46C);
-        crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} IF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             regs.code_seg(), regs.ip32(),
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
             regs.ds as u16, regs.stack_seg(), regs.sp32(),
@@ -652,8 +654,8 @@ pub(crate) fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thr
         }
     } else {
         let fl = regs.flags32();
-        crate::dbg_println!("[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} IF={}",
-            regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), fl, (fl >> 9) & 1);
+        crate::dbg_println!("[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} VIF={}",
+            regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), fl, (fl >> 19) & 1);
         crate::dbg_println!("[DBG] AX={:08x} BX={:08x} CX={:08x} DX={:08x} SI={:08x} DI={:08x} BP={:08x}",
             regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
             regs.rsi as u32, regs.rdi as u32, regs.rbp as u32);

@@ -237,6 +237,28 @@ fn advance_ip(regs: &mut Regs, cs_32: bool, n: u32) {
     if cs_32 { regs.set_ip32(new_ip); } else { regs.set_ip32(new_ip & 0xFFFF); }
 }
 
+/// Finish decoding a string-I/O instruction (`INS`/`OUTS`). A non-`rep` op is a
+/// single element: advance past the instruction and bubble the event so the
+/// kernel does the port access. A `rep` op re-faults once per element — leave IP
+/// on the instruction so it re-executes after the kernel does one element and
+/// decrements the count; this also lets a pending IRQ be delivered between
+/// iterations, exactly as hardware's interruptible REP does. When the count is
+/// already 0 there is nothing to do: skip the instruction and resume.
+fn string_io(regs: &mut Regs, cs_32: bool, advance: u32, rep: bool, addr32: bool, ev: KernelEvent) -> MonitorResult {
+    if rep {
+        let count = if addr32 { regs.rcx } else { regs.rcx & 0xFFFF };
+        if count == 0 {
+            advance_ip(regs, cs_32, advance);
+            return MonitorResult::Resume;
+        }
+        // Leave IP on the instruction: it re-faults for the next element.
+        MonitorResult::Event(ev)
+    } else {
+        advance_ip(regs, cs_32, advance);
+        MonitorResult::Event(ev)
+    }
+}
+
 // =============================================================================
 // Monitor entry
 // =============================================================================
@@ -254,15 +276,25 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
     // so the stack helpers below can also take `&mut V`.
     macro_rules! peek { ($off:expr) => { v.read8(cs_base.wrapping_add(start_ip.wrapping_add($off))) }; }
 
-    // Parse legacy prefixes we care about. Today: 0x66 (operand-size override).
+    // Parse the legacy prefixes we care about: 0x66 (operand-size), 0x67
+    // (address-size), and 0xF2/0xF3 (REP — only meaningful on the string I/O
+    // ops below; ignored elsewhere). Segment-override prefixes aren't consumed:
+    // no sensitive opcode we decode takes one.
     let mut advance = 0u32;
     let mut op_size_override = false;
-    while peek!(advance) == 0x66 {
-        op_size_override = true;
-        advance += 1;
+    let mut addr_size_override = false;
+    let mut rep = false;
+    loop {
+        match peek!(advance) {
+            0x66 => { op_size_override = true; advance += 1; }
+            0x67 => { addr_size_override = true; advance += 1; }
+            0xF2 | 0xF3 => { rep = true; advance += 1; }
+            _ => break,
+        }
     }
 
     let op32 = cs_32 ^ op_size_override;
+    let addr32 = cs_32 ^ addr_size_override;
     let opcode = peek!(advance);
     advance += 1;
 
@@ -428,26 +460,18 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
         // ----- String I/O (kernel reads DX / ES:DI / DS:SI directly from regs) -----
 
         // INSB
-        0x6C => {
-            advance_ip(regs, cs_32, advance);
-            Event(E::Ins { size: IoSize::Byte })
-        }
+        0x6C => string_io(regs, cs_32, advance, rep, addr32, E::Ins { size: IoSize::Byte, rep, addr32 }),
         // INSW / INSD
         0x6D => {
-            advance_ip(regs, cs_32, advance);
             let size = if op32 { IoSize::Dword } else { IoSize::Word };
-            Event(E::Ins { size })
+            string_io(regs, cs_32, advance, rep, addr32, E::Ins { size, rep, addr32 })
         }
         // OUTSB
-        0x6E => {
-            advance_ip(regs, cs_32, advance);
-            Event(E::Outs { size: IoSize::Byte })
-        }
+        0x6E => string_io(regs, cs_32, advance, rep, addr32, E::Outs { size: IoSize::Byte, rep, addr32 }),
         // OUTSW / OUTSD
         0x6F => {
-            advance_ip(regs, cs_32, advance);
             let size = if op32 { IoSize::Dword } else { IoSize::Word };
-            Event(E::Outs { size })
+            string_io(regs, cs_32, advance, rep, addr32, E::Outs { size, rep, addr32 })
         }
 
         // ----- Anything else — real #GP, leave IP pointing at the opcode -----

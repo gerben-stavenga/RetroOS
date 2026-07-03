@@ -414,6 +414,20 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     let raw_int_num = if raw_int_num == 256 { 256 } else { raw_int_num & 0xFF };
 
     if !vm86 && (raw_cs & 3) == 0 {  // from ring 0?
+        // An unhandled ring-0 exception is headed for the panic in
+        // handle_ring0. The most common cause is the exit path's `iret` /
+        // segment pops rejecting a garbage guest frame (#GP at
+        // exit_interrupt_32), and that doomed frame still sits just above
+        // this trap's CPU-pushed portion — a same-ring trap pushes no
+        // SS/ESP, so Raw32's esp/ss slots and the bytes beyond line up
+        // with it. Dump the words so the panic names the bad frame.
+        if !from_64 && !(raw_int_num == 14 || (32..=47).contains(&raw_int_num)) {
+            let p = unsafe { core::ptr::addr_of!((*stack).raw32.0.esp) };
+            lib::println!("ring0 fault: words above the trap frame (iret-target frame):");
+            for i in 0..10 {
+                lib::println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
+            }
+        }
         handle_ring0(raw_int_num, raw_err_code, raw_cs, raw_eip);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss
         return from_64;
     }

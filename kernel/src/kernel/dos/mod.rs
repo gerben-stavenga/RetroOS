@@ -93,6 +93,7 @@ use dos::{
     SLOT_PMDOS_INT21, SLOT_PMDOS_INT33, SLOT_MOUSE_CB_RET,
     slot_offset, ctrl_slot_off,
     host_stack_base, host_stack_size, host_stack_empty_sp,
+    EXC_STACK_TOP, EXC_STACK_SLOT,
     rm_stack_base, rm_stack_size, rm_stack_seg, rm_stack_align_offset,
 };
 
@@ -526,12 +527,12 @@ pub fn handle_event(
             machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
             thread::KernelAction::Done
         }
-        KE::Ins { size } => {
-            machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes());
+        KE::Ins { size, rep, addr32 } => {
+            machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
             thread::KernelAction::Done
         }
-        KE::Outs { size } => {
-            machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes());
+        KE::Outs { size, rep, addr32 } => {
+            machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
@@ -808,7 +809,7 @@ pub(crate) fn handle_synth_child(
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
 fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
-    use machine::{VM_FLAG, VIF_FLAG, IOPL_DEFAULT};
+    use machine::IOPL_DEFAULT;
     let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
     state.ds = psp_seg as u64;
@@ -818,9 +819,10 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
     state.frame = crate::Frame64 {
         rip: ip as u64,
         cs: cs as u64,
-        // Seed the virtual IOPL=3 (compat/step) here at process start; the real
-        // run IOPL is pinned to 1 at the arch exit. <3 would be spec-strict.
-        rflags: (VM_FLAG | VIF_FLAG | IOPL_DEFAULT) as u64,
+        // Seed the virtual IOPL here at process start; the real run IOPL is
+        // pinned to 1 at the arch exit. VM + virtual-IF on + canonical IF
+        // pinned to 1, all via the single construction helper.
+        rflags: machine::vm86_entry_flags(IOPL_DEFAULT) as u64,
         rsp: sp as u64,
         ss: ss as u64,
     };
@@ -1014,6 +1016,41 @@ pub fn audio_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) {
+    // Never inject while the guest sits on the resume-continuation park —
+    // the one-instruction window where a handler's IRET has landed on the
+    // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI
+    // host runs its unwind machinery with interrupts disabled, so an IRQ can
+    // never land there; our park is guest-visible code, so without this
+    // guard a timer tick delivered exactly there re-nests a fresh excursion
+    // at every unwind step. Where ticks outpace the unwind (the interpreted
+    // backend), the depth only ever grows — Duke3D's demo loop died with
+    // DOS/4GW error 2002 "transfer stack overflow on interrupt 08h at
+    // 3F:0504" (= SPECIAL_STUB_SEL:SLOT_RESUME_CONTINUATION) exactly this
+    // way. Only this slot is deferred: every other stub trap is a legitimate
+    // delivery point, and deferring them all starves delivery outright on
+    // the interp (post-execute boundaries during INT-21h-heavy phases are
+    // always at some stub). The vPIC keeps the line latched; delivery
+    // happens at the next boundary, once the unwind has resumed real code.
+    let resume_park_ip = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION) as u32;
+    let at_resume_park = if regs.mode() == crate::UserMode::VM86 {
+        regs.code_seg() == dos::CTRL_STUB_SEG && regs.ip32() == resume_park_ip
+    } else {
+        regs.code_seg() == mode_transitions::SPECIAL_STUB_SEL
+            && regs.ip32() == resume_park_ip
+    };
+    if at_resume_park {
+        // Drop the INTR line for this instant instead of leaving it asserted:
+        // the interp stops at a block boundary BEFORE the park's CD 31
+        // executes whenever the line is up and the guest is interruptible, so
+        // deferral + an asserted line re-stops at the same PC with zero
+        // progress, forever (Jazz Jackrabbit hung this way the moment a
+        // keystroke landed mid-chain: guest parked at 0000:0504, keyboard IRQ
+        // pending, block hook re-firing). The vpic still latches the request;
+        // the CD 31 traps within one instruction and the next raise_pending —
+        // guest no longer at the park — re-asserts the line and delivers.
+        machine.set_irq_line(false);
+        return;
+    }
     // Mouse-callback dispatch (INT 33h AX=000Ch / Function 12), not a
     // hardware IRQ12/INT 74h delivery. Microsoft documents Function 12 as a
     // FAR subroutine callback and says the mouse driver protects it from

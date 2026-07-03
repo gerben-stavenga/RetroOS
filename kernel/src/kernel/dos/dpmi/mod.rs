@@ -843,6 +843,7 @@ pub(super) fn dpmi_api(_machine: &mut crate::TheArch, dos: &mut thread::DosState
             regs.frame.rflags &= !(machine::VIF_FLAG as u64);
             regs.rax = (regs.rax & !0xFF) | prev;
             clear_carry(regs);
+            super::mode_transitions::if_record(7, regs, prev != 0, false, None);
         }
         // AX=0901h — Get and Enable Virtual Interrupt State
         0x0901 => {
@@ -850,6 +851,7 @@ pub(super) fn dpmi_api(_machine: &mut crate::TheArch, dos: &mut thread::DosState
             regs.frame.rflags |= machine::VIF_FLAG as u64;
             regs.rax = (regs.rax & !0xFF) | prev;
             clear_carry(regs);
+            super::mode_transitions::if_record(8, regs, prev != 0, true, None);
         }
         // AX=0902h — Get Virtual Interrupt State
         0x0902 => {

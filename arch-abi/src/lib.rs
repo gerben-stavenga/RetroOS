@@ -480,10 +480,14 @@ pub enum KernelEvent {
     In { port: u16, size: IoSize },
     /// Port `OUT` (port ← AL/AX/EAX).
     Out { port: u16, size: IoSize },
-    /// String `INS` (ES:DI ← port, advance DI by size). Single element — no REP.
-    Ins { size: IoSize },
-    /// String `OUTS` (port ← DS:SI, advance SI by size). Single element.
-    Outs { size: IoSize },
+    /// String `INS` (ES:DI ← port, advance DI by size). One element per event;
+    /// on `rep` the monitor re-faults per iteration (see `monitor`), so the
+    /// kernel does a single element and decrements the count. `addr32` selects
+    /// (E)CX / (E)DI width for the count and index register.
+    Ins { size: IoSize, rep: bool, addr32: bool },
+    /// String `OUTS` (port ← DS:SI, advance SI by size). One element per event;
+    /// same `rep`/`addr32` semantics as `Ins`.
+    Outs { size: IoSize, rep: bool, addr32: bool },
     /// Non-sensitive #GP or unknown opcode — reflect as fault.
     Fault,
 }
@@ -519,8 +523,8 @@ impl KernelEvent {
             KernelEvent::Hlt                  => (Self::HLT, 0),
             KernelEvent::In  { port, size }   => (Self::IN,  (port as u32) | ((size as u32) << 16)),
             KernelEvent::Out { port, size }   => (Self::OUT, (port as u32) | ((size as u32) << 16)),
-            KernelEvent::Ins  { size }        => (Self::INS,  size as u32),
-            KernelEvent::Outs { size }        => (Self::OUTS, size as u32),
+            KernelEvent::Ins  { size, rep, addr32 } => (Self::INS,  (size as u32) | ((rep as u32) << 8) | ((addr32 as u32) << 9)),
+            KernelEvent::Outs { size, rep, addr32 } => (Self::OUTS, (size as u32) | ((rep as u32) << 8) | ((addr32 as u32) << 9)),
             KernelEvent::Fault                => (Self::FAULT, 0),
         }
     }
@@ -536,8 +540,8 @@ impl KernelEvent {
             Self::HLT        => KernelEvent::Hlt,
             Self::IN         => KernelEvent::In  { port: extra as u16, size: IoSize::from_u32(extra >> 16) },
             Self::OUT        => KernelEvent::Out { port: extra as u16, size: IoSize::from_u32(extra >> 16) },
-            Self::INS        => KernelEvent::Ins  { size: IoSize::from_u32(extra) },
-            Self::OUTS       => KernelEvent::Outs { size: IoSize::from_u32(extra) },
+            Self::INS        => KernelEvent::Ins  { size: IoSize::from_u32(extra), rep: extra & (1 << 8) != 0, addr32: extra & (1 << 9) != 0 },
+            Self::OUTS       => KernelEvent::Outs { size: IoSize::from_u32(extra), rep: extra & (1 << 8) != 0, addr32: extra & (1 << 9) != 0 },
             Self::FAULT      => KernelEvent::Fault,
             _ => panic!("KernelEvent::decode: unknown tag {:#x}", event),
         }

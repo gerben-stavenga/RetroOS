@@ -53,6 +53,7 @@ fn mode13h_maps_each_index_through_the_palette() {
         palette: &pal,
         font: &[],
         blink: false,
+        cga_palette: [0; 4],
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
@@ -81,6 +82,7 @@ fn mode13h_tolerates_short_vram() {
         palette: &pal,
         font: &[],
         blink: false,
+        cga_palette: [0; 4],
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
@@ -94,16 +96,22 @@ fn mode13h_tolerates_short_vram() {
 
 #[test]
 fn text_renders_glyph_pixels_with_fg_bg() {
-    // One glyph (index 1) that is all-bits-set on every scanline → a solid
-    // foreground block; cell attribute fg=15 (white) on bg=1 (blue).
+    // Two solid (all-bits-set) glyphs: char 1 (a normal glyph) and char 0xC4 (a
+    // line-draw glyph in the 0xC0..=0xDF block). Cell attribute fg=15 (white) on
+    // bg=1 (blue).
     let mut font = vec![0u8; 256 * 16];
     for b in &mut font[16..16 + 16] {
         *b = 0xFF;
     }
-    // 80×25 cells; put char 1 / attr 0x1F at cell (0,0), leave the rest blank.
+    for b in &mut font[0xC4 * 16..0xC4 * 16 + 16] {
+        *b = 0xFF;
+    }
+    // 80×25 cells: char 1 at (0,0), a blank at (1,0), char 0xC4 at (2,0).
     let mut vram = vec![0u8; 80 * 25 * 2];
     vram[0] = 1;
     vram[1] = 0x1F;
+    vram[4] = 0xC4;
+    vram[5] = 0x1F;
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
@@ -114,6 +122,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
         palette: &pal,
         font: &font,
         blink: false,
+        cga_palette: [0; 4],
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
@@ -123,16 +132,22 @@ fn text_renders_glyph_pixels_with_fg_bg() {
     assert_eq!((w, h), (720, 400));
     let fg = pal_rgb(&pal, 15);
     let bg = pal_rgb(&pal, 1);
-    // Glyph is solid: every pixel of the 9×16 top-left cell is foreground.
+    // Char 1 (not a line-draw code): columns 0..8 are foreground, and the 9th
+    // column (x=8) is BLANK background — inter-character spacing, not a replica
+    // of column 8.
     for y in 0..16usize {
-        for x in 0..9usize {
+        for x in 0..8usize {
             assert_eq!(out[y * w + x], fg, "cell0 px ({x},{y})");
         }
+        assert_eq!(out[y * w + 8], bg, "cell0 9th-dot must be spacing ({y})");
     }
-    let _ = bg;
+    // Char 0xC4 (line-draw block): the 9th column (x = 2*9 + 8 = 26) DOES repeat
+    // column 8, so horizontal box rules join across cells.
+    for y in 0..16usize {
+        assert_eq!(out[y * w + 26], fg, "cell2 9th-dot must replicate ({y})");
+    }
     // A blank cell (char 0, attr 0) renders all-background = palette index 0.
-    let c1 = 9; // cell (1,0) starts at x=9
-    assert_eq!(out[c1], pal_rgb(&pal, 0));
+    assert_eq!(out[9], pal_rgb(&pal, 0)); // cell (1,0) starts at x=9
 }
 
 #[test]

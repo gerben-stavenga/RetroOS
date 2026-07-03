@@ -96,6 +96,20 @@ pub struct DpmiState {
     /// PM→RM has run since the last RM→PM). Non-zero implies PSP[0x2C] of
     /// `saved_rm_psp` is currently patched with `idx_to_sel(env_ldt_idx)`.
     pub(in crate::kernel::dos) env_ldt_idx: usize,
+    /// Where each in-flight exception dispatch pushed its HostContinuation:
+    /// the pm-side (SS, SP) returned by `push_continuation_and_switch_to_pm_side`,
+    /// with the spec exception frames written directly below it. LIFO —
+    /// `dispatch_dpmi_exception` pushes, `exception_return` pops on the
+    /// handler's RETF into the return stub. Recording the real cursor is
+    /// what makes NESTED faults unwind correctly: a fault taken while a
+    /// continuation chain is in flight (e.g. inside a kernel-delivered IRQ
+    /// handler) pushes mid-stack — often on the client's own stack — where
+    /// the old "empty host-stack top" assumption reads unrelated bytes.
+    /// (A handler that abandons its frame instead of RETFing leaks one
+    /// entry; the continuation chain itself has the same LIFO contract.)
+    pub(super) exc_frames: [(u16, u32); MAX_EXC_NEST],
+    /// Number of live entries in `exc_frames`.
+    pub(super) exc_depth: usize,
     /// PSP segment → PM selector cache. HDPMI-style append-only mapping:
     /// each unique RM PSP segment queried from PM gets one stable LDT slot
     /// (descriptor base = segment*16, limit = 0xFF). AH=51/62 from PM
@@ -106,6 +120,11 @@ pub struct DpmiState {
     /// CWSDPMI-shape value for clients that probe.
     pub(super) psp_cache: [PspCacheEntry; MAX_PSP_CACHE],
 }
+
+/// Maximum tracked in-flight (dispatched, not yet returned) DPMI exceptions.
+/// Real nesting is a fault inside an exception handler — depth 2–3 at the
+/// extreme; 8 is comfortably beyond anything a client survives.
+pub(super) const MAX_EXC_NEST: usize = 8;
 
 /// Maximum simultaneous tracked PSPs in the per-client PSP selector cache.
 /// HDPMI uses an unbounded linked list; 16 is plenty for the depths we see
@@ -142,6 +161,8 @@ impl DpmiState {
             saved_rm_psp: 0,
             saved_rm_env: 0,
             env_ldt_idx: 0,
+            exc_frames: [(0, 0); MAX_EXC_NEST],
+            exc_depth: 0,
             psp_cache: [PspCacheEntry::default(); MAX_PSP_CACHE],
         }
     }
