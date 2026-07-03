@@ -228,7 +228,11 @@ fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]
 fn run_program(machine: &mut crate::TheArch, threads: &mut [thread::Thread], path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
     use crate::kernel::{dos, exec};
 
+    // A cmdline path is user-facing: accept both a full VFS path and a DOS
+    // C:-relative one (the common `--cmd GAMES/...` form — C: = c_root, same
+    // resolution the DOS personality applies to the program's own file I/O).
     let buf = exec::load_file_resolved(path)
+        .or_else(|_| exec::load_file_resolved(&[crate::kernel::dos::c_root(), path].concat()))
         .unwrap_or_else(|_| panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
     let args = alloc::vec![path.to_vec()];
     let cmdline_tail = cmdline_tail.to_vec();
