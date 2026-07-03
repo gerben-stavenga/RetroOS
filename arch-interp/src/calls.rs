@@ -48,7 +48,14 @@ pub fn do_arch_execute() -> KernelEvent {
 /// Switch threads: swap live state (`REGS`) with the pointed-to state, and make
 /// the incoming address space active. On entry `vcpu` holds the incoming state;
 /// on exit it holds the saved outgoing state (matching the metal contract).
-pub fn arch_switch_to(vcpu: &mut Vcpu, _hash_ptr: *mut u64, _fx_ptr: *mut FxState) {
+pub fn arch_switch_to(vcpu: &mut Vcpu, _hash_ptr: *mut u64, fx_ptr: *mut FxState) {
+    // Swap x87/SSE state with the thread's save area (metal's semantics:
+    // null fx_ptr = kernel-only transient swap, skip). KVM engine: the live
+    // state is the vcpu's XSAVE; TCG engine: no-op (state lives inside the
+    // software core — pre-existing status).
+    if !fx_ptr.is_null() {
+        crate::engine::fx_switch(unsafe { &mut *fx_ptr });
+    }
     let p = &raw mut crate::vcpu::REGS;
     let live = unsafe { &mut *p };
     core::mem::swap(&mut live.regs, &mut vcpu.regs);
@@ -57,7 +64,6 @@ pub fn arch_switch_to(vcpu: &mut Vcpu, _hash_ptr: *mut u64, _fx_ptr: *mut FxStat
     // drop the outgoing space's lazy Unicorn mappings.
     crate::engine::flush();
     crate::mmu::switch_to(live.space.0);
-    // FPU state is the software core's; cross-switch FPU preservation is M4.
 }
 
 /// Fork the current address space into `child_root`. M4 will make this COW;

@@ -141,4 +141,87 @@ fn kvm_engine_proofs() {
         0x1111_1111,
         "parent's page untouched by the child's COW write"
     );
+
+    // ── IOPB fast path: an allowed port exits as a direct KVM_EXIT_IO (no
+    // #GP, no shim) and must surface with the monitor's exact contract — IP
+    // advanced, OUT value in EAX, IN result taken from EAX on re-entry (the
+    // canceled KVM completion must NOT clobber it). Then the same code with
+    // the port denied again goes through the shim + monitor and must behave
+    // identically — the two paths are meant to be observationally equal.
+    // 0xB0 0x5A   mov al, 0x5A
+    // 0xE6 0xE0   out 0xE0, al
+    // 0xE4 0xE0   in  al, 0xE0
+    // 0xCD 0x80   int 0x80
+    let io_prog: &[u8] = &[0xB0, 0x5A, 0xE6, 0xE0, 0xE4, 0xE0, 0xCD, 0x80];
+    for (label, allowed) in [("fast path", true), ("shim path", false)] {
+        reset_io_bitmap();
+        if allowed {
+            allow_io_ports(0xE0, 1);
+        }
+        mem.copy_to(code as usize, io_prog);
+        let mut r = Regs::empty();
+        r.init_user_process(code, stack);
+        set_regs(r);
+        match run_to_event() {
+            KernelEvent::Out { port: 0xE0, size: arch_abi::IoSize::Byte } => {}
+            ev => panic!("{label}: expected Out(0xE0), got {ev:?}"),
+        }
+        let r = regs();
+        assert_eq!(r.rax as u8, 0x5A, "{label}: OUT value in AL");
+        assert_eq!(r.ip32(), code + 4, "{label}: IP advanced past the OUT");
+        match run_to_event() {
+            KernelEvent::In { port: 0xE0, size: arch_abi::IoSize::Byte } => {}
+            ev => panic!("{label}: expected In(0xE0), got {ev:?}"),
+        }
+        assert_eq!(regs().ip32(), code + 6, "{label}: IP advanced past the IN");
+        // The kernel's device answer.
+        unsafe { (*(&raw mut crate::vcpu::REGS)).regs.rax = 0xA5 };
+        match run_to_event() {
+            KernelEvent::SoftInt(0x80) => {}
+            ev => panic!("{label}: expected SoftInt(0x80), got {ev:?}"),
+        }
+        assert_eq!(regs().rax as u8, 0xA5, "{label}: IN result in AL survived re-entry");
+    }
+    reset_io_bitmap();
+
+    // ── FPU switch: fx_switch swaps the vcpu's live x87/SSE state with a
+    // thread save area (metal's arch_switch_to semantics). Thread A parks a
+    // marker in XMM0; a switch to a clean thread B clobbers XMM0; switching
+    // back must restore A's marker — through the XSAVE round-trip.
+    // A: mov eax, 0x11223344; movd xmm0, eax; int 0x80
+    mem.copy_to(code as usize, &[0xB8, 0x44, 0x33, 0x22, 0x11, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
+    let mut r = Regs::empty();
+    r.init_user_process(code, stack);
+    set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    let mut slot = crate::machine::clean_fx_template();
+    fx_switch(&mut slot); // A out (slot = A's state), clean B in
+    assert_eq!(
+        u32::from_le_bytes(slot.0[160..164].try_into().unwrap()),
+        0x1122_3344,
+        "outgoing thread's XMM0 captured into its save area"
+    );
+    // B: mov eax, 0xDEADBEEF; movd xmm0, eax; int 0x80
+    mem.copy_to(code as usize, &[0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
+    let mut r = Regs::empty();
+    r.init_user_process(code, stack);
+    set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    fx_switch(&mut slot); // B out, A back in
+    assert_eq!(
+        u32::from_le_bytes(slot.0[160..164].try_into().unwrap()),
+        0xDEAD_BEEF,
+        "thread B's XMM0 captured on the way out"
+    );
+    // A resumes: movd eax, xmm0; int 0x80 — the marker must have survived B.
+    mem.copy_to(code as usize, &[0x66, 0x0F, 0x7E, 0xC0, 0xCD, 0x80]);
+    let mut r = Regs::empty();
+    r.init_user_process(code, stack);
+    set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    assert_eq!(
+        regs().rax as u32,
+        0x1122_3344,
+        "thread A's XMM0 restored across the switch"
+    );
 }

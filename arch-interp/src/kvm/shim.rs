@@ -136,7 +136,7 @@ pub(crate) fn write_shim() {
     // TSS: only ss0/esp0 (the CPL3→CPL0 stack switch) and the IOPB matter.
     // iopb_offset = 0x88; bitmap all-1s = every port denied → IN/OUT at
     // CPL3/IOPL1 #GPs into the shared monitor, identical to the TCG engine and
-    // the metal default. (M4's fast path clears bits here per `allow_io_ports`.)
+    // the metal default. `allow_io_ports` clears bits per kernel policy.
     let tss = sys_ptr(TSS_ADDR);
     unsafe {
         core::ptr::write_bytes(tss, 0, 0x1000);
@@ -147,8 +147,53 @@ pub(crate) fn write_shim() {
         w32(0x08, KERNEL_DS as u32); // ss0
         // iopb_offset (u16 at 0x66); redirection bitmap unused (CR4.VME=0).
         core::ptr::copy_nonoverlapping(0x88u16.to_le_bytes().as_ptr(), tss.add(0x66), 2);
-        // IOPB covering ports 0..0x3DF (metal's window) + the 0xFF terminator,
-        // all-deny. Ports past the bitmap are denied by the TSS limit.
-        core::ptr::write_bytes(tss.add(0x88), 0xFF, 0x7D);
+        // All-deny IOPB filling the REST OF THE PAGE, not just the policy
+        // window: a zero byte inside the TSS limit reads as "allowed", so any
+        // unwritten byte between the bitmap and the limit would silently open
+        // the ports it covers (0x3E8.. would have been allowed by the zeroed
+        // page tail).
+        core::ptr::write_bytes(tss.add(0x88), 0xFF, 0x1000 - 0x88);
+    }
+}
+
+/// The IOPB policy window: ports 0..0x3E0, matching metal
+/// (`arch-metal/src/descriptors.rs` — every port the kernel's io_policy ever
+/// grants lives below 0x3E0). Everything above stays permanently denied.
+const IOPB_PORTS: u16 = 0x3E0;
+
+/// One-time shim init shared by setup and the IOPB hooks: `allow_io_ports`
+/// can be called by the kernel's per-swap-in policy BEFORE the first
+/// `execute()` builds the vcpu, and `write_shim`'s all-deny fill must not
+/// clobber grants made through that path.
+pub(super) fn ensure_shim() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        crate::sysdesc::ensure_sys_window();
+        write_shim();
+    });
+}
+
+/// Clear a port range's deny bits (kernel policy grant). SHIM_PORT stays
+/// denied unconditionally — a CPL3 `out 0xF4` must #GP into the real shim,
+/// never fabricate a shim exit.
+pub(super) fn iopb_allow(port: u16, count: usize) {
+    ensure_shim();
+    let end = port.saturating_add(count as u16).min(IOPB_PORTS);
+    for p in port..end {
+        if p == SHIM_PORT {
+            continue;
+        }
+        unsafe {
+            let byte = sys_ptr(TSS_ADDR + 0x88 + (p / 8) as u64);
+            *byte &= !(1 << (p % 8));
+        }
+    }
+}
+
+/// Back to all-deny (per swap-in, like metal's io_policy baseline).
+pub(super) fn iopb_reset() {
+    ensure_shim();
+    unsafe {
+        core::ptr::write_bytes(sys_ptr(TSS_ADDR + 0x88), 0xFF, (IOPB_PORTS / 8) as usize);
     }
 }

@@ -34,3 +34,25 @@ rust_binary(
         "@crates//:sdl2",
     ],
 )
+
+# The windowed tool on the KVM engine (`./run.sh hosted --kvm`, no --terminal):
+# same sources, the *-kvm library pair underneath — and no Unicorn C core (the
+# patched-fork landmine above doesn't apply to this binary at all).
+rust_binary(
+    name = "retroos-play-kvm",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "retroos_play",
+    edition = "2021",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//arch-interp:arch-interp-kvm",
+        "//kernel:bootfs_host",
+        "//kernel:kernel_hosted_kvm",
+        "//lib",
+        "@crates//:sdl2",
+    ],
+)

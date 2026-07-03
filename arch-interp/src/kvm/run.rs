@@ -303,6 +303,39 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
     }
 }
 
+/// Length of the IN/OUT instruction at the interrupted IP (a direct
+/// `KVM_EXIT_IO` exits before it retires, so the bytes at CS:IP are the I/O
+/// instruction itself). Only the non-string forms are supported: the kernel's
+/// io_policy grants scalar register windows, and string I/O on an allowed
+/// port would need KVM's deferred emulator completion (SI/DI/CX bookkeeping)
+/// that our fresh-entry model deliberately cancels — panic loudly rather
+/// than corrupt the guest.
+fn io_insn_len(regs: &Regs, view: &mut InterpView, port: u16) -> u32 {
+    use arch_abi::monitor::GuestView;
+    let base = if regs.mode() == UserMode::VM86 {
+        (regs.code_seg() as u32) << 4
+    } else {
+        crate::desc::seg_base(regs.code_seg())
+    };
+    let mut len: u32 = 0;
+    loop {
+        let b = view.read8(base.wrapping_add(regs.ip32()).wrapping_add(len));
+        match b {
+            // Legacy prefixes (operand/address size, rep, lock, seg overrides).
+            0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => len += 1,
+            0xE4 | 0xE5 | 0xE6 | 0xE7 => return len + 2, // in/out acc, imm8
+            0xEC | 0xED | 0xEE | 0xEF => return len + 1, // in/out acc, dx
+            0x6C..=0x6F => panic!(
+                "string I/O on IOPB-allowed port {port:#x} — unsupported; keep the port trapped"
+            ),
+            _ => panic!(
+                "KVM_EXIT_IO on port {port:#x} but no I/O opcode at CS:IP ({b:#04x} at +{len})"
+            ),
+        }
+        assert!(len < 8, "runaway prefix decode at CS:IP");
+    }
+}
+
 /// Whether the vcpu is currently executing the trap shim (CPL0). Only the
 /// shim ever runs with the flat ring-0 CS.
 fn in_shim(k: &KvmCpu) -> bool {
@@ -374,6 +407,7 @@ pub fn execute() -> KernelEvent {
         enum Kind {
             Intr,
             Shim,
+            Io { port: u16, is_in: bool, bytes: usize },
             Debug,
             BadPhys,
             Shutdown,
@@ -384,11 +418,10 @@ pub fn execute() -> KernelEvent {
                 Err(e) if e.errno() == libc::EINTR => Kind::Intr,
                 Err(e) => panic!("KVM_RUN failed: {e}"),
                 Ok(VcpuExit::IoOut(SHIM_PORT, _)) => Kind::Shim,
-                Ok(VcpuExit::IoOut(port, _)) | Ok(VcpuExit::IoIn(port, _)) => {
-                    // Unreachable while the IOPB is all-deny (guest I/O #GPs
-                    // into the monitor instead); becomes the M4 fast path.
-                    panic!("unexpected direct KVM_EXIT_IO on port {port:#x}");
-                }
+                // An IOPB-allowed port: hardware ran the access with no #GP —
+                // the fast path past the shim + monitor.
+                Ok(VcpuExit::IoOut(port, data)) => Kind::Io { port, is_in: false, bytes: data.len() },
+                Ok(VcpuExit::IoIn(port, data)) => Kind::Io { port, is_in: true, bytes: data.len() },
                 Ok(VcpuExit::Debug(_)) => Kind::Debug,
                 // A guest-physical access outside the memory slot: a page
                 // table pointing at a nonexistent frame (TCG's MEM_UNMAPPED
@@ -424,6 +457,34 @@ pub fn execute() -> KernelEvent {
                     let f = read_frame(kregs.rsp);
                     sync_out_shim(k, regs, mode, &f);
                     break dispatch_shim(k, regs, mode, &f);
+                }
+                // A direct exit happens BEFORE the instruction retires (rip
+                // advance / IN writeback are deferred to the next KVM_RUN).
+                // Complete it ourselves — advance IP past the instruction, so
+                // the event surfaces with the monitor's exact contract (IP
+                // advanced; OUT value in / IN result expected in EAX). Our
+                // rip rewrite makes KVM's own stale completion self-cancel
+                // (its linear-rip guard no longer matches), so the kernel's
+                // IN answer in EAX survives re-entry.
+                Kind::Io { port, is_in, bytes } => {
+                    sync_out(k, regs, mode);
+                    let p = &raw mut vcpu::REGS;
+                    let mut view = InterpView { space: unsafe { &mut (*p).space } };
+                    let len = io_insn_len(regs, &mut view, port);
+                    let ip = regs.ip32().wrapping_add(len);
+                    let wrap16 = mode == UserMode::VM86
+                        || !crate::desc::seg_is_32(regs.code_seg());
+                    regs.set_ip32(if wrap16 { ip & 0xFFFF } else { ip });
+                    let size = match bytes {
+                        1 => arch_abi::IoSize::Byte,
+                        2 => arch_abi::IoSize::Word,
+                        _ => arch_abi::IoSize::Dword,
+                    };
+                    break Some(if is_in {
+                        KernelEvent::In { port, size }
+                    } else {
+                        KernelEvent::Out { port, size }
+                    });
                 }
                 Kind::BadPhys | Kind::Shutdown => {
                     sync_out(k, regs, mode);

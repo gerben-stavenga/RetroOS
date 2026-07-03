@@ -1346,20 +1346,17 @@ launch_hosted() {
     fi
 
     # Window mode: retroos-play is Bazel-built like everything else, so it links the
-    # ONE patched unicorn (//third_party/unicorn). The bootfs is embedded (same as
-    # retroos-host), so this is a single host-platform build — no //:bootfs_tar step
-    # that would flip --platforms and discard Bazel's analysis cache every run.
-    if [ "$KVM" = 1 ]; then
-        echo "run.sh: hosted --kvm window mode (retroos-play-kvm) is not built yet; use --terminal" >&2
-        exit 1
-    fi
-    bazelisk build //play:retroos-play --platforms=@platforms//host
+    # ONE patched unicorn (//third_party/unicorn); the -kvm variant has no Unicorn
+    # at all. The bootfs is embedded (same as retroos-host), so this is a single
+    # host-platform build — no //:bootfs_tar step that would flip --platforms and
+    # discard Bazel's analysis cache every run.
+    bazelisk build "//play:retroos-play$ENG" --platforms=@platforms//host
     [ -n "$HOSTED_WAV" ] && ARGS+=(--wav "$HOSTED_WAV")
     if [ -n "$HOSTED_CMD" ]; then
         ARGS+=(--cwd "$(dirname "$HOSTED_CMD")/")
     fi
     [ -n "$HOSTED_TRACE" ] && export RETRO_TRACE=1
-    exec bazel-bin/play/retroos-play "${ARGS[@]}" "${PASS[@]}"
+    exec "bazel-bin/play/retroos-play$ENG" "${ARGS[@]}" "${PASS[@]}"
 }
 
 # ---------------------------------------------------------------------------

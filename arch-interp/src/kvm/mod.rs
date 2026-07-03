@@ -23,9 +23,36 @@ pub use run::execute;
 /// real state if entry ever moves to dirty-tracked SREGS reloads).
 pub fn mark_tlb_dirty() {}
 
-/// IOPB fast path (M4): allow direct `KVM_EXIT_IO` for a port range by
-/// clearing its bits in the guest TSS I/O bitmap.
-pub fn allow_io_ports(_port: u16, _count: usize) {}
+/// IOPB fast path: allow direct `KVM_EXIT_IO` for a port range by clearing
+/// its bits in the guest TSS I/O bitmap (kernel io_policy grants — real
+/// passthrough hardware only; the hosted platform's emulated VGA keeps its
+/// ports trapped through the shim + monitor).
+pub fn allow_io_ports(port: u16, count: usize) {
+    shim::iopb_allow(port, count)
+}
 
 /// Reset the guest TSS I/O bitmap to all-deny (per swap-in, like metal).
-pub fn reset_io_bitmap() {}
+pub fn reset_io_bitmap() {
+    shim::iopb_reset()
+}
+
+/// Swap the live guest FPU/SSE state with the thread save area `fx` (metal's
+/// `arch_switch_to` fx semantics: on return `fx` holds the outgoing thread's
+/// state, the vcpu holds the incoming). The vcpu's FXSAVE image is the first
+/// 512 bytes of its XSAVE area; the XSAVE header is preserved and the
+/// x87+SSE bits forced into XSTATE_BV so the restore actually loads them.
+pub fn fx_switch(fx: &mut crate::machine::FxState) {
+    setup::with(|k| {
+        let mut xsave = k.vcpu.get_xsave().expect("KVM_GET_XSAVE");
+        let outgoing = *fx;
+        // region is [u32; 1024]; bytes 0..512 = the legacy FXSAVE image,
+        // u64 at byte 512 (region[128..130]) = XSTATE_BV.
+        unsafe {
+            let bytes = xsave.region.as_mut_ptr() as *mut u8;
+            core::ptr::copy_nonoverlapping(bytes, fx.0.as_mut_ptr(), 512);
+            core::ptr::copy_nonoverlapping(outgoing.0.as_ptr(), bytes, 512);
+        }
+        xsave.region[128] |= 0x3; // XSTATE_BV: x87 | SSE
+        unsafe { k.vcpu.set_xsave(&xsave) }.expect("KVM_SET_XSAVE");
+    })
+}

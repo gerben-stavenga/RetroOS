@@ -73,9 +73,10 @@ fn init() -> KvmCpu {
     }
     vcpu.set_cpuid2(&cpuid).expect("KVM_SET_CPUID2");
 
-    // Guest-side tables: the shared SYS window plus the KVM trap shim.
-    crate::sysdesc::ensure_sys_window();
-    super::shim::write_shim();
+    // Guest-side tables: the shared SYS window plus the KVM trap shim (a
+    // Once — the kernel's io_policy may already have initialized it through
+    // `allow_io_ports` before the first execute()).
+    super::shim::ensure_shim();
 
     arm_timer_kick();
 

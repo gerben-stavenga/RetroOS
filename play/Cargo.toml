@@ -14,10 +14,18 @@ edition = "2021"
 name = "retroos-play"
 path = "src/main.rs"
 
+[features]
+# Engine selection, forwarded down the pair (see arch-interp): the Bazel
+# targets retroos-play / retroos-play-kvm are the primary build path; cargo
+# kvm builds use `--no-default-features --features kvm`.
+default = ["tcg"]
+tcg = ["retroos-arch-interp/tcg", "kernel/tcg"]
+kvm = ["retroos-arch-interp/kvm", "kernel/kvm"]
+
 [dependencies]
-kernel = { path = "../kernel" }
+kernel = { path = "../kernel", default-features = false, features = ["hosted"] }
 lib = { path = "../lib" } # default features = hosted (interp backend)
-retroos-arch-interp = { path = "../arch-interp" }
+retroos-arch-interp = { path = "../arch-interp", default-features = false }
 # `bundled` compiles SDL2 from source (like Unicorn's C core); `static-link`
 # avoids needing a system libSDL2 at runtime.
 sdl2 = { version = "0.37", default-features = false, features = ["bundled", "static-link"] }
