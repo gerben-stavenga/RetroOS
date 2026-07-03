@@ -492,26 +492,19 @@ pub fn emulate_inb(machine: &mut crate::TheArch, pc: &mut PcMachine, port: u16) 
         0x61 => pc.vkbd.read_port61(),
         // Keyboard status port (bit 0 = output buffer full).
         //
-        // Model the 8042's refill delay: the controller presents exactly one
-        // scancode per IRQ1 and only loads the next FIFO byte once the current
-        // interrupt has been serviced. So while a keyboard IRQ is in service,
-        // report only the latched byte (no FIFO refill). This makes a guest's
-        // INT 9 drain loop see a single scancode and exit — make and release
-        // arrive as separate interrupts, as on real hardware.
-        //
-        // Reproducer: Prince of Persia's INT 9 handler applies the *first*
-        // scancode of an interrupt to its movement key-table and discards the
-        // rest. With batched delivery a coalesced make+release landed in one
-        // INT 9, so it saw "left down" and threw the release away → stuck key.
-        // Poll-driven guests keep IRQ1 masked (never in service), so they
-        // still advance through the FIFO here.
+        // The serial pacing in `try_surface` (≥1 ms between bytes) keeps an
+        // INT 9 drain loop to a single scancode per interrupt: during a
+        // µs-scale handler the next byte "hasn't arrived on the wire yet".
+        // The in-service sentinel backstops that when the host deschedules
+        // us mid-handler (see queue_tick). Poll-driven guests (IRQ1 masked,
+        // never in service) advance through the FIFO here at the paced rate;
+        // a surfaced byte still raises its IRQ1 edge (harmlessly latched in
+        // the masked IRR, exactly like hardware).
         0x64 => {
-            let ready = if pc.vpic.in_service(1) {
-                pc.vkbd.has_data()
-            } else {
-                pc.vkbd.poll_data()
-            };
-            if ready { 1 } else { 0 }
+            if !pc.vpic.in_service(1) && pc.vkbd.try_surface(machine.get_ticks()) {
+                pc.vpic.raise(1);
+            }
+            if pc.vkbd.has_data() { 1 } else { 0 }
         }
         0x40 => pc.vpit.read_counter0(machine),
         0x41 | 0x42 => 0,
@@ -585,10 +578,12 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
         // Master PIC command
         0x20 => {
             if val == 0x20 {
-                // Non-specific EOI
-                // If keyboard IRQ (bit 1) was in service, and the virtual 8042
-                // still has data ready, IRQ1 should assert again after EOI.
-                let keyboard_in_service = pc.vpic.in_service(1);
+                // Non-specific EOI. No keyboard coupling here: a scancode
+                // arriving mid-handler already latched its own IRR edge when
+                // it surfaced (vkbd::try_surface), and the PIC delivers it
+                // once the EOI clears the in-service bit — plain 8259
+                // behavior, no device knowledge required.
+                //
                 // Re-arm only the passthrough host IRQ5 (the real QEMU sb16
                 // line, masked until the guest EOIs). The emulated SB has no
                 // host line — its IRQ is purely virtual — so there is nothing
@@ -597,16 +592,6 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
                 pc.vpic.master_eoi();
                 if sb_in_service && !pc.sb.is_emulated() {
                     machine.rearm_irq(5);
-                }
-                // Real hardware re-asserts IRQ1 if more scancodes remain in the
-                // controller when the handler finishes. Since reads no longer
-                // prefetch, check buffered bytes too — `latch` surfaces the
-                // next one at the following INT 9 delivery.
-                if keyboard_in_service
-                    && (pc.vkbd.has_data() || pc.vkbd.has_buffered())
-                    && !pc.vpic.is_requested(1)
-                {
-                    pc.vpic.raise(1);
                 }
             }
         }
@@ -623,13 +608,10 @@ pub fn emulate_outb(machine: &mut crate::TheArch, pc: &mut PcMachine, regs: &mut
         // Slave PIC data (write IMR)
         0xA1 => pc.vpic.set_slave_imr(val),
         // Keyboard data port — host-to-device command / parameter byte.
-        // The keyboard's response (ACK, BAT, ID, …) becomes visible at port
-        // 0x60 and asserts IRQ1, exactly as on real hardware.
-        0x60 => {
-            if pc.vkbd.write_port60(val) && !pc.vpic.is_requested(1) {
-                pc.vpic.raise(1);
-            }
-        }
+        // The keyboard's response (ACK, BAT, ID, …) queues like any device
+        // byte and surfaces on the serial pacing clock with its own IRQ1
+        // edge — real keyboards answer on the same ~1 ms wire.
+        0x60 => pc.vkbd.write_port60(val),
         // Keyboard controller / speaker port
         0x61 => pc.vkbd.write_port61(val),
         // Keyboard controller command
@@ -786,6 +768,15 @@ pub fn queue_tick(machine: &mut crate::TheArch, pc: &mut PcMachine) {
     if pc.vrtc.take_pending_irqs(machine) > 0 {
         pc.vpic.raise(8);
     }
+    // The 8042's serial clock: surface at most one queued scancode per
+    // millisecond, each with its own IRQ1 edge (see vkbd::try_surface). The
+    // in-service check is dosemu2's KBD_PIC_HACK sentinel (kbd.c: "timing is
+    // not a reliable measure under heavy loads"): if the host deschedules us
+    // mid-INT 9 for longer than the pacing period, the next byte must still
+    // wait — a byte surfacing mid-handler is exactly the lost-release bug.
+    if !pc.vpic.in_service(1) && pc.vkbd.try_surface(machine.get_ticks()) {
+        pc.vpic.raise(1);
+    }
 }
 
 /// Advance the emulated Sound Blaster's software DSP playback by the virtual
@@ -807,13 +798,12 @@ pub fn queue_irq(pc: &mut PcMachine, regs: &mut Vcpu, event: crate::arch::Irq) {
                     if sc & 0x80 != 0 { " REL" } else { "" }, pc.e0_pending as u8);
             }
             let Some(sc) = normalize_scancode(pc, sc) else { return };
+            // Queue only — the byte travels "over the serial link" and
+            // surfaces (with its own IRQ1 edge) through the pacing clock in
+            // `queue_tick` / the 0x64 poll path. No PIC-state peeking here:
+            // the edge-per-surfaced-byte model lets IRR/ISR do the ordering,
+            // as on real hardware.
             pc.vkbd.push(sc);
-            // Assert IRQ1 only when one isn't already in service or pending —
-            // the scancode otherwise waits in the 8042 buffer and the EOI
-            // re-assert surfaces it (one scancode per INT 9; see vkbd).
-            if !pc.vpic.in_service(1) && !pc.vpic.is_requested(1) {
-                pc.vpic.raise(1);
-            }
         }
         // Ticks carry no host payload and need the machine timer, so they come
         // through `queue_tick` (which has `&mut machine`), never here — the
@@ -878,9 +868,14 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Vcpu) -> Option<u8> {
     };
 
     if irq == 1 {
-        // Keyboard: only commit if a scancode is actually latched; otherwise
-        // drop the (spurious) request so we don't keep re-selecting it.
-        if !pc.vkbd.latch() {
+        // Keyboard: only commit if a scancode is still latched — a polling
+        // guest may have consumed it through 0x60 before delivery (real
+        // edge-mode PICs deliver a stale INT 9 there; we drop the request
+        // instead so we don't keep re-selecting it).
+        if !pc.vkbd.has_data() {
+            if vkbd::KBD_TRACE {
+                crate::dbg_println!("[kbd] spurious IRQ1 cleared");
+            }
             pc.vpic.clear_request(1);
             regs.frame.rflags &= !VIP;
             return None;

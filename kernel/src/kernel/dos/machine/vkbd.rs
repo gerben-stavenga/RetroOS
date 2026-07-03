@@ -12,10 +12,30 @@ pub(super) const KBD_TRACE: bool = false;
 
 /// Virtual keyboard controller (scancode buffer)
 ///
-/// Models the 8042 output buffer. Incoming scancodes become visible in the
-/// controller as soon as the output buffer is free; IRQ1 is merely the
-/// notification that data is ready. That lets BIOS INT 9 handlers and games
-/// that poll ports 0x60/0x64 observe the same underlying device state.
+/// Models the 8042 the way the hardware actually behaves, with its one
+/// non-negotiable physical property made explicit: **bytes arrive over a slow
+/// serial link, roughly one per millisecond.** `try_surface(now)` moves the
+/// next queued byte into the output buffer only when the buffer is free and
+/// the previous byte surfaced on an earlier millisecond tick; each surfaced
+/// byte raises its own IRQ1 edge at the PIC (the caller's job).
+///
+/// That single pacing rule reproduces every guarantee DOS software was
+/// written against, with the device itself knowing nothing about the
+/// interrupt pipeline (the PIC's IRR/ISR handles ordering, as on real
+/// hardware):
+///  - a 0x60 re-read inside an INT 9 handler (game hook chaining to the BIOS
+///    handler — Prince of Persia, OMF, Raptor) returns the byte the interrupt
+///    was raised for, because the next byte "is still on the wire";
+///  - an INT 9 drain loop polling 0x64 sees exactly one scancode and exits —
+///    make and release arrive as separate interrupts;
+///  - a byte arriving while INT 9 is in service waits its turn and arrives
+///    as its own IRQ1 afterwards, so releases are never coalesced away.
+///
+/// The PUMP (queue_tick / the 0x64 poll path) additionally refuses to
+/// surface a byte while IRQ1 is in service — dosemu2's KBD_PIC_HACK
+/// sentinel (kbd.c: "timing is not a reliable measure under heavy loads"):
+/// host scheduling can stretch a µs-scale handler past any pacing period,
+/// and a byte surfacing mid-handler is exactly the lost-release bug.
 pub struct VirtualKeyboard {
     buffer: [u8; KBD_BUF_SIZE],
     head: usize,
@@ -26,6 +46,8 @@ pub struct VirtualKeyboard {
     pub port61: u8,
     /// Output Buffer Full flag — port 0x64 bit 0
     pub obf: bool,
+    /// Millisecond tick when the last byte surfaced (the serial pacing).
+    last_surface_ms: u64,
     /// Set after a multi-byte keyboard command (0xED/0xF0/0xF3) consumed its
     /// opcode and is waiting for the parameter byte. The parameter is ACKed
     /// but otherwise discarded — we don't actually drive LEDs, change scancode
@@ -35,7 +57,10 @@ pub struct VirtualKeyboard {
 
 impl VirtualKeyboard {
     pub const fn new() -> Self {
-        Self { buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false, awaiting_cmd_param: false }
+        Self {
+            buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false,
+            last_surface_ms: 0, awaiting_cmd_param: false,
+        }
     }
 
     fn queue_scancode(&mut self, scancode: u8) {
@@ -46,58 +71,50 @@ impl VirtualKeyboard {
         }
     }
 
-    fn fill_output(&mut self) -> bool {
-        if self.obf {
-            return true;
-        }
-        if self.head == self.tail {
-            return false;
-        }
-        let sc = self.buffer[self.head];
-        self.head = (self.head + 1) % KBD_BUF_SIZE;
-        self.port60 = sc;
-        self.obf = true;
-        true
-    }
-
-    /// Buffer a scancode from the real keyboard IRQ handler. Only present it
-    /// directly when the output buffer is free AND nothing is queued behind it
-    /// — otherwise FIFO order would break (a read clears OBF without pulling
-    /// the next byte forward, so OBF-clear no longer implies an empty ring).
+    /// Buffer a scancode (or command-response byte) from the host side. It
+    /// never becomes visible at port 0x60 here — bytes surface only through
+    /// `try_surface`, on the serial-pacing clock.
     pub fn push(&mut self, scancode: u8) {
         if KBD_TRACE {
             crate::dbg_println!("[kbd] push {:02X}{} obf={} buf={}",
                 scancode, if scancode & 0x80 != 0 { " REL" } else { "" },
                 self.obf as u8, self.depth());
         }
-        if !self.obf && self.head == self.tail {
-            self.port60 = scancode;
-            self.obf = true;
-        } else {
-            self.queue_scancode(scancode);
-        }
+        self.queue_scancode(scancode);
     }
 
     fn depth(&self) -> usize {
         (self.tail + KBD_BUF_SIZE - self.head) % KBD_BUF_SIZE
     }
 
-    /// Ensure a scancode is visible in port60 for INT 9 delivery.
-    pub fn latch(&mut self) -> bool {
-        self.fill_output()
+    /// The 8042's serial clock: move the next queued byte into the output
+    /// buffer iff the buffer is free and the last byte surfaced on an earlier
+    /// millisecond tick (`now_ms` = `get_ticks()`, 1 kHz on every backend).
+    /// Returns true when a byte surfaced — the caller raises the IRQ1 edge:
+    /// exactly one edge per byte, blind to whatever the guest's handler is
+    /// doing (the PIC's IRR/ISR takes it from there, as on real hardware).
+    pub fn try_surface(&mut self, now_ms: u64) -> bool {
+        if self.obf || self.head == self.tail || now_ms == self.last_surface_ms {
+            return false;
+        }
+        let sc = self.buffer[self.head];
+        self.head = (self.head + 1) % KBD_BUF_SIZE;
+        self.port60 = sc;
+        self.obf = true;
+        self.last_surface_ms = now_ms;
+        if KBD_TRACE {
+            crate::dbg_println!("[kbd] surface {:02X}{} t={} buf={}",
+                sc, if sc & 0x80 != 0 { " REL" } else { "" }, now_ms, self.depth());
+        }
+        true
     }
 
     /// Read port 0x60. Clears OBF and returns the current scancode WITHOUT
-    /// pulling the next queued byte forward.
-    ///
-    /// Reproducer: Prince of Persia hooks INT 9, reads 0x60 once to update its
-    /// own key-state table, then chains to the BIOS INT 9 handler — which reads
-    /// 0x60 again. On real hardware that second read returns the *same* byte
-    /// (the 8042 needs ~µs to surface the next scancode + raise a fresh IRQ1),
-    /// and the release arrives as its own later interrupt the game processes.
-    /// If we prefetched here, the BIOS chain would swallow a coalesced release
-    /// byte the game never saw, leaving its key-state stuck (the prince keeps
-    /// walking). Refill happens only at IRQ-delivery (`latch`) and 0x64 polls.
+    /// pulling the next queued byte forward — the next byte surfaces via
+    /// `try_surface` on a later millisecond, so a re-read inside the same
+    /// handler (Prince of Persia's hook → BIOS chain) sees the same byte,
+    /// exactly as on real hardware where the next scancode is still in
+    /// serial transfer.
     pub fn read_port60(&mut self) -> u8 {
         let sc = self.port60;
         if KBD_TRACE {
@@ -106,14 +123,6 @@ impl VirtualKeyboard {
         }
         self.obf = false;
         sc
-    }
-
-    /// Port 0x64 bit 0 (output-buffer-full). A poll-driven guest (no INT 9,
-    /// IRQ1 masked) advances through queued scancodes by sampling this between
-    /// 0x60 reads, so surface the next byte here — but never inside a single
-    /// 0x60 read, where back-to-back reads must see the same byte.
-    pub fn poll_data(&mut self) -> bool {
-        self.fill_output()
     }
 
     /// Check if a byte is latched in the output buffer (no refill).
@@ -143,13 +152,13 @@ impl VirtualKeyboard {
     /// Host write to port 0x60 — a command (or parameter) directed at the
     /// PS/2 keyboard. We don't model the device, only its protocol: queue
     /// the right ACK / response bytes back into the output buffer so the
-    /// guest's polling loop unblocks. Returns true if a response byte was
-    /// made visible (caller raises IRQ1).
-    pub fn write_port60(&mut self, val: u8) -> bool {
+    /// guest's polling loop unblocks (they surface on the serial pacing
+    /// clock like any device byte).
+    pub fn write_port60(&mut self, val: u8) {
         if self.awaiting_cmd_param {
             self.awaiting_cmd_param = false;
             self.push(0xFA);
-            return true;
+            return;
         }
         match val {
             // Multi-byte commands: ACK opcode now, ACK parameter on next write.
@@ -176,7 +185,6 @@ impl VirtualKeyboard {
             // Unknown opcode — keyboard asks the host to resend.
             _ => self.push(0xFE),
         }
-        true
     }
 
     pub fn clear(&mut self) {
@@ -185,6 +193,7 @@ impl VirtualKeyboard {
         self.port60 = 0;
         self.port61 = 0;
         self.obf = false;
+        self.last_surface_ms = 0;
         self.awaiting_cmd_param = false;
     }
 
