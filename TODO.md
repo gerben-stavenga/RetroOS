@@ -203,31 +203,6 @@ same situation the interpreter already has (no ROM).
       RetroOS (GPT scan, or stay RAM-only diskless), and the real-laptop
       trial itself (open questions: panel GOP pixel format, i8042 presence).
 
-## 7. Real-laptop boot reset after "Heap initialized" (RESOLVED 2026-07-03)
-The laptop resets silently right after the "Heap initialized" print — no
-panic, no double-fault dump, machine just reboots. Same kernel boots fine on
-QEMU UEFI, Bochs+OVMF (`run_uefi_bochs.sh`), and hosted. Eliminated so far:
-port-0x80 side effects (delays removed entirely, still resets), and
-"handler couldn't run" (an IST1 double-fault handler now prints+halts for
-that whole class — yet the reset stays silent, so the machine dies without a
-deliverable CPU fault: smells like a write to firmware/SMM-owned memory the
-multiboot map called free, or something interrupt/time-driven).
-- [x] **Get the countdown verdict.** The instrumented kernel (local branch
-      `metal-work`) prints a 10×1s spin countdown with zero memory activity,
-      then `demand[k]: va=… → phys …` for the first 16 heap pages, each line
-      lingering ~2s before the page is touched. Where the output stops picks
-      the cause: mid-countdown = interrupt/time-driven (memory innocent);
-      after `probe: start` with no demand line = fault-entry path; after
-      `demand[k]` = that physical address is poison (cross-check against the
-      `Memory regions:` list printed at the top of boot — photograph both).
-- [ ] **Rebase `metal-work` onto master afterwards.** Its build plumbing
-      (build_host.sh inputs fix) is superseded by the crate_universe work on
-      master. Keepers to land regardless of the bug: the IST1 double-fault
-      handler (arch-metal descriptors/traps), the Bochs UEFI rig
-      (`run_uefi_bochs.sh` + `vncstub.py`, 2MB-OVMF auto-fetch,
-      `reset_on_triple_fault=0`), and whichever probe caught the bug. The
-      diagnostics knobs (`HEAP_PROBE_MB`, `DEMAND_TRACE_N`) go back to 0.
-
 ## 8. Build/toolchain cleanups
 - [ ] **Upstream the pre-generated unicorn bindings into the fork.** The
       86KB `toolchain/unicorn-sys-pregen-bindings.patch` vendors bindgen's
@@ -240,52 +215,6 @@ multiboot map called free, or something interrupt/time-driven).
       hermetic-python external repo and `pkg_tar` failed on a dangling
       setuptools file. Remedy (documented in 7aab93a): delete the
       `rules_python~~python~*` external dir + `.marker`, rebuild.
-
-## 9. arch-interp translation-cache coherence (stale-TB class) (RESOLVED)
-Root cause of the long-standing "DN file-panel Enter can't launch digger" bug
-(Borland RTE 204): the interp loads guest **code** host-side — DOS overlay/EXE
-loads, relocations, BSS go through `vcpu.rs` `GuestBytes` (`host.write_volatile`),
-which bypasses Unicorn's self-modifying-code detection. Unicorn kept executing a
-**stale translation block** of the page's previous content (mis-sized DN's
-`les di,[bp+6]` to 2 bytes → corrupted IP/flow). Works on metal because a real
-CPU guarantees store-vs-fetch coherence (I-cache snoop + serialization on the
-overlay's far call). `flush_tlb` only did `ctl_flush_tlb` (softmmu TLB), never
-`ctl_flush_tb` (translated code). Reconciles every prior failed lead — the
-executed instruction *stream* was stale, so all the register/SP/null-ptr
-"divergences" were downstream noise.
-- [x] **Per-write TB invalidation (the fix).** `cpu::invalidate_code_range`
-      (`ctl_remove_cache` per page — frames are scattered, so the range isn't
-      physically contiguous) called from every `vcpu.rs` host-side write
-      (`write`/`copy_to`/`zero`/`copy_within`). Restores x86 store-vs-fetch
-      coherence at the one choke point, covering all code-load sources by
-      construction. `invalidate_uc` also upgraded to drop TBs for its range
-      (COW/remap frame-reuse: a recycled physical frame can carry a previous
-      owner's TBs). Verified: DN launches digger, RTE-204 idle loop gone.
-- [ ] **No-translation-cache CI mode (the "never again" net).** `RETRO_FLUSH_TB=1`
-      already flushes ALL TBs at slice entry (`configure`), forcing re-decode of
-      every instruction from current memory — staleness becomes structurally
-      impossible. Wire a CI job that runs the DOS/game suite twice (cached vs
-      `RETRO_FLUSH_TB`): **any** behavioral divergence is, by definition, a
-      missing invalidation, caught the moment it's introduced. (No true Unicorn
-      interpreter mode exists; per-slice/per-block flush is the equivalent.) This
-      is the RIGHT regression layer — it exercises real RetroOS execution, unlike
-      a standalone unicorn-decoder unit test (those were diagnosis, not RetroOS
-      tests, and live on `debug/dn-launch-instruction-trace`).
-- [ ] **Batch the invalidation (perf optimization).** Per-write `ctl_remove_cache`
-      runs on every guest write incl. tiny BDA/stack pokes, and each does a
-      `get_page_addr_code` softmmu walk. Instead, accumulate written
-      `(space, page)` ranges in a thread-local dirty set during the kernel turn
-      and drain them once at the next `configure` (slice entry) — where CR3 is
-      freshly loaded for the space about to run, so `ctl_remove_cache` resolves
-      against the correct page tables (also fixes the theoretical cross-space
-      case the per-write version resolves against the *last* slice's CR3).
-      Collapse to a single `ctl_flush_tb` when the dirty set is large.
-- [ ] **Cleanup.** Strip the remaining ad-hoc launch-debug instrumentation in
-      `arch-interp/src/{cpu.rs,vcpu.rs}` (INSN/ITREG/STRINT/WR* hooks, the
-      `0x3db93` probes) and the metal `pm_step_log` SI/DI/BP additions, kept
-      across the hunt. Keep `RETRO_FLUSH_TB` (now the diagnostic mode above).
-
----
 
 ## Mode X DONE; Doom slow = store ceiling, not the VGA path (measured 2026-06-12)
 - [x] **Mode X / Mode Y plane aliasing WORKS** (2fab439, 9a58ca9, f57e96a):
@@ -918,34 +847,6 @@ ALSO FOUND (separate bugs, file/fix independently):
 ## Epic Pinball
 - [ ] Menu is way too fast, arrow keypresses often result in 2/3 steps
 
-## One Must Fall 2097 (RESOLVED 2026-07-03)
-- [x] (sb-dma-virt) MOD music has deep comb-echo "reverb" + unstable
-      tempo at "ultra high quality" mixing; "486" mixing sounds normal.
-      Not a buffer/remap-coherency bug (a coherency fault would echo at
-      any rate). It's a throughput ceiling: with host IRQ5 re-armed on
-      the guest vPIC EOI (`0x20`) — the correct, existing trigger — the
-      full per-IRQ round trip (QEMU sb16 → host trap → event-loop drain
-      → relay → vPIC → mode-transition into guest ISR → passthrough port
-      I/O traps → EOI → cross-mode restore) exceeds the ultra-quality
-      segment period, so free-running auto-init drops segments. Prime
-      suspect: `run_qemu.sh` runs QEMU under TCG (no `-enable-kvm` /
-      `-accel`), inflating every trap. Rejected dead-ends: auto-init
-      special-case + kernel-side 2xEh ack (reverted — both hacks); the
-      0x22E-read re-arm idea (wrong; EOI 0x20 is the right trigger).
-- [x] Restart from launcher after quitting OMF hangs. **Diagnosis
-      confirmed** via fresh trace: OMF2 enters a tight `INT 21 AH=2C`
-      (GetTime) timeout loop that OMF1 never executes (526 calls vs 0)
-      — different sound-init branch. EFLAGS in the loop: IF=0, VIP=1,
-      vpic `pending=[08,0F,09]` (timer + SB IRQ + kbd queued, all
-      blocked by IF=0). BIOS tick at `0:046C` therefore can't advance,
-      AH=2C returns the same time forever, the timeout never fires.
-      Root is *not* IF=0 itself (umbrella IF-stuck bug downstream) —
-      it's persistent HW state (most likely SB DSP / real 8237 / host-
-      IRQ5 mask) carried over from OMF1 sending OMF2 down a "wait for
-      the card to settle" branch. Speculative fix: issue an SB DSP
-      reset and mask the host SB channels in `release_dma_pool` so the
-      next program sees a clean card.
-
 ## Aladdin
 - [ ] Sound is bad and game after a bit starts producing garbage on screen
 
@@ -956,9 +857,6 @@ ALSO FOUND (separate bugs, file/fix independently):
 
 ## Pinball illusions
 - [ ] pMAX protected mode is incompatible
-
-## Extreme pinball (RESOLVED)
-- [x] Kernel panic on keypress
 
 ## Strunts
 - [ ] Does not start
