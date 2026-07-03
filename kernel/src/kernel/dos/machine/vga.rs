@@ -1110,6 +1110,24 @@ pub fn handle_planar_fault(regs: &mut Vcpu, vga: &mut VgaState, cs_base: u32, de
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
             i += modrm_len(modrm, addr32, peek, i);
         }
+        // mov AL/AX/EAX <-> moffs — the direct-offset accumulator forms. The
+        // memory operand is the faulting window itself, so `off` is already the
+        // VRAM offset; only the moffs immediate (addr-size wide) needs to be
+        // consumed. Wolf3D's video detection reads `mov al, es:[0]` at A000:0
+        // (opcode A0 with an ES override) and crashed here unhandled.
+        0xA0 | 0xA1 => {
+            let sz = opsize(op32, opcode == 0xA0);
+            let mut v = 0u32;
+            for b in 0..sz { v |= (vram_read(vga, off + b) as u32) << (b * 8); }
+            set_gpr(regs, 0, sz, v);
+            i += if addr32 { 4 } else { 2 };
+        }
+        0xA2 | 0xA3 => {
+            let sz = opsize(op32, opcode == 0xA2);
+            let val = gpr(regs, 0, sz);
+            for b in 0..sz { vram_write(vga, off + b, (val >> (b * 8)) as u8); }
+            i += if addr32 { 4 } else { 2 };
+        }
         // mov r/m8, imm8
         0xC6 => {
             let modrm = peek(i);
