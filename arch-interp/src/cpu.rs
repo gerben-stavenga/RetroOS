@@ -121,6 +121,21 @@ struct Ctx {
     /// the budget; on an early stop we charge the accumulated work.
     slice_instr: u64,
     stopped: bool,
+    /// Virtual-IF watch: set while a PM client runs with its virtual IF off
+    /// (TF stepping armed). The intr hook uses it to keep single-stepping
+    /// INSIDE one `emu_start` — re-arming TF and continuing per #DB — and
+    /// only stops the slice when the next opcode is one of the five
+    /// IF-touching instructions `step_virtual_if` must emulate. Without this,
+    /// every stepped instruction pays a full slice exit/re-entry (~25µs), and
+    /// audio ISRs that legitimately run long VIF=0 stretches (Duke3D's mixer)
+    /// crawl two orders of magnitude below the virtual CPU's speed.
+    vif_watch: Option<VifWatch>,
+}
+
+#[derive(Clone, Copy)]
+struct VifWatch {
+    cs: u16,
+    cs_base: u32,
 }
 
 thread_local! {
@@ -187,6 +202,42 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_intr_hook(|uc, intno| {
         let vector = (intno & 0xFF) as u8;
         let is_int = intno & 0x100 != 0;
+        // Virtual-IF stepping fast path: a #DB from the armed TF while the PM
+        // client's virtual IF is off. Peek the NEXT opcode; if it is not one
+        // of the five IF-touching instructions (PUSHF/POPF/IRET/CLI/STI),
+        // re-arm TF and continue INSIDE this `emu_start` — the whole stepped
+        // stretch then costs one hook callback per instruction instead of a
+        // full slice exit/re-entry. Falls through (and stops) for sensitive
+        // opcodes, a CS change, or an unmapped code page — the slice loop
+        // routes those to `step_virtual_if` exactly as before.
+        if vector == 1 && !is_int {
+            if let Some(w) = uc.get_data().vif_watch {
+                use RegisterX86 as R;
+                if uc.reg_read(R::CS).unwrap_or(0) as u16 == w.cs {
+                    let eip = uc.reg_read(R::EIP).unwrap_or(0) as u32;
+                    let pd = crate::paging::active_pd();
+                    let mut lin = w.cs_base.wrapping_add(eip);
+                    let mut op = None;
+                    for _ in 0..8 {
+                        let Some(pa) = crate::paging::translate(pd, lin) else { break };
+                        let b = unsafe { *(crate::phys::region_base() as *const u8).add(pa as usize) };
+                        // Legacy prefixes (operand/address size, lock, rep, seg overrides).
+                        if matches!(b, 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3
+                                     | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65) {
+                            lin = lin.wrapping_add(1);
+                            continue;
+                        }
+                        op = Some(b);
+                        break;
+                    }
+                    if matches!(op, Some(b) if !matches!(b, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB)) {
+                        let fl = uc.reg_read(R::EFLAGS).unwrap_or(0);
+                        let _ = uc.reg_write(R::EFLAGS, fl | 0x100); // re-arm TF
+                        return; // no emu_stop → continue stepping in place
+                    }
+                }
+            }
+        }
         // A page fault is the paging backend's own business: demand-commit or
         // genuine SEGV is decided in `execute` (it needs CR2 + the active page
         // tables). It surfaces as #PF (vector 14) when unicorn can report it, or
@@ -865,6 +916,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // interrupt state. NEVER IOPL=3: that lets the guest toggle the real
             // IF behind the kernel's back and bypasses the per-swap-in IO bitmap.
             // Project VIF (bit 19) into the bit-9 IF slot the guest runs with.
+            uc.get_data_mut().vif_watch = None;
             let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32) & !NT_FLAG) | (VM_FLAG as u32) | (1 << 12) | 2);
             let frame = [
                 r.ip32() & 0xFFFF,
@@ -890,6 +942,15 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             let mut flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG) | (1 << 12) | 2);
             if flags & IF_FLAG == 0 {
                 flags |= TF_FLAG; // step the next non-sensitive instruction
+                // Arm the intr hook's in-place stepping fast path (see the
+                // #DB branch in the intr hook): per-#DB it re-arms TF and
+                // continues within the slice until a sensitive opcode shows.
+                uc.get_data_mut().vif_watch = Some(VifWatch {
+                    cs: r.code_seg(),
+                    cs_base: crate::desc::seg_base(r.code_seg()),
+                });
+            } else {
+                uc.get_data_mut().vif_watch = None;
             }
             let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
             let segs = [r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16];

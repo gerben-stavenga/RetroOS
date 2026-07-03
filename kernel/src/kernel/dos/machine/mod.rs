@@ -101,15 +101,56 @@ pub fn set_vm86_sp(regs: &mut Vcpu, sp: u16) {
 #[inline]
 pub fn set_vm86_flags(regs: &mut Vcpu, flags: u32) {
     // `flags` is the guest's view: its IF intent is in bit 9. Map it to VIF
-    // (bit 19), set the low-16 status flags, and PRESERVE the real IF (bit 9)
-    // and the upper EFLAGS (VM/VIP). The next ring-3 exit forces real IF=1.
+    // (bit 19) and set the low-16 status flags; the upper EFLAGS (VM/VIP/VIF
+    // handled below) are preserved. Canonical bit 9 is PINNED TO 1 — the host
+    // always runs the guest interruptible, the guest's IF is VIF — so a
+    // canonical flags word is well-formed wherever it lands in a frame,
+    // and bit 9 never carries guest state.
     let want_vif = flags & IF_FLAG != 0;
-    let real_if = regs.frame.rflags & (IF_FLAG as u64);
     regs.frame.rflags = (regs.frame.rflags & !0xFFFF)
         | ((flags as u64 & 0xFFFF) & !(IF_FLAG as u64))
-        | real_if;
+        | IF_FLAG as u64;
     if want_vif { regs.frame.rflags |= VIF_FLAG as u64; }
     else        { regs.frame.rflags &= !(VIF_FLAG as u64); }
+}
+
+/// Inverse of `guest_flags` for full-width (PM) images: apply a guest-view
+/// flags image — the guest's IF intent in the bit-9 slot — to the canonical
+/// state. VIF (bit 19) is set from the image's bit-9 slot; VM stays
+/// kernel-owned (never image-owned). Canonical bit 9 is PINNED TO 1 (see
+/// `set_vm86_flags`) — never read, never guest-controlled.
+#[inline]
+pub fn apply_guest_flags(regs: &mut Vcpu, image: u32) {
+    let want_vif = image & IF_FLAG != 0;
+    let vm = regs.flags32() & VM_FLAG;
+    let mut nf = (image & !(IF_FLAG | VIF_FLAG | VM_FLAG)) | vm | IF_FLAG;
+    if want_vif { nf |= VIF_FLAG; }
+    regs.set_flags32(nf);
+}
+
+/// Canonical EFLAGS for entering a kernel-orchestrated VM86 excursion:
+/// VM set, the guest's virtual IF on, canonical IF pinned to 1, and the
+/// current virtual IOPL riding along. The single construction point for
+/// from-scratch VM86 entry flags (DPMI RM calls / callbacks).
+#[inline]
+pub fn vm86_entry_flags(current: u32) -> u32 {
+    VM_FLAG | VIF_FLAG | IF_FLAG | (current & IOPL_MASK)
+}
+
+/// Guest-view flags image with the IF slot forced ON — for kernel-built
+/// frames whose eventual IRET must leave the guest interruptible (e.g. a
+/// launched RM helper that waits on a keypress IRQ).
+#[inline]
+pub fn guest_flags_if_on(regs: &Vcpu) -> u32 {
+    guest_flags(regs) | IF_FLAG
+}
+
+/// Guest-view flags image for an INT-style handler entry: the IF slot and TF
+/// (bit 8) are cleared in the image — textbook INT-n semantics, what the CPU
+/// itself would push before vectoring.
+#[inline]
+pub fn guest_flags_handler_entry(regs: &Vcpu) -> u32 {
+    guest_flags(regs) & !(IF_FLAG | (1 << 8))
 }
 
 pub(super) mod vga;

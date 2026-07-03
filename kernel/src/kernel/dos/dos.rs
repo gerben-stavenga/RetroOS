@@ -28,7 +28,7 @@ use super::ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};
 use super::xms::xms_dispatch;
 use super::machine::{
     read_u16, write_u16,
-    vm86_cs, vm86_ip, vm86_ss, vm86_sp, vm86_flags,
+    vm86_cs, vm86_ip, vm86_ss, vm86_sp,
     set_vm86_cs, set_vm86_ip,
     vm86_push, vm86_pop,
     clear_bios_keyboard_buffer, pop_bios_keyboard_word,
@@ -458,7 +458,14 @@ fn finish_dos_call(dos: &mut thread::DosState, regs: &mut Vcpu) {
             super::mode_transitions::pop_iret_frame(&dos.ldt[..], regs, client_use32);
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);
-        regs.set_flags32((ret_flags & !STATUS_MASK) | post_handler_status);
+        // The planted image is guest-view (`machine::guest_flags`): the
+        // client's IF intent rides in the IF slot and the canonical VIF
+        // (bit 19) is stripped. Raw-restoring it would clear VIF on every PM
+        // DOS call — the caller's virtual IF then sticks at 0 until something
+        // else happens to set it (Duke3D's demo loop wedged exactly this way,
+        // its tick-wait starved right after an INT 21h). `apply_guest_flags`
+        // maps the image's IF slot back to VIF.
+        machine::apply_guest_flags(regs, (ret_flags & !STATUS_MASK) | post_handler_status);
     }
 }
 
@@ -712,7 +719,7 @@ fn buffered_input_resume(buf_lin: u32, max_chars: u8, count: u8) -> super::Resum
 fn launch_int16_read(regs: &mut Vcpu) {
     let ivt_off = read_u16(regs, 0, 0x16 * 4);
     let ivt_seg = read_u16(regs, 0, 0x16 * 4 + 2);
-    let ret_flags = (machine::vm86_flags(regs) | machine::IF_FLAG) as u16;
+    let ret_flags = machine::guest_flags_if_on(regs) as u16;
     machine::vm86_push(regs, ret_flags);
     machine::vm86_push(regs, CTRL_STUB_SEG);
     machine::vm86_push(regs, ctrl_slot_off(SLOT_RESUME));
@@ -2763,7 +2770,7 @@ fn exec_program(machine: &mut crate::TheArch, kt: &mut thread::KernelThread, dos
     // dependency hangs forever (e.g. OMF after re-launch from a launcher).
     regs.set_ss32(ss as u32);
     regs.set_sp32(sp as u32);
-    let flags = (vm86_flags(regs) as u16) | (machine::IF_FLAG as u16);
+    let flags = machine::guest_flags_if_on(regs) as u16;
     vm86_push(regs, flags);
     vm86_push(regs, cs);
     vm86_push(regs, ip);

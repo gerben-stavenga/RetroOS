@@ -242,10 +242,9 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception(dos: &mut thread::DosState
             // faulting instruction.
             // Frame width follows client bitness.
             let client_use32 = dpmi.client_use32;
-            // Guest-observable flags pushed into the handler's IRET frame: the
-            // guest's IF lives in the bit-9 slot (via guest_flags); INT-n clears
-            // it, and TF is cleared too.
-            let handler_flags = machine::guest_flags(regs) & !(machine::IF_FLAG | (1u32 << 8));
+            // Guest-observable flags pushed into the handler's IRET frame:
+            // INT-n semantics — the image's IF slot and TF cleared.
+            let handler_flags = machine::guest_flags_handler_entry(regs);
             mode_transitions::push_iret_frame(&dos.ldt[..], regs, client_use32,
                 regs.ip32(), regs.code_seg(), handler_flags);
             return mode_transitions::reflect_int_to_real_mode(dos, regs, exc_num as u8);

@@ -574,6 +574,9 @@ pub(super) struct IfEvt {
 pub(super) const IF_SWITCH_PM: u8 = 1; // push_continuation_and_switch_to_pm_side (first/toggle entry)
 pub(super) const IF_REFLECT_RM: u8 = 2; // reflect_int_to_real_mode (clears IF)
 pub(super) const IF_RESUME_CONTINUATION: u8 = 3;    // resume_continuation_from_stub (pops HostContinuation)
+pub(super) const IF_PM_IRQ_NESTED_DEF: u8 = 4; // deliver_pm_irq nested, default vector (inline reflect)
+pub(super) const IF_PM_IRQ_NESTED: u8 = 5;     // deliver_pm_irq nested, hooked vector (stub return)
+pub(super) const IF_PM_IRQ_FIRST: u8 = 6;      // deliver_pm_irq first-entry/toggle
 
 const IF_RING_LEN: usize = 128;
 pub(super) static mut IF_RING: [IfEvt; IF_RING_LEN] = [IfEvt {
@@ -605,8 +608,26 @@ fn if_bit(regs: &Vcpu) -> bool {
     regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
 }
 
-/// F12 hook for virtual-IF diagnostics. The ring records inline; output is muted.
-pub(super) fn dump_if_ring() {}
+/// F12 hook for virtual-IF diagnostics. Prints the most recent ring entries
+/// (oldest first): tag, guest mode, CS:IP at record time, virtual-IF
+/// before→after, and the other_stack cursor.
+pub(super) fn dump_if_ring() {
+    unsafe {
+        let pos = IF_RING_POS;
+        let n = pos.min(IF_RING_LEN);
+        crate::dbg_println!("[IFRING] {} events total, showing last {} in_hw_irq={}",
+            pos, n,
+            super::IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed));
+        for k in 0..n {
+            let i = (pos - n + k) % IF_RING_LEN;
+            let e = IF_RING[i];
+            crate::dbg_println!(
+                "[IFRING] #{:03} tag={} vm86={} {:04X}:{:08X} if {}→{} other={:04X}:{:08X}",
+                pos - n + k, e.tag, e.vm86 as u8, e.cs, e.ip,
+                e.if_in as u8, e.if_out as u8, e.other.0, e.other.1);
+        }
+    }
+}
 
 pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector: u8) {
     let (sel, off) = dos.pm_vectors[vector as usize];
@@ -633,6 +654,10 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
     //                   Same path as toggle, plus the empty default.
     let in_pm = regs.mode() != crate::UserMode::VM86;
     let nested_on_pm = in_pm && dos.pc.locked_stack.other_stack.is_some();
+    let pre_vif = if_bit(regs);
+    let delivery_tag = if nested_on_pm && default_vector { IF_PM_IRQ_NESTED_DEF }
+                       else if nested_on_pm { IF_PM_IRQ_NESTED }
+                       else { IF_PM_IRQ_FIRST };
     // Track where push_continuation actually placed the HostContinuation, so
     // the default-vector reflect below pops the SAME (possibly nested) slot
     // instead of the fixed top-of-stack. A HW IRQ taken *inside* an active
@@ -641,14 +666,35 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
     // grabbed the outer excursion's HC and leaked a VM86-context segment into
     // the PM frame → #GP on the exit's `pop gs` (Quake/Doom under Bochs, where
     // timing lands the tick mid-excursion).
-    let pushed_hc_at = if nested_on_pm {
-        // Plant iret-frame at regs.SS:[SP-frame_size]; push_iret_frame
-        // uses regs.frame.ss to look up the segment base, so this writes
-        // to whatever stack the handler is currently on (DPMI 0.9 §3.1.2
+    let pushed_hc_at = if nested_on_pm && default_vector {
+        // Nested IRQ on an UNHOOKED vector → default stub reflects to RM below;
+        // the RM/VM86 handler's IRET restores VIF in hardware (VME), so no stub
+        // round-trip is needed. Plant the iret-frame inline at regs.SS:[SP-frame]
+        // (push_iret_frame uses regs.frame.ss for the segment base, so this
+        // writes whatever stack the handler is currently on — DPMI 0.9 §3.1.2
         // permits handler SS != HOST_STACK_PM*).
         push_iret_frame(&dos.ldt[..], regs, handler_use32,
             regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
         None
+    } else if nested_on_pm {
+        // Nested IRQ into the client's OWN PM handler. We're already on the PM
+        // side so we don't switch, but we MUST still push a HostContinuation
+        // (on the handler's current stack — pm_get_stack returns regs.SS:SP for
+        // the nested case) and return the handler through SLOT_RESUME_CONTINUATION.
+        // This is load-bearing for the virtual-IF: deliver clears VIF below
+        // (handlers run with interrupts off), and the CPU CANNOT re-enable it on
+        // the handler's IRET — POPF/IRET preserve EFLAGS bits 19/20. Only
+        // resume_continuation, replaying the captured pre-IRQ eflags, puts VIF
+        // back. Without this the nested path left VIF=0 forever: the client's
+        // timer firing inside a DPMI excursion → mainline spins on a tick now
+        // permanently held (VIP=1) — the Doom/Duke3D startup hang in the wild.
+        let at = push_continuation(dos, regs, None);
+        regs.frame.ss = at.0 as u64;
+        regs.frame.rsp = at.1 as u64;
+        let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
+        push_iret_frame(&dos.ldt[..], regs, handler_use32,
+            stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
+        Some(at)
     } else {
         // First-entry from client OR toggle from rm: push_continuation_and_switch_to_pm_side
         // pushes HostContinuation, lands user on top of the save, captures pre-
@@ -697,6 +743,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
         regs.fs = hc1.fs as u64;
         regs.gs = hc1.gs as u64;
         let _ = r;
+        if_record(delivery_tag, regs, pre_vif, if_bit(regs), Some((vector as u16, 0)));
         return;
     }
 
@@ -707,6 +754,7 @@ pub(super) fn deliver_pm_irq(dos: &mut thread::DosState, regs: &mut Vcpu, vector
     regs.frame.rflags &= !((machine::VM_FLAG | machine::VIF_FLAG | (1u32 << 8)) as u64);
     regs.frame.cs  = sel as u64;
     regs.frame.rip = off as u64;
+    if_record(delivery_tag, regs, pre_vif, if_bit(regs), Some((vector as u16, 0)));
 }
 
 /// Push an IRET frame on the stack addressed by `regs.ss:regs.sp`, updating
@@ -841,7 +889,10 @@ pub(super) fn vector_stub_reflect(machine: &mut crate::TheArch, dos: &mut thread
         let (eip, cs, flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
         regs.set_ip32(eip);
         regs.set_cs32(cs as u32);
-        regs.set_flags32(flags);
+        // The popped image is guest-view (the client's IF intent in the IF
+        // slot, bit 19 absent) — raw set_flags32 would clear the canonical
+        // VIF. `apply_guest_flags` maps the image's IF slot back to VIF.
+        machine::apply_guest_flags(regs, flags);
         return super::dpmi::dpmi_api(machine, dos, regs);
     }
 
@@ -956,14 +1007,13 @@ pub(super) fn resume_continuation_from_stub(dos: &mut thread::DosState, regs: &m
         let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);
-        // Resume with the guest's virtual IF (VIF) on; keep the host's real IF
-        // (bit 9) untouched — ret_flags is guest-observable, so its bit-9 is the
-        // guest's IF and must not land on the real IF.
-        let keep_real_if = regs.flags32() & machine::IF_FLAG;
-        regs.set_flags32(
-            (ret_flags & !STATUS_MASK & !machine::IF_FLAG)
-                | current_status | machine::VIF_FLAG | keep_real_if,
-        );
+        // ret_flags is guest-observable; `apply_guest_flags` maps its IF slot
+        // to VIF. Then force VIF on: this frame closes a HW-IRQ/soft-INT
+        // excursion, and the client resumes interruptible regardless of the
+        // image (handlers enter with the image's IF slot cleared).
+        machine::apply_guest_flags(regs, (ret_flags & !STATUS_MASK) | current_status);
+        let vif_on = regs.flags32() | machine::VIF_FLAG;
+        regs.set_flags32(vif_on);
     }
     // IRQ chain complete when we just popped an outermost HC (HC.other_stack=None
     // ⇒ first-entry from client). Nested HCs (Some) keep the flag so trace

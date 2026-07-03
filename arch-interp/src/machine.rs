@@ -76,9 +76,15 @@ pub fn halt_forever() -> ! {
 // calibration overflow and makes timing reproducible run-to-run.
 
 /// Virtual CPU speed: guest instructions per millisecond of guest-perceived
-/// time. ~2 MIPS models a 386/486-class machine — slow enough that period
-/// delay-calibration loops keep their per-tick counts well inside 16 bits.
-const VIRT_INSTR_PER_MS: u64 = 2_000;
+/// time. ~6 MIPS models a mid-range 486 — slow enough that period
+/// delay-calibration loops keep their per-tick counts inside 16 bits (the
+/// real-hardware "Runtime error 200" cliff is Pentium-class, ~100 MIPS),
+/// fast enough that a 206 Hz game timer ISR (Duke3D's OPL music service,
+/// hundreds of port I/Os per tick) completes well within its tick interval.
+/// At the previous 2 MIPS the Duke3D demo loop structurally overran the
+/// interval: every tick landed mid-chain, the excursion nesting only ever
+/// grew, and DOS/4GW died with error 2002 (transfer stack overflow).
+const VIRT_INSTR_PER_MS: u64 = 6_000;
 
 /// Retired guest instructions, the source of virtual time.
 static VIRT_CYCLES: AtomicU64 = AtomicU64::new(0);
