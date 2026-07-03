@@ -30,6 +30,15 @@ fn trace_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("RETRO_TRACE").is_some())
 }
 
+/// Virtual-IF stepping trace (`RETRO_STEP_TRACE`): one line per stepped
+/// instruction — the lens that caught the stale single-step anchor (see
+/// `set_single_step`).
+fn step_trace_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RETRO_STEP_TRACE").is_some())
+}
+
 /// A null/unusable segment cache.
 fn null_seg() -> kvm_segment {
     kvm_segment { unusable: 1, ..Default::default() }
@@ -343,10 +352,19 @@ fn in_shim(k: &KvmCpu) -> bool {
     sregs.cs.selector == crate::sysdesc::KERNEL_CS
 }
 
-/// Arm/disarm hardware single-step (the virtual-IF stepping driver). Only
-/// ioctls on a state change.
+/// Arm/disarm hardware single-step (the virtual-IF stepping driver).
+///
+/// MUST be called AFTER the entry `KVM_SET_REGS`, and re-issued on every
+/// stepped entry even if already armed: KVM anchors the single-step TF to the
+/// RIP current at KVM_SET_GUEST_DEBUG time (`vcpu->arch.singlestep_rip`) and
+/// only folds TF into RFLAGS while the vcpu still sits at that RIP. Arming
+/// before SET_REGS (or reusing a stale arm after the monitor emulated an
+/// instruction and moved IP host-side) leaves TF unset — the guest FREE-RUNS
+/// through the VIF=0 stretch, hardware silently drops the POPF/IRET IF
+/// restore, and the client hangs with its virtual IF stuck off (Raptor's
+/// tick-wait loop was the reproducer).
 fn set_single_step(k: &mut KvmCpu, on: bool) {
-    if k.single_step == on {
+    if !on && !k.single_step {
         return;
     }
     let control = if on { KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP } else { 0 };
@@ -371,13 +389,25 @@ pub fn execute() -> KernelEvent {
         // non-sensitive instruction at a time (KVM single-step).
         let mut stepping = false;
         if mode == UserMode::Mode32 && regs.flags32() & VIF_FLAG == 0 {
+            let (scs, sip) = (regs.code_seg(), regs.ip32());
             let mut view = InterpView { space: unsafe { &mut (*p).space } };
-            if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if(regs, &mut view) {
+            let r = arch_abi::monitor::step_virtual_if(regs, &mut view);
+            if step_trace_on() {
+                let mut view = InterpView { space: unsafe { &mut (*p).space } };
+                use arch_abi::monitor::GuestView;
+                let op = view.read8(crate::desc::seg_base(scs).wrapping_add(sip));
+                eprintln!(
+                    "[step] {scs:#06x}:{sip:#010x} op={op:02X} -> ip={:#010x} vif={} r={}",
+                    regs.ip32(),
+                    (regs.flags32() & VIF_FLAG != 0) as u8,
+                    match &r { MonitorResult::Resume => "resume", MonitorResult::Event(_) => "event" }
+                );
+            }
+            if let MonitorResult::Event(ev) = r {
                 return ev;
             }
             stepping = regs.flags32() & VIF_FLAG == 0;
         }
-        set_single_step(k, stepping);
 
         // The INTR-line check (the TCG block hook's analogue): hand the slice
         // to the kernel when an IRQ is deliverable.
@@ -393,7 +423,18 @@ pub fn execute() -> KernelEvent {
             );
         }
 
+        // VIF-drop probe (bring-up diagnostic): a slice that enters with the
+        // virtual IF set and comes back with it clear must correspond to a
+        // guest CLI (opcode FA at the pre-slice IP, emulated by the monitor).
+        // Anything else is the engine losing an interrupt-enable.
+        let vif_pre = regs.flags32() & VIF_FLAG != 0;
+        let pre_cs = regs.code_seg();
+        let pre_ip = regs.ip32();
+        let mut shim_vec: Option<(u8, u32)> = None;
+
         enter(k, regs, mode);
+        // After SET_REGS, never before — see set_single_step.
+        set_single_step(k, stepping);
 
         // The inner run loop: an EINTR (timer kick) or single-step exit can
         // land while the vcpu is INSIDE the trap shim — the CPL3→CPL0
@@ -455,6 +496,7 @@ pub fn execute() -> KernelEvent {
                 Kind::Shim => {
                     let kregs = k.vcpu.get_regs().expect("KVM_GET_REGS");
                     let f = read_frame(kregs.rsp);
+                    shim_vec = Some((f.vector, f.err_code));
                     sync_out_shim(k, regs, mode, &f);
                     break dispatch_shim(k, regs, mode, &f);
                 }
@@ -493,6 +535,22 @@ pub fn execute() -> KernelEvent {
             }
         };
 
+        if step_trace_on() && vif_pre && regs.flags32() & VIF_FLAG == 0 {
+            let p2 = &raw mut vcpu::REGS;
+            let mut view = InterpView { space: unsafe { &mut (*p2).space } };
+            let base = if mode == UserMode::VM86 {
+                (pre_cs as u32) << 4
+            } else {
+                crate::desc::seg_base(pre_cs)
+            };
+            use arch_abi::monitor::GuestView;
+            let op = view.read8(base.wrapping_add(pre_ip));
+            eprintln!(
+                "[VIF-DROP] mode={mode:?} pre={pre_cs:#06x}:{pre_ip:#010x} op={op:02X} \
+                 post={:#06x}:{:#010x} shim={shim_vec:?} ev={ev:?}",
+                regs.code_seg(), regs.ip32()
+            );
+        }
         if trace_on() {
             eprintln!(
                 "   -> cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} ev={ev:?}",
