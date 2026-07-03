@@ -1038,7 +1038,16 @@ pub fn raise_pending(machine: &mut crate::TheArch, dos: &mut thread::DosState, r
             && regs.ip32() == resume_park_ip
     };
     if at_resume_park {
-        machine.set_irq_line(dos.pc.intr_pending());
+        // Drop the INTR line for this instant instead of leaving it asserted:
+        // the interp stops at a block boundary BEFORE the park's CD 31
+        // executes whenever the line is up and the guest is interruptible, so
+        // deferral + an asserted line re-stops at the same PC with zero
+        // progress, forever (Jazz Jackrabbit hung this way the moment a
+        // keystroke landed mid-chain: guest parked at 0000:0504, keyboard IRQ
+        // pending, block hook re-firing). The vpic still latches the request;
+        // the CD 31 traps within one instruction and the next raise_pending —
+        // guest no longer at the park — re-asserts the line and delivers.
+        machine.set_irq_line(false);
         return;
     }
     // Mouse-callback dispatch (INT 33h AX=000Ch / Function 12), not a
