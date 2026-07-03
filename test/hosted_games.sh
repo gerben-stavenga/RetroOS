@@ -1,11 +1,12 @@
 #!/bin/bash
-# Hosted (interpreter) end-to-end smoke tests for CI.
+# Hosted end-to-end smoke tests for CI.
 #
-# Each case boots a program on the software CPU (no QEMU/KVM) via
-# test/hosted_test.py, optionally drives keyboard input, and asserts the kernel
-# never panicked (and, for the text-mode DN shell, that its screen painted).
-# This is the "good way of running tests" the hosted backend gives us: it runs
-# on any GitHub-hosted runner. Add a case by appending a `run` line.
+# Each case boots a program on the hosted backend via test/hosted_test.py,
+# optionally drives keyboard input, and asserts the kernel never panicked
+# (and, for the text-mode DN shell, that its screen painted). The default TCG
+# (software CPU) engine runs on any GitHub-hosted runner; set ENGINE=kvm to
+# run the same cases on the KVM engine (needs /dev/kvm — skips cleanly when
+# absent so CI stays green). Add a case by appending a `run` line.
 #
 # Exit 0 = all passed.
 set -uo pipefail
@@ -14,7 +15,18 @@ cd "$(dirname "$0")/.."
 IMG=bazel-bin/image.bin          # the open-source image carries the committed games
 [ -f "$IMG" ] || { echo "no $IMG — run: bazelisk build //:image"; exit 1; }
 
-PY="python3 test/hosted_test.py --image $IMG"
+HOST_BIN=bazel-bin/kernel/retroos-host
+if [ "${ENGINE:-tcg}" = kvm ]; then
+    # Probe by actually opening the device — `test -w` misses ACL grants.
+    if ! { : <> /dev/kvm; } 2>/dev/null; then
+        echo "SKIP: ENGINE=kvm but /dev/kvm unavailable — hosted games not run"
+        exit 0
+    fi
+    HOST_BIN=bazel-bin/kernel/retroos-host-kvm
+fi
+[ -f "$HOST_BIN" ] || { echo "no $HOST_BIN — run: bazelisk build //kernel:$(basename "$HOST_BIN") --platforms=@platforms//host"; exit 1; }
+
+PY="python3 test/hosted_test.py --host-bin $HOST_BIN --image $IMG"
 fail=0
 run() { local label="$1"; shift; echo "=== $label ==="; $PY "$@" || { fail=1; echo "  ^ FAILED: $label"; }; }
 

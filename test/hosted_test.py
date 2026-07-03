@@ -84,21 +84,32 @@ def main():
                     help="substring that MUST appear in the screenshot (repeatable)")
     ap.add_argument("--expect-log", action="append", default=[],
                     help="substring that MUST appear in the kernel log (repeatable)")
-    ap.add_argument("--forbid-log", action="append", default=["KERNEL PANIC"],
+    # "panicked at" = a host-binary Rust panic (e.g. the KVM engine failing
+    # bring-up); "KERNEL PANIC" = the guest kernel's own panic handler.
+    ap.add_argument("--forbid-log", action="append",
+                    default=["KERNEL PANIC", "panicked at"],
                     help="substring that must NOT appear in the log (repeatable)")
+    ap.add_argument("--host-bin", default=os.environ.get("RETRO_HOST_BIN", HOST_BIN),
+                    help="hosted binary to drive (or env RETRO_HOST_BIN); e.g. "
+                         "bazel-bin/kernel/retroos-host-kvm for the KVM engine")
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
-    if not os.path.exists(HOST_BIN):
-        sys.exit(f"hosted_test: {HOST_BIN} not built — "
-                 f"run: bazelisk build //kernel:retroos-host --platforms=@platforms//host")
+    host_bin = args.host_bin
+    if not os.path.exists(host_bin):
+        sys.exit(f"hosted_test: {host_bin} not built — "
+                 f"run: bazelisk build //kernel:{os.path.basename(host_bin)} --platforms=@platforms//host")
 
     # IMPORTANT: retroos-host treats the FIRST positional as the disk image and
     # slurps every following arg into the guest program's argv — so all flags
     # MUST come before the image path.
     shot = args.screenshot or "/tmp/retroos-hosted-shot.txt"
-    cmdline = [HOST_BIN, "--screenshot", shot]
+    # A stale screenshot from a previous run must never satisfy --expect-screen
+    # (it once masked a binary that crashed on startup).
+    if os.path.exists(shot):
+        os.unlink(shot)
+    cmdline = [host_bin, "--screenshot", shot]
     if args.cmd:
         cmdline += ["--cmd", args.cmd]
         cmdline += ["--cwd", args.cwd or (os.path.dirname(args.cmd) + "/")]
@@ -126,6 +137,9 @@ def main():
         remaining = max(0.0, deadline - time.time())
         time.sleep(min(1.5, remaining))
     finally:
+        # The host binary runs until we stop it; if it is already gone, it
+        # crashed or aborted — that is a failure in itself, never a pass.
+        died_early = proc.poll()
         proc.terminate()
         try:
             log = proc.communicate(timeout=5)[1].decode("utf-8", "replace")
@@ -139,6 +153,8 @@ def main():
             screen = f.read()
 
     fails = []
+    if died_early is not None:
+        fails.append(f"host binary exited early (code {died_early})")
     for s in args.forbid_log:
         if s in log:
             fails.append(f"log contained forbidden {s!r}")
