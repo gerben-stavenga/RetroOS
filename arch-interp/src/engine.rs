@@ -2,7 +2,7 @@
 //! crate was compiled with.
 //!
 //! `arch-interp` is the *hosted* backend; the CPU under the guest is a
-//! compile-time choice between two engines (mutually exclusive cargo features,
+//! compile-time choice between two engines (mutually exclusive crate features,
 //! enforced by the `compile_error!` guards in lib.rs):
 //!  * `tcg` (default): the Unicorn / QEMU-TCG software core in `cpu.rs`.
 //!  * `kvm`: real hardware execution via `/dev/kvm` in `kvm/`.

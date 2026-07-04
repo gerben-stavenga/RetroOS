@@ -7,7 +7,7 @@
 //! `KernelEvent` a run produces, port-I/O sizes, the IRQ event, the raw page
 //! blob, and the guest-visible selector/size constants. It is `no_std`, has
 //! zero dependencies, and builds identically under both the Bazel freestanding
-//! toolchain (metal) and host cargo (interp).
+//! toolchain (metal) and the host build (interp).
 //!
 //! Backend-internal types (`RootPageTable`, `KernelPages`, `FxState`, `Vcpu`,
 //! `GuestMem`) deliberately do NOT live here — each backend defines its own,

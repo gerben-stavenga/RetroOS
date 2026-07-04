@@ -30,7 +30,7 @@
 //! * **M4** COW fork, LDT/TLS, ELF load → run a 32-bit flat-PM ELF.
 //!
 //! The self-contained Unicorn proof-of-concept that seeded this backend lives
-//! at `examples/poc.rs` (`cargo run -p retroos-arch-interp --example poc`).
+//! at `examples/poc.rs` (`bazelisk run //arch-interp:poc --platforms=@platforms//host`).
 
 // Re-export the backend-agnostic contract so `crate::arch::{Regs, KernelEvent,
 // Irq, RawPage, PAGE_SIZE, LOW_MEM_BASE, USER_CS, ...}` resolve here exactly as

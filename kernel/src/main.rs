@@ -4,12 +4,13 @@
 //! ports (0xE9→stdout, ATA→image, COM1→host directory) — then hands off to the
 //! same `kernel::startup()` the metal crt0 calls.
 //!
-//!   cargo run -p kernel -- disk.img                 # boot the real kernel
-//!   cargo run -p kernel -- --host DIR disk.img      # ...with /host = DIR
-//!   cargo run -p kernel -- --cmd "PROG ARGS" disk.img  # boot straight into PROG, then halt
-//!   cargo run -p kernel -- program.elf [args...]     # run one 32-bit Linux ELF directly
-//!   cargo run -p kernel -- apps/busybox/busybox sh   # ...e.g. an interactive BusyBox shell
-//!   cargo run -p kernel                             # arch-boundary demo
+//!   retroos-host disk.img                  # boot the real kernel
+//!   retroos-host --host DIR disk.img       # ...with /host = DIR
+//!   retroos-host --cmd "PROG ARGS" disk.img  # boot straight into PROG, then halt
+//!   retroos-host program.elf [args...]     # run one 32-bit Linux ELF directly
+//!   retroos-host apps/busybox/busybox sh   # ...e.g. an interactive BusyBox shell
+//!   retroos-host                           # arch-boundary demo
+//! (build: bazelisk build //kernel:retroos-host --platforms=@platforms//host)
 
 use retroos_arch_interp as arch;
 use std::io::Read;
@@ -33,22 +34,6 @@ fn host_log_byte(b: u8) {
 }
 
 fn main() {
-    // Cargo builds carry no embedded bootfs (Bazel links those bytes into
-    // the Bazel retroos-host); /boot is an invariant, so load the same
-    // Bazel-built TAR at runtime. Not optional: refuse to boot without it.
-    // (Bazel builds — including the bare in-OS build tool, whose empty TAR
-    // is intentional — skip this; the linked bytes are the truth.)
-    if !kernel::bootfs_is_embedded() {
-        match std::fs::read("bazel-bin/bootfs_tar.tar") {
-            Ok(b) => kernel::set_bootfs(Box::leak(b.into_boxed_slice())),
-            Err(e) => {
-                eprintln!("retroos-host: bazel-bin/bootfs_tar.tar: {e}");
-                eprintln!("the bootfs (DN + COMMAND.COM) is required; build it with:");
-                eprintln!("    bazelisk build //:bootfs_tar");
-                std::process::exit(1);
-            }
-        }
-    }
 
     let mut host_dir: Option<String> = None;
     let mut cmd: Option<String> = None;
@@ -80,9 +65,9 @@ fn main() {
             // offline (no real card on the host). Without this flag the audio
             // ports are unpopulated and the kernel sound path is inert.
             "--wav" => wav = args.next(),
-            // The live window moved to its own binary: `cargo run -p retroos-play`.
+            // The live window moved to its own binary: retroos-play.
             "--window" => {
-                eprintln!("retroos-host is headless; use `cargo run -p retroos-play -- <disk> [--cmd ...]`");
+                eprintln!("retroos-host is headless; use `./run.sh hosted` (retroos-play) for the window");
                 std::process::exit(2);
             }
             // First positional ends flag parsing; the rest are the program's argv.

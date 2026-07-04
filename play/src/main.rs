@@ -1,6 +1,6 @@
 //! retroos-play — boot a RetroOS disk image with a live SDL window.
 //!
-//!   cargo run -p retroos-play -- bazel-bin/image_proprietary.bin \
+//!   ./run.sh hosted -i proprietary \
 //!       --cmd "GAMES/SKYROADS/SKYROADS.EXE" --cwd "GAMES/SKYROADS/"
 //!
 //! Threading: the SDL window (event pump + present) owns the MAIN thread; the
@@ -54,11 +54,9 @@ fn main() {
 
     // The bootfs (DN + COMMAND.COM, the /boot invariant) is linked into this
     // binary the same way it is into retroos-host / kernel.elf: the Bazel
-    // `bootfs_host` object supplies the `_binary_bootfs_tar_*` symbols and the
-    // kernel is built `--cfg=bootfs_embedded`, so `bootfs()` reads them. (Before
-    // retroos-play moved off cargo it had to load the TAR at runtime; embedding
-    // keeps the windowed path a single host-platform build with no separate
-    // bootfs_tar step.)
+    // `bootfs_host` object supplies the `_binary_bootfs_tar_*` symbols that
+    // `bootfs()` reads — the windowed path is a single host-platform build
+    // with no separate bootfs_tar step.
 
     // CPU/kernel worker: interpreter state is thread-local, so the platform is
     // composed here, on the thread that will run it.

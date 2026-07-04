@@ -47,7 +47,7 @@ Run via the unified launcher (see the repo root `run.sh`):
 ```
 
 The crate vendors and builds a patched Unicorn C core (needs `cmake` + a C
-compiler); both the Bazel and cargo paths must link the *same* patched fork.
+compiler); every binary links the one Bazel-built patched fork.
 
 Design parity is the rule: differences between metal and interp live **below**
 the arch boundary (emulated devices, a deadline-budget virtual timer), never as

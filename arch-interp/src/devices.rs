@@ -255,7 +255,7 @@ pub fn attach_hostfs(dir: &str) {
 // signature; 0x0019 is the file directory: a u32 count (big-endian) followed by
 // 64-byte entries `{ size:u32 BE, select:u16 BE, reserved:u16, name:[u8;56] }`.
 // File items get selectors from 0x0020 up. Serving a small in-memory file set
-// lets `cargo run -- --cmd "PROG ARGS"` boot straight into one program headless,
+// lets `retroos-host --cmd "PROG ARGS"` boot straight into one program headless,
 // with no keyboard — the device behind the ports differs, `startup()` does not.
 
 const FW_CFG_SEL: u16 = 0x510;

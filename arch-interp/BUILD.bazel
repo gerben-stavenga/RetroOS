@@ -1,16 +1,16 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 # The hosted backend (host-config build only; the metal kernel links
 # //arch-metal instead). Two targets, one per execution engine — the engine is
 # a compile-time choice (see src/engine.rs):
 #  * :arch-interp     — the TCG engine (Unicorn, the patched fork pinned in
-#                       Cargo.lock, via the crate_universe repo @crates).
+#                       MODULE.bazel, via the crate_universe repo @crates).
 #  * :arch-interp-kvm — the KVM engine (/dev/kvm); no Unicorn C core at all.
 rust_library(
     name = "arch-interp",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "retroos_arch_interp",
-    # Bazel does not read cargo default features: select the engine explicitly.
+    # Engine selection is per-target: exactly one of tcg/kvm.
     crate_features = ["tcg"],
     edition = "2021",
     # abort matches //lib and //arch-abi (see //kernel:kernel_hosted).
@@ -47,4 +47,56 @@ rust_library(
         "@crates//:kvm-ioctls",
         "@crates//:libc",
     ],
+)
+
+# ---- tests (bazelisk test //arch-interp:all --platforms=@platforms//host) ----
+# In-crate unit tests per engine. The kvm proofs run for real when /dev/kvm is
+# accessible and skip with a message otherwise; force with
+# --test_env=RETRO_REQUIRE_KVM=1.
+rust_test(
+    name = "arch-interp-test",
+    crate = ":arch-interp",
+    crate_features = ["tcg"],
+    # abort matches the rlibs; a failing assert aborts the test binary, which
+    # Bazel reports as the test failing (same signal, less itemization).
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+)
+
+rust_test(
+    name = "arch-interp-kvm-test",
+    crate = ":arch-interp-kvm",
+    crate_features = ["kvm"],
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+)
+
+# Software-MMU integration test over the public arch surface.
+rust_test(
+    name = "mmu-test",
+    srcs = ["tests/mmu.rs"],
+    edition = "2021",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+    deps = [
+        ":arch-interp",
+        "//arch-abi",
+    ],
+)
+
+# The self-contained Unicorn proof-of-concept that seeded this backend.
+rust_binary(
+    name = "poc",
+    srcs = ["examples/poc.rs"],
+    edition = "2021",
+    deps = ["@crates//:unicorn-engine"],
 )

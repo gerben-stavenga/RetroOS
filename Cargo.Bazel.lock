@@ -12,16 +12,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "arch-abi"
-version = "0.1.0"
-
-[[package]]
 name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
 dependencies = [
- "bitflags 2.12.1",
+ "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
  "itertools",
@@ -43,15 +39,15 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.12.1"
+version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "cc"
-version = "1.2.63"
+version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "556e016178bb5662a08681bbe0f00f8e17631781a4dfc8c45e466e4b185ec27f"
+checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
 dependencies = [
  "find-msvc-tools",
  "shlex 2.0.1",
@@ -108,6 +104,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "direct-cargo-bazel-deps"
+version = "0.0.1"
+dependencies = [
+ "ext4-view",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "rustc-demangle",
+ "sdl2",
+ "spin",
+ "unicorn-engine",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -119,7 +129,7 @@ version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecf18f4817ea4baf95d700eb763642e65f77a94e630867028024b6725848a028"
 dependencies = [
- "bitflags 2.12.1",
+ "bitflags 2.13.0",
  "crc",
 ]
 
@@ -151,18 +161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernel"
-version = "0.1.0"
-dependencies = [
- "arch-abi",
- "ext4-view",
- "lib",
- "retroos-arch-interp",
- "rustc-demangle",
- "spin",
-]
-
-[[package]]
 name = "kvm-bindings"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,7 +175,7 @@ version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "333f77a20344a448f3f70664918135fddeb804e938f28a99d685bd92926e0b19"
 dependencies = [
- "bitflags 2.12.1",
+ "bitflags 2.13.0",
  "kvm-bindings",
  "libc",
  "vmm-sys-util",
@@ -188,10 +186,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "lib"
-version = "0.1.0"
 
 [[package]]
 name = "libc"
@@ -211,15 +205,15 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.32"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "memchr"
-version = "2.8.1"
+version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
+checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "minimal-lexical"
@@ -264,18 +258,18 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.45"
+version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
+checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
 
 [[package]]
 name = "regex"
-version = "1.12.3"
+version = "1.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
+checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -296,31 +290,9 @@ dependencies = [
 
 [[package]]
 name = "regex-syntax"
-version = "0.8.10"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "retroos-arch-interp"
-version = "0.1.0"
-dependencies = [
- "arch-abi",
- "kvm-bindings",
- "kvm-ioctls",
- "lib",
- "libc",
- "unicorn-engine",
-]
-
-[[package]]
-name = "retroos-play"
-version = "0.1.0"
-dependencies = [
- "kernel",
- "lib",
- "retroos-arch-interp",
- "sdl2",
-]
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rustc-demangle"
@@ -330,9 +302,9 @@ checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
 
 [[package]]
 name = "rustc-hash"
-version = "2.1.2"
+version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "sdl2"
@@ -378,9 +350,9 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "syn"
-version = "2.0.117"
+version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -409,7 +381,8 @@ dependencies = [
 [[package]]
 name = "unicorn-engine-sys"
 version = "2.1.5"
-source = "git+https://github.com/gerben-stavenga/unicorn-retroos-patch?rev=269253342e0cf2d415db12b3579abb865b43b13b#269253342e0cf2d415db12b3579abb865b43b13b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "685282714d35a6fbfed0ae14d81bb11c91838bc7a165cac778321679a7bb91d8"
 dependencies = [
  "bindgen",
  "cc",

@@ -14,8 +14,15 @@ RetroOS is an educational x86 operating system written mostly in Rust with minim
 bazelisk build //:image            # Build complete bootable disk image
 bazelisk build //kernel:kernel_elf  # Build kernel only (multiboot-loadable ELF)
 ./run.sh qemu [--arch 386|686|x64] # Run in QEMU (unified launcher; see ./run.sh header)
-./run.sh hosted --cmd GAMES/X      # Run the interp backend as a host process
+./run.sh hosted --cmd GAMES/X      # Run the hosted backend (add --kvm for the KVM engine)
+bazelisk test //arch-interp:all --platforms=@platforms//host  # arch unit tests (tcg + kvm proofs)
 ```
+
+Bazel is the ONLY build system (no cargo): third-party crates are declared as
+`crate.spec` entries in MODULE.bazel, pinned by `Cargo.Bazel.lock` +
+`cargo-bazel-lock.json` (repin with `CARGO_BAZEL_REPIN=1 bazelisk build ...`
+after changing a spec). Engine/feature selection is per-target
+`crate_features` in BUILD files.
 
 `run.sh` is the single launcher for every backend/firmware (`qemu`, `bochs`,
 `86box`, `hosted`); the old `run_qemu.sh` / `run_uefi.sh` / `run_interp.sh` are

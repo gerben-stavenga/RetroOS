@@ -81,11 +81,10 @@ pub use arch_abi::{BootConfig, parse_debug_watch};
 /// CONFIG.SYS) linked in as raw bytes (`//:bootfs_tar` → objcopy → the
 /// `_binary_bootfs_tar_*` symbols), so /boot ALWAYS exists, mounted on top
 /// of whatever the root is — a bare kernel.elf from someone's GRUB, an
-/// imageless hosted run, anything. None only in the bare kernel
-/// (`kernel_elf_bare`, used by image_min) and the cargo build of the hosted
-/// binary (Bazel links the bytes — `bootfs_embedded` cfg; cargo can't).
-#[cfg(any(not(feature = "hosted"), bootfs_embedded))]
-#[allow(unexpected_cfgs)]
+/// imageless hosted run, anything. Every build links a bootfs object; None
+/// only for the intentionally-empty TAR of the bare kernel (`kernel_elf_bare`
+/// / `retroos-host-bare`, used by the in-OS toolchain to break the
+/// COMMAND.COM cycle).
 pub fn bootfs() -> Option<&'static [u8]> {
     unsafe extern "C" {
         static _binary_bootfs_tar_start: u8;
@@ -99,58 +98,6 @@ pub fn bootfs() -> Option<&'static [u8]> {
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts(start as *const u8, end - start) })
-}
-
-/// Cargo build of the hosted binaries: no linked TAR bytes. The std
-/// front-ends (retroos-play, cargo retroos-host) read the Bazel-built
-/// `//:bootfs_tar` at startup and hand it over here before boot — refusing
-/// to run without it, so /boot is the same invariant as everywhere else.
-#[cfg(all(feature = "hosted", not(bootfs_embedded)))]
-#[allow(unexpected_cfgs)]
-mod external_bootfs {
-    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-    static PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-    static LEN: AtomicUsize = AtomicUsize::new(0);
-
-    pub fn set(bytes: &'static [u8]) {
-        LEN.store(bytes.len(), Ordering::Relaxed);
-        PTR.store(bytes.as_ptr() as *mut u8, Ordering::Release);
-    }
-
-    pub fn get() -> Option<&'static [u8]> {
-        let ptr = PTR.load(Ordering::Acquire);
-        if ptr.is_null() {
-            return None;
-        }
-        Some(unsafe { core::slice::from_raw_parts(ptr, LEN.load(Ordering::Relaxed)) })
-    }
-}
-
-#[cfg(all(feature = "hosted", not(bootfs_embedded)))]
-#[allow(unexpected_cfgs)]
-pub fn bootfs() -> Option<&'static [u8]> {
-    external_bootfs::get()
-}
-
-/// Install the runtime-loaded bootfs TAR (cargo hosted builds only; the
-/// embedded-bootfs builds ignore it — the linked bytes are the truth).
-#[cfg(all(feature = "hosted", not(bootfs_embedded)))]
-#[allow(unexpected_cfgs)]
-pub fn set_bootfs(bytes: &'static [u8]) {
-    external_bootfs::set(bytes);
-}
-
-#[cfg(any(not(feature = "hosted"), bootfs_embedded))]
-#[allow(unexpected_cfgs)]
-pub fn set_bootfs(_bytes: &'static [u8]) {}
-
-/// Whether this build links the bootfs bytes (Bazel; the bare build tool's
-/// intentionally-empty TAR counts — it must NOT runtime-load one). The std
-/// front-end mains consult this: only the pure-cargo builds load the TAR
-/// from disk at startup.
-#[allow(unexpected_cfgs)]
-pub fn bootfs_is_embedded() -> bool {
-    cfg!(any(not(feature = "hosted"), bootfs_embedded))
 }
 
 // The multiboot info structs + the metal scratch/zero page frames moved into

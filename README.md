@@ -88,7 +88,7 @@ For booting on a real UEFI machine via its installed GRUB, see [BOOTING.md](BOOT
 - `play` - `retroos-play`, the windowed host emulator built on `arch-interp`
 
 The kernel is backend-agnostic: it links either `arch-metal` (Bazel, `no_std`,
-bare metal) or `arch-interp` (cargo/Bazel, `std`, hosted) and behaves the same.
+bare metal) or `arch-interp` (`std`, hosted) and behaves the same.
 All ring-3 execution is normalized into the same kernel-facing flow: run a task,
 capture an event, handle it, repeat.
 

@@ -7,6 +7,7 @@ the kernel's Linux personality.
 Build and run:
 
     gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start -o /tmp/hello.elf apps/hosted-test/hello.c
-    cargo run -p kernel -- /tmp/hello.elf
+    bazelisk build //kernel:retroos-host --platforms=@platforms//host
+    bazel-bin/kernel/retroos-host /tmp/hello.elf
 
 Expected stdout: `Hello from an interpreted 32-bit Linux ELF!`

@@ -112,7 +112,7 @@ register_toolchains(
 )
 
 # ---- the Unicorn C core, as a Bazel cmake target ---------------------------
-# Source = the patched fork (same rev Cargo.lock pins for the Rust crate).
+# Source = the patched fork (matching the unicorn-engine crate pinned below).
 # Built by //third_party/unicorn with the configured host CC toolchain;
 # rules_foreign_cc supplies a downloaded cmake, so nothing here depends on
 # host tool paths.
@@ -132,25 +132,61 @@ http_archive(
 )""",
 )
 
-# ---- crate_universe: the hosted (cargo-workspace) dependency graph --------
-# Generates Bazel targets for every crates.io/git dependency in Cargo.lock,
-# so retroos-host builds as an ordinary rust_binary instead of
-# cargo-in-a-genrule. unicorn-engine-sys is fully de-build-scripted: the C
-# core comes from //third_party/unicorn and the bindgen output is vendored
-# (see the patch) — no libclang, no host-path pins, and the whole bindgen
-# build-dependency tree is never built.
+# ---- crate_universe: third-party Rust dependencies (Bazel-only) -----------
+# Third-party crates, declared directly (no cargo, no Cargo.toml manifests):
+# `crate.spec` + `crate.from_specs` resolve against crates.io and pin in
+# cargo-bazel-lock.json (repin: CARGO_BAZEL_REPIN=1 bazelisk build ...).
+# Versions/features here are the single source of truth; each rust_library/
+# rust_binary picks its deps and crate_features explicitly per target — no
+# additive-feature unification, which is exactly why the engine split
+# (tcg vs kvm) stays clean. unicorn-engine-sys is fully de-build-scripted:
+# the C core comes from //third_party/unicorn and the bindgen output is
+# vendored (see the patch) — no libclang, no host-path pins, and the whole
+# bindgen build-dependency tree is never built.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
-crate.from_cargo(
-    name = "crates",
-    cargo_lockfile = "//:Cargo.lock",
-    manifests = [
-        "//:Cargo.toml",
-        "//arch-abi:Cargo.toml",
-        "//arch-interp:Cargo.toml",
-        "//kernel:Cargo.toml",
-        "//lib:Cargo.toml",
-        "//play:Cargo.toml",
+
+# Hosted backend (arch-interp).
+crate.spec(package = "libc", version = "0.2")
+crate.spec(package = "unicorn-engine", version = "=2.1.5")  # tcg engine
+crate.spec(package = "kvm-ioctls", version = "0.24")  # kvm engine
+crate.spec(
+    package = "kvm-bindings",
+    version = "0.14",
+    features = ["fam-wrappers"],
+)
+
+# Kernel (hosted).
+crate.spec(package = "ext4-view", version = "0.9.3")
+crate.spec(package = "rustc-demangle", version = "0.1.24")
+crate.spec(
+    package = "spin",
+    version = "0.9",
+    default_features = False,
+    features = [
+        "mutex",
+        "spin_mutex",
     ],
+)
+
+# retroos-play (SDL window). `bundled`+`static-link` compile a static SDL2
+# in the sys crate's build script — no system libSDL2 at build or run time.
+crate.spec(
+    package = "sdl2",
+    version = "0.37",
+    default_features = False,
+    features = [
+        "bundled",
+        "static-link",
+    ],
+)
+
+crate.from_specs(
+    name = "crates",
+    # Both pins are Bazel-owned: Cargo.Bazel.lock is the resolver's version
+    # pinning (Cargo.lock format, no cargo involved), cargo-bazel-lock.json
+    # the rendered-repository pinning.
+    cargo_lockfile = "//:Cargo.Bazel.lock",
+    lockfile = "//:cargo-bazel-lock.json",
 )
 crate.annotation(
     crate = "unicorn-engine-sys",

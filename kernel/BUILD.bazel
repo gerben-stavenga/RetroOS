@@ -25,9 +25,7 @@ rust_static_library(
 )
 
 # ---- hosted: the same kernel on the arch-interp backend, as a host binary --
-# What `cargo build -p kernel --features hosted` used to produce; now an
-# ordinary Bazel target so kernel changes rebuild it like everything else
-# (the cargo genrule reused stale binaries — no declared inputs).
+# An ordinary Bazel target so kernel changes rebuild it like everything else.
 # Genrules consume it via `tools` (exec config = host platform); to build it
 # directly, pass --platforms=@platforms//host (the workspace default target
 # platform is the bare-metal one).
@@ -40,10 +38,7 @@ rust_library(
     edition = "2024",
     # abort matches //lib and //arch-abi (abort rlibs can't link into an
     # unwind binary; unwind rlibs like std/@crates link into abort fine).
-    # bootfs_embedded: Bazel links the bootfs bytes (bootfs_obj_host), so
-    # the symbol-reading bootfs() is selected; cargo keeps the None arm.
     rustc_flags = [
-        "--cfg=bootfs_embedded",
         "-Cpanic=abort",
         # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
         # metal setting); a PIE link rejects them — build non-PIE to match.
@@ -91,7 +86,6 @@ rust_library(
     visibility = ["//visibility:public"],
     edition = "2024",
     rustc_flags = [
-        "--cfg=bootfs_embedded",
         "-Cpanic=abort",
         "-Crelocation-model=static",
     ],

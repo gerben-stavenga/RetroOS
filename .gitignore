@@ -3,8 +3,6 @@ bazel-*
 .bazelrc.user
 MODULE.bazel.lock
 
-# Cargo
-target/
 
 # Build artifacts
 build/
@@ -41,7 +39,6 @@ traces/
 .claude/
 
 # Bazel-built kernel lockfile (regenerated)
-kernel/Cargo.lock
 
 # Stray DOS build artifacts at repo root (DOSBox/in-OS COMMAND build outputs)
 /COMMAND.COM
