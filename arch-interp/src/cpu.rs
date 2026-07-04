@@ -22,7 +22,6 @@ use crate::sysdesc::{
     SYS_SIZE, TF_FLAG, TRAMP_ADDR, VIF_FLAG, VM_FLAG,
 };
 use crate::vcpu;
-use crate::view::InterpView;
 use arch_abi::monitor::MonitorResult;
 use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
 use core::cell::{Cell, RefCell};
@@ -341,20 +340,20 @@ pub fn execute() -> KernelEvent {
         // it's valid — the CPU thread).
         crate::screendump::maybe_dump();
         crate::screendump::maybe_render_live();
-        let p = &raw mut vcpu::REGS;
-        let regs = unsafe { &mut (*p).regs };
-        let mode = regs.mode();
+        // The single `&mut Vcpu` for this iteration — the one unsafe here is
+        // dereferencing the `static mut REGS`; everything downstream (register
+        // access via `Deref<Target=Regs>`, guest memory via `GuestBytes`, the
+        // monitor calls) is a safe reborrow of it.
+        let vcpu = unsafe { &mut *(&raw mut vcpu::REGS) };
+        let mode = vcpu.mode();
         // Virtual-IF stepping: while a PM client has its virtual IF (VIF) off,
         // emulate the leading IF-touching opcodes in software so we only ever
         // hand unicorn a non-sensitive instruction (which `configure` then
         // TF-single-steps).
-        if mode == UserMode::Mode32 && regs.flags32() & VIF_FLAG == 0 {
+        if mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
             // A sensitive op decoded during stepping (e.g. IRET popping CS=0)
-            // bubbles as an Event — surface it rather than re-entering. The view
-            // is bound to the interpreted thread's own space (REGS.space), not
-            // the globally-active one.
-            let mut view = InterpView { space: unsafe { &mut (*p).space } };
-            if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if(regs, &mut view) {
+            // bubbles as an Event — surface it rather than re-entering.
+            if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if::<crate::Interp>(vcpu) {
                 return ev;
             }
         }
@@ -364,7 +363,7 @@ pub fn execute() -> KernelEvent {
         if budget_spent() {
             BUDGET.with(|b| b.set(IRQ_PERIOD));
         }
-        let begin = configure(uc, regs, mode);
+        let begin = configure(uc, vcpu, mode);
         {
             let d = uc.get_data_mut();
             d.pending = None;
@@ -376,8 +375,8 @@ pub fn execute() -> KernelEvent {
 
         if trace_on() {
             eprintln!("[run] mode={:?} cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} ds={:#06x} flags={:#x}",
-                mode, regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
-                regs.ds as u16, regs.frame.rflags);
+                mode, vcpu.code_seg(), vcpu.frame.rip, vcpu.frame.ss as u16, vcpu.frame.rsp,
+                vcpu.ds as u16, vcpu.frame.rflags);
         }
         let mut run = run_slice(uc, begin, usize::MAX);
         // Resolve interp-internal stops without bubbling to the kernel:
@@ -386,7 +385,7 @@ pub fn execute() -> KernelEvent {
         //    A present-page fault (RO write) or illegal VA bubbles as PageFault.
         //  * Trampoline retire: if the slice budget expired with EIP still inside
         //    the CPL-0 iretd scratch window (the block hook counts it too), ring-0
-        //    mid-switch state must NOT surface as user regs — the kernel would
+        //    mid-switch state must NOT surface as user vcpu — the kernel would
         //    deliver IRQs onto it and corrupt the client (duke3d/raptor DOS/4GW
         //    wild-jump SEGVs; DN exec-window ffbf panics). Step it out first.
         for _ in 0..256 {
@@ -424,12 +423,12 @@ pub fn execute() -> KernelEvent {
             }
             run = run_slice(uc, eip, 1);
         }
-        store_regs(uc, regs, mode);
+        store_regs(uc, vcpu, mode);
         // A page fault that demand-paging did not resolve is a genuine SEGV: the
         // kernel signals the thread. Carry CR2 + the #PF error code.
         if matches!(uc.get_data().pending_intr, Some(14) | Some(8)) && !uc.get_data().pending_is_int {
             let cr2 = uc.get_data().pending_cr2;
-            regs.err_code = uc.get_data().pending_err as u64;
+            vcpu.err_code = uc.get_data().pending_err as u64;
             uc.get_data_mut().pending_intr = None;
             return KernelEvent::PageFault { addr: cr2 };
         }
@@ -437,7 +436,7 @@ pub fn execute() -> KernelEvent {
             let intr = uc.get_data().pending_intr;
             let ev = uc.get_data().pending.is_some();
             eprintln!("   -> cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} intr={:?} ev={} run={:?}",
-                regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
+                vcpu.code_seg(), vcpu.frame.rip, vcpu.frame.ss as u16, vcpu.frame.rsp,
                 intr, ev, run.is_ok());
         }
 
@@ -471,8 +470,7 @@ pub fn execute() -> KernelEvent {
             // (duke3d/raptor at sound init); forwarding the #GP to the client's
             // own handler cascaded into a wild jump.
             if n == 13 && !is_int && uc.get_data().pending_err == 0 {
-                let mut view = InterpView { space: unsafe { &mut (*p).space } };
-                match arch_abi::monitor::monitor(regs, &mut view) {
+                match arch_abi::monitor::monitor::<crate::Interp>(vcpu) {
                     MonitorResult::Resume => continue,
                     MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
                     MonitorResult::Event(ev) => return ev,
@@ -491,7 +489,7 @@ pub fn execute() -> KernelEvent {
             if is_int {
                 return KernelEvent::SoftInt(n);
             }
-            regs.err_code = uc.get_data().pending_err as u64;
+            vcpu.err_code = uc.get_data().pending_err as u64;
             return KernelEvent::Exception(n);
         }
         if let Some(ev) = uc.get_data_mut().pending.take() {

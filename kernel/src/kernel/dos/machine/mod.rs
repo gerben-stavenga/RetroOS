@@ -15,7 +15,6 @@
 
 extern crate alloc;
 
-use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::Vcpu;
 
@@ -653,11 +652,11 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
 
 /// Resolve the linear base of segment `sel`. VM86 uses `sel*16`; PM walks
 /// GDT/LDT via the arch descriptor helpers.
-fn seg_base_for<A: crate::Arch>(machine: &mut A, regs: &Vcpu<A::PageTable>, sel: u16) -> u32 {
+fn seg_base_for<A: crate::Arch>(regs: &Vcpu<A::PageTable>, sel: u16) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         (sel as u32) << 4
     } else {
-        machine.seg_base(sel)
+        A::seg_base(sel)
     }
 }
 
@@ -709,7 +708,7 @@ pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
 /// does a single element and decrements the count — `dec_rep_count` — each time.
 pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
-    let es_base = seg_base_for(machine, regs, regs.es as u16);
+    let es_base = seg_base_for::<A>(regs, regs.es as u16);
     let di = regs.rdi as u32;
     for i in 0..size {
         let b = emulate_inb(machine, pc, port + i as u16);
@@ -725,7 +724,7 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
 /// per-iteration `rep` contract as `handle_ins_event`.
 pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
-    let ds_base = seg_base_for(machine, regs, regs.ds as u16);
+    let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
     let si = regs.rsi as u32;
     for i in 0..size {
         let b = regs.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);

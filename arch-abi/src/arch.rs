@@ -304,14 +304,20 @@ pub trait Arch {
     /// Disable interrupts and halt forever (panic / shutdown failure).
     fn halt_forever(&mut self) -> !;
 
-    // ── x86 segment helpers (DOS personality) ──────────────────────────────
+    // ── x86 descriptor resolution (DOS personality + the shared monitor) ────
+    //
+    // Associated functions, NOT methods: the descriptor state they read is
+    // ambient to the backend (the live GDT/LDT on metal, the per-thread `desc`
+    // model on interp), not tied to an `Arch` *value*. That is what lets the
+    // shared `monitor` — which runs deep inside `execute()`, holding no `&mut
+    // self` — reach them with only the type parameter `A`, while the kernel
+    // (which does hold `&mut A`) calls them as `A::seg_base(sel)`.
 
-    /// Linear base of selector `sel` from the live descriptor tables.
-    fn seg_base(&self, sel: u16) -> u32;
+    /// Linear base of selector `sel` from the current descriptor tables.
+    fn seg_base(sel: u16) -> u32;
     /// Whether selector `sel` is a 32-bit (D=1) segment.
-    fn seg_is_32(&self, sel: u16) -> bool;
-    /// Software-reflect a VM86 `INT n` into the guest's IVT handler (used when
-    /// VME is unavailable, e.g. on the interp). Operates on the register frame;
-    /// a `&mut Vcpu` coerces here via `DerefMut`.
-    fn sw_reflect_vm86_int(&mut self, regs: &mut Regs, vector: u8);
+    fn seg_is_32(sel: u16) -> bool;
+    /// Does the VM86 redirection bitmap trap this vector (true), or should the
+    /// monitor reflect it through the real-mode IVT itself (false)?
+    fn int_intercepted(vector: u8) -> bool;
 }

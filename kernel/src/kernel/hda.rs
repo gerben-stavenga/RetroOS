@@ -36,7 +36,6 @@
 //! DMA-window pool. HDA and AC'97 are mutually exclusive (one `Audio` verdict),
 //! so reusing the same window + DMA channel is safe.
 
-use arch_abi::Arch;
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 

@@ -670,22 +670,6 @@ pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
     unsafe { phys::frame_ptr((pa >> 12) as u64).add((pa & 0xFFF) as usize) }
 }
 
-/// Page-directory ppage of the space named by `id` (not the active space).
-pub fn pd_of_space(id: u32) -> u64 {
-    SPACES.with(|s| *s.borrow().pd.get(&id).expect("resolve in unknown space"))
-}
-
-/// Resolve `vaddr` through a SPECIFIC address-space `id`'s page directory — the
-/// space-id form of [`resolve_in`]. The sensitive-instruction monitor uses this
-/// to read/write the *interpreted thread's* memory (the thread carries its
-/// space id in its `RootPageTable`), which is the only space guaranteed to be
-/// the right one: the kernel moves the globally-`active` space around to peek
-/// other spaces (exec argv copy, focus VGA snapshot), and unicorn's CR3 follows
-/// `active`, so neither is a safe basis for the monitor's reads.
-pub fn resolve_in_space(id: u32, vaddr: u32) -> *mut u8 {
-    resolve_in(pd_of_space(id), vaddr)
-}
-
 /// Guest-fault resolve from the software CPU (#PF, no EIP progress + CR2). Returns
 /// `true` if the page was demand-committed (retry) and `false` for a genuinely
 /// illegal access (null guard / out of range) that must bubble as `PageFault`.

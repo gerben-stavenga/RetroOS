@@ -13,7 +13,6 @@
 //! NVMe takes `+0xE0000..+0xEC000`. See memory `project_ac97_lowmem_dma_window_todo`
 //! for the proper DMA-window-pool fix that should eventually replace both.
 
-use arch_abi::Arch;
 use spin::Mutex;
 use crate::kernel::pci;
 use lib::println;

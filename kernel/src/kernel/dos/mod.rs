@@ -16,7 +16,6 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::Vcpu;
-use arch_abi::Arch; // `machine: &mut TheArch` trait methods (set_irq_line, …)
 use arch_abi::GuestBytes;
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
@@ -567,20 +566,20 @@ pub fn handle_event<A: crate::Arch>(
                 // handler that fixes up DX:AX and advances EIP past the
                 // DIV. Reflect instead of killing — this matches what
                 // FreeDOS does.
-                machine.sw_reflect_vm86_int(regs, n);
+                arch_abi::monitor::sw_reflect_vm86_int(&mut regs.regs, &mut regs.space, n);
                 thread::KernelAction::Done
             } else {
                 let lin = if is_vm86 {
                     ((regs.code_seg() as u32) << 4).wrapping_add(regs.ip32())
                 } else {
-                    machine.seg_base(regs.code_seg()).wrapping_add(regs.ip32())
+                    A::seg_base(regs.code_seg()).wrapping_add(regs.ip32())
                 };
                 let mut bytes = [0u8; 8];
                 regs.copy_from(lin as usize, &mut bytes);
                 let ss_lin = if is_vm86 {
                     ((regs.stack_seg() as u32) << 4).wrapping_add(regs.sp32() & 0xFFFF)
                 } else {
-                    machine.seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
+                    A::seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
                 };
                 let s0 = regs.read::<u16>((ss_lin) as usize);
                 let s1 = regs.read::<u16>((ss_lin.wrapping_add(2)) as usize);

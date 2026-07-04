@@ -26,7 +26,6 @@
 //! see memory `project_ac97_lowmem_dma_window_todo`. Until then, do NOT "restore"
 //! the `LOW_MEM_BASE + 0xC0000` window to identity — this driver owns it.
 
-use arch_abi::Arch;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 

@@ -22,7 +22,6 @@
 
 use crate::kernel::platform;
 use crate::kernel::thread::Personality;
-use arch_abi::Arch;
 
 /// Rebuild the live I/O bitmap for a thread taking the CPU: deny-all
 /// baseline, then exactly what its personality + focus state allow. Called

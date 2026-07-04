@@ -9,7 +9,6 @@ use crate::Vcpu;
 use crate::kernel::{vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
-use arch_abi::Arch; // the `machine: &mut TheArch` trait methods (execute/switch_to/…)
 use arch_abi::GuestBytes;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)

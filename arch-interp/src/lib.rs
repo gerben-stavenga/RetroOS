@@ -63,14 +63,12 @@ mod machine;
 mod mmu;
 mod paging;
 mod phys;
-pub mod monitor;
 mod screendump;
 mod space;
 mod sysdesc;
 mod tty;
 mod vcpu;
 mod vga;
-mod view;
 
 pub use backend::Interp;
 pub use calls::*;

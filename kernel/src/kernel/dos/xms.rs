@@ -3,7 +3,6 @@
 //! Pure bookkeeping over the VM86 linear address space above the HMA.
 //! Physical backing comes from the kernel's demand paging.
 
-use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::kernel::dos::linear;
 use crate::Vcpu;

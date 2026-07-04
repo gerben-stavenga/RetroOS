@@ -15,9 +15,8 @@ use crate::sysdesc::{
     if_to_vif, sys_ptr, vif_to_if, write_tables, GDT_ADDR, GDT_BYTES, IDT_ADDR, IOPL_MASK,
     LDT_ADDR, LDT_SEL, NT_FLAG, TF_FLAG, TSS_ADDR, TSS_SEL, VIF_FLAG, VM_FLAG,
 };
-use crate::vcpu;
-use crate::view::InterpView;
 use arch_abi::monitor::MonitorResult;
+use arch_abi::GuestBytes;
 use arch_abi::{KernelEvent, Regs, UserMode};
 use kvm_bindings::{kvm_guest_debug, kvm_regs, kvm_segment, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP};
 use kvm_ioctls::VcpuExit;
@@ -319,16 +318,15 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
 /// port would need KVM's deferred emulator completion (SI/DI/CX bookkeeping)
 /// that our fresh-entry model deliberately cancels — panic loudly rather
 /// than corrupt the guest.
-fn io_insn_len(regs: &Regs, view: &mut InterpView, port: u16) -> u32 {
-    use arch_abi::monitor::GuestView;
-    let base = if regs.mode() == UserMode::VM86 {
-        (regs.code_seg() as u32) << 4
+fn io_insn_len(vcpu: &crate::vcpu::Vcpu, port: u16) -> u32 {
+    let base = if vcpu.mode() == UserMode::VM86 {
+        (vcpu.code_seg() as u32) << 4
     } else {
-        crate::desc::seg_base(regs.code_seg())
+        crate::desc::seg_base(vcpu.code_seg())
     };
     let mut len: u32 = 0;
     loop {
-        let b = view.read8(base.wrapping_add(regs.ip32()).wrapping_add(len));
+        let b = vcpu.read::<u8>(base.wrapping_add(vcpu.ip32()).wrapping_add(len) as usize);
         match b {
             // Legacy prefixes (operand/address size, rep, lock, seg overrides).
             0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => len += 1,
@@ -380,46 +378,45 @@ pub fn execute() -> KernelEvent {
         crate::screendump::maybe_dump();
         crate::screendump::maybe_render_live();
 
-        let p = &raw mut vcpu::REGS;
-        let regs = unsafe { &mut (*p).regs };
-        let mode = regs.mode();
+        // One `&mut Vcpu` for the iteration — the sole unsafe is dereferencing
+        // the `static mut REGS`; the monitor, memory reads and enter/sync_out
+        // helpers all reborrow it (register access via Deref, memory via GuestBytes).
+        let vcpu = unsafe { &mut *(&raw mut crate::vcpu::REGS) };
+        let mode = vcpu.mode();
 
         // Virtual-IF stepping: while a PM client's virtual IF is off, emulate
         // the IF-touching opcodes in software; hardware runs only one
         // non-sensitive instruction at a time (KVM single-step).
         let mut stepping = false;
-        if mode == UserMode::Mode32 && regs.flags32() & VIF_FLAG == 0 {
-            let (scs, sip) = (regs.code_seg(), regs.ip32());
-            let mut view = InterpView { space: unsafe { &mut (*p).space } };
-            let r = arch_abi::monitor::step_virtual_if(regs, &mut view);
+        if mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
+            let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
+            let r = arch_abi::monitor::step_virtual_if::<crate::Interp>(vcpu);
             if step_trace_on() {
-                let mut view = InterpView { space: unsafe { &mut (*p).space } };
-                use arch_abi::monitor::GuestView;
-                let op = view.read8(crate::desc::seg_base(scs).wrapping_add(sip));
+                let op = vcpu.read::<u8>(crate::desc::seg_base(scs).wrapping_add(sip) as usize);
                 eprintln!(
                     "[step] {scs:#06x}:{sip:#010x} op={op:02X} -> ip={:#010x} vif={} r={}",
-                    regs.ip32(),
-                    (regs.flags32() & VIF_FLAG != 0) as u8,
+                    vcpu.ip32(),
+                    (vcpu.flags32() & VIF_FLAG != 0) as u8,
                     match &r { MonitorResult::Resume => "resume", MonitorResult::Event(_) => "event" }
                 );
             }
             if let MonitorResult::Event(ev) = r {
                 return ev;
             }
-            stepping = regs.flags32() & VIF_FLAG == 0;
+            stepping = vcpu.flags32() & VIF_FLAG == 0;
         }
 
         // The INTR-line check (the TCG block hook's analogue): hand the slice
         // to the kernel when an IRQ is deliverable.
-        if crate::machine::irq_line() && regs.flags32() & VIF_FLAG != 0 {
+        if crate::machine::irq_line() && vcpu.flags32() & VIF_FLAG != 0 {
             return KernelEvent::Irq;
         }
 
         if trace_on() {
             eprintln!(
                 "[kvm] mode={:?} cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} ds={:#06x} flags={:#x} step={}",
-                mode, regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp,
-                regs.ds as u16, regs.frame.rflags, stepping
+                mode, vcpu.code_seg(), vcpu.frame.rip, vcpu.frame.ss as u16, vcpu.frame.rsp,
+                vcpu.ds as u16, vcpu.frame.rflags, stepping
             );
         }
 
@@ -427,19 +424,19 @@ pub fn execute() -> KernelEvent {
         // virtual IF set and comes back with it clear must correspond to a
         // guest CLI (opcode FA at the pre-slice IP, emulated by the monitor).
         // Anything else is the engine losing an interrupt-enable.
-        let vif_pre = regs.flags32() & VIF_FLAG != 0;
-        let pre_cs = regs.code_seg();
-        let pre_ip = regs.ip32();
+        let vif_pre = vcpu.flags32() & VIF_FLAG != 0;
+        let pre_cs = vcpu.code_seg();
+        let pre_ip = vcpu.ip32();
         let mut shim_vec: Option<(u8, u32)> = None;
 
-        enter(k, regs, mode);
+        enter(k, vcpu, mode);
         // After SET_REGS, never before — see set_single_step.
         set_single_step(k, stepping);
 
         // The inner run loop: an EINTR (timer kick) or single-step exit can
         // land while the vcpu is INSIDE the trap shim — the CPL3→CPL0
         // delivery happened but the stub's exit `out` hasn't retired. Ring-0
-        // shim state must NOT surface as user regs (the TCG engine has the
+        // shim state must NOT surface as user vcpu (the TCG engine has the
         // identical rule for its trampoline, cpu.rs "trampoline retire"): the
         // interrupted user frame lives on the ring-0 stack and only the stub
         // knows the vector. So: leave the vcpu state untouched and re-run
@@ -475,8 +472,8 @@ pub fn execute() -> KernelEvent {
                     panic!(
                         "KVM_EXIT_FAIL_ENTRY (reason={reason:#x}, cpu={cpu}) mode={mode:?} \
                          cs={:#x}:{:#x} sregs={sregs:#x?}",
-                        regs.code_seg(),
-                        regs.frame.rip
+                        vcpu.code_seg(),
+                        vcpu.frame.rip
                     );
                 }
                 Ok(other) => panic!("unhandled KVM exit: {other:?}"),
@@ -484,11 +481,11 @@ pub fn execute() -> KernelEvent {
             match kind {
                 Kind::Intr | Kind::Debug if in_shim(k) => continue,
                 Kind::Intr => {
-                    sync_out(k, regs, mode);
+                    sync_out(k, vcpu, mode);
                     break Some(KernelEvent::Irq);
                 }
                 // The single stepped instruction retired: re-check the next
-                // one IN PLACE. The vcpu's live state already equals `regs`
+                // one IN PLACE. The vcpu's live state already equals `vcpu`
                 // after the sync, so as long as the monitor only peeks (a
                 // non-sensitive next opcode), the re-step needs no SET_SREGS,
                 // no table rewrite, no SET_REGS — just a re-anchored
@@ -496,25 +493,23 @@ pub fn execute() -> KernelEvent {
                 // path every stepped instruction pays the full entry cost
                 // (including the GDT/LDT copy) and CLI-heavy games crawl.
                 Kind::Debug => {
-                    sync_out(k, regs, mode);
-                    if stepping && mode == UserMode::Mode32 && regs.flags32() & VIF_FLAG == 0 {
-                        let (scs, sip) = (regs.code_seg(), regs.ip32());
-                        let snap_fl = regs.flags32() & !TF_FLAG;
-                        let p2 = &raw mut vcpu::REGS;
-                        let mut view = InterpView { space: unsafe { &mut (*p2).space } };
-                        let r = arch_abi::monitor::step_virtual_if(regs, &mut view);
+                    sync_out(k, vcpu, mode);
+                    if stepping && mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
+                        let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
+                        let snap_fl = vcpu.flags32() & !TF_FLAG;
+                        let r = arch_abi::monitor::step_virtual_if::<crate::Interp>(vcpu);
                         if step_trace_on() {
                             eprintln!(
                                 "[step] {scs:#06x}:{sip:#010x} (fast) -> ip={:#010x} vif={} r={}",
-                                regs.ip32(),
-                                (regs.flags32() & VIF_FLAG != 0) as u8,
+                                vcpu.ip32(),
+                                (vcpu.flags32() & VIF_FLAG != 0) as u8,
                                 match &r { MonitorResult::Resume => "resume", MonitorResult::Event(_) => "event" }
                             );
                         }
                         match r {
                             MonitorResult::Event(ev) => break Some(ev),
                             MonitorResult::Resume => {
-                                if regs.ip32() == sip && regs.flags32() & !TF_FLAG == snap_fl {
+                                if vcpu.ip32() == sip && vcpu.flags32() & !TF_FLAG == snap_fl {
                                     // Next opcode is non-sensitive: step it on
                                     // the live vcpu state.
                                     set_single_step(k, true); // re-anchor at the new RIP
@@ -532,8 +527,8 @@ pub fn execute() -> KernelEvent {
                     let kregs = k.vcpu.get_regs().expect("KVM_GET_REGS");
                     let f = read_frame(kregs.rsp);
                     shim_vec = Some((f.vector, f.err_code));
-                    sync_out_shim(k, regs, mode, &f);
-                    break dispatch_shim(k, regs, mode, &f);
+                    sync_out_shim(k, vcpu, mode, &f);
+                    break dispatch_shim(k, vcpu, mode, &f);
                 }
                 // A direct exit happens BEFORE the instruction retires (rip
                 // advance / IN writeback are deferred to the next KVM_RUN).
@@ -544,14 +539,12 @@ pub fn execute() -> KernelEvent {
                 // (its linear-rip guard no longer matches), so the kernel's
                 // IN answer in EAX survives re-entry.
                 Kind::Io { port, is_in, bytes } => {
-                    sync_out(k, regs, mode);
-                    let p = &raw mut vcpu::REGS;
-                    let mut view = InterpView { space: unsafe { &mut (*p).space } };
-                    let len = io_insn_len(regs, &mut view, port);
-                    let ip = regs.ip32().wrapping_add(len);
+                    sync_out(k, vcpu, mode);
+                    let len = io_insn_len(vcpu, port);
+                    let ip = vcpu.ip32().wrapping_add(len);
                     let wrap16 = mode == UserMode::VM86
-                        || !crate::desc::seg_is_32(regs.code_seg());
-                    regs.set_ip32(if wrap16 { ip & 0xFFFF } else { ip });
+                        || !crate::desc::seg_is_32(vcpu.code_seg());
+                    vcpu.set_ip32(if wrap16 { ip & 0xFFFF } else { ip });
                     let size = match bytes {
                         1 => arch_abi::IoSize::Byte,
                         2 => arch_abi::IoSize::Word,
@@ -564,32 +557,29 @@ pub fn execute() -> KernelEvent {
                     });
                 }
                 Kind::BadPhys | Kind::Shutdown => {
-                    sync_out(k, regs, mode);
+                    sync_out(k, vcpu, mode);
                     break Some(KernelEvent::Fault);
                 }
             }
         };
 
-        if step_trace_on() && vif_pre && regs.flags32() & VIF_FLAG == 0 {
-            let p2 = &raw mut vcpu::REGS;
-            let mut view = InterpView { space: unsafe { &mut (*p2).space } };
+        if step_trace_on() && vif_pre && vcpu.flags32() & VIF_FLAG == 0 {
             let base = if mode == UserMode::VM86 {
                 (pre_cs as u32) << 4
             } else {
                 crate::desc::seg_base(pre_cs)
             };
-            use arch_abi::monitor::GuestView;
-            let op = view.read8(base.wrapping_add(pre_ip));
+            let op = vcpu.read::<u8>(base.wrapping_add(pre_ip) as usize);
             eprintln!(
                 "[VIF-DROP] mode={mode:?} pre={pre_cs:#06x}:{pre_ip:#010x} op={op:02X} \
                  post={:#06x}:{:#010x} shim={shim_vec:?} ev={ev:?}",
-                regs.code_seg(), regs.ip32()
+                vcpu.code_seg(), vcpu.ip32()
             );
         }
         if trace_on() {
             eprintln!(
                 "   -> cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} ev={ev:?}",
-                regs.code_seg(), regs.frame.rip, regs.frame.ss as u16, regs.frame.rsp
+                vcpu.code_seg(), vcpu.frame.rip, vcpu.frame.ss as u16, vcpu.frame.rsp
             );
         }
         match ev {
@@ -604,11 +594,10 @@ pub fn execute() -> KernelEvent {
 /// events — the same dispatch ladder as `cpu.rs` lines 442-546.
 fn dispatch_shim(
     _k: &mut KvmCpu,
-    regs: &mut Regs,
+    vcpu: &mut crate::vcpu::Vcpu,
     mode: UserMode,
     f: &ShimFrame,
 ) -> Option<KernelEvent> {
-    let p = &raw mut vcpu::REGS;
     let n = f.vector;
 
     // #PF: the paging backend's own business. Absent VA → demand-commit;
@@ -627,7 +616,7 @@ fn dispatch_shim(
         if resolved {
             return None; // re-enter at the faulting IP (SET_SREGS reflushes the TLB)
         }
-        regs.err_code = f.err_code as u64;
+        vcpu.err_code = f.err_code as u64;
         return Some(KernelEvent::PageFault { addr: cr2 });
     }
 
@@ -640,8 +629,7 @@ fn dispatch_shim(
     // e.g. a selector-load fault) is a genuine #GP, typed Exception(13) below
     // with the error code preserved.
     if n == 13 {
-        let mut view = InterpView { space: unsafe { &mut (*p).space } };
-        match arch_abi::monitor::monitor(regs, &mut view) {
+        match arch_abi::monitor::monitor::<crate::Interp>(vcpu) {
             MonitorResult::Resume => return None,
             MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
             MonitorResult::Event(ev) => return Some(ev),
@@ -655,8 +643,8 @@ fn dispatch_shim(
         // #GP (13) must bubble, never reflect (see the TCG intr hook: at
         // IOPL=1 the monitor owns it; IVT[0Dh] is a guest disk/UMB handler).
         if n != 3 && n != 4 && n != 13 && !crate::desc::int_intercepted(n) {
-            let mut view = InterpView { space: unsafe { &mut (*p).space } };
-            arch_abi::monitor::sw_reflect_vm86_int(regs, &mut view, n);
+            let crate::vcpu::Vcpu { regs, space } = vcpu;
+            arch_abi::monitor::sw_reflect_vm86_int(regs, space, n);
             return None;
         }
         // Residual VM86 traps: trapped vectors and the DPL=3 gates.
@@ -671,6 +659,6 @@ fn dispatch_shim(
     if n == 3 || n == 4 || n >= 0x30 {
         return Some(KernelEvent::SoftInt(n));
     }
-    regs.err_code = f.err_code as u64;
+    vcpu.err_code = f.err_code as u64;
     Some(KernelEvent::Exception(n))
 }

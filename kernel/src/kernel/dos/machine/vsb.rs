@@ -13,7 +13,6 @@
 //!    playback from the guest's DMA buffer into the canonical kernel `sound`
 //!    API (`audio_tick`), with no real-card interaction at all.
 
-use arch_abi::Arch;
 use super::*;
 
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the

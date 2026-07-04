@@ -1,52 +1,25 @@
 //! Sensitive-instruction monitor — backend-agnostic x86 decoder for #GP traps.
 //!
 //! When ring-3 code executes an IOPL-sensitive instruction (CLI/STI, PUSHF/POPF,
-//! IRET, HLT, INT n, IN/OUT) the CPU raises #GP. Both arch backends land here:
-//!  - **metal** takes a real #GP and the guest's page tables are live, so its
-//!    [`GuestView`] dereferences linear addresses directly;
-//!  - **interp** stops the unicorn slice on #GP and its [`GuestView`] routes
-//!    every access through the software MMU **of the interpreted thread**.
+//! IRET, HLT, INT n, IN/OUT) the CPU raises #GP. Both arch backends drive the
+//! shared decoder with the faulting [`Vcpu`](crate::Vcpu): register state plus
+//! guest memory come from it directly (`vcpu` is [`GuestBytes`](crate::GuestBytes)),
+//! and the three descriptor facts the decoder needs — selector base, operand
+//! size, VM86 interrupt redirection — come from the backend TYPE parameter `A`
+//! as the associated functions [`Arch::seg_base`](crate::Arch::seg_base) etc.
+//! No `A` *value* is required, which is what lets the decoder run this deep
+//! inside `execute()` where no `&mut A` handle exists — it needs only the type.
 //!
-//! The decoder, IP advance, flag/stack emulation and the virtual-IF single-step
-//! driver are identical on both — they operate purely on [`Regs`] plus the
-//! [`GuestView`] memory/segment capability. Only the memory backing differs,
-//! which is exactly what `GuestView` abstracts.
-//!
-//! The view is taken by `&mut`: the monitor *writes* guest memory (PUSHF, INT
-//! frame pushes) and, on interp, even a read can demand-commit a page — both
-//! mutate the thread's owned address space. On metal that state is the live
-//! hardware page tables (the `&mut` is a no-op token); on interp it is the
-//! thread's software MMU, which must be the *interpreted* thread's, not whatever
-//! space is globally active (the kernel moves `active` to peek other spaces).
+//! The vcpu is `&mut` because the monitor *writes* guest memory (PUSHF, INT
+//! frame pushes). On interp it resolves the *interpreted* thread's space —
+//! which is the globally-active one here, because the monitor runs
+//! synchronously inside `execute()` while that thread is the running one.
 //!
 //! Instructions finishable at the machine level (flag toggles, stack work, VM86
 //! IVT reflect) return [`MonitorResult::Resume`]; those needing kernel help
 //! (port emulation, soft INT dispatch, idle) return a typed [`KernelEvent`].
 
-use crate::{IoSize, KernelEvent, Regs, UserMode};
-
-/// The memory + segment-resolution capability the monitor needs, **bound to the
-/// interpreted thread**. Each backend implements it over its own guest memory:
-/// metal dereferences the linear address directly (its page tables are live);
-/// interp resolves through that thread's software MMU. All addresses are linear.
-///
-/// Methods take `&mut self` because guest writes — and, on interp, demand-paged
-/// reads — mutate the thread's address space; the `&mut` makes that exclusive.
-pub trait GuestView {
-    fn read8(&mut self, lin: u32) -> u8;
-    fn read16(&mut self, lin: u32) -> u16;
-    fn read32(&mut self, lin: u32) -> u32;
-    fn write16(&mut self, lin: u32, val: u16);
-    fn write32(&mut self, lin: u32, val: u32);
-    /// Linear base of a selector (VM86 callers pass `seg<<4` themselves; this is
-    /// only consulted in PM, where the monitor resolves CS/SS through it).
-    fn seg_base(&mut self, sel: u16) -> u32;
-    /// Is the selector a 32-bit (D/B=1) segment?
-    fn seg_is_32(&mut self, sel: u16) -> bool;
-    /// Does the VM86 redirection bitmap trap this vector (true) or should the
-    /// monitor reflect it through the real-mode IVT itself (false)?
-    fn int_intercepted(&mut self, vector: u8) -> bool;
-}
+use crate::{Arch, GuestBytes, IoSize, KernelEvent, Regs, UserMode, Vcpu};
 
 /// Result of one monitor decode step. `Resume` is the fast path — the caller
 /// returns to ring-3. `Event(e)` carries a typed kernel event to bubble up.
@@ -131,23 +104,23 @@ pub fn virtual_if_stepping(regs: &Regs) -> bool {
 /// Resolve (linear base, 32-bit?) for the code segment at fault time.
 /// VM86 uses CS*16 and is always 16-bit; PM looks through the descriptor table.
 #[inline]
-fn code_view<V: GuestView>(regs: &Regs, v: &mut V) -> (u32, bool) {
+fn code_view<A: Arch>(regs: &Regs) -> (u32, bool) {
     if regs.mode() == UserMode::VM86 {
         ((regs.code_seg() as u32) << 4, false)
     } else {
         let cs = regs.code_seg();
-        (v.seg_base(cs), v.seg_is_32(cs))
+        (A::seg_base(cs), A::seg_is_32(cs))
     }
 }
 
 /// Resolve (linear base, 32-bit?) for the stack segment at fault time.
 #[inline]
-fn stack_view<V: GuestView>(regs: &Regs, v: &mut V) -> (u32, bool) {
+fn stack_view<A: Arch>(regs: &Regs) -> (u32, bool) {
     if regs.mode() == UserMode::VM86 {
         ((regs.stack_seg() as u32) << 4, false)
     } else {
         let ss = regs.stack_seg();
-        (v.seg_base(ss), v.seg_is_32(ss))
+        (A::seg_base(ss), A::seg_is_32(ss))
     }
 }
 
@@ -170,31 +143,31 @@ fn set_sp(regs: &mut Regs, ss_32: bool, val: u32) {
 }
 
 #[inline]
-fn push16<V: GuestView>(regs: &mut Regs, v: &mut V, ss_base: u32, ss_32: bool, val: u16) {
+fn push16<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool, val: u16) {
     let new_sp = get_sp(regs, ss_32).wrapping_sub(2);
     set_sp(regs, ss_32, new_sp);
-    v.write16(ss_base.wrapping_add(new_sp), val);
+    space.write::<u16>((ss_base.wrapping_add(new_sp)) as usize, val);
 }
 
 #[inline]
-fn pop16<V: GuestView>(regs: &mut Regs, v: &mut V, ss_base: u32, ss_32: bool) -> u16 {
+fn pop16<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool) -> u16 {
     let cur = get_sp(regs, ss_32);
-    let val = v.read16(ss_base.wrapping_add(cur));
+    let val = space.read::<u16>((ss_base.wrapping_add(cur) as usize));
     set_sp(regs, ss_32, cur.wrapping_add(2));
     val
 }
 
 #[inline]
-fn push32<V: GuestView>(regs: &mut Regs, v: &mut V, ss_base: u32, ss_32: bool, val: u32) {
+fn push32<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool, val: u32) {
     let new_sp = get_sp(regs, ss_32).wrapping_sub(4);
     set_sp(regs, ss_32, new_sp);
-    v.write32(ss_base.wrapping_add(new_sp), val);
+    space.write::<u32>((ss_base.wrapping_add(new_sp)) as usize, val);
 }
 
 #[inline]
-fn pop32<V: GuestView>(regs: &mut Regs, v: &mut V, ss_base: u32, ss_32: bool) -> u32 {
+fn pop32<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool) -> u32 {
     let cur = get_sp(regs, ss_32);
-    let val = v.read32(ss_base.wrapping_add(cur));
+    let val = space.read::<u32>((ss_base.wrapping_add(cur) as usize));
     set_sp(regs, ss_32, cur.wrapping_add(4));
     val
 }
@@ -205,11 +178,11 @@ fn pop32<V: GuestView>(regs: &mut Regs, v: &mut V, ss_base: u32, ss_32: bool) ->
 /// redirection-bitmap bit is clear, and by the kernel's VM86 exception-dispatch
 /// path (#DE/#BP/#OF reflect to the program's own real-mode handler).
 #[inline]
-pub fn sw_reflect_vm86_int<V: GuestView>(regs: &mut Regs, v: &mut V, vector: u8) {
+pub fn sw_reflect_vm86_int<P: GuestBytes>(regs: &mut Regs, space: &mut P, vector: u8) {
     // IVT lives at linear 0; entries are 4 bytes each.
     let ivt_addr = (vector as u32) * 4;
-    let new_ip = v.read16(ivt_addr);
-    let new_cs = v.read16(ivt_addr + 2);
+    let new_ip = space.read::<u16>((ivt_addr) as usize);
+    let new_cs = space.read::<u16>((ivt_addr + 2) as usize);
 
     let ss_base = (regs.stack_seg() as u32) << 4;
     // The guest observes its virtual-IF (VIF) in the bit-9 slot of the saved
@@ -217,9 +190,9 @@ pub fn sw_reflect_vm86_int<V: GuestView>(regs: &mut Regs, v: &mut V, vector: u8)
     let flags = guest_flags(regs) as u16;
     let old_cs = regs.code_seg();
     let old_ip = regs.ip32() as u16;
-    push16(regs, v, ss_base, false, flags);
-    push16(regs, v, ss_base, false, old_cs);
-    push16(regs, v, ss_base, false, old_ip);
+    push16(regs, space, ss_base, false, flags);
+    push16(regs, space, ss_base, false, old_cs);
+    push16(regs, space, ss_base, false, old_ip);
     regs.clear_flag32(VIF_FLAG);
     regs.clear_flag32(TF_FLAG);
     regs.set_cs32(new_cs as u32);
@@ -266,15 +239,23 @@ fn string_io(regs: &mut Regs, cs_32: bool, advance: u32, rep: bool, addr32: bool
 /// Decode the instruction at CS:IP and either finish it inline (`Resume`) or
 /// return a typed kernel event (`Event`). At entry bit 9 of `regs.flags32()`
 /// holds the guest's virtual interrupt flag.
-pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
+pub fn monitor<A: Arch>(vcpu: &mut Vcpu<A::PageTable>) -> MonitorResult {
+    let Vcpu { regs, space } = vcpu; // disjoint &mut to regs and guest memory
+    monitor_rs::<A>(regs, space)
+}
+
+/// The decode body, in split `(regs, memory)` form — `step_virtual_if` drives
+/// it with the same two borrows. `A` is used only for its static segment/int
+/// resolution (`A::seg_base` etc.); memory is the `A::PageTable` handle.
+fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResult {
     use KernelEvent as E;
     use MonitorResult::Event;
-    let (cs_base, cs_32) = code_view(regs, v);
-    let (ss_base, ss_32) = stack_view(regs, v);
+    let (cs_base, cs_32) = code_view::<A>(regs);
+    let (ss_base, ss_32) = stack_view::<A>(regs);
     let start_ip = regs.ip32();
-    // Read the i'th instruction byte. Not a closure — each call reborrows `v`
-    // so the stack helpers below can also take `&mut V`.
-    macro_rules! peek { ($off:expr) => { v.read8(cs_base.wrapping_add(start_ip.wrapping_add($off))) }; }
+    // Read the i'th instruction byte. Not a closure — each call reborrows
+    // `space` so the stack helpers below can also take `&mut` it.
+    macro_rules! peek { ($off:expr) => { space.read::<u8>(cs_base.wrapping_add(start_ip.wrapping_add($off)) as usize) }; }
 
     // Parse the legacy prefixes we care about: 0x66 (operand-size), 0x67
     // (address-size), and 0xF2/0xF3 (REP — only meaningful on the string I/O
@@ -319,15 +300,15 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
         0x9C => {
             advance_ip(regs, cs_32, advance);
             let flags = guest_flags(regs);
-            if op32 { push32(regs, v, ss_base, ss_32, flags); }
-            else    { push16(regs, v, ss_base, ss_32, flags as u16); }
+            if op32 { push32(regs, space, ss_base, ss_32, flags); }
+            else    { push16(regs, space, ss_base, ss_32, flags as u16); }
             MonitorResult::Resume
         }
         // POPF / POPFD — IOPL/VM/real-IF preserved; the guest's bit-9 → VIF.
         0x9D => {
             advance_ip(regs, cs_32, advance);
-            let flags = if op32 { pop32(regs, v, ss_base, ss_32) }
-                        else    { pop16(regs, v, ss_base, ss_32) as u32 };
+            let flags = if op32 { pop32(regs, space, ss_base, ss_32) }
+                        else    { pop16(regs, space, ss_base, ss_32) as u32 };
             apply_guest_flags(regs, flags);
             MonitorResult::Resume
         }
@@ -335,9 +316,9 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
         0xCF => {
             // Don't pre-advance IP — we're loading it from the stack.
             if op32 {
-                let new_eip = pop32(regs, v, ss_base, ss_32);
-                let new_cs  = pop32(regs, v, ss_base, ss_32) as u16;
-                let new_fl  = pop32(regs, v, ss_base, ss_32);
+                let new_eip = pop32(regs, space, ss_base, ss_32);
+                let new_cs  = pop32(regs, space, ss_base, ss_32) as u16;
+                let new_fl  = pop32(regs, space, ss_base, ss_32);
                 if new_cs == 0 {
                     return Event(E::Fault);
                 }
@@ -345,9 +326,9 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
                 regs.set_cs32(new_cs as u32);
                 apply_guest_flags(regs, new_fl);
             } else {
-                let new_ip = pop16(regs, v, ss_base, ss_32);
-                let new_cs = pop16(regs, v, ss_base, ss_32);
-                let new_fl = pop16(regs, v, ss_base, ss_32) as u32;
+                let new_ip = pop16(regs, space, ss_base, ss_32);
+                let new_cs = pop16(regs, space, ss_base, ss_32);
+                let new_fl = pop16(regs, space, ss_base, ss_32) as u32;
                 if new_cs == 0 && regs.mode() != UserMode::VM86 {
                     return Event(E::Fault);
                 }
@@ -368,8 +349,8 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
             let vector = peek!(advance);
             advance += 1;
             advance_ip(regs, cs_32, advance);
-            if regs.mode() == UserMode::VM86 && !v.int_intercepted(vector) {
-                sw_reflect_vm86_int(regs, v, vector);
+            if regs.mode() == UserMode::VM86 && !A::int_intercepted(vector) {
+                sw_reflect_vm86_int(regs, space, vector);
                 MonitorResult::Resume
             } else {
                 Event(E::SoftInt(vector))
@@ -496,11 +477,12 @@ pub fn monitor<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
 // - Only meaningful in PM mode with virtual IF already == 0.
 // - TF management lives entirely here; `monitor()` opcode handlers never touch TF.
 
-pub fn step_virtual_if<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResult {
+pub fn step_virtual_if<A: Arch>(vcpu: &mut Vcpu<A::PageTable>) -> MonitorResult {
     // Upper bound on sensitive instructions emulated before yielding back to
     // hardware. Prevents a runaway interpret loop on e.g. `POPF; POPF; ...`.
     const BUDGET: usize = 64;
 
+    let Vcpu { regs, space } = vcpu;
     for _ in 0..BUDGET {
         // Fast path: virtual IF (VIF) came back on — stop stepping.
         if regs.flags32() & VIF_FLAG != 0 {
@@ -511,17 +493,17 @@ pub fn step_virtual_if<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResul
         // Peek the next opcode (skipping legacy prefixes) to decide if we MUST
         // emulate it. Only the flag-touching instructions that would silently
         // drop IF need software emulation here.
-        let (cs_base, _) = code_view(regs, v);
+        let (cs_base, _) = code_view::<A>(regs);
         let mut p = regs.ip32();
         loop {
-            let b = v.read8(cs_base.wrapping_add(p));
+            let b = space.read::<u8>((cs_base.wrapping_add(p) as usize));
             if b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 {
                 p = p.wrapping_add(1);
             } else {
                 break;
             }
         }
-        let op = v.read8(cs_base.wrapping_add(p));
+        let op = space.read::<u8>((cs_base.wrapping_add(p) as usize));
         // 0x9C PUSHF, 0x9D POPF, 0xCF IRET, 0xFA CLI, 0xFB STI.
         let must_emulate = matches!(op, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB);
         if !must_emulate {
@@ -532,7 +514,7 @@ pub fn step_virtual_if<V: GuestView>(regs: &mut Regs, v: &mut V) -> MonitorResul
         }
 
         // Sensitive: emulate via the monitor decoder and loop to re-check.
-        match monitor(regs, v) {
+        match monitor_rs::<A>(regs, space) {
             MonitorResult::Resume => continue,
             ev @ MonitorResult::Event(_) => return ev,
         }

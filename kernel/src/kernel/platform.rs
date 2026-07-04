@@ -10,7 +10,6 @@
 //! site at compile time — deliberately.
 
 use crate::println;
-use arch_abi::Arch;
 
 pub struct Platform {
     pub host: Host,

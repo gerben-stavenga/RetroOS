@@ -18,7 +18,6 @@
 //! where one was found, the port window where a backend installed a sink,
 //! nowhere otherwise — `play` just matches the type.
 
-use arch_abi::Arch;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // RetroOS canonical audio device — a kernel-private ISA port window. It is

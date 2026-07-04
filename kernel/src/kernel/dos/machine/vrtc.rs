@@ -15,7 +15,6 @@
 //! completes and the guest hangs on a black screen — this is the Monkey Island
 //! / SCUMM startup-splash hang.
 
-use arch_abi::Arch;
 const HOST_TIMER_HZ: u64 = 1000;
 
 pub struct VirtualRtc {

@@ -3,7 +3,6 @@
 //! 64KB page-frame in upper memory (set up by `scan_uma`), 256 logical pages
 //! of 16KB each (4MB total) backed by the kernel's demand paging.
 
-use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::dbg_println;
 use crate::Vcpu;

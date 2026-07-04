@@ -6,7 +6,6 @@
 const PAGE_SIZE: usize = 4096;
 extern crate alloc;
 use alloc::vec::Vec;
-use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::Vcpu;
 pub use lib::elf::{ElfError, ElfClass};

@@ -5,7 +5,6 @@
 //! nothing and callers fall back — the same "absent bus reads all-ones"
 //! convention as ISA.
 
-use arch_abi::Arch;
 
 const PCI_CFG_ADDR: u16 = 0xCF8;
 const PCI_CFG_DATA: u16 = 0xCFC;

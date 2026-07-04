@@ -10,7 +10,6 @@
 //! accompanies every switch (see startup's `switch_focus_and_run`) and
 //! tomorrow won't.
 
-use crate::Vcpu;
 use crate::kernel::thread;
 
 /// Compile-time toggle: verify the address-space hash across switches
@@ -40,7 +39,6 @@ impl<A: crate::Arch> ExecutionContext<A> {
 
     /// Run user code until it produces a kernel event.
     pub fn run(&mut self, machine: &mut A) -> crate::KernelEvent {
-        use arch_abi::Arch;
         machine.execute(&mut self.vcpu)
     }
 
@@ -50,7 +48,6 @@ impl<A: crate::Arch> ExecutionContext<A> {
     /// rebuilds the I/O bitmap from policy, and runs the personality's
     /// `on_resume` (LDT/TLS rebinding). Does NOT touch console focus.
     pub fn switch_to(&mut self, threads: &mut [thread::Thread<A>], machine: &mut A, new_tid: usize) {
-        use arch_abi::Arch;
         if new_tid == self.tid {
             return;
         }

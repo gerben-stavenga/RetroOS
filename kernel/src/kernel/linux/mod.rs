@@ -21,7 +21,6 @@ macro_rules! linux_trace {
 }
 
 use arch_abi::GuestBytes;
-use arch_abi::Arch; // `machine: &mut TheArch` trait methods (set_tls_entry, user_fork, …)
 use crate::kernel::elf;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::thread;

@@ -4,7 +4,6 @@
 // Virtual 8253 PIT
 // ============================================================================
 
-use arch_abi::Arch;
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const HOST_TIMER_HZ: u64 = 1000;
 

@@ -8,7 +8,7 @@
 
 use crate::space::RootPageTable;
 use crate::vcpu::{self, Vcpu};
-use arch_abi::{Arch, Irq, KernelEvent, Regs};
+use arch_abi::{Arch, Irq, KernelEvent};
 
 /// The interpreter backend handle. Zero-sized today (state lives in module
 /// statics); it gains fields as the globals migrate into it.
@@ -101,10 +101,8 @@ impl Arch for Interp {
     fn shutdown(&mut self) -> ! { crate::machine::shutdown() }
     fn halt_forever(&mut self) -> ! { crate::machine::halt_forever() }
 
-    // ── x86 segment helpers ──
-    fn seg_base(&self, sel: u16) -> u32 { crate::monitor::seg_base(sel) }
-    fn seg_is_32(&self, sel: u16) -> bool { crate::monitor::seg_is_32(sel) }
-    fn sw_reflect_vm86_int(&mut self, regs: &mut Regs, vector: u8) {
-        unsafe { crate::monitor::sw_reflect_vm86_int(regs, vector) }
-    }
+    // ── x86 descriptor resolution (associated fns — ambient `desc` state) ──
+    fn seg_base(sel: u16) -> u32 { crate::desc::seg_base(sel) }
+    fn seg_is_32(sel: u16) -> bool { crate::desc::seg_is_32(sel) }
+    fn int_intercepted(vector: u8) -> bool { crate::desc::int_intercepted(vector) }
 }

@@ -16,7 +16,6 @@
 
 use crate::Vcpu;
 use crate::kernel::thread;
-use arch_abi::Arch;
 
 /// F11 scancode (press) — focus switch.
 pub const F11_PRESS: u8 = 0x57;

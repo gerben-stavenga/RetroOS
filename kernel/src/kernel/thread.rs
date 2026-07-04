@@ -4,7 +4,6 @@
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
 use crate::Vcpu;
-use arch_abi::Arch;
 use crate::kernel::stacktrace::SymbolData;
 use crate::println;
 use crate::Regs;
@@ -205,7 +204,6 @@ impl<A: crate::Arch> Personality<A> {
     pub fn on_slice(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
         match self {
             Self::Dos(dos) => {
-                use arch_abi::Arch;
                 let ticks = machine.take_pending_ticks();
                 for _ in 0..ticks {
                     crate::kernel::dos::queue_tick(machine, dos);

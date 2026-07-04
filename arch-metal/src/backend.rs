@@ -9,7 +9,7 @@
 
 use super::paging2::RootPageTable;
 use super::x86::FxState;
-use arch_abi::{Arch, Irq, KernelEvent, Regs, Vcpu};
+use arch_abi::{Arch, Irq, KernelEvent, Vcpu};
 
 /// The bare-metal backend handle. Zero-sized today (state lives in module
 /// statics — `traps::REGS`, the timer/IRQ queue); it gains fields as those
@@ -112,10 +112,8 @@ impl Arch for Metal {
     fn shutdown(&mut self) -> ! { super::x86::shutdown() }
     fn halt_forever(&mut self) -> ! { super::halt_forever() }
 
-    // ── x86 segment helpers ──
-    fn seg_base(&self, sel: u16) -> u32 { super::descriptors::seg_base(sel) }
-    fn seg_is_32(&self, sel: u16) -> bool { super::descriptors::seg_is_32(sel) }
-    fn sw_reflect_vm86_int(&mut self, regs: &mut Regs, vector: u8) {
-        unsafe { super::monitor::sw_reflect_vm86_int(regs, vector) }
-    }
+    // ── x86 descriptor resolution (associated fns — ambient GDT/LDT) ──
+    fn seg_base(sel: u16) -> u32 { super::descriptors::seg_base(sel) }
+    fn seg_is_32(sel: u16) -> bool { super::descriptors::seg_is_32(sel) }
+    fn int_intercepted(vector: u8) -> bool { super::descriptors::int_intercepted(vector) }
 }
