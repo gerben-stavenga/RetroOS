@@ -82,7 +82,7 @@ static LAST_RATE: AtomicU32 = AtomicU32::new(0);
 
 /// Does a backend-installed sink answer behind the canonical port window?
 /// Pure probe — called once by `platform::probe`, never cached here.
-pub fn window_present(arch: &mut crate::TheArch) -> bool {
+pub fn window_present<A: crate::Arch>(arch: &mut A) -> bool {
     arch.inw(AUDIO_SIG) == SIGNATURE
 }
 
@@ -90,7 +90,7 @@ pub fn window_present(arch: &mut crate::TheArch) -> bool {
 /// audio output, canonicalizing to i16 stereo on the way. The sink is the
 /// boot-time platform decision; SbPassthrough never produces canonical PCM
 /// (the real card owns sound) and Silent drops it.
-pub fn play(arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
+pub fn play<A: crate::Arch>(arch: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => {

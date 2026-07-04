@@ -6,7 +6,7 @@
 use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::dbg_println;
-use crate::arch::Vcpu;
+use crate::Vcpu;
 use super::xms::EMS_BASE_PAGE;
 use crate::kernel::thread;
 
@@ -35,7 +35,7 @@ fn ems_base_page() -> usize {
 }
 
 /// Swap an EMS window with a backing region.
-fn swap_ems_window(machine: &mut crate::TheArch, window: usize, backing_vpage: usize) {
+fn swap_ems_window<A: crate::Arch>(machine: &mut A, window: usize, backing_vpage: usize) {
     let frame = ems_base_page() + window * 4;
     machine.swap_page_entries(backing_vpage, frame, 4);
 }
@@ -77,14 +77,14 @@ impl EmsState {
 }
 
 /// Ensure EMS state exists for current thread
-fn ems_state(dos: &mut thread::DosState) -> &mut EmsState {
+fn ems_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut EmsState {
     if dos.ems.is_none() {
         dos.ems = Some(alloc::boxed::Box::new(EmsState::new()));
     }
     dos.ems.as_deref_mut().unwrap()
 }
 
-pub(crate) fn int_67h(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
@@ -104,7 +104,7 @@ pub(crate) fn int_67h(machine: &mut crate::TheArch, dos: &mut thread::DosState, 
     result
 }
 
-fn int_67h_inner(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu, ah: u8) -> thread::KernelAction {
+fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, ah: u8) -> thread::KernelAction {
     match ah {
         // AH=40h — Get status
         0x40 => {

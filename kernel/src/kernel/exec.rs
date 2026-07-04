@@ -87,7 +87,7 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
 #[allow(clippy::too_many_arguments)]
-pub fn init_thread(machine: &mut crate::TheArch, threads: &mut [crate::kernel::thread::Thread], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, viopl: u8) -> Result<(), i32> {
+pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, viopl: u8) -> Result<(), i32> {
     match detect_format(&data, path) {
         BinaryFormat::Elf => {
             crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)

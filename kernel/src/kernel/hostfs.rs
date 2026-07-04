@@ -4,7 +4,7 @@
 //! port, which QEMU bridges to a Unix socket where the host-side Python
 //! script serves real file operations.
 
-use crate::arch::{inb, outb};
+use crate::kernel::portio::{inb, outb};
 use crate::kernel::vfs::{Filesystem, Vnode, DirEntry};
 
 const COM1: u16 = 0x3F8;

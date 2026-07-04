@@ -18,12 +18,12 @@ fn cfg_addr(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
         | ((off as u32) & 0xFC)
 }
 
-pub fn read32(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+pub fn read32<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
     arch.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
     arch.inl(PCI_CFG_DATA)
 }
 
-pub fn write32(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
+pub fn write32<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
     arch.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
     arch.outl(PCI_CFG_DATA, val);
 }
@@ -36,7 +36,7 @@ pub fn write32(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8, off: u8, v
 /// port on a high bus (the dev laptop's xHCI is at 65:00.3 — bus 0x65,
 /// function 3), so a buses-0-3 / function-0-only scan misses it and the device
 /// probes as absent. Empty slots read all-ones (0xFFFF vendor id).
-pub fn find_class(arch: &mut crate::TheArch, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
+pub fn find_class<A: crate::Arch>(arch: &mut A, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
     for bus in 0..=255u8 {
         for dev in 0..32u8 {
             for func in 0..8u8 {

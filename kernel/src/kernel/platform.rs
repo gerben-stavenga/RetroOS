@@ -28,10 +28,8 @@ pub enum Host {
     Qemu,
     /// Real hardware — or an emulator without fw_cfg (Bochs), which earns
     /// real-hardware treatment: trust the devices.
-    #[cfg(not(feature = "hosted"))]
     Metal,
     /// The hosted interpreter backend (arch-interp as a host process).
-    #[cfg(feature = "hosted")]
     Interp,
 }
 
@@ -41,15 +39,12 @@ pub enum Host {
 pub enum Display {
     /// A real VGA card answered the SEQ-register probe: guests program the
     /// hardware directly (passthrough port window); console = VGA text.
-    #[cfg(not(feature = "hosted"))]
     VgaCard,
     /// No card, but the loader handed over a linear framebuffer (UEFI/GOP):
     /// the kernel-emulated VGA renders through fbcon.
-    #[cfg(not(feature = "hosted"))]
     Framebuffer,
     /// No card or framebuffer, but a host window installed a present sink
     /// (retroos-play): the emulated VGA renders into the window.
-    #[cfg(feature = "hosted")]
     HostWindow,
     /// Nothing to display on (headless interp run): the emulated VGA still
     /// models state — screendumps and --screenshot remain possible.
@@ -61,7 +56,6 @@ pub enum Display {
 pub enum Firmware {
     /// A legacy BIOS owns F000 (far-JMP at the reset vector): DOS threads
     /// use the real ROM services.
-    #[cfg(not(feature = "hosted"))]
     NativeBios,
     /// No ROM (UEFI metal, interp's zeroed RAM): the DOS personality
     /// installs its substitute Rust BIOS (`dos/bios.rs`).
@@ -128,10 +122,8 @@ pub enum Media {
 pub enum DebugSink {
     /// Port 0xE9 debugcon (QEMU/Bochs `-debugcon`; harmlessly absent on
     /// real metal).
-    #[cfg(not(feature = "hosted"))]
     Debugcon,
     /// The host process's stdout (hosted backend).
-    #[cfg(feature = "hosted")]
     HostStdout,
 }
 
@@ -139,18 +131,51 @@ impl Display {
     /// Guest VGA port programming reaches the real card (vs the VgaState
     /// register model).
     pub fn vga_passthrough(self) -> bool {
-        // `VgaCard` only exists on metal (a hosted run never owns a real card),
-        // so the predicate is constant-false there.
-        #[cfg(feature = "hosted")]
-        {
-            let _ = self;
-            false
-        }
-        #[cfg(not(feature = "hosted"))]
-        {
-            matches!(self, Display::VgaCard)
+        matches!(self, Display::VgaCard)
+    }
+}
+
+/// Environment facts only the ENTRY crate knows — injected before `probe`
+/// instead of selected by `cfg`. Metal installs `{ metal, Debugcon,
+/// fbcon::active }`; the hosted entry installs `{ interp, HostStdout,
+/// || false }`. The default (never installed) describes a bare headless
+/// substitute machine, so a `probe` without an entry is coherent, not UB.
+#[derive(Clone, Copy)]
+pub struct HostEnv {
+    /// Whether the loader handed over a GOP linear framebuffer (metal fbcon).
+    pub fbcon_active: fn() -> bool,
+    /// Where boot debug bytes were routed (recorded for policy).
+    pub debug: DebugSink,
+    /// True on the bare-metal backend (chooses Metal/Qemu vs Interp for host).
+    pub is_metal: bool,
+}
+
+impl HostEnv {
+    fn host(&self, is_qemu: bool) -> Host {
+        if !self.is_metal {
+            Host::Interp
+        } else if is_qemu {
+            Host::Qemu
+        } else {
+            Host::Metal
         }
     }
+}
+
+static mut HOST_ENV: HostEnv = HostEnv {
+    fbcon_active: || false,
+    debug: DebugSink::HostStdout,
+    is_metal: false,
+};
+
+/// Install the entry's environment facts. Boot-time single-threaded; call
+/// before `probe`.
+pub fn set_host_env(env: HostEnv) {
+    unsafe { HOST_ENV = env };
+}
+
+fn host_env() -> HostEnv {
+    unsafe { HOST_ENV }
 }
 
 static mut PLATFORM: Option<Platform> = None;
@@ -158,7 +183,7 @@ static mut PLATFORM: Option<Platform> = None;
 /// Probe the machine and freeze the result. Called exactly once, early in
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
-pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static Platform {
+pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'static Platform {
     let audio = probe_audio(machine);
     let media = probe_media(machine);
 
@@ -166,21 +191,21 @@ pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static
     // backend itself — the interp port bus has no VGA device and its zeroed
     // guest RAM never contains a ROM — and its guest address space doesn't
     // even exist yet this early, so there is nothing to probe.
-    #[cfg(not(feature = "hosted"))]
+    let env = host_env();
     let p = {
-        // A GOP linear framebuffer (fbcon active) IS the scanout the firmware
-        // handed us, so it wins unconditionally — even when a legacy VGA card
-        // also answers its I/O ports. On a UEFI machine the GPU still latches
-        // the VGA sequencer/CRTC registers (so `vga_card_answers` is true), but
-        // that register file no longer drives the panel; the GOP framebuffer
-        // does. Probing VGA first mislabels the display as `VgaCard`, routes the
-        // DOS guest's VGA programming through to those dead legacy registers,
-        // and `display_tick` then skips the GOP present — DOS Navigator launched
-        // on a UEFI laptop showed a blank/white panel while the kernel console
-        // (rendered straight to GOP) was fine. Only when no framebuffer was
-        // handed over (legacy-BIOS boot) does the real VGA card own the screen.
-        let display = if crate::fbcon::active() {
+        // Display resolution, unified across backends by precedence:
+        //   fbcon → present-sink → VGA card → headless.
+        // Each predicate is false on the backends it can't apply to (a hosted
+        // run's `fbcon_active` hook returns false and no real VGA card answers
+        // its port bus; a metal run installs no window present sink), so one
+        // ordered chain covers both. A GOP linear framebuffer (fbcon active)
+        // wins unconditionally — even when a legacy VGA card also answers its
+        // I/O ports, the GOP framebuffer, not the dead legacy register file,
+        // drives the panel (a UEFI laptop mislabelled `VgaCard` painted blank).
+        let display = if (env.fbcon_active)() {
             Display::Framebuffer
+        } else if lib::vga_render::present_sink_installed() {
+            Display::HostWindow
         } else if vga_card_answers() {
             Display::VgaCard
         } else {
@@ -188,41 +213,25 @@ pub fn probe(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> &'static
         };
 
         // Every legacy BIOS has a far-JMP (0xEA) at the reset vector
-        // F000:FFF0; a UEFI-booted machine (no CSM, nothing mapped at the
-        // legacy ROM window) reads something else. The low-mem window is in
-        // the kernel page tables from boot, so this read is always valid.
-        let reset_vector =
-            unsafe { core::ptr::read_volatile((crate::LOW_MEM_BASE + 0xFFFF0) as *const u8) };
-        let firmware = if reset_vector == 0xEA {
-            Firmware::NativeBios
+        // F000:FFF0. Only metal can probe it: `LOW_MEM_BASE` is a real
+        // kernel-mapped window there, but on the hosted backend it is a GUEST
+        // linear address — dereferencing it as a host pointer would SIGSEGV.
+        // A hosted run has no legacy ROM anyway, so it is always Substitute.
+        let firmware = if env.is_metal {
+            let reset_vector =
+                unsafe { core::ptr::read_volatile((crate::LOW_MEM_BASE + 0xFFFF0) as *const u8) };
+            if reset_vector == 0xEA { Firmware::NativeBios } else { Firmware::Substitute }
         } else {
             Firmware::Substitute
         };
 
         Platform {
-            host: if boot.is_qemu { Host::Qemu } else { Host::Metal },
+            host: env.host(boot.is_qemu),
             display,
             firmware,
             audio,
             media,
-            debug: DebugSink::Debugcon,
-        }
-    };
-
-    #[cfg(feature = "hosted")]
-    let p = {
-        let _ = boot;
-        Platform {
-            host: Host::Interp,
-            display: if lib::vga_render::present_sink_installed() {
-                Display::HostWindow
-            } else {
-                Display::Headless
-            },
-            firmware: Firmware::Substitute,
-            audio,
-            media,
-            debug: DebugSink::HostStdout,
+            debug: env.debug,
         }
     };
 
@@ -256,7 +265,7 @@ pub fn get() -> &'static Platform {
 /// installed a sink. Card presence is machine-wide, so the probe uses the
 /// canonical SB base 0x220 (a per-thread BLASTER override relocates the
 /// guest-visible base, not the card).
-fn probe_audio(machine: &mut crate::TheArch) -> Audio {
+fn probe_audio<A: crate::Arch>(machine: &mut A) -> Audio {
     let sb_absent = machine.inb(0x22C) == 0xFF && machine.inb(0x22E) == 0xFF;
     if !sb_absent {
         return Audio::SbPassthrough;
@@ -359,7 +368,7 @@ fn is_linux_root(lba: u32) -> bool {
     }
 }
 
-fn probe_media(machine: &mut crate::TheArch) -> Media {
+fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
     let _ = machine;
     let hostfs = crate::kernel::hostfs::init();
 
@@ -408,10 +417,10 @@ fn probe_media(machine: &mut crate::TheArch) -> Media {
 }
 
 /// Is a real VGA card on the bus? Write the SEQ index register and read it
-/// back — an absent ISA-bus port reads 0xFF.
-#[cfg(not(feature = "hosted"))]
+/// back — an absent ISA-bus port reads 0xFF (so a hosted run, whose port bus
+/// has no VGA card, answers false and falls through to Headless/HostWindow).
 fn vga_card_answers() -> bool {
-    use crate::arch::{inb, outb};
+    use crate::kernel::portio::{inb, outb};
     let saved = inb(0x3C4);
     outb(0x3C4, 0x02);
     let present = inb(0x3C4) == 0x02;

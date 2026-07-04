@@ -19,7 +19,7 @@ static KIND: AtomicU8 = AtomicU8::new(NONE);
 
 /// Probe and select the boot disk. Called once from `startup` before the
 /// partition scan.
-pub fn init(arch: &mut crate::TheArch) {
+pub fn init<A: crate::Arch>(arch: &mut A) {
     if hdd::probe() {
         hdd::reset(); // needed when booted via GRUB (controller left idle)
         KIND.store(ATA, Ordering::Relaxed);

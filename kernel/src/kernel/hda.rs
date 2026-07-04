@@ -159,11 +159,11 @@ struct Hda {
 /// Find an HDA controller (class 0x04, subclass 0x03) anywhere on PCI, via the
 /// shared `pci::find_class` scan. Like `ac97::scan`, tolerant of a no-PCI
 /// backend (all 0xFFFF…).
-pub fn scan(arch: &mut crate::TheArch) -> Option<(u8, u8, u8)> {
+pub fn scan<A: crate::Arch>(arch: &mut A) -> Option<(u8, u8, u8)> {
     crate::kernel::pci::find_class(arch, 0x04, 0x03)
 }
 
-pub fn init(arch: &mut crate::TheArch) {
+pub fn init<A: crate::Arch>(arch: &mut A) {
     if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedHda {
         return;
     }
@@ -173,7 +173,7 @@ pub fn init(arch: &mut crate::TheArch) {
 
 /// Bring up the controller + codec output path at `bus:dev.func`. Returns true
 /// on success.
-fn bring_up(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8) -> bool {
+fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     // Enable memory space + bus master in the PCI command register (bits 1, 2).
     let cmd = crate::kernel::pci::read32(arch, bus, dev, func, 0x04);
     crate::kernel::pci::write32(arch, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
@@ -591,7 +591,7 @@ impl Hda {
 
 /// Stream a block of source PCM to the HDA codec (called by `sound::play` when an
 /// HDA controller was discovered).
-pub fn play(arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
+pub fn play<A: crate::Arch>(arch: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
     let _ = arch;
     let mut g = HDA.lock();
     if let Some(dev) = g.as_mut() {

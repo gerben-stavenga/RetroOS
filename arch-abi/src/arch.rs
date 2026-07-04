@@ -165,7 +165,7 @@ pub trait Arch {
     /// `vcpu.read(addr)` work.
     type PageTable: GuestBytes + Copy + Default;
     /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
-    type Fx: Copy;
+    type Fx: Copy + Default;
 
     // ── Port I/O ───────────────────────────────────────────────────────────
 

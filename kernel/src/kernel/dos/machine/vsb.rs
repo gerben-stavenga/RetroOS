@@ -177,7 +177,7 @@ impl SoundBlaster {
     }
 
     /// Current QEMU i8257 count for the SB 8-bit host channel.
-    pub fn diag_host_count8(&self, machine: &mut crate::TheArch) -> u16 {
+    pub fn diag_host_count8<A: crate::Arch>(&self, machine: &mut A) -> u16 {
         real_8237_count(machine, self.host_dma8)
     }
 
@@ -200,7 +200,7 @@ impl SoundBlaster {
     /// state and OMF2's sound-init probe falls into a "wait for the card
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
-    pub fn release_dma_pool(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+    pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
         if self.emulated() {
             // No real card / no buffer alias in emulation: just stop the
             // software DSP so the next program sees a clean, idle card.
@@ -235,7 +235,7 @@ impl SoundBlaster {
     /// shim for DSP command E4h/E8h (test register write/read). Some older
     /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
     /// sb16 does not appear to surface that response through passthrough.
-    pub fn sb_read(&mut self, machine: &mut crate::TheArch, p: u16) -> u8 {
+    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, p: u16) -> u8 {
         if self.emulated() {
             return self.emu_read(p);
         }
@@ -251,7 +251,7 @@ impl SoundBlaster {
 
     /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
     /// locally; all other traffic continues to the real QEMU sb16/adlib.
-    pub fn sb_write(&mut self, machine: &mut crate::TheArch, p: u16, val: u8) {
+    pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
         if self.emulated() {
             self.emu_write(p, val);
             return;
@@ -290,7 +290,7 @@ impl SoundBlaster {
     ///  - **everything else** (not-yet-armed = programming snapshot,
     ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
     ///    the captured guest programming.
-    pub fn dma_read(&mut self, machine: &mut crate::TheArch, port: u16) -> u8 {
+    pub fn dma_read<A: crate::Arch>(&mut self, machine: &mut A, port: u16) -> u8 {
         // Channel-data ports only: DMA1 0x00..=0x07 (addr/count pairs for
         // chan 0..3), DMA2 0xC0..=0xCF (addr/count pairs for chan 4..7,
         // 4-byte stride per channel due to 16-bit alignment). Control
@@ -355,7 +355,7 @@ impl SoundBlaster {
     /// (re)armed, alias the guest's DMA buffer onto that channel's
     /// permanent host buffer and program the real 8237. A no-op until the
     /// guest finishes a count write (the per-block re-arm signal).
-    pub fn maybe_remap(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
         if self.emulated() {
             // No real chip to program / no buffer to alias: the virtual-8237
             // `prog` is already captured (io_write), and the software DSP reads
@@ -396,7 +396,7 @@ impl SoundBlaster {
     /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
     /// virtual-8237 state after a task switch).
     #[allow(clippy::too_many_arguments)]
-    fn arm(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu, chan: usize, host: usize, is16: bool,
+    fn arm<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>, chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
@@ -465,7 +465,7 @@ impl SoundBlaster {
     /// them, so the partial-end-page neighbour data survives and the guest
     /// can reuse the linear range. The channel buffer is permanent. No-op
     /// when nothing is bound.
-    fn unbind(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+    fn unbind<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
         if self.bound_gpa == 0 { return; }
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
@@ -487,7 +487,7 @@ impl SoundBlaster {
     /// the real 8237 channel so the card stops pulling a buffer that's no
     /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
     /// replays it. Must run with this task's address space active.
-    pub fn sb_suspend(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
         if self.emulated() { return; } // no real chip / alias to detach
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
@@ -499,7 +499,7 @@ impl SoundBlaster {
     /// re-alias every channel the virtual 8237 still shows armed and
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
-    pub fn sb_resume(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
         if self.emulated() { return; }
         if !self.suspended { return; }
         self.suspended = false;
@@ -730,10 +730,10 @@ impl SoundBlaster {
     /// raise the SB IRQ for each completed block. Self-pacing — the guest's
     /// per-block refill keeps up because we consume at exactly its sample rate,
     /// and the auto-init ring's prime gives the refill latency headroom.
-    pub fn audio_tick(
+    pub fn audio_tick<A: crate::Arch>(
         &mut self,
-        machine: &mut crate::TheArch,
-        regs: &mut Vcpu,
+        machine: &mut A,
+        regs: &mut Vcpu<A::PageTable>,
         vpic: &mut super::vpic::VirtualPic,
     ) {
         if !self.emulated() {
@@ -796,7 +796,7 @@ impl SoundBlaster {
 
     /// Copy `count` ring frames (from `cursor`, wrapping) out of guest memory
     /// and hand them to the kernel sound layer.
-    fn emit_frames(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu, count: u64) {
+    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>, count: u64) {
         let channels = if self.emu.stereo { 2u32 } else { 1 };
         let frame_bytes = (self.emu.bits as u32 / 8) * channels;
         if frame_bytes == 0 || self.emu.buf_frames == 0 {
@@ -868,7 +868,7 @@ fn chan_gpa_len(p: &DmaProg, is16: bool) -> (u32, u32) {
 
 /// Mask host DMA channel `chan` on the real 8237 — stops the card pulling
 /// the channel buffer while the owning task is backgrounded.
-fn mask_real_8237(machine: &mut crate::TheArch, chan: u8) {
+fn mask_real_8237<A: crate::Arch>(machine: &mut A, chan: u8) {
     if (4..8).contains(&chan) { machine.outb(0xD4, 0x04 | (chan - 4)); }
     else if chan < 4 { machine.outb(0x0A, 0x04 | chan); }
 }
@@ -894,7 +894,7 @@ fn env_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 /// consumes the buffer, so it's exact for both progress and (terminal-
 /// count) completion. Channel-native units (bytes for 0-3, words 5-7),
 /// matching what the guest programmed.
-fn real_8237_count(machine: &mut crate::TheArch, host: u8) -> u16 {
+fn real_8237_count<A: crate::Arch>(machine: &mut A, host: u8) -> u16 {
     let (clr_ff, cnt) = if host < 4 {
         (0x0Cu16, (host as u16) * 2 + 1)
     } else {
@@ -911,7 +911,7 @@ fn real_8237_count(machine: &mut crate::TheArch, host: u8) -> u16 {
 /// addressed; 16-bit channels (5-7) are word-addressed (addr/count in
 /// words, page bit16 implied). Standard sequence: mask, clear flip-flop,
 /// mode, addr lo/hi, page, count lo/hi, unmask.
-fn program_real_8237(machine: &mut crate::TheArch, chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
+fn program_real_8237<A: crate::Arch>(machine: &mut A, chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
     // Standard PC/AT page-register ports indexed by absolute channel.
     const PAGE: [u8; 8] = [0x87, 0x83, 0x81, 0x82, 0x8F, 0x8B, 0x89, 0x8A];
     if is16 {

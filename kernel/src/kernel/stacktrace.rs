@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use crate::{print, println};
 use crate::kernel::vfs;
-#[cfg(not(feature = "hosted"))]
+#[cfg(target_arch = "x86")]
 use core::arch::asm;
 use lib::elf::SymbolTable;
 
@@ -102,7 +102,7 @@ pub fn init_from_tar() {
 /// panic handler; skips its own frame so the first line is whoever panicked.
 /// Only the metal boot path uses this entry; the hosted backend traces via
 /// `stack_trace_regs`.
-#[cfg(not(feature = "hosted"))]
+#[cfg(target_arch = "x86")]
 pub fn stack_trace() {
     let bp: usize;
     unsafe { asm!("mov {}, ebp", out(reg) bp); }
@@ -153,12 +153,12 @@ fn print_frame(depth: usize, ip: u64) {
 fn walk(mut bp: u64, mut depth: usize, user_64: bool) {
     // The trap-entry boundary is an `entry.asm` label (metal only). The hosted
     // process has no such boundary, so the chain just walks to its natural end.
-    #[cfg(not(feature = "hosted"))]
+    #[cfg(target_arch = "x86")]
     let isr_dispatch = {
         unsafe extern "C" { fn isr_return(); }
         isr_return as *const () as u64
     };
-    #[cfg(feature = "hosted")]
+    #[cfg(not(target_arch = "x86"))]
     let isr_dispatch = 0u64;
     const MAX_DEPTH: usize = 20;
 

@@ -8,7 +8,7 @@ use super::state::PspCacheEntry;
 ///
 /// Does NOT touch `dos.current_psp` — that's pure DOS state and stays as
 /// the segment value the entering program had.
-pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState, regs: &mut Vcpu) {
+pub(in crate::kernel::dos) fn install_dpmi_psp_view<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
     let rm_psp = dos.current_psp;
     let psp_base = (rm_psp as u32) * 16;
     let env_seg = regs.read::<u16>((psp_base + 0x2C) as usize);
@@ -54,8 +54,8 @@ pub(in crate::kernel::dos) fn install_dpmi_psp_view(dos: &mut thread::DosState, 
 /// Look up an existing PSP selector for `segment`, or allocate a new one.
 /// Mirrors HDPMI's `allocxsel(seg, limit=0xFF)`: per-segment stable
 /// mapping, fresh LDT slot on first sight. Returns 0 on alloc failure.
-pub(in crate::kernel::dos) fn get_or_alloc_psp_sel(
-    dos: &mut thread::DosState,
+pub(in crate::kernel::dos) fn get_or_alloc_psp_sel<A: crate::Arch>(
+    dos: &mut thread::DosState<A>,
     segment: u16,
 ) -> u16 {
     if let Some(dpmi) = dos.dpmi.as_ref() {
@@ -88,8 +88,8 @@ pub(in crate::kernel::dos) fn get_or_alloc_psp_sel(
 /// needs. Returns `None` if `selector` isn't a known PSP selector — the
 /// caller should treat the value as already being a segment (matches
 /// HDPMI's `bx_sel2segm` fallthrough).
-pub(in crate::kernel::dos) fn psp_sel_to_segment(
-    dos: &thread::DosState,
+pub(in crate::kernel::dos) fn psp_sel_to_segment<A: crate::Arch>(
+    dos: &thread::DosState<A>,
     selector: u16,
 ) -> Option<u16> {
     let dpmi = dos.dpmi.as_ref()?;

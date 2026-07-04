@@ -12,6 +12,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[derive(Clone, Copy)]
 pub struct FxState(pub [u8; 512]);
 
+impl Default for FxState {
+    fn default() -> Self { Self::zeroed() }
+}
+
 impl FxState {
     pub const fn zeroed() -> Self { Self([0; 512]) }
     /// No-op on the interpreter (FPU state is the software core's; M2 wires the

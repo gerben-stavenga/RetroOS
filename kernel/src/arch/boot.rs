@@ -112,6 +112,18 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // port. Logging is a platform concern, not an arch call — the kernel never
     // touches a port itself; it just hands bytes to this sink.
     crate::vga::set_debug_sink(log_byte_0xe9);
+    // Inject the metal backend into the (backend-agnostic) kernel: port I/O
+    // for the deep driver call sites, and the host-environment facts the
+    // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).
+    crate::install_portio(crate::PortIo {
+        inb: arch::inb, inw: arch::inw, inl: arch::inl,
+        outb: arch::outb, outw: arch::outw, outl: arch::outl,
+    });
+    crate::set_host_env(crate::HostEnv {
+        fbcon_active: crate::fbcon::active,
+        debug: crate::DebugSink::Debugcon,
+        is_metal: true,
+    });
 
     // Switch to flat GDT (base=0) + IDT + TSS immediately after paging.
     // Offset segments are no longer needed — paging maps KERNEL_BASE to KERNEL_PHYS.
@@ -218,7 +230,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // The arch backend handle, threaded as `&mut` through the kernel from here
     // on so its mutable state is borrow-checked rather than global. Lives for
     // the rest of the kernel's life (startup never returns).
-    let mut machine = crate::new_arch();
+    let mut machine = arch::Metal;
 
     // Install the kernel heap now that paging, phys_mm, and the #PF page-backing
     // are all up — just before startup begins allocating (today `new_arch()`

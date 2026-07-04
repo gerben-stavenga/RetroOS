@@ -14,6 +14,7 @@
 //! - Linux owners get keys cooked into their fds; they have no virtual
 //!   device bus for other IRQs.
 
+use crate::Vcpu;
 use crate::kernel::thread;
 use arch_abi::Arch;
 
@@ -23,11 +24,11 @@ pub const F11_PRESS: u8 = 0x57;
 pub const F12_PRESS: u8 = 0x58;
 
 /// Drain pending input into the console owner.
-pub fn drain(
-    machine: &mut crate::TheArch,
-    regs: &mut crate::arch::Vcpu,
-    kt: &mut thread::KernelThread,
-    personality: &mut thread::Personality,
+pub fn drain<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Vcpu<A::PageTable>,
+    kt: &mut thread::KernelThread<A>,
+    personality: &mut thread::Personality<A>,
 ) {
     match personality {
         thread::Personality::Dos(dos) => {
@@ -40,20 +41,20 @@ pub fn drain(
 
 /// DOS owner: `blocked` selects the stdin-pipe path (owner is wait4-parked
 /// behind a foreground Linux child).
-fn drain_dos(
-    machine: &mut crate::TheArch,
-    regs: &mut crate::arch::Vcpu,
+fn drain_dos<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Vcpu<A::PageTable>,
     blocked: bool,
-    dos: &mut thread::DosState,
+    dos: &mut thread::DosState<A>,
 ) {
-    let dp = dos as *mut thread::DosState;
+    let dp = dos as *mut thread::DosState<A>;
     machine.drain(&mut |evt| {
-        if matches!(evt, crate::arch::Irq::Key(sc) if sc == F11_PRESS) {
+        if matches!(evt, crate::Irq::Key(sc) if sc == F11_PRESS) {
             thread::request_switch();
-        } else if matches!(evt, crate::arch::Irq::Key(sc) if sc == F12_PRESS) {
+        } else if matches!(evt, crate::Irq::Key(sc) if sc == F12_PRESS) {
             crate::kernel::startup::dump_interrupted_thread(regs, Some(unsafe { &*dp }));
         } else if blocked {
-            if let crate::arch::Irq::Key(sc) = evt
+            if let crate::Irq::Key(sc) = evt
                 && crate::kernel::keyboard::update_key_state(sc) {
                     let c = crate::kernel::keyboard::scancode_to_ascii(sc);
                     if c != 0 {
@@ -63,7 +64,7 @@ fn drain_dos(
                     }
                 }
         } else {
-            if let crate::arch::Irq::Key(sc) = evt {
+            if let crate::Irq::Key(sc) = evt {
                 unsafe { (*dp).process_key(regs, sc) };
             } else {
                 crate::kernel::dos::queue_irq(unsafe { &mut *dp }, regs, evt);
@@ -73,20 +74,20 @@ fn drain_dos(
 }
 
 /// Linux owner: keys → cooked fd input.
-fn drain_linux(
-    machine: &mut crate::TheArch,
-    regs: &mut crate::arch::Vcpu,
-    kt: &mut thread::KernelThread,
+fn drain_linux<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Vcpu<A::PageTable>,
+    kt: &mut thread::KernelThread<A>,
     linux: &mut thread::LinuxState,
 ) {
-    let ktp = kt as *mut thread::KernelThread;
+    let ktp = kt as *mut thread::KernelThread<A>;
     let lp = linux as *mut thread::LinuxState;
     machine.drain(&mut |evt| {
-        if let crate::arch::Irq::Key(sc) = evt {
+        if let crate::Irq::Key(sc) = evt {
             if sc == F11_PRESS {
                 thread::request_switch();
             } else if sc == F12_PRESS {
-                crate::kernel::startup::dump_interrupted_thread(regs, None);
+                crate::kernel::startup::dump_interrupted_thread::<A>(regs, None);
             } else {
                 unsafe { (*lp).process_key(&(*ktp).fds, sc) };
             }

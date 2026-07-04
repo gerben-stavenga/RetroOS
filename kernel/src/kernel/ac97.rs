@@ -97,14 +97,14 @@ static PRESENT: AtomicBool = AtomicBool::new(false);
 /// shared `pci::find_class` scan. Pure presence probe — `platform::probe` uses
 /// it for the Audio decision; on a no-PCI backend (the interpreter) every read
 /// is 0xFFFFFFFF and nothing is found.
-pub fn scan(arch: &mut crate::TheArch) -> Option<(u8, u8, u8)> {
+pub fn scan<A: crate::Arch>(arch: &mut A) -> Option<(u8, u8, u8)> {
     crate::kernel::pci::find_class(arch, 0x04, 0x01)
 }
 
 /// Bring up the codec the platform probe found. Driver init only — the
 /// routing decision is `platform::Audio` (EmulatedAc97); PRESENT here means
 /// "driver is actually up" and guards `play` against a failed bring-up.
-pub fn init(arch: &mut crate::TheArch) {
+pub fn init<A: crate::Arch>(arch: &mut A) {
     if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedAc97 {
         return;
     }
@@ -115,7 +115,7 @@ pub fn init(arch: &mut crate::TheArch) {
 }
 
 /// Bring up the codec at `bus:dev.func`. Returns true on success.
-fn bring_up(arch: &mut crate::TheArch, bus: u8, dev: u8, func: u8) -> bool {
+fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     // Enable I/O space + bus-master in the PCI command register (low 16 bits of
     // dword 0x04). Writing 0 to the status word (high 16) is harmless (RW1C).
     let cmd = crate::kernel::pci::read32(arch, bus, dev, func, 0x04);
@@ -211,7 +211,7 @@ impl Ac97 {
         }
     }
 
-    fn set_rate(&mut self, arch: &mut crate::TheArch, rate: u32) {
+    fn set_rate<A: crate::Arch>(&mut self, arch: &mut A, rate: u32) {
         if rate != self.rate && rate != 0 {
             arch.outw(self.nam + NAM_PCM_DAC_RATE, rate as u16);
             self.rate = rate;
@@ -219,7 +219,7 @@ impl Ac97 {
     }
 
     /// Decode `bytes` (`fmt`) into canonical i16 stereo and stream into the ring.
-    fn submit(&mut self, arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
+    fn submit<A: crate::Arch>(&mut self, arch: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
         self.set_rate(arch, rate);
         let fb = fmt.frame_bytes();
         if fb == 0 {
@@ -261,7 +261,7 @@ impl Ac97 {
 
 /// Stream a block of source PCM to the AC'97 codec (called by `sound::play` when
 /// a codec was discovered).
-pub fn play(arch: &mut crate::TheArch, rate: u32, fmt: Format, bytes: &[u8]) {
+pub fn play<A: crate::Arch>(arch: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
     let mut g = AC97.lock();
     if let Some(dev) = g.as_mut() {
         dev.submit(arch, rate, fmt, bytes);

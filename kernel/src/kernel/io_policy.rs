@@ -27,7 +27,7 @@ use arch_abi::Arch;
 /// Rebuild the live I/O bitmap for a thread taking the CPU: deny-all
 /// baseline, then exactly what its personality + focus state allow. Called
 /// on every swap-in (and once for the initial program).
-pub fn apply(machine: &mut crate::TheArch, personality: &Personality, focused: bool) {
+pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focused: bool) {
     machine.reset_io_bitmap();
     match personality {
         Personality::Dos(_) => {

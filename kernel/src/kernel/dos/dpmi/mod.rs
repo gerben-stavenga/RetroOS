@@ -14,7 +14,7 @@ extern crate alloc;
 
 use arch_abi::GuestBytes;
 use alloc::boxed::Box;
-use crate::arch::Vcpu;
+use crate::Vcpu;
 use crate::kernel::thread;
 use crate::kernel::dos;
 // used by exceptions.rs via its `use super::*`
@@ -46,7 +46,7 @@ use self::raw_switch::{clear_carry, flat_addr, set_carry, trace_client_selector_
 
 /// Switch from VM86 to 32-bit protected mode.
 /// Called from rm_int31_dispatch when the DPMI entry stub executes.
-pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut Vcpu) {
+pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
     // DPMI entry is a FAR CALL; the real-mode stack holds the PM return CS:IP.
     let ret_ip = machine::vm86_pop(regs);
@@ -181,7 +181,7 @@ pub(in crate::kernel::dos) fn dpmi_enter(dos: &mut thread::DosState, regs: &mut 
 /// PM client-initiated INT 31h — the DPMI service API, dispatched by AX.
 /// Caller (`dos::syscall`) has already classified the trap as client-side
 /// (CS not in the kernel's stub LDT slots).
-pub(super) fn dpmi_api(_machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {

@@ -88,7 +88,7 @@ fn main() {
         if let Some(c) = &c_root {
             config.set_c_root(c.as_bytes());
         }
-        let mut machine = kernel::new_arch();
+        let mut machine = arch::Interp;
         kernel::startup(&mut machine, &config);
     });
 

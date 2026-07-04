@@ -15,7 +15,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::arch::Vcpu;
+use crate::Vcpu;
 use arch_abi::Arch; // `machine: &mut TheArch` trait methods (set_irq_line, …)
 use arch_abi::GuestBytes;
 
@@ -110,7 +110,7 @@ use crate::Regs;
 ///   - DOS personality fields (flattened): PSP tracking, DTA, heap/free segment,
 ///     XMS/EMS state, FindFirst/FindNext state, exec-parent chain.
 ///   - `dpmi`: optional DPMI protected-mode state (LDT, memory blocks, callbacks).
-pub struct DosState {
+pub struct DosState<A: crate::Arch> {
     /// Policy-free PC machine state: virtual 8259 PIC, 8253 PIT, PS/2 keyboard,
     /// VGA register set, A20 gate, HMA page tracking.
     pub pc: machine::PcMachine,
@@ -185,16 +185,20 @@ pub struct DosState {
     /// standard soft-INT iret-frame pop). The return-based contract makes
     /// the "still waiting vs done" decision explicit at every call site
     /// instead of leaning on a side-channel into `dos.pending_resume`.
-    pub pending_resume: Option<ResumeCallback>,
+    pub pending_resume: Option<ResumeCallback<A>>,
 }
 
 /// The boxed retry closure inside a [`ResumeCallback`].
-type ResumeFn =
-    dyn FnOnce(&mut crate::TheArch, &mut thread::KernelThread, &mut DosState, &mut Vcpu) -> Option<ResumeCallback>;
+type ResumeFn<A: crate::Arch> = dyn FnOnce(
+    &mut A,
+    &mut thread::KernelThread<A>,
+    &mut DosState<A>,
+    &mut Vcpu<A::PageTable>,
+) -> Option<ResumeCallback<A>>;
 
 /// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
 /// so the FnOnce can return another `ResumeCallback` (recursive type).
-pub struct ResumeCallback(pub alloc::boxed::Box<ResumeFn>);
+pub struct ResumeCallback<A: crate::Arch>(pub alloc::boxed::Box<ResumeFn<A>>);
 
 #[derive(Clone, Copy)]
 pub struct DosMemBlock {
@@ -214,8 +218,8 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
         .expect("LDT size mismatch")
 }
 
-impl DosState {
-    pub fn new(machine: &mut crate::TheArch) -> Self {
+impl<A: crate::Arch> DosState<A> {
+    pub fn new(machine: &mut A) -> Self {
         let ldt = fresh_ldt();
         let mut dos = DosState {
             pc: machine::PcMachine::new(machine),
@@ -251,15 +255,15 @@ impl DosState {
     }
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
-    pub fn process_key(&mut self, regs: &mut Vcpu, scancode: u8) {
-        machine::queue_irq(&mut self.pc, regs, crate::arch::Irq::Key(scancode));
+    pub fn process_key<P: arch_abi::GuestBytes>(&mut self, regs: &mut Vcpu<P>, scancode: u8) {
+        machine::queue_irq(&mut self.pc, regs, crate::Irq::Key(scancode));
     }
 
     /// Per-thread cleanup at exit: free EMS-backed pages, drop XMS/EMS
     /// state. The screen snapshot is handled by `suspend`, which `exit_thread`
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
-    pub fn on_exit(&mut self, machine: &mut crate::TheArch, regs: &mut Vcpu) {
+    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
         if let Some(ref mut ems) = self.ems {
             ems.free_all_pages();
         }
@@ -274,7 +278,7 @@ impl DosState {
     /// DOS thread. Encapsulates any per-resume side effects (right now: point
     /// LDTR at this thread's LDT). Keeps the LDT layout private to the dos
     /// module — external code never touches `self.ldt`.
-    pub fn on_resume(&self, machine: &mut crate::TheArch) {
+    pub fn on_resume(&self, machine: &mut A) {
         machine.load_ldt(&self.ldt[..]);
     }
 
@@ -371,7 +375,7 @@ pub struct ExecParent {
 /// base+limit. Downstream the linear is used with the flat `regs.read/write/
 /// slice` memory API.
 #[inline]
-fn linear(dos: &thread::DosState, regs: &Vcpu, seg: u16, off: u32) -> u32 {
+fn linear<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A::PageTable>, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
         // A20 is permanently wrapped (force line 20 low): the HMA
@@ -413,11 +417,11 @@ fn linear(dos: &thread::DosState, regs: &Vcpu, seg: u16, off: u32) -> u32 {
 ///
 /// Lives at the personality root because INT 31h spans both submodules
 /// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi`).
-pub fn syscall(
-    machine: &mut crate::TheArch,
-    kt: &mut thread::KernelThread,
-    dos: &mut thread::DosState,
-    regs: &mut Vcpu,
+pub fn syscall<A: crate::Arch>(
+    machine: &mut A,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Vcpu<A::PageTable>,
 ) -> thread::KernelAction {
     use crate::UserMode;
     let mode = regs.mode();
@@ -437,7 +441,7 @@ pub fn syscall(
 /// write/read logic runs), decode the faulting store/load and emulate it. Pure
 /// kernel + lib, no arch — both backends deliver the same PageFault. Returns
 /// true if handled (resume), false → real SEGV.
-pub fn try_vga_fault(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu, addr: u32) -> bool {
+pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, addr: u32) -> bool {
     if !(0xA0000..0xB0000).contains(&addr) {
         return false;
     }
@@ -478,14 +482,14 @@ pub fn try_vga_fault(machine: &mut crate::TheArch, dos: &mut thread::DosState, r
 ///
 /// `PageFault` is excluded — the loop handles it inline because it needs
 /// access to the full `Thread` (for `signal_thread`).
-pub fn handle_event(
-    machine: &mut crate::TheArch,
-    kt: &mut thread::KernelThread,
-    dos: &mut thread::DosState,
-    regs: &mut Vcpu,
-    kevent: crate::arch::monitor::KernelEvent,
+pub fn handle_event<A: crate::Arch>(
+    machine: &mut A,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Vcpu<A::PageTable>,
+    kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
-    use crate::arch::monitor::KernelEvent as KE;
+    use crate::KernelEvent as KE;
 
     let is_vm86 = regs.mode() == crate::UserMode::VM86;
     match kevent {
@@ -641,7 +645,7 @@ pub fn handle_event(
 /// writes, and `display_tick` renders 0xFF (a white screen). Fresh RAM makes the
 /// emulated VGA's memory actually hold data; the kernel renders it to the GOP
 /// framebuffer itself. The planar trap re-maps 0xA0000 as it arms/disarms.
-fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
+fn back_vga_window_if_emulated<A: crate::Arch>(machine: &mut A) {
     if !machine::vga_present() {
         // Graphics + mono-text aperture (0xA0000-0xB7FFF, 24 pages): per-process
         // fresh RAM — planar/Mode-X trapping (disarm_planar) manages A0000 per
@@ -661,7 +665,7 @@ fn back_vga_window_if_emulated(machine: &mut crate::TheArch) {
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
 #[allow(clippy::too_many_arguments)]
-pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8) {
+pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
@@ -747,10 +751,10 @@ pub fn exec_dos_into(machine: &mut crate::TheArch, threads: &mut [thread::Thread
 /// INT-31 synth ops (reap / waitpid-probe / VGA take or peek), run after the
 /// caller's `dos`/`kt` borrow releases. Writes the AX/BX/CF result into the
 /// live frame and stays on the caller (`None`).
-pub(crate) fn handle_synth_child(
-    machine: &mut crate::TheArch,
-    threads: &mut [thread::Thread],
-    regs: &mut crate::arch::Vcpu,
+pub(crate) fn handle_synth_child<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    regs: &mut Vcpu<A::PageTable>,
     tid: usize,
     pid: i32,
     op: thread::DosChildOp,
@@ -817,7 +821,7 @@ pub(crate) fn handle_synth_child(
 
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
-fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
+fn init_process_thread_vm86_state<A: crate::Arch>(thread: &mut thread::Thread<A>, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
     use machine::IOPL_DEFAULT;
     let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
@@ -840,9 +844,9 @@ fn init_process_thread_vm86_state(thread: &mut thread::Thread, psp_seg: u16, cs:
 /// Set up the initial DOS thread for a fresh program load (no parent).
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
-pub fn run_init_program(machine: &mut crate::TheArch, threads: &mut [thread::Thread], buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
+pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
 
-    let t = thread::create_thread(threads, machine, None, crate::RootPageTable::empty(), true)
+    let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
         .expect("Failed to create DOS thread");
     let tid = t.kernel.tid as usize;
 
@@ -915,7 +919,7 @@ pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
-fn snapshot_env(regs: &Vcpu, env_seg: u16) -> alloc::vec::Vec<u8> {
+fn snapshot_env<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, env_seg: u16) -> alloc::vec::Vec<u8> {
     let base = (env_seg as usize) << 4;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;
@@ -934,7 +938,7 @@ fn snapshot_env(regs: &Vcpu, env_seg: u16) -> alloc::vec::Vec<u8> {
 /// `dos.current_psp` is always a segment; PSP[0x2C] may have been
 /// converted to a selector at DPMI entry, so use `saved_rm_env` when the
 /// active PSP matches the one whose env we patched.
-pub fn snapshot_parent_env(regs: &mut Vcpu, dos: &thread::DosState) -> alloc::vec::Vec<u8> {
+pub fn snapshot_parent_env<A: crate::Arch>(regs: &mut Vcpu<A::PageTable>, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
@@ -952,7 +956,7 @@ pub fn dump_if_ring() {
     mode_transitions::dump_if_ring();
 }
 
-pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Vcpu) {
+pub fn dump_dpmi_state<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A::PageTable>) {
     if dos.dpmi.is_none() { return; }
     for (name, sel) in [
         ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
@@ -989,7 +993,7 @@ pub fn dump_dpmi_state(dos: &thread::DosState, regs: &Vcpu) {
 }
 
 /// Queue an arch IRQ into this thread's virtual PIC.
-pub fn queue_irq(dos: &mut thread::DosState, regs: &mut Vcpu, irq: crate::arch::Irq) {
+pub fn queue_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, irq: crate::Irq) {
     machine::queue_irq(&mut dos.pc, regs, irq);
 }
 
@@ -997,7 +1001,7 @@ pub fn queue_irq(dos: &mut thread::DosState, regs: &mut Vcpu, irq: crate::arch::
 /// a period boundary. Separate from `queue_irq` because the tick queries
 /// `machine` (it has no host payload), and `queue_irq` runs inside the input
 /// drain where `machine` is already borrowed.
-pub fn queue_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState) {
+pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) {
     machine::queue_tick(machine, &mut dos.pc);
 }
 
@@ -1005,12 +1009,12 @@ pub fn queue_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState) {
 /// or no present sink). Called by the event loop with the absolute tick clock;
 /// presents once per emulated VGA frame on the retrace edge (see
 /// `machine::display_tick`).
-pub fn display_tick(dos: &mut thread::DosState, regs: &Vcpu, now_ticks: u64) {
+pub fn display_tick<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &Vcpu<A::PageTable>, now_ticks: u64) {
     machine::display_tick(&mut dos.pc, regs, now_ticks);
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).
-pub fn audio_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) {
+pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
     machine::audio_tick(machine, &mut dos.pc, regs);
 }
 
@@ -1024,7 +1028,7 @@ pub fn audio_tick(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs
 /// `reflect_int_to_real_mode` first, then returns through the same continuation
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
-pub fn raise_pending(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) {
+pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI
@@ -1109,7 +1113,7 @@ pub fn raise_pending(machine: &mut crate::TheArch, dos: &mut thread::DosState, r
 /// Mirror `dos.dos_blocks` out as a real DOS Memory Control Block chain
 /// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
 /// walks contiguously from `heap_base_seg` up to 0xA000.
-fn sync_mcb_chain(dos: &DosState, regs: &mut Vcpu) {
+fn sync_mcb_chain<A: crate::Arch>(dos: &DosState<A>, regs: &mut Vcpu<A::PageTable>) {
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
 
@@ -1150,7 +1154,7 @@ fn sync_mcb_chain(dos: &DosState, regs: &mut Vcpu) {
     }
 }
 
-fn next_dos_block_limit(dos: &DosState, seg: u16, skip_seg: Option<u16>) -> u16 {
+fn next_dos_block_limit<A: crate::Arch>(dos: &DosState<A>, seg: u16, skip_seg: Option<u16>) -> u16 {
     let mut limit = 0xA000u16;
     for block in &dos.dos_blocks {
         if Some(block.seg) == skip_seg || block.seg < seg {
@@ -1166,7 +1170,7 @@ fn next_dos_block_limit(dos: &DosState, seg: u16, skip_seg: Option<u16>) -> u16 
 /// `heap_seg` = first paragraph past the contiguous run of allocated blocks
 /// starting at `heap_base_seg`. Used for the in-process EXEC fan-out as the
 /// "where does the child's arena start" hint.
-fn sync_heap_seg(dos: &mut DosState) {
+fn sync_heap_seg<A: crate::Arch>(dos: &mut DosState<A>) {
     let mut first_free = dos.heap_base_seg;
     loop {
         let mut advanced = false;
@@ -1188,7 +1192,7 @@ fn sync_heap_seg(dos: &mut DosState) {
 /// Largest free *data* paragraphs across all gaps + trailing region.
 /// Each gap loses 1 paragraph to MCB overhead. Used by `load_exe` to size a
 /// max-alloc child against the live (non-reset) MCB chain.
-fn largest_dos_block(dos: &DosState) -> u16 {
+fn largest_dos_block<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     let mut largest_data = 0u16;
     let mut cur = dos.heap_base_seg;
     let mut blocks = dos.dos_blocks.clone();
@@ -1211,18 +1215,18 @@ fn largest_dos_block(dos: &DosState) -> u16 {
     largest_data
 }
 
-fn dos_reset_blocks(dos: &mut DosState, regs: &mut Vcpu, base_seg: u16) {
+fn dos_reset_blocks<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, base_seg: u16) {
     dos.heap_base_seg = base_seg;
     dos.heap_seg = base_seg;
     dos.dos_blocks.clear();
     sync_mcb_chain(dos, regs);
 }
 
-fn current_mcb_owner(dos: &DosState) -> u16 {
+fn current_mcb_owner<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     dos.current_psp
 }
 
-fn dos_alloc_block(dos: &mut DosState, regs: &mut Vcpu, need: u16) -> Result<u16, u16> {
+fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, need: u16) -> Result<u16, u16> {
     // Each alloc consumes 1 MCB paragraph + `need` data paragraphs. Quirk
     // preserved from pre-MCB code: AH=48 BX=0 silently succeeds without
     // recording a block (returns the would-be data segment).
@@ -1272,7 +1276,7 @@ fn dos_alloc_block(dos: &mut DosState, regs: &mut Vcpu, need: u16) -> Result<u16
     Err(max_data)
 }
 
-fn dos_free_block(dos: &mut DosState, regs: &mut Vcpu, seg: u16) -> Result<(), u16> {
+fn dos_free_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, seg: u16) -> Result<(), u16> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         dos.dos_blocks.remove(idx);
         sync_heap_seg(dos);
@@ -1283,7 +1287,7 @@ fn dos_free_block(dos: &mut DosState, regs: &mut Vcpu, seg: u16) -> Result<(), u
     }
 }
 
-fn dos_set_program_block_owner(dos: &mut DosState, regs: &mut Vcpu, env_seg: u16, psp_seg: u16, owner: u16) {
+fn dos_set_program_block_owner<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, env_seg: u16, psp_seg: u16, owner: u16) {
     for block in &mut dos.dos_blocks {
         if block.seg == env_seg || block.seg == psp_seg {
             block.owner = owner;
@@ -1292,7 +1296,7 @@ fn dos_set_program_block_owner(dos: &mut DosState, regs: &mut Vcpu, env_seg: u16
     sync_mcb_chain(dos, regs);
 }
 
-fn dos_keep_resident_block(dos: &mut DosState, regs: &mut Vcpu, seg: u16, paras: u16, owner: u16) {
+fn dos_keep_resident_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, seg: u16, paras: u16, owner: u16) {
     let paras = paras.min(0xA000u16.saturating_sub(seg));
     if paras == 0 {
         sync_mcb_chain(dos, regs);
@@ -1304,7 +1308,7 @@ fn dos_keep_resident_block(dos: &mut DosState, regs: &mut Vcpu, seg: u16, paras:
     sync_mcb_chain(dos, regs);
 }
 
-fn dos_resize_block(dos: &mut DosState, regs: &mut Vcpu, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
+fn dos_resize_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         // Block resize: data must end before next block's MCB (or at 0xA000
         // if no next block).

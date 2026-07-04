@@ -39,7 +39,7 @@ pub struct VirtualRtc {
 }
 
 impl VirtualRtc {
-    pub fn new(machine: &mut crate::TheArch) -> Self {
+    pub fn new<A: crate::Arch>(machine: &mut A) -> Self {
         Self {
             // Power-on defaults of a typical PC RTC: reg A = 0x26 (32 kHz time
             // base, 1024 Hz periodic rate), reg B = 0x02 (24-hour, BCD).
@@ -74,7 +74,7 @@ impl VirtualRtc {
         }
     }
 
-    pub fn write(&mut self, machine: &mut crate::TheArch, idx: u8, val: u8) {
+    pub fn write<A: crate::Arch>(&mut self, machine: &mut A, idx: u8, val: u8) {
         match idx {
             0x0A => self.reg_a = val & 0x7F, // UIP is read-only
             0x0B => {
@@ -112,7 +112,7 @@ impl VirtualRtc {
     /// enabled. When non-zero it latches PF/IRQF for the next reg C read. Like
     /// the PIT, repeated intervals coalesce into a single edge at the vPIC — a
     /// slow guest loses intervals rather than flooding, matching real hardware.
-    pub fn take_pending_irqs(&mut self, machine: &mut crate::TheArch) -> u32 {
+    pub fn take_pending_irqs<A: crate::Arch>(&mut self, machine: &mut A) -> u32 {
         if self.reg_b & 0x40 == 0 {
             return 0; // PIE disabled
         }

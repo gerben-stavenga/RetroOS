@@ -100,6 +100,10 @@ fn main() {
         arch::enable_live_console(); // paint guest 0xB8000 to this terminal
     }
     kernel::vga::set_debug_sink(host_log_byte);
+    // Inject the backend into the (backend-agnostic) kernel: its port I/O for
+    // the deep driver call sites (portio), and the host environment facts the
+    // platform probe reads (HostStdout debug, no fbcon, not metal).
+    install_hosted_backend();
     kernel::host_console_init();
     // Display: the kernel emulates the VGA (single-VGA design) and renders
     // frames through its present sink; we just park them in the backend's
@@ -113,13 +117,6 @@ fn main() {
     }
     if let Some(path) = wav {
         arch::attach_audio(&path); // canonical audio device → WAV file
-    }
-
-    // No image and nothing else to do → the demo. With --host or --cmd the
-    // imageless boot is real: the host dir becomes the VFS root
-    // (platform::Media::HostRoot) over the embedded bootfs.
-    if input.is_none() && host_dir.is_none() && cmd.is_none() {
-        kernel::host_run_demo()
     }
 
     let mut data = Vec::new();
@@ -142,7 +139,8 @@ fn main() {
         // drivable. Output already flows to stdout via the kernel's 0xE9 mirror.
         arch::enter_raw_mode();
         spawn_keyboard();
-        kernel::host_run_elf(path.as_bytes(), data, argv);
+        let mut machine = arch::Interp;
+        kernel::host_run_elf(&mut machine, path.as_bytes(), data, argv);
     }
 
     // Otherwise boot the same kernel::startup() the metal crt0 calls — with
@@ -170,8 +168,27 @@ fn main() {
     if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
     if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }
 
-    let mut machine = kernel::new_arch();
+    let mut machine = arch::Interp;
     kernel::startup(&mut machine, &config);
+}
+
+/// Inject the interp backend into the backend-agnostic kernel: its port I/O
+/// (for the deep driver call sites that never see the `&mut Arch`) and the
+/// host-environment facts the platform probe reads.
+fn install_hosted_backend() {
+    kernel::install_portio(kernel::PortIo {
+        inb: arch::inb,
+        inw: arch::inw,
+        inl: arch::inl,
+        outb: arch::outb,
+        outw: arch::outw,
+        outl: arch::outl,
+    });
+    kernel::set_host_env(kernel::HostEnv {
+        fbcon_active: || false,
+        debug: kernel::DebugSink::HostStdout,
+        is_metal: false,
+    });
 }
 
 /// Spawn the stdin → keyboard pump: read host terminal bytes, translate each to

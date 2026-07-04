@@ -8,6 +8,7 @@
 //! arrives, this module is the only thing that should need to change — the
 //! test of whether the factorization around it is right.
 
+use crate::Vcpu;
 use crate::kernel::thread;
 
 /// The scheduler's answer for this iteration.
@@ -23,10 +24,10 @@ pub enum Verdict {
 /// Decide what runs next, given what the personality asked for and any
 /// pending F11. F11 is honored only when the action itself didn't already
 /// pick a successor.
-pub fn verdict(
-    machine: &mut crate::TheArch,
-    threads: &mut [thread::Thread],
-    regs: &mut crate::arch::Vcpu,
+pub fn verdict<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    regs: &mut Vcpu<A::PageTable>,
     tid: usize,
     action: thread::KernelAction,
 ) -> Verdict {
@@ -45,10 +46,10 @@ pub fn verdict(
 
 /// Map a personality action to the next thread to run. `None` = stay on
 /// the current thread.
-fn next_after(
-    machine: &mut crate::TheArch,
-    threads: &mut [thread::Thread],
-    regs: &mut crate::arch::Vcpu,
+fn next_after<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    regs: &mut Vcpu<A::PageTable>,
     tid: usize,
     action: thread::KernelAction,
 ) -> Option<usize> {
@@ -83,7 +84,7 @@ fn next_after(
 /// it, execution. Pure focus shift — does not wake any blocked thread or
 /// break any waitpid; the shell decides backgrounding semantics by polling
 /// SYNTH_WAITPID + reading kbd.
-pub(crate) fn focus_request(threads: &[thread::Thread], tid: usize) -> Option<usize> {
+pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: usize) -> Option<usize> {
     if thread::take_switch_request() {
         thread::cycle_next(threads, tid)
     } else {

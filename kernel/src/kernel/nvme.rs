@@ -128,7 +128,7 @@ fn set_prp1(c: &mut [u32; 16], phys: u64) {
 /// Probe PCI for an NVMe controller (class 01h / subclass 08h) and bring it
 /// up. Returns true when ready to serve reads. Absent bus (interpreter) or
 /// absent device: false, no side effects.
-pub fn init(arch: &mut crate::TheArch) -> bool {
+pub fn init<A: crate::Arch>(arch: &mut A) -> bool {
     let Some((bus, dev, func)) = pci::find_class(arch, 0x01, 0x08) else {
         return false; // no NVMe controller (legacy machine) — not an error
     };

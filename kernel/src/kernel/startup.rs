@@ -5,6 +5,7 @@ extern crate alloc;
 extern crate ext4_view;
 
 
+use crate::Vcpu;
 use crate::kernel::{vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
@@ -20,7 +21,7 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
-pub fn startup(machine: &mut crate::TheArch, boot: &crate::BootConfig) -> ! {
+pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
@@ -132,8 +133,8 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
 /// Port permissions are NOT set here: `io_policy::apply` rebuilds the I/O
 /// bitmap per thread on every swap-in (the VGA window follows console
 /// focus; Linux threads get nothing).
-fn init_device_policy(
-    machine: &mut crate::TheArch,
+fn init_device_policy<A: crate::Arch>(
+    machine: &mut A,
     _platform: &'static crate::kernel::platform::Platform,
 ) {
     // Probe for an AC'97 codec (metal). If present it becomes the kernel audio
@@ -171,7 +172,7 @@ fn init_console_pipe() {
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the interactive DN loop.
-fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8], threads: &mut [thread::Thread]) -> ! {
+fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8], threads: &mut [thread::Thread<A>]) -> ! {
     if let Some(raw) = boot.cmdline() {
         // CWD: explicit `opt/cwd` key wins; else fall back to each program's
         // own directory.
@@ -225,7 +226,7 @@ fn run(machine: &mut crate::TheArch, boot: &crate::BootConfig, master_env: &[u8]
 /// through the Linux loader (a fresh process thread); `.COM` / MZ `.EXE`
 /// through the DOS VM86 loader. `cmdline_tail`/`env` apply only to the DOS
 /// path (PSP:0080h cmdline + environment).
-fn run_program(machine: &mut crate::TheArch, threads: &mut [thread::Thread], path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
+fn run_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
     use crate::kernel::{dos, exec};
 
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
@@ -280,10 +281,10 @@ fn run_program(machine: &mut crate::TheArch, threads: &mut [thread::Thread], pat
 /// the shared console pipe, stdout/stderr go to the console — mirroring the
 /// hosted bare-ELF path (`host_run_elf`). The fresh empty address space is
 /// already clean, so the ELF loader can write straight into it.
-fn launch_elf(machine: &mut crate::TheArch, threads: &mut [thread::Thread], buf: alloc::vec::Vec<u8>, path: &[u8], args: alloc::vec::Vec<alloc::vec::Vec<u8>>) -> usize {
+fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], buf: alloc::vec::Vec<u8>, path: &[u8], args: alloc::vec::Vec<alloc::vec::Vec<u8>>) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
-        let t = thread::create_thread(threads, machine, None, crate::RootPageTable::empty(), true)
+        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
             .expect("create ELF thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
@@ -306,7 +307,7 @@ fn launch_elf(machine: &mut crate::TheArch, threads: &mut [thread::Thread], buf:
 /// (the CPU loan), `console` (input routing), `Personality` (the slice
 /// hooks + event dispatch), `sched` (policy), `focus` (console ownership,
 /// moved together with execution by `switch_focus_and_run` for now).
-pub(crate) fn event_loop(machine: &mut crate::TheArch, threads: &mut [thread::Thread], first_tid: usize) {
+pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], first_tid: usize) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
@@ -356,13 +357,13 @@ pub(crate) fn event_loop(machine: &mut crate::TheArch, threads: &mut [thread::Th
 /// Page faults are decided here — an unhandled user fault is a SEGV exit,
 /// and `signal_thread` wants the whole `Thread` for its diagnostics;
 /// everything else is the personality's call.
-fn dispatch(
-    machine: &mut crate::TheArch,
-    thread: &mut thread::Thread,
-    regs: &mut crate::arch::Vcpu,
-    kevent: crate::arch::monitor::KernelEvent,
+fn dispatch<A: crate::Arch>(
+    machine: &mut A,
+    thread: &mut thread::Thread<A>,
+    regs: &mut Vcpu<A::PageTable>,
+    kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
-    if let crate::arch::monitor::KernelEvent::PageFault { addr } = kevent {
+    if let crate::KernelEvent::PageFault { addr } = kevent {
         // A VGA planar-trap access (A0000 unmapped while unchained graphics
         // needs the write/read planar logic) is decoded + emulated here, not a
         // SEGV. Same path on both backends — both deliver this PageFault.
@@ -387,10 +388,10 @@ fn dispatch(
 /// before `arch_user_clean` unmapped 0xA0000 (re-reading would fault). If
 /// a parent wants the dying child's farewell screen to persist, it calls
 /// `SYNTH_VGA_TAKE` explicitly — the kernel makes no inheritance policy.
-fn switch_focus_and_run(
-    machine: &mut crate::TheArch,
-    threads: &mut [thread::Thread],
-    ctx: &mut crate::kernel::exec_ctx::ExecutionContext,
+fn switch_focus_and_run<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
 ) {
     if new_tid == ctx.tid {
@@ -418,10 +419,10 @@ fn switch_focus_and_run(
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
 /// Blocks parent, returns child tid on success, None on error (caller stays on parent).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn handle_fork_exec(
-    machine: &mut crate::TheArch,
-    threads: &mut [thread::Thread],
-    vcpu: &mut crate::arch::Vcpu,
+pub(crate) fn handle_fork_exec<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    vcpu: &mut Vcpu<A::PageTable>,
     parent_tid: usize,
     path: &[u8],
     cmdtail: &[u8],
@@ -489,7 +490,7 @@ pub(crate) fn handle_fork_exec(
         machine.free_page_count());
 
     // COW-fork parent address space for child
-    let mut child_root = crate::RootPageTable::empty();
+    let mut child_root = A::PageTable::default();
     machine.user_fork(&mut child_root);
 
     let child = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
@@ -592,11 +593,11 @@ pub(crate) fn handle_fork_exec(
 ///
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
-pub fn arch_dump_exception(dos: &thread::DosState, regs: &crate::arch::Vcpu) {
+pub fn arch_dump_exception<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A::PageTable>) {
     dump_interrupted_thread(regs, Some(dos));
 }
 
-pub(crate) fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thread::DosState>) {
+pub(crate) fn dump_interrupted_thread<A: crate::Arch>(regs: &Vcpu<A::PageTable>, dos: Option<&thread::DosState<A>>) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
         // The guest's interrupt flag is VIF (bit 19); canonical bit 9 is
@@ -620,7 +621,7 @@ pub(crate) fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thr
         // black — most often SEQ[1] bit 5 = screen-off, GC[6] framebuffer
         // mapping, or AC mode register text-vs-graphics).
         {
-            use crate::arch::{inb, outb};
+            use crate::kernel::portio::{inb, outb};
             let _ = inb(0x3DA);
             let misc = inb(0x3CC);
             let mut seq = [0u8; 5];
@@ -677,7 +678,7 @@ pub(crate) fn dump_interrupted_thread(regs: &crate::arch::Vcpu, dos: Option<&thr
 /// so hangs that look like "timer stopped" usually show up as a stuck in-
 /// service bit (a higher-priority pending line is blocked by it) or a
 /// requested-but-masked line.
-fn dump_virtual_hw(dos: &thread::DosState) {
+fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
     let (mirr, misr, mimr, sirr, sisr, simr) = dos.pc.vpic.debug_state();
     crate::dbg_println!("[DBG] vpic master irr={:#04x} isr={:#04x} imr={:#04x}  slave irr={:#04x} isr={:#04x} imr={:#04x}",
         mirr, misr, mimr, sirr, sisr, simr);
@@ -715,7 +716,7 @@ impl EventStats {
     /// log (and the `LOG` ring buffer); flip to true to profile the event loop.
     const PROFILE_DUMP: bool = false;
 
-    fn new(machine: &mut crate::TheArch) -> Self {
+    fn new<A: crate::Arch>(machine: &mut A) -> Self {
         let free = machine.free_page_count();
         let now = machine.rdtsc();
         EventStats {
@@ -730,7 +731,7 @@ impl EventStats {
         }
     }
 
-    fn iteration(&mut self, machine: &mut crate::TheArch) {
+    fn iteration<A: crate::Arch>(&mut self, machine: &mut A) {
         self.iterations = self.iterations.wrapping_add(1);
         if self.iterations.is_multiple_of(Self::MEM_DUMP_PERIOD) {
             let free = machine.free_page_count();
@@ -741,7 +742,7 @@ impl EventStats {
         }
     }
 
-    fn pre_run(&mut self, machine: &mut crate::TheArch) {
+    fn pre_run<A: crate::Arch>(&mut self, machine: &mut A) {
         let now = machine.rdtsc();
         self.kernel_cycles = self
             .kernel_cycles
@@ -749,13 +750,13 @@ impl EventStats {
         self.last_kernel_entry = now;
     }
 
-    fn post_run(
+    fn post_run<A: crate::Arch>(
         &mut self,
-        machine: &mut crate::TheArch,
-        kevent: &crate::arch::monitor::KernelEvent,
-        regs: &crate::arch::Vcpu,
+        machine: &mut A,
+        kevent: &crate::KernelEvent,
+        regs: &Vcpu<A::PageTable>,
     ) {
-        use crate::arch::monitor::KernelEvent as KE;
+        use crate::KernelEvent as KE;
         let now = machine.rdtsc();
         self.user_cycles = self
             .user_cycles

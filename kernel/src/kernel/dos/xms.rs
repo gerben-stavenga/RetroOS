@@ -6,7 +6,7 @@
 use arch_abi::Arch;
 use arch_abi::GuestBytes;
 use crate::kernel::dos::linear;
-use crate::arch::Vcpu;
+use crate::Vcpu;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use crate::dbg_println;
 use crate::kernel::thread;
@@ -101,14 +101,14 @@ impl XmsState {
     }
 }
 
-fn xms_state(dos: &mut thread::DosState) -> &mut XmsState {
+fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
     if dos.xms.is_none() {
         dos.xms = Some(alloc::boxed::Box::new(XmsState::new()));
     }
     dos.xms.as_deref_mut().unwrap()
 }
 
-pub(crate) fn xms_dispatch(machine: &mut crate::TheArch, dos: &mut thread::DosState, regs: &mut Vcpu) -> thread::KernelAction {
+pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — Get XMS version
@@ -340,7 +340,7 @@ pub(crate) fn xms_dispatch(machine: &mut crate::TheArch, dos: &mut thread::DosSt
 ///   +06: u32 source offset (or seg:off if handle=0)
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
-fn xms_move(dos: &mut thread::DosState, regs: &mut Vcpu) {
+fn xms_move<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
     let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
 
     let length = regs.read::<u32>((addr) as usize) as usize;
@@ -438,7 +438,7 @@ fn or64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
 pub(super) static EMS_BASE_PAGE: AtomicUsize = AtomicUsize::new(0xD0);
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
-pub(super) fn scan_uma(regs: &Vcpu) {
+pub(super) fn scan_uma<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) {
     let mut free: u64 = 0;
     for i in 0..UMA_PAGES {
         let base = (UMA_BASE + i) * 0x1000;
@@ -495,7 +495,7 @@ fn umb_avail() -> u64 {
 
 /// Allocate a UMB of at least `paragraphs` size (1 paragraph = 16 bytes).
 /// Returns (segment, paragraphs_allocated) or None.
-fn umb_alloc(machine: &mut crate::TheArch, paragraphs: u16) -> Option<(u16, u16)> {
+fn umb_alloc<A: crate::Arch>(machine: &mut A, paragraphs: u16) -> Option<(u16, u16)> {
     let pages_needed = ((paragraphs as usize) * 16).div_ceil(0x1000);
     if pages_needed == 0 { return None; }
 
@@ -526,7 +526,7 @@ fn umb_alloc(machine: &mut crate::TheArch, paragraphs: u16) -> Option<(u16, u16)
 }
 
 /// Free a UMB by segment address.
-fn umb_free(machine: &mut crate::TheArch, segment: u16) -> bool {
+fn umb_free<A: crate::Arch>(machine: &mut A, segment: u16) -> bool {
     let page = (segment / 0x100) as usize;
     if !(UMA_BASE..UMA_END).contains(&page) { return false; }
     let offset = page - UMA_BASE;

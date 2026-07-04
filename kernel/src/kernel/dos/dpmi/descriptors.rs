@@ -119,9 +119,9 @@ pub(super) fn trace_dpmi_desc(label: &str, sel: u16, desc: u64) {
 /// Populate the kernel-owned LDT slots and default pm_vectors. Called from
 /// `DosState::new()` so the PMDOS infrastructure is always live — HW IRQ
 /// routing can use it even before any DPMI client has called dpmi_enter.
-pub(in crate::kernel::dos) fn install_kernel_ldt_slots(dos: &mut thread::DosState) {
+pub(in crate::kernel::dos) fn install_kernel_ldt_slots<A: crate::Arch>(dos: &mut thread::DosState<A>) {
     // Reserve + install each kernel slot.
-    let mark = |dos: &mut thread::DosState, idx: usize, desc: u64| {
+    let mark = |dos: &mut thread::DosState<A>, idx: usize, desc: u64| {
         dos.ldt[idx] = desc;
         dos.ldt_alloc[idx / 32] |= 1 << (idx % 32);
     };
@@ -144,7 +144,7 @@ pub(in crate::kernel::dos) fn install_kernel_ldt_slots(dos: &mut thread::DosStat
 /// traps to its own CD 31 slot in the vector-stub segment; `vector_stub_reflect`
 /// then reflects the interrupt to the real-mode IVT. Called from thread init
 /// and from the EXEC path so a child never inherits a DPMI parent's hooks.
-pub(in crate::kernel::dos) fn reset_pm_vectors(dos: &mut thread::DosState) {
+pub(in crate::kernel::dos) fn reset_pm_vectors<A: crate::Arch>(dos: &mut thread::DosState<A>) {
     for i in 0..256 {
         dos.pm_vectors[i] = (mode_transitions::VECTOR_STUB_SEL, dos::STUB_BASE + (i as u32) * 2);
     }
@@ -159,7 +159,7 @@ pub(in crate::kernel::dos) fn reset_pm_vectors(dos: &mut thread::DosState) {
 /// Starts at 16 to match CWSDPMI's `l_free`, leaving LDT[1..15] null so
 /// DOS/4GW's `lar`-probe of low slots sees an empty range like CWSDPMI does.
 ///
-/// Takes `ldt_alloc` as `&mut [u32]` (not `&mut DosState`) so call sites that
+/// Takes `ldt_alloc` as `&mut [u32]` (not `&mut DosState<A>`) so call sites that
 /// already hold `&mut dos.dpmi` can still invoke via disjoint field borrow:
 /// `alloc_ldt(&mut dos.ldt_alloc)`.
 pub(super) fn alloc_ldt(ldt_alloc: &mut [u32]) -> Option<usize> {

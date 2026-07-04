@@ -10,20 +10,21 @@
 //! accompanies every switch (see startup's `switch_focus_and_run`) and
 //! tomorrow won't.
 
+use crate::Vcpu;
 use crate::kernel::thread;
 
 /// Compile-time toggle: verify the address-space hash across switches
 /// (expensive; bring-up diagnostics).
 const ASSERT_ADDR_HASH: bool = false;
 
-pub struct ExecutionContext {
+pub struct ExecutionContext<A: crate::Arch> {
     pub tid: usize,
-    pub vcpu: crate::arch::Vcpu,
+    pub vcpu: crate::Vcpu<A::PageTable>,
 }
 
-impl ExecutionContext {
+impl<A: crate::Arch> ExecutionContext<A> {
     /// Seed the loan from a thread's saved state (the loop's first thread).
-    pub fn seed(threads: &mut [thread::Thread], tid: usize) -> Self {
+    pub fn seed(threads: &mut [thread::Thread<A>], tid: usize) -> Self {
         let vcpu = thread::get_thread(threads, tid)
             .expect("ExecutionContext::seed: invalid thread")
             .kernel
@@ -33,12 +34,12 @@ impl ExecutionContext {
 
     /// The thread currently holding the CPU. The borrow is tied to the passed
     /// `threads` slice (the loop owns it), not to `self`.
-    pub fn thread<'a>(&self, threads: &'a mut [thread::Thread]) -> &'a mut thread::Thread {
+    pub fn thread<'a>(&self, threads: &'a mut [thread::Thread<A>]) -> &'a mut thread::Thread<A> {
         thread::get_thread(threads, self.tid).expect("ExecutionContext: current thread vanished")
     }
 
     /// Run user code until it produces a kernel event.
-    pub fn run(&mut self, machine: &mut crate::TheArch) -> crate::arch::monitor::KernelEvent {
+    pub fn run(&mut self, machine: &mut A) -> crate::KernelEvent {
         use arch_abi::Arch;
         machine.execute(&mut self.vcpu)
     }
@@ -48,7 +49,7 @@ impl ExecutionContext {
     /// hash), restores the incoming thread's, switches the address space,
     /// rebuilds the I/O bitmap from policy, and runs the personality's
     /// `on_resume` (LDT/TLS rebinding). Does NOT touch console focus.
-    pub fn switch_to(&mut self, threads: &mut [thread::Thread], machine: &mut crate::TheArch, new_tid: usize) {
+    pub fn switch_to(&mut self, threads: &mut [thread::Thread<A>], machine: &mut A, new_tid: usize) {
         use arch_abi::Arch;
         if new_tid == self.tid {
             return;
@@ -82,7 +83,7 @@ impl ExecutionContext {
 /// Verify that a thread's saved cpu_state still matches the hash recorded on
 /// the last switch-out. Print a diff-style dump on mismatch.
 /// `tag` is printed in the header ("switch-in" / "reblock" / ...).
-pub(crate) fn verify_cpu_hash(t: &thread::Thread, tag: &str) {
+pub(crate) fn verify_cpu_hash<A: crate::Arch>(t: &thread::Thread<A>, tag: &str) {
     let k = &t.kernel;
     if k.cpu_hash == 0 { return; }
     let actual = thread::hash_regs(&k.vcpu.regs);

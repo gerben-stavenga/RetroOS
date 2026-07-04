@@ -172,7 +172,7 @@ pub struct VirtualPit {
 }
 
 impl VirtualPit {
-    pub(crate) fn new(machine: &mut crate::TheArch) -> Self {
+    pub(crate) fn new<A: crate::Arch>(machine: &mut A) -> Self {
         let now = machine.get_ticks();
         Self {
             last_host_tick: now,
@@ -182,7 +182,7 @@ impl VirtualPit {
         }
     }
 
-    fn sync(&mut self, machine: &mut crate::TheArch) {
+    fn sync<A: crate::Arch>(&mut self, machine: &mut A) {
         let now = machine.get_ticks();
         let delta_ticks = now.saturating_sub(self.last_host_tick);
         if delta_ticks == 0 {
@@ -194,17 +194,17 @@ impl VirtualPit {
         self.frac_accum = total % HOST_TIMER_HZ;
     }
 
-    pub(crate) fn read_counter0(&mut self, machine: &mut crate::TheArch) -> u8 {
+    pub(crate) fn read_counter0<A: crate::Arch>(&mut self, machine: &mut A) -> u8 {
         self.sync(machine);
         self.ch0.read_byte(self.input_cycles)
     }
 
-    pub(crate) fn write_counter0(&mut self, machine: &mut crate::TheArch, val: u8) {
+    pub(crate) fn write_counter0<A: crate::Arch>(&mut self, machine: &mut A, val: u8) {
         self.sync(machine);
         self.ch0.write_byte(val, self.input_cycles);
     }
 
-    pub(crate) fn write_command(&mut self, machine: &mut crate::TheArch, val: u8) {
+    pub(crate) fn write_command<A: crate::Arch>(&mut self, machine: &mut A, val: u8) {
         self.sync(machine);
         let channel = (val >> 6) & 0x03;
         if channel != 0 {
@@ -218,7 +218,7 @@ impl VirtualPit {
         self.ch0.set_command(rw_mode, (val >> 1) & 0x07);
     }
 
-    pub fn take_pending_irqs(&mut self, machine: &mut crate::TheArch) -> u32 {
+    pub fn take_pending_irqs<A: crate::Arch>(&mut self, machine: &mut A) -> u32 {
         self.sync(machine);
         self.ch0.take_irqs(self.input_cycles)
     }

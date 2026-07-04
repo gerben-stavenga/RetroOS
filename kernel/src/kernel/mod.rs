@@ -19,6 +19,7 @@ pub mod io_policy;
 pub mod nvme;
 pub mod pci;
 pub mod platform;
+pub mod portio;
 pub mod sched;
 pub mod keyboard;
 pub mod kpipe;

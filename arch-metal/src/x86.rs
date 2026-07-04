@@ -9,6 +9,10 @@ use core::arch::asm;
 #[derive(Clone, Copy)]
 pub struct FxState(pub [u8; 512]);
 
+impl Default for FxState {
+    fn default() -> Self { Self::zeroed() }
+}
+
 /// Check if FXSAVE/FXRSTOR is available (CR4.OSFXSR set during boot).
 #[inline]
 fn has_fxsr() -> bool { read_cr4() & cr4::OSFXSR != 0 }
