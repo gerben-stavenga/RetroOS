@@ -487,10 +487,45 @@ pub fn execute() -> KernelEvent {
                     sync_out(k, regs, mode);
                     break Some(KernelEvent::Irq);
                 }
-                // The single stepped instruction retired; loop so
-                // step_virtual_if re-checks the next one.
+                // The single stepped instruction retired: re-check the next
+                // one IN PLACE. The vcpu's live state already equals `regs`
+                // after the sync, so as long as the monitor only peeks (a
+                // non-sensitive next opcode), the re-step needs no SET_SREGS,
+                // no table rewrite, no SET_REGS — just a re-anchored
+                // KVM_SET_GUEST_DEBUG and another KVM_RUN. Without this fast
+                // path every stepped instruction pays the full entry cost
+                // (including the GDT/LDT copy) and CLI-heavy games crawl.
                 Kind::Debug => {
                     sync_out(k, regs, mode);
+                    if stepping && mode == UserMode::Mode32 && regs.flags32() & VIF_FLAG == 0 {
+                        let (scs, sip) = (regs.code_seg(), regs.ip32());
+                        let snap_fl = regs.flags32() & !TF_FLAG;
+                        let p2 = &raw mut vcpu::REGS;
+                        let mut view = InterpView { space: unsafe { &mut (*p2).space } };
+                        let r = arch_abi::monitor::step_virtual_if(regs, &mut view);
+                        if step_trace_on() {
+                            eprintln!(
+                                "[step] {scs:#06x}:{sip:#010x} (fast) -> ip={:#010x} vif={} r={}",
+                                regs.ip32(),
+                                (regs.flags32() & VIF_FLAG != 0) as u8,
+                                match &r { MonitorResult::Resume => "resume", MonitorResult::Event(_) => "event" }
+                            );
+                        }
+                        match r {
+                            MonitorResult::Event(ev) => break Some(ev),
+                            MonitorResult::Resume => {
+                                if regs.ip32() == sip && regs.flags32() & !TF_FLAG == snap_fl {
+                                    // Next opcode is non-sensitive: step it on
+                                    // the live vcpu state.
+                                    set_single_step(k, true); // re-anchor at the new RIP
+                                    continue;
+                                }
+                                // The monitor emulated an instruction (IP or
+                                // flags moved host-side): full re-entry.
+                                break None;
+                            }
+                        }
+                    }
                     break None;
                 }
                 Kind::Shim => {
