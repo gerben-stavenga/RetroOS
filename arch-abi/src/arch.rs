@@ -113,13 +113,11 @@ pub struct Vcpu<A: Arch> {
     pub space: A::PageTable,
 }
 
-// `A::PageTable: Copy` (from the `Arch` bound), so the whole bundle is `Copy` —
-// but `derive` would wrongly demand `A: Copy` (the backend handle), so the
-// Clone/Copy impls are written by hand against the real field bound.
-impl<A: Arch> Clone for Vcpu<A> {
-    fn clone(&self) -> Self { *self }
-}
-impl<A: Arch> Copy for Vcpu<A> {}
+// `Vcpu` is deliberately NOT `Copy`/`Clone`: its `space` is an OWNED address
+// space (a move-only resource), so a `Vcpu` names exactly one address space and
+// the type system forbids aliasing it. `Regs` is plain data (`Copy`) and can be
+// snapshotted on its own; the whole `Vcpu` moves. Switching threads is a
+// `mem::swap` of two `Vcpu`s — a genuine transfer of the space, not a copy.
 
 impl<A: Arch> core::ops::Deref for Vcpu<A> {
     type Target = Regs;
@@ -170,10 +168,12 @@ impl<A: Arch> GuestBytes for Vcpu<A> {
 /// rest of the machine: CPU exec, ports, timer, IRQ lines, the page-table/fork/
 /// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
 pub trait Arch: Sized {
-    /// Backend page-table root type stored in `Vcpu::space`. It is the guest-
-    /// memory primitive — `GuestBytes` routes through it, which is what makes
-    /// `vcpu.read(addr)` work.
-    type PageTable: GuestBytes + Copy + Default;
+    /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
+    /// space, so it is **not** `Copy`: a `Vcpu` moves rather than duplicating the
+    /// space. It is the guest-memory primitive (`GuestBytes` routes through it,
+    /// which is what makes `vcpu.read(addr)` work). `Default` supplies the empty
+    /// placeholder a `Vcpu` starts from and that `mem::swap` leaves behind.
+    type PageTable: GuestBytes + Default;
     /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
     type Fx: Copy + Default;
 

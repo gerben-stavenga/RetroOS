@@ -34,17 +34,22 @@ impl Arch for Interp {
     // core syncs against; bridge the loop-owned `Vcpu` to it around each call.
     // (The internal frame goes away when the globals migrate into `Interp`.)
     fn execute(&mut self, vcpu: &mut Vcpu) -> KernelEvent {
-        unsafe { vcpu::REGS = *vcpu; }
+        // `Vcpu` is move-only, so bridge to the internal live frame by SWAPPING
+        // ownership in and back out (not copying): the space lives in `REGS` for
+        // the duration of the run, then returns to the loop's `vcpu`.
+        let live = unsafe { &mut *(&raw mut vcpu::REGS) };
+        core::mem::swap(live, vcpu);
         let ev = crate::engine::execute();
-        *vcpu = unsafe { vcpu::REGS };
+        core::mem::swap(live, vcpu);
         ev
     }
     fn switch_to(&mut self, live: &mut Vcpu, swap: &mut Vcpu, hash_ptr: *mut u64, fx_ptr: *mut Self::Fx) {
         // `arch_switch_to` swaps the internal live frame with `swap`; stage the
         // loop's `live` into it first, then read the incoming state back out.
-        unsafe { vcpu::REGS = *live; }
+        let regs = unsafe { &mut *(&raw mut vcpu::REGS) };
+        core::mem::swap(regs, live);
         crate::calls::arch_switch_to(swap, hash_ptr, fx_ptr);
-        *live = unsafe { vcpu::REGS };
+        core::mem::swap(regs, live);
     }
 
     // ── Timer ──

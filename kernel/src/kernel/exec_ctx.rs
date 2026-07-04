@@ -24,10 +24,16 @@ pub struct ExecutionContext<A: crate::Arch> {
 impl<A: crate::Arch> ExecutionContext<A> {
     /// Seed the loan from a thread's saved state (the loop's first thread).
     pub fn seed(threads: &mut [thread::Thread<A>], tid: usize) -> Self {
-        let vcpu = thread::get_thread(threads, tid)
-            .expect("ExecutionContext::seed: invalid thread")
-            .kernel
-            .vcpu;
+        // Move the seeded thread's address space into the live loan, leaving an
+        // empty placeholder in its parked slot (it is now the running thread —
+        // its live state lives here, its slot is refilled when it switches out).
+        let vcpu = core::mem::replace(
+            &mut thread::get_thread(threads, tid)
+                .expect("ExecutionContext::seed: invalid thread")
+                .kernel
+                .vcpu,
+            crate::Vcpu::empty(),
+        );
         ExecutionContext { tid, vcpu }
     }
 
@@ -53,7 +59,11 @@ impl<A: crate::Arch> ExecutionContext<A> {
         }
         let (old, new) = thread::get_two_threads(threads, self.tid, new_tid);
         verify_cpu_hash(new, "switch-in");
-        let mut swap_vcpu = new.kernel.vcpu;
+        // Move the incoming thread's space out of its slot (empty placeholder
+        // left behind); `machine.switch_to` swaps it with the live `self.vcpu`,
+        // so afterwards `self.vcpu` holds the incoming space and `swap_vcpu` the
+        // outgoing one, which then moves into the outgoing thread's slot.
+        let mut swap_vcpu = core::mem::replace(&mut new.kernel.vcpu, crate::Vcpu::empty());
         let mut swap_fx = new.kernel.fx_state;
         if ASSERT_ADDR_HASH {
             let mut hash = new.kernel.addr_hash;

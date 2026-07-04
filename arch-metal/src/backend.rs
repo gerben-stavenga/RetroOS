@@ -41,9 +41,12 @@ impl Arch for Metal {
     // register file only (~200 B) — the address space / CR3 is touched only at
     // switch. (The internal frame goes away when the globals migrate into `Metal`.)
     fn execute(&mut self, vcpu: &mut Vcpu<Self>) -> KernelEvent {
-        unsafe { super::traps::REGS = *vcpu; }
+        // `Vcpu` is move-only: SWAP ownership into the internal live frame for
+        // the duration of the run, then swap it back (no copy).
+        let live = unsafe { &mut *(&raw mut super::traps::REGS) };
+        core::mem::swap(live, vcpu);
         let ev = super::calls::do_arch_execute();
-        *vcpu = unsafe { super::traps::REGS };
+        core::mem::swap(live, vcpu);
         ev
     }
     fn switch_to(
@@ -53,9 +56,10 @@ impl Arch for Metal {
         hash_ptr: *mut u64,
         fx_ptr: *mut FxState,
     ) {
-        unsafe { super::traps::REGS = *live; }
+        let regs = unsafe { &mut *(&raw mut super::traps::REGS) };
+        core::mem::swap(regs, live);
         super::calls::arch_switch_to(swap, hash_ptr, fx_ptr);
-        *live = unsafe { super::traps::REGS };
+        core::mem::swap(regs, live);
     }
 
     // ── Timer ──
