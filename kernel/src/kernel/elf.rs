@@ -42,7 +42,7 @@ pub struct LoadedElf {
 /// modern distro binary or the dynamic linker itself). Relocations are NOT
 /// applied here — for dynamically-linked images the interpreter (ld.so) does
 /// that; `load_bias` only places the segments.
-pub fn load_elf<A: crate::Arch>(machine: &mut A, regs: &mut Vcpu<A::PageTable>, elf_data: &[u8], load_bias: usize) -> Result<LoadedElf, ElfError> {
+pub fn load_elf<A: crate::Arch>(machine: &mut A, regs: &mut Vcpu<A>, elf_data: &[u8], load_bias: usize) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
     let mut max_vaddr = 0usize;

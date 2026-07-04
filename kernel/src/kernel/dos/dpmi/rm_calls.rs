@@ -7,7 +7,7 @@ use super::super::mode_transitions::RmCallStruct;
 /// INT 31h/0300h — Simulate Real Mode Interrupt
 /// Trace helper: peek 16 bytes at RM linear (ds<<4)+edx and print ASCII.
 /// Used to see what filename/buffer DOS/4GW hands to real mode.
-fn dump_ds_dx<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, ds: u16, edx: u32) {
+fn dump_ds_dx<A: crate::Arch>(regs: &Vcpu<A>, ds: u16, edx: u32) {
     let linear = ((ds as u32) << 4).wrapping_add(edx & 0xFFFF);
     if linear >= 0x110000 { return; } // guard against non-low memory
     let mut bytes = [0u8; 16];
@@ -34,7 +34,7 @@ fn printable(b: u8) -> char {
 // DPMI 0300/0301/0302 — explicit PM→RM call mechanics
 // ============================================================================
 
-pub(super) fn simulate_real_mode_int<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn simulate_real_mode_int<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let int_num = regs.rbx as u8;
 
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
@@ -102,7 +102,7 @@ pub(super) fn simulate_real_mode_int<A: crate::Arch>(dos: &mut thread::DosState<
 
 
 /// INT 31h/0301h — Call Real Mode Far Procedure
-pub(super) fn call_real_mode_proc<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn call_real_mode_proc<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
 
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
@@ -145,7 +145,7 @@ pub(super) fn call_real_mode_proc<A: crate::Arch>(dos: &mut thread::DosState<A>,
 }
 
 /// INT 31h/0302h — Call Real Mode Procedure with IRET Frame
-pub(super) fn call_real_mode_proc_iret<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn call_real_mode_proc_iret<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
 
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
@@ -200,7 +200,7 @@ pub(super) fn call_real_mode_proc_iret<A: crate::Arch>(dos: &mut thread::DosStat
 
 /// Real-mode callback entry — real-mode code called one of our callback stubs.
 /// Save real-mode state, fill register structure, switch to PM callback handler.
-pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, cb_idx: usize) {
+pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, cb_idx: usize) {
     let cb = match dos.dpmi.as_ref() {
         Some(d) => d.callbacks[cb_idx],
         None => {

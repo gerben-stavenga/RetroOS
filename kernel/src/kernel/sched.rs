@@ -27,7 +27,7 @@ pub enum Verdict {
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     tid: usize,
     action: thread::KernelAction,
 ) -> Verdict {
@@ -49,7 +49,7 @@ pub fn verdict<A: crate::Arch>(
 fn next_after<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     tid: usize,
     action: thread::KernelAction,
 ) -> Option<usize> {

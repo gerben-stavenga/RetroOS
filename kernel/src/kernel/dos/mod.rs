@@ -192,7 +192,7 @@ type ResumeFn<A: crate::Arch> = dyn FnOnce(
     &mut A,
     &mut thread::KernelThread<A>,
     &mut DosState<A>,
-    &mut Vcpu<A::PageTable>,
+    &mut Vcpu<A>,
 ) -> Option<ResumeCallback<A>>;
 
 /// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
@@ -254,7 +254,7 @@ impl<A: crate::Arch> DosState<A> {
     }
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
-    pub fn process_key<P: arch_abi::GuestBytes>(&mut self, regs: &mut Vcpu<P>, scancode: u8) {
+    pub fn process_key(&mut self, regs: &mut Vcpu<A>, scancode: u8) {
         machine::queue_irq(&mut self.pc, regs, crate::Irq::Key(scancode));
     }
 
@@ -262,7 +262,7 @@ impl<A: crate::Arch> DosState<A> {
     /// state. The screen snapshot is handled by `suspend`, which `exit_thread`
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
-    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
+    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
         if let Some(ref mut ems) = self.ems {
             ems.free_all_pages();
         }
@@ -374,7 +374,7 @@ pub struct ExecParent {
 /// base+limit. Downstream the linear is used with the flat `regs.read/write/
 /// slice` memory API.
 #[inline]
-fn linear<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A::PageTable>, seg: u16, off: u32) -> u32 {
+fn linear<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
         // A20 is permanently wrapped (force line 20 low): the HMA
@@ -420,7 +420,7 @@ pub fn syscall<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
 ) -> thread::KernelAction {
     use crate::UserMode;
     let mode = regs.mode();
@@ -440,7 +440,7 @@ pub fn syscall<A: crate::Arch>(
 /// write/read logic runs), decode the faulting store/load and emulate it. Pure
 /// kernel + lib, no arch — both backends deliver the same PageFault. Returns
 /// true if handled (resume), false → real SEGV.
-pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, addr: u32) -> bool {
+pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, addr: u32) -> bool {
     if !(0xA0000..0xB0000).contains(&addr) {
         return false;
     }
@@ -485,7 +485,7 @@ pub fn handle_event<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
     use crate::KernelEvent as KE;
@@ -753,7 +753,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 pub(crate) fn handle_synth_child<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     tid: usize,
     pid: i32,
     op: thread::DosChildOp,
@@ -918,7 +918,7 @@ pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
-fn snapshot_env<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, env_seg: u16) -> alloc::vec::Vec<u8> {
+fn snapshot_env<A: crate::Arch>(regs: &Vcpu<A>, env_seg: u16) -> alloc::vec::Vec<u8> {
     let base = (env_seg as usize) << 4;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;
@@ -937,7 +937,7 @@ fn snapshot_env<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, env_seg: u16) -> alloc:
 /// `dos.current_psp` is always a segment; PSP[0x2C] may have been
 /// converted to a selector at DPMI entry, so use `saved_rm_env` when the
 /// active PSP matches the one whose env we patched.
-pub fn snapshot_parent_env<A: crate::Arch>(regs: &mut Vcpu<A::PageTable>, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
+pub fn snapshot_parent_env<A: crate::Arch>(regs: &mut Vcpu<A>, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
@@ -955,7 +955,7 @@ pub fn dump_if_ring() {
     mode_transitions::dump_if_ring();
 }
 
-pub fn dump_dpmi_state<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A::PageTable>) {
+pub fn dump_dpmi_state<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>) {
     if dos.dpmi.is_none() { return; }
     for (name, sel) in [
         ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
@@ -992,7 +992,7 @@ pub fn dump_dpmi_state<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A:
 }
 
 /// Queue an arch IRQ into this thread's virtual PIC.
-pub fn queue_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, irq: crate::Irq) {
+pub fn queue_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, irq: crate::Irq) {
     machine::queue_irq(&mut dos.pc, regs, irq);
 }
 
@@ -1008,12 +1008,12 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// or no present sink). Called by the event loop with the absolute tick clock;
 /// presents once per emulated VGA frame on the retrace edge (see
 /// `machine::display_tick`).
-pub fn display_tick<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &Vcpu<A::PageTable>, now_ticks: u64) {
+pub fn display_tick<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &Vcpu<A>, now_ticks: u64) {
     machine::display_tick(&mut dos.pc, regs, now_ticks);
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).
-pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
     machine::audio_tick(machine, &mut dos.pc, regs);
 }
 
@@ -1027,7 +1027,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// `reflect_int_to_real_mode` first, then returns through the same continuation
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
-pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI
@@ -1112,7 +1112,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
 /// Mirror `dos.dos_blocks` out as a real DOS Memory Control Block chain
 /// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
 /// walks contiguously from `heap_base_seg` up to 0xA000.
-fn sync_mcb_chain<A: crate::Arch>(dos: &DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+fn sync_mcb_chain<A: crate::Arch>(dos: &DosState<A>, regs: &mut Vcpu<A>) {
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
 
@@ -1214,7 +1214,7 @@ fn largest_dos_block<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     largest_data
 }
 
-fn dos_reset_blocks<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, base_seg: u16) {
+fn dos_reset_blocks<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, base_seg: u16) {
     dos.heap_base_seg = base_seg;
     dos.heap_seg = base_seg;
     dos.dos_blocks.clear();
@@ -1225,7 +1225,7 @@ fn current_mcb_owner<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     dos.current_psp
 }
 
-fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, need: u16) -> Result<u16, u16> {
+fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, need: u16) -> Result<u16, u16> {
     // Each alloc consumes 1 MCB paragraph + `need` data paragraphs. Quirk
     // preserved from pre-MCB code: AH=48 BX=0 silently succeeds without
     // recording a block (returns the would-be data segment).
@@ -1275,7 +1275,7 @@ fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::Pag
     Err(max_data)
 }
 
-fn dos_free_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, seg: u16) -> Result<(), u16> {
+fn dos_free_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, seg: u16) -> Result<(), u16> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         dos.dos_blocks.remove(idx);
         sync_heap_seg(dos);
@@ -1286,7 +1286,7 @@ fn dos_free_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::Page
     }
 }
 
-fn dos_set_program_block_owner<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, env_seg: u16, psp_seg: u16, owner: u16) {
+fn dos_set_program_block_owner<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, env_seg: u16, psp_seg: u16, owner: u16) {
     for block in &mut dos.dos_blocks {
         if block.seg == env_seg || block.seg == psp_seg {
             block.owner = owner;
@@ -1295,7 +1295,7 @@ fn dos_set_program_block_owner<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut
     sync_mcb_chain(dos, regs);
 }
 
-fn dos_keep_resident_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, seg: u16, paras: u16, owner: u16) {
+fn dos_keep_resident_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, seg: u16, paras: u16, owner: u16) {
     let paras = paras.min(0xA000u16.saturating_sub(seg));
     if paras == 0 {
         sync_mcb_chain(dos, regs);
@@ -1307,7 +1307,7 @@ fn dos_keep_resident_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcp
     sync_mcb_chain(dos, regs);
 }
 
-fn dos_resize_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A::PageTable>, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
+fn dos_resize_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         // Block resize: data must end before next block's MCB (or at 0xA000
         // if no next block).

@@ -254,7 +254,7 @@ pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<u8>
 }
 
 /// Clear the BIOS keyboard buffer at 40:1A..40:3E.
-pub fn clear_bios_keyboard_buffer<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+pub fn clear_bios_keyboard_buffer<A: crate::Arch>(regs: &mut Vcpu<A>) {
     write_u16(regs, 0x40, 0x1A, 0x001E);
     write_u16(regs, 0x40, 0x1C, 0x001E);
     for off in (0x1E..0x3E).step_by(2) {
@@ -263,7 +263,7 @@ pub fn clear_bios_keyboard_buffer<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
 }
 
 /// Pop the next word from the BIOS keyboard buffer.
-pub fn pop_bios_keyboard_word<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) -> Option<u16> {
+pub fn pop_bios_keyboard_word<A: crate::Arch>(regs: &mut Vcpu<A>) -> Option<u16> {
     let head = read_u16(regs, 0x40, 0x1A);
     let tail = read_u16(regs, 0x40, 0x1C);
     if head == tail {

@@ -37,7 +37,7 @@ pub use crate::descriptors::{seg_base, seg_is_32};
 #[inline]
 pub fn monitor(regs: &mut Regs) -> MonitorResult {
     let mut v = Vcpu::new(*regs, RootPageTable::empty());
-    let r = arch_abi::monitor::monitor::<crate::Metal>(&mut v);
+    let r = arch_abi::monitor::monitor(&mut v);
     *regs = v.regs;
     r
 }
@@ -47,7 +47,7 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
 #[inline]
 pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
     let mut v = Vcpu::new(*regs, RootPageTable::empty());
-    let r = arch_abi::monitor::step_virtual_if::<crate::Metal>(&mut v);
+    let r = arch_abi::monitor::step_virtual_if(&mut v);
     *regs = v.regs;
     r
 }

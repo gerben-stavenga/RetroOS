@@ -34,7 +34,7 @@ fn for_chunks(addr: usize, len: usize, mut on_chunk: impl FnMut(*mut u8, usize, 
 /// this backend's page-table type. Guest-memory access comes from the blanket
 /// `GuestBytes for Vcpu<P>` impl in `arch-abi`, which forwards to the
 /// `GuestBytes for RootPageTable` impl below.
-pub type Vcpu = arch_abi::Vcpu<RootPageTable>;
+pub type Vcpu = arch_abi::Vcpu<crate::backend::Interp>;
 
 /// The kernel-facing guest-memory primitive on this backend. Each access
 /// commits the spanned pages then indexes the active guest-RAM buffer. Every

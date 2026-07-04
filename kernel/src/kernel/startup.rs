@@ -359,7 +359,7 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
 fn dispatch<A: crate::Arch>(
     machine: &mut A,
     thread: &mut thread::Thread<A>,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
     if let crate::KernelEvent::PageFault { addr } = kevent {
@@ -421,7 +421,7 @@ fn switch_focus_and_run<A: crate::Arch>(
 pub(crate) fn handle_fork_exec<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    vcpu: &mut Vcpu<A::PageTable>,
+    vcpu: &mut Vcpu<A>,
     parent_tid: usize,
     path: &[u8],
     cmdtail: &[u8],
@@ -592,11 +592,11 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
 ///
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
-pub fn arch_dump_exception<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A::PageTable>) {
+pub fn arch_dump_exception<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>) {
     dump_interrupted_thread(regs, Some(dos));
 }
 
-pub(crate) fn dump_interrupted_thread<A: crate::Arch>(regs: &Vcpu<A::PageTable>, dos: Option<&thread::DosState<A>>) {
+pub(crate) fn dump_interrupted_thread<A: crate::Arch>(regs: &Vcpu<A>, dos: Option<&thread::DosState<A>>) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
         // The guest's interrupt flag is VIF (bit 19); canonical bit 9 is
@@ -753,7 +753,7 @@ impl EventStats {
         &mut self,
         machine: &mut A,
         kevent: &crate::KernelEvent,
-        regs: &Vcpu<A::PageTable>,
+        regs: &Vcpu<A>,
     ) {
         use crate::KernelEvent as KE;
         let now = machine.rdtsc();

@@ -48,22 +48,22 @@ const HMA_PAGE_COUNT: usize = 16;
 // ============================================================================
 
 #[inline]
-pub fn vm86_cs<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u16 {
+pub fn vm86_cs<A: crate::Arch>(regs: &Vcpu<A>) -> u16 {
     regs.code_seg()
 }
 
 #[inline]
-pub fn vm86_ip<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u16 {
+pub fn vm86_ip<A: crate::Arch>(regs: &Vcpu<A>) -> u16 {
     regs.ip32() as u16
 }
 
 #[inline]
-pub fn vm86_ss<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u16 {
+pub fn vm86_ss<A: crate::Arch>(regs: &Vcpu<A>) -> u16 {
     regs.stack_seg()
 }
 
 #[inline]
-pub fn vm86_sp<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u16 {
+pub fn vm86_sp<A: crate::Arch>(regs: &Vcpu<A>) -> u16 {
     regs.sp32() as u16
 }
 
@@ -71,34 +71,34 @@ pub fn vm86_sp<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u16 {
 /// bit-9 (IF) slot, and the internal VIF bit is masked out. Bit 9 of the *live*
 /// frame is the real IF — never what the guest should see.
 #[inline]
-pub fn guest_flags<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u32 {
+pub fn guest_flags<A: crate::Arch>(regs: &Vcpu<A>) -> u32 {
     let f = regs.flags32();
     let vif = f & VIF_FLAG != 0;
     (f & !(IF_FLAG | VIF_FLAG)) | if vif { IF_FLAG } else { 0 }
 }
 
-pub fn vm86_flags<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u32 {
+pub fn vm86_flags<A: crate::Arch>(regs: &Vcpu<A>) -> u32 {
     guest_flags(regs)
 }
 
 #[inline]
-pub fn set_vm86_cs<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, cs: u16) {
+pub fn set_vm86_cs<A: crate::Arch>(regs: &mut Vcpu<A>, cs: u16) {
     regs.set_cs32(cs as u32);
 }
 
 #[inline]
-pub fn set_vm86_ip<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, ip: u16) {
+pub fn set_vm86_ip<A: crate::Arch>(regs: &mut Vcpu<A>, ip: u16) {
     regs.set_ip32(ip as u32);
 }
 
 #[inline]
-pub fn set_vm86_sp<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, sp: u16) {
+pub fn set_vm86_sp<A: crate::Arch>(regs: &mut Vcpu<A>, sp: u16) {
     let full = (regs.sp32() & 0xFFFF_0000) | sp as u32;
     regs.set_sp32(full);
 }
 
 #[inline]
-pub fn set_vm86_flags<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, flags: u32) {
+pub fn set_vm86_flags<A: crate::Arch>(regs: &mut Vcpu<A>, flags: u32) {
     // `flags` is the guest's view: its IF intent is in bit 9. Map it to VIF
     // (bit 19) and set the low-16 status flags; the upper EFLAGS (VM/VIP/VIF
     // handled below) are preserved. Canonical bit 9 is PINNED TO 1 — the host
@@ -119,7 +119,7 @@ pub fn set_vm86_flags<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, flags: u32) {
 /// kernel-owned (never image-owned). Canonical bit 9 is PINNED TO 1 (see
 /// `set_vm86_flags`) — never read, never guest-controlled.
 #[inline]
-pub fn apply_guest_flags<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, image: u32) {
+pub fn apply_guest_flags<A: crate::Arch>(regs: &mut Vcpu<A>, image: u32) {
     let want_vif = image & IF_FLAG != 0;
     let vm = regs.flags32() & VM_FLAG;
     let mut nf = (image & !(IF_FLAG | VIF_FLAG | VM_FLAG)) | vm | IF_FLAG;
@@ -140,7 +140,7 @@ pub fn vm86_entry_flags(current: u32) -> u32 {
 /// frames whose eventual IRET must leave the guest interruptible (e.g. a
 /// launched RM helper that waits on a keypress IRQ).
 #[inline]
-pub fn guest_flags_if_on<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u32 {
+pub fn guest_flags_if_on<A: crate::Arch>(regs: &Vcpu<A>) -> u32 {
     guest_flags(regs) | IF_FLAG
 }
 
@@ -148,7 +148,7 @@ pub fn guest_flags_if_on<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u32 {
 /// (bit 8) are cleared in the image — textbook INT-n semantics, what the CPU
 /// itself would push before vectoring.
 #[inline]
-pub fn guest_flags_handler_entry<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> u32 {
+pub fn guest_flags_handler_entry<A: crate::Arch>(regs: &Vcpu<A>) -> u32 {
     guest_flags(regs) & !(IF_FLAG | (1 << 8))
 }
 
@@ -274,7 +274,7 @@ impl MouseState {
     ///   0x10 = right button released
     ///   0x20 = middle button pressed
     ///   0x40 = middle button released
-    pub fn apply_packet<P: arch_abi::GuestBytes>(&mut self, regs: &mut Vcpu<P>, dx: i16, dy: i16, buttons: u8) -> u16 {
+    pub fn apply_packet<A: crate::Arch>(&mut self, regs: &mut Vcpu<A>, dx: i16, dy: i16, buttons: u8) -> u16 {
         self.accum_dx = self.accum_dx.saturating_add(dx as i32);
         self.accum_dy = self.accum_dy.saturating_add(dy as i32);
         self.x = (self.x as i32 + dx as i32).clamp(self.min_x as i32, self.max_x as i32) as i16;
@@ -317,7 +317,7 @@ impl MouseState {
     /// already drawn at this cell. Real Microsoft Mouse drivers also do this
     /// in graphics modes via a sprite — we don't (yet); games that go to
     /// mode 13h hide the driver cursor and draw their own anyway.
-    pub fn render_if_visible<P: arch_abi::GuestBytes>(&mut self, regs: &mut Vcpu<P>) {
+    pub fn render_if_visible<A: crate::Arch>(&mut self, regs: &mut Vcpu<A>) {
         if self.show_count > 0 { return; }
         let col = (self.x >> 3) as u32;
         let row = (self.y >> 3) as u32;
@@ -332,20 +332,20 @@ impl MouseState {
     }
 
     /// Restore the original attribute under the current cursor cell.
-    pub fn erase_cursor<P: arch_abi::GuestBytes>(&mut self, regs: &mut Vcpu<P>) {
+    pub fn erase_cursor<A: crate::Arch>(&mut self, regs: &mut Vcpu<A>) {
         if let Some(old) = self.drawn_at.take() {
             regs.write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
         }
     }
 
     /// AX=01h — show cursor: decrement counter; if it just reached 0, draw.
-    pub fn show<P: arch_abi::GuestBytes>(&mut self, regs: &mut Vcpu<P>) {
+    pub fn show<A: crate::Arch>(&mut self, regs: &mut Vcpu<A>) {
         self.show_count -= 1;
         self.render_if_visible(regs);
     }
 
     /// AX=02h — hide cursor: increment counter; if it was 0, erase.
-    pub fn hide<P: arch_abi::GuestBytes>(&mut self, regs: &mut Vcpu<P>) {
+    pub fn hide<A: crate::Arch>(&mut self, regs: &mut Vcpu<A>) {
         if self.show_count <= 0 { self.erase_cursor(regs); }
         self.show_count += 1;
     }
@@ -540,7 +540,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
 }
 
 /// Emulate OUT to a port.
-pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>, port: u16, val: u8) {
+pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A>, port: u16, val: u8) {
     // ISA 10-bit I/O decode — fold the alias mod 0x400. See `emulate_inb`.
     let port = port & 0x3FF;
     match port {
@@ -652,7 +652,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
 
 /// Resolve the linear base of segment `sel`. VM86 uses `sel*16`; PM walks
 /// GDT/LDT via the arch descriptor helpers.
-fn seg_base_for<A: crate::Arch>(regs: &Vcpu<A::PageTable>, sel: u16) -> u32 {
+fn seg_base_for<A: crate::Arch>(regs: &Vcpu<A>, sel: u16) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         (sel as u32) << 4
     } else {
@@ -675,7 +675,7 @@ fn fabricated_status1<A: crate::Arch>(machine: &mut A) -> u8 {
 
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
 /// bytes through `emulate_inb` and writes the result into `regs.rax`.
-pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>, port: u16, size: u32) {
+pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A>, port: u16, size: u32) {
     if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         let val = machine.inw(port) as u64;
         regs.rax = (regs.rax & !0xFFFF) | val;
@@ -691,7 +691,7 @@ pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs
 }
 
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
-pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>, port: u16, size: u32) {
+pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A>, port: u16, size: u32) {
     let val = regs.rax;
     if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         machine.outw(port, val as u16);
@@ -706,7 +706,7 @@ pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
 /// Complete one `INSB/INSW/INSD` element (ES:DI ← port, advance DI). On `rep`
 /// the monitor re-faults per iteration (leaving IP on the instruction), so this
 /// does a single element and decrements the count — `dec_rep_count` — each time.
-pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>, size: u32, rep: bool, addr32: bool) {
+pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A>, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let es_base = seg_base_for::<A>(regs, regs.es as u16);
     let di = regs.rdi as u32;
@@ -722,7 +722,7 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
 
 /// Complete one `OUTSB/OUTSW/OUTSD` element (port ← DS:SI, advance SI). Same
 /// per-iteration `rep` contract as `handle_ins_event`.
-pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>, size: u32, rep: bool, addr32: bool) {
+pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A>, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
     let si = regs.rsi as u32;
@@ -740,7 +740,7 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, re
 /// emits an event when the count was non-zero, so this never underflows: it
 /// steps (E)CX toward the 0 that makes the monitor skip the instruction and
 /// resume. `addr32` picks ECX vs the 16-bit CX (upper bits preserved).
-fn dec_rep_count<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, addr32: bool) {
+fn dec_rep_count<A: crate::Arch>(regs: &mut Vcpu<A>, addr32: bool) {
     if addr32 {
         regs.rcx = regs.rcx.wrapping_sub(1);
     } else {
@@ -783,12 +783,12 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
 /// Runs in the event loop right after the PIT tick pump, where `machine`,
 /// `regs`, and the machine are all in scope; consumes the guest DMA ring into
 /// the kernel sound API and raises the SB IRQ per block.
-pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A::PageTable>) {
+pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A>) {
     let PcMachine { sb, vpic, .. } = pc;
     sb.audio_tick(machine, regs, vpic);
 }
 
-pub fn queue_irq<P: arch_abi::GuestBytes>(pc: &mut PcMachine, regs: &mut Vcpu<P>, event: crate::Irq) {
+pub fn queue_irq<A: crate::Arch>(pc: &mut PcMachine, regs: &mut Vcpu<A>, event: crate::Irq) {
     use crate::Irq;
     match event {
         Irq::Key(sc) => {
@@ -843,7 +843,7 @@ pub fn queue_irq<P: arch_abi::GuestBytes>(pc: &mut PcMachine, regs: &mut Vcpu<P>
 /// higher-priority IRQ preempts an in-service lower one once the guest does
 /// `sti` mid-handler — and the VME pending-interrupt `#GP` that fires there
 /// always has something real to deliver, so it can't spin.
-pub fn pick_pending_vec<P: arch_abi::GuestBytes>(pc: &mut PcMachine, regs: &mut Vcpu<P>) -> Option<u8> {
+pub fn pick_pending_vec<A: crate::Arch>(pc: &mut PcMachine, regs: &mut Vcpu<A>) -> Option<u8> {
     const VIP: u64 = 1 << 20;
     let vif = regs.frame.rflags & (VIF_FLAG as u64) != 0; // guest virtual interrupt flag
     let candidate = pc.vpic.peek();
@@ -894,17 +894,17 @@ pub fn pick_pending_vec<P: arch_abi::GuestBytes>(pc: &mut PcMachine, regs: &mut 
 
 /// Read a u16 from a real-mode seg:off address, through the active address
 /// space's memory interface (`arch::mem()`) — works under any arch backend.
-pub fn read_u16<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, seg: u32, off: u32) -> u16 {
+pub fn read_u16<A: crate::Arch>(regs: &Vcpu<A>, seg: u32, off: u32) -> u16 {
     regs.read::<u16>(((seg << 4) + off) as usize)
 }
 
 /// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
-pub fn write_u16<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, seg: u32, off: u32, val: u16) {
+pub fn write_u16<A: crate::Arch>(regs: &mut Vcpu<A>, seg: u32, off: u32, val: u16) {
     regs.write::<u16>(((seg << 4) + off) as usize, val);
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
-pub fn vm86_push<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, val: u16) {
+pub fn vm86_push<A: crate::Arch>(regs: &mut Vcpu<A>, val: u16) {
     let sp = vm86_sp(regs).wrapping_sub(2);
     set_vm86_sp(regs, sp);
     let ss = regs.ss32();
@@ -912,7 +912,7 @@ pub fn vm86_push<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, val: u16) {
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
-pub fn vm86_pop<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) -> u16 {
+pub fn vm86_pop<A: crate::Arch>(regs: &mut Vcpu<A>) -> u16 {
     let sp = vm86_sp(regs);
     let val = read_u16(regs, regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));

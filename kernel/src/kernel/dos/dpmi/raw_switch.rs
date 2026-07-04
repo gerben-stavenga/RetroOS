@@ -13,7 +13,7 @@ use super::super::mode_transitions;
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn raw_switch_pm_to_real<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -39,7 +39,7 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &
 /// initiated return trampolines, entry points, and the PMDOS INT 21
 /// short-circuit live here.
 /// Slot = (EIP - STUB_BASE - 2) / 2.
-pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
@@ -121,7 +121,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, 
 ///   (E)BX = new PM (E)SP
 ///   SI = new PM CS selector
 ///   (E)DI = new PM (E)IP
-pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -165,12 +165,12 @@ pub(super) fn flat_addr(ldt: &[u64], seg: u16, offset: u32, cs_32: bool) -> u32 
     seg_base(ldt, seg).wrapping_add(offset)
 }
 
-pub(super) fn trace_client_selector_leak<P: arch_abi::GuestBytes>(_label: &str, _regs: &Vcpu<P>) {}
+pub(super) fn trace_client_selector_leak<A: crate::Arch>(_label: &str, _regs: &Vcpu<A>) {}
 
-pub(super) fn set_carry<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+pub(super) fn set_carry<A: crate::Arch>(regs: &mut Vcpu<A>) {
     regs.set_flag32(1); // CF
 }
 
-pub(super) fn clear_carry<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+pub(super) fn clear_carry<A: crate::Arch>(regs: &mut Vcpu<A>) {
     regs.clear_flag32(1); // CF
 }

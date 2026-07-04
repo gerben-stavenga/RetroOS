@@ -40,7 +40,7 @@ impl Arch for Metal {
     // Bridge the loop-owned `Vcpu` to it around each call; the bridge copy is the
     // register file only (~200 B) — the address space / CR3 is touched only at
     // switch. (The internal frame goes away when the globals migrate into `Metal`.)
-    fn execute(&mut self, vcpu: &mut Vcpu<RootPageTable>) -> KernelEvent {
+    fn execute(&mut self, vcpu: &mut Vcpu<Self>) -> KernelEvent {
         unsafe { super::traps::REGS = *vcpu; }
         let ev = super::calls::do_arch_execute();
         *vcpu = unsafe { super::traps::REGS };
@@ -48,8 +48,8 @@ impl Arch for Metal {
     }
     fn switch_to(
         &mut self,
-        live: &mut Vcpu<RootPageTable>,
-        swap: &mut Vcpu<RootPageTable>,
+        live: &mut Vcpu<Self>,
+        swap: &mut Vcpu<Self>,
         hash_ptr: *mut u64,
         fx_ptr: *mut FxState,
     ) {

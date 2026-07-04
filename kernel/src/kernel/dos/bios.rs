@@ -164,7 +164,7 @@ macro_rules! bda_field {
 /// identical values — the layering matches a real machine (BIOS first, DOS
 /// on top). Native-vs-substitute is decided by the boot-time probe
 /// (`platform::Firmware`), not sniffed here.
-pub(super) fn install<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+pub(super) fn install<A: crate::Arch>(regs: &mut Vcpu<A>) {
     crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (display {:?})",
         crate::kernel::platform::get().display);
     // Vectors with a real service keep their own stub (slot index == vector);
@@ -190,7 +190,7 @@ pub(super) fn install<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
 }
 
 /// Seed the BDA fields a real POST would have set.
-fn seed_bda<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn seed_bda<A: crate::Arch>(regs: &mut Vcpu<A>) {
     bda_field!(regs, video_mode = 3u8); // 80x25 colour text
     bda_field!(regs, columns = 80u16);
     bda_field!(regs, crtc_base = 0x03D4u16);
@@ -215,7 +215,7 @@ fn seed_bda<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
 pub(super) fn dispatch<A: crate::Arch>(
     machine: &mut A,
     dos: &mut super::DosState<A>,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
 ) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     let int_num = (ip.wrapping_sub(2) / 2) as u8;
@@ -287,7 +287,7 @@ pub(super) fn dispatch<A: crate::Arch>(
 }
 
 /// Pop the caller's INT frame (IP/CS/FLAGS) — the IRET every handler ends in.
-fn pop_iret_frame<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn pop_iret_frame<A: crate::Arch>(regs: &mut Vcpu<A>) {
     let ret_ip = vm86_pop(regs);
     let ret_cs = vm86_pop(regs);
     let ret_flags = vm86_pop(regs);
@@ -299,7 +299,7 @@ fn pop_iret_frame<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
 /// Set/clear CF in the caller's *stacked* FLAGS (at `SS:SP+4`), which
 /// `pop_iret_frame` restores on return — clearing the live flag would just be
 /// overwritten by that pop. This is how a real BIOS reports carry through IRET.
-fn set_iret_cf<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, cf: bool) {
+fn set_iret_cf<A: crate::Arch>(regs: &mut Vcpu<A>, cf: bool) {
     let flin = (((vm86_ss(regs) as u32) << 4) + vm86_sp(regs) as u32 + 4) as usize;
     let mut f = regs.read::<u16>(flin);
     if cf { f |= 1 } else { f &= !1 }
@@ -312,9 +312,9 @@ fn set_iret_cf<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, cf: bool) {
 /// 24–31). `CX` = words to copy. We perform the copy directly — the same
 /// operation as XMS AH=0Bh (`copy_within`) — instead of letting the ROM `LGDT`
 /// into protected mode, which is illegal under VM86.
-fn int15_block_move<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn int15_block_move<A: crate::Arch>(regs: &mut Vcpu<A>) {
     let gdt = ((regs.es as u32) << 4) + (regs.rsi as u32 & 0xFFFF);
-    let base = |regs: &Vcpu<P>, desc: u32| -> u32 {
+    let base = |regs: &Vcpu<A>, desc: u32| -> u32 {
         let d = (gdt + desc) as usize;
         (regs.read::<u16>(d + 2) as u32)                      // base bits 0–15
             | (((regs.read::<u16>(d + 4) as u32) & 0xFF) << 16) // byte 4: bits 16–23
@@ -338,7 +338,7 @@ enum Parked {
     No,
 }
 
-fn int16<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, stub_ip: u16) -> Parked {
+fn int16<A: crate::Arch>(regs: &mut Vcpu<A>, stub_ip: u16) -> Parked {
     let ah = (regs.rax >> 8) as u8;
     let head: u16 = bda_field!(regs, kb_head);
     let tail: u16 = bda_field!(regs, kb_tail);
@@ -397,7 +397,7 @@ const KB_UC: [u8; 58] = *b"\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\x0d\x00ASDFGHJ
 /// virtual 8042 on interp, the real one on metal). Translate to ASCII,
 /// track shift/ctrl in the BDA flag byte, push (scancode:ascii) into the
 /// ring for INT 16h. Extended keys (arrows, F-keys) push ascii=0.
-fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
     let sc = emulate_inb(machine, &mut dos.pc, 0x60);
     let key = sc & 0x7F;
     let mut flags: u8 = bda_field!(regs, kb_flags);
@@ -450,7 +450,7 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
 const VRAM_TEXT: usize = 0xB8000;
 const VRAM_MODE13: usize = 0xA0000;
 
-fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
     let ax = regs.rax as u16;
     let ah = (ax >> 8) as u8;
     match ah {
@@ -658,10 +658,10 @@ const VBE_MODES: &[(u16, u16, u16, u8)] = &[
     (0x112, 640, 480, 32),
 ];
 
-fn vbe<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+fn vbe<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
     // Every VBE call returns AL=4Fh ("supported"); AH=00h success, 01h failed.
     let al = regs.rax as u8;
-    let done = |regs: &mut Vcpu<A::PageTable>, ok: bool| {
+    let done = |regs: &mut Vcpu<A>, ok: bool| {
         regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
     };
     match al {
@@ -685,14 +685,14 @@ fn vbe<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut
 
 /// VBE 4F08h — Set/Get DAC palette format. We model only the 6-bit VGA DAC, so
 /// report BH=6 for both set and get (a client asking for 8-bit falls back).
-fn vbe_dac_format<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn vbe_dac_format<A: crate::Arch>(regs: &mut Vcpu<A>) {
     regs.rbx = (regs.rbx & !0xFF00) | (6 << 8);
 }
 
 /// VBE 4F09h — Set/Get Palette Data. CX entries from index DX at ES:DI, each 4
 /// bytes (Blue, Green, Red, align), 6-bit components. Routed through the DAC
 /// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
-fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> bool {
+fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) -> bool {
     let count = regs.rcx as u16 as usize;
     let start = regs.rdx as u8;
     let tbl = es_di(regs);
@@ -729,13 +729,13 @@ fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, re
 }
 
 /// Linear address of the caller's ES:DI block (real-mode VBE buffers).
-fn es_di<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> usize {
+fn es_di<A: crate::Arch>(regs: &Vcpu<A>) -> usize {
     ((regs.es as usize & 0xFFFF) << 4) + (regs.rdi as usize & 0xFFFF)
 }
 
 /// VBE 4F00h — controller info into ES:DI, with the mode list placed in the
 /// block's reserved area and pointed at by VideoModePtr.
-fn vbe_controller_info<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn vbe_controller_info<A: crate::Arch>(regs: &mut Vcpu<A>) {
     let lin = es_di(regs);
     for i in (0..256).step_by(4) {
         regs.write::<u32>(lin + i, 0);
@@ -758,7 +758,7 @@ fn vbe_controller_info<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
 }
 
 /// VBE 4F01h — mode info for CX into ES:DI. Returns false for an unknown mode.
-fn vbe_mode_info<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) -> bool {
+fn vbe_mode_info<A: crate::Arch>(regs: &mut Vcpu<A>) -> bool {
     let want = regs.rcx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
         return false;
@@ -807,7 +807,7 @@ fn vbe_mode_info<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) -> bool {
 }
 
 /// VBE 4F02h — set mode (BX). Ignores the LFB bit (we only do banked).
-fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> bool {
+fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) -> bool {
     let want = regs.rbx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
         return false;
@@ -817,7 +817,7 @@ fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, r
 }
 
 /// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
-fn vbe_window<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+fn vbe_window<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
     if (regs.rbx >> 8) as u8 == 0 {
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
@@ -829,7 +829,7 @@ fn vbe_window<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, reg
 // INT 1Ah: system timer
 // ============================================================================
 
-fn int1a<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn int1a<A: crate::Arch>(regs: &mut Vcpu<A>) {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         0x00 => {

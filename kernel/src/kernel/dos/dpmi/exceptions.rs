@@ -20,7 +20,7 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
     }
 }
 
-fn dump_words<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, label: &str, addr: u32) {
+fn dump_words<A: crate::Arch>(regs: &Vcpu<A>, label: &str, addr: u32) {
     let rd = |off: u32| regs.read::<u16>((addr.wrapping_add(off)) as usize);
     let (w0, w1, w2, w3) = (rd(0), rd(2), rd(4), rd(6));
     let (w4, w5, w6, w7) = (rd(8), rd(10), rd(12), rd(14));
@@ -30,7 +30,7 @@ fn dump_words<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, label: &str, addr: u32) {
     );
 }
 
-fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A::PageTable>, exc_num: u32) {
+fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>, exc_num: u32) {
     let cs_base = seg_base(&dos.ldt[..], regs.code_seg());
     let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
     let ip_addr = cs_base.wrapping_add(regs.ip32());
@@ -188,7 +188,7 @@ struct ExcFrame16 {
 ///   [ESP+0x4C] GS + Reserved
 ///   [ESP+0x50] CR2 (valid for #PF)
 ///   [ESP+0x54] PTE (valid for #PF)
-pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, exc_num: u32) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, exc_num: u32) -> thread::KernelAction {
     dos_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x} DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS:ESP={:04x}:{:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
         regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16,
@@ -454,7 +454,7 @@ pub(super) enum ExcReturnVia { V09, V10 }
 
 pub(super) fn exception_return<A: crate::Arch>(
     dos: &mut thread::DosState<A>,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     via: ExcReturnVia,
 ) -> thread::KernelAction {
     let (use32, recorded_at) = match dos.dpmi.as_mut() {

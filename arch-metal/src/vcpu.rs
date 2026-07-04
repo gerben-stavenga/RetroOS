@@ -20,7 +20,7 @@ use super::paging2::RootPageTable;
 /// working and a `&mut Vcpu` coerces where a `&mut Regs` is expected. Guest
 /// memory comes from the blanket `GuestBytes for Vcpu<P>` impl in `arch-abi`,
 /// forwarding to the `GuestBytes for RootPageTable` impl below.
-pub type Vcpu = arch_abi::Vcpu<RootPageTable>;
+pub type Vcpu = arch_abi::Vcpu<crate::backend::Metal>;
 
 /// The metal guest-memory primitive. On the ring-1 kernel a guest-linear address
 /// *is* a host pointer (shared page tables), so these dereference it directly.

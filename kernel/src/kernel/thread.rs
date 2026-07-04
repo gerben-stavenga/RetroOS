@@ -201,7 +201,7 @@ impl<A: crate::Arch> Personality<A> {
     /// Per-iteration slice work BEFORE input routing: advance the thread's
     /// virtual time (DOS: PIT ticks, display render cadence, emulated-SB
     /// playback). Linux threads have no virtual devices to advance.
-    pub fn on_slice(&mut self, machine: &mut A, regs: &mut Vcpu<A::PageTable>) {
+    pub fn on_slice(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
         match self {
             Self::Dos(dos) => {
                 let ticks = machine.take_pending_ticks();
@@ -226,7 +226,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         kt: &mut KernelThread<A>,
-        regs: &mut Vcpu<A::PageTable>,
+        regs: &mut Vcpu<A>,
         kevent: crate::KernelEvent,
     ) -> KernelAction {
         match self {
@@ -242,7 +242,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn try_vga_fault(
         &mut self,
         machine: &mut A,
-        regs: &mut Vcpu<A::PageTable>,
+        regs: &mut Vcpu<A>,
         addr: u32,
     ) -> bool {
         match self {
@@ -258,7 +258,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         kt: &mut KernelThread<A>,
-        regs: &mut Vcpu<A::PageTable>,
+        regs: &mut Vcpu<A>,
     ) {
         let blocked = kt.state == ThreadState::Blocked;
         match self {
@@ -298,7 +298,7 @@ pub struct KernelThread<A: crate::Arch> {
     /// context. `vcpu.regs` is the saved CPU state, `vcpu.space` the page-table
     /// root. Bundled so the kernel manipulates one "thing to run" rather than
     /// two loosely-coupled fields (see arch::Vcpu).
-    pub vcpu: crate::Vcpu<A::PageTable>,
+    pub vcpu: crate::Vcpu<A>,
     pub fx_state: A::Fx,
     pub exit_code: i32,
     pub addr_hash: u64,

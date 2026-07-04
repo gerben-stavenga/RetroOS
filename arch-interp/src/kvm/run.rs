@@ -390,7 +390,7 @@ pub fn execute() -> KernelEvent {
         let mut stepping = false;
         if mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
             let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
-            let r = arch_abi::monitor::step_virtual_if::<crate::Interp>(vcpu);
+            let r = arch_abi::monitor::step_virtual_if(vcpu);
             if step_trace_on() {
                 let op = vcpu.read::<u8>(crate::desc::seg_base(scs).wrapping_add(sip) as usize);
                 eprintln!(
@@ -497,7 +497,7 @@ pub fn execute() -> KernelEvent {
                     if stepping && mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
                         let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
                         let snap_fl = vcpu.flags32() & !TF_FLAG;
-                        let r = arch_abi::monitor::step_virtual_if::<crate::Interp>(vcpu);
+                        let r = arch_abi::monitor::step_virtual_if(vcpu);
                         if step_trace_on() {
                             eprintln!(
                                 "[step] {scs:#06x}:{sip:#010x} (fast) -> ip={:#010x} vif={} r={}",
@@ -629,7 +629,7 @@ fn dispatch_shim(
     // e.g. a selector-load fault) is a genuine #GP, typed Exception(13) below
     // with the error code preserved.
     if n == 13 {
-        match arch_abi::monitor::monitor::<crate::Interp>(vcpu) {
+        match arch_abi::monitor::monitor(vcpu) {
             MonitorResult::Resume => return None,
             MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
             MonitorResult::Event(ev) => return Some(ev),

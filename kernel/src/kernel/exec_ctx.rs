@@ -18,7 +18,7 @@ const ASSERT_ADDR_HASH: bool = false;
 
 pub struct ExecutionContext<A: crate::Arch> {
     pub tid: usize,
-    pub vcpu: crate::Vcpu<A::PageTable>,
+    pub vcpu: crate::Vcpu<A>,
 }
 
 impl<A: crate::Arch> ExecutionContext<A> {

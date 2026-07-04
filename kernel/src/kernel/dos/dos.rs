@@ -46,7 +46,7 @@ const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
 
-fn bios_time_of_day<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) -> (u8, u8, u8, u8) {
+fn bios_time_of_day<A: crate::Arch>(regs: &Vcpu<A>) -> (u8, u8, u8, u8) {
     // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
     // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
     // of approximating the tick rate as 18 Hz. (BDA = guest address space.)
@@ -118,7 +118,7 @@ fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
     (year, month, day, day_of_week(year, month, day))
 }
 
-fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, regs: &Vcpu<A::PageTable>) -> (u16, u16) {
+fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, regs: &Vcpu<A>) -> (u16, u16) {
     let (hour, min, sec, _) = bios_time_of_day(regs);
     let (year, month, day, _) = cmos_date(machine);
     let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
@@ -126,7 +126,7 @@ fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, regs: &Vcpu<A::PageTab
     (dos_time, dos_date)
 }
 
-fn poll_dos_console_char<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> Option<u8> {
+fn poll_dos_console_char<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> Option<u8> {
     if let Some(ch) = dos.dos_pending_char.take() {
         return Some(ch);
     }
@@ -149,7 +149,7 @@ fn poll_dos_console_char<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &m
 /// cleared (the trap gate at entry, an exception handler, …): pending
 /// kbd/timer IRQs queue in the vPIC but `pick_pending_vec` gates them on
 /// VIF, and VIF is bit 9 of the saved EFLAGS.
-fn park_at_slot_resume<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn park_at_slot_resume<A: crate::Arch>(regs: &mut Vcpu<A>) {
     machine::set_vm86_cs(regs, CTRL_STUB_SEG);
     machine::set_vm86_ip(regs, ctrl_slot_off(SLOT_RESUME));
     regs.frame.rflags |= machine::VIF_FLAG as u64;
@@ -168,7 +168,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     vector: u8,
 ) -> thread::KernelAction {
     match vector {
@@ -222,7 +222,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
 /// (with the CF/ZF flag dance); every other vector is the personality BIOS —
 /// real services or the IRET/EOI defaults (`bios::dispatch`), which own
 /// their frame pop. Caller (`syscall`) has already checked CS.
-pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     debug_assert_eq!(vm86_cs(regs), STUB_SEG, "rm_vector_dispatch: CS must be STUB_SEG");
     let vector = ((ip.wrapping_sub(2)) / 2) as u8;
@@ -279,7 +279,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut threa
 /// as PM's `pm_stub_dispatch` over `SPECIAL_STUB_SEL`. Far-call entries
 /// (XMS, save/restore) have a CS/IP frame to pop; everything else either
 /// switches mode outright or owns its unwind.
-pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     debug_assert_eq!(vm86_cs(regs), CTRL_STUB_SEG, "rm_ctrl_dispatch: CS must be CTRL_STUB_SEG");
     let slot = ((ip.wrapping_sub(STUB_BASE as u16 + 2)) / 2) as u8;
@@ -369,7 +369,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread:
 /// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
-pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     // 16-bit DPMI clients issue INT 21h with 16-bit register parameters; the
     // high 16 bits of EAX..EBP are undefined and real (16-bit) DOS never
     // touches them. Zero them for the duration of servicing so every handler's
@@ -420,7 +420,7 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thre
 /// subfunctions only touch 16-bit register halves and absolute VGA memory, so
 /// no DS:DX buffer translation is needed. On exit `finish_dos_call` does the
 /// mode-aware iret-frame pop.
-pub(super) fn pmdos_int33_handler<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn pmdos_int33_handler<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let _ = int_33h(dos, regs);
     if dos.pending_resume.is_none() {
         finish_dos_call(dos, regs);
@@ -439,7 +439,7 @@ pub(super) fn pmdos_int33_handler<A: crate::Arch>(dos: &mut thread::DosState<A>,
 ///     21 frame).
 ///   - PM: pop the IRET frame `deliver_pm_int` planted on the PM
 ///     stack and merge DOS status flags so CF/AX results survive.
-fn finish_dos_call<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+fn finish_dos_call<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
     // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
     // is a control flag — handler-set CLD/STD must not leak into caller.
     const STATUS_MASK: u32 = 0x08D5;
@@ -470,7 +470,7 @@ fn finish_dos_call<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcp
 
 /// INT 31h from real mode user code. AH selects subfunction.
 /// On success: AX=0, CF=0. On error: AX=errno (unsigned), CF=1.
-pub(super) fn rm_native_syscall<A: crate::Arch>(_machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(super) fn rm_native_syscall<A: crate::Arch>(_machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — SYNTH_VGA_TAKE: adopt a (still-zombie) child's farewell
@@ -611,7 +611,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(_machine: &mut A, kt: &mut threa
 // BIOS INT 13h — Disk services
 // ============================================================================
 
-fn int_13h<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) -> thread::KernelAction {
+fn int_13h<A: crate::Arch>(regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     let dl = regs.rdx as u8; // drive number
     // For floppy drives (DL < 0x80), return "drive not ready" error.
@@ -669,7 +669,7 @@ fn buffered_input_resume<A: crate::Arch>(buf_lin: u32, max_chars: u8, count: u8)
         move |machine: &mut A,
               _kt: &mut thread::KernelThread<A>,
               dos: &mut thread::DosState<A>,
-              regs: &mut Vcpu<A::PageTable>| -> Option<super::ResumeCallback<A>> {
+              regs: &mut Vcpu<A>| -> Option<super::ResumeCallback<A>> {
             let Some(ch) = poll_dos_console_char(dos, regs) else {
                 return Some(buffered_input_resume(buf_lin, max_chars, count));
             };
@@ -715,7 +715,7 @@ fn buffered_input_resume<A: crate::Arch>(buf_lin: u32, max_chars: u8, count: u8)
 /// `SLOT_RESUME` stub. Mirrors what a real `INT 16h` does: push FLAGS/CS/IP
 /// (the return frame, pointing back at SLOT_RESUME) and enter `IVT[0x16]`.
 /// IF is forced so the guest's wait loop can receive the keypress IRQ.
-fn launch_int16_read<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn launch_int16_read<A: crate::Arch>(regs: &mut Vcpu<A>) {
     let ivt_off = read_u16(regs, 0, 0x16 * 4);
     let ivt_seg = read_u16(regs, 0, 0x16 * 4 + 2);
     let ret_flags = machine::guest_flags_if_on(regs) as u16;
@@ -737,7 +737,7 @@ fn int16_finish_resume<A: crate::Arch>(echo: bool) -> super::ResumeCallback<A> {
         move |machine: &mut A,
               _kt: &mut thread::KernelThread<A>,
               dos: &mut thread::DosState<A>,
-              regs: &mut Vcpu<A::PageTable>| -> Option<super::ResumeCallback<A>> {
+              regs: &mut Vcpu<A>| -> Option<super::ResumeCallback<A>> {
             let ax = regs.rax as u16;
             let ascii = ax as u8;
             let scan = (ax >> 8) as u8;
@@ -753,7 +753,7 @@ fn int16_finish_resume<A: crate::Arch>(echo: bool) -> super::ResumeCallback<A> {
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
-fn dos_putchar<A: crate::Arch>(machine: &mut A, regs: &mut Vcpu<A::PageTable>, c: u8) {
+fn dos_putchar<A: crate::Arch>(machine: &mut A, regs: &mut Vcpu<A>, c: u8) {
     // Mirror DOS console output to the debug log stream alongside VGA.
     crate::vga::debug_byte(c);
     // The BDA cursor (0040:0050/0051) is guest address space — go through the
@@ -792,7 +792,7 @@ fn dos_error_from_errno(err: i32) -> u16 {
 // DOS INT 21h — DOS services
 // ============================================================================
 
-fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
     // running clients), 02/06/09 (character/string output — exception
@@ -2197,7 +2197,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
 // INT 2Eh — COMMAND.COM internal execute
 // ============================================================================
 
-fn int_2eh<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn int_2eh<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
     // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
     let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
@@ -2223,7 +2223,7 @@ fn int_2eh<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut thread::D
 
 /// Fill regs with DPMI 0.90 installation-check reply (shared by INT 2F/1687h
 /// and DOS/32A's INT 21h AX=FF87h probe).
-fn dpmi_install_check<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn dpmi_install_check<A: crate::Arch>(regs: &mut Vcpu<A>) {
     regs.rax &= !0xFFFF; // AX=0: DPMI available
     regs.rbx = (regs.rbx & !0xFFFF) | 0x0001; // BX bit0 = 32-bit supported
     regs.rcx = (regs.rcx & !0xFF) | 0x03; // CL = 386
@@ -2233,7 +2233,7 @@ fn dpmi_install_check<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
     regs.rdi = (regs.rdi & !0xFFFF) | ctrl_slot_off(SLOT_DPMI_ENTRY) as u64;
 }
 
-fn int_2fh<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn int_2fh<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ax = regs.rax as u16;
     dos_trace!("D2F {:04X} BX={:04X} CX={:04X} DX={:04X} cs:ip={:04X}:{:04X}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -2284,7 +2284,7 @@ fn int_2fh<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::Pa
 ///
 /// Mouse hardware state lives on `dos.pc.mouse` and is updated by the IRQ 12
 /// packet stream queued through `machine::queue_irq`.
-fn int_33h<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn int_33h<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ax = regs.rax as u16;
     dos_trace!("D33 AX={:04X} BX={:04X} CX={:04X} DX={:04X} ES={:04X}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16, regs.es as u16);
@@ -2375,7 +2375,7 @@ fn int_33h<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::Pag
 /// since `HostContinuation` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
 /// returns via SLOT_MOUSE_CB_RET which restores them and then unwinds through
 /// the standard `resume_continuation_from_stub`.
-pub(super) fn deliver_mouse_callback<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+pub(super) fn deliver_mouse_callback<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
     use super::machine::vm86_push;
     use super::mode_transitions;
 
@@ -2460,7 +2460,7 @@ pub(super) fn deliver_mouse_callback<A: crate::Arch>(dos: &mut thread::DosState<
 /// SLOT_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
 /// Restore the GP regs `deliver_mouse_callback` clobbered, then unwind via
 /// the same `resume_continuation_from_stub` that SLOT_RESUME_CONTINUATION uses.
-pub(super) fn mouse_callback_return<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+pub(super) fn mouse_callback_return<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
     use super::machine::vm86_pop;
     if !dos.pc.mouse.cb_is_pm {
         // VM86: the stub's `CD 31` (INT 31h, IOPL=3) pushed FLAGS/CS/IP onto
@@ -2497,7 +2497,7 @@ fn dos_open_program<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut 
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], viopl: u8, regs: &mut Vcpu<A::PageTable>, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
+fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], viopl: u8, regs: &mut Vcpu<A>, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
     // Verify the file exists (DFS resolve → VFS → would-be open); ENOENT else.
     if dfs_open_existing(dos, prog_name).is_err() {
         regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
@@ -2555,7 +2555,7 @@ fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cm
 /// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C
 /// which interprets BAT itself and uses synth INT 31h AH=01h to
 /// fork+exec+wait each external command in a separate thread.
-fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let al = regs.rax as u8;
     match al {
         0x00 => {}                                  // load & execute — fall through
@@ -2796,7 +2796,7 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
 /// For MZ .EXE the load module is copied at load_seg:0 and each relocation
 /// entry gets `reloc_factor` added (NOT load_seg — the spec leaves it to
 /// the caller, e.g. Borland C passes the segment of the overlay frame).
-fn exec_load_overlay<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn exec_load_overlay<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     // ASCIIZ filename at DS:DX
     let mut addr = linear(dos, regs, regs.ds as u16, regs.rdx as u32);
     let mut filename = [0u8; 128];
@@ -2889,7 +2889,7 @@ fn exec_load_overlay<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, parent: ExecParent,
+fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
     crate::dbg_println!("exec_return: parent ss:sp={:04X}:{:04X} ds={:04X} es={:04X} heap={:04X} psp={:04X}",
         parent.ss, parent.sp, parent.ds, parent.es, parent.heap_seg, parent.psp);
@@ -3038,7 +3038,7 @@ pub(crate) fn dfs_create_path<A: crate::Arch>(dos: &thread::DosState<A>, dos_in:
 
 /// FindFirst/FindNext helper: resume search from dos.find_idx,
 /// updating it in place. Directory and pattern come from find_path.
-fn find_matching_file<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+fn find_matching_file<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     // Split find_path into directory and pattern components.
     // find_path is an absolute VFS path like "DN/DN*.SWP" or "*.*".
     // The directory part includes any trailing slash; the pattern is
@@ -3142,21 +3142,21 @@ impl Psp {
     #[inline]
     fn base(psp_seg: u16) -> usize { ((psp_seg as u32) << 4) as usize }
     /// Write the whole PSP at `psp_seg`.
-    pub fn store<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, psp_seg: u16, psp: Self) { regs.write::<Self>(Self::base(psp_seg), psp); }
+    pub fn store<A: crate::Arch>(regs: &mut Vcpu<A>, psp_seg: u16, psp: Self) { regs.write::<Self>(Self::base(psp_seg), psp); }
     /// Read PSP[0x2C] (environment segment or selector).
-    pub fn env_seg<P: arch_abi::GuestBytes>(regs: &Vcpu<P>, psp_seg: u16) -> u16 {
+    pub fn env_seg<A: crate::Arch>(regs: &Vcpu<A>, psp_seg: u16) -> u16 {
         regs.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
     }
     /// Set one Job File Table entry (PSP[0x18 + idx]).
-    pub fn set_jft<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, psp_seg: u16, idx: usize, val: u8) {
+    pub fn set_jft<A: crate::Arch>(regs: &mut Vcpu<A>, psp_seg: u16, idx: usize, val: u8) {
         regs.write::<u8>(Self::base(psp_seg) + core::mem::offset_of!(Self, jft) + idx, val);
     }
     /// Set the JFT size field (PSP[0x32]).
-    pub fn set_max_files<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, psp_seg: u16, n: u16) {
+    pub fn set_max_files<A: crate::Arch>(regs: &mut Vcpu<A>, psp_seg: u16, n: u16) {
         regs.write::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files), n);
     }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
-    pub fn set_cmdline<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, psp_seg: u16, tail: &[u8]) {
+    pub fn set_cmdline<A: crate::Arch>(regs: &mut Vcpu<A>, psp_seg: u16, tail: &[u8]) {
         let n = tail.len().min(126);
         let base = Self::base(psp_seg);
         regs.write::<u8>(base + core::mem::offset_of!(Self, cmdline_len), n as u8);
@@ -3322,7 +3322,7 @@ fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 /// Update the chain-head pointer that lives at `[LOL - 2]`. Called from
 /// `sync_mcb_chain` so AH=52h-style chain walkers see the current
 /// `heap_base_seg`.
-pub(super) fn set_first_mcb_seg<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, seg: u16) {
+pub(super) fn set_first_mcb_seg<A: crate::Arch>(regs: &mut Vcpu<A>, seg: u16) {
     regs.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
 }
 
@@ -3542,7 +3542,7 @@ pub(crate) const SLOT_RESUME_CONTINUATION: u8 = 0x02;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
-pub(super) fn setup_ivt<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+pub(super) fn setup_ivt<A: crate::Arch>(regs: &mut Vcpu<A>) {
     // Fill the stub array with `CD 31` so any slot reached by an IVT entry
     // (or PM CALL FAR) traps to STUB_INT and the slot dispatcher.
     let stubs = lm_field(core::mem::offset_of!(LowMem, stubs));
@@ -3598,7 +3598,7 @@ pub(super) fn setup_ivt<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
     write_u16(regs, 0x40, 0x17, kbd_flags);
 }
 
-fn setup_lol_sft<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>) {
+fn setup_lol_sft<A: crate::Arch>(regs: &mut Vcpu<A>) {
     let sft_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
     let cds_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
     let boot_seg = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16;
@@ -3663,7 +3663,7 @@ fn sft_entry_addr(handle: usize) -> usize {
 }
 
 /// Populate SFT entry for a newly opened file handle.
-fn sft_set_file<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, handle: u16, size: u32) {
+fn sft_set_file<A: crate::Arch>(regs: &mut Vcpu<A>, handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
     regs.write::<SftEntry>(sft_entry_addr(handle as usize), SftEntry {
         refcount: 1,
@@ -3676,7 +3676,7 @@ fn sft_set_file<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, handle: u16, size: 
 }
 
 /// Clear SFT entry when a file handle is closed.
-fn sft_clear<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, handle: u16) {
+fn sft_clear<A: crate::Arch>(regs: &mut Vcpu<A>, handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
     regs.write::<u16>(sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount), 0);
 }
@@ -3722,7 +3722,7 @@ fn fill_env(env: &mut [u8], parent_env: &[u8], prog_name: &[u8]) {
 
 /// Initialize a freshly-allocated PSP at `psp_seg` to point at its env
 /// block at `env_seg`, with parent_psp / JFT / cmdline default fields set.
-fn init_psp<P: arch_abi::GuestBytes>(regs: &mut Vcpu<P>, psp_seg: u16, env_seg: u16, parent_psp: u16) {
+fn init_psp<A: crate::Arch>(regs: &mut Vcpu<A>, psp_seg: u16, env_seg: u16, parent_psp: u16) {
     let mut jft = [0xFFu8; 20];
     jft[0] = 0; jft[1] = 1; jft[2] = 2;   // stdin/stdout/stderr → SFT 0/1/2
     let mut cmdline = [0u8; 127];
@@ -3762,7 +3762,7 @@ pub(super) fn is_mz_exe(data: &[u8]) -> bool {
 /// separate AH=48-style allocations on `dos`'s MCB chain, exactly like
 /// real DOS does on `INT 21h AH=4B EXEC`. Returns `(env_seg, psp_seg,
 /// end_seg)`.
-fn alloc_program_blocks<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, prog_paras: u16)
+fn alloc_program_blocks<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, prog_paras: u16)
     -> Result<(u16, u16, u16), ()>
 {
     let env_seg = dos_alloc_block(dos, regs, ENV_PARAS).map_err(|_| ())?;
@@ -3774,7 +3774,7 @@ fn alloc_program_blocks<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mu
 /// Populate the env block + PSP + load module for a freshly-allocated
 /// program. Common to `load_exe` and `load_com`. Sets `dos.current_psp`
 /// and re-syncs the MCB chain so block ownership reflects the new PSP.
-fn populate_program<A: crate::Arch>(regs: &mut Vcpu<A::PageTable>, dos: &mut thread::DosState<A>, env_seg: u16, psp_seg: u16,
+fn populate_program<A: crate::Arch>(regs: &mut Vcpu<A>, dos: &mut thread::DosState<A>, env_seg: u16, psp_seg: u16,
                     parent: &ParentRef, prog_name: &[u8]) {
     // Build the env arena in a local buffer, write it to guest memory, and
     // read the BLASTER config from the same buffer (no second guest read).
@@ -3793,7 +3793,7 @@ fn populate_program<A: crate::Arch>(regs: &mut Vcpu<A::PageTable>, dos: &mut thr
 /// Load a .COM binary. Allocates env + program block (1000h paragraphs =
 /// 64 KB, the standard .COM arena), populates env/PSP/code. Stack at
 /// PSP:COM_SP (top of 64 KB segment), code at (psp+0x10):0000.
-pub(super) fn load_com<A: crate::Arch>(regs: &mut Vcpu<A::PageTable>, dos: &mut thread::DosState<A>, parent: &ParentRef,
+pub(super) fn load_com<A: crate::Arch>(regs: &mut Vcpu<A>, dos: &mut thread::DosState<A>, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Loaded {
     let (env_seg, psp_seg, end_seg) = alloc_program_blocks(dos, regs, 0x1000)
         .expect("load_com: allocation failed");
@@ -3823,7 +3823,7 @@ pub(super) fn load_com<A: crate::Arch>(regs: &mut Vcpu<A::PageTable>, dos: &mut 
 ///   0x14: initial IP
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
-pub(super) fn load_exe<A: crate::Arch>(regs: &mut Vcpu<A::PageTable>, dos: &mut thread::DosState<A>, parent: &ParentRef,
+pub(super) fn load_exe<A: crate::Arch>(regs: &mut Vcpu<A>, dos: &mut thread::DosState<A>, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Option<Loaded> {
     if data.len() < 28 { return None; }
 

@@ -25,7 +25,7 @@ pub const F12_PRESS: u8 = 0x58;
 /// Drain pending input into the console owner.
 pub fn drain<A: crate::Arch>(
     machine: &mut A,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
 ) {
@@ -42,7 +42,7 @@ pub fn drain<A: crate::Arch>(
 /// behind a foreground Linux child).
 fn drain_dos<A: crate::Arch>(
     machine: &mut A,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     blocked: bool,
     dos: &mut thread::DosState<A>,
 ) {
@@ -75,7 +75,7 @@ fn drain_dos<A: crate::Arch>(
 /// Linux owner: keys → cooked fd input.
 fn drain_linux<A: crate::Arch>(
     machine: &mut A,
-    regs: &mut Vcpu<A::PageTable>,
+    regs: &mut Vcpu<A>,
     kt: &mut thread::KernelThread<A>,
     linux: &mut thread::LinuxState,
 ) {

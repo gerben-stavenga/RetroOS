@@ -107,7 +107,7 @@ fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
     dos.xms.as_deref_mut().unwrap()
 }
 
-pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — Get XMS version
@@ -339,7 +339,7 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
 ///   +06: u32 source offset (or seg:off if handle=0)
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
-fn xms_move<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) {
+fn xms_move<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
     let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
 
     let length = regs.read::<u32>((addr) as usize) as usize;
@@ -437,7 +437,7 @@ fn or64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
 pub(super) static EMS_BASE_PAGE: AtomicUsize = AtomicUsize::new(0xD0);
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
-pub(super) fn scan_uma<P: arch_abi::GuestBytes>(regs: &Vcpu<P>) {
+pub(super) fn scan_uma<A: crate::Arch>(regs: &Vcpu<A>) {
     let mut free: u64 = 0;
     for i in 0..UMA_PAGES {
         let base = (UMA_BASE + i) * 0x1000;

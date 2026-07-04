@@ -83,7 +83,7 @@ fn ems_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut EmsState {
     dos.ems.as_deref_mut().unwrap()
 }
 
-pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>) -> thread::KernelAction {
+pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
@@ -103,7 +103,7 @@ pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
     result
 }
 
-fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A::PageTable>, ah: u8) -> thread::KernelAction {
+fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, ah: u8) -> thread::KernelAction {
     match ah {
         // AH=40h — Get status
         0x40 => {

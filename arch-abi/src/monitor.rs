@@ -239,7 +239,7 @@ fn string_io(regs: &mut Regs, cs_32: bool, advance: u32, rep: bool, addr32: bool
 /// Decode the instruction at CS:IP and either finish it inline (`Resume`) or
 /// return a typed kernel event (`Event`). At entry bit 9 of `regs.flags32()`
 /// holds the guest's virtual interrupt flag.
-pub fn monitor<A: Arch>(vcpu: &mut Vcpu<A::PageTable>) -> MonitorResult {
+pub fn monitor<A: Arch>(vcpu: &mut Vcpu<A>) -> MonitorResult {
     let Vcpu { regs, space } = vcpu; // disjoint &mut to regs and guest memory
     monitor_rs::<A>(regs, space)
 }
@@ -477,7 +477,7 @@ fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResu
 // - Only meaningful in PM mode with virtual IF already == 0.
 // - TF management lives entirely here; `monitor()` opcode handlers never touch TF.
 
-pub fn step_virtual_if<A: Arch>(vcpu: &mut Vcpu<A::PageTable>) -> MonitorResult {
+pub fn step_virtual_if<A: Arch>(vcpu: &mut Vcpu<A>) -> MonitorResult {
     // Upper bound on sensitive instructions emulated before yielding back to
     // hardware. Prevents a runaway interpret loop on e.g. `POPF; POPF; ...`.
     const BUDGET: usize = 64;

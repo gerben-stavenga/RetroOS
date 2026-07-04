@@ -25,7 +25,7 @@
 //! Representation that genuinely differs between backends stays backend-owned
 //! via associated types: `PageTable` (a real page-table root vs a software
 //! address space) and `Fx` (an FXSAVE area vs a host FPU snapshot). The
-//! register/space bundle the kernel stores per thread is `Vcpu<Self::PageTable>`
+//! register/space bundle the kernel stores per thread is `Vcpu<Self>`
 //! — generic over the page-table type but otherwise shared, since both backends
 //! are x86 and share the `Regs` ABI.
 
@@ -90,43 +90,53 @@ pub trait GuestBytes {
 /// Register state plus the address-space handle those registers execute in.
 ///
 /// This is the unit the kernel stores per thread and hands back to `Arch` to
-/// resume. `space` is the backend's page-table root type (`A::PageTable`):
-/// a real per-thread root on metal, a software address space on the interp.
+/// resume. It is parameterized by the whole backend `A: Arch`, and its `space`
+/// field is `A::PageTable` (a real per-thread root on metal, a software address
+/// space on the interp). Parameterizing over `A` — not just `A::PageTable` —
+/// keeps `A` **inferable** from any `Vcpu<A>` value: `A::PageTable` is a
+/// non-invertible projection, so `Vcpu<A::PageTable>` would force turbofish (or
+/// a `P: GuestBytes` split) everywhere, whereas `Vcpu<A>` lets every function
+/// be uniformly `<A: Arch>` with `A` recovered from the argument. The one cost
+/// is that this data type now names the `Arch` trait; every holder has an `A`
+/// in scope, so nothing is blocked.
 ///
 /// Derefs to `Regs` so `vcpu.rax` / `vcpu.mode()` keep working and a
-/// `&mut Vcpu<P>` coerces where a `&mut Regs` is expected. Guest-memory access
-/// is provided by the backend's [`GuestBytes`] impl for `Vcpu<P>` (the
-/// forwarders that used to be inherent methods).
+/// `&mut Vcpu<A>` coerces where a `&mut Regs` is expected. Guest-memory access
+/// is the [`GuestBytes`] impl below, which forwards to `A::PageTable`.
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Vcpu<P> {
+pub struct Vcpu<A: Arch> {
     /// Architectural register state, including the program counter
     /// (`regs.frame.rip`) and the mode (32/64/VM86, derived from CS/EFLAGS).
     pub regs: Regs,
     /// Handle to the address space these registers run in. The arch context
     /// switch swaps it into the live root on entry.
-    pub space: P,
+    pub space: A::PageTable,
 }
 
-impl<P> core::ops::Deref for Vcpu<P> {
+// `A::PageTable: Copy` (from the `Arch` bound), so the whole bundle is `Copy` —
+// but `derive` would wrongly demand `A: Copy` (the backend handle), so the
+// Clone/Copy impls are written by hand against the real field bound.
+impl<A: Arch> Clone for Vcpu<A> {
+    fn clone(&self) -> Self { *self }
+}
+impl<A: Arch> Copy for Vcpu<A> {}
+
+impl<A: Arch> core::ops::Deref for Vcpu<A> {
     type Target = Regs;
     fn deref(&self) -> &Regs { &self.regs }
 }
-impl<P> core::ops::DerefMut for Vcpu<P> {
+impl<A: Arch> core::ops::DerefMut for Vcpu<A> {
     fn deref_mut(&mut self) -> &mut Regs { &mut self.regs }
 }
 
-impl<P> Vcpu<P> {
+impl<A: Arch> Vcpu<A> {
     /// Bundle existing registers with an address-space handle.
-    pub const fn new(regs: Regs, space: P) -> Self {
+    pub const fn new(regs: Regs, space: A::PageTable) -> Self {
         Vcpu { regs, space }
     }
-}
-
-impl<P: Default> Vcpu<P> {
     /// A cleared context with a default (empty) address space.
     pub fn empty() -> Self {
-        Vcpu { regs: Regs::empty(), space: P::default() }
+        Vcpu { regs: Regs::empty(), space: A::PageTable::default() }
     }
 }
 
@@ -136,7 +146,7 @@ impl<P: Default> Vcpu<P> {
 /// address space they run against, in one object, which the kernel already holds
 /// as `regs`/`vcpu` in every handler. So `regs.read(addr)` is the single way the
 /// kernel touches guest memory — there is no separate machine-side accessor.
-impl<P: GuestBytes> GuestBytes for Vcpu<P> {
+impl<A: Arch> GuestBytes for Vcpu<A> {
     fn read<T: Copy>(&self, addr: usize) -> T { self.space.read(addr) }
     fn write<T: Copy>(&mut self, addr: usize, val: T) { self.space.write(addr, val) }
     fn copy_from(&self, addr: usize, dst: &mut [u8]) { self.space.copy_from(addr, dst) }
@@ -159,7 +169,7 @@ impl<P: GuestBytes> GuestBytes for Vcpu<P> {
 /// So there is exactly one guest-memory path — the vcpu — and `Arch` is just the
 /// rest of the machine: CPU exec, ports, timer, IRQ lines, the page-table/fork/
 /// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
-pub trait Arch {
+pub trait Arch: Sized {
     /// Backend page-table root type stored in `Vcpu::space`. It is the guest-
     /// memory primitive — `GuestBytes` routes through it, which is what makes
     /// `vcpu.read(addr)` work.
@@ -199,7 +209,7 @@ pub trait Arch {
 
     /// Resume `vcpu` and return the next kernel-visible event, leaving `vcpu`
     /// holding the post-run register state.
-    fn execute(&mut self, vcpu: &mut Vcpu<Self::PageTable>) -> KernelEvent;
+    fn execute(&mut self, vcpu: &mut Vcpu<Self>) -> KernelEvent;
 
     /// Context-switch: swap the live state (`live`) with the saved buffer
     /// (`swap`) and make the now-incoming address space active. On entry `swap`
@@ -209,8 +219,8 @@ pub trait Arch {
     /// hashing; `fx_ptr` null ⇒ skip FPU swap.
     fn switch_to(
         &mut self,
-        live: &mut Vcpu<Self::PageTable>,
-        swap: &mut Vcpu<Self::PageTable>,
+        live: &mut Vcpu<Self>,
+        swap: &mut Vcpu<Self>,
         hash_ptr: *mut u64,
         fx_ptr: *mut Self::Fx,
     );

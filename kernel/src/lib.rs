@@ -2,7 +2,7 @@
 //!
 //! The kernel is generic over its arch backend: every function that touches
 //! the machine takes `machine: &mut A` with `A: Arch`, and thread state
-//! carries `Vcpu<A::PageTable>` / `A::Fx`. No backend crate is linked here —
+//! carries `Vcpu<A>` / `A::Fx`. No backend crate is linked here —
 //! composition happens in the ENTRY crates, which pick the backend and call
 //! `startup`:
 //!   * `entry-metal`  — arch-metal (real x86); linked with `entry.asm` into
