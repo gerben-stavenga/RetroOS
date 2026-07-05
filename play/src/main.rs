@@ -18,7 +18,7 @@ use std::io::Write;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: retroos-play DISK_IMAGE [--host DIR] [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE]"
+        "usage: retroos-play (DISK_IMAGE | --host DIR) [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE]"
     );
     std::process::exit(2);
 }
@@ -48,7 +48,12 @@ fn main() {
             _ => usage(),
         }
     }
-    let Some(image) = image else { usage() };
+    // Either a disk image or a `--host DIR` (the live host filesystem as root)
+    // is required — the same as `retroos-host`. `--host` alone boots on the real
+    // host tree (`Media::HostRoot`); an image boots the ext4 root (`DiskRoot`).
+    if image.is_none() && host_dir.is_none() {
+        usage();
+    }
 
     kernel::vga::set_debug_sink(log_byte);
 
@@ -93,10 +98,12 @@ fn main() {
             arch::attach_audio(path); // canonical audio → WAV (offline check)
         }
         arch::init_guest_ram(0);
-        arch::attach_disk(&image).unwrap_or_else(|e| {
-            eprintln!("retroos-play: cannot attach disk {image}: {e}");
-            std::process::exit(1);
-        });
+        if let Some(image) = &image {
+            arch::attach_disk(image).unwrap_or_else(|e| {
+                eprintln!("retroos-play: cannot attach disk {image}: {e}");
+                std::process::exit(1);
+            });
+        }
         let mut config = kernel::BootConfig::empty();
         config.is_qemu = true; // no real VGA raster: fabricate 0x3DA, like QEMU
         if let Some(c) = &cmd {

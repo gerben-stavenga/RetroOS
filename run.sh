@@ -63,6 +63,7 @@ SOUND="sb"
 ARCH="386"
 IMG=""            # resolved to a per-backend default later if empty
 ARCH_SET=0        # whether the user explicitly passed --arch (for warnings)
+IMG_SET=0         # whether the user explicitly passed -i/--image (hosted default logic)
 
 # qemu-specific
 START_BIN=""
@@ -95,7 +96,7 @@ while [ $# -gt 0 ]; do
         --firmware)   FIRMWARE="$2"; shift 2 ;;
         --sound)      SOUND="$2"; shift 2 ;;
         --arch)       ARCH="$2"; ARCH_SET=1; shift 2 ;;
-        -i|--image)   IMG="$2"; shift 2 ;;
+        -i|--image)   IMG="$2"; IMG_SET=1; shift 2 ;;
 
         # qemu passthrough flags
         -r)           START_BIN="$2"; shift 2 ;;
@@ -1316,6 +1317,16 @@ launch_hosted() {
         ext4)        IMG="image_ext4" ;;
         *)           : ;;  # already a basename / passthrough
     esac
+
+    # Default hosted to the machine's REAL filesystem — the same *environment*
+    # RetroOS sees booting this host off its own disk: `--host /` mounts the
+    # live Linux root as `/` and the real `/home/retroos` as `C:`. The transport
+    # (COM1 hostfs vs a disk) is irrelevant; what matters is the guest sees the
+    # identical tree. `-i IMG` opts into the packaged ext4 image instead (a
+    # self-contained, reproducible root that exercises the block+ext4 path).
+    if [ -z "$HOSTED_HOSTDIR" ] && [ "$IMG_SET" != 1 ]; then
+        HOSTED_HOSTDIR="/"
+    fi
 
     if [ -n "$HOSTED_HOSTDIR" ]; then
         ARGS+=(--host "$HOSTED_HOSTDIR")
