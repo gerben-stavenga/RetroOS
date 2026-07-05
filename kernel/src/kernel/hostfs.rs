@@ -107,7 +107,6 @@ fn recv_u8() -> u8 {
 
 const CMD_OPEN: u8 = 0x01;
 const CMD_READ: u8 = 0x02;
-#[allow(dead_code)]
 const CMD_CLOSE: u8 = 0x03;
 const CMD_STAT: u8 = 0x04;
 const CMD_READDIR: u8 = 0x05;
@@ -230,15 +229,16 @@ impl Filesystem for HostFs {
         if status < 0 { return status; }
         written as i32
     }
-}
 
-/// Close a hostfs handle (called when VFS file entry is freed).
-/// Note: the VFS doesn't currently call close on the Filesystem trait,
-/// so hostfs handles leak. This is acceptable for now.
-#[allow(dead_code)]
-pub fn close_handle(handle: u32) {
-    if !is_ready() { return; }
-    send_byte(CMD_CLOSE);
-    send_u32(handle);
-    let _status = recv_i32();
+    /// Tclunk: tell the host to free the server-side fid. Fire-and-forget (the
+    /// server sends no reply). Implemented and ready, but the VFS does not call
+    /// it on file close yet — the `path_cache` shares a fid across opens, so
+    /// there is no safe per-close clunk point (see `vfs::Vfs::close_handle`).
+    /// Until fid lifecycle moves to cache eviction, hostfs leaks one handle per
+    /// distinct path opened.
+    fn clunk(&self, handle: u64) {
+        if !is_ready() { return; }
+        send_byte(CMD_CLOSE);
+        send_u32(handle as u32);
+    }
 }
