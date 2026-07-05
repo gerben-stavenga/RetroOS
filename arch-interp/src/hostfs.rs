@@ -190,7 +190,12 @@ impl HostFs {
 /// Return the `index`-th directory entry as `(name_bytes, size, is_dir)`.
 fn nth_entry(dir: &Path, index: usize) -> Option<(Vec<u8>, u32, bool)> {
     let entry = fs::read_dir(dir).ok()?.flatten().nth(index)?;
-    let meta = entry.metadata().ok()?;
+    // Follow symlinks: a symlink-to-dir must report as a directory so DOS/DN can
+    // enter it (`/home/retroos` is full of them — GAMES entries, BORLANDC, TC…).
+    // `DirEntry::metadata` does NOT traverse links; `fs::metadata` does. Fall
+    // back to the link's own metadata for a dangling target so a broken symlink
+    // still shows (as a file) instead of truncating the whole listing.
+    let meta = fs::metadata(entry.path()).or_else(|_| entry.metadata()).ok()?;
     let name = entry.file_name().into_encoded_bytes();
     Some((name, meta.len().min(u32::MAX as u64) as u32, meta.is_dir()))
 }
