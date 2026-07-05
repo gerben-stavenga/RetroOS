@@ -307,12 +307,12 @@ fn push_continuation_at_cursor<A: crate::Arch>(machine: &mut A, dos: &mut thread
 /// with `resume_continuation`, which restores SS:SP and `other_stack`, so
 /// the post-pop cursor does not need to live anywhere.
 pub(super) fn pop_continuation<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) -> HostContinuation {
-    pop_continuation_at(machine, regs, &dos.ldt[..], pm_get_stack(dos, regs))
+    pop_continuation_at(machine, &dos.ldt[..], pm_get_stack(dos, regs))
 }
 
 /// Read a HostContinuation at an explicit (SS, SP). Used by recipes that
 /// know the pm-side cursor directly.
-pub(super) fn pop_continuation_at<A: crate::Arch>(machine: &mut A, _regs: &Regs, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
+pub(super) fn pop_continuation_at<A: crate::Arch>(machine: &mut A, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
     let addr = pm_addr(ldt, cursor);
     let save = machine.read::<HostContinuation>((addr) as usize);
     {
@@ -751,7 +751,7 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
         // top slot only on the nested_on_pm path, which pushes no continuation.
         let pm_save_at = pushed_hc_at.unwrap_or((host_stack_pm_seg(dos),
                           dos::host_stack_empty_sp() - HOST_CONTINUATION_SIZE));
-        let hc1 = pop_continuation_at(machine, regs, &dos.ldt[..], pm_save_at);
+        let hc1 = pop_continuation_at(machine, &dos.ldt[..], pm_save_at);
         regs.ds = hc1.ds as u64;
         regs.es = hc1.es as u64;
         regs.fs = hc1.fs as u64;
@@ -962,8 +962,8 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A, dos: &mu
     let rm_dest = rm_get_stack(dos);
     let _save_at = push_continuation_and_switch_to_rm_side(machine, dos, regs, rm_dest, None);
 
-    let ivt_off = machine::read_u16(machine, regs, 0, (vector as u32) * 4);
-    let ivt_seg = machine::read_u16(machine, regs, 0, (vector as u32) * 4 + 2);
+    let ivt_off = machine::read_u16(machine, 0, (vector as u32) * 4);
+    let ivt_seg = machine::read_u16(machine, 0, (vector as u32) * 4 + 2);
 
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
     // own INT n in real mode would push: FLAGS / CS / IP.

@@ -718,7 +718,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     crate::dbg_println!("exec_dos_into tid={} psp_seg={:04X} cmdtail.len={} cmdtail={:?}",
         tid, loaded.psp_seg, cmdtail.len(),
         core::str::from_utf8(&cmdtail).unwrap_or("<non-utf8>"));
-    dos::Psp::set_cmdline(machine, regs, loaded.psp_seg, &cmdtail);
+    dos::Psp::set_cmdline(machine, loaded.psp_seg, &cmdtail);
 
     let psp_seg = loaded.psp_seg;
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
@@ -888,7 +888,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
     let (col, row) = vga::vga().cursor_pos();
     {
         let regs = &mut t.kernel.vcpu;
-        dos::Psp::set_cmdline(machine, regs, loaded.psp_seg, &cmdline_tail);
+        dos::Psp::set_cmdline(machine, loaded.psp_seg, &cmdline_tail);
         machine.write::<u8>(0x450, col as u8);
         machine.write::<u8>(0x451, row as u8);
     }
@@ -916,7 +916,7 @@ pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
-fn snapshot_env<A: crate::Arch>(machine: &mut A, _regs: &Regs, env_seg: u16) -> alloc::vec::Vec<u8> {
+fn snapshot_env<A: crate::Arch>(machine: &mut A, env_seg: u16) -> alloc::vec::Vec<u8> {
     let base = (env_seg as usize) << 4;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;
@@ -941,9 +941,9 @@ pub fn snapshot_parent_env<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
             dpmi.saved_rm_env
         }
-        _ => dos::Psp::env_seg(machine, regs, psp_seg),
+        _ => dos::Psp::env_seg(machine, psp_seg),
     };
-    snapshot_env(machine, regs, env_seg)
+    snapshot_env(machine, env_seg)
 }
 
 /// F12 / panic dump: print DPMI LDT entries and PM stack/code bytes.
@@ -1117,7 +1117,7 @@ fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, regs: &mut
     // Update the LOL-1 first-MCB pointer. AH=52h returns ES:BX = LOL, and
     // programs (DOS/4G stubs, MEM utilities) read [LOL - 2] = first MCB
     // segment to walk the chain head.
-    dos::set_first_mcb_seg(machine, regs, dos.heap_base_seg);
+    dos::set_first_mcb_seg(machine, dos.heap_base_seg);
 
     let mut entries: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
 

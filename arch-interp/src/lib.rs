@@ -80,7 +80,7 @@ pub use machine::{
 // events are posted via `post_irq` and surface to the kernel through `drain`.
 pub use tty::enter_raw_mode;
 pub use space::{KernelPages, RootPageTable};
-pub use vcpu::{mem, set_current_vcpu, GuestMem, Vcpu, REGS};
+pub use vcpu::{mem, GuestMem, Vcpu, REGS};
 
 // Interpreter-specific host bring-up (not part of the metal surface):
 // `init_guest_ram` creates the initial address space; `new_space` allocates a

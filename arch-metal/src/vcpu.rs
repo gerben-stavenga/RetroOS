@@ -91,9 +91,3 @@ impl GuestBytes for crate::backend::Metal {
     }
 }
 
-/// Seed the live execution context with `v`. Used for the very first thread,
-/// which is entered directly rather than through a context switch (the swap
-/// path otherwise owns `REGS`). The `static mut` access is confined here.
-pub fn set_current_vcpu(v: Vcpu) {
-    unsafe { crate::REGS = v; }
-}

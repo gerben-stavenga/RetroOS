@@ -786,7 +786,7 @@ pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
 ///
 /// Each mode uses the ROM font matching its character-cell height: the authentic
 /// IBM 8×8 (200-line modes + 13h), 8×14 (EGA 350-line), or 8×16 (VGA 480-line).
-pub fn bios_draw_glyph<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, vga: &mut VgaState, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
+pub fn bios_draw_glyph<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
     let (cell_h, font): (u32, &[u8]) = match mode {
         0x0F | 0x10 => (14, &lib::vga_fonts::FONT_8X14),
         0x11 | 0x12 => (16, &lib::vga_fonts::FONT_8X16),
@@ -1447,7 +1447,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
 /// a slice — the one copy linear modes (mode 13h / text) can't avoid, since that
 /// VRAM is guest memory the kernel can't address as a flat region.
-fn read_aperture<'a, A: crate::Arch>(machine: &mut A, _regs: &Regs, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
+fn read_aperture<'a, A: crate::Arch>(machine: &mut A, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
     buf.clear();
     buf.resize(len, 0);
     machine.copy_from(addr, buf);
@@ -1475,7 +1475,7 @@ impl VgaState {
                 mode: VgaMode::LinearSvga {
                     w: self.svga_w, h: self.svga_h, bpp: self.svga_bpp, pitch: pitch as u16,
                 },
-                vram: read_aperture(machine, regs, scratch, SVGA_LFB_BASE, size),
+                vram: read_aperture(machine, scratch, SVGA_LFB_BASE, size),
                 planes: &[],
                 ac: &self.ac,
                 palette: &self.dac,
@@ -1487,16 +1487,16 @@ impl VgaState {
                 line_compare: usize::MAX,
             });
         }
-        let mode = self.classify_mode(machine, regs)?;
+        let mode = self.classify_mode(machine)?;
         let (_w, h) = lib::vga_render::dimensions(mode);
         let (vram, planes): (&[u8], &[u8]) = match mode {
             VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
             // Read the whole 64 KB window, not just w*h: a panned display-start
             // (screen-shake) slides the scanout origin forward, so the visible
             // window can reach past the nominal 320×200 = 64000 bytes.
-            VgaMode::Mode13h => (read_aperture(machine, regs, scratch, 0xA0000, 0x10000), &[]),
-            VgaMode::Text80x25 => (read_aperture(machine, regs, scratch, 0xB8000, 80 * 25 * 2), &[]),
-            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, regs, scratch, 0xB8000, 0x4000), &[]),
+            VgaMode::Mode13h => (read_aperture(machine, scratch, 0xA0000, 0x10000), &[]),
+            VgaMode::Text80x25 => (read_aperture(machine, scratch, 0xB8000, 80 * 25 * 2), &[]),
+            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, scratch, 0xB8000, 0x4000), &[]),
             VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
         };
         // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
@@ -1538,7 +1538,7 @@ impl VgaState {
     /// here and its resolution comes from the CRTC it programmed. Otherwise
     /// defer to `classify`, honouring the CRTC Offset as the in-memory row
     /// stride for smooth-scrollers (Keen's wide virtual screen).
-    fn classify_mode<A: crate::Arch>(&self, machine: &mut A, _regs: &Regs) -> Option<lib::vga_render::VgaMode> {
+    fn classify_mode<A: crate::Arch>(&self, machine: &mut A) -> Option<lib::vga_render::VgaMode> {
         use lib::vga_render::{self, VgaMode};
         let bda_mode = machine.read::<u8>(0x449);
         if planar_active() && bda_mode == 0x13 {

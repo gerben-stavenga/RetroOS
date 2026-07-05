@@ -7,6 +7,7 @@
 //! phys memfd, so everything runs inside ONE #[test] (Rust runs tests on
 //! separate threads; a second REGS user would race).
 
+use arch_abi::Arch;
 use super::*;
 use crate::space::RootPageTable;
 use crate::sysdesc::{VIF_FLAG, VM_FLAG};
@@ -30,7 +31,10 @@ fn run_to_event() -> KernelEvent {
 }
 
 fn set_regs(regs: Regs) {
-    crate::vcpu::set_current_vcpu(Vcpu::new(regs, RootPageTable(crate::mmu::active_id())));
+    // Seed the backend's live frame directly (arch-level proof, below the
+    // kernel loop where `execute` would swap them in). Space is unchanged —
+    // the active one, set via `Arch::activate` where a test needs to switch.
+    unsafe { (*core::ptr::addr_of_mut!(crate::vcpu::REGS)).regs = regs; }
 }
 
 fn regs() -> Regs {
@@ -134,8 +138,8 @@ fn kvm_engine_proofs() {
         ev => panic!("COW child: expected SoftInt(0x80), got {ev:?}"),
     }
     assert_eq!(child_mem.read::<u32>(data as usize), 0x1111_1112, "child sees its increment");
-    crate::mmu::switch_to(parent);
-    crate::vcpu::set_current_vcpu(Vcpu::new(Regs::empty(), RootPageTable(parent)));
+    crate::backend::Interp.activate(RootPageTable(parent), core::ptr::null_mut(), core::ptr::null_mut());
+    set_regs(Regs::empty());
     assert_eq!(
         mem.read::<u32>(data as usize),
         0x1111_1111,

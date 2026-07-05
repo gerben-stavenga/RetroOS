@@ -7,7 +7,7 @@
 //! against this backend and is the value the kernel will be injected with.
 
 use crate::space::RootPageTable;
-use crate::vcpu::{self, Vcpu};
+use crate::vcpu::{self};
 use arch_abi::{Arch, Irq, KernelEvent, Regs};
 
 /// The interpreter backend handle. Zero-sized today (state lives in module

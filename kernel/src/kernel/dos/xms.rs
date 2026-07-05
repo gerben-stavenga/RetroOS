@@ -436,7 +436,7 @@ fn or64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
 pub(super) static EMS_BASE_PAGE: AtomicUsize = AtomicUsize::new(0xD0);
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
-pub(super) fn scan_uma<A: crate::Arch>(machine: &mut A, _regs: &Regs) {
+pub(super) fn scan_uma<A: crate::Arch>(machine: &mut A) {
     let mut free: u64 = 0;
     for i in 0..UMA_PAGES {
         let base = (UMA_BASE + i) * 0x1000;

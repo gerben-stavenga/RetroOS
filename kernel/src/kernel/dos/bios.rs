@@ -182,14 +182,14 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
         let serviced = matches!(n,
             0x00..=0x33 | 0x40..=0x46 | 0x4A | 0x67 | 0x70..=0x77);
         let off = if serviced { (n * 2) as u16 } else { DUMMY_OFF };
-        write_u16(machine, regs, 0, n * 4, off);
-        write_u16(machine, regs, 0, n * 4 + 2, STUB_SEG);
+        write_u16(machine, 0, n * 4, off);
+        write_u16(machine, 0, n * 4 + 2, STUB_SEG);
     }
-    seed_bda(machine, regs);
+    seed_bda(machine);
 }
 
 /// Seed the BDA fields a real POST would have set.
-fn seed_bda<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
+fn seed_bda<A: crate::Arch>(machine: &mut A) {
     bda_field!(machine, video_mode = 3u8); // 80x25 colour text
     bda_field!(machine, columns = 80u16);
     bda_field!(machine, crtc_base = 0x03D4u16);
@@ -230,9 +230,9 @@ pub(super) fn dispatch<A: crate::Arch>(
             // Chain the user timer tick like a real INT 08 does. The
             // selector tells us whether anyone hooked INT 1C — unhooked
             // points back into this array (a no-op), so skip the bounce.
-            let seg = read_u16(machine, regs, 0, 0x1C * 4 + 2);
+            let seg = read_u16(machine, 0, 0x1C * 4 + 2);
             if seg != STUB_SEG {
-                let off = read_u16(machine, regs, 0, 0x1C * 4);
+                let off = read_u16(machine, 0, 0x1C * 4);
                 // Reuse the caller's IRET frame: the 1C handler's IRET
                 // returns straight to the interrupted code.
                 machine::set_vm86_cs(regs, seg);
@@ -365,7 +365,7 @@ fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Park
             // Peek: ZF in the caller's stacked FLAGS (popped on return).
             let ss = vm86_ss(regs) as u32;
             let fl_off = (vm86_sp(regs) as u32).wrapping_add(4);
-            let mut flags = read_u16(machine, regs, ss, fl_off);
+            let mut flags = read_u16(machine, ss, fl_off);
             if head == tail {
                 flags |= 0x40;
             } else {
@@ -373,7 +373,7 @@ fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Park
                 let key: u16 = machine.read(BDA_BASE + head as usize);
                 regs.rax = (regs.rax & !0xFFFF) | key as u64;
             }
-            write_u16(machine, regs, ss, fl_off, flags);
+            write_u16(machine, ss, fl_off, flags);
         }
         0x02 | 0x12 => {
             let fl: u8 = bda_field!(machine, kb_flags);
@@ -525,7 +525,7 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     // the framebuffer (BL = foreground colour). Text modes write
                     // the char byte at the cursor cell as before.
                     let fg = regs.rbx as u8;
-                    if !super::machine::vga::bios_draw_glyph(machine, regs, &mut dos.pc.vga, mode, ch, col, row, fg) {
+                    if !super::machine::vga::bios_draw_glyph(machine, &mut dos.pc.vga, mode, ch, col, row, fg) {
                         let off = (row * cols as u32 + col) as usize * 2;
                         machine.write::<u8>(VRAM_TEXT + off, ch);
                     }

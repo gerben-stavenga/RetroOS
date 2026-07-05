@@ -44,7 +44,7 @@ const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
 
-fn bios_time_of_day<A: crate::Arch>(machine: &mut A, _regs: &Regs) -> (u8, u8, u8, u8) {
+fn bios_time_of_day<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8, u8) {
     // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
     // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
     // of approximating the tick rate as 18 Hz. (BDA = guest address space.)
@@ -117,7 +117,7 @@ fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
 }
 
 fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, regs: &Regs) -> (u16, u16) {
-    let (hour, min, sec, _) = bios_time_of_day(machine, regs);
+    let (hour, min, sec, _) = bios_time_of_day(machine);
     let (year, month, day, _) = cmos_date(machine);
     let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
     let dos_date = ((year.saturating_sub(1980)) << 9) | ((month as u16) << 5) | day as u16;
@@ -191,7 +191,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
         // INT 29h — DOS FAST_CON_OUT: AL = char to display. Route through
         // the normal console path so VGA and debugcon stay in sync.
         0x29 => {
-            let ch = regs.rax as u8; dos_putchar(machine, regs, ch);
+            let ch = regs.rax as u8; dos_putchar(machine, ch);
             thread::KernelAction::Done
         }
         0x2E => int_2eh(machine, kt, dos, regs),
@@ -230,7 +230,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut threa
             // Restore caller FLAGS into regs so handlers may mutate them
             // (CF/ZF returns); then write back so normal IRET-style pop
             // restores the handler's result to the caller.
-            let caller_flags = read_u16(machine, regs, vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
+            let caller_flags = read_u16(machine, vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
             machine::set_vm86_flags(regs, caller_flags as u32);
             let action = dispatch_kernel_syscall(machine, kt, dos, regs, vector);
             // Exit replaces thread state outright — skip the iret-frame
@@ -251,7 +251,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut threa
                 let ss = vm86_ss(regs) as u32;
                 let off = (vm86_sp(regs) as u32).wrapping_add(4);
                 let flags = machine::vm86_flags(regs) as u16;
-                write_u16(machine, regs, ss, off, flags);
+                write_u16(machine, ss, off, flags);
             }
             // The pop is mode-aware: a child of a PM parent (VM86 client of
             // bcc-via-PMDOS) issuing AH=4C runs `exec_return`, which restores
@@ -674,15 +674,15 @@ fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u32, max_cha
                 0x0D => {
                     machine.write::<u8>((buf_lin + 1) as usize, count);
                     machine.write::<u8>((buf_lin + 2 + count as u32) as usize, 0x0D);
-                    dos_putchar(machine, regs, 0x0D);
-                    dos_putchar(machine, regs, 0x0A);
+                    dos_putchar(machine, 0x0D);
+                    dos_putchar(machine, 0x0A);
                     None
                 }
                 0x08 => {
                     if count > 0 {
-                        dos_putchar(machine, regs, 0x08);
-                        dos_putchar(machine, regs, b' ');
-                        dos_putchar(machine, regs, 0x08);
+                        dos_putchar(machine, 0x08);
+                        dos_putchar(machine, b' ');
+                        dos_putchar(machine, 0x08);
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count - 1))
                     } else {
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count))
@@ -691,10 +691,10 @@ fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u32, max_cha
                 _ => {
                     if (count as u32) + 1 < max_chars as u32 {
                         machine.write::<u8>((buf_lin + 2 + count as u32) as usize, ch);
-                        dos_putchar(machine, regs, ch);
+                        dos_putchar(machine, ch);
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count + 1))
                     } else {
-                        dos_putchar(machine, regs, 0x07); // bell — no room
+                        dos_putchar(machine, 0x07); // bell — no room
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count))
                     }
                 }
@@ -713,8 +713,8 @@ fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u32, max_cha
 /// (the return frame, pointing back at SLOT_RESUME) and enter `IVT[0x16]`.
 /// IF is forced so the guest's wait loop can receive the keypress IRQ.
 fn launch_int16_read<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
-    let ivt_off = read_u16(machine, regs, 0, 0x16 * 4);
-    let ivt_seg = read_u16(machine, regs, 0, 0x16 * 4 + 2);
+    let ivt_off = read_u16(machine, 0, 0x16 * 4);
+    let ivt_seg = read_u16(machine, 0, 0x16 * 4 + 2);
     let ret_flags = machine::guest_flags_if_on(regs) as u16;
     machine::vm86_push(machine, regs, ret_flags);
     machine::vm86_push(machine, regs, CTRL_STUB_SEG);
@@ -742,14 +742,14 @@ fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool) -> super::R
                 dos.dos_pending_char = Some(scan);
             }
             regs.rax = (regs.rax & !0xFF) | ascii as u64;
-            if echo && ascii != 0 { dos_putchar(machine, regs, ascii); }
+            if echo && ascii != 0 { dos_putchar(machine, ascii); }
             None
         }))
 }
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
-fn dos_putchar<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, c: u8) {
+fn dos_putchar<A: crate::Arch>(machine: &mut A, c: u8) {
     // Mirror DOS console output to the debug log stream alongside VGA.
     crate::vga::debug_byte(c);
     // The BDA cursor (0040:0050/0051) is guest address space — go through the
@@ -803,7 +803,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
-            let ch = regs.rdx as u8; dos_putchar(machine, regs, ch);
+            let ch = regs.rdx as u8; dos_putchar(machine, ch);
             thread::KernelAction::Done
         }
         // AH=0x06: Direct console I/O (DL=0xFF=input, else output DL)
@@ -817,7 +817,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     regs.set_flag32(0x40); // set ZF = no char available
                 }
             } else {
-                dos_putchar(machine, regs, dl);
+                dos_putchar(machine, dl);
             }
             thread::KernelAction::Done
         }
@@ -842,7 +842,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             // AL=0 then the scancode on the next read).
             if let Some(ch) = dos.dos_pending_char.take() {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
-                if echo && ch != 0 { dos_putchar(machine, regs, ch); }
+                if echo && ch != 0 { dos_putchar(machine, ch); }
             } else {
                 // Real DOS services console input through INT 16h — so do we.
                 // Enter the guest's IVT[0x16] (AH=00, wait-for-key) with an
@@ -864,7 +864,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             loop {
                 let ch = machine.read::<u8>((addr) as usize);
                 if ch == b'$' { break; }
-                dos_putchar(machine, regs, ch);
+                dos_putchar(machine, ch);
                 addr = addr.wrapping_add(1);
                 // Safety limit: cap at 64 KiB from start
                 if addr.wrapping_sub(start) > 0xFFFF { break; }
@@ -895,8 +895,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // Some Borland C builds back kbhit() with this rather than INT 16h
         // AH=01h, so a hardcoded "no char" silently breaks polling.
         0x0B => {
-            let head = read_u16(machine, regs, 0x40, 0x1A);
-            let tail = read_u16(machine, regs, 0x40, 0x1C);
+            let head = read_u16(machine, 0x40, 0x1A);
+            let tail = read_u16(machine, 0x40, 0x1C);
             let al = if head != tail { 0xFFu8 } else { 0u8 };
             regs.rax = (regs.rax & !0xFF) | al as u64;
             thread::KernelAction::Done
@@ -917,8 +917,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 return thread::KernelAction::Done;
             }
             let (seg, off) = (regs.ds as u16, regs.rdx as u16);
-            write_u16(machine, regs, 0, (int_num as u32) * 4, off);
-            write_u16(machine, regs, 0, (int_num as u32) * 4 + 2, seg);
+            write_u16(machine, 0, (int_num as u32) * 4, off);
+            write_u16(machine, 0, (int_num as u32) * 4 + 2, seg);
             thread::KernelAction::Done
         }
         // AH=0x33: Get/Set Ctrl-Break check state
@@ -1039,8 +1039,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     regs.rbx = (regs.rbx & !0xFFFF) | (off & 0xFFFF) as u64;
                 }
             } else {
-                let off = read_u16(machine, regs, 0, (int_num as u32) * 4);
-                let seg = read_u16(machine, regs, 0, (int_num as u32) * 4 + 2);
+                let off = read_u16(machine, 0, (int_num as u32) * 4);
+                let seg = read_u16(machine, 0, (int_num as u32) * 4 + 2);
                 regs.es = seg as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | off as u64;
             }
@@ -1117,8 +1117,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
-                    sft_set_file(machine, regs, fd as u16, size);
-                    if (fd as usize) < 20 { Psp::set_jft(machine, regs, psp_struct_seg(dos), fd as usize, fd as u8); }
+                    sft_set_file(machine, fd as u16, size);
+                    if (fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
@@ -1132,13 +1132,13 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         0x3E => {
             let handle = regs.rbx as u16;
             if handle <= 2 || handle == NULL_FILE_HANDLE || (EMS_ENABLED && handle == EMS_DEVICE_HANDLE) {
-                if (handle as usize) < 20 { Psp::set_jft(machine, regs, psp_struct_seg(dos), handle as usize, 0xFF); }
+                if (handle as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), handle as usize, 0xFF); }
                 regs.clear_flag32(1);
             } else {
                 let rv = crate::kernel::vfs::close(handle as i32, &mut kt.fds);
                 if rv >= 0 {
-                    sft_clear(machine, regs, handle);
-                    if (handle as usize) < 20 { Psp::set_jft(machine, regs, psp_struct_seg(dos), handle as usize, 0xFF); }
+                    sft_clear(machine, handle);
+                    if (handle as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), handle as usize, 0xFF); }
                     regs.clear_flag32(1);
                 } else {
                     regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rv) as u64;
@@ -1419,8 +1419,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 Err(e) => -e,
             };
             if fd >= 0 {
-                sft_set_file(machine, regs, fd as u16, 0);
-                if (fd as usize) < 20 { Psp::set_jft(machine, regs, psp_struct_seg(dos), fd as usize, fd as u8); }
+                sft_set_file(machine, fd as u16, 0);
+                if (fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8); }
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
@@ -1438,7 +1438,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = machine.read::<u8>((addr + i) as usize);
-                    dos_putchar(machine, regs, ch);
+                    dos_putchar(machine, ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
                 regs.clear_flag32(1);
@@ -1452,7 +1452,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 let n = crate::kernel::vfs::write(machine, handle as i32, &data, &kt.fds);
                 if n >= 0 {
                     let size = crate::kernel::vfs::file_size(handle as i32, &kt.fds);
-                    sft_set_file(machine, regs, handle, size);
+                    sft_set_file(machine, handle, size);
                     regs.rax = (regs.rax & !0xFFFF) | n as u64;
                     regs.clear_flag32(1);
                 } else {
@@ -1793,7 +1793,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         }
         // AH=2Ch — Get System Time
         0x2C => {
-            let (hours, mins, secs, centisecs) = bios_time_of_day(machine, regs);
+            let (hours, mins, secs, centisecs) = bios_time_of_day(machine);
             regs.rcx = (regs.rcx & !0xFFFF) | ((hours as u64) << 8) | mins as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | ((secs as u64) << 8) | centisecs as u64;
             thread::KernelAction::Done
@@ -1938,7 +1938,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         0x67 => {
             let requested = regs.rbx as u16;
             if requested <= 20 {
-                Psp::set_max_files(machine, regs, psp_struct_seg(dos), requested);
+                Psp::set_max_files(machine, psp_struct_seg(dos), requested);
                 regs.clear_flag32(1);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory for an external JFT
@@ -2087,8 +2087,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             if fd >= 0 {
                 if open_exists {
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
-                    sft_set_file(machine, regs, fd as u16, size);
-                    if (fd as usize) < 20 { Psp::set_jft(machine, regs, psp_struct_seg(dos), fd as usize, fd as u8); }
+                    sft_set_file(machine, fd as u16, size);
+                    if (fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
                     regs.clear_flag32(1);
@@ -2099,8 +2099,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                         Err(e) => -e,
                     };
                     if new_fd >= 0 {
-                        sft_set_file(machine, regs, new_fd as u16, 0);
-                        if (new_fd as usize) < 20 { Psp::set_jft(machine, regs, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
+                        sft_set_file(machine, new_fd as u16, 0);
+                        if (new_fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                         regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                         regs.rcx = (regs.rcx & !0xFFFF) | 3; // CX=3: file replaced
                         regs.clear_flag32(1);
@@ -2119,8 +2119,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     Err(e) => -e,
                 };
                 if new_fd >= 0 {
-                    sft_set_file(machine, regs, new_fd as u16, 0);
-                    if (new_fd as usize) < 20 { Psp::set_jft(machine, regs, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
+                    sft_set_file(machine, new_fd as u16, 0);
+                    if (new_fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
                     regs.clear_flag32(1);
@@ -2293,7 +2293,7 @@ fn int_33h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs:
         // AX=0000h — reset / installation check.
         // Returns: AX=0xFFFF (driver installed), BX=number of buttons (2).
         0x0000 => {
-            m.erase_cursor(machine, regs);
+            m.erase_cursor(machine);
             *m = super::machine::MouseState::new();
             regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
             regs.rbx = (regs.rbx & !0xFFFF) | 2;
@@ -2655,9 +2655,9 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == parent_rm_psp => {
             dpmi.saved_rm_env
         }
-        _ => Psp::env_seg(machine, regs, parent_rm_psp),
+        _ => Psp::env_seg(machine, parent_rm_psp),
     };
-    let parent_env_vec = snapshot_env(machine, regs, parent_env_seg);
+    let parent_env_vec = snapshot_env(machine, parent_env_seg);
     let parent = ParentRef { psp_seg: parent_rm_psp, env: &parent_env_vec };
 
     // Save parent state before reseating the heap chain for the child.
@@ -2701,7 +2701,7 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
     let psp_seg = loaded.psp_seg;
 
-    Psp::set_cmdline(machine, regs, loaded.psp_seg, &tail[..copy_len]);
+    Psp::set_cmdline(machine, loaded.psp_seg, &tail[..copy_len]);
     dos.dta = (psp_seg as u32) * 16 + 0x80;
     // DPMI host obligation: parent's PM state must not be observable to the
     // child (no PM handlers fire; child's DPMI entry, if any, allocates a
@@ -2726,12 +2726,12 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
     let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
     let mut parent_ivt = [(0u8, 0u16, 0u16); 12];
     for (slot, &int_num) in parent_ivt.iter_mut().zip(EXEC_SAVED_IVT_VECTORS.iter()) {
-        let off = read_u16(machine, regs, 0, (int_num as u32) * 4);
-        let seg = read_u16(machine, regs, 0, (int_num as u32) * 4 + 2);
+        let off = read_u16(machine, 0, (int_num as u32) * 4);
+        let seg = read_u16(machine, 0, (int_num as u32) * 4 + 2);
         *slot = (int_num, off, seg);
         if parent_pm_mode {
-            write_u16(machine, regs, 0, (int_num as u32) * 4, slot_offset(int_num));
-            write_u16(machine, regs, 0, (int_num as u32) * 4 + 2, STUB_SEG);
+            write_u16(machine, 0, (int_num as u32) * 4, slot_offset(int_num));
+            write_u16(machine, 0, (int_num as u32) * 4 + 2, STUB_SEG);
         }
     }
     super::dpmi::install_kernel_ldt_slots(dos);
@@ -2924,8 +2924,8 @@ fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
     super::sync_mcb_chain(machine, dos, regs);
     if parent.pm_mode && !preserve_pm_env {
         for &(int_num, off, seg) in parent.ivt_vectors.iter() {
-            write_u16(machine, regs, 0, (int_num as u32) * 4, off);
-            write_u16(machine, regs, 0, (int_num as u32) * 4 + 2, seg);
+            write_u16(machine, 0, (int_num as u32) * 4, off);
+            write_u16(machine, 0, (int_num as u32) * 4 + 2, seg);
         }
     }
     // PM-environment handling on exec_return:
@@ -3138,21 +3138,21 @@ impl Psp {
     #[inline]
     fn base(psp_seg: u16) -> usize { ((psp_seg as u32) << 4) as usize }
     /// Write the whole PSP at `psp_seg`.
-    pub fn store<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, psp: Self) { machine.write::<Self>(Self::base(psp_seg), psp); }
+    pub fn store<A: crate::Arch>(machine: &mut A, psp_seg: u16, psp: Self) { machine.write::<Self>(Self::base(psp_seg), psp); }
     /// Read PSP[0x2C] (environment segment or selector).
-    pub fn env_seg<A: crate::Arch>(machine: &mut A, _regs: &Regs, psp_seg: u16) -> u16 {
+    pub fn env_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
         machine.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
     }
     /// Set one Job File Table entry (PSP[0x18 + idx]).
-    pub fn set_jft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, idx: usize, val: u8) {
+    pub fn set_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize, val: u8) {
         machine.write::<u8>(Self::base(psp_seg) + core::mem::offset_of!(Self, jft) + idx, val);
     }
     /// Set the JFT size field (PSP[0x32]).
-    pub fn set_max_files<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, n: u16) {
+    pub fn set_max_files<A: crate::Arch>(machine: &mut A, psp_seg: u16, n: u16) {
         machine.write::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files), n);
     }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
-    pub fn set_cmdline<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, tail: &[u8]) {
+    pub fn set_cmdline<A: crate::Arch>(machine: &mut A, psp_seg: u16, tail: &[u8]) {
         let n = tail.len().min(126);
         let base = Self::base(psp_seg);
         machine.write::<u8>(base + core::mem::offset_of!(Self, cmdline_len), n as u8);
@@ -3318,7 +3318,7 @@ fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 /// Update the chain-head pointer that lives at `[LOL - 2]`. Called from
 /// `sync_mcb_chain` so AH=52h-style chain walkers see the current
 /// `heap_base_seg`.
-pub(super) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, seg: u16) {
+pub(super) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, seg: u16) {
     machine.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
 }
 
@@ -3562,8 +3562,8 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
     // dispatcher (slot index = INT vector).
     for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67] {
-        write_u16(machine, regs, 0, (int_num as u32) * 4, slot_offset(int_num));
-        write_u16(machine, regs, 0, (int_num as u32) * 4 + 2, STUB_SEG);
+        write_u16(machine, 0, (int_num as u32) * 4, slot_offset(int_num));
+        write_u16(machine, 0, (int_num as u32) * 4 + 2, STUB_SEG);
     }
 
     // INT 15h: the SeaBIOS ROM services AH=87h (block move) / AH=89h (switch to
@@ -3573,16 +3573,16 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     // back (or a COW-inherited, already-redirected page 0) would capture our own
     // stub and self-loop the chain — so skip if it's already STUB_SEG.
     if crate::kernel::platform::get().firmware != crate::kernel::platform::Firmware::Substitute {
-        let seg = read_u16(machine, regs, 0, 0x15 * 4 + 2);
+        let seg = read_u16(machine, 0, 0x15 * 4 + 2);
         if seg != STUB_SEG {
-            super::bios::set_native_int15(seg, read_u16(machine, regs, 0, 0x15 * 4));
+            super::bios::set_native_int15(seg, read_u16(machine, 0, 0x15 * 4));
         }
-        write_u16(machine, regs, 0, 0x15 * 4, slot_offset(0x15));
-        write_u16(machine, regs, 0, 0x15 * 4 + 2, STUB_SEG);
+        write_u16(machine, 0, 0x15 * 4, slot_offset(0x15));
+        write_u16(machine, 0, 0x15 * 4 + 2, STUB_SEG);
     }
 
     setup_lol_sft(machine, regs);
-    xms::scan_uma(machine, regs);
+    xms::scan_uma(machine);
 
     // Force NumLock OFF in the BIOS keyboard-flags byte (40:17 bit 5). The
     // grey arrow keys are E0-stripped down to their numpad twins (Up == 0x48
@@ -3590,8 +3590,8 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     // renders them as digits ('8'/'2') instead of navigation — and a laptop
     // keyboard may have no NumLock key to clear it. 86box boots NumLock on;
     // QEMU/Bochs boot it off, which is why arrows worked there.
-    let kbd_flags = read_u16(machine, regs, 0x40, 0x17) & !0x0020;
-    write_u16(machine, regs, 0x40, 0x17, kbd_flags);
+    let kbd_flags = read_u16(machine, 0x40, 0x17) & !0x0020;
+    write_u16(machine, 0x40, 0x17, kbd_flags);
 }
 
 fn setup_lol_sft<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
@@ -3603,7 +3603,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     // PSP[0x16] walk, env_seg = 0 (env defaults live in MASTER_ENV
     // const, not on the chain). The cmdline area at 0x80+ is otherwise
     // unused and gives us a permanent zero byte at the INDOS-flag offset.
-    Psp::store(machine, regs, boot_seg, Psp {
+    Psp::store(machine, boot_seg, Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
         parent_psp: boot_seg,         // self-ref terminates the parent chain
@@ -3659,7 +3659,7 @@ fn sft_entry_addr(handle: usize) -> usize {
 }
 
 /// Populate SFT entry for a newly opened file handle.
-fn sft_set_file<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, handle: u16, size: u32) {
+fn sft_set_file<A: crate::Arch>(machine: &mut A, handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
     machine.write::<SftEntry>(sft_entry_addr(handle as usize), SftEntry {
         refcount: 1,
@@ -3672,7 +3672,7 @@ fn sft_set_file<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, handle: u16, 
 }
 
 /// Clear SFT entry when a file handle is closed.
-fn sft_clear<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, handle: u16) {
+fn sft_clear<A: crate::Arch>(machine: &mut A, handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
     machine.write::<u16>(sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount), 0);
 }
@@ -3724,7 +3724,7 @@ fn init_psp<A: crate::Arch>(machine: &mut A, regs: &mut Regs, psp_seg: u16, env_
     let mut cmdline = [0u8; 127];
     cmdline[0] = 0x0D;                      // empty tail terminated by CR
 
-    Psp::store(machine, regs, psp_seg, Psp {
+    Psp::store(machine, psp_seg, Psp {
         int_20: [0xCD, 0x20],
         top_of_mem: 0xA000,
         parent_psp,

@@ -101,7 +101,7 @@ pub const MULTIBOOT_INFO_FRAMEBUFFER: u32 = 1 << 12;
 // Types
 pub use backend::Metal;
 pub use paging2::{KernelPages, RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE, HEAP_END, heap_base};
-pub use vcpu::{Vcpu, set_current_vcpu};
+pub use vcpu::Vcpu;
 pub use irq::Irq;
 pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 

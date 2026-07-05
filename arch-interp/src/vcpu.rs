@@ -115,10 +115,6 @@ impl GuestBytes for crate::backend::Interp {
 /// syncs to/from the software CPU before/after each run slice.
 pub static mut REGS: Vcpu = Vcpu::new(Regs::empty(), RootPageTable::empty());
 
-/// Seed the live execution context. The `static mut` access is confined here.
-pub fn set_current_vcpu(v: Vcpu) {
-    unsafe { REGS = v; }
-}
 
 /// Initialize guest memory: create the initial address space. The `len`
 /// argument is vestigial (the MMU reserves the full user VA range per space);

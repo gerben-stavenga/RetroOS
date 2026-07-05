@@ -209,7 +209,7 @@ impl SoundBlaster {
             self.emu.cmd = None;
             return;
         }
-        self.unbind(machine, regs);
+        self.unbind(machine);
         // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
         // this atomically; the hardware ~3 µs hold is irrelevant under
         // emulation. Puts the DSP back in its post-power-on state so the
@@ -425,7 +425,7 @@ impl SoundBlaster {
         let bound = self.bound_chan == chan as u8 && self.bound_host == host as u8
             && self.bound_gpa == gpa && self.bound_len == len;
         if !bound {
-            if self.bound_gpa != 0 { self.unbind(machine, regs); }
+            if self.bound_gpa != 0 { self.unbind(machine); }
             let vbase     = (gpa & !0xFFF) as usize;
             let page_off  = (gpa & 0xFFF) as usize;
             let num_pages = (page_off + len as usize).div_ceil(0x1000);
@@ -465,7 +465,7 @@ impl SoundBlaster {
     /// them, so the partial-end-page neighbour data survives and the guest
     /// can reuse the linear range. The channel buffer is permanent. No-op
     /// when nothing is bound.
-    fn unbind<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
+    fn unbind<A: crate::Arch>(&mut self, machine: &mut A) {
         if self.bound_gpa == 0 { return; }
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
@@ -491,7 +491,7 @@ impl SoundBlaster {
         if self.emulated() { return; } // no real chip / alias to detach
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
-        self.unbind(machine, regs);
+        self.unbind(machine);
         self.suspended = true;
     }
 
@@ -775,7 +775,7 @@ impl SoundBlaster {
         if advance >= to_boundary {
             advance = to_boundary;
             self.emu.frac = 0; // discard the excess; we resume on the guest's ack
-            self.emit_frames(machine, regs, advance);
+            self.emit_frames(machine, advance);
             self.emu.cursor += advance;
             self.emu.awaiting_ack = true;
             // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
@@ -789,14 +789,14 @@ impl SoundBlaster {
                 self.emu.next_irq += self.emu.block_frames as u64;
             }
         } else {
-            self.emit_frames(machine, regs, advance);
+            self.emit_frames(machine, advance);
             self.emu.cursor += advance;
         }
     }
 
     /// Copy `count` ring frames (from `cursor`, wrapping) out of guest memory
     /// and hand them to the kernel sound layer.
-    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, count: u64) {
+    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, count: u64) {
         let channels = if self.emu.stereo { 2u32 } else { 1 };
         let frame_bytes = (self.emu.bits as u32 / 8) * channels;
         if frame_bytes == 0 || self.emu.buf_frames == 0 {

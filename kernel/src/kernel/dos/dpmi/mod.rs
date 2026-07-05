@@ -505,8 +505,8 @@ pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosSta
         // BL = interrupt number. Returns: CX:DX = seg:off
         0x0200 => {
             let int_num = regs.rbx as u8;
-            let off = machine::read_u16(machine, regs, 0, (int_num as u32) * 4);
-            let seg = machine::read_u16(machine, regs, 0, (int_num as u32) * 4 + 2);
+            let off = machine::read_u16(machine, 0, (int_num as u32) * 4);
+            let seg = machine::read_u16(machine, 0, (int_num as u32) * 4 + 2);
             regs.rcx = (regs.rcx & !0xFFFF) | seg as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | off as u64;
             clear_carry(regs);
@@ -518,8 +518,8 @@ pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosSta
             let seg = regs.rcx as u16;
             let off = regs.rdx as u16;
             dos_trace!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
-            machine::write_u16(machine, regs, 0, (int_num as u32) * 4, off);
-            machine::write_u16(machine, regs, 0, (int_num as u32) * 4 + 2, seg);
+            machine::write_u16(machine, 0, (int_num as u32) * 4, off);
+            machine::write_u16(machine, 0, (int_num as u32) * 4 + 2, seg);
             clear_carry(regs);
         }
         // AX=0202h — Get Processor Exception Handler Vector

@@ -323,7 +323,7 @@ impl MouseState {
         if col >= 80 || row >= 25 { return; }
         let offset = (row * 80 + col) as u16;
         if Some(offset) == self.drawn_at { return; }
-        self.erase_cursor(machine, regs);
+        self.erase_cursor(machine);
         let attr = (VGA_TEXT_BASE + offset as u32 * 2 + 1) as usize;
         self.saved_attr = machine.read::<u8>(attr);
         machine.write::<u8>(attr, self.saved_attr ^ 0x77);
@@ -331,7 +331,7 @@ impl MouseState {
     }
 
     /// Restore the original attribute under the current cursor cell.
-    pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
+    pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A) {
         if let Some(old) = self.drawn_at.take() {
             machine.write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
         }
@@ -345,7 +345,7 @@ impl MouseState {
 
     /// AX=02h — hide cursor: increment counter; if it was 0, erase.
     pub fn hide<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
-        if self.show_count <= 0 { self.erase_cursor(machine, regs); }
+        if self.show_count <= 0 { self.erase_cursor(machine); }
         self.show_count += 1;
     }
 }
@@ -893,12 +893,12 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
 
 /// Read a u16 from a real-mode seg:off address, through the active address
 /// space's memory interface (`arch::mem()`) — works under any arch backend.
-pub fn read_u16<A: crate::Arch>(machine: &mut A, _regs: &Regs, seg: u32, off: u32) -> u16 {
+pub fn read_u16<A: crate::Arch>(machine: &mut A, seg: u32, off: u32) -> u16 {
     machine.read::<u16>(((seg << 4) + off) as usize)
 }
 
 /// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
-pub fn write_u16<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, seg: u32, off: u32, val: u16) {
+pub fn write_u16<A: crate::Arch>(machine: &mut A, seg: u32, off: u32, val: u16) {
     machine.write::<u16>(((seg << 4) + off) as usize, val);
 }
 
@@ -907,13 +907,13 @@ pub fn vm86_push<A: crate::Arch>(machine: &mut A, regs: &mut Regs, val: u16) {
     let sp = vm86_sp(regs).wrapping_sub(2);
     set_vm86_sp(regs, sp);
     let ss = regs.ss32();
-    write_u16(machine, regs, ss, sp as u32, val);
+    write_u16(machine, ss, sp as u32, val);
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
 pub fn vm86_pop<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> u16 {
     let sp = vm86_sp(regs);
-    let val = read_u16(machine, regs, regs.ss32(), sp as u32);
+    let val = read_u16(machine, regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
     val
 }

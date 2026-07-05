@@ -537,7 +537,7 @@ pub fn do_chdir(path: &[u8], cwd: &mut [u8; 64], cwd_len: &mut usize) -> i32 {
 
 /// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
 /// Read a C `char**` (NULL-terminated) from 32-bit user memory into Vec<Vec<u8>>.
-fn read_c_argv<A: crate::Arch>(machine: &mut A, _vcpu: &Regs, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+fn read_c_argv<A: crate::Arch>(machine: &mut A, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
     let mut args = alloc::vec::Vec::new();
     if ptr == 0 { return args; }
     let mut offset = 0usize;
@@ -567,7 +567,7 @@ fn read_c_argv<A: crate::Arch>(machine: &mut A, _vcpu: &Regs, ptr: usize, wide: 
 /// For 64-bit: same layout with 8-byte slots.
 pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)]) -> usize {
     // Write one machine word (4 or 8 bytes, per client bitness) to the stack.
-    fn write_word<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, addr: usize, val: usize, want_64: bool) {
+    fn write_word<A: crate::Arch>(machine: &mut A, addr: usize, val: usize, want_64: bool) {
         if want_64 { machine.write::<u64>(addr, val as u64); }
         else { machine.write::<u32>(addr, val as u32); }
     }
@@ -632,26 +632,26 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs,
     let mut pos = base;
 
     // argc
-    write_word(machine, vcpu, pos, args.len(), want_64);
+    write_word(machine, pos, args.len(), want_64);
     pos += word;
     // argv[0..N-1], NULL
     for &addr in &string_addrs {
-        write_word(machine, vcpu, pos, addr, want_64);
+        write_word(machine, pos, addr, want_64);
         pos += word;
     }
-    write_word(machine, vcpu, pos, 0, want_64);
+    write_word(machine, pos, 0, want_64);
     pos += word;
     // envp[0..M-1], NULL
     for &addr in &env_addrs {
-        write_word(machine, vcpu, pos, addr, want_64);
+        write_word(machine, pos, addr, want_64);
         pos += word;
     }
-    write_word(machine, vcpu, pos, 0, want_64);
+    write_word(machine, pos, 0, want_64);
     pos += word;
     // auxv (terminated by the AT_NULL already pushed)
     for (tag, val) in auxv {
-        write_word(machine, vcpu, pos, tag, want_64);
-        write_word(machine, vcpu, pos + word, val, want_64);
+        write_word(machine, pos, tag, want_64);
+        write_word(machine, pos + word, val, want_64);
         pos += word * 2;
     }
 
@@ -680,7 +680,7 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // Dynamically-linked PIE → load at PIE_BASE; fixed ET_EXEC (and static
     // ET_DYN, which we keep at bias 0 as before) → no bias.
     let main_bias = if is_pie && interp_path.is_some() { PIE_BASE } else { 0 };
-    let loaded = elf::load_elf(machine, &mut current.kernel.vcpu, data, main_bias).map_err(|_| 8)?;
+    let loaded = elf::load_elf(machine, data, main_bias).map_err(|_| 8)?;
     let want_64 = loaded.class == elf::ElfClass::Elf64;
 
     // Dynamic: load the interpreter (ld.so) at INTERP_BASE and build the full
@@ -693,7 +693,7 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         let mut s: &[u8] = ip;
         while s.first() == Some(&b'/') { s = &s[1..]; }
         let interp_data = crate::kernel::exec::load_file_resolved(s).map_err(|_| 8)?;
-        let interp_loaded = elf::load_elf(machine, &mut current.kernel.vcpu, &interp_data, INTERP_BASE).map_err(|_| 8)?;
+        let interp_loaded = elf::load_elf(machine, &interp_data, INTERP_BASE).map_err(|_| 8)?;
         let aux = alloc::vec![
             (3usize, loaded.phdr_vaddr),  // AT_PHDR
             (4, loaded.phentsize),        // AT_PHENT
@@ -973,7 +973,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     // rather than argv[0]; only synthesize argv[0] from the path if the caller
     // passed an empty argv.
     let wide = regs.mode() == crate::UserMode::Mode64;
-    let mut args = read_c_argv(machine, &kt.vcpu, argv_ptr, wide);
+    let mut args = read_c_argv(machine, argv_ptr, wide);
     if args.is_empty() { args.push(path.clone()); }
 
     // Snapshot cwd up front — execve preserves it across the address-space
@@ -1578,7 +1578,7 @@ fn sys_stat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxSta
 
     // Check if it's a directory
     if vfs::dir_exists(resolved) {
-        write_stat64(machine, vcpu, stat_buf, 0o40755, 0, 0, want_64);
+        write_stat64(machine, stat_buf, 0o40755, 0, 0, want_64);
         return SyscallResult::val(0);
     }
 
@@ -1588,7 +1588,7 @@ fn sys_stat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxSta
     let posix_mode = vfs::file_mode_by_handle(handle);
     let ino = vfs::file_ino_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat64(machine, vcpu, stat_buf, 0o100000 | posix_mode as u32, size, ino, want_64);
+    write_stat64(machine, stat_buf, 0o100000 | posix_mode as u32, size, ino, want_64);
     SyscallResult::val(0)
 }
 
@@ -1601,18 +1601,18 @@ fn sys_fstat64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
     match kt.fds[fd] {
         thread::FdKind::ConsoleOut | thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => {
             // stdin/stdout/stderr / pipes — character device / pipe
-            write_stat64(machine, &mut kt.vcpu, stat_buf, 0o20666, 0, 0, want_64); // S_IFCHR
+            write_stat64(machine, stat_buf, 0o20666, 0, 0, want_64); // S_IFCHR
             SyscallResult::val(0)
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
             let mode = vfs::file_mode_by_handle(handle);
             let ino = vfs::file_ino_by_handle(handle);
-            write_stat64(machine, &mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size, ino, want_64);
+            write_stat64(machine, stat_buf, 0o100000 | mode as u32, size, ino, want_64);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {
-            write_stat64(machine, &mut kt.vcpu, stat_buf, 0o40755, 0, 0, want_64); // S_IFDIR
+            write_stat64(machine, stat_buf, 0o40755, 0, 0, want_64); // S_IFDIR
             SyscallResult::val(0)
         }
         thread::FdKind::None => SyscallResult::val(-EBADF),
@@ -1632,7 +1632,7 @@ fn sys_fstatat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &Linux
 /// x86-64 `struct stat` (144 bytes, st_mode@24, st_size@48). Getting this wrong
 /// for a 64-bit client makes ld.so read st_mode/st_size from the wrong offsets
 /// and reject a shared library as non-regular — so libc never maps.
-fn write_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, buf: usize, mode: u32, size: u32, ino: u64, want_64: bool) {
+fn write_stat64<A: crate::Arch>(machine: &mut A, buf: usize, mode: u32, size: u32, ino: u64, want_64: bool) {
     if want_64 {
         machine.zero(buf, 144);
         machine.write::<u64>(buf, 1);                              // st_dev
@@ -1657,7 +1657,7 @@ fn write_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, buf: usize, m
 /// Write the old (pre-LFS) Linux i386 `struct stat` (newstat layout, 64 bytes).
 /// Used by syscalls 106/107/108. uclibc's busybox falls back to these for
 /// access/exec checks; without correct mode bits we get spurious EACCES.
-fn write_stat_old<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, buf: usize, mode: u32, size: u32) {
+fn write_stat_old<A: crate::Arch>(machine: &mut A, buf: usize, mode: u32, size: u32) {
     machine.zero(buf, 64);
     machine.write::<u16>(buf + 0x08, mode as u16);          // st_mode
     machine.write::<u16>(buf + 0x0a, 1);                    // st_nlink
@@ -1676,7 +1676,7 @@ fn sys_stat_old<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxS
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
     if vfs::dir_exists(resolved) {
-        write_stat_old(machine, vcpu, stat_buf, 0o40755, 0);
+        write_stat_old(machine, stat_buf, 0o40755, 0);
         return SyscallResult::val(0);
     }
     let handle = vfs::open_to_handle(resolved);
@@ -1684,7 +1684,7 @@ fn sys_stat_old<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxS
     let size = vfs::file_size_by_handle(handle);
     let mode = vfs::file_mode_by_handle(handle);
     vfs::close_vfs_handle(handle);
-    write_stat_old(machine, vcpu, stat_buf, 0o100000 | mode as u32, size);
+    write_stat_old(machine, stat_buf, 0o100000 | mode as u32, size);
     SyscallResult::val(0)
 }
 
@@ -1695,17 +1695,17 @@ fn sys_fstat_old<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
     match kt.fds[fd] {
         thread::FdKind::ConsoleOut | thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => {
-            write_stat_old(machine, &mut kt.vcpu, stat_buf, 0o20666, 0); // S_IFCHR
+            write_stat_old(machine, stat_buf, 0o20666, 0); // S_IFCHR
             SyscallResult::val(0)
         }
         thread::FdKind::Vfs(handle) => {
             let size = vfs::file_size_by_handle(handle);
             let mode = vfs::file_mode_by_handle(handle);
-            write_stat_old(machine, &mut kt.vcpu, stat_buf, 0o100000 | mode as u32, size);
+            write_stat_old(machine, stat_buf, 0o100000 | mode as u32, size);
             SyscallResult::val(0)
         }
         thread::FdKind::Dir(_) => {
-            write_stat_old(machine, &mut kt.vcpu, stat_buf, 0o40755, 0);
+            write_stat_old(machine, stat_buf, 0o40755, 0);
             SyscallResult::val(0)
         }
         _ => SyscallResult::val(-EBADF),

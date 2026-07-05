@@ -19,7 +19,7 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
     }
 }
 
-fn dump_words<A: crate::Arch>(machine: &mut A, _regs: &Regs, label: &str, addr: u32) {
+fn dump_words<A: crate::Arch>(machine: &mut A, label: &str, addr: u32) {
     let rd = |off: u32| machine.read::<u16>((addr.wrapping_add(off)) as usize);
     let (w0, w1, w2, w3) = (rd(0), rd(2), rd(4), rd(6));
     let (w4, w5, w6, w7) = (rd(8), rd(10), rd(12), rd(14));
@@ -66,8 +66,8 @@ fn dump_dpmi_fault_context<A: crate::Arch>(machine: &mut A, dos: &thread::DosSta
     dump_selector("DS", dos, regs.ds as u16);
     dump_selector("ES", dos, regs.es as u16);
     dump_selector("SS", dos, regs.stack_seg());
-    dump_words(machine, regs, "stack SP", sp_addr);
-    dump_words(machine, regs, "stack BP", bp_addr);
+    dump_words(machine, "stack SP", sp_addr);
+    dump_words(machine, "stack BP", bp_addr);
 }
 
 /// FAR-CALL return frame the host pushes below the spec exception
@@ -231,8 +231,8 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
         // faulting instruction would just re-execute and refault, producing
         // an infinite loop. Terminate the client instead.
         if matches!(exc_num, 0 | 3 | 4) {
-            let ivt_off = machine::read_u16(machine, regs, 0, exc_num * 4);
-            let ivt_seg = machine::read_u16(machine, regs, 0, exc_num * 4 + 2);
+            let ivt_off = machine::read_u16(machine, 0, exc_num * 4);
+            let ivt_seg = machine::read_u16(machine, 0, exc_num * 4 + 2);
             dos_trace!("[DPMI] reflect exception {} to IVT {:04X}:{:04X} from {:04X}:{:08X} flags={:04X}",
                 exc_num, ivt_seg, ivt_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
             // Plant an iret-frame on the user's stack pointing at the
@@ -515,7 +515,7 @@ pub(super) fn exception_return<A: crate::Arch>(machine: &mut A,
         mode_transitions::host_stack_pm_seg(dos),
         dos::EXC_STACK_TOP - mode_transitions::HOST_CONTINUATION_SIZE,
     ));
-    let mut save = mode_transitions::pop_continuation_at(machine, regs, &dos.ldt[..], (host_seg, mode_save_sp));
+    let mut save = mode_transitions::pop_continuation_at(machine, &dos.ldt[..], (host_seg, mode_save_sp));
     if use32 || via == ExcReturnVia::V10 {
         save.eip    = new_eip;
         save.cs     = new_cs;
