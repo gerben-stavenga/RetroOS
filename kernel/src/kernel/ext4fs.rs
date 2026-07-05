@@ -47,9 +47,8 @@ pub struct Ext4Fs {
     /// Per-handle seekable file cursors (handle = monotonic counter). A `File`
     /// is just an inode + extent iterator + offset (a few hundred bytes), NOT
     /// the file's contents — so this stays small no matter how large the files
-    /// are. Lifetime matches the VFS path-cache: handles are not dropped on
-    /// close (the path-cache shares a handle across opens and is never
-    /// evicted), exactly as the old cached byte buffers lived.
+    /// are. `clunk` drops a cursor when its open file closes (each VFS open owns
+    /// its own handle), so the map tracks only currently-open files.
     open_files: RefCell<BTreeMap<u64, File>>,
     /// Next handle to assign.
     next_handle: RefCell<u64>,
@@ -210,5 +209,12 @@ impl Filesystem for Ext4Fs {
         // busybox reject it). read_dir follows symlinks (FollowSymlinks::All),
         // so a symlink TO a directory correctly counts as one.
         self.fs.read_dir(abs).is_ok()
+    }
+
+    /// Drop the seekable cursor for a closed handle (Tclunk). Without this the
+    /// `open_files` map — and, on hosted, the underlying host fd each `File`
+    /// holds — would grow for the life of the mount.
+    fn clunk(&self, handle: u64) {
+        self.open_files.borrow_mut().remove(&handle);
     }
 }
