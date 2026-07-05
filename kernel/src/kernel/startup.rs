@@ -307,7 +307,7 @@ fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
 /// moved together with execution by `switch_focus_and_run` for now).
 pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], first_tid: usize) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
-    let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, machine, first_tid);
+    let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
 
     loop {

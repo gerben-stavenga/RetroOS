@@ -27,15 +27,18 @@ pub struct ExecutionContext<A: crate::Arch> {
 }
 
 impl<A: crate::Arch> ExecutionContext<A> {
-    /// Seed the loan from a thread's saved state (the loop's first thread): take
-    /// its registers into the loan and make its space the active one.
-    pub fn seed(threads: &mut [thread::Thread<A>], machine: &mut A, tid: usize) -> Self {
+    /// Seed the loan from the first thread: take its registers into the loan.
+    ///
+    /// It does NOT `activate` the thread's space. The first thread runs on the
+    /// space that is ALREADY active — the boot-configured constant root on
+    /// metal, the init'd page directory on interp — while its own `space` handle
+    /// is still the default placeholder from `create_thread`. Activating that
+    /// placeholder would, on metal, swap its empty entries into the live root
+    /// and unmap the running thread (`swap_and_activate`). The handle is filled
+    /// in with the real entries the first time the thread switches out.
+    pub fn seed(threads: &mut [thread::Thread<A>], tid: usize) -> Self {
         let t = thread::get_thread(threads, tid).expect("ExecutionContext::seed: invalid thread");
         let regs = t.kernel.vcpu.regs;
-        // Move the first thread's space into the active slot (discarding the
-        // empty placeholder the backend started with); no FPU swap on seed.
-        let space = core::mem::take(&mut t.kernel.vcpu.space);
-        let _ = machine.activate(space, core::ptr::null_mut(), core::ptr::null_mut());
         ExecutionContext { tid, regs, _a: core::marker::PhantomData }
     }
 
