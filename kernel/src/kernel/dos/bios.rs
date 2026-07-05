@@ -31,8 +31,6 @@
 //! forever).
 
 use crate::Regs;
-use arch_abi::GuestBytes;
-use crate::Vcpu;
 use crate::kernel::thread;
 use super::machine::{
     self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_sp, vm86_ss, read_u16, write_u16,
@@ -191,7 +189,7 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
 }
 
 /// Seed the BDA fields a real POST would have set.
-fn seed_bda<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+fn seed_bda<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     bda_field!(machine, video_mode = 3u8); // 80x25 colour text
     bda_field!(machine, columns = 80u16);
     bda_field!(machine, crtc_base = 0x03D4u16);
@@ -315,7 +313,7 @@ fn set_iret_cf<A: crate::Arch>(machine: &mut A, regs: &mut Regs, cf: bool) {
 /// into protected mode, which is illegal under VM86.
 fn int15_block_move<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let gdt = ((regs.es as u32) << 4) + (regs.rsi as u32 & 0xFFFF);
-    let base = |regs: &Regs, desc: u32| -> u32 {
+    let base = |_regs: &Regs, desc: u32| -> u32 {
         let d = (gdt + desc) as usize;
         (machine.read::<u16>(d + 2) as u32)                      // base bits 0–15
             | (((machine.read::<u16>(d + 4) as u32) & 0xFF) << 16) // byte 4: bits 16–23

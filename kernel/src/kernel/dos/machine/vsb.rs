@@ -465,7 +465,7 @@ impl SoundBlaster {
     /// them, so the partial-end-page neighbour data survives and the guest
     /// can reuse the linear range. The channel buffer is permanent. No-op
     /// when nothing is bound.
-    fn unbind<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    fn unbind<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
         if self.bound_gpa == 0 { return; }
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
@@ -796,7 +796,7 @@ impl SoundBlaster {
 
     /// Copy `count` ring frames (from `cursor`, wrapping) out of guest memory
     /// and hand them to the kernel sound layer.
-    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, count: u64) {
+    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, count: u64) {
         let channels = if self.emu.stereo { 2u32 } else { 1 };
         let frame_bytes = (self.emu.bits as u32 / 8) * channels;
         if frame_bytes == 0 || self.emu.buf_frames == 0 {

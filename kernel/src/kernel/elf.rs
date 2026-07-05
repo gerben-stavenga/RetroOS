@@ -7,8 +7,6 @@ const PAGE_SIZE: usize = 4096;
 extern crate alloc;
 use crate::Regs;
 use alloc::vec::Vec;
-use arch_abi::GuestBytes;
-use crate::Vcpu;
 pub use lib::elf::{ElfError, ElfClass};
 
 /// Peek at an ELF's dynamic-linking info without loading it:
@@ -43,7 +41,7 @@ pub struct LoadedElf {
 /// modern distro binary or the dynamic linker itself). Relocations are NOT
 /// applied here — for dynamically-linked images the interpreter (ld.so) does
 /// that; `load_bias` only places the segments.
-pub fn load_elf<A: crate::Arch>(machine: &mut A, regs: &mut Regs, elf_data: &[u8], load_bias: usize) -> Result<LoadedElf, ElfError> {
+pub fn load_elf<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, elf_data: &[u8], load_bias: usize) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
     let mut max_vaddr = 0usize;

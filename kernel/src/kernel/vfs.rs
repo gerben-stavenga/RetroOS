@@ -489,7 +489,7 @@ impl Vfs {
         n
     }
 
-    fn write_by_handle<A: crate::Arch>(&mut self, machine: &mut A, handle: i32, data: &[u8]) -> i32 {
+    fn write_by_handle<A: crate::Arch>(&mut self, _machine: &mut A, handle: i32, data: &[u8]) -> i32 {
         if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }

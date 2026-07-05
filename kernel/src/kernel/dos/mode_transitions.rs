@@ -44,9 +44,7 @@
 //! GP regs, and restore `other_stack`.
 
 use crate::Regs;
-use arch_abi::GuestBytes;
 use super::dosabi as dos;
-use crate::Vcpu;
 use super::machine;
 use super::thread;
 
@@ -187,7 +185,7 @@ pub(super) struct RmCallStruct {
 }
 
 impl RmCallStruct {
-    pub fn capture<A: crate::Arch>(machine: &mut A, regs: &Regs) -> Self {
+    pub fn capture<A: crate::Arch>(_machine: &mut A, regs: &Regs) -> Self {
         Self {
             edi: regs.rdi as u32, esi: regs.rsi as u32, ebp: regs.rbp as u32, _reserved: 0,
             ebx: regs.rbx as u32, edx: regs.rdx as u32, ecx: regs.rcx as u32, eax: regs.rax as u32,
@@ -314,7 +312,7 @@ pub(super) fn pop_continuation<A: crate::Arch>(machine: &mut A, dos: &thread::Do
 
 /// Read a HostContinuation at an explicit (SS, SP). Used by recipes that
 /// know the pm-side cursor directly.
-pub(super) fn pop_continuation_at<A: crate::Arch>(machine: &mut A, regs: &Regs, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
+pub(super) fn pop_continuation_at<A: crate::Arch>(machine: &mut A, _regs: &Regs, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
     let addr = pm_addr(ldt, cursor);
     let save = machine.read::<HostContinuation>((addr) as usize);
     {
@@ -620,7 +618,7 @@ pub(super) fn if_record(tag: u8, regs: &Regs, if_in: bool, if_out: bool,
 
 /// The guest's virtual interrupt flag (VIF/bit 19) — the kernel's single store.
 #[inline]
-fn if_bit<A: crate::Arch>(machine: &mut A, regs: &Regs) -> bool {
+fn if_bit<A: crate::Arch>(_machine: &mut A, regs: &Regs) -> bool {
     regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
 }
 

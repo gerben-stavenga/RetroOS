@@ -13,9 +13,7 @@
 extern crate alloc;
 
 use crate::Regs;
-use arch_abi::GuestBytes;
 use alloc::boxed::Box;
-use crate::Vcpu;
 use crate::kernel::thread;
 use crate::kernel::dos;
 // used by exceptions.rs via its `use super::*`

@@ -6,11 +6,9 @@ extern crate ext4_view;
 
 
 use crate::Regs;
-use crate::Vcpu;
 use crate::kernel::{vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
 use crate::kernel::thread;
-use arch_abi::GuestBytes;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
 static mut ROOT_TARFS: TarFs = TarFs::new(0);

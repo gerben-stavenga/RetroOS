@@ -1,14 +1,12 @@
 use crate::Regs;
-use arch_abi::GuestBytes;
 use super::*;
-use crate::Vcpu;
 use super::super::mode_transitions;
 use super::super::mode_transitions::RmCallStruct;
 
 /// INT 31h/0300h — Simulate Real Mode Interrupt
 /// Trace helper: peek 16 bytes at RM linear (ds<<4)+edx and print ASCII.
 /// Used to see what filename/buffer DOS/4GW hands to real mode.
-fn dump_ds_dx<A: crate::Arch>(machine: &mut A, regs: &Regs, ds: u16, edx: u32) {
+fn dump_ds_dx<A: crate::Arch>(machine: &mut A, _regs: &Regs, ds: u16, edx: u32) {
     let linear = ((ds as u32) << 4).wrapping_add(edx & 0xFFFF);
     if linear >= 0x110000 { return; } // guard against non-low memory
     let mut bytes = [0u8; 16];

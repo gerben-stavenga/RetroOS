@@ -9,9 +9,7 @@
 
 extern crate alloc;
 
-use arch_abi::GuestBytes;
 use crate::kernel::thread;
-use crate::Vcpu;
 use crate::vga;
 use crate::Regs;
 
@@ -46,7 +44,7 @@ const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
 
-fn bios_time_of_day<A: crate::Arch>(machine: &mut A, regs: &Regs) -> (u8, u8, u8, u8) {
+fn bios_time_of_day<A: crate::Arch>(machine: &mut A, _regs: &Regs) -> (u8, u8, u8, u8) {
     // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
     // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
     // of approximating the tick rate as 18 Hz. (BDA = guest address space.)
@@ -149,7 +147,7 @@ fn poll_dos_console_char<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosS
 /// cleared (the trap gate at entry, an exception handler, …): pending
 /// kbd/timer IRQs queue in the vPIC but `pick_pending_vec` gates them on
 /// VIF, and VIF is bit 9 of the saved EFLAGS.
-fn park_at_slot_resume<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+fn park_at_slot_resume<A: crate::Arch>(_machine: &mut A, regs: &mut Regs) {
     machine::set_vm86_cs(regs, CTRL_STUB_SEG);
     machine::set_vm86_ip(regs, ctrl_slot_off(SLOT_RESUME));
     regs.frame.rflags |= machine::VIF_FLAG as u64;
@@ -664,7 +662,7 @@ fn int_13h(regs: &mut Regs) -> thread::KernelAction {
 /// On completion, writes count to buffer[1] and appends 0x0D at
 /// buffer[count+2], echoes CR+LF. Returns `Some(next)` while still
 /// gathering input; `None` once Enter is pressed.
-fn buffered_input_resume<A: crate::Arch>(machine: &mut A, buf_lin: u32, max_chars: u8, count: u8) -> super::ResumeCallback<A> {
+fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u32, max_chars: u8, count: u8) -> super::ResumeCallback<A> {
     super::ResumeCallback(alloc::boxed::Box::new(move |machine: &mut A,
               _kt: &mut thread::KernelThread<A>,
               dos: &mut thread::DosState<A>,
@@ -731,7 +729,7 @@ fn launch_int16_read<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
 /// guest's INT 16h handler IRETs back to SLOT_RESUME, with AX = the key
 /// (AL=ASCII, AH=scancode). Applies DOS char-read semantics and returns
 /// `None` so SLOT_RESUME pops the original INT 21 return frame.
-fn int16_finish_resume<A: crate::Arch>(machine: &mut A, echo: bool) -> super::ResumeCallback<A> {
+fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool) -> super::ResumeCallback<A> {
     super::ResumeCallback(alloc::boxed::Box::new(move |machine: &mut A,
               _kt: &mut thread::KernelThread<A>,
               dos: &mut thread::DosState<A>,
@@ -751,7 +749,7 @@ fn int16_finish_resume<A: crate::Arch>(machine: &mut A, echo: bool) -> super::Re
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
-fn dos_putchar<A: crate::Arch>(machine: &mut A, regs: &mut Regs, c: u8) {
+fn dos_putchar<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, c: u8) {
     // Mirror DOS console output to the debug log stream alongside VGA.
     crate::vga::debug_byte(c);
     // The BDA cursor (0040:0050/0051) is guest address space — go through the
@@ -3140,21 +3138,21 @@ impl Psp {
     #[inline]
     fn base(psp_seg: u16) -> usize { ((psp_seg as u32) << 4) as usize }
     /// Write the whole PSP at `psp_seg`.
-    pub fn store<A: crate::Arch>(machine: &mut A, regs: &mut Regs, psp_seg: u16, psp: Self) { machine.write::<Self>(Self::base(psp_seg), psp); }
+    pub fn store<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, psp: Self) { machine.write::<Self>(Self::base(psp_seg), psp); }
     /// Read PSP[0x2C] (environment segment or selector).
-    pub fn env_seg<A: crate::Arch>(machine: &mut A, regs: &Regs, psp_seg: u16) -> u16 {
+    pub fn env_seg<A: crate::Arch>(machine: &mut A, _regs: &Regs, psp_seg: u16) -> u16 {
         machine.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
     }
     /// Set one Job File Table entry (PSP[0x18 + idx]).
-    pub fn set_jft<A: crate::Arch>(machine: &mut A, regs: &mut Regs, psp_seg: u16, idx: usize, val: u8) {
+    pub fn set_jft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, idx: usize, val: u8) {
         machine.write::<u8>(Self::base(psp_seg) + core::mem::offset_of!(Self, jft) + idx, val);
     }
     /// Set the JFT size field (PSP[0x32]).
-    pub fn set_max_files<A: crate::Arch>(machine: &mut A, regs: &mut Regs, psp_seg: u16, n: u16) {
+    pub fn set_max_files<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, n: u16) {
         machine.write::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files), n);
     }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
-    pub fn set_cmdline<A: crate::Arch>(machine: &mut A, regs: &mut Regs, psp_seg: u16, tail: &[u8]) {
+    pub fn set_cmdline<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, tail: &[u8]) {
         let n = tail.len().min(126);
         let base = Self::base(psp_seg);
         machine.write::<u8>(base + core::mem::offset_of!(Self, cmdline_len), n as u8);
@@ -3320,7 +3318,7 @@ fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 /// Update the chain-head pointer that lives at `[LOL - 2]`. Called from
 /// `sync_mcb_chain` so AH=52h-style chain walkers see the current
 /// `heap_base_seg`.
-pub(super) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, regs: &mut Regs, seg: u16) {
+pub(super) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, seg: u16) {
     machine.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
 }
 
@@ -3661,7 +3659,7 @@ fn sft_entry_addr(handle: usize) -> usize {
 }
 
 /// Populate SFT entry for a newly opened file handle.
-fn sft_set_file<A: crate::Arch>(machine: &mut A, regs: &mut Regs, handle: u16, size: u32) {
+fn sft_set_file<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
     machine.write::<SftEntry>(sft_entry_addr(handle as usize), SftEntry {
         refcount: 1,
@@ -3674,7 +3672,7 @@ fn sft_set_file<A: crate::Arch>(machine: &mut A, regs: &mut Regs, handle: u16, s
 }
 
 /// Clear SFT entry when a file handle is closed.
-fn sft_clear<A: crate::Arch>(machine: &mut A, regs: &mut Regs, handle: u16) {
+fn sft_clear<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
     machine.write::<u16>(sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount), 0);
 }

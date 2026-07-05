@@ -3,7 +3,6 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
-use crate::Vcpu;
 use crate::kernel::stacktrace::SymbolData;
 use crate::println;
 use crate::Regs;

@@ -4,9 +4,7 @@
 //! Physical backing comes from the kernel's demand paging.
 
 use crate::Regs;
-use arch_abi::GuestBytes;
 use crate::kernel::dos::linear;
-use crate::Vcpu;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use crate::dbg_println;
 use crate::kernel::thread;
@@ -438,7 +436,7 @@ fn or64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
 pub(super) static EMS_BASE_PAGE: AtomicUsize = AtomicUsize::new(0xD0);
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
-pub(super) fn scan_uma<A: crate::Arch>(machine: &mut A, regs: &Regs) {
+pub(super) fn scan_uma<A: crate::Arch>(machine: &mut A, _regs: &Regs) {
     let mut free: u64 = 0;
     for i in 0..UMA_PAGES {
         let base = (UMA_BASE + i) * 0x1000;

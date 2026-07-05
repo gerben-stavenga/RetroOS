@@ -15,7 +15,6 @@
 //!   device bus for other IRQs.
 
 use crate::Regs;
-use crate::Vcpu;
 use crate::kernel::thread;
 
 /// F11 scancode (press) — focus switch.

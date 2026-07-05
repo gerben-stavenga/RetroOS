@@ -580,7 +580,7 @@ fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, seed: Option<
 /// the planes back into a linear A0000 image first (the Mode-X unchain→chain
 /// hop, which expects the 13h view preserved); skip it when simply leaving
 /// graphics for text (the next mode-set clears the screen anyway).
-fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &VgaState, regs: &mut Regs, merge: bool) {
+fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &VgaState, _regs: &mut Regs, merge: bool) {
     machine.map_fresh_range(A0000 >> 12, 16);
     if merge {
         let mut chained = alloc::vec![0u8; 0x10000];
@@ -786,7 +786,7 @@ pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
 ///
 /// Each mode uses the ROM font matching its character-cell height: the authentic
 /// IBM 8×8 (200-line modes + 13h), 8×14 (EGA 350-line), or 8×16 (VGA 480-line).
-pub fn bios_draw_glyph<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga: &mut VgaState, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
+pub fn bios_draw_glyph<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, vga: &mut VgaState, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
     let (cell_h, font): (u32, &[u8]) = match mode {
         0x0F | 0x10 => (14, &lib::vga_fonts::FONT_8X14),
         0x11 | 0x12 => (16, &lib::vga_fonts::FONT_8X16),
@@ -1447,7 +1447,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
 /// a slice — the one copy linear modes (mode 13h / text) can't avoid, since that
 /// VRAM is guest memory the kernel can't address as a flat region.
-fn read_aperture<'a, A: crate::Arch>(machine: &mut A, regs: &Regs, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
+fn read_aperture<'a, A: crate::Arch>(machine: &mut A, _regs: &Regs, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
     buf.clear();
     buf.resize(len, 0);
     machine.copy_from(addr, buf);
@@ -1538,7 +1538,7 @@ impl VgaState {
     /// here and its resolution comes from the CRTC it programmed. Otherwise
     /// defer to `classify`, honouring the CRTC Offset as the in-memory row
     /// stride for smooth-scrollers (Keen's wide virtual screen).
-    fn classify_mode<A: crate::Arch>(&self, machine: &mut A, regs: &Regs) -> Option<lib::vga_render::VgaMode> {
+    fn classify_mode<A: crate::Arch>(&self, machine: &mut A, _regs: &Regs) -> Option<lib::vga_render::VgaMode> {
         use lib::vga_render::{self, VgaMode};
         let bda_mode = machine.read::<u8>(0x449);
         if planar_active() && bda_mode == 0x13 {

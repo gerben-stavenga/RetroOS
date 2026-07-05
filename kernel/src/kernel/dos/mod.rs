@@ -15,8 +15,6 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::Vcpu;
-use arch_abi::GuestBytes;
 
 /// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
 /// Lets COMMAND.COM bracket a single exec so the log only captures that
@@ -188,7 +186,7 @@ pub struct DosState<A: crate::Arch> {
 }
 
 /// The boxed retry closure inside a [`ResumeCallback`].
-type ResumeFn<A: crate::Arch> = dyn FnOnce(
+type ResumeFn<A> = dyn FnOnce(
     &mut A,
     &mut thread::KernelThread<A>,
     &mut DosState<A>,
@@ -285,7 +283,7 @@ impl<A: crate::Arch> DosState<A> {
     /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
-    pub fn suspend(&mut self, machine: &mut A) {
+    pub fn suspend(&mut self, _machine: &mut A) {
         if machine::vga_present() {
             self.pc.vga.save_from_hardware();
         }
@@ -294,7 +292,7 @@ impl<A: crate::Arch> DosState<A> {
     /// Called when the thread regains focus. Repaints the VGA framebuffer
     /// from the suspend snapshot. CPU-binding side effects live in
     /// `on_resume` and happen on every swap-in regardless of focus.
-    pub fn materialize(&mut self, machine: &mut A) {
+    pub fn materialize(&mut self, _machine: &mut A) {
         if machine::vga_present() {
             self.pc.vga.restore_to_hardware();
         }
@@ -374,7 +372,7 @@ pub struct ExecParent {
 /// base+limit. Downstream the linear is used with the flat `regs.read/write/
 /// slice` memory API.
 #[inline]
-fn linear<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> u32 {
+fn linear<A: crate::Arch>(_machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
         // A20 is permanently wrapped (force line 20 low): the HMA
@@ -820,7 +818,7 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
 
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
-fn init_process_thread_vm86_state<A: crate::Arch>(machine: &mut A, thread: &mut thread::Thread<A>, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
+fn init_process_thread_vm86_state<A: crate::Arch>(_machine: &mut A, thread: &mut thread::Thread<A>, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
     use machine::IOPL_DEFAULT;
     let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
@@ -918,7 +916,7 @@ pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
-fn snapshot_env<A: crate::Arch>(machine: &mut A, regs: &Regs, env_seg: u16) -> alloc::vec::Vec<u8> {
+fn snapshot_env<A: crate::Arch>(machine: &mut A, _regs: &Regs, env_seg: u16) -> alloc::vec::Vec<u8> {
     let base = (env_seg as usize) << 4;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;

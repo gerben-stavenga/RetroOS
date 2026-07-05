@@ -1,7 +1,5 @@
 use crate::Regs;
-use arch_abi::GuestBytes;
 use super::*;
-use crate::Vcpu;
 use super::super::mode_transitions;
 
 fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u16) {
@@ -21,7 +19,7 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
     }
 }
 
-fn dump_words<A: crate::Arch>(machine: &mut A, regs: &Regs, label: &str, addr: u32) {
+fn dump_words<A: crate::Arch>(machine: &mut A, _regs: &Regs, label: &str, addr: u32) {
     let rd = |off: u32| machine.read::<u16>((addr.wrapping_add(off)) as usize);
     let (w0, w1, w2, w3) = (rd(0), rd(2), rd(4), rd(6));
     let (w4, w5, w6, w7) = (rd(8), rd(10), rd(12), rd(14));

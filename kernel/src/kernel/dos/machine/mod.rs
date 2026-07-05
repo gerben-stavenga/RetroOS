@@ -16,8 +16,6 @@
 extern crate alloc;
 
 use crate::Regs;
-use arch_abi::GuestBytes;
-use crate::Vcpu;
 
 pub const IF_FLAG: u32 = 1 << 9;
 /// VIF — the guest's virtual interrupt flag (EFLAGS bit 19). The DOS layer's
@@ -333,7 +331,7 @@ impl MouseState {
     }
 
     /// Restore the original attribute under the current cursor cell.
-    pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
         if let Some(old) = self.drawn_at.take() {
             machine.write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
         }
@@ -895,12 +893,12 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
 
 /// Read a u16 from a real-mode seg:off address, through the active address
 /// space's memory interface (`arch::mem()`) — works under any arch backend.
-pub fn read_u16<A: crate::Arch>(machine: &mut A, regs: &Regs, seg: u32, off: u32) -> u16 {
+pub fn read_u16<A: crate::Arch>(machine: &mut A, _regs: &Regs, seg: u32, off: u32) -> u16 {
     machine.read::<u16>(((seg << 4) + off) as usize)
 }
 
 /// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
-pub fn write_u16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, seg: u32, off: u32, val: u16) {
+pub fn write_u16<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, seg: u32, off: u32, val: u16) {
     machine.write::<u16>(((seg << 4) + off) as usize, val);
 }
 

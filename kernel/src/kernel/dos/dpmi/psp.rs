@@ -9,7 +9,7 @@ use super::state::PspCacheEntry;
 ///
 /// Does NOT touch `dos.current_psp` — that's pure DOS state and stays as
 /// the segment value the entering program had.
-pub(in crate::kernel::dos) fn install_dpmi_psp_view<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn install_dpmi_psp_view<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, _regs: &mut Regs) {
     let rm_psp = dos.current_psp;
     let psp_base = (rm_psp as u32) * 16;
     let env_seg = machine.read::<u16>((psp_base + 0x2C) as usize);

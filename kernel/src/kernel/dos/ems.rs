@@ -4,9 +4,7 @@
 //! of 16KB each (4MB total) backed by the kernel's demand paging.
 
 use crate::Regs;
-use arch_abi::GuestBytes;
 use crate::dbg_println;
-use crate::Vcpu;
 use super::xms::EMS_BASE_PAGE;
 use crate::kernel::thread;
 

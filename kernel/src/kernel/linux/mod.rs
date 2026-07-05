@@ -20,7 +20,6 @@ macro_rules! linux_trace {
     };
 }
 
-use arch_abi::GuestBytes;
 use crate::kernel::elf;
 use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::thread;
@@ -28,7 +27,6 @@ use crate::kernel::thread::{FdKind, PendingRead, PendingPoll, MAX_FDS};
 use crate::kernel::vfs;
 use crate::vga;
 use crate::Regs;
-use crate::Vcpu;
 use crate::println;
 
 // =============================================================================
@@ -190,7 +188,7 @@ impl LinuxState {
     /// Echo is the userspace shell's responsibility (busybox-ash handles it
     /// itself based on its termios state); echoing in the kernel as well
     /// would produce doubled characters on screen.
-    pub fn process_key<A: crate::Arch>(&self, machine: &mut A, fds: &[FdKind; MAX_FDS], scancode: u8) {
+    pub fn process_key<A: crate::Arch>(&self, _machine: &mut A, fds: &[FdKind; MAX_FDS], scancode: u8) {
         if !crate::kernel::keyboard::update_key_state(scancode) { return; }
         let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
         if c == 0 { return; }
@@ -539,7 +537,7 @@ pub fn do_chdir(path: &[u8], cwd: &mut [u8; 64], cwd_len: &mut usize) -> i32 {
 
 /// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
 /// Read a C `char**` (NULL-terminated) from 32-bit user memory into Vec<Vec<u8>>.
-fn read_c_argv<A: crate::Arch>(machine: &mut A, vcpu: &Regs, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+fn read_c_argv<A: crate::Arch>(machine: &mut A, _vcpu: &Regs, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
     let mut args = alloc::vec::Vec::new();
     if ptr == 0 { return args; }
     let mut offset = 0usize;
@@ -569,7 +567,7 @@ fn read_c_argv<A: crate::Arch>(machine: &mut A, vcpu: &Regs, ptr: usize, wide: b
 /// For 64-bit: same layout with 8-byte slots.
 pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)]) -> usize {
     // Write one machine word (4 or 8 bytes, per client bitness) to the stack.
-    fn write_word<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, addr: usize, val: usize, want_64: bool) {
+    fn write_word<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, addr: usize, val: usize, want_64: bool) {
         if want_64 { machine.write::<u64>(addr, val as u64); }
         else { machine.write::<u32>(addr, val as u32); }
     }
@@ -785,7 +783,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
     let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
 
     // Child resumes at the parent's fork() call site, returning 0.
-    child.kernel.vcpu.regs = (*vcpu);
+    child.kernel.vcpu.regs = *vcpu;
     child.kernel.vcpu.regs.rax = 0;
     if child_stack != 0 {
         child.kernel.vcpu.regs.frame.rsp = child_stack as u64;
@@ -1039,7 +1037,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
 
 /// chdir(12)
-fn sys_chdir<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_chdir<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let mut path_buf = [0u8; 256];
     let path_len = machine.copy_cstr(a.a0 as usize, &mut path_buf);
     let path = &path_buf[..path_len];
@@ -1047,7 +1045,7 @@ fn sys_chdir<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &mut Linux
 }
 
 /// time(13) — stub
-fn sys_time<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, a: &Args) -> SyscallResult {
+fn sys_time<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
     let ptr = a.a0 as usize;
     if ptr != 0 {
         machine.write::<u32>(ptr, 0);
@@ -1129,7 +1127,7 @@ fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
 /// readlink(85) — minimal stub: only resolves /proc/self/exe (used by
 /// static-busybox to find its own re-exec path). Everything else returns
 /// EINVAL since we have no symlinks.
-fn sys_readlink<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, a: &Args) -> SyscallResult {
+fn sys_readlink<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
     let buf = a.a1 as usize;
     let bufsz = a.a2 as usize;
     let mut self_exe_buf = [0u8; 256];
@@ -1145,7 +1143,7 @@ fn sys_readlink<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, a: &Args) -> S
 }
 
 /// access(33) — check file existence via VFS stat
-fn sys_access<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_access<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
     let mut path_buf = [0u8; 256];
     let path_len = machine.copy_cstr(a.a0 as usize, &mut path_buf);
     let path = &path_buf[..path_len];
@@ -1298,7 +1296,7 @@ pub(crate) fn handle_wait<A: crate::Arch>(
 }
 
 /// uname(122)
-fn sys_uname<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, a: &Args) -> SyscallResult {
+fn sys_uname<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
     let buf = a.a0 as usize;
     if buf == 0 { return SyscallResult::val(-EFAULT); }
 
@@ -1464,7 +1462,7 @@ fn sys_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
 }
 
 /// getcwd(183)
-fn sys_getcwd<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_getcwd<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
     let ptr = a.a0 as usize;
     let size = a.a1 as usize;
     let cwd = linux.cwd_str();
@@ -1500,7 +1498,7 @@ fn sys_pread64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
 
 /// futex(202) — minimal. Single-threaded clients only reach WAIT when a lock is
 /// already held; correct behavior is EAGAIN when the word no longer matches.
-fn sys_futex<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, a: &Args) -> SyscallResult {
+fn sys_futex<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>, a: &Args) -> SyscallResult {
     let uaddr = a.a0 as usize;
     let op = a.a1 as u32 & 0x7f; // strip FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
     let val = a.a2 as u32;
@@ -1634,7 +1632,7 @@ fn sys_fstatat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &Linux
 /// x86-64 `struct stat` (144 bytes, st_mode@24, st_size@48). Getting this wrong
 /// for a 64-bit client makes ld.so read st_mode/st_size from the wrong offsets
 /// and reject a shared library as non-regular — so libc never maps.
-fn write_stat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, buf: usize, mode: u32, size: u32, ino: u64, want_64: bool) {
+fn write_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, buf: usize, mode: u32, size: u32, ino: u64, want_64: bool) {
     if want_64 {
         machine.zero(buf, 144);
         machine.write::<u64>(buf, 1);                              // st_dev
@@ -1659,7 +1657,7 @@ fn write_stat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, buf: usize, mo
 /// Write the old (pre-LFS) Linux i386 `struct stat` (newstat layout, 64 bytes).
 /// Used by syscalls 106/107/108. uclibc's busybox falls back to these for
 /// access/exec checks; without correct mode bits we get spurious EACCES.
-fn write_stat_old<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, buf: usize, mode: u32, size: u32) {
+fn write_stat_old<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, buf: usize, mode: u32, size: u32) {
     machine.zero(buf, 64);
     machine.write::<u16>(buf + 0x08, mode as u16);          // st_mode
     machine.write::<u16>(buf + 0x0a, 1);                    // st_nlink
@@ -1762,7 +1760,7 @@ fn sys_getdents64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
 }
 
 /// set_thread_area(243) — parse user_desc struct, set GDT TLS entry, save to LinuxState
-fn sys_set_thread_area<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_set_thread_area<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let u_info = a.a0 as usize;
     if u_info == 0 { return SyscallResult::val(-EFAULT); }
 
@@ -1790,7 +1788,7 @@ fn sys_set_thread_area<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
 
 /// arch_prctl(158) — x86_64 TLS via FS/GS base.
 /// Stores the base in regs.fs/gs — arch layer writes MSR on return to user.
-fn sys_arch_prctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, _linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_arch_prctl<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>, _linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     const ARCH_SET_GS: u64 = 0x1001;
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
@@ -1814,7 +1812,7 @@ fn sys_arch_prctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
 }
 
 /// clock_gettime(265) — monotonic from tick counter
-fn sys_clock_gettime<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, a: &Args) -> SyscallResult {
+fn sys_clock_gettime<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
     let _clock_id = a.a0 as u32;
     let tp = a.a1 as usize;
     if tp != 0 {
@@ -1840,7 +1838,7 @@ fn sys_openat<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
 }
 
 /// getrandom(355) — stub: fill with PRNG output
-fn sys_getrandom<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, a: &Args) -> SyscallResult {
+fn sys_getrandom<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
     let buf = a.a0 as usize;
     let buflen = a.a1 as usize;
     let mut tmp = alloc::vec![0u8; buflen];

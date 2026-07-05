@@ -9,7 +9,6 @@
 //! test of whether the factorization around it is right.
 
 use crate::Regs;
-use crate::Vcpu;
 use crate::kernel::thread;
 
 /// The scheduler's answer for this iteration.
