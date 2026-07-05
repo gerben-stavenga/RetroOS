@@ -94,6 +94,13 @@ pub use devices::{
     attach_audio, attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon,
     register_debugcon_file, PortIo,
 };
+// Native host-fs backend (hosted "punch-through"): `install_native_hostfs` sets
+// the root; the `host_*` fns are the primitive hooks the kernel's
+// `install_host_backend` points at (direct std::fs, no COM1).
+pub use hostfs::{
+    host_clunk, host_create, host_dir_exists, host_open, host_read, host_readdir,
+    host_remove, host_write, install_native_hostfs,
+};
 // Host-side VGA text-screen snapshotting (headless inspection of the guest's
 // 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the
 // flag from a watcher thread, the CPU thread renders at the next slice boundary.

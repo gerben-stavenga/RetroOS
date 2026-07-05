@@ -8,6 +8,7 @@
 //! are little-endian. The client always sends a complete command, then reads the
 //! reply, so each command is executed synchronously when its last byte arrives.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -192,6 +193,134 @@ impl HostFs {
         }
         r.0
     }
+}
+
+// ── Native backend: the same std::fs server called directly (no COM1) ─────
+//
+// The kernel runs native in this process on the hosted backend, so `/host`
+// need not be byte-serial. These methods return the same values as the COM1
+// commands above, but as primitives the kernel's `InjectedHostFs` consumes
+// directly (via installed fn-pointers) — no framing, no UART round-trip.
+impl HostFs {
+    /// open → (status, handle, size); status < 0 = miss.
+    pub fn n_open(&mut self, path: &[u8]) -> (i32, u64, u32) {
+        let p = self.resolve(path);
+        match fs::metadata(&p) {
+            Ok(m) if m.is_file() => {
+                let h = self.assign(p);
+                (0, h as u64, m.len().min(u32::MAX as u64) as u32)
+            }
+            _ => (-1, 0, 0),
+        }
+    }
+
+    /// read → bytes read, or negative errno. `size` (the kernel's cached vnode
+    /// size) is unused — the read is bounded by `buf`.
+    pub fn n_read(&mut self, handle: u64, offset: u32, buf: &mut [u8]) -> i32 {
+        let n = self.handles.get(&(handle as u32)).and_then(|p| {
+            let mut f = fs::File::open(p).ok()?;
+            f.seek(SeekFrom::Start(offset as u64)).ok()?;
+            f.read(buf).ok()
+        });
+        match n {
+            Some(n) => n as i32,
+            None => -5,
+        }
+    }
+
+    /// readdir → (status, name, name_len, size, is_dir); status < 0 = end.
+    pub fn n_readdir(&self, dir: &[u8], index: usize) -> (i32, [u8; 100], usize, u32, bool) {
+        let p = self.resolve(dir);
+        match nth_entry(&p, index) {
+            Some((name, size, is_dir)) => {
+                let n = name.len().min(100);
+                let mut nb = [0u8; 100];
+                nb[..n].copy_from_slice(&name[..n]);
+                (0, nb, n, size, is_dir)
+            }
+            None => (-1, [0; 100], 0, 0, false),
+        }
+    }
+
+    pub fn n_dir_exists(&self, path: &[u8]) -> bool {
+        fs::metadata(self.resolve(path)).map(|m| m.is_dir()).unwrap_or(false)
+    }
+
+    /// create → (status, handle); status < 0 = fail.
+    pub fn n_create(&mut self, path: &[u8]) -> (i32, u64) {
+        let p = self.resolve(path);
+        match fs::File::create(&p) {
+            Ok(_) => (0, self.assign(p) as u64),
+            Err(_) => (-1, 0),
+        }
+    }
+
+    /// write → bytes written, or negative errno.
+    pub fn n_write(&mut self, handle: u64, offset: u32, data: &[u8]) -> i32 {
+        let ok = self.handles.get(&(handle as u32)).and_then(|p| {
+            let mut f = fs::OpenOptions::new().write(true).open(p).ok()?;
+            f.seek(SeekFrom::Start(offset as u64)).ok()?;
+            f.write_all(data).ok()
+        });
+        match ok {
+            Some(()) => data.len() as i32,
+            None => -5,
+        }
+    }
+
+    /// clunk: free the server-side fid (a cheap HashMap removal here).
+    pub fn n_clunk(&mut self, handle: u64) {
+        self.handles.remove(&(handle as u32));
+    }
+
+    /// remove → 0, or negative errno.
+    pub fn n_remove(&self, path: &[u8]) -> i32 {
+        match fs::remove_file(self.resolve(path)) {
+            Ok(_) => 0,
+            Err(_) => -1,
+        }
+    }
+}
+
+thread_local! {
+    /// The native host-fs server for the injected backend. Set by
+    /// `install_native_hostfs` on the CPU/kernel thread (interpreter state is
+    /// thread-local), before `startup`; the kernel's `/host` calls land here.
+    static NATIVE_HOSTFS: RefCell<Option<HostFs>> = const { RefCell::new(None) };
+}
+
+/// Install the native host-fs server rooted at `dir` (the hosted alternative to
+/// `attach_hostfs`'s COM1 UART). Call on the CPU/kernel thread before startup.
+pub fn install_native_hostfs(dir: &str) {
+    NATIVE_HOSTFS.with(|n| *n.borrow_mut() = Some(HostFs::new(dir)));
+}
+
+// The primitive free functions the kernel's `HostBackendHooks` point at. Each
+// dispatches to the thread-local server; a miss (server not installed) mirrors
+// the COM1 "no peer" errno so behaviour degrades the same way.
+pub fn host_open(path: &[u8]) -> (i32, u64, u32) {
+    NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or((-5, 0, 0), |fs| fs.n_open(path)))
+}
+pub fn host_read(handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
+    NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or(-5, |fs| fs.n_read(handle, offset, buf)))
+}
+pub fn host_readdir(dir: &[u8], index: usize) -> (i32, [u8; 100], usize, u32, bool) {
+    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or((-1, [0; 100], 0, 0, false), |fs| fs.n_readdir(dir, index)))
+}
+pub fn host_dir_exists(path: &[u8]) -> bool {
+    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(false, |fs| fs.n_dir_exists(path)))
+}
+pub fn host_create(path: &[u8]) -> (i32, u64) {
+    NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or((-5, 0), |fs| fs.n_create(path)))
+}
+pub fn host_write(handle: u64, offset: u32, data: &[u8]) -> i32 {
+    NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or(-5, |fs| fs.n_write(handle, offset, data)))
+}
+pub fn host_clunk(handle: u64) {
+    NATIVE_HOSTFS.with(|n| { if let Some(fs) = n.borrow_mut().as_mut() { fs.n_clunk(handle) } });
+}
+pub fn host_remove(path: &[u8]) -> i32 {
+    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(-1, |fs| fs.n_remove(path)))
 }
 
 /// Return the `index`-th directory entry as `(name_bytes, size, is_dir)`.

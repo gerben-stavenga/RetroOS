@@ -113,7 +113,20 @@ fn main() {
         lib::vga_render::set_present_sink(arch::publish_frame);
     }
     if let Some(dir) = &host_dir {
-        arch::attach_hostfs(dir); // COM1 → /host (or the root, per Media)
+        // Native host-fs backend (the hosted "punch-through"): /host (or the
+        // root, per Media) is served by direct std::fs calls, not byte-serial
+        // COM1. Same injection shape as install_hosted_backend above.
+        arch::install_native_hostfs(dir);
+        kernel::install_host_backend(kernel::HostBackendHooks {
+            open: arch::host_open,
+            read: arch::host_read,
+            readdir: arch::host_readdir,
+            dir_exists: arch::host_dir_exists,
+            create: arch::host_create,
+            write: arch::host_write,
+            clunk: arch::host_clunk,
+            remove: arch::host_remove,
+        });
     }
     if let Some(path) = wav {
         arch::attach_audio(&path); // canonical audio device → WAV file

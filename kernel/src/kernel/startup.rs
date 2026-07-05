@@ -59,6 +59,17 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
 /// root, or AS the root under `Media::HostRoot`.
 static HOSTFS: crate::kernel::hostfs::HostFs = crate::kernel::hostfs::HostFs::new();
 
+/// The host fs to mount: the injected native `std::fs` backend when the entry
+/// installed one (hosted "punch-through" — direct calls, no COM1), else the
+/// COM1 `HOSTFS` client (metal / the Python bridge).
+fn host_fs() -> &'static dyn vfs::Filesystem {
+    if crate::kernel::hostfs::host_backend_installed() {
+        &crate::kernel::hostfs::INJECTED_HOSTFS
+    } else {
+        &HOSTFS
+    }
+}
+
 /// Derive the mount set from the platform's Media verdict (the probe already
 /// scanned the MBR and the hostfs transport); then the symbol index.
 /// /boot is an INVARIANT: the embedded bootfs (DN + COMMAND.COM), mounted on
@@ -97,14 +108,14 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
                 }
             }
             if hostfs {
-                vfs::mount(b"host/", &HOSTFS);
+                vfs::mount(b"host/", host_fs());
                 println!("hostfs mounted at /host");
             }
         }
         Media::HostRoot => {
             // The host filesystem IS the VFS root: Linux binaries see /usr,
             // /lib, /etc natively; DOS C: is the /home/retroos subtree.
-            vfs::mount(b"", &HOSTFS);
+            vfs::mount(b"", host_fs());
             println!("hostfs mounted as root");
         }
         Media::Diskless => {}
