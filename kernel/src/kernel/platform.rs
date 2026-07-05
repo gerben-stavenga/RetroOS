@@ -369,7 +369,11 @@ fn is_linux_root(lba: u32) -> bool {
 
 fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
     let _ = machine;
-    let hostfs = crate::kernel::hostfs::init();
+    // A native host backend (hosted "punch-through") means /host is available
+    // without COM1 — take it as hostfs-present and skip the serial probe.
+    // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
+    let hostfs = crate::kernel::hostfs::host_backend_installed()
+        || crate::kernel::hostfs::init();
 
     let mut mbr = [0u8; 512];
     crate::kernel::block::read_sectors(0, &mut mbr);

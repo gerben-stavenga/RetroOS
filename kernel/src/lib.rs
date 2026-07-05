@@ -61,6 +61,7 @@ pub use arch_abi::{
 pub use kernel::startup::startup;
 pub use kernel::platform::{set_host_env, DebugSink, HostEnv};
 pub use kernel::portio::{install_portio, PortIo};
+pub use kernel::hostfs::{install_host_backend, host_backend_installed, HostBackendHooks};
 
 /// Hosted: point the VGA console framebuffer at a scratch buffer so its writes
 /// (clear/scroll/putchar) don't dereference the unmapped `0xB8000` host

@@ -1,8 +1,15 @@
-//! Host filesystem — talks to hostfs.py via COM1 serial port.
+//! Host filesystem — two backends behind the one VFS `Filesystem` trait:
 //!
-//! Implements the VFS Filesystem trait by sending commands over the serial
-//! port, which QEMU bridges to a Unix socket where the host-side Python
-//! script serves real file operations.
+//! - `HostFs` (this file's original): the byte-serial COM1 client. On metal,
+//!   QEMU bridges COM1 to a host-side server; a real transport, kept for metal.
+//! - `InjectedHostFs`: the hosted "punch-through". The kernel runs native in
+//!   the host process there, so `/host` need not go over COM1 at all — the
+//!   entry crate installs `std::fs`-backed hooks (`install_host_backend`, the
+//!   same injection shape as `install_portio`) and this dispatches straight to
+//!   them: direct calls, no framing, no VM exit.
+//!
+//! Hook signatures are primitive-only so no non-primitive type crosses the
+//! arch-interp↔kernel boundary (arch-interp has no `kernel` dependency).
 
 use crate::kernel::portio::{inb, outb};
 use crate::kernel::vfs::{Filesystem, Vnode, DirEntry};
@@ -240,5 +247,94 @@ impl Filesystem for HostFs {
         if !is_ready() { return; }
         send_byte(CMD_CLOSE);
         send_u32(handle as u32);
+    }
+}
+
+// ── Injected native host backend (hosted "punch-through") ─────────────────
+
+/// The installed native host-fs hook table. Primitive signatures only: the
+/// entry crate wires these to `arch-interp`'s `std::fs` server (which has no
+/// `kernel` dependency, so no `Vnode`/`DirEntry` may appear here).
+///   `open`  → (status, handle, size); status < 0 = miss.
+///   `read`  → bytes read, or negative errno.
+///   `readdir` → (status, name, name_len, size, is_dir); status < 0 = end.
+///   `create`→ (status, handle); status < 0 = fail.
+///   `write` → bytes written, or negative errno.
+#[derive(Clone, Copy)]
+pub struct HostBackendHooks {
+    pub open: fn(&[u8]) -> (i32, u64, u32),
+    pub read: fn(u64, u32, &mut [u8], u32) -> i32,
+    pub readdir: fn(&[u8], usize) -> (i32, [u8; 100], usize, u32, bool),
+    pub dir_exists: fn(&[u8]) -> bool,
+    pub create: fn(&[u8]) -> (i32, u64),
+    pub write: fn(u64, u32, &[u8]) -> i32,
+    pub clunk: fn(u64),
+    pub remove: fn(&[u8]) -> i32,
+}
+
+static mut HOST_BACKEND: Option<HostBackendHooks> = None;
+
+/// Install the native host-fs hooks. Single-threaded boot context (the entry
+/// calls this before `startup`), safe by the same argument as `install_portio`.
+pub fn install_host_backend(hooks: HostBackendHooks) {
+    unsafe { HOST_BACKEND = Some(hooks); }
+}
+
+/// Whether a native host backend is installed — the hosted signal that `/host`
+/// is available without probing COM1 (see `platform::probe_media`).
+pub fn host_backend_installed() -> bool {
+    // Copy the Option out (both it and the hooks are `Copy`) so we never take a
+    // reference to the mutable static — an error under edition 2024.
+    unsafe { HOST_BACKEND }.is_some()
+}
+
+#[inline]
+fn backend() -> HostBackendHooks {
+    unsafe { HOST_BACKEND }.expect("host backend not installed")
+}
+
+/// The `Filesystem` mounted at `/host` (or root, under `Media::HostRoot`) on
+/// hosted: every call dispatches to the injected native `std::fs` hooks.
+pub struct InjectedHostFs;
+pub static INJECTED_HOSTFS: InjectedHostFs = InjectedHostFs;
+
+impl Filesystem for InjectedHostFs {
+    fn open(&self, path: &[u8]) -> Option<Vnode> {
+        let (status, handle, size) = (backend().open)(path);
+        if status < 0 { return None; }
+        Some(Vnode { handle, size, mode: 0o644 })
+    }
+
+    fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32 {
+        (backend().read)(handle, offset, buf, size)
+    }
+
+    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
+        let (status, name, name_len, size, is_dir) = (backend().readdir)(dir, index);
+        if status < 0 { return None; }
+        Some(DirEntry { name, name_len, size, is_dir,
+            mode: if is_dir { 0o755 } else { 0o644 } })
+    }
+
+    fn dir_exists(&self, path: &[u8]) -> bool {
+        (backend().dir_exists)(path)
+    }
+
+    fn create(&self, path: &[u8]) -> Option<Vnode> {
+        let (status, handle) = (backend().create)(path);
+        if status < 0 { return None; }
+        Some(Vnode { handle, size: 0, mode: 0o644 })
+    }
+
+    fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
+        (backend().write)(handle, offset, data)
+    }
+
+    fn clunk(&self, handle: u64) {
+        (backend().clunk)(handle)
+    }
+
+    fn remove(&self, path: &[u8]) -> i32 {
+        (backend().remove)(path)
     }
 }

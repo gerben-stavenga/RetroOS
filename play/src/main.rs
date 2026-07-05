@@ -92,7 +92,22 @@ fn main() {
         // mailbox the window thread blits from.
         lib::vga_render::set_present_sink(arch::publish_frame);
         if let Some(dir) = &host_dir {
-            arch::attach_hostfs(dir); // COM1 → /host
+            // Native host-fs backend (the hosted "punch-through"): /host is
+            // served by direct std::fs calls, not byte-serial COM1. Install the
+            // std::fs server root on this (CPU) thread and wire its primitive
+            // hooks into the one kernel library — same injection shape as
+            // install_portio above.
+            arch::install_native_hostfs(dir);
+            kernel::install_host_backend(kernel::HostBackendHooks {
+                open: arch::host_open,
+                read: arch::host_read,
+                readdir: arch::host_readdir,
+                dir_exists: arch::host_dir_exists,
+                create: arch::host_create,
+                write: arch::host_write,
+                clunk: arch::host_clunk,
+                remove: arch::host_remove,
+            });
         }
         if let Some(path) = &wav {
             arch::attach_audio(path); // canonical audio → WAV (offline check)
