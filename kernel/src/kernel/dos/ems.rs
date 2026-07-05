@@ -3,6 +3,7 @@
 //! 64KB page-frame in upper memory (set up by `scan_uma`), 256 logical pages
 //! of 16KB each (4MB total) backed by the kernel's demand paging.
 
+use crate::Regs;
 use arch_abi::GuestBytes;
 use crate::dbg_println;
 use crate::Vcpu;
@@ -83,7 +84,7 @@ fn ems_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut EmsState {
     dos.ems.as_deref_mut().unwrap()
 }
 
-pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
+pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     dbg_println!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
@@ -103,7 +104,7 @@ pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
     result
 }
 
-fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, ah: u8) -> thread::KernelAction {
+fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, ah: u8) -> thread::KernelAction {
     match ah {
         // AH=40h — Get status
         0x40 => {
@@ -265,8 +266,8 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
             let mut count = 0u16;
             for i in 0..MAX_EMS_HANDLES {
                 if let Some(ref h) = ems.handles[i] {
-                    regs.write::<u16>(addr as usize, i as u16);
-                    regs.write::<u16>(addr as usize + 2, h.pages.len() as u16);
+                    machine.write::<u16>(addr as usize, i as u16);
+                    machine.write::<u16>(addr as usize + 2, h.pages.len() as u16);
                     addr += 4;
                     count += 1;
                 }
@@ -291,8 +292,8 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
             }
 
             for i in 0..count as u32 {
-                let log_page = regs.read::<u16>((base_addr + i * 4) as usize);
-                let phys_raw = regs.read::<u16>((base_addr + i * 4 + 2) as usize);
+                let log_page = machine.read::<u16>((base_addr + i * 4) as usize);
+                let phys_raw = machine.read::<u16>((base_addr + i * 4 + 2) as usize);
 
                 let phys_page = if al == 0 {
                     phys_raw as u8
@@ -374,8 +375,8 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
                 let base = (es << 4) + di;
                 for i in 0..4u32 {
                     let seg = ems_frame_seg() + (i as u16) * 0x0400;
-                    regs.write::<u16>((base + i * 4) as usize, seg);
-                    regs.write::<u16>((base + i * 4 + 2) as usize, i as u16);
+                    machine.write::<u16>((base + i * 4) as usize, seg);
+                    machine.write::<u16>((base + i * 4 + 2) as usize, i as u16);
                 }
                 regs.rcx = (regs.rcx & !0xFFFF) | 4; // 4 mappable pages
                 regs.rax &= !0xFF00;

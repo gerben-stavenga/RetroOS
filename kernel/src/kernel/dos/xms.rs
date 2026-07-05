@@ -3,6 +3,7 @@
 //! Pure bookkeeping over the VM86 linear address space above the HMA.
 //! Physical backing comes from the kernel's demand paging.
 
+use crate::Regs;
 use arch_abi::GuestBytes;
 use crate::kernel::dos::linear;
 use crate::Vcpu;
@@ -107,7 +108,7 @@ fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
     dos.xms.as_deref_mut().unwrap()
 }
 
-pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
+pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — Get XMS version
@@ -192,7 +193,7 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
         }
         // AH=0Bh — Move extended memory block (DS:SI = move struct)
         0x0B => {
-            xms_move(dos, regs);
+            xms_move(machine, dos, regs);
         }
         // AH=0Ch — Lock extended memory block (DX=handle)
         0x0C => {
@@ -339,14 +340,14 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
 ///   +06: u32 source offset (or seg:off if handle=0)
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
-fn xms_move<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
-    let addr = linear(dos, regs, regs.ds as u16, regs.rsi as u32);
+fn xms_move<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    let addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32);
 
-    let length = regs.read::<u32>((addr) as usize) as usize;
-    let src_handle = regs.read::<u16>((addr + 4) as usize);
-    let src_offset = regs.read::<u32>((addr + 6) as usize);
-    let dst_handle = regs.read::<u16>((addr + 10) as usize);
-    let dst_offset = regs.read::<u32>((addr + 12) as usize);
+    let length = machine.read::<u32>((addr) as usize) as usize;
+    let src_handle = machine.read::<u16>((addr + 4) as usize);
+    let src_offset = machine.read::<u32>((addr + 6) as usize);
+    let dst_handle = machine.read::<u16>((addr + 10) as usize);
+    let dst_offset = machine.read::<u32>((addr + 12) as usize);
 
     if length == 0 {
         regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -394,7 +395,7 @@ fn xms_move<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
         }
     };
 
-    regs.copy_within(src as usize, dst as usize, length);
+    machine.copy_within(src as usize, dst as usize, length);
     regs.rax = (regs.rax & !0xFFFF) | 1;
     regs.rbx &= !0xFFFF;
 }
@@ -437,14 +438,14 @@ fn or64(lo: &AtomicU32, hi: &AtomicU32, m: u64) {
 pub(super) static EMS_BASE_PAGE: AtomicUsize = AtomicUsize::new(0xD0);
 
 /// Scan UMA to find free pages. A page is "free" if all bytes are 0x00 or 0xFF.
-pub(super) fn scan_uma<A: crate::Arch>(regs: &Vcpu<A>) {
+pub(super) fn scan_uma<A: crate::Arch>(machine: &mut A, regs: &Regs) {
     let mut free: u64 = 0;
     for i in 0..UMA_PAGES {
         let base = (UMA_BASE + i) * 0x1000;
-        let first = regs.read::<u8>(base);
+        let first = machine.read::<u8>(base);
         let mut uniform = true;
         for j in 1..0x1000 {
-            if regs.read::<u8>(base + j) != first { uniform = false; break; }
+            if machine.read::<u8>(base + j) != first { uniform = false; break; }
         }
         if uniform && (first == 0x00 || first == 0xFF) {
             free |= 1 << i;

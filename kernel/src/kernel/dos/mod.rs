@@ -192,7 +192,7 @@ type ResumeFn<A: crate::Arch> = dyn FnOnce(
     &mut A,
     &mut thread::KernelThread<A>,
     &mut DosState<A>,
-    &mut Vcpu<A>,
+    &mut Regs,
 ) -> Option<ResumeCallback<A>>;
 
 /// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
@@ -254,15 +254,15 @@ impl<A: crate::Arch> DosState<A> {
     }
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
-    pub fn process_key(&mut self, regs: &mut Vcpu<A>, scancode: u8) {
-        machine::queue_irq(&mut self.pc, regs, crate::Irq::Key(scancode));
+    pub fn process_key(&mut self, machine: &mut A, regs: &mut Regs, scancode: u8) {
+        machine::queue_irq(machine, &mut self.pc, regs, crate::Irq::Key(scancode));
     }
 
     /// Per-thread cleanup at exit: free EMS-backed pages, drop XMS/EMS
     /// state. The screen snapshot is handled by `suspend`, which `exit_thread`
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
-    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
+    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {
         if let Some(ref mut ems) = self.ems {
             ems.free_all_pages();
         }
@@ -285,7 +285,7 @@ impl<A: crate::Arch> DosState<A> {
     /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
-    pub fn suspend(&mut self) {
+    pub fn suspend(&mut self, machine: &mut A) {
         if machine::vga_present() {
             self.pc.vga.save_from_hardware();
         }
@@ -294,7 +294,7 @@ impl<A: crate::Arch> DosState<A> {
     /// Called when the thread regains focus. Repaints the VGA framebuffer
     /// from the suspend snapshot. CPU-binding side effects live in
     /// `on_resume` and happen on every swap-in regardless of focus.
-    pub fn materialize(&mut self) {
+    pub fn materialize(&mut self, machine: &mut A) {
         if machine::vga_present() {
             self.pc.vga.restore_to_hardware();
         }
@@ -374,7 +374,7 @@ pub struct ExecParent {
 /// base+limit. Downstream the linear is used with the flat `regs.read/write/
 /// slice` memory API.
 #[inline]
-fn linear<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>, seg: u16, off: u32) -> u32 {
+fn linear<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
         // A20 is permanently wrapped (force line 20 low): the HMA
@@ -420,7 +420,7 @@ pub fn syscall<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
 ) -> thread::KernelAction {
     use crate::UserMode;
     let mode = regs.mode();
@@ -440,7 +440,7 @@ pub fn syscall<A: crate::Arch>(
 /// write/read logic runs), decode the faulting store/load and emulate it. Pure
 /// kernel + lib, no arch — both backends deliver the same PageFault. Returns
 /// true if handled (resume), false → real SEGV.
-pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, addr: u32) -> bool {
+pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, addr: u32) -> bool {
     if !(0xA0000..0xB0000).contains(&addr) {
         return false;
     }
@@ -471,7 +471,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
             mode_transitions::seg_base(ldt, regs.es as u16),
         )
     };
-    machine::vga::handle_planar_fault(regs, &mut dos.pc.vga, cs_base, def32, ds_base, es_base, off)
+    machine::vga::handle_planar_fault(machine, regs, &mut dos.pc.vga, cs_base, def32, ds_base, es_base, off)
 }
 
 /// Single entry point the event loop calls for the DOS personality.
@@ -485,7 +485,7 @@ pub fn handle_event<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
     use crate::KernelEvent as KE;
@@ -527,7 +527,7 @@ pub fn handle_event<A: crate::Arch>(
                 } else {
                     debug_assert!(dos.dpmi.is_some(),
                         "PM SoftInt({:#x}) without an active DPMI session", n);
-                    mode_transitions::deliver_pm_int(dos, regs, n)
+                    mode_transitions::deliver_pm_int(machine, dos, regs, n)
                 }
             }
         }
@@ -558,7 +558,7 @@ pub fn handle_event<A: crate::Arch>(
             // VM86→PM toggle if needed; save.restore puts us back in
             // VM86 on the unwind.
             if dos.dpmi.is_some() {
-                dpmi::dispatch_dpmi_exception(dos, regs, n as u32)
+                dpmi::dispatch_dpmi_exception(machine, dos, regs, n as u32)
             } else if is_vm86 && matches!(n, 0 | 3 | 4) {
                 // Bare VM86 (no DPMI), #DE / #BP / #OF: same vectors as
                 // software INTs 0/3/4. Real-mode CPU delivers to IVT[n];
@@ -566,7 +566,7 @@ pub fn handle_event<A: crate::Arch>(
                 // handler that fixes up DX:AX and advances EIP past the
                 // DIV. Reflect instead of killing — this matches what
                 // FreeDOS does.
-                arch_abi::monitor::sw_reflect_vm86_int(&mut regs.regs, &mut regs.space, n);
+                arch_abi::monitor::sw_reflect_vm86_int(regs, machine, n);
                 thread::KernelAction::Done
             } else {
                 let lin = if is_vm86 {
@@ -575,18 +575,18 @@ pub fn handle_event<A: crate::Arch>(
                     A::seg_base(regs.code_seg()).wrapping_add(regs.ip32())
                 };
                 let mut bytes = [0u8; 8];
-                regs.copy_from(lin as usize, &mut bytes);
+                machine.copy_from(lin as usize, &mut bytes);
                 let ss_lin = if is_vm86 {
                     ((regs.stack_seg() as u32) << 4).wrapping_add(regs.sp32() & 0xFFFF)
                 } else {
                     A::seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
                 };
-                let s0 = regs.read::<u16>((ss_lin) as usize);
-                let s1 = regs.read::<u16>((ss_lin.wrapping_add(2)) as usize);
-                let s2 = regs.read::<u16>((ss_lin.wrapping_add(4)) as usize);
-                let s3 = regs.read::<u16>((ss_lin.wrapping_add(6)) as usize);
-                let s4 = regs.read::<u16>((ss_lin.wrapping_add(8)) as usize);
-                let s5 = regs.read::<u16>((ss_lin.wrapping_add(10)) as usize);
+                let s0 = machine.read::<u16>((ss_lin) as usize);
+                let s1 = machine.read::<u16>((ss_lin.wrapping_add(2)) as usize);
+                let s2 = machine.read::<u16>((ss_lin.wrapping_add(4)) as usize);
+                let s3 = machine.read::<u16>((ss_lin.wrapping_add(6)) as usize);
+                let s4 = machine.read::<u16>((ss_lin.wrapping_add(8)) as usize);
+                let s5 = machine.read::<u16>((ss_lin.wrapping_add(10)) as usize);
                 let liq = unsafe { mode_transitions::LAST_IRQ };
                 crate::println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} psp={:04x} (vm86={}) bytes={:02x?} stack={:04x} {:04x} {:04x} {:04x} {:04x} {:04x} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     n, regs.code_seg(), regs.ip32(),
@@ -605,7 +605,7 @@ pub fn handle_event<A: crate::Arch>(
             if is_vm86 {
                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                 let mut bytes = [0u8; 8];
-                regs.copy_from(lin as usize, &mut bytes);
+                machine.copy_from(lin as usize, &mut bytes);
                 // Dump the surrounding state before panicking: a plain
                 // `push ds` etc. can't #GP in genuine VM86, so SS:SP/flags
                 // and the last IRQ we reflected (vector + the CS:IP/SS:SP it
@@ -620,7 +620,7 @@ pub fn handle_event<A: crate::Arch>(
                     bytes[0], bytes[1], bytes[2], bytes[3],
                     bytes[4], bytes[5], bytes[6], bytes[7]);
             } else if dos.dpmi.is_some() {
-                dpmi::dispatch_dpmi_exception(dos, regs, 13)
+                dpmi::dispatch_dpmi_exception(machine, dos, regs, 13)
             } else {
                 thread::KernelAction::Exit(0x0200 | 13) // #GP
             }
@@ -669,7 +669,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     machine.free_user_pages();
     machine.map_low_mem();
     back_vga_window_if_emulated(machine);
-    dos::setup_ivt(&mut current.kernel.vcpu);
+    dos::setup_ivt(machine, &mut current.kernel.vcpu);
 
     // The PSP environment program-name suffix — drive-qualified DOS form
     // ("C:\BIN\PROG.EXE"), which DOS extenders parse back to reopen their own EXE.
@@ -707,25 +707,25 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         thread::Personality::Dos(d) => d,
         _ => unreachable!("just set Dos personality"),
     };
-    dos_reset_blocks(dos_state, regs, dos::heap_start());
+    dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
 
     // Parent: env snapshot with sys's PSP as the segment, since the actual
     // parent is not in this address space (or doesn't exist, e.g. boot).
     let parent = dos::boot_parent_with_env(&parent_env_data);
     let loaded = if is_exe && dos::is_mz_exe(&data) {
-        dos::load_exe(regs, dos_state, &parent, &data, dos_name).expect("Invalid MZ EXE")
+        dos::load_exe(machine, regs, dos_state, &parent, &data, dos_name).expect("Invalid MZ EXE")
     } else {
-        dos::load_com(regs, dos_state, &parent, &data, dos_name)
+        dos::load_com(machine, regs, dos_state, &parent, &data, dos_name)
     };
     crate::dbg_println!("exec_dos_into tid={} psp_seg={:04X} cmdtail.len={} cmdtail={:?}",
         tid, loaded.psp_seg, cmdtail.len(),
         core::str::from_utf8(&cmdtail).unwrap_or("<non-utf8>"));
-    dos::Psp::set_cmdline(regs, loaded.psp_seg, &cmdtail);
+    dos::Psp::set_cmdline(machine, regs, loaded.psp_seg, &cmdtail);
 
     let psp_seg = loaded.psp_seg;
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
 
-    init_process_thread_vm86_state(current, psp_seg, cs, ip, ss, sp);
+    init_process_thread_vm86_state(machine, current, psp_seg, cs, ip, ss, sp);
     // Virtual IOPL passed in by the exec caller: COMMAND.COM reads the `iopl3`
     // flag from LOADFIX.CFG and passes 3 via SYNTH_FORK_EXEC; every other caller
     // passes 1 (spec-conforming). The kernel never reads LOADFIX.CFG itself.
@@ -753,7 +753,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 pub(crate) fn handle_synth_child<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     tid: usize,
     pid: i32,
     op: thread::DosChildOp,
@@ -820,7 +820,7 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
 
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
-fn init_process_thread_vm86_state<A: crate::Arch>(thread: &mut thread::Thread<A>, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
+fn init_process_thread_vm86_state<A: crate::Arch>(machine: &mut A, thread: &mut thread::Thread<A>, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
     use machine::IOPL_DEFAULT;
     let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
@@ -851,7 +851,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
 
     machine.map_low_mem();
     back_vga_window_if_emulated(machine);
-    dos::setup_ivt(&mut t.kernel.vcpu);
+    dos::setup_ivt(machine, &mut t.kernel.vcpu);
 
     let mut dos_name = [0u8; dfs::DFS_PATH_MAX];
     let path = args.first().expect("run_init_program: args[0] must be the program path");
@@ -871,28 +871,28 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
             thread::Personality::Dos(d) => d,
             _ => unreachable!("just set Dos personality"),
         };
-        dos_reset_blocks(dos_state, regs, dos::heap_start());
+        dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
 
         let parent = dos::boot_parent_with_env(&env);
         if dos::is_mz_exe(&buf) {
-            dos::load_exe(regs, dos_state, &parent, &buf, dos_name).expect("load_exe failed")
+            dos::load_exe(machine, regs, dos_state, &parent, &buf, dos_name).expect("load_exe failed")
         } else {
-            dos::load_com(regs, dos_state, &parent, &buf, dos_name)
+            dos::load_com(machine, regs, dos_state, &parent, &buf, dos_name)
         }
     };
 
     let psp_seg = loaded.psp_seg;
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
 
-    init_process_thread_vm86_state(t, psp_seg, cs, ip, ss, sp);
+    init_process_thread_vm86_state(machine, t, psp_seg, cs, ip, ss, sp);
     t.dos_mut().dta = (psp_seg as u32) * 16 + 0x80;
 
     let (col, row) = vga::vga().cursor_pos();
     {
         let regs = &mut t.kernel.vcpu;
-        dos::Psp::set_cmdline(regs, loaded.psp_seg, &cmdline_tail);
-        regs.write::<u8>(0x450, col as u8);
-        regs.write::<u8>(0x451, row as u8);
+        dos::Psp::set_cmdline(machine, regs, loaded.psp_seg, &cmdline_tail);
+        machine.write::<u8>(0x450, col as u8);
+        machine.write::<u8>(0x451, row as u8);
     }
     // (The event loop seeds its live vcpu from this thread's saved state, so no
     // separate "set current vcpu" is needed here.)
@@ -918,13 +918,13 @@ pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
-fn snapshot_env<A: crate::Arch>(regs: &Vcpu<A>, env_seg: u16) -> alloc::vec::Vec<u8> {
+fn snapshot_env<A: crate::Arch>(machine: &mut A, regs: &Regs, env_seg: u16) -> alloc::vec::Vec<u8> {
     let base = (env_seg as usize) << 4;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;
     let mut i = 0usize;
     while i < 32768 {
-        let b = regs.read::<u8>(base + i);
+        let b = machine.read::<u8>(base + i);
         out.push(b);
         i += 1;
         if b == 0 && prev_was_nul { break; }
@@ -937,15 +937,15 @@ fn snapshot_env<A: crate::Arch>(regs: &Vcpu<A>, env_seg: u16) -> alloc::vec::Vec
 /// `dos.current_psp` is always a segment; PSP[0x2C] may have been
 /// converted to a selector at DPMI entry, so use `saved_rm_env` when the
 /// active PSP matches the one whose env we patched.
-pub fn snapshot_parent_env<A: crate::Arch>(regs: &mut Vcpu<A>, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
+pub fn snapshot_parent_env<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
             dpmi.saved_rm_env
         }
-        _ => dos::Psp::env_seg(regs, psp_seg),
+        _ => dos::Psp::env_seg(machine, regs, psp_seg),
     };
-    snapshot_env(regs, env_seg)
+    snapshot_env(machine, regs, env_seg)
 }
 
 /// F12 / panic dump: print DPMI LDT entries and PM stack/code bytes.
@@ -955,7 +955,7 @@ pub fn dump_if_ring() {
     mode_transitions::dump_if_ring();
 }
 
-pub fn dump_dpmi_state<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>) {
+pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
     if dos.dpmi.is_none() { return; }
     for (name, sel) in [
         ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
@@ -979,21 +979,21 @@ pub fn dump_dpmi_state<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>
     let sp_lin = ss_base.wrapping_add(regs.sp32());
     let pre = ip_lin.wrapping_sub(16);
     let mut cp = [0u8; 32];
-    regs.copy_from(pre as usize, &mut cp);
+    machine.copy_from(pre as usize, &mut cp);
     crate::dbg_println!("[DBG] code @{:08x} (-16..+16):", pre);
     crate::dbg_println!("[DBG]   {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} | {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
         cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
         cp[8], cp[9], cp[10], cp[11], cp[12], cp[13], cp[14], cp[15],
         cp[16], cp[17], cp[18], cp[19], cp[20], cp[21], cp[22], cp[23],
         cp[24], cp[25], cp[26], cp[27], cp[28], cp[29], cp[30], cp[31]);
-    let sw: [u32; 8] = core::array::from_fn(|i| regs.read::<u32>(sp_lin as usize + i * 4));
+    let sw: [u32; 8] = core::array::from_fn(|i| machine.read::<u32>(sp_lin as usize + i * 4));
     crate::dbg_println!("[DBG] stack @{:08x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
         sp_lin, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
 }
 
 /// Queue an arch IRQ into this thread's virtual PIC.
-pub fn queue_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, irq: crate::Irq) {
-    machine::queue_irq(&mut dos.pc, regs, irq);
+pub fn queue_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, irq: crate::Irq) {
+    machine::queue_irq(machine, &mut dos.pc, regs, irq);
 }
 
 /// Advance the virtual PIT/RTC against the machine timer and raise IRQ0/IRQ8 on
@@ -1008,12 +1008,12 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// or no present sink). Called by the event loop with the absolute tick clock;
 /// presents once per emulated VGA frame on the retrace edge (see
 /// `machine::display_tick`).
-pub fn display_tick<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &Vcpu<A>, now_ticks: u64) {
-    machine::display_tick(&mut dos.pc, regs, now_ticks);
+pub fn display_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &Regs, now_ticks: u64) {
+    machine::display_tick(machine, &mut dos.pc, regs, now_ticks);
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).
-pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
+pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     machine::audio_tick(machine, &mut dos.pc, regs);
 }
 
@@ -1027,7 +1027,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// `reflect_int_to_real_mode` first, then returns through the same continuation
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
-pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
+pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI
@@ -1077,10 +1077,10 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         && !mouse.cb_in_flight
         && mouse.cb_mask & mouse.pending_cond != 0;
     if mouse_ready {
-        dos::deliver_mouse_callback(dos, regs);
+        dos::deliver_mouse_callback(machine, dos, regs);
     } else if let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) {
         IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
-        mode_transitions::deliver_pm_irq(dos, regs, vec);
+        mode_transitions::deliver_pm_irq(machine, dos, regs, vec);
     }
     // Keep the interpreter's CPU INTR line coherent with what's still pending so
     // its per-block interrupt check keeps firing until everything is delivered
@@ -1112,14 +1112,14 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
 /// Mirror `dos.dos_blocks` out as a real DOS Memory Control Block chain
 /// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
 /// walks contiguously from `heap_base_seg` up to 0xA000.
-fn sync_mcb_chain<A: crate::Arch>(dos: &DosState<A>, regs: &mut Vcpu<A>) {
+fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, regs: &mut Regs) {
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
 
     // Update the LOL-1 first-MCB pointer. AH=52h returns ES:BX = LOL, and
     // programs (DOS/4G stubs, MEM utilities) read [LOL - 2] = first MCB
     // segment to walk the chain head.
-    dos::set_first_mcb_seg(regs, dos.heap_base_seg);
+    dos::set_first_mcb_seg(machine, regs, dos.heap_base_seg);
 
     let mut entries: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
 
@@ -1144,11 +1144,11 @@ fn sync_mcb_chain<A: crate::Arch>(dos: &DosState<A>, regs: &mut Vcpu<A>) {
     for (i, &(mcb_seg, ow, paras)) in entries.iter().enumerate() {
         let sig = if i + 1 == last_idx { b'Z' } else { b'M' };
         let addr = (mcb_seg as u32) << 4;
-        regs.write::<u8>(addr as usize, sig);
-        regs.write::<u16>(addr as usize + 1, ow);
-        regs.write::<u16>(addr as usize + 3, paras);
+        machine.write::<u8>(addr as usize, sig);
+        machine.write::<u16>(addr as usize + 1, ow);
+        machine.write::<u16>(addr as usize + 3, paras);
         for off in 5..16 {
-            regs.write::<u8>(addr as usize + off, 0);
+            machine.write::<u8>(addr as usize + off, 0);
         }
     }
 }
@@ -1214,18 +1214,18 @@ fn largest_dos_block<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     largest_data
 }
 
-fn dos_reset_blocks<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, base_seg: u16) {
+fn dos_reset_blocks<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, base_seg: u16) {
     dos.heap_base_seg = base_seg;
     dos.heap_seg = base_seg;
     dos.dos_blocks.clear();
-    sync_mcb_chain(dos, regs);
+    sync_mcb_chain(machine, dos, regs);
 }
 
 fn current_mcb_owner<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     dos.current_psp
 }
 
-fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, need: u16) -> Result<u16, u16> {
+fn dos_alloc_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, need: u16) -> Result<u16, u16> {
     // Each alloc consumes 1 MCB paragraph + `need` data paragraphs. Quirk
     // preserved from pre-MCB code: AH=48 BX=0 silently succeeds without
     // recording a block (returns the would-be data segment).
@@ -1250,7 +1250,7 @@ fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, ne
                     dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need, owner });
                 }
                 sync_heap_seg(dos);
-                sync_mcb_chain(dos, regs);
+                sync_mcb_chain(machine, dos, regs);
                 return Ok(data_seg);
             }
             max_data = max_data.max(region.saturating_sub(1));
@@ -1266,7 +1266,7 @@ fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, ne
                 dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need, owner });
             }
             sync_heap_seg(dos);
-            sync_mcb_chain(dos, regs);
+            sync_mcb_chain(machine, dos, regs);
             return Ok(data_seg);
         }
         max_data = max_data.max(region.saturating_sub(1));
@@ -1275,39 +1275,39 @@ fn dos_alloc_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, ne
     Err(max_data)
 }
 
-fn dos_free_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, seg: u16) -> Result<(), u16> {
+fn dos_free_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16) -> Result<(), u16> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         dos.dos_blocks.remove(idx);
         sync_heap_seg(dos);
-        sync_mcb_chain(dos, regs);
+        sync_mcb_chain(machine, dos, regs);
         Ok(())
     } else {
         Err(9)
     }
 }
 
-fn dos_set_program_block_owner<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, env_seg: u16, psp_seg: u16, owner: u16) {
+fn dos_set_program_block_owner<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, env_seg: u16, psp_seg: u16, owner: u16) {
     for block in &mut dos.dos_blocks {
         if block.seg == env_seg || block.seg == psp_seg {
             block.owner = owner;
         }
     }
-    sync_mcb_chain(dos, regs);
+    sync_mcb_chain(machine, dos, regs);
 }
 
-fn dos_keep_resident_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, seg: u16, paras: u16, owner: u16) {
+fn dos_keep_resident_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16, owner: u16) {
     let paras = paras.min(0xA000u16.saturating_sub(seg));
     if paras == 0 {
-        sync_mcb_chain(dos, regs);
+        sync_mcb_chain(machine, dos, regs);
         return;
     }
 
     dos.dos_blocks.push(DosMemBlock { seg, paras, owner });
     sync_heap_seg(dos);
-    sync_mcb_chain(dos, regs);
+    sync_mcb_chain(machine, dos, regs);
 }
 
-fn dos_resize_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
+fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         // Block resize: data must end before next block's MCB (or at 0xA000
         // if no next block).
@@ -1320,7 +1320,7 @@ fn dos_resize_block<A: crate::Arch>(dos: &mut DosState<A>, regs: &mut Vcpu<A>, s
         if paras <= max {
             dos.dos_blocks[idx].paras = paras;
             sync_heap_seg(dos);
-            sync_mcb_chain(dos, regs);
+            sync_mcb_chain(machine, dos, regs);
             Ok(())
         } else {
             Err((8, max))

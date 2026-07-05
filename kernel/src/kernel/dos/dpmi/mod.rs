@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use crate::Regs;
 use arch_abi::GuestBytes;
 use alloc::boxed::Box;
 use crate::Vcpu;
@@ -46,11 +47,11 @@ use self::raw_switch::{clear_carry, flat_addr, set_carry, trace_client_selector_
 
 /// Switch from VM86 to 32-bit protected mode.
 /// Called from rm_int31_dispatch when the DPMI entry stub executes.
-pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
+pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
     // DPMI entry is a FAR CALL; the real-mode stack holds the PM return CS:IP.
-    let ret_ip = machine::vm86_pop(regs);
-    let ret_cs = machine::vm86_pop(regs);
+    let ret_ip = machine::vm86_pop(machine, regs);
+    let ret_cs = machine::vm86_pop(machine, regs);
     let real_ss = regs.stack_seg();
     let real_sp = regs.sp32() as u16;
     dos_trace!("[DPMI] ENTER AX={} ({}bit client) caller={:04X}:{:04X} psp={:04X} rm_ss:sp={:04X}:{:04X} ds={:04X} es={:04X}",
@@ -119,7 +120,7 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(dos: &mut thread::DosSt
     // selector per §4.1. `dos.current_psp` stays as the segment value
     // (pure DOS state).
     dos.dpmi = Some(Box::new(dpmi));
-    install_dpmi_psp_view(dos, regs);
+    install_dpmi_psp_view(machine, dos, regs);
 
     // PMDOS: route PM INT 21 to the kernel's direct-service handler.
     if dos.pm_dos {
@@ -181,7 +182,7 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(dos: &mut thread::DosSt
 /// PM client-initiated INT 31h — the DPMI service API, dispatched by AX.
 /// Caller (`dos::syscall`) has already classified the trap as client-side
 /// (CS not in the kernel's stub LDT slots).
-pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
+pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
@@ -315,7 +316,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
                 if let Some(dpmi) = dos.dpmi.as_ref()
                     && !dpmi.client_use32 && dpmi.env_ldt_idx != 0 && (base & 0xF) == 0 {
                         let psp_base = desc_base(dos.ldt[PSP_LDT_IDX]);
-                        let env_sel = regs.read::<u16>((psp_base + 0x2C) as usize);
+                        let env_sel = machine.read::<u16>((psp_base + 0x2C) as usize);
                         if env_sel != 0 && ((env_sel as u32) << 4) == base {
                             let env_idx = sel_to_idx(env_sel);
                             if env_idx < LDT_ENTRIES && ldt_is_allocated(&dos.ldt_alloc, env_idx) {
@@ -398,7 +399,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let desc = dos.ldt[idx];
-                regs.write::<u64>((dest) as usize, desc);
+                machine.write::<u64>((dest) as usize, desc);
                 dos_trace!("[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
                     desc_base(desc), desc);
                 clear_carry(regs);
@@ -412,7 +413,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
             let sel = regs.rbx as u16;
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let src = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-                let mut new_desc = regs.read::<u64>((src) as usize);
+                let mut new_desc = machine.read::<u64>((src) as usize);
                 // Match CWSDPMI: force the descriptor to stay non-system.
                 new_desc |= 1u64 << 44;
                 dos.ldt[idx] = new_desc;
@@ -428,7 +429,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
         // BX = paragraphs. Returns: AX = real-mode segment, DX = selector
         0x0100 => {
             let paragraphs = regs.rbx as u16;
-            match dos::dos_alloc_block(dos, regs, paragraphs) {
+            match dos::dos_alloc_block(machine, dos, regs, paragraphs) {
                 Ok(seg) => {
                     if let Some(idx) = alloc_ldt(&mut dos.ldt_alloc) {
                         let base = (seg as u32) * 16;
@@ -441,7 +442,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
                             paragraphs, seg, sel, base);
                         clear_carry(regs);
                     } else {
-                        let _ = dos::dos_free_block(dos, regs, seg);
+                        let _ = dos::dos_free_block(machine, dos, regs, seg);
                         regs.rax = (regs.rax & !0xFFFF) | 8;
                         set_carry(regs);
                     }
@@ -464,7 +465,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
-                match dos::dos_free_block(dos, regs, seg) {
+                match dos::dos_free_block(machine, dos, regs, seg) {
                     Ok(()) => {
                         free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
                         clear_carry(regs);
@@ -488,7 +489,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
-                match dos::dos_resize_block(dos, regs, seg, paragraphs) {
+                match dos::dos_resize_block(machine, dos, regs, seg, paragraphs) {
                     Ok(()) => {
                         let limit = (paragraphs as u32).saturating_mul(16).saturating_sub(1);
                         dos.ldt[idx] = make_data_desc(base, limit);
@@ -506,8 +507,8 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
         // BL = interrupt number. Returns: CX:DX = seg:off
         0x0200 => {
             let int_num = regs.rbx as u8;
-            let off = machine::read_u16(regs, 0, (int_num as u32) * 4);
-            let seg = machine::read_u16(regs, 0, (int_num as u32) * 4 + 2);
+            let off = machine::read_u16(machine, regs, 0, (int_num as u32) * 4);
+            let seg = machine::read_u16(machine, regs, 0, (int_num as u32) * 4 + 2);
             regs.rcx = (regs.rcx & !0xFFFF) | seg as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | off as u64;
             clear_carry(regs);
@@ -519,8 +520,8 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
             let seg = regs.rcx as u16;
             let off = regs.rdx as u16;
             dos_trace!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
-            machine::write_u16(regs, 0, (int_num as u32) * 4, off);
-            machine::write_u16(regs, 0, (int_num as u32) * 4 + 2, seg);
+            machine::write_u16(machine, regs, 0, (int_num as u32) * 4, off);
+            machine::write_u16(machine, regs, 0, (int_num as u32) * 4 + 2, seg);
             clear_carry(regs);
         }
         // AX=0202h — Get Processor Exception Handler Vector
@@ -639,17 +640,17 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
         // AX=0300h — Simulate Real Mode Interrupt
         // BL = interrupt number, ES:EDI = real-mode call structure (50 bytes)
         0x0300 => {
-            return simulate_real_mode_int(dos, regs);
+            return simulate_real_mode_int(machine, dos, regs);
         }
         // AX=0301h — Call Real Mode Far Procedure
         // ES:EDI = real-mode call structure
         0x0301 => {
-            return call_real_mode_proc(dos, regs);
+            return call_real_mode_proc(machine, dos, regs);
         }
         // AX=0302h — Call Real Mode Procedure with IRET Frame
         // ES:EDI = real-mode call structure (procedure returns via IRET)
         0x0302 => {
-            return call_real_mode_proc_iret(dos, regs);
+            return call_real_mode_proc_iret(machine, dos, regs);
         }
         // AX=0303h — Allocate Real Mode Callback Address
         // DS:SI = PM callback handler, ES:DI = real-mode register structure
@@ -723,9 +724,9 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
             // Buffer layout (DPMI 1.0 §3.4): [0]=major (decimal), [1]=minor,
             // [2..]=ASCIIZ vendor identifier (≤126 bytes).
             const VENDOR: &[u8] = b"RetroOS DPMI Host\0";
-            regs.write::<u8>(dest as usize, 1);        // host major = 1
-            regs.write::<u8>(dest as usize + 1, 0);    // host minor = 0
-            regs.copy_to(dest as usize + 2, VENDOR);
+            machine.write::<u8>(dest as usize, 1);        // host major = 1
+            machine.write::<u8>(dest as usize + 1, 0);    // host minor = 0
+            machine.copy_to(dest as usize + 2, VENDOR);
             clear_carry(regs);
         }
         // AX=0500h — Get Free Memory Information
@@ -746,7 +747,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosSt
             info[1] = swap_pages + physical_pages; // max unlocked alloc (pages)
             info[0] = info[1] << 12;             // largest block (bytes)
             for (i, value) in info.into_iter().enumerate() {
-                regs.write::<u32>(dest as usize + i * 4, value);
+                machine.write::<u32>(dest as usize + i * 4, value);
             }
             clear_carry(regs);
         }

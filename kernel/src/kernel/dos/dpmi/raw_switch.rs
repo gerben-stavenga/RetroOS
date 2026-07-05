@@ -1,3 +1,4 @@
+use crate::Regs;
 use arch_abi::GuestBytes;
 use super::*;
 use crate::Vcpu;
@@ -13,7 +14,7 @@ use super::super::mode_transitions;
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
+fn raw_switch_pm_to_real<A: crate::Arch>(machine: &mut A, _dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -39,7 +40,7 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &
 /// initiated return trampolines, entry points, and the PMDOS INT 21
 /// short-circuit live here.
 /// Slot = (EIP - STUB_BASE - 2) / 2.
-pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
@@ -56,25 +57,25 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, 
             super::super::dosabi::pmdos_int21_handler(machine, kt, dos, regs)
         }
         dos::SLOT_PMDOS_INT33 => {
-            super::super::dosabi::pmdos_int33_handler(dos, regs)
+            super::super::dosabi::pmdos_int33_handler(machine, dos, regs)
         }
         dos::SLOT_EXCEPTION_RET => {
-            exception_return(dos, regs, ExcReturnVia::V09)
+            exception_return(machine, dos, regs, ExcReturnVia::V09)
         }
         dos::SLOT_EXCEPTION_RET_V10 => {
-            exception_return(dos, regs, ExcReturnVia::V10)
+            exception_return(machine, dos, regs, ExcReturnVia::V10)
         }
         dos::SLOT_PM_TO_REAL => {
-            raw_switch_pm_to_real(dos, regs)
+            raw_switch_pm_to_real(machine, dos, regs)
         }
         dos::SLOT_RESUME_CONTINUATION => {
-            mode_transitions::resume_continuation_from_stub(dos, regs);
+            mode_transitions::resume_continuation_from_stub(machine, dos, regs);
             thread::KernelAction::Done
         }
         dos::SLOT_MOUSE_CB_RET => {
             // PM INT 33h AX=0Ch handler FAR-RETurned into this trampoline.
             // Restore the bracket-saved GP regs and unwind the callback.
-            super::super::dosabi::mouse_callback_return(dos, regs);
+            super::super::dosabi::mouse_callback_return(machine, dos, regs);
             thread::KernelAction::Done
         }
         dos::SLOT_SAVE_RESTORE => {
@@ -91,12 +92,12 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, 
             let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
             let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
             let (ret_eip, ret_cs, frame_size) = if use32 {
-                let eip = regs.read::<u32>((ss_base.wrapping_add(sp)) as usize);
-                let cs = regs.read::<u32>((ss_base.wrapping_add(sp + 4)) as usize);
+                let eip = machine.read::<u32>((ss_base.wrapping_add(sp)) as usize);
+                let cs = machine.read::<u32>((ss_base.wrapping_add(sp + 4)) as usize);
                 (eip, cs, 8u32)
             } else {
-                let ip = regs.read::<u16>((ss_base.wrapping_add(sp)) as usize) as u32;
-                let cs = regs.read::<u16>((ss_base.wrapping_add(sp + 2)) as usize) as u32;
+                let ip = machine.read::<u16>((ss_base.wrapping_add(sp)) as usize) as u32;
+                let cs = machine.read::<u16>((ss_base.wrapping_add(sp + 2)) as usize) as u32;
                 (ip, cs, 4u32)
             };
             let new_sp = sp.wrapping_add(frame_size);
@@ -121,7 +122,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(machine: &mut A, 
 ///   (E)BX = new PM (E)SP
 ///   SI = new PM CS selector
 ///   (E)DI = new PM (E)IP
-pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
+pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -165,12 +166,12 @@ pub(super) fn flat_addr(ldt: &[u64], seg: u16, offset: u32, cs_32: bool) -> u32 
     seg_base(ldt, seg).wrapping_add(offset)
 }
 
-pub(super) fn trace_client_selector_leak<A: crate::Arch>(_label: &str, _regs: &Vcpu<A>) {}
+pub(super) fn trace_client_selector_leak(_label: &str, _regs: &Regs) {}
 
-pub(super) fn set_carry<A: crate::Arch>(regs: &mut Vcpu<A>) {
+pub(super) fn set_carry(regs: &mut Regs) {
     regs.set_flag32(1); // CF
 }
 
-pub(super) fn clear_carry<A: crate::Arch>(regs: &mut Vcpu<A>) {
+pub(super) fn clear_carry(regs: &mut Regs) {
     regs.clear_flag32(1); // CF
 }

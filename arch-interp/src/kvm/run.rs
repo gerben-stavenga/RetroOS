@@ -326,7 +326,7 @@ fn io_insn_len(vcpu: &crate::vcpu::Vcpu, port: u16) -> u32 {
     };
     let mut len: u32 = 0;
     loop {
-        let b = vcpu.read::<u8>(base.wrapping_add(vcpu.ip32()).wrapping_add(len) as usize);
+        let b = crate::backend::Interp.read::<u8>(base.wrapping_add(vcpu.ip32()).wrapping_add(len) as usize);
         match b {
             // Legacy prefixes (operand/address size, rep, lock, seg overrides).
             0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => len += 1,
@@ -390,9 +390,9 @@ pub fn execute() -> KernelEvent {
         let mut stepping = false;
         if mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
             let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
-            let r = arch_abi::monitor::step_virtual_if(vcpu);
+            let r = arch_abi::monitor::step_virtual_if(&mut crate::backend::Interp, &mut vcpu.regs);
             if step_trace_on() {
-                let op = vcpu.read::<u8>(crate::desc::seg_base(scs).wrapping_add(sip) as usize);
+                let op = crate::backend::Interp.read::<u8>(crate::desc::seg_base(scs).wrapping_add(sip) as usize);
                 eprintln!(
                     "[step] {scs:#06x}:{sip:#010x} op={op:02X} -> ip={:#010x} vif={} r={}",
                     vcpu.ip32(),
@@ -497,7 +497,7 @@ pub fn execute() -> KernelEvent {
                     if stepping && mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
                         let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
                         let snap_fl = vcpu.flags32() & !TF_FLAG;
-                        let r = arch_abi::monitor::step_virtual_if(vcpu);
+                        let r = arch_abi::monitor::step_virtual_if(&mut crate::backend::Interp, &mut vcpu.regs);
                         if step_trace_on() {
                             eprintln!(
                                 "[step] {scs:#06x}:{sip:#010x} (fast) -> ip={:#010x} vif={} r={}",
@@ -569,7 +569,7 @@ pub fn execute() -> KernelEvent {
             } else {
                 crate::desc::seg_base(pre_cs)
             };
-            let op = vcpu.read::<u8>(base.wrapping_add(pre_ip) as usize);
+            let op = crate::backend::Interp.read::<u8>(base.wrapping_add(pre_ip) as usize);
             eprintln!(
                 "[VIF-DROP] mode={mode:?} pre={pre_cs:#06x}:{pre_ip:#010x} op={op:02X} \
                  post={:#06x}:{:#010x} shim={shim_vec:?} ev={ev:?}",
@@ -629,7 +629,7 @@ fn dispatch_shim(
     // e.g. a selector-load fault) is a genuine #GP, typed Exception(13) below
     // with the error code preserved.
     if n == 13 {
-        match arch_abi::monitor::monitor(vcpu) {
+        match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
             MonitorResult::Resume => return None,
             MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
             MonitorResult::Event(ev) => return Some(ev),
@@ -643,8 +643,7 @@ fn dispatch_shim(
         // #GP (13) must bubble, never reflect (see the TCG intr hook: at
         // IOPL=1 the monitor owns it; IVT[0Dh] is a guest disk/UMB handler).
         if n != 3 && n != 4 && n != 13 && !crate::desc::int_intercepted(n) {
-            let crate::vcpu::Vcpu { regs, space } = vcpu;
-            arch_abi::monitor::sw_reflect_vm86_int(regs, space, n);
+            arch_abi::monitor::sw_reflect_vm86_int(&mut vcpu.regs, &mut crate::backend::Interp, n);
             return None;
         }
         // Residual VM86 traps: trapped vectors and the DPL=3 gates.

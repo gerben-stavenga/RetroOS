@@ -5,6 +5,7 @@ extern crate alloc;
 extern crate ext4_view;
 
 
+use crate::Regs;
 use crate::Vcpu;
 use crate::kernel::{vfs, tarfs::TarFs, ext4fs::Ext4Fs};
 use crate::println;
@@ -308,7 +309,7 @@ fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
 /// moved together with execution by `switch_focus_and_run` for now).
 pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], first_tid: usize) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
-    let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
+    let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, machine, first_tid);
     let mut stats = EventStats::new(machine);
 
     loop {
@@ -316,9 +317,9 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         let thread = ctx.thread(threads);
 
         // Advance this thread's world: virtual time, console input, delivery.
-        thread.personality.on_slice(machine, &mut ctx.vcpu);
-        crate::kernel::console::drain(machine, &mut ctx.vcpu, &mut thread.kernel, &mut thread.personality);
-        thread.personality.after_input(machine, &mut thread.kernel, &mut ctx.vcpu);
+        thread.personality.on_slice(machine, &mut ctx.regs);
+        crate::kernel::console::drain(machine, &mut ctx.regs, &mut thread.kernel, &mut thread.personality);
+        thread.personality.after_input(machine, &mut thread.kernel, &mut ctx.regs);
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or F11 to move on.
@@ -333,11 +334,11 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine);
         let kevent = ctx.run(machine);
-        stats.post_run(machine, &kevent, &ctx.vcpu);
-        let action = dispatch(machine, thread, &mut ctx.vcpu, kevent);
+        stats.post_run(machine, &kevent, &ctx.regs);
+        let action = dispatch(machine, thread, &mut ctx.regs, kevent);
 
         // Ask the scheduler.
-        match crate::kernel::sched::verdict(machine, threads, &mut ctx.vcpu, ctx.tid, action) {
+        match crate::kernel::sched::verdict(machine, threads, &mut ctx.regs, ctx.tid, action) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(machine, threads, &mut ctx, next);
@@ -359,7 +360,7 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
 fn dispatch<A: crate::Arch>(
     machine: &mut A,
     thread: &mut thread::Thread<A>,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
     if let crate::KernelEvent::PageFault { addr } = kevent {
@@ -403,11 +404,11 @@ fn switch_focus_and_run<A: crate::Arch>(
         } else {
             None
         };
-        crate::kernel::focus::release(old_personality);
+        crate::kernel::focus::release(machine, old_personality);
     }
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
-    crate::kernel::focus::acquire(new_tid, &mut new.personality);
+    crate::kernel::focus::acquire(machine, new_tid, &mut new.personality);
     // switch_to derived the I/O bitmap before focus moved (it must — a bare
     // execution switch is valid without any focus change); now that this
     // thread holds focus, re-derive so the focused-only windows (VGA on a
@@ -421,7 +422,7 @@ fn switch_focus_and_run<A: crate::Arch>(
 pub(crate) fn handle_fork_exec<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    vcpu: &mut Vcpu<A>,
+    vcpu: &mut Regs,
     parent_tid: usize,
     path: &[u8],
     cmdtail: &[u8],
@@ -456,7 +457,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             }
             parent_cwd_len = n;
 
-            parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(vcpu, dos));
+            parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(machine, vcpu, dos));
         }
         thread::Personality::Linux(lin) => {
             parent_is_dos = false;
@@ -473,13 +474,13 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let read_path: alloc::vec::Vec<u8> = match personality_name {
         Some(thread::PersonalityName::Dos) => match crate::kernel::dos::dos_abs_to_vfs(path) {
             Some(v) => v,
-            None => { on_error(&mut vcpu.regs, 2); return None; }
+            None => { on_error(vcpu, 2); return None; }
         },
         _ => path.to_vec(),
     };
     let buf = match exec::load_file_resolved(&read_path) {
         Ok(b) => b,
-        Err(_) => { on_error(&mut vcpu.regs, 2); return None; }
+        Err(_) => { on_error(vcpu, 2); return None; }
     };
 
     let format = exec::detect_format(&buf, path);
@@ -494,16 +495,20 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
 
     let child = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
         Some(t) => t,
-        None => { on_error(&mut vcpu.regs, 8); return None; }
+        None => { on_error(vcpu, 8); return None; }
     };
     let child_tid = child.kernel.tid as usize;
 
-    // Save parent's user regs (the live frame) before the swap — exec_dos_into
-    // bundles address-space setup + init_process_thread_vm86, which would
-    // overwrite the parent state that the first swap parks in child.vcpu.regs.
-    let parent_regs = vcpu.regs;
-
-    machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
+    // Temporarily make the child's address space the active one so ELF load /
+    // DOS setup operate on it (guest memory is the active space). The parent's
+    // space is held aside and restored below. Unlike the old vcpu-swap, this
+    // moves ONLY the space — the parent's live registers (`vcpu`) are never
+    // touched, so no save/restore of them is needed.
+    let parent_space = machine.activate(
+        core::mem::take(&mut child.kernel.vcpu.space),
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+    );
 
     // ELF needs user pages freed before loading; DOS handles its own address space
     if matches!(format, exec::BinaryFormat::Elf) {
@@ -516,21 +521,18 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
     if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl).is_err() {
-        let child = thread::get_thread(threads, child_tid).unwrap();
-        machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
+        // Restore the parent's space and tear the half-built child down.
+        let _ = machine.activate(parent_space, core::ptr::null_mut(), core::ptr::null_mut());
         thread::exit_thread(threads, machine, child_tid, 1);
-        on_error(&mut vcpu.regs, 11);
+        on_error(vcpu, 11);
         return None;
     }
 
     let child = thread::get_thread(threads, child_tid).unwrap();
-    // Swap back to parent's address space. Save child's cpu_state (set by
-    // init_thread) and restore after — the swap would overwrite it.
-    let saved_cpu = child.kernel.vcpu.regs;
-    machine.switch_to(vcpu, &mut child.kernel.vcpu, core::ptr::null_mut(), core::ptr::null_mut());
-    child.kernel.vcpu.regs = saved_cpu;
-    // Restore parent's user regs into the live frame (the swap left stale data).
-    vcpu.regs = parent_regs;
+    // Restore the parent's address space; the displaced child space re-parks in
+    // its slot (init_thread already set the child's entry registers there).
+    let child_space = machine.activate(parent_space, core::ptr::null_mut(), core::ptr::null_mut());
+    child.kernel.vcpu.space = child_space;
 
     match &mut child.personality {
         thread::Personality::Linux(lin) => {
@@ -568,8 +570,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             // is a host address only on metal's low-mem identity window — on
             // the interp backend a raw 0x450 deref is the host null page
             // (SEGV'd on DN→PRINCE.EXE, the first task-spawn EXEC on interp).
-            vcpu.write::<u8>(0x450, col);
-            vcpu.write::<u8>(0x451, row);
+            machine.write::<u8>(0x450, col);
+            machine.write::<u8>(0x451, row);
         }
     }
 
@@ -577,7 +579,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // when focus returns to it. No kernel-side blocking — the focused thread
     // runs continuously, so polling is just a status query.
     crate::dbg_println!("  child tid={}, parent tid={} continues without blocking", child_tid, parent_tid);
-    on_success(&mut vcpu.regs, child_tid as i32);
+    on_success(vcpu, child_tid as i32);
     Some(child_tid)
 }
 
@@ -592,11 +594,11 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
 ///
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
-pub fn arch_dump_exception<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>) {
-    dump_interrupted_thread(regs, Some(dos));
+pub fn arch_dump_exception<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
+    dump_interrupted_thread(machine, regs, Some(dos));
 }
 
-pub(crate) fn dump_interrupted_thread<A: crate::Arch>(regs: &Vcpu<A>, dos: Option<&thread::DosState<A>>) {
+pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Regs, dos: Option<&thread::DosState<A>>) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
         // The guest's interrupt flag is VIF (bit 19); canonical bit 9 is
@@ -606,8 +608,8 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(regs: &Vcpu<A>, dos: Optio
         // Guest reads via arch::mem() (identity on metal, mmap offset on the
         // interpreter) — raw `lin as *const u8` would fault on the interp.
         let mut b = [0u8; 8];
-        regs.copy_from(lin as usize, &mut b);
-        let ticks = regs.read::<u32>(0x46C);
+        machine.copy_from(lin as usize, &mut b);
+        let ticks = machine.read::<u32>(0x46C);
         crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             regs.code_seg(), regs.ip32(),
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
@@ -646,7 +648,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(regs: &Vcpu<A>, dos: Optio
         // guest address, identity-mapped on metal but an mmap offset on the
         // interpreter (a raw `0xB8000 as *const u8` would fault there).
         let mut vga = [0u8; 4000];
-        regs.copy_from(0xB8000, &mut vga);
+        machine.copy_from(0xB8000, &mut vga);
         for row in 0..25 {
             let mut line = [b'.'; 80];
             for col in 0..80 {
@@ -666,7 +668,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(regs: &Vcpu<A>, dos: Optio
         crate::dbg_println!("[DBG] DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
             regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16);
         if let Some(d) = dos {
-            crate::kernel::dos::dump_dpmi_state(d, regs);
+            crate::kernel::dos::dump_dpmi_state(machine, d, regs);
             dump_virtual_hw(d);
         }
         crate::kernel::stacktrace::stack_trace_regs(regs);
@@ -753,7 +755,7 @@ impl EventStats {
         &mut self,
         machine: &mut A,
         kevent: &crate::KernelEvent,
-        regs: &Vcpu<A>,
+        regs: &Regs,
     ) {
         use crate::KernelEvent as KE;
         let now = machine.rdtsc();

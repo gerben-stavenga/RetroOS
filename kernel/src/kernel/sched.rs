@@ -8,6 +8,7 @@
 //! arrives, this module is the only thing that should need to change — the
 //! test of whether the factorization around it is right.
 
+use crate::Regs;
 use crate::Vcpu;
 use crate::kernel::thread;
 
@@ -27,7 +28,7 @@ pub enum Verdict {
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
 ) -> Verdict {
@@ -49,7 +50,7 @@ pub fn verdict<A: crate::Arch>(
 fn next_after<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
 ) -> Option<usize> {
@@ -59,8 +60,7 @@ fn next_after<A: crate::Arch>(
         thread::KernelAction::Exit(code) => Some(thread::exit_thread(threads, machine, tid, code)),
         thread::KernelAction::Switch(next) => Some(next),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
-            crate::kernel::startup::handle_fork_exec(
-                machine, threads, regs, tid,
+            crate::kernel::startup::handle_fork_exec(machine, threads, regs, tid,
                 &path[..path_len], &cmdtail[..cmdtail_len], personality_name, viopl,
                 on_error, on_success,
             )

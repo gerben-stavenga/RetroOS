@@ -46,7 +46,7 @@ pub type Vcpu = arch_abi::Vcpu<crate::backend::Interp>;
 /// `host_ptr` resolves the *active* space, matching the prior behaviour. (The
 /// inherent `GuestMem` API below stays for arch-internal callers — BIOS/screen
 /// setup — that legitimately want slice views below the boundary.)
-impl GuestBytes for RootPageTable {
+impl GuestBytes for crate::backend::Interp {
     fn read<T: Copy>(&self, addr: usize) -> T {
         let size = core::mem::size_of::<T>();
         let mut v = core::mem::MaybeUninit::<T>::uninit();
@@ -167,22 +167,22 @@ impl GuestMem {
         }
     }
     pub fn read<T: Copy>(self, addr: usize) -> T {
-        RootPageTable::empty().read::<T>(addr)
+        crate::backend::Interp.read::<T>(addr)
     }
     pub fn write<T: Copy>(self, addr: usize, val: T) {
-        RootPageTable::empty().write::<T>(addr, val);
+        crate::backend::Interp.write::<T>(addr, val);
     }
     pub fn at<T>(self, addr: usize) -> &'static mut T {
         debug_assert!((addr & 0xFFF) + core::mem::size_of::<T>() <= 4096, "GuestMem::at crosses a page");
         unsafe { &mut *(host_ptr(addr, core::mem::size_of::<T>()) as *mut T) }
     }
     pub fn zero(self, addr: usize, len: usize) {
-        RootPageTable::empty().zero(addr, len);
+        crate::backend::Interp.zero(addr, len);
     }
     pub fn write_bytes(self, addr: usize, src: &[u8]) {
-        RootPageTable::empty().copy_to(addr, src);
+        crate::backend::Interp.copy_to(addr, src);
     }
     pub fn copy_within(self, src: usize, dst: usize, len: usize) {
-        RootPageTable::empty().copy_within(src, dst, len);
+        crate::backend::Interp.copy_within(src, dst, len);
     }
 }

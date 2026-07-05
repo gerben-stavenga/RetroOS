@@ -18,23 +18,25 @@ const ASSERT_ADDR_HASH: bool = false;
 
 pub struct ExecutionContext<A: crate::Arch> {
     pub tid: usize,
-    pub vcpu: crate::Vcpu<A>,
+    /// The running thread's REGISTERS (loop-owned, disjoint from the threads
+    /// array). Its ADDRESS SPACE is not here — it lives in the backend as the
+    /// single active space ([`crate::Arch::activate`]); guest memory is reached
+    /// through `machine`. `PhantomData` keeps `A` in the type.
+    pub regs: crate::Regs,
+    _a: core::marker::PhantomData<A>,
 }
 
 impl<A: crate::Arch> ExecutionContext<A> {
-    /// Seed the loan from a thread's saved state (the loop's first thread).
-    pub fn seed(threads: &mut [thread::Thread<A>], tid: usize) -> Self {
-        // Move the seeded thread's address space into the live loan, leaving an
-        // empty placeholder in its parked slot (it is now the running thread —
-        // its live state lives here, its slot is refilled when it switches out).
-        let vcpu = core::mem::replace(
-            &mut thread::get_thread(threads, tid)
-                .expect("ExecutionContext::seed: invalid thread")
-                .kernel
-                .vcpu,
-            crate::Vcpu::empty(),
-        );
-        ExecutionContext { tid, vcpu }
+    /// Seed the loan from a thread's saved state (the loop's first thread): take
+    /// its registers into the loan and make its space the active one.
+    pub fn seed(threads: &mut [thread::Thread<A>], machine: &mut A, tid: usize) -> Self {
+        let t = thread::get_thread(threads, tid).expect("ExecutionContext::seed: invalid thread");
+        let regs = t.kernel.vcpu.regs;
+        // Move the first thread's space into the active slot (discarding the
+        // empty placeholder the backend started with); no FPU swap on seed.
+        let space = core::mem::take(&mut t.kernel.vcpu.space);
+        let _ = machine.activate(space, core::ptr::null_mut(), core::ptr::null_mut());
+        ExecutionContext { tid, regs, _a: core::marker::PhantomData }
     }
 
     /// The thread currently holding the CPU. The borrow is tied to the passed
@@ -45,40 +47,40 @@ impl<A: crate::Arch> ExecutionContext<A> {
 
     /// Run user code until it produces a kernel event.
     pub fn run(&mut self, machine: &mut A) -> crate::KernelEvent {
-        machine.execute(&mut self.vcpu)
+        machine.execute(&mut self.regs)
     }
 
-    /// Execution swap: make `new_tid` the running thread. No-op when it
-    /// already is. Saves the outgoing thread's registers/FPU (and CPU-state
-    /// hash), restores the incoming thread's, switches the address space,
-    /// rebuilds the I/O bitmap from policy, and runs the personality's
-    /// `on_resume` (LDT/TLS rebinding). Does NOT touch console focus.
+    /// Execution swap: make `new_tid` the running thread. No-op when it already
+    /// is. Parks the outgoing thread's registers, loads the incoming thread's,
+    /// and `activate`s the incoming address space (the displaced outgoing space
+    /// returns and re-parks). Rebuilds the I/O bitmap and runs `on_resume`.
     pub fn switch_to(&mut self, threads: &mut [thread::Thread<A>], machine: &mut A, new_tid: usize) {
         if new_tid == self.tid {
             return;
         }
         let (old, new) = thread::get_two_threads(threads, self.tid, new_tid);
         verify_cpu_hash(new, "switch-in");
-        // Move the incoming thread's space out of its slot (empty placeholder
-        // left behind); `machine.switch_to` swaps it with the live `self.vcpu`,
-        // so afterwards `self.vcpu` holds the incoming space and `swap_vcpu` the
-        // outgoing one, which then moves into the outgoing thread's slot.
-        let mut swap_vcpu = core::mem::replace(&mut new.kernel.vcpu, crate::Vcpu::empty());
+        // Registers are plain data: park the outgoing set, load the incoming.
+        old.kernel.vcpu.regs = self.regs;
+        self.regs = new.kernel.vcpu.regs;
+        // The address space is the moved resource: `activate` swaps the incoming
+        // space into the live slot and hands back the displaced (outgoing) one.
         let mut swap_fx = new.kernel.fx_state;
-        if ASSERT_ADDR_HASH {
+        let incoming = core::mem::take(&mut new.kernel.vcpu.space);
+        let old_space = if ASSERT_ADDR_HASH {
             let mut hash = new.kernel.addr_hash;
-            machine.switch_to(&mut self.vcpu, &mut swap_vcpu, &mut hash, &mut swap_fx);
+            let s = machine.activate(incoming, &mut swap_fx, &mut hash);
             old.kernel.addr_hash = hash;
+            s
         } else {
-            machine.switch_to(&mut self.vcpu, &mut swap_vcpu, core::ptr::null_mut(), &mut swap_fx);
-        }
-        old.kernel.vcpu = swap_vcpu;
+            machine.activate(incoming, &mut swap_fx, core::ptr::null_mut())
+        };
+        old.kernel.vcpu.space = old_space;
         old.kernel.fx_state = swap_fx;
         old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
         // The incoming thread's port permissions: rebuilt from (personality,
         // platform, focus) — never inherited from whoever ran last.
-        crate::kernel::io_policy::apply(
-            machine,
+        crate::kernel::io_policy::apply(machine,
             &new.personality,
             new_tid == crate::kernel::focus::focused(),
         );

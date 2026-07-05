@@ -170,10 +170,10 @@ pub enum Personality<A: crate::Arch> {
 impl<A: crate::Arch> Personality<A> {
     /// Out-focus hook: snapshot whatever state lives only in hardware (VGA
     /// framebuffer + register set, shared TTY console buffer).
-    pub fn suspend(&mut self) {
+    pub fn suspend(&mut self, machine: &mut A) {
         match self {
-            Self::Dos(d) => d.suspend(),
-            Self::Linux(l) => l.suspend(),
+            Self::Dos(d) => d.suspend(machine),
+            Self::Linux(l) => l.suspend(machine),
         }
     }
 
@@ -181,10 +181,10 @@ impl<A: crate::Arch> Personality<A> {
     /// Visual rematerialization only — CPU-binding side effects (LDT, TLS,
     /// deferred wait_status writeout) live in `on_resume` and run
     /// independently of focus changes.
-    pub fn materialize(&mut self) {
+    pub fn materialize(&mut self, machine: &mut A) {
         match self {
-            Self::Dos(d) => d.materialize(),
-            Self::Linux(l) => l.materialize(),
+            Self::Dos(d) => d.materialize(machine),
+            Self::Linux(l) => l.materialize(machine),
         }
     }
 
@@ -201,7 +201,7 @@ impl<A: crate::Arch> Personality<A> {
     /// Per-iteration slice work BEFORE input routing: advance the thread's
     /// virtual time (DOS: PIT ticks, display render cadence, emulated-SB
     /// playback). Linux threads have no virtual devices to advance.
-    pub fn on_slice(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
+    pub fn on_slice(&mut self, machine: &mut A, regs: &mut Regs) {
         match self {
             Self::Dos(dos) => {
                 let ticks = machine.take_pending_ticks();
@@ -212,7 +212,7 @@ impl<A: crate::Arch> Personality<A> {
                     // Present is driven off the absolute tick clock (the same one
                     // the 0x3DA vertical-retrace fabrication reads), so it fires on
                     // the emulated VGA frame boundary rather than a private rate.
-                    crate::kernel::dos::display_tick(dos, regs, machine.get_ticks());
+                    crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
                 }
                 // Pump emulated-SB playback against the same virtual clock.
                 crate::kernel::dos::audio_tick(machine, dos, regs);
@@ -226,7 +226,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         kt: &mut KernelThread<A>,
-        regs: &mut Vcpu<A>,
+        regs: &mut Regs,
         kevent: crate::KernelEvent,
     ) -> KernelAction {
         match self {
@@ -242,7 +242,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn try_vga_fault(
         &mut self,
         machine: &mut A,
-        regs: &mut Vcpu<A>,
+        regs: &mut Regs,
         addr: u32,
     ) -> bool {
         match self {
@@ -258,7 +258,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         kt: &mut KernelThread<A>,
-        regs: &mut Vcpu<A>,
+        regs: &mut Regs,
     ) {
         let blocked = kt.state == ThreadState::Blocked;
         match self {
@@ -269,7 +269,7 @@ impl<A: crate::Arch> Personality<A> {
             }
             Self::Linux(linux) => {
                 if blocked {
-                    crate::kernel::linux::complete_pending_io(kt, linux, regs);
+                    crate::kernel::linux::complete_pending_io(machine, kt, linux, regs);
                 }
             }
         }
@@ -649,7 +649,7 @@ pub fn exit_thread<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, t
         // unmaps 0xA0000, after which save_from_hardware would fault. The
         // snapshot stays in the zombie's slot until the parent either
         // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
-        thread.personality.suspend();
+        thread.personality.suspend(machine);
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),
             Personality::Linux(_) => {}

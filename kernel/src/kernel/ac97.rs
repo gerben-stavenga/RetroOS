@@ -1,13 +1,13 @@
-//! Intel AC'97 audio output — a kernel device driver (not arch code).
+//! Intel AC'97 audio output — a kernel device driver (not machine code).
 //!
 //! On a host with an AC'97 codec but no Sound Blaster, the emulated SB
 //! (`dos/machine/vsb.rs`) produces canonical PCM and the kernel `sound` layer
 //! needs somewhere to play it. This driver is that sink on metal: `sound::play`
 //! dispatches here when [`init`] discovered a codec at boot (PCI class 04:01).
-//! It uses only arch *primitives* — 32-bit port I/O (`inl`/`outl`, for PCI
+//! It uses only machine *primitives* — 32-bit port I/O (`inl`/`outl`, for PCI
 //! config + the AC'97 bus-master registers), `dma_channel_buf` (the existing
 //! contiguous DMA buffer), and `map_phys_range` (to map that buffer into kernel
-//! space) — never any arch-side driver logic.
+//! space) — never any machine-side driver logic.
 //!
 //! ## DMA buffer (TEMPORARY placement — see the load-bearing note below)
 //!
@@ -96,41 +96,41 @@ static PRESENT: AtomicBool = AtomicBool::new(false);
 /// shared `pci::find_class` scan. Pure presence probe — `platform::probe` uses
 /// it for the Audio decision; on a no-PCI backend (the interpreter) every read
 /// is 0xFFFFFFFF and nothing is found.
-pub fn scan<A: crate::Arch>(arch: &mut A) -> Option<(u8, u8, u8)> {
-    crate::kernel::pci::find_class(arch, 0x04, 0x01)
+pub fn scan<A: crate::Arch>(machine: &mut A) -> Option<(u8, u8, u8)> {
+    crate::kernel::pci::find_class(machine, 0x04, 0x01)
 }
 
 /// Bring up the codec the platform probe found. Driver init only — the
 /// routing decision is `platform::Audio` (EmulatedAc97); PRESENT here means
 /// "driver is actually up" and guards `play` against a failed bring-up.
-pub fn init<A: crate::Arch>(arch: &mut A) {
+pub fn init<A: crate::Arch>(machine: &mut A) {
     if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedAc97 {
         return;
     }
-    let (bus, dev, func) = scan(arch).expect("platform probe saw an AC'97 codec; scan must agree");
-    if bring_up(arch, bus, dev, func) {
+    let (bus, dev, func) = scan(machine).expect("platform probe saw an AC'97 codec; scan must agree");
+    if bring_up(machine, bus, dev, func) {
         PRESENT.store(true, Ordering::Relaxed);
     }
 }
 
 /// Bring up the codec at `bus:dev.func`. Returns true on success.
-fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
+fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     // Enable I/O space + bus-master in the PCI command register (low 16 bits of
     // dword 0x04). Writing 0 to the status word (high 16) is harmless (RW1C).
-    let cmd = crate::kernel::pci::read32(arch, bus, dev, func, 0x04);
-    crate::kernel::pci::write32(arch, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x05);
+    let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
+    crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x05);
 
-    let nam = (crate::kernel::pci::read32(arch, bus, dev, func, 0x10) & 0xFFFC) as u16; // BAR0
-    let nabm = (crate::kernel::pci::read32(arch, bus, dev, func, 0x14) & 0xFFFC) as u16; // BAR1
+    let nam = (crate::kernel::pci::read32(machine, bus, dev, func, 0x10) & 0xFFFC) as u16; // BAR0
+    let nabm = (crate::kernel::pci::read32(machine, bus, dev, func, 0x14) & 0xFFFC) as u16; // BAR1
     if nam == 0 || nabm == 0 {
         return false;
     }
 
     // Bring the AC-link out of cold reset, then wait for the primary codec.
-    arch.outl(nabm + GLOB_CNT, 0x02);
+    machine.outl(nabm + GLOB_CNT, 0x02);
     let mut ready = false;
     for _ in 0..1_000_000 {
-        if arch.inl(nabm + GLOB_STA) & 0x100 != 0 {
+        if machine.inl(nabm + GLOB_STA) & 0x100 != 0 {
             ready = true;
             break;
         }
@@ -140,32 +140,32 @@ fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     }
 
     // Reset the mixer, unmute master + PCM-out at full volume (0 = 0 dB).
-    arch.outw(nam + NAM_RESET, 0);
-    arch.outw(nam + NAM_MASTER_VOL, 0x0000);
-    arch.outw(nam + NAM_PCM_OUT_VOL, 0x0000);
+    machine.outw(nam + NAM_RESET, 0);
+    machine.outw(nam + NAM_MASTER_VOL, 0x0000);
+    machine.outw(nam + NAM_PCM_OUT_VOL, 0x0000);
     // Enable variable-rate audio so we can play the guest's native rate without
     // resampling (the SB emulation produces 22050/etc., not the AC'97 48 kHz).
-    if arch.inw(nam + NAM_EXT_CAP) & 1 != 0 {
-        let ctrl = arch.inw(nam + NAM_EXT_CTRL);
-        arch.outw(nam + NAM_EXT_CTRL, ctrl | 1);
+    if machine.inw(nam + NAM_EXT_CAP) & 1 != 0 {
+        let ctrl = machine.inw(nam + NAM_EXT_CTRL);
+        machine.outw(nam + NAM_EXT_CTRL, ctrl | 1);
     }
 
     // Reset the PCM-out bus-master engine.
-    arch.outb(nabm + PO_CR, PO_CR_RESET);
+    machine.outb(nabm + PO_CR, PO_CR_RESET);
     for _ in 0..1_000_000 {
-        if arch.inb(nabm + PO_CR) & PO_CR_RESET == 0 {
+        if machine.inb(nabm + PO_CR) & PO_CR_RESET == 0 {
             break;
         }
     }
 
     // Map the channel buffer into the stolen low-mem window VA so the kernel can
     // write PCM into it; the codec reads it (and the BDL) by physical address.
-    let phys_page = arch.dma_channel_buf(DMA_CHANNEL);
+    let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
     if phys_page == 0 {
         return false;
     }
     let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
-    arch.map_phys_range(DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
+    machine.map_phys_range(DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
 
     let mut d = Ac97 {
@@ -178,8 +178,8 @@ fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
         rate: 0,
     };
     d.build_bdl();
-    arch.outl(nabm + PO_BDBAR, dma_phys); // BDL base
-    arch.outb(nabm + PO_LVI, 0);
+    machine.outl(nabm + PO_BDBAR, dma_phys); // BDL base
+    machine.outb(nabm + PO_LVI, 0);
 
     *AC97.lock() = Some(d);
     true
@@ -210,16 +210,16 @@ impl Ac97 {
         }
     }
 
-    fn set_rate<A: crate::Arch>(&mut self, arch: &mut A, rate: u32) {
+    fn set_rate<A: crate::Arch>(&mut self, machine: &mut A, rate: u32) {
         if rate != self.rate && rate != 0 {
-            arch.outw(self.nam + NAM_PCM_DAC_RATE, rate as u16);
+            machine.outw(self.nam + NAM_PCM_DAC_RATE, rate as u16);
             self.rate = rate;
         }
     }
 
     /// Decode `bytes` (`fmt`) into canonical i16 stereo and stream into the ring.
-    fn submit<A: crate::Arch>(&mut self, arch: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
-        self.set_rate(arch, rate);
+    fn submit<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
+        self.set_rate(machine, rate);
         let fb = fmt.frame_bytes();
         if fb == 0 {
             return;
@@ -229,7 +229,7 @@ impl Ac97 {
             // Beyond MAX_AHEAD buffers we drop the rest (bounds latency; rare
             // once producer/codec are rate-matched — only drift reaches here).
             if self.cur_off == 0 && self.running {
-                let civ = arch.inb(self.nabm + PO_CIV) as usize;
+                let civ = machine.inb(self.nabm + PO_CIV) as usize;
                 let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
                 if ahead >= MAX_AHEAD {
                     break;
@@ -245,10 +245,10 @@ impl Ac97 {
             if self.cur_off >= BUF_BYTES {
                 // Buffer complete: make it the last valid index. Start the bus
                 // master once a small cushion is primed, then advance.
-                arch.outb(self.nabm + PO_LVI, self.cur_buf as u8);
+                machine.outb(self.nabm + PO_LVI, self.cur_buf as u8);
                 if !self.running && self.cur_buf + 1 >= PRIME_BUFS {
-                    let cr = arch.inb(self.nabm + PO_CR);
-                    arch.outb(self.nabm + PO_CR, cr | PO_CR_RUN);
+                    let cr = machine.inb(self.nabm + PO_CR);
+                    machine.outb(self.nabm + PO_CR, cr | PO_CR_RUN);
                     self.running = true;
                 }
                 self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
@@ -260,10 +260,10 @@ impl Ac97 {
 
 /// Stream a block of source PCM to the AC'97 codec (called by `sound::play` when
 /// a codec was discovered).
-pub fn play<A: crate::Arch>(arch: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
+pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
     let mut g = AC97.lock();
     if let Some(dev) = g.as_mut() {
-        dev.submit(arch, rate, fmt, bytes);
+        dev.submit(machine, rate, fmt, bytes);
     }
 }
 

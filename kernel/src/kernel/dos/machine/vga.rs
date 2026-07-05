@@ -5,6 +5,7 @@
 //! to the platform's present sink. One VGA, emulated once, kernel-side; the
 //! backends only supply a framebuffer.
 
+use crate::Regs;
 use super::*;
 
 // ============================================================================
@@ -524,7 +525,7 @@ pub fn planar_active() -> bool {
 /// React to a Sequencer register write (port 0x3C5) that may change the
 /// chain-4 mode or the plane-select mask. Drives the A0000 paging alias.
 /// `pc.vga` already holds the post-write register values.
-pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Vcpu<A>) {
+pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
     if vga_present() {
         return; // a real card does its own plane routing
     }
@@ -539,7 +540,7 @@ pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             let currently_planar = planar_active();
             if unchained && !currently_planar {
                 let mut chained = alloc::vec![0u8; 0x10000];
-                regs.copy_from(A0000, &mut chained);
+                machine.copy_from(A0000, &mut chained);
                 arm_planar(machine, &mut pc.vga, Some(&chained));
             } else if !unchained && currently_planar {
                 disarm_planar(machine, &pc.vga, regs, true);
@@ -579,12 +580,12 @@ fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, seed: Option<
 /// the planes back into a linear A0000 image first (the Mode-X unchain→chain
 /// hop, which expects the 13h view preserved); skip it when simply leaving
 /// graphics for text (the next mode-set clears the screen anyway).
-fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &VgaState, regs: &mut Vcpu<A>, merge: bool) {
+fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &VgaState, regs: &mut Regs, merge: bool) {
     machine.map_fresh_range(A0000 >> 12, 16);
     if merge {
         let mut chained = alloc::vec![0u8; 0x10000];
         lib::vga_render::chain4_merge(&vga.planes, &mut chained);
-        regs.copy_to(A0000, &chained);
+        machine.copy_to(A0000, &chained);
     }
     A0000_TARGET.store(0xFF, Ordering::Relaxed);
 }
@@ -674,7 +675,7 @@ pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
 pub fn on_set_mode<A: crate::Arch>(
     machine: &mut A,
     pc: &mut PcMachine,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     mode: u8,
     clear: bool,
 ) {
@@ -785,7 +786,7 @@ pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
 ///
 /// Each mode uses the ROM font matching its character-cell height: the authentic
 /// IBM 8×8 (200-line modes + 13h), 8×14 (EGA 350-line), or 8×16 (VGA 480-line).
-pub fn bios_draw_glyph<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaState, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
+pub fn bios_draw_glyph<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga: &mut VgaState, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
     let (cell_h, font): (u32, &[u8]) = match mode {
         0x0F | 0x10 => (14, &lib::vga_fonts::FONT_8X14),
         0x11 | 0x12 => (16, &lib::vga_fonts::FONT_8X16),
@@ -804,7 +805,7 @@ pub fn bios_draw_glyph<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaState, m
                 let py = py0 + gy;
                 for gx in 0..8u32 {
                     let color = if bits & (0x80 >> gx) != 0 { fg } else { 0 };
-                    regs.write::<u8>(0xA0000 + (py * 320 + px0 + gx) as usize, color);
+                    machine.write::<u8>(0xA0000 + (py * 320 + px0 + gx) as usize, color);
                 }
             }
         }
@@ -820,9 +821,9 @@ pub fn bios_draw_glyph<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaState, m
                     let color = if bits & (0x80 >> gx) != 0 { fg & 0x03 } else { 0 };
                     let off = bank + (px / 4) as usize;
                     let shift = 6 - (px & 3) * 2;
-                    let mut b: u8 = regs.read(off);
+                    let mut b: u8 = machine.read(off);
                     b = (b & !(0x03 << shift)) | (color << shift);
-                    regs.write::<u8>(off, b);
+                    machine.write::<u8>(off, b);
                 }
             }
         }
@@ -836,9 +837,9 @@ pub fn bios_draw_glyph<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaState, m
                     let px = px0 + gx;
                     let off = bank + (px / 8) as usize;
                     let mask = 0x80u8 >> (px & 7);
-                    let mut b: u8 = regs.read(off);
+                    let mut b: u8 = machine.read(off);
                     if bits & (0x80 >> gx) != 0 { b |= mask; } else { b &= !mask; }
-                    regs.write::<u8>(off, b);
+                    machine.write::<u8>(off, b);
                 }
             }
         }
@@ -888,7 +889,7 @@ fn opsize(op32: bool, byte_op: bool) -> u32 {
 
 /// Read/write an integer GP register by encoding `idx` and size `sz` (bytes).
 /// Maps the x86 register order (0=A,1=C,2=D,3=B,4=SP/AH..,5=BP/CH,6=SI,7=DI).
-fn gpr<A: crate::Arch>(regs: &mut Vcpu<A>, idx: u8, sz: u32) -> u32 {
+fn gpr(regs: &mut Regs, idx: u8, sz: u32) -> u32 {
     let full = match idx & 7 {
         0 => regs.rax, 1 => regs.rcx, 2 => regs.rdx, 3 => regs.rbx,
         4 => regs.frame.rsp, 5 => regs.rbp, 6 => regs.rsi, _ => regs.rdi,
@@ -901,8 +902,8 @@ fn gpr<A: crate::Arch>(regs: &mut Vcpu<A>, idx: u8, sz: u32) -> u32 {
     } else if sz == 2 { full & 0xFFFF } else { full }
 }
 
-fn set_gpr<A: crate::Arch>(regs: &mut Vcpu<A>, idx: u8, sz: u32, val: u32) {
-    fn slot<A: crate::Arch>(regs: &mut Vcpu<A>, i: u8) -> &mut u64 {
+fn set_gpr(regs: &mut Regs, idx: u8, sz: u32, val: u32) {
+    fn slot(regs: &mut Regs, i: u8) -> &mut u64 {
         match i & 7 {
             0 => &mut regs.rax, 1 => &mut regs.rcx, 2 => &mut regs.rdx, 3 => &mut regs.rbx,
             4 => &mut regs.frame.rsp, 5 => &mut regs.rbp, 6 => &mut regs.rsi, _ => &mut regs.rdi,
@@ -925,7 +926,7 @@ fn set_gpr<A: crate::Arch>(regs: &mut Vcpu<A>, idx: u8, sz: u32, val: u32) {
 /// `sz` bytes, leaving the rest of EFLAGS untouched. CF/AF/OF are supplied by
 /// the caller (they depend on the operation); PF (always the low byte), ZF, and
 /// SF (the operand-width sign bit) derive from the result.
-fn write_flags<A: crate::Arch>(regs: &mut Vcpu<A>, res: u32, sz: u32, cf: bool, af: bool, of: bool) {
+fn write_flags(regs: &mut Regs, res: u32, sz: u32, cf: bool, af: bool, of: bool) {
     const MASK: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
     let msb = 1u32 << (sz * 8 - 1);
     let mut f = regs.frame.rflags & !MASK;
@@ -956,7 +957,7 @@ fn write_flags<A: crate::Arch>(regs: &mut Vcpu<A>, res: u32, sz: u32, cf: bool, 
 /// CF/OF/AF per the x86 spec; the arithmetic ops follow the standard
 /// borrow/overflow definitions. CMP computes a subtraction for flags but the
 /// caller discards the returned value. Inputs/outputs are masked to `sz`.
-fn alu<A: crate::Arch>(regs: &mut Vcpu<A>, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
+fn alu(regs: &mut Regs, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
     let bits = sz * 8;
     let mask = if sz == 4 {
         0xFFFF_FFFFu32
@@ -1035,14 +1036,14 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 /// `def32` (default operand & address size) are resolved by the caller, which
 /// has the LDT. Returns false (→ real SEGV) for an instruction we don't model,
 /// so a gap is loud rather than silent corruption.
-pub fn handle_planar_fault<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaState, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
+pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga: &mut VgaState, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
     let vm86 = regs.mode() == crate::UserMode::VM86;
     let ip0 = if def32 { regs.ip32() } else { regs.ip32() & 0xFFFF };
     // Pre-read the instruction (max 15 bytes) into a buffer so decoding doesn't
     // hold a borrow of `regs` while the emulation below mutates it.
     let mut buf = [0u8; 16];
     for k in 0..16u32 {
-        buf[k as usize] = regs.read::<u8>((cs_base.wrapping_add(ip0).wrapping_add(k)) as usize);
+        buf[k as usize] = machine.read::<u8>((cs_base.wrapping_add(ip0).wrapping_add(k)) as usize);
     }
     let peek = |o: u32| -> u8 { buf[(o & 15) as usize] };
 
@@ -1263,12 +1264,12 @@ pub fn handle_planar_fault<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaStat
                     let byte = if (0xA0000..0xB0000).contains(&src) {
                         vram_read(vga, src - 0xA0000)
                     } else {
-                        regs.read::<u8>(src as usize)
+                        machine.read::<u8>(src as usize)
                     };
                     if (0xA0000..0xB0000).contains(&dst) {
                         vram_write(vga, dst - 0xA0000, byte);
                     } else {
-                        regs.write::<u8>(dst as usize, byte);
+                        machine.write::<u8>(dst as usize, byte);
                     }
                 }
                 if df { si = si.wrapping_sub(sz); di = di.wrapping_sub(sz); }
@@ -1348,8 +1349,8 @@ pub fn handle_planar_fault<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaStat
                 for b in 0..sz {
                     let s = ds_base.wrapping_add(si).wrapping_add(b);
                     let d = es_base.wrapping_add(di).wrapping_add(b);
-                    let sb = if (0xA0000..0xB0000).contains(&s) { vram_read(vga, s - 0xA0000) } else { regs.read::<u8>(s as usize) };
-                    let db = if (0xA0000..0xB0000).contains(&d) { vram_read(vga, d - 0xA0000) } else { regs.read::<u8>(d as usize) };
+                    let sb = if (0xA0000..0xB0000).contains(&s) { vram_read(vga, s - 0xA0000) } else { machine.read::<u8>(s as usize) };
+                    let db = if (0xA0000..0xB0000).contains(&d) { vram_read(vga, d - 0xA0000) } else { machine.read::<u8>(d as usize) };
                     src1 |= (sb as u32) << (b * 8);
                     src2 |= (db as u32) << (b * 8);
                 }
@@ -1446,10 +1447,10 @@ pub fn handle_planar_fault<A: crate::Arch>(regs: &mut Vcpu<A>, vga: &mut VgaStat
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
 /// a slice — the one copy linear modes (mode 13h / text) can't avoid, since that
 /// VRAM is guest memory the kernel can't address as a flat region.
-fn read_aperture<'a, A: crate::Arch>(regs: &Vcpu<A>, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
+fn read_aperture<'a, A: crate::Arch>(machine: &mut A, regs: &Regs, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
     buf.clear();
     buf.resize(len, 0);
-    regs.copy_from(addr, buf);
+    machine.copy_from(addr, buf);
     buf
 }
 
@@ -1459,7 +1460,7 @@ impl VgaState {
     /// line-compare that select the visible window. Planar modes render our own
     /// `planes` in place (no copy); linear modes copy their guest aperture into
     /// `scratch`. `None` for a mode the renderer doesn't draw.
-    fn scanout<'a, A: crate::Arch>(&'a self, regs: &Vcpu<A>, scratch: &'a mut alloc::vec::Vec<u8>)
+    fn scanout<'a, A: crate::Arch>(&'a self, machine: &mut A, regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>)
         -> Option<lib::vga_render::Frame<'a>>
     {
         use lib::vga_render::{Frame, VgaMode};
@@ -1474,7 +1475,7 @@ impl VgaState {
                 mode: VgaMode::LinearSvga {
                     w: self.svga_w, h: self.svga_h, bpp: self.svga_bpp, pitch: pitch as u16,
                 },
-                vram: read_aperture(regs, scratch, SVGA_LFB_BASE, size),
+                vram: read_aperture(machine, regs, scratch, SVGA_LFB_BASE, size),
                 planes: &[],
                 ac: &self.ac,
                 palette: &self.dac,
@@ -1486,16 +1487,16 @@ impl VgaState {
                 line_compare: usize::MAX,
             });
         }
-        let mode = self.classify_mode(regs)?;
+        let mode = self.classify_mode(machine, regs)?;
         let (_w, h) = lib::vga_render::dimensions(mode);
         let (vram, planes): (&[u8], &[u8]) = match mode {
             VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
             // Read the whole 64 KB window, not just w*h: a panned display-start
             // (screen-shake) slides the scanout origin forward, so the visible
             // window can reach past the nominal 320×200 = 64000 bytes.
-            VgaMode::Mode13h => (read_aperture(regs, scratch, 0xA0000, 0x10000), &[]),
-            VgaMode::Text80x25 => (read_aperture(regs, scratch, 0xB8000, 80 * 25 * 2), &[]),
-            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(regs, scratch, 0xB8000, 0x4000), &[]),
+            VgaMode::Mode13h => (read_aperture(machine, regs, scratch, 0xA0000, 0x10000), &[]),
+            VgaMode::Text80x25 => (read_aperture(machine, regs, scratch, 0xB8000, 80 * 25 * 2), &[]),
+            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, regs, scratch, 0xB8000, 0x4000), &[]),
             VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
         };
         // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
@@ -1537,9 +1538,9 @@ impl VgaState {
     /// here and its resolution comes from the CRTC it programmed. Otherwise
     /// defer to `classify`, honouring the CRTC Offset as the in-memory row
     /// stride for smooth-scrollers (Keen's wide virtual screen).
-    fn classify_mode<A: crate::Arch>(&self, regs: &Vcpu<A>) -> Option<lib::vga_render::VgaMode> {
+    fn classify_mode<A: crate::Arch>(&self, machine: &mut A, regs: &Regs) -> Option<lib::vga_render::VgaMode> {
         use lib::vga_render::{self, VgaMode};
-        let bda_mode = regs.read::<u8>(0x449);
+        let bda_mode = machine.read::<u8>(0x449);
         if planar_active() && bda_mode == 0x13 {
             let row_bytes = if self.crtc[0x13] != 0 { self.crtc[0x13] as u16 * 2 } else { 80 };
             let v_end = self.crtc[0x12] as u16
@@ -1585,7 +1586,7 @@ fn frame_due(now_ticks: u64) -> bool {
 /// Render the emulated VGA's displayed frame to the platform present sink (the
 /// GOP framebuffer on UEFI metal, the window/screenshot mailbox on hosted).
 /// Free when a real card scans out directly or no sink is installed.
-pub fn display_tick<A: crate::Arch>(pc: &mut PcMachine, regs: &Vcpu<A>, now_ticks: u64) {
+pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &Regs, now_ticks: u64) {
     use lib::vga_render;
     if vga_present() || !vga_render::present_sink_installed() {
         return;
@@ -1594,7 +1595,7 @@ pub fn display_tick<A: crate::Arch>(pc: &mut PcMachine, regs: &Vcpu<A>, now_tick
         return;
     }
     let mut scratch = alloc::vec::Vec::new();
-    let Some(frame) = pc.vga.scanout(regs, &mut scratch) else { return };
+    let Some(frame) = pc.vga.scanout(machine, regs, &mut scratch) else { return };
     let (w, h) = vga_render::dimensions(frame.mode);
     let mut fb = alloc::vec![0u32; w * h];
     vga_render::render(&frame, &mut fb);

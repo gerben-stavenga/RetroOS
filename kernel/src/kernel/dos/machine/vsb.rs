@@ -13,6 +13,7 @@
 //!    playback from the guest's DMA buffer into the canonical kernel `sound`
 //!    API (`audio_tick`), with no real-card interaction at all.
 
+use crate::Regs;
 use super::*;
 
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
@@ -199,7 +200,7 @@ impl SoundBlaster {
     /// state and OMF2's sound-init probe falls into a "wait for the card
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
-    pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
+    pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
         if self.emulated() {
             // No real card / no buffer alias in emulation: just stop the
             // software DSP so the next program sees a clean, idle card.
@@ -354,7 +355,7 @@ impl SoundBlaster {
     /// (re)armed, alias the guest's DMA buffer onto that channel's
     /// permanent host buffer and program the real 8237. A no-op until the
     /// guest finishes a count write (the per-block re-arm signal).
-    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
+    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
         if self.emulated() {
             // No real chip to program / no buffer to alias: the virtual-8237
             // `prog` is already captured (io_write), and the software DSP reads
@@ -395,7 +396,7 @@ impl SoundBlaster {
     /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
     /// virtual-8237 state after a task switch).
     #[allow(clippy::too_many_arguments)]
-    fn arm<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A>, chan: usize, host: usize, is16: bool,
+    fn arm<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
@@ -437,14 +438,14 @@ impl SoundBlaster {
             // Snapshot the guest's pre-filled content — whole pages, so the
             // unrelated neighbour bytes on partial end pages survive.
             let mut snap = alloc::vec![0u8; span];
-            regs.copy_from(vbase, &mut snap);
+            machine.copy_from(vbase, &mut snap);
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
             machine.unmap_range(vbase >> 12, num_pages);
             machine.map_phys_range(
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
-            regs.copy_to(vbase, &snap);
+            machine.copy_to(vbase, &snap);
             self.bound_chan  = chan as u8;
             self.bound_host  = host as u8;
             self.bound_gpa   = gpa;
@@ -464,15 +465,15 @@ impl SoundBlaster {
     /// them, so the partial-end-page neighbour data survives and the guest
     /// can reuse the linear range. The channel buffer is permanent. No-op
     /// when nothing is bound.
-    fn unbind<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
+    fn unbind<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
         if self.bound_gpa == 0 { return; }
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
-        regs.copy_from(vbase, &mut snap);
+        machine.copy_from(vbase, &mut snap);
         machine.map_fresh_range(
             self.bound_vpage, self.bound_pages);
-        regs.copy_to(vbase, &snap);
+        machine.copy_to(vbase, &snap);
         self.bound_chan  = 0xFF;
         self.bound_host  = 0xFF;
         self.bound_gpa   = 0;
@@ -486,7 +487,7 @@ impl SoundBlaster {
     /// the real 8237 channel so the card stops pulling a buffer that's no
     /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
     /// replays it. Must run with this task's address space active.
-    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
+    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
         if self.emulated() { return; } // no real chip / alias to detach
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
@@ -498,7 +499,7 @@ impl SoundBlaster {
     /// re-alias every channel the virtual 8237 still shows armed and
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
-    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A>) {
+    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
         if self.emulated() { return; }
         if !self.suspended { return; }
         self.suspended = false;
@@ -732,7 +733,7 @@ impl SoundBlaster {
     pub fn audio_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
-        regs: &mut Vcpu<A>,
+        regs: &mut Regs,
         vpic: &mut super::vpic::VirtualPic,
     ) {
         if !self.emulated() {
@@ -795,7 +796,7 @@ impl SoundBlaster {
 
     /// Copy `count` ring frames (from `cursor`, wrapping) out of guest memory
     /// and hand them to the kernel sound layer.
-    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Vcpu<A>, count: u64) {
+    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, count: u64) {
         let channels = if self.emu.stereo { 2u32 } else { 1 };
         let frame_bytes = (self.emu.bits as u32 / 8) * channels;
         if frame_bytes == 0 || self.emu.buf_frames == 0 {
@@ -812,7 +813,7 @@ impl SoundBlaster {
             let run = remaining.min((self.emu.buf_frames - pos) as u64) as u32;
             let mut scratch = alloc::vec![0u8; (run * frame_bytes) as usize];
             let addr = self.emu.buf_gpa as usize + (pos * frame_bytes) as usize;
-            regs.copy_from(addr, &mut scratch);
+            machine.copy_from(addr, &mut scratch);
             crate::kernel::sound::play(machine, self.emu.rate, fmt, &scratch);
             remaining -= run as u64;
             pos += run;

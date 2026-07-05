@@ -43,6 +43,7 @@
 //! in the continuation so one return path can write results back, restore
 //! GP regs, and restore `other_stack`.
 
+use crate::Regs;
 use arch_abi::GuestBytes;
 use super::dosabi as dos;
 use crate::Vcpu;
@@ -132,7 +133,7 @@ pub(super) struct HostContinuation {
 pub(super) const HOST_CONTINUATION_SIZE: u32 = core::mem::size_of::<HostContinuation>() as u32;
 
 impl HostContinuation {
-    pub fn capture<A: crate::Arch>(regs: &Vcpu<A>, other_stack: Option<(u16, u32)>, rm_call_struct_addr: Option<u32>) -> Self {
+    pub fn capture(regs: &Regs, other_stack: Option<(u16, u32)>, rm_call_struct_addr: Option<u32>) -> Self {
         let (other_ss, other_sp) = other_stack.unwrap_or((0, 0));
         Self {
             eip:    regs.ip32(),
@@ -150,7 +151,7 @@ impl HostContinuation {
         }
     }
 
-    pub fn restore<A: crate::Arch>(&self, regs: &mut Vcpu<A>) {
+    pub fn restore(&self, regs: &mut Regs) {
         regs.frame.cs  = self.cs as u64;
         regs.frame.rip = self.eip as u64;
         regs.set_flags32(self.eflags);
@@ -186,7 +187,7 @@ pub(super) struct RmCallStruct {
 }
 
 impl RmCallStruct {
-    pub fn capture<A: crate::Arch>(regs: &Vcpu<A>) -> Self {
+    pub fn capture<A: crate::Arch>(machine: &mut A, regs: &Regs) -> Self {
         Self {
             edi: regs.rdi as u32, esi: regs.rsi as u32, ebp: regs.rbp as u32, _reserved: 0,
             ebx: regs.rbx as u32, edx: regs.rdx as u32, ecx: regs.rcx as u32, eax: regs.rax as u32,
@@ -196,7 +197,7 @@ impl RmCallStruct {
         }
     }
 
-    pub fn restore_gp<A: crate::Arch>(&self, regs: &mut Vcpu<A>) {
+    pub fn restore_gp(&self, regs: &mut Regs) {
         regs.rax = (regs.rax & !0xFFFFFFFF) | self.eax as u64;
         regs.rbx = (regs.rbx & !0xFFFFFFFF) | self.ebx as u64;
         regs.rcx = (regs.rcx & !0xFFFFFFFF) | self.ecx as u64;
@@ -241,7 +242,7 @@ pub(super) fn host_stack_pm_seg<A: crate::Arch>(dos: &thread::DosState<A>) -> u1
 ///     `(SS, SP)` was stashed in `other_stack` at the toggle that put
 ///     us on rm. Read it back.
 #[inline]
-pub(super) fn pm_get_stack<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>) -> (u16, u32) {
+pub(super) fn pm_get_stack<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> (u16, u32) {
     match dos.pc.locked_stack.other_stack {
         None => (host_stack_pm_seg(dos), dos::host_stack_empty_sp()),
         Some(p) if regs.mode() == crate::UserMode::VM86 => p,
@@ -268,7 +269,7 @@ pub(super) fn rm_get_stack<A: crate::Arch>(dos: &thread::DosState<A>) -> (u16, u
     dos.pc.locked_stack.other_stack.unwrap_or_else(fresh_rm_stack)
 }
 
-fn rm_cursor_for_pm_entry<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>) -> (u16, u32) {
+fn rm_cursor_for_pm_entry<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> (u16, u32) {
     match dos.pc.locked_stack.other_stack {
         None => fresh_rm_stack(),
         Some(cursor) if regs.mode() != crate::UserMode::VM86 => cursor,
@@ -281,8 +282,8 @@ fn rm_cursor_for_pm_entry<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu
 /// post-push (SS, SP). Private — recipes go through `push_continuation_and_switch_to_pm_side`
 /// or `push_continuation_and_switch_to_rm_side`, the only entry points to the locked-stack
 /// chain.
-fn push_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
-    push_continuation_at_cursor(dos, regs, rm_call_struct_addr, None)
+fn push_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+    push_continuation_at_cursor(machine, dos, regs, rm_call_struct_addr, None)
 }
 
 /// `push_continuation` with an optional explicit pm-side (SS, SP) target
@@ -290,12 +291,12 @@ fn push_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut V
 /// which must place its frames in the host stack's exception region — the
 /// chain cursor may point at the client's own stack, where the client's
 /// exception handler is entitled to scribble (see `dos::EXC_STACK_TOP`).
-fn push_continuation_at_cursor<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
+fn push_continuation_at_cursor<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
     let save = HostContinuation::capture(regs, dos.pc.locked_stack.other_stack, rm_call_struct_addr);
     let (ss, sp) = cursor.unwrap_or_else(|| pm_get_stack(dos, regs));
     let new_sp = sp - HOST_CONTINUATION_SIZE;
     let addr = pm_addr(&dos.ldt[..], (ss, new_sp));
-    regs.write::<HostContinuation>((addr) as usize, save);
+    machine.write::<HostContinuation>((addr) as usize, save);
     {
         let (c, e, s2, p, r) = (save.cs, save.eip, save.ss, save.esp, save.rm_call_struct_addr);
         dos_trace!("[HC push] @{:04x}:{:#x} (lin={:#x}) save cs:eip={:04x}:{:#x} ss:esp={:04x}:{:#x} other={:?} rmcs={:#x}",
@@ -307,15 +308,15 @@ fn push_continuation_at_cursor<A: crate::Arch>(dos: &mut thread::DosState<A>, re
 /// Read the topmost HostContinuation on the pm side. The caller follows
 /// with `resume_continuation`, which restores SS:SP and `other_stack`, so
 /// the post-pop cursor does not need to live anywhere.
-pub(super) fn pop_continuation<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>) -> HostContinuation {
-    pop_continuation_at(regs, &dos.ldt[..], pm_get_stack(dos, regs))
+pub(super) fn pop_continuation<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) -> HostContinuation {
+    pop_continuation_at(machine, regs, &dos.ldt[..], pm_get_stack(dos, regs))
 }
 
 /// Read a HostContinuation at an explicit (SS, SP). Used by recipes that
 /// know the pm-side cursor directly.
-pub(super) fn pop_continuation_at<A: crate::Arch>(regs: &Vcpu<A>, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
+pub(super) fn pop_continuation_at<A: crate::Arch>(machine: &mut A, regs: &Regs, ldt: &[u64], cursor: (u16, u32)) -> HostContinuation {
     let addr = pm_addr(ldt, cursor);
-    let save = regs.read::<HostContinuation>((addr) as usize);
+    let save = machine.read::<HostContinuation>((addr) as usize);
     {
         let (c, e, s2, p, r) = (save.cs, save.eip, save.ss, save.esp, save.rm_call_struct_addr);
         dos_trace!("[HC pop ] @{:04x}:{:#x} (lin={:#x}) save cs:eip={:04x}:{:#x} ss:esp={:04x}:{:#x} other={:?} rmcs={:#x}",
@@ -324,11 +325,11 @@ pub(super) fn pop_continuation_at<A: crate::Arch>(regs: &Vcpu<A>, ldt: &[u64], c
     save
 }
 
-pub(super) fn resume_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, save: HostContinuation) {
+pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, save: HostContinuation) {
     let saved_regs = save.rm_call_struct_addr().map(|addr| {
-        let current = RmCallStruct::capture(regs);
-        let saved = regs.read::<RmCallStruct>((addr) as usize);
-        regs.write::<RmCallStruct>((addr) as usize, current);
+        let current = RmCallStruct::capture(machine, regs);
+        let saved = machine.read::<RmCallStruct>((addr) as usize);
+        machine.write::<RmCallStruct>((addr) as usize, current);
         saved
     });
 
@@ -338,8 +339,8 @@ pub(super) fn resume_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>,
     if let Some(saved) = saved_regs {
         saved.restore_gp(regs);
         if regs.mode() == crate::UserMode::VM86 {
-            let ret_ip = machine::vm86_pop(regs);
-            let ret_cs = machine::vm86_pop(regs);
+            let ret_ip = machine::vm86_pop(machine, regs);
+            let ret_cs = machine::vm86_pop(machine, regs);
             machine::set_vm86_ip(regs, ret_ip);
             machine::set_vm86_cs(regs, ret_cs);
         }
@@ -371,21 +372,21 @@ pub(super) fn resume_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>,
 ///
 /// The caller must then choose PM `CS:EIP` and may add recipe-specific
 /// frames above the HostContinuation before finalizing `regs.SP`.
-pub(super) fn push_continuation_and_switch_to_pm_side<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
-    push_continuation_and_switch_to_pm_side_at(dos, regs, rm_call_struct_addr, None)
+pub(super) fn push_continuation_and_switch_to_pm_side<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+    push_continuation_and_switch_to_pm_side_at(machine, dos, regs, rm_call_struct_addr, None)
 }
 
 /// `push_continuation_and_switch_to_pm_side` with an optional explicit
 /// pm-side cursor for the HostContinuation (see `push_continuation_at_cursor`).
-pub(super) fn push_continuation_and_switch_to_pm_side_at<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
-    if_record(IF_SWITCH_PM, regs, if_bit(regs), if_bit(regs),
+pub(super) fn push_continuation_and_switch_to_pm_side_at<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
+    if_record(IF_SWITCH_PM, regs, if_bit(machine, regs), if_bit(machine, regs),
         dos.pc.locked_stack.other_stack);
     // Track where the RM side should resume if this PM entry reflects
     // back to real mode. First entry must use the dedicated RM stack;
     // a VM86 caller's own stack may be too small for BIOS/DOS handlers.
     // HostContinuation still captures the interrupted SS:SP for final restore.
     let next_rm_cursor = rm_cursor_for_pm_entry(dos, regs);
-    let pm_save_at = push_continuation_at_cursor(dos, regs, rm_call_struct_addr, cursor);
+    let pm_save_at = push_continuation_at_cursor(machine, dos, regs, rm_call_struct_addr, cursor);
     regs.frame.ss  = pm_save_at.0 as u64;
     regs.frame.rsp = pm_save_at.1 as u64;
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
@@ -403,9 +404,9 @@ pub(super) fn push_continuation_and_switch_to_pm_side_at<A: crate::Arch>(dos: &m
 /// The caller must then choose RM `CS:EIP` and may add recipe-specific
 /// PM-side frames above the HostContinuation. If it does, it must update
 /// `other_stack` to the new topmost PM cursor before returning to user code.
-pub(super) fn push_continuation_and_switch_to_rm_side<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>,
+pub(super) fn push_continuation_and_switch_to_rm_side<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs,
                                 rm_dest: (u16, u32), rm_call_struct_addr: Option<u32>) -> (u16, u32) {
-    let pm_save_at = push_continuation(dos, regs, rm_call_struct_addr);
+    let pm_save_at = push_continuation(machine, dos, regs, rm_call_struct_addr);
     regs.frame.ss  = rm_dest.0 as u64;
     regs.frame.rsp = rm_dest.1 as u64;
     regs.frame.rflags |= machine::VM_FLAG as u64;
@@ -515,19 +516,19 @@ fn synthetic_host_iret_target() -> (u16, u32) {
 ///   - Run. The handler's eventual IRET pops the frame and resumes the
 ///     client directly — no kernel involvement, no snapshot, no stack
 ///     switch.
-pub(super) fn deliver_pm_int<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, vector: u8) -> thread::KernelAction {
+pub(super) fn deliver_pm_int<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     let (sel, off) = dos.pm_vectors[vector as usize];
     let frame_use32 = match dos.dpmi.as_ref() {
         Some(dpmi) => dpmi.client_use32,
         None => return thread::KernelAction::Done,
     };
-    push_iret_frame(&dos.ldt[..], regs, frame_use32,
+    push_iret_frame(machine, &dos.ldt[..], regs, frame_use32,
         regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
     if sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2 {
         let (stub_sel, stub_off) = synthetic_host_iret_target();
         regs.set_cs32(stub_sel as u32);
         regs.set_ip32(stub_off);
-        return reflect_int_to_real_mode(dos, regs, vector);
+        return reflect_int_to_real_mode(machine, dos, regs, vector);
     }
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
@@ -600,7 +601,7 @@ pub(super) static mut IF_RING: [IfEvt; IF_RING_LEN] = [IfEvt {
 pub(super) static mut IF_RING_POS: usize = 0;
 
 #[inline]
-pub(super) fn if_record<A: crate::Arch>(tag: u8, regs: &Vcpu<A>, if_in: bool, if_out: bool,
+pub(super) fn if_record(tag: u8, regs: &Regs, if_in: bool, if_out: bool,
                         other: Option<(u16, u32)>) {
     unsafe {
         let i = IF_RING_POS % IF_RING_LEN;
@@ -619,7 +620,7 @@ pub(super) fn if_record<A: crate::Arch>(tag: u8, regs: &Vcpu<A>, if_in: bool, if
 
 /// The guest's virtual interrupt flag (VIF/bit 19) — the kernel's single store.
 #[inline]
-fn if_bit<A: crate::Arch>(regs: &Vcpu<A>) -> bool {
+fn if_bit<A: crate::Arch>(machine: &mut A, regs: &Regs) -> bool {
     regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
 }
 
@@ -644,7 +645,7 @@ pub(super) fn dump_if_ring() {
     }
 }
 
-pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, vector: u8) {
+pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) {
     let (sel, off) = dos.pm_vectors[vector as usize];
     unsafe {
         LAST_IRQ = (vector, sel, off, regs.code_seg(), regs.ip32(),
@@ -669,7 +670,7 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs
     //                   Same path as toggle, plus the empty default.
     let in_pm = regs.mode() != crate::UserMode::VM86;
     let nested_on_pm = in_pm && dos.pc.locked_stack.other_stack.is_some();
-    let pre_vif = if_bit(regs);
+    let pre_vif = if_bit(machine, regs);
     let delivery_tag = if nested_on_pm && default_vector { IF_PM_IRQ_NESTED_DEF }
                        else if nested_on_pm { IF_PM_IRQ_NESTED }
                        else { IF_PM_IRQ_FIRST };
@@ -688,7 +689,7 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs
         // (push_iret_frame uses regs.frame.ss for the segment base, so this
         // writes whatever stack the handler is currently on — DPMI 0.9 §3.1.2
         // permits handler SS != HOST_STACK_PM*).
-        push_iret_frame(&dos.ldt[..], regs, handler_use32,
+        push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
             regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
         None
     } else if nested_on_pm {
@@ -703,11 +704,11 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs
         // back. Without this the nested path left VIF=0 forever: the client's
         // timer firing inside a DPMI excursion → mainline spins on a tick now
         // permanently held (VIP=1) — the Doom/Duke3D startup hang in the wild.
-        let at = push_continuation(dos, regs, None);
+        let at = push_continuation(machine, dos, regs, None);
         regs.frame.ss = at.0 as u64;
         regs.frame.rsp = at.1 as u64;
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
-        push_iret_frame(&dos.ldt[..], regs, handler_use32,
+        push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
         Some(at)
     } else {
@@ -717,9 +718,9 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs
         // PM client). Recipe layers an iret-to-SLOT_RESUME_CONTINUATION frame above
         // the save so the eventual handler IRET round-trips through
         // the kernel for unwind.
-        let at = push_continuation_and_switch_to_pm_side(dos, regs, None);
+        let at = push_continuation_and_switch_to_pm_side(machine, dos, regs, None);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
-        push_iret_frame(&dos.ldt[..], regs, handler_use32,
+        push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
 
         // Zero DS/ES/FS/GS:
@@ -747,18 +748,18 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs
         let (stub_sel, stub_off) = synthetic_host_iret_target();
         regs.frame.cs = stub_sel as u64;
         regs.frame.rip = stub_off as u64;
-        let r = reflect_int_to_real_mode(dos, regs, vector);
+        let r = reflect_int_to_real_mode(machine, dos, regs, vector);
         // Use the actual pushed HC slot (nested-aware); fall back to the fixed
         // top slot only on the nested_on_pm path, which pushes no continuation.
         let pm_save_at = pushed_hc_at.unwrap_or((host_stack_pm_seg(dos),
                           dos::host_stack_empty_sp() - HOST_CONTINUATION_SIZE));
-        let hc1 = pop_continuation_at(regs, &dos.ldt[..], pm_save_at);
+        let hc1 = pop_continuation_at(machine, regs, &dos.ldt[..], pm_save_at);
         regs.ds = hc1.ds as u64;
         regs.es = hc1.es as u64;
         regs.fs = hc1.fs as u64;
         regs.gs = hc1.gs as u64;
         let _ = r;
-        if_record(delivery_tag, regs, pre_vif, if_bit(regs), Some((vector as u16, 0)));
+        if_record(delivery_tag, regs, pre_vif, if_bit(machine, regs), Some((vector as u16, 0)));
         return;
     }
 
@@ -769,7 +770,7 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs
     regs.frame.rflags &= !((machine::VM_FLAG | machine::VIF_FLAG | (1u32 << 8)) as u64);
     regs.frame.cs  = sel as u64;
     regs.frame.rip = off as u64;
-    if_record(delivery_tag, regs, pre_vif, if_bit(regs), Some((vector as u16, 0)));
+    if_record(delivery_tag, regs, pre_vif, if_bit(machine, regs), Some((vector as u16, 0)));
 }
 
 /// Push an IRET frame on the stack addressed by `regs.ss:regs.sp`, updating
@@ -777,7 +778,7 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(dos: &mut thread::DosState<A>, regs
 /// 32-bit handler (D=1), 6 bytes for 16-bit (D=0). This is the width the
 /// handler's `IRET` will use on its way back, so push and matching pop must
 /// agree on handler bitness, regardless of the client's overall size.
-pub(super) fn push_iret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>, handler_is_32: bool,
+pub(super) fn push_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
                    eip: u32, cs: u16, flags: u32) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
@@ -798,13 +799,13 @@ pub(super) fn push_iret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>, h
     let addr = base.wrapping_add(eff_sp);
     let a = addr as usize;
     if handler_is_32 {
-        regs.write::<u32>(a, eip);
-        regs.write::<u32>(a + 4, cs as u32);
-        regs.write::<u32>(a + 8, flags);
+        machine.write::<u32>(a, eip);
+        machine.write::<u32>(a + 4, cs as u32);
+        machine.write::<u32>(a + 8, flags);
     } else {
-        regs.write::<u16>(a, eip as u16);
-        regs.write::<u16>(a + 2, cs);
-        regs.write::<u16>(a + 4, flags as u16);
+        machine.write::<u16>(a, eip as u16);
+        machine.write::<u16>(a + 2, cs);
+        machine.write::<u16>(a + 4, flags as u16);
     }
     regs.set_sp32(sp);
 }
@@ -815,7 +816,7 @@ pub(super) fn push_iret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>, h
 /// `RETF` is what pops it. Used for MS-Mouse INT 33h AX=0Ch PM callbacks,
 /// which the driver enters with a FAR CALL and the handler ends with FAR RET
 /// (unlike HW IRQ / DPMI callbacks, which IRET — see `push_iret_frame`).
-pub(super) fn push_farret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>, handler_is_32: bool,
+pub(super) fn push_farret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
                    eip: u32, cs: u16) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
@@ -832,11 +833,11 @@ pub(super) fn push_farret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>,
     let addr = base.wrapping_add(eff_sp);
     let a = addr as usize;
     if handler_is_32 {
-        regs.write::<u32>(a, eip);
-        regs.write::<u32>(a + 4, cs as u32);
+        machine.write::<u32>(a, eip);
+        machine.write::<u32>(a + 4, cs as u32);
     } else {
-        regs.write::<u16>(a, eip as u16);
-        regs.write::<u16>(a + 2, cs);
+        machine.write::<u16>(a, eip as u16);
+        machine.write::<u16>(a + 2, cs);
     }
     regs.set_sp32(sp);
 }
@@ -844,7 +845,7 @@ pub(super) fn push_farret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>,
 /// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp.
 /// `handler_is_32` must match the width used at push time. Frame width
 /// follows handler.D; SP semantics follow SS.B (see `push_iret_frame`).
-pub(super) fn pop_iret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>, handler_is_32: bool) -> (u32, u16, u32) {
+pub(super) fn pop_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs: &mut Regs, handler_is_32: bool) -> (u32, u16, u32) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
     let stack_is_32 = seg_is_32(ldt, ss);
@@ -854,9 +855,9 @@ pub(super) fn pop_iret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>, ha
     let addr = base.wrapping_add(eff_sp);
     let a = addr as usize;
     let frame = if handler_is_32 {
-        (regs.read::<u32>(a), regs.read::<u32>(a + 4) as u16, regs.read::<u32>(a + 8))
+        (machine.read::<u32>(a), machine.read::<u32>(a + 4) as u16, machine.read::<u32>(a + 8))
     } else {
-        (regs.read::<u16>(a) as u32, regs.read::<u16>(a + 2), regs.read::<u16>(a + 4) as u32)
+        (machine.read::<u16>(a) as u32, machine.read::<u16>(a + 2), machine.read::<u16>(a + 4) as u32)
     };
     let new_sp = if stack_is_32 {
         sp_in.wrapping_add(frame_size)
@@ -881,7 +882,7 @@ pub(super) fn pop_iret_frame<A: crate::Arch>(ldt: &[u64], regs: &mut Vcpu<A>, ha
 /// synthetic host IRET after `resume_continuation_from_stub` restores the continuation:
 ///   - `SLOT_RESUME_CONTINUATION` for cross-mode HW-IRQ first-entry.
 ///   - The outer caller's CS:EIP for soft-INT and nested-HW-IRQ.
-pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) -> thread::KernelAction {
+pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
     if vector >= 0x10 {
@@ -901,7 +902,7 @@ pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thr
     // caller's; pop it so dpmi_api's results return to that caller.
     if vector == 0x31 {
         let use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
-        let (eip, cs, flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
+        let (eip, cs, flags) = pop_iret_frame(machine, &dos.ldt[..], regs, use32);
         regs.set_ip32(eip);
         regs.set_cs32(cs as u32);
         // The popped image is guest-view (the client's IF intent in the IF
@@ -914,7 +915,7 @@ pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thr
     let (stub_sel, stub_off) = synthetic_host_iret_target();
     regs.set_cs32(stub_sel as u32);
     regs.set_ip32(stub_off);
-    reflect_int_to_real_mode(dos, regs, vector)
+    reflect_int_to_real_mode(machine, dos, regs, vector)
 }
 
 
@@ -934,7 +935,7 @@ pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thr
 /// SLOT_RESUME_CONTINUATION. If the saved continuation target is the synthetic
 /// host IRET marker, `resume_continuation_from_stub` restores the PM state and
 /// immediately pops the frame the caller planted on the user stack.
-pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, vector: u8) -> thread::KernelAction {
+pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     // Run the RM handler on the dedicated RM stack — never the
     // client's own VM86 stack — so a HW IRQ landing during a sensitive
     // moment in the client (e.g. just after exec_return) can't trample
@@ -961,18 +962,18 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(dos: &mut thread::DosStat
     // through `linear()` which is PM-aware, or via the dedicated
     // pmdos_int21_handler short-circuit for 16-bit clients (`pm_dos`).
     let rm_dest = rm_get_stack(dos);
-    let _save_at = push_continuation_and_switch_to_rm_side(dos, regs, rm_dest, None);
+    let _save_at = push_continuation_and_switch_to_rm_side(machine, dos, regs, rm_dest, None);
 
-    let ivt_off = machine::read_u16(regs, 0, (vector as u32) * 4);
-    let ivt_seg = machine::read_u16(regs, 0, (vector as u32) * 4 + 2);
+    let ivt_off = machine::read_u16(machine, regs, 0, (vector as u32) * 4);
+    let ivt_seg = machine::read_u16(machine, regs, 0, (vector as u32) * 4 + 2);
 
     // Push trampoline IRET frame on the RM slab, mirroring what the CPU's
     // own INT n in real mode would push: FLAGS / CS / IP.
     let ret_off: u16 = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION);
     let ret_seg: u16 = dos::CTRL_STUB_SEG;
-    machine::vm86_push(regs, ret_flags);
-    machine::vm86_push(regs, ret_seg);
-    machine::vm86_push(regs, ret_off);
+    machine::vm86_push(machine, regs, ret_flags);
+    machine::vm86_push(machine, regs, ret_seg);
+    machine::vm86_push(machine, regs, ret_off);
 
     // Enter the RM handler with the guest's virtual IF (VIF) cleared (matches
     // CPU's INT-n: clears IF, preserves status flags) and IOPL=1. The real IF
@@ -981,12 +982,12 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(dos: &mut thread::DosStat
     // preserved by the read-modify-write.
     regs.frame.cs = ivt_seg as u64;
     regs.frame.rip = ivt_off as u64;
-    let if_was = if_bit(regs);
+    let if_was = if_bit(machine, regs);
     // vIOPL rides the flags unchanged (no IOPL force): the real IOPL is pinned
     // to 1 at the arch exit, so the RM-handler entry only needs VIF cleared.
     let new_flags = regs.flags32() & !machine::VIF_FLAG;
     regs.frame.rflags = new_flags as u64;
-    if_record(IF_REFLECT_RM, regs, if_was, if_bit(regs),
+    if_record(IF_REFLECT_RM, regs, if_was, if_bit(machine, regs),
         dos.pc.locked_stack.other_stack);
 
     // Per DPMI, the host must not translate PM selectors into RM paragraphs
@@ -1006,20 +1007,20 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(dos: &mut thread::DosStat
 /// the continuation; `resume_continuation` exchanges that register block and
 /// restores the suspended side. A synthetic host IRET target asks this function
 /// to consume a planted interrupt frame after restoring the continuation.
-pub(super) fn resume_continuation_from_stub<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>) {
+pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     const STATUS_MASK: u32 = 0x08D5;
-    let resume_if_in = if_bit(regs);
+    let resume_if_in = if_bit(machine, regs);
     let resume_other = dos.pc.locked_stack.other_stack;
     let current_status = regs.flags32() & STATUS_MASK;
 
-    let save = pop_continuation(dos, regs);
+    let save = pop_continuation(machine, dos, regs);
     let resumes_to_host_iret = save.cs as u16 == SPECIAL_STUB_SEL
         && save.eip == SYNTHETIC_HOST_IRET_EIP;
     let was_outermost = save.other_stack().is_none();
-    resume_continuation(dos, regs, save);
+    resume_continuation(machine, dos, regs, save);
     if resumes_to_host_iret {
         let use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
-        let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(&dos.ldt[..], regs, use32);
+        let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(machine, &dos.ldt[..], regs, use32);
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);
         // ret_flags is guest-observable; `apply_guest_flags` maps its IF slot
@@ -1036,7 +1037,7 @@ pub(super) fn resume_continuation_from_stub<A: crate::Arch>(dos: &mut thread::Do
     if was_outermost {
         super::IN_HW_IRQ_CONTEXT.store(false, core::sync::atomic::Ordering::Relaxed);
     }
-    if_record(IF_RESUME_CONTINUATION, regs, resume_if_in, if_bit(regs), resume_other);
+    if_record(IF_RESUME_CONTINUATION, regs, resume_if_in, if_bit(machine, regs), resume_other);
 
     dos_trace!("[DPMI] RESUME_CONTINUATION_STUB -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
         regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());

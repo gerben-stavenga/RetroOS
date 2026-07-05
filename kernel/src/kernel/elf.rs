@@ -5,6 +5,7 @@
 
 const PAGE_SIZE: usize = 4096;
 extern crate alloc;
+use crate::Regs;
 use alloc::vec::Vec;
 use arch_abi::GuestBytes;
 use crate::Vcpu;
@@ -42,7 +43,7 @@ pub struct LoadedElf {
 /// modern distro binary or the dynamic linker itself). Relocations are NOT
 /// applied here — for dynamically-linked images the interpreter (ld.so) does
 /// that; `load_bias` only places the segments.
-pub fn load_elf<A: crate::Arch>(machine: &mut A, regs: &mut Vcpu<A>, elf_data: &[u8], load_bias: usize) -> Result<LoadedElf, ElfError> {
+pub fn load_elf<A: crate::Arch>(machine: &mut A, regs: &mut Regs, elf_data: &[u8], load_bias: usize) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
     let mut max_vaddr = 0usize;
@@ -58,9 +59,9 @@ pub fn load_elf<A: crate::Arch>(machine: &mut A, regs: &mut Vcpu<A>, elf_data: &
         let end = vaddr + seg.memsz;
         if end > max_vaddr { max_vaddr = end; }
         if let Some(data) = seg.data {
-            regs.copy_to(vaddr, data);
+            machine.copy_to(vaddr, data);
             if seg.memsz > data.len() {
-                regs.zero(vaddr + data.len(), seg.memsz - data.len());
+                machine.zero(vaddr + data.len(), seg.memsz - data.len());
             }
         }
     }

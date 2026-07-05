@@ -9,7 +9,7 @@
 
 use super::paging2::RootPageTable;
 use super::x86::FxState;
-use arch_abi::{Arch, Irq, KernelEvent, Vcpu};
+use arch_abi::{Arch, Irq, KernelEvent, Regs, Vcpu};
 
 /// The bare-metal backend handle. Zero-sized today (state lives in module
 /// statics — `traps::REGS`, the timer/IRQ queue); it gains fields as those
@@ -40,26 +40,25 @@ impl Arch for Metal {
     // Bridge the loop-owned `Vcpu` to it around each call; the bridge copy is the
     // register file only (~200 B) — the address space / CR3 is touched only at
     // switch. (The internal frame goes away when the globals migrate into `Metal`.)
-    fn execute(&mut self, vcpu: &mut Vcpu<Self>) -> KernelEvent {
-        // `Vcpu` is move-only: SWAP ownership into the internal live frame for
-        // the duration of the run, then swap it back (no copy).
+    fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
+        // Bridge the loop-owned registers to the live trap frame for the run
+        // (the active SPACE already lives in `REGS.space`), then read them back.
         let live = unsafe { &mut *(&raw mut super::traps::REGS) };
-        core::mem::swap(live, vcpu);
+        core::mem::swap(&mut live.regs, regs);
         let ev = super::calls::do_arch_execute();
-        core::mem::swap(live, vcpu);
+        core::mem::swap(&mut live.regs, regs);
         ev
     }
-    fn switch_to(
-        &mut self,
-        live: &mut Vcpu<Self>,
-        swap: &mut Vcpu<Self>,
-        hash_ptr: *mut u64,
-        fx_ptr: *mut FxState,
-    ) {
-        let regs = unsafe { &mut *(&raw mut super::traps::REGS) };
-        core::mem::swap(regs, live);
-        super::calls::arch_switch_to(swap, hash_ptr, fx_ptr);
-        core::mem::swap(regs, live);
+    fn activate(&mut self, incoming: RootPageTable, fx_ptr: *mut Self::Fx, hash_ptr: *mut u64) -> RootPageTable {
+        // `activate` moves only the SPACE (registers are managed by `execute`).
+        // The metal SWITCH_TO handler swaps both regs and space with the live
+        // frame, so pass the CURRENT registers back in — they round-trip
+        // unchanged — while the `incoming` space swaps into the live root (CR3
+        // reload) and the displaced entries come back in `buf.space`.
+        let cur_regs = unsafe { (*(&raw const super::traps::REGS)).regs };
+        let mut buf = Vcpu::<Self>::new(cur_regs, incoming);
+        super::calls::arch_switch_to(&mut buf, hash_ptr, fx_ptr);
+        buf.space
     }
 
     // ── Timer ──

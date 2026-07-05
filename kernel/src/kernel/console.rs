@@ -14,6 +14,7 @@
 //! - Linux owners get keys cooked into their fds; they have no virtual
 //!   device bus for other IRQs.
 
+use crate::Regs;
 use crate::Vcpu;
 use crate::kernel::thread;
 
@@ -25,7 +26,7 @@ pub const F12_PRESS: u8 = 0x58;
 /// Drain pending input into the console owner.
 pub fn drain<A: crate::Arch>(
     machine: &mut A,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
 ) {
@@ -42,16 +43,19 @@ pub fn drain<A: crate::Arch>(
 /// behind a foreground Linux child).
 fn drain_dos<A: crate::Arch>(
     machine: &mut A,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     blocked: bool,
     dos: &mut thread::DosState<A>,
 ) {
     let dp = dos as *mut thread::DosState<A>;
-    machine.drain(&mut |evt| {
+    {
+        let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
+        machine.drain(&mut |evt| _events.push(evt));
+        for evt in _events {
         if matches!(evt, crate::Irq::Key(sc) if sc == F11_PRESS) {
             thread::request_switch();
         } else if matches!(evt, crate::Irq::Key(sc) if sc == F12_PRESS) {
-            crate::kernel::startup::dump_interrupted_thread(regs, Some(unsafe { &*dp }));
+            crate::kernel::startup::dump_interrupted_thread(machine, regs, Some(unsafe { &*dp }));
         } else if blocked {
             if let crate::Irq::Key(sc) = evt
                 && crate::kernel::keyboard::update_key_state(sc) {
@@ -64,32 +68,37 @@ fn drain_dos<A: crate::Arch>(
                 }
         } else {
             if let crate::Irq::Key(sc) = evt {
-                unsafe { (*dp).process_key(regs, sc) };
+                unsafe { (*dp).process_key(machine, regs, sc) };
             } else {
-                crate::kernel::dos::queue_irq(unsafe { &mut *dp }, regs, evt);
+                crate::kernel::dos::queue_irq(machine, unsafe { &mut *dp }, regs, evt);
             }
         }
-    });
+    }
+    }
 }
 
 /// Linux owner: keys → cooked fd input.
 fn drain_linux<A: crate::Arch>(
     machine: &mut A,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     linux: &mut thread::LinuxState,
 ) {
     let ktp = kt as *mut thread::KernelThread<A>;
     let lp = linux as *mut thread::LinuxState;
-    machine.drain(&mut |evt| {
+    {
+        let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
+        machine.drain(&mut |evt| _events.push(evt));
+        for evt in _events {
         if let crate::Irq::Key(sc) = evt {
             if sc == F11_PRESS {
                 thread::request_switch();
             } else if sc == F12_PRESS {
-                crate::kernel::startup::dump_interrupted_thread::<A>(regs, None);
+                crate::kernel::startup::dump_interrupted_thread(machine, regs, None);
             } else {
-                unsafe { (*lp).process_key(&(*ktp).fds, sc) };
+                unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
             }
         }
-    });
+    }
+    }
 }

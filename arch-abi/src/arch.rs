@@ -84,40 +84,34 @@ pub trait GuestBytes {
 }
 
 // =============================================================================
-// Vcpu — one execution context (registers + the address space they run in)
+// Vcpu — a thread's PARKED context (registers + its owned, inactive space)
 // =============================================================================
 
-/// Register state plus the address-space handle those registers execute in.
+/// A thread's saved execution context: its registers plus the OWNED address
+/// space they run in. This is the *parked* form — what a non-running thread
+/// stores. It is deliberately NOT the live/active context: the running thread's
+/// registers live in the event loop (a plain `&mut Regs`) and its address space
+/// is moved *into* the backend as the single active space ([`Arch::activate`]).
 ///
-/// This is the unit the kernel stores per thread and hands back to `Arch` to
-/// resume. It is parameterized by the whole backend `A: Arch`, and its `space`
-/// field is `A::PageTable` (a real per-thread root on metal, a software address
-/// space on the interp). Parameterizing over `A` — not just `A::PageTable` —
-/// keeps `A` **inferable** from any `Vcpu<A>` value: `A::PageTable` is a
-/// non-invertible projection, so `Vcpu<A::PageTable>` would force turbofish (or
-/// a `P: GuestBytes` split) everywhere, whereas `Vcpu<A>` lets every function
-/// be uniformly `<A: Arch>` with `A` recovered from the argument. The one cost
-/// is that this data type now names the `Arch` trait; every holder has an `A`
-/// in scope, so nothing is blocked.
-///
-/// Derefs to `Regs` so `vcpu.rax` / `vcpu.mode()` keep working and a
-/// `&mut Vcpu<A>` coerces where a `&mut Regs` is expected. Guest-memory access
-/// is the [`GuestBytes`] impl below, which forwards to `A::PageTable`.
-#[repr(C)]
+/// `space` is `A::PageTable` — an OWNED, move-only address-space handle. It is
+/// **not** the guest-memory accessor: guest memory is reached only through the
+/// *active* space, which the backend owns, so [`GuestBytes`] is implemented on
+/// `Arch` (the active-space accessor), never on a parked `Vcpu`. That is the
+/// principle — you can only touch memory that is active, which on metal is a
+/// hardware fact (a `deref` needs the live page tables), so the type system
+/// must not offer a way to read an inactive space.
 pub struct Vcpu<A: Arch> {
-    /// Architectural register state, including the program counter
-    /// (`regs.frame.rip`) and the mode (32/64/VM86, derived from CS/EFLAGS).
+    /// Architectural register state (program counter, mode, GPRs).
     pub regs: Regs,
-    /// Handle to the address space these registers run in. The arch context
-    /// switch swaps it into the live root on entry.
+    /// The thread's OWNED address space, dormant while parked. Activated by
+    /// moving it into the backend ([`Arch::activate`]); the displaced space
+    /// comes back and is re-parked here.
     pub space: A::PageTable,
 }
 
-// `Vcpu` is deliberately NOT `Copy`/`Clone`: its `space` is an OWNED address
-// space (a move-only resource), so a `Vcpu` names exactly one address space and
-// the type system forbids aliasing it. `Regs` is plain data (`Copy`) and can be
-// snapshotted on its own; the whole `Vcpu` moves. Switching threads is a
-// `mem::swap` of two `Vcpu`s — a genuine transfer of the space, not a copy.
+// `Vcpu` is NOT `Copy`/`Clone`: `space` is an owned, move-only resource, so a
+// `Vcpu` names exactly one address space and aliasing is a type error. `Regs`
+// is plain data and is snapshotted on its own; the space moves.
 
 impl<A: Arch> core::ops::Deref for Vcpu<A> {
     type Target = Regs;
@@ -128,7 +122,7 @@ impl<A: Arch> core::ops::DerefMut for Vcpu<A> {
 }
 
 impl<A: Arch> Vcpu<A> {
-    /// Bundle existing registers with an address-space handle.
+    /// Bundle registers with an owned address space (re-park after a switch).
     pub const fn new(regs: Regs, space: A::PageTable) -> Self {
         Vcpu { regs, space }
     }
@@ -136,22 +130,6 @@ impl<A: Arch> Vcpu<A> {
     pub fn empty() -> Self {
         Vcpu { regs: Regs::empty(), space: A::PageTable::default() }
     }
-}
-
-/// A `Vcpu` reaches guest memory through the address space it names — forward
-/// every memory op to `self.space` (the backend supplies the real impl on its
-/// page-table type). The `Vcpu` is *the* guest-memory handle: registers + the
-/// address space they run against, in one object, which the kernel already holds
-/// as `regs`/`vcpu` in every handler. So `regs.read(addr)` is the single way the
-/// kernel touches guest memory — there is no separate machine-side accessor.
-impl<A: Arch> GuestBytes for Vcpu<A> {
-    fn read<T: Copy>(&self, addr: usize) -> T { self.space.read(addr) }
-    fn write<T: Copy>(&mut self, addr: usize, val: T) { self.space.write(addr, val) }
-    fn copy_from(&self, addr: usize, dst: &mut [u8]) { self.space.copy_from(addr, dst) }
-    fn copy_to(&mut self, addr: usize, src: &[u8]) { self.space.copy_to(addr, src) }
-    fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize { self.space.copy_cstr(addr, dst) }
-    fn zero(&mut self, addr: usize, len: usize) { self.space.zero(addr, len) }
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize) { self.space.copy_within(src, dst, len) }
 }
 
 // =============================================================================
@@ -167,13 +145,15 @@ impl<A: Arch> GuestBytes for Vcpu<A> {
 /// So there is exactly one guest-memory path — the vcpu — and `Arch` is just the
 /// rest of the machine: CPU exec, ports, timer, IRQ lines, the page-table/fork/
 /// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
-pub trait Arch: Sized {
+pub trait Arch: Sized + GuestBytes {
     /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
-    /// space, so it is **not** `Copy`: a `Vcpu` moves rather than duplicating the
-    /// space. It is the guest-memory primitive (`GuestBytes` routes through it,
-    /// which is what makes `vcpu.read(addr)` work). `Default` supplies the empty
-    /// placeholder a `Vcpu` starts from and that `mem::swap` leaves behind.
-    type PageTable: GuestBytes + Default;
+    /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
+    /// duplicating the space. It is an OPAQUE owned handle — **not** a memory
+    /// accessor. Guest memory is reached only through the *active* space, so
+    /// `GuestBytes` is a supertrait of `Arch` (the active-space accessor), never
+    /// implemented on `PageTable` or a parked `Vcpu`. `Default` supplies the
+    /// empty placeholder a switch leaves behind in a now-running thread's slot.
+    type PageTable: Default;
     /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
     type Fx: Copy + Default;
 
@@ -200,30 +180,30 @@ pub trait Arch: Sized {
 
     // ── Execution & scheduling ─────────────────────────────────────────────
     //
-    // The event loop *owns* the live `Vcpu` (there is no `REGS` global). It hands
-    // a `&mut Vcpu` to `execute`, which resumes it and writes the post-run state
-    // back into the same `Vcpu` before returning the event. Because the loop owns
-    // the vcpu and `arch` is a separate borrow, handlers receive disjoint
-    // `(&mut arch, &mut vcpu)`, and a thread's memory rides on the vcpu itself
-    // (`Vcpu: GuestBytes`) — so the borrow checker, not a global, keeps them sound.
+    // The backend owns THE active context: the one active address space (and the
+    // live FPU). The event loop owns the running thread's *registers* (a plain
+    // `Regs`) and passes `&mut Regs` to `execute`; guest memory is reached
+    // through `self` (the active-space `GuestBytes`). Handlers therefore take
+    // disjoint `(&mut arch, &mut regs)` — registers on one side, machine + active
+    // memory on the other — and there is exactly one guest-memory path, the
+    // active space, so "you can only touch active memory" is enforced by types.
 
-    /// Resume `vcpu` and return the next kernel-visible event, leaving `vcpu`
-    /// holding the post-run register state.
-    fn execute(&mut self, vcpu: &mut Vcpu<Self>) -> KernelEvent;
+    /// Resume the active space with `regs` and return the next kernel-visible
+    /// event, leaving `regs` holding the post-run register state.
+    fn execute(&mut self, regs: &mut Regs) -> KernelEvent;
 
-    /// Context-switch: swap the live state (`live`) with the saved buffer
-    /// (`swap`) and make the now-incoming address space active. On entry `swap`
-    /// holds the incoming thread's state and `live` the outgoing thread's; on
-    /// return `live` holds the incoming state and `swap` the outgoing (which the
-    /// scheduler stores back into the parked thread). `hash_ptr` null ⇒ no
-    /// hashing; `fx_ptr` null ⇒ skip FPU swap.
-    fn switch_to(
+    /// Make `incoming` the active address space and return the displaced one
+    /// (the previously-active space, now parked). THIS is the switch pivot: the
+    /// scheduler moves a thread's space in and re-parks the old one. On metal it
+    /// loads CR3 / swaps the saved entries; on interp it sets the active pd.
+    /// Also swaps the live FPU with `fx` (in on entry, out on return); `hash_ptr`
+    /// null ⇒ no address-space hashing.
+    fn activate(
         &mut self,
-        live: &mut Vcpu<Self>,
-        swap: &mut Vcpu<Self>,
-        hash_ptr: *mut u64,
+        incoming: Self::PageTable,
         fx_ptr: *mut Self::Fx,
-    );
+        hash_ptr: *mut u64,
+    ) -> Self::PageTable;
 
     // ── Timer ──────────────────────────────────────────────────────────────
 

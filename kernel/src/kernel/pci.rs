@@ -17,14 +17,14 @@ fn cfg_addr(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
         | ((off as u32) & 0xFC)
 }
 
-pub fn read32<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
-    arch.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
-    arch.inl(PCI_CFG_DATA)
+pub fn read32<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+    machine.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
+    machine.inl(PCI_CFG_DATA)
 }
 
-pub fn write32<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
-    arch.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
-    arch.outl(PCI_CFG_DATA, val);
+pub fn write32<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
+    machine.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
+    machine.outl(PCI_CFG_DATA, val);
 }
 
 /// Find the first device matching `(class, subclass)`, returning
@@ -35,23 +35,23 @@ pub fn write32<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8, off: u8
 /// port on a high bus (the dev laptop's xHCI is at 65:00.3 — bus 0x65,
 /// function 3), so a buses-0-3 / function-0-only scan misses it and the device
 /// probes as absent. Empty slots read all-ones (0xFFFF vendor id).
-pub fn find_class<A: crate::Arch>(arch: &mut A, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
+pub fn find_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
     for bus in 0..=255u8 {
         for dev in 0..32u8 {
             for func in 0..8u8 {
-                if read32(arch, bus, dev, func, 0x00) & 0xFFFF == 0xFFFF {
+                if read32(machine, bus, dev, func, 0x00) & 0xFFFF == 0xFFFF {
                     if func == 0 {
                         break; // function 0 absent ⇒ no device in this slot
                     }
                     continue;
                 }
-                let classes = read32(arch, bus, dev, func, 0x08);
+                let classes = read32(machine, bus, dev, func, 0x08);
                 if (classes >> 24) as u8 == class && (classes >> 16) as u8 == subclass {
                     return Some((bus, dev, func));
                 }
                 // Probe functions 1-7 only on a multi-function device (header
                 // type bit 7, at config offset 0x0C bit 23).
-                if func == 0 && read32(arch, bus, dev, 0, 0x0C) & 0x0080_0000 == 0 {
+                if func == 0 && read32(machine, bus, dev, 0, 0x0C) & 0x0080_0000 == 0 {
                     break;
                 }
             }

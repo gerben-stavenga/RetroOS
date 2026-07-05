@@ -1,5 +1,6 @@
 //! Virtual PS/2 keyboard + BIOS keyboard buffer.
 
+use crate::Regs;
 use super::*;
 
 const KBD_BUF_SIZE: usize = 32;
@@ -254,24 +255,24 @@ pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<u8>
 }
 
 /// Clear the BIOS keyboard buffer at 40:1A..40:3E.
-pub fn clear_bios_keyboard_buffer<A: crate::Arch>(regs: &mut Vcpu<A>) {
-    write_u16(regs, 0x40, 0x1A, 0x001E);
-    write_u16(regs, 0x40, 0x1C, 0x001E);
+pub fn clear_bios_keyboard_buffer<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+    write_u16(machine, regs, 0x40, 0x1A, 0x001E);
+    write_u16(machine, regs, 0x40, 0x1C, 0x001E);
     for off in (0x1E..0x3E).step_by(2) {
-        write_u16(regs, 0x40, off, 0);
+        write_u16(machine, regs, 0x40, off, 0);
     }
 }
 
 /// Pop the next word from the BIOS keyboard buffer.
-pub fn pop_bios_keyboard_word<A: crate::Arch>(regs: &mut Vcpu<A>) -> Option<u16> {
-    let head = read_u16(regs, 0x40, 0x1A);
-    let tail = read_u16(regs, 0x40, 0x1C);
+pub fn pop_bios_keyboard_word<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> Option<u16> {
+    let head = read_u16(machine, regs, 0x40, 0x1A);
+    let tail = read_u16(machine, regs, 0x40, 0x1C);
     if head == tail {
         return None;
     }
-    let word = read_u16(regs, 0x40, head as u32);
+    let word = read_u16(machine, regs, 0x40, head as u32);
     let next = if head + 2 >= 0x003E { 0x001E } else { head + 2 };
-    write_u16(regs, 0x40, 0x1A, next);
+    write_u16(machine, regs, 0x40, 0x1A, next);
     Some(word)
 }
 

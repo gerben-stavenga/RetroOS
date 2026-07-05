@@ -1,3 +1,4 @@
+use crate::Regs;
 use arch_abi::GuestBytes;
 use super::*;
 use crate::Vcpu;
@@ -20,8 +21,8 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
     }
 }
 
-fn dump_words<A: crate::Arch>(regs: &Vcpu<A>, label: &str, addr: u32) {
-    let rd = |off: u32| regs.read::<u16>((addr.wrapping_add(off)) as usize);
+fn dump_words<A: crate::Arch>(machine: &mut A, regs: &Regs, label: &str, addr: u32) {
+    let rd = |off: u32| machine.read::<u16>((addr.wrapping_add(off)) as usize);
     let (w0, w1, w2, w3) = (rd(0), rd(2), rd(4), rd(6));
     let (w4, w5, w6, w7) = (rd(8), rd(10), rd(12), rd(14));
     crate::println!(
@@ -30,14 +31,14 @@ fn dump_words<A: crate::Arch>(regs: &Vcpu<A>, label: &str, addr: u32) {
     );
 }
 
-fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcpu<A>, exc_num: u32) {
+fn dump_dpmi_fault_context<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, exc_num: u32) {
     let cs_base = seg_base(&dos.ldt[..], regs.code_seg());
     let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
     let ip_addr = cs_base.wrapping_add(regs.ip32());
     let sp_addr = ss_base.wrapping_add(regs.sp32());
     let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
     let mut bytes = [0u8; 16];
-    regs.copy_from(ip_addr as usize, &mut bytes);
+    machine.copy_from(ip_addr as usize, &mut bytes);
 
     crate::println!(
         "[DPMI-FAULT] exc={} at {:04X}:{:08X} err={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X}",
@@ -67,8 +68,8 @@ fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Vcp
     dump_selector("DS", dos, regs.ds as u16);
     dump_selector("ES", dos, regs.es as u16);
     dump_selector("SS", dos, regs.stack_seg());
-    dump_words(regs, "stack SP", sp_addr);
-    dump_words(regs, "stack BP", bp_addr);
+    dump_words(machine, regs, "stack SP", sp_addr);
+    dump_words(machine, regs, "stack BP", bp_addr);
 }
 
 /// FAR-CALL return frame the host pushes below the spec exception
@@ -188,7 +189,7 @@ struct ExcFrame16 {
 ///   [ESP+0x4C] GS + Reserved
 ///   [ESP+0x50] CR2 (valid for #PF)
 ///   [ESP+0x54] PTE (valid for #PF)
-pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Vcpu<A>, exc_num: u32) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
     dos_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x} DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS:ESP={:04x}:{:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
         regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16,
@@ -232,8 +233,8 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut 
         // faulting instruction would just re-execute and refault, producing
         // an infinite loop. Terminate the client instead.
         if matches!(exc_num, 0 | 3 | 4) {
-            let ivt_off = machine::read_u16(regs, 0, exc_num * 4);
-            let ivt_seg = machine::read_u16(regs, 0, exc_num * 4 + 2);
+            let ivt_off = machine::read_u16(machine, regs, 0, exc_num * 4);
+            let ivt_seg = machine::read_u16(machine, regs, 0, exc_num * 4 + 2);
             dos_trace!("[DPMI] reflect exception {} to IVT {:04X}:{:04X} from {:04X}:{:08X} flags={:04X}",
                 exc_num, ivt_seg, ivt_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
             // Plant an iret-frame on the user's stack pointing at the
@@ -245,14 +246,14 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut 
             // Guest-observable flags pushed into the handler's IRET frame:
             // INT-n semantics — the image's IF slot and TF cleared.
             let handler_flags = machine::guest_flags_handler_entry(regs);
-            mode_transitions::push_iret_frame(&dos.ldt[..], regs, client_use32,
+            mode_transitions::push_iret_frame(machine, &dos.ldt[..], regs, client_use32,
                 regs.ip32(), regs.code_seg(), handler_flags);
-            return mode_transitions::reflect_int_to_real_mode(dos, regs, exc_num as u8);
+            return mode_transitions::reflect_int_to_real_mode(machine, dos, regs, exc_num as u8);
         }
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
-        dump_dpmi_fault_context(dos, regs, exc_num);
-        startup::arch_dump_exception(dos, regs);
+        dump_dpmi_fault_context(machine, dos, regs, exc_num);
+        startup::arch_dump_exception(machine, dos, regs);
         return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
     }
 
@@ -291,7 +292,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut 
         mode_transitions::host_stack_pm_seg(dos),
         dos::EXC_STACK_TOP - depth * dos::EXC_STACK_SLOT,
     );
-    let pm_save_at = mode_transitions::push_continuation_and_switch_to_pm_side_at(dos, regs, None, Some(exc_cursor));
+    let pm_save_at = mode_transitions::push_continuation_and_switch_to_pm_side_at(machine, dos, regs, None, Some(exc_cursor));
     let pm_seg_base = mode_transitions::seg_base(&dos.ldt[..], pm_save_at.0);
     let new_sp;
 
@@ -360,9 +361,9 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut 
             - core::mem::size_of::<ExcFrame32>() as u32
             - core::mem::size_of::<ExcFrameV10>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp) as usize;
-        regs.write::<RetF32>(addr, retf);
-        regs.write::<ExcFrame32>(addr + core::mem::size_of::<RetF32>(), frame);
-        regs.write::<ExcFrameV10>(
+        machine.write::<RetF32>(addr, retf);
+        machine.write::<ExcFrame32>(addr + core::mem::size_of::<RetF32>(), frame);
+        machine.write::<ExcFrameV10>(
             addr + core::mem::size_of::<RetF32>() + core::mem::size_of::<ExcFrame32>(), v10);
     } else {
         // 16-bit: RetF16 (4) + ExcFrame16 (28, padded) + ExcFrameV10 (56) = 88 bytes.
@@ -380,9 +381,9 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut 
             - core::mem::size_of::<ExcFrame16>() as u32
             - core::mem::size_of::<ExcFrameV10>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp) as usize;
-        regs.write::<RetF16>(addr, retf);
-        regs.write::<ExcFrame16>(addr + core::mem::size_of::<RetF16>(), frame);
-        regs.write::<ExcFrameV10>(
+        machine.write::<RetF16>(addr, retf);
+        machine.write::<ExcFrame16>(addr + core::mem::size_of::<RetF16>(), frame);
+        machine.write::<ExcFrameV10>(
             addr + core::mem::size_of::<RetF16>() + core::mem::size_of::<ExcFrame16>(), v10);
     }
 
@@ -452,9 +453,9 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(dos: &mut 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum ExcReturnVia { V09, V10 }
 
-pub(super) fn exception_return<A: crate::Arch>(
+pub(super) fn exception_return<A: crate::Arch>(machine: &mut A, 
     dos: &mut thread::DosState<A>,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
     via: ExcReturnVia,
 ) -> thread::KernelAction {
     let (use32, recorded_at) = match dos.dpmi.as_mut() {
@@ -491,10 +492,10 @@ pub(super) fn exception_return<A: crate::Arch>(
     let (new_eip, new_cs, new_eflags, new_esp, new_ss) = match via {
         ExcReturnVia::V09 => {
             if use32 {
-                let f: ExcFrame32 = regs.read(live_base.wrapping_add(live_sp) as usize);
+                let f: ExcFrame32 = machine.read(live_base.wrapping_add(live_sp) as usize);
                 (f.eip, f.cs, f.eflags, f.esp, f.ss)
             } else {
-                let f: ExcFrame16 = regs.read(live_base.wrapping_add(live_sp) as usize);
+                let f: ExcFrame16 = machine.read(live_base.wrapping_add(live_sp) as usize);
                 // 16-bit fields fold into the low halves of the saved
                 // 32-bit registers; upper halves come from the pre-fault
                 // capture in HostContinuation below.
@@ -506,7 +507,7 @@ pub(super) fn exception_return<A: crate::Arch>(
             // client bitness (DPMI 1.0 §4.3). The handler returned with
             // `ADD (E)SP, 20h; RETF`, so SS:(E)SP points at the expanded
             // frame's error code — 8 bytes past the struct's return slot.
-            let f: ExcFrameV10 = regs.read(live_base.wrapping_add(live_sp).wrapping_sub(8) as usize);
+            let f: ExcFrameV10 = machine.read(live_base.wrapping_add(live_sp).wrapping_sub(8) as usize);
             // CS lives in low 16 of cs_xinfo; high 16 is ExceptionInfoBits.
             (f.eip, f.cs_xinfo & 0xFFFF, f.eflags, f.esp, f.ss)
         }
@@ -516,7 +517,7 @@ pub(super) fn exception_return<A: crate::Arch>(
         mode_transitions::host_stack_pm_seg(dos),
         dos::EXC_STACK_TOP - mode_transitions::HOST_CONTINUATION_SIZE,
     ));
-    let mut save = mode_transitions::pop_continuation_at(regs, &dos.ldt[..], (host_seg, mode_save_sp));
+    let mut save = mode_transitions::pop_continuation_at(machine, regs, &dos.ldt[..], (host_seg, mode_save_sp));
     if use32 || via == ExcReturnVia::V10 {
         save.eip    = new_eip;
         save.cs     = new_cs;
@@ -532,7 +533,7 @@ pub(super) fn exception_return<A: crate::Arch>(
         save.esp    = (save.esp    & 0xFFFF_0000) | new_esp;
         save.ss     = new_ss;
     }
-    mode_transitions::resume_continuation(dos, regs, save);
+    mode_transitions::resume_continuation(machine, dos, regs, save);
     // The restored flags came (possibly handler-modified) from the guest-
     // observable frame — a guest image, IF intent in the bit-9 slot. Map it
     // through the single bit-9→VIF home so the canonical invariants (bit 9

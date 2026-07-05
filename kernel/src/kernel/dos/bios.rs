@@ -30,6 +30,7 @@
 //! (reproducer: SkyRoads fades its palette in on a tick wait — black screen
 //! forever).
 
+use crate::Regs;
 use arch_abi::GuestBytes;
 use crate::Vcpu;
 use crate::kernel::thread;
@@ -145,11 +146,11 @@ const KB_RING_FIRST: u16 = core::mem::offset_of!(Bda, kb_ring) as u16;
 const KB_RING_END: u16 = KB_RING_FIRST + (16 * 2);
 
 macro_rules! bda_field {
-    ($regs:expr, $field:ident) => {
-        $regs.read(bda(core::mem::offset_of!(Bda, $field)))
+    ($machine:expr, $field:ident) => {
+        $machine.read(bda(core::mem::offset_of!(Bda, $field)))
     };
-    ($regs:expr, $field:ident = $val:expr) => {
-        $regs.write(bda(core::mem::offset_of!(Bda, $field)), $val)
+    ($machine:expr, $field:ident = $val:expr) => {
+        $machine.write(bda(core::mem::offset_of!(Bda, $field)), $val)
     };
 }
 
@@ -164,7 +165,7 @@ macro_rules! bda_field {
 /// identical values — the layering matches a real machine (BIOS first, DOS
 /// on top). Native-vs-substitute is decided by the boot-time probe
 /// (`platform::Firmware`), not sniffed here.
-pub(super) fn install<A: crate::Arch>(regs: &mut Vcpu<A>) {
+pub(super) fn install<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (display {:?})",
         crate::kernel::platform::get().display);
     // Vectors with a real service keep their own stub (slot index == vector);
@@ -183,24 +184,24 @@ pub(super) fn install<A: crate::Arch>(regs: &mut Vcpu<A>) {
         let serviced = matches!(n,
             0x00..=0x33 | 0x40..=0x46 | 0x4A | 0x67 | 0x70..=0x77);
         let off = if serviced { (n * 2) as u16 } else { DUMMY_OFF };
-        write_u16(regs, 0, n * 4, off);
-        write_u16(regs, 0, n * 4 + 2, STUB_SEG);
+        write_u16(machine, regs, 0, n * 4, off);
+        write_u16(machine, regs, 0, n * 4 + 2, STUB_SEG);
     }
-    seed_bda(regs);
+    seed_bda(machine, regs);
 }
 
 /// Seed the BDA fields a real POST would have set.
-fn seed_bda<A: crate::Arch>(regs: &mut Vcpu<A>) {
-    bda_field!(regs, video_mode = 3u8); // 80x25 colour text
-    bda_field!(regs, columns = 80u16);
-    bda_field!(regs, crtc_base = 0x03D4u16);
-    bda_field!(regs, rows_minus1 = 24u8);
-    bda_field!(regs, cell_height = 16u16);
-    bda_field!(regs, equipment = 0x0001u16);
-    bda_field!(regs, kb_head = KB_RING_FIRST);
-    bda_field!(regs, kb_tail = KB_RING_FIRST);
-    bda_field!(regs, kb_ring_start = KB_RING_FIRST);
-    bda_field!(regs, kb_ring_end = KB_RING_END);
+fn seed_bda<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+    bda_field!(machine, video_mode = 3u8); // 80x25 colour text
+    bda_field!(machine, columns = 80u16);
+    bda_field!(machine, crtc_base = 0x03D4u16);
+    bda_field!(machine, rows_minus1 = 24u8);
+    bda_field!(machine, cell_height = 16u16);
+    bda_field!(machine, equipment = 0x0001u16);
+    bda_field!(machine, kb_head = KB_RING_FIRST);
+    bda_field!(machine, kb_tail = KB_RING_FIRST);
+    bda_field!(machine, kb_ring_start = KB_RING_FIRST);
+    bda_field!(machine, kb_ring_end = KB_RING_END);
 }
 
 // ============================================================================
@@ -215,7 +216,7 @@ fn seed_bda<A: crate::Arch>(regs: &mut Vcpu<A>) {
 pub(super) fn dispatch<A: crate::Arch>(
     machine: &mut A,
     dos: &mut super::DosState<A>,
-    regs: &mut Vcpu<A>,
+    regs: &mut Regs,
 ) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     let int_num = (ip.wrapping_sub(2) / 2) as u8;
@@ -225,15 +226,15 @@ pub(super) fn dispatch<A: crate::Arch>(
             // Timer tick. EOI before the 1C chain (the C BIOS EOI'd after
             // geninterrupt(0x1C) returned; chaining by frame-reuse means we
             // never regain control, so the EOI moves ahead of the handler).
-            let t: u32 = bda_field!(regs, tick_count);
-            bda_field!(regs, tick_count = t.wrapping_add(1));
+            let t: u32 = bda_field!(machine, tick_count);
+            bda_field!(machine, tick_count = t.wrapping_add(1));
             emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
             // Chain the user timer tick like a real INT 08 does. The
             // selector tells us whether anyone hooked INT 1C — unhooked
             // points back into this array (a no-op), so skip the bounce.
-            let seg = read_u16(regs, 0, 0x1C * 4 + 2);
+            let seg = read_u16(machine, regs, 0, 0x1C * 4 + 2);
             if seg != STUB_SEG {
-                let off = read_u16(regs, 0, 0x1C * 4);
+                let off = read_u16(machine, regs, 0, 0x1C * 4);
                 // Reuse the caller's IRET frame: the 1C handler's IRET
                 // returns straight to the interrupted code.
                 machine::set_vm86_cs(regs, seg);
@@ -250,19 +251,19 @@ pub(super) fn dispatch<A: crate::Arch>(
         }
         0x10 => int10(machine, dos, regs),
         0x11 => {
-            let equip: u16 = bda_field!(regs, equipment);
+            let equip: u16 = bda_field!(machine, equipment);
             regs.rax = (regs.rax & !0xFFFF) | equip as u64;
         }
         0x15 => match (regs.rax >> 8) as u8 {
             // AH=87h block move: the ROM does this via a protected-mode LGDT
             // excursion (illegal under VM86). Do the copy directly instead.
-            0x87 => int15_block_move(regs),
+            0x87 => int15_block_move(machine, regs),
             // AH=89h switch-to-PM: a VM86 guest cannot take over real PM — the
             // monitor owns it. Refuse, exactly as EMM386 does (DPMI is the
             // sanctioned path). AH=86h = "unsupported", CF set.
             0x89 => {
                 regs.rax = (regs.rax & !0xFF00) | 0x8600;
-                set_iret_cf(regs, true);
+                set_iret_cf(machine, regs, true);
             }
             // Everything else: on a real BIOS, hand back to the ROM (WAIT,
             // ext-mem size, …) reusing the caller's INT frame. On Substitute
@@ -274,23 +275,23 @@ pub(super) fn dispatch<A: crate::Arch>(
             },
         },
         0x16 => {
-            if int16(regs, ip) == Parked::Yes {
+            if int16(machine, regs, ip) == Parked::Yes {
                 return thread::KernelAction::Done;
             }
         }
-        0x1A => int1a(regs),
+        0x1A => int1a(machine, regs),
         _ => {} // plain IRET — a real BIOS leaves no vector null
     }
 
-    pop_iret_frame(regs);
+    pop_iret_frame(machine, regs);
     thread::KernelAction::Done
 }
 
 /// Pop the caller's INT frame (IP/CS/FLAGS) — the IRET every handler ends in.
-fn pop_iret_frame<A: crate::Arch>(regs: &mut Vcpu<A>) {
-    let ret_ip = vm86_pop(regs);
-    let ret_cs = vm86_pop(regs);
-    let ret_flags = vm86_pop(regs);
+fn pop_iret_frame<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+    let ret_ip = vm86_pop(machine, regs);
+    let ret_cs = vm86_pop(machine, regs);
+    let ret_flags = vm86_pop(machine, regs);
     machine::set_vm86_ip(regs, ret_ip);
     machine::set_vm86_cs(regs, ret_cs);
     machine::set_vm86_flags(regs, ret_flags as u32);
@@ -299,11 +300,11 @@ fn pop_iret_frame<A: crate::Arch>(regs: &mut Vcpu<A>) {
 /// Set/clear CF in the caller's *stacked* FLAGS (at `SS:SP+4`), which
 /// `pop_iret_frame` restores on return — clearing the live flag would just be
 /// overwritten by that pop. This is how a real BIOS reports carry through IRET.
-fn set_iret_cf<A: crate::Arch>(regs: &mut Vcpu<A>, cf: bool) {
+fn set_iret_cf<A: crate::Arch>(machine: &mut A, regs: &mut Regs, cf: bool) {
     let flin = (((vm86_ss(regs) as u32) << 4) + vm86_sp(regs) as u32 + 4) as usize;
-    let mut f = regs.read::<u16>(flin);
+    let mut f = machine.read::<u16>(flin);
     if cf { f |= 1 } else { f &= !1 }
-    regs.write::<u16>(flin, f);
+    machine.write::<u16>(flin, f);
 }
 
 /// INT 15h AH=87h — copy a block to/from extended memory. `ES:SI` → the
@@ -312,20 +313,20 @@ fn set_iret_cf<A: crate::Arch>(regs: &mut Vcpu<A>, cf: bool) {
 /// 24–31). `CX` = words to copy. We perform the copy directly — the same
 /// operation as XMS AH=0Bh (`copy_within`) — instead of letting the ROM `LGDT`
 /// into protected mode, which is illegal under VM86.
-fn int15_block_move<A: crate::Arch>(regs: &mut Vcpu<A>) {
+fn int15_block_move<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let gdt = ((regs.es as u32) << 4) + (regs.rsi as u32 & 0xFFFF);
-    let base = |regs: &Vcpu<A>, desc: u32| -> u32 {
+    let base = |regs: &Regs, desc: u32| -> u32 {
         let d = (gdt + desc) as usize;
-        (regs.read::<u16>(d + 2) as u32)                      // base bits 0–15
-            | (((regs.read::<u16>(d + 4) as u32) & 0xFF) << 16) // byte 4: bits 16–23
-            | (((regs.read::<u16>(d + 6) as u32) >> 8) << 24)   // byte 7: bits 24–31
+        (machine.read::<u16>(d + 2) as u32)                      // base bits 0–15
+            | (((machine.read::<u16>(d + 4) as u32) & 0xFF) << 16) // byte 4: bits 16–23
+            | (((machine.read::<u16>(d + 6) as u32) >> 8) << 24)   // byte 7: bits 24–31
     };
     let src = base(regs, 0x10);
     let dst = base(regs, 0x18);
     let len = (regs.rcx as usize & 0xFFFF) * 2;
-    regs.copy_within(src as usize, dst as usize, len);
+    machine.copy_within(src as usize, dst as usize, len);
     regs.rax &= !0xFF00;       // AH = 0 (success)
-    set_iret_cf(regs, false);  // CF = 0
+    set_iret_cf(machine, regs, false);  // CF = 0
 }
 
 // ============================================================================
@@ -338,10 +339,10 @@ enum Parked {
     No,
 }
 
-fn int16<A: crate::Arch>(regs: &mut Vcpu<A>, stub_ip: u16) -> Parked {
+fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Parked {
     let ah = (regs.rax >> 8) as u8;
-    let head: u16 = bda_field!(regs, kb_head);
-    let tail: u16 = bda_field!(regs, kb_tail);
+    let head: u16 = bda_field!(machine, kb_head);
+    let tail: u16 = bda_field!(machine, kb_tail);
     match ah {
         0x00 | 0x10 => {
             // Blocking read. Empty ring: park by rewinding IP onto the
@@ -354,30 +355,30 @@ fn int16<A: crate::Arch>(regs: &mut Vcpu<A>, stub_ip: u16) -> Parked {
                 machine::set_vm86_ip(regs, stub_ip.wrapping_sub(2));
                 return Parked::Yes;
             }
-            let key: u16 = regs.read(BDA_BASE + head as usize);
+            let key: u16 = machine.read(BDA_BASE + head as usize);
             let mut next = head + 2;
             if next >= KB_RING_END {
                 next = KB_RING_FIRST;
             }
-            bda_field!(regs, kb_head = next);
+            bda_field!(machine, kb_head = next);
             regs.rax = (regs.rax & !0xFFFF) | key as u64;
         }
         0x01 | 0x11 => {
             // Peek: ZF in the caller's stacked FLAGS (popped on return).
             let ss = vm86_ss(regs) as u32;
             let fl_off = (vm86_sp(regs) as u32).wrapping_add(4);
-            let mut flags = read_u16(regs, ss, fl_off);
+            let mut flags = read_u16(machine, regs, ss, fl_off);
             if head == tail {
                 flags |= 0x40;
             } else {
                 flags &= !0x40;
-                let key: u16 = regs.read(BDA_BASE + head as usize);
+                let key: u16 = machine.read(BDA_BASE + head as usize);
                 regs.rax = (regs.rax & !0xFFFF) | key as u64;
             }
-            write_u16(regs, ss, fl_off, flags);
+            write_u16(machine, regs, ss, fl_off, flags);
         }
         0x02 | 0x12 => {
-            let fl: u8 = bda_field!(regs, kb_flags);
+            let fl: u8 = bda_field!(machine, kb_flags);
             regs.rax = (regs.rax & !0xFF) | fl as u64;
         }
         _ => {}
@@ -397,10 +398,10 @@ const KB_UC: [u8; 58] = *b"\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\x0d\x00ASDFGHJ
 /// virtual 8042 on interp, the real one on metal). Translate to ASCII,
 /// track shift/ctrl in the BDA flag byte, push (scancode:ascii) into the
 /// ring for INT 16h. Extended keys (arrows, F-keys) push ascii=0.
-fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
+fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
     let sc = emulate_inb(machine, &mut dos.pc, 0x60);
     let key = sc & 0x7F;
-    let mut flags: u8 = bda_field!(regs, kb_flags);
+    let mut flags: u8 = bda_field!(machine, kb_flags);
 
     // Shift / Ctrl are modifiers: update the BDA flag byte, don't enqueue.
     let modifier_bit = match key {
@@ -411,7 +412,7 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
     };
     if let Some(bit) = modifier_bit {
         flags = if sc & 0x80 != 0 { flags & !bit } else { flags | bit };
-        bda_field!(regs, kb_flags = flags);
+        bda_field!(machine, kb_flags = flags);
         emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
         return;
     }
@@ -429,16 +430,16 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
         }
     }
 
-    let tail: u16 = bda_field!(regs, kb_tail);
+    let tail: u16 = bda_field!(machine, kb_tail);
     let mut next = tail + 2;
     if next >= KB_RING_END {
         next = KB_RING_FIRST;
     }
-    let head: u16 = bda_field!(regs, kb_head);
+    let head: u16 = bda_field!(machine, kb_head);
     if next != head {
         // ring not full
-        regs.write::<u16>(BDA_BASE + tail as usize, ((key as u16) << 8) | asc as u16);
-        bda_field!(regs, kb_tail = next);
+        machine.write::<u16>(BDA_BASE + tail as usize, ((key as u16) << 8) | asc as u16);
+        bda_field!(machine, kb_tail = next);
     }
     emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
 }
@@ -450,7 +451,7 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
 const VRAM_TEXT: usize = 0xB8000;
 const VRAM_MODE13: usize = 0xA0000;
 
-fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
+fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
     let ax = regs.rax as u16;
     let ah = (ax >> 8) as u8;
     match ah {
@@ -458,15 +459,15 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
-            bda_field!(regs, video_mode = mode);
+            bda_field!(machine, video_mode = mode);
             // Text-grid geometry per mode: 40-column modes (CGA/EGA 320-wide and
             // mode 13h) vs 80; 30 rows on the 480-line VGA modes; character cell
             // height 8 (200-line + 13h), 14 (350-line EGA), or 16 (text/480-line).
-            bda_field!(regs, columns = match mode { 0 | 1 | 4 | 5 | 0x0D | 0x13 => 40u16, _ => 80 });
-            bda_field!(regs, rows_minus1 = if matches!(mode, 0x11 | 0x12) { 29u8 } else { 24 });
-            bda_field!(regs, cell_height = match mode { 4 | 5 | 6 | 0x0D | 0x0E | 0x13 => 8u16, 0x0F | 0x10 => 14, _ => 16 });
-            bda_field!(regs, active_page = 0u8);
-            bda_field!(regs, cursor_pos = [0u16; 8]);
+            bda_field!(machine, columns = match mode { 0 | 1 | 4 | 5 | 0x0D | 0x13 => 40u16, _ => 80 });
+            bda_field!(machine, rows_minus1 = if matches!(mode, 0x11 | 0x12) { 29u8 } else { 24 });
+            bda_field!(machine, cell_height = match mode { 4 | 5 | 6 | 0x0D | 0x0E | 0x13 => 8u16, 0x0F | 0x10 => 14, _ => 16 });
+            bda_field!(machine, active_page = 0u8);
+            bda_field!(machine, cursor_pos = [0u16; 8]);
             // Arm/disarm the planar VRAM trap for the EGA 16-colour family
             // (0x0D–0x12, Keen): a BIOS-set planar mode never toggles the
             // Sequencer chain-4 bit, so this is the only place the trap gets
@@ -477,46 +478,46 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                 // cleared inside on_set_mode (their VRAM is the plane window).
                 if mode == 0x13 {
                     for i in 0..(320 * 200 / 4) {
-                        regs.write::<u32>(VRAM_MODE13 + i * 4, 0);
+                        machine.write::<u32>(VRAM_MODE13 + i * 4, 0);
                     }
                 } else if !matches!(mode, 0x0D..=0x12) {
                     for i in 0..16384 {
                         // full 32K text window
-                        regs.write::<u16>(VRAM_TEXT + i * 2, 0x0720);
+                        machine.write::<u16>(VRAM_TEXT + i * 2, 0x0720);
                     }
                 }
             }
         }
         0x01 => {
-            bda_field!(regs, cursor_shape = regs.rcx as u16);
+            bda_field!(machine, cursor_shape = regs.rcx as u16);
         }
         0x02 => {
             // Set cursor position: BH=page, DH=row, DL=col.
             let page = ((regs.rbx >> 8) & 0x7) as usize;
             let pos_off = core::mem::offset_of!(Bda, cursor_pos) + page * 2;
-            regs.write::<u16>(bda(pos_off), regs.rdx as u16);
+            machine.write::<u16>(bda(pos_off), regs.rdx as u16);
         }
         0x03 => {
             let page = ((regs.rbx >> 8) & 0x7) as usize;
             let pos_off = core::mem::offset_of!(Bda, cursor_pos) + page * 2;
-            let pos: u16 = regs.read(bda(pos_off));
-            let shape: u16 = bda_field!(regs, cursor_shape);
+            let pos: u16 = machine.read(bda(pos_off));
+            let shape: u16 = bda_field!(machine, cursor_shape);
             regs.rdx = (regs.rdx & !0xFFFF) | pos as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | shape as u64;
         }
         0x05 => {
-            bda_field!(regs, active_page = (ax & 0xFF) as u8);
+            bda_field!(machine, active_page = (ax & 0xFF) as u8);
         }
         0x0E => {
             // Teletype output: write at cursor, advance. (Scroll is handled
             // by direct writers, matching the C BIOS.)
             let ch = (ax & 0xFF) as u8;
-            let page: u8 = bda_field!(regs, active_page);
+            let page: u8 = bda_field!(machine, active_page);
             let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page & 7) as usize * 2;
-            let pos: u16 = regs.read(bda(pos_off));
+            let pos: u16 = machine.read(bda(pos_off));
             let (mut row, mut col) = ((pos >> 8) as u32, (pos & 0xFF) as u32);
-            let cols: u16 = bda_field!(regs, columns);
-            let mode: u8 = bda_field!(regs, video_mode);
+            let cols: u16 = bda_field!(machine, columns);
+            let mode: u8 = bda_field!(machine, video_mode);
             match ch {
                 b'\r' => col = 0,
                 b'\n' => row += 1,
@@ -526,9 +527,9 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     // the framebuffer (BL = foreground colour). Text modes write
                     // the char byte at the cursor cell as before.
                     let fg = regs.rbx as u8;
-                    if !super::machine::vga::bios_draw_glyph(regs, &mut dos.pc.vga, mode, ch, col, row, fg) {
+                    if !super::machine::vga::bios_draw_glyph(machine, regs, &mut dos.pc.vga, mode, ch, col, row, fg) {
                         let off = (row * cols as u32 + col) as usize * 2;
-                        regs.write::<u8>(VRAM_TEXT + off, ch);
+                        machine.write::<u8>(VRAM_TEXT + off, ch);
                     }
                     col += 1;
                     if col >= cols as u32 {
@@ -537,15 +538,15 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     }
                 }
             }
-            let max_row: u8 = bda_field!(regs, rows_minus1);
+            let max_row: u8 = bda_field!(machine, rows_minus1);
             row = row.min(max_row as u32);
-            regs.write::<u16>(bda(pos_off), ((row << 8) | col) as u16);
+            machine.write::<u16>(bda(pos_off), ((row << 8) | col) as u16);
         }
         0x0F => {
             // Get video mode: AL=mode, AH=columns, BH=page.
-            let mode: u8 = bda_field!(regs, video_mode);
-            let cols: u16 = bda_field!(regs, columns);
-            let page: u8 = bda_field!(regs, active_page);
+            let mode: u8 = bda_field!(machine, video_mode);
+            let cols: u16 = bda_field!(machine, columns);
+            let page: u8 = bda_field!(machine, active_page);
             regs.rax = (regs.rax & !0xFFFF) | ((cols << 8) | mode as u16) as u64;
             regs.rbx = (regs.rbx & !0xFF00) | ((page as u64) << 8);
         }
@@ -580,11 +581,11 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     let tbl = ((regs.es as u16 as usize) << 4) + regs.rdx as u16 as usize;
                     let _ = emulate_inb(machine, &mut dos.pc, 0x3DA);
                     for i in 0..16u8 {
-                        let b: u8 = regs.read(tbl + i as usize);
+                        let b: u8 = machine.read(tbl + i as usize);
                         emulate_outb(machine, &mut dos.pc, regs, 0x3C0, i);
                         emulate_outb(machine, &mut dos.pc, regs, 0x3C0, b);
                     }
-                    let ov: u8 = regs.read(tbl + 16);
+                    let ov: u8 = machine.read(tbl + 16);
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x11);
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, ov);
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x20);
@@ -616,7 +617,7 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     let bx = regs.rbx as u8;
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C8, bx);
                     for i in 0..n {
-                        let b: u8 = regs.read(tbl + i);
+                        let b: u8 = machine.read(tbl + i);
                         emulate_outb(machine, &mut dos.pc, regs, 0x3C9, b);
                     }
                 }
@@ -658,15 +659,15 @@ const VBE_MODES: &[(u16, u16, u16, u8)] = &[
     (0x112, 640, 480, 32),
 ];
 
-fn vbe<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
+fn vbe<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
     // Every VBE call returns AL=4Fh ("supported"); AH=00h success, 01h failed.
     let al = regs.rax as u8;
-    let done = |regs: &mut Vcpu<A>, ok: bool| {
+    let done = |regs: &mut Regs, ok: bool| {
         regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
     };
     match al {
-        0x00 => { vbe_controller_info(regs); done(regs, true); }
-        0x01 => { let ok = vbe_mode_info(regs); done(regs, ok); }
+        0x00 => { vbe_controller_info(machine, regs); done(regs, true); }
+        0x01 => { let ok = vbe_mode_info(machine, regs); done(regs, ok); }
         0x02 => { let ok = vbe_set_mode(machine, dos, regs); done(regs, ok); }
         0x03 => {
             let cur = VBE_MODES.iter()
@@ -685,14 +686,14 @@ fn vbe<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut
 
 /// VBE 4F08h — Set/Get DAC palette format. We model only the 6-bit VGA DAC, so
 /// report BH=6 for both set and get (a client asking for 8-bit falls back).
-fn vbe_dac_format<A: crate::Arch>(regs: &mut Vcpu<A>) {
+fn vbe_dac_format(regs: &mut Regs) {
     regs.rbx = (regs.rbx & !0xFF00) | (6 << 8);
 }
 
 /// VBE 4F09h — Set/Get Palette Data. CX entries from index DX at ES:DI, each 4
 /// bytes (Blue, Green, Red, align), 6-bit components. Routed through the DAC
 /// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
-fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) -> bool {
+fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) -> bool {
     let count = regs.rcx as u16 as usize;
     let start = regs.rdx as u8;
     let tbl = es_di(regs);
@@ -702,7 +703,7 @@ fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, re
             emulate_outb(machine, &mut dos.pc, regs, 0x3C8, start);
             for i in 0..count {
                 let e = tbl + i * 4;
-                let (b, g, r): (u8, u8, u8) = (regs.read(e), regs.read(e + 1), regs.read(e + 2));
+                let (b, g, r): (u8, u8, u8) = (machine.read(e), machine.read(e + 1), machine.read(e + 2));
                 emulate_outb(machine, &mut dos.pc, regs, 0x3C9, r);
                 emulate_outb(machine, &mut dos.pc, regs, 0x3C9, g);
                 emulate_outb(machine, &mut dos.pc, regs, 0x3C9, b);
@@ -717,10 +718,10 @@ fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, re
                 let g = emulate_inb(machine, &mut dos.pc, 0x3C9);
                 let b = emulate_inb(machine, &mut dos.pc, 0x3C9);
                 let e = tbl + i * 4;
-                regs.write::<u8>(e, b);
-                regs.write::<u8>(e + 1, g);
-                regs.write::<u8>(e + 2, r);
-                regs.write::<u8>(e + 3, 0);
+                machine.write::<u8>(e, b);
+                machine.write::<u8>(e + 1, g);
+                machine.write::<u8>(e + 2, r);
+                machine.write::<u8>(e + 3, 0);
             }
             true
         }
@@ -729,63 +730,63 @@ fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, re
 }
 
 /// Linear address of the caller's ES:DI block (real-mode VBE buffers).
-fn es_di<A: crate::Arch>(regs: &Vcpu<A>) -> usize {
+fn es_di(regs: &Regs) -> usize {
     ((regs.es as usize & 0xFFFF) << 4) + (regs.rdi as usize & 0xFFFF)
 }
 
 /// VBE 4F00h — controller info into ES:DI, with the mode list placed in the
 /// block's reserved area and pointed at by VideoModePtr.
-fn vbe_controller_info<A: crate::Arch>(regs: &mut Vcpu<A>) {
+fn vbe_controller_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let lin = es_di(regs);
     for i in (0..256).step_by(4) {
-        regs.write::<u32>(lin + i, 0);
+        machine.write::<u32>(lin + i, 0);
     }
-    regs.write::<u8>(lin, b'V');
-    regs.write::<u8>(lin + 1, b'E');
-    regs.write::<u8>(lin + 2, b'S');
-    regs.write::<u8>(lin + 3, b'A');
-    regs.write::<u16>(lin + 0x04, 0x0200); // VBE 2.0
+    machine.write::<u8>(lin, b'V');
+    machine.write::<u8>(lin + 1, b'E');
+    machine.write::<u8>(lin + 2, b'S');
+    machine.write::<u8>(lin + 3, b'A');
+    machine.write::<u16>(lin + 0x04, 0x0200); // VBE 2.0
     // VideoModePtr (0x0E) → mode list at ES:(DI+0x20), in the reserved area.
     let list_off = (regs.rdi as u16).wrapping_add(0x20);
-    regs.write::<u32>(lin + 0x0E, ((regs.es as u32 & 0xFFFF) << 16) | list_off as u32);
-    regs.write::<u16>(lin + 0x12, 0x80); // total memory: 0x80 × 64 KB = 8 MB
+    machine.write::<u32>(lin + 0x0E, ((regs.es as u32 & 0xFFFF) << 16) | list_off as u32);
+    machine.write::<u16>(lin + 0x12, 0x80); // total memory: 0x80 × 64 KB = 8 MB
     let mut p = lin + 0x20;
     for &(num, ..) in VBE_MODES {
-        regs.write::<u16>(p, num);
+        machine.write::<u16>(p, num);
         p += 2;
     }
-    regs.write::<u16>(p, 0xFFFF); // list terminator
+    machine.write::<u16>(p, 0xFFFF); // list terminator
 }
 
 /// VBE 4F01h — mode info for CX into ES:DI. Returns false for an unknown mode.
-fn vbe_mode_info<A: crate::Arch>(regs: &mut Vcpu<A>) -> bool {
+fn vbe_mode_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> bool {
     let want = regs.rcx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
         return false;
     };
     let lin = es_di(regs);
     for i in (0..256).step_by(4) {
-        regs.write::<u32>(lin + i, 0);
+        machine.write::<u32>(lin + i, 0);
     }
     let bpp8 = (bpp as u16).div_ceil(8);
     let direct = bpp >= 15;
     // ModeAttributes: supported|reserved|colour|graphics, banked + LFB (bit7).
-    regs.write::<u16>(lin, 0x009B);
-    regs.write::<u8>(lin + 0x02, 0x07); // win A: relocatable|readable|writable
-    regs.write::<u8>(lin + 0x03, 0x00); // win B: not present
-    regs.write::<u16>(lin + 0x04, 64); // granularity (KB)
-    regs.write::<u16>(lin + 0x06, 64); // window size (KB)
-    regs.write::<u16>(lin + 0x08, 0xA000); // win A segment
-    regs.write::<u16>(lin + 0x10, w * bpp8); // bytes per scanline
-    regs.write::<u16>(lin + 0x12, w);
-    regs.write::<u16>(lin + 0x14, h);
-    regs.write::<u8>(lin + 0x16, 8); // char width
-    regs.write::<u8>(lin + 0x17, 16); // char height
-    regs.write::<u8>(lin + 0x18, 1); // planes
-    regs.write::<u8>(lin + 0x19, bpp);
-    regs.write::<u8>(lin + 0x1A, 1); // banks
-    regs.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
-    regs.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
+    machine.write::<u16>(lin, 0x009B);
+    machine.write::<u8>(lin + 0x02, 0x07); // win A: relocatable|readable|writable
+    machine.write::<u8>(lin + 0x03, 0x00); // win B: not present
+    machine.write::<u16>(lin + 0x04, 64); // granularity (KB)
+    machine.write::<u16>(lin + 0x06, 64); // window size (KB)
+    machine.write::<u16>(lin + 0x08, 0xA000); // win A segment
+    machine.write::<u16>(lin + 0x10, w * bpp8); // bytes per scanline
+    machine.write::<u16>(lin + 0x12, w);
+    machine.write::<u16>(lin + 0x14, h);
+    machine.write::<u8>(lin + 0x16, 8); // char width
+    machine.write::<u8>(lin + 0x17, 16); // char height
+    machine.write::<u8>(lin + 0x18, 1); // planes
+    machine.write::<u8>(lin + 0x19, bpp);
+    machine.write::<u8>(lin + 0x1A, 1); // banks
+    machine.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
+    machine.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
     if direct {
         // (red, grn, blu, rsv) as (mask_size, field_position) at 0x1F..0x26.
         let masks: [(u8, u8); 4] = match bpp {
@@ -794,20 +795,20 @@ fn vbe_mode_info<A: crate::Arch>(regs: &mut Vcpu<A>) -> bool {
             _ => [(8, 16), (8, 8), (8, 0), if bpp == 32 { (8, 24) } else { (0, 0) }],
         };
         for (i, &(sz, pos)) in masks.iter().enumerate() {
-            regs.write::<u8>(lin + 0x1F + i * 2, sz);
-            regs.write::<u8>(lin + 0x20 + i * 2, pos);
+            machine.write::<u8>(lin + 0x1F + i * 2, sz);
+            machine.write::<u8>(lin + 0x20 + i * 2, pos);
         }
     }
     // PhysBasePtr (0x28): the framebuffer's linear base — directly usable by a
     // PM/DPMI client (physical == linear here). LinBytesPerScanLine (0x32)
     // mirrors the banked pitch since the framebuffer is contiguous.
-    regs.write::<u32>(lin + 0x28, super::machine::vga::svga_lfb_base());
-    regs.write::<u16>(lin + 0x32, w * bpp8);
+    machine.write::<u32>(lin + 0x28, super::machine::vga::svga_lfb_base());
+    machine.write::<u16>(lin + 0x32, w * bpp8);
     true
 }
 
 /// VBE 4F02h — set mode (BX). Ignores the LFB bit (we only do banked).
-fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) -> bool {
+fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) -> bool {
     let want = regs.rbx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
         return false;
@@ -817,7 +818,7 @@ fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, r
 }
 
 /// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
-fn vbe_window<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Vcpu<A>) {
+fn vbe_window<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
     if (regs.rbx >> 8) as u8 == 0 {
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
@@ -829,12 +830,12 @@ fn vbe_window<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, reg
 // INT 1Ah: system timer
 // ============================================================================
 
-fn int1a<A: crate::Arch>(regs: &mut Vcpu<A>) {
+fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         0x00 => {
             // Read tick count: CX:DX = ticks, AL = midnight flag.
-            let ticks: u32 = bda_field!(regs, tick_count);
+            let ticks: u32 = bda_field!(machine, tick_count);
             regs.rcx = (regs.rcx & !0xFFFF) | (ticks >> 16) as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | (ticks & 0xFFFF) as u64;
             regs.rax &= !0xFF; // AL = 0 (no rollover)
@@ -842,7 +843,7 @@ fn int1a<A: crate::Arch>(regs: &mut Vcpu<A>) {
         0x01 => {
             // Set tick count from CX:DX.
             let t = ((regs.rcx as u16 as u32) << 16) | regs.rdx as u16 as u32;
-            bda_field!(regs, tick_count = t);
+            bda_field!(machine, tick_count = t);
         }
         _ => {}
     }

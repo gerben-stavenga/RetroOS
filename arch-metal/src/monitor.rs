@@ -33,28 +33,23 @@ pub use crate::descriptors::{seg_base, seg_is_32};
 
 /// Decode the instruction at CS:IP and either finish it inline (`Resume`) or
 /// return a typed kernel event. Called from `isr_handler_ring3` on #GP from
-/// ring-3 — see [`arch_abi::monitor::monitor`].
+/// ring-3 — see [`arch_abi::monitor::monitor`]. `Metal` is the active-space
+/// `GuestBytes` accessor (ZST); its memory ops deref the live page tables.
 #[inline]
 pub fn monitor(regs: &mut Regs) -> MonitorResult {
-    let mut v = Vcpu::new(*regs, RootPageTable::empty());
-    let r = arch_abi::monitor::monitor(&mut v);
-    *regs = v.regs;
-    r
+    arch_abi::monitor::monitor(&mut crate::backend::Metal, regs)
 }
 
 /// Virtual-IF single-step driver for PM clients — see
 /// [`arch_abi::monitor::step_virtual_if`].
 #[inline]
 pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
-    let mut v = Vcpu::new(*regs, RootPageTable::empty());
-    let r = arch_abi::monitor::step_virtual_if(&mut v);
-    *regs = v.regs;
-    r
+    arch_abi::monitor::step_virtual_if(&mut crate::backend::Metal, regs)
 }
 
 /// SW equivalent of the CPU's VM86 INT dispatch — see
-/// [`arch_abi::monitor::sw_reflect_vm86_int`]. Memory-only, so it takes the
-/// register frame plus a throwaway space directly (no copy-back needed).
+/// [`arch_abi::monitor::sw_reflect_vm86_int`]. Memory reaches the active space
+/// through `Metal` (`GuestBytes`).
 ///
 /// # Safety
 ///
@@ -62,7 +57,7 @@ pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
 /// the active page tables).
 #[inline]
 pub unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
-    arch_abi::monitor::sw_reflect_vm86_int(regs, &mut RootPageTable::empty(), vector)
+    arch_abi::monitor::sw_reflect_vm86_int(regs, &mut crate::backend::Metal, vector)
 }
 
 /// Log one PM/VM86 single-step: CS:EIP + key regs + the first opcode bytes.
@@ -82,7 +77,7 @@ pub fn pm_step_log(regs: &crate::Vcpu) {
     let lin = cs_base.wrapping_add(ip);
     let mut b = [0u8; 8];
     for (i, byte) in b.iter_mut().enumerate() {
-        *byte = regs.read::<u8>((lin + i as u32) as usize);
+        *byte = crate::backend::Metal.read::<u8>((lin + i as u32) as usize);
     }
     let f = regs.flags32();
     lib::dbg_println!(

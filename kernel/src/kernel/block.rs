@@ -19,12 +19,12 @@ static KIND: AtomicU8 = AtomicU8::new(NONE);
 
 /// Probe and select the boot disk. Called once from `startup` before the
 /// partition scan.
-pub fn init<A: crate::Arch>(arch: &mut A) {
+pub fn init<A: crate::Arch>(machine: &mut A) {
     if hdd::probe() {
         hdd::reset(); // needed when booted via GRUB (controller left idle)
         KIND.store(ATA, Ordering::Relaxed);
         println!("Storage: ATA (PIO)");
-    } else if nvme::init(arch) {
+    } else if nvme::init(machine) {
         KIND.store(NVME, Ordering::Relaxed);
         println!("Storage: NVMe");
     } else {

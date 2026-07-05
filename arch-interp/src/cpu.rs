@@ -353,7 +353,7 @@ pub fn execute() -> KernelEvent {
         if mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
             // A sensitive op decoded during stepping (e.g. IRET popping CS=0)
             // bubbles as an Event — surface it rather than re-entering.
-            if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if(vcpu) {
+            if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if(&mut crate::backend::Interp, &mut vcpu.regs) {
                 return ev;
             }
         }
@@ -470,7 +470,7 @@ pub fn execute() -> KernelEvent {
             // (duke3d/raptor at sound init); forwarding the #GP to the client's
             // own handler cascaded into a wild jump.
             if n == 13 && !is_int && uc.get_data().pending_err == 0 {
-                match arch_abi::monitor::monitor(vcpu) {
+                match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
                     MonitorResult::Resume => continue,
                     MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
                     MonitorResult::Event(ev) => return ev,

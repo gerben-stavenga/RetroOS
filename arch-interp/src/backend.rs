@@ -8,7 +8,7 @@
 
 use crate::space::RootPageTable;
 use crate::vcpu::{self, Vcpu};
-use arch_abi::{Arch, Irq, KernelEvent};
+use arch_abi::{Arch, Irq, KernelEvent, Regs};
 
 /// The interpreter backend handle. Zero-sized today (state lives in module
 /// statics); it gains fields as the globals migrate into it.
@@ -33,23 +33,30 @@ impl Arch for Interp {
     // The interp still keeps an internal live frame (`vcpu::REGS`) that its CPU
     // core syncs against; bridge the loop-owned `Vcpu` to it around each call.
     // (The internal frame goes away when the globals migrate into `Interp`.)
-    fn execute(&mut self, vcpu: &mut Vcpu) -> KernelEvent {
-        // `Vcpu` is move-only, so bridge to the internal live frame by SWAPPING
-        // ownership in and back out (not copying): the space lives in `REGS` for
-        // the duration of the run, then returns to the loop's `vcpu`.
+    fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
+        // Bridge the loop-owned registers to the backend's live frame for the
+        // run (the active SPACE already lives in `REGS.space`), then read them
+        // back. Swap, not copy — `Regs` is Copy but swap keeps a single source.
         let live = unsafe { &mut *(&raw mut vcpu::REGS) };
-        core::mem::swap(live, vcpu);
+        core::mem::swap(&mut live.regs, regs);
         let ev = crate::engine::execute();
-        core::mem::swap(live, vcpu);
+        core::mem::swap(&mut live.regs, regs);
         ev
     }
-    fn switch_to(&mut self, live: &mut Vcpu, swap: &mut Vcpu, hash_ptr: *mut u64, fx_ptr: *mut Self::Fx) {
-        // `arch_switch_to` swaps the internal live frame with `swap`; stage the
-        // loop's `live` into it first, then read the incoming state back out.
-        let regs = unsafe { &mut *(&raw mut vcpu::REGS) };
-        core::mem::swap(regs, live);
-        crate::calls::arch_switch_to(swap, hash_ptr, fx_ptr);
-        core::mem::swap(regs, live);
+    fn activate(&mut self, incoming: RootPageTable, fx_ptr: *mut Self::Fx, _hash_ptr: *mut u64) -> RootPageTable {
+        // Swap the live FPU with the thread's save area (null ⇒ transient
+        // kernel-only swap, skip). KVM: state is the vcpu's XSAVE; TCG: no-op.
+        if !fx_ptr.is_null() {
+            crate::engine::fx_switch(unsafe { &mut *fx_ptr });
+        }
+        // Move `incoming` into the single active-space slot and return the
+        // displaced one. Then make the new active space live (drop the outgoing
+        // space's lazy Unicorn mappings).
+        let live = unsafe { &mut *(&raw mut vcpu::REGS) };
+        let old = core::mem::replace(&mut live.space, incoming);
+        crate::engine::flush();
+        crate::mmu::switch_to(live.space.0);
+        old
     }
 
     // ── Timer ──

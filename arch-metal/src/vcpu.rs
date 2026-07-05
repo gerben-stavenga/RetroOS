@@ -32,7 +32,7 @@ pub type Vcpu = arch_abi::Vcpu<crate::backend::Metal>;
 /// alignment / aliasing invariants against guest RAM, and holds no `unsafe`.
 /// `self` (the page-table root) is not consulted — the access reaches the active
 /// mapping (single-core; one space is live at a time).
-impl GuestBytes for RootPageTable {
+impl GuestBytes for crate::backend::Metal {
     fn read<T: Copy>(&self, addr: usize) -> T {
         let mut v = core::mem::MaybeUninit::<T>::uninit();
         let dst = v.as_mut_ptr() as *mut u8;

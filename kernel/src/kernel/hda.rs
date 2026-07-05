@@ -158,30 +158,30 @@ struct Hda {
 /// Find an HDA controller (class 0x04, subclass 0x03) anywhere on PCI, via the
 /// shared `pci::find_class` scan. Like `ac97::scan`, tolerant of a no-PCI
 /// backend (all 0xFFFF…).
-pub fn scan<A: crate::Arch>(arch: &mut A) -> Option<(u8, u8, u8)> {
-    crate::kernel::pci::find_class(arch, 0x04, 0x03)
+pub fn scan<A: crate::Arch>(machine: &mut A) -> Option<(u8, u8, u8)> {
+    crate::kernel::pci::find_class(machine, 0x04, 0x03)
 }
 
-pub fn init<A: crate::Arch>(arch: &mut A) {
+pub fn init<A: crate::Arch>(machine: &mut A) {
     if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedHda {
         return;
     }
-    let (bus, dev, func) = scan(arch).expect("platform probe saw an HDA controller; scan must agree");
-    let _ = bring_up(arch, bus, dev, func);
+    let (bus, dev, func) = scan(machine).expect("platform probe saw an HDA controller; scan must agree");
+    let _ = bring_up(machine, bus, dev, func);
 }
 
 /// Bring up the controller + codec output path at `bus:dev.func`. Returns true
 /// on success.
-fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
+fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     // Enable memory space + bus master in the PCI command register (bits 1, 2).
-    let cmd = crate::kernel::pci::read32(arch, bus, dev, func, 0x04);
-    crate::kernel::pci::write32(arch, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
+    let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
+    crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
 
     // BAR0 is a memory BAR. Read the high dword only if it is actually 64-bit
     // (type bits [2:1] == 0b10); a 32-bit BAR would make 0x14 a different reg.
-    let bar0 = crate::kernel::pci::read32(arch, bus, dev, func, 0x10);
+    let bar0 = crate::kernel::pci::read32(machine, bus, dev, func, 0x10);
     let hi = if bar0 & 0x6 == 0x4 {
-        crate::kernel::pci::read32(arch, bus, dev, func, 0x14) as u64
+        crate::kernel::pci::read32(machine, bus, dev, func, 0x14) as u64
     } else {
         0
     };
@@ -189,7 +189,7 @@ fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     if bar_phys == 0 {
         return false;
     }
-    arch.map_phys_range(BAR_WIN_VA >> 12, BAR_PAGES, bar_phys >> 12, PTE_CACHE_DISABLE);
+    machine.map_phys_range(BAR_WIN_VA >> 12, BAR_PAGES, bar_phys >> 12, PTE_CACHE_DISABLE);
 
     // Controller reset: drive CRST low, wait until it reads low, then high.
     w32(GCTL, 0);
@@ -225,11 +225,11 @@ fn bring_up<A: crate::Arch>(arch: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     let sd = SD_BASE + iss * SD_STRIDE;
 
     // Map the borrowed contiguous DMA buffer.
-    let phys_page = arch.dma_channel_buf(DMA_CHANNEL);
+    let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
     if phys_page == 0 {
         return false;
     }
-    arch.map_phys_range(DMA_WIN_VA >> 12, DMA_PAGES, phys_page, PTE_CACHE_DISABLE);
+    machine.map_phys_range(DMA_WIN_VA >> 12, DMA_PAGES, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
 
     let mut d = Hda {
@@ -590,8 +590,8 @@ impl Hda {
 
 /// Stream a block of source PCM to the HDA codec (called by `sound::play` when an
 /// HDA controller was discovered).
-pub fn play<A: crate::Arch>(arch: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
-    let _ = arch;
+pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
+    let _ = machine;
     let mut g = HDA.lock();
     if let Some(dev) = g.as_mut() {
         dev.submit(rate, fmt, bytes);

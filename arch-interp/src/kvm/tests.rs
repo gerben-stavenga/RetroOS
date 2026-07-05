@@ -48,7 +48,7 @@ fn kvm_engine_proofs() {
         return;
     }
     crate::mmu::init();
-    let mut mem = RootPageTable(crate::mmu::active_id());
+    let mut mem = crate::backend::Interp;
 
     // ── VM86: `int 0x31` (the trapped DPMI stub vector) from real-mode code.
     // The INT is IOPL-sensitive at IOPL=1 → #GP → shim → shared monitor →
@@ -124,7 +124,7 @@ fn kvm_engine_proofs() {
     let mut prog = vec![0xFF, 0x05];
     prog.extend_from_slice(&data.to_le_bytes());
     prog.extend_from_slice(&[0xCD, 0x80]);
-    let mut child_mem = RootPageTable(child);
+    let mut child_mem = crate::backend::Interp;
     child_mem.copy_to(code as usize, &prog);
     let mut r = Regs::empty();
     r.init_user_process(code, stack);

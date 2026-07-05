@@ -19,7 +19,7 @@
 //! IVT reflect) return [`MonitorResult::Resume`]; those needing kernel help
 //! (port emulation, soft INT dispatch, idle) return a typed [`KernelEvent`].
 
-use crate::{Arch, GuestBytes, IoSize, KernelEvent, Regs, UserMode, Vcpu};
+use crate::{Arch, GuestBytes, IoSize, KernelEvent, Regs, UserMode};
 
 /// Result of one monitor decode step. `Resume` is the fast path — the caller
 /// returns to ring-3. `Event(e)` carries a typed kernel event to bubble up.
@@ -239,15 +239,16 @@ fn string_io(regs: &mut Regs, cs_32: bool, advance: u32, rep: bool, addr32: bool
 /// Decode the instruction at CS:IP and either finish it inline (`Resume`) or
 /// return a typed kernel event (`Event`). At entry bit 9 of `regs.flags32()`
 /// holds the guest's virtual interrupt flag.
-pub fn monitor<A: Arch>(vcpu: &mut Vcpu<A>) -> MonitorResult {
-    let Vcpu { regs, space } = vcpu; // disjoint &mut to regs and guest memory
-    monitor_rs::<A>(regs, space)
+pub fn monitor<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
+    // `arch` IS the active-space accessor (`Arch: GuestBytes`) plus the segment
+    // and int-redirection oracle (its associated fns); `regs` is disjoint.
+    monitor_rs::<A>(arch, regs)
 }
 
 /// The decode body, in split `(regs, memory)` form — `step_virtual_if` drives
 /// it with the same two borrows. `A` is used only for its static segment/int
 /// resolution (`A::seg_base` etc.); memory is the `A::PageTable` handle.
-fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResult {
+fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     use KernelEvent as E;
     use MonitorResult::Event;
     let (cs_base, cs_32) = code_view::<A>(regs);
@@ -255,7 +256,7 @@ fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResu
     let start_ip = regs.ip32();
     // Read the i'th instruction byte. Not a closure — each call reborrows
     // `space` so the stack helpers below can also take `&mut` it.
-    macro_rules! peek { ($off:expr) => { space.read::<u8>(cs_base.wrapping_add(start_ip.wrapping_add($off)) as usize) }; }
+    macro_rules! peek { ($off:expr) => { arch.read::<u8>(cs_base.wrapping_add(start_ip.wrapping_add($off)) as usize) }; }
 
     // Parse the legacy prefixes we care about: 0x66 (operand-size), 0x67
     // (address-size), and 0xF2/0xF3 (REP — only meaningful on the string I/O
@@ -300,15 +301,15 @@ fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResu
         0x9C => {
             advance_ip(regs, cs_32, advance);
             let flags = guest_flags(regs);
-            if op32 { push32(regs, space, ss_base, ss_32, flags); }
-            else    { push16(regs, space, ss_base, ss_32, flags as u16); }
+            if op32 { push32(regs, arch, ss_base, ss_32, flags); }
+            else    { push16(regs, arch, ss_base, ss_32, flags as u16); }
             MonitorResult::Resume
         }
         // POPF / POPFD — IOPL/VM/real-IF preserved; the guest's bit-9 → VIF.
         0x9D => {
             advance_ip(regs, cs_32, advance);
-            let flags = if op32 { pop32(regs, space, ss_base, ss_32) }
-                        else    { pop16(regs, space, ss_base, ss_32) as u32 };
+            let flags = if op32 { pop32(regs, arch, ss_base, ss_32) }
+                        else    { pop16(regs, arch, ss_base, ss_32) as u32 };
             apply_guest_flags(regs, flags);
             MonitorResult::Resume
         }
@@ -316,9 +317,9 @@ fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResu
         0xCF => {
             // Don't pre-advance IP — we're loading it from the stack.
             if op32 {
-                let new_eip = pop32(regs, space, ss_base, ss_32);
-                let new_cs  = pop32(regs, space, ss_base, ss_32) as u16;
-                let new_fl  = pop32(regs, space, ss_base, ss_32);
+                let new_eip = pop32(regs, arch, ss_base, ss_32);
+                let new_cs  = pop32(regs, arch, ss_base, ss_32) as u16;
+                let new_fl  = pop32(regs, arch, ss_base, ss_32);
                 if new_cs == 0 {
                     return Event(E::Fault);
                 }
@@ -326,9 +327,9 @@ fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResu
                 regs.set_cs32(new_cs as u32);
                 apply_guest_flags(regs, new_fl);
             } else {
-                let new_ip = pop16(regs, space, ss_base, ss_32);
-                let new_cs = pop16(regs, space, ss_base, ss_32);
-                let new_fl = pop16(regs, space, ss_base, ss_32) as u32;
+                let new_ip = pop16(regs, arch, ss_base, ss_32);
+                let new_cs = pop16(regs, arch, ss_base, ss_32);
+                let new_fl = pop16(regs, arch, ss_base, ss_32) as u32;
                 if new_cs == 0 && regs.mode() != UserMode::VM86 {
                     return Event(E::Fault);
                 }
@@ -350,7 +351,7 @@ fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResu
             advance += 1;
             advance_ip(regs, cs_32, advance);
             if regs.mode() == UserMode::VM86 && !A::int_intercepted(vector) {
-                sw_reflect_vm86_int(regs, space, vector);
+                sw_reflect_vm86_int(regs, arch, vector);
                 MonitorResult::Resume
             } else {
                 Event(E::SoftInt(vector))
@@ -477,12 +478,11 @@ fn monitor_rs<A: Arch>(regs: &mut Regs, space: &mut A::PageTable) -> MonitorResu
 // - Only meaningful in PM mode with virtual IF already == 0.
 // - TF management lives entirely here; `monitor()` opcode handlers never touch TF.
 
-pub fn step_virtual_if<A: Arch>(vcpu: &mut Vcpu<A>) -> MonitorResult {
+pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     // Upper bound on sensitive instructions emulated before yielding back to
     // hardware. Prevents a runaway interpret loop on e.g. `POPF; POPF; ...`.
     const BUDGET: usize = 64;
 
-    let Vcpu { regs, space } = vcpu;
     for _ in 0..BUDGET {
         // Fast path: virtual IF (VIF) came back on — stop stepping.
         if regs.flags32() & VIF_FLAG != 0 {
@@ -496,14 +496,14 @@ pub fn step_virtual_if<A: Arch>(vcpu: &mut Vcpu<A>) -> MonitorResult {
         let (cs_base, _) = code_view::<A>(regs);
         let mut p = regs.ip32();
         loop {
-            let b = space.read::<u8>((cs_base.wrapping_add(p) as usize));
+            let b = arch.read::<u8>((cs_base.wrapping_add(p) as usize));
             if b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 {
                 p = p.wrapping_add(1);
             } else {
                 break;
             }
         }
-        let op = space.read::<u8>((cs_base.wrapping_add(p) as usize));
+        let op = arch.read::<u8>((cs_base.wrapping_add(p) as usize));
         // 0x9C PUSHF, 0x9D POPF, 0xCF IRET, 0xFA CLI, 0xFB STI.
         let must_emulate = matches!(op, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB);
         if !must_emulate {
@@ -514,7 +514,7 @@ pub fn step_virtual_if<A: Arch>(vcpu: &mut Vcpu<A>) -> MonitorResult {
         }
 
         // Sensitive: emulate via the monitor decoder and loop to re-check.
-        match monitor_rs::<A>(regs, space) {
+        match monitor_rs::<A>(arch, regs) {
             MonitorResult::Resume => continue,
             ev @ MonitorResult::Event(_) => return ev,
         }
