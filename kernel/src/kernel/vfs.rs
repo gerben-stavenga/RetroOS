@@ -42,11 +42,19 @@ const PATH_KEY_MAX: usize = 164;
 
 /// Filesystem trait — implemented by TarFs, Ext4Fs, etc. POSIX-strict; the
 /// DOS personality wraps this layer with its own case-folding cache (DFS).
+///
+/// This is 9P-shaped: `open(path)` is a fused Twalk+Topen returning a fid
+/// (`Vnode::handle`), `read`/`write` carry the offset per call (like `Tread`/
+/// `Twrite`, so a fid can be shared across independent offsets), `clunk`
+/// releases a fid (`Tclunk`), and `remove` deletes a path (`Tremove`).
+/// In-process servers implement it as direct calls; a future wire codec can
+/// marshal the same operations over virtio-9p / TCP behind this trait.
 pub trait Filesystem {
     /// Look up a file by normalized path, case-sensitively (POSIX).
+    /// Fused Twalk+Topen: returns a fid (`Vnode::handle`).
     fn open(&self, path: &[u8]) -> Option<Vnode>;
 
-    /// Read from a file identified by handle at given byte offset.
+    /// Read from a file identified by handle at given byte offset (Tread).
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
 
     /// Enumerate directory entries at index. Returns None at end.
@@ -58,17 +66,29 @@ pub trait Filesystem {
     /// Create (or truncate) a file. Returns vnode on success. Default = R/O.
     fn create(&self, _path: &[u8]) -> Option<Vnode> { None }
 
-    /// Write to a file identified by handle at given byte offset. Returns
-    /// bytes written, or negative errno. Default = R/O (silently accept).
+    /// Write to a file identified by handle at given byte offset (Twrite).
+    /// Returns bytes written, or negative errno. Default = R/O (silently accept).
     fn write(&self, _handle: u64, _offset: u32, data: &[u8]) -> i32 {
         data.len() as i32
     }
+
+    /// Release a fid (Tclunk). Default = no-op, for backends whose handle owns
+    /// no server-side resource (TarFs offsets, ext4 inode refs). Backends that
+    /// allocate per-open server state (hostfs COM1 fids, a future 9P client)
+    /// override this to free it. NOTE: the VFS does not yet call this on file
+    /// close — see `close_handle` for why (shared handles via `path_cache`).
+    fn clunk(&self, _handle: u64) {}
+
+    /// Remove a file by path (Tremove). Default = -1 (read-only / unsupported).
+    fn remove(&self, _path: &[u8]) -> i32 { -1 }
 }
 
-/// Identifies a file on a filesystem
+/// Identifies an open file on a filesystem — effectively a 9P fid plus the
+/// cached stat fields (`size`, `mode`) the qid/Tstat would carry. An explicit
+/// `Tstat` message is deferred until the wire codec needs it.
 #[derive(Clone, Copy)]
 pub struct Vnode {
-    pub handle: u64,  // filesystem-specific opaque handle (RAM_SENTINEL for overlay)
+    pub handle: u64,  // 9P fid: filesystem-specific opaque handle (RAM_SENTINEL for overlay)
     pub size: u32,
     /// POSIX permission bits (lower 12 — perms + setuid/setgid/sticky).
     /// Carried through from the backing filesystem (TAR's USTAR mode field,
@@ -111,14 +131,53 @@ pub struct FileEntry {
     pub ram_key_len: u8,
 }
 
-/// Mount table entry
+/// How a mount composes with any bindings already at its prefix — Plan 9's
+/// mount modes, trimmed to the two we use:
+/// - `Replace` — the single-winner mount (Plan 9 MREPL). Mounting `Replace` at
+///   a prefix first drops any existing bindings there, so the group has exactly
+///   one member. This reproduces the old longest-prefix table bit-for-bit and
+///   is the default; every startup mount uses it.
+/// - `Union` — stack a layer on top without removing what's there (Plan 9
+///   MBEFORE). A union group resolves most-recently-mounted first; `readdir`
+///   merges the members (an upper layer shadows a lower one on a name clash).
+///
+/// (Plan 9's MAFTER — stack at the *bottom* — has no consumer yet.)
+#[derive(Clone, Copy, PartialEq)]
+enum MountMode { Replace, Union }
+
+/// What a binding points at.
 #[derive(Clone, Copy)]
-struct Mount {
-    prefix: &'static [u8],  // e.g. b"" for root, b"boot/" for sub-mount
-    fs: &'static dyn Filesystem,
+enum BindTarget {
+    /// A real filesystem served at this prefix (a mount).
+    Server(&'static dyn Filesystem),
+    /// A redirect to another namespace path (a bind): a lookup here is retried
+    /// as `src_prefix + subpath`, so an existing subtree appears at a second
+    /// place (e.g. `bind disk1/games/ → games/`) with no backing fs of its own.
+    Alias { src_prefix: &'static [u8] },
 }
 
-const MAX_MOUNTS: usize = 6;
+/// One entry in the namespace: a prefix, what it points at, how it composes,
+/// and a monotonic sequence number that gives union members a stable order.
+///
+/// Prefixes and alias targets are `&'static` — boot-time mounts leak their
+/// (one-time, boot-lifetime) prefix, the same discipline the old fixed table
+/// used. The table is built entirely at startup before any file is opened, so
+/// the `mount_idx` values cached in `path_cache`/`file_table` (Vec indices)
+/// stay stable — do not mutate the table after boot without revisiting that.
+#[derive(Clone, Copy)]
+struct Binding {
+    prefix: &'static [u8],  // e.g. b"" for root, b"boot/" for sub-mount
+    target: BindTarget,
+    mode: MountMode,
+    seq: u32,
+}
+
+/// Max members in one union group (fixed scratch, no alloc on resolve). A
+/// union stack is tiny in practice; overflow drops the oldest layers (logged).
+const MAX_UNION: usize = 8;
+
+/// Alias (bind) expansion depth cap — breaks any accidental bind cycle.
+const ALIAS_DEPTH: u8 = 8;
 
 /// Single-directory readdir cache (avoids O(n²) re-scanning for sequential
 /// readdir). One directory cached at a time, growable so a flat dir with
@@ -152,8 +211,10 @@ static EMPTY_FS: EmptyFs = EmptyFs;
 
 /// All VFS state, behind one lock. See the module docs for the locking model.
 struct Vfs {
-    mounts: [Option<Mount>; MAX_MOUNTS],
-    mount_count: usize,
+    /// The namespace: an ordered, stackable, bind-capable mount table (the
+    /// composer). Built at startup; a Replace group is a single member.
+    mounts: Vec<Binding>,
+    next_seq: u32,
     /// Writable file overlay — persists across open/close cycles.
     ram_files: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Path-keyed vnode cache in front of `fs.open()` (skips the FS walk on
@@ -176,8 +237,8 @@ impl Vfs {
             ram_key_len: 0,
         };
         Vfs {
-            mounts: [None; MAX_MOUNTS],
-            mount_count: 0,
+            mounts: Vec::new(),
+            next_seq: 0,
             ram_files: BTreeMap::new(),
             path_cache: BTreeMap::new(),
             file_table: [EMPTY; MAX_OPEN_FILES],
@@ -185,76 +246,158 @@ impl Vfs {
         }
     }
 
-    // ── mount table ──────────────────────────────────────────────────────
+    // ── mount table (namespace composer) ─────────────────────────────────
 
-    /// Find the mount whose prefix matches `path`: (mount_index, fs, path-after-
-    /// prefix). Longest prefix wins; a path equal to a prefix sans trailing `/`
-    /// resolves to that mount's root.
-    fn resolve_mount<'a>(&self, path: &'a [u8]) -> (u8, &'static dyn Filesystem, &'a [u8]) {
-        let mut best_idx = 0u8;
-        let mut best_len = 0usize;
-        let mut found = false;
-        for i in 0..self.mount_count {
-            if let Some(ref m) = self.mounts[i] {
-                let plen = m.prefix.len();
-                let matches = m.prefix.is_empty()
-                    || (path.len() >= plen && eq_ignore_case(&path[..plen], m.prefix))
-                    || (plen > 0 && m.prefix.last() == Some(&b'/')
-                        && path.len() == plen - 1
-                        && eq_ignore_case(path, &m.prefix[..plen-1]));
-                if matches && (!found || plen > best_len) {
-                    best_idx = i as u8;
-                    best_len = plen.min(path.len());
-                    found = true;
+    /// Visit the members serving `path`, highest-priority first, each resolved
+    /// to `(mount_idx, fs, subpath)`, calling `f` per member; return the first
+    /// `Some` it yields (short-circuit). So `open` stops at the first hit and
+    /// `dir_exists` at the first existing dir, while a `readdir` closure that
+    /// always returns `None` visits every member in order (union merge). Alias
+    /// (bind) targets are expanded by retrying under `src_prefix`, depth-capped.
+    ///
+    /// For a `Replace` group (every startup mount) there is exactly one member,
+    /// so this reduces to the old single-winner longest-prefix lookup.
+    fn resolve_members<R>(
+        &self,
+        path: &[u8],
+        depth: u8,
+        f: &mut impl FnMut(u8, &'static dyn Filesystem, &[u8]) -> Option<R>,
+    ) -> Option<R> {
+        // Longest matching prefix length across all bindings.
+        let mut best: Option<usize> = None;
+        for b in &self.mounts {
+            if match_prefix(b.prefix, path).is_some() {
+                best = Some(best.map_or(b.prefix.len(), |x| x.max(b.prefix.len())));
+            }
+        }
+        let best = best?;
+
+        // Members at that prefix, ordered most-recently-mounted (highest seq)
+        // first. A Replace group is a single member; a union stacks here.
+        let mut members = [(0usize, 0u32); MAX_UNION];
+        let mut n = 0;
+        for (i, b) in self.mounts.iter().enumerate() {
+            if b.prefix.len() == best && match_prefix(b.prefix, path).is_some() {
+                if n < MAX_UNION {
+                    members[n] = (i, b.seq);
+                    n += 1;
+                } else {
+                    crate::dbg_println!(
+                        "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
                 }
             }
         }
-        if !found {
-            // Nothing mounted (e.g. the hosted bare-ELF Linux path, before a root
-            // fs exists). Resolve to the empty filesystem so opens miss with
-            // -ENOENT instead of panicking.
-            return (0, &EMPTY_FS, path);
-        }
-        let m = self.mounts[best_idx as usize].as_ref().unwrap();
-        (best_idx, m.fs, &path[best_len..])
-    }
+        members[..n].sort_by(|a, b| b.1.cmp(&a.1)); // seq desc = most-recent first
 
-    /// If `parent/<name>` (case-insensitive) is itself a mount point, return the
-    /// mount's directory component (e.g. parent=`home/retroos`, name=`BOOT` →
-    /// `b"boot"`). DFS uses this so a VFS mount point is a traversable directory
-    /// even though the parent's *backing* fs has no such readdir entry.
-    fn mount_child(&self, parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
-        let mut par = parent;
-        while par.first() == Some(&b'/') { par = &par[1..]; }
-        while par.last() == Some(&b'/') { par = &par[..par.len() - 1]; }
-        for i in 0..self.mount_count {
-            if let Some(ref m) = self.mounts[i] {
-                let prefix: &'static [u8] = m.prefix;
-                // Drop the trailing slash mount prefixes carry.
-                let p: &'static [u8] = if prefix.last() == Some(&b'/') {
-                    &prefix[..prefix.len() - 1]
-                } else { prefix };
-                if p.is_empty() { continue; } // root mount: no child name
-                let (dir, last): (&[u8], &'static [u8]) = match p.iter().rposition(|&b| b == b'/') {
-                    Some(idx) => (&p[..idx], &p[idx + 1..]),
-                    None => (&b""[..], p),
-                };
-                if eq_ignore_case(dir, par) && eq_ignore_case(last, name) {
-                    return Some(last);
+        for &(i, _) in &members[..n] {
+            let b = self.mounts[i];
+            let start = match_prefix(b.prefix, path).unwrap();
+            let subpath = &path[start..];
+            match b.target {
+                BindTarget::Server(fs) => {
+                    if let Some(r) = f(i as u8, fs, subpath) { return Some(r); }
+                }
+                BindTarget::Alias { src_prefix } => {
+                    if depth == 0 { continue; }
+                    // Retry the lookup as `src_prefix + subpath`.
+                    let mut buf = [0u8; PATH_KEY_MAX];
+                    let (pl, sl) = (src_prefix.len(), subpath.len());
+                    if pl + sl > buf.len() { continue; }
+                    buf[..pl].copy_from_slice(src_prefix);
+                    buf[pl..pl + sl].copy_from_slice(subpath);
+                    if let Some(r) = self.resolve_members(&buf[..pl + sl], depth - 1, f) {
+                        return Some(r);
+                    }
                 }
             }
         }
         None
     }
 
+    /// The single highest-priority `Server` member at the longest matching
+    /// prefix (non-allocating). Used by `create`/`delete`, which write to the
+    /// top layer. Alias heads and an empty table fall back to `EmptyFs` (so a
+    /// create on a bound or unmounted path lands on the RAM overlay).
+    fn resolve_head<'a>(&self, path: &'a [u8]) -> (u8, &'static dyn Filesystem, &'a [u8]) {
+        let mut best: Option<(usize, u32, usize, usize)> = None; // (plen, seq, idx, start)
+        for (i, b) in self.mounts.iter().enumerate() {
+            if let BindTarget::Server(_) = b.target
+                && let Some(start) = match_prefix(b.prefix, path) {
+                let better = match best {
+                    None => true,
+                    Some((bl, bseq, _, _)) =>
+                        b.prefix.len() > bl || (b.prefix.len() == bl && b.seq > bseq),
+                };
+                if better { best = Some((b.prefix.len(), b.seq, i, start)); }
+            }
+        }
+        match best {
+            Some((_, _, i, start)) => match self.mounts[i].target {
+                BindTarget::Server(fs) => (i as u8, fs, &path[start..]),
+                BindTarget::Alias { .. } => unreachable!(),
+            },
+            None => (0, &EMPTY_FS, path),
+        }
+    }
+
+    /// If `parent/<name>` (case-insensitive) is itself a mount/bind point,
+    /// return its directory component (e.g. parent=`home/retroos`, name=`BOOT`
+    /// → `b"boot"`). DFS uses this so a VFS mount point is a traversable
+    /// directory even though the parent's *backing* fs has no such readdir
+    /// entry. Both Server and Alias bindings expose their prefix here.
+    fn mount_child(&self, parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
+        let mut par = parent;
+        while par.first() == Some(&b'/') { par = &par[1..]; }
+        while par.last() == Some(&b'/') { par = &par[..par.len() - 1]; }
+        for b in &self.mounts {
+            let prefix: &'static [u8] = b.prefix;
+            // Drop the trailing slash mount prefixes carry.
+            let p: &'static [u8] = if prefix.last() == Some(&b'/') {
+                &prefix[..prefix.len() - 1]
+            } else { prefix };
+            if p.is_empty() { continue; } // root mount: no child name
+            let (dir, last): (&[u8], &'static [u8]) = match p.iter().rposition(|&b| b == b'/') {
+                Some(idx) => (&p[..idx], &p[idx + 1..]),
+                None => (&b""[..], p),
+            };
+            if eq_ignore_case(dir, par) && eq_ignore_case(last, name) {
+                return Some(last);
+            }
+        }
+        None
+    }
+
     fn mount_fs(&self, idx: u8) -> &'static dyn Filesystem {
-        self.mounts[idx as usize].as_ref().expect("VFS: invalid mount index").fs
+        match self.mounts[idx as usize].target {
+            BindTarget::Server(fs) => fs,
+            // A file handle only ever records a Server member (open resolves
+            // through Alias to the fs that actually held the file).
+            BindTarget::Alias { .. } => panic!("VFS: file handle points at a bind alias"),
+        }
+    }
+
+    /// Add a binding. `Replace` first drops any existing bindings at the exact
+    /// same prefix (single-winner); `Union` stacks on top. The whole table is
+    /// built at startup before any open, so this never reindexes live handles.
+    fn add_binding(&mut self, prefix: &'static [u8], target: BindTarget, mode: MountMode) {
+        if mode == MountMode::Replace {
+            self.mounts.retain(|b| !eq_ignore_case(b.prefix, prefix));
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.mounts.push(Binding { prefix, target, mode, seq });
     }
 
     fn mount(&mut self, prefix: &'static [u8], fs: &'static dyn Filesystem) {
-        assert!(self.mount_count < MAX_MOUNTS, "VFS: mount table full");
-        self.mounts[self.mount_count] = Some(Mount { prefix, fs });
-        self.mount_count += 1;
+        self.add_binding(prefix, BindTarget::Server(fs), MountMode::Replace);
+    }
+
+    fn mount_union(&mut self, prefix: &'static [u8], fs: &'static dyn Filesystem) {
+        self.add_binding(prefix, BindTarget::Server(fs), MountMode::Union);
+    }
+
+    fn bind(&mut self, prefix: &'static [u8], src_prefix: &'static [u8], mode: MountMode) {
+        self.add_binding(prefix, BindTarget::Alias { src_prefix }, mode);
     }
 
     // ── file table ───────────────────────────────────────────────────────
@@ -263,6 +406,15 @@ impl Vfs {
         (0..MAX_OPEN_FILES).find(|&i| self.file_table[i].refcount == 0)
     }
 
+    /// Drop one reference to a file-table entry. Frees the slot at refcount 0.
+    ///
+    /// This intentionally does NOT `clunk` the backing fid at refcount 0. The
+    /// `path_cache` caches each path's `Vnode` (fid included) indefinitely and
+    /// hands the *same* fid to every open of that path, so a live fid can be
+    /// referenced by the cache and by other file-table entries after this one
+    /// closes — clunking here would corrupt their reads and the next re-open.
+    /// Fid lifecycle therefore belongs with `path_cache` eviction, not here;
+    /// until then hostfs leaks one server handle per distinct path opened.
     fn close_handle(&mut self, idx: i32) {
         if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
             let entry = &mut self.file_table[idx as usize];
@@ -284,46 +436,60 @@ impl Vfs {
         self.dir_cache.valid = false;
     }
 
-    /// Populate the directory cache for `dir` (single pass).
+    /// Populate the directory cache for `dir` (single pass). Layers, top to
+    /// bottom (a name from a higher layer shadows the same name lower down):
+    /// the RAM overlay (writable, shadows the backing fs — matching `open`'s
+    /// RAM-first check), then the union stack of mounted filesystems (most-
+    /// recent first), then synthesized mount/bind-point directories.
     fn populate_dir_cache(&mut self, dir: &[u8]) {
         let dlen = dir.len().min(self.dir_cache.dir.len());
         self.dir_cache.dir[..dlen].copy_from_slice(&dir[..dlen]);
         self.dir_cache.dir_len = dlen;
-        self.dir_cache.entries.clear();
 
-        let (_midx, fs, subpath) = self.resolve_mount(dir);
-        let mut idx = 0usize;
-        while let Some(e) = fs.readdir(subpath, idx) {
-            self.dir_cache.entries.push(e);
-            idx += 1;
-        }
+        let mut entries: Vec<DirEntry> = Vec::new();
 
-        // Synthesize mount-point directories.
-        for i in 0..self.mount_count {
-            if let Some(ref m) = self.mounts[i]
-                && let Some(name) = mount_child_in_dir(m.prefix, dir) {
-                    let name_len = name.len().min(100);
-                    let mut de = DirEntry {
-                        name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
-                    };
-                    de.name[..name_len].copy_from_slice(&name[..name_len]);
-                    self.dir_cache.entries.push(de);
-                }
-        }
-
-        // RAM overlay files.
+        // RAM overlay files (writable layer, highest priority).
         for (key, data) in self.ram_files.iter() {
-            if let Some(basename) = entry_in_ram_dir(key, dir) {
+            if let Some(basename) = entry_in_ram_dir(key, dir)
+                && !dir_entries_has(&entries, basename) {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: data.len() as u32,
                     is_dir: false, mode: 0o644,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
-                self.dir_cache.entries.push(de);
+                entries.push(de);
             }
         }
 
+        // Union merge: visit every member of the group in priority order (most
+        // recent first); an upper layer shadows a lower one on a name clash.
+        // For a Replace group this is just the one backing fs (== old behavior).
+        self.resolve_members(dir, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            let mut idx = 0usize;
+            while let Some(e) = fs.readdir(subpath, idx) {
+                if !dir_entries_has(&entries, &e.name[..e.name_len]) {
+                    entries.push(e);
+                }
+                idx += 1;
+            }
+            None::<()>
+        });
+
+        // Synthesize mount/bind-point directories that live directly under `dir`.
+        for b in &self.mounts {
+            if let Some(name) = mount_child_in_dir(b.prefix, dir)
+                && !dir_entries_has(&entries, name) {
+                let name_len = name.len().min(100);
+                let mut de = DirEntry {
+                    name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
+                };
+                de.name[..name_len].copy_from_slice(&name[..name_len]);
+                entries.push(de);
+            }
+        }
+
+        self.dir_cache.entries = entries;
         self.dir_cache.valid = true;
     }
 
@@ -338,13 +504,14 @@ impl Vfs {
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
-        let (_midx, fs, subpath) = self.resolve_mount(path);
-        // A mount root (and the VFS root) is structurally a directory — answer
-        // without querying the backing fs. This avoids blocking on a mount
-        // whose transport is unresponsive: e.g. `ls /` stats the /host hostfs
-        // mount, and a hostfs read with no server attached hangs forever.
-        if subpath.is_empty() { return true; }
-        fs.dir_exists(subpath)
+        // True if any member of the group has this dir. A mount root (and the
+        // VFS root) is structurally a directory — a member with an empty
+        // subpath answers true without querying the backing fs, which avoids
+        // blocking on a mount whose transport is unresponsive (e.g. `ls /`
+        // stats the /host mount; a hostfs read with no server attached hangs).
+        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            if subpath.is_empty() || fs.dir_exists(subpath) { Some(()) } else { None }
+        }).is_some()
     }
 
     // ── open / create / read / write / seek ──────────────────────────────
@@ -387,9 +554,12 @@ impl Vfs {
             return table_idx as i32;
         }
 
-        let (midx, fs, subpath) = self.resolve_mount(path);
-        let vnode = match fs.open(subpath) {
-            Some(v) => v,
+        // Try each member of the group in priority order; first hit wins and
+        // its mount_idx is recorded (a Replace group = the single backing fs).
+        let (midx, vnode) = match self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
+            fs.open(subpath).map(|v| (idx, v))
+        }) {
+            Some(x) => x,
             None => return -2,
         };
 
@@ -412,7 +582,7 @@ impl Vfs {
     }
 
     fn create_to_handle(&mut self, path: &[u8]) -> i32 {
-        let (midx, fs, subpath) = self.resolve_mount(path);
+        let (midx, fs, subpath) = self.resolve_head(path);
         if let Some(vnode) = fs.create(subpath) {
             let table_idx = match self.alloc_file_entry() {
                 Some(i) => i,
@@ -456,8 +626,18 @@ impl Vfs {
     fn delete(&mut self, path: &[u8]) -> i32 {
         if self.ram_files.remove(path).is_some() {
             self.invalidate_dir_cache();
-            0
-        } else { -2 }
+            return 0;
+        }
+        // Not a RAM-overlay file: ask the backing filesystem (Tremove). Backends
+        // that can't (or are read-only) return the default -1.
+        let (_midx, fs, subpath) = self.resolve_head(path);
+        let r = fs.remove(subpath);
+        if r >= 0 {
+            // The cached vnode (and any shared backend handle) is now stale.
+            self.path_cache.remove(path);
+            self.invalidate_dir_cache();
+        }
+        r
     }
 
     fn read_by_handle(&mut self, handle: i32, buf: &mut [u8]) -> i32 {
@@ -595,6 +775,26 @@ pub fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+/// Does mount `prefix` match `path`? Returns the index in `path` where the
+/// subpath (path-after-prefix) begins, or `None`. The empty prefix (root)
+/// matches everything at 0; a path equal to a prefix sans its trailing `/`
+/// (e.g. `path="boot"` vs `prefix="boot/"`) matches with an empty subpath.
+fn match_prefix(prefix: &[u8], path: &[u8]) -> Option<usize> {
+    let plen = prefix.len();
+    if prefix.is_empty() {
+        Some(0)
+    } else if path.len() >= plen && eq_ignore_case(&path[..plen], prefix) {
+        Some(plen)
+    } else if prefix.last() == Some(&b'/')
+        && path.len() == plen - 1
+        && eq_ignore_case(path, &prefix[..plen - 1])
+    {
+        Some(path.len())
+    } else {
+        None
+    }
+}
+
 fn alloc_fd(fds: &[FdKind; MAX_FDS]) -> Option<usize> {
     (FIRST_FD..MAX_FDS).find(|&fd| fds[fd].is_none())
 }
@@ -606,6 +806,12 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
         FdKind::Vfs(idx) => Ok(idx),
         _ => Err(-9),
     }
+}
+
+/// Case-insensitive membership test over already-collected dir entries — the
+/// union-merge shadow rule (a name from a higher layer hides it below).
+fn dir_entries_has(entries: &[DirEntry], name: &[u8]) -> bool {
+    entries.iter().any(|e| eq_ignore_case(&e.name[..e.name_len], name))
 }
 
 fn clone_dir_entry(e: &DirEntry) -> DirEntry {
@@ -642,9 +848,29 @@ fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 // Called by syscalls.rs and vm86.rs.
 // ============================================================================
 
-/// Mount a filesystem at a prefix. Empty prefix = root.
+/// Mount a filesystem at a prefix (single-winner). Empty prefix = root.
+/// Replaces any binding already at that exact prefix.
 pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
     VFS.lock().mount(prefix, fs);
+}
+
+/// Union-mount a filesystem at a prefix: stack it on top of whatever is there
+/// (Plan 9 MBEFORE). Lookups try it first; `readdir` merges the layers.
+pub fn mount_union(prefix: &'static [u8], fs: &'static dyn Filesystem) {
+    VFS.lock().mount_union(prefix, fs);
+}
+
+/// Bind: make the subtree at `src_prefix` also appear at `prefix` (a path
+/// redirect, no backing fs of its own). `Replace` = single-winner at `prefix`;
+/// pass a union bind to stack it over an existing mount there.
+pub fn bind(prefix: &'static [u8], src_prefix: &'static [u8]) {
+    VFS.lock().bind(prefix, src_prefix, MountMode::Replace);
+}
+
+/// Union-bind: like [`bind`] but stacked on top (Plan 9 MBEFORE) so both the
+/// bound subtree and whatever was already at `prefix` compose there.
+pub fn bind_union(prefix: &'static [u8], src_prefix: &'static [u8]) {
+    VFS.lock().bind(prefix, src_prefix, MountMode::Union);
 }
 
 /// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.

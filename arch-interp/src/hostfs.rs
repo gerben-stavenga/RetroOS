@@ -101,8 +101,15 @@ impl HostFs {
                 }
                 Some((13 + dlen, self.write(le32(&buf[1..5]), le32(&buf[5..9]), &buf[13..13 + dlen])))
             }
-            CMD_CLOSE => Some((5.min(buf.len()).max(1), Vec::new())), // client never sends; no reply
-            _ => Some((1, Vec::new())),                              // unknown: skip one byte
+            CMD_CLOSE => {
+                // Tclunk: [cmd][u32 handle]. Fire-and-forget — free the fid, no reply.
+                if buf.len() < 5 {
+                    return None;
+                }
+                self.handles.remove(&le32(&buf[1..5]));
+                Some((5, Vec::new()))
+            }
+            _ => Some((1, Vec::new())), // unknown: skip one byte
         }
     }
 
