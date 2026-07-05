@@ -72,11 +72,11 @@ pub trait Filesystem {
         data.len() as i32
     }
 
-    /// Release a fid (Tclunk). Default = no-op, for backends whose handle owns
-    /// no server-side resource (TarFs offsets, ext4 inode refs). Backends that
-    /// allocate per-open server state (hostfs COM1 fids, a future 9P client)
-    /// override this to free it. NOTE: the VFS does not yet call this on file
-    /// close — see `close_handle` for why (shared handles via `path_cache`).
+    /// Release a fid (Tclunk). Called by the VFS when the last reference to an
+    /// open file closes (`close_handle`). Default = no-op, for backends whose
+    /// handle owns no per-open resource (TarFs's archive offset). Backends that
+    /// allocate per-open server state — ext4's `File` cursor, hostfs's COM1 /
+    /// native fid, a future 9P client — override this to free it.
     fn clunk(&self, _handle: u64) {}
 
     /// Remove a file by path (Tremove). Default = -1 (read-only / unsupported).
@@ -162,8 +162,8 @@ enum BindTarget {
 /// Prefixes and alias targets are `&'static` — boot-time mounts leak their
 /// (one-time, boot-lifetime) prefix, the same discipline the old fixed table
 /// used. The table is built entirely at startup before any file is opened, so
-/// the `mount_idx` values cached in `path_cache`/`file_table` (Vec indices)
-/// stay stable — do not mutate the table after boot without revisiting that.
+/// the `mount_idx` values stored in `file_table` (Vec indices) stay stable —
+/// do not mutate the table after boot without revisiting that.
 #[derive(Clone, Copy)]
 struct Binding {
     prefix: &'static [u8],  // e.g. b"" for root, b"boot/" for sub-mount
@@ -217,9 +217,6 @@ struct Vfs {
     next_seq: u32,
     /// Writable file overlay — persists across open/close cycles.
     ram_files: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// Path-keyed vnode cache in front of `fs.open()` (skips the FS walk on
-    /// repeated opens — matters most for ext4). RAM overlay shadows it.
-    path_cache: BTreeMap<Vec<u8>, (u8, Vnode)>,
     /// Global file table — slot is free when refcount == 0.
     file_table: [FileEntry; MAX_OPEN_FILES],
     dir_cache: DirCache,
@@ -240,7 +237,6 @@ impl Vfs {
             mounts: Vec::new(),
             next_seq: 0,
             ram_files: BTreeMap::new(),
-            path_cache: BTreeMap::new(),
             file_table: [EMPTY; MAX_OPEN_FILES],
             dir_cache: DirCache::new(),
         }
@@ -406,20 +402,25 @@ impl Vfs {
         (0..MAX_OPEN_FILES).find(|&i| self.file_table[i].refcount == 0)
     }
 
-    /// Drop one reference to a file-table entry. Frees the slot at refcount 0.
+    /// Drop one reference to a file-table entry; at refcount 0 release the slot
+    /// and `clunk` the backing fid (Tclunk).
     ///
-    /// This intentionally does NOT `clunk` the backing fid at refcount 0. The
-    /// `path_cache` caches each path's `Vnode` (fid included) indefinitely and
-    /// hands the *same* fid to every open of that path, so a live fid can be
-    /// referenced by the cache and by other file-table entries after this one
-    /// closes — clunking here would corrupt their reads and the next re-open.
-    /// Fid lifecycle therefore belongs with `path_cache` eviction, not here;
-    /// until then hostfs leaks one server handle per distinct path opened.
+    /// This is correct because every `open()` gets its *own* fid — there is no
+    /// shared-fid cache — so refcount 0 means the last reference to *this* fid
+    /// is gone. `dup`/`fork` share one file-table entry (refcount > 1), so the
+    /// fid is clunked exactly once, when the last of them closes; two
+    /// independent opens of the same path hold distinct fids and clunk
+    /// independently. RAM-overlay entries own no backing fid (skip).
     fn close_handle(&mut self, idx: i32) {
-        if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
-            let entry = &mut self.file_table[idx as usize];
-            if entry.refcount > 0 {
-                entry.refcount -= 1;
+        if idx < 0 || (idx as usize) >= MAX_OPEN_FILES { return; }
+        let i = idx as usize;
+        if self.file_table[i].refcount == 0 { return; }
+        self.file_table[i].refcount -= 1;
+        if self.file_table[i].refcount == 0 {
+            let handle = self.file_table[i].vnode.handle;
+            if handle != RAM_SENTINEL {
+                let midx = self.file_table[i].mount_idx;
+                self.mount_fs(midx).clunk(handle);
             }
         }
     }
@@ -539,31 +540,17 @@ impl Vfs {
             return table_idx as i32;
         }
 
-        // Path cache: skip fs.open if we've already resolved this path. The
-        // cached vnode's FS-internal handle is shared across file-table entries;
-        // each entry still has its own offset.
-        if let Some(&(midx, vnode)) = self.path_cache.get(path) {
-            let table_idx = match self.alloc_file_entry() {
-                Some(i) => i,
-                None => return -24,
-            };
-            self.file_table[table_idx] = FileEntry {
-                vnode, ino: path_ino(path), offset: 0, refcount: 1, mount_idx: midx,
-                ram_key: [0; PATH_KEY_MAX], ram_key_len: 0,
-            };
-            return table_idx as i32;
-        }
-
         // Try each member of the group in priority order; first hit wins and
         // its mount_idx is recorded (a Replace group = the single backing fs).
+        // Every open gets its OWN fid from `fs.open` — fids are never cached or
+        // shared, so `close_handle` can `clunk` this fid at refcount 0 without
+        // affecting any other open (see `close_handle`).
         let (midx, vnode) = match self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
             fs.open(subpath).map(|v| (idx, v))
         }) {
             Some(x) => x,
             None => return -2,
         };
-
-        self.path_cache.insert(path.to_vec(), (midx, vnode));
 
         let table_idx = match self.alloc_file_entry() {
             Some(i) => i,
@@ -633,8 +620,6 @@ impl Vfs {
         let (_midx, fs, subpath) = self.resolve_head(path);
         let r = fs.remove(subpath);
         if r >= 0 {
-            // The cached vnode (and any shared backend handle) is now stale.
-            self.path_cache.remove(path);
             self.invalidate_dir_cache();
         }
         r
