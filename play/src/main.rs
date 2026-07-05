@@ -62,6 +62,26 @@ fn main() {
     // composed here, on the thread that will run it.
     std::thread::spawn(move || {
         kernel::host_console_init();
+        // Inject the interp backend into the backend-agnostic kernel: the port
+        // I/O hooks (the deep driver call sites — `hdd::probe`, the vPIC/PIT —
+        // reach the interp's port bus through these, never via `&mut Arch`) and
+        // the host-environment facts the platform probe reads. `retroos-host`
+        // does the identical injection in `install_hosted_backend`; without it
+        // the port hooks stay `NONE`, `hdd::probe` reads garbage, and the disk
+        // is never detected (Diskless, only the embedded bootfs shows).
+        kernel::install_portio(kernel::PortIo {
+            inb: arch::inb,
+            inw: arch::inw,
+            inl: arch::inl,
+            outb: arch::outb,
+            outw: arch::outw,
+            outl: arch::outl,
+        });
+        kernel::set_host_env(kernel::HostEnv {
+            fbcon_active: || false,
+            debug: kernel::DebugSink::HostStdout,
+            is_metal: false,
+        });
         // Display: the kernel emulates the VGA and renders (single-VGA
         // design); install its present sink to park frames in the backend
         // mailbox the window thread blits from.
