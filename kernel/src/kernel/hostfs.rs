@@ -261,6 +261,7 @@ impl Filesystem for HostFs {
 ///   `create`→ (status, handle); status < 0 = fail.
 ///   `write` → bytes written, or negative errno.
 #[derive(Clone, Copy)]
+#[allow(clippy::type_complexity)] // the readdir hook's tuple reply is documented above
 pub struct HostBackendHooks {
     pub open: fn(&[u8]) -> (i32, u64, u32),
     pub read: fn(u64, u32, &mut [u8], u32) -> i32,

@@ -308,7 +308,7 @@ pub fn host_readdir(dir: &[u8], index: usize) -> (i32, [u8; 100], usize, u32, bo
     NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or((-1, [0; 100], 0, 0, false), |fs| fs.n_readdir(dir, index)))
 }
 pub fn host_dir_exists(path: &[u8]) -> bool {
-    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(false, |fs| fs.n_dir_exists(path)))
+    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().is_some_and(|fs| fs.n_dir_exists(path)))
 }
 pub fn host_create(path: &[u8]) -> (i32, u64) {
     NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or((-5, 0), |fs| fs.n_create(path)))
