@@ -139,6 +139,12 @@ fn main() {
         // drivable. Output already flows to stdout via the kernel's 0xE9 mirror.
         arch::enter_raw_mode();
         spawn_keyboard();
+        // Initialize guest RAM + the active address space before loading the
+        // ELF into it — the disk-boot path below does this via `init_guest_ram`
+        // too, but this branch diverges before reaching it. Without it the ELF
+        // loader's first `copy_to` resolves against no active space and panics
+        // ("active space missing").
+        arch::init_guest_ram(0);
         let mut machine = arch::Interp;
         kernel::host_run_elf(&mut machine, path.as_bytes(), data, argv);
     }
