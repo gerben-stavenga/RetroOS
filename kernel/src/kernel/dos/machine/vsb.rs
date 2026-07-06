@@ -200,7 +200,7 @@ impl SoundBlaster {
     /// state and OMF2's sound-init probe falls into a "wait for the card
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
-    pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
         if self.emulated() {
             // No real card / no buffer alias in emulation: just stop the
             // software DSP so the next program sees a clean, idle card.
@@ -396,7 +396,7 @@ impl SoundBlaster {
     /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
     /// virtual-8237 state after a task switch).
     #[allow(clippy::too_many_arguments)]
-    fn arm<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, chan: usize, host: usize, is16: bool,
+    fn arm<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
@@ -487,7 +487,7 @@ impl SoundBlaster {
     /// the real 8237 channel so the card stops pulling a buffer that's no
     /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
     /// replays it. Must run with this task's address space active.
-    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
         if self.emulated() { return; } // no real chip / alias to detach
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
@@ -733,7 +733,7 @@ impl SoundBlaster {
     pub fn audio_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
-        regs: &mut Regs,
+        _regs: &mut Regs,
         vpic: &mut super::vpic::VirtualPic,
     ) {
         if !self.emulated() {

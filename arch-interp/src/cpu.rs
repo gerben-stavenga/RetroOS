@@ -333,6 +333,9 @@ fn io_with<R>(f: impl FnOnce(&mut Unicorn<'static, Ctx>) -> R) -> R {
 /// that the redirection bitmap does NOT intercept is reflected to the guest's
 /// real-mode IVT here and execution continues — only trapped vectors (and the
 /// DPL=3 gates 3/4) bubble to the kernel.
+// `&mut *(&raw mut REGS)` is the `&raw`-first form that avoids a
+// `static_mut_refs` reference; clippy's `deref_addrof` rewrite would reintroduce it.
+#[allow(clippy::deref_addrof)]
 pub fn execute() -> KernelEvent {
     io_with(|uc| loop {
         // Service an off-thread VGA-screen snapshot request, and paint the live

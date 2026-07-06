@@ -40,6 +40,10 @@ impl Arch for Metal {
     // Bridge the loop-owned `Vcpu` to it around each call; the bridge copy is the
     // register file only (~200 B) — the address space / CR3 is touched only at
     // switch. (The internal frame goes away when the globals migrate into `Metal`.)
+    // `&mut *(&raw mut REGS)` is the deliberate `&raw`-first form that avoids a
+    // `static_mut_refs` reference; clippy's `deref_addrof` "simplification"
+    // would reintroduce exactly that, so allow it here.
+    #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
         // Bridge the loop-owned registers to the live trap frame for the run
         // (the active SPACE already lives in `REGS.space`), then read them back.
@@ -49,6 +53,7 @@ impl Arch for Metal {
         core::mem::swap(&mut live.regs, regs);
         ev
     }
+    #[allow(clippy::deref_addrof)] // `&raw const REGS`-first form; see `execute`
     fn activate(&mut self, incoming: RootPageTable, fx_ptr: *mut Self::Fx, hash_ptr: *mut u64) -> RootPageTable {
         // `activate` moves only the SPACE (registers are managed by `execute`).
         // The metal SWITCH_TO handler swaps both regs and space with the live

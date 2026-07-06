@@ -116,7 +116,7 @@ fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
     (year, month, day, day_of_week(year, month, day))
 }
 
-fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, regs: &Regs) -> (u16, u16) {
+fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, _regs: &Regs) -> (u16, u16) {
     let (hour, min, sec, _) = bios_time_of_day(machine);
     let (year, month, day, _) = cmos_date(machine);
     let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
@@ -3594,7 +3594,7 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     write_u16(machine, 0x40, 0x17, kbd_flags);
 }
 
-fn setup_lol_sft<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     let sft_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
     let cds_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
     let boot_seg = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16;
@@ -3718,7 +3718,7 @@ fn fill_env(env: &mut [u8], parent_env: &[u8], prog_name: &[u8]) {
 
 /// Initialize a freshly-allocated PSP at `psp_seg` to point at its env
 /// block at `env_seg`, with parent_psp / JFT / cmdline default fields set.
-fn init_psp<A: crate::Arch>(machine: &mut A, regs: &mut Regs, psp_seg: u16, env_seg: u16, parent_psp: u16) {
+fn init_psp<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, env_seg: u16, parent_psp: u16) {
     let mut jft = [0xFFu8; 20];
     jft[0] = 0; jft[1] = 1; jft[2] = 2;   // stdin/stdout/stderr → SFT 0/1/2
     let mut cmdline = [0u8; 127];

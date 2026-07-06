@@ -12,7 +12,6 @@
 //! kernel-facing shape of this type does not change.
 
 use arch_abi::GuestBytes;
-use super::paging2::RootPageTable;
 
 /// Register state + address-space handle for one execution context. The shape is
 /// shared across backends, so it is `arch_abi::Vcpu<P>` over this backend's

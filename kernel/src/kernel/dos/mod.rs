@@ -887,7 +887,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
 
     let (col, row) = vga::vga().cursor_pos();
     {
-        let regs = &mut t.kernel.vcpu;
+        let _regs = &mut t.kernel.vcpu;
         dos::Psp::set_cmdline(machine, loaded.psp_seg, &cmdline_tail);
         machine.write::<u8>(0x450, col as u8);
         machine.write::<u8>(0x451, row as u8);
@@ -935,7 +935,7 @@ fn snapshot_env<A: crate::Arch>(machine: &mut A, env_seg: u16) -> alloc::vec::Ve
 /// `dos.current_psp` is always a segment; PSP[0x2C] may have been
 /// converted to a selector at DPMI entry, so use `saved_rm_env` when the
 /// active PSP matches the one whose env we patched.
-pub fn snapshot_parent_env<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
+pub fn snapshot_parent_env<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
@@ -1110,7 +1110,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
 /// Mirror `dos.dos_blocks` out as a real DOS Memory Control Block chain
 /// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
 /// walks contiguously from `heap_base_seg` up to 0xA000.
-fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, regs: &mut Regs) {
+fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mut Regs) {
     let mut blocks = dos.dos_blocks.clone();
     blocks.sort_by_key(|b| b.seg);
 

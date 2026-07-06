@@ -33,6 +33,10 @@ impl Arch for Interp {
     // The interp still keeps an internal live frame (`vcpu::REGS`) that its CPU
     // core syncs against; bridge the loop-owned `Vcpu` to it around each call.
     // (The internal frame goes away when the globals migrate into `Interp`.)
+    // `&mut *(&raw mut REGS)` is the `&raw`-first form that avoids a
+    // `static_mut_refs` reference; clippy's `deref_addrof` rewrite would
+    // reintroduce it.
+    #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
         // Bridge the loop-owned registers to the backend's live frame for the
         // run (the active SPACE already lives in `REGS.space`), then read them
@@ -43,6 +47,10 @@ impl Arch for Interp {
         core::mem::swap(&mut live.regs, regs);
         ev
     }
+    // deref_addrof: same `&raw`-first REGS idiom as `execute`.
+    // not_unsafe_ptr_arg_deref: the `*mut Fx`/`*mut u64` args are the trait's
+    // fixed signature; the deref is guarded by the `is_null` check above.
+    #[allow(clippy::deref_addrof, clippy::not_unsafe_ptr_arg_deref)]
     fn activate(&mut self, incoming: RootPageTable, fx_ptr: *mut Self::Fx, _hash_ptr: *mut u64) -> RootPageTable {
         // Swap the live FPU with the thread's save area (null ⇒ transient
         // kernel-only swap, skip). KVM: state is the vcpu's XSAVE; TCG: no-op.

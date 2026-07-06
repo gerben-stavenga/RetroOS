@@ -152,7 +152,7 @@ fn push16<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bo
 #[inline]
 fn pop16<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool) -> u16 {
     let cur = get_sp(regs, ss_32);
-    let val = space.read::<u16>((ss_base.wrapping_add(cur) as usize));
+    let val = space.read::<u16>(ss_base.wrapping_add(cur) as usize);
     set_sp(regs, ss_32, cur.wrapping_add(2));
     val
 }
@@ -167,7 +167,7 @@ fn push32<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bo
 #[inline]
 fn pop32<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool) -> u32 {
     let cur = get_sp(regs, ss_32);
-    let val = space.read::<u32>((ss_base.wrapping_add(cur) as usize));
+    let val = space.read::<u32>(ss_base.wrapping_add(cur) as usize);
     set_sp(regs, ss_32, cur.wrapping_add(4));
     val
 }
@@ -496,14 +496,14 @@ pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult 
         let (cs_base, _) = code_view::<A>(regs);
         let mut p = regs.ip32();
         loop {
-            let b = arch.read::<u8>((cs_base.wrapping_add(p) as usize));
+            let b = arch.read::<u8>(cs_base.wrapping_add(p) as usize);
             if b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 {
                 p = p.wrapping_add(1);
             } else {
                 break;
             }
         }
-        let op = arch.read::<u8>((cs_base.wrapping_add(p) as usize));
+        let op = arch.read::<u8>(cs_base.wrapping_add(p) as usize);
         // 0x9C PUSHF, 0x9D POPF, 0xCF IRET, 0xFA CLI, 0xFB STI.
         let must_emulate = matches!(op, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB);
         if !must_emulate {

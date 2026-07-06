@@ -9,7 +9,6 @@
 #![allow(unused_variables)]
 
 use crate::space::RootPageTable;
-use crate::vcpu::Vcpu;
 use arch_abi::KernelEvent;
 
 /// Arch call numbers — kept identical to the metal backend (`traps::arch_call`)
