@@ -13,7 +13,7 @@ rust_library(
     # Engine selection is per-target: exactly one of tcg/kvm.
     crate_features = ["tcg"],
     edition = "2021",
-    # abort matches //lib and //arch-abi (see //kernel:kernel_hosted).
+    # abort matches //lib and //arch-abi (see //kernel:kernel).
     rustc_flags = [
         "-Cpanic=abort",
         # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
