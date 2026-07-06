@@ -168,7 +168,9 @@ enum BindTarget {
 struct Binding {
     prefix: &'static [u8],  // e.g. b"" for root, b"boot/" for sub-mount
     target: BindTarget,
-    mode: MountMode,
+    // NB: the mount MODE (Replace vs Union) is applied when the binding is
+    // added (Replace drops peers at the prefix; see `add_binding`) — it does
+    // not need to persist per-binding, so it is not stored here.
     seq: u32,
 }
 
@@ -283,7 +285,7 @@ impl Vfs {
                 }
             }
         }
-        members[..n].sort_by(|a, b| b.1.cmp(&a.1)); // seq desc = most-recent first
+        members[..n].sort_by_key(|&(_, seq)| core::cmp::Reverse(seq)); // most-recent (highest seq) first
 
         for &(i, _) in &members[..n] {
             let b = self.mounts[i];
@@ -381,7 +383,7 @@ impl Vfs {
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        self.mounts.push(Binding { prefix, target, mode, seq });
+        self.mounts.push(Binding { prefix, target, seq });
     }
 
     fn mount(&mut self, prefix: &'static [u8], fs: &'static dyn Filesystem) {
