@@ -257,6 +257,14 @@ pub fn get() -> &'static Platform {
     }
 }
 
+/// Whether `probe` has run. The full disk-boot / windowed paths always probe;
+/// the minimal bare-ELF dev path (`host_run_elf`) does not. Lets the few
+/// pieces reachable from that path (console-VGA snapshot on thread exit) pick a
+/// sane default instead of tripping `get`'s panic-if-unprobed invariant.
+pub fn probed() -> bool {
+    unsafe { (&raw const PLATFORM).as_ref().unwrap().is_some() }
+}
+
 /// The audio probe is uniform across backends: an absent ISA device reads
 /// 0xFF (so no-SB is the same answer on the interpreter's port bus and on
 /// card-less metal), PCI config reads are 0xFFFFFFFF where there is no PCI,

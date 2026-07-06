@@ -84,11 +84,12 @@ jobs:
         run: |
           gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
             -o /tmp/hello.elf apps/hosted-test/hello.c
-          # The bare-ELF dev path never runs platform::probe(), so it prints the
-          # message then parks; cap it with timeout and assert on the output.
+          # The program prints its greeting then exit(0)s; cap with timeout.
           out=$(timeout 20 bazel-bin/kernel/retroos-host /tmp/hello.elf 2>&1 || true)
           echo "$out"
           echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
+          # ...and it must exit cleanly — no kernel panic behind the greeting.
+          if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the bare-ELF path"; exit 1; fi
 
       # End-to-end games: boot each headless, drive keyboard, assert no kernel
       # panic (and, for text-mode programs, an expected on-screen string).
