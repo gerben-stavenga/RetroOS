@@ -267,6 +267,11 @@ pub trait Arch: Sized + GuestBytes {
     fn map_vga_text_aperture(&mut self);
     /// Load the LDT (write base+limit into the GDT slot and `LLDT`).
     fn load_ldt(&mut self, ldt: &[u64]);
+    /// Notify the backend that the active thread's LDT descriptors changed
+    /// (a DPMI descriptor edit). Metal reads the live hardware LDT, so the
+    /// default is a no-op; the interpreter uses it to re-materialize its
+    /// software copy of the descriptor tables before the next guest entry.
+    fn on_ldt_changed(&mut self) {}
     /// Map a range of physical pages into user virtual space.
     fn map_phys_range(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64);
     /// Allocate `num_pages` physically contiguous, ISA-DMA-safe pages
