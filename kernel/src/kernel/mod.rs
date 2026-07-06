@@ -23,6 +23,7 @@ pub mod portio;
 pub mod sched;
 pub mod keyboard;
 pub mod kpipe;
+pub mod net;
 pub mod klog;
 pub mod linux;
 pub mod sound;

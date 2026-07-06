@@ -34,6 +34,9 @@ pub enum FdKind {
     /// index to return; getdents64 advances it on each call so a sequential
     /// reader sees each entry exactly once and EOF after the last.
     Dir(u32),
+    /// Network socket — the i32 is the backend socket handle (injected socket
+    /// layer; hosted std::net punch-through).
+    Socket(i32),
 }
 
 impl FdKind {
@@ -371,6 +374,9 @@ impl<A: crate::Arch> KernelThread<A> {
             FdKind::PipeWrite(idx) => {
                 crate::kernel::kpipe::close_writer(idx);
             }
+            FdKind::Socket(h) => {
+                crate::kernel::net::close(h);
+            }
             FdKind::ConsoleOut | FdKind::None | FdKind::Dir(_) => {}
         }
         self.fds[fd] = FdKind::None;
@@ -409,6 +415,9 @@ impl<A: crate::Arch> KernelThread<A> {
                 FdKind::PipeWrite(idx) => {
                     crate::kernel::kpipe::add_writer(idx);
                 }
+                // TODO: refcount for fork/dup socket sharing — for now the child
+                // inherits the same backend handle; the first close frees it.
+                FdKind::Socket(_) => {}
                 FdKind::ConsoleOut | FdKind::None | FdKind::Dir(_) => {}
             }
         }

@@ -104,6 +104,7 @@ fn main() {
     // the deep driver call sites (portio), and the host environment facts the
     // platform probe reads (HostStdout debug, no fbcon, not metal).
     install_hosted_backend();
+    install_socket_backend_hosted();
     kernel::host_console_init();
     // Display: the kernel emulates the VGA (single-VGA design) and renders
     // frames through its present sink; we just park them in the backend's
@@ -207,6 +208,28 @@ fn install_hosted_backend() {
         fbcon_active: || false,
         debug: kernel::DebugSink::HostStdout,
         is_metal: false,
+    });
+}
+
+/// Install the native socket backend (hosted "punch-through" → host std::net).
+/// Networking is always available on hosted; metal installs nothing here (its
+/// NIC + smoltcp path is a future follow-up). Must run on the CPU/kernel thread
+/// (the native socket table is thread-local), before `startup`.
+fn install_socket_backend_hosted() {
+    arch::install_native_sockets();
+    kernel::install_socket_backend(kernel::SocketHooks {
+        socket: arch::host_sock_socket,
+        connect: arch::host_sock_connect,
+        bind: arch::host_sock_bind,
+        listen: arch::host_sock_listen,
+        accept: arch::host_sock_accept,
+        sendto: arch::host_sock_sendto,
+        recvfrom: arch::host_sock_recvfrom,
+        setsockopt: arch::host_sock_setsockopt,
+        getsockname: arch::host_sock_getsockname,
+        getpeername: arch::host_sock_getpeername,
+        shutdown: arch::host_sock_shutdown,
+        close: arch::host_sock_close,
     });
 }
 

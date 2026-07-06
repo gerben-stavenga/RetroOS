@@ -57,6 +57,7 @@ mod desc;
 mod devices;
 mod engine;
 mod hostfs;
+mod net;
 #[cfg(feature = "kvm")]
 mod kvm;
 mod machine;
@@ -100,6 +101,15 @@ pub use devices::{
 pub use hostfs::{
     host_clunk, host_create, host_dir_exists, host_open, host_read, host_readdir,
     host_remove, host_write, install_native_hostfs,
+};
+// Native socket backend (hosted "punch-through"): `install_native_sockets`
+// enables it; the `host_sock_*` fns are the primitive hooks the kernel's
+// `install_socket_backend` points at (direct std::net).
+pub use net::{
+    host_sock_accept, host_sock_bind, host_sock_close, host_sock_connect,
+    host_sock_getpeername, host_sock_getsockname, host_sock_listen, host_sock_recvfrom,
+    host_sock_sendto, host_sock_setsockopt, host_sock_shutdown, host_sock_socket,
+    install_native_sockets,
 };
 // Host-side VGA text-screen snapshotting (headless inspection of the guest's
 // 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the
