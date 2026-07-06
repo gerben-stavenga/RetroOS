@@ -87,6 +87,23 @@ fn main() {
             debug: kernel::DebugSink::HostStdout,
             is_metal: false,
         });
+        // Native socket backend (hosted "punch-through" → host std::net); the
+        // socket table is thread-local, so install it on this CPU/kernel thread.
+        arch::install_native_sockets();
+        kernel::install_socket_backend(kernel::SocketHooks {
+            socket: arch::host_sock_socket,
+            connect: arch::host_sock_connect,
+            bind: arch::host_sock_bind,
+            listen: arch::host_sock_listen,
+            accept: arch::host_sock_accept,
+            sendto: arch::host_sock_sendto,
+            recvfrom: arch::host_sock_recvfrom,
+            setsockopt: arch::host_sock_setsockopt,
+            getsockname: arch::host_sock_getsockname,
+            getpeername: arch::host_sock_getpeername,
+            shutdown: arch::host_sock_shutdown,
+            close: arch::host_sock_close,
+        });
         // Display: the kernel emulates the VGA and renders (single-VGA
         // design); install its present sink to park frames in the backend
         // mailbox the window thread blits from.
