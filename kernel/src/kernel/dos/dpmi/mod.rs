@@ -165,6 +165,9 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
     dos_trace!("[DPMI] ENTER -> pm cs:eip={:04X}:{:08X} ss:esp={:04X}:{:08X} ds={:04X} es={:04X}",
         regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(),
         regs.ds as u16, regs.es as u16);
+    // Client CS/DS/SS descriptors were written into the LDT above — the backend
+    // must re-materialize its descriptor tables before the next entry.
+    machine.on_ldt_changed();
 }
 
 // PM #GP monitor lives in `arch/monitor.rs`. The arch decoder handles
@@ -180,7 +183,18 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
 /// PM client-initiated INT 31h — the DPMI service API, dispatched by AX.
 /// Caller (`dos::syscall`) has already classified the trap as client-side
 /// (CS not in the kernel's stub LDT slots).
+///
+/// Wrapper: any INT 31h handler may edit the LDT (descriptor alloc / set base /
+/// set limit), so unconditionally tell the backend to re-materialize its
+/// descriptor tables after dispatch — cheap (INT 31h is rare vs guest
+/// instructions) and catches every early-return path in the inner dispatch.
 pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+    let action = dpmi_api_inner(machine, dos, regs);
+    machine.on_ldt_changed();
+    action
+}
+
+fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {

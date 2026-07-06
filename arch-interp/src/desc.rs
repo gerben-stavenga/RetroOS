@@ -42,6 +42,13 @@ struct Desc {
     ldt_len: usize,
     tls: [Tls; TLS_SLOTS],
     int_redir: [u8; 32],
+    // The SYS-frame GDT/LDT are arch's materialized copy of the ACTIVE thread's
+    // descriptors (persistent guest memory). `dirty` means they need a rewrite
+    // before the next guest entry; it is set on swap / descriptor edit / TLS
+    // change and cleared by `ensure_tables`. `ldt_limit` caches the last
+    // materialized LDTR limit so a clean entry needs no recompute.
+    ldt_limit: u32,
+    dirty: bool,
 }
 
 thread_local! {
@@ -51,6 +58,8 @@ thread_local! {
             ldt_len: 0,
             tls: [Tls { base: 0, limit: 0, present: false }; TLS_SLOTS],
             int_redir: INT_REDIR_INIT,
+            ldt_limit: 0,
+            dirty: true,
         })
     };
 }
@@ -61,18 +70,46 @@ pub fn int_intercepted(n: u8) -> bool {
     DESC.with(|d| d.borrow().int_redir[(n / 8) as usize] & (1 << (n % 8)) != 0)
 }
 
-/// The loaded LDT descriptors, copied out for programming the software CPU's
-/// LDT (cpu.rs writes these into a scratch table Unicorn reads as `env->ldt`).
-pub fn ldt_raw() -> std::vec::Vec<u64> {
+/// Copy the loaded LDT straight into the SYS LDT frame at `dst` (no heap), for
+/// `sysdesc::materialize`. Returns the LDTR limit. Mirrors the old `write_tables`
+/// cap of `LDT_MAX_BYTES/8` descriptors.
+pub(crate) fn copy_ldt_into(dst: *mut u8) -> u32 {
     DESC.with(|d| {
         let d = d.borrow();
         if d.ldt.is_null() {
-            return std::vec::Vec::new();
+            return 0;
         }
-        (0..d.ldt_len)
-            .map(|i| unsafe { core::ptr::read_unaligned(d.ldt.add(i)) })
-            .collect()
+        let n = d.ldt_len.min(crate::sysdesc::LDT_MAX_BYTES / 8);
+        for i in 0..n {
+            let desc = unsafe { core::ptr::read_unaligned(d.ldt.add(i)) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(desc.to_le_bytes().as_ptr(), dst.add(i * 8), 8);
+            }
+        }
+        if n == 0 { 0 } else { (n * 8 - 1) as u32 }
     })
+}
+
+/// Mark the materialized descriptor tables stale (rewrite before next entry).
+/// Called on descriptor edits (`on_ldt_changed`) and thread swap (`activate`).
+pub fn mark_ldt_dirty() {
+    DESC.with(|d| d.borrow_mut().dirty = true);
+}
+
+/// Consume the dirty flag: true (and clear) if the tables need materializing.
+pub(crate) fn take_dirty() -> bool {
+    DESC.with(|d| {
+        let mut d = d.borrow_mut();
+        core::mem::replace(&mut d.dirty, false)
+    })
+}
+
+pub(crate) fn ldt_limit() -> u32 {
+    DESC.with(|d| d.borrow().ldt_limit)
+}
+
+pub(crate) fn set_ldt_limit(l: u32) {
+    DESC.with(|d| d.borrow_mut().ldt_limit = l);
 }
 
 /// Visit each present TLS slot as `(gdt_index, base, limit)` so cpu.rs can place
@@ -93,6 +130,7 @@ pub fn load_ldt(ldt: &[u64]) {
         let mut d = d.borrow_mut();
         d.ldt = ldt.as_ptr();
         d.ldt_len = ldt.len();
+        d.dirty = true; // new active LDT ⇒ re-materialize before next entry
     });
 }
 
@@ -105,6 +143,7 @@ pub fn set_tls_entry(index: i32, base: u32, limit: u32) -> i32 {
             d.tls.iter().position(|t| !t.present).unwrap_or(0)
         };
         d.tls[slot] = Tls { base, limit, present: true };
+        d.dirty = true; // GDT TLS slot changed ⇒ re-materialize
         (TLS_MIN + slot) as i32
     })
 }

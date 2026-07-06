@@ -64,7 +64,14 @@ impl Arch for Interp {
         let old = core::mem::replace(&mut live.space, incoming);
         crate::engine::flush();
         crate::mmu::switch_to(live.space.0);
+        // A swap changes the active thread ⇒ its descriptor tables must be
+        // re-materialized before the next entry (catch-all for DOS and Linux).
+        crate::desc::mark_ldt_dirty();
         old
+    }
+
+    fn on_ldt_changed(&mut self) {
+        crate::desc::mark_ldt_dirty();
     }
 
     // ── Timer ──

@@ -137,7 +137,10 @@ pub(crate) fn ensure_sys_window() {
 /// LDT (the kernel's active table) in the SYS-window frames. Returns the LDT
 /// byte limit (the GDTR/LDTR bases are set by the engine, which knows its
 /// paging phase). Writes go to the shared phys frames, not through the CPU.
-pub(crate) fn write_tables() -> u32 {
+/// Rebuild the GDT + LDT in the SYS frames from the active thread's descriptor
+/// state, caching the LDTR limit. Called only when the tables are dirty (thread
+/// swap / descriptor edit / TLS change) — NOT on every entry.
+fn materialize() {
     use arch_abi::{USER_CS, USER_DS};
     let mut gdt = [0u64; 32];
     gdt[(KERNEL_CS >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0x9A, 0xC); // ring-0 code32
@@ -159,11 +162,17 @@ pub(crate) fn write_tables() -> u32 {
         unsafe { core::ptr::copy_nonoverlapping(d.to_le_bytes().as_ptr(), gp.add(i * 8), 8); }
     }
 
-    let ldt = crate::desc::ldt_raw();
-    let n = ldt.len().min(LDT_MAX_BYTES / 8);
-    let lp = sys_ptr(LDT_ADDR);
-    for (i, d) in ldt.iter().take(n).enumerate() {
-        unsafe { core::ptr::copy_nonoverlapping(d.to_le_bytes().as_ptr(), lp.add(i * 8), 8); }
+    // LDT copied straight from the kernel's slice into the SYS frame — no heap.
+    let limit = crate::desc::copy_ldt_into(sys_ptr(LDT_ADDR));
+    crate::desc::set_ldt_limit(limit);
+}
+
+/// Return the LDTR limit, rebuilding the SYS-frame tables first iff they are
+/// dirty. The per-entry hook: a clean entry (the common render-loop case) does
+/// no table work at all, just returns the cached limit for LDTR programming.
+pub(crate) fn ensure_tables() -> u32 {
+    if crate::desc::take_dirty() {
+        materialize();
     }
-    if n == 0 { 0 } else { (n * 8 - 1) as u32 }
+    crate::desc::ldt_limit()
 }

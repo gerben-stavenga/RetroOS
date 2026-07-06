@@ -12,7 +12,7 @@
 use super::setup::{with, KvmCpu};
 use super::shim::{read_frame, ShimFrame, SHIM_PORT};
 use crate::sysdesc::{
-    if_to_vif, sys_ptr, vif_to_if, write_tables, GDT_ADDR, GDT_BYTES, IDT_ADDR, IOPL_MASK,
+    if_to_vif, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES, IDT_ADDR, IOPL_MASK,
     LDT_ADDR, LDT_SEL, NT_FLAG, TF_FLAG, TSS_ADDR, TSS_SEL, VIF_FLAG, VM_FLAG,
 };
 use arch_abi::monitor::MonitorResult;
@@ -110,7 +110,7 @@ fn decode_sel(sel: u16) -> kvm_segment {
 /// context, which is exactly the TLB flush the kernel's host-side page-table
 /// edits require before re-entry.
 fn enter(k: &mut KvmCpu, r: &Regs, mode: UserMode) {
-    let ldt_limit = write_tables();
+    let ldt_limit = ensure_tables();
 
     let mut sregs = k.sregs0;
     sregs.cr0 = 0x8000_0033; // PG | NE | ET | MP | PE (NE: VMX fixed-1; WP off like a 486)

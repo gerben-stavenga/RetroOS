@@ -17,7 +17,7 @@
 //!   (a deterministic timer tick → `Irq`).
 
 use crate::sysdesc::{
-    ensure_sys_window, if_to_vif, sys_phys, sys_ptr, vif_to_if, write_tables, GDT_ADDR, GDT_BYTES,
+    ensure_sys_window, if_to_vif, sys_phys, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES,
     IF_FLAG, IOPL_MASK, KERNEL_CS, KERNEL_DS, LDT_ADDR, LDT_SEL, NT_FLAG, RING0_SP_TOP, SYS_BASE,
     SYS_SIZE, TF_FLAG, TRAMP_ADDR, VIF_FLAG, VM_FLAG,
 };
@@ -649,7 +649,7 @@ fn run_trampoline(uc: &mut Unicorn<'static, Ctx>, frame: &[u32], pre_segs: Optio
     w(uc, RegisterX86::SS, 0);
 
     // 2. Tables into the SYS frames; GDTR/LDTR at the PHYSICAL base while PG=0.
-    let ldt_limit = write_tables();
+    let ldt_limit = ensure_tables();
     set_mmr(uc, RegisterX86::GDTR, 0, sys_phys(GDT_ADDR), (GDT_BYTES - 1) as u32, 0);
     set_mmr(uc, RegisterX86::LDTR, LDT_SEL, sys_phys(LDT_ADDR), ldt_limit, 0x8200);
 
