@@ -122,6 +122,12 @@ impl HostFs {
     }
 }
 
+impl Default for HostFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Filesystem for HostFs {
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         if !is_ready() { return None; }

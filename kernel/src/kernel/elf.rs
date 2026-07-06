@@ -5,7 +5,6 @@
 
 const PAGE_SIZE: usize = 4096;
 extern crate alloc;
-use crate::Regs;
 use alloc::vec::Vec;
 pub use lib::elf::{ElfError, ElfClass};
 

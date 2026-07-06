@@ -316,7 +316,7 @@ impl MouseState {
     /// already drawn at this cell. Real Microsoft Mouse drivers also do this
     /// in graphics modes via a sprite — we don't (yet); games that go to
     /// mode 13h hide the driver cursor and draw their own anyway.
-    pub fn render_if_visible<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn render_if_visible<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
         if self.show_count > 0 { return; }
         let col = (self.x >> 3) as u32;
         let row = (self.y >> 3) as u32;
@@ -344,7 +344,7 @@ impl MouseState {
     }
 
     /// AX=02h — hide cursor: increment counter; if it was 0, erase.
-    pub fn hide<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn hide<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
         if self.show_count <= 0 { self.erase_cursor(machine); }
         self.show_count += 1;
     }

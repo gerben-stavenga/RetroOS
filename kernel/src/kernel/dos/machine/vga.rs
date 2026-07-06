@@ -1036,6 +1036,7 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 /// `def32` (default operand & address size) are resolved by the caller, which
 /// has the LDT. Returns false (→ real SEGV) for an instruction we don't model,
 /// so a gap is loud rather than silent corruption.
+#[allow(clippy::too_many_arguments)] // planar #PF decode needs the full seg/mode context
 pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga: &mut VgaState, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
     let vm86 = regs.mode() == crate::UserMode::VM86;
     let ip0 = if def32 { regs.ip32() } else { regs.ip32() & 0xFFFF };
@@ -1460,7 +1461,7 @@ impl VgaState {
     /// line-compare that select the visible window. Planar modes render our own
     /// `planes` in place (no copy); linear modes copy their guest aperture into
     /// `scratch`. `None` for a mode the renderer doesn't draw.
-    fn scanout<'a, A: crate::Arch>(&'a self, machine: &mut A, regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>)
+    fn scanout<'a, A: crate::Arch>(&'a self, machine: &mut A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>)
         -> Option<lib::vga_render::Frame<'a>>
     {
         use lib::vga_render::{Frame, VgaMode};

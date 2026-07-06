@@ -109,7 +109,6 @@ pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 // arch API; the HW backend implements them as INT 0x80 stubs in `calls.rs`).
 pub use traps::arch_call;
 pub use calls::*;
-pub(crate) use traps::REGS;
 
 // Power/halt entry points. The kernel layer must not toggle IF directly —
 // `cli`/`sti` stay arch-private; use `halt_forever` (panic) and

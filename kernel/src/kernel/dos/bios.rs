@@ -163,7 +163,7 @@ macro_rules! bda_field {
 /// identical values — the layering matches a real machine (BIOS first, DOS
 /// on top). Native-vs-substitute is decided by the boot-time probe
 /// (`platform::Firmware`), not sniffed here.
-pub(super) fn install<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (display {:?})",
         crate::kernel::platform::get().display);
     // Vectors with a real service keep their own stub (slot index == vector);

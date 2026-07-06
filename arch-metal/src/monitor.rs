@@ -11,8 +11,6 @@
 //! re-exported `KernelEvent`/`IoSize`) is unchanged — callers in `traps.rs` /
 //! `backend.rs` keep resolving `crate::monitor::*` as before.
 
-use crate::Vcpu;
-use crate::paging2::RootPageTable;
 use arch_abi::Regs;
 
 // Backend-agnostic arch↔kernel contract types, re-exported so

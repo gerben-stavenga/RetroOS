@@ -255,7 +255,7 @@ pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<u8>
 }
 
 /// Clear the BIOS keyboard buffer at 40:1A..40:3E.
-pub fn clear_bios_keyboard_buffer<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub fn clear_bios_keyboard_buffer<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     write_u16(machine, 0x40, 0x1A, 0x001E);
     write_u16(machine, 0x40, 0x1C, 0x001E);
     for off in (0x1E..0x3E).step_by(2) {
@@ -264,7 +264,7 @@ pub fn clear_bios_keyboard_buffer<A: crate::Arch>(machine: &mut A, regs: &mut Re
 }
 
 /// Pop the next word from the BIOS keyboard buffer.
-pub fn pop_bios_keyboard_word<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> Option<u16> {
+pub fn pop_bios_keyboard_word<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) -> Option<u16> {
     let head = read_u16(machine, 0x40, 0x1A);
     let tail = read_u16(machine, 0x40, 0x1C);
     if head == tail {

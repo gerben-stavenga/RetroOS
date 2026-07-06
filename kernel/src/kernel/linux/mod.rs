@@ -565,7 +565,7 @@ fn read_c_argv<A: crate::Arch>(machine: &mut A, ptr: usize, wide: bool) -> alloc
 ///   [16 random bytes] [string pool]
 ///
 /// For 64-bit: same layout with 8-byte slots.
-pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)]) -> usize {
+pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)]) -> usize {
     // Write one machine word (4 or 8 bytes, per client bitness) to the stack.
     fn write_word<A: crate::Arch>(machine: &mut A, addr: usize, val: usize, want_64: bool) {
         if want_64 { machine.write::<u64>(addr, val as u64); }
@@ -945,7 +945,7 @@ fn sys_close<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
 }
 
 /// execve(11)
-fn sys_execve<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
+fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     use crate::kernel::exec;
 
     let path_ptr = a.a0 as usize;
@@ -1566,7 +1566,7 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
 }
 
 /// stat64(195) / lstat64(196)
-fn sys_stat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
+fn sys_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let stat_buf = a.a1 as usize;
     let mut path_buf = [0u8; 256];
@@ -1668,7 +1668,7 @@ fn write_stat_old<A: crate::Arch>(machine: &mut A, buf: usize, mode: u32, size: 
 
 /// stat(106) / lstat(107) — old struct stat layout. We have no symlinks so
 /// lstat falls through to stat.
-fn sys_stat_old<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_stat_old<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
     let mut path_buf = [0u8; 256];
     let path_len = machine.copy_cstr(a.a0 as usize, &mut path_buf);
     let path = &path_buf[..path_len];

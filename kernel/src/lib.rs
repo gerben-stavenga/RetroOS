@@ -5,10 +5,10 @@
 //! carries `Vcpu<A>` / `A::Fx`. No backend crate is linked here —
 //! composition happens in the ENTRY crates, which pick the backend and call
 //! `startup`:
-//!   * `entry-metal`  — arch-metal (real x86); linked with `entry.asm` into
-//!     kernel.elf.
-//!   * `entry-hosted` — arch-interp (tcg or kvm engine); consumed by the
-//!     retroos-host and retroos-play binaries.
+//!
+//!   * `entry-metal` — arch-metal (real x86), linked with `entry.asm` into kernel.elf.
+//!   * `entry-hosted` — arch-interp (tcg or kvm engine), consumed by the retroos-host and retroos-play binaries.
+//!
 //! Host-side glue (platform probe, log sinks, symbolizers) is injected by the
 //! entries through plain function hooks — no `cfg` anywhere in this crate.
 
