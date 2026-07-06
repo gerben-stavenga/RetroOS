@@ -28,7 +28,7 @@ rust_binary(
     deps = [
         "//arch-interp",
         "//kernel:bootfs_host",
-        "//kernel:kernel_hosted",
+        "//kernel:kernel",
         "//lib",
         "@crates//:sdl2",
     ],
@@ -50,7 +50,7 @@ rust_binary(
     deps = [
         "//arch-interp:arch-interp-kvm",
         "//kernel:bootfs_host",
-        "//kernel:kernel_hosted",
+        "//kernel:kernel",
         "//lib",
         "@crates//:sdl2",
     ],

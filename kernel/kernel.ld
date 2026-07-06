@@ -12,7 +12,11 @@ SECTIONS
     _kernel_start = .;
 
     .text ALIGN(4K) : AT(KERNEL_PHYS) {
-        *(.multiboot)
+        /* KEEP the multiboot header: it is read externally by a multiboot
+         * loader (GRUB), never referenced by kernel code, so rust-lld's
+         * --gc-sections would otherwise collect it. Must stay first / in the
+         * first 8 KiB for GRUB to find it. */
+        KEEP(*(.multiboot))
         *(.text .text.*)
         KEEP(*(.note*))
     }

@@ -1,7 +1,14 @@
 # Build kernel using rules_rust and rules_nasm
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:retro_platform.bzl", "retro_platform_files")
+
+# Bare-metal (os:none) vs host build selector. The one kernel library and the
+# metal ELF binary use this to pick platform-specific deps / linker flags.
+config_setting(
+    name = "metal",
+    constraint_values = ["@platforms//os:none"],
+)
 
 nasm_library(
     name = "entry",
@@ -9,48 +16,144 @@ nasm_library(
     copts = ["-f", "elf32"],
 )
 
-rust_static_library(
+# The linker script, materialized into bazel-out so the rust_binary link action
+# stages it reliably (a source file passed via compile_data wasn't found by the
+# linker; bazel-out inputs are).
+genrule(
+    name = "kernel_ld",
+    srcs = ["kernel.ld"],
+    outs = ["kernel.generated.ld"],
+    cmd = "cp $< $@",
+)
+
+# THE kernel: ONE backend-agnostic rust_library (rlib), linked by every entry
+# binary below. The source gates its metal-only glue (boot.rs, fbcon, the
+# `arch_metal` backend) with `#[cfg(target_arch = "x86")]`, so the same crate
+# builds for the bare-metal target (arch-metal) and the host target
+# (arch-interp, linked in by the hosted binaries). `select()` supplies the
+# platform-specific dep flavours and the metal-only codegen flags.
+rust_library(
     name = "kernel",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "kernel",
-    crate_features = ["kernel"],
     edition = "2024",
-    rustc_flags = [
-        "-Copt-level=s",
-        "-Cpanic=abort",
-        "-Crelocation-model=static",
-        "-Cforce-frame-pointers=yes",
-    ],
-    deps = ["//arch-abi", "//arch-metal", "//lib", "@ext4_view//:ext4_view", "@spin//:spin"],
-)
-
-# ---- hosted: the same kernel on the arch-interp backend, as a host binary --
-# An ordinary Bazel target so kernel changes rebuild it like everything else.
-# Genrules consume it via `tools` (exec config = host platform); to build it
-# directly, pass --platforms=@platforms//host (the workspace default target
-# platform is the bare-metal one).
-rust_library(
-    name = "kernel_hosted",
-    srcs = glob(["src/**/*.rs"]),
-    crate_name = "kernel",
     visibility = ["//visibility:public"],
-    edition = "2024",
-    # abort matches //lib and //arch-abi (abort rlibs can't link into an
-    # unwind binary; unwind rlibs like std/@crates link into abort fine).
     rustc_flags = [
         "-Cpanic=abort",
-        # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
-        # metal setting); a PIE link rejects them — build non-PIE to match.
+        # //lib + //arch-abi are -Crelocation-model=static (non-PIC); a PIE link
+        # rejects them — build non-PIE to match, on both platforms.
         "-Crelocation-model=static",
-    ],
+    ] + select({
+        ":metal": [
+            "-Copt-level=s",
+            "-Cforce-frame-pointers=yes",
+        ],
+        "//conditions:default": [],
+    }),
     deps = [
         "//arch-abi",
         "//lib",
-        "@crates//:ext4-view",
-        "@crates//:rustc-demangle",
-        "@crates//:spin",
+    ] + select({
+        ":metal": [
+            "//arch-metal",
+            "@ext4_view//:ext4_view",
+            "@spin//:spin",
+        ],
+        "//conditions:default": [
+            "@crates//:ext4-view",
+            "@crates//:rustc-demangle",
+            "@crates//:spin",
+        ],
+    }),
+)
+
+# ============================================================================
+# Metal entry: the bootable kernel.elf, produced by rustc-linking the kernel
+# rlib (+ arch-metal, pulled transitively) with the asm entry stub and the
+# embedded bootfs object, under the kernel linker script. Replaces the old
+# `ld` genrule — the rlib is not self-contained, so rustc does the link.
+# ============================================================================
+
+# The asm `_start` stub and the embedded bootfs object are linked straight in
+# as native objects via `-Clink-arg` (the bare-metal CC toolchain has only a
+# dummy `ar`, so they can't go through `cc_library`). `_start` (kept by the
+# script's ENTRY) calls the kernel's `boot_kernel`; the bootfs symbols are read
+# by `kernel::bootfs()`. rust-lld pulls `boot_kernel` and the rest out of the
+# kernel rlib to satisfy the objects' undefined references.
+rust_binary(
+    name = "kernel_elf_bin",
+    srcs = ["metal_entry.rs"],
+    crate_name = "kernel_metal",
+    edition = "2024",
+    compile_data = [":kernel_ld", ":entry", ":bootfs_obj"],
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+        # Link with rustc's bundled lld (the bare CC toolchain is dummy-only),
+        # directly as ld.lld — the i686-unknown-none target's linker.
+        "-Clink-self-contained=+linker",
+        "-Clinker-flavor=ld.lld",
+        "-Clinker=rust-lld",
+        "-Clink-arg=-T$(location :kernel_ld)",
+        "-Clink-arg=$(location :entry)",
+        "-Clink-arg=$(location :bootfs_obj)",
+        "-Clink-arg=-nostdlib",
+        "-Clink-arg=-no-pie",
+    ],
+    deps = [
+        ":kernel",
+        "//arch-metal",
     ],
 )
+
+rust_binary(
+    name = "kernel_elf_bare_bin",
+    srcs = ["metal_entry.rs"],
+    crate_name = "kernel_metal",
+    edition = "2024",
+    compile_data = [":kernel_ld", ":entry", ":bootfs_empty_obj"],
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+        # Link with rustc's bundled lld (the bare CC toolchain is dummy-only),
+        # directly as ld.lld — the i686-unknown-none target's linker.
+        "-Clink-self-contained=+linker",
+        "-Clinker-flavor=ld.lld",
+        "-Clinker=rust-lld",
+        "-Clink-arg=-T$(location :kernel_ld)",
+        "-Clink-arg=$(location :entry)",
+        "-Clink-arg=$(location :bootfs_empty_obj)",
+        "-Clink-arg=-nostdlib",
+        "-Clink-arg=-no-pie",
+    ],
+    deps = [
+        ":kernel",
+        "//arch-metal",
+    ],
+)
+
+# Keep the `//kernel:kernel_elf` label and the `kernel.elf` filename stable
+# (run.sh reads bazel-bin/kernel/kernel.elf; //:image + the md5 genrule consume
+# the label).
+genrule(
+    name = "kernel_elf",
+    srcs = [":kernel_elf_bin"],
+    outs = ["kernel.elf"],
+    cmd = "cp $< $@",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "kernel_elf_bare",
+    srcs = [":kernel_elf_bare_bin"],
+    outs = ["kernel_bare.elf"],
+    cmd = "cp $< $@",
+    visibility = ["//visibility:public"],
+)
+
+# ============================================================================
+# Hosted entry binaries: link the SAME kernel rlib against arch-interp.
+# ============================================================================
 
 rust_binary(
     name = "retroos-host",
@@ -59,14 +162,12 @@ rust_binary(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
-        # metal setting); a PIE link rejects them — build non-PIE to match.
         "-Crelocation-model=static",
     ],
     visibility = ["//visibility:public"],
     deps = [
         ":bootfs_host",
-        ":kernel_hosted",
+        ":kernel",
         "//arch-interp",
         "//lib",
     ],
@@ -84,7 +185,7 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":bootfs_host",
-        ":kernel_hosted",
+        ":kernel",
         "//arch-interp:arch-interp-kvm",
         "//lib",
     ],
@@ -147,14 +248,12 @@ rust_binary(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
-        # metal setting); a PIE link rejects them — build non-PIE to match.
         "-Crelocation-model=static",
     ],
     visibility = ["//visibility:public"],
     deps = [
         ":bootfs_host_empty",
-        ":kernel_hosted",
+        ":kernel",
         "//arch-interp",
         "//lib",
     ],
@@ -176,7 +275,7 @@ genrule(
 
 # Empty variant: same symbols around an empty TAR (two zero end-of-archive
 # blocks — objcopy refuses a 0-byte input; bootfs() reads a zero first block
-# as "no bootfs"). Links into kernel_elf_bare below.
+# as "no bootfs"). Links into kernel_elf_bare above.
 genrule(
     name = "bootfs_empty_obj",
     outs = ["bootfs_empty.o"],
@@ -184,24 +283,4 @@ genrule(
           "(cd $$T && objcopy -I binary -O elf32-i386 -B i386 " +
           "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
           "bootfs.tar $$O) && rm -r $$T",
-)
-
-genrule(
-    name = "kernel_elf",
-    srcs = [":entry", ":kernel", ":bootfs_obj", "kernel.ld"],
-    outs = ["kernel.elf"],
-    cmd = "ld -m elf_i386 -T $(location kernel.ld) $(location :entry) $(location :bootfs_obj) $(location :kernel) -o $@",
-    visibility = ["//visibility:public"],
-)
-
-# Bare kernel: the identical link with an empty bootfs. //:image_min carries
-# this one — the in-OS toolchain genrules (COMMAND.COM, the dosrt stub) boot
-# image_min to do their work, and the full kernel embeds COMMAND.COM, so the
-# full kernel cannot be an input to building COMMAND.COM.
-genrule(
-    name = "kernel_elf_bare",
-    srcs = [":entry", ":kernel", ":bootfs_empty_obj", "kernel.ld"],
-    outs = ["kernel_bare.elf"],
-    cmd = "ld -m elf_i386 -T $(location kernel.ld) $(location :entry) $(location :bootfs_empty_obj) $(location :kernel) -o $@",
-    visibility = ["//visibility:public"],
 )
