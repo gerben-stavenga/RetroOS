@@ -18,14 +18,16 @@
 //! by polling the hardware play position (`SDLPIB` here, `CIV` there) — no
 //! interrupts.
 //!
-//! ## Topology (QEMU-specific)
+//! ## Topology
 //!
-//! QEMU's codec exposes a tiny fixed widget graph, so we target it directly:
-//! the output **DAC is NID 2** and the output **pin complex is NID 3** (AFG is
-//! NID 1). A driver for real, quirky codecs would enumerate the graph via
-//! `Get Parameter`/connection-list verbs; for QEMU the path is known, so we just
-//! program it. If this ever needs to run against real hardware, replace
-//! `configure_path` with an enumerator.
+//! Real laptops often expose several HDA functions: GPU HDMI/DP audio first,
+//! then the internal analog codec later on a high PCI bus. We rank PCI HDA
+//! candidates before bring-up, then enumerate the selected codec's widget graph
+//! and choose a real output route. Pins whose default config says "not
+//! connected" are ignored; internal speakers beat headphones, headphones beat
+//! line-out, and digital-only paths are de-prioritized. This keeps QEMU's tiny
+//! graph working while steering an AMD/Realtek laptop toward its analog speaker
+//! codec instead of an HDMI function.
 //!
 //! ## DMA buffer placement (TEMPORARY — same stopgap as ac97)
 //!
@@ -103,11 +105,47 @@ const PRIME_BUFS: usize = 3;
 const MAX_AHEAD: usize = 6;
 /// Stream tag bound between the descriptor and the DAC converter (1..15).
 const STREAM_TAG: u32 = 1;
-/// Fallback codec node IDs if enumeration fails (QEMU's usual layout).
-const FALLBACK_DAC: u32 = 2;
-const FALLBACK_PIN: u32 = 3;
 /// Boot-time bring-up diagnostics to debugcon (flip on to debug the codec).
 const DEBUG: bool = false;
+
+const MAX_HDA_CONTROLLERS: usize = 8;
+const MAX_WIDGETS: usize = 64;
+const MAX_CONNS: usize = 8;
+const MAX_PATH: usize = 8;
+
+const PARAM_VENDOR_ID: u32 = 0x00;
+const PARAM_SUBNODE_COUNT: u32 = 0x04;
+const PARAM_FUNCTION_GROUP_TYPE: u32 = 0x05;
+const PARAM_AUDIO_WIDGET_CAPS: u32 = 0x09;
+const PARAM_PIN_CAPS: u32 = 0x0C;
+const PARAM_CONN_LIST_LEN: u32 = 0x0E;
+
+const VERB_GET_PARAMETER: u32 = 0xF00;
+const VERB_GET_CONN_SELECT: u32 = 0xF01;
+const VERB_GET_CONN_LIST_ENTRY: u32 = 0xF02;
+const VERB_GET_CONFIG_DEFAULT: u32 = 0xF1C;
+const VERB_SET_CONN_SELECT: u32 = 0x701;
+const VERB_SET_POWER_STATE: u32 = 0x705;
+const VERB_SET_CONV_STREAM_CHAN: u32 = 0x706;
+const VERB_SET_PIN_WIDGET_CONTROL: u32 = 0x707;
+const VERB_SET_EAPD_BTL: u32 = 0x70C;
+
+const WTYPE_AUDIO_OUTPUT: u32 = 0x0;
+const WTYPE_AUDIO_MIXER: u32 = 0x2;
+const WTYPE_AUDIO_SELECTOR: u32 = 0x3;
+const WTYPE_PIN_COMPLEX: u32 = 0x4;
+
+const AW_CAP_DIGITAL: u32 = 1 << 9;
+const PIN_CAP_OUT: u32 = 1 << 4;
+const PIN_CTL_OUT: u32 = 0x40;
+const PIN_CTL_HP: u32 = 0x80;
+
+const DEFAULT_PORT_NONE: u32 = 0x1;
+const DEFAULT_PORT_FIXED: u32 = 0x2;
+const DEFAULT_DEVICE_LINE_OUT: u32 = 0x0;
+const DEFAULT_DEVICE_SPEAKER: u32 = 0x1;
+const DEFAULT_DEVICE_HP_OUT: u32 = 0x2;
+const REALTEK_ALC298: u32 = 0x10ec_0298;
 
 static HDA: Mutex<Option<Hda>> = Mutex::new(None);
 
@@ -146,28 +184,184 @@ struct Hda {
     rirb_rp: usize,
     /// Codec address of the first present codec.
     cad: u32,
-    /// Output DAC + output pin node IDs (enumerated, not assumed).
+    /// Codec vendor/device id from node 0, e.g. 0x10ec0298 for Realtek ALC298.
+    codec_vendor: u32,
+    /// Output DAC + output pin node IDs selected from the codec graph.
     dac: u32,
     pin: u32,
+    pin_def: u32,
+    path: OutputPath,
     cur_buf: usize,
     cur_off: usize,
     running: bool,
+    /// Hardware stream rate currently programmed into SDFMT/the converter.
     rate: u32,
+    /// Producer/source rate currently being adapted into the hardware stream.
+    src_rate: u32,
+    /// Output-rate accumulator for zero-order-hold resampling.
+    resample_acc: u64,
 }
 
-/// Find an HDA controller (class 0x04, subclass 0x03) anywhere on PCI, via the
-/// shared `pci::find_class` scan. Like `ac97::scan`, tolerant of a no-PCI
-/// backend (all 0xFFFF…).
+#[derive(Clone, Copy)]
+struct HdaPciDevice {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    score: i32,
+}
+
+impl HdaPciDevice {
+    const EMPTY: Self = Self {
+        bus: 0,
+        dev: 0,
+        func: 0,
+        score: i32::MIN,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct Widget {
+    nid: u32,
+    typ: u32,
+    caps: u32,
+    pin_caps: u32,
+    def_cfg: u32,
+    conn_sel: u8,
+    conn_len: usize,
+    conns: [u32; MAX_CONNS],
+}
+
+impl Widget {
+    const EMPTY: Self = Self {
+        nid: 0,
+        typ: 0,
+        caps: 0,
+        pin_caps: 0,
+        def_cfg: 0,
+        conn_sel: 0,
+        conn_len: 0,
+        conns: [0; MAX_CONNS],
+    };
+}
+
+#[derive(Clone, Copy)]
+struct OutputPath {
+    nodes: [u32; MAX_PATH],   // pin -> ... -> DAC
+    conn_idx: [u8; MAX_PATH], // connection index from nodes[i] to nodes[i + 1]
+    len: usize,
+    score: i32,
+}
+
+impl OutputPath {
+    const EMPTY: Self = Self {
+        nodes: [0; MAX_PATH],
+        conn_idx: [0; MAX_PATH],
+        len: 0,
+        score: i32::MIN,
+    };
+}
+
+/// Find the preferred HDA controller (class 0x04, subclass 0x03) anywhere on
+/// PCI. We do not just return the first class match: real laptops often expose
+/// GPU HDMI audio before the internal analog codec.
 pub fn scan<A: crate::Arch>(machine: &mut A) -> Option<(u8, u8, u8)> {
-    crate::kernel::pci::find_class(machine, 0x04, 0x03)
+    let mut devices = [HdaPciDevice::EMPTY; MAX_HDA_CONTROLLERS];
+    let n = collect_hda_controllers(machine, &mut devices);
+    if n == 0 {
+        None
+    } else {
+        sort_hda_controllers(&mut devices, n);
+        Some((devices[0].bus, devices[0].dev, devices[0].func))
+    }
 }
 
 pub fn init<A: crate::Arch>(machine: &mut A) {
     if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedHda {
         return;
     }
-    let (bus, dev, func) = scan(machine).expect("platform probe saw an HDA controller; scan must agree");
-    let _ = bring_up(machine, bus, dev, func);
+    let mut devices = [HdaPciDevice::EMPTY; MAX_HDA_CONTROLLERS];
+    let n = collect_hda_controllers(machine, &mut devices);
+    sort_hda_controllers(&mut devices, n);
+    for d in devices.iter().take(n) {
+        if bring_up(machine, d.bus, d.dev, d.func) {
+            return;
+        }
+        if DEBUG {
+            crate::println!(
+                "hda: {:02x}:{:02x}.{} bring-up failed",
+                d.bus,
+                d.dev,
+                d.func
+            );
+        }
+    }
+}
+
+fn collect_hda_controllers<A: crate::Arch>(
+    machine: &mut A,
+    out: &mut [HdaPciDevice; MAX_HDA_CONTROLLERS],
+) -> usize {
+    let mut n = 0;
+    for bus in 0..=255u8 {
+        for dev in 0..32u8 {
+            for func in 0..8u8 {
+                let id = crate::kernel::pci::read32(machine, bus, dev, func, 0x00);
+                if id & 0xFFFF == 0xFFFF {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let classes = crate::kernel::pci::read32(machine, bus, dev, func, 0x08);
+                if (classes >> 24) as u8 == 0x04 && (classes >> 16) as u8 == 0x03 && n < out.len() {
+                    let vendor = (id & 0xFFFF) as u16;
+                    let device = (id >> 16) as u16;
+                    out[n] = HdaPciDevice {
+                        bus,
+                        dev,
+                        func,
+                        score: hda_pci_score(vendor, device),
+                    };
+                    n += 1;
+                }
+                if func == 0
+                    && crate::kernel::pci::read32(machine, bus, dev, 0, 0x0C) & 0x0080_0000 == 0
+                {
+                    break;
+                }
+            }
+        }
+    }
+    n
+}
+
+fn hda_pci_score(vendor: u16, device: u16) -> i32 {
+    let mut score = 100;
+    match vendor {
+        0x1022 => score += 250, // AMD platform HDA, e.g. Family 17h/19h analog codec.
+        0x8086 => score += 150, // Intel PCH/QEMU HDA.
+        0x10de => score -= 200, // NVIDIA display audio is usually HDMI/DP only.
+        0x1002 => score -= 150, // AMD/ATI GPU display audio is usually HDMI/DP only.
+        _ => {}
+    }
+    if vendor == 0x1022 && device == 0x15e3 {
+        score += 1000; // This laptop's AMD HDA controller with Realtek ALC298.
+    }
+    score
+}
+
+fn sort_hda_controllers(devices: &mut [HdaPciDevice; MAX_HDA_CONTROLLERS], n: usize) {
+    for i in 0..n {
+        let mut best = i;
+        for j in i + 1..n {
+            if devices[j].score > devices[best].score {
+                best = j;
+            }
+        }
+        if best != i {
+            devices.swap(i, best);
+        }
+    }
 }
 
 /// Bring up the controller + codec output path at `bus:dev.func`. Returns true
@@ -189,7 +383,12 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     if bar_phys == 0 {
         return false;
     }
-    machine.map_phys_range(BAR_WIN_VA >> 12, BAR_PAGES, bar_phys >> 12, PTE_CACHE_DISABLE);
+    machine.map_phys_range(
+        BAR_WIN_VA >> 12,
+        BAR_PAGES,
+        bar_phys >> 12,
+        PTE_CACHE_DISABLE,
+    );
 
     // Controller reset: drive CRST low, wait until it reads low, then high.
     w32(GCTL, 0);
@@ -238,16 +437,22 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         sd,
         rirb_rp: 0,
         cad,
+        codec_vendor: 0,
         dac: 0,
         pin: 0,
+        pin_def: 0,
+        path: OutputPath::EMPTY,
         cur_buf: 0,
         cur_off: 0,
         running: false,
         rate: 0,
+        src_rate: 0,
+        resample_acc: 0,
     };
 
     // CORB/RIRB must run before any verb (enumeration uses verbs).
     d.setup_corb_rirb();
+    d.codec_vendor = d.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID);
     if DEBUG {
         crate::println!(
             "hda: rings up corbctl={:#x} rirbctl={:#x} corbsz={:#x} rirbsz={:#x} corbwp={} corbrp={} rirbwp={}",
@@ -259,16 +464,17 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
             let r = d.verb(0, (0xF00 << 8) | p);
             crate::println!(
                 "hda: probe param={:#04x} -> {:#x} corbwp={} corbrp={} rirbwp={} rirbsts={:#x}",
-                p, r, r16(CORBWP), r16(CORBRP), r16(RIRBWP), r8(RIRBSTS)
+                p,
+                r,
+                r16(CORBWP),
+                r16(CORBRP),
+                r16(RIRBWP),
+                r8(RIRBSTS)
             );
         }
     }
-    d.enumerate();
-    if d.dac == 0 {
-        d.dac = FALLBACK_DAC;
-    }
-    if d.pin == 0 {
-        d.pin = FALLBACK_PIN;
+    if !d.select_output_path() {
+        return false;
     }
 
     d.build_bdl();
@@ -308,11 +514,26 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     if DEBUG {
         crate::println!(
             "hda: bar={:#x} gcap={:#06x} iss={} oss={} statests={:#x} cad={} sd={:#x}",
-            bar_phys, gcap, iss, (gcap >> 12) & 0xF, codecs, cad, sd
+            bar_phys,
+            gcap,
+            iss,
+            (gcap >> 12) & 0xF,
+            codecs,
+            cad,
+            sd
         );
         crate::println!("hda: dac=nid{} pin=nid{}", d.dac, d.pin);
     }
 
+    crate::println!(
+        "hda: selected {:02x}:{:02x}.{} codec={:#x} pin=nid{} dac=nid{}",
+        bus,
+        dev,
+        func,
+        d.codec_vendor,
+        d.pin,
+        d.dac,
+    );
     *HDA.lock() = Some(d);
     true
 }
@@ -348,7 +569,8 @@ impl Hda {
         let corb_phys = self.dma_phys + CORB_OFF as u32;
         w32(CORBLBASE, corb_phys);
         w32(CORBUBASE, 0);
-        w8(CORBSIZE, 0x02); // 256 entries
+        // 256-entry CORB.
+        w8(CORBSIZE, 0x02);
         // Reset the read pointer: set bit15, wait for it to read back, then clear.
         w16(CORBRP, 0x8000);
         for _ in 0..100_000 {
@@ -402,61 +624,169 @@ impl Hda {
         resp
     }
 
-    /// Walk the codec graph and record the first output DAC + output-capable pin
-    /// into `self.dac`/`self.pin` (0 if not found → bring_up uses the fallbacks).
-    /// Real topology beats hardcoded NIDs across QEMU codec revisions / real HW.
-    fn enumerate(&mut self) {
+    /// Walk the codec graph and choose a real analog-ish output route.
+    fn select_output_path(&mut self) -> bool {
+        let mut widgets = [Widget::EMPTY; MAX_WIDGETS];
+        let count = self.enumerate_widgets(&mut widgets);
+        let mut best = OutputPath::EMPTY;
+        for i in 0..count {
+            let w = widgets[i];
+            if w.typ != WTYPE_PIN_COMPLEX {
+                continue;
+            }
+            let pin_score = output_pin_score(&w);
+            if pin_score <= 0 {
+                continue;
+            }
+            let mut path = OutputPath::EMPTY;
+            let mut visited = [0u32; MAX_PATH];
+            dfs_output_path(
+                &widgets,
+                count,
+                w.nid,
+                pin_score,
+                self.codec_vendor,
+                &mut path,
+                &mut visited,
+                0,
+                &mut best,
+            );
+        }
+        if best.len == 0 {
+            let Some(path) = fallback_output_path(&widgets, count) else {
+                return false;
+            };
+            best = path;
+        }
+        self.path = best;
+        self.pin = best.nodes[0];
+        self.dac = best.nodes[best.len - 1];
+        if let Some(pin) = find_widget(&widgets, count, self.pin) {
+            self.pin_def = widgets[pin].def_cfg;
+        }
+        true
+    }
+
+    fn enumerate_widgets(&mut self, widgets: &mut [Widget; MAX_WIDGETS]) -> usize {
         // Root node 0 → the function groups it contains.
-        let root = self.verb(0, (0xF00 << 8) | 0x04); // Get Subnode Count
+        let root = self.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_SUBNODE_COUNT);
         let fg_start = (root >> 16) & 0xFF;
         let fg_count = root & 0xFF;
         let mut afg = 0u32;
         for n in fg_start..fg_start + fg_count {
-            if self.verb(n, (0xF00 << 8) | 0x05) & 0xFF == 0x01 {
+            if self.verb(n, (VERB_GET_PARAMETER << 8) | PARAM_FUNCTION_GROUP_TYPE) & 0xFF == 0x01 {
                 afg = n; // Audio Function Group
                 break;
             }
         }
         if DEBUG {
-            crate::println!("hda: enum root={:#x} fg_start={} fg_count={} afg={}", root, fg_start, fg_count, afg);
+            crate::println!(
+                "hda: enum root={:#x} fg_start={} fg_count={} afg={}",
+                root,
+                fg_start,
+                fg_count,
+                afg
+            );
         }
         if afg == 0 {
-            return;
+            return 0;
         }
         // The AFG's subnodes are the widgets.
-        let sub = self.verb(afg, (0xF00 << 8) | 0x04);
+        let sub = self.verb(afg, (VERB_GET_PARAMETER << 8) | PARAM_SUBNODE_COUNT);
         let w_start = (sub >> 16) & 0xFF;
         let w_count = sub & 0xFF;
+        let mut count = 0;
         for nid in w_start..w_start + w_count {
-            let caps = self.verb(nid, (0xF00 << 8) | 0x09); // Audio Widget Capabilities
-            match (caps >> 20) & 0xF {
-                0x0 if self.dac == 0 => self.dac = nid, // Audio Output (DAC)
-                0x4 if self.pin == 0
-                    // Pin Complex — take the first output-capable one.
-                    && self.verb(nid, (0xF00 << 8) | 0x0C) & (1 << 4) != 0 => {
-                        self.pin = nid;
-                    }
-                _ => {}
+            if count >= widgets.len() {
+                break;
             }
+            let caps = self.verb(nid, (VERB_GET_PARAMETER << 8) | PARAM_AUDIO_WIDGET_CAPS);
+            let typ = (caps >> 20) & 0xF;
+            let pin_caps = if typ == WTYPE_PIN_COMPLEX {
+                self.verb(nid, (VERB_GET_PARAMETER << 8) | PARAM_PIN_CAPS)
+            } else {
+                0
+            };
+            let def_cfg = if typ == WTYPE_PIN_COMPLEX {
+                self.verb(nid, VERB_GET_CONFIG_DEFAULT << 8)
+            } else {
+                0
+            };
+            let conn_sel = (self.verb(nid, VERB_GET_CONN_SELECT << 8) & 0xFF) as u8;
+            let (conns, conn_len) = self.conn_list(nid);
+            widgets[count] = Widget {
+                nid,
+                typ,
+                caps,
+                pin_caps,
+                def_cfg,
+                conn_sel,
+                conn_len,
+                conns,
+            };
+            count += 1;
             if DEBUG {
-                crate::println!("hda: nid{} caps={:#x} type={}", nid, caps, (caps >> 20) & 0xF);
+                crate::println!(
+                    "hda: nid{} caps={:#x} type={}",
+                    nid,
+                    caps,
+                    (caps >> 20) & 0xF
+                );
             }
         }
+        count
+    }
+
+    fn conn_list(&mut self, nid: u32) -> ([u32; MAX_CONNS], usize) {
+        let param = self.verb(nid, (VERB_GET_PARAMETER << 8) | PARAM_CONN_LIST_LEN);
+        let len = (param & 0x7F) as usize;
+        let long = param & 0x80 != 0;
+        let mut conns = [0u32; MAX_CONNS];
+        let keep = len.min(MAX_CONNS);
+        for (i, slot) in conns.iter_mut().enumerate().take(keep) {
+            let group = if long { i / 2 } else { i / 4 };
+            let resp = self.verb(nid, (VERB_GET_CONN_LIST_ENTRY << 8) | group as u32);
+            *slot = if long {
+                (resp >> ((i % 2) * 16)) & 0xFFFF
+            } else {
+                (resp >> ((i % 4) * 8)) & 0xFF
+            };
+        }
+        (conns, keep)
     }
 
     /// Program the output path: route the DAC to the pin, power both up, unmute,
     /// and bind the stream tag. Format is set later (per rate) by `set_format`.
     fn configure_path(&mut self) {
-        let (pin, dac) = (self.pin, self.dac);
-        // Pin: power D0, enable output, select the DAC connection, unmute amp.
-        self.verb(pin, 0x705 << 8); // Set Power State D0
-        self.verb(pin, (0x707 << 8) | 0x40); // Set Pin Widget Control: OUT enable
-        self.verb(pin, 0x701 << 8); // Set Connection Select: first input
-        self.verb(pin, (0x3 << 16) | 0xB07F); // Set Amp: out, L+R, unmute, max gain
-        // DAC: power D0, bind the stream tag / channel 0, unmute at full gain.
-        self.verb(dac, 0x705 << 8); // Set Power State D0
-        self.verb(dac, (0x706 << 8) | (STREAM_TAG << 4)); // Stream/Channel
-        self.verb(dac, (0x3 << 16) | 0xB07F); // Set Amp: out, L+R, unmute, gain 0x7F
+        for i in 0..self.path.len {
+            let nid = self.path.nodes[i];
+            self.verb(nid, VERB_SET_POWER_STATE << 8); // D0
+            if i + 1 < self.path.len {
+                self.verb(
+                    nid,
+                    (VERB_SET_CONN_SELECT << 8) | self.path.conn_idx[i] as u32,
+                );
+                self.verb(
+                    nid,
+                    (0x3 << 16) | 0x3000 | ((self.path.conn_idx[i] as u32) << 8),
+                );
+            }
+        }
+
+        let pin_ctl = if default_device(self.pin_def) == DEFAULT_DEVICE_HP_OUT {
+            PIN_CTL_OUT | PIN_CTL_HP
+        } else {
+            PIN_CTL_OUT
+        };
+        self.verb(self.pin, (VERB_SET_PIN_WIDGET_CONTROL << 8) | pin_ctl);
+        self.verb(self.pin, (VERB_SET_EAPD_BTL << 8) | 0x02); // external amp on, if present
+        self.verb(self.pin, (0x3 << 16) | 0xB07F); // output amp unmute / max
+
+        self.verb(
+            self.dac,
+            (VERB_SET_CONV_STREAM_CHAN << 8) | (STREAM_TAG << 4),
+        );
+        self.verb(self.dac, (0x3 << 16) | 0xB07F); // DAC output amp unmute / max
     }
 
     /// Encode a 16-bit stereo stream format for `rate` (HDA SDFMT / converter
@@ -496,6 +826,15 @@ impl Hda {
         }
     }
 
+    fn hardware_rate(src_rate: u32) -> u32 {
+        match src_rate {
+            44100 | 48000 => src_rate,
+            24000 | 16000 | 12000 | 8000 => 48000,
+            0 => 44100,
+            _ => 44100,
+        }
+    }
+
     /// Current play position as a buffer index, from the hardware byte position.
     fn play_buf(&self) -> usize {
         (r32(self.sd + SDLPIB) as usize / BUF_BYTES) % NUM_BUF
@@ -518,73 +857,261 @@ impl Hda {
         }
     }
 
+    fn emit_stereo(&mut self, l: i16, r: i16) -> bool {
+        // At each buffer boundary, cap how far we run ahead of the controller.
+        if self.cur_off == 0 && self.running {
+            let civ = self.play_buf();
+            let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
+            // Only throttle when genuinely AHEAD of the codec. A wrapped
+            // value (>= half the ring) means the play position lapped us
+            // (underrun) — feed hard to catch up, never stall.
+            if (MAX_AHEAD..NUM_BUF / 2).contains(&ahead) {
+                if DEBUG {
+                    crate::println!(
+                        "hda: stall cur_buf={} civ={} lpib={} pos={} sdsts={:#x}",
+                        self.cur_buf,
+                        civ,
+                        r32(self.sd + SDLPIB),
+                        self.dma_pos(),
+                        r8(self.sd + 0x03)
+                    );
+                }
+                return false;
+            }
+        }
+        let p = self.buf_va(self.cur_buf) + self.cur_off;
+        unsafe {
+            write_volatile(p as *mut u16, l as u16);
+            write_volatile((p + 2) as *mut u16, r as u16);
+        }
+        self.cur_off += 4;
+        if self.cur_off >= BUF_BYTES {
+            self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
+            self.cur_off = 0;
+            // Start the stream once a small cushion is primed. Write RUN +
+            // stream number as ONE dword so QEMU re-evaluates the codec<->
+            // stream binding with the stream number visible (a byte-0-only
+            // RUN write may not retrigger it → codec never drains the FIFO).
+            if !self.running && self.cur_buf >= PRIME_BUFS {
+                w32(self.sd + SDCTL, 0x02 | (STREAM_TAG << 20));
+                self.running = true;
+                if DEBUG {
+                    crate::println!(
+                        "hda: stream RUN sdctl={:#010x} sdsts={:#x} cbl={} lvi={} fmt={:#06x}",
+                        r32(self.sd + SDCTL),
+                        r8(self.sd + 0x03),
+                        r32(self.sd + SDCBL),
+                        r16(self.sd + SDLVI),
+                        r16(self.sd + SDFMT)
+                    );
+                }
+            }
+            // Heartbeat once per ring lap (~0.7 s): does the HW play position
+            // actually advance? lpib stuck at 0 = DMA not progressing.
+            if DEBUG && self.running && self.cur_buf == 0 {
+                crate::println!(
+                    "hda: lpib={} sdsts={:#x}",
+                    r32(self.sd + SDLPIB),
+                    r8(self.sd + 0x03)
+                );
+            }
+        }
+        true
+    }
+
     /// Decode `bytes` (`fmt`) into canonical i16 stereo and stream into the ring.
     fn submit(&mut self, rate: u32, fmt: Format, bytes: &[u8]) {
-        // A rate change needs a fresh format, which means stopping the stream and
-        // re-priming. DOS playback sets one rate per session, so this is rare.
-        if rate != 0 && rate != self.rate {
+        let src_rate = if rate == 0 { 44100 } else { rate };
+        let hw_rate = Self::hardware_rate(src_rate);
+        // A hardware-rate change needs a fresh format, which means stopping the
+        // stream and re-priming. DOS playback sets one rate per session, so this
+        // is rare. Source-rate changes also reset the resampler phase.
+        if hw_rate != self.rate || src_rate != self.src_rate {
             if self.running {
                 self.stop();
                 self.running = false;
             }
             self.cur_buf = 0;
             self.cur_off = 0;
-            self.set_format(rate);
+            self.set_format(hw_rate);
+            self.src_rate = src_rate;
+            self.resample_acc = 0;
         }
         let fb = fmt.frame_bytes();
         if fb == 0 {
             return;
         }
         for i in 0..bytes.len() / fb {
-            // At each buffer boundary, cap how far we run ahead of the controller.
-            if self.cur_off == 0 && self.running {
-                let civ = self.play_buf();
-                let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
-                // Only throttle when genuinely AHEAD of the codec. A wrapped
-                // value (>= half the ring) means the play position lapped us
-                // (underrun) — feed hard to catch up, never stall.
-                if (MAX_AHEAD..NUM_BUF / 2).contains(&ahead) {
-                    if DEBUG {
-                        crate::println!(
-                            "hda: stall cur_buf={} civ={} lpib={} pos={} sdsts={:#x}",
-                            self.cur_buf, civ, r32(self.sd + SDLPIB), self.dma_pos(), r8(self.sd + 0x03)
-                        );
-                    }
+            let (l, r) = fmt.frame(bytes, i);
+            if src_rate == hw_rate {
+                if !self.emit_stereo(l, r) {
                     break;
                 }
-            }
-            let (l, r) = fmt.frame(bytes, i);
-            let p = self.buf_va(self.cur_buf) + self.cur_off;
-            unsafe {
-                write_volatile(p as *mut u16, l as u16);
-                write_volatile((p + 2) as *mut u16, r as u16);
-            }
-            self.cur_off += 4;
-            if self.cur_off >= BUF_BYTES {
-                self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
-                self.cur_off = 0;
-                // Start the stream once a small cushion is primed. Write RUN +
-                // stream number as ONE dword so QEMU re-evaluates the codec<->
-                // stream binding with the stream number visible (a byte-0-only
-                // RUN write may not retrigger it → codec never drains the FIFO).
-                if !self.running && self.cur_buf >= PRIME_BUFS {
-                    w32(self.sd + SDCTL, 0x02 | (STREAM_TAG << 20));
-                    self.running = true;
-                    if DEBUG {
-                        crate::println!(
-                            "hda: stream RUN sdctl={:#010x} sdsts={:#x} cbl={} lvi={} fmt={:#06x}",
-                            r32(self.sd + SDCTL), r8(self.sd + 0x03),
-                            r32(self.sd + SDCBL), r16(self.sd + SDLVI), r16(self.sd + SDFMT)
-                        );
+            } else {
+                self.resample_acc += hw_rate as u64;
+                while self.resample_acc >= src_rate as u64 {
+                    if !self.emit_stereo(l, r) {
+                        return;
                     }
-                }
-                // Heartbeat once per ring lap (~0.7 s): does the HW play position
-                // actually advance? lpib stuck at 0 = DMA not progressing.
-                if DEBUG && self.running && self.cur_buf == 0 {
-                    crate::println!("hda: lpib={} sdsts={:#x}", r32(self.sd + SDLPIB), r8(self.sd + 0x03));
+                    self.resample_acc -= src_rate as u64;
                 }
             }
         }
+    }
+}
+
+fn find_widget(widgets: &[Widget; MAX_WIDGETS], count: usize, nid: u32) -> Option<usize> {
+    (0..count).find(|&i| widgets[i].nid == nid)
+}
+
+fn default_port(def_cfg: u32) -> u32 {
+    (def_cfg >> 30) & 0x3
+}
+
+fn default_device(def_cfg: u32) -> u32 {
+    (def_cfg >> 20) & 0xF
+}
+
+fn output_pin_score(w: &Widget) -> i32 {
+    if w.pin_caps & PIN_CAP_OUT == 0 || default_port(w.def_cfg) == DEFAULT_PORT_NONE {
+        return -1;
+    }
+    let mut score = 100;
+    match default_device(w.def_cfg) {
+        DEFAULT_DEVICE_SPEAKER => score += 800,
+        DEFAULT_DEVICE_HP_OUT => score += 500,
+        DEFAULT_DEVICE_LINE_OUT => score += 350,
+        _ => score += 100,
+    }
+    if default_port(w.def_cfg) == DEFAULT_PORT_FIXED {
+        score += 80;
+    }
+    let assoc = (w.def_cfg >> 4) & 0xF;
+    if assoc != 0 && assoc != 0xF {
+        score += 20;
+    }
+    score
+}
+
+fn fallback_output_path(widgets: &[Widget; MAX_WIDGETS], count: usize) -> Option<OutputPath> {
+    let mut pin = 0;
+    let mut dac = 0;
+    for w in widgets.iter().take(count) {
+        if dac == 0 && w.typ == WTYPE_AUDIO_OUTPUT {
+            dac = w.nid;
+        }
+        if pin == 0 && w.typ == WTYPE_PIN_COMPLEX && w.pin_caps & PIN_CAP_OUT != 0 {
+            pin = w.nid;
+        }
+    }
+    if pin == 0 || dac == 0 {
+        None
+    } else {
+        let mut path = OutputPath::EMPTY;
+        path.nodes[0] = pin;
+        path.nodes[1] = dac;
+        path.len = 2;
+        path.score = 0;
+        Some(path)
+    }
+}
+
+fn path_extra_score(
+    widgets: &[Widget; MAX_WIDGETS],
+    count: usize,
+    path: &OutputPath,
+    codec_vendor: u32,
+) -> i32 {
+    let Some(dac_idx) = find_widget(widgets, count, path.nodes[path.len - 1]) else {
+        return -1000;
+    };
+    let mut score = (MAX_PATH - path.len) as i32;
+    if widgets[dac_idx].caps & AW_CAP_DIGITAL != 0 {
+        score -= 300;
+    }
+    let pin_dev = find_widget(widgets, count, path.nodes[0])
+        .map(|i| default_device(widgets[i].def_cfg))
+        .unwrap_or(0xF);
+    for i in 0..path.len.saturating_sub(1) {
+        if let Some(widx) = find_widget(widgets, count, path.nodes[i]) {
+            if widgets[widx].conn_sel == path.conn_idx[i] {
+                score += 10;
+            }
+        }
+    }
+    // This Razer/AMD laptop reports a Realtek ALC298. Linux routes speakers as
+    // pin 0x17 -> mixer 0x0d -> DAC 0x03 and headphones as pin 0x21 -> 0x0c
+    // -> DAC 0x02. Keep the rule as a topology preference, not a hard-coded
+    // only path, so other codecs still use the generic graph walk.
+    if codec_vendor == REALTEK_ALC298 {
+        if pin_dev == DEFAULT_DEVICE_SPEAKER {
+            if path.nodes[path.len - 1] == 0x03 {
+                score += 80;
+            }
+            if path.nodes[..path.len].contains(&0x0d) {
+                score += 80;
+            }
+        } else if pin_dev == DEFAULT_DEVICE_HP_OUT {
+            if path.nodes[path.len - 1] == 0x02 {
+                score += 40;
+            }
+            if path.nodes[..path.len].contains(&0x0c) {
+                score += 40;
+            }
+        }
+    }
+    score
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dfs_output_path(
+    widgets: &[Widget; MAX_WIDGETS],
+    count: usize,
+    nid: u32,
+    base_score: i32,
+    codec_vendor: u32,
+    path: &mut OutputPath,
+    visited: &mut [u32; MAX_PATH],
+    depth: usize,
+    best: &mut OutputPath,
+) {
+    if depth >= MAX_PATH || visited[..depth].contains(&nid) {
+        return;
+    }
+    let Some(idx) = find_widget(widgets, count, nid) else {
+        return;
+    };
+    path.nodes[depth] = nid;
+    path.len = depth + 1;
+    visited[depth] = nid;
+
+    if widgets[idx].typ == WTYPE_AUDIO_OUTPUT {
+        let mut candidate = *path;
+        candidate.score = base_score + path_extra_score(widgets, count, &candidate, codec_vendor);
+        if candidate.score > best.score {
+            *best = candidate;
+        }
+        return;
+    }
+    if !matches!(
+        widgets[idx].typ,
+        WTYPE_PIN_COMPLEX | WTYPE_AUDIO_MIXER | WTYPE_AUDIO_SELECTOR
+    ) {
+        return;
+    }
+    for i in 0..widgets[idx].conn_len {
+        path.conn_idx[depth] = i as u8;
+        dfs_output_path(
+            widgets,
+            count,
+            widgets[idx].conns[i],
+            base_score,
+            codec_vendor,
+            path,
+            visited,
+            depth + 1,
+            best,
+        );
     }
 }
 
