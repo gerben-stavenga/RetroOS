@@ -25,6 +25,7 @@ static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new
 /// the interpreter's port/device machinery.
 fn host_log_byte(b: u8) {
     use std::io::Write;
+    kernel::kernel::klog::push_byte(b);
     if let Ok(mut g) = LOG_FILE.lock()
         && let Some(f) = g.as_mut() {
             let _ = f.write_all(&[b]);

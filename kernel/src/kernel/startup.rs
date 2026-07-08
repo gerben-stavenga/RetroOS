@@ -135,7 +135,20 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
     #[allow(static_mut_refs)]
     unsafe { vfs::mount(bootfs_prefix, &ROOT_TARFS); }
 
+    mount_kernel_log_fs();
+
     crate::kernel::stacktrace::init_from_tar();
+}
+
+fn mount_kernel_log_fs() {
+    vfs::mount_union(b"proc/", &crate::kernel::klog::KLOG_FS);
+
+    let c_root = crate::kernel::dos::c_root();
+    if !c_root.is_empty() {
+        let dos_proc_prefix: &'static [u8] =
+            alloc::boxed::Box::leak([c_root, b"proc/"].concat().into_boxed_slice());
+        vfs::mount_union(dos_proc_prefix, &crate::kernel::klog::KLOG_FS);
+    }
 }
 
 /// Device policy, derived from the platform probe — not re-probed here.
