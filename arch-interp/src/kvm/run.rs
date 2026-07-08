@@ -297,7 +297,13 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             r.fs = fs as u64;
             r.gs = gs as u64;
             let fl = if_to_vif(eflags) as u64;
-            r.frame.rflags = (fl & !IOPL_MASK & !(TF_FLAG as u64)) | (1 << 12);
+            // Preserve the guest's *virtual* IOPL (bits 12-13): the vcpu runs at
+            // real IOPL=1 (enter forces it, so CLI/STI trap), but the vIOPL rides
+            // in the saved flags for `virtual_if_stepping` — exactly as metal
+            // stashes it. Forcing it to 1 here would erase the iopl3 policy and
+            // make the monitor single-step even conforming clients.
+            let viopl = r.frame.rflags & IOPL_MASK as u64;
+            r.frame.rflags = (fl & !IOPL_MASK & !(TF_FLAG as u64)) | viopl;
             if !crate::desc::seg_is_32(ss as u16) {
                 r.frame.rsp &= 0xFFFF;
             }
@@ -388,7 +394,15 @@ pub fn execute() -> KernelEvent {
         // the IF-touching opcodes in software; hardware runs only one
         // non-sensitive instruction at a time (KVM single-step).
         let mut stepping = false;
-        if mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
+        // Only single-step to catch a POPF/IRET rearm for *non-conforming*
+        // clients (virtual IOPL=3, the `iopl3` policy) — identical to metal's
+        // `virtual_if_stepping` gate in traps.rs. Spec-conforming clients
+        // (vIOPL<3) re-enable via STI/AX=0900-0902, which trap on their own, so
+        // stepping them is pure overhead (DPMI 0.9 §2.13).
+        if mode == UserMode::Mode32
+            && vcpu.flags32() & VIF_FLAG == 0
+            && arch_abi::monitor::virtual_if_stepping(&vcpu.regs)
+        {
             let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
             let r = arch_abi::monitor::step_virtual_if(&mut crate::backend::Interp, &mut vcpu.regs);
             if step_trace_on() {

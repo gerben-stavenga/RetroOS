@@ -105,9 +105,16 @@ pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
     // canonical flags word is well-formed wherever it lands in a frame,
     // and bit 9 never carries guest state.
     let want_vif = flags & IF_FLAG != 0;
+    // The guest's IOPL bits (12-13) are NOT real state: under VME the VM86 flags
+    // image reads back IOPL=3 regardless of the pinned real IOPL=1 (KVM), while
+    // TCG hands back the literal 1. Never trust them — preserve the kernel-owned
+    // virtual IOPL already in the frame (restored from the VIOPL stash on entry),
+    // the same reason bit 9 (IF) is forced and routed through VIF.
+    let viopl = regs.frame.rflags & (IOPL_MASK as u64);
     regs.frame.rflags = (regs.frame.rflags & !0xFFFF)
-        | ((flags as u64 & 0xFFFF) & !(IF_FLAG as u64))
-        | IF_FLAG as u64;
+        | ((flags as u64 & 0xFFFF) & !((IF_FLAG | IOPL_MASK) as u64))
+        | IF_FLAG as u64
+        | viopl;
     if want_vif { regs.frame.rflags |= VIF_FLAG as u64; }
     else        { regs.frame.rflags &= !(VIF_FLAG as u64); }
 }
@@ -121,7 +128,10 @@ pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
 pub fn apply_guest_flags(regs: &mut Regs, image: u32) {
     let want_vif = image & IF_FLAG != 0;
     let vm = regs.flags32() & VM_FLAG;
-    let mut nf = (image & !(IF_FLAG | VIF_FLAG | VM_FLAG)) | vm | IF_FLAG;
+    // Preserve the kernel-owned virtual IOPL (see `set_vm86_flags`): the guest's
+    // IOPL bits are a VME artifact under KVM, never trusted — like IF.
+    let viopl = regs.flags32() & IOPL_MASK;
+    let mut nf = (image & !(IF_FLAG | VIF_FLAG | VM_FLAG | IOPL_MASK)) | vm | IF_FLAG | viopl;
     if want_vif { nf |= VIF_FLAG; }
     regs.set_flags32(nf);
 }
