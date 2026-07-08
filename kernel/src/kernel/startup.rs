@@ -669,8 +669,8 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Re
         }
     } else {
         let fl = regs.flags32();
-        crate::dbg_println!("[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} VIF={}",
-            regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), fl, (fl >> 19) & 1);
+        crate::dbg_println!("[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} VIF={} vIOPL={}",
+            regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), fl, (fl >> 19) & 1, (fl >> 12) & 3);
         crate::dbg_println!("[DBG] AX={:08x} BX={:08x} CX={:08x} DX={:08x} SI={:08x} DI={:08x} BP={:08x}",
             regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
             regs.rsi as u32, regs.rdi as u32, regs.rbp as u32);
