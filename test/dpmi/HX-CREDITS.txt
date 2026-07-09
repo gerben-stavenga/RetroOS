@@ -1,0 +1,30 @@
+DPMI.EXE — third-party test binary
+===================================
+
+DPMI.EXE is the DPMI-host information/conformance probe from the **HX DOS
+Extender** runtime (HXRT), by **Japheth** (Andreas Grech).
+
+  - Source package : HXRT 2.16  (HXRT216/TEST/DPMI.EXE)
+  - Author         : Japheth (Andreas Grech)  <http://www.japheth.de/HX.html>
+  - License        : Freeware. The HX DOS Extender is distributed as freeware
+                     with source available ("This extender is freeware." —
+                     HXRT DOC/DCIMAN32.TXT).
+
+What it does
+------------
+`DPMI.EXE -r` queries the running DPMI host and dumps its state: CPU mode,
+XMS/VCPI presence, the DPMI 0.90 host version and 32-bit-client support, the
+real->protected entry point, client selectors, GDTR/IDTR/LDTR/TR, the PIC
+bases, the state-save buffer, and the "raw" real<->protected mode-switch
+entries. It is a compact, self-contained conformance probe for a DPMI host.
+
+Why it's here
+-------------
+RetroOS provides its own DPMI 0.90 host (kernel/src/kernel/dos/dpmi/). This
+binary is a neutral, third-party check that the host reports sane state and
+survives the real<->protected mode round-trips a real DPMI client performs.
+dosemu2 uses the same tool as a reference (dosemu2 issue #52), which makes it
+a useful cross-check against a mature DPMI implementation.
+
+The binary is unmodified as shipped in HXRT 2.16. It is redistributed here
+under HX's freeware terms purely as a test fixture.

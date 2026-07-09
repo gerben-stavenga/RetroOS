@@ -91,7 +91,9 @@ jobs:
           # ...and it must exit cleanly — no kernel panic behind the greeting.
           if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the bare-ELF path"; exit 1; fi
 
-      # End-to-end games: boot each headless, drive keyboard, assert no kernel
-      # panic (and, for text-mode programs, an expected on-screen string).
-      - name: Hosted game smoke tests
-        run: test/hosted_games.sh
+      # End-to-end test suite via the single aggregator (test/run_all.sh). On a
+      # GitHub-hosted runner it runs the hosted-TCG tests (hosted_games, dpmi_hx)
+      # and auto-skips the QEMU/KVM/proprietary ones; a local run covers all.
+      # New tests are wired up by adding a line to test/run_all.sh.
+      - name: End-to-end tests
+        run: test/run_all.sh
