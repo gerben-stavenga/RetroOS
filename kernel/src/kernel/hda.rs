@@ -119,6 +119,7 @@ const PARAM_FUNCTION_GROUP_TYPE: u32 = 0x05;
 const PARAM_AUDIO_WIDGET_CAPS: u32 = 0x09;
 const PARAM_PIN_CAPS: u32 = 0x0C;
 const PARAM_CONN_LIST_LEN: u32 = 0x0E;
+const PARAM_OUT_AMP_CAPS: u32 = 0x12;
 
 const VERB_GET_PARAMETER: u32 = 0xF00;
 const VERB_GET_CONN_SELECT: u32 = 0xF01;
@@ -952,13 +953,29 @@ impl Hda {
         };
         self.verb(self.pin, (VERB_SET_PIN_WIDGET_CONTROL << 8) | pin_ctl);
         self.verb(self.pin, (VERB_SET_EAPD_BTL << 8) | 0x02); // external amp on, if present
-        self.verb(self.pin, (0x3 << 16) | 0xB07F); // output amp unmute / max
+        let pin_gain = self.out_amp_zero_db(self.pin);
+        self.verb(self.pin, (0x3 << 16) | 0xB000 | pin_gain); // output amp unmute @ 0 dB
 
         self.verb(
             self.dac,
             (VERB_SET_CONV_STREAM_CHAN << 8) | (STREAM_TAG << 4),
         );
-        self.verb(self.dac, (0x3 << 16) | 0xB07F); // DAC output amp unmute / max
+        let dac_gain = self.out_amp_zero_db(self.dac);
+        self.verb(self.dac, (0x3 << 16) | 0xB000 | dac_gain); // DAC amp unmute @ 0 dB
+        crate::println!("hda: amp pin gain={:#x} dac gain={:#x}", pin_gain, dac_gain);
+    }
+
+    /// 0 dB gain value for a widget's output amp: the offset field of its amp
+    /// capabilities (a mute-only amp has offset 0). Widgets without their own
+    /// caps inherit the AFG defaults. Writing a gain beyond the amp's range
+    /// (e.g. 0x7F to pin 0x17's zero-step amp on the ALC298) is undefined and
+    /// may leave the amp muted, so never blast a fixed "max" value.
+    fn out_amp_zero_db(&mut self, nid: u32) -> u32 {
+        let mut caps = self.verb(nid, (VERB_GET_PARAMETER << 8) | PARAM_OUT_AMP_CAPS);
+        if caps == 0 {
+            caps = self.verb(self.afg, (VERB_GET_PARAMETER << 8) | PARAM_OUT_AMP_CAPS);
+        }
+        caps & 0x7F
     }
 
     fn read_realtek_coef(&mut self, index: u32) -> u32 {
@@ -1312,6 +1329,14 @@ fn dfs_output_path(
     let Some(idx) = find_widget(widgets, count, nid) else {
         return;
     };
+    // A pin complex can only *start* a path. Interior pins are not signal
+    // routes: on the laptop's ALC298 the walk otherwise threads speaker pin
+    // 0x17 through mixer 0x0c, input mixer 0x0b and mic pin 0x1a to reach
+    // 0x0d/DAC 0x03, collecting the topology bonuses with a route that
+    // programs the speaker to listen to the (silent) input loopback.
+    if depth > 0 && widgets[idx].typ == WTYPE_PIN_COMPLEX {
+        return;
+    }
     path.nodes[depth] = nid;
     path.len = depth + 1;
     visited[depth] = nid;
