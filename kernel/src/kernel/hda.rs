@@ -182,6 +182,8 @@ struct Hda {
     sd: usize,
     /// Our private RIRB read cursor (the controller advances RIRBWP).
     rirb_rp: usize,
+    /// Latched when a codec verb times out; bring-up abandons this controller.
+    verb_failed: bool,
     /// Codec address of the first present codec.
     cad: u32,
     /// Codec vendor/device id from node 0, e.g. 0x10ec0298 for Realtek ALC298.
@@ -436,6 +438,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         dma_phys,
         sd,
         rirb_rp: 0,
+        verb_failed: false,
         cad,
         codec_vendor: 0,
         dac: 0,
@@ -453,6 +456,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     // CORB/RIRB must run before any verb (enumeration uses verbs).
     d.setup_corb_rirb();
     d.codec_vendor = d.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID);
+    if d.verb_failed {
+        return false;
+    }
     if DEBUG {
         crate::println!(
             "hda: rings up corbctl={:#x} rirbctl={:#x} corbsz={:#x} rirbsz={:#x} corbwp={} corbrp={} rirbwp={}",
@@ -462,6 +468,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         // Probe consecutive verbs: does the ring keep processing past the first?
         for p in [0x00u32, 0x02, 0x04, 0x09] {
             let r = d.verb(0, (0xF00 << 8) | p);
+            if d.verb_failed {
+                return false;
+            }
             crate::println!(
                 "hda: probe param={:#04x} -> {:#x} corbwp={} corbrp={} rirbwp={} rirbsts={:#x}",
                 p,
@@ -473,7 +482,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
             );
         }
     }
-    if !d.select_output_path() {
+    if !d.select_output_path() || d.verb_failed {
         return false;
     }
 
@@ -510,6 +519,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     w8(sd + SDCTL + 2, (STREAM_TAG << 4) as u8);
 
     d.configure_path();
+    if d.verb_failed {
+        return false;
+    }
 
     if DEBUG {
         crate::println!(
@@ -596,6 +608,9 @@ impl Hda {
     /// Send one verb to `nid` and return the codec's 32-bit response. `verb` is
     /// the pre-packed verb+payload field (bits 19:0 of the command).
     fn verb(&mut self, nid: u32, verb: u32) -> u32 {
+        if self.verb_failed {
+            return 0;
+        }
         let cmd = (self.cad << 28) | (nid << 20) | (verb & 0xF_FFFF);
         // Push at (CORBWP + 1) and advance the write pointer.
         let wp = (r16(CORBWP) as usize + 1) % CORB_ENTRIES;
@@ -606,11 +621,18 @@ impl Hda {
 
         // The response lands at our next RIRB slot; wait for RIRBWP to reach it.
         let want = (self.rirb_rp + 1) % RIRB_ENTRIES;
+        let mut ready = false;
         for _ in 0..1_000_000 {
             if (r16(RIRBWP) as usize) % RIRB_ENTRIES == want {
+                ready = true;
                 break;
             }
             core::hint::spin_loop();
+        }
+        if !ready {
+            self.verb_failed = true;
+            w8(RIRBSTS, 0x05);
+            return 0;
         }
         self.rirb_rp = want;
         // RIRB entry = { response: u32, response_ex: u32 }.
@@ -741,18 +763,39 @@ impl Hda {
         let param = self.verb(nid, (VERB_GET_PARAMETER << 8) | PARAM_CONN_LIST_LEN);
         let len = (param & 0x7F) as usize;
         let long = param & 0x80 != 0;
+        let range_bit = if long { 0x8000 } else { 0x80 };
+        let nid_mask = if long { 0x7FFF } else { 0x7F };
         let mut conns = [0u32; MAX_CONNS];
-        let keep = len.min(MAX_CONNS);
-        for (i, slot) in conns.iter_mut().enumerate().take(keep) {
+        let mut out_len = 0usize;
+        let mut prev: Option<u32> = None;
+        for i in 0..len {
             let group = if long { i / 2 } else { i / 4 };
             let resp = self.verb(nid, (VERB_GET_CONN_LIST_ENTRY << 8) | group as u32);
-            *slot = if long {
+            if self.verb_failed {
+                break;
+            }
+            let raw = if long {
                 (resp >> ((i % 2) * 16)) & 0xFFFF
             } else {
                 (resp >> ((i % 4) * 8)) & 0xFF
             };
+            let entry = raw & nid_mask;
+            if raw & range_bit != 0 {
+                if let Some(start) = prev {
+                    let mut n = start.saturating_add(1);
+                    while n <= entry && out_len < MAX_CONNS {
+                        conns[out_len] = n;
+                        out_len += 1;
+                        n += 1;
+                    }
+                }
+            } else if out_len < MAX_CONNS {
+                conns[out_len] = entry;
+                out_len += 1;
+            }
+            prev = Some(entry);
         }
-        (conns, keep)
+        (conns, out_len)
     }
 
     /// Program the output path: route the DAC to the pin, power both up, unmute,
@@ -768,7 +811,7 @@ impl Hda {
                 );
                 self.verb(
                     nid,
-                    (0x3 << 16) | 0x3000 | ((self.path.conn_idx[i] as u32) << 8),
+                    (0x3 << 16) | 0x7000 | ((self.path.conn_idx[i] as u32) << 8),
                 );
             }
         }
@@ -1033,10 +1076,10 @@ fn path_extra_score(
         .map(|i| default_device(widgets[i].def_cfg))
         .unwrap_or(0xF);
     for i in 0..path.len.saturating_sub(1) {
-        if let Some(widx) = find_widget(widgets, count, path.nodes[i]) {
-            if widgets[widx].conn_sel == path.conn_idx[i] {
-                score += 10;
-            }
+        if let Some(widx) = find_widget(widgets, count, path.nodes[i])
+            && widgets[widx].conn_sel == path.conn_idx[i]
+        {
+            score += 10;
         }
     }
     // This Razer/AMD laptop reports a Realtek ALC298. Linux routes speakers as
