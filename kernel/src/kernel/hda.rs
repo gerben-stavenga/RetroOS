@@ -696,6 +696,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         d.shutdown_controller();
         return false;
     }
+    d.dump_output_state();
     d.stop_corb_rirb();
 
     if DEBUG {
@@ -1089,6 +1090,35 @@ impl Hda {
             REALTEK_VENDOR_NID,
             (VERB_SET_PROC_COEF << 8) | (value & 0xFFFF),
         );
+    }
+
+    /// Read back the programmed output state + a window of Realtek COEFs so a
+    /// silent boot's klog can be diffed against a working one.
+    fn dump_output_state(&mut self) {
+        let pinctl = self.verb(self.pin, 0xF07 << 8);
+        let eapd = self.verb(self.pin, 0xF0C << 8);
+        let pinamp = self.verb(self.pin, (0xB << 16) | 0x8000);
+        let dacamp = self.verb(self.dac, (0xB << 16) | 0x8000);
+        let pinpwr = self.verb(self.pin, 0xF05 << 8);
+        let dacpwr = self.verb(self.dac, 0xF05 << 8);
+        let pinsel = self.verb(self.pin, VERB_GET_CONN_SELECT << 8);
+        crate::println!(
+            "hda: state pinctl={:#x} eapd={:#x} pinamp={:#x} dacamp={:#x} pinpwr={:#x} dacpwr={:#x} pinsel={:#x}",
+            pinctl, eapd, pinamp, dacamp, pinpwr, dacpwr, pinsel
+        );
+        if self.codec_vendor != REALTEK_ALC298 {
+            return;
+        }
+        for base in (0x00..0x40u32).step_by(8) {
+            let mut c = [0u32; 8];
+            for (i, v) in c.iter_mut().enumerate() {
+                *v = self.read_realtek_coef(base + i as u32);
+            }
+            crate::println!(
+                "hda: coef {:02x}: {:04x} {:04x} {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}",
+                base, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
+            );
+        }
     }
 
     fn configure_realtek_eapd_coef(&mut self) {
