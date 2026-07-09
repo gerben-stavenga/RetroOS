@@ -154,7 +154,7 @@ fn read_bytes(offset: u32, out: &mut [u8]) -> i32 {
 }
 
 fn is_klog_path(path: &[u8]) -> bool {
-    KLOG_NAMES.iter().any(|&name| path == name)
+    KLOG_NAMES.contains(&path)
 }
 
 impl Filesystem for KLogFs {
