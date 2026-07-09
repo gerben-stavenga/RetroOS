@@ -133,6 +133,9 @@ _EXTRA_FILES = {
     "//apps/tests/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
     "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
+    # Japheth's HX DPMI conformance probe (freeware; see test/dpmi/HX-CREDITS.txt).
+    # `DPMI.EXE -r` dumps the DPMI host state; test/dpmi_hx.sh asserts the dump.
+    "test/dpmi/DPMI.EXE":                   "TESTS/DPMI.EXE",
     # SB DMA test: MODPLAY.EXE (stub + Rust payload) supersedes the C
     # `sbtest` -- modplay drives the same SB+8237 in both poll and IRQ
     # modes. RLOADER.BIN is the in-OS PM loader the stub fopens from cwd.
