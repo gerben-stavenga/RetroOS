@@ -117,11 +117,13 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     }
 }
 
-/// Tell the selected canonical output that the producer went idle.
-pub fn stop<A: crate::Arch>(machine: &mut A) {
+/// Tell the selected canonical output that the producer went idle. `park`
+/// marks a real session end (DSP reset / program cleanup): the output may
+/// power down its hardware fully, not just pause the stream.
+pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::hda::stop(machine),
+        Audio::EmulatedHda => crate::kernel::hda::stop(machine, park),
         Audio::EmulatedAc97 | Audio::EmulatedPortWindow => {}
         Audio::SbPassthrough | Audio::EmulatedSilent => {}
     }

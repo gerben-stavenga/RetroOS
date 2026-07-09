@@ -205,7 +205,7 @@ impl SoundBlaster {
             // No real card / no buffer alias in emulation: just stop the
             // software DSP so the next program sees a clean, idle card.
             self.emu.playing = false;
-            crate::kernel::sound::stop(machine);
+            crate::kernel::sound::stop(machine, true); // session end: power down
             self.emu.out_len = 0;
             self.emu.cmd = None;
             return;
@@ -611,7 +611,7 @@ impl SoundBlaster {
                 // DSP reset: a 1→0 edge triggers the reset handshake.
                 if self.emu.reset_prev == 1 && val == 0 {
                     self.emu.playing = false;
-                    crate::kernel::sound::stop(machine);
+                    crate::kernel::sound::stop(machine, true); // session end: power down
                     self.emu.cmd = None;
                     self.emu.param_got = 0;
                     self.emu.out_len = 0;
@@ -668,7 +668,7 @@ impl SoundBlaster {
             0xD1 | 0xD4 => {}                          // speaker on / continue DMA
             0xD0 | 0xD3 | 0xD9 | 0xDA => {
                 self.emu.playing = false; // pause / speaker off / exit auto-init
-                crate::kernel::sound::stop(machine);
+                crate::kernel::sound::stop(machine, false); // pause: keep configured
             }
             0x40 => {
                 let tc = p[0] as u32;
@@ -790,7 +790,7 @@ impl SoundBlaster {
             }
             if self.emu.single {
                 self.emu.playing = false; // single-cycle: one pass done, stop (no loop)
-                crate::kernel::sound::stop(machine);
+                crate::kernel::sound::stop(machine, false); // next block re-primes
             } else {
                 self.emu.next_irq += self.emu.block_frames as u64;
             }
