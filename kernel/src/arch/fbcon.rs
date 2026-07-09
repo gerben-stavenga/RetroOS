@@ -215,11 +215,24 @@ pub fn init(info: &arch::MultibootInfo) {
     // The physical address may sit above 4GB (OVMF does this with the NVMe BAR) —
     // PAE/compat PTEs carry 64-bit phys, so keep it u64 end to end. (Legacy
     // 32-bit paging couldn't, but a pre-PAE CPU has no UEFI/GOP to boot from.)
-    let fb_cache_flag = if paging2::wc_pat_enabled() {
+    // QEMU-TCG's display only re-scans pages its dirty-tracking flags, and it
+    // misses Write-Combining bursts (the WC fast path skips the dirty mark) — a
+    // WC present lands in RAM but the window never repaints it (only the region
+    // the boot console already dirtied shows). KVM (MMU dirty tracking) and real
+    // hardware (continuous scanout) both see WC fine. Detect plain QEMU-TCG via
+    // its hypervisor signature ("TCGTCGTCGTCG") and use strong-UC there, where
+    // every write is a dirty-tracked device access the display picks up.
+    let (_, hv_ebx, _, _) = arch::x86::cpuid(0x4000_0000);
+    let (_, _, cpuid1_ecx, _) = arch::x86::cpuid(1);
+    let qemu_tcg = (cpuid1_ecx >> 31) & 1 == 1 && hv_ebx == 0x5447_4354; // "TCGT"
+    let fb_cache_flag = if paging2::wc_pat_enabled() && !qemu_tcg {
         paging2::flags::WRITE_COMBINE
     } else {
         paging2::flags::CACHE_DISABLE
     };
+    if qemu_tcg {
+        lib::println!("fbcon: QEMU-TCG detected — strong-UC framebuffer (WC not scanned)");
+    }
     let fb_bytes = pitch * height;
     let page_off = (addr & (PAGE_SIZE as u64 - 1)) as usize;
     let pages = (page_off + fb_bytes).div_ceil(PAGE_SIZE);
