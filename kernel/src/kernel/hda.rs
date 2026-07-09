@@ -155,6 +155,15 @@ const REALTEK_EAPD_COEF_INDEX: u32 = 0x10;
 const REALTEK_EAPD_COEF_MASK: u32 = 1 << 9;
 
 static HDA: Mutex<Option<Hda>> = Mutex::new(None);
+/// True once the controller BAR is mapped at `BAR_WIN_VA` (panic-path guard).
+static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn spin(n: usize) {
+    for _ in 0..n {
+        core::hint::spin_loop();
+    }
+}
 
 // ── MMIO helpers (volatile, the BAR is mapped present + PCD) ──────────────────
 #[inline]
@@ -403,6 +412,47 @@ fn sort_hda_controllers(devices: &mut [HdaPciDevice; MAX_HDA_CONTROLLERS], n: us
     }
 }
 
+/// Bounce a PCI function through D3hot → D0 via its power-management
+/// capability. Unlike a CRST link reset, this cycles the codec's power
+/// domain, which is what recovers a codec wedged by a hard reboot during
+/// active streaming. Returns false if the function has no PM capability.
+fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
+    // Status register bit 4 (dword 0x04, bit 20): capability list present.
+    if crate::kernel::pci::read32(machine, bus, dev, func, 0x04) & (1 << 20) == 0 {
+        return false;
+    }
+    let mut ptr = (crate::kernel::pci::read32(machine, bus, dev, func, 0x34) & 0xFC) as u8;
+    let mut pm = 0u8;
+    for _ in 0..16 {
+        if ptr == 0 {
+            break;
+        }
+        let hdr = crate::kernel::pci::read32(machine, bus, dev, func, ptr);
+        if hdr & 0xFF == 0x01 {
+            pm = ptr;
+            break;
+        }
+        ptr = ((hdr >> 8) & 0xFC) as u8;
+    }
+    if pm == 0 {
+        return false;
+    }
+    // The function may internally reset on the D3hot → D0 edge (that is the
+    // point), losing config context: save and restore what bring-up relies on.
+    let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
+    let bar0 = crate::kernel::pci::read32(machine, bus, dev, func, 0x10);
+    let bar1 = crate::kernel::pci::read32(machine, bus, dev, func, 0x14);
+    let pmcsr = crate::kernel::pci::read32(machine, bus, dev, func, pm + 4);
+    crate::kernel::pci::write32(machine, bus, dev, func, pm + 4, (pmcsr & !0x3) | 0x3);
+    spin(20_000_000); // ≥ 10 ms settle in each state (PCI PM spec)
+    crate::kernel::pci::write32(machine, bus, dev, func, pm + 4, pmcsr & !0x3);
+    spin(20_000_000);
+    crate::kernel::pci::write32(machine, bus, dev, func, 0x10, bar0);
+    crate::kernel::pci::write32(machine, bus, dev, func, 0x14, bar1);
+    crate::kernel::pci::write32(machine, bus, dev, func, 0x04, cmd);
+    true
+}
+
 /// Bring up the controller + codec output path at `bus:dev.func`. Returns true
 /// on success.
 fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
@@ -429,42 +479,8 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         bar_phys >> 12,
         PTE_CACHE_DISABLE,
     );
+    BAR_MAPPED.store(true, core::sync::atomic::Ordering::Relaxed);
     stop_controller_dma();
-
-    // Controller reset: drive CRST low, wait until it reads low, then high.
-    w32(GCTL, 0);
-    for _ in 0..1_000_000 {
-        if r32(GCTL) & 1 == 0 {
-            break;
-        }
-    }
-    w32(GCTL, 1);
-    let mut up = false;
-    for _ in 0..1_000_000 {
-        if r32(GCTL) & 1 != 0 {
-            up = true;
-            break;
-        }
-    }
-    if !up {
-        crate::println!("hda: {:02x}:{:02x}.{} failed: CRST stuck low", bus, dev, func);
-        return false;
-    }
-    // Codecs need ≥ 521 µs after CRST to report in STATESTS; spin a cushion.
-    for _ in 0..1_000_000 {
-        core::hint::spin_loop();
-    }
-    let codecs = r16(STATESTS);
-    if codecs == 0 {
-        crate::println!(
-            "hda: {:02x}:{:02x}.{} failed: statests=0, no codec responded after reset",
-            bus,
-            dev,
-            func
-        );
-        return false;
-    }
-    let cad = codecs.trailing_zeros();
 
     // Output stream descriptor base sits past the ISS input streams.
     let gcap = r16(GCAP);
@@ -487,7 +503,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         rirb_rp: 0,
         rings_running: false,
         verb_failed: false,
-        cad,
+        cad: 0,
         codec_vendor: 0,
         afg: 0,
         dac: 0,
@@ -506,19 +522,97 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         diag_stalls: 0,
     };
 
-    // CORB/RIRB must run before any verb (enumeration uses verbs).
-    d.setup_corb_rirb();
-    d.codec_vendor = d.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID);
-    if d.verb_failed {
-        crate::println!(
-            "hda: {:02x}:{:02x}.{} failed: vendor-id verb timeout (cad={}, statests={:#x})",
-            bus,
-            dev,
-            func,
-            cad,
-            codecs
-        );
-        d.shutdown_controller();
+    // Link reset + codec detection, with escalating recovery. A hard reboot
+    // during active streaming can leave the codec wedged: it stays deaf to
+    // plain CRST resets across warm reboots until its power well cycles
+    // (observed on the ALC298 laptop; Linux then reports "no codecs found"
+    // until a cold boot). Attempt 0 is the normal spec sequence; attempt 1
+    // retries with a longer reset hold; attempt 2 first bounces the function
+    // through PCI D3hot → D0, which resets the codec power domain without a
+    // cold boot.
+    let mut detected = false;
+    for attempt in 0..3u32 {
+        if attempt == 2 {
+            if !pci_pm_power_cycle(machine, bus, dev, func) {
+                break; // no PM capability; another link reset won't differ
+            }
+            stop_controller_dma();
+        }
+        // Clear stale STATESTS (RW1C) BEFORE asserting reset: real codecs
+        // report in after CRST releases, but QEMU latches the bits at the
+        // CRST=0 write itself, so clearing while in reset would wipe them.
+        w16(STATESTS, 0x7FFF);
+        // CRST low; hold well past the 100 µs minimum before releasing.
+        w32(GCTL, 0);
+        for _ in 0..1_000_000 {
+            if r32(GCTL) & 1 == 0 {
+                break;
+            }
+        }
+        spin(1_000_000 << attempt);
+        w32(GCTL, 1);
+        let mut up = false;
+        for _ in 0..1_000_000 {
+            if r32(GCTL) & 1 != 0 {
+                up = true;
+                break;
+            }
+        }
+        if !up {
+            crate::println!(
+                "hda: {:02x}:{:02x}.{} attempt {}: CRST stuck low",
+                bus,
+                dev,
+                func,
+                attempt
+            );
+            continue;
+        }
+        // Codecs need ≥ 521 µs after CRST to report in STATESTS.
+        spin(1_000_000 << attempt);
+        let codecs = r16(STATESTS);
+        if codecs == 0 {
+            crate::println!(
+                "hda: {:02x}:{:02x}.{} attempt {}: statests=0, no codec responded",
+                bus,
+                dev,
+                func,
+                attempt
+            );
+            continue;
+        }
+        // A codec that reports in STATESTS can still be verb-dead; probe it.
+        d.cad = codecs.trailing_zeros();
+        d.verb_failed = false;
+        d.setup_corb_rirb();
+        d.codec_vendor = d.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID);
+        if d.verb_failed || d.codec_vendor == 0 || d.codec_vendor == 0xFFFF_FFFF {
+            crate::println!(
+                "hda: {:02x}:{:02x}.{} attempt {}: codec verb-dead (cad={} statests={:#x} vendor={:#x})",
+                bus,
+                dev,
+                func,
+                attempt,
+                d.cad,
+                codecs,
+                d.codec_vendor
+            );
+            d.shutdown_controller();
+            continue;
+        }
+        if attempt > 0 {
+            crate::println!(
+                "hda: {:02x}:{:02x}.{} codec recovered on attempt {}",
+                bus,
+                dev,
+                func,
+                attempt
+            );
+        }
+        detected = true;
+        break;
+    }
+    if !detected {
         return false;
     }
     if DEBUG {
@@ -611,8 +705,8 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
             gcap,
             iss,
             (gcap >> 12) & 0xF,
-            codecs,
-            cad,
+            r16(STATESTS),
+            d.cad,
             sd
         );
         crate::println!("hda: dac=nid{} pin=nid{}", d.dac, d.pin);
@@ -1379,6 +1473,19 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     if let Some(dev) = g.as_mut() {
         dev.submit(rate, fmt, bytes);
     }
+}
+
+/// Panic-path quiesce: stop all controller DMA and hold the link in reset so a
+/// hard reboot from a panic doesn't leave the codec wedged (mid-stream resets
+/// have left the ALC298 deaf to every OS until a cold power-off). Touches only
+/// MMIO — no locks, no allocation — so it is safe from the panic handler even
+/// if the HDA mutex is held.
+pub fn emergency_quiesce() {
+    if !BAR_MAPPED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    stop_controller_dma();
+    w32(GCTL, 0); // assert CRST: the codec rides out the reboot in reset
 }
 
 /// Stop active HDA playback DMA after the emulated producer goes idle. This is
