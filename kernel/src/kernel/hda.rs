@@ -804,6 +804,17 @@ impl Hda {
         self.cur_buf = 0;
         self.cur_off = 0;
         self.resample_acc = 0;
+        // Clear the PCM ring: the producer restarts at buffer 0, so if the
+        // hardware ever runs past the freshly primed buffers (session start,
+        // underrun) it must find silence, not a replay of the previous
+        // session's audio.
+        unsafe {
+            core::ptr::write_bytes(
+                (self.dma_va + BUF_OFF) as *mut u8,
+                0,
+                NUM_BUF * BUF_BYTES,
+            );
+        }
     }
 
     fn shutdown_controller(&mut self) {
