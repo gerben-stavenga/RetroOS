@@ -332,14 +332,6 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
         if bring_up(machine, d.bus, d.dev, d.func) {
             return;
         }
-        if DEBUG {
-            crate::println!(
-                "hda: {:02x}:{:02x}.{} bring-up failed",
-                d.bus,
-                d.dev,
-                d.func
-            );
-        }
     }
 }
 
@@ -427,6 +419,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     };
     let bar_phys = (hi << 32) | (bar0 & 0xFFFF_FFF0) as u64;
     if bar_phys == 0 {
+        crate::println!("hda: {:02x}:{:02x}.{} skipped: no BAR", bus, dev, func);
         return false;
     }
     machine.map_phys_range(
@@ -453,6 +446,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         }
     }
     if !up {
+        crate::println!("hda: {:02x}:{:02x}.{} failed: CRST stuck low", bus, dev, func);
         return false;
     }
     // Codecs need ≥ 521 µs after CRST to report in STATESTS; spin a cushion.
@@ -461,6 +455,12 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     }
     let codecs = r16(STATESTS);
     if codecs == 0 {
+        crate::println!(
+            "hda: {:02x}:{:02x}.{} failed: statests=0, no codec responded after reset",
+            bus,
+            dev,
+            func
+        );
         return false;
     }
     let cad = codecs.trailing_zeros();
@@ -473,6 +473,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     // Map the borrowed contiguous DMA buffer.
     let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
     if phys_page == 0 {
+        crate::println!("hda: {:02x}:{:02x}.{} failed: no DMA buffer", bus, dev, func);
         return false;
     }
     machine.map_phys_range(DMA_WIN_VA >> 12, DMA_PAGES, phys_page, PTE_CACHE_DISABLE);
@@ -508,6 +509,14 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     d.setup_corb_rirb();
     d.codec_vendor = d.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID);
     if d.verb_failed {
+        crate::println!(
+            "hda: {:02x}:{:02x}.{} failed: vendor-id verb timeout (cad={}, statests={:#x})",
+            bus,
+            dev,
+            func,
+            cad,
+            codecs
+        );
         d.shutdown_controller();
         return false;
     }
@@ -536,6 +545,14 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         }
     }
     if !d.select_output_path() || d.verb_failed {
+        crate::println!(
+            "hda: {:02x}:{:02x}.{} failed: no output path (codec={:#x}, verb_failed={})",
+            bus,
+            dev,
+            func,
+            d.codec_vendor,
+            d.verb_failed
+        );
         d.shutdown_controller();
         return false;
     }
@@ -574,6 +591,13 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
 
     d.configure_path();
     if d.verb_failed {
+        crate::println!(
+            "hda: {:02x}:{:02x}.{} failed: configure-path verb timeout (codec={:#x})",
+            bus,
+            dev,
+            func,
+            d.codec_vendor
+        );
         d.shutdown_controller();
         return false;
     }
