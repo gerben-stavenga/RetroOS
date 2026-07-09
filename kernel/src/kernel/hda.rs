@@ -123,7 +123,10 @@ const PARAM_CONN_LIST_LEN: u32 = 0x0E;
 const VERB_GET_PARAMETER: u32 = 0xF00;
 const VERB_GET_CONN_SELECT: u32 = 0xF01;
 const VERB_GET_CONN_LIST_ENTRY: u32 = 0xF02;
+const VERB_GET_PROC_COEF: u32 = 0xC00;
 const VERB_GET_CONFIG_DEFAULT: u32 = 0xF1C;
+const VERB_SET_PROC_COEF: u32 = 0x400;
+const VERB_SET_COEF_INDEX: u32 = 0x500;
 const VERB_SET_CONN_SELECT: u32 = 0x701;
 const VERB_SET_POWER_STATE: u32 = 0x705;
 const VERB_SET_CONV_STREAM_CHAN: u32 = 0x706;
@@ -146,6 +149,9 @@ const DEFAULT_DEVICE_LINE_OUT: u32 = 0x0;
 const DEFAULT_DEVICE_SPEAKER: u32 = 0x1;
 const DEFAULT_DEVICE_HP_OUT: u32 = 0x2;
 const REALTEK_ALC298: u32 = 0x10ec_0298;
+const REALTEK_VENDOR_NID: u32 = 0x20;
+const REALTEK_EAPD_COEF_INDEX: u32 = 0x10;
+const REALTEK_EAPD_COEF_MASK: u32 = 1 << 9;
 
 static HDA: Mutex<Option<Hda>> = Mutex::new(None);
 
@@ -175,6 +181,19 @@ fn w32(off: usize, v: u32) {
     unsafe { write_volatile((BAR_WIN_VA + off) as *mut u32, v) }
 }
 
+fn stop_controller_dma() {
+    let gcap = r16(GCAP);
+    let stream_count = (((gcap >> 8) & 0xF) + ((gcap >> 12) & 0xF)) as usize;
+    for i in 0..stream_count {
+        let sd = SD_BASE + i * SD_STRIDE;
+        w8(sd + SDCTL, r8(sd + SDCTL) & !0x02);
+    }
+    w8(CORBCTL, 0);
+    w8(RIRBCTL, 0);
+    w32(DPLBASE, 0);
+    w32(DPUBASE, 0);
+}
+
 struct Hda {
     dma_va: usize,
     dma_phys: u32,
@@ -182,12 +201,16 @@ struct Hda {
     sd: usize,
     /// Our private RIRB read cursor (the controller advances RIRBWP).
     rirb_rp: usize,
+    /// True while CORB/RIRB DMA engines are running for codec verbs.
+    rings_running: bool,
     /// Latched when a codec verb times out; bring-up abandons this controller.
     verb_failed: bool,
     /// Codec address of the first present codec.
     cad: u32,
     /// Codec vendor/device id from node 0, e.g. 0x10ec0298 for Realtek ALC298.
     codec_vendor: u32,
+    /// Audio Function Group node found during enumeration.
+    afg: u32,
     /// Output DAC + output pin node IDs selected from the codec graph.
     dac: u32,
     pin: u32,
@@ -202,6 +225,11 @@ struct Hda {
     src_rate: u32,
     /// Output-rate accumulator for zero-order-hold resampling.
     resample_acc: u64,
+    /// Sparse runtime diagnostics for real hardware bring-up.
+    logged_submit: bool,
+    logged_run: bool,
+    diag_buffers: u8,
+    diag_stalls: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -261,6 +289,22 @@ impl OutputPath {
         len: 0,
         score: i32::MIN,
     };
+}
+
+fn path_node(path: &OutputPath, i: usize) -> u32 {
+    if i < path.len {
+        path.nodes[i]
+    } else {
+        0
+    }
+}
+
+fn path_conn(path: &OutputPath, i: usize) -> u8 {
+    if i + 1 < path.len {
+        path.conn_idx[i]
+    } else {
+        0
+    }
 }
 
 /// Find the preferred HDA controller (class 0x04, subclass 0x03) anywhere on
@@ -391,6 +435,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         bar_phys >> 12,
         PTE_CACHE_DISABLE,
     );
+    stop_controller_dma();
 
     // Controller reset: drive CRST low, wait until it reads low, then high.
     w32(GCTL, 0);
@@ -438,9 +483,11 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         dma_phys,
         sd,
         rirb_rp: 0,
+        rings_running: false,
         verb_failed: false,
         cad,
         codec_vendor: 0,
+        afg: 0,
         dac: 0,
         pin: 0,
         pin_def: 0,
@@ -451,12 +498,17 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         rate: 0,
         src_rate: 0,
         resample_acc: 0,
+        logged_submit: false,
+        logged_run: false,
+        diag_buffers: 0,
+        diag_stalls: 0,
     };
 
     // CORB/RIRB must run before any verb (enumeration uses verbs).
     d.setup_corb_rirb();
     d.codec_vendor = d.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID);
     if d.verb_failed {
+        d.shutdown_controller();
         return false;
     }
     if DEBUG {
@@ -469,6 +521,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         for p in [0x00u32, 0x02, 0x04, 0x09] {
             let r = d.verb(0, (0xF00 << 8) | p);
             if d.verb_failed {
+                d.shutdown_controller();
                 return false;
             }
             crate::println!(
@@ -483,6 +536,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         }
     }
     if !d.select_output_path() || d.verb_failed {
+        d.shutdown_controller();
         return false;
     }
 
@@ -520,8 +574,10 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
 
     d.configure_path();
     if d.verb_failed {
+        d.shutdown_controller();
         return false;
     }
+    d.stop_corb_rirb();
 
     if DEBUG {
         crate::println!(
@@ -545,6 +601,22 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         d.codec_vendor,
         d.pin,
         d.dac,
+    );
+    crate::println!(
+        "hda: path len={} score={} nodes={:02x}>{:02x}>{:02x}>{:02x}>{:02x}>{:02x} conn={},{},{},{},{}",
+        d.path.len,
+        d.path.score,
+        path_node(&d.path, 0),
+        path_node(&d.path, 1),
+        path_node(&d.path, 2),
+        path_node(&d.path, 3),
+        path_node(&d.path, 4),
+        path_node(&d.path, 5),
+        path_conn(&d.path, 0),
+        path_conn(&d.path, 1),
+        path_conn(&d.path, 2),
+        path_conn(&d.path, 3),
+        path_conn(&d.path, 4),
     );
     *HDA.lock() = Some(d);
     true
@@ -603,6 +675,30 @@ impl Hda {
 
         w8(CORBCTL, 0x02); // CORBRUN
         w8(RIRBCTL, 0x02); // RIRBDMAEN
+        self.rings_running = true;
+    }
+
+    fn stop_corb_rirb(&mut self) {
+        w8(CORBCTL, 0);
+        w8(RIRBCTL, 0);
+        self.rings_running = false;
+    }
+
+    fn stop_playback(&mut self) {
+        if self.running {
+            self.stop();
+            self.running = false;
+        }
+        self.cur_buf = 0;
+        self.cur_off = 0;
+        self.resample_acc = 0;
+    }
+
+    fn shutdown_controller(&mut self) {
+        self.stop_playback();
+        self.stop_corb_rirb();
+        w32(DPLBASE, 0);
+        w32(DPUBASE, 0);
     }
 
     /// Send one verb to `nid` and return the codec's 32-bit response. `verb` is
@@ -610,6 +706,9 @@ impl Hda {
     fn verb(&mut self, nid: u32, verb: u32) -> u32 {
         if self.verb_failed {
             return 0;
+        }
+        if !self.rings_running {
+            self.setup_corb_rirb();
         }
         let cmd = (self.cad << 28) | (nid << 20) | (verb & 0xF_FFFF);
         // Push at (CORBWP + 1) and advance the write pointer.
@@ -713,6 +812,7 @@ impl Hda {
         if afg == 0 {
             return 0;
         }
+        self.afg = afg;
         // The AFG's subnodes are the widgets.
         let sub = self.verb(afg, (VERB_GET_PARAMETER << 8) | PARAM_SUBNODE_COUNT);
         let w_start = (sub >> 16) & 0xFF;
@@ -801,6 +901,11 @@ impl Hda {
     /// Program the output path: route the DAC to the pin, power both up, unmute,
     /// and bind the stream tag. Format is set later (per rate) by `set_format`.
     fn configure_path(&mut self) {
+        if self.afg != 0 {
+            self.verb(self.afg, VERB_SET_POWER_STATE << 8); // D0
+        }
+        self.configure_realtek_eapd_coef();
+
         for i in 0..self.path.len {
             let nid = self.path.nodes[i];
             self.verb(nid, VERB_SET_POWER_STATE << 8); // D0
@@ -830,6 +935,40 @@ impl Hda {
             (VERB_SET_CONV_STREAM_CHAN << 8) | (STREAM_TAG << 4),
         );
         self.verb(self.dac, (0x3 << 16) | 0xB07F); // DAC output amp unmute / max
+    }
+
+    fn read_realtek_coef(&mut self, index: u32) -> u32 {
+        self.verb(
+            REALTEK_VENDOR_NID,
+            (VERB_SET_COEF_INDEX << 8) | (index & 0xFF),
+        );
+        self.verb(REALTEK_VENDOR_NID, VERB_GET_PROC_COEF << 8) & 0xFFFF
+    }
+
+    fn write_realtek_coef(&mut self, index: u32, value: u32) {
+        self.verb(
+            REALTEK_VENDOR_NID,
+            (VERB_SET_COEF_INDEX << 8) | (index & 0xFF),
+        );
+        self.verb(
+            REALTEK_VENDOR_NID,
+            (VERB_SET_PROC_COEF << 8) | (value & 0xFFFF),
+        );
+    }
+
+    fn configure_realtek_eapd_coef(&mut self) {
+        if self.codec_vendor != REALTEK_ALC298 {
+            return;
+        }
+        let old = self.read_realtek_coef(REALTEK_EAPD_COEF_INDEX);
+        if self.verb_failed {
+            return;
+        }
+        let new = old & !REALTEK_EAPD_COEF_MASK;
+        if new != old {
+            self.write_realtek_coef(REALTEK_EAPD_COEF_INDEX, new);
+        }
+        crate::println!("hda: alc298 coef10 {:#06x}->{:#06x}", old, new);
     }
 
     /// Encode a 16-bit stereo stream format for `rate` (HDA SDFMT / converter
@@ -863,6 +1002,7 @@ impl Hda {
         w16(self.sd + SDFMT, f);
         let dac = self.dac;
         self.verb(dac, (0x2 << 16) | f as u32); // Set Converter Format
+        self.stop_corb_rirb();
         self.rate = rate;
         if DEBUG {
             crate::println!("hda: set_format rate={} fmt={:#06x}", rate, f);
@@ -909,15 +1049,18 @@ impl Hda {
             // value (>= half the ring) means the play position lapped us
             // (underrun) — feed hard to catch up, never stall.
             if (MAX_AHEAD..NUM_BUF / 2).contains(&ahead) {
-                if DEBUG {
+                if self.diag_stalls < 3 {
                     crate::println!(
-                        "hda: stall cur_buf={} civ={} lpib={} pos={} sdsts={:#x}",
+                        "hda: stall cur_buf={} play_buf={} ahead={} lpib={} pos={} sdctl={:#x} sdsts={:#x}",
                         self.cur_buf,
                         civ,
+                        ahead,
                         r32(self.sd + SDLPIB),
                         self.dma_pos(),
+                        r32(self.sd + SDCTL),
                         r8(self.sd + 0x03)
                     );
+                    self.diag_stalls += 1;
                 }
                 return false;
             }
@@ -938,25 +1081,33 @@ impl Hda {
             if !self.running && self.cur_buf >= PRIME_BUFS {
                 w32(self.sd + SDCTL, 0x02 | (STREAM_TAG << 20));
                 self.running = true;
-                if DEBUG {
+                if !self.logged_run {
                     crate::println!(
-                        "hda: stream RUN sdctl={:#010x} sdsts={:#x} cbl={} lvi={} fmt={:#06x}",
+                        "hda: stream RUN sdctl={:#010x} sdsts={:#x} cbl={} lvi={} fmt={:#06x} lpib={} pos={}",
                         r32(self.sd + SDCTL),
                         r8(self.sd + 0x03),
                         r32(self.sd + SDCBL),
                         r16(self.sd + SDLVI),
-                        r16(self.sd + SDFMT)
+                        r16(self.sd + SDFMT),
+                        r32(self.sd + SDLPIB),
+                        self.dma_pos(),
                     );
+                    self.logged_run = true;
                 }
             }
-            // Heartbeat once per ring lap (~0.7 s): does the HW play position
-            // actually advance? lpib stuck at 0 = DMA not progressing.
-            if DEBUG && self.running && self.cur_buf == 0 {
+            // First few buffer boundaries: does the HW play position advance?
+            if self.running && self.diag_buffers < 6 {
                 crate::println!(
-                    "hda: lpib={} sdsts={:#x}",
+                    "hda: playback cur_buf={} play_buf={} pos_buf={} lpib={} pos={} sdctl={:#x} sdsts={:#x}",
+                    self.cur_buf,
+                    self.play_buf(),
+                    (self.dma_pos() as usize / BUF_BYTES) % NUM_BUF,
                     r32(self.sd + SDLPIB),
-                    r8(self.sd + 0x03)
+                    self.dma_pos(),
+                    r32(self.sd + SDCTL),
+                    r8(self.sd + 0x03),
                 );
+                self.diag_buffers += 1;
             }
         }
         true
@@ -983,6 +1134,19 @@ impl Hda {
         let fb = fmt.frame_bytes();
         if fb == 0 {
             return;
+        }
+        if !self.logged_submit {
+            crate::println!(
+                "hda: pcm submit src_rate={} hw_rate={} bits={} signed={} ch={} frame_bytes={} bytes={}",
+                src_rate,
+                hw_rate,
+                fmt.bits,
+                fmt.signed,
+                fmt.channels,
+                fb,
+                bytes.len(),
+            );
+            self.logged_submit = true;
         }
         for i in 0..bytes.len() / fb {
             let (l, r) = fmt.frame(bytes, i);
@@ -1165,5 +1329,17 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     let mut g = HDA.lock();
     if let Some(dev) = g.as_mut() {
         dev.submit(rate, fmt, bytes);
+    }
+}
+
+/// Stop active HDA playback DMA after the emulated producer goes idle. This is
+/// intentionally lighter than a full controller reset so a later DOS program can
+/// re-prime the same configured codec path.
+pub fn stop<A: crate::Arch>(machine: &mut A) {
+    let _ = machine;
+    let mut g = HDA.lock();
+    if let Some(dev) = g.as_mut() {
+        dev.stop_playback();
+        dev.stop_corb_rirb();
     }
 }

@@ -116,3 +116,13 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
         machine.outw(AUDIO_RIGHT, r as u16);
     }
 }
+
+/// Tell the selected canonical output that the producer went idle.
+pub fn stop<A: crate::Arch>(machine: &mut A) {
+    use crate::kernel::platform::Audio;
+    match crate::kernel::platform::get().audio {
+        Audio::EmulatedHda => crate::kernel::hda::stop(machine),
+        Audio::EmulatedAc97 | Audio::EmulatedPortWindow => {}
+        Audio::SbPassthrough | Audio::EmulatedSilent => {}
+    }
+}

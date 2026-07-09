@@ -205,6 +205,7 @@ impl SoundBlaster {
             // No real card / no buffer alias in emulation: just stop the
             // software DSP so the next program sees a clean, idle card.
             self.emu.playing = false;
+            crate::kernel::sound::stop(machine);
             self.emu.out_len = 0;
             self.emu.cmd = None;
             return;
@@ -253,7 +254,7 @@ impl SoundBlaster {
     /// locally; all other traffic continues to the real QEMU sb16/adlib.
     pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
         if self.emulated() {
-            self.emu_write(p, val);
+            self.emu_write(machine, p, val);
             return;
         }
         if p == self.io_base + 0x0C {
@@ -582,7 +583,7 @@ impl SoundBlaster {
     }
 
     /// Emulated DSP/mixer port write.
-    fn emu_write(&mut self, p: u16, val: u8) {
+    fn emu_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
         // OPL2 FM (AdLib 0x388/0x389, or the SB's OPL at io_base+8/+9): index
         // register select + the timer-control register, enough for detection.
         if p == 0x388 || p == self.io_base + 8 {
@@ -610,6 +611,7 @@ impl SoundBlaster {
                 // DSP reset: a 1→0 edge triggers the reset handshake.
                 if self.emu.reset_prev == 1 && val == 0 {
                     self.emu.playing = false;
+                    crate::kernel::sound::stop(machine);
                     self.emu.cmd = None;
                     self.emu.param_got = 0;
                     self.emu.out_len = 0;
@@ -617,19 +619,19 @@ impl SoundBlaster {
                 }
                 self.emu.reset_prev = val;
             }
-            0x0C => self.emu_dsp_byte(val), // DSP command / parameter port
+            0x0C => self.emu_dsp_byte(machine, val), // DSP command / parameter port
             _ => {}                         // mixer index/data, OPL: ignored
         }
     }
 
     /// Feed one byte to the DSP command FSM: a parameter for the in-flight
     /// command, or the start of a new one.
-    fn emu_dsp_byte(&mut self, val: u8) {
+    fn emu_dsp_byte<A: crate::Arch>(&mut self, machine: &mut A, val: u8) {
         if let Some(cmd) = self.emu.cmd {
             self.emu.params[self.emu.param_got as usize] = val;
             self.emu.param_got += 1;
             if self.emu.param_got >= self.emu.param_need {
-                self.emu_exec(cmd);
+                self.emu_exec(machine, cmd);
                 self.emu.cmd = None;
                 self.emu.param_got = 0;
             }
@@ -647,12 +649,12 @@ impl SoundBlaster {
             self.emu.param_need = need;
             self.emu.param_got = 0;
         } else {
-            self.emu_exec(val);
+            self.emu_exec(machine, val);
         }
     }
 
     /// Execute a fully-parameterized DSP command.
-    fn emu_exec(&mut self, cmd: u8) {
+    fn emu_exec<A: crate::Arch>(&mut self, machine: &mut A, cmd: u8) {
         let p = self.emu.params;
         match cmd {
             0xE1 => {
@@ -664,7 +666,10 @@ impl SoundBlaster {
             0xE4 => self.emu.test_reg = p[0], // write test register
             0xE8 => self.emu.push_out(self.emu.test_reg), // read test register back
             0xD1 | 0xD4 => {}                          // speaker on / continue DMA
-            0xD0 | 0xD3 | 0xD9 | 0xDA => self.emu.playing = false, // pause / speaker off / exit auto-init
+            0xD0 | 0xD3 | 0xD9 | 0xDA => {
+                self.emu.playing = false; // pause / speaker off / exit auto-init
+                crate::kernel::sound::stop(machine);
+            }
             0x40 => {
                 let tc = p[0] as u32;
                 self.emu.rate = if tc < 256 { 1_000_000 / (256 - tc) } else { 22050 };
@@ -785,6 +790,7 @@ impl SoundBlaster {
             }
             if self.emu.single {
                 self.emu.playing = false; // single-cycle: one pass done, stop (no loop)
+                crate::kernel::sound::stop(machine);
             } else {
                 self.emu.next_irq += self.emu.block_frames as u64;
             }
