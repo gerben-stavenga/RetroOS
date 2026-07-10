@@ -1170,7 +1170,12 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 let mut buf = alloc::vec![0u8; count];
                 let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
                 if n >= 0 {
-                    machine.copy_to(buf_addr as usize, &buf[..(n as usize).min(count)]);
+                    machine::vga::copy_to_guest(
+                        machine,
+                        &mut dos.pc.vga,
+                        buf_addr as usize,
+                        &buf[..(n as usize).min(count)],
+                    );
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
                     let dump_n = (n as usize).min(16);
                     let mut hex = [0u8; 16];

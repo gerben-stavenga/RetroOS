@@ -112,6 +112,10 @@ pub struct VgaState {
     pub svga_bpp: u8,
     /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
     pub svga_bank: u16,
+    /// This address space's A0000 window is mapped as the planar trap
+    /// (present=0 + MMIO marker), so kernel-side writes must route through
+    /// `vram_write` instead of raw guest-memory stores.
+    pub a0000_trapped: bool,
 }
 
 impl Default for VgaState {
@@ -161,6 +165,7 @@ impl VgaState {
             svga_h: 0,
             svga_bpp: 0,
             svga_bank: 0,
+            a0000_trapped: false,
         }
     }
 
@@ -492,25 +497,18 @@ impl VgaState {
 
 
 // ============================================================================
-// Emulated VGA planar VRAM (paging-aliased planes)
+// Emulated VGA planar VRAM (trap-backed A0000)
 // ============================================================================
 //
 // Planar/Mode-X graphics route a single CPU store to A0000 through the VGA's
 // plane logic into 1-4 of the 4 planes — the result is not what lands in
-// linear RAM, so it must be modelled at write time. We do it metal-natively
-// with paging, no per-write trap: the 4 planes are physical frames; A0000 is
-// page-aliased onto the active plane (CPU writes land there directly); the
-// renderer reads all 4 planes through a kernel-private guest-VA window. On the
-// chain↔unchain hop the chained (mode-13h linear) content is synced into/out
-// of the planes (chain4 split/merge). Single-plane access (all Mode X, simple
-// EGA) is pure alias; EGA multi-plane set/reset fan-out is the not-yet-handled
-// fallback. Interp emulates the same paging; metal does it in page tables.
+// linear RAM, so it must be modelled at write time. A0000 is mapped as an MMIO
+// trap window while planar modes are active; the #PF path decodes guest CPU
+// accesses and kernel-side transfers use `copy_to_guest`. On the chain↔unchain
+// hop the chained (mode-13h linear) content is synced into/out of the planes
+// (chain4 split/merge). Interp and metal use the same trap marker contract.
 
-use core::sync::atomic::{AtomicU8, Ordering};
-
-/// Which plane the guest A0000 window currently aliases (0..3), or 0xFF when
-/// A0000 is plain linear RAM (chained mode 13h / text — not planar).
-static A0000_TARGET: AtomicU8 = AtomicU8::new(0xFF);
+use core::sync::atomic::Ordering;
 
 /// The emulated VGA's plane memory: 4 planes × 64 KB, byte (plane `p`, offset
 /// `off`) at `[p*0x10000 + off]`. Lives per-thread on `VgaState::planes` (the
@@ -519,11 +517,6 @@ static A0000_TARGET: AtomicU8 = AtomicU8::new(0xFF);
 /// no per-frame copy.
 const PLANES_LEN: usize = 4 * 0x10000;
 const A0000: usize = 0xA0000;
-
-/// True while a guest is in unchained planar graphics (A0000 aliases a plane).
-pub fn planar_active() -> bool {
-    A0000_TARGET.load(Ordering::Relaxed) != 0xFF
-}
 
 /// React to a Sequencer register write (port 0x3C5) that may change the
 /// chain-4 mode or the plane-select mask. Drives the A0000 paging alias.
@@ -540,13 +533,13 @@ pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             // planes from the current chained A0000 image (a 13h frame the game
             // unchains into Mode X mid-stream); the reverse merges them back.
             let unchained = pc.vga.seq[4] & 0x08 == 0;
-            let currently_planar = planar_active();
+            let currently_planar = pc.vga.a0000_trapped;
             if unchained && !currently_planar {
                 let mut chained = alloc::vec![0u8; 0x10000];
                 machine.copy_from(A0000, &mut chained);
                 arm_planar(machine, &mut pc.vga, Some(&chained));
             } else if !unchained && currently_planar {
-                disarm_planar(machine, &pc.vga, regs, true);
+                disarm_planar(machine, &mut pc.vga, regs, true);
             }
         }
         2 => {
@@ -576,21 +569,21 @@ fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, seed: Option<
         None => vga.planes.fill(0),
     }
     machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
-    A0000_TARGET.store(0, Ordering::Relaxed); // 0 != 0xFF ⇒ planar_active()
+    vga.a0000_trapped = true;
 }
 
 /// Tear down the planar trap: map A0000 back to plain RAM. `merge`: interleave
 /// the planes back into a linear A0000 image first (the Mode-X unchain→chain
 /// hop, which expects the 13h view preserved); skip it when simply leaving
 /// graphics for text (the next mode-set clears the screen anyway).
-fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &VgaState, _regs: &mut Regs, merge: bool) {
+fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, _regs: &mut Regs, merge: bool) {
     machine.map_fresh_range(A0000 >> 12, 16);
     if merge {
         let mut chained = alloc::vec![0u8; 0x10000];
         lib::vga_render::chain4_merge(&vga.planes, &mut chained);
         machine.copy_to(A0000, &chained);
     }
-    A0000_TARGET.store(0xFF, Ordering::Relaxed);
+    vga.a0000_trapped = false;
 }
 
 // ============================================================================
@@ -636,7 +629,7 @@ pub fn svga_set_mode<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, w: u16
     pc.vga.svga_bpp = bpp;
     pc.vga.svga_bank = 0;
     // A VBE set-mode bypasses on_set_mode, so clear any stale planar marker.
-    A0000_TARGET.store(0xFF, Ordering::Relaxed);
+    pc.vga.a0000_trapped = false;
 }
 
 /// VBE 4F05h window control: alias the 0xA0000 window onto `bank` of the
@@ -666,6 +659,7 @@ pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     pc.vga.svga_h = 0;
     pc.vga.svga_bpp = 0;
     pc.vga.svga_bank = 0;
+    pc.vga.a0000_trapped = false;
 }
 
 /// React to a BIOS INT 10h AH=00 video mode set. The EGA/VGA 16-colour planar
@@ -738,14 +732,14 @@ pub fn on_set_mode<A: crate::Arch>(
         pc.vga.ac[0x13] = 0x00; // pixel pan
         pc.vga.ac[0x14] = 0x00; // colour select high bits
     }
-    let currently = planar_active();
+    let currently = pc.vga.a0000_trapped;
     if planar && !currently {
         arm_planar(machine, &mut pc.vga, None); // fresh mode-set ⇒ zeroed planes
     } else if planar && currently && clear {
         // Re-set the same planar mode: keep the trap, just blank the planes.
         pc.vga.planes.fill(0);
     } else if !planar && currently {
-        disarm_planar(machine, &pc.vga, regs, false); // leaving planar ⇒ A0000 back to RAM
+        disarm_planar(machine, &mut pc.vga, regs, false); // leaving planar ⇒ A0000 back to RAM
     }
 }
 
@@ -763,6 +757,52 @@ pub fn vram_write(vga: &mut VgaState, off: u32, byte: u8) {
         if out[p] != cur[p] {
             vga.planes[p * 0x10000 + off] = out[p];
         }
+    }
+}
+
+/// Copy bytes into guest memory, routing any overlap with a trap-backed planar
+/// A0000 window through the VGA write path. DOS services can legally transfer
+/// file/device data straight into video memory; on a real VGA those CPU stores
+/// still honour map mask/write-mode/latches, while the emulated path has A0000
+/// unmapped so raw `machine.copy_to` would fault in the kernel.
+pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, addr: usize, src: &[u8]) {
+    const A0000_END: usize = A0000 + 0x10000;
+    if vga.a0000_trapped {
+        let bda_mode = machine.read::<u8>(0x449);
+        let planar_mode =
+            matches!(bda_mode, 0x0D..=0x12) || (bda_mode == 0x13 && vga.seq[4] & 0x08 == 0);
+        if !planar_mode {
+            machine.map_fresh_range(A0000 >> 12, 16);
+            vga.a0000_trapped = false;
+        }
+    }
+    if src.is_empty()
+        || !vga.a0000_trapped
+        || addr >= A0000_END
+        || addr.saturating_add(src.len()) <= A0000
+    {
+        machine.copy_to(addr, src);
+        return;
+    }
+
+    let mut pos = 0;
+    if addr < A0000 {
+        let n = (A0000 - addr).min(src.len());
+        machine.copy_to(addr, &src[..n]);
+        pos = n;
+    }
+
+    while pos < src.len() {
+        let cur = addr + pos;
+        if cur >= A0000_END {
+            machine.copy_to(cur, &src[pos..]);
+            break;
+        }
+        let n = (A0000_END - cur).min(src.len() - pos);
+        for (i, &byte) in src[pos..pos + n].iter().enumerate() {
+            vram_write(vga, (cur + i - A0000) as u32, byte);
+        }
+        pos += n;
     }
 }
 
@@ -1545,17 +1585,29 @@ impl VgaState {
     fn classify_mode<A: crate::Arch>(&self, machine: &mut A) -> Option<lib::vga_render::VgaMode> {
         use lib::vga_render::{self, VgaMode};
         let bda_mode = machine.read::<u8>(0x449);
-        if planar_active() && bda_mode == 0x13 {
+        if self.a0000_trapped && bda_mode == 0x13 {
             let row_bytes = if self.crtc[0x13] != 0 { self.crtc[0x13] as u16 * 2 } else { 80 };
+            // CRTC Offset is the virtual stride, not the visible width: Jazz
+            // sets it to 42 words (84 bytes/plane = 336 virtual pixels) while
+            // the mode-13h viewport remains 320 pixels wide. Our BIOS does not
+            // seed HDE, so 0 means "standard mode-13h width" unless the game
+            // programmed it.
+            let mut w = if self.crtc[1] != 0 { (self.crtc[1] as u16 + 1) * 4 } else { 320 };
+            if !(160..=800).contains(&w) { w = 320; }
             let v_end = self.crtc[0x12] as u16
                 | (((self.crtc[7] >> 1) & 1) as u16) << 8
                 | (((self.crtc[7] >> 6) & 1) as u16) << 9;
-            let mut h = v_end + 1;
-            if self.crtc[9] & 0x80 != 0 { h /= 2; }
-            // Mode-Y games keep the BIOS mode-13h CRTC our BIOS never wrote
+            // CRTC[9] low bits are the maximum scanline within a character row:
+            // graphics modes with value 1 display two physical scanlines per
+            // memory row. Jazz uses v_end=397, max_scanline=1 => 199 visible
+            // rows; treating it as 398 rows shows two stacked playfields.
+            let scan_div = ((self.crtc[9] as u16 & 0x1F) + 1)
+                * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+            let mut h = (v_end + 1) / scan_div.max(1);
+            // Mode-Y games may keep the BIOS mode-13h CRTC our BIOS never wrote
             // (v-end ~0); fall back to the 320×200 default.
             if !(64..=480).contains(&h) { h = 200; }
-            return Some(VgaMode::ModeX { w: row_bytes * 4, h, row_bytes });
+            return Some(VgaMode::ModeX { w, h, row_bytes });
         }
         let rregs = vga_render::Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };
         match vga_render::classify(bda_mode, &rregs)? {
@@ -1569,12 +1621,15 @@ impl VgaState {
 
     /// CRTC Line Compare (0x18 + overflow bits 8/9): the scanline where the
     /// lower split-screen region restarts from address 0 (the locked status
-    /// panel). All-ones ⇒ no split; halved under double-scan to match `h`.
+    /// panel). All-ones ⇒ no split; converted through the same max-scanline
+    /// divisor as mode height to match `h`.
     fn line_compare(&self, h: usize) -> usize {
         let lc = self.crtc[0x18] as usize
             | (((self.crtc[7] >> 4) & 1) as usize) << 8
             | (((self.crtc[9] >> 6) & 1) as usize) << 9;
-        let lc = if self.crtc[9] & 0x80 != 0 { lc / 2 } else { lc };
+        let scan_div = ((self.crtc[9] as usize & 0x1F) + 1)
+            * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let lc = lc / scan_div.max(1);
         if lc < h { lc } else { usize::MAX }
     }
 }
