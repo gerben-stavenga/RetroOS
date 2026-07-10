@@ -883,6 +883,16 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
 
     init_process_thread_vm86_state(machine, t, psp_seg, cs, ip, ss, sp);
+    // Direct launches (--cmd, boot init) bypass COMMAND.COM, so no LOADFIX.CFG
+    // policy is applied — seed the compat vIOPL=3 instead of the conforming
+    // default: the launcher can't know whether the program is a non-conforming
+    // DPMI client (DOOM re-enables IF via POPF and hangs on KVM/metal at
+    // vIOPL<3), and stepping costs nothing outside VIF=0 windows. Programs
+    // launched through the shell still get the per-program LOADFIX policy.
+    {
+        let f = &mut t.kernel.vcpu.regs.frame.rflags;
+        *f = (*f & !(machine::IOPL_MASK as u64)) | (machine::IOPL_MASK as u64);
+    }
     t.dos_mut().dta = (psp_seg as u32) * 16 + 0x80;
 
     let (col, row) = vga::vga().cursor_pos();

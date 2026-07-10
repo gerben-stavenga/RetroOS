@@ -287,7 +287,15 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             r.fs = fs as u64;
             r.gs = gs as u64;
             let fl = if_to_vif(eflags) as u64;
-            r.frame.rflags = (fl & !IOPL_MASK) | VM_FLAG | (1 << 12);
+            // Preserve the *virtual* IOPL exactly like the Mode32 arm below:
+            // hardcoding 1 here erased the iopl3 launch policy on the first
+            // VM86 slice exit — DOS4GW clients start in VM86, so by the time
+            // they switched to PM the stepping gate always read vIOPL=1 and
+            // KVM silently dropped their POPF/IRET IF-restores (DOOM hung at
+            // I_StartupTimer with VIF=0). The guest-visible IOPL in `eflags`
+            // is a VME artifact, never trusted (see set_vm86_flags).
+            let viopl = r.frame.rflags & IOPL_MASK as u64;
+            r.frame.rflags = (fl & !IOPL_MASK) | VM_FLAG | viopl;
         }
         UserMode::Mode32 => {
             r.set_cs32(cs);
