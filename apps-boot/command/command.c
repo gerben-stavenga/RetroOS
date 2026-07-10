@@ -567,8 +567,9 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
  * keeps tokenisation in a single place (the BAT-line / cmdline parser). */
 
 /* Run the command at argv[prog_idx] with arguments at argv[prog_idx+1..argc-1].
- * Built-ins (REM/ECHO/CD/CLS/TYPE/PAUSE/TRACE/EXIT) are matched first and
- * handled inline; if none match, dispatch_external takes over at the tail.
+ * Built-ins (REM/ECHO/CD/CLS/TYPE/LOG/PAUSE/TRACE/EXIT/SHUTDOWN) are matched
+ * first and handled inline; if none match, dispatch_external takes over at
+ * the tail.
  * argv[prog_idx-1] and argv[prog_idx-2] (when prog_idx >= 1 / >= 2) must be
  * caller-reserved scratch slots that dispatch_external may overwrite for
  * trampoline-prefix injection. Returns the command's exit code. */
@@ -666,6 +667,18 @@ static int run_command(char **argv, int prog_idx, int argc, int poll_kbd) {
     if (stricmp(name, "EXIT") == 0) {
         should_exit = 1;
         return (nargs > 0) ? atoi(argv[args]) : 0;
+    }
+    if (stricmp(name, "SHUTDOWN") == 0) {
+        /* Park the audio hardware and halt via the kernel (INT 31h AH=08h).
+         * Always leave real hardware this way instead of the power button: a
+         * hard power-off while the HDA codec is streaming wedges it (deaf to
+         * every OS) until a cold power cycle. The kernel prints its own
+         * "safe to turn off" line and never returns; after it, holding the
+         * power button is harmless. */
+        r.h.ah = 0x08;
+        int86(0x31, &r, &r);
+        puts("Shutdown failed");   /* not reached on any working kernel */
+        return 1;
     }
 
     /* Tail: not a built-in -- spawn as external program. */

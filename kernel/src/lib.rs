@@ -103,12 +103,14 @@ pub fn host_run_elf<A: Arch>(
     let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
     if let Err(e) = kernel::linux::exec_elf_into(machine, &mut threads, tid, &data, path, &argv) {
         dbg_println!("[host] exec failed: errno {}", e);
+        kernel::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }
 
     dbg_println!("[host] running 32-bit Linux ELF");
     kernel::startup::event_loop(machine, &mut threads, tid);
     dbg_println!("[host] guest exited");
+    kernel::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
     machine.shutdown();
 }
 

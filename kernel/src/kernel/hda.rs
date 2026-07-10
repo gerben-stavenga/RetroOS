@@ -417,9 +417,15 @@ fn sort_hda_controllers(devices: &mut [HdaPciDevice; MAX_HDA_CONTROLLERS], n: us
 }
 
 /// Bounce a PCI function through D3hot → D0 via its power-management
-/// capability. Unlike a CRST link reset, this cycles the codec's power
-/// domain, which is what recovers a codec wedged by a hard reboot during
-/// active streaming. Returns false if the function has no PM capability.
+/// capability, hoping the function internally resets on the D0 edge and
+/// takes the codec's power domain with it. NOTE: a function with
+/// PMCSR.No_Soft_Reset=1 is spec-guaranteed to KEEP state across that
+/// transition — the AMD HDA function on the ALC298 laptop sets it, so this
+/// escalation cannot recover that machine's wedge (verified from Linux
+/// 2026-07: only a cold power-off revives the codec; prevention via
+/// park/quiesce before power-off is the real fix). Still attempted for
+/// hardware that resets anyway, with the NSR bit logged so the bring-up
+/// trace is honest. Returns false if the function has no PM capability.
 fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     // Status register bit 4 (dword 0x04, bit 20): capability list present.
     if crate::kernel::pci::read32(machine, bus, dev, func, 0x04) & (1 << 20) == 0 {
@@ -447,6 +453,12 @@ fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u
     let bar0 = crate::kernel::pci::read32(machine, bus, dev, func, 0x10);
     let bar1 = crate::kernel::pci::read32(machine, bus, dev, func, 0x14);
     let pmcsr = crate::kernel::pci::read32(machine, bus, dev, func, pm + 4);
+    if pmcsr & (1 << 3) != 0 {
+        crate::println!(
+            "hda: {:02x}:{:02x}.{} PMCSR.NSR=1: D3hot cycle will not reset this function",
+            bus, dev, func
+        );
+    }
     crate::kernel::pci::write32(machine, bus, dev, func, pm + 4, (pmcsr & !0x3) | 0x3);
     spin(20_000_000); // ≥ 10 ms settle in each state (PCI PM spec)
     crate::kernel::pci::write32(machine, bus, dev, func, pm + 4, pmcsr & !0x3);
@@ -533,8 +545,10 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     // (observed on the ALC298 laptop; Linux then reports "no codecs found"
     // until a cold boot). Attempt 0 is the normal spec sequence; attempt 1
     // retries with a longer reset hold; attempt 2 first bounces the function
-    // through PCI D3hot → D0, which resets the codec power domain without a
-    // cold boot.
+    // through PCI D3hot → D0 in the hope the codec power domain resets with
+    // it. That hope is dead on the ALC298 laptop itself (its HDA function
+    // sets PMCSR.No_Soft_Reset — see pci_pm_power_cycle), so prevention is
+    // the real defense: park/quiesce the link on every shutdown path.
     let mut detected = false;
     for attempt in 0..3u32 {
         if attempt == 2 {

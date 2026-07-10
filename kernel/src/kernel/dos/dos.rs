@@ -633,6 +633,18 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             }
             thread::KernelAction::Done
         }
+        // AH=08h — SYNTH_SHUTDOWN: park the audio hardware and halt the
+        // machine. Never returns to the guest (metal hlt-loops after trying
+        // the hypervisor poweroff ports; hosted exits). This is the safe way
+        // off real hardware: a raw power-button hold mid-stream wedges the
+        // laptop's ALC298 until a cold power cycle, but a codec left with
+        // its link in reset rides out any power-off. Drives COMMAND.COM's
+        // `SHUTDOWN` builtin.
+        0x08 => {
+            crate::kernel::hda::emergency_quiesce();
+            crate::println!("It is now safe to turn off your computer.");
+            machine.shutdown();
+        }
         // Unknown AH: RetroOS synth space is kernel-owned; anything outside
         // the documented subfunctions is a guest bug. Return AX=errno/CF=1.
         _ => {

@@ -225,6 +225,7 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
             run_program(machine, threads, path, tail, cwd, master_env, boot.debug_watch);
         }
         println!("All commands done — shutting down.");
+        crate::kernel::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }
 
