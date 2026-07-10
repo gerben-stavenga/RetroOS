@@ -254,14 +254,20 @@ fn spawn_keyboard() {
             }
             // ESC may start a CSI/SS3 escape sequence (arrows, F-keys). The tty
             // sends the whole sequence in one burst, so reading ahead is safe.
+            // Space the make and break codes apart: games that poll a
+            // key-state table once per frame (menu loops) miss a press whose
+            // down and up both land between two polls.
+            const TAP_GAP: std::time::Duration = std::time::Duration::from_millis(30);
             if b == 0x1B
                 && let Some(sc) = read_escape_seq(&mut stdin) {
                     arch::post_irq(arch::Irq::Key(sc));
+                    std::thread::sleep(TAP_GAP);
                     arch::post_irq(arch::Irq::Key(sc | 0x80));
                     continue;
                 }
             for sc in byte_to_scancodes(b) {
                 arch::post_irq(arch::Irq::Key(sc));
+                std::thread::sleep(TAP_GAP);
             }
         }
     });
