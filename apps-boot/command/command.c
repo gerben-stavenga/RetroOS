@@ -417,6 +417,28 @@ static unsigned int get_child_exit_status(void) {
     return (unsigned int)r.x.ax;
 }
 
+/* Re-seed the BIOS tick-of-day counter (40:6C) from the RTC. A fork-exec'd
+ * child runs in its own address space with its own BDA; while we sit in the
+ * waitpid loop our timer IRQs coalesce, so our copy of the counter falls
+ * behind by however long the child ran. INT 1A AH=02 reads the RTC (BCD),
+ * AH=01 stores the recomputed count. */
+static void refresh_bda_clock(void) {
+    unsigned long secs, ticks;
+    r.h.ah = 0x02;
+    int86(0x1A, &r, &r);
+    if (r.x.cflag) return;
+    secs = 3600UL * (unsigned char)((r.h.ch >> 4) * 10 + (r.h.ch & 0x0F))
+         +   60UL * (unsigned char)((r.h.cl >> 4) * 10 + (r.h.cl & 0x0F))
+         +          (unsigned char)((r.h.dh >> 4) * 10 + (r.h.dh & 0x0F));
+    /* ticks = secs * 1193182 / 65536 = secs * 18.20651 Hz, kept in 32 bits:
+     * secs*2065 <= 86399*2065 < 2^32. */
+    ticks = secs * 18UL + (secs * 2065UL) / 10000UL;
+    r.h.ah = 0x01;
+    r.x.cx = (unsigned)(ticks >> 16);
+    r.x.dx = (unsigned)(ticks & 0xFFFF);
+    int86(0x1A, &r, &r);
+}
+
 /* Fork-exec a child and wait for it. argv[0] = program path,
  * argv[1..argc-1] = args. The args are joined into the cmdline tail
  * right here at the synth call boundary so callers stay tokenised.
@@ -444,6 +466,7 @@ static int run_external_raw(char **argv, int argc, int poll_kbd, unsigned char v
             }
         }
     }
+    refresh_bda_clock();
     {
         unsigned int status = get_child_exit_status();
         unsigned char term_type = (unsigned char)(status >> 8);

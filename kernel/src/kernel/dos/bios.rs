@@ -884,6 +884,18 @@ fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
             let t = ((regs.rcx as u16 as u32) << 16) | regs.rdx as u16 as u32;
             bda_field!(machine, tick_count = t);
         }
+        0x02 => {
+            // Read RTC time: CH=hours CL=minutes DH=seconds DL=DST flag,
+            // all BCD, CF clear on success — the real AT BIOS ABI. Backed
+            // by the host CMOS like the 40:6C seed.
+            let (hour, min, sec) = super::dos::rtc_time(machine);
+            let bcd = |v: u8| ((v / 10) << 4) | (v % 10);
+            regs.rcx = (regs.rcx & !0xFFFF)
+                | ((bcd(hour) as u64) << 8)
+                | bcd(min) as u64;
+            regs.rdx = (regs.rdx & !0xFFFF) | ((bcd(sec) as u64) << 8);
+            set_iret_cf(machine, regs, false);
+        }
         _ => {}
     }
 }

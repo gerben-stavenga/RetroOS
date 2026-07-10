@@ -116,12 +116,10 @@ fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
     (year, month, day, day_of_week(year, month, day))
 }
 
-/// BIOS tick-of-day counter value for "now", read from the RTC — what a real
-/// POST stores at 40:6C. Handles BCD/binary and 12/24-hour CMOS formats;
-/// implausible values seed midnight (a wrong-but-sane clock) rather than
-/// letting garbage through: DOS/4GW's 16-bit ticks→time conversion #DEs on a
-/// counter whose high word exceeds ~24 hours' worth of ticks.
-pub(super) fn rtc_ticks_today<A: crate::Arch>(machine: &mut A) -> u32 {
+/// RTC time of day as binary (hour, minute, second), handling BCD/binary and
+/// 12/24-hour CMOS formats. Implausible values collapse to midnight — a
+/// wrong-but-sane clock beats letting firmware garbage through.
+pub(super) fn rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
     for _ in 0..10_000 {
         if cmos_read(machine, 0x0A) & 0x80 == 0 {
             break;
@@ -129,10 +127,10 @@ pub(super) fn rtc_ticks_today<A: crate::Arch>(machine: &mut A) -> u32 {
     }
     let status_b = cmos_read(machine, 0x0B);
     let binary = status_b & 0x04 != 0;
-    let sec = cmos_decode(cmos_read(machine, 0x00), binary) as u32;
-    let min = cmos_decode(cmos_read(machine, 0x02), binary) as u32;
+    let sec = cmos_decode(cmos_read(machine, 0x00), binary);
+    let min = cmos_decode(cmos_read(machine, 0x02), binary);
     let raw_hour = cmos_read(machine, 0x04);
-    let mut hour = cmos_decode(raw_hour & 0x7F, binary) as u32;
+    let mut hour = cmos_decode(raw_hour & 0x7F, binary);
     if status_b & 0x02 == 0 {
         // 12-hour mode: bit 7 = PM, hour 12 wraps to 0.
         hour %= 12;
@@ -141,9 +139,18 @@ pub(super) fn rtc_ticks_today<A: crate::Arch>(machine: &mut A) -> u32 {
         }
     }
     if sec > 59 || min > 59 || hour > 23 {
-        return 0;
+        return (0, 0, 0);
     }
-    let secs = (hour * 3600 + min * 60 + sec) as u64;
+    (hour, min, sec)
+}
+
+/// BIOS tick-of-day counter value for "now", read from the RTC — what a real
+/// POST stores at 40:6C. Guarded time source: DOS/4GW's 16-bit ticks→time
+/// conversion #DEs on a counter whose high word exceeds ~24 hours' worth of
+/// ticks, so this never returns more than a day.
+pub(super) fn rtc_ticks_today<A: crate::Arch>(machine: &mut A) -> u32 {
+    let (hour, min, sec) = rtc_time(machine);
+    let secs = (hour as u64) * 3600 + (min as u64) * 60 + sec as u64;
     (secs * PIT_INPUT_HZ / BIOS_TICK_DIVISOR) as u32
 }
 
