@@ -437,12 +437,16 @@ pub fn init_interrupts() {
     lib::println!("IRQ: mouse probe");
     if init_mouse() {
         lib::println!("IRQ: mouse ready");
+        // The emulated legacy machine that supplies a PS/2 mouse may also
+        // supply an ISA Sound Blaster on IRQ 5 or 7. Both deliveries carry
+        // it: ISA IRQs map 1:1 to GSIs, and the IOAPIC entries are edge-
+        // triggered like the 8259, so an idle line costs nothing.
         if apic {
             ioapic_route(12, IRQ_OFFSET + 12); // mouse GSI12
+            ioapic_route(5, IRQ_OFFSET + 5);   // ISA SB (QEMU sb16 default)
+            ioapic_route(7, IRQ_OFFSET + 7);   // ISA SB alternate line
         } else {
             unmask_irq(12);
-            // The emulated legacy machine that supplies a PS/2 mouse may also
-            // supply an ISA Sound Blaster on IRQ 5 or 7 (legacy delivery only).
             unmask_irq(5);
             unmask_irq(7);
         }
@@ -722,6 +726,12 @@ pub fn handle_irq(regs: &mut Regs) {
 /// ack `Irq::Hw` line). Called from the kernel once the guest has acked
 /// the device so the next interrupt can be delivered.
 pub fn rearm_irq(irq: u8) {
+    // APIC mode delivers Hw lines edge-triggered through the IOAPIC and acks
+    // inline (LAPIC EOI in handle_irq) — nothing was masked, and the bypassed
+    // 8259's IMR is not ours to touch.
+    if lapic_timer_active() {
+        return;
+    }
     unmask_irq(irq);
 }
 
