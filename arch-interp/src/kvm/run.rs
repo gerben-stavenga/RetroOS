@@ -10,10 +10,11 @@
 //! (`shim.rs`) and exits on its magic OUT.
 
 use super::setup::{with, KvmCpu};
-use super::shim::{read_frame, ShimFrame, SHIM_PORT};
+use super::shim::{read_frame, read_frame64, ShimFrame, ShimFrame64, SHIM_PORT};
 use crate::sysdesc::{
-    if_to_vif, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES, IDT_ADDR, IOPL_MASK,
-    LDT_ADDR, LDT_SEL, NT_FLAG, TF_FLAG, TSS_ADDR, TSS_SEL, VIF_FLAG, VM_FLAG,
+    if_to_vif, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES, IDT64_ADDR, IDT_ADDR,
+    IOPL_MASK, KERNEL_CS64, LDT_ADDR, LDT_SEL, NT_FLAG, TF_FLAG, TSS64_ADDR, TSS64_SEL, TSS_ADDR,
+    TSS_SEL, VIF_FLAG, VM_FLAG,
 };
 use arch_abi::monitor::MonitorResult;
 use arch_abi::GuestBytes;
@@ -154,6 +155,14 @@ fn enter(k: &mut KvmCpu, r: &Regs, mode: UserMode) {
         rbp: r.rbp,
         rsp: r.frame.rsp,
         rip: r.frame.rip,
+        r8: r.r8,
+        r9: r.r9,
+        r10: r.r10,
+        r11: r.r11,
+        r12: r.r12,
+        r13: r.r13,
+        r14: r.r14,
+        r15: r.r15,
         ..Default::default()
     };
 
@@ -191,17 +200,43 @@ fn enter(k: &mut KvmCpu, r: &Regs, mode: UserMode) {
             ) as u64;
         }
         UserMode::Mode64 => {
-            // 64-bit guests aren't run natively yet (the hosted machine model
-            // is 32-bit non-PAE); run flat-32 at CPL3 like the TCG engine
-            // (smoke paths only).
-            use arch_abi::{USER_CS, USER_DS};
-            sregs.cs = decode_sel(USER_CS);
+            // Real long mode: CR3 = the 4-level twin of the active space
+            // (rebuilt lazily on page-table change), PAE + EFER.LME|LMA, flat
+            // 64-bit CPL3 CS with flat data SS/DS/ES. FS/GS carry the 64-bit
+            // BASES from `Regs.fs/gs` — the metal convention (entry.asm
+            // rdmsr/wrmsr's them; arch_prctl stores there). Traps vector
+            // through the long-mode IDT onto the shared stubs at TSS64.rsp0.
+            // EFER.SCE stays 0: `syscall` #UDs and `dispatch_shim64` decodes
+            // it into KernelEvent::Syscall — no LSTAR/STAR machinery.
+            use arch_abi::{USER_CS64, USER_DS};
+            sregs.cr3 = crate::paging::frame_phys(crate::paging::active_pml4()) as u64;
+            sregs.cr4 |= 1 << 5; // PAE
+            sregs.efer = (1 << 8) | (1 << 10); // LME | LMA
+            sregs.idt.base = IDT64_ADDR;
+            sregs.idt.limit = 0xFFF;
+            sregs.tr = kvm_segment {
+                base: TSS64_ADDR,
+                limit: 0xFFF,
+                selector: TSS64_SEL,
+                type_: 11, // busy 64-bit TSS (VM entry requires busy)
+                present: 1,
+                s: 0,
+                ..Default::default()
+            };
+            sregs.ldt = kvm_segment { unusable: 1, ..Default::default() };
+            sregs.cs = decode_sel(USER_CS64); // L=1 descriptor from the GDT image
             sregs.ss = decode_sel(USER_DS);
             sregs.ds = decode_sel(USER_DS);
             sregs.es = decode_sel(USER_DS);
-            sregs.fs = decode_sel(USER_DS);
-            sregs.gs = decode_sel(USER_DS);
-            regs.rflags = ((r.frame.rflags as u32 & !(IOPL_MASK as u32)) | (1 << 12) | 2) as u64;
+            let mut fs = decode_sel(USER_DS);
+            fs.base = r.fs;
+            let mut gs = decode_sel(USER_DS);
+            gs.base = r.gs;
+            sregs.fs = fs;
+            sregs.gs = gs;
+            regs.rflags = (vif_to_if(
+                r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG & !TF_FLAG,
+            ) | 2) as u64;
         }
     }
 
@@ -215,15 +250,14 @@ fn enter(k: &mut KvmCpu, r: &Regs, mode: UserMode) {
 fn sync_out(k: &KvmCpu, r: &mut Regs, mode: UserMode) {
     let regs = k.vcpu.get_regs().expect("KVM_GET_REGS");
     let sregs = k.vcpu.get_sregs().expect("KVM_GET_SREGS");
-    r.rax = regs.rax;
-    r.rbx = regs.rbx;
-    r.rcx = regs.rcx;
-    r.rdx = regs.rdx;
-    r.rsi = regs.rsi;
-    r.rdi = regs.rdi;
-    r.rbp = regs.rbp;
+    copy_gprs(r, &regs);
     r.frame.rsp = regs.rsp;
     r.frame.rip = regs.rip;
+    if mode == UserMode::Mode64 {
+        // FS/GS hold the 64-bit bases in Mode64 (metal's convention).
+        r.fs = sregs.fs.base;
+        r.gs = sregs.gs.base;
+    }
     store_segs_flags(
         r,
         mode,
@@ -239,11 +273,9 @@ fn sync_out(k: &KvmCpu, r: &mut Regs, mode: UserMode) {
     );
 }
 
-/// Read guest state back into `Regs` after a shim exit: GPRs are live in the
-/// vcpu (the stubs clobber nothing — `out imm8, al` only reads AL), the
-/// interrupted frame comes off the ring-0 stack.
-fn sync_out_shim(k: &KvmCpu, r: &mut Regs, mode: UserMode, f: &ShimFrame) {
-    let regs = k.vcpu.get_regs().expect("KVM_GET_REGS");
+/// The GPR copy shared by every sync-out flavor (r8-r15 exist in all modes —
+/// 32-bit guests simply can't touch them, so the values round-trip).
+fn copy_gprs(r: &mut Regs, regs: &kvm_regs) {
     r.rax = regs.rax;
     r.rbx = regs.rbx;
     r.rcx = regs.rcx;
@@ -251,6 +283,38 @@ fn sync_out_shim(k: &KvmCpu, r: &mut Regs, mode: UserMode, f: &ShimFrame) {
     r.rsi = regs.rsi;
     r.rdi = regs.rdi;
     r.rbp = regs.rbp;
+    r.r8 = regs.r8;
+    r.r9 = regs.r9;
+    r.r10 = regs.r10;
+    r.r11 = regs.r11;
+    r.r12 = regs.r12;
+    r.r13 = regs.r13;
+    r.r14 = regs.r14;
+    r.r15 = regs.r15;
+}
+
+/// Read guest state back into `Regs` after a 64-bit shim exit: GPRs live in
+/// the vcpu, the interrupted frame off TSS64.rsp0. CS/SS selectors in `Regs`
+/// stay untouched — `frame.cs == USER_CS64` is the kernel's Mode64
+/// fingerprint and 64-bit gates don't reload data segments.
+fn sync_out_shim64(k: &KvmCpu, r: &mut Regs, f: &ShimFrame64) {
+    let regs = k.vcpu.get_regs().expect("KVM_GET_REGS");
+    let sregs = k.vcpu.get_sregs().expect("KVM_GET_SREGS");
+    copy_gprs(r, &regs);
+    r.frame.rsp = f.rsp;
+    r.frame.rip = f.rip;
+    r.fs = sregs.fs.base;
+    r.gs = sregs.gs.base;
+    r.frame.rflags =
+        (if_to_vif(f.rflags as u32) as u64) & !IOPL_MASK & !(TF_FLAG as u64);
+}
+
+/// Read guest state back into `Regs` after a shim exit: GPRs are live in the
+/// vcpu (the stubs clobber nothing — `out imm8, al` only reads AL), the
+/// interrupted frame comes off the ring-0 stack.
+fn sync_out_shim(k: &KvmCpu, r: &mut Regs, mode: UserMode, f: &ShimFrame) {
+    let regs = k.vcpu.get_regs().expect("KVM_GET_REGS");
+    copy_gprs(r, &regs);
     r.frame.rsp = f.esp as u64;
     r.frame.rip = f.eip as u64;
     let segs = if f.eflags & (VM_FLAG as u32) != 0 {
@@ -320,7 +384,11 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             }
         }
         UserMode::Mode64 => {
-            r.frame.rflags = eflags as u64;
+            // Mirror IF into VIF like the other arms (enter projects it back);
+            // CS/SS selectors stay as the kernel set them (USER_CS64 is the
+            // Mode64 fingerprint `Regs::mode()` keys on).
+            r.frame.rflags =
+                (if_to_vif(eflags) as u64) & !IOPL_MASK & !(TF_FLAG as u64);
         }
     }
 }
@@ -361,7 +429,7 @@ fn io_insn_len(vcpu: &crate::vcpu::Vcpu, port: u16) -> u32 {
 /// shim ever runs with the flat ring-0 CS.
 fn in_shim(k: &KvmCpu) -> bool {
     let sregs = k.vcpu.get_sregs().expect("KVM_GET_SREGS");
-    sregs.cs.selector == crate::sysdesc::KERNEL_CS
+    sregs.cs.selector == crate::sysdesc::KERNEL_CS || sregs.cs.selector == KERNEL_CS64
 }
 
 /// Arm/disarm hardware single-step (the virtual-IF stepping driver).
@@ -547,6 +615,12 @@ pub fn execute() -> KernelEvent {
                 }
                 Kind::Shim => {
                     let kregs = k.vcpu.get_regs().expect("KVM_GET_REGS");
+                    if mode == UserMode::Mode64 {
+                        let f = read_frame64(kregs.rsp);
+                        shim_vec = Some((f.vector, f.err_code));
+                        sync_out_shim64(k, vcpu, &f);
+                        break dispatch_shim64(k, vcpu, &f);
+                    }
                     let f = read_frame(kregs.rsp);
                     shim_vec = Some((f.vector, f.err_code));
                     sync_out_shim(k, vcpu, mode, &f);
@@ -609,6 +683,62 @@ pub fn execute() -> KernelEvent {
             None => continue,
         }
     })
+}
+
+/// Route a 64-bit shim-vectored trap. Leaner than the 32-bit ladder: no VM86,
+/// no monitor (it decodes 32-bit code) — just demand-#PF/COW resolution, the
+/// `syscall`-as-#UD synthesis, and typed events for the rest.
+fn dispatch_shim64(
+    k: &mut KvmCpu,
+    vcpu: &mut crate::vcpu::Vcpu,
+    f: &ShimFrame64,
+) -> Option<KernelEvent> {
+    let n = f.vector;
+
+    // #PF: resolve against the 2-level source tree (demand-commit / COW); the
+    // twin refreshes on re-entry via the generation bump the fix caused.
+    if n == 14 {
+        let cr2 = k.vcpu.get_sregs().expect("KVM_GET_SREGS").cr2;
+        let resolved = cr2 <= u32::MAX as u64 && {
+            let a = cr2 as u32;
+            if crate::paging::space_translate(a).is_none() {
+                crate::paging::space_demand(a)
+            } else {
+                crate::paging::space_cow_fault(a)
+            }
+        };
+        if resolved {
+            return None; // re-enter at the faulting RIP (SET_SREGS reflushes)
+        }
+        vcpu.err_code = f.err_code as u64;
+        // The loader keeps 64-bit user VAs below 4 GiB, so a wider CR2 is
+        // already a wild access — the u32 truncation only affects the SEGV
+        // diagnostic, not the verdict.
+        return Some(KernelEvent::PageFault { addr: cr2 as u32 });
+    }
+
+    // `syscall` with EFER.SCE=0 raises #UD: decode 0F 05 at the faulting RIP
+    // and synthesize the typed event (the monitor idiom, one opcode wide).
+    // rcx/r11 get the architected SYSCALL clobber values for ABI fidelity.
+    if n == 6 {
+        let rip = vcpu.frame.rip;
+        let b0: u8 = crate::backend::Interp.read(rip as usize);
+        let b1: u8 = crate::backend::Interp.read(rip as usize + 1);
+        if (b0, b1) == (0x0F, 0x05) {
+            vcpu.frame.rip = rip.wrapping_add(2);
+            vcpu.rcx = vcpu.frame.rip;
+            vcpu.r11 = vcpu.frame.rflags;
+            return Some(KernelEvent::Syscall);
+        }
+    }
+
+    // DPL=3 gates (3, 4, 0x30..=0xFF) are only reachable by `INT n` — INT 0x80
+    // from 64-bit code lands here as SoftInt(0x80), same as everywhere else.
+    if n == 3 || n == 4 || n >= 0x30 {
+        return Some(KernelEvent::SoftInt(n));
+    }
+    vcpu.err_code = f.err_code as u64;
+    Some(KernelEvent::Exception(n))
 }
 
 /// Route a shim-vectored trap: resolve engine-internal ones (demand paging,

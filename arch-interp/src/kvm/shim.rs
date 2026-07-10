@@ -35,7 +35,8 @@
 //! a user `out 0xF4` #GPs into the real shim first.
 
 use crate::sysdesc::{
-    sys_ptr, IDT_ADDR, KERNEL_CS, KERNEL_DS, RING0_SP_TOP, STUB_ADDR, TSS_ADDR,
+    sys_ptr, IDT64_ADDR, IDT_ADDR, KERNEL_CS, KERNEL_CS64, KERNEL_DS, RING0_SP_TOP, STUB_ADDR,
+    TSS64_ADDR, TSS_ADDR,
 };
 
 /// The magic port the stubs exit through (`KVM_EXIT_IO`).
@@ -58,6 +59,38 @@ pub(crate) struct ShimFrame {
     pub ss: u32,
     /// ES, DS, FS, GS — valid only when `eflags` has VM set (VM86 entry).
     pub vm86_segs: [u32; 4],
+}
+
+/// The 64-bit shim frame: a long-mode gate pushed SS RSP RFLAGS CS RIP (+err)
+/// as 8-byte slots onto TSS64.rsp0, then the (shared) stub pushed err-dummy +
+/// vector as 8-byte pushes. Read at ring-0 `rsp` after the stub's exit OUT.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShimFrame64 {
+    pub vector: u8,
+    pub err_code: u32,
+    pub rip: u64,
+    pub cs: u32,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u32,
+}
+
+/// Read the 64-bit shim frame at ring-0 stack pointer `rsp`.
+pub(crate) fn read_frame64(rsp: u64) -> ShimFrame64 {
+    let rd = |off: u64| -> u64 {
+        let mut b = [0u8; 8];
+        unsafe { core::ptr::copy_nonoverlapping(sys_ptr(rsp + off), b.as_mut_ptr(), 8) };
+        u64::from_le_bytes(b)
+    };
+    ShimFrame64 {
+        vector: rd(0) as u8,
+        err_code: rd(8) as u32,
+        rip: rd(16),
+        cs: rd(24) as u32,
+        rflags: rd(32),
+        rsp: rd(40),
+        ss: rd(48) as u32,
+    }
 }
 
 /// Read the shim frame at ring-0 stack pointer `rsp` (a SYS-window linear).
@@ -89,6 +122,20 @@ fn idt_gate(offset: u32, dpl: u8) -> u64 {
         | ((offset as u64 >> 16) << 48)
 }
 
+/// Write one 64-bit interrupt gate (16 bytes, type 0xE): same shape as the
+/// legacy gate plus offset[63:32]; IST=0 → CPL3→0 delivery switches to
+/// TSS64.rsp0.
+fn idt_gate64(offset: u64, dpl: u8) -> [u8; 16] {
+    let low = (offset & 0xFFFF)
+        | ((KERNEL_CS64 as u64) << 16)
+        | (0x8Eu64 | ((dpl as u64) << 5)) << 40
+        | (((offset >> 16) & 0xFFFF) << 48);
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&low.to_le_bytes());
+    b[8..12].copy_from_slice(&((offset >> 32) as u32).to_le_bytes());
+    b
+}
+
 /// Build the IDT, the per-vector stubs, and the TSS in the SYS-window frames.
 /// Static content — written once at engine setup (the frames are shared by
 /// every address space).
@@ -101,6 +148,32 @@ pub(crate) fn write_shim() {
         unsafe {
             core::ptr::copy_nonoverlapping(gate.to_le_bytes().as_ptr(), idt.add(n * 8), 8);
         }
+    }
+
+    // Long-mode IDT: 16-byte gates onto the SAME stubs (`push imm` and
+    // `out imm8, al` decode identically in 64-bit mode; the pushes just become
+    // 8 bytes wide, which `read_frame64` accounts for).
+    let idt64 = sys_ptr(IDT64_ADDR);
+    for n in 0..256usize {
+        let dpl = if n == 3 || n == 4 || n >= 0x30 { 3 } else { 0 };
+        let gate = idt_gate64(STUB_ADDR + (n as u64) * 16, dpl);
+        unsafe {
+            core::ptr::copy_nonoverlapping(gate.as_ptr(), idt64.add(n * 16), 16);
+        }
+    }
+
+    // TSS64: rsp0 (u64 at offset 4) + the same all-deny IOPB story as the
+    // 32-bit TSS below. Long-mode CPL3→0 delivery takes the stack from here.
+    let tss64 = sys_ptr(TSS64_ADDR);
+    unsafe {
+        core::ptr::write_bytes(tss64, 0, 0x1000);
+        core::ptr::copy_nonoverlapping(
+            RING0_SP_TOP.to_le_bytes().as_ptr(),
+            tss64.add(0x04),
+            8,
+        );
+        core::ptr::copy_nonoverlapping(0x88u16.to_le_bytes().as_ptr(), tss64.add(0x66), 2);
+        core::ptr::write_bytes(tss64.add(0x88), 0xFF, 0x1000 - 0x88);
     }
 
     // Stubs: self-contained 16-byte slots (no shared tail → no jmp reach math).
@@ -183,9 +256,13 @@ pub(super) fn iopb_allow(port: u16, count: usize) {
         if p == SHIM_PORT {
             continue;
         }
-        unsafe {
-            let byte = sys_ptr(TSS_ADDR + 0x88 + (p / 8) as u64);
-            *byte &= !(1 << (p % 8));
+        // Both TSS images (legacy + TSS64) carry the policy: a thread's mode
+        // is not known at grant time and 32/64-bit slices interleave.
+        for tss in [TSS_ADDR, TSS64_ADDR] {
+            unsafe {
+                let byte = sys_ptr(tss + 0x88 + (p / 8) as u64);
+                *byte &= !(1 << (p % 8));
+            }
         }
     }
 }
@@ -193,7 +270,9 @@ pub(super) fn iopb_allow(port: u16, count: usize) {
 /// Back to all-deny (per swap-in, like metal's io_policy baseline).
 pub(super) fn iopb_reset() {
     ensure_shim();
-    unsafe {
-        core::ptr::write_bytes(sys_ptr(TSS_ADDR + 0x88), 0xFF, (IOPB_PORTS / 8) as usize);
+    for tss in [TSS_ADDR, TSS64_ADDR] {
+        unsafe {
+            core::ptr::write_bytes(sys_ptr(tss + 0x88), 0xFF, (IOPB_PORTS / 8) as usize);
+        }
     }
 }

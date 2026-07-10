@@ -1559,18 +1559,30 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 static mut TRAMPOLINE_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 static mut TRAMPOLINE_PT: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
-/// Identity-map the page holding `toggle_prot_compat` (first page of kernel
-/// `.text`, physical KERNEL_PHYS) so the function can run at its physical
-/// address while paging is briefly disabled during a mode toggle.
+/// Identity-map the page holding `toggle_prot_compat` so the function can run
+/// at its physical address while paging is briefly disabled during a mode
+/// toggle. The page is COMPUTED from the symbol — an old version hardcoded
+/// "first page of .text" (KERNEL_PHYS), but the linker long since stopped
+/// placing the stub there, so the identity fetch landed on an unmapped page,
+/// the arch demand-fault mapped it as NX data, and the retried fetch panicked
+/// with a present+NX #PF (first 64-bit exec on metal was the reproducer).
 /// Returns the previous PDPT[0] value to pass back to `clear_trampoline()`.
 pub fn ensure_trampoline_mapped() -> u64 {
-    let page = KERNEL_PHYS / PAGE_SIZE;
+    unsafe extern "C" {
+        fn toggle_prot_compat(new_cr3: u32);
+    }
+    let stub_phys = toggle_prot_compat as usize - KERNEL_BASE + KERNEL_PHYS;
+    let page = stub_phys / PAGE_SIZE;
+    // One PT covers 2 MiB; the stub is a few dozen bytes but map its neighbor
+    // too in case it straddles a page boundary.
+    debug_assert!(page + 1 < PAGE_SIZE / 8, "toggle stub beyond the trampoline PT's 2 MiB reach");
     if let Entries::E64(e) = entries() {
         let root = root_base();
         let saved = e[root].0;
         #[allow(static_mut_refs)]
         unsafe {
             TRAMPOLINE_PT[page] = Entry64::new(page as u64, true, false);
+            TRAMPOLINE_PT[page + 1] = Entry64::new(page as u64 + 1, true, false);
             TRAMPOLINE_PD[0] = Entry64::new(boot_phys_page(&TRAMPOLINE_PT.0), true, false);
             e[root] = Entry64::new(boot_phys_page(&TRAMPOLINE_PD.0), true, false);
         }

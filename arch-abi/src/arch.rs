@@ -192,6 +192,13 @@ pub trait Arch: Sized + GuestBytes {
     /// event, leaving `regs` holding the post-run register state.
     fn execute(&mut self, regs: &mut Regs) -> KernelEvent;
 
+    /// Whether this backend can run 64-bit user code (`UserMode::Mode64`).
+    /// On metal this is a CPU fact (long mode available); the hosted machine
+    /// model is 32-bit non-PAE, so both hosted engines answer false. Exec
+    /// consults this to refuse a 64-bit ELF with ENOEXEC instead of letting
+    /// x86-64 code be decoded as i386.
+    fn user_64_supported(&self) -> bool;
+
     /// Make `incoming` the active address space and return the displaced one
     /// (the previously-active space, now parked). THIS is the switch pivot: the
     /// scheduler moves a thread's space in and re-parks the old one. On metal it

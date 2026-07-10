@@ -43,6 +43,12 @@ impl Arch for Metal {
     // `&mut *(&raw mut REGS)` is the deliberate `&raw`-first form that avoids a
     // `static_mut_refs` reference; clippy's `deref_addrof` "simplification"
     // would reintroduce exactly that, so allow it here.
+    fn user_64_supported(&self) -> bool {
+        // Long mode is toggled per-thread on demand (traps::toggle_mode_if_needed),
+        // so CPU support is the whole capability.
+        super::paging2::cpu_supports_long_mode()
+    }
+
     #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
         // Bridge the loop-owned registers to the live trap frame for the run

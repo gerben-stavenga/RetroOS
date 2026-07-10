@@ -72,7 +72,14 @@ pub(crate) const IDT_ADDR: u64 = SYS_BASE + 0x8000; // 256 × 8-byte interrupt g
 #[cfg(feature = "kvm")]
 pub(crate) const STUB_ADDR: u64 = SYS_BASE + 0x9000; // 256 × 16-byte exit stubs
 pub(crate) const TSS_ADDR: u64 = SYS_BASE + 0xA000; // TSS + all-deny IOPB
-pub(crate) const SYS_SIZE: usize = 0xB000;
+// Long-mode (64-bit user slices) shim pages, KVM engine only: 64-bit gates are
+// 16 bytes and the TSS64 layout differs, so they get their own pages. The
+// stubs are shared — `push imm` / `out imm8, al` decode identically in 64-bit.
+#[cfg(feature = "kvm")]
+pub(crate) const IDT64_ADDR: u64 = SYS_BASE + 0xB000; // 256 × 16-byte long-mode gates
+#[cfg(feature = "kvm")]
+pub(crate) const TSS64_ADDR: u64 = SYS_BASE + 0xC000; // TSS64 + all-deny IOPB
+pub(crate) const SYS_SIZE: usize = 0xD000;
 pub(crate) const GDT_BYTES: usize = 32 * 8;
 pub(crate) const LDT_MAX_BYTES: usize = 0x4000; // 2048 descriptors
 
@@ -80,6 +87,14 @@ pub(crate) const LDT_MAX_BYTES: usize = 0x4000; // 2048 descriptors
 // to match the kernel's `descriptors.rs` KERNEL_CS=0x08 / KERNEL_DS=0x18 layout).
 pub(crate) const KERNEL_CS: u16 = 0x08;
 pub(crate) const KERNEL_DS: u16 = 0x18;
+/// Ring-0 64-bit code (GDT slot 2, free in the kernel's layout) — the CS every
+/// long-mode IDT gate targets, so the shim stubs run 64-bit when a 64-bit user
+/// slice traps. KVM engine only.
+#[cfg(feature = "kvm")]
+pub(crate) const KERNEL_CS64: u16 = 0x10;
+/// TSS64 selector (GDT slots 10-11 — a 64-bit TSS descriptor is 16 bytes).
+#[cfg(feature = "kvm")]
+pub(crate) const TSS64_SEL: u16 = 0x50;
 /// TSS selector (GDT slot 9 — unused by the kernel's layout). The KVM engine's
 /// TR points here for the CPL3→CPL0 stack switch (TSS.esp0) and the IOPB.
 pub(crate) const TSS_SEL: u16 = 0x48;
@@ -152,6 +167,17 @@ fn materialize() {
     // busy). Present in the GDT on both engines for one canonical table image;
     // nothing on the TCG engine ever loads it.
     gdt[(TSS_SEL >> 3) as usize] = gdt_desc(TSS_ADDR as u32, 0x1FF, 0x8B, 0x0);
+    #[cfg(feature = "kvm")]
+    {
+        // Long-mode descriptors (64-bit user slices). KERNEL_CS64 is fetched
+        // from this table by the CPU on every 64-bit gate delivery; USER_CS64
+        // matches arch-abi's Mode64 selector; the TSS64 descriptor is 16 bytes
+        // (slots 10-11) — flags4 0xA = G|L for the code descriptors.
+        gdt[(KERNEL_CS64 >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0x9A, 0xA);
+        gdt[(arch_abi::USER_CS64 >> 3) as usize] = gdt_desc(0, 0xF_FFFF, 0xFA, 0xA);
+        gdt[(TSS64_SEL >> 3) as usize] = gdt_desc(TSS64_ADDR as u32, 0xFFF, 0x8B, 0x0);
+        gdt[(TSS64_SEL >> 3) as usize + 1] = 0; // TSS64 base[63:32] = 0
+    }
     crate::desc::for_each_tls(|idx, base, _limit| {
         if idx < 32 {
             gdt[idx] = gdt_desc(base, 0xF_FFFF, 0xF2, 0xC);

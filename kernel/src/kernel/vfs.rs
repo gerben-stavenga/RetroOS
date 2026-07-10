@@ -965,6 +965,73 @@ pub fn mount_child(parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
     VFS.lock().mount_child(parent, name)
 }
 
+// ── Directory handles (Linux `FdKind::Dir`) ─────────────────────────────────
+//
+// An opendir'd fd must remember WHICH directory it names: getdents64 reads the
+// path back through this table. (Listing the thread's cwd instead was a
+// busybox-era shortcut — busybox only ever opendir'd "." — that broke
+// `ls /path` from real coreutils.) Fixed-size and refcounted like FILE_TABLE;
+// fork/dup add a reference, close releases the slot at zero.
+
+const DIR_HANDLES: usize = 32;
+pub const DIR_PATH_MAX: usize = 164;
+
+#[derive(Clone, Copy)]
+struct DirHandle {
+    path: [u8; DIR_PATH_MAX],
+    len: u8,
+    refcount: u8,
+}
+
+static DIR_TABLE: Mutex<[DirHandle; DIR_HANDLES]> =
+    Mutex::new([DirHandle { path: [0; DIR_PATH_MAX], len: 0, refcount: 0 }; DIR_HANDLES]);
+
+/// Allocate a directory handle recording `path` (refcount 1), or -24 (EMFILE).
+pub fn open_dir_handle(path: &[u8]) -> i32 {
+    let mut t = DIR_TABLE.lock();
+    for (i, e) in t.iter_mut().enumerate() {
+        if e.refcount == 0 {
+            let n = path.len().min(DIR_PATH_MAX);
+            e.path[..n].copy_from_slice(&path[..n]);
+            e.len = n as u8;
+            e.refcount = 1;
+            return i as i32;
+        }
+    }
+    -24
+}
+
+/// Copy the handle's directory path into `buf`; returns its length (0 for a
+/// dead/invalid handle — the caller falls back to cwd, the pre-table behavior).
+pub fn dir_handle_path(idx: i32, buf: &mut [u8; DIR_PATH_MAX]) -> usize {
+    if !(0..DIR_HANDLES as i32).contains(&idx) {
+        return 0;
+    }
+    let t = DIR_TABLE.lock();
+    let e = &t[idx as usize];
+    if e.refcount == 0 {
+        return 0;
+    }
+    buf[..e.len as usize].copy_from_slice(&e.path[..e.len as usize]);
+    e.len as usize
+}
+
+/// Increment a dir handle's refcount (Linux fork/dup).
+pub fn add_dir_ref(idx: i32) {
+    if let Some(e) = DIR_TABLE.lock().get_mut(idx as usize) {
+        if e.refcount > 0 {
+            e.refcount += 1;
+        }
+    }
+}
+
+/// Decrement a dir handle's refcount; the slot frees at zero.
+pub fn close_dir_handle(idx: i32) {
+    if let Some(e) = DIR_TABLE.lock().get_mut(idx as usize) {
+        e.refcount = e.refcount.saturating_sub(1);
+    }
+}
+
 /// Decrement refcount for a VFS file table entry (Linux FdKind::Vfs close).
 pub fn close_vfs_handle(idx: i32) {
     VFS.lock().close_handle(idx);

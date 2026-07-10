@@ -284,11 +284,17 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
 ) {
     if let Some(ref pr) = linux.pending_read {
         if let thread::FdKind::PipeRead(idx) = pr.fd_kind {
-            let user_buf = unsafe {
-                core::slice::from_raw_parts_mut(pr.buf_ptr as *mut u8, pr.buf_len)
-            };
-            let n = crate::kernel::kpipe::read(idx, user_buf);
+            let (buf_ptr, buf_len) = (pr.buf_ptr, pr.buf_len);
+            // buf_ptr is a GUEST virtual address — write through the
+            // guest-memory API (the blocked thread stayed the running tid, so
+            // its space is the active one). Deref'ing it as a host pointer
+            // worked on metal (ring-1 shares the space) but scribbled the
+            // host heap on the hosted backends — dash, which blocks inside
+            // read() (busybox polls first), was the reproducer.
+            let mut tmp = alloc::vec![0u8; buf_len];
+            let n = crate::kernel::kpipe::read(idx, &mut tmp);
             if n > 0 {
+                machine.copy_to(buf_ptr, &tmp[..n]);
                 regs.rax = n as u64;
                 linux.pending_read = None;
                 kt.state = thread::ThreadState::Ready;
@@ -377,7 +383,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         114 => sys_wait4(machine, kt, a, regs),
         120 => sys_clone(machine, kt, linux, a, regs),
         190 => sys_fork(machine, kt, linux, a, regs), // vfork → COW fork
-        122 => sys_uname(machine, &mut kt.vcpu, a),
+        122 => sys_uname(machine, &mut kt.vcpu, a, false),
         125 => SyscallResult::val(0),
         140 => sys_llseek(machine, kt, a),
         146 => sys_writev(machine, kt, a, false),
@@ -402,7 +408,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         265 => sys_clock_gettime(machine, &mut kt.vcpu, a),
         270 => sys_exit(machine, tid, a),
         295 => sys_openat(machine, kt, linux, a),
-        300 => sys_fstatat64(machine, &mut kt.vcpu, linux, a, false),
+        300 => sys_fstatat64(machine, kt, linux, a, false),
         305 => SyscallResult::val(-ENOENT),
         331 => sys_pipe(machine, kt, a, true),
         340 => SyscallResult::val(0),
@@ -440,6 +446,11 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         21  => sys_access(machine, &mut kt.vcpu, linux, a),
         22  => sys_pipe(machine, kt, a, false),
         24  => sys_sched_yield(kt, regs),
+        25  => sys_mremap(machine, linux, a),
+        // statfs(137): -ENOSYS — callers fall back. fadvise64(221): advisory.
+        137 => SyscallResult::val(-ENOSYS),
+        332 => sys_statx(machine, kt, linux, a),
+        221 => SyscallResult::val(0),
         33  => sys_dup2(kt, a),
         35  => sys_nanosleep(),
         39  => SyscallResult::val(kt.tid),
@@ -452,6 +463,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         59  => sys_execve(machine, kt, linux, a, regs),
         60  => sys_exit(machine, tid, a),
         61  => sys_wait4(machine, kt, a, regs),
+        63  => sys_uname(machine, &mut kt.vcpu, a, true),
         72  => sys_fcntl(kt, a),
         79  => sys_getcwd(machine, &mut kt.vcpu, linux, a),
         80  => sys_chdir(machine, &mut kt.vcpu, linux, a),
@@ -468,6 +480,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         131 => SyscallResult::val(0),
         158 => sys_arch_prctl(machine, kt, linux, a, regs),
         200 => sys_exit(machine, tid, a),
+        201 => sys_time(machine, &mut kt.vcpu, a),
         202 => sys_futex(machine, kt, a),
         217 => sys_getdents64(machine, kt, linux, a),
         218 => SyscallResult::val(kt.tid),
@@ -475,9 +488,13 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         231 => sys_exit(machine, tid, a),
         234 => sys_exit(machine, tid, a),
         257 => sys_openat(machine, kt, linux, a),
-        262 => sys_fstatat64(machine, &mut kt.vcpu, linux, a, true),
+        262 => sys_fstatat64(machine, kt, linux, a, true),
         267 => SyscallResult::val(-ENOENT),
+        269 => sys_faccessat(machine, linux, a),
+        273 => SyscallResult::val(0),       // set_robust_list — no threads share
         293 => sys_pipe(machine, kt, a, true),
+        334 => SyscallResult::val(-ENOSYS), // rseq — glibc falls back cleanly
+        439 => sys_faccessat(machine, linux, a),
         302 => SyscallResult::val(0),
         318 => sys_getrandom(machine, &mut kt.vcpu, a),
         // Sockets (x86-64 direct numbering).
@@ -595,7 +612,7 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs
 
     // 1. Write NUL-terminated string data at top of stack
     // Environment strings first (they end up at higher addresses)
-    let env_strings: &[&[u8]] = &[b"PATH=/bin:/"];
+    let env_strings: &[&[u8]] = &[b"PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"HOME=/", b"TERM=linux"];
     let mut env_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(env_strings.len());
     for &env in env_strings.iter().rev() {
         sp -= env.len() + 1;
@@ -687,6 +704,13 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // mmaps the shared libraries between these and the stack.
     const PIE_BASE: usize = 0x0800_0000;     // 128 MiB — main PIE load bias
     const INTERP_BASE: usize = 0x4000_0000;  // 1 GiB — dynamic-linker load bias
+
+    // Refuse a 64-bit image the backend can't execute (ENOEXEC) — running
+    // x86-64 code misdecoded as i386 is never useful. execve pre-checks this
+    // before its point of no return; this catches direct/boot launches.
+    if elf::is_class64(data) && !machine.user_64_supported() {
+        return Err(ENOEXEC);
+    }
 
     // Peek dynamic info before loading so we know whether to apply a bias and
     // whether to bring in the interpreter.
@@ -877,7 +901,7 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
             if n > 0 { machine.copy_to(buf, &tmp[..n as usize]); }
             SyscallResult::val(n)
         }
-        thread::FdKind::ConsoleOut | thread::FdKind::PipeWrite(_) | thread::FdKind::Dir(_) => {
+        thread::FdKind::ConsoleOut | thread::FdKind::PipeWrite(_) | thread::FdKind::Dir { .. } => {
             SyscallResult::val(-EBADF)
         }
         thread::FdKind::None => SyscallResult::val(-EBADF),
@@ -923,7 +947,7 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             machine.copy_from(buf, &mut tmp);
             SyscallResult::val(crate::kernel::net::sendto(h, &tmp, 0, &[]))
         }
-        thread::FdKind::PipeRead(_) | thread::FdKind::None | thread::FdKind::Dir(_) => {
+        thread::FdKind::PipeRead(_) | thread::FdKind::None | thread::FdKind::Dir { .. } => {
             SyscallResult::val(-EBADF)
         }
     }
@@ -939,12 +963,16 @@ fn sys_open<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     let mut buf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut buf);
 
-    // Directories: hand out a placeholder fd so opendir() succeeds; the
-    // getdents64 syscall reads against the thread's cwd anyway.
+    // Directories: the fd records WHICH directory was opened (dir-handle
+    // table) so getdents64 lists it — `ls /path` opens an fd on /path.
     if vfs::dir_exists(resolved) {
         return match kt.alloc_fd(3) {
             Some(fd) => {
-                kt.fds[fd] = thread::FdKind::Dir(0);
+                let handle = vfs::open_dir_handle(resolved);
+                if handle < 0 {
+                    return SyscallResult::val(handle); // EMFILE
+                }
+                kt.fds[fd] = thread::FdKind::Dir { handle, next: 0 };
                 SyscallResult::val(fd as i32)
             }
             None => SyscallResult::val(-24), // EMFILE
@@ -1168,6 +1196,16 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
         Err(_) => return SyscallResult::val(-ENOENT),
     };
 
+    // A 64-bit ELF on a backend without 64-bit user execution must fail HERE,
+    // before the point of no return, so the caller survives and can fall back
+    // (shell.elf tries /bin/busybox after /bin/sh).
+    if matches!(exec::detect_format(&buffer, &path), exec::BinaryFormat::Elf)
+        && crate::kernel::elf::is_class64(&buffer)
+        && !machine.user_64_supported()
+    {
+        return SyscallResult::val(-ENOEXEC);
+    }
+
     // File loaded — hand teardown + rebuild to the executor (`handle_exec`),
     // which runs off this handler's borrow so its in-place
     // init_thread/exit_thread/reg-reload don't alias `kt`. The point of no
@@ -1326,8 +1364,24 @@ fn sys_readlink<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> 
 
 /// access(33) — check file existence via VFS stat
 fn sys_access<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
+    access_at(machine, linux, a.a0 as usize)
+}
+
+/// faccessat(269) / faccessat2(439) — path at a.a1; only AT_FDCWD dirfds are
+/// honored (path resolves against cwd, which is faccessat's AT_FDCWD meaning).
+/// Mode/flags are ignored like sys_access: existence = permission (single-user).
+fn sys_faccessat<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
+    const AT_FDCWD: i32 = -100;
+    if a.a0 as i32 != AT_FDCWD {
+        return SyscallResult::val(-EBADF);
+    }
+    access_at(machine, linux, a.a1 as usize)
+}
+
+/// Existence check behind access/faccessat: open + close through the VFS.
+fn access_at<A: crate::Arch>(machine: &mut A, linux: &LinuxState, path_ptr: usize) -> SyscallResult {
     let mut path_buf = [0u8; 256];
-    let path_len = machine.copy_cstr(a.a0 as usize, &mut path_buf);
+    let path_len = machine.copy_cstr(path_ptr, &mut path_buf);
     let path = &path_buf[..path_len];
     let mut buf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut buf);
@@ -1383,7 +1437,7 @@ fn sys_fcntl<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
                 thread::FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
                 thread::FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
                 thread::FdKind::Socket(_) => {} // TODO: socket dup refcount
-                thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir(_) => {}
+                thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir { .. } => {}
             }
             kt.fds[newfd] = kind;
             if cmd == F_DUPFD_CLOEXEC {
@@ -1478,14 +1532,15 @@ pub(crate) fn handle_wait<A: crate::Arch>(
     Some(thread::schedule(threads, tid).unwrap_or(0))
 }
 
-/// uname(122)
-fn sys_uname<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
+/// uname(122 / x86-64 63)
+fn sys_uname<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args, want_64: bool) -> SyscallResult {
     let buf = a.a0 as usize;
     if buf == 0 { return SyscallResult::val(-EFAULT); }
 
     // Linux struct old_utsname: 6 fields, 65 bytes each
     machine.zero(buf, 65 * 6);
-    let fields: [&[u8]; 6] = [b"Linux", b"retroos", b"5.0.0", b"#1", b"i686", b"(none)"];
+    let machine_name: &[u8] = if want_64 { b"x86_64" } else { b"i686" };
+    let fields: [&[u8]; 6] = [b"Linux", b"retroos", b"5.0.0", b"#1", machine_name, b"(none)"];
     for (i, s) in fields.iter().enumerate() {
         let n = s.len().min(64);
         machine.copy_to(buf + i * 65, &s[..n]);
@@ -1610,7 +1665,7 @@ pub(crate) fn run_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
                 thread::FdKind::PipeWrite(_idx) => {
                     if (events & POLLOUT) != 0 { revents |= POLLOUT; }
                 }
-                thread::FdKind::Vfs(_) | thread::FdKind::Dir(_) => {
+                thread::FdKind::Vfs(_) | thread::FdKind::Dir { .. } => {
                     if (events & POLLIN) != 0 { revents |= POLLIN; }
                     if (events & POLLOUT) != 0 { revents |= POLLOUT; }
                 }
@@ -1755,6 +1810,73 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     SyscallResult::val64(base as i64)
 }
 
+/// mremap(i386 163 / x86-64 25) — glibc realloc's grow path for large chunks.
+/// The mmap model is a bare downward bump with no per-mapping bookkeeping, so
+/// growing is always a move: fresh anonymous region + content copy (requires
+/// MREMAP_MAYMOVE, which glibc always passes). Shrinks keep the mapping —
+/// over-mapped tails are harmless here.
+fn sys_mremap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+    const MREMAP_MAYMOVE: u32 = 1;
+    let old_addr = a.a0 as usize;
+    let old_len = a.a1 as usize;
+    let new_len = a.a2 as usize;
+    let flags = a.a3 as u32;
+    if old_addr & 0xFFF != 0 || new_len == 0 {
+        return SyscallResult::val(-EINVAL);
+    }
+    if new_len <= old_len {
+        return SyscallResult::val64(old_addr as i64);
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        return SyscallResult::val64(-ENOMEM as i64);
+    }
+    let alloc_size = new_len.div_ceil(0x1000) * 0x1000;
+    if linux.mmap_cursor < linux.heap_end + alloc_size {
+        return SyscallResult::val64(-ENOMEM as i64);
+    }
+    linux.mmap_cursor -= alloc_size;
+    let base = linux.mmap_cursor;
+    machine.zero(base, alloc_size);
+    machine.copy_within(old_addr, base, old_len);
+    SyscallResult::val64(base as i64)
+}
+
+/// stat data (full st_mode incl. file type, size, ino) for a resolved VFS
+/// path — the lookup shared by stat/fstatat/statx.
+fn stat_lookup(resolved: &[u8]) -> Option<(u32, u32, u64)> {
+    if vfs::dir_exists(resolved) {
+        return Some((0o40755, 0, 0));
+    }
+    let handle = vfs::open_to_handle(resolved);
+    if handle < 0 {
+        return None;
+    }
+    let size = vfs::file_size_by_handle(handle);
+    let mode = vfs::file_mode_by_handle(handle);
+    let ino = vfs::file_ino_by_handle(handle);
+    vfs::close_vfs_handle(handle);
+    Some((0o100000 | mode as u32, size, ino))
+}
+
+/// Base directory for `*at()` path resolution: a dirfd naming a directory
+/// (via the dir-handle table) wins; AT_FDCWD / anything else = cwd.
+fn at_base<'a, A: crate::Arch>(
+    kt: &thread::KernelThread<A>,
+    linux: &'a LinuxState,
+    dirfd: i32,
+    buf: &'a mut [u8; vfs::DIR_PATH_MAX],
+) -> &'a [u8] {
+    if dirfd >= 0 && (dirfd as usize) < thread::MAX_FDS {
+        if let thread::FdKind::Dir { handle, .. } = kt.fds[dirfd as usize] {
+            let n = vfs::dir_handle_path(handle, buf);
+            if n > 0 {
+                return &buf[..n];
+            }
+        }
+    }
+    linux.cwd_str()
+}
+
 /// stat64(195) / lstat64(196)
 fn sys_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
     let path_ptr = a.a0 as usize;
@@ -1766,20 +1888,68 @@ fn sys_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxSt
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
 
-    // Check if it's a directory
-    if vfs::dir_exists(resolved) {
-        write_stat64(machine, stat_buf, 0o40755, 0, 0, want_64);
+    match stat_lookup(resolved) {
+        Some((mode, size, ino)) => {
+            write_stat64(machine, stat_buf, mode, size, ino, want_64);
+            SyscallResult::val(0)
+        }
+        None => SyscallResult::val(-ENOENT),
+    }
+}
+
+/// statx(x86-64 332 / i386 383) — the modern stat coreutils tries first.
+/// Fills the basic-stats set from the same lookup as stat64.
+fn sys_statx<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &LinuxState, a: &Args) -> SyscallResult {
+    let dirfd = a.a0 as i32;
+    let path_ptr = a.a1 as usize;
+    let statx_buf = a.a4 as usize;
+    let mut path_buf = [0u8; 256];
+    let path_len = machine.copy_cstr(path_ptr, &mut path_buf);
+    let path = &path_buf[..path_len];
+
+    // Empty path (AT_EMPTY_PATH): stat the fd itself.
+    if path.is_empty() {
+        let fd = dirfd as usize;
+        if dirfd < 0 || fd >= thread::MAX_FDS {
+            return SyscallResult::val(-EBADF);
+        }
+        let (mode, size, ino) = match kt.fds[fd] {
+            thread::FdKind::Vfs(h) => (
+                0o100000 | vfs::file_mode_by_handle(h) as u32,
+                vfs::file_size_by_handle(h),
+                vfs::file_ino_by_handle(h),
+            ),
+            thread::FdKind::Dir { .. } => (0o40755, 0, 0),
+            thread::FdKind::None => return SyscallResult::val(-EBADF),
+            _ => (0o20666, 0, 0), // console / pipe / socket: char-dev-ish
+        };
+        write_statx(machine, statx_buf, mode, size, ino);
         return SyscallResult::val(0);
     }
 
-    let handle = vfs::open_to_handle(resolved);
-    if handle < 0 { return SyscallResult::val(-ENOENT); }
-    let size = vfs::file_size_by_handle(handle);
-    let posix_mode = vfs::file_mode_by_handle(handle);
-    let ino = vfs::file_ino_by_handle(handle);
-    vfs::close_vfs_handle(handle);
-    write_stat64(machine, stat_buf, 0o100000 | posix_mode as u32, size, ino, want_64);
-    SyscallResult::val(0)
+    let mut dbuf = [0u8; vfs::DIR_PATH_MAX];
+    let base = at_base(kt, linux, dirfd, &mut dbuf);
+    let mut pbuf = [0u8; 164];
+    let resolved = resolve_path(path, base, &mut pbuf);
+    match stat_lookup(resolved) {
+        Some((mode, size, ino)) => {
+            write_statx(machine, statx_buf, mode, size, ino);
+            SyscallResult::val(0)
+        }
+        None => SyscallResult::val(-ENOENT),
+    }
+}
+
+/// Write a Linux `struct statx` (256 bytes) covering STATX_BASIC_STATS.
+fn write_statx<A: crate::Arch>(machine: &mut A, buf: usize, mode: u32, size: u32, ino: u64) {
+    machine.zero(buf, 256);
+    machine.write::<u32>(buf, 0x7FF); // stx_mask = STATX_BASIC_STATS
+    machine.write::<u32>(buf + 4, 4096); // stx_blksize
+    machine.write::<u32>(buf + 16, 1); // stx_nlink
+    machine.write::<u16>(buf + 28, mode as u16); // stx_mode
+    machine.write::<u64>(buf + 32, ino); // stx_ino
+    machine.write::<u64>(buf + 40, size as u64); // stx_size
+    machine.write::<u64>(buf + 48, (size as u64).div_ceil(512)); // stx_blocks
 }
 
 /// fstat64(197)
@@ -1801,7 +1971,7 @@ fn sys_fstat64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
             write_stat64(machine, stat_buf, 0o100000 | mode as u32, size, ino, want_64);
             SyscallResult::val(0)
         }
-        thread::FdKind::Dir(_) => {
+        thread::FdKind::Dir { .. } => {
             write_stat64(machine, stat_buf, 0o40755, 0, 0, want_64); // S_IFDIR
             SyscallResult::val(0)
         }
@@ -1814,11 +1984,27 @@ fn sys_fstat64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
 }
 
 /// fstatat64(300 / x86-64 262)
-fn sys_fstatat64<A: crate::Arch>(machine: &mut A, vcpu: &mut Regs, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
-    let _dirfd = a.a0 as i32;
-    // Treat as stat64 on the path (a.a1 = path, a.a2 = stat buf)
-    let shifted = Args { a0: a.a1, a1: a.a2, a2: a.a3, a3: a.a4, a4: a.a5, a5: 0 };
-    sys_stat64(machine, vcpu, linux, &shifted, want_64)
+fn sys_fstatat64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
+    let dirfd = a.a0 as i32;
+    let path_ptr = a.a1 as usize;
+    let stat_buf = a.a2 as usize;
+    let mut path_buf = [0u8; 256];
+    let path_len = machine.copy_cstr(path_ptr, &mut path_buf);
+    let path = &path_buf[..path_len];
+
+    // Resolve relative to the dirfd's directory (dir-handle table) — ls does
+    // fstatat(dirfd_of_dir, entry_name) for every listing entry.
+    let mut dbuf = [0u8; vfs::DIR_PATH_MAX];
+    let base = at_base(kt, linux, dirfd, &mut dbuf);
+    let mut pbuf = [0u8; 164];
+    let resolved = resolve_path(path, base, &mut pbuf);
+    match stat_lookup(resolved) {
+        Some((mode, size, ino)) => {
+            write_stat64(machine, stat_buf, mode, size, ino, want_64);
+            SyscallResult::val(0)
+        }
+        None => SyscallResult::val(-ENOENT),
+    }
 }
 
 /// Write a minimal Linux stat struct to user memory. The layout differs by
@@ -1898,7 +2084,7 @@ fn sys_fstat_old<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<
             write_stat_old(machine, stat_buf, 0o100000 | mode as u32, size);
             SyscallResult::val(0)
         }
-        thread::FdKind::Dir(_) => {
+        thread::FdKind::Dir { .. } => {
             write_stat_old(machine, stat_buf, 0o40755, 0);
             SyscallResult::val(0)
         }
@@ -1912,17 +2098,20 @@ fn sys_getdents64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
     let dirp = a.a1 as usize;
     let count = a.a2 as usize;
 
-    // The fd carries a per-fd cursor (FdKind::Dir(idx)). Without it, every
-    // call would replay from index 0 and the caller would loop forever.
+    // The fd carries the directory identity (dir-handle table) and a per-fd
+    // cursor. Without the cursor, every call would replay from index 0 and
+    // the caller would loop forever.
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
-    let mut index = match kt.fds[fd] {
-        thread::FdKind::Dir(i) => i as usize,
-        _ => 0,  // Tolerate fd=0 / non-Dir fd: read against cwd from start.
+    let (handle, mut index) = match kt.fds[fd] {
+        thread::FdKind::Dir { handle, next } => (handle, next as usize),
+        _ => (-1, 0), // Tolerate fd=0 / non-Dir fd: read against cwd from start.
     };
 
-    // No directory fd → use cwd. (Real fix would track the path on the fd,
-    // but for now the only opener is `opendir(".")` which equals cwd.)
-    let cwd = linux.cwd_str();
+    // The fd's recorded directory; a dead/unknown handle falls back to cwd
+    // (the pre-table behavior for opendir(".")).
+    let mut dir_buf = [0u8; vfs::DIR_PATH_MAX];
+    let dir_len = vfs::dir_handle_path(handle, &mut dir_buf);
+    let cwd: &[u8] = if dir_len > 0 { &dir_buf[..dir_len] } else { linux.cwd_str() };
 
     let mut offset = 0usize;
     while let Some(entry) = vfs::readdir(cwd, index) {
@@ -1947,8 +2136,8 @@ fn sys_getdents64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         offset += reclen;
     }
 
-    if let thread::FdKind::Dir(_) = kt.fds[fd] {
-        kt.fds[fd] = thread::FdKind::Dir(index as u32);
+    if let thread::FdKind::Dir { handle, .. } = kt.fds[fd] {
+        kt.fds[fd] = thread::FdKind::Dir { handle, next: index as u32 };
     }
     SyscallResult::val(offset as i32)
 }
@@ -2106,7 +2295,7 @@ fn sys_dup2<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysca
         thread::FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
         thread::FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
         thread::FdKind::Socket(_) => {} // TODO: socket dup refcount
-        thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir(_) => {}
+        thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir { .. } => {}
     }
     kt.fds[newfd] = kind;
     kt.cloexec &= !(1 << newfd);

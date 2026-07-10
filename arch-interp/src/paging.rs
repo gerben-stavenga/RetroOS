@@ -46,8 +46,11 @@ fn read_entry(ppage: u64, i: usize) -> u32 {
         p.read_unaligned()
     }
 }
-/// Write entry `i` of the table in frame `ppage`.
+/// Write entry `i` of the table in frame `ppage`. This is the single funnel
+/// every 2-level mutation goes through, so it also advances the long-mode
+/// twin's invalidation generation (see `active_pml4`).
 fn write_entry(ppage: u64, i: usize, v: u32) {
+    LONG_GEN.with(|g| g.set(g.get() + 1));
     unsafe {
         let p = phys::frame_ptr(ppage).add(i * 4) as *mut u32;
         p.write_unaligned(v);
@@ -386,7 +389,7 @@ mod integration {
 // methods drive. Built on the primitives above; the live wiring (cpu.rs
 // build/configure/execute, calls.rs) swaps onto these.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 struct Spaces {
@@ -796,11 +799,181 @@ pub fn space_destroy(id: u32) {
         }
         s.pd.remove(&id);
     });
+    LONG_TWINS.with(|t| {
+        if let Some(tw) = t.borrow_mut().remove(&id) {
+            for f in tw.frames {
+                phys::free_frames(f, 1);
+            }
+        }
+    });
+}
+
+// ── Long-mode (4-level) twin ─────────────────────────────────────────────────
+//
+// 64-bit user slices run with PAE 4-level tables; the 2-level tree above stays
+// the single source of truth for every mutation (map/unmap/COW/fork/clean).
+// Rather than keeping a second tree in lockstep at each of those sites, the
+// twin is derived lazily: `write_entry` (the one funnel all mutations pass
+// through) bumps a generation, and a 64-bit slice entry calls `active_pml4()`,
+// which rebuilds the active space's 4-level tree iff the generation moved
+// since the last build. A 32-bit leaf PTE zero-extends into a 64-bit PTE
+// unchanged — PRESENT/W/USER/PCD/COW sit at the same bit positions, the frame
+// stays in bits 31:12, and bit 63 (NX) stays 0 — so the twin is a bit-faithful
+// mirror of the source tree, software markers included. Not-present markers
+// (the PCD MMIO trap, COW leftovers) mirror too: the hardware walk #PFs and
+// the kernel resolves against the 2-level tree as always, which bumps the
+// generation and refreshes the twin on the next 64-bit entry.
+
+/// Intermediate-level (PML4E/PDPTE/PDE) flags: present | writable | user.
+const ENTRY_FLAGS64: u64 = ENTRY_FLAGS as u64;
+
+struct LongTwin {
+    /// PML4 root frame (ppage) — `frame_phys(pml4)` is the long-mode CR3.
+    pml4: u64,
+    /// Every table frame of the twin (PML4 included), for wholesale free.
+    frames: Vec<u64>,
+    /// `LONG_GEN` at build time; any later 2-level write invalidates. Coarse
+    /// (a write in space A invalidates B's twin too) but safe, and rebuilds
+    /// are a handful of tables for a typical space.
+    built_at: u64,
+}
+
+thread_local! {
+    static LONG_GEN: Cell<u64> = const { Cell::new(1) };
+    static LONG_TWINS: RefCell<BTreeMap<u32, LongTwin>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+fn read_entry64(ppage: u64, i: usize) -> u64 {
+    unsafe { (phys::frame_ptr(ppage).add(i * 8) as *const u64).read_unaligned() }
+}
+fn write_entry64(ppage: u64, i: usize, v: u64) {
+    unsafe { (phys::frame_ptr(ppage).add(i * 8) as *mut u64).write_unaligned(v) }
+}
+
+/// Build a fresh 4-level tree mirroring the 2-level tree at `pd`. User VAs are
+/// all below 4 GiB, so the shape is PML4[0] → one PDPT → up to 4 PDs → PTs;
+/// each 32-bit page table (4 MiB reach) feeds two 64-bit ones (2 MiB reach).
+fn build_long_twin(pd: u64) -> (u64, Vec<u64>) {
+    let mut frames = Vec::new();
+    let fresh = |frames: &mut Vec<u64>| {
+        let f = alloc_table();
+        frames.push(f);
+        f
+    };
+    let pml4 = fresh(&mut frames);
+    let pdpt = fresh(&mut frames);
+    write_entry64(pml4, 0, (pdpt << 12) | ENTRY_FLAGS64);
+    for pde_i in 0..1024usize {
+        let pde = read_entry(pd, pde_i);
+        if pde & PRESENT == 0 {
+            continue;
+        }
+        let pt32 = (pde >> 12) as u64;
+        for pte_i in 0..1024usize {
+            let pte = read_entry(pt32, pte_i);
+            if pte == 0 {
+                continue; // mirror every non-zero entry, markers included
+            }
+            let v = ((pde_i << 22) | (pte_i << 12)) as u64;
+            let pdpt_i = ((v >> 30) & 0x1FF) as usize;
+            let pd_i = ((v >> 21) & 0x1FF) as usize;
+            let pt_i = ((v >> 12) & 0x1FF) as usize;
+            let pdpte = read_entry64(pdpt, pdpt_i);
+            let pd64 = if pdpte & (PRESENT as u64) != 0 {
+                pdpte >> 12
+            } else {
+                let f = fresh(&mut frames);
+                write_entry64(pdpt, pdpt_i, (f << 12) | ENTRY_FLAGS64);
+                f
+            };
+            let pde64 = read_entry64(pd64, pd_i);
+            let pt64 = if pde64 & (PRESENT as u64) != 0 {
+                pde64 >> 12
+            } else {
+                let f = fresh(&mut frames);
+                write_entry64(pd64, pd_i, (f << 12) | ENTRY_FLAGS64);
+                f
+            };
+            write_entry64(pt64, pt_i, pte as u64);
+        }
+    }
+    (pml4, frames)
+}
+
+/// PML4 root (ppage — `frame_phys` of it is the CR3 value) for a long-mode
+/// slice of the ACTIVE space: the lazily (re)built 4-level twin.
+pub fn active_pml4() -> u64 {
+    let id = active_id();
+    let pd = active_pd();
+    let gen = LONG_GEN.with(|g| g.get());
+    LONG_TWINS.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(tw) = t.get(&id) {
+            if tw.built_at == gen {
+                return tw.pml4;
+            }
+        }
+        if let Some(old) = t.remove(&id) {
+            for f in old.frames {
+                phys::free_frames(f, 1);
+            }
+        }
+        let (pml4, frames) = build_long_twin(pd);
+        t.insert(id, LongTwin { pml4, frames, built_at: gen });
+        pml4
+    })
+}
+
+/// 4-level software walk (tests + diagnostics): virtual → physical through a
+/// twin rooted at `pml4`, or None on the first not-present entry.
+#[cfg(test)]
+fn translate64(pml4: u64, vaddr: u64) -> Option<u64> {
+    let mut table = pml4;
+    for shift in [39u32, 30, 21, 12] {
+        let e = read_entry64(table, ((vaddr >> shift) & 0x1FF) as usize);
+        if e & (PRESENT as u64) == 0 {
+            return None;
+        }
+        table = (e >> 12) & 0xF_FFFF_FFFF;
+        if shift == 12 {
+            return Some((table << 12) | (vaddr & 0xFFF));
+        }
+    }
+    unreachable!()
 }
 
 #[cfg(test)]
 mod space_ops {
     use super::*;
+
+    #[test]
+    fn long_twin_mirrors_and_tracks_changes() {
+        space_init();
+        let s = space_new();
+        space_switch(s);
+        space_map_fresh(0x10, 2);
+        let pml4 = active_pml4();
+        assert_eq!(
+            translate64(pml4, 0x10_000),
+            space_translate(0x10_000).map(u64::from),
+            "twin translates a mapped page to the same frame"
+        );
+        assert_eq!(translate64(pml4, 0x12_000), None, "unmapped stays unmapped");
+        assert_eq!(active_pml4(), pml4, "no mutation → same twin, no rebuild");
+        // Mutate the source tree → the twin refreshes on next request.
+        space_map_fresh(0x12, 1);
+        let pml4b = active_pml4();
+        assert_eq!(
+            translate64(pml4b, 0x12_000),
+            space_translate(0x12_000).map(u64::from),
+            "rebuilt twin sees the new page"
+        );
+        // Read-only source PTE mirrors as read-only (W bit clear).
+        space_set_writable(0x10, 1, false);
+        let pml4c = active_pml4();
+        let pa = translate64(pml4c, 0x10_000).expect("still mapped");
+        assert_eq!(pa >> 12, space_translate(0x10_000).unwrap() as u64 >> 12);
+    }
 
     #[test]
     fn map_fork_translate() {
@@ -939,5 +1112,74 @@ mod vm86 {
                   VEC.with(|c| c.get()));
         assert_eq!(ax, 0x1234, "VM86 code ran through the page-table translation");
         assert!(vm != 0, "still in VM86 mode after entry");
+    }
+}
+
+#[cfg(all(test, feature = "tcg"))] // proofs drive Unicorn directly
+mod proof64 {
+    use super::*;
+    use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
+    use unicorn_engine::{RegisterX86, Unicorn};
+
+    /// `uc_x86_msr { rid: u32, value: u64 }` (repr C: 4 bytes pad after rid).
+    fn msr_bytes(rid: u32, value: u64) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&rid.to_le_bytes());
+        b[8..16].copy_from_slice(&value.to_le_bytes());
+        b
+    }
+
+    /// Long-mode keystone: a 64-bit unicorn walks the 4-level twin that
+    /// `active_pml4()` derived from the ordinary 2-level space — 64-bit code
+    /// fetched through a non-identity virtual mapping runs, and a full-width
+    /// (REX.W) result reads back. This is the page-table foundation the KVM
+    /// and TCG Mode64 slice paths both stand on.
+    #[test]
+    fn unicorn_walks_the_long_mode_twin() {
+        space_init();
+        let s = space_new();
+        space_switch(s);
+
+        // Code page at virtual 0x40_0000, backed by whatever frame the space
+        // allocator picked (non-identity by construction).
+        space_map_fresh(0x400, 1);
+        let code_pa = space_translate(0x40_0000).expect("mapped");
+        // movabs rax, 0x1122334455667788 ; jmp $
+        let code: [u8; 12] = [0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xEB, 0xFE];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                code.as_ptr(),
+                phys::frame_ptr((code_pa >> 12) as u64),
+                code.len(),
+            );
+        }
+
+        let pml4 = active_pml4();
+
+        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_64).expect("uc64");
+        // ONE region: all guest physical RAM = the memfd (same topology as the
+        // 32-bit proofs and the real backend).
+        unsafe {
+            uc.mem_map_ptr(0, phys::PHYS_SIZE as u64, Prot::ALL, phys::region_base() as *mut core::ffi::c_void)
+                .expect("map the one phys region");
+        }
+
+        // Bring up the long-mode MMU: PAE, EFER.LME|LMA, CR3 → the twin, PG on.
+        // (MODE_64 unicorn already presents a 64-bit CS; only paging is off.)
+        uc.reg_write(RegisterX86::CR4, 1 << 5).unwrap(); // PAE
+        uc.reg_write(RegisterX86::CR3, frame_phys(pml4) as u64).unwrap();
+        uc.reg_write_long(RegisterX86::MSR, &msr_bytes(0xC000_0080, (1 << 8) | (1 << 10)))
+            .unwrap(); // EFER = LME | LMA
+        uc.reg_write(RegisterX86::CR0, 0x8000_0011).unwrap(); // PG | PE (+ET)
+
+        uc.reg_write(RegisterX86::RAX, 0).unwrap();
+        let r = uc.emu_start(0x40_0000, 0, 0, 2);
+        let rax = uc.reg_read(RegisterX86::RAX).unwrap();
+        let rip = uc.reg_read(RegisterX86::RIP).unwrap();
+        eprintln!("proof64: r={r:?} rax={rax:#x} rip={rip:#x}");
+        assert_eq!(
+            rax, 0x1122_3344_5566_7788,
+            "64-bit code at virtual 0x400000 should run through the twin's walk"
+        );
     }
 }

@@ -30,10 +30,11 @@ pub enum FdKind {
     PipeWrite(u8),
     /// Console stdout/stderr (VGA putchar)
     ConsoleOut,
-    /// Open directory (for opendir/getdents). The u32 is the next entry
-    /// index to return; getdents64 advances it on each call so a sequential
-    /// reader sees each entry exactly once and EOF after the last.
-    Dir(u32),
+    /// Open directory (for opendir/getdents). `handle` names the directory in
+    /// the VFS dir-handle table (-1 = unknown → getdents falls back to cwd);
+    /// `next` is the next entry index to return — getdents64 advances it so a
+    /// sequential reader sees each entry exactly once and EOF after the last.
+    Dir { handle: i32, next: u32 },
     /// Network socket — the i32 is the backend socket handle (injected socket
     /// layer; hosted std::net punch-through).
     Socket(i32),
@@ -377,7 +378,10 @@ impl<A: crate::Arch> KernelThread<A> {
             FdKind::Socket(h) => {
                 crate::kernel::net::close(h);
             }
-            FdKind::ConsoleOut | FdKind::None | FdKind::Dir(_) => {}
+            FdKind::Dir { handle, .. } => {
+                crate::kernel::vfs::close_dir_handle(handle);
+            }
+            FdKind::ConsoleOut | FdKind::None => {}
         }
         self.fds[fd] = FdKind::None;
         self.cloexec &= !(1 << fd);
@@ -418,7 +422,10 @@ impl<A: crate::Arch> KernelThread<A> {
                 // TODO: refcount for fork/dup socket sharing — for now the child
                 // inherits the same backend handle; the first close frees it.
                 FdKind::Socket(_) => {}
-                FdKind::ConsoleOut | FdKind::None | FdKind::Dir(_) => {}
+                FdKind::Dir { handle, .. } => {
+                    crate::kernel::vfs::add_dir_ref(handle);
+                }
+                FdKind::ConsoleOut | FdKind::None => {}
             }
         }
     }

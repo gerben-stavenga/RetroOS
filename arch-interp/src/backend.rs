@@ -36,6 +36,13 @@ impl Arch for Interp {
     // `&mut *(&raw mut REGS)` is the `&raw`-first form that avoids a
     // `static_mut_refs` reference; clippy's `deref_addrof` rewrite would
     // reintroduce it.
+    fn user_64_supported(&self) -> bool {
+        // The KVM engine runs Mode64 slices in real long mode (4-level twin
+        // CR3 + 64-bit shim). The TCG engine still executes Mode64 flat-32
+        // ("smoke paths only") — it flips when the Unicorn core goes MODE_64.
+        cfg!(feature = "kvm")
+    }
+
     #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
         // Bridge the loop-owned registers to the backend's live frame for the

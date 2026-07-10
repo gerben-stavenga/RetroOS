@@ -24,8 +24,17 @@ impl FxState {
     pub fn restore(&self) {}
 }
 
-/// A zeroed FPU template for seeding a new thread's save area.
-pub fn clean_fx_template() -> FxState { FxState::zeroed() }
+/// A clean FPU template for seeding a new thread's save area — like metal's
+/// boot-time `fxsave` snapshot, NOT all-zero: MXCSR=0 leaves every SSE
+/// exception unmasked, so the first flag-setting SSE op in a fresh thread
+/// (glibc's SSE memchr/strlen) raises #XM (Exception 19) on the KVM engine.
+/// x87 FCW likewise defaults to 0x037F.
+pub fn clean_fx_template() -> FxState {
+    let mut fx = FxState::zeroed();
+    fx.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
+    fx.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+    fx
+}
 
 // ── Port I/O ───────────────────────────────────────────────────────────────
 //

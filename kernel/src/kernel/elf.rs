@@ -8,6 +8,13 @@ extern crate alloc;
 use alloc::vec::Vec;
 pub use lib::elf::{ElfError, ElfClass};
 
+/// True if `elf_data` is a 64-bit ELF (EI_CLASS = ELFCLASS64). Cheap ident
+/// peek for the exec-time capability check — a 64-bit image on a backend
+/// without 64-bit user execution must fail with ENOEXEC, not run misdecoded.
+pub fn is_class64(elf_data: &[u8]) -> bool {
+    elf_data.len() > 4 && elf_data[4] == 2
+}
+
 /// Peek at an ELF's dynamic-linking info without loading it:
 /// `(is_pie /* ET_DYN */, PT_INTERP path if dynamically linked)`.
 pub fn dyn_info(elf_data: &[u8]) -> Result<(bool, Option<Vec<u8>>), ElfError> {

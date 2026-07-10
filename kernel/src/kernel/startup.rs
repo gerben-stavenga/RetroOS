@@ -258,7 +258,31 @@ fn run_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>
     let buf = exec::load_file_resolved(path)
         .or_else(|_| exec::load_file_resolved(&[crate::kernel::dos::c_root(), path].concat()))
         .unwrap_or_else(|_| panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
-    let args = alloc::vec![path.to_vec()];
+    // argv = path + the cmdline tail split into words. The ELF/Linux path
+    // consumes the full argv (`--cmd "/usr/bin/dash -c 'echo hi'"` must reach
+    // dash as ["-c", "echo hi"]); DOS ignores the extra entries and gets the
+    // raw tail as PSP:0080h instead. Quotes group words, nothing more — the
+    // launcher is not a shell.
+    let mut args = alloc::vec![path.to_vec()];
+    {
+        let mut word: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut quote: u8 = 0;
+        for &b in cmdline_tail {
+            match b {
+                b'\'' | b'"' if quote == 0 => quote = b,
+                b if quote != 0 && b == quote => quote = 0,
+                b' ' if quote == 0 => {
+                    if !word.is_empty() {
+                        args.push(core::mem::take(&mut word));
+                    }
+                }
+                b => word.push(b),
+            }
+        }
+        if !word.is_empty() {
+            args.push(word);
+        }
+    }
     let cmdline_tail = cmdline_tail.to_vec();
     let cwd = cwd.to_vec();
     let env = env.to_vec();
@@ -395,6 +419,10 @@ fn dispatch<A: crate::Arch>(
         }
         crate::println!("  fault rip={:#x} addr={:#x} err={:#x}",
             regs.frame.rip, addr, regs.err_code);
+        crate::println!("  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}",
+            regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp, regs.frame.rsp);
+        crate::println!("  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15);
         thread::signal_thread(thread, addr as usize);
         return thread::KernelAction::Exit(-11);
     }
