@@ -619,6 +619,29 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                         emulate_outb(machine, &mut dos.pc, regs, 0x3C9, b);
                     }
                 }
+                0x15 => {
+                    // Read one DAC register: BX=index → DH=R, CH=G, CL=B.
+                    // Fade loops read-modify-write through here; without it
+                    // they scale garbage and the palette decays.
+                    let bx = regs.rbx as u8;
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C7, bx);
+                    let r = emulate_inb(machine, &mut dos.pc, 0x3C9) as u64;
+                    let g = emulate_inb(machine, &mut dos.pc, 0x3C9) as u64;
+                    let b = emulate_inb(machine, &mut dos.pc, 0x3C9) as u64;
+                    regs.rdx = (regs.rdx & !0xFF00) | (r << 8);
+                    regs.rcx = (regs.rcx & !0xFFFF) | (g << 8) | b;
+                }
+                0x17 => {
+                    // Read DAC block: BX=first, CX=count → ES:DX RGB triples.
+                    let tbl = ((regs.es as u16 as usize) << 4) + regs.rdx as u16 as usize;
+                    let n = (regs.rcx as u16 as usize) * 3;
+                    let bx = regs.rbx as u8;
+                    emulate_outb(machine, &mut dos.pc, regs, 0x3C7, bx);
+                    for i in 0..n {
+                        let v = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                        machine.write::<u8>(tbl + i, v);
+                    }
+                }
                 _ => {}
             }
         }
