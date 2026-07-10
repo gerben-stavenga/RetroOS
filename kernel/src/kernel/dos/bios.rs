@@ -74,7 +74,10 @@ struct Bda {
     /// games' adapter detection (e.g. SkyRoads) checks this alongside
     /// INT 10h AX=1A00.
     equipment: u16,
-    _pad_12: [u8; 5],
+    _pad_12: u8,
+    /// 0x13: conventional memory size in KB (INT 12h reads this).
+    mem_size_kb: u16,
+    _pad_15: [u8; 2],
     /// 0x17: keyboard shift/ctrl/alt flag byte (INT 16h AH=02).
     kb_flags: u8,
     _pad_18: [u8; 2],
@@ -117,6 +120,7 @@ struct Bda {
 const _: () = {
     use core::mem::offset_of;
     assert!(offset_of!(Bda, equipment) == 0x10);
+    assert!(offset_of!(Bda, mem_size_kb) == 0x13);
     assert!(offset_of!(Bda, kb_flags) == 0x17);
     assert!(offset_of!(Bda, kb_head) == 0x1A);
     assert!(offset_of!(Bda, kb_ring) == 0x1E);
@@ -190,6 +194,15 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
 
 /// Seed the BDA fields a real POST would have set.
 fn seed_bda<A: crate::Arch>(machine: &mut A) {
+    // Zero the whole BDA first: on a UEFI machine this low page holds
+    // whatever the firmware left behind (a real POST cleared it), and guests
+    // read unseeded fields directly — DOS/4GW #DE'd converting a leftover
+    // 0xFFF1xxxx at 40:6C to a time of day.
+    machine.copy_to(0x400, &[0u8; 0x100]);
+    // Tick-of-day counter: a real POST seeds 40:6C from the RTC.
+    let ticks = super::dos::rtc_ticks_today(machine);
+    bda_field!(machine, tick_count = ticks);
+    bda_field!(machine, mem_size_kb = 640u16);
     bda_field!(machine, video_mode = 3u8); // 80x25 colour text
     bda_field!(machine, columns = 80u16);
     bda_field!(machine, crtc_base = 0x03D4u16);
@@ -251,6 +264,11 @@ pub(super) fn dispatch<A: crate::Arch>(
         0x11 => {
             let equip: u16 = bda_field!(machine, equipment);
             regs.rax = (regs.rax & !0xFFFF) | equip as u64;
+        }
+        0x12 => {
+            // Conventional memory size in KB (the BDA word a POST seeded).
+            let kb: u16 = bda_field!(machine, mem_size_kb);
+            regs.rax = (regs.rax & !0xFFFF) | kb as u64;
         }
         0x15 => match (regs.rax >> 8) as u8 {
             // AH=87h block move: the ROM does this via a protected-mode LGDT

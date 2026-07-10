@@ -116,6 +116,37 @@ fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
     (year, month, day, day_of_week(year, month, day))
 }
 
+/// BIOS tick-of-day counter value for "now", read from the RTC — what a real
+/// POST stores at 40:6C. Handles BCD/binary and 12/24-hour CMOS formats;
+/// implausible values seed midnight (a wrong-but-sane clock) rather than
+/// letting garbage through: DOS/4GW's 16-bit ticks→time conversion #DEs on a
+/// counter whose high word exceeds ~24 hours' worth of ticks.
+pub(super) fn rtc_ticks_today<A: crate::Arch>(machine: &mut A) -> u32 {
+    for _ in 0..10_000 {
+        if cmos_read(machine, 0x0A) & 0x80 == 0 {
+            break;
+        }
+    }
+    let status_b = cmos_read(machine, 0x0B);
+    let binary = status_b & 0x04 != 0;
+    let sec = cmos_decode(cmos_read(machine, 0x00), binary) as u32;
+    let min = cmos_decode(cmos_read(machine, 0x02), binary) as u32;
+    let raw_hour = cmos_read(machine, 0x04);
+    let mut hour = cmos_decode(raw_hour & 0x7F, binary) as u32;
+    if status_b & 0x02 == 0 {
+        // 12-hour mode: bit 7 = PM, hour 12 wraps to 0.
+        hour %= 12;
+        if raw_hour & 0x80 != 0 {
+            hour += 12;
+        }
+    }
+    if sec > 59 || min > 59 || hour > 23 {
+        return 0;
+    }
+    let secs = (hour * 3600 + min * 60 + sec) as u64;
+    (secs * PIT_INPUT_HZ / BIOS_TICK_DIVISOR) as u32
+}
+
 fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, _regs: &Regs) -> (u16, u16) {
     let (hour, min, sec, _) = bios_time_of_day(machine);
     let (year, month, day, _) = cmos_date(machine);
