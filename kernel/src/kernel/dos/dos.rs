@@ -634,15 +634,25 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             thread::KernelAction::Done
         }
         // AH=08h — SYNTH_SHUTDOWN: park the audio hardware and halt the
-        // machine. Never returns to the guest (metal hlt-loops after trying
-        // the hypervisor poweroff ports; hosted exits). This is the safe way
-        // off real hardware: a raw power-button hold mid-stream wedges the
-        // laptop's ALC298 until a cold power cycle, but a codec left with
-        // its link in reset rides out any power-off. Drives COMMAND.COM's
-        // `SHUTDOWN` builtin.
+        // machine. Never returns to the guest. This is the safe way off real
+        // hardware: a raw power-button hold mid-stream wedges the laptop's
+        // ALC298 until a cold power cycle, but a codec left with its link in
+        // reset rides out any power-off. Drives COMMAND.COM's `SHUTDOWN`
+        // builtin.
+        //
+        // Host::Metal takes halt_forever, NOT shutdown(): shutdown() blind-
+        // writes the QEMU/Bochs/VBox poweroff ports (0x604/0xB004/0x4004),
+        // and on a real chipset those land in ACPI PM / SMI space with
+        // undefined effect — the Blade 14's FCH warm-RESETS, which boots
+        // RetroOS again, whose HDA bring-up re-activates the freshly parked
+        // codec right before the user cuts power (observed 2026-07-10: that
+        // re-wedged the ALC298 the SHUTDOWN command exists to protect).
         0x08 => {
             crate::kernel::hda::emergency_quiesce();
             crate::println!("It is now safe to turn off your computer.");
+            if crate::kernel::platform::get().host == crate::kernel::platform::Host::Metal {
+                machine.halt_forever();
+            }
             machine.shutdown();
         }
         // Unknown AH: RetroOS synth space is kernel-owned; anything outside
