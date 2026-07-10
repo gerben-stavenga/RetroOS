@@ -4,6 +4,7 @@
 //! that gives the system meaning but doesn't require hardware privilege.
 
 pub mod ac97;
+pub mod alc298_amp;
 pub mod hda;
 pub mod block;
 pub mod console;

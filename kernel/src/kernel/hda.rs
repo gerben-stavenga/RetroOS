@@ -219,6 +219,9 @@ struct Hda {
     parked: bool,
     /// Latched when a codec verb times out; bring-up abandons this controller.
     verb_failed: bool,
+    /// True once the ALC298 vendor-DSP amp sequence has been replayed this
+    /// boot (survives CRST, so park/unpark cycles don't repeat it).
+    amp_init_done: bool,
     /// Codec address of the first present codec.
     cad: u32,
     /// Codec vendor/device id from node 0, e.g. 0x10ec0298 for Realtek ALC298.
@@ -520,6 +523,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         rings_running: false,
         parked: false,
         verb_failed: false,
+        amp_init_done: false,
         cad: 0,
         codec_vendor: 0,
         afg: 0,
@@ -1227,6 +1231,7 @@ impl Hda {
         if self.codec_vendor != REALTEK_ALC298 {
             return;
         }
+        self.replay_alc298_amp_init();
         let old = self.read_realtek_coef(REALTEK_EAPD_COEF_INDEX);
         if self.verb_failed {
             return;
@@ -1236,6 +1241,30 @@ impl Hda {
             self.write_realtek_coef(REALTEK_EAPD_COEF_INDEX, new);
         }
         crate::println!("hda: alc298 coef10 {:#06x}->{:#06x}", old, new);
+    }
+
+    /// Program the ALC298's vendor DSP so the speaker amp actually produces
+    /// sound. The laptop speaker is silent after a COLD boot without this —
+    /// the tiny coef10 poke below only helps when a previous Linux boot
+    /// already ran the full Windows-driver sequence and its state survived
+    /// the warm reboot. Once per boot: DSP/COEF state rides out CRST link
+    /// resets, so unpark's configure_path re-entry skips the ~2000 verbs.
+    fn replay_alc298_amp_init(&mut self) {
+        if self.amp_init_done {
+            return;
+        }
+        for &v in crate::kernel::alc298_amp::AMP_INIT {
+            self.verb(REALTEK_VENDOR_NID, v);
+            if self.verb_failed {
+                crate::println!("hda: alc298 amp init aborted (codec stopped responding)");
+                return;
+            }
+        }
+        self.amp_init_done = true;
+        crate::println!(
+            "hda: alc298 amp init replayed ({} verbs)",
+            crate::kernel::alc298_amp::AMP_INIT.len()
+        );
     }
 
     /// Encode a 16-bit stereo stream format for `rate` (HDA SDFMT / converter
