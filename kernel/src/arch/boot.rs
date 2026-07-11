@@ -144,11 +144,16 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // are rendered as backlog.
     crate::fbcon::early(info);
 
-    lib::println!("\x1b[96mRetroOS Rust Kernel\x1b[0m");
+    // The screen license: constructed HERE, once, and moved down the boot
+    // chain (fbcon::init → timer_selftest → startup). On-screen kernel text
+    // exists only where this value is; ambient println! is log-only.
+    let mut screen = lib::vga::Screen::new();
+
+    lib::screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
     paging2::finish_setup_paging();
 
-    lib::println!("kernel_phys: {:#x}", KERNEL_PHYS);
+    lib::screenln!(screen, "kernel_phys: {:#x}", KERNEL_PHYS);
 
     let kernel_low_page = (KERNEL_PHYS / PAGE_SIZE) as u64;
     let kernel_high_page = (KERNEL_PHYS + kernel_size).div_ceil(PAGE_SIZE) as u64;
@@ -164,14 +169,14 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         kernel_high_page,
     );
 
-    lib::println!("Physical memory: {:#x} pages free", phys_mm::free_page_count());
+    lib::screenln!(screen, "Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
-    lib::println!("Memory regions: {}", mmap_count);
+    lib::screenln!(screen, "Memory regions: {}", mmap_count);
     for entry in mmap_entries {
         if entry.typ == 1 {
             let base = entry.base;
             let length = entry.length;
-            lib::println!("  Available: {:#x} - {:#x}", base, base + length);
+            lib::screenln!(screen, "  Available: {:#x} - {:#x}", base, base + length);
         }
     }
 
@@ -180,10 +185,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // faults, phys_mm for the frames) — so every later init phase can paint
     // its panics. The mappings land in the dual-use PDPT page that the
     // compat-mode toggle below reuses, so they survive the switch.
-    crate::fbcon::init(info);
+    crate::fbcon::init(info, &mut screen);
 
     irq::init_interrupts();
-    lib::println!("Interrupts initialized");
+    lib::screenln!(screen, "Interrupts initialized");
 
     // The compat-mode switch was a test harness to force the experimental
     // x64/long-mode path — the kernel normally runs PAE 32-bit. On a real CPU
@@ -196,7 +201,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         let saved = paging2::ensure_trampoline_mapped();
         descriptors::toggle_mode(paging2::toggle_cr3(true));
         paging2::clear_trampoline(saved);
-        lib::println!("Switched to Compat mode");
+        lib::screenln!(screen, "Switched to Compat mode");
     }
 
     // Interrupts are enabled by `enter_ring1` (it sets IF in the IRET frame it
@@ -210,10 +215,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     let astack_guard = (&raw const crate::ARCH_STACK_GUARD) as usize;
     paging2::unmap_kernel_page(kstack_guard);
     paging2::unmap_kernel_page(astack_guard);
-    lib::println!("Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
+    lib::screenln!(screen, "Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
 
-    lib::println!();
-    lib::println!("\x1b[92mHello from Rust kernel!\x1b[0m");
+    lib::screenln!(screen);
+    lib::screenln!(screen, "\x1b[92mHello from Rust kernel!\x1b[0m");
 
     // Read the boot config (QEMU fw_cfg) at the platform boundary, before
     // handing it to the kernel — the kernel no longer pokes firmware ports.
@@ -221,11 +226,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     // Diagnostic: with IF still 0, dump the timer chain to the VGA console so a
     // freeze-at-first-IRQ on real hardware is readable instead of a black hang.
-    irq::timer_selftest();
+    irq::timer_selftest(&mut screen);
 
     descriptors::enter_ring1();
 
-    lib::println!("Ring1 entered, paging + interrupts + syscall setup complete");
+    lib::screenln!(screen, "Ring1 entered, paging + interrupts + syscall setup complete");
 
     // The arch backend handle, threaded as `&mut` through the kernel from here
     // on so its mutable state is borrow-checked rather than global. Lives for
@@ -237,9 +242,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // above does not allocate, matching the previous order where startup() did
     // this as its first step). Hosted installs std's allocator instead.
     ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
-    lib::println!("Heap base: {:#x}", arch::heap_base());
+    lib::screenln!(screen, "Heap base: {:#x}", arch::heap_base());
 
-    crate::kernel::startup::startup(&mut machine, &config);
+    crate::kernel::startup::startup(&mut machine, &config, screen);
 }
 
 /// Read QEMU's fw_cfg interface into a `BootConfig` (headless cmdline/cwd,
@@ -305,27 +310,24 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // panic mid-stream can wedge the codec until a cold power-off.
     crate::kernel::hda::emergency_quiesce();
 
-    // Mirror to both VGA (println) and debugcon (dbg_println) so panic
-    // shows up in out.log too, not just on the QEMU display.
-    crate::println!();
-    crate::println!("\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
-    crate::dbg_println!();
-    crate::dbg_println!("!!! KERNEL PANIC !!!");
+    // The screen license lives somewhere up the dead call chain; a panic
+    // doesn't follow the ownership rules — they protect a running program's
+    // screen, and nothing runs after this. Build a fresh writer and render.
+    // Screen writes mirror to the log stream, so debugcon/klog get every
+    // line too — no separate dbg_println! needed.
+    let mut screen = lib::vga::Screen::new();
+    screen.clear();
 
+    lib::screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
     if let Some(location) = info.location() {
-        crate::println!("at {}:{}", location.file(), location.line());
-        crate::dbg_println!("at {}:{}", location.file(), location.line());
+        lib::screenln!(screen, "at {}:{}", location.file(), location.line());
     } else {
-        crate::println!("at <unknown location>");
-        crate::dbg_println!("at <unknown location>");
+        lib::screenln!(screen, "at <unknown location>");
     }
+    lib::screenln!(screen, "  {}", info.message());
+    lib::screenln!(screen);
 
-    crate::println!("  {}", info.message());
-    crate::dbg_println!("  {}", info.message());
-    crate::println!();
-    crate::dbg_println!();
-
-    crate::kernel::stacktrace::stack_trace();
+    crate::kernel::stacktrace::stack_trace(&mut screen);
 
     arch::halt_forever();
 }

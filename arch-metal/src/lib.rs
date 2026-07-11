@@ -116,9 +116,24 @@ pub use calls::*;
 pub use x86::shutdown;
 
 /// Disable interrupts and halt forever. For panic / shutdown failure.
+/// Callable from either privilege level: `hlt` is CPL-0-only, so the ring-1
+/// kernel must drop to ring 0 via the HALT arch call — executing it directly
+/// #GPs, which used to bounce every ring-1 panic/shutdown through a second
+/// "Unexpected interrupt in kernel" panic before coming to rest at ring 0.
 pub fn halt_forever() -> ! {
-    x86::cli();
-    loop { x86::hlt(); }
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack)) };
+    if cs & 3 == 0 {
+        x86::cli();
+        loop { x86::hlt(); }
+    }
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") traps::arch_call::HALT as u32,
+            options(noreturn),
+        );
+    }
 }
 
 // TODO: migrate to arch calls

@@ -7,7 +7,6 @@ extern crate ext4_view;
 
 use crate::Regs;
 use crate::kernel::{vfs, tarfs::TarFs, ext4fs::Ext4Fs};
-use crate::println;
 use crate::kernel::thread;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
@@ -19,7 +18,7 @@ static mut EXT4_FS: Option<&'static Ext4Fs> = None;
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
-pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
+pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut screen: crate::vga::Screen) -> ! {
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
@@ -31,7 +30,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // Pick the boot disk: ATA where present, NVMe on UEFI-class machines —
     // before the platform probe, which reads the MBR for the Media verdict.
     crate::kernel::block::init(machine);
-    println!("Block devices initialized");
+    crate::screenln!(screen, "Block devices initialized");
 
     // Probe the machine ONCE and freeze the result; all hardware policy
     // (VGA passthrough, BIOS choice, audio, media/mounts, console, IOPB)
@@ -42,17 +41,17 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
     let mut threads = crate::kernel::thread::init_threading();
-    println!("Threading initialized");
+    crate::screenln!(screen, "Threading initialized");
 
     // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
     crate::kernel::dos::set_c_root(boot.c_root());
 
-    mount_filesystems(platform);
+    mount_filesystems(platform, &mut screen);
     init_device_policy(machine, platform);
     let master_env = load_master_env();
     init_console_pipe();
 
-    run(machine, boot, &master_env, &mut threads)
+    run(machine, boot, &master_env, &mut threads, screen)
 }
 
 /// The host filesystem (COM1 transport). Mounted at /host beside a disk
@@ -75,12 +74,12 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
 /// /boot is an INVARIANT: the embedded bootfs (DN + COMMAND.COM), mounted on
 /// top of whatever the root is — the disk's 0xDA boot-bundle partition is
 /// bootloader-only and never mounted.
-fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
+fn mount_filesystems(platform: &'static crate::kernel::platform::Platform, screen: &mut crate::vga::Screen) {
     use crate::kernel::platform::Media;
 
     match platform.media {
         Media::DiskRoot { ext4_lba, extra_ext, hostfs } => {
-            println!("ext4 root at sector {:#x}", ext4_lba);
+            crate::screenln!(screen, "ext4 root at sector {:#x}", ext4_lba);
             match Ext4Fs::new(ext4_lba) {
                 Ok(fs) => {
                     let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
@@ -102,21 +101,21 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform) {
                     Ok(fs) => {
                         let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                         vfs::mount(SUBDIRS[i], leaked);
-                        println!("ext4 partition at sector {:#x} → /disk{}", lba, i + 1);
+                        crate::screenln!(screen, "ext4 partition at sector {:#x} → /disk{}", lba, i + 1);
                     }
-                    Err(e) => println!("ext4 partition at {:#x} skipped: {}", lba, e),
+                    Err(e) => crate::screenln!(screen, "ext4 partition at {:#x} skipped: {}", lba, e),
                 }
             }
             if hostfs {
                 vfs::mount(b"host/", host_fs());
-                println!("hostfs mounted at /host");
+                crate::screenln!(screen, "hostfs mounted at /host");
             }
         }
         Media::HostRoot => {
             // The host filesystem IS the VFS root: Linux binaries see /usr,
             // /lib, /etc natively; DOS C: is the /home/retroos subtree.
             vfs::mount(b"", host_fs());
-            println!("hostfs mounted as root");
+            crate::screenln!(screen, "hostfs mounted as root");
         }
         Media::Diskless => {}
     }
@@ -194,7 +193,7 @@ fn init_console_pipe() {
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the interactive DN loop.
-fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8], threads: &mut [thread::Thread<A>]) -> ! {
+fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8], threads: &mut [thread::Thread<A>], mut screen: crate::vga::Screen) -> ! {
     if let Some(raw) = boot.cmdline() {
         // CWD: explicit `opt/cwd` key wins; else fall back to each program's
         // own directory.
@@ -218,13 +217,13 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
                     &path[..cwd_end]
                 }
             };
-            println!("Starting {} {} (cwd={})...",
+            crate::screenln!(screen, "Starting {} {} (cwd={})...",
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
             run_program(machine, threads, path, tail, cwd, master_env, boot.debug_watch);
         }
-        println!("All commands done — shutting down.");
+        crate::screenln!(screen, "All commands done — shutting down.");
         crate::kernel::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }
@@ -235,13 +234,13 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.
 
-    println!("Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
+    crate::screenln!(screen, "Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
 
-    println!("Starting DN...");
+    crate::screenln!(screen, "Starting DN...");
     let dn_path = [crate::kernel::dos::c_root(), b"boot/DN/DN.COM"].concat();
     loop {
         run_program(machine, threads, &dn_path, b"", b"", master_env, boot.debug_watch);
-        println!("DN exited, restarting...");
+        crate::screenln!(screen, "DN exited, restarting...");
     }
 }
 
@@ -287,13 +286,13 @@ fn run_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>
     let cwd = cwd.to_vec();
     let env = env.to_vec();
 
-    // Hand the screen off to the user. From here on, kernel println!/print!
-    // go to debugcon only — VGA writes from the kernel would otherwise
-    // corrupt user-space pixel data when the program is in graphics mode
-    // (CGA modes use B8000 as a pixel framebuffer, identical address to
-    // text-mode char+attr storage). dos_putchar's direct VGA writes are
-    // not gated by this flag and continue to work for text-mode programs.
-    crate::vga::KERNEL_OWNS_SCREEN.store(false, core::sync::atomic::Ordering::Relaxed);
+    // No screen handoff bookkeeping: on-screen kernel text requires the
+    // `Screen` value, which our caller holds and does not touch until this
+    // program's world ends — so kernel logs cannot trample user-space pixel
+    // data when the program is in graphics mode (CGA modes use B8000 as a
+    // pixel framebuffer, identical address to text-mode char+attr storage).
+    // dos_putchar's direct VGA writes are the program's own output, not
+    // kernel text, and keep working for text-mode programs.
 
     machine.set_debug_watch(None);
 

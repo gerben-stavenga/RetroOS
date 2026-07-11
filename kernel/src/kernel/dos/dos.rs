@@ -649,7 +649,13 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         // re-wedged the ALC298 the SHUTDOWN command exists to protect).
         0x08 => {
             crate::kernel::hda::emergency_quiesce();
-            crate::println!("It is now safe to turn off your computer.");
+            // Diverging path: the machine halts here, so like the panic
+            // handler we don't chase the screen license up the (now
+            // irrelevant) call chain — build a writer and render the
+            // farewell over whatever the program left on screen.
+            let mut screen = crate::vga::Screen::new();
+            screen.clear();
+            crate::screenln!(screen, "It is now safe to turn off your computer.");
             if crate::kernel::platform::get().host == crate::kernel::platform::Host::Metal {
                 machine.halt_forever();
             }

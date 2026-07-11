@@ -190,7 +190,9 @@ fn main() {
     if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }
 
     let mut machine = arch::Interp;
-    kernel::startup(&mut machine, &config);
+    // The screen license (see lib::vga::Screen): hosted constructs it here,
+    // mirroring the metal boot_kernel — one per boot, moved into startup.
+    kernel::startup(&mut machine, &config, kernel::vga::Screen::new());
 }
 
 /// Inject the interp backend into the backend-agnostic kernel: its port I/O

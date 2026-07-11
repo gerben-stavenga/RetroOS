@@ -105,6 +105,7 @@ pub mod arch_call {
     pub const REARM_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
+    pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -254,6 +255,12 @@ fn arch_dispatch(regs: &mut Regs) {
         }
         arch_call::FREE_PHYS_CONTIG => {
             crate::phys_mm::free_phys_contig(regs.rdx, regs.rcx as usize);
+        }
+        // HALT: the ring-1 kernel cannot `hlt` (CPL-0-only, #GPs); panic and
+        // shutdown funnel here to die quietly at ring 0.
+        arch_call::HALT => {
+            x86::cli();
+            loop { x86::hlt(); }
         }
         arch_call::REARM_IRQ => {
             crate::irq::rearm_irq(regs.rdx as u8);

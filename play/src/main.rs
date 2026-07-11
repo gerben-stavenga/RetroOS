@@ -148,7 +148,8 @@ fn main() {
             config.set_c_root(c.as_bytes());
         }
         let mut machine = arch::Interp;
-        kernel::startup(&mut machine, &config);
+        // The screen license (see lib::vga::Screen): one per boot, moved in.
+        kernel::startup(&mut machine, &config, kernel::vga::Screen::new());
     });
 
     display::run() // main thread: SDL loop; exits the process on window close

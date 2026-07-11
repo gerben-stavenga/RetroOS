@@ -550,7 +550,7 @@ fn init_mouse() -> bool {
 ///
 /// If both pass but the kernel still freezes, the break is CPU delivery —
 /// LINT0 / virtual-wire routing through the (x2)APIC, the known UEFI failure.
-pub fn timer_selftest() {
+pub fn timer_selftest(screen: &mut lib::vga::Screen) {
     // --- 1. PIT channel 0 counting? Sample the latched counter several times.
     let mut samples = [0u16; 8];
     for s in samples.iter_mut() {
@@ -562,7 +562,7 @@ pub fn timer_selftest() {
         for _ in 0..2000 { let _ = inb(0x80); }
     }
     let counting = samples.iter().any(|&v| v != samples[0]);
-    lib::println!(
+    lib::screenln!(screen,
         "SELFTEST PIT counting={} samples={:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
         counting as u8,
         samples[0], samples[1], samples[2], samples[3],
@@ -581,7 +581,7 @@ pub fn timer_selftest() {
     }
     outb(MASTER_CMD, 0x0B);
     let mask = inb(MASTER_DATA);
-    lib::println!(
+    lib::screenln!(screen,
         "SELFTEST PIC master IRR(seen)={:08b} IMR={:08b} IRQ0_pending={} IRQ0_masked={}",
         irr_seen, mask, irr_seen & 1, mask & 1,
     );
@@ -595,12 +595,12 @@ pub fn timer_selftest() {
         let mode = if base & (1 << 11) == 0 { "disabled" }
             else if base & (1 << 10) != 0 { "x2apic" }
             else { "xapic" };
-        lib::println!(
+        lib::screenln!(screen,
             "SELFTEST APIC base={:#x} mode={} (LINT0 ExtINT route is what carries IRQ0)",
             base, mode,
         );
     } else {
-        lib::println!("SELFTEST APIC none (pure-PIC machine, INTR direct)");
+        lib::screenln!(screen, "SELFTEST APIC none (pure-PIC machine, INTR direct)");
     }
 
     // --- 4. CPU timer capabilities — picks the LAPIC-timer calibration path
@@ -611,7 +611,7 @@ pub fn timer_selftest() {
         vd as u8, (vd >> 8) as u8, (vd >> 16) as u8, (vd >> 24) as u8,
         vc as u8, (vc >> 8) as u8, (vc >> 16) as u8, (vc >> 24) as u8,
     ];
-    lib::println!(
+    lib::screenln!(screen,
         "SELFTEST CPU vendor={} family={} tsc_deadline={} x2apic_cap={} invtsc={}",
         core::str::from_utf8(&vendor).unwrap_or("????????????"),
         family,
@@ -620,15 +620,15 @@ pub fn timer_selftest() {
     );
     if maxleaf >= 0x15 {
         let (den, num, crystal, _) = crate::x86::cpuid(0x15);
-        lib::println!("SELFTEST CPUID.15H den={} num={} crystal_hz={}", den, num, crystal);
+        lib::screenln!(screen, "SELFTEST CPUID.15H den={} num={} crystal_hz={}", den, num, crystal);
     } else {
-        lib::println!("SELFTEST CPUID.15H unavailable (maxleaf={:#x})", maxleaf);
+        lib::screenln!(screen, "SELFTEST CPUID.15H unavailable (maxleaf={:#x})", maxleaf);
     }
     if maxleaf >= 0x16 {
         let (base_mhz, max_mhz, bus_mhz, _) = crate::x86::cpuid(0x16);
-        lib::println!("SELFTEST CPUID.16H base={}MHz max={}MHz bus={}MHz", base_mhz, max_mhz, bus_mhz);
+        lib::screenln!(screen, "SELFTEST CPUID.16H base={}MHz max={}MHz bus={}MHz", base_mhz, max_mhz, bus_mhz);
     } else {
-        lib::println!("SELFTEST CPUID.16H unavailable");
+        lib::screenln!(screen, "SELFTEST CPUID.16H unavailable");
     }
 }
 

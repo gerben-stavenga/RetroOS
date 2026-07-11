@@ -160,7 +160,7 @@ pub fn early(info: &arch::MultibootInfo) -> bool {
 /// Map the framebuffer and start rendering. Called once paging, phys_mm and
 /// the #PF handler are up (the mapping writes demand-allocate page tables),
 /// still at ring 0 — so `paging2` is called directly, not via arch calls.
-pub fn init(info: &arch::MultibootInfo) {
+pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
     if info.flags & arch::MULTIBOOT_INFO_FRAMEBUFFER == 0 || info.framebuffer_type != 1 {
         return;
     }
@@ -173,12 +173,14 @@ pub fn init(info: &arch::MultibootInfo) {
     // (the native little-endian representation of that value) or RGBX memory;
     // use Multiboot's channel metadata instead of assuming one firmware layout.
     let [rp, rs, gp, gs, bp, bs] = info.color_info;
-    lib::println!(
+    lib::screenln!(
+        screen,
         "fbcon: GOP {}x{} pitch={} bpp={} R{}/{} G{}/{} B{}/{} addr={:#x}",
         width, height, pitch, info.framebuffer_bpp, rp, rs, gp, gs, bp, bs, addr
     );
     let Some(format) = PixelFormat::from_multiboot(info) else {
-        lib::println!(
+        lib::screenln!(
+            screen,
             "fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — no display",
             info.framebuffer_bpp, rp, rs, gp, gs, bp, bs
         );
@@ -202,7 +204,7 @@ pub fn init(info: &arch::MultibootInfo) {
         return;
     };
     if width < TEXT_W || height < TEXT_H {
-        lib::println!("fbcon: framebuffer {}x{} too small — no display", width, height);
+        lib::screenln!(screen, "fbcon: framebuffer {}x{} too small — no display", width, height);
         return;
     }
 
@@ -231,7 +233,7 @@ pub fn init(info: &arch::MultibootInfo) {
         paging2::flags::CACHE_DISABLE
     };
     if qemu_tcg {
-        lib::println!("fbcon: QEMU-TCG detected — strong-UC framebuffer (WC not scanned)");
+        lib::screenln!(screen, "fbcon: QEMU-TCG detected — strong-UC framebuffer (WC not scanned)");
     }
     let fb_bytes = pitch * height;
     let page_off = (addr & (PAGE_SIZE as u64 - 1)) as usize;
@@ -249,7 +251,7 @@ pub fn init(info: &arch::MultibootInfo) {
         );
     }
 
-    lib::println!("fbcon: format accepted, native_blit={}", format.is_native());
+    lib::screenln!(screen, "fbcon: format accepted, native_blit={}", format.is_native());
     let stride = pitch / 4;
     let origin = (height - TEXT_H) / 2 * stride + (width - TEXT_W) / 2;
     unsafe { PALETTE = vga_render::fallback_palette(); }

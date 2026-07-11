@@ -49,7 +49,7 @@ pub mod vga;
 // The console macros live in `lib`; re-exporting them at the crate root makes
 // both bare `println!` (crate-wide, via this 2018 path import) and the explicit
 // `crate::println!` / `crate::dbg_println!` paths the kernel uses resolve.
-pub use lib::{print, println, dbg_print, dbg_println};
+pub use lib::{print, println, dbg_print, dbg_println, screenln};
 
 // The backend-agnostic arch contract, re-exported at the crate root: the
 // kernel is written against exactly this surface.

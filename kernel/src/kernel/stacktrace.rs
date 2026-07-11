@@ -7,7 +7,8 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec;
-use crate::{print, println};
+use crate::println;
+use core::fmt::Write;
 use crate::kernel::vfs;
 #[cfg(target_arch = "x86")]
 use core::arch::asm;
@@ -98,20 +99,21 @@ pub fn init_from_tar() {
     }
 }
 
-/// Print a stack trace starting from the caller of this function. Used by the
-/// panic handler; skips its own frame so the first line is whoever panicked.
-/// Only the metal boot path uses this entry; the hosted backend traces via
-/// `stack_trace_regs`.
+/// Write a stack trace starting from the caller of this function. Used by the
+/// panic handler, which passes its rule-free `Screen` so the trace lands on
+/// the display (and, mirrored, in the log); skips its own frame so the first
+/// line is whoever panicked. Only the metal boot path uses this entry; the
+/// hosted backend traces via `stack_trace_regs`.
 #[cfg(target_arch = "x86")]
-pub fn stack_trace() {
+pub fn stack_trace(out: &mut dyn Write) {
     let bp: usize;
     unsafe { asm!("mov {}, ebp", out(reg) bp); }
     // Pre-advance one hop so `walk` starts at our caller's frame (panic's, say).
     let caller_bp = if bp != 0 {
         unsafe { *(bp as *const u32) as u64 }
     } else { 0 };
-    println!("Stack trace:");
-    walk(caller_bp, 0, false);
+    let _ = writeln!(out, "Stack trace:");
+    walk(out, caller_bp, 0, false);
 }
 
 /// Print a stack trace for a saved interrupt context (F12 debug hotkey, etc).
@@ -122,22 +124,23 @@ pub fn stack_trace() {
 ///   - Ring 0 (arch self-reentry): rbp is mid-asm garbage — stop.
 ///   - Ring 3 / VM86 (user): rbp points into untrusted user memory — stop.
 pub fn stack_trace_regs(regs: &crate::Regs) {
-    println!("Stack trace:");
-    print_frame(0, regs.ip());
+    let mut out = lib::vga::DebugCon;
+    let _ = writeln!(out, "Stack trace:");
+    print_frame(&mut out, 0, regs.ip());
     if (regs.frame.cs & 3) == 1 {
         let user_64 = regs.mode() == crate::UserMode::Mode64;
-        walk(regs.rbp, 1, user_64);
+        walk(&mut out, regs.rbp, 1, user_64);
     }
 }
 
-/// Print one line of the backtrace.
-fn print_frame(depth: usize, ip: u64) {
+/// Write one line of the backtrace.
+fn print_frame(out: &mut dyn Write, depth: usize, ip: u64) {
     let (name, offset) = lookup_symbol(ip);
-    print!("  {:2}: {:#010x}", depth, ip);
+    let _ = write!(out, "  {:2}: {:#010x}", depth, ip);
     if !name.is_empty() {
-        print!(" {}+{:#x}", rustc_demangle::demangle(name), offset);
+        let _ = write!(out, " {}+{:#x}", rustc_demangle::demangle(name), offset);
     }
-    println!();
+    let _ = writeln!(out);
 }
 
 /// Walk the ebp/rbp chain starting at `bp`. Each iteration reads the frame's
@@ -150,7 +153,7 @@ fn print_frame(depth: usize, ip: u64) {
 /// junk for ring-0/arch self-reentry, untrusted for ring-3 user. The trap
 /// context itself is shown via `stack_trace_regs`, which prints regs.rip
 /// up front and decides whether to chain into ring-1 from there.
-fn walk(mut bp: u64, mut depth: usize, user_64: bool) {
+fn walk(out: &mut dyn Write, mut bp: u64, mut depth: usize, user_64: bool) {
     // The trap-entry boundary is an `entry.asm` label (metal only). The hosted
     // process has no such boundary, so the chain just walks to its natural end.
     #[cfg(target_arch = "x86")]
@@ -172,13 +175,13 @@ fn walk(mut bp: u64, mut depth: usize, user_64: bool) {
         };
         if ip == 0 || ip < 0x1000 { break; }
         if ip == isr_dispatch { break; }
-        print_frame(depth, ip);
+        print_frame(out, depth, ip);
         bp = next_bp;
         depth += 1;
     }
 
     if depth == MAX_DEPTH {
-        println!("  ... (truncated)");
+        let _ = writeln!(out, "  ... (truncated)");
     }
 }
 

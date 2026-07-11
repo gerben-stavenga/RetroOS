@@ -7,7 +7,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use lib::{elf::Elf, md5, println, tar::TarHeader, vga};
+use lib::{elf::Elf, md5, screenln, tar::TarHeader};
 
 /// Verify the MD5 of the loaded kernel against `kernel.elf.md5` in the TAR
 /// before jumping to it. Useful when iterating on the bootloader itself, to
@@ -308,13 +308,15 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         }
     }
 
-    // Clear screen and print banner
-    vga::vga().clear();
-    println!("\x1b[92mRetroOS Rust Bootloader\x1b[0m");
+    // The bootloader owns the whole machine: construct the screen license
+    // (see lib::vga::Screen) for its lifetime. Clear and print the banner.
+    let mut screen = lib::vga::Screen::new();
+    screen.clear();
+    screenln!(screen, "\x1b[92mRetroOS Rust Bootloader\x1b[0m");
 
     // Enable A20 line
     enable_a20();
-    println!("A20 enabled");
+    screenln!(screen, "A20 enabled");
 
     // Read filesystem LBA from MBR partition table entry 1
     let fs_lba = unsafe {
@@ -328,18 +330,18 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         let (md5_lba, md5_size) = match tar_find_file(drive, fs_lba, md5_path) {
             Some(result) => result,
             None => {
-                println!("Error: kernel.elf.md5 not found");
+                screenln!(screen, "Error: kernel.elf.md5 not found");
                 halt();
             }
         };
         if md5_size != 16 {
-            println!("Error: invalid md5 file size");
+            screenln!(screen, "Error: invalid md5 file size");
             halt();
         }
         // Need a 512-byte buffer since TAR reads full blocks.
         let mut md5_block = [0u8; 512];
         if !tar_read_file(drive, md5_lba, md5_block.as_mut_ptr(), 16) {
-            println!("Error: failed to read md5 file");
+            screenln!(screen, "Error: failed to read md5 file");
             halt();
         }
         md5_block[..16].try_into().unwrap()
@@ -352,12 +354,12 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
     let (kernel_lba, kernel_size) = match tar_find_file(drive, fs_lba, kernel_path) {
         Some(result) => result,
         None => {
-            println!("Error: kernel.elf not found");
+            screenln!(screen, "Error: kernel.elf not found");
             halt();
         }
     };
 
-    println!("Loading kernel size {:#x}", kernel_size);
+    screenln!(screen, "Loading kernel size {:#x}", kernel_size);
 
     // Load ELF to high memory in chunks (BIOS can only read to <1MB)
     let low_buf = LOW_BUFFER as *mut u8;
@@ -371,7 +373,7 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
 
         // Read to low memory via BIOS
         if !read_disk(drive, lba, sectors, low_buf) {
-            println!("Error: failed to read kernel");
+            screenln!(screen, "Error: failed to read kernel");
             halt();
         }
 
@@ -389,17 +391,17 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         let mut computed_md5 = [0u8; 16];
         md5::compute(elf_slice, &mut computed_md5);
         if expected_md5 != computed_md5 {
-            println!("Error: kernel MD5 mismatch!");
+            screenln!(screen, "Error: kernel MD5 mismatch!");
             halt();
         }
-        println!("MD5 verified");
+        screenln!(screen, "MD5 verified");
     }
 
     // Parse ELF from high memory
     let elf = match Elf::parse(elf_slice) {
         Ok(e) => e,
         Err(_) => {
-            println!("Error: invalid ELF");
+            screenln!(screen, "Error: invalid ELF");
             halt();
         }
     };
@@ -408,7 +410,7 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
     let seg0 = elf.segments().next().unwrap();
     let entry_phys = elf.entry() as u32 - seg0.vaddr as u32 + seg0.paddr as u32;
 
-    println!("Loading segments...");
+    screenln!(screen, "Loading segments...");
 
     // Load ELF segments at their physical addresses (p_paddr from AT() directives)
     for seg in elf.segments() {
@@ -448,7 +450,7 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         ext: [0; 17],
     };
 
-    println!("Starting kernel...");
+    screenln!(screen, "Starting kernel...");
 
     // Jump to kernel with EAX=magic, EBX=info pointer (Multiboot convention)
     unsafe {
@@ -462,14 +464,18 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
     }
 }
 
-/// Panic handler - required for no_std
+/// Panic handler - required for no_std. Diverging path: builds its own
+/// screen writer rather than threading the entry fn's down (see
+/// lib::vga::Screen — the rules protect a running program; nothing runs
+/// after this).
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!();
-    println!("\x1b[91m!!! PANIC !!!\x1b[0m");
+    let mut screen = lib::vga::Screen::new();
+    screenln!(screen);
+    screenln!(screen, "\x1b[91m!!! PANIC !!!\x1b[0m");
 
     if let Some(location) = info.location() {
-        println!("at {}:{}", location.file(), location.line());
+        screenln!(screen, "at {}:{}", location.file(), location.line());
     }
 
     loop {

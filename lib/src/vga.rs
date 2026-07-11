@@ -165,28 +165,51 @@ impl Vga {
     }
 }
 
-impl Write for Vga {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        // Pure renderer: write cells into the framebuffer only. The debug
-        // console / output stream (port 0xE9) is the embedder's concern — it
-        // crosses the arch boundary, which `lib` sits below.
-        if KERNEL_OWNS_SCREEN.load(core::sync::atomic::Ordering::Relaxed) {
-            for byte in s.bytes() {
-                self.putchar(byte);
-            }
-        }
-        Ok(())
+/// The license to render kernel text on the display, tracked purely by move
+/// semantics — no flag, no registry, no global. The platform entry constructs
+/// exactly one and the boot call chain owns it (bootloader / `boot_kernel` →
+/// `startup`); while a user program runs, `startup` holds the value without
+/// writing, so kernel logs cannot trample the user's framebuffer (in CGA/EGA
+/// graphics modes the same B8000 bytes are the program's pixel data). A call
+/// site without the value simply has no way to draw: the ambient `println!` /
+/// `dbg_println!` macros feed only the log stream.
+///
+/// Diverging paths — panic, SHUTDOWN — construct their own writer instead of
+/// reaching for the holder: the ownership rules protect a *running* program's
+/// screen, and theirs is dead, never to run again.
+///
+/// A focused program's own console output (`putchar` / DOS teletype) is the
+/// program writing its own screen and takes no license.
+pub struct Screen(());
+
+impl Screen {
+    /// See the type docs: platform entry (once per boot) and diverging
+    /// paths (panic/shutdown) only.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Screen(())
+    }
+
+    /// Reset to a blank screen. Panic/shutdown banners start clean: the cells
+    /// hold whatever the previous owner drew — raw pixel bytes, if it died in
+    /// a graphics mode.
+    pub fn clear(&mut self) {
+        let v = vga();
+        v.attr = 0x07;
+        v.clear();
     }
 }
 
-/// Whether `println!`/`print!` should write to the VGA framebuffer in addition
-/// to debugcon. True at boot so kernel POST messages appear on screen; flipped
-/// to false once the first DOS thread starts running, so kernel runtime logs
-/// stop trampling the user's framebuffer (which is especially harmful in
-/// CGA/EGA graphics modes where char+attr writes corrupt pixel data).
-/// `dos_putchar` calls `vga().putchar(c)` directly and is not gated by this.
-pub static KERNEL_OWNS_SCREEN: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
+impl Write for Screen {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            vga().putchar(b);
+            stream(b);
+        }
+        text_flush();
+        Ok(())
+    }
+}
 
 /// Global VGA state
 static mut VGA: Vga = Vga::new();
@@ -269,25 +292,6 @@ pub fn putchar(c: u8) {
     text_flush();
 }
 
-/// Console writer behind `print!`/`println!`: renders to the framebuffer when
-/// the kernel owns the screen, and always mirrors to the sink stream.
-pub struct Console;
-impl Write for Console {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let to_screen = KERNEL_OWNS_SCREEN.load(core::sync::atomic::Ordering::Relaxed);
-        for b in s.bytes() {
-            if to_screen {
-                vga().putchar(b);
-            }
-            stream(b);
-        }
-        if to_screen {
-            text_flush();
-        }
-        Ok(())
-    }
-}
-
 /// Debug-console-only writer (the sink stream, never the framebuffer).
 pub struct DebugCon;
 impl Write for DebugCon {
@@ -299,22 +303,39 @@ impl Write for DebugCon {
     }
 }
 
-/// Print formatted text (framebuffer when kernel-owned + sink mirror).
+/// Print formatted text to the log stream (debugcon sink + klog). Never the
+/// screen: on-screen text requires holding the [`Screen`] value — use
+/// `screenln!`. (Kept alongside `dbg_print!` so the kernel's existing log
+/// call sites keep compiling; the two are now synonyms.)
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        let _ = $crate::vga::Console.write_fmt(format_args!($($arg)*));
+        let _ = $crate::vga::DebugCon.write_fmt(format_args!($($arg)*));
     }};
 }
 
-/// Print formatted text with newline.
+/// `print!` with a newline (log stream only, like `print!`).
 #[macro_export]
 macro_rules! println {
-    () => { $crate::vga::putchar(b'\n') };
+    () => { $crate::print!("\n") };
     ($($arg:tt)*) => {{
         $crate::print!($($arg)*);
         $crate::print!("\n");
+    }};
+}
+
+/// Print one line through an owned [`Screen`]: renders to the display and
+/// mirrors to the log stream. The only formatted path that draws on screen.
+#[macro_export]
+macro_rules! screenln {
+    ($screen:expr) => {{
+        use core::fmt::Write;
+        let _ = ::core::writeln!($screen);
+    }};
+    ($screen:expr, $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = ::core::writeln!($screen, $($arg)*);
     }};
 }
 

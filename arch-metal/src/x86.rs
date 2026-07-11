@@ -370,7 +370,9 @@ pub fn shutdown() -> ! {
     outw(0x604, 0x2000);   // QEMU PIIX (i440FX) ACPI shutdown
     outw(0xB004, 0x2000);  // QEMU pre-1.7 / Bochs
     outw(0x4004, 0x3400);  // VirtualBox
-    loop { hlt(); }
+    // Fallback halt via halt_forever: shutdown() is called from the ring-1
+    // kernel, where a direct `hlt` would #GP (CPL-0-only instruction).
+    crate::halt_forever()
 }
 
 /// GDT pointer structure

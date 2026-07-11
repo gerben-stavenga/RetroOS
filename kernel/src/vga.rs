@@ -8,6 +8,6 @@
 //! root (see `lib.rs`) so `crate::println!` and bare `println!` keep working.
 
 pub use lib::vga::{
-    vga, Vga, KERNEL_OWNS_SCREEN,
-    set_debug_sink, debug_byte, putchar, Console, DebugCon,
+    vga, Vga, Screen,
+    set_debug_sink, debug_byte, putchar, DebugCon,
 };
