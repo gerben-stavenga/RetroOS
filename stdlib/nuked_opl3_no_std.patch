@@ -1,0 +1,180 @@
+diff -ruN orig/src/core.rs patched/src/core.rs
+--- a/src/core.rs	2026-07-11 01:30:35.197925386 -0700
++++ b/src/core.rs	2026-07-11 02:05:47.904338460 -0700
+@@ -324,7 +324,53 @@
+     }
+ 
+     pub(crate) fn reset(&mut self, sample_rate: u32) {
+-        *self = Self::default();
++        // In-place, field-by-field reset. `*self = Self::default()` (and the
++        // by-value construction in `new`) materialize the ~20 KB Chip as a
++        // stack temporary, which overflows small kernel stacks; per-element
++        // loops keep the largest temporary at one array element.
++        for c in self.channels.iter_mut() {
++            *c = Channel::default();
++        }
++        for s in self.slots.iter_mut() {
++            *s = Slot::default();
++        }
++        self.outputs = [0; 74];
++        self.timer = 0;
++        self.eg_timer = 0;
++        self.eg_timerrem = 0;
++        self.eg_state = 0;
++        self.eg_add = 0;
++        self.eg_timer_lo = 0;
++        self.newm = 0;
++        self.nts = 0;
++        self.rhy = 0;
++        self.vibpos = 0;
++        self.vibshift = 0;
++        self.tremolo = 0;
++        self.tremolopos = 0;
++        self.tremoloshift = 0;
++        self.noise = 0;
++        self.noise_hh = 0;
++        self.noise_sd = 0;
++        self.mixbuff = [0; 4];
++        self.rm_hh_bit2 = 0;
++        self.rm_hh_bit3 = 0;
++        self.rm_hh_bit7 = 0;
++        self.rm_hh_bit8 = 0;
++        self.rm_tc_bit3 = 0;
++        self.rm_tc_bit5 = 0;
++        self.stereoext = 0;
++        self.rateratio = 0;
++        self.samplecnt = 0;
++        self.oldsamples = [0; 4];
++        self.samples = [0; 4];
++        self.writebuf_samplecnt = 0;
++        self.writebuf_cur = 0;
++        self.writebuf_last = 0;
++        self.writebuf_lasttime = 0;
++        for w in self.writebuf.iter_mut() {
++            *w = WriteBuf::default();
++        }
+ 
+         for slotnum in 0..36 {
+             self.slots[slotnum] = Slot {
+@@ -1191,11 +1237,16 @@
+     }
+ 
+     fn channel_write_d0(&mut self, channel: usize, data: u8) {
++        // stereo-ext panning needs f64::sin (std); without the feature
++        // `stereoext` can never be set, so this register is inert.
++        #[cfg(feature = "stereo-ext")]
+         if self.stereoext != 0 {
+             self.channels[channel].leftpan = panpot(data ^ 0xff);
+             self.channels[channel].rightpan = panpot(data);
+             self.refresh_channel_mix_mask(channel);
+         }
++        #[cfg(not(feature = "stereo-ext"))]
++        let _ = (channel, data);
+     }
+ 
+     fn refresh_channel_mix_mask(&mut self, channel: usize) {
+@@ -1403,8 +1454,9 @@
+     ((mask as u32) << 16) as i32
+ }
+ 
++#[cfg(feature = "stereo-ext")]
+ fn panpot(value: u8) -> i32 {
+-    ((value as f64 * std::f64::consts::PI / 512.0).sin() * 65536.0) as i32
++    ((value as f64 * core::f64::consts::PI / 512.0).sin() * 65536.0) as i32
+ }
+ 
+ fn envelope_calc_exp(mut level: u32) -> i16 {
+diff -ruN orig/src/lib.rs patched/src/lib.rs
+--- a/src/lib.rs	2026-07-11 01:30:35.198103668 -0700
++++ b/src/lib.rs	2026-07-11 02:05:47.904862364 -0700
+@@ -5,6 +5,10 @@
+ // Copyright (C) 2026 Tony Gies (Rust port)
+ #![warn(missing_docs)]
+ #![doc = include_str!("./docs.md")]
++// RetroOS: build the synthesis core freestanding. The `std` feature
++// re-enables the Opl3Device wrapper (f64 timers) and Error impls.
++#![no_std]
++extern crate alloc;
+ 
+ /*
+ * Nuked OPL3 is free software: you can redistribute it and/or modify
+@@ -69,8 +73,8 @@
+     MutexLockFailed,
+ }
+ 
+-impl std::fmt::Display for OplError {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++impl ::core::fmt::Display for OplError {
++    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+         match self {
+             OplError::BufferUndersized => write!(f, "Buffer slice provided was too small"),
+             OplError::BufferMismatch => write!(f, "Buffer slices must be equal in length"),
+@@ -80,6 +84,7 @@
+     }
+ }
+ 
++#[cfg(feature = "std")]
+ impl std::error::Error for OplError {}
+ 
+ #[derive(Debug)]
+@@ -108,6 +113,7 @@
+ }
+ 
+ /// The `Opl3Device` maintains two internal timers.
++#[cfg(feature = "std")]
+ #[derive(Default, Debug)]
+ struct OplTimer {
+     enabled: bool,
+@@ -119,6 +125,7 @@
+     elapsed: bool,
+ }
+ 
++#[cfg(feature = "std")]
+ impl OplTimer {
+     fn new(rate: u32) -> Self {
+         OplTimer {
+@@ -182,6 +189,7 @@
+ /// The `Opl3Device` struct provides convenience functions for fully implementing an OPL3 device on
+ /// top of Nuked-OPL3.
+ /// By keeping a copy of all registers written, we can implement a read_register function.
++#[cfg(feature = "std")]
+ pub struct Opl3Device {
+     addr_reg: [u8; 2],
+     sample_rate: u32,
+@@ -193,6 +201,7 @@
+     usec_accumulator: f64,
+ }
+ 
++#[cfg(feature = "std")]
+ impl Opl3Device {
+     /// Create a new OPL3 device instance.
+     /// `Opl3Device` is a convenience wrapper around the Nuked-OPL3's direct wrapper, `Opl3Chip`.
+@@ -501,6 +510,19 @@
+         }
+     }
+ 
++    /// Create the chip directly on the heap. The chip is ~20 KB; `new()`
++    /// materializes it on the stack first, which small (kernel) stacks
++    /// cannot absorb.
++    pub fn new_boxed(sample_rate: u32) -> alloc::boxed::Box<Self> {
++        // SAFETY: Chip is plain integers/arrays (no references, no Drop);
++        // the zeroed bytes are only a placeholder — `reset` rewrites every
++        // field in place before anything reads them.
++        let mut chip: alloc::boxed::Box<Opl3Chip> =
++            unsafe { alloc::boxed::Box::new_zeroed().assume_init() };
++        chip.reset(sample_rate);
++        chip
++    }
++
+     /// Reinitialize the OPL3 chip instance.
+     ///
+     /// # Arguments
+@@ -756,7 +778,7 @@
+     }
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "std"))]
+ mod tests {
+     use super::*;
+ 

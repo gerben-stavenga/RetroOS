@@ -100,6 +100,19 @@ http_archive(
     build_file = "//stdlib:spin.BUILD",
 )
 
+# OPL2/OPL3 FM synthesis (DOS AdLib/SB music). Patched no_std so ONE archive
+# serves both kernel flavours (metal and hosted) — the crate is zero-dep, so
+# it skips the crates.io pin entirely.
+http_archive(
+    name = "nuked_opl3",
+    url = "https://static.crates.io/crates/nuked-opl3/nuked-opl3-0.1.0.crate",
+    type = "tar.gz",
+    strip_prefix = "nuked-opl3-0.1.0",
+    build_file = "//stdlib:nuked_opl3.BUILD",
+    patches = ["//stdlib:nuked_opl3_no_std.patch"],
+    patch_args = ["-p1"],
+)
+
 # Register toolchains
 register_toolchains(
     "@rules_nasm//nasm/toolchain",

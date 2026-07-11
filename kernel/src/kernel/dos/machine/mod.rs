@@ -168,6 +168,7 @@ pub use vga::*;
 // ============================================================================
 pub(super) mod vdma;
 pub(super) use vdma::*;
+pub(super) mod opl;
 pub(super) mod vsb;
 pub(super) use vsb::*;
 /// Policy-free PC machine virtualization — per-thread peripheral state.

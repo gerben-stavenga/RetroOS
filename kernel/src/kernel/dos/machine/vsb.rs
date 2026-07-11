@@ -11,7 +11,8 @@
 //!  - **Emulated** — no card answers (the hosted interpreter, or metal hardware
 //!    with no SB16): a software DSP command FSM + a play cursor synthesize
 //!    playback from the guest's DMA buffer into the canonical kernel `sound`
-//!    API (`audio_tick`), with no real-card interaction at all.
+//!    API (`audio_tick`), with no real-card interaction at all. FM music goes
+//!    through a real OPL2/OPL3 synth ([`opl`](super::opl)) on the same tick.
 
 use crate::Regs;
 use super::*;
@@ -46,13 +47,6 @@ struct EmuDsp {
     /// DSP test register (write 0xE4 → store, read 0xE8 → return). Some card
     /// detection routines round-trip a byte through it to confirm a real DSP.
     test_reg: u8,
-    /// Minimal OPL2 (AdLib FM) state — *just enough to pass FM detection*, no
-    /// synthesis. `opl_index` = the selected register (port 0x388 write);
-    /// `opl_status` = the timer status the detect routine reads from 0x388.
-    /// Without this, FM detection fails and Apogee games exit ("could not
-    /// detect FM chip") before they ever reach digital sound.
-    opl_index: u8,
-    opl_status: u8,
     /// SB16 mixer register index (port base+4 write); its data port is base+5.
     mixer_index: u8,
     /// Mixer reg 0x82 IRQ status: bit0 = 8-bit DMA IRQ pending, bit1 = 16-bit.
@@ -96,7 +90,7 @@ impl EmuDsp {
         EmuDsp {
             out: [0; 4], out_len: 0,
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
-            reset_prev: 0, test_reg: 0, opl_index: 0, opl_status: 0,
+            reset_prev: 0, test_reg: 0,
             mixer_index: 0, irq_status: 0,
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
@@ -126,6 +120,10 @@ impl EmuDsp {
 pub struct SoundBlaster {
     /// The software DSP/DMA engine (used only when emulating).
     emu: EmuDsp,
+    /// FM synthesis (OPL2/OPL3), software-emulated mode only. Lazily created
+    /// on the first FM register write — the chip is ~20 KB per thread and
+    /// most programs never touch FM.
+    opl: Option<opl::OplFm>,
     pub io_base: u16, // BLASTER A — DSP/mixer port base (passthrough target)
     pub irq: u8,      // BLASTER I — guest vPIC IRQ to inject on SB completion
     pub dma8: u8,     // BLASTER D — guest's 8-bit vDMA channel (0..3)
@@ -166,6 +164,7 @@ impl SoundBlaster {
     pub fn new() -> Self {
         Self {
             emu: EmuDsp::new(),
+            opl: None,
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
             dma: Dma8237::new(),
@@ -208,6 +207,7 @@ impl SoundBlaster {
             crate::kernel::sound::stop(machine, true); // session end: power down
             self.emu.out_len = 0;
             self.emu.cmd = None;
+            self.opl = None; // next program gets a power-on-fresh FM chip
             return;
         }
         self.unbind(machine);
@@ -225,11 +225,13 @@ impl SoundBlaster {
         self.last_gen = [0; 8];
     }
 
-    /// SB ports that pass straight through to the real card (QEMU
-    /// `sb16`/`adlib`): the DSP/mixer block `[io_base, io_base+0x10)` and
-    /// the OPL2/3 FM ports 0x388/0x389. Only the 8237 is virtual.
+    /// SB ports this card decodes — the dispatch guard for both modes: the
+    /// DSP/mixer block `[io_base, io_base+0x10)` and the OPL2/3 FM window
+    /// 0x388-0x38B. In passthrough these go straight to the real card (QEMU
+    /// `sb16`/`adlib`); emulated, to the software DSP / FM synth. Only the
+    /// 8237 is virtual in passthrough.
     pub fn is_passthrough(&self, p: u16) -> bool {
-        (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388 | 0x389)
+        (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388..=0x38B)
     }
 
     /// Read an SB DSP/mixer/OPL passthrough port, with a tiny compatibility
@@ -552,10 +554,12 @@ impl SoundBlaster {
 
     /// Emulated DSP/mixer port read.
     fn emu_read(&mut self, p: u16) -> u8 {
-        // OPL2 status register (0x388 or io_base+8): timer-expiry bits the FM
-        // detection routine checks.
-        if p == 0x388 || p == self.io_base + 8 {
-            return self.emu.opl_status;
+        // OPL status register: a read of any FM window port returns the timer
+        // status. Bits 1-2 are always 0 — the "this is an OPL3" answer type
+        // probes look for. Before any FM write there is no chip yet: power-on
+        // status is 0 anyway.
+        if opl::decode_port(self.io_base, p).is_some() {
+            return self.opl.as_ref().map_or(0, |o| o.status());
         }
         match p.wrapping_sub(self.io_base) {
             0x05 => match self.emu.mixer_index {       // mixer data
@@ -584,25 +588,16 @@ impl SoundBlaster {
 
     /// Emulated DSP/mixer port write.
     fn emu_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
-        // OPL2 FM (AdLib 0x388/0x389, or the SB's OPL at io_base+8/+9): index
-        // register select + the timer-control register, enough for detection.
-        if p == 0x388 || p == self.io_base + 8 {
-            self.emu.opl_index = val;
+        // OPL2/OPL3 FM (AdLib 0x388-0x38B, or the SB mirrors at io_base+0..3
+        // and +8/+9): address latch + data writes into the FM synth, created
+        // on first touch. Timer semantics live in `opl.rs` (same instant-
+        // expiry detection behavior as the old stub).
+        if let Some(port) = opl::decode_port(self.io_base, p) {
+            let now = machine.get_ticks();
+            self.opl
+                .get_or_insert_with(|| opl::OplFm::new(now))
+                .write(now, port, val);
             return;
-        }
-        if p == 0x389 || p == self.io_base + 9 {
-            if self.emu.opl_index == 0x04 {
-                // Timer control: bit7 = reset status/IRQ; bit0/1 = start T1/T2.
-                // Detection starts a timer then reads status expecting it
-                // "expired", so set the expiry bits on start (no real timing).
-                if val & 0x80 != 0 {
-                    self.emu.opl_status = 0;
-                } else {
-                    if val & 0x01 != 0 { self.emu.opl_status |= 0xC0; } // T1 → IRQ|T1
-                    if val & 0x02 != 0 { self.emu.opl_status |= 0xA0; } // T2 → IRQ|T2
-                }
-            }
-            return; // other FM registers: no synthesis (music stays silent)
         }
         match p.wrapping_sub(self.io_base) {
             0x04 => self.emu.mixer_index = val, // mixer register select
@@ -620,7 +615,7 @@ impl SoundBlaster {
                 self.emu.reset_prev = val;
             }
             0x0C => self.emu_dsp_byte(machine, val), // DSP command / parameter port
-            _ => {}                         // mixer index/data, OPL: ignored
+            _ => {}                         // unmodeled DSP-block ports: ignored
         }
     }
 
@@ -730,20 +725,38 @@ impl SoundBlaster {
         self.emu.playing = self.emu.buf_frames > 0;
     }
 
-    /// Advance emulated playback by the virtual time elapsed since the last
-    /// call: consume `rate × Δt` ring frames into the kernel sound API and
-    /// raise the SB IRQ for each completed block. Self-pacing — the guest's
-    /// per-block refill keeps up because we consume at exactly its sample rate,
-    /// and the auto-init ring's prime gives the refill latency headroom.
+    /// Advance emulated sound by the virtual time elapsed since the last call:
+    /// the DSP's DMA playback (`dsp_tick`) and the FM synth. Exactly one of
+    /// them produces into the canonical sink at a time — while the DSP stream
+    /// is live it *pulls* FM frames itself (`emit_frames` mixes them in), so
+    /// the FM pump only free-runs when the DSP is silent.
     pub fn audio_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
-        _regs: &mut Regs,
+        regs: &mut Regs,
         vpic: &mut super::vpic::VirtualPic,
     ) {
         if !self.emulated() {
             return;
         }
+        self.dsp_tick(machine, regs, vpic);
+        let dsp_streaming = self.emu.playing;
+        if let Some(opl) = self.opl.as_mut() {
+            opl.tick(machine, dsp_streaming);
+        }
+    }
+
+    /// Advance emulated DSP playback: consume `rate × Δt` ring frames into the
+    /// kernel sound API and raise the SB IRQ for each completed block.
+    /// Self-pacing — the guest's per-block refill keeps up because we consume
+    /// at exactly its sample rate, and the auto-init ring's prime gives the
+    /// refill latency headroom.
+    fn dsp_tick<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        _regs: &mut Regs,
+        vpic: &mut super::vpic::VirtualPic,
+    ) {
         if !self.emu.playing {
             self.emu.last_ms = machine.get_ticks(); // keep Δt small for first tick
             return;
@@ -801,7 +814,9 @@ impl SoundBlaster {
     }
 
     /// Copy `count` ring frames (from `cursor`, wrapping) out of guest memory
-    /// and hand them to the kernel sound layer.
+    /// and hand them to the kernel sound layer. While the FM synth is sounding
+    /// its frames are pulled at the DSP rate and mixed in here — the DSP
+    /// stream owns the sink, and this is the one place its frames pass by.
     fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, count: u64) {
         let channels = if self.emu.stereo { 2u32 } else { 1 };
         let frame_bytes = (self.emu.bits as u32 / 8) * channels;
@@ -820,7 +835,25 @@ impl SoundBlaster {
             let mut scratch = alloc::vec![0u8; (run * frame_bytes) as usize];
             let addr = self.emu.buf_gpa as usize + (pos * frame_bytes) as usize;
             machine.copy_from(addr, &mut scratch);
-            crate::kernel::sound::play(machine, self.emu.rate, fmt, &scratch);
+            if let Some(opl) = self.opl.as_mut().filter(|o| o.mixing()) {
+                // Canonicalize the guest frames here (normally sound::play's
+                // job) so the FM voice can be added per-frame, saturating.
+                let canon = crate::kernel::sound::Format {
+                    bits: 16, signed: true, channels: 2,
+                };
+                let mut mixed = alloc::vec![0u8; run as usize * 4];
+                for i in 0..run as usize {
+                    let (l, r) = fmt.frame(&scratch, i);
+                    let (fl, fr) = opl.mix_frame(self.emu.rate);
+                    let l = (l as i32 + fl as i32).clamp(-32768, 32767) as i16;
+                    let r = (r as i32 + fr as i32).clamp(-32768, 32767) as i16;
+                    mixed[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
+                    mixed[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+                }
+                crate::kernel::sound::play(machine, self.emu.rate, canon, &mixed);
+            } else {
+                crate::kernel::sound::play(machine, self.emu.rate, fmt, &scratch);
+            }
             remaining -= run as u64;
             pos += run;
             if pos >= self.emu.buf_frames {

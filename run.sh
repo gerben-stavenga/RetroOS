@@ -1347,6 +1347,8 @@ launch_hosted() {
     local ENG=""
     [ "$KVM" = 1 ] && ENG="-kvm"
 
+    [ -n "$HOSTED_WAV" ] && ARGS+=(--wav "$HOSTED_WAV")
+
     if [ -n "$HOSTED_TERMINAL" ]; then
         # Headless kernel binary. Hosted build needs the host platform; the repo
         # default pins i686_retro_none.
@@ -1362,7 +1364,6 @@ launch_hosted() {
     # host-platform build — no //:bootfs_tar step that would flip --platforms and
     # discard Bazel's analysis cache every run.
     bazelisk build "//play:retroos-play$ENG" --platforms=@platforms//host
-    [ -n "$HOSTED_WAV" ] && ARGS+=(--wav "$HOSTED_WAV")
     if [ -n "$HOSTED_CMD" ]; then
         ARGS+=(--cwd "$(dirname "$HOSTED_CMD")/")
     fi
