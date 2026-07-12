@@ -10,9 +10,13 @@
 ;               register-select / data-low/high scheme: a 16-bit voice
 ;               register (frequency control) and the global active-voices
 ;               register (readback sets the top two bits).
+;   GTIMER-OK — timer 1 (80 µs units) programmed through the AdLib-shaped
+;               2X8/2X9 window + reg 0x45 IRQ enable + reset-reg master
+;               enable actually raises the ULTRASND IRQ (5 -> INT 0Dh),
+;               and the ISR sees the T1 bit in the 2X6 IRQ status.
 ;
-; Later phases (timers/IRQ, DMA upload, an audible voice) join as the
-; corresponding emulation lands — same file, appended markers.
+; Later phases (DMA upload, an audible voice) join as the corresponding
+; emulation lands — same file, appended markers.
 ; CI: test/hosted_games.sh runs this and asserts every marker.
         org 0x100
 
@@ -91,8 +95,77 @@ start:
         mov ah, 9
         mov dx, msg_reg
         int 0x21
+
+        ; ---- phase 3: timer 1 -> ULTRASND IRQ 5 (INT 0Dh) ----
+        xor ax, ax
+        mov es, ax
+        cli
+        mov word [es:0x0D*4], irq5_isr
+        mov [es:0x0D*4+2], cs
+        in  al, 0x21           ; unmask IRQ 5 on the master PIC
+        and al, 0xDF
+        out 0x21, al
+        sti
+        mov al, 0x4C           ; reset reg: run + DAC + master IRQ enable
+        call selreg
+        mov al, 7
+        call wr8
+        mov al, 0x46           ; T1 count 156: (256-156)*80us = 8 ms period
+        call selreg
+        mov al, 156
+        call wr8
+        mov al, 0x45           ; enable the T1 IRQ
+        call selreg
+        mov al, 0x04
+        call wr8
+        mov dx, 0x248          ; AdLib window: index 4 = timer control
+        mov al, 0x04
+        out dx, al
+        inc dx
+        mov al, 0x01           ; start T1
+        out dx, al
+        mov bx, 0x8000         ; bounded wait for the ISR flag
+.twait: mov cx, 0x0100
+.tw2:   cmp byte [irqflag], 0
+        jne timer_seen
+        loop .tw2
+        dec bx
+        jnz .twait
+        jmp fail_timer
+timer_seen:
+        mov ah, 9
+        mov dx, msg_timer
+        int 0x21
         jmp exit
 
+irq5_isr:
+        push ax
+        push dx
+        mov dx, 0x246          ; GF1 IRQ status: T1 bit?
+        in  al, dx
+        test al, 0x04
+        jz  .eoi               ; not ours: just EOI
+        mov byte [cs:irqflag], 1
+        mov dx, 0x248          ; timer control:
+        mov al, 0x04
+        out dx, al
+        inc dx
+        mov al, 0x80           ;   clear the expiry flags...
+        out dx, al
+        xor al, al             ;   ...and stop both timers
+        out dx, al
+.eoi:   mov al, 0x20
+        out 0x20, al
+        pop dx
+        pop ax
+        iret
+irqflag: db 0
+
+fail_timer:
+        mov ah, 9
+        mov dx, msg_ftm
+        int 0x21
+        jmp exit
 fail_dram:
         mov ah, 9
         mov dx, msg_fd
@@ -156,7 +229,9 @@ set_dram_addr:
         call wr8
         ret
 
-msg_dram: db 'GDRAM-OK', 13, 10, '$'
-msg_reg:  db 'GREG-OK', 13, 10, '$'
-msg_fd:   db 'FAIL-GDRAM', 13, 10, '$'
-msg_fr:   db 'FAIL-GREG', 13, 10, '$'
+msg_dram:  db 'GDRAM-OK', 13, 10, '$'
+msg_reg:   db 'GREG-OK', 13, 10, '$'
+msg_timer: db 'GTIMER-OK', 13, 10, '$'
+msg_fd:    db 'FAIL-GDRAM', 13, 10, '$'
+msg_fr:    db 'FAIL-GREG', 13, 10, '$'
+msg_ftm:   db 'FAIL-GTIMER', 13, 10, '$'

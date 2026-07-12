@@ -78,6 +78,31 @@ struct GusCore {
     /// SB's BLASTER (the guest telling us differs from what its env said
     /// would be a driver bug, not a reconfiguration).
     irq_dma_latch: u8,
+    /// AdLib-compatible window (2X8/2X9) index latch. The GF1 exposes its
+    /// two rate timers through this OPL-shaped port pair (SBOS and tracker
+    /// players clock music off them); index 0x04 is the timer control.
+    adlib_index: u8,
+    timers: [GusTimer; 2],
+    /// Per-voice wave/ramp IRQ pending masks — the FIFO register 0x8F pops
+    /// the lowest set voice. Fed by the engine's Events at playback.
+    wave_pending: u32,
+    ramp_pending: u32,
+    /// `get_ticks()` at the last `tick` (virtual-time pacing anchor).
+    last_ms: u64,
+}
+
+/// One GF1 rate timer. T1 counts 80 µs units, T2 320 µs; each reloads and
+/// keeps running (they are rate generators, not one-shots).
+#[derive(Clone, Copy, Default)]
+struct GusTimer {
+    running: bool,
+    /// AdLib-window mask bit: expiry doesn't reach the status bits.
+    masked: bool,
+    /// Latched expiry — the AdLib-style status flag, cleared by the timer-
+    /// control reset write (2X9 index 4, bit 7).
+    expired: bool,
+    /// µs accumulated toward the next expiry.
+    acc_us: u32,
 }
 
 impl GusCore {
@@ -96,6 +121,11 @@ impl GusCore {
             active_reg: 13, // hardware default: 14 voices
             mix_ctrl: 0x0B, // line/mic off, latches disabled — power-on value
             irq_dma_latch: 0,
+            adlib_index: 0,
+            timers: [GusTimer::default(); 2],
+            wave_pending: 0,
+            ramp_pending: 0,
+            last_ms: 0,
         })
     }
 
@@ -113,6 +143,42 @@ impl GusCore {
         self.active_reg = 13;
         self.reg41 = 0;
         self.reg45 = 0;
+        self.timers = [GusTimer::default(); 2];
+        self.wave_pending = 0;
+        self.ramp_pending = 0;
+    }
+
+    /// The 2X6 IRQ status byte: bit2/3 = timer 1/2 (gated by their reg-0x45
+    /// enables), bit5 wave, bit6 ramp, bit7 DMA TC (lands with the upload).
+    fn irq_status(&self) -> u8 {
+        let mut s = 0u8;
+        if self.timers[0].expired && self.reg45 & 0x04 != 0 {
+            s |= 0x04;
+        }
+        if self.timers[1].expired && self.reg45 & 0x08 != 0 {
+            s |= 0x08;
+        }
+        if self.wave_pending != 0 {
+            s |= 0x20;
+        }
+        if self.ramp_pending != 0 {
+            s |= 0x40;
+        }
+        s
+    }
+
+    /// The AdLib-compatible status byte at 2X8: bit6 = T1 expired, bit5 =
+    /// T2 expired (mask bits suppress), bit7 = either. OPL-shaped on
+    /// purpose — that's what SBOS-era probes poll.
+    fn adlib_status(&self) -> u8 {
+        let mut s = 0u8;
+        if self.timers[0].expired && !self.timers[0].masked {
+            s |= 0xC0;
+        }
+        if self.timers[1].expired && !self.timers[1].masked {
+            s |= 0xA0;
+        }
+        s
     }
 }
 
@@ -159,6 +225,46 @@ impl Gus {
         self.present = false;
     }
 
+    /// Per-quantum device tick, from `machine::audio_tick`: pace the two
+    /// rate timers by virtual time and raise the GF1 IRQ line for enabled,
+    /// unserviced sources. (The playback pump joins this in the next phase.)
+    pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, vpic: &mut super::vpic::VirtualPic) {
+        let Some(c) = self.core.as_mut() else { return };
+        let now = machine.get_ticks();
+        // First tick / long background gap: don't synthesize a backlog.
+        let dt = now.saturating_sub(c.last_ms).min(100) as u32;
+        c.last_ms = now;
+        if dt == 0 {
+            return;
+        }
+        let (reg45, reg46, reg47) = (c.reg45, c.reg46, c.reg47);
+        let mut want_irq = false;
+        for (i, t) in c.timers.iter_mut().enumerate() {
+            if !t.running {
+                t.acc_us = 0;
+                continue;
+            }
+            // T1 counts 80 µs units, T2 320 µs; the count register holds
+            // 256 − n. Multiple expiries inside one ms tick coalesce — an
+            // unserviced edge-latched 8259 line coalesces on hardware too.
+            let unit = if i == 0 { 80u32 } else { 320 };
+            let count = if i == 0 { reg46 } else { reg47 };
+            let period = unit * (256 - count as u32);
+            t.acc_us += dt * 1000;
+            if t.acc_us >= period {
+                t.acc_us %= period;
+                t.expired = true;
+                if reg45 & (0x04 << i) != 0 {
+                    want_irq = true;
+                }
+            }
+        }
+        // Master IRQ enable is reset-register bit 2.
+        if want_irq && c.reset_reg & 0x04 != 0 && !vpic.is_requested(self.irq) {
+            vpic.raise(self.irq);
+        }
+    }
+
     fn core(&mut self) -> &mut GusCore {
         self.core.get_or_insert_with(GusCore::new_boxed)
     }
@@ -172,11 +278,10 @@ impl Gus {
         if lo < 0x10 {
             return match lo {
                 // IRQ status: bit2 T1, bit3 T2, bit5 wave, bit6 ramp,
-                // bit7 DMA-TC, bits0/1 MIDI. Sources land in later commits;
-                // reads must already be well-defined (0 = nothing pending).
-                0x06 => 0,
-                // AdLib-compatible timer status window (detection reads it).
-                0x08 => 0,
+                // bit7 DMA-TC, bits0/1 MIDI.
+                0x06 => c.irq_status(),
+                // AdLib-compatible timer status window.
+                0x08 => c.adlib_status(),
                 // Board revision: 0xFF = pre-3.7 board, no extra registers —
                 // the simplest personality every driver accepts.
                 0x0F => 0xFF,
@@ -207,9 +312,23 @@ impl Gus {
         if lo < 0x10 {
             match lo {
                 0x00 => c.mix_ctrl = val,
-                // AdLib timer window + IRQ/DMA latches: stored; the timer
-                // model lands in the next commit.
-                0x08 | 0x09 => {}
+                0x08 => c.adlib_index = val,
+                0x09 => {
+                    // The OPL-shaped timer control (index 4): bit7 resets the
+                    // expiry flags; otherwise bits 0/1 start T1/T2 and bits
+                    // 6/5 mask them out of the status byte.
+                    if c.adlib_index == 0x04 {
+                        if val & 0x80 != 0 {
+                            c.timers[0].expired = false;
+                            c.timers[1].expired = false;
+                        } else {
+                            c.timers[0].running = val & 0x01 != 0;
+                            c.timers[1].running = val & 0x02 != 0;
+                            c.timers[0].masked = val & 0x40 != 0;
+                            c.timers[1].masked = val & 0x20 != 0;
+                        }
+                    }
+                }
                 0x0B => c.irq_dma_latch = val,
                 _ => {}
             }
@@ -309,6 +428,28 @@ impl GusCore {
             }
             // Active voices: hardware sets the top two bits on readback.
             0x8E => 0xC0 | self.active_reg as u16,
+            // Voice IRQ source: pop the lowest pending voice. Flag bits are
+            // ACTIVE LOW (bit7 clear = wave IRQ, bit6 clear = ramp IRQ);
+            // no voice pending reads 0xE0. Reading consumes the voice's
+            // pending bits — the hardware FIFO drain loop every GUS ISR runs.
+            0x8F => {
+                let pend = self.wave_pending | self.ramp_pending;
+                if pend == 0 {
+                    0xE0
+                } else {
+                    let v = pend.trailing_zeros();
+                    let mut r = v as u16 | 0x20;
+                    if self.wave_pending & (1 << v) == 0 {
+                        r |= 0x80;
+                    }
+                    if self.ramp_pending & (1 << v) == 0 {
+                        r |= 0x40;
+                    }
+                    self.wave_pending &= !(1 << v);
+                    self.ramp_pending &= !(1 << v);
+                    r
+                }
+            }
             0x41 => self.reg41 as u16,
             0x45 => self.reg45 as u16,
             0x49 => self.reg49 as u16,

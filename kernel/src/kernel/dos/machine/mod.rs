@@ -856,8 +856,11 @@ impl MixSource for NullSource {
 /// `regs`, and the machine are all in scope; consumes the guest DMA ring into
 /// the kernel sound API and raises the SB IRQ per block.
 pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
-    let PcMachine { sb, vpic, .. } = pc;
+    let PcMachine { sb, gus, vpic, .. } = pc;
     sb.audio_tick(machine, regs, vpic, &mut NullSource);
+    // The GUS ticks regardless of the SB's mode: it is always the software
+    // model, even when a real SB card handles the Blaster ports.
+    gus.tick(machine, vpic);
 }
 
 pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {
