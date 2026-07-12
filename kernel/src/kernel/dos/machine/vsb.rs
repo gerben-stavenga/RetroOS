@@ -17,6 +17,12 @@
 use crate::Regs;
 use super::*;
 
+/// How long the software DSP keeps the canonical stream open after playback
+/// stops, feeding silence (see [`EmuDsp::stream_hold`]). Long enough to bridge
+/// per-animation-frame sound-effect re-triggers (~150 ms), short enough that
+/// FM music isn't held at the DSP rate for long once effects go quiet.
+const DSP_HANGOVER_MS: u64 = 300;
+
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
 /// "externally owned" mark — COW-fork and address-space teardown both
 /// skip such frames — exactly what an aliased permanent DMA buffer needs.
@@ -54,6 +60,12 @@ struct EmuDsp {
     /// acks (reads base+0xE for 8-bit / base+0xF for 16-bit). A 16-bit driver
     /// reads this to confirm "that was a *16-bit* DMA interrupt".
     irq_status: u8,
+    /// DSP 0xF2/0xF3 (trigger 8-/16-bit IRQ) latched, same bit layout as
+    /// `irq_status`; the next `audio_tick` raises it. The BLASTER IRQ probe:
+    /// drivers hook every candidate line, send 0xF2, and keep whichever
+    /// handler fired — no IRQ means "broken card" (PoP 1.0 then drops sound
+    /// entirely, AdLib included).
+    trigger_irq: u8,
 
     /// True between a `start playback` command and a stop/reset.
     playing: bool,
@@ -83,6 +95,29 @@ struct EmuDsp {
     /// outrun the guest's refill (which would re-read stale ring data and repeat
     /// the previous lap's audio). Locks consume-rate to refill-rate.
     awaiting_ack: bool,
+    /// Read counter behind the write-status busy flicker (see the base+0x0C
+    /// read): bit 3 alternates the busy bit every 8 reads mid-transfer.
+    write_busy: u8,
+    /// The DSP owns the canonical sink beyond `playing`: after a single-cycle
+    /// sample completes (or the guest pauses), the stream is held open for
+    /// [`DSP_HANGOVER_MS`] feeding silence (FM still mixed in) instead of
+    /// being torn down. Sound-effect chains re-trigger every ~150 ms (PoP's
+    /// gate grinding); stopping the sink per sample meant a stream
+    /// park/re-prime — and a 11 kHz ↔ 49716 Hz rate flip against the FM
+    /// free-run — around every effect, which stuttered on real codecs.
+    stream_hold: bool,
+    /// `get_ticks()` when playback last stopped (hangover anchor).
+    done_ms: u64,
+    /// The last single-cycle transfer ran to terminal count: the guest-visible
+    /// current-count reads 0xFFFF (the real 8237's post-TC underflow) until the
+    /// channel is restarted. Completion pollers key on this (PoP 1.4's digi.drv
+    /// waits for it after its level-transition sample — an IRQ alone does not
+    /// unpark it).
+    dma_tc: bool,
+    /// 8237 status-register TC bits, one per global channel, accumulated since
+    /// the last status read; reading a controller's status register clears its
+    /// four bits, exactly like the real chip.
+    tc_status: u8,
 }
 
 impl EmuDsp {
@@ -91,12 +126,13 @@ impl EmuDsp {
             out: [0; 4], out_len: 0,
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
             reset_prev: 0, test_reg: 0,
-            mixer_index: 0, irq_status: 0,
+            mixer_index: 0, irq_status: 0, trigger_irq: 0,
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0, frac: 0, last_ms: 0,
-            awaiting_ack: false,
+            awaiting_ack: false, write_busy: 0, dma_tc: false, tc_status: 0,
+            stream_hold: false, done_ms: 0,
         }
     }
     fn push_out(&mut self, b: u8) {
@@ -137,6 +173,22 @@ pub struct SoundBlaster {
     dsp_test_reg: u8,
     dsp_read_data: Option<u8>,
     dsp_expect_test_write: bool,
+    /// Parameter bytes still expected for the in-progress passthrough DSP
+    /// command. While non-zero, a write to the command port is a parameter
+    /// (length, time constant, …), not a new opcode — so it's never decoded
+    /// as one (a length byte can equal any command code). Backs the busy-bit
+    /// synthesis.
+    dsp_param_bytes: u8,
+    /// A *single-cycle* DSP DMA transfer is in flight on the passthrough card
+    /// (a `0x14`/`0x16`/ADPCM start command was issued, or a `0xD4` continue).
+    /// Set positively by those commands and cleared by `0xD0` (pause), DSP
+    /// reset, exec/exit, or an 8237 (re)arm — so a stale/paused/reset transfer
+    /// never reads busy. Backs the synthesized write-status busy flicker (see
+    /// `sb_read`); a completed block also drops it via the live 8237 count.
+    dsp_dma_active: bool,
+    /// Read counter behind the passthrough write-status busy flicker: bit 3
+    /// alternates the busy bit every 8 reads mid-transfer.
+    dsp_write_busy: u8,
     /// Current alias binding. `bound_chan == 0xFF` ⇒ none. While bound,
     /// the guest's `bound_vpage..+bound_pages` linear pages alias DMA
     /// channel `bound_host`'s permanent buffer; `bound_gpa`/`bound_len`
@@ -169,6 +221,7 @@ impl SoundBlaster {
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
             dma: Dma8237::new(),
             dsp_test_reg: 0, dsp_read_data: None, dsp_expect_test_write: false,
+            dsp_param_bytes: 0, dsp_dma_active: false, dsp_write_busy: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
             suspended: false, last_gen: [0; 8],
@@ -204,6 +257,7 @@ impl SoundBlaster {
             // No real card / no buffer alias in emulation: just stop the
             // software DSP so the next program sees a clean, idle card.
             self.emu.playing = false;
+            self.emu.stream_hold = false;
             crate::kernel::sound::stop(machine, true); // session end: power down
             self.emu.out_len = 0;
             self.emu.cmd = None;
@@ -223,6 +277,9 @@ impl SoundBlaster {
         mask_real_8237(machine, self.host_dma16);
         self.suspended = false;
         self.last_gen = [0; 8];
+        self.dsp_param_bytes = 0;
+        self.dsp_dma_active = false;
+        self.dsp_expect_test_write = false;
     }
 
     /// SB ports this card decodes — the dispatch guard for both modes: the
@@ -248,33 +305,107 @@ impl SoundBlaster {
             }
         } else if p == self.io_base + 0x0E && self.dsp_read_data.is_some() {
             return 0x80;
+        } else if p == self.io_base + 0x0C {
+            // DSP write-buffer status. Bit 7 = 1 means the DSP can't yet
+            // accept a command byte. QEMU's sb16 always reports ready (0),
+            // but on the real chip the bit FLICKERS while a *single-cycle*
+            // DMA transfer is in flight — it's a per-byte buffer status,
+            // pulsing as the DSP services DMA between command bytes (which
+            // is why 0xD0/pause can be sent mid-transfer at all). Synthesize
+            // that flicker (alternate every 8 reads, DOSBox's proven model)
+            // so a driver polling for busy, or for the busy→idle edge, sees
+            // it within a few reads.
+            //
+            // Reproducer: Prince of Persia's per-frame "stop digitized sound"
+            // routine (PRINCE.EXE file off 0x19E6F: wait-until-busy,
+            // wait-until-idle, then DSP 0xD0/pause). On QEMU's always-ready
+            // status the first wait spun forever — the end-door sound
+            // repeated and the game hung. Holding busy for the whole block
+            // (this shim's first iteration) stalled that routine a full
+            // sample per game frame instead — 1 fps and staccato audio.
+            //
+            // Auto-init transfers (8237 mode bit 4 set) are left alone: real
+            // hardware keeps accepting commands between auto-init blocks, and
+            // our auto-init clients (Quake, Dune2, ROTT) must not stall here.
+            let v = machine.inb(p);
+            if self.dsp_single_cycle_busy(machine) {
+                self.dsp_write_busy = self.dsp_write_busy.wrapping_add(1);
+                if self.dsp_write_busy & 8 != 0 {
+                    return v | 0x80;
+                }
+            }
+            return v;
         }
         machine.inb(p)
     }
 
+    /// True while a single-cycle DSP DMA transfer is genuinely mid-block: a
+    /// start/continue command is active *and* the real 8237's live current-
+    /// count hasn't yet underflowed to the terminal 0xFFFF. Gates the DSP
+    /// write-status busy flicker in `sb_read`. The `dsp_dma_active` flag is
+    /// checked first, so an idle/paused/completed channel costs no port I/O.
+    /// 16-bit single-cycle isn't modelled (no client polls for it); the
+    /// 8-bit/ADPCM host channel is the only one a `0x14`-class command drives.
+    /// The 8237 single-cycle mode check (bit 4 clear) keeps auto-init clients
+    /// (Quake, Dune2, ROTT) unconditionally exempt — their busy bit stays 0
+    /// even across a pause/continue — so their command polls never throttle.
+    fn dsp_single_cycle_busy<A: crate::Arch>(&mut self, machine: &mut A) -> bool {
+        self.dsp_dma_active
+            && self.dma.ch[self.dma8 as usize].prog.mode & 0x10 == 0
+            && real_8237_count(machine, self.host_dma8) != 0xFFFF
+    }
+
     /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
     /// locally; all other traffic continues to the real QEMU sb16/adlib.
+    ///
+    /// On the DSP command port we also run a minimal opcode/parameter tracker
+    /// — enough to keep the synthesized write-status busy bit (see `sb_read`)
+    /// honest across the start/pause/resume of a single-cycle transfer. It
+    /// never suppresses a write: every byte still reaches QEMU. A DSP reset
+    /// (write to base+0x06) clears the tracker.
     pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
         if self.emulated() {
             self.emu_write(machine, p, val);
             return;
         }
-        if p == self.io_base + 0x0C {
+        if p == self.io_base + 0x06 {
+            // DSP reset — drop any half-decoded command / transfer state.
+            self.dsp_param_bytes = 0;
+            self.dsp_dma_active = false;
+            self.dsp_expect_test_write = false;
+        } else if p == self.io_base + 0x0C {
             if self.dsp_expect_test_write {
                 self.dsp_test_reg = val;
                 self.dsp_expect_test_write = false;
                 return;
             }
-            match val {
-                0xE4 => {
-                    self.dsp_expect_test_write = true;
-                    return;
+            // A parameter byte of the command in progress — forward it
+            // verbatim and never re-decode it as an opcode (a length/time-
+            // constant byte can equal any command code).
+            if self.dsp_param_bytes > 0 {
+                self.dsp_param_bytes -= 1;
+            } else {
+                // Command opcode. Track parameter length and the single-cycle
+                // transfer-active flag; only commands relevant to busy-bit
+                // accuracy and the local E4/E8 shim are special-cased — the
+                // rest forward with no parameter expectation (a wrong guess
+                // could only mis-set the single-cycle busy bit, which auto-
+                // init clients never consult).
+                match val {
+                    0xE4 => { self.dsp_expect_test_write = true; return; }
+                    0xE8 => { self.dsp_read_data = Some(self.dsp_test_reg); return; }
+                    // Single-cycle DMA output start (8-bit / ADPCM): two
+                    // length bytes follow, and the DSP is now mid-transfer.
+                    0x14 | 0x16 | 0x74..=0x77 => {
+                        self.dsp_param_bytes = 2;
+                        self.dsp_dma_active = true;
+                    }
+                    0xD4 => self.dsp_dma_active = true,  // continue 8-bit DMA
+                    0xD0 => self.dsp_dma_active = false, // pause 8-bit DMA
+                    0x10 | 0x40 | 0xE0 | 0xE2 => self.dsp_param_bytes = 1,
+                    0x48 | 0x80 => self.dsp_param_bytes = 2,
+                    _ => {}
                 }
-                0xE8 => {
-                    self.dsp_read_data = Some(self.dsp_test_reg);
-                    return;
-                }
-                _ => {}
             }
         }
         machine.outb(p, val);
@@ -307,6 +438,16 @@ impl SoundBlaster {
             let r = (port - 0xC0) >> 1;
             (r & 1 == 1, 4 + (r >> 1) as usize, true)
         } else {
+            // Emulated card: the controller status register carries the TC
+            // bits the software DSP latched (bits 0-3, one per channel);
+            // reading clears them — real-8237 semantics completion pollers
+            // rely on. Passthrough continues to the shadow/real chip.
+            if self.emulated() && (port == 0x08 || port == 0xD0) {
+                let base = if port == 0xD0 { 4 } else { 0 };
+                let bits = (self.emu.tc_status >> base) & 0x0F;
+                self.emu.tc_status &= !(0x0F << base);
+                return bits;
+            }
             return self.dma.io_read(machine, port);
         };
 
@@ -403,6 +544,12 @@ impl SoundBlaster {
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
+        // (Re)programming the 8237 only stages the next block; the DSP isn't
+        // transferring until it gets the matching `0x14`-class start command.
+        // Drop the busy flag here so the driver's "wait for DSP ready" poll
+        // before that start (PoP re-arms the chip *then* issues 0x14 each
+        // block) doesn't see a stale busy from the block just finished.
+        self.dsp_dma_active = false;
         // The buffer sits at `off` inside its channel's 64 KB / 128 KB
         // window; the channel buffer is window-aligned, so the same `off`
         // lands it correctly. An ISA transfer never crosses the boundary.
@@ -571,7 +718,26 @@ impl SoundBlaster {
                 _ => 0x00,
             },
             0x0A => self.emu.pop_out(),                // DSP read data
-            0x0C => 0x00,                              // write-status: always ready
+            // DSP write-buffer status: while a single-cycle transfer is in
+            // flight, bit 7 (busy) FLICKERS — on the real chip it's a per-byte
+            // buffer status, pulsing as the DSP services DMA between command
+            // bytes (that's why 0xD0/pause can be sent mid-transfer at all).
+            // Alternate it every 8 reads, DOSBox's proven model: a driver
+            // waiting for busy sees it within 8 reads and one waiting for the
+            // busy→idle edge sees that within 16 — microseconds, never a
+            // block-long stall. PoP's per-frame "stop digitized sound" routine
+            // needs BOTH: with always-ready it spins forever on wait-for-busy
+            // (end-door hang); with busy-held-for-the-block it stalls a full
+            // sample per game frame (1 fps, staccato gate grinding). Idle DSP
+            // reads always-ready.
+            0x0C => {
+                if self.emu.playing && self.emu.single {
+                    self.emu.write_busy = self.emu.write_busy.wrapping_add(1);
+                    if self.emu.write_busy & 8 != 0 { 0x80 } else { 0x00 }
+                } else {
+                    0x00
+                }
+            }
             0x0E => {                                  // read-status / 8-bit IRQ ack
                 self.emu.irq_status &= !0x01;          // reading acks the 8-bit IRQ
                 self.emu.awaiting_ack = false;         // ...and releases the produce gate
@@ -606,6 +772,7 @@ impl SoundBlaster {
                 // DSP reset: a 1→0 edge triggers the reset handshake.
                 if self.emu.reset_prev == 1 && val == 0 {
                     self.emu.playing = false;
+                    self.emu.stream_hold = false;
                     crate::kernel::sound::stop(machine, true); // session end: power down
                     self.emu.cmd = None;
                     self.emu.param_got = 0;
@@ -651,6 +818,12 @@ impl SoundBlaster {
     /// Execute a fully-parameterized DSP command.
     fn emu_exec<A: crate::Arch>(&mut self, machine: &mut A, cmd: u8) {
         let p = self.emu.params;
+        if super::PORT_TRACE {
+            crate::dbg_println!(
+                "[dsp] cmd {:02X} p={:02X},{:02X},{:02X} ticks={}",
+                cmd, p[0], p[1], p[2], machine.get_ticks()
+            );
+        }
         match cmd {
             0xE1 => {
                 self.emu.push_out(4); // DSP version 4.5 (SB16)
@@ -660,10 +833,15 @@ impl SoundBlaster {
             0xE0 => self.emu.push_out(!p[0]), // identification: return ~byte
             0xE4 => self.emu.test_reg = p[0], // write test register
             0xE8 => self.emu.push_out(self.emu.test_reg), // read test register back
+            0xF2 => self.emu.trigger_irq |= 0x01,      // trigger 8-bit IRQ (IRQ probe)
+            0xF3 => self.emu.trigger_irq |= 0x02,      // trigger 16-bit IRQ
             0xD1 | 0xD4 => {}                          // speaker on / continue DMA
             0xD0 | 0xD3 | 0xD9 | 0xDA => {
-                self.emu.playing = false; // pause / speaker off / exit auto-init
-                crate::kernel::sound::stop(machine, false); // pause: keep configured
+                // Pause / speaker off / exit auto-init: playback stops, but the
+                // stream is held open through the hangover (dsp_tick) — effect
+                // chains pause-and-restart every animation frame.
+                self.emu.playing = false;
+                self.emu.done_ms = machine.get_ticks();
             }
             0x40 => {
                 let tc = p[0] as u32;
@@ -722,7 +900,18 @@ impl SoundBlaster {
         self.emu.next_irq = self.emu.block_frames as u64;
         self.emu.frac = 0;
         self.emu.awaiting_ack = false;
+        self.emu.dma_tc = false; // restart re-loads the count registers
         self.emu.playing = self.emu.buf_frames > 0;
+        if self.emu.playing {
+            self.emu.stream_hold = true;
+        }
+        if super::PORT_TRACE {
+            crate::dbg_println!(
+                "[dsp] start bits={} single={} gpa={:08X} frames={} block={} playing={}",
+                bits, single, self.emu.buf_gpa, self.emu.buf_frames,
+                self.emu.block_frames, self.emu.playing
+            );
+        }
     }
 
     /// Advance emulated sound by the virtual time elapsed since the last call:
@@ -739,8 +928,19 @@ impl SoundBlaster {
         if !self.emulated() {
             return;
         }
+        // Deliver a latched 0xF2/0xF3 trigger-IRQ. A real card answers within
+        // microseconds; the next slice is well inside any probe's poll window.
+        if self.emu.trigger_irq != 0 {
+            self.emu.irq_status |= self.emu.trigger_irq;
+            self.emu.trigger_irq = 0;
+            if !vpic.is_requested(self.irq) {
+                vpic.raise(self.irq);
+            }
+        }
         self.dsp_tick(machine, regs, vpic);
-        let dsp_streaming = self.emu.playing;
+        // The DSP owns the sink while playing OR while holding the stream
+        // through the hangover — either way it pulls FM itself.
+        let dsp_streaming = self.emu.playing || self.emu.stream_hold;
         if let Some(opl) = self.opl.as_mut() {
             opl.tick(machine, dsp_streaming);
         }
@@ -758,7 +958,27 @@ impl SoundBlaster {
         vpic: &mut super::vpic::VirtualPic,
     ) {
         if !self.emu.playing {
-            self.emu.last_ms = machine.get_ticks(); // keep Δt small for first tick
+            let now = machine.get_ticks();
+            let dt = now.saturating_sub(self.emu.last_ms).min(100);
+            self.emu.last_ms = now; // keep Δt small for first tick
+            if self.emu.stream_hold {
+                if now.saturating_sub(self.emu.done_ms) < DSP_HANGOVER_MS {
+                    // Hold the stream open across the between-samples gap:
+                    // feed silence at the configured rate (FM mixed in like
+                    // live playback) so an effect re-trigger lands on a
+                    // running stream instead of a park/re-prime + rate flip.
+                    self.emu.frac += self.emu.rate as u64 * dt;
+                    let n = self.emu.frac / 1000;
+                    self.emu.frac %= 1000;
+                    if n > 0 {
+                        self.emit_hold_silence(machine, n);
+                    }
+                } else {
+                    crate::kernel::sound::stop(machine, false); // pause: keep configured
+                    self.emu.stream_hold = false;
+                    self.emu.frac = 0;
+                }
+            }
             return;
         }
         // Frozen at a block boundary until the guest services the IRQ (clears
@@ -798,12 +1018,23 @@ impl SoundBlaster {
             self.emu.awaiting_ack = true;
             // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
             self.emu.irq_status |= if self.emu.bits == 16 { 0x02 } else { 0x01 };
+            if super::PORT_TRACE {
+                crate::dbg_println!(
+                    "[dsp] boundary cursor={} single={} ticks={}",
+                    self.emu.cursor, self.emu.single, machine.get_ticks()
+                );
+            }
             if !vpic.is_requested(self.irq) {
                 vpic.raise(self.irq);
             }
             if self.emu.single {
                 self.emu.playing = false; // single-cycle: one pass done, stop (no loop)
-                crate::kernel::sound::stop(machine, false); // next block re-primes
+                self.emu.done_ms = now;   // stream held open through the hangover
+                // The 8237 side hit terminal count: current-count underflows to
+                // 0xFFFF and the status TC bit latches until read.
+                self.emu.dma_tc = true;
+                let chan = if self.emu.bits == 16 { self.dma16 } else { self.dma8 };
+                self.emu.tc_status |= 1 << (chan & 7);
             } else {
                 self.emu.next_irq += self.emu.block_frames as u64;
             }
@@ -862,6 +1093,30 @@ impl SoundBlaster {
         }
     }
 
+    /// Push `count` frames of silence at the configured rate, FM mixed in
+    /// exactly as `emit_frames` does for live playback — the hangover feed
+    /// that keeps the stream (and the music riding on it) running between
+    /// closely-spaced sound effects.
+    fn emit_hold_silence<A: crate::Arch>(&mut self, machine: &mut A, count: u64) {
+        let canon = crate::kernel::sound::Format { bits: 16, signed: true, channels: 2 };
+        let mixing = self.opl.as_ref().is_some_and(|o| o.mixing());
+        let mut remaining = count;
+        while remaining > 0 {
+            let run = remaining.min(256) as usize;
+            let mut buf = alloc::vec![0u8; run * 4];
+            if mixing {
+                let opl = self.opl.as_mut().unwrap();
+                for i in 0..run {
+                    let (fl, fr) = opl.mix_frame(self.emu.rate);
+                    buf[i * 4..i * 4 + 2].copy_from_slice(&fl.to_le_bytes());
+                    buf[i * 4 + 2..i * 4 + 4].copy_from_slice(&fr.to_le_bytes());
+                }
+            }
+            crate::kernel::sound::play(machine, self.emu.rate, canon, &buf);
+            remaining -= run as u64;
+        }
+    }
+
     /// Emulated DMA current-address/count read: serve the active SB channel's
     /// live state from the play cursor (auto-init down-count), other channels
     /// from the captured base programming. Mirrors `dma_read`'s flip-flop split.
@@ -889,7 +1144,16 @@ impl SoundBlaster {
             return if low { v as u8 } else { (v >> 8) as u8 };
         }
         let p = self.dma.ch[chan].prog;
-        let v = if is_cnt { p.count } else { p.addr };
+        // Post-terminal-count state: a finished single-cycle transfer reads
+        // count 0xFFFF (underflow) and the address one past the end, until the
+        // channel is restarted — not the base programming.
+        let v = if is_active && self.emu.dma_tc {
+            if is_cnt { 0xFFFF } else { p.addr.wrapping_add(p.count).wrapping_add(1) }
+        } else if is_cnt {
+            p.count
+        } else {
+            p.addr
+        };
         if low { v as u8 } else { (v >> 8) as u8 }
     }
 }
