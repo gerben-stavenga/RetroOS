@@ -1328,6 +1328,11 @@ launch_hosted() {
         HOSTED_HOSTDIR="/"
     fi
 
+    # Flags must precede the image: the hosted binaries end flag parsing at
+    # the first positional (the rest becomes the program's argv tail), so a
+    # --wav appended after the image path silently lands in guest argv.
+    [ -n "$HOSTED_WAV" ] && ARGS+=(--wav "$HOSTED_WAV")
+
     if [ -n "$HOSTED_HOSTDIR" ]; then
         ARGS+=(--host "$HOSTED_HOSTDIR")
     else
@@ -1346,8 +1351,6 @@ launch_hosted() {
     # engine); default is the TCG (Unicorn) engine.
     local ENG=""
     [ "$KVM" = 1 ] && ENG="-kvm"
-
-    [ -n "$HOSTED_WAV" ] && ARGS+=(--wav "$HOSTED_WAV")
 
     if [ -n "$HOSTED_TERMINAL" ]; then
         # Headless kernel binary. Hosted build needs the host platform; the repo

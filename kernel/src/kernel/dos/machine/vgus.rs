@@ -22,12 +22,58 @@
 //! <irq>,<midi irq>` env var, the exact contract real drivers use; without
 //! it the device stays absent (`owns` never claims a port).
 
-use crate::Regs;
 use super::*;
 
 /// Onboard sample DRAM: we model a fully-populated 1 MB board (every real
 /// sizing probe pokes powers-of-two boundaries below this and finds RAM).
 const DRAM_LEN: usize = 1 << 20;
+
+/// Frames per `sound::play` push in the standalone pump (as vsb/opl).
+const CHUNK_FRAMES: usize = 128;
+
+/// Canonical shape the engine produces: signed 16-bit stereo.
+const CANON: crate::kernel::sound::Format = crate::kernel::sound::Format {
+    bits: 16,
+    signed: true,
+    channels: 2,
+};
+
+/// GF1 voice/current/loop addresses live in one 29-bit fixed-point value —
+/// 20 integer bits, 9 fraction bits — split across a high/low register pair.
+fn comb(hi: u16, lo: u16) -> u32 {
+    ((hi as u32) << 16) | lo as u32
+}
+
+/// GF1 combined address → engine Q32.32 sample frames. For 16-bit voices
+/// the GF1 keeps the 256 KB bank bits untranslated and doubles the offset
+/// within the bank (a *word* index inside a byte-addressed DRAM window);
+/// the engine indexes frames, so the translated byte address halves back
+/// to `((a & 0xC0000) >> 1) | (a & 0x1FFFF)` frames.
+fn addr_q32(c: u32, bits16: bool) -> u64 {
+    let mut a = (c >> 9) & 0xFFFFF;
+    let frac = (c & 0x1FF) as u64;
+    if bits16 {
+        a = ((a & 0xC0000) >> 1) | (a & 0x1FFFF);
+    }
+    ((a as u64) << 32) | (frac << 23)
+}
+
+/// Engine Q32.32 → GF1 combined address (readback of live voice state).
+fn q32_addr(q: u64, bits16: bool) -> u32 {
+    let mut a = (q >> 32) as u32;
+    let frac = ((q >> 23) & 0x1FF) as u32;
+    if bits16 {
+        a = (a & 0x1FFFF) | ((a & 0x60000) << 1);
+    }
+    ((a & 0xFFFFF) << 9) | frac
+}
+
+/// GF1 16-position pan → Q12 stereo gains (0 = full left, 15 = full right;
+/// linear law, unity 4096).
+fn pan_gains(p: u16) -> (u16, u16) {
+    let p = (p & 15) as u32;
+    ((((15 - p) * 4096) / 15) as u16, ((p * 4096) / 15) as u16)
+}
 
 /// Always-present, tiny per-thread GUS state: the ULTRASND wiring and the
 /// lazily-built core. Mirrors `SoundBlaster`'s shape — config outside,
@@ -89,6 +135,20 @@ struct GusCore {
     ramp_pending: u32,
     /// `get_ticks()` at the last `tick` (virtual-time pacing anchor).
     last_ms: u64,
+    /// Standalone-pump pacing: sub-frame accumulator (frames × 1000) and
+    /// whether we currently own an open canonical stream.
+    frac: u64,
+    streaming: bool,
+    /// A reg-0x41 write with the enable bit set: the upload is serviced by
+    /// `service_dma` right after the register write returns (it needs the
+    /// machine and the 8237 shadow, which the register file never sees).
+    dma_kick: bool,
+    /// DMA terminal count, poll-visible: 0x41 readback bit 6 and IRQ-status
+    /// bit 7; cleared by reading 0x41 (the hardware ack).
+    dma_tc: bool,
+    /// TC wants the GF1 IRQ (reg-0x41 bit 5 was set): delivered on the next
+    /// tick, the same deferral the SB uses for its trigger IRQ.
+    dma_irq_latch: bool,
 }
 
 /// One GF1 rate timer. T1 counts 80 µs units, T2 320 µs; each reloads and
@@ -109,7 +169,7 @@ impl GusCore {
     fn new_boxed() -> alloc::boxed::Box<GusCore> {
         // Both big members are heap-built in place; the struct itself is
         // small enough (~1.2 KB of registers) that a by-value move is fine.
-        alloc::boxed::Box::new(GusCore {
+        let mut c = alloc::boxed::Box::new(GusCore {
             dram: alloc::vec![0u8; DRAM_LEN].into_boxed_slice(),
             engine: sampler::Engine::new_boxed(),
             voice_sel: 0,
@@ -126,7 +186,21 @@ impl GusCore {
             wave_pending: 0,
             ramp_pending: 0,
             last_ms: 0,
-        })
+            frac: 0,
+            streaming: false,
+            dma_kick: false,
+            dma_tc: false,
+            dma_irq_latch: false,
+        });
+        c.engine.active = 14; // matches active_reg's power-on 13 (n−1)
+        c
+    }
+
+    /// Native output rate: the GF1 trades voices for rate — 44100 Hz at 14
+    /// voices down to 19293 Hz at 32 (617400/voices, the SDK table; the
+    /// same constant DOSBox and dosemu use).
+    fn native_rate(&self) -> u32 {
+        617_400 / (self.engine.active as u32).clamp(14, 32)
     }
 
     /// DRAM I/O address from global regs 0x43/0x44 (20 bits).
@@ -139,6 +213,7 @@ impl GusCore {
     /// as on hardware, where reset touches the synth, not the memory.
     fn chip_reset(&mut self) {
         self.engine.reset();
+        self.engine.active = 14;
         self.vregs = [[0; 16]; 32];
         self.active_reg = 13;
         self.reg41 = 0;
@@ -146,6 +221,10 @@ impl GusCore {
         self.timers = [GusTimer::default(); 2];
         self.wave_pending = 0;
         self.ramp_pending = 0;
+        self.frac = 0;
+        self.dma_kick = false;
+        self.dma_tc = false;
+        self.dma_irq_latch = false;
     }
 
     /// The 2X6 IRQ status byte: bit2/3 = timer 1/2 (gated by their reg-0x45
@@ -163,6 +242,9 @@ impl GusCore {
         }
         if self.ramp_pending != 0 {
             s |= 0x40;
+        }
+        if self.dma_tc {
+            s |= 0x80;
         }
         s
     }
@@ -220,14 +302,16 @@ impl Gus {
     /// sees a power-on card (same lifecycle as the SB's `release_dma_pool`
     /// and the per-program OPL chip).
     pub fn reset<A: crate::Arch>(&mut self, machine: &mut A) {
-        let _ = machine;
+        if self.core.as_ref().is_some_and(|c| c.streaming) {
+            crate::kernel::sound::stop(machine, true); // session end: power down
+        }
         self.core = None;
         self.present = false;
     }
 
-    /// Per-quantum device tick, from `machine::audio_tick`: pace the two
-    /// rate timers by virtual time and raise the GF1 IRQ line for enabled,
-    /// unserviced sources. (The playback pump joins this in the next phase.)
+    /// Per-quantum device tick, from `machine::audio_tick`: pace the rate
+    /// timers and the standalone playback pump by virtual time, and raise
+    /// the GF1 IRQ line for enabled, unserviced sources.
     pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, vpic: &mut super::vpic::VirtualPic) {
         let Some(c) = self.core.as_mut() else { return };
         let now = machine.get_ticks();
@@ -238,7 +322,9 @@ impl Gus {
             return;
         }
         let (reg45, reg46, reg47) = (c.reg45, c.reg46, c.reg47);
-        let mut want_irq = false;
+        // A DMA terminal count from the last register write delivers its
+        // IRQ here, one tick later — a real transfer isn't instant either.
+        let mut want_irq = core::mem::take(&mut c.dma_irq_latch);
         for (i, t) in c.timers.iter_mut().enumerate() {
             if !t.running {
                 t.acc_us = 0;
@@ -258,6 +344,44 @@ impl Gus {
                     want_irq = true;
                 }
             }
+        }
+        // ── standalone playback pump (the OplFm::tick discipline) ──
+        // DAC enable is reset-register bit 1; a running voice (or ramp)
+        // means the chip owes the sink audio. Rate rides the active-voice
+        // count, so it's re-read every tick — the sink owns resampling and
+        // a rate change is just a different `play` argument.
+        let audible = c.reset_reg & 0x02 != 0 && c.engine.any_running();
+        if audible {
+            let rate = c.native_rate();
+            c.frac += rate as u64 * dt as u64;
+            let mut n = c.frac / 1000;
+            c.frac %= 1000;
+            if n > 0 {
+                c.streaming = true;
+                let mut pcm = [0i16; CHUNK_FRAMES * 2];
+                let mut bytes = [0u8; CHUNK_FRAMES * 4];
+                while n > 0 {
+                    let run = (n as usize).min(CHUNK_FRAMES);
+                    let mut ev = sampler::Events::default();
+                    c.engine.generate(&c.dram, &mut pcm[..run * 2], &mut ev);
+                    if ev.any() {
+                        c.wave_pending |= ev.wave_irq;
+                        c.ramp_pending |= ev.ramp_irq;
+                        want_irq = true;
+                    }
+                    for (i, s) in pcm[..run * 2].iter().enumerate() {
+                        bytes[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
+                    }
+                    crate::kernel::sound::play(machine, rate, CANON, &bytes[..run * 4]);
+                    n -= run as u64;
+                }
+            }
+        } else {
+            if c.streaming {
+                crate::kernel::sound::stop(machine, false); // pause, keep configured
+                c.streaming = false;
+            }
+            c.frac = 0;
         }
         // Master IRQ enable is reset-register bit 2.
         if want_irq && c.reset_reg & 0x04 != 0 && !vpic.is_requested(self.irq) {
@@ -304,8 +428,7 @@ impl Gus {
     }
 
     /// Guest OUT to a decoded port.
-    pub fn io_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
-        let _ = machine;
+    pub fn io_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
         let base = self.base;
         let c = self.core();
         let lo = p.wrapping_sub(base);
@@ -340,13 +463,62 @@ impl Gus {
             0x02 => c.voice_sel = val & 0x1F,
             0x03 => c.reg_sel = val,
             0x04 => c.reg_write(false, val),
-            0x05 => c.reg_write(true, val),
+            0x05 => {
+                c.reg_write(true, val);
+                // A completed reg-0x41 write with the enable bit kicks an
+                // upload; it runs here, where the machine and 8237 live.
+                self.service_dma(machine, dma);
+            }
             0x07 => {
                 let a = c.dram_addr();
                 c.dram[a] = val;
             }
             _ => {}
         }
+    }
+
+    /// Service a kicked GF1 DMA transfer: move the guest buffer the virtual
+    /// 8237 was programmed with into DRAM at (reg 0x42 << 4), applying the
+    /// reg-0x41 transforms — bit2 = 16-bit ISA channel (bank-preserving
+    /// address doubling, like 16-bit voice fetches), bit7 = invert MSB
+    /// (unsigned→signed samples; bit6 picks 8- vs 16-bit sample width).
+    /// Terminal count latches poll-visible state; the IRQ (bit5) is raised
+    /// on the next tick — the same deferral the SB's trigger IRQ uses.
+    fn service_dma<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237) {
+        let ch = self.dma_ch as usize;
+        let Some(c) = self.core.as_mut() else { return };
+        if !core::mem::take(&mut c.dma_kick) {
+            return;
+        }
+        // Direction bit set = DRAM→host (recording): complete without data.
+        if c.reg41 & 0x02 == 0 && ch < 8 {
+            let is16_chan = ch >= 4;
+            let p = dma.ch[ch].prog;
+            let (gpa, len) = chan_gpa_len(&p, is16_chan);
+            let mut dest = (c.reg42 as usize) << 4;
+            if c.reg41 & 0x04 != 0 {
+                dest = (dest & 0xC0000) | ((dest & 0x1FFFF) << 1);
+            }
+            let len = (len as usize).min(DRAM_LEN.saturating_sub(dest));
+            if len > 0 {
+                let mut buf = alloc::vec![0u8; len];
+                machine.copy_from(gpa as usize, &mut buf);
+                if c.reg41 & 0x80 != 0 {
+                    if c.reg41 & 0x40 != 0 {
+                        for b in buf.iter_mut().skip(1).step_by(2) {
+                            *b ^= 0x80;
+                        }
+                    } else {
+                        for b in buf.iter_mut() {
+                            *b ^= 0x80;
+                        }
+                    }
+                }
+                c.dram[dest..dest + len].copy_from_slice(&buf);
+            }
+        }
+        c.dma_tc = true;
+        c.dma_irq_latch = c.reg41 & 0x20 != 0;
     }
 }
 
@@ -364,13 +536,14 @@ impl GusCore {
     }
 
     /// Byte write to the selected register (`high` = data-high port). The
-    /// high byte completes a write for either width; that's where register
-    /// side effects belong as they land (voice start, DMA kick, reset).
+    /// high byte completes a write for either width, so that's where the
+    /// register's side effect fires (voice start, DMA kick, reset).
     fn reg_write(&mut self, high: bool, val: u8) {
         let reg = self.reg_sel;
         match reg {
             0x00..=0x0D => {
-                let slot = &mut self.vregs[self.voice_sel as usize][reg as usize];
+                let vi = self.voice_sel as usize;
+                let slot = &mut self.vregs[vi][reg as usize];
                 if Self::voice_is16(reg) {
                     if high {
                         *slot = (*slot & 0x00FF) | ((val as u16) << 8);
@@ -380,9 +553,22 @@ impl GusCore {
                 } else if high {
                     *slot = val as u16;
                 }
+                if high {
+                    self.voice_reg_effect(vi, reg);
+                }
             }
-            0x0E if high => self.active_reg = val & 0x3F,
-            0x41 if high => self.reg41 = val,
+            0x0E if high => {
+                self.active_reg = val & 0x3F;
+                // (n−1) encoding; hardware clamps to the 14..32 range, and
+                // the native output rate follows from the count.
+                self.engine.active = (((val & 0x1F) as u32) + 1).clamp(14, 32) as u8;
+            }
+            0x41 if high => {
+                self.reg41 = val;
+                // Enable bit set = kick an upload; serviced right after this
+                // OUT returns (io_write has the machine + 8237 shadow).
+                self.dma_kick = val & 0x01 != 0;
+            }
             0x42 => {
                 if high {
                     self.reg42 = (self.reg42 & 0x00FF) | ((val as u16) << 8);
@@ -416,13 +602,117 @@ impl GusCore {
         }
     }
 
+    /// Map one just-written per-voice register onto the engine voice. The
+    /// raw images in `vregs` stay the source of truth for programming
+    /// readback; the engine holds the live playing state.
+    fn voice_reg_effect(&mut self, vi: usize, reg: u8) {
+        let raw = self.vregs[vi];
+        let v = &mut self.engine.voices[vi];
+        match reg {
+            0x00 => {
+                let ctrl = raw[0] as u8;
+                v.bits16 = ctrl & 0x04 != 0;
+                v.loop_mode = if ctrl & 0x08 != 0 {
+                    if ctrl & 0x10 != 0 { sampler::LoopMode::Bidi } else { sampler::LoopMode::Forward }
+                } else {
+                    sampler::LoopMode::None
+                };
+                v.irq_on_end = ctrl & 0x20 != 0;
+                v.backwards = ctrl & 0x40 != 0;
+                if ctrl & 0x03 != 0 {
+                    v.running = false;
+                } else {
+                    // (Re)start: derive the full address state from the raw
+                    // images with the data width this same write declared —
+                    // drivers program addresses first and control last, so
+                    // any earlier translation guess would be stale.
+                    v.start = addr_q32(comb(raw[2], raw[3]), v.bits16);
+                    v.end = addr_q32(comb(raw[4], raw[5]), v.bits16);
+                    v.addr = addr_q32(comb(raw[0xA], raw[0xB]), v.bits16);
+                    v.running = true;
+                }
+            }
+            // Frequency control: the GF1 adds FC/2 per output frame in
+            // 9-bit-fraction address units.
+            0x01 => v.inc = ((raw[1] >> 1) as u64) << 23,
+            0x02 | 0x03 => v.start = addr_q32(comb(raw[2], raw[3]), v.bits16),
+            0x04 | 0x05 => v.end = addr_q32(comb(raw[4], raw[5]), v.bits16),
+            0x06 => {
+                v.ramp.inc = (raw[6] & 0x3F) as u8;
+                v.ramp.shift = (raw[6] >> 6) as u8;
+            }
+            0x07 => v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8,
+            0x08 => v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8,
+            0x09 => v.vol = raw[9] as i32,
+            0x0A | 0x0B => v.addr = addr_q32(comb(raw[0xA], raw[0xB]), v.bits16),
+            0x0C => {
+                let (l, r) = pan_gains(raw[0xC]);
+                v.pan_l = l;
+                v.pan_r = r;
+            }
+            0x0D => {
+                let rc = raw[0xD] as u8;
+                v.rollover = rc & 0x04 != 0;
+                v.ramp.looped = rc & 0x08 != 0;
+                v.ramp.bidi = rc & 0x10 != 0;
+                v.ramp.irq = rc & 0x20 != 0;
+                v.ramp.down = rc & 0x40 != 0;
+                if rc & 0x03 != 0 {
+                    v.ramp.running = false;
+                } else {
+                    // Ramp start snapshots rate + bounds from their images.
+                    v.ramp.inc = (raw[6] & 0x3F) as u8;
+                    v.ramp.shift = (raw[6] >> 6) as u8;
+                    v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8;
+                    v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8;
+                    v.ramp.frames_to_next = 1u16 << (3 * v.ramp.shift.min(3));
+                    v.ramp.running = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Byte read of the selected register. Reads use the `0x80 | index`
     /// aliases for per-voice registers (hardware convention); programming
-    /// registers echo their images, hardware-status bits join with playback.
+    /// registers echo their images, live state (current address/volume,
+    /// stopped bits, IRQ-pending bits) comes from the engine.
     fn reg_read(&mut self, high: bool) -> u8 {
         let reg = self.reg_sel;
         let word = match reg {
-            0x80..=0x8D => {
+            // Voice control: mode bits from the image, stopped state from
+            // the engine, bit7 = wave IRQ pending for this voice.
+            0x80 => {
+                let vi = self.voice_sel as usize;
+                let mut r = self.vregs[vi][0] & 0x7C;
+                if !self.engine.voices[vi].running {
+                    r |= 0x03;
+                }
+                if self.wave_pending & (1 << vi) != 0 {
+                    r |= 0x80;
+                }
+                r
+            }
+            // Current volume / current address: live engine state.
+            0x89 => self.engine.voices[self.voice_sel as usize].vol.clamp(0, 0xFFFF) as u16,
+            0x8A | 0x8B => {
+                let v = &self.engine.voices[self.voice_sel as usize];
+                let c = q32_addr(v.addr, v.bits16);
+                if reg == 0x8A { (c >> 16) as u16 } else { c as u16 }
+            }
+            // Ramp control: same composition as voice control.
+            0x8D => {
+                let vi = self.voice_sel as usize;
+                let mut r = self.vregs[vi][0x0D] & 0x7C;
+                if !self.engine.voices[vi].ramp.running {
+                    r |= 0x03;
+                }
+                if self.ramp_pending & (1 << vi) != 0 {
+                    r |= 0x80;
+                }
+                r
+            }
+            0x81..=0x8C => {
                 let idx = (reg & 0x0F) as usize;
                 self.vregs[self.voice_sel as usize][idx]
             }
@@ -450,7 +740,13 @@ impl GusCore {
                     r
                 }
             }
-            0x41 => self.reg41 as u16,
+            // DMA control readback: bit6 = terminal count reached; reading
+            // is the ack (clears it and the IRQ-status bit).
+            0x41 => {
+                let r = (self.reg41 & 0xBF) as u16 | if self.dma_tc { 0x40 } else { 0 };
+                self.dma_tc = false;
+                r
+            }
             0x45 => self.reg45 as u16,
             0x49 => self.reg49 as u16,
             0x4C => self.reset_reg as u16,

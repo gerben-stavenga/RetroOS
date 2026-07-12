@@ -681,7 +681,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             pc.sb.sb_write(machine, &pc.dma, p, val);
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
-        p if pc.gus.owns(p) => pc.gus.io_write(machine, p, val),
+        p if pc.gus.owns(p) => pc.gus.io_write(machine, &pc.dma, p, val),
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.

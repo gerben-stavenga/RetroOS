@@ -14,9 +14,11 @@
 ;               2X8/2X9 window + reg 0x45 IRQ enable + reset-reg master
 ;               enable actually raises the ULTRASND IRQ (5 -> INT 0Dh),
 ;               and the ISR sees the T1 bit in the 2X6 IRQ status.
-;
-; Later phases (DMA upload, an audible voice) join as the corresponding
-; emulation lands — same file, appended markers.
+;   GDMA-OK   — a 256-byte sample upload through the virtual 8237 (ch 1) +
+;               GF1 regs 0x42/0x41 lands in DRAM byte-exact, raises the
+;               TC IRQ, and reading 0x41 (bit6 set) acks it.
+;   GVOICE-OK — the uploaded data programmed as a looping voice actually
+;               plays: the live current-address register moves.
 ; CI: test/hosted_games.sh runs this and asserts every marker.
         org 0x100
 
@@ -136,15 +138,145 @@ timer_seen:
         mov ah, 9
         mov dx, msg_timer
         int 0x21
+
+        ; ---- phase 4: DMA sample upload + TC IRQ ----
+        mov bx, 0              ; fill pattern: buf[i] = i ^ 0x5A
+.fill:  mov al, bl
+        xor al, 0x5A
+        mov [dmabuf+bx], al
+        inc bx
+        cmp bx, 256
+        jne .fill
+        mov al, 0x05           ; program virtual 8237 ch1: mask
+        out 0x0A, al
+        mov al, 0x49           ; mode: single, read (mem -> card), ch1
+        out 0x0B, al
+        xor al, al
+        out 0x0C, al           ; clear flip-flop
+        mov ax, cs
+        mov bx, ax
+        shr bx, 12             ; page bits 19:16
+        shl ax, 4
+        add ax, dmabuf
+        adc bx, 0
+        out 0x02, al           ; addr lo
+        mov al, ah
+        out 0x02, al           ; addr hi
+        mov ax, bx
+        out 0x83, al           ; page (ch1)
+        mov ax, 255            ; count - 1
+        out 0x03, al
+        mov al, ah
+        out 0x03, al
+        mov al, 0x01
+        out 0x0A, al           ; unmask ch1
+        mov al, 0x42           ; GF1 DMA start address: DRAM 0 (units of 16)
+        call selreg
+        xor ax, ax
+        call wr16
+        mov al, 0x41           ; enable upload + TC IRQ (bits 0,5)
+        call selreg
+        mov al, 0x21
+        call wr8
+        mov bx, 0x8000         ; bounded wait for the TC IRQ
+.dwait: mov cx, 0x0100
+.dw2:   cmp byte [dmaflag], 0
+        jne dma_seen
+        loop .dw2
+        dec bx
+        jnz .dwait
+        jmp fail_dma
+dma_seen:
+        xor ax, ax             ; DRAM[0] == 0x00 ^ 0x5A?
+        xor bl, bl
+        call set_dram_addr
+        mov dx, GF1_DRAM
+        in  al, dx
+        cmp al, 0x5A
+        jne fail_dma
+        mov ax, 255            ; DRAM[255] == 255 ^ 0x5A = 0xA5?
+        xor bl, bl
+        call set_dram_addr
+        mov dx, GF1_DRAM
+        in  al, dx
+        cmp al, 0xA5
+        jne fail_dma
+        mov ah, 9
+        mov dx, msg_dma
+        int 0x21
+
+        ; ---- phase 5: the uploaded block as a looping, audible voice ----
+        mov dx, GF1_VOICE      ; voice 0
+        xor al, al
+        out dx, al
+        mov al, 0x01           ; frequency control: 1.0 frames/sample
+        call selreg
+        mov ax, 0x0400
+        call wr16
+        mov al, 0x02           ; start = 0
+        call selreg
+        xor ax, ax
+        call wr16
+        mov al, 0x03
+        call selreg
+        xor ax, ax
+        call wr16
+        mov al, 0x04           ; end = frame 256 (combined = 256 << 9)
+        call selreg
+        mov ax, 0x0002
+        call wr16
+        mov al, 0x05
+        call selreg
+        xor ax, ax
+        call wr16
+        mov al, 0x0A           ; current address = 0
+        call selreg
+        xor ax, ax
+        call wr16
+        mov al, 0x0B
+        call selreg
+        xor ax, ax
+        call wr16
+        mov al, 0x09           ; current volume: near unity
+        call selreg
+        mov ax, 0xFFF0
+        call wr16
+        mov al, 0x0C           ; pan center
+        call selreg
+        mov al, 7
+        call wr8
+        mov al, 0x00           ; voice control: 8-bit forward loop, start
+        call selreg
+        mov al, 0x08
+        call wr8
+        mov al, 0x8B           ; watch the live current-address low register
+        call selreg
+        call rd16
+        mov si, bx
+        mov bp, 0x4000         ; bounded wait for address motion
+.vwait: mov cx, 0x0040
+.vw2:   loop .vw2
+        mov al, 0x8B
+        call selreg
+        call rd16
+        cmp bx, si
+        jne voice_ok
+        dec bp
+        jnz .vwait
+        jmp fail_voice
+voice_ok:
+        mov ah, 9
+        mov dx, msg_voice
+        int 0x21
         jmp exit
 
 irq5_isr:
         push ax
         push dx
-        mov dx, 0x246          ; GF1 IRQ status: T1 bit?
+        mov dx, 0x246          ; GF1 IRQ status
         in  al, dx
-        test al, 0x04
-        jz  .eoi               ; not ours: just EOI
+        test al, 0x04          ; timer 1?
+        jz  .chk_dma
         mov byte [cs:irqflag], 1
         mov dx, 0x248          ; timer control:
         mov al, 0x04
@@ -154,16 +286,35 @@ irq5_isr:
         out dx, al
         xor al, al             ;   ...and stop both timers
         out dx, al
+        jmp .eoi
+.chk_dma:
+        test al, 0x80          ; DMA terminal count?
+        jz  .eoi
+        mov al, 0x41           ; reading 0x41 acks the TC
+        call selreg
+        call rd8
+        mov byte [cs:dmaflag], 1
 .eoi:   mov al, 0x20
         out 0x20, al
         pop dx
         pop ax
         iret
 irqflag: db 0
+dmaflag: db 0
 
 fail_timer:
         mov ah, 9
         mov dx, msg_ftm
+        int 0x21
+        jmp exit
+fail_dma:
+        mov ah, 9
+        mov dx, msg_fdm
+        int 0x21
+        jmp exit
+fail_voice:
+        mov ah, 9
+        mov dx, msg_fv
         int 0x21
         jmp exit
 fail_dram:
@@ -232,6 +383,11 @@ set_dram_addr:
 msg_dram:  db 'GDRAM-OK', 13, 10, '$'
 msg_reg:   db 'GREG-OK', 13, 10, '$'
 msg_timer: db 'GTIMER-OK', 13, 10, '$'
+msg_dma:   db 'GDMA-OK', 13, 10, '$'
+msg_voice: db 'GVOICE-OK', 13, 10, '$'
 msg_fd:    db 'FAIL-GDRAM', 13, 10, '$'
 msg_fr:    db 'FAIL-GREG', 13, 10, '$'
 msg_ftm:   db 'FAIL-GTIMER', 13, 10, '$'
+msg_fdm:   db 'FAIL-GDMA', 13, 10, '$'
+msg_fv:    db 'FAIL-GVOICE', 13, 10, '$'
+dmabuf:    times 256 db 0
