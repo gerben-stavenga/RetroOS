@@ -65,6 +65,17 @@ pub struct Dma8237 {
     pub(super) read_latch: u16,
 }
 
+/// Decode a channel's captured 8237 programming into the (DOS-physical
+/// buffer address, byte length) the card layers work in. 16-bit
+/// channels count words: addr is a word offset, count a word count − 1.
+pub(super) fn chan_gpa_len(p: &DmaProg, is16: bool) -> (u32, u32) {
+    if is16 {
+        (((p.page as u32) << 16) | ((p.addr as u32) << 1), ((p.count as u32) + 1) * 2)
+    } else {
+        (((p.page as u32) << 16) | p.addr as u32, (p.count as u32) + 1)
+    }
+}
+
 /// Standard PC/AT page-register port → absolute channel. 0x8F is the
 /// refresh page (ch4 is the cascade channel, never used for transfers).
 const DMA_PAGE_PORT: [(u16, usize); 7] = [

@@ -187,8 +187,12 @@ pub struct PcMachine {
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: VgaState,
-    /// Sound Blaster DMA virtualization (generic virtual 8237 + the
-    /// thread's BLASTER channel/IRQ map). SB itself is passthrough.
+    /// Generic virtual 8237 DMA controller shadow — bus infrastructure
+    /// shared by every DMA-using card model (SB today, GUS next), so it
+    /// lives here rather than inside any one card.
+    pub dma: Dma8237,
+    /// Sound Blaster card state (the thread's BLASTER channel/IRQ map +
+    /// DSP passthrough/emulation). Observes `dma` for its transfers.
     pub sb: SoundBlaster,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
@@ -386,6 +390,7 @@ impl PcMachine {
             skip_irq: false,
             e0_pending: false,
             vga: VgaState::new(),
+            dma: Dma8237::new(),
             sb: SoundBlaster::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
@@ -532,13 +537,13 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            pc.sb.sb_read(machine, p)
+            pc.sb.sb_read(machine, &pc.dma, p)
         }
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
         // poll it for DMA progress, not just completion).
         p if Dma8237::owns(p) =>
-            pc.sb.dma_read(machine, p),
+            pc.sb.dma_read(machine, &mut pc.dma, p),
         // Unknown ports read as an unpopulated ISA bus and are logged for missing-device coverage.
         _ => {
             if PORT_TRACE {
@@ -638,14 +643,14 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.is_passthrough(p) => {
-            pc.sb.sb_write(machine, p, val);
+            pc.sb.sb_write(machine, &pc.dma, p, val);
         }
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.
         p if Dma8237::owns(p) => {
-            pc.sb.dma.io_write(machine, p, val);
-            pc.sb.maybe_remap(machine, regs);
+            pc.dma.io_write(machine, p, val);
+            pc.sb.maybe_remap(machine, regs, &mut pc.dma);
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {

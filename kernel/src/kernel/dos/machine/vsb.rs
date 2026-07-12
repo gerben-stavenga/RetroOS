@@ -151,8 +151,10 @@ impl EmuDsp {
 }
 
 /// Per-thread Sound Blaster card state: the BLASTER-declared channel/IRQ map,
-/// the generic virtual 8237 it drives, and either the passthrough remap binding
-/// or the software DSP/DMA engine depending on `mode`.
+/// and either the passthrough remap binding or the software DSP/DMA engine
+/// depending on `mode`. The generic virtual 8237 it observes is bus
+/// infrastructure shared with every DMA-using card, so it lives on
+/// `PcMachine` and is passed in per call.
 pub struct SoundBlaster {
     /// The software DSP/DMA engine (used only when emulating).
     emu: EmuDsp,
@@ -169,7 +171,6 @@ pub struct SoundBlaster {
     /// a guest channel-D transfer must drive *these* on the real 8237.
     pub host_dma8: u8,
     pub host_dma16: u8,
-    pub dma: Dma8237, // generic virtual controller shadow
     dsp_test_reg: u8,
     dsp_read_data: Option<u8>,
     dsp_expect_test_write: bool,
@@ -219,7 +220,6 @@ impl SoundBlaster {
             opl: None,
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
-            dma: Dma8237::new(),
             dsp_test_reg: 0, dsp_read_data: None, dsp_expect_test_write: false,
             dsp_param_bytes: 0, dsp_dma_active: false, dsp_write_busy: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
@@ -239,8 +239,8 @@ impl SoundBlaster {
     }
 
     /// Whether virtual DMA channel `ch` is armed on the real chip.
-    pub fn dma_ch_armed(&self, ch: usize) -> bool {
-        ch < 8 && self.dma.ch[ch].armed
+    pub fn dma_ch_armed(&self, dma: &Dma8237, ch: usize) -> bool {
+        ch < 8 && dma.ch[ch].armed
     }
 
     /// Release any SB-DMA binding this thread holds — exec/exit cleanup.
@@ -295,7 +295,7 @@ impl SoundBlaster {
     /// shim for DSP command E4h/E8h (test register write/read). Some older
     /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
     /// sb16 does not appear to surface that response through passthrough.
-    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, p: u16) -> u8 {
+    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16) -> u8 {
         if self.emulated() {
             return self.emu_read(p);
         }
@@ -328,7 +328,7 @@ impl SoundBlaster {
             // hardware keeps accepting commands between auto-init blocks, and
             // our auto-init clients (Quake, Dune2, ROTT) must not stall here.
             let v = machine.inb(p);
-            if self.dsp_single_cycle_busy(machine) {
+            if self.dsp_single_cycle_busy(machine, dma) {
                 self.dsp_write_busy = self.dsp_write_busy.wrapping_add(1);
                 if self.dsp_write_busy & 8 != 0 {
                     return v | 0x80;
@@ -349,9 +349,9 @@ impl SoundBlaster {
     /// The 8237 single-cycle mode check (bit 4 clear) keeps auto-init clients
     /// (Quake, Dune2, ROTT) unconditionally exempt — their busy bit stays 0
     /// even across a pause/continue — so their command polls never throttle.
-    fn dsp_single_cycle_busy<A: crate::Arch>(&mut self, machine: &mut A) -> bool {
+    fn dsp_single_cycle_busy<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237) -> bool {
         self.dsp_dma_active
-            && self.dma.ch[self.dma8 as usize].prog.mode & 0x10 == 0
+            && dma.ch[self.dma8 as usize].prog.mode & 0x10 == 0
             && real_8237_count(machine, self.host_dma8) != 0xFFFF
     }
 
@@ -363,9 +363,9 @@ impl SoundBlaster {
     /// honest across the start/pause/resume of a single-cycle transfer. It
     /// never suppresses a write: every byte still reaches QEMU. A DSP reset
     /// (write to base+0x06) clears the tracker.
-    pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
+    pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
         if self.emulated() {
-            self.emu_write(machine, p, val);
+            self.emu_write(machine, dma, p, val);
             return;
         }
         if p == self.io_base + 0x06 {
@@ -424,7 +424,7 @@ impl SoundBlaster {
     ///  - **everything else** (not-yet-armed = programming snapshot,
     ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
     ///    the captured guest programming.
-    pub fn dma_read<A: crate::Arch>(&mut self, machine: &mut A, port: u16) -> u8 {
+    pub fn dma_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &mut Dma8237, port: u16) -> u8 {
         // Channel-data ports only: DMA1 0x00..=0x07 (addr/count pairs for
         // chan 0..3), DMA2 0xC0..=0xCF (addr/count pairs for chan 4..7,
         // 4-byte stride per channel due to 16-bit alignment). Control
@@ -448,31 +448,31 @@ impl SoundBlaster {
                 self.emu.tc_status &= !(0x0F << base);
                 return bits;
             }
-            return self.dma.io_read(machine, port);
+            return dma.io_read(machine, port);
         };
 
         // Emulated card: the live current-count comes from the software DSP's
         // play cursor (there is no real 8257 to interrogate).
         if self.emulated() {
-            return self.emu_dma_read(is_cnt, chan, hi_ctrl);
+            return self.emu_dma_read(dma, is_cnt, chan, hi_ctrl);
         }
 
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
                    else if chan == self.dma16 as usize { Some(self.host_dma16) }
                    else { None };
-        if self.dma.ch[chan].armed
+        if dma.ch[chan].armed
             && let Some(h) = host {
                 // Serve the *live* transfer state for the armed SB channel,
                 // lo/hi via the controller byte-pointer flip-flop; snapshot
                 // the full u16 at the low-byte read so the pair is coherent.
-                let ff = if hi_ctrl { &mut self.dma.ff_hi }
-                         else { &mut self.dma.ff_lo };
+                let ff = if hi_ctrl { &mut dma.ff_hi }
+                         else { &mut dma.ff_lo };
                 let low = !*ff;
                 *ff = !*ff;
                 if low {
                     let live_count = real_8237_count(machine, h);
-                    let p = self.dma.ch[chan].prog;
-                    self.dma.read_latch = if is_cnt {
+                    let p = dma.ch[chan].prog;
+                    dma.read_latch = if is_cnt {
                         // Count register: QEMU-8257's live current-count —
                         // decrements during playback, 0xFFFF at terminal
                         // (Dune2's 0x4D8 ISR relies on this).
@@ -489,17 +489,17 @@ impl SoundBlaster {
                         p.addr.wrapping_add(p.count.wrapping_sub(live_count))
                     };
                 }
-                let v = self.dma.read_latch;
+                let v = dma.read_latch;
                 return if low { v as u8 } else { (v >> 8) as u8 };
             }
-        self.dma.io_read(machine, port)
+        dma.io_read(machine, port)
     }
 
     /// Called after every virtual-8237 write. When the BLASTER channel is
     /// (re)armed, alias the guest's DMA buffer onto that channel's
     /// permanent host buffer and program the real 8237. A no-op until the
     /// guest finishes a count write (the per-block re-arm signal).
-    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237) {
         if self.emulated() {
             // No real chip to program / no buffer to alias: the virtual-8237
             // `prog` is already captured (io_write), and the software DSP reads
@@ -509,10 +509,10 @@ impl SoundBlaster {
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
         let c8 = self.dma8 as usize;
         let c16 = self.dma16 as usize;
-        let armed8 = c8 < 4 && !self.dma.ch[c8].masked
-            && self.dma.ch[c8].prog.count != 0;
-        let armed16 = (5..8).contains(&c16) && !self.dma.ch[c16].masked
-            && self.dma.ch[c16].prog.count != 0;
+        let armed8 = c8 < 4 && !dma.ch[c8].masked
+            && dma.ch[c8].prog.count != 0;
+        let armed16 = (5..8).contains(&c16) && !dma.ch[c16].masked
+            && dma.ch[c16].prog.count != 0;
         let (chan, is16, host) = if armed16 {
                 (c16, true, self.host_dma16 as usize)
             } else if armed8 {
@@ -526,13 +526,13 @@ impl SoundBlaster {
         // count_gen since we last acted. The per-block re-arm signal
         // regardless of whether the driver masks (single-cycle rewrites
         // count every block; auto-init writes it once).
-        let cur_gen = self.dma.count_gen[chan];
+        let cur_gen = dma.count_gen[chan];
         if self.last_gen[chan] == cur_gen { return; }
         self.last_gen[chan] = cur_gen;
 
-        let p = self.dma.ch[chan].prog;
+        let p = dma.ch[chan].prog;
         let (gpa, len) = chan_gpa_len(&p, is16);
-        self.arm(machine, regs, chan, host, is16, gpa, len, p.mode);
+        self.arm(machine, regs, dma, chan, host, is16, gpa, len, p.mode);
     }
 
     /// Alias the guest buffer at `gpa` onto host DMA channel `host`'s
@@ -540,7 +540,8 @@ impl SoundBlaster {
     /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
     /// virtual-8237 state after a task switch).
     #[allow(clippy::too_many_arguments)]
-    fn arm<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, chan: usize, host: usize, is16: bool,
+    fn arm<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, dma: &mut Dma8237,
+           chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
@@ -564,7 +565,7 @@ impl SoundBlaster {
         // so the transfer completes and raises the IRQ.
         if len < 0x100 || (gpa & !0xFFF) < 0x1000 {
             program_real_8237(machine, host as u8, phys, len, mode, is16);
-            self.dma.ch[chan].armed = true;
+            dma.ch[chan].armed = true;
             return;
         }
 
@@ -607,7 +608,7 @@ impl SoundBlaster {
         program_real_8237(machine, host as u8, phys, len, mode, is16);
         // Armed: the real QEMU-8257 is now authoritative for this channel's
         // live addr/count reads (`dma_read` serves them).
-        self.dma.ch[chan].armed = true;
+        dma.ch[chan].armed = true;
     }
 
     /// Detach the current alias: hand the guest's buffer range fresh
@@ -649,17 +650,17 @@ impl SoundBlaster {
     /// re-alias every channel the virtual 8237 still shows armed and
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
-    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237) {
         if self.emulated() { return; }
         if !self.suspended { return; }
         self.suspended = false;
         for chan in 0..8 {
-            if !self.dma.ch[chan].armed { continue; }
+            if !dma.ch[chan].armed { continue; }
             let is16 = chan >= 4;
             let host = if is16 { self.host_dma16 } else { self.host_dma8 } as usize;
-            let p = self.dma.ch[chan].prog;
+            let p = dma.ch[chan].prog;
             let (gpa, len) = chan_gpa_len(&p, is16);
-            self.arm(machine, regs, chan, host, is16, gpa, len, p.mode);
+            self.arm(machine, regs, dma, chan, host, is16, gpa, len, p.mode);
         }
     }
 
@@ -753,7 +754,7 @@ impl SoundBlaster {
     }
 
     /// Emulated DSP/mixer port write.
-    fn emu_write<A: crate::Arch>(&mut self, machine: &mut A, p: u16, val: u8) {
+    fn emu_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
         // OPL2/OPL3 FM (AdLib 0x388-0x38B, or the SB mirrors at io_base+0..3
         // and +8/+9): address latch + data writes into the FM synth, created
         // on first touch. Timer semantics live in `opl.rs` (same instant-
@@ -781,19 +782,19 @@ impl SoundBlaster {
                 }
                 self.emu.reset_prev = val;
             }
-            0x0C => self.emu_dsp_byte(machine, val), // DSP command / parameter port
+            0x0C => self.emu_dsp_byte(machine, dma, val), // DSP command / parameter port
             _ => {}                         // unmodeled DSP-block ports: ignored
         }
     }
 
     /// Feed one byte to the DSP command FSM: a parameter for the in-flight
     /// command, or the start of a new one.
-    fn emu_dsp_byte<A: crate::Arch>(&mut self, machine: &mut A, val: u8) {
+    fn emu_dsp_byte<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, val: u8) {
         if let Some(cmd) = self.emu.cmd {
             self.emu.params[self.emu.param_got as usize] = val;
             self.emu.param_got += 1;
             if self.emu.param_got >= self.emu.param_need {
-                self.emu_exec(machine, cmd);
+                self.emu_exec(machine, dma, cmd);
                 self.emu.cmd = None;
                 self.emu.param_got = 0;
             }
@@ -811,12 +812,12 @@ impl SoundBlaster {
             self.emu.param_need = need;
             self.emu.param_got = 0;
         } else {
-            self.emu_exec(machine, val);
+            self.emu_exec(machine, dma, val);
         }
     }
 
     /// Execute a fully-parameterized DSP command.
-    fn emu_exec<A: crate::Arch>(&mut self, machine: &mut A, cmd: u8) {
+    fn emu_exec<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, cmd: u8) {
         let p = self.emu.params;
         if super::PORT_TRACE {
             crate::dbg_println!(
@@ -852,19 +853,19 @@ impl SoundBlaster {
             0x48 => self.emu.block_param = (p[0] as u16) | ((p[1] as u16) << 8),
             // Legacy 8-bit mono output. 0x1C/0x90 = auto-init (block from 0x48);
             // 0x14/0x91 = single-cycle (play once; length from the 8237).
-            0x1C | 0x90 => self.emu_start(8, false, None, false),
-            0x14 | 0x91 => self.emu_start(8, false, None, true),
+            0x1C | 0x90 => self.emu_start(dma, 8, false, None, false),
+            0x14 | 0x91 => self.emu_start(dma, 8, false, None, true),
             // SB16 8-/16-bit output: mode byte + 16-bit length; bit1 = auto-init,
             // its absence = single-cycle. (0xC8.., 0xB8.. are input/ADC — ignored.)
             0xC0..=0xC7 => {
                 let stereo = p[0] & 0x20 != 0;
                 let single = cmd & 0x02 == 0;
-                self.emu_start(8, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
+                self.emu_start(dma, 8, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
             }
             0xB0..=0xB7 => {
                 let stereo = p[0] & 0x20 != 0;
                 let single = cmd & 0x02 == 0;
-                self.emu_start(16, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
+                self.emu_start(dma, 16, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
             }
             _ => {}
         }
@@ -872,7 +873,7 @@ impl SoundBlaster {
 
     /// Begin auto-init playback: snapshot the ring geometry from the active
     /// BLASTER channel's virtual-8237 programming and arm the play cursor.
-    fn emu_start(&mut self, bits: u8, stereo: bool, block_override: Option<u16>, single: bool) {
+    fn emu_start(&mut self, dma: &Dma8237, bits: u8, stereo: bool, block_override: Option<u16>, single: bool) {
         self.emu.bits = bits;
         self.emu.stereo = stereo;
         self.emu.single = single;
@@ -883,7 +884,7 @@ impl SoundBlaster {
 
         let is16 = bits == 16;
         let chan = if is16 { self.dma16 as usize } else { self.dma8 as usize };
-        let prog = self.dma.ch[chan].prog;
+        let prog = dma.ch[chan].prog;
         let (gpa, len_bytes) = chan_gpa_len(&prog, is16);
         let frame_bytes = (bits as u32 / 8) * channels;
         self.emu.buf_gpa = gpa;
@@ -1120,7 +1121,7 @@ impl SoundBlaster {
     /// Emulated DMA current-address/count read: serve the active SB channel's
     /// live state from the play cursor (auto-init down-count), other channels
     /// from the captured base programming. Mirrors `dma_read`'s flip-flop split.
-    fn emu_dma_read(&mut self, is_cnt: bool, chan: usize, hi_ctrl: bool) -> u8 {
+    fn emu_dma_read(&mut self, dma: &mut Dma8237, is_cnt: bool, chan: usize, hi_ctrl: bool) -> u8 {
         let is_active = chan == self.dma8 as usize || chan == self.dma16 as usize;
         // The guest reading the active channel's count = it serviced the block
         // (computed `current_play_seg` to refill). Release the consume gate so
@@ -1128,7 +1129,7 @@ impl SoundBlaster {
         if is_cnt && is_active && self.emu.playing {
             self.emu.awaiting_ack = false;
         }
-        let ff = if hi_ctrl { &mut self.dma.ff_hi } else { &mut self.dma.ff_lo };
+        let ff = if hi_ctrl { &mut dma.ff_hi } else { &mut dma.ff_lo };
         let low = !*ff;
         *ff = !*ff;
         if self.emu.playing && is_active {
@@ -1137,13 +1138,13 @@ impl SoundBlaster {
                 let total = (self.emu.buf_frames as u64 * channels).max(1); // transfers
                 let consumed = (self.emu.cursor * channels) % total;
                 let count = total.wrapping_sub(1).wrapping_sub(consumed) as u16;
-                let addr = self.dma.ch[chan].prog.addr.wrapping_add(consumed as u16);
-                self.dma.read_latch = if is_cnt { count } else { addr };
+                let addr = dma.ch[chan].prog.addr.wrapping_add(consumed as u16);
+                dma.read_latch = if is_cnt { count } else { addr };
             }
-            let v = self.dma.read_latch;
+            let v = dma.read_latch;
             return if low { v as u8 } else { (v >> 8) as u8 };
         }
-        let p = self.dma.ch[chan].prog;
+        let p = dma.ch[chan].prog;
         // Post-terminal-count state: a finished single-cycle transfer reads
         // count 0xFFFF (underflow) and the address one past the end, until the
         // channel is restarted — not the base programming.
@@ -1155,17 +1156,6 @@ impl SoundBlaster {
             p.addr
         };
         if low { v as u8 } else { (v >> 8) as u8 }
-    }
-}
-
-/// Decode a channel's captured 8237 programming into the (DOS-physical
-/// buffer address, byte length) the SB-DMA layer works in. 16-bit
-/// channels count words: addr is a word offset, count a word count − 1.
-fn chan_gpa_len(p: &DmaProg, is16: bool) -> (u32, u32) {
-    if is16 {
-        (((p.page as u32) << 16) | ((p.addr as u32) << 1), ((p.count as u32) + 1) * 2)
-    } else {
-        (((p.page as u32) << 16) | p.addr as u32, (p.count as u32) + 1)
     }
 }
 
