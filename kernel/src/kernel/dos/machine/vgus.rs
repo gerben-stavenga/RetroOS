@@ -302,6 +302,13 @@ impl Gus {
         if let Some(n) = it.next().and_then(|t| parse_uint(t, 10)) {
             self.irq = n as u8;
         }
+        // One line per program launch: which wiring this program's GUS got.
+        // The counterpart of DMX's own "GUS1/GUS2 vs ain't responding" —
+        // together they answer every "why is there no GUS music" report.
+        crate::dbg_println!(
+            "[gus] ULTRASND base={:03X} irq={} dma={}",
+            self.base, self.irq, self.dma_ch
+        );
     }
 
     /// Program-exit / exec cleanup: drop the whole core so the next program
