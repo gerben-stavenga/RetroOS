@@ -163,3 +163,92 @@ pub fn min_fill(rate: u32) -> Option<u32> {
         Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => None,
     }
 }
+
+/// Producer-side pacing for a *generated* PCM stream — the synth pumps (FM,
+/// GUS wavetable) that make frames on demand rather than consuming a guest
+/// ring. Answers one question per tick: how many frames are due now?
+///
+/// Slaved to the sink's playback position when it reports one ([`position`]):
+/// keep [`min_fill`] frames queued ahead of the drain point, so the pump and
+/// the codec share a clock by construction — the synth-side counterpart of
+/// the vsb pipe model, and the reason the sink needs no clock-follow servo.
+/// Paced by virtual time at the session rate otherwise (WAV window / silent
+/// sinks have no consumer clock to read).
+///
+/// A session is keyed by rate: [`due`](Self::due) re-anchors itself when the
+/// rate changes (the sink restarts its stream and counters then), and
+/// [`reset`](Self::reset) parks it when the pump goes idle or is superseded.
+pub struct Pace {
+    rate: u32,
+    /// Pipe depth target in source frames; 0 = synthetic (no sink position).
+    fill: u32,
+    use_pos: bool,
+    /// Source frames pushed this session.
+    pushed: u64,
+    /// Sink `written` counter at our session start (`u64::MAX` = not yet
+    /// anchored; computed as `written − pushed` on the tick after the first
+    /// push, so anything queued before us drains first — see vsb).
+    anchor: u64,
+    /// Synthetic-clock accumulator, frames × 1000.
+    frac: u64,
+}
+
+impl Pace {
+    pub const fn new() -> Self {
+        Pace { rate: 0, fill: 0, use_pos: false, pushed: 0, anchor: u64::MAX, frac: 0 }
+    }
+
+    /// Park the pacer: next [`due`] starts a fresh session (fresh anchor).
+    /// Call when the pump stops its stream or another producer takes the sink.
+    pub fn reset(&mut self) {
+        self.rate = 0;
+        self.pushed = 0;
+        self.anchor = u64::MAX;
+        self.frac = 0;
+    }
+
+    /// Frames due at `rate` after `dt_ms` of virtual time. The caller must
+    /// push exactly this many frames to the sink before the next call.
+    pub fn due<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, dt_ms: u64) -> u64 {
+        if rate != self.rate {
+            // New session (first tick, or a rate change — the sink restarts
+            // its stream and counters on that): re-key and re-anchor.
+            let fill = min_fill(rate);
+            self.rate = rate;
+            self.use_pos = fill.is_some();
+            self.fill = fill.unwrap_or(0);
+            self.pushed = 0;
+            self.anchor = u64::MAX;
+            self.frac = 0;
+        }
+        if self.use_pos {
+            let (written, consumed) = position(machine).unwrap_or((0, 0));
+            if self.anchor == u64::MAX && self.pushed > 0 {
+                self.anchor = written.saturating_sub(self.pushed);
+            }
+            let drained = if self.anchor == u64::MAX {
+                0
+            } else {
+                consumed.saturating_sub(self.anchor)
+            };
+            // Top the pipe up to `fill` ahead of the drain point. Self-
+            // limiting: `consumed` can never pass what was written, so a
+            // stall's backlog is bounded by `fill`, never a burst.
+            let due = (drained + self.fill as u64).saturating_sub(self.pushed);
+            self.pushed += due;
+            due
+        } else {
+            self.frac += rate as u64 * dt_ms;
+            let due = self.frac / 1000;
+            self.frac %= 1000;
+            self.pushed += due;
+            due
+        }
+    }
+}
+
+impl Default for Pace {
+    fn default() -> Self {
+        Self::new()
+    }
+}

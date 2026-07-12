@@ -135,9 +135,10 @@ struct GusCore {
     ramp_pending: u32,
     /// `get_ticks()` at the last `tick` (virtual-time pacing anchor).
     last_ms: u64,
-    /// Standalone-pump pacing: sub-frame accumulator (frames × 1000) and
+    /// Standalone-pump pacing — slaved to the sink's playback position where
+    /// one exists (see [`sound::Pace`](crate::kernel::sound::Pace)) — and
     /// whether we currently own an open canonical stream.
-    frac: u64,
+    pace: crate::kernel::sound::Pace,
     streaming: bool,
     /// A reg-0x41 write with the enable bit set: the upload is serviced by
     /// `service_dma` right after the register write returns (it needs the
@@ -190,7 +191,7 @@ impl GusCore {
             wave_pending: 0,
             ramp_pending: 0,
             last_ms: 0,
-            frac: 0,
+            pace: crate::kernel::sound::Pace::new(),
             streaming: false,
             dma_kick: false,
             dma_tc: false,
@@ -226,7 +227,7 @@ impl GusCore {
         self.timers = [GusTimer::default(); 2];
         self.wave_pending = 0;
         self.ramp_pending = 0;
-        self.frac = 0;
+        self.pace.reset();
         self.dma_kick = false;
         self.dma_tc = false;
         self.dma_irq_latch = false;
@@ -329,11 +330,13 @@ impl Gus {
     }
 
     /// Per-quantum device tick, from `machine::audio_tick`: pace the rate
-    /// timers and the standalone playback pump by virtual time, and raise
-    /// the GF1 IRQ line for enabled, unserviced sources. While the SB DSP
-    /// stream owns the sink (`dsp_streaming`) the pump parks and the DSP
-    /// pulls us per frame instead (the `MixSource` impl below); timers and
-    /// IRQ delivery run regardless.
+    /// timers by virtual time, the standalone playback pump by the sink's
+    /// real playback position (`sound::Pace` — virtual time only where the
+    /// sink has no clock), and raise the GF1 IRQ line for enabled,
+    /// unserviced sources. While the SB DSP stream owns the sink
+    /// (`dsp_streaming`) the pump parks and the DSP pulls us per frame
+    /// instead (the `MixSource` impl below); timers and IRQ delivery run
+    /// regardless.
     pub fn tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
@@ -383,13 +386,11 @@ impl Gus {
         if dsp_streaming {
             // The DSP stream superseded the pump mid-flight; it re-programs
             // the sink itself and pulls our frames, so nothing to stop.
-            c.frac = 0;
+            c.pace.reset();
             c.streaming = false;
         } else if audible {
             let rate = c.native_rate();
-            c.frac += rate as u64 * dt as u64;
-            let mut n = c.frac / 1000;
-            c.frac %= 1000;
+            let mut n = c.pace.due(machine, rate, dt as u64);
             if n > 0 {
                 c.streaming = true;
                 let mut pcm = [0i16; CHUNK_FRAMES * 2];
@@ -415,7 +416,7 @@ impl Gus {
                 crate::kernel::sound::stop(machine, false); // pause, keep configured
                 c.streaming = false;
             }
-            c.frac = 0;
+            c.pace.reset();
         }
         // Master IRQ enable is reset-register bit 2.
         if want_irq && c.reset_reg & 0x04 != 0 && !vpic.is_requested(self.irq) {

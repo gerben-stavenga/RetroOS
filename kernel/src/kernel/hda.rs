@@ -102,15 +102,10 @@ const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 const NUM_BUF: usize = 32;
 const BUF_BYTES: usize = 0x800; // 2 KB = 512 stereo frames ≈ 23 ms @ 22 kHz
 const PRIME_BUFS: usize = 3;
-/// Ring-fill setpoint (buffers ahead of the codec) the output clock-follow
-/// servos toward: ~116 ms @ 44.1 kHz — above real audio backends' chunk
-/// jitter (pulseaudio consumes in ~50-100 ms gulps), below annoying-latency.
-const TARGET_AHEAD: usize = 10;
 /// Hard drop ceiling, just under the ring's ahead/behind ambiguity point.
-/// The servo keeps fill at TARGET_AHEAD; this only catches runaway bursts.
+/// Every producer is position-slaved (`sound::position`/`sound::Pace`) and
+/// pins its own fill, so this only catches runaway bursts.
 const MAX_AHEAD: usize = 15;
-/// Clock-follow authority: ±25‰ (2.5%) trim on the output resample ratio.
-const TRIM_MAX_PM: i32 = 25;
 /// Stream tag bound between the descriptor and the DAC converter (1..15).
 const STREAM_TAG: u32 = 1;
 /// Boot-time bring-up diagnostics to debugcon (flip on to debug the codec).
@@ -250,22 +245,12 @@ struct Hda {
     src_rate: u32,
     /// Output-rate accumulator for zero-order-hold resampling.
     resample_acc: u64,
-    /// Clock-follow trim (permille) on the output resample ratio. A
-    /// *free-running* producer (the GUS pump) paces on guest virtual time,
-    /// the codec on the sound card's real clock; nobody guarantees those
-    /// match or advance smoothly, so an open-loop ring random-walks into
-    /// the drop ceiling (lost audio) or a codec lap (stale-ring echo).
-    /// Updated each buffer boundary from the fill level. Forced to 0 while
-    /// `slaved` — a position-slaved producer pins the fill itself, and any
-    /// trim would skew the consumed-counter inversion it paces by.
-    trim_pm: i32,
-    /// A producer read [`position`] this session: it slaves its pacing to
-    /// consumption, so the clock-follow servo must stand down (see
-    /// `trim_pm`). Cleared with the session in `stop_playback`.
-    slaved: bool,
     /// Pipe counters for [`position`]: source frames accepted by `submit`,
     /// and hardware bytes consumed (LPIB deltas accumulated across ring
-    /// wraps — LPIB itself is modular in CBL).
+    /// wraps — LPIB itself is modular in CBL). Every producer slaves its
+    /// pacing to these (`sound::Pace` / the vsb pipe model), which is why
+    /// this driver needs no clock-follow servo: producer and codec share a
+    /// clock by construction.
     written_src: u64,
     consumed_hw: u64,
     last_lpib: u32,
@@ -564,13 +549,11 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         rate: 0,
         src_rate: 0,
         resample_acc: 0,
-        slaved: false,
         written_src: 0,
         consumed_hw: 0,
         last_lpib: 0,
         logged_submit: false,
         logged_run: false,
-        trim_pm: 0,
         diag_buffers: 0,
         diag_stalls: 0,
     };
@@ -854,7 +837,6 @@ impl Hda {
         self.cur_buf = 0;
         self.cur_off = 0;
         self.resample_acc = 0;
-        self.slaved = false;
         self.written_src = 0;
         self.consumed_hw = 0;
         self.last_lpib = 0;
@@ -1388,7 +1370,6 @@ impl Hda {
                     core::ptr::write_bytes(self.buf_va(guard) as *mut u8, 0, BUF_BYTES);
                 }
                 self.cur_buf = (civ + 2) % NUM_BUF;
-                self.trim_pm = TRIM_MAX_PM; // refill toward the setpoint
             } else if ahead >= MAX_AHEAD {
                 if self.diag_stalls < 3 {
                     crate::println!(
@@ -1402,19 +1383,6 @@ impl Hda {
                     self.diag_stalls += 1;
                 }
                 return false;
-            } else {
-                // Proportional trim toward the fill setpoint: producer fast
-                // (fill high) → emit fewer output frames per source frame;
-                // producer slow → emit more. Pinned fill = no drops, no laps.
-                self.trim_pm =
-                    ((TARGET_AHEAD as i32 - ahead as i32) * 4).clamp(-TRIM_MAX_PM, TRIM_MAX_PM);
-            }
-            // A position-slaved producer pins the fill itself, and the servo
-            // fighting it would skew the consumed-counter inversion the
-            // producer paces by: 1:1 resampling only. (The lap resync above
-            // still applies — it's the emergency path, not the servo.)
-            if self.slaved {
-                self.trim_pm = 0;
             }
         }
         let p = self.buf_va(self.cur_buf) + self.cur_off;
@@ -1499,10 +1467,9 @@ impl Hda {
             self.set_format(hw_rate);
             self.src_rate = src_rate;
             self.resample_acc = 0;
-            self.trim_pm = 0;
-            // New stream session: pipe counters restart with it. `slaved`
-            // is left as-is — the producer that set it is mid-session and
-            // re-anchors to the fresh counters on its next position read.
+            // New stream session: pipe counters restart with it; the
+            // producer re-anchors to the fresh counters on its next
+            // position read.
             self.written_src = 0;
             self.consumed_hw = 0;
             self.last_lpib = 0;
@@ -1527,13 +1494,11 @@ impl Hda {
         for i in 0..bytes.len() / fb {
             let (l, r) = fmt.frame(bytes, i);
             self.written_src += 1;
-            // One resample path for every ratio (1:1 included) so the
-            // clock-follow trim applies uniformly: the effective output
-            // rate flexes ±TRIM_MAX_PM‰ around the hardware rate to hold
-            // the ring fill at its setpoint.
-            let hw_eff =
-                (hw_rate as i64 + (hw_rate as i64 * self.trim_pm as i64) / 1000) as u64;
-            self.resample_acc += hw_eff;
+            // Fixed-ratio zero-order-hold resample. No clock-follow trim:
+            // producers pace by [`position`], so their rate IS the codec's
+            // rate — and a trimmed ratio would skew the consumed-counter
+            // inversion `position` performs.
+            self.resample_acc += hw_rate as u64;
             while self.resample_acc >= src_rate as u64 {
                 if !self.emit_stereo(l, r) {
                     return;
@@ -1733,16 +1698,13 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
 
 /// Pipe counters for `sound::position`: `(written, consumed)` in source
 /// frames of the current stream session. `consumed` inverts the accumulated
-/// hardware byte position through the session's fixed resample ratio —
-/// exact because reading this switches the driver to `slaved` mode, which
-/// pins the clock-follow trim at 0 (see `Hda::trim_pm`).
+/// hardware byte position through the session's fixed resample ratio.
 pub fn position() -> Option<(u64, u64)> {
     let mut g = HDA.lock();
     let dev = g.as_mut()?;
     if dev.parked {
         return None;
     }
-    dev.slaved = true;
     dev.update_consumed();
     if dev.src_rate == 0 || dev.rate == 0 {
         return Some((dev.written_src, 0)); // no stream session yet

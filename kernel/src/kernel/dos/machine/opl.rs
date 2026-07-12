@@ -12,8 +12,9 @@
 //! Output follows the one-producer rule of the canonical `sound` sink:
 //!
 //!  - **standalone** (no DSP playback): [`OplFm::tick`] paces native-rate
-//!    frames by virtual time straight into `sound::play` — the sink owns
-//!    any resampling, like every other producer.
+//!    frames into `sound::play` by the sink's real playback position
+//!    (`sound::Pace`; virtual time where the sink has no clock) — the sink
+//!    owns any resampling, like every other producer.
 //!  - **mixed** (DSP playback active): the DSP stream owns the sink, and
 //!    `emit_frames` pulls FM frames at the DSP rate via [`OplFm::mix_frame`]
 //!    (chip-native steps, zero-order hold — the same resampling the codec
@@ -91,8 +92,9 @@ pub(super) struct OplFm {
     last_write_ms: u64,
     /// `get_ticks()` at the last `tick` (standalone pacing).
     last_ms: u64,
-    /// Sub-frame pacing accumulator, units of frames×1000 (as vsb's `frac`).
-    frac: u64,
+    /// Standalone-pump pacing — slaved to the sink's playback position where
+    /// one exists ([`sound::Pace`](crate::kernel::sound::Pace)).
+    pace: crate::kernel::sound::Pace,
     /// Native-frame accumulator for the DSP-rate pull in `mix_frame`.
     mix_acc: u32,
     /// Last native frame generated (zero-order hold for `mix_frame`).
@@ -113,7 +115,7 @@ impl OplFm {
             status: 0,
             last_write_ms: now,
             last_ms: now,
-            frac: 0,
+            pace: crate::kernel::sound::Pace::new(),
             mix_acc: 0,
             hold: (0, 0),
             streaming: false,
@@ -170,8 +172,9 @@ impl OplFm {
 
     /// Standalone pump — the per-quantum device tick. While the DSP stream is
     /// live it owns the sink and pulls FM itself (`mix_frame`), so this only
-    /// re-anchors the pacing clock; otherwise synthesize the elapsed virtual
-    /// time at native rate and push it to the canonical output.
+    /// re-anchors the pacing clock; otherwise generate what the sink's
+    /// playback position says is due (`sound::Pace` — virtual time only where
+    /// the sink has no clock) and push it to the canonical output.
     pub(super) fn tick<A: crate::Arch>(&mut self, machine: &mut A, dsp_streaming: bool) {
         let now = machine.get_ticks();
         let dt = now.saturating_sub(self.last_ms).min(MAX_CATCHUP_MS);
@@ -179,7 +182,7 @@ impl OplFm {
         if dsp_streaming {
             // The DSP stream superseded ours mid-flight; it re-programs the
             // sink rate itself, so there is nothing to stop or flush.
-            self.frac = 0;
+            self.pace.reset();
             self.streaming = false;
             return;
         }
@@ -188,12 +191,10 @@ impl OplFm {
                 crate::kernel::sound::stop(machine, false); // pause, keep configured
                 self.streaming = false;
             }
-            self.frac = 0;
+            self.pace.reset();
             return;
         }
-        self.frac += NATIVE_RATE as u64 * dt;
-        let mut n = self.frac / 1000;
-        self.frac %= 1000;
+        let mut n = self.pace.due(machine, NATIVE_RATE, dt);
         if n == 0 {
             return;
         }
