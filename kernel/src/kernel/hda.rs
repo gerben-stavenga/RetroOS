@@ -250,14 +250,25 @@ struct Hda {
     src_rate: u32,
     /// Output-rate accumulator for zero-order-hold resampling.
     resample_acc: u64,
-    /// Clock-follow trim (permille) on the output resample ratio. The
-    /// producer paces on guest virtual time, the codec on the sound card's
-    /// real clock; nobody guarantees those match or advance smoothly, so an
-    /// open-loop ring random-walks into the drop ceiling (lost audio) or a
-    /// codec lap (stale-ring echo). Updated each buffer boundary from the
-    /// fill level; guest-visible pacing (DMA counts, IRQs) is untouched —
-    /// only the emitted frame count flexes.
+    /// Clock-follow trim (permille) on the output resample ratio. A
+    /// *free-running* producer (the GUS pump) paces on guest virtual time,
+    /// the codec on the sound card's real clock; nobody guarantees those
+    /// match or advance smoothly, so an open-loop ring random-walks into
+    /// the drop ceiling (lost audio) or a codec lap (stale-ring echo).
+    /// Updated each buffer boundary from the fill level. Forced to 0 while
+    /// `slaved` — a position-slaved producer pins the fill itself, and any
+    /// trim would skew the consumed-counter inversion it paces by.
     trim_pm: i32,
+    /// A producer read [`position`] this session: it slaves its pacing to
+    /// consumption, so the clock-follow servo must stand down (see
+    /// `trim_pm`). Cleared with the session in `stop_playback`.
+    slaved: bool,
+    /// Pipe counters for [`position`]: source frames accepted by `submit`,
+    /// and hardware bytes consumed (LPIB deltas accumulated across ring
+    /// wraps — LPIB itself is modular in CBL).
+    written_src: u64,
+    consumed_hw: u64,
+    last_lpib: u32,
     /// Sparse runtime diagnostics for real hardware bring-up.
     logged_submit: bool,
     logged_run: bool,
@@ -553,6 +564,10 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         rate: 0,
         src_rate: 0,
         resample_acc: 0,
+        slaved: false,
+        written_src: 0,
+        consumed_hw: 0,
+        last_lpib: 0,
         logged_submit: false,
         logged_run: false,
         trim_pm: 0,
@@ -839,6 +854,10 @@ impl Hda {
         self.cur_buf = 0;
         self.cur_off = 0;
         self.resample_acc = 0;
+        self.slaved = false;
+        self.written_src = 0;
+        self.consumed_hw = 0;
+        self.last_lpib = 0;
         // Clear the PCM ring: the producer restarts at buffer 0, so if the
         // hardware ever runs past the freshly primed buffers (session start,
         // underrun) it must find silence, not a replay of the previous
@@ -1390,6 +1409,13 @@ impl Hda {
                 self.trim_pm =
                     ((TARGET_AHEAD as i32 - ahead as i32) * 4).clamp(-TRIM_MAX_PM, TRIM_MAX_PM);
             }
+            // A position-slaved producer pins the fill itself, and the servo
+            // fighting it would skew the consumed-counter inversion the
+            // producer paces by: 1:1 resampling only. (The lap resync above
+            // still applies — it's the emergency path, not the servo.)
+            if self.slaved {
+                self.trim_pm = 0;
+            }
         }
         let p = self.buf_va(self.cur_buf) + self.cur_off;
         unsafe {
@@ -1400,6 +1426,18 @@ impl Hda {
         if self.cur_off >= BUF_BYTES {
             self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
             self.cur_off = 0;
+            // Zero the buffer AHEAD of the write cursor. Nothing queued lives
+            // there (fill is capped well under a ring lap), so this only
+            // erases history — if the codec ever outruns the producer it
+            // plays a guard of silence instead of the previous lap's audio.
+            // Matters most for slaved mode's shallow fill.
+            unsafe {
+                core::ptr::write_bytes(
+                    self.buf_va((self.cur_buf + 1) % NUM_BUF) as *mut u8,
+                    0,
+                    BUF_BYTES,
+                );
+            }
             // Start the stream once a small cushion is primed. Write RUN +
             // stream number as ONE dword so QEMU re-evaluates the codec<->
             // stream binding with the stream number visible (a byte-0-only
@@ -1462,6 +1500,12 @@ impl Hda {
             self.src_rate = src_rate;
             self.resample_acc = 0;
             self.trim_pm = 0;
+            // New stream session: pipe counters restart with it. `slaved`
+            // is left as-is — the producer that set it is mid-session and
+            // re-anchors to the fresh counters on its next position read.
+            self.written_src = 0;
+            self.consumed_hw = 0;
+            self.last_lpib = 0;
         }
         let fb = fmt.frame_bytes();
         if fb == 0 {
@@ -1482,6 +1526,7 @@ impl Hda {
         }
         for i in 0..bytes.len() / fb {
             let (l, r) = fmt.frame(bytes, i);
+            self.written_src += 1;
             // One resample path for every ratio (1:1 included) so the
             // clock-follow trim applies uniformly: the effective output
             // rate flexes ±TRIM_MAX_PM‰ around the hardware rate to hold
@@ -1496,6 +1541,20 @@ impl Hda {
                 self.resample_acc -= src_rate as u64;
             }
         }
+    }
+
+    /// Accumulate the codec's consumed-byte counter from LPIB deltas (LPIB
+    /// itself wraps at CBL). Call cadence must beat a full ring period
+    /// (~370 ms @ 44.1 kHz); the slaved producer polls every scheduler
+    /// slice, orders of magnitude inside that.
+    fn update_consumed(&mut self) {
+        if !self.running {
+            return;
+        }
+        let cbl = (NUM_BUF * BUF_BYTES) as u32;
+        let lpib = r32(self.sd + SDLPIB) % cbl.max(1);
+        self.consumed_hw += ((lpib + cbl - self.last_lpib) % cbl) as u64;
+        self.last_lpib = lpib;
     }
 }
 
@@ -1670,6 +1729,41 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     if let Some(dev) = g.as_mut() {
         dev.submit(rate, fmt, bytes);
     }
+}
+
+/// Pipe counters for `sound::position`: `(written, consumed)` in source
+/// frames of the current stream session. `consumed` inverts the accumulated
+/// hardware byte position through the session's fixed resample ratio —
+/// exact because reading this switches the driver to `slaved` mode, which
+/// pins the clock-follow trim at 0 (see `Hda::trim_pm`).
+pub fn position() -> Option<(u64, u64)> {
+    let mut g = HDA.lock();
+    let dev = g.as_mut()?;
+    if dev.parked {
+        return None;
+    }
+    dev.slaved = true;
+    dev.update_consumed();
+    if dev.src_rate == 0 || dev.rate == 0 {
+        return Some((dev.written_src, 0)); // no stream session yet
+    }
+    let consumed_src = (dev.consumed_hw / 4) * dev.src_rate as u64 / dev.rate as u64;
+    Some((dev.written_src, consumed_src))
+}
+
+/// Minimum pipe fill for a position-slaved producer, in source frames:
+/// the stream-start prime plus one hardware buffer of claim-burst slack,
+/// converted to the source rate.
+pub fn min_fill(rate: u32) -> Option<u32> {
+    let g = HDA.lock();
+    let dev = g.as_ref()?;
+    if dev.parked && dev.verb_failed {
+        return None;
+    }
+    let src = if rate == 0 { 44100 } else { rate };
+    let hw = Hda::hardware_rate(src);
+    let hw_frames = ((PRIME_BUFS + 1) * BUF_BYTES / 4) as u64;
+    Some((hw_frames * src as u64 / hw as u64) as u32 + 1)
 }
 
 /// Panic-path quiesce: stop all controller DMA and hold the link in reset so a

@@ -46,6 +46,7 @@ const NAM_PCM_DAC_RATE: u16 = 0x2C; // sample rate when VRA enabled
 const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
 const PO_CIV: u16 = 0x14; // 8-bit: current index value (RO)
 const PO_LVI: u16 = 0x15; // 8-bit: last valid index
+const PO_PICB: u16 = 0x18; // 16-bit: samples left in the current buffer (RO)
 const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset)
 const GLOB_CNT: u16 = 0x2C; // 32-bit: bit1 = AC-link out of cold reset
 const GLOB_STA: u16 = 0x30; // 32-bit: bit8 = primary codec ready
@@ -87,6 +88,13 @@ struct Ac97 {
     cur_off: usize, // byte offset within `cur_buf`
     running: bool,  // bus master started
     rate: u32,      // last programmed sample rate (Hz)
+    /// Pipe counters for [`position`] (the DAC runs at the source rate — no
+    /// resampler — so these are directly in source frames). `written` counts
+    /// frames accepted by `submit`; `consumed_bufs` accumulates completed
+    /// ring buffers from CIV deltas (CIV alone is modular).
+    written: u64,
+    consumed_bufs: u64,
+    last_civ: u8,
 }
 
 static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
@@ -176,6 +184,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         cur_off: 0,
         running: false,
         rate: 0,
+        written: 0,
+        consumed_bufs: 0,
+        last_civ: 0,
     };
     d.build_bdl();
     machine.outl(nabm + PO_BDBAR, dma_phys); // BDL base
@@ -241,6 +252,7 @@ impl Ac97 {
                 core::ptr::write_volatile(p as *mut u16, l as u16);
                 core::ptr::write_volatile((p + 2) as *mut u16, r as u16);
             }
+            self.written += 1;
             self.cur_off += 4;
             if self.cur_off >= BUF_BYTES {
                 // Buffer complete: make it the last valid index. Start the bus
@@ -265,5 +277,40 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     if let Some(dev) = g.as_mut() {
         dev.submit(machine, rate, fmt, bytes);
     }
+}
+
+/// Pipe counters for `sound::position`: `(written, consumed)` in source
+/// frames (the DAC is programmed to the source rate — 1 frame here is 1
+/// source frame). `consumed` = completed buffers (CIV-delta accumulated)
+/// plus PICB progress inside the current one; it stalls when the bus
+/// master halts at LVI, which is exactly what the slaved producer needs
+/// to see (its clock stops until it queues more).
+pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
+    let mut g = AC97.lock();
+    let dev = g.as_mut()?;
+    if !dev.running {
+        return Some((dev.written, 0));
+    }
+    let civ = machine.inb(dev.nabm + PO_CIV);
+    dev.consumed_bufs += ((civ + NUM_BUF as u8 - dev.last_civ) % NUM_BUF as u8) as u64;
+    dev.last_civ = civ;
+    let frames_per_buf = (BUF_BYTES / 4) as u64;
+    // PICB: 16-bit samples remaining in the current buffer → frames played.
+    let picb = machine.inw(dev.nabm + PO_PICB) as u64;
+    let in_buf = frames_per_buf.saturating_sub(picb / 2);
+    Some((dev.written, dev.consumed_bufs * frames_per_buf + in_buf))
+}
+
+/// Minimum pipe fill for a position-slaved producer, in source frames: the
+/// bus master only plays *completed* ring buffers (LVI gates it), so the
+/// fill must always span the start prime (`PRIME_BUFS` full buffers) plus a
+/// partial buffer of slack — below that the engine halts at LVI while the
+/// producer waits for consumption, and the pipe deadlocks.
+pub fn min_fill(_rate: u32) -> Option<u32> {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return None;
+    }
+    let frames_per_buf = (BUF_BYTES / 4) as u32;
+    Some(PRIME_BUFS as u32 * frames_per_buf + frames_per_buf / 4)
 }
 

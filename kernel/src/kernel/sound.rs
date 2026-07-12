@@ -128,3 +128,38 @@ pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
         Audio::SbPassthrough | Audio::EmulatedSilent => {}
     }
 }
+
+/// The selected output's pipe counters, in **source-rate frames**:
+/// `(written, consumed)` — frames accepted via [`play`] and frames the
+/// hardware has actually claimed for playback, both since the output's
+/// current stream session started. `None` when the output has no real-time
+/// consumer (WAV port window, silent): there is no playback clock to read,
+/// and the producer must pace itself by virtual time instead.
+///
+/// This is the pull side of the SB pipe model: the emulated DSP slaves its
+/// guest-visible cursor (DMA counts, block IRQs) to `consumed`, so guest
+/// timing derives from real playback — the same definition a real card's
+/// DMA cursor has — instead of a free-running virtual clock that the sink
+/// then has to absorb with a deep latency cushion.
+pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
+    use crate::kernel::platform::Audio;
+    match crate::kernel::platform::get().audio {
+        Audio::EmulatedHda => crate::kernel::hda::position(),
+        Audio::EmulatedAc97 => crate::kernel::ac97::position(machine),
+        Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => None,
+    }
+}
+
+/// Minimum pipe fill (source frames at `rate`) a position-slaved producer
+/// must keep queued in the selected output: enough to cover the sink's
+/// start-of-stream prime plus its claim burst (how far ahead of audible
+/// playback the hardware grabs data at once). `None` when [`position`]
+/// would return `None` — same routing, probed once per playback session.
+pub fn min_fill(rate: u32) -> Option<u32> {
+    use crate::kernel::platform::Audio;
+    match crate::kernel::platform::get().audio {
+        Audio::EmulatedHda => crate::kernel::hda::min_fill(rate),
+        Audio::EmulatedAc97 => crate::kernel::ac97::min_fill(rate),
+        Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => None,
+    }
+}
