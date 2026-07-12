@@ -1,0 +1,9 @@
+# Gravis UltraSound emulation probe (see gustest.asm header). Runs in CI
+# via test/hosted_games.sh; markers accrete as GF1 emulation phases land.
+genrule(
+    name = "gustest_com",
+    srcs = ["gustest.asm"],
+    outs = ["GUSTEST.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

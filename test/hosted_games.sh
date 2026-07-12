@@ -56,4 +56,11 @@ run "SB DSP completion protocol" \
     --cmd "TESTS/SBTEST.COM" --settle 3 --timeout 30 \
     --expect-log "BUSY-OK" --expect-log "EDGE-OK" --expect-log "TC-OK"
 
+# Emulated-GUS (GF1) probe (apps/tests/gusproto): DRAM poke/peek detection
+# and register-file readback through the voice/register-select scheme.
+# Markers accrete as GF1 phases land (timers, DMA upload, audible voice).
+run "GUS (GF1) register file + DRAM" \
+    --cmd "TESTS/GUSTEST.COM" --settle 3 --timeout 30 \
+    --expect-log "GDRAM-OK" --expect-log "GREG-OK"
+
 exit $fail

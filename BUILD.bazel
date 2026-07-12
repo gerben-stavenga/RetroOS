@@ -146,6 +146,8 @@ _EXTRA_FILES = {
     # count underflow) — hosted_games.sh asserts SBTEST prints TC-OK.
     "//apps/tests/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
     "//apps/tests/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
+    # GUS (GF1) emulation probe — hosted_games.sh asserts its G*-OK markers.
+    "//apps/tests/gusproto:gustest_com":    "TESTS/GUSTEST.COM",
     "//apps/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
     "//apps/dosrt:rloader_bin":             "TESTS/RLOADER.BIN",
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).

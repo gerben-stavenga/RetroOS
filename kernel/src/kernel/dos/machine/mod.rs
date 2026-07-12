@@ -171,6 +171,35 @@ pub(super) use vdma::*;
 pub(super) mod opl;
 pub(super) mod vsb;
 pub(super) use vsb::*;
+pub(super) mod vgus;
+pub(super) use vgus::*;
+
+/// Look up `KEY` in a DOS environment block, returning its value bytes.
+/// Shared by every card's `configure_from_env` (BLASTER, ULTRASND).
+pub(super) fn env_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut i = 0;
+    while i < env.len() && env[i] != 0 {
+        let end = env[i..].iter().position(|&b| b == 0).map(|p| i + p)?;
+        let entry = &env[i..end];
+        if let Some(eq) = entry.iter().position(|&b| b == b'=')
+            && entry[..eq].eq_ignore_ascii_case(key) {
+                return Some(&entry[eq + 1..]);
+            }
+        i = end + 1;
+    }
+    None
+}
+
+pub(super) fn parse_uint(s: &[u8], radix: u32) -> Option<u32> {
+    let mut acc: u32 = 0;
+    let mut any = false;
+    for &b in s {
+        let d = (b as char).to_digit(radix)?;
+        acc = acc.checked_mul(radix)?.checked_add(d)?;
+        any = true;
+    }
+    any.then_some(acc)
+}
 /// Policy-free PC machine virtualization — per-thread peripheral state.
 ///
 /// Holds the virtual 8259 PIC, 8253 PIT, PS/2 keyboard, VGA register set, and
@@ -194,6 +223,9 @@ pub struct PcMachine {
     /// Sound Blaster card state (the thread's BLASTER channel/IRQ map +
     /// DSP passthrough/emulation). Observes `dma` for its transfers.
     pub sb: SoundBlaster,
+    /// Gravis UltraSound card state (ULTRASND wiring + the GF1 over the
+    /// unified sampler engine). Absent until the env declares it.
+    pub gus: Gus,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -392,6 +424,7 @@ impl PcMachine {
             vga: VgaState::new(),
             dma: Dma8237::new(),
             sb: SoundBlaster::new(),
+            gus: Gus::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
         }
@@ -539,6 +572,8 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         p if pc.sb.is_passthrough(p) => {
             pc.sb.sb_read(machine, &pc.dma, p)
         }
+        // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
+        p if pc.gus.owns(p) => pc.gus.io_read(machine, p),
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
         // poll it for DMA progress, not just completion).
@@ -645,6 +680,8 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         p if pc.sb.is_passthrough(p) => {
             pc.sb.sb_write(machine, &pc.dma, p, val);
         }
+        // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
+        p if pc.gus.owns(p) => pc.gus.io_write(machine, p, val),
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.

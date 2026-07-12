@@ -1195,21 +1195,6 @@ fn mask_real_8237<A: crate::Arch>(machine: &mut A, chan: u8) {
     else if chan < 4 { machine.outb(0x0A, 0x04 | chan); }
 }
 
-/// Look up `KEY` in a DOS environment block, returning its value bytes.
-fn env_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let mut i = 0;
-    while i < env.len() && env[i] != 0 {
-        let end = env[i..].iter().position(|&b| b == 0).map(|p| i + p)?;
-        let entry = &env[i..end];
-        if let Some(eq) = entry.iter().position(|&b| b == b'=')
-            && entry[..eq].eq_ignore_ascii_case(key) {
-                return Some(&entry[eq + 1..]);
-            }
-        i = end + 1;
-    }
-    None
-}
-
 /// Read the real (QEMU) 8237's live current-count for host channel
 /// `host`. Standard sequence: clear the byte-pointer flip-flop, read
 /// low then high. QEMU's 8257 decrements this as QEMU-sb16 actually
@@ -1261,15 +1246,4 @@ fn program_real_8237<A: crate::Arch>(machine: &mut A, chan: u8, phys: u32, len: 
         machine.outb((chan as u16) * 2 + 1, (cnt >> 8) as u8);
         machine.outb(0x0A, chan);                      // unmask channel
     }
-}
-
-fn parse_uint(s: &[u8], radix: u32) -> Option<u32> {
-    let mut acc: u32 = 0;
-    let mut any = false;
-    for &b in s {
-        let d = (b as char).to_digit(radix)?;
-        acc = acc.checked_mul(radix)?.checked_add(d)?;
-        any = true;
-    }
-    any.then_some(acc)
 }

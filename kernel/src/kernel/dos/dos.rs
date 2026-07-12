@@ -3852,6 +3852,9 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
     // virtual 8237 traps the right channel and the IRQ relay uses the
     // right vector. Missing BLASTER leaves the SB16 defaults.
     dos.pc.sb.configure_from_env(&env);
+    // ULTRASND makes the (emulated) GUS exist for this program and sets its
+    // base/DMA/IRQ wiring; without it the card stays absent.
+    dos.pc.gus.configure_from_env(&env);
     init_psp(machine, regs, psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
     dos_set_program_block_owner(machine, dos, regs, env_seg, psp_seg, psp_seg);
