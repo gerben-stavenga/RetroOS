@@ -425,6 +425,9 @@ impl Gus {
         let _ = machine;
         let base = self.base;
         let c = self.core();
+        if super::PORT_TRACE {
+            crate::dbg_println!("[gus] in  {:03X} (reg {:02X}v{})", p, c.reg_sel, c.voice_sel);
+        }
         let lo = p.wrapping_sub(base);
         if lo < 0x10 {
             return match lo {
@@ -433,6 +436,10 @@ impl Gus {
                 0x06 => c.irq_status(),
                 // AdLib-compatible timer status window.
                 0x08 => c.adlib_status(),
+                // 2XA reads back the 2X8 index latch — THE classic GUS
+                // detection (DMX writes 0xAA to 2X8 and expects it here;
+                // a real AdLib puts its status there, never the echo).
+                0x0A => c.adlib_index,
                 // Board revision: 0xFF = pre-3.7 board, no extra registers —
                 // the simplest personality every driver accepts.
                 0x0F => 0xFF,
@@ -458,6 +465,9 @@ impl Gus {
     pub fn io_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
         let base = self.base;
         let c = self.core();
+        if super::PORT_TRACE {
+            crate::dbg_println!("[gus] out {:03X} <- {:02X} (reg {:02X}v{})", p, val, c.reg_sel, c.voice_sel);
+        }
         let lo = p.wrapping_sub(base);
         if lo < 0x10 {
             match lo {
