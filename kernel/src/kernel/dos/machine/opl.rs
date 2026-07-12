@@ -168,12 +168,6 @@ impl OplFm {
             || now.saturating_sub(self.last_write_ms) < HANGOVER_MS
     }
 
-    /// Whether `emit_frames` should pull FM into the DSP stream. Voices-only
-    /// (no write hangover): a silent chip mixes silence, so skip the work.
-    pub(super) fn mixing(&self) -> bool {
-        self.chip.active_voice_count() > 0
-    }
-
     /// Standalone pump — the per-quantum device tick. While the DSP stream is
     /// live it owns the sink and pulls FM itself (`mix_frame`), so this only
     /// re-anchors the pacing clock; otherwise synthesize the elapsed virtual
@@ -217,11 +211,21 @@ impl OplFm {
         }
     }
 
+}
+
+/// The DSP stream pulls FM through the canonical mix-source shape.
+impl super::MixSource for OplFm {
+    /// Whether `emit_frames` should pull FM into the DSP stream. Voices-only
+    /// (no write hangover): a silent chip mixes silence, so skip the work.
+    fn mixing(&self) -> bool {
+        self.chip.active_voice_count() > 0
+    }
+
     /// Pull one FM frame at the DSP stream's rate: advance the chip by the
     /// corresponding number of native frames (zero-order hold on the last).
     /// Keeps FM consumption locked to the DSP cursor, which is already paced
     /// by virtual time.
-    pub(super) fn mix_frame(&mut self, rate: u32) -> (i16, i16) {
+    fn mix_frame(&mut self, rate: u32) -> (i16, i16) {
         let rate = rate.max(4_000); // guest-programmed; never let it stall us
         self.mix_acc += NATIVE_RATE;
         let mut pair = [0i16; 2];

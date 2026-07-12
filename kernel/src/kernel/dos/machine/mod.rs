@@ -793,6 +793,26 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     }
 }
 
+/// A synth voice the sink-owning stream pulls per output frame, mixed in
+/// saturating — the shape `OplFm::mix_frame` established (zero-order-hold
+/// consumption locked to the puller's cursor). OPL implements it today;
+/// the sampler-backed devices (GUS, GM) join as they land, so the DSP
+/// stream mixes every co-sounding synth through one shape instead of
+/// growing a per-device arm.
+pub(super) trait MixSource {
+    /// Audibly active. A silent source mixes silence — skip the work.
+    fn mixing(&self) -> bool;
+    /// Pull one frame at the pulling stream's rate.
+    fn mix_frame(&mut self, out_rate: u32) -> (i16, i16);
+}
+
+/// The inert source: stands in until a thread's real second synth exists.
+pub(super) struct NullSource;
+impl MixSource for NullSource {
+    fn mixing(&self) -> bool { false }
+    fn mix_frame(&mut self, _out_rate: u32) -> (i16, i16) { (0, 0) }
+}
+
 /// Advance the emulated Sound Blaster's software DSP playback by the virtual
 /// time elapsed since the last call (no-op unless the SB is in emulation mode).
 /// Runs in the event loop right after the PIT tick pump, where `machine`,
@@ -800,7 +820,7 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
 /// the kernel sound API and raises the SB IRQ per block.
 pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
     let PcMachine { sb, vpic, .. } = pc;
-    sb.audio_tick(machine, regs, vpic);
+    sb.audio_tick(machine, regs, vpic, &mut NullSource);
 }
 
 pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {

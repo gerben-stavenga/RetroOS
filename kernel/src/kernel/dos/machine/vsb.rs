@@ -925,6 +925,7 @@ impl SoundBlaster {
         machine: &mut A,
         regs: &mut Regs,
         vpic: &mut super::vpic::VirtualPic,
+        ext: &mut dyn MixSource,
     ) {
         if !self.emulated() {
             return;
@@ -938,7 +939,7 @@ impl SoundBlaster {
                 vpic.raise(self.irq);
             }
         }
-        self.dsp_tick(machine, regs, vpic);
+        self.dsp_tick(machine, regs, vpic, ext);
         // The DSP owns the sink while playing OR while holding the stream
         // through the hangover — either way it pulls FM itself.
         let dsp_streaming = self.emu.playing || self.emu.stream_hold;
@@ -957,6 +958,7 @@ impl SoundBlaster {
         machine: &mut A,
         _regs: &mut Regs,
         vpic: &mut super::vpic::VirtualPic,
+        ext: &mut dyn MixSource,
     ) {
         if !self.emu.playing {
             let now = machine.get_ticks();
@@ -972,7 +974,7 @@ impl SoundBlaster {
                     let n = self.emu.frac / 1000;
                     self.emu.frac %= 1000;
                     if n > 0 {
-                        self.emit_hold_silence(machine, n);
+                        self.emit_hold_silence(machine, ext, n);
                     }
                 } else {
                     crate::kernel::sound::stop(machine, false); // pause: keep configured
@@ -1014,7 +1016,7 @@ impl SoundBlaster {
         if advance >= to_boundary {
             advance = to_boundary;
             self.emu.frac = 0; // discard the excess; we resume on the guest's ack
-            self.emit_frames(machine, advance);
+            self.emit_frames(machine, ext, advance);
             self.emu.cursor += advance;
             self.emu.awaiting_ack = true;
             // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
@@ -1040,16 +1042,17 @@ impl SoundBlaster {
                 self.emu.next_irq += self.emu.block_frames as u64;
             }
         } else {
-            self.emit_frames(machine, advance);
+            self.emit_frames(machine, ext, advance);
             self.emu.cursor += advance;
         }
     }
 
     /// Copy `count` ring frames (from `cursor`, wrapping) out of guest memory
-    /// and hand them to the kernel sound layer. While the FM synth is sounding
-    /// its frames are pulled at the DSP rate and mixed in here — the DSP
-    /// stream owns the sink, and this is the one place its frames pass by.
-    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, count: u64) {
+    /// and hand them to the kernel sound layer. While any co-sounding synth
+    /// (the FM chip, an external [`MixSource`]) is active its frames are
+    /// pulled at the DSP rate and mixed in here — the DSP stream owns the
+    /// sink, and this is the one place its frames pass by.
+    fn emit_frames<A: crate::Arch>(&mut self, machine: &mut A, ext: &mut dyn MixSource, count: u64) {
         let channels = if self.emu.stereo { 2u32 } else { 1 };
         let frame_bytes = (self.emu.bits as u32 / 8) * channels;
         if frame_bytes == 0 || self.emu.buf_frames == 0 {
@@ -1060,6 +1063,9 @@ impl SoundBlaster {
             signed: self.emu.bits == 16,
             channels: channels as u8,
         };
+        let rate = self.emu.rate;
+        let fm_on = self.opl.as_ref().is_some_and(|o| o.mixing());
+        let ext_on = ext.mixing();
         let mut remaining = count;
         let mut pos = (self.emu.cursor % self.emu.buf_frames as u64) as u32;
         while remaining > 0 {
@@ -1067,24 +1073,34 @@ impl SoundBlaster {
             let mut scratch = alloc::vec![0u8; (run * frame_bytes) as usize];
             let addr = self.emu.buf_gpa as usize + (pos * frame_bytes) as usize;
             machine.copy_from(addr, &mut scratch);
-            if let Some(opl) = self.opl.as_mut().filter(|o| o.mixing()) {
+            if fm_on || ext_on {
                 // Canonicalize the guest frames here (normally sound::play's
-                // job) so the FM voice can be added per-frame, saturating.
+                // job) so the synth voices can be added per-frame, saturating.
                 let canon = crate::kernel::sound::Format {
                     bits: 16, signed: true, channels: 2,
                 };
                 let mut mixed = alloc::vec![0u8; run as usize * 4];
                 for i in 0..run as usize {
                     let (l, r) = fmt.frame(&scratch, i);
-                    let (fl, fr) = opl.mix_frame(self.emu.rate);
-                    let l = (l as i32 + fl as i32).clamp(-32768, 32767) as i16;
-                    let r = (r as i32 + fr as i32).clamp(-32768, 32767) as i16;
+                    let (mut l, mut r) = (l as i32, r as i32);
+                    if fm_on {
+                        let (fl, fr) = self.opl.as_mut().unwrap().mix_frame(rate);
+                        l += fl as i32;
+                        r += fr as i32;
+                    }
+                    if ext_on {
+                        let (el, er) = ext.mix_frame(rate);
+                        l += el as i32;
+                        r += er as i32;
+                    }
+                    let l = l.clamp(-32768, 32767) as i16;
+                    let r = r.clamp(-32768, 32767) as i16;
                     mixed[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
                     mixed[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
                 }
-                crate::kernel::sound::play(machine, self.emu.rate, canon, &mixed);
+                crate::kernel::sound::play(machine, rate, canon, &mixed);
             } else {
-                crate::kernel::sound::play(machine, self.emu.rate, fmt, &scratch);
+                crate::kernel::sound::play(machine, rate, fmt, &scratch);
             }
             remaining -= run as u64;
             pos += run;
@@ -1094,26 +1110,39 @@ impl SoundBlaster {
         }
     }
 
-    /// Push `count` frames of silence at the configured rate, FM mixed in
-    /// exactly as `emit_frames` does for live playback — the hangover feed
-    /// that keeps the stream (and the music riding on it) running between
-    /// closely-spaced sound effects.
-    fn emit_hold_silence<A: crate::Arch>(&mut self, machine: &mut A, count: u64) {
+    /// Push `count` frames of silence at the configured rate, the synth
+    /// voices mixed in exactly as `emit_frames` does for live playback — the
+    /// hangover feed that keeps the stream (and the music riding on it)
+    /// running between closely-spaced sound effects.
+    fn emit_hold_silence<A: crate::Arch>(&mut self, machine: &mut A, ext: &mut dyn MixSource, count: u64) {
         let canon = crate::kernel::sound::Format { bits: 16, signed: true, channels: 2 };
-        let mixing = self.opl.as_ref().is_some_and(|o| o.mixing());
+        let rate = self.emu.rate;
+        let fm_on = self.opl.as_ref().is_some_and(|o| o.mixing());
+        let ext_on = ext.mixing();
         let mut remaining = count;
         while remaining > 0 {
             let run = remaining.min(256) as usize;
             let mut buf = alloc::vec![0u8; run * 4];
-            if mixing {
-                let opl = self.opl.as_mut().unwrap();
+            if fm_on || ext_on {
                 for i in 0..run {
-                    let (fl, fr) = opl.mix_frame(self.emu.rate);
-                    buf[i * 4..i * 4 + 2].copy_from_slice(&fl.to_le_bytes());
-                    buf[i * 4 + 2..i * 4 + 4].copy_from_slice(&fr.to_le_bytes());
+                    let (mut l, mut r) = (0i32, 0i32);
+                    if fm_on {
+                        let (fl, fr) = self.opl.as_mut().unwrap().mix_frame(rate);
+                        l += fl as i32;
+                        r += fr as i32;
+                    }
+                    if ext_on {
+                        let (el, er) = ext.mix_frame(rate);
+                        l += el as i32;
+                        r += er as i32;
+                    }
+                    let l = l.clamp(-32768, 32767) as i16;
+                    let r = r.clamp(-32768, 32767) as i16;
+                    buf[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
+                    buf[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
                 }
             }
-            crate::kernel::sound::play(machine, self.emu.rate, canon, &buf);
+            crate::kernel::sound::play(machine, rate, canon, &buf);
             remaining -= run as u64;
         }
     }
