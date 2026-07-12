@@ -920,12 +920,20 @@ impl SoundBlaster {
     /// them produces into the canonical sink at a time — while the DSP stream
     /// is live it *pulls* FM frames itself (`emit_frames` mixes them in), so
     /// the FM pump only free-runs when the DSP is silent.
+    /// Whether the software DSP owns the canonical sink right now: playing,
+    /// or holding the stream open through the hangover. The top of the
+    /// producer priority chain (DSP > GUS > OPL).
+    pub fn dsp_owns_sink(&self) -> bool {
+        self.emulated() && (self.emu.playing || self.emu.stream_hold)
+    }
+
     pub fn audio_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
         regs: &mut Regs,
         vpic: &mut super::vpic::VirtualPic,
         ext: &mut dyn MixSource,
+        ext_streaming: bool,
     ) {
         if !self.emulated() {
             return;
@@ -941,10 +949,12 @@ impl SoundBlaster {
         }
         self.dsp_tick(machine, regs, vpic, ext);
         // The DSP owns the sink while playing OR while holding the stream
-        // through the hangover — either way it pulls FM itself.
+        // through the hangover — either way it pulls FM itself. A streaming
+        // external producer (the GUS pump) also parks the FM free-run: the
+        // sink has one owner, and OPL is the bottom of the priority chain.
         let dsp_streaming = self.emu.playing || self.emu.stream_hold;
         if let Some(opl) = self.opl.as_mut() {
-            opl.tick(machine, dsp_streaming);
+            opl.tick(machine, dsp_streaming || ext_streaming);
         }
     }
 

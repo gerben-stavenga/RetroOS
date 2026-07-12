@@ -149,6 +149,10 @@ struct GusCore {
     /// TC wants the GF1 IRQ (reg-0x41 bit 5 was set): delivered on the next
     /// tick, the same deferral the SB uses for its trigger IRQ.
     dma_irq_latch: bool,
+    /// Voice events accrued outside `tick` (the DSP stream pulling us via
+    /// `mix_frame`) want the IRQ line; delivered on the next tick, where
+    /// the vPIC is in reach.
+    event_irq_latch: bool,
 }
 
 /// One GF1 rate timer. T1 counts 80 µs units, T2 320 µs; each reloads and
@@ -191,6 +195,7 @@ impl GusCore {
             dma_kick: false,
             dma_tc: false,
             dma_irq_latch: false,
+            event_irq_latch: false,
         });
         c.engine.active = 14; // matches active_reg's power-on 13 (n−1)
         c
@@ -225,6 +230,7 @@ impl GusCore {
         self.dma_kick = false;
         self.dma_tc = false;
         self.dma_irq_latch = false;
+        self.event_irq_latch = false;
     }
 
     /// The 2X6 IRQ status byte: bit2/3 = timer 1/2 (gated by their reg-0x45
@@ -309,10 +315,24 @@ impl Gus {
         self.present = false;
     }
 
+    /// Whether the standalone pump currently owns an open canonical stream —
+    /// the signal that parks the (lower-priority) OPL free-run pump.
+    pub fn streaming(&self) -> bool {
+        self.core.as_ref().is_some_and(|c| c.streaming)
+    }
+
     /// Per-quantum device tick, from `machine::audio_tick`: pace the rate
     /// timers and the standalone playback pump by virtual time, and raise
-    /// the GF1 IRQ line for enabled, unserviced sources.
-    pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, vpic: &mut super::vpic::VirtualPic) {
+    /// the GF1 IRQ line for enabled, unserviced sources. While the SB DSP
+    /// stream owns the sink (`dsp_streaming`) the pump parks and the DSP
+    /// pulls us per frame instead (the `MixSource` impl below); timers and
+    /// IRQ delivery run regardless.
+    pub fn tick<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        vpic: &mut super::vpic::VirtualPic,
+        dsp_streaming: bool,
+    ) {
         let Some(c) = self.core.as_mut() else { return };
         let now = machine.get_ticks();
         // First tick / long background gap: don't synthesize a backlog.
@@ -322,9 +342,11 @@ impl Gus {
             return;
         }
         let (reg45, reg46, reg47) = (c.reg45, c.reg46, c.reg47);
-        // A DMA terminal count from the last register write delivers its
-        // IRQ here, one tick later — a real transfer isn't instant either.
-        let mut want_irq = core::mem::take(&mut c.dma_irq_latch);
+        // A DMA terminal count from the last register write, or voice events
+        // accrued while the DSP stream pulled us, deliver their IRQ here,
+        // one tick later — a real transfer isn't instant either.
+        let mut want_irq =
+            core::mem::take(&mut c.dma_irq_latch) | core::mem::take(&mut c.event_irq_latch);
         for (i, t) in c.timers.iter_mut().enumerate() {
             if !t.running {
                 t.acc_us = 0;
@@ -351,7 +373,12 @@ impl Gus {
         // count, so it's re-read every tick — the sink owns resampling and
         // a rate change is just a different `play` argument.
         let audible = c.reset_reg & 0x02 != 0 && c.engine.any_running();
-        if audible {
+        if dsp_streaming {
+            // The DSP stream superseded the pump mid-flight; it re-programs
+            // the sink itself and pulls our frames, so nothing to stop.
+            c.frac = 0;
+            c.streaming = false;
+        } else if audible {
             let rate = c.native_rate();
             c.frac += rate as u64 * dt as u64;
             let mut n = c.frac / 1000;
@@ -759,5 +786,29 @@ impl GusCore {
         } else {
             word as u8
         }
+    }
+}
+
+/// The sink-owning DSP stream pulls GUS voices per frame while it plays —
+/// the same canonical shape the OPL uses. Voice-boundary events latch for
+/// the next tick's IRQ delivery (the vPIC isn't reachable from a pull).
+impl super::MixSource for Gus {
+    fn mixing(&self) -> bool {
+        self.core
+            .as_ref()
+            .is_some_and(|c| c.reset_reg & 0x02 != 0 && c.engine.any_running())
+    }
+
+    fn mix_frame(&mut self, out_rate: u32) -> (i16, i16) {
+        let Some(c) = self.core.as_mut() else { return (0, 0) };
+        let rate = c.native_rate();
+        let mut ev = sampler::Events::default();
+        let f = c.engine.mix_frame(&c.dram, rate, out_rate, &mut ev);
+        if ev.any() {
+            c.wave_pending |= ev.wave_irq;
+            c.ramp_pending |= ev.ramp_irq;
+            c.event_irq_latch = true;
+        }
+        f
     }
 }
