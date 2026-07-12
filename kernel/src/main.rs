@@ -85,9 +85,17 @@ fn main() {
     let shot_armed = shot.is_some();
     if let Some(path) = shot {
         arch::set_dump_path(&path);
-        std::thread::spawn(|| loop {
+        let ppm_path = format!("{path}.ppm");
+        std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             arch::request_vga_dump();
+            if let Some((w, h, px)) = arch::take_frame() {
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for p in &px {
+                    out.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
+                }
+                let _ = std::fs::write(&ppm_path, out);
+            }
         });
     }
 

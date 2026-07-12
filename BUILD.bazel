@@ -142,6 +142,10 @@ _EXTRA_FILES = {
     # No build cycle: `image_min` (used to build the stub) uses
     # _MIN_EXTRA_FILES below, not these.
     "//apps/tests/modplay:modplay_exe":     "TESTS/MODPLAY.EXE",
+    # SB single-cycle completion-protocol probes (busy flicker, status TC,
+    # count underflow) — hosted_games.sh asserts SBTEST prints TC-OK.
+    "//apps/tests/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
+    "//apps/tests/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
     "//apps/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
     "//apps/dosrt:rloader_bin":             "TESTS/RLOADER.BIN",
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).

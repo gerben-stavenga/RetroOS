@@ -1,0 +1,18 @@
+# Sound Blaster completion-protocol probes (see the .asm headers). SBTEST
+# runs in CI (test/hosted_games.sh); SBDOOR is a manual stream-continuity
+# tool whose real-time phases are too slow for the TCG engine.
+genrule(
+    name = "sbtest_com",
+    srcs = ["sbtest.asm"],
+    outs = ["SBTEST.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "sbdoor_com",
+    srcs = ["sbdoor.asm"],
+    outs = ["SBDOOR.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
