@@ -102,7 +102,15 @@ const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 const NUM_BUF: usize = 32;
 const BUF_BYTES: usize = 0x800; // 2 KB = 512 stereo frames ≈ 23 ms @ 22 kHz
 const PRIME_BUFS: usize = 3;
-const MAX_AHEAD: usize = 6;
+/// Ring-fill setpoint (buffers ahead of the codec) the output clock-follow
+/// servos toward: ~116 ms @ 44.1 kHz — above real audio backends' chunk
+/// jitter (pulseaudio consumes in ~50-100 ms gulps), below annoying-latency.
+const TARGET_AHEAD: usize = 10;
+/// Hard drop ceiling, just under the ring's ahead/behind ambiguity point.
+/// The servo keeps fill at TARGET_AHEAD; this only catches runaway bursts.
+const MAX_AHEAD: usize = 15;
+/// Clock-follow authority: ±25‰ (2.5%) trim on the output resample ratio.
+const TRIM_MAX_PM: i32 = 25;
 /// Stream tag bound between the descriptor and the DAC converter (1..15).
 const STREAM_TAG: u32 = 1;
 /// Boot-time bring-up diagnostics to debugcon (flip on to debug the codec).
@@ -242,6 +250,14 @@ struct Hda {
     src_rate: u32,
     /// Output-rate accumulator for zero-order-hold resampling.
     resample_acc: u64,
+    /// Clock-follow trim (permille) on the output resample ratio. The
+    /// producer paces on guest virtual time, the codec on the sound card's
+    /// real clock; nobody guarantees those match or advance smoothly, so an
+    /// open-loop ring random-walks into the drop ceiling (lost audio) or a
+    /// codec lap (stale-ring echo). Updated each buffer boundary from the
+    /// fill level; guest-visible pacing (DMA counts, IRQs) is untouched —
+    /// only the emitted frame count flexes.
+    trim_pm: i32,
     /// Sparse runtime diagnostics for real hardware bring-up.
     logged_submit: bool,
     logged_run: bool,
@@ -539,6 +555,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         resample_acc: 0,
         logged_submit: false,
         logged_run: false,
+        trim_pm: 0,
         diag_buffers: 0,
         diag_stalls: 0,
     };
@@ -1337,28 +1354,41 @@ impl Hda {
     }
 
     fn emit_stereo(&mut self, l: i16, r: i16) -> bool {
-        // At each buffer boundary, cap how far we run ahead of the controller.
+        // At each buffer boundary: clock-follow servo + lap resync + a hard
+        // drop ceiling. `ahead` is modular distance producer→codec; values
+        // past half the ring mean the codec lapped us (starvation).
         if self.cur_off == 0 && self.running {
             let civ = self.play_buf();
             let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
-            // Only throttle when genuinely AHEAD of the codec. A wrapped
-            // value (>= half the ring) means the play position lapped us
-            // (underrun) — feed hard to catch up, never stall.
-            if (MAX_AHEAD..NUM_BUF / 2).contains(&ahead) {
+            if ahead >= NUM_BUF / 2 {
+                // Lapped: the codec is replaying stale ring behind us (the
+                // audible "echoes"). Resync just past the play position and
+                // zero a guard buffer so the gap plays silence, not history.
+                let guard = (civ + 1) % NUM_BUF;
+                unsafe {
+                    core::ptr::write_bytes(self.buf_va(guard) as *mut u8, 0, BUF_BYTES);
+                }
+                self.cur_buf = (civ + 2) % NUM_BUF;
+                self.trim_pm = TRIM_MAX_PM; // refill toward the setpoint
+            } else if ahead >= MAX_AHEAD {
                 if self.diag_stalls < 3 {
                     crate::println!(
-                        "hda: stall cur_buf={} play_buf={} ahead={} lpib={} pos={} sdctl={:#x} sdsts={:#x}",
+                        "hda: stall cur_buf={} play_buf={} ahead={} lpib={} pos={}",
                         self.cur_buf,
                         civ,
                         ahead,
                         r32(self.sd + SDLPIB),
                         self.dma_pos(),
-                        r32(self.sd + SDCTL),
-                        r8(self.sd + 0x03)
                     );
                     self.diag_stalls += 1;
                 }
                 return false;
+            } else {
+                // Proportional trim toward the fill setpoint: producer fast
+                // (fill high) → emit fewer output frames per source frame;
+                // producer slow → emit more. Pinned fill = no drops, no laps.
+                self.trim_pm =
+                    ((TARGET_AHEAD as i32 - ahead as i32) * 4).clamp(-TRIM_MAX_PM, TRIM_MAX_PM);
             }
         }
         let p = self.buf_va(self.cur_buf) + self.cur_off;
@@ -1431,6 +1461,7 @@ impl Hda {
             self.set_format(hw_rate);
             self.src_rate = src_rate;
             self.resample_acc = 0;
+            self.trim_pm = 0;
         }
         let fb = fmt.frame_bytes();
         if fb == 0 {
@@ -1451,18 +1482,18 @@ impl Hda {
         }
         for i in 0..bytes.len() / fb {
             let (l, r) = fmt.frame(bytes, i);
-            if src_rate == hw_rate {
+            // One resample path for every ratio (1:1 included) so the
+            // clock-follow trim applies uniformly: the effective output
+            // rate flexes ±TRIM_MAX_PM‰ around the hardware rate to hold
+            // the ring fill at its setpoint.
+            let hw_eff =
+                (hw_rate as i64 + (hw_rate as i64 * self.trim_pm as i64) / 1000) as u64;
+            self.resample_acc += hw_eff;
+            while self.resample_acc >= src_rate as u64 {
                 if !self.emit_stereo(l, r) {
-                    break;
+                    return;
                 }
-            } else {
-                self.resample_acc += hw_rate as u64;
-                while self.resample_acc >= src_rate as u64 {
-                    if !self.emit_stereo(l, r) {
-                        return;
-                    }
-                    self.resample_acc -= src_rate as u64;
-                }
+                self.resample_acc -= src_rate as u64;
             }
         }
     }
