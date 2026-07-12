@@ -1460,6 +1460,34 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
                 }
             }
         }
+        // Grp1: the immediate forms of the ALU group above — ADD/OR/ADC/SBB/
+        // AND/SUB/XOR/CMP r/m, imm (0x80 = byte, 0x81 = imm16/32, 0x83 =
+        // sign-extended imm8; the group lives in ModRM bits 3-5). Same VRAM
+        // read-modify-write path: the read loads the GC latches, the
+        // write-back (every group but CMP) goes through the EGA write logic.
+        // Operation Wolf clears its planar back buffer with
+        // `and byte es:[di], 0`.
+        0x80 | 0x81 | 0x83 => {
+            let modrm = peek(i);
+            let group = (modrm >> 3) & 7;
+            let sz = if opcode == 0x80 { 1 } else { opsize(op32, false) };
+            let l = modrm_len(modrm, addr32, peek, i);
+            let immsz = if opcode == 0x81 { sz } else { 1 };
+            let mut imm = 0u32;
+            for b in 0..immsz { imm |= (peek(i + l + b) as u32) << (b * 8); }
+            if opcode == 0x83 {
+                imm = imm as u8 as i8 as i32 as u32; // sign-extend to operand size
+                if sz == 2 { imm &= 0xFFFF; }
+            }
+            i += l + immsz;
+            let mut mem = 0u32;
+            for b in 0..sz { mem |= (vram_read(vga, off + b) as u32) << (b * 8); }
+            let res = alu(regs, group, mem, imm, sz);
+            if group != 7 {
+                // CMP: flags only, no write-back
+                for b in 0..sz { vram_write(vga, off + b, (res >> (b * 8)) as u8); }
+            }
+        }
         _ => {
             let _ = (rep, addr32);
             crate::println!(
