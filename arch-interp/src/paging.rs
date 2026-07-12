@@ -825,8 +825,13 @@ pub fn space_destroy(id: u32) {
 // generation and refreshes the twin on the next 64-bit entry.
 
 /// Intermediate-level (PML4E/PDPTE/PDE) flags: present | writable | user.
+// dead_code: nothing enters a 64-bit slice yet — the Mode64 slice wiring is
+// the hosted-64-bit project's next milestone; the twin builder stays
+// compiling until it lands (same allowance on the items below).
+#[allow(dead_code)]
 const ENTRY_FLAGS64: u64 = ENTRY_FLAGS as u64;
 
+#[allow(dead_code)]
 struct LongTwin {
     /// PML4 root frame (ppage) — `frame_phys(pml4)` is the long-mode CR3.
     pml4: u64,
@@ -843,9 +848,11 @@ thread_local! {
     static LONG_TWINS: RefCell<BTreeMap<u32, LongTwin>> = const { RefCell::new(BTreeMap::new()) };
 }
 
+#[allow(dead_code)]
 fn read_entry64(ppage: u64, i: usize) -> u64 {
     unsafe { (phys::frame_ptr(ppage).add(i * 8) as *const u64).read_unaligned() }
 }
+#[allow(dead_code)]
 fn write_entry64(ppage: u64, i: usize, v: u64) {
     unsafe { (phys::frame_ptr(ppage).add(i * 8) as *mut u64).write_unaligned(v) }
 }
@@ -853,6 +860,7 @@ fn write_entry64(ppage: u64, i: usize, v: u64) {
 /// Build a fresh 4-level tree mirroring the 2-level tree at `pd`. User VAs are
 /// all below 4 GiB, so the shape is PML4[0] → one PDPT → up to 4 PDs → PTs;
 /// each 32-bit page table (4 MiB reach) feeds two 64-bit ones (2 MiB reach).
+#[allow(dead_code)]
 fn build_long_twin(pd: u64) -> (u64, Vec<u64>) {
     let mut frames = Vec::new();
     let fresh = |frames: &mut Vec<u64>| {
@@ -902,6 +910,7 @@ fn build_long_twin(pd: u64) -> (u64, Vec<u64>) {
 
 /// PML4 root (ppage — `frame_phys` of it is the CR3 value) for a long-mode
 /// slice of the ACTIVE space: the lazily (re)built 4-level twin.
+#[allow(dead_code)]
 pub fn active_pml4() -> u64 {
     let id = active_id();
     let pd = active_pd();

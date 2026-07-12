@@ -1018,10 +1018,10 @@ pub fn dir_handle_path(idx: i32, buf: &mut [u8; DIR_PATH_MAX]) -> usize {
 
 /// Increment a dir handle's refcount (Linux fork/dup).
 pub fn add_dir_ref(idx: i32) {
-    if let Some(e) = DIR_TABLE.lock().get_mut(idx as usize) {
-        if e.refcount > 0 {
-            e.refcount += 1;
-        }
+    if let Some(e) = DIR_TABLE.lock().get_mut(idx as usize)
+        && e.refcount > 0
+    {
+        e.refcount += 1;
     }
 }
 

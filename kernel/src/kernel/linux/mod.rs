@@ -1866,12 +1866,13 @@ fn at_base<'a, A: crate::Arch>(
     dirfd: i32,
     buf: &'a mut [u8; vfs::DIR_PATH_MAX],
 ) -> &'a [u8] {
-    if dirfd >= 0 && (dirfd as usize) < thread::MAX_FDS {
-        if let thread::FdKind::Dir { handle, .. } = kt.fds[dirfd as usize] {
-            let n = vfs::dir_handle_path(handle, buf);
-            if n > 0 {
-                return &buf[..n];
-            }
+    if dirfd >= 0
+        && (dirfd as usize) < thread::MAX_FDS
+        && let thread::FdKind::Dir { handle, .. } = kt.fds[dirfd as usize]
+    {
+        let n = vfs::dir_handle_path(handle, buf);
+        if n > 0 {
+            return &buf[..n];
         }
     }
     linux.cwd_str()

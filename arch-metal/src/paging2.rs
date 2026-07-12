@@ -1568,10 +1568,10 @@ static mut TRAMPOLINE_PT: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 /// with a present+NX #PF (first 64-bit exec on metal was the reproducer).
 /// Returns the previous PDPT[0] value to pass back to `clear_trampoline()`.
 pub fn ensure_trampoline_mapped() -> u64 {
-    unsafe extern "C" {
+    unsafe extern "fastcall" {
         fn toggle_prot_compat(new_cr3: u32);
     }
-    let stub_phys = toggle_prot_compat as usize - KERNEL_BASE + KERNEL_PHYS;
+    let stub_phys = toggle_prot_compat as *const () as usize - KERNEL_BASE + KERNEL_PHYS;
     let page = stub_phys / PAGE_SIZE;
     // One PT covers 2 MiB; the stub is a few dozen bytes but map its neighbor
     // too in case it straddles a page boundary.
