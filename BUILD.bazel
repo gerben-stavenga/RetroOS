@@ -215,6 +215,7 @@ pkg_tar(
     files = _DOS_EXTRA,
     deps = [
         "//apps/games:tar",
+        "//apps/gus:tar",
         ":tc_tar",
         ":tp70_tar",
     ],
@@ -236,6 +237,7 @@ pkg_tar(
     files = _DOS_EXTRA_PROPRIETARY,
     deps = [
         "//apps/games:tar",
+        "//apps/gus:tar",
         ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
@@ -255,6 +257,7 @@ pkg_tar(
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
         "//apps/games:tar",
+        "//apps/gus:tar",
         ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",

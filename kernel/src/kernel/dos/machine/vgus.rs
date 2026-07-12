@@ -463,7 +463,13 @@ impl Gus {
             0x03 => c.reg_sel,
             0x04 => c.reg_read(false),
             0x05 => c.reg_read(true),
-            0x07 => c.dram[c.dram_addr()],
+            0x07 => {
+                let a = c.dram_addr();
+                if super::PORT_TRACE {
+                    crate::dbg_println!("[gus] peek [{:05X}]={:02X}", a, c.dram[a]);
+                }
+                c.dram[a]
+            }
             _ => 0xFF,
         }
     }
@@ -515,6 +521,9 @@ impl Gus {
             }
             0x07 => {
                 let a = c.dram_addr();
+                if super::PORT_TRACE {
+                    crate::dbg_println!("[gus] poke [{:05X}]={:02X}", a, val);
+                }
                 c.dram[a] = val;
             }
             _ => {}
