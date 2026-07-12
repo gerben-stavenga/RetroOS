@@ -126,14 +126,9 @@ start:
         inc dx
         mov al, 0x01           ; start T1
         out dx, al
-        mov bx, 0x8000         ; bounded wait for the ISR flag
-.twait: mov cx, 0x0100
-.tw2:   cmp byte [irqflag], 0
-        jne timer_seen
-        loop .tw2
-        dec bx
-        jnz .twait
-        jmp fail_timer
+        mov bx, irqflag        ; wait ~2s of real time for the ISR flag —
+        call wait_flag         ; instruction-count loops expire in ms on KVM
+        jc  fail_timer
 timer_seen:
         mov ah, 9
         mov dx, msg_timer
@@ -178,14 +173,9 @@ timer_seen:
         call selreg
         mov al, 0x21
         call wr8
-        mov bx, 0x8000         ; bounded wait for the TC IRQ
-.dwait: mov cx, 0x0100
-.dw2:   cmp byte [dmaflag], 0
-        jne dma_seen
-        loop .dw2
-        dec bx
-        jnz .dwait
-        jmp fail_dma
+        mov bx, dmaflag        ; wait ~2s of real time for the TC IRQ
+        call wait_flag
+        jc  fail_dma
 dma_seen:
         xor ax, ax             ; DRAM[0] == 0x00 ^ 0x5A?
         xor bl, bl
@@ -253,17 +243,23 @@ dma_seen:
         call selreg
         call rd16
         mov si, bx
-        mov bp, 0x4000         ; bounded wait for address motion
-.vwait: mov cx, 0x0040
-.vw2:   loop .vw2
-        mov al, 0x8B
+        push es                ; wait ~2s of real time for address motion
+        xor ax, ax
+        mov es, ax
+        mov di, [es:0x46C]     ; BIOS tick count (18.2 Hz)
+.vwait: mov al, 0x8B
         call selreg
         call rd16
         cmp bx, si
-        jne voice_ok
-        dec bp
-        jnz .vwait
+        jne .vmoved
+        mov ax, [es:0x46C]
+        sub ax, di
+        cmp ax, 36
+        jb  .vwait
+        pop es
         jmp fail_voice
+.vmoved:
+        pop es
 voice_ok:
         mov ah, 9
         mov dx, msg_voice
@@ -333,6 +329,31 @@ exit:
         int 0x16
         mov ax, 0x4C00
         int 0x21
+
+; wait for the flag byte at [BX] (CS=DS) to go nonzero, up to ~2 s of real
+; time via the BIOS tick counter (18.2 Hz). CF set on timeout. Real-time,
+; not instruction-count: KVM runs the guest at native speed, where a counted
+; loop expires in milliseconds — before any IRQ could possibly arrive.
+wait_flag:
+        push es
+        push dx
+        xor ax, ax
+        mov es, ax
+        mov dx, [es:0x46C]
+.wf:    cmp byte [bx], 0
+        jne .ok
+        mov ax, [es:0x46C]
+        sub ax, dx
+        cmp ax, 36
+        jb  .wf
+        pop dx
+        pop es
+        stc
+        ret
+.ok:    pop dx
+        pop es
+        clc
+        ret
 
 ; ---- GF1 register access helpers ----
 ; select global/voice register AL
