@@ -644,6 +644,15 @@ fn isr_handler_ring3(regs: &mut Regs) {
             if debug_watch_trap(regs, dr6, false) {
                 return;
             }
+            // B3: the virtual-IF exit breakpoint. It is a FAULT, so the POPF/
+            // IRET there has not run yet — emulate it, which closes the window
+            // and restores VIF without a single step in sight.
+            if dr6 & (1 << 3) != 0 {
+                unsafe { x86::write_dr6(0) };
+                if crate::monitor::exec_bp_hit(regs) {
+                    return;
+                }
+            }
             let budget = arch_abi::PM_STEP_BUDGET.load(Ordering::Relaxed);
             if budget > 0 {
                 // Log step in PM and VM86 — VM86 logging needed to trace
@@ -675,19 +684,22 @@ fn isr_handler_ring3(regs: &mut Regs) {
             // the (innocent) instruction, so it re-runs after the handler IRETs.
             const VIF_VIP: u32 = (1 << 19) | (1 << 20);
             let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
+            // Where this instruction lives, and whether virtual IF was on before
+            // it ran: a 1 -> 0 transition is the site that OPENS an
+            // interrupts-off window, which is what `if_gate` keys its learned
+            // exit breakpoints on.
+            let entry_ip = regs.ip32();
+            let vif_was_on = regs.flags32() & (1 << 19) != 0;
             match monitor(regs) {
                 MonitorResult::Resume => {
-                    // If the monitor just cleared virtual IF in PM (e.g. a CLI),
-                    // kick off the single-step interpreter so POPF/IRET get
-                    // intercepted before hardware runs them. Skipped when TF
-                    // stepping is disabled — DPMI 0.9 §2.13 says POPF/IRET
-                    // aren't required to affect virtual IF, so spec-conforming
-                    // clients use CLI/STI/AX=0900-0902 only.
-                    if virtual_if_stepping(regs)
-                        && regs.mode() != UserMode::VM86
-                        && regs.flags32() & (1 << 19) == 0
-                    {
-                        let _ = step_virtual_if(regs);
+                    // Hand the window to the virtual-IF gate: it either arms the
+                    // learned exit breakpoint and lets the client run at full
+                    // speed, or falls back to single-stepping to learn it.
+                    // Skipped when TF stepping is disabled — DPMI 0.9 §2.13 says
+                    // POPF/IRET aren't required to affect virtual IF, so
+                    // spec-conforming clients use CLI/STI/AX=0900-0902 only.
+                    if virtual_if_stepping(regs) && regs.mode() != UserMode::VM86 {
+                        let _ = crate::monitor::if_gate(regs, entry_ip, vif_was_on);
                     }
                     if regs.flags32() & VIF_VIP != VIF_VIP {
                         return;

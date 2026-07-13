@@ -83,6 +83,31 @@ impl Arch for Metal {
     fn rearm_irq(&mut self, line: u8) { super::calls::arch_rearm_irq(line) }
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>) { super::calls::arch_set_debug_watch(addrs) }
 
+    /// Program DR3 as an execute breakpoint (R/W3 = 00, LEN3 = 00 — the only
+    /// legal encoding for one) and enable it with L3.
+    ///
+    /// This runs from the trap handlers, which are already ring 0, so it pokes
+    /// the debug registers directly rather than going through an arch call.
+    fn set_exec_breakpoint(&mut self, addr: Option<u32>) -> bool {
+        unsafe {
+            match addr {
+                Some(a) => {
+                    super::x86::write_dr3(a);
+                    // Clear R/W3+LEN3 (bits 28..31) so it is an execute break,
+                    // then enable L3. Leaves DR0/DR1's watchpoint bits alone.
+                    let dr7 = (super::x86::read_dr7() & !0xF000_0000)
+                        | super::x86::DR3_EXEC_ENABLE;
+                    super::x86::write_dr7(dr7);
+                }
+                None => {
+                    let dr7 = super::x86::read_dr7() & !super::x86::DR3_EXEC_ENABLE;
+                    super::x86::write_dr7(dr7);
+                }
+            }
+        }
+        true
+    }
+
     // ── Arch calls: paging / fork / LDT / DMA ──
     fn user_fork(&mut self, child: &mut RootPageTable) { super::calls::arch_user_fork(child) }
     fn free_user_pages(&mut self) { super::calls::arch_free_user_pages() }

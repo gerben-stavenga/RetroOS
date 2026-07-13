@@ -45,6 +45,18 @@ pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
     arch_abi::monitor::step_virtual_if(&mut crate::backend::Metal, regs)
 }
 
+/// Virtual-IF window gate — see [`arch_abi::monitor::if_gate`].
+#[inline]
+pub fn if_gate(regs: &mut Regs, entry_ip: u32, vif_was_on: bool) -> MonitorResult {
+    arch_abi::monitor::if_gate(&mut crate::backend::Metal, regs, entry_ip, vif_was_on)
+}
+
+/// A DR3 execute breakpoint fired — see [`arch_abi::monitor::exec_bp_hit`].
+#[inline]
+pub fn exec_bp_hit(regs: &mut Regs) -> bool {
+    arch_abi::monitor::exec_bp_hit(&mut crate::backend::Metal, regs)
+}
+
 /// SW equivalent of the CPU's VM86 INT dispatch — see
 /// [`arch_abi::monitor::sw_reflect_vm86_int`]. Memory reaches the active space
 /// through `Metal` (`GuestBytes`).

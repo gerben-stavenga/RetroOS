@@ -667,6 +667,9 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
+    // The virtual-IF exit breakpoints are keyed by bare code address, so a new
+    // address space must not inherit the last program's learned exits.
+    arch_abi::monitor::forget_if_windows();
     back_vga_window_if_emulated(machine);
     dos::setup_ivt(machine, &mut current.kernel.vcpu);
 
@@ -1028,6 +1031,43 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
     machine::audio_tick(machine, &mut dos.pc, regs);
 }
 
+/// Safety net for the virtual-IF exit breakpoints (`monitor::if_gate`).
+///
+/// A learned CLI→exit pairing lets a client run its interrupts-off section at
+/// full speed with a breakpoint on the POPF that ends it. If the client ever
+/// leaves that section by a path we never learned, the breakpoint is not hit
+/// and virtual IF stays off — nothing is mis-delivered, but the tick would
+/// never land. No real critical section holds interrupts off for anything like
+/// this long, so once it does, the pairing must be wrong: throw it away and go
+/// back to single-stepping, which always finds the truth.
+///
+/// This is what makes the scheme *sound*: a mislearned exit costs one stall of
+/// up to `STALL_MS`, once, and then self-heals. It can never wedge the guest
+/// and can never deliver an interrupt inside a section the client believes is
+/// protected.
+fn stall_guard<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    const STALL_MS: u32 = 10;
+    static OFF_SINCE: AtomicU32 = AtomicU32::new(0);
+
+    let vif_on = regs.frame.rflags & (machine::VIF_FLAG as u64) != 0;
+    let gated = regs.mode() != crate::UserMode::VM86
+        && arch_abi::monitor::virtual_if_stepping(regs);
+    if vif_on || !gated || !dos.pc.vpic.has_deliverable() {
+        OFF_SINCE.store(0, Relaxed);
+        return;
+    }
+    // `| 1` keeps 0 free as the "not stalling" sentinel.
+    let now = (machine.get_ticks() as u32) | 1;
+    let since = OFF_SINCE.load(Relaxed);
+    if since == 0 {
+        OFF_SINCE.store(now, Relaxed);
+    } else if now.wrapping_sub(since) >= STALL_MS {
+        arch_abi::monitor::relearn(machine, regs);
+        OFF_SINCE.store(0, Relaxed);
+    }
+}
+
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery
 /// is uniform regardless of the client's current mode: `deliver_pm_irq`
 /// snapshots the client state on a kernel IRQ stack and switches to the
@@ -1039,6 +1079,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    stall_guard(machine, dos, regs);
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI

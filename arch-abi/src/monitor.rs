@@ -20,6 +20,7 @@
 //! (port emulation, soft INT dispatch, idle) return a typed [`KernelEvent`].
 
 use crate::{Arch, GuestBytes, IoSize, KernelEvent, Regs, UserMode};
+use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// Result of one monitor decode step. `Resume` is the fast path — the caller
 /// returns to ring-3. `Event(e)` carries a typed kernel event to bubble up.
@@ -478,6 +479,171 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
 // - Only meaningful in PM mode with virtual IF already == 0.
 // - TF management lives entirely here; `monitor()` opcode handlers never touch TF.
 
+// ── Interrupts-off windows: learn the exit, then breakpoint it ───────────────
+//
+// Stepping is correct but costs a #DB per instruction — a ~2500x slowdown of
+// everything the client runs with interrupts off, which is exactly where DOS
+// games put their sound mixing. It is also almost entirely wasted: at IOPL=1
+// CLI and STI already #GP, so the ONLY thing stepping buys is catching the
+// POPF/IRET that silently re-enables IF. Doom burned ~170k steps/s to find
+// ~170 such instructions.
+//
+// So step only to LEARN. A window opens where VIF goes 1 -> 0 (a CLI) and
+// closes where some instruction sets it back (a POPF). Both are addresses the
+// CPU actually executed, so both are proven instruction boundaries — no static
+// disassembly, nothing undecidable. Remember the pair; the next time that same
+// site opens a window, arm a hardware execute breakpoint on its exit and let
+// the client run the section at full speed.
+//
+// Sound, not complete:
+//   * A window whose exit faults on its own (an STI #GPs at IOPL=1) needs no
+//     breakpoint at all — `EXIT_FAULTS` records that and it runs free forever.
+//   * If a window ever leaves by a path we never learned, VIF simply stays 0.
+//     Nothing is mis-delivered; the DOS layer's stall guard notices and calls
+//     [`relearn`], which drops the bad pairing and steps again.
+//   * A backend with no debug registers returns false from `set_exec_breakpoint`
+//     and every window steps, exactly as before.
+// The worst case is therefore today's behavior — never a hang, and never an
+// interrupt delivered inside a section the client believes is protected.
+
+/// Learned pairings, direct-mapped and tiny: only the hot working set matters
+/// (Doom's steady state is two POPFs) and a miss just costs a relearn.
+const PAIRS: usize = 16;
+static PAIR_SITE: [AtomicU32; PAIRS] = [const { AtomicU32::new(0) }; PAIRS];
+static PAIR_EXIT: [AtomicU32; PAIRS] = [const { AtomicU32::new(0) }; PAIRS];
+
+/// Sentinel exit: this window ends on an instruction that traps by itself, so
+/// it needs no breakpoint — just let it run.
+const EXIT_FAULTS: u32 = u32::MAX;
+
+/// The site that opened the window we are currently inside (0 = none).
+static CUR_SITE: AtomicU32 = AtomicU32::new(0);
+/// The exit address currently armed in a hardware breakpoint (0 = none).
+static ARMED: AtomicU32 = AtomicU32::new(0);
+
+fn pair_slot(site: u32) -> usize {
+    // Code addresses are dense; fold a few bits so neighbours don't collide.
+    ((site ^ (site >> 5) ^ (site >> 11)) as usize) % PAIRS
+}
+
+fn pair_lookup(site: u32) -> Option<u32> {
+    let i = pair_slot(site);
+    if PAIR_SITE[i].load(Relaxed) == site {
+        let exit = PAIR_EXIT[i].load(Relaxed);
+        if exit != 0 {
+            return Some(exit);
+        }
+    }
+    None
+}
+
+fn pair_learn(site: u32, exit: u32) {
+    if site == 0 {
+        return;
+    }
+    let i = pair_slot(site);
+    PAIR_SITE[i].store(site, Relaxed);
+    PAIR_EXIT[i].store(exit, Relaxed);
+}
+
+/// Drop every learned pairing. The cache is keyed by bare code address, so a
+/// new address space must not inherit the previous program's exits.
+pub fn forget_if_windows() {
+    for i in 0..PAIRS {
+        PAIR_SITE[i].store(0, Relaxed);
+        PAIR_EXIT[i].store(0, Relaxed);
+    }
+    CUR_SITE.store(0, Relaxed);
+    ARMED.store(0, Relaxed);
+}
+
+fn disarm<A: Arch>(arch: &mut A) {
+    if ARMED.swap(0, Relaxed) != 0 {
+        arch.set_exec_breakpoint(None);
+    }
+}
+
+/// The PM virtual-IF gate, called after the #GP monitor resumes an instruction.
+/// `entry_ip` is where that instruction lives and `vif_was_on` is VIF before it
+/// ran, so a 1 -> 0 transition identifies the site that OPENS an interrupts-off
+/// window. Decides whether the client runs free (breakpointed) or steps to learn.
+pub fn if_gate<A: Arch>(
+    arch: &mut A,
+    regs: &mut Regs,
+    entry_ip: u32,
+    vif_was_on: bool,
+) -> MonitorResult {
+    if regs.flags32() & VIF_FLAG != 0 {
+        // The window is closed (or never opened) — e.g. an STI that #GP'd here.
+        if !vif_was_on {
+            // It closed by faulting on its own: it never needs a breakpoint.
+            pair_learn(CUR_SITE.swap(0, Relaxed), EXIT_FAULTS);
+        }
+        disarm(arch);
+        regs.clear_flag32(TF_FLAG);
+        return MonitorResult::Resume;
+    }
+    if !vif_was_on {
+        // Already inside a window — this was some other sensitive instruction
+        // (a port-I/O #GP, say). Do NOT re-key on it: keep whatever breakpoint
+        // or stepping decision the window opened with.
+        if ARMED.load(Relaxed) != 0 {
+            regs.clear_flag32(TF_FLAG);
+            return MonitorResult::Resume;
+        }
+        return step_virtual_if(arch, regs);
+    }
+    // VIF just went 1 -> 0: a new window opens at `entry_ip`.
+    CUR_SITE.store(entry_ip, Relaxed);
+    match pair_lookup(entry_ip) {
+        Some(EXIT_FAULTS) => {
+            regs.clear_flag32(TF_FLAG);
+            MonitorResult::Resume
+        }
+        Some(exit) if arch.set_exec_breakpoint(Some(exit)) => {
+            ARMED.store(exit, Relaxed);
+            regs.clear_flag32(TF_FLAG);
+            MonitorResult::Resume
+        }
+        // Unknown window, or a backend with no breakpoint: step and learn.
+        _ => step_virtual_if(arch, regs),
+    }
+}
+
+/// A hardware execute breakpoint fired. If it is the exit we armed, emulate the
+/// instruction there — the breakpoint is a FAULT, so it has not run yet — which
+/// closes the window and restores VIF without a single step. Returns whether
+/// this `#DB` was ours.
+pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
+    let armed = ARMED.load(Relaxed);
+    if armed == 0 || regs.ip32() != armed {
+        return false;
+    }
+    let ev = monitor_rs::<A>(arch, regs);
+    if regs.flags32() & VIF_FLAG != 0 {
+        disarm(arch);
+        CUR_SITE.store(0, Relaxed);
+        regs.clear_flag32(TF_FLAG);
+    }
+    // Else the exit ran but the client popped IF=0: the pairing is not wrong,
+    // the window simply continues. Leave the breakpoint armed.
+    matches!(ev, MonitorResult::Resume)
+}
+
+/// The DOS layer saw virtual IF stay off, with an interrupt pending, for far
+/// longer than any real critical section: the client left its window by an exit
+/// we never learned, so VIF is stale. Drop the pairing and go back to stepping,
+/// which always finds the truth.
+pub fn relearn<A: Arch>(arch: &mut A, regs: &mut Regs) {
+    disarm(arch);
+    let site = CUR_SITE.load(Relaxed);
+    let i = pair_slot(site);
+    if PAIR_SITE[i].load(Relaxed) == site {
+        PAIR_EXIT[i].store(0, Relaxed);
+    }
+    regs.set_flag32(TF_FLAG);
+}
+
 pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     // Upper bound on sensitive instructions emulated before yielding back to
     // hardware. Prevents a runaway interpret loop on e.g. `POPF; POPF; ...`.
@@ -514,8 +680,20 @@ pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult 
         }
 
         // Sensitive: emulate via the monitor decoder and loop to re-check.
+        let site = regs.ip32();
         match monitor_rs::<A>(arch, regs) {
-            MonitorResult::Resume => continue,
+            MonitorResult::Resume => {
+                // The whole point of stepping: if that instruction just restored
+                // VIF it is the EXIT of the window we are in. Learn the pair, so
+                // the next pass runs on a breakpoint instead of a #DB per
+                // instruction. An STI would have #GP'd on its own, so record the
+                // cheaper sentinel for it and skip the breakpoint entirely.
+                if regs.flags32() & VIF_FLAG != 0 {
+                    let exit = if op == 0xFB { EXIT_FAULTS } else { site };
+                    pair_learn(CUR_SITE.swap(0, Relaxed), exit);
+                }
+                continue;
+            }
             ev @ MonitorResult::Event(_) => return ev,
         }
     }

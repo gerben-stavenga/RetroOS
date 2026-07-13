@@ -305,6 +305,23 @@ pub(super) unsafe fn write_dr0(value: u32) {
 }
 
 #[inline]
+pub(super) unsafe fn read_dr7() -> u32 {
+    let value: u32;
+    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack)); }
+    value
+}
+
+/// DR3 is reserved for the virtual-IF exit breakpoint; DR0/DR1 stay free for
+/// the write-watchpoint debug feature (`set_debug_watch`), which writes DR7
+/// wholesale. The two are not meant to be armed at the same time.
+pub(super) const DR3_EXEC_ENABLE: u32 = 1 << 6; // L3
+
+#[inline]
+pub(super) unsafe fn write_dr3(value: u32) {
+    unsafe { asm!("mov dr3, {}", in(reg) value, options(nomem, nostack)); }
+}
+
+#[inline]
 pub(super) unsafe fn write_dr1(value: u32) {
     unsafe { asm!("mov dr1, {}", in(reg) value, options(nomem, nostack)); }
 }
