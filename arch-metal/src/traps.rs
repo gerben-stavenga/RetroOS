@@ -106,6 +106,7 @@ pub mod arch_call {
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
+    pub const SET_EXEC_BP: u64 = 0x120;       // EDX=linear addr (0 = disable) — virtual-IF exit breakpoint
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -301,6 +302,10 @@ fn arch_dispatch(regs: &mut Regs) {
                     x86::write_dr6(0);
                 }
             }
+        }
+        arch_call::SET_EXEC_BP => {
+            let addr = regs.rdx as u32;
+            unsafe { x86::program_exec_bp(if addr == 0 { None } else { Some(addr) }) };
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }

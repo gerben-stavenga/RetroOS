@@ -83,27 +83,19 @@ impl Arch for Metal {
     fn rearm_irq(&mut self, line: u8) { super::calls::arch_rearm_irq(line) }
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>) { super::calls::arch_set_debug_watch(addrs) }
 
-    /// Program DR3 as an execute breakpoint (R/W3 = 00, LEN3 = 00 — the only
-    /// legal encoding for one) and enable it with L3.
+    /// Program DR3 as the virtual-IF exit breakpoint.
     ///
-    /// This runs from the trap handlers, which are already ring 0, so it pokes
-    /// the debug registers directly rather than going through an arch call.
+    /// `MOV DR` is **CPL=0 only**. Both rings reach this: the trap handlers
+    /// (`if_gate`, `exec_bp_hit`) are already ring 0 and can poke the register
+    /// directly, but `monitor::relearn` is driven from `dos::stall_guard`, which
+    /// runs in the ring-1 kernel — there the write must go through the arch call
+    /// or it #GPs, and a #GP in ring 1 is a kernel panic (it is exactly how
+    /// DUKE3D and ROTT died: they DO take the relearn path, unlike Doom).
     fn set_exec_breakpoint(&mut self, addr: Option<u32>) -> bool {
-        unsafe {
-            match addr {
-                Some(a) => {
-                    super::x86::write_dr3(a);
-                    // Clear R/W3+LEN3 (bits 28..31) so it is an execute break,
-                    // then enable L3. Leaves DR0/DR1's watchpoint bits alone.
-                    let dr7 = (super::x86::read_dr7() & !0xF000_0000)
-                        | super::x86::DR3_EXEC_ENABLE;
-                    super::x86::write_dr7(dr7);
-                }
-                None => {
-                    let dr7 = super::x86::read_dr7() & !super::x86::DR3_EXEC_ENABLE;
-                    super::x86::write_dr7(dr7);
-                }
-            }
+        if super::x86::cpl() == 0 {
+            unsafe { super::x86::program_exec_bp(addr) };
+        } else {
+            super::calls::arch_set_exec_breakpoint(addr);
         }
         true
     }

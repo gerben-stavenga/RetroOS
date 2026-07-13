@@ -314,11 +314,41 @@ pub(super) unsafe fn read_dr7() -> u32 {
 /// DR3 is reserved for the virtual-IF exit breakpoint; DR0/DR1 stay free for
 /// the write-watchpoint debug feature (`set_debug_watch`), which writes DR7
 /// wholesale. The two are not meant to be armed at the same time.
-pub(super) const DR3_EXEC_ENABLE: u32 = 1 << 6; // L3
+const DR3_EXEC_ENABLE: u32 = 1 << 6; // L3
 
 #[inline]
-pub(super) unsafe fn write_dr3(value: u32) {
+unsafe fn write_dr3(value: u32) {
     unsafe { asm!("mov dr3, {}", in(reg) value, options(nomem, nostack)); }
+}
+
+/// Current privilege level, from CS's low two bits.
+#[inline]
+pub fn cpl() -> u16 {
+    let cs: u16;
+    unsafe { asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack)); }
+    cs & 3
+}
+
+/// Program DR3 as an execute breakpoint at `addr` (`None` disables it):
+/// R/W3 = 00 and LEN3 = 00, the only legal encoding for one, enabled via L3.
+///
+/// # Safety
+///
+/// `MOV DR` is CPL=0-only — a ring-1 caller #GPs. Reach this through
+/// `Arch::set_exec_breakpoint`, which routes an unprivileged caller via the
+/// arch call instead of faulting.
+pub(super) unsafe fn program_exec_bp(addr: Option<u32>) {
+    unsafe {
+        match addr {
+            Some(a) => {
+                write_dr3(a);
+                // Clear R/W3+LEN3 (bits 28..31) so it is an execute break, then
+                // enable L3. Leaves DR0/DR1's watchpoint bits untouched.
+                write_dr7((read_dr7() & !0xF000_0000) | DR3_EXEC_ENABLE);
+            }
+            None => write_dr7(read_dr7() & !DR3_EXEC_ENABLE),
+        }
+    }
 }
 
 #[inline]
