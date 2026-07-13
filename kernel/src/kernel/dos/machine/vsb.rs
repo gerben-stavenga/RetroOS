@@ -96,32 +96,19 @@ struct EmuDsp {
     /// guest's per-block refill lands before the codec reaches the data.
     cursor: u64,
     next_irq: u64,    // cursor value of the next block boundary (IRQ point)
-    frac: u64,        // sub-frame pacing accumulator, units of frames×1000
-    last_ms: u64,     // get_ticks() at the last `audio_tick`
-    /// The sink reports a playback position (`sound::position`): slave the
-    /// pipe to it. False → no real-time consumer (WAV window, silent);
-    /// `synth` paces a virtual-time stand-in.
-    use_pos: bool,
-    /// Synthetic drain clock (source frames), `use_pos == false` only:
-    /// advances at `rate` × virtual time, frozen at each block boundary
-    /// until the guest services the IRQ — with an instant consumer that
-    /// gate is the only thing pacing the pipe.
-    synth: u64,
-    /// Source frames handed to the sink this session (the pipe's write side).
-    pushed: u64,
-    /// Sink `consumed`-counter value corresponding to our frame 0: set from
-    /// the sink's *written* counter at the first push (`written − pushed`),
-    /// so frames queued before ours (hangover silence, a previous session's
-    /// tail) are accounted for. `u64::MAX` = not yet anchored.
-    anchor: u64,
-    /// Pipe fill target in source frames (`sound::min_fill`): how far
-    /// `pushed` runs ahead of the drain point. Sized by the sink: its
-    /// stream-start prime plus claim-burst slack.
-    fill: u32,
-    /// How far the guest clock leads the drain point (source frames) — the
-    /// refill margin of the pipe model (= `fill`; both are the sink's
-    /// minimum). Latency vs. a real card ≈ this many frames.
+    /// How far the guest clock leads the mixer's drain point (source
+    /// frames): only what the guest ring is too small to cover — see
+    /// `emu_start`. Latency vs. a real card ≈ the sink's minimum fill.
     slack: u32,
+    /// This DSP playback (re)started: tell the mixer pump to re-key its
+    /// session so pump frame numbering restarts at our frame 0.
+    restarted: bool,
+    /// Tiny single-cycle transfer (same 0x100-byte threshold as the
+    /// passthrough probe path): a DMA-wiring probe wanting its completion
+    /// IRQ within milliseconds — completed on virtual time, not drain.
+    probe: bool,
+    /// `get_ticks()` at the first clock tick of a probe transfer.
+    start_ms: u64,
     /// Block IRQs raised / serviced (guest read the DMA count or status
     /// port — poll-bool/poll-dma/irq-mix all do). Their gap is the commit
     /// horizon: a serviced block means the guest has refilled its slot, so
@@ -164,9 +151,9 @@ impl EmuDsp {
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
-            cursor: 0, next_irq: 0, frac: 0, last_ms: 0,
-            use_pos: false, synth: 0, pushed: 0, anchor: u64::MAX,
-            fill: 0, slack: 0, blocks_done: 0, blocks_acked: 0,
+            cursor: 0, next_irq: 0,
+            slack: 0, restarted: false, probe: false, start_ms: 0,
+            blocks_done: 0, blocks_acked: 0,
             write_busy: 0, dma_tc: false, tc_status: 0,
             stream_hold: false, done_ms: 0,
         }
@@ -936,33 +923,24 @@ impl SoundBlaster {
         };
         self.emu.cursor = 0;
         self.emu.next_irq = self.emu.block_frames as u64;
-        self.emu.frac = 0;
-        self.emu.synth = 0;
-        self.emu.pushed = 0;
-        self.emu.anchor = u64::MAX;
         self.emu.blocks_done = 0;
         self.emu.blocks_acked = 0;
-        // Slave the pipe to the sink's playback position when it has one.
-        // Exception: DMA-wiring probes (tiny single-cycle transfers, the
-        // same 0x100-byte threshold as the passthrough probe path) stay on
-        // the synthetic clock — they need the completion IRQ within
-        // milliseconds and their content is inaudible either way.
-        let fill = if len_bytes < 0x100 {
-            None
-        } else {
-            crate::kernel::sound::min_fill(self.emu.rate)
-        };
-        self.emu.use_pos = fill.is_some();
-        self.emu.fill = fill.unwrap_or(0);
+        self.emu.restarted = true; // mixer pump: re-key session numbering
+        // DMA-wiring probes (tiny single-cycle transfers, the same 0x100-byte
+        // threshold as the passthrough probe path) complete on virtual time —
+        // they need the IRQ within milliseconds and are inaudible either way.
+        self.emu.probe = single && len_bytes < 0x100;
+        self.emu.start_ms = 0;
         // The guest clock leads the drain only by what the ring is too small
         // to cover: with ring ≥ fill + one block, the refill a block IRQ
-        // commits always lands before the push point reads its slot, and the
+        // commits always lands before the mix point reads its slot, and the
         // cursor can track audible playback exactly (slack = 0). Single-cycle
         // never needs a lead — its whole buffer is committed up front.
+        let fill = crate::kernel::sound::min_fill(self.emu.rate).unwrap_or(0);
         self.emu.slack = if single {
             0
         } else {
-            (self.emu.fill + self.emu.block_frames).saturating_sub(self.emu.buf_frames)
+            (fill + self.emu.block_frames).saturating_sub(self.emu.buf_frames)
         };
         self.emu.dma_tc = false; // restart re-loads the count registers
         self.emu.playing = self.emu.buf_frames > 0;
@@ -990,164 +968,144 @@ impl SoundBlaster {
         self.emulated() && (self.emu.playing || self.emu.stream_hold)
     }
 
-    pub fn audio_tick<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        regs: &mut Regs,
-        vpic: &mut super::vpic::VirtualPic,
-        ext: &mut dyn MixSource,
-        ext_streaming: bool,
-    ) {
-        if !self.emulated() {
+    /// Deliver a latched 0xF2/0xF3 trigger-IRQ (the BLASTER IRQ probe). A
+    /// real card answers within microseconds; the next slice is well inside
+    /// any probe's poll window.
+    pub fn deliver_trigger_irq(&mut self, vpic: &mut super::vpic::VirtualPic) {
+        if !self.emulated() || self.emu.trigger_irq == 0 {
             return;
         }
-        // Deliver a latched 0xF2/0xF3 trigger-IRQ. A real card answers within
-        // microseconds; the next slice is well inside any probe's poll window.
-        if self.emu.trigger_irq != 0 {
-            self.emu.irq_status |= self.emu.trigger_irq;
-            self.emu.trigger_irq = 0;
-            if !vpic.is_requested(self.irq) {
-                vpic.raise(self.irq);
-            }
-        }
-        self.dsp_tick(machine, regs, vpic, ext);
-        // The DSP owns the sink while playing OR while holding the stream
-        // through the hangover — either way it pulls FM itself. A streaming
-        // external producer (the GUS pump) also parks the FM free-run: the
-        // sink has one owner, and OPL is the bottom of the priority chain.
-        let dsp_streaming = self.emu.playing || self.emu.stream_hold;
-        if let Some(opl) = self.opl.as_mut() {
-            opl.tick(machine, dsp_streaming || ext_streaming);
+        self.emu.irq_status |= self.emu.trigger_irq;
+        self.emu.trigger_irq = 0;
+        if !vpic.is_requested(self.irq) {
+            vpic.raise(self.irq);
         }
     }
 
-    /// Advance emulated DSP playback — the pipe model. Committed guest ring
-    /// data is pushed into the canonical sink ahead of its drain point (at
-    /// most [`fill`](EmuDsp::fill) frames ahead), and the guest-visible
-    /// cursor — the DMA count and the block-boundary IRQs — derives from
-    /// what the sink has actually *consumed*, leading it by
-    /// [`slack`](EmuDsp::slack) so the guest's per-block refill lands
-    /// before the codec reaches its data. A real SB's DMA cursor IS its
-    /// playback position; slaving to the sink reproduces exactly that
-    /// (drivers verifying the count rate — Duke3D — see the codec's own
-    /// crystal, the same ppm-vs-PIT skew a real card has), and end-to-end
-    /// latency is the sink's minimum fill instead of a deep cushion stacked
-    /// after a virtual-time cursor.
-    ///
-    /// With no real-time consumer behind the sink (WAV window, silent) a
-    /// synthetic drain stands in: virtual-time paced, frozen at each block
-    /// boundary until the guest services the IRQ — with an instant consumer
-    /// that gate is the only thing pacing the pipe.
-    fn dsp_tick<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        _regs: &mut Regs,
-        vpic: &mut super::vpic::VirtualPic,
-        ext: &mut dyn MixSource,
-    ) {
-        if !self.emu.playing {
-            let now = machine.get_ticks();
-            let dt = now.saturating_sub(self.emu.last_ms).min(100);
-            self.emu.last_ms = now; // keep Δt small for first tick
-            if self.emu.stream_hold {
-                if now.saturating_sub(self.emu.done_ms) < DSP_HANGOVER_MS {
-                    // Hold the stream open across the between-samples gap:
-                    // feed silence at the configured rate (FM mixed in like
-                    // live playback) so an effect re-trigger lands on a
-                    // running stream instead of a park/re-prime + rate flip.
-                    self.emu.frac += self.emu.rate as u64 * dt;
-                    let n = self.emu.frac / 1000;
-                    self.emu.frac %= 1000;
-                    if n > 0 {
-                        self.emit_hold_silence(machine, ext, n);
-                    }
-                } else {
-                    crate::kernel::sound::stop(machine, false); // pause: keep configured
-                    self.emu.stream_hold = false;
-                    self.emu.frac = 0;
-                }
-            }
+    /// Rate the DSP stream runs the mixer session at.
+    pub fn dsp_rate(&self) -> u32 {
+        self.emu.rate
+    }
+
+    /// A DSP playback (re)started since the last call: the mixer pump must
+    /// re-key its session so pump frames and DSP stream frames coincide.
+    pub fn take_restart(&mut self) -> bool {
+        core::mem::take(&mut self.emu.restarted)
+    }
+
+    /// Whether the FM synth wants the canonical stream held open (voices
+    /// sounding, or the driver wrote between-notes recently).
+    pub fn opl_audible(&self, now: u64) -> bool {
+        self.opl.as_ref().is_some_and(|o| o.audible(now))
+    }
+
+    /// Add the FM synth's frames into the pump block (no-op when silent).
+    pub fn mix_fm<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, out: &mut [(i16, i16)]) {
+        if let Some(opl) = self.opl.as_mut()
+            && opl.mixing()
+        {
+            opl.mix(machine, rate, base, out);
+        }
+    }
+
+    /// Add the DSP stream's guest-ring frames into the pump block. `base` is
+    /// the mixer-session frame of `out[0]`, which — because `emu_start`
+    /// re-keys the pump session — is also the DSP stream frame. Frames past
+    /// the commit horizon (one ring lap beyond the last *serviced* block,
+    /// floored at the next boundary: an unserviced ring keeps cycling and
+    /// replays, exactly like the real card) stay silent.
+    pub fn mix_dsp<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, out: &mut [(i16, i16)]) {
+        if !self.emu.playing || rate != self.emu.rate {
+            return; // idle or hangover: the pump's zeros are our silence
+        }
+        let channels = if self.emu.stereo { 2u32 } else { 1 };
+        let frame_bytes = (self.emu.bits as u32 / 8) * channels;
+        if frame_bytes == 0 || self.emu.buf_frames == 0 {
             return;
         }
-        let now = machine.get_ticks();
-        // ── The clock: source frames of this session the sink has consumed.
-        let drained = if self.emu.use_pos {
-            let consumed = crate::kernel::sound::position(machine).map_or(0, |(_, c)| c);
-            if self.emu.anchor == u64::MAX {
-                0 // nothing pushed yet: our stream hasn't started draining
-            } else {
-                consumed.saturating_sub(self.emu.anchor)
-            }
-        } else {
-            // Synthetic drain: rate × Δt virtual time, frozen at a block
-            // boundary until the guest services the IRQ. This is what stops
-            // an instant consumer outrunning the guest's refill (which would
-            // re-read stale ring frames and repeat the previous lap's audio).
-            if self.emu.blocks_acked < self.emu.blocks_done {
-                self.emu.last_ms = now;
-            } else {
-                let dt = now.saturating_sub(self.emu.last_ms);
-                self.emu.last_ms = now;
-                self.emu.frac += self.emu.rate as u64 * dt; // units: frames × 1000
-                self.emu.synth += self.emu.frac / 1000;
-                self.emu.frac %= 1000;
-                if self.emu.synth >= self.emu.next_irq {
-                    self.emu.synth = self.emu.next_irq;
-                    self.emu.frac = 0; // discard the excess; resume on the ack
-                }
-            }
-            self.emu.synth
+        let fmt = crate::kernel::sound::Format {
+            bits: self.emu.bits,
+            signed: self.emu.bits == 16,
+            channels: channels as u8,
         };
+        let committed = self.committed_end();
+        let mut done = 0usize;
+        while done < out.len() {
+            let abs = base + done as u64;
+            if abs >= committed {
+                break; // starved: leave the pump's silence
+            }
+            let pos = (abs % self.emu.buf_frames as u64) as u32;
+            let run = (out.len() - done)
+                .min((committed - abs) as usize)
+                .min((self.emu.buf_frames - pos) as usize);
+            let mut scratch = alloc::vec![0u8; run * frame_bytes as usize];
+            let addr = self.emu.buf_gpa as usize + (pos * frame_bytes) as usize;
+            machine.copy_from(addr, &mut scratch);
+            for (i, slot) in out[done..done + run].iter_mut().enumerate() {
+                let (l, r) = fmt.frame(&scratch, i);
+                slot.0 = slot.0.saturating_add(l);
+                slot.1 = slot.1.saturating_add(r);
+            }
+            done += run;
+        }
+    }
 
-        // ── The push: top the pipe up from committed guest ring data.
-        // Auto-init commit horizon: one full ring past the last *serviced*
-        // block (a serviced IRQ means the guest refilled that slot), but
-        // never behind the next boundary — an unserviced ring keeps cycling
-        // and replays, exactly like the real card.
-        let committed = if self.emu.single {
+    /// Auto-init commit horizon (see `mix_dsp`); single-cycle commits the
+    /// whole buffer up front.
+    fn committed_end(&self) -> u64 {
+        if self.emu.single {
             self.emu.buf_frames as u64
         } else {
             (self.emu.blocks_acked * self.emu.block_frames as u64
                 + self.emu.buf_frames as u64)
                 .max(self.emu.next_irq)
-        };
-        let target = if self.emu.use_pos {
-            committed.min(drained + self.emu.fill as u64)
-        } else {
-            committed.min(drained) // no real consumer: emit exactly as consumed
-        };
-        if self.emu.use_pos && self.emu.pushed < drained {
-            // Sink underrun (we stalled; the codec played guard silence past
-            // our write point): skip the frames whose playback moment already
-            // passed, like a real card that kept cycling while the CPU was away.
-            self.emu.pushed = drained.min(target);
         }
-        if target > self.emu.pushed {
-            let from = self.emu.pushed;
-            self.emit_frames(machine, ext, from, target - from);
-            self.emu.pushed = target;
-            if self.emu.use_pos && self.emu.anchor == u64::MAX {
-                // Anchor on the sink's *written* counter: our frame f drains
-                // when `consumed` reaches (written_now − pushed) + f, i.e.
-                // after everything queued before our first push (a previous
-                // session's tail, hangover silence) has drained first.
-                let written = crate::kernel::sound::position(machine).map_or(0, |(w, _)| w);
-                self.emu.anchor = written.saturating_sub(self.emu.pushed);
-            }
-            if self.emu.use_pos && self.emu.single && self.emu.pushed >= committed {
-                // Single-cycle content fully queued: pad with one fill of
-                // silence so a sample shorter than the sink's start prime
-                // still gets the stream RUNning — otherwise it never drains
-                // and the completion IRQ never fires. (Runs once: `pushed`
-                // stops growing after this.) Auto-init needs no pad; a real
-                // playback ring always spans the prime.
-                self.emit_hold_silence(machine, ext, self.emu.fill as u64);
-            }
-        }
+    }
 
-        // ── The guest-visible clock: leads the drain by `slack` (the refill
-        // margin), never past data actually handed to the sink.
-        let guest_now = (drained + self.emu.slack as u64).min(self.emu.pushed);
+    /// The DSP's guest-visible clock, driven by the mixer's drain point:
+    /// the cursor — the DMA count and the block-boundary IRQs both derive
+    /// from it — is `drained + slack`, capped at `pushed` (frames actually
+    /// handed to the sink). A real SB's DMA cursor IS its playback position;
+    /// deriving it from what the codec has consumed reproduces exactly that.
+    /// Also ends the hangover hold, and completes tiny probe transfers on
+    /// virtual time (their IRQ can't wait for a stream to start draining).
+    pub fn dsp_clock_tick<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        vpic: &mut super::vpic::VirtualPic,
+        drained: u64,
+        pushed: u64,
+    ) {
+        if !self.emulated() {
+            return;
+        }
+        let now = machine.get_ticks();
+        if !self.emu.playing {
+            // Hangover: the pump keeps the stream fed (silence + synths)
+            // while `stream_hold` keeps `dsp_owns_sink` true; effect chains
+            // re-trigger onto a hot stream instead of a park/re-prime.
+            if self.emu.stream_hold
+                && now.saturating_sub(self.emu.done_ms) >= DSP_HANGOVER_MS
+            {
+                self.emu.stream_hold = false;
+            }
+            return;
+        }
+        let guest_now = if self.emu.probe {
+            // Probe transfers complete after their real duration on the
+            // virtual clock — milliseconds, independent of stream priming.
+            if self.emu.start_ms == 0 {
+                self.emu.start_ms = now;
+            }
+            let len_ms = self.emu.buf_frames as u64 * 1000 / self.emu.rate.max(1) as u64;
+            if now.saturating_sub(self.emu.start_ms) < len_ms {
+                return;
+            }
+            self.emu.next_irq
+        } else {
+            (drained + self.emu.slack as u64).min(pushed)
+        };
         while self.emu.playing && guest_now >= self.emu.next_irq {
             self.emu.cursor = self.emu.next_irq;
             self.emu.blocks_done += 1;
@@ -1176,112 +1134,6 @@ impl SoundBlaster {
         }
         if self.emu.playing {
             self.emu.cursor = guest_now;
-        }
-    }
-
-    /// Copy `count` ring frames (from frame `from`, wrapping) out of guest
-    /// memory and hand them to the kernel sound layer. While any co-sounding
-    /// synth (the FM chip, an external [`MixSource`]) is active its frames
-    /// are pulled at the DSP rate and mixed in here — the DSP stream owns
-    /// the sink, and this is the one place its frames pass by.
-    fn emit_frames<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        ext: &mut dyn MixSource,
-        from: u64,
-        count: u64,
-    ) {
-        let channels = if self.emu.stereo { 2u32 } else { 1 };
-        let frame_bytes = (self.emu.bits as u32 / 8) * channels;
-        if frame_bytes == 0 || self.emu.buf_frames == 0 {
-            return;
-        }
-        let fmt = crate::kernel::sound::Format {
-            bits: self.emu.bits,
-            signed: self.emu.bits == 16,
-            channels: channels as u8,
-        };
-        let rate = self.emu.rate;
-        let fm_on = self.opl.as_ref().is_some_and(|o| o.mixing());
-        let ext_on = ext.mixing();
-        let mut remaining = count;
-        let mut pos = (from % self.emu.buf_frames as u64) as u32;
-        while remaining > 0 {
-            let run = remaining.min((self.emu.buf_frames - pos) as u64) as u32;
-            let mut scratch = alloc::vec![0u8; (run * frame_bytes) as usize];
-            let addr = self.emu.buf_gpa as usize + (pos * frame_bytes) as usize;
-            machine.copy_from(addr, &mut scratch);
-            if fm_on || ext_on {
-                // Canonicalize the guest frames here (normally sound::play's
-                // job) so the synth voices can be added per-frame, saturating.
-                let canon = crate::kernel::sound::Format {
-                    bits: 16, signed: true, channels: 2,
-                };
-                let mut mixed = alloc::vec![0u8; run as usize * 4];
-                for i in 0..run as usize {
-                    let (l, r) = fmt.frame(&scratch, i);
-                    let (mut l, mut r) = (l as i32, r as i32);
-                    if fm_on {
-                        let (fl, fr) = self.opl.as_mut().unwrap().mix_frame(rate);
-                        l += fl as i32;
-                        r += fr as i32;
-                    }
-                    if ext_on {
-                        let (el, er) = ext.mix_frame(rate);
-                        l += el as i32;
-                        r += er as i32;
-                    }
-                    let l = l.clamp(-32768, 32767) as i16;
-                    let r = r.clamp(-32768, 32767) as i16;
-                    mixed[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
-                    mixed[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
-                }
-                crate::kernel::sound::play(machine, rate, canon, &mixed);
-            } else {
-                crate::kernel::sound::play(machine, rate, fmt, &scratch);
-            }
-            remaining -= run as u64;
-            pos += run;
-            if pos >= self.emu.buf_frames {
-                pos = 0;
-            }
-        }
-    }
-
-    /// Push `count` frames of silence at the configured rate, the synth
-    /// voices mixed in exactly as `emit_frames` does for live playback — the
-    /// hangover feed that keeps the stream (and the music riding on it)
-    /// running between closely-spaced sound effects.
-    fn emit_hold_silence<A: crate::Arch>(&mut self, machine: &mut A, ext: &mut dyn MixSource, count: u64) {
-        let canon = crate::kernel::sound::Format { bits: 16, signed: true, channels: 2 };
-        let rate = self.emu.rate;
-        let fm_on = self.opl.as_ref().is_some_and(|o| o.mixing());
-        let ext_on = ext.mixing();
-        let mut remaining = count;
-        while remaining > 0 {
-            let run = remaining.min(256) as usize;
-            let mut buf = alloc::vec![0u8; run * 4];
-            if fm_on || ext_on {
-                for i in 0..run {
-                    let (mut l, mut r) = (0i32, 0i32);
-                    if fm_on {
-                        let (fl, fr) = self.opl.as_mut().unwrap().mix_frame(rate);
-                        l += fl as i32;
-                        r += fr as i32;
-                    }
-                    if ext_on {
-                        let (el, er) = ext.mix_frame(rate);
-                        l += el as i32;
-                        r += er as i32;
-                    }
-                    let l = l.clamp(-32768, 32767) as i16;
-                    let r = r.clamp(-32768, 32767) as i16;
-                    buf[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
-                    buf[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
-                }
-            }
-            crate::kernel::sound::play(machine, rate, canon, &buf);
-            remaining -= run as u64;
         }
     }
 

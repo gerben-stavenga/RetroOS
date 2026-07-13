@@ -189,13 +189,19 @@ pub struct Pace {
     /// anchored; computed as `written − pushed` on the tick after the first
     /// push, so anything queued before us drains first — see vsb).
     anchor: u64,
+    /// Session frames the sink has consumed, as of the last [`due`] call
+    /// (synthetic: everything pushed — an instant consumer).
+    drained: u64,
     /// Synthetic-clock accumulator, frames × 1000.
     frac: u64,
 }
 
 impl Pace {
     pub const fn new() -> Self {
-        Pace { rate: 0, fill: 0, use_pos: false, pushed: 0, anchor: u64::MAX, frac: 0 }
+        Pace {
+            rate: 0, fill: 0, use_pos: false,
+            pushed: 0, anchor: u64::MAX, drained: 0, frac: 0,
+        }
     }
 
     /// Park the pacer: next [`due`] starts a fresh session (fresh anchor).
@@ -204,7 +210,28 @@ impl Pace {
         self.rate = 0;
         self.pushed = 0;
         self.anchor = u64::MAX;
+        self.drained = 0;
         self.frac = 0;
+    }
+
+    /// Force a fresh session on the next [`due`] even at an unchanged rate —
+    /// the session-identity signal (a new stream-frame numbering starts at 0).
+    /// The sink stream itself is untouched; the anchor math absorbs whatever
+    /// is still queued from the previous numbering.
+    pub fn rekey(&mut self) {
+        self.reset();
+    }
+
+    /// Session frames pushed so far — the absolute frame index the *next*
+    /// [`due`]'d frame will have. Producers stamp sub-block events with this.
+    pub fn pushed(&self) -> u64 {
+        self.pushed
+    }
+
+    /// Session frames consumed by the sink as of the last [`due`] — the
+    /// drain clock that guest-visible cursors and event delivery derive from.
+    pub fn drained(&self) -> u64 {
+        self.drained
     }
 
     /// Frames due at `rate` after `dt_ms` of virtual time. The caller must
@@ -226,7 +253,7 @@ impl Pace {
             if self.anchor == u64::MAX && self.pushed > 0 {
                 self.anchor = written.saturating_sub(self.pushed);
             }
-            let drained = if self.anchor == u64::MAX {
+            self.drained = if self.anchor == u64::MAX {
                 0
             } else {
                 consumed.saturating_sub(self.anchor)
@@ -234,7 +261,7 @@ impl Pace {
             // Top the pipe up to `fill` ahead of the drain point. Self-
             // limiting: `consumed` can never pass what was written, so a
             // stall's backlog is bounded by `fill`, never a burst.
-            let due = (drained + self.fill as u64).saturating_sub(self.pushed);
+            let due = (self.drained + self.fill as u64).saturating_sub(self.pushed);
             self.pushed += due;
             due
         } else {
@@ -242,6 +269,7 @@ impl Pace {
             let due = self.frac / 1000;
             self.frac %= 1000;
             self.pushed += due;
+            self.drained = self.pushed; // instant consumer: drained ≡ pushed
             due
         }
     }

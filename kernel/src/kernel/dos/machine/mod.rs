@@ -226,6 +226,9 @@ pub struct PcMachine {
     /// Gravis UltraSound card state (ULTRASND wiring + the GF1 over the
     /// unified sampler engine). Absent until the env declares it.
     pub gus: Gus,
+    /// The mixer pump: the thread's one canonical PCM stream, every emulated
+    /// sound device summed into it, paced by the sink's playback position.
+    pub mixer: Mixer,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -425,6 +428,7 @@ impl PcMachine {
             dma: Dma8237::new(),
             sb: SoundBlaster::new(),
             gus: Gus::new(),
+            mixer: Mixer::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
         }
@@ -830,34 +834,141 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     }
 }
 
-/// A synth voice the sink-owning stream pulls per output frame, mixed in
-/// saturating — the shape `OplFm::mix_frame` established (zero-order-hold
-/// consumption locked to the puller's cursor). OPL and the GUS implement
-/// it; further sampler-backed devices (GM) join as they land, so the DSP
-/// stream mixes every co-sounding synth through one shape instead of
-/// growing a per-device arm.
+/// A PCM producer the mixer pump sums per block, saturating — the one shape
+/// every emulated sound device presents: the SB DSP fills from the guest
+/// ring, OPL from nuked-opl3, the GUS from the wavetable sampler; further
+/// sampler-backed devices (GM, AWE) join by implementing this. `mix` is a
+/// pure frame generator: sub-block events (voice IRQs, block boundaries)
+/// are stamped with their session frame (`base + i`) and delivered by the
+/// device's *tick* when the sink's drain clock crosses them — never raised
+/// from inside `mix`, which runs up to a pipe-fill ahead of the speaker.
 pub trait MixSource {
     /// Audibly active. A silent source mixes silence — skip the work.
     fn mixing(&self) -> bool;
-    /// Pull one frame at the pulling stream's rate.
-    fn mix_frame(&mut self, out_rate: u32) -> (i16, i16);
+    /// ADD this source's frames into `out` at `rate`, saturating. `base` is
+    /// the mixer-session frame index of `out[0]` (for event stamping).
+    fn mix<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, out: &mut [(i16, i16)]);
 }
 
-/// Advance the emulated Sound Blaster's software DSP playback by the virtual
-/// time elapsed since the last call (no-op unless the SB is in emulation mode).
-/// Runs in the event loop right after the PIT tick pump, where `machine`,
-/// `regs`, and the machine are all in scope; consumes the guest DMA ring into
-/// the kernel sound API and raises the SB IRQ per block.
+/// Canonical shape the pump plays: signed 16-bit interleaved stereo.
+const MIX_CANON: crate::kernel::sound::Format = crate::kernel::sound::Format {
+    bits: 16,
+    signed: true,
+    channels: 2,
+};
+
+/// Frames per pump chunk (bounded stack buffers; a due burst loops).
+const MIX_CHUNK: usize = 128;
+
+/// Which producer owns the canonical stream's *rate* (priority
+/// DSP > GUS > OPL — everything audible still mixes in regardless).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixOwner {
+    None,
+    Dsp,
+    Gus,
+    Opl,
+}
+
+/// The one mixer pump: exactly one canonical PCM stream, paced by the sink's
+/// playback position (`sound::Pace`), into which every audible `MixSource`
+/// sums its frames. Owns the stream lifecycle (open while anything is
+/// audible, paused when everything goes quiet) and the session identity that
+/// event stamps and the DSP's guest clock are numbered in.
+pub struct Mixer {
+    pace: crate::kernel::sound::Pace,
+    owner: MixOwner,
+    streaming: bool,
+    last_ms: u64,
+}
+
+impl Mixer {
+    pub const fn new() -> Self {
+        Mixer {
+            pace: crate::kernel::sound::Pace::new(),
+            owner: MixOwner::None,
+            streaming: false,
+            last_ms: 0,
+        }
+    }
+}
+
+/// Advance emulated sound by one event-loop quantum (no-op for the parts a
+/// real card serves): deliver device IRQs, run the mixer pump, then derive
+/// every guest-visible clock from the sink's drain position.
 pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
-    let PcMachine { sb, gus, vpic, .. } = pc;
-    // Producer priority: SB DSP stream > GUS pump > OPL free-run. The DSP
-    // pulls the synths per frame while it owns the sink; a streaming GUS
-    // pump parks the OPL free-run below it.
-    let gus_streaming = gus.streaming();
-    sb.audio_tick(machine, regs, vpic, gus, gus_streaming);
-    // The GUS ticks regardless of the SB's mode: it is always the software
-    // model, even when a real SB card handles the Blaster ports.
-    gus.tick(machine, vpic, sb.dsp_owns_sink());
+    let _ = regs;
+    let PcMachine { sb, gus, vpic, mixer, .. } = pc;
+    let now = machine.get_ticks();
+    let dt = now.saturating_sub(mixer.last_ms).min(100);
+    mixer.last_ms = now;
+
+    // Device ticks that run regardless of playback: the SB's latched
+    // 0xF2/0xF3 trigger IRQ, the GF1 rate timers + DMA-TC IRQ.
+    sb.deliver_trigger_irq(vpic);
+    gus.tick(machine, vpic);
+
+    // ── the pump ──
+    let dsp_on = sb.dsp_owns_sink();
+    let gus_on = <Gus as MixSource>::mixing(gus);
+    let opl_on = sb.opl_audible(now);
+    let owner = if dsp_on {
+        MixOwner::Dsp
+    } else if gus_on {
+        MixOwner::Gus
+    } else if opl_on {
+        MixOwner::Opl
+    } else {
+        MixOwner::None
+    };
+    if owner == MixOwner::None {
+        if mixer.streaming {
+            crate::kernel::sound::stop(machine, false); // pause, keep configured
+            mixer.streaming = false;
+        }
+        mixer.pace.reset();
+        mixer.owner = owner;
+        return;
+    }
+    // Session identity: a new numbering starts when the rate-owner changes
+    // or the DSP (re)starts playback — pump frame 0 must be DSP frame 0,
+    // and stamped events from the old numbering are meaningless.
+    if owner != mixer.owner || sb.take_restart() {
+        mixer.pace.rekey();
+        gus.on_mix_session();
+    }
+    mixer.owner = owner;
+    let rate = match owner {
+        MixOwner::Dsp => sb.dsp_rate(),
+        MixOwner::Gus => gus.pump_rate(),
+        _ => opl::NATIVE_RATE,
+    };
+    let mut n = mixer.pace.due(machine, rate, dt);
+    let mut base = mixer.pace.pushed() - n;
+    let mut frames = [(0i16, 0i16); MIX_CHUNK];
+    let mut bytes = [0u8; MIX_CHUNK * 4];
+    while n > 0 {
+        let run = (n as usize).min(MIX_CHUNK);
+        frames[..run].fill((0, 0));
+        sb.mix_dsp(machine, rate, base, &mut frames[..run]);
+        sb.mix_fm(machine, rate, base, &mut frames[..run]);
+        if gus_on {
+            gus.mix(machine, rate, base, &mut frames[..run]);
+        }
+        for (i, (l, r)) in frames[..run].iter().enumerate() {
+            bytes[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
+            bytes[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+        }
+        crate::kernel::sound::play(machine, rate, MIX_CANON, &bytes[..run * 4]);
+        base += run as u64;
+        n -= run as u64;
+    }
+    mixer.streaming = true;
+
+    // ── guest clocks & event delivery, on the drain clock ──
+    let drained = mixer.pace.drained();
+    sb.dsp_clock_tick(machine, vpic, drained, mixer.pace.pushed());
+    gus.deliver_events(drained, vpic);
 }
 
 pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {

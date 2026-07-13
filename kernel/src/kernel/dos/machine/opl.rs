@@ -9,43 +9,23 @@
 //! (start ⇒ instant expiry; ms ticks can't resolve the 80 µs timer, and
 //! every probe only polls "did it expire").
 //!
-//! Output follows the one-producer rule of the canonical `sound` sink:
-//!
-//!  - **standalone** (no DSP playback): [`OplFm::tick`] paces native-rate
-//!    frames into `sound::play` by the sink's real playback position
-//!    (`sound::Pace`; virtual time where the sink has no clock) — the sink
-//!    owns any resampling, like every other producer.
-//!  - **mixed** (DSP playback active): the DSP stream owns the sink, and
-//!    `emit_frames` pulls FM frames at the DSP rate via [`OplFm::mix_frame`]
-//!    (chip-native steps, zero-order hold — the same resampling the codec
-//!    drivers use) and adds them into the canonical i16-stereo frames.
-//!
-//! The synth pauses (and the stream parks) once every envelope is released
-//! and the driver has gone quiet; state is per-thread and dropped on program
-//! cleanup like the rest of the virtual SB.
+//! Output goes through the machine mixer pump (`machine::audio_tick`): the
+//! chip implements [`MixSource`](super::MixSource) and adds its frames into
+//! the pump's block at the pump's rate (chip-native steps, zero-order hold —
+//! the same resampling the codec drivers use). [`OplFm::audible`] keeps the
+//! canonical stream open through the between-notes hangover; once every
+//! envelope is released and the driver has gone quiet the pump parks the
+//! stream. State is per-thread and dropped on program cleanup like the rest
+//! of the virtual SB.
 
 use nuked_opl3::Opl3Chip;
 
 /// The YMF262's native output rate (14.318 MHz master clock / 288).
-const NATIVE_RATE: u32 = 49_716;
+pub(super) const NATIVE_RATE: u32 = 49_716;
 
 /// Keep synthesizing this long after the last data-register write even with
 /// all envelopes released — drivers pause between notes and between songs.
 const HANGOVER_MS: u64 = 2_000;
-
-/// Longest virtual-time gap made up in one pump (first tick, or the task was
-/// backgrounded): older backlog is dropped, not synthesized — nobody heard it.
-const MAX_CATCHUP_MS: u64 = 100;
-
-/// Frames per `sound::play` push in the standalone pump.
-const CHUNK_FRAMES: usize = 128;
-
-/// Canonical shape FM synthesis is produced in: signed 16-bit stereo.
-const CANON: crate::kernel::sound::Format = crate::kernel::sound::Format {
-    bits: 16,
-    signed: true,
-    channels: 2,
-};
 
 /// What a guest-visible FM port decodes to.
 pub(super) enum OplPort {
@@ -90,17 +70,10 @@ pub(super) struct OplFm {
     status: u8,
     /// `get_ticks()` at the last data-register write (activity hangover).
     last_write_ms: u64,
-    /// `get_ticks()` at the last `tick` (standalone pacing).
-    last_ms: u64,
-    /// Standalone-pump pacing — slaved to the sink's playback position where
-    /// one exists ([`sound::Pace`](crate::kernel::sound::Pace)).
-    pace: crate::kernel::sound::Pace,
-    /// Native-frame accumulator for the DSP-rate pull in `mix_frame`.
+    /// Native-frame accumulator for the foreign-rate pull in `mix`.
     mix_acc: u32,
-    /// Last native frame generated (zero-order hold for `mix_frame`).
+    /// Last native frame generated (zero-order hold for `mix`).
     hold: (i16, i16),
-    /// A standalone stream is open (so going idle must `sound::stop`).
-    streaming: bool,
 }
 
 impl OplFm {
@@ -114,11 +87,8 @@ impl OplFm {
             index: 0,
             status: 0,
             last_write_ms: now,
-            last_ms: now,
-            pace: crate::kernel::sound::Pace::new(),
             mix_acc: 0,
             hold: (0, 0),
-            streaming: false,
         }
     }
 
@@ -165,76 +135,37 @@ impl OplFm {
 
     /// Whether the synth currently owes the sink audio: envelopes still
     /// sounding, or the driver wrote recently (between-notes hangover).
-    fn audible(&self, now: u64) -> bool {
+    /// The mixer pump keeps the canonical stream open while this holds.
+    pub(super) fn audible(&self, now: u64) -> bool {
         self.chip.active_voice_count() > 0
             || now.saturating_sub(self.last_write_ms) < HANGOVER_MS
     }
-
-    /// Standalone pump — the per-quantum device tick. While the DSP stream is
-    /// live it owns the sink and pulls FM itself (`mix_frame`), so this only
-    /// re-anchors the pacing clock; otherwise generate what the sink's
-    /// playback position says is due (`sound::Pace` — virtual time only where
-    /// the sink has no clock) and push it to the canonical output.
-    pub(super) fn tick<A: crate::Arch>(&mut self, machine: &mut A, dsp_streaming: bool) {
-        let now = machine.get_ticks();
-        let dt = now.saturating_sub(self.last_ms).min(MAX_CATCHUP_MS);
-        self.last_ms = now;
-        if dsp_streaming {
-            // The DSP stream superseded ours mid-flight; it re-programs the
-            // sink rate itself, so there is nothing to stop or flush.
-            self.pace.reset();
-            self.streaming = false;
-            return;
-        }
-        if !self.audible(now) {
-            if self.streaming {
-                crate::kernel::sound::stop(machine, false); // pause, keep configured
-                self.streaming = false;
-            }
-            self.pace.reset();
-            return;
-        }
-        let mut n = self.pace.due(machine, NATIVE_RATE, dt);
-        if n == 0 {
-            return;
-        }
-        self.streaming = true;
-        let mut pcm = [0i16; CHUNK_FRAMES * 2];
-        let mut bytes = [0u8; CHUNK_FRAMES * 4];
-        while n > 0 {
-            let run = (n as usize).min(CHUNK_FRAMES);
-            let _ = self.chip.generate_stream(&mut pcm[..run * 2]);
-            for (i, s) in pcm[..run * 2].iter().enumerate() {
-                bytes[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
-            }
-            crate::kernel::sound::play(machine, NATIVE_RATE, CANON, &bytes[..run * 4]);
-            n -= run as u64;
-        }
-    }
-
 }
 
-/// The DSP stream pulls FM through the canonical mix-source shape.
+/// The mixer pump pulls FM through the canonical mix-source shape.
 impl super::MixSource for OplFm {
-    /// Whether `emit_frames` should pull FM into the DSP stream. Voices-only
-    /// (no write hangover): a silent chip mixes silence, so skip the work.
+    /// Voices-only (no write hangover): a silent chip mixes silence — skip
+    /// the work. (`audible` decides whether the *stream* stays open.)
     fn mixing(&self) -> bool {
         self.chip.active_voice_count() > 0
     }
 
-    /// Pull one FM frame at the DSP stream's rate: advance the chip by the
-    /// corresponding number of native frames (zero-order hold on the last).
-    /// Keeps FM consumption locked to the DSP cursor, which is already paced
-    /// by virtual time.
-    fn mix_frame(&mut self, rate: u32) -> (i16, i16) {
+    /// Add FM at the pump's rate: per output frame advance the chip by the
+    /// corresponding number of native frames (zero-order hold on the last),
+    /// summing saturating. No sub-block events: the OPL's guest-visible
+    /// timers run on virtual time, not the stream.
+    fn mix<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, _base: u64, out: &mut [(i16, i16)]) {
         let rate = rate.max(4_000); // guest-programmed; never let it stall us
-        self.mix_acc += NATIVE_RATE;
         let mut pair = [0i16; 2];
-        while self.mix_acc >= rate {
-            self.mix_acc -= rate;
-            let _ = self.chip.generate(&mut pair);
-            self.hold = (pair[0], pair[1]);
+        for slot in out.iter_mut() {
+            self.mix_acc += NATIVE_RATE;
+            while self.mix_acc >= rate {
+                self.mix_acc -= rate;
+                let _ = self.chip.generate(&mut pair);
+                self.hold = (pair[0], pair[1]);
+            }
+            slot.0 = slot.0.saturating_add(self.hold.0);
+            slot.1 = slot.1.saturating_add(self.hold.1);
         }
-        self.hold
     }
 }
