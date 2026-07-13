@@ -78,6 +78,7 @@ fn main() {
             inb: arch::inb,
             inw: arch::inw,
             inl: arch::inl,
+            insw: arch::insw,
             outb: arch::outb,
             outw: arch::outw,
             outl: arch::outl,

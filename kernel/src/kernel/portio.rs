@@ -13,6 +13,10 @@ pub struct PortIo {
     pub inb: fn(u16) -> u8,
     pub inw: fn(u16) -> u16,
     pub inl: fn(u16) -> u32,
+    /// Bulk word read — one `rep insw` on metal. A discrete `inw` per word is
+    /// a VM exit per word on a virtualized host; the ATA data register is read
+    /// 256 times per sector, so the block driver needs the batched form.
+    pub insw: fn(u16, &mut [u16]),
     pub outb: fn(u16, u8),
     pub outw: fn(u16, u16),
     pub outl: fn(u16, u32),
@@ -22,6 +26,7 @@ const NONE: PortIo = PortIo {
     inb: |_| 0xFF,
     inw: |_| 0xFFFF,
     inl: |_| 0xFFFF_FFFF,
+    insw: |_, buf| buf.fill(0xFFFF),
     outb: |_, _| {},
     outw: |_, _| {},
     outl: |_, _| {},
@@ -52,6 +57,10 @@ pub fn inw(port: u16) -> u16 {
 #[inline]
 pub fn inl(port: u16) -> u32 {
     (hooks().inl)(port)
+}
+#[inline]
+pub fn insw(port: u16, buf: &mut [u16]) {
+    (hooks().insw)(port, buf)
 }
 #[inline]
 pub fn outb(port: u16, val: u8) {

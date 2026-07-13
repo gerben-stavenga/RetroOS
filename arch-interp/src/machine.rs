@@ -48,6 +48,13 @@ pub fn clean_fx_template() -> FxState {
 pub fn inb(port: u16) -> u8 { crate::devices::port_in(port, 1) as u8 }
 pub fn inw(port: u16) -> u16 { crate::devices::port_in(port, 2) as u16 }
 pub fn inl(port: u16) -> u32 { crate::devices::port_in(port, 4) }
+/// Bulk word read (`rep insw` on metal). Hosted has no exit to amortize, so
+/// the loop IS the primitive.
+pub fn insw(port: u16, buf: &mut [u16]) {
+    for w in buf.iter_mut() {
+        *w = crate::devices::port_in(port, 2) as u16;
+    }
+}
 pub fn outb(port: u16, value: u8) { crate::devices::port_out(port, 1, value as u32); }
 pub fn outw(port: u16, value: u16) { crate::devices::port_out(port, 2, value as u32); }
 pub fn outl(port: u16, value: u32) { crate::devices::port_out(port, 4, value); }

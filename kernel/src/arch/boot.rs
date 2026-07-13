@@ -116,7 +116,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // for the deep driver call sites, and the host-environment facts the
     // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).
     crate::install_portio(crate::PortIo {
-        inb: arch::inb, inw: arch::inw, inl: arch::inl,
+        inb: arch::inb, inw: arch::inw, inl: arch::inl, insw: arch::insw,
         outb: arch::outb, outw: arch::outw, outl: arch::outl,
     });
     crate::set_host_env(crate::HostEnv {

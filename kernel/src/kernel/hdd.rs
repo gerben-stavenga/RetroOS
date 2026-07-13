@@ -3,7 +3,7 @@
 //! Simple polling-based driver for reading sectors from the primary ATA disk.
 //! Uses LBA28 addressing mode, supporting disks up to 128GB.
 
-use crate::kernel::portio::{inb, inw, outb};
+use crate::kernel::portio::{inb, insw, outb};
 
 /// ATA register offsets from base port
 mod reg {
@@ -136,23 +136,22 @@ pub fn read_sectors(lba: u32, mut  buffer: &mut [u8]) -> u32 {
         remaining -= batch;
         current_lba += batch;
 
-        // Read each sector in this batch
+        // Read each sector in this batch. One `rep insw` per sector, not 256
+        // discrete `in`s: under a hypervisor each `in` is a VM exit, and at
+        // 256 of them per sector an 8 KB read cost ~80 ms — long enough to
+        // stall the audio pump and coalesce away the guest's timer ticks.
         for _ in 0..batch {
             wait_data_ready(port);
 
-            // Read 256 words (512 bytes) per sector
-            let mut tmp = [0u8; 512];
-            for i in 0..256 {
-                let data = inw(port + reg::DATA);
-                tmp[2 * i] = data as u8;
-                tmp[2 * i + 1] = (data >> 8) as u8;
+            let mut words = [0u16; 256];
+            insw(port + reg::DATA, &mut words);
+            let mut bytes = [0u8; 512];
+            for (pair, w) in bytes.chunks_exact_mut(2).zip(words) {
+                pair.copy_from_slice(&w.to_le_bytes());
             }
-            if buffer.len() >= 512 {
-                buffer[..512].copy_from_slice(&tmp);
-                buffer = &mut buffer[512..];
-            } else {
-                buffer.copy_from_slice(&tmp[..buffer.len()])
-            }
+            let n = buffer.len().min(512);
+            buffer[..n].copy_from_slice(&bytes[..n]);
+            buffer = &mut buffer[n..];
         }
     }
     count

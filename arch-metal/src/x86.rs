@@ -233,6 +233,26 @@ pub fn inw(port: u16) -> u16 {
     value
 }
 
+/// Read `buf.len()` words from an I/O port in one `rep insw`.
+///
+/// The bulk form is not a micro-optimization: on a virtualized host every
+/// discrete `in` is a VM exit, so a 512-byte ATA sector cost 256 of them. A
+/// `rep insw` is one instruction the hypervisor services as a single batched
+/// transfer — the difference between an 80 ms 8 KB WAD read (which stalls the
+/// audio pump and swallows the guest's timer ticks) and a sub-millisecond one.
+#[inline]
+pub fn insw(port: u16, buf: &mut [u16]) {
+    unsafe {
+        asm!(
+            "rep insw",
+            in("dx") port,
+            inout("edi") buf.as_mut_ptr() => _,
+            inout("ecx") buf.len() => _,
+            options(nostack),
+        );
+    }
+}
+
 /// Write to I/O port
 #[inline]
 pub fn outb(port: u16, value: u8) {
