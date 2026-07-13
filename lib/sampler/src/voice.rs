@@ -28,8 +28,14 @@ pub enum LoopMode {
 #[derive(Clone, Copy, Default)]
 pub struct Ramp {
     pub running: bool,
-    /// Amount added per update (the GF1 ramp-rate register's bits 5..0).
-    pub inc: u8,
+    /// Amount added per update, in the SAME log-volume domain as `floor` /
+    /// `ceil` / `Voice::vol`. Not the GF1 rate register's raw 6-bit field:
+    /// that counts in units of the volume's 12-bit significand (bit 4 of the
+    /// 16-bit register), so the GF1 front-end scales it by 16 on the way in.
+    /// Feeding the raw field straight through made every ramp 16x too slow —
+    /// a ~1.5 ms note attack took ~24 ms, and DMX busy-waits (interrupts off)
+    /// for the ramp to finish, which swallowed the guest's 140 Hz music ticks.
+    pub inc: u16,
     /// Update-rate divider (rate bits 7..6): apply every `1 << (3*shift)`
     /// frames — 1, 8, 64, 512.
     pub shift: u8,

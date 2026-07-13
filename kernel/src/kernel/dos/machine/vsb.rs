@@ -139,6 +139,8 @@ struct EmuDsp {
     /// the last status read; reading a controller's status register clears its
     /// four bits, exactly like the real chip.
     tc_status: u8,
+    /// Bounded channel-5 diagnostic reads for SB16 initialization failures.
+    trace_dma16_reads: u8,
 }
 
 impl EmuDsp {
@@ -154,7 +156,7 @@ impl EmuDsp {
             cursor: 0, next_irq: 0,
             slack: 0, restarted: false, probe: false, start_ms: 0,
             blocks_done: 0, blocks_acked: 0,
-            write_busy: 0, dma_tc: false, tc_status: 0,
+            write_busy: 0, dma_tc: false, tc_status: 0, trace_dma16_reads: 0,
             stream_hold: false, done_ms: 0,
         }
     }
@@ -798,7 +800,11 @@ impl SoundBlaster {
                 if self.emu.reset_prev == 1 && val == 0 {
                     self.emu.playing = false;
                     self.emu.stream_hold = false;
-                    crate::kernel::sound::stop(machine, true); // session end: power down
+                    // This resets only the SB DSP. The canonical sink is
+                    // shared: GUS music or OPL may still be contributing, so
+                    // powering it down here resets the HDA position counters
+                    // underneath their continuous mixer timeline. The mixer
+                    // stops the sink itself when every source is idle.
                     self.emu.cmd = None;
                     self.emu.param_got = 0;
                     self.emu.out_len = 0;
@@ -876,9 +882,17 @@ impl SoundBlaster {
             0x42 => {}                                                  // input rate: ignore
             0x48 => self.emu.block_param = (p[0] as u16) | ((p[1] as u16) << 8),
             // Legacy 8-bit mono output. 0x1C/0x90 = auto-init (block from 0x48);
-            // 0x14/0x91 = single-cycle (play once; length from the 8237).
+            // 0x14 carries its single-cycle transfer length in the command.
+            // 0x91 has no length parameters and falls back to the DMA count.
             0x1C | 0x90 => self.emu_start(dma, 8, false, None, false),
-            0x14 | 0x91 => self.emu_start(dma, 8, false, None, true),
+            0x14 => self.emu_start(
+                dma,
+                8,
+                false,
+                Some((p[0] as u16) | ((p[1] as u16) << 8)),
+                true,
+            ),
+            0x91 => self.emu_start(dma, 8, false, None, true),
             // SB16 8-/16-bit output: mode byte + 16-bit length; bit1 = auto-init,
             // its absence = single-cycle. (0xC8.., 0xB8.. are input/ADC — ignored.)
             0xC0..=0xC7 => {
@@ -913,10 +927,14 @@ impl SoundBlaster {
         let frame_bytes = (bits as u32 / 8) * channels;
         self.emu.buf_gpa = gpa;
         self.emu.buf_frames = len_bytes.checked_div(frame_bytes).unwrap_or(0);
-        // Single-cycle: the whole buffer is one block — IRQ fires at the end and
-        // playback stops. Auto-init: IRQ per DSP block and the ring loops.
+        // The DSP command's length is authoritative when it supplied one;
+        // the 8237 count remains the physical ceiling (terminal count).
+        // Auto-init raises an IRQ for each programmed DSP block.
         self.emu.block_frames = if single {
-            self.emu.buf_frames.max(1)
+            block_override
+                .map(|n| ((n as u32 + 1) / channels).max(1))
+                .unwrap_or(self.emu.buf_frames.max(1))
+                .min(self.emu.buf_frames.max(1))
         } else {
             // Block size is "transfers − 1"; a transfer is one sample/channel.
             ((self.emu.block_param as u32 + 1) / channels).max(1)
@@ -926,10 +944,14 @@ impl SoundBlaster {
         self.emu.blocks_done = 0;
         self.emu.blocks_acked = 0;
         self.emu.restarted = true; // mixer pump: re-key session numbering
-        // DMA-wiring probes (tiny single-cycle transfers, the same 0x100-byte
-        // threshold as the passthrough probe path) complete on virtual time —
-        // they need the IRQ within milliseconds and are inaudible either way.
-        self.emu.probe = single && len_bytes < 0x100;
+        // A single-cycle DMA transfer has its own finite device clock: it
+        // starts when the DSP command arms DRQ and reaches terminal count
+        // after `buf_frames / rate`, independent of how much older music is
+        // queued in the final speaker sink. Treating only sub-256-byte blocks
+        // this way made Duke3D's larger 16-bit channel-5 self-test wait behind
+        // the GUS output cushion and time out as "conflicting DMA channel".
+        // Auto-init rings remain slaved to the sink's continuous cursor.
+        self.emu.probe = single;
         self.emu.start_ms = 0;
         // The guest clock leads the drain only by what the ring is too small
         // to cover: with ring ≥ fill + one block, the refill a block IRQ
@@ -943,9 +965,18 @@ impl SoundBlaster {
             (fill + self.emu.block_frames).saturating_sub(self.emu.buf_frames)
         };
         self.emu.dma_tc = false; // restart re-loads the count registers
+        self.emu.trace_dma16_reads = 0;
         self.emu.playing = self.emu.buf_frames > 0;
         if self.emu.playing {
             self.emu.stream_hold = true;
+        }
+        if bits == 16 {
+            crate::dbg_println!(
+                "[dsp16] start single={} stereo={} rate={} dma={} page={:02X} addr={:04X} count={:04X} gpa={:08X} ring_frames={} block_frames={}",
+                single, stereo, self.emu.rate, chan, prog.page, prog.addr,
+                prog.count, self.emu.buf_gpa, self.emu.buf_frames,
+                self.emu.block_frames
+            );
         }
         if super::PORT_TRACE {
             crate::dbg_println!(
@@ -1000,11 +1031,11 @@ impl SoundBlaster {
     }
 
     /// Add the FM synth's frames into the pump block (no-op when silent).
-    pub fn mix_fm<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, out: &mut [(i16, i16)]) {
+    fn mix_fm_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i16, i16)]) {
         if let Some(opl) = self.opl.as_mut()
             && opl.mixing()
         {
-            opl.mix(machine, rate, base, out);
+            opl.mix_into(machine, rate, base, block);
         }
     }
 
@@ -1014,8 +1045,8 @@ impl SoundBlaster {
     /// the commit horizon (one ring lap beyond the last *serviced* block,
     /// floored at the next boundary: an unserviced ring keeps cycling and
     /// replays, exactly like the real card) stay silent.
-    pub fn mix_dsp<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, out: &mut [(i16, i16)]) {
-        if !self.emu.playing || rate != self.emu.rate {
+    fn mix_dsp_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i16, i16)]) {
+        if !self.emu.playing || rate == 0 {
             return; // idle or hangover: the pump's zeros are our silence
         }
         let channels = if self.emu.stereo { 2u32 } else { 1 };
@@ -1028,30 +1059,62 @@ impl SoundBlaster {
             signed: self.emu.bits == 16,
             channels: channels as u8,
         };
+        // The ring is the guest's, clocked at the guest's rate; `out` is the
+        // mixer's, clocked at the canonical rate. Map each output frame back
+        // to the DSP frame playing at that instant (zero-order hold — the
+        // same thing the sink used to do one stage later, minus the rest of
+        // the mix getting dragged down to the DSP's bandwidth with it).
+        let dsp_rate = self.emu.rate.max(1) as u64;
         let committed = self.committed_end();
-        let mut done = 0usize;
-        while done < out.len() {
-            let abs = base + done as u64;
-            if abs >= committed {
-                break; // starved: leave the pump's silence
+        let first = base * dsp_rate / rate as u64;
+        let last = (base + block.len().saturating_sub(1) as u64) * dsp_rate / rate as u64;
+        let end = (last + 1).min(committed);
+        if first >= end {
+            return; // starved: leave the pump's silence
+        }
+
+        // Fetch the source span in ring-sized runs, then resample from the
+        // local copy. `copy_from` may cross a VM/backend boundary; doing it
+        // once per DSP sample here caused thousands of crossings per second
+        // and starved the shared GUS/SB sink under Doom. A mixer chunk spans
+        // only a few hundred DSP frames, so this remains a small allocation.
+        let source_frames = (end - first) as usize;
+        let mut scratch = alloc::vec![0u8; source_frames * frame_bytes as usize];
+        let mut copied = 0usize;
+        while copied < source_frames {
+            let abs = first + copied as u64;
+            let pos = (abs % self.emu.buf_frames as u64) as usize;
+            let run = (source_frames - copied).min(self.emu.buf_frames as usize - pos);
+            let addr = self.emu.buf_gpa as usize + pos * frame_bytes as usize;
+            let lo = copied * frame_bytes as usize;
+            let hi = lo + run * frame_bytes as usize;
+            machine.copy_from(addr, &mut scratch[lo..hi]);
+            copied += run;
+        }
+        for (i, slot) in block.iter_mut().enumerate() {
+            let src = (base + i as u64) * dsp_rate / rate as u64;
+            if src >= end {
+                break;
             }
-            let pos = (abs % self.emu.buf_frames as u64) as u32;
-            let run = (out.len() - done)
-                .min((committed - abs) as usize)
-                .min((self.emu.buf_frames - pos) as usize);
-            let mut scratch = alloc::vec![0u8; run * frame_bytes as usize];
-            let addr = self.emu.buf_gpa as usize + (pos * frame_bytes) as usize;
-            machine.copy_from(addr, &mut scratch);
-            for (i, slot) in out[done..done + run].iter_mut().enumerate() {
-                let (l, r) = fmt.frame(&scratch, i);
-                slot.0 = slot.0.saturating_add(l);
-                slot.1 = slot.1.saturating_add(r);
-            }
-            done += run;
+            let (l, r) = fmt.frame(&scratch, (src - first) as usize);
+            slot.0 = slot.0.saturating_add(l);
+            slot.1 = slot.1.saturating_add(r);
         }
     }
 
-    /// Auto-init commit horizon (see `mix_dsp`); single-cycle commits the
+    /// Mix every producer on this card into the same final PCM block.
+    pub(super) fn mix_into<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        rate: u32,
+        base: u64,
+        block: &mut [(i16, i16)],
+    ) {
+        self.mix_dsp_into(machine, rate, base, block);
+        self.mix_fm_into(machine, rate, base, block);
+    }
+
+    /// Auto-init commit horizon (see `mix_dsp_into`); single-cycle commits the
     /// whole buffer up front.
     fn committed_end(&self) -> u64 {
         if self.emu.single {
@@ -1093,16 +1156,13 @@ impl SoundBlaster {
             return;
         }
         let guest_now = if self.emu.probe {
-            // Probe transfers complete after their real duration on the
-            // virtual clock — milliseconds, independent of stream priming.
+            // Single-cycle DMA advances continuously on the DSP's virtual
+            // sample clock, independent of final-speaker stream priming.
             if self.emu.start_ms == 0 {
                 self.emu.start_ms = now;
             }
-            let len_ms = self.emu.buf_frames as u64 * 1000 / self.emu.rate.max(1) as u64;
-            if now.saturating_sub(self.emu.start_ms) < len_ms {
-                return;
-            }
-            self.emu.next_irq
+            (now.saturating_sub(self.emu.start_ms) * self.emu.rate.max(1) as u64 / 1000)
+                .min(self.emu.next_irq)
         } else {
             (drained + self.emu.slack as u64).min(pushed)
         };
@@ -1128,6 +1188,12 @@ impl SoundBlaster {
                 self.emu.dma_tc = true;
                 let chan = if self.emu.bits == 16 { self.dma16 } else { self.dma8 };
                 self.emu.tc_status |= 1 << (chan & 7);
+                if self.emu.bits == 16 {
+                    crate::dbg_println!(
+                        "[dsp16] terminal cursor={} irq_status={:02X} tc_status={:02X} ticks={}",
+                        self.emu.cursor, self.emu.irq_status, self.emu.tc_status, now
+                    );
+                }
             } else {
                 self.emu.next_irq += self.emu.block_frames as u64;
             }
@@ -1159,6 +1225,14 @@ impl SoundBlaster {
                 let count = total.wrapping_sub(1).wrapping_sub(consumed) as u16;
                 let addr = dma.ch[chan].prog.addr.wrapping_add(consumed as u16);
                 dma.read_latch = if is_cnt { count } else { addr };
+                if chan == self.dma16 as usize && self.emu.trace_dma16_reads < 16 {
+                    crate::dbg_println!(
+                        "[dsp16] read {} cursor={} value={:04X} playing={}",
+                        if is_cnt { "count" } else { "addr" }, self.emu.cursor,
+                        dma.read_latch, self.emu.playing
+                    );
+                    self.emu.trace_dma16_reads += 1;
+                }
             }
             let v = dma.read_latch;
             return if low { v as u8 } else { (v >> 8) as u8 };

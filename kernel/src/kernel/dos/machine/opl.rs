@@ -10,7 +10,7 @@
 //! every probe only polls "did it expire").
 //!
 //! Output goes through the machine mixer pump (`machine::audio_tick`): the
-//! chip implements [`MixSource`](super::MixSource) and adds its frames into
+//! chip adds its frames through the common PCM-source mixer path and into
 //! the pump's block at the pump's rate (chip-native steps, zero-order hold —
 //! the same resampling the codec drivers use). [`OplFm::audible`] keeps the
 //! canonical stream open through the between-notes hangover; once every
@@ -143,10 +143,10 @@ impl OplFm {
 }
 
 /// The mixer pump pulls FM through the canonical mix-source shape.
-impl super::MixSource for OplFm {
+impl OplFm {
     /// Voices-only (no write hangover): a silent chip mixes silence — skip
     /// the work. (`audible` decides whether the *stream* stays open.)
-    fn mixing(&self) -> bool {
+    pub(super) fn mixing(&self) -> bool {
         self.chip.active_voice_count() > 0
     }
 
@@ -154,10 +154,10 @@ impl super::MixSource for OplFm {
     /// corresponding number of native frames (zero-order hold on the last),
     /// summing saturating. No sub-block events: the OPL's guest-visible
     /// timers run on virtual time, not the stream.
-    fn mix<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, _base: u64, out: &mut [(i16, i16)]) {
+    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, _base: u64, block: &mut [(i16, i16)]) {
         let rate = rate.max(4_000); // guest-programmed; never let it stall us
         let mut pair = [0i16; 2];
-        for slot in out.iter_mut() {
+        for slot in block.iter_mut() {
             self.mix_acc += NATIVE_RATE;
             while self.mix_acc >= rate {
                 self.mix_acc -= rate;

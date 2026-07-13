@@ -305,11 +305,6 @@ impl Gus {
         self.present = false;
     }
 
-    /// Rate this card would run the canonical stream at if it owns it.
-    pub fn pump_rate(&self) -> u32 {
-        self.core.as_ref().map_or(44_100, |c| c.native_rate())
-    }
-
     /// Mixer-session restart: stamped event frames from the previous session
     /// numbering are meaningless — drop them.
     pub fn on_mix_session(&mut self) {
@@ -339,7 +334,7 @@ impl Gus {
     /// Per-quantum device tick, from `machine::audio_tick`: pace the rate
     /// timers by virtual time and raise the GF1 IRQ line for enabled,
     /// unserviced sources. Playback runs through the mixer pump (the
-    /// `MixSource` impl below); voice-event IRQs deliver separately, on the
+    /// common PCM-source path below); voice-event IRQs deliver separately, on the
     /// pump's drain clock ([`Gus::deliver_events`]).
     pub fn tick<A: crate::Arch>(
         &mut self,
@@ -549,6 +544,22 @@ impl GusCore {
         matches!(reg, 0x01..=0x05 | 0x09..=0x0B)
     }
 
+    /// The ramp increment, converted from the GF1 rate register (0x06) into the
+    /// sampler's log-volume domain.
+    ///
+    /// The two ends of a ramp come from the 8-bit start/end registers, which
+    /// hold the volume's TOP byte (`reg << 8`). The rate register's 6-bit
+    /// increment is *not* in those units: it steps the volume's 12-bit
+    /// significand, whose LSB is bit 4 of the 16-bit volume word. Hence `<< 4`.
+    ///
+    /// Getting this wrong is not a subtle detune — an unscaled increment makes
+    /// every ramp 16x too long (a 1.5 ms attack becomes 24 ms), and DMX polls
+    /// the ramp-done bit with interrupts disabled, so the guest sits in that
+    /// spin long enough to miss its own 140 Hz music ticks.
+    fn ramp_inc(rate_reg: u16) -> u16 {
+        (rate_reg & 0x3F) << 4
+    }
+
     /// Byte write to the selected register (`high` = data-high port). The
     /// high byte completes a write for either width, so that's where the
     /// register's side effect fires (voice start, DMA kick, reset).
@@ -652,7 +663,7 @@ impl GusCore {
             0x02 | 0x03 => v.start = addr_q32(comb(raw[2], raw[3]), v.bits16),
             0x04 | 0x05 => v.end = addr_q32(comb(raw[4], raw[5]), v.bits16),
             0x06 => {
-                v.ramp.inc = (raw[6] & 0x3F) as u8;
+                v.ramp.inc = Self::ramp_inc(raw[6]);
                 v.ramp.shift = (raw[6] >> 6) as u8;
             }
             0x07 => v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8,
@@ -675,7 +686,7 @@ impl GusCore {
                     v.ramp.running = false;
                 } else {
                     // Ramp start snapshots rate + bounds from their images.
-                    v.ramp.inc = (raw[6] & 0x3F) as u8;
+                    v.ramp.inc = Self::ramp_inc(raw[6]);
                     v.ramp.shift = (raw[6] >> 6) as u8;
                     v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8;
                     v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8;
@@ -779,8 +790,8 @@ impl GusCore {
 /// The sink-owning DSP stream pulls GUS voices per frame while it plays —
 /// the same canonical shape the OPL uses. Voice-boundary events latch for
 /// the next tick's IRQ delivery (the vPIC isn't reachable from a pull).
-impl super::MixSource for Gus {
-    fn mixing(&self) -> bool {
+impl Gus {
+    pub(super) fn mixing(&self) -> bool {
         self.core
             .as_ref()
             .is_some_and(|c| c.reset_reg & 0x02 != 0 && c.engine.any_running())
@@ -791,10 +802,16 @@ impl super::MixSource for Gus {
     /// exact session frame they occur at and queued for [`Gus::deliver_events`]
     /// — they become guest-visible when that frame *plays*, not when it is
     /// generated `fill` early.
-    fn mix<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, base: u64, out: &mut [(i16, i16)]) {
+    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, base: u64, block: &mut [(i16, i16)]) {
+        if !self.mixing() {
+            return;
+        }
         let Some(c) = self.core.as_mut() else { return };
         let native = c.native_rate();
-        for (i, slot) in out.iter_mut().enumerate() {
+        // Process every position in this final PCM block. `mix_frame` advances
+        // the GF1/native-rate phase as needed; each native step walks all
+        // active voices, including address/loop/stop and volume-ramp state.
+        for (i, slot) in block.iter_mut().enumerate() {
             let mut ev = sampler::Events::default();
             let (l, r) = c.engine.mix_frame(&c.dram, native, rate, &mut ev);
             slot.0 = slot.0.saturating_add(l);

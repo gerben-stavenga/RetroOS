@@ -192,7 +192,9 @@ pub struct Pace {
     /// Session frames the sink has consumed, as of the last [`due`] call
     /// (synthetic: everything pushed — an instant consumer).
     drained: u64,
-    /// Synthetic-clock accumulator, frames × 1000.
+    /// Synthetic-clock accumulator, frames × 1000. This deliberately keeps
+    /// whole-frame credit too: callers request fixed-size PCM blocks, so a
+    /// partial block remains here until the next complete block is due.
     frac: u64,
 }
 
@@ -236,7 +238,14 @@ impl Pace {
 
     /// Frames due at `rate` after `dt_ms` of virtual time. The caller must
     /// push exactly this many frames to the sink before the next call.
-    pub fn due<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, dt_ms: u64) -> u64 {
+    pub fn due<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        rate: u32,
+        dt_ms: u64,
+        block_frames: usize,
+    ) -> u64 {
+        let block = block_frames.max(1) as u64;
         if rate != self.rate {
             // New session (first tick, or a rate change — the sink restarts
             // its stream and counters on that): re-key and re-anchor.
@@ -261,13 +270,15 @@ impl Pace {
             // Top the pipe up to `fill` ahead of the drain point. Self-
             // limiting: `consumed` can never pass what was written, so a
             // stall's backlog is bounded by `fill`, never a burst.
-            let due = (self.drained + self.fill as u64).saturating_sub(self.pushed);
+            let wanted = (self.drained + self.fill as u64).saturating_sub(self.pushed);
+            let due = wanted / block * block;
             self.pushed += due;
             due
         } else {
             self.frac += rate as u64 * dt_ms;
-            let due = self.frac / 1000;
-            self.frac %= 1000;
+            let available = self.frac / 1000;
+            let due = available / block * block;
+            self.frac -= due * 1000;
             self.pushed += due;
             self.drained = self.pushed; // instant consumer: drained ≡ pushed
             due

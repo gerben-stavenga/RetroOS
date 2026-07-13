@@ -29,6 +29,17 @@ ln -sfn "$REPO/apps-proprietary/BP"       "$C/BP"
 ln -sfn "$REPO/apps-proprietary/nc"       "$C/NC"
 ln -sfn "$REPO/apps-boot/tc"              "$C/TC"
 
+# C:\ULTRASND — the GUS instrument patches ULTRADIR (below) points at. The
+# disk image gets these from //apps/gus:tar; this drive needs them too, or
+# DMX detects the GF1, finds no .PAT files, and silently disables music
+# (sfx keep working — the "GUS in QEMU but not on metal" report). Named
+# uppercase to match the image's tar mapping.
+mkdir -p "$C/ULTRASND/MIDI"
+for p in "$REPO"/apps/gus/MIDI/*.pat; do
+    ln -sfn "$p" "$C/ULTRASND/MIDI/$(basename "$p" .pat | tr '[:lower:]' '[:upper:]').PAT"
+done
+ln -sfn "$REPO/apps/gus/dgguspat.txt" "$C/ULTRASND/DGGUSPAT.TXT"
+
 # C:\CONFIG.SYS overrides the bootfs default (the kernel reads C:\CONFIG.SYS
 # first, then C:\BOOT\CONFIG.SYS). COMSPEC points at the bootfs COMMAND.COM;
 # PATH covers DN/COMMAND (C:\BOOT), Turbo C, Borland C, Borland Pascal.
