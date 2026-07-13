@@ -763,9 +763,28 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
 
     // PM HW-IRQ handler entry: clear VM, the guest's virtual IF (VIF — handlers
     // enter with interrupts disabled, textbook INT semantics), and TF. The real
-    // IF (bit 9) is the host's, forced =1 at the arch exit. IOPL is pinned to 1
-    // there too, so it needs no touch here.
+    // IF (bit 9) is the host's, forced =1 at the arch exit.
     regs.frame.rflags &= !((machine::VM_FLAG | machine::VIF_FLAG | (1u32 << 8)) as u64);
+    // ...and drop the *virtual* IOPL to the spec-strict level for the handler
+    // body, so `virtual_if_stepping` is off inside it and the handler runs at
+    // hardware speed instead of one #DB per instruction.
+    //
+    // Stepping exists for exactly one reason: at the pinned real IOPL=1, CLI
+    // and STI still #GP (the monitor keeps tracking VIF exactly), but POPF and
+    // IRET do NOT fault — they silently preserve EFLAGS bits 19/20 — so a
+    // client that re-enables IF that way can only be caught by stepping.
+    // Inside a handler none of that applies:
+    //   * the handler's IRET is routed through SLOT_RESUME_CONTINUATION, which
+    //     replays the captured pre-IRQ eflags and forces VIF back on. The CPU
+    //     never restores VIF on its own here, stepped or not.
+    //   * a PUSHF/POPF pair *inside* the handler pushes an image whose IF slot
+    //     is the handler's own (cleared on entry), so honoring the POPF would
+    //     be a no-op anyway.
+    // The client's own vIOPL rides the HostContinuation pushed above — captured
+    // before this line, put back by `HostContinuation::restore` on unwind — so
+    // the mainline resumes at whatever level it was launched with.
+    regs.frame.rflags = (regs.frame.rflags & !(machine::IOPL_MASK as u64))
+        | machine::IOPL_DEFAULT as u64;
     regs.frame.cs  = sel as u64;
     regs.frame.rip = off as u64;
     if_record(delivery_tag, regs, pre_vif, if_bit(machine, regs), Some((vector as u16, 0)));
