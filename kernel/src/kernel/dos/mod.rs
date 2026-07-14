@@ -1084,12 +1084,22 @@ fn stall_guard<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
             // program. Say so — it is the one event that says the model has a
             // hole, and it should never pass silently.
             use arch_abi::monitor as m;
+            let site = m::REPAIR_SITE.load(Relaxed);
+            let at = m::REPAIR_IP.load(Relaxed);
+            let mut sect = [0u8; 96];
+            let mut here = [0u8; 24];
+            machine.copy_from(site as usize, &mut sect);
+            machine.copy_from(at as usize, &mut here);
             crate::dbg_println!(
-                "[repair] #{} site={:08x} left via an exit we had never stepped; stranded at {:08x}. Re-learning it.",
-                m::REPAIRS.load(Relaxed),
-                m::REPAIR_SITE.load(Relaxed),
-                m::REPAIR_IP.load(Relaxed),
-            );
+                "[repair] #{} site={:08x} stranded={:08x}",
+                m::REPAIRS.load(Relaxed), site, at);
+            let _ = (sect, here);
+            for i in 0..arch_abi::MAX_EXEC_BP {
+                let (addr, hits) = m::exit_snapshot(i);
+                if addr != 0 {
+                    crate::dbg_println!("[repair]   armed[{}]={:08x} hits={}", i, addr, hits);
+                }
+            }
         }
     }
 }

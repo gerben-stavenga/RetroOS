@@ -551,11 +551,37 @@ static N_EXITS: AtomicU32 = AtomicU32::new(0);
 /// just take the common path again and re-learn the exit we already had. Serving
 /// a penalty of several windows samples the other branches too, so the second
 /// exit actually gets interned and the site then runs free forever.
-const SITES: usize = 32;
+const SITES: usize = 64;
 const PENALTY: u32 = 32;
 const ALWAYS_STEP: u32 = u32::MAX;
 static SITE_IP: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
 static SITE_STEP: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+
+/// Sites we have given up on: they mispredicted while the debug registers were
+/// full, so no breakpoint can ever cover them and they must always be stepped.
+///
+/// This is a SET, not a slot in the hashed table, precisely because it must
+/// never be evicted. Pinning it in the hash was the bug: DUKE3D has plenty of
+/// sites, one collided with the pinned entry, the site looked unknown again,
+/// drifted back to running free, and mispredicted forever — the same site
+/// repairing over and over instead of once.
+const GIVEN_UP: usize = 8;
+static NEVER_FREE: [AtomicU32; GIVEN_UP] = [const { AtomicU32::new(0) }; GIVEN_UP];
+
+fn is_never_free(ip: u32) -> bool {
+    NEVER_FREE.iter().any(|e| e.load(Relaxed) == ip)
+}
+
+fn give_up_on(ip: u32) {
+    if is_never_free(ip) {
+        return;
+    }
+    for e in NEVER_FREE.iter() {
+        if e.compare_exchange(0, ip, Relaxed, Relaxed).is_ok() {
+            return;
+        }
+    }
+}
 
 /// The site that opened the window we are in, and the stack level it opened at
 /// (see [`repair`] — the stack is what tells us whether the client LEFT).
@@ -570,13 +596,23 @@ static PREDICTED: AtomicU32 = AtomicU32::new(0);
 pub static REPAIRS: AtomicU32 = AtomicU32::new(0);
 pub static REPAIR_SITE: AtomicU32 = AtomicU32::new(0);
 pub static REPAIR_IP: AtomicU32 = AtomicU32::new(0);
+/// TEMPORARY: per-slot breakpoint hit counts, and the armed set, so we can tell
+/// "the section has a second exit" from "our breakpoint never fired".
+pub static BP_HITS: [AtomicU32; crate::MAX_EXEC_BP] =
+    [const { AtomicU32::new(0) }; crate::MAX_EXEC_BP];
+pub fn exit_snapshot(i: usize) -> (u32, u32) {
+    (EXITS[i].load(Relaxed), BP_HITS[i].load(Relaxed))
+}
 
 fn site_slot(ip: u32) -> usize {
     ((ip ^ (ip >> 5) ^ (ip >> 11)) as usize) % SITES
 }
 
-/// Known, and not serving a step penalty.
+/// Known, not given up on, and not serving a step penalty.
 fn site_is_ok(ip: u32) -> bool {
+    if is_never_free(ip) {
+        return false;
+    }
     let i = site_slot(ip);
     SITE_IP[i].load(Relaxed) == ip && SITE_STEP[i].load(Relaxed) == 0
 }
@@ -593,7 +629,7 @@ fn site_learned(ip: u32, armable: bool) {
         SITE_STEP[i].store(0, Relaxed);
     }
     if !armable {
-        SITE_STEP[i].store(ALWAYS_STEP, Relaxed);
+        give_up_on(ip); // its exit will not fit in the register file
         return;
     }
     let n = SITE_STEP[i].load(Relaxed);
@@ -602,11 +638,27 @@ fn site_learned(ip: u32, armable: bool) {
     }
 }
 
-/// This site mispredicted: it has an exit we have never stepped. Put it in the
-/// penalty box so the next several windows are stepped and the other branch's
-/// exit gets found.
+/// This site mispredicted: it left through an IF-restoring address we had not
+/// armed. What to do about it depends on whether we CAN arm one more.
+///
+/// If there is a free debug register, serve a penalty: step the next several
+/// windows so the other branch is sampled, its exit interned, and the site then
+/// runs free forever — a two-exit section costs exactly one repair, once.
+///
+/// If the register file is FULL, no amount of stepping can help: we would learn
+/// the address and still have nowhere to put it, drift back to running free, and
+/// mispredict again — an endless cycle of repairs. So pin the site to stepping
+/// permanently. It is slow but exact, and it is *deterministic*: one site pays,
+/// the rest of the program keeps its breakpoints.
+///
+/// This is the real capacity limit of the scheme. x86 gives four execute
+/// breakpoints; DUKE3D wants five.
 fn site_penalise(ip: u32) {
     if ip == 0 {
+        return;
+    }
+    if exits_full() {
+        give_up_on(ip);
         return;
     }
     let i = site_slot(ip);
@@ -627,7 +679,7 @@ fn exit_intern<A: Arch>(arch: &mut A, addr: u32) -> bool {
         }
     }
     if n >= crate::MAX_EXEC_BP {
-        return false;
+        return false; // out of debug registers — see `exits_full`
     }
     EXITS[n].store(addr, Relaxed);
     N_EXITS.store(n as u32 + 1, Relaxed);
@@ -641,6 +693,12 @@ fn rearm<A: Arch>(arch: &mut A) -> bool {
         *b = e.load(Relaxed);
     }
     arch.set_exec_breakpoints(&buf[..n])
+}
+
+/// Every debug register is spoken for, so no NEW IF-restoring address can ever
+/// be armed. x86 gives four, and a program can want more: DUKE3D has five.
+fn exits_full() -> bool {
+    N_EXITS.load(Relaxed) as usize >= crate::MAX_EXEC_BP
 }
 
 /// Is `addr` one of the armed IF-restoring addresses?
@@ -659,6 +717,9 @@ pub fn forget_if_windows() {
     for i in 0..SITES {
         SITE_IP[i].store(0, Relaxed);
         SITE_STEP[i].store(0, Relaxed);
+    }
+    for e in NEVER_FREE.iter() {
+        e.store(0, Relaxed);
     }
     CUR_SITE.store(0, Relaxed);
     PREDICTED.store(0, Relaxed);
@@ -721,6 +782,11 @@ pub fn if_gate<A: Arch>(
 pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
     if !is_exit(regs.ip32()) {
         return false;
+    }
+    for i in 0..crate::MAX_EXEC_BP {
+        if EXITS[i].load(Relaxed) == regs.ip32() {
+            BP_HITS[i].fetch_add(1, Relaxed);
+        }
     }
     let ev = monitor_rs::<A>(arch, regs);
     if regs.flags32() & VIF_FLAG != 0 {
