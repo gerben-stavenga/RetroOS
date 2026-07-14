@@ -39,6 +39,143 @@ const PTE_CACHE_DISABLE: u64 = 1 << 4;
 /// buffer programming into canonical PCM (`sound::play`), paced by the sink's
 /// real playback position (virtual time where the sink has no clock), raising
 /// the SB IRQ once per completed DMA block exactly like the real card's
+/// CT1745 (SB16) mixer attenuation table: a 5-bit level in bits 7:3 of the
+/// volume register, 2 dB per step, as a linear amplitude out of 32767. Taken
+/// verbatim from 86Box `src/sound/snd_sb.c` (`sb_att_2dbstep_5bits`), whose
+/// comment notes the 32767 ceiling deliberately leaves ~6 dB of headroom.
+const ATT_2DB_5BIT: [u16; 32] = [
+    25, 32, 41, 51, 65, 82, 103, 130, 164, 206,
+    260, 327, 412, 519, 653, 822, 1036, 1304, 1641, 2067,
+    2602, 3276, 4125, 5192, 6537, 8230, 10362, 13044, 16422, 20674,
+    26027, 32767,
+];
+
+/// Fixed source scales on the card's analog summing node, in Q16. These — not
+/// the mixer registers — set the FM-vs-DAC balance, and both cards' power-on
+/// mixer defaults are *full* volume, so these are what you hear by default.
+/// From 86Box's SB16 mix (`sb_get_buffer_sb16_awe32` / `sb_get_music_buffer_sb16_awe32`):
+///
+/// ```text
+///   DAC: dsp.buffer * voice * master / 3.0
+///   FM : opl_buf    * fm    * master * 0.7171630859375
+/// ```
+///
+/// So FM sits **2.15x above** the DAC at equal digital full scale. Summing both
+/// at unity (what we did before) therefore ran digital SFX ~9.5 dB too hot
+/// against FM music, and pinned the sum at the clipping rail whenever a
+/// full-scale sample played over a track.
+const FM_SCALE_Q16: i32 = 47_000; // 0.7171630859375 == 47000/65536, exactly
+const DAC_SCALE_Q16: i32 = 65_536 / 3;
+
+/// Unity. The GF1's own output is the mixer's reference level (86Box
+/// `gus_get_buffer` adds `gus->buffer[]` straight into the mix), and the
+/// GUS has no guest-visible master volume — the GF1's per-voice volume ramps
+/// already carry it.
+pub(super) const GUS_SCALE_Q16: i32 = 65_536;
+
+/// One knob for overall loudness, applied to the summed mix just before the
+/// single clip. Unity: the headroom already lives in the per-source scales
+/// above (that is exactly what the 32767 table ceiling buys), so rescaling
+/// here would only trade it away. This is the place to change if the whole
+/// machine should be louder or quieter.
+pub(super) const OUTPUT_GAIN_Q16: i32 = 65_536;
+
+/// Combine two Q16 gains without overflowing i32 on the way.
+const fn combine_q16(a: i32, b: i32) -> i32 {
+    ((a as i64 * b as i64) >> 16) as i32
+}
+
+/// The CT1745 (SB16) mixer register file.
+///
+/// Every volume register is a 5-bit level in bits 7:3 (2 dB/step, see
+/// [`ATT_2DB_5BIT`]). The older register maps are *aliases*, exactly as on the
+/// real chip: an SB Pro game writing 0x22/0x04/0x26 and an SB1/2 game writing
+/// 0x02/0x06 both land in the same 0x30-0x35 pairs, so one code path serves
+/// every generation. Games really do set these — they were previously accepted
+/// and dropped, so a game turning its SFX down changed nothing.
+#[derive(Clone, Copy)]
+pub(super) struct SbMixer {
+    regs: [u8; 256],
+}
+
+impl SbMixer {
+    /// Power-on state. `const`: the whole `EmuDsp` is built in a const fn, so
+    /// the defaults are spelled out here rather than via `reset()`.
+    pub(super) const fn new() -> Self {
+        let mut regs = [0u8; 256];
+        regs[0x30] = 0xF8; regs[0x31] = 0xF8; // master L/R
+        regs[0x32] = 0xF8; regs[0x33] = 0xF8; // voice  L/R
+        regs[0x34] = 0xF8; regs[0x35] = 0xF8; // FM     L/R
+        regs[0x36] = 0xF8; regs[0x37] = 0xF8; // CD     L/R
+        regs[0x3B] = 0x80;                    // PC speaker
+        regs[0x04] = 0xEE; regs[0x22] = 0xEE; // legacy views of the same levels
+        regs[0x26] = 0xEE; regs[0x28] = 0xEE;
+        SbMixer { regs }
+    }
+
+    /// Power-on / mixer-index-0 reset. Defaults are 86Box's `sb_ct1745_mixer_reset`:
+    /// master, voice, FM and CD all at maximum (0xF8 → level 31 → unity), line/mic
+    /// muted. A game that never touches the mixer gets full volume — which is why
+    /// the FM/DAC balance has to come from the fixed scales, not from these.
+    pub(super) fn reset(&mut self) {
+        *self = SbMixer::new();
+    }
+
+    pub(super) fn read(&self, index: u8) -> u8 {
+        self.regs[index as usize]
+    }
+
+    pub(super) fn write(&mut self, index: u8, val: u8) {
+        if index == 0x00 {
+            self.reset();
+            return;
+        }
+        self.regs[index as usize] = val;
+        // Legacy maps alias into the SB16 pairs (86Box snd_sb.c, CT1745 write).
+        // `| 0x8` is the chip's low-bit fill when a coarser register is widened
+        // into the 5-bit one. SB1/2 (0x02/0x06) carry one mono nibble in bits
+        // 3:0; SB Pro (0x22/0x04/0x26) carry L in bits 7:4 and R in bits 3:0.
+        let mono = ((val & 0x0F) << 4) | 0x8;
+        let left = (val & 0xF0) | 0x8;
+        let right = ((val & 0x0F) << 4) | 0x8;
+        match index {
+            0x02 => { self.regs[0x30] = mono; self.regs[0x31] = mono; }      // SB1/2 master
+            0x06 => { self.regs[0x34] = mono; self.regs[0x35] = mono; }      // SB1/2 FM
+            0x08 => { self.regs[0x36] = mono; self.regs[0x37] = mono; }      // SB1/2 CD
+            0x22 => { self.regs[0x30] = left; self.regs[0x31] = right; }     // SB Pro master
+            0x04 => { self.regs[0x32] = left; self.regs[0x33] = right; }     // SB Pro voice
+            0x26 => { self.regs[0x34] = left; self.regs[0x35] = right; }     // SB Pro FM
+            0x28 => { self.regs[0x36] = left; self.regs[0x37] = right; }     // SB Pro CD
+            _ => {}
+        }
+    }
+
+    /// Linear gain (Q16, unity = 65536) for a CT1745 volume register.
+    fn level_q16(&self, reg: usize) -> i32 {
+        // The table is an amplitude out of 32767; 86Box divides by 32768, so
+        // Q16 gain is simply the entry doubled.
+        ATT_2DB_5BIT[(self.regs[reg] >> 3) as usize] as i32 * 2
+    }
+
+    /// (left, right) Q16 gain the DSP's PCM is summed at: voice × master ÷ 3.
+    pub(super) fn voice_gain_q16(&self) -> (i32, i32) {
+        let m = (self.level_q16(0x30), self.level_q16(0x31));
+        (
+            combine_q16(combine_q16(self.level_q16(0x32), m.0), DAC_SCALE_Q16),
+            combine_q16(combine_q16(self.level_q16(0x33), m.1), DAC_SCALE_Q16),
+        )
+    }
+
+    /// (left, right) Q16 gain the FM synth is summed at: fm × master × 0.7172.
+    pub(super) fn fm_gain_q16(&self) -> (i32, i32) {
+        let m = (self.level_q16(0x30), self.level_q16(0x31));
+        (
+            combine_q16(combine_q16(self.level_q16(0x34), m.0), FM_SCALE_Q16),
+            combine_q16(combine_q16(self.level_q16(0x35), m.1), FM_SCALE_Q16),
+        )
+    }
+}
+
 /// terminal count. See [`SoundBlaster::audio_tick`].
 #[derive(Clone, Copy)]
 struct EmuDsp {
@@ -60,6 +197,8 @@ struct EmuDsp {
     test_reg: u8,
     /// SB16 mixer register index (port base+4 write); its data port is base+5.
     mixer_index: u8,
+    /// CT1745 mixer register file — the guest's volume settings (see `SbMixer`).
+    mixer: SbMixer,
     /// Mixer reg 0x82 IRQ status: bit0 = 8-bit DMA IRQ pending, bit1 = 16-bit.
     /// Set when the SB IRQ is raised (by playback width); cleared when the guest
     /// acks (reads base+0xE for 8-bit / base+0xF for 16-bit). A 16-bit driver
@@ -149,7 +288,7 @@ impl EmuDsp {
             out: [0; 4], out_len: 0,
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
             reset_prev: 0, test_reg: 0,
-            mixer_index: 0, irq_status: 0, trigger_irq: 0,
+            mixer_index: 0, mixer: SbMixer::new(), irq_status: 0, trigger_irq: 0,
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
@@ -742,7 +881,9 @@ impl SoundBlaster {
                     2 | 9 => 0x01, 5 => 0x02, 7 => 0x04, 10 => 0x08, _ => 0x04,
                 },
                 0x81 => (1u8 << (self.dma8 & 7)) | (1u8 << (self.dma16 & 7)), // DMA select
-                _ => 0x00,
+                // Everything else is the mixer register file: a game that
+                // read-modify-writes a volume must see back what it set.
+                i => self.emu.mixer.read(i),
             },
             0x0A => self.emu.pop_out(),                // DSP read data
             // DSP write-buffer status: while a single-cycle transfer is in
@@ -794,7 +935,7 @@ impl SoundBlaster {
         }
         match p.wrapping_sub(self.io_base) {
             0x04 => self.emu.mixer_index = val, // mixer register select
-            0x05 => {}                          // mixer data: no mixing modeled
+            0x05 => self.emu.mixer.write(self.emu.mixer_index, val), // mixer data
             0x06 => {
                 // DSP reset: a 1→0 edge triggers the reset handshake.
                 if self.emu.reset_prev == 1 && val == 0 {
@@ -1031,11 +1172,12 @@ impl SoundBlaster {
     }
 
     /// Add the FM synth's frames into the pump block (no-op when silent).
-    fn mix_fm_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i16, i16)]) {
+    fn mix_fm_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i32, i32)]) {
+        let (gl, gr) = self.emu.mixer.fm_gain_q16();
         if let Some(opl) = self.opl.as_mut()
             && opl.mixing()
         {
-            opl.mix_into(machine, rate, base, block);
+            opl.mix_into(machine, rate, base, block, (gl, gr));
         }
     }
 
@@ -1045,7 +1187,7 @@ impl SoundBlaster {
     /// the commit horizon (one ring lap beyond the last *serviced* block,
     /// floored at the next boundary: an unserviced ring keeps cycling and
     /// replays, exactly like the real card) stay silent.
-    fn mix_dsp_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i16, i16)]) {
+    fn mix_dsp_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i32, i32)]) {
         if !self.emu.playing || rate == 0 {
             return; // idle or hangover: the pump's zeros are our silence
         }
@@ -1064,6 +1206,7 @@ impl SoundBlaster {
         // to the DSP frame playing at that instant (zero-order hold — the
         // same thing the sink used to do one stage later, minus the rest of
         // the mix getting dragged down to the DSP's bandwidth with it).
+        let (gl, gr) = self.emu.mixer.voice_gain_q16();
         let dsp_rate = self.emu.rate.max(1) as u64;
         let committed = self.committed_end();
         let first = base * dsp_rate / rate as u64;
@@ -1097,8 +1240,8 @@ impl SoundBlaster {
                 break;
             }
             let (l, r) = fmt.frame(&scratch, (src - first) as usize);
-            slot.0 = slot.0.saturating_add(l);
-            slot.1 = slot.1.saturating_add(r);
+            slot.0 += (l as i32 * gl) >> 16;
+            slot.1 += (r as i32 * gr) >> 16;
         }
     }
 
@@ -1108,7 +1251,7 @@ impl SoundBlaster {
         machine: &mut A,
         rate: u32,
         base: u64,
-        block: &mut [(i16, i16)],
+        block: &mut [(i32, i32)],
     ) {
         self.mix_dsp_into(machine, rate, base, block);
         self.mix_fm_into(machine, rate, base, block);
