@@ -106,7 +106,7 @@ pub mod arch_call {
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
-    pub const SET_EXEC_BP: u64 = 0x120;       // EDX=linear addr (0 = disable) — virtual-IF exit breakpoint
+    pub const SET_EXEC_BP: u64 = 0x120;       // EDX=&[u32] ECX=len — virtual-IF exit-breakpoint set
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -304,8 +304,10 @@ fn arch_dispatch(regs: &mut Regs) {
             }
         }
         arch_call::SET_EXEC_BP => {
-            let addr = regs.rdx as u32;
-            unsafe { x86::program_exec_bp(if addr == 0 { None } else { Some(addr) }) };
+            let ptr = regs.rdx as u32 as *const u32;
+            let len = (regs.rcx as usize).min(arch_abi::MAX_EXEC_BP);
+            let addrs = unsafe { core::slice::from_raw_parts(ptr, len) };
+            unsafe { x86::program_exec_bps(addrs) };
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }
@@ -649,10 +651,15 @@ fn isr_handler_ring3(regs: &mut Regs) {
             if debug_watch_trap(regs, dr6, false) {
                 return;
             }
-            // B3: the virtual-IF exit breakpoint. It is a FAULT, so the POPF/
-            // IRET there has not run yet — emulate it, which closes the window
-            // and restores VIF without a single step in sight.
-            if dr6 & (1 << 3) != 0 {
+            // B0..B3: a virtual-IF exit breakpoint. The whole DR file is the
+            // exit SET (one address per slot), so any of the four can be the
+            // hit — checking only B3 left a DR0/DR1/DR2 hit unhandled, and an
+            // exec breakpoint is a FAULT: the instruction had not run, so it
+            // re-executed, fired again, and looped in #DB forever.
+            //
+            // Emulating it here is what closes the window and restores VIF
+            // without a single step in sight.
+            if dr6 & 0xF != 0 {
                 unsafe { x86::write_dr6(0) };
                 if crate::monitor::exec_bp_hit(regs) {
                     return;

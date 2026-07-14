@@ -890,14 +890,15 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
 
     init_process_thread_vm86_state(machine, t, psp_seg, cs, ip, ss, sp);
     // Direct launches (--cmd, boot init) bypass COMMAND.COM, so no LOADFIX.CFG
-    // policy is applied — seed the compat vIOPL=3 instead of the conforming
-    // default: the launcher can't know whether the program is a non-conforming
-    // DPMI client (DOOM re-enables IF via POPF and hangs on KVM/metal at
-    // vIOPL<3), and stepping costs nothing outside VIF=0 windows. Programs
-    // launched through the shell still get the per-program LOADFIX policy.
+    // policy applies — seed `IfMode::Repair` (vIOPL=2) rather than the strict
+    // conforming default. The launcher cannot know whether the program is a
+    // non-conforming DPMI client (DOOM re-enables IF via POPF and HANGS at
+    // vIOPL=1), and Repair honors it for the price of a few #DB per second.
+    // Programs launched through the shell get the per-program LOADFIX policy,
+    // which can name `iopl3` to fall back to the always-correct stepping path.
     {
         let f = &mut t.kernel.vcpu.regs.frame.rflags;
-        *f = (*f & !(machine::IOPL_MASK as u64)) | (machine::IOPL_MASK as u64);
+        *f = (*f & !(machine::IOPL_MASK as u64)) | (2u64 << 12);
     }
     t.dos_mut().dta = (psp_seg as u32) * 16 + 0x80;
 
@@ -1031,28 +1032,40 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
     machine::audio_tick(machine, &mut dos.pc, regs);
 }
 
-/// Safety net for the virtual-IF exit breakpoints (`monitor::if_gate`).
+/// Safety net for the virtual-IF exit breakpoints (`monitor::if_gate`) — and the
+/// thing that makes `IfMode::Repair` deserve its name.
 ///
-/// A learned CLI→exit pairing lets a client run its interrupts-off section at
-/// full speed with a breakpoint on the POPF that ends it. If the client ever
-/// leaves that section by a path we never learned, the breakpoint is not hit
-/// and virtual IF stays off — nothing is mis-delivered, but the tick would
-/// never land. No real critical section holds interrupts off for anything like
-/// this long, so once it does, the pairing must be wrong: throw it away and go
-/// back to single-stepping, which always finds the truth.
+/// A learned pairing lets a client run its interrupts-off section at full speed,
+/// its exit caught by a hardware breakpoint (or by the STI faulting on its own).
+/// If the client ever leaves that section by a POPF/IRET we never learned, the
+/// exit is missed and virtual IF is stale-0 — and it is stale FOREVER, because
+/// the POPF is already in the past. The client now believes interrupts are on
+/// and spins on a tick that can never be delivered.
 ///
-/// This is what makes the scheme *sound*: a mislearned exit costs one stall of
-/// up to `STALL_MS`, once, and then self-heals. It can never wedge the guest
-/// and can never deliver an interrupt inside a section the client believes is
-/// protected.
+/// Stepping cannot undo that; there is no future instruction left to catch. So
+/// the repair has to put the flag back, which is the one place the host decides
+/// the client's IF for it. What keeps that honest is `monitor::predicting()`: it
+/// fires only where a wrong guess of ours is the explanation — never inside a
+/// section we faithfully stepped, where nothing can be missed. And a critical
+/// section that genuinely holds interrupts off for `STALL_MS` with an IRQ
+/// waiting is already broken by any standard.
+///
+/// Cost: one stall, once per mispredicted site — the pairing is then forgotten,
+/// so the next pass steps that site and learns the exit it really has.
 fn stall_guard<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
     const STALL_MS: u32 = 10;
     static OFF_SINCE: AtomicU32 = AtomicU32::new(0);
 
     let vif_on = regs.frame.rflags & (machine::VIF_FLAG as u64) != 0;
+    // Only a window running on a PREDICTION can strand virtual IF. One we are
+    // stepping cannot: the step loop sees every instruction, so it always finds
+    // the exit — and a stepped section is legitimately slow (~2500x), so firing
+    // there would forget the pairing mid-learn and step that section forever
+    // (which is exactly what DUKE3D did).
     let gated = regs.mode() != crate::UserMode::VM86
-        && arch_abi::monitor::virtual_if_stepping(regs);
+        && arch_abi::monitor::virtual_if_stepping(regs)
+        && arch_abi::monitor::predicting();
     if vif_on || !gated || !dos.pc.vpic.has_deliverable() {
         OFF_SINCE.store(0, Relaxed);
         return;
@@ -1063,8 +1076,21 @@ fn stall_guard<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
     if since == 0 {
         OFF_SINCE.store(now, Relaxed);
     } else if now.wrapping_sub(since) >= STALL_MS {
-        arch_abi::monitor::relearn(machine, regs);
-        OFF_SINCE.store(0, Relaxed);
+        // Re-arm either way: if the client is still inside its section (ROTT's
+        // retrace wait), `repair` declines and we simply look again later.
+        OFF_SINCE.store(now, Relaxed);
+        if arch_abi::monitor::repair(machine, regs) {
+            // A repair means our exit prediction was WRONG about a real
+            // program. Say so — it is the one event that says the model has a
+            // hole, and it should never pass silently.
+            use arch_abi::monitor as m;
+            crate::dbg_println!(
+                "[repair] #{} site={:08x} left via an exit we had never stepped; stranded at {:08x}. Re-learning it.",
+                m::REPAIRS.load(Relaxed),
+                m::REPAIR_SITE.load(Relaxed),
+                m::REPAIR_IP.load(Relaxed),
+            );
+        }
     }
 }
 

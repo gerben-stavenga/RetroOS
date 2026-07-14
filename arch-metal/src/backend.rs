@@ -91,11 +91,11 @@ impl Arch for Metal {
     /// runs in the ring-1 kernel — there the write must go through the arch call
     /// or it #GPs, and a #GP in ring 1 is a kernel panic (it is exactly how
     /// DUKE3D and ROTT died: they DO take the relearn path, unlike Doom).
-    fn set_exec_breakpoint(&mut self, addr: Option<u32>) -> bool {
+    fn set_exec_breakpoints(&mut self, addrs: &[u32]) -> bool {
         if super::x86::cpl() == 0 {
-            unsafe { super::x86::program_exec_bp(addr) };
+            unsafe { super::x86::program_exec_bps(addrs) };
         } else {
-            super::calls::arch_set_exec_breakpoint(addr);
+            super::calls::arch_set_exec_breakpoints(addrs);
         }
         true
     }

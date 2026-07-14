@@ -22,6 +22,9 @@ pub use arch::{Arch, GuestBytes, Vcpu};
 
 pub mod monitor;
 
+/// Hardware execute breakpoints available for the virtual-IF exit set (DR0-DR3).
+pub const MAX_EXEC_BP: usize = 4;
+
 /// Single-step trace budget — a cross-boundary diagnostic, not an arch operation.
 /// Armed by the DOS/DPMI layer (kernel) to watch a client's code path after a
 /// suspicious return; consumed by the backend's single-step `#DB` handler, which

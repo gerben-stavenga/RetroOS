@@ -70,33 +70,57 @@ fn apply_guest_flags(regs: &mut Regs, popped: u32) {
     regs.set_flags32(nf);
 }
 
-/// When true, after a PM client clears virtual IF (via `CLI`), arm TF=1 and walk
-/// the instruction stream so POPF/IRET that would *silently* drop the IF bit at
-/// CPL>IOPL get intercepted. Per DPMI 0.9 §2.13 spec-conforming clients use only
-/// CLI/STI + AX=0900-0902, so this is belt-and-braces — but it MUST stay `true`:
-/// real clients (Hexen via DOS32A, sporadic IF=0 hangs elsewhere) re-enable
-/// interrupts via POPF/IRET, and with stepping off virtual IF sticks at 0, the
-/// timer IRQ never delivers, and tick-paced delay loops deadlock.
+/// The virtual-IF policy for a PM client, encoded in the *virtual* IOPL
+/// (EFLAGS bits 12-13).
 ///
-/// VM86 never needs this: at IOPL<3 every IF-touching op (including POPF/IRET)
-/// #GPs, so the monitor sees them all. Only PM (CPL>IOPL) has the silent-drop
-/// hole this closes.
-/// True when the current guest's *virtual* IOPL is 3, meaning the client is
-/// treated as owning the interrupt flag and POPF/IRET must be honored by
-/// single-stepping (compat for the non-conforming clients above: Hexen via
-/// DOS32A, sporadic IF=0 hangs). A virtual IOPL < 3 is spec-strict per DPMI 0.9
-/// §2.13 — CLI/STI stay virtualized, POPF/IRET are left ignored, no step.
+/// The hole all of this closes: at CPL>IOPL, `POPF`/`IRET` do **not** #GP — they
+/// silently drop the IF bit. `CLI`/`STI` do fault, so the monitor sees those for
+/// free; only the sloppy re-enable is invisible. (VM86 needs none of this: there
+/// every IF-touching op faults.)
 ///
-/// vIOPL is per-thread interrupt-control state, so it lives in the saved flags
-/// exactly like VIF/VIP — NOT a global. The *real* IOPL is pinned to 1 in traps
-/// (so CLI/STI/IN/OUT trap); the IOPL field (bits 12-13) carries the *virtual*
-/// level, stashed/restored around the iret in the isr like VIF/VIP. Default 3
-/// (the old unconditional `TF_VIRTUAL_IF_STEPPING == true`); a per-program
-/// policy (LOADFIX.CFG) can launch a client at vIOPL < 3.
+/// | vIOPL | mode     | POPF/IRET re-enable | cost |
+/// |-------|----------|---------------------|------|
+/// | 1 | [`Iopl1`](IfMode::Iopl1)   | ignored — DPMI 0.9 §2.13 says a host may | nothing: no gate |
+/// | 2 | [`Repair`](IfMode::Repair) | honored, caught by a learned exit breakpoint | a few #DB/s |
+/// | 3 | [`Iopl3`](IfMode::Iopl3)   | honored, caught by single-stepping the window | ~2500x slower |
+///
+/// `Iopl1` is spec-strict and free, but a client that re-enables IF the sloppy
+/// way HANGS in it: virtual IF sticks at 0, the timer never delivers, and
+/// tick-paced delay loops deadlock (DOOM/DOOM2/HEXEN, Hexen via DOS32A).
+///
+/// `Iopl3` is the reference implementation — always correct, never predicts.
+/// It is kept precisely as the escape hatch for a client `Repair` mispredicts.
+///
+/// `Repair` is `Iopl3`'s answer at `Iopl1`'s price, and is the default. It steps
+/// only to LEARN each window's exit, then breakpoints it (see [`if_gate`]).
+///
+/// vIOPL is per-thread interrupt-control state, so it rides the saved flags
+/// exactly like VIF/VIP — never a global. The *real* IOPL is pinned to 1 in
+/// traps (so CLI/STI/IN/OUT keep faulting); these bits carry only the virtual
+/// level, stashed and restored around the iret.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum IfMode {
+    Iopl1,
+    Repair,
+    Iopl3,
+}
+
+#[inline]
+pub fn if_mode(regs: &Regs) -> IfMode {
+    match (regs.flags32() >> 12) & 3 {
+        2 => IfMode::Repair,
+        3 => IfMode::Iopl3,
+        _ => IfMode::Iopl1,
+    }
+}
+
+/// Does this client honor POPF/IRET at all? True for both `Repair` and `Iopl3`
+/// — they differ in HOW the window's exit is caught, not in whether it is.
 #[inline]
 pub fn virtual_if_stepping(regs: &Regs) -> bool {
-    (regs.flags32() >> 12) & 3 == 3
+    if_mode(regs) != IfMode::Iopl1
 }
+
 
 // =============================================================================
 // Segment views
@@ -506,67 +530,152 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
 // The worst case is therefore today's behavior — never a hang, and never an
 // interrupt delivered inside a section the client believes is protected.
 
-/// Learned pairings, direct-mapped and tiny: only the hot working set matters
-/// (Doom's steady state is two POPFs) and a miss just costs a relearn.
-const PAIRS: usize = 16;
-static PAIR_SITE: [AtomicU32; PAIRS] = [const { AtomicU32::new(0) }; PAIRS];
-static PAIR_EXIT: [AtomicU32; PAIRS] = [const { AtomicU32::new(0) }; PAIRS];
+/// Every code address we have ever seen re-enable interrupts — the union, not
+/// a per-site guess. All of them stay armed in the hardware breakpoint set, so
+/// a window is caught leaving through ANY of them, no matter which CLI opened
+/// it. There is no prediction left to get wrong.
+///
+/// This is small on purpose because it IS small in practice: a program has only
+/// a couple of instructions that re-enable IF (DOOM: 2; DUKE3D: 2-3). Every
+/// other window ends on an `STI`, which #GPs on its own and can never be missed.
+static EXITS: [AtomicU32; crate::MAX_EXEC_BP] = [const { AtomicU32::new(0) }; crate::MAX_EXEC_BP];
+static N_EXITS: AtomicU32 = AtomicU32::new(0);
 
-/// Sentinel exit: this window ends on an instruction that traps by itself, so
-/// it needs no breakpoint — just let it run.
-const EXIT_FAULTS: u32 = u32::MAX;
+/// Sites we have already stepped. A site may run free once every exit it has
+/// been seen to take is either an `STI` (self-faulting, unmissable) or is in the
+/// armed `EXITS` set.
+///
+/// `SITE_STEP` is a countdown of windows we still insist on stepping. A repair
+/// sets it to `PENALTY`, not to 1: the whole reason we mispredicted is that the
+/// site has MORE THAN ONE exit, and stepping it a single time would very likely
+/// just take the common path again and re-learn the exit we already had. Serving
+/// a penalty of several windows samples the other branches too, so the second
+/// exit actually gets interned and the site then runs free forever.
+const SITES: usize = 32;
+const PENALTY: u32 = 32;
+const ALWAYS_STEP: u32 = u32::MAX;
+static SITE_IP: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+static SITE_STEP: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
 
-/// The site that opened the window we are currently inside (0 = none).
+/// The site that opened the window we are in, and the stack level it opened at
+/// (see [`repair`] — the stack is what tells us whether the client LEFT).
 static CUR_SITE: AtomicU32 = AtomicU32::new(0);
-/// The exit address currently armed in a hardware breakpoint (0 = none).
-static ARMED: AtomicU32 = AtomicU32::new(0);
+static CUR_SP: AtomicU32 = AtomicU32::new(0);
+/// Is the window we are in running free on the breakpoint set, rather than
+/// being stepped? Only such a window can strand virtual IF — see [`repair`].
+static PREDICTED: AtomicU32 = AtomicU32::new(0);
 
-fn pair_slot(site: u32) -> usize {
-    // Code addresses are dense; fold a few bits so neighbours don't collide.
-    ((site ^ (site >> 5) ^ (site >> 11)) as usize) % PAIRS
+/// Forensics for the last repair — a repair means a real program did something
+/// our model had never seen, which should never pass silently.
+pub static REPAIRS: AtomicU32 = AtomicU32::new(0);
+pub static REPAIR_SITE: AtomicU32 = AtomicU32::new(0);
+pub static REPAIR_IP: AtomicU32 = AtomicU32::new(0);
+
+fn site_slot(ip: u32) -> usize {
+    ((ip ^ (ip >> 5) ^ (ip >> 11)) as usize) % SITES
 }
 
-fn pair_lookup(site: u32) -> Option<u32> {
-    let i = pair_slot(site);
-    if PAIR_SITE[i].load(Relaxed) == site {
-        let exit = PAIR_EXIT[i].load(Relaxed);
-        if exit != 0 {
-            return Some(exit);
-        }
-    }
-    None
+/// Known, and not serving a step penalty.
+fn site_is_ok(ip: u32) -> bool {
+    let i = site_slot(ip);
+    SITE_IP[i].load(Relaxed) == ip && SITE_STEP[i].load(Relaxed) == 0
 }
 
-fn pair_learn(site: u32, exit: u32) {
-    if site == 0 {
+/// A stepped window at `ip` closed. If its exit could be armed, count down the
+/// penalty; if not (the exit set is full), this site can never run free.
+fn site_learned(ip: u32, armable: bool) {
+    if ip == 0 {
         return;
     }
-    let i = pair_slot(site);
-    PAIR_SITE[i].store(site, Relaxed);
-    PAIR_EXIT[i].store(exit, Relaxed);
+    let i = site_slot(ip);
+    if SITE_IP[i].load(Relaxed) != ip {
+        SITE_IP[i].store(ip, Relaxed);
+        SITE_STEP[i].store(0, Relaxed);
+    }
+    if !armable {
+        SITE_STEP[i].store(ALWAYS_STEP, Relaxed);
+        return;
+    }
+    let n = SITE_STEP[i].load(Relaxed);
+    if n != 0 && n != ALWAYS_STEP {
+        SITE_STEP[i].store(n - 1, Relaxed);
+    }
 }
 
-/// Drop every learned pairing. The cache is keyed by bare code address, so a
-/// new address space must not inherit the previous program's exits.
+/// This site mispredicted: it has an exit we have never stepped. Put it in the
+/// penalty box so the next several windows are stepped and the other branch's
+/// exit gets found.
+fn site_penalise(ip: u32) {
+    if ip == 0 {
+        return;
+    }
+    let i = site_slot(ip);
+    SITE_IP[i].store(ip, Relaxed);
+    if SITE_STEP[i].load(Relaxed) != ALWAYS_STEP {
+        SITE_STEP[i].store(PENALTY, Relaxed);
+    }
+}
+
+/// Intern an IF-restoring address into the global set and re-arm the hardware.
+/// Returns false when the set is full and this address is new — then the site
+/// can never run free and must keep being stepped, which is slow but correct.
+fn exit_intern<A: Arch>(arch: &mut A, addr: u32) -> bool {
+    let n = N_EXITS.load(Relaxed) as usize;
+    for e in EXITS.iter().take(n) {
+        if e.load(Relaxed) == addr {
+            return true;
+        }
+    }
+    if n >= crate::MAX_EXEC_BP {
+        return false;
+    }
+    EXITS[n].store(addr, Relaxed);
+    N_EXITS.store(n as u32 + 1, Relaxed);
+    rearm(arch)
+}
+
+fn rearm<A: Arch>(arch: &mut A) -> bool {
+    let n = N_EXITS.load(Relaxed) as usize;
+    let mut buf = [0u32; crate::MAX_EXEC_BP];
+    for (b, e) in buf.iter_mut().zip(EXITS.iter()).take(n) {
+        *b = e.load(Relaxed);
+    }
+    arch.set_exec_breakpoints(&buf[..n])
+}
+
+/// Is `addr` one of the armed IF-restoring addresses?
+fn is_exit(addr: u32) -> bool {
+    let n = N_EXITS.load(Relaxed) as usize;
+    EXITS.iter().take(n).any(|e| e.load(Relaxed) == addr)
+}
+
+/// Drop everything learned. Keyed by bare code address, so a new address space
+/// must not inherit the previous program's exits.
 pub fn forget_if_windows() {
-    for i in 0..PAIRS {
-        PAIR_SITE[i].store(0, Relaxed);
-        PAIR_EXIT[i].store(0, Relaxed);
+    N_EXITS.store(0, Relaxed);
+    for e in EXITS.iter() {
+        e.store(0, Relaxed);
+    }
+    for i in 0..SITES {
+        SITE_IP[i].store(0, Relaxed);
+        SITE_STEP[i].store(0, Relaxed);
     }
     CUR_SITE.store(0, Relaxed);
-    ARMED.store(0, Relaxed);
+    PREDICTED.store(0, Relaxed);
 }
 
-fn disarm<A: Arch>(arch: &mut A) {
-    if ARMED.swap(0, Relaxed) != 0 {
-        arch.set_exec_breakpoint(None);
-    }
+/// Is the current interrupts-off window running on the breakpoint set rather
+/// than being stepped? This is the entire licence for [`repair`]: a window we
+/// are STEPPING cannot lose its exit, because the step loop sees every
+/// instruction.
+pub fn predicting() -> bool {
+    PREDICTED.load(Relaxed) != 0
 }
 
 /// The PM virtual-IF gate, called after the #GP monitor resumes an instruction.
 /// `entry_ip` is where that instruction lives and `vif_was_on` is VIF before it
 /// ran, so a 1 -> 0 transition identifies the site that OPENS an interrupts-off
-/// window. Decides whether the client runs free (breakpointed) or steps to learn.
+/// window.
 pub fn if_gate<A: Arch>(
     arch: &mut A,
     regs: &mut Regs,
@@ -574,20 +683,20 @@ pub fn if_gate<A: Arch>(
     vif_was_on: bool,
 ) -> MonitorResult {
     if regs.flags32() & VIF_FLAG != 0 {
-        // The window is closed (or never opened) — e.g. an STI that #GP'd here.
+        // The window closed on an instruction that faulted by itself — an STI.
+        // Those can never be missed, so this site is safe to run free.
         if !vif_was_on {
-            // It closed by faulting on its own: it never needs a breakpoint.
-            pair_learn(CUR_SITE.swap(0, Relaxed), EXIT_FAULTS);
+            site_learned(CUR_SITE.swap(0, Relaxed), true);
+            PREDICTED.store(0, Relaxed);
         }
-        disarm(arch);
         regs.clear_flag32(TF_FLAG);
         return MonitorResult::Resume;
     }
     if !vif_was_on {
-        // Already inside a window — this was some other sensitive instruction
-        // (a port-I/O #GP, say). Do NOT re-key on it: keep whatever breakpoint
-        // or stepping decision the window opened with.
-        if ARMED.load(Relaxed) != 0 {
+        // Already inside a window — some other sensitive instruction (a
+        // port-I/O #GP, say). Keep the decision the window opened with; do NOT
+        // fall into stepping just because this faulted.
+        if predicting() {
             regs.clear_flag32(TF_FLAG);
             return MonitorResult::Resume;
         }
@@ -595,53 +704,74 @@ pub fn if_gate<A: Arch>(
     }
     // VIF just went 1 -> 0: a new window opens at `entry_ip`.
     CUR_SITE.store(entry_ip, Relaxed);
-    match pair_lookup(entry_ip) {
-        Some(EXIT_FAULTS) => {
-            regs.clear_flag32(TF_FLAG);
-            MonitorResult::Resume
-        }
-        Some(exit) if arch.set_exec_breakpoint(Some(exit)) => {
-            ARMED.store(exit, Relaxed);
-            regs.clear_flag32(TF_FLAG);
-            MonitorResult::Resume
-        }
-        // Unknown window, or a backend with no breakpoint: step and learn.
-        _ => step_virtual_if(arch, regs),
+    CUR_SP.store(regs.sp32(), Relaxed);
+    // Iopl3 is the reference path: always step, never predict.
+    if if_mode(regs) == IfMode::Iopl3 || !site_is_ok(entry_ip) {
+        PREDICTED.store(0, Relaxed);
+        return step_virtual_if(arch, regs);
     }
+    PREDICTED.store(1, Relaxed);
+    regs.clear_flag32(TF_FLAG);
+    MonitorResult::Resume
 }
 
-/// A hardware execute breakpoint fired. If it is the exit we armed, emulate the
-/// instruction there — the breakpoint is a FAULT, so it has not run yet — which
-/// closes the window and restores VIF without a single step. Returns whether
-/// this `#DB` was ours.
+/// A hardware execute breakpoint fired. If it is one of the armed IF-restoring
+/// addresses, emulate the instruction there — the breakpoint is a FAULT, so it
+/// has not run yet — and the window closes. Returns whether this `#DB` was ours.
 pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
-    let armed = ARMED.load(Relaxed);
-    if armed == 0 || regs.ip32() != armed {
+    if !is_exit(regs.ip32()) {
         return false;
     }
     let ev = monitor_rs::<A>(arch, regs);
     if regs.flags32() & VIF_FLAG != 0 {
-        disarm(arch);
         CUR_SITE.store(0, Relaxed);
+        PREDICTED.store(0, Relaxed);
         regs.clear_flag32(TF_FLAG);
     }
-    // Else the exit ran but the client popped IF=0: the pairing is not wrong,
-    // the window simply continues. Leave the breakpoint armed.
     matches!(ev, MonitorResult::Resume)
 }
 
-/// The DOS layer saw virtual IF stay off, with an interrupt pending, for far
-/// longer than any real critical section: the client left its window by an exit
-/// we never learned, so VIF is stale. Drop the pairing and go back to stepping,
-/// which always finds the truth.
-pub fn relearn<A: Arch>(arch: &mut A, regs: &mut Regs) {
-    disarm(arch);
-    let site = CUR_SITE.load(Relaxed);
-    let i = pair_slot(site);
-    if PAIR_SITE[i].load(Relaxed) == site {
-        PAIR_EXIT[i].store(0, Relaxed);
+/// Repair a virtual IF we lost, and re-open the site that lost it for learning.
+///
+/// Called when virtual IF has stayed off, with an interrupt pending, far longer
+/// than any real critical section — while the window was running free on the
+/// breakpoint set. Two very different things can look like that, and only the
+/// STACK tells them apart:
+///
+///   DUKE3D  sp0=00846c90 sp=00846ec4 -> unwound 564 bytes ABOVE entry: it
+///           popped the flags and returned through several frames. It really
+///           did leave, through a second POPF in that section we had never
+///           stepped. Repair.
+///   ROTT    sp0=006d9276 sp=006d9276 -> the SAME stack level it entered with.
+///           It never executed a POPF at all: it is still inside its own
+///           critical section, just slow (`cli; wait for vertical retrace; popf`
+///           runs ~16 ms, and it is entitled to). Do NOT touch it.
+///
+/// So the test is structural, not temporal: the exit POPF consumes the flags
+/// image pushed before the CLI, which can only raise SP above where the window
+/// opened. At or below that level the client is still inside, and we have no
+/// business touching its interrupt flag — that is the difference between
+/// repairing a flag we broke and firing an interrupt into a critical section the
+/// client believes is protected.
+///
+/// On a genuine repair, mark the site NOT ok: the next pass steps it, learns the
+/// exit it really took, and interns that address into the armed set. The site
+/// then runs free forever after, and cannot be missed again — which is why a
+/// second exit costs exactly one repair, once.
+pub fn repair<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
+    if !predicting() || regs.sp32() <= CUR_SP.load(Relaxed) {
+        return false;
     }
-    regs.set_flag32(TF_FLAG);
+    let _ = arch;
+    let site = CUR_SITE.swap(0, Relaxed);
+    REPAIRS.fetch_add(1, Relaxed);
+    REPAIR_SITE.store(site, Relaxed);
+    REPAIR_IP.store(regs.ip32(), Relaxed);
+    site_penalise(site);
+    PREDICTED.store(0, Relaxed);
+    regs.set_flags32(regs.flags32() | VIF_FLAG);
+    regs.clear_flag32(TF_FLAG);
+    true
 }
 
 pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
@@ -680,17 +810,18 @@ pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult 
         }
 
         // Sensitive: emulate via the monitor decoder and loop to re-check.
-        let site = regs.ip32();
+        let at = regs.ip32();
         match monitor_rs::<A>(arch, regs) {
             MonitorResult::Resume => {
                 // The whole point of stepping: if that instruction just restored
-                // VIF it is the EXIT of the window we are in. Learn the pair, so
-                // the next pass runs on a breakpoint instead of a #DB per
-                // instruction. An STI would have #GP'd on its own, so record the
-                // cheaper sentinel for it and skip the breakpoint entirely.
+                // VIF, it is an address that re-enables interrupts. Intern it
+                // into the armed set (an STI needs no breakpoint — it #GPs on
+                // its own) and the site may then run free.
                 if regs.flags32() & VIF_FLAG != 0 {
-                    let exit = if op == 0xFB { EXIT_FAULTS } else { site };
-                    pair_learn(CUR_SITE.swap(0, Relaxed), exit);
+                    let site = CUR_SITE.swap(0, Relaxed);
+                    let armed = op == 0xFB || exit_intern(arch, at);
+                    site_learned(site, armed);
+                    PREDICTED.store(0, Relaxed);
                 }
                 continue;
             }

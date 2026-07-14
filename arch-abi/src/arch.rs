@@ -239,17 +239,23 @@ pub trait Arch: Sized + GuestBytes {
     /// registers); a no-op on backends with no debug-register feature.
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>);
 
-    /// Arm (or disarm, with `None`) a hardware EXECUTE breakpoint at a guest
-    /// code address: a `#DB` fires *before* the instruction there runs.
+    /// Arm hardware EXECUTE breakpoints at up to [`MAX_EXEC_BP`] guest code
+    /// addresses (fewer disarms the rest; empty disarms all): a `#DB` fires
+    /// *before* the instruction at any of them runs.
     ///
-    /// The virtual-IF machinery uses this to stop single-stepping (see
-    /// [`monitor::if_gate`](crate::monitor::if_gate)). Returns whether the
-    /// backend actually armed it — a backend with no debug registers returns
-    /// `false` and the caller falls back to TF stepping, which is always
-    /// correct, just slow. That is why this has a default: adding a backend
-    /// must never silently lose the breakpoint *and* the fallback.
-    fn set_exec_breakpoint(&mut self, addr: Option<u32>) -> bool {
-        let _ = addr;
+    /// The virtual-IF machinery arms the *union of every address known to
+    /// re-enable interrupts* here and leaves it armed, which is what lets it
+    /// stop single-stepping (see [`monitor::if_gate`](crate::monitor::if_gate)).
+    /// It is a set, not a single slot, because one critical section can leave
+    /// through more than one POPF — DUKE3D does — and a single-slot breakpoint
+    /// would miss the other and strand the client's interrupt flag.
+    ///
+    /// Returns whether the backend actually armed them. A backend with no debug
+    /// registers returns `false` and the caller falls back to TF stepping, which
+    /// is always correct, just slow. That is why this has a default: adding a
+    /// backend must never silently lose the breakpoints *and* the fallback.
+    fn set_exec_breakpoints(&mut self, addrs: &[u32]) -> bool {
+        let _ = addrs;
         false
     }
 

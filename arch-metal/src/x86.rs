@@ -305,16 +305,9 @@ pub(super) unsafe fn write_dr0(value: u32) {
 }
 
 #[inline]
-pub(super) unsafe fn read_dr7() -> u32 {
-    let value: u32;
-    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack)); }
-    value
+unsafe fn write_dr2(value: u32) {
+    unsafe { asm!("mov dr2, {}", in(reg) value, options(nomem, nostack)); }
 }
-
-/// DR3 is reserved for the virtual-IF exit breakpoint; DR0/DR1 stay free for
-/// the write-watchpoint debug feature (`set_debug_watch`), which writes DR7
-/// wholesale. The two are not meant to be armed at the same time.
-const DR3_EXEC_ENABLE: u32 = 1 << 6; // L3
 
 #[inline]
 unsafe fn write_dr3(value: u32) {
@@ -329,25 +322,32 @@ pub fn cpl() -> u16 {
     cs & 3
 }
 
-/// Program DR3 as an execute breakpoint at `addr` (`None` disables it):
-/// R/W3 = 00 and LEN3 = 00, the only legal encoding for one, enabled via L3.
+/// Program DR0..DR3 as EXECUTE breakpoints at `addrs` (R/W = 00 and LEN = 00,
+/// the only legal encoding for one); slots beyond `addrs.len()` are disabled.
+///
+/// This takes the whole debug-register file, so it is mutually exclusive with
+/// the `set_debug_watch` write-watchpoint feature — a ring-0 debugging aid that
+/// is off unless someone turns it on.
 ///
 /// # Safety
 ///
 /// `MOV DR` is CPL=0-only — a ring-1 caller #GPs. Reach this through
-/// `Arch::set_exec_breakpoint`, which routes an unprivileged caller via the
+/// `Arch::set_exec_breakpoints`, which routes an unprivileged caller via the
 /// arch call instead of faulting.
-pub(super) unsafe fn program_exec_bp(addr: Option<u32>) {
+pub(super) unsafe fn program_exec_bps(addrs: &[u32]) {
     unsafe {
-        match addr {
-            Some(a) => {
-                write_dr3(a);
-                // Clear R/W3+LEN3 (bits 28..31) so it is an execute break, then
-                // enable L3. Leaves DR0/DR1's watchpoint bits untouched.
-                write_dr7((read_dr7() & !0xF000_0000) | DR3_EXEC_ENABLE);
+        let mut dr7: u32 = 0x0000_0400; // bit 10 reads as 1
+        for (i, &a) in addrs.iter().take(4).enumerate() {
+            match i {
+                0 => write_dr0(a),
+                1 => write_dr1(a),
+                2 => write_dr2(a),
+                _ => write_dr3(a),
             }
-            None => write_dr7(read_dr7() & !DR3_EXEC_ENABLE),
+            dr7 |= 1 << (2 * i); // Ln; R/Wn = 00 (exec) and LENn = 00
         }
+        write_dr6(0);
+        write_dr7(dr7);
     }
 }
 

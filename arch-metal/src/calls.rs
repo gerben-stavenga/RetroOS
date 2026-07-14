@@ -286,14 +286,15 @@ pub fn arch_free_user_pages() {
 /// Arm hardware write-watchpoints at up to two addresses (`addr1==0`/`None`
 /// disables the second/both). The ring-0 handler programs the debug registers
 /// so a guest write to a watched address raises `#DB`.
-/// Arm/disarm the virtual-IF exit breakpoint (DR3) from an unprivileged ring:
+/// Arm the virtual-IF exit-breakpoint SET (DR0..DR3) from an unprivileged ring:
 /// `MOV DR` needs CPL=0, and the kernel runs at ring 1.
-pub fn arch_set_exec_breakpoint(addr: Option<u32>) {
+pub fn arch_set_exec_breakpoints(addrs: &[u32]) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
             in("eax") crate::arch_call::SET_EXEC_BP as u32,
-            in("edx") addr.unwrap_or(0),
+            in("edx") addrs.as_ptr(),
+            in("ecx") addrs.len(),
         );
     }
 }

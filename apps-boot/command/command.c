@@ -75,6 +75,7 @@ static void trace(int on) {
 #define LF_F_LOADFIX 0x01
 #define LF_F_DOS32A  0x02
 #define LF_F_IOPL3   0x04
+#define LF_F_REPAIR  0x08
 
 static char          loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
 static unsigned char loadfix_flags[LF_MAX_NAMES];
@@ -98,6 +99,7 @@ static unsigned char parse_flag(const char *tok) {
     if (stricmp(tok, "loadfix") == 0) return LF_F_LOADFIX;
     if (stricmp(tok, "dos32a")  == 0) return LF_F_DOS32A;
     if (stricmp(tok, "iopl3")   == 0) return LF_F_IOPL3;
+    if (stricmp(tok, "repair")  == 0) return LF_F_REPAIR;
     return 0;
 }
 
@@ -521,10 +523,15 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
     if (has_ext(resolved, ".BAT")) return run_bat_file(resolved);
     argv[prog_idx] = resolved;
     flags = lookup_flags(resolved);
-    /* iopl3: no trampoline, just run the program directly at virtual IOPL=3
-     * so the monitor single-steps its sloppy POPF/IRET interrupt-enable
-     * (DOOM/DOOM2/Hexen). Conforming clients get the default IOPL=1. */
-    viopl = (flags & LF_F_IOPL3) ? 3 : 1;
+    /* Virtual-IF mode (the kernel's `IfMode`), passed as the child's vIOPL:
+     *   1 = iopl1  spec-strict: POPF/IRET are ignored, per DPMI 0.9 2.13.
+     *   2 = repair honor them, caught by a learned exit breakpoint. Cheap.
+     *   3 = iopl3  honor them by single-stepping the window. The always-correct
+     *              reference path, ~2500x slower — the escape hatch for a
+     *              client `repair` mispredicts.
+     * A client that re-enables IF the sloppy way HANGS at iopl1 (DOOM et al),
+     * so `repair` is what games want; `iopl3` stays available to fall back to. */
+    viopl = (flags & LF_F_IOPL3) ? 3 : (flags & LF_F_REPAIR) ? 2 : 1;
     if (flags & LF_F_DOS32A) {
         /* Spawn DOS/32A.EXE with prog + args as its tail. DOS/32A loads
          * the target itself and provides a stricter DPMI 0.9 environment
