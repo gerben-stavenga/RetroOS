@@ -46,7 +46,8 @@ pub struct Engine {
     /// [`mix_frame`](Engine::mix_frame).
     mix_acc: u32,
     /// Last native frame generated (zero-order hold for `mix_frame`).
-    hold: (i16, i16),
+    /// Unclipped: the final mixer owns the one clip point (see `step`).
+    hold: (i32, i32),
 }
 
 impl Engine {
@@ -90,8 +91,8 @@ impl Engine {
     pub fn generate(&mut self, mem: &[u8], out: &mut [i16], ev: &mut Events) {
         for frame in out.chunks_exact_mut(2) {
             let (l, r) = self.step(mem, ev);
-            frame[0] = l;
-            frame[1] = r;
+            frame[0] = sat16(l);
+            frame[1] = sat16(r);
         }
     }
 
@@ -104,7 +105,7 @@ impl Engine {
         native_rate: u32,
         out_rate: u32,
         ev: &mut Events,
-    ) -> (i16, i16) {
+    ) -> (i32, i32) {
         let out_rate = out_rate.max(4_000); // caller-programmed; never stall
         self.mix_acc += native_rate;
         while self.mix_acc >= out_rate {
@@ -115,8 +116,13 @@ impl Engine {
     }
 
     /// One native frame: fetch/advance every participating voice, tick its
-    /// ramp, sum saturating.
-    fn step(&mut self, mem: &[u8], ev: &mut Events) -> (i16, i16) {
+    /// ramp, sum into the wide accumulator.
+    ///
+    /// Returned UNCLIPPED. 32 GF1 voices summing at full ramp overflow i16
+    /// easily, and clipping here — before the final mixer has applied its
+    /// master attenuation — would flat-top the wave permanently. The pump owns
+    /// the single clip point.
+    fn step(&mut self, mem: &[u8], ev: &mut Events) -> (i32, i32) {
         let n = (self.active as usize).min(MAX_VOICES);
         let (mut al, mut ar) = (0i32, 0i32);
         for vi in 0..n {
@@ -137,7 +143,7 @@ impl Engine {
                 ramp_tick(v, vi, ev);
             }
         }
-        (sat16(al), sat16(ar))
+        (al, ar)
     }
 }
 

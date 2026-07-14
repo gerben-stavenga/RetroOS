@@ -27,6 +27,12 @@ pub(super) const NATIVE_RATE: u32 = 49_716;
 /// all envelopes released — drivers pause between notes and between songs.
 const HANGOVER_MS: u64 = 2_000;
 
+/// Ceiling on queued-but-unapplied register writes (see `pending`). Deep
+/// enough for any real driver's init burst (a full 22-register instrument
+/// load is ~90 writes); a write storm past this gives up the inter-write
+/// gap rather than the write, so the queue can never grow without bound.
+const PENDING_MAX: usize = 4_096;
+
 /// What a guest-visible FM port decodes to.
 pub(super) enum OplPort {
     /// Address latch write; the payload is the register file (bank) the
@@ -74,6 +80,25 @@ pub(super) struct OplFm {
     mix_acc: u32,
     /// Last native frame generated (zero-order hold for `mix`).
     hold: (i16, i16),
+    /// Guest register writes not yet handed to the chip, released one per
+    /// generated frame by `mix_into`.
+    ///
+    /// The chip does not retrigger a note on the key-on write itself: a write
+    /// only flips the slot's `key` bit. The attack is armed inside the chip's
+    /// per-sample envelope step, which fires only when it observes `key != 0`
+    /// while the envelope is already in RELEASE — and RELEASE is itself set by
+    /// an *earlier* per-sample step that saw `key == 0`. A note therefore
+    /// re-attacks only if at least one frame is generated between the driver's
+    /// key-off and its key-on.
+    ///
+    /// Real silicon is clocked continuously at `NATIVE_RATE`, so two OUTs are
+    /// always ≥1 frame apart and that always holds. Our chip is clocked only by
+    /// the mixer pump, so every write inside one pump window would otherwise
+    /// land between the same two frames: a driver that writes key-off, fnum,
+    /// key-on back-to-back (the usual shape) would never re-attack, and the
+    /// note would hang at its sustain level — audible as music that keeps its
+    /// melody but collapses to a fraction of its volume.
+    pending: alloc::collections::VecDeque<(u16, u8)>,
 }
 
 impl OplFm {
@@ -89,6 +114,7 @@ impl OplFm {
             last_write_ms: now,
             mix_acc: 0,
             hold: (0, 0),
+            pending: alloc::collections::VecDeque::new(),
         }
     }
 
@@ -128,7 +154,11 @@ impl OplFm {
                     }
                     return;
                 }
-                self.chip.write_register(self.index, val);
+                if self.pending.len() >= PENDING_MAX {
+                    let (reg, val) = self.pending.pop_front().unwrap();
+                    self.chip.write_register(reg, val);
+                }
+                self.pending.push_back((self.index, val));
             }
         }
     }
@@ -138,6 +168,7 @@ impl OplFm {
     /// The mixer pump keeps the canonical stream open while this holds.
     pub(super) fn audible(&self, now: u64) -> bool {
         self.chip.active_voice_count() > 0
+            || !self.pending.is_empty()
             || now.saturating_sub(self.last_write_ms) < HANGOVER_MS
     }
 }
@@ -145,27 +176,42 @@ impl OplFm {
 /// The mixer pump pulls FM through the canonical mix-source shape.
 impl OplFm {
     /// Voices-only (no write hangover): a silent chip mixes silence — skip
-    /// the work. (`audible` decides whether the *stream* stays open.)
+    /// the work. (`audible` decides whether the *stream* stays open.) Queued
+    /// writes also count: the queue drains a frame at a time from `mix_into`,
+    /// so a chip whose only pending work is a key-on must still be pumped or
+    /// the write would never reach it.
     pub(super) fn mixing(&self) -> bool {
-        self.chip.active_voice_count() > 0
+        self.chip.active_voice_count() > 0 || !self.pending.is_empty()
     }
 
     /// Add FM at the pump's rate: per output frame advance the chip by the
     /// corresponding number of native frames (zero-order hold on the last),
-    /// summing saturating. No sub-block events: the OPL's guest-visible
-    /// timers run on virtual time, not the stream.
-    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, _base: u64, block: &mut [(i16, i16)]) {
+    /// summing saturating. Each native frame first releases one queued guest
+    /// write, which is what keeps consecutive writes ≥1 frame apart — see
+    /// `pending`. No sub-block events: the OPL's guest-visible timers run on
+    /// virtual time, not the stream.
+    pub(super) fn mix_into<A: crate::Arch>(
+        &mut self,
+        _machine: &mut A,
+        rate: u32,
+        _base: u64,
+        block: &mut [(i32, i32)],
+        gain_q16: (i32, i32),
+    ) {
         let rate = rate.max(4_000); // guest-programmed; never let it stall us
         let mut pair = [0i16; 2];
         for slot in block.iter_mut() {
             self.mix_acc += NATIVE_RATE;
             while self.mix_acc >= rate {
                 self.mix_acc -= rate;
+                if let Some((reg, val)) = self.pending.pop_front() {
+                    self.chip.write_register(reg, val);
+                }
                 let _ = self.chip.generate(&mut pair);
                 self.hold = (pair[0], pair[1]);
             }
-            slot.0 = slot.0.saturating_add(self.hold.0);
-            slot.1 = slot.1.saturating_add(self.hold.1);
+            slot.0 += (self.hold.0 as i32 * gain_q16.0) >> 16;
+            slot.1 += (self.hold.1 as i32 * gain_q16.1) >> 16;
         }
     }
 }

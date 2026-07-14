@@ -309,6 +309,16 @@ fn mix_frame_zoh_matches_decimated_generate() {
     for k in 0..16 {
         let (l, r) = a.mix_frame(&mem, 44100, 11025, &mut ev);
         let native = k * 4 + 3; // 4 native frames per pull; hold = the last
-        assert_eq!((l, r), (full[native * 2], full[native * 2 + 1]), "pull {k}");
+        // What's under test is that the ZOH pull lands on the same native frame
+        // as the decimated `generate`. `mix_frame` is now unclipped (the final
+        // mixer owns the one clip point) while `generate` still saturates, and
+        // this fixture's voices do sum past i16 — so compare through the same
+        // saturation rather than against the raw accumulator.
+        let sat = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        assert_eq!(
+            (sat(l), sat(r)),
+            (full[native * 2], full[native * 2 + 1]),
+            "pull {k}"
+        );
     }
 }

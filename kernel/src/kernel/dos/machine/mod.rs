@@ -854,7 +854,7 @@ impl PcmSource<'_> {
         rate: u32,
         base: u64,
         dsp_base: u64,
-        block: &mut [(i16, i16)],
+        block: &mut [(i32, i32)],
     ) {
         match self {
             Self::SoundBlaster(sb) => sb.mix_into(machine, rate, dsp_base, block),
@@ -872,6 +872,11 @@ const MIX_CANON: crate::kernel::sound::Format = crate::kernel::sound::Format {
 
 /// Frames per pump chunk (bounded stack buffers; a due burst loops).
 const MIX_CHUNK: usize = 128;
+
+/// The mix's one and only clip point.
+fn sat16(v: i32) -> i16 {
+    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
 
 /// The canonical mix clock. Fixed, and deliberately *not* borrowed from
 /// whichever device happens to be loudest: a DOS game commonly plays 11 kHz
@@ -960,7 +965,14 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let rate = MIX_RATE;
     let mut n = mixer.pace.due(machine, rate, dt, MIX_CHUNK);
     let mut base = mixer.pace.pushed() - n;
-    let mut frames = [(0i16, 0i16); MIX_CHUNK];
+    // Sources sum into a WIDE accumulator and the mix is clipped exactly once,
+    // here, on the way out. Saturating each i16 add per source (what we used to
+    // do) clips every source against every other one: a full-scale digital SFX
+    // played over FM music pinned the sum at the rail and flat-topped the music
+    // with it. Each source carries its own card-accurate scale (see vsb.rs's
+    // FM_SCALE_Q16 / DAC_SCALE_Q16 / GUS_SCALE_Q16), which is where the
+    // headroom lives, so the clamp below is a backstop, not the normal path.
+    let mut frames = [(0i32, 0i32); MIX_CHUNK];
     let mut bytes = [0u8; MIX_CHUNK * 4];
     while n > 0 {
         let run = MIX_CHUNK;
@@ -971,6 +983,8 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
             source.mix_into(machine, rate, base, dsp_base, &mut frames[..run]);
         }
         for (i, (l, r)) in frames[..run].iter().enumerate() {
+            let l = sat16((l * vsb::OUTPUT_GAIN_Q16) >> 16);
+            let r = sat16((r * vsb::OUTPUT_GAIN_Q16) >> 16);
             bytes[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
             bytes[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
         }

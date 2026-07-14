@@ -802,7 +802,7 @@ impl Gus {
     /// exact session frame they occur at and queued for [`Gus::deliver_events`]
     /// — they become guest-visible when that frame *plays*, not when it is
     /// generated `fill` early.
-    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, base: u64, block: &mut [(i16, i16)]) {
+    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, base: u64, block: &mut [(i32, i32)]) {
         if !self.mixing() {
             return;
         }
@@ -814,8 +814,11 @@ impl Gus {
         for (i, slot) in block.iter_mut().enumerate() {
             let mut ev = sampler::Events::default();
             let (l, r) = c.engine.mix_frame(&c.dram, native, rate, &mut ev);
-            slot.0 = slot.0.saturating_add(l);
-            slot.1 = slot.1.saturating_add(r);
+            // Unity — the GF1's output is the mixer's reference level (86Box
+            // `gus_get_buffer` adds it straight in) and the GUS has no guest
+            // master volume; the per-voice ramps already carry it.
+            slot.0 += (l * super::vsb::GUS_SCALE_Q16) >> 16;
+            slot.1 += (r * super::vsb::GUS_SCALE_Q16) >> 16;
             if ev.any() {
                 let at = base + i as u64;
                 match c.events.back_mut() {
