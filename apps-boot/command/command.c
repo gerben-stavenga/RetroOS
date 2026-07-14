@@ -114,6 +114,19 @@ static void load_loadfix_cfg(void) {
         char *p = line + strspn(line, " \t");
         char *name, *tok;
         unsigned char flags = 0;
+        int overlong = strchr(line, '\n') == 0 && !feof(f);
+        /* A line longer than the buffer arrives in pieces, and the TAIL does not
+         * start with '#' -- so it would be parsed as a program entry, quietly
+         * filling the table with junk and shifting the real entries out. A long
+         * COMMENT then silently disables the policy for a game: DOOM lost its
+         * `repair` flag that way, fell back to the legacy loadfix default at
+         * vIOPL=1, and hung at DMX_Init with virtual IF stuck off. Never let a
+         * line's overflow become a record: drop the whole line. */
+        if (overlong) {
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') { }
+            continue;
+        }
         if (*p == 0 || *p == ';' || *p == '#' || *p == '\r' || *p == '\n') continue;
         /* Strip CR/LF terminator but leave inline whitespace for tokenising. */
         p[strcspn(p, "\r\n")] = 0;

@@ -558,9 +558,18 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             crate::dbg_println!("synth_fork_exec: filename={:?} tail.len={} tail_first8={:02x?}",
                 core::str::from_utf8(&filename[..flen]).unwrap_or("<non-utf8>"),
                 tlen, &tail[..tlen.min(8)]);
-            // CL carries the child's virtual IOPL: 3 = `iopl3` from LOADFIX.CFG
-            // (COMMAND.COM looked it up); anything else = conforming default (1).
-            let viopl: u8 = if (regs.rcx & 0xFF) == 3 { 3 } else { 1 };
+            // CL carries the child's virtual IOPL — the `IfMode` COMMAND.COM
+            // looked up in LOADFIX.CFG. It must accept EVERY mode: this used to
+            // read `== 3 { 3 } else { 1 }`, from when there were only two, so a
+            // `repair` client (2) was silently demoted to spec-strict (1). That
+            // is not a slow path, it is a HANG — POPF/IRET stop being honored,
+            // virtual IF sticks at 0, and DOOM deadlocks at DMX_Init spinning on
+            // a tick that can never arrive. Anything unknown stays conforming.
+            let viopl: u8 = match regs.rcx & 0xFF {
+                2 => 2, // IfMode::Repair
+                3 => 3, // IfMode::Iopl3
+                _ => 1, // IfMode::Iopl1
+            };
             fork_exec(dos, &filename[..flen], &tail[..tlen], viopl, regs, kt)
         }
         // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
