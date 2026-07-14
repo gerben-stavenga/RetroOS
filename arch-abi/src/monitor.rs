@@ -530,213 +530,137 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
 // The worst case is therefore today's behavior — never a hang, and never an
 // interrupt delivered inside a section the client believes is protected.
 
-/// Every code address we have ever seen re-enable interrupts — the union, not
-/// a per-site guess. All of them stay armed in the hardware breakpoint set, so
-/// a window is caught leaving through ANY of them, no matter which CLI opened
-/// it. There is no prediction left to get wrong.
+/// What we know about one CLI site: the addresses its window has been seen to
+/// re-enable interrupts at, and whether it still owes us stepping.
 ///
-/// This is small on purpose because it IS small in practice: a program has only
-/// a couple of instructions that re-enable IF (DOOM: 2; DUKE3D: 2-3). Every
-/// other window ends on an `STI`, which #GPs on its own and can never be missed.
-static EXITS: [AtomicU32; crate::MAX_EXEC_BP] = [const { AtomicU32::new(0) }; crate::MAX_EXEC_BP];
-static N_EXITS: AtomicU32 = AtomicU32::new(0);
-
-/// Sites we have already stepped. A site may run free once every exit it has
-/// been seen to take is either an `STI` (self-faulting, unmissable) or is in the
-/// armed `EXITS` set.
-///
-/// `SITE_STEP` is a countdown of windows we still insist on stepping. A repair
-/// sets it to `PENALTY`, not to 1: the whole reason we mispredicted is that the
-/// site has MORE THAN ONE exit, and stepping it a single time would very likely
-/// just take the common path again and re-learn the exit we already had. Serving
-/// a penalty of several windows samples the other branches too, so the second
-/// exit actually gets interned and the site then runs free forever.
+/// The exits are stored PER SITE and armed only while that site's window is
+/// open, because **only one interrupts-off window is open at a time**. So the
+/// four hardware breakpoints are not a global budget shared by the whole
+/// program — they belong to the current window. That is the difference between
+/// "the program may have at most 4 instructions that re-enable IF" (DUKE3D has
+/// five, and we ran out) and "one critical section may leave through at most 4
+/// places", which is a limit no real code comes close to.
 const SITES: usize = 64;
+const SITE_EXITS: usize = crate::MAX_EXEC_BP;
+/// Windows still owed stepping after a mispredict — enough to sample the other
+/// branch of a section that has more than one exit.
 const PENALTY: u32 = 32;
 const ALWAYS_STEP: u32 = u32::MAX;
+
 static SITE_IP: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+/// Exit addresses, per site. `SITE_N` of them are valid. An empty list is
+/// meaningful: it means every exit seen was an `STI`, which #GPs on its own and
+/// needs no breakpoint at all.
+static SITE_EX: [[AtomicU32; SITE_EXITS]; SITES] =
+    [const { [const { AtomicU32::new(0) }; SITE_EXITS] }; SITES];
+static SITE_N: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
 static SITE_STEP: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
-
-/// Sites we have given up on: they mispredicted while the debug registers were
-/// full, so no breakpoint can ever cover them and they must always be stepped.
-///
-/// This is a SET, not a slot in the hashed table, precisely because it must
-/// never be evicted. Pinning it in the hash was the bug: DUKE3D has plenty of
-/// sites, one collided with the pinned entry, the site looked unknown again,
-/// drifted back to running free, and mispredicted forever — the same site
-/// repairing over and over instead of once.
-const GIVEN_UP: usize = 8;
-static NEVER_FREE: [AtomicU32; GIVEN_UP] = [const { AtomicU32::new(0) }; GIVEN_UP];
-
-fn is_never_free(ip: u32) -> bool {
-    NEVER_FREE.iter().any(|e| e.load(Relaxed) == ip)
-}
-
-fn give_up_on(ip: u32) {
-    if is_never_free(ip) {
-        return;
-    }
-    for e in NEVER_FREE.iter() {
-        if e.compare_exchange(0, ip, Relaxed, Relaxed).is_ok() {
-            return;
-        }
-    }
-}
 
 /// The site that opened the window we are in, and the stack level it opened at
 /// (see [`repair`] — the stack is what tells us whether the client LEFT).
 static CUR_SITE: AtomicU32 = AtomicU32::new(0);
 static CUR_SP: AtomicU32 = AtomicU32::new(0);
-/// Is the window we are in running free on the breakpoint set, rather than
-/// being stepped? Only such a window can strand virtual IF — see [`repair`].
+/// Is the window we are in running free on its breakpoints, rather than being
+/// stepped? Only such a window can strand virtual IF — see [`repair`].
 static PREDICTED: AtomicU32 = AtomicU32::new(0);
+/// What is physically armed right now, so an unchanged set costs no DR writes.
+static ARMED: [AtomicU32; SITE_EXITS] = [const { AtomicU32::new(0) }; SITE_EXITS];
+static ARMED_N: AtomicU32 = AtomicU32::new(0);
 
-/// Forensics for the last repair — a repair means a real program did something
-/// our model had never seen, which should never pass silently.
+/// Forensics: a repair means a real program did something our model had never
+/// seen, and that should never pass silently.
 pub static REPAIRS: AtomicU32 = AtomicU32::new(0);
 pub static REPAIR_SITE: AtomicU32 = AtomicU32::new(0);
 pub static REPAIR_IP: AtomicU32 = AtomicU32::new(0);
-/// TEMPORARY: per-slot breakpoint hit counts, and the armed set, so we can tell
-/// "the section has a second exit" from "our breakpoint never fired".
-pub static BP_HITS: [AtomicU32; crate::MAX_EXEC_BP] =
-    [const { AtomicU32::new(0) }; crate::MAX_EXEC_BP];
-pub fn exit_snapshot(i: usize) -> (u32, u32) {
-    (EXITS[i].load(Relaxed), BP_HITS[i].load(Relaxed))
-}
 
-fn site_slot(ip: u32) -> usize {
+fn slot(ip: u32) -> usize {
     ((ip ^ (ip >> 5) ^ (ip >> 11)) as usize) % SITES
 }
 
-/// Known, not given up on, and not serving a step penalty.
-fn site_is_ok(ip: u32) -> bool {
-    if is_never_free(ip) {
-        return false;
-    }
-    let i = site_slot(ip);
-    SITE_IP[i].load(Relaxed) == ip && SITE_STEP[i].load(Relaxed) == 0
+fn site_find(ip: u32) -> Option<usize> {
+    let i = slot(ip);
+    (SITE_IP[i].load(Relaxed) == ip).then_some(i)
 }
 
-/// A stepped window at `ip` closed. If its exit could be armed, count down the
-/// penalty; if not (the exit set is full), this site can never run free.
-fn site_learned(ip: u32, armable: bool) {
-    if ip == 0 {
-        return;
-    }
-    let i = site_slot(ip);
+fn site_entry(ip: u32) -> usize {
+    let i = slot(ip);
     if SITE_IP[i].load(Relaxed) != ip {
         SITE_IP[i].store(ip, Relaxed);
+        SITE_N[i].store(0, Relaxed);
         SITE_STEP[i].store(0, Relaxed);
     }
-    if !armable {
-        give_up_on(ip); // its exit will not fit in the register file
-        return;
-    }
-    let n = SITE_STEP[i].load(Relaxed);
-    if n != 0 && n != ALWAYS_STEP {
-        SITE_STEP[i].store(n - 1, Relaxed);
-    }
+    i
 }
 
-/// This site mispredicted: it left through an IF-restoring address we had not
-/// armed. What to do about it depends on whether we CAN arm one more.
-///
-/// If there is a free debug register, serve a penalty: step the next several
-/// windows so the other branch is sampled, its exit interned, and the site then
-/// runs free forever — a two-exit section costs exactly one repair, once.
-///
-/// If the register file is FULL, no amount of stepping can help: we would learn
-/// the address and still have nowhere to put it, drift back to running free, and
-/// mispredict again — an endless cycle of repairs. So pin the site to stepping
-/// permanently. It is slow but exact, and it is *deterministic*: one site pays,
-/// the rest of the program keeps its breakpoints.
-///
-/// This is the real capacity limit of the scheme. x86 gives four execute
-/// breakpoints; DUKE3D wants five.
-fn site_penalise(ip: u32) {
-    if ip == 0 {
-        return;
+/// Arm exactly the exits of the window that is opening (none, if it exits on an
+/// STI). Skips the hardware writes when the set is already what we want.
+fn arm<A: Arch>(arch: &mut A, i: usize) -> bool {
+    let n = SITE_N[i].load(Relaxed) as usize;
+    let mut buf = [0u32; SITE_EXITS];
+    for (b, e) in buf.iter_mut().zip(SITE_EX[i].iter()).take(n) {
+        *b = e.load(Relaxed);
     }
-    if exits_full() {
-        give_up_on(ip);
-        return;
+    if ARMED_N.load(Relaxed) as usize == n
+        && buf.iter().zip(ARMED.iter()).take(n).all(|(b, a)| a.load(Relaxed) == *b)
+    {
+        return true; // already armed — no DR traffic
     }
-    let i = site_slot(ip);
-    SITE_IP[i].store(ip, Relaxed);
-    if SITE_STEP[i].load(Relaxed) != ALWAYS_STEP {
-        SITE_STEP[i].store(PENALTY, Relaxed);
+    if !arch.set_exec_breakpoints(&buf[..n]) {
+        return false; // no debug registers: caller must step
     }
+    for (a, b) in ARMED.iter().zip(buf.iter()) {
+        a.store(*b, Relaxed);
+    }
+    ARMED_N.store(n as u32, Relaxed);
+    true
 }
 
-/// Intern an IF-restoring address into the global set and re-arm the hardware.
-/// Returns false when the set is full and this address is new — then the site
-/// can never run free and must keep being stepped, which is slow but correct.
-fn exit_intern<A: Arch>(arch: &mut A, addr: u32) -> bool {
-    let n = N_EXITS.load(Relaxed) as usize;
-    for e in EXITS.iter().take(n) {
+fn is_armed(addr: u32) -> bool {
+    let n = ARMED_N.load(Relaxed) as usize;
+    ARMED.iter().take(n).any(|a| a.load(Relaxed) == addr)
+}
+
+/// Record an address this site re-enables interrupts at. Returns false only if
+/// the site already has [`SITE_EXITS`] distinct exits — a section leaving
+/// through five different places, which no real code does.
+fn site_add_exit(i: usize, addr: u32) -> bool {
+    let n = SITE_N[i].load(Relaxed) as usize;
+    for e in SITE_EX[i].iter().take(n) {
         if e.load(Relaxed) == addr {
             return true;
         }
     }
-    if n >= crate::MAX_EXEC_BP {
-        return false; // out of debug registers — see `exits_full`
+    if n >= SITE_EXITS {
+        return false;
     }
-    EXITS[n].store(addr, Relaxed);
-    N_EXITS.store(n as u32 + 1, Relaxed);
-    rearm(arch)
-}
-
-fn rearm<A: Arch>(arch: &mut A) -> bool {
-    let n = N_EXITS.load(Relaxed) as usize;
-    let mut buf = [0u32; crate::MAX_EXEC_BP];
-    for (b, e) in buf.iter_mut().zip(EXITS.iter()).take(n) {
-        *b = e.load(Relaxed);
-    }
-    arch.set_exec_breakpoints(&buf[..n])
-}
-
-/// Every debug register is spoken for, so no NEW IF-restoring address can ever
-/// be armed. x86 gives four, and a program can want more: DUKE3D has five.
-fn exits_full() -> bool {
-    N_EXITS.load(Relaxed) as usize >= crate::MAX_EXEC_BP
-}
-
-/// Is `addr` one of the armed IF-restoring addresses?
-fn is_exit(addr: u32) -> bool {
-    let n = N_EXITS.load(Relaxed) as usize;
-    EXITS.iter().take(n).any(|e| e.load(Relaxed) == addr)
+    SITE_EX[i][n].store(addr, Relaxed);
+    SITE_N[i].store(n as u32 + 1, Relaxed);
+    true
 }
 
 /// Drop everything learned. Keyed by bare code address, so a new address space
 /// must not inherit the previous program's exits.
 pub fn forget_if_windows() {
-    N_EXITS.store(0, Relaxed);
-    for e in EXITS.iter() {
-        e.store(0, Relaxed);
-    }
     for i in 0..SITES {
         SITE_IP[i].store(0, Relaxed);
+        SITE_N[i].store(0, Relaxed);
         SITE_STEP[i].store(0, Relaxed);
     }
-    for e in NEVER_FREE.iter() {
-        e.store(0, Relaxed);
-    }
+    ARMED_N.store(0, Relaxed);
     CUR_SITE.store(0, Relaxed);
     PREDICTED.store(0, Relaxed);
 }
 
-/// Is the current interrupts-off window running on the breakpoint set rather
-/// than being stepped? This is the entire licence for [`repair`]: a window we
-/// are STEPPING cannot lose its exit, because the step loop sees every
-/// instruction.
+/// Is the current window running free on its breakpoints rather than being
+/// stepped? The entire licence for [`repair`]: a window we are STEPPING cannot
+/// lose its exit, because the step loop sees every instruction.
 pub fn predicting() -> bool {
     PREDICTED.load(Relaxed) != 0
 }
 
 /// The PM virtual-IF gate, called after the #GP monitor resumes an instruction.
 /// `entry_ip` is where that instruction lives and `vif_was_on` is VIF before it
-/// ran, so a 1 -> 0 transition identifies the site that OPENS an interrupts-off
-/// window.
+/// ran, so a 1 -> 0 transition identifies the site that OPENS a window.
 pub fn if_gate<A: Arch>(
     arch: &mut A,
     regs: &mut Regs,
@@ -745,9 +669,16 @@ pub fn if_gate<A: Arch>(
 ) -> MonitorResult {
     if regs.flags32() & VIF_FLAG != 0 {
         // The window closed on an instruction that faulted by itself — an STI.
-        // Those can never be missed, so this site is safe to run free.
+        // Those can never be missed.
         if !vif_was_on {
-            site_learned(CUR_SITE.swap(0, Relaxed), true);
+            let site = CUR_SITE.swap(0, Relaxed);
+            if site != 0 {
+                let i = site_entry(site);
+                let n = SITE_STEP[i].load(Relaxed);
+                if n != 0 && n != ALWAYS_STEP {
+                    SITE_STEP[i].store(n - 1, Relaxed);
+                }
+            }
             PREDICTED.store(0, Relaxed);
         }
         regs.clear_flag32(TF_FLAG);
@@ -767,26 +698,25 @@ pub fn if_gate<A: Arch>(
     CUR_SITE.store(entry_ip, Relaxed);
     CUR_SP.store(regs.sp32(), Relaxed);
     // Iopl3 is the reference path: always step, never predict.
-    if if_mode(regs) == IfMode::Iopl3 || !site_is_ok(entry_ip) {
-        PREDICTED.store(0, Relaxed);
-        return step_virtual_if(arch, regs);
+    if if_mode(regs) != IfMode::Iopl3
+        && let Some(i) = site_find(entry_ip)
+        && SITE_STEP[i].load(Relaxed) == 0
+        && arm(arch, i)
+    {
+        PREDICTED.store(1, Relaxed);
+        regs.clear_flag32(TF_FLAG);
+        return MonitorResult::Resume;
     }
-    PREDICTED.store(1, Relaxed);
-    regs.clear_flag32(TF_FLAG);
-    MonitorResult::Resume
+    PREDICTED.store(0, Relaxed);
+    step_virtual_if(arch, regs)
 }
 
-/// A hardware execute breakpoint fired. If it is one of the armed IF-restoring
-/// addresses, emulate the instruction there — the breakpoint is a FAULT, so it
-/// has not run yet — and the window closes. Returns whether this `#DB` was ours.
+/// A hardware execute breakpoint fired. If it is one of the exits we armed for
+/// the open window, emulate the instruction there — the breakpoint is a FAULT,
+/// so it has not run yet — and the window closes. Returns whether it was ours.
 pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
-    if !is_exit(regs.ip32()) {
+    if !is_armed(regs.ip32()) {
         return false;
-    }
-    for i in 0..crate::MAX_EXEC_BP {
-        if EXITS[i].load(Relaxed) == regs.ip32() {
-            BP_HITS[i].fetch_add(1, Relaxed);
-        }
     }
     let ev = monitor_rs::<A>(arch, regs);
     if regs.flags32() & VIF_FLAG != 0 {
@@ -800,40 +730,43 @@ pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
 /// Repair a virtual IF we lost, and re-open the site that lost it for learning.
 ///
 /// Called when virtual IF has stayed off, with an interrupt pending, far longer
-/// than any real critical section — while the window was running free on the
-/// breakpoint set. Two very different things can look like that, and only the
-/// STACK tells them apart:
+/// than any real critical section — while the window was running free on its
+/// breakpoints. Two very different things look like that, and only the STACK
+/// tells them apart:
 ///
-///   DUKE3D  sp0=00846c90 sp=00846ec4 -> unwound 564 bytes ABOVE entry: it
-///           popped the flags and returned through several frames. It really
-///           did leave, through a second POPF in that section we had never
-///           stepped. Repair.
+///   DUKE3D  sp0=00846c90 sp=00846ec4 -> unwound ABOVE entry: it popped the
+///           flags and returned through several frames. It really did leave,
+///           through an exit we had not armed. Repair.
 ///   ROTT    sp0=006d9276 sp=006d9276 -> the SAME stack level it entered with.
 ///           It never executed a POPF at all: it is still inside its own
 ///           critical section, just slow (`cli; wait for vertical retrace; popf`
 ///           runs ~16 ms, and it is entitled to). Do NOT touch it.
 ///
-/// So the test is structural, not temporal: the exit POPF consumes the flags
-/// image pushed before the CLI, which can only raise SP above where the window
-/// opened. At or below that level the client is still inside, and we have no
-/// business touching its interrupt flag — that is the difference between
-/// repairing a flag we broke and firing an interrupt into a critical section the
-/// client believes is protected.
+/// So the test is structural, not temporal: the exit consumes the flags image
+/// pushed before the CLI, which can only raise SP above where the window opened.
+/// At or below that level the client is still inside, and we have no business
+/// touching its interrupt flag — that is the difference between repairing a flag
+/// we broke and firing an interrupt into a critical section the client believes
+/// is protected. A timeout alone cannot tell those apart; the stack can.
 ///
-/// On a genuine repair, mark the site NOT ok: the next pass steps it, learns the
-/// exit it really took, and interns that address into the armed set. The site
-/// then runs free forever after, and cannot be missed again — which is why a
-/// second exit costs exactly one repair, once.
+/// Then put the site in the penalty box: the next windows are stepped, the exit
+/// it really took is learned and added to ITS list, and it runs free forever
+/// after. A section with a second exit therefore costs exactly one repair, once.
 pub fn repair<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
+    let _ = arch;
     if !predicting() || regs.sp32() <= CUR_SP.load(Relaxed) {
         return false;
     }
-    let _ = arch;
     let site = CUR_SITE.swap(0, Relaxed);
     REPAIRS.fetch_add(1, Relaxed);
     REPAIR_SITE.store(site, Relaxed);
     REPAIR_IP.store(regs.ip32(), Relaxed);
-    site_penalise(site);
+    if site != 0 {
+        let i = site_entry(site);
+        if SITE_STEP[i].load(Relaxed) != ALWAYS_STEP {
+            SITE_STEP[i].store(PENALTY, Relaxed);
+        }
+    }
     PREDICTED.store(0, Relaxed);
     regs.set_flags32(regs.flags32() | VIF_FLAG);
     regs.clear_flag32(TF_FLAG);
@@ -884,9 +817,23 @@ pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult 
                 // into the armed set (an STI needs no breakpoint — it #GPs on
                 // its own) and the site may then run free.
                 if regs.flags32() & VIF_FLAG != 0 {
+                    // This instruction re-enables interrupts, so it is an EXIT
+                    // of the window we are in. An STI needs no breakpoint (it
+                    // #GPs on its own); a POPF/IRET must be remembered against
+                    // this site so the next window can arm it.
                     let site = CUR_SITE.swap(0, Relaxed);
-                    let armed = op == 0xFB || exit_intern(arch, at);
-                    site_learned(site, armed);
+                    if site != 0 {
+                        let i = site_entry(site);
+                        let ok = op == 0xFB || site_add_exit(i, at);
+                        if !ok {
+                            SITE_STEP[i].store(ALWAYS_STEP, Relaxed);
+                        } else {
+                            let n = SITE_STEP[i].load(Relaxed);
+                            if n != 0 && n != ALWAYS_STEP {
+                                SITE_STEP[i].store(n - 1, Relaxed);
+                            }
+                        }
+                    }
                     PREDICTED.store(0, Relaxed);
                 }
                 continue;
