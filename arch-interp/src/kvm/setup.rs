@@ -17,6 +17,9 @@ pub(super) struct KvmCpu {
     pub vcpu: VcpuFd,
     /// Current KVM_SET_GUEST_DEBUG single-step state (toggle only on change).
     pub single_step: bool,
+    /// The virtual-IF exit breakpoints currently programmed into DR0-3, so an
+    /// unchanged set costs no ioctl (see `run::apply_guest_debug`).
+    pub armed: ([u32; arch_abi::MAX_EXEC_BP], usize),
     /// The vcpu's reset sregs — the template each entry builds on, so fields
     /// this engine doesn't manage (apic_base, interrupt_bitmap) keep the
     /// values KVM expects.
@@ -81,7 +84,7 @@ fn init() -> KvmCpu {
     arm_timer_kick();
 
     let sregs0 = vcpu.get_sregs().expect("KVM_GET_SREGS");
-    KvmCpu { _vm: vm, vcpu, single_step: false, sregs0 }
+    KvmCpu { _vm: vm, vcpu, single_step: false, armed: ([0; arch_abi::MAX_EXEC_BP], 0), sregs0 }
 }
 
 /// Program the real-time preemption kick: a 1 ms CLOCK_MONOTONIC timer signals

@@ -19,8 +19,34 @@ use crate::sysdesc::{
 use arch_abi::monitor::MonitorResult;
 use arch_abi::GuestBytes;
 use arch_abi::{KernelEvent, Regs, UserMode};
-use kvm_bindings::{kvm_guest_debug, kvm_regs, kvm_segment, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP};
+use kvm_bindings::{
+    kvm_guest_debug, kvm_guest_debug_arch, kvm_regs, kvm_segment, KVM_GUESTDBG_ENABLE,
+    KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP,
+};
 use kvm_ioctls::VcpuExit;
+use std::cell::Cell;
+
+/// The virtual-IF exit-breakpoint set the monitor wants armed (`MAX_EXEC_BP`
+/// addresses), recorded here and programmed into DR0-3 at the next guest entry.
+///
+/// Recorded rather than programmed on the spot because
+/// `Arch::set_exec_breakpoints` is called from *inside* the monitor, which runs
+/// inside `with()`'s borrow of the vcpu — re-entering it would double-borrow.
+/// (The TCG engine records for the same reason; see `cpu.rs::sync_exec_bps`.)
+type BpSet = ([u32; arch_abi::MAX_EXEC_BP], usize);
+thread_local! {
+    static WANT_BPS: Cell<BpSet> = const { Cell::new(([0; arch_abi::MAX_EXEC_BP], 0)) };
+}
+
+/// Record the exit-breakpoint set (`Arch::set_exec_breakpoints`). Always
+/// succeeds: DR0-3 are real here (`KVM_GUESTDBG_USE_HW_BP`), so a `Repair`
+/// client runs its critical sections free, exactly as on metal.
+pub fn set_exec_breakpoints(addrs: &[u32]) -> bool {
+    let mut set: BpSet = ([0; arch_abi::MAX_EXEC_BP], addrs.len().min(arch_abi::MAX_EXEC_BP));
+    set.0[..set.1].copy_from_slice(&addrs[..set.1]);
+    WANT_BPS.with(|w| w.set(set));
+    true
+}
 
 /// Per-slice transition trace, gated by `RETRO_TRACE` (checked once). Same
 /// lens as the TCG engine's.
@@ -371,11 +397,17 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             let fl = if_to_vif(eflags) as u64;
             // Preserve the guest's *virtual* IOPL (bits 12-13): the vcpu runs at
             // real IOPL=1 (enter forces it, so CLI/STI trap), but the vIOPL rides
-            // in the saved flags for `virtual_if_stepping` — exactly as metal
-            // stashes it. Forcing it to 1 here would erase the iopl3 policy and
-            // make the monitor single-step even conforming clients.
+            // in the saved flags — it is the thread's `IfMode` — exactly as metal
+            // stashes it. Forcing it to 1 here would erase the policy and make
+            // every client an `Iopl1` one.
+            //
+            // TF likewise comes from the saved flags, not from the guest: KVM
+            // strips TF out of RFLAGS while GUESTDBG_SINGLESTEP is on
+            // (`kvm_get_rflags`), so the CPU cannot tell us whether a step is
+            // still pending. The monitor owns that bit; carry it across the run.
             let viopl = r.frame.rflags & IOPL_MASK as u64;
-            r.frame.rflags = (fl & !IOPL_MASK & !(TF_FLAG as u64)) | viopl;
+            let tf = r.frame.rflags & TF_FLAG as u64;
+            r.frame.rflags = (fl & !IOPL_MASK & !(TF_FLAG as u64)) | viopl | tf;
             if !crate::desc::seg_is_32(ss as u16) {
                 r.frame.rsp &= 0xFFFF;
             }
@@ -432,7 +464,9 @@ fn in_shim(k: &KvmCpu) -> bool {
     sregs.cs.selector == crate::sysdesc::KERNEL_CS || sregs.cs.selector == KERNEL_CS64
 }
 
-/// Arm/disarm hardware single-step (the virtual-IF stepping driver).
+/// Program the guest-debug state for this entry: hardware single-step (the
+/// virtual-IF stepping driver) plus DR0-3 (the learned virtual-IF exit
+/// breakpoints). One ioctl carries both — they are the same register file.
 ///
 /// MUST be called AFTER the entry `KVM_SET_REGS`, and re-issued on every
 /// stepped entry even if already armed: KVM anchors the single-step TF to the
@@ -443,14 +477,44 @@ fn in_shim(k: &KvmCpu) -> bool {
 /// through the VIF=0 stretch, hardware silently drops the POPF/IRET IF
 /// restore, and the client hangs with its virtual IF stuck off (Raptor's
 /// tick-wait loop was the reproducer).
-fn set_single_step(k: &mut KvmCpu, on: bool) {
-    if !on && !k.single_step {
+fn apply_guest_debug(k: &mut KvmCpu, step: bool) {
+    let want = WANT_BPS.with(|w| w.get());
+    // Stepping must re-anchor on every entry (above). Otherwise only a change
+    // needs an ioctl — including the last one that turned stepping off. A
+    // client running free with its interrupts on takes no ioctl at all.
+    if !step && !k.single_step && want == k.armed {
         return;
     }
-    let control = if on { KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP } else { 0 };
-    let dbg = kvm_guest_debug { control, pad: 0, ..Default::default() };
+    // USE_HW_BP stays set even with nothing armed, and an empty set is disarmed
+    // by writing DR7=0 — never by dropping guest debug. Two reasons, and the
+    // second one bites:
+    //  * KVM only *intercepts* #DB while guest_debug has SINGLESTEP or
+    //    USE_HW_BP. Without it a #DB is injected into the guest instead — the
+    //    DPMI client's own vector 1 — which is not ours to hand it.
+    //  * Handing the DR file back does not reliably clear the breakpoints that
+    //    were in it. Disabling on an empty set (`arm()` legitimately asks for
+    //    one: a window whose every exit is an STI needs no breakpoint at all)
+    //    left DOOM's learned POPF address armed in hardware but no longer
+    //    intercepted, so the next pass through it raised a #DB straight into
+    //    DOS/4GW: "exception 01h (debug exception) at 1DF:0065FE4E".
+    let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+    if step {
+        control |= KVM_GUESTDBG_SINGLESTEP;
+    }
+    // DR7: Ln (local enable) per armed slot; RW=00 / LEN=00 is an execute
+    // breakpoint, so the high half stays zero. Bit 10 reads as one on real
+    // hardware. Nothing armed ⇒ DR7 = 0 ⇒ no breakpoint can fire.
+    let mut arch = kvm_guest_debug_arch { debugreg: [0; 8] };
+    let mut dr7: u64 = if want.1 > 0 { 1 << 10 } else { 0 };
+    for (i, &addr) in want.0[..want.1].iter().enumerate() {
+        arch.debugreg[i] = addr as u64;
+        dr7 |= 1 << (2 * i);
+    }
+    arch.debugreg[7] = dr7;
+    let dbg = kvm_guest_debug { control, pad: 0, arch };
     k.vcpu.set_guest_debug(&dbg).expect("KVM_SET_GUEST_DEBUG");
-    k.single_step = on;
+    k.single_step = step;
+    k.armed = want;
 }
 
 /// Run the current Vcpu (`REGS`) until the next kernel-visible event.
@@ -466,21 +530,21 @@ pub fn execute() -> KernelEvent {
         let vcpu = unsafe { &mut *(&raw mut crate::vcpu::REGS) };
         let mode = vcpu.mode();
 
-        // Virtual-IF stepping: while a PM client's virtual IF is off, emulate
-        // the IF-touching opcodes in software; hardware runs only one
-        // non-sensitive instruction at a time (KVM single-step).
-        let mut stepping = false;
-        // Only single-step to catch a POPF/IRET rearm for *non-conforming*
-        // clients (virtual IOPL=3, the `iopl3` policy) — identical to metal's
-        // `virtual_if_stepping` gate in traps.rs. Spec-conforming clients
-        // (vIOPL<3) re-enable via STI/AX=0900-0902, which trap on their own, so
-        // stepping them is pure overhead (DPMI 0.9 §2.13).
-        if mode == UserMode::Mode32
-            && vcpu.flags32() & VIF_FLAG == 0
-            && arch_abi::monitor::virtual_if_stepping(&vcpu.regs)
-        {
+        // Virtual-IF stepping: the monitor owns TF — it sets it when it wants
+        // hardware to retire exactly one instruction, and only ever leaves it
+        // set on a NON-sensitive one. Re-peek here because the kernel may have
+        // moved IP since (an injected ISR frame): emulate any leading
+        // IF-touching opcode in software, so hardware — whose POPF/IRET
+        // silently drops IF at CPL>IOPL — never sees one.
+        //
+        // Which windows step at all is the client's `IfMode`, decided in the
+        // shared gate, not here: `Iopl1` never steps (DPMI 0.9 §2.13 — a
+        // conforming client re-enables via CLI/STI/AX=0900-0902, which fault on
+        // their own), `Repair` steps only until it has learned the window's
+        // exits and then runs free on DR0-3, `Iopl3` steps every window.
+        if mode == UserMode::Mode32 && arch_abi::monitor::stepping(&vcpu.regs) {
             let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
-            let r = arch_abi::monitor::step_virtual_if(&mut crate::backend::Interp, &mut vcpu.regs);
+            let r = arch_abi::monitor::db_gate(&mut crate::backend::Interp, &mut vcpu.regs, false);
             if step_trace_on() {
                 let op = crate::backend::Interp.read::<u8>(crate::desc::seg_base(scs).wrapping_add(sip) as usize);
                 eprintln!(
@@ -493,8 +557,10 @@ pub fn execute() -> KernelEvent {
             if let MonitorResult::Event(ev) = r {
                 return ev;
             }
-            stepping = vcpu.flags32() & VIF_FLAG == 0;
         }
+        // TF is not handed to the CPU (KVM strips it from guest RFLAGS under
+        // GUESTDBG_SINGLESTEP); it is the flag that says "step this entry".
+        let stepping = arch_abi::monitor::stepping(&vcpu.regs);
 
         // The INTR-line check (the TCG block hook's analogue): hand the slice
         // to the kernel when an IRQ is deliverable.
@@ -520,8 +586,8 @@ pub fn execute() -> KernelEvent {
         let mut shim_vec: Option<(u8, u32)> = None;
 
         enter(k, vcpu, mode);
-        // After SET_REGS, never before — see set_single_step.
-        set_single_step(k, stepping);
+        // After SET_REGS, never before — see apply_guest_debug.
+        apply_guest_debug(k, stepping);
 
         // The inner run loop: an EINTR (timer kick) or single-step exit can
         // land while the vcpu is INSIDE the trap shim — the CPL3→CPL0
@@ -536,7 +602,9 @@ pub fn execute() -> KernelEvent {
             Intr,
             Shim,
             Io { port: u16, is_in: bool, bytes: usize },
-            Debug,
+            /// A #DB. `bp` = DR6 B0..B3: one of the armed virtual-IF exit
+            /// breakpoints, as opposed to the single-step trap (BS).
+            Debug { bp: bool },
             BadPhys,
             Shutdown,
         }
@@ -550,7 +618,7 @@ pub fn execute() -> KernelEvent {
                 // the fast path past the shim + monitor.
                 Ok(VcpuExit::IoOut(port, data)) => Kind::Io { port, is_in: false, bytes: data.len() },
                 Ok(VcpuExit::IoIn(port, data)) => Kind::Io { port, is_in: true, bytes: data.len() },
-                Ok(VcpuExit::Debug(_)) => Kind::Debug,
+                Ok(VcpuExit::Debug(d)) => Kind::Debug { bp: d.dr6 & 0xF != 0 },
                 // A guest-physical access outside the memory slot: a page
                 // table pointing at a nonexistent frame (TCG's MEM_UNMAPPED
                 // analogue).
@@ -569,10 +637,22 @@ pub fn execute() -> KernelEvent {
                 Ok(other) => panic!("unhandled KVM exit: {other:?}"),
             };
             match kind {
-                Kind::Intr | Kind::Debug if in_shim(k) => continue,
+                Kind::Intr | Kind::Debug { .. } if in_shim(k) => continue,
                 Kind::Intr => {
                     sync_out(k, vcpu, mode);
                     break Some(KernelEvent::Irq);
+                }
+                // An armed exit breakpoint: an execute breakpoint is a FAULT, so
+                // the instruction under it has NOT run. The gate emulates it,
+                // which closes the window and restores virtual IF with no
+                // stepping at all — the whole point of `IfMode::Repair`, and
+                // bit-for-bit what metal's DR6 B0..B3 path does.
+                Kind::Debug { bp: true } => {
+                    sync_out(k, vcpu, mode);
+                    match arch_abi::monitor::db_gate(&mut crate::backend::Interp, &mut vcpu.regs, true) {
+                        MonitorResult::Event(ev) => break Some(ev),
+                        MonitorResult::Resume => break None, // re-enter at the (emulated) IP
+                    }
                 }
                 // The single stepped instruction retired: re-check the next
                 // one IN PLACE. The vcpu's live state already equals `vcpu`
@@ -582,12 +662,12 @@ pub fn execute() -> KernelEvent {
                 // KVM_SET_GUEST_DEBUG and another KVM_RUN. Without this fast
                 // path every stepped instruction pays the full entry cost
                 // (including the GDT/LDT copy) and CLI-heavy games crawl.
-                Kind::Debug => {
+                Kind::Debug { bp: false } => {
                     sync_out(k, vcpu, mode);
-                    if stepping && mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
+                    if stepping && mode == UserMode::Mode32 && arch_abi::monitor::stepping(&vcpu.regs) {
                         let (scs, sip) = (vcpu.code_seg(), vcpu.ip32());
                         let snap_fl = vcpu.flags32() & !TF_FLAG;
-                        let r = arch_abi::monitor::step_virtual_if(&mut crate::backend::Interp, &mut vcpu.regs);
+                        let r = arch_abi::monitor::db_gate(&mut crate::backend::Interp, &mut vcpu.regs, false);
                         if step_trace_on() {
                             eprintln!(
                                 "[step] {scs:#06x}:{sip:#010x} (fast) -> ip={:#010x} vif={} r={}",
@@ -602,7 +682,7 @@ pub fn execute() -> KernelEvent {
                                 if vcpu.ip32() == sip && vcpu.flags32() & !TF_FLAG == snap_fl {
                                     // Next opcode is non-sensitive: step it on
                                     // the live vcpu state.
-                                    set_single_step(k, true); // re-anchor at the new RIP
+                                    apply_guest_debug(k, true); // re-anchor at the new RIP
                                     continue;
                                 }
                                 // The monitor emulated an instruction (IP or
@@ -781,8 +861,20 @@ fn dispatch_shim(
     // e.g. a selector-load fault) is a genuine #GP, typed Exception(13) below
     // with the error code preserved.
     if n == 13 {
+        // Where the faulting instruction lives, and whether virtual IF was on
+        // before it ran: a 1 -> 0 transition is the site that OPENS an
+        // interrupts-off window, which is what the gate keys its learned exit
+        // breakpoints on.
+        let entry_ip = vcpu.ip32();
+        let vif_was_on = vcpu.flags32() & VIF_FLAG != 0;
         match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
-            MonitorResult::Resume => return None,
+            MonitorResult::Resume => {
+                // Hand the window to the virtual-IF gate: it either arms this
+                // site's learned exits (DR0-3, next entry) and lets the client
+                // run at full speed, or falls back to stepping to learn them.
+                arch_abi::monitor::gp_gate(&mut crate::backend::Interp, &mut vcpu.regs, entry_ip, vif_was_on);
+                return None;
+            }
             MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
             MonitorResult::Event(ev) => return Some(ev),
         }

@@ -709,6 +709,17 @@ pub fn exit_thread<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, t
     threads[tid].kernel.state = ThreadState::Zombie;
     crate::dbg_println!("[mem] exit tid={} code={} free_pages={}",
         tid, exit_code, machine.free_page_count());
+    // What the virtual-IF machinery did for this client. `steps` is the number
+    // that matters: a client whose windows are all predicted pays none, and one
+    // that has silently fallen back to stepping pays ~2500x for every one of
+    // them. It is also the cross-backend parity check — metal, TCG and KVM
+    // should report the same shape for the same program.
+    let (windows, predicted, bp_hits, steps, repairs) = arch_abi::monitor::vif_stats();
+    if windows != 0 {
+        crate::dbg_println!(
+            "[vif] windows={} predicted={} bp_hits={} steps={} repairs={}",
+            windows, predicted, bp_hits, steps, repairs);
+    }
 
     // Hand focus back to the parent that spawned us — it's the natural caller
     // of wait4. Covers "parent was Blocked on wait4 and we just woke it" and

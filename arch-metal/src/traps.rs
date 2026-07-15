@@ -635,7 +635,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 /// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
 /// are handled inline by arch before bubbling.
 fn isr_handler_ring3(regs: &mut Regs) {
-    use crate::monitor::{monitor, step_virtual_if, virtual_if_stepping, KernelEvent as KE, MonitorResult};
+    use crate::monitor::{monitor, KernelEvent as KE, MonitorResult};
     use arch_abi::UserMode;
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
@@ -659,14 +659,15 @@ fn isr_handler_ring3(regs: &mut Regs) {
             //
             // Emulating it here is what closes the window and restores VIF
             // without a single step in sight.
-            if dr6 & 0xF != 0 {
+            let bp_hit = dr6 & 0xF != 0;
+            if bp_hit {
                 unsafe { x86::write_dr6(0) };
-                if crate::monitor::exec_bp_hit(regs) {
-                    return;
-                }
             }
+            // The step tracer never gets to eat a breakpoint #DB: the
+            // instruction under it has NOT run, so returning with TF on (and
+            // without emulating it) re-faults on the same address forever.
             let budget = arch_abi::PM_STEP_BUDGET.load(Ordering::Relaxed);
-            if budget > 0 {
+            if budget > 0 && !bp_hit {
                 // Log step in PM and VM86 — VM86 logging needed to trace
                 // RM execution after a raw PM->RM switch. The DOS-layer tracer
                 // takes a `&Vcpu`; wrap the trap frame in a throwaway vcpu view
@@ -677,11 +678,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 regs.set_flag32(1 << 8); // keep TF on
                 return;
             }
-            if virtual_if_stepping(regs) {
-                let _ = step_virtual_if(regs);
-            } else {
-                regs.clear_flag32(1 << 8);
-            }
+            let _ = crate::monitor::db_gate(regs, bp_hit);
             return;
         }
         13 => {
@@ -705,14 +702,9 @@ fn isr_handler_ring3(regs: &mut Regs) {
             match monitor(regs) {
                 MonitorResult::Resume => {
                     // Hand the window to the virtual-IF gate: it either arms the
-                    // learned exit breakpoint and lets the client run at full
-                    // speed, or falls back to single-stepping to learn it.
-                    // Skipped when TF stepping is disabled — DPMI 0.9 §2.13 says
-                    // POPF/IRET aren't required to affect virtual IF, so
-                    // spec-conforming clients use CLI/STI/AX=0900-0902 only.
-                    if virtual_if_stepping(regs) && regs.mode() != UserMode::VM86 {
-                        let _ = crate::monitor::if_gate(regs, entry_ip, vif_was_on);
-                    }
+                    // learned exit breakpoints and lets the client run at full
+                    // speed, or falls back to single-stepping to learn them.
+                    crate::monitor::gp_gate(regs, entry_ip, vif_was_on);
                     if regs.flags32() & VIF_VIP != VIF_VIP {
                         return;
                     }

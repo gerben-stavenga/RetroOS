@@ -573,6 +573,38 @@ pub static REPAIRS: AtomicU32 = AtomicU32::new(0);
 pub static REPAIR_SITE: AtomicU32 = AtomicU32::new(0);
 pub static REPAIR_IP: AtomicU32 = AtomicU32::new(0);
 
+/// What the virtual-IF machinery actually did, per client. Without these the
+/// only symptom of a mode that silently degraded to stepping is "the game feels
+/// slow" — a #DB step never reaches the kernel event loop, so nothing else in
+/// the system can see one. They are also the parity check between backends: the
+/// same client on metal, TCG and KVM must produce the same shape of numbers.
+pub static WINDOWS: AtomicU32 = AtomicU32::new(0); // interrupts-off windows opened
+pub static PREDICTED_WINDOWS: AtomicU32 = AtomicU32::new(0); // ...run free on learned exits
+pub static BP_HITS: AtomicU32 = AtomicU32::new(0); // ...and closed by an exit breakpoint
+pub static HW_STEPS: AtomicU32 = AtomicU32::new(0); // single steps handed to hardware
+
+/// Count one single-stepped instruction a backend retired on its own, without
+/// coming back through [`step_virtual_if`]. A backend is allowed to keep
+/// stepping in place while the next opcode is non-sensitive (both hosted engines
+/// do — it saves a full slice exit per instruction); the step still happened and
+/// still costs, so it still counts. Without this the fast path would make a
+/// stepping client look free.
+#[inline]
+pub fn count_hw_step() {
+    HW_STEPS.fetch_add(1, Relaxed);
+}
+
+/// `(windows, predicted, bp_hits, hw_steps, repairs)` — see the statics above.
+pub fn vif_stats() -> (u32, u32, u32, u32, u32) {
+    (
+        WINDOWS.load(Relaxed),
+        PREDICTED_WINDOWS.load(Relaxed),
+        BP_HITS.load(Relaxed),
+        HW_STEPS.load(Relaxed),
+        REPAIRS.load(Relaxed),
+    )
+}
+
 fn slot(ip: u32) -> usize {
     ((ip ^ (ip >> 5) ^ (ip >> 11)) as usize) % SITES
 }
@@ -649,6 +681,10 @@ pub fn forget_if_windows() {
     ARMED_N.store(0, Relaxed);
     CUR_SITE.store(0, Relaxed);
     PREDICTED.store(0, Relaxed);
+    // The stats describe one program's windows, so they reset with them.
+    for c in [&WINDOWS, &PREDICTED_WINDOWS, &BP_HITS, &HW_STEPS, &REPAIRS] {
+        c.store(0, Relaxed);
+    }
 }
 
 /// Is the current window running free on its breakpoints rather than being
@@ -697,12 +733,14 @@ pub fn if_gate<A: Arch>(
     // VIF just went 1 -> 0: a new window opens at `entry_ip`.
     CUR_SITE.store(entry_ip, Relaxed);
     CUR_SP.store(regs.sp32(), Relaxed);
+    WINDOWS.fetch_add(1, Relaxed);
     // Iopl3 is the reference path: always step, never predict.
     if if_mode(regs) != IfMode::Iopl3
         && let Some(i) = site_find(entry_ip)
         && SITE_STEP[i].load(Relaxed) == 0
         && arm(arch, i)
     {
+        PREDICTED_WINDOWS.fetch_add(1, Relaxed);
         PREDICTED.store(1, Relaxed);
         regs.clear_flag32(TF_FLAG);
         return MonitorResult::Resume;
@@ -718,6 +756,7 @@ pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
     if !is_armed(regs.ip32()) {
         return false;
     }
+    BP_HITS.fetch_add(1, Relaxed);
     let ev = monitor_rs::<A>(arch, regs);
     if regs.flags32() & VIF_FLAG != 0 {
         CUR_SITE.store(0, Relaxed);
@@ -725,6 +764,63 @@ pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
         regs.clear_flag32(TF_FLAG);
     }
     matches!(ev, MonitorResult::Resume)
+}
+
+// =============================================================================
+// The driver gates
+// =============================================================================
+//
+// Every backend that runs a ring-3 guest hits the same two decision points: a
+// #GP the monitor just finished, and a #DB. What to do at each is POLICY and
+// lives here — hand-writing it per driver is exactly how metal, TCG and KVM
+// drifted into three different virtual-IF implementations. A driver supplies
+// only the two machine facts it alone knows (where the faulting instruction
+// was; whether the #DB was an exec breakpoint) and calls these.
+
+/// A #GP the monitor resumed: hand the window to the virtual-IF gate, which
+/// either arms this site's learned exits and lets the client run free, or falls
+/// back to single-stepping to learn them.
+///
+/// `entry_ip` is where the resumed instruction lived and `vif_was_on` is VIF as
+/// it stood *before* it ran — a 1 -> 0 transition is the site that OPENS an
+/// interrupts-off window, which is what the learned breakpoints are keyed on.
+///
+/// Skipped for `Iopl1` clients (DPMI 0.9 §2.13 lets a host ignore POPF/IRET, so
+/// a conforming client re-enables via CLI/STI/AX=0900-0902, which fault on their
+/// own) and in VM86 (where every IF-touching op faults, so nothing can be lost).
+pub fn gp_gate<A: Arch>(arch: &mut A, regs: &mut Regs, entry_ip: u32, vif_was_on: bool) {
+    if virtual_if_stepping(regs) && regs.mode() != UserMode::VM86 {
+        let _ = if_gate(arch, regs, entry_ip, vif_was_on);
+    }
+}
+
+/// A #DB: either one of our learned exit breakpoints (`bp_hit`, from DR6 B0..B3
+/// on metal / KVM, from the code-hook address on TCG) or the single-step trap
+/// that the stepping path armed. `bp_hit` closes the window without a step;
+/// otherwise re-check the next opcode. TF is cleared for a client that isn't
+/// stepping at all — nothing in the kernel arms it, but a stale bit in the
+/// client's flags would loop.
+pub fn db_gate<A: Arch>(arch: &mut A, regs: &mut Regs, bp_hit: bool) -> MonitorResult {
+    if bp_hit && exec_bp_hit(arch, regs) {
+        return MonitorResult::Resume;
+    }
+    if virtual_if_stepping(regs) {
+        step_virtual_if(arch, regs)
+    } else {
+        regs.clear_flag32(TF_FLAG);
+        MonitorResult::Resume
+    }
+}
+
+/// Is a hardware single step pending for this guest? The monitor owns TF: it
+/// sets it when it wants hardware to retire exactly one (non-sensitive)
+/// instruction and clears it when the window closes. Drivers ask this instead of
+/// inferring "VIF is off, so step" — that inference is what made `Repair` and
+/// `Iopl1` unrepresentable on the hosted engines, which stepped every window
+/// regardless of the client's [`IfMode`].
+#[inline]
+pub fn stepping(regs: &Regs) -> bool {
+    regs.flags32() & TF_FLAG != 0
 }
 
 /// Repair a virtual IF we lost, and re-open the site that lost it for learning.
@@ -804,6 +900,7 @@ pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult 
         if !must_emulate {
             // Non-sensitive instruction — let hardware execute one step, then
             // #DB brings us back to re-check.
+            HW_STEPS.fetch_add(1, Relaxed);
             regs.set_flag32(TF_FLAG);
             return MonitorResult::Resume;
         }
@@ -843,6 +940,7 @@ pub fn step_virtual_if<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult 
     }
 
     // Budget exhausted — back off to hardware stepping for a while.
+    HW_STEPS.fetch_add(1, Relaxed);
     regs.set_flag32(TF_FLAG);
     MonitorResult::Resume
 }

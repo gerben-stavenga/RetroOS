@@ -45,16 +45,17 @@ pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
     arch_abi::monitor::step_virtual_if(&mut crate::backend::Metal, regs)
 }
 
-/// Virtual-IF window gate — see [`arch_abi::monitor::if_gate`].
+/// Post-#GP virtual-IF gate — see [`arch_abi::monitor::gp_gate`].
 #[inline]
-pub fn if_gate(regs: &mut Regs, entry_ip: u32, vif_was_on: bool) -> MonitorResult {
-    arch_abi::monitor::if_gate(&mut crate::backend::Metal, regs, entry_ip, vif_was_on)
+pub fn gp_gate(regs: &mut Regs, entry_ip: u32, vif_was_on: bool) {
+    arch_abi::monitor::gp_gate(&mut crate::backend::Metal, regs, entry_ip, vif_was_on)
 }
 
-/// A DR3 execute breakpoint fired — see [`arch_abi::monitor::exec_bp_hit`].
+/// #DB gate: exit breakpoint (DR6 B0..B3) or single-step — see
+/// [`arch_abi::monitor::db_gate`].
 #[inline]
-pub fn exec_bp_hit(regs: &mut Regs) -> bool {
-    arch_abi::monitor::exec_bp_hit(&mut crate::backend::Metal, regs)
+pub fn db_gate(regs: &mut Regs, bp_hit: bool) -> MonitorResult {
+    arch_abi::monitor::db_gate(&mut crate::backend::Metal, regs, bp_hit)
 }
 
 /// SW equivalent of the CPU's VM86 INT dispatch — see

@@ -70,6 +70,9 @@ mod sysdesc;
 mod tty;
 mod vcpu;
 mod vga;
+/// The virtual-IF (`IfMode`) proofs — same source, both engines.
+#[cfg(test)]
+mod vif_tests;
 
 pub use backend::Interp;
 pub use calls::*;
