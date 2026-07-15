@@ -20,6 +20,10 @@ pub struct PortIo {
     pub outb: fn(u16, u8),
     pub outw: fn(u16, u16),
     pub outl: fn(u16, u32),
+    /// Bulk word write — one `rep outsw` on metal. The write-direction twin of
+    /// `insw`: the block driver writes the ATA data register 256 times per
+    /// sector, so a WRITE needs the batched form for the same reason a READ does.
+    pub outsw: fn(u16, &[u16]),
 }
 
 const NONE: PortIo = PortIo {
@@ -30,6 +34,7 @@ const NONE: PortIo = PortIo {
     outb: |_, _| {},
     outw: |_, _| {},
     outl: |_, _| {},
+    outsw: |_, _| {},
 };
 
 static mut HOOKS: PortIo = NONE;
@@ -73,4 +78,8 @@ pub fn outw(port: u16, val: u16) {
 #[inline]
 pub fn outl(port: u16, val: u32) {
     (hooks().outl)(port, val)
+}
+#[inline]
+pub fn outsw(port: u16, buf: &[u16]) {
+    (hooks().outsw)(port, buf)
 }

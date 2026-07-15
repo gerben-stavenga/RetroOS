@@ -1,0 +1,48 @@
+# lwext4 (gkostka, pinned in MODULE.bazel) compiled freestanding for the i686
+# metal kernel. The bare CC toolchain is link-only (dummy `ar`), so — like the
+# `bootfs_obj` genrule shelling out to host `objcopy` — this shells out to host
+# `clang` with `--target=i686-unknown-none-elf` (which fixes codegen regardless
+# of the host clang version) and combines the objects into one relocatable
+# `lwext4.o`, linked into kernel.elf via `-Clink-arg` (see //kernel).
+#
+# `-march=i486` is load-bearing: the project's default arch is 386 (QEMU
+# `-cpu 486`), which has no CMOV. Without it, clang emits CMOV for the i686
+# target and the guest #UDs the instant it enters lwext4 (at mount). i486
+# codegen runs on every supported CPU (486/686/x64).
+#
+# Config is defines-only (no CMake-generated header): default cfg, own errno,
+# debug/asserts off. lwext4's only libc needs are 4 freestanding shim headers
+# (shim/) plus ~9 symbols the kernel provides (memcpy/… from compiler-builtins,
+# malloc/free/str*/qsort from the kernel shim). GPLv2 — see //third_party/lwext4
+# note in MODULE.bazel; fetched at build time, never vendored.
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["restricted"])  # GPL-2.0 (ext4_extents.c); scoped to the lwext4 feature
+
+genrule(
+    name = "lwext4_obj",
+    srcs = [
+        "@lwext4//:srcs",
+    ] + glob(["shim/*.h"]),
+    outs = ["lwext4.o"],
+    cmd = """
+set -e
+SHIM=$$(dirname $(location shim/string.h))
+INC=""
+for f in $(locations @lwext4//:srcs); do
+  case "$$f" in */include/ext4.h) INC="$${f%/ext4.h}";; esac
+done
+ROOT="$${INC%/include}"
+mkdir -p lwext4_obj
+for c in "$$ROOT"/src/*.c; do
+  clang --target=i686-unknown-none-elf -march=i486 -ffreestanding -nostdlibinc -Os \
+    -fno-stack-protector -mno-sse -mno-mmx \
+    -I"$$SHIM" -I"$$ROOT/include" \
+    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_HAVE_OWN_ERRNO=1 \
+    -DCONFIG_DEBUG_PRINTF=0 -DCONFIG_DEBUG_ASSERT=0 \
+    -c "$$c" -o "lwext4_obj/$$(basename $${c%.c}).o"
+done
+ld -r -m elf_i386 -o $(location lwext4.o) lwext4_obj/*.o
+""",
+)

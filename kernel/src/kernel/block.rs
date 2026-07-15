@@ -2,7 +2,7 @@
 //! whichever disk this machine actually has.
 //!
 //! Detection happens once at startup, below the filesystem layer, so
-//! tarfs/ext4fs/MBR code is identical on every platform:
+//! tarfs/lwext4/MBR code is identical on every platform:
 //!   - ATA PIO (legacy BIOS machines, QEMU/Bochs/86Box IDE, the interpreter's
 //!     emulated controller) — probed first, bounded, no hang on absent ports.
 //!   - NVMe (UEFI-class machines: the run_uefi.sh mock, modern laptops).
@@ -41,5 +41,16 @@ pub fn read_sectors(lba: u32, buffer: &mut [u8]) -> u32 {
             buffer.fill(0);
             0
         }
+    }
+}
+
+/// Write `buffer.len().div_ceil(512)` sectors starting at `lba`. Used by the
+/// backing-file overlay to persist writes through the raw disk, bypassing the
+/// read-only ext4 layer entirely. Returns sectors written (0 = no device).
+pub fn write_sectors(lba: u32, buffer: &[u8]) -> u32 {
+    match KIND.load(Ordering::Relaxed) {
+        ATA => hdd::write_sectors(lba, buffer),
+        NVME => nvme::write_sectors(lba, buffer),
+        _ => 0,
     }
 }

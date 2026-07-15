@@ -368,11 +368,7 @@ fn gpt_collect_ext(out: &mut [u32]) -> usize {
 /// laptop with a data partition AND the real root) gives no order guarantee, so
 /// we sniff the layout to mount the right one at VFS /.
 fn is_linux_root(lba: u32) -> bool {
-    use crate::kernel::vfs::Filesystem;
-    match crate::kernel::ext4fs::Ext4Fs::new(lba) {
-        Ok(fs) => fs.dir_exists(b"etc") && fs.dir_exists(b"usr"),
-        Err(_) => false,
-    }
+    crate::kernel::lwext4::is_linux_root(lba)
 }
 
 fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
@@ -406,9 +402,13 @@ fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
         // real Linux root); GPT/MBR order doesn't say which is the root. Mount
         // the one that looks like a Linux root (/etc + /usr) at VFS /; fall back
         // to the first if none matches (e.g. the RetroOS image's own ext4).
+        // Only sniff when there's ambiguity: a single ext partition IS the root
+        // (and probing would needlessly mount/unmount it via lwext4).
         let mut root_idx = 0;
-        for (i, &p) in parts.iter().enumerate().take(n) {
-            if is_linux_root(p) { root_idx = i; break; }
+        if n > 1 {
+            for (i, &p) in parts.iter().enumerate().take(n) {
+                if is_linux_root(p) { root_idx = i; break; }
+            }
         }
         // The remaining ext partitions mount as C:\DISK1, C:\DISK2, …
         let mut extra_ext = [0u32; 3];

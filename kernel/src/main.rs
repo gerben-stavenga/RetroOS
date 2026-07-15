@@ -215,6 +215,7 @@ fn install_hosted_backend() {
         outb: arch::outb,
         outw: arch::outw,
         outl: arch::outl,
+        outsw: arch::outsw,
     });
     kernel::set_host_env(kernel::HostEnv {
         fbcon_active: || false,

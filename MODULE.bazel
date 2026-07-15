@@ -85,14 +85,6 @@ http_archive(
 )
 
 http_archive(
-    name = "ext4_view",
-    url = "https://static.crates.io/crates/ext4-view/ext4-view-0.9.3.crate",
-    type = "tar.gz",
-    strip_prefix = "ext4-view-0.9.3",
-    build_file = "//stdlib:ext4_view.BUILD",
-)
-
-http_archive(
     name = "spin",
     url = "https://static.crates.io/crates/spin/spin-0.9.8.crate",
     type = "tar.gz",
@@ -145,6 +137,45 @@ http_archive(
 )""",
 )
 
+# ---- lwext4: the C ext4 filesystem library (writable ext4) -----------------
+# gkostka/lwext4 upstream, pinned. Compiled freestanding for i686 by
+# //third_party/lwext4 (host clang via genrule, --target=i686-unknown-none-elf
+# fixes codegen). GPLv2 (ext4_extents.c) — fetched at build time, never in the
+# repo, so RetroOS's own sources stay permissive; binaries built with the
+# `lwext4` feature are GPLv2 as distributed. See //third_party/lwext4.
+http_archive(
+    name = "lwext4",
+    url = "https://github.com/gkostka/lwext4/archive/58bcf89a121b72d4fb66334f1693d3b30e4cb9c5.tar.gz",
+    sha256 = "8f7cce20f5dad2719cb22982e64c75069af51741555c98d34a247a5d8f154890",
+    strip_prefix = "lwext4-58bcf89a121b72d4fb66334f1693d3b30e4cb9c5",
+    build_file_content = """
+filegroup(
+    name = "srcs",
+    srcs = glob(["src/**", "include/**"]),
+    visibility = ["//visibility:public"],
+)
+
+# Host build: a normal cc_library (the HOST cc toolchain has a real `ar`,
+# unlike the bare-metal one). Linked into the hosted entry binaries so the
+# kernel's backend-agnostic Lwext4Fs resolves ext4_* on hosted too (the fs
+# library is linked into both backends). On host, lwext4 uses the system libc,
+# so no cshim is needed (that's metal-only, in arch-metal).
+cc_library(
+    name = "lwext4_host",
+    srcs = glob(["src/*.c"]),
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    copts = [
+        "-DCONFIG_USE_DEFAULT_CFG=1",
+        "-DCONFIG_DEBUG_PRINTF=0",
+        "-DCONFIG_DEBUG_ASSERT=0",
+        "-w",
+    ],
+    visibility = ["//visibility:public"],
+)
+""",
+)
+
 # ---- crate_universe: third-party Rust dependencies (Bazel-only) -----------
 # Third-party crates, declared directly (no cargo, no Cargo.toml manifests):
 # `crate.spec` + `crate.from_specs` resolve against crates.io and pin in
@@ -169,7 +200,6 @@ crate.spec(
 )
 
 # Kernel (hosted).
-crate.spec(package = "ext4-view", version = "0.9.3")
 crate.spec(package = "rustc-demangle", version = "0.1.24")
 crate.spec(
     package = "spin",

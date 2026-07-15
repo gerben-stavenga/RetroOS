@@ -1,5 +1,5 @@
 {
-  "checksum": "08bc21b74a4576449cd4ac599b649c7eba3b4106e1282b5a8cbd8d60dac852e5",
+  "checksum": "e7d326c0c788938c74a4a12e55648d978613ba39686d36394e97f880cd44fe7e",
   "crates": {
     "aho-corasick 1.1.4": {
       "name": "aho-corasick",
@@ -563,93 +563,6 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "crc 3.4.0": {
-      "name": "crc",
-      "version": "3.4.0",
-      "package_url": "https://github.com/mrhooray/crc-rs.git",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/crc/3.4.0/download",
-          "sha256": "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "crc",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "crc",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "deps": {
-          "common": [
-            {
-              "id": "crc-catalog 2.5.0",
-              "target": "crc_catalog"
-            }
-          ],
-          "selects": {}
-        },
-        "edition": "2021",
-        "version": "3.4.0"
-      },
-      "license": "MIT OR Apache-2.0",
-      "license_ids": [
-        "Apache-2.0",
-        "MIT"
-      ],
-      "license_file": "LICENSE-APACHE"
-    },
-    "crc-catalog 2.5.0": {
-      "name": "crc-catalog",
-      "version": "2.5.0",
-      "package_url": "https://github.com/akhilles/crc-catalog.git",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/crc-catalog/2.5.0/download",
-          "sha256": "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "crc_catalog",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "crc_catalog",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "edition": "2018",
-        "version": "2.5.0"
-      },
-      "license": "MIT OR Apache-2.0",
-      "license_ids": [
-        "Apache-2.0",
-        "MIT"
-      ],
-      "license_file": "LICENSES"
-    },
     "direct-cargo-bazel-deps 0.0.1": {
       "name": "direct-cargo-bazel-deps",
       "version": "0.0.1",
@@ -676,10 +589,6 @@
         ],
         "deps": {
           "common": [
-            {
-              "id": "ext4-view 0.9.3",
-              "target": "ext4_view"
-            },
             {
               "id": "kvm-bindings 0.14.1",
               "target": "kvm_bindings"
@@ -749,58 +658,6 @@
         ],
         "edition": "2021",
         "version": "1.16.0"
-      },
-      "license": "MIT OR Apache-2.0",
-      "license_ids": [
-        "Apache-2.0",
-        "MIT"
-      ],
-      "license_file": "LICENSE-APACHE"
-    },
-    "ext4-view 0.9.3": {
-      "name": "ext4-view",
-      "version": "0.9.3",
-      "package_url": "https://github.com/nicholasbishop/ext4-view-rs",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/ext4-view/0.9.3/download",
-          "sha256": "ecf18f4817ea4baf95d700eb763642e65f77a94e630867028024b6725848a028"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "ext4_view",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "ext4_view",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "deps": {
-          "common": [
-            {
-              "id": "bitflags 2.13.0",
-              "target": "bitflags"
-            },
-            {
-              "id": "crc 3.4.0",
-              "target": "crc"
-            }
-          ],
-          "selects": {}
-        },
-        "edition": "2021",
-        "version": "0.9.3"
       },
       "license": "MIT OR Apache-2.0",
       "license_ids": [
@@ -2760,7 +2617,6 @@
     ]
   },
   "direct_deps": [
-    "ext4-view 0.9.3",
     "kvm-bindings 0.14.1",
     "kvm-ioctls 0.24.0",
     "libc 0.2.186",

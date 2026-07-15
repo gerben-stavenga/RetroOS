@@ -3,7 +3,7 @@
 //! Simple polling-based driver for reading sectors from the primary ATA disk.
 //! Uses LBA28 addressing mode, supporting disks up to 128GB.
 
-use crate::kernel::portio::{inb, insw, outb};
+use crate::kernel::portio::{inb, insw, outb, outsw};
 
 /// ATA register offsets from base port
 mod reg {
@@ -28,6 +28,8 @@ mod status {
 /// ATA commands
 mod cmd {
     pub const READ_SECTORS: u8 = 0x20;
+    pub const WRITE_SECTORS: u8 = 0x30;
+    pub const CACHE_FLUSH: u8 = 0xE7;
 }
 
 /// Primary ATA controller base port
@@ -154,5 +156,73 @@ pub fn read_sectors(lba: u32, mut  buffer: &mut [u8]) -> u32 {
             buffer = &mut buffer[n..];
         }
     }
+    count
+}
+
+/// Write sectors to disk using LBA28 addressing — the write-direction twin of
+/// [`read_sectors`], same batching and same `outsw`-per-sector rationale.
+///
+/// A short final chunk (buffer not a 512-multiple) is zero-padded to a full
+/// sector, since a sector is the atomic unit of the transfer. The backing-file
+/// overlay always writes block-aligned, so this padding is a safety net, not a
+/// hot path.
+///
+/// # Arguments
+/// * `lba` - Logical Block Address (sector number, 0-indexed)
+/// * `buffer` - Source bytes; `buffer.len().div_ceil(512)` sectors are written
+pub fn write_sectors(lba: u32, mut buffer: &[u8]) -> u32 {
+    let count = buffer.len().div_ceil(512) as u32;
+    debug_assert!(lba + count <= (1 << 28), "LBA28 overflow");
+
+    let port = PRIMARY_BASE;
+    let slave = 0u8; // Master drive
+
+    let mut remaining = count;
+    let mut current_lba = lba;
+
+    while remaining > 0 {
+        // Can only request up to 256 sectors at a time (0 means 256)
+        let batch = if remaining > 256 { 256 } else { remaining };
+        let sector_count = if batch == 256 { 0u8 } else { batch as u8 };
+
+        wait_disk_ready(port);
+
+        // Same register programming as the read, only the command differs.
+        outb(port + reg::LBA_24_27_FLAGS,
+             ((current_lba >> 24) as u8 & 0x0F) | 0xE0 | (slave << 4));
+        outb(port + reg::FEATURES, 0);
+        outb(port + reg::SECTOR_COUNT, sector_count);
+        outb(port + reg::LBA_0_7, current_lba as u8);
+        outb(port + reg::LBA_8_15, (current_lba >> 8) as u8);
+        outb(port + reg::LBA_16_23, (current_lba >> 16) as u8);
+        outb(port + reg::COMMAND, cmd::WRITE_SECTORS);
+
+        remaining -= batch;
+        current_lba += batch;
+
+        // One `rep outsw` per sector — the same VM-exit amortization as the
+        // read side (256 discrete `out`s per sector would be 256 exits).
+        for _ in 0..batch {
+            wait_data_ready(port);
+
+            let mut bytes = [0u8; 512];
+            let n = buffer.len().min(512);
+            bytes[..n].copy_from_slice(&buffer[..n]); // tail (< 512) stays zero
+            buffer = &buffer[n..];
+
+            let mut words = [0u16; 256];
+            for (w, pair) in words.iter_mut().zip(bytes.chunks_exact(2)) {
+                *w = u16::from_le_bytes([pair[0], pair[1]]);
+            }
+            outsw(port + reg::DATA, &words);
+        }
+    }
+
+    // Flush the drive's write cache so the data is durable before we report
+    // success — the whole point of the backing-file overlay is persistence.
+    wait_disk_ready(port);
+    outb(port + reg::COMMAND, cmd::CACHE_FLUSH);
+    wait_disk_ready(port);
+
     count
 }
