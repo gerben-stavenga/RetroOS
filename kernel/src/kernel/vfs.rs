@@ -40,7 +40,7 @@ const RAM_SENTINEL: u64 = u64::MAX;
 /// Maximum length of a normalized path key
 const PATH_KEY_MAX: usize = 164;
 
-/// Filesystem trait — implemented by TarFs, Ext4Fs, etc. POSIX-strict; the
+/// Filesystem trait — implemented by TarFs, Lwext4Fs, etc. POSIX-strict; the
 /// DOS personality wraps this layer with its own case-folding cache (DFS).
 ///
 /// This is 9P-shaped: `open(path)` is a fused Twalk+Topen returning a fid
@@ -75,7 +75,7 @@ pub trait Filesystem {
     /// Release a fid (Tclunk). Called by the VFS when the last reference to an
     /// open file closes (`close_handle`). Default = no-op, for backends whose
     /// handle owns no per-open resource (TarFs's archive offset). Backends that
-    /// allocate per-open server state — ext4's `File` cursor, hostfs's COM1 /
+    /// allocate per-open server state — lwext4's file handle, hostfs's COM1 /
     /// native fid, a future 9P client — override this to free it.
     fn clunk(&self, _handle: u64) {}
 
@@ -742,7 +742,7 @@ impl Vfs {
 }
 
 // `Vfs` holds `&'static dyn Filesystem`, and some backends are not thread-safe
-// in isolation (the ext4 wrapper uses `Rc`/`RefCell` because `ext4_view` is
+// in isolation (the lwext4 wrapper uses `RefCell`, and lwext4's C state is
 // single-threaded). This `Send` is nonetheless sound — and SMP-correct, not a
 // single-core assumption — because *every* filesystem access goes through
 // `&mut self` while the VFS `spin::Mutex` is held, so no filesystem (and no

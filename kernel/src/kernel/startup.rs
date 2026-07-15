@@ -2,18 +2,15 @@
 
 extern crate alloc;
 
-extern crate ext4_view;
-
-
 use crate::Regs;
-use crate::kernel::{vfs, tarfs::TarFs, ext4fs::Ext4Fs};
+use crate::kernel::{vfs, tarfs::TarFs, lwext4::Lwext4Fs};
 use crate::kernel::thread;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
 static mut ROOT_TARFS: TarFs = TarFs::new(0);
 
 /// Ext4 filesystem (heap-allocated at boot, leaked to get &'static)
-static mut EXT4_FS: Option<&'static Ext4Fs> = None;
+static mut EXT4_FS: Option<&'static Lwext4Fs> = None;
 
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
@@ -80,7 +77,7 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform, scree
     match platform.media {
         Media::DiskRoot { ext4_lba, extra_ext, hostfs } => {
             crate::screenln!(screen, "ext4 root at sector {:#x}", ext4_lba);
-            match Ext4Fs::new(ext4_lba) {
+            match Lwext4Fs::new(ext4_lba, 0) {
                 Ok(fs) => {
                     let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                     unsafe { EXT4_FS = Some(leaked); }
@@ -97,7 +94,7 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform, scree
                 if lba == 0 {
                     continue;
                 }
-                match Ext4Fs::new(lba) {
+                match Lwext4Fs::new(lba, i + 1) {
                     Ok(fs) => {
                         let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                         vfs::mount(SUBDIRS[i], leaked);

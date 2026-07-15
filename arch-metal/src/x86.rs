@@ -253,6 +253,31 @@ pub fn insw(port: u16, buf: &mut [u16]) {
     }
 }
 
+/// Write `buf.len()` words to an I/O port in one `rep outsw`.
+///
+/// The write-direction twin of [`insw`]: same VM-exit amortization argument —
+/// the ATA data register is written 256 times per sector, so the block driver
+/// needs the batched form to keep a WRITE cheap on a virtualized host.
+#[inline]
+pub fn outsw(port: u16, buf: &[u16]) {
+    // `rep outsw` sources from DS:ESI, but LLVM reserves ESI on 32-bit x86 and
+    // rejects it as an explicit operand (unlike EDI for `insw`). Load it inside
+    // the asm from a scratch register and restore it, so ESI is never bound.
+    unsafe {
+        asm!(
+            "mov {saved}, esi",
+            "mov esi, {ptr}",
+            "rep outsw",
+            "mov esi, {saved}",
+            ptr = in(reg) buf.as_ptr(),
+            saved = out(reg) _,
+            in("dx") port,
+            inout("ecx") buf.len() => _,
+            options(nostack, readonly),
+        );
+    }
+}
+
 /// Write to I/O port
 #[inline]
 pub fn outb(port: u16, value: u8) {

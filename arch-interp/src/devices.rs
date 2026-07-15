@@ -108,6 +108,8 @@ const ATA_STATUS_CMD: u16 = 0x1F7;
 const ST_DRDY: u32 = 0x40;
 const ST_DRQ: u32 = 0x08;
 const CMD_READ_SECTORS: u32 = 0x20;
+const CMD_WRITE_SECTORS: u32 = 0x30;
+const CMD_CACHE_FLUSH: u32 = 0xE7;
 
 struct Ata {
     file: File,
@@ -115,16 +117,50 @@ struct Ata {
     lba: u32,
     buf: Vec<u8>,
     pos: usize,
+    /// True between a WRITE SECTORS command and its buffer draining to the
+    /// file: the data port ACCEPTS words instead of yielding them. DRQ means
+    /// the same thing either way — "the sector buffer isn't done" — so the
+    /// status bit is shared; only the data-port direction flips.
+    writing: bool,
 }
 
 impl Ata {
     fn new(file: File) -> Ata {
-        Ata { file, seccount: 0, lba: 0, buf: Vec::new(), pos: 0 }
+        Ata { file, seccount: 0, lba: 0, buf: Vec::new(), pos: 0, writing: false }
     }
 
     fn status(&self) -> u32 {
-        // Reads are synchronous → never BSY; DRQ while a sector buffer has data.
+        // Reads/writes are synchronous → never BSY; DRQ while the sector buffer
+        // still has data to yield (read) or room to accept (write).
         ST_DRDY | if self.pos < self.buf.len() { ST_DRQ } else { 0 }
+    }
+
+    /// Begin a WRITE SECTORS: size the buffer to the request and assert DRQ so
+    /// the guest streams `count * 256` words in through the data port.
+    fn begin_write(&mut self) {
+        let count = if self.seccount == 0 { 256 } else { self.seccount as usize };
+        self.buf = vec![0u8; count * SECTOR];
+        self.pos = 0;
+        self.writing = true;
+    }
+
+    /// Accept one data word during a write; flush the whole buffer to the file
+    /// once the last word lands (mirrors `read_sectors`' seek+transfer).
+    fn write_data_word(&mut self, val: u32) {
+        if self.pos + 1 < self.buf.len() {
+            self.buf[self.pos] = val as u8;
+            self.buf[self.pos + 1] = (val >> 8) as u8;
+        }
+        self.pos = (self.pos + 2).min(self.buf.len());
+        if self.pos >= self.buf.len() && self.writing {
+            if self.file.seek(SeekFrom::Start(self.lba as u64 * SECTOR as u64)).is_ok() {
+                let _ = self.file.write_all(&self.buf);
+                let _ = self.file.flush();
+            }
+            self.buf.clear();
+            self.pos = 0;
+            self.writing = false;
+        }
     }
 
     fn read_sectors(&mut self) {
@@ -163,21 +199,31 @@ impl PortIo for Ata {
 
     fn write(&mut self, port: u16, _width: u8, val: u32) {
         match port {
+            ATA_DATA if self.writing => self.write_data_word(val),
             ATA_SECCOUNT => self.seccount = val as u8,
             ATA_LBA_0_7 => self.lba = (self.lba & 0xFFFF_FF00) | (val & 0xFF),
             ATA_LBA_8_15 => self.lba = (self.lba & 0xFFFF_00FF) | ((val & 0xFF) << 8),
             ATA_LBA_16_23 => self.lba = (self.lba & 0xFF00_FFFF) | ((val & 0xFF) << 16),
             ATA_LBA_24_27 => self.lba = (self.lba & 0x00FF_FFFF) | ((val & 0x0F) << 24),
             ATA_STATUS_CMD if val == CMD_READ_SECTORS => self.read_sectors(),
+            ATA_STATUS_CMD if val == CMD_WRITE_SECTORS => self.begin_write(),
+            ATA_STATUS_CMD if val == CMD_CACHE_FLUSH => {} // synchronous writes: nothing buffered
             _ => {} // features / other commands: no-op
         }
     }
 }
 
 /// Hook a host image file onto the primary ATA ports — `hdd::read_sectors`
-/// reads it through the interpreted PIO.
+/// reads it and `hdd::write_sectors` writes it back through the interpreted
+/// PIO. Opened read-write so the backing-file overlay persists; falls back to
+/// read-only if the image isn't writable (writes then silently no-op, same as
+/// a write-protected disk).
 pub fn attach_disk(path: &str) -> std::io::Result<()> {
-    let file = File::open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .or_else(|_| File::open(path))?;
     register(ATA_BASE, ATA_STATUS_CMD, Box::new(Ata::new(file)));
     Ok(())
 }

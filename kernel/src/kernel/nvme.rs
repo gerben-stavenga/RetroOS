@@ -2,10 +2,9 @@
 //! have no ATA: the SSD hangs directly off PCIe).
 //!
 //! Minimal by design: one admin queue pair + one I/O queue pair, polled
-//! completions (no MSI/interrupts), 512-byte LBAs, reads in 4 KB chunks
-//! through a bounce buffer (single-PRP commands — no PRP lists). That is
-//! everything the boot path needs (MBR scan, TAR index, ext4 reads); writes
-//! come with the writable-filesystem work.
+//! completions (no MSI/interrupts), 512-byte LBAs, reads and writes in 4 KB
+//! chunks through a shared bounce buffer (single-PRP commands — no PRP lists).
+//! Writes exist for the backing-file overlay's raw-sector persistence.
 //!
 //! Memory: controller registers (BAR0) and the DMA region (queues + bounce)
 //! are mapped into slices of the dead low-mem identity window, following the
@@ -275,6 +274,46 @@ pub fn read_sectors(lba: u32, mut buffer: &mut [u8]) -> u32 {
             );
         }
         buffer = &mut buffer[bytes..];
+        current += batch;
+        remaining -= batch;
+    }
+    total
+}
+
+/// Write sectors (512-byte LBAs) — the write-direction twin of
+/// [`read_sectors`]. Source bytes are staged into the bounce buffer, then a
+/// WRITE (opcode 01h) points PRP1 at it. A short final chunk is zero-padded to
+/// a full 4 KB command page (the backing-file overlay writes block-aligned).
+pub fn write_sectors(lba: u32, mut buffer: &[u8]) -> u32 {
+    let total = buffer.len().div_ceil(512) as u32;
+    let mut guard = NVME.lock();
+    let n = guard.as_mut().expect("nvme::write_sectors before init");
+
+    let mut current = lba;
+    let mut remaining = total;
+    while remaining > 0 {
+        let batch = remaining.min(SECTORS_PER_CMD);
+        let bytes = (batch as usize * 512).min(buffer.len());
+        // Stage into the bounce buffer, zero-filling any partial tail so the
+        // whole command page is defined.
+        unsafe {
+            core::ptr::write_bytes((DMA_VA + BOUNCE_OFF) as *mut u8, 0, batch as usize * 512);
+            core::ptr::copy_nonoverlapping(
+                buffer.as_ptr(),
+                (DMA_VA + BOUNCE_OFF) as *mut u8,
+                bytes,
+            );
+        }
+        let mut c = cmd(0x01, 1); // WRITE, nsid 1
+        set_prp1(&mut c, n.dma_phys + BOUNCE_OFF as u64);
+        c[10] = current; // starting LBA, low
+        c[11] = 0;       // starting LBA, high
+        c[12] = batch - 1; // 0-based count
+        let status = n.io.exec(&c);
+        if status != 0 {
+            panic!("NVMe write failed: lba={:#x} status={:#x}", current, status);
+        }
+        buffer = &buffer[bytes..];
         current += batch;
         remaining -= batch;
     }

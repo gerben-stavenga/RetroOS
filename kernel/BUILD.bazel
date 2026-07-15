@@ -60,11 +60,9 @@ rust_library(
     ] + select({
         ":metal": [
             "//arch-metal",
-            "@ext4_view//:ext4_view",
             "@spin//:spin",
         ],
         "//conditions:default": [
-            "@crates//:ext4-view",
             "@crates//:rustc-demangle",
             "@crates//:spin",
         ],
@@ -89,7 +87,7 @@ rust_binary(
     srcs = ["metal_entry.rs"],
     crate_name = "kernel_metal",
     edition = "2024",
-    compile_data = [":kernel_ld", ":entry", ":bootfs_obj"],
+    compile_data = [":kernel_ld", ":entry", ":bootfs_obj", "//third_party/lwext4:lwext4_obj"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Crelocation-model=static",
@@ -101,6 +99,10 @@ rust_binary(
         "-Clink-arg=-T$(location :kernel_ld)",
         "-Clink-arg=$(location :entry)",
         "-Clink-arg=$(location :bootfs_obj)",
+        # lwext4 (writable ext4): the freestanding C object, linked straight in
+        # like :entry. Its undefined externals (malloc/str*/qsort) resolve to the
+        # arch-metal cshim; mem*/__udivdi3 to compiler-builtins.
+        "-Clink-arg=$(location //third_party/lwext4:lwext4_obj)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
     ],
@@ -115,7 +117,7 @@ rust_binary(
     srcs = ["metal_entry.rs"],
     crate_name = "kernel_metal",
     edition = "2024",
-    compile_data = [":kernel_ld", ":entry", ":bootfs_empty_obj"],
+    compile_data = [":kernel_ld", ":entry", ":bootfs_empty_obj", "//third_party/lwext4:lwext4_obj"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Crelocation-model=static",
@@ -127,6 +129,7 @@ rust_binary(
         "-Clink-arg=-T$(location :kernel_ld)",
         "-Clink-arg=$(location :entry)",
         "-Clink-arg=$(location :bootfs_empty_obj)",
+        "-Clink-arg=$(location //third_party/lwext4:lwext4_obj)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
     ],
@@ -175,6 +178,7 @@ rust_binary(
         "//arch-interp",
         "//lib",
         "//lib:sampler",
+        "@lwext4//:lwext4_host",
     ],
 )
 
@@ -194,6 +198,7 @@ rust_binary(
         "//arch-interp:arch-interp-kvm",
         "//lib",
         "//lib:sampler",
+        "@lwext4//:lwext4_host",
     ],
 )
 
@@ -263,6 +268,7 @@ rust_binary(
         "//arch-interp",
         "//lib",
         "//lib:sampler",
+        "@lwext4//:lwext4_host",
     ],
 )
 

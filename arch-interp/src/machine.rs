@@ -57,6 +57,13 @@ pub fn insw(port: u16, buf: &mut [u16]) {
 }
 pub fn outb(port: u16, value: u8) { crate::devices::port_out(port, 1, value as u32); }
 pub fn outw(port: u16, value: u16) { crate::devices::port_out(port, 2, value as u32); }
+/// Bulk word write (`rep outsw` on metal). Hosted has no exit to amortize, so
+/// the loop IS the primitive — the write-direction twin of [`insw`].
+pub fn outsw(port: u16, buf: &[u16]) {
+    for &w in buf.iter() {
+        crate::devices::port_out(port, 2, w as u32);
+    }
+}
 pub fn outl(port: u16, value: u32) { crate::devices::port_out(port, 4, value); }
 
 /// Monotonic cycle counter. Deterministic stand-in for the TSC (TCG engine).

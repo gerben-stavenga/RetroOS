@@ -117,7 +117,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).
     crate::install_portio(crate::PortIo {
         inb: arch::inb, inw: arch::inw, inl: arch::inl, insw: arch::insw,
-        outb: arch::outb, outw: arch::outw, outl: arch::outl,
+        outb: arch::outb, outw: arch::outw, outl: arch::outl, outsw: arch::outsw,
     });
     crate::set_host_env(crate::HostEnv {
         fbcon_active: crate::fbcon::active,
