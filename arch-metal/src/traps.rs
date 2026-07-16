@@ -106,7 +106,6 @@ pub mod arch_call {
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
-    pub const SET_EXEC_BP: u64 = 0x120;       // EDX=&[u32] ECX=len — virtual-IF exit-breakpoint set
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -302,12 +301,6 @@ fn arch_dispatch(regs: &mut Regs) {
                     x86::write_dr6(0);
                 }
             }
-        }
-        arch_call::SET_EXEC_BP => {
-            let ptr = regs.rdx as u32 as *const u32;
-            let len = (regs.rcx as usize).min(arch_abi::MAX_EXEC_BP);
-            let addrs = unsafe { core::slice::from_raw_parts(ptr, len) };
-            unsafe { x86::program_exec_bps(addrs) };
         }
         _ => panic!("Unknown arch call: {:#x}", regs.rax),
     }
@@ -635,54 +628,26 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 /// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
 /// are handled inline by arch before bubbling.
 fn isr_handler_ring3(regs: &mut Regs) {
-    use crate::monitor::{monitor, step_virtual_if, virtual_if_stepping, KernelEvent as KE, MonitorResult};
+    use crate::monitor::{monitor, KernelEvent as KE, MonitorResult};
     use arch_abi::UserMode;
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
     let kevent: KE = match int_num {
-        // #DB: only armed by `step_virtual_if` to single-step PM regions
-        // where virtual IF is 0. The hardware just executed one insn under
-        // TF; decide what to do about the NEXT one. When TF stepping is
-        // disabled, defensively clear TF and resume — nothing in the
-        // kernel arms it, but a stale bit in client flags would loop.
+        // #DB: a virtual-IF single-step. One instruction retired under TF —
+        // either a learning step or a tagged POPF/IRET that just loaded TF.
+        // Reflect it to `dpmi::vif` (the policy lives in dos). For anything but
+        // a PM client (no virtual IF there), defensively clear TF and resume —
+        // nothing in the kernel arms it, but a stale bit would loop.
         1 => {
-            use core::sync::atomic::Ordering;
             let dr6 = unsafe { x86::read_dr6() };
             if debug_watch_trap(regs, dr6, false) {
                 return;
             }
-            // B0..B3: a virtual-IF exit breakpoint. The whole DR file is the
-            // exit SET (one address per slot), so any of the four can be the
-            // hit — checking only B3 left a DR0/DR1/DR2 hit unhandled, and an
-            // exec breakpoint is a FAULT: the instruction had not run, so it
-            // re-executed, fired again, and looped in #DB forever.
-            //
-            // Emulating it here is what closes the window and restores VIF
-            // without a single step in sight.
-            if dr6 & 0xF != 0 {
-                unsafe { x86::write_dr6(0) };
-                if crate::monitor::exec_bp_hit(regs) {
-                    return;
-                }
-            }
-            let budget = arch_abi::PM_STEP_BUDGET.load(Ordering::Relaxed);
-            if budget > 0 {
-                // Log step in PM and VM86 — VM86 logging needed to trace
-                // RM execution after a raw PM->RM switch. The DOS-layer tracer
-                // takes a `&Vcpu`; wrap the trap frame in a throwaway vcpu view
-                // (its `space` is unused — `mem()` reads the active mapping).
-                let v = Vcpu::new(*regs, paging2::RootPageTable::empty());
-                crate::monitor::pm_step_log(&v);
-                arch_abi::PM_STEP_BUDGET.store(budget - 1, Ordering::Relaxed);
-                regs.set_flag32(1 << 8); // keep TF on
+            if regs.mode() != UserMode::Mode32 {
+                regs.clear_flag32(1 << 8); // clear TF
                 return;
             }
-            if virtual_if_stepping(regs) {
-                let _ = step_virtual_if(regs);
-            } else {
-                regs.clear_flag32(1 << 8);
-            }
-            return;
+            KE::VifStep
         }
         13 => {
             // VME raises #GP with VIF=1 && VIP=1 to ask the host to inject the
@@ -697,26 +662,24 @@ fn isr_handler_ring3(regs: &mut Regs) {
             const VIF_VIP: u32 = (1 << 19) | (1 << 20);
             let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
             // Where this instruction lives, and whether virtual IF was on before
-            // it ran: a 1 -> 0 transition is the site that OPENS an
-            // interrupts-off window, which is what `if_gate` keys its learned
-            // exit breakpoints on.
+            // it ran: a PM CLI/STI that toggles virtual IF is a window boundary,
+            // reflected to `dpmi::vif`.
             let entry_ip = regs.ip32();
             let vif_was_on = regs.flags32() & (1 << 19) != 0;
             match monitor(regs) {
                 MonitorResult::Resume => {
-                    // Hand the window to the virtual-IF gate: it either arms the
-                    // learned exit breakpoint and lets the client run at full
-                    // speed, or falls back to single-stepping to learn it.
-                    // Skipped when TF stepping is disabled — DPMI 0.9 §2.13 says
-                    // POPF/IRET aren't required to affect virtual IF, so
-                    // spec-conforming clients use CLI/STI/AX=0900-0902 only.
-                    if virtual_if_stepping(regs) && regs.mode() != UserMode::VM86 {
-                        let _ = crate::monitor::if_gate(regs, entry_ip, vif_was_on);
-                    }
-                    if regs.flags32() & VIF_VIP != VIF_VIP {
+                    // A PM CLI/STI toggled virtual IF: reflect the window to
+                    // dpmi::vif (which owns the per-space tag/learn policy). VM86
+                    // handles POPF/IRET on its own #GP (VME) and needs no tag.
+                    if regs.mode() != UserMode::VM86
+                        && (regs.flags32() & (1 << 19) != 0) != vif_was_on
+                    {
+                        KE::VifWindow { entry_ip, vif_was_on }
+                    } else if regs.flags32() & VIF_VIP != VIF_VIP {
                         return;
+                    } else {
+                        KE::Irq
                     }
-                    KE::Irq
                 }
                 // A real fault is reclassified as IRQ delivery only when the
                 // VME pending-interrupt condition held at fault time.

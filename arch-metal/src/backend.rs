@@ -83,23 +83,6 @@ impl Arch for Metal {
     fn rearm_irq(&mut self, line: u8) { super::calls::arch_rearm_irq(line) }
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>) { super::calls::arch_set_debug_watch(addrs) }
 
-    /// Program DR3 as the virtual-IF exit breakpoint.
-    ///
-    /// `MOV DR` is **CPL=0 only**. Both rings reach this: the trap handlers
-    /// (`if_gate`, `exec_bp_hit`) are already ring 0 and can poke the register
-    /// directly, but `monitor::relearn` is driven from `dos::stall_guard`, which
-    /// runs in the ring-1 kernel — there the write must go through the arch call
-    /// or it #GPs, and a #GP in ring 1 is a kernel panic (it is exactly how
-    /// DUKE3D and ROTT died: they DO take the relearn path, unlike Doom).
-    fn set_exec_breakpoints(&mut self, addrs: &[u32]) -> bool {
-        if super::x86::cpl() == 0 {
-            unsafe { super::x86::program_exec_bps(addrs) };
-        } else {
-            super::calls::arch_set_exec_breakpoints(addrs);
-        }
-        true
-    }
-
     // ── Arch calls: paging / fork / LDT / DMA ──
     fn user_fork(&mut self, child: &mut RootPageTable) { super::calls::arch_user_fork(child) }
     fn free_user_pages(&mut self) { super::calls::arch_free_user_pages() }

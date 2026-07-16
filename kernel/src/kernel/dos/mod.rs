@@ -27,11 +27,6 @@ static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
 pub(crate) static IN_HW_IRQ_CONTEXT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Single-step tracing budget — lives in `arch-abi` (the backend's `#DB` handler
-/// consumes it; this layer only arms it). Re-exported so DPMI sites keep writing
-/// `dos::PM_STEP_BUDGET`.
-pub(crate) use arch_abi::PM_STEP_BUDGET;
-
 /// Returns true if a trace line should fire. Folds away to `false` when the
 /// compile-time `DOS_TRACE` master switch is off, so disabled traces cost
 /// nothing in the binary.
@@ -492,6 +487,25 @@ pub fn handle_event<A: crate::Arch>(
     let is_vm86 = regs.mode() == crate::UserMode::VM86;
     match kevent {
         KE::Irq => thread::KernelAction::Done,
+        // Virtual IF: arch reflected a PM CLI/STI (window toggle) or a #DB
+        // inside a window; the policy + per-space map live here (dpmi::vif).
+        KE::VifWindow { entry_ip, vif_was_on } => {
+            if let Some(dpmi) = dos.dpmi.as_mut() {
+                let vif_now = regs.flags32() & (1 << 19) != 0;
+                if vif_was_on && !vif_now {
+                    dpmi.vif.on_cli(machine, regs, entry_ip);
+                } else if !vif_was_on && vif_now {
+                    dpmi.vif.on_sti(regs);
+                }
+            }
+            thread::KernelAction::Done
+        }
+        KE::VifStep => {
+            match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
+                Some(dpmi::DbResult::Event(ev)) => handle_event(machine, kt, dos, regs, ev),
+                _ => thread::KernelAction::Done,
+            }
+        }
         // Cooperative focus: HLT means "park me until an IRQ arrives". It
         // must NOT yield/schedule — that would hand focus to the next Ready
         // thread on the very first idle cycle, defeating F11. The Phase 1
@@ -667,9 +681,9 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
-    // The virtual-IF exit breakpoints are keyed by bare code address, so a new
-    // address space must not inherit the last program's learned exits.
-    arch_abi::monitor::forget_if_windows();
+    // The virtual-IF exit map (dpmi::vif) is owned by the DPMI client and made
+    // fresh at each `dpmi_enter`, so a new address space starts with an empty
+    // one — no global clear needed.
     back_vga_window_if_emulated(machine);
     dos::setup_ivt(machine, &mut current.kernel.vcpu);
 
@@ -1032,68 +1046,6 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
     machine::audio_tick(machine, &mut dos.pc, regs);
 }
 
-/// Safety net for the virtual-IF exit breakpoints (`monitor::if_gate`) — and the
-/// thing that makes `IfMode::Repair` deserve its name.
-///
-/// A learned pairing lets a client run its interrupts-off section at full speed,
-/// its exit caught by a hardware breakpoint (or by the STI faulting on its own).
-/// If the client ever leaves that section by a POPF/IRET we never learned, the
-/// exit is missed and virtual IF is stale-0 — and it is stale FOREVER, because
-/// the POPF is already in the past. The client now believes interrupts are on
-/// and spins on a tick that can never be delivered.
-///
-/// Stepping cannot undo that; there is no future instruction left to catch. So
-/// the repair has to put the flag back, which is the one place the host decides
-/// the client's IF for it. What keeps that honest is `monitor::predicting()`: it
-/// fires only where a wrong guess of ours is the explanation — never inside a
-/// section we faithfully stepped, where nothing can be missed. And a critical
-/// section that genuinely holds interrupts off for `STALL_MS` with an IRQ
-/// waiting is already broken by any standard.
-///
-/// Cost: one stall, once per mispredicted site — the pairing is then forgotten,
-/// so the next pass steps that site and learns the exit it really has.
-fn stall_guard<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
-    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    const STALL_MS: u32 = 10;
-    static OFF_SINCE: AtomicU32 = AtomicU32::new(0);
-
-    let vif_on = regs.frame.rflags & (machine::VIF_FLAG as u64) != 0;
-    // Only a window running on a PREDICTION can strand virtual IF. One we are
-    // stepping cannot: the step loop sees every instruction, so it always finds
-    // the exit — and a stepped section is legitimately slow (~2500x), so firing
-    // there would forget the pairing mid-learn and step that section forever
-    // (which is exactly what DUKE3D did).
-    let gated = regs.mode() != crate::UserMode::VM86
-        && arch_abi::monitor::virtual_if_stepping(regs)
-        && arch_abi::monitor::predicting();
-    if vif_on || !gated || !dos.pc.vpic.has_deliverable() {
-        OFF_SINCE.store(0, Relaxed);
-        return;
-    }
-    // `| 1` keeps 0 free as the "not stalling" sentinel.
-    let now = (machine.get_ticks() as u32) | 1;
-    let since = OFF_SINCE.load(Relaxed);
-    if since == 0 {
-        OFF_SINCE.store(now, Relaxed);
-    } else if now.wrapping_sub(since) >= STALL_MS {
-        // Re-arm either way: if the client is still inside its section (ROTT's
-        // retrace wait), `repair` declines and we simply look again later.
-        OFF_SINCE.store(now, Relaxed);
-        if arch_abi::monitor::repair(machine, regs) {
-            // A repair means our exit prediction was WRONG about a real
-            // program. Say so — it is the one event that says the model has a
-            // hole, and it should never pass silently.
-            use arch_abi::monitor as m;
-            crate::dbg_println!(
-                "[repair] #{} site={:08x} left through an exit we had not armed; stranded at {:08x}. Stepping it to learn.",
-                m::REPAIRS.load(Relaxed),
-                m::REPAIR_SITE.load(Relaxed),
-                m::REPAIR_IP.load(Relaxed),
-            );
-        }
-    }
-}
-
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery
 /// is uniform regardless of the client's current mode: `deliver_pm_irq`
 /// snapshots the client state on a kernel IRQ stack and switches to the
@@ -1105,7 +1057,6 @@ fn stall_guard<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
-    stall_guard(machine, dos, regs);
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI

@@ -12,6 +12,10 @@
 // ── EFLAGS bits + the virtual-IF projection ─────────────────────────────────
 
 pub(crate) const IF_FLAG: u32 = 1 << 9;
+/// Only the KVM engine masks TF out of the flags it hands the vcpu (TCG drives
+/// stepping through Unicorn's own TF); gated so a TCG-only build doesn't see it
+/// as dead.
+#[cfg(feature = "kvm")]
 pub(crate) const TF_FLAG: u32 = 1 << 8;
 /// NT (Nested Task, EFLAGS bit 14). A real `INT` clears NT on entry, so DOS/DPMI
 /// guests never legitimately run with it set; the interp's software INT

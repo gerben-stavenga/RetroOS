@@ -329,16 +329,6 @@ pub(super) unsafe fn write_dr0(value: u32) {
     unsafe { asm!("mov dr0, {}", in(reg) value, options(nomem, nostack)); }
 }
 
-#[inline]
-unsafe fn write_dr2(value: u32) {
-    unsafe { asm!("mov dr2, {}", in(reg) value, options(nomem, nostack)); }
-}
-
-#[inline]
-unsafe fn write_dr3(value: u32) {
-    unsafe { asm!("mov dr3, {}", in(reg) value, options(nomem, nostack)); }
-}
-
 /// Current privilege level, from CS's low two bits.
 #[inline]
 pub fn cpl() -> u16 {
@@ -347,35 +337,8 @@ pub fn cpl() -> u16 {
     cs & 3
 }
 
-/// Program DR0..DR3 as EXECUTE breakpoints at `addrs` (R/W = 00 and LEN = 00,
-/// the only legal encoding for one); slots beyond `addrs.len()` are disabled.
-///
-/// This takes the whole debug-register file, so it is mutually exclusive with
-/// the `set_debug_watch` write-watchpoint feature — a ring-0 debugging aid that
-/// is off unless someone turns it on.
-///
 /// # Safety
-///
-/// `MOV DR` is CPL=0-only — a ring-1 caller #GPs. Reach this through
-/// `Arch::set_exec_breakpoints`, which routes an unprivileged caller via the
-/// arch call instead of faulting.
-pub(super) unsafe fn program_exec_bps(addrs: &[u32]) {
-    unsafe {
-        let mut dr7: u32 = 0x0000_0400; // bit 10 reads as 1
-        for (i, &a) in addrs.iter().take(4).enumerate() {
-            match i {
-                0 => write_dr0(a),
-                1 => write_dr1(a),
-                2 => write_dr2(a),
-                _ => write_dr3(a),
-            }
-            dr7 |= 1 << (2 * i); // Ln; R/Wn = 00 (exec) and LENn = 00
-        }
-        write_dr6(0);
-        write_dr7(dr7);
-    }
-}
-
+/// `MOV DR` is CPL=0-only — a ring-1 caller #GPs.
 #[inline]
 pub(super) unsafe fn write_dr1(value: u32) {
     unsafe { asm!("mov dr1, {}", in(reg) value, options(nomem, nostack)); }

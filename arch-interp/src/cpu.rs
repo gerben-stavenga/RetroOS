@@ -18,8 +18,8 @@
 
 use crate::sysdesc::{
     ensure_sys_window, if_to_vif, sys_phys, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES,
-    IF_FLAG, IOPL_MASK, KERNEL_CS, KERNEL_DS, LDT_ADDR, LDT_SEL, NT_FLAG, RING0_SP_TOP, SYS_BASE,
-    SYS_SIZE, TF_FLAG, TRAMP_ADDR, VIF_FLAG, VM_FLAG,
+    IOPL_MASK, KERNEL_CS, KERNEL_DS, LDT_ADDR, LDT_SEL, NT_FLAG, RING0_SP_TOP, SYS_BASE,
+    SYS_SIZE, TRAMP_ADDR, VIF_FLAG, VM_FLAG,
 };
 use crate::vcpu;
 use arch_abi::monitor::MonitorResult;
@@ -70,21 +70,6 @@ struct Ctx {
     /// the budget; on an early stop we charge the accumulated work.
     slice_instr: u64,
     stopped: bool,
-    /// Virtual-IF watch: set while a PM client runs with its virtual IF off
-    /// (TF stepping armed). The intr hook uses it to keep single-stepping
-    /// INSIDE one `emu_start` — re-arming TF and continuing per #DB — and
-    /// only stops the slice when the next opcode is one of the five
-    /// IF-touching instructions `step_virtual_if` must emulate. Without this,
-    /// every stepped instruction pays a full slice exit/re-entry (~25µs), and
-    /// audio ISRs that legitimately run long VIF=0 stretches (Duke3D's mixer)
-    /// crawl two orders of magnitude below the virtual CPU's speed.
-    vif_watch: Option<VifWatch>,
-}
-
-#[derive(Clone, Copy)]
-struct VifWatch {
-    cs: u16,
-    cs_base: u32,
 }
 
 thread_local! {
@@ -151,42 +136,8 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_intr_hook(|uc, intno| {
         let vector = (intno & 0xFF) as u8;
         let is_int = intno & 0x100 != 0;
-        // Virtual-IF stepping fast path: a #DB from the armed TF while the PM
-        // client's virtual IF is off. Peek the NEXT opcode; if it is not one
-        // of the five IF-touching instructions (PUSHF/POPF/IRET/CLI/STI),
-        // re-arm TF and continue INSIDE this `emu_start` — the whole stepped
-        // stretch then costs one hook callback per instruction instead of a
-        // full slice exit/re-entry. Falls through (and stops) for sensitive
-        // opcodes, a CS change, or an unmapped code page — the slice loop
-        // routes those to `step_virtual_if` exactly as before.
-        if vector == 1 && !is_int {
-            if let Some(w) = uc.get_data().vif_watch {
-                use RegisterX86 as R;
-                if uc.reg_read(R::CS).unwrap_or(0) as u16 == w.cs {
-                    let eip = uc.reg_read(R::EIP).unwrap_or(0) as u32;
-                    let pd = crate::paging::active_pd();
-                    let mut lin = w.cs_base.wrapping_add(eip);
-                    let mut op = None;
-                    for _ in 0..8 {
-                        let Some(pa) = crate::paging::translate(pd, lin) else { break };
-                        let b = unsafe { *(crate::phys::region_base() as *const u8).add(pa as usize) };
-                        // Legacy prefixes (operand/address size, lock, rep, seg overrides).
-                        if matches!(b, 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3
-                                     | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65) {
-                            lin = lin.wrapping_add(1);
-                            continue;
-                        }
-                        op = Some(b);
-                        break;
-                    }
-                    if matches!(op, Some(b) if !matches!(b, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB)) {
-                        let fl = uc.reg_read(R::EFLAGS).unwrap_or(0);
-                        let _ = uc.reg_write(R::EFLAGS, fl | 0x100); // re-arm TF
-                        return; // no emu_stop → continue stepping in place
-                    }
-                }
-            }
-        }
+        // Virtual-IF single-steps are reflected as `KernelEvent::VifStep` and
+        // handled by `dpmi::vif` — there is no in-arch stepping fast path.
         // A page fault is the paging backend's own business: demand-commit or
         // genuine SEGV is decided in `execute` (it needs CR2 + the active page
         // tables). It surfaces as #PF (vector 14) when unicorn can report it, or
@@ -349,17 +300,11 @@ pub fn execute() -> KernelEvent {
         // monitor calls) is a safe reborrow of it.
         let vcpu = unsafe { &mut *(&raw mut vcpu::REGS) };
         let mode = vcpu.mode();
-        // Virtual-IF stepping: while a PM client has its virtual IF (VIF) off,
-        // emulate the leading IF-touching opcodes in software so we only ever
-        // hand unicorn a non-sensitive instruction (which `configure` then
-        // TF-single-steps).
-        if mode == UserMode::Mode32 && vcpu.flags32() & VIF_FLAG == 0 {
-            // A sensitive op decoded during stepping (e.g. IRET popping CS=0)
-            // bubbles as an Event — surface it rather than re-entering.
-            if let MonitorResult::Event(ev) = arch_abi::monitor::step_virtual_if(&mut crate::backend::Interp, &mut vcpu.regs) {
-                return ev;
-            }
-        }
+        // A virtual-IF single-step is driven by TF in `regs`: `dpmi::vif` sets it
+        // (to learn a window's exit) or a tagged POPF/IRET loads it (the exit
+        // fires one instruction later). `configure` arms TF in hardware; the
+        // resulting `#DB` is reflected below as `KernelEvent::VifStep`. Nothing
+        // to do at the top of the slice — just let it run.
         // Roll to the next IRQ0 grid period once the last was fully spent; a trap
         // carries the remainder over so the grid stays fixed in cumulative
         // instructions (the kernel pumps the PIT on every return regardless).
@@ -445,21 +390,20 @@ pub fn execute() -> KernelEvent {
 
         if let Some(n) = uc.get_data_mut().pending_intr.take() {
             let is_int = uc.get_data().pending_is_int;
-            // #DB single-step trap from the virtual-IF stepping (configure armed
-            // TF while the PM client's IF is off): the one non-sensitive
-            // instruction retired; loop back so `step_virtual_if` re-checks.
+            // #DB single-step trap: one instruction retired under TF — reflect it
+            // to `dpmi::vif` (post-tag VIF restore, or a learning step). The
+            // policy lives in dos; arch only reports the trap.
             if n == 1 && !is_int {
                 // A single-stepped port `in`/`out` raises the I/O hook AND the
                 // #DB on the SAME instruction. The instruction already retired,
-                // so the I/O event must be delivered — not dropped by this
-                // re-step `continue` (the loop top clears `pending`). Losing it
-                // silently swallowed a PM IRQ handler's `out 0x20` EOI, leaving
-                // IRQ0 stuck in-service forever (Doom timer freeze after
+                // so the I/O event must be delivered first — not dropped (losing
+                // it silently swallowed a PM IRQ handler's `out 0x20` EOI, leaving
+                // IRQ0 stuck in-service forever: Doom timer freeze after
                 // I_StartupTimer; the ISR EOIs while IF=0, i.e. single-stepped).
                 if let Some(ev) = uc.get_data_mut().pending.take() {
                     return ev;
                 }
-                continue;
+                return KernelEvent::VifStep;
             }
             // Sensitive-instruction #GP (error code 0): decode through the shared
             // monitor — the same decoder arch-metal runs on its real #GP, so the
@@ -473,8 +417,25 @@ pub fn execute() -> KernelEvent {
             // (duke3d/raptor at sound init); forwarding the #GP to the client's
             // own handler cascaded into a wild jump.
             if n == 13 && !is_int && uc.get_data().pending_err == 0 {
+                // Where the faulting instruction lives, and whether virtual IF
+                // was on before it ran: a 1 -> 0 transition is the site that
+                // OPENS an interrupts-off window, which is what the gate keys
+                // its learned exit breakpoints on.
+                let entry_ip = vcpu.ip32();
+                let vif_was_on = vcpu.flags32() & VIF_FLAG != 0;
                 match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
-                    MonitorResult::Resume => continue,
+                    MonitorResult::Resume => {
+                        // A PM CLI/STI toggled virtual IF: reflect the window
+                        // boundary to the DOS personality (dpmi::vif owns the
+                        // policy + the per-space map). VM86 handles POPF/IRET on
+                        // its own #GP and needs no tag, so it never reflects.
+                        if mode != UserMode::VM86
+                            && (vcpu.flags32() & VIF_FLAG != 0) != vif_was_on
+                        {
+                            return KernelEvent::VifWindow { entry_ip, vif_was_on };
+                        }
+                        continue;
+                    }
                     MonitorResult::Event(KernelEvent::Fault) => {} // genuine #GP
                     MonitorResult::Event(ev) => return ev,
                 }
@@ -725,7 +686,6 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // interrupt state. NEVER IOPL=3: that lets the guest toggle the real
             // IF behind the kernel's back and bypasses the per-swap-in IO bitmap.
             // Project VIF (bit 19) into the bit-9 IF slot the guest runs with.
-            uc.get_data_mut().vif_watch = None;
             let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32) & !NT_FLAG) | (VM_FLAG as u32) | (1 << 12) | 2);
             let frame = [
                 r.ip32() & 0xFFFF,
@@ -742,25 +702,15 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
         }
         UserMode::Mode32 => {
             // The client runs CPL=3, IOPL=1 — exactly like the real processor on
-            // metal. CLI/STI #GP and are emulated against the virtual IF (rflags
-            // bit 9); POPF/IRET silently drop IF at CPL>IOPL, so while the virtual
-            // IF is 0 we single-step (TF=1) and `step_virtual_if` emulates the
-            // IF-touching opcodes in software. With IF on we run at full speed.
-            // Project VIF (bit 19) into the bit-9 IF slot; then if the guest's IF
-            // is off, single-step so POPF/IRET get caught (CPL>IOPL drops them).
-            let mut flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG) | (1 << 12) | 2);
-            if flags & IF_FLAG == 0 {
-                flags |= TF_FLAG; // step the next non-sensitive instruction
-                // Arm the intr hook's in-place stepping fast path (see the
-                // #DB branch in the intr hook): per-#DB it re-arms TF and
-                // continues within the slice until a sensitive opcode shows.
-                uc.get_data_mut().vif_watch = Some(VifWatch {
-                    cs: r.code_seg(),
-                    cs_base: crate::desc::seg_base(r.code_seg()),
-                });
-            } else {
-                uc.get_data_mut().vif_watch = None;
-            }
+            // metal. CLI/STI #GP and toggle the virtual IF (the guest observes it
+            // in the bit-9 IF slot); POPF/IRET silently drop IF at CPL>IOPL and
+            // are caught by `dpmi::vif`'s tag-TF technique. TF rides in the
+            // client's own flags — set by `dpmi::vif` when it wants to learn a
+            // window's exit — so the run single-steps exactly when dos asked. The
+            // *virtual* IOPL rides in the saved flags too and must not reach the
+            // CPU: the real IOPL is pinned to 1 (never 3 — that would let the
+            // client toggle the host's interrupt flag and bypass the I/O bitmap).
+            let flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG) | (1 << 12) | 2);
             let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
             let segs = [r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16];
             run_trampoline(uc, &frame, Some(segs))
@@ -799,11 +749,16 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             r.es = rd(uc, RegisterX86::ES);
             r.fs = rd(uc, RegisterX86::FS);
             r.gs = rd(uc, RegisterX86::GS);
-            // Re-assert VM86 so `regs.mode()` stays VM86 for the kernel; normalize
-            // IOPL to the kernel invariant (1, never 3). Mirror the emulated IF
-            // (bit 9) into the canonical VIF (bit 19) and set the real IF =1.
+            // Re-assert VM86 so `regs.mode()` stays VM86 for the kernel. Mirror
+            // the emulated IF (bit 9) into the canonical VIF (bit 19) and set the
+            // real IF = 1. The guest ran at real IOPL=1; its *virtual* IOPL — the
+            // per-thread `IfMode` — rides in the saved flags and is preserved
+            // across the run, exactly as metal stashes it (see `store_regs` for
+            // Mode32: forcing it to 1 here would erase the thread's IF policy on
+            // its first exit).
+            let viopl = r.frame.rflags & IOPL_MASK;
             let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
-            r.frame.rflags = (uc_fl & !IOPL_MASK) | VM_FLAG | (1 << 12);
+            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl | VM_FLAG;
         }
         UserMode::Mode32 => {
             // PM client: a far jump / mov may have reloaded any selector — read
@@ -816,12 +771,23 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             r.es = rd(uc, RegisterX86::ES);
             r.fs = rd(uc, RegisterX86::FS);
             r.gs = rd(uc, RegisterX86::GS);
-            // Normalize IOPL to the kernel invariant (1, never 3) and strip the
-            // stepping TF. The guest ran at CPL=3/IOPL=1, so CLI/STI #GP'd into
-            // the monitor; mirror the emulated IF (bit 9) into the canonical VIF
-            // (bit 19) and set the real IF =1.
+            // The guest ran at CPL=3/IOPL=1, so CLI/STI #GP'd into the monitor;
+            // mirror the emulated IF (bit 9) into the canonical VIF (bit 19) and
+            // set the real IF = 1.
+            //
+            // Preserve the guest's *virtual* IOPL (bits 12-13): that is where the
+            // thread's `IfMode` lives (Repair / Iopl3 / Iopl1), carried across the
+            // run like VIF/VIP — exactly as metal stashes it around the iret.
+            // Forcing it to 1 here erased the policy on the client's first exit,
+            // which made every hosted DPMI client an `Iopl1` one.
+            //
+            // TF is kept, not stripped: it is the monitor's request for one more
+            // hardware step, and it is the monitor that clears it when the window
+            // closes. (Nothing else can set it: the client's own PUSHF/POPF go
+            // through the monitor while a window is open.)
+            let viopl = r.frame.rflags & IOPL_MASK;
             let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
-            r.frame.rflags = (uc_fl & !IOPL_MASK & !(TF_FLAG as u64)) | (1 << 12);
+            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl;
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
             // (and possibly EIP) holding stale bits from the trampoline's own
