@@ -122,6 +122,9 @@ pub fn is_linux_root(part_lba: u32) -> bool {
             false
         }
     }
+    let Some(part_size) = part_size_from_superblock(part_lba) else {
+        return false;
+    };
     unsafe {
         if IFACE.ph_bbuf.is_null() {
             IFACE.ph_bbuf = core::ptr::addr_of_mut!(PH_BBUF) as *mut u8;
@@ -129,7 +132,7 @@ pub fn is_linux_root(part_lba: u32) -> bool {
         let bdev = Box::leak(Box::new(Ext4Blockdev {
             bdif: core::ptr::addr_of_mut!(IFACE),
             part_offset: part_lba as u64 * 512,
-            part_size: 0x20_0000_0000,
+            part_size, // the fs's own extent — see part_size_from_superblock
             bc: core::ptr::null_mut(),
             lg_bsize: 0,
             lg_bcnt: 0,
@@ -195,6 +198,36 @@ static mut IFACE: Ext4BlockdevIface = Ext4BlockdevIface {
 };
 
 /// Leak a NUL-terminated copy of `s` (boot-lifetime), returning its pointer.
+/// The filesystem's true extent, read from its own superblock (1024 B into the
+/// partition = sector +2): `s_blocks_count × block_size`. `None` = no ext
+/// superblock there.
+///
+/// This MUST be exact, not a guess. lwext4 takes `part_size` as gospel: it sets
+/// `lg_bcnt = part_size / block_size` (the fs's logical block count) and EINVALs
+/// every access past it (`ext4_blockdev.c` :126, :224, :324, :394) — but nothing
+/// validates it against the superblock at mount time. So a `part_size` that is
+/// too small mounts CLEANLY and then silently fails every read beyond it: a real
+/// laptop root (flex_bg scatters inode tables and directory blocks across the
+/// whole partition) mounts and lists as EMPTY. The old hard-coded 128 GiB was
+/// invisible only because the built image's ext4 partition is 1 GiB.
+fn part_size_from_superblock(part_lba: u32) -> Option<u64> {
+    let mut sb = [0u8; 512];
+    crate::kernel::block::read_sectors(part_lba + 2, &mut sb);
+    let rd32 = |off: usize| u32::from_le_bytes(sb[off..off + 4].try_into().unwrap());
+    if u16::from_le_bytes([sb[0x38], sb[0x39]]) != 0xEF53 {
+        return None; // s_magic
+    }
+    let log_bs = rd32(0x18); // s_log_block_size: block size = 1024 << it
+    if log_bs > 6 {
+        return None; // 1 KiB..64 KiB is the whole legal range
+    }
+    // s_blocks_count_hi is only meaningful with INCOMPAT_64BIT; ignore it
+    // otherwise so a stale/garbage high word can't inflate the size.
+    let hi = if rd32(0x60) & 0x80 != 0 { rd32(0x150) as u64 } else { 0 };
+    let blocks = (hi << 32) | rd32(0x04) as u64; // s_blocks_count
+    blocks.checked_mul(1024u64 << log_bs)
+}
+
 fn leak_cstr(s: &[u8]) -> *const u8 {
     let mut v: Vec<u8> = Vec::with_capacity(s.len() + 1);
     v.extend_from_slice(s);
@@ -227,6 +260,8 @@ impl Lwext4Fs {
     /// Register + mount the ext4 partition starting at `part_lba`. `index`
     /// disambiguates the global lwext4 device name / mount point.
     pub fn new(part_lba: u32, index: usize) -> Result<Self, &'static str> {
+        let part_size = part_size_from_superblock(part_lba)
+            .ok_or("no ext4 superblock at partition start")?;
         unsafe {
             if IFACE.ph_bbuf.is_null() {
                 IFACE.ph_bbuf = core::ptr::addr_of_mut!(PH_BBUF) as *mut u8;
@@ -234,7 +269,7 @@ impl Lwext4Fs {
             let bdev = Box::leak(Box::new(Ext4Blockdev {
                 bdif: core::ptr::addr_of_mut!(IFACE),
                 part_offset: part_lba as u64 * 512,
-                part_size: 0x20_0000_0000, // permissive (128 GiB); reads stay within the fs
+                part_size, // the fs's own extent — see part_size_from_superblock
                 bc: core::ptr::null_mut(),
                 lg_bsize: 0,
                 lg_bcnt: 0,
