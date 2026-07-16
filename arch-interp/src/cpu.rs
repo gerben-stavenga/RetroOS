@@ -228,7 +228,9 @@ fn build() -> Unicorn<'static, Ctx> {
         // full slice exit/re-entry. Falls through (and stops) for sensitive
         // opcodes, a CS change, or an unmapped code page — the slice loop
         // routes those to `step_virtual_if` exactly as before.
-        if vector == 1 && !is_int {
+        // Skip the fast path under the delta prototype: every #DB must reach
+        // `db_gate` (the post-tag trap that restores VIF looks like a plain step).
+        if vector == 1 && !is_int && !arch_abi::monitor::delta_mode() {
             if let Some(w) = uc.get_data().vif_watch {
                 use RegisterX86 as R;
                 if uc.reg_read(R::CS).unwrap_or(0) as u16 == w.cs {

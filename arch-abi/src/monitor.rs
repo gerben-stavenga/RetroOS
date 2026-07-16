@@ -20,7 +20,7 @@
 //! (port emulation, soft INT dispatch, idle) return a typed [`KernelEvent`].
 
 use crate::{Arch, GuestBytes, IoSize, KernelEvent, Regs, UserMode};
-use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 /// Result of one monitor decode step. `Resume` is the fast path — the caller
 /// returns to ring-3. `Event(e)` carries a typed kernel event to bubble up.
@@ -790,7 +790,11 @@ pub fn exec_bp_hit<A: Arch>(arch: &mut A, regs: &mut Regs) -> bool {
 /// own) and in VM86 (where every IF-touching op faults, so nothing can be lost).
 pub fn gp_gate<A: Arch>(arch: &mut A, regs: &mut Regs, entry_ip: u32, vif_was_on: bool) {
     if virtual_if_stepping(regs) && regs.mode() != UserMode::VM86 {
-        let _ = if_gate(arch, regs, entry_ip, vif_was_on);
+        if DELTA_MODE.load(Relaxed) {
+            gp_gate_delta(arch, regs, entry_ip, vif_was_on);
+        } else {
+            let _ = if_gate(arch, regs, entry_ip, vif_was_on);
+        }
     }
 }
 
@@ -801,6 +805,9 @@ pub fn gp_gate<A: Arch>(arch: &mut A, regs: &mut Regs, entry_ip: u32, vif_was_on
 /// stepping at all — nothing in the kernel arms it, but a stale bit in the
 /// client's flags would loop.
 pub fn db_gate<A: Arch>(arch: &mut A, regs: &mut Regs, bp_hit: bool) -> MonitorResult {
+    if DELTA_MODE.load(Relaxed) {
+        return db_gate_delta(arch, regs);
+    }
     if bp_hit && exec_bp_hit(arch, regs) {
         return MonitorResult::Resume;
     }
@@ -810,6 +817,224 @@ pub fn db_gate<A: Arch>(arch: &mut A, regs: &mut Regs, bp_hit: bool) -> MonitorR
         regs.clear_flag32(TF_FLAG);
         MonitorResult::Resume
     }
+}
+
+// ── PROTOTYPE: Windows-style "tag TF in the saved flags" virtual-IF path ─────
+//
+// Instead of learning each window's EXIT ADDRESS and arming a DR breakpoint,
+// learn the STACK OFFSET of the flags word the exit will reload (delta from the
+// CLI-entry SP), and at the CLI set TF *in that flags word*. The client's POPF/
+// IRET then drops IF (the quirk) but loads TF (not IOPL-gated), so a #DB fires
+// one instruction later and we restore VIF there — deterministic, no DR regs,
+// no union, no repair/stack heuristic. STI exits still #GP on their own.
+// See `dpmi-iopl3-single-step-cost` / the vogons thread (jmarsh) + Raymond Chen
+// "Getting MS-DOS games to run on Windows 95: the interrupt flag".
+//
+// Default OFF (the proven DR path stays intact); flip with `set_delta_mode` for
+// A/B on the TCG engine.
+
+/// Prototype toggle — route the gates through the delta path.
+pub static DELTA_MODE: AtomicBool = AtomicBool::new(false);
+/// Enable/disable the prototype virtual-IF path at runtime.
+pub fn set_delta_mode(on: bool) {
+    DELTA_MODE.store(on, Relaxed);
+}
+/// Is the prototype delta path active? (Backends gate their step fast-paths on
+/// this so every #DB reaches `db_gate`.)
+#[inline]
+pub fn delta_mode() -> bool {
+    DELTA_MODE.load(Relaxed)
+}
+
+// Per-CLI-site exit class, keyed by the same hash as `SITE_IP`:
+//   0            unlearned
+//   STI_CLASS    StiEnabled (exit is an STI, which #GPs on its own)
+//   FLAG_BIT|d   FlagOffset(d): flags word sits at CLI-entry-SP + d
+const STI_CLASS: u32 = 1;
+const FLAG_BIT: u32 = 0x8000_0000;
+static SITE_CLASS: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+
+// Active-window state for the delta path:
+//   0 idle · 1 learning (single-stepping) · 2 tagged (ran free, awaiting the
+//   post-POPF/IRET #DB).
+static WIN: AtomicU32 = AtomicU32::new(0);
+
+fn get_class(cli_ip: u32) -> u32 {
+    site_find(cli_ip).map_or(0, |i| SITE_CLASS[i].load(Relaxed))
+}
+fn set_class(cli_ip: u32, class: u32) {
+    if cli_ip != 0 {
+        SITE_CLASS[site_entry(cli_ip)].store(class, Relaxed);
+    }
+}
+
+/// Does `w` look like a saved-flags image we want to re-enable IF from? IF set,
+/// reserved bit 1 set, TF clear. Checks only the low 16 bits, so it is valid
+/// whether the pushed image was 16- or 32-bit.
+fn looks_like_flags(w: u32) -> bool {
+    w & IF_FLAG != 0 && w & 2 != 0 && w & TF_FLAG == 0
+}
+
+/// Linear address of the flags word `d` bytes above the CLI-entry SP.
+fn flags_lin<A: Arch>(regs: &Regs, d: u32) -> u32 {
+    let (ss_base, _) = stack_view::<A>(regs);
+    ss_base.wrapping_add(CUR_SP.load(Relaxed).wrapping_add(d))
+}
+
+/// `gp_gate` when `DELTA_MODE` is on. Called for Repair/Iopl3 PM clients only.
+fn gp_gate_delta<A: Arch>(arch: &mut A, regs: &mut Regs, entry_ip: u32, vif_was_on: bool) {
+    let vif_on = regs.flags32() & VIF_FLAG != 0;
+    if vif_on {
+        // Window closed. If we were learning and it closed by STI (VIF turned
+        // on while we were mid-learn), record StiEnabled for this site.
+        if !vif_was_on && WIN.load(Relaxed) == 1 {
+            set_class(CUR_SITE.load(Relaxed), STI_CLASS);
+        }
+        WIN.store(0, Relaxed);
+        CUR_SITE.store(0, Relaxed);
+        regs.clear_flag32(TF_FLAG);
+        return;
+    }
+    if !vif_was_on {
+        // Already inside a window (some other #GP). Keep stepping iff learning.
+        if WIN.load(Relaxed) == 1 {
+            regs.set_flag32(TF_FLAG);
+        } else {
+            regs.clear_flag32(TF_FLAG);
+        }
+        return;
+    }
+    // VIF just went 1 -> 0: a new window opens at `entry_ip`.
+    CUR_SITE.store(entry_ip, Relaxed);
+    CUR_SP.store(regs.sp32(), Relaxed);
+    WINDOWS.fetch_add(1, Relaxed);
+
+    if if_mode(regs) != IfMode::Iopl3 {
+        let class = get_class(entry_ip);
+        if class == STI_CLASS {
+            // Run free — the STI will #GP and close it.
+            WIN.store(0, Relaxed);
+            PREDICTED_WINDOWS.fetch_add(1, Relaxed);
+            regs.clear_flag32(TF_FLAG);
+            return;
+        }
+        if class & FLAG_BIT != 0 {
+            let d = class & !FLAG_BIT;
+            let addr = flags_lin::<A>(regs, d);
+            let w: u32 = arch.read(addr as usize);
+            if looks_like_flags(w) {
+                arch.write(addr as usize, w | TF_FLAG); // tag: TF rides the flags
+                WIN.store(2, Relaxed);
+                PREDICTED_WINDOWS.fetch_add(1, Relaxed);
+                regs.clear_flag32(TF_FLAG);
+                return;
+            }
+            // Validity miss (stale delta / operand-size shift) → relearn.
+        }
+    }
+    // Unlearned / miss / Iopl3: learn by single-stepping.
+    WIN.store(1, Relaxed);
+    regs.set_flag32(TF_FLAG);
+}
+
+/// `db_gate` when `DELTA_MODE` is on.
+fn db_gate_delta<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
+    match WIN.load(Relaxed) {
+        // Post-tag: the tagged POPF/IRET ran on the CPU, dropped IF, loaded TF.
+        // Restore VIF one instruction late.
+        2 => {
+            regs.set_flags32(regs.flags32() | VIF_FLAG);
+            regs.clear_flag32(TF_FLAG);
+            WIN.store(0, Relaxed);
+            CUR_SITE.store(0, Relaxed);
+            BP_HITS.fetch_add(1, Relaxed); // "closed by the tag"
+            MonitorResult::Resume
+        }
+        // Learning single-step: emulate sensitive ops, detect the exit, record
+        // the delta.
+        1 => step_learn_delta(arch, regs),
+        // Stray #DB (self-heal of a leaked tag, or a real step). If VIF is off a
+        // tag fired late — set it. Always clear TF.
+        _ => {
+            if regs.flags32() & VIF_FLAG == 0 {
+                regs.set_flags32(regs.flags32() | VIF_FLAG);
+            }
+            regs.clear_flag32(TF_FLAG);
+            MonitorResult::Resume
+        }
+    }
+}
+
+/// Single-step a window to learn its exit class + `delta`. Mirrors
+/// `step_virtual_if`, but on the exit records `FlagOffset`/`StiEnabled` instead
+/// of interning an address.
+fn step_learn_delta<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
+    const BUDGET: usize = 64;
+    for _ in 0..BUDGET {
+        if regs.flags32() & VIF_FLAG != 0 {
+            regs.clear_flag32(TF_FLAG);
+            WIN.store(0, Relaxed);
+            return MonitorResult::Resume;
+        }
+        let (cs_base, cs_32) = code_view::<A>(regs);
+        let mut p = regs.ip32();
+        let mut has66 = false;
+        loop {
+            let b = arch.read::<u8>(cs_base.wrapping_add(p) as usize);
+            if b == 0x66 {
+                has66 = true;
+                p = p.wrapping_add(1);
+            } else if matches!(b, 0x67 | 0xF0 | 0xF2 | 0xF3) {
+                p = p.wrapping_add(1);
+            } else {
+                break;
+            }
+        }
+        let op = arch.read::<u8>(cs_base.wrapping_add(p) as usize);
+        if !matches!(op, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB) {
+            HW_STEPS.fetch_add(1, Relaxed);
+            regs.set_flag32(TF_FLAG);
+            return MonitorResult::Resume;
+        }
+        // Capture SP + operand size BEFORE emulating (needed if this is the exit).
+        // Operand width = CS default (D bit) XOR a 0x66 prefix.
+        let op32 = cs_32 ^ has66;
+        let sp_before = regs.sp32();
+        match monitor_rs::<A>(arch, regs) {
+            MonitorResult::Resume => {
+                if regs.flags32() & VIF_FLAG != 0 {
+                    // This instruction re-enabled VIF — it is the window's exit.
+                    let cli = CUR_SITE.load(Relaxed);
+                    match op {
+                        0xFB => set_class(cli, STI_CLASS), // STI: no stack flags
+                        0x9D | 0xCF => {
+                            // POPF: flags at [sp]. IRET: flags after EIP+CS,
+                            // i.e. [sp + 8] (32-bit) or [sp + 4] (16-bit).
+                            let instr_off = match (op, op32) {
+                                (0xCF, true) => 8,
+                                (0xCF, false) => 4,
+                                _ => 0,
+                            };
+                            let d = sp_before
+                                .wrapping_add(instr_off)
+                                .wrapping_sub(CUR_SP.load(Relaxed));
+                            set_class(cli, FLAG_BIT | (d & !FLAG_BIT));
+                        }
+                        _ => {}
+                    }
+                    WIN.store(0, Relaxed);
+                    CUR_SITE.store(0, Relaxed);
+                    regs.clear_flag32(TF_FLAG);
+                    return MonitorResult::Resume;
+                }
+                continue;
+            }
+            ev @ MonitorResult::Event(_) => return ev,
+        }
+    }
+    HW_STEPS.fetch_add(1, Relaxed);
+    regs.set_flag32(TF_FLAG);
+    MonitorResult::Resume
 }
 
 /// Is a hardware single step pending for this guest? The monitor owns TF: it
