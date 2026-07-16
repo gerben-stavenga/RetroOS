@@ -228,7 +228,7 @@ impl VifMap {
                 arch_abi::monitor::MonitorResult::Resume => {
                     if regs.flags32() & VIF_FLAG != 0 {
                         if let Some(a) = self.active {
-                            let class = classify_exit(arch, regs, &a, op, op32, cs_base, sp_before, ip_before);
+                            let class = classify_exit(arch, regs, &a, op, op32, sp_before, ip_before);
                             self.sites.insert(a.cli_ip, class);
                         }
                         regs.clear_flag32(TF_FLAG);
@@ -261,7 +261,6 @@ fn classify_exit<A: Arch>(
     a: &Active,
     op: u8,
     op32: bool,
-    cs_base: u32,
     sp_before: u32,
     ip_before: u32,
 ) -> Class {
@@ -282,6 +281,9 @@ fn classify_exit<A: Arch>(
     //    `Reg(r1)` runs free; its absence proves coincidence → fall through to
     //    the memory delta (d < 0 keeps stepping).
     if op == 0x9D {
+        // POPF never changes CS, so the code base is still the faulting CS's —
+        // resolve it here instead of threading it through the call.
+        let cs_base = code_view::<A>(regs).0;
         let popped: u32 = arch.read(stack_base::<A>(regs).wrapping_add(sp_before) as usize);
         let m = if op32 { u32::MAX } else { 0xFFFF };
         if let Some(r) = a.probe {
