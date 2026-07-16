@@ -34,6 +34,16 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // derives from this.
     let platform = crate::kernel::platform::probe(machine, boot);
 
+    // Disk-write policy: on real hardware the boot disk is someone's actual
+    // home partition, so writes land in a volatile RAM overlay — everything
+    // above (lwext4 journal, savegames, configs) works normally in-session,
+    // nothing persists. QEMU/hosted runs write through to their image file.
+    // Armed before any mount, so no ext4 write can ever precede it.
+    if platform.host == crate::kernel::platform::Host::Metal {
+        crate::kernel::block::arm_ram_overlay();
+        crate::screenln!(screen, "Disk writes: volatile RAM overlay (real hardware) — changes will NOT persist");
+    }
+
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
