@@ -22,6 +22,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The ~14 GB runner disk is the CI's real constraint: the restored bazel
+      # disk cache + rust toolchain fetch + build outputs overflowed it, and a
+      # full disk fails in maximally confusing ways (build_tar exit 1 with no
+      # message on master; "No space left on device" mid-toolchain-fetch here).
+      # Drop the preinstalled toolchains this build never uses (~10+ GB back).
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+
       # `nasm` for the apps/tests `.COM` genrules (apps/tests/*/BUILD.bazel shell
       # out to system nasm; the bootloader uses hermetic rules_nasm instead).
       # ubuntu-latest doesn't ship nasm, so //:image's analysis fails without it.
@@ -97,3 +108,22 @@ jobs:
       # New tests are wired up by adding a line to test/run_all.sh.
       - name: End-to-end tests
         run: test/run_all.sh
+
+      # Cap the disk cache BEFORE the post-job cache save: it only ever grows
+      # (every lockfile bump saves a bigger cache under a new key), and once
+      # restored-cache + toolchains + outputs exceed the runner disk, builds
+      # die with ENOSPC in whatever action happens to write next. Keep the
+      # newest ~3 GiB by access time; drop the tail.
+      - name: Trim bazel disk cache
+        if: always()
+        run: |
+          if [ -d ~/.cache/bazel-disk ]; then
+            du -sh ~/.cache/bazel-disk || true
+            # Cache entries are content-hash filenames — no spaces, plain text safe.
+            find ~/.cache/bazel-disk -type f -printf '%A@ %s %p\n' 2>/dev/null | \
+              sort -rn | \
+              awk -v budget=$((3*1024*1024*1024)) '{tot+=$2; if (tot>budget) print $3}' | \
+              xargs -r rm -f
+            du -sh ~/.cache/bazel-disk || true
+          fi
+          df -h /
