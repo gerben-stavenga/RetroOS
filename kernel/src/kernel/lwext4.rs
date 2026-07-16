@@ -101,6 +101,7 @@ unsafe extern "C" {
     fn ext4_dir_close(dir: *mut Ext4Dir) -> i32;
     fn ext4_dir_entry_next(dir: *mut Ext4Dir) -> *const Ext4Direntry;
     fn ext4_mode_get(path: *const u8, mode: *mut u32) -> i32;
+    fn ext4_readlink(path: *const u8, buf: *mut u8, bufsize: usize, rcnt: *mut usize) -> i32;
     fn ext4_umount(mount_point: *const u8) -> i32;
     fn ext4_device_unregister(dev_name: *const u8) -> i32;
     /// No-follow check: EOK iff `path`'s final component is itself a symlink
@@ -228,6 +229,30 @@ fn part_size_from_superblock(part_lba: u32) -> Option<u64> {
     blocks.checked_mul(1024u64 << log_bs)
 }
 
+/// Lexically fold `.` / `..` / empty segments out of a mount-relative path.
+/// A `..` above the mount root is clamped at the root (it can't escape the
+/// partition), matching how the kernel would resolve `/..` == `/`.
+fn normalize(path: &[u8]) -> Vec<u8> {
+    let mut segs: Vec<&[u8]> = Vec::new();
+    for seg in path.split(|&b| b == b'/') {
+        match seg {
+            b"" | b"." => {}
+            b".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    let mut out = Vec::with_capacity(path.len());
+    for (i, s) in segs.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(s);
+    }
+    out
+}
+
 fn leak_cstr(s: &[u8]) -> *const u8 {
     let mut v: Vec<u8> = Vec::with_capacity(s.len() + 1);
     v.extend_from_slice(s);
@@ -326,8 +351,16 @@ impl Lwext4Fs {
         }
     }
 
-    /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`.
+    /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`,
+    /// following symlinks first — so callers address the physical object.
+    /// Use [`cpath_nofollow`] where the link ITSELF is the subject.
     fn cpath(&self, rel: &[u8], buf: &mut [u8; 320]) -> Option<*const u8> {
+        let real = self.real(rel);
+        self.cpath_nofollow(&real, buf)
+    }
+
+    /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`.
+    fn cpath_nofollow(&self, rel: &[u8], buf: &mut [u8; 320]) -> Option<*const u8> {
         let mut n = 0;
         for &b in self.mp.iter().chain(rel.iter()) {
             if n >= buf.len() - 1 {
@@ -379,30 +412,97 @@ impl Lwext4Fs {
     /// Is `rel`'s final component a symlink? (No-follow — the real escape check.)
     fn is_symlink(&self, rel: &[u8]) -> bool {
         let mut buf = [0u8; 320];
-        match self.cpath(rel, &mut buf) {
+        match self.cpath_nofollow(rel, &mut buf) {
             Some(cpath) => (unsafe { ext4_inode_exist(cpath, EXT4_DE_SYMLINK) }) == EOK,
             None => false,
         }
     }
 
-    /// May a write touch `path`? Lexically in-zone AND no path component is a
-    /// symlink — so the (already-resolved-lexically) string path is also the
-    /// physical path lwext4 will resolve, closing the `home/retroos/link → /bin`
-    /// escape. Only called when a write is actually attempted, so the per-
-    /// component `ext4_inode_exist` cost is off the read hot path.
-    fn write_allowed(&self, path: &[u8]) -> bool {
-        if !self.in_zone(path) {
-            return false;
+    /// Read `rel`'s symlink target (mount-relative in, raw target out).
+    fn readlink(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 320];
+        let cpath = self.cpath_nofollow(rel, &mut buf)?;
+        let mut tgt = [0u8; 256];
+        let mut rcnt = 0usize;
+        if unsafe { ext4_readlink(cpath, tgt.as_mut_ptr(), tgt.len(), &mut rcnt) } != EOK {
+            return None;
         }
-        // Check every prefix component (and the full path) for a symlink. We
-        // reject at the first, so components before it are confirmed real dirs
-        // and the string prefixes are the true physical prefixes.
-        for (i, &b) in path.iter().enumerate() {
-            if b == b'/' && i > 0 && self.is_symlink(&path[..i]) {
-                return false;
+        Some(tgt[..rcnt.min(tgt.len())].to_vec())
+    }
+
+    /// Resolve every symlink in `rel` to the physical path lwext4 can open.
+    ///
+    /// lwext4's own lookup does NOT follow symlinks (only `ext4_readlink` reads
+    /// them), so a symlinked directory otherwise surfaces as a "file" whose
+    /// contents are its target string — a real `home/retroos` full of symlinks
+    /// listed as garbage. Resolve here, once, and hand lwext4 a real path.
+    ///
+    /// Targets are interpreted INSIDE this mount: a leading `/` means the mount
+    /// root (the ext4 partition's own root), not the VFS root — the same frame
+    /// the link was authored in when the partition was someone's `/`. Bounded by
+    /// `MAX_HOPS` so a symlink loop terminates instead of hanging.
+    fn resolve(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        const MAX_HOPS: u32 = 16;
+        let mut path = normalize(rel);
+        let mut hops = 0;
+        loop {
+            // Leftmost symlink component (or the whole path).
+            let mut at = None;
+            for (i, &b) in path.iter().enumerate() {
+                if b == b'/' && i > 0 && self.is_symlink(&path[..i]) {
+                    at = Some(i);
+                    break;
+                }
             }
+            if at.is_none() && !path.is_empty() && self.is_symlink(&path) {
+                at = Some(path.len());
+            }
+            let Some(i) = at else { return Some(path) };
+            hops += 1;
+            if hops > MAX_HOPS {
+                return None; // loop, or a chain too deep to be real
+            }
+            let target = self.readlink(&path[..i])?;
+            let mut next = Vec::with_capacity(path.len() + target.len());
+            if target.first() == Some(&b'/') {
+                next.extend_from_slice(&target[1..]); // mount-absolute
+            } else {
+                // Relative to the link's own directory.
+                let parent = path[..i].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                next.extend_from_slice(&path[..parent]);
+                if !next.is_empty() {
+                    next.push(b'/');
+                }
+                next.extend_from_slice(&target);
+            }
+            next.extend_from_slice(&path[i..]); // the untraversed remainder
+            path = normalize(&next);
         }
-        !path.is_empty() && !self.is_symlink(path)
+    }
+
+    /// `resolve`, falling back to the original path when it resolves to nothing
+    /// (a broken/looping link) so callers keep their previous behaviour: lwext4
+    /// reports the miss, we don't invent one.
+    fn real(&self, rel: &[u8]) -> Vec<u8> {
+        self.resolve(rel).unwrap_or_else(|| rel.to_vec())
+    }
+
+    /// May a write touch `path`? The zone check must apply to the PHYSICAL
+    /// object, so resolve every symlink first and judge the result: a link
+    /// escaping the zone (`home/retroos/link → /bin`) resolves outside and is
+    /// refused, while a link that stays inside (a real `home/retroos` is mostly
+    /// symlinks) stays writable — savegames land where the user put them.
+    ///
+    /// Resolving and then judging is what makes this sound: the returned path is
+    /// the one lwext4 will actually open, so there is no second resolution left
+    /// to disagree with the verdict. An unresolvable path (broken/looping link)
+    /// is refused outright. Only called on a real write, so the per-component
+    /// `ext4_inode_exist` cost stays off the read hot path.
+    fn write_allowed(&self, path: &[u8]) -> bool {
+        let Some(real) = self.resolve(path) else {
+            return false;
+        };
+        !real.is_empty() && self.in_zone(&real)
     }
 
     fn alloc_handle(&self, file: Ext4File, writable: bool) -> u64 {
@@ -510,7 +610,21 @@ impl Filesystem for Lwext4Fs {
                 continue;
             }
             if i == index {
-                let is_dir = e.inode_type == EXT4_DE_DIR;
+                let mut rel = Vec::with_capacity(dir.len() + 1 + name.len());
+                rel.extend_from_slice(dir);
+                if !rel.is_empty() && *rel.last().unwrap() != b'/' {
+                    rel.push(b'/');
+                }
+                rel.extend_from_slice(name);
+                // A symlink must present its TARGET's identity: the dirent type
+                // says SYMLINK, and reporting that as a plain file made a
+                // symlinked directory list as a corrupt "file" whose bytes are
+                // the target path. Resolve, then classify off the real object.
+                let is_dir = if i32::from(e.inode_type) == EXT4_DE_SYMLINK {
+                    self.dir_exists(&rel)
+                } else {
+                    e.inode_type == EXT4_DE_DIR
+                };
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100],
@@ -520,15 +634,9 @@ impl Filesystem for Lwext4Fs {
                     mode: if is_dir { 0o755 } else { 0o644 },
                 };
                 de.name[..name_len].copy_from_slice(&name[..name_len]);
-                // Size for regular files: open the child and read its size.
+                // Size/mode for regular files: open the (resolved) child.
                 if !is_dir {
                     let mut child = [0u8; 320];
-                    let mut rel = Vec::with_capacity(dir.len() + 1 + name.len());
-                    rel.extend_from_slice(dir);
-                    if !rel.is_empty() && *rel.last().unwrap() != b'/' {
-                        rel.push(b'/');
-                    }
-                    rel.extend_from_slice(name);
                     if let Some(cchild) = self.cpath(&rel, &mut child) {
                         let mut f: Ext4File = unsafe { core::mem::zeroed() };
                         if unsafe { ext4_fopen(&mut f, cchild, c"rb".as_ptr().cast()) } == EOK {
