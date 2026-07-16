@@ -21,7 +21,8 @@ use crate::kernel::startup;
 use super::machine;
 use super::mode_transitions::{seg_base, seg_is_32};
 
-mod vif;
+pub(in crate::kernel::dos) mod vif;
+pub(in crate::kernel::dos) use self::vif::DbResult;
 mod state;
 pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PSP_SEL};
 use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX};
@@ -210,20 +211,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
         regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16,
         regs.code_seg(), regs.ip32() as u16);
-
-    // Optional PM TF single-step arming.
-    #[allow(dead_code)]
-    if false {
-        use core::sync::atomic::Ordering;
-        if dos::PM_STEP_BUDGET.load(Ordering::Relaxed) == 0 {
-            static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-            if !ONCE.swap(true, Ordering::Relaxed) {
-                dos::PM_STEP_BUDGET.store(200_000, Ordering::Relaxed);
-                regs.set_flag32(1 << 8); // TF on return to client
-                dos_trace!("[STEP] armed 200000 steps at first INT 31 (PM init)");
-            }
-        }
-    }
 
     match ax {
         // AX=0000h — Allocate LDT Descriptors

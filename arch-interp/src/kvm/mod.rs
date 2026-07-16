@@ -14,7 +14,7 @@ mod shim;
 #[cfg(test)]
 mod tests;
 
-pub use run::{execute, set_exec_breakpoints};
+pub use run::execute;
 
 /// Host-side page-table edits invalidated guest translations. The execute loop
 /// re-loads SREGS (CR3 included) on every guest entry — KVM resets the vcpu's

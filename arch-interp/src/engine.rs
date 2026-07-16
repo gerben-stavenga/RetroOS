@@ -14,7 +14,7 @@
 
 #[cfg(feature = "tcg")]
 mod imp {
-    pub use crate::cpu::{execute, invalidate_code_range, set_exec_breakpoints};
+    pub use crate::cpu::{execute, invalidate_code_range};
     /// Flush all cached translations (context switch / space teardown).
     pub fn flush() {
         crate::cpu::flush_uc()
@@ -33,7 +33,7 @@ mod imp {
 
 #[cfg(feature = "kvm")]
 mod imp {
-    pub use crate::kvm::{allow_io_ports, execute, fx_switch, reset_io_bitmap, set_exec_breakpoints};
+    pub use crate::kvm::{allow_io_ports, execute, fx_switch, reset_io_bitmap};
     /// The guest TLB is real: mark it dirty so the next entry flushes it.
     pub fn flush() {
         crate::kvm::mark_tlb_dirty()

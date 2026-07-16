@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Stage-1 scaffold: wired in Stage 2
 //! Virtual interrupt-flag (IF) virtualization for protected-mode DPMI clients —
 //! the single path, owned by the address space.
 //!
@@ -74,7 +73,10 @@ impl VifMap {
                 self.stats[1] = self.stats[1].wrapping_add(1);
                 regs.clear_flag32(TF_FLAG);
             }
-            Some(Class::Flags(d)) => {
+            // A flags word at or ABOVE the CLI's SP (d >= 0) was pushed BEFORE the
+            // CLI, so it exists now and nothing rewrites it before the exit reads
+            // it — tag it in place and run free.
+            Some(Class::Flags(d)) if d >= 0 => {
                 let addr = stack_base(arch, regs).wrapping_add(cli_sp.wrapping_add(d as u32));
                 let w: u32 = arch.read(addr as usize);
                 if looks_like_flags(w) {
@@ -85,6 +87,10 @@ impl VifMap {
                     self.begin_learn(regs); // stale delta (wrong page / SMC) → relearn
                 }
             }
+            // A word BELOW cli_sp (d < 0) is pushed AFTER the CLI (the exit builds
+            // its own flags image), so a CLI-time tag would be overwritten before
+            // the POPF/IRET reads it — step to catch the real exit every time.
+            Some(Class::Flags(_)) => self.begin_learn(regs),
             None => self.begin_learn(regs),
         }
     }

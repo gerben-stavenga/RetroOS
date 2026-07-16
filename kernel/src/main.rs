@@ -114,10 +114,6 @@ fn main() {
     // platform probe reads (HostStdout debug, no fbcon, not metal).
     install_hosted_backend();
     install_socket_backend_hosted();
-    // Prototype: VIF_DELTA=1 routes virtual-IF through the delta (tag-TF) path.
-    if std::env::var("VIF_DELTA").as_deref() == Ok("1") {
-        kernel::set_vif_delta(true);
-    }
     kernel::host_console_init();
     // Display: the kernel emulates the VGA (single-VGA design) and renders
     // frames through its present sink; we just park them in the backend's

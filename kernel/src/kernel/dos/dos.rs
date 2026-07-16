@@ -1245,12 +1245,26 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 let mut buf = alloc::vec![0u8; count];
                 let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
                 if n >= 0 {
+                    let got = (n as usize).min(count);
                     machine::vga::copy_to_guest(
                         machine,
                         &mut dos.pc.vga,
                         buf_addr as usize,
-                        &buf[..(n as usize).min(count)],
+                        &buf[..got],
                     );
+                    // An overlay reload can drop fresh code onto a page that a
+                    // prior CLI window was learned at; drop those stale entries so
+                    // dpmi::vif re-learns instead of running free on a wrong exit.
+                    // PM clients run flat (EIP == linear), so `buf_addr` shares the
+                    // site keys' page basis. (Over-invalidation of a data read just
+                    // costs one re-learn — retain scans a 64-slot table.)
+                    if got > 0
+                        && let Some(dpmi) = dos.dpmi.as_mut()
+                    {
+                        for page in (buf_addr >> 12)..=((buf_addr + got as u32 - 1) >> 12) {
+                            dpmi.vif.invalidate_page(page);
+                        }
+                    }
                     if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
                     let dump_n = (n as usize).min(16);
                     let mut hex = [0u8; 16];

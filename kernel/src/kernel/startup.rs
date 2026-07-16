@@ -822,6 +822,7 @@ impl EventStats {
             KE::PageFault { .. } => 8,
             KE::Exception(_) => 9,
             KE::Syscall => 10,
+            KE::VifWindow { .. } | KE::VifStep => 1,
         };
         self.counts[idx] += 1;
         if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {

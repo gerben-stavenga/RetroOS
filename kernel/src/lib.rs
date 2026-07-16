@@ -58,12 +58,6 @@ pub use arch_abi::{
     parse_debug_watch, LOW_MEM_BASE, PAGE_SIZE, RawPage,
 };
 
-/// Prototype toggle: route the virtual-IF machinery through the delta path
-/// (tag TF in the saved flags) instead of DR breakpoints. See arch_abi::monitor.
-pub fn set_vif_delta(on: bool) {
-    arch_abi::monitor::set_delta_mode(on);
-}
-
 pub use kernel::startup::startup;
 pub use kernel::platform::{set_host_env, DebugSink, HostEnv};
 pub use kernel::portio::{install_portio, PortIo};

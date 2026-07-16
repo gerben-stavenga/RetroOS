@@ -6,17 +6,16 @@
 //! page tables are live, so guest memory is reached by dereferencing the linear
 //! address directly, and selectors resolve through `descriptors::seg_base`.
 //!
-//! The public surface (`monitor`, `step_virtual_if`, `sw_reflect_vm86_int`,
-//! `seg_base`, `seg_is_32`, `MonitorResult`, `virtual_if_stepping`, plus the
-//! re-exported `KernelEvent`/`IoSize`) is unchanged — callers in `traps.rs` /
-//! `backend.rs` keep resolving `crate::monitor::*` as before.
+//! The public surface (`monitor`, `sw_reflect_vm86_int`, `seg_base`,
+//! `seg_is_32`, `MonitorResult`, plus the re-exported `KernelEvent`/`IoSize`) is
+//! resolved as `crate::monitor::*` by callers in `traps.rs` / `backend.rs`.
 
 use arch_abi::Regs;
 
 // Backend-agnostic arch↔kernel contract types, re-exported so
 // `crate::monitor::{KernelEvent, IoSize}` keeps resolving.
 pub use arch_abi::{IoSize, KernelEvent};
-pub use arch_abi::monitor::{virtual_if_stepping, MonitorResult};
+pub use arch_abi::monitor::MonitorResult;
 
 // Segment resolution (re-exported from descriptors).
 pub use crate::descriptors::{seg_base, seg_is_32};
@@ -38,26 +37,6 @@ pub fn monitor(regs: &mut Regs) -> MonitorResult {
     arch_abi::monitor::monitor(&mut crate::backend::Metal, regs)
 }
 
-/// Virtual-IF single-step driver for PM clients — see
-/// [`arch_abi::monitor::step_virtual_if`].
-#[inline]
-pub fn step_virtual_if(regs: &mut Regs) -> MonitorResult {
-    arch_abi::monitor::step_virtual_if(&mut crate::backend::Metal, regs)
-}
-
-/// Post-#GP virtual-IF gate — see [`arch_abi::monitor::gp_gate`].
-#[inline]
-pub fn gp_gate(regs: &mut Regs, entry_ip: u32, vif_was_on: bool) {
-    arch_abi::monitor::gp_gate(&mut crate::backend::Metal, regs, entry_ip, vif_was_on)
-}
-
-/// #DB gate: exit breakpoint (DR6 B0..B3) or single-step — see
-/// [`arch_abi::monitor::db_gate`].
-#[inline]
-pub fn db_gate(regs: &mut Regs, bp_hit: bool) -> MonitorResult {
-    arch_abi::monitor::db_gate(&mut crate::backend::Metal, regs, bp_hit)
-}
-
 /// SW equivalent of the CPU's VM86 INT dispatch — see
 /// [`arch_abi::monitor::sw_reflect_vm86_int`]. Memory reaches the active space
 /// through `Metal` (`GuestBytes`).
@@ -69,34 +48,4 @@ pub fn db_gate(regs: &mut Regs, bp_hit: bool) -> MonitorResult {
 #[inline]
 pub unsafe fn sw_reflect_vm86_int(regs: &mut Regs, vector: u8) {
     arch_abi::monitor::sw_reflect_vm86_int(regs, &mut crate::backend::Metal, vector)
-}
-
-/// Log one PM/VM86 single-step: CS:EIP + key regs + the first opcode bytes.
-/// Armed via `arch_abi::PM_STEP_BUDGET`; the single-step `#DB` handler calls
-/// this each step until the budget drains. Pure arch-level instruction tracing.
-pub fn pm_step_log(regs: &crate::Vcpu) {
-    use arch_abi::GuestBytes;
-    let is_vm86 = regs.frame.rflags & (1u64 << 17) != 0;
-    let (cs_base, mode) = if is_vm86 {
-        ((regs.code_seg() as u32) << 4, "RM")
-    } else {
-        let cs = regs.code_seg();
-        let m = if seg_is_32(cs) { "PM32" } else { "PM16" };
-        (seg_base(cs), m)
-    };
-    let ip = if mode == "PM32" { regs.ip32() } else { regs.ip32() & 0xFFFF };
-    let lin = cs_base.wrapping_add(ip);
-    let mut b = [0u8; 8];
-    for (i, byte) in b.iter_mut().enumerate() {
-        *byte = crate::backend::Metal.read::<u8>((lin + i as u32) as usize);
-    }
-    let f = regs.flags32();
-    lib::dbg_println!(
-        "[STEP {}] {:04X}:{:08X} VIF={} IF={} op={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X} SS:SP={:04X}:{:08X}",
-        mode, regs.code_seg(), ip,
-        (f >> 19) & 1, (f >> 9) & 1,
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
-        regs.frame.ss as u16, regs.sp32(),
-    );
 }

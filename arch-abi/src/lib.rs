@@ -22,19 +22,6 @@ pub use arch::{Arch, GuestBytes, Vcpu};
 
 pub mod monitor;
 
-/// Hardware execute breakpoints available for the virtual-IF exit set (DR0-DR3).
-pub const MAX_EXEC_BP: usize = 4;
-
-/// Single-step trace budget — a cross-boundary diagnostic, not an arch operation.
-/// Armed by the DOS/DPMI layer (kernel) to watch a client's code path after a
-/// suspicious return; consumed by the backend's single-step `#DB` handler, which
-/// decrements it and logs each step until it reaches zero. It lives here because
-/// it is the one piece of state the *arming* side (kernel) and the *consuming*
-/// side (backend) both touch, and both depend on this crate. Backends without a
-/// single-step trap (the interpreter) simply never read it.
-pub static PM_STEP_BUDGET: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
 /// Boot-time platform configuration, read once by the platform entry point and
 /// handed to `startup` — instead of the kernel poking firmware ports itself.
 ///
@@ -493,6 +480,15 @@ pub enum KernelEvent {
     Outs { size: IoSize, rep: bool, addr32: bool },
     /// Non-sensitive #GP or unknown opcode — reflect as fault.
     Fault,
+    /// A CLI/STI just toggled the virtual IF for a PM DPMI client — the DOS
+    /// personality's virtual-IF handler (`dpmi::vif`) opens/closes the window
+    /// against its per-address-space map. `vif_was_on` distinguishes CLI (1→0)
+    /// from STI (0→1). arch only reflects it — the policy lives in dos.
+    VifWindow { entry_ip: u32, vif_was_on: bool },
+    /// A #DB while a PM DPMI client is inside a virtual-IF window — either the
+    /// post-tag trap (a tagged POPF/IRET ran) or a learning single-step. Handled
+    /// by `dpmi::vif::on_db`.
+    VifStep,
 }
 
 impl KernelEvent {
@@ -511,6 +507,8 @@ impl KernelEvent {
     const OUTS:       u32 = 9;
     const FAULT:      u32 = 10;
     const SYSCALL:    u32 = 11;
+    const VIF_WINDOW: u32 = 12; // `vif_was_on` packed into tag bit 8; entry_ip in extra
+    const VIF_STEP:   u32 = 13;
 
     /// Encode into the `(event, extra)` u32 pair that flows across the
     /// arch→kernel boundary as `(eax, edx)`. Total over all variants.
@@ -529,12 +527,14 @@ impl KernelEvent {
             KernelEvent::Ins  { size, rep, addr32 } => (Self::INS,  (size as u32) | ((rep as u32) << 8) | ((addr32 as u32) << 9)),
             KernelEvent::Outs { size, rep, addr32 } => (Self::OUTS, (size as u32) | ((rep as u32) << 8) | ((addr32 as u32) << 9)),
             KernelEvent::Fault                => (Self::FAULT, 0),
+            KernelEvent::VifWindow { entry_ip, vif_was_on } => (Self::VIF_WINDOW | ((vif_was_on as u32) << 8), entry_ip),
+            KernelEvent::VifStep              => (Self::VIF_STEP, 0),
         }
     }
 
     /// Decode the `(event, extra)` pair produced by `encode`.
     pub fn decode(event: u32, extra: u32) -> Self {
-        match event {
+        match event & 0xFF {
             Self::IRQ        => KernelEvent::Irq,
             Self::PAGE_FAULT => KernelEvent::PageFault { addr: extra },
             Self::EXCEPTION  => KernelEvent::Exception(extra as u8),
@@ -546,6 +546,8 @@ impl KernelEvent {
             Self::INS        => KernelEvent::Ins  { size: IoSize::from_u32(extra), rep: extra & (1 << 8) != 0, addr32: extra & (1 << 9) != 0 },
             Self::OUTS       => KernelEvent::Outs { size: IoSize::from_u32(extra), rep: extra & (1 << 8) != 0, addr32: extra & (1 << 9) != 0 },
             Self::FAULT      => KernelEvent::Fault,
+            Self::VIF_WINDOW => KernelEvent::VifWindow { entry_ip: extra, vif_was_on: event & (1 << 8) != 0 },
+            Self::VIF_STEP   => KernelEvent::VifStep,
             _ => panic!("KernelEvent::decode: unknown tag {:#x}", event),
         }
     }

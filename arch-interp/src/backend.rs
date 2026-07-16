@@ -92,14 +92,6 @@ impl Arch for Interp {
     fn rearm_irq(&mut self, line: u8) { crate::calls::arch_rearm_irq(line) }
     fn set_debug_watch(&mut self, _addrs: Option<(u32, u32)>) {} // no write-watchpoint feature
 
-    /// Arm the virtual-IF exit breakpoints. Both engines implement them (KVM:
-    /// real DR0-3 via `KVM_SET_GUEST_DEBUG`; TCG: Unicorn code hooks), so a
-    /// hosted `Repair` client runs free on its learned exits exactly like metal
-    /// — no single-stepping, no divergence in DPMI timing behaviour.
-    fn set_exec_breakpoints(&mut self, addrs: &[u32]) -> bool {
-        crate::engine::set_exec_breakpoints(addrs)
-    }
-
     // ── Arch calls: paging / fork / LDT / DMA ──
     fn user_fork(&mut self, child: &mut RootPageTable) { crate::calls::arch_user_fork(child) }
     fn free_user_pages(&mut self) { crate::calls::arch_free_user_pages() }

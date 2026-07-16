@@ -119,6 +119,9 @@ pub struct DpmiState {
     /// `(initial_psp, PSP_SEL)` so the well-known selector keeps its
     /// CWSDPMI-shape value for clients that probe.
     pub(super) psp_cache: [PspCacheEntry; MAX_PSP_CACHE],
+    /// Virtual-IF state for this client's address space (per-CLI-site exit map +
+    /// the open window). Owned here, dropped with the client. See `vif.rs`.
+    pub(in crate::kernel::dos) vif: super::vif::VifMap,
 }
 
 /// Maximum tracked in-flight (dispatched, not yet returned) DPMI exceptions.
@@ -164,6 +167,7 @@ impl DpmiState {
             exc_frames: [(0, 0); MAX_EXC_NEST],
             exc_depth: 0,
             psp_cache: [PspCacheEntry::default(); MAX_PSP_CACHE],
+            vif: super::vif::VifMap::new(),
         }
     }
 }

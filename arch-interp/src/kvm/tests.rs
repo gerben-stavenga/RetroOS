@@ -228,10 +228,4 @@ fn kvm_engine_proofs() {
         0x1122_3344,
         "thread A's XMM0 restored across the switch"
     );
-
-    // ── The virtual-IF modes, on real hardware: DR0-3 via KVM_SET_GUEST_DEBUG.
-    // Folded in here rather than as its own #[test] because the live context is
-    // global (see this module's header). The TCG build runs the same source
-    // against Unicorn code hooks — that is the parity proof.
-    crate::vif_tests::proofs();
 }
