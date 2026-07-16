@@ -21,6 +21,7 @@ use crate::kernel::startup;
 use super::machine;
 use super::mode_transitions::{seg_base, seg_is_32};
 
+mod vif;
 mod state;
 pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PSP_SEL};
 use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX};
