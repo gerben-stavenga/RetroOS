@@ -1518,7 +1518,12 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
-                regs.rax = (regs.rax & !0xFFFF) | 4; // too many open files
+                // Map the VFS errno to a DOS error: EACCES (write-protected --
+                // the file/dir isn't RetroOS's to write) is 5 "access denied",
+                // the condition every DOS program already knows. Anything else
+                // stays 4 "too many open files" (the fd-exhaustion case).
+                let ax: u16 = if fd == -5 { 5 } else { 4 };
+                regs.rax = (regs.rax & !0xFFFF) | ax as u64;
                 regs.set_flag32(1);
             }
             thread::KernelAction::Done
