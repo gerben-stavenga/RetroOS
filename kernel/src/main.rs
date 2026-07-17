@@ -142,17 +142,22 @@ fn main() {
         arch::attach_audio(&path); // canonical audio device → WAV file
     }
 
-    let mut data = Vec::new();
+    // Sniff the ELF magic from the header alone — a disk image is attached by
+    // path and streamed (`attach_disk`), so slurping it whole here just to read
+    // four bytes put its entire size in RAM (a 200 GiB test disk OOM'd).
+    let mut magic = [0u8; 4];
     if let Some(path) = &input {
         std::fs::File::open(path)
-            .and_then(|mut f| f.read_to_end(&mut data))
+            .map(|mut f| {
+                let _ = f.read(&mut magic); // short file → stays zeroed, not ELF
+            })
             .unwrap_or_else(|e| {
                 eprintln!("retroos-host: cannot read {path}: {e}");
                 std::process::exit(1);
             });
     }
 
-    if data.starts_with(b"\x7fELF") {
+    if magic == *b"\x7fELF" {
         let path = input.as_deref().unwrap();
         // A bare executable: run it directly (no disk). argv = the positional
         // tail (so `… apps/busybox/busybox sh` runs BusyBox's `sh` applet).
@@ -169,6 +174,10 @@ fn main() {
         // ("active space missing").
         arch::init_guest_ram(0);
         let mut machine = arch::Interp;
+        let data = std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!("retroos-host: cannot read {path}: {e}");
+            std::process::exit(1);
+        });
         kernel::host_run_elf(&mut machine, path.as_bytes(), data, argv);
     }
 

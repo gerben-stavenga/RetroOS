@@ -26,6 +26,11 @@ use crate::kernel::vfs::{DirEntry, Filesystem, Vnode};
 
 const EOK: i32 = 0;
 const SEEK_SET: u32 = 0;
+/// POSIX permission bits we care about: the group's read/write bits — the
+/// grant RetroOS looks for (`chmod g+w`).
+const S_IWGRP: u32 = 0o020;
+const S_IRGRP: u32 = 0o040;
+
 const EXT4_DE_DIR: u8 = 2;
 const EXT4_DE_SYMLINK: i32 = 7;
 
@@ -101,6 +106,10 @@ unsafe extern "C" {
     fn ext4_dir_close(dir: *mut Ext4Dir) -> i32;
     fn ext4_dir_entry_next(dir: *mut Ext4Dir) -> *const Ext4Direntry;
     fn ext4_mode_get(path: *const u8, mode: *mut u32) -> i32;
+    fn ext4_mode_set(path: *const u8, mode: u32) -> i32;
+    fn ext4_owner_get(path: *const u8, uid: *mut u32, gid: *mut u32) -> i32;
+    fn ext4_owner_set(path: *const u8, uid: u32, gid: u32) -> i32;
+    fn ext4_readlink(path: *const u8, buf: *mut u8, bufsize: usize, rcnt: *mut usize) -> i32;
     fn ext4_umount(mount_point: *const u8) -> i32;
     fn ext4_device_unregister(dev_name: *const u8) -> i32;
     /// No-follow check: EOK iff `path`'s final component is itself a symlink
@@ -122,6 +131,9 @@ pub fn is_linux_root(part_lba: u32) -> bool {
             false
         }
     }
+    let Some(part_size) = part_size_from_superblock(part_lba) else {
+        return false;
+    };
     unsafe {
         if IFACE.ph_bbuf.is_null() {
             IFACE.ph_bbuf = core::ptr::addr_of_mut!(PH_BBUF) as *mut u8;
@@ -129,7 +141,7 @@ pub fn is_linux_root(part_lba: u32) -> bool {
         let bdev = Box::leak(Box::new(Ext4Blockdev {
             bdif: core::ptr::addr_of_mut!(IFACE),
             part_offset: part_lba as u64 * 512,
-            part_size: 0x20_0000_0000,
+            part_size, // the fs's own extent — see part_size_from_superblock
             bc: core::ptr::null_mut(),
             lg_bsize: 0,
             lg_bcnt: 0,
@@ -163,8 +175,22 @@ unsafe extern "C" fn bdev_open(_bdev: *mut Ext4Blockdev) -> i32 {
 unsafe extern "C" fn bdev_close(_bdev: *mut Ext4Blockdev) -> i32 {
     EOK
 }
-unsafe extern "C" fn bdev_bread(_bdev: *mut Ext4Blockdev, buf: *mut u8, blk_id: u64, blk_cnt: u32) -> i32 {
+unsafe extern "C" fn bdev_bread(bdev: *mut Ext4Blockdev, buf: *mut u8, blk_id: u64, blk_cnt: u32) -> i32 {
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, blk_cnt as usize * 512) };
+    // A read that targets filesystem block 0 (the partition's first sector) is
+    // lwext4 asking for a SPARSE HOLE. `ext4_fread`'s aligned/direct and tail
+    // paths map an unallocated block (physical block 0) to `part_offset` and,
+    // unlike its head path, do NOT zero-fill — so `ext4_blocks_get_direct` and
+    // the byte-tail read would hand us the superblock area as if it were file
+    // data. Block 0 is never a real data or metadata block, so this uniquely
+    // means a hole: return zeros, exactly as every other ext4 reader does.
+    // (Without this, sparse files — e.g. DUKE3D.GRP — read garbage where they
+    // should read zeros.)
+    let part_start = unsafe { (*bdev).part_offset } / 512;
+    if blk_id == part_start {
+        slice.fill(0);
+        return EOK;
+    }
     crate::kernel::block::read_sectors(blk_id as u32, slice);
     EOK
 }
@@ -195,6 +221,60 @@ static mut IFACE: Ext4BlockdevIface = Ext4BlockdevIface {
 };
 
 /// Leak a NUL-terminated copy of `s` (boot-lifetime), returning its pointer.
+/// The filesystem's true extent, read from its own superblock (1024 B into the
+/// partition = sector +2): `s_blocks_count × block_size`. `None` = no ext
+/// superblock there.
+///
+/// This MUST be exact, not a guess. lwext4 takes `part_size` as gospel: it sets
+/// `lg_bcnt = part_size / block_size` (the fs's logical block count) and EINVALs
+/// every access past it (`ext4_blockdev.c` :126, :224, :324, :394) — but nothing
+/// validates it against the superblock at mount time. So a `part_size` that is
+/// too small mounts CLEANLY and then silently fails every read beyond it: a real
+/// laptop root (flex_bg scatters inode tables and directory blocks across the
+/// whole partition) mounts and lists as EMPTY. The old hard-coded 128 GiB was
+/// invisible only because the built image's ext4 partition is 1 GiB.
+fn part_size_from_superblock(part_lba: u32) -> Option<u64> {
+    let mut sb = [0u8; 512];
+    crate::kernel::block::read_sectors(part_lba + 2, &mut sb);
+    let rd32 = |off: usize| u32::from_le_bytes(sb[off..off + 4].try_into().unwrap());
+    if u16::from_le_bytes([sb[0x38], sb[0x39]]) != 0xEF53 {
+        return None; // s_magic
+    }
+    let log_bs = rd32(0x18); // s_log_block_size: block size = 1024 << it
+    if log_bs > 6 {
+        return None; // 1 KiB..64 KiB is the whole legal range
+    }
+    // s_blocks_count_hi is only meaningful with INCOMPAT_64BIT; ignore it
+    // otherwise so a stale/garbage high word can't inflate the size.
+    let hi = if rd32(0x60) & 0x80 != 0 { rd32(0x150) as u64 } else { 0 };
+    let blocks = (hi << 32) | rd32(0x04) as u64; // s_blocks_count
+    blocks.checked_mul(1024u64 << log_bs)
+}
+
+/// Lexically fold `.` / `..` / empty segments out of a mount-relative path.
+/// A `..` above the mount root is clamped at the root (it can't escape the
+/// partition), matching how the kernel would resolve `/..` == `/`.
+fn normalize(path: &[u8]) -> Vec<u8> {
+    let mut segs: Vec<&[u8]> = Vec::new();
+    for seg in path.split(|&b| b == b'/') {
+        match seg {
+            b"" | b"." => {}
+            b".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    let mut out = Vec::with_capacity(path.len());
+    for (i, s) in segs.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(s);
+    }
+    out
+}
+
 fn leak_cstr(s: &[u8]) -> *const u8 {
     let mut v: Vec<u8> = Vec::with_capacity(s.len() + 1);
     v.extend_from_slice(s);
@@ -214,11 +294,16 @@ struct OpenFile {
 pub struct Lwext4Fs {
     /// lwext4 mount-point prefix incl. trailing slash, no NUL, e.g. `b"/m0/"`.
     mp: Vec<u8>,
-    /// The ONLY subtree writes are allowed under (VFS-relative, no leading or
-    /// trailing slash), e.g. `b"home/retroos"` for the DOS `C:`. `None` = the
-    /// whole mount is read-only. Everything outside this is read-only so RetroOS
-    /// can never clobber the host's `/bin`, `/etc`, other partitions, etc.
-    writable_root: Option<Vec<u8>>,
+    /// RetroOS's own group — the gid of the C: root directory, read once at
+    /// mount. It IS the "retroos group" by definition: whatever owns RetroOS's
+    /// home is its identity, so nothing needs pinning or an /etc/group parse.
+    ///
+    /// This gid plus the group-write bit is the WHOLE write policy (see
+    /// [`Self::writable`]): the host grants access with `chgrp retroos` +
+    /// `chmod g+w`, exactly as it would to any other Unix user, and RetroOS can
+    /// touch nothing else on the partition. `None` = read-only mount (the extra
+    /// partitions, or a C: root we couldn't stat).
+    grant_gid: Option<u32>,
     open_files: RefCell<BTreeMap<u64, OpenFile>>,
     next_handle: Cell<u64>,
 }
@@ -227,6 +312,8 @@ impl Lwext4Fs {
     /// Register + mount the ext4 partition starting at `part_lba`. `index`
     /// disambiguates the global lwext4 device name / mount point.
     pub fn new(part_lba: u32, index: usize) -> Result<Self, &'static str> {
+        let part_size = part_size_from_superblock(part_lba)
+            .ok_or("no ext4 superblock at partition start")?;
         unsafe {
             if IFACE.ph_bbuf.is_null() {
                 IFACE.ph_bbuf = core::ptr::addr_of_mut!(PH_BBUF) as *mut u8;
@@ -234,7 +321,7 @@ impl Lwext4Fs {
             let bdev = Box::leak(Box::new(Ext4Blockdev {
                 bdif: core::ptr::addr_of_mut!(IFACE),
                 part_offset: part_lba as u64 * 512,
-                part_size: 0x20_0000_0000, // permissive (128 GiB); reads stay within the fs
+                part_size, // the fs's own extent — see part_size_from_superblock
                 bc: core::ptr::null_mut(),
                 lg_bsize: 0,
                 lg_bcnt: 0,
@@ -254,20 +341,10 @@ impl Lwext4Fs {
             mp.push(b'/');
             let mp_c = leak_cstr(&mp);
 
-            // Only the boot root (index 0) is writable, and only within the DOS
-            // `C:` subtree — tracked from `dos::c_root()` (default `home/retroos/`;
-            // the in-OS build toolchain sets it to `""` = the whole mount). Extra
-            // partitions (a laptop's data / other-distro partitions) are mounted
-            // READ-ONLY at the lwext4 level AND have no writable root — defence in
-            // depth so RetroOS can never write to them.
-            let (read_only, writable_root) = if index == 0 {
-                let cr = crate::kernel::dos::c_root();
-                // Store without a trailing slash to match the prefix checks.
-                let root = cr.strip_suffix(b"/").unwrap_or(cr);
-                (false, Some(root.to_vec()))
-            } else {
-                (true, None)
-            };
+            // Only the boot root (index 0) may write at all. Extra partitions (a
+            // laptop's data / other-distro partitions) are mounted READ-ONLY at
+            // the lwext4 level AND get no grant gid — defence in depth.
+            let read_only = index != 0;
 
             if ext4_device_register(bdev, dev_name) != EOK {
                 return Err("ext4_device_register failed");
@@ -282,17 +359,33 @@ impl Lwext4Fs {
             // savegame/log/config workload; revisit if bulk writes need speed.
             ext4_journal_start(mp_c);
 
-            Ok(Lwext4Fs {
+            let mut fs = Lwext4Fs {
                 mp,
-                writable_root,
+                grant_gid: None,
                 open_files: RefCell::new(BTreeMap::new()),
                 next_handle: Cell::new(1),
-            })
+            };
+            // RetroOS's identity: the group owning its own home (the C: root).
+            // Must run AFTER the mount — it reads the directory's inode.
+            if index == 0 {
+                let cr = crate::kernel::dos::c_root();
+                let root = cr.strip_suffix(b"/").unwrap_or(cr);
+                fs.grant_gid = fs.gid_of(root);
+            }
+            Ok(fs)
         }
     }
 
-    /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`.
+    /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`,
+    /// following symlinks first — so callers address the physical object.
+    /// Use [`cpath_nofollow`] where the link ITSELF is the subject.
     fn cpath(&self, rel: &[u8], buf: &mut [u8; 320]) -> Option<*const u8> {
+        let real = self.real(rel);
+        self.cpath_nofollow(&real, buf)
+    }
+
+    /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`.
+    fn cpath_nofollow(&self, rel: &[u8], buf: &mut [u8; 320]) -> Option<*const u8> {
         let mut n = 0;
         for &b in self.mp.iter().chain(rel.iter()) {
             if n >= buf.len() - 1 {
@@ -320,54 +413,150 @@ impl Lwext4Fs {
         }
     }
 
-    /// May a write touch `path` (VFS-relative, no leading slash)? True only for
-    /// paths at or under `writable_root` (the DOS `C:` = `home/retroos`).
-    /// Lexical zone check: `path` is at/under `writable_root`, with no `..`
-    /// segment (which lwext4 would resolve out of the zone despite a prefix
-    /// match). Necessary but not sufficient — see `write_allowed`.
-    fn in_zone(&self, path: &[u8]) -> bool {
-        let Some(root) = &self.writable_root else {
-            return false;
-        };
-        if path.split(|&b| b == b'/').any(|seg| seg == b"..") {
-            return false;
-        }
-        // Empty root means `C:` IS the whole mount (the in-OS build toolchain's
-        // `c_root=""`): everything is in-zone (still minus `..`).
-        if root.is_empty() {
-            return true;
-        }
-        path == root.as_slice()
-            || (path.len() > root.len() && path.starts_with(root) && path[root.len()] == b'/')
-    }
-
-    /// Is `rel`'s final component a symlink? (No-follow — the real escape check.)
+    /// Is `rel`'s final component a symlink? (No-follow.)
     fn is_symlink(&self, rel: &[u8]) -> bool {
         let mut buf = [0u8; 320];
-        match self.cpath(rel, &mut buf) {
+        match self.cpath_nofollow(rel, &mut buf) {
             Some(cpath) => (unsafe { ext4_inode_exist(cpath, EXT4_DE_SYMLINK) }) == EOK,
             None => false,
         }
     }
 
-    /// May a write touch `path`? Lexically in-zone AND no path component is a
-    /// symlink — so the (already-resolved-lexically) string path is also the
-    /// physical path lwext4 will resolve, closing the `home/retroos/link → /bin`
-    /// escape. Only called when a write is actually attempted, so the per-
-    /// component `ext4_inode_exist` cost is off the read hot path.
-    fn write_allowed(&self, path: &[u8]) -> bool {
-        if !self.in_zone(path) {
+    /// Read `rel`'s symlink target (mount-relative in, raw target out).
+    fn readlink(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 320];
+        let cpath = self.cpath_nofollow(rel, &mut buf)?;
+        let mut tgt = [0u8; 256];
+        let mut rcnt = 0usize;
+        if unsafe { ext4_readlink(cpath, tgt.as_mut_ptr(), tgt.len(), &mut rcnt) } != EOK {
+            return None;
+        }
+        Some(tgt[..rcnt.min(tgt.len())].to_vec())
+    }
+
+    /// Resolve every symlink in `rel` to the physical path lwext4 can open.
+    ///
+    /// lwext4's own lookup does NOT follow symlinks (only `ext4_readlink` reads
+    /// them), so a symlinked directory otherwise surfaces as a "file" whose
+    /// contents are its target string — a real `home/retroos` full of symlinks
+    /// listed as garbage. Resolve here, once, and hand lwext4 a real path.
+    ///
+    /// Targets are interpreted INSIDE this mount: a leading `/` means the mount
+    /// root (the ext4 partition's own root), not the VFS root — the same frame
+    /// the link was authored in when the partition was someone's `/`. Bounded by
+    /// `MAX_HOPS` so a symlink loop terminates instead of hanging.
+    fn resolve(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        const MAX_HOPS: u32 = 16;
+        let mut path = normalize(rel);
+        let mut hops = 0;
+        loop {
+            // Leftmost symlink component (or the whole path).
+            let mut at = None;
+            for (i, &b) in path.iter().enumerate() {
+                if b == b'/' && i > 0 && self.is_symlink(&path[..i]) {
+                    at = Some(i);
+                    break;
+                }
+            }
+            if at.is_none() && !path.is_empty() && self.is_symlink(&path) {
+                at = Some(path.len());
+            }
+            let Some(i) = at else { return Some(path) };
+            hops += 1;
+            if hops > MAX_HOPS {
+                return None; // loop, or a chain too deep to be real
+            }
+            let target = self.readlink(&path[..i])?;
+            let mut next = Vec::with_capacity(path.len() + target.len());
+            if target.first() == Some(&b'/') {
+                next.extend_from_slice(&target[1..]); // mount-absolute
+            } else {
+                // Relative to the link's own directory.
+                let parent = path[..i].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                next.extend_from_slice(&path[..parent]);
+                if !next.is_empty() {
+                    next.push(b'/');
+                }
+                next.extend_from_slice(&target);
+            }
+            next.extend_from_slice(&path[i..]); // the untraversed remainder
+            path = normalize(&next);
+        }
+    }
+
+    /// `resolve`, falling back to the original path when it resolves to nothing
+    /// (a broken/looping link) so callers keep their previous behaviour: lwext4
+    /// reports the miss, we don't invent one.
+    fn real(&self, rel: &[u8]) -> Vec<u8> {
+        self.resolve(rel).unwrap_or_else(|| rel.to_vec())
+    }
+
+    /// The group owning `rel` (symlinks followed — the target's inode is what a
+    /// write would actually hit).
+    fn gid_of(&self, rel: &[u8]) -> Option<u32> {
+        let mut buf = [0u8; 320];
+        let cpath = self.cpath(rel, &mut buf)?;
+        let (mut uid, mut gid) = (0u32, 0u32);
+        (unsafe { ext4_owner_get(cpath, &mut uid, &mut gid) } == EOK).then_some(gid)
+    }
+
+    /// May RetroOS write the object at `path`? The ext4 inode answers: it must
+    /// belong to RetroOS's group AND carry the group-write bit.
+    ///
+    /// This is the whole policy. It replaces the old path-prefix zone, and is
+    /// both stricter and more useful: the host grants access per file/dir with
+    /// `chgrp retroos` + `chmod g+w` — ordinary Unix administration — and
+    /// RetroOS can touch nothing else, no matter where it is or how it was
+    /// reached. Symlinks stop mattering (we judge the resolved inode, so a link
+    /// to `/etc/passwd` is refused because passwd isn't ours, not because of
+    /// where the link pointed), and games linked in from elsewhere on the
+    /// partition are writable exactly when the host says so.
+    fn writable(&self, path: &[u8]) -> bool {
+        let Some(grant) = self.grant_gid else {
+            return false; // read-only mount
+        };
+        if self.gid_of(path) != Some(grant) {
             return false;
         }
-        // Check every prefix component (and the full path) for a symlink. We
-        // reject at the first, so components before it are confirmed real dirs
-        // and the string prefixes are the true physical prefixes.
-        for (i, &b) in path.iter().enumerate() {
-            if b == b'/' && i > 0 && self.is_symlink(&path[..i]) {
-                return false;
+        let mut buf = [0u8; 320];
+        let Some(cpath) = self.cpath(path, &mut buf) else {
+            return false;
+        };
+        let mut mode: u32 = 0;
+        unsafe { ext4_mode_get(cpath, &mut mode) == EOK && mode & S_IWGRP != 0 }
+    }
+
+    /// May RetroOS create/delete `path`? Unix rule: that's a write to the
+    /// PARENT directory, so the parent's group + group-write bit decide (the
+    /// file itself doesn't exist yet).
+    fn may_create_in_parent(&self, path: &[u8]) -> bool {
+        let real = normalize(path);
+        if real.is_empty() {
+            return false;
+        }
+        let parent = match real.iter().rposition(|&b| b == b'/') {
+            Some(i) => &real[..i],
+            None => b"", // mount root
+        };
+        self.writable(parent)
+    }
+
+    /// Stamp a newly created file as RetroOS's own: our group + group-write.
+    /// Without this the file would inherit whatever lwext4 defaults to and we
+    /// could not reopen our own savegame for writing next time.
+    fn claim(&self, path: &[u8]) {
+        let Some(grant) = self.grant_gid else { return };
+        let mut buf = [0u8; 320];
+        let Some(cpath) = self.cpath(path, &mut buf) else { return };
+        let (mut uid, mut gid) = (0u32, 0u32);
+        unsafe {
+            ext4_owner_get(cpath, &mut uid, &mut gid);
+            ext4_owner_set(cpath, uid, grant);
+            let mut mode: u32 = 0;
+            if ext4_mode_get(cpath, &mut mode) == EOK {
+                ext4_mode_set(cpath, mode | S_IWGRP | S_IRGRP);
             }
         }
-        !path.is_empty() && !self.is_symlink(path)
     }
 
     fn alloc_handle(&self, file: Ext4File, writable: bool) -> u64 {
@@ -382,9 +571,9 @@ impl Filesystem for Lwext4Fs {
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let mut buf = [0u8; 320];
         let cpath = self.cpath(path, &mut buf)?;
-        // Only open read+write inside the writable root; everywhere else is
-        // opened read-only so a handle can never mutate a protected path.
-        let writable = self.write_allowed(path);
+        // A handle is writable only if the inode is ours (group + g+w);
+        // everything else opens read-only so it can never mutate the disk.
+        let writable = self.writable(path);
         let mut file: Ext4File = unsafe { core::mem::zeroed() };
         let rw_flags: &[u8] = if writable { b"r+b\0" } else { b"rb\0" };
         if unsafe { ext4_fopen(&mut file, cpath, rw_flags.as_ptr()) } != EOK
@@ -439,8 +628,12 @@ impl Filesystem for Lwext4Fs {
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
-        // Creating a file is a write — only inside the writable root.
-        if !self.write_allowed(path) {
+        // Creating (or truncating) is a write. An existing file must itself be
+        // ours; a new one needs write permission on its parent directory —
+        // the ordinary Unix rule.
+        let exists = self.gid_of(path).is_some();
+        let ok = if exists { self.writable(path) } else { self.may_create_in_parent(path) };
+        if !ok {
             return None;
         }
         let mut buf = [0u8; 320];
@@ -450,8 +643,19 @@ impl Filesystem for Lwext4Fs {
         if unsafe { ext4_fopen(&mut file, cpath, c"wb".as_ptr().cast()) } != EOK {
             return None;
         }
+        // Stamp it ours so we can reopen it for writing later.
+        if !exists {
+            self.claim(path);
+        }
         let handle = self.alloc_handle(file, true);
-        Some(Vnode { handle, size: 0, mode: 0o644 })
+        Some(Vnode { handle, size: 0, mode: 0o664 })
+    }
+
+    /// lwext4 has a real create — so a `None` from [`Self::create`] means
+    /// DENIED, not "unsupported". The VFS must surface it as an error instead
+    /// of silently substituting a RAM file.
+    fn supports_create(&self) -> bool {
+        true
     }
 
     fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
@@ -475,7 +679,21 @@ impl Filesystem for Lwext4Fs {
                 continue;
             }
             if i == index {
-                let is_dir = e.inode_type == EXT4_DE_DIR;
+                let mut rel = Vec::with_capacity(dir.len() + 1 + name.len());
+                rel.extend_from_slice(dir);
+                if !rel.is_empty() && *rel.last().unwrap() != b'/' {
+                    rel.push(b'/');
+                }
+                rel.extend_from_slice(name);
+                // A symlink must present its TARGET's identity: the dirent type
+                // says SYMLINK, and reporting that as a plain file made a
+                // symlinked directory list as a corrupt "file" whose bytes are
+                // the target path. Resolve, then classify off the real object.
+                let is_dir = if i32::from(e.inode_type) == EXT4_DE_SYMLINK {
+                    self.dir_exists(&rel)
+                } else {
+                    e.inode_type == EXT4_DE_DIR
+                };
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100],
@@ -485,15 +703,9 @@ impl Filesystem for Lwext4Fs {
                     mode: if is_dir { 0o755 } else { 0o644 },
                 };
                 de.name[..name_len].copy_from_slice(&name[..name_len]);
-                // Size for regular files: open the child and read its size.
+                // Size/mode for regular files: open the (resolved) child.
                 if !is_dir {
                     let mut child = [0u8; 320];
-                    let mut rel = Vec::with_capacity(dir.len() + 1 + name.len());
-                    rel.extend_from_slice(dir);
-                    if !rel.is_empty() && *rel.last().unwrap() != b'/' {
-                        rel.push(b'/');
-                    }
-                    rel.extend_from_slice(name);
                     if let Some(cchild) = self.cpath(&rel, &mut child) {
                         let mut f: Ext4File = unsafe { core::mem::zeroed() };
                         if unsafe { ext4_fopen(&mut f, cchild, c"rb".as_ptr().cast()) } == EOK {
@@ -533,8 +745,10 @@ impl Filesystem for Lwext4Fs {
     }
 
     fn remove(&self, path: &[u8]) -> i32 {
-        // Deleting is a write — only inside the writable root.
-        if !self.write_allowed(path) {
+        // Unlinking mutates the PARENT directory, so that is what must be ours
+        // (Unix rule) — and the victim itself must be ours too, so a link we
+        // may traverse can't be used to delete something we may not write.
+        if !self.may_create_in_parent(path) || !self.writable(path) {
             return -1;
         }
         let mut buf = [0u8; 320];

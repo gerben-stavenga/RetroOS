@@ -299,6 +299,18 @@ _DISK_CMD = """
     EXT4_IMG=$$(mktemp)
     EXTRACT_DIR=$$(mktemp -d)
     tar xf $(EXTRAS_TAR) -C "$$EXTRACT_DIR"
+
+    # RetroOS writes a file only when it belongs to RetroOS's group (the gid of
+    # its own C: root) AND carries the group-write bit -- ordinary Unix
+    # permissions, checked against the ext4 inode (see lwext4::writable). The
+    # tar arrives 0555/0755, so without this the image would be honestly
+    # read-only and every savegame would fail with "access denied". Extraction
+    # as the build user already gives the whole tree one consistent gid, which
+    # IS the retroos group by definition.
+    # (image_min carries no home/retroos -- only CONFIG.SYS -- so guard it.)
+    if [ -d "$$EXTRACT_DIR/home/retroos" ]; then
+        chmod -R g+w "$$EXTRACT_DIR/home/retroos"
+    fi
     truncate -s $$(( EXT4_SECTORS * 512 )) "$$EXT4_IMG"
     mkfs.ext4 -q -b 4096 -L "RetroOS" -d "$$EXTRACT_DIR" "$$EXT4_IMG"
     rm -rf "$$EXTRACT_DIR"

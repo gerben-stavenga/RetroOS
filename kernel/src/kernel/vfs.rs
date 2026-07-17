@@ -66,6 +66,17 @@ pub trait Filesystem {
     /// Create (or truncate) a file. Returns vnode on success. Default = R/O.
     fn create(&self, _path: &[u8]) -> Option<Vnode> { None }
 
+    /// Does this backend implement `create` at all?
+    ///
+    /// This distinguishes the two very different meanings of `create → None`:
+    /// a read-only backend (tarfs, klog — the default) has no create, so the
+    /// VFS substitutes a RAM-backed file and the guest can scribble on C:\BOOT
+    /// harmlessly. A backend that DOES create (lwext4, hostfs) returning `None`
+    /// means DENIED, and must surface to the guest as an error — silently
+    /// handing it a RAM file would report success for a write that will never
+    /// exist.
+    fn supports_create(&self) -> bool { false }
+
     /// Write to a file identified by handle at given byte offset (Twrite).
     /// Returns bytes written, or negative errno. Default = R/O (silently accept).
     fn write(&self, _handle: u64, _offset: u32, data: &[u8]) -> i32 {
@@ -588,6 +599,13 @@ impl Vfs {
             };
             self.invalidate_dir_cache();
             return table_idx as i32;
+        }
+
+        // The backend HAS a create and refused: that is a permission denial, not
+        // a missing feature. Report it (EACCES) — never paper over it with a RAM
+        // file, which would tell the guest its write succeeded.
+        if fs.supports_create() {
+            return -5;
         }
 
         let key_len = path.len().min(PATH_KEY_MAX) as u8;
