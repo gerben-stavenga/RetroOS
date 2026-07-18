@@ -9,8 +9,9 @@
 //! virtio and USB mass storage are standards from outside RetroOS, and each
 //! new one should be a new file, not an edit to a central type.
 
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 
+pub mod overlay;
 pub mod partition;
 use crate::kernel::drivers::{hdd::{self, AtaDisk}, nvme::NvmeDisk};
 
@@ -78,9 +79,7 @@ impl Volume {
         if inside.is_empty() {
             return 0;
         }
-        let got = self.disk.read(self.start + lba, inside);
-        apply_overlay(self.start + lba, inside);
-        got
+        self.disk.read(self.start + lba, inside)
     }
 
     /// Write `buf.len().div_ceil(512)` sectors at volume-relative `lba`.
@@ -93,35 +92,8 @@ impl Volume {
         if n == 0 {
             return 0;
         }
-        write_through(self, lba, &buf[..n])
+        self.disk.write(self.start + lba, &buf[..n])
     }
-}
-
-/// Volatile write overlay — the real-hardware safety net. When armed (real
-/// metal, where the disk is someone's actual home partition), `Volume::write`
-/// diverts every sector into this kernel-heap map and `Volume::read` patches
-/// them back over the device reads: the filesystems above stay fully writable
-/// (lwext4 journals, savegames, configs), but the device itself is never
-/// written and power-off discards everything. QEMU/hosted runs — where the
-/// disk is a disposable image file — leave it unarmed and write through.
-///
-/// Keyed by DEVICE-ABSOLUTE sector, and still one map for the whole system —
-/// which is only correct while a single disk is in use. It becomes a `Disk`
-/// that wraps a `Disk`, composed per-device by startup, in a later step.
-///
-/// Single kernel thread (same invariant as the fs layer above); accessed via
-/// `&raw mut` like the other kernel statics.
-static mut OVERLAY: Option<BTreeMap<u64, Box<[u8; 512]>>> = None;
-
-fn overlay() -> &'static mut Option<BTreeMap<u64, Box<[u8; 512]>>> {
-    // A static's address is never null, so `as_mut` always yields Some.
-    unsafe { (&raw mut OVERLAY).as_mut().unwrap() }
-}
-
-/// Arm the volatile write overlay. Call once at startup, after the platform
-/// probe and before any filesystem mounts.
-pub fn arm_ram_overlay() {
-    *overlay() = Some(BTreeMap::new());
 }
 
 /// Discover every disk on this machine, in a stable order: the legacy ATA
@@ -144,42 +116,4 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<&'static dyn Disk> {
         disks.push(Box::leak(Box::new(d)));
     }
     disks
-}
-
-/// Patch armed-overlay sectors over a freshly read buffer. `abs` is the
-/// device-absolute LBA of `buf`'s first sector.
-fn apply_overlay(abs: u64, buf: &mut [u8]) {
-    if let Some(map) = overlay().as_ref()
-        && !map.is_empty()
-    {
-        for (i, chunk) in buf.chunks_mut(512).enumerate() {
-            if let Some(s) = map.get(&(abs + i as u64)) {
-                chunk.copy_from_slice(&s[..chunk.len()]);
-            }
-        }
-    }
-}
-
-/// The write half: into the volatile overlay when armed (real metal), through
-/// to the device otherwise. `lba` is volume-relative; the overlay is keyed by
-/// device-absolute sector.
-fn write_through(vol: &Volume, lba: u64, buf: &[u8]) -> u32 {
-    let abs = vol.start + lba;
-    if overlay().is_some() {
-        for (i, chunk) in buf.chunks(512).enumerate() {
-            let sector = abs + i as u64;
-            let mut s = Box::new([0u8; 512]);
-            if chunk.len() == 512 {
-                s.copy_from_slice(chunk);
-            } else {
-                // Partial trailing sector: seed with the current contents
-                // (overlay-aware read; no map borrow is held across it).
-                vol.read(lba + i as u64, &mut s[..]);
-                s[..chunk.len()].copy_from_slice(chunk);
-            }
-            overlay().as_mut().unwrap().insert(sector, s);
-        }
-        return buf.len().div_ceil(512) as u32;
-    }
-    vol.disk.write(abs, buf)
 }

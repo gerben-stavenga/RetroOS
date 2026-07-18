@@ -35,15 +35,25 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // the partition tables, by the layer that owns it.
     let platform = crate::kernel::platform::probe(machine, boot);
 
-    // Disk-write policy: on real hardware the boot disk is someone's actual
-    // home partition, so writes land in a volatile RAM overlay — everything
-    // above (lwext4 journal, savegames, configs) works normally in-session,
-    // nothing persists. QEMU/hosted runs write through to their image file.
-    // Armed before any mount, so no ext4 write can ever precede it.
-    if platform.host == crate::kernel::platform::Host::Metal {
-        crate::kernel::block::arm_ram_overlay();
+    // Disk-write policy, applied by COMPOSITION: on real hardware the disk is
+    // someone's actual home partition, so each one is wrapped in a volatile RAM
+    // overlay and the wrapped disk becomes the only reference that exists from
+    // here on — nothing downstream can reach the platter, and no write path has
+    // to remember to check a flag. QEMU/hosted runs write through to their
+    // disposable image file. Done before the partition scan, so every Volume
+    // built below already carries the policy.
+    let disks = if platform.host == crate::kernel::platform::Host::Metal {
         crate::screenln!(screen, "Disk writes: volatile RAM overlay (real hardware) — changes will NOT persist");
-    }
+        disks
+            .into_iter()
+            .map(|d| -> &'static dyn crate::kernel::block::Disk {
+                alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                    crate::kernel::block::overlay::RamOverlay::wrap(d)))
+            })
+            .collect()
+    } else {
+        disks
+    };
 
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
     // reused) — startup owns it and threads `&mut threads` down through run →
