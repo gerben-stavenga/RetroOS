@@ -10,6 +10,8 @@
 //! new one should be a new file, not an edit to a central type.
 
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+
+pub mod partition;
 use crate::kernel::drivers::{hdd::{self, AtaDisk}, nvme::NvmeDisk};
 
 /// One block device: a physical disk, an NVMe namespace, or a wrapper around

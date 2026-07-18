@@ -9,7 +9,6 @@
 //! private `static` verdict. Adding an enum variant breaks every policy
 //! site at compile time — deliberately.
 
-use crate::kernel::block::Volume;
 use crate::println;
 
 pub struct Platform {
@@ -17,7 +16,10 @@ pub struct Platform {
     pub display: Display,
     pub firmware: Firmware,
     pub audio: Audio,
-    pub media: Media,
+    /// A host filesystem transport answered — the native backend punch-through
+    /// (hosted) or the COM1 client (metal / the Python bridge). Whether it ends
+    /// up as `/host`, as the root, or unused is `startup`'s mount policy.
+    pub hostfs: bool,
     pub debug: DebugSink,
 }
 
@@ -93,29 +95,6 @@ impl Audio {
     }
 }
 
-/// Where the filesystems come from — the probe result IS the mount plan
-/// (`mount_filesystems` derives the mount set from the variant payload).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Media {
-    /// A boot disk answered with an ext4 root (0x83) in its partition
-    /// table: the natural root for metal (and hosted runs with an image
-    /// attached). `hostfs` additionally at /host when the COM1 transport
-    /// answered. (/boot is NOT from disk — the embedded bootfs is an
-    /// invariant; the 0xDA boot-bundle partition is bootloader-only.)
-    /// `extra_ext` holds additional ext partitions (a multi-distro disk has
-    /// several); they mount as subdirectories C:\DISK1, C:\DISK2, … of the
-    /// root. Unused slots are 0.
-    DiskRoot { ext4_lba: u32, extra_ext: [u32; 3], hostfs: bool },
-    /// No usable disk, but the host filesystem answered: it IS the root —
-    /// the natural root for hosted runs (DOSBox-style: a host directory is
-    /// the drive, no image build). Also aliased at /host so DiskRoot-era
-    /// `host/...` paths keep working; /boot = the embedded bootfs.
-    HostRoot,
-    /// Neither: the embedded bootfs at /boot is the whole world (a bare
-    /// kernel.elf booted from someone's GRUB).
-    Diskless,
-}
-
 /// Where dbg_println bytes go. Installed by the backend long before startup
 /// (boot prints need it); recorded here so policy can reason about it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -183,13 +162,13 @@ static mut PLATFORM: Option<Platform> = None;
 /// Probe the machine and freeze the result. Called exactly once, early in
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
-pub fn probe<A: crate::Arch>(
-    machine: &mut A,
-    boot: &crate::BootConfig,
-    disk: Option<crate::kernel::block::Volume>,
-) -> &'static Platform {
+pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'static Platform {
     let audio = probe_audio(machine);
-    let media = probe_media(machine, disk);
+    // A native host backend (hosted "punch-through") means /host is available
+    // without COM1 — take it as hostfs-present and skip the serial probe.
+    // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
+    let hostfs = crate::kernel::fs::hostfs::host_backend_installed()
+        || crate::kernel::fs::hostfs::init();
 
     // Metal: ask the hardware. Hosted: the answers are properties of the
     // backend itself — the interp port bus has no VGA device and its zeroed
@@ -234,7 +213,7 @@ pub fn probe<A: crate::Arch>(
             display,
             firmware,
             audio,
-            media,
+            hostfs,
             debug: env.debug,
         }
     };
@@ -244,8 +223,8 @@ pub fn probe<A: crate::Arch>(
     }
     let p = get();
     println!(
-        "Platform: host={:?} display={:?} firmware={:?} audio={:?} media={:?} debug={:?}",
-        p.host, p.display, p.firmware, p.audio, p.media, p.debug
+        "Platform: host={:?} display={:?} firmware={:?} audio={:?} hostfs={} debug={:?}",
+        p.host, p.display, p.firmware, p.audio, p.hostfs, p.debug
     );
     p
 }
@@ -294,148 +273,10 @@ fn probe_audio<A: crate::Arch>(machine: &mut A) -> Audio {
     Audio::EmulatedSilent
 }
 
-/// True if sector 0 is a GPT *protective* MBR — a single entry of type 0xEE
-/// covering the disk. GPT disks (every UEFI machine) put this at LBA 0 so
-/// legacy tooling leaves the real layout alone; it also means the 0x83 scan
-/// finds nothing, which is why a real laptop probes as Diskless.
-fn is_protective_mbr(mbr: &[u8; 512]) -> bool {
-    (0..4).any(|i| mbr[0x1BE + i * 16 + 4] == 0xEE)
-}
 
-/// Confirm the partition starting at `lba` is ext2/3/4 by its superblock magic:
-/// 0xEF53 lives at byte 1080 of the partition (superblock at 1024, s_magic at
-/// +0x38) → sector lba+2, offset 56. GUID-agnostic, so it catches any ext root
-/// regardless of how the partition was typed.
-fn is_ext_partition(disk: &Volume, lba: u32) -> bool {
-    let mut sb = [0u8; 512];
-    disk.read(lba as u64 + 2, &mut sb);
-    u16::from_le_bytes([sb[56], sb[57]]) == 0xEF53
-}
 
-/// Walk the GPT and return the first-LBA of an ext* partition, or None.
-///
-/// LBA 1 holds the header (signature "EFI PART", then the partition-array LBA,
-/// entry count and entry stride); the array follows. We read it a sector at a
-/// time and probe each non-empty entry's superblock. Assumes 512-byte sectors
-/// (the only size `Volume::read` handles — a 4K-formatted NVMe is
-/// rejected earlier in the driver); partition starts past 4 GiB-sectors don't
-/// fit our u32 LBA and are skipped, which never happens on a real laptop root.
-fn gpt_collect_ext(disk: &Volume, out: &mut [u32]) -> usize {
-    let mut hdr = [0u8; 512];
-    disk.read(1, &mut hdr);
-    if &hdr[0..8] != b"EFI PART" {
-        return 0;
-    }
-    let entry_lba = u64::from_le_bytes(hdr[0x48..0x50].try_into().unwrap());
-    let num_entries = u32::from_le_bytes(hdr[0x50..0x54].try_into().unwrap()).min(256) as usize;
-    let entry_size = u32::from_le_bytes(hdr[0x54..0x58].try_into().unwrap()) as usize;
-    // Standard entries are 128 bytes (4 per 512-byte sector) and never straddle
-    // a sector. Bail on anything that doesn't divide a sector cleanly.
-    if entry_size == 0 || entry_lba == 0 || entry_lba > u32::MAX as u64 || 512 % entry_size != 0 {
-        return 0;
-    }
-    let per_sector = 512 / entry_size;
-    let sectors = num_entries.div_ceil(per_sector);
-    let mut buf = [0u8; 512];
-    let mut n = 0;
-    for s in 0..sectors {
-        disk.read(entry_lba + s as u64, &mut buf);
-        for e in 0..per_sector {
-            let off = e * entry_size;
-            // Type GUID all-zero ⇒ unused slot.
-            if buf[off..off + 16].iter().all(|&b| b == 0) {
-                continue;
-            }
-            let first_lba = u64::from_le_bytes(buf[off + 32..off + 40].try_into().unwrap());
-            if first_lba == 0 || first_lba > u32::MAX as u64 {
-                continue;
-            }
-            // Collect every ext* partition (a multi-distro disk has several);
-            // the first becomes the root, the rest mount as subdirectories.
-            if is_ext_partition(disk, first_lba as u32) && n < out.len() {
-                out[n] = first_lba as u32;
-                n += 1;
-            }
-        }
-    }
-    n
-}
 
-/// Find the ext4 root and probe the hostfs COM1 transport. First the MBR (4
-/// entries at 0x1BE, type 0x83 — the RetroOS image / legacy disks); if that's
-/// empty and sector 0 is a GPT protective MBR (a real UEFI disk), walk the GPT
-/// for an ext* partition instead. The 0xDA boot-bundle partition is the legacy
-/// bootloader's business — the kernel ignores it. With no block device,
-/// `read_sectors` leaves the buffer zeroed and every scan finds nothing — the
-/// same verdict path as an empty disk.
-/// Heuristic: does the ext partition at `lba` look like an actual Linux root
-/// (has `/etc` and `/usr`) rather than a data partition? A multi-ext disk (a
-/// laptop with a data partition AND the real root) gives no order guarantee, so
-/// we sniff the layout to mount the right one at VFS /.
-fn is_linux_root(disk: &Volume, lba: u32) -> bool {
-    crate::kernel::fs::lwext4::is_linux_root(disk, lba)
-}
 
-fn probe_media<A: crate::Arch>(machine: &mut A, disk: Option<Volume>) -> Media {
-    let _ = machine;
-    // A native host backend (hosted "punch-through") means /host is available
-    // without COM1 — take it as hostfs-present and skip the serial probe.
-    // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
-    let hostfs = crate::kernel::fs::hostfs::host_backend_installed()
-        || crate::kernel::fs::hostfs::init();
-
-    // No disk at all: every scan below finds nothing, the same verdict path
-    // as an empty disk.
-    let Some(disk) = disk else {
-        return if hostfs { Media::HostRoot } else { Media::Diskless };
-    };
-    let mut mbr = [0u8; 512];
-    disk.read(0, &mut mbr);
-    // Collect every ext partition on the disk (a dual-boot laptop has more than
-    // one): MBR type 0x83 entries, or — on a real UEFI disk (protective MBR) —
-    // the GPT's ext* partitions found by superblock magic.
-    let mut parts = [0u32; 4];
-    let mut n = 0;
-    for i in 0..4 {
-        let base = 0x1BE + i * 16;
-        if mbr[base + 4] == 0x83 && n < parts.len() {
-            parts[n] = u32::from_le_bytes(mbr[base + 8..base + 12].try_into().unwrap());
-            n += 1;
-        }
-    }
-    if n == 0 && is_protective_mbr(&mbr) {
-        n = gpt_collect_ext(&disk, &mut parts);
-    }
-
-    if n > 0 {
-        // A disk can carry several ext partitions (a data partition AND the
-        // real Linux root); GPT/MBR order doesn't say which is the root. Mount
-        // the one that looks like a Linux root (/etc + /usr) at VFS /; fall back
-        // to the first if none matches (e.g. the RetroOS image's own ext4).
-        // Only sniff when there's ambiguity: a single ext partition IS the root
-        // (and probing would needlessly mount/unmount it via lwext4).
-        let mut root_idx = 0;
-        if n > 1 {
-            for (i, &p) in parts.iter().enumerate().take(n) {
-                if is_linux_root(&disk, p) { root_idx = i; break; }
-            }
-        }
-        // The remaining ext partitions mount as C:\DISK1, C:\DISK2, …
-        let mut extra_ext = [0u32; 3];
-        let mut e = 0;
-        for (i, &p) in parts.iter().enumerate().take(n) {
-            if i != root_idx && e < extra_ext.len() {
-                extra_ext[e] = p;
-                e += 1;
-            }
-        }
-        Media::DiskRoot { ext4_lba: parts[root_idx], extra_ext, hostfs }
-    } else if hostfs {
-        Media::HostRoot
-    } else {
-        Media::Diskless
-    }
-}
 
 /// Is a real VGA card on the bus? Write the SEQ index register and read it
 /// back — an absent ISA-bus port reads 0xFF (so a hosted run, whose port bus

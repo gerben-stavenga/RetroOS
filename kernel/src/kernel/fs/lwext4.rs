@@ -122,7 +122,7 @@ unsafe extern "C" {
 /// Read-only mount → check → unmount, leaving lwext4's global registry clean so
 /// the real root mount can reuse the same partition. Used only to disambiguate
 /// a multi-ext disk (a laptop's data partition vs its real root).
-pub fn is_linux_root(disk: &Volume, part_lba: u32) -> bool {
+pub fn is_linux_root(vol: &Volume) -> bool {
     unsafe fn dir_exists_c(cpath: *const u8) -> bool {
         let mut d: Ext4Dir = unsafe { core::mem::zeroed() };
         if unsafe { ext4_dir_open(&mut d, cpath) } == EOK {
@@ -132,14 +132,14 @@ pub fn is_linux_root(disk: &Volume, part_lba: u32) -> bool {
             false
         }
     }
-    let Some(part_size) = part_size_from_superblock(disk, part_lba) else {
+    let Some(part_size) = fs_extent(vol) else {
         return false;
     };
     unsafe {
         let bdev = Box::leak(Box::new(Ext4Blockdev {
-            bdif: new_iface(*disk),
-            part_offset: part_lba as u64 * 512,
-            part_size, // the fs's own extent — see part_size_from_superblock
+            bdif: new_iface(*vol),
+            part_offset: 0, // the Volume IS the partition; ids are relative to it
+            part_size,
             bc: core::ptr::null_mut(),
             lg_bsize: 0,
             lg_bcnt: 0,
@@ -235,9 +235,31 @@ fn new_iface(vol: Volume) -> *mut Ext4BlockdevIface {
 /// laptop root (flex_bg scatters inode tables and directory blocks across the
 /// whole partition) mounts and lists as EMPTY. The old hard-coded 128 GiB was
 /// invisible only because the built image's ext4 partition is 1 GiB.
-fn part_size_from_superblock(disk: &Volume, part_lba: u32) -> Option<u64> {
+/// The extent lwext4 may address, in bytes.
+///
+/// Two sources now disagree in principle, so both get consulted: the PARTITION
+/// TABLE says how much disk belongs to this filesystem, and the SUPERBLOCK says
+/// how much of it the filesystem claims. The smaller wins — a superblock
+/// claiming more than its partition holds is corrupt or misread, and honouring
+/// it would let lwext4 address a neighbour's sectors.
+///
+/// Before the table's extent reached this layer, the superblock was the only
+/// source and therefore had to be exactly right (see below). It is now a
+/// cross-check.
+fn fs_extent(vol: &Volume) -> Option<u64> {
+    let from_sb = part_size_from_superblock(vol)?;
+    let from_table = vol.sectors * 512;
+    if from_sb > from_table {
+        crate::println!(
+            "ext4: superblock claims {} bytes but the partition holds {}; clamping",
+            from_sb, from_table);
+    }
+    Some(from_sb.min(from_table))
+}
+
+fn part_size_from_superblock(vol: &Volume) -> Option<u64> {
     let mut sb = [0u8; 512];
-    disk.read(part_lba as u64 + 2, &mut sb);
+    vol.read(2, &mut sb);
     let rd32 = |off: usize| u32::from_le_bytes(sb[off..off + 4].try_into().unwrap());
     if u16::from_le_bytes([sb[0x38], sb[0x39]]) != 0xEF53 {
         return None; // s_magic
@@ -311,16 +333,15 @@ pub struct Lwext4Fs {
 }
 
 impl Lwext4Fs {
-    /// Register + mount the ext4 partition starting at `part_lba`. `index`
+    /// Register + mount the ext4 filesystem filling `vol`. `index`
     /// disambiguates the global lwext4 device name / mount point.
-    pub fn new(disk: Volume, part_lba: u32, index: usize) -> Result<Self, &'static str> {
-        let part_size = part_size_from_superblock(&disk, part_lba)
-            .ok_or("no ext4 superblock at partition start")?;
+    pub fn new(vol: Volume, index: usize) -> Result<Self, &'static str> {
+        let part_size = fs_extent(&vol).ok_or("no ext4 superblock at partition start")?;
         unsafe {
             let bdev = Box::leak(Box::new(Ext4Blockdev {
-                bdif: new_iface(disk),
-                part_offset: part_lba as u64 * 512,
-                part_size, // the fs's own extent — see part_size_from_superblock
+                bdif: new_iface(vol),
+                part_offset: 0, // the Volume IS the partition; ids are relative to it
+                part_size,
                 bc: core::ptr::null_mut(),
                 lg_bsize: 0,
                 lg_bcnt: 0,

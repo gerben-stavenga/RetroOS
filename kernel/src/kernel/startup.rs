@@ -18,24 +18,22 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // on machines with no serial/debug port (real metal — 0xE9 goes nowhere).
     crate::kernel::klog::init();
 
-    // Discover every disk, then take the first as the boot volume. The block
-    // layer only reports what exists; picking one is startup's call, and it
-    // happens here rather than inside a driver.
+    // Discover every disk. The block layer reports what exists; nothing below
+    // this line picks a boot disk or decides where anything mounts.
     let disks = crate::kernel::block::probe(machine);
     for d in &disks {
         crate::println!("Storage: {} ({} MB)", d.name(), d.sectors() / 2048);
     }
-    let boot_vol = disks.first().copied().map(crate::kernel::block::Volume::whole);
-    if boot_vol.is_none() {
+    if disks.is_empty() {
         crate::println!("Storage: none detected");
     }
     crate::screenln!(screen, "Block devices initialized");
 
     // Probe the machine ONCE and freeze the result; all hardware policy
-    // (VGA passthrough, BIOS choice, audio, media/mounts, console, IOPB)
-    // derives from this. The boot volume goes in because the Media verdict
-    // still comes from an MBR/GPT scan here — that moves to `block` next.
-    let platform = crate::kernel::platform::probe(machine, boot, boot_vol);
+    // (VGA passthrough, BIOS choice, audio, console, IOPB) derives from this.
+    // It no longer touches storage — the mount decision is made below, from
+    // the partition tables, by the layer that owns it.
+    let platform = crate::kernel::platform::probe(machine, boot);
 
     // Disk-write policy: on real hardware the boot disk is someone's actual
     // home partition, so writes land in a volatile RAM overlay — everything
@@ -56,7 +54,14 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
     crate::kernel::dos::set_c_root(boot.c_root());
 
-    mount_filesystems(platform, boot_vol, &mut screen);
+    // Read every disk's partition table, then decide the mount tree from what
+    // they declare. `plan_mounts` is a pure function of those facts.
+    let parts: alloc::vec::Vec<_> = disks
+        .iter()
+        .flat_map(|&d| crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d)))
+        .collect();
+    let plan = plan_mounts(&parts, platform.hostfs);
+    mount_filesystems(&plan, &mut screen);
     init_device_policy(machine, platform);
     let master_env = load_master_env();
     init_console_pipe();
@@ -79,56 +84,133 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
     }
 }
 
-/// Derive the mount set from the platform's Media verdict (the probe already
-/// scanned the MBR and the hostfs transport); then the symbol index.
+/// Where the VFS root comes from. A closed set RetroOS defines, so an enum —
+/// adding a root kind breaks every site that has to handle one.
+enum RootSource {
+    /// An ext filesystem on a disk — the natural root for metal, and for
+    /// hosted runs with an image attached.
+    Disk(crate::kernel::block::Volume),
+    /// The host filesystem IS the root (DOSBox-style: a host directory is the
+    /// drive, no image build). Linux binaries see /usr, /lib, /etc natively.
+    Host,
+    /// Neither: the embedded bootfs at /boot is the whole world (a bare
+    /// kernel.elf booted from someone's GRUB).
+    None,
+}
+
+/// The mount tree to build. Derived from facts, then executed — deciding and
+/// doing are separate so the decision is inspectable and testable on its own.
+struct MountPlan {
+    root: RootSource,
+    /// Additional ext filesystems: (mount prefix, volume). A dual-boot laptop
+    /// has several; they are Linux-visible only, not under C:.
+    extra: alloc::vec::Vec<(&'static [u8], crate::kernel::block::Volume)>,
+    /// Also mount the host fs at /host, beside a disk root.
+    host_alias: bool,
+}
+
+/// lwext4 names its devices and mount points with a single digit (`/m0/` …
+/// `/m9/`) in a registry global to the C library, so ten mounts is the
+/// ceiling. The root takes one.
+const MAX_EXT_MOUNTS: usize = 10;
+
+/// Decide the mount tree from the partition tables and whether a host
+/// transport answered. Pure: no I/O beyond the ext-root sniff, no globals, and
+/// no mounting — see `mount_filesystems` for the doing.
+fn plan_mounts(
+    parts: &[crate::kernel::block::partition::Partition],
+    hostfs: bool,
+) -> MountPlan {
+    use crate::kernel::block::partition::PartKind;
+
+    let ext: alloc::vec::Vec<_> = parts
+        .iter()
+        .filter(|p| p.kind == PartKind::Ext)
+        .map(|p| p.volume)
+        .collect();
+
+    if ext.is_empty() {
+        // No ext filesystem anywhere: the host fs is the root if we have one.
+        return MountPlan {
+            root: if hostfs { RootSource::Host } else { RootSource::None },
+            extra: alloc::vec::Vec::new(),
+            host_alias: false,
+        };
+    }
+
+    // Several ext partitions (a data partition AND the real Linux root) give no
+    // order guarantee, so sniff for /etc + /usr to find the real root. Only
+    // when ambiguous: a single ext partition IS the root, and probing it would
+    // mean a needless lwext4 mount/unmount.
+    let mut root_idx = 0;
+    if ext.len() > 1 {
+        for (i, vol) in ext.iter().enumerate() {
+            if crate::kernel::fs::lwext4::is_linux_root(vol) {
+                root_idx = i;
+                break;
+            }
+        }
+    }
+    let mut extra = alloc::vec::Vec::new();
+    for (i, &vol) in ext.iter().enumerate() {
+        if i == root_idx {
+            continue;
+        }
+        if extra.len() + 1 >= MAX_EXT_MOUNTS {
+            // Never drop a filesystem silently — say which and why.
+            crate::println!(
+                "ext4: {} further partition(s) not mounted (lwext4 allows {} mounts)",
+                ext.len() - extra.len() - 1, MAX_EXT_MOUNTS);
+            break;
+        }
+        let n = extra.len() + 1;
+        let mut name = alloc::vec::Vec::new();
+        name.extend_from_slice(b"disk");
+        name.push(b'0' + n as u8);
+        name.push(b'/');
+        extra.push((&*alloc::boxed::Box::leak(name.into_boxed_slice()), vol));
+    }
+
+    MountPlan { root: RootSource::Disk(ext[root_idx]), extra, host_alias: hostfs }
+}
+
+/// Execute the plan, then the invariant mounts.
 /// /boot is an INVARIANT: the embedded bootfs (DN + COMMAND.COM), mounted on
 /// top of whatever the root is — the disk's 0xDA boot-bundle partition is
 /// bootloader-only and never mounted.
-fn mount_filesystems(
-    platform: &'static crate::kernel::platform::Platform,
-    boot_vol: Option<crate::kernel::block::Volume>,
-    screen: &mut crate::vga::Screen,
-) {
-    use crate::kernel::platform::Media;
-
-    match platform.media {
-        Media::DiskRoot { ext4_lba, extra_ext, hostfs } => {
-            crate::screenln!(screen, "ext4 root at sector {:#x}", ext4_lba);
-            let vol = boot_vol.expect("DiskRoot without a boot volume");
-            match Lwext4Fs::new(vol, ext4_lba, 0) {
+fn mount_filesystems(plan: &MountPlan, screen: &mut crate::vga::Screen) {
+    match plan.root {
+        RootSource::Disk(vol) => {
+            crate::screenln!(screen, "ext4 root ({} MB)", vol.sectors / 2048);
+            match Lwext4Fs::new(vol, 0) {
                 Ok(fs) => vfs::mount(b"", alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))),
                 Err(e) => panic!("ext4 mount failed: {}", e),
             }
-            // Additional ext partitions (a laptop's data partition / other
-            // distro) mount at VFS /disk1, /disk2, … (Linux-visible; not under
-            // C:). An unreadable one is logged and skipped, never fatal — the
-            // boot root was already chosen by the /etc+/usr sniff in probe_media.
-            const SUBDIRS: [&[u8]; 3] = [b"disk1/", b"disk2/", b"disk3/"];
-            for (i, &lba) in extra_ext.iter().enumerate() {
-                if lba == 0 {
-                    continue;
-                }
-                match Lwext4Fs::new(vol, lba, i + 1) {
-                    Ok(fs) => {
-                        let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
-                        vfs::mount(SUBDIRS[i], leaked);
-                        crate::screenln!(screen, "ext4 partition at sector {:#x} → /disk{}", lba, i + 1);
-                    }
-                    Err(e) => crate::screenln!(screen, "ext4 partition at {:#x} skipped: {}", lba, e),
-                }
-            }
-            if hostfs {
-                vfs::mount(b"host/", host_fs());
-                crate::screenln!(screen, "hostfs mounted at /host");
-            }
         }
-        Media::HostRoot => {
-            // The host filesystem IS the VFS root: Linux binaries see /usr,
-            // /lib, /etc natively; DOS C: is the /home/retroos subtree.
+        RootSource::Host => {
             vfs::mount(b"", host_fs());
             crate::screenln!(screen, "hostfs mounted as root");
         }
-        Media::Diskless => {}
+        RootSource::None => {}
+    }
+
+    // Extra ext filesystems mount at /disk1, /disk2, … An unreadable one is
+    // logged and skipped, never fatal — the root is already mounted.
+    for (i, (prefix, vol)) in plan.extra.iter().enumerate() {
+        match Lwext4Fs::new(*vol, i + 1) {
+            Ok(fs) => {
+                vfs::mount(prefix, alloc::boxed::Box::leak(alloc::boxed::Box::new(fs)));
+                crate::screenln!(screen, "ext4 partition ({} MB) → /{}",
+                    vol.sectors / 2048,
+                    core::str::from_utf8(&prefix[..prefix.len() - 1]).unwrap_or("?"));
+            }
+            Err(e) => crate::screenln!(screen, "ext4 partition skipped: {}", e),
+        }
+    }
+
+    if plan.host_alias && !matches!(plan.root, RootSource::Host) {
+        vfs::mount(b"host/", host_fs());
+        crate::screenln!(screen, "hostfs mounted at /host");
     }
 
     // The embedded DOS system mounts under C:\BOOT (= c_root + "boot/"). C:
