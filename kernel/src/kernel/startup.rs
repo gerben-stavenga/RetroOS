@@ -310,7 +310,7 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.
 
-    crate::screenln!(screen, "Welcome to RetroOS! Use F11 to switch tasks, F12 to dump the currently running thread's state, and type `help` for DOS commands.");
+    crate::screenln!(screen, "Welcome to RetroOS! F10 toggles cycle profiling, F11 switches tasks, F12 dumps the running thread's state; type `help` for DOS commands.");
 
     crate::screenln!(screen, "Starting DN...");
     let dn_path = [crate::kernel::dos::c_root(), b"boot/DN/DN.COM"].concat();
@@ -823,6 +823,26 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// Event-loop diagnostics: per-event-type counts, user/kernel cycle split,
 /// the periodic [prof] dump, and the free-page low-water sampling. Keeps
 /// the loop body logic, not bookkeeping.
+/// Is the periodic `[prof]` dump on? Written by the console chord, read by
+/// the event loop — the same single-threaded volatile-flag shape as
+/// `thread::request_switch`.
+static mut PROFILE_DUMP: bool = false;
+
+/// Toggle the profile dump, and say which way it went — a chord with no
+/// feedback is indistinguishable from a dead key.
+pub fn toggle_profile() {
+    let on = unsafe {
+        let v = !core::ptr::read_volatile(&raw const PROFILE_DUMP);
+        core::ptr::write_volatile(&raw mut PROFILE_DUMP, v);
+        v
+    };
+    crate::println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
+}
+
+fn profile_enabled() -> bool {
+    unsafe { core::ptr::read_volatile(&raw const PROFILE_DUMP) }
+}
+
 struct EventStats {
     iterations: u64,
     min_free: usize,
@@ -842,7 +862,9 @@ impl EventStats {
     const PROFILE_DUMP_CYCLES: u64 = 2_000_000_000;
     /// Emit the periodic `[prof]` line. Off by default — it floods the kernel
     /// log (and the `LOG` ring buffer); flip to true to profile the event loop.
-    const PROFILE_DUMP: bool = false;
+    /// Whether to emit it — toggled at runtime by the F10 console chord
+    /// (see `kernel::console`), so a run can be profiled without a rebuild.
+    /// Off at boot: the dump is noise unless you asked for it.
 
     fn new<A: crate::Arch>(machine: &mut A) -> Self {
         let free = machine.free_page_count();
@@ -906,7 +928,7 @@ impl EventStats {
         };
         self.counts[idx] += 1;
         if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
-            if Self::PROFILE_DUMP {
+            if profile_enabled() {
                 let total = self.user_cycles.wrapping_add(self.kernel_cycles);
                 let user_pct = self.user_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
                 let kern_pct = self.kernel_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);

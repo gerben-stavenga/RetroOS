@@ -1,8 +1,9 @@
 //! Console input routing — drained host/hardware events to their owners.
 //!
 //! ONE place decides where an input event goes:
-//! - Console-global chords are intercepted first: F11 requests a focus
-//!   switch, F12 dumps the interrupted thread's state.
+//! - Console-global chords are intercepted first: F10 toggles the cycle
+//!   profile dump, F11 requests a focus switch, F12 dumps the interrupted
+//!   thread's state.
 //! - Everything else is addressed to the console owner — `focus::focused()`,
 //!   which today is also the running thread (focus implies execution until
 //!   the scheduler decouples them; this router is written against the
@@ -17,6 +18,8 @@
 use crate::Regs;
 use crate::kernel::thread;
 
+/// F10 scancode (press) — toggle the cycle/event profile dump.
+pub const F10_PRESS: u8 = 0x44;
 /// F11 scancode (press) — focus switch.
 pub const F11_PRESS: u8 = 0x57;
 /// F12 scancode (press) — dump the running thread's state.
@@ -51,10 +54,9 @@ fn drain_dos<A: crate::Arch>(
         let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
         machine.drain(&mut |evt| _events.push(evt));
         for evt in _events {
-        if matches!(evt, crate::Irq::Key(sc) if sc == F11_PRESS) {
-            thread::request_switch();
-        } else if matches!(evt, crate::Irq::Key(sc) if sc == F12_PRESS) {
-            crate::kernel::startup::dump_interrupted_thread(machine, regs, Some(unsafe { &*dp }));
+        if matches!(evt, crate::Irq::Key(sc)
+            if console_chord(machine, regs, sc, Some(unsafe { &*dp }))) {
+            // consumed by a console-global chord
         } else if blocked {
             if let crate::Irq::Key(sc) = evt
                 && crate::kernel::keyboard::update_key_state(sc) {
@@ -76,6 +78,26 @@ fn drain_dos<A: crate::Arch>(
     }
 }
 
+/// Console-global chords, tried before any owner sees the key. Returns true
+/// when the chord was consumed.
+///
+/// One copy, not one per personality: DOS and Linux had identical F11/F12
+/// arms, so a third chord would have been a third place to forget.
+fn console_chord<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    sc: u8,
+    dos: Option<&thread::DosState<A>>,
+) -> bool {
+    match sc {
+        F10_PRESS => crate::kernel::startup::toggle_profile(),
+        F11_PRESS => thread::request_switch(),
+        F12_PRESS => crate::kernel::startup::dump_interrupted_thread(machine, regs, dos),
+        _ => return false,
+    }
+    true
+}
+
 /// Linux owner: keys → cooked fd input.
 fn drain_linux<A: crate::Arch>(
     machine: &mut A,
@@ -89,14 +111,10 @@ fn drain_linux<A: crate::Arch>(
         let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
         machine.drain(&mut |evt| _events.push(evt));
         for evt in _events {
-        if let crate::Irq::Key(sc) = evt {
-            if sc == F11_PRESS {
-                thread::request_switch();
-            } else if sc == F12_PRESS {
-                crate::kernel::startup::dump_interrupted_thread(machine, regs, None);
-            } else {
-                unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
-            }
+        if let crate::Irq::Key(sc) = evt
+            && !console_chord(machine, regs, sc, None)
+        {
+            unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
         }
     }
     }
