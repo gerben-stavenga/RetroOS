@@ -17,6 +17,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use crate::kernel::block::Volume;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -121,7 +122,7 @@ unsafe extern "C" {
 /// Read-only mount → check → unmount, leaving lwext4's global registry clean so
 /// the real root mount can reuse the same partition. Used only to disambiguate
 /// a multi-ext disk (a laptop's data partition vs its real root).
-pub fn is_linux_root(part_lba: u32) -> bool {
+pub fn is_linux_root(disk: &Volume, part_lba: u32) -> bool {
     unsafe fn dir_exists_c(cpath: *const u8) -> bool {
         let mut d: Ext4Dir = unsafe { core::mem::zeroed() };
         if unsafe { ext4_dir_open(&mut d, cpath) } == EOK {
@@ -131,15 +132,12 @@ pub fn is_linux_root(part_lba: u32) -> bool {
             false
         }
     }
-    let Some(part_size) = part_size_from_superblock(part_lba) else {
+    let Some(part_size) = part_size_from_superblock(disk, part_lba) else {
         return false;
     };
     unsafe {
-        if IFACE.ph_bbuf.is_null() {
-            IFACE.ph_bbuf = core::ptr::addr_of_mut!(PH_BBUF) as *mut u8;
-        }
         let bdev = Box::leak(Box::new(Ext4Blockdev {
-            bdif: core::ptr::addr_of_mut!(IFACE),
+            bdif: new_iface(*disk),
             part_offset: part_lba as u64 * 512,
             part_size, // the fs's own extent — see part_size_from_superblock
             bc: core::ptr::null_mut(),
@@ -168,6 +166,16 @@ pub fn is_linux_root(part_lba: u32) -> bool {
 // ── The block-device bridge: lwext4 ↔ RetroOS `block` layer ─────────────────
 // `bread`/`bwrite` receive DEVICE-ABSOLUTE block ids (lwext4 already folded in
 // `part_offset`), and `ph_bsize` is 512, so the id is the LBA directly.
+//
+// Which DEVICE those ids address comes from the mount itself: lwext4 hands
+// every callback the `Ext4Blockdev` it was invoked for, and that struct's
+// interface carries our `Volume` in its `p_user` slot. Nothing here consults a
+// global — two mounts on two different disks stay distinct.
+
+/// The mount's volume, recovered from the callback's own device pointer.
+unsafe fn vol_of(bdev: *mut Ext4Blockdev) -> &'static Volume {
+    unsafe { &*((*(*bdev).bdif).p_user as *const Volume) }
+}
 
 unsafe extern "C" fn bdev_open(_bdev: *mut Ext4Blockdev) -> i32 {
     EOK
@@ -175,40 +183,44 @@ unsafe extern "C" fn bdev_open(_bdev: *mut Ext4Blockdev) -> i32 {
 unsafe extern "C" fn bdev_close(_bdev: *mut Ext4Blockdev) -> i32 {
     EOK
 }
-unsafe extern "C" fn bdev_bread(_bdev: *mut Ext4Blockdev, buf: *mut u8, blk_id: u64, blk_cnt: u32) -> i32 {
+unsafe extern "C" fn bdev_bread(bdev: *mut Ext4Blockdev, buf: *mut u8, blk_id: u64, blk_cnt: u32) -> i32 {
     // Sparse holes are zero-filled inside `ext4_fread` itself (our lwext4 patch
     // adds the hole guard to the aligned/direct and tail paths that upstream
     // omits — only its head path had it), so a hole never reaches the block
     // layer here. This is a plain device read.
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, blk_cnt as usize * 512) };
-    crate::kernel::block::read_sectors(blk_id as u32, slice);
+    unsafe { vol_of(bdev) }.read(blk_id, slice);
     EOK
 }
-unsafe extern "C" fn bdev_bwrite(_bdev: *mut Ext4Blockdev, buf: *const u8, blk_id: u64, blk_cnt: u32) -> i32 {
+unsafe extern "C" fn bdev_bwrite(bdev: *mut Ext4Blockdev, buf: *const u8, blk_id: u64, blk_cnt: u32) -> i32 {
     let slice = unsafe { core::slice::from_raw_parts(buf, blk_cnt as usize * 512) };
-    crate::kernel::block::write_sectors(blk_id as u32, slice);
+    unsafe { vol_of(bdev) }.write(blk_id, slice);
     EOK
 }
 
-// One physical disk → one shared interface (a scratch block buffer + the
-// callbacks). Each partition gets its own `Ext4Blockdev` (own `part_offset`)
-// pointing at this. Single-threaded boot, so the shared `ph_bbuf` is safe.
-static mut PH_BBUF: [u8; 512] = [0; 512];
-static mut IFACE: Ext4BlockdevIface = Ext4BlockdevIface {
-    open: Some(bdev_open),
-    bread: Some(bdev_bread),
-    bwrite: Some(bdev_bwrite),
-    close: Some(bdev_close),
-    lock: None,
-    unlock: None,
-    ph_bsize: 512,
-    ph_bcnt: 0x1_0000_0000, // permissive device size; the superblock sets the real fs extent
-    ph_bbuf: core::ptr::null_mut(),
-    ph_refctr: 0,
-    bread_ctr: 0,
-    bwrite_ctr: 0,
-    p_user: core::ptr::null_mut(),
-};
+// Each mount gets its OWN interface: its own scratch block buffer, and its own
+// `Volume` in `p_user` for the callbacks to route on. The shared static these
+// replace was safe only by the single-threaded-boot argument, and it could not
+// have described two mounts on two different disks at all.
+fn new_iface(vol: Volume) -> *mut Ext4BlockdevIface {
+    let bbuf: &'static mut [u8; 512] = Box::leak(Box::new([0u8; 512]));
+    let vol: &'static Volume = Box::leak(Box::new(vol));
+    Box::leak(Box::new(Ext4BlockdevIface {
+        open: Some(bdev_open),
+        bread: Some(bdev_bread),
+        bwrite: Some(bdev_bwrite),
+        close: Some(bdev_close),
+        lock: None,
+        unlock: None,
+        ph_bsize: 512,
+        ph_bcnt: vol.sectors,
+        ph_bbuf: bbuf.as_mut_ptr(),
+        ph_refctr: 0,
+        bread_ctr: 0,
+        bwrite_ctr: 0,
+        p_user: vol as *const Volume as *mut c_void,
+    }))
+}
 
 /// Leak a NUL-terminated copy of `s` (boot-lifetime), returning its pointer.
 /// The filesystem's true extent, read from its own superblock (1024 B into the
@@ -223,9 +235,9 @@ static mut IFACE: Ext4BlockdevIface = Ext4BlockdevIface {
 /// laptop root (flex_bg scatters inode tables and directory blocks across the
 /// whole partition) mounts and lists as EMPTY. The old hard-coded 128 GiB was
 /// invisible only because the built image's ext4 partition is 1 GiB.
-fn part_size_from_superblock(part_lba: u32) -> Option<u64> {
+fn part_size_from_superblock(disk: &Volume, part_lba: u32) -> Option<u64> {
     let mut sb = [0u8; 512];
-    crate::kernel::block::read_sectors(part_lba + 2, &mut sb);
+    disk.read(part_lba as u64 + 2, &mut sb);
     let rd32 = |off: usize| u32::from_le_bytes(sb[off..off + 4].try_into().unwrap());
     if u16::from_le_bytes([sb[0x38], sb[0x39]]) != 0xEF53 {
         return None; // s_magic
@@ -301,15 +313,12 @@ pub struct Lwext4Fs {
 impl Lwext4Fs {
     /// Register + mount the ext4 partition starting at `part_lba`. `index`
     /// disambiguates the global lwext4 device name / mount point.
-    pub fn new(part_lba: u32, index: usize) -> Result<Self, &'static str> {
-        let part_size = part_size_from_superblock(part_lba)
+    pub fn new(disk: Volume, part_lba: u32, index: usize) -> Result<Self, &'static str> {
+        let part_size = part_size_from_superblock(&disk, part_lba)
             .ok_or("no ext4 superblock at partition start")?;
         unsafe {
-            if IFACE.ph_bbuf.is_null() {
-                IFACE.ph_bbuf = core::ptr::addr_of_mut!(PH_BBUF) as *mut u8;
-            }
             let bdev = Box::leak(Box::new(Ext4Blockdev {
-                bdif: core::ptr::addr_of_mut!(IFACE),
+                bdif: new_iface(disk),
                 part_offset: part_lba as u64 * 512,
                 part_size, // the fs's own extent — see part_size_from_superblock
                 bc: core::ptr::null_mut(),

@@ -11,7 +11,6 @@
 
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use crate::kernel::drivers::{hdd::{self, AtaDisk}, nvme::NvmeDisk};
-use lib::println;
 
 /// One block device: a physical disk, an NVMe namespace, or a wrapper around
 /// either (see the RAM overlay). Addressing is 512-byte LBAs throughout.
@@ -26,26 +25,87 @@ pub trait Disk {
     fn name(&self) -> &str;
 }
 
-/// The disk the filesystems currently read through.
+/// A contiguous extent on a disk — what a filesystem reads through.
 ///
-/// TEMPORARY. This is the last remnant of the old single-disk `KIND` global,
-/// kept only so the existing `read_sectors(lba, ..)` call sites compile
-/// unchanged during this step. It disappears in the next one, when `Volume`
-/// carries the device reference to each filesystem and nothing needs to ask
-/// "which disk" of a static.
-static mut BOOT_DISK: Option<&'static dyn Disk> = None;
+/// This is the unit the rest of the kernel handles: it names the device, where
+/// the extent starts, and — crucially — how long it is. Nothing above needs to
+/// ask a global "which disk"; whoever holds a `Volume` already knows.
+///
+/// Addressing is VOLUME-RELATIVE and bounds-checked, so a filesystem cannot
+/// read past its own extent into whatever follows on the disk.
+#[derive(Clone, Copy)]
+pub struct Volume {
+    disk: &'static dyn Disk,
+    start: u64,
+    /// Length of the extent in 512-byte sectors.
+    pub sectors: u64,
+}
 
-fn boot_disk() -> Option<&'static dyn Disk> {
-    unsafe { *(&raw const BOOT_DISK) }
+impl Volume {
+    /// The whole disk as one volume — for partition-table scans, which by
+    /// definition address the device rather than any partition on it.
+    pub fn whole(disk: &'static dyn Disk) -> Volume {
+        Volume { disk, start: 0, sectors: disk.sectors() }
+    }
+
+    /// An extent within `disk`, clamped to the device's real capacity so a
+    /// bogus partition entry can't manufacture reach the hardware lacks.
+    pub fn new(disk: &'static dyn Disk, start: u64, sectors: u64) -> Volume {
+        let sectors = sectors.min(disk.sectors().saturating_sub(start));
+        Volume { disk, start, sectors }
+    }
+
+    /// The disk this extent lives on.
+    pub fn disk(&self) -> &'static dyn Disk {
+        self.disk
+    }
+
+    /// Read `buf.len().div_ceil(512)` sectors from volume-relative `lba`.
+    /// Returns sectors actually read from the device.
+    ///
+    /// Anything past the end of the extent reads as ZEROS rather than as the
+    /// neighbouring partition's bytes. That is the whole point of carrying the
+    /// length: a filesystem that miscalculates an offset gets an obviously
+    /// empty block, not plausible garbage from somewhere else on the disk.
+    pub fn read(&self, lba: u64, buf: &mut [u8]) -> u32 {
+        let want = buf.len().div_ceil(512) as u64;
+        let avail = self.sectors.saturating_sub(lba).min(want);
+        let n = ((avail * 512) as usize).min(buf.len());
+        let (inside, past_end) = buf.split_at_mut(n);
+        past_end.fill(0);
+        if inside.is_empty() {
+            return 0;
+        }
+        let got = self.disk.read(self.start + lba, inside);
+        apply_overlay(self.start + lba, inside);
+        got
+    }
+
+    /// Write `buf.len().div_ceil(512)` sectors at volume-relative `lba`.
+    /// Bytes past the end of the extent are DROPPED, not written to whatever
+    /// follows. Returns sectors written.
+    pub fn write(&self, lba: u64, buf: &[u8]) -> u32 {
+        let want = buf.len().div_ceil(512) as u64;
+        let avail = self.sectors.saturating_sub(lba).min(want);
+        let n = ((avail * 512) as usize).min(buf.len());
+        if n == 0 {
+            return 0;
+        }
+        write_through(self, lba, &buf[..n])
+    }
 }
 
 /// Volatile write overlay — the real-hardware safety net. When armed (real
-/// metal, where the disk is someone's actual home partition), `write_sectors`
-/// diverts every sector into this kernel-heap map and `read_sectors` patches
+/// metal, where the disk is someone's actual home partition), `Volume::write`
+/// diverts every sector into this kernel-heap map and `Volume::read` patches
 /// them back over the device reads: the filesystems above stay fully writable
 /// (lwext4 journals, savegames, configs), but the device itself is never
 /// written and power-off discards everything. QEMU/hosted runs — where the
 /// disk is a disposable image file — leave it unarmed and write through.
+///
+/// Keyed by DEVICE-ABSOLUTE sector, and still one map for the whole system —
+/// which is only correct while a single disk is in use. It becomes a `Disk`
+/// that wraps a `Disk`, composed per-device by startup, in a later step.
 ///
 /// Single kernel thread (same invariant as the fs layer above); accessed via
 /// `&raw mut` like the other kernel statics.
@@ -84,66 +144,40 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<&'static dyn Disk> {
     disks
 }
 
-/// Probe and select the boot disk. Called once from `startup` before the
-/// partition scan.
-///
-/// TEMPORARY, alongside [`BOOT_DISK`]: this takes the first disk found,
-/// reproducing the old ATA-else-NVMe chain exactly. Enumeration already
-/// returns all of them; teaching the mount policy to use more than one is a
-/// later step.
-pub fn init<A: crate::Arch>(machine: &mut A) {
-    let disk = probe(machine).first().copied();
-    match disk {
-        Some(d) => println!("Storage: {} ({} MB)", d.name(), d.sectors() / 2048),
-        None => println!("Storage: none detected"),
-    }
-    unsafe { BOOT_DISK = disk };
-}
-
-/// Read `buffer.len().div_ceil(512)` sectors starting at `lba`. Sectors the
-/// armed overlay holds shadow the device contents.
-pub fn read_sectors(lba: u32, buffer: &mut [u8]) -> u32 {
-    let n = match boot_disk() {
-        Some(d) => d.read(lba as u64, buffer),
-        None => {
-            buffer.fill(0);
-            0
-        }
-    };
+/// Patch armed-overlay sectors over a freshly read buffer. `abs` is the
+/// device-absolute LBA of `buf`'s first sector.
+fn apply_overlay(abs: u64, buf: &mut [u8]) {
     if let Some(map) = overlay().as_ref()
         && !map.is_empty()
     {
-        for (i, chunk) in buffer.chunks_mut(512).enumerate() {
-            if let Some(s) = map.get(&(lba as u64 + i as u64)) {
+        for (i, chunk) in buf.chunks_mut(512).enumerate() {
+            if let Some(s) = map.get(&(abs + i as u64)) {
                 chunk.copy_from_slice(&s[..chunk.len()]);
             }
         }
     }
-    n
 }
 
-/// Write `buffer.len().div_ceil(512)` sectors starting at `lba` — into the
-/// volatile overlay when armed (real metal), through to the device otherwise.
-/// Returns sectors written (0 = no device).
-pub fn write_sectors(lba: u32, buffer: &[u8]) -> u32 {
+/// The write half: into the volatile overlay when armed (real metal), through
+/// to the device otherwise. `lba` is volume-relative; the overlay is keyed by
+/// device-absolute sector.
+fn write_through(vol: &Volume, lba: u64, buf: &[u8]) -> u32 {
+    let abs = vol.start + lba;
     if overlay().is_some() {
-        for (i, chunk) in buffer.chunks(512).enumerate() {
-            let sector = lba as u64 + i as u64;
+        for (i, chunk) in buf.chunks(512).enumerate() {
+            let sector = abs + i as u64;
             let mut s = Box::new([0u8; 512]);
             if chunk.len() == 512 {
                 s.copy_from_slice(chunk);
             } else {
                 // Partial trailing sector: seed with the current contents
                 // (overlay-aware read; no map borrow is held across it).
-                read_sectors(sector as u32, &mut s[..]);
+                vol.read(lba + i as u64, &mut s[..]);
                 s[..chunk.len()].copy_from_slice(chunk);
             }
             overlay().as_mut().unwrap().insert(sector, s);
         }
-        return buffer.len().div_ceil(512) as u32;
+        return buf.len().div_ceil(512) as u32;
     }
-    match boot_disk() {
-        Some(d) => d.write(lba as u64, buffer),
-        None => 0,
-    }
+    vol.disk.write(abs, buf)
 }

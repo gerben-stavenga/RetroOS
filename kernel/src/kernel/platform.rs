@@ -9,6 +9,7 @@
 //! private `static` verdict. Adding an enum variant breaks every policy
 //! site at compile time — deliberately.
 
+use crate::kernel::block::Volume;
 use crate::println;
 
 pub struct Platform {
@@ -182,9 +183,13 @@ static mut PLATFORM: Option<Platform> = None;
 /// Probe the machine and freeze the result. Called exactly once, early in
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
-pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'static Platform {
+pub fn probe<A: crate::Arch>(
+    machine: &mut A,
+    boot: &crate::BootConfig,
+    disk: Option<crate::kernel::block::Volume>,
+) -> &'static Platform {
     let audio = probe_audio(machine);
-    let media = probe_media(machine);
+    let media = probe_media(machine, disk);
 
     // Metal: ask the hardware. Hosted: the answers are properties of the
     // backend itself — the interp port bus has no VGA device and its zeroed
@@ -301,9 +306,9 @@ fn is_protective_mbr(mbr: &[u8; 512]) -> bool {
 /// 0xEF53 lives at byte 1080 of the partition (superblock at 1024, s_magic at
 /// +0x38) → sector lba+2, offset 56. GUID-agnostic, so it catches any ext root
 /// regardless of how the partition was typed.
-fn is_ext_partition(lba: u32) -> bool {
+fn is_ext_partition(disk: &Volume, lba: u32) -> bool {
     let mut sb = [0u8; 512];
-    crate::kernel::block::read_sectors(lba + 2, &mut sb);
+    disk.read(lba as u64 + 2, &mut sb);
     u16::from_le_bytes([sb[56], sb[57]]) == 0xEF53
 }
 
@@ -312,12 +317,12 @@ fn is_ext_partition(lba: u32) -> bool {
 /// LBA 1 holds the header (signature "EFI PART", then the partition-array LBA,
 /// entry count and entry stride); the array follows. We read it a sector at a
 /// time and probe each non-empty entry's superblock. Assumes 512-byte sectors
-/// (the only size `block::read_sectors` handles — a 4K-formatted NVMe is
+/// (the only size `Volume::read` handles — a 4K-formatted NVMe is
 /// rejected earlier in the driver); partition starts past 4 GiB-sectors don't
 /// fit our u32 LBA and are skipped, which never happens on a real laptop root.
-fn gpt_collect_ext(out: &mut [u32]) -> usize {
+fn gpt_collect_ext(disk: &Volume, out: &mut [u32]) -> usize {
     let mut hdr = [0u8; 512];
-    crate::kernel::block::read_sectors(1, &mut hdr);
+    disk.read(1, &mut hdr);
     if &hdr[0..8] != b"EFI PART" {
         return 0;
     }
@@ -334,7 +339,7 @@ fn gpt_collect_ext(out: &mut [u32]) -> usize {
     let mut buf = [0u8; 512];
     let mut n = 0;
     for s in 0..sectors {
-        crate::kernel::block::read_sectors(entry_lba as u32 + s as u32, &mut buf);
+        disk.read(entry_lba + s as u64, &mut buf);
         for e in 0..per_sector {
             let off = e * entry_size;
             // Type GUID all-zero ⇒ unused slot.
@@ -347,7 +352,7 @@ fn gpt_collect_ext(out: &mut [u32]) -> usize {
             }
             // Collect every ext* partition (a multi-distro disk has several);
             // the first becomes the root, the rest mount as subdirectories.
-            if is_ext_partition(first_lba as u32) && n < out.len() {
+            if is_ext_partition(disk, first_lba as u32) && n < out.len() {
                 out[n] = first_lba as u32;
                 n += 1;
             }
@@ -367,11 +372,11 @@ fn gpt_collect_ext(out: &mut [u32]) -> usize {
 /// (has `/etc` and `/usr`) rather than a data partition? A multi-ext disk (a
 /// laptop with a data partition AND the real root) gives no order guarantee, so
 /// we sniff the layout to mount the right one at VFS /.
-fn is_linux_root(lba: u32) -> bool {
-    crate::kernel::fs::lwext4::is_linux_root(lba)
+fn is_linux_root(disk: &Volume, lba: u32) -> bool {
+    crate::kernel::fs::lwext4::is_linux_root(disk, lba)
 }
 
-fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
+fn probe_media<A: crate::Arch>(machine: &mut A, disk: Option<Volume>) -> Media {
     let _ = machine;
     // A native host backend (hosted "punch-through") means /host is available
     // without COM1 — take it as hostfs-present and skip the serial probe.
@@ -379,8 +384,13 @@ fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
     let hostfs = crate::kernel::fs::hostfs::host_backend_installed()
         || crate::kernel::fs::hostfs::init();
 
+    // No disk at all: every scan below finds nothing, the same verdict path
+    // as an empty disk.
+    let Some(disk) = disk else {
+        return if hostfs { Media::HostRoot } else { Media::Diskless };
+    };
     let mut mbr = [0u8; 512];
-    crate::kernel::block::read_sectors(0, &mut mbr);
+    disk.read(0, &mut mbr);
     // Collect every ext partition on the disk (a dual-boot laptop has more than
     // one): MBR type 0x83 entries, or — on a real UEFI disk (protective MBR) —
     // the GPT's ext* partitions found by superblock magic.
@@ -394,7 +404,7 @@ fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
         }
     }
     if n == 0 && is_protective_mbr(&mbr) {
-        n = gpt_collect_ext(&mut parts);
+        n = gpt_collect_ext(&disk, &mut parts);
     }
 
     if n > 0 {
@@ -407,7 +417,7 @@ fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
         let mut root_idx = 0;
         if n > 1 {
             for (i, &p) in parts.iter().enumerate().take(n) {
-                if is_linux_root(p) { root_idx = i; break; }
+                if is_linux_root(&disk, p) { root_idx = i; break; }
             }
         }
         // The remaining ext partitions mount as C:\DISK1, C:\DISK2, …

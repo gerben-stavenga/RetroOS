@@ -7,11 +7,11 @@ use alloc::vec::Vec;
 
 const BLOCK_SIZE: usize = 512;
 
-/// Where the TAR bytes live. Everything above `read_block` is identical for
-/// both: a TAR is a TAR.
+/// Where the TAR bytes live: RAM only. A disk-backed variant existed but was
+/// never constructed — startup's placeholder was always replaced by the
+/// embedded bootfs before mount, so the only thing it could ever have done was
+/// read sector 0 with an unbuilt index.
 enum Source {
-    /// TAR partition on the boot disk, starting at this sector.
-    Disk(u32),
     /// TAR bytes in RAM (`kernel::bootfs()`, linked into the kernel image).
     Ram(&'static [u8]),
 }
@@ -42,12 +42,8 @@ pub struct TarFs {
 }
 
 impl TarFs {
-    pub const fn new(start_sector: u32) -> Self {
-        Self { source: Source::Disk(start_sector), index: Vec::new() }
-    }
-
     /// A TAR held in RAM (the embedded bootfs).
-    pub fn new_ram(bytes: &'static [u8]) -> Self {
+    pub const fn new_ram(bytes: &'static [u8]) -> Self {
         Self { source: Source::Ram(bytes), index: Vec::new() }
     }
 
@@ -56,7 +52,6 @@ impl TarFs {
     /// truncated blob still terminates the index walk.
     fn read_block(&self, block: u32, buf: &mut [u8; BLOCK_SIZE]) {
         match self.source {
-            Source::Disk(start) => { crate::kernel::block::read_sectors(start + block, buf); }
             Source::Ram(bytes) => {
                 let off = block as usize * BLOCK_SIZE;
                 buf.fill(0);
@@ -88,13 +83,10 @@ impl TarFs {
         self.index.sort_by(|a, b| {
             a.name[..a.name_len as usize].cmp(&b.name[..b.name_len as usize])
         });
-        match self.source {
-            Source::Disk(start) => crate::println!(
-                "TAR: indexed {} entries from sector {:#x}", self.index.len(), start),
-            Source::Ram(bytes) => crate::println!(
-                "TAR: indexed {} entries from embedded bootfs ({} KB)",
-                self.index.len(), bytes.len() / 1024),
-        }
+        let Source::Ram(bytes) = self.source;
+        crate::println!(
+            "TAR: indexed {} entries from embedded bootfs ({} KB)",
+            self.index.len(), bytes.len() / 1024);
     }
 
     /// O(log N) case-sensitive lookup.

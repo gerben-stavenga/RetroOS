@@ -7,7 +7,7 @@ use crate::kernel::{vfs, fs::tarfs::TarFs, fs::lwext4::Lwext4Fs};
 use crate::kernel::thread;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
-static mut ROOT_TARFS: TarFs = TarFs::new(0);
+static mut ROOT_TARFS: TarFs = TarFs::new_ram(&[]);
 
 /// Ext4 filesystem (heap-allocated at boot, leaked to get &'static)
 static mut EXT4_FS: Option<&'static Lwext4Fs> = None;
@@ -24,15 +24,24 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // on machines with no serial/debug port (real metal — 0xE9 goes nowhere).
     crate::kernel::klog::init();
 
-    // Pick the boot disk: ATA where present, NVMe on UEFI-class machines —
-    // before the platform probe, which reads the MBR for the Media verdict.
-    crate::kernel::block::init(machine);
+    // Discover every disk, then take the first as the boot volume. The block
+    // layer only reports what exists; picking one is startup's call, and it
+    // happens here rather than inside a driver.
+    let disks = crate::kernel::block::probe(machine);
+    for d in &disks {
+        crate::println!("Storage: {} ({} MB)", d.name(), d.sectors() / 2048);
+    }
+    let boot_vol = disks.first().copied().map(crate::kernel::block::Volume::whole);
+    if boot_vol.is_none() {
+        crate::println!("Storage: none detected");
+    }
     crate::screenln!(screen, "Block devices initialized");
 
     // Probe the machine ONCE and freeze the result; all hardware policy
     // (VGA passthrough, BIOS choice, audio, media/mounts, console, IOPB)
-    // derives from this.
-    let platform = crate::kernel::platform::probe(machine, boot);
+    // derives from this. The boot volume goes in because the Media verdict
+    // still comes from an MBR/GPT scan here — that moves to `block` next.
+    let platform = crate::kernel::platform::probe(machine, boot, boot_vol);
 
     // Disk-write policy: on real hardware the boot disk is someone's actual
     // home partition, so writes land in a volatile RAM overlay — everything
@@ -53,7 +62,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
     crate::kernel::dos::set_c_root(boot.c_root());
 
-    mount_filesystems(platform, &mut screen);
+    mount_filesystems(platform, boot_vol, &mut screen);
     init_device_policy(machine, platform);
     let master_env = load_master_env();
     init_console_pipe();
@@ -81,13 +90,18 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
 /// /boot is an INVARIANT: the embedded bootfs (DN + COMMAND.COM), mounted on
 /// top of whatever the root is — the disk's 0xDA boot-bundle partition is
 /// bootloader-only and never mounted.
-fn mount_filesystems(platform: &'static crate::kernel::platform::Platform, screen: &mut crate::vga::Screen) {
+fn mount_filesystems(
+    platform: &'static crate::kernel::platform::Platform,
+    boot_vol: Option<crate::kernel::block::Volume>,
+    screen: &mut crate::vga::Screen,
+) {
     use crate::kernel::platform::Media;
 
     match platform.media {
         Media::DiskRoot { ext4_lba, extra_ext, hostfs } => {
             crate::screenln!(screen, "ext4 root at sector {:#x}", ext4_lba);
-            match Lwext4Fs::new(ext4_lba, 0) {
+            let vol = boot_vol.expect("DiskRoot without a boot volume");
+            match Lwext4Fs::new(vol, ext4_lba, 0) {
                 Ok(fs) => {
                     let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                     unsafe { EXT4_FS = Some(leaked); }
@@ -104,7 +118,7 @@ fn mount_filesystems(platform: &'static crate::kernel::platform::Platform, scree
                 if lba == 0 {
                     continue;
                 }
-                match Lwext4Fs::new(lba, i + 1) {
+                match Lwext4Fs::new(vol, lba, i + 1) {
                     Ok(fs) => {
                         let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
                         vfs::mount(SUBDIRS[i], leaked);
