@@ -3,7 +3,7 @@
 extern crate alloc;
 
 use crate::Regs;
-use crate::kernel::{vfs, tarfs::TarFs, lwext4::Lwext4Fs};
+use crate::kernel::{vfs, fs::tarfs::TarFs, fs::lwext4::Lwext4Fs};
 use crate::kernel::thread;
 
 /// The root filesystem instance (static so it lives forever for &'static dyn)
@@ -63,14 +63,14 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
 
 /// The host filesystem (COM1 transport). Mounted at /host beside a disk
 /// root, or AS the root under `Media::HostRoot`.
-static HOSTFS: crate::kernel::hostfs::HostFs = crate::kernel::hostfs::HostFs::new();
+static HOSTFS: crate::kernel::fs::hostfs::HostFs = crate::kernel::fs::hostfs::HostFs::new();
 
 /// The host fs to mount: the injected native `std::fs` backend when the entry
 /// installed one (hosted "punch-through" — direct calls, no COM1), else the
 /// COM1 `HOSTFS` client (metal / the Python bridge).
 fn host_fs() -> &'static dyn vfs::Filesystem {
-    if crate::kernel::hostfs::host_backend_installed() {
-        &crate::kernel::hostfs::INJECTED_HOSTFS
+    if crate::kernel::fs::hostfs::host_backend_installed() {
+        &crate::kernel::fs::hostfs::INJECTED_HOSTFS
     } else {
         &HOSTFS
     }
@@ -168,8 +168,8 @@ fn init_device_policy<A: crate::Arch>(
     // Probe for an AC'97 codec (metal). If present it becomes the kernel audio
     // output for the emulated Sound Blaster; absent (no PCI, e.g. the
     // interpreter) leaves the sound path on its port-window fallback.
-    crate::kernel::ac97::init(machine);
-    crate::kernel::hda::init(machine);
+    crate::kernel::drivers::ac97::init(machine);
+    crate::kernel::drivers::hda::init(machine);
 }
 
 /// /CONFIG.SYS provides the master env handed to DN and any user-driven
@@ -231,7 +231,7 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
             run_program(machine, threads, path, tail, cwd, master_env, boot.debug_watch);
         }
         crate::screenln!(screen, "All commands done — shutting down.");
-        crate::kernel::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
+        crate::kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }
 

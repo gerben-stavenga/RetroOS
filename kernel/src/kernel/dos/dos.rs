@@ -657,7 +657,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         // codec right before the user cuts power (observed 2026-07-10: that
         // re-wedged the ALC298 the SHUTDOWN command exists to protect).
         0x08 => {
-            crate::kernel::hda::emergency_quiesce();
+            crate::kernel::drivers::hda::emergency_quiesce();
             // Diverging path: the machine halts here, so like the panic
             // handler we don't chase the screen license up the (now
             // irrelevant) call chain — build a writer and render the

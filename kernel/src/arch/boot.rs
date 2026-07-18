@@ -308,7 +308,7 @@ fn read_boot_config() -> crate::BootConfig {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // Stop HDA DMA and hold its link in reset first: a hard reboot from a
     // panic mid-stream can wedge the codec until a cold power-off.
-    crate::kernel::hda::emergency_quiesce();
+    crate::kernel::drivers::hda::emergency_quiesce();
 
     // The screen license lives somewhere up the dead call chain; a panic
     // doesn't follow the ownership rules — they protect a running program's

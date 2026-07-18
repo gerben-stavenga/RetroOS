@@ -93,11 +93,11 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => {
-            crate::kernel::hda::play(machine, rate, fmt, bytes);
+            crate::kernel::drivers::hda::play(machine, rate, fmt, bytes);
             return;
         }
         Audio::EmulatedAc97 => {
-            crate::kernel::ac97::play(machine, rate, fmt, bytes);
+            crate::kernel::drivers::ac97::play(machine, rate, fmt, bytes);
             return;
         }
         Audio::EmulatedPortWindow => {}
@@ -123,7 +123,7 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
 pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::hda::stop(machine, park),
+        Audio::EmulatedHda => crate::kernel::drivers::hda::stop(machine, park),
         Audio::EmulatedAc97 | Audio::EmulatedPortWindow => {}
         Audio::SbPassthrough | Audio::EmulatedSilent => {}
     }
@@ -144,8 +144,8 @@ pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
 pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::hda::position(),
-        Audio::EmulatedAc97 => crate::kernel::ac97::position(machine),
+        Audio::EmulatedHda => crate::kernel::drivers::hda::position(),
+        Audio::EmulatedAc97 => crate::kernel::drivers::ac97::position(machine),
         Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => None,
     }
 }
@@ -158,8 +158,8 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
 pub fn min_fill(rate: u32) -> Option<u32> {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::hda::min_fill(rate),
-        Audio::EmulatedAc97 => crate::kernel::ac97::min_fill(rate),
+        Audio::EmulatedHda => crate::kernel::drivers::hda::min_fill(rate),
+        Audio::EmulatedAc97 => crate::kernel::drivers::ac97::min_fill(rate),
         Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => None,
     }
 }

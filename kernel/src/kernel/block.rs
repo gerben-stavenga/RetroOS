@@ -9,7 +9,7 @@
 
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::sync::atomic::{AtomicU8, Ordering};
-use crate::kernel::{hdd, nvme};
+use crate::kernel::drivers::{hdd, nvme};
 use lib::println;
 
 const NONE: u8 = 0;

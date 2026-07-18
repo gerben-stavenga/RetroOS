@@ -57,7 +57,10 @@ backends — `arch-metal` (real CPU, `no_std`/Bazel) and `arch-interp` (Unicorn,
   - `kernel/src/kernel/dos/` - DOS personality (machine.rs = PC hardware, dos.rs, dpmi/)
   - `kernel/src/kernel/linux/` - Linux ABI personality (32/64-bit ELF syscalls)
   - `kernel/src/kernel/{platform,focus,io_policy}.rs` - machine probe, console owner, IOPB
-  - `kernel/src/kernel/{ac97,hda,sound,nvme,pci,ext4fs}.rs` - device + fs drivers
+  - `kernel/src/kernel/{block,sound,net,console,vfs,portio,pci}.rs` - the driver/fs APIs
+    the personalities call; they own the policy and dispatch downward
+  - `kernel/src/kernel/drivers/` - concrete hardware only (hdd, nvme, hda, ac97, alc298_amp)
+  - `kernel/src/kernel/fs/` - filesystem backends (tarfs, hostfs, lwext4)
   - `kernel/src/vga.rs` - the single emulated VGA model
 - `lib/` - Freestanding library (VGA render, ELF, TAR, MD5)
 - `play/` - `retroos-play` windowed host emulator (on `arch-interp`)
@@ -87,6 +90,7 @@ existing GRUB (`kernel.elf` is multiboot-loadable — see BOOTING.md).
 ### Key Design Patterns
 
 - **Canonicalization**: normalize mode/ABI differences into shared kernel abstractions
+- **Kernel layering**: personalities → kernel APIs → `drivers`/`fs`. Arrows point down only; a personality never names a driver or a filesystem, it calls `block`/`sound`/`vfs`/`net`
 - **Swappable arch backend**: `arch-metal` (real CPU) and `arch-interp` (Unicorn) implement one `arch-abi`; differences live *below* the boundary, never as kernel `cfg`/hooks
 - **Recursive Paging**: one flat `entries[]` model across legacy, PAE, and compat mode
 - **Copy-on-Write Forking**: Fork shares parent pages read-only, allocates on write fault

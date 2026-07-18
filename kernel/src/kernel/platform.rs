@@ -277,10 +277,10 @@ fn probe_audio<A: crate::Arch>(machine: &mut A) -> Audio {
     if !sb_absent {
         return Audio::SbPassthrough;
     }
-    if crate::kernel::hda::scan(machine).is_some() {
+    if crate::kernel::drivers::hda::scan(machine).is_some() {
         return Audio::EmulatedHda;
     }
-    if crate::kernel::ac97::scan(machine).is_some() {
+    if crate::kernel::drivers::ac97::scan(machine).is_some() {
         return Audio::EmulatedAc97;
     }
     if crate::kernel::sound::window_present(machine) {
@@ -368,7 +368,7 @@ fn gpt_collect_ext(out: &mut [u32]) -> usize {
 /// laptop with a data partition AND the real root) gives no order guarantee, so
 /// we sniff the layout to mount the right one at VFS /.
 fn is_linux_root(lba: u32) -> bool {
-    crate::kernel::lwext4::is_linux_root(lba)
+    crate::kernel::fs::lwext4::is_linux_root(lba)
 }
 
 fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
@@ -376,8 +376,8 @@ fn probe_media<A: crate::Arch>(machine: &mut A) -> Media {
     // A native host backend (hosted "punch-through") means /host is available
     // without COM1 — take it as hostfs-present and skip the serial probe.
     // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
-    let hostfs = crate::kernel::hostfs::host_backend_installed()
-        || crate::kernel::hostfs::init();
+    let hostfs = crate::kernel::fs::hostfs::host_backend_installed()
+        || crate::kernel::fs::hostfs::init();
 
     let mut mbr = [0u8; 512];
     crate::kernel::block::read_sectors(0, &mut mbr);

@@ -1271,7 +1271,7 @@ impl Hda {
         if self.amp_init_done {
             return;
         }
-        for &v in crate::kernel::alc298_amp::AMP_INIT {
+        for &v in crate::kernel::drivers::alc298_amp::AMP_INIT {
             self.verb(REALTEK_VENDOR_NID, v);
             if self.verb_failed {
                 crate::println!("hda: alc298 amp init aborted (codec stopped responding)");
@@ -1281,7 +1281,7 @@ impl Hda {
         self.amp_init_done = true;
         crate::println!(
             "hda: alc298 amp init replayed ({} verbs)",
-            crate::kernel::alc298_amp::AMP_INIT.len()
+            crate::kernel::drivers::alc298_amp::AMP_INIT.len()
         );
     }
 
