@@ -852,6 +852,11 @@ struct EventStats {
     last_kernel_entry: u64,
     last_profile_dump: u64,
     counts: [u32; 11], // irq, softint, hlt, in, out, ins, outs, fault, pf, exc, syscall
+    /// Port I/O by PORT — a small associative table rather than a 64K array,
+    /// which would not fit the kernel stack. Ports that matter are few; once
+    /// the table is full the rest aggregate into `port_other`.
+    ports: [(u16, u32); 12],
+    port_other: u32,
     /// Software interrupts BY VECTOR. The aggregate above says the guest is
     /// trapping a lot; only this says which service it is asking for, which is
     /// the difference between a number and a lead.
@@ -882,6 +887,8 @@ impl EventStats {
             last_kernel_entry: now,
             last_profile_dump: now,
             counts: [0; 11],
+            ports: [(0, 0); 12],
+            port_other: 0,
             softint_by_vec: [0; 256],
         }
     }
@@ -903,6 +910,19 @@ impl EventStats {
             .kernel_cycles
             .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
         self.last_kernel_entry = now;
+    }
+
+    /// Tally one port access. Linear scan of a 12-entry table: shorter than a
+    /// cache line's worth of work, and the hot set is a handful of ports.
+    fn count_port(&mut self, port: u16) {
+        for e in self.ports.iter_mut() {
+            if e.1 == 0 || e.0 == port {
+                e.0 = port;
+                e.1 += 1;
+                return;
+            }
+        }
+        self.port_other += 1;
     }
 
     fn post_run<A: crate::Arch>(
@@ -933,8 +953,14 @@ impl EventStats {
                 1
             }
             KE::Hlt => 2,
-            KE::In { .. } => 3,
-            KE::Out { .. } => 4,
+            KE::In { port, .. } => {
+                self.count_port(*port);
+                3
+            }
+            KE::Out { port, .. } => {
+                self.count_port(*port);
+                4
+            }
             KE::Ins { .. } => 5,
             KE::Outs { .. } => 6,
             KE::Fault => 7,
@@ -963,6 +989,12 @@ impl EventStats {
                     c[0], c[1], c[2], c[3], c[4], c[5], c[6],
                     c[8], c[9], c[7], c[10], machine.get_ticks(),
                     regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+                if c[3] + c[4] > 0 {
+                    let mut p = self.ports;
+                    p.sort_by(|a, b| b.1.cmp(&a.1));
+                    crate::dbg_println!("[prof] hottest port: {:03X}h={} {:03X}h={} {:03X}h={} other={}",
+                        p[0].0, p[0].1, p[1].0, p[1].1, p[2].0, p[2].1, self.port_other);
+                }
                 if c[1] > 0 {
                     crate::dbg_println!("[prof] hottest INT (service, not the 31h trampoline): {:02X}h={} {:02X}h={} {:02X}h={}",
                         top[0].1, top[0].0, top[1].1, top[1].0, top[2].1, top[2].0);
@@ -972,6 +1004,8 @@ impl EventStats {
             self.kernel_cycles = 0;
             self.counts = [0; 11];
             self.softint_by_vec = [0; 256];
+            self.ports = [(0, 0); 12];
+            self.port_other = 0;
             self.last_profile_dump = now;
         }
     }
