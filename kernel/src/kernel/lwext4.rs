@@ -175,22 +175,12 @@ unsafe extern "C" fn bdev_open(_bdev: *mut Ext4Blockdev) -> i32 {
 unsafe extern "C" fn bdev_close(_bdev: *mut Ext4Blockdev) -> i32 {
     EOK
 }
-unsafe extern "C" fn bdev_bread(bdev: *mut Ext4Blockdev, buf: *mut u8, blk_id: u64, blk_cnt: u32) -> i32 {
+unsafe extern "C" fn bdev_bread(_bdev: *mut Ext4Blockdev, buf: *mut u8, blk_id: u64, blk_cnt: u32) -> i32 {
+    // Sparse holes are zero-filled inside `ext4_fread` itself (our lwext4 patch
+    // adds the hole guard to the aligned/direct and tail paths that upstream
+    // omits — only its head path had it), so a hole never reaches the block
+    // layer here. This is a plain device read.
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, blk_cnt as usize * 512) };
-    // A read that targets filesystem block 0 (the partition's first sector) is
-    // lwext4 asking for a SPARSE HOLE. `ext4_fread`'s aligned/direct and tail
-    // paths map an unallocated block (physical block 0) to `part_offset` and,
-    // unlike its head path, do NOT zero-fill — so `ext4_blocks_get_direct` and
-    // the byte-tail read would hand us the superblock area as if it were file
-    // data. Block 0 is never a real data or metadata block, so this uniquely
-    // means a hole: return zeros, exactly as every other ext4 reader does.
-    // (Without this, sparse files — e.g. DUKE3D.GRP — read garbage where they
-    // should read zeros.)
-    let part_start = unsafe { (*bdev).part_offset } / 512;
-    if blk_id == part_start {
-        slice.fill(0);
-        return EOK;
-    }
     crate::kernel::block::read_sectors(blk_id as u32, slice);
     EOK
 }

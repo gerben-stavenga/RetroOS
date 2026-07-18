@@ -1,35 +1,63 @@
-ext4_fread: zero-fill holes in the aligned and tail paths.
+ext4_fread: zero-fill sparse holes on the aligned and tail read paths.
 
-Upstream ext4_fread() only guards holes (fblock==0) on the HEAD partial-
-block path (if fblock != 0 ... else memset). The aligned/full-block loop
-and the tail partial-block path both feed a hole's fblock straight into a
-read, returning stale on-disk bytes (the partition's superblock area)
-instead of zeros. Two fixes:
+ext4_fread() only guards holes (physical block fblock == 0) on the HEAD
+partial-block path:
 
-  1. Aligned loop: `fblock_start == 0` was used as a "run not started"
-     sentinel, but 0 is a valid HOLE block; a hole followed by real data
-     let the next block overwrite fblock_start and steal its data. Key the
-     start-of-run off the run length instead, so a leading hole keeps
-     fblock_start=0.
+    if (fblock != 0) { read }
+    else             { memset(u8_buf, 0, len); }
+
+The aligned/full-block loop and the tail partial-block path both feed a
+hole's fblock straight into a read (ext4_blocks_get_direct / read at
+fblock*block_size == the partition superblock area), returning stale disk
+bytes instead of zeros. Reading any sparse file (e.g. one produced by
+`mkfs.ext4 -d` folding zero-runs into holes) returns garbage in the holes.
+
+Two fixes:
+  1. Aligned loop: `fblock_start == 0` doubled as a "run not started"
+     sentinel, but 0 is a valid hole block, so a hole followed by data let
+     the next block overwrite fblock_start and steal its data. Key the
+     start-of-run off the run length (0 only for the first block), then
+     zero-fill when the run is a hole (fblock_start == 0).
   2. Tail path: add the same `if (fblock != 0) ... else memset` guard the
      head path already has.
 
-Surfaced as garbage pixels in games loading sparse assets (OMF 2097).
---- a/src/ext4.c	2026-07-17 22:57:47.354331210 -0700
-+++ b/src/ext4.c	2026-07-17 22:57:47.356218681 -0700
-@@ -1780,7 +1780,10 @@
+--- a/src/ext4.c	2026-07-17 23:13:18.073822215 -0700
++++ b/src/ext4.c	2026-07-17 23:13:18.074611002 -0700
+@@ -1780,7 +1780,11 @@
  
  			iblock_idx++;
  
 -			if (!fblock_start)
-+			/* fblock 0 is a valid HOLE, not "unset": key the
-+			 * start-of-run off the run length (never 0 after the
-+			 * first block) so a leading hole keeps fblock_start=0. */
++			/* fblock 0 is a valid HOLE, not "unset": key start-of-run off
++			 * the run length (0 only for the first block) so a leading hole
++			 * keeps fblock_start=0 and is zero-filled below, not overwritten
++			 * by the next block. */
 +			if (!fblock_count)
  				fblock_start = fblock;
  
  			if ((fblock_start + fblock_count) != fblock)
-@@ -1811,10 +1814,16 @@
+@@ -1789,10 +1793,16 @@
+ 			fblock_count++;
+ 		}
+ 
+-		r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf, fblock_start,
+-					   fblock_count);
+-		if (r != EOK)
+-			goto Finish;
++		if (fblock_start == 0) {
++			/* Sparse hole run: zero-fill instead of reading block 0.
++			 * The head path guards holes; the aligned loop did not. */
++			memset(u8_buf, 0, block_size * fblock_count);
++		} else {
++			r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf,
++						   fblock_start, fblock_count);
++			if (r != EOK)
++				goto Finish;
++		}
+ 
+ 		size -= block_size * fblock_count;
+ 		u8_buf += block_size * fblock_count;
+@@ -1811,10 +1821,15 @@
  		if (r != EOK)
  			goto Finish;
  
@@ -37,14 +65,13 @@ Surfaced as garbage pixels in games loading sparse assets (OMF 2097).
 -		r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, size);
 -		if (r != EOK)
 -			goto Finish;
-+		/* fblock 0 is a HOLE: zero-fill like the head path
-+		 * above (upstream omits this guard on the tail). */
 +		if (fblock != 0) {
 +			off = fblock * block_size;
 +			r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, size);
 +			if (r != EOK)
 +				goto Finish;
 +		} else {
++			/* hole tail: zero-fill like the head path. */
 +			memset(u8_buf, 0, size);
 +		}
  
