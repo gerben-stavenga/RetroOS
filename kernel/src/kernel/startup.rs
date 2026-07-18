@@ -747,6 +747,7 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
         en, mode, reload, now, next, delta);
 
     crate::kernel::dos::dump_if_ring();
+    crate::kernel::dos::dump_gus_ring();
 }
 
 

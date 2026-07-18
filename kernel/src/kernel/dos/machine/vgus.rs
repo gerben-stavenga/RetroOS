@@ -392,8 +392,8 @@ impl Gus {
             crate::dbg_println!("[gus] in  {:03X} (reg {:02X}v{})", p, c.reg_sel, c.voice_sel);
         }
         let lo = p.wrapping_sub(base);
-        if lo < 0x10 {
-            return match lo {
+        let v = if lo < 0x10 {
+            match lo {
                 // IRQ status: bit2 T1, bit3 T2, bit5 wave, bit6 ramp,
                 // bit7 DMA-TC, bits0/1 MIDI.
                 0x06 => c.irq_status(),
@@ -407,27 +407,30 @@ impl Gus {
                 // the simplest personality every driver accepts.
                 0x0F => 0xFF,
                 _ => 0xFF,
-            };
-        }
-        let hi = p.wrapping_sub(base + 0x100);
-        match hi {
-            // MIDI 6850 status: TX register empty, no RX byte. The GM/MPU
-            // personality wires this for real later.
-            0x00 => 0x02,
-            0x01 => 0x00,
-            0x02 => c.voice_sel,
-            0x03 => c.reg_sel,
-            0x04 => c.reg_read(false),
-            0x05 => c.reg_read(true),
-            0x07 => {
-                let a = c.dram_addr();
-                if super::PORT_TRACE {
-                    crate::dbg_println!("[gus] peek [{:05X}]={:02X}", a, c.dram[a]);
-                }
-                c.dram[a]
             }
-            _ => 0xFF,
-        }
+        } else {
+            let hi = p.wrapping_sub(base + 0x100);
+            match hi {
+                // MIDI 6850 status: TX register empty, no RX byte. The GM/MPU
+                // personality wires this for real later.
+                0x00 => 0x02,
+                0x01 => 0x00,
+                0x02 => c.voice_sel,
+                0x03 => c.reg_sel,
+                0x04 => c.reg_read(false),
+                0x05 => c.reg_read(true),
+                0x07 => {
+                    let a = c.dram_addr();
+                    if super::PORT_TRACE {
+                        crate::dbg_println!("[gus] peek [{:05X}]={:02X}", a, c.dram[a]);
+                    }
+                    c.dram[a]
+                }
+                _ => 0xFF,
+            }
+        };
+        gus_ring_record(false, p, v, c.reg_sel, c.voice_sel);
+        v
     }
 
     /// Guest OUT to a decoded port.
@@ -437,6 +440,7 @@ impl Gus {
         if super::PORT_TRACE {
             crate::dbg_println!("[gus] out {:03X} <- {:02X} (reg {:02X}v{})", p, val, c.reg_sel, c.voice_sel);
         }
+        gus_ring_record(true, p, val, c.reg_sel, c.voice_sel);
         let lo = p.wrapping_sub(base);
         if lo < 0x10 {
             match lo {
@@ -609,7 +613,24 @@ impl GusCore {
                 }
             }
             0x44 if high => self.reg44 = val,
-            0x45 if high => self.reg45 = val,
+            // Timer control / IRQ enable (bit2 = T1, bit3 = T2). Dropping a
+            // timer's enable bit is also its IRQ ACK: on the GF1 that clears the
+            // latched overflow, exactly as it de-asserts the line. Music drivers
+            // (Duke3D's GUS player) ack the timer purely through 0x45 — write 0
+            // then re-arm — and never touch the AdLib 2X9 reset. Without clearing
+            // `expired` here, `irq_status` keeps returning the timer bit, the ISR
+            // sees T2 forever pending, and the IRQ storms → the mainline starves
+            // (the GUS-music-while-SB-sfx hang). The 2X9 reset path still clears
+            // `expired` independently for SBOS-style pollers.
+            0x45 if high => {
+                if val & 0x04 == 0 {
+                    self.timers[0].expired = false;
+                }
+                if val & 0x08 == 0 {
+                    self.timers[1].expired = false;
+                }
+                self.reg45 = val;
+            }
             0x46 if high => self.reg46 = val,
             0x47 if high => self.reg47 = val,
             0x48 if high => self.reg48 = val,
@@ -829,6 +850,61 @@ impl Gus {
                     _ => c.events.push_back((at, ev.wave_irq, ev.ramp_irq)),
                 }
             }
+        }
+    }
+}
+
+// ── Zero-perturbation GUS-access trace ring ──────────────────────────────
+// One entry per decoded GUS port IN/OUT, written inline (pure stores, no I/O,
+// no formatting) so it doesn't change instruction timing — the same idiom the
+// virtual-IF ring (`mode_transitions::IF_RING`) uses, and for the same reason:
+// the Duke3D "wedged in the GUS music ISR" hang is timing-sensitive and
+// print-tracing (PORT_TRACE) hides it. Dumped only on the F12 state key via
+// `dump_gus_ring()`, alongside the IF ring.
+#[derive(Clone, Copy)]
+struct GusEvt {
+    write: bool,     // true = OUT, false = IN
+    in_irq: bool,    // true = recorded while servicing a HW IRQ (ISR context)
+    port: u16,
+    val: u8,
+    reg_sel: u8,     // selected GF1 register at access time
+    voice_sel: u8,   // selected voice at access time
+}
+
+const GUS_RING_LEN: usize = 128;
+static mut GUS_RING: [GusEvt; GUS_RING_LEN] = [GusEvt {
+    write: false, in_irq: false, port: 0, val: 0, reg_sel: 0, voice_sel: 0,
+}; GUS_RING_LEN];
+static mut GUS_RING_POS: usize = 0;
+
+#[inline]
+fn gus_ring_record(write: bool, port: u16, val: u8, reg_sel: u8, voice_sel: u8) {
+    let in_irq = super::super::IN_HW_IRQ_CONTEXT
+        .load(core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let i = GUS_RING_POS % GUS_RING_LEN;
+        GUS_RING[i] = GusEvt { write, in_irq, port, val, reg_sel, voice_sel };
+        GUS_RING_POS = GUS_RING_POS.wrapping_add(1);
+    }
+}
+
+/// F12 hook: dump the most recent GUS port accesses (oldest first). A stuck
+/// GUS ISR shows up as a short cycle of the same (port, reg) repeating with
+/// `irq=1`; an IRQ storm shows the same ISR-drain prologue re-appearing over
+/// and over. `total` is the lifetime access count.
+pub fn dump_gus_ring() {
+    unsafe {
+        let pos = GUS_RING_POS;
+        let n = pos.min(GUS_RING_LEN);
+        crate::dbg_println!("[GUSRING] {} accesses total, showing last {}", pos, n);
+        for k in 0..n {
+            let i = (pos - n + k) % GUS_RING_LEN;
+            let e = GUS_RING[i];
+            crate::dbg_println!(
+                "[GUSRING] #{:03} {} {:03X} {}={:02X} reg={:02X} v={:02X} irq={}",
+                pos - n + k, if e.write { "OUT" } else { "IN " }, e.port,
+                if e.write { "val" } else { "->" }, e.val, e.reg_sel, e.voice_sel,
+                e.in_irq as u8);
         }
     }
 }

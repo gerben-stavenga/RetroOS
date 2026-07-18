@@ -984,6 +984,13 @@ pub fn dump_if_ring() {
     mode_transitions::dump_if_ring();
 }
 
+/// Dump the zero-perturbation GUS port-access ring (F12 state key). Pairs with
+/// `dump_if_ring` to diagnose a wedged/storming GUS ISR: shows the exact
+/// register cycle the handler loops on, tagged with `irq=1` for ISR-context.
+pub fn dump_gus_ring() {
+    machine::vgus::dump_gus_ring();
+}
+
 pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
     if dos.dpmi.is_none() { return; }
     for (name, sel) in [
