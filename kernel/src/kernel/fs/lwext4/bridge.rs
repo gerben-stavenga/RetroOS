@@ -11,6 +11,7 @@
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use crate::kernel::block::Volume;
+use core::ffi::CStr;
 use lwext4_sys::*;
 
 // ── The block-device bridge: lwext4 ↔ RetroOS `block` layer ─────────────────
@@ -127,13 +128,30 @@ fn part_size_from_superblock(vol: &Volume) -> Option<u64> {
 /// Lexically fold `.` / `..` / empty segments out of a mount-relative path.
 /// A `..` above the mount root is clamped at the root (it can't escape the
 
+/// Register `vol` with lwext4 under `name`. False if the volume carries no ext
+/// superblock, or the library's device registry is full.
+///
+/// The `Ext4Blockdev` never leaves this module: registering means handing C a
+/// struct full of function pointers, which no wrapper can make safe, so the
+/// raw part stays here with the callbacks it points at. Everything above talks
+/// in Volumes and names.
+pub fn register_device(vol: &Volume, name: &CStr) -> bool {
+    let Some(bdev) = new_bdev(vol) else { return false };
+    unsafe { ext4_device_register(bdev, name.as_ptr().cast()) == EOK }
+}
+
+/// Drop a registration made by [`register_device`].
+pub fn unregister_device(name: &CStr) -> bool {
+    unsafe { ext4_device_unregister(name.as_ptr().cast()) == EOK }
+}
+
 /// Build an `Ext4Blockdev` ready to register for `vol`, or `None` when there
 /// is no ext superblock at its start.
 ///
 /// Both callers — the real mount and the is-this-a-Linux-root probe — used to
 /// open-code this identically, which is exactly how `part_offset` or the
 /// interface could have drifted apart between them.
-pub fn new_bdev(vol: &Volume) -> Option<*mut Ext4Blockdev> {
+fn new_bdev(vol: &Volume) -> Option<*mut Ext4Blockdev> {
     let part_size = fs_extent(vol)?;
     Some(Box::leak(Box::new(Ext4Blockdev {
         bdif: new_iface(*vol),

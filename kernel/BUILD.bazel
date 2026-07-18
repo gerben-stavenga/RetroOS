@@ -54,6 +54,7 @@ rust_library(
         "//arch-abi",
         "//lib",
         "//lib:sampler",
+        "//third_party/lwext4:lwext4",
         "//third_party/lwext4:lwext4-sys",
         # no_std-patched http_archive (not @crates): one flavour serves both
         # platforms — the synth core is pure integer math with zero deps.
@@ -179,6 +180,7 @@ rust_binary(
         "//arch-interp",
         "//lib",
         "//lib:sampler",
+        "//third_party/lwext4:lwext4",
         "//third_party/lwext4:lwext4-sys",
         "@lwext4//:lwext4_host",
     ],
@@ -200,6 +202,7 @@ rust_binary(
         "//arch-interp:arch-interp-kvm",
         "//lib",
         "//lib:sampler",
+        "//third_party/lwext4:lwext4",
         "//third_party/lwext4:lwext4-sys",
         "@lwext4//:lwext4_host",
     ],
@@ -271,6 +274,7 @@ rust_binary(
         "//arch-interp",
         "//lib",
         "//lib:sampler",
+        "//third_party/lwext4:lwext4",
         "//third_party/lwext4:lwext4-sys",
         "@lwext4//:lwext4_host",
     ],

@@ -18,15 +18,15 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use crate::kernel::block::Volume;
-use lwext4_sys::*;
+
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use crate::kernel::vfs::{DirEntry, Filesystem, Vnode};
+use core::ffi::CStr;
 
 mod bridge;
-use bridge::new_bdev;
 
 /// POSIX permission bits we care about: the group's read/write bits — the
 /// grant RetroOS looks for (`chmod g+w`).
@@ -39,33 +39,19 @@ const S_IRGRP: u32 = 0o040;
 /// the real root mount can reuse the same partition. Used only to disambiguate
 /// a multi-ext disk (a laptop's data partition vs its real root).
 pub fn is_linux_root(vol: &Volume) -> bool {
-    unsafe fn dir_exists_c(cpath: *const u8) -> bool {
-        let mut d: Ext4Dir = unsafe { core::mem::zeroed() };
-        if unsafe { ext4_dir_open(&mut d, cpath) } == EOK {
-            unsafe { ext4_dir_close(&mut d) };
-            true
-        } else {
-            false
-        }
-    }
-    let Some(bdev) = new_bdev(vol) else {
+    const DEV: &CStr = c"ext4probe";
+    const MP: &CStr = c"/probe/";
+    if !bridge::register_device(vol, DEV) {
         return false;
-    };
-    unsafe {
-        let dev: *const u8 = c"ext4probe".as_ptr().cast();
-        let mp: *const u8 = c"/probe/".as_ptr().cast();
-        if ext4_device_register(bdev, dev) != EOK {
-            return false;
-        }
-        if ext4_mount(dev, mp, true) != EOK {
-            ext4_device_unregister(dev);
-            return false;
-        }
-        let has = dir_exists_c(c"/probe/etc".as_ptr().cast()) && dir_exists_c(c"/probe/usr".as_ptr().cast());
-        ext4_umount(mp);
-        ext4_device_unregister(dev);
-        has
     }
+    if lwext4::mount(DEV, MP, true).is_err() {
+        bridge::unregister_device(DEV);
+        return false;
+    }
+    let has = lwext4::Dir::exists(c"/probe/etc") && lwext4::Dir::exists(c"/probe/usr");
+    let _ = lwext4::umount(MP);
+    bridge::unregister_device(DEV);
+    has
 }
 
 /// Append `n` as decimal ASCII.
@@ -99,18 +85,19 @@ fn normalize(path: &[u8]) -> Vec<u8> {
 }
 
 /// Leak a NUL-terminated copy of `s` (boot-lifetime), returning its pointer.
-fn leak_cstr(s: &[u8]) -> *const u8 {
+fn leak_cstr(s: &[u8]) -> &'static CStr {
     let mut v: Vec<u8> = Vec::with_capacity(s.len() + 1);
     v.extend_from_slice(s);
     v.push(0);
-    Box::leak(v.into_boxed_slice()).as_ptr()
+    // NUL pushed above, so this is infallible.
+    CStr::from_bytes_with_nul(Box::leak(v.into_boxed_slice())).unwrap()
 }
 
 /// An open lwext4 file plus whether writes to it are permitted (the file lives
 /// inside the writable subtree). `write` consults this so a handle opened
 /// outside the writable root can never mutate the disk.
 struct OpenFile {
-    file: Ext4File,
+    file: lwext4::File,
     writable: bool,
 }
 
@@ -153,64 +140,58 @@ impl Lwext4Fs {
     /// It carries no policy — see [`MountMode`] for that — and no identity;
     /// the device this filesystem lives on travels in `vol`.
     pub fn new(vol: Volume, slot: usize, mode: MountMode) -> Result<Self, &'static str> {
-        let bdev = new_bdev(&vol).ok_or("no ext4 superblock at partition start")?;
-        unsafe {
+        // Decimal, so slots past 9 keep working; the prefix stays short
+        // because it is prepended to every path this mount resolves.
+        let mut name = Vec::new();
+        name.extend_from_slice(b"ext4dev");
+        push_decimal(&mut name, slot);
+        let dev_name = leak_cstr(&name);
 
-            // Decimal, so slots past 9 keep working; the prefix stays short
-            // because it is prepended to every path this mount resolves.
-            let mut name = Vec::new();
-            name.extend_from_slice(b"ext4dev");
-            push_decimal(&mut name, slot);
-            let dev_name = leak_cstr(&name);
+        let mut mp = Vec::new();
+        mp.extend_from_slice(b"/m");
+        push_decimal(&mut mp, slot);
+        mp.push(b'/');
+        let mp_c = leak_cstr(&mp);
 
-            let mut mp = Vec::new();
-            mp.extend_from_slice(b"/m");
-            push_decimal(&mut mp, slot);
-            mp.push(b'/');
-            let mp_c = leak_cstr(&mp);
-
-            let read_only = mode == MountMode::ReadOnly;
-
-            if ext4_device_register(bdev, dev_name) != EOK {
-                return Err("ext4_device_register failed");
-            }
-            if ext4_mount(dev_name, mp_c, read_only) != EOK {
-                return Err("ext4_mount failed");
-            }
-            // Journal recovery + transactions (transparent no-op if the fs has
-            // no journal). NOTE: no write-back caching — writes go through
-            // synchronously so they're durable at close without an explicit
-            // flush/umount on the (abrupt) kernel shutdown path. Fine for the
-            // savegame/log/config workload; revisit if bulk writes need speed.
-            ext4_journal_start(mp_c);
-
-            let mut fs = Lwext4Fs {
-                mp,
-                grant_gid: None,
-                open_files: RefCell::new(BTreeMap::new()),
-                next_handle: Cell::new(1),
-            };
-            // RetroOS's identity: the group owning its own home (the C: root).
-            // Must run AFTER the mount — it reads the directory's inode.
-            if mode == MountMode::ReadWrite {
-                let cr = crate::kernel::dos::c_root();
-                let root = cr.strip_suffix(b"/").unwrap_or(cr);
-                fs.grant_gid = fs.gid_of(root);
-            }
-            Ok(fs)
+        if !bridge::register_device(&vol, dev_name) {
+            return Err("ext4_device_register failed");
         }
+        if lwext4::mount(dev_name, mp_c, mode == MountMode::ReadOnly).is_err() {
+            bridge::unregister_device(dev_name);
+            return Err("ext4_mount failed");
+        }
+        // Journal recovery + transactions (transparent no-op if the fs has no
+        // journal). NOTE: no write-back caching — writes go through
+        // synchronously so they are durable at close without an explicit
+        // flush/umount on the (abrupt) kernel shutdown path.
+        let _ = lwext4::journal_start(mp_c);
+
+        let mut fs = Lwext4Fs {
+            mp,
+            grant_gid: None,
+            open_files: RefCell::new(BTreeMap::new()),
+            next_handle: Cell::new(1),
+        };
+        // RetroOS's identity: the group owning its own home (the C: root).
+        // Must run AFTER the mount — it reads the directory's inode.
+        if mode == MountMode::ReadWrite {
+            let cr = crate::kernel::dos::c_root();
+            let root = cr.strip_suffix(b"/").unwrap_or(cr);
+            fs.grant_gid = fs.gid_of(root);
+        }
+        Ok(fs)
     }
 
     /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`,
     /// following symlinks first — so callers address the physical object.
     /// Use [`cpath_nofollow`] where the link ITSELF is the subject.
-    fn cpath(&self, rel: &[u8], buf: &mut [u8; 320]) -> Option<*const u8> {
+    fn cpath<'b>(&self, rel: &[u8], buf: &'b mut [u8; 320]) -> Option<&'b CStr> {
         let real = self.real(rel);
         self.cpath_nofollow(&real, buf)
     }
 
     /// Build a NUL-terminated lwext4 absolute path (`<mp><rel>\0`) in `buf`.
-    fn cpath_nofollow(&self, rel: &[u8], buf: &mut [u8; 320]) -> Option<*const u8> {
+    fn cpath_nofollow<'b>(&self, rel: &[u8], buf: &'b mut [u8; 320]) -> Option<&'b CStr> {
         let mut n = 0;
         for &b in self.mp.iter().chain(rel.iter()) {
             if n >= buf.len() - 1 {
@@ -224,12 +205,14 @@ impl Lwext4Fs {
             n -= 1;
         }
         buf[n] = 0;
-        Some(buf.as_ptr())
+        // The NUL is in place by construction, so this cannot fail — and from
+        // here on the path is a &CStr, which the safe API requires. No call
+        // site can hand lwext4 an unterminated string.
+        CStr::from_bytes_with_nul(&buf[..=n]).ok()
     }
 
-    fn stat_mode(cpath: *const u8, is_dir: bool) -> u16 {
-        let mut mode: u32 = 0;
-        if unsafe { ext4_mode_get(cpath, &mut mode) } == EOK {
+    fn stat_mode(cpath: &CStr, is_dir: bool) -> u16 {
+        if let Some(mode) = lwext4::mode_get(cpath) {
             (mode & 0xFFF) as u16
         } else if is_dir {
             0o755
@@ -242,7 +225,7 @@ impl Lwext4Fs {
     fn is_symlink(&self, rel: &[u8]) -> bool {
         let mut buf = [0u8; 320];
         match self.cpath_nofollow(rel, &mut buf) {
-            Some(cpath) => (unsafe { ext4_inode_exist(cpath, EXT4_DE_SYMLINK) }) == EOK,
+            Some(cpath) => lwext4::is_symlink(cpath),
             None => false,
         }
     }
@@ -252,11 +235,8 @@ impl Lwext4Fs {
         let mut buf = [0u8; 320];
         let cpath = self.cpath_nofollow(rel, &mut buf)?;
         let mut tgt = [0u8; 256];
-        let mut rcnt = 0usize;
-        if unsafe { ext4_readlink(cpath, tgt.as_mut_ptr(), tgt.len(), &mut rcnt) } != EOK {
-            return None;
-        }
-        Some(tgt[..rcnt.min(tgt.len())].to_vec())
+        let rcnt = lwext4::readlink(cpath, &mut tgt)?;
+        Some(tgt[..rcnt].to_vec())
     }
 
     /// Resolve every symlink in `rel` to the physical path lwext4 can open.
@@ -321,8 +301,7 @@ impl Lwext4Fs {
     fn gid_of(&self, rel: &[u8]) -> Option<u32> {
         let mut buf = [0u8; 320];
         let cpath = self.cpath(rel, &mut buf)?;
-        let (mut uid, mut gid) = (0u32, 0u32);
-        (unsafe { ext4_owner_get(cpath, &mut uid, &mut gid) } == EOK).then_some(gid)
+        lwext4::owner_get(cpath).map(|(_uid, gid)| gid)
     }
 
     /// May RetroOS write the object at `path`? The ext4 inode answers: it must
@@ -347,8 +326,7 @@ impl Lwext4Fs {
         let Some(cpath) = self.cpath(path, &mut buf) else {
             return false;
         };
-        let mut mode: u32 = 0;
-        unsafe { ext4_mode_get(cpath, &mut mode) == EOK && mode & S_IWGRP != 0 }
+        lwext4::mode_get(cpath).is_some_and(|mode| mode & S_IWGRP != 0)
     }
 
     /// May RetroOS create/delete `path`? Unix rule: that's a write to the
@@ -373,18 +351,14 @@ impl Lwext4Fs {
         let Some(grant) = self.grant_gid else { return };
         let mut buf = [0u8; 320];
         let Some(cpath) = self.cpath(path, &mut buf) else { return };
-        let (mut uid, mut gid) = (0u32, 0u32);
-        unsafe {
-            ext4_owner_get(cpath, &mut uid, &mut gid);
-            ext4_owner_set(cpath, uid, grant);
-            let mut mode: u32 = 0;
-            if ext4_mode_get(cpath, &mut mode) == EOK {
-                ext4_mode_set(cpath, mode | S_IWGRP | S_IRGRP);
-            }
+        let uid = lwext4::owner_get(cpath).map_or(0, |(uid, _gid)| uid);
+        let _ = lwext4::owner_set(cpath, uid, grant);
+        if let Some(mode) = lwext4::mode_get(cpath) {
+            let _ = lwext4::mode_set(cpath, mode | S_IWGRP | S_IRGRP);
         }
     }
 
-    fn alloc_handle(&self, file: Ext4File, writable: bool) -> u64 {
+    fn alloc_handle(&self, file: lwext4::File, writable: bool) -> u64 {
         let h = self.next_handle.get();
         self.next_handle.set(h.wrapping_add(1));
         self.open_files.borrow_mut().insert(h, OpenFile { file, writable });
@@ -399,14 +373,13 @@ impl Filesystem for Lwext4Fs {
         // A handle is writable only if the inode is ours (group + g+w);
         // everything else opens read-only so it can never mutate the disk.
         let writable = self.writable(path);
-        let mut file: Ext4File = unsafe { core::mem::zeroed() };
-        let rw_flags: &[u8] = if writable { b"r+b\0" } else { b"rb\0" };
-        if unsafe { ext4_fopen(&mut file, cpath, rw_flags.as_ptr()) } != EOK
-            && unsafe { ext4_fopen(&mut file, cpath, c"rb".as_ptr().cast()) } != EOK
-        {
-            return None;
-        }
-        let size = unsafe { ext4_fsize(&mut file) } as u32;
+        // Try read-write when permitted, else fall back to read-only — a file
+        // we may not write is still readable.
+        let flags = if writable { c"r+b" } else { c"rb" };
+        let mut file = lwext4::File::open(cpath, flags)
+            .or_else(|_| lwext4::File::open(cpath, c"rb"))
+            .ok()?;
+        let size = file.size() as u32;
         let mode = Self::stat_mode(cpath, false);
         let handle = self.alloc_handle(file, writable);
         Some(Vnode { handle, size, mode })
@@ -417,16 +390,12 @@ impl Filesystem for Lwext4Fs {
         let Some(of) = files.get_mut(&handle) else {
             return 0;
         };
-        let fp = &mut of.file as *mut Ext4File;
-        unsafe {
-            if ext4_fseek(fp, offset as i64, SEEK_SET) != EOK {
-                return 0;
-            }
-            let mut rcnt: usize = 0;
-            if ext4_fread(fp, buf.as_mut_ptr(), buf.len(), &mut rcnt) != EOK {
-                return 0;
-            }
-            rcnt as i32
+        if of.file.seek_to(offset as u64).is_err() {
+            return 0;
+        }
+        match of.file.read(buf) {
+            Ok(n) => n as i32,
+            Err(_) => 0,
         }
     }
 
@@ -439,16 +408,12 @@ impl Filesystem for Lwext4Fs {
         if !of.writable {
             return -30;
         }
-        let fp = &mut of.file as *mut Ext4File;
-        unsafe {
-            if ext4_fseek(fp, offset as i64, SEEK_SET) != EOK {
-                return -5;
-            }
-            let mut wcnt: usize = 0;
-            if ext4_fwrite(fp, data.as_ptr(), data.len(), &mut wcnt) != EOK {
-                return -5;
-            }
-            wcnt as i32
+        if of.file.seek_to(offset as u64).is_err() {
+            return -5;
+        }
+        match of.file.write(data) {
+            Ok(n) => n as i32,
+            Err(_) => -5,
         }
     }
 
@@ -463,11 +428,8 @@ impl Filesystem for Lwext4Fs {
         }
         let mut buf = [0u8; 320];
         let cpath = self.cpath(path, &mut buf)?;
-        let mut file: Ext4File = unsafe { core::mem::zeroed() };
         // "wb": create + truncate for writing.
-        if unsafe { ext4_fopen(&mut file, cpath, c"wb".as_ptr().cast()) } != EOK {
-            return None;
-        }
+        let file = lwext4::File::open(cpath, c"wb").ok()?;
         // Stamp it ours so we can reopen it for writing later.
         if !exists {
             self.claim(path);
@@ -486,21 +448,12 @@ impl Filesystem for Lwext4Fs {
     fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
         let mut buf = [0u8; 320];
         let cpath = self.cpath(dir, &mut buf)?;
-        let mut d: Ext4Dir = unsafe { core::mem::zeroed() };
-        if unsafe { ext4_dir_open(&mut d, cpath) } != EOK {
-            return None;
-        }
+        let d = lwext4::Dir::open(cpath).ok()?;
         let mut i = 0usize;
         let mut result = None;
-        loop {
-            let e = unsafe { ext4_dir_entry_next(&mut d) };
-            if e.is_null() {
-                break;
-            }
-            let e = unsafe { &*e };
-            let nlen = e.name_length as usize;
-            let name = &e.name[..nlen.min(255)];
-            if name == b"." || name == b".." || nlen == 0 {
+        for e in d {
+            let name = e.name();
+            if name == b"." || name == b".." || name.is_empty() {
                 continue;
             }
             if i == index {
@@ -514,10 +467,10 @@ impl Filesystem for Lwext4Fs {
                 // says SYMLINK, and reporting that as a plain file made a
                 // symlinked directory list as a corrupt "file" whose bytes are
                 // the target path. Resolve, then classify off the real object.
-                let is_dir = if i32::from(e.inode_type) == EXT4_DE_SYMLINK {
+                let is_dir = if e.is_symlink {
                     self.dir_exists(&rel)
                 } else {
-                    e.inode_type == EXT4_DE_DIR
+                    e.is_dir
                 };
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
@@ -532,11 +485,9 @@ impl Filesystem for Lwext4Fs {
                 if !is_dir {
                     let mut child = [0u8; 320];
                     if let Some(cchild) = self.cpath(&rel, &mut child) {
-                        let mut f: Ext4File = unsafe { core::mem::zeroed() };
-                        if unsafe { ext4_fopen(&mut f, cchild, c"rb".as_ptr().cast()) } == EOK {
-                            de.size = unsafe { ext4_fsize(&mut f) } as u32;
+                        if let Ok(mut f) = lwext4::File::open(cchild, c"rb") {
+                            de.size = f.size() as u32;
                             de.mode = Self::stat_mode(cchild, false);
-                            unsafe { ext4_fclose(&mut f) };
                         }
                     }
                 }
@@ -545,8 +496,7 @@ impl Filesystem for Lwext4Fs {
             }
             i += 1;
         }
-        unsafe { ext4_dir_close(&mut d) };
-        result
+        result // the Dir closed itself on drop
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
@@ -554,19 +504,12 @@ impl Filesystem for Lwext4Fs {
         let Some(cpath) = self.cpath(path, &mut buf) else {
             return false;
         };
-        let mut d: Ext4Dir = unsafe { core::mem::zeroed() };
-        if unsafe { ext4_dir_open(&mut d, cpath) } == EOK {
-            unsafe { ext4_dir_close(&mut d) };
-            true
-        } else {
-            false
-        }
+        lwext4::Dir::exists(cpath)
     }
 
     fn clunk(&self, handle: u64) {
-        if let Some(mut of) = self.open_files.borrow_mut().remove(&handle) {
-            unsafe { ext4_fclose(&mut of.file) };
-        }
+        // Dropping the entry closes the file — the handle cannot outlive it.
+        self.open_files.borrow_mut().remove(&handle);
     }
 
     fn remove(&self, path: &[u8]) -> i32 {
@@ -580,7 +523,7 @@ impl Filesystem for Lwext4Fs {
         let Some(cpath) = self.cpath(path, &mut buf) else {
             return -1;
         };
-        if unsafe { ext4_fremove(cpath) } == EOK {
+        if lwext4::remove(cpath).is_ok() {
             0
         } else {
             -1

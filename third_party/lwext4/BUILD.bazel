@@ -67,3 +67,22 @@ rust_library(
     ],
     visibility = ["//visibility:public"],
 )
+
+# The safe API the kernel actually uses. Every raw entry point above is wrapped
+# exactly once here, so filesystem policy code contains no `unsafe` and no
+# pointers. Device registration is absent by design — handing C a struct of
+# function pointers is not something a wrapper can make safe, so it stays with
+# the code that builds the callbacks.
+rust_library(
+    name = "lwext4",
+    srcs = ["safe/src/lib.rs"],
+    crate_name = "lwext4",
+    edition = "2024",
+    deps = [":lwext4-sys"],
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
+)
