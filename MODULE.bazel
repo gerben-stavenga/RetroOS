@@ -174,6 +174,10 @@ cc_library(
         "-DCONFIG_USE_DEFAULT_CFG=1",
         "-DCONFIG_DEBUG_PRINTF=0",
         "-DCONFIG_DEBUG_ASSERT=0",
+        # Must match //third_party/lwext4 (the metal build) — upstream defaults
+        # to 2, which caps us at a root plus one extra partition.
+        "-DCONFIG_EXT4_BLOCKDEVS_COUNT=8",
+        "-DCONFIG_EXT4_MOUNTPOINTS_COUNT=8",
         "-w",
     ],
     visibility = ["//visibility:public"],

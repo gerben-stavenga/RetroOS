@@ -1,0 +1,7 @@
+genrule(
+    name = "wr_com",
+    srcs = ["wr.asm"],
+    outs = ["WR.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

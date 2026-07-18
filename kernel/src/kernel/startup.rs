@@ -3,7 +3,7 @@
 extern crate alloc;
 
 use crate::Regs;
-use crate::kernel::{vfs, fs::tarfs::TarFs, fs::lwext4::Lwext4Fs};
+use crate::kernel::{vfs, fs::tarfs::TarFs, fs::lwext4::{Lwext4Fs, MountMode}};
 use crate::kernel::thread;
 
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
@@ -109,10 +109,11 @@ struct MountPlan {
     host_alias: bool,
 }
 
-/// lwext4 names its devices and mount points with a single digit (`/m0/` …
-/// `/m9/`) in a registry global to the C library, so ten mounts is the
-/// ceiling. The root takes one.
-const MAX_EXT_MOUNTS: usize = 10;
+/// lwext4's device and mount-point registries are fixed-size arrays in the C
+/// library, sized by CONFIG_EXT4_{BLOCKDEVS,MOUNTPOINTS}_COUNT — we build it
+/// with 8 (upstream defaults to 2, which would cap us at a root plus one).
+/// Keep this in step with //third_party/lwext4 and MODULE.bazel.
+const MAX_EXT_MOUNTS: usize = 8;
 
 /// Decide the mount tree from the partition tables and whether a host
 /// transport answered. Pure: no I/O beyond the ext-root sniff, no globals, and
@@ -182,7 +183,9 @@ fn mount_filesystems(plan: &MountPlan, screen: &mut crate::vga::Screen) {
     match plan.root {
         RootSource::Disk(vol) => {
             crate::screenln!(screen, "ext4 root ({} MB)", vol.sectors / 2048);
-            match Lwext4Fs::new(vol, 0) {
+            // The root is the only writable mount; the group+write-bit policy
+            // inside lwext4 narrows it further.
+            match Lwext4Fs::new(vol, 0, MountMode::ReadWrite) {
                 Ok(fs) => vfs::mount(b"", alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))),
                 Err(e) => panic!("ext4 mount failed: {}", e),
             }
@@ -197,7 +200,9 @@ fn mount_filesystems(plan: &MountPlan, screen: &mut crate::vga::Screen) {
     // Extra ext filesystems mount at /disk1, /disk2, … An unreadable one is
     // logged and skipped, never fatal — the root is already mounted.
     for (i, (prefix, vol)) in plan.extra.iter().enumerate() {
-        match Lwext4Fs::new(*vol, i + 1) {
+        // Extra partitions (a laptop's data / another distro) are never
+        // written: read-only at the lwext4 level and with no grant gid.
+        match Lwext4Fs::new(*vol, i + 1, MountMode::ReadOnly) {
             Ok(fs) => {
                 vfs::mount(prefix, alloc::boxed::Box::leak(alloc::boxed::Box::new(fs)));
                 crate::screenln!(screen, "ext4 partition ({} MB) → /{}",

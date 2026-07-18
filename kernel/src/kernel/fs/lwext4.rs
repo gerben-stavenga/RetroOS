@@ -222,6 +222,14 @@ fn new_iface(vol: Volume) -> *mut Ext4BlockdevIface {
     }))
 }
 
+/// Append `n` as decimal ASCII.
+fn push_decimal(out: &mut Vec<u8>, n: usize) {
+    if n >= 10 {
+        push_decimal(out, n / 10);
+    }
+    out.push(b'0' + (n % 10) as u8);
+}
+
 /// Leak a NUL-terminated copy of `s` (boot-lifetime), returning its pointer.
 /// The filesystem's true extent, read from its own superblock (1024 B into the
 /// partition = sector +2): `s_blocks_count × block_size`. `None` = no ext
@@ -314,6 +322,19 @@ struct OpenFile {
     writable: bool,
 }
 
+/// How a filesystem is mounted. A closed set RetroOS defines, so an enum.
+///
+/// This used to be inferred from the mount slot (`read_only = index != 0`),
+/// which made a registry housekeeping number decide a security property.
+/// The caller states it now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MountMode {
+    /// Writable, subject to the group+write-bit policy (see `grant_gid`).
+    ReadWrite,
+    /// Read-only at the lwext4 level AND with no grant gid — defence in depth.
+    ReadOnly,
+}
+
 /// The lwext4-backed filesystem — one instance per mounted ext4 partition.
 pub struct Lwext4Fs {
     /// lwext4 mount-point prefix incl. trailing slash, no NUL, e.g. `b"/m0/"`.
@@ -333,9 +354,13 @@ pub struct Lwext4Fs {
 }
 
 impl Lwext4Fs {
-    /// Register + mount the ext4 filesystem filling `vol`. `index`
-    /// disambiguates the global lwext4 device name / mount point.
-    pub fn new(vol: Volume, index: usize) -> Result<Self, &'static str> {
+    /// Register + mount the ext4 filesystem filling `vol`.
+    ///
+    /// `slot` is nothing but a name: lwext4's device and mount-point registries
+    /// are global C state keyed by string, so each mount needs a distinct one.
+    /// It carries no policy — see [`MountMode`] for that — and no identity;
+    /// the device this filesystem lives on travels in `vol`.
+    pub fn new(vol: Volume, slot: usize, mode: MountMode) -> Result<Self, &'static str> {
         let part_size = fs_extent(&vol).ok_or("no ext4 superblock at partition start")?;
         unsafe {
             let bdev = Box::leak(Box::new(Ext4Blockdev {
@@ -350,21 +375,20 @@ impl Lwext4Fs {
                 journal: core::ptr::null_mut(),
             }));
 
+            // Decimal, so slots past 9 keep working; the prefix stays short
+            // because it is prepended to every path this mount resolves.
             let mut name = Vec::new();
             name.extend_from_slice(b"ext4dev");
-            name.push(b'0' + index as u8);
+            push_decimal(&mut name, slot);
             let dev_name = leak_cstr(&name);
 
             let mut mp = Vec::new();
             mp.extend_from_slice(b"/m");
-            mp.push(b'0' + index as u8);
+            push_decimal(&mut mp, slot);
             mp.push(b'/');
             let mp_c = leak_cstr(&mp);
 
-            // Only the boot root (index 0) may write at all. Extra partitions (a
-            // laptop's data / other-distro partitions) are mounted READ-ONLY at
-            // the lwext4 level AND get no grant gid — defence in depth.
-            let read_only = index != 0;
+            let read_only = mode == MountMode::ReadOnly;
 
             if ext4_device_register(bdev, dev_name) != EOK {
                 return Err("ext4_device_register failed");
@@ -387,7 +411,7 @@ impl Lwext4Fs {
             };
             // RetroOS's identity: the group owning its own home (the C: root).
             // Must run AFTER the mount — it reads the directory's inode.
-            if index == 0 {
+            if mode == MountMode::ReadWrite {
                 let cr = crate::kernel::dos::c_root();
                 let root = cr.strip_suffix(b"/").unwrap_or(cr);
                 fs.grant_gid = fs.gid_of(root);
