@@ -1,22 +1,43 @@
-//! Block-device facade — one `read_sectors` for the filesystems, backed by
-//! whichever disk this machine actually has.
+//! Block-device layer — the `Disk` interface the filesystems read through,
+//! and the probe that discovers which disks this machine has.
 //!
-//! Detection happens once at startup, below the filesystem layer, so
-//! tarfs/lwext4/MBR code is identical on every platform:
-//!   - ATA PIO (legacy BIOS machines, QEMU/Bochs/86Box IDE, the interpreter's
-//!     emulated controller) — probed first, bounded, no hang on absent ports.
-//!   - NVMe (UEFI-class machines: the run_uefi.sh mock, modern laptops).
+//! Drivers below implement [`Disk`] and answer "what is here, and how do I
+//! move sectors"; they never know which disk is the boot disk. That choice —
+//! and the whole mount tree — belongs to `startup`.
+//!
+//! `dyn` rather than an enum because the transport set is open: ATA, NVMe,
+//! virtio and USB mass storage are standards from outside RetroOS, and each
+//! new one should be a new file, not an edit to a central type.
 
-use alloc::{boxed::Box, collections::BTreeMap};
-use core::sync::atomic::{AtomicU8, Ordering};
-use crate::kernel::drivers::{hdd, nvme};
+use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use crate::kernel::drivers::{hdd::{self, AtaDisk}, nvme::NvmeDisk};
 use lib::println;
 
-const NONE: u8 = 0;
-const ATA: u8 = 1;
-const NVME: u8 = 2;
+/// One block device: a physical disk, an NVMe namespace, or a wrapper around
+/// either (see the RAM overlay). Addressing is 512-byte LBAs throughout.
+pub trait Disk {
+    /// Read `buf.len().div_ceil(512)` sectors from `lba`. Returns sectors read.
+    fn read(&self, lba: u64, buf: &mut [u8]) -> u32;
+    /// Write `buf.len().div_ceil(512)` sectors at `lba`. Returns sectors written.
+    fn write(&self, lba: u64, buf: &[u8]) -> u32;
+    /// Capacity in 512-byte sectors.
+    fn sectors(&self) -> u64;
+    /// Stable short name for logs and mount points: "ata0", "nvme0n1".
+    fn name(&self) -> &str;
+}
 
-static KIND: AtomicU8 = AtomicU8::new(NONE);
+/// The disk the filesystems currently read through.
+///
+/// TEMPORARY. This is the last remnant of the old single-disk `KIND` global,
+/// kept only so the existing `read_sectors(lba, ..)` call sites compile
+/// unchanged during this step. It disappears in the next one, when `Volume`
+/// carries the device reference to each filesystem and nothing needs to ask
+/// "which disk" of a static.
+static mut BOOT_DISK: Option<&'static dyn Disk> = None;
+
+fn boot_disk() -> Option<&'static dyn Disk> {
+    unsafe { *(&raw const BOOT_DISK) }
+}
 
 /// Volatile write overlay — the real-hardware safety net. When armed (real
 /// metal, where the disk is someone's actual home partition), `write_sectors`
@@ -28,9 +49,9 @@ static KIND: AtomicU8 = AtomicU8::new(NONE);
 ///
 /// Single kernel thread (same invariant as the fs layer above); accessed via
 /// `&raw mut` like the other kernel statics.
-static mut OVERLAY: Option<BTreeMap<u32, Box<[u8; 512]>>> = None;
+static mut OVERLAY: Option<BTreeMap<u64, Box<[u8; 512]>>> = None;
 
-fn overlay() -> &'static mut Option<BTreeMap<u32, Box<[u8; 512]>>> {
+fn overlay() -> &'static mut Option<BTreeMap<u64, Box<[u8; 512]>>> {
     // A static's address is never null, so `as_mut` always yields Some.
     unsafe { (&raw mut OVERLAY).as_mut().unwrap() }
 }
@@ -41,28 +62,50 @@ pub fn arm_ram_overlay() {
     *overlay() = Some(BTreeMap::new());
 }
 
+/// Discover every disk on this machine, in a stable order: the legacy ATA
+/// channels (master then slave) first, then NVMe.
+///
+/// The order is fixed so results are reproducible across runs; it is *not* a
+/// priority ranking, and this function makes no claim about which disk
+/// matters. Each disk is leaked to `&'static` at boot lifetime, exactly as
+/// `vfs` does with its filesystems.
+pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<&'static dyn Disk> {
+    let mut disks: Vec<&'static dyn Disk> = Vec::new();
+    for (base, ctrl) in hdd::CHANNELS {
+        for drive in 0..2 {
+            if let Some(d) = AtaDisk::probe(base, ctrl, drive) {
+                disks.push(Box::leak(Box::new(d)));
+            }
+        }
+    }
+    if let Some(d) = NvmeDisk::probe(machine) {
+        disks.push(Box::leak(Box::new(d)));
+    }
+    disks
+}
+
 /// Probe and select the boot disk. Called once from `startup` before the
 /// partition scan.
+///
+/// TEMPORARY, alongside [`BOOT_DISK`]: this takes the first disk found,
+/// reproducing the old ATA-else-NVMe chain exactly. Enumeration already
+/// returns all of them; teaching the mount policy to use more than one is a
+/// later step.
 pub fn init<A: crate::Arch>(machine: &mut A) {
-    if hdd::probe() {
-        hdd::reset(); // needed when booted via GRUB (controller left idle)
-        KIND.store(ATA, Ordering::Relaxed);
-        println!("Storage: ATA (PIO)");
-    } else if nvme::init(machine) {
-        KIND.store(NVME, Ordering::Relaxed);
-        println!("Storage: NVMe");
-    } else {
-        println!("Storage: none detected");
+    let disk = probe(machine).first().copied();
+    match disk {
+        Some(d) => println!("Storage: {} ({} MB)", d.name(), d.sectors() / 2048),
+        None => println!("Storage: none detected"),
     }
+    unsafe { BOOT_DISK = disk };
 }
 
 /// Read `buffer.len().div_ceil(512)` sectors starting at `lba`. Sectors the
 /// armed overlay holds shadow the device contents.
 pub fn read_sectors(lba: u32, buffer: &mut [u8]) -> u32 {
-    let n = match KIND.load(Ordering::Relaxed) {
-        ATA => hdd::read_sectors(lba, buffer),
-        NVME => nvme::read_sectors(lba, buffer),
-        _ => {
+    let n = match boot_disk() {
+        Some(d) => d.read(lba as u64, buffer),
+        None => {
             buffer.fill(0);
             0
         }
@@ -71,7 +114,7 @@ pub fn read_sectors(lba: u32, buffer: &mut [u8]) -> u32 {
         && !map.is_empty()
     {
         for (i, chunk) in buffer.chunks_mut(512).enumerate() {
-            if let Some(s) = map.get(&(lba + i as u32)) {
+            if let Some(s) = map.get(&(lba as u64 + i as u64)) {
                 chunk.copy_from_slice(&s[..chunk.len()]);
             }
         }
@@ -85,23 +128,22 @@ pub fn read_sectors(lba: u32, buffer: &mut [u8]) -> u32 {
 pub fn write_sectors(lba: u32, buffer: &[u8]) -> u32 {
     if overlay().is_some() {
         for (i, chunk) in buffer.chunks(512).enumerate() {
-            let sector = lba + i as u32;
+            let sector = lba as u64 + i as u64;
             let mut s = Box::new([0u8; 512]);
             if chunk.len() == 512 {
                 s.copy_from_slice(chunk);
             } else {
                 // Partial trailing sector: seed with the current contents
                 // (overlay-aware read; no map borrow is held across it).
-                read_sectors(sector, &mut s[..]);
+                read_sectors(sector as u32, &mut s[..]);
                 s[..chunk.len()].copy_from_slice(chunk);
             }
             overlay().as_mut().unwrap().insert(sector, s);
         }
         return buffer.len().div_ceil(512) as u32;
     }
-    match KIND.load(Ordering::Relaxed) {
-        ATA => hdd::write_sectors(lba, buffer),
-        NVME => nvme::write_sectors(lba, buffer),
-        _ => 0,
+    match boot_disk() {
+        Some(d) => d.write(lba as u64, buffer),
+        None => 0,
     }
 }

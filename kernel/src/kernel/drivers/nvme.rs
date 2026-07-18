@@ -13,6 +13,7 @@
 //! for the proper DMA-window-pool fix that should eventually replace both.
 
 use spin::Mutex;
+use crate::kernel::block::Disk;
 use crate::kernel::pci;
 use lib::println;
 
@@ -107,7 +108,15 @@ struct Nvme {
     dma_phys: u64,
 }
 
-static NVME: Mutex<Option<Nvme>> = Mutex::new(None);
+/// One NVMe namespace, presented as a [`Disk`].
+///
+/// Owns the controller state it drives — there is no global handle. The queues
+/// need `&mut` to submit (tail/head/phase advance) while `Disk` hands out
+/// `&self`, so the state sits behind the same `Mutex` the old global used.
+pub struct NvmeDisk {
+    inner: Mutex<Nvme>,
+    sectors: u64,
+}
 
 /// A zeroed command with opcode + nsid filled in.
 fn cmd(opc: u8, nsid: u32) -> [u32; 16] {
@@ -124,11 +133,11 @@ fn set_prp1(c: &mut [u32; 16], phys: u64) {
 }
 
 /// Probe PCI for an NVMe controller (class 01h / subclass 08h) and bring it
-/// up. Returns true when ready to serve reads. Absent bus (interpreter) or
-/// absent device: false, no side effects.
-pub fn init<A: crate::Arch>(machine: &mut A) -> bool {
+/// up. `None` when there is no controller (legacy machine, or the
+/// interpreter's absent bus) — not an error, and no side effects.
+fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     let Some((bus, dev, func)) = pci::find_class(machine, 0x01, 0x08) else {
-        return false; // no NVMe controller (legacy machine) — not an error
+        return None; // no NVMe controller (legacy machine) — not an error
     };
 
     // Enable memory space + bus mastering.
@@ -141,7 +150,7 @@ pub fn init<A: crate::Arch>(machine: &mut A) -> bool {
     // truncate, but no NVMe machine is a 386.)
     let bar0 = pci::read32(machine, bus, dev, func, 0x10);
     if bar0 & 1 != 0 {
-        return false; // I/O BAR — not an NVMe register set
+        return None; // I/O BAR — not an NVMe register set
     }
     let is_64 = (bar0 >> 1) & 3 == 2;
     let bar_hi = if is_64 { pci::read32(machine, bus, dev, func, 0x14) } else { 0 };
@@ -165,7 +174,7 @@ pub fn init<A: crate::Arch>(machine: &mut A) -> bool {
     // Reset: EN=0, wait !RDY; program admin queues; EN=1, wait RDY.
     w32(R_CC, 0);
     if !wait_csts(0) {
-        return false;
+        return None;
     }
     w32(R_AQA, ((DEPTH as u32 - 1) << 16) | (DEPTH as u32 - 1));
     w64(R_ASQ, dma_phys + ASQ_OFF as u64);
@@ -174,7 +183,7 @@ pub fn init<A: crate::Arch>(machine: &mut A) -> bool {
     w32(R_CC, (4 << 20) | (6 << 16) | 1);
     if !wait_csts(1) {
         println!("NVMe: controller did not become ready (csts={:#x})", r32(R_CSTS));
-        return false;
+        return None;
     }
 
     let mut n = Nvme {
@@ -197,16 +206,18 @@ pub fn init<A: crate::Arch>(machine: &mut A) -> bool {
     // cdw10 = CNS 0 (namespace data structure)
     if n.admin.exec(&c) != 0 {
         println!("NVMe: IDENTIFY failed");
-        return false;
+        return None;
     }
     let ident = DMA_VA + IDENT_OFF;
+    // NSZE (bytes 0..8): namespace size in logical blocks — the capacity.
+    let sectors = unsafe { core::ptr::read_volatile(ident as *const u64) };
     let flbas = unsafe { core::ptr::read_volatile((ident + 26) as *const u8) } & 0xF;
     let lbads = unsafe {
         core::ptr::read_volatile((ident + 128 + flbas as usize * 4 + 2) as *const u8)
     };
     if lbads != 9 {
         println!("NVMe: unsupported LBA size 2^{} (want 512)", lbads);
-        return false;
+        return None;
     }
 
     // Create the I/O completion queue (opc 05h), then submission queue (01h).
@@ -216,7 +227,7 @@ pub fn init<A: crate::Arch>(machine: &mut A) -> bool {
     c[11] = 1; // physically contiguous, no interrupts
     if n.admin.exec(&c) != 0 {
         println!("NVMe: create IO CQ failed");
-        return false;
+        return None;
     }
     let mut c = cmd(0x01, 0);
     set_prp1(&mut c, dma_phys + IOSQ_OFF as u64);
@@ -224,11 +235,10 @@ pub fn init<A: crate::Arch>(machine: &mut A) -> bool {
     c[11] = (1 << 16) | 1; // CQID 1 | physically contiguous
     if n.admin.exec(&c) != 0 {
         println!("NVMe: create IO SQ failed");
-        return false;
+        return None;
     }
 
-    *NVME.lock() = Some(n);
-    true
+    Some((n, sectors))
 }
 
 fn wait_csts(ready: u32) -> bool {
@@ -245,12 +255,21 @@ fn wait_csts(ready: u32) -> bool {
     false
 }
 
-/// Read sectors (512-byte LBAs) — same contract as `hdd::read_sectors`.
-/// 4 KB chunks through the bounce buffer; short tails copy partially.
-pub fn read_sectors(lba: u32, mut buffer: &mut [u8]) -> u32 {
-    let total = buffer.len().div_ceil(512) as u32;
-    let mut guard = NVME.lock();
-    let n = guard.as_mut().expect("nvme::read_sectors before init");
+impl NvmeDisk {
+    /// Probe PCI and bring up the controller's namespace 1. `None` when there
+    /// is no NVMe controller — a legacy machine, not an error.
+    pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Self> {
+        let (n, sectors) = bring_up(machine)?;
+        Some(NvmeDisk { inner: Mutex::new(n), sectors })
+    }
+}
+
+impl Disk for NvmeDisk {
+    /// 4 KB chunks through the bounce buffer; short tails copy partially.
+    fn read(&self, lba: u64, mut buffer: &mut [u8]) -> u32 {
+        let total = buffer.len().div_ceil(512) as u32;
+        let mut guard = self.inner.lock();
+        let n = &mut *guard;
 
     let mut current = lba;
     let mut remaining = total;
@@ -258,8 +277,8 @@ pub fn read_sectors(lba: u32, mut buffer: &mut [u8]) -> u32 {
         let batch = remaining.min(SECTORS_PER_CMD);
         let mut c = cmd(0x02, 1); // READ, nsid 1
         set_prp1(&mut c, n.dma_phys + BOUNCE_OFF as u64);
-        c[10] = current; // starting LBA, low
-        c[11] = 0;       // starting LBA, high
+        c[10] = current as u32;         // starting LBA, low
+        c[11] = (current >> 32) as u32; // starting LBA, high
         c[12] = batch - 1; // 0-based count
         let status = n.io.exec(&c);
         if status != 0 {
@@ -274,20 +293,19 @@ pub fn read_sectors(lba: u32, mut buffer: &mut [u8]) -> u32 {
             );
         }
         buffer = &mut buffer[bytes..];
-        current += batch;
+        current += batch as u64;
         remaining -= batch;
     }
     total
 }
 
-/// Write sectors (512-byte LBAs) — the write-direction twin of
-/// [`read_sectors`]. Source bytes are staged into the bounce buffer, then a
-/// WRITE (opcode 01h) points PRP1 at it. A short final chunk is zero-padded to
-/// a full 4 KB command page (the backing-file overlay writes block-aligned).
-pub fn write_sectors(lba: u32, mut buffer: &[u8]) -> u32 {
-    let total = buffer.len().div_ceil(512) as u32;
-    let mut guard = NVME.lock();
-    let n = guard.as_mut().expect("nvme::write_sectors before init");
+    /// The write-direction twin of [`Self::read`]. Source bytes are staged
+    /// into the bounce buffer, then a WRITE (opcode 01h) points PRP1 at it. A
+    /// short final chunk is zero-padded to a full 4 KB command page.
+    fn write(&self, lba: u64, mut buffer: &[u8]) -> u32 {
+        let total = buffer.len().div_ceil(512) as u32;
+        let mut guard = self.inner.lock();
+        let n = &mut *guard;
 
     let mut current = lba;
     let mut remaining = total;
@@ -306,16 +324,25 @@ pub fn write_sectors(lba: u32, mut buffer: &[u8]) -> u32 {
         }
         let mut c = cmd(0x01, 1); // WRITE, nsid 1
         set_prp1(&mut c, n.dma_phys + BOUNCE_OFF as u64);
-        c[10] = current; // starting LBA, low
-        c[11] = 0;       // starting LBA, high
+        c[10] = current as u32;         // starting LBA, low
+        c[11] = (current >> 32) as u32; // starting LBA, high
         c[12] = batch - 1; // 0-based count
         let status = n.io.exec(&c);
         if status != 0 {
             panic!("NVMe write failed: lba={:#x} status={:#x}", current, status);
         }
         buffer = &buffer[bytes..];
-        current += batch;
+        current += batch as u64;
         remaining -= batch;
     }
     total
+    }
+
+    fn sectors(&self) -> u64 {
+        self.sectors
+    }
+
+    fn name(&self) -> &str {
+        "nvme0n1"
+    }
 }

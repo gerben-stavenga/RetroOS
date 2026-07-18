@@ -110,6 +110,7 @@ const ST_DRQ: u32 = 0x08;
 const CMD_READ_SECTORS: u32 = 0x20;
 const CMD_WRITE_SECTORS: u32 = 0x30;
 const CMD_CACHE_FLUSH: u32 = 0xE7;
+const CMD_IDENTIFY: u32 = 0xEC;
 
 struct Ata {
     file: File,
@@ -122,17 +123,45 @@ struct Ata {
     /// the same thing either way — "the sector buffer isn't done" — so the
     /// status bit is shared; only the data-port direction flips.
     writing: bool,
+    /// Selected drive from bit 4 of the drive/head register. Only the master
+    /// (0) exists here — one image file, one drive. A real controller reports
+    /// status 0x00 for an absent drive, which is how the guest tells a missing
+    /// slave from a present one (the status register alone can't: the master
+    /// drives the bus on the slave's behalf).
+    drive: u8,
+    /// Capacity in sectors, from the image file's length — answered by
+    /// IDENTIFY so the guest can size the disk.
+    sectors: u64,
 }
 
 impl Ata {
     fn new(file: File) -> Ata {
-        Ata { file, seccount: 0, lba: 0, buf: Vec::new(), pos: 0, writing: false }
+        let sectors = file.metadata().map(|m| m.len() / SECTOR as u64).unwrap_or(0);
+        Ata { file, seccount: 0, lba: 0, buf: Vec::new(), pos: 0, writing: false, drive: 0, sectors }
     }
 
     fn status(&self) -> u32 {
+        if self.drive != 0 {
+            return 0; // no slave on this channel
+        }
         // Reads/writes are synchronous → never BSY; DRQ while the sector buffer
         // still has data to yield (read) or room to accept (write).
         ST_DRDY | if self.pos < self.buf.len() { ST_DRQ } else { 0 }
+    }
+
+    /// IDENTIFY DEVICE: publish the geometry the guest needs. Only words 0, 49
+    /// and 60-61 matter to us — device type, LBA support, and the LBA28
+    /// capacity that sizes the disk.
+    fn identify(&mut self) {
+        let mut buf = vec![0u8; SECTOR];
+        let mut word = |n: usize, v: u16| buf[n * 2..n * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        word(0, 0x0040); // non-removable ATA device
+        word(49, 0x0200); // LBA supported
+        let lba28 = self.sectors.min((1 << 28) - 1) as u32;
+        word(60, lba28 as u16);
+        word(61, (lba28 >> 16) as u16);
+        self.buf = buf;
+        self.pos = 0;
     }
 
     /// Begin a WRITE SECTORS: size the buffer to the request and assert DRQ so
@@ -204,7 +233,11 @@ impl PortIo for Ata {
             ATA_LBA_0_7 => self.lba = (self.lba & 0xFFFF_FF00) | (val & 0xFF),
             ATA_LBA_8_15 => self.lba = (self.lba & 0xFFFF_00FF) | ((val & 0xFF) << 8),
             ATA_LBA_16_23 => self.lba = (self.lba & 0xFF00_FFFF) | ((val & 0xFF) << 16),
-            ATA_LBA_24_27 => self.lba = (self.lba & 0x00FF_FFFF) | ((val & 0x0F) << 24),
+            ATA_LBA_24_27 => {
+                self.lba = (self.lba & 0x00FF_FFFF) | ((val & 0x0F) << 24);
+                self.drive = ((val >> 4) & 1) as u8;
+            }
+            ATA_STATUS_CMD if val == CMD_IDENTIFY => self.identify(),
             ATA_STATUS_CMD if val == CMD_READ_SECTORS => self.read_sectors(),
             ATA_STATUS_CMD if val == CMD_WRITE_SECTORS => self.begin_write(),
             ATA_STATUS_CMD if val == CMD_CACHE_FLUSH => {} // synchronous writes: nothing buffered
