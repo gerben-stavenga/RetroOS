@@ -1,3 +1,5 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
 # lwext4 (gkostka, pinned in MODULE.bazel) compiled freestanding for the i686
 # metal kernel. The bare CC toolchain is link-only (dummy `ar`), so — like the
 # `bootfs_obj` genrule shelling out to host `objcopy` — this shells out to host
@@ -46,4 +48,22 @@ for c in "$$ROOT"/src/*.c; do
 done
 ld -r -m elf_i386 -o $(location lwext4.o) lwext4_obj/*.o
 """,
+)
+
+# Raw Rust FFI bindings to the C library above. Declarations only — it links
+# nothing itself, so a consumer that never calls in pulls nothing in. Lives
+# here rather than in //lib so that `lib` stays a self-contained freestanding
+# library (the bootloader depends on it), and so the bindings version with the
+# C source and its patches.
+rust_library(
+    name = "lwext4-sys",
+    srcs = ["sys/src/lib.rs"],
+    crate_name = "lwext4_sys",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        "-Crelocation-model=static",
+    ],
+    visibility = ["//visibility:public"],
 )
