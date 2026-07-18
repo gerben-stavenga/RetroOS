@@ -138,21 +138,29 @@ http_archive(
 )
 
 # ---- lwext4: the C ext4 filesystem library (writable ext4) -----------------
-# gkostka/lwext4 upstream, pinned. Compiled freestanding for i686 by
-# //third_party/lwext4 (host clang via genrule, --target=i686-unknown-none-elf
-# fixes codegen). GPLv2 (ext4_extents.c) — fetched at build time, never in the
-# repo, so RetroOS's own sources stay permissive; binaries built with the
-# `lwext4` feature are GPLv2 as distributed. See //third_party/lwext4.
+# gerben-stavenga/lwext4, a fork of gkostka/lwext4 pinned at our own commit.
+# Compiled freestanding for i686 by //third_party/lwext4 (host clang via
+# genrule, --target=i686-unknown-none-elf fixes codegen). GPLv2
+# (ext4_extents.c) — fetched at build time, never in the repo, so RetroOS's own
+# sources stay permissive; binaries built with the `lwext4` feature are GPLv2
+# as distributed. See //third_party/lwext4.
+#
+# The fork exists because upstream is dormant: master's last commit is
+# September 2022, its maintainer's last activity anywhere in the repo is the
+# same day, and PRs have sat unread for three years. It carries one commit —
+# ext4_fread() zero-filling unwritten ranges on the aligned and tail paths,
+# which upstream only guards on the head path, so reading a sparse file
+# returns superblock bytes where zeros belong (it surfaced as garbage pixels
+# in sparse game assets). Two other downstreams, RT-Thread-packages and
+# extremscorner, fixed part of the same bug independently.
+#
+# Rebasing on upstream is a non-issue while it stays dead; if it revives,
+# `git rebase upstream/master` on the fork and re-pin.
 http_archive(
     name = "lwext4",
-    url = "https://github.com/gkostka/lwext4/archive/58bcf89a121b72d4fb66334f1693d3b30e4cb9c5.tar.gz",
-    sha256 = "8f7cce20f5dad2719cb22982e64c75069af51741555c98d34a247a5d8f154890",
-    strip_prefix = "lwext4-58bcf89a121b72d4fb66334f1693d3b30e4cb9c5",
-    # Upstream ext4_fread() reads a hole-then-data boundary as duplicate data
-    # (fblock 0 is a valid hole but is used as a "run not started" sentinel);
-    # surfaced as garbage pixels in sparse game assets (OMF intro). See patch.
-    patches = ["//third_party/lwext4:fread-hole.patch"],
-    patch_args = ["-p1"],
+    url = "https://github.com/gerben-stavenga/lwext4/archive/b66afa465cb1b947a31d5276ad14cd64ebf5788e.tar.gz",
+    sha256 = "d4120a8d742a4a852d69c65de31e4f5056b38526e55a7eead9efa50ac7911454",
+    strip_prefix = "lwext4-b66afa465cb1b947a31d5276ad14cd64ebf5788e",
     build_file_content = """
 filegroup(
     name = "srcs",
