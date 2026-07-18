@@ -6,12 +6,6 @@ use crate::Regs;
 use crate::kernel::{vfs, fs::tarfs::TarFs, fs::lwext4::Lwext4Fs};
 use crate::kernel::thread;
 
-/// The root filesystem instance (static so it lives forever for &'static dyn)
-static mut ROOT_TARFS: TarFs = TarFs::new_ram(&[]);
-
-/// Ext4 filesystem (heap-allocated at boot, leaked to get &'static)
-static mut EXT4_FS: Option<&'static Lwext4Fs> = None;
-
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
@@ -102,11 +96,7 @@ fn mount_filesystems(
             crate::screenln!(screen, "ext4 root at sector {:#x}", ext4_lba);
             let vol = boot_vol.expect("DiskRoot without a boot volume");
             match Lwext4Fs::new(vol, ext4_lba, 0) {
-                Ok(fs) => {
-                    let leaked = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
-                    unsafe { EXT4_FS = Some(leaked); }
-                    vfs::mount(b"", leaked);
-                }
+                Ok(fs) => vfs::mount(b"", alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))),
                 Err(e) => panic!("ext4 mount failed: {}", e),
             }
             // Additional ext partitions (a laptop's data partition / other
@@ -141,19 +131,18 @@ fn mount_filesystems(
         Media::Diskless => {}
     }
 
-    if let Some(bytes) = crate::bootfs() {
-        unsafe {
-            ROOT_TARFS = TarFs::new_ram(bytes);
-            (&raw mut ROOT_TARFS).as_mut().unwrap().build_index();
-        }
-    }
     // The embedded DOS system mounts under C:\BOOT (= c_root + "boot/"). C:
-    // itself is the disk/host fs; C:\BOOT is this overlay. Prefix is leaked
-    // (one-time, boot-lifetime) to satisfy vfs::mount's &'static requirement.
+    // itself is the disk/host fs; C:\BOOT is this overlay. Both the prefix and
+    // the filesystem are leaked (one-time, boot-lifetime) to satisfy
+    // vfs::mount's &'static requirement — the same shape as the ext4 and host
+    // mounts above, so no `static mut` is involved.
+    let mut root_tarfs = TarFs::new_ram(crate::bootfs().unwrap_or(&[]));
+    if crate::bootfs().is_some() {
+        root_tarfs.build_index();
+    }
     let bootfs_prefix: &'static [u8] = alloc::boxed::Box::leak(
         [crate::kernel::dos::c_root(), b"boot/"].concat().into_boxed_slice());
-    #[allow(static_mut_refs)]
-    unsafe { vfs::mount(bootfs_prefix, &ROOT_TARFS); }
+    vfs::mount(bootfs_prefix, alloc::boxed::Box::leak(alloc::boxed::Box::new(root_tarfs)));
 
     mount_kernel_log_fs();
 

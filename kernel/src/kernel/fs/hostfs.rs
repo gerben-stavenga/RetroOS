@@ -16,11 +16,13 @@ use crate::kernel::vfs::{Filesystem, Vnode, DirEntry};
 
 const COM1: u16 = 0x3F8;
 
-/// Whether hostfs has been initialized (COM1 configured).
-static mut INITIALIZED: bool = false;
-
-/// Initialize COM1 for hostfs communication.
-/// Returns true if a serial port is present and peer is connected.
+/// Configure COM1 for hostfs communication.
+/// Returns true if a serial port is present and a peer is connected.
+///
+/// The result is the ONLY gate: `startup` mounts [`HostFs`] exactly when this
+/// returned true (via the platform's hostfs verdict), so reaching any method
+/// below already proves COM1 was configured. There is no readiness flag to
+/// consult — being mounted is the proof.
 pub fn init() -> bool {
     // Check UART exists: writing scratch register should read back
     outb(COM1 + 7, 0xAA);
@@ -39,12 +41,7 @@ pub fn init() -> bool {
     if msr & 0x30 == 0 {
         return false; // No peer
     }
-    unsafe { INITIALIZED = true; }
     true
-}
-
-fn is_ready() -> bool {
-    unsafe { INITIALIZED }
 }
 
 fn send_byte(b: u8) {
@@ -136,7 +133,6 @@ impl Default for HostFs {
 
 impl Filesystem for HostFs {
     fn open(&self, path: &[u8]) -> Option<Vnode> {
-        if !is_ready() { return None; }
         send_byte(CMD_OPEN);
         send_u16(path.len() as u16);
         send_bytes(path);
@@ -153,7 +149,6 @@ impl Filesystem for HostFs {
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
-        if !is_ready() { return -5; }
         send_byte(CMD_READ);
         send_u32(handle as u32);
         send_u32(offset);
@@ -173,7 +168,6 @@ impl Filesystem for HostFs {
     }
 
     fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        if !is_ready() { return None; }
         send_byte(CMD_READDIR);
         send_u16(dir.len() as u16);
         send_bytes(dir);
@@ -200,7 +194,6 @@ impl Filesystem for HostFs {
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
-        if !is_ready() { return false; }
         send_byte(CMD_STAT);
         send_u16(path.len() as u16);
         send_bytes(path);
@@ -212,7 +205,6 @@ impl Filesystem for HostFs {
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
-        if !is_ready() { return None; }
         send_byte(CMD_CREATE);
         send_u16(path.len() as u16);
         send_bytes(path);
@@ -224,7 +216,6 @@ impl Filesystem for HostFs {
     }
 
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
-        if !is_ready() { return -5; }
         send_byte(CMD_WRITE);
         send_u32(handle as u32);
         send_u32(offset);
@@ -244,7 +235,6 @@ impl Filesystem for HostFs {
     /// Until fid lifecycle moves to cache eviction, hostfs leaks one handle per
     /// distinct path opened.
     fn clunk(&self, handle: u64) {
-        if !is_ready() { return; }
         send_byte(CMD_CLOSE);
         send_u32(handle as u32);
     }
