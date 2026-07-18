@@ -291,10 +291,13 @@ impl Filesystem for Lwext4Fs {
         // Open as permissively as the MOUNT permits — read-write if lwext4
         // allows it, else read-only. Whether this CALLER may write is not the
         // driver's question; the policy layer above decides that.
-        let mut file = lwext4::File::open(cpath, c"r+b")
-            .or_else(|_| lwext4::File::open(cpath, c"rb"))
-            .ok()?;
-        let writable = lwext4::File::open(cpath, c"r+b").is_ok();
+        // One open, not two: the mode that succeeded IS the answer to whether
+        // this handle can write. (An earlier version re-opened the file just to
+        // compute that flag, doubling every open.)
+        let (mut file, writable) = match lwext4::File::open(cpath, c"r+b") {
+            Ok(f) => (f, true),
+            Err(_) => (lwext4::File::open(cpath, c"rb").ok()?, false),
+        };
         let size = file.size() as u32;
         let mode = Self::stat_mode(cpath, false);
         let handle = self.alloc_handle(file, writable);
