@@ -852,6 +852,10 @@ struct EventStats {
     last_kernel_entry: u64,
     last_profile_dump: u64,
     counts: [u32; 11], // irq, softint, hlt, in, out, ins, outs, fault, pf, exc, syscall
+    /// Software interrupts BY VECTOR. The aggregate above says the guest is
+    /// trapping a lot; only this says which service it is asking for, which is
+    /// the difference between a number and a lead.
+    softint_by_vec: [u32; 256],
 }
 
 impl EventStats {
@@ -878,6 +882,7 @@ impl EventStats {
             last_kernel_entry: now,
             last_profile_dump: now,
             counts: [0; 11],
+            softint_by_vec: [0; 256],
         }
     }
 
@@ -914,7 +919,19 @@ impl EventStats {
         self.last_kernel_entry = now;
         let idx = match kevent {
             KE::Irq => 0,
-            KE::SoftInt(_) => 1,
+            KE::SoftInt(n) => {
+                // Every IVT slot is a 2-byte `INT 31h` stub, so the event's own
+                // vector is always 31h — the trampoline, not the service. The
+                // service is the slot the guest landed in, which `rm_vector_
+                // dispatch` recovers the same way: (ip - 2) / 2.
+                let vec = if regs.code_seg() == crate::kernel::dos::stub_seg() {
+                    (regs.ip32().wrapping_sub(2) / 2) as u8
+                } else {
+                    *n
+                };
+                self.softint_by_vec[vec as usize] += 1;
+                1
+            }
             KE::Hlt => 2,
             KE::In { .. } => 3,
             KE::Out { .. } => 4,
@@ -933,15 +950,28 @@ impl EventStats {
                 let user_pct = self.user_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
                 let kern_pct = self.kernel_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
                 let c = &self.counts;
+                // The three hottest vectors, so a polling loop names itself.
+                let mut top = [(0u32, 0usize); 3];
+                for (v, &n) in self.softint_by_vec.iter().enumerate() {
+                    if n > top[2].0 {
+                        top[2] = (n, v);
+                        top.sort_by(|a, b| b.0.cmp(&a.0));
+                    }
+                }
                 crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
                     user_pct, kern_pct,
                     c[0], c[1], c[2], c[3], c[4], c[5], c[6],
                     c[8], c[9], c[7], c[10], machine.get_ticks(),
                     regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+                if c[1] > 0 {
+                    crate::dbg_println!("[prof] hottest INT (service, not the 31h trampoline): {:02X}h={} {:02X}h={} {:02X}h={}",
+                        top[0].1, top[0].0, top[1].1, top[1].0, top[2].1, top[2].0);
+                }
             }
             self.user_cycles = 0;
             self.kernel_cycles = 0;
             self.counts = [0; 11];
+            self.softint_by_vec = [0; 256];
             self.last_profile_dump = now;
         }
     }
