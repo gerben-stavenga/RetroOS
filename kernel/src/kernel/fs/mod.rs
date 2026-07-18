@@ -7,6 +7,7 @@
 //!
 //! Backends read blocks through `kernel::block`, never a driver directly.
 
+pub mod grant;
 pub mod hostfs;
 pub mod lwext4;
 pub mod tarfs;

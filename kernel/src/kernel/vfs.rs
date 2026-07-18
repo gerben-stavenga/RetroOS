@@ -24,6 +24,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::kernel::thread::FdKind;
+use crate::kernel::fs::grant::WriteAccess;
 
 /// Maximum simultaneous open files system-wide
 const MAX_OPEN_FILES: usize = 64;
@@ -49,6 +50,19 @@ const PATH_KEY_MAX: usize = 164;
 /// releases a fid (`Tclunk`), and `remove` deletes a path (`Tremove`).
 /// In-process servers implement it as direct calls; a future wire codec can
 /// marshal the same operations over virtio-9p / TCP behind this trait.
+/// Ownership and permission FACTS about an object — what the filesystem
+/// records, with no judgement about what it means.
+///
+/// Deciding whether RetroOS may write something is policy and lives above
+/// (see `kernel::fs::grant`); a filesystem only reports.
+#[derive(Clone, Copy)]
+pub struct Meta {
+    pub uid: u32,
+    pub gid: u32,
+    /// POSIX mode bits.
+    pub mode: u32,
+}
+
 pub trait Filesystem {
     /// Look up a file by normalized path, case-sensitively (POSIX).
     /// Fused Twalk+Topen: returns a fid (`Vnode::handle`).
@@ -92,6 +106,19 @@ pub trait Filesystem {
 
     /// Remove a file by path (Tremove). Default = -1 (read-only / unsupported).
     fn remove(&self, _path: &[u8]) -> i32 { -1 }
+
+    /// Ownership/permission facts for `path`, if this filesystem keeps any.
+    /// `None` = it has no such concept (a TAR, say), which callers must read
+    /// as "cannot be judged", not "permitted".
+    fn meta(&self, _path: &[u8]) -> Option<Meta> {
+        None
+    }
+
+    /// Set ownership and mode. False if unsupported or the write failed.
+    fn set_meta(&self, _path: &[u8], _uid: u32, _gid: u32, _mode: u32) -> bool {
+        false
+    }
+
 }
 
 /// Identifies an open file on a filesystem — effectively a 9P fid plus the
@@ -137,6 +164,10 @@ pub struct FileEntry {
     pub ino: u64,
     /// Index into the mount table (which filesystem owns this file)
     pub mount_idx: u8,
+    /// Decided once at open/create, when the PATH was still in hand: may
+    /// RetroOS write through this handle? `write` only receives a handle, so
+    /// the verdict has to be remembered rather than re-derived.
+    pub writable: bool,
     /// For RAM-backed files: normalized path key into the RAM overlay
     pub ram_key: [u8; PATH_KEY_MAX],
     pub ram_key_len: u8,
@@ -179,6 +210,9 @@ enum BindTarget {
 struct Binding {
     prefix: &'static [u8],  // e.g. b"" for root, b"boot/" for sub-mount
     target: BindTarget,
+    /// Who decides writes here. Enforced by the VFS itself (see `may_write`) —
+    /// never by a driver, and never by a wrapper a mount site could forget.
+    access: crate::kernel::fs::grant::WriteAccess,
     // NB: the mount MODE (Replace vs Union) is applied when the binding is
     // added (Replace drops peers at the prefix; see `add_binding`) — it does
     // not need to persist per-binding, so it is not stored here.
@@ -243,6 +277,7 @@ impl Vfs {
             offset: 0,
             refcount: 0,
             mount_idx: 0,
+            writable: false,
             ram_key: [0; PATH_KEY_MAX],
             ram_key_len: 0,
         };
@@ -376,6 +411,41 @@ impl Vfs {
         None
     }
 
+    /// May RetroOS write `subpath` on mount `midx`? THE enforcement point:
+    /// every write, create and delete in the system funnels through here, so
+    /// the rule cannot be bypassed by reaching a driver directly.
+    ///
+    /// No grant on the mount means nothing on it is writable.
+    fn may_write(&self, midx: u8, subpath: &[u8]) -> bool {
+        match self.mounts[midx as usize].access {
+            WriteAccess::None => false,
+            WriteAccess::Delegated => true,
+            WriteAccess::Granted(grant) => {
+                let fs = self.mount_fs(midx);
+                fs.meta(subpath).is_some_and(|m| grant.allows(&m))
+            }
+        }
+    }
+
+    /// May RetroOS create or delete `subpath`? The Unix rule: that mutates the
+    /// PARENT directory, so the parent's ownership decides.
+    fn may_write_parent(&self, midx: u8, subpath: &[u8]) -> bool {
+        match crate::kernel::fs::grant::parent_of(subpath) {
+            Some(parent) => self.may_write(midx, parent),
+            None => false,
+        }
+    }
+
+    /// Stamp a newly created object as RetroOS's own, so it can be reopened
+    /// for writing later.
+    fn claim(&self, midx: u8, subpath: &[u8]) {
+        let WriteAccess::Granted(grant) = self.mounts[midx as usize].access else { return };
+        let fs = self.mount_fs(midx);
+        if let Some(m) = fs.meta(subpath) {
+            fs.set_meta(subpath, m.uid, grant.gid(), grant.claim_mode(m.mode));
+        }
+    }
+
     fn mount_fs(&self, idx: u8) -> &'static dyn Filesystem {
         match self.mounts[idx as usize].target {
             BindTarget::Server(fs) => fs,
@@ -394,7 +464,7 @@ impl Vfs {
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        self.mounts.push(Binding { prefix, target, seq });
+        self.mounts.push(Binding { prefix, target, access: WriteAccess::Delegated, seq });
     }
 
     fn mount(&mut self, prefix: &'static [u8], fs: &'static dyn Filesystem) {
@@ -549,6 +619,7 @@ impl Vfs {
                 mount_idx: 0,
                 ram_key,
                 ram_key_len: key_len,
+                writable: true, // RAM overlay files are always ours
             };
             return table_idx as i32;
         }
@@ -558,8 +629,11 @@ impl Vfs {
         // Every open gets its OWN fid from `fs.open` — fids are never cached or
         // shared, so `close_handle` can `clunk` this fid at refcount 0 without
         // affecting any other open (see `close_handle`).
-        let (midx, vnode) = match self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
-            fs.open(subpath).map(|v| (idx, v))
+        // Carry the subpath out too: the write verdict must be taken against
+        // the member that actually opened the file, not against whatever
+        // `resolve_head` would pick.
+        let (midx, vnode, sub) = match self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
+            fs.open(subpath).map(|v| (idx, v, subpath.to_vec()))
         }) {
             Some(x) => x,
             None => return -2,
@@ -577,13 +651,38 @@ impl Vfs {
             mount_idx: midx,
             ram_key: [0; PATH_KEY_MAX],
             ram_key_len: 0,
+            // Decide now, while the path is still in hand — `write` receives
+            // only a handle.
+            writable: self.may_write(midx, &sub),
         };
         table_idx as i32
     }
 
     fn create_to_handle(&mut self, path: &[u8]) -> i32 {
         let (midx, fs, subpath) = self.resolve_head(path);
+        // The check applies only to filesystems that can really create. One
+        // that cannot (a TAR) falls through to the RAM overlay below, exactly
+        // as before — denying there would make read-only mounts lose their
+        // scratch files rather than protect anything.
+        // Did it already exist? Decides both which permission applies and
+        // whether a successful create needs stamping as ours.
+        let existed = fs.meta(subpath).is_some();
+        if fs.supports_create() {
+            // Creating or truncating is a write: an existing object must
+            // itself be ours, a new one needs write permission on its parent.
+            let permitted = if existed {
+                self.may_write(midx, subpath)
+            } else {
+                self.may_write_parent(midx, subpath)
+            };
+            if !permitted {
+                return -13; // EACCES
+            }
+        }
         if let Some(vnode) = fs.create(subpath) {
+            if !existed {
+                self.claim(midx, subpath);
+            }
             let table_idx = match self.alloc_file_entry() {
                 Some(i) => i,
                 None => return -24,
@@ -596,6 +695,7 @@ impl Vfs {
                 mount_idx: midx,
                 ram_key: [0; PATH_KEY_MAX],
                 ram_key_len: 0,
+                writable: true, // the permission check above already passed
             };
             self.invalidate_dir_cache();
             return table_idx as i32;
@@ -624,6 +724,7 @@ impl Vfs {
             offset: 0,
             refcount: 1,
             mount_idx: 0,
+            writable: true, // RAM overlay files are always ours
             ram_key,
             ram_key_len: key_len,
         };
@@ -637,7 +738,15 @@ impl Vfs {
         }
         // Not a RAM-overlay file: ask the backing filesystem (Tremove). Backends
         // that can't (or are read-only) return the default -1.
-        let (_midx, fs, subpath) = self.resolve_head(path);
+        let (midx, fs, subpath) = self.resolve_head(path);
+        // Unlinking mutates the parent, so the parent must be ours — and the
+        // victim too, so a link we may traverse can't delete something we may
+        // not write. Only meaningful where the mount has a rule at all.
+        if fs.meta(subpath).is_some()
+            && (!self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath))
+        {
+            return -13; // EACCES
+        }
         let r = fs.remove(subpath);
         if r >= 0 {
             self.invalidate_dir_cache();
@@ -695,6 +804,9 @@ impl Vfs {
             return -9;
         }
 
+        if !self.file_table[h].writable {
+            return -30; // EROFS — this handle was opened on something not ours
+        }
         let (mount_idx, fs_handle, offset) = {
             let e = &self.file_table[h];
             (e.mount_idx, e.vnode.handle, e.offset)
@@ -857,6 +969,23 @@ fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 /// Replaces any binding already at that exact prefix.
 pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
     VFS.lock().mount(prefix, fs);
+}
+
+/// Mount `fs` and give it a write grant derived from the group owning `home`
+/// (a path within the new mount). Without this a mount is read-only, which is
+/// the safe default: a mount site cannot accidentally grant write access, only
+/// deliberately.
+pub fn mount_writable(prefix: &'static [u8], fs: &'static dyn Filesystem, home: &[u8]) {
+    let mut v = VFS.lock();
+    v.mount(prefix, fs);
+    let access = match crate::kernel::fs::grant::Grant::from_home(fs, home) {
+        Some(g) => WriteAccess::Granted(g),
+        // Unreadable identity ⇒ no grant at all, rather than a guessed gid.
+        None => WriteAccess::None,
+    };
+    if let Some(b) = v.mounts.iter_mut().find(|b| b.prefix == prefix) {
+        b.access = access;
+    }
 }
 
 /// Union-mount a filesystem at a prefix: stack it on top of whatever is there

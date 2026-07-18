@@ -196,7 +196,15 @@ fn mount_filesystems(plan: &MountPlan, screen: &mut crate::vga::Screen) {
             // The root is the only writable mount; the group+write-bit policy
             // inside lwext4 narrows it further.
             match Lwext4Fs::new(vol, 0, MountMode::ReadWrite) {
-                Ok(fs) => vfs::mount(b"", alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))),
+                Ok(fs) => {
+                    let fs: &'static dyn vfs::Filesystem =
+                        alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+                    // The write grant is RetroOS's identity — the group owning
+                    // its home. C: is a DOS-side notion only this layer knows,
+                    // and the VFS enforces the rule from here on. Extra mounts
+                    // get no grant, so nothing on them is writable.
+                    vfs::mount_writable(b"", fs, crate::kernel::dos::c_root());
+                }
                 Err(e) => panic!("ext4 mount failed: {}", e),
             }
         }

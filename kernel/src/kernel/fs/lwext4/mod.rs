@@ -28,10 +28,6 @@ use core::ffi::CStr;
 
 mod bridge;
 
-/// POSIX permission bits we care about: the group's read/write bits — the
-/// grant RetroOS looks for (`chmod g+w`).
-const S_IWGRP: u32 = 0o020;
-const S_IRGRP: u32 = 0o040;
 
 
 /// Does the ext partition at `part_lba` look like a Linux root (`/etc`+`/usr`)?
@@ -108,9 +104,11 @@ struct OpenFile {
 /// The caller states it now.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MountMode {
-    /// Writable, subject to the group+write-bit policy (see `grant_gid`).
+    /// Writable as far as the MOUNT is concerned. Whether a given caller may
+    /// write a given object is policy, decided by `fs::grant`, not here.
     ReadWrite,
-    /// Read-only at the lwext4 level AND with no grant gid — defence in depth.
+    /// Read-only at the lwext4 level. The VFS refuses writes to such a mount
+    /// as well, so this is defence in depth, not the only barrier.
     ReadOnly,
 }
 
@@ -118,16 +116,6 @@ pub enum MountMode {
 pub struct Lwext4Fs {
     /// lwext4 mount-point prefix incl. trailing slash, no NUL, e.g. `b"/m0/"`.
     mp: Vec<u8>,
-    /// RetroOS's own group — the gid of the C: root directory, read once at
-    /// mount. It IS the "retroos group" by definition: whatever owns RetroOS's
-    /// home is its identity, so nothing needs pinning or an /etc/group parse.
-    ///
-    /// This gid plus the group-write bit is the WHOLE write policy (see
-    /// [`Self::writable`]): the host grants access with `chgrp retroos` +
-    /// `chmod g+w`, exactly as it would to any other Unix user, and RetroOS can
-    /// touch nothing else on the partition. `None` = read-only mount (the extra
-    /// partitions, or a C: root we couldn't stat).
-    grant_gid: Option<u32>,
     open_files: RefCell<BTreeMap<u64, OpenFile>>,
     next_handle: Cell<u64>,
 }
@@ -166,19 +154,11 @@ impl Lwext4Fs {
         // flush/umount on the (abrupt) kernel shutdown path.
         let _ = lwext4::journal_start(mp_c);
 
-        let mut fs = Lwext4Fs {
+        let fs = Lwext4Fs {
             mp,
-            grant_gid: None,
             open_files: RefCell::new(BTreeMap::new()),
             next_handle: Cell::new(1),
         };
-        // RetroOS's identity: the group owning its own home (the C: root).
-        // Must run AFTER the mount — it reads the directory's inode.
-        if mode == MountMode::ReadWrite {
-            let cr = crate::kernel::dos::c_root();
-            let root = cr.strip_suffix(b"/").unwrap_or(cr);
-            fs.grant_gid = fs.gid_of(root);
-        }
         Ok(fs)
     }
 
@@ -296,68 +276,6 @@ impl Lwext4Fs {
         self.resolve(rel).unwrap_or_else(|| rel.to_vec())
     }
 
-    /// The group owning `rel` (symlinks followed — the target's inode is what a
-    /// write would actually hit).
-    fn gid_of(&self, rel: &[u8]) -> Option<u32> {
-        let mut buf = [0u8; 320];
-        let cpath = self.cpath(rel, &mut buf)?;
-        lwext4::owner_get(cpath).map(|(_uid, gid)| gid)
-    }
-
-    /// May RetroOS write the object at `path`? The ext4 inode answers: it must
-    /// belong to RetroOS's group AND carry the group-write bit.
-    ///
-    /// This is the whole policy. It replaces the old path-prefix zone, and is
-    /// both stricter and more useful: the host grants access per file/dir with
-    /// `chgrp retroos` + `chmod g+w` — ordinary Unix administration — and
-    /// RetroOS can touch nothing else, no matter where it is or how it was
-    /// reached. Symlinks stop mattering (we judge the resolved inode, so a link
-    /// to `/etc/passwd` is refused because passwd isn't ours, not because of
-    /// where the link pointed), and games linked in from elsewhere on the
-    /// partition are writable exactly when the host says so.
-    fn writable(&self, path: &[u8]) -> bool {
-        let Some(grant) = self.grant_gid else {
-            return false; // read-only mount
-        };
-        if self.gid_of(path) != Some(grant) {
-            return false;
-        }
-        let mut buf = [0u8; 320];
-        let Some(cpath) = self.cpath(path, &mut buf) else {
-            return false;
-        };
-        lwext4::mode_get(cpath).is_some_and(|mode| mode & S_IWGRP != 0)
-    }
-
-    /// May RetroOS create/delete `path`? Unix rule: that's a write to the
-    /// PARENT directory, so the parent's group + group-write bit decide (the
-    /// file itself doesn't exist yet).
-    fn may_create_in_parent(&self, path: &[u8]) -> bool {
-        let real = normalize(path);
-        if real.is_empty() {
-            return false;
-        }
-        let parent = match real.iter().rposition(|&b| b == b'/') {
-            Some(i) => &real[..i],
-            None => b"", // mount root
-        };
-        self.writable(parent)
-    }
-
-    /// Stamp a newly created file as RetroOS's own: our group + group-write.
-    /// Without this the file would inherit whatever lwext4 defaults to and we
-    /// could not reopen our own savegame for writing next time.
-    fn claim(&self, path: &[u8]) {
-        let Some(grant) = self.grant_gid else { return };
-        let mut buf = [0u8; 320];
-        let Some(cpath) = self.cpath(path, &mut buf) else { return };
-        let uid = lwext4::owner_get(cpath).map_or(0, |(uid, _gid)| uid);
-        let _ = lwext4::owner_set(cpath, uid, grant);
-        if let Some(mode) = lwext4::mode_get(cpath) {
-            let _ = lwext4::mode_set(cpath, mode | S_IWGRP | S_IRGRP);
-        }
-    }
-
     fn alloc_handle(&self, file: lwext4::File, writable: bool) -> u64 {
         let h = self.next_handle.get();
         self.next_handle.set(h.wrapping_add(1));
@@ -370,15 +288,13 @@ impl Filesystem for Lwext4Fs {
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let mut buf = [0u8; 320];
         let cpath = self.cpath(path, &mut buf)?;
-        // A handle is writable only if the inode is ours (group + g+w);
-        // everything else opens read-only so it can never mutate the disk.
-        let writable = self.writable(path);
-        // Try read-write when permitted, else fall back to read-only — a file
-        // we may not write is still readable.
-        let flags = if writable { c"r+b" } else { c"rb" };
-        let mut file = lwext4::File::open(cpath, flags)
+        // Open as permissively as the MOUNT permits — read-write if lwext4
+        // allows it, else read-only. Whether this CALLER may write is not the
+        // driver's question; the policy layer above decides that.
+        let mut file = lwext4::File::open(cpath, c"r+b")
             .or_else(|_| lwext4::File::open(cpath, c"rb"))
             .ok()?;
+        let writable = lwext4::File::open(cpath, c"r+b").is_ok();
         let size = file.size() as u32;
         let mode = Self::stat_mode(cpath, false);
         let handle = self.alloc_handle(file, writable);
@@ -418,22 +334,10 @@ impl Filesystem for Lwext4Fs {
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
-        // Creating (or truncating) is a write. An existing file must itself be
-        // ours; a new one needs write permission on its parent directory —
-        // the ordinary Unix rule.
-        let exists = self.gid_of(path).is_some();
-        let ok = if exists { self.writable(path) } else { self.may_create_in_parent(path) };
-        if !ok {
-            return None;
-        }
         let mut buf = [0u8; 320];
         let cpath = self.cpath(path, &mut buf)?;
         // "wb": create + truncate for writing.
         let file = lwext4::File::open(cpath, c"wb").ok()?;
-        // Stamp it ours so we can reopen it for writing later.
-        if !exists {
-            self.claim(path);
-        }
         let handle = self.alloc_handle(file, true);
         Some(Vnode { handle, size: 0, mode: 0o664 })
     }
@@ -507,18 +411,30 @@ impl Filesystem for Lwext4Fs {
         lwext4::Dir::exists(cpath)
     }
 
+    /// Report the inode's owner and mode. Symlinks are followed: a write hits
+    /// the TARGET, so the target's facts are the relevant ones.
+    fn meta(&self, path: &[u8]) -> Option<crate::kernel::vfs::Meta> {
+        let mut buf = [0u8; 320];
+        let cpath = self.cpath(path, &mut buf)?;
+        let (uid, gid) = lwext4::owner_get(cpath)?;
+        let mode = lwext4::mode_get(cpath)?;
+        Some(crate::kernel::vfs::Meta { uid, gid, mode })
+    }
+
+    fn set_meta(&self, path: &[u8], uid: u32, gid: u32, mode: u32) -> bool {
+        let mut buf = [0u8; 320];
+        let Some(cpath) = self.cpath(path, &mut buf) else {
+            return false;
+        };
+        lwext4::owner_set(cpath, uid, gid).is_ok() && lwext4::mode_set(cpath, mode).is_ok()
+    }
+
     fn clunk(&self, handle: u64) {
         // Dropping the entry closes the file — the handle cannot outlive it.
         self.open_files.borrow_mut().remove(&handle);
     }
 
     fn remove(&self, path: &[u8]) -> i32 {
-        // Unlinking mutates the PARENT directory, so that is what must be ours
-        // (Unix rule) — and the victim itself must be ours too, so a link we
-        // may traverse can't be used to delete something we may not write.
-        if !self.may_create_in_parent(path) || !self.writable(path) {
-            return -1;
-        }
         let mut buf = [0u8; 320];
         let Some(cpath) = self.cpath(path, &mut buf) else {
             return -1;
@@ -530,3 +446,4 @@ impl Filesystem for Lwext4Fs {
         }
     }
 }
+
