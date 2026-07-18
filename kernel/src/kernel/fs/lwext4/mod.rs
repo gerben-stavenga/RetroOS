@@ -34,6 +34,12 @@ mod bridge;
 /// Read-only mount → check → unmount, leaving lwext4's global registry clean so
 /// the real root mount can reuse the same partition. Used only to disambiguate
 /// a multi-ext disk (a laptop's data partition vs its real root).
+/// Does `vol` hold an ext filesystem? Reading its superblock is the only way
+/// to know; partition type bytes and GUIDs are declarations, not facts.
+pub fn is_ext(vol: &Volume) -> bool {
+    bridge::fs_extent(vol).is_some()
+}
+
 pub fn is_linux_root(vol: &Volume) -> bool {
     const DEV: &CStr = c"ext4probe";
     const MP: &CStr = c"/probe/";

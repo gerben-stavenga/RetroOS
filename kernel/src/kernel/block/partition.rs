@@ -15,12 +15,13 @@ use super::Volume;
 ///
 /// A closed set — these are the categories RetroOS itself acts on — so an
 /// enum, and adding one breaks every match that has to care.
+/// What the TABLE claims — a declaration, not a verdict. Whether a partition
+/// really holds a given filesystem is that filesystem's question: it reads the
+/// superblock. This layer parses tables and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PartKind {
-    /// ext2/3/4. On MBR this is the 0x83 type byte; on GPT it is a confirmed
-    /// ext superblock (GUID-agnostic, so it catches an ext root however the
-    /// partition was typed).
-    Ext,
+    /// Linux (MBR type 0x83) — conventionally ext, but only a probe knows.
+    Linux,
     /// FAT of some flavour.
     Fat,
     /// RetroOS's own 0xDA boot bundle — the bootloader's business, never
@@ -41,7 +42,7 @@ impl PartKind {
     /// Classify an MBR type byte.
     fn from_mbr(ty: u8) -> PartKind {
         match ty {
-            0x83 => PartKind::Ext,
+            0x83 => PartKind::Linux,
             0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E => PartKind::Fat,
             0xDA => PartKind::BootBundle,
             other => PartKind::Other(other),
@@ -125,22 +126,15 @@ fn gpt(disk: Volume) -> Vec<Partition> {
             if first == 0 || last < first {
                 continue;
             }
-            let volume = Volume::new(disk.disk(), first, last - first + 1);
-            let kind = if has_ext_superblock(&volume) {
-                PartKind::Ext
-            } else {
-                PartKind::Other(0)
-            };
-            out.push(Partition { volume, kind });
+            // GPT type GUIDs are deliberately not interpreted — an ext root is
+            // one with an ext superblock, whatever the installer typed it as,
+            // and only the fs layer can tell.
+            out.push(Partition {
+                volume: Volume::new(disk.disk(), first, last - first + 1),
+                kind: PartKind::Other(0),
+            });
         }
     }
     out
 }
 
-/// Confirm ext2/3/4 by superblock magic: 0xEF53 lives 1024 B into the
-/// partition (superblock at 1024, s_magic at +0x38) → sector 2, offset 56.
-fn has_ext_superblock(vol: &Volume) -> bool {
-    let mut sb = [0u8; 512];
-    vol.read(2, &mut sb);
-    u16::from_le_bytes([sb[56], sb[57]]) == 0xEF53
-}

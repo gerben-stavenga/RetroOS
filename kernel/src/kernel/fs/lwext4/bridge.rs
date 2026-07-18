@@ -96,7 +96,7 @@ fn new_iface(vol: Volume) -> *mut Ext4BlockdevIface {
 /// Before the table's extent reached this layer, the superblock was the only
 /// source and therefore had to be exactly right (see below). It is now a
 /// cross-check.
-fn fs_extent(vol: &Volume) -> Option<u64> {
+pub fn fs_extent(vol: &Volume) -> Option<u64> {
     let from_sb = part_size_from_superblock(vol)?;
     let from_table = vol.sectors * 512;
     if from_sb > from_table {

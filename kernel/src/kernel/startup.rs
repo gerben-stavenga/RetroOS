@@ -134,10 +134,14 @@ fn plan_mounts(
 ) -> MountPlan {
     use crate::kernel::block::partition::PartKind;
 
+    // Ask the filesystem, don't trust the table: a partition holds ext when it
+    // has an ext superblock, whatever type byte or GUID it carries. The probe
+    // is the same read the mount would do anyway.
     let ext: alloc::vec::Vec<_> = parts
         .iter()
-        .filter(|p| p.kind == PartKind::Ext)
+        .filter(|p| p.kind != PartKind::BootBundle)
         .map(|p| p.volume)
+        .filter(crate::kernel::fs::lwext4::is_ext)
         .collect();
 
     if ext.is_empty() {

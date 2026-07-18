@@ -63,6 +63,13 @@ impl Volume {
         self.disk
     }
 
+    /// How many of `len` bytes at volume-relative `lba` fall inside the extent.
+    fn clamp(&self, lba: u64, len: usize) -> usize {
+        let want = len.div_ceil(512) as u64;
+        let avail = self.sectors.saturating_sub(lba).min(want);
+        ((avail * 512) as usize).min(len)
+    }
+
     /// Read `buf.len().div_ceil(512)` sectors from volume-relative `lba`.
     /// Returns sectors actually read from the device.
     ///
@@ -71,9 +78,7 @@ impl Volume {
     /// length: a filesystem that miscalculates an offset gets an obviously
     /// empty block, not plausible garbage from somewhere else on the disk.
     pub fn read(&self, lba: u64, buf: &mut [u8]) -> u32 {
-        let want = buf.len().div_ceil(512) as u64;
-        let avail = self.sectors.saturating_sub(lba).min(want);
-        let n = ((avail * 512) as usize).min(buf.len());
+        let n = self.clamp(lba, buf.len());
         let (inside, past_end) = buf.split_at_mut(n);
         past_end.fill(0);
         if inside.is_empty() {
@@ -86,9 +91,7 @@ impl Volume {
     /// Bytes past the end of the extent are DROPPED, not written to whatever
     /// follows. Returns sectors written.
     pub fn write(&self, lba: u64, buf: &[u8]) -> u32 {
-        let want = buf.len().div_ceil(512) as u64;
-        let avail = self.sectors.saturating_sub(lba).min(want);
-        let n = ((avail * 512) as usize).min(buf.len());
+        let n = self.clamp(lba, buf.len());
         if n == 0 {
             return 0;
         }
