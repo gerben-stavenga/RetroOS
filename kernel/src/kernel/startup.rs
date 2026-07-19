@@ -867,8 +867,9 @@ struct EventStats {
     /// Port I/O by PORT — a small associative table rather than a 64K array,
     /// which would not fit the kernel stack. Ports that matter are few; once
     /// the table is full the rest aggregate into `port_other`.
-    ports: [(u16, u32); 12],
+    ports: [(u16, u32, u64); 12], // (port, accesses, dispatch cycles)
     port_other: u32,
+    last_port: Option<u16>,
     /// Software interrupts BY VECTOR. The aggregate above says the guest is
     /// trapping a lot; only this says which service it is asking for, which is
     /// the difference between a number and a lead.
@@ -904,8 +905,9 @@ impl EventStats {
             last_kernel_entry: now,
             last_profile_dump: now,
             counts: [0; 11],
-            ports: [(0, 0); 12],
+            ports: [(0, 0, 0); 12],
             port_other: 0,
+            last_port: None,
             softint_by_vec: [0; 256],
         }
     }
@@ -914,8 +916,10 @@ impl EventStats {
     /// that caused it, so cost-per-event falls out of cycles/count.
     fn after_dispatch<A: crate::Arch>(&mut self, machine: &mut A) {
         let now = machine.rdtsc();
-        self.dispatch_cycles[self.last_idx] = self.dispatch_cycles[self.last_idx]
-            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
+        let spent = now.wrapping_sub(self.last_kernel_entry);
+        self.dispatch_cycles[self.last_idx] =
+            self.dispatch_cycles[self.last_idx].wrapping_add(spent);
+        self.bill_port(spent);
     }
 
     /// Top of the loop: everything from here to `pre_run` is the per-event
@@ -954,6 +958,7 @@ impl EventStats {
     /// Tally one port access. Linear scan of a 12-entry table: shorter than a
     /// cache line's worth of work, and the hot set is a handful of ports.
     fn count_port(&mut self, port: u16) {
+        self.last_port = Some(port);
         for e in self.ports.iter_mut() {
             if e.1 == 0 || e.0 == port {
                 e.0 = port;
@@ -962,6 +967,18 @@ impl EventStats {
             }
         }
         self.port_other += 1;
+    }
+
+    /// Bill dispatch cycles to the port that caused them, so an expensive
+    /// HANDLER is distinguishable from a merely popular port.
+    fn bill_port(&mut self, cycles: u64) {
+        let Some(port) = self.last_port.take() else { return };
+        for e in self.ports.iter_mut() {
+            if e.0 == port && e.1 != 0 {
+                e.2 = e.2.wrapping_add(cycles);
+                return;
+            }
+        }
     }
 
     fn post_run<A: crate::Arch>(
@@ -1040,8 +1057,12 @@ impl EventStats {
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
                     p.sort_by(|a, b| b.1.cmp(&a.1));
-                    crate::dbg_println!("[prof] hottest port: {:03X}h={} {:03X}h={} {:03X}h={} other={}",
-                        p[0].0, p[0].1, p[1].0, p[1].1, p[2].0, p[2].1, self.port_other);
+                    let per = |e: (u16, u32, u64)| e.2.checked_div(e.1.max(1) as u64).unwrap_or(0);
+                    crate::dbg_println!(
+                        "[prof] ports: {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c other={}",
+                        p[0].0, p[0].1, per(p[0]), p[1].0, p[1].1, per(p[1]),
+                        p[2].0, p[2].1, per(p[2]), p[3].0, p[3].1, per(p[3]),
+                        p[4].0, p[4].1, per(p[4]), self.port_other);
                 }
                 if c[1] > 0 {
                     crate::dbg_println!("[prof] hottest INT (service, not the 31h trampoline): {:02X}h={} {:02X}h={} {:02X}h={}",
@@ -1055,7 +1076,7 @@ impl EventStats {
             self.dispatch_cycles = [0; 11];
             self.counts = [0; 11];
             self.softint_by_vec = [0; 256];
-            self.ports = [(0, 0); 12];
+            self.ports = [(0, 0, 0); 12];
             self.port_other = 0;
             self.last_profile_dump = now;
         }
