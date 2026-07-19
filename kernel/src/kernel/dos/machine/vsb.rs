@@ -673,10 +673,15 @@ impl SoundBlaster {
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
         let c8 = self.dma8 as usize;
         let c16 = self.dma16 as usize;
-        let armed8 = c8 < 4 && !dma.ch[c8].masked
-            && dma.ch[c8].prog.count != 0;
-        let armed16 = (5..8).contains(&c16) && !dma.ch[c16].masked
-            && dma.ch[c16].prog.count != 0;
+        // Armed = unmasked. NOT `count != 0`: the 8237 count register holds
+        // transfers MINUS ONE, so 0 is a legal one-transfer block — exactly
+        // what a driver's minimal DMA-wiring probe arms (MONKEY2's
+        // SOUNBLAS.IMS). Treating it as idle left the real chip unprogrammed,
+        // so the probe's completion IRQ never came and the driver gave up
+        // with "Unable to initialize SoundDriver". "Has the guest armed this
+        // *since we last acted*" is `count_gen` below, not the count value.
+        let armed8 = c8 < 4 && !dma.ch[c8].masked;
+        let armed16 = (5..8).contains(&c16) && !dma.ch[c16].masked;
         let (chan, is16, host) = if armed16 {
                 (c16, true, self.host_dma16 as usize)
             } else if armed8 {
@@ -1310,33 +1315,15 @@ impl SoundBlaster {
             (drained + self.emu.slack as u64).min(pushed)
         };
         while self.emu.playing && guest_now >= self.emu.next_irq {
-            self.emu.cursor = self.emu.next_irq;
-            self.emu.blocks_done += 1;
-            // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
-            self.emu.irq_status |= if self.emu.bits == 16 { 0x02 } else { 0x01 };
             if super::PORT_TRACE {
                 crate::dbg_println!(
                     "[dsp] boundary cursor={} single={} drained={} ticks={}",
-                    self.emu.cursor, self.emu.single, drained, now
+                    self.emu.next_irq, self.emu.single, drained, now
                 );
             }
-            if !vpic.is_requested(self.irq) {
-                vpic.raise(self.irq);
-            }
+            self.raise_block_irq(vpic);
             if self.emu.single {
-                self.emu.playing = false; // single-cycle: one pass done, stop (no loop)
-                self.emu.done_ms = now;   // stream held open through the hangover
-                // The 8237 side hit terminal count: current-count underflows to
-                // 0xFFFF and the status TC bit latches until read.
-                self.emu.dma_tc = true;
-                let chan = if self.emu.bits == 16 { self.dma16 } else { self.dma8 };
-                self.emu.tc_status |= 1 << (chan & 7);
-                if self.emu.bits == 16 {
-                    crate::dbg_println!(
-                        "[dsp16] terminal cursor={} irq_status={:02X} tc_status={:02X} ticks={}",
-                        self.emu.cursor, self.emu.irq_status, self.emu.tc_status, now
-                    );
-                }
+                self.finish_single_cycle(now);
             } else {
                 self.emu.next_irq += self.emu.block_frames as u64;
             }
@@ -1344,6 +1331,63 @@ impl SoundBlaster {
         if self.emu.playing {
             self.emu.cursor = guest_now;
         }
+    }
+
+    /// A block boundary passed: advance the cursor over it, latch the
+    /// width-tagged mixer IRQ status, and put the line up.
+    fn raise_block_irq(&mut self, vpic: &mut super::vpic::VirtualPic) {
+        self.emu.cursor = self.emu.next_irq;
+        self.emu.blocks_done += 1;
+        // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
+        self.emu.irq_status |= if self.emu.bits == 16 { 0x02 } else { 0x01 };
+        if !vpic.is_requested(self.irq) {
+            vpic.raise(self.irq);
+        }
+    }
+
+    /// Single-cycle: one pass and stop (no loop). The 8237 side hit terminal
+    /// count, so the current count underflows to 0xFFFF and the status TC bit
+    /// latches until read; the stream stays held open through the hangover.
+    fn finish_single_cycle(&mut self, now: u64) {
+        self.emu.playing = false;
+        self.emu.done_ms = now;
+        self.emu.dma_tc = true;
+        let chan = if self.emu.bits == 16 { self.dma16 } else { self.dma8 };
+        self.emu.tc_status |= 1 << (chan & 7);
+        if self.emu.bits == 16 {
+            crate::dbg_println!(
+                "[dsp16] terminal cursor={} irq_status={:02X} tc_status={:02X} ticks={}",
+                self.emu.cursor, self.emu.irq_status, self.emu.tc_status, now
+            );
+        }
+    }
+
+    /// Complete a single-cycle transfer too short for the pump clock to see.
+    ///
+    /// A real card finishes a few-byte transfer in microseconds: the DSP
+    /// command and its completion IRQ are, to the driver, back to back. Our
+    /// DSP clock turns on the mixer pump — once a millisecond, and never on
+    /// the same turn that arms the transfer — so the IRQ lands 1-2 ms late.
+    /// That is an eternity to a driver probing how its card is wired:
+    /// MONKEY2's SOUNBLAS.IMS arms a 1-byte transfer and re-masks the PIC a
+    /// few instructions later, so on a fast backend it had already stopped
+    /// listening when the line finally went up, and gave up with "Unable to
+    /// initialize SoundDriver". Sub-quantum transfers complete here instead,
+    /// on the slice, alongside 0xF2's latched trigger IRQ.
+    pub fn deliver_probe_irq<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        vpic: &mut super::vpic::VirtualPic,
+    ) {
+        if !self.emulated() || !self.emu.probe || !self.emu.playing {
+            return;
+        }
+        // Frames the pump clock cannot resolve: shorter than its 1 ms turn.
+        if self.emu.block_frames as u64 * 1000 >= self.emu.rate.max(1) as u64 {
+            return;
+        }
+        self.raise_block_irq(vpic);
+        self.finish_single_cycle(machine.get_ticks());
     }
 
     /// Emulated DMA current-address/count read: serve the active SB channel's

@@ -941,6 +941,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // Device ticks that run regardless of playback: the SB's latched
     // 0xF2/0xF3 trigger IRQ, the GF1 rate timers + DMA-TC IRQ.
     sb.deliver_trigger_irq(vpic);
+    sb.deliver_probe_irq(machine, vpic);
     gus.tick(machine, vpic);
 
     // The pump runs on the millisecond, not on the slice. A DOS program that
