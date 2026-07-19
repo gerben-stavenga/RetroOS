@@ -18,6 +18,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // on machines with no serial/debug port (real metal — 0xE9 goes nowhere).
     crate::kernel::klog::init();
 
+
     // Discover every disk. The block layer reports what exists; nothing below
     // this line picks a boot disk or decides where anything mounts.
     let disks = crate::kernel::block::probe(machine);
