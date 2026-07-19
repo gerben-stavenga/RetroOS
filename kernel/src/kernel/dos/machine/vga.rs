@@ -1697,48 +1697,28 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     // writes, so the buffer needs no pre-zeroing either.
     let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
-    let (w, h) = vga_render::dimensions(frame.mode);
-    // Mode 13h with no split screen and no pixel pan — the ordinary case for
-    // every game — hands the INDEXED pixels straight to the sink, which does
-    // palette, format and stretch in one pass per source row. That skips both
-    // the full-frame RGB buffer and `render`'s per-pixel palette lookup. The
-    // fallback below still covers split/panned frames and every other mode.
-    if let Some(fb) = direct
-        && matches!(frame.mode, vga_render::VgaMode::Mode13h)
-        && frame.line_compare == usize::MAX
-        && frame.pixel_pan == 0
-        && frame.vram.len() >= frame.start_offset + w * h
+    // One path for every mode: the renderer draws a source row directly in the
+    // framebuffer's pixel format, the blit stretches and copies it. No special
+    // case, no full-frame intermediate.
+    if let crate::kernel::platform::Display::Framebuffer(fb) =
+        crate::kernel::platform::get().display
     {
-        crate::kernel::display::blit_indexed(
-            &mut pc.present_scratch2, &fb, &frame.vram[frame.start_offset..], w, h, frame.palette);
-        crate::kernel::display::present();
-        if prof {
-            let p4 = machine.rdtsc();
-            crate::kernel::startup::bill_display(
-                p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), w * h);
-        }
-        return;
-    }
-    let need = w * h;
-    if pc.present_fb.len() < need {
-        pc.present_fb.resize(need, 0);
-    }
-    let fb = &mut pc.present_fb[..need];
-    let p2 = if prof { machine.rdtsc() } else { 0 };
-    vga_render::render(&frame, fb);
-    let p3 = if prof { machine.rdtsc() } else { 0 };
-    // Same destination question for the rendered-RGB path: blit it ourselves
-    // when we have a framebuffer, else hand it to the window sink.
-    if let Some(dfb) = direct {
-        crate::kernel::display::blit_rgb(&mut pc.present_scratch2, &dfb, fb, w, h);
+        crate::kernel::display::blit(&mut pc.present_scratch2, &fb, &frame);
         crate::kernel::display::present();
     } else {
+        // Window sink (hosted): still takes a whole rendered frame.
+        let (w, h) = vga_render::dimensions(frame.mode);
+        let need = w * h;
+        if pc.present_fb.len() < need {
+            pc.present_fb.resize(need, 0);
+        }
+        let fb = &mut pc.present_fb[..need];
+        vga_render::render(&frame, fb);
         vga_render::present(w, h, fb);
     }
-    let p4 = if prof { machine.rdtsc() } else { 0 };
     if prof {
+        let p4 = machine.rdtsc();
         crate::kernel::startup::bill_display(
-            p1.wrapping_sub(p0), p2.wrapping_sub(p1),
-            p3.wrapping_sub(p2), p4.wrapping_sub(p3), need);
+            p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), 0);
     }
 }

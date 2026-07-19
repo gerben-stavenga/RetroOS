@@ -492,6 +492,221 @@ pub fn present_sink_installed() -> bool {
     PRESENT_SINK.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
+/// Where a channel sits in the 32-bit framebuffer pixel. Lives here, with the
+/// renderer, because it is a property of the pixels rather than of any backend.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PixelFormat {
+    pub red_pos: u8,
+    pub green_pos: u8,
+    pub blue_pos: u8,
+}
+
+impl PixelFormat {
+    pub const NATIVE: PixelFormat = PixelFormat { red_pos: 16, green_pos: 8, blue_pos: 0 };
+
+    /// Re-lay `0x00RRGGBB`. Called 256 times per palette change for indexed
+    /// modes — and per pixel only in direct-colour SVGA, which has no palette.
+    pub fn encode(self, rgb: u32) -> u32 {
+        ((rgb >> 16) & 0xFF) << self.red_pos
+            | ((rgb >> 8) & 0xFF) << self.green_pos
+            | (rgb & 0xFF) << self.blue_pos
+    }
+}
+
+/// The DAC palette, already converted to the framebuffer's format.
+///
+/// Every VGA mode ultimately picks a DAC entry — mode 13h and Mode-X directly,
+/// planar through the attribute controller, text through the attribute byte —
+/// so one table serves them all, and the per-pixel work becomes a single array
+/// index. CGA's fixed colours and direct-colour SVGA are the exceptions and use
+/// `fmt` instead.
+pub struct Pal {
+    pub lut: [u32; 256],
+    pub fmt: PixelFormat,
+}
+
+impl Pal {
+    pub const fn new() -> Pal {
+        Pal { lut: [0; 256], fmt: PixelFormat::NATIVE }
+    }
+
+    /// Rebuild for `palette`/`fmt`. Cheap to call every frame — it compares
+    /// first and only 256 entries are recomputed when the DAC actually moves.
+    pub fn sync(&mut self, palette: &[u8; 768], fmt: PixelFormat, cache: &mut [u8; 768]) -> bool {
+        if cache == palette && self.fmt == fmt {
+            return false;
+        }
+        *cache = *palette;
+        self.fmt = fmt;
+        for (i, e) in self.lut.iter_mut().enumerate() {
+            *e = fmt.encode(pal_rgb(palette, i as u8));
+        }
+        true
+    }
+}
+
+/// Render ONE source scanline into `out`, in the framebuffer's format.
+///
+/// This is the whole renderer surface the present path needs: the caller walks
+/// source rows, stretches each one and copies it to the output rows it covers,
+/// so no full-frame intermediate is ever materialised and every mode takes the
+/// same path. `out` must hold at least `dimensions(frame.mode).0` pixels.
+pub fn render_row(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32]) {
+    let (w, h) = dimensions(frame.mode);
+    if sy >= h || out.len() < w {
+        return;
+    }
+    let out = &mut out[..w];
+    match frame.mode {
+        VgaMode::Mode13h => row_mode13(frame, sy, pal, out, w),
+        VgaMode::Text80x25 => row_text(frame, sy, pal, out, w),
+        VgaMode::Cga4 => row_cga4(frame, sy, pal, out, w),
+        VgaMode::Cga2 => row_cga2(frame, sy, pal, out, w),
+        VgaMode::Planar16 { row_bytes, .. } => row_planar16(frame, sy, pal, out, w, row_bytes as usize),
+        VgaMode::ModeX { row_bytes, .. } => row_modex(frame, sy, pal, out, w, row_bytes as usize),
+        VgaMode::LinearSvga { bpp, pitch, .. } => row_svga(frame, sy, pal, out, w, bpp, pitch as usize),
+    }
+}
+
+/// Address of source row `sy`, honouring the Line Compare split (below it the
+/// latch resets to 0 and panning is suppressed — a fixed panel under a
+/// scrolling playfield) and the smooth-scroll pixel pan.
+fn row_origin(frame: &Frame, sy: usize) -> (usize, usize, usize) {
+    if sy >= frame.line_compare {
+        (0, 0, sy - frame.line_compare)
+    } else {
+        (frame.start_offset, frame.pixel_pan & 7, sy)
+    }
+}
+
+fn row_mode13(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], w: usize) {
+    let (start, pan, ry) = row_origin(frame, sy);
+    let base = start + ry * w + pan;
+    for (x, px) in out.iter_mut().enumerate() {
+        *px = pal.lut[frame.vram.get(base + x).copied().unwrap_or(0) as usize];
+    }
+}
+
+fn row_modex(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], w: usize, row_bytes: usize) {
+    let rb = if row_bytes == 0 { w / 4 } else { row_bytes };
+    let (start, pan, ry) = row_origin(frame, sy);
+    for (x, px) in out.iter_mut().enumerate() {
+        let sx = x + pan;
+        let off = start + ry * rb + sx / 4;
+        let idx = frame.planes.get((sx & 3) * 0x10000 + off).copied().unwrap_or(0);
+        *px = pal.lut[idx as usize];
+    }
+}
+
+fn row_planar16(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], w: usize, row_bytes: usize) {
+    let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
+    let (start, pan, ry) = row_origin(frame, sy);
+    // Per SOURCE BYTE: fetch its 4 plane bytes once (64K apart) and spread them
+    // into 8 chunky nibbles, rather than re-fetching 4 planes per pixel — which
+    // was once essentially the whole cost of EGA/16-colour present.
+    let base = start + ry * rb;
+    let (mut x, mut bit, mut sbyte) = (0usize, pan & 7, pan / 8);
+    while x < w {
+        let off = base + sbyte;
+        let p0 = frame.planes.get(off).copied().unwrap_or(0) as usize;
+        let p1 = frame.planes.get(0x10000 + off).copied().unwrap_or(0) as usize;
+        let p2 = frame.planes.get(0x20000 + off).copied().unwrap_or(0) as usize;
+        let p3 = frame.planes.get(0x30000 + off).copied().unwrap_or(0) as usize;
+        let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
+        while bit < 8 && x < w {
+            out[x] = pal.lut[planar_index(frame, ((pix >> (4 * bit)) & 0xF) as u8) as usize];
+            bit += 1;
+            x += 1;
+        }
+        bit = 0;
+        sbyte += 1;
+    }
+}
+
+fn row_cga4(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], w: usize) {
+    // CGA's four colours are fixed, not DAC entries — encode them once per row.
+    let c: [u32; 4] = core::array::from_fn(|i| pal.fmt.encode(frame.cga_palette[i]));
+    let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 4);
+    for (x, px) in out.iter_mut().enumerate() {
+        let byte = frame.vram.get(bank + x / 4).copied().unwrap_or(0);
+        *px = c[((byte >> (6 - (x & 3) * 2)) & 0x03) as usize];
+    }
+}
+
+fn row_cga2(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], w: usize) {
+    let (bg, fg) = (pal.fmt.encode(frame.cga_palette[0]), pal.fmt.encode(frame.cga_palette[1]));
+    let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 8);
+    for (x, px) in out.iter_mut().enumerate() {
+        let byte = frame.vram.get(bank + x / 8).copied().unwrap_or(0);
+        *px = if byte & (0x80 >> (x & 7)) != 0 { fg } else { bg };
+    }
+}
+
+fn row_text(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], w: usize) {
+    let (trow, gy) = (sy / CELL_H, sy % CELL_H);
+    if frame.font.len() < 256 * 16 || trow >= TEXT_ROWS {
+        return;
+    }
+    let bg_mask = if frame.blink { 0x07 } else { 0x0F };
+    for col in 0..TEXT_COLS {
+        let cell = (trow * TEXT_COLS + col) * 2;
+        let (ch, attr) = match (frame.vram.get(cell), frame.vram.get(cell + 1)) {
+            (Some(&c), Some(&a)) => (c as usize, a),
+            _ => return,
+        };
+        let fg = pal.lut[(attr & 0x0F) as usize];
+        let bg = pal.lut[((attr >> 4) & bg_mask) as usize];
+        let bits = frame.font[ch * 16 + gy];
+        // VGA 9th-dot rule: the 9th column repeats the 8th ONLY for the
+        // line-draw block 0xC0..=0xDF, so box drawing joins seamlessly; every
+        // other glyph gets a blank 9th column for inter-character spacing.
+        let line_gfx = (0xC0..=0xDF).contains(&ch);
+        for gx in 0..CELL_W {
+            let x = col * CELL_W + gx;
+            if x >= w {
+                break;
+            }
+            let on = if gx < 8 { bits & (0x80 >> gx) != 0 } else { line_gfx && bits & 0x01 != 0 };
+            out[x] = if on { fg } else { bg };
+        }
+    }
+}
+
+fn row_svga(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], w: usize, bpp: u8, pitch: usize) {
+    let bpp8 = (bpp as usize).div_ceil(8);
+    let pitch = if pitch == 0 { w * bpp8 } else { pitch };
+    let vram = frame.vram;
+    let rd16 = |p: usize| (vram.get(p).copied().unwrap_or(0) as u16)
+        | ((vram.get(p + 1).copied().unwrap_or(0) as u16) << 8);
+    let base = sy * pitch;
+    for (x, px) in out.iter_mut().enumerate() {
+        let p = base + x * bpp8;
+        // 8bpp is a DAC index like every other mode; the direct-colour depths
+        // carry their own channels and need encoding per pixel.
+        *px = match bpp {
+            8 => pal.lut[vram.get(p).copied().unwrap_or(0) as usize],
+            15 => {
+                let v = rd16(p);
+                pal.fmt.encode(((((v >> 10) & 0x1F) as u32 * 255 / 31) << 16)
+                    | ((((v >> 5) & 0x1F) as u32 * 255 / 31) << 8)
+                    | ((v & 0x1F) as u32 * 255 / 31))
+            }
+            16 => {
+                let v = rd16(p);
+                pal.fmt.encode(((((v >> 11) & 0x1F) as u32 * 255 / 31) << 16)
+                    | ((((v >> 5) & 0x3F) as u32 * 255 / 63) << 8)
+                    | ((v & 0x1F) as u32 * 255 / 31))
+            }
+            _ => {
+                let b = vram.get(p).copied().unwrap_or(0) as u32;
+                let g = vram.get(p + 1).copied().unwrap_or(0) as u32;
+                let r = vram.get(p + 2).copied().unwrap_or(0) as u32;
+                pal.fmt.encode((r << 16) | (g << 8) | b)
+            }
+        };
+    }
+}
+
 /// Hand a rendered frame (`0x00RRGGBB` pixels, row-major) to the platform.
 pub fn present(w: usize, h: usize, px: &[u32]) {
     let p = PRESENT_SINK.load(core::sync::atomic::Ordering::Relaxed);
@@ -666,17 +881,22 @@ fn render_cga2(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
 /// (P6/P7), gated by the mode-control P5P4-select bit.
 #[inline]
 fn planar_rgb(frame: &Frame, val: u8) -> u32 {
+    pal_rgb(frame.palette, planar_index(frame, val))
+}
+
+/// The DAC index a 4-bit planar value selects, through the attribute
+/// controller palette and colour-select register.
+fn planar_index(frame: &Frame, val: u8) -> u8 {
     let ac = frame.ac;
     let pal = ac[(val & 0x0F) as usize] & 0x3F;
     let csel = ac[0x14];
     // Mode control (AC[0x10]) bit 7: take P4/P5 from colour-select instead of
     // the palette register. Standard 16-colour boot leaves it clear.
-    let idx = if ac[0x10] & 0x80 != 0 {
+    if ac[0x10] & 0x80 != 0 {
         (pal & 0x0F) | ((csel & 0x03) << 4) | ((csel & 0x0C) << 4)
     } else {
         pal | ((csel & 0x0C) << 4)
-    };
-    pal_rgb(frame.palette, idx)
+    }
 }
 
 /// Bit-spread LUT for planar→chunky: `SPREAD[b]` scatters the 8 bits of a plane
