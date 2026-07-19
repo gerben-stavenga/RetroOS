@@ -1684,19 +1684,25 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     crate::kernel::startup::bill_present();
     let prof = crate::kernel::startup::profile_enabled();
     let p0 = if prof { machine.rdtsc() } else { 0 };
-    let mut scratch = alloc::vec::Vec::new();
-    let Some(frame) = pc.vga.scanout(machine, regs, &mut scratch) else { return };
+    // Nothing here allocates per frame: both buffers live in PcMachine and are
+    // grown once, on the first frame of a mode. `render` clears the region it
+    // writes, so the buffer needs no pre-zeroing either.
+    let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
     let (w, h) = vga_render::dimensions(frame.mode);
-    let mut fb = alloc::vec![0u32; w * h];
+    let need = w * h;
+    if pc.present_fb.len() < need {
+        pc.present_fb.resize(need, 0);
+    }
+    let fb = &mut pc.present_fb[..need];
     let p2 = if prof { machine.rdtsc() } else { 0 };
-    vga_render::render(&frame, &mut fb);
+    vga_render::render(&frame, fb);
     let p3 = if prof { machine.rdtsc() } else { 0 };
-    vga_render::present(w, h, &fb);
+    vga_render::present(w, h, fb);
     let p4 = if prof { machine.rdtsc() } else { 0 };
     if prof {
         crate::kernel::startup::bill_display(
             p1.wrapping_sub(p0), p2.wrapping_sub(p1),
-            p3.wrapping_sub(p2), p4.wrapping_sub(p3), w * h);
+            p3.wrapping_sub(p2), p4.wrapping_sub(p3), need);
     }
 }
