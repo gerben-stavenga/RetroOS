@@ -335,7 +335,24 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         return;
     }
     let origin = (fb_h - out_h) / 2 * g.stride + (fb_w - out_w) / 2;
-    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+    // DIAGNOSTIC: with the RAM sink armed, blit into ordinary kernel memory
+    // instead of the mapped framebuffer. Same pixels, same loop — but no MMIO
+    // and, under QEMU, no display dirty-page tracking. The delta between the
+    // two is what the framebuffer itself costs us.
+    // Heap, not BSS: a 3 MB static array overruns the kernel's mapped image
+    // and the machine never boots. Allocated once, on first use.
+    static mut RAM_FB: *mut u32 = core::ptr::null_mut();
+    let out = if crate::kernel::startup::fb_to_ram() {
+        unsafe {
+            let slot = &raw mut RAM_FB;
+            if (*slot).is_null() {
+                *slot = alloc::vec![0u32; g.len].leak().as_mut_ptr();
+            }
+            core::slice::from_raw_parts_mut(*slot, g.len)
+        }
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) }
+    };
     // On a resolution change (a mode switch — e.g. text 720×400 → Mode-Y
     // 320×200), the centered image and its letterbox border move, so clear the
     // whole framebuffer once to drop stale pixels from the previous mode. This
@@ -422,7 +439,24 @@ fn flush() {
     let Some(g) = geom() else { return };
     // A DOS frame painted over us: wipe and repaint the whole console.
     if DOS_PAINTED.swap(false, core::sync::atomic::Ordering::Relaxed) {
-        let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+        // DIAGNOSTIC: with the RAM sink armed, blit into ordinary kernel memory
+    // instead of the mapped framebuffer. Same pixels, same loop — but no MMIO
+    // and, under QEMU, no display dirty-page tracking. The delta between the
+    // two is what the framebuffer itself costs us.
+    // Heap, not BSS: a 3 MB static array overruns the kernel's mapped image
+    // and the machine never boots. Allocated once, on first use.
+    static mut RAM_FB: *mut u32 = core::ptr::null_mut();
+    let out = if crate::kernel::startup::fb_to_ram() {
+        unsafe {
+            let slot = &raw mut RAM_FB;
+            if (*slot).is_null() {
+                *slot = alloc::vec![0u32; g.len].leak().as_mut_ptr();
+            }
+            core::slice::from_raw_parts_mut(*slot, g.len)
+        }
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) }
+    };
         out.fill(0);
         let sp = &raw mut SHADOW;
         unsafe { (*sp).fill(0) };
@@ -450,7 +484,24 @@ fn flush() {
         pixel_pan: 0,
         line_compare: usize::MAX,
     };
-    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+    // DIAGNOSTIC: with the RAM sink armed, blit into ordinary kernel memory
+    // instead of the mapped framebuffer. Same pixels, same loop — but no MMIO
+    // and, under QEMU, no display dirty-page tracking. The delta between the
+    // two is what the framebuffer itself costs us.
+    // Heap, not BSS: a 3 MB static array overruns the kernel's mapped image
+    // and the machine never boots. Allocated once, on first use.
+    static mut RAM_FB: *mut u32 = core::ptr::null_mut();
+    let out = if crate::kernel::startup::fb_to_ram() {
+        unsafe {
+            let slot = &raw mut RAM_FB;
+            if (*slot).is_null() {
+                *slot = alloc::vec![0u32; g.len].leak().as_mut_ptr();
+            }
+            core::slice::from_raw_parts_mut(*slot, g.len)
+        }
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) }
+    };
     let native = g.format.is_native();
     let mut cell_pixels = [0u32; CELL_W * CELL_H];
     for i in 0..80 * 25 {

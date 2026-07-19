@@ -18,6 +18,9 @@
 use crate::Regs;
 use crate::kernel::thread;
 
+/// F9 scancode (press) — blit frames to RAM instead of the framebuffer, a
+/// diagnostic that freezes the screen but isolates the blit's own cost.
+pub const F9_PRESS: u8 = 0x43;
 /// F10 scancode (press) — toggle the cycle/event profile dump.
 pub const F10_PRESS: u8 = 0x44;
 /// F11 scancode (press) — focus switch.
@@ -90,6 +93,7 @@ fn console_chord<A: crate::Arch>(
     dos: Option<&thread::DosState<A>>,
 ) -> bool {
     match sc {
+        F9_PRESS => crate::kernel::startup::toggle_fb_to_ram(),
         F10_PRESS => crate::kernel::startup::toggle_profile(),
         F11_PRESS => thread::request_switch(),
         F12_PRESS => crate::kernel::startup::dump_interrupted_thread(machine, regs, dos),

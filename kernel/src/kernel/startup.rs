@@ -832,6 +832,24 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// tick+display, audio_tick). Diagnostic only — read by the profile dump.
 static mut SLICE_PARTS: [u64; 3] = [0; 3];
 
+/// Diagnostic: blit frames into kernel RAM instead of the framebuffer, to
+/// separate our blit's cost from the framebuffer write path (MMIO, and under
+/// QEMU the display's dirty-page tracking). Toggled with F9.
+static mut FB_TO_RAM: bool = false;
+
+pub fn fb_to_ram() -> bool {
+    unsafe { core::ptr::read_volatile(&raw const FB_TO_RAM) }
+}
+
+pub fn toggle_fb_to_ram() {
+    let on = unsafe {
+        let v = !core::ptr::read_volatile(&raw const FB_TO_RAM);
+        core::ptr::write_volatile(&raw mut FB_TO_RAM, v);
+        v
+    };
+    crate::println!("[prof] frame blit → {}", if on { "RAM (screen frozen)" } else { "framebuffer" });
+}
+
 /// Count of actual frame presentations (past the frame_due gate), so the
 /// tick+display total can be divided by the right denominator.
 static mut PRESENTS: u64 = 0;
