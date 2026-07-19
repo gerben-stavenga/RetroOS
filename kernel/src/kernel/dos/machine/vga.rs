@@ -1675,7 +1675,15 @@ fn frame_due(now_ticks: u64) -> bool {
 /// Free when a real card scans out directly or no sink is installed.
 pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &Regs, now_ticks: u64) {
     use lib::vga_render;
-    if vga_present() || !vga_render::present_sink_installed() {
+    // A real card scans out its own memory — nothing to do. Otherwise we need
+    // somewhere to put the frame: a framebuffer we write into, or a window
+    // sink. (This used to test only the sink; when fbcon stopped registering
+    // one, every metal frame silently returned here.)
+    let direct = match crate::kernel::platform::get().display {
+        crate::kernel::platform::Display::Framebuffer(fb) => Some(fb),
+        _ => None,
+    };
+    if vga_present() || (direct.is_none() && !vga_render::present_sink_installed()) {
         return;
     }
     if !frame_due(now_ticks) {
@@ -1695,13 +1703,6 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     // palette, format and stretch in one pass per source row. That skips both
     // the full-frame RGB buffer and `render`'s per-pixel palette lookup. The
     // fallback below still covers split/panned frames and every other mode.
-    // A framebuffer we can write into directly: the kernel owns the whole
-    // pipeline — palette, format and scale — and the backend is told only that
-    // the frame is finished. No present callback, no full-frame intermediate.
-    let direct = match crate::kernel::platform::get().display {
-        crate::kernel::platform::Display::Framebuffer(fb) => Some(fb),
-        _ => None,
-    };
     if let Some(fb) = direct
         && matches!(frame.mode, vga_render::VgaMode::Mode13h)
         && frame.line_compare == usize::MAX
