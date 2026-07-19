@@ -441,8 +441,11 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
 
         // Advance this thread's world: virtual time, console input, delivery.
         thread.personality.on_slice(machine, &mut ctx.regs);
+        stats.part(machine, 0);
         crate::kernel::console::drain(machine, &mut ctx.regs, &mut thread.kernel, &mut thread.personality);
+        stats.part(machine, 1);
         thread.personality.after_input(machine, &mut thread.kernel, &mut ctx.regs);
+        stats.part(machine, 2);
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or F11 to move on.
@@ -859,6 +862,9 @@ struct EventStats {
     /// Cycles spent in `dispatch` per event kind — the same 11 slots as
     /// `counts`, so dividing one by the other gives cost-per-event.
     dispatch_cycles: [u64; 11],
+    /// The pre-phase, split three ways: on_slice, console drain, after_input.
+    pre_parts: [u64; 3],
+    part_mark: u64,
     slice_start: u64,
     last_idx: usize,
     last_kernel_entry: u64,
@@ -900,6 +906,8 @@ impl EventStats {
             pre_cycles: 0,
             post_cycles: 0,
             dispatch_cycles: [0; 11],
+            pre_parts: [0; 3],
+            part_mark: 0,
             slice_start: 0,
             last_idx: 0,
             last_kernel_entry: now,
@@ -931,6 +939,14 @@ impl EventStats {
             .post_cycles
             .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
         self.slice_start = now;
+        self.part_mark = now;
+    }
+
+    /// Close out one part of the pre-phase and open the next.
+    fn part<A: crate::Arch>(&mut self, machine: &mut A, i: usize) {
+        let now = machine.rdtsc();
+        self.pre_parts[i] = self.pre_parts[i].wrapping_add(now.wrapping_sub(self.part_mark));
+        self.part_mark = now;
     }
 
     fn iteration<A: crate::Arch>(&mut self, machine: &mut A) {
@@ -1054,6 +1070,9 @@ impl EventStats {
                     regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
                 crate::dbg_println!("[prof] dispatch cycles/event: in={} out={} irq={} softint={}",
                     cost(3), cost(4), cost(0), cost(1));
+                let ev = self.iterations.max(1);
+                crate::dbg_println!("[prof] pre cycles/event: on_slice={} drain={} after_input={}",
+                    self.pre_parts[0] / ev, self.pre_parts[1] / ev, self.pre_parts[2] / ev);
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
                     p.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1074,11 +1093,13 @@ impl EventStats {
             self.pre_cycles = 0;
             self.post_cycles = 0;
             self.dispatch_cycles = [0; 11];
+            self.pre_parts = [0; 3];
             self.counts = [0; 11];
             self.softint_by_vec = [0; 256];
             self.ports = [(0, 0, 0); 12];
             self.port_other = 0;
             self.last_profile_dump = now;
+            self.iterations = 0;
         }
     }
 }
