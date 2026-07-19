@@ -1681,6 +1681,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     if !frame_due(now_ticks) {
         return;
     }
+    crate::kernel::startup::bill_present();
     let mut scratch = alloc::vec::Vec::new();
     let Some(frame) = pc.vga.scanout(machine, regs, &mut scratch) else { return };
     let (w, h) = vga_render::dimensions(frame.mode);

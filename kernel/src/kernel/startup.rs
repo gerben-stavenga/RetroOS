@@ -832,6 +832,17 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// tick+display, audio_tick). Diagnostic only — read by the profile dump.
 static mut SLICE_PARTS: [u64; 3] = [0; 3];
 
+/// Count of actual frame presentations (past the frame_due gate), so the
+/// tick+display total can be divided by the right denominator.
+static mut PRESENTS: u64 = 0;
+
+pub fn bill_present() {
+    unsafe {
+        let p = &raw mut PRESENTS;
+        *p = (*p).wrapping_add(1);
+    }
+}
+
 pub fn bill_slice(take: u64, tickwork: u64, audio: u64) {
     unsafe {
         let p = &raw mut SLICE_PARTS;
@@ -1085,8 +1096,10 @@ impl EventStats {
                     cost(3), cost(4), cost(0), cost(1));
                 let ev = self.iterations.max(1);
                 let sp = unsafe { *(&raw const SLICE_PARTS) };
-                crate::dbg_println!("[prof] on_slice inner totals: take_ticks={} tick+display={} audio={}",
-                    sp[0], sp[1], sp[2]);
+                let np = unsafe { *(&raw const PRESENTS) };
+                unsafe { *(&raw mut PRESENTS) = 0 };
+                crate::dbg_println!("[prof] on_slice totals: take={} tick+display={} audio={} | presents={} = {}cyc each",
+                    sp[0], sp[1], sp[2], np, sp[1].checked_div(np.max(1)).unwrap_or(0));
                 unsafe { *(&raw mut SLICE_PARTS) = [0; 3] };
                 crate::dbg_println!("[prof] pre cycles/event: on_slice={} drain={} after_input={}",
                     self.pre_parts[0] / ev, self.pre_parts[1] / ev, self.pre_parts[2] / ev);
