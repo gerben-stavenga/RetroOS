@@ -435,6 +435,7 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
     let mut stats = EventStats::new(machine);
 
     loop {
+        stats.slice_begin(machine);
         stats.iteration(machine);
         let thread = ctx.thread(threads);
 
@@ -458,6 +459,7 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         let kevent = ctx.run(machine);
         stats.post_run(machine, &kevent, &ctx.regs);
         let action = dispatch(machine, thread, &mut ctx.regs, kevent);
+        stats.after_dispatch(machine);
 
         // Ask the scheduler.
         match crate::kernel::sched::verdict(machine, threads, &mut ctx.regs, ctx.tid, action) {
@@ -849,6 +851,16 @@ struct EventStats {
     last_free: usize,
     user_cycles: u64,
     kernel_cycles: u64,
+    /// Kernel time split by phase, to localize it: `pre` is the per-event
+    /// world-advance before the guest runs (on_slice, console drain,
+    /// after_input); `post` is dispatch + scheduler afterwards.
+    pre_cycles: u64,
+    post_cycles: u64,
+    /// Cycles spent in `dispatch` per event kind — the same 11 slots as
+    /// `counts`, so dividing one by the other gives cost-per-event.
+    dispatch_cycles: [u64; 11],
+    slice_start: u64,
+    last_idx: usize,
     last_kernel_entry: u64,
     last_profile_dump: u64,
     counts: [u32; 11], // irq, softint, hlt, in, out, ins, outs, fault, pf, exc, syscall
@@ -884,6 +896,11 @@ impl EventStats {
             last_free: free,
             user_cycles: 0,
             kernel_cycles: 0,
+            pre_cycles: 0,
+            post_cycles: 0,
+            dispatch_cycles: [0; 11],
+            slice_start: 0,
+            last_idx: 0,
             last_kernel_entry: now,
             last_profile_dump: now,
             counts: [0; 11],
@@ -891,6 +908,25 @@ impl EventStats {
             port_other: 0,
             softint_by_vec: [0; 256],
         }
+    }
+
+    /// Called right after `dispatch` returns: bills its cost to the event kind
+    /// that caused it, so cost-per-event falls out of cycles/count.
+    fn after_dispatch<A: crate::Arch>(&mut self, machine: &mut A) {
+        let now = machine.rdtsc();
+        self.dispatch_cycles[self.last_idx] = self.dispatch_cycles[self.last_idx]
+            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
+    }
+
+    /// Top of the loop: everything from here to `pre_run` is the per-event
+    /// world-advance.
+    fn slice_begin<A: crate::Arch>(&mut self, machine: &mut A) {
+        let now = machine.rdtsc();
+        // Whatever ran since the last post_run was dispatch + scheduler.
+        self.post_cycles = self
+            .post_cycles
+            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
+        self.slice_start = now;
     }
 
     fn iteration<A: crate::Arch>(&mut self, machine: &mut A) {
@@ -906,6 +942,9 @@ impl EventStats {
 
     fn pre_run<A: crate::Arch>(&mut self, machine: &mut A) {
         let now = machine.rdtsc();
+        self.pre_cycles = self
+            .pre_cycles
+            .wrapping_add(now.wrapping_sub(self.slice_start));
         self.kernel_cycles = self
             .kernel_cycles
             .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
@@ -970,11 +1009,18 @@ impl EventStats {
             KE::VifWindow { .. } | KE::VifStep => 1,
         };
         self.counts[idx] += 1;
+        self.last_idx = idx;
         if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
             if profile_enabled() {
                 let total = self.user_cycles.wrapping_add(self.kernel_cycles);
                 let user_pct = self.user_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
                 let kern_pct = self.kernel_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
+                let pre_pct = self.pre_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
+                let post_pct = self.post_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
+                // Average dispatch cost for the two hottest event kinds.
+                let cost = |i: usize| -> u64 {
+                    self.dispatch_cycles[i].checked_div(self.counts[i].max(1) as u64).unwrap_or(0)
+                };
                 let c = &self.counts;
                 // The three hottest vectors, so a polling loop names itself.
                 let mut top = [(0u32, 0usize); 3];
@@ -984,11 +1030,13 @@ impl EventStats {
                         top.sort_by(|a, b| b.0.cmp(&a.0));
                     }
                 }
-                crate::dbg_println!("[prof] user={}% kernel={}% irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
-                    user_pct, kern_pct,
+                crate::dbg_println!("[prof] user={}% kernel={}% (pre={}% post={}%) irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
+                    user_pct, kern_pct, pre_pct, post_pct,
                     c[0], c[1], c[2], c[3], c[4], c[5], c[6],
                     c[8], c[9], c[7], c[10], machine.get_ticks(),
                     regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
+                crate::dbg_println!("[prof] dispatch cycles/event: in={} out={} irq={} softint={}",
+                    cost(3), cost(4), cost(0), cost(1));
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
                     p.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1002,6 +1050,9 @@ impl EventStats {
             }
             self.user_cycles = 0;
             self.kernel_cycles = 0;
+            self.pre_cycles = 0;
+            self.post_cycles = 0;
+            self.dispatch_cycles = [0; 11];
             self.counts = [0; 11];
             self.softint_by_vec = [0; 256];
             self.ports = [(0, 0); 12];
