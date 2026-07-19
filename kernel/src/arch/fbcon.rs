@@ -367,19 +367,34 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         out.fill(0);
     }
     // This blit runs at the present rate on the guest thread, so its cost is
-    // stolen guest time — and once a present exceeds the ~14ms frame budget the
-    // guest starves. `encode` (a per-channel multiply/divide) run per *output*
-    // pixel dominated it. Hoist it: encode each *source* row once into a staging
-    // row, then scale that row to the panel with a plain native copy — the inner
-    // (per-output-pixel) loop is just a load + store. Fixed-point 16.16
-    // nearest-neighbour stepping; indices are provably in range (`sx>>16 < w`,
-    // `sy>>16 < h`, dst within `g.len`), so bounds checks are elided.
+    // stolen guest time — once a present exceeds the ~14 ms frame budget the
+    // guest starves.
+    //
+    // Row-at-a-time: scale each SOURCE row once into a full-width expanded row,
+    // then copy that row to every output row mapping to it. Two wins over
+    // scaling straight to the panel per output row:
+    //
+    //   * memory. The working set is ONE output row (4 KB at 1024 px), not a
+    //     frame-sized intermediate.
+    //   * work. The per-output-pixel indexed load — a gather with a fractional
+    //     step, which cannot vectorize — runs once per source row rather than
+    //     once per output row (200 x 1024 instead of 768 x 1024 here). The
+    //     remaining ~570 rows are a straight `copy_from_slice`.
+    //
+    // Format encoding folds into the same pass: the expanded row is built in
+    // the framebuffer's own format, so no separate encode-staging row is
+    // needed. Fixed-point 16.16 nearest-neighbour; indices are provably in
+    // range (`sx>>16 < w`, `sy>>16 < h`, dst within `g.len`), so bounds checks
+    // are elided.
     let x_step = ((w as u64) << 16) / out_w as u64;
     let y_step = ((h as u64) << 16) / out_h as u64;
     let native = g.format.is_native();
-    static mut ENC_ROW: [u32; 2048] = [0; 2048];
-    let enc_p = &raw mut ENC_ROW;
-    let enc = unsafe { &mut *enc_p };
+    // One output row, not one frame: 16 KB of BSS covers panels to 4096 px.
+    // (A frame-sized static does not fit the kernel image — it must be heap.)
+    const EXP_MAX: usize = 4096;
+    static mut EXP_ROW: [u32; EXP_MAX] = [0; EXP_MAX];
+    let exp_p = &raw mut EXP_ROW;
+    let exp = unsafe { &mut *exp_p };
     let mut sy = 0u64;
     let mut prev_sry = usize::MAX;
     for oy in 0..out_h {
@@ -387,27 +402,9 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         sy += y_step;
         let drow = origin + oy * g.stride;
         let dst = unsafe { out.get_unchecked_mut(drow..drow + out_w) };
-        if w <= enc.len() {
-            // Encode this source row once (a copy when already native), then the
-            // hot loop below scales from the staging row with no per-pixel encode.
-            if sry != prev_sry {
-                prev_sry = sry;
-                let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
-                if native {
-                    enc[..w].copy_from_slice(src_row);
-                } else {
-                    for (e, &p) in enc[..w].iter_mut().zip(src_row) {
-                        *e = g.format.encode(p);
-                    }
-                }
-            }
-            let mut sx = 0u64;
-            for d in dst.iter_mut() {
-                *d = unsafe { *enc.get_unchecked((sx >> 16) as usize) };
-                sx += x_step;
-            }
-        } else {
-            // Source wider than the staging row (never for our modes): direct.
+        if out_w > EXP_MAX {
+            // Panel wider than the expanded row (no panel we have): scale
+            // straight to the framebuffer.
             let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
             let mut sx = 0u64;
             for d in dst.iter_mut() {
@@ -415,7 +412,19 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
                 *d = if native { rgb } else { g.format.encode(rgb) };
                 sx += x_step;
             }
+            continue;
         }
+        if sry != prev_sry {
+            prev_sry = sry;
+            let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
+            let mut sx = 0u64;
+            for e in exp[..out_w].iter_mut() {
+                let rgb = unsafe { *src_row.get_unchecked((sx >> 16) as usize) };
+                *e = if native { rgb } else { g.format.encode(rgb) };
+                sx += x_step;
+            }
+        }
+        dst.copy_from_slice(unsafe { exp.get_unchecked(..out_w) });
     }
     // The framebuffer is Write-Combining: its stores sit in the CPU's WC buffers
     // until something drains them. A display controller scanning out (real metal)
