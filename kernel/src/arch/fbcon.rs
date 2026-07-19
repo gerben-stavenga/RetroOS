@@ -320,6 +320,27 @@ const EXP_MAX: usize = 4096;
 static mut EXP_ROW: [u32; EXP_MAX] = [0; EXP_MAX];
 const SRC_MAX: usize = 2048;
 
+/// The blit destination: the mapped framebuffer, or — with the F9 diagnostic
+/// armed — ordinary kernel memory. Same pixels either way; the RAM case has no
+/// MMIO and, under QEMU, no display dirty-page tracking, so the difference
+/// between the two is what the framebuffer path itself costs.
+fn blit_target(g: &Geom) -> &'static mut [u32] {
+    // Heap, not BSS: a frame-sized static overruns the kernel image and the
+    // machine never boots. Allocated once, on first use.
+    static mut RAM_FB: *mut u32 = core::ptr::null_mut();
+    if crate::kernel::startup::fb_to_ram() {
+        unsafe {
+            let slot = &raw mut RAM_FB;
+            if (*slot).is_null() {
+                *slot = alloc::vec![0u32; g.len].leak().as_mut_ptr();
+            }
+            core::slice::from_raw_parts_mut(*slot, g.len)
+        }
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) }
+    }
+}
+
 /// Largest 4:3 rectangle that fits the panel, and where it starts.
 ///
 /// DOS modes are authored for a 4:3 display with non-square pixels, so fitting
@@ -396,11 +417,10 @@ fn present_indexed_frame(w: usize, h: usize, src: &[u8], palette: &[u8; 768]) {
         }
     }
 
-    let runs = column_runs(w, out_w);
-    let Some(runs) = runs else {
+    let Some(runs) = column_runs(w, out_w) else {
         return; // geometry beyond the tables; the RGB path handles it
     };
-    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+    let out = blit_target(&g);
     let exp = unsafe { &mut *(&raw mut EXP_ROW) };
     let y_step = ((h as u64) << 16) / out_h as u64;
     let mut sy = 0u64;
@@ -451,24 +471,7 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         return;
     }
     let origin = (fb_h - out_h) / 2 * g.stride + (fb_w - out_w) / 2;
-    // DIAGNOSTIC: with the RAM sink armed, blit into ordinary kernel memory
-    // instead of the mapped framebuffer. Same pixels, same loop — but no MMIO
-    // and, under QEMU, no display dirty-page tracking. The delta between the
-    // two is what the framebuffer itself costs us.
-    // Heap, not BSS: a 3 MB static array overruns the kernel's mapped image
-    // and the machine never boots. Allocated once, on first use.
-    static mut RAM_FB: *mut u32 = core::ptr::null_mut();
-    let out = if crate::kernel::startup::fb_to_ram() {
-        unsafe {
-            let slot = &raw mut RAM_FB;
-            if (*slot).is_null() {
-                *slot = alloc::vec![0u32; g.len].leak().as_mut_ptr();
-            }
-            core::slice::from_raw_parts_mut(*slot, g.len)
-        }
-    } else {
-        unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) }
-    };
+    let out = blit_target(&g);
     // On a resolution change (a mode switch — e.g. text 720×400 → Mode-Y
     // 320×200), the centered image and its letterbox border move, so clear the
     // whole framebuffer once to drop stale pixels from the previous mode. This
