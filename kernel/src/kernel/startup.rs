@@ -830,7 +830,7 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// the loop body logic, not bookkeeping.
 /// on_slice's internals, billed from `thread.rs`: (take_pending_ticks,
 /// tick+display, audio_tick). Diagnostic only — read by the profile dump.
-static mut SLICE_PARTS: [u64; 3] = [0; 3];
+static mut SLICE_PARTS: [u64; 5] = [0; 5];
 
 /// Diagnostic: blit frames into kernel RAM instead of the framebuffer, to
 /// separate our blit's cost from the framebuffer write path (MMIO, and under
@@ -854,6 +854,21 @@ pub fn toggle_fb_to_ram() {
 /// tick+display total can be divided by the right denominator.
 static mut PRESENTS: u64 = 0;
 
+/// display_tick's internals: scanout, the per-frame vec alloc+zero, render,
+/// present — plus the source pixel count.
+static mut DISP_PARTS: [u64; 5] = [0; 5];
+
+pub fn bill_display(scanout: u64, alloc: u64, render: u64, present: u64, px: usize) {
+    unsafe {
+        let p = &raw mut DISP_PARTS;
+        (*p)[0] = (*p)[0].wrapping_add(scanout);
+        (*p)[1] = (*p)[1].wrapping_add(alloc);
+        (*p)[2] = (*p)[2].wrapping_add(render);
+        (*p)[3] = (*p)[3].wrapping_add(present);
+        (*p)[4] = px as u64;
+    }
+}
+
 pub fn bill_present() {
     unsafe {
         let p = &raw mut PRESENTS;
@@ -861,12 +876,16 @@ pub fn bill_present() {
     }
 }
 
-pub fn bill_slice(take: u64, tickwork: u64, audio: u64) {
+/// take, queue_tick loop, display_tick, audio, and the tick COUNT — so each
+/// gets divided by its own denominator instead of all by the present count.
+pub fn bill_slice2(take: u64, ticks_cyc: u64, display: u64, audio: u64, nticks: u64) {
     unsafe {
         let p = &raw mut SLICE_PARTS;
         (*p)[0] = (*p)[0].wrapping_add(take);
-        (*p)[1] = (*p)[1].wrapping_add(tickwork);
-        (*p)[2] = (*p)[2].wrapping_add(audio);
+        (*p)[1] = (*p)[1].wrapping_add(ticks_cyc);
+        (*p)[2] = (*p)[2].wrapping_add(display);
+        (*p)[3] = (*p)[3].wrapping_add(audio);
+        (*p)[4] = (*p)[4].wrapping_add(nticks);
     }
 }
 
@@ -1116,9 +1135,18 @@ impl EventStats {
                 let sp = unsafe { *(&raw const SLICE_PARTS) };
                 let np = unsafe { *(&raw const PRESENTS) };
                 unsafe { *(&raw mut PRESENTS) = 0 };
-                crate::dbg_println!("[prof] on_slice totals: take={} tick+display={} audio={} | presents={} = {}cyc each",
-                    sp[0], sp[1], sp[2], np, sp[1].checked_div(np.max(1)).unwrap_or(0));
-                unsafe { *(&raw mut SLICE_PARTS) = [0; 3] };
+                crate::dbg_println!(
+                    "[prof] on_slice: take={} | queue_tick={} over {} ticks = {}c each | display={} over {} presents = {}c each | audio={}",
+                    sp[0],
+                    sp[1], sp[4], sp[1].checked_div(sp[4].max(1)).unwrap_or(0),
+                    sp[2], np, sp[2].checked_div(np.max(1)).unwrap_or(0),
+                    sp[3]);
+                let dp = unsafe { *(&raw const DISP_PARTS) };
+                unsafe { *(&raw mut DISP_PARTS) = [0; 5] };
+                let per = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
+                crate::dbg_println!("[prof]   display/frame: scanout={} alloc={} render={} present={} (src {}px)",
+                    per(dp[0]), per(dp[1]), per(dp[2]), per(dp[3]), dp[4]);
+                unsafe { *(&raw mut SLICE_PARTS) = [0; 5] };
                 crate::dbg_println!("[prof] pre cycles/event: on_slice={} drain={} after_input={}",
                     self.pre_parts[0] / ev, self.pre_parts[1] / ev, self.pre_parts[2] / ev);
                 if c[3] + c[4] > 0 {

@@ -216,6 +216,7 @@ impl<A: crate::Arch> Personality<A> {
                 for _ in 0..ticks {
                     crate::kernel::dos::queue_tick(machine, dos);
                 }
+                let t1b = if prof { machine.rdtsc() } else { 0 };
                 if ticks > 0 {
                     // Present is driven off the absolute tick clock (the same one
                     // the 0x3DA vertical-retrace fabrication reads), so it fires on
@@ -227,8 +228,9 @@ impl<A: crate::Arch> Personality<A> {
                 crate::kernel::dos::audio_tick(machine, dos, regs);
                 if prof {
                     let t3 = machine.rdtsc();
-                    crate::kernel::startup::bill_slice(
-                        t1.wrapping_sub(t0), t2.wrapping_sub(t1), t3.wrapping_sub(t2));
+                    crate::kernel::startup::bill_slice2(
+                        t1.wrapping_sub(t0), t1b.wrapping_sub(t1),
+                        t2.wrapping_sub(t1b), t3.wrapping_sub(t2), ticks as u64);
                 }
             }
             Self::Linux(_) => {}
