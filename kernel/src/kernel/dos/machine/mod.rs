@@ -225,6 +225,8 @@ pub struct PcMachine {
     /// lifetime, which a field of `VgaState` could not satisfy.
     pub present_scratch: alloc::vec::Vec<u8>,
     pub present_fb: alloc::vec::Vec<u32>,
+    /// Blit scratch: the palette in framebuffer format, and one output row.
+    pub present_scratch2: crate::kernel::display::Scratch,
     /// Generic virtual 8237 DMA controller shadow — bus infrastructure
     /// shared by every DMA-using card model (SB today, GUS next), so it
     /// lives here rather than inside any one card.
@@ -436,6 +438,7 @@ impl PcMachine {
             vga: VgaState::new(),
             present_scratch: alloc::vec::Vec::new(),
             present_fb: alloc::vec::Vec::new(),
+            present_scratch2: crate::kernel::display::Scratch::new(),
             dma: Dma8237::new(),
             sb: SoundBlaster::new(),
             gus: Gus::new(),

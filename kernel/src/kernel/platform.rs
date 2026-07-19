@@ -42,9 +42,11 @@ pub enum Display {
     /// A real VGA card answered the SEQ-register probe: guests program the
     /// hardware directly (passthrough port window); console = VGA text.
     VgaCard,
-    /// No card, but the loader handed over a linear framebuffer (UEFI/GOP):
-    /// the kernel-emulated VGA renders through fbcon.
-    Framebuffer,
+    /// No card, but the loader handed over a linear framebuffer (UEFI/GOP) —
+    /// or a hosted window supplied one. The emulated VGA blits into it; the
+    /// descriptor travels with the verdict, so nothing has to call back to
+    /// find out where the pixels go.
+    Framebuffer(crate::kernel::display::Framebuffer),
     /// No card or framebuffer, but a host window installed a present sink
     /// (retroos-play): the emulated VGA renders into the window.
     HostWindow,
@@ -112,6 +114,8 @@ impl Display {
     pub fn vga_passthrough(self) -> bool {
         matches!(self, Display::VgaCard)
     }
+
+
 }
 
 /// Environment facts only the ENTRY crate knows — injected before `probe`
@@ -121,8 +125,10 @@ impl Display {
 /// substitute machine, so a `probe` without an entry is coherent, not UB.
 #[derive(Clone, Copy)]
 pub struct HostEnv {
-    /// Whether the loader handed over a GOP linear framebuffer (metal fbcon).
-    pub fbcon_active: fn() -> bool,
+    /// The framebuffer this backend presents into, if any: a GOP framebuffer
+    /// on metal, a window-sized buffer on hosted. Probed once — the kernel
+    /// writes into it directly rather than through a present callback.
+    pub framebuffer: fn() -> Option<crate::kernel::display::Framebuffer>,
     /// Where boot debug bytes were routed (recorded for policy).
     pub debug: DebugSink,
     /// True on the bare-metal backend (chooses Metal/Qemu vs Interp for host).
@@ -142,7 +148,7 @@ impl HostEnv {
 }
 
 static mut HOST_ENV: HostEnv = HostEnv {
-    fbcon_active: || false,
+    framebuffer: || None,
     debug: DebugSink::HostStdout,
     is_metal: false,
 };
@@ -185,8 +191,8 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
         // wins unconditionally — even when a legacy VGA card also answers its
         // I/O ports, the GOP framebuffer, not the dead legacy register file,
         // drives the panel (a UEFI laptop mislabelled `VgaCard` painted blank).
-        let display = if (env.fbcon_active)() {
-            Display::Framebuffer
+        let display = if let Some(fb) = (env.framebuffer)() {
+            Display::Framebuffer(fb)
         } else if lib::vga_render::present_sink_installed() {
             Display::HostWindow
         } else if vga_card_answers() {

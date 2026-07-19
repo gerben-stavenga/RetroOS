@@ -227,7 +227,7 @@ fn install_hosted_backend() {
         outsw: arch::outsw,
     });
     kernel::set_host_env(kernel::HostEnv {
-        fbcon_active: || false,
+        framebuffer: || None, // hosted still presents through the window sink
         debug: kernel::DebugSink::HostStdout,
         is_metal: false,
     });

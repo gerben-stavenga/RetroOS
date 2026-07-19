@@ -1695,12 +1695,22 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     // palette, format and stretch in one pass per source row. That skips both
     // the full-frame RGB buffer and `render`'s per-pixel palette lookup. The
     // fallback below still covers split/panned frames and every other mode.
-    if matches!(frame.mode, vga_render::VgaMode::Mode13h)
+    // A framebuffer we can write into directly: the kernel owns the whole
+    // pipeline — palette, format and scale — and the backend is told only that
+    // the frame is finished. No present callback, no full-frame intermediate.
+    let direct = match crate::kernel::platform::get().display {
+        crate::kernel::platform::Display::Framebuffer(fb) => Some(fb),
+        _ => None,
+    };
+    if let Some(fb) = direct
+        && matches!(frame.mode, vga_render::VgaMode::Mode13h)
         && frame.line_compare == usize::MAX
         && frame.pixel_pan == 0
         && frame.vram.len() >= frame.start_offset + w * h
-        && vga_render::present_indexed(w, h, &frame.vram[frame.start_offset..], frame.palette)
     {
+        crate::kernel::display::blit_indexed(
+            &mut pc.present_scratch2, &fb, &frame.vram[frame.start_offset..], w, h, frame.palette);
+        crate::kernel::display::present();
         if prof {
             let p4 = machine.rdtsc();
             crate::kernel::startup::bill_display(
@@ -1716,7 +1726,14 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     let p2 = if prof { machine.rdtsc() } else { 0 };
     vga_render::render(&frame, fb);
     let p3 = if prof { machine.rdtsc() } else { 0 };
-    vga_render::present(w, h, fb);
+    // Same destination question for the rendered-RGB path: blit it ourselves
+    // when we have a framebuffer, else hand it to the window sink.
+    if let Some(dfb) = direct {
+        crate::kernel::display::blit_rgb(&mut pc.present_scratch2, &dfb, fb, w, h);
+        crate::kernel::display::present();
+    } else {
+        vga_render::present(w, h, fb);
+    }
     let p4 = if prof { machine.rdtsc() } else { 0 };
     if prof {
         crate::kernel::startup::bill_display(

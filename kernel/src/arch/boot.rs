@@ -119,8 +119,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         inb: arch::inb, inw: arch::inw, inl: arch::inl, insw: arch::insw,
         outb: arch::outb, outw: arch::outw, outl: arch::outl, outsw: arch::outsw,
     });
+    crate::kernel::display::set_present_hook(crate::fbcon::present);
     crate::set_host_env(crate::HostEnv {
-        fbcon_active: crate::fbcon::active,
+        framebuffer: crate::fbcon::framebuffer,
         debug: crate::DebugSink::Debugcon,
         is_metal: true,
     });
