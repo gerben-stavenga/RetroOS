@@ -310,10 +310,14 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
     // kernel console and every DOS program share one screen, like VGA hardware.
     let aperture = paging2::vga_text_aperture_ppage();
     for i in 0..8 {
+        // Cacheable, FOREIGN: RAM we allocated (not a card's MMIO), shared with
+        // every DOS process, so no address space may free or COW it. It was
+        // uncached only because CACHE_DISABLE used to double as the
+        // "externally owned" marker — see `flags::FOREIGN`.
         paging2::map_user_page_phys(
             (paging2::LOW_MEM_BASE + 0xB8000) / PAGE_SIZE + i,
             aperture + i as u64,
-            paging2::flags::CACHE_DISABLE,
+            paging2::flags::FOREIGN,
         );
     }
     // alloc_contig doesn't zero — blank the text aperture (space, light-gray on

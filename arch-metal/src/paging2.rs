@@ -297,6 +297,21 @@ pub mod flags {
     /// framebuffer so linear blits burst instead of going out as per-pixel UC
     /// transactions. Only valid on a 4 KB leaf entry.
     pub const WRITE_COMBINE: u64 = 1 << 7;
+    /// Software flag: this frame is NOT owned by the address space mapping it —
+    /// never free it on unmap/teardown, never copy-on-write it on fork.
+    ///
+    /// That ownership question used to be answered by `CACHE_DISABLE`, on the
+    /// reasoning that externally-owned frames are MMIO. They mostly are, but not
+    /// always: the shared VGA text aperture is ordinary RAM shared by the kernel
+    /// console and every DOS process, and marking it uncached purely to protect
+    /// it cost a full memory transaction per byte (and disabled fast-string, so
+    /// a 4 KB scanout read measured ~2M cycles on real hardware). Splitting the
+    /// two lets a frame be cacheable AND externally owned.
+    /// Bit 11, not 10: `arch_abi::MAP_MMIO` is `1 << 10` and is passed through
+    /// the same `extra_flags` argument, so a FOREIGN mapping on bit 10 took the
+    /// MMIO branch and mapped the page NOT PRESENT — the console's first write
+    /// then faulted.
+    pub const FOREIGN: u64 = 1 << 11;
     /// Software read-only flag - page is semantically read-only
     /// When set, page can never become writable (e.g., .text, .rodata)
     /// When clear (default), page is semantically writable
@@ -1398,7 +1413,7 @@ fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
 
     for i in 0..src.len() {
         let mut e = src[i];
-        if e.present() && e.raw() & flags::CACHE_DISABLE == 0 {
+        if e.present() && e.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
             e.set_hw_writable(false);
             src[i].set_hw_writable(false);
             phys_mm::inc_shared_count(src[i].page());
@@ -1533,7 +1548,7 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
                 free_subtree(entries, child);
             } else if entries[child].present() {
                 // Leaf page — free unless MMIO (cache-disabled)
-                if entries[child].raw() & flags::CACHE_DISABLE == 0 {
+                if entries[child].raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
                     phys_mm::free_phys_page(entries[child].page());
                 }
                 entries[child] = E::default();
@@ -1754,7 +1769,10 @@ pub fn vga_text_aperture_ppage() -> u64 {
 pub fn map_vga_text_aperture_user() {
     let ap = vga_text_aperture_ppage();
     for i in 0..8usize {
-        map_user_page_phys(0xB8000 / PAGE_SIZE + i, ap + i as u64, flags::CACHE_DISABLE);
+        // Cacheable — this is RAM we allocated, not a card's MMIO — but FOREIGN,
+        // because the same frames are mapped into the kernel window and every
+        // other DOS process: no space may free or copy-on-write them.
+        map_user_page_phys(0xB8000 / PAGE_SIZE + i, ap + i as u64, flags::FOREIGN);
     }
 }
 
@@ -1790,7 +1808,7 @@ pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
             // clobbered frame's refcount never reaches zero and it leaks (mirror
             // unmap_range). Skip MMIO / externally-owned frames.
             let old = e[dst_vpage + i];
-            if old.present() && old.raw() & flags::CACHE_DISABLE == 0 {
+            if old.present() && old.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
                 phys_mm::free_phys_page(old.addr() >> 12);
             }
             e[dst_vpage + i] = e[src_vpage + i];
@@ -1801,7 +1819,7 @@ pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
             // clobbered frame's refcount never reaches zero and it leaks (mirror
             // unmap_range). Skip MMIO / externally-owned frames.
             let old = e[dst_vpage + i];
-            if old.present() && old.raw() & flags::CACHE_DISABLE == 0 {
+            if old.present() && old.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
                 phys_mm::free_phys_page(old.addr() >> 12);
             }
             e[dst_vpage + i] = e[src_vpage + i];
@@ -1837,7 +1855,7 @@ pub fn unmap_range(base_page: usize, num_pages: usize) {
                 let ent = e[base_page + i];
                 // MMIO / externally-owned (cache-disabled) frames are not
                 // ours to free — same rule as the address-space teardown.
-                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
                     phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry32::default();
@@ -1846,7 +1864,7 @@ pub fn unmap_range(base_page: usize, num_pages: usize) {
         Entries::E64(e) => {
             for i in 0..num_pages {
                 let ent = e[base_page + i];
-                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
                     phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 e[base_page + i] = Entry64::default();
@@ -1866,7 +1884,7 @@ pub fn map_fresh_range(base_page: usize, num_pages: usize) {
         Entries::E32(e) => {
             for i in 0..num_pages {
                 let ent = e[base_page + i];
-                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
                     phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
@@ -1876,7 +1894,7 @@ pub fn map_fresh_range(base_page: usize, num_pages: usize) {
         Entries::E64(e) => {
             for i in 0..num_pages {
                 let ent = e[base_page + i];
-                if ent.present() && ent.raw() & flags::CACHE_DISABLE == 0 {
+                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
                     phys_mm::free_phys_page(ent.addr() >> 12);
                 }
                 let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
