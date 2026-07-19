@@ -207,7 +207,12 @@ impl<A: crate::Arch> Personality<A> {
     pub fn on_slice(&mut self, machine: &mut A, regs: &mut Regs) {
         match self {
             Self::Dos(dos) => {
+                // Four rdtsc per event is ~3% of a core at this event rate, so
+                // the instrument only runs when someone is looking.
+                let prof = crate::kernel::startup::profile_enabled();
+                let t0 = if prof { machine.rdtsc() } else { 0 };
                 let ticks = machine.take_pending_ticks();
+                let t1 = if prof { machine.rdtsc() } else { 0 };
                 for _ in 0..ticks {
                     crate::kernel::dos::queue_tick(machine, dos);
                 }
@@ -217,8 +222,14 @@ impl<A: crate::Arch> Personality<A> {
                     // the emulated VGA frame boundary rather than a private rate.
                     crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
                 }
+                let t2 = if prof { machine.rdtsc() } else { 0 };
                 // Pump emulated-SB playback against the same virtual clock.
                 crate::kernel::dos::audio_tick(machine, dos, regs);
+                if prof {
+                    let t3 = machine.rdtsc();
+                    crate::kernel::startup::bill_slice(
+                        t1.wrapping_sub(t0), t2.wrapping_sub(t1), t3.wrapping_sub(t2));
+                }
             }
             Self::Linux(_) => {}
         }

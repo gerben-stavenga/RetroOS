@@ -828,6 +828,19 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// Event-loop diagnostics: per-event-type counts, user/kernel cycle split,
 /// the periodic [prof] dump, and the free-page low-water sampling. Keeps
 /// the loop body logic, not bookkeeping.
+/// on_slice's internals, billed from `thread.rs`: (take_pending_ticks,
+/// tick+display, audio_tick). Diagnostic only — read by the profile dump.
+static mut SLICE_PARTS: [u64; 3] = [0; 3];
+
+pub fn bill_slice(take: u64, tickwork: u64, audio: u64) {
+    unsafe {
+        let p = &raw mut SLICE_PARTS;
+        (*p)[0] = (*p)[0].wrapping_add(take);
+        (*p)[1] = (*p)[1].wrapping_add(tickwork);
+        (*p)[2] = (*p)[2].wrapping_add(audio);
+    }
+}
+
 /// Is the periodic `[prof]` dump on? Written by the console chord, read by
 /// the event loop — the same single-threaded volatile-flag shape as
 /// `thread::request_switch`.
@@ -844,7 +857,7 @@ pub fn toggle_profile() {
     crate::println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
 }
 
-fn profile_enabled() -> bool {
+pub fn profile_enabled() -> bool {
     unsafe { core::ptr::read_volatile(&raw const PROFILE_DUMP) }
 }
 
@@ -1071,6 +1084,10 @@ impl EventStats {
                 crate::dbg_println!("[prof] dispatch cycles/event: in={} out={} irq={} softint={}",
                     cost(3), cost(4), cost(0), cost(1));
                 let ev = self.iterations.max(1);
+                let sp = unsafe { *(&raw const SLICE_PARTS) };
+                crate::dbg_println!("[prof] on_slice inner totals: take_ticks={} tick+display={} audio={}",
+                    sp[0], sp[1], sp[2]);
+                unsafe { *(&raw mut SLICE_PARTS) = [0; 3] };
                 crate::dbg_println!("[prof] pre cycles/event: on_slice={} drain={} after_input={}",
                     self.pre_parts[0] / ev, self.pre_parts[1] / ev, self.pre_parts[2] / ev);
                 if c[3] + c[4] > 0 {
