@@ -293,6 +293,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
     // The emulated VGA's display sink: DOS screens (text or mode 13h) render
     // kernel-side through lib::vga_render and land here for the GOP blit.
     lib::vga_render::set_present_sink(present_dos_frame);
+    lib::vga_render::set_present_indexed_sink(present_indexed_frame);
     flush(); // render the boot backlog accumulated since `early`
 }
 
@@ -312,6 +313,121 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
 static DOS_PAINTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+
+/// One output row, shared by both sinks. 16 KB of BSS covers panels to 4096 px
+/// (a frame-sized buffer would not fit the kernel image at all).
+const EXP_MAX: usize = 4096;
+static mut EXP_ROW: [u32; EXP_MAX] = [0; EXP_MAX];
+const SRC_MAX: usize = 2048;
+
+/// Largest 4:3 rectangle that fits the panel, and where it starts.
+///
+/// DOS modes are authored for a 4:3 display with non-square pixels, so fitting
+/// the source to 4:3 — rather than scaling both axes equally — reproduces each
+/// mode's pixel aspect automatically: 320x200 comes out stretched 6/5 tall,
+/// 320x240 square, 360x400 wide, exactly as a VGA monitor showed them.
+fn out_geometry(g: &Geom, w: usize, h: usize) -> Option<(usize, usize, usize)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let fb_w = g.stride;
+    let fb_h = g.len / g.stride;
+    let (out_w, out_h) = if fb_w * 3 >= fb_h * 4 {
+        ((fb_h * 4 / 3).min(fb_w), fb_h) // wider than 4:3 -> pillarbox
+    } else {
+        (fb_w, (fb_w * 3 / 4).min(fb_h)) // taller -> letterbox
+    };
+    if out_w == 0 || out_h == 0 {
+        return None;
+    }
+    Some((out_w, out_h, (fb_h - out_h) / 2 * g.stride + (fb_w - out_w) / 2))
+}
+
+/// How many output columns each SOURCE column covers.
+///
+/// The horizontal map is a pure function of (w, out_w) — identical for every
+/// row and every frame — so it is built once per geometry rather than
+/// re-derived per pixel. It also inverts the inner loop: walking source columns
+/// and writing each one's run replaces a per-output-column indexed gather with
+/// one load and a short sequential fill.
+fn column_runs(w: usize, out_w: usize) -> Option<&'static [u16]> {
+    if w > SRC_MAX || out_w > EXP_MAX {
+        return None;
+    }
+    static mut RUNS: [u16; SRC_MAX] = [0; SRC_MAX];
+    static mut KEY: (usize, usize) = (0, 0);
+    let runs = unsafe { &mut *(&raw mut RUNS) };
+    if unsafe { *(&raw const KEY) } != (w, out_w) {
+        unsafe { *(&raw mut KEY) = (w, out_w) };
+        for r in runs[..w].iter_mut() {
+            *r = 0;
+        }
+        for ox in 0..out_w {
+            runs[ox * w / out_w] += 1;
+        }
+    }
+    Some(&runs[..w])
+}
+
+/// Present an 8-bit indexed frame, the whole pipeline in one pass per source
+/// row: palette -> panel format via a table, stretch, then copy the finished
+/// row down to every output row that maps to it.
+///
+/// The table is the point. Palette entries change rarely (a fade, a mode set);
+/// pixels are converted 64,000 times a frame. Building `palette -> panel u32`
+/// once when the DAC changes removes BOTH the per-pixel palette lookup and the
+/// per-pixel format encode — and with it the full-frame RGB intermediate that
+/// existed only to carry pixels between those two conversions.
+fn present_indexed_frame(w: usize, h: usize, src: &[u8], palette: &[u8; 768]) {
+    let Some(g) = geom() else { return };
+    let Some(geo) = out_geometry(&g, w, h) else { return };
+    let (out_w, out_h, origin) = geo;
+
+    // palette -> panel format, rebuilt only when the DAC actually changes.
+    static mut LUT: [u32; 256] = [0; 256];
+    static mut LUT_PAL: [u8; 768] = [0; 768];
+    let lut = unsafe { &mut *(&raw mut LUT) };
+    let cached = unsafe { &mut *(&raw mut LUT_PAL) };
+    if cached != palette {
+        cached.copy_from_slice(palette);
+        for (i, e) in lut.iter_mut().enumerate() {
+            let rgb = lib::vga_render::pal_rgb_at(palette, i as u8);
+            *e = if g.format.is_native() { rgb } else { g.format.encode(rgb) };
+        }
+    }
+
+    let runs = column_runs(w, out_w);
+    let Some(runs) = runs else {
+        return; // geometry beyond the tables; the RGB path handles it
+    };
+    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
+    let exp = unsafe { &mut *(&raw mut EXP_ROW) };
+    let y_step = ((h as u64) << 16) / out_h as u64;
+    let mut sy = 0u64;
+    let mut prev_sry = usize::MAX;
+    for oy in 0..out_h {
+        let sry = (sy >> 16) as usize;
+        sy += y_step;
+        let drow = origin + oy * g.stride;
+        let dst = unsafe { out.get_unchecked_mut(drow..drow + out_w) };
+        if sry != prev_sry {
+            prev_sry = sry;
+            let row = unsafe { src.get_unchecked(sry * w..sry * w + w) };
+            let mut o = 0usize;
+            for i in 0..w {
+                let v = unsafe { *lut.get_unchecked(*row.get_unchecked(i) as usize) };
+                let n = unsafe { *runs.get_unchecked(i) } as usize;
+                for e in unsafe { exp.get_unchecked_mut(o..o + n) } {
+                    *e = v;
+                }
+                o += n;
+            }
+        }
+        dst.copy_from_slice(unsafe { exp.get_unchecked(..out_w) });
+    }
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)); }
+    DOS_PAINTED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 
 fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     let Some(g) = geom() else { return };
@@ -386,15 +502,38 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
     // needed. Fixed-point 16.16 nearest-neighbour; indices are provably in
     // range (`sx>>16 < w`, `sy>>16 < h`, dst within `g.len`), so bounds checks
     // are elided.
-    let x_step = ((w as u64) << 16) / out_w as u64;
     let y_step = ((h as u64) << 16) / out_h as u64;
     let native = g.format.is_native();
     // One output row, not one frame: 16 KB of BSS covers panels to 4096 px.
     // (A frame-sized static does not fit the kernel image — it must be heap.)
     const EXP_MAX: usize = 4096;
     static mut EXP_ROW: [u32; EXP_MAX] = [0; EXP_MAX];
-    let exp_p = &raw mut EXP_ROW;
-    let exp = unsafe { &mut *exp_p };
+    // How many output columns each SOURCE column covers. The horizontal map is
+    // a pure function of (w, out_w) — the same for every row and every frame —
+    // so it is computed once per geometry instead of re-derived per pixel. That
+    // also inverts the inner loop: walking source columns and writing each
+    // one's run turns 1024 indexed gathers per row into 320 loads and 1024
+    // sequential stores.
+    const SRC_MAX: usize = 2048;
+    static mut RUNS: [u16; SRC_MAX] = [0; SRC_MAX];
+    static mut RUNS_KEY: (usize, usize) = (0, 0);
+
+    let exp = unsafe { &mut *(&raw mut EXP_ROW) };
+    let runs = unsafe { &mut *(&raw mut RUNS) };
+    let runs_ok = w <= SRC_MAX && out_w <= EXP_MAX;
+    if runs_ok && unsafe { *(&raw const RUNS_KEY) } != (w, out_w) {
+        unsafe { *(&raw mut RUNS_KEY) = (w, out_w) };
+        // Column ox samples source column (ox * w) / out_w; count how many
+        // consecutive ox share each source column.
+        for r in runs[..w].iter_mut() {
+            *r = 0;
+        }
+        for ox in 0..out_w {
+            let sc = ox * w / out_w;
+            runs[sc] += 1;
+        }
+    }
+
     let mut sy = 0u64;
     let mut prev_sry = usize::MAX;
     for oy in 0..out_h {
@@ -402,9 +541,10 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         sy += y_step;
         let drow = origin + oy * g.stride;
         let dst = unsafe { out.get_unchecked_mut(drow..drow + out_w) };
-        if out_w > EXP_MAX {
-            // Panel wider than the expanded row (no panel we have): scale
-            // straight to the framebuffer.
+        if !runs_ok {
+            // Geometry beyond the tables (no panel we have): sample per output
+            // column straight to the framebuffer.
+            let x_step = ((w as u64) << 16) / out_w as u64;
             let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
             let mut sx = 0u64;
             for d in dst.iter_mut() {
@@ -417,11 +557,28 @@ fn present_dos_frame(w: usize, h: usize, px: &[u32]) {
         if sry != prev_sry {
             prev_sry = sry;
             let src_row = unsafe { px.get_unchecked(sry * w..sry * w + w) };
-            let mut sx = 0u64;
-            for e in exp[..out_w].iter_mut() {
-                let rgb = unsafe { *src_row.get_unchecked((sx >> 16) as usize) };
-                *e = if native { rgb } else { g.format.encode(rgb) };
-                sx += x_step;
+            // One load per SOURCE pixel, then its run of identical output
+            // pixels written sequentially — no gather, no per-pixel stepping,
+            // and the format test hoisted out of both loops.
+            let mut o = 0usize;
+            if native {
+                for i in 0..w {
+                    let v = unsafe { *src_row.get_unchecked(i) };
+                    let n = runs[i] as usize;
+                    for e in unsafe { exp.get_unchecked_mut(o..o + n) } {
+                        *e = v;
+                    }
+                    o += n;
+                }
+            } else {
+                for i in 0..w {
+                    let v = g.format.encode(unsafe { *src_row.get_unchecked(i) });
+                    let n = runs[i] as usize;
+                    for e in unsafe { exp.get_unchecked_mut(o..o + n) } {
+                        *e = v;
+                    }
+                    o += n;
+                }
             }
         }
         dst.copy_from_slice(unsafe { exp.get_unchecked(..out_w) });

@@ -458,6 +458,12 @@ fn c6to8(v: u8) -> u32 {
 
 /// Pack a palette entry `idx` (0..255) from `palette` into `0x00RRGGBB`.
 #[inline]
+/// One DAC entry as `0x00RRGGBB`. Public so a sink can build its own
+/// palette->panel-format table.
+pub fn pal_rgb_at(palette: &[u8; 768], idx: u8) -> u32 {
+    pal_rgb(palette, idx)
+}
+
 fn pal_rgb(palette: &[u8; 768], idx: u8) -> u32 {
     let o = idx as usize * 3;
     (c6to8(palette[o]) << 16) | (c6to8(palette[o + 1]) << 8) | c6to8(palette[o + 2])
@@ -484,6 +490,32 @@ pub fn set_present_sink(f: fn(usize, usize, &[u32])) {
 /// Whether a sink is installed — lets the renderer skip work entirely.
 pub fn present_sink_installed() -> bool {
     PRESENT_SINK.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Sink for INDEXED frames: 8-bit source pixels plus the DAC palette, handed
+/// over without an RGB intermediate. The sink owns the panel's pixel format, so
+/// it can fold palette lookup and format encoding into one 256-entry table
+/// built when the palette changes — instead of converting every pixel twice,
+/// every frame (palette -> 0x00RRGGBB here, then -> panel format there).
+static PRESENT_INDEXED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the indexed sink. Optional: a backend without one just gets the
+/// rendered-RGB path.
+pub fn set_present_indexed_sink(f: fn(usize, usize, &[u8], &[u8; 768])) {
+    PRESENT_INDEXED.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Hand an 8-bit indexed frame to the platform. `false` when no indexed sink is
+/// installed, so the caller falls back to render-then-present.
+pub fn present_indexed(w: usize, h: usize, src: &[u8], palette: &[u8; 768]) -> bool {
+    let p = PRESENT_INDEXED.load(core::sync::atomic::Ordering::Relaxed);
+    if p == 0 || src.len() < w * h {
+        return false;
+    }
+    let f: fn(usize, usize, &[u8], &[u8; 768]) = unsafe { core::mem::transmute(p) };
+    f(w, h, src, palette);
+    true
 }
 
 /// Hand a rendered frame (`0x00RRGGBB` pixels, row-major) to the platform.

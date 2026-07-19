@@ -1690,6 +1690,24 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
     let (w, h) = vga_render::dimensions(frame.mode);
+    // Mode 13h with no split screen and no pixel pan — the ordinary case for
+    // every game — hands the INDEXED pixels straight to the sink, which does
+    // palette, format and stretch in one pass per source row. That skips both
+    // the full-frame RGB buffer and `render`'s per-pixel palette lookup. The
+    // fallback below still covers split/panned frames and every other mode.
+    if matches!(frame.mode, vga_render::VgaMode::Mode13h)
+        && frame.line_compare == usize::MAX
+        && frame.pixel_pan == 0
+        && frame.vram.len() >= frame.start_offset + w * h
+        && vga_render::present_indexed(w, h, &frame.vram[frame.start_offset..], frame.palette)
+    {
+        if prof {
+            let p4 = machine.rdtsc();
+            crate::kernel::startup::bill_display(
+                p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), w * h);
+        }
+        return;
+    }
     let need = w * h;
     if pc.present_fb.len() < need {
         pc.present_fb.resize(need, 0);
