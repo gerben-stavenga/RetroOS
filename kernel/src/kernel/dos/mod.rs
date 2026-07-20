@@ -1381,17 +1381,11 @@ fn dos_set_program_block_owner<A: crate::Arch>(machine: &mut A, dos: &mut DosSta
 }
 
 fn dos_keep_resident_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16, owner: u16) {
-    let clamped = paras.min(0xA000u16.saturating_sub(seg));
-    if clamped == 0 {
-        // TEMPORARY DIAGNOSTIC (forced): a resident block at/above 0xA000 is
-        // silently dropped here — the conventional chain cannot hold it. If
-        // this fires, a TSR reported success while nothing was kept.
-        crate::dbg_println!(
-            "D21 31 TSR: block seg={:04X}+{:04X} DROPPED (>= A000, not recorded)", seg, paras);
+    let paras = paras.min(0xA000u16.saturating_sub(seg));
+    if paras == 0 {
         sync_mcb_chain(machine, dos, regs);
         return;
     }
-    let paras = clamped;
 
     dos.dos_blocks.push(DosMemBlock { seg, paras, owner });
     sync_heap_seg(dos);

@@ -1390,13 +1390,6 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // remain valid because the IVT is part of the address space and the
         // child's code at heap_seg+offset is still mapped.
         0x31 => {
-            // TEMPORARY DIAGNOSTIC (forced): why does a TSR vanish on the
-            // UEFI/substitute-BIOS path but not on native BIOS? Prints on
-            // every AH=31h so the failing run says whether the TSR took the
-            // in-process keep path at all, and where its block sits.
-            dos_trace!(force "D21 31 TSR: psp={:04X} keep={:04X} paras heap={:04X} exec_parent={}",
-                dos.current_psp, regs.rdx as u16, dos.heap_seg,
-                if dos.exec_parent.is_some() { "yes(in-process)" } else { "NO(cross-thread: block is DISCARDED)" });
             if let Some(parent) = dos.exec_parent.take() {
                 let keep = regs.rdx as u16;
                 // DX is paragraphs from the *child's* PSP, not from parent's
@@ -1417,9 +1410,6 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 // trampoline.
                 let action = exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/true);
                 dos_keep_resident_block(machine, dos, regs, child_psp_seg, keep, child_psp_seg);
-            TSR_RANGE.store(((child_psp_seg as u32) << 16) | keep as u32,
-                core::sync::atomic::Ordering::Relaxed);
-            dump_tsr_vectors(machine, "just after TSR");
                 dos_trace!("D21 31 TSR kept resident block {:04X}+{:04X} top={:04X}",
                     child_psp_seg, keep, resident_top);
                 return action;
@@ -2695,7 +2685,6 @@ fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cm
 /// which interprets BAT itself and uses synth INT 31h AH=01h to
 /// fork+exec+wait each external command in a separate thread.
 fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
-    dump_tsr_vectors(machine, "at next EXEC");
     let al = regs.rax as u8;
     match al {
         0x00 => {}                                  // load & execute — fall through
@@ -3567,39 +3556,6 @@ pub(super) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, seg: u16) {
 
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;
 pub(crate) const STUB_SEG: u16 = (LOW_MEM_BASE >> 4) as u16;
-
-/// TEMPORARY DIAGNOSTIC: the segment range of the last TSR that went
-/// resident, as (seg << 16) | paras. Zero = none seen yet.
-static TSR_RANGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// TEMPORARY DIAGNOSTIC: how many IVT entries currently point INTO the last
-/// resident TSR, and which. A TSR is discoverable only through the vectors it
-/// hooked, so if this count is non-zero right after AH=31h and zero when the
-/// next program starts, something reverted the hooks between the two — which
-/// is exactly what "UltraMID not found" looks like from the guest.
-fn dump_tsr_vectors<A: crate::Arch>(machine: &mut A, tag: &str) {
-    let packed = TSR_RANGE.load(core::sync::atomic::Ordering::Relaxed);
-    if packed == 0 {
-        return;
-    }
-    let (seg, paras) = ((packed >> 16) as u16, packed as u16);
-    let hi = seg.saturating_add(paras);
-    let mut hooked = [0u8; 12];
-    let mut n = 0usize;
-    for v in 0..256u32 {
-        let s = machine.read::<u16>((v * 4 + 2) as usize);
-        if s >= seg && s < hi {
-            if n < hooked.len() {
-                hooked[n] = v as u8;
-            }
-            n += 1;
-        }
-    }
-    crate::dbg_println!(
-        "[tsrvec] {}: {} vector(s) into TSR {:04X}..{:04X} -> {:02X?}",
-        tag, n, seg, hi, &hooked[..n.min(hooked.len())]);
-}
-
 
 /// RM alias segment for the CONTROL view of the stub array. The ONE 256-slot
 /// `CD 31` array serves two namespaces, separated purely by how its bytes are
