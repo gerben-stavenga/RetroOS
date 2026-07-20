@@ -84,6 +84,7 @@ impl Volume {
         if inside.is_empty() {
             return 0;
         }
+        crate::kernel::iostat::vol_read(inside.len().div_ceil(512) as u64);
         self.disk.read(self.start + lba, inside)
     }
 

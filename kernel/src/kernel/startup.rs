@@ -932,12 +932,6 @@ impl EventStats {
     /// Profile dump cadence. Roughly assume 2 GHz host; only used to format
     /// the dump as seconds. Off by a constant factor but the ratio is exact.
     const PROFILE_DUMP_CYCLES: u64 = 2_000_000_000;
-    /// Emit the periodic `[prof]` line. Off by default — it floods the kernel
-    /// log (and the `LOG` ring buffer); flip to true to profile the event loop.
-    /// Whether to emit it — toggled at runtime by the F10 console chord
-    /// (see `kernel::console`), so a run can be profiled without a rebuild.
-    /// Off at boot: the dump is noise unless you asked for it.
-
     fn new<A: crate::Arch>(machine: &mut A) -> Self {
         let free = machine.free_page_count();
         let now = machine.rdtsc();
@@ -1104,7 +1098,7 @@ impl EventStats {
                 for (v, &n) in self.softint_by_vec.iter().enumerate() {
                     if n > top[2].0 {
                         top[2] = (n, v);
-                        top.sort_by(|a, b| b.0.cmp(&a.0));
+                        top.sort_by_key(|e| core::cmp::Reverse(e.0));
                     }
                 }
                 crate::dbg_println!("[prof] user={}% kernel={}% (pre={}% post={}%) irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
@@ -1115,26 +1109,26 @@ impl EventStats {
                 crate::dbg_println!("[prof] dispatch cycles/event: in={} out={} irq={} softint={}",
                     cost(3), cost(4), cost(0), cost(1));
                 let ev = self.iterations.max(1);
-                let sp = unsafe { *(&raw const SLICE_PARTS) };
-                let np = unsafe { *(&raw const PRESENTS) };
-                unsafe { *(&raw mut PRESENTS) = 0 };
+                let sp = unsafe { SLICE_PARTS };
+                let np = unsafe { PRESENTS };
+                unsafe { PRESENTS = 0 };
                 crate::dbg_println!(
                     "[prof] on_slice: take={} | queue_tick={} over {} ticks = {}c each | display={} over {} presents = {}c each | audio={}",
                     sp[0],
                     sp[1], sp[4], sp[1].checked_div(sp[4].max(1)).unwrap_or(0),
                     sp[2], np, sp[2].checked_div(np.max(1)).unwrap_or(0),
                     sp[3]);
-                let dp = unsafe { *(&raw const DISP_PARTS) };
-                unsafe { *(&raw mut DISP_PARTS) = [0; 5] };
+                let dp = unsafe { DISP_PARTS };
+                unsafe { DISP_PARTS = [0; 5] };
                 let per = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
                 crate::dbg_println!("[prof]   display/frame: scanout={} alloc={} render={} present={} (src {}px)",
                     per(dp[0]), per(dp[1]), per(dp[2]), per(dp[3]), dp[4]);
-                unsafe { *(&raw mut SLICE_PARTS) = [0; 5] };
+                unsafe { SLICE_PARTS = [0; 5] };
                 crate::dbg_println!("[prof] pre cycles/event: on_slice={} drain={} after_input={}",
                     self.pre_parts[0] / ev, self.pre_parts[1] / ev, self.pre_parts[2] / ev);
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
-                    p.sort_by(|a, b| b.1.cmp(&a.1));
+                    p.sort_by_key(|e| core::cmp::Reverse(e.1));
                     let per = |e: (u16, u32, u64)| e.2.checked_div(e.1.max(1) as u64).unwrap_or(0);
                     crate::dbg_println!(
                         "[prof] ports: {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c other={}",
@@ -1146,6 +1140,21 @@ impl EventStats {
                     crate::dbg_println!("[prof] hottest INT (service, not the 31h trampoline): {:02X}h={} {:02X}h={} {:02X}h={}",
                         top[0].1, top[0].0, top[1].1, top[1].0, top[2].1, top[2].0);
                 }
+                // Disk I/O per directory entry — the ratio that says whether a
+                // slow listing is MANY reads (cache) or SLOW reads (driver).
+                let io = crate::kernel::iostat::snapshot();
+                if io.vol_reads > 0 || io.dirents > 0 {
+                    let per = |v: u64| v.checked_div(io.dirents.max(1)).unwrap_or(0);
+                    crate::dbg_println!(
+                        "[io] reads={} ({} sectors, {} sec/read) bread={} | readdir: opens={} entries={} => {} reads/entry | resolve={} symprobe={} ({} probes/resolve) stat={}",
+                        io.vol_reads, io.vol_sectors,
+                        io.vol_sectors.checked_div(io.vol_reads.max(1)).unwrap_or(0),
+                        io.breads, io.dir_opens, io.dirents, per(io.vol_reads),
+                        io.resolves, io.symlink_probes,
+                        io.symlink_probes.checked_div(io.resolves.max(1)).unwrap_or(0),
+                        io.stats);
+                }
+                crate::kernel::iostat::reset();
             }
             self.user_cycles = 0;
             self.kernel_cycles = 0;

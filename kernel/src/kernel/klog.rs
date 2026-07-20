@@ -181,21 +181,28 @@ impl Filesystem for KLogFs {
         read_bytes(offset, &mut buf[..n])
     }
 
-    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        if !dir.is_empty() || index >= KLOG_NAMES.len() {
+    fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
+        if !dir.is_empty() {
             return None;
         }
-        let name = KLOG_NAMES[index];
-        let len = name.len().min(100);
-        let mut de = DirEntry {
-            name: [0; 100],
-            name_len: len,
-            size: byte_len(),
-            is_dir: false,
-            mode: 0o444,
-        };
-        de.name[..len].copy_from_slice(&name[..len]);
-        Some(de)
+        // A fixed handful of synthetic names, so the cookie is just the index.
+        for (i, name) in KLOG_NAMES.iter().enumerate().skip(cookie as usize) {
+            if out.len() >= max {
+                return Some(i as u64);
+            }
+            let len = name.len().min(100);
+            let mut de = DirEntry {
+                name: [0; 100],
+                name_len: len,
+                size: byte_len(),
+                is_dir: false,
+                mode: 0o444,
+                mtime: 0,
+            };
+            de.name[..len].copy_from_slice(&name[..len]);
+            out.push(de);
+        }
+        None
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {

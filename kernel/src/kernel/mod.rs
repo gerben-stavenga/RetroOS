@@ -23,6 +23,7 @@ pub mod io_policy;
 pub mod platform;
 
 // ── Diagnostics ─────────────────────────────────────────────────────────
+pub mod iostat;
 pub mod klog;
 pub mod stacktrace;
 

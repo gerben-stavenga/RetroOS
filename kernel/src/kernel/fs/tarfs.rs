@@ -31,6 +31,8 @@ struct IndexEntry {
     link_len: u16,
     /// POSIX mode bits from USTAR header (filemode field, parsed octal).
     mode: u16,
+    /// Unix epoch seconds from the USTAR mtime field; 0 = unknown.
+    mtime: u32,
 }
 
 pub struct TarFs {
@@ -77,6 +79,7 @@ impl TarFs {
                 link: entry.link,
                 link_len: entry.link_len as u16,
                 mode: entry.mode,
+                mtime: entry.mtime,
             });
             block = entry.next_block;
         }
@@ -121,6 +124,7 @@ impl TarFs {
             is_symlink: header.is_symlink(),
             link, link_len,
             mode: header.filemode(),
+            mtime: header.filemtime(),
         })
     }
 }
@@ -136,6 +140,7 @@ struct TarEntry {
     link: [u8; 100],
     link_len: usize,
     mode: u16,
+    mtime: u32,
 }
 
 /// Check if a TAR entry name is in the given directory.
@@ -217,12 +222,17 @@ impl Filesystem for TarFs {
         done as i32
     }
 
-    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        // Phase 1: collect unique subdirectory names from the in-memory
-        // index. Linear scan of RAM, no ATA reads. Vec-backed so a dir
-        // with many subdirs (or many files in TP70's case via Phase 2)
-        // doesn't get truncated.
-        let mut dirs: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    /// The whole archive index is in RAM, so one pass over it yields the
+    /// entire directory — subdirectories first, then files, matching the
+    /// order the old index-based version produced. `max` is honoured, but a
+    /// tar directory is small enough that the first batch normally finishes
+    /// it; the cookie is a logical entry index into that fixed sequence.
+    fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
+        let mut seen = 0u64; // entries passed over to reach the cookie
+        let start = cookie;
+
+        // Phase 1: unique subdirectory names. Linear scan of RAM, no ATA reads.
+        let mut dirs: Vec<&[u8]> = Vec::new();
         for entry in &self.index {
             let name = &entry.name[..entry.name_len as usize];
             if name.len() > dir.len() {
@@ -238,34 +248,42 @@ impl Filesystem for TarFs {
                 }
             }
         }
-
-        // Return directory entry if index falls in directory range
-        if index < dirs.len() {
-            let dir_name = dirs[index];
-            let len = dir_name.len().min(100);
-            let mut de = DirEntry { name: [0; 100], name_len: len, size: 0, is_dir: true, mode: 0o755 };
-            de.name[..len].copy_from_slice(&dir_name[..len]);
-            return Some(de);
+        for dir_name in dirs {
+            if seen >= start {
+                if out.len() >= max {
+                    return Some(seen);
+                }
+                let len = dir_name.len().min(100);
+                let mut de =
+                    DirEntry { name: [0; 100], name_len: len, size: 0, is_dir: true,
+                        mode: 0o755, mtime: 0 };
+                de.name[..len].copy_from_slice(&dir_name[..len]);
+                out.push(de);
+            }
+            seen += 1;
         }
 
-        // Phase 2: enumerate files in directory (also from index).
-        let file_idx = index - dirs.len();
-        let mut i = 0usize;
+        // Phase 2: files directly in this directory.
         for entry in &self.index {
             let name = &entry.name[..entry.name_len as usize];
             if let Some(basename) = entry_in_dir(name, dir) {
-                if i == file_idx {
+                if seen >= start {
+                    if out.len() >= max {
+                        return Some(seen);
+                    }
+                    let len = basename.len().min(100);
                     let mut de = DirEntry {
                         name: [0; 100],
-                        name_len: basename.len(),
+                        name_len: len,
                         size: entry.size,
                         is_dir: false,
                         mode: entry.mode,
+                        mtime: entry.mtime,
                     };
-                    de.name[..basename.len()].copy_from_slice(basename);
-                    return Some(de);
+                    de.name[..len].copy_from_slice(&basename[..len]);
+                    out.push(de);
                 }
-                i += 1;
+                seen += 1;
             }
         }
 

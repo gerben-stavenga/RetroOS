@@ -52,6 +52,39 @@ pub fn remove(path: &CStr) -> Result<()> {
 }
 
 /// POSIX mode bits, or `None` if the path can't be stat'ed.
+/// Everything a directory listing needs about one file.
+pub struct Stat {
+    pub size: u64,
+    /// Permission bits only (lower 12) — the file-type nibble is stripped.
+    pub mode: u16,
+    /// Modification time, seconds since the Unix epoch.
+    pub mtime: u32,
+}
+
+/// Size + mode + mtime from a SINGLE path resolution.
+///
+/// Prefer this over `File::open().size()` followed by `mode_get()`: those walk
+/// the path (resolving symlinks at every component) twice, and still don't
+/// yield a timestamp. On a directory listing that difference is the listing's
+/// whole cost.
+pub fn stat(path: &CStr) -> Option<Stat> {
+    let mut inode: sys::Ext4Inode = unsafe { core::mem::zeroed() };
+    let mut ino: u32 = 0;
+    let r = unsafe { sys::ext4_raw_inode_fill(path.as_ptr().cast(), &mut ino, &mut inode) };
+    if r != sys::EOK {
+        return None;
+    }
+    // Field-by-field reads: the struct is `packed`, so these must be copied
+    // out by value rather than referenced.
+    let (size_lo, size_hi) = (inode.size_lo, inode.size_hi);
+    let (mode, mtime) = (inode.mode, inode.modification_time);
+    Some(Stat {
+        size: u64::from(size_lo) | (u64::from(size_hi) << 32),
+        mode: mode & 0xFFF,
+        mtime,
+    })
+}
+
 pub fn mode_get(path: &CStr) -> Option<u32> {
     let mut mode = 0u32;
     (unsafe { sys::ext4_mode_get(path.as_ptr().cast(), &mut mode) } == sys::EOK).then_some(mode)
@@ -156,6 +189,24 @@ impl Dir {
     /// Does this path open as a directory? The cheap existence test.
     pub fn exists(path: &CStr) -> bool {
         Dir::open(path).is_ok()
+    }
+
+    /// The iteration cursor: lwext4's own byte offset into the directory.
+    ///
+    /// `ext4_dir_entry_next` resumes purely from this value — it fetches the
+    /// directory by inode NUMBER and inits its iterator directly at the
+    /// offset, walking none of the entries already returned. So saving this
+    /// and restoring it onto a freshly opened `Dir` continues enumeration in
+    /// O(1), which is what lets a batched readdir stay linear.
+    pub fn cookie(&self) -> u64 {
+        self.0.next_off
+    }
+
+    /// Resume iteration at a cookie previously returned by `cookie()`.
+    /// Passing anything else is meaningless: the value is a raw directory
+    /// offset, not an entry count.
+    pub fn seek(&mut self, cookie: u64) {
+        self.0.next_off = cookie;
     }
 }
 

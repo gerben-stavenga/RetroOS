@@ -209,6 +209,7 @@ impl Lwext4Fs {
 
     /// Is `rel`'s final component a symlink? (No-follow.)
     fn is_symlink(&self, rel: &[u8]) -> bool {
+        crate::kernel::iostat::symlink_probe();
         let mut buf = [0u8; 320];
         match self.cpath_nofollow(rel, &mut buf) {
             Some(cpath) => lwext4::is_symlink(cpath),
@@ -237,6 +238,7 @@ impl Lwext4Fs {
     /// the link was authored in when the partition was someone's `/`. Bounded by
     /// `MAX_HOPS` so a symlink loop terminates instead of hanging.
     fn resolve(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        crate::kernel::iostat::resolve();
         const MAX_HOPS: u32 = 16;
         let mut path = normalize(rel);
         let mut hops = 0;
@@ -358,58 +360,86 @@ impl Filesystem for Lwext4Fs {
         true
     }
 
-    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
+    fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
+        // Resolve the directory ONCE per batch, not once per entry.
+        //
+        // `cpath` chases symlinks by asking `is_symlink` about every prefix of
+        // the path, and each of those is a full lookup from the mount root.
+        // Calling it per entry re-resolved this same parent directory every
+        // time: measured at ~4 probes and ~12 device reads per entry, which
+        // was essentially all the disk traffic a listing generated. The parent
+        // cannot change while we walk it, so one resolution serves the batch.
+        let real_dir = self.real(dir);
         let mut buf = [0u8; 320];
-        let cpath = self.cpath(dir, &mut buf)?;
-        let d = lwext4::Dir::open(cpath).ok()?;
-        let mut i = 0usize;
-        let mut result = None;
-        for e in d {
+        let cpath = self.cpath_nofollow(&real_dir, &mut buf)?;
+        crate::kernel::iostat::dir_open();
+        let mut d = lwext4::Dir::open(cpath).ok()?;
+        // Resume exactly where the last batch stopped. The cookie IS lwext4's
+        // directory offset, so this costs one inode lookup — none of the
+        // entries already returned are re-walked.
+        if cookie != 0 {
+            d.seek(cookie);
+        }
+        while out.len() < max {
+            let Some(e) = d.next() else {
+                return None; // directory exhausted
+            };
             let name = e.name();
             if name == b"." || name == b".." || name.is_empty() {
                 continue;
             }
-            if i == index {
-                let mut rel = Vec::with_capacity(dir.len() + 1 + name.len());
-                rel.extend_from_slice(dir);
-                if !rel.is_empty() && *rel.last().unwrap() != b'/' {
-                    rel.push(b'/');
-                }
-                rel.extend_from_slice(name);
-                // A symlink must present its TARGET's identity: the dirent type
-                // says SYMLINK, and reporting that as a plain file made a
-                // symlinked directory list as a corrupt "file" whose bytes are
-                // the target path. Resolve, then classify off the real object.
-                let is_dir = if e.is_symlink {
-                    self.dir_exists(&rel)
-                } else {
-                    e.is_dir
-                };
-                let name_len = name.len().min(100);
-                let mut de = DirEntry {
-                    name: [0; 100],
-                    name_len,
-                    size: 0,
-                    is_dir,
-                    mode: if is_dir { 0o755 } else { 0o644 },
-                };
-                de.name[..name_len].copy_from_slice(&name[..name_len]);
-                // Size/mode for regular files: open the (resolved) child.
-                if !is_dir {
-                    let mut child = [0u8; 320];
-                    if let Some(cchild) = self.cpath(&rel, &mut child) {
-                        if let Ok(mut f) = lwext4::File::open(cchild, c"rb") {
-                            de.size = f.size() as u32;
-                            de.mode = Self::stat_mode(cchild, false);
-                        }
-                    }
-                }
-                result = Some(de);
-                break;
+            // The physical path of this child, built from the ALREADY-physical
+            // parent — so no prefix probing is needed. Only an entry the dirent
+            // itself calls a symlink needs resolving, and only then do we pay
+            // for it; a directory of ordinary files pays nothing.
+            let mut phys = Vec::with_capacity(real_dir.len() + 1 + name.len());
+            phys.extend_from_slice(&real_dir);
+            if !phys.is_empty() && *phys.last().unwrap() != b'/' {
+                phys.push(b'/');
             }
-            i += 1;
+            phys.extend_from_slice(name);
+            if e.is_symlink {
+                phys = self.real(&phys);
+            }
+            let mut child = [0u8; 320];
+            let cchild = self.cpath_nofollow(&phys, &mut child);
+            // A symlink must present its TARGET's identity: the dirent type
+            // says SYMLINK, and reporting that as a plain file made a
+            // symlinked directory list as a corrupt "file" whose bytes are
+            // the target path. Classify off the real object — which `phys`
+            // now names, so this costs no second resolution.
+            let is_dir = if e.is_symlink {
+                cchild.is_some_and(lwext4::Dir::exists)
+            } else {
+                e.is_dir
+            };
+            let name_len = name.len().min(100);
+            let mut de = DirEntry {
+                name: [0; 100],
+                name_len,
+                size: 0,
+                is_dir,
+                mode: if is_dir { 0o755 } else { 0o644 },
+                mtime: 0,
+            };
+            de.name[..name_len].copy_from_slice(&name[..name_len]);
+            // Size, mode and mtime for the (resolved) child in ONE inode read.
+            // This used to be `File::open` for the size plus `mode_get` for the
+            // mode — two full path resolutions per entry, each chasing symlinks
+            // component by component, and no timestamp to show for it.
+            if let Some(cchild) = cchild
+                && let Some(st) = { crate::kernel::iostat::stat(); lwext4::stat(cchild) }
+            {
+                de.mtime = st.mtime;
+                de.mode = st.mode;
+                if !is_dir {
+                    de.size = st.size as u32;
+                }
+            }
+            out.push(de);
+            crate::kernel::iostat::dirents(1);
         }
-        result // the Dir closed itself on drop
+        Some(d.cookie()) // the Dir closed itself on drop
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {

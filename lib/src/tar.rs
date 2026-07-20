@@ -79,6 +79,12 @@ impl TarHeader {
         (parse_octal(&self.filemode) & 0xFFF) as u16
     }
 
+    /// Modification time, seconds since the Unix epoch (USTAR octal field).
+    /// 0 when the archive omits it — callers read that as "unknown".
+    pub fn filemtime(&self) -> u32 {
+        parse_octal(&self.mtime).min(u32::MAX as u64) as u32
+    }
+
     /// Number of 512-byte blocks for file data
     pub fn data_blocks(&self) -> u32 {
         self.filesize().div_ceil(512) as u32

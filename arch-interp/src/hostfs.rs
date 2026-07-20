@@ -185,9 +185,9 @@ impl HostFs {
         let p = self.resolve(dir);
         let mut r = Reply::new();
         match nth_entry(&p, index as usize) {
-            Some((name, size, is_dir)) => {
+            Some((name, size, is_dir, mtime)) => {
                 let n = name.len().min(100);
-                r.i32(0).u8(n as u8).bytes(&name[..n]).u32(size).u8(is_dir as u8);
+                r.i32(0).u8(n as u8).bytes(&name[..n]).u32(size).u8(is_dir as u8).u32(mtime);
             }
             None => { r.i32(-1); } // end of directory (client reads only the status)
         }
@@ -229,16 +229,16 @@ impl HostFs {
     }
 
     /// readdir → (status, name, name_len, size, is_dir); status < 0 = end.
-    pub fn n_readdir(&self, dir: &[u8], index: usize) -> (i32, [u8; 100], usize, u32, bool) {
+    pub fn n_readdir(&self, dir: &[u8], index: usize) -> (i32, [u8; 100], usize, u32, bool, u32) {
         let p = self.resolve(dir);
         match nth_entry(&p, index) {
-            Some((name, size, is_dir)) => {
+            Some((name, size, is_dir, mtime)) => {
                 let n = name.len().min(100);
                 let mut nb = [0u8; 100];
                 nb[..n].copy_from_slice(&name[..n]);
-                (0, nb, n, size, is_dir)
+                (0, nb, n, size, is_dir, mtime)
             }
-            None => (-1, [0; 100], 0, 0, false),
+            None => (-1, [0; 100], 0, 0, false, 0),
         }
     }
 
@@ -304,8 +304,9 @@ pub fn host_open(path: &[u8]) -> (i32, u64, u32) {
 pub fn host_read(handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
     NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or(-5, |fs| fs.n_read(handle, offset, buf)))
 }
-pub fn host_readdir(dir: &[u8], index: usize) -> (i32, [u8; 100], usize, u32, bool) {
-    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or((-1, [0; 100], 0, 0, false), |fs| fs.n_readdir(dir, index)))
+pub fn host_readdir(dir: &[u8], index: usize) -> (i32, [u8; 100], usize, u32, bool, u32) {
+    NATIVE_HOSTFS
+        .with(|n| n.borrow().as_ref().map_or((-1, [0; 100], 0, 0, false, 0), |fs| fs.n_readdir(dir, index)))
 }
 pub fn host_dir_exists(path: &[u8]) -> bool {
     NATIVE_HOSTFS.with(|n| n.borrow().as_ref().is_some_and(|fs| fs.n_dir_exists(path)))
@@ -323,8 +324,8 @@ pub fn host_remove(path: &[u8]) -> i32 {
     NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(-1, |fs| fs.n_remove(path)))
 }
 
-/// Return the `index`-th directory entry as `(name_bytes, size, is_dir)`.
-fn nth_entry(dir: &Path, index: usize) -> Option<(Vec<u8>, u32, bool)> {
+/// Return the `index`-th directory entry as `(name_bytes, size, is_dir, mtime)`.
+fn nth_entry(dir: &Path, index: usize) -> Option<(Vec<u8>, u32, bool, u32)> {
     let entry = fs::read_dir(dir).ok()?.flatten().nth(index)?;
     // Follow symlinks: a symlink-to-dir must report as a directory so DOS/DN can
     // enter it (`/home/retroos` is full of them — GAMES entries, BORLANDC, TC…).
@@ -333,7 +334,14 @@ fn nth_entry(dir: &Path, index: usize) -> Option<(Vec<u8>, u32, bool)> {
     // still shows (as a file) instead of truncating the whole listing.
     let meta = fs::metadata(entry.path()).or_else(|_| entry.metadata()).ok()?;
     let name = entry.file_name().into_encoded_bytes();
-    Some((name, meta.len().min(u32::MAX as u64) as u32, meta.is_dir()))
+    // Unix epoch seconds; a pre-1970 or unreadable mtime reports 0 ("unknown"),
+    // which the DOS layer renders as a blank date rather than a bogus one.
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32);
+    Some((name, meta.len().min(u32::MAX as u64) as u32, meta.is_dir(), mtime))
 }
 
 /// Little-endian reply builder.

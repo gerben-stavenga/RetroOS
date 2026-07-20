@@ -44,6 +44,7 @@ for c in "$$ROOT"/src/*.c; do
     -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_HAVE_OWN_ERRNO=1 \
     -DCONFIG_DEBUG_PRINTF=0 -DCONFIG_DEBUG_ASSERT=0 \
     -DCONFIG_EXT4_BLOCKDEVS_COUNT=8 -DCONFIG_EXT4_MOUNTPOINTS_COUNT=8 \
+    -DCONFIG_BLOCK_DEV_CACHE_SIZE=512 \
     -c "$$c" -o "lwext4_obj/$$(basename $${c%.c}).o"
 done
 ld -r -m elf_i386 -o $(location lwext4.o) lwext4_obj/*.o

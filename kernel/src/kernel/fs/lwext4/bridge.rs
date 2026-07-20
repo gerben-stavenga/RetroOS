@@ -40,6 +40,7 @@ unsafe extern "C" fn bdev_bread(bdev: *mut Ext4Blockdev, buf: *mut u8, blk_id: u
     // omits — only its head path had it), so a hole never reaches the block
     // layer here. This is a plain device read.
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, blk_cnt as usize * 512) };
+    crate::kernel::iostat::bread();
     unsafe { vol_of(bdev) }.read(blk_id, slice);
     EOK
 }
@@ -124,9 +125,6 @@ fn part_size_from_superblock(vol: &Volume) -> Option<u64> {
     let blocks = (hi << 32) | rd32(0x04) as u64; // s_blocks_count
     blocks.checked_mul(1024u64 << log_bs)
 }
-
-/// Lexically fold `.` / `..` / empty segments out of a mount-relative path.
-/// A `..` above the mount root is clamped at the root (it can't escape the
 
 /// Register `vol` with lwext4 under `name`. False if the volume carries no ext
 /// superblock, or the library's device registry is full.

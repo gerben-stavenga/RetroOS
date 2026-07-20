@@ -71,8 +71,25 @@ pub trait Filesystem {
     /// Read from a file identified by handle at given byte offset (Tread).
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
 
-    /// Enumerate directory entries at index. Returns None at end.
-    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry>;
+    /// Append up to `max` directory entries to `out`, resuming at `cookie`
+    /// (`READDIR_START` begins a fresh enumeration). Returns the cookie to
+    /// resume from, or `None` once the directory is exhausted.
+    ///
+    /// The cookie is OPAQUE and filesystem-defined — lwext4 uses its raw
+    /// directory byte offset, tarfs a logical entry index. A caller may only
+    /// ever pass back a value this same filesystem handed it; synthesizing
+    /// one, or doing arithmetic on one, is meaningless.
+    ///
+    /// This is deliberately not an "entry at index N" call. That shape forces
+    /// every backend to restart the directory on each entry — n opens and
+    /// n(n+1)/2 dirent steps to list n files — because a bare index carries
+    /// no resumable state. It is also a question ext4 cannot answer cheaply:
+    /// htree directories are hash-ordered, so "the 47th entry" only exists by
+    /// counting to it.
+    ///
+    /// Implementations MUST make progress: either append at least one entry,
+    /// or return a cookie different from the one passed in (or `None`).
+    fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64>;
 
     /// Check if a directory path exists.
     fn dir_exists(&self, path: &[u8]) -> bool;
@@ -142,6 +159,11 @@ pub struct DirEntry {
     pub is_dir: bool,
     /// POSIX permission bits (same convention as `Vnode::mode`).
     pub mode: u16,
+    /// Last-modified time, seconds since the Unix epoch. `0` = unknown, which
+    /// backends without a clock (tarfs entries predating the field, the COM1
+    /// hostfs wire) report; DOS renders that as an empty date rather than as
+    /// 1970, which would look like a real timestamp.
+    pub mtime: u32,
 }
 
 /// Stable inode from a path (FNV-1a, forced nonzero). Same path → same ino,
@@ -226,6 +248,14 @@ const MAX_UNION: usize = 8;
 /// Alias (bind) expansion depth cap — breaks any accidental bind cycle.
 const ALIAS_DEPTH: u8 = 8;
 
+/// The cookie that starts a fresh directory enumeration.
+pub const READDIR_START: u64 = 0;
+
+/// Entries requested per `Filesystem::readdir` call. Each batch costs one
+/// directory open in the backend, so this trades a little scratch memory for
+/// far fewer opens: a 341-entry directory takes 6 calls instead of 341.
+const READDIR_BATCH: usize = 64;
+
 /// Single-directory readdir cache (avoids O(n²) re-scanning for sequential
 /// readdir). One directory cached at a time, growable so a flat dir with
 /// hundreds of entries doesn't get truncated.
@@ -247,7 +277,7 @@ struct EmptyFs;
 impl Filesystem for EmptyFs {
     fn open(&self, _path: &[u8]) -> Option<Vnode> { None }
     fn read(&self, _h: u64, _o: u32, _b: &mut [u8], _s: u32) -> i32 { -2 }
-    fn readdir(&self, _dir: &[u8], _index: usize) -> Option<DirEntry> { None }
+    fn readdir(&self, _d: &[u8], _c: u64, _o: &mut Vec<DirEntry>, _m: usize) -> Option<u64> { None }
     fn dir_exists(&self, _path: &[u8]) -> bool { false }
 }
 static EMPTY_FS: EmptyFs = EmptyFs;
@@ -539,7 +569,7 @@ impl Vfs {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: data.len() as u32,
-                    is_dir: false, mode: 0o644,
+                    is_dir: false, mode: 0o644, mtime: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -550,12 +580,24 @@ impl Vfs {
         // recent first); an upper layer shadows a lower one on a name clash.
         // For a Replace group this is just the one backing fs (== old behavior).
         self.resolve_members(dir, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
-            let mut idx = 0usize;
-            while let Some(e) = fs.readdir(subpath, idx) {
-                if !dir_entries_has(&entries, &e.name[..e.name_len]) {
-                    entries.push(e);
+            let mut batch: Vec<DirEntry> = Vec::new();
+            let mut cookie = READDIR_START;
+            loop {
+                batch.clear();
+                let next = fs.readdir(subpath, cookie, &mut batch, READDIR_BATCH);
+                for e in batch.drain(..) {
+                    if !dir_entries_has(&entries, &e.name[..e.name_len]) {
+                        entries.push(e);
+                    }
                 }
-                idx += 1;
+                match next {
+                    // A backend that neither advanced its cookie nor produced
+                    // an entry would spin here forever. The trait forbids it;
+                    // this makes a buggy backend a truncated listing rather
+                    // than a hung kernel.
+                    Some(c) if c != cookie => cookie = c,
+                    _ => break,
+                }
             }
             None::<()>
         });
@@ -567,6 +609,7 @@ impl Vfs {
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
+                    mtime: 0,
                 };
                 de.name[..name_len].copy_from_slice(&name[..name_len]);
                 entries.push(de);
@@ -938,6 +981,7 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
         size: e.size,
         is_dir: e.is_dir,
         mode: e.mode,
+        mtime: e.mtime,
     }
 }
 

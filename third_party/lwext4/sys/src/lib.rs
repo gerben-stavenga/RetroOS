@@ -81,6 +81,40 @@ pub struct Ext4Dir {
     pub next_off: u64,
 }
 
+/// The on-disk inode, as lwext4 declares it (`ext4_types.h`, inside a
+/// `#pragma pack(push, 1)` region — hence `packed`). Laid out in full because
+/// `ext4_raw_inode_fill` writes the whole struct; a truncated version would
+/// let C scribble past the end.
+#[repr(C, packed)]
+pub struct Ext4Inode {
+    pub mode: u16,
+    pub uid: u16,
+    pub size_lo: u32,
+    pub access_time: u32,
+    pub change_inode_time: u32,
+    pub modification_time: u32,
+    pub deletion_time: u32,
+    pub gid: u16,
+    pub links_count: u16,
+    pub blocks_count_lo: u32,
+    pub flags: u32,
+    pub unused_osd1: u32,
+    pub blocks: [u32; 15], // EXT4_INODE_BLOCKS
+    pub generation: u32,
+    pub file_acl_lo: u32,
+    pub size_hi: u32,
+    pub obso_faddr: u32,
+    pub osd2: [u8; 12], // union { linux2, hurd2 } — never read here
+    pub extra_isize: u16,
+    pub checksum_hi: u16,
+    pub ctime_extra: u32,
+    pub mtime_extra: u32,
+    pub atime_extra: u32,
+    pub crtime: u32,
+    pub crtime_extra: u32,
+    pub version_hi: u32,
+}
+
 unsafe extern "C" {
     pub fn ext4_device_register(bd: *mut Ext4Blockdev, dev_name: *const u8) -> i32;
     pub fn ext4_mount(dev_name: *const u8, mount_point: *const u8, read_only: bool) -> i32;
@@ -105,4 +139,8 @@ unsafe extern "C" {
     /// No-follow check: EOK iff `path`'s final component is itself a symlink
     /// (ext4_generic_open2 with the SYMLINK filetype doesn't chase it).
     pub fn ext4_inode_exist(path: *const u8, ftype: i32) -> i32;
+    /// Read a whole inode in one path resolution — size, mode and the three
+    /// timestamps together. The alternative (`ext4_fopen` for the size, then
+    /// `ext4_mode_get`, then `ext4_mtime_get`) walks the path three times.
+    pub fn ext4_raw_inode_fill(path: *const u8, ret_ino: *mut u32, inode: *mut Ext4Inode) -> i32;
 }

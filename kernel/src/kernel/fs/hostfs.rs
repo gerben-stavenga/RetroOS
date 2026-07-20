@@ -13,6 +13,7 @@
 
 use crate::kernel::portio::{inb, outb};
 use crate::kernel::vfs::{Filesystem, Vnode, DirEntry};
+use alloc::vec::Vec;
 
 const COM1: u16 = 0x3F8;
 
@@ -167,30 +168,47 @@ impl Filesystem for HostFs {
         to_read as i32
     }
 
-    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        send_byte(CMD_READDIR);
-        send_u16(dir.len() as u16);
-        send_bytes(dir);
-        send_u32(index as u32);
+    /// The wire protocol is still one request per entry (`CMD_READDIR` takes a
+    /// u32 index), so the cookie here is simply that index. Batching is done
+    /// on this side: the VFS gets whole chunks, even though each one costs a
+    /// round trip. Widening the protocol to a real batch reply would cut the
+    /// round trips, but hostfs is the hosted backend and not the hot path.
+    fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
+        let mut index = cookie;
+        while out.len() < max {
+            send_byte(CMD_READDIR);
+            send_u16(dir.len() as u16);
+            send_bytes(dir);
+            send_u32(index as u32);
 
-        let status = recv_i32();
-        if status < 0 { return None; }
+            let status = recv_i32();
+            if status < 0 {
+                return None;
+            }
 
-        let name_len = recv_u8() as usize;
-        let mut name = [0u8; 100];
-        let n = name_len.min(100);
-        recv_bytes(&mut name[..n]);
-        // Drain excess
-        for _ in n..name_len {
-            recv_byte();
+            let name_len = recv_u8() as usize;
+            let mut name = [0u8; 100];
+            let n = name_len.min(100);
+            recv_bytes(&mut name[..n]);
+            // Drain excess
+            for _ in n..name_len {
+                recv_byte();
+            }
+            let size = recv_u32();
+            let is_dir = recv_u8() != 0;
+            let mtime = recv_u32();
+
+            out.push(DirEntry {
+                name,
+                name_len: n,
+                size,
+                is_dir,
+                mode: if is_dir { 0o755 } else { 0o644 },
+                mtime,
+            });
+            index += 1;
         }
-        let size = recv_u32();
-        let is_dir = recv_u8() != 0;
-
-        Some(DirEntry {
-            name, name_len: n, size, is_dir,
-            mode: if is_dir { 0o755 } else { 0o644 },
-        })
+        Some(index)
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
@@ -247,7 +265,7 @@ impl Filesystem for HostFs {
 /// `kernel` dependency, so no `Vnode`/`DirEntry` may appear here).
 ///   `open`  → (status, handle, size); status < 0 = miss.
 ///   `read`  → bytes read, or negative errno.
-///   `readdir` → (status, name, name_len, size, is_dir); status < 0 = end.
+///   `readdir` → (status, name, name_len, size, is_dir, mtime); status < 0 = end.
 ///   `create`→ (status, handle); status < 0 = fail.
 ///   `write` → bytes written, or negative errno.
 #[derive(Clone, Copy)]
@@ -255,7 +273,7 @@ impl Filesystem for HostFs {
 pub struct HostBackendHooks {
     pub open: fn(&[u8]) -> (i32, u64, u32),
     pub read: fn(u64, u32, &mut [u8], u32) -> i32,
-    pub readdir: fn(&[u8], usize) -> (i32, [u8; 100], usize, u32, bool),
+    pub readdir: fn(&[u8], usize) -> (i32, [u8; 100], usize, u32, bool, u32),
     pub dir_exists: fn(&[u8]) -> bool,
     pub create: fn(&[u8]) -> (i32, u64),
     pub write: fn(u64, u32, &[u8]) -> i32,
@@ -300,11 +318,26 @@ impl Filesystem for InjectedHostFs {
         (backend().read)(handle, offset, buf, size)
     }
 
-    fn readdir(&self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        let (status, name, name_len, size, is_dir) = (backend().readdir)(dir, index);
-        if status < 0 { return None; }
-        Some(DirEntry { name, name_len, size, is_dir,
-            mode: if is_dir { 0o755 } else { 0o644 } })
+    /// Cookie = entry index: the hook is per-entry, so batching happens here.
+    fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
+        let mut index = cookie;
+        while out.len() < max {
+            let (status, name, name_len, size, is_dir, mtime) =
+                (backend().readdir)(dir, index as usize);
+            if status < 0 {
+                return None;
+            }
+            out.push(DirEntry {
+                name,
+                name_len,
+                size,
+                is_dir,
+                mode: if is_dir { 0o755 } else { 0o644 },
+                mtime,
+            });
+            index += 1;
+        }
+        Some(index)
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
