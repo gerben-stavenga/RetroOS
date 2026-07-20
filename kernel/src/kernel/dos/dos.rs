@@ -1321,19 +1321,30 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     return thread::KernelAction::Done;
                 }
             };
-            // Compose "vfs_dir/pat" in dos.find_path.
+            // Compose "vfs_dir/pat" into a local buffer — the FCB search state
+            // in `dos.find_path` belongs to AH=11h/12h and must not be
+            // disturbed by a handle-based search.
+            let mut composed = [0u8; 96];
             let mut pos = 0;
             for &b in &vfs_dir[..vlen] {
-                if pos < dos.find_path.len() { dos.find_path[pos] = b; pos += 1; }
+                if pos < composed.len() { composed[pos] = b; pos += 1; }
             }
-            if vlen > 0 && pos < dos.find_path.len() {
-                dos.find_path[pos] = b'/'; pos += 1;
+            if vlen > 0 && pos < composed.len() {
+                composed[pos] = b'/'; pos += 1;
             }
             for &b in pat {
-                if pos < dos.find_path.len() { dos.find_path[pos] = b; pos += 1; }
+                if pos < composed.len() { composed[pos] = b; pos += 1; }
             }
-            dos.find_path_len = pos as u8;
-            dos.find_idx = 0;
+            // Claim a search slot and stamp its identity into the caller's DTA,
+            // so a FindNext knows which enumeration it is continuing even if
+            // another search ran in between.
+            let slot = alloc_search_slot(dos);
+            dos.searches[slot].path[..pos].copy_from_slice(&composed[..pos]);
+            dos.searches[slot].path_len = pos as u8;
+            let generation = dos.searches[slot].generation;
+            let dta = dos.dta as usize;
+            machine.zero(dta, 43);
+            write_search_state(machine, dta, slot as u8, generation, 0);
             find_matching_file(machine, dos, regs)
         }
         // AH=0x4F: Find next matching file
@@ -1745,10 +1756,12 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             let is_ext = dos.fcb_search_ext;
             loop {
                 match dfs::ci::entry_at(dir_for_ci, idx) {
-                    Some((alias, size, is_dir)) => {
+                    // `ent`, not `e` — the extension slice below owns that name.
+                    Some((alias, ent)) => {
                         idx += 1;
                         if !dos_wildcard_match(pat, alias) { continue; }
                         dos.find_idx = idx as u16;
+                        let (is_dir, size) = (ent.is_dir, ent.size);
                         // Write search FCB into DTA. Layout above.
                         let dta = dos.dta as usize;
                         // Zero the (extended-prefix + 32-byte) area first.
@@ -1783,9 +1796,10 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                         // size = 128 (0x0E-0x0F), file size at 0x10-0x13.
                         machine.write::<u16>(fcb_base + 0x0E, 128);
                         machine.write::<u32>(fcb_base + 0x10, size);
-                        // Date = 1980-01-01 (0x0021), time = 00:00:00.
-                        machine.write::<u16>(fcb_base + 0x14, 0x0021);
-                        machine.write::<u16>(fcb_base + 0x16, 0);
+                        // Real mtime; (0, 0) when the backing fs has none.
+                        let (time, date) = unix_to_dos_datetime(ent.mtime);
+                        machine.write::<u16>(fcb_base + 0x14, date);
+                        machine.write::<u16>(fcb_base + 0x16, time);
                         regs.rax &= !0xFF;
                         return thread::KernelAction::Done;
                     }
@@ -3131,15 +3145,108 @@ pub(crate) fn dfs_create_path<A: crate::Arch>(dos: &thread::DosState<A>, dos_in:
     Ok((out, vlen))
 }
 
-/// FindFirst/FindNext helper: resume search from dos.find_idx,
-/// updating it in place. Directory and pattern come from find_path.
+/// Offsets of our search bookkeeping inside the DTA's 21-byte reserved area
+/// (0x00-0x14). Real DOS puts a drive, an 11-byte template, an attribute and
+/// a directory index here; we keep the same spirit — enough state to resume —
+/// in the tail of that area, and leave the front zeroed.
+mod dta {
+    pub const CURSOR: usize = 0x0D; // u16: next entry index
+    pub const SLOT: usize = 0x0F; // u8: index into DosState::searches
+    pub const GENERATION: usize = 0x10; // u8: must match the slot's
+    pub const MAGIC: usize = 0x11; // u16: this DTA really holds our state
+    pub const MAGIC_VALUE: u16 = 0x4F53; // 'SO'
+    /// First byte of the caller-visible result (attribute). Everything below
+    /// this is the reserved area and must survive across a FindNext.
+    pub const RESULT: usize = 0x15;
+}
+
+/// Stamp a search's identity and cursor into the caller's DTA.
+fn write_search_state<A: crate::Arch>(machine: &mut A, dta: usize, slot: u8, generation: u8, cursor: u16) {
+    machine.write::<u16>(dta + dta::CURSOR, cursor);
+    machine.write::<u8>(dta + dta::SLOT, slot);
+    machine.write::<u8>(dta + dta::GENERATION, generation);
+    machine.write::<u16>(dta + dta::MAGIC, dta::MAGIC_VALUE);
+}
+
+/// Recover `(slot, cursor)` from a DTA, or `None` if it holds no live search
+/// of ours — an unpaired FindNext, a DTA the program has since overwritten,
+/// or a stale one whose slot has been recycled.
+fn read_search_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, dta: usize) -> Option<(usize, u16)> {
+    if machine.read::<u16>(dta + dta::MAGIC) != dta::MAGIC_VALUE {
+        return None;
+    }
+    let slot = machine.read::<u8>(dta + dta::SLOT) as usize;
+    let generation = machine.read::<u8>(dta + dta::GENERATION);
+    let s = dos.searches.get(slot)?;
+    if !s.in_use || s.generation != generation {
+        return None;
+    }
+    Some((slot, machine.read::<u16>(dta + dta::CURSOR)))
+}
+
+/// Claim a search slot, round-robin. Slots are never explicitly freed — DOS
+/// has no "close search" call — so the oldest simply gets recycled, and its
+/// generation bump invalidates any DTA still pointing at it.
+fn alloc_search_slot<A: crate::Arch>(dos: &mut thread::DosState<A>) -> usize {
+    let slot = dos.search_next as usize % dos.searches.len();
+    dos.search_next = dos.search_next.wrapping_add(1);
+    let s = &mut dos.searches[slot];
+    s.generation = s.generation.wrapping_add(1);
+    s.in_use = true;
+    slot
+}
+
+/// Unix epoch seconds → DOS `(time, date)` as INT 21h reports them in the DTA.
+///
+/// Time packs hh:mm:(ss/2) into 5/6/5 bits; date packs (year-1980):month:day
+/// into 7/4/5. The representable window is 1980-01-01 through 2107-12-31 —
+/// anything outside it, including the `0` that means "no timestamp", reports
+/// `(0, 0)`. A zero date renders as blank rather than as a plausible-looking
+/// 1980-01-01, so an unknown time never masquerades as a real one.
+fn unix_to_dos_datetime(unix: u32) -> (u16, u16) {
+    const DOS_EPOCH: u32 = 315_532_800; // 1980-01-01T00:00:00Z
+    if unix < DOS_EPOCH {
+        return (0, 0);
+    }
+    let days = (unix / 86_400) as i64;
+    let secs = unix % 86_400;
+
+    // Days since the Unix epoch → civil date (Howard Hinnant's algorithm,
+    // shifted to an era starting 0000-03-01 so leap days land at the end).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (y + i64::from(month <= 2)) as u32;
+
+    if !(1980..=2107).contains(&year) {
+        return (0, 0);
+    }
+    let dos_date = ((year - 1980) << 9) | (month << 5) | day;
+    let dos_time = ((secs / 3_600) << 11) | ((secs % 3_600 / 60) << 5) | ((secs % 60) / 2);
+    (dos_time as u16, dos_date as u16)
+}
+
+/// FindFirst/FindNext helper: resume the search this DTA identifies, writing
+/// the match into the DTA and advancing the cursor kept there.
 fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
-    // Split find_path into directory and pattern components.
-    // find_path is an absolute VFS path like "DN/DN*.SWP" or "*.*".
-    // The directory part includes any trailing slash; the pattern is
-    // the basename (filespec with wildcards).
-    let path_len = dos.find_path_len as usize;
-    let full = &dos.find_path[..path_len];
+    let dta = dos.dta as usize;
+    let Some((slot, cursor)) = read_search_state(machine, dos, dta) else {
+        // FindNext with no live search in this DTA.
+        regs.rax = (regs.rax & !0xFFFF) | 18; // no more files
+        regs.set_flag32(1);
+        return thread::KernelAction::Done;
+    };
+    // The search path is an absolute VFS path like "DN/DN*.SWP" or "*.*".
+    // The directory part includes any trailing slash; the pattern is the
+    // basename (filespec with wildcards).
+    let path_len = dos.searches[slot].path_len as usize;
+    let full = &dos.searches[slot].path[..path_len];
     let split = full.iter().rposition(|&b| b == b'/').map(|i| i + 1).unwrap_or(0);
     let dir_buf = {
         let mut b = [0u8; 96];
@@ -3155,7 +3262,8 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
     let dir = &dir_buf.0[..dir_buf.1];
     let pat = &pat_buf.0[..pat_buf.1];
 
-    let mut idx = dos.find_idx as usize;
+    let mut idx = cursor as usize;
+    let generation = dos.searches[slot].generation;
 
     // Iterate DFS's per-dir CI cache. Keys are 8.3 aliases (uppercase),
     // already in the form DOS expects in the DTA filename slot — long VFS
@@ -3164,14 +3272,19 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
     let dir_for_ci = if dir.last() == Some(&b'/') { &dir[..dir.len() - 1] } else { dir };
     loop {
         match dfs::ci::entry_at(dir_for_ci, idx) {
-            Some((alias, size, is_dir)) => {
+            Some((alias, entry)) => {
                 idx += 1;
                 if dos_wildcard_match(pat, alias) {
-                    dos.find_idx = idx as u16;
-                    let dta = dos.dta as usize;
-                    machine.zero(dta, 43);
-                    machine.write::<u8>(dta + 0x15, if is_dir { 0x10 } else { 0x20 });
-                    machine.write::<u32>(dta + 0x1A, size);
+                    // Clear only the result fields: the reserved area below
+                    // holds this search's cursor, and wiping it would strand
+                    // the enumeration after its first entry.
+                    machine.zero(dta + dta::RESULT, 43 - dta::RESULT);
+                    write_search_state(machine, dta, slot as u8, generation, idx as u16);
+                    let (time, date) = unix_to_dos_datetime(entry.mtime);
+                    machine.write::<u8>(dta + 0x15, if entry.is_dir { 0x10 } else { 0x20 });
+                    machine.write::<u16>(dta + 0x16, time);
+                    machine.write::<u16>(dta + 0x18, date);
+                    machine.write::<u32>(dta + 0x1A, entry.size);
                     let name_len = alias.len().min(12);
                     machine.copy_to(dta + 0x1E, &alias[..name_len]);
                     machine.write::<u8>(dta + 0x1E + name_len, 0);

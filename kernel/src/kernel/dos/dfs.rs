@@ -43,6 +43,8 @@ pub mod ci {
         pub original: Vec<u8>,
         pub size: u32,
         pub is_dir: bool,
+        /// Unix epoch seconds; 0 = unknown (the DTA then shows a blank date).
+        pub mtime: u32,
     }
 
     /// Per-dir mapping `alias → entry`, sorted by alias.
@@ -71,7 +73,12 @@ pub mod ci {
         while let Some(e) = vfs::readdir(&readdir_key, idx) {
             let original = e.name[..e.name_len].to_vec();
             let alias = compute_alias_8_3(&original, &entries);
-            entries.push((alias, Entry { original, size: e.size, is_dir: e.is_dir }));
+            entries.push((alias, Entry {
+                original,
+                size: e.size,
+                is_dir: e.is_dir,
+                mtime: e.mtime,
+            }));
             idx += 1;
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -100,11 +107,11 @@ pub mod ci {
         crate::kernel::vfs::mount_child(vfs_dir, alias)
     }
 
-    /// Get the entry at `idx` in the cache's alias order. Returns `(alias,
-    /// size, is_dir)`. Used by find_first/find_next.
-    pub fn entry_at(vfs_dir: &[u8], idx: usize) -> Option<(&'static [u8], u32, bool)> {
+    /// Get the entry at `idx` in the cache's alias order. Used by
+    /// find_first/find_next, which copies these straight into the DTA.
+    pub fn entry_at(vfs_dir: &[u8], idx: usize) -> Option<(&'static [u8], &'static Entry)> {
         let dir = ensure_cached(vfs_dir);
-        dir.get(idx).map(|(a, e)| (a.as_slice(), e.size, e.is_dir))
+        dir.get(idx).map(|(a, e)| (a.as_slice(), e))
     }
 
     /// Drop cached entries for `vfs_dir`. Call after writes that can change

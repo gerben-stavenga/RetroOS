@@ -120,10 +120,17 @@ pub struct DosState<A: crate::Arch> {
     pub exec_parent: Option<ExecParent>,
     pub xms: Option<alloc::boxed::Box<xms::XmsState>>,
     pub ems: Option<alloc::boxed::Box<ems::EmsState>>,
-    /// FindFirst/FindNext search state (per-thread, one active enumeration).
+    /// FCB-FindFirst (AH=11h/12h) search state. Still a single enumeration:
+    /// the FCB surface has nowhere better to keep a cursor, and no DOS program
+    /// we run interleaves FCB searches. The handle-based AH=4Eh/4Fh path uses
+    /// `searches` below instead.
     pub find_path: [u8; 96],
     pub find_path_len: u8,
     pub find_idx: u16,
+    /// Active AH=4Eh enumerations. See `DosSearch`.
+    pub searches: [DosSearch; DOS_SEARCH_SLOTS],
+    /// Round-robin allocation cursor for `searches`.
+    pub search_next: u8,
     /// FCB-FindFirst (AH=11h) state remembered across to FindNext (AH=12h):
     /// the drive number to report in the DTA result FCB and whether the
     /// caller used an extended FCB (0xFF prefix in their input FCB) so the
@@ -229,6 +236,8 @@ impl<A: crate::Arch> DosState<A> {
             find_path: [0; 96],
             find_path_len: 0,
             find_idx: 0,
+            searches: [DosSearch::new(); DOS_SEARCH_SLOTS],
+            search_next: 0,
             fcb_search_drive: 0,
             fcb_search_ext: false,
             dfs: dfs::DfsState::new(),
@@ -292,6 +301,43 @@ impl<A: crate::Arch> DosState<A> {
         if machine::vga_present() {
             self.pc.vga.restore_to_hardware();
         }
+    }
+}
+
+/// How many AH=4Eh enumerations may be live at once.
+pub const DOS_SEARCH_SLOTS: usize = 8;
+
+/// One active FindFirst/FindNext enumeration.
+///
+/// Real DOS keeps the resume cursor in the caller's own DTA, which is what
+/// lets a program run several searches at once by swapping DTAs between
+/// calls — file managers do exactly that, walking a directory while stat-ing
+/// entries through a second DTA. Holding a single cursor in `DosState`
+/// instead makes the two searches silently consume each other's entries.
+///
+/// The search path (up to 96 bytes) will not fit in the DTA's 21-byte
+/// reserved area, so it stays here and the DTA carries a slot id, a
+/// generation and the cursor — enough to identify *which* search a given DTA
+/// belongs to and where it had got to.
+#[derive(Clone, Copy)]
+pub struct DosSearch {
+    pub path: [u8; 96],
+    pub path_len: u8,
+    /// Bumped every time the slot is reused, so a DTA left over from a
+    /// finished search cannot resume whatever now occupies its slot.
+    pub generation: u8,
+    pub in_use: bool,
+}
+
+impl DosSearch {
+    pub const fn new() -> Self {
+        DosSearch { path: [0; 96], path_len: 0, generation: 0, in_use: false }
+    }
+}
+
+impl Default for DosSearch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
