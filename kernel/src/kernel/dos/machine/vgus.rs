@@ -258,7 +258,7 @@ impl GusCore {
 impl Gus {
     /// Absent until the program's env declares it (ULTRASND).
     pub fn new() -> Self {
-        Gus { base: 0x240, irq: 5, dma_ch: 1, present: false, core: None }
+        Gus { base: 0x240, irq: 11, dma_ch: 3, present: false, core: None }
     }
 
     /// Ports this card decodes: the GF1 decodes two 16-port ISA blocks,
@@ -299,8 +299,17 @@ impl Gus {
     /// Program-exit / exec cleanup: drop the whole core so the next program
     /// sees a power-on card (same lifecycle as the SB's `release_dma_pool`
     /// and the per-program OPL chip).
-    pub fn reset<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn reset<A: crate::Arch>(&mut self, machine: &mut A, vpic: &mut VirtualPic) {
         let _ = machine; // stream lifecycle is the mixer pump's (it parks on idle)
+        // Lower the GF1 line as well as dropping the core. A voice/timer event
+        // may already have latched the IRQ in the vPIC's IRR; dropping the card
+        // does not unlatch it, so it stays pending and is delivered AFTER the
+        // owning program is gone — straight through the interrupt vector that
+        // program installed, into memory that has since been freed and reused.
+        // That is a #UD on garbage (Hocus Pocus's GUS IRQ killing the shell
+        // after HOCUSG.BAT finished). A card that no longer exists must not
+        // still be asking for service.
+        vpic.clear_request(self.irq);
         self.core = None;
         self.present = false;
     }

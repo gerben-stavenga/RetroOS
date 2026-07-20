@@ -185,10 +185,28 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     for n in 0..256u32 {
         let serviced = matches!(n,
             0x00..=0x33 | 0x40..=0x46 | 0x4A | 0x67 | 0x70..=0x77);
-        let off = if serviced { (n * 2) as u16 } else { DUMMY_OFF };
-        write_u16(machine, 0, n * 4, off);
+        if !serviced {
+            // NULL, not a dummy stub — a real BIOS leaves the unused vectors
+            // (the 0x60-0x67 and 0x78-0x7F user ranges especially) at
+            // 0000:0000, and TSRs SCAN for that to find a free vector to
+            // publish their API on. Pointing all 256 at the shared dummy
+            // advertises zero free vectors: UltraMID's scan found none and
+            // installed itself on INT 00h instead of INT 79h, so the game's
+            // probe missed it ("UltraMID not found") and the unload left a
+            // divide-by-zero vector dangling into freed memory. Native BIOS
+            // was unaffected because `install` never runs there — the exact
+            // shape of a substitute-BIOS-only bug.
+            write_u16(machine, 0, n * 4, 0);
+            write_u16(machine, 0, n * 4 + 2, 0);
+            continue;
+        }
+        write_u16(machine, 0, n * 4, (n * 2) as u16);
         write_u16(machine, 0, n * 4 + 2, STUB_SEG);
     }
+    // DOS/4GW (raptor's bound extender) finds the BIOS dummy handler by
+    // scanning for an address that appears in TWO entries; the NULLs above
+    // are that duplicate now, so the scan still terminates.
+    let _ = DUMMY_OFF;
     seed_bda(machine);
 }
 

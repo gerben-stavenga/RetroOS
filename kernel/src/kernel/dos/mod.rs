@@ -273,7 +273,8 @@ impl<A: crate::Arch> DosState<A> {
         // Hand the single global ISA-DMA pool back; a dying thread that
         // armed SB DMA must not poison it for the next program.
         self.pc.sb.release_dma_pool(machine, regs);
-        self.pc.gus.reset(machine);
+        let pc = &mut self.pc;
+        pc.gus.reset(machine, &mut pc.vpic);
     }
 
     /// Called by the context-switch code when this thread becomes the running
@@ -759,7 +760,8 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // DMA pool binding first, else the global pool stays held forever.
     if let thread::Personality::Dos(old) = &mut current.personality {
         old.pc.sb.release_dma_pool(machine, &mut current.kernel.vcpu);
-        old.pc.gus.reset(machine);
+        let pc = &mut old.pc;
+        pc.gus.reset(machine, &mut pc.vpic);
     }
     current.personality = thread::Personality::Dos(new_state);
     // `regs` (the thread's vcpu) and `dos_state` (its DOS personality) are
@@ -925,7 +927,8 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
     new_state.dfs.init_from_vfs(&cwd);
     if let thread::Personality::Dos(old) = &mut t.personality {
         old.pc.sb.release_dma_pool(machine, &mut t.kernel.vcpu);
-        old.pc.gus.reset(machine);
+        let pc = &mut old.pc;
+        pc.gus.reset(machine, &mut pc.vpic);
     }
     t.personality = thread::Personality::Dos(new_state);
     let loaded = {
@@ -1378,11 +1381,17 @@ fn dos_set_program_block_owner<A: crate::Arch>(machine: &mut A, dos: &mut DosSta
 }
 
 fn dos_keep_resident_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16, owner: u16) {
-    let paras = paras.min(0xA000u16.saturating_sub(seg));
-    if paras == 0 {
+    let clamped = paras.min(0xA000u16.saturating_sub(seg));
+    if clamped == 0 {
+        // TEMPORARY DIAGNOSTIC (forced): a resident block at/above 0xA000 is
+        // silently dropped here — the conventional chain cannot hold it. If
+        // this fires, a TSR reported success while nothing was kept.
+        crate::dbg_println!(
+            "D21 31 TSR: block seg={:04X}+{:04X} DROPPED (>= A000, not recorded)", seg, paras);
         sync_mcb_chain(machine, dos, regs);
         return;
     }
+    let paras = clamped;
 
     dos.dos_blocks.push(DosMemBlock { seg, paras, owner });
     sync_heap_seg(dos);
