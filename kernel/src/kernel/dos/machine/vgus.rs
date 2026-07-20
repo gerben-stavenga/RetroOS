@@ -258,7 +258,7 @@ impl GusCore {
 impl Gus {
     /// Absent until the program's env declares it (ULTRASND).
     pub fn new() -> Self {
-        Gus { base: 0x240, irq: 11, dma_ch: 3, present: false, core: None }
+        Gus { base: 0x240, irq: 5, dma_ch: 3, present: false, core: None }
     }
 
     /// Ports this card decodes: the GF1 decodes two 16-port ISA blocks,
