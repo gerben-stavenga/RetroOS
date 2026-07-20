@@ -32,10 +32,25 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+/* Keep this shell small. A .COM is handed a whole 64 KB segment, and the
+ * tiny-model startup honours these to SETBLOCK it back down (measured: the
+ * block goes from 0x1000 to ~0x6DC paragraphs, 64 KB -> 27 KB).
+ *
+ * It matters because a .BAT line is EXEC'd in THIS address space, so whatever
+ * the shell holds is memory the game does not get: Hocus Pocus wants 567 KB
+ * and refused to start with 11 KB missing. The LOADFIX path wants the 64 KB
+ * back and asks for it explicitly (see set_block_size). */
+unsigned _stklen  = 0x1000;
+unsigned _heaplen = 0x1000;
+
 static union REGS r;
 static struct SREGS s;
 static int echo_on = 1;
 static int should_exit = 0;     /* set by EXIT builtin to break out of BAT */
+/* Nonzero while a .BAT is being interpreted. Batch lines run in THIS address
+ * space (in-process EXEC) rather than forking, so a TSR loaded by one line is
+ * still resident for the next — see dispatch_external. */
+static int in_batch = 0;
 static const char empty_str[] = "";
 
 /* ----- thin INT wrappers ----- */
@@ -55,9 +70,9 @@ static void trace(int on) {
  *     ~64 KB low, pushing the program above 0x1000. Implemented here as
  *     a trampoline: parent forks COMMAND.COM with "/L <name> [args]";
  *     the child takes the /L branch and EXECs the program in-process via
- *     INT 21h AH=4B AL=00. The trampoline itself is the push-up -- our
- *     COMMAND.COM is a tiny-model .COM and claims a full 64 KB block,
- *     exactly the shift real LOADFIX provided.
+ *     INT 21h AH=4B AL=00. The trampoline itself is the push-up: the /L
+ *     child grows its own block back to a full 64 KB first (see
+ *     set_block_size), exactly the shift real LOADFIX provided.
  *
  *   dos32a:  DOS/4GW-bound games that don't run cleanly under our DPMI
  *     host. Wrapped by spawning C:\DOS32A.EXE with "<prog> [args]" as
@@ -389,6 +404,31 @@ static int dos_exec_inplace(const char *name, const char *args) {
     return (int)(get_child_exit_status() & 0xFF);
 }
 
+/* Resize our own memory block to `paras` paragraphs (INT 21h AH=4Ah).
+ *
+ * The startup shrinks us to roughly _heaplen+_stklen so a batch line EXEC'd
+ * in-process gets nearly all of conventional memory — Hocus Pocus wants 567 KB
+ * and a 64 KB shell left it 11 KB short. But the LOADFIX trampoline needs the
+ * opposite: it exists to push the program's PSP above segment 0x1000, and the
+ * shell's own block IS that push. So /L grows back to 0x1000 paragraphs first.
+ * Failure is not fatal — the EXEC just loads lower, exactly as before. */
+static void set_block_size(unsigned paras) {
+    r.h.ah = 0x4A;
+    r.x.bx = paras;
+    s.es   = _psp;
+    s.ds   = _psp;
+    int86x(0x21, &r, &r, &s);
+}
+
+/* Set THIS thread's virtual IOPL (the kernel's IfMode) via INT 31h AH=09h.
+ * Fork-exec passes the child's mode in CL because the child is a new thread;
+ * an in-process EXEC runs on ours, so batch lines set it here instead. */
+static void synth_set_viopl(unsigned char viopl) {
+    r.h.ah = 0x09;
+    r.x.cx = viopl;
+    int86(0x31, &r, &r);
+}
+
 static int synth_waitpid(int pid) {
     r.h.ah = 0x04;
     r.x.bx = (unsigned)pid;
@@ -577,6 +617,33 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
         argv[prog_idx] = command_com_path;
         argv[prog_idx + 1] = "/L";
     }
+    /* Inside a .BAT, run the line in OUR address space instead of forking.
+     *
+     * A batch file is one shell session, and DOS ran each line as an
+     * in-process EXEC into the single conventional-memory map. That is what
+     * makes `TSR` on one line visible to the program on the next: the
+     * resident block stays in the MCB chain and its interrupt hooks stay in
+     * the shared IVT. Fork-exec gives every line a private address space with
+     * a private page-0 IVT, so a TSR dies with the line that loaded it —
+     * HOCUSG.BAT loads ULTRAMID, then the game reports "UltraMID not found".
+     *
+     * The LOADFIX trampoline is skipped here: it exists only to re-fork
+     * COMMAND.COM so the program's PSP lands above segment 0x1000, and an
+     * in-process EXEC already loads above this interpreter's own block.
+     * DOS/32A prefixing above still applies — that is just a different
+     * program to exec, and it works in-process unchanged.
+     */
+    if (in_batch) {
+        char tail[128];
+        int rc;
+        int start = (flags & LF_F_LOADFIX) ? prog_idx + 2 : prog_idx;
+        join_args(tail, sizeof(tail), argv, start + 1, argc);
+        synth_set_viopl(viopl);
+        rc = dos_exec_inplace(argv[start], tail);
+        synth_set_viopl(1);      /* back to the shell's own spec-strict mode */
+        refresh_bda_clock();
+        return rc;
+    }
     return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd, viopl);
 }
 
@@ -734,12 +801,14 @@ static int run_bat_file(const char *path) {
     int last = 0;
     f = fopen(path, "r");
     if (f == 0) { puts("Cannot open batch file"); return 1; }
+    in_batch++;
     while (fgets(line, sizeof(line), f) != 0) {
         int n = (int)strlen(line);
         while (n > 0 && (line[n-1] == '\r' || line[n-1] == '\n')) line[--n] = 0;
         last = run_bat_line(line);
         if (should_exit) break;
     }
+    in_batch--;
     fclose(f);
     return last;
 }
@@ -783,6 +852,8 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         join_args(tail, sizeof(tail), argv, 3, argc);
+        /* Restore the 64 KB claim: this block is the LOADFIX push-up. */
+        set_block_size(0x1000);
         return dos_exec_inplace(argv[2], tail);
     }
 

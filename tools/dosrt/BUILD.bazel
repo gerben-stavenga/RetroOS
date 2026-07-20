@@ -9,7 +9,7 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 load(":retro.bzl", "retro_lib")
 
-# The in-OS TCC build action is shared: //apps-boot/command builds COMMAND.COM
+# The in-OS TCC build action is shared: //tools/command builds COMMAND.COM
 # with it (same interp_host + image_min recipe as stub_exe below).
 exports_files(["interp_tcc.sh"], visibility = ["//visibility:public"])
 
@@ -135,7 +135,7 @@ genrule(
     outs = ["STUB.EXE"],
     tools = ["interp_tcc.sh", ":interp_host"],
     cmd = "$(location interp_tcc.sh) $(location :interp_host) $(location //:image_min) $(location stub/stub.c) $@",
-    # Packed onto by dosrt payloads (hello, //apps/tests/modplay, …).
+    # Packed onto by dosrt payloads (hello, //test/dos/modplay, …).
     visibility = ["//visibility:public"],
 )
 
@@ -152,5 +152,5 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
-# modplay (the .MOD player / SB DMA test) lives under //apps/tests/modplay.
+# modplay (the .MOD player / SB DMA test) lives under //test/dos/modplay.
 # It links dosrt_lib + is packed onto stub_exe (both visible above).

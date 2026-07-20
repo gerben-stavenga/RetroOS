@@ -3,6 +3,56 @@ load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
 exports_files(["i686-retro-none.json", "hostfs.py"])
 
+# ── Content packaged out of apps/ ────────────────────────────────────────────
+#
+# apps/ holds shipped CONTENT only and carries no BUILD files of its own, so
+# every file under it belongs to this package and is globbed from here. Things
+# built from source live in test/, tools/, shell/ instead.
+
+# The standard Gravis UltraSound instrument patches (.PAT), as originally
+# distributed with the GUS drivers and long redistributed as dgguspat.zip
+# (idgames /music/dgguspat, packaged by Simon Howard — see dgguspat.txt).
+# Ships at C:\ULTRASND\MIDI, the ULTRADIR default every GUS-native game and
+# driver (Doom's DMX, AIL, ULTRAMID) loads instrument data from — without
+# these, games detect the emulated GUS but silently disable music.
+_ULTRASND_PREFIX = "apps/ultrasnd/"
+
+_PATS = glob([_ULTRASND_PREFIX + "MIDI/*.pat"])
+
+pkg_tar(
+    name = "ultrasnd_tar",
+    files = {
+        ":" + p: "ULTRASND/" + p[len(_ULTRASND_PREFIX):].upper()
+        for p in _PATS
+    } | {
+        ":" + _ULTRASND_PREFIX + "dgguspat.txt": "ULTRASND/DGGUSPAT.TXT",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# All files under apps/games are auto-included with their paths uppercased and
+# prefixed with "GAMES/" (e.g. doom/DOOM.EXE → GAMES/DOOM/DOOM.EXE). Drop a
+# game's files into a subdirectory and they ship on next build — no per-file
+# wiring.
+_GAMES_PREFIX = "apps/games/"
+
+_GAME_SRCS = glob([_GAMES_PREFIX + "**/*"])
+
+pkg_tar(
+    name = "games_tar",
+    files = {
+        ":" + s: "GAMES/" + s[len(_GAMES_PREFIX):].upper()
+        for s in _GAME_SRCS
+    },
+    visibility = ["//visibility:public"],
+)
+
+# Static-linked busybox 1.31 (i686-uclibc) — single-binary userland for the
+# Linux personality. Provides sh + coreutils via the standalone-shell-mode
+# applet dispatch (basename(argv[0]) -> applet).
+exports_files(["apps/busybox/busybox"])
+
+
 # Convenient applet shims for busybox: each is a tar symlink "bin/<name>"
 # pointing at "busybox" (relative within /bin), so PATH=/bin lookup of
 # `ls`, `cat`, etc. resolves to the busybox binary which dispatches via
@@ -71,15 +121,15 @@ _DN_FILES = {
 # (someone's existing GRUB) comes up with a usable system, no RetroOS disk
 # required.
 _BOOTFS_FILES = {
-    "//apps-boot/command:command_com": "COMMAND.COM",
+    "//tools/command:command_com": "COMMAND.COM",
     # Per-program launch overrides, in the ALWAYS-present embedded bootfs so
     # COMMAND.COM finds them regardless of how the ext4 root mounts (it may
     # land at C:\DISK1 rather than C:\ — see startup.rs mount_filesystems).
-    "//apps-boot/command:LOADFIX.CFG": "LOADFIX.CFG",
+    "//tools/command:LOADFIX.CFG": "LOADFIX.CFG",
     # Bridge into the Linux personality: a DN-launchable ELF that execs
     # /bin/busybox as `sh`. In the bootfs (C:\BOOT\SHELL.ELF) so it's ALWAYS
     # present — independent of whatever's on the disk root / /home/retroos.
-    "//apps/shell:shell_elf": "SHELL.ELF",
+    "//shell:shell_elf": "SHELL.ELF",
     "etc/CONFIG.BOOTFS": "CONFIG.SYS",
 }
 _BOOTFS_FILES.update(_DN_FILES)
@@ -101,7 +151,7 @@ _BOOT_FILES = {
 }
 
 # image_min's boot bundle: the bare kernel (no embedded bootfs). The in-OS
-# toolchain genrules (//apps-boot/command:command_com, //apps/dosrt:stub_exe)
+# toolchain genrules (//tools/command:command_com, //tools/dosrt:stub_exe)
 # boot image_min, and the full kernel embeds COMMAND.COM — swapping in the
 # bare kernel here is what keeps that acyclic.
 _BOOT_FILES_MIN = dict(_BOOT_FILES)
@@ -116,21 +166,21 @@ _BOOT_FILES_MIN[":kernel_md5_bare"] = "kernel.elf.md5"
 _EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
-    "//apps-boot/command:command.c": "SRC/COMMAND.C",
+    "//tools/command:command.c": "SRC/COMMAND.C",
     # COMMAND.COM itself is NOT duplicated here: it lives in the embedded bootfs
     # at C:\BOOT\COMMAND.COM (see _BOOTFS_FILES), which is where COMSPEC points.
     "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
     # LOADFIX.CFG and shell.elf now live in the embedded bootfs (C:\BOOT) —
     # see _BOOTFS_FILES.
-    "//apps/tests/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
-    "//apps/tests/stress:stress_elf":       "TESTS/stress.elf",
-    "//apps/tests/stress64:stress64_elf":   "TESTS/stress64.elf",
-    "//apps/tests/hello_com:hello_com":     "TESTS/HELLO.COM",
-    "//apps/tests/gfx_com:gfx_com":         "TESTS/GFX.COM",
-    "//apps/tests/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
-    "//apps/tests/trexec:trexec_com":       "TESTS/TREXEC.COM",
-    "//apps/tests/hello32_linux:hello32_linux": "TESTS/HI.ELF",
-    "//apps/tests/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
+    "//test/dos/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
+    "//test/dos/stress:stress_elf":       "TESTS/stress.elf",
+    "//test/dos/stress64:stress64_elf":   "TESTS/stress64.elf",
+    "//test/dos/hello_com:hello_com":     "TESTS/HELLO.COM",
+    "//test/dos/gfx_com:gfx_com":         "TESTS/GFX.COM",
+    "//test/dos/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
+    "//test/dos/trexec:trexec_com":       "TESTS/TREXEC.COM",
+    "//test/dos/hello32_linux:hello32_linux": "TESTS/HI.ELF",
+    "//test/dos/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
     "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
     # Japheth's HX DPMI conformance probe (freeware; see test/dpmi/HX-CREDITS.txt).
@@ -141,22 +191,22 @@ _EXTRA_FILES = {
     # modes. RLOADER.BIN is the in-OS PM loader the stub fopens from cwd.
     # No build cycle: `image_min` (used to build the stub) uses
     # _MIN_EXTRA_FILES below, not these.
-    "//apps/tests/modplay:modplay_exe":     "TESTS/MODPLAY.EXE",
+    "//test/dos/modplay:modplay_exe":     "TESTS/MODPLAY.EXE",
     # SB single-cycle completion-protocol probes (busy flicker, status TC,
     # count underflow) — hosted_games.sh asserts SBTEST prints TC-OK.
-    "//apps/tests/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
-    "//apps/tests/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
+    "//test/dos/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
+    "//test/dos/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
     # GUS (GF1) emulation probe — hosted_games.sh asserts its G*-OK markers.
-    "//apps/tests/gusproto:gustest_com":    "TESTS/GUSTEST.COM",
-    "//apps/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
-    "//apps/dosrt:rloader_bin":             "TESTS/RLOADER.BIN",
+    "//test/dos/gusproto:gustest_com":    "TESTS/GUSTEST.COM",
+    "//tools/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
+    "//tools/dosrt:rloader_bin":             "TESTS/RLOADER.BIN",
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).
     # Standalone-shell mode dispatches applets via basename(argv[0]); the
     # binary's compiled-in re-exec path is /bin/busybox, hence the location.
-    "//apps/busybox:busybox":               "bin/busybox",
+    "//:apps/busybox/busybox":               "bin/busybox",
 }
 
-# Minimum extras needed for the stub-build image (//apps/dosrt:stub_exe
+# Minimum extras needed for the stub-build image (//tools/dosrt:stub_exe
 # boots //:image_min and runs in-OS TCC from ext4 /TC;
 # CONFIG.SYS supplies the PATH
 # (= C:\;C:\BOOT\TC;C:\BORLANDC\BIN) so TCC can find TLINK.EXE. Keeping
@@ -165,7 +215,7 @@ _EXTRA_FILES = {
 _MIN_EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
-    "//apps-boot/command:command.c": "SRC/COMMAND.C",
+    "//tools/command:command.c": "SRC/COMMAND.C",
 }
 
 # Monolithic file map for the open-source image and FreeDOS apps disk —
@@ -203,7 +253,7 @@ pkg_tar(
 # busybox + applet shims at /bin (the Linux side, NOT under home/retroos).
 pkg_tar(
     name = "bin_tar",
-    files = {"//apps/busybox:busybox": "bin/busybox"},
+    files = {"//:apps/busybox/busybox": "bin/busybox"},
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
 )
 
@@ -214,8 +264,8 @@ pkg_tar(
     name = "dos_extras_tar",
     files = _DOS_EXTRA,
     deps = [
-        "//apps/games:tar",
-        "//apps/gus:tar",
+        ":games_tar",
+        ":ultrasnd_tar",
         ":tc_tar",
         ":tp70_tar",
     ],
@@ -236,8 +286,8 @@ pkg_tar(
     name = "dos_extras_tar_proprietary",
     files = _DOS_EXTRA_PROPRIETARY,
     deps = [
-        "//apps/games:tar",
-        "//apps/gus:tar",
+        ":games_tar",
+        ":ultrasnd_tar",
         ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
@@ -256,8 +306,8 @@ pkg_tar(
     files = _BASE_FILES,
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
-        "//apps/games:tar",
-        "//apps/gus:tar",
+        ":games_tar",
+        ":ultrasnd_tar",
         ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
@@ -347,7 +397,7 @@ genrule(
     cmd = _DISK_CMD
         .replace("$(BOOT_TAR)", "$(location :boot_bundle_min_tar)")
         .replace("$(EXTRAS_TAR)", "$(location :extras_min_tar)"),
-    # Consumed by //apps/dosrt:stub_exe and //apps-boot/command:command_com
+    # Consumed by //tools/dosrt:stub_exe and //tools/command:command_com
     # (the in-OS TC compile host).
     visibility = ["//visibility:public"],
 )

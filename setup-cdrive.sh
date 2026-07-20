@@ -30,15 +30,16 @@ ln -sfn "$REPO/apps-proprietary/nc"       "$C/NC"
 ln -sfn "$REPO/apps-boot/tc"              "$C/TC"
 
 # C:\ULTRASND — the GUS instrument patches ULTRADIR (below) points at. The
-# disk image gets these from //apps/gus:tar; this drive needs them too, or
+# disk image gets these from //:ultrasnd_tar; this drive needs them too, or
 # DMX detects the GF1, finds no .PAT files, and silently disables music
-# (sfx keep working — the "GUS in QEMU but not on metal" report). Named
-# uppercase to match the image's tar mapping.
-mkdir -p "$C/ULTRASND/MIDI"
-for p in "$REPO"/apps/gus/MIDI/*.pat; do
-    ln -sfn "$p" "$C/ULTRASND/MIDI/$(basename "$p" .pat | tr '[:lower:]' '[:upper:]').PAT"
-done
-ln -sfn "$REPO/apps/gus/dgguspat.txt" "$C/ULTRASND/DGGUSPAT.TXT"
+# (sfx keep working — the "GUS in QEMU but not on metal" report).
+#
+# One directory link, not a link per patch. The repo names are lowercase and
+# the image's tar mapping uppercases them, but DOS never sees either directly:
+# every lookup goes through DFS's case-folding cache, which derives the 8.3
+# alias (ACBASS.PAT) from whatever the real name is. 196 links to spell the
+# names differently bought nothing.
+ln -sfn "$REPO/apps/ultrasnd" "$C/ULTRASND"
 
 # C:\CONFIG.SYS overrides the bootfs default (the kernel reads C:\CONFIG.SYS
 # first, then C:\BOOT\CONFIG.SYS). COMSPEC points at the bootfs COMMAND.COM;

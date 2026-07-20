@@ -306,7 +306,7 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
     }
 
     // COMMAND.COM is prebuilt (in-OS TCC at image-build time —
-    // //apps-boot/command:command_com) and ships at C:\COMMAND.COM plus inside
+    // //tools/command:command_com) and ships at C:\COMMAND.COM plus inside
     // the embedded bootfs at C:\BOOT\COMMAND.COM. The per-boot self-build from
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.

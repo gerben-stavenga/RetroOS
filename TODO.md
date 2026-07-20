@@ -181,7 +181,7 @@ same situation the interpreter already has (no ROM).
       + a fallback CONFIG.SYS ride inside the kernel image (`//:bootfs_tar` →
       objcopy → linked into .rodata; `kernel::bootfs()`); startup mounts it at
       /boot when no TAR partition exists. COMMAND.COM is a Bazel artifact now
-      (in-OS TCC on the interpreter, `//apps-boot/command:command_com`) — the
+      (in-OS TCC on the interpreter, `//tools/command:command_com`) — the
       per-boot self-build is gone; it also ships at C:\COMMAND.COM on ext4.
       The boot kernel mapping grew 1MB→5MB (pt_kernel2/3) to fit. Verified:
       `qemu-system-i386 -kernel kernel.elf` with NO disk boots to DN.

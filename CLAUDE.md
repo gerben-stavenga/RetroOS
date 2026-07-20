@@ -64,7 +64,13 @@ backends — `arch-metal` (real CPU, `no_std`/Bazel) and `arch-interp` (Unicorn,
   - `kernel/src/vga.rs` - the single emulated VGA model
 - `lib/` - Freestanding library (VGA render, ELF, TAR, MD5)
 - `play/` - `retroos-play` windowed host emulator (on `arch-interp`)
-- `apps/` - User applications, stress tests, and DOS binaries; `apps-boot/` = embedded bootfs
+- `apps/` - Shipped CONTENT only (games, GUS patches, busybox), no BUILD files:
+  every file belongs to the root package and is globbed from `//BUILD.bazel`
+- `test/` - Test harnesses (`*.sh`, `hosted_test.py`) plus the guest-side
+  probes they run: `test/dos/` (DOS `.COM`/ELF tests), `test/hosted/`
+- `tools/` - Build-time guest tooling: `tools/dosrt/` (in-OS TCC), `tools/command/` (COMMAND.COM)
+- `shell/` - Rust `no_std` userland shell for the Linux personality
+- `apps-boot/` - embedded bootfs (DN, TC)
 - `toolchain/` - Bazel toolchain configuration for bare-metal Rust
 
 ### Boot Process

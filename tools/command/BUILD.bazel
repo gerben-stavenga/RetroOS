@@ -1,5 +1,5 @@
 # COMMAND.COM is built by in-OS TCC on the interpreter backend (the same
-# recipe as //apps/dosrt:stub_exe), so it's an ordinary Bazel artifact: it
+# recipe as //tools/dosrt:stub_exe), so it's an ordinary Bazel artifact: it
 # ships prebuilt on the ext4 root and inside the kernel's embedded bootfs.
 # (It used to be self-built at every boot from SRC/COMMAND.C; the source is
 # still exported for in-OS tinkering.)
@@ -19,8 +19,8 @@ genrule(
         "//:image_min",
     ],
     outs = ["COMMAND.COM"],
-    tools = ["//apps/dosrt:interp_tcc.sh", "//apps/dosrt:interp_host"],
-    cmd = "$(location //apps/dosrt:interp_tcc.sh) $(location //apps/dosrt:interp_host) " +
+    tools = ["//tools/dosrt:interp_tcc.sh", "//tools/dosrt:interp_host"],
+    cmd = "$(location //tools/dosrt:interp_tcc.sh) $(location //tools/dosrt:interp_host) " +
           "$(location //:image_min) $(location command.c) $@ -mt -lt",
     visibility = ["//visibility:public"],
 )

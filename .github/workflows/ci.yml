@@ -33,7 +33,7 @@ jobs:
             /usr/local/share/boost /opt/hostedtoolcache/CodeQL
           df -h /
 
-      # `nasm` for the apps/tests `.COM` genrules (apps/tests/*/BUILD.bazel shell
+      # `nasm` for the test/dos `.COM` genrules (test/dos/*/BUILD.bazel shell
       # out to system nasm; the bootloader uses hermetic rules_nasm instead).
       # ubuntu-latest doesn't ship nasm, so //:image's analysis fails without it.
       - name: Install nasm
@@ -94,7 +94,7 @@ jobs:
       - name: Hosted ELF smoke
         run: |
           gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
-            -o /tmp/hello.elf apps/hosted-test/hello.c
+            -o /tmp/hello.elf test/hosted/hello.c
           # The program prints its greeting then exit(0)s; cap with timeout.
           out=$(timeout 20 bazel-bin/kernel/retroos-host /tmp/hello.elf 2>&1 || true)
           echo "$out"

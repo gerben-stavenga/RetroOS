@@ -6,7 +6,7 @@ the kernel's Linux personality.
 
 Build and run:
 
-    gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start -o /tmp/hello.elf apps/hosted-test/hello.c
+    gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start -o /tmp/hello.elf test/hosted/hello.c
     bazelisk build //kernel:retroos-host --platforms=@platforms//host
     bazel-bin/kernel/retroos-host /tmp/hello.elf
 

@@ -1,10 +1,10 @@
 # modplay — ProTracker .MOD player; the SB DMA test (replaces the C
-# sbtest in role). A dosrt app: links //apps/dosrt:dosrt_lib for the
-# crt0+console+DPMI+libc, and is packed onto //apps/dosrt:stub_exe (the
+# sbtest in role). A dosrt app: links //tools/dosrt:dosrt_lib for the
+# crt0+console+DPMI+libc, and is packed onto //tools/dosrt:stub_exe (the
 # Turbo C MZ stub) the same way as the in-tree hello payload.
 
 load("@rules_rust//rust:defs.bzl", "rust_static_library")
-load("//apps/dosrt:retro.bzl", "retro_lib")
+load("//tools/dosrt:retro.bzl", "retro_lib")
 
 rust_static_library(
     name = "modplay_lib",
@@ -18,7 +18,7 @@ rust_static_library(
         # R_386_RELATIVE fixups at load time (DOS4GW-style).
         "-Crelocation-model=pie",
     ],
-    deps = ["//apps/dosrt:dosrt_lib"],
+    deps = ["//tools/dosrt:dosrt_lib"],
 )
 
 retro_lib(
@@ -40,8 +40,8 @@ genrule(
 
 genrule(
     name = "modplay_exe",
-    srcs = ["//apps/dosrt:stub_exe", ":modplay_elf"],
+    srcs = ["//tools/dosrt:stub_exe", ":modplay_elf"],
     outs = ["MODPLAY.EXE"],
-    cmd = "cat $(location //apps/dosrt:stub_exe) $(location :modplay_elf) > $@",
+    cmd = "cat $(location //tools/dosrt:stub_exe) $(location :modplay_elf) > $@",
     visibility = ["//visibility:public"],
 )

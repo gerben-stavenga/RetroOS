@@ -1,6 +1,6 @@
 ; GUSTEST.COM — Gravis UltraSound (GF1) emulation probe.
 ;
-; Exercises the emulated GUS at ULTRASND=240,1,1,5,5 the way real drivers
+; Exercises the emulated GUS at ULTRASND=240,3,3,11,5 the way real drivers
 ; do, one phase per marker (a FAIL-* line stops the run):
 ;
 ;   GDRAM-OK  — chip reset, then the standard detection poke/peek: distinct
@@ -12,9 +12,10 @@
 ;               register (readback sets the top two bits).
 ;   GTIMER-OK — timer 1 (80 µs units) programmed through the AdLib-shaped
 ;               2X8/2X9 window + reg 0x45 IRQ enable + reset-reg master
-;               enable actually raises the ULTRASND IRQ (5 -> INT 0Dh),
+;               enable actually raises the ULTRASND IRQ (11 -> INT 73h,
+;               a SLAVE-PIC line: cascade through master IR2, EOI both),
 ;               and the ISR sees the T1 bit in the 2X6 IRQ status.
-;   GDMA-OK   — a 256-byte sample upload through the virtual 8237 (ch 1) +
+;   GDMA-OK   — a 256-byte sample upload through the virtual 8237 (ch 3) +
 ;               GF1 regs 0x42/0x41 lands in DRAM byte-exact, raises the
 ;               TC IRQ, and reading 0x41 (bit6 set) acks it.
 ;   GVOICE-OK — the uploaded data programmed as a looping voice actually
@@ -98,14 +99,17 @@ start:
         mov dx, msg_reg
         int 0x21
 
-        ; ---- phase 3: timer 1 -> ULTRASND IRQ 5 (INT 0Dh) ----
+        ; ---- phase 3: timer 1 -> ULTRASND IRQ 11 (INT 73h) ----
         xor ax, ax
         mov es, ax
         cli
-        mov word [es:0x0D*4], irq5_isr
-        mov [es:0x0D*4+2], cs
-        in  al, 0x21           ; unmask IRQ 5 on the master PIC
-        and al, 0xDF
+        mov word [es:0x73*4], gus_isr
+        mov [es:0x73*4+2], cs
+        in  al, 0xA1           ; unmask IRQ 11 (slave IR3)
+        and al, 0xF7
+        out 0xA1, al
+        in  al, 0x21           ; ...and master IR2, the cascade the slave
+        and al, 0xFB           ;    hangs off — masked, IRQ 11 never arrives
         out 0x21, al
         sti
         mov al, 0x4C           ; reset reg: run + DAC + master IRQ enable
@@ -142,9 +146,9 @@ timer_seen:
         inc bx
         cmp bx, 256
         jne .fill
-        mov al, 0x05           ; program virtual 8237 ch1: mask
+        mov al, 0x07           ; program virtual 8237 ch3: mask
         out 0x0A, al
-        mov al, 0x49           ; mode: single, read (mem -> card), ch1
+        mov al, 0x4B           ; mode: single, read (mem -> card), ch3
         out 0x0B, al
         xor al, al
         out 0x0C, al           ; clear flip-flop
@@ -154,17 +158,17 @@ timer_seen:
         shl ax, 4
         add ax, dmabuf
         adc bx, 0
-        out 0x02, al           ; addr lo
+        out 0x06, al           ; addr lo (ch3)
         mov al, ah
-        out 0x02, al           ; addr hi
+        out 0x06, al           ; addr hi
         mov ax, bx
-        out 0x83, al           ; page (ch1)
+        out 0x82, al           ; page (ch3)
         mov ax, 255            ; count - 1
-        out 0x03, al
+        out 0x07, al
         mov al, ah
-        out 0x03, al
-        mov al, 0x01
-        out 0x0A, al           ; unmask ch1
+        out 0x07, al
+        mov al, 0x03
+        out 0x0A, al           ; unmask ch3
         mov al, 0x42           ; GF1 DMA start address: DRAM 0 (units of 16)
         call selreg
         xor ax, ax
@@ -266,7 +270,7 @@ voice_ok:
         int 0x21
         jmp exit
 
-irq5_isr:
+gus_isr:
         push ax
         push dx
         mov dx, 0x246          ; GF1 IRQ status
@@ -290,7 +294,8 @@ irq5_isr:
         call selreg
         call rd8
         mov byte [cs:dmaflag], 1
-.eoi:   mov al, 0x20
+.eoi:   mov al, 0x20           ; slave EOI first, then master (cascade)
+        out 0xA0, al
         out 0x20, al
         pop dx
         pop ax

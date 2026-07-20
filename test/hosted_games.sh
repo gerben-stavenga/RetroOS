@@ -48,7 +48,7 @@ run "DIGGER (real-mode) + keyboard" \
 run "DOOM (shareware, DPMI) boots" \
     --cmd "GAMES/DOOMS/DOOM.EXE" --settle 2 --timeout 35
 
-# Emulated-SB single-cycle completion protocol (apps/tests/sbproto): the DSP
+# Emulated-SB single-cycle completion protocol (test/dos/sbproto): the DSP
 # write-status busy flicker, the 8237 status TC bit, and the post-terminal
 # count underflow — each regressed or went missing at least once (PoP's
 # end-door hang / level-transition freeze). TC-OK on screen = all three hold.
@@ -56,7 +56,7 @@ run "SB DSP completion protocol" \
     --cmd "TESTS/SBTEST.COM" --settle 3 --timeout 30 \
     --expect-log "BUSY-OK" --expect-log "EDGE-OK" --expect-log "TC-OK"
 
-# Emulated-GUS (GF1) probe (apps/tests/gusproto): DRAM poke/peek detection
+# Emulated-GUS (GF1) probe (test/dos/gusproto): DRAM poke/peek detection
 # and register-file readback through the voice/register-select scheme.
 # Markers accrete as GF1 phases land (timers, DMA upload, audible voice).
 run "GUS (GF1) registers, DRAM, timer IRQ, DMA upload, voice" \

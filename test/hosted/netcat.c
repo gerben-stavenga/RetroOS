@@ -3,7 +3,7 @@
 // Uses the i386 socketcall(2) multiplexer directly (no libc).
 //
 //   gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start -DPORT=NNNN \
-//       -o netcat.elf apps/hosted-test/netcat.c
+//       -o netcat.elf test/hosted/netcat.c
 
 static int socketcall(int call, unsigned long *args) {
     int ret;
