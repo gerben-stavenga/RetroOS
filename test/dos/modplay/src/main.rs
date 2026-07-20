@@ -561,9 +561,7 @@ unsafe extern "C" fn sb_isr_body() {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(ISR_NEXT_FILL), nf) };
 }
 
-/// Hardcoded for now; once `dosrt::env_get(b"BLASTER")` lands we read the
-/// real value from PSP[0x2C]:0.
-const BLASTER_STR: &[u8] = b"A220 I7 D1 H5 T6";
+
 
 #[unsafe(no_mangle)]
 pub fn app_main(argc: usize, argv: &[&[u8]]) {
@@ -626,7 +624,14 @@ pub fn app_main(argc: usize, argv: &[&[u8]]) {
     puts(" songlen=");
     puthex8(parsed.song_len as u8);
 
-    let sb = match sb::SoundBlaster::init(BLASTER_STR, bit16_mode, stereo_mode) {
+    // The card's real wiring, same string every DOS driver reads. Required:
+    // guessing a default would drive whatever card happens to be at the
+    // guessed ports and report success for the wrong hardware.
+    let Some(blaster) = dos::env_get(b"BLASTER") else {
+        puts(" BLASTER not in environment\r\n");
+        dos::exit(1);
+    };
+    let sb = match sb::SoundBlaster::init(blaster, bit16_mode, stereo_mode) {
         Some(sb) => sb,
         None => { puts(" sb init FAIL\r\n"); dos::exit(1); }
     };

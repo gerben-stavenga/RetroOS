@@ -472,6 +472,59 @@ pub mod dos {
         }
     }
 
+    /// Look up `name` in the DOS environment, returning its value bytes.
+    ///
+    /// PSP:0x2C holds the environment segment: a run of NUL-terminated
+    /// `KEY=VALUE` strings ended by an empty one. This is the same source
+    /// every DOS driver reads its wiring from — BLASTER, ULTRASND, ULTRADIR —
+    /// so a test that parses it follows whatever the image actually ships
+    /// instead of hardcoding a copy that can drift.
+    ///
+    /// The match is case-insensitive on the key, as DOS itself is.
+    pub fn env_get(name: &[u8]) -> Option<&'static [u8]> {
+        let mut r = Rmcs::default();
+        r.eax = 0x6200;                       // get PSP segment -> BX
+        dpmi::sim_int(0x21, &mut r);
+        let psp = r.ebx as u16;
+        if psp == 0 {
+            return None;
+        }
+        let pspp = crate::conv_flat_ptr(psp);
+        // PSP[0x2C] locates the environment — DOS has no getenv call, this
+        // field is the mechanism. But its MEANING depends on the mode we read
+        // it in: the DPMI host patches it with an env SELECTOR while a 32-bit
+        // client runs in PM, and restores the real-mode paragraph on PM→RM.
+        // We are a 32-bit client, so treat it as a selector and ask DPMI
+        // AX=0006 for its linear base; a value that is not a valid selector
+        // reports base 0, and we fall back to reading it as a paragraph.
+        let raw = unsafe { core::ptr::read_unaligned(pspp.add(0x2C) as *const u16) };
+        if raw == 0 {
+            return None;
+        }
+        let sel_base = dpmi::seg_base(raw);
+        let lin = if sel_base != 0 { sel_base } else { (raw as u32) << 4 };
+        let base = lin.wrapping_sub(dpmi::seg_base(dpmi::ds_sel())) as *mut u8;
+        let mut i = 0usize;
+        loop {
+            // An entry starting with NUL is the terminator of the block.
+            if unsafe { *base.add(i) } == 0 {
+                return None;
+            }
+            let start = i;
+            while unsafe { *base.add(i) } != 0 {
+                i += 1;
+            }
+            let entry = unsafe { core::slice::from_raw_parts(base.add(start), i - start) };
+            i += 1;
+            if entry.len() > name.len()
+                && entry[..name.len()].eq_ignore_ascii_case(name)
+                && entry[name.len()] == b'='
+            {
+                return Some(&entry[name.len() + 1..]);
+            }
+        }
+    }
+
     /// INT 21h AH=4Ch exit (register-only; reflects directly).
     pub fn exit(code: u8) -> ! {
         unsafe { core::arch::asm!("int 0x21", in("ax") 0x4C00u16 | code as u16) }

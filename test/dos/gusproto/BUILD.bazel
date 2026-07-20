@@ -1,9 +1,48 @@
-# Gravis UltraSound emulation probe (see gustest.asm header). Runs in CI
-# via test/hosted_games.sh; markers accrete as GF1 emulation phases land.
+# GUSTEST — Gravis UltraSound (GF1) emulation probe (see src/main.rs).
+# Runs in CI via test/hosted_games.sh; markers accrete as GF1 emulation
+# phases land. A dosrt app: links //tools/dosrt:dosrt_lib for the
+# crt0+console+DPMI+libc, and is packed onto //tools/dosrt:stub_exe (the
+# Turbo C MZ stub) the same way as modplay.
+
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("//tools/dosrt:retro.bzl", "retro_lib")
+
+rust_static_library(
+    name = "gustest_lib",
+    srcs = ["src/main.rs"],
+    crate_name = "gustest",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
+        # PIE: emit position-independent code; RLOADER applies the
+        # R_386_RELATIVE fixups at load time (DOS4GW-style).
+        "-Crelocation-model=pie",
+    ],
+    deps = ["//tools/dosrt:dosrt_lib"],
+)
+
+retro_lib(
+    name = "gustest_retro",
+    lib = ":gustest_lib",
+)
+
 genrule(
-    name = "gustest_com",
-    srcs = ["gustest.asm"],
-    outs = ["GUSTEST.COM"],
-    cmd = "nasm -f bin -o $@ $<",
+    name = "gustest_elf",
+    srcs = [":gustest_retro", "gustest.ld"],
+    outs = ["gustest.elf"],
+    # -pie: position-independent ET_DYN; --no-dynamic-linker drops the
+    # PT_INTERP (no ld.so — RLOADER is the loader). --gc-sections strips
+    # the unused dosrt/core bulk.
+    cmd = "ld -m elf_i386 -pie --no-dynamic-linker --hash-style=sysv " +
+          "--gc-sections -T $(location gustest.ld) -u _start " +
+          "$(location :gustest_retro) -o $@",
+)
+
+genrule(
+    name = "gustest_exe",
+    srcs = ["//tools/dosrt:stub_exe", ":gustest_elf"],
+    outs = ["GUSTEST.EXE"],
+    cmd = "cat $(location //tools/dosrt:stub_exe) $(location :gustest_elf) > $@",
     visibility = ["//visibility:public"],
 )

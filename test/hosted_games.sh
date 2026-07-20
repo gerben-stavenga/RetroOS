@@ -60,7 +60,7 @@ run "SB DSP completion protocol" \
 # and register-file readback through the voice/register-select scheme.
 # Markers accrete as GF1 phases land (timers, DMA upload, audible voice).
 run "GUS (GF1) registers, DRAM, timer IRQ, DMA upload, voice" \
-    --cmd "TESTS/GUSTEST.COM" --settle 3 --timeout 45 \
+    --cmd "TESTS/GUSTEST.EXE" --settle 3 --timeout 45 \
     --expect-log "GDRAM-OK" --expect-log "GREG-OK" --expect-log "GTIMER-OK" \
     --expect-log "GDMA-OK" --expect-log "GVOICE-OK"
 
