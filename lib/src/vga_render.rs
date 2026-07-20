@@ -525,6 +525,12 @@ pub struct Pal {
     pub fmt: PixelFormat,
 }
 
+impl Default for Pal {
+    fn default() -> Pal {
+        Pal::new()
+    }
+}
+
 impl Pal {
     pub const fn new() -> Pal {
         Pal { lut: [0; 256], fmt: PixelFormat::NATIVE }

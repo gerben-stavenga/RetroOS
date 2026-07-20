@@ -52,6 +52,12 @@ pub struct Scratch {
     row: alloc::vec::Vec<u32>,
 }
 
+impl Default for Scratch {
+    fn default() -> Scratch {
+        Scratch::new()
+    }
+}
+
 impl Scratch {
     pub const fn new() -> Scratch {
         Scratch {
