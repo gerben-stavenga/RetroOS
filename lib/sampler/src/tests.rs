@@ -172,6 +172,28 @@ fn ramp_dividers_clamp_and_loop() {
     assert!(e.voices[1].vol >= 0 && e.voices[1].vol <= 3);
 }
 
+/// The 16-bit data-width transform belongs at the DRAM fetch, not at the
+/// address-register write: voices store width-agnostic GF1 addresses, so a
+/// control write that changes `bits16` reinterprets the SAME stored address
+/// instead of forcing a re-derivation (which is what used to cost a live voice
+/// its position). The transform itself keeps address bits 19:18 as the 256 KB
+/// bank selector, drops bit 17, and doubles the offset within the bank —
+/// DOSBox Staging's `Read16BitSample` computes `upper | (lower << 1)`.
+#[test]
+fn width_transform_happens_at_fetch_not_at_write() {
+    let mut mem = vec![0u8; 1 << 20];
+    let gf1_addr: u64 = 0x40000 | 0x1234; // bank bit 18 set, low offset
+    let word = 0x40000 | (0x1234 << 1);
+    mem[word] = 0x34;
+    mem[word + 1] = 0x12;
+    assert_eq!(fetch(&mem, true, gf1_addr, 0), 0x1234);
+    // Bit 17 is dropped by the hardware: it selects the same word.
+    assert_eq!(fetch(&mem, true, gf1_addr | 0x20000, 0), 0x1234);
+    // The very same address read as 8-bit data is a plain byte index.
+    mem[gf1_addr as usize] = 0x7F;
+    assert_eq!(fetch(&mem, false, gf1_addr, 0), 0x7F00);
+}
+
 /// A tiny xorshift so the golden buffer is reproducible without std rand.
 fn fill_lfsr(buf: &mut [u8]) {
     let mut s = 0xACE1u32;

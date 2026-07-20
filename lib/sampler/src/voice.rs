@@ -83,7 +83,10 @@ pub struct Voice {
     pub running: bool,
     /// 16-bit little-endian signed frames when set; signed 8-bit otherwise.
     pub bits16: bool,
-    /// Position / increment / loop boundaries, Q32.32 sample frames.
+    /// Position / increment / loop boundaries, Q32.32 GF1 sample addresses.
+    /// Width-agnostic: for 16-bit voices the bank/doubling transform to a DRAM
+    /// byte offset is applied at fetch, not here, so these stay valid across a
+    /// change of `bits16` and never need re-deriving from the register images.
     pub addr: u64,
     pub inc: u64,
     pub start: u64,

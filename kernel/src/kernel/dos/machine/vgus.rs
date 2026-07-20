@@ -34,28 +34,22 @@ fn comb(hi: u16, lo: u16) -> u32 {
     ((hi as u32) << 16) | lo as u32
 }
 
-/// GF1 combined address → engine Q32.32 sample frames. For 16-bit voices
-/// the GF1 keeps the 256 KB bank bits untranslated and doubles the offset
-/// within the bank (a *word* index inside a byte-addressed DRAM window);
-/// the engine indexes frames, so the translated byte address halves back
-/// to `((a & 0xC0000) >> 1) | (a & 0x1FFFF)` frames.
-fn addr_q32(c: u32, bits16: bool) -> u64 {
-    let mut a = (c >> 9) & 0xFFFFF;
+/// GF1 combined address → engine Q32.32. Both sides hold the *same*
+/// width-agnostic GF1 address: the 16-bit bank/doubling transform lives at the
+/// DRAM fetch (`sampler::fetch`), not here. Keeping the translation out of the
+/// register path is what lets a voice-control write leave a live position
+/// alone — there is no width-dependent derivation left for it to redo.
+fn addr_q32(c: u32) -> u64 {
+    let a = ((c >> 9) & 0xFFFFF) as u64;
     let frac = (c & 0x1FF) as u64;
-    if bits16 {
-        a = ((a & 0xC0000) >> 1) | (a & 0x1FFFF);
-    }
-    ((a as u64) << 32) | (frac << 23)
+    (a << 32) | (frac << 23)
 }
 
 /// Engine Q32.32 → GF1 combined address (readback of live voice state).
-fn q32_addr(q: u64, bits16: bool) -> u32 {
-    let mut a = (q >> 32) as u32;
+fn q32_addr(q: u64) -> u32 {
+    let a = ((q >> 32) & 0xFFFFF) as u32;
     let frac = ((q >> 23) & 0x1FF) as u32;
-    if bits16 {
-        a = (a & 0x1FFFF) | ((a & 0x60000) << 1);
-    }
-    ((a & 0xFFFFF) << 9) | frac
+    (a << 9) | frac
 }
 
 /// GF1 16-position pan → Q12 stereo gains (0 = full left, 15 = full right;
@@ -674,24 +668,33 @@ impl GusCore {
                 };
                 v.irq_on_end = ctrl & 0x20 != 0;
                 v.backwards = ctrl & 0x40 != 0;
-                if ctrl & 0x03 != 0 {
-                    v.running = false;
-                } else {
-                    // (Re)start: derive the full address state from the raw
-                    // images with the data width this same write declared —
-                    // drivers program addresses first and control last, so
-                    // any earlier translation guess would be stale.
-                    v.start = addr_q32(comb(raw[2], raw[3]), v.bits16);
-                    v.end = addr_q32(comb(raw[4], raw[5]), v.bits16);
-                    v.addr = addr_q32(comb(raw[0xA], raw[0xB]), v.bits16);
-                    v.running = true;
-                }
+                // Mode bits and run/stop ONLY — a control write must not touch
+                // the position. On the GF1 the current-address counter is
+                // loaded by writes to registers 0x0A/0x0B and by nothing else;
+                // DOSBox Staging's `UpdateCtrlState` is the same shape (it
+                // writes `state` and the IRQ mask, never `pos`).
+                //
+                // This used to re-derive start/end/addr from the register
+                // images here, because the old engine translated addresses for
+                // the 16-bit bank layout at *write* time and so needed the
+                // width this write declares. That guess cost a live voice its
+                // position on every mid-note control write — the loop-bit clear
+                // at sustain→release, or an IRQ-acknowledging read-modify-write
+                // — teleporting it back to its note-on address (or to DRAM 0,
+                // if the driver never rewrote 0x0A/0x0B). Now that the width
+                // transform happens at fetch, there is nothing to re-derive.
+                // Measured on DOOM's DMX driver: it re-writes voice control
+                // ~20x/second on already-running voices while leaving 0x0A/0x0B
+                // at the note-on value, so the old reload dragged live voices
+                // back by up to ~10000 samples that often — every note kept
+                // restarting its attack instead of reaching its sustain loop.
+                v.running = ctrl & 0x03 == 0;
             }
             // Frequency control: the GF1 adds FC/2 per output frame in
             // 9-bit-fraction address units.
             0x01 => v.inc = ((raw[1] >> 1) as u64) << 23,
-            0x02 | 0x03 => v.start = addr_q32(comb(raw[2], raw[3]), v.bits16),
-            0x04 | 0x05 => v.end = addr_q32(comb(raw[4], raw[5]), v.bits16),
+            0x02 | 0x03 => v.start = addr_q32(comb(raw[2], raw[3])),
+            0x04 | 0x05 => v.end = addr_q32(comb(raw[4], raw[5])),
             0x06 => {
                 v.ramp.inc = Self::ramp_inc(raw[6]);
                 v.ramp.shift = (raw[6] >> 6) as u8;
@@ -699,7 +702,7 @@ impl GusCore {
             0x07 => v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8,
             0x08 => v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8,
             0x09 => v.vol = raw[9] as i32,
-            0x0A | 0x0B => v.addr = addr_q32(comb(raw[0xA], raw[0xB]), v.bits16),
+            0x0A | 0x0B => v.addr = addr_q32(comb(raw[0xA], raw[0xB])),
             0x0C => {
                 let (l, r) = pan_gains(raw[0xC]);
                 v.pan_l = l;
@@ -752,7 +755,7 @@ impl GusCore {
             0x89 => self.engine.voices[self.voice_sel as usize].vol.clamp(0, 0xFFFF) as u16,
             0x8A | 0x8B => {
                 let v = &self.engine.voices[self.voice_sel as usize];
-                let c = q32_addr(v.addr, v.bits16);
+                let c = q32_addr(v.addr);
                 if reg == 0x8A { (c >> 16) as u16 } else { c as u16 }
             }
             // Ramp control: same composition as voice control.
