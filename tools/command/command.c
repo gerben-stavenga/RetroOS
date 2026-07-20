@@ -573,7 +573,27 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
         printf("Bad command or file name: '%s'\r\n", argv[prog_idx]);
         return 255;
     }
-    if (has_ext(resolved, ".BAT")) return run_bat_file(resolved);
+    if (has_ext(resolved, ".BAT")) {
+        /* A .BAT gets its OWN address space.
+         *
+         * Batch lines are EXEC'd in-process so a TSR loaded by one line is
+         * still resident for the next. That only stays safe if the batch is
+         * isolated first: interpreting it inline runs every line — the TSR
+         * and the game it loads — in the CALLER's address space, which is
+         * DN's. Hocus Pocus then corrupted DN, which crashed on return.
+         *
+         * So fork a fresh COMMAND.COM in /B mode, exactly as the LOADFIX
+         * trampoline re-forks for /L. The child owns a clean address space
+         * with all of conventional memory, runs the lines in-process inside
+         * it, and takes the TSR down with it when the batch ends. Already
+         * inside a batch (nested .BAT) we are that child, so run it inline. */
+        if (in_batch) return run_bat_file(resolved);
+        prog_idx -= 2;   /* claim the two scratch slots for the trampoline */
+        argv[prog_idx] = command_com_path;
+        argv[prog_idx + 1] = "/B";
+        argv[prog_idx + 2] = resolved;
+        return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd, 1);
+    }
     argv[prog_idx] = resolved;
     flags = lookup_flags(resolved);
     /* Virtual-IF mode (the kernel's `IfMode`), passed as the child's vIOPL:
@@ -836,9 +856,21 @@ int main(int argc, char *argv[]) {
      * argv[1] (the flag) are both writable scratch slots in front of
      * argv[2] (the program) -- exactly what dispatch_external needs to
      * inject trampoline prefixes in place without an extra buffer. */
-    if (argc < 2 || (!is_flag(argv[1], 'L') && !is_flag(argv[1], 'C'))) {
-        printf("Usage: COMMAND.COM /C cmdline   (or /L for LOADFIX)\r\n");
+    if (argc < 2 || (!is_flag(argv[1], 'L') && !is_flag(argv[1], 'C')
+                     && !is_flag(argv[1], 'B'))) {
+        printf("Usage: COMMAND.COM /C cmdline   (/L LOADFIX, /B batch)\r\n");
         return 1;
+    }
+
+    /* /B batfile -- batch trampoline entry. We are a fresh fork with our own
+     * address space; interpret the file here so its lines (and any TSR they
+     * leave resident) are confined to it. */
+    if (is_flag(argv[1], 'B')) {
+        if (argc < 3) {
+            printf("/B requires a batch file\r\n");
+            return 1;
+        }
+        return run_bat_file(argv[2]);
     }
 
     /* /L progname [args] -- LOADFIX trampoline entry. The interactive
