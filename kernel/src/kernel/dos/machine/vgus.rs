@@ -551,8 +551,8 @@ impl GusCore {
         matches!(reg, 0x01..=0x05 | 0x09..=0x0B)
     }
 
-    /// The ramp increment, converted from the GF1 rate register (0x06) into the
-    /// sampler's log-volume domain.
+    /// The ramp increment PER FRAME, converted from the GF1 rate register
+    /// (0x06) into the sampler's ramp-domain volume units.
     ///
     /// The two ends of a ramp come from the 8-bit start/end registers, which
     /// hold the volume's TOP byte (`reg << 8`). The rate register's 6-bit
@@ -563,8 +563,24 @@ impl GusCore {
     /// every ramp 16x too long (a 1.5 ms attack becomes 24 ms), and DMX polls
     /// the ramp-done bit with interrupts disabled, so the guest sits in that
     /// spin long enough to miss its own 140 Hz music ticks.
-    fn ramp_inc(rate_reg: u16) -> u16 {
-        (rate_reg & 0x3F) << 4
+    ///
+    /// Bits 7..6 are the update-rate divider (1/8/64/512). They are folded in
+    /// HERE, as a per-frame fractional rate, rather than paced by a countdown
+    /// in the engine: DMX rewrites a voice's ramp roughly every 20 ms, which is
+    /// shorter than the slow dividers' own period, so a countdown kept getting
+    /// reset before it fired and the ramp made no progress at all. Both
+    /// DOSBox Staging (`WriteVolRate`) and 86Box (`rfreq`) fold it the same way
+    /// for the same reason — the extra `RAMP_FRACT` bits are what make a
+    /// sub-unit-per-frame rate representable.
+    fn ramp_inc(rate_reg: u16) -> i32 {
+        let per_update = ((rate_reg & 0x3F) as i32) << 4;
+        (per_update << sampler::volume::RAMP_FRACT) >> (3 * (rate_reg >> 6).min(3))
+    }
+
+    /// An 8-bit ramp bound register (0x07/0x08) into ramp-domain volume: the
+    /// register holds the volume's top byte, then the ramp's fractional bits.
+    fn ramp_bound(reg: u16) -> i32 {
+        ((reg & 0xFF) as i32) << (8 + sampler::volume::RAMP_FRACT)
     }
 
     /// Byte write to the selected register (`high` = data-high port). The
@@ -695,13 +711,10 @@ impl GusCore {
             0x01 => v.inc = ((raw[1] >> 1) as u64) << 23,
             0x02 | 0x03 => v.start = addr_q32(comb(raw[2], raw[3])),
             0x04 | 0x05 => v.end = addr_q32(comb(raw[4], raw[5])),
-            0x06 => {
-                v.ramp.inc = Self::ramp_inc(raw[6]);
-                v.ramp.shift = (raw[6] >> 6) as u8;
-            }
-            0x07 => v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8,
-            0x08 => v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8,
-            0x09 => v.vol = raw[9] as i32,
+            0x06 => v.ramp.inc = Self::ramp_inc(raw[6]),
+            0x07 => v.ramp.floor = Self::ramp_bound(raw[7]),
+            0x08 => v.ramp.ceil = Self::ramp_bound(raw[8]),
+            0x09 => v.vol = (raw[9] as i32) << sampler::volume::RAMP_FRACT,
             0x0A | 0x0B => v.addr = addr_q32(comb(raw[0xA], raw[0xB])),
             0x0C => {
                 let (l, r) = pan_gains(raw[0xC]);
@@ -719,11 +732,11 @@ impl GusCore {
                     v.ramp.running = false;
                 } else {
                     // Ramp start snapshots rate + bounds from their images.
+                    // Note there is deliberately no pacing state to (re)set
+                    // here — see `ramp_inc`. A rewrite must not cost progress.
                     v.ramp.inc = Self::ramp_inc(raw[6]);
-                    v.ramp.shift = (raw[6] >> 6) as u8;
-                    v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8;
-                    v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8;
-                    v.ramp.frames_to_next = 1u16 << (3 * v.ramp.shift.min(3));
+                    v.ramp.floor = Self::ramp_bound(raw[7]);
+                    v.ramp.ceil = Self::ramp_bound(raw[8]);
                     v.ramp.running = true;
                 }
             }
@@ -752,7 +765,9 @@ impl GusCore {
                 r
             }
             // Current volume / current address: live engine state.
-            0x89 => self.engine.voices[self.voice_sel as usize].vol.clamp(0, 0xFFFF) as u16,
+            0x89 => (self.engine.voices[self.voice_sel as usize].vol
+                >> sampler::volume::RAMP_FRACT)
+                .clamp(0, 0xFFFF) as u16,
             0x8A | 0x8B => {
                 let v = &self.engine.voices[self.voice_sel as usize];
                 let c = q32_addr(v.addr);

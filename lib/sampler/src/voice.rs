@@ -28,19 +28,25 @@ pub enum LoopMode {
 #[derive(Clone, Copy, Default)]
 pub struct Ramp {
     pub running: bool,
-    /// Amount added per update, in the SAME log-volume domain as `floor` /
-    /// `ceil` / `Voice::vol`. Not the GF1 rate register's raw 6-bit field:
-    /// that counts in units of the volume's 12-bit significand (bit 4 of the
-    /// 16-bit register), so the GF1 front-end scales it by 16 on the way in.
-    /// Feeding the raw field straight through made every ramp 16x too slow —
-    /// a ~1.5 ms note attack took ~24 ms, and DMX busy-waits (interrupts off)
-    /// for the ramp to finish, which swallowed the guest's 140 Hz music ticks.
-    pub inc: u16,
-    /// Update-rate divider (rate bits 7..6): apply every `1 << (3*shift)`
-    /// frames — 1, 8, 64, 512.
-    pub shift: u8,
-    /// Ramp boundaries in the log-volume domain (GF1 ramp start/end
-    /// registers hold the top byte: `reg << 8`).
+    /// Amount added EVERY frame, in the same ramp-domain units as `floor` /
+    /// `ceil` / `Voice::vol` (the GF1 16-bit volume register scaled up by
+    /// [`volume::RAMP_FRACT`](crate::volume::RAMP_FRACT) fractional bits).
+    ///
+    /// Both the rate register's 6-bit field and its 2-bit divider are folded
+    /// in here at write time, so the ramp advances on every frame and holds no
+    /// phase state. That is deliberate: a countdown-paced ramp has phase, and
+    /// DMX rewrites voice ramps faster than the slow dividers' own period,
+    /// which reset that phase and cost the ramp updates it should have made.
+    /// DOSBox Staging (`WriteVolRate`) and 86Box (`rfreq`) both do it this way.
+    ///
+    /// Note the 6-bit field counts in units of the volume's 12-bit significand
+    /// (bit 4 of the 16-bit register), so the GF1 front-end also scales it by
+    /// 16 on the way in. Feeding the raw field straight through made every ramp
+    /// 16x too slow — a ~1.5 ms note attack took ~24 ms, and DMX busy-waits
+    /// (interrupts off) for a ramp, which swallowed the guest's music ticks.
+    pub inc: i32,
+    /// Ramp boundaries, ramp-domain (GF1 ramp start/end registers hold the
+    /// top byte: `reg << 8`, then scaled by `RAMP_FRACT`).
     pub floor: i32,
     pub ceil: i32,
     /// Direction: toward `floor` when set.
@@ -51,8 +57,6 @@ pub struct Ramp {
     pub looped: bool,
     /// Raise a RampEnd event at each boundary.
     pub irq: bool,
-    /// Divider countdown to the next update (internal pacing).
-    pub frames_to_next: u16,
 }
 
 /// Per-voice resonant lowpass — shaped for the SF2/EMU8000 voice model but a
@@ -98,8 +102,10 @@ pub struct Voice {
     /// With `LoopMode::None`: keep running past the boundary instead of
     /// stopping (GF1 rollover bit — streaming players' refill idiom).
     pub rollover: bool,
-    /// Current volume in the log domain (GF1 16-bit register value; i32 for
-    /// ramp headroom).
+    /// Current volume, ramp-domain: the GF1 16-bit log-volume register scaled
+    /// up by [`volume::RAMP_FRACT`](crate::volume::RAMP_FRACT) fractional bits
+    /// so the ramp can move it by less than a register unit per frame. Shift
+    /// down by `RAMP_FRACT` for the register value or for `volume::lin_q16`.
     pub vol: i32,
     pub ramp: Ramp,
     /// Resolved stereo gains, Q12 (pan tables are personality policy).

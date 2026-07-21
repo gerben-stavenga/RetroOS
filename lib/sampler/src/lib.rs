@@ -135,7 +135,7 @@ impl Engine {
                 let s = v.filter.apply(s);
                 // s (16-bit) × log-volume gain (Q16) back to 16-bit, then
                 // pan (Q12) into the i32 accumulator.
-                let g = (s * volume::lin_q16(v.vol)) >> 16;
+                let g = (s * volume::lin_q16(v.vol >> volume::RAMP_FRACT)) >> 16;
                 al += (g * v.pan_l as i32) >> 12;
                 ar += (g * v.pan_r as i32) >> 12;
                 advance(v, vi, ev);
@@ -251,17 +251,18 @@ fn boundary(v: &mut Voice, vi: usize, ev: &mut Events, at_start: bool, overshoot
     }
 }
 
-/// Tick a voice's volume ramp: every `1/8/64/512` frames (the GF1 dividers)
-/// add the 6-bit increment in the log-volume register domain, resolving
-/// floor/ceil boundaries like the wave loop (clamp / loop / bidi + IRQ).
+/// Tick a voice's volume ramp: add the per-frame increment in the ramp-domain
+/// volume units, resolving floor/ceil boundaries like the wave loop (clamp /
+/// loop / bidi + IRQ).
+///
+/// Every frame, unconditionally — the GF1's 1/8/64/512 rate dividers are
+/// folded into `inc` at write time rather than paced by a countdown here. A
+/// countdown would carry phase that a ramp rewrite resets, and DMX rewrites
+/// ramps faster than the slow dividers' period, so the phase model silently
+/// dropped updates. Neither reference implementation keeps that state.
 fn ramp_tick(v: &mut Voice, vi: usize, ev: &mut Events) {
     let r = &mut v.ramp;
-    if r.frames_to_next > 1 {
-        r.frames_to_next -= 1;
-        return;
-    }
-    r.frames_to_next = 1u16 << (3 * r.shift.min(3));
-    let step = r.inc as i32;
+    let step = r.inc;
     let (hit, bound) = if r.down {
         v.vol -= step;
         (v.vol <= r.floor, r.floor)
