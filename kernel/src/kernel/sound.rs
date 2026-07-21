@@ -192,9 +192,10 @@ pub struct Pace {
     /// Session frames the sink has consumed, as of the last [`due`] call
     /// (synthetic: everything pushed — an instant consumer).
     drained: u64,
-    /// Synthetic-clock accumulator, frames × 1000. This deliberately keeps
-    /// whole-frame credit too: callers request fixed-size PCM blocks, so a
-    /// partial block remains here until the next complete block is due.
+    /// Guest-clock accumulator, frames × 1000. Production is paced on
+    /// `get_ticks` (real-time to ~1e-3); this keeps whole-frame credit so a
+    /// partial block remains here until the next complete block is due. Used on
+    /// a real sink too — the drain only sets the anchor and the wide drift band.
     frac: u64,
 }
 
@@ -267,11 +268,35 @@ impl Pace {
             } else {
                 consumed.saturating_sub(self.anchor)
             };
-            // Top the pipe up to `fill` ahead of the drain point. Self-
-            // limiting: `consumed` can never pass what was written, so a
-            // stall's backlog is bounded by `fill`, never a burst.
-            let wanted = (self.drained + self.fill as u64).saturating_sub(self.pushed);
-            let due = wanted / block * block;
+            // Pace on GUEST TIME, not on the drain position. `get_ticks` is
+            // real-time to ~1e-3 (measured against wall-clock), so producing
+            // `rate·dt` frames matches the codec's rate directly — and, unlike
+            // chasing the jittery `consumed`, the rate is near-constant, so the
+            // synth engine (and the GUS volume ramps DMX polls to time its notes)
+            // advances evenly. Chasing the drain made the engine step in the
+            // codec's coarse jitter, which desynced DMX and dropped brief
+            // silences into GUS music.
+            //
+            // To soak the crystal-level drift between the guest clock and the
+            // codec, we ALTER THE MIX RATE — a gentle proportional servo that
+            // trims `rate` by how far the pipe fill sits off `fill` (>>4 gain →
+            // sub-0.5% trim). Not the drain position (no averaging), not a
+            // resample: production stays guest-clocked, just at a rate nudged to
+            // the codec's true crystal so the pipe neither fills nor empties.
+            let deficit = (self.drained + self.fill as u64).saturating_sub(self.pushed);
+            let due = if deficit > self.fill as u64 * 3 / 4 {
+                // Far behind — an empty pipe at startup, or a severe guest stall.
+                // A gentle rate trim primes too slowly (underruns the codec), so
+                // catch straight up to `fill`. The servo only handles drift.
+                deficit / block * block
+            } else {
+                let err = (self.pushed as i64 - self.drained as i64) - self.fill as i64;
+                let rate_eff = (rate as i64 - (err >> 4)).clamp(1, rate as i64 * 2) as u64;
+                self.frac += rate_eff * dt_ms;
+                let d = self.frac / 1000 / block * block;
+                self.frac -= d * 1000;
+                d
+            };
             self.pushed += due;
             due
         } else {
