@@ -201,10 +201,12 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
-    /// Per-iteration slice work BEFORE input routing: advance the thread's
-    /// virtual time (DOS: PIT ticks, display render cadence, emulated-SB
-    /// playback). Linux threads have no virtual devices to advance.
-    pub fn on_slice(&mut self, machine: &mut A, regs: &mut Regs) {
+    /// Advance this thread's emulated world to the current virtual time,
+    /// BEFORE the guest is resumed and BEFORE input routing: DOS steps PIT
+    /// ticks, the display present cadence, and audio mixing. Linux threads have
+    /// no virtual devices to advance. Runs once per event-loop iteration, while
+    /// the guest is stopped (see `event_loop`).
+    pub fn advance_world(&mut self, machine: &mut A, regs: &mut Regs) {
         match self {
             Self::Dos(dos) => {
                 // Four rdtsc per event is ~3% of a core at this event rate, so
@@ -224,7 +226,8 @@ impl<A: crate::Arch> Personality<A> {
                     crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
                 }
                 let t2 = if prof { machine.rdtsc() } else { 0 };
-                // Pump emulated-SB playback against the same virtual clock.
+                // Advance audio (mix all sources, push to the sink) on the same
+                // virtual clock.
                 crate::kernel::dos::audio_tick(machine, dos, regs);
                 if prof {
                     let t3 = machine.rdtsc();

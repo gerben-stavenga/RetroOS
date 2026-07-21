@@ -441,7 +441,7 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         let thread = ctx.thread(threads);
 
         // Advance this thread's world: virtual time, console input, delivery.
-        thread.personality.on_slice(machine, &mut ctx.regs);
+        thread.personality.advance_world(machine, &mut ctx.regs);
         stats.part(machine, 0);
         crate::kernel::console::drain(machine, &mut ctx.regs, &mut thread.kernel, &mut thread.personality);
         stats.part(machine, 1);
@@ -829,7 +829,7 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// Event-loop diagnostics: per-event-type counts, user/kernel cycle split,
 /// the periodic [prof] dump, and the free-page low-water sampling. Keeps
 /// the loop body logic, not bookkeeping.
-/// on_slice's internals, billed from `thread.rs`: (take_pending_ticks,
+/// advance_world's internals, billed from `thread.rs`: (take_pending_ticks,
 /// tick+display, audio_tick). Diagnostic only — read by the profile dump.
 static mut SLICE_PARTS: [u64; 5] = [0; 5];
 
@@ -899,14 +899,14 @@ struct EventStats {
     user_cycles: u64,
     kernel_cycles: u64,
     /// Kernel time split by phase, to localize it: `pre` is the per-event
-    /// world-advance before the guest runs (on_slice, console drain,
+    /// world-advance before the guest runs (advance_world, console drain,
     /// after_input); `post` is dispatch + scheduler afterwards.
     pre_cycles: u64,
     post_cycles: u64,
     /// Cycles spent in `dispatch` per event kind — the same 11 slots as
     /// `counts`, so dividing one by the other gives cost-per-event.
     dispatch_cycles: [u64; 11],
-    /// The pre-phase, split three ways: on_slice, console drain, after_input.
+    /// The pre-phase, split three ways: advance_world, console drain, after_input.
     pre_parts: [u64; 3],
     part_mark: u64,
     slice_start: u64,
@@ -1113,7 +1113,7 @@ impl EventStats {
                 let np = unsafe { PRESENTS };
                 unsafe { PRESENTS = 0 };
                 crate::dbg_println!(
-                    "[prof] on_slice: take={} | queue_tick={} over {} ticks = {}c each | display={} over {} presents = {}c each | audio={}",
+                    "[prof] advance_world: take={} | queue_tick={} over {} ticks = {}c each | display={} over {} presents = {}c each | audio={}",
                     sp[0],
                     sp[1], sp[4], sp[1].checked_div(sp[4].max(1)).unwrap_or(0),
                     sp[2], np, sp[2].checked_div(np.max(1)).unwrap_or(0),
@@ -1124,7 +1124,7 @@ impl EventStats {
                 crate::dbg_println!("[prof]   display/frame: scanout={} alloc={} render={} present={} (src {}px)",
                     per(dp[0]), per(dp[1]), per(dp[2]), per(dp[3]), dp[4]);
                 unsafe { SLICE_PARTS = [0; 5] };
-                crate::dbg_println!("[prof] pre cycles/event: on_slice={} drain={} after_input={}",
+                crate::dbg_println!("[prof] pre cycles/event: advance_world={} drain={} after_input={}",
                     self.pre_parts[0] / ev, self.pre_parts[1] / ev, self.pre_parts[2] / ev);
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
