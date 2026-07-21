@@ -136,12 +136,6 @@ struct GusCore {
     ramp_pending: u32,
     /// `get_ticks()` at the last `tick` (virtual-time pacing anchor).
     last_ms: u64,
-    /// Voice wave/ramp events discovered while mixing, stamped with the
-    /// mixer-session frame they occur at: `(frame, wave_mask, ramp_mask)`.
-    /// [`Gus::deliver_events`] latches them into the guest-visible pending
-    /// masks and raises the GF1 IRQ when the sink's drain clock crosses the
-    /// frame — audible-exact delivery, like the SB's block IRQs.
-    events: alloc::collections::VecDeque<(u64, u32, u32)>,
     /// A reg-0x41 write with the enable bit set: the upload is serviced by
     /// `service_dma` right after the register write returns (it needs the
     /// machine and the 8237 shadow, which the register file never sees).
@@ -189,7 +183,6 @@ impl GusCore {
             wave_pending: 0,
             ramp_pending: 0,
             last_ms: 0,
-            events: alloc::collections::VecDeque::new(),
             dma_kick: false,
             dma_tc: false,
             dma_irq_latch: false,
@@ -223,7 +216,6 @@ impl GusCore {
         self.timers = [GusTimer::default(); 2];
         self.wave_pending = 0;
         self.ramp_pending = 0;
-        self.events.clear();
         self.dma_kick = false;
         self.dma_tc = false;
         self.dma_irq_latch = false;
@@ -325,28 +317,22 @@ impl Gus {
         self.present = false;
     }
 
-    /// Mixer-session restart: stamped event frames from the previous session
-    /// numbering are meaningless — drop them.
-    pub fn on_mix_session(&mut self) {
-        if let Some(c) = self.core.as_mut() {
-            c.events.clear();
-        }
-    }
-
-    /// Deliver voice events whose stream frame the sink has played past
-    /// (`drained` = the mixer's drain clock): latch the guest-visible
-    /// pending masks and request the GF1 IRQ line (master enable is
-    /// reset-register bit 2).
-    pub fn deliver_events(&mut self, drained: u64, vpic: &mut super::vpic::VirtualPic) {
+    /// Raise the GF1 IRQ line for voice boundaries latched while mixing (master
+    /// enable is reset-register bit 2).
+    ///
+    /// The events are latched into the guest-visible pending masks as the voice
+    /// crosses the boundary — i.e. on the GF1's own clock. Nothing here consults
+    /// the sink: a voice's wave/ramp IRQ is a property of where the voice is, not
+    /// of how far a codec has drained. This used to defer each event until the
+    /// drain clock crossed the frame it was stamped at, which delivered the
+    /// guest's IRQs a pipe-depth late on a real codec and not at all late on the
+    /// hosted sink — a sink clock reaching into guest-visible GF1 behaviour.
+    /// `mix_into` cannot raise the line itself (it has no vPIC), so it only
+    /// latches; this runs from the device tick and asserts.
+    pub fn deliver_events(&mut self, vpic: &mut super::vpic::VirtualPic) {
         let Some(c) = self.core.as_mut() else { return };
-        let mut want_irq = false;
-        while c.events.front().is_some_and(|&(f, _, _)| f <= drained) {
-            let (_, wave, ramp) = c.events.pop_front().unwrap();
-            c.wave_pending |= wave;
-            c.ramp_pending |= ramp;
-            want_irq = true;
-        }
-        if want_irq && c.reset_reg & 0x04 != 0 && !vpic.is_requested(self.irq) {
+        let pending = c.wave_pending | c.ramp_pending;
+        if pending != 0 && c.reset_reg & 0x04 != 0 && !vpic.is_requested(self.irq) {
             vpic.raise(self.irq);
         }
     }
@@ -354,8 +340,8 @@ impl Gus {
     /// Per-quantum device tick, from `machine::audio_tick`: pace the rate
     /// timers by virtual time and raise the GF1 IRQ line for enabled,
     /// unserviced sources. Playback runs through the mixer pump (the
-    /// common PCM-source path below); voice-event IRQs deliver separately, on the
-    /// pump's drain clock ([`Gus::deliver_events`]).
+    /// common PCM-source path below); voice-boundary IRQs assert separately via
+    /// [`Gus::deliver_events`], off the GF1's own clock — never the sink's.
     pub fn tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
@@ -862,12 +848,12 @@ impl Gus {
             .is_some_and(|c| c.reset_reg & 0x02 != 0 && c.engine.any_running())
     }
 
-    /// Add wavetable output at the pump's rate (chip-native steps, zero-order
-    /// hold), summing saturating. Voice wave/ramp events are stamped with the
-    /// exact session frame they occur at and queued for [`Gus::deliver_events`]
-    /// — they become guest-visible when that frame *plays*, not when it is
-    /// generated `fill` early.
-    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, base: u64, block: &mut [(i32, i32)]) {
+    /// Add wavetable output at the mixer's rate (chip-native steps, zero-order
+    /// hold), summing saturating. Voice wave/ramp boundaries latch straight into
+    /// the guest-visible pending masks as the voice crosses them — on the GF1's
+    /// own clock, with no reference to the sink. [`Gus::deliver_events`] asserts
+    /// the IRQ line from the device tick (no vPIC reachable from a pull).
+    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, _base: u64, block: &mut [(i32, i32)]) {
         if !self.mixing() {
             return;
         }
@@ -876,7 +862,7 @@ impl Gus {
         // Process every position in this final PCM block. `mix_frame` advances
         // the GF1/native-rate phase as needed; each native step walks all
         // active voices, including address/loop/stop and volume-ramp state.
-        for (i, slot) in block.iter_mut().enumerate() {
+        for slot in block.iter_mut() {
             let mut ev = sampler::Events::default();
             let (l, r) = c.engine.mix_frame(&c.dram, native, rate, &mut ev);
             // Unity — the GF1's output is the mixer's reference level (86Box
@@ -884,16 +870,8 @@ impl Gus {
             // master volume; the per-voice ramps already carry it.
             slot.0 += (l * super::vsb::GUS_SCALE_Q16) >> 16;
             slot.1 += (r * super::vsb::GUS_SCALE_Q16) >> 16;
-            if ev.any() {
-                let at = base + i as u64;
-                match c.events.back_mut() {
-                    Some(e) if e.0 == at => {
-                        e.1 |= ev.wave_irq;
-                        e.2 |= ev.ramp_irq;
-                    }
-                    _ => c.events.push_back((at, ev.wave_irq, ev.ramp_irq)),
-                }
-            }
+            c.wave_pending |= ev.wave_irq;
+            c.ramp_pending |= ev.ramp_irq;
         }
     }
 }

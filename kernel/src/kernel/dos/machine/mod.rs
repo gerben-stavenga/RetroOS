@@ -967,7 +967,6 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         }
         mixer.pace.reset();
         mixer.dsp_epoch = 0;
-        gus.on_mix_session();
         return;
     }
     // Source activity does not define the output session. In particular, an
@@ -1018,7 +1017,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let dsp_rate = sb.dsp_rate().max(1) as u64;
     let to_dsp = |mix: u64| mix.saturating_sub(mixer.dsp_epoch) * dsp_rate / rate as u64;
     sb.dsp_clock_tick(machine, vpic, to_dsp(drained), to_dsp(pushed));
-    gus.deliver_events(drained, vpic);
+    gus.deliver_events(vpic);
 
 }
 
