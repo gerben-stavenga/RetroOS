@@ -52,11 +52,28 @@ fn q32_addr(q: u64) -> u32 {
     (a << 9) | frac
 }
 
-/// GF1 16-position pan → Q12 stereo gains (0 = full left, 15 = full right;
-/// linear law, unity 4096).
+/// GF1 16-position pan → Q12 stereo gains (0 = full left, 15 = full right).
+///
+/// Constant-power law: `left = cos θ`, `right = sin θ` with θ swept 0..90° so
+/// `left² + right² == unity` at every position — the pan the GUS SDK specifies
+/// ("output power is held constant") and what DOSBox Staging's
+/// `PopulatePanScalars` builds. A *linear* law (what this used to do) drops the
+/// summed power 3 dB at centre (position 7 = 0.53/0.47, power ≈ 0.50), which
+/// hollows out centred voices and smears the stereo image — audible on GUS SFX
+/// as a "hole in the middle" / mistimed-speaker depth. The table is precomputed
+/// (Q12, rounded from the cos/sin arc) because the kernel is float-free; note
+/// the arc is *asymmetric* about centre (divisor 7 below, 8 at/above), so the
+/// two columns are not mirror images.
 fn pan_gains(p: u16) -> (u16, u16) {
-    let p = (p & 15) as u32;
-    ((((15 - p) * 4096) / 15) as u16, ((p * 4096) / 15) as u16)
+    // dosbox-staging PopulatePanScalars, ×4096 rounded: norm = (i−7)/(i<7?7:8),
+    // angle = (norm+1)·π/4, left = cos, right = sin.
+    const PAN: [(u16, u16); 16] = [
+        (4096, 0), (4070, 459), (3993, 911), (3866, 1353),
+        (3690, 1777), (3468, 2179), (3202, 2554), (2896, 2896),
+        (2598, 3166), (2276, 3406), (1931, 3612), (1567, 3784),
+        (1189, 3920), (799, 4017), (401, 4076), (0, 4096),
+    ];
+    PAN[(p & 15) as usize]
 }
 
 /// Always-present, tiny per-thread GUS state: the ULTRASND wiring and the
