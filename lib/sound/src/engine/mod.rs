@@ -1,5 +1,5 @@
 //! The unified wavetable sampler — the one integer voice-mixing engine every
-//! sample-playback personality programs (GUS/GF1 now; GM-over-SoundFont,
+//! sample-playback card programs (GUS/GF1 now; GM-over-SoundFont,
 //! AWE32/EMU8000 and the MT-32 timbre renderer later). The engine is a pure
 //! function of (voice state, sample memory): it owns no clock, no sample
 //! memory, and no device policy — callers decide how many frames to pull and
@@ -24,10 +24,6 @@
 //!
 //! The per-frame mix loop is hot (up to 44.1 kHz × 32 voices), which is why
 //! the crate builds `-Copt-level=2` instead of //lib's `-z`.
-
-#![cfg_attr(not(test), no_std)]
-
-extern crate alloc;
 
 pub mod voice;
 pub mod volume;
