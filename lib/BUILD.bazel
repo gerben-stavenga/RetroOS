@@ -39,6 +39,9 @@ rust_library(
 rust_test(
     name = "sound_test",
     crate = ":sound",
+    # One real .PAT is compiled into the test: the synthetic fixtures only
+    # prove the parser agrees with our own idea of the layout.
+    compile_data = ["//:apps/ultrasnd/MIDI/acpiano.pat"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Zpanic_abort_tests",

@@ -32,6 +32,7 @@ extern crate alloc;
 pub mod engine;
 pub mod gus;
 pub mod opl;
+pub mod pat;
 pub mod sb;
 
 pub use engine::{
