@@ -34,35 +34,46 @@ fn comb(hi: u16, lo: u16) -> u32 {
     ((hi as u32) << 16) | lo as u32
 }
 
-/// GF1 combined address → engine Q32.32 sample frames. For 16-bit voices
-/// the GF1 keeps the 256 KB bank bits untranslated and doubles the offset
-/// within the bank (a *word* index inside a byte-addressed DRAM window);
-/// the engine indexes frames, so the translated byte address halves back
-/// to `((a & 0xC0000) >> 1) | (a & 0x1FFFF)` frames.
-fn addr_q32(c: u32, bits16: bool) -> u64 {
-    let mut a = (c >> 9) & 0xFFFFF;
+/// GF1 combined address → engine Q32.32. Both sides hold the *same*
+/// width-agnostic GF1 address: the 16-bit bank/doubling transform lives at the
+/// DRAM fetch (`sampler::fetch`), not here. Keeping the translation out of the
+/// register path is what lets a voice-control write leave a live position
+/// alone — there is no width-dependent derivation left for it to redo.
+fn addr_q32(c: u32) -> u64 {
+    let a = ((c >> 9) & 0xFFFFF) as u64;
     let frac = (c & 0x1FF) as u64;
-    if bits16 {
-        a = ((a & 0xC0000) >> 1) | (a & 0x1FFFF);
-    }
-    ((a as u64) << 32) | (frac << 23)
+    (a << 32) | (frac << 23)
 }
 
 /// Engine Q32.32 → GF1 combined address (readback of live voice state).
-fn q32_addr(q: u64, bits16: bool) -> u32 {
-    let mut a = (q >> 32) as u32;
+fn q32_addr(q: u64) -> u32 {
+    let a = ((q >> 32) & 0xFFFFF) as u32;
     let frac = ((q >> 23) & 0x1FF) as u32;
-    if bits16 {
-        a = (a & 0x1FFFF) | ((a & 0x60000) << 1);
-    }
-    ((a & 0xFFFFF) << 9) | frac
+    (a << 9) | frac
 }
 
-/// GF1 16-position pan → Q12 stereo gains (0 = full left, 15 = full right;
-/// linear law, unity 4096).
+/// GF1 16-position pan → Q12 stereo gains (0 = full left, 15 = full right).
+///
+/// Constant-power law: `left = cos θ`, `right = sin θ` with θ swept 0..90° so
+/// `left² + right² == unity` at every position — the pan the GUS SDK specifies
+/// ("output power is held constant") and what DOSBox Staging's
+/// `PopulatePanScalars` builds. A *linear* law (what this used to do) drops the
+/// summed power 3 dB at centre (position 7 = 0.53/0.47, power ≈ 0.50), which
+/// hollows out centred voices and smears the stereo image — audible on GUS SFX
+/// as a "hole in the middle" / mistimed-speaker depth. The table is precomputed
+/// (Q12, rounded from the cos/sin arc) because the kernel is float-free; note
+/// the arc is *asymmetric* about centre (divisor 7 below, 8 at/above), so the
+/// two columns are not mirror images.
 fn pan_gains(p: u16) -> (u16, u16) {
-    let p = (p & 15) as u32;
-    ((((15 - p) * 4096) / 15) as u16, ((p * 4096) / 15) as u16)
+    // dosbox-staging PopulatePanScalars, ×4096 rounded: norm = (i−7)/(i<7?7:8),
+    // angle = (norm+1)·π/4, left = cos, right = sin.
+    const PAN: [(u16, u16); 16] = [
+        (4096, 0), (4070, 459), (3993, 911), (3866, 1353),
+        (3690, 1777), (3468, 2179), (3202, 2554), (2896, 2896),
+        (2598, 3166), (2276, 3406), (1931, 3612), (1567, 3784),
+        (1189, 3920), (799, 4017), (401, 4076), (0, 4096),
+    ];
+    PAN[(p & 15) as usize]
 }
 
 /// Always-present, tiny per-thread GUS state: the ULTRASND wiring and the
@@ -125,12 +136,6 @@ struct GusCore {
     ramp_pending: u32,
     /// `get_ticks()` at the last `tick` (virtual-time pacing anchor).
     last_ms: u64,
-    /// Voice wave/ramp events discovered while mixing, stamped with the
-    /// mixer-session frame they occur at: `(frame, wave_mask, ramp_mask)`.
-    /// [`Gus::deliver_events`] latches them into the guest-visible pending
-    /// masks and raises the GF1 IRQ when the sink's drain clock crosses the
-    /// frame — audible-exact delivery, like the SB's block IRQs.
-    events: alloc::collections::VecDeque<(u64, u32, u32)>,
     /// A reg-0x41 write with the enable bit set: the upload is serviced by
     /// `service_dma` right after the register write returns (it needs the
     /// machine and the 8237 shadow, which the register file never sees).
@@ -178,7 +183,6 @@ impl GusCore {
             wave_pending: 0,
             ramp_pending: 0,
             last_ms: 0,
-            events: alloc::collections::VecDeque::new(),
             dma_kick: false,
             dma_tc: false,
             dma_irq_latch: false,
@@ -212,7 +216,6 @@ impl GusCore {
         self.timers = [GusTimer::default(); 2];
         self.wave_pending = 0;
         self.ramp_pending = 0;
-        self.events.clear();
         self.dma_kick = false;
         self.dma_tc = false;
         self.dma_irq_latch = false;
@@ -314,28 +317,22 @@ impl Gus {
         self.present = false;
     }
 
-    /// Mixer-session restart: stamped event frames from the previous session
-    /// numbering are meaningless — drop them.
-    pub fn on_mix_session(&mut self) {
-        if let Some(c) = self.core.as_mut() {
-            c.events.clear();
-        }
-    }
-
-    /// Deliver voice events whose stream frame the sink has played past
-    /// (`drained` = the mixer's drain clock): latch the guest-visible
-    /// pending masks and request the GF1 IRQ line (master enable is
-    /// reset-register bit 2).
-    pub fn deliver_events(&mut self, drained: u64, vpic: &mut super::vpic::VirtualPic) {
+    /// Raise the GF1 IRQ line for voice boundaries latched while mixing (master
+    /// enable is reset-register bit 2).
+    ///
+    /// The events are latched into the guest-visible pending masks as the voice
+    /// crosses the boundary — i.e. on the GF1's own clock. Nothing here consults
+    /// the sink: a voice's wave/ramp IRQ is a property of where the voice is, not
+    /// of how far a codec has drained. This used to defer each event until the
+    /// drain clock crossed the frame it was stamped at, which delivered the
+    /// guest's IRQs a pipe-depth late on a real codec and not at all late on the
+    /// hosted sink — a sink clock reaching into guest-visible GF1 behaviour.
+    /// `mix_into` cannot raise the line itself (it has no vPIC), so it only
+    /// latches; this runs from the device tick and asserts.
+    pub fn deliver_events(&mut self, vpic: &mut super::vpic::VirtualPic) {
         let Some(c) = self.core.as_mut() else { return };
-        let mut want_irq = false;
-        while c.events.front().is_some_and(|&(f, _, _)| f <= drained) {
-            let (_, wave, ramp) = c.events.pop_front().unwrap();
-            c.wave_pending |= wave;
-            c.ramp_pending |= ramp;
-            want_irq = true;
-        }
-        if want_irq && c.reset_reg & 0x04 != 0 && !vpic.is_requested(self.irq) {
+        let pending = c.wave_pending | c.ramp_pending;
+        if pending != 0 && c.reset_reg & 0x04 != 0 && !vpic.is_requested(self.irq) {
             vpic.raise(self.irq);
         }
     }
@@ -343,8 +340,8 @@ impl Gus {
     /// Per-quantum device tick, from `machine::audio_tick`: pace the rate
     /// timers by virtual time and raise the GF1 IRQ line for enabled,
     /// unserviced sources. Playback runs through the mixer pump (the
-    /// common PCM-source path below); voice-event IRQs deliver separately, on the
-    /// pump's drain clock ([`Gus::deliver_events`]).
+    /// common PCM-source path below); voice-boundary IRQs assert separately via
+    /// [`Gus::deliver_events`], off the GF1's own clock — never the sink's.
     pub fn tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
@@ -557,8 +554,8 @@ impl GusCore {
         matches!(reg, 0x01..=0x05 | 0x09..=0x0B)
     }
 
-    /// The ramp increment, converted from the GF1 rate register (0x06) into the
-    /// sampler's log-volume domain.
+    /// The ramp increment PER FRAME, converted from the GF1 rate register
+    /// (0x06) into the sampler's ramp-domain volume units.
     ///
     /// The two ends of a ramp come from the 8-bit start/end registers, which
     /// hold the volume's TOP byte (`reg << 8`). The rate register's 6-bit
@@ -569,8 +566,24 @@ impl GusCore {
     /// every ramp 16x too long (a 1.5 ms attack becomes 24 ms), and DMX polls
     /// the ramp-done bit with interrupts disabled, so the guest sits in that
     /// spin long enough to miss its own 140 Hz music ticks.
-    fn ramp_inc(rate_reg: u16) -> u16 {
-        (rate_reg & 0x3F) << 4
+    ///
+    /// Bits 7..6 are the update-rate divider (1/8/64/512). They are folded in
+    /// HERE, as a per-frame fractional rate, rather than paced by a countdown
+    /// in the engine: DMX rewrites a voice's ramp roughly every 20 ms, which is
+    /// shorter than the slow dividers' own period, so a countdown kept getting
+    /// reset before it fired and the ramp made no progress at all. Both
+    /// DOSBox Staging (`WriteVolRate`) and 86Box (`rfreq`) fold it the same way
+    /// for the same reason — the extra `RAMP_FRACT` bits are what make a
+    /// sub-unit-per-frame rate representable.
+    fn ramp_inc(rate_reg: u16) -> i32 {
+        let per_update = ((rate_reg & 0x3F) as i32) << 4;
+        (per_update << sampler::volume::RAMP_FRACT) >> (3 * (rate_reg >> 6).min(3))
+    }
+
+    /// An 8-bit ramp bound register (0x07/0x08) into ramp-domain volume: the
+    /// register holds the volume's top byte, then the ramp's fractional bits.
+    fn ramp_bound(reg: u16) -> i32 {
+        ((reg & 0xFF) as i32) << (8 + sampler::volume::RAMP_FRACT)
     }
 
     /// Byte write to the selected register (`high` = data-high port). The
@@ -674,32 +687,38 @@ impl GusCore {
                 };
                 v.irq_on_end = ctrl & 0x20 != 0;
                 v.backwards = ctrl & 0x40 != 0;
-                if ctrl & 0x03 != 0 {
-                    v.running = false;
-                } else {
-                    // (Re)start: derive the full address state from the raw
-                    // images with the data width this same write declared —
-                    // drivers program addresses first and control last, so
-                    // any earlier translation guess would be stale.
-                    v.start = addr_q32(comb(raw[2], raw[3]), v.bits16);
-                    v.end = addr_q32(comb(raw[4], raw[5]), v.bits16);
-                    v.addr = addr_q32(comb(raw[0xA], raw[0xB]), v.bits16);
-                    v.running = true;
-                }
+                // Mode bits and run/stop ONLY — a control write must not touch
+                // the position. On the GF1 the current-address counter is
+                // loaded by writes to registers 0x0A/0x0B and by nothing else;
+                // DOSBox Staging's `UpdateCtrlState` is the same shape (it
+                // writes `state` and the IRQ mask, never `pos`).
+                //
+                // This used to re-derive start/end/addr from the register
+                // images here, because the old engine translated addresses for
+                // the 16-bit bank layout at *write* time and so needed the
+                // width this write declares. That guess cost a live voice its
+                // position on every mid-note control write — the loop-bit clear
+                // at sustain→release, or an IRQ-acknowledging read-modify-write
+                // — teleporting it back to its note-on address (or to DRAM 0,
+                // if the driver never rewrote 0x0A/0x0B). Now that the width
+                // transform happens at fetch, there is nothing to re-derive.
+                // Measured on DOOM's DMX driver: it re-writes voice control
+                // ~20x/second on already-running voices while leaving 0x0A/0x0B
+                // at the note-on value, so the old reload dragged live voices
+                // back by up to ~10000 samples that often — every note kept
+                // restarting its attack instead of reaching its sustain loop.
+                v.running = ctrl & 0x03 == 0;
             }
             // Frequency control: the GF1 adds FC/2 per output frame in
             // 9-bit-fraction address units.
             0x01 => v.inc = ((raw[1] >> 1) as u64) << 23,
-            0x02 | 0x03 => v.start = addr_q32(comb(raw[2], raw[3]), v.bits16),
-            0x04 | 0x05 => v.end = addr_q32(comb(raw[4], raw[5]), v.bits16),
-            0x06 => {
-                v.ramp.inc = Self::ramp_inc(raw[6]);
-                v.ramp.shift = (raw[6] >> 6) as u8;
-            }
-            0x07 => v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8,
-            0x08 => v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8,
-            0x09 => v.vol = raw[9] as i32,
-            0x0A | 0x0B => v.addr = addr_q32(comb(raw[0xA], raw[0xB]), v.bits16),
+            0x02 | 0x03 => v.start = addr_q32(comb(raw[2], raw[3])),
+            0x04 | 0x05 => v.end = addr_q32(comb(raw[4], raw[5])),
+            0x06 => v.ramp.inc = Self::ramp_inc(raw[6]),
+            0x07 => v.ramp.floor = Self::ramp_bound(raw[7]),
+            0x08 => v.ramp.ceil = Self::ramp_bound(raw[8]),
+            0x09 => v.vol = (raw[9] as i32) << sampler::volume::RAMP_FRACT,
+            0x0A | 0x0B => v.addr = addr_q32(comb(raw[0xA], raw[0xB])),
             0x0C => {
                 let (l, r) = pan_gains(raw[0xC]);
                 v.pan_l = l;
@@ -716,11 +735,11 @@ impl GusCore {
                     v.ramp.running = false;
                 } else {
                     // Ramp start snapshots rate + bounds from their images.
+                    // Note there is deliberately no pacing state to (re)set
+                    // here — see `ramp_inc`. A rewrite must not cost progress.
                     v.ramp.inc = Self::ramp_inc(raw[6]);
-                    v.ramp.shift = (raw[6] >> 6) as u8;
-                    v.ramp.floor = ((raw[7] & 0xFF) as i32) << 8;
-                    v.ramp.ceil = ((raw[8] & 0xFF) as i32) << 8;
-                    v.ramp.frames_to_next = 1u16 << (3 * v.ramp.shift.min(3));
+                    v.ramp.floor = Self::ramp_bound(raw[7]);
+                    v.ramp.ceil = Self::ramp_bound(raw[8]);
                     v.ramp.running = true;
                 }
             }
@@ -749,10 +768,12 @@ impl GusCore {
                 r
             }
             // Current volume / current address: live engine state.
-            0x89 => self.engine.voices[self.voice_sel as usize].vol.clamp(0, 0xFFFF) as u16,
+            0x89 => (self.engine.voices[self.voice_sel as usize].vol
+                >> sampler::volume::RAMP_FRACT)
+                .clamp(0, 0xFFFF) as u16,
             0x8A | 0x8B => {
                 let v = &self.engine.voices[self.voice_sel as usize];
-                let c = q32_addr(v.addr, v.bits16);
+                let c = q32_addr(v.addr);
                 if reg == 0x8A { (c >> 16) as u16 } else { c as u16 }
             }
             // Ramp control: same composition as voice control.
@@ -827,12 +848,12 @@ impl Gus {
             .is_some_and(|c| c.reset_reg & 0x02 != 0 && c.engine.any_running())
     }
 
-    /// Add wavetable output at the pump's rate (chip-native steps, zero-order
-    /// hold), summing saturating. Voice wave/ramp events are stamped with the
-    /// exact session frame they occur at and queued for [`Gus::deliver_events`]
-    /// — they become guest-visible when that frame *plays*, not when it is
-    /// generated `fill` early.
-    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, base: u64, block: &mut [(i32, i32)]) {
+    /// Add wavetable output at the mixer's rate (chip-native steps, zero-order
+    /// hold), summing saturating. Voice wave/ramp boundaries latch straight into
+    /// the guest-visible pending masks as the voice crosses them — on the GF1's
+    /// own clock, with no reference to the sink. [`Gus::deliver_events`] asserts
+    /// the IRQ line from the device tick (no vPIC reachable from a pull).
+    pub(super) fn mix_into<A: crate::Arch>(&mut self, _machine: &mut A, rate: u32, _base: u64, block: &mut [(i32, i32)]) {
         if !self.mixing() {
             return;
         }
@@ -841,7 +862,7 @@ impl Gus {
         // Process every position in this final PCM block. `mix_frame` advances
         // the GF1/native-rate phase as needed; each native step walks all
         // active voices, including address/loop/stop and volume-ramp state.
-        for (i, slot) in block.iter_mut().enumerate() {
+        for slot in block.iter_mut() {
             let mut ev = sampler::Events::default();
             let (l, r) = c.engine.mix_frame(&c.dram, native, rate, &mut ev);
             // Unity — the GF1's output is the mixer's reference level (86Box
@@ -849,16 +870,8 @@ impl Gus {
             // master volume; the per-voice ramps already carry it.
             slot.0 += (l * super::vsb::GUS_SCALE_Q16) >> 16;
             slot.1 += (r * super::vsb::GUS_SCALE_Q16) >> 16;
-            if ev.any() {
-                let at = base + i as u64;
-                match c.events.back_mut() {
-                    Some(e) if e.0 == at => {
-                        e.1 |= ev.wave_irq;
-                        e.2 |= ev.ramp_irq;
-                    }
-                    _ => c.events.push_back((at, ev.wave_irq, ev.ramp_irq)),
-                }
-            }
+            c.wave_pending |= ev.wave_irq;
+            c.ramp_pending |= ev.ramp_irq;
         }
     }
 }

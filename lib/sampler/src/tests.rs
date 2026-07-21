@@ -8,9 +8,14 @@ fn q32(frames: u64) -> u64 {
     frames << 32
 }
 
+/// A GF1 16-bit volume register value in the ramp's fixed-point domain.
+fn rvol(reg: i32) -> i32 {
+    reg << volume::RAMP_FRACT
+}
+
 fn voice_on(v: &mut Voice) {
     v.running = true;
-    v.vol = 0xFFF0; // near-unity
+    v.vol = rvol(0xFFF0); // near-unity
     v.pan_l = 0x0FFF;
     v.pan_r = 0x0FFF;
 }
@@ -121,41 +126,38 @@ fn backwards_forward_loop_wraps_to_end() {
 }
 
 #[test]
-fn ramp_dividers_clamp_and_loop() {
+fn ramp_advances_every_frame_and_clamps_or_loops() {
     let mem = [0u8; 4];
     let mut e = Engine::new_boxed();
     e.active = 2;
 
-    // Voice 0: slowest divider (every 512 frames), no loop: count updates
-    // over 1024 frames, then clamp+stop+IRQ at the ceiling.
+    // Voice 0: a slow rate (one register unit per 512 frames, the GF1's
+    // slowest divider) climbing 2 register units, then clamp+stop+IRQ.
+    let slow = rvol(1) / 512;
     let v = &mut e.voices[0];
-    v.vol = 0x1000;
+    v.vol = rvol(0x1000);
     v.ramp = Ramp {
         running: true,
-        inc: 4,
-        shift: 3,
-        floor: 0x1000,
-        ceil: 0x1000 + 8,
+        inc: slow,
+        floor: rvol(0x1000),
+        ceil: rvol(0x1002),
         down: false,
         bidi: false,
         looped: false,
         irq: true,
-        frames_to_next: 512,
     };
-    // Voice 1: fastest divider, looped: wraps back to floor at the ceiling.
+    // Voice 1: a fast rate, looped: wraps back to floor at the ceiling.
     let v = &mut e.voices[1];
     v.vol = 0;
     v.ramp = Ramp {
         running: true,
-        inc: 1,
-        shift: 0,
+        inc: rvol(1),
         floor: 0,
-        ceil: 3,
+        ceil: rvol(3),
         down: false,
         bidi: false,
         looped: true,
         irq: false,
-        frames_to_next: 1,
     };
 
     let mut ev = Events::default();
@@ -163,13 +165,80 @@ fn ramp_dividers_clamp_and_loop() {
     for _ in 0..1024 {
         e.generate(&mem, &mut out, &mut ev);
     }
-    // Updates at frames 512 and 1024: +4, then +4 hits ceil 0x1008 -> clamp.
-    assert_eq!(e.voices[0].vol, 0x1008);
+    // 1024 frames x (1/512 register units) = exactly the 2-unit span.
+    assert_eq!(e.voices[0].vol, rvol(0x1002));
     assert!(!e.voices[0].ramp.running);
     assert_eq!(ev.ramp_irq & 1, 1);
-    // Looped: 1024 updates over a 3-step cycle (0->1->2->3==ceil->0 wrap).
+    // Looped: wraps around a 3-unit cycle and keeps running.
     assert!(e.voices[1].ramp.running);
-    assert!(e.voices[1].vol >= 0 && e.voices[1].vol <= 3);
+    assert!(e.voices[1].vol >= 0 && e.voices[1].vol <= rvol(3));
+}
+
+/// The property the phase-counter model got wrong: a ramp rewritten more often
+/// than its own update period must still make progress. Reprogramming carries
+/// no pacing state, so N frames of ramping advance the volume by N*inc no
+/// matter how many times the ramp is restarted in between. DMX rewrites voice
+/// ramps every ~20ms, faster than the slow dividers' period, and under the old
+/// countdown model those ramps stalled outright.
+#[test]
+fn frequent_ramp_rewrites_do_not_stall_progress() {
+    let mem = [0u8; 4];
+    let slow = rvol(1) / 512; // GF1 slowest divider: 512 frames per unit
+
+    let run = |restart_every: usize| -> i32 {
+        let mut e = Engine::new_boxed();
+        e.active = 1;
+        let v = &mut e.voices[0];
+        v.vol = rvol(0x8000);
+        v.ramp = Ramp {
+            running: true,
+            inc: slow,
+            floor: 0,
+            ceil: rvol(0xFFFF),
+            down: true,
+            bidi: false,
+            looped: false,
+            irq: false,
+        };
+        let mut ev = Events::default();
+        let mut out = [0i16; 2];
+        for i in 0..4096 {
+            if restart_every != 0 && i % restart_every == 0 {
+                // What a guest ramp-control write does: re-arm, same params.
+                e.voices[0].ramp.running = true;
+            }
+            e.generate(&mem, &mut out, &mut ev);
+        }
+        rvol(0x8000) - e.voices[0].vol
+    };
+
+    let undisturbed = run(0);
+    assert_eq!(undisturbed, 4096 * slow, "4096 frames must move 4096 steps");
+    // Rewritten far more often than the 512-frame update period would allow.
+    assert_eq!(run(64), undisturbed, "a rewrite must not cost progress");
+    assert_eq!(run(1), undisturbed, "even a rewrite every single frame");
+}
+
+/// The 16-bit data-width transform belongs at the DRAM fetch, not at the
+/// address-register write: voices store width-agnostic GF1 addresses, so a
+/// control write that changes `bits16` reinterprets the SAME stored address
+/// instead of forcing a re-derivation (which is what used to cost a live voice
+/// its position). The transform itself keeps address bits 19:18 as the 256 KB
+/// bank selector, drops bit 17, and doubles the offset within the bank —
+/// DOSBox Staging's `Read16BitSample` computes `upper | (lower << 1)`.
+#[test]
+fn width_transform_happens_at_fetch_not_at_write() {
+    let mut mem = vec![0u8; 1 << 20];
+    let gf1_addr: u64 = 0x40000 | 0x1234; // bank bit 18 set, low offset
+    let word = 0x40000 | (0x1234 << 1);
+    mem[word] = 0x34;
+    mem[word + 1] = 0x12;
+    assert_eq!(fetch(&mem, true, gf1_addr, 0), 0x1234);
+    // Bit 17 is dropped by the hardware: it selects the same word.
+    assert_eq!(fetch(&mem, true, gf1_addr | 0x20000, 0), 0x1234);
+    // The very same address read as 8-bit data is a plain byte index.
+    mem[gf1_addr as usize] = 0x7F;
+    assert_eq!(fetch(&mem, false, gf1_addr, 0), 0x7F00);
 }
 
 /// A tiny xorshift so the golden buffer is reproducible without std rand.
@@ -231,18 +300,16 @@ fn golden_mix() {
     v.addr = q32(150);
     v.inc = q32(1) / 2;
     v.loop_mode = LoopMode::Forward;
-    v.vol = 0xE000;
+    v.vol = rvol(0xE000);
     v.ramp = Ramp {
         running: true,
-        inc: 8,
-        shift: 1,
-        floor: 0xA000,
-        ceil: 0xE000,
+        inc: rvol(1), // one register unit per frame (was 8 units per 8 frames)
+        floor: rvol(0xA000),
+        ceil: rvol(0xE000),
         down: true,
         bidi: true,
         looped: true,
         irq: false,
-        frames_to_next: 8,
     };
 
     let v = &mut e.voices[3]; // 8-bit backwards forward-loop
@@ -265,7 +332,11 @@ fn golden_mix() {
     }
     assert_eq!(
         fnv1a(&bytes),
-        11527402967319707540, // from the first verified run of this exact scene
+        // Regenerated when the ramp moved from a lump-every-N-frames staircase
+        // to a per-frame fractional slope: voice 2 ramps, so its instantaneous
+        // volume differs frame to frame even though the average rate is
+        // unchanged. Previous literal: 11527402967319707540.
+        11509080982864882439,
         "golden mix hash changed; if the semantics change was intentional, update the literal"
     );
 }

@@ -10,9 +10,10 @@
 //! to x87 the kernel doesn't context-switch (see stdlib/nuked_opl3.BUILD for
 //! the same rule). Formats:
 //!
-//!  - addresses/increments: Q32.32 sample-frame index (`u64`). The GF1's
-//!    20.9 registers convert losslessly by `<< 23` / `>> 23`; 32 integer
-//!    bits also cover SF2 sample pools.
+//!  - addresses/increments: Q32.32 GF1 sample address (`u64`), width-agnostic
+//!    — data-width transforms belong at the DRAM fetch. The GF1's 20.9
+//!    registers convert losslessly by `<< 23` / `>> 23`; 32 integer bits also
+//!    cover SF2 sample pools.
 //!  - volume: the GF1's logarithmic 16-bit register domain (exponent in
 //!    bits 15-12, mantissa in bits 11-0), held in an `i32` for ramp
 //!    headroom. This is the canonical volume domain for every personality:
@@ -134,7 +135,7 @@ impl Engine {
                 let s = v.filter.apply(s);
                 // s (16-bit) × log-volume gain (Q16) back to 16-bit, then
                 // pan (Q12) into the i32 accumulator.
-                let g = (s * volume::lin_q16(v.vol)) >> 16;
+                let g = (s * volume::lin_q16(v.vol >> volume::RAMP_FRACT)) >> 16;
                 al += (g * v.pan_l as i32) >> 12;
                 ar += (g * v.pan_r as i32) >> 12;
                 advance(v, vi, ev);
@@ -151,25 +152,41 @@ fn sat16(v: i32) -> i16 {
     v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// Fetch the (interpolated) sample at frame `idx` + `frac10` (top 10 fraction
-/// bits — the GF1 interpolates linearly in hardware). 8-bit data is signed
-/// DRAM bytes scaled to 16-bit; 16-bit data is little-endian signed frames.
+/// Fetch the (interpolated) sample at GF1 address `idx` + `frac10` (top 10
+/// fraction bits — the GF1 interpolates linearly in hardware). 8-bit data is
+/// signed DRAM bytes scaled to 16-bit; 16-bit data is little-endian signed.
 /// Out-of-range reads yield silence rather than trapping: guests can program
 /// addresses beyond the memory they uploaded.
+///
+/// `idx` is a *width-agnostic* GF1 sample address, exactly as the guest
+/// programs it — the 16-bit bank transform happens HERE, at the DRAM read,
+/// and not when the address registers are written. That ordering is the whole
+/// point: because the width isn't needed until fetch time, a voice-control
+/// write (which is what declares the width) never has to re-derive an address
+/// that is already live, and so can leave the position counter alone the way
+/// the GF1 does.
 fn fetch(mem: &[u8], bits16: bool, idx: u64, frac10: i32) -> i32 {
     let get = |b: usize| -> u8 { mem.get(b).copied().unwrap_or(0) };
+    // GF1 address → DRAM byte offset. 8-bit voices address bytes directly;
+    // 16-bit voices keep the 256 KB bank bits (19:18) and double the offset
+    // within the bank — bit 17 is dropped by the hardware. Applied per
+    // sample (not once for the pair) so interpolation across a bank edge
+    // lands where the hardware lands.
+    let byte = |a: u64| -> usize {
+        if bits16 {
+            ((a & 0xC0000) | ((a & 0x1FFFF) << 1)) as usize
+        } else {
+            (a & 0xFFFFF) as usize
+        }
+    };
+    let (b, n) = (byte(idx), byte(idx + 1));
     let (s0, s1) = if bits16 {
-        let b = (idx as usize).wrapping_mul(2);
         (
             i16::from_le_bytes([get(b), get(b + 1)]) as i32,
-            i16::from_le_bytes([get(b + 2), get(b + 3)]) as i32,
+            i16::from_le_bytes([get(n), get(n + 1)]) as i32,
         )
     } else {
-        let b = idx as usize;
-        (
-            ((get(b) as i8) as i32) << 8,
-            ((get(b + 1) as i8) as i32) << 8,
-        )
+        (((get(b) as i8) as i32) << 8, ((get(n) as i8) as i32) << 8)
     };
     s0 + (((s1 - s0) * frac10) >> 10)
 }
@@ -234,17 +251,18 @@ fn boundary(v: &mut Voice, vi: usize, ev: &mut Events, at_start: bool, overshoot
     }
 }
 
-/// Tick a voice's volume ramp: every `1/8/64/512` frames (the GF1 dividers)
-/// add the 6-bit increment in the log-volume register domain, resolving
-/// floor/ceil boundaries like the wave loop (clamp / loop / bidi + IRQ).
+/// Tick a voice's volume ramp: add the per-frame increment in the ramp-domain
+/// volume units, resolving floor/ceil boundaries like the wave loop (clamp /
+/// loop / bidi + IRQ).
+///
+/// Every frame, unconditionally — the GF1's 1/8/64/512 rate dividers are
+/// folded into `inc` at write time rather than paced by a countdown here. A
+/// countdown would carry phase that a ramp rewrite resets, and DMX rewrites
+/// ramps faster than the slow dividers' period, so the phase model silently
+/// dropped updates. Neither reference implementation keeps that state.
 fn ramp_tick(v: &mut Voice, vi: usize, ev: &mut Events) {
     let r = &mut v.ramp;
-    if r.frames_to_next > 1 {
-        r.frames_to_next -= 1;
-        return;
-    }
-    r.frames_to_next = 1u16 << (3 * r.shift.min(3));
-    let step = r.inc as i32;
+    let step = r.inc;
     let (hit, bound) = if r.down {
         v.vol -= step;
         (v.vol <= r.floor, r.floor)
