@@ -31,6 +31,8 @@ extern crate alloc;
 
 pub mod engine;
 pub mod gus;
+pub mod opl;
+pub mod sb;
 
 pub use engine::{
     Engine, Events, LoopMode, MAX_VOICES, Ramp, Voice, VoiceFilter, voice, volume,

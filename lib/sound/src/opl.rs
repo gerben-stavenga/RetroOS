@@ -9,19 +9,18 @@
 //! (start ⇒ instant expiry; ms ticks can't resolve the 80 µs timer, and
 //! every probe only polls "did it expire").
 //!
-//! Output goes through the machine mixer pump (`machine::audio_tick`): the
-//! chip adds its frames through the common PCM-source mixer path and into
-//! the pump's block at the pump's rate (chip-native steps, zero-order hold —
-//! the same resampling the codec drivers use). [`OplFm::audible`] keeps the
+//! Output goes through the host's mixer pump: the chip adds its frames through
+//! [`Fm::mix_into`] at the pump's rate (chip-native steps, zero-order hold —
+//! the same resampling the codec drivers use). [`Fm::audible`] keeps the
 //! canonical stream open through the between-notes hangover; once every
-//! envelope is released and the driver has gone quiet the pump parks the
-//! stream. State is per-thread and dropped on program cleanup like the rest
-//! of the virtual SB.
+//! envelope is released and the driver has gone quiet the host parks the
+//! stream. Passive like every card here: the clock arrives as an argument to
+//! [`Fm::write`], never read; the chip owns no I/O.
 
 use nuked_opl3::Opl3Chip;
 
 /// The YMF262's native output rate (14.318 MHz master clock / 288).
-pub(super) const NATIVE_RATE: u32 = 49_716;
+pub const NATIVE_RATE: u32 = 49_716;
 
 /// Keep synthesizing this long after the last data-register write even with
 /// all envelopes released — drivers pause between notes and between songs.
@@ -34,7 +33,7 @@ const HANGOVER_MS: u64 = 2_000;
 const PENDING_MAX: usize = 4_096;
 
 /// What a guest-visible FM port decodes to.
-pub(super) enum OplPort {
+pub enum OplPort {
     /// Address latch write; the payload is the register file (bank) the
     /// port hard-wires: 0 for `0x388`/`base+0`/`base+8`, 1 for the OPL3
     /// extension ports `0x38A`/`base+2`.
@@ -46,7 +45,7 @@ pub(super) enum OplPort {
 /// Decode a guest FM port against the SB base, or `None` if not an FM port.
 /// Covers the AdLib block and both SB mirrors; reads of any of these return
 /// the (single) status register.
-pub(super) fn decode_port(io_base: u16, p: u16) -> Option<OplPort> {
+pub fn decode_port(io_base: u16, p: u16) -> Option<OplPort> {
     match p {
         0x388 => Some(OplPort::Addr(0)),
         0x38A => Some(OplPort::Addr(1)),
@@ -63,7 +62,7 @@ pub(super) fn decode_port(io_base: u16, p: u16) -> Option<OplPort> {
 /// Per-thread FM synthesizer state. Created lazily on the first FM register
 /// write (the chip is ~20 KB of tables/slots; programs without FM never pay
 /// for it), dropped with the rest of the SB state on program cleanup.
-pub(super) struct OplFm {
+pub struct Fm {
     /// Native-rate synthesis core. Boxed: the chip is ~20 KB and `PcMachine`
     /// is per-thread state.
     chip: alloc::boxed::Box<Opl3Chip>,
@@ -101,9 +100,9 @@ pub(super) struct OplFm {
     pending: alloc::collections::VecDeque<(u16, u8)>,
 }
 
-impl OplFm {
-    pub(super) fn new(now: u64) -> Self {
-        OplFm {
+impl Fm {
+    pub fn new(now: u64) -> Self {
+        Fm {
             // new_boxed, NOT Box::new(Opl3Chip::new(..)): the by-value
             // constructor materializes the ~20 KB chip on the kernel stack,
             // which overflowed it on metal (creation happens in the guest's
@@ -119,12 +118,12 @@ impl OplFm {
     }
 
     /// The status register — what a read of any FM window port returns.
-    pub(super) fn status(&self) -> u8 {
+    pub fn status(&self) -> u8 {
         self.status
     }
 
     /// Guest write to an FM port.
-    pub(super) fn write(&mut self, now: u64, port: OplPort, val: u8) {
+    pub fn write(&mut self, now: u64, port: OplPort, val: u8) {
         match port {
             OplPort::Addr(bank) => self.index = ((bank as u16) << 8) | val as u16,
             OplPort::Data => {
@@ -166,7 +165,7 @@ impl OplFm {
     /// Whether the synth currently owes the sink audio: envelopes still
     /// sounding, or the driver wrote recently (between-notes hangover).
     /// The mixer pump keeps the canonical stream open while this holds.
-    pub(super) fn audible(&self, now: u64) -> bool {
+    pub fn audible(&self, now: u64) -> bool {
         self.chip.active_voice_count() > 0
             || !self.pending.is_empty()
             || now.saturating_sub(self.last_write_ms) < HANGOVER_MS
@@ -174,13 +173,13 @@ impl OplFm {
 }
 
 /// The mixer pump pulls FM through the canonical mix-source shape.
-impl OplFm {
+impl Fm {
     /// Voices-only (no write hangover): a silent chip mixes silence — skip
     /// the work. (`audible` decides whether the *stream* stays open.) Queued
     /// writes also count: the queue drains a frame at a time from `mix_into`,
     /// so a chip whose only pending work is a key-on must still be pumped or
     /// the write would never reach it.
-    pub(super) fn mixing(&self) -> bool {
+    pub fn mixing(&self) -> bool {
         self.chip.active_voice_count() > 0 || !self.pending.is_empty()
     }
 
@@ -190,11 +189,9 @@ impl OplFm {
     /// write, which is what keeps consecutive writes ≥1 frame apart — see
     /// `pending`. No sub-block events: the OPL's guest-visible timers run on
     /// virtual time, not the stream.
-    pub(super) fn mix_into<A: crate::Arch>(
+    pub fn mix_into(
         &mut self,
-        _machine: &mut A,
         rate: u32,
-        _base: u64,
         block: &mut [(i32, i32)],
         gain_q16: (i32, i32),
     ) {

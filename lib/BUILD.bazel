@@ -30,6 +30,7 @@ rust_library(
         "-Copt-level=2",
         "-Crelocation-model=static",
     ],
+    deps = ["@nuked_opl3//:nuked_opl3"],
 )
 
 # Host unit tests (bazelisk test //lib:sound_test --platforms=@platforms//host).
