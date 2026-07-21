@@ -67,11 +67,18 @@ const ATT_2DB_5BIT: [u16; 32] = [
 const FM_SCALE_Q16: i32 = 47_000; // 0.7171630859375 == 47000/65536, exactly
 const DAC_SCALE_Q16: i32 = 65_536 / 3;
 
-/// Unity. The GF1's own output is the mixer's reference level (86Box
-/// `gus_get_buffer` adds `gus->buffer[]` straight into the mix), and the
-/// GUS has no guest-visible master volume — the GF1's per-voice volume ramps
-/// already carry it.
-pub(super) const GUS_SCALE_Q16: i32 = 65_536;
+/// Level-matched to FM so a game's SFX balance does not depend on which music
+/// device it picked. The GF1 has no guest-visible master volume (its per-voice
+/// ramps carry it) and 86Box's `gus_get_buffer` adds `gus->buffer[]` straight
+/// in, so this used to be unity — but the GF1 sums 32 voices where OPL has 9,
+/// and measured on the same track (DOOM E1M8, 2 min of steady music) GUS came
+/// out **3.74x / +11.5 dB above OPL** (rms 2719 vs 727). Digital SFX are scaled
+/// for the FM balance, so under GUS music they were simply buried.
+///
+/// 65536/3.74: brings GUS music to the FM music level, leaving the DAC-vs-music
+/// balance the same whichever music device the game selects. Re-measure with the
+/// same method if either source's level changes.
+pub(super) const GUS_SCALE_Q16: i32 = 17_500;
 
 /// One knob for overall loudness, applied to the summed mix just before the
 /// single clip. Unity: the headroom already lives in the per-source scales
