@@ -94,32 +94,44 @@ impl Gus {
         self.present = false;
     }
 
-    /// Latch the chip's service request into the vPIC. The GF1 line is
-    /// edge-triggered into the 8259, so a request that is already pending
-    /// coalesces — exactly as it does on hardware.
-    fn raise_if_wanted(&mut self, vpic: &mut super::vpic::VirtualPic) {
-        if self.card.take_irq() && !vpic.is_requested(self.irq) {
+    /// Latch a GF1 service request into the vPIC. The line is edge-triggered
+    /// into the 8259, so a request that is already pending coalesces —
+    /// exactly as it does on hardware.
+    fn raise(&mut self, vpic: &mut super::vpic::VirtualPic) {
+        if !vpic.is_requested(self.irq) {
             vpic.raise(self.irq);
         }
     }
 
     /// Voice-boundary IRQs latched while mixing. `mix_into` cannot reach the
     /// vPIC (it may run a pipe-depth ahead of the speaker, so raising there
-    /// would deliver early); this runs from the device tick and asserts.
+    /// would deliver early); this runs once per audio quantum and asserts.
+    ///
+    /// Once per quantum is load-bearing, which is why this is a separate entry
+    /// point from [`tick`](Self::tick) rather than one "does the chip want the
+    /// line" call: the voice pending masks are a *standing* request, and
+    /// re-latching them on every pass of the event loop re-arms IRQ5 the
+    /// instant the guest EOIs. DOOM's DMX driver under DOS/4GW dies of nested
+    /// interrupt transfers within seconds when that happens.
     pub fn deliver_events(&mut self, vpic: &mut super::vpic::VirtualPic) {
-        self.raise_if_wanted(vpic);
+        if self.card.wants_service() {
+            self.raise(vpic);
+        }
     }
 
     /// Per-quantum device tick, from `machine::audio_tick`: hand the chip the
-    /// clock for its rate timers, then assert the line if it asks. Playback
-    /// runs through the mixer pump (the common PCM-source path).
+    /// clock for its rate timers, then assert the line for the one-shot
+    /// sources (timer expiry, DMA terminal count). Playback runs through the
+    /// mixer pump (the common PCM-source path).
     pub fn tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
         vpic: &mut super::vpic::VirtualPic,
     ) {
         self.card.tick(machine.get_ticks());
-        self.raise_if_wanted(vpic);
+        if self.card.take_irq() {
+            self.raise(vpic);
+        }
     }
 
     /// Guest IN from a decoded port.

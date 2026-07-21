@@ -127,31 +127,53 @@ fn port_out(&mut self, port: u16, val: u8);
 // ── clock: passed in, never read ───────────────────────────────
 fn tick(&mut self, now_ms: u64);
 
-// ── IRQ: a level the host samples, never a call outward ────────
-fn irq_line(&self) -> bool;
+// ── IRQ: the host samples, the card never calls outward ────────
+fn take_irq(&mut self) -> bool;      // one-shot: timer expiry, DMA TC
+fn wants_service(&self) -> bool;     // standing: until the ISR drains it
 
 // ── PCM: pure frame generation, no I/O of any kind ─────────────
-fn mix_into(&mut self, rate: u32, block: &mut [(i32, i32)]);
+fn mix_into(&mut self, rate: u32, gain: (i32, i32), block: &mut [(i32, i32)]);
 ```
 
 `tick` taking its clock as an argument is the same discipline
-`Engine::mix_frame` already uses for its rate. `irq_line` as a *level* the
-host samples (rather than a `vpic.raise` the card performs) is what removes
+`Engine::mix_frame` already uses for its rate. Reporting the interrupt
+instead of performing it (no `vpic.raise` inside the card) is what removes
 the last kernel type from the signature list.
+
+**The IRQ surface is two queries, not one, and the GUS pilot proved why the
+hard way.** This document originally specified a single `irq_line() -> bool`
+level. Folding both sources into it looks obviously right and is a latent IRQ
+storm: a card's interrupt sources do not share a cadence. Timer expiries and
+DMA terminal counts are *one-shot* — they happen, they are consumed, they are
+gone. Voice-boundary interrupts are *standing* — they sit in a guest-visible
+pending mask until the ISR pops the FIFO register, so a single level query
+keeps answering "yes" for as long as the guest takes to service them. A host
+that samples that on every pass of its event loop re-latches the line the
+instant the guest EOIs. Under DOS/4GW, DOOM's DMX driver died of nested
+interrupt transfers within four seconds.
+
+Splitting them lets the host sample each on the clock that fits: one-shots
+from the device tick, standing requests once per audio quantum. The general
+rule for any card added later: **do not merge two interrupt sources behind
+one query unless they are serviced on the same clock.**
+
+`mix_into` takes its gain because how loud one card sits against another is
+a property of the *mix*, not of the card (the open question at the end of
+§3, resolved in the host's favour).
 
 ### 2.2 Sample bytes: the fourth port, in two directions
 
-DMA becomes a byte stream with no addresses in it. The card says which
-channel the guest latched onto and whether a transfer is armed; the host —
-which owns the 8237 and guest memory — moves the bytes.
+DMA becomes a byte stream with no addresses in it. The card says a transfer
+is armed and which way it runs; the host — which owns the 8237 and guest
+memory — moves the bytes.
 
 ```rust
-fn dma_channel(&self) -> Option<u8>;   // what the guest programmed
-fn dma_active(&self)  -> bool;         // a transfer is armed
+fn dma_armed(&self)   -> bool;         // a transfer is armed
+fn dma_to_card(&self) -> bool;         // direction, from the guest's registers
 
 // GUS-shaped (sink): the card files bytes into its own DRAM, applying its
 // own reg-0x41 transforms, advancing its own address, TC-ing itself.
-fn dma_write(&mut self, bytes: &[u8]) -> usize;   // bytes accepted
+fn dma_write(&mut self, bytes: &[u8], tc: bool) -> usize;  // bytes accepted
 
 // SB-shaped (source): the card takes PCM into its ring; its DAC consumes.
 fn dma_feed(&mut self, bytes: &[u8]) -> usize;    // bytes accepted
@@ -164,9 +186,18 @@ counters advance by what it actually received or played, so a host that
 paces differently gets correct register readback for free instead of
 needing to share our timing model.
 
-Note what is *absent*: `gpa`, `len`, page registers, `Dma8237`. The card
-reports a channel number; translating that to an address is the host's job,
-because only the host knows what a channel means.
+`tc` is the controller's terminal-count wire, so it is a *parameter* rather
+than something the card decides. A chunked feed must land identically to a
+single-shot one, which is why the GF1's byte-parity sample transform runs off
+the running transfer offset and not the chunk's. We pass the whole upload at
+once with `tc: true`: a GF1 upload is bounded and the driver waits for TC
+anyway.
+
+Note what is *absent*: `gpa`, `len`, page registers, `Dma8237` — and, after
+the pilot, the channel number too. Which channel a GUS sits on is ULTRASND
+strapping, i.e. host configuration, not a chip register, so the card never
+learns it at all. A card whose channel genuinely is guest-programmed can
+report one; do not add the accessor speculatively.
 
 ### 2.3 Consumption-based accounting
 
@@ -207,11 +238,12 @@ simply not been fed, so it must reproduce the same guest-visible behaviour
 The split is "spatial and temporal facts belong to the host":
 
 - **The 8237** (`vdma.rs`), page registers, and every guest physical
-  address. The host reads `dma_channel()`, decodes its own controller,
-  performs `copy_from`, and reconstructs the guest-visible count from what
-  the card reports.
-- **The vPIC** (`vpic.rs`). The host samples `irq_line()` and drives its
-  own interrupt controller.
+  address. The host knows the card's channel from its strapping, decodes its
+  own controller, performs `copy_from`, and reconstructs the guest-visible
+  count from what the card reports.
+- **The vPIC** (`vpic.rs`). The host samples the card's two IRQ queries and
+  drives its own interrupt controller — including the "is a request already
+  latched" guard, which is a property of an 8259, not of a sound chip.
 - **The clock.** `machine.get_ticks()` is read once per `audio_tick` and
   passed down.
 - **Configuration discovery.** `configure_from_env` for `ULTRASND=`
@@ -260,12 +292,16 @@ Register decode is not hot but does not object to being optimised.
 
 ## 5. Migration order
 
-1. **GUS pilot.** Two arch calls, mechanical. Move `Gus`/`GusCore` to
-   `lib/sound/src/gus.rs`, convert `service_dma` to `dma_write`, `tick` to
-   take `now_ms`, `deliver_events` to `irq_line`. The kernel keeps the
-   ULTRASND parse, the 8237 decode, the vPIC, and the trace ring.
-   *Verify:* the E1M8/Doom GUS recipes — real-time production to 0.1 %, no
-   note gaps, and the DUKE3D GUS-ISR path.
+1. **GUS pilot — DONE.** `Gus`/`GusCore` → `sound::gus::Gf1`; `service_dma`
+   split into a host-side DMA cycle plus the card's `dma_write`; `tick` takes
+   `now_ms`; the vPIC raise became `take_irq` + `wants_service`. The kernel
+   keeps the ULTRASND parse, the 8237 decode, the vPIC and the trace ring.
+   *Verified:* GUSTEST's five markers (DRAM, register file, timer IRQ,
+   byte-exact DMA upload, audible voice); DOOM E1M8 with GUS music captured
+   to WAV against master — identical peak (3383), RMS within 0.3 %, same
+   silent-gap count; DUKE3D + ROTT + the hosted battery; QEMU metal boot.
+   *Cost one real bug*, recorded in §2.1: the single `irq_line()` level this
+   document originally specified is an IRQ storm.
 2. **OPL.** Nearly free; carries the `nuked_opl3` dependency across.
 3. **SB core.** `EmuDsp` + `SbMixer` → `lib/sound/src/sb.rs` with
    consumption-based accounting (section 2.3), leaving `SoundBlaster` in

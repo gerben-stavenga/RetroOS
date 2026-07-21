@@ -442,25 +442,33 @@ impl Gf1 {
         }
     }
 
-    /// Whether the GF1 wants service, consuming the one-shot part of that
-    /// claim. Master IRQ enable is reset-register bit 2.
+    /// A *one-shot* service request — a rate-timer expiry or a DMA terminal
+    /// count — drained by the call. Master IRQ enable is reset-register bit 2;
+    /// with it clear the edge is dropped, not queued.
     ///
-    /// Two kinds of source are folded together here. Voice wave/ramp
-    /// boundaries are *standing* — they sit in the guest-visible pending
-    /// masks until the ISR pops register 0x8F — so they are reported for as
-    /// long as they stand. Timer expiries and DMA terminal counts are
-    /// one-shot edges and are drained by the call.
-    ///
-    /// The GF1 line is edge-latched into an 8259 in every real machine, so
-    /// the host owns the "is a request already latched" question; this only
-    /// answers "does the chip want the line".
+    /// The GF1 line is edge-latched into an 8259 in every real machine, so the
+    /// host owns the "is a request already latched" question; this only
+    /// answers "did the chip just ask".
     pub fn take_irq(&mut self) -> bool {
         let Some(c) = self.core.as_mut() else { return false };
         let edge = core::mem::take(&mut c.irq_edge);
-        if c.reset_reg & 0x04 == 0 {
-            return false; // master disabled: the edge is dropped, not queued
-        }
-        edge || (c.wave_pending | c.ramp_pending) != 0
+        edge && c.reset_reg & 0x04 != 0
+    }
+
+    /// A *standing* service request: voice wave/ramp boundaries sit in the
+    /// guest-visible pending masks until the ISR pops register 0x8F, so this
+    /// stays true for as long as they stand.
+    ///
+    /// Deliberately NOT folded into [`take_irq`](Self::take_irq): the two have
+    /// different natural cadences, and the host must be free to sample them
+    /// separately. Asking this on every pass of a fast event loop and
+    /// re-latching the line each time the guest EOIs is an IRQ storm — a
+    /// DOS extender drowns in nested interrupt transfers long before the
+    /// pending mask drains. Sample it on the same clock that produces audio.
+    pub fn wants_service(&self) -> bool {
+        self.core
+            .as_ref()
+            .is_some_and(|c| c.reset_reg & 0x04 != 0 && (c.wave_pending | c.ramp_pending) != 0)
     }
 
     // ── sample upload (the card end of a DMA cycle) ──────────────────────
