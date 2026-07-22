@@ -78,13 +78,14 @@ jobs:
       - name: Clippy (metal crates)
         run: |
           bazel build --config=clippy \
-            //kernel:kernel //lib:lib //arch-abi:arch-abi //arch-metal:arch-metal
+            //kernel:kernel //lib:lib //lib:sound \
+            //arch-abi:arch-abi //arch-metal:arch-metal
 
       - name: Clippy (host crates)
         run: |
           bazel build --config=clippy --platforms=@platforms//host \
             //kernel:kernel //kernel:retroos-host \
-            //arch-interp:arch-interp //lib:lib //arch-abi:arch-abi
+            //arch-interp:arch-interp //lib:lib //lib:sound //arch-abi:arch-abi
 
       - name: Build hosted runner
         run: bazel build //kernel:retroos-host --platforms=@platforms//host

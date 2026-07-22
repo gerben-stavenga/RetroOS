@@ -52,6 +52,10 @@ pkg_tar(
 # applet dispatch (basename(argv[0]) -> applet).
 exports_files(["apps/busybox/busybox"])
 
+# One real GUS instrument, compiled into //lib:sound_test so the .PAT parser
+# is checked against a shipped file and not only synthetic fixtures.
+exports_files(["apps/ultrasnd/MIDI/acpiano.pat"])
+
 
 # Convenient applet shims for busybox: each is a tar symlink "bin/<name>"
 # pointing at "busybox" (relative within /bin), so PATH=/bin lookup of

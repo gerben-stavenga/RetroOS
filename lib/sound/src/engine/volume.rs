@@ -28,3 +28,27 @@ pub fn lin_q16(v: i32) -> i32 {
     let v = v.clamp(0, 0xFFFF);
     ((0x1000 | (v & 0xFFF)) << ((v >> 12) as u32)) >> 12
 }
+
+/// The register value meaning unity gain.
+pub const FULL: i32 = 0xFFFF;
+
+/// Inverse of [`lin_q16`]: a linear Q16 gain → the log register encoding it.
+///
+/// `lin_q16(v) = (0x1000 | mant) << exp >> 12`, so a gain `g` lies in
+/// `[2^exp, 2^(exp+1))` — the exponent is `floor(log2 g)` and the mantissa is
+/// what remains after normalizing. Exact round-trip on every representable
+/// value; gains below 1 or above unity clamp.
+#[inline]
+pub fn log_q16(g: i32) -> i32 {
+    let g = g.clamp(1, FULL);
+    let exp = (31 - (g as u32).leading_zeros() as i32).clamp(0, 15);
+    let mant = ((((g as u32) << 12) >> exp) as i32 - 0x1000).clamp(0, 0xFFF);
+    (exp << 12) | mant
+}
+
+/// A MIDI 0-127 level (velocity, volume, expression) as a log register,
+/// treating the level as a linear amplitude fraction of unity.
+#[inline]
+pub fn log_from_midi(level: u8) -> i32 {
+    log_q16((level.min(127) as i32 * FULL) / 127)
+}

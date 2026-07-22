@@ -4016,6 +4016,9 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
     // ULTRASND makes the (emulated) GUS exist for this program and sets its
     // base/DMA/IRQ wiring; without it the card stays absent.
     dos.pc.gus.configure_from_env(&env);
+    // BLASTER's P<port> makes the MPU-401 / General MIDI device exist, and
+    // ULTRADIR says where its .PAT bank lives (the same one the GUS plays).
+    dos.pc.mpu.configure_from_env(&env);
     init_psp(machine, regs, psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
     dos_set_program_block_owner(machine, dos, regs, env_seg, psp_seg, psp_seg);

@@ -1,31 +1,28 @@
-//! Virtual Sound Blaster card (DSP + SB-DMA virtualization).
+//! The machine's Sound Blaster: everything a card needs that is *not* the chip.
 //!
-//! The SB is the one DOS sound device RetroOS virtualizes. It *uses* an ISA DMA
-//! channel — the generic [`Dma8237`](super::vdma::Dma8237) shadow in `vdma.rs`,
-//! exactly as a real SB card uses an 8237 channel — and runs in one of two
-//! modes (passthrough vs emulated, the boot-time `platform::Audio` verdict):
+//! The emulated chip itself is [`sound::sb::Sb`] — a passive state machine in
+//! `//lib:sound` (DSP + CT1745 mixer + the OPL on the same card) that owns no
+//! sample memory and reaches nothing. This file is the machine around it, and
+//! it has a second job the GUS never had: the SB runs in one of two modes,
+//! the boot-time `platform::Audio` verdict.
 //!
 //!  - **Passthrough** — a real card answers (QEMU `sb16`/`adlib` on metal): DSP
 //!    traffic forwards to it, and the guest's DMA buffer is remapped contiguous
-//!    onto the real 8237 (`maybe_remap` → `arm`).
-//!  - **Emulated** — no card answers (the hosted interpreter, or metal hardware
-//!    with no SB16): a software DSP command FSM + a play cursor synthesize
-//!    playback from the guest's DMA buffer into the canonical kernel `sound`
-//!    API (`audio_tick`), with no real-card interaction at all. The cursor is
-//!    slaved to the sink's real playback position where one exists (the pipe
-//!    model — see [`SoundBlaster::dsp_tick`]), so guest-visible timing derives
-//!    from what the codec actually plays, exactly as a real card's DMA cursor
-//!    is its playback position. FM music goes through a real OPL2/OPL3 synth
-//!    ([`opl`](super::opl)) on the same tick.
+//!    onto the real 8237 (`maybe_remap` → `arm`). No library card exists; this
+//!    is the kernel driving real hardware and cannot be anything else.
+//!  - **Emulated** — no card answers (the hosted interpreter, or metal with no
+//!    SB16): the library card runs the DSP command FSM and the play cursor,
+//!    and this file supplies it with everything spatial and temporal — the
+//!    clock, the vPIC line, the guest's DMA ring, the sink's pipe depth.
+//!
+//! The ring is the interesting one. The GUS files samples into its own DRAM
+//! and mixes from memory it owns; the SB DSP streams the guest's DMA ring
+//! straight to its DAC and owns nothing. So at mix time the card names the
+//! window it needs ([`sound::sb::Sb::dsp_fetch`]) and *we* move those bytes —
+//! the guest's address space is ours to reach, never the card's.
 
 use crate::Regs;
 use super::*;
-
-/// How long the software DSP keeps the canonical stream open after playback
-/// stops, feeding silence (see [`EmuDsp::stream_hold`]). Long enough to bridge
-/// per-animation-frame sound-effect re-triggers (~150 ms), short enough that
-/// FM music isn't held at the DSP rate for long once effects go quiet.
-const DSP_HANGOVER_MS: u64 = 300;
 
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
 /// "externally owned" mark — COW-fork and address-space teardown both
@@ -33,39 +30,6 @@ const DSP_HANGOVER_MS: u64 = 300;
 /// Arch's `paging2::flags` is private, so the bit is duplicated here per
 /// the arch-boundary rule (small primitives are copied, not cross-called).
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
-
-/// Software DSP/DMA playback engine — populated and driven only in
-/// software-emulated mode. Turns the guest's DSP command stream + virtual-8237
-/// buffer programming into canonical PCM (`sound::play`), paced by the sink's
-/// real playback position (virtual time where the sink has no clock), raising
-/// the SB IRQ once per completed DMA block exactly like the real card's
-/// CT1745 (SB16) mixer attenuation table: a 5-bit level in bits 7:3 of the
-/// volume register, 2 dB per step, as a linear amplitude out of 32767. Taken
-/// verbatim from 86Box `src/sound/snd_sb.c` (`sb_att_2dbstep_5bits`), whose
-/// comment notes the 32767 ceiling deliberately leaves ~6 dB of headroom.
-const ATT_2DB_5BIT: [u16; 32] = [
-    25, 32, 41, 51, 65, 82, 103, 130, 164, 206,
-    260, 327, 412, 519, 653, 822, 1036, 1304, 1641, 2067,
-    2602, 3276, 4125, 5192, 6537, 8230, 10362, 13044, 16422, 20674,
-    26027, 32767,
-];
-
-/// Fixed source scales on the card's analog summing node, in Q16. These — not
-/// the mixer registers — set the FM-vs-DAC balance, and both cards' power-on
-/// mixer defaults are *full* volume, so these are what you hear by default.
-/// From 86Box's SB16 mix (`sb_get_buffer_sb16_awe32` / `sb_get_music_buffer_sb16_awe32`):
-///
-/// ```text
-///   DAC: dsp.buffer * voice * master / 3.0
-///   FM : opl_buf    * fm    * master * 0.7171630859375
-/// ```
-///
-/// So FM sits **2.15x above** the DAC at equal digital full scale. Summing both
-/// at unity (what we did before) therefore ran digital SFX ~9.5 dB too hot
-/// against FM music, and pinned the sum at the clipping rail whenever a
-/// full-scale sample played over a track.
-const FM_SCALE_Q16: i32 = 47_000; // 0.7171630859375 == 47000/65536, exactly
-const DAC_SCALE_Q16: i32 = 65_536 / 3;
 
 /// Level-matched to FM so a game's SFX balance does not depend on which music
 /// device it picked. The GF1 has no guest-visible master volume (its per-voice
@@ -78,261 +42,49 @@ const DAC_SCALE_Q16: i32 = 65_536 / 3;
 /// 65536/3.74: brings GUS music to the FM music level, leaving the DAC-vs-music
 /// balance the same whichever music device the game selects. Re-measure with the
 /// same method if either source's level changes.
+///
+/// This is *cross-card* balance, which is why it lives up here in the machine
+/// and not in either card: how loud a GUS sits against a Sound Blaster is a
+/// property of the mix, not of either chip. (The FM-vs-DAC balance *within*
+/// the SB is the card's own, and moved into `//lib:sound` with it.)
 pub(super) const GUS_SCALE_Q16: i32 = 17_500;
+
+/// The General MIDI synth, level-matched the same way and for the same reason.
+///
+/// Measured exactly as `GUS_SCALE_Q16` was: DOOM E1M1, `sfx_volume 0` so the
+/// capture is music alone, 40 s of steady playing from t=3 s, once with
+/// `snd_musicdevice 5` (GUS) and once with `6` (MPU/General MIDI). GM came out
+/// **2.27x above the GUS** (rms 1720 vs 757) — it plays the same `.PAT` bank,
+/// but a GM sequence drives far more simultaneous voices than DMX's GUS player
+/// does, and every voice here starts at the note's full velocity.
+///
+/// 17500/2.27: brings GM music onto the GUS's level, which is itself matched
+/// to FM — so digital SFX keep one balance against music whichever of the
+/// three devices a game selects. Re-measure with the same method if any
+/// source's level changes.
+///
+/// Measure this *after* any change to sample addressing. The first attempt at
+/// this constant was taken while the synth still ran the GF1's DRAM transform
+/// over its flat pool: instruments aliased onto each other, which is both
+/// audibly wrong and 2.7x louder, and calibrating against it baked the bug
+/// into the level.
+pub(super) const GM_SCALE_Q16: i32 = 7_700;
 
 /// One knob for overall loudness, applied to the summed mix just before the
 /// single clip. Unity: the headroom already lives in the per-source scales
-/// above (that is exactly what the 32767 table ceiling buys), so rescaling
+/// above (that is exactly what the CT1745 table ceiling buys), so rescaling
 /// here would only trade it away. This is the place to change if the whole
 /// machine should be louder or quieter.
 pub(super) const OUTPUT_GAIN_Q16: i32 = 65_536;
 
-/// Combine two Q16 gains without overflowing i32 on the way.
-const fn combine_q16(a: i32, b: i32) -> i32 {
-    ((a as i64 * b as i64) >> 16) as i32
-}
-
-/// The CT1745 (SB16) mixer register file.
-///
-/// Every volume register is a 5-bit level in bits 7:3 (2 dB/step, see
-/// [`ATT_2DB_5BIT`]). The older register maps are *aliases*, exactly as on the
-/// real chip: an SB Pro game writing 0x22/0x04/0x26 and an SB1/2 game writing
-/// 0x02/0x06 both land in the same 0x30-0x35 pairs, so one code path serves
-/// every generation. Games really do set these — they were previously accepted
-/// and dropped, so a game turning its SFX down changed nothing.
-#[derive(Clone, Copy)]
-pub(super) struct SbMixer {
-    regs: [u8; 256],
-}
-
-impl SbMixer {
-    /// Power-on state. `const`: the whole `EmuDsp` is built in a const fn, so
-    /// the defaults are spelled out here rather than via `reset()`.
-    pub(super) const fn new() -> Self {
-        let mut regs = [0u8; 256];
-        regs[0x30] = 0xF8; regs[0x31] = 0xF8; // master L/R
-        regs[0x32] = 0xF8; regs[0x33] = 0xF8; // voice  L/R
-        regs[0x34] = 0xF8; regs[0x35] = 0xF8; // FM     L/R
-        regs[0x36] = 0xF8; regs[0x37] = 0xF8; // CD     L/R
-        regs[0x3B] = 0x80;                    // PC speaker
-        regs[0x04] = 0xEE; regs[0x22] = 0xEE; // legacy views of the same levels
-        regs[0x26] = 0xEE; regs[0x28] = 0xEE;
-        SbMixer { regs }
-    }
-
-    /// Power-on / mixer-index-0 reset. Defaults are 86Box's `sb_ct1745_mixer_reset`:
-    /// master, voice, FM and CD all at maximum (0xF8 → level 31 → unity), line/mic
-    /// muted. A game that never touches the mixer gets full volume — which is why
-    /// the FM/DAC balance has to come from the fixed scales, not from these.
-    pub(super) fn reset(&mut self) {
-        *self = SbMixer::new();
-    }
-
-    pub(super) fn read(&self, index: u8) -> u8 {
-        self.regs[index as usize]
-    }
-
-    pub(super) fn write(&mut self, index: u8, val: u8) {
-        if index == 0x00 {
-            self.reset();
-            return;
-        }
-        self.regs[index as usize] = val;
-        // Legacy maps alias into the SB16 pairs (86Box snd_sb.c, CT1745 write).
-        // `| 0x8` is the chip's low-bit fill when a coarser register is widened
-        // into the 5-bit one. SB1/2 (0x02/0x06) carry one mono nibble in bits
-        // 3:0; SB Pro (0x22/0x04/0x26) carry L in bits 7:4 and R in bits 3:0.
-        let mono = ((val & 0x0F) << 4) | 0x8;
-        let left = (val & 0xF0) | 0x8;
-        let right = ((val & 0x0F) << 4) | 0x8;
-        match index {
-            0x02 => { self.regs[0x30] = mono; self.regs[0x31] = mono; }      // SB1/2 master
-            0x06 => { self.regs[0x34] = mono; self.regs[0x35] = mono; }      // SB1/2 FM
-            0x08 => { self.regs[0x36] = mono; self.regs[0x37] = mono; }      // SB1/2 CD
-            0x22 => { self.regs[0x30] = left; self.regs[0x31] = right; }     // SB Pro master
-            0x04 => { self.regs[0x32] = left; self.regs[0x33] = right; }     // SB Pro voice
-            0x26 => { self.regs[0x34] = left; self.regs[0x35] = right; }     // SB Pro FM
-            0x28 => { self.regs[0x36] = left; self.regs[0x37] = right; }     // SB Pro CD
-            _ => {}
-        }
-    }
-
-    /// Linear gain (Q16, unity = 65536) for a CT1745 volume register.
-    fn level_q16(&self, reg: usize) -> i32 {
-        // The table is an amplitude out of 32767; 86Box divides by 32768, so
-        // Q16 gain is simply the entry doubled.
-        ATT_2DB_5BIT[(self.regs[reg] >> 3) as usize] as i32 * 2
-    }
-
-    /// (left, right) Q16 gain the DSP's PCM is summed at: voice × master ÷ 3.
-    pub(super) fn voice_gain_q16(&self) -> (i32, i32) {
-        let m = (self.level_q16(0x30), self.level_q16(0x31));
-        (
-            combine_q16(combine_q16(self.level_q16(0x32), m.0), DAC_SCALE_Q16),
-            combine_q16(combine_q16(self.level_q16(0x33), m.1), DAC_SCALE_Q16),
-        )
-    }
-
-    /// (left, right) Q16 gain the FM synth is summed at: fm × master × 0.7172.
-    pub(super) fn fm_gain_q16(&self) -> (i32, i32) {
-        let m = (self.level_q16(0x30), self.level_q16(0x31));
-        (
-            combine_q16(combine_q16(self.level_q16(0x34), m.0), FM_SCALE_Q16),
-            combine_q16(combine_q16(self.level_q16(0x35), m.1), FM_SCALE_Q16),
-        )
-    }
-}
-
-/// terminal count. See [`SoundBlaster::audio_tick`].
-#[derive(Clone, Copy)]
-struct EmuDsp {
-    /// DSP read-buffer FIFO (reset 0xAA, version bytes …) the guest pops from
-    /// `base+0x0A`; `out_len` valid bytes starting at `out[0]`.
-    out: [u8; 4],
-    out_len: u8,
-    /// Command awaiting parameter bytes (`None` = idle), and the parameters
-    /// collected so far. SB DSP commands take 0–3 parameter bytes.
-    cmd: Option<u8>,
-    params: [u8; 3],
-    param_got: u8,
-    param_need: u8,
-    /// Last value written to `base+0x06` (DSP reset register); the 1→0 edge
-    /// triggers the reset handshake.
-    reset_prev: u8,
-    /// DSP test register (write 0xE4 → store, read 0xE8 → return). Some card
-    /// detection routines round-trip a byte through it to confirm a real DSP.
-    test_reg: u8,
-    /// SB16 mixer register index (port base+4 write); its data port is base+5.
-    mixer_index: u8,
-    /// CT1745 mixer register file — the guest's volume settings (see `SbMixer`).
-    mixer: SbMixer,
-    /// Mixer reg 0x82 IRQ status: bit0 = 8-bit DMA IRQ pending, bit1 = 16-bit.
-    /// Set when the SB IRQ is raised (by playback width); cleared when the guest
-    /// acks (reads base+0xE for 8-bit / base+0xF for 16-bit). A 16-bit driver
-    /// reads this to confirm "that was a *16-bit* DMA interrupt".
-    irq_status: u8,
-    /// DSP 0xF2/0xF3 (trigger 8-/16-bit IRQ) latched, same bit layout as
-    /// `irq_status`; the next `audio_tick` raises it. The BLASTER IRQ probe:
-    /// drivers hook every candidate line, send 0xF2, and keep whichever
-    /// handler fired — no IRQ means "broken card" (PoP 1.0 then drops sound
-    /// entirely, AdLib included).
-    trigger_irq: u8,
-
-    /// True between a `start playback` command and a stop/reset.
-    playing: bool,
-    rate: u32,        // output sample rate (Hz)
-    bits: u8,         // 8 or 16
-    stereo: bool,     // false = mono, true = interleaved L/R
-    block_param: u16, // DSP block size set by 0x48 (transfers − 1)
-    /// Single-cycle DMA (DSP 0x14/0x91/0xC0/0xB0 without the auto-init bit):
-    /// play the buffer ONCE, raise the IRQ at the end, then stop — vs auto-init
-    /// (0x1C/0xC6/0xB6) which loops the ring and IRQs per block. Dune 2 speech
-    /// uses single-cycle.
-    single: bool,
-
-    /// Ring geometry, snapshotted from the virtual 8237 at `start playback`.
-    buf_gpa: u32,      // DOS-physical base of the auto-init ring
-    buf_frames: u32,   // ring length in frames
-    block_frames: u32, // frames between SB IRQs (one DMA block)
-    /// Guest-visible frames played since playback start (monotonic).
-    /// `dma_read` derives the down-count from this, and block IRQs fire as
-    /// it crosses block boundaries. Slaved to the sink's real playback
-    /// position when one exists (`use_pos`) — a real SB's DMA cursor IS its
-    /// playback position — leading it by [`slack`](Self::slack) so the
-    /// guest's per-block refill lands before the codec reaches the data.
-    cursor: u64,
-    next_irq: u64,    // cursor value of the next block boundary (IRQ point)
-    /// How far the guest clock leads the mixer's drain point (source
-    /// frames): only what the guest ring is too small to cover — see
-    /// `emu_start`. Latency vs. a real card ≈ the sink's minimum fill.
-    slack: u32,
-    /// This DSP playback (re)started: tell the mixer pump to re-key its
-    /// session so pump frame numbering restarts at our frame 0.
-    restarted: bool,
-    /// Tiny single-cycle transfer (same 0x100-byte threshold as the
-    /// passthrough probe path): a DMA-wiring probe wanting its completion
-    /// IRQ within milliseconds — completed on virtual time, not drain.
-    probe: bool,
-    /// `get_ticks()` at the first clock tick of a probe transfer.
-    start_ms: u64,
-    /// Block IRQs raised / serviced (guest read the DMA count or status
-    /// port — poll-bool/poll-dma/irq-mix all do). Their gap is the commit
-    /// horizon: a serviced block means the guest has refilled its slot, so
-    /// the ring is committed one full lap past it. The synthetic clock
-    /// freezes while `acked < done` (the classic boundary gate).
-    blocks_done: u64,
-    blocks_acked: u64,
-    /// Read counter behind the write-status busy flicker (see the base+0x0C
-    /// read): bit 3 alternates the busy bit every 8 reads mid-transfer.
-    write_busy: u8,
-    /// The DSP owns the canonical sink beyond `playing`: after a single-cycle
-    /// sample completes (or the guest pauses), the stream is held open for
-    /// [`DSP_HANGOVER_MS`] feeding silence (FM still mixed in) instead of
-    /// being torn down. Sound-effect chains re-trigger every ~150 ms (PoP's
-    /// gate grinding); stopping the sink per sample meant a stream
-    /// park/re-prime — and a 11 kHz ↔ 49716 Hz rate flip against the FM
-    /// free-run — around every effect, which stuttered on real codecs.
-    stream_hold: bool,
-    /// `get_ticks()` when playback last stopped (hangover anchor).
-    done_ms: u64,
-    /// The last single-cycle transfer ran to terminal count: the guest-visible
-    /// current-count reads 0xFFFF (the real 8237's post-TC underflow) until the
-    /// channel is restarted. Completion pollers key on this (PoP 1.4's digi.drv
-    /// waits for it after its level-transition sample — an IRQ alone does not
-    /// unpark it).
-    dma_tc: bool,
-    /// 8237 status-register TC bits, one per global channel, accumulated since
-    /// the last status read; reading a controller's status register clears its
-    /// four bits, exactly like the real chip.
-    tc_status: u8,
-    /// Bounded channel-5 diagnostic reads for SB16 initialization failures.
-    trace_dma16_reads: u8,
-}
-
-impl EmuDsp {
-    const fn new() -> Self {
-        EmuDsp {
-            out: [0; 4], out_len: 0,
-            cmd: None, params: [0; 3], param_got: 0, param_need: 0,
-            reset_prev: 0, test_reg: 0,
-            mixer_index: 0, mixer: SbMixer::new(), irq_status: 0, trigger_irq: 0,
-            playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
-            single: false,
-            buf_gpa: 0, buf_frames: 0, block_frames: 0,
-            cursor: 0, next_irq: 0,
-            slack: 0, restarted: false, probe: false, start_ms: 0,
-            blocks_done: 0, blocks_acked: 0,
-            write_busy: 0, dma_tc: false, tc_status: 0, trace_dma16_reads: 0,
-            stream_hold: false, done_ms: 0,
-        }
-    }
-    fn push_out(&mut self, b: u8) {
-        if (self.out_len as usize) < self.out.len() {
-            self.out[self.out_len as usize] = b;
-            self.out_len += 1;
-        }
-    }
-    fn pop_out(&mut self) -> u8 {
-        if self.out_len == 0 { return 0; }
-        let b = self.out[0];
-        self.out.copy_within(1..self.out_len as usize, 0);
-        self.out_len -= 1;
-        b
-    }
-}
-
 /// Per-thread Sound Blaster card state: the BLASTER-declared channel/IRQ map,
-/// and either the passthrough remap binding or the software DSP/DMA engine
+/// and either the passthrough remap binding or the emulated library card
 /// depending on `mode`. The generic virtual 8237 it observes is bus
 /// infrastructure shared with every DMA-using card, so it lives on
 /// `PcMachine` and is passed in per call.
 pub struct SoundBlaster {
-    /// The software DSP/DMA engine (used only when emulating).
-    emu: EmuDsp,
-    /// FM synthesis (OPL2/OPL3), software-emulated mode only. Lazily created
-    /// on the first FM register write — the chip is ~20 KB per thread and
-    /// most programs never touch FM.
-    opl: Option<opl::OplFm>,
+    /// The emulated card (used only when emulating).
+    core: sound::sb::Sb,
     pub io_base: u16, // BLASTER A — DSP/mixer port base (passthrough target)
     pub irq: u8,      // BLASTER I — guest vPIC IRQ to inject on SB completion
     pub dma8: u8,     // BLASTER D — guest's 8-bit vDMA channel (0..3)
@@ -387,8 +139,7 @@ impl SoundBlaster {
     /// intentionally decoupled). Overridden by the guest's `BLASTER=` env.
     pub fn new() -> Self {
         Self {
-            emu: EmuDsp::new(),
-            opl: None,
+            core: sound::sb::Sb::new(),
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
             host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
             dsp_test_reg: 0, dsp_read_data: None, dsp_expect_test_write: false,
@@ -426,13 +177,10 @@ impl SoundBlaster {
     pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
         if self.emulated() {
             // No real card / no buffer alias in emulation: just stop the
-            // software DSP so the next program sees a clean, idle card.
-            self.emu.playing = false;
-            self.emu.stream_hold = false;
+            // card so the next program sees a clean, idle one. Parking the
+            // sink is ours — it is shared with every other source.
+            self.core.reset_for_exit();
             crate::kernel::sound::stop(machine, true); // session end: power down
-            self.emu.out_len = 0;
-            self.emu.cmd = None;
-            self.opl = None; // next program gets a power-on-fresh FM chip
             return;
         }
         self.unbind(machine);
@@ -456,8 +204,8 @@ impl SoundBlaster {
     /// SB ports this card decodes — the dispatch guard for both modes: the
     /// DSP/mixer block `[io_base, io_base+0x10)` and the OPL2/3 FM window
     /// 0x388-0x38B. In passthrough these go straight to the real card (QEMU
-    /// `sb16`/`adlib`); emulated, to the software DSP / FM synth. Only the
-    /// 8237 is virtual in passthrough.
+    /// `sb16`/`adlib`); emulated, to the library card. Only the 8237 is
+    /// virtual in passthrough.
     pub fn is_passthrough(&self, p: u16) -> bool {
         (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388..=0x38B)
     }
@@ -468,7 +216,7 @@ impl SoundBlaster {
     /// sb16 does not appear to surface that response through passthrough.
     pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16) -> u8 {
         if self.emulated() {
-            return self.emu_read(p);
+            return self.core.port_read(p);
         }
         if p == self.io_base + 0x0A {
             if let Some(v) = self.dsp_read_data.take() {
@@ -610,20 +358,17 @@ impl SoundBlaster {
             (r & 1 == 1, 4 + (r >> 1) as usize, true)
         } else {
             // Emulated card: the controller status register carries the TC
-            // bits the software DSP latched (bits 0-3, one per channel);
-            // reading clears them — real-8237 semantics completion pollers
-            // rely on. Passthrough continues to the shadow/real chip.
+            // bits the card latched (bits 0-3, one per channel); reading
+            // clears them — real-8237 semantics completion pollers rely on.
+            // Passthrough continues to the shadow/real chip.
             if self.emulated() && (port == 0x08 || port == 0xD0) {
-                let base = if port == 0xD0 { 4 } else { 0 };
-                let bits = (self.emu.tc_status >> base) & 0x0F;
-                self.emu.tc_status &= !(0x0F << base);
-                return bits;
+                return self.core.take_tc_status(port == 0xD0);
             }
             return dma.io_read(machine, port);
         };
 
-        // Emulated card: the live current-count comes from the software DSP's
-        // play cursor (there is no real 8257 to interrogate).
+        // Emulated card: the live current-count comes from the card's play
+        // cursor (there is no real 8257 to interrogate).
         if self.emulated() {
             return self.emu_dma_read(dma, is_cnt, chan, hi_ctrl);
         }
@@ -673,8 +418,8 @@ impl SoundBlaster {
     pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237) {
         if self.emulated() {
             // No real chip to program / no buffer to alias: the virtual-8237
-            // `prog` is already captured (io_write), and the software DSP reads
-            // the guest buffer directly at playback. Nothing to remap.
+            // `prog` is already captured (io_write), and we read the guest
+            // ring for the card at playback. Nothing to remap.
             return;
         }
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
@@ -857,17 +602,17 @@ impl SoundBlaster {
                 _ => {}
             }
         }
+        // The card decodes against the base and reports the IRQ/DMA numbers
+        // back through its mixer configuration registers.
+        self.core.set_wiring(self.io_base, self.irq, self.dma8, self.dma16);
     }
 
-    // ── Software DSP/DMA emulation (platform::Audio emulated paths) ─────────
+    // ── The emulated card's machine side ────────────────────────────────
     //
-    // Active only when no real card answers. The guest drives the standard SB16
-    // DSP register file (reset, version, set-rate, auto-init playback); we run
-    // the command FSM, then `audio_tick` consumes the guest's DMA ring into
-    // canonical PCM (`sound::play`) paced by the sink's playback position
-    // (virtual time where the sink has no clock), raising the SB IRQ per
-    // block. The virtual 8237 (`self.dma`) already captured the buffer
-    // programming, so playback needs no real-chip interaction at all.
+    // Active only when no real card answers. The library card runs the DSP
+    // register file and command FSM; everything below supplies it with what a
+    // passive card cannot have — the clock, the interrupt line, the guest's
+    // DMA ring, and the sink's pipe depth.
 
     /// Software emulation vs real-card passthrough — the boot-time platform
     /// probe's verdict (`platform::Audio`), not probed here. The OPL window
@@ -877,387 +622,89 @@ impl SoundBlaster {
         !crate::kernel::platform::get().audio.sb_passthrough()
     }
 
-    /// Emulated DSP/mixer port read.
-    fn emu_read(&mut self, p: u16) -> u8 {
-        // OPL status register: a read of any FM window port returns the timer
-        // status. Bits 1-2 are always 0 — the "this is an OPL3" answer type
-        // probes look for. Before any FM write there is no chip yet: power-on
-        // status is 0 anyway.
-        if opl::decode_port(self.io_base, p).is_some() {
-            return self.opl.as_ref().map_or(0, |o| o.status());
-        }
-        match p.wrapping_sub(self.io_base) {
-            0x05 => match self.emu.mixer_index {       // mixer data
-                0x82 => self.emu.irq_status,           // IRQ status (8/16-bit)
-                0x80 => match self.irq {               // IRQ select
-                    2 | 9 => 0x01, 5 => 0x02, 7 => 0x04, 10 => 0x08, _ => 0x04,
-                },
-                0x81 => (1u8 << (self.dma8 & 7)) | (1u8 << (self.dma16 & 7)), // DMA select
-                // Everything else is the mixer register file: a game that
-                // read-modify-writes a volume must see back what it set.
-                i => self.emu.mixer.read(i),
-            },
-            0x0A => self.emu.pop_out(),                // DSP read data
-            // DSP write-buffer status: while a single-cycle transfer is in
-            // flight, bit 7 (busy) FLICKERS — on the real chip it's a per-byte
-            // buffer status, pulsing as the DSP services DMA between command
-            // bytes (that's why 0xD0/pause can be sent mid-transfer at all).
-            // Alternate it every 8 reads, DOSBox's proven model: a driver
-            // waiting for busy sees it within 8 reads and one waiting for the
-            // busy→idle edge sees that within 16 — microseconds, never a
-            // block-long stall. PoP's per-frame "stop digitized sound" routine
-            // needs BOTH: with always-ready it spins forever on wait-for-busy
-            // (end-door hang); with busy-held-for-the-block it stalls a full
-            // sample per game frame (1 fps, staccato gate grinding). Idle DSP
-            // reads always-ready.
-            0x0C => {
-                if self.emu.playing && self.emu.single {
-                    self.emu.write_busy = self.emu.write_busy.wrapping_add(1);
-                    if self.emu.write_busy & 8 != 0 { 0x80 } else { 0x00 }
-                } else {
-                    0x00
-                }
-            }
-            0x0E => {                                  // read-status / 8-bit IRQ ack
-                self.emu.irq_status &= !0x01;          // reading acks the 8-bit IRQ
-                self.emu.blocks_acked = self.emu.blocks_done; // block serviced: extend commit
-                if self.emu.out_len > 0 { 0x80 } else { 0x00 }
-            }
-            0x0F => {                                  // 16-bit IRQ ack
-                self.emu.irq_status &= !0x02;
-                self.emu.blocks_acked = self.emu.blocks_done;
-                0x00
-            }
-            _ => 0xFF,
-        }
-    }
-
-    /// Emulated DSP/mixer port write.
+    /// Emulated DSP/mixer/FM port write. The card decodes; when it decodes a
+    /// start-playback command it hands it back, because only we can read the
+    /// guest's DMA controller for the ring that command refers to.
     fn emu_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
-        // OPL2/OPL3 FM (AdLib 0x388-0x38B, or the SB mirrors at io_base+0..3
-        // and +8/+9): address latch + data writes into the FM synth, created
-        // on first touch. Timer semantics live in `opl.rs` (same instant-
-        // expiry detection behavior as the old stub).
-        if let Some(port) = opl::decode_port(self.io_base, p) {
-            let now = machine.get_ticks();
-            self.opl
-                .get_or_insert_with(|| opl::OplFm::new(now))
-                .write(now, port, val);
-            return;
+        let now = machine.get_ticks();
+        let Some(start) = self.core.port_write(p, val, now) else { return };
+        let is16 = start.bits == 16;
+        let chan = if is16 { self.dma16 } else { self.dma8 } as usize;
+        if chan >= dma.ch.len() {
+            return; // BLASTER declared a channel that does not exist
         }
-        match p.wrapping_sub(self.io_base) {
-            0x04 => self.emu.mixer_index = val, // mixer register select
-            0x05 => self.emu.mixer.write(self.emu.mixer_index, val), // mixer data
-            0x06 => {
-                // DSP reset: a 1→0 edge triggers the reset handshake.
-                if self.emu.reset_prev == 1 && val == 0 {
-                    self.emu.playing = false;
-                    self.emu.stream_hold = false;
-                    // This resets only the SB DSP. The canonical sink is
-                    // shared: GUS music or OPL may still be contributing, so
-                    // powering it down here resets the HDA position counters
-                    // underneath their continuous mixer timeline. The mixer
-                    // stops the sink itself when every source is idle.
-                    self.emu.cmd = None;
-                    self.emu.param_got = 0;
-                    self.emu.out_len = 0;
-                    self.emu.push_out(0xAA); // reset acknowledge
-                }
-                self.emu.reset_prev = val;
-            }
-            0x0C => self.emu_dsp_byte(machine, dma, val), // DSP command / parameter port
-            _ => {}                         // unmodeled DSP-block ports: ignored
-        }
-    }
-
-    /// Feed one byte to the DSP command FSM: a parameter for the in-flight
-    /// command, or the start of a new one.
-    fn emu_dsp_byte<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, val: u8) {
-        if let Some(cmd) = self.emu.cmd {
-            self.emu.params[self.emu.param_got as usize] = val;
-            self.emu.param_got += 1;
-            if self.emu.param_got >= self.emu.param_need {
-                self.emu_exec(machine, dma, cmd);
-                self.emu.cmd = None;
-                self.emu.param_got = 0;
-            }
-            return;
-        }
-        // Parameter count by command (only the subset DSP clients use here).
-        let need = match val {
-            0x40 | 0xE0 | 0xE4 => 1,              // time constant; ident byte; test-reg write
-            0x14 | 0x41 | 0x42 | 0x48 | 0x80 => 2, // single-cycle len, out/in rate, block, silence
-            0xB0..=0xCF => 3,                      // SB16 16/8-bit DMA: mode + length lo/hi
-            _ => 0,                               // 0x1C/0x90/0x91/0xE8 etc. take no params
-        };
-        if need > 0 {
-            self.emu.cmd = Some(val);
-            self.emu.param_need = need;
-            self.emu.param_got = 0;
-        } else {
-            self.emu_exec(machine, dma, val);
-        }
-    }
-
-    /// Execute a fully-parameterized DSP command.
-    fn emu_exec<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, cmd: u8) {
-        let p = self.emu.params;
-        if super::PORT_TRACE {
-            crate::dbg_println!(
-                "[dsp] cmd {:02X} p={:02X},{:02X},{:02X} ticks={}",
-                cmd, p[0], p[1], p[2], machine.get_ticks()
-            );
-        }
-        match cmd {
-            0xE1 => {
-                self.emu.push_out(4); // DSP version 4.5 (SB16)
-                self.emu.push_out(5);
-            }
-            // Detection helpers some drivers use to confirm a real DSP:
-            0xE0 => self.emu.push_out(!p[0]), // identification: return ~byte
-            0xE4 => self.emu.test_reg = p[0], // write test register
-            0xE8 => self.emu.push_out(self.emu.test_reg), // read test register back
-            0xF2 => self.emu.trigger_irq |= 0x01,      // trigger 8-bit IRQ (IRQ probe)
-            0xF3 => self.emu.trigger_irq |= 0x02,      // trigger 16-bit IRQ
-            0xD1 | 0xD4 => {}                          // speaker on / continue DMA
-            0xD0 | 0xD3 | 0xD9 | 0xDA => {
-                // Pause / speaker off / exit auto-init: playback stops, but the
-                // stream is held open through the hangover (dsp_tick) — effect
-                // chains pause-and-restart every animation frame.
-                self.emu.playing = false;
-                self.emu.done_ms = machine.get_ticks();
-            }
-            0x40 => {
-                let tc = p[0] as u32;
-                self.emu.rate = if tc < 256 { 1_000_000 / (256 - tc) } else { 22050 };
-            }
-            0x41 => self.emu.rate = ((p[0] as u32) << 8) | p[1] as u32, // output rate (hi, lo)
-            0x42 => {}                                                  // input rate: ignore
-            0x48 => self.emu.block_param = (p[0] as u16) | ((p[1] as u16) << 8),
-            // Legacy 8-bit mono output. 0x1C/0x90 = auto-init (block from 0x48);
-            // 0x14 carries its single-cycle transfer length in the command.
-            // 0x91 has no length parameters and falls back to the DMA count.
-            0x1C | 0x90 => self.emu_start(dma, 8, false, None, false),
-            0x14 => self.emu_start(
-                dma,
-                8,
-                false,
-                Some((p[0] as u16) | ((p[1] as u16) << 8)),
-                true,
-            ),
-            0x91 => self.emu_start(dma, 8, false, None, true),
-            // SB16 8-/16-bit output: mode byte + 16-bit length; bit1 = auto-init,
-            // its absence = single-cycle. (0xC8.., 0xB8.. are input/ADC — ignored.)
-            0xC0..=0xC7 => {
-                let stereo = p[0] & 0x20 != 0;
-                let single = cmd & 0x02 == 0;
-                self.emu_start(dma, 8, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
-            }
-            0xB0..=0xB7 => {
-                let stereo = p[0] & 0x20 != 0;
-                let single = cmd & 0x02 == 0;
-                self.emu_start(dma, 16, stereo, Some((p[1] as u16) | ((p[2] as u16) << 8)), single);
-            }
-            _ => {}
-        }
-    }
-
-    /// Begin auto-init playback: snapshot the ring geometry from the active
-    /// BLASTER channel's virtual-8237 programming and arm the play cursor.
-    fn emu_start(&mut self, dma: &Dma8237, bits: u8, stereo: bool, block_override: Option<u16>, single: bool) {
-        self.emu.bits = bits;
-        self.emu.stereo = stereo;
-        self.emu.single = single;
-        if let Some(b) = block_override {
-            self.emu.block_param = b;
-        }
-        let channels = if stereo { 2u32 } else { 1 };
-
-        let is16 = bits == 16;
-        let chan = if is16 { self.dma16 as usize } else { self.dma8 as usize };
         let prog = dma.ch[chan].prog;
-        let (gpa, len_bytes) = chan_gpa_len(&prog, is16);
-        let frame_bytes = (bits as u32 / 8) * channels;
-        self.emu.buf_gpa = gpa;
-        self.emu.buf_frames = len_bytes.checked_div(frame_bytes).unwrap_or(0);
-        // The DSP command's length is authoritative when it supplied one;
-        // the 8237 count remains the physical ceiling (terminal count).
-        // Auto-init raises an IRQ for each programmed DSP block.
-        self.emu.block_frames = if single {
-            block_override
-                .map(|n| ((n as u32 + 1) / channels).max(1))
-                .unwrap_or(self.emu.buf_frames.max(1))
-                .min(self.emu.buf_frames.max(1))
-        } else {
-            // Block size is "transfers − 1"; a transfer is one sample/channel.
-            ((self.emu.block_param as u32 + 1) / channels).max(1)
-        };
-        self.emu.cursor = 0;
-        self.emu.next_irq = self.emu.block_frames as u64;
-        self.emu.blocks_done = 0;
-        self.emu.blocks_acked = 0;
-        self.emu.restarted = true; // mixer pump: re-key session numbering
-        // A single-cycle DMA transfer has its own finite device clock: it
-        // starts when the DSP command arms DRQ and reaches terminal count
-        // after `buf_frames / rate`, independent of how much older music is
-        // queued in the final speaker sink. Treating only sub-256-byte blocks
-        // this way made Duke3D's larger 16-bit channel-5 self-test wait behind
-        // the GUS output cushion and time out as "conflicting DMA channel".
-        // Auto-init rings remain slaved to the sink's continuous cursor.
-        self.emu.probe = single;
-        self.emu.start_ms = 0;
-        // The guest clock leads the drain only by what the ring is too small
-        // to cover: with ring ≥ fill + one block, the refill a block IRQ
-        // commits always lands before the mix point reads its slot, and the
-        // cursor can track audible playback exactly (slack = 0). Single-cycle
-        // never needs a lead — its whole buffer is committed up front.
-        let fill = crate::kernel::sound::min_fill(self.emu.rate).unwrap_or(0);
-        self.emu.slack = if single {
-            0
-        } else {
-            (fill + self.emu.block_frames).saturating_sub(self.emu.buf_frames)
-        };
-        self.emu.dma_tc = false; // restart re-loads the count registers
-        self.emu.trace_dma16_reads = 0;
-        self.emu.playing = self.emu.buf_frames > 0;
-        if self.emu.playing {
-            self.emu.stream_hold = true;
-        }
-        if bits == 16 {
-            crate::dbg_println!(
-                "[dsp16] start single={} stereo={} rate={} dma={} page={:02X} addr={:04X} count={:04X} gpa={:08X} ring_frames={} block_frames={}",
-                single, stereo, self.emu.rate, chan, prog.page, prog.addr,
-                prog.count, self.emu.buf_gpa, self.emu.buf_frames,
-                self.emu.block_frames
-            );
-        }
+        let (gpa, len) = chan_gpa_len(&prog, is16);
+        // How deep the sink's pipe runs is our policy, not the card's.
+        let min_fill = crate::kernel::sound::min_fill(self.core.rate()).unwrap_or(0);
+        self.core.begin(start, gpa, len, min_fill);
         if super::PORT_TRACE {
             crate::dbg_println!(
-                "[dsp] start bits={} single={} gpa={:08X} frames={} block={} playing={}",
-                bits, single, self.emu.buf_gpa, self.emu.buf_frames,
-                self.emu.block_frames, self.emu.playing
+                "[dsp] start bits={} single={} gpa={:08X} len={} chan={}",
+                start.bits, start.single, gpa, len, chan
             );
         }
-    }
-
-    /// Advance emulated sound by the virtual time elapsed since the last call:
-    /// the DSP's DMA playback (`dsp_tick`) and the FM synth. Exactly one of
-    /// them produces into the canonical sink at a time — while the DSP stream
-    /// is live it *pulls* FM frames itself (`emit_frames` mixes them in), so
-    /// the FM pump only free-runs when the DSP is silent.
-    /// Whether the software DSP owns the canonical sink right now: playing,
-    /// or holding the stream open through the hangover. The top of the
-    /// producer priority chain (DSP > GUS > OPL).
-    pub fn dsp_owns_sink(&self) -> bool {
-        self.emulated() && (self.emu.playing || self.emu.stream_hold)
     }
 
     /// Deliver a latched 0xF2/0xF3 trigger-IRQ (the BLASTER IRQ probe). A
     /// real card answers within microseconds; the next slice is well inside
     /// any probe's poll window.
     pub fn deliver_trigger_irq(&mut self, vpic: &mut super::vpic::VirtualPic) {
-        if !self.emulated() || self.emu.trigger_irq == 0 {
+        if !self.emulated() {
             return;
         }
-        self.emu.irq_status |= self.emu.trigger_irq;
-        self.emu.trigger_irq = 0;
-        if !vpic.is_requested(self.irq) {
+        if self.core.take_trigger() && !vpic.is_requested(self.irq) {
             vpic.raise(self.irq);
         }
     }
 
+    /// Complete a single-cycle transfer too short for the pump clock to see
+    /// (see the card's `take_probe`), on the slice alongside 0xF2's latched
+    /// trigger IRQ.
+    pub fn deliver_probe_irq<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        vpic: &mut super::vpic::VirtualPic,
+    ) {
+        if !self.emulated() {
+            return;
+        }
+        if self.core.take_probe(machine.get_ticks()) && !vpic.is_requested(self.irq) {
+            vpic.raise(self.irq);
+        }
+    }
+
+    /// Whether the emulated DSP owns the canonical sink right now: playing,
+    /// or holding the stream open through the hangover. The top of the
+    /// producer priority chain (DSP > GUS > OPL).
+    pub fn dsp_owns_sink(&self) -> bool {
+        self.emulated() && self.core.owns_sink()
+    }
+
     /// Rate the DSP stream runs the mixer session at.
     pub fn dsp_rate(&self) -> u32 {
-        self.emu.rate
+        self.core.rate()
     }
 
     /// A DSP playback (re)started since the last call: the mixer pump must
     /// re-key its session so pump frames and DSP stream frames coincide.
     pub fn take_restart(&mut self) -> bool {
-        core::mem::take(&mut self.emu.restarted)
+        self.core.take_restart()
     }
 
     /// Whether the FM synth wants the canonical stream held open (voices
     /// sounding, or the driver wrote between-notes recently).
     pub fn opl_audible(&self, now: u64) -> bool {
-        self.opl.as_ref().is_some_and(|o| o.audible(now))
-    }
-
-    /// Add the FM synth's frames into the pump block (no-op when silent).
-    fn mix_fm_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i32, i32)]) {
-        let (gl, gr) = self.emu.mixer.fm_gain_q16();
-        if let Some(opl) = self.opl.as_mut()
-            && opl.mixing()
-        {
-            opl.mix_into(machine, rate, base, block, (gl, gr));
-        }
-    }
-
-    /// Add the DSP stream's guest-ring frames into the pump block. `base` is
-    /// the mixer-session frame of `out[0]`, which — because `emu_start`
-    /// re-keys the pump session — is also the DSP stream frame. Frames past
-    /// the commit horizon (one ring lap beyond the last *serviced* block,
-    /// floored at the next boundary: an unserviced ring keeps cycling and
-    /// replays, exactly like the real card) stay silent.
-    fn mix_dsp_into<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, base: u64, block: &mut [(i32, i32)]) {
-        if !self.emu.playing || rate == 0 {
-            return; // idle or hangover: the pump's zeros are our silence
-        }
-        let channels = if self.emu.stereo { 2u32 } else { 1 };
-        let frame_bytes = (self.emu.bits as u32 / 8) * channels;
-        if frame_bytes == 0 || self.emu.buf_frames == 0 {
-            return;
-        }
-        let fmt = crate::kernel::sound::Format {
-            bits: self.emu.bits,
-            signed: self.emu.bits == 16,
-            channels: channels as u8,
-        };
-        // The ring is the guest's, clocked at the guest's rate; `out` is the
-        // mixer's, clocked at the canonical rate. Map each output frame back
-        // to the DSP frame playing at that instant (zero-order hold — the
-        // same thing the sink used to do one stage later, minus the rest of
-        // the mix getting dragged down to the DSP's bandwidth with it).
-        let (gl, gr) = self.emu.mixer.voice_gain_q16();
-        let dsp_rate = self.emu.rate.max(1) as u64;
-        let committed = self.committed_end();
-        let first = base * dsp_rate / rate as u64;
-        let last = (base + block.len().saturating_sub(1) as u64) * dsp_rate / rate as u64;
-        let end = (last + 1).min(committed);
-        if first >= end {
-            return; // starved: leave the pump's silence
-        }
-
-        // Fetch the source span in ring-sized runs, then resample from the
-        // local copy. `copy_from` may cross a VM/backend boundary; doing it
-        // once per DSP sample here caused thousands of crossings per second
-        // and starved the shared GUS/SB sink under Doom. A mixer chunk spans
-        // only a few hundred DSP frames, so this remains a small allocation.
-        let source_frames = (end - first) as usize;
-        let mut scratch = alloc::vec![0u8; source_frames * frame_bytes as usize];
-        let mut copied = 0usize;
-        while copied < source_frames {
-            let abs = first + copied as u64;
-            let pos = (abs % self.emu.buf_frames as u64) as usize;
-            let run = (source_frames - copied).min(self.emu.buf_frames as usize - pos);
-            let addr = self.emu.buf_gpa as usize + pos * frame_bytes as usize;
-            let lo = copied * frame_bytes as usize;
-            let hi = lo + run * frame_bytes as usize;
-            machine.copy_from(addr, &mut scratch[lo..hi]);
-            copied += run;
-        }
-        for (i, slot) in block.iter_mut().enumerate() {
-            let src = (base + i as u64) * dsp_rate / rate as u64;
-            if src >= end {
-                break;
-            }
-            let (l, r) = fmt.frame(&scratch, (src - first) as usize);
-            slot.0 += (l as i32 * gl) >> 16;
-            slot.1 += (r as i32 * gr) >> 16;
-        }
+        self.core.fm_audible(now)
     }
 
     /// Mix every producer on this card into the same final PCM block.
+    ///
+    /// The DSP half needs a DMA cycle first: the card names the ring window
+    /// it wants and we move those bytes out of guest memory for it. Fetch in
+    /// ring-sized runs — `copy_from` may cross a VM/backend boundary, and
+    /// doing it once per DSP sample cost thousands of crossings a second and
+    /// starved the shared GUS/SB sink under Doom.
     pub(super) fn mix_into<A: crate::Arch>(
         &mut self,
         machine: &mut A,
@@ -1265,29 +712,27 @@ impl SoundBlaster {
         base: u64,
         block: &mut [(i32, i32)],
     ) {
-        self.mix_dsp_into(machine, rate, base, block);
-        self.mix_fm_into(machine, rate, base, block);
-    }
-
-    /// Auto-init commit horizon (see `mix_dsp_into`); single-cycle commits the
-    /// whole buffer up front.
-    fn committed_end(&self) -> u64 {
-        if self.emu.single {
-            self.emu.buf_frames as u64
-        } else {
-            (self.emu.blocks_acked * self.emu.block_frames as u64
-                + self.emu.buf_frames as u64)
-                .max(self.emu.next_irq)
+        if let Some(f) = self.core.dsp_fetch(rate, base, block.len()) {
+            let fb = f.frame_bytes as usize;
+            let mut scratch = alloc::vec![0u8; f.source_frames * fb];
+            let mut copied = 0usize;
+            while copied < f.source_frames {
+                let abs = f.first + copied as u64;
+                let pos = (abs % f.buf_frames as u64) as usize;
+                let run = (f.source_frames - copied).min(f.buf_frames as usize - pos);
+                let addr = f.gpa as usize + pos * fb;
+                let lo = copied * fb;
+                machine.copy_from(addr, &mut scratch[lo..lo + run * fb]);
+                copied += run;
+            }
+            self.core.mix_dsp(rate, base, &scratch, &f, block);
         }
+        self.core.mix_fm(rate, block);
     }
 
-    /// The DSP's guest-visible clock, driven by the mixer's drain point:
-    /// the cursor — the DMA count and the block-boundary IRQs both derive
-    /// from it — is `drained + slack`, capped at `pushed` (frames actually
-    /// handed to the sink). A real SB's DMA cursor IS its playback position;
-    /// deriving it from what the codec has consumed reproduces exactly that.
-    /// Also ends the hangover hold, and completes tiny probe transfers on
-    /// virtual time (their IRQ can't wait for a stream to start draining).
+    /// Drive the emulated DSP's guest-visible clock from the mixer's drain
+    /// point and put its interrupt line up when it asks. `drained`/`pushed`
+    /// are already converted into the DSP's own frames by the pump.
     pub fn dsp_clock_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
@@ -1299,134 +744,34 @@ impl SoundBlaster {
             return;
         }
         let now = machine.get_ticks();
-        if !self.emu.playing {
-            // Hangover: the pump keeps the stream fed (silence + synths)
-            // while `stream_hold` keeps `dsp_owns_sink` true; effect chains
-            // re-trigger onto a hot stream instead of a park/re-prime.
-            if self.emu.stream_hold
-                && now.saturating_sub(self.emu.done_ms) >= DSP_HANGOVER_MS
-            {
-                self.emu.stream_hold = false;
-            }
-            return;
-        }
-        let guest_now = if self.emu.probe {
-            // Single-cycle DMA advances continuously on the DSP's virtual
-            // sample clock, independent of final-speaker stream priming.
-            if self.emu.start_ms == 0 {
-                self.emu.start_ms = now;
-            }
-            (now.saturating_sub(self.emu.start_ms) * self.emu.rate.max(1) as u64 / 1000)
-                .min(self.emu.next_irq)
-        } else {
-            (drained + self.emu.slack as u64).min(pushed)
-        };
-        while self.emu.playing && guest_now >= self.emu.next_irq {
-            if super::PORT_TRACE {
-                crate::dbg_println!(
-                    "[dsp] boundary cursor={} single={} drained={} ticks={}",
-                    self.emu.next_irq, self.emu.single, drained, now
-                );
-            }
-            self.raise_block_irq(vpic);
-            if self.emu.single {
-                self.finish_single_cycle(now);
-            } else {
-                self.emu.next_irq += self.emu.block_frames as u64;
-            }
-        }
-        if self.emu.playing {
-            self.emu.cursor = guest_now;
-        }
-    }
-
-    /// A block boundary passed: advance the cursor over it, latch the
-    /// width-tagged mixer IRQ status, and put the line up.
-    fn raise_block_irq(&mut self, vpic: &mut super::vpic::VirtualPic) {
-        self.emu.cursor = self.emu.next_irq;
-        self.emu.blocks_done += 1;
-        // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
-        self.emu.irq_status |= if self.emu.bits == 16 { 0x02 } else { 0x01 };
-        if !vpic.is_requested(self.irq) {
+        if self.core.advance_clock(now, drained, pushed) && !vpic.is_requested(self.irq) {
             vpic.raise(self.irq);
         }
     }
 
-    /// Single-cycle: one pass and stop (no loop). The 8237 side hit terminal
-    /// count, so the current count underflows to 0xFFFF and the status TC bit
-    /// latches until read; the stream stays held open through the hangover.
-    fn finish_single_cycle(&mut self, now: u64) {
-        self.emu.playing = false;
-        self.emu.done_ms = now;
-        self.emu.dma_tc = true;
-        let chan = if self.emu.bits == 16 { self.dma16 } else { self.dma8 };
-        self.emu.tc_status |= 1 << (chan & 7);
-        if self.emu.bits == 16 {
-            crate::dbg_println!(
-                "[dsp16] terminal cursor={} irq_status={:02X} tc_status={:02X} ticks={}",
-                self.emu.cursor, self.emu.irq_status, self.emu.tc_status, now
-            );
-        }
-    }
-
-    /// Complete a single-cycle transfer too short for the pump clock to see.
-    ///
-    /// A real card finishes a few-byte transfer in microseconds: the DSP
-    /// command and its completion IRQ are, to the driver, back to back. Our
-    /// DSP clock turns on the mixer pump — once a millisecond, and never on
-    /// the same turn that arms the transfer — so the IRQ lands 1-2 ms late.
-    /// That is an eternity to a driver probing how its card is wired:
-    /// MONKEY2's SOUNBLAS.IMS arms a 1-byte transfer and re-masks the PIC a
-    /// few instructions later, so on a fast backend it had already stopped
-    /// listening when the line finally went up, and gave up with "Unable to
-    /// initialize SoundDriver". Sub-quantum transfers complete here instead,
-    /// on the slice, alongside 0xF2's latched trigger IRQ.
-    pub fn deliver_probe_irq<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        vpic: &mut super::vpic::VirtualPic,
-    ) {
-        if !self.emulated() || !self.emu.probe || !self.emu.playing {
-            return;
-        }
-        // Frames the pump clock cannot resolve: shorter than its 1 ms turn.
-        if self.emu.block_frames as u64 * 1000 >= self.emu.rate.max(1) as u64 {
-            return;
-        }
-        self.raise_block_irq(vpic);
-        self.finish_single_cycle(machine.get_ticks());
-    }
-
     /// Emulated DMA current-address/count read: serve the active SB channel's
-    /// live state from the play cursor (auto-init down-count), other channels
-    /// from the captured base programming. Mirrors `dma_read`'s flip-flop split.
+    /// live state from the card's play cursor (auto-init down-count), other
+    /// channels from the captured base programming. The flip-flop and the
+    /// programmed base are the controller's — ours; the cursor is the card's.
+    /// Mirrors `dma_read`'s flip-flop split.
     fn emu_dma_read(&mut self, dma: &mut Dma8237, is_cnt: bool, chan: usize, hi_ctrl: bool) -> u8 {
         let is_active = chan == self.dma8 as usize || chan == self.dma16 as usize;
         // The guest reading the active channel's count = it serviced the block
-        // (computed `current_play_seg` to refill). Extend the commit horizon
-        // so the pipe may read the ring one full lap past this block.
-        if is_cnt && is_active && self.emu.playing {
-            self.emu.blocks_acked = self.emu.blocks_done;
+        // (it computed where to refill). Extend the card's commit horizon.
+        if is_cnt && is_active {
+            self.core.mark_block_serviced();
         }
         let ff = if hi_ctrl { &mut dma.ff_hi } else { &mut dma.ff_lo };
         let low = !*ff;
         *ff = !*ff;
-        if self.emu.playing && is_active {
+        if self.core.playing() && is_active {
             if low {
-                let channels = if self.emu.stereo { 2u64 } else { 1 };
-                let total = (self.emu.buf_frames as u64 * channels).max(1); // transfers
-                let consumed = (self.emu.cursor * channels) % total;
-                let count = total.wrapping_sub(1).wrapping_sub(consumed) as u16;
-                let addr = dma.ch[chan].prog.addr.wrapping_add(consumed as u16);
-                dma.read_latch = if is_cnt { count } else { addr };
-                if chan == self.dma16 as usize && self.emu.trace_dma16_reads < 16 {
-                    crate::dbg_println!(
-                        "[dsp16] read {} cursor={} value={:04X} playing={}",
-                        if is_cnt { "count" } else { "addr" }, self.emu.cursor,
-                        dma.read_latch, self.emu.playing
-                    );
-                    self.emu.trace_dma16_reads += 1;
-                }
+                let (count, consumed) = self.core.dma_cursor();
+                dma.read_latch = if is_cnt {
+                    count
+                } else {
+                    dma.ch[chan].prog.addr.wrapping_add(consumed)
+                };
             }
             let v = dma.read_latch;
             return if low { v as u8 } else { (v >> 8) as u8 };
@@ -1435,7 +780,7 @@ impl SoundBlaster {
         // Post-terminal-count state: a finished single-cycle transfer reads
         // count 0xFFFF (underflow) and the address one past the end, until the
         // channel is restarted — not the base programming.
-        let v = if is_active && self.emu.dma_tc {
+        let v = if is_active && self.core.at_terminal_count() {
             if is_cnt { 0xFFFF } else { p.addr.wrapping_add(p.count).wrapping_add(1) }
         } else if is_cnt {
             p.count

@@ -15,29 +15,33 @@ rust_library(
     ],
 )
 
-# The unified wavetable sampler — integer-only voice mixing under every
-# sample-playback personality (GUS now; GM/SF2, AWE32, MT-32 later).
+# Emulated sound cards as passive, host-agnostic state machines, plus the
+# integer voice engine they share (GUS now; GM/SF2, AWE32, MT-32 later).
 # Its own target, not part of :lib: the per-frame mix loop runs at up to
 # 44.1 kHz × 32 voices, so opt-level 2, not z (the nuked_opl3 reasoning).
 rust_library(
-    name = "sampler",
-    srcs = glob(["sampler/src/**/*.rs"]),
-    crate_name = "sampler",
-    crate_root = "sampler/src/lib.rs",
+    name = "sound",
+    srcs = glob(["sound/src/**/*.rs"]),
+    crate_name = "sound",
+    crate_root = "sound/src/lib.rs",
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
         "-Copt-level=2",
         "-Crelocation-model=static",
     ],
+    deps = ["@nuked_opl3//:nuked_opl3"],
 )
 
-# Host unit tests (bazelisk test //lib:sampler_test --platforms=@platforms//host).
+# Host unit tests (bazelisk test //lib:sound_test --platforms=@platforms//host).
 # The crate is cfg_attr(not(test), no_std), so the test build links std and
 # the harness; abort matches the rlib (arch-interp test pattern).
 rust_test(
-    name = "sampler_test",
-    crate = ":sampler",
+    name = "sound_test",
+    crate = ":sound",
+    # One real .PAT is compiled into the test: the synthetic fixtures only
+    # prove the parser agrees with our own idea of the layout.
+    compile_data = ["//:apps/ultrasnd/MIDI/acpiano.pat"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Zpanic_abort_tests",
