@@ -374,6 +374,21 @@ enum Parked {
 }
 
 fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Parked {
+    // A real INT 16h opens with `STI`, and its wait loop keeps interrupts on
+    // (IBM's K16 spins `sti; nop; cli; check-buffer`) — so calling it is how a
+    // program with interrupts OFF gets them back on, and the only reason the
+    // very IRQ1 it is waiting for can ever arrive. We are that ROM here, so
+    // raise virtual IF the same way; `pop_iret_frame` restores the caller's
+    // own IF from its stacked FLAGS on return, exactly as the ROM's IRET does.
+    //
+    // Without this, a guest that CLI'd before the call parked forever: VIF
+    // stayed 0, so `pick_pending_vec` delivered neither the keystroke nor the
+    // timer (Xenon 2's video-mode menu hung on "press ENTER" — its keys were
+    // queued in the vkbd and never surfaced as an INT 09). Native-BIOS boots
+    // were unaffected because there the ROM's own `sti` did this, which is
+    // what made it look like a firmware bug.
+    regs.frame.rflags |= machine::VIF_FLAG as u64;
+
     let ah = (regs.rax >> 8) as u8;
     let head: u16 = bda_field!(machine, kb_head);
     let tail: u16 = bda_field!(machine, kb_tail);
@@ -485,6 +500,78 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
 const VRAM_TEXT: usize = 0xB8000;
 const VRAM_MODE13: usize = 0xA0000;
 
+/// Is this a text mode? Only 0-3 and 7 have character cells; everything else
+/// the BIOS knows is a pixel buffer, where the text services rasterize glyphs
+/// (`vga::bios_draw_glyph`) instead of writing cells.
+fn is_text_mode(mode: u8) -> bool {
+    matches!(mode, 0..=3 | 7)
+}
+
+/// Linear address of one text cell. A page is 0x1000 bytes in the 80-column
+/// modes and 0x800 in the 40-column ones, which the BDA's column count
+/// decides — the same rule a real BIOS applies.
+fn text_cell<A: crate::Arch>(machine: &mut A, page: u8, row: u32, col: u32) -> usize {
+    let cols: u16 = bda_field!(machine, columns);
+    let page_size = if cols > 40 { 0x1000 } else { 0x800 };
+    VRAM_TEXT
+        + (page as usize & 7) * page_size
+        + (row as usize * cols as usize + col as usize) * 2
+}
+
+/// A page's cursor position from the BDA, as (row, column).
+fn cursor_of<A: crate::Arch>(machine: &mut A, page: u8) -> (u32, u32) {
+    let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page as usize & 7) * 2;
+    let pos: u16 = machine.read(bda(pos_off));
+    ((pos >> 8) as u32, (pos & 0xFF) as u32)
+}
+
+/// INT 10h AH=06/07: scroll a text window up (`up`) or down, filling the
+/// vacated lines with blanks in BH's attribute. AL = lines to scroll; 0 (or
+/// any count that covers the window) clears it outright — the "clear the
+/// screen" idiom nearly every text-mode program opens with.
+///
+/// Graphics modes are left alone: scrolling a pixel buffer needs the mode's
+/// plane layout, and no guest we serve asks for it.
+fn scroll_window<A: crate::Arch>(machine: &mut A, regs: &mut Regs, up: bool) {
+    let mode: u8 = bda_field!(machine, video_mode);
+    if !is_text_mode(mode) {
+        return;
+    }
+    let cols: u16 = bda_field!(machine, columns);
+    let rows: u8 = bda_field!(machine, rows_minus1);
+    let (cols, rows) = (cols as u32, rows as u32 + 1);
+    let top = ((regs.rcx >> 8) & 0xFF) as u32;
+    let left = (regs.rcx & 0xFF) as u32;
+    let bottom = (((regs.rdx >> 8) & 0xFF) as u32).min(rows - 1);
+    let right = ((regs.rdx & 0xFF) as u32).min(cols - 1);
+    if top > bottom || left > right {
+        return;
+    }
+    let height = bottom - top + 1;
+    let lines = (regs.rax & 0xFF) as u32;
+    let n = if lines == 0 || lines > height { height } else { lines };
+    let blank = (((regs.rbx >> 8) as u16 & 0xFF) << 8) | 0x20;
+    let page: u8 = bda_field!(machine, active_page);
+    // Walk from the edge the vacated lines end up on, so a source row is
+    // always one this pass has not overwritten yet.
+    for i in 0..height {
+        let dst = if up { top + i } else { bottom - i };
+        let src = if up { dst.checked_add(n) } else { dst.checked_sub(n) }
+            .filter(|r| (top..=bottom).contains(r));
+        for c in left..=right {
+            let val = match src {
+                Some(s) => {
+                    let from = text_cell(machine, page, s, c);
+                    machine.read::<u16>(from)
+                }
+                None => blank,
+            };
+            let to = text_cell(machine, page, dst, c);
+            machine.write::<u16>(to, val);
+        }
+    }
+}
+
 fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
     let ax = regs.rax as u16;
     let ah = (ax >> 8) as u8;
@@ -542,6 +629,55 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
         0x05 => {
             bda_field!(machine, active_page = (ax & 0xFF) as u8);
         }
+        0x06 | 0x07 => scroll_window(machine, regs, ah == 0x06),
+        0x08 => {
+            // Read the character + attribute under the cursor (BH = page).
+            let page = ((regs.rbx >> 8) & 7) as u8;
+            let (row, col) = cursor_of(machine, page);
+            let mode: u8 = bda_field!(machine, video_mode);
+            let cell = if is_text_mode(mode) {
+                let at = text_cell(machine, page, row, col);
+                machine.read::<u16>(at)
+            } else {
+                0x0720 // graphics modes: no cell to read back
+            };
+            regs.rax = (regs.rax & !0xFFFF) | cell as u64;
+        }
+        0x09 | 0x0A => {
+            // Write a character at the cursor CX times WITHOUT advancing it —
+            // how full-screen text UIs paint (Xenon 2's video-mode menu is
+            // drawn entirely with AH=09; with this unserviced its menu was
+            // invisible and it sat in INT 16h waiting for a key nobody knew
+            // to press). AH=09 also sets the attribute from BL; AH=0A leaves
+            // the cell's existing one.
+            let ch = (ax & 0xFF) as u8;
+            let page = ((regs.rbx >> 8) & 7) as u8;
+            let attr = regs.rbx as u8;
+            let count = ((regs.rcx as u16).max(1)) as u32;
+            let (row, col) = cursor_of(machine, page);
+            let mode: u8 = bda_field!(machine, video_mode);
+            let cols: u16 = bda_field!(machine, columns);
+            let rows: u8 = bda_field!(machine, rows_minus1);
+            let (cols, rows) = (cols as u32, rows as u32 + 1);
+            for i in 0..count {
+                // A run that overflows the line wraps to the next, as on a
+                // real BIOS; one that overflows the screen is dropped.
+                let (r, c) = (row + (col + i) / cols, (col + i) % cols);
+                if r >= rows {
+                    break;
+                }
+                // BL is the foreground colour in graphics modes, the
+                // attribute in text ones.
+                if !super::machine::vga::bios_draw_glyph(machine, &mut dos.pc.vga, mode, ch, c, r, attr) {
+                    let at = text_cell(machine, page, r, c);
+                    if ah == 0x09 {
+                        machine.write::<u16>(at, ((attr as u16) << 8) | ch as u16);
+                    } else {
+                        machine.write::<u8>(at, ch);
+                    }
+                }
+            }
+        }
         0x0E => {
             // Teletype output: write at cursor, advance. (Scroll is handled
             // by direct writers, matching the C BIOS.)
@@ -562,8 +698,8 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     // the char byte at the cursor cell as before.
                     let fg = regs.rbx as u8;
                     if !super::machine::vga::bios_draw_glyph(machine, &mut dos.pc.vga, mode, ch, col, row, fg) {
-                        let off = (row * cols as u32 + col) as usize * 2;
-                        machine.write::<u8>(VRAM_TEXT + off, ch);
+                        let at = text_cell(machine, page, row, col);
+                        machine.write::<u8>(at, ch);
                     }
                     col += 1;
                     if col >= cols as u32 {

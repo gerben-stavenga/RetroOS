@@ -1460,6 +1460,24 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
                 }
             }
         }
+        // TEST r/m, r (0x84 byte, 0x85 word/dword): AND for flags only. Not
+        // part of the group above — TEST has no ALU group number and never
+        // writes back, so it is the one read-modify-*no*-write form. The VRAM
+        // read still goes through `vram_read`, which loads the GC latches
+        // exactly as a real read does. Xenon 2 tests its planar back buffer
+        // with `es: test [di], bl` before merging a sprite.
+        0x84 | 0x85 => {
+            let sz = opsize(op32, opcode == 0x84);
+            let modrm = peek(i);
+            let ridx = (modrm >> 3) & 7;
+            i += modrm_len(modrm, addr32, peek, i);
+            let reg = gpr(regs, ridx, sz);
+            let mut mem = 0u32;
+            for b in 0..sz {
+                mem |= (vram_read(vga, off + b) as u32) << (b * 8);
+            }
+            alu(regs, 4, mem, reg, sz); // group 4 = AND, result discarded
+        }
         // Grp1: the immediate forms of the ALU group above — ADD/OR/ADC/SBB/
         // AND/SUB/XOR/CMP r/m, imm (0x80 = byte, 0x81 = imm16/32, 0x83 =
         // sign-extended imm8; the group lives in ModRM bits 3-5). Same VRAM
