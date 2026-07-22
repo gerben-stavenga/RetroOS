@@ -219,6 +219,17 @@ free to feed arbitrarily far ahead, which is the freedom we wanted, and the
 guest-visible cursor becomes honest, which fixes the coherency jumpiness as
 a side effect.
 
+**Update after the SB landed:** this section was not implemented, and two of
+its claims have since been undermined. Its portability argument is wrong — a
+pull/callback sink answers "how much has drained" by counting what the
+callback asked for, so `drained` is not a RetroOS-specific concept and the
+current contract ports fine. And the "IRQ fires when the audio was actually
+played, by construction" claim only holds if the card's consumption point *is*
+the playback point, which is false for a mixer that runs a pipe-depth ahead.
+What survives is the narrower goal: the guest-visible cursor steps in coarse
+per-pump jumps, and that granularity is worth fixing on its own terms. Read
+the rest of this section as a proposal that did not survive contact.
+
 The happy consequence is that **this reproduces today's timing rather than
 disturbing it.** `mix_into` *is* the consumption point, and the pump already
 calls it paced by `Pace` (`kernel/src/kernel/sound.rs:181`), which is
@@ -303,14 +314,25 @@ Register decode is not hot but does not object to being optimised.
    *Cost one real bug*, recorded in §2.1: the single `irq_line()` level this
    document originally specified is an IRQ storm.
 2. **OPL.** Nearly free; carries the `nuked_opl3` dependency across.
-3. **SB core.** `EmuDsp` + `SbMixer` → `lib/sound/src/sb.rs` with
-   consumption-based accounting (section 2.3), leaving `SoundBlaster` in
-   the kernel as the passthrough wrapper that owns an optional library
-   core. This is the only step with real timing risk.
-   *Verify:* the full game battery under screenshot test, not Doom alone —
-   DUKE3D, ROTT, PoP, Dune 2 speech (single-cycle), and the SB16 channel-5
-   self-test. Plus the shell launch path, not `--cmd`.
-4. **New cards** against the contract that fell out.
+3. **SB core — DONE, but *without* §2.3.** `EmuDsp` + `SbMixer` →
+   `sound::sb::Sb`, leaving `SoundBlaster` in the kernel as the passthrough
+   wrapper. Because the SB owns no sample memory, `dsp_fetch` names the ring
+   window and the kernel performs that DMA cycle, handing the card a borrowed
+   slice — nothing in lib touches guest memory.
+   **Consumption-based accounting was deliberately not attempted**: the cursor
+   is still drain-slaved, `advance_clock(now, drained, pushed)` still takes the
+   sink's position, and that is *why* the timing came out identical. §2.3
+   remains a proposal, and section 2.3's own analysis of it is now suspect —
+   see the note there.
+   *Verified:* SBTEST's three protocol markers, the hosted battery, DUKE3D,
+   ROTT, Dune 2 and PoP (single-cycle), plus master-vs-branch WAV parity on FM
+   music and on single-cycle speech (identical peak and discontinuity count).
+4. **MPU-401 + General MIDI — DONE.** `mpu401.rs` (UART wire), `midi.rs`
+   (channels, voice allocation, envelopes over the engine's ramp generator),
+   `pat.rs` (the Gravis bank parser), and kernel `vmpu.rs` for presence and the
+   filesystem. The bank is the dgguspat set already shipped for the GUS, so it
+   costs no asset and hits no ROM wall.
+5. **AWE32** against the contract that fell out.
 
 Step 1 is deliberately allowed to be imperfect: the API is what falls out
 of one working case, and steps 2–3 are what prove it generalises. Do not
