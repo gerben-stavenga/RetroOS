@@ -34,11 +34,37 @@ pub use voice::{Events, LoopMode, Ramp, Voice, VoiceFilter};
 /// personalities with fewer notes simply leave voices stopped.
 pub const MAX_VOICES: usize = 32;
 
+/// How a voice's sample address maps onto the bytes of `mem`.
+///
+/// This is *device* policy, not engine math, and keeping it here rather than
+/// hard-coded in [`fetch`] is what lets one engine serve a card with onboard
+/// DRAM and a synth with a flat sample pool. The GF1 wraps at 1 MB and gives
+/// 16-bit voices a bank-preserving doubling, because that is how the board is
+/// wired; a General MIDI pool is just an array, and applying the GF1's
+/// transform to it aliases every instrument past 256 KB onto another one —
+/// which sounds exactly like the right notes played by the wrong instruments.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Addressing {
+    /// GF1 onboard DRAM: a 20-bit space, and 16-bit voices keep the 256 KB
+    /// bank bits (19:18) while doubling the offset within the bank — bit 17
+    /// is dropped by the hardware. Must stay the zero value; see
+    /// [`Engine::new_boxed`].
+    #[default]
+    Gf1Dram = 0,
+    /// A flat pool: sample frame `n` is at byte `n`, or `2n` when 16-bit.
+    /// Out-of-range reads yield silence, as they do in either mode.
+    Linear = 1,
+}
+
 pub struct Engine {
     pub voices: [Voice; MAX_VOICES],
     /// Voices participating in the mix: `voices[..active]`. The GF1's
     /// "active voices" register maps here; MIDI personalities set 32.
     pub active: u8,
+    /// How voice addresses map onto `mem`. Defaults to the GF1's DRAM
+    /// layout; a flat sample pool must set [`Addressing::Linear`].
+    pub addressing: Addressing,
     /// Q32 native-frame accumulator for the foreign-rate pull in
     /// [`mix_frame`](Engine::mix_frame).
     mix_acc: u32,
@@ -54,8 +80,9 @@ impl Engine {
     /// lazily creates devices) — the same trap `OplFm` hit.
     pub fn new_boxed() -> alloc::boxed::Box<Engine> {
         // SAFETY: all-zero bytes are a valid, silent Engine by construction:
-        // every field is an integer, a bool (false), or LoopMode, which is
-        // repr(u8) with None = 0. Keep it that way when adding fields.
+        // every field is an integer, a bool (false), LoopMode (repr(u8),
+        // None = 0) or Addressing (repr(u8), Gf1Dram = 0). Keep it that way
+        // when adding fields.
         unsafe {
             let layout = core::alloc::Layout::new::<Engine>();
             let p = alloc::alloc::alloc_zeroed(layout);
@@ -121,13 +148,14 @@ impl Engine {
     /// the single clip point.
     fn step(&mut self, mem: &[u8], ev: &mut Events) -> (i32, i32) {
         let n = (self.active as usize).min(MAX_VOICES);
+        let addressing = self.addressing;
         let (mut al, mut ar) = (0i32, 0i32);
         for vi in 0..n {
             let v = &mut self.voices[vi];
             if v.running {
                 let idx = v.addr >> 32;
                 let frac10 = ((v.addr >> 22) & 0x3FF) as i32;
-                let s = fetch(mem, v.bits16, idx, frac10);
+                let s = fetch(mem, v.bits16, idx, frac10, addressing);
                 let s = v.filter.apply(s);
                 // s (16-bit) × log-volume gain (Q16) back to 16-bit, then
                 // pan (Q12) into the i32 accumulator.
@@ -161,18 +189,22 @@ fn sat16(v: i32) -> i16 {
 /// write (which is what declares the width) never has to re-derive an address
 /// that is already live, and so can leave the position counter alone the way
 /// the GF1 does.
-fn fetch(mem: &[u8], bits16: bool, idx: u64, frac10: i32) -> i32 {
+fn fetch(mem: &[u8], bits16: bool, idx: u64, frac10: i32, mode: Addressing) -> i32 {
     let get = |b: usize| -> u8 { mem.get(b).copied().unwrap_or(0) };
-    // GF1 address → DRAM byte offset. 8-bit voices address bytes directly;
-    // 16-bit voices keep the 256 KB bank bits (19:18) and double the offset
-    // within the bank — bit 17 is dropped by the hardware. Applied per
-    // sample (not once for the pair) so interpolation across a bank edge
-    // lands where the hardware lands.
-    let byte = |a: u64| -> usize {
-        if bits16 {
-            ((a & 0xC0000) | ((a & 0x1FFFF) << 1)) as usize
-        } else {
-            (a & 0xFFFFF) as usize
+    // Sample address → byte offset in `mem`, per the device's addressing.
+    //
+    // GF1 DRAM: 8-bit voices address bytes directly; 16-bit voices keep the
+    // 256 KB bank bits (19:18) and double the offset within the bank — bit 17
+    // is dropped by the hardware. Applied per sample (not once for the pair)
+    // so interpolation across a bank edge lands where the hardware lands.
+    //
+    // Linear: no wrap and no bank, because a sample pool is not a board.
+    let byte = move |a: u64| -> usize {
+        match mode {
+            Addressing::Gf1Dram if bits16 => ((a & 0xC0000) | ((a & 0x1FFFF) << 1)) as usize,
+            Addressing::Gf1Dram => (a & 0xFFFFF) as usize,
+            Addressing::Linear if bits16 => (a as usize).saturating_mul(2),
+            Addressing::Linear => a as usize,
         }
     };
     let (b, n) = (byte(idx), byte(idx + 1));

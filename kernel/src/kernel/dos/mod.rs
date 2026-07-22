@@ -275,6 +275,7 @@ impl<A: crate::Arch> DosState<A> {
         self.pc.sb.release_dma_pool(machine, regs);
         let pc = &mut self.pc;
         pc.gus.reset(machine, &mut pc.vpic);
+        pc.mpu.reset();
     }
 
     /// Called by the context-switch code when this thread becomes the running
@@ -762,6 +763,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         old.pc.sb.release_dma_pool(machine, &mut current.kernel.vcpu);
         let pc = &mut old.pc;
         pc.gus.reset(machine, &mut pc.vpic);
+        pc.mpu.reset();
     }
     current.personality = thread::Personality::Dos(new_state);
     // `regs` (the thread's vcpu) and `dos_state` (its DOS personality) are
@@ -929,6 +931,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
         old.pc.sb.release_dma_pool(machine, &mut t.kernel.vcpu);
         let pc = &mut old.pc;
         pc.gus.reset(machine, &mut pc.vpic);
+        pc.mpu.reset();
     }
     t.personality = thread::Personality::Dos(new_state);
     let loaded = {

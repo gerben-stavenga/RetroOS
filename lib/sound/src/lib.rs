@@ -31,10 +31,13 @@ extern crate alloc;
 
 pub mod engine;
 pub mod gus;
+pub mod mpu401;
 pub mod opl;
+pub mod midi;
 pub mod pat;
 pub mod sb;
 
 pub use engine::{
-    Engine, Events, LoopMode, MAX_VOICES, Ramp, Voice, VoiceFilter, voice, volume,
+    Addressing, Engine, Events, LoopMode, MAX_VOICES, Ramp, Voice, VoiceFilter, voice,
+    volume,
 };

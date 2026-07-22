@@ -217,26 +217,34 @@ impl Patch {
         }
     }
 
-    /// Pick the sample covering `hz_milli`, or the nearest edge one. Patches
-    /// split the keyboard into frequency bands (`acpiano.pat` has seven), and
-    /// a note outside every band still has to sound.
-    pub fn select(&self, hz_milli: u32) -> &Sample {
-        for s in &self.samples {
+    /// Index of the sample covering `hz_milli`, or the nearest by root pitch.
+    /// Patches split the keyboard into frequency bands (`acpiano.pat` has
+    /// seven), and a note outside every band still has to sound.
+    ///
+    /// Callers want the *index*, not just the sample: a voice's envelope has
+    /// to come from the same sample its PCM does, and taking one from sample 0
+    /// while playing another is a silent mismatch on every multi-sample patch.
+    pub fn select_index(&self, hz_milli: u32) -> usize {
+        for (i, s) in self.samples.iter().enumerate() {
             if hz_milli >= s.low_hz_milli && hz_milli <= s.high_hz_milli {
-                return s;
+                return i;
             }
         }
-        // Outside every band: clamp to the closest by root pitch.
-        let mut best = &self.samples[0];
+        let mut best = 0;
         let mut best_d = u32::MAX;
-        for s in &self.samples {
+        for (i, s) in self.samples.iter().enumerate() {
             let d = s.root_hz_milli.abs_diff(hz_milli);
             if d < best_d {
                 best_d = d;
-                best = s;
+                best = i;
             }
         }
         best
+    }
+
+    /// The sample covering `hz_milli`. See [`select_index`](Self::select_index).
+    pub fn select(&self, hz_milli: u32) -> &Sample {
+        &self.samples[self.select_index(hz_milli)]
     }
 }
 

@@ -49,6 +49,27 @@ const PTE_CACHE_DISABLE: u64 = 1 << 4;
 /// the SB is the card's own, and moved into `//lib:sound` with it.)
 pub(super) const GUS_SCALE_Q16: i32 = 17_500;
 
+/// The General MIDI synth, level-matched the same way and for the same reason.
+///
+/// Measured exactly as `GUS_SCALE_Q16` was: DOOM E1M1, `sfx_volume 0` so the
+/// capture is music alone, 40 s of steady playing from t=3 s, once with
+/// `snd_musicdevice 5` (GUS) and once with `6` (MPU/General MIDI). GM came out
+/// **2.27x above the GUS** (rms 1720 vs 757) — it plays the same `.PAT` bank,
+/// but a GM sequence drives far more simultaneous voices than DMX's GUS player
+/// does, and every voice here starts at the note's full velocity.
+///
+/// 17500/2.27: brings GM music onto the GUS's level, which is itself matched
+/// to FM — so digital SFX keep one balance against music whichever of the
+/// three devices a game selects. Re-measure with the same method if any
+/// source's level changes.
+///
+/// Measure this *after* any change to sample addressing. The first attempt at
+/// this constant was taken while the synth still ran the GF1's DRAM transform
+/// over its flat pool: instruments aliased onto each other, which is both
+/// audibly wrong and 2.7x louder, and calibrating against it baked the bug
+/// into the level.
+pub(super) const GM_SCALE_Q16: i32 = 7_700;
+
 /// One knob for overall loudness, applied to the summed mix just before the
 /// single clip. Unity: the headroom already lives in the per-source scales
 /// above (that is exactly what the CT1745 table ceiling buys), so rescaling

@@ -172,6 +172,8 @@ pub(super) mod vsb;
 pub(super) use vsb::*;
 pub(super) mod vgus;
 pub(super) use vgus::*;
+pub(super) mod vmpu;
+pub(super) use vmpu::*;
 
 /// Look up `KEY` in a DOS environment block, returning its value bytes.
 /// Shared by every card's `configure_from_env` (BLASTER, ULTRASND).
@@ -236,6 +238,8 @@ pub struct PcMachine {
     /// Gravis UltraSound card state (ULTRASND wiring + the GF1 over the
     /// unified sampler engine). Absent until the env declares it.
     pub gus: Gus,
+    /// MPU-401 / General MIDI. Absent until BLASTER declares a `P<port>`.
+    pub mpu: Mpu,
     /// The mixer pump: the thread's one canonical PCM stream, every emulated
     /// sound device summed into it, paced by the sink's playback position.
     pub mixer: Mixer,
@@ -441,6 +445,7 @@ impl PcMachine {
             dma: Dma8237::new(),
             sb: SoundBlaster::new(),
             gus: Gus::new(),
+            mpu: Mpu::new(),
             mixer: Mixer::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
@@ -591,6 +596,8 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
         p if pc.gus.owns(p) => pc.gus.io_read(machine, p),
+        // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
+        p if pc.mpu.owns(p) => pc.mpu.io_read(p),
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
         // poll it for DMA progress, not just completion).
@@ -699,6 +706,8 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
         p if pc.gus.owns(p) => pc.gus.io_write(machine, &pc.dma, p, val),
+        // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
+        p if pc.mpu.owns(p) => pc.mpu.io_write(p, val),
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.
@@ -858,6 +867,7 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
 enum PcmSource<'a> {
     SoundBlaster(&'a mut SoundBlaster),
     Gus(&'a mut Gus),
+    Midi(&'a mut Mpu),
 }
 
 impl PcmSource<'_> {
@@ -872,6 +882,7 @@ impl PcmSource<'_> {
         match self {
             Self::SoundBlaster(sb) => sb.mix_into(machine, rate, dsp_base, block),
             Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
+            Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
         }
     }
 }
@@ -933,7 +944,7 @@ impl Mixer {
 /// every guest-visible clock from the sink's drain position.
 pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
     let _ = regs;
-    let PcMachine { sb, gus, vpic, mixer, .. } = pc;
+    let PcMachine { sb, gus, mpu, vpic, mixer, .. } = pc;
     let now = machine.get_ticks();
     let dt = now.saturating_sub(mixer.last_ms).min(100);
 
@@ -942,6 +953,9 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     sb.deliver_trigger_irq(vpic);
     sb.deliver_probe_irq(machine, vpic);
     gus.tick(machine, vpic);
+    // MPU-401: drain the port's MIDI bytes into the synth and satisfy a
+    // bounded number of its instrument requests (a .PAT read per request).
+    mpu.tick();
 
     // The pump runs on the millisecond, not on the slice. A DOS program that
     // drives an emulated device hard (the GUS driver writes GF1 registers by
@@ -959,7 +973,8 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let dsp_on = sb.dsp_owns_sink();
     let gus_on = gus.mixing();
     let opl_on = sb.opl_audible(now);
-    if !dsp_on && !gus_on && !opl_on {
+    let midi_on = mpu.mixing();
+    if !dsp_on && !gus_on && !opl_on && !midi_on {
         if mixer.streaming {
             crate::kernel::sound::stop(machine, false); // pause, keep configured
             mixer.streaming = false;
@@ -991,7 +1006,11 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         let run = MIX_CHUNK;
         frames[..run].fill((0, 0));
         let dsp_base = base.saturating_sub(mixer.dsp_epoch);
-        let mut sources = [PcmSource::SoundBlaster(sb), PcmSource::Gus(gus)];
+        let mut sources = [
+            PcmSource::SoundBlaster(sb),
+            PcmSource::Gus(gus),
+            PcmSource::Midi(mpu),
+        ];
         for source in &mut sources {
             source.mix_into(machine, rate, base, dsp_base, &mut frames[..run]);
         }

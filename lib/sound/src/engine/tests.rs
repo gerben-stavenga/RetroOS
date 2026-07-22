@@ -233,12 +233,12 @@ fn width_transform_happens_at_fetch_not_at_write() {
     let word = 0x40000 | (0x1234 << 1);
     mem[word] = 0x34;
     mem[word + 1] = 0x12;
-    assert_eq!(fetch(&mem, true, gf1_addr, 0), 0x1234);
+    assert_eq!(fetch(&mem, true, gf1_addr, 0, Addressing::Gf1Dram), 0x1234);
     // Bit 17 is dropped by the hardware: it selects the same word.
-    assert_eq!(fetch(&mem, true, gf1_addr | 0x20000, 0), 0x1234);
+    assert_eq!(fetch(&mem, true, gf1_addr | 0x20000, 0, Addressing::Gf1Dram), 0x1234);
     // The very same address read as 8-bit data is a plain byte index.
     mem[gf1_addr as usize] = 0x7F;
-    assert_eq!(fetch(&mem, false, gf1_addr, 0), 0x7F00);
+    assert_eq!(fetch(&mem, false, gf1_addr, 0, Addressing::Gf1Dram), 0x7F00);
 }
 
 /// A tiny xorshift so the golden buffer is reproducible without std rand.
@@ -392,4 +392,70 @@ fn mix_frame_zoh_matches_decimated_generate() {
             "pull {k}"
         );
     }
+}
+
+/// The GF1's DRAM addressing must not reach a flat sample pool.
+///
+/// A GUS models a 1 MB board: 8-bit voices wrap at 20 bits and 16-bit voices
+/// keep the 256 KB bank bits while doubling within the bank. A General MIDI
+/// pool is an array — a dozen instruments already exceed 256 KB, and applying
+/// the board's transform aliases each one onto another. The audible signature
+/// is a song played with the wrong instruments, which is how this was found.
+#[test]
+fn linear_addressing_does_not_wrap_or_bank_like_gf1_dram() {
+    // A frame past the 16-bit bank boundary (0x1FFFF frames = 256 KB).
+    let frame = 0x20_010u64;
+    let byte_linear = frame as usize * 2;
+    let mut mem = alloc::vec![0u8; byte_linear + 4];
+    // Put a recognizable sample where LINEAR addressing would look.
+    mem[byte_linear] = 0x00;
+    mem[byte_linear + 1] = 0x40; // i16 0x4000
+    // ...and a different one where the GF1 bank transform would land instead.
+    let banked = ((frame & 0xC0000) | ((frame & 0x1FFFF) << 1)) as usize;
+    assert_ne!(banked, byte_linear, "the transform must actually differ here");
+    mem[banked] = 0x00;
+    mem[banked + 1] = 0xC0; // i16 -0x4000
+
+    let mut read = |mode: Addressing| -> i32 {
+        let mut e = Engine::new_boxed();
+        e.active = 1;
+        e.addressing = mode;
+        let v = &mut e.voices[0];
+        v.running = true;
+        v.bits16 = true;
+        v.addr = frame << 32;
+        v.inc = 0; // hold position
+        v.end = u64::MAX;
+        v.vol = rvol(0xFFF0);
+        v.pan_l = 0x0FFF;
+        v.pan_r = 0x0FFF;
+        let mut ev = Events::default();
+        e.step(&mem, &mut ev).0
+    };
+    let lin = read(Addressing::Linear);
+    let gf1 = read(Addressing::Gf1Dram);
+    assert!(lin > 0, "linear must read the sample actually at that byte");
+    assert!(gf1 < 0, "GF1 mode must read the banked location instead");
+}
+
+/// Linear mode must not wrap at the GF1's 1 MB ceiling either.
+#[test]
+fn linear_addressing_reaches_past_one_megabyte() {
+    let frame = 0x10_0004u64; // just past 1 MB of 8-bit frames
+    let mut mem = alloc::vec![0u8; frame as usize + 2];
+    mem[frame as usize] = 0x7F; // loud positive
+    mem[(frame & 0xFFFFF) as usize] = 0x80; // what a 20-bit wrap would hit
+    let mut e = Engine::new_boxed();
+    e.active = 1;
+    e.addressing = Addressing::Linear;
+    let v = &mut e.voices[0];
+    v.running = true;
+    v.addr = frame << 32;
+    v.inc = 0;
+    v.end = u64::MAX;
+    v.vol = rvol(0xFFF0);
+    v.pan_l = 0x0FFF;
+    v.pan_r = 0x0FFF;
+    let mut ev = Events::default();
+    assert!(e.step(&mem, &mut ev).0 > 0, "must not wrap at 20 bits");
 }
