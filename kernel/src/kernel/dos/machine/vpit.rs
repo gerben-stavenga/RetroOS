@@ -139,6 +139,23 @@ impl VirtualPitChannel {
         self.read_lsb_next = true;
     }
 
+    /// The channel's OUT line. Only channel 2's is guest-visible (port 61h
+    /// bit 5), and programs poll it both as a "is there a PIT" check and as a
+    /// sub-tick delay source — which is why this is derived from the real
+    /// count rather than faked with a toggle-per-read like the refresh bit.
+    fn output(&self, now: u64) -> bool {
+        if !self.enabled {
+            return true; // never programmed, or a one-shot that has expired
+        }
+        let div = self.divisor();
+        let elapsed = now.saturating_sub(self.start_cycle);
+        match self.mode {
+            2 => elapsed % div != div - 1, // low for one input cycle at count 1
+            3 => elapsed % div < div / 2,  // square: high for the first half
+            _ => elapsed >= div,           // one-shot: low until terminal count
+        }
+    }
+
     fn take_irqs(&mut self, now: u64) -> u32 {
         if !self.enabled {
             return 0;
@@ -163,11 +180,21 @@ impl VirtualPitChannel {
     }
 }
 
+/// Channels 0 and 2 are modelled; 1 (DRAM refresh) is not — nothing reads it,
+/// and port 61h bit 4 already fakes the refresh line for the games that poll
+/// it (see `vkbd::read_port61`).
 pub struct VirtualPit {
     last_host_tick: u64,
     frac_accum: u64,
     input_cycles: u64,
+    /// The system timer: the only channel wired to an IRQ line.
     ch0: VirtualPitChannel,
+    /// The speaker's tone generator. It drives no interrupt — the guest sees
+    /// it only through its reload (which sets the pitch) and its OUT line at
+    /// port 61h bit 5. Note the gate: on real hardware 61h bit 0 stops this
+    /// counter, but the phase it resumes at is not guest-visible, so the
+    /// channel free-runs here and gating lives entirely in the speaker card.
+    ch2: VirtualPitChannel,
 }
 
 impl VirtualPit {
@@ -178,6 +205,16 @@ impl VirtualPit {
             frac_accum: 0,
             input_cycles: 0,
             ch0: VirtualPitChannel::new(),
+            ch2: VirtualPitChannel::new(),
+        }
+    }
+
+    /// The modelled channels, by the index the guest addresses them with.
+    fn chan(&mut self, channel: u8) -> Option<&mut VirtualPitChannel> {
+        match channel {
+            0 => Some(&mut self.ch0),
+            2 => Some(&mut self.ch2),
+            _ => None,
         }
     }
 
@@ -193,28 +230,43 @@ impl VirtualPit {
         self.frac_accum = total % HOST_TIMER_HZ;
     }
 
-    pub(crate) fn read_counter0<A: crate::Arch>(&mut self, machine: &mut A) -> u8 {
+    pub(crate) fn read_counter<A: crate::Arch>(&mut self, machine: &mut A, channel: u8) -> u8 {
         self.sync(machine);
-        self.ch0.read_byte(self.input_cycles)
+        let now = self.input_cycles;
+        self.chan(channel).map_or(0, |c| c.read_byte(now))
     }
 
-    pub(crate) fn write_counter0<A: crate::Arch>(&mut self, machine: &mut A, val: u8) {
+    pub(crate) fn write_counter<A: crate::Arch>(&mut self, machine: &mut A, channel: u8, val: u8) {
         self.sync(machine);
-        self.ch0.write_byte(val, self.input_cycles);
+        let now = self.input_cycles;
+        if let Some(c) = self.chan(channel) {
+            c.write_byte(val, now);
+        }
     }
 
     pub(crate) fn write_command<A: crate::Arch>(&mut self, machine: &mut A, val: u8) {
         self.sync(machine);
+        let now = self.input_cycles;
         let channel = (val >> 6) & 0x03;
-        if channel != 0 {
-            return;
-        }
         let rw_mode = (val >> 4) & 0x03;
+        let Some(c) = self.chan(channel) else { return };
         if rw_mode == 0 {
-            self.ch0.latch_count(self.input_cycles);
+            c.latch_count(now);
             return;
         }
-        self.ch0.set_command(rw_mode, (val >> 1) & 0x07);
+        c.set_command(rw_mode, (val >> 1) & 0x07);
+    }
+
+    /// Channel 2's reload, for the speaker's pitch (0 means 65536, which the
+    /// card resolves — it is the guest's value, passed through unchanged).
+    pub(crate) fn ch2_reload(&self) -> u16 {
+        self.ch2.reload
+    }
+
+    /// Channel 2's OUT line, as read at port 61h bit 5.
+    pub(crate) fn ch2_output<A: crate::Arch>(&mut self, machine: &mut A) -> bool {
+        self.sync(machine);
+        self.ch2.output(self.input_cycles)
     }
 
     pub fn take_pending_irqs<A: crate::Arch>(&mut self, machine: &mut A) -> u32 {

@@ -1,0 +1,11 @@
+# PC speaker probe (see the .asm header): asserts PIT channel 2's OUT line at
+# port 61h bit 5 from inside the guest, then plays three tones of known pitch
+# and duration for a host-side WAV capture to measure. Runs in CI
+# (test/hosted_games.sh) on the OUT-line half, which needs no audio sink.
+genrule(
+    name = "spktest_com",
+    srcs = ["spktest.asm"],
+    outs = ["SPKTEST.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

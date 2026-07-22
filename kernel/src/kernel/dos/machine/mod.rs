@@ -240,6 +240,10 @@ pub struct PcMachine {
     pub gus: Gus,
     /// MPU-401 / General MIDI. Absent until BLASTER declares a `P<port>`.
     pub mpu: Mpu,
+    /// The PC speaker. Always present — it is the one sound device a PC has
+    /// no configuration for — and driven entirely by the port dispatch above:
+    /// PIT channel 2's reload for pitch, port 61h bits 0-1 for the gate.
+    pub spk: sound::speaker::Speaker,
     /// The mixer pump: the thread's one canonical PCM stream, every emulated
     /// sound device summed into it, paced by the sink's playback position.
     pub mixer: Mixer,
@@ -446,6 +450,7 @@ impl PcMachine {
             sb: SoundBlaster::new(),
             gus: Gus::new(),
             mpu: Mpu::new(),
+            spk: sound::speaker::Speaker::new(),
             mixer: Mixer::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
@@ -557,8 +562,14 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         0xA1 => pc.vpic.slave_imr(),
         // Keyboard data port — returns current scancode from the virtual 8042.
         0x60 => pc.vkbd.read_port60(),
-        // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge sequence.
-        0x61 => pc.vkbd.read_port61(),
+        // Keyboard controller / speaker port used by BIOS IRQ1 acknowledge
+        // sequence. Bit 5 is PIT channel 2's OUT line, which lives in the PIT
+        // and not in the 8042 — composed here rather than inside either, since
+        // neither device may name the other.
+        0x61 => {
+            let out = pc.vpit.ch2_output(machine);
+            (pc.vkbd.read_port61() & !0x20) | if out { 0x20 } else { 0 }
+        }
         // Keyboard status port (bit 0 = output buffer full).
         //
         // The serial pacing in `try_surface` (≥1 ms between bytes) keeps an
@@ -575,8 +586,10 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
             }
             if pc.vkbd.has_data() { 1 } else { 0 }
         }
-        0x40 => pc.vpit.read_counter0(machine),
-        0x41 | 0x42 => 0,
+        0x40 => pc.vpit.read_counter(machine, 0),
+        0x42 => pc.vpit.read_counter(machine, 2),
+        // Channel 1 (DRAM refresh) is not modelled; nothing reads it.
+        0x41 => 0,
         // PIT command register not readable
         0x43 => 0xFF,
         // CMOS index port: read returns the last index byte (rare).
@@ -685,13 +698,23 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // byte and surfaces on the serial pacing clock with its own IRQ1
         // edge — real keyboards answer on the same ~1 ms wire.
         0x60 => pc.vkbd.write_port60(val),
-        // Keyboard controller / speaker port
-        0x61 => pc.vkbd.write_port61(val),
+        // Keyboard controller / speaker port. Bits 0-1 are the speaker's half
+        // of its level expression (gate and data); the rest is 8042 business.
+        0x61 => {
+            pc.vkbd.write_port61(val);
+            pc.spk.set_port61(val);
+        }
         // Keyboard controller command
         0x64 => {}
         0x43 => pc.vpit.write_command(machine, val),
-        0x40 => pc.vpit.write_counter0(machine, val),
-        0x41 | 0x42 => {}
+        0x40 => pc.vpit.write_counter(machine, 0, val),
+        // Channel 2 is the speaker's pitch: the card holds no clock of its
+        // own, so hand it the new reload as the guest completes it.
+        0x42 => {
+            pc.vpit.write_counter(machine, 2, val);
+            pc.spk.set_divisor(pc.vpit.ch2_reload());
+        }
+        0x41 => {}
         // CMOS index: latch for the next data-port read. Mask off the NMI
         // disable bit (0x80) — we never want guest writes to toggle host NMI.
         0x70 => pc.cmos_index = val & 0x7F,
@@ -868,6 +891,7 @@ enum PcmSource<'a> {
     SoundBlaster(&'a mut SoundBlaster),
     Gus(&'a mut Gus),
     Midi(&'a mut Mpu),
+    Speaker(&'a mut sound::speaker::Speaker),
 }
 
 impl PcmSource<'_> {
@@ -883,6 +907,10 @@ impl PcmSource<'_> {
             Self::SoundBlaster(sb) => sb.mix_into(machine, rate, dsp_base, block),
             Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
             Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
+            Self::Speaker(spk) => {
+                let g = vsb::SPEAKER_SCALE_Q16;
+                spk.mix_into(rate, (g, g), block)
+            }
         }
     }
 }
@@ -944,7 +972,7 @@ impl Mixer {
 /// every guest-visible clock from the sink's drain position.
 pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
     let _ = regs;
-    let PcMachine { sb, gus, mpu, vpic, mixer, .. } = pc;
+    let PcMachine { sb, gus, mpu, spk, vpic, mixer, .. } = pc;
     let now = machine.get_ticks();
     let dt = now.saturating_sub(mixer.last_ms).min(100);
 
@@ -974,7 +1002,8 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let gus_on = gus.mixing();
     let opl_on = sb.opl_audible(now);
     let midi_on = mpu.mixing();
-    if !dsp_on && !gus_on && !opl_on && !midi_on {
+    let spk_on = spk.audible(MIX_RATE);
+    if !dsp_on && !gus_on && !opl_on && !midi_on && !spk_on {
         if mixer.streaming {
             crate::kernel::sound::stop(machine, false); // pause, keep configured
             mixer.streaming = false;
@@ -1010,6 +1039,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
             PcmSource::SoundBlaster(sb),
             PcmSource::Gus(gus),
             PcmSource::Midi(mpu),
+            PcmSource::Speaker(spk),
         ];
         for source in &mut sources {
             source.mix_into(machine, rate, base, dsp_base, &mut frames[..run]);

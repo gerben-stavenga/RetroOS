@@ -70,6 +70,23 @@ pub(super) const GUS_SCALE_Q16: i32 = 17_500;
 /// into the level.
 pub(super) const GM_SCALE_Q16: i32 = 7_700;
 
+/// The PC speaker, level-matched to the same reference as the other two, but
+/// *derived* rather than measured — and it can be, because a square wave's
+/// level is known exactly rather than depending on what a game plays.
+///
+/// A square's rms equals its amplitude (crest factor 1), so a full-scale
+/// square would sit at rms 32767 — 33 dB above the FM music that
+/// `GUS_SCALE_Q16` above measured at rms 727, i.e. it would arrive as a
+/// full-scale rail. Scaling so the amplitude *is* 727 puts a speaker tone at
+/// the same rms as the other devices' music, which is the same balance rule
+/// the GUS and GM constants follow: `727/32767 * 65536`.
+///
+/// Nothing plays over it in practice — a game that picks the speaker has no
+/// other device — so this is about not startling anyone when a beep lands
+/// during Sound Blaster audio, and about the constant being a decision with a
+/// derivation rather than a knob someone turned until it sounded right.
+pub(super) const SPEAKER_SCALE_Q16: i32 = 1_454;
+
 /// One knob for overall loudness, applied to the summed mix just before the
 /// single clip. Unity: the headroom already lives in the per-source scales
 /// above (that is exactly what the CT1745 table ceiling buys), so rescaling

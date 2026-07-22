@@ -64,4 +64,13 @@ run "GUS (GF1) registers, DRAM, timer IRQ, DMA upload, voice" \
     --expect-log "GDRAM-OK" --expect-log "GREG-OK" --expect-log "GTIMER-OK" \
     --expect-log "GDMA-OK" --expect-log "GVOICE-OK"
 
+# PC speaker (test/dos/spkproto): PIT channel 2's OUT line at port 61h bit 5 —
+# the only part of the speaker path a guest can check by itself, and the part
+# programs poll as a PIT presence test and a sub-tick delay source. TONES-DONE
+# means the tone sequence also ran to completion; measuring its pitch needs a
+# host-side capture (see the .asm header for the recipe).
+run "PC speaker OUT line + tone sequence" \
+    --cmd "TESTS/SPKTEST.COM" --settle 3 --timeout 30 \
+    --expect-log "OUT-OK" --expect-log "TONES-DONE"
+
 exit $fail

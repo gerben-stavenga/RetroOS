@@ -36,6 +36,7 @@ pub mod opl;
 pub mod midi;
 pub mod pat;
 pub mod sb;
+pub mod speaker;
 
 pub use engine::{
     Addressing, Engine, Events, LoopMode, MAX_VOICES, Ramp, Voice, VoiceFilter, voice,

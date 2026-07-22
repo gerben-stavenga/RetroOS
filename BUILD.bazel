@@ -200,6 +200,10 @@ _EXTRA_FILES = {
     # count underflow) — hosted_games.sh asserts SBTEST prints TC-OK.
     "//test/dos/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
     "//test/dos/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
+    # PC speaker probe — hosted_games.sh asserts SPKTEST prints OUT-OK (the
+    # PIT ch2 OUT line at port 61h bit 5); its tone sequence is the fixture
+    # the WAV-capture check measures.
+    "//test/dos/spkproto:spktest_com":    "TESTS/SPKTEST.COM",
     # GUS (GF1) emulation probe — hosted_games.sh asserts its G*-OK markers.
     "//test/dos/gusproto:gustest_exe":    "TESTS/GUSTEST.EXE",
     "//tools/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
