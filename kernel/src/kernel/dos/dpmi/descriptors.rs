@@ -13,6 +13,25 @@ pub(super) fn sel_to_idx(sel: u16) -> usize {
     (sel >> 3) as usize
 }
 
+/// Force an access byte's DPL to the client's privilege level.
+///
+/// A DPMI client's LDT is its own: every descriptor in it is only ever loaded
+/// by that client, so the DPL is not a protection boundary here — it is purely
+/// a gate on whether the client can load the selector at all. We run clients at
+/// CPL 3 (spec-conforming), while every DOS-era host they were built against —
+/// DOS/4GW, CWSDPMI, PMODE/W, DOS/32A — runs them at ring 0. A client written
+/// for those hosts asks for the ring-0 flat descriptor it has always used, and
+/// under us the very next `MOV DS, sel` #GPs because CPL 3 > DPL 0.
+///
+/// Dark Forces does exactly this: its GUS driver does 000Ah (alias) then 0009h
+/// with CX=C093 — a DPL-0 flat data segment — and faults two instructions later
+/// at `MOV DS, AX`. Its Sound Blaster path asks for C0F3 and has always worked.
+/// So take the client's type/granularity bits and substitute our own DPL,
+/// exactly as the S=1 bit is already forced just below.
+pub(super) fn client_dpl(access: u8) -> u8 {
+    (access & !0x60) | 0x60 // DPL 3
+}
+
 /// Build a data descriptor (present, DPL=3, writable).
 /// db = D/B bit: false = 16-bit, true = 32-bit.
 pub(super) fn make_data_desc_ex(base: u32, limit: u32, db: bool) -> u64 {

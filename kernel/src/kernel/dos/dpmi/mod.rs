@@ -28,7 +28,7 @@ pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL
 use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors};
-use self::descriptors::{alloc_ldt, alloc_ldt_range, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc, valid_ldt_selector_idx};
+use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc, valid_ldt_selector_idx};
 mod rm_calls;
 pub(in crate::kernel::dos) use self::rm_calls::callback_entry;
 use self::rm_calls::{call_real_mode_proc, call_real_mode_proc_iret, simulate_real_mode_int};
@@ -357,9 +357,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 let cl = regs.rcx as u8;
                 let ch = (regs.rcx >> 8) as u8;
                 // Match CWSDPMI: force the descriptor to stay code/data (S=1)
-                // and only accept G/D/B/AVL in the high nibble.
+                // and only accept G/D/B/AVL in the high nibble. The DPL is
+                // ours, not the client's — see `client_dpl`.
                 dos.ldt[idx] &= !0x00F0_FF00_0000_0000;
-                dos.ldt[idx] |= ((0x10 | cl) as u64) << 40;
+                dos.ldt[idx] |= ((0x10 | client_dpl(cl)) as u64) << 40;
                 dos.ldt[idx] |= ((ch & 0xD0) as u64) << 48;
                 trace_dpmi_desc("0009 rights", sel, dos.ldt[idx]);
                 clear_carry(regs);
@@ -416,6 +417,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 let mut new_desc = machine.read::<u64>((src) as usize);
                 // Match CWSDPMI: force the descriptor to stay non-system.
                 new_desc |= 1u64 << 44;
+                // ...and force the DPL to the client's — see `client_dpl`.
+                let acc = client_dpl((new_desc >> 40) as u8);
+                new_desc = (new_desc & !(0xFFu64 << 40)) | ((acc as u64) << 40);
                 dos.ldt[idx] = new_desc;
                 trace_dpmi_desc("000C set", sel, new_desc);
                 dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
