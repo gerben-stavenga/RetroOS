@@ -710,16 +710,21 @@ pub fn on_set_mode<A: crate::Arch>(
     }
     let planar = matches!(mode, 0x0D..=0x12);
     if planar {
-        // Standard EGA AC palettes. In 200-line compatibility modes, brown uses
-        // value 0x06 because green's secondary bit is the RGBI intensity bit; in
-        // normal 350/480-line modes it uses the full-EGA brown value 0x14.
+        // Standard EGA AC palettes, straight out of the BIOS video parameter
+        // table. The 200-line modes are the RGBI-compatibility family: colour
+        // 6 is brown at 0x06 (green's secondary bit is the intensity bit, not
+        // a colour bit) and the bright bank sits at 0x10..0x17 — the SAME eight
+        // DAC entries a game reprograms when it loads its own 16 colours
+        // (Xenon 2 writes DAC 0x00..0x17 and never touches the AC). The
+        // 350/480-line modes use the full 64-colour EGA encoding instead:
+        // brown is 0x14 and the bright bank is 0x38..0x3F.
         const EGA_AC_NORMAL: [u8; 16] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
             0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
         ];
         const EGA_AC_200LINE: [u8; 16] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
         ];
         let ac = if matches!(mode, 0x0D | 0x0E) {
             &EGA_AC_200LINE
