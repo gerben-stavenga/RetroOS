@@ -240,18 +240,23 @@ impl VirtualKeyboard {
 /// Bochs boot NumLock off and emit neither E0-less numpads nor fake shifts,
 /// so this only began to matter under 86box, whose accurate MF2 keyboard
 /// emits the fake shifts and whose BIOS boots NumLock on.)
-pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<u8> {
+pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<(bool, u8)> {
     if scancode == 0xE0 {
+        // Hold the prefix rather than queueing it: the 8042 brackets the gray
+        // keys with fake shifts (E0 2A / E0 AA around them when NumLock or a
+        // real shift is down) and those pairs must vanish whole. One byte of
+        // lookahead is all it takes, and every surviving prefix is then
+        // queued with its code — the guest sees the same E0 xx pair a real
+        // controller sends, which is what makes the enhanced keystrokes
+        // (AL=0xE0) reachable at all.
         pc.e0_pending = true;
         return None;
     }
-    if pc.e0_pending {
-        pc.e0_pending = false;
-        if matches!(scancode, 0x2A | 0xAA | 0x36 | 0xB6) {
-            return None;
-        }
+    let e0 = core::mem::take(&mut pc.e0_pending);
+    if e0 && matches!(scancode, 0x2A | 0xAA | 0x36 | 0xB6) {
+        return None;
     }
-    Some(scancode)
+    Some((e0, scancode))
 }
 
 /// Clear the BIOS keyboard buffer at 40:1A..40:3E.

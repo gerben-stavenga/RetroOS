@@ -114,6 +114,10 @@ struct Bda {
     rows_minus1: u8,
     /// 0x85: character cell height.
     cell_height: u16,
+    _pad_87: [u8; 15],
+    /// 0x96: keyboard flags 3. Bit 4 = enhanced (101/102-key) keyboard
+    /// installed.
+    kb_flags3: u8,
 }
 
 /// The BDA's canonical offsets are guest ABI — pin the projection to them.
@@ -133,6 +137,7 @@ const _: () = {
     assert!(offset_of!(Bda, tick_count) == 0x6C);
     assert!(offset_of!(Bda, kb_ring_start) == 0x80);
     assert!(offset_of!(Bda, rows_minus1) == 0x84);
+    assert!(offset_of!(Bda, kb_flags3) == 0x96);
 };
 
 const BDA_BASE: usize = 0x400;
@@ -231,6 +236,7 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
     bda_field!(machine, kb_tail = KB_RING_FIRST);
     bda_field!(machine, kb_ring_start = KB_RING_FIRST);
     bda_field!(machine, kb_ring_end = KB_RING_END);
+    bda_field!(machine, kb_flags3 = KB3_ENHANCED);
 }
 
 // ============================================================================
@@ -373,6 +379,29 @@ enum Parked {
     No,
 }
 
+/// BDA 40:96 bit 1 — "the last scancode was E0". The BIOS's own scratch bit
+/// between the prefix byte's INT 09 and the next one's.
+const KB3_LAST_E0: u8 = 0x02;
+/// BDA 40:96 bit 4 — an enhanced (101/102-key) keyboard is installed. A real
+/// POST sets it; software reads it to decide between the conventional
+/// (AH=00/01) and enhanced (AH=10/11) INT 16h calls.
+const KB3_ENHANCED: u8 = 0x10;
+
+/// Fold an enhanced keystroke back to what the *conventional* INT 16h calls
+/// (AH=00/01) report: they predate the 101-key keyboard, so the gray keys must
+/// look like the 83-key ones whose scancodes they share. AL=0xE0 becomes 0x00
+/// (an extended key with no ASCII), and gray Enter / gray `/` — which carry the
+/// 0xE0 in the scancode slot — get their real scancodes back. AH=10/11 report
+/// the word untouched; that difference is the whole point of the enhanced calls.
+fn conventional(word: u16) -> u16 {
+    match ((word >> 8) as u8, word as u8) {
+        (0xE0, 0x0D) => 0x1C0D, // gray Enter → the main Enter's scancode
+        (0xE0, 0x2F) => 0x352F, // gray /     → the main /'s scancode
+        (scan, 0xE0) if scan != 0 => word & 0xFF00, // gray cursor block: AL=0
+        _ => word,
+    }
+}
+
 fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Parked {
     // A real INT 16h opens with `STI`, and its wait loop keeps interrupts on
     // (IBM's K16 spins `sti; nop; cli; check-buffer`) — so calling it is how a
@@ -410,6 +439,7 @@ fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Park
                 next = KB_RING_FIRST;
             }
             bda_field!(machine, kb_head = next);
+            let key = if ah == 0x00 { conventional(key) } else { key };
             regs.rax = (regs.rax & !0xFFFF) | key as u64;
         }
         0x01 | 0x11 => {
@@ -422,6 +452,7 @@ fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Park
             } else {
                 flags &= !0x40;
                 let key: u16 = machine.read(BDA_BASE + head as usize);
+                let key = if ah == 0x01 { conventional(key) } else { key };
                 regs.rax = (regs.rax & !0xFFFF) | key as u64;
             }
             write_u16(machine, ss, fl_off, flags);
@@ -449,6 +480,19 @@ const KB_UC: [u8; 58] = *b"\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\x0d\x00ASDFGHJ
 /// ring for INT 16h. Extended keys (arrows, F-keys) push ascii=0.
 fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
     let sc = emulate_inb(machine, &mut dos.pc, 0x60);
+    // The E0 prefix arrives as its own byte with its own IRQ1 (real 8042, and
+    // `vkbd` queues it the same way). It is not a keystroke — latch it in the
+    // BDA flag that exists for exactly this and wait for the code it prefixes.
+    let flags3: u8 = bda_field!(machine, kb_flags3);
+    if sc == 0xE0 {
+        bda_field!(machine, kb_flags3 = flags3 | KB3_LAST_E0);
+        emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
+        return;
+    }
+    let e0 = flags3 & KB3_LAST_E0 != 0;
+    if e0 {
+        bda_field!(machine, kb_flags3 = flags3 & !KB3_LAST_E0);
+    }
     let key = sc & 0x7F;
     let mut flags: u8 = bda_field!(machine, kb_flags);
 
@@ -479,6 +523,21 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
         }
     }
 
+    // The buffer word. An E0-prefixed key is an *enhanced* keystroke: the gray
+    // duplicates report AL=0xE0 in place of an ASCII code (that marker is how
+    // software tells the gray cursor block from the keypad keys that share its
+    // scancodes), and the two gray keys that do have an ASCII code — Enter and
+    // `/` — put the 0xE0 in the scancode slot instead. `int16` folds all of
+    // this back for the conventional AH=00/01 reads.
+    let word = if e0 {
+        match key {
+            0x1C => 0xE00D, // gray Enter
+            0x35 => 0xE02F, // gray /
+            _ => ((key as u16) << 8) | 0x00E0,
+        }
+    } else {
+        ((key as u16) << 8) | asc as u16
+    };
     let tail: u16 = bda_field!(machine, kb_tail);
     let mut next = tail + 2;
     if next >= KB_RING_END {
@@ -487,7 +546,7 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
     let head: u16 = bda_field!(machine, kb_head);
     if next != head {
         // ring not full
-        machine.write::<u16>(BDA_BASE + tail as usize, ((key as u16) << 8) | asc as u16);
+        machine.write::<u16>(BDA_BASE + tail as usize, word);
         bda_field!(machine, kb_tail = next);
     }
     emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);

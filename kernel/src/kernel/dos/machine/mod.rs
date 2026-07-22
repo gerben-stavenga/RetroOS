@@ -1047,7 +1047,10 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
                 crate::dbg_println!("[kbd] raw {:02X}{} e0p={}", sc,
                     if sc & 0x80 != 0 { " REL" } else { "" }, pc.e0_pending as u8);
             }
-            let Some(sc) = normalize_scancode(pc, sc) else { return };
+            let Some((e0, sc)) = normalize_scancode(pc, sc) else { return };
+            if e0 {
+                pc.vkbd.push(0xE0);
+            }
             // Queue only — the byte travels "over the serial link" and
             // surfaces (with its own IRQ1 edge) through the pacing clock in
             // `queue_tick` / the 0x64 poll path. No PIC-state peeking here:

@@ -816,7 +816,11 @@ fn launch_int16_read<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     machine::vm86_push(machine, regs, ctrl_slot_off(SLOT_RESUME));
     machine::set_vm86_cs(regs, ivt_seg);
     machine::set_vm86_ip(regs, ivt_off);
-    regs.rax &= !0xFF00;                      // AH = 0 (INT 16h AH=00)
+    // AH = 00: the CONVENTIONAL read, deliberately. DOS char input reports an
+    // extended key as AL=0x00 + the scancode on the next call, and programs
+    // branch on exactly that (`test al,al`) — the enhanced call's AL=0xE0
+    // marker would send them down the plain-ASCII path instead.
+    regs.rax &= !0xFF00;
     regs.frame.rflags |= machine::VIF_FLAG as u64; // guest VIF=1 while INT 16 runs
 }
 
@@ -824,7 +828,14 @@ fn launch_int16_read<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
 /// guest's INT 16h handler IRETs back to SLOT_RESUME, with AX = the key
 /// (AL=ASCII, AH=scancode). Applies DOS char-read semantics and returns
 /// `None` so SLOT_RESUME pops the original INT 21 return frame.
-fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool) -> super::ResumeCallback<A> {
+///
+/// `func` is the INT 21h function number the guest called with. DOS leaves AH
+/// alone across a char read — only AL is a result — and programs lean on it:
+/// Prince of Persia 2's SETUP reads an extended key with `int 21h` / `test al,al`
+/// / `int 21h`, the second call carrying no `mov ah,7` of its own. Handing back
+/// the INT 16h scancode in AH turned that into function 50h (set PSP), so the
+/// scancode was never delivered and its menus ignored every arrow key.
+fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool, func: u8) -> super::ResumeCallback<A> {
     super::ResumeCallback(alloc::boxed::Box::new(move |machine: &mut A,
               _kt: &mut thread::KernelThread<A>,
               dos: &mut thread::DosState<A>,
@@ -836,7 +847,7 @@ fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool) -> super::R
             if ascii == 0 && scan != 0 {
                 dos.dos_pending_char = Some(scan);
             }
-            regs.rax = (regs.rax & !0xFF) | ascii as u64;
+            regs.rax = (regs.rax & !0xFFFF) | ((func as u64) << 8) | ascii as u64;
             if echo && ascii != 0 { dos_putchar(machine, ascii); }
             None
         }))
@@ -948,7 +959,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 // unhooked guest just runs the BIOS INT 16h, reading the same
                 // 40:1A the old fast path did.
                 launch_int16_read(machine, regs);
-                dos.pending_resume = Some(int16_finish_resume(machine, echo));
+                dos.pending_resume = Some(int16_finish_resume(machine, echo, ah));
             }
             thread::KernelAction::Done
         }

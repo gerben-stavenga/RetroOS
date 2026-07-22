@@ -281,8 +281,18 @@ fn spawn_keyboard() {
             const TAP_GAP: std::time::Duration = std::time::Duration::from_millis(30);
             if b == 0x1B
                 && let Some(sc) = read_escape_seq(&mut stdin) {
+                    // A 101-key keyboard brackets the cursor block and
+                    // Insert/Delete with an E0 prefix, and that prefix is what
+                    // the BIOS turns into the enhanced AL=0xE0 keystroke a lot
+                    // of DOS software matches arrows on. A terminal escape
+                    // carries no such distinction, so put it back: from a
+                    // terminal these are always the gray keys, never the
+                    // keypad duplicates that share their scancodes.
+                    let gray = GRAY_KEYS.contains(&sc);
+                    if gray { arch::post_irq(arch::Irq::Key(0xE0)); }
                     arch::post_irq(arch::Irq::Key(sc));
                     std::thread::sleep(TAP_GAP);
+                    if gray { arch::post_irq(arch::Irq::Key(0xE0)); }
                     arch::post_irq(arch::Irq::Key(sc | 0x80));
                     continue;
                 }
@@ -293,6 +303,11 @@ fn spawn_keyboard() {
         }
     });
 }
+
+/// The scancodes a 101-key keyboard sends with an E0 prefix: the dedicated
+/// cursor block plus Insert/Delete. (F11/F12 are enhanced keys too, but they
+/// are new scancodes, not E0-prefixed duplicates of keypad ones.)
+const GRAY_KEYS: [u8; 10] = [0x47, 0x48, 0x49, 0x4B, 0x4D, 0x4F, 0x50, 0x51, 0x52, 0x53];
 
 /// After an ESC, read a CSI (`[ … final`) or SS3 (`O P/Q/R/S`) sequence and
 /// return the single PC scancode it maps to (arrows, Home/End/PgUp/Del, F1-F12),
