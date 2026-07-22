@@ -87,7 +87,7 @@ impl Mpu {
         }
         let Some(blaster) = env_var(env, b"BLASTER") else { return };
         for tok in blaster.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
-            if tok[0].to_ascii_uppercase() == b'P'
+            if tok[0].eq_ignore_ascii_case(&b'P')
                 && let Some(n) = parse_uint(&tok[1..], 16)
             {
                 self.base = n as u16;

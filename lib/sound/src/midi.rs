@@ -716,7 +716,7 @@ fn ramp_bound(offset: u8, peak: i32) -> i32 {
 fn pitch_inc(s: &crate::pat::Sample, hz_milli: u32, out_rate: u32) -> u64 {
     let root = s.root_hz_milli.max(1) as u128;
     let out = out_rate.max(1) as u128;
-    let num = (s.sample_rate as u128) * (hz_milli as u128) << 32;
+    let num = ((s.sample_rate as u128) * (hz_milli as u128)) << 32;
     (num / (out * root)).min(u64::MAX as u128) as u64
 }
 
