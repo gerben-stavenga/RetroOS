@@ -954,6 +954,11 @@ pub struct Mixer {
     dsp_epoch: u64,
     streaming: bool,
     last_ms: u64,
+    /// MIDI-arrival frame clock: a real-time (get_ticks) counter in the mixer's
+    /// production frame numbering, never behind the production frontier. Incoming
+    /// MIDI bytes are stamped with it so note onset is independent of block size.
+    midi_frame: u64,
+    midi_ms: u64,
 }
 
 impl Mixer {
@@ -963,6 +968,8 @@ impl Mixer {
             dsp_epoch: 0,
             streaming: false,
             last_ms: 0,
+            midi_frame: 0,
+            midi_ms: 0,
         }
     }
 }
@@ -981,9 +988,25 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     sb.deliver_trigger_irq(vpic);
     sb.deliver_probe_irq(machine, vpic);
     gus.tick(machine, vpic);
-    // MPU-401: drain the port's MIDI bytes into the synth and satisfy a
-    // bounded number of its instrument requests (a .PAT read per request).
-    mpu.tick();
+    // Advance the MIDI-arrival clock in the production frame numbering: extend it
+    // by the real time elapsed (get_ticks, ms → frames), but never behind the
+    // production frontier (`pushed`). Between production passes this spreads
+    // arrivals across the interval; at a pass boundary it re-aligns to the new
+    // frontier. Stamping incoming MIDI with it decouples note onset from block
+    // size (a note lands at its true sub-block frame, not the block start).
+    let pushed = mixer.pace.pushed();
+    if mixer.midi_ms == 0 {
+        mixer.midi_frame = pushed;
+        mixer.midi_ms = now;
+    }
+    mixer.midi_frame = (mixer.midi_frame
+        + now.saturating_sub(mixer.midi_ms) * MIX_RATE as u64 / 1000)
+        .max(pushed);
+    mixer.midi_ms = now;
+    // MPU-401: drain the port's MIDI bytes into the synth (stamped at the arrival
+    // frame) and satisfy a bounded number of its instrument requests (a .PAT
+    // read per request).
+    mpu.tick(mixer.midi_frame);
 
     // The pump runs on the millisecond, not on the slice. A DOS program that
     // drives an emulated device hard (the GUS driver writes GF1 registers by
@@ -1010,6 +1033,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         }
         mixer.pace.reset();
         mixer.dsp_epoch = 0;
+        mixer.midi_ms = 0; // re-seed the MIDI clock on the next active session
         return;
     }
     // Source activity does not define the output session. In particular, an

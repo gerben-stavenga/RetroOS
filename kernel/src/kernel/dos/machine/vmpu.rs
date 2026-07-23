@@ -167,8 +167,10 @@ impl Mpu {
     }
 
     /// Per-quantum service: drain the port's MIDI bytes into the synth, then
-    /// satisfy a bounded number of its instrument requests.
-    pub fn tick(&mut self) {
+    /// satisfy a bounded number of its instrument requests. `arrival_frame` is
+    /// the current mix-frame the bytes arrived at — the synth applies each at
+    /// that frame so note onset timing is independent of the mix block size.
+    pub fn tick(&mut self, arrival_frame: u64) {
         if !self.present {
             return;
         }
@@ -184,7 +186,7 @@ impl Mpu {
         }
         while let Some(b) = self.card.take() {
             if let Some(s) = self.synth.as_mut() {
-                s.write(b);
+                s.write_at(arrival_frame, b);
             }
         }
         for _ in 0..LOADS_PER_TICK {
@@ -202,7 +204,12 @@ impl Mpu {
 
     /// Whether the synth currently owes the sink audio.
     pub(super) fn mixing(&self) -> bool {
-        self.synth.as_ref().is_some_and(|s| s.mixing())
+        // Also true while stamped bytes are still queued: they will start notes
+        // at a future frame, so the producer must keep the stream running until
+        // they are consumed (otherwise production stops before they render).
+        self.synth
+            .as_ref()
+            .is_some_and(|s| s.mixing() || s.has_pending())
     }
 
     /// Sum the GM synth into the pump block. The scale is mix policy, like
@@ -213,12 +220,12 @@ impl Mpu {
         &mut self,
         _machine: &mut A,
         rate: u32,
-        _base: u64,
+        base: u64,
         block: &mut [(i32, i32)],
     ) {
         let g = super::vsb::GM_SCALE_Q16;
         if let Some(s) = self.synth.as_mut() {
-            s.mix_into(rate, (g, g), block);
+            s.mix_into(rate, base, (g, g), block);
         }
     }
 }

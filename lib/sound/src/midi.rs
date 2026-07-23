@@ -24,6 +24,7 @@
 use crate::pat::Patch;
 use crate::{Engine, Events, LoopMode, MAX_VOICES, volume};
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 /// General MIDI melodic programs 0-127 → `dgguspat` patch file stems.
@@ -208,6 +209,11 @@ pub struct Synth {
     clock: u64,
     /// The host's mix rate, needed to turn a pitch into an address increment.
     out_rate: u32,
+    /// MIDI bytes stamped with the absolute mix-frame they arrived at, applied
+    /// inside [`mix_into`](Self::mix_into) at that exact frame. This makes note
+    /// onset timing independent of the mix block size — a large output buffer no
+    /// longer quantises notes to its boundary. FIFO, frames non-decreasing.
+    timed: VecDeque<(u64, u8)>,
 }
 
 impl Synth {
@@ -228,6 +234,7 @@ impl Synth {
             in_sysex: false,
             clock: 0,
             out_rate: 44_100,
+            timed: VecDeque::new(),
         })
     }
 
@@ -306,6 +313,25 @@ impl Synth {
     }
 
     // ── the MIDI wire ────────────────────────────────────────────────────
+
+    /// Enqueue a MIDI byte stamped at absolute mix-frame `frame`; it is applied
+    /// inside [`mix_into`](Self::mix_into) when rendering reaches that frame, so
+    /// its note onset lands at the right sub-block position regardless of block
+    /// size. Frames must be non-decreasing (wire arrival order). The ring is
+    /// bounded; a pathological overrun falls back to applying immediately.
+    pub fn write_at(&mut self, frame: u64, b: u8) {
+        if self.timed.len() >= 8192 {
+            self.write(b);
+            return;
+        }
+        self.timed.push_back((frame, b));
+    }
+
+    /// Bytes are queued to start a note but not yet applied — the producer must
+    /// keep mixing until they are (`mixing()` alone would stop too early).
+    pub fn has_pending(&self) -> bool {
+        !self.timed.is_empty()
+    }
 
     /// Feed one byte of the MIDI stream. Handles running status, ignores
     /// real-time bytes, and swallows SysEx.
@@ -646,20 +672,37 @@ impl Synth {
         self.engine.any_running()
     }
 
-    /// Sum the synth into `block` at the host's mix rate, scaled by `gain`
-    /// (Q16). Envelope stages advance on the engine's ramp events, so the
-    /// whole six-stage envelope runs inside the mix with no clock.
-    pub fn mix_into(&mut self, rate: u32, gain: (i32, i32), block: &mut [(i32, i32)]) {
+    /// Sum the synth into `block` (absolute mix-frame `base`) at the host's mix
+    /// rate, scaled by `gain` (Q16). Timed MIDI bytes ([`write_at`](Self::write_at))
+    /// are applied at their stamped frame *inside* the loop, so a note starts at
+    /// its sub-block sample position — onset timing is independent of block size.
+    /// Envelope stages advance on the engine's ramp events, so the whole
+    /// six-stage envelope runs inside the mix with no clock.
+    pub fn mix_into(&mut self, rate: u32, base: u64, gain: (i32, i32), block: &mut [(i32, i32)]) {
         // The host's rate is authoritative and can change between sessions;
         // adopting it here means a caller never has to remember to announce it.
         self.set_rate(rate);
-        if !self.mixing() {
+        if self.timed.is_empty() && !self.mixing() {
             return;
         }
         // The bank is recorded at assorted rates; the engine resamples per
         // voice from its increment, so the "native" rate here is just the
         // output rate — one engine step per output frame.
-        for slot in block.iter_mut() {
+        for (i, slot) in block.iter_mut().enumerate() {
+            let abs = base + i as u64;
+            // Apply every byte due at or before this frame first, so a note-on
+            // stamped mid-block starts a voice exactly here (a byte stamped
+            // before `base` — the producer caught up past it — applies at i=0).
+            while let Some(&(f, b)) = self.timed.front() {
+                if f > abs {
+                    break;
+                }
+                self.timed.pop_front();
+                self.write(b);
+            }
+            if !self.mixing() {
+                continue; // no voice sounding at this frame yet
+            }
             let mut ev = Events::default();
             let (l, r) = self.engine.mix_frame(&self.pool, self.out_rate, self.out_rate, &mut ev);
             slot.0 += (l * gain.0) >> 16;
@@ -800,7 +843,7 @@ mod tests {
                 return (true, i * 64);
             }
             block.fill((0, 0));
-            s.mix_into(44_100, (1 << 16, 1 << 16), &mut block);
+            s.mix_into(44_100, 0, (1 << 16, 1 << 16), &mut block);
         }
         (!s.mixing(), limit)
     }
@@ -812,7 +855,7 @@ mod tests {
         s.write(60);
         s.write(100);
         let mut block = [(0i32, 0i32); 64];
-        s.mix_into(44_100, (1 << 16, 1 << 16), &mut block);
+        s.mix_into(44_100, 0, (1 << 16, 1 << 16), &mut block);
         assert!(s.mixing(), "the note must be sounding");
         s.write(0x80);
         s.write(60);
@@ -869,7 +912,7 @@ mod tests {
         s.write(60);
         s.write(0);
         let mut block = [(0i32, 0i32); 64];
-        s.mix_into(44_100, (1 << 16, 1 << 16), &mut block);
+        s.mix_into(44_100, 0, (1 << 16, 1 << 16), &mut block);
         assert!(s.mixing(), "the pedal must hold the note");
         s.write(0xB0);
         s.write(121);
@@ -891,7 +934,7 @@ mod tests {
         s.write(60);
         s.write(100);
         let mut block = [(0i32, 0i32); 64];
-        s.mix_into(44_100, (1 << 16, 1 << 16), &mut block);
+        s.mix_into(44_100, 0, (1 << 16, 1 << 16), &mut block);
         let v = (0..MAX_VOICES)
             .find(|&i| s.notes[i].active)
             .expect("a voice must be sounding");
