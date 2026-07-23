@@ -108,14 +108,16 @@ const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
 // ── PCM ring geometry (mirror ac97) ──────────────────────────────────────────
 const NUM_BUF: usize = 32;
-// 1 KB = 256 stereo frames ≈ 5.8 ms @ 44.1 kHz. With MSI each completed buffer
-// is one interrupt that drives one production pass, so the buffer duration sets
-// how finely the synth engine advances — a large buffer would step GUS/DMX in
-// coarse lumps (the E1M8 "cut notes" failure mode). ~6 ms stays fine there while
-// giving the pipe (6 buffers ≈ 35 ms) depth to ride out the ~14.3 ms
-// framebuffer-blit stall that would otherwise crackle a shallower pipe.
-const BUF_BYTES: usize = 0x400;
-const PRIME_BUFS: usize = 3;
+// Double-buffered pipe: the producer keeps min_fill = 2 buffers queued ahead of
+// the play cursor, so playback latency ≈ 2 × this buffer's duration. MIDI onset
+// timing is stamped at arrival and applied per-frame (see midi.rs), so buffer
+// size no longer quantises notes — it is chosen purely for pipe depth. 2 KB =
+// 512 stereo frames ≈ 11.6 ms @ 44.1 kHz → ~23 ms pipe, deep enough to ride out
+// the ~14.3 ms framebuffer-blit stall. (GUS-native register writes are still
+// block-quantised, but games default to General MIDI.) The ring is larger than
+// the pipe only to give the write cursor guard room ahead of the play cursor.
+const BUF_BYTES: usize = 0x800;
+const PRIME_BUFS: usize = 2;
 /// Hard drop ceiling, just under the ring's ahead/behind ambiguity point.
 /// Every producer is position-slaved (`sound::position`/`sound::Pace`) and
 /// pins its own fill, so this only catches runaway bursts.
@@ -1781,9 +1783,11 @@ pub fn min_fill(rate: u32) -> Option<u32> {
     }
     let src = if rate == 0 { 44100 } else { rate };
     let hw = Hda::hardware_rate(src);
-    // Event-driven: one buffer is refilled per completion interrupt. Six buffers
-    // (6 × 5.8 ms ≈ 35 ms) span the ~14.3 ms framebuffer-blit stall with margin.
-    let hw_frames = (6 * BUF_BYTES / 4) as u64;
+    // Double-buffered: keep 2 buffers queued ahead of the play cursor. That is
+    // the whole pipe, so latency ≈ 2 × the buffer duration (≈23 ms) — deep enough
+    // to span the ~14.3 ms framebuffer-blit stall. MIDI timing no longer depends
+    // on it (events are stamped at arrival), so this is a pure latency knob.
+    let hw_frames = (2 * BUF_BYTES / 4) as u64;
     Some((hw_frames * src as u64 / hw as u64) as u32 + 1)
 }
 
