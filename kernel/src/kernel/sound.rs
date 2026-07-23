@@ -91,11 +91,17 @@ pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
 /// event is consumed, never forwarded to a guest). Cross-personality by design
 /// — the sink belongs to the kernel, not to whichever thread is focused.
 pub fn on_hw_irq<A: crate::Arch>(machine: &mut A, line: u8) -> bool {
-    let _ = machine;
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda if line == crate::kernel::drivers::hda::MSI_LINE => {
             crate::kernel::drivers::hda::on_irq();
+            true
+        }
+        Audio::EmulatedAc97 if Some(line) == crate::kernel::drivers::ac97::irq_line() => {
+            crate::kernel::drivers::ac97::on_irq(machine);
+            // Level INTx: the driver cleared the source above; re-unmask the line
+            // (the PIC path masked it on receipt — a no-op in APIC edge mode).
+            machine.rearm_irq(line);
             true
         }
         _ => false,
@@ -167,17 +173,6 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     }
 }
 
-/// Is the selected sink driving production by its own completion interrupt
-/// (vs a polled cursor)? When true the pacer refills purely on the drain (each
-/// completion frees one buffer to produce), because a hardware-buffer-clocked
-/// interrupt is a stable pace — unlike a jitter-prone polled cursor, which
-/// still needs the `get_ticks` smoothing servo. Probed once per session.
-pub fn irq_paced() -> bool {
-    use crate::kernel::platform::Audio;
-    matches!(crate::kernel::platform::get().audio, Audio::EmulatedHda)
-        && crate::kernel::drivers::hda::msi_active()
-}
-
 /// Minimum pipe fill (source frames at `rate`) a position-slaved producer
 /// must keep queued in the selected output: enough to cover the sink's
 /// start-of-stream prime plus its claim burst (how far ahead of audible
@@ -211,9 +206,6 @@ pub struct Pace {
     /// Pipe depth target in source frames; 0 = synthetic (no sink position).
     fill: u32,
     use_pos: bool,
-    /// The sink drives production by completion IRQ (see [`irq_paced`]): refill
-    /// purely on the drain, skipping the get_ticks drift servo.
-    irq_paced: bool,
     /// Source frames pushed this session.
     pushed: u64,
     /// Sink `written` counter at our session start (`u64::MAX` = not yet
@@ -233,7 +225,7 @@ pub struct Pace {
 impl Pace {
     pub const fn new() -> Self {
         Pace {
-            rate: 0, fill: 0, use_pos: false, irq_paced: false,
+            rate: 0, fill: 0, use_pos: false,
             pushed: 0, anchor: u64::MAX, drained: 0, frac: 0,
         }
     }
@@ -284,7 +276,6 @@ impl Pace {
             let fill = min_fill(rate);
             self.rate = rate;
             self.use_pos = fill.is_some();
-            self.irq_paced = irq_paced();
             self.fill = fill.unwrap_or(0);
             self.pushed = 0;
             self.anchor = u64::MAX;
@@ -300,38 +291,13 @@ impl Pace {
             } else {
                 consumed.saturating_sub(self.anchor)
             };
-            // Pace on GUEST TIME, not on the drain position. `get_ticks` is
-            // real-time to ~1e-3 (measured against wall-clock), so producing
-            // `rate·dt` frames matches the codec's rate directly — and, unlike
-            // chasing the jittery `consumed`, the rate is near-constant, so the
-            // synth engine (and the GUS volume ramps DMX polls to time its notes)
-            // advances evenly. Chasing the drain made the engine step in the
-            // codec's coarse jitter, which desynced DMX and dropped brief
-            // silences into GUS music.
-            //
-            // To soak the crystal-level drift between the guest clock and the
-            // codec, we ALTER THE MIX RATE — a gentle proportional servo that
-            // trims `rate` by how far the pipe fill sits off `fill` (>>4 gain →
-            // sub-0.5% trim). Not the drain position (no averaging), not a
-            // resample: production stays guest-clocked, just at a rate nudged to
-            // the codec's true crystal so the pipe neither fills nor empties.
+            // Refill the deficit to keep `fill` frames queued ahead of the drain.
+            // The sink advances `consumed` from its own completion interrupt, so
+            // production tracks consumption exactly — no clock drift to servo, no
+            // guest-time pacing. At startup the deficit is the whole `fill`, which
+            // primes the pipe in one go.
             let deficit = (self.drained + self.fill as u64).saturating_sub(self.pushed);
-            let due = if self.irq_paced || deficit > self.fill as u64 * 3 / 4 {
-                // Event-driven sink (`irq_paced`): produce exactly what the drain
-                // freed to restore `fill` frames ahead — each completion IRQ moved
-                // `drained` by one buffer, so this is one buffer's worth. The
-                // hardware-buffer-clocked interrupt is a stable pace, so no drift
-                // servo is needed. (Same catch-up formula also handles a far-behind
-                // pipe on a polled sink: empty at startup or a severe guest stall.)
-                deficit / block * block
-            } else {
-                let err = (self.pushed as i64 - self.drained as i64) - self.fill as i64;
-                let rate_eff = (rate as i64 - (err >> 4)).clamp(1, rate as i64 * 2) as u64;
-                self.frac += rate_eff * dt_ms;
-                let d = self.frac / 1000 / block * block;
-                self.frac -= d * 1000;
-                d
-            };
+            let due = deficit / block * block;
             self.pushed += due;
             due
         } else {

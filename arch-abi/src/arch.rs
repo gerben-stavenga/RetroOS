@@ -246,6 +246,15 @@ pub trait Arch: Sized + GuestBytes {
         None
     }
 
+    /// Route and unmask a device's wired interrupt `line` (a PCI INTx line the
+    /// driver read from config space, or a fixed ISA line) so it reaches the CPU
+    /// and arrives via `drain` as `Irq::Hw(line)`. On metal: an IOAPIC entry in
+    /// APIC mode, an 8259 unmask in PIC mode — the same legacy path the fixed ISA
+    /// lines already use. No-op where there is no interrupt hardware.
+    fn route_device_irq(&mut self, line: u8) {
+        let _ = line;
+    }
+
     /// Arm hardware write-watchpoints at up to two guest-linear addresses
     /// (`None`/missing entry disables): a `#DB` fires when the guest writes one,
     /// for catching memory corruption. Real on metal (programs the debug

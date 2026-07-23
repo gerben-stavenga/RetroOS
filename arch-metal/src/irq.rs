@@ -755,6 +755,19 @@ pub fn msi_target(source: u8) -> Option<(u64, u32)> {
     Some((addr, data))
 }
 
+/// Route and unmask a wired device IRQ `line` so it reaches the CPU — the same
+/// legacy path the fixed ISA lines take at init: an IOAPIC entry in APIC mode,
+/// an 8259 unmask in PIC mode. Routed edge-triggered like the ISA lines; a level
+/// PCI-INTx source is deasserted by the driver clearing its status register in
+/// its interrupt handler, so no level-trigger IOAPIC setup is needed.
+pub fn route_device_irq(line: u8) {
+    if lapic_timer_active() {
+        ioapic_route(line, IRQ_OFFSET + line);
+    } else {
+        unmask_irq(line);
+    }
+}
+
 /// Get timer ticks
 pub fn get_ticks() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const TIMER_TICKS) }

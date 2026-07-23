@@ -46,13 +46,18 @@ const NAM_PCM_DAC_RATE: u16 = 0x2C; // sample rate when VRA enabled
 const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
 const PO_CIV: u16 = 0x14; // 8-bit: current index value (RO)
 const PO_LVI: u16 = 0x15; // 8-bit: last valid index
-const PO_PICB: u16 = 0x18; // 16-bit: samples left in the current buffer (RO)
-const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset)
+const PO_SR: u16 = 0x16; // 16-bit: status; bit2 LVBCI, bit3 BCIS, bit4 FIFOE (W1C)
+const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset, bit4 IOCE)
 const GLOB_CNT: u16 = 0x2C; // 32-bit: bit1 = AC-link out of cold reset
 const GLOB_STA: u16 = 0x30; // 32-bit: bit8 = primary codec ready
 
 const PO_CR_RUN: u8 = 0x01;
 const PO_CR_RESET: u8 = 0x02;
+const PO_CR_IOCE: u8 = 0x10; // interrupt-on-completion enable
+/// BDL entry control word bit 15: interrupt on completion of this buffer.
+const BDL_IOC: u16 = 1 << 15;
+/// All three PO status interrupt bits (LVBCI | BCIS | FIFOE), write-1-to-clear.
+const PO_SR_INTR: u16 = 0x1C;
 
 // ── DMA ring geometry ───────────────────────────────────────────────────────
 /// Kernel VA we steal from the low-mem identity window (over phys
@@ -70,14 +75,9 @@ const BDL_BYTES: usize = 0x1000; // first page of the buffer holds the BDL
 /// audible ~ring-length echo. 32 distinct buffers, no mirror.
 const NUM_BUF: usize = 32;
 const BUF_BYTES: usize = 0x800; // 2 KB each = 512 stereo frames ≈ 23 ms @ 22 kHz
-/// Prefill this many buffers before starting the bus master — a small cushion so
-/// the gate-paced producer's jitter doesn't underrun the codec (clicking).
-const PRIME_BUFS: usize = 3;
-/// Cap how far the producer may run ahead of the codec (`LVI − CIV`). This
-/// BOUNDS LATENCY — without it, any producer/codec clock drift lets the queue
-/// grow to the whole ring (~0.7 s). It also keeps LVI from lapping CIV, which
-/// would make the bus master replay buffers (echo). ≈ 6 × 23 ms ≈ 140 ms.
-const MAX_AHEAD: usize = 6;
+/// Prefill this many buffers before starting the bus master, so the double-
+/// buffered pipe (min_fill = 2) is full at stream start.
+const PRIME_BUFS: usize = 2;
 
 struct Ac97 {
     nam: u16,       // NAM I/O base
@@ -99,6 +99,18 @@ struct Ac97 {
 
 static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
 static PRESENT: AtomicBool = AtomicBool::new(false);
+/// The wired IRQ line the codec's INTx was routed to (from PCI config 0x3C), so
+/// the canonical audio-IRQ router can match it. 0xFF until bring-up. Production
+/// is always driven from this interrupt — there is no polled model.
+static IRQ_LINE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0xFF);
+
+/// The routed completion-IRQ line, for `sound::on_hw_irq`. `None` until up.
+pub fn irq_line() -> Option<u8> {
+    match IRQ_LINE.load(Ordering::Relaxed) {
+        0xFF => None,
+        n => Some(n as u8),
+    }
+}
 
 /// Find an AC'97 codec (class 0x04, subclass 0x01) anywhere on PCI, via the
 /// shared `pci::find_class` scan. Pure presence probe — `platform::probe` uses
@@ -127,6 +139,22 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     // dword 0x04). Writing 0 to the status word (high 16) is harmless (RW1C).
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
     crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x05);
+
+    // Discover the wired completion IRQ (PCI INTx). Firmware programmed the
+    // Interrupt Line register (config 0x3C low byte) with the line it routed the
+    // device's pin to; route+unmask it and drive production from it. If it is
+    // unprogrammed (0/0xFF), stay on the polled CIV path.
+    let line = (crate::kernel::pci::read32(machine, bus, dev, func, 0x3C) & 0xFF) as u8;
+    if !(1..=15).contains(&line) {
+        crate::println!(
+            "ac97: {:02x}:{:02x}.{} no INTx line — required for the sink; skipping",
+            bus, dev, func
+        );
+        return false;
+    }
+    machine.route_device_irq(line);
+    IRQ_LINE.store(line as u32, Ordering::Relaxed);
+    crate::println!("ac97: {:02x}:{:02x}.{} INTx line {}", bus, dev, func, line);
 
     let nam = (crate::kernel::pci::read32(machine, bus, dev, func, 0x10) & 0xFFFC) as u16; // BAR0
     let nabm = (crate::kernel::pci::read32(machine, bus, dev, func, 0x14) & 0xFFFC) as u16; // BAR1
@@ -206,17 +234,19 @@ impl Ac97 {
         self.dma_va + BDL_BYTES + i * BUF_BYTES
     }
 
-    /// Fill the BDL: entry i → buffer i, length in 16-bit samples, control 0
-    /// (we poll CIV; no interrupt-on-completion). NUM_BUF == 32 so every entry
-    /// maps a distinct buffer — no mirrored entries to replay.
+    /// Fill the BDL: entry i → buffer i, length in 16-bit samples. Control word
+    /// carries IOC — one interrupt per completed buffer drives the event-loop
+    /// audio track. NUM_BUF == 32 so every entry maps a distinct buffer — no
+    /// mirrored entries to replay.
     fn build_bdl(&mut self) {
+        let ctrl = BDL_IOC;
         for i in 0..NUM_BUF {
             let entry = self.dma_va + i * 8;
             let samples = (BUF_BYTES / 2) as u16; // 16-bit samples per buffer
             unsafe {
                 core::ptr::write_volatile(entry as *mut u32, self.buf_phys(i));
                 core::ptr::write_volatile((entry + 4) as *mut u16, samples);
-                core::ptr::write_volatile((entry + 6) as *mut u16, 0);
+                core::ptr::write_volatile((entry + 6) as *mut u16, ctrl);
             }
         }
     }
@@ -236,16 +266,8 @@ impl Ac97 {
             return;
         }
         for i in 0..bytes.len() / fb {
-            // At each buffer boundary, cap how far we run ahead of the codec.
-            // Beyond MAX_AHEAD buffers we drop the rest (bounds latency; rare
-            // once producer/codec are rate-matched — only drift reaches here).
-            if self.cur_off == 0 && self.running {
-                let civ = machine.inb(self.nabm + PO_CIV) as usize;
-                let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
-                if ahead >= MAX_AHEAD {
-                    break;
-                }
-            }
+            // No run-ahead cap needed: the deficit producer only ever pushes
+            // enough to reach `min_fill` (2 buffers) ahead of the drain.
             let (l, r) = fmt.frame(bytes, i);
             let p = self.buf_va(self.cur_buf) + self.cur_off;
             unsafe {
@@ -260,7 +282,7 @@ impl Ac97 {
                 machine.outb(self.nabm + PO_LVI, self.cur_buf as u8);
                 if !self.running && self.cur_buf + 1 >= PRIME_BUFS {
                     let cr = machine.inb(self.nabm + PO_CR);
-                    machine.outb(self.nabm + PO_CR, cr | PO_CR_RUN);
+                    machine.outb(self.nabm + PO_CR, cr | PO_CR_RUN | PO_CR_IOCE);
                     self.running = true;
                 }
                 self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
@@ -288,17 +310,30 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
 pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     let mut g = AC97.lock();
     let dev = g.as_mut()?;
+    let _ = machine;
     if !dev.running {
         return Some((dev.written, 0));
     }
-    let civ = machine.inb(dev.nabm + PO_CIV);
-    dev.consumed_bufs += ((civ + NUM_BUF as u8 - dev.last_civ) % NUM_BUF as u8) as u64;
-    dev.last_civ = civ;
+    // `on_irq` maintains `consumed_bufs` per completed buffer, so there is no
+    // poll here — buffer-granular consumed is what the deficit producer needs.
     let frames_per_buf = (BUF_BYTES / 4) as u64;
-    // PICB: 16-bit samples remaining in the current buffer → frames played.
-    let picb = machine.inw(dev.nabm + PO_PICB) as u64;
-    let in_buf = frames_per_buf.saturating_sub(picb / 2);
-    Some((dev.written, dev.consumed_bufs * frames_per_buf + in_buf))
+    Some((dev.written, dev.consumed_bufs * frames_per_buf))
+}
+
+/// Service a PCM-out completion interrupt (canonical `Irq::Hw(irq_line())`
+/// routed here by `sound::on_hw_irq`). Accumulates the consumed-buffer clock
+/// from the CIV delta and clears the status register so the level INTx pin
+/// deasserts (the caller then rearms the line). Robust to coalesced interrupts
+/// because it reads the true current index, not a fixed +1.
+pub fn on_irq<A: crate::Arch>(machine: &mut A) {
+    let mut g = AC97.lock();
+    let Some(dev) = g.as_mut() else { return };
+    if dev.running {
+        let civ = machine.inb(dev.nabm + PO_CIV);
+        dev.consumed_bufs += ((civ + NUM_BUF as u8 - dev.last_civ) % NUM_BUF as u8) as u64;
+        dev.last_civ = civ;
+    }
+    machine.outw(dev.nabm + PO_SR, PO_SR_INTR); // clear LVBCI|BCIS|FIFOE (W1C)
 }
 
 /// Minimum pipe fill for a position-slaved producer, in source frames: the
@@ -310,7 +345,10 @@ pub fn min_fill(_rate: u32) -> Option<u32> {
     if !PRESENT.load(Ordering::Relaxed) {
         return None;
     }
+    // Double-buffered: keep 2 buffers queued ahead of the play cursor — the
+    // whole pipe, so latency ≈ 2 × the buffer duration. Event-driven refill
+    // (one completion per buffer) needs only this shallow depth.
     let frames_per_buf = (BUF_BYTES / 4) as u32;
-    Some(PRIME_BUFS as u32 * frames_per_buf + frames_per_buf / 4)
+    Some(2 * frames_per_buf)
 }
 
