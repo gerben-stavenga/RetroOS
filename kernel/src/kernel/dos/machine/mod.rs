@@ -959,6 +959,12 @@ pub struct Mixer {
     /// MIDI bytes are stamped with it so note onset is independent of block size.
     midi_frame: u64,
     midi_ms: u64,
+    /// Last buffer-granular drain value, the ms it changed, and the size of that
+    /// step (the sink buffer, learned) — for smoothing the SB DSP's guest-visible
+    /// cursor between completion points (below).
+    drained_coarse: u64,
+    drained_ms: u64,
+    drain_step: u64,
 }
 
 impl Mixer {
@@ -970,6 +976,9 @@ impl Mixer {
             last_ms: 0,
             midi_frame: 0,
             midi_ms: 0,
+            drained_coarse: 0,
+            drained_ms: 0,
+            drain_step: 0,
         }
     }
 }
@@ -1034,6 +1043,9 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         mixer.pace.reset();
         mixer.dsp_epoch = 0;
         mixer.midi_ms = 0; // re-seed the MIDI clock on the next active session
+        mixer.drained_coarse = 0;
+        mixer.drained_ms = 0;
+        mixer.drain_step = 0;
         return;
     }
     // Source activity does not define the output session. In particular, an
@@ -1091,9 +1103,25 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // into the DSP's rate on the way in.
     let drained = mixer.pace.drained();
     let pushed = mixer.pace.pushed();
+    // Smooth the drain for the SB DSP's guest-visible cursor. `drained` advances
+    // one whole buffer per completion interrupt; feeding that straight in makes
+    // `advance_clock` leap past several block boundaries at once, so `blocks_done`
+    // bursts ahead of the one-per-tick guest IRQ service → backlog and SFX
+    // crackle. A real SB's DMA cursor advances evenly, so interpolate between the
+    // completion points with real time, re-anchored whenever `drained` steps. The
+    // fraction is capped at the last observed step (the buffer size, learned from
+    // the step itself) so the cursor never crosses the next, unconfirmed boundary
+    // — keeping it monotonic — and the whole thing is capped at `pushed`.
+    if drained != mixer.drained_coarse {
+        mixer.drain_step = drained - mixer.drained_coarse;
+        mixer.drained_coarse = drained;
+        mixer.drained_ms = now;
+    }
+    let frac = (now.saturating_sub(mixer.drained_ms) * rate as u64 / 1000).min(mixer.drain_step);
+    let drained_smooth = (drained + frac).min(pushed);
     let dsp_rate = sb.dsp_rate().max(1) as u64;
     let to_dsp = |mix: u64| mix.saturating_sub(mixer.dsp_epoch) * dsp_rate / rate as u64;
-    sb.dsp_clock_tick(machine, vpic, to_dsp(drained), to_dsp(pushed));
+    sb.dsp_clock_tick(machine, vpic, to_dsp(drained_smooth), to_dsp(pushed));
     gus.deliver_events(vpic);
 
 }
