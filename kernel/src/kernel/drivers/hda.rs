@@ -13,10 +13,13 @@
 //!    programmed by sending *verbs* over the **CORB/RIRB** DMA rings, then a
 //!    stream descriptor + BDL feed PCM exactly like AC'97's bus master.
 //!
-//! Everything else mirrors `ac97`: a 32-entry ring of PCM buffers in a borrowed
-//! contiguous DMA buffer, primed then run, with the producer's run-ahead capped
-//! by polling the hardware play position (`SDLPIB` here, `CIV` there) — no
-//! interrupts.
+//! Ring geometry mirrors `ac97`: a 32-entry ring of small PCM buffers in a
+//! borrowed contiguous DMA buffer, primed then run. Unlike `ac97`, HDA drives
+//! production by **MSI**: one interrupt-on-completion per buffer signals the
+//! canonical `Irq::Hw` line, and the producer refills the drained buffer from
+//! the event loop. HDA is a PCI-E-era controller, so a machine that has one
+//! always has a local APIC — there is no polled fallback (bring-up fails loudly
+//! if MSI can't be programmed).
 //!
 //! ## Topology
 //!
@@ -176,8 +179,8 @@ static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// (an otherwise-unused ISA line so it can't alias a wired IRQ). The kernel's
 /// audio-IRQ router ([`crate::kernel::sound::on_hw_irq`]) matches on it.
 pub const MSI_LINE: u8 = 11;
-/// Set once bring-up successfully programmed MSI; when false the driver stays on
-/// the polled `SDLPIB` path and never enables interrupt-on-completion.
+/// Set once bring-up successfully programmed MSI (always, on any real HDA
+/// machine — bring-up fails otherwise). Read by [`msi_active`].
 static MSI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Buffer-completion interrupts serviced (bring-up diagnostic for now).
 static HDA_IRQS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -274,7 +277,6 @@ struct Hda {
     /// clock by construction.
     written_src: u64,
     consumed_hw: u64,
-    last_lpib: u32,
     /// Sparse runtime diagnostics for real hardware bring-up.
     logged_submit: bool,
     logged_run: bool,
@@ -512,15 +514,23 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
     crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
 
-    // Message-signalled interrupts: ask the arch for a target that delivers the
-    // canonical `Irq::Hw(MSI_LINE)` and program it into the device's MSI
-    // capability. When unavailable (no LAPIC → PIC-only), MSI_ON stays false and
-    // the driver keeps its polled `SDLPIB` production path.
+    // MSI drives the sink. HDA is a PCI-E-era controller; any machine that has
+    // one has a local APIC, so MSI is always available on real hardware. If it
+    // can't be programmed — only the artificial i486 + intel-hda QEMU combo, a
+    // machine that never existed — skip the controller loudly rather than fall
+    // back to polling. There is no real hardware to serve a polled HDA path.
     let msi = machine
         .msi_alloc(MSI_LINE)
         .is_some_and(|(addr, data)| crate::kernel::pci::msi_enable(machine, bus, dev, func, addr, data));
-    MSI_ON.store(msi, core::sync::atomic::Ordering::Relaxed);
-    crate::println!("hda: {:02x}:{:02x}.{} MSI {}", bus, dev, func, if msi { "on" } else { "unavailable (polled)" });
+    if !msi {
+        crate::println!(
+            "hda: {:02x}:{:02x}.{} no MSI — HDA implies an APIC machine (use --arch 686/x64); skipping",
+            bus, dev, func
+        );
+        return false;
+    }
+    MSI_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    crate::println!("hda: {:02x}:{:02x}.{} MSI on", bus, dev, func);
 
     // BAR0 is a memory BAR. Read the high dword only if it is actually 64-bit
     // (type bits [2:1] == 0b10); a 32-bit BAR would make 0x14 a different reg.
@@ -582,7 +592,6 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         resample_acc: 0,
         written_src: 0,
         consumed_hw: 0,
-        last_lpib: 0,
         logged_submit: false,
         logged_run: false,
         diag_buffers: 0,
@@ -807,11 +816,10 @@ impl Hda {
     }
 
     /// Fill the BDL: entry i → PCM buffer i. Each HDA BDL entry is 16 bytes
-    /// { addr:u64, len:u32, flags:u32 }. flags bit0 = IOC: set per buffer when
-    /// MSI is on (one completion interrupt per buffer drives the event-loop
-    /// audio track); off otherwise (the driver polls `SDLPIB` instead).
+    /// { addr:u64, len:u32, flags:u32 }. flags bit0 = IOC, set per buffer: one
+    /// completion interrupt per buffer drives the event-loop audio track.
     fn build_bdl(&mut self) {
-        let ioc = if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) { 1 } else { 0 };
+        let ioc = 1u32;
         for i in 0..NUM_BUF {
             let entry = self.dma_va + BDL_OFF + i * 16;
             unsafe {
@@ -873,7 +881,6 @@ impl Hda {
         self.resample_acc = 0;
         self.written_src = 0;
         self.consumed_hw = 0;
-        self.last_lpib = 0;
         // Clear the PCM ring: the producer restarts at buffer 0, so if the
         // hardware ever runs past the freshly primed buffers (session start,
         // underrun) it must find silence, not a replay of the previous
@@ -930,10 +937,8 @@ impl Hda {
         // Enable delivery of this stream's completion interrupts to the CPU:
         // global-interrupt-enable + this stream's status-interrupt-enable bit.
         // The per-buffer IOCE (SDCTL bit2) is set with RUN at playback start.
-        if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) {
-            let sidx = (self.sd - SD_BASE) / SD_STRIDE;
-            w32(INTCTL, 0x8000_0000 | (1u32 << sidx));
-        }
+        let sidx = (self.sd - SD_BASE) / SD_STRIDE;
+        w32(INTCTL, 0x8000_0000 | (1u32 << sidx));
     }
 
     /// Park the link: stop all DMA and hold the controller in reset (CRST
@@ -1453,8 +1458,7 @@ impl Hda {
             // stream binding with the stream number visible (a byte-0-only
             // RUN write may not retrigger it → codec never drains the FIFO).
             if !self.running && self.cur_buf >= PRIME_BUFS {
-                let ioce = if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) { SDCTL_IOCE } else { 0 };
-                w32(self.sd + SDCTL, 0x02 | ioce | (STREAM_TAG << 20));
+                w32(self.sd + SDCTL, 0x02 | SDCTL_IOCE | (STREAM_TAG << 20));
                 self.running = true;
                 if !self.logged_run {
                     crate::println!(
@@ -1515,8 +1519,7 @@ impl Hda {
             // position read.
             self.written_src = 0;
             self.consumed_hw = 0;
-            self.last_lpib = 0;
-        }
+            }
         let fb = fmt.frame_bytes();
         if fb == 0 {
             return;
@@ -1551,19 +1554,6 @@ impl Hda {
         }
     }
 
-    /// Accumulate the codec's consumed-byte counter from LPIB deltas (LPIB
-    /// itself wraps at CBL). Call cadence must beat a full ring period
-    /// (~370 ms @ 44.1 kHz); the slaved producer polls every scheduler
-    /// slice, orders of magnitude inside that.
-    fn update_consumed(&mut self) {
-        if !self.running {
-            return;
-        }
-        let cbl = (NUM_BUF * BUF_BYTES) as u32;
-        let lpib = r32(self.sd + SDLPIB) % cbl.max(1);
-        self.consumed_hw += ((lpib + cbl - self.last_lpib) % cbl) as u64;
-        self.last_lpib = lpib;
-    }
 }
 
 fn find_widget(widgets: &[Widget; MAX_WIDGETS], count: usize, nid: u32) -> Option<usize> {
@@ -1757,9 +1747,8 @@ pub fn on_irq() {
     }
 }
 
-/// True once MSI is up and the sink is driving production by completion IRQ
-/// (vs the polled SDLPIB path). The producer's pacer reads this to switch to
-/// event-driven refill.
+/// True once the HDA sink is up and driving production by completion IRQ. The
+/// producer's pacer reads this to select event-driven refill.
 pub fn msi_active() -> bool {
     MSI_ON.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -1773,12 +1762,7 @@ pub fn position() -> Option<(u64, u64)> {
     if dev.parked {
         return None;
     }
-    // MSI-driven: `on_irq` maintains `consumed_hw` per completed buffer, so the
-    // per-call SDLPIB poll (a KVM/MMIO exit) is gone. Polled fallback still reads
-    // the hardware position here.
-    if !MSI_ON.load(core::sync::atomic::Ordering::Relaxed) {
-        dev.update_consumed();
-    }
+    // `on_irq` maintains `consumed_hw` per completed buffer — no SDLPIB poll.
     if dev.src_rate == 0 || dev.rate == 0 {
         return Some((dev.written_src, 0)); // no stream session yet
     }
@@ -1797,13 +1781,9 @@ pub fn min_fill(rate: u32) -> Option<u32> {
     }
     let src = if rate == 0 { 44100 } else { rate };
     let hw = Hda::hardware_rate(src);
-    // Event-driven (MSI) refills one small buffer per completion interrupt, so a
-    // shallow pipe suffices and keeps latency low. The polled fallback refills on
-    // the jittery ms tick and needs a deep cushion against underrun — with the
-    // small buffers that give MSI its fine granularity, that means many of them.
-    // Both fit the 32-buffer ring (46 ms @ 44.1 kHz).
-    let depth_bufs = if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) { 6 } else { 24 };
-    let hw_frames = (depth_bufs * BUF_BYTES / 4) as u64;
+    // Event-driven: one small buffer is refilled per completion interrupt, so a
+    // shallow pipe suffices and keeps latency low (6 × 1.45 ms ≈ 9 ms).
+    let hw_frames = (6 * BUF_BYTES / 4) as u64;
     Some((hw_frames * src as u64 / hw as u64) as u32 + 1)
 }
 
