@@ -167,6 +167,17 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     }
 }
 
+/// Is the selected sink driving production by its own completion interrupt
+/// (vs a polled cursor)? When true the pacer refills purely on the drain (each
+/// completion frees one buffer to produce), because a hardware-buffer-clocked
+/// interrupt is a stable pace — unlike a jitter-prone polled cursor, which
+/// still needs the `get_ticks` smoothing servo. Probed once per session.
+pub fn irq_paced() -> bool {
+    use crate::kernel::platform::Audio;
+    matches!(crate::kernel::platform::get().audio, Audio::EmulatedHda)
+        && crate::kernel::drivers::hda::msi_active()
+}
+
 /// Minimum pipe fill (source frames at `rate`) a position-slaved producer
 /// must keep queued in the selected output: enough to cover the sink's
 /// start-of-stream prime plus its claim burst (how far ahead of audible
@@ -200,6 +211,9 @@ pub struct Pace {
     /// Pipe depth target in source frames; 0 = synthetic (no sink position).
     fill: u32,
     use_pos: bool,
+    /// The sink drives production by completion IRQ (see [`irq_paced`]): refill
+    /// purely on the drain, skipping the get_ticks drift servo.
+    irq_paced: bool,
     /// Source frames pushed this session.
     pushed: u64,
     /// Sink `written` counter at our session start (`u64::MAX` = not yet
@@ -219,7 +233,7 @@ pub struct Pace {
 impl Pace {
     pub const fn new() -> Self {
         Pace {
-            rate: 0, fill: 0, use_pos: false,
+            rate: 0, fill: 0, use_pos: false, irq_paced: false,
             pushed: 0, anchor: u64::MAX, drained: 0, frac: 0,
         }
     }
@@ -270,6 +284,7 @@ impl Pace {
             let fill = min_fill(rate);
             self.rate = rate;
             self.use_pos = fill.is_some();
+            self.irq_paced = irq_paced();
             self.fill = fill.unwrap_or(0);
             self.pushed = 0;
             self.anchor = u64::MAX;
@@ -301,10 +316,13 @@ impl Pace {
             // resample: production stays guest-clocked, just at a rate nudged to
             // the codec's true crystal so the pipe neither fills nor empties.
             let deficit = (self.drained + self.fill as u64).saturating_sub(self.pushed);
-            let due = if deficit > self.fill as u64 * 3 / 4 {
-                // Far behind — an empty pipe at startup, or a severe guest stall.
-                // A gentle rate trim primes too slowly (underruns the codec), so
-                // catch straight up to `fill`. The servo only handles drift.
+            let due = if self.irq_paced || deficit > self.fill as u64 * 3 / 4 {
+                // Event-driven sink (`irq_paced`): produce exactly what the drain
+                // freed to restore `fill` frames ahead — each completion IRQ moved
+                // `drained` by one buffer, so this is one buffer's worth. The
+                // hardware-buffer-clocked interrupt is a stable pace, so no drift
+                // servo is needed. (Same catch-up formula also handles a far-behind
+                // pipe on a polled sink: empty at startup or a severe guest stall.)
                 deficit / block * block
             } else {
                 let err = (self.pushed as i64 - self.drained as i64) - self.fill as i64;

@@ -105,7 +105,13 @@ const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
 // ── PCM ring geometry (mirror ac97) ──────────────────────────────────────────
 const NUM_BUF: usize = 32;
-const BUF_BYTES: usize = 0x800; // 2 KB = 512 stereo frames ≈ 23 ms @ 22 kHz
+// 256 B = 64 stereo frames ≈ 1.45 ms @ 44.1 kHz. Deliberately small: with MSI
+// each completed buffer is one interrupt that drives one production pass, so
+// the buffer duration sets how finely the synth engine advances. A large buffer
+// would step GUS/DMX in coarse lumps (the E1M8 "cut notes" failure mode); ~1.5
+// ms keeps it close to the old 1 ms get_ticks cadence. Polled sinks are
+// unaffected — their pacing is the get_ticks servo, not the buffer size.
+const BUF_BYTES: usize = 0x100;
 const PRIME_BUFS: usize = 3;
 /// Hard drop ceiling, just under the ring's ahead/behind ambiguity point.
 /// Every producer is position-slaved (`sound::position`/`sound::Pace`) and
@@ -1739,14 +1745,23 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
 /// signal the next block. For now it only accounts the interrupt; the
 /// event-loop audio track will produce a block per call in the next step.
 pub fn on_irq() {
-    let n = HDA_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    if let Some(dev) = HDA.lock().as_ref() {
+    HDA_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if let Some(dev) = HDA.lock().as_mut() {
         w8(dev.sd + SDSTS, 0x04); // BCIS write-1-clear
         w32(INTSTS, r32(INTSTS)); // clear latched stream-interrupt-status bits
+        // One IOC per buffer: each interrupt is exactly one buffer drained. This
+        // is the consumed clock the producer paces to — no SDLPIB poll needed.
+        if dev.running {
+            dev.consumed_hw += BUF_BYTES as u64;
+        }
     }
-    if n <= 3 || n % 512 == 0 {
-        crate::println!("hda: MSI completion irq #{}", n);
-    }
+}
+
+/// True once MSI is up and the sink is driving production by completion IRQ
+/// (vs the polled SDLPIB path). The producer's pacer reads this to switch to
+/// event-driven refill.
+pub fn msi_active() -> bool {
+    MSI_ON.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Pipe counters for `sound::position`: `(written, consumed)` in source
@@ -1758,7 +1773,12 @@ pub fn position() -> Option<(u64, u64)> {
     if dev.parked {
         return None;
     }
-    dev.update_consumed();
+    // MSI-driven: `on_irq` maintains `consumed_hw` per completed buffer, so the
+    // per-call SDLPIB poll (a KVM/MMIO exit) is gone. Polled fallback still reads
+    // the hardware position here.
+    if !MSI_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        dev.update_consumed();
+    }
     if dev.src_rate == 0 || dev.rate == 0 {
         return Some((dev.written_src, 0)); // no stream session yet
     }
@@ -1777,7 +1797,13 @@ pub fn min_fill(rate: u32) -> Option<u32> {
     }
     let src = if rate == 0 { 44100 } else { rate };
     let hw = Hda::hardware_rate(src);
-    let hw_frames = ((PRIME_BUFS + 1) * BUF_BYTES / 4) as u64;
+    // Event-driven (MSI) refills one small buffer per completion interrupt, so a
+    // shallow pipe suffices and keeps latency low. The polled fallback refills on
+    // the jittery ms tick and needs a deep cushion against underrun — with the
+    // small buffers that give MSI its fine granularity, that means many of them.
+    // Both fit the 32-buffer ring (46 ms @ 44.1 kHz).
+    let depth_bufs = if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) { 6 } else { 24 };
+    let hw_frames = (depth_bufs * BUF_BYTES / 4) as u64;
     Some((hw_frames * src as u64 / hw as u64) as u32 + 1)
 }
 
