@@ -16,7 +16,7 @@ Version            13
 ; 8  -  General Midi
 ; 9  -  Sound Canvas
 ; 10 -  Adlib
-MusicMode          2
+MusicMode          8
 
 ;
 ; FX Modes
@@ -36,7 +36,7 @@ FXMode             2
 ;
 ; Music Volume
 ; (low) 0 - 255 (high)
-MusicVolume      196
+MusicVolume      254
 
 ;
 ; FX Volume
