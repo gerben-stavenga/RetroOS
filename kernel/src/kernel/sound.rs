@@ -173,18 +173,25 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     }
 }
 
-/// Minimum pipe fill (source frames at `rate`) a position-slaved producer
-/// must keep queued in the selected output: enough to cover the sink's
-/// start-of-stream prime plus its claim burst (how far ahead of audible
-/// playback the hardware grabs data at once). `None` when [`position`]
-/// would return `None` — same routing, probed once per playback session.
+/// Output pipe depth (playback latency), in source frames the producer keeps
+/// queued ahead of the sink's play cursor. This is UNIVERSAL — the same depth
+/// for every hardware sink (HDA, AC97, SB16), one latency knob, not a per-driver
+/// value. Below ~one framebuffer-blit period a present stall can underrun it
+/// (crackle); higher only adds latency. The sink's own buffer size is a separate
+/// concern (completion-IRQ granularity), never the pipe.
+const PIPE_MS: u32 = 12;
+
+/// The universal pipe depth [`PIPE_MS`] in frames, or `None` when the active sink
+/// has no real-time consumer clock (hosted WAV / silent) — then production is
+/// virtual-time paced. Probed once per playback session.
 pub fn min_fill(rate: u32) -> Option<u32> {
     use crate::kernel::platform::Audio;
-    match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::drivers::hda::min_fill(rate),
-        Audio::EmulatedAc97 => crate::kernel::drivers::ac97::min_fill(rate),
-        Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => None,
-    }
+    let present = match crate::kernel::platform::get().audio {
+        Audio::EmulatedHda => crate::kernel::drivers::hda::present(),
+        Audio::EmulatedAc97 => crate::kernel::drivers::ac97::present(),
+        Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => false,
+    };
+    present.then(|| rate * PIPE_MS / 1000)
 }
 
 /// Producer-side pacing for a *generated* PCM stream — the synth pumps (FM,

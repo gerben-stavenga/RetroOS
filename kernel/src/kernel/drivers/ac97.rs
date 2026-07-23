@@ -74,7 +74,11 @@ const BDL_BYTES: usize = 0x1000; // first page of the buffer holds the BDL
 /// 0..15, and the bus master replays them when its index runs past LVI — an
 /// audible ~ring-length echo. 32 distinct buffers, no mirror.
 const NUM_BUF: usize = 32;
-const BUF_BYTES: usize = 0x800; // 2 KB each = 512 stereo frames ≈ 23 ms @ 22 kHz
+// 1 KB = 256 stereo frames ≈ 5.8 ms @ 44.1 kHz. This is the completion-IRQ
+// granularity (one interrupt per buffer), NOT the pipe depth — the pipe is the
+// universal `sound::min_fill`. Kept ≤ half the pipe so ≥ 2 buffers are queued
+// (double-buffered event-driven refill).
+const BUF_BYTES: usize = 0x400;
 /// Prefill this many buffers before starting the bus master, so the double-
 /// buffered pipe (min_fill = 2) is full at stream start.
 const PRIME_BUFS: usize = 2;
@@ -341,14 +345,9 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A) {
 /// fill must always span the start prime (`PRIME_BUFS` full buffers) plus a
 /// partial buffer of slack — below that the engine halts at LVI while the
 /// producer waits for consumption, and the pipe deadlocks.
-pub fn min_fill(_rate: u32) -> Option<u32> {
-    if !PRESENT.load(Ordering::Relaxed) {
-        return None;
-    }
-    // Double-buffered: keep 2 buffers queued ahead of the play cursor — the
-    // whole pipe, so latency ≈ 2 × the buffer duration. Event-driven refill
-    // (one completion per buffer) needs only this shallow depth.
-    let frames_per_buf = (BUF_BYTES / 4) as u32;
-    Some(2 * frames_per_buf)
+/// The sink is up and reports a play position (so `sound::min_fill` returns the
+/// universal pipe depth). The pipe latency itself is not this driver's to set.
+pub fn present() -> bool {
+    PRESENT.load(Ordering::Relaxed)
 }
 

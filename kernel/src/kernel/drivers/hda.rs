@@ -108,15 +108,13 @@ const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
 // ── PCM ring geometry (mirror ac97) ──────────────────────────────────────────
 const NUM_BUF: usize = 32;
-// Double-buffered pipe: the producer keeps min_fill = 2 buffers queued ahead of
-// the play cursor, so playback latency ≈ 2 × this buffer's duration. MIDI onset
-// timing is stamped at arrival and applied per-frame (see midi.rs), so buffer
-// size no longer quantises notes — it is chosen purely for pipe depth. 2 KB =
-// 512 stereo frames ≈ 11.6 ms @ 44.1 kHz → ~23 ms pipe, deep enough to ride out
-// the ~14.3 ms framebuffer-blit stall. (GUS-native register writes are still
-// block-quantised, but games default to General MIDI.) The ring is larger than
-// the pipe only to give the write cursor guard room ahead of the play cursor.
-const BUF_BYTES: usize = 0x800;
+// 1 KB = 256 stereo frames ≈ 5.8 ms @ 44.1 kHz. This is the completion-IRQ
+// granularity (one interrupt per buffer), NOT the pipe depth — the pipe is the
+// universal `sound::min_fill`, shared by every sink. Kept ≤ half the pipe so
+// ≥ 2 buffers are queued (double-buffered event-driven refill). MIDI onset is
+// stamped at arrival (see midi.rs), so buffer size never quantises notes. The
+// ring is larger than the pipe only to guard the write cursor ahead of play.
+const BUF_BYTES: usize = 0x400;
 const PRIME_BUFS: usize = 2;
 /// Hard drop ceiling, just under the ring's ahead/behind ambiguity point.
 /// Every producer is position-slaved (`sound::position`/`sound::Pace`) and
@@ -1775,20 +1773,11 @@ pub fn position() -> Option<(u64, u64)> {
 /// Minimum pipe fill for a position-slaved producer, in source frames:
 /// the stream-start prime plus one hardware buffer of claim-burst slack,
 /// converted to the source rate.
-pub fn min_fill(rate: u32) -> Option<u32> {
+/// The sink is up and reports a play position (so `sound::min_fill` returns the
+/// universal pipe depth). The pipe latency itself is not this driver's to set.
+pub fn present() -> bool {
     let g = HDA.lock();
-    let dev = g.as_ref()?;
-    if dev.parked && dev.verb_failed {
-        return None;
-    }
-    let src = if rate == 0 { 44100 } else { rate };
-    let hw = Hda::hardware_rate(src);
-    // Double-buffered: keep 2 buffers queued ahead of the play cursor. That is
-    // the whole pipe, so latency ≈ 2 × the buffer duration (≈23 ms) — deep enough
-    // to span the ~14.3 ms framebuffer-blit stall. MIDI timing no longer depends
-    // on it (events are stamped at arrival), so this is a pure latency knob.
-    let hw_frames = (2 * BUF_BYTES / 4) as u64;
-    Some((hw_frames * src as u64 / hw as u64) as u32 + 1)
+    g.as_ref().is_some_and(|d| !(d.parked && d.verb_failed))
 }
 
 /// Panic-path quiesce: stop all controller DMA and hold the link in reset so a
