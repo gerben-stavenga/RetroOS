@@ -84,6 +84,20 @@ fn next_after<A: crate::Arch>(
 /// break any waitpid; the shell decides backgrounding semantics by polling
 /// SYNTH_WAITPID + reading kbd.
 pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: usize) -> Option<usize> {
+    // The F12 picker's explicit choice wins over the round-robin. Ignore a
+    // stale target that is the current owner, out of range, or no longer active.
+    if let Some(target) = thread::take_switch_target() {
+        if target != tid
+            && target < threads.len()
+            && matches!(
+                threads[target].kernel.state,
+                thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked
+            )
+        {
+            return Some(target);
+        }
+        return None;
+    }
     if thread::take_switch_request() {
         thread::cycle_next(threads, tid)
     } else {

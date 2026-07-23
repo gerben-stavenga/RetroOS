@@ -7,7 +7,7 @@ const KBD_BUF_SIZE: usize = 32;
 
 /// Flip to `true` to trace every scancode in/out of the virtual 8042
 /// (push from the host IRQ, INT 9 latch/delivery, guest port-0x60 read).
-/// Unconditional dbg_println — bypasses the DOS_TRACE_RT gate, which is
+/// Unconditional dbg_println — bypasses the shared syscall-trace gate, which is
 /// suppressed in HW-IRQ context exactly where keyboard pushes happen.
 pub(super) const KBD_TRACE: bool = false;
 

@@ -386,6 +386,7 @@ fn run_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>
     crate::kernel::focus::adopt(tid);
     {
         let t = thread::get_thread(threads, tid).expect("init program thread");
+        t.kernel.set_comm(path); // name the boot program for the F12 picker
         crate::kernel::io_policy::apply(machine, &t.personality, true);
     }
 
@@ -438,6 +439,11 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
     loop {
         stats.slice_begin(machine);
         stats.iteration(machine);
+        // Keep the F12 switch picker's process list fresh while it's open —
+        // here, at the top, where the whole thread table is borrowable.
+        if crate::kernel::osd::is_open() {
+            crate::kernel::osd::refresh_processes(threads, crate::kernel::focus::focused());
+        }
         let thread = ctx.thread(threads);
 
         // Advance this thread's world: virtual time, console input, delivery.
@@ -491,6 +497,13 @@ fn dispatch<A: crate::Arch>(
     regs: &mut Regs,
     kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
+    // The F12 monitor's Kill acts on the focused thread — which, under today's
+    // focus/execution coupling, is exactly this one. Turn it into an ordinary
+    // Exit so `exit_thread` does all teardown and hands focus back to the
+    // parent, the same path SEGV takes below.
+    if crate::kernel::osd::take_kill_request() {
+        return thread::KernelAction::Exit(-9);
+    }
     if let crate::KernelEvent::PageFault { addr } = kevent {
         // A VGA planar-trap access (A0000 unmapped while unchained graphics
         // needs the write/read planar logic) is decoded + emulated here, not a
@@ -890,6 +903,33 @@ pub fn toggle_profile() {
 
 pub fn profile_enabled() -> bool {
     unsafe { core::ptr::read_volatile(&raw const PROFILE_DUMP) }
+}
+
+/// Runtime syscall-trace gate, consulted by both `dos_trace!` (DOS/DPMI) and
+/// `linux_trace!` (Linux). Distinct from [`profile_enabled`]: that's the
+/// periodic cycle profiler, this is per-syscall log lines. Toggled by the F12
+/// monitor's Trace item, and bracketed by COMMAND.COM around a child exec (INT
+/// 31h synth AH=02/03) so a log captures just that program. Default OFF so
+/// boot/init/DN startup stay silent until something enables it.
+static mut SYSCALL_TRACE: bool = false;
+
+/// Set the trace gate directly (the COMMAND.COM bracket path).
+pub fn set_trace(on: bool) {
+    unsafe { core::ptr::write_volatile(&raw mut SYSCALL_TRACE, on) };
+}
+
+/// Toggle syscall tracing, reporting which way it went (the F12 Trace item).
+pub fn toggle_trace() {
+    let on = unsafe {
+        let v = !core::ptr::read_volatile(&raw const SYSCALL_TRACE);
+        core::ptr::write_volatile(&raw mut SYSCALL_TRACE, v);
+        v
+    };
+    crate::println!("[trace] syscall tracing {}", if on { "ON" } else { "off" });
+}
+
+pub fn trace_enabled() -> bool {
+    unsafe { core::ptr::read_volatile(&raw const SYSCALL_TRACE) }
 }
 
 struct EventStats {

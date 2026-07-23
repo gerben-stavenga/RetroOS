@@ -1056,6 +1056,72 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     }
 }
 
+// ── On-screen overlay (the host monitor) ─────────────────────────────────────
+//
+// A small text panel the kernel composites over the *finished* frame, after
+// render and before present, so it looks identical over text mode, mode 13h and
+// Doom's Mode-Y — it never touches the VGA model. Two primitives, both writing
+// format-encoded pixels so one call serves the native hosted `present_fb` and
+// the GOP framebuffer (`fb.format`) alike. 8-px cells through `FONT_8X16`: a
+// menu needs no 9th-dot line-draw welding, so the cell is the glyph's width.
+
+/// Overlay text cell width in pixels (glyph width; no 9th dot).
+pub const OVERLAY_CELL_W: usize = 8;
+/// Overlay text cell height in pixels.
+pub const OVERLAY_CELL_H: usize = 16;
+
+/// Fill a `rw`×`rh` rectangle at pixel (`x`,`y`) with one `0x00RRGGBB` colour,
+/// encoded through `fmt`. `out` is pitched by `stride`; `w`/`h` clip to the
+/// visible area (a GOP `stride` may exceed `w`).
+pub fn overlay_fill(
+    out: &mut [u32], stride: usize, w: usize, h: usize,
+    x: usize, y: usize, rw: usize, rh: usize, rgb: u32, fmt: PixelFormat,
+) {
+    let px = fmt.encode(rgb);
+    let x1 = (x + rw).min(w);
+    let y1 = (y + rh).min(h);
+    for yy in y..y1 {
+        let base = yy * stride;
+        for xx in x..x1 {
+            if base + xx < out.len() {
+                out[base + xx] = px;
+            }
+        }
+    }
+}
+
+/// Draw a CP437 byte string at pixel (`x`,`y`) with `FONT_8X16`, `fg`/`bg` as
+/// `0x00RRGGBB` encoded through `fmt`. One 8×16 cell per byte; stops at the
+/// right/bottom clip edge.
+pub fn overlay_text(
+    out: &mut [u32], stride: usize, w: usize, h: usize,
+    x: usize, y: usize, s: &[u8], fg: u32, bg: u32, fmt: PixelFormat,
+) {
+    let fgp = fmt.encode(fg);
+    let bgp = fmt.encode(bg);
+    let font = &crate::vga_fonts::FONT_8X16;
+    for (i, &ch) in s.iter().enumerate() {
+        let cx = x + i * OVERLAY_CELL_W;
+        if cx + OVERLAY_CELL_W > w {
+            break;
+        }
+        let glyph = &font[ch as usize * 16..ch as usize * 16 + 16];
+        for (gy, &bits) in glyph.iter().enumerate() {
+            let py = y + gy;
+            if py >= h {
+                break;
+            }
+            let base = py * stride + cx;
+            for gx in 0..OVERLAY_CELL_W {
+                if base + gx >= out.len() {
+                    break;
+                }
+                out[base + gx] = if bits & (0x80 >> gx) != 0 { fgp } else { bgp };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;

@@ -1727,6 +1727,14 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         crate::kernel::platform::get().display
     {
         crate::kernel::display::blit(&mut pc.present_scratch2, &fb, &frame);
+        // The F12 monitor composites onto the finished frame — after the guest
+        // is drawn, before present — so it appears over any video mode.
+        if crate::kernel::osd::is_open() {
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(fb.va as *mut u32, fb.stride * fb.height)
+            };
+            crate::kernel::osd::paint(out, fb.stride, fb.width, fb.height, fb.format);
+        }
         crate::kernel::display::present();
     } else {
         // Window sink (hosted): still takes a whole rendered frame.
@@ -1737,6 +1745,10 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         }
         let fb = &mut pc.present_fb[..need];
         vga_render::render(&frame, fb);
+        if crate::kernel::osd::is_open() {
+            // `render` writes native 0x00RRGGBB into a tightly-packed w×h buffer.
+            crate::kernel::osd::paint(fb, w, w, h, vga_render::PixelFormat::NATIVE);
+        }
         vga_render::present(w, h, fb);
     }
     if prof {

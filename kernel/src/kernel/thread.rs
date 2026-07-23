@@ -325,6 +325,10 @@ pub struct KernelThread<A: crate::Arch> {
     pub symbols: Option<SymbolData>,
     pub fds: [FdKind; MAX_FDS],
     pub cloexec: u16,
+    /// Short program name for the F12 switch picker (DOS has no stored image
+    /// path the way Linux's `exec_path` does). Set from the launch path's
+    /// basename at fork-exec; empty until then. NUL-padded.
+    pub comm: [u8; 16],
 }
 
 /// Thread control block = kernel state + OS personality
@@ -370,7 +374,22 @@ impl<A: crate::Arch> KernelThread<A> {
             symbols: None,
             fds: [FdKind::None; MAX_FDS],
             cloexec: 0,
+            comm: [0; 16],
         }
+    }
+
+    /// Record the program's display name from a launch path (basename, NUL-padded).
+    pub fn set_comm(&mut self, path: &[u8]) {
+        self.comm = [0; 16];
+        let base = basename(path);
+        let n = base.len().min(self.comm.len());
+        self.comm[..n].copy_from_slice(&base[..n]);
+    }
+
+    /// The recorded program name, empty if never set.
+    pub fn comm_str(&self) -> &[u8] {
+        let end = self.comm.iter().position(|&b| b == 0).unwrap_or(self.comm.len());
+        &self.comm[..end]
     }
 
     /// Find a free fd slot (starting from `from`). Returns fd number or None.
@@ -637,8 +656,18 @@ pub fn with_target_dos<F: FnOnce(&mut DosState<A>) -> i32, A: crate::Arch>(threa
     }
 }
 
-/// F11 hotkey flag for thread cycling
+/// Last path component (after the final `/` or `\`). The name a picker shows.
+pub fn basename(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/' || b == b'\\') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// Focus-switch request. `SWITCH_REQUESTED` is the round-robin flag; `SWITCH_TO`
+/// (a tid, else -1) is the F12 picker's targeted choice, honored ahead of it.
 static mut SWITCH_REQUESTED: bool = false;
+static SWITCH_TO: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(-1);
 
 pub fn request_switch() {
     unsafe { core::ptr::write_volatile(&raw mut SWITCH_REQUESTED, true); }
@@ -650,6 +679,17 @@ pub fn take_switch_request() -> bool {
         if v { core::ptr::write_volatile(&raw mut SWITCH_REQUESTED, false); }
         v
     }
+}
+
+/// Ask to focus a specific thread (the F12 picker's selection).
+pub fn request_switch_to(tid: usize) {
+    SWITCH_TO.store(tid as isize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Consume a pending targeted switch, if any.
+pub fn take_switch_target() -> Option<usize> {
+    let v = SWITCH_TO.swap(-1, core::sync::atomic::Ordering::Relaxed);
+    if v >= 0 { Some(v as usize) } else { None }
 }
 
 /// Round-robin: next active thread after current (skips thread 0).

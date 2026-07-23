@@ -1,9 +1,9 @@
 //! Console input routing — drained host/hardware events to their owners.
 //!
 //! ONE place decides where an input event goes:
-//! - Console-global chords are intercepted first: F10 toggles the cycle
-//!   profile dump, F11 requests a focus switch, F12 dumps the interrupted
-//!   thread's state.
+//! - The F12 host monitor is intercepted first: F12 opens an on-screen menu
+//!   (kill / switch / volume / trace / profile / dump), and while it is open every key
+//!   drives the menu instead of the guest. See [`crate::kernel::osd`].
 //! - Everything else is addressed to the console owner — `focus::focused()`,
 //!   which today is also the running thread (focus implies execution until
 //!   the scheduler decouples them; this router is written against the
@@ -18,11 +18,7 @@
 use crate::Regs;
 use crate::kernel::thread;
 
-/// F10 scancode (press) — toggle the cycle/event profile dump.
-pub const F10_PRESS: u8 = 0x44;
-/// F11 scancode (press) — focus switch.
-pub const F11_PRESS: u8 = 0x57;
-/// F12 scancode (press) — dump the running thread's state.
+/// F12 scancode (press) — open the host monitor.
 pub const F12_PRESS: u8 = 0x58;
 
 /// Drain pending input into the console owner.
@@ -54,12 +50,12 @@ fn drain_dos<A: crate::Arch>(
         let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
         machine.drain(&mut |evt| _events.push(evt));
         for evt in _events {
-        if matches!(evt, crate::Irq::Key(sc)
-            if console_chord(machine, regs, sc, Some(unsafe { &*dp }))) {
-            // consumed by a console-global chord
-        } else if blocked {
-            if let crate::Irq::Key(sc) = evt
-                && crate::kernel::keyboard::update_key_state(sc) {
+        if let crate::Irq::Key(sc) = evt {
+            if monitor_key(machine, regs, sc, Some(unsafe { &*dp })) {
+                continue; // eaten by the F12 monitor
+            }
+            if blocked {
+                if crate::kernel::keyboard::update_key_state(sc) {
                     let c = crate::kernel::keyboard::scancode_to_ascii(sc);
                     if c != 0 {
                         crate::vga::putchar(c);
@@ -67,35 +63,36 @@ fn drain_dos<A: crate::Arch>(
                         crate::kernel::kpipe::write(cpipe, &[c]);
                     }
                 }
-        } else {
-            if let crate::Irq::Key(sc) = evt {
-                unsafe { (*dp).process_key(machine, regs, sc) };
             } else {
-                crate::kernel::dos::queue_irq(machine, unsafe { &mut *dp }, regs, evt);
+                unsafe { (*dp).process_key(machine, regs, sc) };
             }
+        } else if !blocked {
+            crate::kernel::dos::queue_irq(machine, unsafe { &mut *dp }, regs, evt);
         }
     }
     }
 }
 
-/// Console-global chords, tried before any owner sees the key. Returns true
-/// when the chord was consumed.
+/// The single host-monitor gate, tried before any owner sees the key. Returns
+/// true when the key was consumed (never reaches the guest).
 ///
-/// One copy, not one per personality: DOS and Linux had identical F11/F12
-/// arms, so a third chord would have been a third place to forget.
-fn console_chord<A: crate::Arch>(
+/// One door, not one chord per action: while the monitor is open it eats every
+/// key; when closed, only F12 (opening it) is special.
+fn monitor_key<A: crate::Arch>(
     machine: &mut A,
     regs: &mut Regs,
     sc: u8,
     dos: Option<&thread::DosState<A>>,
 ) -> bool {
-    match sc {
-        F10_PRESS => crate::kernel::startup::toggle_profile(),
-        F11_PRESS => thread::request_switch(),
-        F12_PRESS => crate::kernel::startup::dump_interrupted_thread(machine, regs, dos),
-        _ => return false,
+    if crate::kernel::osd::is_open() {
+        crate::kernel::osd::key(machine, regs, sc, dos);
+        return true;
     }
-    true
+    if sc == F12_PRESS {
+        crate::kernel::osd::open();
+        return true;
+    }
+    false
 }
 
 /// Linux owner: keys → cooked fd input.
@@ -112,7 +109,7 @@ fn drain_linux<A: crate::Arch>(
         machine.drain(&mut |evt| _events.push(evt));
         for evt in _events {
         if let crate::Irq::Key(sc) = evt
-            && !console_chord(machine, regs, sc, None)
+            && !monitor_key(machine, regs, sc, None)
         {
             unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
         }

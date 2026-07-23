@@ -16,23 +16,18 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-/// Runtime trace gate, toggled by INT 31h synth AH=02 (on) / AH=03 (off).
-/// Lets COMMAND.COM bracket a single exec so the log only captures that
-/// child program, not surrounding shell/launcher noise. Default OFF so
-/// boot/init/DN startup are silent until something explicitly enables it.
-static DOS_TRACE_RT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 /// Track whether we're currently running in a hardware IRQ context.
 pub(crate) static IN_HW_IRQ_CONTEXT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Returns true if a trace line should fire. Folds away to `false` when the
-/// compile-time `DOS_TRACE` master switch is off, so disabled traces cost
-/// nothing in the binary.
+/// Returns true if a DOS/DPMI trace line should fire: the shared runtime trace
+/// gate is on ([`crate::kernel::startup::trace_enabled`] — toggled by the F12
+/// monitor or bracketed by COMMAND.COM via INT 31h AH=02/03) and we are not
+/// inside a hardware IRQ.
 #[inline]
 fn should_trace() -> bool {
-    DOS_TRACE_RT.load(core::sync::atomic::Ordering::Relaxed) && !IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed)
+    crate::kernel::startup::trace_enabled()
+        && !IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 macro_rules! dos_trace {

@@ -25,6 +25,7 @@ pub mod platform;
 // ── Diagnostics ─────────────────────────────────────────────────────────
 pub mod iostat;
 pub mod klog;
+pub mod osd;
 pub mod stacktrace;
 
 // ── Kernel APIs the personalities call: one surface per resource class ───

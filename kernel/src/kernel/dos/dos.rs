@@ -18,7 +18,6 @@ use super::{
     linear, snapshot_env,
     dos_alloc_block, dos_free_block, dos_resize_block,
     dos_set_program_block_owner, dos_keep_resident_block,
-    DOS_TRACE_RT,
 };
 use super::{dpmi, dfs, machine, mode_transitions, xms};
 use super::ems::{EMS_ENABLED, EMS_DEVICE_HANDLE, int_67h};
@@ -593,7 +592,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         // AH=03h — TRACE_OFF: disable it.
         // No DPMI 0.9 collision (RM-only path; PM DPMI is dispatched separately).
         0x02 | 0x03 => {
-            DOS_TRACE_RT.store(ah == 0x02, core::sync::atomic::Ordering::Relaxed);
+            crate::kernel::startup::set_trace(ah == 0x02);
             regs.rax &= !0xFFFF;
             regs.clear_flag32(1);
             thread::KernelAction::Done

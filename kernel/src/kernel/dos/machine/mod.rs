@@ -1029,6 +1029,11 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // with it. Each source carries its own card-accurate scale (see vsb.rs's
     // FM_SCALE_Q16 / DAC_SCALE_Q16 / GUS_SCALE_Q16), which is where the
     // headroom lives, so the clamp below is a backstop, not the normal path.
+    // Card-balance headroom (unity) composed with the F12 monitor's runtime
+    // master volume, applied once at the mix-out clip below. Composed in i64 so
+    // the two Q16 factors can't overflow; the result is ≤ unity.
+    let out_gain =
+        ((vsb::OUTPUT_GAIN_Q16 as i64 * crate::kernel::osd::master_gain_q16() as i64) >> 16) as i32;
     let mut frames = [(0i32, 0i32); MIX_CHUNK];
     let mut bytes = [0u8; MIX_CHUNK * 4];
     while n > 0 {
@@ -1045,8 +1050,8 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
             source.mix_into(machine, rate, base, dsp_base, &mut frames[..run]);
         }
         for (i, (l, r)) in frames[..run].iter().enumerate() {
-            let l = sat16((l * vsb::OUTPUT_GAIN_Q16) >> 16);
-            let r = sat16((r * vsb::OUTPUT_GAIN_Q16) >> 16);
+            let l = sat16((l * out_gain) >> 16);
+            let r = sat16((r * out_gain) >> 16);
             bytes[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
             bytes[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
         }
