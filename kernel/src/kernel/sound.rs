@@ -220,8 +220,16 @@ pub struct Pace {
     /// push, so anything queued before us drains first — see vsb).
     anchor: u64,
     /// Session frames the sink has consumed, as of the last [`due`] call
-    /// (synthetic: everything pushed — an instant consumer).
+    /// (synthetic: everything pushed — an instant consumer). Interpolated: the
+    /// sink confirms whole buffers per completion IRQ, and this advances smoothly
+    /// between them (see `drained_from`/`drained_ms`/`drain_step`) so both
+    /// production and the guest cursor derived from it advance evenly.
     drained: u64,
+    /// Last buffer-granular consumed value, the ms it stepped, and the step size
+    /// (buffer, learned) — for interpolating `drained` between completions.
+    drained_from: u64,
+    drained_ms: u64,
+    drain_step: u64,
     /// Guest-clock accumulator, frames × 1000. Production is paced on
     /// `get_ticks` (real-time to ~1e-3); this keeps whole-frame credit so a
     /// partial block remains here until the next complete block is due. Used on
@@ -234,6 +242,7 @@ impl Pace {
         Pace {
             rate: 0, fill: 0, use_pos: false,
             pushed: 0, anchor: u64::MAX, drained: 0, frac: 0,
+            drained_from: 0, drained_ms: 0, drain_step: 0,
         }
     }
 
@@ -245,6 +254,9 @@ impl Pace {
         self.anchor = u64::MAX;
         self.drained = 0;
         self.frac = 0;
+        self.drained_from = 0;
+        self.drained_ms = 0;
+        self.drain_step = 0;
     }
 
     /// Force a fresh session on the next [`due`] even at an unchanged rate —
@@ -287,22 +299,42 @@ impl Pace {
             self.pushed = 0;
             self.anchor = u64::MAX;
             self.frac = 0;
+            self.drained_from = 0;
+            self.drain_step = 0;
         }
         if self.use_pos {
             let (written, consumed) = position(machine).unwrap_or((0, 0));
             if self.anchor == u64::MAX && self.pushed > 0 {
                 self.anchor = written.saturating_sub(self.pushed);
             }
-            self.drained = if self.anchor == u64::MAX {
+            let coarse = if self.anchor == u64::MAX {
                 0
             } else {
                 consumed.saturating_sub(self.anchor)
             };
+            // The sink confirms `consumed` one whole buffer per completion IRQ — a
+            // coarse staircase. Interpolate it with real time so `drained` advances
+            // evenly, like a real DMA cursor: re-anchor on each step, cap the
+            // fraction at the last step (the buffer, learned from the step itself)
+            // so it stays monotonic and never crosses the next, unconfirmed
+            // boundary. This one smooth drain feeds BOTH the deficit below and the
+            // guest-visible SB cursor — so production and that cursor advance
+            // evenly instead of in buffer-sized bursts (the SFX-crackle source).
+            let now = machine.get_ticks();
+            if coarse != self.drained_from {
+                self.drain_step = coarse - self.drained_from;
+                self.drained_from = coarse;
+                self.drained_ms = now;
+            }
+            let frac =
+                (now.saturating_sub(self.drained_ms) * rate as u64 / 1000).min(self.drain_step);
+            self.drained = coarse + frac;
             // Refill the deficit to keep `fill` frames queued ahead of the drain.
-            // The sink advances `consumed` from its own completion interrupt, so
-            // production tracks consumption exactly — no clock drift to servo, no
-            // guest-time pacing. At startup the deficit is the whole `fill`, which
-            // primes the pipe in one go.
+            // Production paces on this smoothed drain — real-time between the
+            // completion anchors — so it tracks consumption without the coarse
+            // buffer-step bursts (and without a get_ticks drift servo: the anchors
+            // pin it to the true drain). At startup the deficit is the whole
+            // `fill`, which primes the pipe in one go.
             let deficit = (self.drained + self.fill as u64).saturating_sub(self.pushed);
             let due = deficit / block * block;
             self.pushed += due;
