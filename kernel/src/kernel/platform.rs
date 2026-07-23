@@ -71,11 +71,12 @@ pub enum Firmware {
 /// and sound's port-window signature cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Audio {
-    /// A real Sound Blaster answered the DSP-status probe (legacy metal,
-    /// QEMU `sb16`): guest DSP/mixer traffic forwards to the card and only
-    /// the 8237 stays virtual. Implies a real OPL — the 0x388 window is
-    /// part of the DOS io_policy template, not a runtime grant.
-    SbPassthrough,
+    /// A real Sound Blaster 16 answered the DSP reset/probe (legacy metal, QEMU
+    /// `sb16`): the software SB/GUS/GM are emulated as usual and their canonical
+    /// PCM renders out the real SB16 as the kernel `sound` sink (`drivers::sb16`,
+    /// 16-bit auto-init DMA on channel 5, IRQ 5). (Phase B will make ownership of
+    /// the card movable — handing it to the guest for native SB playback.)
+    RealSb,
     /// No card; the software SB16 renders through the kernel sound API into an
     /// Intel HD Audio controller found on PCI (QEMU `intel-hda`, modern metal).
     EmulatedHda,
@@ -91,9 +92,12 @@ pub enum Audio {
 }
 
 impl Audio {
-    /// Guest SB programming reaches a real card (vs the software DSP).
+    /// Guest SB programming reaches the real card directly (native playback),
+    /// vs the software DSP. Phase A always emulates — even with a real SB16
+    /// present it is a kernel sink, not guest-owned — so this is always false.
+    /// Phase B makes it dynamic (true while a DOS program drives the card).
     pub fn sb_passthrough(self) -> bool {
-        matches!(self, Audio::SbPassthrough)
+        false
     }
 }
 
@@ -263,9 +267,9 @@ pub fn probed() -> bool {
 /// canonical SB base 0x220 (a per-thread BLASTER override relocates the
 /// guest-visible base, not the card).
 fn probe_audio<A: crate::Arch>(machine: &mut A) -> Audio {
-    let sb_absent = machine.inb(0x22C) == 0xFF && machine.inb(0x22E) == 0xFF;
-    if !sb_absent {
-        return Audio::SbPassthrough;
+    // A real SB16 answers a DSP reset with 0xAA — it becomes the kernel sink.
+    if crate::kernel::drivers::sb16::scan(machine) {
+        return Audio::RealSb;
     }
     if crate::kernel::drivers::hda::scan(machine).is_some() {
         return Audio::EmulatedHda;

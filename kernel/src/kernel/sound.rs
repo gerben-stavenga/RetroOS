@@ -104,14 +104,18 @@ pub fn on_hw_irq<A: crate::Arch>(machine: &mut A, line: u8) -> bool {
             machine.rearm_irq(line);
             true
         }
+        Audio::RealSb if Some(line) == crate::kernel::drivers::sb16::irq_line() => {
+            crate::kernel::drivers::sb16::on_irq(machine);
+            machine.rearm_irq(line); // re-unmask the ISA line the sink owns
+            true
+        }
         _ => false,
     }
 }
 
 /// Stream a block of source PCM `bytes` (`fmt`, `rate` Hz) to the canonical
 /// audio output, canonicalizing to i16 stereo on the way. The sink is the
-/// boot-time platform decision; SbPassthrough never produces canonical PCM
-/// (the real card owns sound) and Silent drops it.
+/// boot-time platform decision; Silent drops it.
 pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
@@ -123,8 +127,12 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
             crate::kernel::drivers::ac97::play(machine, rate, fmt, bytes);
             return;
         }
+        Audio::RealSb => {
+            crate::kernel::drivers::sb16::play(machine, rate, fmt, bytes);
+            return;
+        }
         Audio::EmulatedPortWindow => {}
-        Audio::SbPassthrough | Audio::EmulatedSilent => return,
+        Audio::EmulatedSilent => return,
     }
     if LAST_RATE.swap(rate, Ordering::Relaxed) != rate {
         machine.outw(AUDIO_SIG, rate as u16);
@@ -147,8 +155,8 @@ pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => crate::kernel::drivers::hda::stop(machine, park),
-        Audio::EmulatedAc97 | Audio::EmulatedPortWindow => {}
-        Audio::SbPassthrough | Audio::EmulatedSilent => {}
+        Audio::RealSb => crate::kernel::drivers::sb16::stop(machine, park),
+        Audio::EmulatedAc97 | Audio::EmulatedPortWindow | Audio::EmulatedSilent => {}
     }
 }
 
@@ -169,7 +177,8 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => crate::kernel::drivers::hda::position(),
         Audio::EmulatedAc97 => crate::kernel::drivers::ac97::position(machine),
-        Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => None,
+        Audio::RealSb => crate::kernel::drivers::sb16::position(machine),
+        Audio::EmulatedPortWindow | Audio::EmulatedSilent => None,
     }
 }
 
@@ -189,7 +198,8 @@ pub fn min_fill(rate: u32) -> Option<u32> {
     let present = match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => crate::kernel::drivers::hda::present(),
         Audio::EmulatedAc97 => crate::kernel::drivers::ac97::present(),
-        Audio::EmulatedPortWindow | Audio::SbPassthrough | Audio::EmulatedSilent => false,
+        Audio::RealSb => crate::kernel::drivers::sb16::present(),
+        Audio::EmulatedPortWindow | Audio::EmulatedSilent => false,
     };
     present.then(|| rate * PIPE_MS / 1000)
 }

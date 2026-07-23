@@ -12,5 +12,6 @@
 pub mod ac97;
 pub mod alc298_amp;
 pub mod hda;
+pub mod sb16;
 pub mod hdd;
 pub mod nvme;

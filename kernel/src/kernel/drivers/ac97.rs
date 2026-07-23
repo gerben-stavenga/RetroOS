@@ -44,7 +44,6 @@ const NAM_PCM_DAC_RATE: u16 = 0x2C; // sample rate when VRA enabled
 
 // NABM (Native Audio Bus Master, BAR1): the DMA engine. PCM-Out ("PO") channel.
 const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
-const PO_CIV: u16 = 0x14; // 8-bit: current index value (RO)
 const PO_LVI: u16 = 0x15; // 8-bit: last valid index
 const PO_SR: u16 = 0x16; // 16-bit: status; bit2 LVBCI, bit3 BCIS, bit4 FIFOE (W1C)
 const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset, bit4 IOCE)
@@ -94,11 +93,10 @@ struct Ac97 {
     rate: u32,      // last programmed sample rate (Hz)
     /// Pipe counters for [`position`] (the DAC runs at the source rate — no
     /// resampler — so these are directly in source frames). `written` counts
-    /// frames accepted by `submit`; `consumed_bufs` accumulates completed
-    /// ring buffers from CIV deltas (CIV alone is modular).
+    /// frames accepted by `submit`; `consumed_bufs` counts completed ring
+    /// buffers, one per completion interrupt (`on_irq`).
     written: u64,
     consumed_bufs: u64,
-    last_civ: u8,
 }
 
 static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
@@ -218,7 +216,6 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         rate: 0,
         written: 0,
         consumed_bufs: 0,
-        last_civ: 0,
     };
     d.build_bdl();
     machine.outl(nabm + PO_BDBAR, dma_phys); // BDL base
@@ -333,9 +330,7 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A) {
     let mut g = AC97.lock();
     let Some(dev) = g.as_mut() else { return };
     if dev.running {
-        let civ = machine.inb(dev.nabm + PO_CIV);
-        dev.consumed_bufs += ((civ + NUM_BUF as u8 - dev.last_civ) % NUM_BUF as u8) as u64;
-        dev.last_civ = civ;
+        dev.consumed_bufs += 1; // one buffer per completion interrupt — no CIV poll
     }
     machine.outw(dev.nabm + PO_SR, PO_SR_INTR); // clear LVBCI|BCIS|FIFOE (W1C)
 }

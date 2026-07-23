@@ -240,6 +240,7 @@ fn init_device_policy<A: crate::Arch>(
     // interpreter) leaves the sound path on its port-window fallback.
     crate::kernel::drivers::ac97::init(machine);
     crate::kernel::drivers::hda::init(machine);
+    crate::kernel::drivers::sb16::init(machine);
 }
 
 /// /CONFIG.SYS provides the master env handed to DN and any user-driven
