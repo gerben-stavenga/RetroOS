@@ -108,13 +108,13 @@ const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
 // ── PCM ring geometry (mirror ac97) ──────────────────────────────────────────
 const NUM_BUF: usize = 32;
-// 256 B = 64 stereo frames ≈ 1.45 ms @ 44.1 kHz. Deliberately small: with MSI
-// each completed buffer is one interrupt that drives one production pass, so
-// the buffer duration sets how finely the synth engine advances. A large buffer
-// would step GUS/DMX in coarse lumps (the E1M8 "cut notes" failure mode); ~1.5
-// ms keeps it close to the old 1 ms get_ticks cadence. Polled sinks are
-// unaffected — their pacing is the get_ticks servo, not the buffer size.
-const BUF_BYTES: usize = 0x100;
+// 1 KB = 256 stereo frames ≈ 5.8 ms @ 44.1 kHz. With MSI each completed buffer
+// is one interrupt that drives one production pass, so the buffer duration sets
+// how finely the synth engine advances — a large buffer would step GUS/DMX in
+// coarse lumps (the E1M8 "cut notes" failure mode). ~6 ms stays fine there while
+// giving the pipe (6 buffers ≈ 35 ms) depth to ride out the ~14.3 ms
+// framebuffer-blit stall that would otherwise crackle a shallower pipe.
+const BUF_BYTES: usize = 0x400;
 const PRIME_BUFS: usize = 3;
 /// Hard drop ceiling, just under the ring's ahead/behind ambiguity point.
 /// Every producer is position-slaved (`sound::position`/`sound::Pace`) and
@@ -1781,8 +1781,8 @@ pub fn min_fill(rate: u32) -> Option<u32> {
     }
     let src = if rate == 0 { 44100 } else { rate };
     let hw = Hda::hardware_rate(src);
-    // Event-driven: one small buffer is refilled per completion interrupt, so a
-    // shallow pipe suffices and keeps latency low (6 × 1.45 ms ≈ 9 ms).
+    // Event-driven: one buffer is refilled per completion interrupt. Six buffers
+    // (6 × 5.8 ms ≈ 35 ms) span the ~14.3 ms framebuffer-blit stall with margin.
     let hw_frames = (6 * BUF_BYTES / 4) as u64;
     Some((hw_frames * src as u64 / hw as u64) as u32 + 1)
 }
