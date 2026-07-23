@@ -30,6 +30,9 @@ freedos/.installed
 # Loose images / debug artifacts at repo root
 tmp/
 traces/
+/*.wav
+/*.ppm
+/*.log
 
 # Claude Code session state
 .claude/
