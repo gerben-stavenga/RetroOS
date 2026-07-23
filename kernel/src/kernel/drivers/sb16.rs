@@ -38,7 +38,11 @@ const CMD_SPEAKER_ON: u8 = 0xD1;
 const CMD_SET_RATE_OUT: u8 = 0x41; // output rate, big-endian 16-bit
 const CMD_16BIT_AUTO_OUT: u8 = 0xB6; // 16-bit, auto-init, FIFO, D/A
 const CMD_EXIT_AUTO_16: u8 = 0xD9; // finish the current block then stop
-const MODE_SIGNED_STEREO: u8 = 0x30; // bit5 stereo, bit4 signed
+// Mono, signed (bit4 = signed, bit5 = stereo). QEMU's sb16 does not honour the
+// DSP stereo bit on the 16-bit auto-init path — it plays the interleaved buffer
+// as mono, which comes out at half speed / doubled — so the sink downmixes to
+// mono and programs mono output. (Stereo out is a TODO pending the QEMU quirk.)
+const MODE_SIGNED_MONO: u8 = 0x10;
 
 // ── 8237 channel-5 (16-bit) registers ───────────────────────────────────────
 const DMA_CHANNEL: usize = 5;
@@ -56,7 +60,11 @@ const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 /// Completion-IRQ granularity: one interrupt per buffer. ≤ half the universal
 /// pipe (see `sound::min_fill`) so ≥ 2 buffers stay queued (double-buffered).
-const BUF_BYTES: usize = 0x400; // 1 KB = 256 stereo frames ≈ 5.8 ms @ 44.1 kHz
+/// Mono: one 16-bit sample per mixed stereo frame, so a buffer holds
+/// `BUF_BYTES/2` frames.
+const BUF_BYTES: usize = 0x200; // 512 B = 256 mono samples ≈ 5.8 ms @ 44.1 kHz
+/// Playback frames (= mono samples) per buffer.
+const BUF_FRAMES: usize = BUF_BYTES / 2;
 const NUM_BUF: usize = 32;
 const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
 /// Prime this many buffers before starting the DSP.
@@ -220,11 +228,11 @@ impl Sb16 {
         machine.outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
         machine.outb(DMA5_MASK, 0x01); // unmask channel 5
 
-        // DSP block length in 16-bit samples − 1 (one buffer per IRQ). Stereo
-        // counts L and R samples, so a buffer is BUF_BYTES/2 samples.
-        let block_samples = (BUF_BYTES / 2) as u16;
+        // DSP block length in 16-bit samples − 1 (one buffer per IRQ). Mono, so
+        // a buffer is BUF_FRAMES samples.
+        let block_samples = BUF_FRAMES as u16;
         dsp_write(machine, CMD_16BIT_AUTO_OUT);
-        dsp_write(machine, MODE_SIGNED_STEREO);
+        dsp_write(machine, MODE_SIGNED_MONO);
         dsp_write(machine, (block_samples - 1) as u8);
         dsp_write(machine, ((block_samples - 1) >> 8) as u8);
         self.running = true;
@@ -239,13 +247,13 @@ impl Sb16 {
         }
         for i in 0..bytes.len() / fb {
             let (l, r) = fmt.frame(bytes, i);
+            let m = ((l as i32 + r as i32) / 2) as i16; // downmix to mono
             let p = self.buf_va(self.cur_buf) + self.cur_off;
             unsafe {
-                core::ptr::write_volatile(p as *mut u16, l as u16);
-                core::ptr::write_volatile((p + 2) as *mut u16, r as u16);
+                core::ptr::write_volatile(p as *mut u16, m as u16);
             }
             self.written += 1;
-            self.cur_off += 4;
+            self.cur_off += 2;
             if self.cur_off >= BUF_BYTES {
                 self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
                 self.cur_off = 0;
@@ -285,8 +293,7 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     let _ = machine;
     let g = SB16.lock();
     let dev = g.as_ref()?;
-    let frames_per_buf = (BUF_BYTES / 4) as u64;
-    Some((dev.written, dev.consumed_bufs * frames_per_buf))
+    Some((dev.written, dev.consumed_bufs * BUF_FRAMES as u64))
 }
 
 /// Producer went idle. `park` ends the session: stop auto-init and reset counters.
