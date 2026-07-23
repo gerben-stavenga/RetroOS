@@ -73,8 +73,13 @@ const RINTCNT: usize = 0x5A; // w16: response interrupt count
 const RIRBCTL: usize = 0x5C; // b8: bit1 RIRBDMAEN
 const RIRBSTS: usize = 0x5D; // b8: bit0 RINTFL (response interrupt), bit2 overrun
 const RIRBSIZE: usize = 0x5E; // b8: bits1:0 size (0b10 = 256 entries)
+const INTCTL: usize = 0x20; // d32: bit31 GIE, bit30 CIE, bits0..29 per-stream SIE
+const INTSTS: usize = 0x24; // d32: bit31 GIS, bits0..29 per-stream status (W1C-ish)
 const DPLBASE: usize = 0x70; // d32: DMA position buffer base; bit0 = enable
 const DPUBASE: usize = 0x74; // d32: DMA position buffer base high
+
+const SDSTS: usize = 0x03; // b8 (in the SD block): bit2 BCIS (buffer-complete), W1C
+const SDCTL_IOCE: u32 = 0x04; // SDCTL bit2: interrupt-on-completion enable
 
 // Output stream descriptor register offsets (added to the descriptor base, which
 // is 0x80 + ISS*0x20 — the first output stream sits past the input streams).
@@ -160,6 +165,16 @@ const REALTEK_EAPD_COEF_MASK: u32 = 1 << 9;
 static HDA: Mutex<Option<Hda>> = Mutex::new(None);
 /// True once the controller BAR is mapped at `BAR_WIN_VA` (panic-path guard).
 static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Canonical audio-sink IRQ line this controller's MSI is programmed to raise
+/// (an otherwise-unused ISA line so it can't alias a wired IRQ). The kernel's
+/// audio-IRQ router ([`crate::kernel::sound::on_hw_irq`]) matches on it.
+pub const MSI_LINE: u8 = 11;
+/// Set once bring-up successfully programmed MSI; when false the driver stays on
+/// the polled `SDLPIB` path and never enables interrupt-on-completion.
+static MSI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Buffer-completion interrupts serviced (bring-up diagnostic for now).
+static HDA_IRQS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[inline]
 fn spin(n: usize) {
@@ -491,6 +506,16 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
     crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
 
+    // Message-signalled interrupts: ask the arch for a target that delivers the
+    // canonical `Irq::Hw(MSI_LINE)` and program it into the device's MSI
+    // capability. When unavailable (no LAPIC → PIC-only), MSI_ON stays false and
+    // the driver keeps its polled `SDLPIB` production path.
+    let msi = machine
+        .msi_alloc(MSI_LINE)
+        .is_some_and(|(addr, data)| crate::kernel::pci::msi_enable(machine, bus, dev, func, addr, data));
+    MSI_ON.store(msi, core::sync::atomic::Ordering::Relaxed);
+    crate::println!("hda: {:02x}:{:02x}.{} MSI {}", bus, dev, func, if msi { "on" } else { "unavailable (polled)" });
+
     // BAR0 is a memory BAR. Read the high dword only if it is actually 64-bit
     // (type bits [2:1] == 0b10); a 32-bit BAR would make 0x14 a different reg.
     let bar0 = crate::kernel::pci::read32(machine, bus, dev, func, 0x10);
@@ -776,15 +801,18 @@ impl Hda {
     }
 
     /// Fill the BDL: entry i → PCM buffer i. Each HDA BDL entry is 16 bytes
-    /// { addr:u64, len:u32, flags:u32 }; IOC stays off (we poll `SDLPIB`).
+    /// { addr:u64, len:u32, flags:u32 }. flags bit0 = IOC: set per buffer when
+    /// MSI is on (one completion interrupt per buffer drives the event-loop
+    /// audio track); off otherwise (the driver polls `SDLPIB` instead).
     fn build_bdl(&mut self) {
+        let ioc = if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) { 1 } else { 0 };
         for i in 0..NUM_BUF {
             let entry = self.dma_va + BDL_OFF + i * 16;
             unsafe {
                 write_volatile(entry as *mut u32, self.buf_phys(i)); // addr low
                 write_volatile((entry + 4) as *mut u32, 0); // addr high
                 write_volatile((entry + 8) as *mut u32, BUF_BYTES as u32); // length
-                write_volatile((entry + 12) as *mut u32, 0); // flags (IOC off)
+                write_volatile((entry + 12) as *mut u32, ioc); // flags (IOC per buffer)
             }
         }
     }
@@ -892,6 +920,14 @@ impl Hda {
         w16(sd + SDLVI, (NUM_BUF - 1) as u16);
         // Stream tag in the descriptor control byte (bits 20..23 of SDCTL).
         w8(sd + SDCTL + 2, (STREAM_TAG << 4) as u8);
+
+        // Enable delivery of this stream's completion interrupts to the CPU:
+        // global-interrupt-enable + this stream's status-interrupt-enable bit.
+        // The per-buffer IOCE (SDCTL bit2) is set with RUN at playback start.
+        if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) {
+            let sidx = (self.sd - SD_BASE) / SD_STRIDE;
+            w32(INTCTL, 0x8000_0000 | (1u32 << sidx));
+        }
     }
 
     /// Park the link: stop all DMA and hold the controller in reset (CRST
@@ -1411,7 +1447,8 @@ impl Hda {
             // stream binding with the stream number visible (a byte-0-only
             // RUN write may not retrigger it → codec never drains the FIFO).
             if !self.running && self.cur_buf >= PRIME_BUFS {
-                w32(self.sd + SDCTL, 0x02 | (STREAM_TAG << 20));
+                let ioce = if MSI_ON.load(core::sync::atomic::Ordering::Relaxed) { SDCTL_IOCE } else { 0 };
+                w32(self.sd + SDCTL, 0x02 | ioce | (STREAM_TAG << 20));
                 self.running = true;
                 if !self.logged_run {
                     crate::println!(
@@ -1693,6 +1730,22 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     let mut g = HDA.lock();
     if let Some(dev) = g.as_mut() {
         dev.submit(rate, fmt, bytes);
+    }
+}
+
+/// Service a buffer-completion interrupt (canonical `Irq::Hw(MSI_LINE)` routed
+/// here by `sound::on_hw_irq`). Acknowledges the stream's completion status
+/// (SDSTS.BCIS, write-1-clear) and the controller INTSTS so the device can
+/// signal the next block. For now it only accounts the interrupt; the
+/// event-loop audio track will produce a block per call in the next step.
+pub fn on_irq() {
+    let n = HDA_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if let Some(dev) = HDA.lock().as_ref() {
+        w8(dev.sd + SDSTS, 0x04); // BCIS write-1-clear
+        w32(INTSTS, r32(INTSTS)); // clear latched stream-interrupt-status bits
+    }
+    if n <= 3 || n % 512 == 0 {
+        crate::println!("hda: MSI completion irq #{}", n);
     }
 }
 

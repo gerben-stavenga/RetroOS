@@ -66,8 +66,17 @@ fn drain_dos<A: crate::Arch>(
             } else {
                 unsafe { (*dp).process_key(machine, regs, sc) };
             }
-        } else if !blocked {
-            crate::kernel::dos::queue_irq(machine, unsafe { &mut *dp }, regs, evt);
+        } else {
+            // A sink completion interrupt is the kernel's, not the guest's:
+            // offer every Hw line to the audio router first.
+            if let crate::Irq::Hw(line) = evt
+                && crate::kernel::sound::on_hw_irq(machine, line)
+            {
+                continue;
+            }
+            if !blocked {
+                crate::kernel::dos::queue_irq(machine, unsafe { &mut *dp }, regs, evt);
+            }
         }
     }
     }
@@ -108,10 +117,14 @@ fn drain_linux<A: crate::Arch>(
         let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
         machine.drain(&mut |evt| _events.push(evt));
         for evt in _events {
-        if let crate::Irq::Key(sc) = evt
-            && !monitor_key(machine, regs, sc, None)
-        {
-            unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
+        if let crate::Irq::Key(sc) = evt {
+            if !monitor_key(machine, regs, sc, None) {
+                unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
+            }
+        } else if let crate::Irq::Hw(line) = evt {
+            // Same audio-sink IRQ routing as the DOS drain (see `drain_dos`):
+            // the sink is the kernel's regardless of the focused personality.
+            crate::kernel::sound::on_hw_irq(machine, line);
         }
     }
     }

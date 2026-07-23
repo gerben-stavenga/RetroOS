@@ -735,6 +735,26 @@ pub fn rearm_irq(irq: u8) {
     unmask_irq(irq);
 }
 
+/// Build an MSI `(message_address, message_data)` that delivers `source` as
+/// vector `IRQ_OFFSET + source`, i.e. straight into `handle_irq`'s generic
+/// `Irq::Hw(source)` arm (APIC branch: read device, single LAPIC EOI). MSI is
+/// edge-triggered and LAPIC-delivered, so it needs no PIC mask/unmask and no
+/// IOAPIC routing — only that the LAPIC is up. `source` must be an otherwise
+/// unused line so it doesn't alias a wired ISA IRQ.
+///
+/// xAPIC physical-mode format: address `0xFEE0_0000 | (apic_id << 12)`, data =
+/// the low-8-bit vector (delivery mode fixed, edge). Returns `None` in PIC-only
+/// mode (no LAPIC → MSI cannot be delivered; the device must fall back to a
+/// wired line or polling).
+pub fn msi_target(source: u8) -> Option<(u64, u32)> {
+    if !lapic_timer_active() {
+        return None;
+    }
+    let addr = LAPIC_PHYS | ((bsp_apic_id() as u64) << 12);
+    let data = (IRQ_OFFSET + source) as u32;
+    Some((addr, data))
+}
+
 /// Get timer ticks
 pub fn get_ticks() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const TIMER_TICKS) }

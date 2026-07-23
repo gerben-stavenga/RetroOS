@@ -233,6 +233,19 @@ pub trait Arch: Sized + GuestBytes {
     /// deferred guest-visible device ack.
     fn rearm_irq(&mut self, line: u8);
 
+    /// Allocate an MSI target for a device that should raise the canonical
+    /// `Irq::Hw(source)` event. Returns the `(message_address, message_data)`
+    /// pair to program into the device's PCI MSI capability, or `None` when
+    /// message-signalled interrupts are unavailable (no local APIC, or a
+    /// backend with no real interrupt hardware). The backend guarantees that a
+    /// write matching the returned pair delivers as `Irq::Hw(source)` through
+    /// the ordinary `drain` path — the caller never learns the vector or APIC
+    /// id, keeping interrupt delivery canonical above the arch boundary.
+    fn msi_alloc(&mut self, source: u8) -> Option<(u64, u32)> {
+        let _ = source;
+        None
+    }
+
     /// Arm hardware write-watchpoints at up to two guest-linear addresses
     /// (`None`/missing entry disables): a `#DB` fires when the guest writes one,
     /// for catching memory corruption. Real on metal (programs the debug

@@ -85,6 +85,23 @@ pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
     machine.inw(AUDIO_SIG) == SIGNATURE
 }
 
+/// Canonical audio-sink interrupt router. A hardware `Irq::Hw(line)` drained by
+/// any personality is offered here first: if `line` is the selected sink's
+/// completion interrupt, the sink services it and this returns `true` (the
+/// event is consumed, never forwarded to a guest). Cross-personality by design
+/// — the sink belongs to the kernel, not to whichever thread is focused.
+pub fn on_hw_irq<A: crate::Arch>(machine: &mut A, line: u8) -> bool {
+    let _ = machine;
+    use crate::kernel::platform::Audio;
+    match crate::kernel::platform::get().audio {
+        Audio::EmulatedHda if line == crate::kernel::drivers::hda::MSI_LINE => {
+            crate::kernel::drivers::hda::on_irq();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Stream a block of source PCM `bytes` (`fmt`, `rate` Hz) to the canonical
 /// audio output, canonicalizing to i16 stereo on the way. The sink is the
 /// boot-time platform decision; SbPassthrough never produces canonical PCM
