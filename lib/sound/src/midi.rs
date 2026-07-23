@@ -559,9 +559,22 @@ impl Synth {
     /// the loop run out.
     fn begin_release(&mut self, v: usize) {
         self.notes[v].held = false;
-        // A sustaining loop must stop looping once the key is up, or the note
-        // never ends.
-        self.engine.voices[v].loop_mode = LoopMode::None;
+        // A looping voice must still end after the key is up. When the sample
+        // has a release envelope, that envelope fades the voice to zero and
+        // stops it (see `advance_envelopes`), so the loop keeps sounding until
+        // then — and that sustained loop *is* the note's ring-out. Killing the
+        // loop here instead would truncate the tail to whatever PCM happens to
+        // follow the loop: a crash cymbal loops in its last ~4k samples with
+        // only 7 samples after `loop_end`, so cutting the loop clips the whole
+        // wash down to the initial strike. Only an envelope-less sample has
+        // nothing to end it, so there the loop must run out to the sample end.
+        let n = self.notes[v];
+        let has_env = self.resident[n.patch as usize]
+            .as_ref()
+            .is_some_and(|res| res.patch.samples[n.sample as usize].envelope);
+        if !has_env {
+            self.engine.voices[v].loop_mode = LoopMode::None;
+        }
         if self.notes[v].stage < 3 {
             self.notes[v].stage = 3;
             self.start_stage(v, 3);
@@ -863,6 +876,38 @@ mod tests {
         s.write(0); // reset all controllers
         let (quiet, _) = run_until_silent(&mut s, 44_100 * 4);
         assert!(quiet, "resetting controllers must release what the pedal held");
+    }
+
+    /// A looped, enveloped voice must keep looping across note-off so the
+    /// release envelope — not the PCM that happens to follow `loop_end` — sets
+    /// the ring-out. A crash cymbal loops in its final samples with almost no
+    /// tail after the loop, so cutting the loop on note-off would clip its
+    /// whole wash down to the strike. The note must still terminate, on the
+    /// envelope reaching zero.
+    #[test]
+    fn note_off_keeps_a_looped_voice_ringing_on_its_release_envelope() {
+        let mut s = synth();
+        s.write(0x90);
+        s.write(60);
+        s.write(100);
+        let mut block = [(0i32, 0i32); 64];
+        s.mix_into(44_100, (1 << 16, 1 << 16), &mut block);
+        let v = (0..MAX_VOICES)
+            .find(|&i| s.notes[i].active)
+            .expect("a voice must be sounding");
+        assert!(
+            s.engine.voices[v].loop_mode == LoopMode::Forward,
+            "the fixture patch loops"
+        );
+        s.write(0x80);
+        s.write(60);
+        s.write(0);
+        assert!(
+            s.engine.voices[v].loop_mode == LoopMode::Forward,
+            "note-off must not cut the loop — the release envelope ends the note"
+        );
+        let (quiet, _) = run_until_silent(&mut s, 44_100 * 4);
+        assert!(quiet, "the release envelope must still stop the looped note");
     }
 
     /// All-notes-off must clear everything, on every channel it names.
